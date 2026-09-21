@@ -84,6 +84,7 @@ TEST_Q8_STORAGE_TEST := $(ENGINE_TEST_BUILD)/q8-page-storage
 TEST_Q8_ATTENTION_TEST := $(ENGINE_TEST_BUILD)/q8-flash-attention
 TEST_Q8_PREFILL_TEST := $(ENGINE_TEST_BUILD)/q8-chunked-prefill
 TEST_Q4_BATCH_TEST := $(ENGINE_TEST_BUILD)/q4-batched-projection
+TEST_Q4_PREFILL_TEST := $(ENGINE_TEST_BUILD)/q4-prefill-projection
 TEST_MOE_METAL_TEST := $(ENGINE_TEST_BUILD)/moe-metal
 TEST_GDN_METAL_TEST := $(ENGINE_TEST_BUILD)/gdn-metal
 TEST_OPERATOR_WORKSPACE := $(ENGINE_TEST_BUILD)/operator-workspace
@@ -165,6 +166,7 @@ TEST_METAL_TARGETS := $(TEST_TUNING_WORKLOADS) \
 	$(TEST_Q8_ATTENTION_TEST) \
 	$(TEST_Q8_PREFILL_TEST) \
 	$(TEST_Q4_BATCH_TEST) \
+	$(TEST_Q4_PREFILL_TEST) \
 	$(TEST_MOE_METAL_TEST) \
 	$(TEST_GDN_METAL_TEST) \
 	$(TEST_DFLASH_BATCH_CONTROL_TEST) \
@@ -351,6 +353,12 @@ $(TEST_Q8_PREFILL_TEST): dev/tests/engine/q8_chunked_prefill_metal_test.mm \
 $(TEST_Q4_BATCH_TEST): runtime/metal/DeviceCapabilities.cpp \
 		runtime/metal/MetalBackend.mm \
 		dev/tests/engine/q4_batched_projection_metal_test.mm $(LIB) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $(TEST_INPUTS) \
+		$(ENGINE_LINKFLAGS) -o $@
+
+$(TEST_Q4_PREFILL_TEST): runtime/metal/DeviceCapabilities.cpp \
+		runtime/metal/MetalBackend.mm \
+		dev/tests/engine/q4_prefill_projection_metal_test.mm $(LIB) | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $(TEST_INPUTS) \
 		$(ENGINE_LINKFLAGS) -o $@
 
@@ -596,6 +604,7 @@ test-engine-metal: $(TEST_METAL_TARGETS)
 	$(METAL_TEST_ENV) $(TEST_Q8_ATTENTION_TEST) $(TEST_Q8_ATTENTION_LIB)
 	$(METAL_TEST_ENV) $(TEST_Q8_PREFILL_TEST) $(TEST_Q8_ATTENTION_LIB)
 	$(METAL_TEST_ENV) $(TEST_Q4_BATCH_TEST) $(LIB)
+	$(METAL_TEST_ENV) $(TEST_Q4_PREFILL_TEST) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_MOE_METAL_TEST) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_GDN_METAL_TEST) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_DFLASH_BATCH_CONTROL_TEST) $(LIB)

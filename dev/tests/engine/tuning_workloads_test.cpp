@@ -12,8 +12,8 @@ namespace {
 using namespace splash::model;
 using namespace splash::ops;
 
-static_assert(tuning::kPrefillProbeRows.size() == 1 &&
-              tuning::kPrefillProbeRows.front() == ExecutionLimits::prefillTokenBudget);
+static_assert(!tuning::kPrefillProbeRows.empty() &&
+              tuning::kPrefillProbeRows.back() == ExecutionLimits::prefillTokenBudget);
 static_assert(tuning::kDecodeProbeWidths == std::array<uint32_t, 4>{1, 2, 3, 4});
 
 void require(bool condition, const char *message) {
@@ -169,11 +169,17 @@ void checkPair(ModelPackage package, bool sparse) {
   require(linearKeys(startup) == expectedLinear(
               package, tuning::kPrefillProbeRows, tuning::kDecodeProbeWidths),
           "startup inventory differs from fixed 2048 prefill and B1-B4 decode");
-  require(startup.moe.size() == (sparse ? 5U : 0U),
+  require(startup.moe.size() ==
+              (sparse ? tuning::kPrefillProbeRows.size() +
+                            tuning::kDecodeProbeWidths.size()
+                      : 0U),
           "startup MoE inventory contains extra prefill shapes");
   for (const auto &input : startup.moe)
     require(input.workload.phase == MoePhase::Prefill
-                ? input.workload.rows == ExecutionLimits::prefillTokenBudget
+                ? std::find(tuning::kPrefillProbeRows.begin(),
+                            tuning::kPrefillProbeRows.end(),
+                            input.workload.rows) !=
+                      tuning::kPrefillProbeRows.end()
                 : input.workload.rows >= 8 && input.workload.rows <= 32 &&
                       input.workload.rows % 8 == 0,
             "startup MoE inventory contains an unsupported row count");

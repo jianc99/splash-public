@@ -8,9 +8,12 @@
 
 namespace splash::ops::tuning {
 
-// Tune only the full prefill budget. Short ragged inputs keep the shipped
-// operator defaults and still execute their actual row count.
-inline constexpr std::array<uint32_t, 1> kPrefillProbeRows{SPLASH_PREFILL_TOKEN_BUDGET};
+// Tune the full prefill budget plus the chunk sizes the scheduler actually
+// emits: contended halves of the budget, and the small tails around state
+// boundaries. Row counts outside this set keep the shipped operator defaults
+// and still execute their actual row count.
+inline constexpr std::array<uint32_t, 5> kPrefillProbeRows{
+    64, 256, 512, 1024, SPLASH_PREFILL_TOKEN_BUDGET};
 inline constexpr std::array<uint32_t, 4> kDecodeProbeWidths{1, 2, 3, 4};
 
 } // namespace splash::ops::tuning

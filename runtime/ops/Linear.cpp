@@ -236,7 +236,14 @@ uint32_t decodeGroups(uint32_t tiles, uint32_t cores,
 // halves the grid; it pays only while the N256 grid keeps two tiles per core.
 constexpr uint32_t kWideDecodeTilesPerCore = 2;
 // Apple9 N256 prefill needs eight threadgroups per core to amortize its larger
-// tile. Apple10 selects four-simdgroup N128; that variant is unmeasured on Apple9.
+// tile. Paired-A/B tuning (tune-kernels) and the per-shape microprofile
+// (benchmark-prefill) on a 32-core Apple9 GPU (M4 Max) measured the
+// four-simdgroup N128 tile ahead of N256 on every prefill shape and probed
+// row count: +6..10% GPU wherever the margin cleared the tuning threshold,
+// never behind. Apple9 GPUs at or below that measured core count therefore
+// share the Apple10 prefill rule. Larger Apple9 GPUs (40-core class) keep the
+// wide-tile rule below; it was sized for them and remains unremeasured there.
+constexpr uint32_t kApple9MeasuredPrefillCores = 32;
 constexpr double kApple9WidePrefillGroupsPerCore = 8.0;
 // Without a core count the policy assumes a large GPU, so every rule picks
 // the configuration with more threadgroups, which is the safe direction.
@@ -255,7 +262,7 @@ LinearConfig Q4Linear::baseline(LinearWorkload w) const {
   const uint32_t tiles128 = w.matrix.outputSize / 128;
   const uint32_t tiles256 = w.matrix.outputSize / 256;
   if (w.phase == LinearPhase::Prefill) {
-    if (appleGpuFamily_ >= 10)
+    if (appleGpuFamily_ >= 10 || gpuCores_ <= kApple9MeasuredPrefillCores)
       return {LinearTile::N128, 0, LinearSimdgroups::Four};
     const uint32_t rowTiles = (w.rows + kPrefillRows - 1) / kPrefillRows;
     const bool wide = double(rowTiles) * tiles256 >=

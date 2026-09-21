@@ -102,6 +102,72 @@ void profileShape(MetalBackend &backend, uint32_t rows, uint32_t inputSize,
             << " projection_ms=" << median(projectionSamples) << '\n';
 }
 
+// The fused up projection (silu(gate)*up plus the next GEMM's input sums)
+// carries an extra gate buffer and an output-sums sink.
+void profileUpSilu(MetalBackend &backend, uint32_t rows, uint32_t inputSize,
+                   uint32_t outputSize, const std::string &projectionPipeline,
+                   const std::string &label, uint32_t tileColumns = 256,
+                   uint32_t threads = 256) {
+  const uint32_t allocatedRows = (rows + 31) / 32 * 32;
+  const uint64_t inputElements = uint64_t{allocatedRows} * inputSize;
+  const uint64_t outputElements = uint64_t{allocatedRows} * outputSize;
+  const uint64_t weightElements = uint64_t{inputSize} * outputSize;
+  const uint64_t parameterElements = weightElements / kQuantGroup;
+  const uint64_t sumElements =
+      uint64_t{allocatedRows} * (inputSize / kQuantGroup);
+  const uint64_t outputSumElements =
+      uint64_t{allocatedRows} * (outputSize / kQuantGroup);
+
+  MetalBuffer input =
+      shared(backend, inputElements * sizeof(__bf16), label + " input");
+  MetalBuffer weights = shared(backend, weightElements / 2, label + " weights");
+  MetalBuffer scales =
+      shared(backend, parameterElements * sizeof(__bf16), label + " scales");
+  MetalBuffer biases =
+      shared(backend, parameterElements * sizeof(__bf16), label + " biases");
+  MetalBuffer gate = shared(backend, outputElements * sizeof(__bf16), label + " gate");
+  MetalBuffer output =
+      shared(backend, outputElements * sizeof(__bf16), label + " output");
+  MetalBuffer sums =
+      shared(backend, sumElements * sizeof(float), label + " sums");
+  MetalBuffer outputSums = shared(backend, outputSumElements * sizeof(float),
+                                  label + " output sums");
+  std::memset(input.contents(), 0x3c, input.sizeBytes());
+  std::memset(weights.contents(), 0x5a, weights.sizeBytes());
+  std::memset(scales.contents(), 0x3c, scales.sizeBytes());
+  std::memset(biases.contents(), 0x3c, biases.sizeBytes());
+  std::memset(gate.contents(), 0x3c, gate.sizeBytes());
+  Q4PrefillParams params{outputSize, inputSize};
+
+  ComputeDispatch sum;
+  sum.pipelineName = "prefill_linear_q4_sums32";
+  sum.buffers = {{0, input}, {1, sums}};
+  sum.bytes = {{2, &params, sizeof(params)}};
+  sum.threadgroups = {(rows + 31) / 32, 1, 1};
+  sum.threadsPerThreadgroup = {256, 1, 1};
+
+  ComputeDispatch projection;
+  projection.pipelineName = projectionPipeline;
+  projection.buffers = {{0, input}, {1, weights}, {2, scales}, {3, biases},
+                        {4, gate}, {5, output}, {6, sums}, {7, outputSums}};
+  projection.bytes = {{8, &params, sizeof(params)}};
+  projection.threadgroups = {(rows + 31) / 32, outputSize / tileColumns, 1};
+  projection.threadsPerThreadgroup = {threads, 1, 1};
+
+  for (uint32_t warmup = 0; warmup < 2; ++warmup) {
+    static_cast<void>(backend.submit(sum));
+    static_cast<void>(backend.submit(projection));
+  }
+  std::vector<double> sumSamples;
+  std::vector<double> projectionSamples;
+  for (uint32_t repeat = 0; repeat < 7; ++repeat) {
+    sumSamples.push_back(backend.submit(sum).gpuSeconds * 1000.0);
+    projectionSamples.push_back(backend.submit(projection).gpuSeconds * 1000.0);
+  }
+  std::cout << label << " rows=" << rows << " sums_ms=" << median(sumSamples)
+            << " projection_ms=" << median(projectionSamples) << '\n';
+}
+
 void profileRmsSums(MetalBackend &backend, uint32_t rows, uint32_t width,
                     uint32_t tileRows, const std::string &sumPipeline,
                     const std::string &fusedPipeline,
@@ -186,6 +252,11 @@ void run(const std::string &metallibPath) {
     profileTiles(rows, 5120, 17408, "ffn_up");
     profileShape(backend, rows, 17408, 5120, 32, 256, "prefill_linear_q4_sums32",
                  "prefill_linear_q4_n256", "ffn_down_m32n256");
+    profileUpSilu(backend, rows, 5120, 17408,
+                  "prefill_linear_q4_n256_up_silu_sums", "ffn_up_silu_m32n256");
+    profileUpSilu(backend, rows, 5120, 17408,
+                  "prefill_linear_q4_n128_up_silu_sums_sg4",
+                  "ffn_up_silu_m32n128_sg4", 128, 128);
     profileTiles(rows, 5120, 16640, "gdn_input");
     profileTiles(rows, 5120, 14336, "attention_input");
     profileTiles(rows, 6144, 5120, "mixer_output");

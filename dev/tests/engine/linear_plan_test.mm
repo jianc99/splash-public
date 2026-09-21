@@ -170,13 +170,17 @@ void baselinePlans() {
               const auto plan = linear.plan({matrix, rows, LinearPhase::Prefill, epilogue});
               const double rowTiles = (rows + 31) / 32;
               const bool wide = rowTiles * (matrix.outputSize / 256) >= 8.0 * cores;
-              const LinearConfig expected = family >= 10
+              // Apple10 everywhere, and Apple9 up to the measured 32-core
+              // device, prefill with the four-simdgroup N128 tile; larger
+              // Apple9 GPUs keep the wide-tile rule.
+              const LinearConfig expected = family >= 10 || cores <= 32
                   ? LinearConfig{LinearTile::N128, 0, LinearSimdgroups::Four}
                   : LinearConfig{epilogue == LinearEpilogue::UpWithGate || wide
                                      ? LinearTile::N256 : LinearTile::N128, 0};
               require(plan.configuration() == expected,
                       "prefill policy differs from its stated rule");
-              require(plan.threadsPerThreadgroup() == (family >= 10 ? 128U : 256U),
+              require(plan.threadsPerThreadgroup() ==
+                          (family >= 10 || cores <= 32 ? 128U : 256U),
                       "prefill cooperative execution scope changed");
             }
           }
