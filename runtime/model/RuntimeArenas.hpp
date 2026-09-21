@@ -343,7 +343,20 @@ public:
       gateScratch_ = backend_.allocateBuffer(
           denseScratchBytes, metal::BufferStorage::Private, "qwen-gate-scratch");
     }
-    bytes_ = checkedAdd(baseBytes, denseScratchBytes, "decode arena");
+    const auto linearSize = linearScratchSize(geometry_, operators);
+    if (linearSize.bytes()) {
+      linearScratch_.input = backend_.allocateBuffer(
+          linearSize.input, metal::BufferStorage::Private, "q4-input");
+      linearScratch_.sums = backend_.allocateBuffer(
+          linearSize.sums, metal::BufferStorage::Private, "q4-sums");
+      linearScratch_.partials = backend_.allocateBuffer(
+          linearSize.partials, metal::BufferStorage::Private, "q4-partials");
+      linearScratch_.counters = backend_.allocateBuffer(
+          linearSize.counters, metal::BufferStorage::Shared, "q4-counters");
+      std::memset(linearScratch_.counters.contents(), 0, linearSize.counters);
+    }
+    bytes_ = checkedAdd(checkedAdd(baseBytes, denseScratchBytes, "decode arena"),
+                        linearSize.bytes(), "Q4 decode scratch");
   }
 
   [[nodiscard]] metal::MetalBuffer get(uint32_t lane, DecodeTensor tensor) const {
@@ -372,6 +385,10 @@ public:
     return backend_.view(base_, offsets_[index],
                          uint64_t{lanes} * sizes_[index]);
   }
+
+  [[nodiscard]] ops::LinearScratch linearScratch() const { return linearScratch_; }
+  static ops::LinearScratchSize linearScratchSize(const RuntimeGeometry &geometry,
+                                                 const ops::ExecutionPlans &operators);
 
   [[nodiscard]] metal::MetalBuffer gateScratch() const { return gateScratch_; }
 
@@ -442,6 +459,7 @@ private:
   std::array<uint64_t, decodeTensorCount> offsets_{};
   std::array<uint64_t, decodeTensorCount> sizes_{};
   metal::MetalBuffer gateScratch_;
+  ops::LinearScratch linearScratch_;
   uint64_t bytes_ = 0;
 };
 

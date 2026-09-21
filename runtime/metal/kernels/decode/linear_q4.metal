@@ -82,6 +82,10 @@ Q4_DECODE_AFFINE(decode_linear_q4_n256_m24,
 Q4_DECODE_AFFINE(decode_linear_q4_n256, (q4_mpp_tile<256, false, false>), 64, 256)
 Q4_DECODE_AFFINE(decode_linear_q4_n128_paired,
                  (q4_mpp_tile<128, false, false, 256, true>), 64, 128)
+// 128 threads: four 8 x 256 tiles per core reach the occupancy knee for very
+// wide one-lane projections, with half the input re-reads of N128 tiles.
+Q4_DECODE_AFFINE(decode_linear_q4_n256_paired_sg4,
+                 (q4_mpp_tile<256, false, false, 256, true, 4>), 64, 256)
 Q4_DECODE_AUXILIARY(decode_linear_q4_n128_residual_paired, residual,
                     (q4_mpp_tile<128, false, true, 256, true>), 64, 128)
 Q4_DECODE_AUXILIARY(decode_linear_q4_n128_residual, residual,

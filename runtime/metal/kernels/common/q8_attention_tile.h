@@ -337,3 +337,44 @@ inline void splash_q8_attention_reduce_row(
   }
   tile_output[fused_row * D + thread_index] = bfloat(value);
 }
+
+// Statistics are shared by all 256 output dimensions. Compute their weights
+// once per row, then let each lane stream one dimension of the partials.
+template <uint QueryHeadsPerKVHead, uint RowsPerTile>
+inline void splash_q8_attention_reduce_row_shared(
+    device const float *partials, device const float *statistics,
+    device bfloat *tile_output, uint committed_tokens, uint active_rows,
+    uint splits, ulong head_slot, uint fused_row, uint thread_index,
+    threadgroup float *weights, threadgroup float *group_values) {
+  constexpr uint M = RowsPerTile * QueryHeadsPerKVHead;
+  constexpr uint D = SplashQ8HeadDimension;
+  if (fused_row / QueryHeadsPerKVHead >= active_rows) {
+    tile_output[fused_row * D + thread_index] = bfloat(0.0f);
+    return;
+  }
+  const uint pages = splash_attention_pages(committed_tokens + active_rows);
+  const uint per_split = splash_attention_pages_per_split(pages, splits);
+  const uint written = (pages + per_split - 1) / per_split;
+  const uint lane = thread_index % 32, sg = thread_index / 32;
+  const ulong stat = ((head_slot + thread_index) * M + fused_row) * 2;
+  const float maximum = thread_index < written ? statistics[stat] : -INFINITY;
+  const float group_maximum = simd_max(maximum);
+  if (lane == 0) group_values[sg] = group_maximum;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const float row_maximum = simd_max(lane < 8 ? group_values[lane] : -INFINITY);
+  if (thread_index < written)
+    weights[thread_index] = fast::exp(maximum - row_maximum);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  float numerator = 0.0f, denominator = 0.0f;
+  // Keep both accumulations in the original split order. A parallel sum of
+  // the denominator changes speculative acceptance on real model prompts.
+  for (uint split = 0; split < written; ++split) {
+    const float weight = weights[split];
+    const ulong stat = ((head_slot + split) * M + fused_row) * 2;
+    numerator += weight *
+        partials[((head_slot + split) * M + fused_row) * D + thread_index];
+    denominator += weight * statistics[stat + 1];
+  }
+  tile_output[fused_row * D + thread_index] =
+      bfloat(denominator > 0.0f ? numerator / denominator : 0.0f);
+}

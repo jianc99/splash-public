@@ -1,6 +1,7 @@
 #pragma once
 
 #include "metal/CommandGraph.hpp"
+#include "ops/Linear.hpp"
 
 #include <cstdint>
 #include <span>
@@ -73,6 +74,7 @@ struct GdnDecodeBuffers final {
   metal::MetalBuffer hidden;
   metal::MetalBuffer arrived;
   metal::MetalBuffer generation;
+  LinearScratch linearScratch{};
 };
 
 struct GdnCommitBuffers final {

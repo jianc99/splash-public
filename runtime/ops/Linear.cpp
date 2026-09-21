@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -15,7 +16,33 @@ namespace {
 
 constexpr uint32_t kPrefillRows = 32;
 constexpr uint32_t kQuantGroup = 64;
+constexpr uint32_t kMaximumSimdgroupSplits = 8;
+// Split tiles hold four K partitions, each a whole number of the kernels'
+// four-quant-group (256-input) input-sum blocks.
+constexpr uint32_t kSplitPartitions = 4;
+constexpr uint32_t kSplitInputBlock = kSplitPartitions * 4 * kQuantGroup;
 static_assert(sizeof(LinearMatrix) == 8);
+
+bool splitTile(LinearTile tile) noexcept {
+  return tile == LinearTile::Split32 || tile == LinearTile::Split64;
+}
+bool oneLaneTile(LinearTile tile) noexcept {
+  return tile == LinearTile::Paired128 || tile == LinearTile::Paired256 || tile == LinearTile::Simdgroup || splitTile(tile);
+}
+// Simdgroups fixed by the kernel instance: split tiles run four partitions of
+// one (N32) or two (N64) simdgroups; the paired N256 tile runs four.
+std::optional<LinearSimdgroups> fixedSimdgroups(LinearTile tile) noexcept {
+  switch (tile) {
+  case LinearTile::Split32:
+  case LinearTile::Simdgroup:
+  case LinearTile::Paired256: return LinearSimdgroups::Four;
+  case LinearTile::Split64: return LinearSimdgroups::Eight;
+  case LinearTile::N128:
+  case LinearTile::N256:
+  case LinearTile::Paired128: return std::nullopt;
+  }
+  return std::nullopt;
+}
 
 void validate(LinearWorkload w) {
   if (!w.matrix.outputSize || w.matrix.outputSize % 256 ||
@@ -66,9 +93,17 @@ LinearWorkload decode(LinearMatrix matrix, uint32_t lanes, LinearEpilogue epilog
   return {matrix, lanes * SPLASH_TARGET_VERIFY_ROWS, LinearPhase::Decode, epilogue};
 }
 
-// The four-simdgroup kernels: every prefill N128 tile, and the decode M24
-// N128 plain and residual projections.
+// The four-simdgroup kernels: every prefill N128 tile, the decode M24 N128
+// plain and residual projections, and the one-lane Split32 (plain, residual
+// and gate/up) and Paired256 (plain) tiles.
 bool supportsFourSimdgroups(LinearWorkload w, LinearTile tile) noexcept {
+  if (tile == LinearTile::Split32 || tile == LinearTile::Simdgroup)
+    return w.phase == LinearPhase::Decode && w.rows == SPLASH_TARGET_VERIFY_ROWS;
+  // Only the affine paired N256 kernel is instantiated: this tile is used
+  // for wide plain projections; residual and gate/up retain their own tiles.
+  if (tile == LinearTile::Paired256)
+    return w.phase == LinearPhase::Decode && w.rows == SPLASH_TARGET_VERIFY_ROWS &&
+        w.epilogue == LinearEpilogue::None;
   if (tile != LinearTile::N128) return false;
   return w.phase == LinearPhase::Prefill ||
       (w.rows == 24 && (w.epilogue == LinearEpilogue::None ||
@@ -82,11 +117,32 @@ uint32_t LinearPlan::storageRows() const noexcept {
       ? ((workload_.rows + kPrefillRows - 1) / kPrefillRows) * kPrefillRows : workload_.rows;
 }
 uint32_t LinearPlan::tileColumns() const noexcept {
-  return config_.tile == LinearTile::N256 ? 256 : 128;
+  switch (config_.tile) {
+  case LinearTile::Simdgroup: return workload_.epilogue == LinearEpilogue::GateUp ? 32 : 64;
+  case LinearTile::Split32: return 32;
+  case LinearTile::Split64: return 64;
+  case LinearTile::N256:
+  case LinearTile::Paired256: return 256;
+  case LinearTile::N128:
+  case LinearTile::Paired128: return 128;
+  }
+  return 0;
 }
 uint32_t LinearPlan::threadsPerThreadgroup() const noexcept {
   return static_cast<uint32_t>(config_.simdgroups) * 32;
 }
+uint32_t LinearPlan::partialSums() const noexcept {
+  return usesSimdgroup() ? config_.splits : splitTile(config_.tile) ? kSplitPartitions : 1;
+}
+bool LinearPlan::usesSimdgroup() const noexcept { return config_.tile == LinearTile::Simdgroup; }
+LinearScratchSize LinearPlan::scratchSize() const noexcept {
+  if (!usesSimdgroup()) return {};
+  const auto [n, k] = workload_.matrix;
+  return {uint64_t(k) * 16, uint64_t(k) / 2,
+          config_.splits > 1 ? uint64_t(config_.splits) * 64 * n : 4,
+          config_.splits > 1 ? uint64_t(n / tileColumns()) * 4 : 4};
+}
+
 uint64_t LinearPlan::sumsBytes() const noexcept {
   return workload_.phase == LinearPhase::Prefill
       ? uint64_t{storageRows()} * (workload_.matrix.inputSize / kQuantGroup) * 4 : 0;
@@ -104,20 +160,24 @@ uint64_t LinearPlan::downSumsBytes() const noexcept {
 LinearPlan::LinearPlan(LinearWorkload w, LinearConfig config)
     : workload_(w), config_(config) {
   validate(w);
+  if (config.tile != LinearTile::Simdgroup && config.splits != 1)
+    throw std::invalid_argument("K splits require the simdgroup Q4 tile");
   if (config.tile != LinearTile::N128 && config.tile != LinearTile::N256 &&
-      config.tile != LinearTile::Paired128)
+      !oneLaneTile(config.tile))
     throw std::invalid_argument("invalid Q4 linear tile");
   if ((config.simdgroups != LinearSimdgroups::Four &&
        config.simdgroups != LinearSimdgroups::Eight) ||
       (config.simdgroups == LinearSimdgroups::Four &&
        !supportsFourSimdgroups(w, config.tile)))
     throw std::invalid_argument("invalid Q4 cooperative execution scope");
+  if (const auto fixed = fixedSimdgroups(config.tile); fixed && config.simdgroups != *fixed)
+    throw std::invalid_argument("Q4 tile requires its kernel's simdgroup count");
   if (w.matrix.outputSize % tileColumns())
     throw std::invalid_argument("Q4 matrix is not divisible by tile columns");
   const bool residual = w.epilogue == LinearEpilogue::Residual;
   const bool four = config.simdgroups == LinearSimdgroups::Four;
   if (w.phase == LinearPhase::Prefill) {
-    if (config.groups || config.tile == LinearTile::Paired128)
+    if (config.groups || oneLaneTile(config.tile))
       throw std::invalid_argument("invalid Q4 prefill configuration");
     if (four) {
       pipeline_ = w.epilogue == LinearEpilogue::UpWithGate
@@ -140,8 +200,41 @@ LinearPlan::LinearPlan(LinearWorkload w, LinearConfig config)
   if (!config.groups || config.groups > w.matrix.outputSize / tileColumns())
     throw std::invalid_argument("invalid Q4 decode group count");
   const uint32_t lane = w.rows / SPLASH_TARGET_VERIFY_ROWS - 1;
-  if (config.tile == LinearTile::Paired128 && (lane != 0 || w.matrix.outputSize % 256))
-    throw std::invalid_argument("paired Q4 tile requires one lane and paired columns");
+  if (oneLaneTile(config.tile) && (lane != 0 || w.matrix.outputSize % 256))
+    throw std::invalid_argument("paired or split Q4 tile requires one lane and paired columns");
+  if (usesSimdgroup()) {
+    const uint32_t groups = w.matrix.inputSize / kQuantGroup;
+    if (config.groups != w.matrix.outputSize / tileColumns() ||
+        !config.splits || config.splits > kMaximumSimdgroupSplits || (config.splits & (config.splits - 1)) ||
+        groups % config.splits)
+      throw std::invalid_argument("simdgroup Q4 requires full column grid and whole power-of-two K partitions");
+    pipeline_ = w.epilogue == LinearEpilogue::GateUp ? "decode_linear_q4_sg_gate_up" :
+        residual ? "decode_linear_q4_sg_residual" : "decode_linear_q4_sg";
+    return;
+  }
+  if (splitTile(config.tile)) {
+    // Each partition takes a quarter of K in whole 256-input blocks, and the
+    // split kernels are dispatched one threadgroup per tile.
+    if (w.matrix.inputSize % kSplitInputBlock ||
+        config.groups != w.matrix.outputSize / tileColumns())
+      throw std::invalid_argument("split Q4 tile requires K % 1024 == 0 and the full grid");
+    const bool n32 = config.tile == LinearTile::Split32;
+    if (w.epilogue == LinearEpilogue::GateUp) {
+      // Only the N32 two-stream split kernel is instantiated.
+      if (!n32) throw std::invalid_argument("Q4 split gate/up requires Split32");
+      pipeline_ = "decode_linear_q4_n32_split4_gate_up";
+    } else if (residual) {
+      pipeline_ = n32 ? "decode_linear_q4_n32_split4_residual"
+                      : "decode_linear_q4_n64_split4_residual";
+    } else {
+      pipeline_ = n32 ? "decode_linear_q4_n32_split4" : "decode_linear_q4_n64_split4";
+    }
+    return;
+  }
+  if (config.tile == LinearTile::Paired256) {
+    pipeline_ = "decode_linear_q4_n256_paired_sg4";
+    return;
+  }
   if (four) {
     pipeline_ = residual ? "decode_linear_q4_n128_residual_m24_sg4"
                          : "decode_linear_q4_n128_m24_sg4";
@@ -245,9 +338,27 @@ constexpr uint32_t kWideDecodeTilesPerCore = 2;
 // wide-tile rule below; it was sized for them and remains unremeasured there.
 constexpr uint32_t kApple9MeasuredPrefillCores = 32;
 constexpr double kApple9WidePrefillGroupsPerCore = 8.0;
-// Without a core count the policy assumes a large GPU, so every rule picks
-// the configuration with more threadgroups, which is the safe direction.
-constexpr uint32_t kAssumedGpuCores = 64;
+// Missing core metadata uses one intermediate estimate for all families.
+// This is a fallback, not a calibrated optimum. Reported counts always win.
+constexpr uint32_t kAssumedGpuCores = 32;
+
+// Apple10 wide plain projections reduce input re-reads with paired N256
+// tiles at one resident wave, measured on 16/20-core GPUs. Split-K remains
+// an offline candidate: its reassociation reduced speculative acceptance
+// on some measured prompts. Apple9's simdgroup policy is independent.
+constexpr uint32_t kPaired256TilesPerCore = 8;
+constexpr uint32_t kPaired256WaveGroupsPerCore = 4;
+
+std::optional<LinearConfig> apple10OneLaneConfig(LinearWorkload w, uint32_t cores) {
+  // validate() requires outputSize % 256 == 0, so every tile width divides it.
+  const uint32_t n = w.matrix.outputSize;
+  const uint32_t tiles256 = n / 256;
+  if (w.epilogue == LinearEpilogue::None && tiles256 >= kPaired256TilesPerCore * cores)
+    return LinearConfig{LinearTile::Paired256,
+                        std::min(tiles256, kPaired256WaveGroupsPerCore * cores),
+                        LinearSimdgroups::Four};
+  return std::nullopt;
+}
 
 } // namespace
 
@@ -271,6 +382,19 @@ LinearConfig Q4Linear::baseline(LinearWorkload w) const {
                                                               : LinearTile::N128, 0};
   }
   const uint32_t lanes = w.rows / SPLASH_TARGET_VERIFY_ROWS;
+  if (appleGpuFamily_ == 9 && lanes == 1) {
+    const uint32_t columns = w.epilogue == LinearEpilogue::GateUp ? 32 : 64;
+    const uint32_t grid = w.matrix.outputSize / columns, groups = w.matrix.inputSize / 64;
+    uint32_t splits = 1;
+    // Aim for sixteen independent column/K groups per core, retaining at
+    // least twelve quant groups per partition to amortize the reduction.
+    while (splits < kMaximumSimdgroupSplits && uint64_t(grid) * splits < 16ULL * gpuCores_ &&
+           groups % (2 * splits) == 0 && groups / (2 * splits) >= 12)
+      splits *= 2;
+    return {LinearTile::Simdgroup, grid, LinearSimdgroups::Four, splits};
+  }
+  if (appleGpuFamily_ >= 10 && lanes == 1)
+    if (const auto config = apple10OneLaneConfig(w, gpuCores_)) return *config;
   // Apple9 keeps its one-tile grids (see kApple9GateUpGroupsPerCore).
   const auto groups = [&](uint32_t tiles, DecodeGroupPolicy policy) {
     return appleGpuFamily_ >= 10 ? decodeGroups(tiles, gpuCores_, policy)
@@ -286,9 +410,14 @@ LinearConfig Q4Linear::baseline(LinearWorkload w) const {
   }
   // Pipelined N128 hides the latency of a single lane's weight stream.
   if (lanes == 1) return {LinearTile::Paired128, groups(tiles128, kN128Groups)};
+  // With at most one N128 tile per core, longer M24 dot products benefit
+  // from eight groups. Short K and wider grids retain the four-group path.
+  if (appleGpuFamily_ >= 10 && lanes == 3 && tiles128 <= gpuCores_ &&
+      w.matrix.inputSize >= 4096)
+    return {LinearTile::N128, tiles128, LinearSimdgroups::Eight};
   // M24 plain projections benefit from four SIMD groups on Apple9 too.
   // Apple9 residual projections retain eight groups with compact prefix
-  // traversal; Apple10 uses four groups for both epilogues.
+  // traversal; Apple10 uses four groups outside the narrow-grid case above.
   if (lanes == 3 && (appleGpuFamily_ >= 10 ||
       (appleGpuFamily_ == 9 && w.epilogue == LinearEpilogue::None)))
     return {LinearTile::N128, groups(tiles128, kFourSimdgroupGroups),
@@ -323,7 +452,7 @@ void Q4Linear::setChoices(std::span<const LinearChoice> choices) {
 
 std::vector<LinearPlan> Q4Linear::candidates(LinearWorkload w) const {
   std::vector<LinearPlan> result;
-  result.reserve(16);
+  result.reserve(kMaximumCandidates);
   result.push_back(LinearPlan(w, baseline(w)));
   const auto append = [&](LinearConfig config) {
     for (const auto &existing : result)
@@ -346,14 +475,46 @@ std::vector<LinearPlan> Q4Linear::candidates(LinearWorkload w) const {
         append({tile, 0, LinearSimdgroups::Four});
     } else {
       const uint32_t tiles = w.matrix.outputSize / columns;
-      for (const uint32_t groups : {36U, 60U, 80U, tiles}) {
+      // Sample two, three and four groups per core plus the full grid.
+      // Always retain the measured baseline above, including its balanced
+      // group count. Fixed counts tied to one GPU miss these waves elsewhere.
+      for (const uint32_t groups : {2 * gpuCores_, 3 * gpuCores_, 4 * gpuCores_, tiles}) {
         append({tile, std::min(groups, tiles)});
         if (supportsFourSimdgroups(w, tile))
           append({tile, std::min(groups, tiles), LinearSimdgroups::Four});
       }
     }
   }
+  // One-lane tiles: the split forms at their full grid and the paired N256
+  // tile at one resident wave and at its full grid.
+  if (w.phase == LinearPhase::Decode && w.rows == SPLASH_TARGET_VERIFY_ROWS) {
+    const uint32_t n = w.matrix.outputSize;
+    if (appleGpuFamily_ == 9) {
+      const uint32_t columns = w.epilogue == LinearEpilogue::GateUp ? 32 : 64;
+      for (uint32_t splits = 1; splits <= kMaximumSimdgroupSplits; splits *= 2)
+        if ((w.matrix.inputSize / kQuantGroup) % splits == 0)
+          append({LinearTile::Simdgroup, n / columns, LinearSimdgroups::Four, splits});
+    }
+    if (w.matrix.inputSize % kSplitInputBlock == 0) {
+      append({LinearTile::Split32, n / 32, LinearSimdgroups::Four});
+      if (w.epilogue != LinearEpilogue::GateUp)
+        append({LinearTile::Split64, n / 64, LinearSimdgroups::Eight});
+    }
+    if (w.epilogue == LinearEpilogue::None)
+      for (const uint32_t groups : {kPaired256WaveGroupsPerCore * gpuCores_, n / 256})
+        append({LinearTile::Paired256, std::min(groups, n / 256), LinearSimdgroups::Four});
+  }
   return result;
+}
+
+LinearScratchSize Q4Linear::decodeScratchSize(LinearWorkload w) const {
+  auto size = LinearPlan(w, baseline(w)).scratchSize();
+  const auto selected = plan(w).scratchSize();
+  size.input = std::max(size.input, selected.input);
+  size.sums = std::max(size.sums, selected.sums);
+  size.partials = std::max(size.partials, selected.partials);
+  size.counters = std::max(size.counters, selected.counters);
+  return size;
 }
 
 void Q4Linear::add(metal::CommandGraph &graph, LinearBuffers b,
@@ -373,6 +534,26 @@ void Q4Linear::add(metal::CommandGraph &graph, LinearBuffers b,
     if (!gate) throw std::invalid_argument("Q4 gate projection is missing");
     requireProjection(*gate, w.matrix);
   } else if (gate) throw std::invalid_argument("unexpected Q4 gate projection");
+  if (selected.usesSimdgroup()) {
+    const auto size = selected.scratchSize();
+    requireBytes(b.scratch.input, size.input);
+    requireBytes(b.scratch.sums, size.sums);
+    requireBytes(b.scratch.partials, size.partials);
+    requireBytes(b.scratch.counters, size.counters);
+    if (!b.inputPrepared)
+      graph.add("decode_linear_q4_prepare", {b.input, b.scratch.input, b.scratch.sums},
+                k, {k / 32, 1, 1}, {128, 1, 1});
+    const auto &first = gate ? *gate : p;
+    std::vector<metal::MetalBuffer> bindings{b.scratch.input, first.weights,
+        first.scales, first.biases, b.output, b.scratch.sums,
+        b.scratch.partials, b.scratch.counters};
+    if (gate) bindings.insert(bindings.end(), {p.weights, p.scales, p.biases});
+    else if (w.epilogue == LinearEpilogue::Residual) bindings.push_back(b.residual);
+    graph.add(std::string(selected.pipeline()), std::move(bindings),
+        Q4Params{n, k, selected.configuration().splits},
+        {selected.configuration().groups, selected.configuration().splits, 1}, {128, 1, 1});
+    return;
+  }
   const auto dispatch = [&](std::string_view name,
       std::initializer_list<metal::MetalBuffer> bindings) {
     if (w.phase == LinearPhase::Prefill)
@@ -437,23 +618,23 @@ void Q4Linear::addPrefillUpWithGate(metal::CommandGraph &graph, metal::MetalBuff
       plan({matrix, rows, LinearPhase::Prefill, LinearEpilogue::UpWithGate}));
 }
 void Q4Linear::addDecode(metal::CommandGraph &graph, metal::MetalBuffer input,
-    const Q4Projection &p, metal::MetalBuffer output, LinearMatrix matrix) const {
-  add(graph, {input, output, {}, {}, {}, {}}, p, plan(decode(matrix, 1, LinearEpilogue::None)));
+    const Q4Projection &p, metal::MetalBuffer output, LinearMatrix matrix, LinearScratch scratch) const {
+  add(graph, {input, output, {}, {}, {}, {}, scratch}, p, plan(decode(matrix, 1, LinearEpilogue::None)));
 }
 void Q4Linear::addDecodeBatch(metal::CommandGraph &graph, metal::MetalBuffer input,
     const Q4Projection &p, metal::MetalBuffer output, LinearMatrix matrix,
-    uint32_t lanes, Q4DispatchStats &stats) const {
-  add(graph, {input, output, {}, {}, {}, {}}, p, plan(decode(matrix, lanes, LinearEpilogue::None)), nullptr, &stats);
+    uint32_t lanes, Q4DispatchStats &stats, LinearScratch scratch, bool inputPrepared) const {
+  add(graph, {input, output, {}, {}, {}, {}, scratch, inputPrepared}, p, plan(decode(matrix, lanes, LinearEpilogue::None)), nullptr, &stats);
 }
 void Q4Linear::addResidualBatch(metal::CommandGraph &graph, metal::MetalBuffer input,
     const Q4Projection &p, metal::MetalBuffer residual, metal::MetalBuffer output,
-    LinearMatrix matrix, uint32_t lanes, Q4DispatchStats &stats) const {
-  add(graph, {input, output, {}, residual, {}, {}}, p, plan(decode(matrix, lanes, LinearEpilogue::Residual)), nullptr, &stats);
+    LinearMatrix matrix, uint32_t lanes, Q4DispatchStats &stats, LinearScratch scratch, bool inputPrepared) const {
+  add(graph, {input, output, {}, residual, {}, {}, scratch, inputPrepared}, p, plan(decode(matrix, lanes, LinearEpilogue::Residual)), nullptr, &stats);
 }
 void Q4Linear::addGateUpBatch(metal::CommandGraph &graph, metal::MetalBuffer input,
     const Q4Projection &gate, const Q4Projection &up, metal::MetalBuffer gateScratch,
-    metal::MetalBuffer output, LinearMatrix matrix, uint32_t lanes, Q4DispatchStats &stats) const {
-  add(graph, {input, output, {}, {}, gateScratch, {}}, up, plan(decode(matrix, lanes, LinearEpilogue::GateUp)), &gate, &stats);
+    metal::MetalBuffer output, LinearMatrix matrix, uint32_t lanes, Q4DispatchStats &stats, LinearScratch scratch, bool inputPrepared) const {
+  add(graph, {input, output, {}, {}, gateScratch, {}, scratch, inputPrepared}, up, plan(decode(matrix, lanes, LinearEpilogue::GateUp)), &gate, &stats);
 }
 
 } // namespace splash::ops

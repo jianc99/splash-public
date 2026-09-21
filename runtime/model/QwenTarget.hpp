@@ -252,6 +252,7 @@ struct QwenTargetPrefillBuffers final {
 };
 
 struct QwenTargetVerifyBuffers final {
+  ops::LinearScratch linearScratch{};
   std::array<metal::MetalBuffer, 2> hidden;
   metal::MetalBuffer normalized;
   metal::MetalBuffer recurrent;
@@ -340,7 +341,7 @@ public:
       ops::Q4DispatchStats &stats) const;
   void addHead(metal::CommandGraph &graph, metal::MetalBuffer hidden,
                metal::MetalBuffer finalHidden, metal::MetalBuffer logits,
-               uint32_t normalizedRows) const;
+               uint32_t normalizedRows, ops::LinearScratch scratch = {}) const;
   void addEmbedding(metal::CommandGraph &graph, metal::MetalBuffer tokens,
                     metal::MetalBuffer hidden, uint32_t rows) const;
   void addStateCommit(metal::CommandGraph &graph,

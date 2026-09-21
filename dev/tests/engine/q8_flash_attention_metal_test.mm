@@ -600,6 +600,104 @@ void runCase(id<MTLDevice> device, id<MTLCommandQueue> queue,
   }
 }
 
+// Isolate the merge from QK/PV: large differences in maxima, cancellation,
+// ragged split counts and inactive rows exercise the shared-weight reduction.
+void checkReduce(id<MTLDevice> device, id<MTLCommandQueue> queue,
+                 id<MTLLibrary> library, Shape shape, uint32_t splits,
+                 uint32_t activeRows) {
+  const uint32_t m = shape.fusedRows(), d = kHeadDimension;
+  auto partials = makeBuffer(device, uint64_t{shape.kvHeads} * splits * m * d * 4);
+  auto stats = makeBuffer(device, uint64_t{shape.kvHeads} * splits * m * 2 * 4);
+  auto output = makeBuffer(device, uint64_t{shape.kvHeads} * kStride *
+                                      shape.queryHeadsPerKvHead * d * 2);
+  auto *p = static_cast<float *>(partials.contents);
+  auto *t = static_cast<float *>(stats.contents);
+  auto *out = static_cast<BFloat16Bits *>(output.contents);
+  std::memset(out, 0xa5, output.length);
+  for (uint32_t head = 0; head < shape.kvHeads; ++head)
+    for (uint32_t split = 0; split < splits; ++split)
+      for (uint32_t row = 0; row < m; ++row) {
+        const uint64_t index = (uint64_t{head} * splits + split) * m + row;
+        const bool active = row / shape.queryHeadsPerKvHead < activeRows;
+        // Alternate underflow-scale differences and fractional exp weights.
+        const float spacing = row % 2 ? 0.25f : 500.0f;
+        t[index * 2] = active ? float(int(split % 5) - 2) * spacing : -INFINITY;
+        t[index * 2 + 1] = active ? 1.0f + float(split % 7) : 0.0f;
+        for (uint32_t dim = 0; dim < d; ++dim)
+          p[index * d + dim] = float(int((split * 71 + dim * 37 + row * 13) % 257) - 128) * 0.125f;
+      }
+  Q8VerifyAttentionParams params{splits * 32 - activeRows, activeRows, kStride,
+                                 splits, 1, splits, splits, 0};
+  id<MTLCommandBuffer> command = [queue commandBuffer];
+  id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
+  [encoder setComputePipelineState:makePipeline(
+      device, library, std::string("verify_attention_q8_reduce") + shape.suffix)];
+  [encoder setBuffer:partials offset:0 atIndex:0];
+  [encoder setBuffer:stats offset:0 atIndex:1];
+  [encoder setBuffer:output offset:0 atIndex:2];
+  [encoder setBytes:&params length:sizeof(params) atIndex:3];
+  [encoder dispatchThreadgroups:MTLSizeMake(shape.kvHeads, m, 1)
+         threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+  [encoder endEncoding];
+  finish(command);
+  // The unchanged prefill merge uses the original sequential formula and
+  // the same eight-row tile. Guard against acceptance-changing reassociation.
+  static_assert(SPLASH_PREFILL_ATTENTION_TILE_ROWS == SPLASH_TARGET_VERIFY_ROWS);
+  id<MTLBuffer> sequential;
+  if (splits <= SPLASH_PREFILL_ATTENTION_MAXIMUM_SPLITS) {
+    sequential = makeBuffer(device, output.length);
+    SplashQ8PrefillAttentionParams referenceParams{
+        params.committed_tokens, activeRows, kStride, splits, 1, splits, 0, 0};
+    command = [queue commandBuffer];
+    encoder = [command computeCommandEncoder];
+    [encoder setComputePipelineState:makePipeline(
+        device, library, std::string("prefill_attention_q8_reduce") + shape.suffix)];
+    [encoder setBuffer:partials offset:0 atIndex:0];
+    [encoder setBuffer:stats offset:0 atIndex:1];
+    [encoder setBuffer:sequential offset:0 atIndex:2];
+    [encoder setBytes:&referenceParams length:sizeof(referenceParams) atIndex:3];
+    [encoder dispatchThreadgroups:MTLSizeMake(shape.kvHeads, m, 1)
+           threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [encoder endEncoding];
+    finish(command);
+  }
+  for (uint32_t head = 0; head < shape.kvHeads; ++head)
+    for (uint32_t row = 0; row < m; ++row) {
+      const uint64_t offset = (uint64_t{head} * kStride * shape.queryHeadsPerKvHead + row) * d;
+      const bool active = row / shape.queryHeadsPerKvHead < activeRows;
+      double maximum = -INFINITY;
+      for (uint32_t split = 0; split < splits; ++split)
+        maximum = std::max(maximum, double(t[((uint64_t{head} * splits + split) * m + row) * 2]));
+      for (uint32_t dim = 0; dim < d; ++dim) {
+        double numerator = 0, denominator = 0;
+        if (active)
+          for (uint32_t split = 0; split < splits; ++split) {
+            const uint64_t index = (uint64_t{head} * splits + split) * m + row;
+            const double weight = std::exp(double(t[index * 2]) - maximum);
+            numerator += weight * p[index * d + dim];
+            denominator += weight * t[index * 2 + 1];
+          }
+        const double expected = active ? numerator / denominator : 0;
+        const double actual = bfloat16ToFloat(out[offset + dim]);
+        if (active && sequential)
+          require(out[offset + dim] == static_cast<BFloat16Bits *>(sequential.contents)[offset + dim],
+                  "verify merge changed the sequential reduction result");
+        // Final bf16 rounding plus fp32 reduction; cancellation uses an
+        // absolute floor so an exact zero reference remains a useful check.
+        require(std::isfinite(actual) &&
+                    std::abs(actual - expected) <= std::abs(expected) * 0.004 + 0.000002,
+                "shared attention merge differs from fp64 reference");
+        if (!active)
+          require(out[offset + dim] == 0, "inactive attention row was not exactly zero");
+      }
+    }
+  for (uint32_t head = 0; head < shape.kvHeads; ++head)
+    for (uint32_t row = m; row < kStride * shape.queryHeadsPerKvHead; ++row)
+      for (uint32_t dim = 0; dim < d; ++dim)
+        require(out[(uint64_t{head} * kStride * shape.queryHeadsPerKvHead + row) * d + dim] == 0xa5a5,
+                "attention merge wrote beyond its eight-row view");
+}
+
 void run(const char *libraryPath) {
   testContract();
   id<MTLDevice> device = MTLCreateSystemDefaultDevice();
@@ -613,6 +711,9 @@ void run(const char *libraryPath) {
     throw std::runtime_error(error.localizedDescription.UTF8String);
   id<MTLCommandQueue> queue = [device newCommandQueue];
   for (const Shape shape : kShapes) {
+    for (uint32_t splits : {1U, 3U, 7U, 32U, 65U, 128U})
+      for (uint32_t activeRows : {1U, 8U})
+        checkReduce(device, queue, library, shape, splits, activeRows);
     const std::array<Pipelines, 2> pipelines{
         makePipelines(device, library, shape, false),
         makePipelines(device, library, shape, true)};

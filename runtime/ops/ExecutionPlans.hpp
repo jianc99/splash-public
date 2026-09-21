@@ -104,7 +104,8 @@ public:
   [[nodiscard]] MoePlan moePrefill(MoeShape shape, uint32_t rows) const;
   [[nodiscard]] MoePlan moeDecode(MoeShape shape, uint32_t lanes) const;
   // Shipped baseline first, independent of installed choices. Every candidate
-  // uses the same device router policy as production lookups and encoding.
+  // uses the same device router and expert-tile policy as production lookups
+  // and encoding.
   [[nodiscard]] std::array<MoePlan, 2> moeCandidates(const MoeWorkload &workload) const;
 
   // Bounds include baseline and every matching installed key, not just the
@@ -126,6 +127,7 @@ private:
   Q4Linear linear_;
   Q4Linear baselineLinear_;
   uint32_t moeRouteWideRows_ = kMoeRouteWideRows;
+  MoeExpertSimdgroups moeDecodeSimdgroups_ = MoeExpertSimdgroups::Eight;
   OperatorChoices choices_;
 };
 

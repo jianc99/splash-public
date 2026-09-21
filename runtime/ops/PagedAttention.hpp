@@ -4,6 +4,7 @@
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/PagedAttention.h"
 #include "ops/PagedKv.hpp"
+#include "ops/Linear.hpp"
 
 #include <algorithm>
 #include <array>
@@ -312,7 +313,7 @@ public:
                             metal::MetalBuffer hidden, uint32_t rowsPerLane,
                             uint32_t cacheStride, uint32_t rowStride,
                             uint32_t queryHeads, kv::Q8Layout layout,
-                            uint32_t lanes);
+                            uint32_t lanes, LinearScratch scratch = {});
 
   [[nodiscard]] static kv::Q8ChunkedPrefillParams
   prefillParams(uint64_t logicalPosition, uint32_t chunkTokens,

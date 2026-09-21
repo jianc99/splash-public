@@ -1,3 +1,4 @@
+#include "metal/kernels/common/q4_sgmatrix.h"
 #include "metal/abi/KernelABI.h"
 #include "metal/kernels/common/attention_qkv_prepare.h"
 
@@ -69,38 +70,43 @@ kernel void verify_attention_qkv_kv2_g8(
 }
 
 template <uint QHeads, uint KHeads>
-inline void full_attention_gate_decode_phase(
+inline bfloat full_attention_gate_value(
     device const bfloat *packed_qkv, device const bfloat *attention,
-    device bfloat *hidden, constant FullDecodeBatchParams &params, uint index,
-    uint grid_size) {
+    constant FullDecodeBatchParams &params, uint element) {
   constexpr uint HeadDim = 256, QStride = 2 * HeadDim;
   constexpr uint PackedStride = QHeads * QStride + 2 * KHeads * HeadDim;
   constexpr uint HeadsPerKV = QHeads / KHeads;
   uint per_lane = params.tokens * QHeads * HeadDim;
-  uint count = params.lanes * per_lane;
-  for (uint element = index; element < count; element += grid_size) {
-    uint batch = element / per_lane;
-    uint lane_element = element % per_lane;
-    uint row = lane_element / (QHeads * HeadDim);
-    uint remainder = lane_element % (QHeads * HeadDim);
-    uint query_head = remainder / HeadDim;
-    uint dim = remainder % HeadDim;
-    float gate = float(
-        packed_qkv[(ulong(batch) * params.tokens + row) * PackedStride +
-                   query_head * QStride + HeadDim + dim]);
-    float sigmoid = 1.0f / (1.0f + fast::exp2(-1.44269504089f * gate));
-    uint kv_head = query_head / HeadsPerKV;
-    uint local_head = query_head % HeadsPerKV;
-    ulong attention_index =
-        (((ulong(batch) * KHeads + kv_head) * params.row_stride + row) *
-             HeadsPerKV +
-         local_head) *
-            HeadDim +
-        dim;
-    hidden[(ulong(batch) * params.tokens + row) * QHeads * HeadDim +
-           query_head * HeadDim + dim] =
-        bfloat(float(attention[attention_index]) * sigmoid);
-  }
+  uint batch = element / per_lane;
+  uint lane_element = element % per_lane;
+  uint row = lane_element / (QHeads * HeadDim);
+  uint remainder = lane_element % (QHeads * HeadDim);
+  uint query_head = remainder / HeadDim;
+  uint dim = remainder % HeadDim;
+  float gate = float(
+      packed_qkv[(ulong(batch) * params.tokens + row) * PackedStride +
+                 query_head * QStride + HeadDim + dim]);
+  float sigmoid = 1.0f / (1.0f + fast::exp2(-1.44269504089f * gate));
+  uint kv_head = query_head / HeadsPerKV;
+  uint local_head = query_head % HeadsPerKV;
+  ulong attention_index =
+      (((ulong(batch) * KHeads + kv_head) * params.row_stride + row) *
+           HeadsPerKV +
+       local_head) *
+          HeadDim +
+      dim;
+  return bfloat(float(attention[attention_index]) * sigmoid);
+}
+
+template <uint QHeads, uint KHeads>
+inline void full_attention_gate_decode_phase(
+    device const bfloat *packed_qkv, device const bfloat *attention,
+    device bfloat *hidden, constant FullDecodeBatchParams &params, uint index,
+    uint grid_size) {
+  const uint count = params.lanes * params.tokens * QHeads * 256;
+  for (uint element = index; element < count; element += grid_size)
+    hidden[element] = full_attention_gate_value<QHeads, KHeads>(
+        packed_qkv, attention, params, element);
 }
 
 kernel void verify_attention_gate(
@@ -124,3 +130,23 @@ kernel void verify_attention_gate_kv2_g8(
   full_attention_gate_decode_phase<16, 2>(
       packed_qkv, attention, hidden, params, index, grid_size);
 }
+
+#define ATTENTION_GATE_Q4(Name, QHeads, KHeads) \
+  kernel void Name( \
+      device const bfloat *packed [[buffer(0)]], \
+      device const bfloat *attention [[buffer(1)]], \
+      device bfloat *hidden [[buffer(2)]], \
+      device bfloat *table [[buffer(3)]], device float *sums [[buffer(4)]], \
+      constant FullDecodeBatchParams &params [[buffer(5)]], \
+      uint index [[thread_position_in_grid]], \
+      uint lane [[thread_index_in_simdgroup]]) { \
+    constexpr uint width = QHeads * 256; \
+    const uint element = 2 * index; \
+    const bfloat a = full_attention_gate_value<QHeads, KHeads>(packed, attention, params, element); \
+    const bfloat b = full_attention_gate_value<QHeads, KHeads>(packed, attention, params, element + 1); \
+    hidden[element] = a; hidden[element + 1] = b; \
+    q4sg::write_input(table, sums, (element % width) / 64, element / width, lane, a, b); \
+  }
+ATTENTION_GATE_Q4(verify_attention_gate_q4, 24, 4)
+ATTENTION_GATE_Q4(verify_attention_gate_q4_kv2_g8, 16, 2)
+#undef ATTENTION_GATE_Q4

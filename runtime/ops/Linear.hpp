@@ -3,8 +3,9 @@
 #include "metal/DeviceCapabilities.hpp"
 #include "metal/CommandGraph.hpp"
 
-#include <cstdint>
 #include <compare>
+#include <cstddef>
+#include <cstdint>
 #include <span>
 #include <string_view>
 #include <vector>
@@ -50,7 +51,15 @@ struct LinearMatrix final {
 
 enum class LinearPhase : uint8_t { Prefill, Decode };
 enum class LinearEpilogue : uint8_t { None, Residual, GateUp, UpWithGate };
-enum class LinearTile : uint8_t { N128, N256, Paired128 };
+// Compute tiles over the StorageN=256 packing. Paired tiles pipeline two
+// quant groups of one lane. Split tiles keep one 8-row tile per threadgroup
+// and split K into four partitions whose fp32 partial sums are reduced before
+// the bf16 rounding; they take one lane, K % 1024 == 0 and one threadgroup
+// per tile. Paired256 is the four-simdgroup N256 paired tile. Simdgroup
+// uses bf16 8x8 matrix operations and an explicit activation/split workspace.
+enum class LinearTile : uint8_t {
+  N128, N256, Paired128, Split32, Split64, Paired256, Simdgroup
+};
 enum class LinearSimdgroups : uint8_t { Four = 4, Eight = 8 };
 
 struct LinearWorkload final {
@@ -65,14 +74,32 @@ struct LinearConfig final {
   LinearTile tile = LinearTile::N128;
   // Decode grid size. Prefill uses its matrix grid and requires zero here.
   uint32_t groups = 0;
-  // Cooperative execution scope, independent of the persistent grid size.
+  // Simdgroups per threadgroup, independent of the persistent grid size: the
+  // cooperative scope of one tile, or for split tiles the four partitions
+  // together (Split32 is 4 x 1, Split64 is 4 x 2; Paired256 runs four).
   LinearSimdgroups simdgroups = LinearSimdgroups::Eight;
+  // Cross-threadgroup K partitions for Simdgroup; all other tiles use one.
+  uint32_t splits = 1;
   bool operator==(const LinearConfig &) const = default;
 };
 
 struct LinearChoice final {
   LinearWorkload workload;
   LinearConfig configuration;
+};
+
+// Reused serially within one decode command stream. Counters are zeroed at
+// allocation and restored by each completed split dispatch. Never share this
+// workspace between concurrent command streams.
+struct LinearScratch final {
+  metal::MetalBuffer input;
+  metal::MetalBuffer sums;
+  metal::MetalBuffer partials;
+  metal::MetalBuffer counters;
+};
+struct LinearScratchSize final {
+  uint64_t input = 0, sums = 0, partials = 0, counters = 0;
+  [[nodiscard]] uint64_t bytes() const noexcept { return input + sums + partials + counters; }
 };
 
 class LinearPlan final {
@@ -82,6 +109,13 @@ public:
   [[nodiscard]] uint32_t storageRows() const noexcept;
   [[nodiscard]] uint32_t tileColumns() const noexcept;
   [[nodiscard]] uint32_t threadsPerThreadgroup() const noexcept;
+  // fp32 partial sums the kernel reduces before the single bf16 rounding of
+  // the projection: 1 for the sequential tiles, whose outputs are bitwise
+  // identical for a workload; 4 for split tiles; 1-8 for Simdgroup. The latter
+  // also reassociates within each quantization group, even with one split.
+  [[nodiscard]] uint32_t partialSums() const noexcept;
+  [[nodiscard]] bool usesSimdgroup() const noexcept;
+  [[nodiscard]] LinearScratchSize scratchSize() const noexcept;
   [[nodiscard]] uint64_t sumsBytes() const noexcept;
   [[nodiscard]] uint64_t gateScratchBytes() const noexcept;
   [[nodiscard]] uint64_t downSumsBytes() const noexcept;
@@ -107,6 +141,10 @@ struct LinearBuffers final {
   metal::MetalBuffer residual;
   metal::MetalBuffer gateScratch;
   metal::MetalBuffer downSums;
+  LinearScratch scratch{};
+  // The scratch table and sums already describe input (for example after
+  // fused RMSNorm). They must survive unchanged until this dispatch.
+  bool inputPrepared = false;
 };
 
 struct Q4DispatchStats final {
@@ -122,7 +160,15 @@ class Q4Linear final {
 public:
   explicit Q4Linear(const DeviceCapabilities &device) noexcept;
 
+  // One lane: at most 3 tiles * 4 group counts, 2 split tiles, 2 paired
+  // N256 grids, and 4 Apple9 simdgroup K splits (including its baseline):
+  // 3 * 4 + 2 + 2 + 4 = 20. Other families have no simdgroup candidates
+  // and at most one additional baseline (17). M24 replaces Paired128 with
+  // N128/four-simdgroup candidates, and has no one-lane tiles (at most 13).
+  static constexpr std::size_t kMaximumCandidates = 20;
+
   [[nodiscard]] LinearPlan plan(LinearWorkload workload) const;
+  [[nodiscard]] LinearScratchSize decodeScratchSize(LinearWorkload workload) const;
   [[nodiscard]] static LinearPlan plan(LinearWorkload workload, LinearConfig config);
   [[nodiscard]] std::vector<LinearPlan> candidates(LinearWorkload workload) const;
   // Installed only at startup; encoding does a read-only lookup, never tuning.
@@ -154,23 +200,27 @@ public:
 
   void addDecode(metal::CommandGraph &graph,
                  metal::MetalBuffer input, const Q4Projection &projection,
-                 metal::MetalBuffer output, LinearMatrix matrix) const;
+                 metal::MetalBuffer output, LinearMatrix matrix,
+                 LinearScratch scratch = {}) const;
   void addDecodeBatch(metal::CommandGraph &graph,
                       metal::MetalBuffer input,
                       const Q4Projection &projection,
                       metal::MetalBuffer output, LinearMatrix matrix,
-                      uint32_t lanes, Q4DispatchStats &stats) const;
+                      uint32_t lanes, Q4DispatchStats &stats,
+                      LinearScratch scratch = {}, bool inputPrepared = false) const;
   void addGateUpBatch(metal::CommandGraph &graph, metal::MetalBuffer input,
                       const Q4Projection &gate, const Q4Projection &up,
                       metal::MetalBuffer gateScratch,
                       metal::MetalBuffer output, LinearMatrix matrix,
-                      uint32_t lanes, Q4DispatchStats &stats) const;
+                      uint32_t lanes, Q4DispatchStats &stats,
+                      LinearScratch scratch = {}, bool inputPrepared = false) const;
   void addResidualBatch(metal::CommandGraph &graph,
                         metal::MetalBuffer input,
                         const Q4Projection &projection,
                         metal::MetalBuffer residual,
                         metal::MetalBuffer output, LinearMatrix matrix,
-                        uint32_t lanes, Q4DispatchStats &stats) const;
+                        uint32_t lanes, Q4DispatchStats &stats,
+                        LinearScratch scratch = {}, bool inputPrepared = false) const;
 
 private:
   [[nodiscard]] LinearConfig baseline(LinearWorkload workload) const;

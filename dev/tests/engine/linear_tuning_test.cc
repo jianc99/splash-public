@@ -43,7 +43,8 @@ void cpuContracts() {
                   "fixture does not cover input/output/reference or physical alignment");
           for (const auto &plan : plans)
             require(bytes >= base + plan.sumsBytes() + plan.gateScratchBytes() +
-                2 * plan.downSumsBytes(), "fixture misses a candidate workspace");
+                2 * plan.downSumsBytes() + plan.scratchSize().bytes(),
+                "fixture misses a candidate workspace");
           auto denied = device;
           denied.maxBufferLengthBytes = bytes - 1;
           rejects([&] { (void)linearTuningFixtureBytes(denied, workload); });
@@ -186,6 +187,13 @@ void gpuSweep(metal::MetalBackend &backend, std::span<const Q4Projection> projec
     weightsBefore.push_back(fingerprint(weights));
   }
   const auto plans = Q4Linear(backend.capabilities()).candidates(workload);
+  // A gate/up sweep mixing split-K and sequential plans computes the exact
+  // gate and up projections once per representative, outside the timing.
+  bool mixed = false;
+  for (const auto &plan : plans) mixed |= plan.partialSums() != plans.front().partialSums() ||
+      plan.usesSimdgroup() || plans.front().usesSimdgroup();
+  const uint64_t referenceSubmissions =
+      mixed && epilogue == LinearEpilogue::GateUp ? projections.size() : 0;
   const uint64_t before = backend.submissionCount();
   const uint64_t allocated = backend.memoryStats().allocatedBytes;
   size_t admissions = 0;
@@ -207,7 +215,7 @@ void gpuSweep(metal::MetalBackend &backend, std::span<const Q4Projection> projec
       "timed batch does not cover a bounded complete representative ring");
   require(result.measurements.size() + 1 == plans.size(), "candidate measurement missing");
   require(backend.submissionCount() - before == plans.size() * (projections.size() + 1) +
-      (plans.size() - 1) * 2 * (options.warmupPairs + options.samplePairs),
+      (plans.size() - 1) * 2 * (options.warmupPairs + options.samplePairs) + referenceSubmissions,
       "sweep did not time one full production command per invocation");
   require(backend.memoryStats().allocatedBytes == allocated, "fixture allocation leaked");
   for (size_t i = 0; i < projections.size(); ++i)
@@ -325,6 +333,20 @@ void gpuBatchEquivalence(metal::MetalBackend &backend,
       allocate(epilogue == LinearEpilogue::Residual ?
           uint64_t{baseline.storageRows()} * workload.matrix.outputSize * 2 : 0),
       allocate(baseline.gateScratchBytes()), allocate(baseline.downSumsBytes())};
+  LinearScratchSize scratch;
+  // This fixture runs every candidate, whose K split count can require more
+  // partials than the default. Match the production tuner's field maxima.
+  for (const auto &plan : plans) {
+    const auto needed = plan.scratchSize();
+    scratch.input = std::max(scratch.input, needed.input);
+    scratch.sums = std::max(scratch.sums, needed.sums);
+    scratch.partials = std::max(scratch.partials, needed.partials);
+    scratch.counters = std::max(scratch.counters, needed.counters);
+  }
+  buffers.scratch = {allocate(scratch.input), allocate(scratch.sums),
+                     allocate(scratch.partials), allocate(scratch.counters)};
+  if (buffers.scratch.counters)
+    std::memset(buffers.scratch.counters.contents(), 0, scratch.counters);
   const auto fill = [&](const metal::MetalBuffer &buffer, uint32_t width, uint32_t seed) {
     auto *values = static_cast<uint16_t *>(buffer.contents());
     for (uint64_t i = 0; i < buffer.sizeBytes() / 2; ++i)
@@ -368,11 +390,11 @@ void gpuBatchEquivalence(metal::MetalBackend &backend,
   const auto immutableResidual = snapshot(buffers.residual);
   for (uint32_t repetitions : {1U, uint32_t(projections.size()), 16U}) {
     const uint32_t last = (repetitions - 1) % projections.size();
-    (void)invoke(baseline, last, 1);
-    const auto expected = snapshot(buffers.output);
-    const auto expectedSums = snapshot(buffers.downSums);
-    const auto expectedGate = snapshot(buffers.gateScratch);
     for (const auto &plan : plans) {
+      (void)invoke(plan, last, 1);
+      const auto expected = snapshot(buffers.output);
+      const auto expectedSums = snapshot(buffers.downSums);
+      const auto expectedGate = snapshot(buffers.gateScratch);
       (void)invoke(plan, 0, repetitions);
       require(same(buffers.output, expected) && same(buffers.downSums, expectedSums),
               "repeated whole operator differs from isolated last representative");
@@ -436,6 +458,17 @@ int main(int argc, char **argv) {
     std::array gate{projection(backend, {10240, 256}), projection(backend, {10240, 256}, 131)};
     for (uint32_t rows : {8U, 16U, 24U, 32U})
       gpuSweep(backend, gate, rows, LinearPhase::Decode, LinearEpilogue::GateUp);
+    // K % 1024 == 0 lists the split-K tiles beside the sequential ones (and
+    // selects one as the baseline on a GPU with two or more cores), so every
+    // qualification crosses the bitwise class and runs the derived bound.
+    std::array split{projection(backend, {512, 1024}), projection(backend, {512, 1024}, 131)};
+    bool mixedClasses = false;
+    for (const auto &plan : Q4Linear(backend.capabilities()).candidates({{512, 1024}, 8}))
+      mixedClasses |= plan.partialSums() > 1;
+    require(mixedClasses, "split-K candidates are missing for a K % 1024 == 0 workload");
+    for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual,
+                               LinearEpilogue::GateUp})
+      gpuSweep(backend, split, 8, LinearPhase::Decode, epilogue);
     std::vector<Q4Projection> maximum;
     for (uint32_t i = 0; i < kMaximumLinearTuningRepresentatives; ++i)
       maximum.push_back(projection(backend, {512, 256}, 1009 + i));

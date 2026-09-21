@@ -3,8 +3,8 @@
 //   decode-profile METALLIB MODEL_ROOT [--prompt-tokens N] [--cycles K]
 //
 // Drives the real model runtime with Metal dispatch profiling enabled, so
-// every dispatch of a packed prefill command, a B1 DFlash cycle, and a B4
-// DFlash cycle is replayed as its own command and attributed to its pipeline.
+// every dispatch of a packed prefill command and B1 through B4 DFlash cycles
+// is replayed as its own command and attributed to its pipeline.
 // The fused (unprofiled) GPU time of the same work is reported alongside, so
 // the gap between the sum of parts and the fused command shows how much a
 // cycle pays in dispatch boundaries rather than kernel work.
@@ -294,10 +294,12 @@ int main(int argc, char **argv) {
         print(title, table, cycles, median.gpuSeconds);
       };
       profileWidth("B1 decode cycle", std::span<Lane>(&lanes[0], 1));
-      // B4 decode cycles: three more lanes over the same prompt.
-      for (uint32_t index = 1; index < lanes.size(); ++index)
+      // Add one lane at a time so M16 and M24 paths are measured too.
+      for (uint32_t index = 1; index < lanes.size(); ++index) {
         prefill(executor, lanes[index], prompt);
-      profileWidth("B4 decode cycle", lanes);
+        const std::string title = "B" + std::to_string(index + 1) + " decode cycle";
+        profileWidth(title.c_str(), std::span<Lane>(lanes.data(), index + 1));
+      }
 
       for (Lane &lane : lanes)
         executor.end(lane.id);

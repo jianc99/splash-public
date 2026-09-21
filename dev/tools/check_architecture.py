@@ -19,7 +19,8 @@ OPERATOR_WORKSPACE_POLICY = re.compile(
     r"narrowAffineKind|narrowResidualKind|headKind|gdnInputGroups|"
     r"attentionGroups|addPrefill128|LinearTile|LinearConfig|LinearSimdgroups|"
     r"PrefillSplitMultiplier|PrefillAttentionConfig|VerifySplitCount|"
-    r"VerifyAttentionConfig|AttentionScalePlacement|MoeExpertTile|MoeConfig|"
+    r"VerifyAttentionConfig|AttentionScalePlacement|MoeExpertTile|"
+    r"MoeExpertSimdgroups|MoeConfig|"
     r"DraftAttentionConfiguration|selectorShards)\b"
 )
 

@@ -443,7 +443,7 @@ void QwenTarget::addVerifyImpl(
     metal::MetalBuffer input = buffers.hidden[layerIndex & 1];
     metal::MetalBuffer output = buffers.hidden[(layerIndex & 1) ^ 1];
     ops::Normalization::addRms(graph, input, layer.inputNorm,
-                               buffers.normalized, geometry_.hiddenSize, rows);
+                               buffers.normalized, geometry_.hiddenSize, rows, buffers.linearScratch);
 
     metal::MetalBuffer residual;
     std::visit(
@@ -452,7 +452,7 @@ void QwenTarget::addVerifyImpl(
             operators_.linear().addDecodeBatch(graph,
                                buffers.normalized, mixer.inputProjection,
                                buffers.gdnPacked[gdnIndex], gdnInput, lanes,
-                               stats);
+                               stats, buffers.linearScratch, true);
             ops::GDN::addDecode(
                 graph,
                 {buffers.gdnPacked[gdnIndex], mixer.convolutionWeights,
@@ -460,7 +460,7 @@ void QwenTarget::addVerifyImpl(
                  buffers.gdnMixed[gdnIndex], mixer.decay, mixer.timeBias,
                  buffers.gdnDecay[gdnIndex], buffers.gdnBeta[gdnIndex],
                  buffers.recurrent, mixer.mixerNorm, buffers.gdnHidden,
-                 buffers.arrived, buffers.generation},
+                 buffers.arrived, buffers.generation, buffers.linearScratch},
                 geometry_.gdnShape(), lanes, gdnIndex,
                 {geometry_.stateLayout.convolutionLayerBytes(),
                  geometry_.stateLayout.recurrentLayerBytes(),
@@ -468,14 +468,14 @@ void QwenTarget::addVerifyImpl(
             operators_.linear().addResidualBatch(
                 graph, buffers.gdnHidden,
                 mixer.outputProjection, input, buffers.gdnOutput, mixerOutput,
-                lanes, stats);
+                lanes, stats, buffers.linearScratch, true);
             residual = buffers.gdnOutput;
             ++gdnIndex;
           } else {
             operators_.linear().addDecodeBatch(graph,
                                buffers.normalized, mixer.inputProjection,
                                buffers.fullPacked, attentionInput, lanes,
-                               stats);
+                               stats, buffers.linearScratch, true);
             ops::PagedAttention::addVerifyProjection(
                 graph, buffers.fullPacked, mixer.queryNorm, mixer.keyNorm,
                 buffers.ropeCos, buffers.ropeSin, buffers.fullQueries,
@@ -494,11 +494,11 @@ void QwenTarget::addVerifyImpl(
                 graph, buffers.fullPacked, buffers.fullAttention,
                 buffers.attentionHidden, ExecutionLimits::targetVerifyRows,
                 tileRows, tileRows, geometry_.attentionQueryHeads,
-                geometry_.kvLayout, lanes);
+                geometry_.kvLayout, lanes, buffers.linearScratch);
             operators_.linear().addResidualBatch(
                 graph, buffers.attentionHidden,
                 mixer.outputProjection, input, buffers.attentionOutput,
-                mixerOutput, lanes, stats);
+                mixerOutput, lanes, stats, buffers.linearScratch, true);
             residual = buffers.attentionOutput;
             ++attentionIndex;
           }
@@ -506,16 +506,16 @@ void QwenTarget::addVerifyImpl(
         layer.mixer);
 
     ops::Normalization::addRms(graph, residual, layer.postAttentionNorm,
-                               buffers.normalized, geometry_.hiddenSize, rows);
+                               buffers.normalized, geometry_.hiddenSize, rows, buffers.linearScratch);
     if constexpr (hasDenseFfn<std::remove_cvref_t<decltype(layer)>>) {
       const ops::LinearMatrix up{geometry_.denseIntermediateSize, geometry_.hiddenSize};
       const ops::LinearMatrix down{geometry_.hiddenSize, geometry_.denseIntermediateSize};
       operators_.linear().addGateUpBatch(graph, buffers.normalized, layer.gateProjection,
                          layer.upProjection, buffers.denseGateScratch,
-                         buffers.denseIntermediate, up, lanes, stats);
+                         buffers.denseIntermediate, up, lanes, stats, buffers.linearScratch, true);
       operators_.linear().addResidualBatch(
           graph, buffers.denseIntermediate,
-          layer.downProjection, residual, output, down, lanes, stats);
+          layer.downProjection, residual, output, down, lanes, stats, buffers.linearScratch);
     } else {
       ops::MoE::add(
           graph,
@@ -545,18 +545,18 @@ void QwenTarget::addVerifyImpl(
                              std::visit([](const auto *value) {
                                return value->finalNorm;
                              }, weights_),
-                             buffers.finalHidden, geometry_.hiddenSize, rows);
+                             buffers.finalHidden, geometry_.hiddenSize, rows, buffers.linearScratch);
   const ops::LinearMatrix head{geometry_.vocabularySize, geometry_.hiddenSize};
   operators_.linear().addDecodeBatch(graph, buffers.finalHidden,
                      vocabularyProjection(), buffers.logits, head, lanes,
-                     stats);
+                     stats, buffers.linearScratch, true);
 }
 
 void QwenTarget::addHead(metal::CommandGraph &graph,
                          metal::MetalBuffer hidden,
                          metal::MetalBuffer finalHidden,
                          metal::MetalBuffer logits,
-                         uint32_t normalizedRows) const {
+                         uint32_t normalizedRows, ops::LinearScratch scratch) const {
   if (!normalizedRows ||
       normalizedRows > ExecutionLimits::targetVerifyRows) {
     throw std::invalid_argument("invalid Qwen head row count");
@@ -568,7 +568,7 @@ void QwenTarget::addHead(metal::CommandGraph &graph,
   const ops::LinearMatrix head{geometry_.vocabularySize, geometry_.hiddenSize};
   operators_.linear().addDecode(graph,
                 std::move(finalHidden), vocabularyProjection(),
-                std::move(logits), head);
+                std::move(logits), head, scratch);
 }
 
 void QwenTarget::addEmbedding(metal::CommandGraph &graph,

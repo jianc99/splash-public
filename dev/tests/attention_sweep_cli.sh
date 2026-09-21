@@ -30,9 +30,10 @@ done
 for value in typo '' '27b,' '27b,typo' ',35b'; do
     reject '--shapes takes 27b or 35b' --shapes "$value"
 done
-for option in --histories --lanes --repeat --shapes; do
+for option in --histories --lanes --repeat --shapes --phases --compare-metallib; do
     reject "$option requires a value" "$option"
 done
+reject '--phases takes both, verify or prefill' --phases typo
 reject 'unknown option --unknown' --unknown 1
 # Valid values must reach the final sentinel, still without opening Metal.
 reject 'unknown option --sentinel' \

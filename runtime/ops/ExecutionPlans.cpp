@@ -114,7 +114,8 @@ bool MoeWorkload::operator==(const MoeWorkload &other) const noexcept {
 
 ExecutionPlans::ExecutionPlans(const DeviceCapabilities &device)
     : linear_(device), baselineLinear_(device),
-      moeRouteWideRows_(moeRouteWideRows(device.gpuCoreCount)) {}
+      moeRouteWideRows_(moeRouteWideRows(device.gpuCoreCount)),
+      moeDecodeSimdgroups_(moeDecodeSimdgroups(device.appleGpuFamily)) {}
 
 void ExecutionPlans::install(const OperatorChoices &choices) {
   OperatorChoices pending = choices;
@@ -189,6 +190,9 @@ MoePlan ExecutionPlans::moePrefill(MoeShape shape, uint32_t rows) const {
       configurationFor(choices_.moe, MoeWorkload{shape, rows, MoePhase::Prefill},
                        MoeConfig{MoeExpertTile::M32});
   config.routeWideRows = moeRouteWideRows_;
+  // The four-simdgroup 8-row tiles are measured at decode occupancy only; a
+  // prefill chunk's much larger expert grid keeps the shipped tile.
+  config.m8Simdgroups = MoeExpertSimdgroups::Eight;
   return MoE::prefillPlan(shape, rows, config);
 }
 
@@ -200,6 +204,7 @@ MoePlan ExecutionPlans::moeDecode(MoeShape shape, uint32_t lanes) const {
       choices_.moe, MoeWorkload{shape, lanes * kDecodeRows, MoePhase::Decode},
       MoeConfig{MoeExpertTile::M8});
   config.routeWideRows = moeRouteWideRows_;
+  config.m8Simdgroups = moeDecodeSimdgroups_;
   return MoE::decodePlan(shape, lanes, config);
 }
 
@@ -209,7 +214,7 @@ std::array<MoePlan, 2> ExecutionPlans::moeCandidates(const MoeWorkload &workload
   if (workload.phase != MoePhase::Decode || workload.rows % kDecodeRows)
     throw std::invalid_argument("invalid MoE candidate workload");
   return MoE::decodeCandidates(workload.shape, workload.rows / kDecodeRows,
-                               moeRouteWideRows_);
+                               moeRouteWideRows_, moeDecodeSimdgroups_);
 }
 
 AttentionWorkspace ExecutionPlans::prefillAttentionWorkspace(

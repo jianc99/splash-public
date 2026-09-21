@@ -1,5 +1,7 @@
 #include "tuning/LinearTuning.hpp"
 
+#include "tuning/LinearNumerics.hpp"
+
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -7,15 +9,20 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 
 namespace splash::ops::tuning {
 namespace {
 
 using Clock = std::chrono::steady_clock;
+// ReferenceGate/ReferenceUp hold the exact gate and up projections a split-K
+// gate/up plan is held to; they exist only when the candidates mix split-K
+// and sequential tiles for a gate/up workload.
 enum Field : size_t {
   Input, Output, Sums, Residual, GateScratch, DownSums,
-  ReferenceOutput, ReferenceDownSums, FieldCount
+  ReferenceOutput, ReferenceDownSums, ReferenceGate, ReferenceUp,
+  PreparedInput, PreparedSums, Partials, Counters, FieldCount
 };
 struct Region final { uint64_t offset = 0, bytes = 0; };
 struct Layout final {
@@ -41,6 +48,11 @@ Layout layout(const DeviceCapabilities &device,
   if (workload.epilogue == LinearEpilogue::Residual)
     result.fields[Residual].bytes = result.fields[Output].bytes;
   for (const auto &plan : plans) {
+    const auto scratch = plan.scratchSize();
+    for (auto [field, bytes] : {std::pair{PreparedInput, scratch.input},
+                               {PreparedSums, scratch.sums}, {Partials, scratch.partials},
+                               {Counters, scratch.counters}})
+      result.fields[field].bytes = std::max(result.fields[field].bytes, bytes);
     result.fields[Sums].bytes = std::max(result.fields[Sums].bytes, plan.sumsBytes());
     result.fields[GateScratch].bytes =
         std::max(result.fields[GateScratch].bytes, plan.gateScratchBytes());
@@ -48,6 +60,13 @@ Layout layout(const DeviceCapabilities &device,
         std::max(result.fields[DownSums].bytes, plan.downSumsBytes());
   }
   result.fields[ReferenceDownSums].bytes = result.fields[DownSums].bytes;
+  bool mixed = false;
+  for (const auto &plan : plans)
+    mixed |= plan.partialSums() != plans.front().partialSums() ||
+        plan.usesSimdgroup() || plans.front().usesSimdgroup();
+  if (mixed && workload.epilogue == LinearEpilogue::GateUp)
+    result.fields[ReferenceGate].bytes = result.fields[ReferenceUp].bytes =
+        result.fields[Output].bytes;
   for (auto &field : result.fields) {
     field.offset = align(result.bytes, 256);
     if (field.bytes > std::numeric_limits<uint64_t>::max() - field.offset)
@@ -100,6 +119,37 @@ void poisonFloat(metal::MetalBuffer buffer) {
   auto *values = static_cast<float *>(buffer.contents());
   std::fill_n(values, buffer.sizeBytes() / 4, std::numeric_limits<float>::quiet_NaN());
 }
+// A split-K plan and a sequential plan are not bitwise comparable, so every
+// output element is held to the derived bound instead (LinearNumerics.hpp),
+// with the sequential plan's output as the reference whichever side it is.
+void requireWithinSplitTolerance(LinearWorkload workload, const metal::MetalBuffer &exact,
+                                 const metal::MetalBuffer &split,
+                                 const metal::MetalBuffer &residual,
+                                 const metal::MetalBuffer &gate,
+                                 const metal::MetalBuffer &up, float operandSlack = 0) {
+  const auto values = [](const metal::MetalBuffer &buffer) {
+    return buffer ? static_cast<const uint16_t *>(buffer.contents()) : nullptr;
+  };
+  const auto *exactValues = values(exact);
+  const auto *splitValues = values(split);
+  const auto *residualValues = values(residual);
+  const auto *gateValues = values(gate);
+  const auto *upValues = values(up);
+  const uint64_t elements = uint64_t{workload.rows} * workload.matrix.outputSize;
+  float maxAbs = 0;
+  for (uint64_t i = 0; i < elements; ++i)
+    maxAbs = std::max(maxAbs, std::fabs(bf16ToFloat(exactValues[i])));
+  const float slack = reassociationSlack(workload.matrix.inputSize, maxAbs) + operandSlack;
+  for (uint64_t i = 0; i < elements; ++i) {
+    SplitReference reference{bf16ToFloat(exactValues[i])};
+    if (residualValues) reference.residual = bf16ToFloat(residualValues[i]);
+    if (gateValues) reference.gate = bf16ToFloat(gateValues[i]);
+    if (upValues) reference.up = bf16ToFloat(upValues[i]);
+    if (!withinSplitTolerance(bf16ToFloat(splitValues[i]), workload.epilogue, reference, slack))
+      throw std::runtime_error("Linear tuning split-K candidate output exceeds its bf16 tolerance");
+  }
+}
+
 void requireFinite(metal::MetalBuffer buffer, bool floats) {
   if (!buffer) return;
   if (floats) {
@@ -175,7 +225,9 @@ LinearTuningResult tuneLinear(metal::MetalBackend &backend,
       if (fixture.fields[i].bytes)
         fields[i] = backend.view(backing, fixture.fields[i].offset, fixture.fields[i].bytes);
     LinearBuffers buffers{fields[Input], fields[Output], fields[Sums], fields[Residual],
-                          fields[GateScratch], fields[DownSums]};
+                          fields[GateScratch], fields[DownSums],
+                          {fields[PreparedInput], fields[PreparedSums], fields[Partials], fields[Counters]}};
+    if (fields[Counters]) std::memset(fields[Counters].contents(), 0, fields[Counters].sizeBytes());
     const auto workload = input.workload;
     initialize(buffers.input, uint64_t{workload.rows} * workload.matrix.inputSize, 1949);
     if (buffers.residual)
@@ -215,16 +267,47 @@ LinearTuningResult tuneLinear(metal::MetalBackend &backend,
           !std::isfinite(timing.wallSeconds) || timing.wallSeconds <= 0)
         throw std::runtime_error("Linear tuning qualification returned invalid timing");
     };
-    auto qualify = [&](bool baseline) {
+    // Gate/up mixes of split-K and sequential plans are held to the exact
+    // gate and up projections of the representative being qualified: one
+    // untimed submission per representative, before its candidates run.
+    const std::optional<LinearPlan> exactPlain = fields[ReferenceGate]
+        ? std::optional{Q4Linear::plan(
+              {workload.matrix, workload.rows, LinearPhase::Decode, LinearEpilogue::None},
+              {LinearTile::N128, workload.matrix.outputSize / 128})}
+        : std::nullopt;
+    float operandSlack = 0;
+    auto referenceGateUp = [&](uint32_t representative) {
+      if (fields[PreparedInput]) {
+        operandSlack = simdgroupSlack(workload, buffers.input, input.weights[representative].projection);
+        if (input.weights[representative].gate)
+          operandSlack = std::max(operandSlack, simdgroupSlack(workload, buffers.input, *input.weights[representative].gate));
+      }
+      if (!exactPlain) return;
+      const auto &weights = input.weights[representative];
+      metal::CommandGraph graph;
+      linear.add(graph, {buffers.input, fields[ReferenceGate], {}, {}, {}, {}},
+                 *weights.gate, *exactPlain);
+      linear.add(graph, {buffers.input, fields[ReferenceUp], {}, {}, {}, {}},
+                 weights.projection, *exactPlain);
+      (void)backend.submitCommand(graph.dispatches());
+    };
+    auto qualify = [&](size_t candidate, bool baseline) {
       requireFinite(buffers.output, false);
       requireFinite(buffers.downSums, true);
+      const bool mixed = plans[candidate].partialSums() != plans[0].partialSums() ||
+          plans[candidate].usesSimdgroup() || plans[0].usesSimdgroup();
       for (const auto pair : {std::pair{Output, ReferenceOutput},
                               std::pair{DownSums, ReferenceDownSums}}) {
         const auto &actual = fields[pair.first];
         const auto &reference = fields[pair.second];
         if (!actual) continue;
         if (baseline) std::memcpy(reference.contents(), actual.contents(), actual.sizeBytes());
-        else if (std::memcmp(reference.contents(), actual.contents(), actual.sizeBytes()))
+        else if (mixed && pair.first == Output) {
+          const bool baselineExact = plans[0].partialSums() == 1 && !plans[0].usesSimdgroup();
+          requireWithinSplitTolerance(workload, baselineExact ? reference : actual,
+                                      baselineExact ? actual : reference, buffers.residual,
+                                      fields[ReferenceGate], fields[ReferenceUp], operandSlack);
+        } else if (std::memcmp(reference.contents(), actual.contents(), actual.sizeBytes()))
           throw std::runtime_error("Linear tuning candidate output differs from baseline");
       }
     };
@@ -234,12 +317,14 @@ LinearTuningResult tuneLinear(metal::MetalBackend &backend,
     // matches a full model graph, which remains a caller-owned acceptance gate.
     double baselineGpuSeconds = 0;
     for (uint32_t representative = 0; representative < result.representativeCount; ++representative) {
+      if (!control()) return result;
+      referenceGateUp(representative);
       for (size_t i = 0; i < plans.size(); ++i) {
         if (!control()) return result;
         const auto timing = run(CandidateId{uint32_t(i)}, representative, 1);
         if (timing.underPressure || !control()) return result;
         requireTiming(timing);
-        qualify(i == 0);
+        qualify(i, i == 0);
         if (!i) baselineGpuSeconds += timing.gpuSeconds;
       }
     }
@@ -258,7 +343,7 @@ LinearTuningResult tuneLinear(metal::MetalBackend &backend,
       const auto timing = run(CandidateId{uint32_t(i)}, 0, result.repetitions);
       if (timing.underPressure || !control()) return result;
       requireTiming(timing);
-      qualify(false);
+      qualify(i, false);
     }
 
     result.measurements.reserve(plans.size() - 1);

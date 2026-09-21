@@ -1,5 +1,6 @@
 #include "metal/abi/KernelABI.h"
 #include "metal/kernels/common/gdn_primitives.h"
+#include "metal/kernels/common/q4_sgmatrix.h"
 
 // Decode threadgroups are 256 threads: one simdgroup per verify row in the
 // prologue, and in the scan the head's 128 state rows strided over the eight
@@ -319,7 +320,8 @@ inline void gdn_decode_batch_phase(
     device bfloat *gdn_hidden, device atomic_uint *arrived,
     device atomic_uint *generation, constant GDNDecodeBatchParams &params,
     uint2 group, uint thread_index, uint lane, uint simd_group,
-    threadgroup float *scratch, threadgroup bfloat *prepared) {
+    threadgroup float *scratch, threadgroup bfloat *prepared,
+    device bfloat *q4_table = nullptr, device float *q4_sums = nullptr) {
   constexpr uint Rows = SPLASH_TARGET_VERIFY_ROWS;
   constexpr uint ValueWidth = ValueHeads * HeadDim;
   uint batch = group.y;
@@ -365,46 +367,64 @@ inline void gdn_decode_batch_phase(
       lane_recurrent, packed, gdn_norm_weight, lane_hidden, Rows * ValueHeads,
       ValueHeads, params.packed_width, scratch, group.x, thread_index, lane,
       simd_group);
+  if (q4_table) {
+    // Each group owns this head for all eight rows. Publish its rounded
+    // outputs before the eight SIMD groups transpose one row each.
+    threadgroup_barrier(mem_flags::mem_device);
+    for (uint g = 0; g < HeadDim / 64; ++g) {
+      const uint column = group.x * HeadDim + g * 64 + 2 * lane;
+      const uint index = simd_group * ValueWidth + column;
+      q4sg::write_input(q4_table, q4_sums, column / 64, simd_group, lane,
+                        lane_hidden[index], lane_hidden[index + 1]);
+    }
+  }
   grid_completion(arrived[batch], generation[batch], ValueHeads,
                   thread_index);
 }
 
-#define GDN_DECODE_ENTRY(Name, KeyHeads, ValueHeads, HeadDim, ConvDim,         \
-                         RowsInFlight)                                         \
-  kernel void Name(                                                           \
-      device const bfloat *packed [[buffer(0)]],                              \
-      device const bfloat *conv_weights [[buffer(1)]],                        \
-      device const uchar *current0 [[buffer(2)]],                             \
-      device const uchar *current1 [[buffer(3)]],                             \
-      device const uchar *current2 [[buffer(4)]],                             \
-      device const uchar *current3 [[buffer(5)]],                             \
-      device uchar *next0 [[buffer(6)]], device uchar *next1 [[buffer(7)]],   \
-      device uchar *next2 [[buffer(8)]], device uchar *next3 [[buffer(9)]],   \
-      device bfloat *mixed [[buffer(10)]],                                    \
-      device const float *a_scale [[buffer(11)]],                             \
-      device const bfloat *dt_bias [[buffer(12)]],                            \
-      device float *decay [[buffer(13)]], device bfloat *beta [[buffer(14)]], \
-      device bfloat *recurrent [[buffer(15)]],                                \
-      device const bfloat *gdn_norm_weight [[buffer(16)]],                    \
-      device bfloat *gdn_hidden [[buffer(17)]],                               \
-      device atomic_uint *arrived [[buffer(18)]],                             \
-      device atomic_uint *generation [[buffer(19)]],                          \
-      constant GDNDecodeBatchParams &params [[buffer(20)]],                   \
-      uint2 group [[threadgroup_position_in_grid]],                           \
-      uint thread_index [[thread_index_in_threadgroup]],                      \
-      uint lane [[thread_index_in_simdgroup]],                                \
-      uint simd_group [[simdgroup_index_in_threadgroup]]) {                   \
-    threadgroup float scratch[kDecodeSimdgroups];                             \
-    threadgroup bfloat prepared[2 * SPLASH_TARGET_VERIFY_ROWS * HeadDim];   \
-    gdn_decode_batch_phase<KeyHeads, ValueHeads, HeadDim, ConvDim,            \
-                           RowsInFlight>(                                     \
-        packed, conv_weights, current0, current1, current2, current3, next0,  \
+#define GDN_DECODE_BUFFERS \
+    device const bfloat *packed [[buffer(0)]], \
+    device const bfloat *conv_weights [[buffer(1)]], \
+    device const uchar *current0 [[buffer(2)]], device const uchar *current1 [[buffer(3)]], \
+    device const uchar *current2 [[buffer(4)]], device const uchar *current3 [[buffer(5)]], \
+    device uchar *next0 [[buffer(6)]], device uchar *next1 [[buffer(7)]], \
+    device uchar *next2 [[buffer(8)]], device uchar *next3 [[buffer(9)]], \
+    device bfloat *mixed [[buffer(10)]], device const float *a_scale [[buffer(11)]], \
+    device const bfloat *dt_bias [[buffer(12)]], device float *decay [[buffer(13)]], \
+    device bfloat *beta [[buffer(14)]], device bfloat *recurrent [[buffer(15)]], \
+    device const bfloat *gdn_norm_weight [[buffer(16)]], device bfloat *gdn_hidden [[buffer(17)]], \
+    device atomic_uint *arrived [[buffer(18)]], device atomic_uint *generation [[buffer(19)]]
+#define GDN_DECODE_THREADS \
+    uint2 group [[threadgroup_position_in_grid]], \
+    uint thread_index [[thread_index_in_threadgroup]], \
+    uint lane [[thread_index_in_simdgroup]], uint simd_group [[simdgroup_index_in_threadgroup]]
+#define GDN_DECODE_BODY(KeyHeads, ValueHeads, HeadDim, ConvDim, Table, Sums) \
+    threadgroup float scratch[kDecodeSimdgroups]; \
+    threadgroup bfloat prepared[2 * SPLASH_TARGET_VERIFY_ROWS * HeadDim]; \
+    gdn_decode_batch_phase<KeyHeads, ValueHeads, HeadDim, ConvDim, 2>( \
+        packed, conv_weights, current0, current1, current2, current3, next0, \
         next1, next2, next3, mixed, a_scale, dt_bias, decay, beta, recurrent, \
-        gdn_norm_weight, gdn_hidden, arrived, generation, params, group,       \
-        thread_index, lane, simd_group, scratch, prepared);                   \
+        gdn_norm_weight, gdn_hidden, arrived, generation, params, group, \
+        thread_index, lane, simd_group, scratch, prepared, Table, Sums);
+#define GDN_DECODE_ENTRY(Name, KeyHeads, ValueHeads, HeadDim, ConvDim) \
+  kernel void Name(GDN_DECODE_BUFFERS, \
+      constant GDNDecodeBatchParams &params [[buffer(20)]], GDN_DECODE_THREADS) { \
+    GDN_DECODE_BODY(KeyHeads, ValueHeads, HeadDim, ConvDim, nullptr, nullptr) \
+  }
+#define GDN_DECODE_Q4_ENTRY(Name, KeyHeads, ValueHeads, HeadDim, ConvDim) \
+  kernel void Name(GDN_DECODE_BUFFERS, \
+      device bfloat *q4_table [[buffer(20)]], device float *q4_sums [[buffer(21)]], \
+      constant GDNDecodeBatchParams &params [[buffer(22)]], GDN_DECODE_THREADS) { \
+    GDN_DECODE_BODY(KeyHeads, ValueHeads, HeadDim, ConvDim, q4_table, q4_sums) \
   }
 
 // Two rows overlap reductions and arithmetic without the register cost of four.
-GDN_DECODE_ENTRY(verify_gdn_fused, 16, 48, 128, 10240, 2)
-GDN_DECODE_ENTRY(verify_gdn_fused_vh32, 16, 32, 128, 8192, 2)
+GDN_DECODE_ENTRY(verify_gdn_fused, 16, 48, 128, 10240)
+GDN_DECODE_ENTRY(verify_gdn_fused_vh32, 16, 32, 128, 8192)
+GDN_DECODE_Q4_ENTRY(verify_gdn_fused_q4, 16, 48, 128, 10240)
+GDN_DECODE_Q4_ENTRY(verify_gdn_fused_q4_vh32, 16, 32, 128, 8192)
 #undef GDN_DECODE_ENTRY
+#undef GDN_DECODE_Q4_ENTRY
+#undef GDN_DECODE_BODY
+#undef GDN_DECODE_THREADS
+#undef GDN_DECODE_BUFFERS

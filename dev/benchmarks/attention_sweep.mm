@@ -7,7 +7,8 @@
 // timings, not a correctness oracle (the tuning tests are).
 //
 // usage: attention-sweep METALLIB [--histories 0,2048,...] [--shapes 27b,35b]
-//                        [--lanes 1,4] [--repeat N]
+//                        [--lanes 1,4] [--repeat N] [--phases both|verify|prefill]
+//                        [--compare-metallib PATH]
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
 #include "ops/ExecutionPlans.hpp"
@@ -21,6 +22,7 @@
 #include <iostream>
 #include <limits>
 #include <map>
+#include <memory>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -267,28 +269,47 @@ double median(std::vector<double> values) {
   return values[values.size() / 2];
 }
 
-Case measure(metal::MetalBackend &backend, const Plan &plan, uint32_t repeat) {
-  Fixture fixture(backend, plan);
-  const metal::CommandGraph graph = fixture.graph();
-  Case result;
-  result.int8Bytes = fixture.historyBytesInt8();
-  for (uint32_t i = 0; i < 2; ++i) static_cast<void>(backend.submitCommand(graph.dispatches()));
-  std::vector<double> fused;
-  for (uint32_t i = 0; i < repeat; ++i)
-    fused.push_back(backend.submitCommand(graph.dispatches()).gpuSeconds * 1000.0);
-  result.fusedMilliseconds = median(fused);
-  std::map<std::string, std::vector<double>> perPipeline;
-  backend.setDispatchProfiling(true);
-  for (uint32_t i = 0; i < repeat; ++i) {
-    static_cast<void>(backend.submitCommand(graph.dispatches()));
-    std::map<std::string, double> run;
-    for (const metal::DispatchTiming &timing : backend.takeDispatchProfile())
-      run[timing.pipelineName] += timing.gpuSeconds * 1000.0;
-    for (const auto &[name, milliseconds] : run) perPipeline[name].push_back(milliseconds);
+std::vector<Case> measure(std::span<metal::MetalBackend *> backends,
+                          const Plan &plan, uint32_t repeat) {
+  std::vector<std::unique_ptr<Fixture>> fixtures;
+  std::vector<metal::CommandGraph> graphs;
+  std::vector<Case> results(backends.size());
+  for (size_t i = 0; i < backends.size(); ++i) {
+    fixtures.push_back(std::make_unique<Fixture>(*backends[i], plan));
+    graphs.push_back(fixtures.back()->graph());
+    results[i].int8Bytes = fixtures.back()->historyBytesInt8();
   }
-  backend.setDispatchProfiling(false);
-  for (auto &[name, samples] : perPipeline) result.pipelineMilliseconds[name] = median(samples);
-  return result;
+  // Warm every variant, then alternate order to limit clock/thermal drift.
+  double warmup = 0.0;
+  while (warmup < 0.1)
+    for (size_t i = 0; i < backends.size(); ++i)
+      warmup += backends[i]->submitCommand(graphs[i].dispatches()).gpuSeconds;
+  std::vector<std::vector<double>> fused(backends.size());
+  std::vector<std::map<std::string, std::vector<double>>> perPipeline(backends.size());
+  for (uint32_t round = 0; round < repeat; ++round)
+    for (size_t offset = 0; offset < backends.size(); ++offset) {
+      const size_t i = (round + offset) % backends.size();
+      fused[i].push_back(backends[i]->submitCommand(graphs[i].dispatches()).gpuSeconds * 1000.0);
+    }
+  for (auto *backend : backends) backend->setDispatchProfiling(true);
+  for (uint64_t round = 0; round <= repeat; ++round)
+    for (size_t offset = 0; offset < backends.size(); ++offset) {
+      const size_t i = (round + offset) % backends.size();
+      static_cast<void>(backends[i]->submitCommand(graphs[i].dispatches()));
+      std::map<std::string, double> run;
+      for (const auto &timing : backends[i]->takeDispatchProfile())
+        run[timing.pipelineName] += timing.gpuSeconds * 1000.0;
+      if (round)
+        for (const auto &[name, milliseconds] : run)
+          perPipeline[i][name].push_back(milliseconds);
+    }
+  for (size_t i = 0; i < backends.size(); ++i) {
+    backends[i]->setDispatchProfiling(false);
+    results[i].fusedMilliseconds = median(fused[i]);
+    for (auto &[name, samples] : perPipeline[i])
+      results[i].pipelineMilliseconds[name] = median(samples);
+  }
+  return results;
 }
 
 uint32_t parseCount(std::string_view text, uint32_t minimum, uint32_t maximum,
@@ -318,8 +339,8 @@ std::vector<uint32_t> parseList(const std::string &text, uint32_t minimum,
 }
 
 std::string json(const Case &item, const std::string &shape, uint32_t history,
-                 const std::string &kind, uint32_t lanes) {
-  std::string out = "{\"shape\":\"" + shape + "\",\"history\":" + std::to_string(history) +
+                 const std::string &kind, uint32_t lanes, size_t variant) {
+  std::string out = "{\"variant\":" + std::to_string(variant) + ",\"shape\":\"" + shape + "\",\"history\":" + std::to_string(history) +
                     ",\"kind\":\"" + kind + "\",\"lanes\":" + std::to_string(lanes) +
                     ",\"fused_ms\":" + std::to_string(item.fusedMilliseconds) +
                     ",\"int8_kv_bytes\":" + std::to_string(item.int8Bytes) + ",\"pipelines\":{";
@@ -337,13 +358,15 @@ int main(int argc, const char *argv[]) {
   try {
     if (argc < 2) {
       std::cerr << "usage: attention-sweep METALLIB [--histories LIST] [--shapes 27b,35b] "
-                   "[--lanes LIST] [--repeat N]\n";
+                   "[--lanes LIST] [--repeat N] [--phases both|verify|prefill] "
+                   "[--compare-metallib PATH]\n";
       return 64;
     }
     std::vector<uint32_t> histories{0, 2048, 8192, 16384, 32768, 65536, 131072};
     std::vector<uint32_t> lanes{1, 4};
     std::vector<std::string> shapes{"27b", "35b"};
     uint32_t repeat = 5;
+    std::string comparisonLibrary, phases = "both";
     for (int index = 2; index < argc; index += 2) {
       const std::string option(argv[index]);
       if (index + 1 >= argc)
@@ -355,6 +378,12 @@ int main(int argc, const char *argv[]) {
         lanes = parseList(argv[index + 1], 1, kMaximumLanes, option);
       else if (option == "--repeat")
         repeat = parseCount(argv[index + 1], 1, std::numeric_limits<uint32_t>::max(), option);
+      else if (option == "--compare-metallib") comparisonLibrary = argv[index + 1];
+      else if (option == "--phases") {
+        phases = argv[index + 1];
+        if (phases != "both" && phases != "verify" && phases != "prefill")
+          throw std::invalid_argument("--phases takes both, verify or prefill");
+      }
       else if (option == "--shapes") {
         shapes.clear();
         std::string text(argv[index + 1]);
@@ -372,6 +401,12 @@ int main(int argc, const char *argv[]) {
       } else throw std::invalid_argument("unknown option " + option);
     }
     metal::MetalBackend backend(argv[1]);
+    std::unique_ptr<metal::MetalBackend> comparison;
+    std::vector<metal::MetalBackend *> backends{&backend};
+    if (!comparisonLibrary.empty()) {
+      comparison = std::make_unique<metal::MetalBackend>(comparisonLibrary);
+      backends.push_back(comparison.get());
+    }
     std::cerr << "device " << backend.capabilities().deviceName << ", one attention layer, "
               << "Page32 Q8 KV, median of " << repeat << " fused graphs (ms)\n";
     std::cout << "{\"device\":\"" << backend.capabilities().deviceName << "\",\"cases\":[";
@@ -382,34 +417,20 @@ int main(int argc, const char *argv[]) {
       const std::string name = shape == "27b" ? "qwen3.8-27b" : "qwen3.6-35b-a3b";
       std::cerr << "\n" << name << "  (" << geometry.queryHeads << " query heads, "
                 << geometry.kvHeads << " KV heads, d=" << geometry.headDimension << ")\n";
-      std::cerr << "  history   prefill2048 fused | store | attention split | reduce   ";
-      for (uint32_t lane : lanes)
-        std::cerr << "| verify8 x" << lane << " fused | split | reduce ";
-      std::cerr << "\n";
       for (uint32_t history : histories) {
-        const Case prefill =
-            measure(backend, makePlan(geometry, true, 1, history), repeat);
-        const auto pick = [](const Case &item, const std::string &needle) {
-          double total = 0.0;
-          for (const auto &[pipeline, milliseconds] : item.pipelineMilliseconds)
-            if (pipeline.find(needle) != std::string::npos) total += milliseconds;
-          return total;
+        auto report = [&](bool prefill, uint32_t lane) {
+          const auto cases = measure(backends, makePlan(geometry, prefill, lane, history), repeat);
+          for (size_t i = 0; i < cases.size(); ++i) {
+            std::cout << (firstCase ? "" : ",")
+                      << json(cases[i], name, history, prefill ? "prefill" : "verify", lane, i);
+            firstCase = false;
+            std::cerr << history << " " << (prefill ? "prefill" : "verify")
+                      << " lanes=" << lane << " variant=" << i << " fused="
+                      << cases[i].fusedMilliseconds << " ms\n";
+          }
         };
-        std::cerr << "  " << history << "\t" << prefill.fusedMilliseconds << " | "
-                  << pick(prefill, "store") << " | " << pick(prefill, "_q8_split") << " | "
-                  << pick(prefill, "_q8_reduce") << "   ";
-        std::cout << (firstCase ? "" : ",") << json(prefill, name, history, "prefill", 1);
-        firstCase = false;
-        VerifyAttentionConfig configuration;
-        for (uint32_t lane : lanes) {
-          const Case verify = measure(
-              backend, makePlan(geometry, false, lane, history, configuration),
-              repeat);
-          std::cerr << "| " << verify.fusedMilliseconds << " | " << pick(verify, "_q8_split")
-                    << " | " << pick(verify, "_q8_reduce") << " ";
-          std::cout << "," << json(verify, name, history, "verify", lane);
-        }
-        std::cerr << "\n";
+        if (phases != "verify") report(true, 1);
+        if (phases != "prefill") for (uint32_t lane : lanes) report(false, lane);
       }
     }
     std::cout << "]}\n";

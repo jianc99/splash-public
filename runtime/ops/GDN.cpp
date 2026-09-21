@@ -75,13 +75,20 @@ void GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffers,
   const KernelLayout kernel = kernelShape(shape);
   std::vector<metal::MetalBuffer> bindings{buffers.packed,
                                            buffers.convolutionWeights};
-  bindings.reserve(20);
+  const bool prepare = lanes == 1 && buffers.linearScratch.input;
+  const uint64_t outputWidth = uint64_t{shape.valueHeads} * shape.headDimension;
+  if (prepare && (buffers.linearScratch.input.sizeBytes() < outputWidth * 16 ||
+                  buffers.linearScratch.sums.sizeBytes() < outputWidth / 2))
+    throw std::invalid_argument("Q4 GDN preparation scratch is below requirement");
+  bindings.reserve(prepare ? 22 : 20);
   appendLaneBindings(bindings, buffers.currentStates, buffers.nextStates);
   bindings.insert(bindings.end(),
                   {buffers.mixed, buffers.decayWeights, buffers.timeBias,
                    buffers.decay, buffers.beta, buffers.recurrent,
                    buffers.mixerNorm, buffers.hidden, buffers.arrived,
                    buffers.generation});
+  if (prepare)
+    bindings.insert(bindings.end(), {buffers.linearScratch.input, buffers.linearScratch.sums});
   const GDNDecodeBatchParams params{0,
                                     shape.packedWidth,
                                     lanes,
@@ -89,7 +96,8 @@ void GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffers,
                                     state.convolutionLayerBytes,
                                     state.recurrentLayerBytes,
                                     state.convolutionStateBytes};
-  graph.add(kernelName(kernel, "verify_gdn_fused", "verify_gdn_fused_vh32"),
+  graph.add(prepare ? kernelName(kernel, "verify_gdn_fused_q4", "verify_gdn_fused_q4_vh32")
+                    : kernelName(kernel, "verify_gdn_fused", "verify_gdn_fused_vh32"),
             std::move(bindings), params, {shape.valueHeads, lanes, 1});
 }
 

@@ -321,10 +321,41 @@ uint64_t decodeArenaBaseBytes(const RuntimeGeometry &geometry,
   return bytes;
 }
 
+ops::LinearScratchSize DecodeArena::linearScratchSize(
+    const RuntimeGeometry &geometry, const ops::ExecutionPlans &operators) {
+  const auto &t = geometry.target;
+  const auto &d = geometry.draft;
+  ops::LinearScratchSize result;
+  const auto include = [&](ops::LinearMatrix matrix) {
+    if (!matrix.outputSize || !matrix.inputSize) return;
+    for (auto epilogue : {ops::LinearEpilogue::None, ops::LinearEpilogue::Residual,
+                          ops::LinearEpilogue::GateUp}) {
+      const auto size = operators.linear().decodeScratchSize(
+          {matrix, 8, ops::LinearPhase::Decode, epilogue});
+      result.input = std::max(result.input, size.input);
+      result.sums = std::max(result.sums, size.sums);
+      result.partials = std::max(result.partials, size.partials);
+      result.counters = std::max(result.counters, size.counters);
+    }
+  };
+  for (auto matrix : {ops::LinearMatrix{t.packedGdnWidth, t.hiddenSize},
+       {t.packedAttentionWidth, t.hiddenSize}, {t.hiddenSize, t.attentionWidth},
+       {t.denseIntermediateSize, t.hiddenSize}, {t.hiddenSize, t.denseIntermediateSize},
+       {t.vocabularySize, t.hiddenSize}, {d.dynamicSize, d.hiddenSize},
+       {d.qkvSize, d.hiddenSize}, {d.hiddenSize, d.attentionSize},
+       {d.intermediateSize, d.hiddenSize}, {d.hiddenSize, d.intermediateSize},
+       {d.vocabularySize, d.hiddenSize}, {d.selectorRank, d.hiddenSize},
+       {d.hiddenSize, d.targetHiddenSize}})
+    include(matrix);
+  return result;
+}
+
 uint64_t plannedDecodeBytes(const RuntimeGeometry &geometry,
                            const ops::ExecutionPlans &operators) {
   return checkedAdd(decodeArenaBaseBytes(geometry, operators),
-                    DecodeArena::gateScratchBytes(geometry, operators),
+                    checkedAdd(DecodeArena::gateScratchBytes(geometry, operators),
+                               DecodeArena::linearScratchSize(geometry, operators).bytes(),
+                               "Q4 decode scratch"),
                     "planned gate scratch");
 }
 

@@ -97,11 +97,39 @@ struct MoeWorkspace final {
 // tile.
 enum class MoeExpertTile : uint8_t { M8 = 8, M32 = 32 };
 
+// Simdgroups per 8-row expert tile: a device policy the execution plans set,
+// not a tuned choice. Eight is the shipped N128 tile for both projections.
+// Four halves the threadgroup to 128 threads and runs gate/up at N128 and
+// down at N256, for Apple9 decode plans: family 9 has no per-core matrix
+// unit, and a decode expert grid leaves it latency-bound at low occupancy.
+// Measured on a 40-core Apple9 GPU at the 35B shape (H=2048, E=256,
+// top_k=8, I=512), ms per layer at rows 8/16/24/32: gate/up
+// 0.332/0.551/0.728/0.859 -> 0.314/0.503/0.618/0.699 (1.06x-1.23x), down
+// 0.157/0.274/0.363/0.419 -> 0.137/0.226/0.297/0.335 (1.15x-1.25x). Apple10
+// variants had mixed results across shapes, so family 10
+// keeps eight. Smaller Apple9 core counts still need performance validation;
+// this family gate does not establish their optimum.
+// The 32-row tiles always run eight simdgroups. Either choice
+// writes bit-identical outputs and needs the same workspace; only the down
+// pass's column grid changes.
+enum class MoeExpertSimdgroups : uint8_t { Eight = 8, Four = 4 };
+
+// Families below 9 are rejected at startup; 10 and later keep the shipped
+// tile, as does an unknown family.
+[[nodiscard]] constexpr MoeExpertSimdgroups
+moeDecodeSimdgroups(uint32_t appleGpuFamily) noexcept {
+  return appleGpuFamily == 9 ? MoeExpertSimdgroups::Four
+                             : MoeExpertSimdgroups::Eight;
+}
+
 struct MoeConfig final {
   MoeExpertTile expertTile = MoeExpertTile::M32;
   // Rows from which the router uses the 32-row scores tile; the execution
   // plans derive it from the GPU core count.
   uint32_t routeWideRows = kMoeRouteWideRows;
+  // Simdgroups of the 8-row expert tiles; the execution plans derive it from
+  // the GPU family for decode plans and keep eight for prefill plans.
+  MoeExpertSimdgroups m8Simdgroups = MoeExpertSimdgroups::Eight;
   bool operator==(const MoeConfig &) const = default;
 };
 
@@ -161,11 +189,13 @@ struct MoE final {
       MoeShape shape, uint32_t lanes,
       MoeConfig config = {MoeExpertTile::M8});
   // Bounded precompiled candidates, shipped baseline first. ExecutionPlans
-  // supplies the device's router threshold to every expert-tile candidate.
+  // supplies the device's router threshold to every expert-tile candidate
+  // and its 8-row tile simdgroups to the decode candidates.
   [[nodiscard]] static std::array<MoePlan, 2>
   prefillCandidates(MoeShape shape, uint32_t rows, uint32_t routeWideRows);
   [[nodiscard]] static std::array<MoePlan, 2>
-  decodeCandidates(MoeShape shape, uint32_t lanes, uint32_t routeWideRows);
+  decodeCandidates(MoeShape shape, uint32_t lanes, uint32_t routeWideRows,
+                   MoeExpertSimdgroups m8Simdgroups = MoeExpertSimdgroups::Eight);
   static void add(metal::CommandGraph &graph, const MoeBuffers &buffers,
                   const MoeWeights &weights, const MoePlan &plan);
 };

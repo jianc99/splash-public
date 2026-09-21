@@ -79,6 +79,7 @@ struct DFlashDraftLayout final {
 };
 
 struct DFlashDecodeBuffers final {
+  ops::LinearScratch linearScratch{};
   std::array<metal::MetalBuffer, 2> hidden;
   metal::MetalBuffer normalized;
   metal::MetalBuffer dynamic;
@@ -103,6 +104,7 @@ struct DFlashDecodeBuffers final {
 };
 
 struct DFlashContextBuffers final {
+  ops::LinearScratch linearScratch{};
   metal::MetalBuffer capturedTargetHidden;
   metal::MetalBuffer projected;
   metal::MetalBuffer hidden;

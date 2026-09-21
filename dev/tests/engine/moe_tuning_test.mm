@@ -45,16 +45,22 @@ void devicePolicyPlans() {
         };
         const auto candidates = production.moeCandidates(workload);
         const auto baseline = lookup();
+        // Family 9 decode plans run the four-simdgroup 8-row tiles; prefill
+        // and every other family keep the shipped eight.
+        const auto simdgroups = workload.phase == MoePhase::Decode && family == 9
+            ? MoeExpertSimdgroups::Four : MoeExpertSimdgroups::Eight;
         require(candidates.front().config() == baseline.config() &&
                     baseline.config().expertTile == (workload.phase == MoePhase::Prefill
-                        ? MoeExpertTile::M32 : MoeExpertTile::M8),
+                        ? MoeExpertTile::M32 : MoeExpertTile::M8) &&
+                    baseline.config().m8Simdgroups == simdgroups,
                 "MoE measurement/reporting baseline differs from production");
         for (const auto &candidate : candidates) {
           const auto route = moeRouteTile(workload.rows, candidate.config().routeWideRows);
           const bool wide = workload.rows >= threshold;
           require(candidate.config().routeWideRows == threshold &&
-                      route.rows == (wide ? 32U : 8U) && route.experts == (wide ? 128U : 32U),
-                  "MoE candidate departed from device router policy");
+                      route.rows == (wide ? 32U : 8U) && route.experts == (wide ? 128U : 32U) &&
+                      candidate.config().m8Simdgroups == simdgroups,
+                  "MoE candidate departed from device router or expert-tile policy");
           OperatorChoices choices;
           choices.moe.push_back({workload, candidate.config()});
           production.install(choices);
@@ -66,11 +72,15 @@ void devicePolicyPlans() {
                   "installed MoE candidate differs from its measured plan");
           require(production.moeCandidates(workload).front().config() == baseline.config(),
                   "installed choice changed the shipped tuning baseline");
-          // Imported expert choices must retain this device's router policy.
+          // Imported expert choices must retain this device's router and
+          // expert-tile policy.
           choices.moe.front().configuration.routeWideRows = threshold + 1;
+          choices.moe.front().configuration.m8Simdgroups =
+              simdgroups == MoeExpertSimdgroups::Four ? MoeExpertSimdgroups::Eight
+                                                      : MoeExpertSimdgroups::Four;
           production.install(choices);
           require(lookup().config() == candidate.config(),
-                  "installed MoE choice overrode the device router threshold");
+                  "installed MoE choice overrode the device router or tile policy");
         }
       };
       for (uint32_t rows : {1U, 512U, 2048U, std::min(threshold - 1, 2048U),

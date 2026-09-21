@@ -71,6 +71,7 @@ class ArchitectureTests(unittest.TestCase):
             "VerifyAttentionConfig",
             "AttentionScalePlacement",
             "MoeExpertTile",
+            "MoeExpertSimdgroups",
             "MoeConfig",
             "DraftAttentionConfiguration",
             "selectorShards",

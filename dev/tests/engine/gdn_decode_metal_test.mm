@@ -566,6 +566,35 @@ void runDecode(MetalBackend &backend, const GdnShape &shape, uint32_t lanes) {
   }
 }
 
+void fusedPreparation(MetalBackend &backend, const GdnShape &shape) {
+  Fixture fixture(backend, shape, 1);
+  const uint32_t width = shape.valueHeads * shape.headDimension;
+  auto table = backend.allocateBuffer(width * 16);
+  auto sums = backend.allocateBuffer(width / 2);
+  auto referenceTable = backend.allocateBuffer(width * 16);
+  auto referenceSums = backend.allocateBuffer(width / 2);
+  CommandGraph reference;
+  GDN::addDecode(reference, fixture.decodeBuffers(0), shape, 1, 0, fixture.cell.strides());
+  reference.add("decode_linear_q4_prepare", {fixture.hidden, referenceTable, referenceSums},
+                width, {width / 32, 1, 1}, {128, 1, 1});
+  (void)backend.submitCommand(reference.dispatches());
+  std::vector<uint8_t> expected(width * 16);
+  std::memcpy(expected.data(), fixture.hidden.contents(), expected.size());
+  fixture.clear();
+  auto buffers = fixture.decodeBuffers(0);
+  buffers.linearScratch = {table, sums, {}, {}};
+  CommandGraph fused;
+  GDN::addDecode(fused, buffers, shape, 1, 0, fixture.cell.strides());
+  (void)backend.submitCommand(fused.dispatches());
+  require(!std::memcmp(expected.data(), fixture.hidden.contents(), expected.size()),
+          "fused GDN changed output");
+  require(!std::memcmp(table.contents(), referenceTable.contents(), width * 16),
+          "fused GDN table mismatch");
+  require(!std::memcmp(sums.contents(), referenceSums.contents(), width / 2),
+          "fused GDN sums mismatch");
+  checkDecode(fixture, 0, 0);
+}
+
 void rejectsInvalid(MetalBackend &backend) {
   const GdnShape &shape = kShapes[1];
   Fixture fixture(backend, shape, 1);
@@ -587,6 +616,12 @@ void rejectsInvalid(MetalBackend &backend) {
     GDN::addCommit(graph, fixture.commitBuffers(), shape, 0, 1,
                    fixture.cell.strides());
   });
+  rejects([&] {
+    auto buffers = fixture.decodeBuffers(0);
+    buffers.linearScratch.input = backend.allocateBuffer(16);
+    buffers.linearScratch.sums = backend.allocateBuffer(4);
+    GDN::addDecode(graph, buffers, shape, 1, 0, fixture.cell.strides());
+  });
   require(graph.empty(), "invalid GDN request partially encoded a graph");
 }
 
@@ -598,6 +633,7 @@ int main(int argc, char **argv) {
       throw std::invalid_argument("usage: gdn-decode METALLIB");
     MetalBackend backend(argv[1]);
     rejectsInvalid(backend);
+    for (const GdnShape &shape : kShapes) fusedPreparation(backend, shape);
     for (const GdnShape &shape : kShapes)
       for (uint32_t lanes = 1; lanes <= kMaxLanes; ++lanes)
         runDecode(backend, shape, lanes);

@@ -755,7 +755,7 @@ struct Runtime::Impl {
     CommandGraph graph;
     targetModel.addHead(graph, d(DecodeTensor::Hidden0),
                         d(DecodeTensor::FinalHidden), d(DecodeTensor::Logits),
-                        kDecodeRows);
+                        kDecodeRows, decodeArena->linearScratch());
     addInitialPolicySelection(graph, entry, lane, 0);
     CommandTiming timing = backend.submitCommand(graph.dispatches());
     entry.pendingToken = *contents<uint32_t>(d(DecodeTensor::OutputTokens),
@@ -1057,7 +1057,7 @@ struct Runtime::Impl {
         // policy selection, sampling, or anchor is produced.
         targetModel.addHead(graph, d(DecodeTensor::Hidden0),
                             d(DecodeTensor::FinalHidden),
-                            d(DecodeTensor::Logits), lastRows);
+                            d(DecodeTensor::Logits), lastRows, decodeArena->linearScratch());
       } else if (entry.constraint == ConstraintMode::None) {
         if (samplingEnabled(entry)) {
           entry.cycleUniforms.fill(0.0F);
@@ -1151,6 +1151,7 @@ struct Runtime::Impl {
     }
 
     DFlashDecodeBuffers buffers;
+    buffers.linearScratch = decodeArena->linearScratch();
     for (uint32_t hidden = 0; hidden < buffers.hidden.size(); ++hidden) {
       buffers.hidden[hidden] = d(static_cast<DecodeTensor>(
           static_cast<uint32_t>(DecodeTensor::DraftHidden0) + hidden));
@@ -1223,6 +1224,7 @@ struct Runtime::Impl {
     std::vector<MetalBuffer> chunkKeys(attentionLayers);
     std::vector<MetalBuffer> chunkValues(attentionLayers);
     QwenTargetVerifyBuffers buffers;
+    buffers.linearScratch = decodeArena->linearScratch();
     buffers.hidden = {d(DecodeTensor::Hidden0), d(DecodeTensor::Hidden1)};
     buffers.normalized = d(DecodeTensor::Normalized);
     buffers.recurrent = d(DecodeTensor::Recurrent);
@@ -1325,7 +1327,7 @@ struct Runtime::Impl {
     };
     targetModel.addHead(graph, d(DecodeTensor::Hidden0),
                         d(DecodeTensor::FinalHidden), d(DecodeTensor::Logits),
-                        finalRow + 1);
+                        finalRow + 1, decodeArena->linearScratch());
     addInitialPolicySelection(graph, entry, lane, finalRow);
   }
 
@@ -1347,6 +1349,7 @@ struct Runtime::Impl {
       startPositions[lane] = static_cast<uint32_t>(
           items[std::min(lane, lanes - 1)].logicalPosition);
     DFlashContextBuffers buffers;
+    buffers.linearScratch = decodeArena->linearScratch();
     buffers.capturedTargetHidden = d(DecodeTensor::CapturedTargetHidden);
     buffers.projected = d(DecodeTensor::ContextProjected);
     buffers.hidden = d(DecodeTensor::ContextHidden);

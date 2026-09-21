@@ -77,6 +77,29 @@ MoeWorkspace workspaceFor(MoeShape shape, uint32_t rows, uint32_t tileRows,
           groupedRows * outputWidth * sizeof(uint16_t)};
 }
 
+// Pipelines, column tiles and threadgroup width of a plan's fused gate/up
+// and down passes. Only the 8-row tiles have a four-simdgroup form; see
+// MoeExpertSimdgroups for its geometry and measurements.
+struct ExpertPasses final {
+  const char *gateUp;
+  const char *down;
+  uint32_t gateUpColumns;
+  uint32_t downColumns;
+  uint32_t threads;
+};
+
+ExpertPasses fusedExpertPasses(const MoeConfig &config) noexcept {
+  if (config.expertTile == MoeExpertTile::M32)
+    return {"moe_expert_gate_up_q4_m32", "moe_expert_down_q4_m32", 128, 128,
+            metal::CommandGraph::kDefaultThreads};
+  const uint32_t threads = static_cast<uint32_t>(config.m8Simdgroups) * 32;
+  if (config.m8Simdgroups == MoeExpertSimdgroups::Four)
+    return {"moe_expert_gate_up_q4_m8_n128_sg4",
+            "moe_expert_down_q4_m8_n256_sg4", 128, 256, threads};
+  return {"moe_expert_gate_up_q4_m8", "moe_expert_down_q4_m8", 128, 128,
+          threads};
+}
+
 } // namespace
 
 MoePlan::MoePlan(MoeShape shape, uint32_t rows, MoeConfig config,
@@ -86,6 +109,9 @@ MoePlan::MoePlan(MoeShape shape, uint32_t rows, MoeConfig config,
   if (config.expertTile != MoeExpertTile::M8 &&
       config.expertTile != MoeExpertTile::M32)
     throw std::invalid_argument("invalid MoE expert tile configuration");
+  if (config.m8Simdgroups != MoeExpertSimdgroups::Eight &&
+      config.m8Simdgroups != MoeExpertSimdgroups::Four)
+    throw std::invalid_argument("invalid MoE expert simdgroup configuration");
   workspace_ = workspaceFor(shape, rows, tileRows(), splitExperts_);
   maximumTiles_ = moeMaximumTiles(rows, shape, tileRows());
 }
@@ -130,7 +156,6 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
              weights.sharedExpertGate.biases, buffers.selectedExperts,
              buffers.routingWeights},
             routeParams, {rows, 1, 1});
-  const bool m8 = plan.config().expertTile == MoeExpertTile::M8;
   graph.add("moe_group_routes",
             {buffers.selectedExperts, buffers.tileDescriptors,
              buffers.tileCount, buffers.groupedRoutes, buffers.routeRows},
@@ -180,17 +205,23 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
                weights.sharedDown.packed, buffers.expertOutput},
               down, {shape.hiddenSize / 256, tiles, 1});
   } else {
-    graph.add(m8 ? "moe_expert_gate_up_q4_m8" : "moe_expert_gate_up_q4_m32",
+    // The workspace holds the same grouped rows whatever the column tile;
+    // only the grid's column count and the threadgroup width follow it.
+    const ExpertPasses passes = fusedExpertPasses(plan.config());
+    graph.add(passes.gateUp,
               {buffers.groupedInput, buffers.tileDescriptors,
                buffers.tileCount, weights.expertGate.packed,
                weights.expertUp.packed, weights.sharedGate.packed,
                weights.sharedUp.packed, buffers.expertIntermediate},
-              gateUp, {shape.expertIntermediateSize / 128, tiles, 1});
-    graph.add(m8 ? "moe_expert_down_q4_m8" : "moe_expert_down_q4_m32",
+              gateUp,
+              {shape.expertIntermediateSize / passes.gateUpColumns, tiles, 1},
+              {passes.threads, 1, 1});
+    graph.add(passes.down,
               {buffers.expertIntermediate, buffers.tileDescriptors,
                buffers.tileCount, weights.expertDown.packed,
                weights.sharedDown.packed, buffers.expertOutput},
-              down, {shape.hiddenSize / 128, tiles, 1});
+              down, {shape.hiddenSize / passes.downColumns, tiles, 1},
+              {passes.threads, 1, 1});
   }
   graph.add("moe_combine",
             {buffers.expertOutput, buffers.routeRows, buffers.routingWeights,
@@ -218,9 +249,12 @@ std::array<MoePlan, 2> MoE::prefillCandidates(MoeShape shape, uint32_t rows,
 }
 
 std::array<MoePlan, 2> MoE::decodeCandidates(MoeShape shape, uint32_t lanes,
-                                         uint32_t routeWideRows) {
-  return {decodePlan(shape, lanes, {MoeExpertTile::M8, routeWideRows}),
-          decodePlan(shape, lanes, {MoeExpertTile::M32, routeWideRows})};
+                                         uint32_t routeWideRows,
+                                         MoeExpertSimdgroups m8Simdgroups) {
+  return {decodePlan(shape, lanes,
+                     {MoeExpertTile::M8, routeWideRows, m8Simdgroups}),
+          decodePlan(shape, lanes,
+                     {MoeExpertTile::M32, routeWideRows, m8Simdgroups})};
 }
 
 } // namespace splash::ops

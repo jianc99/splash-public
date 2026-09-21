@@ -167,10 +167,10 @@ void DFlashDraft::addDecode(
     const DFlashDraftLayerWeights &weights = weights_.layers[layer];
     ops::Normalization::addRms(graph, buffers.hidden[current],
                                weights.inputNorm,
-                               buffers.normalized, layout.hiddenSize, rows);
+                               buffers.normalized, layout.hiddenSize, rows, buffers.linearScratch);
     operators_.linear().addDecodeBatch(graph,
                        buffers.normalized, weights.attentionDynamic,
-                       buffers.dynamic, dynamic, lanes, stats);
+                       buffers.dynamic, dynamic, lanes, stats, buffers.linearScratch, true);
     ops::DraftAttention::addConvolution(
         graph,
         {buffers.normalized, buffers.dynamic, weights.attentionConvolution,
@@ -178,7 +178,7 @@ void DFlashDraft::addDecode(
         attentionPlan, ops::DraftConvolutionStage::Prepare);
     operators_.linear().addDecodeBatch(graph, buffers.convolved,
                        weights.qkvProjection, buffers.proposalQkv, qkv, lanes,
-                       stats);
+                       stats, buffers.linearScratch);
     ops::DraftAttention::addPrepare(
         graph,
         {buffers.proposalQkv, buffers.attention, weights.queryNorm,
@@ -195,7 +195,7 @@ void DFlashDraft::addDecode(
                                     buffers.proposalQkv, attentionPlan);
     operators_.linear().addDecodeBatch(graph,
                        buffers.proposalQkv, weights.outputProjection,
-                       buffers.projected, output, lanes, stats);
+                       buffers.projected, output, lanes, stats, buffers.linearScratch);
     ops::DraftAttention::addConvolution(
         graph,
         {buffers.projected, buffers.dynamic, weights.attentionConvolution,
@@ -203,10 +203,10 @@ void DFlashDraft::addDecode(
         attentionPlan, ops::DraftConvolutionStage::Residual);
     ops::Normalization::addRms(graph, buffers.residual,
                                weights.postAttentionNorm, buffers.normalized,
-                               layout.hiddenSize, rows);
+                               layout.hiddenSize, rows, buffers.linearScratch);
     operators_.linear().addDecodeBatch(graph,
                        buffers.normalized, weights.mlpDynamic, buffers.dynamic,
-                       dynamic, lanes, stats);
+                       dynamic, lanes, stats, buffers.linearScratch, true);
     ops::DraftAttention::addConvolution(
         graph,
         {buffers.normalized, buffers.dynamic, weights.mlpConvolution,
@@ -214,10 +214,10 @@ void DFlashDraft::addDecode(
         attentionPlan, ops::DraftConvolutionStage::Prepare);
     operators_.linear().addGateUpBatch(graph, buffers.convolved, weights.gateProjection,
                        weights.upProjection, buffers.gateScratch,
-                       buffers.intermediate, gateUp, lanes, stats);
+                       buffers.intermediate, gateUp, lanes, stats, buffers.linearScratch);
     operators_.linear().addDecodeBatch(graph,
                        buffers.intermediate, weights.downProjection,
-                       buffers.projected, down, lanes, stats);
+                       buffers.projected, down, lanes, stats, buffers.linearScratch);
     ops::DraftAttention::addConvolution(
         graph,
         {buffers.projected, buffers.dynamic, weights.mlpConvolution,
@@ -228,14 +228,14 @@ void DFlashDraft::addDecode(
   ops::Normalization::addRms(graph,
                              buffers.hidden[weights_.layout.layers & 1],
                              weights_.finalNorm,
-                             buffers.finalHidden, layout.hiddenSize, rows);
+                             buffers.finalHidden, layout.hiddenSize, rows, buffers.linearScratch);
   const ops::LinearMatrix head{layout.vocabularySize, layout.hiddenSize};
   operators_.linear().addDecodeBatch(graph, buffers.finalHidden,
-                     vocabularyProjection, buffers.logits, head, lanes, stats);
+                     vocabularyProjection, buffers.logits, head, lanes, stats, buffers.linearScratch, true);
   const ops::LinearMatrix selector{layout.selectorRank, layout.hiddenSize};
   operators_.linear().addDecodeBatch(graph,
                      buffers.finalHidden, weights_.selectorProjection,
-                     buffers.selectorHidden, selector, lanes, stats);
+                     buffers.selectorHidden, selector, lanes, stats, buffers.linearScratch, true);
 }
 
 void DFlashDraft::addContextCommit(
@@ -253,15 +253,15 @@ void DFlashDraft::addContextCommit(
   const ops::LinearMatrix context{layout.hiddenSize, layout.targetHiddenSize};
   operators_.linear().addDecodeBatch(graph,
                      buffers.capturedTargetHidden, weights_.contextProjection,
-                     buffers.projected, context, lanes, stats);
+                     buffers.projected, context, lanes, stats, buffers.linearScratch);
   ops::Normalization::addRms(graph, buffers.projected, weights_.hiddenNorm,
-                             buffers.hidden, layout.hiddenSize, rows);
+                             buffers.hidden, layout.hiddenSize, rows, buffers.linearScratch);
 
   const ops::LinearMatrix qkv{layout.qkvSize, layout.hiddenSize};
   for (uint32_t layer = 0; layer < layout.layers; ++layer) {
     operators_.linear().addDecodeBatch(graph, buffers.hidden,
                        weights_.layers[layer].qkvProjection, buffers.qkv, qkv,
-                       lanes, stats);
+                       lanes, stats, buffers.linearScratch, true);
     ops::DraftAttention::addContextCommit(
         graph, buffers.qkv, weights_.layers[layer].keyNorm, buffers.ropeCos,
         buffers.ropeSin, buffers.persistentKeys[layer],

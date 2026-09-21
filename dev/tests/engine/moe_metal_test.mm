@@ -1,6 +1,7 @@
 // Sparse MoE against a CPU reference with real Q4 expert weights: routing,
 // expert grouping (including partially filled tiles), the grouped gate/up and
-// down tiles, and the combine, for every operator-owned M8/M32 plan. Routing
+// down tiles, and the combine, for every operator-owned M8/M32 plan and the
+// Apple9 four-simdgroup decode tiles (bitwise against the shipped tile). Routing
 // fixtures cover dispersed, concentrated and skewed expert utilization with
 // hidden width 1024 and intermediate width 512.
 #include "../../../runtime/metal/CommandGraph.hpp"
@@ -36,6 +37,7 @@ using splash::ops::kMoeRouteWideRows;
 using splash::ops::MoE;
 using splash::ops::MoeBuffers;
 using splash::ops::MoeConfig;
+using splash::ops::MoeExpertSimdgroups;
 using splash::ops::MoeExpertTile;
 using splash::ops::MoePlan;
 using splash::ops::MoeShape;
@@ -476,6 +478,19 @@ template <class Function> void rejects(Function function, const char *label) {
   fail(std::string(label) + ": invalid plan or buffers were accepted");
 }
 
+bool sameWorkspace(const splash::ops::MoeWorkspace &a,
+                   const splash::ops::MoeWorkspace &b) {
+  return a.selectedExpertsBytes == b.selectedExpertsBytes &&
+         a.routingWeightsBytes == b.routingWeightsBytes &&
+         a.tileDescriptorsBytes == b.tileDescriptorsBytes &&
+         a.tileCountBytes == b.tileCountBytes &&
+         a.groupedRoutesBytes == b.groupedRoutesBytes &&
+         a.routeRowsBytes == b.routeRowsBytes &&
+         a.groupedInputBytes == b.groupedInputBytes &&
+         a.expertIntermediateBytes == b.expertIntermediateBytes &&
+         a.expertOutputBytes == b.expertOutputBytes;
+}
+
 void checkPlan(const MoePlan &plan) {
   const auto shape = plan.shape();
   const uint64_t rows = plan.rows();
@@ -538,6 +553,24 @@ void planBounds() {
         require(!plan.splitExperts(), "decode plans keep the fused expert tile");
         checkPlan(plan);
       }
+      // The Apple9 four-simdgroup tiles change only the down pass's column
+      // grid: same rows, tiles and scratch as the shipped candidates.
+      const auto narrow = MoE::decodeCandidates(shape, lanes, kMoeRouteWideRows,
+                                                MoeExpertSimdgroups::Four);
+      require(narrow[0].config() == MoeConfig{MoeExpertTile::M8, kMoeRouteWideRows,
+                                              MoeExpertSimdgroups::Four} &&
+                  narrow[1].config() == MoeConfig{MoeExpertTile::M32, kMoeRouteWideRows,
+                                                  MoeExpertSimdgroups::Four},
+              "four-simdgroup decode candidates must carry the device tile policy");
+      for (size_t index = 0; index < narrow.size(); ++index) {
+        require(narrow[index].rows() == plans[index].rows() &&
+                    narrow[index].tileRows() == plans[index].tileRows() &&
+                    narrow[index].maximumTiles() == plans[index].maximumTiles() &&
+                    !narrow[index].splitExperts() &&
+                    sameWorkspace(narrow[index].workspace(), plans[index].workspace()),
+                "four-simdgroup tiles changed the plan geometry or workspace");
+        checkPlan(narrow[index]);
+      }
     }
     rejects([&] { (void)MoE::prefillCandidates(shape, 0, kMoeRouteWideRows); }, "zero prefill");
     rejects([&] { (void)MoE::prefillCandidates(shape, 2049, kMoeRouteWideRows); }, "large prefill");
@@ -545,8 +578,18 @@ void planBounds() {
     rejects([&] { (void)MoE::decodeCandidates(shape, 5, kMoeRouteWideRows); }, "large batch");
     rejects([&] { (void)MoE::prefillPlan(shape, 1, {static_cast<MoeExpertTile>(16)}); },
             "uncompiled expert tile");
+    rejects([&] { (void)MoE::decodePlan(shape, 1, {MoeExpertTile::M8, kMoeRouteWideRows,
+                                                  static_cast<MoeExpertSimdgroups>(6)}); },
+            "uncompiled expert simdgroups");
   }
   rejects([] { (void)MoE::prefillPlan({}, 1); }, "invalid shape");
+  // Only family 9 runs the four-simdgroup decode tiles; an unknown family
+  // and families 10 and later keep the shipped tile.
+  require(splash::ops::moeDecodeSimdgroups(9) == MoeExpertSimdgroups::Four &&
+              splash::ops::moeDecodeSimdgroups(10) == MoeExpertSimdgroups::Eight &&
+              splash::ops::moeDecodeSimdgroups(11) == MoeExpertSimdgroups::Eight &&
+              splash::ops::moeDecodeSimdgroups(0) == MoeExpertSimdgroups::Eight,
+          "decode expert simdgroups are not gated on GPU family 9");
 }
 
 void checkEncoding(const CommandGraph &graph, const MoePlan &plan) {
@@ -586,16 +629,35 @@ void checkEncoding(const CommandGraph &graph, const MoePlan &plan) {
                 dispatches[experts + 2].threadgroups.x == kHidden / 256,
             "split MoE plan chose inconsistent gate scratch or column tiles");
   } else {
-    require(dispatches[experts].pipelineName ==
-                    (m8 ? "moe_expert_gate_up_q4_m8"
-                        : "moe_expert_gate_up_q4_m32") &&
-                dispatches[experts + 1].pipelineName ==
-                    (m8 ? "moe_expert_down_q4_m8" : "moe_expert_down_q4_m32"),
+    // Four-simdgroup 8-row tiles launch 128 threads and widen the down tile
+    // to N256; every other fused pass keeps N128 at 256 threads.
+    const bool four = m8 && plan.config().m8Simdgroups == MoeExpertSimdgroups::Four;
+    const std::string gateUp = four ? "moe_expert_gate_up_q4_m8_n128_sg4"
+                               : m8 ? "moe_expert_gate_up_q4_m8"
+                                    : "moe_expert_gate_up_q4_m32";
+    const std::string down = four ? "moe_expert_down_q4_m8_n256_sg4"
+                             : m8 ? "moe_expert_down_q4_m8"
+                                  : "moe_expert_down_q4_m32";
+    require(dispatches[experts].pipelineName == gateUp &&
+                dispatches[experts + 1].pipelineName == down,
             "fused MoE plan chose inconsistent expert pipelines");
+    const uint32_t threads = four ? 128 : 256;
+    require(dispatches[experts].threadgroups.x == kIntermediate / 128 &&
+                dispatches[experts + 1].threadgroups.x == kHidden / (four ? 256 : 128) &&
+                dispatches[experts].threadsPerThreadgroup.x == threads &&
+                dispatches[experts + 1].threadsPerThreadgroup.x == threads,
+            "fused MoE plan chose inconsistent column tiles or threadgroup width");
   }
   bool tileGrids = true;
   for (size_t pass = experts; pass < combine; ++pass)
     tileGrids &= dispatches[pass].threadgroups.y == plan.maximumTiles();
+  for (size_t pass = 0; pass <= combine; ++pass) {
+    const bool expertPass = pass >= experts && pass < combine;
+    require((expertPass || dispatches[pass].threadsPerThreadgroup.x == 256) &&
+                dispatches[pass].threadsPerThreadgroup.y == 1 &&
+                dispatches[pass].threadsPerThreadgroup.z == 1,
+            "MoE plan changed a non-expert threadgroup width");
+  }
   require(dispatches[0].threadgroups.x ==
                   (plan.rows() + route.rows - 1) / route.rows &&
               dispatches[0].threadgroups.y == kStorageN / route.experts &&
@@ -821,14 +883,25 @@ void run(const std::string &metallibPath) {
                   << " baseline_fp32_bits=" << std::bit_cast<uint32_t>(*mismatch.second)
                   << " candidate_fp32_bits=" << std::bit_cast<uint32_t>(*mismatch.first)
                   << '\n';
-        fail(label + " " + routingLabel + ": M8/M32 outputs differ");
+        fail(label + " " + routingLabel + ": outputs differ from the shipped tile");
       }
     };
     for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
       const auto candidates = MoE::decodeCandidates(fixture.shape, lanes, kMoeRouteWideRows);
       const std::string label = "decode B" + std::to_string(lanes);
       const auto baseline = execute(candidates[0], label);
-      requireEqual(execute(candidates[1], label), baseline, label);
+      requireEqual(execute(candidates[1], label), baseline, label + " M32");
+      // The Apple9 four-simdgroup tiles (gate/up N128, down N256, 128
+      // threads) must reproduce the shipped N128 x 8 tile bit for bit: each
+      // output element sums its quant groups in the same order, so no
+      // tolerance is granted. The M32 candidate carries the device policy
+      // but keeps its eight-simdgroup tiles.
+      const auto narrow = MoE::decodeCandidates(fixture.shape, lanes, kMoeRouteWideRows,
+                                                MoeExpertSimdgroups::Four);
+      requireEqual(execute(narrow[0], label + " sg4"), baseline,
+                   label + " four-simdgroup M8");
+      requireEqual(execute(narrow[1], label + " sg4"), baseline,
+                   label + " four-simdgroup M32");
     }
     // 12 and 48 rows leave 16-row ragged tiles in every routing fixture; 9,
     // 33 and 263 leave 8-row ones next to full tiles; 511/512 straddle the
