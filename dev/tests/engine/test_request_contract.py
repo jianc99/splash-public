@@ -183,6 +183,16 @@ class RequestContractTests(unittest.TestCase):
             with self.assertRaises(schema_validation.SchemaEvaluationError):
                 validator.is_valid({"key_one": 1})
 
+    def test_build_validator_reuses_a_cached_instance_for_the_same_schema(self):
+        nodes, registry = lambda s: [s], Registry()
+        schema_a = {"type": "object", "properties": {"x": {"type": "integer"}}}
+        schema_b = {"type": "object", "properties": {"x": {"type": "string"}}}
+        first = schema_validation.build_validator(schema_a, nodes, registry)
+        second = schema_validation.build_validator(dict(schema_a), nodes, registry)
+        third = schema_validation.build_validator(schema_b, nodes, registry)
+        self.assertIs(first, second)
+        self.assertIsNot(first, third)
+
     def test_nonstring_schema_is_a_request_error(self):
         for value in ([], {}, 1):
             with self.subTest(value=value), self.assertRaises(api.APIError) as caught:

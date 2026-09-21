@@ -1,6 +1,9 @@
 """JSON Schema validation with bounded regular-expression evaluation."""
 
 import copy
+import json
+import threading
+from collections import OrderedDict
 from functools import lru_cache
 
 import regex
@@ -70,7 +73,21 @@ def _bounded_class(base):
     )
 
 
+_VALIDATOR_CACHE_SIZE = 256
+_validator_cache_lock = threading.Lock()
+_validator_cache = OrderedDict()
+
+
 def build_validator(schema, nodes, registry):
+    # check_schema walks the whole JSON Schema meta-schema; tool and
+    # response_format schemas are the same on every turn of a conversation,
+    # so cache the built validator instead of re-validating and rebuilding it.
+    key = (id(nodes), id(registry), json.dumps(schema, sort_keys=True))
+    with _validator_cache_lock:
+        cached = _validator_cache.get(key)
+        if cached is not None:
+            _validator_cache.move_to_end(key)
+            return cached
     base = validators.validator_for(schema)
     base.check_schema(schema)
     validated = copy.deepcopy(schema)
@@ -81,4 +98,10 @@ def build_validator(schema, nodes, registry):
             if validators.validator_for(node) is not base:
                 raise APIError(400, "mixed schema dialects are not supported")
             node.pop("$schema")
-    return _bounded_class(base)(validated, registry=registry)
+    validator = _bounded_class(base)(validated, registry=registry)
+    with _validator_cache_lock:
+        _validator_cache[key] = validator
+        _validator_cache.move_to_end(key)
+        while len(_validator_cache) > _VALIDATOR_CACHE_SIZE:
+            _validator_cache.popitem(last=False)
+    return validator
