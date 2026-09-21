@@ -15,9 +15,8 @@ from server.errors import APIError
 
 class HttpBoundaryTests(unittest.TestCase):
     def test_model_retrieval_matches_listing_without_inference(self):
-        harness = Harness(FakeRuntime())
+        harness = Harness(FakeRuntime(), model="community/example-model")
         self.addCleanup(harness.close)
-        harness.app.model = "community/example-model"
         status, _, body = harness.request("GET", "/v1/models")
         self.assertEqual(status, 200)
         model = json.loads(body)["data"][0]

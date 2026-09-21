@@ -178,6 +178,8 @@ def serve(args):
             "--max-context",
             "auto" if args.max_context is None else str(args.max_context),
         ]
+        for name in args.served_model_name:
+            command.append(f"--served-model-name={name}")
         if args.max_request_size is not None:
             command.extend(["--max-request-size", str(args.max_request_size)])
         if args.max_image_pixels is not None:
@@ -212,7 +214,7 @@ def coding_client(args):
     models = catalog.get("data", []) if isinstance(catalog, dict) else []
     if (
         not isinstance(models, list)
-        or len(models) != 1
+        or not models
         or not isinstance(models[0], dict)
         or models[0].get("owned_by") != "splash"
     ):
@@ -312,6 +314,18 @@ def _version():
     )
 
 
+def _parse_served_model_name(value):
+    if (
+        not value
+        or any(not c.isprintable() or c.isspace() or c in "\\%?#" for c in value)
+        or any(part in ("", ".", "..") for part in value.split("/"))
+    ):
+        raise argparse.ArgumentTypeError(
+            "model alias must be a non-empty name without whitespace or URL delimiters"
+        )
+    return value
+
+
 def parse_args(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     client_args = []
@@ -343,6 +357,13 @@ def parse_args(argv=None):
         required=True,
         metavar="OWNER/REPO",
         help="Hugging Face repository containing a Splash package",
+    )
+    server.add_argument(
+        "--served-model-name",
+        action="append",
+        default=[],
+        type=_parse_served_model_name,
+        help="additional API model name; responses keep the loaded model ID (repeatable)",
     )
     server.add_argument(
         "--max-memory",

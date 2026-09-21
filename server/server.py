@@ -42,7 +42,7 @@ if __package__:
     from .constraints import ConstraintFactory, validate_tokenizer
     from .diagnostics import log_unexpected, print_request, print_status
     from .errors import APIError, ContextLengthError
-    from .frontend import Frontend
+    from .frontend import Frontend, validate_served_model_name
     from .http_security import authenticate, validate_api_key, validate_headers
     from .latency import RequestLatency
     from .metrics import (
@@ -81,7 +81,7 @@ else:
     from constraints import ConstraintFactory, validate_tokenizer
     from diagnostics import log_unexpected, print_request, print_status
     from errors import APIError, ContextLengthError
-    from frontend import Frontend
+    from frontend import Frontend, validate_served_model_name
     from http_security import authenticate, validate_api_key, validate_headers
     from latency import RequestLatency
     from metrics import is_finite_number, metrics_dict, prometheus_metrics, usage_dict
@@ -381,25 +381,36 @@ class FrontendHandler(BaseHTTPRequestHandler):
             return
         model_path = _normalize_path(self.path)
         if model_path == "/v1/models" or model_path.startswith("/v1/models/"):
-            model = {
-                "id": self.app.model,
-                "object": "model",
-                "created": 0,
-                "owned_by": "splash",
-            }
-            # TypeSafe SDK compatibility: models.list() reads "models" entries.
-            # The release date is not tracked locally and stays unknown.
-            typed = {
-                "name": self.app.model,
-                "description": "Splash resident model",
-                "release_date": "",
-            }
+            models = [
+                {
+                    "id": name,
+                    "object": "model",
+                    "created": 0,
+                    "owned_by": "splash",
+                    **({"root": self.app.model} if name != self.app.model else {}),
+                }
+                for name in self.app.model_names
+            ]
             if model_path == "/v1/models":
-                self._json(200, {"object": "list", "data": [model], "models": [typed]})
-            elif model_path.removeprefix("/v1/models/") == self.app.model:
-                self._json(200, model)
+                # TypeSafe SDK compatibility: models.list() reads "models" entries.
+                typed = [
+                    {
+                        "name": item["id"],
+                        "description": "Splash resident model",
+                        "release_date": "",
+                    }
+                    for item in models
+                ]
+                self._json(200, {"object": "list", "data": models, "models": typed})
             else:
-                self._safe_error(APIError(404, "model not found", "model_not_found"))
+                name = model_path.removeprefix("/v1/models/")
+                model = next((item for item in models if item["id"] == name), None)
+                if model is None:
+                    self._safe_error(
+                        APIError(404, "model not found", "model_not_found")
+                    )
+                else:
+                    self._json(200, model)
             return
         self._safe_error(APIError(404, "not found", "not_found"))
 
@@ -1826,6 +1837,13 @@ def parse_args(argv=None):
     parser.add_argument(
         "--model", type=_parse_model_id, required=True, metavar="OWNER/REPO"
     )
+    parser.add_argument(
+        "--served-model-name",
+        action="append",
+        default=[],
+        type=validate_served_model_name,
+        help="additional API model name; responses still identify the loaded model (repeatable)",
+    )
     parser.add_argument("--max-context", type=_parse_max_context, default=None)
     parser.add_argument("--max-memory", type=_parse_max_memory, default=None)
     parser.add_argument(
@@ -1951,6 +1969,7 @@ def main():
             constraint_factory,
             max_image_pixels=args.max_image_pixels,
             thinking_codec=thinking_codec,
+            served_model_names=args.served_model_name,
         )
         server.app = app
         server.server_activate()

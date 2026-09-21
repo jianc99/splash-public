@@ -68,6 +68,21 @@ Use `--port 8001` or set `SPLASH_PORT=8001` to select another port. Set the same
 their memory limits are independent. The packaged agent launchers connect to
 loopback, so use a listener that includes loopback when launching agents locally.
 
+## API model aliases
+
+Repeat `--served-model-name NAME` to accept additional API model IDs. The full
+`--model OWNER/REPO` still selects the package. `/v1/models` lists that ID first,
+followed by unique aliases; each alias's `root` identifies the loaded package.
+Generation and scoring responses always report the real package ID, even when
+requested through an alias. The model list and lookup support both names.
+
+```sh
+splash serve --model incoai/Qwen3.8-27B-Splash --served-model-name local-qwen
+```
+
+Aliases cannot contain whitespace, control characters, `\`, `%`, `?`, `#`,
+or empty, `.` or `..` path segments. This keeps model discovery URLs unambiguous.
+
 ## Model cache
 
 To download new models to another disk, set the cache location before serving:
