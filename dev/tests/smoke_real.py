@@ -774,9 +774,14 @@ def filler(nonce: str, label: str, items: int) -> str:
     )
 
 
-def counters(port: int) -> dict:
+def runtime_status(port: int) -> dict:
     code, status = request(port, "GET", "/status")
     require(code == 200, f"status read failed with HTTP {code}")
+    return status
+
+
+def counters(port: int) -> dict:
+    status = runtime_status(port)
     return {
         "submitted": status["requests"]["submitted"],
         "cancelled": status["requests"]["cancelled"],
@@ -784,6 +789,37 @@ def counters(port: int) -> dict:
         "reused_tokens": status["cache"]["reused_tokens"],
         "restarts": status["transport"]["restarts"],
     }
+
+
+def wait_for_timeout_cleanup(port: int, before: dict) -> None:
+    limit = time.monotonic() + 120
+    while True:
+        after = runtime_status(port)
+        require(
+            after["instance"] == before["instance"]
+            and after["transport"]["restarts"] == 0
+            and after["ready"]
+            and after["metal"]["healthy"],
+            "scoring timeout destabilized the runtime",
+        )
+        delta = {
+            key: after["requests"][key] - before["requests"][key]
+            for key in ("submitted", "completed", "cancelled", "failed")
+        }
+        require(
+            delta["submitted"] == 1 and delta["completed"] == 0,
+            f"unexpected scoring timeout outcome: {delta!r}",
+        )
+        terminal = (delta["cancelled"], delta["failed"])
+        require(
+            terminal in ((0, 0), (1, 0), (0, 1)),
+            f"score did not terminate exactly once: {delta!r}",
+        )
+        # Frontend cancellation or the native deadline can finish first.
+        if terminal != (0, 0) and after["transport"]["pending"] == 0:
+            return
+        require(time.monotonic() < limit, "scoring timeout cleanup did not finish")
+        time.sleep(0.5)
 
 
 def run_judgments(port: int, model: str, nonce: str) -> None:
@@ -949,7 +985,7 @@ def run_judgments(port: int, model: str, nonce: str) -> None:
     require(code == 200, f"long scored prompt failed with HTTP {code}: {long_score!r}")
     forward = long_score["forward_seconds"]
     require(forward > 0.5, f"prefill is too fast to cancel: {forward:.2f}s")
-    before = counters(port)
+    before = runtime_status(port)
     started = time.monotonic()
     code, timed_out = request(
         port,
@@ -964,29 +1000,24 @@ def run_judgments(port: int, model: str, nonce: str) -> None:
         elapsed < forward,
         f"the deadline did not cut prefill short: {elapsed:.2f}s of {forward:.2f}s",
     )
-    # The 504 is the frontend giving up; the engine reports the cancellation
-    # once the in-flight prefill chunk unwinds.
-    limit = time.monotonic() + 120
-    after = counters(port)
-    while time.monotonic() < limit and after["cancelled"] == before["cancelled"]:
-        time.sleep(0.5)
-        after = counters(port)
     require(
-        after["submitted"] > before["submitted"],
-        f"the timed-out score never reached the engine: {before!r} -> {after!r}",
+        timed_out.get("error", {}).get("code") == "request_timeout",
+        f"504 did not identify a request timeout: {timed_out!r}",
     )
-    require(
-        after["cancelled"] > before["cancelled"],
-        f"the timed-out score was not cancelled natively: {before!r} -> {after!r}",
-    )
+    wait_for_timeout_cleanup(port, before)
     code, recovered = request(
         port, "POST", "/v1/judgments", judgment_body(model, approved)
     )
     require(
         code == 200 and recovered["usage"]["completion_tokens"] == 0,
-        f"scoring did not recover after cancellation: {recovered!r}",
+        f"scoring did not recover after timeout: {recovered!r}",
     )
-    print(f"judgments cancellation: PASS (504 after {elapsed:.2f}s)", flush=True)
+    after = runtime_status(port)
+    require(
+        after["instance"] == before["instance"] and after["transport"]["restarts"] == 0,
+        "scoring recovery replaced the runtime",
+    )
+    print(f"judgments timeout recovery: PASS (504 after {elapsed:.2f}s)", flush=True)
 
 
 def add_server_arguments(parser):
