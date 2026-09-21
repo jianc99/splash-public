@@ -82,6 +82,25 @@ class ServedModelNamesTests(unittest.TestCase):
                 self.assertEqual(status, 200, payload)
         self.assertEqual(harness.backend.runtime.requests, [])
 
+    def test_alias_and_reasoning_default_work_together(self):
+        harness = self.harness(default_reasoning_effort="none")
+        for path in ("/v1/chat/completions", "/v1/responses"):
+            for effort in (None, "low"):
+                for stream in (False, True):
+                    body = request_body(path, stream)
+                    body["model"] = "local"
+                    if effort is not None:
+                        body.update(
+                            {"reasoning": {"effort": effort}}
+                            if path.endswith("responses")
+                            else {"reasoning_effort": effort}
+                        )
+                    status, _, payload = harness.request("POST", path, body)
+                    self.assertEqual(status, 200, payload)
+                    template = harness.tokenizer.templates[-1][1]
+                    self.assertEqual(template["enable_thinking"], effort is not None)
+                    self.assertEqual(template.get("reasoning_effort"), effort)
+
     def test_scoring_accepts_alias_and_reports_real_model(self):
         runtime = fixtures.FakeRuntime(
             fixtures.Plan(logits=(1.0, -1.0)), fixtures.Plan(logits=(1.0, -1.0))
