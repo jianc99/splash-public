@@ -420,6 +420,7 @@ void run(const std::string &metallibPath) {
   // input (5120->14336), mixer output (6144->5120) and FFN down
   // (17408->5120). Rows cover a full chunk, a contended slice and a tail.
   for (const ProjectionShape shape : std::vector<ProjectionShape>{
+           {1, 2048, 2048}, {31, 2048, 2048}, {33, 2048, 2048}, {176, 2048, 2048},
            {64, 6144, 5120}, {256, 5120, 14336}, {2048, 17408, 5120}})
     runShape(backend, shape, random);
   runDecodeCrossCheck(backend, random);

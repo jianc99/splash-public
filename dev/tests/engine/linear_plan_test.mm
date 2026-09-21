@@ -217,7 +217,7 @@ void narrowM24BoundaryPlans() {
 
 void baselinePlans() {
   for (const uint32_t family : {9U, 10U, 11U}) {
-    for (const uint32_t reportedCores : {0U, 10U, 16U, 18U, 20U, 40U, 80U}) {
+    for (const uint32_t reportedCores : {0U, 8U, 10U, 16U, 18U, 20U, 31U, 32U, 33U, 40U, 80U}) {
       const uint32_t cores = reportedCores ? reportedCores : 32U;
       DeviceCapabilities device;
       device.appleGpuFamily = family;
