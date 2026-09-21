@@ -369,9 +369,9 @@ inline void q4_mpp_tile_batched(
 // sequential kernel's group order with the same per-group terms, so the
 // only difference from the sequential form is the association of the fp32
 // sum: four range sums added at the end instead of one running sum. After
-// the single bf16 rounding the result lies within one bf16 ulp of the
-// sequential kernel's, and every instance with the same SplitK is
-// bit-identical to the others whatever TileN or Simdgroups it uses.
+// the single bf16 rounding, cancellation can make the difference exceed one
+// output ulp; qualification needs an operand-magnitude error bound. Instances
+// with the same SplitK retain the same per-element accumulation order.
 template <ushort TileN, bool GateUp, ushort StorageN = TileN,
           bool Pipelined = true, ushort Simdgroups = 8, ushort SplitK = 4>
 inline void q4_mpp_tile_split(device bfloat *input, device uchar *weights_0,
