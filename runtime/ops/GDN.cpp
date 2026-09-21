@@ -75,10 +75,10 @@ void GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffers,
   const KernelLayout kernel = kernelShape(shape);
   std::vector<metal::MetalBuffer> bindings{buffers.packed,
                                            buffers.convolutionWeights};
-  const bool prepare = lanes == 1 && buffers.linearScratch.input;
+  const bool prepare = bool(buffers.linearScratch.input);
   const uint64_t outputWidth = uint64_t{shape.valueHeads} * shape.headDimension;
-  if (prepare && (buffers.linearScratch.input.sizeBytes() < outputWidth * 16 ||
-                  buffers.linearScratch.sums.sizeBytes() < outputWidth / 2))
+  if (prepare && (buffers.linearScratch.input.sizeBytes() < outputWidth * 16 * lanes ||
+                  buffers.linearScratch.sums.sizeBytes() < outputWidth / 2 * lanes))
     throw std::invalid_argument("Q4 GDN preparation scratch is below requirement");
   bindings.reserve(prepare ? 22 : 20);
   appendLaneBindings(bindings, buffers.currentStates, buffers.nextStates);

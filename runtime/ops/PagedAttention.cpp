@@ -310,13 +310,13 @@ void PagedAttention::addVerifyGate(
     throw std::invalid_argument("invalid paged verify gate geometry");
   const FullDecodeBatchParams params{rowsPerLane, cacheStride, rowStride,
                                      lanes};
-  if (scratch.input && lanes == 1 && rowsPerLane == SPLASH_TARGET_VERIFY_ROWS) {
+  if (scratch.input && rowsPerLane == SPLASH_TARGET_VERIFY_ROWS) {
     const uint32_t width = queryHeads * layout.headDimension;
-    if (scratch.input.sizeBytes() < uint64_t{width} * 16 || scratch.sums.sizeBytes() < width / 2)
+    if (scratch.input.sizeBytes() < uint64_t{width} * 16 * lanes || scratch.sums.sizeBytes() < uint64_t{width} / 2 * lanes)
       throw std::invalid_argument("Q4 attention gate scratch is below requirement");
     graph.add(std::string(pipeline(kernel, "verify_attention_gate_q4", "verify_attention_gate_q4_kv2_g8")),
               {packed, attention, hidden, scratch.input, scratch.sums}, params,
-              {width / 64, 1, 1}, {256, 1, 1});
+              {width / 64 * lanes, 1, 1}, {256, 1, 1});
     return;
   }
   graph.add(std::string(pipeline(kernel, "verify_attention_gate",

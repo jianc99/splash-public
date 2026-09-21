@@ -145,7 +145,9 @@ kernel void verify_attention_gate_kv2_g8(
     const bfloat a = full_attention_gate_value<QHeads, KHeads>(packed, attention, params, element); \
     const bfloat b = full_attention_gate_value<QHeads, KHeads>(packed, attention, params, element + 1); \
     hidden[element] = a; hidden[element + 1] = b; \
-    q4sg::write_input(table, sums, (element % width) / 64, element / width, lane, a, b); \
+    const uint row = element / width; \
+    q4sg::write_input(table + ulong(row / 8) * width * 8, sums + ulong(row / 8) * width / 8, \
+                      (element % width) / 64, row % 8, lane, a, b); \
   }
 ATTENTION_GATE_Q4(verify_attention_gate_q4, 24, 4)
 ATTENTION_GATE_Q4(verify_attention_gate_q4_kv2_g8, 16, 2)

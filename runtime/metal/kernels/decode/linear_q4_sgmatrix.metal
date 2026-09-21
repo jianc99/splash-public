@@ -14,12 +14,22 @@ __attribute__((always_inline)) inline void decode(device const bfloat *table, de
                    device float *partials, device atomic_uint *counters,
                    device const bfloat *residual, device const uchar *w1,
                    device const bfloat *sc1, device const bfloat *bi1,
-                   constant Q4Params &p, uint2 tg, uint tid, uint sg, uint lane,
+                   constant Q4Params &p, uint3 tg, uint tid, uint sg, uint lane,
                    threadgroup uint *arrival) {
   constexpr bool gateUp = E == Epilogue::GateUp;
   constexpr uint tileN = gateUp ? 32 : 64;
   const uint N = p.output_size, groups = p.input_size / 64;
   const uint splits = p.persistent_groups;
+  // Independent eight-row tiles share the weight layout and dispatch.
+  // Each tile owns its activation workspace and split completion counters.
+  table += ulong(tg.z) * p.input_size * 8;
+  sums += ulong(tg.z) * p.input_size / 8;
+  out += ulong(tg.z) * 8 * N;
+  residual += ulong(tg.z) * 8 * N;
+  if (splits > 1) {
+    partials += ulong(tg.z) * splits * 16 * N;
+    counters += ulong(tg.z) * N / tileN;
+  }
   const uint first = tg.y * (groups / splits);
   const uint end = tg.y + 1 == splits ? groups : first + groups / splits;
   const Lane l = lane_map(lane);
@@ -127,9 +137,12 @@ __attribute__((always_inline)) inline void decode(device const bfloat *table, de
 kernel void decode_linear_q4_prepare(
     device const bfloat *input [[buffer(0)]], device bfloat *table [[buffer(1)]],
     device float *sums [[buffer(2)]], constant uint &width [[buffer(3)]],
-    uint tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+    uint2 tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
-  const uint group = (tg * 4 + sg) / 8, row = (tg * 4 + sg) % 8;
+  const uint group = (tg.x * 4 + sg) / 8, row = (tg.x * 4 + sg) % 8;
+  input += ulong(tg.y) * width * 8;
+  table += ulong(tg.y) * width * 8;
+  sums += ulong(tg.y) * width / 8;
   const uint offset = row * width + group * 64 + 2 * lane;
   q4sg::write_input(table, sums, group, row, lane, input[offset], input[offset + 1]);
 }
@@ -140,7 +153,7 @@ kernel void decode_linear_q4_prepare(
     device bfloat *output [[buffer(4)]], device const float *sums [[buffer(5)]], \
     device float *partials [[buffer(6)]], device atomic_uint *counters [[buffer(7)]]
 #define Q4_SG_THREADS \
-    uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], \
+    uint3 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], \
     uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]
 
 kernel void decode_linear_q4_sg(Q4_SG_INPUTS, constant Q4Params &p [[buffer(8)]], Q4_SG_THREADS) {

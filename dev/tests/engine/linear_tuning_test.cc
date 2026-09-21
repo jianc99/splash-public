@@ -323,6 +323,8 @@ void gpuBatchEquivalence(metal::MetalBackend &backend,
   Q4Linear linear(backend.capabilities());
   const auto plans = linear.candidates(workload);
   const auto &baseline = plans.front();
+  uint64_t gateBytes = 0;
+  for (const auto &plan : plans) gateBytes = std::max(gateBytes, plan.gateScratchBytes());
   const auto allocate = [&](uint64_t bytes) {
     return bytes ? backend.allocateBuffer(bytes) : metal::MetalBuffer{};
   };
@@ -332,7 +334,7 @@ void gpuBatchEquivalence(metal::MetalBackend &backend,
       allocate(baseline.sumsBytes()),
       allocate(epilogue == LinearEpilogue::Residual ?
           uint64_t{baseline.storageRows()} * workload.matrix.outputSize * 2 : 0),
-      allocate(baseline.gateScratchBytes()), allocate(baseline.downSumsBytes())};
+      allocate(gateBytes), allocate(baseline.downSumsBytes())};
   LinearScratchSize scratch;
   // This fixture runs every candidate, whose K split count can require more
   // partials than the default. Match the production tuner's field maxima.

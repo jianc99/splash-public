@@ -102,7 +102,8 @@ std::optional<ExpectedConfig> expectedOneLane(uint32_t cores,
 
 ExpectedConfig expectedDecode(uint32_t family, uint32_t cores, LinearMatrix matrix,
                               uint32_t lanes, LinearEpilogue epilogue) {
-  if (family == 9 && lanes == 1) {
+  if (family == 9 && !(lanes >= 3 && epilogue == LinearEpilogue::None &&
+                      matrix.outputSize / 256 >= 2 * cores)) {
     const uint32_t columns = epilogue == LinearEpilogue::GateUp ? 32 : 64;
     const uint32_t grid = matrix.outputSize / columns;
     uint32_t selected = 1;
@@ -277,7 +278,7 @@ void baselinePlans() {
             require(plan.pipeline() == expectedPipeline(expected, lanes, call.epilogue),
                     "Linear decode pipeline differs from its configuration");
             require(plan.secondPipeline().empty() ==
-                        !(call.epilogue == LinearEpilogue::GateUp && lanes >= 3),
+                        !(call.epilogue == LinearEpilogue::GateUp && lanes >= 3 && !plan.usesSimdgroup()),
                     "gate/up dispatch decomposition changed");
           }
         }
@@ -325,11 +326,12 @@ void baselinePlans() {
               configured(10, 0, gateUp) == configured(10, 32, gateUp) &&
               configured(9, 0, gateUp) == configured(9, 32, gateUp),
           "fused gate/up grid does not follow the balanced two-tile rule");
-  // Apple9 scales single-lane K splits; wider batches retain their grids.
+  // Apple9 matrix K splits cover all decode widths; broad plain projections
+  // retain their old multi-lane grids.
   require(configured(9, 16, gateUp) == LinearConfig{LinearTile::Simdgroup, 544, LinearSimdgroups::Four, 1} &&
               configured(9, 20, gateUp) == LinearConfig{LinearTile::Simdgroup, 544, LinearSimdgroups::Four, 1} &&
               configured(9, 20, {{16640, 5120}, 8}) == LinearConfig{LinearTile::Simdgroup, 260, LinearSimdgroups::Four, 2} &&
-              configured(9, 16, {{16640, 5120}, 16}) == LinearConfig{LinearTile::N128, 130} &&
+              configured(9, 16, {{16640, 5120}, 16}) == LinearConfig{LinearTile::Simdgroup, 260, LinearSimdgroups::Four, 1} &&
               configured(9, 20, {{16640, 5120}, 32}) == LinearConfig{LinearTile::N256, 65},
           "Apple9 decode grids changed without a measurement");
   // Former split-K defaults return to sequential tiles. Apple9 simdgroup and
@@ -370,7 +372,7 @@ void baselinePlans() {
                   LinearConfig{LinearTile::Paired256, 80, LinearSimdgroups::Four} &&
               configured(10, 20, {{40704, 5120}, 8}) == LinearConfig{LinearTile::Paired128, 318},
           "one-lane paired N256 anchors changed");
-  // K % 1024 != 0 keeps the shipped one-lane rules; multi-lane rules are untouched.
+  // K % 1024 != 0 is legal for matrix tiles; Apple10 keeps its shipped rules.
   require(configured(10, 20, {{5120, 4352}, 8}) == LinearConfig{LinearTile::Paired128, 40} &&
               configured(9, 40, {{5120, 4352}, 8, LinearPhase::Decode, LinearEpilogue::Residual}) ==
                   LinearConfig{LinearTile::Simdgroup, 80, LinearSimdgroups::Four, 4} &&
@@ -379,7 +381,7 @@ void baselinePlans() {
               configured(10, 20, {{2048, 768}, 8}) == LinearConfig{LinearTile::Paired128, 16} &&
               configured(10, 20, {{2048, 4096}, 16}) == LinearConfig{LinearTile::N128, 16} &&
               configured(9, 40, {{5120, 6144}, 24, LinearPhase::Decode, LinearEpilogue::Residual}) ==
-                  LinearConfig{LinearTile::N128, 40} &&
+                  LinearConfig{LinearTile::Simdgroup, 80, LinearSimdgroups::Four, 8} &&
               configured(10, 20, {{6144, 2048}, 32, LinearPhase::Decode, LinearEpilogue::GateUp}) ==
                   LinearConfig{LinearTile::N256, 24},
           "one-lane fallbacks or multi-lane rules changed");
@@ -407,11 +409,11 @@ void baselinePlans() {
           configured(10, 16, {{14336, 5120}, 32}) == LinearConfig{LinearTile::N256, 40} &&
           configured(10, 40, {{14336, 5120}, 32}) == LinearConfig{LinearTile::N128, 112} &&
           configured(9, 40, {{14336, 5120}, 24}) ==
-              LinearConfig{LinearTile::N128, 112, LinearSimdgroups::Four} &&
+              LinearConfig{LinearTile::Simdgroup, 224, LinearSimdgroups::Four, 4} &&
           configured(9, 40, {{248320, 5120}, 24}) ==
               LinearConfig{LinearTile::N128, 1940, LinearSimdgroups::Four} &&
           configured(9, 40, {{5120, 17408}, 24, LinearPhase::Decode, LinearEpilogue::Residual}) ==
-              LinearConfig{LinearTile::N128, 40},
+              LinearConfig{LinearTile::Simdgroup, 80, LinearSimdgroups::Four, 8},
           "decode tile rules changed for the measured shapes");
   require(configured(10, 16, {{5120, 17408}, 8}) == LinearConfig{LinearTile::Paired128, 40} &&
           configured(10, 16, {{5120, 17408}, 16}) == LinearConfig{LinearTile::N128, 40} &&
@@ -470,7 +472,7 @@ void planContracts(uint32_t family, uint32_t cores, size_t &widestCandidates) {
                     "split-K candidate escaped its one-lane full-grid contract");
           } else if (plan.usesSimdgroup()) {
             ++simdgroupCandidates;
-            require(lanes == 1 && family == 9 && four &&
+            require(family == 9 && four &&
                         plan.partialSums() == plan.configuration().splits &&
                         plan.configuration().groups == matrix.outputSize / plan.tileColumns(),
                     "simdgroup candidate escaped its full-grid contract");
@@ -480,12 +482,12 @@ void planContracts(uint32_t family, uint32_t cores, size_t &widestCandidates) {
           if (four) {
             ++fourScopeCandidates;
             const bool oneLane = lanes == 1 &&
-                (tile == LinearTile::Simdgroup || tile == LinearTile::Split32 ||
+                (tile == LinearTile::Split32 ||
                  (tile == LinearTile::Paired256 && epilogue == LinearEpilogue::None));
             require(((lanes == 3 && tile == LinearTile::N128 && epilogue != LinearEpilogue::GateUp) ||
-                     oneLane) && plan.secondPipeline().empty(),
+                     oneLane || plan.usesSimdgroup()) && plan.secondPipeline().empty(),
                     "four-SIMDgroup candidate escaped its precompiled workload set");
-            if (lanes == 3)
+            if (lanes == 3 && !plan.usesSimdgroup())
               require(plan.pipeline() == (epilogue == LinearEpilogue::Residual
                           ? "decode_linear_q4_n128_residual_m24_sg4" : "decode_linear_q4_n128_m24_sg4"),
                       "four-SIMDgroup plan chose the wrong pipeline");
@@ -494,7 +496,7 @@ void planContracts(uint32_t family, uint32_t cores, size_t &widestCandidates) {
                   "Linear plan scope/thread count disagree");
           require(plan.storageRows() == lanes * 8 && !plan.sumsBytes() && !plan.downSumsBytes(),
                   "decode storage/sums contract changed");
-          require(plan.gateScratchBytes() == (epilogue == LinearEpilogue::GateUp && lanes >= 3
+          require(plan.gateScratchBytes() == (epilogue == LinearEpilogue::GateUp && lanes >= 3 && !plan.usesSimdgroup()
                       ? uint64_t{lanes} * 8 * matrix.outputSize * 2 : 0),
                   "decode gate scratch disagrees with decomposition");
           for (size_t prior = 0; prior < index; ++prior)
@@ -505,11 +507,11 @@ void planContracts(uint32_t family, uint32_t cores, size_t &widestCandidates) {
         // the split tiles when K allows them: Split32 for every decode
         // epilogue, Split64 for the single-stream ones.
         require((fourScopeCandidates != 0) ==
-                    ((lanes == 3 && epilogue != LinearEpilogue::GateUp) ||
+                    (family == 9 || (lanes == 3 && epilogue != LinearEpilogue::GateUp) ||
                      (lanes == 1 && (family == 9 || epilogue == LinearEpilogue::None || matrix.inputSize % 1024 == 0))),
                 "Linear candidate set omitted or added four-SIMDgroup plans");
         uint32_t legalSplits = 0;
-        if (lanes == 1 && family == 9)
+        if (family == 9)
           for (uint32_t split : {1U, 2U, 4U, 8U})
             legalSplits += matrix.inputSize % (64 * split) == 0;
         require(simdgroupCandidates == legalSplits,
@@ -588,7 +590,12 @@ void planContracts(uint32_t family, uint32_t cores, size_t &widestCandidates) {
   }
   rejects([&] { (void)Q4Linear::plan({{512, 768}, 8},
       {LinearTile::Simdgroup, 8, LinearSimdgroups::Four, 8}); });
-  rejects([&] { (void)Q4Linear::plan({{512, 1024}, 16}, matrixTile); });
+  for (uint32_t rows : {8U,16U,24U,32U}) {
+    const auto size = Q4Linear::plan({{512,1024},rows}, matrixTile).scratchSize();
+    require(size.input == uint64_t(rows)*1024*2 && size.sums == uint64_t(rows)*16*4 &&
+                size.partials == uint64_t(rows)*512*2*4*4 && size.counters == uint64_t(rows/8)*8*4,
+            "matrix row tiles must own disjoint input, sums, partials and counters");
+  }
   rejects([&] { (void)Q4Linear::plan(splitWorkload,
       {LinearTile::Simdgroup, 4, LinearSimdgroups::Four, 4}); });
   rejects([&] { (void)Q4Linear::plan(splitWorkload,
@@ -1011,10 +1018,12 @@ void numericalCase(metal::MetalBackend &backend, Q4Linear &linear,
       require(last.threadgroups.x == plan.configuration().groups &&
                   graph.dispatches().size() == dispatches,
               "Linear decode plan/graph geometry mismatch");
-      require(stats.fusedSourceOperations == (lanes == 1 ? 0 : lanes * dispatches) &&
-                  stats.m16Dispatches == (lanes == 2 ? dispatches : 0) &&
-                  stats.m24Dispatches == (lanes == 3 ? dispatches : 0) &&
-                  stats.m32Dispatches == (lanes == 4 ? dispatches : 0),
+      // These counters describe projection fusion, excluding input preparation.
+      const uint32_t projections = plan.secondPipeline().empty() ? 1 : 2;
+      require(stats.fusedSourceOperations == (lanes == 1 ? 0 : lanes * projections) &&
+                  stats.m16Dispatches == (lanes == 2 ? projections : 0) &&
+                  stats.m24Dispatches == (lanes == 3 ? projections : 0) &&
+                  stats.m32Dispatches == (lanes == 4 ? projections : 0),
               "Linear dispatch statistics changed");
     } else {
       require(last.threadgroups.x == storageRows / 32 &&

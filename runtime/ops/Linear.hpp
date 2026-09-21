@@ -90,7 +90,8 @@ struct LinearChoice final {
 
 // Reused serially within one decode command stream. Counters are zeroed at
 // allocation and restored by each completed split dispatch. Never share this
-// workspace between concurrent command streams.
+// workspace between concurrent command streams. Within a batched dispatch,
+// each eight-row tile owns disjoint input, sums, partials and counters.
 struct LinearScratch final {
   metal::MetalBuffer input;
   metal::MetalBuffer sums;
@@ -164,7 +165,8 @@ public:
   // N256 grids, and 4 Apple9 simdgroup K splits (including its baseline):
   // 3 * 4 + 2 + 2 + 4 = 20. Other families have no simdgroup candidates
   // and at most one additional baseline (17). M24 replaces Paired128 with
-  // N128/four-simdgroup candidates, and has no one-lane tiles (at most 13).
+  // N128/four-simdgroup candidates and adds up to four matrix K splits,
+  // with no one-lane tiles (at most 17).
   static constexpr std::size_t kMaximumCandidates = 20;
 
   [[nodiscard]] LinearPlan plan(LinearWorkload workload) const;

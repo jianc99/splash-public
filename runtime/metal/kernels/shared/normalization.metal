@@ -36,6 +36,7 @@ kernel void norm_rms_q4_decode(device const bfloat *input [[buffer(0)]],
     const bfloat b = bfloat(float(input[row * width + k + 1]) * inverse * float(weight[k + 1]));
     output[row * width + k] = a;
     output[row * width + k + 1] = b;
-    q4sg::write_input(table, sums, g, row, lane, a, b);
+    q4sg::write_input(table + ulong(row / 8) * width * 8,
+                       sums + ulong(row / 8) * width / 8, g, row % 8, lane, a, b);
   }
 }

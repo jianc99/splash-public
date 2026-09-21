@@ -87,8 +87,8 @@ void baselinePlans() {
         }
       }
       require(plans.gateUpWorkspace(matrix) == gateBound &&
-                  gateBound == uint64_t{32} * matrix.outputSize * 2,
-              "gate/up bound omitted baseline B3/B4 scratch");
+                  gateBound == (family == 9 ? 0 : uint64_t{32} * matrix.outputSize * 2),
+              "gate/up workspace disagrees with fused or decomposed baseline");
       for (uint32_t rows : {1U, 17U, 2048U})
         for (auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual,
                               LinearEpilogue::UpWithGate}) {

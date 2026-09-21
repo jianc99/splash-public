@@ -566,33 +566,33 @@ void runDecode(MetalBackend &backend, const GdnShape &shape, uint32_t lanes) {
   }
 }
 
-void fusedPreparation(MetalBackend &backend, const GdnShape &shape) {
-  Fixture fixture(backend, shape, 1);
+void fusedPreparation(MetalBackend &backend, const GdnShape &shape, uint32_t lanes) {
+  Fixture fixture(backend, shape, lanes);
   const uint32_t width = shape.valueHeads * shape.headDimension;
-  auto table = backend.allocateBuffer(width * 16);
-  auto sums = backend.allocateBuffer(width / 2);
-  auto referenceTable = backend.allocateBuffer(width * 16);
-  auto referenceSums = backend.allocateBuffer(width / 2);
+  auto table = backend.allocateBuffer(width * 16 * lanes);
+  auto sums = backend.allocateBuffer(width / 2 * lanes);
+  auto referenceTable = backend.allocateBuffer(width * 16 * lanes);
+  auto referenceSums = backend.allocateBuffer(width / 2 * lanes);
   CommandGraph reference;
-  GDN::addDecode(reference, fixture.decodeBuffers(0), shape, 1, 0, fixture.cell.strides());
+  GDN::addDecode(reference, fixture.decodeBuffers(0), shape, lanes, 0, fixture.cell.strides());
   reference.add("decode_linear_q4_prepare", {fixture.hidden, referenceTable, referenceSums},
-                width, {width / 32, 1, 1}, {128, 1, 1});
+                width, {width / 32, lanes, 1}, {128, 1, 1});
   (void)backend.submitCommand(reference.dispatches());
-  std::vector<uint8_t> expected(width * 16);
+  std::vector<uint8_t> expected(width * 16 * lanes);
   std::memcpy(expected.data(), fixture.hidden.contents(), expected.size());
   fixture.clear();
   auto buffers = fixture.decodeBuffers(0);
   buffers.linearScratch = {table, sums, {}, {}};
   CommandGraph fused;
-  GDN::addDecode(fused, buffers, shape, 1, 0, fixture.cell.strides());
+  GDN::addDecode(fused, buffers, shape, lanes, 0, fixture.cell.strides());
   (void)backend.submitCommand(fused.dispatches());
   require(!std::memcmp(expected.data(), fixture.hidden.contents(), expected.size()),
           "fused GDN changed output");
-  require(!std::memcmp(table.contents(), referenceTable.contents(), width * 16),
+  require(!std::memcmp(table.contents(), referenceTable.contents(), width * 16 * lanes),
           "fused GDN table mismatch");
-  require(!std::memcmp(sums.contents(), referenceSums.contents(), width / 2),
+  require(!std::memcmp(sums.contents(), referenceSums.contents(), width / 2 * lanes),
           "fused GDN sums mismatch");
-  checkDecode(fixture, 0, 0);
+  for (uint32_t lane=0;lane<lanes;++lane) checkDecode(fixture, 0, lane);
 }
 
 void rejectsInvalid(MetalBackend &backend) {
@@ -633,7 +633,8 @@ int main(int argc, char **argv) {
       throw std::invalid_argument("usage: gdn-decode METALLIB");
     MetalBackend backend(argv[1]);
     rejectsInvalid(backend);
-    for (const GdnShape &shape : kShapes) fusedPreparation(backend, shape);
+    for (const GdnShape &shape : kShapes)
+      for (uint32_t lanes=1;lanes<=kMaxLanes;++lanes) fusedPreparation(backend, shape, lanes);
     for (const GdnShape &shape : kShapes)
       for (uint32_t lanes = 1; lanes <= kMaxLanes; ++lanes)
         runDecode(backend, shape, lanes);

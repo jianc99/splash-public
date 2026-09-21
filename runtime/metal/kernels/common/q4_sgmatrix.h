@@ -5,6 +5,7 @@ using namespace metal;
 
 // Eight-row decode activation layout shared by the normalizer, pre-pass and
 // register matrix kernel. One 64-element group occupies 512 bfloat values.
+// A batch concatenates these eight-row tables, one per request lane.
 namespace q4sg {
 // simdgroup_matrix lane -> element mapping (verified by the driver's probe):
 // a lane's thread_elements() are M[fm][fn] and M[fm][fn + 1].

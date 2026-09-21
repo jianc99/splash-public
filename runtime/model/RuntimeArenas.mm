@@ -328,14 +328,16 @@ ops::LinearScratchSize DecodeArena::linearScratchSize(
   ops::LinearScratchSize result;
   const auto include = [&](ops::LinearMatrix matrix) {
     if (!matrix.outputSize || !matrix.inputSize) return;
-    for (auto epilogue : {ops::LinearEpilogue::None, ops::LinearEpilogue::Residual,
-                          ops::LinearEpilogue::GateUp}) {
-      const auto size = operators.linear().decodeScratchSize(
-          {matrix, 8, ops::LinearPhase::Decode, epilogue});
-      result.input = std::max(result.input, size.input);
-      result.sums = std::max(result.sums, size.sums);
-      result.partials = std::max(result.partials, size.partials);
-      result.counters = std::max(result.counters, size.counters);
+    for (uint32_t lanes = 1; lanes <= kLaneCount; ++lanes) {
+      for (auto epilogue : {ops::LinearEpilogue::None, ops::LinearEpilogue::Residual,
+                            ops::LinearEpilogue::GateUp}) {
+        const auto size = operators.linear().decodeScratchSize(
+            {matrix, lanes * kDecodeRows, ops::LinearPhase::Decode, epilogue});
+        result.input = std::max(result.input, size.input);
+        result.sums = std::max(result.sums, size.sums);
+        result.partials = std::max(result.partials, size.partials);
+        result.counters = std::max(result.counters, size.counters);
+      }
     }
   };
   for (auto matrix : {ops::LinearMatrix{t.packedGdnWidth, t.hiddenSize},

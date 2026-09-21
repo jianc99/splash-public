@@ -374,7 +374,9 @@ inline void gdn_decode_batch_phase(
     for (uint g = 0; g < HeadDim / 64; ++g) {
       const uint column = group.x * HeadDim + g * 64 + 2 * lane;
       const uint index = simd_group * ValueWidth + column;
-      q4sg::write_input(q4_table, q4_sums, column / 64, simd_group, lane,
+      q4sg::write_input(q4_table + ulong(batch) * ValueWidth * Rows,
+                        q4_sums + ulong(batch) * ValueWidth / 8,
+                        column / 64, simd_group, lane,
                         lane_hidden[index], lane_hidden[index + 1]);
     }
   }
