@@ -83,6 +83,23 @@ splash serve --model incoai/Qwen3.8-27B-Splash --served-model-name local-qwen
 Aliases cannot contain whitespace, control characters, `\`, `%`, `?`, `#`,
 or empty, `.` or `..` path segments. This keeps model discovery URLs unambiguous.
 
+## Default reasoning effort
+
+`--default-reasoning-effort` (or `SPLASH_DEFAULT_REASONING_EFFORT`) sets the
+fallback for Chat `reasoning_effort` and Responses `reasoning.effort` when absent
+or null. Accepted values: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`,
+`max`. An explicit request value wins; the CLI flag takes precedence over the
+environment. Unset, the model's template default is unchanged. Effort names are
+passed to the template using the same mapping as per-request values, not token
+budgets.
+
+```sh
+splash serve --model incoai/Qwen3.8-27B-Splash --default-reasoning-effort none
+```
+
+`/apply-template` uses the same default. Anthropic `thinking` keeps its protocol
+semantics (off when omitted); judgment endpoints always disable thinking.
+
 ## Model cache
 
 To download new models to another disk, set the cache location before serving:

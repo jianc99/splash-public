@@ -24,6 +24,7 @@ except ImportError:  # Executed directly by the source or packaged entry point.
 ROOT = paths.ROOT
 RUNTIME_DIR = paths.RUNTIME
 PORT = 8000
+REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 BASE_URL = f"http://127.0.0.1:{PORT}"
 
 
@@ -180,6 +181,10 @@ def serve(args):
         ]
         for name in args.served_model_name:
             command.append(f"--served-model-name={name}")
+        if args.default_reasoning_effort is not None:
+            command.extend(
+                ["--default-reasoning-effort", args.default_reasoning_effort]
+            )
         if args.max_request_size is not None:
             command.extend(["--max-request-size", str(args.max_request_size)])
         if args.max_image_pixels is not None:
@@ -366,6 +371,12 @@ def parse_args(argv=None):
         help="additional API model name; responses keep the loaded model ID (repeatable)",
     )
     server.add_argument(
+        "--default-reasoning-effort",
+        choices=REASONING_EFFORTS,
+        default=os.environ.get("SPLASH_DEFAULT_REASONING_EFFORT"),
+        help="Chat/Responses effort when unspecified (default: SPLASH_DEFAULT_REASONING_EFFORT or model template)",
+    )
+    server.add_argument(
         "--max-memory",
         type=_parse_max_memory,
         help="Metal budget ceiling, e.g. 28G (default: auto)",
@@ -401,6 +412,14 @@ def parse_args(argv=None):
     for name in clients.INSTALL_URLS:
         commands.add_parser(name, help=f"connect {name} to the running server")
     args = parser.parse_args(argv)
+    if (
+        args.command == "serve"
+        and args.default_reasoning_effort is not None
+        and args.default_reasoning_effort not in REASONING_EFFORTS
+    ):
+        parser.error(
+            "invalid --default-reasoning-effort / SPLASH_DEFAULT_REASONING_EFFORT"
+        )
     if args.command in clients.INSTALL_URLS:
         try:
             args.port = _parse_port(os.environ.get("SPLASH_PORT", str(PORT)))

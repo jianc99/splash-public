@@ -3094,6 +3094,7 @@ class ServerTest(unittest.TestCase):
         args = SimpleNamespace(
             target="target",
             served_model_name=[],
+            default_reasoning_effort=None,
             draft="draft",
             tokenizer="tokenizer",
             model="test-model",
@@ -3196,6 +3197,7 @@ class ServerTest(unittest.TestCase):
         args = SimpleNamespace(
             target="target",
             served_model_name=[],
+            default_reasoning_effort=None,
             draft="draft",
             tokenizer="tokenizer",
             model="test-model",
@@ -3243,6 +3245,7 @@ class ServerTest(unittest.TestCase):
         args = SimpleNamespace(
             target="target",
             served_model_name=[],
+            default_reasoning_effort=None,
             draft="draft",
             tokenizer="tokenizer",
             model="test-model",
