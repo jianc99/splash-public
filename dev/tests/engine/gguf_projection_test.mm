@@ -173,8 +173,67 @@ static Seg makeSegK(Fmt f, uint32_t N, uint32_t K, uint32_t colOffset) {   // no
 struct GgufFusedParams { uint32_t input_size, out_stride, segments, reserved, cols[3], fmt[3], offset[3]; };
 struct GgufGateUpParams { uint32_t input_size, output_size, out_stride, gate_fmt, up_fmt; };
 struct GgufSplitParams { uint32_t output_size, input_size, splits, out_stride, out_offset, epilogue, k_permute; };
+// The small oracle shapes missed a shader-validation-sensitive Q3_K prefill
+// regression at the 27B out-projection dimensions. Check repeatability over the
+// entire output and FP64 staged-weight dot products across tile boundaries.
+static int checkQ3PrefillRepeatability(id<MTLLibrary> lib) {
+  constexpr uint32_t N = 5120, K = 6144;
+  const std::string name = "pfa_q3k_r32_sg4_n64_k64_p1";
+  auto ps = pso(lib, name);
+  if (!ps) return 1;
+  Seg s = makeSeg(Q3K, N, K, 0);
+  std::mt19937 inputRng(42);
+  std::uniform_real_distribution<float> random(-1.f, 1.f);
+  int failures = 0;
+  for (uint32_t rows : {128u, 256u}) {
+    auto X = mkbuf(uint64_t(rows) * K * 2), Y = mkbuf(uint64_t(rows) * N * 2);
+    auto *x = static_cast<uint16_t *>(X.contents);
+    for (size_t i = 0; i < size_t(rows) * K; ++i) x[i] = f2bf(random(inputRng));
+    GgufParams p{N, K, 0, N, 0, 0};
+    Dispatch d{ps, {X, s.w0, s.w1, s.meta, Y}, bytes(p), 5,
+               MTLSizeMake(rows / 128, N / 64, 1), MTLSizeMake(128, 1, 1)};
+    std::vector<uint16_t> first(size_t(rows) * N);
+    size_t different = 0, nonfinite = 0, outsideReference = 0;
+    for (int repeat = 0; repeat < 4; ++repeat) {
+      // Poison output so missing stores cannot pass as a stable zero result.
+      std::fill_n(static_cast<uint16_t *>(Y.contents), first.size(), uint16_t(0x7fc0));
+      runOnce({d}, 1);
+      const auto *y = static_cast<const uint16_t *>(Y.contents);
+      for (size_t i = 0; i < first.size(); ++i) {
+        nonfinite += !std::isfinite(bf2f(y[i]));
+        if (repeat) different += y[i] != first[i];
+      }
+      if (repeat == 0) std::copy_n(y, first.size(), first.begin());
+      // Sample both sides of each 16-row and 64-column boundary. Full FP64
+      // GEMM at these dimensions would dominate the regular test suite.
+      for (uint32_t r = 0; r < rows; ++r) {
+        if (r % 16 != 0 && r % 16 != 15) continue;
+        for (uint32_t c = 0; c < N; c += 64) for (uint32_t n : {c, c + 3, c + 63}) {
+          double ref = 0, magnitude = 0;
+          for (uint32_t k = 0; k < K; ++k) {
+            const double v = double(bf2f(x[size_t(r) * K + k])) * s.Ws[size_t(n) * K + k];
+            ref += v; magnitude += std::fabs(v);
+          }
+          const uint16_t bits = y[size_t(r) * N + n];
+          const double got = bf2f(bits);
+          const double halfUlp = 0.5 * std::max(std::fabs(bf2f(uint16_t(bits + 1)) - got),
+                                               std::fabs(bf2f(uint16_t(bits - 1)) - got));
+          // FP32 dot-product rounding bound plus the final BF16 rounding cell.
+          constexpr double gamma = (K * 0x1p-24) / (1.0 - K * 0x1p-24);
+          outsideReference += !std::isfinite(got) || std::fabs(got - ref) > halfUlp + gamma * magnitude;
+        }
+      }
+    }
+    const bool ok = different == 0 && nonfinite == 0 && outsideReference == 0;
+    failures += !ok;
+    printf("Q3_K prefill repeat rows=%u N=%u K=%u: different=%zu nonfinite=%zu reference_failures=%zu %s\n",
+           rows, N, K, different, nonfinite, outsideReference, ok ? "ok" : "FAIL");
+  }
+  return failures;
+}
+
 int main(int argc, char **argv) { @autoreleasepool {
-  if (argc < 2) { std::cerr << "usage: harness_prod <metallib> [full|dequant|time-gu] [input-scale] [seed]\n"; return 2; }
+  if (argc < 2) { std::cerr << "usage: harness_prod <metallib> [full|dequant|prefill-repeat|time-gu] [input-scale] [seed]\n"; return 2; }
   dev = MTLCreateSystemDefaultDevice(); queue = [dev newCommandQueue];
   NSError *err = nil; id<MTLLibrary> lib = [dev newLibraryWithURL:[NSURL fileURLWithPath:[NSString stringWithUTF8String:argv[1]]] error:&err];
   if (!lib) { std::cerr << "library load failed: " << err.localizedDescription.UTF8String << "\n"; return 1; }
@@ -202,6 +261,7 @@ int main(int argc, char **argv) { @autoreleasepool {
     }
     return failures ? 1 : 0;
   }
+  if (argc > 2 && std::string(argv[2]) == "prefill-repeat") return checkQ3PrefillRepeatability(lib) ? 1 : 0;
   const bool full = argc > 2 && std::string(argv[2]) == "full";
   const float inputScale = argc > 3 ? std::stof(argv[3]) : 1.f;
   if (argc > 4) rng.seed(std::stoul(argv[4]));
@@ -311,6 +371,7 @@ int main(int argc, char **argv) { @autoreleasepool {
         GgufSplitParams sp{N, K, splits, N, 0, 0, spec}; snprintf(name, sizeof name, "gguf_splitk_%s_m%u_kp", fmtName[fi], rows); id<MTLComputePipelineState> ps = pso(lib, name); if (!ps) { ++failures; continue; }
         Dispatch d{ps, {Xbf, s.w0, s.w1, s.meta, partials, counters, Ys, Ys}, bytes(sp), 8, MTLSizeMake(N / 64, splits, 1), MTLSizeMake(64, 1, 1)}; runOnce({d}, 1);
         compare(name, Ys, ref, rows, N); } } }
+  failures += checkQ3PrefillRepeatability(lib);
   printf("%s (%d failures)\n", failures ? "VALIDATION FAILED" : "all production kernels validated", failures);
   if (argc > 2 && std::string(argv[2]) == "time-gu") {
     const uint32_t NN = 17408, KK = 5120;
