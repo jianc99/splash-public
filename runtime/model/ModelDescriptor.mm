@@ -353,7 +353,8 @@ ModelDescriptor makeModelDescriptor(std::string name, TargetLayout target,
 }
 
 bool ModelDescriptor::valid() const noexcept {
-  if (name.empty() || !capabilities.vocabularySize ||
+  if ((targetSource != TargetSource::Packed && targetSource != TargetSource::Affine && targetSource != TargetSource::Gguf) ||
+      name.empty() || !capabilities.vocabularySize ||
       !capabilities.maximumContextTokens ||
       capabilities.maximumBatchWidth != ExecutionLimits::maximumBatchWidth ||
       capabilities.prefillTokenBudget != ExecutionLimits::prefillTokenBudget ||
@@ -393,9 +394,9 @@ ModelDescriptor inspectModelPackage(const std::filesystem::path &root) {
     if (format == "splash-packed-q4") {
       descriptor = qwen38Descriptor(model);
       validateQwen38(manifest, root, descriptor);
-    } else if (format == "gguf") {
+    } else if (format == "gguf" || format == "mlx-affine") {
       // The schema names the target as for the packed formats: 3 Qwen3.8,
-      // 4 Qwen3.6 MoE. The loader checks the GGUF's architecture against it.
+      // 4 Qwen3.6 MoE. The source adapter checks the architecture against it.
       const uint64_t schema =
           requireUnsigned(manifest, @"schema_version", "schema_version");
       if (schema == 3) {
@@ -405,12 +406,13 @@ ModelDescriptor inspectModelPackage(const std::filesystem::path &root) {
         descriptor = qwen36Descriptor(model);
         validateQwen36Declarations(manifest, root, descriptor);
       } else {
-        throw std::invalid_argument("unsupported GGUF package schema_version " +
+        throw std::invalid_argument("unsupported source package schema_version " +
                                     std::to_string(schema));
       }
       validateCommonFormat(requireObject(manifest, @"format", "model weight format"),
-                           kGgufImageMagic);
-      descriptor.ggufTarget = true;
+                           format == "gguf" ? kGgufImageMagic
+                             : schema == 3 ? Qwen3_8Layout::layerMagic : Qwen3_6MoeLayout::layerMagic);
+      descriptor.targetSource = format == "gguf" ? TargetSource::Gguf : TargetSource::Affine;
     } else if (format == "splash-packed-q4-moe") {
       descriptor = qwen36Descriptor(model);
       validateQwen36(manifest, root, descriptor);

@@ -90,24 +90,22 @@ constexpr bool isGdnMixer =
 
 namespace {
 // Concatenates GGUF tensors into one fused projection along output columns.
-ops::Q4Projection readGgufFused(WeightFile &file, uint32_t outputSize,
+ops::Projection readGgufFused(WeightFile &file, uint32_t outputSize,
                                   uint32_t inputSize,
                                   std::initializer_list<const char *> labels) {
-  ops::Q4Projection p;
-  p.outputSize = outputSize;
-  p.inputSize = inputSize;
+  ops::BlockWeights weights;
   uint32_t offset = 0;
   for (const char *label : labels) {
-    ops::GgufSegment s = readGgufSegment(file, label);
+    ops::QuantizedSegment s = readQuantizedSegment(file, label);
     s.columnOffset = offset;
     offset += s.outputSize;
-    p.gguf.push_back(std::move(s));
+    weights.segments.push_back(std::move(s));
   }
   // The segments may leave the padding columns of a destination row
   // unwritten (LinearGguf.cpp requireSegments).
-  if (offset > outputSize || p.gguf.front().inputSize != inputSize)
+  if (offset > outputSize || weights.segments.front().inputSize != inputSize)
     throw WeightStoreError("GGUF fused projection does not match the layout");
-  return p;
+  return {outputSize, inputSize, std::move(weights)};
 }
 } // namespace
 
@@ -120,7 +118,7 @@ QwenMixerWeights readQwenMixer(WeightFile &file, metal::MetalBackend &backend,
     attention.inputProjection = ggufTarget
         ? readGgufFused(file, geometry.packedAttentionWidth, geometry.hiddenSize,
                           {"attn-q", "attn-k", "attn-v"})
-        : readQ4Projection(file, backend, geometry.packedAttentionWidth,
+        : readProjection(file, backend, geometry.packedAttentionWidth,
                            geometry.hiddenSize, "attention-input");
     attention.queryNorm =
         readNorm(file, geometry.attentionHeadDimension, ggufTarget, "query-norm");
@@ -128,7 +126,7 @@ QwenMixerWeights readQwenMixer(WeightFile &file, metal::MetalBackend &backend,
         readNorm(file, geometry.attentionHeadDimension, ggufTarget, "key-norm");
     attention.outputProjection = ggufTarget
         ? readGgufProjection(file, "attn-output")
-        : readQ4Projection(file, backend, geometry.hiddenSize,
+        : readProjection(file, backend, geometry.hiddenSize,
                            geometry.attentionWidth, "attention-output");
     return attention;
   }
@@ -136,7 +134,7 @@ QwenMixerWeights readQwenMixer(WeightFile &file, metal::MetalBackend &backend,
   gdn.inputProjection = ggufTarget
       ? readGgufFused(file, geometry.packedGdnWidth, geometry.hiddenSize,
                         {"gdn-qkv", "gdn-z", "gdn-ab"})
-      : readQ4Projection(file, backend, geometry.packedGdnWidth,
+      : readProjection(file, backend, geometry.packedGdnWidth,
                          geometry.hiddenSize, "gdn-input");
   gdn.convolutionWeights = file.section(
       checkedWeightMultiply(
@@ -159,7 +157,7 @@ QwenMixerWeights readQwenMixer(WeightFile &file, metal::MetalBackend &backend,
     gdn.outputProjection = readGgufProjection(file, "gdn-output");
     gdn.outputHeadOrder = ops::GdnHeadOrder::Tiled;
   } else {
-    gdn.outputProjection = readQ4Projection(
+    gdn.outputProjection = readProjection(
         file, backend, geometry.hiddenSize, geometry.attentionWidth, "gdn-output");
   }
   return gdn;
@@ -183,28 +181,63 @@ QwenTarget::QwenTarget(const Qwen3_6MoeWeights &weights,
   requireWeights(weights, geometry_);
 }
 
-QwenTargetGeometry qwenTargetGeometry(const Qwen3_8Weights &weights) {
-  QwenTargetGeometry geometry = geometryFor(weights.layout);
-  if (!weights.logitsProjection.gguf.empty()) geometry.quant = ops::QuantFamily::Gguf;
+namespace {
+template <class Weights>
+QwenTargetGeometry targetGeometry(const Weights &weights) {
+  auto geometry = geometryFor(weights.layout);
+  const auto include = [&](const ops::Projection &p) {
+    if (p.outputSize && p.inputSize) geometry.decodeProjections.push_back(p.shape());
+  };
+  for (const auto &layer : weights.layers) {
+    std::visit([&](const auto &mixer) {
+      include(mixer.inputProjection);
+      include(mixer.outputProjection);
+    }, layer.mixer);
+    if constexpr (hasDenseFfn<decltype(layer)>) {
+      include(layer.gateProjection);
+      include(layer.upProjection);
+      include(layer.downProjection);
+      if (layer.upProjection.outputSize && layer.upProjection.inputSize)
+        geometry.gateUpProjections.push_back(layer.upProjection.shape());
+    } else {
+      auto shape = geometry.moe;
+      shape.weightLayout = layer.ffn.layout();
+      if (std::none_of(geometry.moeShapes.begin(), geometry.moeShapes.end(),
+          [&](const auto &s) { return s.weightLayout == shape.weightLayout; }))
+        geometry.moeShapes.push_back(shape);
+    }
+  }
+  geometry.prefillProjections = geometry.decodeProjections;
+  include(weights.logitsProjection);
+  for (auto *shapes : {&geometry.prefillProjections, &geometry.decodeProjections,
+                       &geometry.gateUpProjections}) {
+    std::sort(shapes->begin(), shapes->end());
+    shapes->erase(std::unique(shapes->begin(), shapes->end()), shapes->end());
+  }
   return geometry;
+}
+} // namespace
+
+QwenTargetGeometry qwenTargetGeometry(const Qwen3_8Weights &weights) {
+  return targetGeometry(weights);
 }
 
 QwenTargetGeometry qwenTargetGeometry(const Qwen3_6MoeWeights &weights) {
-  QwenTargetGeometry geometry = geometryFor(weights.layout);
-  if (!weights.logitsProjection.gguf.empty())
-    geometry.quant = geometry.moe.quant = ops::QuantFamily::Gguf;
-  return geometry;
+  return targetGeometry(weights);
 }
 
-const ops::Q4Projection &QwenTarget::vocabularyProjection() const noexcept {
-  return std::visit([](const auto *weights) -> const ops::Q4Projection & {
+const ops::Projection &QwenTarget::vocabularyProjection() const noexcept {
+  return std::visit([](const auto *weights) -> const ops::Projection & {
     return weights->logitsProjection;
   }, weights_);
 }
 
 uint32_t QwenTarget::decodeStorageLanes(uint32_t lanes) const {
-  return operators_.linear().decodeStorageRows(lanes * ExecutionLimits::targetVerifyRows, geometry_.quant) /
-         ExecutionLimits::targetVerifyRows;
+  const uint32_t rows = lanes * ExecutionLimits::targetVerifyRows;
+  uint32_t storageRows = rows;
+  for (const auto &shape : geometry_.decodeProjections)
+    storageRows = std::max(storageRows, operators_.linear().decodeStorageRows(rows, shape.layout));
+  return storageRows / ExecutionLimits::targetVerifyRows;
 }
 
 void QwenTarget::addPrefill(
@@ -245,11 +278,9 @@ void QwenTarget::addPrefillImpl(
                                            geometry_.hiddenSize};
   const ops::LinearMatrix mixerOutput{geometry_.hiddenSize,
                                         geometry_.attentionWidth};
-  const auto moePlan = [&]() -> std::optional<ops::MoePlan> {
-    if constexpr (!hasDenseFfn<typename std::remove_cvref_t<decltype(weights.layers)>::value_type>)
-      return operators_.moePrefill(geometry_.moe, rows);
-    return std::nullopt;
-  }();
+  std::array<std::optional<ops::MoePlan>, 2> moePlans;
+  for (const auto &shape : geometry_.moeShapes)
+    moePlans.at(static_cast<size_t>(shape.weightLayout)) = operators_.moePrefill(shape, rows);
 
   auto u16 = [&](const metal::MetalBuffer &buffer, uint32_t begin,
                  uint32_t count, uint32_t width) {
@@ -406,7 +437,7 @@ void QwenTarget::addPrefillImpl(
            buffers.groupedRoutes, buffers.routeRows, buffers.groupedInput,
            buffers.expertIntermediate, buffers.expertOutput,
            buffers.groupedSums},
-          layer.ffn, *moePlan);
+          layer.ffn, *moePlans.at(static_cast<size_t>(layer.ffn.layout())));
     }
 
     const auto captureLayers = geometry_.captureLayers();
@@ -437,7 +468,7 @@ void QwenTarget::addVerify(
     std::span<const kv::LayerStorage> kvLayers,
     std::span<const kv::Q8ChunkedPrefillParams> q8,
     std::span<const kv::Q8VerifyAttentionParams> verify, uint32_t lanes,
-    ops::Q4DispatchStats &stats) const {
+    ops::LinearDispatchStats &stats) const {
   std::visit(
       [&](const auto *weights) {
         addVerifyImpl(*weights, graph, std::move(buffers), kvLayers, q8,
@@ -453,7 +484,7 @@ void QwenTarget::addVerifyImpl(
     std::span<const kv::LayerStorage> kvLayers,
     std::span<const kv::Q8ChunkedPrefillParams> q8,
     std::span<const kv::Q8VerifyAttentionParams> verify, uint32_t lanes,
-    ops::Q4DispatchStats &stats) const {
+    ops::LinearDispatchStats &stats) const {
   if (!lanes || lanes > ExecutionLimits::maximumBatchWidth ||
       q8.size() != ExecutionLimits::maximumBatchWidth ||
       verify.size() != ExecutionLimits::maximumBatchWidth ||
@@ -475,11 +506,9 @@ void QwenTarget::addVerifyImpl(
   const ops::LinearMatrix gdnInput{geometry_.packedGdnWidth, geometry_.hiddenSize};
   const ops::LinearMatrix attentionInput{geometry_.packedAttentionWidth, geometry_.hiddenSize};
   const ops::LinearMatrix mixerOutput{geometry_.hiddenSize, geometry_.attentionWidth};
-  const auto moePlan = [&]() -> std::optional<ops::MoePlan> {
-    if constexpr (!hasDenseFfn<typename std::remove_cvref_t<decltype(weights.layers)>::value_type>)
-      return operators_.moeDecode(geometry_.moe, lanes);
-    return std::nullopt;
-  }();
+  std::array<std::optional<ops::MoePlan>, 2> moePlans;
+  for (const auto &shape : geometry_.moeShapes)
+    moePlans.at(static_cast<size_t>(shape.weightLayout)) = operators_.moeDecode(shape, lanes);
   constexpr uint32_t tileRows = kv::kPageTokens;
 
   uint32_t gdnIndex = 0;
@@ -586,7 +615,7 @@ void QwenTarget::addVerifyImpl(
            buffers.groupedRoutes, buffers.routeRows, buffers.groupedInput,
            buffers.expertIntermediate, buffers.expertOutput,
            buffers.groupedSums},
-          layer.ffn, *moePlan);
+          layer.ffn, *moePlans.at(static_cast<size_t>(layer.ffn.layout())));
     }
 
     const auto captureLayers = geometry_.captureLayers();
@@ -638,8 +667,8 @@ void QwenTarget::addEmbedding(metal::CommandGraph &graph,
                               metal::MetalBuffer tokens,
                               metal::MetalBuffer hidden,
                               uint32_t rows) const {
-  const ops::Q4Projection &embedding = std::visit(
-      [](const auto *weights) -> const ops::Q4Projection & {
+  const ops::EmbeddingWeights &embedding = std::visit(
+      [](const auto *weights) -> const ops::EmbeddingWeights & {
         return weights->tokenEmbedding;
       },
       weights_);

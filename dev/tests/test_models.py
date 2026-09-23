@@ -1231,6 +1231,192 @@ class ModelArtifactTest(unittest.TestCase):
             ],
         )
 
+    def affine_source_fixture(self, schema=3):
+        snapshot, manifest = self.package_fixture(schema=schema)
+        manifest["format"]["name"] = "mlx-affine"
+        manifest["artifacts"] = [
+            r for r in manifest["artifacts"] if not r["path"].startswith("target/")
+        ]
+        repo = "quantizer/Affine-Model"
+        upstream = (
+            self.root
+            / "source-cache"
+            / ("models--" + repo.replace("/", "--"))
+            / "snapshots"
+            / ("d" * 40)
+        )
+        upstream.mkdir(parents=True, exist_ok=True)
+        for name, data in (
+            ("config.json", b'{"quantization":{"bits":4,"group_size":64}}'),
+            ("model-00001-of-00002.safetensors", b"first shard"),
+            ("model-00002-of-00002.safetensors", b"second shard"),
+        ):
+            (upstream / name).write_bytes(data)
+        source = {
+            "repo_id": repo,
+            "revision": "d" * 40,
+            "files": [
+                {
+                    "path": path.name,
+                    "size": path.stat().st_size,
+                    "sha256": artifacts.sha256(path),
+                }
+                for path in sorted(upstream.iterdir())
+            ],
+        }
+        manifest.setdefault("target", {})["source"] = source
+        self.write_manifest(snapshot, manifest)
+        return snapshot, manifest, upstream
+
+    def test_affine_source_install_reuses_shared_assets_and_pins_weights(self):
+        for schema in (3, 4):
+            snapshot, manifest, source = self.affine_source_fixture(schema)
+            validated = artifacts.validate_package_manifest(snapshot / "manifest.json")
+            self.assertEqual(
+                artifacts.target_source(validated, None), manifest["target"]["source"]
+            )
+            self.assertIsNone(artifacts.select_variant(validated, None))
+            destination = self.root / f"models-{schema}"
+            args = SimpleNamespace(models=destination, model=self.MODEL_ID)
+            with (
+                mock.patch.object(artifacts, "resolve_snapshot", return_value=snapshot),
+                mock.patch.object(
+                    artifacts,
+                    "resolve_target_source",
+                    return_value={p.name: p for p in source.iterdir()},
+                ),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                artifacts.prepare(args)
+            installed = destination / self.MODEL_ID
+            for path in source.iterdir():
+                self.assertEqual(
+                    (installed / "target" / path.name).resolve(), path.resolve()
+                )
+            self.assertEqual(
+                (installed / "draft/model.bin").resolve(),
+                (snapshot / "draft/model.bin").resolve(),
+            )
+            artifacts.verify_installed(destination, model_id=self.MODEL_ID, full=True)
+            with (
+                mock.patch.object(
+                    artifacts, "resolve_snapshot", side_effect=AssertionError("network")
+                ),
+                mock.patch.object(
+                    artifacts,
+                    "resolve_target_source",
+                    side_effect=AssertionError("network"),
+                ),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                artifacts.prepare(args)
+            shard = source / "model-00001-of-00002.safetensors"
+            shard.write_bytes(b"x" * shard.stat().st_size)
+            with self.assertRaisesRegex(artifacts.ModelError, "checksum"):
+                artifacts.verify_installed(
+                    destination, model_id=self.MODEL_ID, full=True
+                )
+
+    def test_gguf_source_uses_the_same_pinned_assembly(self):
+        snapshot, manifest, upstream = self.affine_source_fixture()
+        weight = upstream / "model.gguf"
+        weight.write_bytes(b"GGUF fixture")
+        manifest["format"].update(name="gguf", target_layer_magic="MDGG0001")
+        manifest["target"]["source"]["files"] = [
+            {
+                "path": weight.name,
+                "size": weight.stat().st_size,
+                "sha256": artifacts.sha256(weight),
+            }
+        ]
+        self.write_manifest(snapshot, manifest)
+        validated = artifacts.validate_package_manifest(snapshot / "manifest.json")
+        self.assertIsNone(artifacts.select_variant(validated, None))
+        self.assertEqual(
+            artifacts.target_source(validated, None), manifest["target"]["source"]
+        )
+        destination = self.root / "source-gguf"
+        artifacts.install_source(snapshot, destination, manifest, {weight.name: weight})
+        self.assertEqual(
+            (destination / "target" / weight.name).resolve(), weight.resolve()
+        )
+        self.assertEqual(
+            (destination / "vision/model.bin").resolve(),
+            (snapshot / "vision/model.bin").resolve(),
+        )
+
+    def test_source_manifest_rejects_unsafe_or_incomplete_assemblies(self):
+        snapshot, manifest, _ = self.affine_source_fixture()
+        mutations = [
+            lambda m: m["target"]["source"].update(revision="main"),
+            lambda m: m["target"]["source"].update(files=[]),
+            lambda m: m["target"]["source"]["files"][0].update(path="../config.json"),
+            lambda m: m["target"]["source"]["files"][0].update(
+                path="shard/config.json"
+            ),
+            lambda m: m["target"]["source"]["files"].pop(0),
+            lambda m: m["target"]["source"].update(
+                files=m["target"]["source"]["files"][:1]
+            ),
+            lambda m: m["artifacts"].append(
+                {"path": "target/old.bin", "size": 16384, "sha256": "0" * 64}
+            ),
+            lambda m: m["target"].update(gguf={}),
+        ]
+        for mutate in mutations:
+            changed = copy.deepcopy(manifest)
+            mutate(changed)
+            self.write_manifest(snapshot, changed)
+            with self.assertRaises(artifacts.ModelError):
+                artifacts.validate_package_manifest(snapshot / "manifest.json")
+
+    def test_source_publication_failure_restores_previous_installation(self):
+        snapshot, manifest, source = self.affine_source_fixture()
+        destination = self.root / "installed"
+        files = {p.name: p for p in source.iterdir()}
+        artifacts.install_source(snapshot, destination, manifest, files)
+        previous = (destination / "manifest.json").readlink()
+        rename = artifacts.os.rename
+
+        def fail_publish(origin, target):
+            if (
+                Path(origin).name.startswith(".prepare-")
+                and Path(target) == destination
+            ):
+                raise OSError(errno.ENOSPC, "injected publish failure")
+            return rename(origin, target)
+
+        with (
+            mock.patch.object(artifacts.os, "rename", side_effect=fail_publish),
+            self.assertRaises(OSError),
+        ):
+            artifacts.install_source(snapshot, destination, manifest, files)
+        self.assertEqual((destination / "manifest.json").readlink(), previous)
+        self.assertTrue((destination / "target/config.json").is_file())
+
+    def test_affine_source_download_is_pinned_and_checks_all_shards(self):
+        _, manifest, upstream = self.affine_source_fixture()
+        source = manifest["target"]["source"]
+        self.api.return_value.model_info.return_value = SimpleNamespace(
+            sha=source["revision"],
+            siblings=[
+                SimpleNamespace(
+                    rfilename=r["path"],
+                    size=r["size"],
+                    lfs=SimpleNamespace(sha256=r["sha256"]),
+                )
+                for r in source["files"]
+            ],
+        )
+        self.manifest_download.side_effect = lambda **kwargs: str(
+            upstream / kwargs["filename"]
+        )
+        result = artifacts.resolve_target_source(source)
+        self.assertEqual(set(result), {r["path"] for r in source["files"]})
+        self.assertEqual(self.manifest_download.call_count, 3)
+        for call in self.manifest_download.call_args_list:
+            self.assertEqual(call.kwargs["revision"], source["revision"])
+
 
 if __name__ == "__main__":
     unittest.main()

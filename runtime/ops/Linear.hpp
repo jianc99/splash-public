@@ -2,6 +2,7 @@
 
 #include "metal/DeviceCapabilities.hpp"
 #include "metal/CommandGraph.hpp"
+#include "ops/Weights.hpp"
 
 #include <compare>
 #include <cstddef>
@@ -12,53 +13,18 @@
 
 namespace splash::ops {
 
-// Immutable views of one packed Q4 projection.  StorageN is part of the
-// package ABI; the operator may choose a different compute tile at runtime.
-// One GGUF GGUF tensor occupying output columns [columnOffset,
-// columnOffset + outputSize) of a projection. Layouts and kernels live in
-// metal/abi/Gguf.h and kernels/shared/gguf_linear.metal.
-struct GgufSegment final {
-  metal::MetalBuffer plane0;
-  metal::MetalBuffer plane1;
-  metal::MetalBuffer meta;
-  uint32_t type = 0;
-  uint32_t outputSize = 0;
-  uint32_t inputSize = 0;
-  uint32_t p0 = 0;
-  uint32_t p1 = 0;
-  uint32_t metaBytes = 0;
-  uint32_t metaGroups = 0;
-  uint32_t columnOffset = 0;
-  uint32_t formatId = 0;    // GGUF_FMT_* (metal/abi/QuantFormat.h)
-  const char *format = "";
-  // A float tensor the GGUF keeps unquantized (F32, as llama.cpp keeps the
-  // MoE router): plane0 holds its [outputSize][inputSize] floats, multiplied
-  // unrounded in fp32 (kernels/shared/gguf_float.metal).
-  [[nodiscard]] bool isFloat() const noexcept;
-};
-
 // The destination element type of a float segment's projection.
 enum class FloatOutput : uint8_t { BFloat16, Float32 };
 // The tile of a float projection (kernels/shared/gguf_float.metal): fp32
 // simdgroup MMA on the weights as stored, or the neural accelerator's bf16
 // matmul on each weight's three bf16 parts, which sum to it exactly. Both
-// round only in fp32 accumulation; Q4Linear::ggufFloatTile picks one.
+// round only in fp32 accumulation; Linear::ggufFloatTile picks one.
 enum class FloatTile : uint8_t { Simdgroup, NeuralAccelerator };
 // out[r][outOffset + n] = sum_k input[r][k] W[n][k] for rows r < `rows` of a
 // float segment, into a destination of `outStride` columns (LinearGguf.cpp).
-void addGgufFloat(metal::CommandGraph &graph, metal::MetalBuffer input, const GgufSegment &weights,
+void addGgufFloat(metal::CommandGraph &graph, metal::MetalBuffer input, const QuantizedSegment &weights,
                   metal::MetalBuffer output, uint32_t rows, uint32_t outStride, uint32_t outOffset,
                   FloatOutput type, FloatTile tile);
-
-struct Q4Projection final {
-  metal::MetalBuffer weights;
-  metal::MetalBuffer scales;
-  metal::MetalBuffer biases;
-  uint32_t outputSize = 0;
-  uint32_t inputSize = 0;
-  // Non-empty: a GGUF projection; weights/scales/biases are unused.
-  std::vector<GgufSegment> gguf{};
-};
 
 // Q8 affine projections use per-64-input quantization and StorageN=256 order.
 // Used by the MoE router and shared-expert gate.
@@ -73,7 +39,7 @@ struct Q8Projection final {
 // Expert-major Q4 slabs keep one complete StorageN-packed projection per
 // expert. The operator selects expertStrideBytes directly; no per-expert
 // MetalBuffer objects or weight copies are created at runtime.
-struct ExpertQ4Projection final {
+struct ExpertProjection final {
   metal::MetalBuffer packed;
   uint32_t experts = 0;
   uint32_t outputSize = 0;
@@ -88,9 +54,6 @@ struct LinearMatrix final {
 };
 
 enum class LinearPhase : uint8_t { Prefill, Decode };
-// How a projection stores its weights: MLX affine int4 (weights, scales,
-// biases) or GGUF segments (metal/abi/QuantFormat.h).
-enum class QuantFamily : uint8_t { Affine, Gguf };
 enum class LinearEpilogue : uint8_t { None, Residual, GateUp, UpWithGate };
 // Compute tiles over the StorageN=256 packing. Paired tiles pipeline two
 // quant groups of one lane. Split tiles keep one 8-row tile per threadgroup
@@ -114,7 +77,7 @@ struct LinearWorkload final {
   uint32_t rows = 0;
   LinearPhase phase = LinearPhase::Decode;
   LinearEpilogue epilogue = LinearEpilogue::None;
-  QuantFamily quant = QuantFamily::Affine;
+  WeightLayout weightLayout = WeightLayout::Affine64;
   auto operator<=>(const LinearWorkload &) const = default;
 };
 
@@ -199,7 +162,7 @@ public:
   }
 
 private:
-  friend class Q4Linear;
+  friend class Linear;
   LinearPlan(LinearWorkload workload, LinearConfig config);
   LinearWorkload workload_;
   LinearConfig config_;
@@ -221,7 +184,7 @@ struct LinearBuffers final {
   PreparedInput prepared{};
 };
 
-struct Q4DispatchStats final {
+struct LinearDispatchStats final {
   uint64_t fusedSourceOperations = 0;
   uint64_t m16Dispatches = 0;
   uint64_t m24Dispatches = 0;
@@ -230,9 +193,9 @@ struct Q4DispatchStats final {
 
 // Owns Q4 pipeline selection and dispatch. Device policy uses GPU family,
 // core count and workload tile counts.
-class Q4Linear final {
+class Linear final {
 public:
-  explicit Q4Linear(const DeviceCapabilities &device) noexcept;
+  explicit Linear(const DeviceCapabilities &device) noexcept;
 
   // One lane: at most 3 tiles * 4 group counts, 2 split tiles, 2 paired
   // N256 grids, and 4 Apple9 simdgroup K splits (including its baseline):
@@ -245,13 +208,13 @@ public:
   [[nodiscard]] LinearPlan plan(LinearWorkload workload) const;
   // The plan that runs for this projection (GGUF projections plan their
   // own tiles).
-  [[nodiscard]] LinearPlan plan(LinearWorkload workload, const Q4Projection &projection) const;
+  [[nodiscard]] LinearPlan plan(LinearWorkload workload, const Projection &projection) const;
   // Rows of storage a decode step of `rows` rows binds for this device's
   // projection tiles (LinearPlan::storageRows of its decode plans): the step's
   // rows, or the staged GGUF tile's 8, 16 or 32.
-  [[nodiscard]] uint32_t decodeStorageRows(uint32_t rows, QuantFamily quant) const noexcept;
+  [[nodiscard]] uint32_t decodeStorageRows(uint32_t rows, WeightLayout weightLayout) const noexcept;
   // The layout the decode plan of this projection reads, for its producer.
-  [[nodiscard]] LinearInput decodeInput(const Q4Projection &projection, uint32_t lanes,
+  [[nodiscard]] LinearInput decodeInput(const Projection &projection, uint32_t lanes,
                                         LinearEpilogue epilogue = LinearEpilogue::None) const;
   [[nodiscard]] LinearScratchSize decodeScratchSize(LinearWorkload workload) const;
   // The tile of a float projection of `rows` rows into `outputSize` columns
@@ -263,9 +226,9 @@ public:
   void setChoices(std::span<const LinearChoice> choices);
   // Returns what the scratch table describes after the dispatch.
   PreparedInput add(metal::CommandGraph &graph, LinearBuffers buffers,
-                    const Q4Projection &projection, const LinearPlan &plan,
-                    const Q4Projection *gate = nullptr,
-                    Q4DispatchStats *stats = nullptr) const;
+                    const Projection &projection, const LinearPlan &plan,
+                    const Projection *gate = nullptr,
+                    LinearDispatchStats *stats = nullptr) const;
 
   void addPrefillSums(metal::CommandGraph &graph, metal::MetalBuffer input,
                       metal::MetalBuffer sums, LinearMatrix matrix,
@@ -273,45 +236,45 @@ public:
   // `scratch` holds the partials and counters of split plans (GGUF chunks of
   // up to 32 rows); reused serially within one command stream, as in decode.
   void addPrefill(metal::CommandGraph &graph, metal::MetalBuffer input,
-                  const Q4Projection &projection, metal::MetalBuffer output,
+                  const Projection &projection, metal::MetalBuffer output,
                   metal::MetalBuffer sums, LinearMatrix matrix,
                   uint32_t rows, LinearScratch scratch = {}) const;
   void addPrefillUpWithGate(
       metal::CommandGraph &graph, metal::MetalBuffer input,
-      const Q4Projection &up, metal::MetalBuffer gateScratch,
+      const Projection &up, metal::MetalBuffer gateScratch,
       metal::MetalBuffer output, metal::MetalBuffer sums,
       metal::MetalBuffer downSums, LinearMatrix matrix,
       uint32_t rows, LinearScratch scratch = {}) const;
   void addPrefillResidual(metal::CommandGraph &graph,
                           metal::MetalBuffer input,
-                          const Q4Projection &projection,
+                          const Projection &projection,
                           metal::MetalBuffer residual,
                           metal::MetalBuffer output, metal::MetalBuffer sums,
                           LinearMatrix matrix, uint32_t rows,
                           LinearScratch scratch = {}) const;
 
   PreparedInput addDecode(metal::CommandGraph &graph,
-                          metal::MetalBuffer input, const Q4Projection &projection,
+                          metal::MetalBuffer input, const Projection &projection,
                           metal::MetalBuffer output, LinearMatrix matrix,
                           LinearScratch scratch = {}) const;
   PreparedInput addDecodeBatch(metal::CommandGraph &graph,
                                metal::MetalBuffer input,
-                               const Q4Projection &projection,
+                               const Projection &projection,
                                metal::MetalBuffer output, LinearMatrix matrix,
-                               uint32_t lanes, Q4DispatchStats &stats,
+                               uint32_t lanes, LinearDispatchStats &stats,
                                LinearScratch scratch = {}, PreparedInput prepared = {}) const;
   PreparedInput addGateUpBatch(metal::CommandGraph &graph, metal::MetalBuffer input,
-                               const Q4Projection &gate, const Q4Projection &up,
+                               const Projection &gate, const Projection &up,
                                metal::MetalBuffer gateScratch,
                                metal::MetalBuffer output, LinearMatrix matrix,
-                               uint32_t lanes, Q4DispatchStats &stats,
+                               uint32_t lanes, LinearDispatchStats &stats,
                                LinearScratch scratch = {}, PreparedInput prepared = {}) const;
   PreparedInput addResidualBatch(metal::CommandGraph &graph,
                                  metal::MetalBuffer input,
-                                 const Q4Projection &projection,
+                                 const Projection &projection,
                                  metal::MetalBuffer residual,
                                  metal::MetalBuffer output, LinearMatrix matrix,
-                                 uint32_t lanes, Q4DispatchStats &stats,
+                                 uint32_t lanes, LinearDispatchStats &stats,
                                  LinearScratch scratch = {}, PreparedInput prepared = {}) const;
 
 private:
@@ -320,16 +283,16 @@ private:
   [[nodiscard]] LinearTile ggufDecodeTile() const noexcept;
   [[nodiscard]] LinearConfig ggufBaseline(LinearWorkload workload) const;
   void addGguf(metal::CommandGraph &graph, const LinearBuffers &buffers,
-               const Q4Projection &projection, const LinearPlan &plan,
-               const Q4Projection *gate, Q4DispatchStats *stats) const;
+               const Projection &projection, const LinearPlan &plan,
+               const Projection *gate, LinearDispatchStats *stats) const;
   void addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &buffers,
-                     const Q4Projection &projection, const LinearPlan &plan,
-                     const Q4Projection *gate) const;
+                     const Projection &projection, const LinearPlan &plan,
+                     const Projection *gate) const;
   void addGgufSimdgroup(metal::CommandGraph &graph, const LinearBuffers &buffers,
-                        const Q4Projection &projection, const LinearPlan &plan,
-                        const Q4Projection *gate) const;
+                        const Projection &projection, const LinearPlan &plan,
+                        const Projection *gate) const;
   void addGgufFloatSegments(metal::CommandGraph &graph, const LinearBuffers &buffers,
-                            const Q4Projection &projection, const LinearPlan &plan) const;
+                            const Projection &projection, const LinearPlan &plan) const;
   uint32_t appleGpuFamily_ = 0;
   uint32_t gpuCores_ = 0;
   std::vector<LinearChoice> choices_;

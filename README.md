@@ -70,7 +70,11 @@ See [judgment contracts](DEVELOPMENT.md#judgment-contracts) for details.
 
 `--model` takes any `owner/repo` that holds a Splash package, a format
 [DEVELOPMENT.md](DEVELOPMENT.md#model-packages) describes. Plain MLX or
-Transformers checkpoints do not work. Private repositories need `HF_TOKEN`.
+Transformers checkpoints need a compatible Splash support package. Such a package
+can reference upstream GGUF or MLX affine weights and prepare them locally on first
+load. Preparation keeps the original download and stores an additional weight
+copy in `~/Library/Caches/Splash/weights`; later starts reuse it. Existing packed
+packages need no conversion. Private repositories need `HF_TOKEN`.
 Packages download into the Hugging Face cache, and `brew upgrade splash` keeps
 them, along with model links and agent sessions.
 

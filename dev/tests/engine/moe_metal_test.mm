@@ -32,7 +32,7 @@ using splash::metal::CommandGraph;
 using splash::metal::MetalBackend;
 using splash::metal::MetalBuffer;
 using splash::model::q4PackedBytes;
-using splash::ops::ExpertQ4Projection;
+using splash::ops::ExpertProjection;
 using splash::ops::kMoeRouteWideRows;
 using splash::ops::MoE;
 using splash::ops::MoeBuffers;
@@ -196,7 +196,7 @@ Q8Projection fixtureRouter(MetalBackend &backend, bool sharedGate) {
 
 struct Experts final {
   std::vector<ExpertSlab> slabs;
-  ExpertQ4Projection projection;
+  ExpertProjection projection;
 };
 
 Experts randomExperts(MetalBackend &backend, Random &random,
@@ -231,8 +231,8 @@ struct Fixture final {
 Fixture makeFixture(MetalBackend &backend) {
   Random random(0x0e5);
   Fixture fixture;
-  fixture.weights.router = fixtureRouter(backend, false);
-  fixture.weights.sharedExpertGate = fixtureRouter(backend, true);
+  fixture.weights.affine().router = fixtureRouter(backend, false);
+  fixture.weights.affine().sharedExpertGate = fixtureRouter(backend, true);
   fixture.gate =
       randomExperts(backend, random, kExperts, kIntermediate, kHidden, "gate");
   fixture.up =
@@ -245,12 +245,12 @@ Fixture makeFixture(MetalBackend &backend) {
       randomExperts(backend, random, 1, kIntermediate, kHidden, "shared-up");
   fixture.sharedDown =
       randomExperts(backend, random, 1, kHidden, kIntermediate, "shared-down");
-  fixture.weights.expertGate = fixture.gate.projection;
-  fixture.weights.expertUp = fixture.up.projection;
-  fixture.weights.expertDown = fixture.down.projection;
-  fixture.weights.sharedGate = fixture.sharedGate.projection;
-  fixture.weights.sharedUp = fixture.sharedUp.projection;
-  fixture.weights.sharedDown = fixture.sharedDown.projection;
+  fixture.weights.affine().expertGate = fixture.gate.projection;
+  fixture.weights.affine().expertUp = fixture.up.projection;
+  fixture.weights.affine().expertDown = fixture.down.projection;
+  fixture.weights.affine().sharedGate = fixture.sharedGate.projection;
+  fixture.weights.affine().sharedUp = fixture.sharedUp.projection;
+  fixture.weights.affine().sharedDown = fixture.sharedDown.projection;
 
   const uint64_t rowElements = uint64_t{kMaximumRows} * kHidden;
   MoeBuffers &b = fixture.buffers;
@@ -676,22 +676,22 @@ void bufferBounds(MetalBackend &backend, Fixture &fixture) {
       rejects([&] { MoE::add(graph, fixture.buffers, weights, plan); }, label);
       require(graph.empty(), "invalid weights partially encoded MoE");
     };
-    for (auto projection : {&MoeWeights::router, &MoeWeights::sharedExpertGate}) {
+    for (auto projection : {&splash::ops::AffineMoeWeights::router, &splash::ops::AffineMoeWeights::sharedExpertGate}) {
       for (auto field : {&Q8Projection::weights, &Q8Projection::scales,
                          &Q8Projection::biases}) {
         MoeWeights shortWeights = fixture.weights;
-        auto &buffer = (shortWeights.*projection).*field;
+        auto &buffer = (shortWeights.affine().*projection).*field;
         buffer = backend.view(buffer, 0, buffer.sizeBytes() - 1);
         rejectWeights(shortWeights, "undersized Q8 weight view");
       }
     }
-    for (auto member : {&MoeWeights::expertGate, &MoeWeights::expertUp,
-                        &MoeWeights::expertDown, &MoeWeights::sharedGate,
-                        &MoeWeights::sharedUp, &MoeWeights::sharedDown}) {
-      const auto &source = fixture.weights.*member;
+    for (auto member : {&splash::ops::AffineMoeWeights::expertGate, &splash::ops::AffineMoeWeights::expertUp,
+                        &splash::ops::AffineMoeWeights::expertDown, &splash::ops::AffineMoeWeights::sharedGate,
+                        &splash::ops::AffineMoeWeights::sharedUp, &splash::ops::AffineMoeWeights::sharedDown}) {
+      const auto &source = fixture.weights.affine().*member;
       const uint64_t payload = q4PackedBytes(source.outputSize, source.inputSize);
       MoeWeights changed = fixture.weights;
-      auto &projection = changed.*member;
+      auto &projection = changed.affine().*member;
       projection.packed = backend.view(source.packed, 0, payload - 1);
       rejectWeights(changed, "undersized expert payload");
       projection.packed = source.packed;

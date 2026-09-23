@@ -229,6 +229,9 @@ ENGINE_CPP_SOURCES := \
 	runtime/model/GgufFile.cpp \
 	runtime/model/GgufImage.cpp \
 	runtime/model/GgufTarget.cpp \
+	runtime/model/AffineTarget.cpp \
+	runtime/model/PreparedWeights.cpp \
+	runtime/model/GgufPreparation.cpp \
 	runtime/model/Qwen3_6Moe.cpp \
 	runtime/model/Qwen3_8.cpp \
 	runtime/model/QwenVision.cpp \
@@ -237,6 +240,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/model/ModelFactory.cpp \
 	runtime/model/QwenState.cpp
 ENGINE_MM_SOURCES := \
+	runtime/model/AffineCheckpoint.mm \
 	runtime/model/ModelDescriptor.mm \
 	runtime/model/Runtime.mm \
 	runtime/model/RuntimeArenas.mm \

@@ -189,11 +189,11 @@ Q8Projection router(MetalBackend &backend, bool shared, uint32_t representative 
   return result;
 }
 
-ExpertQ4Projection experts(MetalBackend &backend, uint32_t count, uint32_t salt = 0) {
+ExpertProjection experts(MetalBackend &backend, uint32_t count, uint32_t salt = 0) {
   constexpr uint32_t width = 256;
   constexpr uint64_t elements = uint64_t{width} * width;
   constexpr uint64_t stride = elements / 2 + elements / 16;
-  ExpertQ4Projection result{zeroed(backend, count * stride), count, width, width, stride};
+  ExpertProjection result{zeroed(backend, count * stride), count, width, width, stride};
   auto *base = static_cast<uint8_t *>(result.packed.contents());
   for (uint32_t expert = 0; expert < count; ++expert) {
     auto *slab = base + expert * stride;
@@ -323,7 +323,7 @@ void nativeMeasurement(const char *library) {
           "MoE tuning retained temporary backing");
   // A malformed LAST representative must stop at the finite-value gate
   // before timing. Checking only the first layer would incorrectly pass.
-  auto *slab = static_cast<uint8_t *>(input.weights.back().sharedDown.packed.contents());
+  auto *slab = static_cast<uint8_t *>(input.weights.back().affine().sharedDown.packed.contents());
   auto *scale = reinterpret_cast<uint16_t *>(slab + 256 * 256 / 2);
   scale[0] = 0x7fc0;
   const auto notFinite = tuneMoe(backend, allowed, input, options);

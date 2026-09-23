@@ -33,7 +33,7 @@ template <class Function> void rejects(Function function) {
 // The collector only borrows projection metadata. Empty immutable Metal
 // handles make any accidental allocation, weight access or dispatch fail;
 // these tests never construct a MetalBackend or load a model package.
-Q4Projection projection(uint32_t output, uint32_t input) {
+Projection projection(uint32_t output, uint32_t input) {
   return {{}, {}, {}, output, input};
 }
 
@@ -60,9 +60,9 @@ template <class Weights, class Layout> Weights targetWeights(Layout layout) {
       layer.downProjection = projection(layout.hiddenSize, layout.intermediateSize);
     } else {
       const Q8Projection router{{}, {}, {}, 256, layout.hiddenSize};
-      const ExpertQ4Projection up{{}, layout.experts, layout.expertIntermediateSize,
+      const ExpertProjection up{{}, layout.experts, layout.expertIntermediateSize,
                                   layout.hiddenSize, 16'384};
-      const ExpertQ4Projection down{{}, layout.experts, layout.hiddenSize,
+      const ExpertProjection down{{}, layout.experts, layout.hiddenSize,
                                     layout.expertIntermediateSize, 16'384};
       auto sharedUp = up;
       auto sharedDown = down;
@@ -192,7 +192,7 @@ void checkPair(ModelPackage package, bool sparse) {
   for (const auto &input : inventory.linear) {
     require(input.weights.size() == 1, "tied empty views were not deduplicated");
     const auto &weight = input.weights.front().projection;
-    require(!weight.weights && !weight.scales && !weight.biases,
+    require(!weight.affine().weights && !weight.affine().scales && !weight.affine().biases,
             "inventory created weight backing");
   }
   require(keys == expectedLinear(package, prefill, decode),
@@ -210,10 +210,10 @@ void checkPair(ModelPackage package, bool sparse) {
     require(actualMoe.insert(input.workload).second, "duplicate MoE workload");
     require(input.weights.size() == 1, "tied empty MoE views were not deduplicated");
     for (const auto &weights : input.weights)
-      require(weights.expertGate.inputSize == input.workload.shape.hiddenSize &&
-                  weights.expertDown.outputSize == input.workload.shape.hiddenSize &&
-                  weights.expertGate.experts == input.workload.shape.experts &&
-                  weights.sharedGate.experts == 1,
+      require(weights.affine().expertGate.inputSize == input.workload.shape.hiddenSize &&
+                  weights.affine().expertDown.outputSize == input.workload.shape.hiddenSize &&
+                  weights.affine().expertGate.experts == input.workload.shape.experts &&
+                  weights.affine().sharedGate.experts == 1,
               "MoE representative lost real router/expert geometry");
   }
   std::set<MoeWorkload> expectedMoe;
@@ -327,7 +327,7 @@ void metadataViews(const char *metallib) {
                            8, LinearPhase::Decode, LinearEpilogue::GateUp};
   auto view = [&](uint32_t index, bool gate) {
     const uint64_t offset = uint64_t{index * 6 + (gate ? 3U : 0U)} * 128;
-    return Q4Projection{
+    return Projection{
         backend.view(backing, offset, 128),
         backend.view(backing, offset + 128, 128),
         backend.view(backing, offset + 256, 128),
@@ -345,7 +345,7 @@ void metadataViews(const char *metallib) {
       layer.gateProjection = view(variation == Variation::Distinct ||
                                      variation == Variation::GateOnly ? representative : 0, true);
       if (variation == Variation::ScaleOnly)
-        layer.upProjection.scales = view(representative, false).scales;
+        layer.upProjection.affine().scales = view(representative, false).affine().scales;
     }
     // Target and draft execute the same GateUp shape in this pair. They also
     // share a representative here, so this must not add another measurement.
@@ -369,13 +369,13 @@ void metadataViews(const char *metallib) {
     for (size_t index = 0; index < expected; ++index) {
       const auto &actual = found->weights[index];
       const auto &source = target.layers[sourceLayers[index]];
-      require(actual.projection.weights.sameView(source.upProjection.weights) &&
-                  actual.projection.scales.sameView(source.upProjection.scales) &&
-                  actual.projection.biases.sameView(source.upProjection.biases) &&
+      require(actual.projection.affine().weights.sameView(source.upProjection.affine().weights) &&
+                  actual.projection.affine().scales.sameView(source.upProjection.affine().scales) &&
+                  actual.projection.affine().biases.sameView(source.upProjection.affine().biases) &&
                   actual.gate &&
-                  actual.gate->weights.sameView(source.gateProjection.weights) &&
-                  actual.gate->scales.sameView(source.gateProjection.scales) &&
-                  actual.gate->biases.sameView(source.gateProjection.biases),
+                  actual.gate->affine().weights.sameView(source.gateProjection.affine().weights) &&
+                  actual.gate->affine().scales.sameView(source.gateProjection.affine().scales) &&
+                  actual.gate->affine().biases.sameView(source.gateProjection.affine().biases),
               "representatives missed layer depth or lost gate/up pairing");
     }
     require(backend.memoryStats().allocatedBytes == bytes,
@@ -399,7 +399,7 @@ void metadataViews(const char *metallib) {
     const Q8Projection router{buffer(0), buffer(1), buffer(2), 256, layout.hiddenSize};
     const Q8Projection sharedRouter{buffer(3), buffer(4), buffer(5), 256, layout.hiddenSize};
     auto expert = [&](uint32_t component, uint32_t count, bool down) {
-      return ExpertQ4Projection{buffer(component), count,
+      return ExpertProjection{buffer(component), count,
           down ? layout.hiddenSize : layout.expertIntermediateSize,
           down ? layout.expertIntermediateSize : layout.hiddenSize, 16'384};
     };
@@ -416,11 +416,11 @@ void metadataViews(const char *metallib) {
       auto &weights = sparse.layers[index].ffn;
       weights = moeView(variation == MoeVariation::Distinct ? representative : 0);
       if (variation == MoeVariation::RouterOnly)
-        weights.router.scales = moeView(representative).router.scales;
+        weights.affine().router.scales = moeView(representative).affine().router.scales;
       if (variation == MoeVariation::SharedOnly)
-        weights.sharedDown.packed = moeView(representative).sharedDown.packed;
+        weights.affine().sharedDown.packed = moeView(representative).affine().sharedDown.packed;
       if (variation == MoeVariation::StrideOnly)
-        weights.expertGate.expertStrideBytes += representative * 16'384;
+        weights.affine().expertGate.expertStrideBytes += representative * 16'384;
     }
     const auto bytes = backend.memoryStats().allocatedBytes;
     const auto inventory = collectTuningWorkloads(package, std::array{32U}, std::array{1U});
@@ -435,18 +435,18 @@ void metadataViews(const char *metallib) {
       for (size_t index = 0; index < expected; ++index) {
         const auto &actual = input.weights[index];
         const auto &source = sparse.layers[sourceLayers[index]].ffn;
-        for (auto field : {&MoeWeights::router, &MoeWeights::sharedExpertGate}) {
-          const auto &left = actual.*field;
-          const auto &right = source.*field;
+        for (auto field : {&AffineMoeWeights::router, &AffineMoeWeights::sharedExpertGate}) {
+          const auto &left = actual.affine().*field;
+          const auto &right = source.affine().*field;
           require(left.weights.sameView(right.weights) &&
                       left.scales.sameView(right.scales) && left.biases.sameView(right.biases),
                   "MoE representatives missed router layer depth");
         }
-        for (auto field : {&MoeWeights::expertGate, &MoeWeights::expertUp,
-                            &MoeWeights::expertDown, &MoeWeights::sharedGate,
-                            &MoeWeights::sharedUp, &MoeWeights::sharedDown}) {
-          const auto &left = actual.*field;
-          const auto &right = source.*field;
+        for (auto field : {&AffineMoeWeights::expertGate, &AffineMoeWeights::expertUp,
+                            &AffineMoeWeights::expertDown, &AffineMoeWeights::sharedGate,
+                            &AffineMoeWeights::sharedUp, &AffineMoeWeights::sharedDown}) {
+          const auto &left = actual.affine().*field;
+          const auto &right = source.affine().*field;
           require(left.packed.sameView(right.packed) &&
                       left.expertStrideBytes == right.expertStrideBytes,
                   "MoE representative lost router/expert/shared pairing");

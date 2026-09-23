@@ -1,6 +1,6 @@
 #pragma once
 
-// Plans the in-memory MDGG0001 images of a Qwen3.8 (qwen35) or Qwen3.6 MoE
+// Plans the prepared MDGG0001 images of a Qwen3.8 (qwen35) or Qwen3.6 MoE
 // (qwen35moe) target read straight from a llama.cpp GGUF: section offsets, the
 // bytes the CPU fills (header, descriptors, norms, convolution, decay, time
 // bias, alpha/beta) and the GPU repacks/copies that move quantized rows into
@@ -83,7 +83,7 @@ public:
   [[nodiscard]] Image head() const;
   [[nodiscard]] Image embedding() const;
   [[nodiscard]] const TargetGeometry &geometry() const noexcept { return geometry_; }
-  // Sum of all image bytes, for memory accounting before allocation.
+  // Sum of all image bytes, for weight admission before preparation.
   [[nodiscard]] uint64_t totalBytes() const;
 
 private:

@@ -1,4 +1,4 @@
-// GGUF sparse MoE (ops::MoE over GgufMoeWeights) and the fp32 projection of
+// GGUF sparse MoE (ops::MoE over BlockMoeWeights) and the fp32 projection of
 // GGUF float tensors, against fp64 references over GGML's dequantized weights
 // (GgufFormatReference.hpp), through the production dispatch code.
 // - Float projection, both tiles (fp32 simdgroup MMA, and the neural
@@ -6,7 +6,7 @@
 //   decode or prefill dispatch takes (with ragged tile tails), the router and
 //   alpha/beta widths, bf16 and fp32 destinations at a column offset of a
 //   wider row; neighbours stay untouched.
-// - Float segments of a fused GGUF projection (Q4Linear), on either float
+// - Float segments of a fused GGUF projection (Linear), on either float
 //   tile: the quantized segments' outputs unchanged, the padding past the
 //   segments unwritten.
 // - MoE: every GGUF plan (the staged 8- and 32-row tiles and the Apple9
@@ -51,9 +51,9 @@ using splash::metal::MetalBackend;
 using splash::metal::MetalBuffer;
 using splash::ops::FloatOutput;
 using splash::ops::FloatTile;
-using splash::ops::GgufExpertProjection;
-using splash::ops::GgufMoeWeights;
-using splash::ops::GgufSegment;
+using splash::ops::BlockExpertProjection;
+using splash::ops::BlockMoeWeights;
+using splash::ops::QuantizedSegment;
 using splash::ops::MoE;
 using splash::ops::MoeBuffers;
 using splash::ops::MoeConfig;
@@ -69,9 +69,9 @@ using splash::ops::LinearPhase;
 using splash::ops::LinearPlan;
 using splash::ops::LinearScratch;
 using splash::ops::LinearScratchSize;
-using splash::ops::Q4Linear;
-using splash::ops::Q4Projection;
-using splash::ops::QuantFamily;
+using splash::ops::Linear;
+using splash::ops::Projection;
+using splash::ops::WeightLayout;
 using namespace gguf_reference;
 
 // K = 1024 on the hidden side (16 spans, four 256-input coefficient units)
@@ -114,7 +114,7 @@ MetalBuffer zeros(MetalBackend &backend, uint64_t bytes, const char *label) {
 
 // A GGUF tensor [rows, K]: its segment and GGML's fp32 values of it.
 struct Tensor {
-  GgufSegment segment;
+  QuantizedSegment segment;
   std::vector<float> values;
   uint32_t rows = 0, columns = 0;
   [[nodiscard]] const float *row(uint64_t n) const { return values.data() + n * columns; }
@@ -131,7 +131,7 @@ Tensor quantized(MetalBackend &backend, Fmt f, uint32_t rows, uint32_t K) {
   t.columns = K;
   const Packed planes = repack(f, native, rows, K, &t.values);
   const QuantFormat &layout = kQuantFormats[f];
-  GgufSegment &s = t.segment;
+  QuantizedSegment &s = t.segment;
   s.plane0 = upload(backend, planes.w0.data(), planes.w0.size(), "gguf-plane0");
   if (layout.plane1_bytes) s.plane1 = upload(backend, planes.w1.data(), planes.w1.size(), "gguf-plane1");
   s.meta = upload(backend, planes.meta.data(), planes.meta.size(), "gguf-meta");
@@ -154,7 +154,7 @@ Tensor floating(MetalBackend &backend, uint32_t rows, uint32_t K, float scale) {
   t.columns = K;
   t.values.resize(uint64_t{rows} * K);
   for (float &v : t.values) v = normal(rng);
-  GgufSegment &s = t.segment;
+  QuantizedSegment &s = t.segment;
   s.plane0 = upload(backend, t.values.data(), t.values.size() * sizeof(float), "gguf-floats");
   s.type = GGUF_TYPE_F32;
   s.outputSize = rows;
@@ -296,20 +296,18 @@ int floatSegments(MetalBackend &backend) {
   constexpr uint32_t K = 1024, N = 768, kFloatColumn = 512, kCovered = 576;
   const Tensor q80 = quantized(backend, Q80, 256, K), q4k = quantized(backend, Q4K, 256, K);
   const Tensor gates = floating(backend, 64, K, 0.05f);
-  const auto at = [](GgufSegment s, uint32_t offset) { s.columnOffset = offset; return s; };
-  Q4Projection full, quantizedOnly;
-  full.outputSize = quantizedOnly.outputSize = N;
-  full.inputSize = quantizedOnly.inputSize = K;
-  full.gguf = {at(q80.segment, 0), at(q4k.segment, 256), at(gates.segment, kFloatColumn)};
-  quantizedOnly.gguf = {at(q80.segment, 0), at(q4k.segment, 256)};
+  const auto at = [](QuantizedSegment s, uint32_t offset) { s.columnOffset = offset; return s; };
+  Projection full(N, K, splash::ops::BlockWeights{{at(q80.segment, 0),
+      at(q4k.segment, 256), at(gates.segment, kFloatColumn)}});
+  Projection quantizedOnly(N, K, splash::ops::BlockWeights{{at(q80.segment, 0), at(q4k.segment, 256)}});
   int failures = 0;
   for (const auto [family, cores] : {std::pair{9u, 0u}, std::pair{10u, 0u}, std::pair{10u, 1u}}) {
     DeviceCapabilities device = backend.capabilities();
     device.appleGpuFamily = family;
     if (cores) device.gpuCoreCount = cores;
-    const Q4Linear linear(device);
+    const Linear linear(device);
     const auto check = [&](uint32_t rows, uint32_t storage, const std::string &label,
-                           const std::function<void(CommandGraph &, MetalBuffer, const Q4Projection &, MetalBuffer)> &add) {
+                           const std::function<void(CommandGraph &, MetalBuffer, const Projection &, MetalBuffer)> &add) {
       const std::vector<float> x = activations(uint64_t{storage} * K);
       const MetalBuffer input = bfloatBuffer(backend, x, "segments-input");
       MetalBuffer y = zeros(backend, uint64_t{storage} * N * 2, "segments-output"),
@@ -351,21 +349,21 @@ int floatSegments(MetalBackend &backend) {
     };
     const LinearMatrix matrix{N, K};
     for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
-      const LinearPlan plan = linear.plan({matrix, lanes * 8, LinearPhase::Decode, LinearEpilogue::None, QuantFamily::Gguf},
+      const LinearPlan plan = linear.plan({matrix, lanes * 8, LinearPhase::Decode, LinearEpilogue::None, WeightLayout::Block32},
                                           full);
       const LinearScratch scratch = scratchFor(plan);
       check(lanes * 8, plan.storageRows(), "decode B" + std::to_string(lanes),
-            [&](CommandGraph &graph, MetalBuffer input, const Q4Projection &p, MetalBuffer output) {
-              splash::ops::Q4DispatchStats stats;
+            [&](CommandGraph &graph, MetalBuffer input, const Projection &p, MetalBuffer output) {
+              splash::ops::LinearDispatchStats stats;
               static_cast<void>(linear.addDecodeBatch(graph, input, p, output, matrix, lanes, stats, scratch));
             });
     }
     for (const uint32_t rows : {1u, 24u, 33u, 263u}) {
       const LinearPlan plan =
-          linear.plan({matrix, rows, LinearPhase::Prefill, LinearEpilogue::None, QuantFamily::Gguf}, full);
+          linear.plan({matrix, rows, LinearPhase::Prefill, LinearEpilogue::None, WeightLayout::Block32}, full);
       const LinearScratch scratch = scratchFor(plan);
       check(rows, plan.storageRows(), "prefill rows=" + std::to_string(rows),
-            [&](CommandGraph &graph, MetalBuffer input, const Q4Projection &p, MetalBuffer output) {
+            [&](CommandGraph &graph, MetalBuffer input, const Projection &p, MetalBuffer output) {
               linear.addPrefill(graph, input, p, output, {}, matrix, rows, scratch);
             });
     }
@@ -396,13 +394,13 @@ Model makeModel(MetalBackend &backend, int f) {
     m.routed[p] = quantized(backend, m.formats[p], kExperts * n[p], k[p]);
     m.shared[p] = quantized(backend, m.formats[3 + p], n[p], k[p]);
   }
-  GgufMoeWeights gguf;
+  BlockMoeWeights gguf;
   gguf.router = m.router.segment;
   gguf.sharedExpertGate = m.sharedGate.segment;
   gguf.gate = {m.routed[0].segment, m.shared[0].segment};
   gguf.up = {m.routed[1].segment, m.shared[1].segment};
   gguf.down = {m.routed[2].segment, m.shared[2].segment};
-  m.weights.gguf = gguf;
+  m.weights = gguf;
   return m;
 }
 
@@ -579,7 +577,7 @@ int moe(MetalBackend &backend) {
   b.moe.input = bfloatBuffer(backend, b.input, "moe-input");
   b.moe.residual = bfloatBuffer(backend, b.residual, "moe-residual");
   b.moe.output = zeros(backend, uint64_t{kMaximumRows} * kHidden * 2, "moe-output");
-  const MoeShape shape{kHidden, kExperts, kTopK, kIntermediate, QuantFamily::Gguf};
+  const MoeShape shape{kHidden, kExperts, kTopK, kIntermediate, WeightLayout::Block32};
   for (int f = 0; f < FMT_COUNT; ++f) {
     const Model m = makeModel(backend, f);
     std::map<std::pair<uint32_t, uint32_t>, GateUp> products;
@@ -659,7 +657,7 @@ int moe(MetalBackend &backend) {
 // The weights exceed the system cache, so each layer streams its experts from DRAM.
 int timing(MetalBackend &backend, uint32_t rounds) {
   constexpr uint32_t H = 2048, I = 512, E = 256, kRowsMax = 2048;
-  const MoeShape affineShape{H, E, 8, I}, ggufShape{H, E, 8, I, QuantFamily::Gguf};
+  const MoeShape affineShape{H, E, 8, I}, ggufShape{H, E, 8, I, WeightLayout::Block32};
   std::mt19937 local(9);
   // Affine: random Q4 slabs with finite scales, the router and shared gate of the routing fixture.
   const auto affineExperts = [&](uint32_t experts, uint32_t n, uint32_t k) {
@@ -672,7 +670,7 @@ int timing(MetalBackend &backend, uint32_t rounds) {
       auto *parameters = reinterpret_cast<__bf16 *>(slab + elements / 2);
       for (uint64_t i = 0; i < elements / 32; ++i) parameters[i] = __bf16(i < elements / 64 ? 0.01f : -0.05f);
     }
-    return splash::ops::ExpertQ4Projection{packed, experts, n, k, stride};
+    return splash::ops::ExpertProjection{packed, experts, n, k, stride};
   };
   const auto affineRouter = [&](bool routes) {
     const uint64_t elements = uint64_t{256} * H;
@@ -688,21 +686,21 @@ int timing(MetalBackend &backend, uint32_t rounds) {
     return splash::ops::Q8Projection{weights, scales, biases, 256, H};
   };
   MoeWeights affine;
-  affine.router = affineRouter(true);
-  affine.sharedExpertGate = affineRouter(false);
-  affine.expertGate = affineExperts(E, I, H);
-  affine.expertUp = affineExperts(E, I, H);
-  affine.expertDown = affineExperts(E, H, I);
-  affine.sharedGate = affineExperts(1, I, H);
-  affine.sharedUp = affineExperts(1, I, H);
-  affine.sharedDown = affineExperts(1, H, I);
+  affine.affine().router = affineRouter(true);
+  affine.affine().sharedExpertGate = affineRouter(false);
+  affine.affine().expertGate = affineExperts(E, I, H);
+  affine.affine().expertUp = affineExperts(E, I, H);
+  affine.affine().expertDown = affineExperts(E, H, I);
+  affine.affine().sharedGate = affineExperts(1, I, H);
+  affine.affine().sharedUp = affineExperts(1, I, H);
+  affine.affine().sharedDown = affineExperts(1, H, I);
   // GGUF: the same routing in an F32 router, experts in the 35B UD-Q4_K_M formats.
   const auto planes = [&](Fmt f, uint32_t rows, uint32_t k) {
     std::uniform_real_distribution<float> d(0.0005f, 0.004f);
     const std::vector<uint8_t> native = makeNative(f, rows, k, local, [&] { return f2h(d(local)); });
     const Packed packed = repack(f, native, rows, k, nullptr);
     const QuantFormat &layout = kQuantFormats[f];
-    GgufSegment s;
+    QuantizedSegment s;
     s.plane0 = upload(backend, packed.w0.data(), packed.w0.size(), "gguf-plane0");
     if (layout.plane1_bytes) s.plane1 = upload(backend, packed.w1.data(), packed.w1.size(), "gguf-plane1");
     s.meta = upload(backend, packed.meta.data(), packed.meta.size(), "gguf-meta");
@@ -719,10 +717,10 @@ int timing(MetalBackend &backend, uint32_t rounds) {
   };
   std::vector<float> router(uint64_t{E} * H, 0.0f), sharedGate(H, 0.0f);
   for (uint32_t e = 0; e < E; ++e) router[uint64_t{e} * H + e] = 4.0f;
-  GgufSegment routerSegment, sharedGateSegment;
+  QuantizedSegment routerSegment, sharedGateSegment;
   routerSegment.plane0 = upload(backend, router.data(), router.size() * 4, "router");
   sharedGateSegment.plane0 = upload(backend, sharedGate.data(), sharedGate.size() * 4, "shared-gate");
-  for (GgufSegment *s : {&routerSegment, &sharedGateSegment}) {
+  for (QuantizedSegment *s : {&routerSegment, &sharedGateSegment}) {
     s->type = GGUF_TYPE_F32;
     s->inputSize = H;
     s->formatId = GGUF_FMT_COUNT;
@@ -730,7 +728,7 @@ int timing(MetalBackend &backend, uint32_t rounds) {
   routerSegment.outputSize = E;
   sharedGateSegment.outputSize = 1;
   MoeWeights gguf;
-  gguf.gguf = GgufMoeWeights{routerSegment, sharedGateSegment,
+  gguf = BlockMoeWeights{routerSegment, sharedGateSegment,
                              {planes(Q4K, E * I, H), planes(Q80, I, H)},
                              {planes(Q4K, E * I, H), planes(Q80, I, H)},
                              {planes(Q5K, E * H, I), planes(Q80, H, I)}};

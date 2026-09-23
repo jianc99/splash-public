@@ -153,7 +153,7 @@ private:
 
 struct WeightFile::Impl {
     metal::MetalBackend *backend = nullptr;
-    std::shared_ptr<MappedRegion> mapping; // null for in-memory images
+    std::shared_ptr<MappedRegion> mapping;
     metal::MetalBuffer base;
     uint64_t bytes = 0;
     WeightFileRecord record;
@@ -185,7 +185,7 @@ WeightFile::WeightFile(metal::MetalBackend &backend,
                        std::string relativePath,
                        std::string_view expectedMagic,
                        uint32_t expectedLayer,
-                       uint32_t expectedType)
+                       uint32_t expectedType, std::string contentIdentity)
     : impl_(std::make_unique<Impl>()) {
     impl_->backend = &backend;
     impl_->mapping = MappedRegion::openReadOnly(path);
@@ -195,28 +195,11 @@ WeightFile::WeightFile(metal::MetalBackend &backend,
                       path.string());
     impl_->record = {
         std::move(relativePath), std::string(expectedMagic), expectedLayer, expectedType,
-        impl_->bytes,
+        impl_->bytes, std::move(contentIdentity),
     };
     impl_->base = backend.wrapSharedMemory(
         impl_->mapping->address(), impl_->bytes, impl_->mapping,
         impl_->record.relativePath);
-}
-
-WeightFile::WeightFile(metal::MetalBackend &backend, metal::MetalBuffer image,
-                       std::string relativePath, std::string_view expectedMagic,
-                       uint32_t expectedLayer, uint32_t expectedType)
-    : impl_(std::make_unique<Impl>()) {
-    impl_->backend = &backend;
-    impl_->bytes = image.sizeBytes();
-    const auto *header = static_cast<const uint8_t *>(image.contents());
-    if (!header) throw WeightStoreError("weight image is not host visible: " + relativePath);
-    checkWeightHeader(header, impl_->bytes, expectedMagic, expectedLayer, expectedType,
-                      relativePath);
-    impl_->record = {
-        std::move(relativePath), std::string(expectedMagic), expectedLayer, expectedType,
-        impl_->bytes,
-    };
-    impl_->base = std::move(image);
 }
 
 WeightFile::WeightFile(WeightFile &&) noexcept = default;
@@ -255,7 +238,7 @@ const WeightFileRecord &WeightFile::record() const noexcept {
     return impl_->record;
 }
 
-ops::Q4Projection readQ4Projection(WeightFile &file,
+ops::Projection readProjection(WeightFile &file,
                                    metal::MetalBackend &backend,
                                    uint32_t outputSize,
                                    uint32_t inputSize,
@@ -266,26 +249,26 @@ ops::Q4Projection readQ4Projection(WeightFile &file,
     const uint64_t parameterBytes = elements / 32;
     metal::MetalBuffer packed =
         file.section(q4PackedBytes(outputSize, inputSize), label);
-    ops::Q4Projection result;
-    result.weights = backend.view(packed, 0, weightBytes);
-    result.scales = backend.view(packed, weightBytes, parameterBytes);
-    result.biases =
+    ops::Projection result;
+    result.affine().weights = backend.view(packed, 0, weightBytes);
+    result.affine().scales = backend.view(packed, weightBytes, parameterBytes);
+    result.affine().biases =
         backend.view(packed, weightBytes + parameterBytes, parameterBytes);
     result.outputSize = outputSize;
     result.inputSize = inputSize;
     return result;
 }
 
-ops::Q4Projection readQ4ProjectionComponents(WeightFile &file,
+ops::EmbeddingWeights readAffineEmbedding(WeightFile &file,
                                              uint32_t outputSize,
                                              uint32_t inputSize,
                                              std::string_view label) {
     const uint64_t elements = q4Elements(outputSize, inputSize);
     const std::string prefix(label);
-    ops::Q4Projection result;
-    result.weights = file.section(elements / 2, prefix + "-weights");
-    result.scales = file.section(elements / 32, prefix + "-scales");
-    result.biases = file.section(elements / 32, prefix + "-biases");
+    ops::EmbeddingWeights result;
+    result.affine().weights = file.section(elements / 2, prefix + "-weights");
+    result.affine().scales = file.section(elements / 32, prefix + "-scales");
+    result.affine().biases = file.section(elements / 32, prefix + "-biases");
     result.outputSize = outputSize;
     result.inputSize = inputSize;
     return result;
@@ -323,13 +306,13 @@ GgufDescriptor readGgufDescriptor(WeightFile &file, std::string_view label) {
 }
 } // namespace
 
-ops::GgufSegment readGgufSegment(WeightFile &file, std::string_view label) {
+ops::QuantizedSegment readQuantizedSegment(WeightFile &file, std::string_view label) {
     const GgufDescriptor d = readGgufDescriptor(file, label);
     if (d.type == GGUF_TYPE_F32) {
         if (d.p0 || d.p1 || d.metaBytes || d.metaGroups || d.plane1Bytes || d.metaTotalBytes ||
             d.plane0Bytes != uint64_t{d.outputSize} * d.inputSize * sizeof(float))
             throw WeightStoreError("GGUF float section sizes are inconsistent: " + std::string(label));
-        ops::GgufSegment s;
+        ops::QuantizedSegment s;
         s.plane0 = file.section(d.plane0Bytes, std::string(label) + "-floats");
         s.type = d.type; s.outputSize = d.outputSize; s.inputSize = d.inputSize;
         s.formatId = GGUF_FMT_COUNT;
@@ -347,7 +330,7 @@ ops::GgufSegment readGgufSegment(WeightFile &file, std::string_view label) {
         d.plane1Bytes != uint64_t{d.outputSize} * groups * layout.plane1_bytes ||
         d.metaTotalBytes != uint64_t{d.outputSize} * (groups / layout.meta_groups) * layout.meta_bytes)
         throw WeightStoreError("GGUF section sizes are inconsistent: " + std::string(label));
-    ops::GgufSegment s;
+    ops::QuantizedSegment s;
     s.plane0 = file.section(d.plane0Bytes, std::string(label) + "-plane0");
     if (d.plane1Bytes) s.plane1 = file.section(d.plane1Bytes, std::string(label) + "-plane1");
     s.meta = file.section(d.metaTotalBytes, std::string(label) + "-meta");
@@ -359,15 +342,12 @@ ops::GgufSegment readGgufSegment(WeightFile &file, std::string_view label) {
     return s;
 }
 
-ops::Q4Projection readGgufProjection(WeightFile &file, std::string_view label) {
-    ops::Q4Projection p;
-    p.gguf.push_back(readGgufSegment(file, label));
-    p.outputSize = p.gguf.front().outputSize;
-    p.inputSize = p.gguf.front().inputSize;
-    return p;
+ops::Projection readGgufProjection(WeightFile &file, std::string_view label) {
+    auto segment = readQuantizedSegment(file, label);
+    return {segment.outputSize, segment.inputSize, ops::BlockWeights{{std::move(segment)}}};
 }
 
-ops::Q4Projection readGgufEmbedding(WeightFile &file, std::string_view label) {
+ops::EmbeddingWeights readGgufEmbedding(WeightFile &file, std::string_view label) {
     const GgufDescriptor d = readGgufDescriptor(file, label);
     // Native rows, gathered by gguf_embed_<type>: block_q4_K, block_q6_K or block_q8_0.
     const uint32_t format = gguf_format_of(d.type);
@@ -375,14 +355,10 @@ ops::Q4Projection readGgufEmbedding(WeightFile &file, std::string_view label) {
         d.plane0Bytes != uint64_t{d.outputSize} * (d.inputSize / kQuantFormats[format].block_elements) *
                              kQuantFormats[format].block_bytes)
         throw WeightStoreError("GGUF embedding must be native block_q4_K, block_q6_K or block_q8_0 rows");
-    ops::Q4Projection p;
-    ops::GgufSegment s;
+    ops::QuantizedSegment s;
     s.plane0 = file.section(d.plane0Bytes, std::string(label) + "-native");
     s.type = d.type; s.outputSize = d.outputSize; s.inputSize = d.inputSize;
-    p.gguf.push_back(std::move(s));
-    p.outputSize = d.outputSize;
-    p.inputSize = d.inputSize;
-    return p;
+    return ops::EmbeddingWeights(std::move(s));
 }
 
 ops::Q8Projection readQ8Projection(WeightFile &file,
@@ -404,8 +380,8 @@ ops::Q8Projection readQ8Projection(WeightFile &file,
     };
 }
 
-ops::ExpertQ4Projection
-readExpertQ4Projection(WeightFile &file, uint32_t experts,
+ops::ExpertProjection
+readExpertProjection(WeightFile &file, uint32_t experts,
                        uint32_t outputSize, uint32_t inputSize,
                        std::string_view label) {
     if (!experts)
@@ -436,7 +412,9 @@ std::string weightManifestFingerprint(
     for (const WeightFileRecord &record : sorted) {
         canonical << record.relativePath << '\t' << record.declaredBytes
                   << '\t' << record.magic << '\t' << record.layer << '\t'
-                  << record.type << '\n';
+                  << record.type;
+        if (!record.contentIdentity.empty()) canonical << '\t' << record.contentIdentity;
+        canonical << '\n';
     }
     std::string value = canonical.str();
     if (value.size() > std::numeric_limits<CC_LONG>::max()) {

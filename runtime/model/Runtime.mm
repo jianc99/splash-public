@@ -1140,7 +1140,7 @@ struct Runtime::Impl {
   void encodeDraftBatchGraph(CommandGraph &graph,
                              std::span<Request *const> entries,
                              std::span<const uint64_t> logicalPositions,
-                             ops::Q4DispatchStats &stats) {
+                             ops::LinearDispatchStats &stats) {
     if (entries.empty() || entries.size() > kLaneCount ||
         entries.size() != logicalPositions.size()) {
       throw std::invalid_argument("invalid draft decode batch");
@@ -1206,7 +1206,7 @@ struct Runtime::Impl {
   void encodeTargetVerifyBatchForward(CommandGraph &graph,
                                       std::span<Request *const> entries,
                                       std::span<const ModelBatchItem> items,
-                                      ops::Q4DispatchStats &stats) {
+                                      ops::LinearDispatchStats &stats) {
     if (entries.empty() || entries.size() > kLaneCount ||
         entries.size() != items.size()) {
       throw std::invalid_argument("invalid target verify batch");
@@ -1343,7 +1343,7 @@ struct Runtime::Impl {
   void encodeDraftStateCommitBatch(CommandGraph &graph,
                                    std::span<Request *const> entries,
                                    std::span<const ModelBatchItem> items,
-                                   ops::Q4DispatchStats &stats) {
+                                   ops::LinearDispatchStats &stats) {
     if (entries.empty() || entries.size() > kLaneCount ||
         entries.size() != items.size()) {
       throw std::invalid_argument("invalid draft state commit batch");
@@ -1463,7 +1463,7 @@ struct Runtime::Impl {
 
   std::vector<ModelStepResult> finalizeDecode(
       std::span<DecodeLaneResult> lanes, std::vector<ModelStepResult> results,
-      std::span<const ModelBatchItem> items, const ops::Q4DispatchStats &stats,
+      std::span<const ModelBatchItem> items, const ops::LinearDispatchStats &stats,
       uint32_t planWidth, CommandTiming timing) {
     if (lanes.size() != items.size() || results.size() != items.size())
       throw std::logic_error("decode completion shape changed");
@@ -1558,7 +1558,7 @@ struct Runtime::Impl {
     ConstrainedDecodeTicket(Impl &impl, std::vector<DecodeLaneResult> lanes,
                             std::vector<ModelStepResult> results,
                             std::span<const ModelBatchItem> items,
-                            const ops::Q4DispatchStats &stats,
+                            const ops::LinearDispatchStats &stats,
                             uint32_t planWidth, CommandTiming priorTiming,
                             const CommandGraph &draft,
                             std::function<void()> completion)
@@ -1734,7 +1734,7 @@ struct Runtime::Impl {
     std::vector<DecodeLaneResult> lanes_;
     std::vector<ModelStepResult> results_;
     std::vector<ModelBatchItem> items_;
-    ops::Q4DispatchStats stats_;
+    ops::LinearDispatchStats stats_;
     uint32_t planWidth_ = 0;
     Stage stage_ = Stage::Draft;
     CommandTicket command_;
@@ -2137,7 +2137,7 @@ Runtime::decodeAsync(const BatchPlan &plan,
 
   std::vector<Impl::DecodeLaneResult> lanes(items.size());
   std::vector<ModelStepResult> results(items.size());
-  ops::Q4DispatchStats batchStats;
+  ops::LinearDispatchStats batchStats;
   CommandTiming priorTiming;
   for (uint32_t lane = 0; lane < items.size(); ++lane) {
     const ModelBatchItem &item = items[lane];

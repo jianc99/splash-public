@@ -61,11 +61,14 @@ public:
   }
   std::string string() {
     const uint64_t length = scalar<uint64_t>();
-    if (length > (64u << 20)) throw GgufError("GGUF string is too long");
+    if (length > (8u << 20) || retainedStrings_ > (8u << 20) - length)
+      throw GgufError("GGUF string metadata exceeds bounds");
+    retainedStrings_ += length;
     std::string value(length, '\0');
     if (length) bytes(value.data(), length);
     return value;
   }
+  void skipString() { skip(scalar<uint64_t>()); }
   [[nodiscard]] uint64_t position() const noexcept { return position_; }
 
 private:
@@ -76,6 +79,7 @@ private:
   std::ifstream stream_;
   uint64_t size_;
   uint64_t position_ = 0;
+  uint64_t retainedStrings_ = 0;
 };
 
 uint64_t scalarBytes(uint32_t type) {
@@ -92,7 +96,7 @@ uint64_t scalarBytes(uint32_t type) {
 void skipValue(Reader &reader, uint32_t type, unsigned depth = 0) {
   if (depth > 16) throw GgufError("GGUF metadata nesting is too deep");
   if (type == kString) {
-    (void)reader.string();
+    reader.skipString();
   } else if (type == kArray) {
     const uint32_t element = reader.scalar<uint32_t>();
     const uint64_t count = reader.scalar<uint64_t>();
@@ -143,7 +147,7 @@ GgufFile::GgufFile(std::filesystem::path path) : path_(std::move(path)) {
   if (version != 3) throw GgufError("unsupported GGUF version " + std::to_string(version));
   const uint64_t tensorCount = reader.scalar<uint64_t>();
   const uint64_t keyCount = reader.scalar<uint64_t>();
-  if (tensorCount > 1u << 20 || keyCount > 1u << 20) throw GgufError("implausible GGUF header counts");
+  if (tensorCount > 16384 || keyCount > 16384) throw GgufError("implausible GGUF header counts");
   for (uint64_t i = 0; i < keyCount; ++i) {
     const std::string key = reader.string();
     const uint32_t type = reader.scalar<uint32_t>();

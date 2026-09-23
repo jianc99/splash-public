@@ -19,11 +19,12 @@ struct MoeShape final {
   uint32_t expertsPerToken = 0;
   uint32_t expertIntermediateSize = 0;
   // How the weights are stored: affine Q4/Q8 slabs, or the tensors of a GGUF
-  // (GgufMoeWeights), which run their own router and expert kernels.
-  QuantFamily quant = QuantFamily::Affine;
+  // (BlockMoeWeights), which run their own router and expert kernels.
+  WeightLayout weightLayout = WeightLayout::Affine64;
 
   [[nodiscard]] constexpr bool valid() const noexcept {
-    return hiddenSize && hiddenSize % 256 == 0 && experts && experts <= 256 &&
+    return (weightLayout == WeightLayout::Affine64 || weightLayout == WeightLayout::Block32) &&
+           hiddenSize && hiddenSize % 256 == 0 && experts && experts <= 256 &&
            expertsPerToken && expertsPerToken <= experts &&
            expertIntermediateSize && expertIntermediateSize % 256 == 0;
   }
@@ -37,36 +38,59 @@ struct MoeShape final {
 // N rows, expert e's planes from tile e * N / 256 on (moe_gguf_segment in
 // kernels/common/moe_expert_slab.h), and the shared expert's segment, whose
 // format may differ.
-struct GgufExpertProjection final {
-  GgufSegment routed;
-  GgufSegment shared;
+struct BlockExpertProjection final {
+  QuantizedSegment routed;
+  QuantizedSegment shared;
 };
 
 // The sparse MoE block of a GGUF target. The router and the shared-expert
 // gate are float tensors llama.cpp keeps unquantized, and they run in fp32.
-struct GgufMoeWeights final {
-  GgufSegment router;           // [experts][hidden]
-  GgufSegment sharedExpertGate; // [1][hidden]
-  GgufExpertProjection gate;
-  GgufExpertProjection up;
-  GgufExpertProjection down;
+struct BlockMoeWeights final {
+  QuantizedSegment router;           // [experts][hidden]
+  QuantizedSegment sharedExpertGate; // [1][hidden]
+  BlockExpertProjection gate;
+  BlockExpertProjection up;
+  BlockExpertProjection down;
 };
 
 // All weights for one sparse MoE block. The model package owns the buffers;
 // this value only exposes semantic projections to the operator. The shared
 // expert is a one-expert slab.
-struct MoeWeights final {
+struct AffineMoeWeights final {
   Q8Projection router;
-  ExpertQ4Projection expertGate;
-  ExpertQ4Projection expertUp;
-  ExpertQ4Projection expertDown;
-  ExpertQ4Projection sharedGate;
-  ExpertQ4Projection sharedUp;
-  ExpertQ4Projection sharedDown;
+  ExpertProjection expertGate;
+  ExpertProjection expertUp;
+  ExpertProjection expertDown;
+  ExpertProjection sharedGate;
+  ExpertProjection sharedUp;
+  ExpertProjection sharedDown;
   Q8Projection sharedExpertGate;
-  // Set for a GGUF target (MoeShape::quant == Gguf); the fields above are
-  // then unused.
-  std::optional<GgufMoeWeights> gguf{};
+};
+
+class MoeWeights final {
+public:
+  MoeWeights() = default;
+  MoeWeights(AffineMoeWeights weights) : storage_(std::move(weights)) {}
+  MoeWeights(BlockMoeWeights weights) : storage_(std::move(weights)) {}
+  MoeWeights(Q8Projection router, ExpertProjection gate, ExpertProjection up,
+             ExpertProjection down, ExpertProjection sharedGate,
+             ExpertProjection sharedUp, ExpertProjection sharedDown,
+             Q8Projection sharedExpertGate)
+      : storage_(AffineMoeWeights{std::move(router), std::move(gate), std::move(up),
+          std::move(down), std::move(sharedGate), std::move(sharedUp),
+          std::move(sharedDown), std::move(sharedExpertGate)}) {}
+  [[nodiscard]] WeightLayout layout() const noexcept {
+    return std::holds_alternative<AffineMoeWeights>(storage_)
+        ? WeightLayout::Affine64 : WeightLayout::Block32;
+  }
+  [[nodiscard]] AffineMoeWeights &affine() { return std::get<AffineMoeWeights>(storage_); }
+  [[nodiscard]] const AffineMoeWeights &affine() const { return std::get<AffineMoeWeights>(storage_); }
+  [[nodiscard]] const BlockMoeWeights *blocks() const {
+    return std::get_if<BlockMoeWeights>(&storage_);
+  }
+
+private:
+  std::variant<AffineMoeWeights, BlockMoeWeights> storage_;
 };
 
 // Grouped-row scratch. Routes are sorted by expert into tiles of tileRows
@@ -195,7 +219,7 @@ struct MoeConfig final {
   // GGUF plans only; the execution plans derive it from the GPU family.
   MoeGgufTile ggufTile = MoeGgufTile::Staged;
   // The tile of a GGUF plan's F32 router; the execution plans derive it from
-  // the device and the plan's rows (Q4Linear::ggufFloatTile).
+  // the device and the plan's rows (Linear::ggufFloatTile).
   FloatTile ggufRouterTile = FloatTile::Simdgroup;
   bool operator==(const MoeConfig &) const = default;
 };

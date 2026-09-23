@@ -89,7 +89,7 @@ struct OperatorChoices final {
 class ExecutionPlans final {
 public:
   explicit ExecutionPlans(const DeviceCapabilities &device);
-  [[nodiscard]] const Q4Linear &linear() const noexcept { return linear_; }
+  [[nodiscard]] const Linear &linear() const noexcept { return linear_; }
   // Validate every table before replacing any installed choice. Missing keys
   // always use the operator's shipped baseline; an empty install resets all.
   void install(const OperatorChoices &choices);
@@ -123,11 +123,11 @@ public:
   [[nodiscard]] MoeWorkspace moeDecodeWorkspacePerLane(MoeShape shape) const;
   // This scratch is one whole-command buffer, not a per-lane arena field.
   [[nodiscard]] uint64_t gateUpWorkspace(LinearMatrix matrix,
-                                         QuantFamily quant = QuantFamily::Affine) const;
+                                         WeightLayout weightLayout = WeightLayout::Affine64) const;
 
 private:
-  Q4Linear linear_;
-  Q4Linear baselineLinear_;
+  Linear linear_;
+  Linear baselineLinear_;
   uint32_t moeRouteWideRows_ = kMoeRouteWideRows;
   MoeExpertSimdgroups moeDecodeSimdgroups_ = MoeExpertSimdgroups::Eight;
   MoeGgufTile moeGgufTile_ = MoeGgufTile::Staged;

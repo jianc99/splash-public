@@ -81,13 +81,13 @@ Layout layout(const DeviceCapabilities &device,
   return result;
 }
 
-void requireProjection(const Q4Projection &projection, LinearMatrix matrix) {
+void requireProjection(const Projection &projection, LinearMatrix matrix) {
   const uint64_t parameters = uint64_t{matrix.outputSize} * (matrix.inputSize / 64);
   if (projection.outputSize != matrix.outputSize ||
       projection.inputSize != matrix.inputSize ||
-      !projection.weights || projection.weights.sizeBytes() < parameters * 32 ||
-      !projection.scales || projection.scales.sizeBytes() < parameters * 2 ||
-      !projection.biases || projection.biases.sizeBytes() < parameters * 2)
+      !projection.affine().weights || projection.affine().weights.sizeBytes() < parameters * 32 ||
+      !projection.affine().scales || projection.affine().scales.sizeBytes() < parameters * 2 ||
+      !projection.affine().biases || projection.affine().biases.sizeBytes() < parameters * 2)
     throw std::invalid_argument("Linear tuning projection does not match workload");
 }
 
@@ -169,7 +169,7 @@ void requireFinite(metal::MetalBuffer buffer, bool floats) {
 
 uint64_t linearTuningFixtureBytes(const DeviceCapabilities &device,
                                   LinearWorkload workload) {
-  return layout(device, Q4Linear(device).candidates(workload)).bytes;
+  return layout(device, Linear(device).candidates(workload)).bytes;
 }
 
 LinearTuningResult tuneLinear(metal::MetalBackend &backend,
@@ -185,7 +185,7 @@ LinearTuningResult tuneLinear(metal::MetalBackend &backend,
     return std::chrono::duration<double>(Clock::now() - start).count();
   };
   try {
-    Q4Linear linear(backend.capabilities());
+    Linear linear(backend.capabilities());
     const auto plans = linear.candidates(input.workload);
     result.choice.configuration = plans.front().configuration();
     if (!validMeasurementOptions(options) || !admit)
@@ -271,7 +271,7 @@ LinearTuningResult tuneLinear(metal::MetalBackend &backend,
     // gate and up projections of the representative being qualified: one
     // untimed submission per representative, before its candidates run.
     const std::optional<LinearPlan> exactPlain = fields[ReferenceGate]
-        ? std::optional{Q4Linear::plan(
+        ? std::optional{Linear::plan(
               {workload.matrix, workload.rows, LinearPhase::Decode, LinearEpilogue::None},
               {LinearTile::N128, workload.matrix.outputSize / 128})}
         : std::nullopt;

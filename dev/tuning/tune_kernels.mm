@@ -427,7 +427,7 @@ int main(int argc, char **argv) {
         if (!backend.healthy()) throw std::runtime_error("Metal backend became unhealthy");
       };
 
-      const Q4Linear linear(device);
+      const Linear linear(device);
       const auto verifyBaseline = VerifyAttentionConfig{};
       for (const auto &input : workloads.linear) {
         if (interrupted) break;

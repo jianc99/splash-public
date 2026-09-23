@@ -28,22 +28,22 @@ enum class QwenFfnKind : uint8_t { Dense, SparseMoe };
 // Both supported targets bind the same mixer tensors per hybrid layer; only
 // the FFN differs between them.
 struct QwenGdnWeights final {
-  ops::Q4Projection inputProjection;
+  ops::Projection inputProjection;
   metal::MetalBuffer convolutionWeights;
   metal::MetalBuffer decay;
   metal::MetalBuffer timeBias;
   ops::NormWeights mixerNorm;
-  ops::Q4Projection outputProjection;
+  ops::Projection outputProjection;
   // The value-head order of outputProjection's input columns, in which the
   // GDN writes its output.
   ops::GdnHeadOrder outputHeadOrder = ops::GdnHeadOrder::Grouped;
 };
 
 struct QwenAttentionWeights final {
-  ops::Q4Projection inputProjection;
+  ops::Projection inputProjection;
   ops::NormWeights queryNorm;
   ops::NormWeights keyNorm;
-  ops::Q4Projection outputProjection;
+  ops::Projection outputProjection;
 };
 
 using QwenMixerWeights = std::variant<QwenGdnWeights, QwenAttentionWeights>;
@@ -91,7 +91,7 @@ struct PackedTargetFiles final {
   }
 };
 
-// Reads a target through Files (packed files or GGUF images built in memory):
+// Reads a target through immutable WeightFiles, packaged or prepared locally:
 // per layer the input norm, mixer, post-attention norm and the architecture's
 // FFN through readFfn, then the head and the token embedding. Weights is the
 // architecture's weight struct. The norms of a GGUF image are F32, those of
@@ -124,7 +124,7 @@ readQwenTargetWeights(metal::MetalBackend &backend, const Layout &layout, Files 
     result.finalNorm = readNorm(file, layout.hiddenSize, ggufTarget, "final-norm");
     result.logitsProjection = ggufTarget
         ? readGgufProjection(file, "logits")
-        : readQ4Projection(file, backend, layout.vocabularySize,
+        : readProjection(file, backend, layout.vocabularySize,
                            layout.hiddenSize, "logits");
     file.finish();
     result.files.push_back(file.record());
@@ -133,7 +133,7 @@ readQwenTargetWeights(metal::MetalBackend &backend, const Layout &layout, Files 
     WeightFile file = files.embedding(layout.vocabularySize, layout.hiddenSize);
     result.tokenEmbedding = ggufTarget
         ? readGgufEmbedding(file, "embedding")
-        : readQ4ProjectionComponents(file, layout.vocabularySize,
+        : readAffineEmbedding(file, layout.vocabularySize,
                                      layout.hiddenSize, "embedding");
     file.finish();
     result.files.push_back(file.record());
@@ -189,8 +189,11 @@ struct QwenTargetGeometry final {
   uint32_t captureLayerCount = 0;
   kv::Layout kvLayout{};
   GdnStateLayout stateLayout{};
-  // The target projections' weight format (the draft is always affine).
-  ops::QuantFamily quant = ops::QuantFamily::Affine;
+  // Distinct operator requirements, collected from the loaded weights.
+  std::vector<ops::ProjectionShape> prefillProjections;
+  std::vector<ops::ProjectionShape> decodeProjections;
+  std::vector<ops::ProjectionShape> gateUpProjections;
+  std::vector<ops::MoeShape> moeShapes;
 
   [[nodiscard]] constexpr uint32_t gdnKeyWidth() const noexcept {
     return gdnKeyHeads * gdnHeadDimension;
@@ -370,7 +373,7 @@ public:
   [[nodiscard]] const QwenTargetGeometry &geometry() const noexcept {
     return geometry_;
   }
-  [[nodiscard]] const ops::Q4Projection &
+  [[nodiscard]] const ops::Projection &
   vocabularyProjection() const noexcept;
   // Lanes of storage the tensors of a decode step of `lanes` lanes bind: a
   // linear tile may hold more rows than the step (LinearPlan::storageRows;
@@ -388,7 +391,7 @@ public:
       std::span<const kv::LayerStorage> kvLayers,
       std::span<const kv::Q8ChunkedPrefillParams> q8,
       std::span<const kv::Q8VerifyAttentionParams> verify, uint32_t lanes,
-      ops::Q4DispatchStats &stats) const;
+      ops::LinearDispatchStats &stats) const;
   void addHead(metal::CommandGraph &graph, metal::MetalBuffer hidden,
                metal::MetalBuffer finalHidden, metal::MetalBuffer logits,
                uint32_t normalizedRows, ops::LinearScratch scratch = {}) const;
@@ -414,7 +417,7 @@ private:
       std::span<const kv::LayerStorage> kvLayers,
       std::span<const kv::Q8ChunkedPrefillParams> q8,
       std::span<const kv::Q8VerifyAttentionParams> verify, uint32_t lanes,
-      ops::Q4DispatchStats &stats) const;
+      ops::LinearDispatchStats &stats) const;
 
   WeightView weights_;
   QwenTargetGeometry geometry_;

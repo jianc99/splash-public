@@ -1,10 +1,7 @@
 #pragma once
 
-// Loads a Qwen target straight from a llama.cpp GGUF: each layer image is
-// planned (GgufImage), allocated as one anonymous Metal buffer, filled by the
-// CPU (header, descriptors, small tensors) and by the gguf_repack / gguf_copy
-// kernels reading the mmapped file, then handed out as a WeightFile so the
-// section readers are the ones used for packed files.
+// Source adapter for a Qwen GGUF. Preparation writes immutable cached files;
+// serving uses the same read-only WeightFile mappings as packaged weights.
 
 #include <filesystem>
 #include <memory>
@@ -12,6 +9,7 @@
 #include "metal/MetalBackend.hpp"
 #include "model/GgufFile.hpp"
 #include "model/GgufImage.hpp"
+#include "model/PreparedWeights.hpp"
 #include "model/WeightStore.hpp"
 
 namespace splash::model {
@@ -22,8 +20,7 @@ namespace splash::model {
 class GgufTargetLoader final {
 public:
   GgufTargetLoader(metal::MetalBackend &backend, std::filesystem::path path,
-                   gguf::TargetGeometry geometry);
-  ~GgufTargetLoader();
+                   gguf::TargetGeometry geometry, PreparationCheck check = {});
   GgufTargetLoader(const GgufTargetLoader &) = delete;
   GgufTargetLoader &operator=(const GgufTargetLoader &) = delete;
 
@@ -34,14 +31,15 @@ public:
   [[nodiscard]] const gguf::ImagePlanner &planner() const noexcept { return planner_; }
 
 private:
-  [[nodiscard]] metal::MetalBuffer mapTensor(uint64_t offset, uint64_t bytes);
   [[nodiscard]] WeightFile build(const gguf::Image &image, uint32_t expectedLayer,
                                  uint32_t expectedType);
 
   metal::MetalBackend *backend_;
+  PreparationCheck check_;
+  WeightSource source_;
   GgufFile file_;
   gguf::ImagePlanner planner_;
-  int descriptor_ = -1;
+  PreparedWeights cache_;
 };
 
 // The GGUF geometry of a Qwen layout: a dense FFN, or a sparse MoE when the

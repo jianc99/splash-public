@@ -560,6 +560,14 @@ void testSyntheticPackage(MetalBackend &backend,
         require(weightManifestFingerprint(records) ==
                     package.manifestFingerprintSha256,
                 "manifest fingerprint depends on load order");
+        records.front().contentIdentity = std::string(64, 'a');
+        const auto preparedIdentity = weightManifestFingerprint(records);
+        require(preparedIdentity != package.manifestFingerprintSha256,
+                "prepared content was omitted from runtime cache identity");
+        records.front().contentIdentity = std::string(64, 'b');
+        require(weightManifestFingerprint(records) != preparedIdentity,
+                "same-shape different weights share a runtime cache identity");
+        records.front().contentIdentity.clear();
         records.front().declaredBytes += kWeightFileAlignment;
         require(weightManifestFingerprint(records) !=
                     package.manifestFingerprintSha256,

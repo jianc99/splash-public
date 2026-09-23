@@ -15,6 +15,9 @@
 #include "metal/abi/Gguf.h"
 #include "model/GgufImage.hpp"
 #include "model/GgufTarget.hpp"
+#include "model/GgufPreparation.hpp"
+#include <fcntl.h>
+#include <unistd.h>
 
 #include <CommonCrypto/CommonDigest.h>
 
@@ -642,7 +645,7 @@ struct Shape {
   uint32_t rows, K, permuteFrom, headRows, groupHeads, groups;
 };
 
-void checkRepack(const Gpu &gpu, Fmt f, const Shape &shape, uint32_t seed) {
+void checkRepack(const Gpu &gpu, splash::metal::MetalBackend &backend, Fmt f, const Shape &shape, uint32_t seed) {
   const QuantFormat &layout = kQuantFormats[f];
   const uint32_t rows = shape.rows, K = shape.K, G = K / 32, stride = rowBytes(f, K);
   const std::vector<uint8_t> native = fixture(f, rows, K, seed);
@@ -669,6 +672,35 @@ void checkRepack(const Gpu &gpu, Fmt f, const Shape &shape, uint32_t seed) {
   std::snprintf(what, sizeof what, "gguf_repack %s rows=%u K=%u%s", fmtName(f), rows, K,
                 shape.permuteFrom == kNoPermute ? "" : " permuted");
   check(ran && imageMatches(image, sections), what);
+  // Independent CPU oracle above also checks a bounded, file-backed repack.
+  // The last shape crosses both a row tile and the 8192-column chunk boundary.
+  char inputPath[] = "/tmp/splash-repack-source-XXXXXX";
+  char outputPath[] = "/tmp/splash-repack-output-XXXXXX";
+  const int inputFd = mkstemp(inputPath), outputFd = mkstemp(outputPath);
+  try {
+    if (inputFd < 0 || outputFd < 0 || ftruncate(outputFd, bytes))
+      throw std::runtime_error("cannot create repack fixture");
+    splash::model::writeWeightBytes(inputFd, kSourceOffset, native);
+    splash::model::gguf::Image plan;
+    plan.bytes = bytes;
+    auto chunkParams = params;
+    chunkParams.src_offset = 0;
+    plan.repacks.push_back({chunkParams, kSourceOffset, native.size()});
+    const uint64_t before = backend.memoryStats().allocatedBytes;
+    splash::model::prepareGgufImage(backend, inputFd, outputFd, plan);
+    check(backend.memoryStats().allocatedBytes == before, "chunked repack releases staging buffers");
+    std::vector<uint8_t> actual(bytes), reference(bytes, 0);
+    splash::model::readWeightBytes(outputFd, 0, actual);
+    for (const auto &section : sections)
+      std::copy(section.bytes->begin(), section.bytes->end(), reference.begin() + section.begin);
+    check(actual == reference, std::string("chunked file repack: ") + what);
+  } catch (const std::exception &error) {
+    check(false, std::string("chunked repack: ") + error.what());
+  }
+  if (inputFd >= 0) close(inputFd);
+  if (outputFd >= 0) close(outputFd);
+  unlink(inputPath);
+  unlink(outputPath);
 }
 
 void checkCopy(const Gpu &gpu, uint32_t bytes) {
@@ -713,9 +745,12 @@ int main(int argc, char **argv) {
       gpu.repack = pipeline(gpu.device, library, "gguf_repack");
       gpu.copy = pipeline(gpu.device, library, "gguf_copy");
       if (!gpu.repack || !gpu.copy) return 1;
-      const Shape shapes[] = {{512, 1024, kNoPermute, 0, 0, 0}, {768, 1280, 256, 16, 8, 4}};
-      for (int s = 0; s < 2; ++s)
-        for (int f = 0; f < FMT_COUNT; ++f) checkRepack(gpu, Fmt(f), shapes[s], 100 + 8 * s + f);
+      splash::metal::MetalBackend backend(argv[1]);
+      const Shape shapes[] = {{512, 1024, kNoPermute, 0, 0, 0},
+                              {768, 1280, 256, 16, 8, 4},
+                              {768, 8448, 128, 16, 8, 5}};
+      for (int s = 0; s < 3; ++s)
+        for (int f = 0; f < FMT_COUNT; ++f) checkRepack(gpu, backend, Fmt(f), shapes[s], 100 + 8 * s + f);
       // 768 whole 16-byte chunks and a 5-byte tail, then an exact multiple.
       checkCopy(gpu, 768 * 16 + 5);
       checkCopy(gpu, 1024 * 16);

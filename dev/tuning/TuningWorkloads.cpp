@@ -7,11 +7,16 @@
 namespace splash::model {
 namespace {
 
-template <class Projection>
-bool sameProjection(const Projection &left, const Projection &right) noexcept {
+bool sameProjection(const ops::Projection &left, const ops::Projection &right) noexcept {
   return left.inputSize == right.inputSize && left.outputSize == right.outputSize &&
-         left.weights.sameView(right.weights) &&
-         left.scales.sameView(right.scales) && left.biases.sameView(right.biases);
+         left.affine().weights.sameView(right.affine().weights) &&
+         left.affine().scales.sameView(right.affine().scales) && left.affine().biases.sameView(right.affine().biases);
+}
+
+bool sameProjection(const ops::Q8Projection &left, const ops::Q8Projection &right) noexcept {
+  return left.inputSize == right.inputSize && left.outputSize == right.outputSize &&
+         left.weights.sameView(right.weights) && left.scales.sameView(right.scales) &&
+         left.biases.sameView(right.biases);
 }
 
 bool sameWeights(const ops::tuning::LinearTuningWeights &left,
@@ -21,21 +26,22 @@ bool sameWeights(const ops::tuning::LinearTuningWeights &left,
          (!left.gate || sameProjection(*left.gate, *right.gate));
 }
 
-bool sameExpert(const ops::ExpertQ4Projection &left,
-                 const ops::ExpertQ4Projection &right) noexcept {
+bool sameExpert(const ops::ExpertProjection &left,
+                 const ops::ExpertProjection &right) noexcept {
   return left.inputSize == right.inputSize && left.outputSize == right.outputSize &&
          left.experts == right.experts &&
          left.expertStrideBytes == right.expertStrideBytes &&
          left.packed.sameView(right.packed);
 }
 
-bool sameWeights(const ops::MoeWeights &left, const ops::MoeWeights &right) noexcept {
+bool sameWeights(const ops::MoeWeights &leftWeights, const ops::MoeWeights &rightWeights) noexcept {
+  const auto &left = leftWeights.affine(), &right = rightWeights.affine();
   if (!sameProjection(left.router, right.router) ||
       !sameProjection(left.sharedExpertGate, right.sharedExpertGate))
     return false;
-  for (auto field : {&ops::MoeWeights::expertGate, &ops::MoeWeights::expertUp,
-                     &ops::MoeWeights::expertDown, &ops::MoeWeights::sharedGate,
-                     &ops::MoeWeights::sharedUp, &ops::MoeWeights::sharedDown})
+  for (auto field : {&ops::AffineMoeWeights::expertGate, &ops::AffineMoeWeights::expertUp,
+                     &ops::AffineMoeWeights::expertDown, &ops::AffineMoeWeights::sharedGate,
+                     &ops::AffineMoeWeights::sharedUp, &ops::AffineMoeWeights::sharedDown})
     if (!sameExpert(left.*field, right.*field))
       return false;
   return true;
@@ -79,13 +85,14 @@ TuningWorkloads collectTuningWorkloads(
 
   std::map<ops::LinearWorkload, ops::tuning::LinearTuningInput> linear;
   std::map<ops::MoeWorkload, ops::tuning::MoeTuningInput> moe;
-  auto projection = [&](const ops::Q4Projection &weight, LinearPhase phase,
+  auto projection = [&](const ops::Projection &weight, LinearPhase phase,
                          LinearEpilogue epilogue,
-                         const ops::Q4Projection *gate = nullptr) {
+                         const ops::Projection *gate = nullptr) {
     if (!weight.inputSize || !weight.outputSize)
       throw std::invalid_argument("operator probe projection has no geometry");
     // GGUF projections are not tuned yet; their plans ignore installed choices.
-    if (!weight.gguf.empty()) return;
+    if (weight.layout() != ops::WeightLayout::Affine64 ||
+        (gate && gate->layout() != ops::WeightLayout::Affine64)) return;
     const auto sizes = phase == LinearPhase::Prefill ? prefillRows : decodeWidths;
     for (uint32_t size : sizes) {
       const uint32_t rows = phase == LinearPhase::Prefill
@@ -97,7 +104,7 @@ TuningWorkloads collectTuningWorkloads(
       appendDistinct(linear, workload, representative);
     }
   };
-  auto bothPhases = [&](const ops::Q4Projection &weight,
+  auto bothPhases = [&](const ops::Projection &weight,
                          LinearEpilogue epilogue = LinearEpilogue::None) {
     projection(weight, LinearPhase::Prefill, epilogue);
     projection(weight, LinearPhase::Decode, epilogue);
@@ -125,6 +132,7 @@ TuningWorkloads collectTuningWorkloads(
                      LinearEpilogue::GateUp, &layer.gateProjection);
         bothPhases(layer.downProjection, LinearEpilogue::Residual);
       } else {
+        if (layer.ffn.layout() != ops::WeightLayout::Affine64) continue;
         for (uint32_t rows : prefillRows) {
           ops::MoeWorkload workload{geometry.moe, rows, ops::MoePhase::Prefill};
           appendDistinct(moe, workload, layer.ffn);

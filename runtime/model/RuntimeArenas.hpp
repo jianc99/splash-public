@@ -411,11 +411,9 @@ public:
     // own route-major arena tensors, but must not remove the draft's scratch.
     const uint64_t draft = operators.gateUpWorkspace(
         {geometry.draft.intermediateSize, geometry.draft.hiddenSize});
-    const uint64_t target = geometry.target.denseIntermediateSize
-        ? operators.gateUpWorkspace({geometry.target.denseIntermediateSize,
-                                     geometry.target.hiddenSize},
-                                    geometry.target.quant)
-        : 0;
+    uint64_t target = 0;
+    for (const auto &p : geometry.target.gateUpProjections)
+      target = std::max(target, operators.gateUpWorkspace({p.outputSize, p.inputSize}, p.layout));
     return std::max(target, draft);
   }
 

@@ -42,6 +42,8 @@ uint32_t sourceHead(uint32_t destinationHead, uint32_t groupHeads, uint32_t grou
 }
 
 std::vector<uint8_t> readBytes(const GgufFile &file, const GgufTensor &tensor) {
+  if (tensor.bytes > 1024 * 1024)
+    throw GgufError("small weight tensor exceeds preparation bound: " + tensor.name);
   std::ifstream stream(file.path(), std::ios::binary);
   if (!stream) throw GgufError("cannot open GGUF file: " + file.path().string());
   std::vector<uint8_t> bytes(tensor.bytes);
@@ -112,6 +114,9 @@ public:
   }
 
   void fill(std::vector<uint8_t> bytes) {
+    uint64_t total = bytes.size();
+    for (const auto &fill : image_.fills) total += fill.bytes.size();
+    if (total > 4 * 1024 * 1024) throw GgufError("image metadata exceeds preparation bound");
     const uint64_t offset = section(bytes.size());
     image_.fills.push_back({offset, std::move(bytes)});
   }
@@ -174,6 +179,8 @@ public:
     const uint64_t meta = uint64_t{rows} * groups * q8.meta_bytes;
     descriptor(q8.ggml_type, rows, hidden, q8.plane0_bytes, q8.plane1_bytes, q8.meta_bytes,
                q8.meta_groups, plane0, 0, meta);
+    if (heads > 128 || plane0 + meta > 2 * 1024 * 1024)
+      throw GgufError("alpha/beta exceeds preparation bound");
     std::vector<uint8_t> betaBytes = readBytes(file_, beta), alphaBytes = readBytes(file_, alpha);
     std::vector<uint8_t> plane(plane0, 0), metaBytes(meta, 0);
     const uint32_t groupHeads = geometry_.gdnKeyHeads, valueGroups = heads / groupHeads;

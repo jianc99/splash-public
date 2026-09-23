@@ -33,6 +33,10 @@ BACKEND_CONTROL_SOURCES := \
 	runtime/engine/Cache.cpp \
 	runtime/engine/Engine.cpp
 MODEL_SOURCES := \
+	runtime/model/AffineTarget.cpp \
+	runtime/model/AffineCheckpoint.mm \
+	runtime/model/PreparedWeights.cpp \
+	runtime/model/GgufPreparation.cpp \
 	runtime/model/WeightStore.cpp \
 	runtime/model/GgufFile.cpp \
 	runtime/model/GgufImage.cpp \
@@ -65,6 +69,8 @@ TEST_OPERATOR_MEASUREMENT_ASAN := $(ENGINE_SANITIZER_BUILD)/operator-measurement
 TEST_OPERATOR_MEASUREMENT_TSAN := $(ENGINE_SANITIZER_BUILD)/operator-measurement-tsan
 TEST_MEMORY_TEST := $(ENGINE_TEST_BUILD)/engine-memory-plan
 TEST_DEVICE_QUERIES := $(ENGINE_TEST_BUILD)/device-queries
+TEST_AFFINE_CHECKPOINT := $(ENGINE_TEST_BUILD)/affine-checkpoint
+TEST_PREPARED_WEIGHTS := $(ENGINE_TEST_BUILD)/prepared-weights
 TEST_GGUF_FILE := $(ENGINE_TEST_BUILD)/gguf-file
 TEST_GGUF_PROJECTION := $(ENGINE_TEST_BUILD)/gguf-projection
 TEST_GGUF_MOE := $(ENGINE_TEST_BUILD)/gguf-moe
@@ -135,7 +141,7 @@ TEST_METAL_BACKEND_TEST := $(ENGINE_TEST_BUILD)/metal-backend
 TEST_METAL_BACKEND_AIR := $(ENGINE_TEST_BUILD)/metal-backend.air
 TEST_METAL_BACKEND_LIB := $(ENGINE_TEST_BUILD)/metal-backend.metallib
 
-TEST_CPU_TARGETS := $(TEST_OPERATOR_WORKSPACE) \
+TEST_CPU_TARGETS := $(TEST_AFFINE_CHECKPOINT) $(TEST_PREPARED_WEIGHTS) $(TEST_OPERATOR_WORKSPACE) \
 	$(TEST_GGUF_FILE) \
 	$(TEST_GGUF_REPACK) \
 	$(TEST_DEVICE_QUERIES) \
@@ -196,6 +202,7 @@ TEST_UNIT_TEST_TARGETS := $(sort $(TEST_CPU_TARGETS) $(TEST_METAL_TARGETS))
 # Keep every output that uses a flag set together, including standalone
 # benchmarks, real-model tests and intermediate test AIRs/metallibs.
 TEST_CONFIG_TARGETS := $(filter-out $(LIB),$(TEST_UNIT_TEST_TARGETS)) \
+	$(ENGINE_TEST_BUILD)/affine-source-oracle \
 	$(TEST_MODEL_RUNTIME_ORACLE) $(TEST_VISION_ENCODER_TEST) \
 	$(TEST_DECODE_PROFILE) $(TEST_ATTENTION_SWEEP) \
 	$(TEST_Q8_AIR) $(TEST_Q8_KERNEL_AIRS) $(TEST_METAL_BACKEND_AIR)
@@ -599,6 +606,8 @@ METAL_TEST_ENV := MTL_SHADER_VALIDATION=1
 test-engine: test-engine-cpu test-engine-metal
 
 test-engine-cpu: $(TEST_CPU_TARGETS) $(TEST_ATTENTION_SWEEP) $(TUNE_KERNELS)
+	$(TEST_AFFINE_CHECKPOINT)
+	$(TEST_PREPARED_WEIGHTS)
 	$(TEST_GGUF_FILE)
 	$(TEST_GGUF_REPACK) --cpu
 	$(TEST_DEVICE_QUERIES)
@@ -760,3 +769,14 @@ test-sanitizers: $(TEST_BACKEND_ASAN) $(TEST_BACKEND_TSAN) \
 		UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
 		$(TEST_OPERATOR_MEASUREMENT_ASAN)
 	TSAN_OPTIONS=halt_on_error=1 $(TEST_OPERATOR_MEASUREMENT_TSAN)
+
+$(TEST_PREPARED_WEIGHTS): dev/tests/engine/prepared_weights_test.cpp runtime/model/PreparedWeights.cpp | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) -o $@
+
+# Optional real-source oracle: compare locally prepared affine artifacts with
+# the existing released package, including all padding and metadata bytes.
+$(ENGINE_TEST_BUILD)/affine-source-oracle: dev/tests/engine/affine_source_oracle_test.mm $(ENGINE_LIBRARY) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< $(ENGINE_LIBRARY) $(ENGINE_LINKFLAGS) -o $@
+
+$(TEST_AFFINE_CHECKPOINT): dev/tests/engine/affine_checkpoint_test.cpp $(ENGINE_LIBRARY) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $< $(ENGINE_LIBRARY) $(ENGINE_LINKFLAGS) -o $@

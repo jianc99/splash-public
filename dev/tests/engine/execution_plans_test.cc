@@ -72,7 +72,7 @@ void covers(const Workspace &stride, const Workspace &needed, uint32_t lanes,
 void baselinePlans() {
   for (uint32_t family : {9U, 10U, 11U}) {
     const ExecutionPlans plans(device(family));
-    const Q4Linear baseline(device(family));
+    const Linear baseline(device(family));
     for (auto matrix : matrices) {
       uint64_t gateBound = 0;
       for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
@@ -212,7 +212,7 @@ void moeDeviceTiles() {
 // one route per expert), and no installed choices.
 void ggufMoePlans() {
   MoeShape shape = routedShape;
-  shape.quant = QuantFamily::Gguf;
+  shape.weightLayout = WeightLayout::Block32;
   for (uint32_t family : {0U, 9U, 10U, 11U}) {
     ExecutionPlans plans(device(family));
     const MoeGgufTile expected = family == 9 ? MoeGgufTile::Register : MoeGgufTile::Staged;
@@ -240,7 +240,7 @@ void ggufMoePlans() {
     }
     // Prefill: the register tile's 8 rows, or staged 8-row tiles while the
     // routes average at most one row per expert (32 rows of 8 of 256
-    // experts). The router's float tile follows Q4Linear::ggufFloatTile (32
+    // experts). The router's float tile follows Linear::ggufFloatTile (32
     // assumed cores: the neural accelerator from 321 rows, never on Apple9).
     for (uint32_t rows : {1U, 8U, 17U, 32U, 33U, 100U, 256U, 257U, 320U, 321U, 2048U}) {
       const MoePlan plan = plans.moePrefill(shape, rows);
@@ -267,7 +267,7 @@ void ggufMoePlans() {
 void allCandidates() {
   ExecutionPlans plans(device());
   const ExecutionPlans shipped(device());
-  const Q4Linear baseline(device());
+  const Linear baseline(device());
   for (auto matrix : matrices) {
     for (uint32_t rows : {1U, 17U, 2048U, 8U, 16U, 24U, 32U}) {
       const auto phase = rows == 1 || rows == 17 || rows == 2048

@@ -29,9 +29,8 @@ struct ModelDescriptor final {
   // Exact bytes parsed during package inspection, including artifact digests.
   // Synthetic descriptors retain zero; this is separate from layout identity.
   std::array<uint8_t, 32> packageManifestSha256{};
-  // Target weights are the tensors of a llama.cpp GGUF (format "gguf"),
-  // repacked into memory at load time and served by the GGUF kernels.
-  bool ggufTarget = false;
+  // Container selection belongs to loading; runtime dispatch follows each weight.
+  TargetSource targetSource = TargetSource::Packed;
 
   [[nodiscard]] bool valid() const noexcept;
 };

@@ -25,7 +25,7 @@ bool matches(const Q8Projection &projection, uint32_t output,
          projection.biases.sizeBytes() >= parameterBytes;
 }
 
-bool matches(const ExpertQ4Projection &projection, uint32_t experts,
+bool matches(const ExpertProjection &projection, uint32_t experts,
              uint32_t output, uint32_t input) noexcept {
   if (!projection.packed || projection.experts != experts || !experts ||
       projection.outputSize != output || projection.inputSize != input)
@@ -45,7 +45,7 @@ bool matches(const ExpertQ4Projection &projection, uint32_t experts,
 
 // A float segment holds [output][input] floats in plane0; a quantized one
 // its planes in a GGUF_FMT_* format.
-bool matches(const GgufSegment &segment, uint32_t output, uint32_t input,
+bool matches(const QuantizedSegment &segment, uint32_t output, uint32_t input,
              bool floatWeights) noexcept {
   if (!segment.plane0 || segment.isFloat() != floatWeights ||
       segment.outputSize != output || segment.inputSize != input)
@@ -55,17 +55,19 @@ bool matches(const GgufSegment &segment, uint32_t output, uint32_t input,
              : segment.formatId < GGUF_FMT_COUNT && segment.meta;
 }
 
-bool matches(const GgufExpertProjection &projection, uint32_t experts,
+bool matches(const BlockExpertProjection &projection, uint32_t experts,
              uint32_t output, uint32_t input) noexcept {
   return matches(projection.routed, experts * output, input, false) &&
          matches(projection.shared, output, input, false);
 }
 
 void validate(const MoeWeights &weights, MoeShape shape) {
+  if (shape.weightLayout != weights.layout())
+    throw std::invalid_argument("MoE weight layout does not match plan");
   const uint32_t hidden = shape.hiddenSize;
   const uint32_t intermediate = shape.expertIntermediateSize;
-  if (shape.quant == QuantFamily::Gguf) {
-    const GgufMoeWeights *gguf = weights.gguf ? &*weights.gguf : nullptr;
+  if (shape.weightLayout == WeightLayout::Block32) {
+    const BlockMoeWeights *gguf = weights.blocks();
     if (!shape.valid() || !gguf ||
         !matches(gguf->router, shape.experts, hidden, true) ||
         !matches(gguf->sharedExpertGate, 1, hidden, true) ||
@@ -75,14 +77,14 @@ void validate(const MoeWeights &weights, MoeShape shape) {
       throw std::invalid_argument("GGUF MoE weights do not match execution shape");
     return;
   }
-  if (!shape.valid() || weights.gguf || !matches(weights.router, 256, hidden) ||
-      !matches(weights.sharedExpertGate, 256, hidden) ||
-      !matches(weights.expertGate, shape.experts, intermediate, hidden) ||
-      !matches(weights.expertUp, shape.experts, intermediate, hidden) ||
-      !matches(weights.expertDown, shape.experts, hidden, intermediate) ||
-      !matches(weights.sharedGate, 1, intermediate, hidden) ||
-      !matches(weights.sharedUp, 1, intermediate, hidden) ||
-      !matches(weights.sharedDown, 1, hidden, intermediate)) {
+  if (!shape.valid() || weights.blocks() || !matches(weights.affine().router, 256, hidden) ||
+      !matches(weights.affine().sharedExpertGate, 256, hidden) ||
+      !matches(weights.affine().expertGate, shape.experts, intermediate, hidden) ||
+      !matches(weights.affine().expertUp, shape.experts, intermediate, hidden) ||
+      !matches(weights.affine().expertDown, shape.experts, hidden, intermediate) ||
+      !matches(weights.affine().sharedGate, 1, intermediate, hidden) ||
+      !matches(weights.affine().sharedUp, 1, intermediate, hidden) ||
+      !matches(weights.affine().sharedDown, 1, hidden, intermediate)) {
     throw std::invalid_argument("MoE weights do not match execution shape");
   }
 }
@@ -136,7 +138,7 @@ ExpertPasses fusedExpertPasses(const MoeConfig &config) noexcept {
 }
 
 void addAffineExperts(metal::CommandGraph &graph, const MoeBuffers &buffers,
-                      const MoeWeights &weights, const MoePlan &plan) {
+                      const AffineMoeWeights &weights, const MoePlan &plan) {
   const MoeShape shape = plan.shape();
   const uint32_t tiles = plan.maximumTiles();
   // The two expert strides are the gate and up slabs of the fused tile; a
@@ -202,12 +204,12 @@ void addAffineExperts(metal::CommandGraph &graph, const MoeBuffers &buffers,
 // read Table16 tiles from groupedInput: the gather writes the gate/up input's
 // and a prepare dispatch the down input's.
 void addGgufExperts(metal::CommandGraph &graph, const MoeBuffers &buffers,
-                    const GgufMoeWeights &weights, const MoePlan &plan) {
+                    const BlockMoeWeights &weights, const MoePlan &plan) {
   const MoeShape shape = plan.shape();
   const uint32_t tiles = plan.maximumTiles();
   const bool table16 = plan.config().ggufTile == MoeGgufTile::Register;
-  const auto plane1 = [](const GgufSegment &s) { return s.plane1 ? s.plane1 : s.meta; };
-  const auto pass = [&](const GgufExpertProjection &projection, bool up,
+  const auto plane1 = [](const QuantizedSegment &s) { return s.plane1 ? s.plane1 : s.meta; };
+  const auto pass = [&](const BlockExpertProjection &projection, bool up,
                         const metal::MetalBuffer &input,
                         const metal::MetalBuffer &output, uint32_t n, uint32_t k) {
     std::vector<metal::MetalBuffer> bindings{input};
@@ -246,11 +248,11 @@ void addGgufExperts(metal::CommandGraph &graph, const MoeBuffers &buffers,
 MoePlan::MoePlan(MoeShape shape, uint32_t rows, MoeConfig config,
                  bool prefill)
     : shape_(shape), rows_(rows), config_(config),
-      splitExperts_(shape.quant == QuantFamily::Gguf ||
+      splitExperts_(shape.weightLayout == WeightLayout::Block32 ||
                     (prefill && config.expertTile == MoeExpertTile::M32)) {
   // Affine plans have 8- and 32-row kernels in both phases, GGUF plans 8-row
   // kernels in both phases and 32-row prefill kernels.
-  const bool gguf = shape.quant == QuantFamily::Gguf;
+  const bool gguf = shape.weightLayout == WeightLayout::Block32;
   if ((config.expertTile != MoeExpertTile::M8 && config.expertTile != MoeExpertTile::M32) ||
       (gguf && !prefill && config.expertTile != MoeExpertTile::M8))
     throw std::invalid_argument("invalid MoE expert tile configuration");
@@ -258,7 +260,7 @@ MoePlan::MoePlan(MoeShape shape, uint32_t rows, MoeConfig config,
       config.m8Simdgroups != MoeExpertSimdgroups::Four)
     throw std::invalid_argument("invalid MoE expert simdgroup configuration");
   if (config.ggufTile == MoeGgufTile::Register &&
-      (shape.quant != QuantFamily::Gguf || config.expertTile != MoeExpertTile::M8))
+      (shape.weightLayout != WeightLayout::Block32 || config.expertTile != MoeExpertTile::M8))
     throw std::invalid_argument("the GGUF register expert tile takes GGUF 8-row tiles");
   workspace_ = workspaceFor(shape, rows, tileRows(), splitExperts_, config.ggufTile);
   maximumTiles_ = moeMaximumTiles(rows, shape, tileRows());
@@ -291,7 +293,7 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
   }
   const MoeRouteParams routeParams{rows, shape.hiddenSize, shape.experts,
                                    shape.expertsPerToken};
-  const GgufMoeWeights *gguf = weights.gguf ? &*weights.gguf : nullptr;
+  const BlockMoeWeights *gguf = weights.blocks();
   if (gguf) {
     // fp32 scores of the F32 router in rows of 256, as the select kernel reads.
     addGgufFloat(graph, buffers.input, gguf->router, buffers.groupedInput, rows,
@@ -305,15 +307,15 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
     const MoeRouteTile route = moeRouteTile(rows, plan.config().routeWideRows);
     graph.add(route.rows == 8 ? "moe_route_scores_q8_m8"
                               : "moe_route_scores_q8_m32",
-              {buffers.input, weights.router.weights, weights.router.scales,
-               weights.router.biases, buffers.groupedInput},
+              {buffers.input, weights.affine().router.weights, weights.affine().router.scales,
+               weights.affine().router.biases, buffers.groupedInput},
               routeParams,
               {(rows + route.rows - 1) / route.rows, 256 / route.experts, 1});
     graph.add("moe_route_select_q8",
               {buffers.groupedInput, buffers.input,
-               weights.sharedExpertGate.weights,
-               weights.sharedExpertGate.scales,
-               weights.sharedExpertGate.biases, buffers.selectedExperts,
+               weights.affine().sharedExpertGate.weights,
+               weights.affine().sharedExpertGate.scales,
+               weights.affine().sharedExpertGate.biases, buffers.selectedExperts,
                buffers.routingWeights},
               routeParams, {rows, 1, 1});
   }
@@ -337,7 +339,7 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
   if (gguf)
     addGgufExperts(graph, buffers, *gguf, plan);
   else
-    addAffineExperts(graph, buffers, weights, plan);
+    addAffineExperts(graph, buffers, weights.affine(), plan);
   graph.add("moe_combine",
             {buffers.expertOutput, buffers.routeRows, buffers.routingWeights,
              buffers.residual, buffers.output},
@@ -364,7 +366,7 @@ MoePlan MoE::decodePlan(MoeShape shape, uint32_t lanes, MoeConfig config) {
 std::array<MoePlan, 2> MoE::prefillCandidates(MoeShape shape, uint32_t rows,
                                           uint32_t routeWideRows) {
   const MoePlan baseline = prefillPlan(shape, rows, {MoeExpertTile::M32, routeWideRows});
-  if (shape.quant == QuantFamily::Gguf) return {baseline, baseline};
+  if (shape.weightLayout == WeightLayout::Block32) return {baseline, baseline};
   return {baseline, prefillPlan(shape, rows, {MoeExpertTile::M8, routeWideRows})};
 }
 
@@ -374,7 +376,7 @@ std::array<MoePlan, 2> MoE::decodeCandidates(MoeShape shape, uint32_t lanes,
                                          MoeGgufTile ggufTile) {
   const MoePlan baseline = decodePlan(
       shape, lanes, {MoeExpertTile::M8, routeWideRows, m8Simdgroups, ggufTile});
-  if (shape.quant == QuantFamily::Gguf) return {baseline, baseline};
+  if (shape.weightLayout == WeightLayout::Block32) return {baseline, baseline};
   return {baseline, decodePlan(shape, lanes,
                                {MoeExpertTile::M32, routeWideRows, m8Simdgroups})};
 }

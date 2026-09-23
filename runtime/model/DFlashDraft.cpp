@@ -142,9 +142,9 @@ void DFlashDraft::addContextPrefill(
 
 void DFlashDraft::addDecode(
     metal::CommandGraph &graph, DFlashDecodeBuffers buffers,
-    const ops::Q4Projection &vocabularyProjection,
+    const ops::Projection &vocabularyProjection,
     std::span<const uint32_t> cacheLengths, uint32_t lanes,
-    ops::Q4DispatchStats &stats) const {
+    ops::LinearDispatchStats &stats) const {
   if (!lanes || lanes > ExecutionLimits::maximumBatchWidth ||
       cacheLengths.size() != ExecutionLimits::maximumBatchWidth ||
       buffers.persistentKeys.size() != weights_.layout.layers ||
@@ -248,7 +248,7 @@ void DFlashDraft::addDecode(
 void DFlashDraft::addContextCommit(
     metal::CommandGraph &graph, DFlashContextBuffers buffers,
     std::span<const uint32_t> startPositions, uint32_t lanes,
-    ops::Q4DispatchStats &stats) const {
+    ops::LinearDispatchStats &stats) const {
   if (!lanes || lanes > ExecutionLimits::maximumBatchWidth ||
       startPositions.size() != ExecutionLimits::maximumBatchWidth ||
       buffers.persistentKeys.size() != weights_.layout.layers ||
@@ -306,26 +306,26 @@ loadDFlashDraftWeights(metal::MetalBackend &backend,
     layer.inputNorm = readNorm(file, layout.hiddenSize, false, "input-norm");
     layer.attentionConvolution =
         file.section(convolutionBytes, "attention-convolution");
-    layer.attentionDynamic = readQ4Projection(
+    layer.attentionDynamic = readProjection(
         file, backend, layout.dynamicSize, layout.hiddenSize,
         "attention-dynamic");
-    layer.qkvProjection = readQ4Projection(
+    layer.qkvProjection = readProjection(
         file, backend, layout.qkvSize, layout.hiddenSize, "qkv");
     layer.queryNorm = file.section(headNormBytes, "query-norm");
     layer.keyNorm = file.section(headNormBytes, "key-norm");
-    layer.outputProjection = readQ4Projection(
+    layer.outputProjection = readProjection(
         file, backend, layout.hiddenSize, layout.attentionSize,
         "attention-output");
     layer.postAttentionNorm =
         readNorm(file, layout.hiddenSize, false, "post-attention-norm");
     layer.mlpConvolution = file.section(convolutionBytes, "mlp-convolution");
-    layer.mlpDynamic = readQ4Projection(
+    layer.mlpDynamic = readProjection(
         file, backend, layout.dynamicSize, layout.hiddenSize, "mlp-dynamic");
-    layer.gateProjection = readQ4Projection(
+    layer.gateProjection = readProjection(
         file, backend, layout.intermediateSize, layout.hiddenSize, "mlp-gate");
-    layer.upProjection = readQ4Projection(
+    layer.upProjection = readProjection(
         file, backend, layout.intermediateSize, layout.hiddenSize, "mlp-up");
-    layer.downProjection = readQ4Projection(file, backend, layout.hiddenSize,
+    layer.downProjection = readProjection(file, backend, layout.hiddenSize,
                                             layout.intermediateSize,
                                             "mlp-down");
     file.finish();
@@ -336,12 +336,12 @@ loadDFlashDraftWeights(metal::MetalBackend &backend,
   {
     WeightFile file(backend, directory / "model.bin", "draft/model.bin",
                     kDFlashLayerMagic, layout.layers, 1);
-    result.contextProjection = readQ4Projection(
+    result.contextProjection = readProjection(
         file, backend, layout.hiddenSize, layout.targetHiddenSize,
         "context-projection");
     result.hiddenNorm = readNorm(file, layout.hiddenSize, false, "hidden-norm");
     result.finalNorm = readNorm(file, layout.hiddenSize, false, "final-norm");
-    result.selectorProjection = readQ4Projection(
+    result.selectorProjection = readProjection(
         file, backend, layout.selectorRank, layout.hiddenSize, "selector");
     const uint64_t codebookBytes = checkedWeightMultiply(
         checkedWeightMultiply(layout.vocabularySize, layout.selectorRank,

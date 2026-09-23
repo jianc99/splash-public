@@ -85,23 +85,6 @@ uint64_t checkedAdd(uint64_t left, uint64_t right, std::string_view label) {
   return left + right;
 }
 
-uint64_t packedModelFileBytes(const std::filesystem::path &root) {
-  uint64_t bytes = 0;
-  for (std::string_view directory : {"target", "draft", "vision"}) {
-    const std::filesystem::path package = root / directory;
-    for (const auto &entry :
-         std::filesystem::recursive_directory_iterator(package)) {
-      if (!entry.is_regular_file())
-        continue;
-      bytes = checkedAdd(bytes, entry.file_size(), "model package");
-    }
-  }
-  if (!bytes) {
-    throw std::invalid_argument("model package contains no regular files");
-  }
-  return bytes;
-}
-
 uint64_t mebibytes(uint64_t bytes) noexcept { return bytes / kMiB; }
 
 // The startup admission rule. Deliberately independent of the model size:
@@ -318,7 +301,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
             pressure ? pressure() : MemoryPressure::Normal);
       });
   try {
-    const uint64_t modelBytes = packedModelFileBytes(config.modelRoot);
+    const uint64_t modelBytes = model::preparedModelWeightBytes(config.modelRoot, config.model);
     const uint64_t hardBudgetBytes = EngineMemoryPolicy::hardBudgetBytes(
         device.recommendedMaxWorkingSetBytes, config.maximumMemoryBytes);
     // Reject an impossible weight budget before registering model buffers.
@@ -348,7 +331,17 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
 
   model::ModelPackage package;
   try {
-    package = model::loadModelPackage(*backend, config.modelRoot, config.model);
+    package = model::loadModelPackage(*backend, config.modelRoot, config.model,
+        [&] {
+          backend->checkOperation();
+          const auto pressure = config.memoryPressure ? config.memoryPressure() : MemoryPressure::Normal;
+          if (pressure != MemoryPressure::Normal)
+            throw metal::MetalAllocationError("weight preparation requires normal memory pressure",
+                                               metal::AllocationFailure::HostPressure);
+          requireStartupHeadroom(hostAvailableMemory,
+              checkedAdd(hostReserveBytes, model::kWeightPreparationWorkspaceBytes,
+                         "weight preparation reserve"), pressure);
+        });
     requireLoadedModel(package);
   } catch (const metal::MetalAllocationError &error) {
     throw RuntimeResourcesError(RuntimeResourceStage::ModelLoading,

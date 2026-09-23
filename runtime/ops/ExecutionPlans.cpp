@@ -18,7 +18,7 @@ auto shapeKey(DraftAttentionShape s) noexcept {
 }
 auto shapeKey(MoeShape s) noexcept {
   return std::tuple{s.hiddenSize, s.experts, s.expertsPerToken,
-                    s.expertIntermediateSize, s.quant};
+                    s.expertIntermediateSize, s.weightLayout};
 }
 AttentionShape attentionShape(uint32_t queryHeads, kv::Layout layout) {
   return {queryHeads, layout.kvHeads, layout.headDimension, layout.format};
@@ -120,7 +120,7 @@ ExecutionPlans::ExecutionPlans(const DeviceCapabilities &device)
 
 void ExecutionPlans::install(const OperatorChoices &choices) {
   OperatorChoices pending = choices;
-  Q4Linear nextLinear = baselineLinear_;
+  Linear nextLinear = baselineLinear_;
   nextLinear.setChoices(pending.linear);
   for (const auto &choice : pending.prefillAttention) {
     const auto &w = choice.workload;
@@ -190,7 +190,7 @@ DraftAttentionPlan ExecutionPlans::draftAttention(DraftAttentionShape shape,
 // and they take the device's tiles.
 MoePlan ExecutionPlans::moePrefill(MoeShape shape, uint32_t rows) const {
   MoeConfig config{MoeExpertTile::M32};
-  if (shape.quant == QuantFamily::Gguf) {
+  if (shape.weightLayout == WeightLayout::Block32) {
     config.expertTile = moeGgufPrefillTile(shape, rows, moeGgufTile_);
     config.ggufTile = moeGgufTile_;
     config.ggufRouterTile = linear_.ggufFloatTile(rows, shape.experts);
@@ -209,13 +209,13 @@ MoePlan ExecutionPlans::moeDecode(MoeShape shape, uint32_t lanes) const {
   if (!lanes || lanes > kMaximumLanes)
     throw std::invalid_argument("invalid MoE decode width");
   const MoeConfig baseline{MoeExpertTile::M8};
-  MoeConfig config = shape.quant == QuantFamily::Gguf
+  MoeConfig config = shape.weightLayout == WeightLayout::Block32
       ? baseline
       : configurationFor(choices_.moe, MoeWorkload{shape, lanes * kDecodeRows, MoePhase::Decode},
                          baseline);
   config.routeWideRows = moeRouteWideRows_;
   config.m8Simdgroups = moeDecodeSimdgroups_;
-  if (shape.quant == QuantFamily::Gguf) {
+  if (shape.weightLayout == WeightLayout::Block32) {
     config.ggufTile = moeGgufTile_;
     config.ggufRouterTile = linear_.ggufFloatTile(lanes * kDecodeRows, shape.experts);
   }
@@ -224,7 +224,7 @@ MoePlan ExecutionPlans::moeDecode(MoeShape shape, uint32_t lanes) const {
 
 std::array<MoePlan, 2> ExecutionPlans::moeCandidates(const MoeWorkload &workload) const {
   // GGUF plans are not tuned: both candidates are the device's plan.
-  if (workload.phase == MoePhase::Prefill && workload.shape.quant == QuantFamily::Gguf) {
+  if (workload.phase == MoePhase::Prefill && workload.shape.weightLayout == WeightLayout::Block32) {
     const MoePlan plan = moePrefill(workload.shape, workload.rows);
     return {plan, plan};
   }
@@ -234,7 +234,7 @@ std::array<MoePlan, 2> ExecutionPlans::moeCandidates(const MoeWorkload &workload
     throw std::invalid_argument("invalid MoE candidate workload");
   return MoE::decodeCandidates(
       workload.shape, workload.rows / kDecodeRows, moeRouteWideRows_, moeDecodeSimdgroups_,
-      workload.shape.quant == QuantFamily::Gguf ? moeGgufTile_ : MoeGgufTile::Staged);
+      workload.shape.weightLayout == WeightLayout::Block32 ? moeGgufTile_ : MoeGgufTile::Staged);
 }
 
 AttentionWorkspace ExecutionPlans::prefillAttentionWorkspace(
@@ -324,11 +324,11 @@ MoeWorkspace ExecutionPlans::moeDecodeWorkspacePerLane(MoeShape shape) const {
   return bound;
 }
 
-uint64_t ExecutionPlans::gateUpWorkspace(LinearMatrix matrix, QuantFamily quant) const {
+uint64_t ExecutionPlans::gateUpWorkspace(LinearMatrix matrix, WeightLayout weightLayout) const {
   uint64_t bound = 0;
   for (uint32_t lanes = 1; lanes <= kMaximumLanes; ++lanes) {
     const LinearWorkload workload{matrix, lanes * kDecodeRows,
-                                  LinearPhase::Decode, LinearEpilogue::GateUp, quant};
+                                  LinearPhase::Decode, LinearEpilogue::GateUp, weightLayout};
     bound = std::max({bound, baselineLinear_.plan(workload).gateScratchBytes(),
                       linear_.plan(workload).gateScratchBytes()});
   }

@@ -150,26 +150,26 @@ struct DFlashSelectionBuffers final {
 struct DFlashDraftLayerWeights final {
   ops::NormWeights inputNorm;
   metal::MetalBuffer attentionConvolution;
-  ops::Q4Projection attentionDynamic;
-  ops::Q4Projection qkvProjection;
+  ops::Projection attentionDynamic;
+  ops::Projection qkvProjection;
   metal::MetalBuffer queryNorm;
   metal::MetalBuffer keyNorm;
-  ops::Q4Projection outputProjection;
+  ops::Projection outputProjection;
   ops::NormWeights postAttentionNorm;
   metal::MetalBuffer mlpConvolution;
-  ops::Q4Projection mlpDynamic;
-  ops::Q4Projection gateProjection;
-  ops::Q4Projection upProjection;
-  ops::Q4Projection downProjection;
+  ops::Projection mlpDynamic;
+  ops::Projection gateProjection;
+  ops::Projection upProjection;
+  ops::Projection downProjection;
 };
 
 struct DFlashDraftWeights final {
   DFlashDraftLayout layout;
   std::vector<DFlashDraftLayerWeights> layers;
-  ops::Q4Projection contextProjection;
+  ops::Projection contextProjection;
   ops::NormWeights hiddenNorm;
   ops::NormWeights finalNorm;
-  ops::Q4Projection selectorProjection;
+  ops::Projection selectorProjection;
   metal::MetalBuffer predecessorCodebook;
   metal::MetalBuffer successorCodebook;
   std::vector<WeightFileRecord> files;
@@ -196,9 +196,9 @@ public:
                          std::span<const DFlashPrefillSpan> spans) const;
 
   void addDecode(metal::CommandGraph &graph, DFlashDecodeBuffers buffers,
-                 const ops::Q4Projection &vocabularyProjection,
+                 const ops::Projection &vocabularyProjection,
                  std::span<const uint32_t> cacheLengths, uint32_t lanes,
-                 ops::Q4DispatchStats &stats) const;
+                 ops::LinearDispatchStats &stats) const;
   void addSelection(metal::CommandGraph &graph,
                     DFlashSelectionBuffers buffers,
                     std::span<const uint32_t> anchors,
@@ -208,7 +208,7 @@ public:
                         DFlashContextBuffers buffers,
                         std::span<const uint32_t> startPositions,
                         uint32_t lanes,
-                        ops::Q4DispatchStats &stats) const;
+                        ops::LinearDispatchStats &stats) const;
 
 private:
   const DFlashDraftWeights &weights_;

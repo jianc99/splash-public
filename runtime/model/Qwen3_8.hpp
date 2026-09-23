@@ -1,5 +1,7 @@
 #pragma once
 
+#include "model/PreparedWeights.hpp"
+
 #include "Model.hpp"
 #include "QwenTarget.hpp"
 #include "StateLayout.hpp"
@@ -73,17 +75,17 @@ struct Qwen3_8LayerWeights final {
   ops::NormWeights inputNorm;
   QwenMixerWeights mixer;
   ops::NormWeights postAttentionNorm;
-  ops::Q4Projection gateProjection;
-  ops::Q4Projection upProjection;
-  ops::Q4Projection downProjection;
+  ops::Projection gateProjection;
+  ops::Projection upProjection;
+  ops::Projection downProjection;
 };
 
 struct Qwen3_8Weights final {
   Qwen3_8Layout layout;
   std::vector<Qwen3_8LayerWeights> layers;
   ops::NormWeights finalNorm;
-  ops::Q4Projection logitsProjection;
-  ops::Q4Projection tokenEmbedding;
+  ops::Projection logitsProjection;
+  ops::EmbeddingWeights tokenEmbedding;
   std::vector<WeightFileRecord> files;
   uint64_t actualAllocatedBytes = 0;
   std::string manifestFingerprintSha256;
@@ -92,6 +94,6 @@ struct Qwen3_8Weights final {
 [[nodiscard]] Qwen3_8Weights
 loadQwen3_8Weights(metal::MetalBackend &backend,
                    const std::filesystem::path &directory,
-                   Qwen3_8Layout layout = {}, bool ggufTarget = false);
+                   Qwen3_8Layout layout = {}, TargetSource source = TargetSource::Packed, PreparationCheck prepareCheck = {});
 
 } // namespace splash::model

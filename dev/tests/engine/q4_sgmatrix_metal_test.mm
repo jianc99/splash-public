@@ -34,13 +34,13 @@ struct Guarded {
   }
 };
 uint32_t hash(uint32_t v) { v ^= v >> 16; v *= 0x7feb352d; v ^= v >> 15; return v * 0x846ca68b; }
-Q4Projection weights(metal::MetalBackend &backend, LinearMatrix shape, uint32_t seed, bool zero) {
+Projection weights(metal::MetalBackend &backend, LinearMatrix shape, uint32_t seed, bool zero) {
   const uint64_t params = uint64_t(shape.outputSize) * shape.inputSize / 64;
-  Q4Projection p{backend.allocateBuffer(params * 32), backend.allocateBuffer(params * 2),
+  Projection p{backend.allocateBuffer(params * 32), backend.allocateBuffer(params * 2),
                  backend.allocateBuffer(params * 2), shape.outputSize, shape.inputSize};
-  auto *q = static_cast<uint8_t *>(p.weights.contents());
-  auto *s = static_cast<uint16_t *>(p.scales.contents());
-  auto *b = static_cast<uint16_t *>(p.biases.contents());
+  auto *q = static_cast<uint8_t *>(p.affine().weights.contents());
+  auto *s = static_cast<uint16_t *>(p.affine().scales.contents());
+  auto *b = static_cast<uint16_t *>(p.affine().biases.contents());
   for (uint64_t i = 0; i < params * 32; ++i) q[i] = zero ? 0 : hash(uint32_t(i) + seed);
   for (uint64_t i = 0; i < params; ++i) {
     s[i] = floatToBf16((int(hash(uint32_t(i) + seed + 7) % 17) - 8) / 2048.0f);
@@ -51,10 +51,10 @@ Q4Projection weights(metal::MetalBackend &backend, LinearMatrix shape, uint32_t 
 // The fp64 projection of one output and the operand magnitudes its error
 // bound scales with.
 struct Exact { double value, quantMagnitude, magnitude; };
-Exact exact(const Q4Projection &p, const uint16_t *input, uint32_t row, uint32_t col) {
-  const auto *q = static_cast<const uint8_t *>(p.weights.contents());
-  const auto *sc = static_cast<const uint16_t *>(p.scales.contents());
-  const auto *bi = static_cast<const uint16_t *>(p.biases.contents());
+Exact exact(const Projection &p, const uint16_t *input, uint32_t row, uint32_t col) {
+  const auto *q = static_cast<const uint8_t *>(p.affine().weights.contents());
+  const auto *sc = static_cast<const uint16_t *>(p.affine().scales.contents());
+  const auto *bi = static_cast<const uint16_t *>(p.affine().biases.contents());
   double value = 0, magnitude = 0, quantMagnitude = 0;
   const uint32_t groups = p.inputSize / 64;
   for (uint32_t g = 0; g < groups; ++g) {
@@ -106,7 +106,7 @@ bool within(const Reference &ref, uint16_t actual) {
 void runCase(metal::MetalBackend &backend, uint32_t n, uint32_t k, uint32_t splits,
              LinearEpilogue epilogue, uint32_t fixture, uint32_t rows) {
   const LinearWorkload workload{{n, k}, rows, LinearPhase::Decode, epilogue};
-  const auto plan = Q4Linear::plan(workload,
+  const auto plan = Linear::plan(workload,
       {LinearTile::Simdgroup, n / (epilogue == LinearEpilogue::GateUp ? 32 : 64), LinearSimdgroups::Four, splits});
   const auto size = plan.scratchSize();
   Guarded input(backend, 2ULL * rows * k), output(backend, 2ULL * rows * n), residual(backend, 2ULL * rows * n);
@@ -125,7 +125,7 @@ void runCase(metal::MetalBackend &backend, uint32_t n, uint32_t k, uint32_t spli
   for (uint32_t i = 0; i < rows * n; ++i) r[i] = floatToBf16(float(int(i % 31) - 15) / 8);
   const auto p = weights(backend, {n,k}, 31, fixture == 3);
   const auto gate = weights(backend, {n,k}, 177, fixture == 3);
-  Q4Linear linear(backend.capabilities());
+  Linear linear(backend.capabilities());
   LinearBuffers b{input.view, output.view, {}, epilogue == LinearEpilogue::Residual ? residual.view : metal::MetalBuffer{}, {}, {}, scratch};
   metal::CommandGraph graph;
   // Reuse one workspace repeatedly in a single command to expose incomplete
@@ -181,7 +181,7 @@ void runCase(metal::MetalBackend &backend, uint32_t n, uint32_t k, uint32_t spli
 // counter must return to zero.
 struct SplitOperand {
   LinearWorkload workload;
-  Q4Projection weights, gate;
+  Projection weights, gate;
   metal::MetalBuffer input, residual, output;
   std::vector<Exact> exact, gateExact;
 };
@@ -224,7 +224,7 @@ void splitVisibility(metal::MetalBackend &backend,
     DeviceCapabilities device;
     device.appleGpuFamily = 9;
     device.gpuCoreCount = cores;
-    const Q4Linear policy(device);
+    const Linear policy(device);
     const auto a = policy.plan(operands[0].workload).configuration();
     const auto b = policy.plan(operands[1].workload).configuration();
     if (a.tile == LinearTile::Simdgroup && b.tile == LinearTile::Simdgroup && std::max(a.splits, b.splits) > 1)
@@ -233,7 +233,7 @@ void splitVisibility(metal::MetalBackend &backend,
   require(!splitPairs.empty(), "the policy splits neither projection");
   const auto plan = [&](uint32_t i, uint32_t splits) {
     const LinearWorkload &w = operands[i].workload;
-    return Q4Linear::plan(w, {LinearTile::Simdgroup, w.matrix.outputSize / (w.epilogue == LinearEpilogue::GateUp ? 32 : 64),
+    return Linear::plan(w, {LinearTile::Simdgroup, w.matrix.outputSize / (w.epilogue == LinearEpilogue::GateUp ? 32 : 64),
                               LinearSimdgroups::Four, splits});
   };
   LinearScratchSize size;
@@ -248,7 +248,7 @@ void splitVisibility(metal::MetalBackend &backend,
   std::memset(counters.view.contents(), 0, size.counters);
   const LinearScratch scratch{table.view, sums.view, partials.view, counters.view};
   const auto poison = backend.allocateBuffer(size.partials);
-  const Q4Linear linear(backend.capabilities());
+  const Linear linear(backend.capabilities());
   const auto add = [&](metal::CommandGraph &graph, uint32_t i, uint32_t splits) {
     const SplitOperand &o = operands[i];
     const bool gateUp = o.workload.epilogue == LinearEpilogue::GateUp;

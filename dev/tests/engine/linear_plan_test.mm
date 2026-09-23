@@ -201,7 +201,7 @@ void narrowM24BoundaryPlans() {
     DeviceCapabilities device;
     device.appleGpuFamily = 10;
     device.gpuCoreCount = cores;
-    Q4Linear linear(device);
+    Linear linear(device);
     for (auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual}) {
       // Explicit values on both sides of the tile and K boundaries.
       for (auto [matrix, threads] : std::array<std::pair<LinearMatrix, uint32_t>, 4>{{
@@ -223,7 +223,7 @@ void baselinePlans() {
       DeviceCapabilities device;
       device.appleGpuFamily = family;
       device.gpuCoreCount = reportedCores;
-      Q4Linear linear(device);
+      Linear linear(device);
       for (const auto &shape : kProductionShapes) {
         for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
           const LinearWorkload workload{shape.matrix, lanes * 8, LinearPhase::Decode, shape.epilogue};
@@ -316,7 +316,7 @@ void baselinePlans() {
     DeviceCapabilities device;
     device.appleGpuFamily = family;
     device.gpuCoreCount = cores;
-    return Q4Linear(device).plan(workload).configuration();
+    return Linear(device).plan(workload).configuration();
   };
   const LinearWorkload gateUp{{17408, 5120}, 8, LinearPhase::Decode, LinearEpilogue::GateUp};
   require(configured(10, 16, gateUp) == LinearConfig{LinearTile::N256, 36} &&
@@ -438,7 +438,7 @@ void planContracts(uint32_t family, uint32_t cores, size_t &widestCandidates) {
   DeviceCapabilities device;
   device.appleGpuFamily = family;
   device.gpuCoreCount = cores;
-  Q4Linear linear(device);
+  Linear linear(device);
   // Include a wide Apple9 projection with four distinct persistent grids,
   // both paired N256 grids and all four K splits to reach the candidate bound.
   for (const LinearMatrix matrix : {LinearMatrix{512, 256}, LinearMatrix{768, 768},
@@ -452,7 +452,7 @@ void planContracts(uint32_t family, uint32_t cores, size_t &widestCandidates) {
         require(linear.plan(workload).configuration().tile != LinearTile::Split32 &&
                     linear.plan(workload).configuration().tile != LinearTile::Split64,
                 "offline split-K candidate became a serving default");
-        require(!candidates.empty() && candidates.size() <= Q4Linear::kMaximumCandidates,
+        require(!candidates.empty() && candidates.size() <= Linear::kMaximumCandidates,
                 "Linear candidates exceed the bounded set");
         widestCandidates = std::max(widestCandidates, candidates.size());
         require(candidates.front().configuration() == linear.plan(workload).configuration(),
@@ -567,13 +567,13 @@ void planContracts(uint32_t family, uint32_t cores, size_t &widestCandidates) {
   for (const LinearConfig invalid : {
            LinearConfig{LinearTile::N128, 0}, LinearConfig{LinearTile::N128, 5},
            LinearConfig{static_cast<LinearTile>(255), 1}})
-    rejects([&] { (void)Q4Linear::plan(valid, invalid); });
-  rejects([&] { (void)Q4Linear::plan({{512, 256}, 16}, {LinearTile::Paired128, 1}); });
-  rejects([&] { (void)Q4Linear::plan({{512, 256}, 32, LinearPhase::Prefill}, {LinearTile::N128, 1}); });
-  rejects([&] { (void)Q4Linear::plan({{512, 256}, 32, LinearPhase::Prefill}, {LinearTile::Paired128, 0}); });
-  rejects([&] { (void)Q4Linear::plan({{512, 256}, 8, LinearPhase::Decode, LinearEpilogue::Residual}, {LinearTile::N256, 1}); });
-  rejects([&] { (void)Q4Linear::plan({{512, 256}, 8, LinearPhase::Decode, LinearEpilogue::GateUp}, {LinearTile::N128, 1}); });
-  rejects([&] { (void)Q4Linear::plan({{512, 256}, 8, LinearPhase::Prefill, LinearEpilogue::UpWithGate}, {LinearTile::N128, 0}); });
+    rejects([&] { (void)Linear::plan(valid, invalid); });
+  rejects([&] { (void)Linear::plan({{512, 256}, 16}, {LinearTile::Paired128, 1}); });
+  rejects([&] { (void)Linear::plan({{512, 256}, 32, LinearPhase::Prefill}, {LinearTile::N128, 1}); });
+  rejects([&] { (void)Linear::plan({{512, 256}, 32, LinearPhase::Prefill}, {LinearTile::Paired128, 0}); });
+  rejects([&] { (void)Linear::plan({{512, 256}, 8, LinearPhase::Decode, LinearEpilogue::Residual}, {LinearTile::N256, 1}); });
+  rejects([&] { (void)Linear::plan({{512, 256}, 8, LinearPhase::Decode, LinearEpilogue::GateUp}, {LinearTile::N128, 1}); });
+  rejects([&] { (void)Linear::plan({{512, 256}, 8, LinearPhase::Prefill, LinearEpilogue::UpWithGate}, {LinearTile::N128, 0}); });
   // Split tiles: one lane, K % 1024 == 0, the full grid and the kernel's own
   // simdgroup count; Split64 has no gate/up form. Paired256: one lane, plain
   // epilogue, four simdgroups. Neither exists in prefill.
@@ -581,89 +581,89 @@ void planContracts(uint32_t family, uint32_t cores, size_t &widestCandidates) {
   const LinearWorkload splitResidual{{512, 1024}, 8, LinearPhase::Decode, LinearEpilogue::Residual};
   const LinearWorkload splitGateUp{{512, 1024}, 8, LinearPhase::Decode, LinearEpilogue::GateUp};
   const LinearConfig matrixTile{LinearTile::Simdgroup, 8, LinearSimdgroups::Four, 4};
-  require(Q4Linear::plan(splitWorkload, matrixTile).scratchSize().partials == 4ULL * 64 * 512,
+  require(Linear::plan(splitWorkload, matrixTile).scratchSize().partials == 4ULL * 64 * 512,
           "simdgroup partial workspace does not cover both fragment streams");
   for (const uint32_t splits : {0U, 3U, 16U}) {
     auto invalid = matrixTile;
     invalid.splits = splits;
-    rejects([&] { (void)Q4Linear::plan(splitWorkload, invalid); });
+    rejects([&] { (void)Linear::plan(splitWorkload, invalid); });
   }
-  rejects([&] { (void)Q4Linear::plan({{512, 768}, 8},
+  rejects([&] { (void)Linear::plan({{512, 768}, 8},
       {LinearTile::Simdgroup, 8, LinearSimdgroups::Four, 8}); });
   for (uint32_t rows : {8U,16U,24U,32U}) {
-    const auto size = Q4Linear::plan({{512,1024},rows}, matrixTile).scratchSize();
+    const auto size = Linear::plan({{512,1024},rows}, matrixTile).scratchSize();
     require(size.input == uint64_t(rows)*1024*2 && size.sums == uint64_t(rows)*16*4 &&
                 size.partials == uint64_t(rows)*512*2*4*4 && size.counters == uint64_t(rows/8)*8*4,
             "matrix row tiles must own disjoint input, sums, partials and counters");
   }
-  rejects([&] { (void)Q4Linear::plan(splitWorkload,
+  rejects([&] { (void)Linear::plan(splitWorkload,
       {LinearTile::Simdgroup, 4, LinearSimdgroups::Four, 4}); });
-  rejects([&] { (void)Q4Linear::plan(splitWorkload,
+  rejects([&] { (void)Linear::plan(splitWorkload,
       {LinearTile::Simdgroup, 8, LinearSimdgroups::Eight, 4}); });
   const LinearConfig split32{LinearTile::Split32, 16, LinearSimdgroups::Four};
   const LinearConfig split64{LinearTile::Split64, 8, LinearSimdgroups::Eight};
   const LinearConfig paired256{LinearTile::Paired256, 2, LinearSimdgroups::Four};
   {
-    const auto plan = Q4Linear::plan(splitWorkload, split64);
+    const auto plan = Linear::plan(splitWorkload, split64);
     require(plan.pipeline() == "decode_linear_q4_n64_split4" && plan.threadsPerThreadgroup() == 256 &&
                 plan.tileColumns() == 64 && plan.partialSums() == 4 && plan.secondPipeline().empty(),
             "Split64 plan geometry or pipeline is wrong");
-    const auto residual = Q4Linear::plan(splitResidual, split32);
+    const auto residual = Linear::plan(splitResidual, split32);
     require(residual.pipeline() == "decode_linear_q4_n32_split4_residual" &&
                 residual.threadsPerThreadgroup() == 128 && residual.tileColumns() == 32 &&
                 residual.partialSums() == 4,
             "Split32 residual plan geometry or pipeline is wrong");
-    require(Q4Linear::plan(splitResidual, split64).pipeline() == "decode_linear_q4_n64_split4_residual" &&
-                Q4Linear::plan(splitWorkload, split32).pipeline() == "decode_linear_q4_n32_split4",
+    require(Linear::plan(splitResidual, split64).pipeline() == "decode_linear_q4_n64_split4_residual" &&
+                Linear::plan(splitWorkload, split32).pipeline() == "decode_linear_q4_n32_split4",
             "split plan pipeline names are wrong");
-    const auto gateUpPlan = Q4Linear::plan(splitGateUp, split32);
+    const auto gateUpPlan = Linear::plan(splitGateUp, split32);
     require(gateUpPlan.pipeline() == "decode_linear_q4_n32_split4_gate_up" &&
                 gateUpPlan.threadsPerThreadgroup() == 128 && gateUpPlan.secondPipeline().empty() &&
                 gateUpPlan.gateScratchBytes() == 0,
             "Split32 gate/up plan geometry or pipeline is wrong");
-    const auto wide = Q4Linear::plan(splitWorkload, paired256);
+    const auto wide = Linear::plan(splitWorkload, paired256);
     require(wide.pipeline() == "decode_linear_q4_n256_paired_sg4" && wide.threadsPerThreadgroup() == 128 &&
                 wide.tileColumns() == 256 && wide.partialSums() == 1,
             "Paired256 plan geometry or pipeline is wrong");
   }
-  rejects([&] { (void)Q4Linear::plan(splitWorkload, {LinearTile::Split32, 16, LinearSimdgroups::Eight}); });
-  rejects([&] { (void)Q4Linear::plan(splitWorkload, {LinearTile::Split64, 8, LinearSimdgroups::Four}); });
-  rejects([&] { (void)Q4Linear::plan(splitWorkload, {LinearTile::Paired256, 2, LinearSimdgroups::Eight}); });
-  rejects([&] { (void)Q4Linear::plan(splitWorkload, {LinearTile::Split32, 8, LinearSimdgroups::Four}); });
-  rejects([&] { (void)Q4Linear::plan(splitWorkload, {LinearTile::Split64, 4, LinearSimdgroups::Eight}); });
-  rejects([&] { (void)Q4Linear::plan(splitWorkload, {LinearTile::Split64, 16, LinearSimdgroups::Eight}); });
-  rejects([&] { (void)Q4Linear::plan(splitGateUp, split64); });
-  rejects([&] { (void)Q4Linear::plan(splitResidual, paired256); });
-  rejects([&] { (void)Q4Linear::plan(splitGateUp, paired256); });
+  rejects([&] { (void)Linear::plan(splitWorkload, {LinearTile::Split32, 16, LinearSimdgroups::Eight}); });
+  rejects([&] { (void)Linear::plan(splitWorkload, {LinearTile::Split64, 8, LinearSimdgroups::Four}); });
+  rejects([&] { (void)Linear::plan(splitWorkload, {LinearTile::Paired256, 2, LinearSimdgroups::Eight}); });
+  rejects([&] { (void)Linear::plan(splitWorkload, {LinearTile::Split32, 8, LinearSimdgroups::Four}); });
+  rejects([&] { (void)Linear::plan(splitWorkload, {LinearTile::Split64, 4, LinearSimdgroups::Eight}); });
+  rejects([&] { (void)Linear::plan(splitWorkload, {LinearTile::Split64, 16, LinearSimdgroups::Eight}); });
+  rejects([&] { (void)Linear::plan(splitGateUp, split64); });
+  rejects([&] { (void)Linear::plan(splitResidual, paired256); });
+  rejects([&] { (void)Linear::plan(splitGateUp, paired256); });
   for (const LinearConfig config : {split32, split64})
-    rejects([&] { (void)Q4Linear::plan({{512, 768}, 8}, config); });
+    rejects([&] { (void)Linear::plan({{512, 768}, 8}, config); });
   for (uint32_t rows : {16U, 24U, 32U})
     for (const LinearConfig config : {split32, split64, paired256})
-      rejects([&] { (void)Q4Linear::plan({{512, 1024}, rows}, config); });
+      rejects([&] { (void)Linear::plan({{512, 1024}, rows}, config); });
   for (const auto tile : {LinearTile::Split32, LinearTile::Split64, LinearTile::Paired256})
-    rejects([&] { (void)Q4Linear::plan({{512, 1024}, 32, LinearPhase::Prefill},
+    rejects([&] { (void)Linear::plan({{512, 1024}, 32, LinearPhase::Prefill},
         {tile, 0, tile == LinearTile::Split64 ? LinearSimdgroups::Eight : LinearSimdgroups::Four}); });
   const LinearWorkload fourWorkload{{512, 256}, 24, LinearPhase::Decode, LinearEpilogue::None};
   const LinearConfig fourConfig{LinearTile::N128, 1, LinearSimdgroups::Four};
   for (uint32_t scope : {0U, 1U, 2U, 3U, 16U, 255U})
-    rejects([&] { (void)Q4Linear::plan(fourWorkload,
+    rejects([&] { (void)Linear::plan(fourWorkload,
         {LinearTile::N128, 1, static_cast<LinearSimdgroups>(scope)}); });
   for (uint32_t rows : {8U, 16U, 32U})
-    rejects([&] { (void)Q4Linear::plan({{512, 256}, rows}, fourConfig); });
+    rejects([&] { (void)Linear::plan({{512, 256}, rows}, fourConfig); });
   for (const auto tile : {LinearTile::N256, LinearTile::Paired128})
-    rejects([&] { (void)Q4Linear::plan(fourWorkload,
+    rejects([&] { (void)Linear::plan(fourWorkload,
         {tile, 1, LinearSimdgroups::Four}); });
   for (const auto epilogue : {LinearEpilogue::GateUp, LinearEpilogue::UpWithGate})
-    rejects([&] { (void)Q4Linear::plan({{512, 256}, 24, LinearPhase::Decode, epilogue},
+    rejects([&] { (void)Linear::plan({{512, 256}, 24, LinearPhase::Decode, epilogue},
                                       fourConfig); });
   for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual,
                              LinearEpilogue::UpWithGate}) {
     const LinearWorkload prefill{{512, 256}, 24, LinearPhase::Prefill, epilogue};
-    require(Q4Linear::plan(prefill, {LinearTile::N128, 0, LinearSimdgroups::Four})
+    require(Linear::plan(prefill, {LinearTile::N128, 0, LinearSimdgroups::Four})
                     .threadsPerThreadgroup() == 128,
             "four-SIMDgroup prefill plan was rejected");
-    rejects([&] { (void)Q4Linear::plan(prefill, {LinearTile::N256, 0, LinearSimdgroups::Four}); });
-    rejects([&] { (void)Q4Linear::plan(prefill, {LinearTile::N128, 1, LinearSimdgroups::Four}); });
+    rejects([&] { (void)Linear::plan(prefill, {LinearTile::N256, 0, LinearSimdgroups::Four}); });
+    rejects([&] { (void)Linear::plan(prefill, {LinearTile::N128, 1, LinearSimdgroups::Four}); });
   }
 
   const LinearWorkload other{{768, 768}, 16, LinearPhase::Decode, LinearEpilogue::None};
@@ -723,7 +723,7 @@ void affinePolicyIdentity() {
       DeviceCapabilities device;
       device.appleGpuFamily = family;
       device.gpuCoreCount = cores;
-      const Q4Linear linear(device);
+      const Linear linear(device);
       for (const uint32_t n : {256U, 512U, 1024U, 2048U, 4096U, 5120U, 6144U, 9216U, 10240U,
                                12544U, 14336U, 16640U, 17408U, 248320U})
         for (const uint32_t k : {2048U, 4096U, 5120U, 6144U, 17408U}) {
@@ -761,23 +761,21 @@ void ggufPlans() {
   DeviceCapabilities device;
   device.appleGpuFamily = 10;
   device.gpuCoreCount = 16;
-  const Q4Linear linear(device);
+  const Linear linear(device);
   const auto projection = [](uint32_t n, uint32_t k, uint32_t segments) {
-    Q4Projection p;
-    p.outputSize = n;
-    p.inputSize = k;
+    BlockWeights weights;
     for (uint32_t i = 0; i < segments; ++i) {
-      GgufSegment s;
+      QuantizedSegment s;
       s.outputSize = n / segments;
       s.inputSize = k;
       s.columnOffset = i * (n / segments);
-      p.gguf.push_back(s);
+      weights.segments.push_back(s);
     }
-    return p;
+    return Projection(n, k, std::move(weights));
   };
   const LinearWorkload down{{5120, 17408}, 8, LinearPhase::Decode, LinearEpilogue::Residual};
   const LinearPlan single = linear.plan(down, projection(5120, 17408, 1));
-  require(single.workload().quant == QuantFamily::Gguf &&
+  require(single.workload().weightLayout == WeightLayout::Block32 &&
               single.configuration() == LinearConfig{LinearTile::GgufStaged, 80, LinearSimdgroups::Two, 2} &&
               single.input() == LinearInput::Plain && single.partialSums() == 2 &&
               single.scratchSize().partials == uint64_t{2} * 8 * 5120 * 4 &&
@@ -790,7 +788,7 @@ void ggufPlans() {
     DeviceCapabilities apple10;
     apple10.appleGpuFamily = 10;
     apple10.gpuCoreCount = cores;
-    return Q4Linear(apple10).plan({{n, k}, 8, LinearPhase::Decode, epilogue},
+    return Linear(apple10).plan({{n, k}, 8, LinearPhase::Decode, epilogue},
                                   projection(n, k, segments)).configuration().splits;
   };
   const auto residual = LinearEpilogue::Residual, none = LinearEpilogue::None, gateUp = LinearEpilogue::GateUp;
@@ -827,15 +825,15 @@ void ggufPlans() {
             "GGUF prefill tile rows and splits");
   }
   // The decode tiles hold at most a decode batch.
-  LinearWorkload longPrefill{{5120, 17408}, 33, LinearPhase::Prefill, LinearEpilogue::None, QuantFamily::Gguf};
-  rejects([&] { (void)Q4Linear::plan(longPrefill, {LinearTile::GgufStaged, 0, LinearSimdgroups::Two}); });
+  LinearWorkload longPrefill{{5120, 17408}, 33, LinearPhase::Prefill, LinearEpilogue::None, WeightLayout::Block32};
+  rejects([&] { (void)Linear::plan(longPrefill, {LinearTile::GgufStaged, 0, LinearSimdgroups::Two}); });
   // Affine and GGUF plans do not mix.
-  rejects([&] { (void)Q4Linear::plan(down, {LinearTile::GgufStaged, 80, LinearSimdgroups::Two, 8}); });
+  rejects([&] { (void)Linear::plan(down, {LinearTile::GgufStaged, 80, LinearSimdgroups::Two, 8}); });
   LinearWorkload gguf = down;
-  gguf.quant = QuantFamily::Gguf;
-  rejects([&] { (void)Q4Linear::plan(gguf, {LinearTile::N128, 40}); });
-  rejects([&] { (void)Q4Linear::plan(gguf, {LinearTile::GgufStaged, 40, LinearSimdgroups::Two, 8}); });
-  rejects([&] { (void)Q4Linear::plan(gguf, {LinearTile::GgufStaged, 80, LinearSimdgroups::Two, 3}); });
+  gguf.weightLayout = WeightLayout::Block32;
+  rejects([&] { (void)Linear::plan(gguf, {LinearTile::N128, 40}); });
+  rejects([&] { (void)Linear::plan(gguf, {LinearTile::GgufStaged, 40, LinearSimdgroups::Two, 8}); });
+  rejects([&] { (void)Linear::plan(gguf, {LinearTile::GgufStaged, 80, LinearSimdgroups::Two, 3}); });
   // The arena bound is the single-tensor plan, which fused and gate/up plans share.
   require(linear.decodeScratchSize(gguf).partials == single.scratchSize().partials,
           "GGUF decode scratch bound");
@@ -849,8 +847,8 @@ void ggufPlans() {
               linear.ggufFloatTile(2048, 256) == FloatTile::NeuralAccelerator &&
               linear.ggufFloatTile(704, 64) == FloatTile::Simdgroup &&
               linear.ggufFloatTile(705, 64) == FloatTile::NeuralAccelerator &&
-              Q4Linear(oneCore).ggufFloatTile(15, 256) == FloatTile::Simdgroup &&
-              Q4Linear(oneCore).ggufFloatTile(16, 256) == FloatTile::NeuralAccelerator,
+              Linear(oneCore).ggufFloatTile(15, 256) == FloatTile::Simdgroup &&
+              Linear(oneCore).ggufFloatTile(16, 256) == FloatTile::NeuralAccelerator,
           "GGUF float tile rule");
 
   // Apple9 decodes every GGUF width with the exact register tile, all lanes
@@ -860,7 +858,7 @@ void ggufPlans() {
     DeviceCapabilities apple9;
     apple9.appleGpuFamily = 9;
     apple9.gpuCoreCount = cores;
-    const LinearPlan plan = Q4Linear(apple9).plan({{n, k}, rows, LinearPhase::Decode, epilogue},
+    const LinearPlan plan = Linear(apple9).plan({{n, k}, rows, LinearPhase::Decode, epilogue},
                                                   projection(n, k, segments));
     require(plan.configuration().tile == LinearTile::GgufSimdgroup &&
                 plan.configuration().groups == n / 64 &&
@@ -894,7 +892,7 @@ void ggufPlans() {
   DeviceCapabilities apple9;
   apple9.appleGpuFamily = 9;
   apple9.gpuCoreCount = 40;
-  const Q4Linear m3(apple9);
+  const Linear m3(apple9);
   for (const uint32_t rows : {8U, 32U}) {
     const LinearPlan plan = m3.plan({{5120, 17408}, rows, LinearPhase::Decode, LinearEpilogue::Residual},
                                     projection(5120, 17408, 1));
@@ -918,21 +916,21 @@ void ggufPlans() {
           "Apple9 GGUF prefill stages");
   require(m3.ggufFloatTile(2048, 256) == FloatTile::Simdgroup, "Apple9 float projections take the simdgroup tile");
   LinearWorkload registerDown = down;
-  registerDown.quant = QuantFamily::Gguf;
+  registerDown.weightLayout = WeightLayout::Block32;
   require(m3.decodeScratchSize(registerDown).partials == uint64_t{8} * 8 * 5120 * 4,
           "Apple9 GGUF decode scratch bound");
   for (const LinearConfig config : {LinearConfig{LinearTile::GgufSimdgroup, 80, LinearSimdgroups::Four, 3},
                                     LinearConfig{LinearTile::GgufSimdgroup, 80, LinearSimdgroups::Four, 16},
                                     LinearConfig{LinearTile::GgufSimdgroup, 40, LinearSimdgroups::Four, 8},
                                     LinearConfig{LinearTile::GgufSimdgroup, 80, LinearSimdgroups::Two, 8}})
-    rejects([&] { (void)Q4Linear::plan(registerDown, config); });
+    rejects([&] { (void)Linear::plan(registerDown, config); });
   // Split boundaries fall on 256-input units, and prefill has no register tile.
   rejects([&] {
-    (void)Q4Linear::plan({{5120, 512}, 8, LinearPhase::Decode, LinearEpilogue::None, QuantFamily::Gguf},
+    (void)Linear::plan({{5120, 512}, 8, LinearPhase::Decode, LinearEpilogue::None, WeightLayout::Block32},
                          {LinearTile::GgufSimdgroup, 80, LinearSimdgroups::Four, 4});
   });
   rejects([&] {
-    (void)Q4Linear::plan({{5120, 17408}, 128, LinearPhase::Prefill, LinearEpilogue::None, QuantFamily::Gguf},
+    (void)Linear::plan({{5120, 17408}, 128, LinearPhase::Prefill, LinearEpilogue::None, WeightLayout::Block32},
                          {LinearTile::GgufSimdgroup, 0, LinearSimdgroups::Four, 1});
   });
 }
@@ -950,36 +948,34 @@ void ggufPlans() {
 // - the arena bound (the single-tensor plan) covers every segment count.
 void ggufCoreLaws() {
   const auto projection = [](uint32_t n, uint32_t k, uint32_t segments) {
-    Q4Projection p;
-    p.outputSize = n;
-    p.inputSize = k;
+    BlockWeights weights;
     for (uint32_t i = 0; i < segments; ++i) {
-      GgufSegment s;
+      QuantizedSegment s;
       s.outputSize = n / segments;
       s.inputSize = k;
       s.columnOffset = i * (n / segments);
-      p.gguf.push_back(s);
+      weights.segments.push_back(s);
     }
-    return p;
+    return Projection(n, k, std::move(weights));
   };
   const auto gpu = [](uint32_t family, uint32_t cores) {
     DeviceCapabilities device;
     device.appleGpuFamily = family;
     device.gpuCoreCount = cores;
-    return Q4Linear(device);
+    return Linear(device);
   };
   constexpr std::array<uint32_t, 16> widths{256, 512, 768, 1024, 1536, 2048, 3072, 4096, 5120,
                                             6144, 8192, 12288, 16384, 24576, 65536, 248320};
   constexpr std::array<uint32_t, 11> inputs{256, 512, 1024, 2048, 3072, 4096, 5120, 6144, 8192, 12288, 17408};
   for (const uint32_t family : {9U, 10U})
     for (uint32_t cores = 0; cores <= 128; ++cores) {
-      const Q4Linear linear = gpu(family, cores), more = gpu(family, cores + 1), twice = gpu(family, 2 * cores);
+      const Linear linear = gpu(family, cores), more = gpu(family, cores + 1), twice = gpu(family, 2 * cores);
       for (const uint32_t n : widths)
         for (const uint32_t k : inputs)
           for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::GateUp})
             for (uint32_t segments = 1; segments <= (epilogue == LinearEpilogue::None ? 3U : 1U); ++segments) {
-              const Q4Projection p = projection(n, k, segments);
-              const auto plan = [&](const Q4Linear &l, uint32_t width, uint32_t rows) {
+              const Projection p = projection(n, k, segments);
+              const auto plan = [&](const Linear &l, uint32_t width, uint32_t rows) {
                 return l.plan({{width, k}, rows, LinearPhase::Decode, epilogue}, projection(width, k, segments));
               };
               const LinearPlan one = plan(linear, n, 8);
@@ -1007,7 +1003,7 @@ void ggufCoreLaws() {
                 require(plan(linear, 2 * n, 8).configuration().splits <= s,
                         "GGUF split count rises with the width");
               }
-              LinearWorkload w{{n, k}, 32, LinearPhase::Decode, epilogue, QuantFamily::Gguf};
+              LinearWorkload w{{n, k}, 32, LinearPhase::Decode, epilogue, WeightLayout::Block32};
               const LinearScratchSize bound = linear.decodeScratchSize(w), need = linear.plan(w, p).scratchSize();
               require(bound.input >= need.input && bound.sums >= need.sums && bound.partials >= need.partials &&
                           bound.counters >= need.counters,
@@ -1019,7 +1015,7 @@ void ggufCoreLaws() {
   // on Apple9.
   for (uint32_t cores = 1; cores <= 128; ++cores)
     for (const uint32_t n : {16U, 64U, 256U, 1024U}) {
-      const Q4Linear linear = gpu(10, cores), more = gpu(10, cores + 1);
+      const Linear linear = gpu(10, cores), more = gpu(10, cores + 1);
       bool accelerator = false;
       for (uint32_t rows = 1; rows <= 2048; ++rows) {
         const bool now = linear.ggufFloatTile(rows, n) == FloatTile::NeuralAccelerator;
@@ -1040,7 +1036,7 @@ void scalingContracts() {
       DeviceCapabilities device;
       device.appleGpuFamily = family;
       device.gpuCoreCount = reported;
-      Q4Linear linear(device);
+      Linear linear(device);
       for (uint32_t n : {256U, 5120U, 131072U}) {
         for (uint32_t k : {256U, 768U, 1024U, 4096U, 5120U, 17408U}) {
           for (uint32_t rows : {8U, 16U, 24U, 32U}) {
@@ -1050,7 +1046,7 @@ void scalingContracts() {
               const auto baseline = linear.plan(w);
               const auto candidates = linear.candidates(w);
               require(candidates.front().configuration() == baseline.configuration() &&
-                          candidates.size() <= Q4Linear::kMaximumCandidates,
+                          candidates.size() <= Linear::kMaximumCandidates,
                       "core scaling lost or displaced the baseline");
               for (size_t i = 0; i < candidates.size(); ++i) {
                 const auto &plan = candidates[i];
@@ -1102,9 +1098,9 @@ uint32_t mix(uint32_t value) {
   return value ^ (value >> 16);
 }
 
-std::array<uint64_t, 3> projectionFingerprint(const Q4Projection &projection) {
+std::array<uint64_t, 3> projectionFingerprint(const Projection &projection) {
   std::array<uint64_t, 3> result{};
-  const std::array buffers{projection.weights, projection.scales, projection.biases};
+  const std::array buffers{projection.affine().weights, projection.affine().scales, projection.affine().biases};
   for (size_t slot = 0; slot < buffers.size(); ++slot) {
     const auto *bytes = static_cast<const uint8_t *>(buffers[slot].contents());
     uint64_t hash = 14695981039346656037ULL;
@@ -1115,13 +1111,13 @@ std::array<uint64_t, 3> projectionFingerprint(const Q4Projection &projection) {
   return result;
 }
 
-Q4Projection projection(metal::MetalBackend &backend, LinearMatrix matrix, uint32_t seed) {
+Projection projection(metal::MetalBackend &backend, LinearMatrix matrix, uint32_t seed) {
   const uint64_t parameters = uint64_t{matrix.outputSize} * (matrix.inputSize / 64);
-  Q4Projection p{allocate(backend, parameters * 32), allocate(backend, parameters * 2),
+  Projection p{allocate(backend, parameters * 32), allocate(backend, parameters * 2),
                   allocate(backend, parameters * 2), matrix.outputSize, matrix.inputSize};
-  auto *weights = static_cast<uint8_t *>(p.weights.contents());
-  auto *scales = static_cast<uint16_t *>(p.scales.contents());
-  auto *biases = static_cast<uint16_t *>(p.biases.contents());
+  auto *weights = static_cast<uint8_t *>(p.affine().weights.contents());
+  auto *scales = static_cast<uint16_t *>(p.affine().scales.contents());
+  auto *biases = static_cast<uint16_t *>(p.affine().biases.contents());
   for (uint64_t i = 0; i < parameters * 32; ++i) weights[i] = mix(uint32_t(i) + seed);
   for (uint64_t i = 0; i < parameters; ++i) {
     const float scale = 0.004f + float(mix(uint32_t(i) + seed) % 17) * 0.0001f;
@@ -1133,11 +1129,11 @@ Q4Projection projection(metal::MetalBackend &backend, LinearMatrix matrix, uint3
 
 // Scalar reference uses the actual StorageN=256 bytes and FP32 per-group
 // affine accumulation, including the BF16 boundary before each epilogue.
-float affineReference(const Q4Projection &p, const uint16_t *input,
+float affineReference(const Projection &p, const uint16_t *input,
                         uint32_t row, uint32_t column) {
-  const auto *weights = static_cast<const uint8_t *>(p.weights.contents());
-  const auto *scales = static_cast<const uint16_t *>(p.scales.contents());
-  const auto *biases = static_cast<const uint16_t *>(p.biases.contents());
+  const auto *weights = static_cast<const uint8_t *>(p.affine().weights.contents());
+  const auto *scales = static_cast<const uint16_t *>(p.affine().scales.contents());
+  const auto *biases = static_cast<const uint16_t *>(p.affine().biases.contents());
   const uint32_t groups = p.inputSize / 64;
   float result = 0;
   for (uint32_t group = 0; group < groups; ++group) {
@@ -1155,7 +1151,7 @@ float affineReference(const Q4Projection &p, const uint16_t *input,
   return fp32(bf16(result));
 }
 
-void checkReference(const Q4Projection &p, const Q4Projection &gate,
+void checkReference(const Projection &p, const Projection &gate,
                       LinearWorkload workload, const LinearBuffers &buffers,
                       const uint16_t *savedResidual = nullptr, bool split = false, float slack = 0) {
   const auto *input = static_cast<const uint16_t *>(buffers.input.contents());
@@ -1212,12 +1208,12 @@ void checkReference(const Q4Projection &p, const Q4Projection &gate,
   }
 }
 
-void bufferContracts(metal::MetalBackend &backend, Q4Linear &linear,
-                        LinearBuffers buffers, const Q4Projection &p,
-                        const Q4Projection &gate, const LinearPlan &plan) {
+void bufferContracts(metal::MetalBackend &backend, Linear &linear,
+                        LinearBuffers buffers, const Projection &p,
+                        const Projection &gate, const LinearPlan &plan) {
   const bool gateUp = plan.workload().epilogue == LinearEpilogue::GateUp;
   const auto add = [&](metal::CommandGraph &graph, LinearBuffers b,
-                        const Q4Projection &projection, const Q4Projection *g) {
+                        const Projection &projection, const Projection *g) {
     linear.add(graph, b, projection, plan, g);
   };
   const std::array members{&LinearBuffers::input, &LinearBuffers::output,
@@ -1242,9 +1238,9 @@ void bufferContracts(metal::MetalBackend &backend, Q4Linear &linear,
       require(graph.empty(), "invalid simdgroup workspace partially encoded a graph");
     }
   }
-  for (auto member : {&Q4Projection::weights, &Q4Projection::scales, &Q4Projection::biases}) {
+  for (auto member : {&AffineWeights::weights, &AffineWeights::scales, &AffineWeights::biases}) {
     auto shortProjection = p;
-    shortProjection.*member = backend.view(p.*member, 0, (p.*member).sizeBytes() - 1);
+    shortProjection.affine().*member = backend.view(p.affine().*member, 0, (p.affine().*member).sizeBytes() - 1);
     metal::CommandGraph graph;
     rejects([&] { add(graph, buffers, shortProjection, gateUp ? &gate : nullptr); });
     require(graph.empty(), "invalid projection partially encoded a graph");
@@ -1280,8 +1276,8 @@ void bufferContracts(metal::MetalBackend &backend, Q4Linear &linear,
   }
 }
 
-void numericalCase(metal::MetalBackend &backend, Q4Linear &linear,
-                      const Q4Projection &p, const Q4Projection &gate,
+void numericalCase(metal::MetalBackend &backend, Linear &linear,
+                      const Projection &p, const Projection &gate,
                       LinearWorkload workload, bool inPlaceResidual = false) {
   require(!inPlaceResidual || workload.epilogue == LinearEpilogue::Residual,
           "in-place residual fixture requires residual epilogue");
@@ -1332,7 +1328,7 @@ void numericalCase(metal::MetalBackend &backend, Q4Linear &linear,
       linear.add(graph, {input, b.gateScratch, b.sums, {}, {}, {}}, gate, gatePlan);
     }
     const size_t prepasses = graph.dispatches().size();
-    Q4DispatchStats stats;
+    LinearDispatchStats stats;
     linear.add(graph, b, p, plan, workload.epilogue == LinearEpilogue::GateUp ? &gate : nullptr, &stats);
     const auto &last = graph.dispatches().back();
     require(last.pipelineName == (plan.secondPipeline().empty() ? plan.pipeline() : plan.secondPipeline()),
@@ -1436,7 +1432,7 @@ void numericalCase(metal::MetalBackend &backend, Q4Linear &linear,
   // N128 plain plan on both weight sets.
   std::vector<uint16_t> gateReference, upReference;
   if (workload.epilogue == LinearEpilogue::GateUp) {
-    const auto plain = Q4Linear::plan({workload.matrix, workload.rows, LinearPhase::Decode,
+    const auto plain = Linear::plan({workload.matrix, workload.rows, LinearPhase::Decode,
                                        LinearEpilogue::None},
                                       {LinearTile::N128, p.outputSize / 128});
     auto gateOutput = allocate(backend, uint64_t{storageRows} * p.outputSize * 2);
@@ -1479,7 +1475,7 @@ void numericalCase(metal::MetalBackend &backend, Q4Linear &linear,
 }
 
 void pipelineCapabilities(const char *metallib, const DeviceCapabilities &capabilities) {
-  Q4Linear linear(capabilities);
+  Linear linear(capabilities);
   std::map<std::string, uint32_t> names{{"prefill_linear_q4_sums32", 256}};
   const auto collect = [&](LinearWorkload workload) {
     for (const auto &plan : linear.candidates(workload)) {
@@ -1539,14 +1535,14 @@ int main(int argc, char **argv) {
     size_t widestCandidates = 0;
     planContracts(9, 0, widestCandidates);
     planContracts(10, 16, widestCandidates);
-    require(widestCandidates == Q4Linear::kMaximumCandidates,
+    require(widestCandidates == Linear::kMaximumCandidates,
             "no covered workload reaches the Linear candidate bound");
     if (std::string_view(argv[1]) == "--cpu") {
       std::cout << "Linear CPU plans: PASS\n";
       return 0;
     }
     metal::MetalBackend backend(argv[1]);
-    Q4Linear linear(backend.capabilities());
+    Linear linear(backend.capabilities());
     // Instrumented shader builds can report additional validation storage;
     // inspect production requirements in the ordinary/API-validation run.
     if (!std::getenv("MTL_SHADER_VALIDATION"))

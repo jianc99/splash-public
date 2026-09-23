@@ -123,7 +123,68 @@ Dense packages use schema 3 / `splash-packed-q4`; MoE uses schema 4 /
 These formats encode Qwen3.8-27B and Qwen3.6-35B-A3B layouts. Compatible community
 fine-tunes may use any nonempty manifest model name. Native loading validates
 geometry, tensor sizes, binary headers, tokenizer and target/draft compatibility.
-New architectures require engine support; ordinary HF weights need conversion.
+New architectures require engine support. Source packages bind upstream weights
+to these same validated target, draft, vision and tokenizer interfaces.
+
+### Upstream target weights
+
+A support package can contain only `draft/`, `vision/`, `tokenizer/` and its
+manifest. `target.source` pins the upstream target independently:
+
+```json
+"target": {
+  "source": {
+    "repo_id": "mlx-community/Qwen3.8-27B-4bit",
+    "revision": "<40-character commit SHA>",
+    "files": [
+      {"path": "config.json", "size": 1234, "sha256": "<SHA-256>"},
+      {"path": "model-00001-of-00003.safetensors", "size": 5678, "sha256": "<SHA-256>"}
+    ]
+  }
+}
+```
+
+The example is schematic: list every required shard with its actual size and
+hash. Affine sources use `format.name = "mlx-affine"`, schema 3 or 4, and the same
+layer magic and support declarations as their packed counterpart. Configuration,
+tensor shapes, dtypes, group size and per-projection quantization are validated.
+GGUF can use this same declaration with `format.name = "gguf"` and one GGUF file,
+or retain the variant declaration below. These declarations are mutually exclusive.
+The installer verifies pinned files and assembles links to them; it never rewrites
+an upstream snapshot. `--model` still identifies the compatible support package.
+Automatic support-asset discovery for arbitrary upstream repository IDs is not
+implemented by this format change.
+
+`AffineTarget` reorders codes, scales and biases into the existing affine ABI
+without requantization. GDN decay is computed as `float(-exp(double(A_log)))`;
+older packages produced using MLX's float exponential may differ by a few float
+ULPs in this small vector. The existing inference kernels are unchanged.
+
+Both adapters use `PreparedWeights`. Its default cache is
+`~/Library/Caches/Splash/weights`; `SPLASH_WEIGHT_CACHE` overrides that location.
+Preparation costs an additional on-disk copy of the prepared target. Existing
+packed artifacts are used directly. Source-content hashes, preparation ABI and
+transformation parameters identify the cache; app releases, core counts and
+support-asset updates alone do not invalidate it. Completed files are read-only.
+One writer per cache serializes conversion; interruption, disk-full errors and
+memory-pressure rejection cannot publish partial files. Stale partial generations
+are removed on retry. There is no automatic cache eviction yet; with Splash
+stopped, deleting this cache simply causes preparation at the next load.
+
+Cold source hashing and output validation stream bounded buffers. Unchanged
+files reuse a digest proof tied to device, inode, size, birth time, mtime and ctime;
+a write or replacement invalidates it. This is not a full disk scrub on every
+startup. Preparation uses uncached destination I/O and bounded tensor tiles,
+with a 64 MiB admission reserve for staging and capped metadata. Warning/critical
+memory pressure or inadequate host headroom stops preparation. Runtime admission
+counts prepared weights, draft and vision exactly once. File backing removes the
+whole-model anonymous repack allocation; macOS page cache, driver allocations and
+other applications still affect memory pressure.
+
+Operator plans use each projection's physical layout, independently of the source
+container. `Projection`, `MoeWeights` and `EmbeddingWeights` represent different
+operator contracts. Arena sizing collects the actual layer layouts, including
+mixed affine/block layers, and reserves the vocabulary head only for decode.
 
 ### GGUF targets
 
@@ -144,21 +205,23 @@ it. The manifest names the source repository and the files a model ID may select
 files and that one GGUF into the Hub cache, checks them against the manifest, and installs
 `models/<owner>/<repo>:UD-Q4_K_M/` as a real directory of per-file symlinks whose
 `target/<file>.gguf` links the cached GGUF (the engine requires `target/` and `draft/` to be
-subdirectories of one root). Nothing is written to disk besides the download.
+subdirectories of one root). The original download remains unchanged.
 
-At load time the engine parses the GGUF header (`runtime/model/GgufFile.cpp`), checks the
-architecture's metadata (layer, head, SSM and expert counts) against its layout, plans one
-in-memory image per layer in the `MDGG0001` layout (`GgufImage.cpp`: descriptor, payload plane,
-optional high-bit plane and superblock headers in 256-column tiles; a 3-D expert tensor is one
-segment of experts x N rows) and fills it with the `gguf_repack` / `gguf_copy` kernels reading the
-mmapped file (`GgufTarget.cpp`). Every tensor keeps its stored format: the F32 norm multipliers,
+At load time the engine validates the GGUF metadata and plans the existing
+`MDGG0001` layout. `GgufPreparation` gathers at most 256 rows and 8192 input columns
+at a time, runs the existing repack kernel, and writes its planes into a prepared
+file. Embeddings and F32 sections use bounded direct copies. `PreparedWeights`
+publishes only completed files; `WeightFile` maps them read-only without copying
+into a model-sized Metal allocation. Later starts reuse these files.
+
+Every tensor keeps its stored format: the F32 norm multipliers,
 the MoE router and shared-expert gate, and GDN alpha/beta when a file stores them as F32 stay F32
 and run in fp32, as llama.cpp keeps them (Apple10 prefill chunks multiply the router and
 alpha/beta on the neural accelerator as three bf16 parts per weight that sum to it exactly, so
 only fp32 accumulation rounds); the other small F32 tensors (the GDN convolution and
 time-step bias) become bf16 only when every value converts exactly, and loading fails otherwise.
-The images are anonymous Metal memory, so under memory pressure they are compressed or swapped
-rather than dropped and refaulted like mapped package files. Supported tensor types are Q4_K,
+Prepared weight pages can be dropped and refaulted under memory pressure, just
+like existing packed packages. Supported tensor types are Q4_K,
 Q5_K, Q6_K, Q3_K, IQ4_XS, IQ4_NL, Q8_0 and IQ3_S for linears and experts, F32 for the tensors
 above, and Q4_K, Q6_K or Q8_0 token embeddings; the loader lists every unsupported tensor in one
 error. Of Unsloth's files that covers, for Qwen3.8-27B, UD-Q4_K_M and every larger file but

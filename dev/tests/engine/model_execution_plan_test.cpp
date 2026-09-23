@@ -1,4 +1,5 @@
 #include "model/ModelFactory.hpp"
+#include "model/RuntimeArenas.hpp"
 
 #include <algorithm>
 #include <array>
@@ -31,6 +32,31 @@ model::ModelPackage package() {
     draft.dynamicSize = 512;
     draft.intermediateSize = 6144;
     draft.targetHiddenSize = target.layout.capturedHiddenSize();
+  }
+  const auto projection = [](uint32_t n, uint32_t k) {
+    return ops::Projection({}, {}, {}, n, k);
+  };
+  const auto &layout = target.layout;
+  target.logitsProjection = projection(layout.vocabularySize, layout.hiddenSize);
+  target.layers.resize(layout.layers);
+  for (uint32_t i = 0; i < layout.layers; ++i) {
+    auto &layer = target.layers[i];
+    if (layout.isFullAttentionLayer(i)) {
+      model::QwenAttentionWeights attention;
+      attention.inputProjection = projection(layout.packedFullWidth, layout.hiddenSize);
+      attention.outputProjection = projection(layout.hiddenSize, layout.attentionWidth);
+      layer.mixer = std::move(attention);
+    } else {
+      model::QwenGdnWeights gdn;
+      gdn.inputProjection = projection(layout.packedGdnWidth, layout.hiddenSize);
+      gdn.outputProjection = projection(layout.hiddenSize, layout.attentionWidth);
+      layer.mixer = std::move(gdn);
+    }
+    if constexpr (std::is_same_v<Weights, model::Qwen3_8Weights>) {
+      layer.gateProjection = projection(layout.intermediateSize, layout.hiddenSize);
+      layer.upProjection = layer.gateProjection;
+      layer.downProjection = projection(layout.hiddenSize, layout.intermediateSize);
+    }
   }
   ops::VisionLayout vision;
   vision.outputHiddenSize = target.layout.hiddenSize;
@@ -123,10 +149,64 @@ void checkPackage(const model::ModelPackage &package, uint32_t family) {
           "reset left stale selected workspace");
 }
 
+void checkMixedLayouts() {
+  auto mixed = package<model::Qwen3_8Weights>();
+  auto &target = std::get<model::Qwen3_8Weights>(mixed.target);
+  auto &up = target.layers.front().upProjection;
+  ops::QuantizedSegment segment;
+  segment.outputSize = up.outputSize;
+  segment.inputSize = up.inputSize;
+  up = ops::Projection(up.outputSize, up.inputSize, ops::BlockWeights{{segment}});
+  target.layers.front().gateProjection = up;
+  require(target.logitsProjection.layout() == ops::WeightLayout::Affine64,
+          "mixed fixture must keep an affine vocabulary head");
+  for (uint32_t family : {9U, 10U}) {
+    DeviceCapabilities device;
+    device.appleGpuFamily = family;
+    device.gpuCoreCount = 16;
+    ops::ExecutionPlans plans(device);
+    const auto geometry = model::RuntimeGeometry::from(mixed);
+    const auto head = target.logitsProjection.shape();
+    const auto containsHead = [&](const auto &shapes) {
+      return std::find(shapes.begin(), shapes.end(), head) != shapes.end();
+    };
+    require(!containsHead(geometry.target.prefillProjections) &&
+                containsHead(geometry.target.decodeProjections),
+            "vocabulary head must reserve workspace only in decode");
+    const auto scratch = model::DecodeArena::linearScratchSize(geometry, plans);
+    for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
+      const auto plan = plans.linear().plan({{up.outputSize, up.inputSize}, lanes * 8,
+          ops::LinearPhase::Decode, ops::LinearEpilogue::GateUp}, up);
+      const auto required = plan.scratchSize();
+      require(scratch.input >= required.input && scratch.sums >= required.sums &&
+                  scratch.partials >= required.partials && scratch.counters >= required.counters,
+              "affine head hid a block-quantized layer's scratch requirement");
+      require(model::DecodeArena::gateScratchBytes(geometry, plans) >= plan.gateScratchBytes(),
+              "mixed gate/up workspace is too small");
+    }
+    const auto sizes = model::prefillTensorBytes(geometry, plans);
+    for (uint32_t rows : {1U, 8U, 17U, 32U}) {
+      const auto required = plans.linear().plan({{up.outputSize, up.inputSize}, rows,
+          ops::LinearPhase::Prefill, ops::LinearEpilogue::None}, up).scratchSize();
+      require(sizes[uint32_t(model::PrefillTensor::LinearPartials)] >= required.partials &&
+                  sizes[uint32_t(model::PrefillTensor::LinearCounters)] >= required.counters,
+              "mixed short-prefill split scratch is too small");
+    }
+  }
+  auto sparse = package<model::Qwen3_6MoeWeights>();
+  auto &moe = std::get<model::Qwen3_6MoeWeights>(sparse.target);
+  moe.layers.front().ffn = ops::BlockMoeWeights{};
+  const auto geometry = model::qwenTargetGeometry(moe);
+  require(geometry.moeShapes.size() == 2 &&
+              moe.logitsProjection.layout() == ops::WeightLayout::Affine64,
+          "MoE layout inventory must follow the expert layers, not the head");
+}
+
 } // namespace
 
 int main() {
   try {
+    checkMixedLayouts();
     const auto dense = package<model::Qwen3_8Weights>();
     const auto sparse = package<model::Qwen3_6MoeWeights>();
     for (uint32_t family : {9U, 10U}) {

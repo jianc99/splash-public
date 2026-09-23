@@ -1,6 +1,7 @@
 #include "model/Qwen3_8.hpp"
 
 #include "model/GgufTarget.hpp"
+#include "model/AffineTarget.hpp"
 
 #include <algorithm>
 #include <cstring>
@@ -42,32 +43,34 @@ void validateLayout(const Qwen3_8Layout &layout) {
 
 Qwen3_8Weights loadQwen3_8Weights(metal::MetalBackend &backend,
                                   const std::filesystem::path &directory,
-                                  Qwen3_8Layout layout, bool ggufTarget) {
+                                  Qwen3_8Layout layout, TargetSource source, PreparationCheck prepareCheck) {
   validateLayout(layout);
   auto readFfn = [&](WeightFile &file, Qwen3_8LayerWeights &layer) {
-    if (ggufTarget) {
+    if (source == TargetSource::Gguf) {
       layer.gateProjection = readGgufProjection(file, "mlp-gate");
       layer.upProjection = readGgufProjection(file, "mlp-up");
       layer.downProjection = readGgufProjection(file, "mlp-down");
       return;
     }
-    layer.gateProjection = readQ4Projection(
+    layer.gateProjection = readProjection(
         file, backend, layout.intermediateSize, layout.hiddenSize,
         "mlp-gate");
-    layer.upProjection = readQ4Projection(
+    layer.upProjection = readProjection(
         file, backend, layout.intermediateSize, layout.hiddenSize,
         "mlp-up");
-    layer.downProjection = readQ4Projection(
+    layer.downProjection = readProjection(
         file, backend, layout.hiddenSize, layout.intermediateSize,
         "mlp-down");
   };
   Qwen3_8Weights weights;
-  if (ggufTarget) {
-    // The target directory holds the llama.cpp GGUF; every layer image is
-    // repacked into memory as it is read.
-    GgufTargetLoader loader(backend, findTargetGguf(directory), ggufTargetGeometry(layout));
+  if (source == TargetSource::Gguf) {
+    // Source-specific preparation ends at immutable WeightFile views.
+    GgufTargetLoader loader(backend, findTargetGguf(directory), ggufTargetGeometry(layout), std::move(prepareCheck));
     weights = readQwenTargetWeights<Qwen3_8Weights>(backend, layout, GgufTargetFiles{loader},
                                                     readFfn, true);
+  } else if (source == TargetSource::Affine) {
+    AffineTargetLoader loader(backend, directory, layout, std::move(prepareCheck));
+    weights = readQwenTargetWeights<Qwen3_8Weights>(backend, layout, loader, readFfn, false);
   } else {
     weights = loadQwenTargetWeights<Qwen3_8Weights>(backend, directory, layout, kHeadMagic,
                                                     readFfn);

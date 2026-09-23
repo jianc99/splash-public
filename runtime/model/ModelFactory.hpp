@@ -75,6 +75,9 @@ struct RuntimeContext final {
 // architectures. Each architecture validates its own tensor and state layout.
 void requireCompatibleModelPackage(const ModelPackage &package);
 
+[[nodiscard]] uint64_t preparedModelWeightBytes(const std::filesystem::path &root,
+                                                 const ModelDescriptor &descriptor);
+
 // Production loading is selected by the validated package descriptor. There
 // is one shared engine and DFlash controller; only model execution differs.
 [[nodiscard]] ModelPackage
@@ -83,7 +86,7 @@ loadModelPackage(metal::MetalBackend &backend,
 [[nodiscard]] ModelPackage
 loadModelPackage(metal::MetalBackend &backend,
                  const std::filesystem::path &root,
-                 const ModelDescriptor &descriptor);
+                 const ModelDescriptor &descriptor, PreparationCheck prepareCheck = {});
 
 [[nodiscard]] ModelMemoryPlan
 plannedRuntimeMemory(const DeviceCapabilities &device,

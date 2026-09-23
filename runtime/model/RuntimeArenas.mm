@@ -3,24 +3,13 @@
 #include "ops/Sampling.hpp"
 
 namespace splash::model {
-namespace {
-
-// The target's projection matrices; the draft also runs its vocabulary head.
-std::array<ops::LinearMatrix, 6> targetProjections(const QwenTargetGeometry &t) {
-  return {ops::LinearMatrix{t.packedGdnWidth, t.hiddenSize},
-          {t.packedAttentionWidth, t.hiddenSize}, {t.hiddenSize, t.attentionWidth},
-          {t.denseIntermediateSize, t.hiddenSize}, {t.hiddenSize, t.denseIntermediateSize},
-          {t.vocabularySize, t.hiddenSize}};
-}
-
-} // namespace
-
 std::array<uint64_t, prefillTensorCount>
 prefillTensorBytes(const RuntimeGeometry &geometry,
                    const ops::ExecutionPlans &operators) {
   std::array<uint64_t, prefillTensorCount> result{};
   auto put = [&](PrefillTensor tensor, uint64_t bytes) {
-    result[static_cast<uint32_t>(tensor)] = bytes;
+    auto &size = result[static_cast<uint32_t>(tensor)];
+    size = std::max(size, bytes);
   };
   put(PrefillTensor::Hidden0,
       bytesFor<uint16_t>(uint64_t{kPrefillRows} * geometry.target.hiddenSize));
@@ -129,22 +118,22 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
   ops::LinearScratchSize linear;
   const uint32_t decodeTileRows =
       ExecutionLimits::maximumBatchWidth * ExecutionLimits::targetVerifyRows;
-  for (const ops::LinearMatrix matrix : targetProjections(geometry.target)) {
-    if (!matrix.outputSize || !matrix.inputSize) continue;
+  for (const auto &projection : geometry.target.prefillProjections) {
+    const ops::LinearMatrix matrix{projection.outputSize, projection.inputSize};
     for (uint32_t rows = 1; rows <= decodeTileRows; ++rows)
       for (const auto epilogue : {ops::LinearEpilogue::None, ops::LinearEpilogue::Residual,
                                   ops::LinearEpilogue::UpWithGate}) {
         const ops::LinearScratchSize size = operators.linear().plan(
-            {matrix, rows, ops::LinearPhase::Prefill, epilogue, geometry.target.quant}).scratchSize();
+            {matrix, rows, ops::LinearPhase::Prefill, epilogue, projection.layout}).scratchSize();
         linear.partials = std::max(linear.partials, size.partials);
         linear.counters = std::max(linear.counters, size.counters);
       }
   }
   put(PrefillTensor::LinearPartials, linear.partials);
   put(PrefillTensor::LinearCounters, linear.counters);
-  if (geometry.target.ffnKind == QwenFfnKind::SparseMoe) {
+  for (const auto &shape : geometry.target.moeShapes) {
     const ops::MoeWorkspace workspace =
-        operators.moePrefillWorkspace(geometry.target.moe, kPrefillRows);
+        operators.moePrefillWorkspace(shape, kPrefillRows);
     put(PrefillTensor::MoeSelectedExperts, workspace.selectedExpertsBytes);
     put(PrefillTensor::MoeRoutingWeights, workspace.routingWeightsBytes);
     put(PrefillTensor::MoeTileDescriptors, workspace.tileDescriptorsBytes);
@@ -199,7 +188,8 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
   const auto samplingWorkspace = ops::Sampling::workspace(kDecodeRows);
   const auto selectorWorkspace = ops::Sampling::draftWorkspace(kDraftProposalTokens);
   auto put = [&](DecodeTensor tensor, uint64_t bytes) {
-    result[static_cast<uint32_t>(tensor)] = bytes;
+    auto &size = result[static_cast<uint32_t>(tensor)];
+    size = std::max(size, bytes);
   };
   const uint64_t r = kDecodeRows;
   put(DecodeTensor::Hidden0,
@@ -324,9 +314,9 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
   put(DecodeTensor::ChunkValuesBase,
       uint64_t{geometry.target.kvLayout.attentionLayers} *
           decodeChunkLayerBytes(geometry));
-  if (geometry.target.ffnKind == QwenFfnKind::SparseMoe) {
+  for (const auto &shape : geometry.target.moeShapes) {
     const ops::MoeWorkspace workspace =
-        operators.moeDecodeWorkspacePerLane(geometry.target.moe);
+        operators.moeDecodeWorkspacePerLane(shape);
     put(DecodeTensor::MoeSelectedExperts, workspace.selectedExpertsBytes);
     put(DecodeTensor::MoeRoutingWeights, workspace.routingWeightsBytes);
     put(DecodeTensor::MoeTileDescriptors, workspace.tileDescriptorsBytes);
@@ -357,13 +347,13 @@ ops::LinearScratchSize DecodeArena::linearScratchSize(
   const auto &t = geometry.target;
   const auto &d = geometry.draft;
   ops::LinearScratchSize result;
-  const auto include = [&](ops::LinearMatrix matrix, ops::QuantFamily quant) {
+  const auto include = [&](ops::LinearMatrix matrix, ops::WeightLayout weightLayout) {
     if (!matrix.outputSize || !matrix.inputSize) return;
     for (uint32_t lanes = 1; lanes <= kLaneCount; ++lanes) {
       for (auto epilogue : {ops::LinearEpilogue::None, ops::LinearEpilogue::Residual,
                             ops::LinearEpilogue::GateUp}) {
         const auto size = operators.linear().decodeScratchSize(
-            {matrix, lanes * kDecodeRows, ops::LinearPhase::Decode, epilogue, quant});
+            {matrix, lanes * kDecodeRows, ops::LinearPhase::Decode, epilogue, weightLayout});
         result.input = std::max(result.input, size.input);
         result.sums = std::max(result.sums, size.sums);
         result.partials = std::max(result.partials, size.partials);
@@ -371,14 +361,13 @@ ops::LinearScratchSize DecodeArena::linearScratchSize(
       }
     }
   };
-  for (const ops::LinearMatrix matrix : targetProjections(t)) include(matrix, t.quant);
-  // The draft shares the target's vocabulary head.
-  include({d.vocabularySize, d.hiddenSize}, t.quant);
+  // Includes the vocabulary head shared with the draft.
+  for (const auto &p : t.decodeProjections) include({p.outputSize, p.inputSize}, p.layout);
   for (auto matrix : {ops::LinearMatrix{d.dynamicSize, d.hiddenSize},
        {d.qkvSize, d.hiddenSize}, {d.hiddenSize, d.attentionSize},
        {d.intermediateSize, d.hiddenSize}, {d.hiddenSize, d.intermediateSize},
        {d.selectorRank, d.hiddenSize}, {d.hiddenSize, d.targetHiddenSize}})
-    include(matrix, ops::QuantFamily::Affine);
+    include(matrix, ops::WeightLayout::Affine64);
   return result;
 }
 
