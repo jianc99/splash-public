@@ -63,8 +63,28 @@ benchmark. Reopening the resulting affine artifacts, without comparison, took
 - The full CPU suite and 72 Python installer/build-identity checks pass.
 - Prepared-code fingerprint tests distinguish conversion changes from unrelated
   source changes. Native build-identity verification passes.
-- The production metallib remains byte-identical:
+- Before the shader separation described below, the production metallib at
+  `2ca5691` remained byte-identical to the previous implementation:
   `b61f7cbea458952315c88953f16f31ef2226aee682a81d2e242cd660c7c9745b`.
+
+## Preparation fingerprint follow-up
+
+The GGUF preparation and copy kernels now live in `shared/gguf_repack.metal`.
+Their bodies were moved verbatim, and all remaining inference source is unchanged.
+The preparation fingerprint includes this file, the host planner/executor and
+the shared storage/parameter ABI. It no longer includes `gguf_linear.metal` or
+the inference helpers in `common/quant_formats.h`. Tests edit those inference
+files and the Apple9 decode file independently to check that they leave the
+preparation identity unchanged; each preparation input must still change it.
+
+This changes the development cache identity once. Future edits to those inference
+implementations will no longer force weight preparation. Shared ABI changes
+conservatively invalidate the cache. Shader separation changes the metallib
+container, so the earlier binary-identity claim does not apply to this follow-up.
+The production build, 72 Python checks and native build-identity verification
+pass after separation. On the local M5 Pro, both GGUF repack and full projection
+tests pass with Metal shader validation (zero failures). This follow-up did not
+repeat the full-model preparation timing or the earlier cross-device runs.
 
 ## Remaining boundaries
 

@@ -15,11 +15,22 @@ class PreparationIdentityTest(unittest.TestCase):
                     path.parent.mkdir(parents=True, exist_ok=True)
                     path.write_text(name)
             original = header(root)
-            (root / "runtime/unrelated.cpp").write_text("new inference policy")
-            self.assertEqual(header(root), original)
-            path = root / INPUTS["GGUF"][-1]
-            path.write_text(path.read_text() + "changed repack")
-            changed = header(root)
-            self.assertNotEqual(changed, original)
-            self.assertEqual(changed.splitlines()[2], original.splitlines()[2])
-            self.assertNotEqual(changed.splitlines()[3], original.splitlines()[3])
+            for name in (
+                "runtime/metal/kernels/shared/gguf_linear.metal",
+                "runtime/metal/kernels/decode/linear_gguf_sgmatrix.metal",
+                "runtime/metal/kernels/common/quant_formats.h",
+            ):
+                with self.subTest(inference=name):
+                    path = root / name
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text("changed inference implementation")
+                    self.assertEqual(header(root), original)
+            for name in INPUTS["GGUF"]:
+                with self.subTest(preparation=name):
+                    path = root / name
+                    previous = path.read_text()
+                    path.write_text(previous + "changed preparation")
+                    changed = header(root)
+                    self.assertEqual(changed.splitlines()[2], original.splitlines()[2])
+                    self.assertNotEqual(changed.splitlines()[3], original.splitlines()[3])
+                    path.write_text(previous)

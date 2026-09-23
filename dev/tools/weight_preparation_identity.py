@@ -23,8 +23,7 @@ INPUTS = {
         "runtime/model/GgufImage.hpp",
         "runtime/metal/abi/Gguf.h",
         "runtime/metal/abi/QuantFormat.h",
-        "runtime/metal/kernels/common/quant_formats.h",
-        "runtime/metal/kernels/shared/gguf_linear.metal",
+        "runtime/metal/kernels/shared/gguf_repack.metal",
     ),
 }
 
