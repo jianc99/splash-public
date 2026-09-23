@@ -181,11 +181,15 @@ ModelDescriptor qwen36Descriptor(std::string name) {
                              vision);
 }
 
-void validateTokenizer(const std::filesystem::path &root,
-                       const ModelDescriptor &descriptor,
-                       std::string_view expectedTextModelType) {
-  NSDictionary *config = readObject(root / "tokenizer" / "config.json",
-                                    "tokenizer model config");
+void validateModelConfig(NSDictionary *manifest, const std::filesystem::path &root,
+                         const ModelDescriptor &descriptor,
+                         std::string_view expectedTextModelType) {
+  // Source assemblies expose model metadata separately; legacy packages keep
+  // this file beside their bundled tokenizer.
+  const auto configPath = manifest[@"tokenizer"] != nil
+                              ? root / "config.json"
+                              : root / "tokenizer" / "config.json";
+  NSDictionary *config = readObject(configPath, "model config");
   NSDictionary *text =
       requireObject(config, @"text_config", "text model config");
   requireEqual(requireString(text, @"model_type", "text model type"),
@@ -216,7 +220,7 @@ void validateQwen38(NSDictionary *manifest,
   requireEqual(requireUnsigned(format, @"q4_storage_n", "q4_storage_n"),
                kQ4StorageN, "q4_storage_n");
   validateCommonFormat(format, Qwen3_8Layout::layerMagic);
-  validateTokenizer(root, descriptor, "qwen3_5_text");
+  validateModelConfig(manifest, root, descriptor, "qwen3_5_text");
 }
 
 void validateLayerTypes(NSDictionary *target,
@@ -300,7 +304,7 @@ void validateQwen36Declarations(NSDictionary *manifest,
                  field.value, field.name);
   }
   validateCaptureLayers(draft);
-  validateTokenizer(root, descriptor, "qwen3_5_moe_text");
+  validateModelConfig(manifest, root, descriptor, "qwen3_5_moe_text");
 }
 
 void validateQwen36(NSDictionary *manifest,
@@ -401,7 +405,7 @@ ModelDescriptor inspectModelPackage(const std::filesystem::path &root) {
           requireUnsigned(manifest, @"schema_version", "schema_version");
       if (schema == 3) {
         descriptor = qwen38Descriptor(model);
-        validateTokenizer(root, descriptor, "qwen3_5_text");
+        validateModelConfig(manifest, root, descriptor, "qwen3_5_text");
       } else if (schema == 4) {
         descriptor = qwen36Descriptor(model);
         validateQwen36Declarations(manifest, root, descriptor);

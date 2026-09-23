@@ -128,8 +128,8 @@ to these same validated target, draft, vision and tokenizer interfaces.
 
 ### Upstream target weights
 
-A support package can contain only `draft/`, `vision/`, `tokenizer/` and its
-manifest. `target.source` pins the upstream target independently:
+A support package can contain only `draft/`, `vision/` and its manifest.
+`target.source` pins the upstream target independently:
 
 ```json
 "target": {
@@ -154,6 +154,56 @@ The installer verifies pinned files and assembles links to them; it never rewrit
 an upstream snapshot. `--model` still identifies the compatible support package.
 Automatic support-asset discovery for arbitrary upstream repository IDs is not
 implemented by this format change.
+
+### Upstream tokenizer and chat templates
+
+New support packages can omit `tokenizer/` and declare `tokenizer.source`:
+
+```json
+"tokenizer": {
+  "source": {
+    "files": [
+      {"path": "config.json", "size": 1234, "sha256": "<SHA-256>"},
+      {"path": "tokenizer.json", "size": 5678, "sha256": "<SHA-256>"},
+      {"path": "tokenizer_config.json", "size": 123, "sha256": "<SHA-256>"},
+      {"path": "chat_template.jinja", "size": 456, "sha256": "<SHA-256>"}
+    ]
+  }
+}
+```
+
+This short form inherits the repository and pinned revision from `target.source`.
+To use a different repository (including a GGUF model's original HF tokenizer),
+add both `repo_id` and a 40-character `revision` to `tokenizer.source`. Include
+all tokenizer files required by that revision with their real sizes and hashes.
+`config.json`, `tokenizer.json` and `tokenizer_config.json` are required for the
+currently supported models; `chat_template.jinja` is optional when the template
+is embedded in the tokenizer configuration. Vocabulary, merges, added-token and
+special-token JSON files can also be listed. Remote Python code is not loaded.
+
+The installer verifies and links these files into the local assembly, and retains
+the source snapshots in the HF cache. It does not modify or copy tokenizer data.
+Warm startup verifies these small files without rehashing target weights. Complete
+cached sources support offline installation. Model metadata is exposed separately
+as the assembly's `config.json`: from the target source when it provides one,
+otherwise from the explicitly declared HF tokenizer source. Legacy packages with
+bundled `tokenizer/` retain their existing loading path.
+
+The server uses the upstream chat template. For a non-initial system message,
+`server/chat_templates.py` recognizes two verified Qwen template fingerprints and
+replaces only their system-position rejection in a cached, in-memory override.
+Message order, tokenizer data and upstream files stay unchanged. Ordinary
+requests use the original template; unknown templates retain their own behavior.
+Existing Splash templates already accepting later system messages need no patch.
+Text, image rendering and token counting share this selection path. This supports
+agent clients introducing instructions during a conversation without moving those
+instructions to the beginning or discarding them. It does not add model support.
+
+`response_format` constrains generation and validates final output; it does not
+inject formatting instructions into the prompt. Clients should describe their
+output requirements in their own messages.
+
+### Local weight preparation
 
 `AffineTarget` reorders codes, scales and biases into the existing affine ABI
 without requantization. GDN decay is computed as `float(-exp(double(A_log)))`;

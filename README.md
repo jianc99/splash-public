@@ -74,7 +74,9 @@ Transformers checkpoints need a compatible Splash support package. Such a packag
 can reference upstream GGUF or MLX affine weights and prepare them locally on first
 load. Preparation keeps the original download and stores an additional weight
 copy in `~/Library/Caches/Splash/weights`; later starts reuse it. Existing packed
-packages need no conversion. Private repositories need `HF_TOKEN`.
+packages need no conversion. Support packages can also reference the model’s
+original tokenizer and chat template, without bundling another copy.
+Private repositories need `HF_TOKEN`.
 Packages download into the Hugging Face cache, and `brew upgrade splash` keeps
 them, along with model links and agent sessions.
 

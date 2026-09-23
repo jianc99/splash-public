@@ -167,6 +167,56 @@ def _validate_records(records, artifact_paths):
         artifact_paths.add(record["path"])
 
 
+def _validate_pinned_source(source, label):
+    if not isinstance(source, dict) or set(source) != {"repo_id", "revision", "files"}:
+        raise ModelError(f"runtime package {label} source is invalid")
+    validate_repo_id(source["repo_id"])
+    if (
+        not is_hex_digest(source["revision"], 40)
+        or not isinstance(source["files"], list)
+        or not source["files"]
+    ):
+        raise ModelError(f"{label} source requires a pinned revision and file list")
+    paths = set()
+    _validate_records(source["files"], paths)
+    if any("/" in name for name in paths):
+        raise ModelError(f"{label} source files must be at the snapshot root")
+    return paths
+
+
+def tokenizer_source(manifest):
+    """A tokenizer defaults to the pinned target repository, never a name guess."""
+    if "tokenizer" not in manifest:
+        return None
+    declaration = manifest["tokenizer"]
+    if not isinstance(declaration, dict) or set(declaration) != {"source"}:
+        raise ModelError("runtime package tokenizer declaration is invalid")
+    source = declaration["source"]
+    if isinstance(source, dict) and set(source) == {"files"}:
+        target = manifest.get("target")
+        target = target.get("source") if isinstance(target, dict) else None
+        if not isinstance(target, dict):
+            raise ModelError(
+                "tokenizer source requires an explicit repository and revision"
+            )
+        source = {**target, "files": source["files"]}
+    paths = _validate_pinned_source(source, "tokenizer")
+    if not {"config.json", "tokenizer.json", "tokenizer_config.json"} <= paths:
+        raise ModelError("tokenizer source requires model config and tokenizer files")
+    if not paths <= {
+        "config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "vocab.json",
+        "merges.txt",
+        "added_tokens.json",
+        "special_tokens_map.json",
+        "chat_template.jinja",
+    }:
+        raise ModelError("tokenizer source contains unsupported files")
+    return source
+
+
 def validate_package_manifest(path: Path):
     manifest = read_json(path)
     format_ = manifest.get("format")
@@ -228,23 +278,7 @@ def validate_package_manifest(path: Path):
             raise ModelError(
                 "runtime package has conflicting target source declarations"
             )
-        if not isinstance(source, dict) or set(source) != {
-            "repo_id",
-            "revision",
-            "files",
-        }:
-            raise ModelError("runtime package target source is invalid")
-        validate_repo_id(source["repo_id"])
-        if (
-            not is_hex_digest(source["revision"], 40)
-            or not isinstance(source["files"], list)
-            or not source["files"]
-        ):
-            raise ModelError("target source requires a pinned revision and file list")
-        source_paths = set()
-        _validate_records(source["files"], source_paths)
-        if any("/" in name for name in source_paths):
-            raise ModelError("target source files must be at the snapshot root")
+        source_paths = _validate_pinned_source(source, "target")
         if format_name == "mlx-affine":
             if (
                 "config.json" not in source_paths
@@ -310,12 +344,21 @@ def validate_package_manifest(path: Path):
         for parent in PurePosixPath(name).parents
     ):
         raise ModelError("runtime package artifact paths overlap")
+    tokenizer = tokenizer_source(manifest)
+    if tokenizer is not None and any(
+        name == "tokenizer"
+        or name.startswith("tokenizer/")
+        or name == "config.json"
+        or name.startswith("config.json/")
+        for name in artifact_paths
+    ):
+        raise ModelError("source package must not ship tokenizer files or model config")
     target_layers, draft_layers = (64, 5) if schema == 3 else (40, 6)
     required_files = {
         "draft/model.bin",
         "vision/model.bin",
         *(f"draft/layer-{index}.bin" for index in range(draft_layers)),
-        *(f"tokenizer/{name}" for name in TOKENIZER_FILES),
+        *(f"tokenizer/{name}" for name in TOKENIZER_FILES if tokenizer is None),
     }
     if source is None and format_name not in VARIANT_FORMATS:
         required_files.update(
@@ -400,6 +443,20 @@ def artifact_records(manifest, variant: str | None, *, installed: bool):
         records.extend(
             {**record, "path": "target/" + record["path"]} for record in source["files"]
         )
+    if installed and (tokenizer := tokenizer_source(manifest)):
+        records.extend(
+            {**record, "path": "tokenizer/" + record["path"]}
+            for record in tokenizer["files"]
+        )
+        # Model metadata is independent of tokenizer lookup. Prefer the target
+        # config when the source adapter has one; GGUF uses the declared HF config.
+        source = target_source(manifest, variant)
+        configs = (
+            source["files"]
+            if source and any(r["path"] == "config.json" for r in source["files"])
+            else tokenizer["files"]
+        )
+        records.append(next(r for r in configs if r["path"] == "config.json"))
     return records
 
 
@@ -412,7 +469,15 @@ def verify_artifacts(
             raise ModelError(f"installed artifact has the wrong size: {record['path']}")
         if path.suffix == ".bin" and record["size"] % ALIGNMENT:
             raise ModelError(f"installed packed file is unaligned: {record['path']}")
-        if full and sha256(path) != record["sha256"].lower():
+        check_content = full or (
+            installed
+            and manifest.get("tokenizer") is not None
+            and (
+                record["path"].startswith("tokenizer/")
+                or record["path"] == "config.json"
+            )
+        )
+        if check_content and sha256(path) != record["sha256"].lower():
             raise ModelError(f"installed artifact checksum changed: {record['path']}")
 
 
@@ -444,6 +509,7 @@ def verify_installed(
     manifest = validate_package_manifest(root / "manifest.json")
     variant = select_variant(manifest, variant)
     _snapshot_revision(installed_snapshot(root), repo_id)
+    _installed_source_snapshots(root, manifest, variant)
     verify_artifacts(root, manifest, full=full, variant=variant, installed=True)
     return model_id
 
@@ -610,11 +676,11 @@ def _resolve_source_files(source, token):
                 raise ModelError(f"downloaded source checksum or size changed: {name}")
         actual_revision = _snapshot_revision(path.parent, source["repo_id"])
         if source.get("revision") and actual_revision != source["revision"]:
-            raise ModelError("target source revision does not match its manifest")
+            raise ModelError("source revision does not match its manifest")
         result[name] = path
     snapshots = {path.parent for path in result.values()}
     if len(snapshots) != 1:
-        raise ModelError("target files came from different source revisions")
+        raise ModelError("files came from different source revisions")
     return result
 
 
@@ -741,13 +807,17 @@ def resolve_target_gguf(manifest, variant: str) -> Path:
 
 
 def resolve_target_source(source):
+    return resolve_source(source, "target weights")
+
+
+def resolve_source(source, label):
     import httpx
     from huggingface_hub import get_token, try_to_load_from_cache
     from huggingface_hub.errors import OfflineModeIsEnabled
 
     token = os.environ.get("HF_TOKEN") or get_token()
     print(
-        f"Fetching target weights from {source['repo_id']}; cached files are reused.",
+        f"Fetching {label} from {source['repo_id']}; cached files are reused.",
         flush=True,
     )
     try:
@@ -776,7 +846,7 @@ def resolve_target_source(source):
         message = str(error)
         if token:
             message = message.replace(token, "[redacted]")
-        raise ModelError(f"could not fetch target weights: {message}") from error
+        raise ModelError(f"could not fetch {label}: {message}") from error
 
 
 @contextmanager
@@ -813,7 +883,15 @@ def install_snapshot(snapshot: Path, destination: Path):
         stage.rmdir()
 
 
-def install_source(snapshot: Path, destination: Path, manifest, files: dict[str, Path]):
+def install_source(
+    snapshot: Path,
+    destination: Path,
+    manifest,
+    files: dict[str, Path],
+    *,
+    tokenizer_files: dict[str, Path] | None = None,
+    variant: str | None = None,
+):
     """Publish support assets and upstream target links as one model assembly.
 
     Both affine shards and GGUF use the same installation ownership and pins.
@@ -833,10 +911,21 @@ def install_source(snapshot: Path, destination: Path, manifest, files: dict[str,
             link = stage / record["path"]
             link.parent.mkdir(parents=True, exist_ok=True)
             os.symlink(snapshot / record["path"], link)
-        for name, source in files.items():
-            target = stage / "target" / name
-            target.parent.mkdir(parents=True, exist_ok=True)
-            os.symlink(source, target)
+        for folder, entries in (
+            ("target", files),
+            ("tokenizer", tokenizer_files or {}),
+        ):
+            for name, source in entries.items():
+                target = stage / folder / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                os.symlink(source, target)
+        if tokenizer_files is not None:
+            os.symlink(
+                files.get("config.json", tokenizer_files["config.json"]),
+                stage / "config.json",
+            )
+        verify_artifacts(stage, manifest, full=False, variant=variant, installed=True)
+
         if destination.exists() or destination.is_symlink():
             retired = Path(
                 tempfile.mkdtemp(
@@ -859,6 +948,32 @@ def install_source(snapshot: Path, destination: Path, manifest, files: dict[str,
         shutil.rmtree(retired, ignore_errors=True)
 
 
+def _installed_source_snapshots(root, manifest, variant):
+    result = []
+    for folder, source in (
+        ("target", target_source(manifest, variant)),
+        ("tokenizer", tokenizer_source(manifest)),
+    ):
+        if source is None:
+            continue
+        snapshots = {
+            (root / folder / record["path"]).readlink().parent
+            for record in source["files"]
+        }
+        if len(snapshots) != 1:
+            raise ModelError(
+                f"installed {folder} files have different source revisions"
+            )
+        snapshot = snapshots.pop()
+        revision = _snapshot_revision(snapshot, source["repo_id"])
+        if source.get("revision") and revision != source["revision"]:
+            raise ModelError(
+                f"installed {folder} source revision does not match manifest"
+            )
+        result.append((snapshot, source["repo_id"]))
+    return result
+
+
 def prepare(args):
     repo_id, variant = split_model_id(args.model)
     models = args.models.resolve()
@@ -869,18 +984,7 @@ def prepare(args):
             _snapshot_revision(installed_snapshot(root), repo_id)
             manifest = validate_package_manifest(root / "manifest.json")
             selected = select_variant(manifest, variant)
-            source_snapshot = None
-            if source := target_source(manifest, selected):
-                snapshots = {
-                    (root / "target" / record["path"]).readlink().parent
-                    for record in source["files"]
-                }
-                if len(snapshots) != 1:
-                    raise ModelError(
-                        "installed target files have different source revisions"
-                    )
-                source_snapshot = snapshots.pop()
-                _snapshot_revision(source_snapshot, source["repo_id"])
+            sources = _installed_source_snapshots(root, manifest, selected)
             verify_artifacts(
                 root, manifest, full=False, variant=selected, installed=True
             )
@@ -900,19 +1004,40 @@ def prepare(args):
             selected = select_variant(manifest, variant)
             refs = [_retain_snapshot_ref(snapshot, repo_id, root)]
             source = target_source(manifest, selected)
-            if source is None:
+            tokenizer = tokenizer_source(manifest)
+            if source is None and tokenizer is None:
                 install_snapshot(snapshot, root)
             else:
-                if selected is not None:
-                    gguf = resolve_target_gguf(manifest, selected)
-                    files = {gguf.name: gguf}
-                else:
-                    files = resolve_target_source(source)
-                source_snapshot = next(iter(files.values())).parent
-                refs.append(
-                    _retain_snapshot_ref(source_snapshot, source["repo_id"], root)
+                files = {}
+                if source is not None:
+                    if selected is not None:
+                        gguf = resolve_target_gguf(manifest, selected)
+                        files = {gguf.name: gguf}
+                    else:
+                        files = resolve_target_source(source)
+                    refs.append(
+                        _retain_snapshot_ref(
+                            next(iter(files.values())).parent, source["repo_id"], root
+                        )
+                    )
+                tokenizer_files = None
+                if tokenizer is not None:
+                    tokenizer_files = resolve_source(tokenizer, "tokenizer")
+                    refs.append(
+                        _retain_snapshot_ref(
+                            next(iter(tokenizer_files.values())).parent,
+                            tokenizer["repo_id"],
+                            root,
+                        )
+                    )
+                install_source(
+                    snapshot,
+                    root,
+                    manifest,
+                    files,
+                    tokenizer_files=tokenizer_files,
+                    variant=selected,
                 )
-                install_source(snapshot, root, manifest, files)
             manifest = validate_package_manifest(root / "manifest.json")
             verify_artifacts(
                 root, manifest, full=False, variant=selected, installed=True
@@ -922,13 +1047,9 @@ def prepare(args):
             print(f"Splash model {args.model} is already installed in {root}")
             try:
                 refs = [_retain_snapshot_ref(installed_snapshot(root), repo_id, root)]
-                if source_snapshot is not None:
+                for source_snapshot, source_repo in sources:
                     refs.append(
-                        _retain_snapshot_ref(
-                            source_snapshot,
-                            target_source(manifest, selected)["repo_id"],
-                            root,
-                        )
+                        _retain_snapshot_ref(source_snapshot, source_repo, root)
                     )
             except OSError as error:
                 if error.errno not in (errno.EACCES, errno.EPERM, errno.EROFS):

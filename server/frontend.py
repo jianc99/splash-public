@@ -26,6 +26,7 @@ if __package__:
         template_messages,
     )
     from .backend import REQUEST_PRIORITIES, Job, remaining_request_time
+    from .chat_templates import compatible_chat_template
     from .diagnostics import print_status
     from .errors import APIError, ContextLengthError
     from .latency import LatencyMetrics
@@ -53,6 +54,7 @@ else:
         template_messages,
     )
     from backend import REQUEST_PRIORITIES, Job, remaining_request_time
+    from chat_templates import compatible_chat_template
     from diagnostics import print_status
     from errors import APIError, ContextLengthError
     from latency import LatencyMetrics
@@ -348,7 +350,9 @@ class Frontend:
         each real image to its placeholder even when a coding agent has read
         documentation or source containing literal vision tokens.
         """
-        source = self.tokenizer.get_chat_template(tools=template.get("tools"))
+        source = template.get("chat_template") or self.tokenizer.get_chat_template(
+            tools=template.get("tools")
+        )
         rendered = self._apply_chat_template(
             messages,
             {
@@ -709,28 +713,6 @@ class Frontend:
         response_schema, response_validator = normalize_response_format(
             body.get("response_format")
         )
-        if response_schema is not None:
-            instruction = (
-                "Your final answer must be a JSON value matching the following "
-                "JSON schema, without Markdown fences."
-            )
-            if tools:
-                instruction += (
-                    " You may call tools first when needed. Tool calls use their "
-                    "own argument schemas; this schema applies only to your final answer."
-                )
-            instruction += "\n" + json.dumps(response_schema, separators=(",", ":"))
-            # The template already describes tools. Describe the answer format
-            # too, so the model can choose between a tool and a final answer.
-            index = next(
-                (
-                    i
-                    for i, message in enumerate(messages)
-                    if message["role"] != "system"
-                ),
-                len(messages),
-            )
-            messages.insert(index, {"role": "system", "content": instruction})
         return Prompt(
             messages,
             tools,
@@ -783,6 +765,11 @@ class Frontend:
             raise APIError(400, "the tokenizer does not define the image pad token")
         positions = []
         try:
+            override = compatible_chat_template(
+                self.tokenizer, prompt.messages, tools=template.get("tools")
+            )
+            if override is not None:
+                template["chat_template"] = override
             if images:
                 tokens, positions, rendered = self._render_image_tokens(
                     prompt.messages, template

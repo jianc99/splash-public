@@ -113,6 +113,9 @@ class FakeTokenizer:
         self.backend_tokenizer = _byte_backend(self.fragments)
         self.templates = []
 
+    def get_chat_template(self, **kwargs):
+        return None
+
     def apply_chat_template(self, messages, **kwargs):
         self.templates.append((messages, kwargs))
         rendered = "<|im_start|>assistant\n<think>\n"
@@ -164,6 +167,9 @@ class TemplateTokenizer(FakeTokenizer):
 
         self.renderer = PreTrainedTokenizerFast(tokenizer_object=self.backend_tokenizer)
         self.renderer.chat_template = template
+
+    def get_chat_template(self, **kwargs):
+        return self.renderer.get_chat_template(**kwargs)
 
     def apply_chat_template(self, messages, **kwargs):
         self.templates.append((messages, kwargs))
@@ -5366,7 +5372,7 @@ class ServerTest(unittest.TestCase):
         self.assertIn("| answer)", grammar)
         self.assertIn("%json", grammar)
 
-    def test_structured_output_schema_is_visible_without_changing_input_history(self):
+    def test_structured_output_preserves_prompt_messages(self):
         harness = self.harness(FakeRuntime())
         schema = {
             "type": "object",
@@ -5387,13 +5393,7 @@ class ServerTest(unittest.TestCase):
                 original = json.dumps(body, sort_keys=True)
                 prompt = harness.app._prepare_prompt(body)
                 self.assertEqual(json.dumps(body, sort_keys=True), original)
-                self.assertEqual(prompt.messages[: len(system)], system)
-                self.assertEqual(prompt.messages[-1], body["messages"][-1])
-                instruction = prompt.messages[len(system)]
-                self.assertEqual(instruction["role"], "system")
-                self.assertEqual(
-                    json.loads(instruction["content"].split("\n", 1)[1]), schema
-                )
+                self.assertEqual(prompt.messages, body["messages"])
                 self.assertEqual(prompt.response_schema, schema)
                 self.assertIsNotNone(prompt.response_validator)
 
