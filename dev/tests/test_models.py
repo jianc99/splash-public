@@ -147,7 +147,14 @@ class ModelArtifactTest(unittest.TestCase):
 
     @staticmethod
     def write_manifest(snapshot, manifest):
-        (snapshot / "manifest.json").write_text(json.dumps(manifest, sort_keys=True))
+        # Match the real Hub cache: installation -> snapshot -> blob.
+        path = snapshot / "manifest.json"
+        if not path.exists():
+            blob = snapshot.parent.parent / "blobs" / "manifest"
+            blob.parent.mkdir(exist_ok=True)
+            blob.write_text("")
+            path.symlink_to("../../blobs/manifest")
+        path.write_text(json.dumps(manifest, sort_keys=True))
 
     def configure_hub(self, snapshot):
         self.api.return_value.model_info.return_value = SimpleNamespace(

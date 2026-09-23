@@ -495,7 +495,9 @@ def installed_snapshot(root: Path) -> Path:
     manifest = root / "manifest.json"
     if not manifest.is_symlink():
         raise ModelError(f"installed model root is not a Splash installation: {root}")
-    return manifest.resolve().parent
+    # A Hub snapshot's manifest is itself a link into blobs/. Preserve the
+    # snapshot identity by following only our installation link.
+    return (manifest.parent / manifest.readlink()).parent.resolve()
 
 
 def verify_installed(
