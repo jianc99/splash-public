@@ -445,6 +445,7 @@ void checkMoeLayer(const char *metallib) {
     }
     tensors.push_back({std::move(name), std::move(dims), type, std::move(data)});
   };
+  add("output_norm.weight", {hidden}, kF32);
   add("blk.0.attn_norm.weight", {hidden}, kF32);
   add("blk.0.attn_qkv.weight", {hidden, geometry.convolutionDimension}, kQ8_0);
   add("blk.0.attn_gate.weight", {hidden, valueRows}, kQ8_0);
@@ -544,8 +545,11 @@ void checkMoeLayer(const char *metallib) {
         return t.name == "blk.0.ffn_down_exps.weight";
       });
       down.data = fixture(Q5K, experts * hidden, width, 507);
+      bool allowPreparation = true;
       const auto load = [&] {
-        model::GgufTargetLoader loader(backend, path, geometry);
+        model::GgufTargetLoader loader(backend, path, geometry, [&] {
+          if (!allowPreparation) throw std::runtime_error("conversion forbidden on warm load");
+        });
         auto weights = loader.layer(0);
         const auto bytes = weights.section(weights.record().declaredBytes - model::kWeightFileAlignment);
         const auto *begin = static_cast<const uint8_t *>(bytes.contents());
@@ -555,6 +559,9 @@ void checkMoeLayer(const char *metallib) {
       };
       write(geometry);
       const auto expected = load();
+      allowPreparation = false;
+      check(load() == expected, "GGUF warm load does not require conversion headroom");
+      allowPreparation = true;
       for (const char *name : {"blk.0.ffn_down_exps.weight", "blk.0.ffn_gate_inp.weight"}) {
         write(geometry);
         const model::GgufFile original(path);
@@ -689,6 +696,8 @@ void checkRepack(const Gpu &gpu, splash::metal::MetalBackend &backend, Fmt f, co
     const uint64_t before = backend.memoryStats().allocatedBytes;
     splash::model::prepareGgufImage(backend, inputFd, outputFd, plan);
     check(backend.memoryStats().allocatedBytes == before, "chunked repack releases staging buffers");
+    check(backend.memoryStats().peakAllocatedBytes <= splash::model::kWeightPreparationWorkspaceBytes,
+          "repack staging stays within the fixed preparation reserve");
     std::vector<uint8_t> actual(bytes), reference(bytes, 0);
     splash::model::readWeightBytes(outputFd, 0, actual);
     for (const auto &section : sections)
@@ -728,6 +737,14 @@ int main(int argc, char **argv) {
       ggml = dlopen(oracle, RTLD_NOW | RTLD_LOCAL);
       check(ggml, std::string("load ") + oracle + (ggml ? "" : std::string(": ") + dlerror()));
     }
+    // Every run must exercise conversion, including the >4 GiB source offsets.
+    char cachePath[] = "/tmp/splash-repack-cache-XXXXXX";
+    if (!mkdtemp(cachePath)) return 1;
+    struct CacheCleanup {
+      const char *path;
+      ~CacheCleanup() { std::filesystem::remove_all(path); }
+    } cleanup{cachePath};
+    setenv("SPLASH_WEIGHT_CACHE", cachePath, 1);
     checkGoldens(ggml);
     checkAlphaBeta();
     checkFloatTensors();
@@ -751,6 +768,11 @@ int main(int argc, char **argv) {
                               {768, 8448, 128, 16, 8, 5}};
       for (int s = 0; s < 3; ++s)
         for (int f = 0; f < FMT_COUNT; ++f) checkRepack(gpu, backend, Fmt(f), shapes[s], 100 + 8 * s + f);
+      // Multiple bounded row batches and a row wider than the staging budget.
+      for (Fmt format : {Q3K, Q80}) {
+        checkRepack(gpu, backend, format, {8704, 2048, kNoPermute, 0, 0, 0}, 741);
+        checkRepack(gpu, backend, format, {256, 131328, kNoPermute, 0, 0, 0}, 742);
+      }
       // 768 whole 16-byte chunks and a 5-byte tail, then an exact multiple.
       checkCopy(gpu, 768 * 16 + 5);
       checkCopy(gpu, 1024 * 16);

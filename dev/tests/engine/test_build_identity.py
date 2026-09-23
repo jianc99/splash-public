@@ -92,6 +92,9 @@ class BuildIdentityTests(unittest.TestCase):
             tool = root / "dev/tools/build_identity.py"
             tool.parent.mkdir(parents=True)
             tool.write_text("fixture tool")
+            (tool.parent / "weight_preparation_identity.py").write_text(
+                "fixture preparation tool"
+            )
             first = build_identity.build_id(root)
             geometry.write_text("#define SPLASH_DFLASH_QUERY_ROWS 7\n")
             self.assertNotEqual(first, build_identity.build_id(root))
@@ -102,6 +105,9 @@ class BuildIdentityTests(unittest.TestCase):
             tool = root / "dev/tools/build_identity.py"
             tool.parent.mkdir(parents=True)
             shutil.copy2(build_identity.ROOT / "dev/tools/build_identity.py", tool)
+            (tool.parent / "weight_preparation_identity.py").write_text(
+                "fixture preparation tool"
+            )
             shader = root / "runtime/metal/kernels/shared/alternate.metal"
             shader.parent.mkdir(parents=True)
             header = root / "generated/BuildIdentity.hpp"

@@ -6,7 +6,7 @@
 
 namespace splash::model {
 
-// At most two 256 x 8192 staging buffers, plus bounded hashing/copy space.
+// Input and output staging together use at most 32 MiB, plus bounded hashing/copy space.
 // No tensor, layer or expert count can increase this bound.
 
 [[nodiscard]] std::string ggufImageKey(const std::string &sourceDigest,

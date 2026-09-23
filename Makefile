@@ -42,7 +42,7 @@ MACOS_MIN_VERSION := 26.4
 MACOS_TARGET_FLAG := -mmacosx-version-min=$(MACOS_MIN_VERSION)
 PROD_METALFLAGS := -std=metal4.0 -O3 -Wall -Wextra -Werror -Iruntime \
 	$(MACOS_TARGET_FLAG)
-ENGINE_CXXFLAGS := -std=c++20 -O3 -Wall -Wextra -Werror -Iruntime \
+ENGINE_CXXFLAGS := -std=c++20 -O3 -Wall -Wextra -Werror -Iruntime -I$(BUILD)/engine \
 	$(MACOS_TARGET_FLAG)
 ENGINE_OBJCXXFLAGS := $(ENGINE_CXXFLAGS) -fobjc-arc
 LIB := $(BUILD)/splash.metallib
@@ -270,6 +270,16 @@ $(BUILD_ID_STAMP): force-build-identity | $(ENGINE_BUILD)
 
 $(BUILD_ID_HEADER): $(BUILD_ID_STAMP)
 	@:
+
+# Cache identities follow only preparation code and its storage ABI. Updating
+# inference kernels or an unrelated app component does not rebuild weights.
+WEIGHT_PREPARATION_HEADER := $(ENGINE_BUILD)/WeightPreparationIdentity.hpp
+
+WEIGHT_PREPARATION_INPUTS := $(shell $(BUILD_ID_PYTHON) dev/tools/weight_preparation_identity.py --inputs)
+$(WEIGHT_PREPARATION_HEADER): $(WEIGHT_PREPARATION_INPUTS) dev/tools/weight_preparation_identity.py dev/tools/build_identity.py | $(ENGINE_BUILD)
+	@$(BUILD_ID_PYTHON) dev/tools/weight_preparation_identity.py --root . --header $@
+
+$(ENGINE_BUILD)/model/AffineTarget.o $(ENGINE_BUILD)/model/GgufPreparation.o: $(WEIGHT_PREPARATION_HEADER)
 
 $(ENGINE_BUILD)/%.o: runtime/%.cpp
 	@mkdir -p $(dir $@)

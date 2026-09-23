@@ -213,23 +213,39 @@ ULPs in this small vector. The existing inference kernels are unchanged.
 Both adapters use `PreparedWeights`. Its default cache is
 `~/Library/Caches/Splash/weights`; `SPLASH_WEIGHT_CACHE` overrides that location.
 Preparation costs an additional on-disk copy of the prepared target. Existing
-packed artifacts are used directly. Source-content hashes, preparation ABI and
-transformation parameters identify the cache; app releases, core counts and
-support-asset updates alone do not invalidate it. Completed files are read-only.
-One writer per cache serializes conversion; interruption, disk-full errors and
-memory-pressure rejection cannot publish partial files. Stale partial generations
-are removed on retry. There is no automatic cache eviction yet; with Splash
-stopped, deleting this cache simply causes preparation at the next load.
+packed artifacts are used directly. Source-content hashes, a build-generated fingerprint of preparation code and its
+storage ABI, and transformation parameters identify the cache. Changing that
+code invalidates its artifacts automatically; unrelated app releases, core
+counts and support-asset updates do not. Completed files are read-only.
+One writer per cache serializes conversion; complete cache hits bypass this lock.
+Interruption, disk-full errors and memory-pressure rejection cannot publish partial
+files. Before conversion, the adapters validate the whole source and budget every
+missing artifact plus a 2 GiB disk reserve. Each output's disk space is preallocated
+before writing. Concurrent external disk activity can still exhaust the volume;
+write errors leave no published partial artifact. Retrying removes abandoned writes
+under the converter lock and reuses previously completed layers.
+
+Cold preparation reports each artifact's progress. Each new cache entry records
+its source path and artifact name in `source`. There is no automatic eviction:
+completed entries can be shared by installations and pinned source revisions.
+With Splash stopped, unused entry directories can be deleted; deleting the whole
+cache causes preparation at the next load. Uninstalling one support package does
+not delete possibly shared prepared weights.
 
 Cold source hashing and output validation stream bounded buffers. Unchanged
 files reuse a digest proof tied to device, inode, size, birth time, mtime and ctime;
 a write or replacement invalidates it. This is not a full disk scrub on every
 startup. Preparation uses uncached destination I/O and bounded tensor tiles,
-with a 64 MiB admission reserve for staging and capped metadata. Warning/critical
-memory pressure or inadequate host headroom stops preparation. Runtime admission
+with a 64 MiB admission reserve for staging and capped metadata. The input/output
+staging buffers together stay within 32 MiB. Complete rows and multiple row tiles
+are processed together where possible, avoiding per-row I/O and small GPU waits.
+Warning/critical memory pressure or inadequate host headroom stops conversion.
+Cache hits and bounded source verification use normal startup admission instead;
+cancellation and critical pressure still abort loading. Runtime admission
 counts prepared weights, draft and vision exactly once. File backing removes the
-whole-model anonymous repack allocation; macOS page cache, driver allocations and
-other applications still affect memory pressure.
+whole-model anonymous repack allocation. It does not make Metal-resident pages
+reclaimable: residency can wire them until released. macOS page cache, driver
+allocations and other applications still affect memory pressure and swap.
 
 Operator plans use each projection's physical layout, independently of the source
 container. `Projection`, `MoeWeights` and `EmbeddingWeights` represent different
@@ -258,9 +274,10 @@ files and that one GGUF into the Hub cache, checks them against the manifest, an
 subdirectories of one root). The original download remains unchanged.
 
 At load time the engine validates the GGUF metadata and plans the existing
-`MDGG0001` layout. `GgufPreparation` gathers at most 256 rows and 8192 input columns
-at a time, runs the existing repack kernel, and writes its planes into a prepared
-file. Embeddings and F32 sections use bounded direct copies. `PreparedWeights`
+`MDGG0001` layout. `GgufPreparation` sizes row batches to a fixed 32 MiB total
+staging budget, uses contiguous reads where possible, runs the existing repack
+kernel, and writes its planes into a prepared file. Rows wider than this budget
+are split into column chunks. Embeddings and F32 sections use bounded direct copies. `PreparedWeights`
 publishes only completed files; `WeightFile` maps them read-only without copying
 into a model-sized Metal allocation. Later starts reuse these files.
 

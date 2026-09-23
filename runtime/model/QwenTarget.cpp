@@ -55,8 +55,9 @@ QwenTargetGeometry geometryFor(const Qwen3_8Layout &layout) {
 
 QwenTargetGeometry geometryFor(const Qwen3_6MoeLayout &layout) {
   QwenTargetGeometry result = commonGeometry(layout);
-  result.moe = {layout.hiddenSize, layout.experts, layout.expertsPerToken,
-                layout.expertIntermediateSize};
+  result.experts = layout.experts;
+  result.expertsPerToken = layout.expertsPerToken;
+  result.expertIntermediateSize = layout.expertIntermediateSize;
   result.ffnKind = QwenFfnKind::SparseMoe;
   return result;
 }
@@ -194,14 +195,15 @@ QwenTargetGeometry targetGeometry(const Weights &weights) {
       include(mixer.outputProjection);
     }, layer.mixer);
     if constexpr (hasDenseFfn<decltype(layer)>) {
+      if (layer.gateProjection.shape() != layer.upProjection.shape())
+        throw WeightStoreError("fused gate/up projections must have matching shapes and layouts");
       include(layer.gateProjection);
       include(layer.upProjection);
       include(layer.downProjection);
       if (layer.upProjection.outputSize && layer.upProjection.inputSize)
         geometry.gateUpProjections.push_back(layer.upProjection.shape());
     } else {
-      auto shape = geometry.moe;
-      shape.weightLayout = layer.ffn.layout();
+      const auto shape = geometry.moeShape(layer.ffn.layout());
       if (std::none_of(geometry.moeShapes.begin(), geometry.moeShapes.end(),
           [&](const auto &s) { return s.weightLayout == shape.weightLayout; }))
         geometry.moeShapes.push_back(shape);

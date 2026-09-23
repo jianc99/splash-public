@@ -84,7 +84,7 @@ void checkPackage(const model::ModelPackage &package, uint32_t family) {
   choices.draftAttention.push_back(
       {{package.draft.layout.attentionShape(), 3}, {80}});
   if (geometry.ffnKind == model::QwenFfnKind::SparseMoe)
-    choices.moe.push_back({{geometry.moe, 24, ops::MoePhase::Decode},
+    choices.moe.push_back({{geometry.moeShape(ops::WeightLayout::Affine64), 24, ops::MoePhase::Decode},
                            {ops::MoeExpertTile::M32}});
   ops::ExecutionPlans selected(device);
   selected.install(choices);
@@ -123,8 +123,8 @@ void checkPackage(const model::ModelPackage &package, uint32_t family) {
         &ops::MoeWorkspace::groupedInputBytes,
         &ops::MoeWorkspace::expertIntermediateBytes,
         &ops::MoeWorkspace::expertOutputBytes};
-    const auto oldMoe = baseline.moeDecodeWorkspacePerLane(geometry.moe);
-    const auto newMoe = selected.moeDecodeWorkspacePerLane(geometry.moe);
+    const auto oldMoe = baseline.moeDecodeWorkspacePerLane(geometry.moeShape(ops::WeightLayout::Affine64));
+    const auto newMoe = selected.moeDecodeWorkspacePerLane(geometry.moeShape(ops::WeightLayout::Affine64));
     for (auto field : fields)
       decodeGrowth += aligned(4 * (newMoe.*field)) - aligned(4 * (oldMoe.*field));
     require(decodeGrowth > 0, "M24 expert plan did not reserve larger scratch");
@@ -157,6 +157,10 @@ void checkMixedLayouts() {
   segment.outputSize = up.outputSize;
   segment.inputSize = up.inputSize;
   up = ops::Projection(up.outputSize, up.inputSize, ops::BlockWeights{{segment}});
+  bool mismatchRejected = false;
+  try { static_cast<void>(model::qwenTargetGeometry(target)); }
+  catch (const model::WeightStoreError &) { mismatchRejected = true; }
+  require(mismatchRejected, "incompatible fused gate/up layouts reached execution");
   target.layers.front().gateProjection = up;
   require(target.logitsProjection.layout() == ops::WeightLayout::Affine64,
           "mixed fixture must keep an affine vocabulary head");

@@ -2,6 +2,7 @@
 
 #include <sys/wait.h>
 #include <sys/stat.h>
+#include <sys/file.h>
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -36,10 +37,47 @@ int main() {
     for (size_t i = 0; i < bytes.size(); ++i) bytes[i] = static_cast<uint8_t>(i * 37);
     int builds = 0;
     const auto write = [&](int fd) { ++builds; writeWeightBytes(fd, 0, bytes); };
-    const auto cached = store.prepare(key(1), bytes.size(), write);
+    const auto cached = store.prepare({key(1), bytes.size()}, write);
     require(builds == 1 && std::filesystem::file_size(cached) == bytes.size(), "cold preparation");
-    static_cast<void>(store.prepare(key(1), bytes.size(), write));
+    static_cast<void>(store.prepare({key(1), bytes.size()}, write));
     require(builds == 1, "warm preparation rebuilt weights");
+    const auto noWorkspace = [] { throw std::runtime_error("conversion pressure"); };
+    static_cast<void>(store.prepare({key(1), bytes.size()}, write, {}, noWorkspace));
+    rejects([&] { static_cast<void>(store.prepare({key(10), bytes.size()}, write, {}, noWorkspace)); },
+            "cold preparation ignored workspace admission");
+    rejects([&] { static_cast<void>(store.prepare({key(1), bytes.size()}, write,
+        [] { throw std::runtime_error("cancelled"); }, {})); }, "warm hit ignored cancellation");
+    // A warm load must finish while an unrelated converter still holds its
+    // lock. Use pipes for ordering; the alarm turns a deadlock into a failure.
+    int ready[2], release[2];
+    require(pipe(ready) == 0 && pipe(release) == 0, "lock fixture pipes");
+    const pid_t holder = fork();
+    if (holder == 0) {
+      alarm(5);
+      const int lock = open((root / "prepare.lock").c_str(), O_RDWR);
+      if (lock < 0 || flock(lock, LOCK_EX)) _exit(1);
+      char byte = 'x';
+      if (::write(ready[1], &byte, 1) != 1 || read(release[0], &byte, 1) != 1) _exit(2);
+      _exit(0);
+    }
+    require(holder > 0, "fork lock holder");
+    char signal;
+    require(read(ready[0], &signal, 1) == 1, "wait for converter lock");
+    const std::array<PreparedWeight, 1> warm{{{key(1), bytes.size()}}};
+    store.requireSpace(warm);
+    static_cast<void>(store.prepare({key(1), bytes.size()}, write, {}, noWorkspace));
+    require(::write(release[1], &signal, 1) == 1, "release converter");
+    int lockStatus;
+    waitpid(holder, &lockStatus, 0);
+    require(WIFEXITED(lockStatus) && WEXITSTATUS(lockStatus) == 0, "warm load waited for converter lock");
+    for (int pipeFd : {ready[0], ready[1], release[0], release[1]}) close(pipeFd);
+    requireWeightDiskSpace(0, 0); // No disk reservation for a complete model.
+    requireWeightDiskSpace(kWeightCacheDiskReserve + 128, 128);
+    rejects([&] { requireWeightDiskSpace(kWeightCacheDiskReserve + 127, 128); }, "disk reserve ignored");
+    rejects([&] { requireWeightDiskSpace(UINT64_MAX, UINT64_MAX); }, "disk budget overflow");
+    const std::array<PreparedWeight, 2> tooLarge{{{key(20), UINT64_MAX / 2}, {key(21), UINT64_MAX / 2}}};
+    rejects([&] { store.requireSpace(tooLarge); }, "model-wide disk budget ignored");
+    require(!std::filesystem::exists(root / key(20)), "disk preflight wrote a partial model");
     require(weightDigest(bytes) == WeightSource(cached).digest(), "cached content differs");
     struct stat info{};
     require(stat(cached.c_str(), &info) == 0 && !(info.st_mode & 0222), "cache is writable");
@@ -49,21 +87,21 @@ int main() {
     const uint8_t bad = 9;
     writeWeightBytes(fd, 0, std::span(&bad, 1));
     close(fd);
-    static_cast<void>(store.prepare(key(1), bytes.size(), write));
+    static_cast<void>(store.prepare({key(1), bytes.size()}, write));
     require(builds == 2 && WeightSource(cached).digest() == weightDigest(bytes), "corruption not repaired");
     // Interrupted and ENOSPC writes do not publish anything and can be retried.
-    rejects([&] { static_cast<void>(store.prepare(key(2), bytes.size(), [&](int output) {
+    rejects([&] { static_cast<void>(store.prepare({key(2), bytes.size()}, [&](int output) {
       writeWeightBytes(output, 0, std::span(bytes).first(64));
       throw std::system_error(ENOSPC, std::generic_category());
     })); }, "failed write accepted");
     require(!std::filesystem::exists(root / key(2)), "partial file published");
-    static_cast<void>(store.prepare(key(2), bytes.size(), write));
-    rejects([&] { static_cast<void>(store.prepare(key(3), bytes.size(), write, [] { throw std::runtime_error("pressure"); })); }, "pressure ignored");
+    static_cast<void>(store.prepare({key(2), bytes.size()}, write));
+    rejects([&] { static_cast<void>(store.prepare({key(3), bytes.size()}, write, [] { throw std::runtime_error("pressure"); })); }, "pressure ignored");
     require(!std::filesystem::exists(root / key(3)), "pressure rejection published weights");
-    rejects([&] { static_cast<void>(store.prepare("../outside", bytes.size(), write)); }, "unsafe cache key accepted");
+    rejects([&] { static_cast<void>(store.prepare({"../outside", bytes.size()}, write)); }, "unsafe cache key accepted");
     const pid_t crash = fork();
     if (crash == 0) {
-      static_cast<void>(store.prepare(key(4), bytes.size(), [&](int output) {
+      static_cast<void>(store.prepare({key(4), bytes.size()}, [&](int output) {
         writeWeightBytes(output, 0, std::span(bytes).first(64));
         _exit(7);
       }));
@@ -74,8 +112,10 @@ int main() {
     waitpid(crash, &status, 0);
     require(WIFEXITED(status) && WEXITSTATUS(status) == 7, "crash fixture failed");
     require(!std::filesystem::exists(root / key(4)), "crash published partial weights");
-    static_cast<void>(store.prepare(key(4), bytes.size(), write));
+    const std::array<PreparedWeight, 1> retry{{{key(4), bytes.size()}}};
+    store.requireSpace(retry);
     require(!std::filesystem::exists(root / (key(4) + ".partial")), "abandoned staging not cleaned");
+    static_cast<void>(store.prepare({key(4), bytes.size()}, write));
     // Two processes requesting the same identity must run its writer only once.
     const auto counter = root / "builds";
     const auto competing = [&](int output) {
@@ -86,11 +126,11 @@ int main() {
     };
     const pid_t child = fork();
     if (child == 0) {
-      try { static_cast<void>(store.prepare(key(5), bytes.size(), competing)); _exit(0); }
+      try { static_cast<void>(store.prepare({key(5), bytes.size()}, competing)); _exit(0); }
       catch (...) { _exit(1); }
     }
     require(child > 0, "fork competitor");
-    static_cast<void>(store.prepare(key(5), bytes.size(), competing));
+    static_cast<void>(store.prepare({key(5), bytes.size()}, competing));
     waitpid(child, &status, 0);
     require(WIFEXITED(status) && WEXITSTATUS(status) == 0 && std::filesystem::file_size(counter) == 1,
             "concurrent cache miss rebuilt or corrupted weights");
@@ -111,7 +151,7 @@ int main() {
       writeWeightBytes(proof, 0, std::span(&bad, 1));
       close(proof);
     }
-    static_cast<void>(store.prepare(key(2), bytes.size(), write));
+    static_cast<void>(store.prepare({key(2), bytes.size()}, write));
     require(builds == 4, "damaged proof forced an unnecessary rebuild");
     std::filesystem::remove_all(root);
     std::cout << "prepared weights: content, reuse, corruption, interruption, pressure and concurrency PASS\n";

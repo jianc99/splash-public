@@ -13,6 +13,7 @@
 #include <cerrno>
 #include <cstdlib>
 #include <limits>
+#include <iostream>
 #include <stdexcept>
 #include <sstream>
 #include <system_error>
@@ -34,6 +35,20 @@ public:
   operator int() const noexcept { return fd_; }
 private:
   int fd_;
+};
+
+class PreparationLock final {
+public:
+  PreparationLock(const std::filesystem::path &root, const PreparationCheck &check)
+      : file_(open((root / "prepare.lock").c_str(), O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0600)) {
+    while (flock(file_, LOCK_EX | LOCK_NB) < 0) {
+      if (errno != EINTR && errno != EWOULDBLOCK) fail("lock weight preparation");
+      if (check) check();
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+  }
+private:
+  Descriptor file_;
 };
 
 std::string hex(const unsigned char *digest) {
@@ -240,36 +255,72 @@ PreparedWeights::PreparedWeights(std::filesystem::path root) : root_(std::move(r
   if (root_.empty()) root_ = defaultCacheRoot();
 }
 
+void requireWeightDiskSpace(uint64_t available, uint64_t required) {
+  if (required && (available < kWeightCacheDiskReserve || required > available - kWeightCacheDiskReserve))
+    throw std::runtime_error("not enough disk space to prepare weights: need " +
+        std::to_string(required) + " bytes plus a 2 GiB free-space reserve");
+}
+
+void PreparedWeights::requireSpace(std::span<const PreparedWeight> weights,
+                                   const PreparationCheck &check) const {
+  const auto missingBytes = [&] {
+    uint64_t missing = 0;
+    for (const auto &weight : weights) {
+      if (weight.key.size() != 64 || weight.key.find_first_not_of("0123456789abcdef") != weight.key.npos || !weight.bytes)
+        throw std::invalid_argument("invalid prepared weight identity or size");
+      if (check) check();
+      if (complete(root_ / weight.key, weight.bytes, check)) continue;
+      if (weight.bytes > std::numeric_limits<uint64_t>::max() - missing)
+        throw std::overflow_error("prepared model size overflow");
+      missing += weight.bytes;
+    }
+    return missing;
+  };
+  if (!missingBytes()) return;
+  std::filesystem::create_directories(root_);
+  PreparationLock lock(root_, check);
+  // Reclaim abandoned writes before budgeting a retry. Live converters hold
+  // the lock; complete generations are retained and excluded from the budget.
+  for (const auto &weight : weights) std::filesystem::remove_all(root_ / (weight.key + ".partial"));
+  requireWeightDiskSpace(std::filesystem::space(root_).available, missingBytes());
+}
+
 std::filesystem::path PreparedWeights::prepare(
-    std::string_view key, uint64_t bytes, const std::function<void(int)> &write,
-    const PreparationCheck &check) const {
+    const PreparedWeight &weight, const std::function<void(int)> &write,
+    const PreparationCheck &check, const PreparationCheck &prepareCheck) const {
+  const auto &key = weight.key;
+  const auto bytes = weight.bytes;
   if (key.size() != 64 || key.find_first_not_of("0123456789abcdef") != key.npos ||
       !bytes || bytes > uint64_t(std::numeric_limits<off_t>::max()))
     throw std::invalid_argument("invalid prepared weight identity or size");
   if (check) check();
+  const auto destination = root_ / key;
+  // Immutable hits need neither conversion admission nor the converter lock.
+  if (complete(destination, bytes, check)) return destination / "weights";
   std::filesystem::create_directories(root_);
   // One converter per user cache: concurrent cold loads cannot multiply the
   // bounded conversion workspace. OS locks are released on crashes.
-  Descriptor lock(open((root_ / "prepare.lock").c_str(), O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0600));
-  while (flock(lock, LOCK_EX | LOCK_NB) < 0) {
-    if (errno != EINTR && errno != EWOULDBLOCK) fail("lock weight preparation");
-    if (check) check();
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-  }
-  const auto destination = root_ / key;
+  PreparationLock lock(root_, check);
   if (complete(destination, bytes, check)) return destination / "weights";
   if (check) check();
-  if (std::filesystem::space(root_).available < bytes)
-    throw std::runtime_error("not enough disk space to prepare weights");
+  if (prepareCheck) prepareCheck();
   // This name belongs only to this key under the converter lock. An abandoned
   // staging directory is never a cache hit and is safe to replace.
   const auto staging = root_ / (std::string(key) + ".partial");
   std::filesystem::remove_all(staging);
+  requireWeightDiskSpace(std::filesystem::space(root_).available, bytes);
   std::filesystem::create_directory(staging);
+  const auto started = std::chrono::steady_clock::now();
+  if (!weight.name.empty()) std::clog << "Preparing target weights: " << weight.name << std::endl;
   try {
     Descriptor file(open((staging / "weights").c_str(), O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0600));
     // Do not let dirty filesystem pages grow into a hidden model-sized buffer.
     if (fcntl(file, F_NOCACHE, 1)) fail("set preparation uncached I/O");
+    fstore_t allocation{};
+    allocation.fst_flags = F_ALLOCATEALL;
+    allocation.fst_posmode = F_PEOFPOSMODE;
+    allocation.fst_length = static_cast<off_t>(bytes);
+    if (fcntl(file, F_PREALLOCATE, &allocation)) fail("reserve prepared weight disk space");
     if (ftruncate(file, static_cast<off_t>(bytes))) fail("size prepared weights");
     write(file);
     if (check) check();
@@ -284,6 +335,12 @@ std::filesystem::path PreparedWeights::prepare(
     Descriptor manifest(open((staging / "sha256").c_str(), O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0400));
     writeWeightBytes(manifest, 0, {reinterpret_cast<const uint8_t *>(digest.data()), digest.size()});
     if (fsync(manifest)) fail("flush prepared weight digest");
+    if (!weight.source.empty()) {
+      Descriptor origin(open((staging / "source").c_str(), O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0400));
+      const auto description = weight.source + "\n" + weight.name + "\n";
+      writeWeightBytes(origin, 0, {reinterpret_cast<const uint8_t *>(description.data()), description.size()});
+      if (fsync(origin)) fail("flush prepared weight source");
+    }
     // Invalid cached generations may be replaced; existing read-only mappings
     // retain their inode. No valid generation is rewritten in place.
     std::filesystem::remove_all(destination);
@@ -294,6 +351,10 @@ std::filesystem::path PreparedWeights::prepare(
     std::error_code ignored;
     std::filesystem::remove_all(staging, ignored);
     throw;
+  }
+  if (!weight.name.empty()) {
+    const auto seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+    std::clog << "Prepared " << weight.name << " in " << seconds << " s" << std::endl;
   }
   return destination / "weights";
 }

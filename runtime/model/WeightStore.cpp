@@ -116,7 +116,8 @@ public:
         }
 
         // Metal can materialize MAP_PRIVATE file mappings as anonymous dirty
-        // pages on GPU use. Keep immutable weights file-backed and reclaimable.
+        // pages on GPU use. Preserve file backing; pages held resident by Metal
+        // are still wired and cannot be reclaimed until that residency ends.
         void *address = mmap(nullptr, static_cast<size_t>(bytes), PROT_READ,
                              MAP_SHARED, descriptor, 0);
         int mapError = errno;

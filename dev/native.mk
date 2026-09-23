@@ -1,5 +1,5 @@
 ENGINE_TEST_BUILD := $(BUILD)/engine-tests
-ENGINE_TEST_CXXFLAGS := -std=c++20 -O2 -Wall -Wextra -Werror -Iruntime -Idev \
+ENGINE_TEST_CXXFLAGS := -std=c++20 -O2 -Wall -Wextra -Werror -Iruntime -I$(ENGINE_BUILD) -Idev \
 	$(MACOS_TARGET_FLAG)
 # Test kernels compile like production ones without the release optimizer.
 TEST_METALFLAGS := $(filter-out -O3,$(PROD_METALFLAGS))
@@ -10,7 +10,7 @@ TEST_CONFIG_DIGEST := $(shell printf '%s\0' $(CONFIG_DIGEST) \
 	$(call shell-quote,$(TEST_METALFLAGS)) | shasum -a 256 | cut -c1-16)
 ENGINE_SANITIZER_BUILD := $(BUILD)/sanitizers
 ENGINE_SANITIZER_CXXFLAGS := -std=c++20 -O1 -g -fno-omit-frame-pointer \
-	-Wall -Wextra -Werror -Iruntime -Idev $(MACOS_TARGET_FLAG)
+	-Wall -Wextra -Werror -Iruntime -I$(ENGINE_BUILD) -Idev $(MACOS_TARGET_FLAG)
 SANITIZER_CONFIG_DIGEST := $(shell printf '%s\0' $(CONFIG_DIGEST) \
 	$(call shell-quote,$(ENGINE_SANITIZER_CXXFLAGS)) \
 	| shasum -a 256 | cut -c1-16)
@@ -32,7 +32,7 @@ BACKEND_CONTROL_SOURCES := \
 	runtime/engine/StateCache.cpp \
 	runtime/engine/Cache.cpp \
 	runtime/engine/Engine.cpp
-MODEL_SOURCES := \
+MODEL_SOURCES := $(WEIGHT_PREPARATION_HEADER) \
 	runtime/model/AffineTarget.cpp \
 	runtime/model/AffineCheckpoint.mm \
 	runtime/model/PreparedWeights.cpp \
@@ -69,6 +69,7 @@ TEST_OPERATOR_MEASUREMENT_ASAN := $(ENGINE_SANITIZER_BUILD)/operator-measurement
 TEST_OPERATOR_MEASUREMENT_TSAN := $(ENGINE_SANITIZER_BUILD)/operator-measurement-tsan
 TEST_MEMORY_TEST := $(ENGINE_TEST_BUILD)/engine-memory-plan
 TEST_DEVICE_QUERIES := $(ENGINE_TEST_BUILD)/device-queries
+TEST_AFFINE_PREPARATION := $(ENGINE_TEST_BUILD)/affine-preparation
 TEST_AFFINE_CHECKPOINT := $(ENGINE_TEST_BUILD)/affine-checkpoint
 TEST_PREPARED_WEIGHTS := $(ENGINE_TEST_BUILD)/prepared-weights
 TEST_GGUF_FILE := $(ENGINE_TEST_BUILD)/gguf-file
@@ -169,7 +170,7 @@ TEST_CPU_TARGETS := $(TEST_AFFINE_CHECKPOINT) $(TEST_PREPARED_WEIGHTS) $(TEST_OP
 	$(TEST_STATUS_TEST) \
 	$(TEST_Q8_CPU_TEST)
 
-TEST_METAL_TARGETS := $(TEST_Q4_SGMATRIX_TEST) $(TEST_TUNING_WORKLOADS) \
+TEST_METAL_TARGETS := $(TEST_AFFINE_PREPARATION) $(TEST_Q4_SGMATRIX_TEST) $(TEST_TUNING_WORKLOADS) \
 	$(TEST_GGUF_PROJECTION) \
 	$(TEST_GGUF_MOE) \
 	$(TEST_GGUF_REPACK) \
@@ -645,6 +646,7 @@ $(TEST_Q4_SGMATRIX_TEST): dev/tests/engine/q4_sgmatrix_metal_test.mm $(ENGINE_LI
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< $(ENGINE_LIBRARY) $(ENGINE_LINKFLAGS) -o $@
 
 test-engine-metal: $(TEST_METAL_TARGETS)
+	$(METAL_TEST_ENV) $(BUILD_ID_PYTHON) dev/tests/engine/test_affine_preparation.py $(TEST_AFFINE_PREPARATION) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_GGUF_REPACK) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_GGUF_PROJECTION) $(TEST_GGUF_DEQUANT_LIB) dequant
 	$(METAL_TEST_ENV) $(TEST_GGUF_PROJECTION) $(LIB) full
@@ -780,3 +782,6 @@ $(ENGINE_TEST_BUILD)/affine-source-oracle: dev/tests/engine/affine_source_oracle
 
 $(TEST_AFFINE_CHECKPOINT): dev/tests/engine/affine_checkpoint_test.cpp $(ENGINE_LIBRARY) | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $< $(ENGINE_LIBRARY) $(ENGINE_LINKFLAGS) -o $@
+
+$(TEST_AFFINE_PREPARATION): dev/tests/engine/affine_preparation_test.mm $(ENGINE_LIBRARY) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< $(ENGINE_LIBRARY) $(ENGINE_LINKFLAGS) -o $@

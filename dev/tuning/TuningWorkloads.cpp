@@ -134,11 +134,11 @@ TuningWorkloads collectTuningWorkloads(
       } else {
         if (layer.ffn.layout() != ops::WeightLayout::Affine64) continue;
         for (uint32_t rows : prefillRows) {
-          ops::MoeWorkload workload{geometry.moe, rows, ops::MoePhase::Prefill};
+          ops::MoeWorkload workload{geometry.moeShape(layer.ffn.layout()), rows, ops::MoePhase::Prefill};
           appendDistinct(moe, workload, layer.ffn);
         }
         for (uint32_t width : decodeWidths) {
-          ops::MoeWorkload workload{geometry.moe,
+          ops::MoeWorkload workload{geometry.moeShape(layer.ffn.layout()),
               width * ExecutionLimits::targetVerifyRows, ops::MoePhase::Decode};
           appendDistinct(moe, workload, layer.ffn);
         }

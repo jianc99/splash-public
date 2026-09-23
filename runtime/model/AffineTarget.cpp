@@ -1,3 +1,4 @@
+#include "WeightPreparationIdentity.hpp"
 #include "model/AffineTarget.hpp"
 #include "model/Qwen3_8.hpp"
 #include "model/Qwen3_6Moe.hpp"
@@ -13,7 +14,8 @@
 namespace splash::model {
 namespace {
 
-constexpr uint32_t kTileRows = 256, kChunkGroups = 128;
+constexpr uint32_t kTileRows = 256;
+constexpr uint64_t kChunkBytes = 16 * 1024 * 1024;
 uint64_t align(uint64_t bytes) { return (bytes + kWeightFileAlignment - 1) & ~(kWeightFileAlignment - 1); }
 
 enum class SectionKind { Copy, Decay, Projection };
@@ -211,7 +213,7 @@ Image embeddingImage(const AffineCheckpoint *source, const Layout &layout) {
 
 std::string imageKey(const AffineCheckpoint &source, const Image &image) {
   std::ostringstream identity;
-  identity << "splash-affine64-preparation-v1\n" << source.digest() << '\n'
+  identity << "splash-affine64-preparation-v1\n" SPLASH_AFFINE_PREPARATION_ID "\n" << source.digest() << '\n'
            << image.magic << ' ' << image.layer << ' ' << image.type << ' ' << image.bytes << '\n';
   for (const auto &section : image.sections) {
     identity << int(section.kind) << ' ' << section.offset << ' ' << section.bytes << ' '
@@ -231,12 +233,13 @@ void writeProjection(int destination, const Section &section, const PreparationC
     uint64_t fieldBase = section.offset + expert * expertBytes;
     for (size_t field = 0; field < unit.size(); ++field) {
       if (check) check();
-      const uint64_t maximumBytes = uint64_t(kTileRows) * std::min(groups, kChunkGroups) * unit[field];
+      const uint32_t chunkGroups = std::min<uint64_t>(groups, kChunkBytes / (kTileRows * unit[field]));
+      const uint64_t maximumBytes = uint64_t(kTileRows) * chunkGroups * unit[field];
       std::vector<uint8_t> input(maximumBytes), output(maximumBytes);
       for (uint32_t firstRow = 0; firstRow < section.rows; firstRow += kTileRows) {
-        for (uint32_t firstGroup = 0; firstGroup < groups; firstGroup += kChunkGroups) {
+        for (uint32_t firstGroup = 0; firstGroup < groups; firstGroup += chunkGroups) {
           if (check) check();
-          const uint32_t count = std::min(kChunkGroups, groups - firstGroup);
+          const uint32_t count = std::min(chunkGroups, groups - firstGroup);
           const uint32_t rowBytes = count * unit[field];
           std::fill(input.begin(), input.end(), 0);
           uint32_t partBegin = 0;
@@ -322,19 +325,34 @@ struct AffineTargetLoader::Impl {
   metal::MetalBackend &backend;
   PreparationCheck check;
   AffineCheckpoint source;
+  std::filesystem::path sourceDirectory;
   std::variant<Qwen3_8Layout, Qwen3_6MoeLayout> layout;
   PreparedWeights cache;
   template<class Layout>
   Impl(metal::MetalBackend &backend, const std::filesystem::path &directory,
        const Layout &layout, PreparationCheck check)
-      : backend(backend), check(std::move(check)), source(directory, this->check), layout(layout) { validateConfiguration(source, layout); }
+      : backend(backend), check(std::move(check)),
+        source(directory, [&backend] { backend.checkOperation(); }), sourceDirectory(directory), layout(layout) {
+    validateConfiguration(source, layout);
+    std::vector<PreparedWeight> weights;
+    const auto include = [&](const Image &image) {
+      weights.push_back({imageKey(source, image), image.bytes});
+    };
+    for (uint32_t layer = 0; layer < layout.layers; ++layer) {
+      backend.checkOperation();
+      include(layerImage(&source, layout, layer));
+    }
+    include(headImage(&source, layout));
+    include(embeddingImage(&source, layout));
+    cache.requireSpace(weights, [&backend] { backend.checkOperation(); });
+  }
   WeightFile load(const Image &image) {
     source.checkUnchanged();
     const auto key = imageKey(source, image);
-    const auto path = cache.prepare(key, image.bytes, [&](int output) {
+    const auto path = cache.prepare({key, image.bytes, image.name, sourceDirectory.string()}, [&](int output) {
       writeImage(output, image, check);
       source.checkUnchanged();
-    }, check);
+    }, [&] { backend.checkOperation(); }, check);
     source.checkUnchanged();
     return WeightFile(backend, path, "target/" + image.name, image.magic, image.layer, image.type, key);
   }

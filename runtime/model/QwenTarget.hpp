@@ -181,7 +181,9 @@ struct QwenTargetGeometry final {
   uint32_t rotaryPairs = 0;
   float rotaryTheta = 0.0F;
   uint32_t denseIntermediateSize = 0;
-  ops::MoeShape moe{};
+  uint32_t experts = 0;
+  uint32_t expertsPerToken = 0;
+  uint32_t expertIntermediateSize = 0;
   QwenFfnKind ffnKind = QwenFfnKind::Dense;
   uint32_t maskToken = 0;
   std::array<uint32_t, 2> stopTokens{};
@@ -201,9 +203,12 @@ struct QwenTargetGeometry final {
   [[nodiscard]] constexpr uint32_t capturedHiddenSize() const noexcept {
     return hiddenSize * captureLayerCount;
   }
+  [[nodiscard]] constexpr ops::MoeShape moeShape(ops::WeightLayout layout) const noexcept {
+    return {hiddenSize, experts, expertsPerToken, expertIntermediateSize, layout};
+  }
   [[nodiscard]] constexpr uint32_t ffnScratchWidth() const noexcept {
     return ffnKind == QwenFfnKind::Dense ? denseIntermediateSize
-                                         : moe.expertIntermediateSize;
+                                         : expertIntermediateSize;
   }
   [[nodiscard]] constexpr std::span<const uint32_t>
   captureLayers() const noexcept {
@@ -227,7 +232,7 @@ struct QwenTargetGeometry final {
            kvLayout.kvHeads == attentionKvHeads &&
            kvLayout.headDimension == attentionHeadDimension &&
            ((ffnKind == QwenFfnKind::Dense && denseIntermediateSize) ||
-            (ffnKind == QwenFfnKind::SparseMoe && moe.valid()));
+            (ffnKind == QwenFfnKind::SparseMoe && moeShape(ops::WeightLayout::Affine64).valid()));
   }
 };
 

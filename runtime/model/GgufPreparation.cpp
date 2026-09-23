@@ -1,3 +1,4 @@
+#include "WeightPreparationIdentity.hpp"
 #include "model/GgufPreparation.hpp"
 
 #include <algorithm>
@@ -10,7 +11,8 @@
 namespace splash::model {
 namespace {
 
-constexpr uint32_t kRows = 256, kColumns = 8192;
+constexpr uint32_t kRows = 256;
+constexpr uint64_t kStagingBytes = 32 * 1024 * 1024;
 
 uint32_t sourceRow(uint32_t row, const GgufRepackParams &p) {
   if (row < p.permute_from_row) return row;
@@ -32,9 +34,9 @@ void requireRange(uint64_t offset, uint64_t bytes, uint64_t available) {
 } // namespace
 
 std::string ggufImageKey(const std::string &sourceDigest, const gguf::Image &image) {
-  // Bump only when the transformation or stored bytes change, never for a
-  // compute tile, core count or unrelated application release.
-  const std::string identity = "splash-block32-preparation-v1\n" + sourceDigest;
+  // The envelope version covers identity serialization. Conversion code and
+  // its storage ABI are fingerprinted at build time, independently of tuning.
+  const std::string identity = "splash-block32-preparation-v1\n" SPLASH_GGUF_PREPARATION_ID "\n" + sourceDigest;
   std::vector<uint8_t> bytes(identity.begin(), identity.end());
   const auto append = [&](const auto &value) {
     const auto *begin = reinterpret_cast<const uint8_t *>(&value);
@@ -101,26 +103,44 @@ void prepareGgufImage(metal::MetalBackend &backend, int source, int destination,
     const std::array<uint32_t, 3> base{p.dst_plane0, p.dst_plane1, p.dst_meta};
     for (size_t plane = 0; plane < base.size(); ++plane)
       if (unitBytes[plane]) requireRange(base[plane], uint64_t(p.rows) * (groups / divisor[plane]) * unitBytes[plane], image.bytes);
-    const uint32_t maximumColumns = std::min(kColumns, p.input_size);
-    const uint64_t inputBytes = uint64_t(kRows) * (maximumColumns / format.block_elements) * format.block_bytes;
-    const uint64_t outputBytes = uint64_t(kRows) * (maximumColumns / 32) *
-        (format.plane0_bytes + format.plane1_bytes) +
+    // Prefer complete rows: one sequential read and one submission can cover
+    // many 256-row tiles. Very wide rows still split within the same bound.
+    const uint64_t bytesPerBlock = uint64_t(format.block_bytes) * (256 / format.block_elements) +
+        8 * (format.plane0_bytes + format.plane1_bytes) + (8 / format.meta_groups) * format.meta_bytes;
+    const uint32_t maximumColumns = std::min<uint64_t>(p.input_size,
+        (kStagingBytes / (kRows * bytesPerBlock)) * 256);
+    if (!maximumColumns) throw GgufError("weight row exceeds preparation bound");
+    const uint64_t tileBytes = uint64_t(kRows) * (maximumColumns / format.block_elements) * format.block_bytes +
+        uint64_t(kRows) * (maximumColumns / 32) * (format.plane0_bytes + format.plane1_bytes) +
         uint64_t(kRows) * (maximumColumns / 32 / format.meta_groups) * format.meta_bytes;
+    const uint32_t maximumRows = maximumColumns == p.input_size
+        ? std::min<uint64_t>(p.rows, (kStagingBytes / tileBytes) * kRows) : kRows;
+    const uint64_t inputBytes = uint64_t(maximumRows) * (maximumColumns / format.block_elements) * format.block_bytes;
+    const uint64_t outputBytes = uint64_t(maximumRows) * (maximumColumns / 32) *
+        (format.plane0_bytes + format.plane1_bytes) +
+        uint64_t(maximumRows) * (maximumColumns / 32 / format.meta_groups) * format.meta_bytes;
     guard();
     auto input = backend.allocateBuffer(inputBytes, metal::BufferStorage::Shared, "prepare/source");
     auto output = backend.allocateBuffer(outputBytes, metal::BufferStorage::Shared, "prepare/planes");
-    for (uint32_t firstRow = 0; firstRow < p.rows; firstRow += kRows) {
-      for (uint32_t firstColumn = 0; firstColumn < p.input_size; firstColumn += kColumns) {
+    for (uint32_t firstRow = 0; firstRow < p.rows; firstRow += maximumRows) {
+      const uint32_t rows = std::min(maximumRows, p.rows - firstRow);
+      for (uint32_t firstColumn = 0; firstColumn < p.input_size; firstColumn += maximumColumns) {
         guard();
-        const uint32_t columns = std::min(kColumns, p.input_size - firstColumn);
+        const uint32_t columns = std::min(maximumColumns, p.input_size - firstColumn);
         const uint32_t chunkRowBytes = columns / format.block_elements * format.block_bytes;
         auto *host = static_cast<uint8_t *>(input.contents());
-        for (uint32_t row = 0; row < kRows; ++row)
-          readWeightBytes(source, repack.sourceOffset + uint64_t(sourceRow(firstRow + row, p)) * rowBytes +
+        for (uint32_t row = 0; row < rows;) {
+          const uint32_t start = sourceRow(firstRow + row, p);
+          uint32_t count = 1;
+          if (columns == p.input_size)
+            while (row + count < rows && sourceRow(firstRow + row + count, p) == start + count) ++count;
+          readWeightBytes(source, repack.sourceOffset + uint64_t(start) * rowBytes +
                           uint64_t(firstColumn / format.block_elements) * format.block_bytes,
-                          {host + row * chunkRowBytes, chunkRowBytes});
+                          {host + uint64_t(row) * chunkRowBytes, uint64_t(count) * chunkRowBytes});
+          row += count;
+        }
         GgufRepackParams chunk{};
-        chunk.rows = kRows;
+        chunk.rows = rows;
         chunk.input_size = columns;
         chunk.fmt = p.fmt;
         chunk.src_row_bytes = chunkRowBytes;
@@ -128,11 +148,11 @@ void prepareGgufImage(metal::MetalBackend &backend, int source, int destination,
         const uint32_t chunkGroups = columns / 32;
         std::array<uint32_t, 3> lengths{};
         for (size_t plane = 0; plane < lengths.size(); ++plane)
-          lengths[plane] = kRows * (chunkGroups / divisor[plane]) * unitBytes[plane];
+          lengths[plane] = rows * (chunkGroups / divisor[plane]) * unitBytes[plane];
         chunk.dst_plane1 = lengths[0];
         chunk.dst_meta = lengths[0] + lengths[1];
         const metal::ComputeDispatch dispatch{"gguf_repack", {{0, input}, {1, output}},
-            {{2, &chunk, sizeof(chunk)}}, {uint64_t(kRows) * chunkGroups / 256, 1, 1}, {256, 1, 1}};
+            {{2, &chunk, sizeof(chunk)}}, {uint64_t(rows) * chunkGroups / 256, 1, 1}, {256, 1, 1}};
         static_cast<void>(backend.submitCommand(std::span(&dispatch, 1)));
         const auto *prepared = static_cast<const uint8_t *>(output.contents());
         uint32_t offset = 0;
