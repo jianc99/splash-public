@@ -4,7 +4,7 @@ The supported tokenizer profile describes algorithms; vocabulary, merge ranks,
 special-token IDs and the chat template always come from the selected GGUF.
 
 This file is the metadata adapter, identified by the SHA-256 of its bytes:
-upstream._metadata_key keys each derived metadata entry by that hash, the
+assembly._metadata_key keys each derived metadata entry by that hash, the
 tokenizers version and the size and digest of each source GGUF. After any
 edit to this file, a comment included, preparing an installed GGUF model
 reports that the adapter changed and derives its metadata again.
