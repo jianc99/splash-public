@@ -5,7 +5,6 @@
 
 #include <array>
 #include <compare>
-#include <compare>
 #include <cstdint>
 #include <span>
 

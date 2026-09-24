@@ -33,7 +33,6 @@ struct LinearMatrix final {
   auto operator<=>(const LinearMatrix &) const = default;
 };
 
-
 // Throws unless `projection` is an affine projection of `matrix` whose planes
 // hold all of its Q4 weights, scales and biases.
 void requireAffineProjection(const Projection &projection, LinearMatrix matrix);

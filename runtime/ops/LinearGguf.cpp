@@ -392,7 +392,6 @@ FloatTile Linear::ggufFloatTile(uint32_t rows, uint32_t outputSize) const noexce
                                                                                      : FloatTile::Simdgroup;
 }
 
-
 // Simdgroup: 8 columns of 32 rows per threadgroup of 16 simdgroups. Neural
 // accelerator: 32 columns of 64 rows per threadgroup of 4 simdgroups, at least
 // 16 rows and K a multiple of 32 (kernels/shared/gguf_float.metal).
