@@ -287,27 +287,32 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
   MemoryGovernor::HostAvailableMemoryProvider hostAvailableMemory =
       config.hostAvailableMemory ? config.hostAvailableMemory
                                  : queryHostAvailableMemory;
-  // The one startup memory check: cancellation, then system pressure and
-  // reclaimable host memory against a reserve. Every Metal operation runs it
-  // with the desktop reserve; weight preparation adds its workspace to the
-  // reserve and needs normal pressure.
-  const auto admitStartup = [cancelled = config.cancelled,
-                             pressure = config.memoryPressure,
-                             hostAvailableMemory](uint64_t reserveBytes,
-                                                  bool preparingWeights) {
+  // Startup work stops on cancellation and keeps its reserve of host memory.
+  const auto throwIfCancelled = [cancelled = config.cancelled] {
     if (cancelled && cancelled())
-      throw metal::MetalBackendError("Metal operation cancelled");
-    const MemoryPressure level =
-        pressure ? pressure() : MemoryPressure::Normal;
-    if (preparingWeights && level != MemoryPressure::Normal)
+      throw metal::MetalBackendError("startup cancelled");
+  };
+  const auto currentPressure = [pressure = config.memoryPressure] {
+    return pressure ? pressure() : MemoryPressure::Normal;
+  };
+  const auto admitMetalOperation = [throwIfCancelled, currentPressure,
+                                    hostAvailableMemory, hostReserveBytes] {
+    throwIfCancelled();
+    requireStartupHeadroom(hostAvailableMemory, hostReserveBytes,
+                           currentPressure());
+  };
+  const auto admitWeightPreparation = [throwIfCancelled, currentPressure,
+                                       hostAvailableMemory,
+                                       preparationReserveBytes] {
+    throwIfCancelled();
+    const MemoryPressure level = currentPressure();
+    if (level != MemoryPressure::Normal)
       throw metal::MetalAllocationError(
           "weight preparation requires normal memory pressure",
           metal::AllocationFailure::HostPressure);
-    requireStartupHeadroom(hostAvailableMemory, reserveBytes, level);
+    requireStartupHeadroom(hostAvailableMemory, preparationReserveBytes, level);
   };
-  backend->setOperationGuard([admitStartup, hostReserveBytes] {
-    admitStartup(hostReserveBytes, false);
-  });
+  backend->setOperationGuard(admitMetalOperation);
   try {
     const uint64_t modelBytes =
         model::preparedModelWeightBytes(config.modelRoot, config.model);
@@ -325,7 +330,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
     }
     // Fail before opening the package when the machine has no headroom at
     // all; the guard installed above keeps checking as residency grows.
-    admitStartup(hostReserveBytes, false);
+    admitMetalOperation();
   } catch (const RuntimeResourcesError &) {
     throw;
   } catch (const metal::MetalAllocationError &error) {
@@ -339,9 +344,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
 
   model::ModelPackage package;
   try {
-    package = model::loadModelPackage(
-        *backend, config.modelRoot, config.model,
-        [&] { admitStartup(preparationReserveBytes, true); });
+    package = model::loadModelPackage(*backend, config.modelRoot, config.model,
+                                      admitWeightPreparation);
     requireLoadedModel(package);
   } catch (const metal::MetalAllocationError &error) {
     throw RuntimeResourcesError(RuntimeResourceStage::ModelLoading,
