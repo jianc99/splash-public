@@ -8,7 +8,7 @@
 #include "metal/abi/QuantFormat.h"
 
 struct GgufRepackParams {
-  uint32_t rows;          // rows of the chunk (a multiple of 256)
+  uint32_t rows;          // rows of the chunk (a multiple of QUANT_TILE_ROWS)
   uint32_t input_size;    // K of the chunk (a multiple of 256)
   uint32_t fmt;           // GGUF_FMT_*
   uint32_t src_row_bytes; // bytes per staged row

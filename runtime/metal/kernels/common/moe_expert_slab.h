@@ -30,8 +30,8 @@ inline MoeQ4Slab moe_q4_slab(device uchar *packed, device uchar *shared,
 
 // A GGUF expert pass's weights for one tile (ops/MoE.cpp, metal/abi/MoE.h):
 // every routed expert of the projection is one image segment of experts *
-// output_size rows, so expert e's planes start at tile e * output_size / 256
-// (metal/abi/QuantFormat.h); the shared expert (id `experts`) has a segment
+// output_size rows, so expert e's planes start at tile e * output_size /
+// QUANT_TILE_ROWS (metal/abi/QuantFormat.h); the shared expert (id `experts`) has a segment
 // of its own, possibly in another format. w1 is the meta plane for formats
 // without a second plane, as the host binds it.
 struct MoeGgufSegment {

@@ -93,6 +93,7 @@ kernel void gguf_repack(device const uchar *src [[buffer(0)]], device uchar *dst
       meta[0] = blk[0]; meta[1] = blk[1];
       break;
     }
+    case GGUF_FMT_IQ3S:
     default: {  // IQ3_S: grid entry t covers elements 4t..4t+3 (qs[t], ninth bit t of qh); sign bit e negates element e
       device const uchar *qs = blk + 2 + 8 * j, *signs = blk + 74 + 4 * j;
       const uint qh = blk[66 + j], scale = (blk[106 + j / 2] >> (4 * (j % 2))) & 15;

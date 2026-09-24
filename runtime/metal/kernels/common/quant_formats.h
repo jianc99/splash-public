@@ -1,5 +1,6 @@
 #pragma once
 #include "metal/abi/QuantFormat.h"
+#include "metal/abi/QuantTables.h"
 #include <metal_stdlib>
 using namespace metal;
 

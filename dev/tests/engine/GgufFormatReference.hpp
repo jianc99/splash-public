@@ -5,6 +5,7 @@
 // the planes the load-time repack writes. Shared by the GGUF Metal tests.
 
 #include "metal/abi/QuantFormat.h"
+#include "metal/abi/QuantTables.h"
 
 #include <cstdint>
 #include <cstring>
