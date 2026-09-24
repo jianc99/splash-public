@@ -526,20 +526,12 @@ def _snapshot_of(path):
 def _pin(root, sources):
     """Pin every Hub snapshot the installation links, so pruning the Hub cache
     cannot remove them, then retire this installation's older pins."""
-    refs = []
-    for repo, sample in sources:
-        if not repo.local and (snapshot := _snapshot_of(sample)):
-            refs.append(models._retain_snapshot_ref(snapshot, repo.name, root))
-    try:
-        for ref in refs:
-            for previous in ref.parent.iterdir():
-                if previous not in refs and models.is_hex_digest(previous.name, 40):
-                    previous.unlink()
-    except OSError as error:
-        # An old pin only costs cache space; the current ones are in place.
-        print(
-            f"Warning: could not retire old Hub cache references: {error}", flush=True
-        )
+    refs = [
+        models.retain_ref(snapshot, repo.name, root)
+        for repo, sample in sources
+        if not repo.local and (snapshot := _snapshot_of(sample))
+    ]
+    models.retire_refs(refs)
 
 
 def _gguf_metadata(models_root, target, vision):

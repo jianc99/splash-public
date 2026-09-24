@@ -1075,8 +1075,8 @@ class ModelArtifactTest(unittest.TestCase):
         (refs / "main").write_text("b" * 40)
         install_a = self.root / "install-a" / self.MODEL_ID
         install_b = self.root / "install-b" / self.MODEL_ID
-        pin_a = artifacts._retain_snapshot_ref(first, self.MODEL_ID, install_a)
-        pin_b = artifacts._retain_snapshot_ref(second, self.MODEL_ID, install_b)
+        pin_a = artifacts.retain_ref(first, self.MODEL_ID, install_a)
+        pin_b = artifacts.retain_ref(second, self.MODEL_ID, install_b)
         self.assertNotEqual(pin_a.parent, pin_b.parent)
         self.assertEqual((refs / "main").read_text(), "b" * 40)
         scanned = scan_cache_dir(cache)
@@ -1090,7 +1090,7 @@ class ModelArtifactTest(unittest.TestCase):
         models = self.root / "models"
         destination = models / self.MODEL_ID
         artifacts.install_snapshot(snapshot, destination)
-        ref = artifacts._retain_snapshot_ref(snapshot, self.MODEL_ID, destination)
+        ref = artifacts.retain_ref(snapshot, self.MODEL_ID, destination)
         with mock.patch.object(
             artifacts.os, "link", side_effect=AssertionError("cache write")
         ):
@@ -1128,7 +1128,7 @@ class ModelArtifactTest(unittest.TestCase):
         self.configure_hub(snapshot)
         with mock.patch.object(
             artifacts,
-            "_retain_snapshot_ref",
+            "retain_ref",
             side_effect=OSError(errno.EROFS, "read only"),
         ):
             with contextlib.redirect_stdout(io.StringIO()):
@@ -1143,7 +1143,7 @@ class ModelArtifactTest(unittest.TestCase):
         models = self.root / "models"
         destination = models / self.MODEL_ID
         artifacts.install_snapshot(snapshot, destination)
-        ref = artifacts._retain_snapshot_ref(snapshot, self.MODEL_ID, destination)
+        ref = artifacts.retain_ref(snapshot, self.MODEL_ID, destination)
         ref.write_text("wrong")
         with contextlib.redirect_stdout(io.StringIO()):
             with self.assertRaisesRegex(
@@ -1158,7 +1158,7 @@ class ModelArtifactTest(unittest.TestCase):
         models = self.root / "models"
         destination = models / self.MODEL_ID
         artifacts.install_snapshot(snapshot, destination)
-        ref = artifacts._retain_snapshot_ref(snapshot, self.MODEL_ID, destination)
+        ref = artifacts.retain_ref(snapshot, self.MODEL_ID, destination)
         old = ref.parent / ("b" * 40)
         old.write_text("b" * 40)
         errors = io.StringIO()
@@ -1183,8 +1183,8 @@ class ModelArtifactTest(unittest.TestCase):
         models = self.root / "install-a"
         destination = models / self.MODEL_ID
         other = self.root / "install-b" / self.MODEL_ID
-        old_pin = artifacts._retain_snapshot_ref(first, self.MODEL_ID, destination)
-        other_pin = artifacts._retain_snapshot_ref(first, self.MODEL_ID, other)
+        old_pin = artifacts.retain_ref(first, self.MODEL_ID, destination)
+        other_pin = artifacts.retain_ref(first, self.MODEL_ID, other)
         artifacts.install_snapshot(second, destination)
         with contextlib.redirect_stdout(io.StringIO()):
             artifacts.prepare_legacy(

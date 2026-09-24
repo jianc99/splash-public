@@ -411,7 +411,9 @@ def _snapshot_revision(snapshot: Path, model_id: str) -> str:
     return snapshot.name
 
 
-def _retain_snapshot_ref(snapshot: Path, model_id: str, installation: Path):
+def retain_ref(snapshot: Path, model_id: str, installation: Path) -> Path:
+    """Pin snapshot for installation (refs/splash/<installation>/<commit>), so
+    pruning the Hub cache cannot remove files the installation links."""
     revision = _snapshot_revision(snapshot, model_id)
     # Each installation owns its references; Hub branch updates and other
     # installations must not unpin this installation's current weights.
@@ -436,6 +438,46 @@ def _retain_snapshot_ref(snapshot: Path, model_id: str, installation: Path):
             if ref.read_text() != revision:
                 raise ModelError(f"invalid installed snapshot reference: {ref}")
     return ref
+
+
+def retire_refs(refs):
+    """Remove the installation's other pins beside refs. Call it only after
+    publishing and verifying the installation refs pin; other installations
+    own other folders."""
+    try:
+        for ref in refs:
+            for previous in ref.parent.iterdir():
+                if previous not in refs and is_hex_digest(previous.name, 40):
+                    previous.unlink()
+    except OSError as error:
+        # Keeping an old pin uses cache space but cannot invalidate the
+        # verified installation or its successfully retained current pin.
+        print(
+            f"Warning: could not retire old Hub cache references: {error}",
+            file=sys.stderr,
+        )
+
+
+def retain_refs(installation: Path, snapshots):
+    """Pin a verified installation's (snapshot, repository ID) pairs again,
+    repairing a pin that was lost or never written, and retire its older pins.
+    Only local files are written; a read-only cache leaves the verified model
+    usable, with a warning."""
+    try:
+        refs = [
+            retain_ref(snapshot, repo, installation) for snapshot, repo in snapshots
+        ]
+    except OSError as error:
+        if error.errno not in (errno.EACCES, errno.EPERM, errno.EROFS):
+            raise
+        print(
+            "Warning: the verified model can be used, but its Hub cache "
+            "reference could not be retained; protect this snapshot from "
+            f"external cache pruning: {error}",
+            file=sys.stderr,
+        )
+        return
+    retire_refs(refs)
 
 
 def _download_snapshot(model_id: str, token):
@@ -802,15 +844,14 @@ def prepare_legacy(args):
             snapshot = resolve_snapshot(args.model)
             manifest = validate_package_manifest(snapshot / "manifest.json")
             selected = select_variant(manifest, variant)
-            refs = [_retain_snapshot_ref(snapshot, repo_id, root)]
+            # A new installation requires its pins before it is published.
+            refs = [retain_ref(snapshot, repo_id, root)]
             if selected is None:
                 install_snapshot(snapshot, root)
             else:
                 gguf = resolve_target_gguf(manifest, selected)
                 refs.append(
-                    _retain_snapshot_ref(
-                        gguf.parent, gguf_table(manifest)["repo_id"], root
-                    )
+                    retain_ref(gguf.parent, gguf_table(manifest)["repo_id"], root)
                 )
                 install_variant(snapshot, root, manifest, selected, gguf)
             manifest = validate_package_manifest(root / "manifest.json")
@@ -818,40 +859,13 @@ def prepare_legacy(args):
                 root, manifest, full=False, variant=selected, installed=True
             )
             print(f"Installed verified Splash model {args.model} in {root}")
+            retire_refs(refs)
         else:
             print(f"Splash model {args.model} is already installed in {root}")
-            try:
-                refs = [_retain_snapshot_ref(installed_snapshot(root), repo_id, root)]
-                if gguf_snapshot is not None:
-                    refs.append(
-                        _retain_snapshot_ref(
-                            gguf_snapshot, gguf_table(manifest)["repo_id"], root
-                        )
-                    )
-            except OSError as error:
-                if error.errno not in (errno.EACCES, errno.EPERM, errno.EROFS):
-                    raise
-                print(
-                    "Warning: the verified model can be used, but its Hub cache "
-                    "reference could not be retained; protect this snapshot from "
-                    f"external cache pruning: {error}",
-                    file=sys.stderr,
-                )
-                return
-        # Retire this installation's previous pins only after publishing and
-        # verifying its new destination. Other installations own other folders.
-        try:
-            for ref in refs:
-                for previous in ref.parent.iterdir():
-                    if previous not in refs and is_hex_digest(previous.name, 40):
-                        previous.unlink()
-        except OSError as error:
-            # Keeping an old pin uses cache space but cannot invalidate the
-            # verified installation or its successfully retained current pin.
-            print(
-                f"Warning: could not retire old Hub cache references: {error}",
-                file=sys.stderr,
-            )
+            snapshots = [(installed_snapshot(root), repo_id)]
+            if gguf_snapshot is not None:
+                snapshots.append((gguf_snapshot, gguf_table(manifest)["repo_id"]))
+            retain_refs(root, snapshots)
 
 
 def prepare(args):
