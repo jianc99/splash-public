@@ -276,7 +276,8 @@ class PartialToolOutputTests(unittest.TestCase):
                             [
                                 call,
                                 {"role": "user", "content": "Continue"},
-                            ]
+                            ],
+                            vision=True,
                         )
                         actual = normalized[0]["tool_calls"][0]["function"]
                         self.assertEqual(actual["arguments"], arguments)

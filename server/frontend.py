@@ -235,16 +235,17 @@ class Frontend:
         request_timeout,
         preparation_capacity,
         constraint_factory=None,
+        *,
+        vision,
         max_image_pixels=image_input.MAX_PIXELS,
         thinking_codec=None,
         served_model_names=(),
         default_reasoning_effort=None,
-        vision=True,
     ):
         if not isinstance(preparation_capacity, int) or preparation_capacity <= 0:
             raise ValueError("frontend preparation capacity must be positive")
-        # Announced by the engine: without vision, image and document parts
-        # are rejected when their messages are converted.
+        # Announced by the engine in its Ready event. Without it, message
+        # normalization rejects image and PDF input before any decoding.
         self.vision = vision
         self.latencies = LatencyMetrics()
         self.tokenizer = tokenizer
@@ -289,6 +290,7 @@ class Frontend:
 
     @property
     def input_modalities(self):
+        """The one list /status, /v1/models and client setup report."""
         return ["text", "image", "pdf"] if self.vision else ["text"]
 
     def status(self):
@@ -727,7 +729,7 @@ class Frontend:
             raise APIError(400, "preserve_thinking must be a boolean")
         messages = template_messages(
             normalize_messages(
-                body.get("messages"), deadline=deadline, vision=self.vision
+                body.get("messages"), vision=self.vision, deadline=deadline
             )
         )
         tools, tool_policy = normalize_tools(
@@ -1019,7 +1021,7 @@ class Frontend:
                 if reserve_input is not None:
                     reserve_input(len(previous.history_json))
                 previous_items = json_codec.loads(previous.history_json)
-            chat = responses_to_chat_body(body, previous_items, vision=self.vision)
+            chat = responses_to_chat_body(body, previous_items)
             namespaces = chat.pop("_tool_namespaces")
             job, thinking, has_tools = self._prepare(chat, namespaces, deadline)
             job.response_store = store

@@ -251,7 +251,7 @@ class NativeBackendContractTests(unittest.TestCase):
     def test_http_fields_reach_native_generation_request(self):
         transport, runtime = self.make_transport()
         app = request_frontend.Frontend(
-            FakeTokenizer(), transport, "test-model", 128, 32, 10, 2
+            FakeTokenizer(), transport, "test-model", 128, 32, 10, 2, vision=True
         )
         job, _thinking, _tools = app.prepare(
             {

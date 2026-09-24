@@ -529,7 +529,8 @@ class LeadingSystemMergeTests(unittest.TestCase):
                 {"role": "user", "content": "Ask"},
                 {"role": "developer", "content": "Later"},
                 {"role": "system", "content": "Later still"},
-            ]
+            ],
+            vision=True,
         )
         self.assertEqual(
             merged,
@@ -545,7 +546,8 @@ class LeadingSystemMergeTests(unittest.TestCase):
                 [
                     {"role": "system", "content": "  Only  "},
                     {"role": "user", "content": "x"},
-                ]
+                ],
+                vision=True,
             )[0],
             {"role": "system", "content": "  Only  "},
         )
@@ -573,7 +575,7 @@ class LeadingSystemMergeTests(unittest.TestCase):
         for messages in (responses, anthropic):
             with self.subTest(messages=messages):
                 self.assertEqual(
-                    api_shapes.normalize_messages(messages),
+                    api_shapes.normalize_messages(messages, vision=True),
                     [
                         {"role": "system", "content": "Base\n\nDeveloper"},
                         {"role": "user", "content": "Ask"},

@@ -30,6 +30,7 @@ class PdfProtocolTests(unittest.TestCase):
                 }
             ],
             **kwargs,
+            vision=True,
         )
 
     def test_protocols_share_rendered_pages_and_preserve_order(self):
@@ -50,7 +51,9 @@ class PdfProtocolTests(unittest.TestCase):
                 ],
             }
         )
-        actual = api_shapes.normalize_messages(response["messages"])[0]["content"]
+        actual = api_shapes.normalize_messages(response["messages"], vision=True)[0][
+            "content"
+        ]
         self.assertEqual(
             actual,
             [
@@ -257,7 +260,7 @@ class PdfProtocolTests(unittest.TestCase):
                     ),
                     self.assertRaisesRegex(APIError, "request size limit"),
                 ):
-                    api_shapes.normalize_messages(messages)
+                    api_shapes.normalize_messages(messages, vision=True)
 
     def test_deadline_applies_even_to_cached_pdf(self):
         self.chat()
@@ -285,7 +288,8 @@ class PdfProtocolTests(unittest.TestCase):
             for file in values:
                 with self.subTest(file=file), self.assertRaises(APIError):
                     api_shapes.normalize_messages(
-                        [{"role": "user", "content": [{"type": "file", "file": file}]}]
+                        [{"role": "user", "content": [{"type": "file", "file": file}]}],
+                        vision=True,
                     )
 
     def test_input_bound_checked_before_decode(self):

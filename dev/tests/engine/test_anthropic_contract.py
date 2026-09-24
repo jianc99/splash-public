@@ -5,7 +5,12 @@ import unittest
 from dev.tests import test_server
 from dev.tests.engine.test_documents import document_block
 from dev.tests.test_server import FakeConstraintFactory, FakeRuntime, Harness, Plan
-from server.api_shapes import anthropic_to_chat_body, anthropic_to_chat_prompt
+from server import documents
+from server.api_shapes import (
+    anthropic_to_chat_body,
+    anthropic_to_chat_prompt,
+    normalize_messages,
+)
 from server.errors import APIError
 
 SCHEMA = {
@@ -368,7 +373,22 @@ class AnthropicHTTPContractTest(unittest.TestCase):
             with self.subTest(tool_result=len(messages) > 1):
                 body = request_body(messages=messages)
                 translated = anthropic_to_chat_body(body)
-                parts = translated["messages"][-1]["content"]
+                # Conversion leaves the PDF to request preparation.
+                self.assertEqual(
+                    translated["messages"][-1]["content"],
+                    [
+                        {
+                            "type": "file",
+                            "file": {
+                                "file_data": documents.PDF_DATA_URL_PREFIX
+                                + document["source"]["data"]
+                            },
+                        }
+                    ],
+                )
+                parts = normalize_messages(translated["messages"], vision=True)[-1][
+                    "content"
+                ]
                 self.assertIn("ALPHA 42", parts[0]["text"])
                 self.assertEqual(parts[1]["type"], "image_url")
                 status, _, payload = harness.request(

@@ -520,10 +520,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             if count_tokens:
                 tokens = self.app.count_tokens(
                     anthropic_to_chat_prompt(
-                        body,
-                        deadline=deadline,
-                        thinking_resolver=self.app.thinking_codec.decode,
-                        vision=self.app.vision,
+                        body, thinking_resolver=self.app.thinking_codec.decode
                     ),
                     deadline=deadline,
                 )
@@ -556,10 +553,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             if anthropic:
                 job, thinking, has_tools = self.app.prepare(
                     anthropic_to_chat_body(
-                        body,
-                        deadline=deadline,
-                        thinking_resolver=self.app.thinking_codec.decode,
-                        vision=self.app.vision,
+                        body, thinking_resolver=self.app.thinking_codec.decode
                     ),
                     deadline=deadline,
                     clamp_output_budget=True,

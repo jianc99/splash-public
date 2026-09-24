@@ -339,7 +339,7 @@ class ProtocolRecoveryTests(unittest.TestCase):
             {"role": "tool", "tool_call_id": "interrupted", "content": "interrupted"},
         ]
         original = copy.deepcopy(source)
-        normalized = normalize_messages(source)
+        normalized = normalize_messages(source, vision=True)
         projected = template_messages(normalized)
         self.assertEqual(source, original)
         self.assertEqual(

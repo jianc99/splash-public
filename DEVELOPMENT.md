@@ -202,10 +202,13 @@ table as F32, all of them BF16-exact, and prepares byte-identical to the packed
 file. Quantized MLX towers, deepstack projectors and mmproj tensors the tower does
 not use are rejected. `--language-only` removes vision weights from startup and
 memory accounting. The native Ready event announces vision only when the model
-loaded it. Without it, image and PDF parts fail with a 400 when their messages are
-converted, before decoding or rendering; `/status` and `/v1/models` report
-`vision: false`, and the launchers configure OpenCode and Hermes without
-attachments.
+loaded it. Without it, image and PDF input fails with a 400 naming the modality.
+Every API shape converts its media to image and file parts, and message
+normalization, the one place that accepts or rejects them, checks before any
+image is decoded or PDF rendered, in user turns, tool results and stored
+Responses history alike. `/status` and `/v1/models` report `vision: false` and
+`input_modalities: ["text"]`, and the launchers configure OpenCode and Hermes
+without attachments.
 
 ### Draft assets
 

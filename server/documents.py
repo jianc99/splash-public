@@ -26,6 +26,7 @@ MAX_TEXT_CHARACTERS = 1_000_000
 MAX_RENDERED_BYTES = 32 * 1024 * 1024
 CACHE_BYTES = 64 * 1024 * 1024
 CACHE_ENTRIES = 16
+PDF_DATA_URL_PREFIX = "data:application/pdf;base64,"
 
 
 @dataclass(slots=True)
@@ -213,10 +214,12 @@ def _pages(encoded, budget):
         _pdf_lock.release()
 
 
-def document_content(block, *, budget=None):
-    """Translate an inline PDF into canonical text/image parts, preserving pages."""
-    if budget is None:
-        budget = DocumentBudget()
+def document_parts(block):
+    """An Anthropic PDF document block as canonical text and file parts.
+
+    Only the block is checked here. Request preparation renders the file with
+    the request's shared document budget, like every other PDF, or rejects it
+    when the model serves without vision."""
     source = block.get("source")
     if (
         not isinstance(source, dict)
@@ -224,7 +227,6 @@ def document_content(block, *, budget=None):
         or source.get("media_type") != "application/pdf"
     ):
         raise APIError(400, "documents require a base64 application/pdf source")
-    encoded = source.get("data")
     citations = block.get("citations")
     if citations is not None and (
         not isinstance(citations, dict) or citations.get("enabled", False) is not False
@@ -236,9 +238,25 @@ def document_content(block, *, budget=None):
         if value is not None:
             if not isinstance(value, str):
                 raise APIError(400, f"document {field} must be a string")
-            budget.charge((len(value) + 1) * 4)
             parts.append({"type": "text", "text": value + "\n"})
-    parts.extend(pdf_content(encoded, budget=budget))
+    encoded = source.get("data")
+    if not isinstance(encoded, str):
+        raise APIError(400, "PDF data must be a base64 string")
+    parts.append({"type": "file", "file": {"file_data": PDF_DATA_URL_PREFIX + encoded}})
+    return parts
+
+
+def document_content(block, *, budget=None):
+    """Render an Anthropic PDF document block as canonical text/image parts."""
+    if budget is None:
+        budget = DocumentBudget()
+    parts = []
+    for part in document_parts(block):
+        if part["type"] == "file":
+            parts.extend(file_content(part["file"], budget=budget))
+        else:
+            budget.charge(len(part["text"]) * 4)
+            parts.append(part)
     return parts
 
 
@@ -272,8 +290,7 @@ def file_content(file, *, budget):
     if not isinstance(data, str):
         raise APIError(400, "file_data must contain a base64 PDF")
     if data.startswith("data:"):
-        prefix = "data:application/pdf;base64,"
-        if not data.startswith(prefix):
+        if not data.startswith(PDF_DATA_URL_PREFIX):
             raise APIError(400, "only application/pdf file data is supported")
-        data = data[len(prefix) :]
+        data = data[len(PDF_DATA_URL_PREFIX) :]
     return pdf_content(data, budget=budget)

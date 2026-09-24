@@ -64,9 +64,9 @@ class RequestContractTests(unittest.TestCase):
             }
         ]
         self.assertEqual(
-            normalize_messages([{"role": "user", "content": "Hi"}, *messages])[1][
-                "tool_calls"
-            ][0]["id"],
+            normalize_messages(
+                [{"role": "user", "content": "Hi"}, *messages], vision=True
+            )[1]["tool_calls"][0]["id"],
             "call_42",
         )
 
