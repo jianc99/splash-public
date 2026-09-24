@@ -7,7 +7,6 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
-#include <optional>
 
 namespace splash::ops {
 
@@ -53,9 +52,8 @@ struct BlockMoeWeights final {
   BlockExpertProjection down;
 };
 
-// All weights for one sparse MoE block. The model package owns the buffers;
-// this value only exposes semantic projections to the operator. The shared
-// expert is a one-expert slab.
+// The affine weights of a sparse MoE block: Q8 router and shared-expert
+// gate, and Q4 expert slabs. The shared expert is a one-expert slab.
 struct AffineMoeWeights final {
   Q8Projection router;
   ExpertProjection expertGate;
@@ -67,24 +65,9 @@ struct AffineMoeWeights final {
   Q8Projection sharedExpertGate;
 };
 
-class MoeWeights final {
-public:
-  MoeWeights() = default;
-  MoeWeights(AffineMoeWeights weights) : storage_(std::move(weights)) {}
-  MoeWeights(BlockMoeWeights weights) : storage_(std::move(weights)) {}
-  [[nodiscard]] WeightLayout layout() const noexcept {
-    return std::holds_alternative<AffineMoeWeights>(storage_)
-        ? WeightLayout::Affine64 : WeightLayout::Block32;
-  }
-  [[nodiscard]] AffineMoeWeights &affine() { return std::get<AffineMoeWeights>(storage_); }
-  [[nodiscard]] const AffineMoeWeights &affine() const { return std::get<AffineMoeWeights>(storage_); }
-  [[nodiscard]] const BlockMoeWeights *blocks() const {
-    return std::get_if<BlockMoeWeights>(&storage_);
-  }
-
-private:
-  std::variant<AffineMoeWeights, BlockMoeWeights> storage_;
-};
+// All weights for one sparse MoE block. The model package owns the buffers;
+// this value only exposes semantic projections to the operator.
+using MoeWeights = LayoutWeights<AffineMoeWeights, BlockMoeWeights>;
 
 // Grouped-row scratch. Routes are sorted by expert into tiles of tileRows
 // rows; every routed expert may leave one partially filled tile and no tile

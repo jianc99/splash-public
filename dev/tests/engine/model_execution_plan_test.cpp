@@ -34,7 +34,7 @@ model::ModelPackage package() {
     draft.targetHiddenSize = target.layout.capturedHiddenSize();
   }
   const auto projection = [](uint32_t n, uint32_t k) {
-    return ops::Projection({}, {}, {}, n, k);
+    return ops::Projection(n, k, ops::AffineWeights{});
   };
   const auto &layout = target.layout;
   target.logitsProjection = projection(layout.vocabularySize, layout.hiddenSize);

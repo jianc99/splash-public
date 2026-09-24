@@ -685,15 +685,16 @@ int timing(MetalBackend &backend, uint32_t rounds) {
     }
     return splash::ops::Q8Projection{weights, scales, biases, 256, H};
   };
-  MoeWeights affine;
-  affine.affine().router = affineRouter(true);
-  affine.affine().sharedExpertGate = affineRouter(false);
-  affine.affine().expertGate = affineExperts(E, I, H);
-  affine.affine().expertUp = affineExperts(E, I, H);
-  affine.affine().expertDown = affineExperts(E, H, I);
-  affine.affine().sharedGate = affineExperts(1, I, H);
-  affine.affine().sharedUp = affineExperts(1, I, H);
-  affine.affine().sharedDown = affineExperts(1, H, I);
+  MoeWeights affine = splash::ops::AffineMoeWeights{
+      .router = affineRouter(true),
+      .expertGate = affineExperts(E, I, H),
+      .expertUp = affineExperts(E, I, H),
+      .expertDown = affineExperts(E, H, I),
+      .sharedGate = affineExperts(1, I, H),
+      .sharedUp = affineExperts(1, I, H),
+      .sharedDown = affineExperts(1, H, I),
+      .sharedExpertGate = affineRouter(false),
+  };
   // GGUF: the same routing in an F32 router, experts in the 35B UD-Q4_K_M formats.
   const auto planes = [&](Fmt f, uint32_t rows, uint32_t k) {
     std::uniform_real_distribution<float> d(0.0005f, 0.004f);

@@ -67,24 +67,25 @@ void validate(const MoeWeights &weights, MoeShape shape) {
   const uint32_t hidden = shape.hiddenSize;
   const uint32_t intermediate = shape.expertIntermediateSize;
   if (shape.weightLayout == WeightLayout::Block32) {
-    const BlockMoeWeights *gguf = weights.blocks();
-    if (!shape.valid() || !gguf ||
-        !matches(gguf->router, shape.experts, hidden, true) ||
-        !matches(gguf->sharedExpertGate, 1, hidden, true) ||
-        !matches(gguf->gate, shape.experts, intermediate, hidden) ||
-        !matches(gguf->up, shape.experts, intermediate, hidden) ||
-        !matches(gguf->down, shape.experts, hidden, intermediate))
+    const BlockMoeWeights &blocks = weights.blocks();
+    if (!shape.valid() ||
+        !matches(blocks.router, shape.experts, hidden, true) ||
+        !matches(blocks.sharedExpertGate, 1, hidden, true) ||
+        !matches(blocks.gate, shape.experts, intermediate, hidden) ||
+        !matches(blocks.up, shape.experts, intermediate, hidden) ||
+        !matches(blocks.down, shape.experts, hidden, intermediate))
       throw std::invalid_argument("GGUF MoE weights do not match execution shape");
     return;
   }
-  if (!shape.valid() || weights.blocks() || !matches(weights.affine().router, 256, hidden) ||
-      !matches(weights.affine().sharedExpertGate, 256, hidden) ||
-      !matches(weights.affine().expertGate, shape.experts, intermediate, hidden) ||
-      !matches(weights.affine().expertUp, shape.experts, intermediate, hidden) ||
-      !matches(weights.affine().expertDown, shape.experts, hidden, intermediate) ||
-      !matches(weights.affine().sharedGate, 1, intermediate, hidden) ||
-      !matches(weights.affine().sharedUp, 1, intermediate, hidden) ||
-      !matches(weights.affine().sharedDown, 1, hidden, intermediate)) {
+  const AffineMoeWeights &affine = weights.affine();
+  if (!shape.valid() || !matches(affine.router, 256, hidden) ||
+      !matches(affine.sharedExpertGate, 256, hidden) ||
+      !matches(affine.expertGate, shape.experts, intermediate, hidden) ||
+      !matches(affine.expertUp, shape.experts, intermediate, hidden) ||
+      !matches(affine.expertDown, shape.experts, hidden, intermediate) ||
+      !matches(affine.sharedGate, 1, intermediate, hidden) ||
+      !matches(affine.sharedUp, 1, intermediate, hidden) ||
+      !matches(affine.sharedDown, 1, hidden, intermediate)) {
     throw std::invalid_argument("MoE weights do not match execution shape");
   }
 }
@@ -293,29 +294,30 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
   }
   const MoeRouteParams routeParams{rows, shape.hiddenSize, shape.experts,
                                    shape.expertsPerToken};
-  const BlockMoeWeights *gguf = weights.blocks();
-  if (gguf) {
+  const bool block = weights.layout() == WeightLayout::Block32;
+  if (block) {
     // fp32 scores of the F32 router in rows of 256, as the select kernel reads.
-    addGgufFloat(graph, buffers.input, gguf->router, buffers.groupedInput, rows,
+    addGgufFloat(graph, buffers.input, weights.blocks().router, buffers.groupedInput, rows,
                  256, 0, FloatOutput::Float32, plan.config().ggufRouterTile);
     graph.add("moe_route_select_f32",
               {buffers.groupedInput, buffers.input,
-               gguf->sharedExpertGate.plane0, buffers.selectedExperts,
+               weights.blocks().sharedExpertGate.plane0, buffers.selectedExperts,
                buffers.routingWeights},
               routeParams, {rows, 1, 1});
   } else {
+    const AffineMoeWeights &affine = weights.affine();
     const MoeRouteTile route = moeRouteTile(rows, plan.config().routeWideRows);
     graph.add(route.rows == 8 ? "moe_route_scores_q8_m8"
                               : "moe_route_scores_q8_m32",
-              {buffers.input, weights.affine().router.weights, weights.affine().router.scales,
-               weights.affine().router.biases, buffers.groupedInput},
+              {buffers.input, affine.router.weights, affine.router.scales,
+               affine.router.biases, buffers.groupedInput},
               routeParams,
               {(rows + route.rows - 1) / route.rows, 256 / route.experts, 1});
     graph.add("moe_route_select_q8",
               {buffers.groupedInput, buffers.input,
-               weights.affine().sharedExpertGate.weights,
-               weights.affine().sharedExpertGate.scales,
-               weights.affine().sharedExpertGate.biases, buffers.selectedExperts,
+               affine.sharedExpertGate.weights,
+               affine.sharedExpertGate.scales,
+               affine.sharedExpertGate.biases, buffers.selectedExperts,
                buffers.routingWeights},
               routeParams, {rows, 1, 1});
   }
@@ -336,8 +338,8 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
               {buffers.input, buffers.groupedRoutes, buffers.tileCount,
                buffers.groupedInput},
               gather, {tiles, shape.hiddenSize / 256, 1});
-  if (gguf)
-    addGgufExperts(graph, buffers, *gguf, plan);
+  if (block)
+    addGgufExperts(graph, buffers, weights.blocks(), plan);
   else
     addAffineExperts(graph, buffers, weights.affine(), plan);
   graph.add("moe_combine",

@@ -506,7 +506,7 @@ void testGgufImageLayout(MetalBackend &backend, const std::filesystem::path &roo
         WeightFile file = mapped(projection);
         const auto read = splash::model::readGgufProjection(file, rows, columns, "projection");
         file.finish();
-        require(read.outputSize == rows && read.inputSize == columns && read.segments().size() == 1,
+        require(read.outputSize == rows && read.inputSize == columns && read.blocks().segments.size() == 1,
                 "GGUF projection lost its layout sizes");
     }
     for (const auto [output, input] : {std::pair{2 * rows, columns}, std::pair{rows, 2 * columns}}) {

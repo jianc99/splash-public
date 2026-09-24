@@ -719,11 +719,11 @@ void checkDenseTarget(splash::metal::MetalBackend &backend) {
   // The segments of a block projection of `n` x `k` by output width.
   const auto blocks = [](const ops::Projection &p, uint32_t n, uint32_t k, std::vector<uint32_t> widths) {
     if (p.layout() != ops::WeightLayout::Block32 || p.outputSize != n || p.inputSize != k ||
-        p.segments().size() != widths.size())
+        p.blocks().segments.size() != widths.size())
       return false;
     uint32_t offset = 0;
     for (size_t i = 0; i < widths.size(); ++i) {
-      const ops::QuantizedSegment &s = p.segments()[i];
+      const ops::QuantizedSegment &s = p.blocks().segments[i];
       if (s.columnOffset != offset || s.outputSize != widths[i] || s.inputSize != k) return false;
       offset += widths[i];
     }
@@ -735,8 +735,9 @@ void checkDenseTarget(splash::metal::MetalBackend &backend) {
         model::loadQwen3_8Weights(backend, directory, layout, model::TargetSource::Gguf);
     read = weights.layers.size() == layout.layers && weights.finalNorm.float32 &&
            blocks(weights.logitsProjection, layout.vocabularySize, hidden, {layout.vocabularySize}) &&
-           std::string_view(weights.logitsProjection.segments().front().format) == "q6k" &&
-           !weights.tokenEmbedding.isAffine() && weights.tokenEmbedding.outputSize == layout.vocabularySize &&
+           std::string_view(weights.logitsProjection.blocks().segments.front().format) == "q6k" &&
+           weights.tokenEmbedding.layout() == ops::WeightLayout::Block32 &&
+           weights.tokenEmbedding.outputSize == layout.vocabularySize &&
            weights.tokenEmbedding.inputSize == hidden && model::qwenTargetGeometry(weights).valid();
     for (const auto &layer : weights.layers) {
       read = read && layer.inputNorm.float32 && layer.postAttentionNorm.float32 &&

@@ -250,14 +250,12 @@ ops::Projection readProjection(WeightFile &file,
     const uint64_t parameterBytes = elements / 32;
     metal::MetalBuffer packed =
         file.section(q4PackedBytes(outputSize, inputSize), label);
-    ops::Projection result;
-    result.affine().weights = backend.view(packed, 0, weightBytes);
-    result.affine().scales = backend.view(packed, weightBytes, parameterBytes);
-    result.affine().biases =
-        backend.view(packed, weightBytes + parameterBytes, parameterBytes);
-    result.outputSize = outputSize;
-    result.inputSize = inputSize;
-    return result;
+    return {outputSize, inputSize,
+            ops::AffineWeights{
+                backend.view(packed, 0, weightBytes),
+                backend.view(packed, weightBytes, parameterBytes),
+                backend.view(packed, weightBytes + parameterBytes, parameterBytes),
+            }};
 }
 
 ops::EmbeddingWeights readAffineEmbedding(WeightFile &file,
@@ -266,13 +264,13 @@ ops::EmbeddingWeights readAffineEmbedding(WeightFile &file,
                                              std::string_view label) {
     const uint64_t elements = q4Elements(outputSize, inputSize);
     const std::string prefix(label);
-    ops::EmbeddingWeights result;
-    result.affine().weights = file.section(elements / 2, prefix + "-weights");
-    result.affine().scales = file.section(elements / 32, prefix + "-scales");
-    result.affine().biases = file.section(elements / 32, prefix + "-biases");
-    result.outputSize = outputSize;
-    result.inputSize = inputSize;
-    return result;
+    // Braced initializers read the sections in file order.
+    return {outputSize, inputSize,
+            ops::AffineWeights{
+                file.section(elements / 2, prefix + "-weights"),
+                file.section(elements / 32, prefix + "-scales"),
+                file.section(elements / 32, prefix + "-biases"),
+            }};
 }
 
 ops::NormWeights readNorm(WeightFile &file, uint32_t width, bool float32,
@@ -365,7 +363,7 @@ ops::EmbeddingWeights readGgufEmbedding(WeightFile &file, uint32_t outputSize, u
     ops::QuantizedSegment s;
     s.plane0 = file.section(d.plane0Bytes, std::string(label) + "-native");
     s.type = d.type; s.outputSize = d.outputSize; s.inputSize = d.inputSize;
-    return ops::EmbeddingWeights(std::move(s));
+    return {outputSize, inputSize, std::move(s)};
 }
 
 ops::Q8Projection readQ8Projection(WeightFile &file,

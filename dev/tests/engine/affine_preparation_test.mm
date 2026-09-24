@@ -100,7 +100,7 @@ int main(int argc, char **argv) {
       };
       bool read = weights.layers.size() == layout.layers && !weights.finalNorm.float32 &&
                   affine(weights.logitsProjection, layout.vocabularySize, layout.hiddenSize) &&
-                  weights.tokenEmbedding.isAffine();
+                  weights.tokenEmbedding.layout() == ops::WeightLayout::Affine64;
       for (const auto &layer : weights.layers) {
         read = read && !layer.inputNorm.float32 && !layer.postAttentionNorm.float32 &&
                affine(layer.gateProjection, layout.intermediateSize, layout.hiddenSize) &&

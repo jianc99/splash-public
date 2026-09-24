@@ -32,6 +32,7 @@ using splash::metal::CommandGraph;
 using splash::metal::MetalBackend;
 using splash::metal::MetalBuffer;
 using splash::model::q4PackedBytes;
+using splash::ops::AffineMoeWeights;
 using splash::ops::ExpertProjection;
 using splash::ops::kMoeRouteWideRows;
 using splash::ops::MoE;
@@ -231,8 +232,9 @@ struct Fixture final {
 Fixture makeFixture(MetalBackend &backend) {
   Random random(0x0e5);
   Fixture fixture;
-  fixture.weights.affine().router = fixtureRouter(backend, false);
-  fixture.weights.affine().sharedExpertGate = fixtureRouter(backend, true);
+  AffineMoeWeights weights;
+  weights.router = fixtureRouter(backend, false);
+  weights.sharedExpertGate = fixtureRouter(backend, true);
   fixture.gate =
       randomExperts(backend, random, kExperts, kIntermediate, kHidden, "gate");
   fixture.up =
@@ -245,12 +247,13 @@ Fixture makeFixture(MetalBackend &backend) {
       randomExperts(backend, random, 1, kIntermediate, kHidden, "shared-up");
   fixture.sharedDown =
       randomExperts(backend, random, 1, kHidden, kIntermediate, "shared-down");
-  fixture.weights.affine().expertGate = fixture.gate.projection;
-  fixture.weights.affine().expertUp = fixture.up.projection;
-  fixture.weights.affine().expertDown = fixture.down.projection;
-  fixture.weights.affine().sharedGate = fixture.sharedGate.projection;
-  fixture.weights.affine().sharedUp = fixture.sharedUp.projection;
-  fixture.weights.affine().sharedDown = fixture.sharedDown.projection;
+  weights.expertGate = fixture.gate.projection;
+  weights.expertUp = fixture.up.projection;
+  weights.expertDown = fixture.down.projection;
+  weights.sharedGate = fixture.sharedGate.projection;
+  weights.sharedUp = fixture.sharedUp.projection;
+  weights.sharedDown = fixture.sharedDown.projection;
+  fixture.weights = weights;
 
   const uint64_t rowElements = uint64_t{kMaximumRows} * kHidden;
   MoeBuffers &b = fixture.buffers;
@@ -679,8 +682,8 @@ void bufferBounds(MetalBackend &backend, Fixture &fixture) {
     for (auto projection : {&splash::ops::AffineMoeWeights::router, &splash::ops::AffineMoeWeights::sharedExpertGate}) {
       for (auto field : {&Q8Projection::weights, &Q8Projection::scales,
                          &Q8Projection::biases}) {
-        MoeWeights shortWeights = fixture.weights;
-        auto &buffer = (shortWeights.affine().*projection).*field;
+        AffineMoeWeights shortWeights = fixture.weights.affine();
+        auto &buffer = (shortWeights.*projection).*field;
         buffer = backend.view(buffer, 0, buffer.sizeBytes() - 1);
         rejectWeights(shortWeights, "undersized Q8 weight view");
       }
@@ -690,8 +693,8 @@ void bufferBounds(MetalBackend &backend, Fixture &fixture) {
                         &splash::ops::AffineMoeWeights::sharedUp, &splash::ops::AffineMoeWeights::sharedDown}) {
       const auto &source = fixture.weights.affine().*member;
       const uint64_t payload = q4PackedBytes(source.outputSize, source.inputSize);
-      MoeWeights changed = fixture.weights;
-      auto &projection = changed.affine().*member;
+      AffineMoeWeights changed = fixture.weights.affine();
+      auto &projection = changed.*member;
       projection.packed = backend.view(source.packed, 0, payload - 1);
       rejectWeights(changed, "undersized expert payload");
       projection.packed = source.packed;

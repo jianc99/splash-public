@@ -89,9 +89,10 @@ uint16_t bf16(float value) {
 // modifying them; it owns only activation and comparison scratch.
 Projection projection(metal::MetalBackend &backend, LinearMatrix matrix, uint32_t seed = 29) {
   const uint64_t parameters = uint64_t{matrix.outputSize} * (matrix.inputSize / 64);
-  Projection result{backend.allocateBuffer(parameters * 32),
-      backend.allocateBuffer(parameters * 2), backend.allocateBuffer(parameters * 2),
-      matrix.outputSize, matrix.inputSize};
+  Projection result(matrix.outputSize, matrix.inputSize,
+                    AffineWeights{backend.allocateBuffer(parameters * 32),
+                                  backend.allocateBuffer(parameters * 2),
+                                  backend.allocateBuffer(parameters * 2)});
   auto *weights = static_cast<uint8_t *>(result.affine().weights.contents());
   auto *scales = static_cast<uint16_t *>(result.affine().scales.contents());
   auto *biases = static_cast<uint16_t *>(result.affine().biases.contents());

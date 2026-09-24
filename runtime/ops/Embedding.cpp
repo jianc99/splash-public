@@ -31,22 +31,22 @@ void Embedding::add(metal::CommandGraph &graph, metal::MetalBuffer tokens,
   if (tokens.sizeBytes() < uint64_t{rows} * sizeof(uint32_t) ||
       output.sizeBytes() < uint64_t{rows} * table.inputSize * sizeof(uint16_t))
     throw std::invalid_argument("embedding buffers are smaller than the gathered rows");
-  if (!table.isAffine()) {
+  if (table.layout() == WeightLayout::Block32) {
     const GgufEmbedParams params{rows, table.outputSize, table.inputSize};
-    const uint32_t type = table.nativeRows().type;
+    const uint32_t type = table.blocks().type;
     const char *kernel = type == 12 ? "gguf_embed_q4k"
                          : type == 14 ? "gguf_embed_q6k"
                          : type == 8 ? "gguf_embed_q80" : nullptr;
     if (!kernel) throw std::invalid_argument("unsupported GGUF embedding type");
-    graph.add(kernel, {std::move(tokens), table.nativeRows().plane0, std::move(output)},
+    graph.add(kernel, {std::move(tokens), table.blocks().plane0, std::move(output)},
               params, {(rows * table.inputSize + 255) / 256, 1, 1}, {256, 1, 1});
     return;
   }
   const uint32_t hiddenGroups = (table.inputSize + 127) / 128;
   const Q4EmbeddingParams params{rows, table.outputSize};
+  const AffineWeights &affine = table.affine();
   graph.add(embeddingPipeline(table.inputSize),
-            {std::move(tokens), table.affine().weights, table.affine().scales, table.affine().biases,
-             std::move(output)},
+            {std::move(tokens), affine.weights, affine.scales, affine.biases, std::move(output)},
             params, {hiddenGroups, 1, 1});
 }
 

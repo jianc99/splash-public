@@ -34,7 +34,7 @@ template <class Function> void rejects(Function function) {
 // handles make any accidental allocation, weight access or dispatch fail;
 // these tests never construct a MetalBackend or load a model package.
 Projection projection(uint32_t output, uint32_t input) {
-  return {{}, {}, {}, output, input};
+  return {output, input, AffineWeights{}};
 }
 
 template <class Weights, class Layout> Weights targetWeights(Layout layout) {
@@ -327,11 +327,10 @@ void metadataViews(const char *metallib) {
                            8, LinearPhase::Decode, LinearEpilogue::GateUp};
   auto view = [&](uint32_t index, bool gate) {
     const uint64_t offset = uint64_t{index * 6 + (gate ? 3U : 0U)} * 128;
-    return Projection{
-        backend.view(backing, offset, 128),
-        backend.view(backing, offset + 128, 128),
-        backend.view(backing, offset + 256, 128),
-        key.matrix.outputSize, key.matrix.inputSize};
+    return Projection(key.matrix.outputSize, key.matrix.inputSize,
+                      AffineWeights{backend.view(backing, offset, 128),
+                                    backend.view(backing, offset + 128, 128),
+                                    backend.view(backing, offset + 256, 128)});
   };
   enum class Variation { Distinct, GateOnly, ScaleOnly, Tied };
   for (const auto variation : {Variation::Distinct, Variation::GateOnly,
@@ -344,8 +343,11 @@ void metadataViews(const char *metallib) {
       layer.upProjection = view(variation == Variation::Distinct ? representative : 0, false);
       layer.gateProjection = view(variation == Variation::Distinct ||
                                      variation == Variation::GateOnly ? representative : 0, true);
-      if (variation == Variation::ScaleOnly)
-        layer.upProjection.affine().scales = view(representative, false).affine().scales;
+      if (variation == Variation::ScaleOnly) {
+        AffineWeights planes = layer.upProjection.affine();
+        planes.scales = view(representative, false).affine().scales;
+        layer.upProjection = Projection(key.matrix.outputSize, key.matrix.inputSize, planes);
+      }
     }
     // Target and draft execute the same GateUp shape in this pair. They also
     // share a representative here, so this must not add another measurement.
@@ -403,9 +405,9 @@ void metadataViews(const char *metallib) {
           down ? layout.hiddenSize : layout.expertIntermediateSize,
           down ? layout.expertIntermediateSize : layout.hiddenSize, 16'384};
     };
-    return MoeWeights(AffineMoeWeights{router, expert(6, layout.experts, false),
+    return AffineMoeWeights{router, expert(6, layout.experts, false),
         expert(7, layout.experts, false), expert(8, layout.experts, true),
-        expert(9, 1, false), expert(10, 1, false), expert(11, 1, true), sharedRouter});
+        expert(9, 1, false), expert(10, 1, false), expert(11, 1, true), sharedRouter};
   };
   enum class MoeVariation { Distinct, RouterOnly, SharedOnly, StrideOnly, Tied };
   for (const auto variation : {MoeVariation::Distinct, MoeVariation::RouterOnly,
@@ -413,14 +415,14 @@ void metadataViews(const char *metallib) {
                                 MoeVariation::Tied}) {
     for (uint32_t index = 0; index < sparse.layers.size(); ++index) {
       const uint32_t representative = index / 2;
-      auto &weights = sparse.layers[index].ffn;
-      weights = moeView(variation == MoeVariation::Distinct ? representative : 0);
+      AffineMoeWeights weights = moeView(variation == MoeVariation::Distinct ? representative : 0);
       if (variation == MoeVariation::RouterOnly)
-        weights.affine().router.scales = moeView(representative).affine().router.scales;
+        weights.router.scales = moeView(representative).router.scales;
       if (variation == MoeVariation::SharedOnly)
-        weights.affine().sharedDown.packed = moeView(representative).affine().sharedDown.packed;
+        weights.sharedDown.packed = moeView(representative).sharedDown.packed;
       if (variation == MoeVariation::StrideOnly)
-        weights.affine().expertGate.expertStrideBytes += representative * 16'384;
+        weights.expertGate.expertStrideBytes += representative * 16'384;
+      sparse.layers[index].ffn = weights;
     }
     const auto bytes = backend.memoryStats().allocatedBytes;
     const auto inventory = collectTuningWorkloads(package, std::array{32U}, std::array{1U});

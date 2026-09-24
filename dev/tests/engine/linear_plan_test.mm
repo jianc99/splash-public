@@ -1127,8 +1127,9 @@ std::array<uint64_t, 3> projectionFingerprint(const Projection &projection) {
 
 Projection projection(metal::MetalBackend &backend, LinearMatrix matrix, uint32_t seed) {
   const uint64_t parameters = uint64_t{matrix.outputSize} * (matrix.inputSize / 64);
-  Projection p{allocate(backend, parameters * 32), allocate(backend, parameters * 2),
-                  allocate(backend, parameters * 2), matrix.outputSize, matrix.inputSize};
+  Projection p(matrix.outputSize, matrix.inputSize,
+               AffineWeights{allocate(backend, parameters * 32), allocate(backend, parameters * 2),
+                             allocate(backend, parameters * 2)});
   auto *weights = static_cast<uint8_t *>(p.affine().weights.contents());
   auto *scales = static_cast<uint16_t *>(p.affine().scales.contents());
   auto *biases = static_cast<uint16_t *>(p.affine().biases.contents());
@@ -1253,8 +1254,9 @@ void bufferContracts(metal::MetalBackend &backend, Linear &linear,
     }
   }
   for (auto member : {&AffineWeights::weights, &AffineWeights::scales, &AffineWeights::biases}) {
-    auto shortProjection = p;
-    shortProjection.affine().*member = backend.view(p.affine().*member, 0, (p.affine().*member).sizeBytes() - 1);
+    AffineWeights planes = p.affine();
+    planes.*member = backend.view(p.affine().*member, 0, (p.affine().*member).sizeBytes() - 1);
+    const Projection shortProjection(p.outputSize, p.inputSize, planes);
     metal::CommandGraph graph;
     rejects([&] { add(graph, buffers, shortProjection, gateUp ? &gate : nullptr); });
     require(graph.empty(), "invalid projection partially encoded a graph");

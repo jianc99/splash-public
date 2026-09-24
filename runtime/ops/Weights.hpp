@@ -50,59 +50,73 @@ struct QuantizedSegment final {
   [[nodiscard]] bool isFloat() const noexcept;
 };
 
-
 struct BlockWeights final {
   std::vector<QuantizedSegment> segments;
 };
 
-class Projection final {
+// Immutable weights in one of the two layouts: Affine holds the Affine64
+// form, Block the Block32 form, and layout() names the one held. Projections,
+// token tables and MoE blocks share this pattern; the accessor of the layout
+// not held throws std::bad_variant_access. A default value holds empty affine
+// weights, which a reader replaces.
+template <class Affine, class Block>
+class LayoutWeights {
 public:
-  Projection() = default;
-  Projection(metal::MetalBuffer weights, metal::MetalBuffer scales,
-             metal::MetalBuffer biases, uint32_t output, uint32_t input)
-      : outputSize(output), inputSize(input),
-        storage_(AffineWeights{std::move(weights), std::move(scales), std::move(biases)}) {}
-  // Every block projection holds at least one segment.
-  Projection(uint32_t output, uint32_t input, BlockWeights weights)
-      : outputSize(output), inputSize(input), storage_(std::move(weights)) {
-    if (segments().empty()) throw std::invalid_argument("block projection has no segments");
-  }
+  LayoutWeights() = default;
+  LayoutWeights(Affine weights) : storage_(std::move(weights)) {}
+  LayoutWeights(Block weights) : storage_(std::move(weights)) {}
 
   [[nodiscard]] WeightLayout layout() const noexcept {
-    return std::holds_alternative<AffineWeights>(storage_) ? WeightLayout::Affine64
-         : WeightLayout::Block32;
+    return std::visit([](const auto &weights) { return layoutOf(weights); }, storage_);
   }
+  [[nodiscard]] const Affine &affine() const { return std::get<Affine>(storage_); }
+  [[nodiscard]] const Block &blocks() const { return std::get<Block>(storage_); }
+
+private:
+  // One layout per alternative: an alternative without one does not compile.
+  static constexpr WeightLayout layoutOf(const Affine &) noexcept { return WeightLayout::Affine64; }
+  static constexpr WeightLayout layoutOf(const Block &) noexcept { return WeightLayout::Block32; }
+
+  std::variant<Affine, Block> storage_;
+};
+
+// A projection of outputSize x inputSize. A block projection holds at least
+// one segment; its segments tile the leading output columns (LinearGguf.cpp).
+class Projection final : public LayoutWeights<AffineWeights, BlockWeights> {
+public:
+  Projection() = default;
+  Projection(uint32_t output, uint32_t input, AffineWeights weights)
+      : LayoutWeights(std::move(weights)), outputSize(output), inputSize(input) {}
+  Projection(uint32_t output, uint32_t input, BlockWeights weights)
+      : LayoutWeights(std::move(weights)), outputSize(output), inputSize(input) {
+    if (blocks().segments.empty()) throw std::invalid_argument("block projection has no segments");
+  }
+
   [[nodiscard]] ProjectionShape shape() const noexcept {
     return {outputSize, inputSize, layout()};
   }
-  [[nodiscard]] AffineWeights &affine() { return std::get<AffineWeights>(storage_); }
-  [[nodiscard]] const AffineWeights &affine() const { return std::get<AffineWeights>(storage_); }
-  [[nodiscard]] const std::vector<QuantizedSegment> &segments() const {
-    return std::get<BlockWeights>(storage_).segments;
+
+  uint32_t outputSize = 0;
+  uint32_t inputSize = 0;
+};
+
+// A token table of outputSize rows of inputSize values, which Embedding
+// gathers: affine Q4 rows, or one segment of native GGUF rows (block_q4_K,
+// block_q6_K or block_q8_0). It is intentionally a separate type: no table
+// may be bound as a projection.
+class EmbeddingWeights final : public LayoutWeights<AffineWeights, QuantizedSegment> {
+public:
+  EmbeddingWeights() = default;
+  EmbeddingWeights(uint32_t output, uint32_t input, AffineWeights weights)
+      : LayoutWeights(std::move(weights)), outputSize(output), inputSize(input) {}
+  EmbeddingWeights(uint32_t output, uint32_t input, QuantizedSegment rows)
+      : LayoutWeights(std::move(rows)), outputSize(output), inputSize(input) {
+    if (blocks().outputSize != output || blocks().inputSize != input)
+      throw std::invalid_argument("native embedding rows do not match the table");
   }
 
   uint32_t outputSize = 0;
   uint32_t inputSize = 0;
-
-private:
-  std::variant<AffineWeights, BlockWeights> storage_;
-};
-
-// Gather consumes native rows. This is intentionally a separate type: neither
-// affine row tables nor GGUF blocks may be bound as a prepared projection.
-class EmbeddingWeights final {
-public:
-  EmbeddingWeights() = default;
-  explicit EmbeddingWeights(QuantizedSegment rows)
-      : outputSize(rows.outputSize), inputSize(rows.inputSize), storage_(std::move(rows)) {}
-  [[nodiscard]] bool isAffine() const noexcept { return std::holds_alternative<AffineWeights>(storage_); }
-  [[nodiscard]] AffineWeights &affine() { return std::get<AffineWeights>(storage_); }
-  [[nodiscard]] const AffineWeights &affine() const { return std::get<AffineWeights>(storage_); }
-  [[nodiscard]] const QuantizedSegment &nativeRows() const { return std::get<QuantizedSegment>(storage_); }
-  uint32_t outputSize = 0;
-  uint32_t inputSize = 0;
-private:
-  std::variant<AffineWeights, QuantizedSegment> storage_;
 };
 
 } // namespace splash::ops

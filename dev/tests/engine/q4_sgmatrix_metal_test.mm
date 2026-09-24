@@ -36,8 +36,9 @@ struct Guarded {
 uint32_t hash(uint32_t v) { v ^= v >> 16; v *= 0x7feb352d; v ^= v >> 15; return v * 0x846ca68b; }
 Projection weights(metal::MetalBackend &backend, LinearMatrix shape, uint32_t seed, bool zero) {
   const uint64_t params = uint64_t(shape.outputSize) * shape.inputSize / 64;
-  Projection p{backend.allocateBuffer(params * 32), backend.allocateBuffer(params * 2),
-                 backend.allocateBuffer(params * 2), shape.outputSize, shape.inputSize};
+  Projection p(shape.outputSize, shape.inputSize,
+               AffineWeights{backend.allocateBuffer(params * 32), backend.allocateBuffer(params * 2),
+                             backend.allocateBuffer(params * 2)});
   auto *q = static_cast<uint8_t *>(p.affine().weights.contents());
   auto *s = static_cast<uint16_t *>(p.affine().scales.contents());
   auto *b = static_cast<uint16_t *>(p.affine().biases.contents());
