@@ -591,7 +591,13 @@ class LauncherTests(unittest.TestCase):
                     {"maximum_context_tokens": 102400}
                     if self.path == "/status"
                     else {
-                        "data": [{"id": MODEL_ID, "owned_by": "splash", "vision": True}]
+                        "data": [
+                            {
+                                "id": MODEL_ID,
+                                "owned_by": "splash",
+                                "input_modalities": ["text", "image", "pdf"],
+                            }
+                        ]
                     }
                 )
                 body = json.dumps(payload).encode()

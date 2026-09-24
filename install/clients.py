@@ -146,17 +146,27 @@ def command(
     runtime_dir,
     environment=None,
     *,
+    input_modalities,
     client_args=(),
     client_version=None,
-    vision=True,
 ):
-    """Return argv and a private environment; never mutate the caller's env."""
+    """Return argv and a private environment; never mutate the caller's env.
+    input_modalities is what the served model accepts, as /v1/models
+    reports it."""
     if not isinstance(model, str) or not model:
         raise ClientError("The server did not report a model name")
     if type(context) is not int or context <= 0:
         raise ClientError("The server did not report a valid context limit")
-    if type(vision) is not bool:
-        raise ClientError("The server did not report whether the model has vision")
+    if (
+        not isinstance(input_modalities, list)
+        or "text" not in input_modalities
+        or not all(isinstance(m, str) for m in input_modalities)
+    ):
+        raise ClientError(
+            "The server did not report its input modalities; it predates this "
+            "launcher, so restart it with this version of Splash"
+        )
+    vision = "image" in input_modalities
     environment = dict(os.environ if environment is None else environment)
     endpoint = base_url.rstrip("/") + "/v1"
     api_key = environment.get("SPLASH_API_KEY") or "local"
@@ -230,12 +240,9 @@ def command(
                             "xhigh": {"reasoningEffort": "xhigh"},
                             **variants,
                         },
-                        # Images and PDFs both need the vision tower.
-                        "attachment": vision,
-                        "modalities": {
-                            "input": ["text", "image", "pdf"] if vision else ["text"],
-                            "output": ["text"],
-                        },
+                        # Attachments are images and PDFs.
+                        "attachment": input_modalities != ["text"],
+                        "modalities": {"input": input_modalities, "output": ["text"]},
                         # The shared window includes the output allowance.
                         # An explicit input budget also lets OpenCode retain
                         # its normal compaction reserve for the next turn.

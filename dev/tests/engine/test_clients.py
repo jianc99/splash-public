@@ -57,7 +57,7 @@ class ClientTests(unittest.TestCase):
         env=None,
         client_args=(),
         client_version=None,
-        vision=True,
+        input_modalities=None,
     ):
         return clients.command(
             name,
@@ -69,7 +69,9 @@ class ClientTests(unittest.TestCase):
             {} if env is None else env,
             client_args=client_args,
             client_version=client_version,
-            vision=vision,
+            input_modalities=["text", "image", "pdf"]
+            if input_modalities is None
+            else input_modalities,
         )
 
     def test_missing_clients_have_actionable_install_message(self):
@@ -249,22 +251,19 @@ class ClientTests(unittest.TestCase):
                 self.assertEqual(limits["output"], min(32768, context // 4))
                 self.assertNotIn("compaction", config)
 
-    def test_clients_offer_image_and_pdf_input_only_with_vision(self):
-        for vision in (True, False):
-            with self.subTest(vision=vision):
-                _, env = self.command("opencode", vision=vision)
+    def test_clients_offer_the_served_input_modalities(self):
+        for modalities in (["text", "image", "pdf"], ["text"]):
+            vision = "image" in modalities
+            with self.subTest(modalities=modalities):
+                _, env = self.command("opencode", input_modalities=modalities)
                 model = json.loads(env["OPENCODE_CONFIG_CONTENT"])["provider"][
                     "splash"
                 ]["models"]["incoai/Qwen3.6-35B-A3B-Splash"]
                 self.assertIs(model["attachment"], vision)
                 self.assertEqual(
-                    model["modalities"],
-                    {
-                        "input": ["text", "image", "pdf"] if vision else ["text"],
-                        "output": ["text"],
-                    },
+                    model["modalities"], {"input": modalities, "output": ["text"]}
                 )
-                _, env = self.command("hermes", vision=vision)
+                _, env = self.command("hermes", input_modalities=modalities)
                 profile = Path(env["HERMES_HOME"]) / "config.yaml"
                 config = yaml.safe_load(profile.read_text())
                 self.assertIs(config["model"]["supports_vision"], vision)
@@ -272,12 +271,15 @@ class ClientTests(unittest.TestCase):
         for name in ("claude", "codex"):
             with self.subTest(name=name):
                 self.assertEqual(
-                    self.command(name, vision=True), self.command(name, vision=False)
+                    self.command(name, input_modalities=["text", "image", "pdf"]),
+                    self.command(name, input_modalities=["text"]),
                 )
+        # A server that reports no modalities predates the launcher.
         for name in clients.INSTALL_URLS:
-            with self.subTest(name=name, vision=None):
-                with self.assertRaisesRegex(clients.ClientError, "vision"):
-                    self.command(name, vision=None)
+            for modalities in ([], ["image"], "text", [None]):
+                with self.subTest(name=name, modalities=modalities):
+                    with self.assertRaisesRegex(clients.ClientError, "restart it"):
+                        self.command(name, input_modalities=modalities)
 
     def test_opencode_preserves_user_compaction_preferences(self):
         compaction = {"auto": True, "reserved": 12000, "prune": False}
@@ -625,7 +627,7 @@ class ClientLifecycleTests(unittest.TestCase):
                             {
                                 "id": "incoai/Qwen3.6-35B-A3B-Splash",
                                 "owned_by": "splash",
-                                "vision": True,
+                                "input_modalities": ["text", "image", "pdf"],
                             }
                         ]
                     },
@@ -678,7 +680,7 @@ class ClientLifecycleTests(unittest.TestCase):
                             {
                                 "id": "incoai/Qwen3.6-35B-A3B-Splash",
                                 "owned_by": "splash",
-                                "vision": True,
+                                "input_modalities": ["text", "image", "pdf"],
                             }
                         ]
                     },
@@ -690,13 +692,13 @@ class ClientLifecycleTests(unittest.TestCase):
             self.assertEqual(execute.call_args.args[1], expected)
             probe.assert_called_once_with("/bin/opencode")
 
-    def test_launcher_configures_clients_from_the_served_model_vision(self):
-        for reported in (True, False, None):
+    def test_launcher_configures_clients_from_the_served_input_modalities(self):
+        for reported in (["text", "image", "pdf"], ["text"], None):
             model = {"id": "incoai/Qwen3.6-35B-A3B-Splash", "owned_by": "splash"}
             if reported is not None:
-                model["vision"] = reported
+                model["input_modalities"] = reported
             with (
-                self.subTest(vision=reported),
+                self.subTest(modalities=reported),
                 mock.patch.object(
                     clients, "find_executable", return_value="/bin/opencode"
                 ),
@@ -715,14 +717,17 @@ class ClientLifecycleTests(unittest.TestCase):
             ):
                 result = launcher.main(["opencode"])
             if reported is None:
+                # A server started by an older Splash reports only vision.
                 self.assertEqual(result, 1)
-                self.assertIn("vision", error.getvalue())
+                self.assertIn(
+                    "restart it with this version of Splash", error.getvalue()
+                )
                 execute.assert_not_called()
                 continue
             config = json.loads(execute.call_args.args[2]["OPENCODE_CONFIG_CONTENT"])
             served = config["provider"]["splash"]["models"][model["id"]]
-            self.assertIs(served["attachment"], reported)
-            self.assertEqual("image" in served["modalities"]["input"], reported)
+            self.assertIs(served["attachment"], "image" in reported)
+            self.assertEqual(served["modalities"]["input"], reported)
 
     def test_unready_server_never_probes_or_launches(self):
         with (
@@ -759,7 +764,7 @@ class ClientLifecycleTests(unittest.TestCase):
                             {
                                 "id": "incoai/Qwen3.6-35B-A3B-Splash",
                                 "owned_by": "splash",
-                                "vision": True,
+                                "input_modalities": ["text", "image", "pdf"],
                             }
                         ]
                     },
@@ -855,6 +860,7 @@ class InstalledOpenCodeTests(unittest.TestCase):
                 environment,
                 client_version=version,
                 client_args=query[1:],
+                input_modalities=["text", "image", "pdf"],
             )
             try:
                 run([binary, "service", "start"], environment)
@@ -916,6 +922,7 @@ class InstalledCodexTests(unittest.TestCase):
                 131072,
                 work / "runtime",
                 environment,
+                input_modalities=["text", "image", "pdf"],
                 client_args=[
                     "exec",
                     "--ignore-user-config",
@@ -1079,6 +1086,7 @@ class InstalledCodexTests(unittest.TestCase):
                         102400,
                         work / "runtime",
                         env,
+                        input_modalities=["text", "image", "pdf"],
                         client_args=args,
                     )
                     with (

@@ -26,7 +26,7 @@ class AgentRunnerTests(unittest.TestCase):
             alias = root / "alias"
             alias.symlink_to(physical, target_is_directory=True)
             runner = agent.ClientRun(
-                "hermes", "hermes", alias / "run", "test-model", 102400, 10
+                "hermes", "hermes", alias / "run", "test-model", 102400, 10, ["text"]
             )
             workspace = physical / "run/project"
             runtime = root / "runtime"
@@ -440,6 +440,7 @@ class AgentRunnerTests(unittest.TestCase):
                     runner = agent.ClientRun.__new__(agent.ClientRun)
                     runner.name, runner.path = name, f"/test/{name}"
                     runner.model, runner.context = "Actual-model", 102400
+                    runner.input_modalities = ["text"]
                     runner.workspace = Path("/test/project")
                     runner.codex_home = Path(directory) / "codex-home"
                     runner.session = session
@@ -458,6 +459,7 @@ class AgentRunnerTests(unittest.TestCase):
                         "Actual-model",
                         102400,
                         agent.launcher.RUNTIME_DIR,
+                        input_modalities=["text"],
                     )
                     for forbidden in (
                         "--ephemeral",
