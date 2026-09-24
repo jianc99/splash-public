@@ -25,6 +25,7 @@ except ImportError:  # Executed directly by the source or packaged entry point.
 ROOT = paths.ROOT
 RUNTIME_DIR = paths.RUNTIME
 PORT = 8000
+# A copy: the launcher runs before .venv exists; server/chat_templates imports Jinja2.
 REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 
 
