@@ -203,9 +203,9 @@ header is read before the download; the tokenizer and configuration are derived
 from the downloaded file.
 Remote Python code is not loaded. Vision uses MLX's `vision_tower.*` tensors,
 linking only `config.json` and the shards holding them, or the same GGUF
-repository's `mmproj-BF16.gguf` or `mmproj-F32.gguf`; F16 has a narrower exponent
-than BF16, so an F16 projector has already rounded small weights. Both source
-adapters prepare the packed `vision/model.bin` layout, which the one BF16 vision
+repository's `mmproj` projector, chosen by its header: a `clip` projector with BF16
+or F32 weights, BF16 preferred. F16 has a narrower exponent than BF16, so an F16
+projector has already rounded small weights. Both source adapters prepare the packed `vision/model.bin` layout, which the one BF16 vision
 operator reads: BF16 tensors are copied, and F32 or F16 tensors are converted only
 when every value is exactly a BF16. Otherwise preparation fails, naming the tensor
 and file. Unsloth's mmproj stores its 1-D tensors, patch embedding and position
