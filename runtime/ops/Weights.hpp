@@ -1,7 +1,6 @@
 #pragma once
 
 #include "metal/MetalBackend.hpp"
-#include "metal/abi/QuantFormat.h"
 
 #include <compare>
 #include <cstdint>
@@ -9,6 +8,8 @@
 #include <utility>
 #include <variant>
 #include <vector>
+
+struct QuantFormat;
 
 namespace splash::ops {
 
@@ -59,10 +60,7 @@ struct QuantizedSegment final {
 
   [[nodiscard]] static QuantizedSegment planes(uint32_t formatId, uint32_t outputSize, uint32_t inputSize,
                                                metal::MetalBuffer plane0, metal::MetalBuffer plane1,
-                                               metal::MetalBuffer meta) {
-    if (formatId >= GGUF_FMT_COUNT) throw std::invalid_argument("unknown GGUF segment format");
-    return {std::move(plane0), std::move(plane1), std::move(meta), outputSize, inputSize, 0, formatId};
-  }
+                                               metal::MetalBuffer meta);
   [[nodiscard]] static QuantizedSegment floats(uint32_t outputSize, uint32_t inputSize,
                                                metal::MetalBuffer values) {
     return {std::move(values), {}, {}, outputSize, inputSize, 0, kFloat32};
@@ -78,9 +76,9 @@ struct QuantizedSegment final {
 
   [[nodiscard]] bool isFloat() const noexcept { return formatId == kFloat32; }
   // The plane geometry of a quantized segment.
-  [[nodiscard]] const QuantFormat &format() const noexcept { return kQuantFormats[formatId]; }
+  [[nodiscard]] const QuantFormat &format() const noexcept;
   // The kernel name suffix of its format ("f32" for a float segment).
-  [[nodiscard]] const char *name() const noexcept { return isFloat() ? "f32" : format().name; }
+  [[nodiscard]] const char *name() const noexcept;
   // The buffer bound in plane1's slot: a format without a second plane binds
   // its meta plane there, which its kernels never read as plane1.
   [[nodiscard]] const metal::MetalBuffer &plane1Slot() const noexcept { return plane1 ? plane1 : meta; }
@@ -147,13 +145,10 @@ public:
 // block_q8_0 (GGUF_FMT_Q4K, _Q6K or _Q80), gathered, never multiplied
 // (Embedding.cpp).
 struct NativeRows final {
-  NativeRows(metal::MetalBuffer rows, uint32_t formatId) : rows(std::move(rows)), formatId(formatId) {
-    if (formatId != GGUF_FMT_Q4K && formatId != GGUF_FMT_Q6K && formatId != GGUF_FMT_Q80)
-      throw std::invalid_argument("unsupported native embedding format");
-  }
+  NativeRows(metal::MetalBuffer rows, uint32_t formatId);
   metal::MetalBuffer rows;
   uint32_t formatId;
-  [[nodiscard]] const char *name() const noexcept { return kQuantFormats[formatId].name; }
+  [[nodiscard]] const char *name() const noexcept;
 };
 
 // A token table of outputSize rows of inputSize values, which Embedding

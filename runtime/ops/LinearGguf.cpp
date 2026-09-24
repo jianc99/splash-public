@@ -396,4 +396,13 @@ void addGgufFloat(metal::CommandGraph &graph, metal::MetalBuffer input, const Qu
             GgufFloatParams{rows, k, n, outStride, outOffset}, grid, {accelerator ? 128u : 512u, 1, 1});
 }
 
+QuantizedSegment QuantizedSegment::planes(uint32_t formatId, uint32_t outputSize, uint32_t inputSize,
+                                          metal::MetalBuffer plane0, metal::MetalBuffer plane1,
+                                          metal::MetalBuffer meta) {
+  if (formatId >= GGUF_FMT_COUNT) throw std::invalid_argument("unknown GGUF segment format");
+  return {std::move(plane0), std::move(plane1), std::move(meta), outputSize, inputSize, 0, formatId};
+}
+const QuantFormat &QuantizedSegment::format() const noexcept { return kQuantFormats[formatId]; }
+const char *QuantizedSegment::name() const noexcept { return isFloat() ? "f32" : format().name; }
+
 } // namespace splash::ops
