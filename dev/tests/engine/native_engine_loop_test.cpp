@@ -783,8 +783,7 @@ void testImageRequestWithoutVisionStaysRequestScoped() {
         require(error->requestId == 9 && error->code == "invalid_request" &&
                     error->failureClass ==
                         protocol::FailureClass::RequestError &&
-                    error->message == "this model is serving without vision "
-                                      "(started with --language-only)",
+                    error->message == "this model is serving without vision",
                 "image request did not produce its own vision error");
         ++errors;
       }

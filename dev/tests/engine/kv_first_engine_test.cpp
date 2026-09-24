@@ -757,7 +757,7 @@ void testTextOnlyRejectsImagesBeforeScheduling() {
     engine.submit(std::move(image));
   } catch (const std::invalid_argument &error) {
     rejected = std::string_view(error.what()) ==
-               "this model is serving without vision (started with --language-only)";
+               "this model is serving without vision";
   }
   require(rejected && events.starts.empty(), "disabled vision reached execution");
   engine.submit(request(2, std::vector<uint32_t>(65, 7)));
