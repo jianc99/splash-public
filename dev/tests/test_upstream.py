@@ -873,6 +873,7 @@ class UpstreamTest(unittest.TestCase):
             lambda r: r["files"]["config.json"].pop("mtime_ns"),
             lambda r: r["files"]["config.json"].update(digest="z" * 64),
             lambda r: r["files"].update({"../escape": r["files"]["config.json"]}),
+            lambda r: r["files"].update({".": r["files"]["config.json"]}),
         ):
             changed = json.loads(json.dumps(record))
             change(changed)

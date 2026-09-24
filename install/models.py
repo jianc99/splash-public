@@ -76,11 +76,12 @@ def is_safe_path(name) -> bool:
     """Whether name is a plain relative POSIX path: no absolute, empty, "."
     or ".." part, no backslash or control character, and none of the
     characters Hub download patterns read as globs (* ? [ ])."""
-    if not isinstance(name, str) or not name:
+    if not isinstance(name, str):
         return False
     path = PurePosixPath(name)
     return (
-        not path.is_absolute()
+        bool(path.parts)  # "" and "." have none
+        and not path.is_absolute()
         and path.as_posix() == name
         and ".." not in path.parts
         and not any(character in name for character in "\\*?[]")

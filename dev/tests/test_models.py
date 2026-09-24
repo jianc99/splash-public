@@ -313,6 +313,7 @@ class ModelArtifactTest(unittest.TestCase):
             "target/*",
             "target/?",
             "target/[abc]",
+            ".",
             "target/\x00file",
             "target/\nfile",
             "manifest.json",
