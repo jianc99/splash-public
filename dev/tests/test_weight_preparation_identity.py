@@ -15,7 +15,6 @@ GENERATED = {"WeightPreparationIdentity.hpp"}
 # golden hashes of prepared fixtures cover the shared I/O.
 REVIEWED = {
     "runtime/model/PreparedWeights.hpp": "the store, staging bound and bounded I/O",
-    "runtime/model/SafetensorsCheckpoint.hpp": "keys record each tensor's bytes, dtype and shape",
     "runtime/model/GgufFile.hpp": "keys record each tensor's bytes and type",
     "runtime/model/GgufImage.hpp": "the GGUF plan, which keys record whole",
     "runtime/model/AffinePreparation.hpp": "the affine plan, which keys record whole",

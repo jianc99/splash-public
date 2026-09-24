@@ -7,7 +7,6 @@
 // every other tensor is copied as stored.
 
 #include "model/PreparedWeights.hpp"
-#include "model/SafetensorsCheckpoint.hpp"
 
 #include <array>
 #include <string>
