@@ -44,11 +44,6 @@ constexpr std::array draftFields{
     &DraftAttentionWorkspace::groupedQueriesBytes,
     &DraftAttentionWorkspace::queryKeysBytes,
     &DraftAttentionWorkspace::queryValuesBytes};
-constexpr auto moeFields = [] {
-  std::array<uint64_t MoeWorkspace::*, kMoeScratchFields.size()> fields{};
-  for (size_t i = 0; i < fields.size(); ++i) fields[i] = kMoeScratchFields[i].bytes;
-  return fields;
-}();
 
 template <typename Workspace, size_t N>
 void include(Workspace &bound, const Workspace &required,
@@ -239,8 +234,8 @@ MoeWorkspace ExecutionPlans::moePrefillWorkspace(MoeShape shape,
   // future grouped layout's largest field is not monotone in row count.
   auto bound = moePrefill(shape, maximumRows).workspace();
   for (uint32_t rows = 1; rows <= maximumRows; ++rows) {
-    include(bound, moePlan({shape, rows, MoePhase::Prefill}, {MoeExpertTile::M32}).workspace(), moeFields);
-    include(bound, moePrefill(shape, rows).workspace(), moeFields);
+    include(bound, moePlan({shape, rows, MoePhase::Prefill}, {MoeExpertTile::M32}).workspace(), kMoeWorkspaceFields);
+    include(bound, moePrefill(shape, rows).workspace(), kMoeWorkspaceFields);
   }
   return bound;
 }
@@ -249,8 +244,8 @@ MoeWorkspace ExecutionPlans::moeDecodeWorkspacePerLane(MoeShape shape) const {
   MoeWorkspace bound;
   for (uint32_t lanes = 1; lanes <= kMaximumLanes; ++lanes) {
     include(bound, moePlan({shape, lanes * kDecodeRows, MoePhase::Decode}, {MoeExpertTile::M8}).workspace(),
-            moeFields, lanes);
-    include(bound, moeDecode(shape, lanes).workspace(), moeFields, lanes);
+            kMoeWorkspaceFields, lanes);
+    include(bound, moeDecode(shape, lanes).workspace(), kMoeWorkspaceFields, lanes);
   }
   return bound;
 }

@@ -40,11 +40,6 @@ constexpr std::array draftFields{
     &DraftAttentionWorkspace::groupedQueriesBytes,
     &DraftAttentionWorkspace::queryKeysBytes,
     &DraftAttentionWorkspace::queryValuesBytes};
-constexpr auto moeFields = [] {
-  std::array<uint64_t MoeWorkspace::*, kMoeScratchFields.size()> fields{};
-  for (size_t i = 0; i < fields.size(); ++i) fields[i] = kMoeScratchFields[i].bytes;
-  return fields;
-}();
 
 kv::Layout layout(AttentionShape shape, uint32_t layers = 1) {
   return {layers, shape.kvHeads, shape.headDimension, shape.format};
@@ -152,13 +147,13 @@ void baselinePlans() {
       require(stride == MoE::decodePlan(shape, 1).workspace(), "workspace bound changed");
       const auto prefill = plans.moePrefillWorkspace(shape, 2048);
       for (uint32_t rows = 1; rows <= 2048; ++rows)
-        covers(prefill, plans.moePrefill(shape, rows).workspace(), 1, moeFields);
+        covers(prefill, plans.moePrefill(shape, rows).workspace(), 1, kMoeWorkspaceFields);
       for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
         const auto selected = plans.moeDecode(shape, lanes);
         require(selected.tileRows() == 8 &&
                     selected.configuration().m8Simdgroups == moeDecodeSimdgroups(family),
                 "MoE decode baseline changed");
-        covers(stride, selected.workspace(), lanes, moeFields);
+        covers(stride, selected.workspace(), lanes, kMoeWorkspaceFields);
       }
     }
   }
@@ -231,7 +226,7 @@ void ggufMoePlans() {
       require(plan.workspace().groupedSumsBytes ==
                   (expected == MoeGgufTile::Register ? uint64_t{plan.maximumTiles()} * 2048 * 3 : 0),
               "GGUF register plan sums its Table16 tiles");
-      covers(plans.moeDecodeWorkspacePerLane(shape), plan.workspace(), lanes, moeFields);
+      covers(plans.moeDecodeWorkspacePerLane(shape), plan.workspace(), lanes, kMoeWorkspaceFields);
       require(plans.moeDecode(routedShape, lanes).configuration().ggufTile == MoeGgufTile::Staged &&
                   plans.moeDecode(routedShape, lanes).workspace().groupedSumsBytes == 0,
               "affine MoE plan took the GGUF register tile");
@@ -248,7 +243,7 @@ void ggufMoePlans() {
                   (plan.workspace().groupedSumsBytes > 0) == (expected == MoeGgufTile::Register) &&
                   plan.configuration().ggufRouterTile == router,
               "GGUF MoE prefill plan left the device's tile");
-      covers(plans.moePrefillWorkspace(shape, 2048), plan.workspace(), 1, moeFields);
+      covers(plans.moePrefillWorkspace(shape, 2048), plan.workspace(), 1, kMoeWorkspaceFields);
       for (const MoePlan &candidate : plans.moeCandidates({shape, rows, MoePhase::Prefill}))
         require(candidate.configuration() == plan.configuration(), "GGUF MoE prefill candidate is not the device's plan");
     }
@@ -348,7 +343,7 @@ void allCandidates() {
         require(plans.moePrefill(shape, rows).configuration() == candidate.configuration(),
                 "MoE prefill candidate not selected");
         covers(plans.moePrefillWorkspace(shape, 2048), candidate.workspace(), 1,
-               moeFields);
+               kMoeWorkspaceFields);
       }
     for (uint32_t lanes = 1; lanes <= 4; ++lanes)
       for (const auto &candidate : plans.moeCandidates({shape, lanes * 8, MoePhase::Decode})) {
@@ -358,7 +353,7 @@ void allCandidates() {
         require(plans.moeDecode(shape, lanes).configuration() == candidate.configuration(),
                 "MoE decode candidate not selected");
         covers(plans.moeDecodeWorkspacePerLane(shape), candidate.workspace(), lanes,
-               moeFields);
+               kMoeWorkspaceFields);
       }
   }
 }

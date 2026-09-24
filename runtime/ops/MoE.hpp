@@ -160,6 +160,12 @@ inline constexpr std::array<MoeScratchField, 10> kMoeScratchFields{{
 static_assert(sizeof(MoeWorkspace) == kMoeScratchFields.size() * sizeof(uint64_t) &&
               sizeof(MoeScratch) == kMoeScratchFields.size() * sizeof(metal::MetalBuffer),
               "every scratch buffer is in kMoeScratchFields");
+// The workspace fields of kMoeScratchFields, in its order.
+inline constexpr auto kMoeWorkspaceFields = [] {
+  std::array<uint64_t MoeWorkspace::*, kMoeScratchFields.size()> fields{};
+  for (size_t i = 0; i < fields.size(); ++i) fields[i] = kMoeScratchFields[i].bytes;
+  return fields;
+}();
 
 // The tile applies to grouping, gather and both expert projections together;
 // changing it never changes the physical rows in a command. Affine plans
