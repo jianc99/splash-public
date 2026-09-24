@@ -1,9 +1,12 @@
 """Resolve supported upstream models and their drafts into a local assembly.
 
-The Hub owns downloads and snapshots. This module selects components and links
-immutable files; native source adapters own tensor validation and preparation.
-No published Splash target package, quantization catalog or pinned revision is
-required. The small registry pairs base models, independently of weight format.
+The Hub owns downloads and snapshots; this module selects components and links
+immutable files, and the native source adapters own tensor validation and
+preparation. An installed assembly starts without contacting the Hub: each
+source is pinned to the commit it was installed from, and --update is the only
+way to follow a newer one. A target is identified by its own metadata (a GGUF
+header or an MLX config), read before any weight download, and paired with the
+draft trained for that architecture; repository names play no part.
 """
 
 from __future__ import annotations
@@ -13,31 +16,63 @@ import json
 import os
 import shutil
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
 if __package__:
-    from . import models
+    from . import gguf, models
 else:
+    import gguf
     import models
+
+
+@dataclass(frozen=True)
+class Draft:
+    repo: str
+    # The published commit of the draft's Splash assets; None follows the
+    # repository's main branch until a release pins it.
+    revision: str | None
+    layers: int
 
 
 @dataclass(frozen=True)
 class ModelFamily:
     name: str
-    text_type: str
-    hidden_size: int
-    layers: int
-    draft_layers: int
-
-    @property
-    def draft_model(self):
-        return f"incoai/{self.name}-DFlash2"
+    # The text_config fields that identify the architecture, as an MLX config
+    # states them and as gguf.model_config derives them from a GGUF header.
+    signature: tuple[tuple[str, object], ...]
+    draft: Draft
 
 
 FAMILIES = (
-    ModelFamily("Qwen3.8-27B", "qwen3_5_text", 5120, 64, 5),
-    ModelFamily("Qwen3.6-35B-A3B", "qwen3_5_moe_text", 2048, 40, 6),
+    ModelFamily(
+        "Qwen3.8-27B",
+        (
+            ("model_type", "qwen3_5_text"),
+            ("hidden_size", 5120),
+            ("num_hidden_layers", 64),
+            ("vocab_size", 248320),
+            ("num_attention_heads", 24),
+            ("num_key_value_heads", 4),
+            ("head_dim", 256),
+        ),
+        Draft("incoai/Qwen3.8-27B-DFlash2", None, 5),
+    ),
+    ModelFamily(
+        "Qwen3.6-35B-A3B",
+        (
+            ("model_type", "qwen3_5_moe_text"),
+            ("hidden_size", 2048),
+            ("num_hidden_layers", 40),
+            ("vocab_size", 248320),
+            ("num_attention_heads", 16),
+            ("num_key_value_heads", 2),
+            ("head_dim", 256),
+            ("num_experts", 256),
+            ("num_experts_per_tok", 8),
+        ),
+        Draft("incoai/Qwen3.6-35B-A3B-DFlash2", None, 6),
+    ),
 )
 TOKENIZER_FILES = (
     "tokenizer.json",
@@ -55,78 +90,76 @@ PROCESSOR_FILES = (
 )
 
 
-def match_family(repo_id, base_models=()):
-    if isinstance(base_models, str):
-        base_models = [base_models]
-    if not isinstance(base_models, (list, tuple)) or not all(
-        isinstance(x, str) for x in base_models
-    ):
-        raise models.ModelError("invalid upstream base_model metadata")
-    matches = set()
-    for name in (repo_id, *base_models):
-        basename = name.rsplit("/", 1)[-1].lower()
-        for family in FAMILIES:
-            prefix = family.name.lower()
-            if basename == prefix or basename.startswith(prefix + "-"):
-                matches.add(family)
+def family_for(config):
+    """The one supported family whose architecture the target's config states."""
+    text = config.get("text_config") if isinstance(config, dict) else None
+    if not isinstance(text, dict):
+        raise models.ModelError("upstream configuration has no text_config")
+    matches = [f for f in FAMILIES if all(text.get(k) == v for k, v in f.signature)]
     if len(matches) != 1:
+        keys = sorted({key for family in FAMILIES for key, _ in family.signature})
+        found = ", ".join(f"{key}={text.get(key)}" for key in keys if key in text)
         raise models.ModelError(
-            "model has no unambiguous supported DFlash2 pairing: " + repo_id
+            f"no supported model has this architecture ({found}); "
+            f"supported: {', '.join(f.name for f in FAMILIES)}"
         )
-    return matches.pop()
-
-
-def validate_config(config, family):
-    text = config.get("text_config", {})
-    expected = {
-        "model_type": family.text_type,
-        "hidden_size": family.hidden_size,
-        "num_hidden_layers": family.layers,
-        "vocab_size": 248320,
-    }
-    if not isinstance(text, dict) or any(text.get(k) != v for k, v in expected.items()):
-        raise models.ModelError("upstream configuration does not match " + family.name)
+    return matches[0]
 
 
 def select_gguf(files, variant):
+    """The target GGUF: a file in the repository root named ...-<variant>.gguf.
+    Of several that end so (X-Q4_K_M and X-UD-Q4_K_M for Q4_K_M), the one with
+    the shortest name wins; subfolders (split BF16, MTP heads) never count."""
     candidates = sorted(
         name
         for name in files
-        if name.endswith(".gguf") and not Path(name).name.lower().startswith("mmproj")
+        if "/" not in name
+        and name.lower().endswith(".gguf")
+        and not name.lower().startswith("mmproj")
     )
     if variant:
-        candidates = [
-            name
-            for name in candidates
-            if Path(name).stem.lower().endswith("-" + variant.lower())
-        ]
-    if len(candidates) != 1:
+        suffix = "-" + variant.lower()
+        matches = [n for n in candidates if Path(n).stem.lower().endswith(suffix)]
+        shortest = min((len(n) for n in matches), default=0)
+        matches = [n for n in matches if len(n) == shortest]
+    else:
+        matches = candidates
+    if len(matches) != 1:
+        listed = ", ".join(candidates) or "none"
         raise models.ModelError(
-            "select one GGUF with --model OWNER/REPO:VARIANT (for example :UD-Q4_K_M); split GGUF files are not supported"
+            (
+                "no single GGUF matches :" + variant
+                if variant
+                else "select a GGUF with OWNER/REPO:VARIANT"
+            )
+            + f" (files in the repository root: {listed})"
         )
-    return candidates[0]
+    return matches[0]
 
 
 def select_vision(files):
-    for dtype in ("BF16", "F16", "F32"):
-        matches = [
-            name
-            for name in files
-            if Path(name).name.lower() == f"mmproj-{dtype}.gguf".lower()
-        ]
+    for dtype in ("BF16", "F32", "F16"):
+        name = f"mmproj-{dtype}.gguf"
+        matches = [n for n in files if n.lower() == name.lower()]
         if len(matches) == 1:
             return matches[0]
-    raise models.ModelError("model repository has no supported BF16/F16/F32 mmproj")
+    raise models.ModelError(
+        "the GGUF repository has no mmproj-BF16/F32/F16.gguf vision projector; "
+        "use --language-only to serve text only"
+    )
 
 
 class Repository:
+    """One source at one commit: a local directory, or a Hub repository whose
+    revision is resolved once, at installation, to an immutable commit."""
+
     def __init__(self, name, revision=None):
-        from huggingface_hub import HfApi, ModelCard, snapshot_download
+        from huggingface_hub import HfApi, snapshot_download
 
         self.name = str(name)
-        self.base_models = []
         local = Path(name).expanduser()
-        if local.is_dir():
+        self.local = local.is_dir()
+        if self.local:
             self.root = local.resolve()
             self.revision = None
             self.files = {
@@ -138,24 +171,18 @@ class Repository:
         models.validate_repo_id(name)
         try:
             info = HfApi().model_info(name, revision=revision)
-        except Exception:
-            # Hub cache remains usable without network. A missing snapshot is
-            # an error; it never substitutes a different requested revision.
+        except Exception as error:
+            # Without the Hub, the cache can still resolve a branch it recorded
+            # or a commit; it never substitutes a different revision.
             try:
                 self.root = Path(
                     snapshot_download(name, revision=revision, local_files_only=True)
                 )
             except Exception:
                 raise models.ModelError(
-                    f"cannot resolve {name}; check the repository, access and connection"
+                    models.hub_error(error, f"cannot resolve {name}")
                 ) from None
             self.revision = self.root.name
-            if (self.root / "README.md").is_file():
-                self.base_models = (
-                    ModelCard.load(self.root / "README.md")
-                    .data.to_dict()
-                    .get("base_model", [])
-                )
             self.files = {
                 p.relative_to(self.root).as_posix()
                 for p in self.root.rglob("*")
@@ -165,9 +192,6 @@ class Repository:
             self.root = None
             self.revision = info.sha
             self.files = {item.rfilename for item in info.siblings}
-            card_data = getattr(info, "card_data", None)
-            card = card_data.to_dict() if card_data else {}
-            self.base_models = card.get("base_model", [])
         for name in self.files:
             path = PurePosixPath(name)
             if path.is_absolute() or ".." in path.parts:
@@ -181,6 +205,22 @@ class Repository:
         from huggingface_hub import hf_hub_download
 
         return Path(hf_hub_download(self.name, name, revision=self.revision))
+
+    def open(self, name):
+        """A binary stream of one file read on demand: reading a GGUF header
+        costs a few range requests, not a download."""
+        if name not in self.files:
+            raise models.ModelError(f"missing {name} in {self.name}")
+        if self.root is not None:
+            return (self.root / name).open("rb")
+        from huggingface_hub import HfFileSystem, try_to_load_from_cache
+
+        cached = try_to_load_from_cache(self.name, name, revision=self.revision)
+        if isinstance(cached, str):
+            return open(cached, "rb")
+        return HfFileSystem().open(
+            f"{self.name}/{name}", "rb", revision=self.revision, block_size=8 << 20
+        )
 
     def download(self, names):
         if self.root is None:
@@ -199,6 +239,62 @@ class Repository:
 
     def identity(self):
         return {"repo": self.name, "revision": self.revision}
+
+
+@dataclass
+class Target:
+    """What the target repository supplies, known before any weight download."""
+
+    format: str
+    config: dict
+    weights: set[str]
+    vision: str | None = None
+    # MLX: assembly path -> repository file for configuration, tokenizer and
+    # processor. A GGUF describes these itself (gguf.tokenizer_files).
+    metadata: dict[str, str] = field(default_factory=dict)
+
+
+def _target(repo, variant, language_only):
+    if variant is not None or not any(n.endswith(".safetensors") for n in repo.files):
+        name = select_gguf(repo.files, variant)
+        with repo.open(name) as stream:
+            header = gguf.Metadata(stream, tensors=True)
+        gguf.require_loadable(header)
+        vision = None if language_only else select_vision(repo.files)
+        vision_header = None
+        if vision:
+            with repo.open(vision) as stream:
+                vision_header = gguf.Metadata(stream)
+        config = gguf.model_config(header, vision_header)
+        print(f"Selected {name} from {repo.name}.", flush=True)
+        return Target("gguf", config, {name}, vision)
+    required = {"config.json", "tokenizer.json", "tokenizer_config.json"}
+    if not language_only:
+        required.add("preprocessor_config.json")
+    if missing := required - repo.files:
+        raise models.ModelError(
+            f"target repository {repo.name} is missing: {', '.join(sorted(missing))}. "
+            "Configuration, tokenizer and processor must come from the target repository."
+        )
+    config = models.read_json(repo.file("config.json"))
+    quant = config.get("quantization", config.get("quantization_config", {}))
+    if (
+        not isinstance(quant, dict)
+        or quant.get("mode", "affine") != "affine"
+        or quant.get("bits") != 4
+        or quant.get("group_size") != 64
+    ):
+        raise models.ModelError(
+            "this model requires an MLX affine 4-bit/group-64 checkpoint or a supported GGUF"
+        )
+    metadata = {"config.json": "config.json"}
+    metadata.update({"tokenizer/" + n: n for n in TOKENIZER_FILES if n in repo.files})
+    if not language_only:
+        _validate_processor(models.read_json(repo.file("preprocessor_config.json")))
+        metadata.update(
+            {"processor/" + n: n for n in PROCESSOR_FILES if n in repo.files}
+        )
+    return Target("mlx-affine", config, _weight_files(repo), metadata=metadata)
 
 
 def _weight_files(repo):
@@ -229,17 +325,18 @@ def _draft_files(repo, family):
     names = {
         "splash/config.json",
         "splash/model.bin",
-        *(f"splash/layer-{i}.bin" for i in range(family.draft_layers)),
+        *(f"splash/layer-{i}.bin" for i in range(family.draft.layers)),
     }
     if not names <= repo.files:
         raise models.ModelError(
             f"{repo.name} does not contain the prepared DFlash2 weights (splash/); use a draft repository with these assets"
         )
     config = models.read_json(repo.file("splash/config.json"))
+    hidden = dict(family.signature)["hidden_size"]
     if (
         config.get("architectures") != ["DFlash2DraftModel"]
-        or config.get("hidden_size") != family.hidden_size
-        or config.get("num_hidden_layers") != family.draft_layers
+        or config.get("hidden_size") != hidden
+        or config.get("num_hidden_layers") != family.draft.layers
         or config.get("splash", {}).get("format") != "MDFD0004"
     ):
         raise models.ModelError(
@@ -266,14 +363,27 @@ def _link(stage, relative, source):
     path.symlink_to(source.absolute())
 
 
+def _installed(root):
+    """An installation that verifies starts with no Hub access at all."""
+    if not (root / "model.json").exists():
+        return False
+    try:
+        verify(root)
+    except (models.ModelError, OSError) as error:
+        print(f"Reinstalling {root.name}: {error}", flush=True)
+        return False
+    return True
+
+
 def prepare(args, repo=None):
-    """Return False for a legacy package; otherwise publish a source assembly."""
+    """Return False for a legacy package; otherwise ensure the source assembly."""
     repo_id, variant = models.split_model_id(args.model)
     revision = getattr(args, "revision", None)
     language_only = getattr(args, "language_only", False)
     draft_override = getattr(args, "draft_model", None)
+    models_root = args.models.resolve()
     root = models.installed_root(
-        args.models.resolve(),
+        models_root,
         args.model,
         revision=revision,
         language_only=language_only,
@@ -286,6 +396,9 @@ def prepare(args, repo=None):
                 "source selection options require an upstream model ID"
             )
         return False
+    if not getattr(args, "update", False) and _installed(root):
+        print(f"Splash model {args.model} is already installed in {root}", flush=True)
+        return True
     repo = repo or Repository(repo_id, revision)
     if "manifest.json" in repo.files:
         if revision or language_only or draft_override:
@@ -293,117 +406,126 @@ def prepare(args, repo=None):
                 "source selection options require an upstream model ID"
             )
         return False
-    family = match_family(repo_id, repo.base_models)
-    gguf = variant is not None or not any(
-        name.endswith(".safetensors") for name in repo.files
+    target = _target(repo, variant, language_only)
+    family = family_for(target.config)
+    draft = Repository(
+        draft_override or family.draft.repo,
+        None if draft_override else family.draft.revision,
     )
-    # Cache the card so renamed repositories also resolve while offline.
-    if "README.md" in repo.files:
-        repo.file("README.md")
-    files = {}
-    if gguf:
-        target_name = select_gguf(repo.files, variant)
-        vision_name = select_vision(repo.files) if not language_only else None
-        sources = repo.download(
-            {target_name} | ({vision_name} if vision_name else set())
-        )
-        files["target/" + Path(target_name).name] = sources[target_name]
-        vision_path = sources[vision_name] if vision_name else None
-        if vision_path:
-            files["vision/mmproj.gguf"] = vision_path
-        files.update(
-            _gguf_metadata(args.models.resolve(), sources[target_name], vision_path)
-        )
-    else:
-        required = {"config.json", "tokenizer.json", "tokenizer_config.json"}
-        if not language_only:
-            required.add("preprocessor_config.json")
-        missing = required - repo.files
-        if missing:
-            raise models.ModelError(
-                f"target repository {repo_id} is missing: {', '.join(sorted(missing))}. "
-                "Configuration, tokenizer and processor must come from the target repository."
-            )
-        files["config.json"] = repo.file("config.json")
-        for name in TOKENIZER_FILES:
-            if name in repo.files:
-                files["tokenizer/" + name] = repo.file(name)
-        if not language_only:
-            for name in PROCESSOR_FILES:
-                if name in repo.files:
-                    files["processor/" + name] = repo.file(name)
-    config = models.read_json(files["config.json"])
-    validate_config(config, family)
-    if not gguf:
-        quant = config.get("quantization", config.get("quantization_config", {}))
-        if (
-            not isinstance(quant, dict)
-            or quant.get("mode", "affine") != "affine"
-            or quant.get("bits") != 4
-            or quant.get("group_size") != 64
-        ):
-            raise models.ModelError(
-                "this model requires an MLX affine 4-bit/group-64 checkpoint or a supported GGUF"
-            )
-    if not language_only:
-        _validate_processor(
-            models.read_json(files["processor/preprocessor_config.json"])
-        )
-    draft = Repository(draft_override or family.draft_model)
     draft_names = _draft_files(draft, family)
     print(
-        f"Loading {args.model}; draft {draft.name}; vision {'disabled' if language_only else 'enabled'}.",
+        f"Installing {args.model} as {family.name} ({target.format}); draft {draft.name}; "
+        f"vision {'disabled' if language_only else 'enabled'}.",
         flush=True,
     )
-    if not gguf:
-        for name, path in repo.download(_weight_files(repo)).items():
-            files["target/" + name] = path
-            if not language_only:
-                files["vision/" + name] = path
+    wanted = target.weights | set(target.metadata.values())
+    if target.vision:
+        wanted.add(target.vision)
+    sources = repo.download(wanted)
+    files = {name: sources[source] for name, source in target.metadata.items()}
+    for name in sorted(target.weights):
+        files["target/" + Path(name).name] = sources[name]
+    if target.format == "gguf":
+        vision = sources[target.vision] if target.vision else None
+        if vision:
+            files["vision/mmproj.gguf"] = vision
+        files.update(
+            _gguf_metadata(models_root, sources[next(iter(target.weights))], vision)
+        )
+    else:
         files["target/config.json"] = files["config.json"]
         if not language_only:
             files["vision/config.json"] = files["config.json"]
+            for name in target.weights:
+                files["vision/" + name] = sources[name]
     files["tokenizer/config.json"] = files["config.json"]
-    for name, path in draft.download(draft_names).items():
+    drafts = draft.download(draft_names)
+    for name, path in drafts.items():
         files["draft/" + Path(name).name] = path
+    records = {}
     record = {
         "version": 1,
         "model": args.model,
-        "target_format": "gguf" if gguf else "mlx-affine",
-        "vision_format": "none" if language_only else "gguf" if gguf else "safetensors",
-        "sources": {
-            "target": repo.identity(),
-            "config": repo.identity(),
-            "tokenizer": repo.identity(),
-            "draft": draft.identity(),
+        "family": family.name,
+        "target_format": target.format,
+        "vision_format": "none"
+        if language_only
+        else "gguf"
+        if target.format == "gguf"
+        else "safetensors",
+        "sources": {"target": repo.identity(), "draft": draft.identity()},
+        "files": {
+            name: records.setdefault(str(path.absolute()), _file_record(path))
+            for name, path in sorted(files.items())
         },
-        "files": {name: _file_record(path) for name, path in sorted(files.items())},
     }
-    encoded = json.dumps(record, sort_keys=True, indent=2) + "\n"
-    cache = args.models.resolve() / ".resolved"
-    cache.mkdir(parents=True, exist_ok=True)
-    destination = cache / hashlib.sha256(encoded.encode()).hexdigest()
-    with models.installation_lock(args.models.resolve()):
-        if not destination.exists():
-            stage = Path(tempfile.mkdtemp(prefix=".loading-", dir=cache))
-            try:
-                for name, path in files.items():
-                    _link(stage, name, path)
-                (stage / "model.json").write_text(encoded)
-                os.rename(stage, destination)
-            finally:
-                if stage.exists():
-                    shutil.rmtree(stage)
-        verify(destination)
+    models_root.mkdir(parents=True, exist_ok=True)
+    with models.installation_lock(models_root):
+        destination = _publish(models_root, record, files)
         models.install_snapshot(destination, root)
+    _pin(
+        root,
+        [(repo, next(iter(sources.values()))), (draft, next(iter(drafts.values())))],
+    )
     return True
 
 
+def _publish(models_root, record, files):
+    """The verified assembly for record, rebuilding a damaged one."""
+    encoded = json.dumps(record, sort_keys=True, indent=2) + "\n"
+    cache = models_root / ".resolved"
+    cache.mkdir(parents=True, exist_ok=True)
+    destination = cache / hashlib.sha256(encoded.encode()).hexdigest()
+    if destination.exists():
+        try:
+            verify(destination)
+            return destination
+        except (models.ModelError, OSError):
+            shutil.rmtree(destination)
+    stage = Path(tempfile.mkdtemp(prefix=".loading-", dir=cache))
+    try:
+        for name, path in files.items():
+            _link(stage, name, path)
+        with (stage / "model.json").open("w") as stream:
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.rename(stage, destination)
+    finally:
+        if stage.exists():
+            shutil.rmtree(stage)
+    verify(destination)
+    return destination
+
+
+def _snapshot_of(path):
+    """The Hub snapshot folder a cached file belongs to; None for local files."""
+    for parent in Path(path).absolute().parents:
+        if parent.parent.name == "snapshots":
+            return parent
+    return None
+
+
+def _pin(root, sources):
+    """Pin every Hub snapshot the installation links, so pruning the Hub cache
+    cannot remove them, then retire this installation's older pins."""
+    refs = []
+    for repo, sample in sources:
+        if not repo.local and (snapshot := _snapshot_of(sample)):
+            refs.append(models._retain_snapshot_ref(snapshot, repo.name, root))
+    try:
+        for ref in refs:
+            for previous in ref.parent.iterdir():
+                if previous not in refs and models.is_hex_digest(previous.name, 40):
+                    previous.unlink()
+    except OSError as error:
+        # An old pin only costs cache space; the current ones are in place.
+        print(
+            f"Warning: could not retire old Hub cache references: {error}", flush=True
+        )
+
+
 def _gguf_metadata(models_root, target, vision):
-    if __package__:
-        from . import gguf
-    else:
-        import gguf
     from importlib.metadata import version
 
     source_paths = [target] + ([vision] if vision else [])

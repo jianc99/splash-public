@@ -132,9 +132,15 @@ to these same validated target, draft, vision and tokenizer interfaces.
 repositories, then atomically publishes a local assembly of links to their Hub
 snapshots. `model.json` describes those resolved sources and selected formats;
 it is local installation metadata, not a file model publishers must supply.
-The registry maps supported base models to drafts, independently of quantizer
-and quantization variant. Native source adapters validate model geometry,
-quantization, tensor shapes and draft compatibility before execution.
+A target is identified by its own metadata: an MLX config's `text_config`, or
+the one `gguf.model_config` derives from the selected GGUF's header, read with a
+few HTTP range requests before any weight download. The registry (`FAMILIES`)
+states each supported architecture's signature and the draft trained for it;
+repository names and model-card `base_model` fields play no part. The same
+header rejects a GGUF whose tensor types the native loader cannot read
+(`gguf.LOADABLE_TYPES`, checked against `metal/abi/QuantFormat.h`) before it is
+downloaded. Native source adapters validate model geometry, quantization, tensor
+shapes and draft compatibility again before execution.
 
 Examples:
 
@@ -144,11 +150,17 @@ splash serve --model unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M
 splash serve --model mlx-community/Qwen3.8-27B-4bit --language-only
 ```
 
-A revision is optional. One resolution fixes the snapshot for every download
-in that loading operation, so a repository update cannot mix files from different
-revisions. `--revision` can select a particular target branch, tag or commit.
-A complete cached snapshot can be used offline. The installer never rewrites
-upstream files. Older manifest-based packages use the legacy installer.
+Installation resolves each source's revision once to a commit, downloads by
+that commit and records it in `model.json`, so a repository update cannot mix
+files from different revisions. It pins those snapshots in the Hub cache
+(`refs/splash/<installation>/<commit>`), so pruning the cache cannot remove files
+an installed model links. An installed model starts without contacting the Hub:
+`prepare` checks the assembly's links, sizes and times and returns. `--update`
+resolves the target and draft again, and an assembly that no longer verifies is
+rebuilt. `--revision` can select a particular target branch, tag or commit.
+Without a network, installation can still use a snapshot the cache resolves.
+The installer never rewrites upstream files. Older manifest-based packages use
+the legacy installer.
 
 MLX configuration, tokenizer, chat template and processor come from the same
 resolved target snapshot. For GGUF, `install/gguf.py` reads the selected file's
@@ -164,9 +176,10 @@ layers from the transformer layer count. Vision configuration and preprocessing
 come from the same snapshot's mmproj. Native loaders independently validate the
 model geometry and all tensor shapes. Derived metadata is cached under
 `models/.metadata`, keyed by source identity, adapter code and tokenizer-library
-version; publication is atomic and cache contents are hash-checked. The selected
-GGUF must be downloaded before its metadata can be read. Legacy manifest-based
-packages retain their explicitly declared component sources.
+version; publication is atomic and cache contents are hash-checked. Only the
+header is read before the download; the tokenizer and configuration are derived
+from the downloaded file. Legacy manifest-based packages retain their explicitly
+declared component sources.
 Remote Python code is not loaded. Vision uses MLX's `vision_tower.*` tensors or
 the same GGUF repository's unquantized mmproj. Source adapters share one vision
 operator implementation: BF16 matrices retain their representation, F32 weights

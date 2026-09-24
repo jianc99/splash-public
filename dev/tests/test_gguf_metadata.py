@@ -14,7 +14,7 @@ from transformers import AutoTokenizer
 from install import gguf, models, upstream
 
 
-def write_gguf(path, values):
+def write_gguf(path, values, tensors=()):
     def string(text):
         data = text.encode()
         return struct.pack("<Q", len(data)) + data
@@ -35,10 +35,12 @@ def write_gguf(path, values):
             )
         raise AssertionError(value)
 
-    data = struct.pack("<4sIQQ", b"GGUF", 3, 0, len(values))
+    data = struct.pack("<4sIQQ", b"GGUF", 3, len(tensors), len(values))
     for key, value in values.items():
         kind, encoded = typed(value)
         data += string(key) + struct.pack("<I", kind) + encoded
+    for name, kind in tensors:
+        data += string(name) + struct.pack("<IQIQ", 1, 256, kind, 0)
     path.write_bytes(data)
     return path
 
@@ -59,6 +61,8 @@ def fixture(*, native=False):
         "qwen35moe.attention.head_count": 16,
         "qwen35moe.attention.head_count_kv": 2,
         "qwen35moe.attention.key_length": 256,
+        "qwen35moe.expert_count": 256,
+        "qwen35moe.expert_used_count": 8,
         "tokenizer.ggml.model": "gpt2",
         "tokenizer.ggml.pre": "qwen35",
         "tokenizer.ggml.tokens": tokens,
@@ -198,6 +202,61 @@ class GgufMetadataTests(unittest.TestCase):
                 with self.assertRaises(models.ModelError):
                     gguf.tokenizer_files(self.metadata(values))
 
+    def test_unloadable_tensor_types_are_rejected_from_the_header(self):
+        values = fixture()
+        values["qwen35moe.block_count"] = 41
+        values["qwen35moe.nextn_predict_layers"] = 1
+        loadable = {
+            "token_embd.weight": 12,  # Q4_K
+            "output.weight": 14,  # Q6_K
+            "blk.0.ffn_down_exps.weight": 23,  # IQ4_XS
+            "blk.0.attn_norm.weight": 0,  # F32
+            # The MTP layer (block 40) is never loaded, so its type does not matter.
+            "blk.40.ffn_up_exps.weight": 16,  # IQ2_XXS
+        }
+        path = write_gguf(self.root / "ok.gguf", values, loadable.items())
+        gguf.require_loadable(gguf.Metadata(path, tensors=True))
+        for changes, reason in (
+            ({"blk.3.ffn_gate_exps.weight": 18}, "IQ3_XXS [(]1 tensors[)]"),
+            (
+                {"blk.0.attn_qkv.weight": 39, "blk.1.attn_qkv.weight": 39},
+                "MXFP4 [(]2 tensors[)]",
+            ),
+            ({"token_embd.weight": 23}, "IQ4_XS"),
+            ({"blk.0.attn_q.weight": 30}, "BF16"),
+        ):
+            with self.subTest(reason=reason):
+                path = write_gguf(
+                    self.root / "bad.gguf", values, (loadable | changes).items()
+                )
+                with self.assertRaisesRegex(
+                    models.ModelError, "cannot load: .*" + reason
+                ):
+                    gguf.require_loadable(gguf.Metadata(path, tensors=True))
+        # Without tensors=True the reader never reads the tensor table.
+        self.assertEqual(gguf.Metadata(path).tensors, {})
+
+    def test_loadable_types_are_the_native_formats(self):
+        # The installer's list must be the loader's own: kQuantFormats' GGML types
+        # plus F32 (runtime/metal/abi/QuantFormat.h).
+        import re
+
+        header = (
+            Path(__file__).resolve().parents[2] / "runtime/metal/abi/QuantFormat.h"
+        ).read_text()
+        table = header.split("kQuantFormats[GGUF_FMT_COUNT] = {", 1)[1].split("};", 1)[
+            0
+        ]
+        native = {gguf.TENSOR_TYPES[int(n)] for n in re.findall(r"\{(\d+),", table)}
+        self.assertEqual(native | {"F32"}, gguf.LOADABLE_TYPES)
+        self.assertLessEqual(gguf.EMBEDDING_TYPES, gguf.LOADABLE_TYPES)
+
+    def test_moe_config_states_its_experts_and_identifies_the_family(self):
+        config = gguf.model_config(self.metadata(fixture(native=True)))
+        text = config["text_config"]
+        self.assertEqual((text["num_experts"], text["num_experts_per_tok"]), (256, 8))
+        self.assertEqual(upstream.family_for(config).name, "Qwen3.6-35B-A3B")
+
     def test_config_uses_metadata_and_subtracts_only_mtp_layers(self):
         values = fixture()
         values["qwen35moe.block_count"] = 41
@@ -297,7 +356,7 @@ class GgufMetadataTests(unittest.TestCase):
                     source, "download", wraps=source.download
                 ) as download:
                     upstream.prepare(args, repo=source)
-                resolve.assert_called_once_with("incoai/Qwen3.6-35B-A3B-DFlash2")
+                resolve.assert_called_once_with("incoai/Qwen3.6-35B-A3B-DFlash2", None)
                 expected = {"model-Q4_K_M.gguf"} | (
                     set() if language_only else {"mmproj-F32.gguf"}
                 )

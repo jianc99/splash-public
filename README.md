@@ -69,8 +69,9 @@ See [judgment contracts](DEVELOPMENT.md#judgment-contracts) for details.
 | Qwen3.8-27B | `mlx-community/Qwen3.8-27B-4bit` | `unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M` |
 | Qwen3.6-35B-A3B | `mlx-community/Qwen3.6-35B-A3B-4bit` | `unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M` |
 
-`--model` accepts the upstream repository directly. Splash automatically matches
-its DFlash2 draft by base model. MLX uses the target repository's tokenizer,
+`--model` accepts the upstream repository directly. Splash identifies the model
+from its own metadata, its architecture and dimensions, before downloading any
+weights, and pairs the DFlash2 draft trained for it. MLX uses the target repository's tokenizer,
 configuration and chat template; GGUF reads these from the selected GGUF file
 itself. No tokenizer or configuration is downloaded from another model repository.
 Only the separate draft model is automatically paired. A separate Splash support
@@ -89,9 +90,12 @@ those shards still download in full.
 
 The first preparation stores an additional weight copy in
 `~/Library/Caches/Splash/weights`, using bounded temporary memory. Later starts
-reuse it. `--revision` optionally selects an upstream branch, tag or commit;
-otherwise the current default revision is resolved automatically. `--draft-model`
-overrides the matching draft repository or supplies a local draft directory.
+reuse it. An installed model starts without contacting the Hub; `--update`
+resolves the upstream model and draft again. `--revision` optionally selects an
+upstream branch, tag or commit; otherwise the current default revision is
+resolved at installation. GGUF variants whose tensor types Splash cannot load are
+rejected before download. `--draft-model` overrides the matching draft
+repository or supplies a local draft directory.
 Private repositories need `HF_TOKEN`. Downloads use the Hugging Face cache, and
 `brew upgrade splash` preserves models and agent sessions.
 

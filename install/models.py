@@ -746,7 +746,6 @@ def resolve_snapshot(model_id: str):
     validate_model_id(model_id)
     try:
         from huggingface_hub import get_token
-        from huggingface_hub.errors import HfHubHTTPError
     except ImportError as error:
         raise ModelError(
             "missing dependency huggingface_hub; reinstall Splash"
@@ -764,20 +763,33 @@ def resolve_snapshot(model_id: str):
                 return cached
         if isinstance(error, ModelError):
             raise
-        message = str(error)
-        if token:
-            message = message.replace(token, "[redacted]")
-        if (
-            isinstance(error, HfHubHTTPError)
-            and error.response is not None
-            and error.response.status_code in (401, 403)
-        ):
-            message += (
-                "; set HF_TOKEN or run 'hf auth login' with access to this repository"
-            )
         raise ModelError(
-            f"could not download Splash runtime package {model_id}@main: {message}"
+            hub_error(
+                error,
+                f"could not download Splash runtime package {model_id}@main",
+                token,
+            )
         ) from error
+
+
+def hub_error(error, context: str, token=None) -> str:
+    """context: the Hub's reason, with the token redacted (the caller's, or the
+    configured one) and, for denied access, how to authenticate."""
+    from huggingface_hub import get_token
+    from huggingface_hub.errors import HfHubHTTPError
+
+    message = str(error)
+    if token := token or os.environ.get("HF_TOKEN") or get_token():
+        message = message.replace(token, "[redacted]")
+    if (
+        isinstance(error, HfHubHTTPError)
+        and error.response is not None
+        and error.response.status_code in (401, 403)
+    ):
+        message += (
+            "; set HF_TOKEN or run 'hf auth login' with access to this repository"
+        )
+    return f"{context}: {message}"
 
 
 def resolve_target_gguf(manifest, variant: str) -> Path:
@@ -1113,6 +1125,11 @@ def parse_args(argv=None):
         "--language-only",
         action="store_true",
         help="skip vision preparation and loading",
+    )
+    parser.add_argument(
+        "--update",
+        action="store_true",
+        help="resolve the upstream model and draft again instead of using the installation",
     )
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("prepare")

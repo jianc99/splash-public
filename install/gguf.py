@@ -6,6 +6,7 @@ special-token IDs and the chat template always come from the selected GGUF.
 
 from __future__ import annotations
 
+import collections
 import json
 import struct
 from pathlib import Path
@@ -35,29 +36,46 @@ class Metadata:
         12: "d",
     }
 
-    def __init__(self, path):
+    def __init__(self, source, *, tensors=False):
+        """Read a local path, or a binary stream at the start of the file such
+        as a Hub range reader. tensors also reads each tensor's type."""
         self.values = {}
-        with Path(path).open("rb") as self.stream:
+        self.tensors = {}
+        self.consumed = 0
+        stream = Path(source).open("rb") if isinstance(source, (str, Path)) else source
+        with stream as self.stream:
             if self.read(4) != b"GGUF" or self.scalar("I") not in (2, 3):
                 raise ModelError(
                     "unsupported GGUF header (expected little-endian v2/v3)"
                 )
-            self.scalar("Q")  # Tensor count; tensor data is not needed here.
+            tensor_count = self.scalar("Q")
             count = self.scalar("Q")
-            if count > self.MAX_ITEMS:
+            if count > self.MAX_ITEMS or tensor_count > self.MAX_ITEMS:
                 raise ModelError("GGUF metadata has too many fields")
             for _ in range(count):
                 key = self.string()
                 if key in self.values:
                     raise ModelError("duplicate GGUF metadata key: " + key)
                 self.values[key] = self.value(self.scalar("I"))
+            for _ in range(tensor_count if tensors else 0):
+                name = self.string()
+                dimensions = self.scalar("I")
+                if dimensions > 8:
+                    raise ModelError("invalid GGUF tensor rank: " + name)
+                self.read(8 * dimensions)
+                kind = self.scalar("I")
+                self.scalar("Q")  # Data offset; the payload is never read here.
+                if name in self.tensors:
+                    raise ModelError("duplicate GGUF tensor: " + name)
+                self.tensors[name] = kind
 
     def read(self, size):
-        if size > self.MAX_BYTES - self.stream.tell():
+        if size > self.MAX_BYTES - self.consumed:
             raise ModelError("GGUF metadata exceeds the size limit")
         data = self.stream.read(size)
         if len(data) != size:
             raise ModelError("truncated GGUF metadata")
+        self.consumed += size
         return data
 
     def scalar(self, fmt):
@@ -230,6 +248,11 @@ def model_config(metadata, vision=None):
     text.update(
         model_type=types[arch], vocab_size=len(m.require("tokenizer.ggml.tokens", list))
     )
+    if arch == "qwen35moe":
+        text.update(
+            num_experts=m.positive(arch + ".expert_count"),
+            num_experts_per_tok=m.positive(arch + ".expert_used_count"),
+        )
     config = {"model_type": types[arch].removesuffix("_text"), "text_config": text}
     if vision is not None:
         config["vision_config"] = vision_config(vision)
@@ -279,6 +302,80 @@ def processor_config(m):
         "image_mean": m.require("clip.vision.image_mean", list),
         "image_std": m.require("clip.vision.image_std", list),
     }
+
+
+# GGML tensor type names, and the ones the native loader reads: its quantized
+# formats (metal/abi/QuantFormat.h, checked by the tests) and F32 for small float
+# tensors; token embeddings are gathered from Q4_K, Q6_K or Q8_0 rows.
+TENSOR_TYPES = {
+    0: "F32",
+    1: "F16",
+    2: "Q4_0",
+    3: "Q4_1",
+    6: "Q5_0",
+    7: "Q5_1",
+    8: "Q8_0",
+    10: "Q2_K",
+    11: "Q3_K",
+    12: "Q4_K",
+    13: "Q5_K",
+    14: "Q6_K",
+    16: "IQ2_XXS",
+    17: "IQ2_XS",
+    18: "IQ3_XXS",
+    19: "IQ1_S",
+    20: "IQ4_NL",
+    21: "IQ3_S",
+    22: "IQ2_S",
+    23: "IQ4_XS",
+    29: "IQ1_M",
+    30: "BF16",
+    39: "MXFP4",
+}
+LOADABLE_TYPES = {
+    "F32",
+    "Q3_K",
+    "Q4_K",
+    "Q5_K",
+    "Q6_K",
+    "Q8_0",
+    "IQ3_S",
+    "IQ4_NL",
+    "IQ4_XS",
+}
+EMBEDDING_TYPES = {"Q4_K", "Q6_K", "Q8_0"}
+
+
+def require_loadable(m):
+    """Reject a target whose tensor types the native loader cannot read, from
+    its header alone, so an unusable file is never downloaded. MTP layers are
+    not loaded, so their types do not matter."""
+    arch = m.require("general.architecture", str)
+    layers = m.positive(arch + ".block_count") - m.values.get(
+        arch + ".nextn_predict_layers", 0
+    )
+    unsupported = collections.Counter()
+    for name, kind in m.tensors.items():
+        parts = name.split(".")
+        if (
+            parts[0] == "blk"
+            and len(parts) > 1
+            and parts[1].isdigit()
+            and int(parts[1]) >= layers
+        ):
+            continue
+        type_name = TENSOR_TYPES.get(kind, f"type {kind}")
+        if type_name not in (
+            EMBEDDING_TYPES if name == "token_embd.weight" else LOADABLE_TYPES
+        ):
+            unsupported[type_name] += 1
+    if unsupported:
+        listed = ", ".join(
+            f"{name} ({count} tensors)" for name, count in sorted(unsupported.items())
+        )
+        raise ModelError(
+            f"this GGUF uses tensor types Splash cannot load: {listed}; choose another variant"
+        )
 
 
 def json_bytes(value):
