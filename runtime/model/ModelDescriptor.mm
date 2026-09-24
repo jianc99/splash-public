@@ -250,11 +250,24 @@ void validateCaptureLayers(NSDictionary *draft) {
   }
 }
 
-// The target and draft declarations and the tokenizer of a Qwen3.6 MoE
-// package, whatever its weight format.
-void validateQwen36Declarations(NSDictionary *manifest,
-                                const std::filesystem::path &root,
-                                const ModelDescriptor &descriptor) {
+void validateQwen36(NSDictionary *manifest,
+                    const std::filesystem::path &root,
+                    const ModelDescriptor &descriptor) {
+  requireEqual(requireUnsigned(manifest, @"schema_version", "schema_version"),
+               4, "schema_version");
+  NSDictionary *format =
+      requireObject(manifest, @"format", "model weight format");
+  requireEqual(requireUnsigned(format, @"q4_bits", "q4_bits"), 4,
+               "q4_bits");
+  requireEqual(requireUnsigned(format, @"q8_bits", "q8_bits"), 8,
+               "q8_bits");
+  requireEqual(requireUnsigned(format, @"quant_group_size",
+                               "quant_group_size"),
+               kQ4GroupElements, "quant_group_size");
+  requireEqual(requireUnsigned(format, @"storage_n", "storage_n"),
+               kQ4StorageN, "storage_n");
+  validateCommonFormat(format, Qwen3_6MoeLayout::layerMagic);
+
   const auto &targetLayout = std::get<Qwen3_6MoeLayout>(descriptor.target);
   NSDictionary *target =
       requireObject(manifest, @"target", "target declaration");
@@ -301,26 +314,6 @@ void validateQwen36Declarations(NSDictionary *manifest,
   }
   validateCaptureLayers(draft);
   validateTokenizer(root, descriptor, "qwen3_5_moe_text");
-}
-
-void validateQwen36(NSDictionary *manifest,
-                    const std::filesystem::path &root,
-                    const ModelDescriptor &descriptor) {
-  requireEqual(requireUnsigned(manifest, @"schema_version", "schema_version"),
-               4, "schema_version");
-  NSDictionary *format =
-      requireObject(manifest, @"format", "model weight format");
-  requireEqual(requireUnsigned(format, @"q4_bits", "q4_bits"), 4,
-               "q4_bits");
-  requireEqual(requireUnsigned(format, @"q8_bits", "q8_bits"), 8,
-               "q8_bits");
-  requireEqual(requireUnsigned(format, @"quant_group_size",
-                               "quant_group_size"),
-               kQ4GroupElements, "quant_group_size");
-  requireEqual(requireUnsigned(format, @"storage_n", "storage_n"),
-               kQ4StorageN, "storage_n");
-  validateCommonFormat(format, Qwen3_6MoeLayout::layerMagic);
-  validateQwen36Declarations(manifest, root, descriptor);
 }
 
 
@@ -480,24 +473,6 @@ ModelDescriptor inspectModelPackage(const std::filesystem::path &root) {
     if (format == "splash-packed-q4") {
       descriptor = qwen38Descriptor(model);
       validateQwen38(manifest, root, descriptor);
-    } else if (format == "gguf") {
-      // The schema names the target as for the packed formats: 3 Qwen3.8,
-      // 4 Qwen3.6 MoE. The loader checks the GGUF's architecture against it.
-      const uint64_t schema =
-          requireUnsigned(manifest, @"schema_version", "schema_version");
-      if (schema == 3) {
-        descriptor = qwen38Descriptor(model);
-        validateTokenizer(root, descriptor, "qwen3_5_text");
-      } else if (schema == 4) {
-        descriptor = qwen36Descriptor(model);
-        validateQwen36Declarations(manifest, root, descriptor);
-      } else {
-        throw std::invalid_argument("unsupported GGUF package schema_version " +
-                                    std::to_string(schema));
-      }
-      validateCommonFormat(requireObject(manifest, @"format", "model weight format"),
-                           kGgufImageMagic);
-      descriptor.targetSource = TargetSource::Gguf;
     } else if (format == "splash-packed-q4-moe") {
       descriptor = qwen36Descriptor(model);
       validateQwen36(manifest, root, descriptor);
