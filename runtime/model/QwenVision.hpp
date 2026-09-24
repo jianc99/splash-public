@@ -24,11 +24,15 @@ struct QwenVisionWeights final {
 
 inline constexpr std::string_view kVisionMagic = "MDFV0001";
 
+// The packed vision/model.bin of directory.
 [[nodiscard]] QwenVisionWeights
 loadQwenVisionWeights(metal::MetalBackend &backend,
                       const std::filesystem::path &directory,
-                      ops::VisionLayout layout = {},
-                      VisionSource source = VisionSource::Packed,
+                      ops::VisionLayout layout = {});
+// The same layout, prepared from an upstream source.
+[[nodiscard]] QwenVisionWeights
+loadQwenVisionWeights(metal::MetalBackend &backend,
+                      const VisionPreparation &source,
                       PreparationCheck prepareCheck = {});
 
 } // namespace splash::model

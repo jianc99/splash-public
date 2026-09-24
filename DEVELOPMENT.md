@@ -181,10 +181,12 @@ header is read before the download; the tokenizer and configuration are derived
 from the downloaded file. Legacy manifest-based packages retain their explicitly
 declared component sources.
 Remote Python code is not loaded. Vision uses MLX's `vision_tower.*` tensors or
-the same GGUF repository's unquantized mmproj. Source adapters share one vision
-operator implementation: BF16 matrices retain their representation, F32 weights
-are read directly, and F16 values are promoted losslessly to F32. GGUF norm/bias
-parameters and position tables use F32. Intermediate activations remain BF16.
+the same GGUF repository's unquantized mmproj. Both source adapters prepare the
+packed `vision/model.bin` layout, which the one BF16 vision operator reads: BF16
+tensors are copied, and F32 or F16 tensors are converted only when every value is
+exactly a BF16. Otherwise preparation fails, naming the tensor and file. Unsloth's
+mmproj stores its 1-D tensors, patch embedding and position table as F32, all of
+them BF16-exact, and prepares byte-identical to the packed file.
 `--language-only` removes vision weights from startup and memory accounting and
 rejects image requests before decoding them.
 

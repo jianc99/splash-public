@@ -1,4 +1,6 @@
-"""Exercise both vision readers against independently serialized tensor layouts."""
+"""Prepare tiny MLX and GGUF vision towers and compare them with an independently
+serialized packed file; check the exact-BF16 rule and that invalid sources fail
+with their message and publish nothing."""
 
 import json
 import math
@@ -10,28 +12,22 @@ import tempfile
 from pathlib import Path
 
 ALIGN = 16384
+DTYPES = ("BF16", "F16", "F32")
+GGML_TYPES = {"F32": 0, "F16": 1, "Q4_0": 2, "BF16": 30}
+SHARD = "model.safetensors"
 
 
-def packed(values, dtype):
+def encode(values, dtype):
     if dtype == "BF16":
         return b"".join(struct.pack("<f", x)[2:] for x in values)
-    return struct.pack("<" + ("f" if dtype == "F32" else "e") * len(values), *values)
+    code = {"F16": "e", "F32": "f", "F64": "d"}[dtype]
+    return struct.pack("<" + code * len(values), *values)
 
 
-def decoded(data, dtype):
-    if dtype == "BF16":
-        return [
-            struct.unpack("<f", b"\0\0" + data[i : i + 2])[0]
-            for i in range(0, len(data), 2)
-        ]
-    return list(
-        struct.unpack(
-            "<"
-            + ("f" if dtype == "F32" else "e")
-            * (len(data) // (4 if dtype == "F32" else 2)),
-            data,
-        )
-    )
+def bfloat16(values):
+    # The upper half of each value's F32 bits: the value itself when it is
+    # exactly a BF16.
+    return b"".join(struct.pack("<f", x)[2:] for x in values)
 
 
 def string(value):
@@ -39,99 +35,136 @@ def string(value):
     return struct.pack("<Q", len(data)) + data
 
 
-def fixture(root, source, corrupt=None):
+def safetensors(path, tensors):
+    header, data = {}, bytearray()
+    for name, (shape, dtype, raw) in tensors.items():
+        header[name] = {
+            "shape": shape,
+            "dtype": dtype,
+            "data_offsets": [len(data), len(data) + len(raw)],
+        }
+        data.extend(raw)
+    encoded = json.dumps(header).encode()
+    path.write_bytes(struct.pack("<Q", len(encoded)) + encoded + data)
+
+
+def gguf(path, metadata, tensors):
+    def field(value):
+        if isinstance(value, str):
+            return 8, string(value)
+        if isinstance(value, bool):
+            return 7, bytes([value])
+        if isinstance(value, int):
+            return 4, struct.pack("<I", value)
+        if isinstance(value, float):
+            return 6, struct.pack("<f", value)
+        kind, _ = field(value[0])
+        return 9, struct.pack("<IQ", kind, len(value)) + b"".join(
+            field(x)[1] for x in value
+        )
+
+    header = bytearray(struct.pack("<4sIQQ", b"GGUF", 3, len(tensors), len(metadata)))
+    for name, value in metadata.items():
+        kind, data = field(value)
+        header.extend(string(name) + struct.pack("<I", kind) + data)
+    data = bytearray()
+    for name, (shape, dtype, raw) in tensors.items():
+        header.extend(string(name) + struct.pack("<I", len(shape)))
+        header.extend(struct.pack("<" + "Q" * len(shape), *shape))
+        header.extend(struct.pack("<IQ", GGML_TYPES[dtype], len(data)))
+        data.extend(raw)
+        data.extend(bytes(-len(data) % 32))
+    header.extend(bytes(-len(header) % 32))
+    path.write_bytes(header + data)
+
+
+def fixture(root, source, shift=0, case=None):
+    """Writes a tiny tower (depth 2, width 8, 2x2 patches) whose tensors cycle
+    through BF16, F16 and F32, and the packed file it must prepare."""
     tensors = {}
     sections = []
 
-    def add(
-        mlx, gguf, rows, columns=1, padded_rows=None, padded_columns=None, patch=False
-    ):
+    def add(mlx, gguf_name, rows, columns=1, padded_rows=None, padded_columns=None):
         index = len(sections)
-        dtype = "BF16" if source == "mlx" else ("F32", "BF16", "F16")[index % 3]
-        if corrupt == "dtype" and (
-            (source == "mlx" and index == 0)
-            or (source == "gguf" and gguf == "mm.0.weight")
-        ):
-            dtype = "F32" if source == "mlx" else "Q4_0"
-        storage = (
-            "BF16"
-            if source == "mlx"
-            or (dtype == "BF16" and columns > 1 and "position" not in gguf)
-            else "F32"
-        )
-        # Deliberately non-BF16 values, not a sequence of exactly representable integers.
-        values = [
-            ((i * 7 + index * 11) % 257 - 128) / 1031 for i in range(rows * columns)
+        dtype = DTYPES[(index + shift) % 3]
+        # Exact in every dtype: signed zero, infinity, 2^-24 (an F16
+        # subnormal) and multiples of 1/64.
+        values = [-0.0, math.inf, 2.0**-24] + [
+            ((i * 7 + index * 11) % 255 - 127) / 64 for i in range(3, rows * columns)
         ]
-        raw = packed(values, "F32" if dtype == "Q4_0" else dtype)
-        rounded = decoded(raw, "F32" if dtype == "Q4_0" else dtype)
-        if patch:
-            # Oracle output order is [output, channel, temporal, patch-row, patch-col].
+        if case == "inexact-f32" and index == 0:
+            values[5] = 1 + 2.0**-20
+        if case == "inexact-f16" and index == 0:
+            values[5] = 1 + 2.0**-10
+        if index == 0:
+            # One patch row is [frame, patch-row, patch-col, channel] in MLX and
+            # [channel, patch-row, patch-col] per frame in GGUF. Packed rows are
+            # [channel, frame, patch-row, patch-col].
+            def at(row, frame, pixel, channel):
+                return values[row * 24 + (frame * 4 + pixel) * 3 + channel]
+
             if source == "mlx":
-                tensors["vision_tower." + mlx] = ([rows, 2, 2, 2, 3], dtype, raw)
-                converted = [
-                    rounded[r * 24 + t * 12 + pixel * 3 + channel]
-                    for r in range(rows)
-                    for channel in range(3)
-                    for t in range(2)
-                    for pixel in range(4)
-                ]
+                tensors["vision_tower." + mlx] = (
+                    [rows, 2, 2, 2, 3],
+                    dtype,
+                    encode(values, dtype),
+                )
             else:
-                # GGUF has one [output, channel, patch-row, patch-col] tensor per frame.
-                tensors[gguf] = (
-                    [2, 2, 3, rows],
-                    dtype,
-                    packed(rounded[: rows * 12], "F32" if dtype == "Q4_0" else dtype),
-                )
-                tensors[gguf + ".1"] = (
-                    [2, 2, 3, rows],
-                    dtype,
-                    packed(rounded[rows * 12 :], "F32" if dtype == "Q4_0" else dtype),
-                )
-                converted = [
-                    rounded[t * rows * 12 + r * 12 + channel * 4 + pixel]
-                    for r in range(rows)
-                    for channel in range(3)
-                    for t in range(2)
-                    for pixel in range(4)
-                ]
+                for frame, suffix in enumerate(("", ".1")):
+                    frame_values = [
+                        at(row, frame, pixel, channel)
+                        for row in range(rows)
+                        for channel in range(3)
+                        for pixel in range(4)
+                    ]
+                    tensors[gguf_name + suffix] = (
+                        [2, 2, 3, rows],
+                        dtype,
+                        encode(frame_values, dtype),
+                    )
+            values = [
+                at(row, frame, pixel, channel)
+                for row in range(rows)
+                for channel in range(3)
+                for frame in range(2)
+                for pixel in range(4)
+            ]
         else:
-            shape = (
-                [rows]
-                if columns == 1
-                else [rows, columns]
-                if source == "mlx"
-                else [columns, rows]
-            )
-            tensors[("vision_tower." + mlx) if source == "mlx" else gguf] = (
-                shape,
-                dtype,
-                raw,
-            )
-            converted = rounded
-        if corrupt == "shape" and index == 0:
-            name = next(iter(tensors))
-            shape, dt, data = tensors[name]
-            tensors[name] = ([math.prod(shape)], dt, data)
+            name = "vision_tower." + mlx if source == "mlx" else gguf_name
+            if columns == 1:
+                shape = [rows]
+            else:
+                shape = [rows, columns] if source == "mlx" else [columns, rows]
+            if case == "dtype" and mlx == "merger.linear_fc1.weight":
+                dtype = "F64" if source == "mlx" else "Q4_0"
+            raw = encode(values, "F32" if dtype == "Q4_0" else dtype)
+            tensors[name] = (shape, dtype, raw)
         output = []
         for row in range(padded_rows or rows):
             output.extend(
-                converted[row * columns : (row + 1) * columns]
+                values[row * columns : (row + 1) * columns]
                 if row < rows
-                else [0] * columns
+                else [0.0] * columns
             )
-            output.extend([0] * ((padded_columns or columns) - columns))
-        sections.append(packed(output, storage))
+            output.extend([0.0] * ((padded_columns or columns) - columns))
+        sections.append(bfloat16(output))
 
-    def affine(mlx, gguf, rows, columns, pr=None, pc=None, patch=False):
-        add(mlx + ".weight", gguf + ".weight", rows, columns, pr, pc, patch)
-        add(mlx + ".bias", gguf + ".bias", rows, padded_rows=pr)
+    def affine(mlx, gguf_name, rows, columns, padded_rows=None, padded_columns=None):
+        add(
+            mlx + ".weight",
+            gguf_name + ".weight",
+            rows,
+            columns,
+            padded_rows,
+            padded_columns,
+        )
+        add(mlx + ".bias", gguf_name + ".bias", rows, padded_rows=padded_rows)
 
-    def norm(mlx, gguf):
-        add(mlx + ".weight", gguf + ".weight", 8)
-        add(mlx + ".bias", gguf + ".bias", 8)
+    def norm(mlx, gguf_name):
+        add(mlx + ".weight", gguf_name + ".weight", 8)
+        add(mlx + ".bias", gguf_name + ".bias", 8)
 
-    affine("patch_embed.proj", "v.patch_embd", 8, 24, patch=True)
+    affine("patch_embed.proj", "v.patch_embd", 8, 24)
     add("pos_embed.weight", "v.position_embd.weight", 4, 8)
     for layer in range(2):
         m, g = f"blocks.{layer}.", f"v.blk.{layer}."
@@ -139,91 +172,60 @@ def fixture(root, source, corrupt=None):
         affine(m + "attn.qkv", g + "attn_qkv", 24, 8)
         affine(m + "attn.proj", g + "attn_out", 8, 8)
         norm(m + "norm2", g + "ln2")
-        affine(m + "mlp.linear_fc1", g + "ffn_up", 10, 8, pr=16)
-        affine(m + "mlp.linear_fc2", g + "ffn_down", 8, 10, pc=16)
+        affine(m + "mlp.linear_fc1", g + "ffn_up", 10, 8, padded_rows=16)
+        affine(m + "mlp.linear_fc2", g + "ffn_down", 8, 10, padded_columns=16)
     norm("merger.norm", "v.post_ln")
     affine("merger.linear_fc1", "mm.0", 32, 32)
     affine("merger.linear_fc2", "mm.2", 8, 32)
-    expected = bytearray(struct.pack("<8sII", b"MDFV0001", 2, int(source == "gguf")))
+    first = next(iter(tensors))
+    if case == "shape":
+        shape, dtype, raw = tensors[first]
+        tensors[first] = ([math.prod(shape)], dtype, raw)
+    expected = bytearray(struct.pack("<8sII", b"MDFV0001", 2, 0))
     expected.extend(bytes(ALIGN - len(expected)))
     for section in sections:
         expected.extend(section)
         expected.extend(bytes(-len(expected) % ALIGN))
     (root / "expected.bin").write_bytes(expected)
     if source == "mlx":
-        header, data = {}, bytearray()
-        for name, (shape, dtype, raw) in tensors.items():
-            header[name] = {
-                "shape": shape,
-                "dtype": dtype,
-                "data_offsets": [len(data), len(data) + len(raw)],
-            }
-            data.extend(raw)
-        encoded = json.dumps(header).encode()
-        (root / "model.safetensors").write_bytes(
-            struct.pack("<Q", len(encoded)) + encoded + data
-        )
+        safetensors(root / SHARD, tensors)
         (root / "config.json").write_text("{}")
-    else:
-        metadata = {
-            "general.architecture": "clip",
-            "clip.projector_type": "qwen3vl_merger",
-            "clip.vision.projection_dim": 8,
-            "clip.vision.patch_size": 2,
-            "clip.vision.embedding_length": 8,
-            "clip.vision.feed_forward_length": 10,
-            "clip.vision.block_count": 2,
-            "clip.vision.attention.head_count": 2,
-            "clip.vision.spatial_merge_size": 2,
-            "clip.use_gelu": True,
-            "clip.vision.attention.layer_norm_epsilon": 1e-6,
-            "clip.vision.image_mean": [0.5] * 3,
-            "clip.vision.image_std": [0.5] * 3,
-            "clip.vision.is_deepstack_layers": [False] * 2,
-            # Unknown metadata must not make an otherwise supported projector fail.
-            "clip.unused": ["ignored"],
-        }
-        if corrupt == "epsilon":
-            metadata["clip.vision.attention.layer_norm_epsilon"] = 1e-5
-        if corrupt == "deepstack":
-            metadata["clip.vision.is_deepstack_layers"] = [True, False]
+        return
+    metadata = {
+        "general.architecture": "clip",
+        "clip.projector_type": "qwen3vl_merger",
+        "clip.vision.projection_dim": 8,
+        "clip.vision.patch_size": 2,
+        "clip.vision.embedding_length": 8,
+        "clip.vision.feed_forward_length": 10,
+        "clip.vision.block_count": 2,
+        "clip.vision.attention.head_count": 2,
+        "clip.vision.spatial_merge_size": 2,
+        "clip.use_gelu": True,
+        "clip.vision.attention.layer_norm_epsilon": 1e-6,
+        "clip.vision.image_mean": [0.5] * 3,
+        "clip.vision.image_std": [0.5] * 3,
+        "clip.vision.is_deepstack_layers": [False] * 2,
+        # Unknown metadata must not make an otherwise supported projector fail.
+        "clip.unused": ["ignored"],
+    }
+    if case == "epsilon":
+        metadata["clip.vision.attention.layer_norm_epsilon"] = 1e-5
+    if case == "deepstack":
+        metadata["clip.vision.is_deepstack_layers"] = [True, False]
+    gguf(root / "mmproj.gguf", metadata, tensors)
 
-        def field(value):
-            if isinstance(value, str):
-                return 8, string(value)
-            if isinstance(value, bool):
-                return 7, bytes([value])
-            if isinstance(value, int):
-                return 4, struct.pack("<I", value)
-            if isinstance(value, float):
-                return 6, struct.pack("<f", value)
-            dt, _ = field(value[0])
-            return 9, struct.pack("<IQ", dt, len(value)) + b"".join(
-                field(x)[1] for x in value
-            )
 
-        header = bytearray(
-            struct.pack("<4sIQQ", b"GGUF", 3, len(tensors), len(metadata))
-        )
-        for name, value in metadata.items():
-            dt, data = field(value)
-            header.extend(string(name) + struct.pack("<I", dt) + data)
-        data = bytearray()
-        for name, (shape, dtype, raw) in tensors.items():
-            header.extend(
-                string(name)
-                + struct.pack("<I", len(shape))
-                + struct.pack("<" + "Q" * len(shape), *shape)
-            )
-            header.extend(
-                struct.pack(
-                    "<IQ", {"F32": 0, "F16": 1, "BF16": 30, "Q4_0": 2}[dtype], len(data)
-                )
-            )
-            data.extend(raw)
-            data.extend(bytes(-len(data) % 32))
-        header.extend(bytes(-len(header) % 32))
-        (root / "mmproj.gguf").write_bytes(header + data)
+def prepare(binary, directory, source, mode, expected=True):
+    command = [binary, source, str(directory), "tiny", mode]
+    if expected:
+        command.append(str(directory / "expected.bin"))
+    env = {**os.environ, "SPLASH_WEIGHT_CACHE": str(directory / "cache")}
+    return subprocess.run(command, env=env, text=True, capture_output=True)
+
+
+def published(directory):
+    return list((directory / "cache").glob("*/weights"))
 
 
 def main():
@@ -231,38 +233,53 @@ def main():
     with tempfile.TemporaryDirectory(prefix="splash-vision-preparation-") as temp:
         root = Path(temp)
         for source in ("mlx", "gguf"):
-            for case in (
-                None,
-                "shape",
-                "dtype",
-                *(("epsilon", "deepstack") if source == "gguf" else ()),
-            ):
+            mlx = source == "mlx"
+            file = SHARD if mlx else "mmproj.gguf"
+            # Every tensor as BF16, F16 and F32; BF16 is copied and exact F32
+            # or F16 values become their BF16 bits.
+            for shift in range(3):
+                directory = root / f"{source}-{shift}"
+                directory.mkdir()
+                fixture(directory, source, shift)
+                result = prepare(binary, directory, source, "cold")
+                assert result.returncode == 0, (source, shift, result.stderr)
+            patch = (
+                "vision_tower.patch_embed.proj.weight" if mlx else "v.patch_embd.weight"
+            )
+            merger = "vision_tower.merger.linear_fc1.weight" if mlx else "mm.0.weight"
+            dtype = "F64" if mlx else "Q4_0"
+            inexact = (
+                f"vision tensor {patch} in {{}} is not exactly representable in BF16"
+            )
+            # The patch embedding is F32 with shift 2 and F16 with shift 1.
+            rejected = {
+                ("inexact-f32", 2): inexact,
+                ("inexact-f16", 1): inexact,
+                ("shape", 0): f"vision tensor shape mismatch: {patch}",
+                ("dtype", 0): f"vision tensor {merger} in {{}} is {dtype}; "
+                "preparation reads BF16, F16 or F32",
+            }
+            if not mlx:
+                rejected |= {
+                    ("epsilon", 0): "vision LayerNorm epsilon mismatch",
+                    ("deepstack", 0): "vision deepstack layers are unsupported",
+                }
+            for (case, shift), message in rejected.items():
                 directory = root / f"{source}-{case}"
                 directory.mkdir()
-                fixture(directory, source, case)
-                env = {**os.environ, "SPLASH_WEIGHT_CACHE": str(directory / "cache")}
-                result = subprocess.run(
-                    [
-                        binary,
-                        source,
-                        str(directory),
-                        "tiny",
-                        str(directory / "expected.bin"),
-                    ],
-                    env=env,
-                    text=True,
-                    capture_output=True,
+                fixture(directory, source, shift, case)
+                result = prepare(binary, directory, source, "cold")
+                expected = message.format(directory / file)
+                errors = result.stderr.strip().splitlines()
+                assert result.returncode == 1 and errors[-1] == expected, (
+                    source,
+                    case,
+                    result.stderr,
                 )
-                if case:
-                    assert result.returncode != 0, (source, case, result.stdout)
-                    assert not list((directory / "cache").glob("*/weights")), (
-                        source,
-                        case,
-                    )
-                else:
-                    assert result.returncode == 0, result.stderr
+                assert not published(directory), (source, case)
         print(
-            "Vision source layouts, dtype preservation, warm reuse and invalid metadata PASS"
+            "Vision layouts from MLX and GGUF, exact BF16 conversion and rejected "
+            "sources PASS"
         )
 
 

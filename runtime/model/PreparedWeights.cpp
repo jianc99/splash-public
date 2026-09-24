@@ -240,6 +240,7 @@ struct WeightSource::Impl {
 WeightSource::WeightSource(const std::filesystem::path &path, const PreparationCheck &check)
     : impl_(std::make_unique<Impl>(path, check)) { checkUnchanged(); }
 WeightSource::~WeightSource() = default;
+const std::filesystem::path &WeightSource::path() const noexcept { return impl_->path; }
 int WeightSource::descriptor() const noexcept { return impl_->file; }
 const std::string &WeightSource::digest() const noexcept { return impl_->digest; }
 void WeightSource::checkUnchanged() const {

@@ -25,19 +25,14 @@ struct VisionLayout final {
   bool operator==(const VisionLayout &) const = default;
 };
 
-enum class VisionPrecision : uint8_t { BFloat16, Float32 };
-
 struct VisionAffine final {
   metal::MetalBuffer weight;
   metal::MetalBuffer bias;
-  VisionPrecision weightPrecision = VisionPrecision::BFloat16;
-  VisionPrecision biasPrecision = VisionPrecision::BFloat16;
 };
 
 struct VisionNorm final {
   metal::MetalBuffer weight;
   metal::MetalBuffer bias;
-  VisionPrecision precision = VisionPrecision::BFloat16;
 };
 
 struct VisionBlock final {
@@ -53,7 +48,6 @@ struct VisionWeights final {
   VisionLayout layout;
   VisionAffine patchEmbedding;
   metal::MetalBuffer positionTable;
-  VisionPrecision positionPrecision = VisionPrecision::BFloat16;
   std::vector<VisionBlock> blocks;
   VisionNorm mergerNorm;
   VisionAffine mergerUpProjection;

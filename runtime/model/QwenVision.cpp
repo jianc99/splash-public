@@ -21,91 +21,67 @@ void validateLayout(const ops::VisionLayout &layout) {
   }
 }
 
-class VisionReader {
-public:
-  VisionReader(WeightFile &file,
-               const std::vector<ops::VisionPrecision> &precision)
-      : file_(file), precision_(precision) {}
-  std::pair<metal::MetalBuffer, ops::VisionPrecision>
-  tensor(uint64_t elements, std::string_view label) {
-    if (cursor_ == precision_.size())
-      throw WeightStoreError("missing vision storage type");
-    const auto type = precision_[cursor_++];
-    const uint64_t unit = type == ops::VisionPrecision::Float32 ? 4 : 2;
-    return {file_.section(
-                checkedWeightMultiply(elements, unit, "vision tensor bytes"),
-                label),
-            type};
-  }
-  ops::VisionAffine affine(uint32_t rows, uint32_t columns,
-                           std::string_view label) {
-    auto [weight, weightType] = tensor(uint64_t(rows) * columns, label);
-    auto [bias, biasType] = tensor(rows, label);
-    return {std::move(weight), std::move(bias), weightType, biasType};
-  }
-  ops::VisionNorm norm(uint32_t width, std::string_view label) {
-    auto [weight, weightType] = tensor(width, label);
-    auto [bias, biasType] = tensor(width, label);
-    if (weightType != biasType)
-      throw WeightStoreError("vision norm storage types differ");
-    return {std::move(weight), std::move(bias), weightType};
-  }
+ops::VisionAffine readAffine(WeightFile &file, uint32_t outputSize,
+                             uint32_t inputSize, std::string_view label) {
+  return {
+      file.section(checkedWeightMultiply(
+                       checkedWeightMultiply(outputSize, inputSize,
+                                             "vision weight elements"),
+                       kBFloat16Bytes, "vision weight bytes"),
+                   label),
+      file.section(checkedWeightMultiply(outputSize, kBFloat16Bytes,
+                                         "vision bias bytes"),
+                   label),
+  };
+}
 
-private:
-  WeightFile &file_;
-  const std::vector<ops::VisionPrecision> &precision_;
-  size_t cursor_ = 0;
-};
+ops::VisionNorm readNorm(WeightFile &file, uint32_t width,
+                         std::string_view label) {
+  const uint64_t bytes =
+      checkedWeightMultiply(width, kBFloat16Bytes, "vision norm bytes");
+  return {file.section(bytes, label), file.section(bytes, label)};
+}
 
-} // namespace
-
-QwenVisionWeights loadQwenVisionWeights(metal::MetalBackend &backend,
-                                        const std::filesystem::path &directory,
-                                        ops::VisionLayout layout,
-                                        VisionSource source,
-                                        PreparationCheck prepareCheck) {
-  validateLayout(layout);
+QwenVisionWeights readVision(metal::MetalBackend &backend,
+                             const std::filesystem::path &path,
+                             std::string contentIdentity,
+                             const ops::VisionLayout &layout) {
   const uint64_t allocationBaseline = backend.memoryStats().allocatedBytes;
   QwenVisionWeights result;
   result.tensors.layout = layout;
   result.tensors.blocks.reserve(layout.depth);
 
-  const auto prepared = prepareVisionWeights(
-      directory, source, layout, [&backend] { backend.checkOperation(); },
-      prepareCheck);
-  WeightFile file(backend, prepared.path, "vision/model.bin", kVisionMagic,
-                  layout.depth, source == VisionSource::Gguf ? 1 : 0,
-                  source == VisionSource::Packed
-                      ? ""
-                      : prepared.path.parent_path().filename().string());
-  VisionReader reader(file, prepared.precision);
+  WeightFile file(backend, path, "vision/model.bin", kVisionMagic, layout.depth,
+                  0, std::move(contentIdentity));
   result.tensors.patchEmbedding =
-      reader.affine(layout.hiddenSize, layout.patchDimension, "patch-embed");
-  auto [position, positionType] =
-      reader.tensor(uint64_t(layout.positionGridSide) *
-                        layout.positionGridSide * layout.hiddenSize,
-                    "position-table");
-  result.tensors.positionTable = std::move(position);
-  result.tensors.positionPrecision = positionType;
-
+      readAffine(file, layout.hiddenSize, layout.patchDimension, "patch-embed");
+  result.tensors.positionTable = file.section(
+      checkedWeightMultiply(
+          checkedWeightMultiply(
+              checkedWeightMultiply(layout.positionGridSide,
+                                    layout.positionGridSide,
+                                    "vision position count"),
+              layout.hiddenSize, "vision position elements"),
+          kBFloat16Bytes, "vision position bytes"),
+      "position-table");
   for (uint32_t blockIndex = 0; blockIndex < layout.depth; ++blockIndex) {
     ops::VisionBlock block;
-    block.norm1 = reader.norm(layout.hiddenSize, "norm1");
-    block.qkv = reader.affine(3 * layout.hiddenSize, layout.hiddenSize, "qkv");
+    block.norm1 = readNorm(file, layout.hiddenSize, "norm1");
+    block.qkv = readAffine(file, 3 * layout.hiddenSize, layout.hiddenSize, "qkv");
     block.projection =
-        reader.affine(layout.hiddenSize, layout.hiddenSize, "proj");
-    block.norm2 = reader.norm(layout.hiddenSize, "norm2");
-    block.upProjection =
-        reader.affine(layout.paddedIntermediateSize, layout.hiddenSize, "fc1");
-    block.downProjection =
-        reader.affine(layout.hiddenSize, layout.paddedIntermediateSize, "fc2");
+        readAffine(file, layout.hiddenSize, layout.hiddenSize, "proj");
+    block.norm2 = readNorm(file, layout.hiddenSize, "norm2");
+    block.upProjection = readAffine(file, layout.paddedIntermediateSize,
+                                    layout.hiddenSize, "fc1");
+    block.downProjection = readAffine(file, layout.hiddenSize,
+                                      layout.paddedIntermediateSize, "fc2");
     result.tensors.blocks.push_back(std::move(block));
   }
-  result.tensors.mergerNorm = reader.norm(layout.hiddenSize, "merger-norm");
-  result.tensors.mergerUpProjection = reader.affine(
-      layout.mergedHiddenSize, layout.mergedHiddenSize, "merger-fc1");
-  result.tensors.mergerDownProjection = reader.affine(
-      layout.outputHiddenSize, layout.mergedHiddenSize, "merger-fc2");
+  result.tensors.mergerNorm = readNorm(file, layout.hiddenSize, "merger-norm");
+  result.tensors.mergerUpProjection = readAffine(
+      file, layout.mergedHiddenSize, layout.mergedHiddenSize, "merger-fc1");
+  result.tensors.mergerDownProjection = readAffine(
+      file, layout.outputHiddenSize, layout.mergedHiddenSize, "merger-fc2");
   file.finish();
   result.files.push_back(file.record());
 
@@ -113,6 +89,23 @@ QwenVisionWeights loadQwenVisionWeights(metal::MetalBackend &backend,
   result.actualAllocatedBytes = metal::allocationDelta(
       allocationBaseline, backend.memoryStats().allocatedBytes);
   return result;
+}
+
+} // namespace
+
+QwenVisionWeights loadQwenVisionWeights(metal::MetalBackend &backend,
+                                        const std::filesystem::path &directory,
+                                        ops::VisionLayout layout) {
+  validateLayout(layout);
+  return readVision(backend, directory / "model.bin", {}, layout);
+}
+
+QwenVisionWeights loadQwenVisionWeights(metal::MetalBackend &backend,
+                                        const VisionPreparation &source,
+                                        PreparationCheck prepareCheck) {
+  validateLayout(source.layout());
+  return readVision(backend, source.prepare(prepareCheck), source.weight().key,
+                    source.layout());
 }
 
 } // namespace splash::model

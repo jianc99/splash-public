@@ -127,12 +127,7 @@ void Vision::addGemm(CommandGraph &graph, const char *pipeline,
                      const MetalBuffer &output, const MetalBuffer &residual,
                      uint32_t outputSize, uint32_t inputSize, uint32_t rows,
                      uint32_t tileRows, uint32_t tileColumns) const {
-  std::string name(pipeline);
-  if (weights.weightPrecision == VisionPrecision::Float32) {
-    if (weights.biasPrecision != VisionPrecision::Float32) throw std::invalid_argument("F32 vision projection requires F32 bias");
-    name += "_f32";
-  } else if (weights.biasPrecision == VisionPrecision::Float32) name += "_f32_bias";
-  graph.add(name, {input, weights.weight, weights.bias, output, residual},
+  graph.add(pipeline, {input, weights.weight, weights.bias, output, residual},
             VisionGemmParams{outputSize, inputSize},
             {(rows + tileRows - 1) / tileRows, outputSize / tileColumns, 1});
 }
@@ -140,8 +135,7 @@ void Vision::addGemm(CommandGraph &graph, const char *pipeline,
 void Vision::addNorm(CommandGraph &graph, const MetalBuffer &input,
                      const VisionNorm &weights, const MetalBuffer &output,
                      uint32_t rows) const {
-  graph.add(weights.precision == VisionPrecision::Float32 ? "vision_layer_norm_f32" : "vision_layer_norm",
-            {input, weights.weight, weights.bias, output},
+  graph.add("vision_layer_norm", {input, weights.weight, weights.bias, output},
             VisionNormParams{model_.layout.hiddenSize}, {rows, 1, 1});
 }
 
@@ -175,7 +169,7 @@ void Vision::encode(CommandGraph &graph, ImageGrid grid,
 
   graph.add("vision_patchify", {pixels, scratch(Scratch::Patches)}, gridParams,
             {tokens, 1, 1});
-  graph.add(model_.positionPrecision == VisionPrecision::Float32 ? "vision_prepare_positions_f32" : "vision_prepare_positions",
+  graph.add("vision_prepare_positions",
             {model_.positionTable, scratch(Scratch::Positions),
              scratch(Scratch::RopeCos), scratch(Scratch::RopeSin)},
             gridParams, {tokens, 1, 1});

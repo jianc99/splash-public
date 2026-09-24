@@ -1,21 +1,38 @@
+// Prepares one vision source and prints the prepared file and its cache key.
+//
+//   vision-preparation mlx|gguf DIRECTORY tiny|27b|35b cold|warm [EXPECTED]
+//
+// warm requires a cache hit. EXPECTED is an independently serialized file the
+// prepared bytes must equal.
+
 #include "model/VisionPreparation.hpp"
+
+#include <algorithm>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 using namespace splash;
+
 int main(int argc, char **argv) {
   try {
-    if (argc < 4 || argc > 5)
-      throw std::runtime_error(
-          "usage: vision-preparation mlx|gguf DIRECTORY tiny|35b [EXPECTED]");
-    model::VisionSource source = std::string(argv[1]) == "mlx"
-                                     ? model::VisionSource::Safetensors
-                                     : model::VisionSource::Gguf;
+    if (argc < 5 || argc > 6)
+      throw std::runtime_error("usage: vision-preparation mlx|gguf DIRECTORY "
+                               "tiny|27b|35b cold|warm [EXPECTED]");
+    const std::string format = argv[1], size = argv[3], mode = argv[4];
+    if ((format != "mlx" && format != "gguf") ||
+        (size != "tiny" && size != "27b" && size != "35b") ||
+        (mode != "cold" && mode != "warm"))
+      throw std::runtime_error("invalid vision-preparation arguments");
+    const auto source = format == "mlx" ? model::VisionSource::Safetensors
+                                        : model::VisionSource::Gguf;
     ops::VisionLayout layout;
-    layout.outputHiddenSize = 2048;
-    if (std::string(argv[3]) == "tiny") {
+    if (size == "35b")
+      layout.outputHiddenSize = 2048;
+    if (size == "tiny") {
       layout.depth = 2;
       layout.hiddenSize = 8;
       layout.patchSize = 2;
@@ -28,36 +45,34 @@ int main(int argc, char **argv) {
       layout.headDimension = 4;
       layout.positionGridSide = 2;
     }
-    auto prepared = model::prepareVisionWeights(argv[2], source, layout);
-    if (prepared.bytes != model::preparedVisionBytes(argv[2], source, layout))
+    const auto forbidden = [] {
+      throw std::runtime_error("unexpected warm conversion");
+    };
+    const model::VisionPreparation preparation(argv[2], source, layout);
+    if (preparation.weight().bytes != model::preparedVisionBytes(layout))
       throw std::runtime_error("vision size estimate differs");
-    const auto warm =
-        model::prepareVisionWeights(argv[2], source, layout, {}, [] {
-          throw std::runtime_error("unexpected warm conversion");
-        });
-    if (warm.path != prepared.path)
+    const auto path = mode == "warm" ? preparation.prepare(forbidden)
+                                     : preparation.prepare();
+    if (model::VisionPreparation(argv[2], source, layout).prepare(forbidden) !=
+        path)
       throw std::runtime_error("warm cache miss");
-    if (argc == 5) {
-      std::ifstream actual(prepared.path, std::ios::binary),
-          expected(argv[4], std::ios::binary);
-      if (!expected || std::filesystem::file_size(argv[4]) != prepared.bytes)
+    if (argc == 6) {
+      std::ifstream actual(path, std::ios::binary),
+          expected(argv[5], std::ios::binary);
+      if (!expected || std::filesystem::file_size(argv[5]) !=
+                           std::filesystem::file_size(path))
         throw std::runtime_error("oracle size differs");
       std::vector<char> a(1024 * 1024), b(a.size());
-      uint64_t offset = 0;
-      while (actual) {
+      for (uint64_t offset = 0; actual; offset += a.size()) {
         actual.read(a.data(), a.size());
         const auto count = actual.gcount();
         expected.read(b.data(), count);
         if (!std::equal(a.begin(), a.begin() + count, b.begin()))
-          throw std::runtime_error("oracle bytes differ at chunk " +
+          throw std::runtime_error("oracle bytes differ in the MiB at " +
                                    std::to_string(offset));
-        offset += count;
       }
     }
-    std::cout << prepared.path << '\n';
-    for (auto type : prepared.precision)
-      std::cout << (type == ops::VisionPrecision::Float32 ? 4 : 2);
-    std::cout << '\n';
+    std::cout << path.string() << '\n' << preparation.weight().key << '\n';
   } catch (const std::exception &e) {
     std::cerr << e.what() << '\n';
     return 1;

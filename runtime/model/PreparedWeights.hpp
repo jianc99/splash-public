@@ -42,6 +42,7 @@ public:
   ~WeightSource();
   WeightSource(const WeightSource &) = delete;
   WeightSource &operator=(const WeightSource &) = delete;
+  [[nodiscard]] const std::filesystem::path &path() const noexcept;
   [[nodiscard]] int descriptor() const noexcept;
   [[nodiscard]] const std::string &digest() const noexcept;
   void checkUnchanged() const;

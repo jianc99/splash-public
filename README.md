@@ -83,7 +83,8 @@ on later starts. Unsupported or incomplete tokenizer metadata causes an explicit
 error; Splash does not substitute another tokenizer.
 
 Vision comes from the same source: embedded vision tensors for MLX, or the
-companion `mmproj` for GGUF. GGUF F32 weights stay F32; BF16 matrices stay BF16.
+companion `mmproj` for GGUF. Both are prepared as BF16; an F32 or F16 tensor
+loads only when every value is exactly a BF16, as in Unsloth's mmproj files.
 Use `--language-only` to skip vision loading and preparation. It also skips the
 GGUF mmproj download; MLX vision tensors share the language model's shards, so
 those shards still download in full.

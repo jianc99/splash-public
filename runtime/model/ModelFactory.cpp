@@ -46,9 +46,15 @@ ModelPackage loadPackage(metal::MetalBackend &backend,
       result.descriptor.target);
   result.draft = loadDFlashDraftWeights(
       backend, root / "draft", result.descriptor.draft);
-  if (result.descriptor.visionSource != VisionSource::None)
+  if (result.descriptor.visionSource == VisionSource::Safetensors ||
+      result.descriptor.visionSource == VisionSource::Gguf)
     result.vision = loadQwenVisionWeights(
-        backend, root / "vision", result.descriptor.vision, result.descriptor.visionSource, prepareCheck);
+        backend,
+        VisionPreparation(root / "vision", result.descriptor.visionSource, result.descriptor.vision,
+                          [&backend] { backend.checkOperation(); }),
+        prepareCheck);
+  else if (result.descriptor.visionSource == VisionSource::Packed)
+    result.vision = loadQwenVisionWeights(backend, root / "vision", result.descriptor.vision);
 
   std::vector<WeightFileRecord> records(result.targetFiles().begin(),
                                         result.targetFiles().end());
@@ -85,7 +91,7 @@ uint64_t preparedModelWeightBytes(const std::filesystem::path &root, const Model
     bytes = std::visit([](const auto &layout) { return preparedAffineBytes(layout); }, descriptor.target);
   }
   if (descriptor.visionSource == VisionSource::Safetensors || descriptor.visionSource == VisionSource::Gguf)
-    bytes += preparedVisionBytes(root / "vision", descriptor.visionSource, descriptor.vision);
+    bytes += preparedVisionBytes(descriptor.vision);
   for (std::string_view directory : {"target", "draft", "vision"}) {
     if (directory == "vision" && descriptor.visionSource != VisionSource::Packed) continue;
     if (directory == "target" && descriptor.targetSource != TargetSource::Packed) continue;
