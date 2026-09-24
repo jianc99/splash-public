@@ -59,6 +59,8 @@ TEST_GGUF_MOE := $(ENGINE_TEST_BUILD)/gguf-moe
 TEST_GGUF_REPACK := $(ENGINE_TEST_BUILD)/gguf-repack
 TEST_GGUF_DEQUANT_AIR := $(ENGINE_TEST_BUILD)/gguf-dequant.air
 TEST_GGUF_DEQUANT_LIB := $(ENGINE_TEST_BUILD)/gguf-dequant.metallib
+# Every hash the weight tests compare against, and how to update them.
+WEIGHT_GOLDENS := dev/tests/fixtures/weight-goldens/goldens.json
 TEST_KV_PAGE_CACHE_TEST := $(ENGINE_TEST_BUILD)/kv-page-cache
 TEST_KV_FIRST_CACHE_TEST := $(ENGINE_TEST_BUILD)/kv-first-cache
 TEST_DRAFT_CONTEXT_PLAN_TEST := $(ENGINE_TEST_BUILD)/draft-context-plan
@@ -551,11 +553,11 @@ METAL_TEST_ENV := MTL_SHADER_VALIDATION=1
 test-engine: test-engine-cpu test-engine-metal
 
 test-engine-cpu: $(TEST_CPU_TARGETS) $(TEST_ATTENTION_SWEEP) $(TUNE_KERNELS)
-	$(BUILD_ID_PYTHON) dev/tests/engine/run_vision_preparation.py $(TEST_VISION_PREPARATION)
+	$(BUILD_ID_PYTHON) dev/tests/engine/run_vision_preparation.py $(TEST_VISION_PREPARATION) $(WEIGHT_GOLDENS)
 	$(TEST_AFFINE_CHECKPOINT)
 	$(TEST_PREPARED_WEIGHTS)
 	$(TEST_GGUF_FILE)
-	$(TEST_GGUF_REPACK) --cpu
+	$(TEST_GGUF_REPACK) --cpu $(WEIGHT_GOLDENS)
 	$(TEST_DEVICE_QUERIES)
 	$(TEST_TUNING_WORKLOADS)
 	$(TEST_LINEAR_PLAN) --cpu
@@ -588,8 +590,9 @@ test-engine-cpu: $(TEST_CPU_TARGETS) $(TEST_ATTENTION_SWEEP) $(TUNE_KERNELS)
 	$(TEST_Q8_CPU_TEST)
 
 test-engine-metal: $(TEST_METAL_TARGETS)
-	$(METAL_TEST_ENV) $(BUILD_ID_PYTHON) dev/tests/engine/run_affine_preparation.py $(TEST_AFFINE_PREPARATION) $(LIB)
-	$(METAL_TEST_ENV) $(TEST_GGUF_REPACK) $(LIB)
+	$(METAL_TEST_ENV) $(BUILD_ID_PYTHON) dev/tests/engine/run_affine_preparation.py $(TEST_AFFINE_PREPARATION) $(LIB) \
+		$(WEIGHT_GOLDENS)
+	$(METAL_TEST_ENV) $(TEST_GGUF_REPACK) $(LIB) $(WEIGHT_GOLDENS)
 	$(METAL_TEST_ENV) $(TEST_GGUF_PROJECTION) $(TEST_GGUF_DEQUANT_LIB) dequant
 	$(METAL_TEST_ENV) $(TEST_GGUF_PROJECTION) $(TEST_PRODUCTION_LIB) full
 	$(METAL_TEST_ENV) $(TEST_GGUF_MOE) $(LIB)

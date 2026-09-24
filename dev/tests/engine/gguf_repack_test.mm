@@ -4,11 +4,11 @@
 // conversions refused when inexact), the sparse MoE layer (qwen35moe), every
 // format's planes through the production executor, and golden hashes of the
 // images the loader prepares.
-//   gguf-repack --cpu        the golden dequantization hashes and the plans
-//   gguf-repack <metallib>   also the prepared bytes
-// With SPLASH_GGML_ORACLE=<libggml-base.dylib> the reference is also compared
-// with GGML directly and GGML's hashes are printed; a build of llama.cpp
-// 7ab4ee7 regenerates kGolden.
+//   gguf-repack --cpu GOLDENS        the golden dequantization hashes and the plans
+//   gguf-repack <metallib> GOLDENS   also the prepared bytes
+// GOLDENS is dev/tests/fixtures/weight-goldens/goldens.json; its README says
+// how to update it. With SPLASH_GGML_ORACLE=<libggml-base.dylib> the reference
+// is also compared with GGML directly and GGML's hashes are printed.
 #import <Foundation/Foundation.h>
 
 #include "GgufFormatReference.hpp"
@@ -19,8 +19,6 @@
 #include <fcntl.h>
 #include <unistd.h>
 
-#include <CommonCrypto/CommonDigest.h>
-
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -28,6 +26,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <optional>
 #include <string>
 #include <vector>
@@ -44,15 +43,33 @@ void check(bool ok, const std::string &what) {
 }
 
 std::string sha256(const void *data, size_t bytes) {
-  unsigned char digest[CC_SHA256_DIGEST_LENGTH];
-  CC_SHA256(data, static_cast<CC_LONG>(bytes), digest);
-  std::string hex;
-  for (unsigned char byte : digest) {
-    char text[3];
-    std::snprintf(text, sizeof text, "%02x", byte);
-    hex += text;
-  }
-  return hex;
+  return splash::model::weightDigest({static_cast<const uint8_t *>(data), bytes});
+}
+
+// The hashes of one section of the goldens file, nested keys joined by '/'.
+using Goldens = std::map<std::string, std::string>;
+Goldens goldens(const char *path, NSString *section) {
+  NSData *data = [NSData dataWithContentsOfFile:@(path)];
+  NSDictionary *all = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+  if (![all isKindOfClass:NSDictionary.class] || ![all[section] isKindOfClass:NSDictionary.class])
+    throw std::runtime_error(std::string("no ") + section.UTF8String + " in " + path);
+  Goldens hashes;
+  const auto flatten = [&](auto &self, NSDictionary *object, const std::string &prefix) -> void {
+    for (NSString *key in object) {
+      const std::string name = prefix + key.UTF8String;
+      if ([object[key] isKindOfClass:NSDictionary.class]) self(self, object[key], name + "/");
+      else hashes[name] = [object[key] UTF8String];
+    }
+  };
+  flatten(flatten, all[section], "");
+  return hashes;
+}
+
+void checkGolden(const Goldens &hashes, const std::string &name, const std::string &actual, const std::string &what) {
+  const auto golden = hashes.find(name);
+  const bool matches = golden != hashes.end() && golden->second == actual;
+  check(matches, what);
+  if (!matches) std::printf("  %s is now %s\n", name.c_str(), actual.c_str());
 }
 
 // Every byte random and every half scale a random finite half: either sign,
@@ -67,26 +84,17 @@ std::vector<uint8_t> fixture(Fmt f, uint32_t rows, uint32_t K, uint32_t seed) {
   });
 }
 
-// SHA-256 of GGML's fp32 dequantization of fixture(f, 256, 1024, kGoldenSeed + f).
+// The goldens are SHA-256 of GGML's fp32 dequantization of
+// fixture(f, 256, 1024, kGoldenSeed + f).
 constexpr uint32_t kGoldenRows = 256, kGoldenK = 1024, kGoldenSeed = 7;
-const char *const kGolden[FMT_COUNT] = {
-    "36905e2a1a87522067f1dd4a59e5fa658390d01338bb2639df70d622b97804f4", // q4k
-    "39f9536d2c5efdfc8f566c176f9ffe8b2eefcc395caa9b2ef9111eb5fc76b453", // iq4xs
-    "efe2505213961362b93459a7eb511d7bee39487a2d7f870c0fa972912d93df29", // iq4nl
-    "8c2c2b9caf1e1831d516610e0bddf3acc7d736d2884bc1549dd9e579fdd61921", // q5k
-    "6478ac742b3e4010323642d0f99b91ba9f62513838cdfc775ec564062d86f117", // q6k
-    "8ecc6c113faf9fb8cc77d438dd595a146933c6c75394651cab377c41a55e5677", // q3k
-    "1f11dbe883e04db7367fbc5df5c7d2c34a14bae5d772501687a9072f9237b605", // q80
-    "dacc281a47cc2940e8352e3cd890283f69c8126d2894768ab7f179cf8fda34e8", // iq3s
-};
 
-void checkGoldens(void *ggml) {
+void checkGoldens(void *ggml, const Goldens &hashes) {
   for (int f = 0; f < FMT_COUNT; ++f) {
     const std::vector<uint8_t> native = fixture(Fmt(f), kGoldenRows, kGoldenK, kGoldenSeed + f);
     std::vector<float> values;
     repack(Fmt(f), native, kGoldenRows, kGoldenK, &values);
-    check(sha256(values.data(), values.size() * sizeof(float)) == kGolden[f],
-          std::string("CPU reference matches the GGML golden hash: ") + fmtName(f));
+    checkGolden(hashes, fmtName(f), sha256(values.data(), values.size() * sizeof(float)),
+                std::string("CPU reference matches the GGML golden hash: ") + fmtName(f));
     if (!ggml) continue;
     std::vector<float> official;
     std::string error;
@@ -840,34 +848,12 @@ void checkSourceIdentity(splash::metal::MetalBackend &backend) {
   }
 }
 
-// SHA-256 of every image the loader prepares from two small GGUFs: a dense
-// qwen35 target (both layer kinds, all eight formats, permuted value-head rows,
-// Q8_0 alpha/beta, F32 norms, bf16-exact convolution and time bias, Q6_K token
-// rows) and a qwen35moe layer (F32 alpha/beta, F32 router and shared-expert
-// gate, 3-D expert tensors). A different hash means the prepared bytes
-// changed; that needs a new preparation identity, so no cache entry of the
-// old bytes is served.
-struct GoldenImage {
-  const char *model, *image, *sha256;
-};
-constexpr GoldenImage kGoldenImages[] = {
-    {"dense", "target/layer-0.bin",
-     "3cb6434604cdcae0d93b72844939421eff05f98cff74196392c2153a5c0b4ab3"},
-    {"dense", "target/layer-1.bin",
-     "f7e1f9a7dec53a1a2396898a302d39e7877ee13bcb493f7240b7c9479df91bfe"},
-    {"dense", "target/head.bin",
-     "568caf2ce1c20591bbb6da095f1e94b47f868addf0ca3865fede7bafe7486e36"},
-    {"dense", "target/embedding.bin",
-     "6d17df18962f4941a0ce6538aa0092dba1073c78848a62f577a666b81a89e159"},
-    {"moe", "target/layer-0.bin",
-     "70d9d2727f5a8883507b6f7c3680913f6f8c3c131fbb90b01bffa05e831b637e"},
-    {"moe", "target/head.bin",
-     "3f61a8a408a40624b12f9564472930c655a84cdf5e1782191990f678fe80305c"},
-    {"moe", "target/embedding.bin",
-     "86a749f41cab45849eb9a2753025779ef1c58e74842b65290534eff4e29403e9"},
-};
-
-void checkGoldenImages(splash::metal::MetalBackend &backend) {
+// The goldens are SHA-256 of every image the loader prepares from two small
+// GGUFs: a dense qwen35 target (both layer kinds, all eight formats, permuted
+// value-head rows, Q8_0 alpha/beta, F32 norms, bf16-exact convolution and
+// time bias, Q6_K token rows) and a qwen35moe layer (F32 alpha/beta, F32
+// router and shared-expert gate, 3-D expert tensors).
+void checkGoldenImages(splash::metal::MetalBackend &backend, const Goldens &hashes) {
   namespace model = splash::model;
   using namespace model::ggml;
   char directory[] = "/tmp/splash-gguf-golden-XXXXXX";
@@ -897,12 +883,8 @@ void checkGoldenImages(splash::metal::MetalBackend &backend) {
         check(planned, std::string("GGUF loader plans the file it writes: ") + name + " " + record.relativePath);
         std::ifstream stream(cache / record.contentIdentity / "weights", std::ios::binary);
         const std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(stream)), {});
-        const std::string actual = sha256(bytes.data(), bytes.size());
-        const auto golden = std::find_if(std::begin(kGoldenImages), std::end(kGoldenImages), [&](const GoldenImage &g) {
-          return name == std::string_view(g.model) && record.relativePath == g.image;
-        });
-        check(golden != std::end(kGoldenImages) && actual == golden->sha256,
-              std::string("golden prepared bytes: ") + name + " " + record.relativePath + " " + actual);
+        const std::string image = std::string(name) + "/" + record.relativePath;
+        checkGolden(hashes, image, sha256(bytes.data(), bytes.size()), "golden prepared bytes: " + image);
       };
       for (uint32_t layer = 0; layer < geometry.layers; ++layer) hash(loader.layer(layer));
       hash(loader.head());
@@ -1096,8 +1078,8 @@ void checkRepack(splash::metal::MetalBackend &backend, Fmt f, const Shape &shape
 
 int main(int argc, char **argv) {
   @autoreleasepool {
-    if (argc != 2) {
-      std::fprintf(stderr, "usage: gguf-repack --cpu | <metallib>\n");
+    if (argc != 3) {
+      std::fprintf(stderr, "usage: gguf-repack --cpu|<metallib> GOLDENS\n");
       return 2;
     }
     void *ggml = nullptr;
@@ -1113,7 +1095,7 @@ int main(int argc, char **argv) {
       ~CacheCleanup() { std::filesystem::remove_all(path); }
     } cleanup{cachePath};
     setenv("SPLASH_WEIGHT_CACHE", cachePath, 1);
-    checkGoldens(ggml);
+    checkGoldens(ggml, goldens(argv[2], @"gguf_dequantization"));
     std::optional<splash::metal::MetalBackend> backend;
     if (std::string(argv[1]) != "--cpu") backend.emplace(argv[1]);
     splash::metal::MetalBackend *gpu = backend ? &*backend : nullptr;
@@ -1121,7 +1103,7 @@ int main(int argc, char **argv) {
     checkFloatTensors(gpu);
     checkMoeLayer(gpu);
     if (gpu) {
-      checkGoldenImages(*gpu);
+      checkGoldenImages(*gpu, goldens(argv[2], @"gguf_images"));
       checkSourceIdentity(*gpu);
       checkDenseTarget(*gpu);
       const Shape shapes[] = {{512, 1024, kNoPermute, 0, 0, 0},

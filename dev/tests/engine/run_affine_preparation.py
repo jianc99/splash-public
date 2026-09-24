@@ -20,24 +20,6 @@ from dev.tests.fixture_files import (  # noqa: E402
     write_safetensors,
 )
 
-# SHA-256 of every prepared image of the two fixtures. A change means the
-# prepared bytes changed: that needs a new preparation identity, so cached
-# images of the old layout are never served.
-GOLDEN = {
-    "dense": {
-        "target/layer-0.bin": "475768a2f36a25870f844e3c99d5cd1b85c00c8c3569f3f0abc3a1bffc14fd0b",
-        "target/layer-1.bin": "228844988bdd3ecf8cd32395b2a1fd3820f4bd7f91c68683f5b633e1c1919d1f",
-        "target/head.bin": "3dde9dffefd58b1b0bb06e445b4347eb2cf5412b203f1b2f6ebe00d681dc1c8f",
-        "target/embedding.bin": "5bfea1223081c0b006d617ee0fc044517937a4cd9fe9503421537e8d8c459211",
-    },
-    "moe": {
-        "target/layer-0.bin": "5b9926e5cbd89f8c772ed8308abc1e4dae140a67e2c44cddbd4ce8e688dcda61",
-        "target/layer-1.bin": "76e65f55a4b9ed13103583bd44da12fe2dc4258584b82a7df3f0f7cb0aebae69",
-        "target/head.bin": "25556e9c9b5c9629e2707cd4f90f82008a722cf82a64ec0dc97665ae242aefc6",
-        "target/embedding.bin": "3623464c3b923b290f556b1a66612f9012c0e249d3d49982b13300003dd81edf",
-    },
-}
-
 
 def fixture(root, moe=False):
     tensors = {}
@@ -191,7 +173,7 @@ def fixture(root, moe=False):
     write_safetensors(root / "model.safetensors", tensors)
 
 
-def prepare(binary, metallib, root, kind):
+def prepare(binary, metallib, root, kind, golden):
     command = [str(binary.resolve()), str(metallib.resolve()), str(root), kind]
     result = subprocess.run(command, capture_output=True, text=True, check=False)
     assert result.returncode == 0, result.stderr
@@ -203,7 +185,7 @@ def prepare(binary, metallib, root, kind):
             if line.startswith("prepared ")
         )
     }
-    assert hashes == GOLDEN[kind], (kind, hashes)
+    assert hashes == golden, (kind, hashes)
     print(result.stdout.splitlines()[-1])
     return command
 
@@ -212,16 +194,18 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", type=Path)
     parser.add_argument("metallib", type=Path)
+    parser.add_argument("goldens", type=Path)
     args = parser.parse_args()
+    goldens = json.loads(args.goldens.read_text())["affine_images"]
     with tempfile.TemporaryDirectory(prefix="splash-affine-preparation-") as directory:
         root = Path(directory) / "moe"
         root.mkdir()
         fixture(root, moe=True)
-        prepare(args.binary, args.metallib, root, "moe")
+        prepare(args.binary, args.metallib, root, "moe", goldens["moe"])
         root = Path(directory) / "dense"
         root.mkdir()
         fixture(root)
-        command = prepare(args.binary, args.metallib, root, "dense")
+        command = prepare(args.binary, args.metallib, root, "dense", goldens["dense"])
         # Raw checkpoints need a different normalization convention. Refuse
         # their unsanitized convolution layout before publishing any weights.
         source = root / "model.safetensors"
