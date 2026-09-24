@@ -31,10 +31,6 @@ class ModelFamily:
     draft_layers: int
 
     @property
-    def base_model(self):
-        return f"Qwen/{self.name}"
-
-    @property
     def draft_model(self):
         return f"incoai/{self.name}-DFlash2"
 
@@ -298,15 +294,29 @@ def prepare(args, repo=None):
             )
         return False
     family = match_family(repo_id, repo.base_models)
+    gguf = variant is not None or not any(
+        name.endswith(".safetensors") for name in repo.files
+    )
+    required = {"config.json", "tokenizer.json", "tokenizer_config.json"}
+    if not language_only:
+        required.add("preprocessor_config.json")
+    missing = required - repo.files
+    if missing:
+        raise models.ModelError(
+            f"target repository {repo_id} is missing: {', '.join(sorted(missing))}. "
+            "Configuration, tokenizer and processor must come from the target "
+            "repository; Splash does not download replacements from another repository."
+            + (
+                " Embedded GGUF tokenizer/configuration loading is not yet supported."
+                if gguf
+                else ""
+            )
+        )
     # Cache the model card too, so renamed repositories can still resolve their
     # declared base model without contacting the Hub on the next offline load.
     if "README.md" in repo.files:
         repo.file("README.md")
-    gguf = variant is not None or not any(
-        name.endswith(".safetensors") for name in repo.files
-    )
-    config_repo = repo if "config.json" in repo.files else Repository(family.base_model)
-    config = models.read_json(config_repo.file("config.json"))
+    config = models.read_json(repo.file("config.json"))
     validate_config(config, family)
     if not gguf:
         quant = config.get("quantization", config.get("quantization_config", {}))
@@ -319,24 +329,12 @@ def prepare(args, repo=None):
             raise models.ModelError(
                 "this model requires an MLX affine 4-bit/group-64 checkpoint or a supported GGUF"
             )
-    # Use the model's tokenizer, or its base repository when the GGUF repo has
-    # no tokenizer files. Never mix tokenizer files from multiple repositories.
-    tokenizer_repo = (
-        repo
-        if {"tokenizer.json", "tokenizer_config.json"} <= repo.files
-        else config_repo
-    )
-    if not {"tokenizer.json", "tokenizer_config.json"} <= tokenizer_repo.files:
-        raise models.ModelError("model repository has no complete HF tokenizer")
     draft = Repository(draft_override or family.draft_model)
     draft_names = _draft_files(draft, family)
     target_names = {select_gguf(repo.files, variant)} if gguf else _weight_files(repo)
     vision_name = select_vision(repo.files) if gguf and not language_only else None
-    processor_repo = config_repo
     if not language_only:
-        _validate_processor(
-            models.read_json(processor_repo.file("preprocessor_config.json"))
-        )
+        _validate_processor(models.read_json(repo.file("preprocessor_config.json")))
     print(
         f"Loading {args.model}; draft {draft.name}; vision {'disabled' if language_only else 'enabled'}.",
         flush=True,
@@ -348,7 +346,7 @@ def prepare(args, repo=None):
         files[
             "vision/mmproj.gguf" if name == vision_name else "target/" + Path(name).name
         ] = path
-    files["config.json"] = config_repo.file("config.json")
+    files["config.json"] = repo.file("config.json")
     if not gguf:
         files["target/config.json"] = files["config.json"]
         if not language_only:
@@ -356,15 +354,15 @@ def prepare(args, repo=None):
                 files["vision/" + name] = files["target/" + name]
             files["vision/config.json"] = files["config.json"]
     for name in TOKENIZER_FILES:
-        if name in tokenizer_repo.files:
-            files["tokenizer/" + name] = tokenizer_repo.file(name)
+        if name in repo.files:
+            files["tokenizer/" + name] = repo.file(name)
     files["tokenizer/config.json"] = files["config.json"]
     for name, path in draft.download(draft_names).items():
         files["draft/" + Path(name).name] = path
     if not language_only:
         for name in PROCESSOR_FILES:
-            if name in processor_repo.files:
-                files["processor/" + name] = processor_repo.file(name)
+            if name in repo.files:
+                files["processor/" + name] = repo.file(name)
     record = {
         "version": 1,
         "model": args.model,
@@ -372,8 +370,8 @@ def prepare(args, repo=None):
         "vision_format": "none" if language_only else "gguf" if gguf else "safetensors",
         "sources": {
             "target": repo.identity(),
-            "config": config_repo.identity(),
-            "tokenizer": tokenizer_repo.identity(),
+            "config": repo.identity(),
+            "tokenizer": repo.identity(),
             "draft": draft.identity(),
         },
         "files": {name: _file_record(path) for name, path in sorted(files.items())},

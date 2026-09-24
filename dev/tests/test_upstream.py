@@ -54,6 +54,38 @@ class UpstreamTest(unittest.TestCase):
                 {"text_config": {"model_type": family.text_type}}, family
             )
 
+    def test_missing_metadata_never_falls_back_to_another_repository(self):
+        required = {
+            "config.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "preprocessor_config.json",
+        }
+        for weight in ("model.safetensors", "model.gguf"):
+            for missing in (*sorted(required), None):
+                with self.subTest(weight=weight, missing=missing):
+                    with tempfile.TemporaryDirectory() as temporary:
+                        args = argparse.Namespace(
+                            model="user/Qwen3.6-35B-A3B-custom",
+                            models=Path(temporary) / "models",
+                            language_only=False,
+                        )
+                        source = mock.Mock()
+                        source.base_models = []
+                        source.files = {weight} | (
+                            required - {missing} if missing else set()
+                        )
+                        with mock.patch.object(upstream, "Repository") as resolve:
+                            with self.assertRaisesRegex(
+                                models.ModelError,
+                                "must come from the target repository",
+                            ):
+                                upstream.prepare(args, repo=source)
+                            resolve.assert_not_called()
+                        source.file.assert_not_called()
+                        source.download.assert_not_called()
+                        self.assertFalse(args.models.exists())
+
     def test_source_assembly_has_no_package_or_fixed_revision(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -111,6 +143,13 @@ class UpstreamTest(unittest.TestCase):
                 args.models, args.model, language_only=True
             )
             record = upstream.verify(installed)
+            for component in ("target", "config", "tokenizer"):
+                self.assertEqual(record["sources"][component], source.identity())
+            for name in ("tokenizer.json", "tokenizer_config.json"):
+                self.assertEqual(
+                    (installed / "tokenizer" / name).resolve(),
+                    (target / name).resolve(),
+                )
             self.assertEqual(record["vision_format"], "none")
             self.assertFalse((installed / "manifest.json").exists())
             self.assertFalse((installed / "vision").exists())

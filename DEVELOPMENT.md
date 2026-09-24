@@ -140,7 +140,6 @@ Examples:
 
 ```bash
 splash serve --model mlx-community/Qwen3.6-35B-A3B-4bit
-splash serve --model unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M
 splash serve --model mlx-community/Qwen3.8-27B-4bit --language-only
 ```
 
@@ -150,8 +149,14 @@ revisions. `--revision` can select a particular target branch, tag or commit.
 A complete cached snapshot can be used offline. The installer never rewrites
 upstream files. Older manifest-based packages use the legacy installer.
 
-The tokenizer and chat template come from the target repository when it includes
-a complete tokenizer, otherwise from the supported base model repository.
+The configuration, tokenizer, chat template and processor come from the same
+target repository and resolved snapshot. There is no implicit base-repository
+fallback. Missing required metadata is rejected before resolving the draft or
+downloading weights. GGUF repositories can use `--model OWNER/REPO:VARIANT`, but
+must currently supply HF configuration and tokenizer files alongside the GGUF.
+Embedded GGUF tokenizer/configuration loading remains unimplemented; GGUF-only
+repositories therefore fail explicitly. Legacy manifest-based packages retain
+their explicitly declared component sources.
 Remote Python code is not loaded. Vision uses MLX's `vision_tower.*` tensors or
 the same GGUF repository's unquantized mmproj. Source adapters share one vision
 operator implementation: BF16 matrices retain their representation, F32 weights

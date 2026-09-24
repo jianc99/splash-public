@@ -64,16 +64,23 @@ See [judgment contracts](DEVELOPMENT.md#judgment-contracts) for details.
 
 ## Models
 
-| Base model | MLX affine example | GGUF example |
-| --- | --- | --- |
-| Qwen3.8-27B | `mlx-community/Qwen3.8-27B-4bit` | `unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M` |
-| Qwen3.6-35B-A3B | `mlx-community/Qwen3.6-35B-A3B-4bit` | `unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M` |
+| Base model | MLX affine example |
+| --- | --- |
+| Qwen3.8-27B | `mlx-community/Qwen3.8-27B-4bit` |
+| Qwen3.6-35B-A3B | `mlx-community/Qwen3.6-35B-A3B-4bit` |
 
 `--model` accepts the upstream repository directly. Splash automatically matches
 its DFlash2 draft by base model and uses the model's tokenizer and chat template.
-When a GGUF repository has no tokenizer or configuration, these come from the
-base model's Hugging Face repository. A separate Splash support package is not
-required. Existing Splash packages remain loadable.
+Configuration, tokenizer, chat template and vision preprocessing metadata come
+from the same target repository and resolved snapshot. Missing metadata causes
+an error before weight downloads; Splash never substitutes another repository's
+files. Only the separate draft model is automatically paired. A separate Splash
+support package is not required. Existing Splash packages remain loadable.
+
+GGUF selection uses `--model OWNER/REPO:VARIANT` (for example `:UD-Q4_K_M`).
+The repository must currently also contain HF configuration and tokenizer files.
+Loading these from embedded GGUF metadata is not implemented yet, so GGUF-only
+repositories cannot currently be served directly through this upstream loader.
 
 Vision comes from the same source: embedded vision tensors for MLX, or the
 companion `mmproj` for GGUF. GGUF F32 weights stay F32; BF16 matrices stay BF16.
