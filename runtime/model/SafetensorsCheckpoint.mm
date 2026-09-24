@@ -16,8 +16,9 @@ uint64_t number(id value) {
   if (![value isKindOfClass:[NSNumber class]] || CFGetTypeID((__bridge CFTypeRef)value) == CFBooleanGetTypeID())
     throw WeightStoreError("safetensors metadata requires an integer");
   const double real = [value doubleValue];
-  // File offsets and shapes above 2^53 are neither usable on this backend nor
-  // exactly represented by all JSON readers.
+  // The checks run on the value as a double, which holds every integer
+  // exactly only up to 2^53 - 1; larger values, far beyond any tensor shape
+  // or file offset, are rejected rather than checked inexactly.
   if (!std::isfinite(real) || real < 0 || real > 9007199254740991.0 || std::floor(real) != real)
     throw WeightStoreError("invalid safetensors integer");
   return [value unsignedLongLongValue];

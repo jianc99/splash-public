@@ -13,8 +13,9 @@ enum class VisionSource : uint8_t { Packed, Safetensors, Gguf, None };
 // Source adapter for the vision tower: the vision_tower.* tensors of an MLX
 // checkpoint or a GGUF mmproj, both prepared into the packed vision/model.bin
 // (model/VisionPreparation.hpp). Construction validates the source's
-// metadata and plans the prepared file; tensor values are read only when
-// preparing.
+// metadata, plans the prepared file and computes its key, which hashes each
+// source file's tensor data once (later starts reuse the digest remembered
+// for the unchanged file); tensor values are converted only when preparing.
 class VisionLoader final {
 public:
   // check runs on every load, admitConversion on a cache miss.
