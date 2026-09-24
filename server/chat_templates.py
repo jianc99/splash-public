@@ -28,6 +28,8 @@ import re
 from dataclasses import dataclass
 
 from jinja2 import Environment, TemplateSyntaxError, nodes
+from jinja2.ext import Extension
+from jinja2.lexer import Token
 
 # What Splash does with a later system message.
 NATIVE = "native"
@@ -308,27 +310,27 @@ def _literal(text):
 
 def _patch(render, source, original):
     """The template with its rejecting or dropping construct replaced, or None."""
+    # Jinja lexes CRLF and CR as LF and renders them so; tags are located in
+    # the source as it lexes.
+    source = source.replace("\r\n", "\n").replace("\r", "\n")
     try:
-        tags = _tags(source)
-        blocks, parents = _blocks(tags)
-    except ValueError:
+        tree = _ENVIRONMENT.parse(source)
+    except TemplateSyntaxError:
         return None
-    # The one construct responsible, by position; none or several is no patch.
+    spans = _tag_spans(source)
+    find = _rejections if original == REJECTS else _skips
+    # The one construct responsible, as a tag; none or several is no patch.
     constructs = {
-        tag.start: (tag, variable)
-        for loop, variable in _message_loops(tags, blocks)
-        for tag in (
-            _rejections(tags, blocks, loop, variable)
-            if original == REJECTS
-            else _skips(tags, blocks, parents, loop, variable)
-        )
+        spans[node.lineno]: variable
+        for loop, variable in _message_loops(tree)
+        for node in find(loop, variable)
     }
     if len(constructs) != 1:
         return None
     block = _system_block(render, source)
     if block is None:
         return None
-    ((tag, variable),) = constructs.values()
+    (((start, end), variable),) = constructs.items()
     prefix, suffix = block
     # The later system message, rendered as the template renders a system
     # message: its own block around the trimmed content.
@@ -344,141 +346,82 @@ def _patch(render, source, original):
         # Render ahead of the condition that skipped the message. Leading
         # system messages are merged into the first message, so every system
         # message after the first is a later one.
-        text = source[tag.start : tag.end]
+        text = source[start:end]
         head = _STATEMENT_HEAD.match(text).group()
         replacement = (
             f"{head}if not loop.first and {variable}.role == 'system' %}}"
             f"{later}{head}el{text[len(head) :]}"
         )
-    return source[: tag.start] + replacement + source[tag.end :]
+    return source[:start] + replacement + source[end:]
 
 
-# Structural matching. Tags are located in the source; each construct's
-# expression is parsed by Jinja itself, so formatting and quoting do not
-# matter.
+# Structural matching. Jinja parses the template to find the construct, and
+# lexes it to locate the tag the construct was parsed from.
 
-_ENVIRONMENT = Environment()
-_TAG_START = re.compile(r"\{[{%#]")
-_TAG_END = {"{": "}}", "%": "%}", "#": "#}"}
-_RAW_END = re.compile(r"\{%[-+]?\s*endraw\s*[-+]?%\}")
-_STATEMENT_HEAD = re.compile(r"\{%[-+]?\s*")
-_KEYWORD = re.compile(r"[A-Za-z_]\w*")
-# Statements closed by "end" + keyword; ``set`` is one only without "=".
-_BLOCK_STATEMENTS = frozenset(
-    {
-        "autoescape",
-        "block",
-        "call",
-        "filter",
-        "for",
-        "generation",
-        "if",
-        "macro",
-        "trans",
-        "with",
-    }
+
+class _Generation(Extension):
+    """transformers' ``{% generation %}`` block, parsed as a plain scope."""
+
+    tags = {"generation"}
+
+    def parse(self, parser):
+        lineno = next(parser.stream).lineno
+        body = parser.parse_statements(("name:endgeneration",), drop_needle=True)
+        return nodes.Scope(body, lineno=lineno)
+
+
+class _TagNumbers(Extension):
+    """Numbers each parsed node by the tag it starts in, in place of its line,
+    so ``_tag_spans(source)[node.lineno]`` is where it was written."""
+
+    def filter_stream(self, stream):
+        number = -1
+        for token in stream:
+            if token.type in ("variable_begin", "block_begin"):
+                number += 1
+            yield Token(number, token.type, token.value)
+
+
+_ENVIRONMENT = Environment(
+    extensions=["jinja2.ext.loopcontrols", _Generation, _TagNumbers]
 )
-_BRANCH_STATEMENTS = frozenset({"elif", "else", "pluralize"})
+_STATEMENT_HEAD = re.compile(r"\{%[-+]?\s*")
 
 
-@dataclass(frozen=True, slots=True)
-class _Tag:
-    start: int
-    end: int
-    # "{" expression, "%" statement or "#" comment.
-    kind: str
-    # Between the delimiters, without whitespace control.
-    text: str
-
-    @property
-    def keyword(self):
-        word = _KEYWORD.match(self.text) if self.kind == "%" else None
-        return word.group() if word else ""
-
-
-def _tags(source):
-    """The template's tags in source order, without raw sections."""
-    tags, position = [], 0
-    while match := _TAG_START.search(source, position):
-        kind = match.group()[1]
-        close, cursor, quote = _TAG_END[kind], match.end(), None
-        while quote is not None or not source.startswith(close, cursor):
-            if cursor >= len(source):
-                raise ValueError("unterminated template tag")
-            char = source[cursor]
-            if quote is not None:
-                if char == "\\":
-                    cursor += 1
-                elif char == quote:
-                    quote = None
-            elif kind != "#" and char in "'\"":
-                quote = char
-            cursor += 1
-        text = source[match.end() : cursor]
-        text = text[1:] if text[:1] in ("-", "+") else text
-        text = text[:-1] if text[-1:] in ("-", "+") else text
-        tag = _Tag(match.start(), cursor + len(close), kind, text.strip())
-        position = tag.end
-        if tag.keyword == "raw":
-            end = _RAW_END.search(source, position)
-            if end is None:
-                raise ValueError("unterminated raw block")
-            position = end.end()
-        else:
-            tags.append(tag)
-    return tags
+def _tag_spans(source):
+    """Where each expression and statement tag is, in the order Jinja lexes
+    them (so strings, comments and raw sections are Jinja's own)."""
+    spans, cursor = [], 0
+    for _, token, value in _ENVIRONMENT.lex(source):
+        # Tokens follow each other, except for whitespace a "-" strips.
+        position = source.index(value, cursor)
+        cursor = position + len(value)
+        if token in ("variable_begin", "block_begin"):
+            start = position
+        elif token in ("variable_end", "block_end"):
+            # "-%}" and "-}}" take the whitespace they strip; the tag does not.
+            spans.append((start, position + len(value.rstrip())))
+    return spans
 
 
-def _blocks(tags):
-    """Each block's chain of tags (opening, branches, closing) by opening
-    index, and the innermost open block at every tag."""
-    blocks, parents, stack = {}, [], []
-    for index, tag in enumerate(tags):
-        keyword = tag.keyword
-        parents.append(stack[-1] if stack else None)
-        if keyword in _BLOCK_STATEMENTS or (keyword == "set" and "=" not in tag.text):
-            stack.append(index)
-            blocks[index] = [index]
-        elif keyword in _BRANCH_STATEMENTS:
-            if not stack:
-                raise ValueError("branch outside a block")
-            blocks[stack[-1]].append(index)
-        elif keyword.startswith("end"):
-            if not stack or tags[stack[-1]].keyword != keyword[3:]:
-                raise ValueError("unbalanced template block")
-            blocks[stack.pop()].append(index)
-    if stack:
-        raise ValueError("unclosed template block")
-    return blocks, parents
-
-
-def _parse(text):
-    try:
-        return _ENVIRONMENT.parse(text).body[0]
-    except TemplateSyntaxError:
-        return None
-
-
-def _condition(tag):
-    """The test of an ``if`` or ``elif`` tag."""
-    node = _parse(f"{{% if {tag.text[len(tag.keyword) :]} %}}{{% endif %}}")
-    return node.test if node is not None else None
-
-
-def _message_loops(tags, blocks):
-    """(opening index, loop variable) of each ``for`` over ``messages``."""
-    for index in blocks:
-        if tags[index].keyword != "for":
-            continue
-        node = _parse(f"{{% {tags[index].text} %}}{{% endfor %}}")
+def _message_loops(tree):
+    """(loop, variable) of each ``for`` over ``messages``."""
+    for loop in tree.find_all(nodes.For):
         if (
-            node is not None
-            and isinstance(node.target, nodes.Name)
-            and isinstance(node.iter, nodes.Name)
-            and node.iter.name == "messages"
-            and node.test is None
+            isinstance(loop.target, nodes.Name)
+            and isinstance(loop.iter, nodes.Name)
+            and loop.iter.name == "messages"
+            and loop.test is None
         ):
-            yield index, node.target.name
+            yield loop, loop.target.name
+
+
+def _within(body, kind):
+    """The nodes of a kind in a body, at any depth."""
+    for node in body:
+        if isinstance(node, kind):
+            yield node
+        yield from node.find_all(kind)
 
 
 def _terms(node, operator):
@@ -488,14 +431,13 @@ def _terms(node, operator):
     return [node]
 
 
-def _compares_role(node, variable, op, role):
-    """Whether node is ``variable.role <op> role`` (attribute or item)."""
+def _compares_role(node, variable, op):
+    """Whether node is ``variable.role <op> 'system'`` (attribute or item)."""
     if not (
         isinstance(node, nodes.Compare)
         and len(node.ops) == 1
         and node.ops[0].op == op
-        and isinstance(node.ops[0].expr, nodes.Const)
-        and node.ops[0].expr.value == role
+        and node.ops[0].expr == nodes.Const("system")
     ):
         return False
     subject = node.expr
@@ -505,58 +447,35 @@ def _compares_role(node, variable, op, role):
         name, target = subject.arg.value, subject.node
     else:
         return False
-    return name == "role" and isinstance(target, nodes.Name) and target.name == variable
+    return name == "role" and target == nodes.Name(variable, "load")
 
 
-def _body(blocks, loop):
-    """Tag indices inside a loop's body, before its ``else`` or end."""
-    return range(loop + 1, blocks[loop][1])
+def _rejections(loop, variable):
+    """The raise_exception calls in the loop's branches for system messages;
+    each ``elif`` is an ``If`` node of its own."""
+    for branch in _within(loop.body, nodes.If):
+        if any(
+            _compares_role(term, variable, "eq")
+            for term in _terms(branch.test, nodes.Or)
+        ):
+            for output in _within(branch.body, nodes.Output):
+                for call in output.nodes:
+                    if isinstance(call, nodes.Call) and call.node == nodes.Name(
+                        "raise_exception", "load"
+                    ):
+                        yield call
 
 
-def _rejections(tags, blocks, loop, variable):
-    """The raise inside the loop's branch for system messages."""
-    for opening in _body(blocks, loop):
-        if tags[opening].keyword != "if":
-            continue
-        chain = blocks[opening]
-        for branch, following in zip(chain, chain[1:]):
-            test = (
-                _condition(tags[branch])
-                if tags[branch].keyword in ("if", "elif")
-                else None
-            )
-            if test is None or not any(
-                _compares_role(term, variable, "eq", "system")
-                for term in _terms(test, nodes.Or)
-            ):
-                continue
-            for index in range(branch + 1, following):
-                node = (
-                    _parse(f"{{{{ {tags[index].text} }}}}")
-                    if tags[index].kind == "{"
-                    else None
-                )
-                call = node.nodes[0] if node is not None else None
-                if (
-                    isinstance(call, nodes.Call)
-                    and isinstance(call.node, nodes.Name)
-                    and call.node.name == "raise_exception"
-                ):
-                    yield tags[index]
-
-
-def _skips(tags, blocks, parents, loop, variable):
+def _skips(loop, variable):
     """The condition directly in the loop that excludes system messages."""
-    for opening in _body(blocks, loop):
+    for node in loop.body:
         if (
-            tags[opening].keyword != "if"
-            or parents[opening] != loop
-            or len(blocks[opening]) != 2
+            isinstance(node, nodes.If)
+            and not node.elif_
+            and not node.else_
+            and any(
+                _compares_role(term, variable, "ne")
+                for term in _terms(node.test, nodes.And)
+            )
         ):
-            continue
-        test = _condition(tags[opening])
-        if test is not None and any(
-            _compares_role(term, variable, "ne", "system")
-            for term in _terms(test, nodes.And)
-        ):
-            yield tags[opening]
+            yield node

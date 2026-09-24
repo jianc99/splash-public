@@ -97,6 +97,16 @@ def variants(name):
     yield "space after endmacro", text.replace("{%- endmacro %}", "{%- endmacro %} ", 1)
     yield "trailing newlines", text + "\n\n"
     yield "CRLF line endings", text.replace("\n", "\r\n")
+    yield "single line", "".join(line.strip() for line in text.split("\n"))
+    # A dict literal ends in "}}" inside an expression, and a string after it
+    # holds a statement tag.
+    loop = "{%- for message in messages %}"
+    yield (
+        "nested dict literal",
+        text.replace(
+            loop, loop + "{{- {'a': {'b': ''}}['a']['b'] ~ '{% if x %}' if false }}", 1
+        ),
+    )
     raise_tag = "{{- raise_exception('System message must be at the beginning.') }}"
     if raise_tag in text:
         yield (
