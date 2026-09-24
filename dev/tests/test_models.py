@@ -157,7 +157,7 @@ class ModelArtifactTest(unittest.TestCase):
                 self.assertEqual(installer.validate_repo_id(model_id), model_id)
                 self.assertEqual(installer.parse_model_id(model_id), model_id)
                 self.assertEqual(
-                    installer.installed_root(self.root, model_id), self.root / model_id
+                    installer.selection_link(self.root, model_id), self.root / model_id
                 )
 
     def test_missing_or_invalid_model_fails_before_creating_or_downloading(self):
@@ -708,7 +708,7 @@ class ModelArtifactTest(unittest.TestCase):
             export_draft.export(snapshot, config, self.root / "other")
         self.assertFalse((self.root / "other").exists())
 
-    def test_variant_model_ids_parse_and_name_installed_roots(self):
+    def test_variant_model_ids_parse_and_name_selection_links(self):
         self.assertEqual(
             installer.split_model_id("owner/repo:UD-Q4_K_M"),
             ("owner/repo", "UD-Q4_K_M"),
@@ -725,11 +725,11 @@ class ModelArtifactTest(unittest.TestCase):
             installer.parse_model_id("owner/repo:")
         models = self.root / "models"
         self.assertEqual(
-            installer.installed_root(models, "owner/repo:UD-Q4_K_M"),
+            installer.selection_link(models, "owner/repo:UD-Q4_K_M"),
             models / "owner" / "repo:UD-Q4_K_M",
         )
         self.assertEqual(
-            installer.installed_root(models, "owner/repo"), models / "owner/repo"
+            installer.selection_link(models, "owner/repo"), models / "owner/repo"
         )
 
     def test_a_package_takes_no_variant(self):

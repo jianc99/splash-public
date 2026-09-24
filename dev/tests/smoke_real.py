@@ -1051,7 +1051,7 @@ def add_server_arguments(parser):
 
 def resolve_server_arguments(arguments):
     if arguments.package is None:
-        link = model_artifacts.installed_root(model_artifacts.MODELS, arguments.model)
+        link = model_artifacts.selection_link(model_artifacts.MODELS, arguments.model)
         arguments.package = link
         if model_artifacts.installation_kind(link) == model_artifacts.ASSEMBLY:
             # As splash serve does: every server this process starts, and its

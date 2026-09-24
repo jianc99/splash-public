@@ -181,7 +181,7 @@ class AgentRunnerTests(unittest.TestCase):
         model = "unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M"
         artifacts = agent.launcher.model_artifacts
         link = str(
-            artifacts.installed_root(artifacts.MODELS, model).relative_to(agent.ROOT)
+            artifacts.selection_link(artifacts.MODELS, model).relative_to(agent.ROOT)
         )
         for target, tools in (
             ("test-real", ("vision-encoder", "model-runtime-oracle")),

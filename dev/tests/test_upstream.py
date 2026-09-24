@@ -1095,10 +1095,10 @@ class UpstreamTest(unittest.TestCase):
     def test_selection_paths_do_not_conflict(self):
         root = Path("/models")
         paths = {
-            models.installed_root(root, MODEL),
-            models.installed_root(root, MODEL, language_only=True),
-            models.installed_root(root, MODEL, revision="old"),
-            models.installed_root(root, MODEL, draft_model="mine/draft"),
+            models.selection_link(root, MODEL),
+            models.selection_link(root, MODEL, language_only=True),
+            models.selection_link(root, MODEL, revision="old"),
+            models.selection_link(root, MODEL, draft_model="mine/draft"),
         }
         self.assertEqual(len(paths), 4)
         # Each is where garbage collection finds the selection links.

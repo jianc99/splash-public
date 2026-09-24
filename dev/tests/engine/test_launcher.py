@@ -541,7 +541,7 @@ class LauncherTests(unittest.TestCase):
                 "launcher.RUNTIME_DIR = launcher.ROOT / 'runtime'\n"
                 "launcher.paths.PYTHON = Path(sys.executable)\n"
                 "launcher._ensure_installed = lambda selection: None\n"
-                "launcher.model_artifacts.installed_root = lambda *a, **k: launcher.ROOT\n"
+                "launcher.model_artifacts.selection_link = lambda *a, **k: launcher.ROOT\n"
                 "launcher.catalog.spawn_refresh = lambda: None\n"
                 "launcher.main(['serve', '--model', 'test/model', '--port', sys.argv[2]])\n"
             )
@@ -714,7 +714,7 @@ class LauncherTests(unittest.TestCase):
                 mock.patch.object(launcher, "_ensure_installed") as install,
                 mock.patch.object(
                     launcher.model_artifacts,
-                    "installed_root",
+                    "selection_link",
                     return_value=runtime / "selected",
                 ) as root,
                 mock.patch.object(launcher.os, "execve") as execute,
@@ -792,7 +792,7 @@ class LauncherTests(unittest.TestCase):
                 mock.patch.object(launcher.catalog, "spawn_refresh"),
                 mock.patch.object(launcher, "_ensure_installed"),
                 mock.patch.object(
-                    launcher.model_artifacts, "installed_root", return_value=selection
+                    launcher.model_artifacts, "selection_link", return_value=selection
                 ),
                 mock.patch.object(launcher.os, "execve", side_effect=execute),
             ):

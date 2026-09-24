@@ -35,7 +35,7 @@ class HttpRegressionTests(unittest.TestCase):
                 self.assertEqual(arguments.model, selected)
                 self.assertEqual(
                     arguments.package,
-                    smoke.model_artifacts.installed_root(
+                    smoke.model_artifacts.selection_link(
                         smoke.model_artifacts.MODELS, selected
                     ),
                 )

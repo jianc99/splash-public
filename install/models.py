@@ -171,7 +171,7 @@ def json_bytes(value) -> bytes:
     ).encode()
 
 
-def installed_root(
+def selection_link(
     models: Path, model_id: str, *, revision=None, language_only=False, draft_model=None
 ) -> Path:
     """The selection link of model_id with these source options:
@@ -189,7 +189,7 @@ def installed_root(
 
 
 def selection_links(models: Path):
-    """Every selection link under models, in the places installed_root names."""
+    """Every selection link under models, in the places selection_link names."""
     return [path for path in models.glob("*/*") if path.is_symlink()]
 
 
@@ -212,7 +212,7 @@ class Selection:
     ):
         repo_id, variant = split_model_id(model)
         models_root = Path(models_root).resolve()
-        link = installed_root(
+        link = selection_link(
             models_root,
             model,
             revision=revision,

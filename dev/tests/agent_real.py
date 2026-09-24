@@ -901,7 +901,7 @@ def main(argv=None):
         port = launcher.PORT
         if args.http_smoke:
             smoke_real.run(port, model)
-        installed = launcher.model_artifacts.installed_root(
+        installed = launcher.model_artifacts.selection_link(
             launcher.model_artifacts.MODELS, args.model
         )
         reference = (
