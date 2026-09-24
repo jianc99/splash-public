@@ -1,5 +1,6 @@
 import contextlib
 import io
+import re
 import shutil
 import struct
 import tempfile
@@ -21,6 +22,18 @@ GGUF_REPO = "unsloth/Qwen3.6-35B-A3B-GGUF"
 # The GGUF specification's token types (llama_token_type), stated
 # independently of the reader under test.
 NORMAL, UNKNOWN, CONTROL, USER_DEFINED, UNUSED, BYTE = 1, 2, 3, 4, 5, 6
+# GGML tensor types (ggml_type), stated independently of gguf.TENSOR_TYPES.
+GGML = {
+    "F32": 0,
+    "F16": 1,
+    "Q8_0": 8,
+    "Q4_K": 12,
+    "IQ2_XXS": 16,
+    "IQ3_XXS": 18,
+    "IQ4_XS": 23,
+    "BF16": 30,
+    "MXFP4": 39,
+}
 
 
 def write_gguf(path, values, tensors=()):
@@ -64,10 +77,9 @@ def fixture(*, native=False):
 def loadable_tensors(values, directory):
     """A tensor table the native loader accepts for the header values: each
     tensor it reads, quantized as Q4_K, Q8_0 (GDN alpha and beta) or F32."""
-    codes = {name: code for code, name in gguf.TENSOR_TYPES.items()}
     header = gguf.Metadata(write_gguf(directory / "header.gguf", values))
     return {
-        name: codes[next(t for t in ("Q4_K", "Q8_0", "F32") if t in types)]
+        name: GGML[next(t for t in ("Q4_K", "Q8_0", "F32") if t in types)]
         for name, types in gguf.loaded_tensors(header).items()
     }
 
@@ -161,22 +173,25 @@ class GgufMetadataTests(unittest.TestCase):
                 gguf.Metadata(path)
 
     def test_reader_checks_counts_tensor_ranks_and_duplicate_tensors(self):
-        path = write_gguf(self.root / "tensors.gguf", {"key": "value"}, [("t", 0)])
+        path = self.root / "tensors.gguf"
         with mock.patch.object(gguf.Metadata, "MAX_ITEMS", 0):
-            for tensors in (False, True):
+            for values, tensors in (({"key": "value"}, []), ({}, [("t", GGML["F32"])])):
+                write_gguf(path, values, tensors)
                 with (
-                    self.subTest(tensors=tensors),
+                    self.subTest(keys=len(values), tensors=len(tensors)),
                     self.assertRaisesRegex(models.ModelError, "too many fields"),
                 ):
-                    gguf.Metadata(path, tensors=tensors)
+                    gguf.Metadata(path)
         # Ranks up to the native reader's limit, GGML_MAX_DIMS.
         for rank in (1, 4):
-            fixture_files.write_gguf(path, {}, [("t", [2] * rank, 0, b"")])
-            self.assertEqual(gguf.Metadata(path, tensors=True).tensors, {"t": 0})
-        fixture_files.write_gguf(path, {}, [("t", [2] * 5, 0, b"")])
+            fixture_files.write_gguf(path, {}, [("t", [2] * rank, GGML["F32"], b"")])
+            self.assertEqual(
+                gguf.Metadata(path, tensors=True).tensors, {"t": GGML["F32"]}
+            )
+        fixture_files.write_gguf(path, {}, [("t", [2] * 5, GGML["F32"], b"")])
         with self.assertRaisesRegex(models.ModelError, "invalid GGUF tensor rank: t"):
             gguf.Metadata(path, tensors=True)
-        write_gguf(path, {}, [("t", 0), ("t", 0)])
+        write_gguf(path, {}, [("t", GGML["F32"]), ("t", GGML["F32"])])
         with self.assertRaisesRegex(models.ModelError, "duplicate GGUF tensor: t"):
             gguf.Metadata(path, tensors=True)
 
@@ -264,29 +279,37 @@ class GgufMetadataTests(unittest.TestCase):
         self.assertNotIn("blk.2.attn_q.weight", tensors)
         # GDN alpha and beta may also both be F32, and the MTP layer (block
         # 40) is never loaded, so its types do not matter.
-        tensors |= {"blk.1.ssm_alpha.weight": 0, "blk.1.ssm_beta.weight": 0}
-        tensors |= {"blk.40.ffn_up_exps.weight": 16, "blk.0.ffn_down_exps.weight": 23}
+        tensors |= {"blk.1.ssm_alpha.weight": GGML["F32"]}
+        tensors |= {"blk.1.ssm_beta.weight": GGML["F32"]}
+        tensors |= {"blk.40.ffn_up_exps.weight": GGML["IQ2_XXS"]}
+        tensors |= {"blk.0.ffn_down_exps.weight": GGML["IQ4_XS"]}
         path = write_gguf(self.root / "ok.gguf", values, tensors.items())
         gguf.require_loadable(gguf.Metadata(path, tensors=True))
-        f32 = {name: 0 for name in tensors}
+        f32 = {name: GGML["F32"] for name in tensors}
         for changes, reason in (
             (
-                {"blk.4.ffn_gate_exps.weight": 18},
+                {"blk.4.ffn_gate_exps.weight": GGML["IQ3_XXS"]},
                 "ffn_gate_exps.weight IQ3_XXS [(]1 tensor[)]",
             ),
             (
-                {"blk.0.attn_qkv.weight": 39, "blk.1.attn_qkv.weight": 39},
+                {
+                    "blk.0.attn_qkv.weight": GGML["MXFP4"],
+                    "blk.1.attn_qkv.weight": GGML["MXFP4"],
+                },
                 "attn_qkv.weight MXFP4 [(]2 tensors[)]",
             ),
-            ({"token_embd.weight": 23}, "token_embd.weight IQ4_XS"),
-            ({"blk.3.attn_q.weight": 30}, "attn_q.weight BF16"),
+            ({"token_embd.weight": GGML["IQ4_XS"]}, "token_embd.weight IQ4_XS"),
+            ({"blk.3.attn_q.weight": GGML["BF16"]}, "attn_q.weight BF16"),
             # F32 only where the loader reads floats: not a projection, not
             # a quantized router or norm, not half an alpha/beta pair.
-            ({"blk.3.attn_q.weight": 0}, "attn_q.weight F32"),
-            ({"blk.0.ffn_gate_inp.weight": 8}, "ffn_gate_inp.weight Q8_0"),
-            ({"output_norm.weight": 1}, "output_norm.weight F16"),
+            ({"blk.3.attn_q.weight": GGML["F32"]}, "attn_q.weight F32"),
             (
-                {"blk.1.ssm_alpha.weight": 8},
+                {"blk.0.ffn_gate_inp.weight": GGML["Q8_0"]},
+                "ffn_gate_inp.weight Q8_0",
+            ),
+            ({"output_norm.weight": GGML["F16"]}, "output_norm.weight F16"),
+            (
+                {"blk.1.ssm_alpha.weight": GGML["Q8_0"]},
                 "ssm_alpha.weight and ssm_beta.weight of different types",
             ),
             # An all-F32 file, whose types the loader reads somewhere.
@@ -311,8 +334,6 @@ class GgufMetadataTests(unittest.TestCase):
     def test_loadable_types_are_the_native_formats(self):
         # The installer's list must be the loader's own: kQuantFormats' GGML
         # types (runtime/metal/abi/QuantFormat.h).
-        import re
-
         header = (
             Path(__file__).resolve().parents[2] / "runtime/metal/abi/QuantFormat.h"
         ).read_text()
@@ -363,8 +384,29 @@ class GgufMetadataTests(unittest.TestCase):
                     ),
                 ):
                     derive(metadata)
+
+    def test_vision_config_derives_the_position_grid_and_rejects_other_towers(self):
         vision = self.metadata(vision_fixture())
+        # 768-pixel images in 16-pixel patches: a 48 x 48 position grid.
         self.assertEqual(gguf.vision_config(vision)["num_position_embeddings"], 2304)
+        for key, value, reason in (
+            ("general.architecture", "qwen35", "unsupported GGUF vision architecture"),
+            ("clip.projector_type", "mlp", "unsupported GGUF vision architecture"),
+            ("clip.use_gelu", False, "unsupported GGUF vision architecture"),
+            ("clip.vision.image_size", 770, "invalid GGUF vision position grid"),
+            (
+                "clip.vision.is_deepstack_layers",
+                [True] + [False] * 26,
+                "deepstack layers are unsupported",
+            ),
+        ):
+            values = vision_fixture()
+            values[key] = value
+            with (
+                self.subTest(key=key, value=value),
+                self.assertRaisesRegex(models.ModelError, reason),
+            ):
+                gguf.vision_config(self.metadata(values))
 
     def derived(self, models_root, path):
         """The metadata derived from a target GGUF, as installations derive
@@ -377,7 +419,10 @@ class GgufMetadataTests(unittest.TestCase):
             return assembly.derived_metadata(models_root, {"target/m.gguf": path})
 
     def test_vision_projector_is_chosen_by_its_header(self):
-        tensors = (("v.blk.0.attn_qkv.weight", 30), ("v.patch_embd.weight", 0))
+        tensors = (
+            ("v.blk.0.attn_qkv.weight", GGML["BF16"]),
+            ("v.patch_embd.weight", GGML["F32"]),
+        )
 
         def projectors(**files):
             root = self.root / "projectors"
@@ -388,8 +433,8 @@ class GgufMetadataTests(unittest.TestCase):
             return hub.Repository.local_directory(root)
 
         bf16 = (vision_fixture(), tensors)
-        f32 = (vision_fixture(), [(name, 0) for name, _ in tensors])
-        f16 = (vision_fixture(), [(tensors[0][0], 1), tensors[1]])
+        f32 = (vision_fixture(), [(name, GGML["F32"]) for name, _ in tensors])
+        f16 = (vision_fixture(), [(tensors[0][0], GGML["F16"]), tensors[1]])
         text = (fixture(), tensors)
         # Other publishers' names; F16 and non-vision files never count.
         repo = projectors(
@@ -489,7 +534,7 @@ class GgufMetadataTests(unittest.TestCase):
                 write_gguf(
                     root / "mmproj-F32.gguf",
                     vision_fixture(),
-                    [("v.patch_embd.weight", 0)],
+                    [("v.patch_embd.weight", GGML["F32"])],
                 )
             for name in ("config.json", "tokenizer.json", "tokenizer_config.json"):
                 (root / name).write_text("invalid sidecar")
@@ -558,7 +603,7 @@ class GgufMetadataTests(unittest.TestCase):
         write_gguf(
             fake.remote / GGUF_REPO / ("a" * 40) / "mmproj-F32.gguf",
             values,
-            [("v.patch_embd.weight", 0)],
+            [("v.patch_embd.weight", GGML["F32"])],
         )
         with self.assertRaisesRegex(models.ModelError, "vision preprocessing"):
             self.prepare(
