@@ -123,7 +123,7 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
     const ops::MoeWorkspace workspace =
         operators.moePrefillWorkspace(geometry.target.moeShape(), kPrefillRows);
     for (size_t field = 0; field < ops::kMoeScratchFields.size(); ++field)
-      put(moeScratchTensor(PrefillTensor::MoeSelectedExperts, field),
+      put(moeScratchTensor<PrefillTensor>(field),
           workspace.*ops::kMoeScratchFields[field].bytes);
   }
   return result;
@@ -299,7 +299,7 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
     const ops::MoeWorkspace workspace =
         operators.moeDecodeWorkspacePerLane(geometry.target.moeShape());
     for (size_t field = 0; field < ops::kMoeScratchFields.size(); ++field)
-      put(moeScratchTensor(DecodeTensor::MoeSelectedExperts, field),
+      put(moeScratchTensor<DecodeTensor>(field),
           workspace.*ops::kMoeScratchFields[field].bytes);
   }
   return result;
