@@ -659,8 +659,8 @@ class UpstreamTest(unittest.TestCase):
         )
         self.assertIn(
             f"Warning: cannot fetch the {DENSE.name} draft {'e' * 12}; keeping the "
-            "installed one: cannot fetch the Qwen3.8-27B draft: [Errno 54] "
-            "connection reset by peer",
+            f"installed one: cannot fetch the {DENSE.name} draft: "
+            f"[Errno {errno.ECONNRESET}] connection reset by peer",
             warnings,
         )
 
