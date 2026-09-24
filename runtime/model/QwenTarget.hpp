@@ -102,7 +102,7 @@ struct BlockTargetFormat final {
 
   [[nodiscard]] ops::Projection projection(WeightFile &file, uint32_t outputSize,
                                            uint32_t inputSize, std::string_view label) const {
-    return readGgufProjection(file, outputSize, inputSize, label);
+    return readBlockProjection(file, outputSize, inputSize, label);
   }
   // The tensors, which may leave padding columns past the last one
   // (LinearGguf.cpp requireSegments); affine files keep one tensor.
@@ -111,7 +111,7 @@ struct BlockTargetFormat final {
                                       std::initializer_list<std::string_view> tensors) const;
   [[nodiscard]] ops::EmbeddingWeights embedding(WeightFile &file, uint32_t outputSize,
                                                 uint32_t inputSize) const {
-    return readGgufEmbedding(file, outputSize, inputSize, "embedding");
+    return readBlockEmbedding(file, outputSize, inputSize, "embedding");
   }
 };
 

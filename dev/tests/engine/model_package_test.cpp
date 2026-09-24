@@ -504,7 +504,7 @@ void testGgufImageLayout(MetalBackend &backend, const std::filesystem::path &roo
     };
     {
         WeightFile file = mapped(projection);
-        const auto read = splash::model::readGgufProjection(file, rows, columns, "projection");
+        const auto read = splash::model::readBlockProjection(file, rows, columns, "projection");
         file.finish();
         require(read.outputSize == rows && read.inputSize == columns && read.blocks().segments.size() == 1,
                 "GGUF projection lost its layout sizes");
@@ -513,18 +513,18 @@ void testGgufImageLayout(MetalBackend &backend, const std::filesystem::path &roo
         requirePackedError(
             [&] {
                 WeightFile file = mapped(projection);
-                (void)splash::model::readGgufProjection(file, output, input, "projection");
+                (void)splash::model::readBlockProjection(file, output, input, "projection");
             },
             "GGUF projection of other sizes than the layout's was accepted");
         requirePackedError(
             [&] {
                 WeightFile file = mapped(embedding);
-                (void)splash::model::readGgufEmbedding(file, output, input, "embedding");
+                (void)splash::model::readBlockEmbedding(file, output, input, "embedding");
             },
             "GGUF embedding of other sizes than the layout's was accepted");
     }
     WeightFile file = mapped(embedding);
-    const auto table = splash::model::readGgufEmbedding(file, rows, columns, "embedding");
+    const auto table = splash::model::readBlockEmbedding(file, rows, columns, "embedding");
     file.finish();
     constexpr uint32_t gathered = 8;
     const MetalBuffer tokens = backend.allocateBuffer(gathered * sizeof(uint32_t), BufferStorage::Shared);

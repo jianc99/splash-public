@@ -318,16 +318,16 @@ ops::QuantizedSegment readQuantizedSegment(WeightFile &file, std::string_view la
                                          std::move(plane1), std::move(meta));
 }
 
-ops::Projection readGgufProjection(WeightFile &file, uint32_t outputSize, uint32_t inputSize,
-                                   std::string_view label) {
+ops::Projection readBlockProjection(WeightFile &file, uint32_t outputSize, uint32_t inputSize,
+                                    std::string_view label) {
     ops::QuantizedSegment segment = readQuantizedSegment(file, label);
     if (segment.outputSize != outputSize || segment.inputSize != inputSize)
         throw WeightStoreError("GGUF tensor does not match the layout: " + std::string(label));
     return {outputSize, inputSize, ops::BlockWeights{{std::move(segment)}}};
 }
 
-ops::EmbeddingWeights readGgufEmbedding(WeightFile &file, uint32_t outputSize, uint32_t inputSize,
-                                        std::string_view label) {
+ops::EmbeddingWeights readBlockEmbedding(WeightFile &file, uint32_t outputSize, uint32_t inputSize,
+                                         std::string_view label) {
     const GgufTensorDescriptor d = readGgufDescriptor(file, label);
     if (d.outputSize != outputSize || d.inputSize != inputSize)
         throw WeightStoreError("GGUF embedding does not match the layout: " + std::string(label));
@@ -339,8 +339,8 @@ ops::EmbeddingWeights readGgufEmbedding(WeightFile &file, uint32_t outputSize, u
             ops::NativeRows(file.section(d.plane0Bytes, std::string(label) + "-native"), format)};
 }
 
-ops::Q8Projection readQ8Projection(WeightFile &file, uint32_t outputSize, uint32_t inputSize,
-                                   std::string_view label) {
+ops::Q8Projection readAffineQ8Projection(WeightFile &file, uint32_t outputSize, uint32_t inputSize,
+                                         std::string_view label) {
     validateQ4Layout(outputSize, inputSize);
     const uint64_t elements = q4Elements(outputSize, inputSize);
     const std::vector<metal::MetalBuffer> planes = file.split({elements, elements / 32, elements / 32}, label);
@@ -348,9 +348,9 @@ ops::Q8Projection readQ8Projection(WeightFile &file, uint32_t outputSize, uint32
 }
 
 ops::ExpertProjection
-readExpertProjection(WeightFile &file, uint32_t experts,
-                       uint32_t outputSize, uint32_t inputSize,
-                       std::string_view label) {
+readAffineExpertProjection(WeightFile &file, uint32_t experts,
+                           uint32_t outputSize, uint32_t inputSize,
+                           std::string_view label) {
     if (!experts)
         throw WeightStoreError("expert projection requires experts");
     validateQ4Layout(outputSize, inputSize);

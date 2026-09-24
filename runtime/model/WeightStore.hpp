@@ -79,12 +79,12 @@ readAffineProjection(WeightFile &file, uint32_t outputSize, uint32_t inputSize,
 [[nodiscard]] ops::QuantizedSegment readQuantizedSegment(WeightFile &file,
                                                    std::string_view label);
 // A single-tensor projection; its descriptor must hold the layout's sizes.
-[[nodiscard]] ops::Projection readGgufProjection(WeightFile &file, uint32_t outputSize,
-                                                 uint32_t inputSize, std::string_view label);
+[[nodiscard]] ops::Projection readBlockProjection(WeightFile &file, uint32_t outputSize,
+                                                  uint32_t inputSize, std::string_view label);
 // Native block_q4_K, block_q6_K or block_q8_0 rows for the token table
 // (gathered, never multiplied).
-[[nodiscard]] ops::EmbeddingWeights readGgufEmbedding(WeightFile &file, uint32_t outputSize,
-                                                      uint32_t inputSize, std::string_view label);
+[[nodiscard]] ops::EmbeddingWeights readBlockEmbedding(WeightFile &file, uint32_t outputSize,
+                                                       uint32_t inputSize, std::string_view label);
 
 // Embedding weights, scales and biases are independently aligned sections
 // so token gather can bind each table directly.
@@ -93,13 +93,13 @@ readAffineEmbedding(WeightFile &file, uint32_t outputSize,
                            uint32_t inputSize, std::string_view label);
 
 [[nodiscard]] ops::Q8Projection
-readQ8Projection(WeightFile &file, uint32_t outputSize, uint32_t inputSize,
-                 std::string_view label);
+readAffineQ8Projection(WeightFile &file, uint32_t outputSize, uint32_t inputSize,
+                       std::string_view label);
 
 [[nodiscard]] ops::ExpertProjection
-readExpertProjection(WeightFile &file, uint32_t experts,
-                       uint32_t outputSize, uint32_t inputSize,
-                       std::string_view label);
+readAffineExpertProjection(WeightFile &file, uint32_t experts,
+                           uint32_t outputSize, uint32_t inputSize,
+                           std::string_view label);
 
 [[nodiscard]] std::string
 weightManifestFingerprint(std::span<const WeightFileRecord> records);
