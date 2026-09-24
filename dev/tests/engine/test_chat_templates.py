@@ -87,8 +87,9 @@ def render(template_tokenizer, messages, template=None, **options):
 
 
 def variants(name):
-    """Formatting changes at and around the construct each upstream template
-    is patched at."""
+    """Changes to an upstream template that keep what it renders, at and
+    around the construct it is patched at: formatting, and tags from
+    transformers' Jinja extensions."""
     text = source(name)
     yield "space after endmacro", text.replace("{%- endmacro %}", "{%- endmacro %} ", 1)
     yield "trailing newlines", text + "\n\n"
@@ -118,6 +119,23 @@ def variants(name):
                 raise_tag, "{{- raise_exception('Put system messages first.') }}"
             ),
         )
+    end, tool = "{{- '<|im_end|>\\n' }}", '\n    {%- elif message.role == "tool" %}'
+    assistant = '{%- elif message.role == "assistant" %}'
+    assert end + tool in text and assistant in text, name
+    yield (
+        "generation block",
+        text.replace(
+            end + tool, "{%- generation %}" + end + "{%- endgeneration %}" + tool, 1
+        ),
+    )
+    yield (
+        "continue statement",
+        text.replace(
+            assistant,
+            '{%- elif message.role == "ignored" %}{%- continue %}' + assistant,
+            1,
+        ),
+    )
     skip = '{%- if loop.index0 >= num_sys and message.role != "system" and message.role != "developer" %}'
     if skip in text:
         yield (
@@ -246,7 +264,7 @@ class ChatTemplateProbeTests(unittest.TestCase):
                             expected,
                         )
 
-    def test_formatting_variants_are_patched_at_the_same_construct(self):
+    def test_template_variants_are_patched_at_the_same_construct(self):
         for name in UPSTREAM:
             for variant, text in variants(name):
                 with self.subTest(name=name, variant=variant):
