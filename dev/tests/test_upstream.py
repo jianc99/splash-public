@@ -71,7 +71,8 @@ def arguments(root, model=MODEL, **options):
 def http_error(status):
     request = httpx.Request("GET", "https://huggingface.co/api/models/owner/model")
     return HfHubHTTPError(
-        f"{status} Client Error", response=httpx.Response(status, request=request)
+        f"{status} Client Error.\n\nRevision Not Found for url: {request.url}.",
+        response=httpx.Response(status, request=request),
     )
 
 
@@ -486,16 +487,18 @@ class UpstreamTest(unittest.TestCase):
                 hub.failure = failure
                 result, output = self.prepare(args)
                 self.assertTrue(result)
+                reason = models.hub_reason(failure)
+                self.assertNotIn("\n", reason)
                 self.assertIn(
-                    f"Could not reach the Hub ({models.hub_reason(failure)}); "
-                    f"using the installed {MODEL}@{'a' * 12}.",
+                    f"Could not reach the Hub ({reason}); "
+                    f"using the installed {MODEL}@{'a' * 12}.\n",
                     output,
                 )
                 self.assertIn("is already installed", output)
         # Without an installation, the failure is the error.
         with self.assertRaisesRegex(
             models.ModelError,
-            "cannot resolve someone/other: 404 Client Error; neither this "
+            "cannot resolve someone/other: 404 Client Error.*; neither this "
             "installation nor the Hub cache records a commit for the default branch",
         ):
             self.prepare(arguments(self.root, "someone/other"))
@@ -737,7 +740,7 @@ class UpstreamTest(unittest.TestCase):
         hub.failure = http_error(401)
         with self.assertRaisesRegex(
             models.ModelError,
-            "cannot resolve owner/private: 401 Client Error; set HF_TOKEN .*; "
+            "cannot resolve owner/private: 401 Client Error.*; set HF_TOKEN .*; "
             "neither this installation nor the Hub cache records a commit "
             "for the default branch",
         ):
@@ -818,7 +821,7 @@ class UpstreamTest(unittest.TestCase):
                 self.assertTrue(
                     message.startswith("cannot install owner/model:Q4_K_M: "), message
                 )
-                self.assertIn(str(failure), message)
+                self.assertIn(" ".join(str(failure).split()), message)
                 self.assertEqual("hf auth login" in message, hint)
         # A download that fails mid-transfer is reported without a traceback.
         hub = self.fake_hub()

@@ -662,7 +662,8 @@ def hub_reason(error, token=None) -> str:
     from huggingface_hub import get_token
     from huggingface_hub.errors import HfHubHTTPError
 
-    message = str(error) or type(error).__name__
+    # One line: the Hub's messages span several.
+    message = " ".join(str(error).split()) or type(error).__name__
     if token := token or os.environ.get("HF_TOKEN") or get_token():
         message = message.replace(token, "[redacted]")
     if (
