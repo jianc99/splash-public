@@ -493,7 +493,7 @@ void metadataViews(const char *metallib) {
       for (size_t index = 0; index < expected; ++index) {
         const auto &actual = input.weights[index];
         const auto &source = sparse.layers[sourceLayers[index]].ffn;
-        for (auto field : {&AffineMoeWeights::router, &AffineMoeWeights::sharedExpertGate}) {
+        for (auto field : {&AffineMoeWeights::router, &AffineMoeWeights::sharedScalarGate}) {
           const auto &left = (actual.affine().*field).planes;
           const auto &right = (source.affine().*field).planes;
           require(left.weights.sameView(right.weights) &&

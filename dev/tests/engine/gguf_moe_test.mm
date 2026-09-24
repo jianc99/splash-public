@@ -392,7 +392,7 @@ Model makeModel(MetalBackend &backend, int f) {
   }
   BlockMoeWeights gguf;
   gguf.router = m.router.segment;
-  gguf.sharedExpertGate = m.sharedGate.segment;
+  gguf.sharedScalarGate = m.sharedGate.segment;
   gguf.gate = {m.routed[0].segment, m.shared[0].segment};
   gguf.up = {m.routed[1].segment, m.shared[1].segment};
   gguf.down = {m.routed[2].segment, m.shared[2].segment};
@@ -680,7 +680,7 @@ int timing(MetalBackend &backend, uint32_t rounds) {
       .sharedGate = affineExperts(1, I, H),
       .sharedUp = affineExperts(1, I, H),
       .sharedDown = affineExperts(1, H, I),
-      .sharedExpertGate = affineRouter(false),
+      .sharedScalarGate = affineRouter(false),
   };
   // GGUF: the same routing in an F32 router, experts in the 35B UD-Q4_K_M formats.
   const auto planes = [&](Fmt f, uint32_t rows, uint32_t k) {

@@ -36,7 +36,7 @@ bool sameExpert(const ops::ExpertProjection &left,
 bool sameWeights(const ops::MoeWeights &leftWeights, const ops::MoeWeights &rightWeights) {
   const auto &left = leftWeights.affine(), &right = rightWeights.affine();
   if (!sameProjection(left.router, right.router) ||
-      !sameProjection(left.sharedExpertGate, right.sharedExpertGate))
+      !sameProjection(left.sharedScalarGate, right.sharedScalarGate))
     return false;
   for (auto field : {&ops::AffineMoeWeights::expertGate, &ops::AffineMoeWeights::expertUp,
                      &ops::AffineMoeWeights::expertDown, &ops::AffineMoeWeights::sharedGate,

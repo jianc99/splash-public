@@ -44,18 +44,19 @@ struct BlockExpertProjection final {
   QuantizedSegment shared;
 };
 
-// The sparse MoE block of a GGUF target. The router and the shared-expert
-// gate are float tensors llama.cpp keeps unquantized, and they run in fp32.
+// The sparse MoE block of a GGUF target. The router and the shared expert's
+// scalar gate are float tensors llama.cpp keeps unquantized, and they run in
+// fp32.
 struct BlockMoeWeights final {
   QuantizedSegment router;           // [experts][hidden]
-  QuantizedSegment sharedExpertGate; // [1][hidden]
+  QuantizedSegment sharedScalarGate; // [1][hidden]
   BlockExpertProjection gate;
   BlockExpertProjection up;
   BlockExpertProjection down;
 };
 
 // The affine weights of a sparse MoE block: Q8 router and shared-expert
-// gate, and Q4 expert slabs. The shared expert is a one-expert slab.
+// scalar gate, and Q4 expert slabs. The shared expert is a one-expert slab.
 struct AffineMoeWeights final {
   Q8Projection router;
   ExpertProjection expertGate;
@@ -64,7 +65,7 @@ struct AffineMoeWeights final {
   ExpertProjection sharedGate;
   ExpertProjection sharedUp;
   ExpertProjection sharedDown;
-  Q8Projection sharedExpertGate;
+  Q8Projection sharedScalarGate;
 };
 
 // All weights for one sparse MoE block. The model package owns the buffers;

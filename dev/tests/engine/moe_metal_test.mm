@@ -236,7 +236,7 @@ Fixture makeFixture(MetalBackend &backend) {
   Fixture fixture;
   AffineMoeWeights weights;
   weights.router = fixtureRouter(backend, false);
-  weights.sharedExpertGate = fixtureRouter(backend, true);
+  weights.sharedScalarGate = fixtureRouter(backend, true);
   fixture.gate =
       randomExperts(backend, random, kExperts, kIntermediate, kHidden, "gate");
   fixture.up =
@@ -660,7 +660,7 @@ void bufferBounds(MetalBackend &backend, Fixture &fixture) {
       rejects([&] { MoE::add(graph, fixture.buffers, weights, plan); }, label);
       require(graph.empty(), "invalid weights partially encoded MoE");
     };
-    for (auto projection : {&splash::ops::AffineMoeWeights::router, &splash::ops::AffineMoeWeights::sharedExpertGate}) {
+    for (auto projection : {&splash::ops::AffineMoeWeights::router, &splash::ops::AffineMoeWeights::sharedScalarGate}) {
       for (auto field : {&splash::ops::AffineWeights::weights, &splash::ops::AffineWeights::scales,
                          &splash::ops::AffineWeights::biases}) {
         AffineMoeWeights shortWeights = fixture.weights.affine();

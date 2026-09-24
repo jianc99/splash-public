@@ -71,7 +71,7 @@ void validate(const MoeWeights &weights, MoeShape shape) {
     const BlockMoeWeights &blocks = weights.blocks();
     if (!shape.valid() ||
         !matches(blocks.router, shape.experts, hidden, true) ||
-        !matches(blocks.sharedExpertGate, 1, hidden, true) ||
+        !matches(blocks.sharedScalarGate, 1, hidden, true) ||
         !matches(blocks.gate, shape.experts, intermediate, hidden) ||
         !matches(blocks.up, shape.experts, intermediate, hidden) ||
         !matches(blocks.down, shape.experts, hidden, intermediate))
@@ -80,7 +80,7 @@ void validate(const MoeWeights &weights, MoeShape shape) {
   }
   const AffineMoeWeights &affine = weights.affine();
   if (!shape.valid() || !matches(affine.router, 256, hidden) ||
-      !matches(affine.sharedExpertGate, 256, hidden) ||
+      !matches(affine.sharedScalarGate, 256, hidden) ||
       !matches(affine.expertGate, shape.experts, intermediate, hidden) ||
       !matches(affine.expertUp, shape.experts, intermediate, hidden) ||
       !matches(affine.expertDown, shape.experts, hidden, intermediate) ||
@@ -292,7 +292,7 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
                  256, 0, FloatOutput::Float32, plan.configuration().ggufRouterTile);
     graph.add("moe_route_select_f32",
               {scratch.groupedInput, buffers.input,
-               weights.blocks().sharedExpertGate.plane0, scratch.selectedExperts,
+               weights.blocks().sharedScalarGate.plane0, scratch.selectedExperts,
                scratch.routingWeights},
               routeParams, {rows, 1, 1});
   } else {
@@ -306,9 +306,9 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
               {(rows + route.rows - 1) / route.rows, 256 / route.experts, 1});
     graph.add("moe_route_select_q8",
               {scratch.groupedInput, buffers.input,
-               affine.sharedExpertGate.planes.weights,
-               affine.sharedExpertGate.planes.scales,
-               affine.sharedExpertGate.planes.biases, scratch.selectedExperts,
+               affine.sharedScalarGate.planes.weights,
+               affine.sharedScalarGate.planes.scales,
+               affine.sharedScalarGate.planes.biases, scratch.selectedExperts,
                scratch.routingWeights},
               routeParams, {rows, 1, 1});
   }

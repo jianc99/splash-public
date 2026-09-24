@@ -59,7 +59,7 @@ loadQwen3_6MoeWeights(metal::MetalBackend &backend, Qwen3_6MoeLayout layout,
         .sharedGate = readAffineExpertProjection(file, 1, width, hidden, "shared-expert-gate"),
         .sharedUp = readAffineExpertProjection(file, 1, width, hidden, "shared-expert-up"),
         .sharedDown = readAffineExpertProjection(file, 1, hidden, width, "shared-expert-down"),
-        .sharedExpertGate =
+        .sharedScalarGate =
             readAffineQ8Projection(file, kQ4StorageN, hidden, "shared-expert-scalar-gate"),
     };
   };
@@ -75,7 +75,7 @@ loadQwen3_6MoeWeights(metal::MetalBackend &backend, Qwen3_6MoeLayout layout,
     ffn.gate.shared = readQuantizedSegment(file, "shared-expert-gate");
     ffn.up.shared = readQuantizedSegment(file, "shared-expert-up");
     ffn.down.shared = readQuantizedSegment(file, "shared-expert-down");
-    ffn.sharedExpertGate = readQuantizedSegment(file, "shared-expert-scalar-gate");
+    ffn.sharedScalarGate = readQuantizedSegment(file, "shared-expert-scalar-gate");
     layer.ffn = std::move(ffn);
   };
   return loadQwenTarget<Qwen3_6MoeWeights>(backend, layout, files, readAffineFfn, readBlockFfn);
