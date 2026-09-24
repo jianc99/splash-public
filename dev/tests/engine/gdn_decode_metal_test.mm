@@ -12,6 +12,8 @@
 #include "ops/GDN.hpp"
 #include "tuning/LinearNumerics.hpp"
 
+#include "NormReference.hpp"
+
 #import <Foundation/Foundation.h>
 
 #include <array>
@@ -30,6 +32,7 @@ using splash::metal::CommandGraph;
 using splash::metal::MetalBackend;
 using splash::metal::MetalBuffer;
 using namespace splash::ops;
+using namespace splash::test;
 using splash::ops::tuning::bf16ToFloat;
 using splash::ops::tuning::floatToBf16;
 
@@ -162,15 +165,8 @@ struct Fixture final {
         uint64_t{kMaxLanes} * kRows * shape.valueHeads * kHeadDim * 2;
     recurrent = alloc(rowBytes, "gdn recurrent rows");
     hidden = alloc(rowBytes, "gdn hidden");
-    mixerNorm = {alloc(uint64_t{kHeadDim} * (float32 ? 4 : 2), "gdn mixer norm"),
-                 float32};
-    for (uint32_t dim = 0; dim < kHeadDim; ++dim) {
-      const float weight = random.unit();
-      if (float32)
-        static_cast<float *>(mixerNorm.buffer.contents())[dim] = weight;
-      else
-        static_cast<uint16_t *>(mixerNorm.buffer.contents())[dim] = floatToBf16(weight);
-    }
+    mixerNorm = makeNormWeights(backend, kHeadDim, float32,
+                                [&](uint32_t) { return random.unit(); });
     arrived = alloc(kMaxLanes * 4, "gdn arrived");
     generation = alloc(kMaxLanes * 4, "gdn generation");
     retained = alloc(kMaxLanes * 4, "gdn retained");
@@ -253,11 +249,6 @@ struct Fixture final {
   }
   const uint8_t *cellBytes(const MetalBuffer &buffer) const {
     return static_cast<const uint8_t *>(buffer.contents());
-  }
-  double normWeight(uint32_t dim) const {
-    return mixerNorm.float32
-               ? static_cast<const float *>(mixerNorm.buffer.contents())[dim]
-               : bf16ToFloat(static_cast<const uint16_t *>(mixerNorm.buffer.contents())[dim]);
   }
 };
 
@@ -472,15 +463,10 @@ void checkDecode(const Fixture &fixture, uint32_t layer, uint32_t lane) {
           fixture.rowsOf(fixture.recurrent, lane, token, head);
       const uint16_t *hidden =
           fixture.rowsOf(fixture.hidden, lane, token, head);
-      double squares = 0.0;
+      const std::vector<double> exact =
+          rmsNorm(recurrent, fixture.mixerNorm, kHeadDim);
       for (uint32_t dim = 0; dim < kHeadDim; ++dim) {
-        const double row = bf16ToFloat(recurrent[dim]);
-        squares += row * row;
-      }
-      const double inverse = 1.0 / std::sqrt(squares / kHeadDim + 1e-6);
-      for (uint32_t dim = 0; dim < kHeadDim; ++dim) {
-        const double normalized = roundBfloat(
-            bf16ToFloat(recurrent[dim]) * inverse * fixture.normWeight(dim));
+        const double normalized = roundBfloat(exact[dim]);
         const double gate = bf16ToFloat(packed[zOffset + head * kHeadDim + dim]);
         const double reference = normalized * gate * sigmoid(gate);
         require(closeBfloat(hidden[dim], reference, 2.0, 1e-6),

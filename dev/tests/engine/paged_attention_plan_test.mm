@@ -1,6 +1,8 @@
 #include "ops/PagedAttention.hpp"
 #include "tuning/LinearNumerics.hpp"
 
+#include "NormReference.hpp"
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -692,10 +694,8 @@ void checkVerify(metal::MetalBackend &backend, uint32_t heads, kv::Layout layout
 
 // The q/k RMS norms, RoPE and V copy of the attention prepare, prefill and
 // verify, against fp64 with norm weights in bf16 or F32 (a GGUF's). Past the
-// rotary pairs a row holds the norm rounded once to bf16, up to the fp32
-// noise (well below 2^-8 of half an ulp), which weights rounded to bf16 would
-// miss for about a quarter of the values; the rotated pairs are within an
-// ulp of the fp64 rotation of the rounded norms.
+// rotary pairs a row holds the norm rounded once to bf16; the rotated pairs
+// are within an ulp of the fp64 rotation of the rounded norms.
 void checkProjection(metal::MetalBackend &backend, uint32_t queryHeads, kv::Layout layout,
                      bool float32, bool verify) {
   constexpr uint32_t kDim = 256, kPairs = 32;
@@ -705,8 +705,6 @@ void checkProjection(metal::MetalBackend &backend, uint32_t queryHeads, kv::Layo
   auto packed = allocate(backend, uint64_t{lanes} * rows * packedWidth * 2);
   auto ropeCos = allocate(backend, uint64_t{lanes} * rows * kPairs * 4);
   auto ropeSin = allocate(backend, ropeCos.sizeBytes());
-  const ops::NormWeights queryNorm{allocate(backend, kDim * (float32 ? 4 : 2)), float32};
-  const ops::NormWeights keyNorm{allocate(backend, queryNorm.buffer.sizeBytes()), float32};
   auto queries = allocate(backend, uint64_t{lanes} * queryHeads * stride * kDim * 2);
   auto keys = allocate(backend, uint64_t{lanes} * kvHeads * stride * kDim * 2);
   auto values = allocate(backend, keys.sizeBytes());
@@ -723,17 +721,9 @@ void checkProjection(metal::MetalBackend &backend, uint32_t queryHeads, kv::Layo
     static_cast<float *>(ropeCos.contents())[i] = float(std::cos(angle));
     static_cast<float *>(ropeSin.contents())[i] = float(std::sin(angle));
   }
-  std::array<std::array<double, kDim>, 2> weights{};
-  for (uint32_t which = 0; which < 2; ++which)
-    for (uint32_t d = 0; d < kDim; ++d) {
-      const float value = float(1.0 + 0.3 * unit());
-      const auto &norm = which == 0 ? queryNorm : keyNorm;
-      if (float32)
-        static_cast<float *>(norm.buffer.contents())[d] = value;
-      else
-        static_cast<uint16_t *>(norm.buffer.contents())[d] = floatToBf16(value);
-      weights[which][d] = float32 ? value : bf16ToFloat(floatToBf16(value));
-    }
+  const auto weight = [&](uint32_t) { return float(1.0 + 0.3 * unit()); };
+  const ops::NormWeights queryNorm = test::makeNormWeights(backend, kDim, float32, weight);
+  const ops::NormWeights keyNorm = test::makeNormWeights(backend, kDim, float32, weight);
   metal::CommandGraph graph;
   if (verify)
     ops::PagedAttention::addVerifyProjection(graph, packed, queryNorm, keyNorm, ropeCos, ropeSin,
@@ -761,16 +751,10 @@ void checkProjection(metal::MetalBackend &backend, uint32_t queryHeads, kv::Layo
             query ? queryData + (((uint64_t{lane} * kvHeads + h / group) * stride + row) * group +
                                  h % group) * kDim
                   : keyData + ((uint64_t{lane} * kvHeads + h) * stride + row) * kDim;
-        double squares = 0;
-        for (uint32_t d = 0; d < kDim; ++d)
-          squares += double(bf16ToFloat(source[d])) * bf16ToFloat(source[d]);
-        const double inverse = 1 / std::sqrt(squares / kDim + 1e-6);
-        std::array<double, kDim> normalized{};
-        for (uint32_t d = 0; d < kDim; ++d)
-          normalized[d] = bf16ToFloat(source[d]) * inverse * weights[query ? 0 : 1][d];
+        const std::vector<double> normalized =
+            test::rmsNorm(source, query ? queryNorm : keyNorm, kDim);
         for (uint32_t d = 2 * kPairs; d < kDim; ++d)
-          require(std::fabs(bf16ToFloat(out[d]) - normalized[d]) <=
-                      0.5 * ulpBf16(float(normalized[d])) * (1 + 1.0 / 256),
+          require(test::roundedOnceToBf16(out[d], normalized[d]),
                   "attention prepare norm differs from the fp64 reference");
         for (uint32_t d = 0; d < kPairs; ++d) {
           const double first = bf16ToFloat(floatToBf16(float(normalized[d])));

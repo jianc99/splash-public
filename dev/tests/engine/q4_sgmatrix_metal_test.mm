@@ -5,6 +5,8 @@
 #include "ops/PagedAttention.hpp"
 #include "tuning/LinearNumerics.hpp"
 
+#include "NormReference.hpp"
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -19,6 +21,7 @@
 using namespace splash;
 using namespace splash::ops;
 using namespace splash::ops::tuning;
+using namespace splash::test;
 namespace {
 void require(bool value, const char *message) { if (!value) throw std::runtime_error(message); }
 struct Guarded {
@@ -300,41 +303,23 @@ const char *prepareKernel(LinearInput layout) {
 struct NormCase {
   metal::MetalBuffer input;
   NormWeights weight;
-  std::vector<double> weights;  // the values the kernels read
 };
 NormCase normCase(metal::MetalBackend &backend, uint32_t k, uint32_t rows, bool float32) {
-  NormCase c{backend.allocateBuffer(k*rows*2), {backend.allocateBuffer(k*(float32?4:2)), float32},
-             std::vector<double>(k)};
+  NormCase c{backend.allocateBuffer(k*rows*2), makeNormWeights(backend, k, float32, [&](uint32_t i) {
+    const float value=float(int(i%17)-8)/4;
+    return float32 ? value*(1+float(hash(i)%4093)/65536) : value;
+  })};
   auto *x=static_cast<uint16_t *>(c.input.contents());
   for (uint32_t i=0;i<k*rows;++i) x[i]=floatToBf16(float(int(hash(i)%257)-128)*8192);
-  for (uint32_t i=0;i<k;++i) {
-    const float value=float(int(i%17)-8)/4;
-    if (float32) {
-      const float exact=value*(1+float(hash(i)%4093)/65536);
-      static_cast<float *>(c.weight.buffer.contents())[i]=exact;
-      c.weights[i]=exact;
-    } else {
-      static_cast<uint16_t *>(c.weight.buffer.contents())[i]=floatToBf16(value);
-      c.weights[i]=bf16ToFloat(floatToBf16(value));
-    }
-  }
   return c;
 }
-// Every output is the fp64 norm rounded once to bf16, up to the fp32
-// arithmetic's noise (well below 2^-8 of half an ulp): weights rounded to
-// bf16 anywhere on the way would miss the bound on about a quarter of them.
 void requireNorm(const NormCase &c, const metal::MetalBuffer &output, uint32_t k, uint32_t rows,
                  const char *what) {
   const auto *x=static_cast<const uint16_t *>(c.input.contents());
   const auto *out=static_cast<const uint16_t *>(output.contents());
   for (uint32_t r=0;r<rows;++r) {
-    double squares=0;
-    for (uint32_t i=0;i<k;++i) squares+=double(bf16ToFloat(x[r*k+i]))*bf16ToFloat(x[r*k+i]);
-    const double inverse=1/std::sqrt(squares/k+1e-6);
-    for (uint32_t i=0;i<k;++i) {
-      const double exact=bf16ToFloat(x[r*k+i])*inverse*c.weights[i];
-      require(std::fabs(bf16ToFloat(out[r*k+i])-exact)<=0.5*ulpBf16(float(exact))*(1+1.0/256),what);
-    }
+    const std::vector<double> exact=rmsNorm(x+uint64_t{r}*k,c.weight,k);
+    for (uint32_t i=0;i<k;++i) require(roundedOnceToBf16(out[r*k+i],exact[i]),what);
   }
 }
 void fusedNorm(metal::MetalBackend &backend, uint32_t k, uint32_t rows, LinearInput layout, bool float32) {

@@ -8,6 +8,8 @@
 #include "../../../runtime/ops/GDN.hpp"
 #include "tuning/LinearNumerics.hpp"
 
+#include "NormReference.hpp"
+
 #import <Foundation/Foundation.h>
 
 #include <algorithm>
@@ -144,8 +146,7 @@ GdnPrefillBuffers randomPrefill(MetalBackend &backend, const GdnShape &shape,
       shared(backend, stateElements * 4, "state in"),
       shared(backend, uint64_t{convDim} * 4 * 2, "conv weights"),
       shared(backend, valueHeads * 4, "a scale"),
-      shared(backend, valueHeads * 2, "dt bias"),
-      {shared(backend, kHeadDim * (float32 ? 4 : 2), "mixer norm"), float32});
+      shared(backend, valueHeads * 2, "dt bias"), {});
 
   Random random(0x9E3779B97F4A7C15ULL ^ (uint64_t{valueHeads} << 32) ^ tokens);
   auto *packed = data<uint16_t>(buffers.packed);
@@ -169,19 +170,10 @@ GdnPrefillBuffers randomPrefill(MetalBackend &backend, const GdnShape &shape,
   auto *stateIn = data<float>(buffers.recurrentIn);
   for (uint64_t i = 0; i < stateElements; ++i)
     stateIn[i] = 0.05F * random.gauss();
-  for (uint32_t i = 0; i < kHeadDim; ++i) {
-    const double weight = 1.0 + 0.2 * random.gauss();
-    if (float32)
-      data<float>(buffers.mixerNorm.buffer)[i] = static_cast<float>(weight);
-    else
-      data<uint16_t>(buffers.mixerNorm.buffer)[i] = toBf16(weight);
-  }
+  buffers.mixerNorm = splash::test::makeNormWeights(backend, kHeadDim, float32, [&](uint32_t) {
+    return static_cast<float>(1.0 + 0.2 * random.gauss());
+  });
   return buffers;
-}
-
-double normWeight(const NormWeights &norm, uint32_t index) {
-  return norm.float32 ? data<float>(norm.buffer)[index]
-                      : fromBf16(data<uint16_t>(norm.buffer)[index]);
 }
 
 void submitPrefill(MetalBackend &backend, const GdnPrefillBuffers &buffers,
@@ -369,18 +361,12 @@ void runCase(MetalBackend &backend, const GdnShape &shape, uint32_t tokens,
   for (uint32_t token = 0; token < tokens; ++token) {
     for (uint32_t head = 0; head < valueHeads; ++head) {
       const uint64_t base = (uint64_t{token} * valueHeads + head) * kHeadDim;
-      double squares = 0.0;
-      for (uint32_t dim = 0; dim < kHeadDim; ++dim) {
-        row[dim] = fromBf16(recurrent[base + dim]);
-        squares += row[dim] * row[dim];
-      }
-      const double inverse = 1.0 / std::sqrt(squares / kHeadDim + kEpsilon);
+      const std::vector<double> normalized =
+          splash::test::rmsNorm(recurrent + base, buffers.mixerNorm, kHeadDim);
       for (uint32_t dim = 0; dim < kHeadDim; ++dim) {
         const double z = fromBf16(packed[uint64_t{token} * packedWidth + convDim +
                                          head * kHeadDim + dim]);
-        const double ref = roundBf16(
-            roundBf16(row[dim] * inverse * normWeight(buffers.mixerNorm, dim)) *
-            silu(z));
+        const double ref = roundBf16(roundBf16(normalized[dim]) * silu(z));
         const double got = fromBf16(hidden[base + dim]);
         require(std::isfinite(got), label + "gated output is not finite");
         hiddenUlps = std::max(hiddenUlps, std::fabs(got - ref) / bf16Ulp(ref));
