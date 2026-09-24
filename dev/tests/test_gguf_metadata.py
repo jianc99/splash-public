@@ -59,6 +59,7 @@ def fixture(*, native=False):
         "general.architecture": "qwen35moe",
         "qwen35moe.embedding_length": 2048,
         "qwen35moe.block_count": 40,
+        "qwen35moe.full_attention_interval": 4,
         "qwen35moe.context_length": 262144,
         "qwen35moe.attention.head_count": 16,
         "qwen35moe.attention.head_count_kv": 2,
@@ -74,6 +75,17 @@ def fixture(*, native=False):
         "tokenizer.ggml.bos_token_id": 257,
         "tokenizer.ggml.padding_token_id": 257,
         "tokenizer.chat_template": "{% for message in messages %}{{ message.content }}<|im_end|>{% endfor %}",
+    }
+
+
+def loadable_tensors(values, directory):
+    """A tensor table the native loader accepts for the header values: each
+    tensor it reads, quantized as Q4_K, Q8_0 (GDN alpha and beta) or F32."""
+    codes = {name: code for code, name in gguf.TENSOR_TYPES.items()}
+    header = gguf.Metadata(write_gguf(directory / "header.gguf", values))
+    return {
+        name: codes[next(t for t in ("Q4_K", "Q8_0", "F32") if t in types)]
+        for name, types in gguf.loaded_tensors(header).items()
     }
 
 
@@ -204,43 +216,63 @@ class GgufMetadataTests(unittest.TestCase):
                 with self.assertRaises(models.ModelError):
                     gguf.tokenizer_files(self.metadata(values))
 
-    def test_unloadable_tensor_types_are_rejected_from_the_header(self):
+    def test_screening_accepts_each_tensor_as_the_native_loader_reads_it(self):
         values = fixture()
         values["qwen35moe.block_count"] = 41
         values["qwen35moe.nextn_predict_layers"] = 1
-        loadable = {
-            "token_embd.weight": 12,  # Q4_K
-            "output.weight": 14,  # Q6_K
-            "blk.0.ffn_down_exps.weight": 23,  # IQ4_XS
-            "blk.0.attn_norm.weight": 0,  # F32
-            # The MTP layer (block 40) is never loaded, so its type does not matter.
-            "blk.40.ffn_up_exps.weight": 16,  # IQ2_XXS
-        }
-        path = write_gguf(self.root / "ok.gguf", values, loadable.items())
+        tensors = loadable_tensors(values, self.root)
+        # Layer 3 is full attention; the others around it GDN.
+        self.assertIn("blk.3.attn_q.weight", tensors)
+        self.assertNotIn("blk.2.attn_q.weight", tensors)
+        # GDN alpha and beta may also both be F32, and the MTP layer (block
+        # 40) is never loaded, so its types do not matter.
+        tensors |= {"blk.1.ssm_alpha.weight": 0, "blk.1.ssm_beta.weight": 0}
+        tensors |= {"blk.40.ffn_up_exps.weight": 16, "blk.0.ffn_down_exps.weight": 23}
+        path = write_gguf(self.root / "ok.gguf", values, tensors.items())
         gguf.require_loadable(gguf.Metadata(path, tensors=True))
+        f32 = {name: 0 for name in tensors}
         for changes, reason in (
-            ({"blk.3.ffn_gate_exps.weight": 18}, "IQ3_XXS [(]1 tensors[)]"),
+            (
+                {"blk.4.ffn_gate_exps.weight": 18},
+                "ffn_gate_exps.weight IQ3_XXS [(]1 tensor[)]",
+            ),
             (
                 {"blk.0.attn_qkv.weight": 39, "blk.1.attn_qkv.weight": 39},
-                "MXFP4 [(]2 tensors[)]",
+                "attn_qkv.weight MXFP4 [(]2 tensors[)]",
             ),
-            ({"token_embd.weight": 23}, "IQ4_XS"),
-            ({"blk.0.attn_q.weight": 30}, "BF16"),
+            ({"token_embd.weight": 23}, "token_embd.weight IQ4_XS"),
+            ({"blk.3.attn_q.weight": 30}, "attn_q.weight BF16"),
+            # F32 only where the loader reads floats: not a projection, not
+            # a quantized router or norm, not half an alpha/beta pair.
+            ({"blk.3.attn_q.weight": 0}, "attn_q.weight F32"),
+            ({"blk.0.ffn_gate_inp.weight": 8}, "ffn_gate_inp.weight Q8_0"),
+            ({"output_norm.weight": 1}, "output_norm.weight F16"),
+            (
+                {"blk.1.ssm_alpha.weight": 8},
+                "ssm_alpha.weight and ssm_beta.weight of different types",
+            ),
+            # An all-F32 file, whose types the loader reads somewhere.
+            (f32, "attn_output.weight F32 [(]10 tensors[)]"),
         ):
             with self.subTest(reason=reason):
                 path = write_gguf(
-                    self.root / "bad.gguf", values, (loadable | changes).items()
+                    self.root / "bad.gguf", values, (tensors | changes).items()
                 )
                 with self.assertRaisesRegex(
                     models.ModelError, "cannot load: .*" + reason
                 ):
                     gguf.require_loadable(gguf.Metadata(path, tensors=True))
+        # Every tensor the loader reads must be present.
+        missing = {n: k for n, k in tensors.items() if n != "blk.7.attn_k.weight"}
+        path = write_gguf(self.root / "bad.gguf", values, missing.items())
+        with self.assertRaisesRegex(models.ModelError, "attn_k.weight missing"):
+            gguf.require_loadable(gguf.Metadata(path, tensors=True))
         # Without tensors=True the reader never reads the tensor table.
         self.assertEqual(gguf.Metadata(path).tensors, {})
 
     def test_loadable_types_are_the_native_formats(self):
-        # The installer's list must be the loader's own: kQuantFormats' GGML types
-        # plus F32 (runtime/metal/abi/QuantFormat.h).
+        # The installer's list must be the loader's own: kQuantFormats' GGML
+        # types (runtime/metal/abi/QuantFormat.h).
         import re
 
         header = (
@@ -250,8 +282,8 @@ class GgufMetadataTests(unittest.TestCase):
             0
         ]
         native = {gguf.TENSOR_TYPES[int(n)] for n in re.findall(r"\{(\d+),", table)}
-        self.assertEqual(native | {"F32"}, gguf.LOADABLE_TYPES)
-        self.assertLessEqual(gguf.EMBEDDING_TYPES, gguf.LOADABLE_TYPES)
+        self.assertEqual(native, gguf.QUANTIZED_TYPES)
+        self.assertLessEqual(gguf.EMBEDDING_TYPES, gguf.QUANTIZED_TYPES)
 
     def test_moe_config_states_its_experts_and_identifies_the_family(self):
         config = gguf.model_config(self.metadata(fixture(native=True)))
@@ -376,7 +408,12 @@ class GgufMetadataTests(unittest.TestCase):
     def test_gguf_only_repository_assembly_never_resolves_other_target_sources(self):
         target = self.root / "target"
         target.mkdir()
-        write_gguf(target / "model-Q4_K_M.gguf", fixture(native=True))
+        values = fixture(native=True)
+        write_gguf(
+            target / "model-Q4_K_M.gguf",
+            values,
+            loadable_tensors(values, self.root).items(),
+        )
         write_gguf(
             target / "mmproj-F32.gguf", vision_fixture(), [("v.patch_embd.weight", 0)]
         )
@@ -441,7 +478,12 @@ class GgufMetadataTests(unittest.TestCase):
     def test_a_new_metadata_adapter_rebuilds_the_metadata_locally(self):
         target = self.root / "target"
         target.mkdir()
-        write_gguf(target / "model-Q4_K_M.gguf", fixture(native=True))
+        values = fixture(native=True)
+        write_gguf(
+            target / "model-Q4_K_M.gguf",
+            values,
+            loadable_tensors(values, self.root).items(),
+        )
         source = upstream.Repository.local_directory(target)
         draft = draft_dir(self.root / "draft", MOE)
         args = argparse.Namespace(

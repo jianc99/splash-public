@@ -48,7 +48,8 @@ class Draft:
 class ModelFamily:
     name: str
     # The text_config fields that identify the architecture, as an MLX config
-    # states them and as gguf.model_config derives them from a GGUF header.
+    # states them and as gguf.model_config derives them from a GGUF header,
+    # including every one the native source model inspection requires.
     signature: tuple[tuple[str, object], ...]
     draft: Draft
 
@@ -58,6 +59,7 @@ FAMILIES = (
         "Qwen3.8-27B",
         (
             ("model_type", "qwen3_5_text"),
+            ("max_position_embeddings", 262144),
             ("hidden_size", 5120),
             ("num_hidden_layers", 64),
             ("vocab_size", 248320),
@@ -71,6 +73,7 @@ FAMILIES = (
         "Qwen3.6-35B-A3B",
         (
             ("model_type", "qwen3_5_moe_text"),
+            ("max_position_embeddings", 262144),
             ("hidden_size", 2048),
             ("num_hidden_layers", 40),
             ("vocab_size", 248320),
@@ -425,7 +428,9 @@ def _target(repo, variant, language_only):
             "Configuration, tokenizer and processor must come from the target repository."
         )
     config = models.read_json(repo.file("config.json"))
-    quant = config.get("quantization", config.get("quantization_config", {}))
+    # MLX states its quantization under "quantization"; a transformers
+    # quantization_config alone describes another method (GPTQ, AWQ, ...).
+    quant = config.get("quantization")
     if (
         not isinstance(quant, dict)
         or quant.get("mode", "affine") != "affine"

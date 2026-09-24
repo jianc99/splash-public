@@ -304,9 +304,8 @@ def processor_config(m):
     }
 
 
-# GGML tensor type names, and the ones the native loader reads: its quantized
-# formats (metal/abi/QuantFormat.h, checked by the tests) and F32 for small float
-# tensors; token embeddings are gathered from Q4_K, Q6_K or Q8_0 rows.
+# GGML tensor type names, and the quantized formats the native loader reads
+# (metal/abi/QuantFormat.h, checked by the tests).
 TENSOR_TYPES = {
     0: "F32",
     1: "F16",
@@ -332,49 +331,99 @@ TENSOR_TYPES = {
     30: "BF16",
     39: "MXFP4",
 }
-LOADABLE_TYPES = {
-    "F32",
-    "Q3_K",
-    "Q4_K",
-    "Q5_K",
-    "Q6_K",
-    "Q8_0",
-    "IQ3_S",
-    "IQ4_NL",
-    "IQ4_XS",
-}
+QUANTIZED_TYPES = {"Q3_K", "Q4_K", "Q5_K", "Q6_K", "Q8_0", "IQ3_S", "IQ4_NL", "IQ4_XS"}
 EMBEDDING_TYPES = {"Q4_K", "Q6_K", "Q8_0"}
+# The tensors the native loader reads from a target, and the types it accepts
+# for each (runtime/model/GgufImage.cpp): quantized projections; F32 norms,
+# small GDN vectors and MoE routers, which llama.cpp keeps unquantized and
+# which run unrounded; GDN alpha and beta both Q8_0 or both F32.
+F32 = {"F32"}
+MODEL_TENSORS = {
+    "token_embd.weight": EMBEDDING_TYPES,
+    "output_norm.weight": F32,
+    "output.weight": QUANTIZED_TYPES,
+}
+LAYER_TENSORS = {"attn_norm.weight": F32, "post_attention_norm.weight": F32}
+ATTENTION_TENSORS = {
+    "attn_q.weight": QUANTIZED_TYPES,
+    "attn_k.weight": QUANTIZED_TYPES,
+    "attn_v.weight": QUANTIZED_TYPES,
+    "attn_q_norm.weight": F32,
+    "attn_k_norm.weight": F32,
+    "attn_output.weight": QUANTIZED_TYPES,
+}
+GDN_TENSORS = {
+    "attn_qkv.weight": QUANTIZED_TYPES,
+    "attn_gate.weight": QUANTIZED_TYPES,
+    "ssm_alpha.weight": {"Q8_0", "F32"},
+    "ssm_beta.weight": {"Q8_0", "F32"},
+    "ssm_conv1d.weight": F32,
+    "ssm_a": F32,
+    "ssm_dt.bias": F32,
+    "ssm_norm.weight": F32,
+    "ssm_out.weight": QUANTIZED_TYPES,
+}
+DENSE_TENSORS = {
+    "ffn_gate.weight": QUANTIZED_TYPES,
+    "ffn_up.weight": QUANTIZED_TYPES,
+    "ffn_down.weight": QUANTIZED_TYPES,
+}
+MOE_TENSORS = {
+    "ffn_gate_inp.weight": F32,
+    "ffn_gate_exps.weight": QUANTIZED_TYPES,
+    "ffn_up_exps.weight": QUANTIZED_TYPES,
+    "ffn_down_exps.weight": QUANTIZED_TYPES,
+    "ffn_gate_inp_shexp.weight": F32,
+    "ffn_gate_shexp.weight": QUANTIZED_TYPES,
+    "ffn_up_shexp.weight": QUANTIZED_TYPES,
+    "ffn_down_shexp.weight": QUANTIZED_TYPES,
+}
 
 
-def require_loadable(m):
-    """Reject a target whose tensor types the native loader cannot read, from
-    its header alone, so an unusable file is never downloaded. MTP layers are
-    not loaded, so their types do not matter."""
+def loaded_tensors(m):
+    """Each tensor name the native loader reads from target header m, with
+    the types it accepts. MTP layers are not loaded; every
+    full_attention_interval-th layer is full attention, the others GDN."""
     arch = m.require("general.architecture", str)
     layers = m.positive(arch + ".block_count") - m.values.get(
         arch + ".nextn_predict_layers", 0
     )
+    period = m.positive(arch + ".full_attention_interval")
+    ffn = MOE_TENSORS if arch == "qwen35moe" else DENSE_TENSORS
+    tensors = dict(MODEL_TENSORS)
+    for layer in range(layers):
+        mixer = ATTENTION_TENSORS if (layer + 1) % period == 0 else GDN_TENSORS
+        for name, types in (LAYER_TENSORS | mixer | ffn).items():
+            tensors[f"blk.{layer}.{name}"] = types
+    return tensors
+
+
+def require_loadable(m):
+    """Reject a target the native loader cannot read, from its header alone,
+    so an unusable file is never downloaded: every tensor it reads must be
+    present, with a type it accepts for that tensor."""
     unsupported = collections.Counter()
-    for name, kind in m.tensors.items():
-        parts = name.split(".")
-        if (
-            parts[0] == "blk"
-            and len(parts) > 1
-            and parts[1].isdigit()
-            and int(parts[1]) >= layers
+    for name, types in loaded_tensors(m).items():
+        kind = m.tensors.get(name)
+        found = "missing" if kind is None else TENSOR_TYPES.get(kind, f"type {kind}")
+        if found not in types:
+            unsupported[
+                name.split(".", 2)[-1] if name.startswith("blk.") else name, found
+            ] += 1
+        # The two GDN input gates run as one segment of their shared format.
+        if name.endswith(".ssm_beta.weight") and kind != m.tensors.get(
+            name.replace("ssm_beta", "ssm_alpha")
         ):
-            continue
-        type_name = TENSOR_TYPES.get(kind, f"type {kind}")
-        if type_name not in (
-            EMBEDDING_TYPES if name == "token_embd.weight" else LOADABLE_TYPES
-        ):
-            unsupported[type_name] += 1
+            unsupported[
+                "ssm_alpha.weight and ssm_beta.weight", "of different types"
+            ] += 1
     if unsupported:
         listed = ", ".join(
-            f"{name} ({count} tensors)" for name, count in sorted(unsupported.items())
+            f"{tensor} {found} ({count} {'tensor' if count == 1 else 'tensors'})"
+            for (tensor, found), count in sorted(unsupported.items())
         )
         raise ModelError(
-            f"this GGUF uses tensor types Splash cannot load: {listed}; choose another variant"
+            f"this GGUF stores tensors Splash cannot load: {listed}; choose another variant"
         )
 
 

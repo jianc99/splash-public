@@ -205,6 +205,7 @@ class UpstreamTest(unittest.TestCase):
         # A differing field is another architecture, whatever the repository is called.
         for changes in (
             {"num_hidden_layers": 48},
+            {"max_position_embeddings": 131072},
             {"vocab_size": 151936},
             {"head_dim": 128},
             {"model_type": "qwen3_moe"},
@@ -261,6 +262,57 @@ class UpstreamTest(unittest.TestCase):
             self.prepare(arguments(self.root, "someone/renamed-27b"))
         self.assertEqual(hub.requests, [("someone/renamed-27b", None)])
         self.assertEqual(hub.downloads, ["someone/renamed-27b/config.json"])
+
+    def test_only_mlx_affine_quantization_is_accepted(self):
+        def target(quantization):
+            def build(root):
+                mlx_target(root, DENSE)
+                config = json.loads((root / "config.json").read_text())
+                del config["quantization"]
+                (root / "config.json").write_text(json.dumps(config | quantization))
+
+            return build
+
+        hub = self.fake_hub()
+        for name, quantization in (
+            # A transformers quantization_config alone is another method.
+            (
+                "gptq",
+                {
+                    "quantization_config": {
+                        "quant_method": "gptq",
+                        "bits": 4,
+                        "group_size": 64,
+                    }
+                },
+            ),
+            (
+                "awq",
+                {
+                    "quantization_config": {
+                        "quant_method": "awq",
+                        "bits": 4,
+                        "group_size": 64,
+                    }
+                },
+            ),
+            ("mxfp4", {"quantization": {"mode": "mxfp4", "bits": 4, "group_size": 64}}),
+            ("q8", {"quantization": {"bits": 8, "group_size": 64}}),
+        ):
+            with self.subTest(name=name):
+                hub.publish(f"someone/{name}", "b" * 40, target(quantization))
+                with self.assertRaisesRegex(
+                    models.ModelError, "requires an MLX affine 4-bit/group-64"
+                ):
+                    self.prepare(arguments(self.root, f"someone/{name}"))
+        # MLX writes both keys, and states the mode only in newer versions.
+        affine = {"bits": 4, "group_size": 64, "mode": "affine"}
+        hub.publish(
+            "someone/mlx",
+            "c" * 40,
+            target({"quantization": affine, "quantization_config": affine}),
+        )
+        self.assertTrue(self.prepare(arguments(self.root, "someone/mlx"))[0])
 
     def test_missing_metadata_never_falls_back_to_another_repository(self):
         required = {
