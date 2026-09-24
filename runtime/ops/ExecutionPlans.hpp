@@ -37,8 +37,7 @@ struct VerifyAttentionPolicy final {
 struct DraftAttentionWorkload final {
   DraftAttentionShape shape;
   uint32_t lanes = 0;
-  std::strong_ordering operator<=>(const DraftAttentionWorkload &) const noexcept;
-  bool operator==(const DraftAttentionWorkload &) const noexcept;
+  auto operator<=>(const DraftAttentionWorkload &) const = default;
 };
 
 enum class MoePhase : uint8_t { Prefill, Decode };
@@ -48,8 +47,7 @@ struct MoeWorkload final {
   // Physical rows in both phases: decode uses 8, 16, 24 or 32.
   uint32_t rows = 0;
   MoePhase phase = MoePhase::Decode;
-  std::strong_ordering operator<=>(const MoeWorkload &) const noexcept;
-  bool operator==(const MoeWorkload &) const noexcept;
+  auto operator<=>(const MoeWorkload &) const = default;
 };
 
 struct PrefillAttentionChoice final {
@@ -106,7 +104,7 @@ public:
   [[nodiscard]] MoePlan moeDecode(MoeShape shape, uint32_t lanes) const;
   // Shipped baseline first, independent of installed choices. Every candidate
   // uses the same device router and expert-tile policy as production lookups
-  // and encoding.
+  // and encoding; a GGUF workload's two are its device plan.
   [[nodiscard]] std::array<MoePlan, 2> moeCandidates(const MoeWorkload &workload) const;
 
   // Bounds include baseline and every matching installed key, not just the
@@ -126,6 +124,9 @@ public:
                                          WeightLayout weightLayout = WeightLayout::Affine64) const;
 
 private:
+  // The plan of `config` with the device's fields.
+  [[nodiscard]] MoePlan moePlan(const MoeWorkload &workload, MoeConfig config) const;
+
   Linear linear_;
   Linear baselineLinear_;
   uint32_t moeRouteWideRows_ = kMoeRouteWideRows;

@@ -357,21 +357,16 @@ MoePlan MoE::decodePlan(MoeShape shape, uint32_t lanes, MoeConfig config) {
 }
 
 std::array<MoePlan, 2> MoE::prefillCandidates(MoeShape shape, uint32_t rows,
-                                          uint32_t routeWideRows) {
-  const MoePlan baseline = prefillPlan(shape, rows, {MoeExpertTile::M32, routeWideRows});
-  if (shape.weightLayout == WeightLayout::Block32) return {baseline, baseline};
-  return {baseline, prefillPlan(shape, rows, {MoeExpertTile::M8, routeWideRows})};
+                                              uint32_t routeWideRows) {
+  return {prefillPlan(shape, rows, {MoeExpertTile::M32, routeWideRows}),
+          prefillPlan(shape, rows, {MoeExpertTile::M8, routeWideRows})};
 }
 
 std::array<MoePlan, 2> MoE::decodeCandidates(MoeShape shape, uint32_t lanes,
-                                         uint32_t routeWideRows,
-                                         MoeExpertSimdgroups m8Simdgroups,
-                                         MoeGgufTile ggufTile) {
-  const MoePlan baseline = decodePlan(
-      shape, lanes, {MoeExpertTile::M8, routeWideRows, m8Simdgroups, ggufTile});
-  if (shape.weightLayout == WeightLayout::Block32) return {baseline, baseline};
-  return {baseline, decodePlan(shape, lanes,
-                               {MoeExpertTile::M32, routeWideRows, m8Simdgroups})};
+                                             uint32_t routeWideRows,
+                                             MoeExpertSimdgroups m8Simdgroups) {
+  return {decodePlan(shape, lanes, {MoeExpertTile::M8, routeWideRows, m8Simdgroups}),
+          decodePlan(shape, lanes, {MoeExpertTile::M32, routeWideRows, m8Simdgroups})};
 }
 
 } // namespace splash::ops

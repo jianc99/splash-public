@@ -258,10 +258,9 @@ void checkPair(ModelPackage package, bool sparse) {
   rejects([&] { (void)collectTuningWorkloads(package, prefill, decode); });
 }
 
-// A GGUF target is not tuned: block plans never read installed choices
-// (Linear::plan, ExecutionPlans::moePrefill/moeDecode), so the collector
-// takes none of its projections or MoE blocks, only the affine draft's, and
-// a choice installed for its MoE shape leaves its plans as they were.
+// A GGUF target is not tuned: the collector takes none of its projections or
+// MoE blocks, only the affine draft's, and a choice table may not hold a
+// block projection or GGUF MoE workload.
 void blockTarget() {
   ModelPackage package;
   const Qwen3_6MoeLayout layout;
@@ -301,12 +300,16 @@ void blockTarget() {
   device.appleGpuFamily = 10;
   device.gpuCoreCount = 16;
   ExecutionPlans plans(device);
-  const MoeConfig before = plans.moePrefill(shape, 512).config();
   OperatorChoices choices;
   choices.moe.push_back({{shape, 512, MoePhase::Prefill}, {MoeExpertTile::M8}});
-  plans.install(choices);
-  require(before.expertTile == MoeExpertTile::M32 && plans.moePrefill(shape, 512).config() == before,
-          "an installed choice changed a GGUF MoE plan");
+  rejects([&] { plans.install(choices); });
+  choices.moe.clear();
+  choices.linear.push_back({{{layout.vocabularySize, layout.hiddenSize}, 8, LinearPhase::Decode,
+                             LinearEpilogue::None, WeightLayout::Block32},
+                            plans.linear().plan({{layout.vocabularySize, layout.hiddenSize}, 8, LinearPhase::Decode,
+                                                 LinearEpilogue::None, WeightLayout::Block32})
+                                .configuration()});
+  rejects([&] { plans.install(choices); });
 }
 
 void run() {

@@ -511,7 +511,7 @@ void planBounds() {
           "router wide-tile threshold does not scale with the core count");
   require(splash::ops::moeRouteTile(519, 520).rows == 8 &&
               splash::ops::moeRouteTile(520, 520).rows == 32 &&
-              splash::ops::moeRouteTile(512).rows == 32,
+              splash::ops::moeRouteTile(512, kMoeRouteWideRows).rows == 32,
           "router tile selection ignores the configured threshold");
   for (const MoeShape shape : {MoeShape{256, 8, 2, 512},
                               MoeShape{2048, 256, 8, 512}}) {
@@ -528,7 +528,7 @@ void planBounds() {
       }
     }
     for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
-      const auto plans = MoE::decodeCandidates(shape, lanes, kMoeRouteWideRows);
+      const auto plans = MoE::decodeCandidates(shape, lanes, kMoeRouteWideRows, MoeExpertSimdgroups::Eight);
       require(plans[0].config() == MoeConfig{MoeExpertTile::M8} &&
                   plans[1].config() == MoeConfig{MoeExpertTile::M32},
               "decode candidates must preserve the shipped baseline first");
@@ -558,8 +558,8 @@ void planBounds() {
     }
     rejects([&] { (void)MoE::prefillCandidates(shape, 0, kMoeRouteWideRows); }, "zero prefill");
     rejects([&] { (void)MoE::prefillCandidates(shape, 2049, kMoeRouteWideRows); }, "large prefill");
-    rejects([&] { (void)MoE::decodeCandidates(shape, 0, kMoeRouteWideRows); }, "zero batch");
-    rejects([&] { (void)MoE::decodeCandidates(shape, 5, kMoeRouteWideRows); }, "large batch");
+    rejects([&] { (void)MoE::decodeCandidates(shape, 0, kMoeRouteWideRows, MoeExpertSimdgroups::Eight); }, "zero batch");
+    rejects([&] { (void)MoE::decodeCandidates(shape, 5, kMoeRouteWideRows, MoeExpertSimdgroups::Eight); }, "large batch");
     rejects([&] { (void)MoE::prefillPlan(shape, 1, {static_cast<MoeExpertTile>(16)}); },
             "uncompiled expert tile");
     rejects([&] { (void)MoE::decodePlan(shape, 1, {MoeExpertTile::M8, kMoeRouteWideRows,
@@ -871,7 +871,7 @@ void run(const std::string &metallibPath) {
       }
     };
     for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
-      const auto candidates = MoE::decodeCandidates(fixture.shape, lanes, kMoeRouteWideRows);
+      const auto candidates = MoE::decodeCandidates(fixture.shape, lanes, kMoeRouteWideRows, MoeExpertSimdgroups::Eight);
       const std::string label = "decode B" + std::to_string(lanes);
       const auto baseline = execute(candidates[0], label);
       requireEqual(execute(candidates[1], label), baseline, label + " M32");

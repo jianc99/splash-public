@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <compare>
 #include <cstdint>
 
 namespace splash::ops {
@@ -31,6 +32,7 @@ struct MoeShape final {
   [[nodiscard]] constexpr uint32_t routesPerToken() const noexcept {
     return expertsPerToken + 1;
   }
+  auto operator<=>(const MoeShape &) const = default;
 };
 
 // A GGUF expert projection: every routed expert in one segment of experts *
@@ -91,7 +93,7 @@ inline constexpr uint32_t kMoeRouteRowsPerCore = 26;
 }
 
 [[nodiscard]] constexpr MoeRouteTile
-moeRouteTile(uint32_t rows, uint32_t wideRows = kMoeRouteWideRows) noexcept {
+moeRouteTile(uint32_t rows, uint32_t wideRows) noexcept {
   return rows >= wideRows ? MoeRouteTile{32, 128} : MoeRouteTile{8, 32};
 }
 
@@ -285,16 +287,14 @@ struct MoE final {
   [[nodiscard]] static MoePlan decodePlan(
       MoeShape shape, uint32_t lanes,
       MoeConfig config = {MoeExpertTile::M8});
-  // Bounded precompiled candidates, shipped baseline first. ExecutionPlans
-  // supplies the device's router threshold to every expert-tile candidate
-  // and its 8-row tile simdgroups to the decode candidates. GGUF plans are
-  // not tuned: both candidates are the baseline.
+  // Bounded precompiled candidates of an affine shape, shipped baseline
+  // first. ExecutionPlans supplies the device's router threshold to every
+  // expert-tile candidate and its 8-row tile simdgroups to the decode ones.
   [[nodiscard]] static std::array<MoePlan, 2>
   prefillCandidates(MoeShape shape, uint32_t rows, uint32_t routeWideRows);
   [[nodiscard]] static std::array<MoePlan, 2>
   decodeCandidates(MoeShape shape, uint32_t lanes, uint32_t routeWideRows,
-                   MoeExpertSimdgroups m8Simdgroups = MoeExpertSimdgroups::Eight,
-                   MoeGgufTile ggufTile = MoeGgufTile::Staged);
+                   MoeExpertSimdgroups m8Simdgroups);
   static void add(metal::CommandGraph &graph, const MoeBuffers &buffers,
                   const MoeWeights &weights, const MoePlan &plan);
 };

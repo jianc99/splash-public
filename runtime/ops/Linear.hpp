@@ -210,8 +210,7 @@ public:
   static constexpr std::size_t kMaximumCandidates = 20;
 
   [[nodiscard]] LinearPlan plan(LinearWorkload workload) const;
-  // The plan that runs for this projection (GGUF projections plan their
-  // own tiles).
+  // The plan of `workload` in the projection's weight layout.
   [[nodiscard]] LinearPlan plan(LinearWorkload workload, const Projection &projection) const;
   // Rows of storage a decode step of `rows` rows binds for this device's
   // projection tiles (LinearPlan::storageRows of its decode plans): the step's
@@ -227,6 +226,7 @@ public:
   [[nodiscard]] static LinearPlan plan(LinearWorkload workload, LinearConfig config);
   [[nodiscard]] std::vector<LinearPlan> candidates(LinearWorkload workload) const;
   // Installed only at startup; encoding does a read-only lookup, never tuning.
+  // Block projection plans are not tuned: their workloads take no choice.
   void setChoices(std::span<const LinearChoice> choices);
   // Returns what the scratch table describes after the dispatch.
   PreparedInput add(metal::CommandGraph &graph, LinearBuffers buffers,

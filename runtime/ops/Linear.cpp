@@ -528,15 +528,17 @@ LinearPlan Linear::plan(LinearWorkload workload) const {
 LinearPlan Linear::plan(LinearWorkload workload, LinearConfig config) {
   return LinearPlan(workload, config);
 }
-// GGUF plans are not tuned yet: installed choices do not apply to them.
 LinearPlan Linear::plan(LinearWorkload w, const Projection &p) const {
   w.weightLayout = p.layout();
-  if (w.weightLayout == WeightLayout::Affine64) return plan(w);
-  return LinearPlan(w, ggufBaseline(w));
+  return plan(w);
 }
 void Linear::setChoices(std::span<const LinearChoice> choices) {
   std::vector<LinearChoice> pending(choices.begin(), choices.end());
-  for (const auto &choice : pending) (void)plan(choice.workload, choice.configuration);
+  for (const auto &choice : pending) {
+    if (choice.workload.weightLayout == WeightLayout::Block32)
+      throw std::invalid_argument("block projection plans are not tuned");
+    (void)plan(choice.workload, choice.configuration);
+  }
   std::sort(pending.begin(), pending.end(), [](const auto &a, const auto &b) {
     return a.workload < b.workload;
   });

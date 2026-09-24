@@ -205,7 +205,7 @@ void moeDeviceTiles() {
   }
 }
 
-// GGUF MoE plans (MoeShape::quant == Gguf) run the three expert passes: the
+// GGUF MoE plans (Block32 weights) run the three expert passes: the
 // exact register tile on Apple9, with its Table16 row sums in the workspace
 // bounds, staged tiles everywhere else (32-row tiles for prefill chunks past
 // one route per expert), and no installed choices.
@@ -216,18 +216,17 @@ void ggufMoePlans() {
     ExecutionPlans plans(device(family));
     const MoeGgufTile expected = family == 9 ? MoeGgufTile::Register : MoeGgufTile::Staged;
     require(moeGgufTile(family) == expected, "GGUF expert tile is not gated on GPU family 9");
-    // A valid choice of the other tile, which the plans must ignore.
+    // GGUF plans are not tuned: a table may not hold a choice for them.
     OperatorChoices choices;
-    choices.moe.push_back({MoeWorkload{shape, 16, MoePhase::Decode},
-                           MoeConfig{MoeExpertTile::M8, kMoeRouteWideRows, MoeExpertSimdgroups::Eight,
-                                     expected == MoeGgufTile::Register ? MoeGgufTile::Staged
-                                                                       : MoeGgufTile::Register}});
-    plans.install(choices);
+    choices.moe.push_back({MoeWorkload{shape, 16, MoePhase::Decode}, MoeConfig{MoeExpertTile::M8}});
+    rejects([&] { plans.install(choices); });
     for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
       const MoePlan plan = plans.moeDecode(shape, lanes);
       require(plan.config().ggufTile == expected && plan.tileRows() == 8 && plan.splitExperts() &&
                   plan.config().ggufRouterTile == FloatTile::Simdgroup,
-              "GGUF MoE decode plan left its device tile or took an installed choice");
+              "GGUF MoE decode plan left its device tile");
+      for (const MoePlan &candidate : plans.moeCandidates({shape, lanes * 8, MoePhase::Decode}))
+        require(candidate.config() == plan.config(), "GGUF MoE decode candidate is not the device's plan");
       // Sums of the widest input (hidden, 3 K / 4 fp32) per 8-row tile.
       require(plan.workspace().groupedSumsBytes ==
                   (expected == MoeGgufTile::Register ? uint64_t{plan.maximumTiles()} * 2048 * 3 : 0),
