@@ -44,10 +44,11 @@ template <class Acc, class Fn> inline void gguf_elements(thread Acc &acc, Fn fn)
 
 // The decode tile loop without the store: dequantize one KS-input step of the Cols columns into the stage, then run
 // the tile's matmul2d on it, over steps [step_begin, step_end) of K.
-template <class F, ushort Rows, ushort Cols, ushort KS, ushort Prefetch, class Acc>
+template <class F, ushort Rows, ushort Cols, ushort KS, class Acc>
 inline void staged_accumulate(device bfloat *input, device uchar *w0, device uchar *w1, device uchar *meta, uint input_size, uint output_origin,
                      threadgroup half *stage, threadgroup half2 *tl, uint simd_lane, uint step_begin, uint step_end, thread Acc &acc) {
-  constexpr ushort GPS = KS / 32, Items = Cols * GPS, IPT = (Items + 31) / 32;
+  // Prefetch: the steps whose weights are loaded ahead of the one being staged.
+  constexpr ushort Prefetch = 1, GPS = KS / 32, Items = Cols * GPS, IPT = (Items + 31) / 32;
   auto a = tensor(input, dextents<int, 2>{int(input_size), Rows}, array<int, 2>{1, int(input_size)});
   constexpr auto descriptor = matmul2d_descriptor(Rows, Cols, KS, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
   matmul2d<descriptor, execution_simdgroups<1>> operation;
@@ -82,10 +83,6 @@ inline void staged_accumulate(device bfloat *input, device uchar *w0, device uch
       dequant32<F>(packed[0][it], hdr[it], j, tl, buf + col * KS + gi * 32);
     }
     simdgroup_barrier(mem_flags::mem_threadgroup);
-#pragma unroll
-    for (ushort pf = 0; pf + 1 < Prefetch; ++pf)
-#pragma unroll
-      for (ushort it = 0; it < IPT; ++it) packed[pf][it] = packed[pf + 1][it];
     if (step + Prefetch < step_end) {
 #pragma unroll
       for (ushort it = 0; it < IPT; ++it) {
@@ -101,11 +98,11 @@ inline void staged_accumulate(device bfloat *input, device uchar *w0, device uch
 }
 
 // runtime dequantizer selection (uniform per threadgroup)
-template <ushort Rows, ushort Cols, ushort KS, ushort Prefetch, class Acc>
+template <ushort Rows, ushort Cols, ushort KS, class Acc>
 inline void staged_accumulate_any(uint fmt, device bfloat *input, device uchar *w0, device uchar *w1, device uchar *meta, uint input_size, uint origin,
                            threadgroup half *stage, threadgroup half2 *tl, uint simd_lane, uint sb, uint se, thread Acc &acc) {
   quant_format_switch(fmt, [&](auto format) {
-    staged_accumulate<decltype(format), Rows, Cols, KS, Prefetch>(input, w0, w1, meta, input_size, origin, stage, tl,
+    staged_accumulate<decltype(format), Rows, Cols, KS>(input, w0, w1, meta, input_size, origin, stage, tl,
                                                                      simd_lane, sb, se, acc);
   });
 }
