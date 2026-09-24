@@ -118,22 +118,26 @@ class ChatTemplates:
 
     def describe(self):
         """One line for the startup log."""
-        parts = []
-        for name, template in self.templates.items():
-            if template.later_system == NATIVE:
-                text = "renders later system messages in place"
-            elif template.later_system == PATCHED:
-                text = (
-                    "patched to render later system messages in place "
-                    f"(it {template.original} them)"
-                )
-            else:
-                text = (
-                    "requests with later system messages are rejected "
-                    f"(it {template.original} them)"
-                )
-            parts.append(text if name is None else f"{name} {text}")
-        return " · ".join(parts)
+        return " · ".join(
+            ("" if name is None else f"{name} ")
+            + _DESCRIPTIONS[template.later_system].format(template.original)
+            for name, template in self.templates.items()
+        )
+
+
+# Startup log text for each outcome; {} names what the unmodified template
+# does with a later system message.
+_DESCRIPTIONS = {
+    NATIVE: "renders later system messages in place",
+    PATCHED: (
+        "patched to render later system messages in place "
+        "(the original template {} them)"
+    ),
+    UNSUPPORTED: (
+        "requests with later system messages are rejected "
+        "(the original template {} them)"
+    ),
+}
 
 
 def _renderer(tokenizer):

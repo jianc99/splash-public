@@ -143,7 +143,11 @@ class ChatTemplateProbeTests(unittest.TestCase):
                 self.assertEqual(chosen.original, ORIGINAL[name])
                 self.assertEqual(chosen.later_system, PATCHED)
                 self.assertEqual(templates.status(), {"later_system": PATCHED})
-                self.assertIn("patched", templates.describe())
+                self.assertEqual(
+                    templates.describe(),
+                    "patched to render later system messages in place "
+                    f"(the original template {ORIGINAL[name]} them)",
+                )
 
     def test_original_templates_reject_or_drop_what_the_patch_renders(self):
         for name in UPSTREAM:
@@ -352,7 +356,12 @@ class ChatTemplateProbeTests(unittest.TestCase):
             templates.status(),
             {"later_system": {"default": NATIVE, "tool_use": PATCHED}},
         )
-        self.assertIn("tool_use patched to render", templates.describe())
+        self.assertEqual(
+            templates.describe(),
+            "default renders later system messages in place · tool_use patched to "
+            "render later system messages in place (the original template rejects "
+            "them)",
+        )
         for defined, message in (
             (None, "defines no chat template"),
             ("", "defines no chat template"),
