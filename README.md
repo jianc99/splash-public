@@ -7,17 +7,18 @@
 **A local inference engine for Apple silicon, built around the model.**
 
 Splash serves a small set of models to coding agents and to any OpenAI or
-Anthropic compatible client, on one Mac. On a 48 GB M5 Pro it decodes
-Qwen3.8-27B at 2× the speed of the next-fastest engine and, with a 32K context
-cached, returns the first token in 282 ms. Its kernels, draft model, and memory
+Anthropic compatible client, on one Mac. On a 48 GB M5 Pro, Splash 1.0 decoded
+Qwen3.8-27B at 2× the speed of the next-fastest engine we measured and, with a
+32K context cached, returned the first token in 282 ms
+([Performance](#performance)). Its kernels, draft model, and memory
 plan are specialized for each model it serves. That is why it is fast, and why
 there is nothing to configure.
 
 ## Quick start
 
 Apple M3 or newer, macOS 26.4 or later, [Homebrew](https://brew.sh), 36 GB
-of unified memory (48 GB or more recommended), and free disk for the model plus
-its prepared weights (about 35 GB for Qwen3.8-27B).
+of unified memory (48 GB or more recommended), and free disk for the model and
+a prepared copy of its weights (about 35 GB in total for Qwen3.8-27B).
 
 ```bash
 brew install incoai/tap/splash
@@ -71,19 +72,17 @@ See [judgment contracts](DEVELOPMENT.md#judgment-contracts) for details.
 | Qwen3.6-35B-A3B | `mlx-community/Qwen3.6-35B-A3B-4bit` | `unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M` |
 
 `--model` accepts the upstream repository directly: an MLX affine 4-bit,
-group-64 checkpoint (such as the mlx-community `-4bit` conversions) or a GGUF.
-Splash identifies the model from its own metadata, its architecture and
-dimensions, before downloading any weights, and pairs the DFlash2 draft trained
-for it. MLX uses the target repository's tokenizer, configuration and chat
-template; GGUF reads these from the selected GGUF file itself. No tokenizer or
-configuration is downloaded from another model repository. Only the separate
-draft model is automatically paired. A separate Splash support
-package is not required. Existing Splash packages remain loadable.
-
-GGUF selection uses `--model OWNER/REPO:VARIANT` (for example `:UD-Q4_K_M`).
-Embedded tokenizer metadata is prepared once into a small local cache and reused
-on later starts. Unsupported or incomplete tokenizer metadata causes an explicit
-error; Splash does not substitute another tokenizer.
+group-64 checkpoint (such as the mlx-community `-4bit` conversions) or a GGUF,
+selected with `OWNER/REPO:VARIANT` (for example `:UD-Q4_K_M`). Splash
+identifies the model from its own metadata, its architecture and dimensions,
+before downloading any weights, and pairs the DFlash2 draft trained for it;
+`--draft-model` replaces that draft with another repository of the same layout
+or a local draft directory. The tokenizer, configuration and chat template come
+from the target repository for MLX and from the selected GGUF file itself for
+GGUF, never from another repository: unsupported or incomplete tokenizer
+metadata is an error. GGUF variants whose tensor types Splash cannot load are
+rejected before download. Legacy Splash packages such as
+`incoai/Qwen3.8-27B-Splash` remain loadable.
 
 Vision comes from the same source: embedded vision tensors for MLX, or the
 repository's companion BF16 or F32 `mmproj` GGUF. Both are prepared as
@@ -94,18 +93,15 @@ GGUF mmproj download; MLX vision tensors share the language model's shards, so
 those shards still download in full. The server then rejects image and PDF input
 and reports `vision: false` in `/status` and `/v1/models`.
 
-The first preparation stores an additional copy of the weights, about the
-model's size, in `~/Library/Caches/Splash/weights` (`SPLASH_WEIGHT_CACHE`
-relocates it), using bounded temporary memory. Later starts reuse it. Each
-start checks the upstream revision with one Hub request and installs a new
-commit before serving it; without the Hub, or when the new commit cannot be
-installed, the installed model starts. `--revision` optionally selects an
-upstream branch, tag or commit (a commit is never checked again); otherwise the
-default branch is followed. GGUF variants whose tensor types Splash cannot load are
-rejected before download. `--draft-model` overrides the matching draft
-repository or supplies a local draft directory.
-Private repositories need `HF_TOKEN`. Downloads use the Hugging Face cache, and
-`brew upgrade splash` preserves models and agent sessions.
+The prepared weights live in `~/Library/Caches/Splash/weights`
+(`SPLASH_WEIGHT_CACHE` relocates them); preparation uses bounded temporary
+memory, and later starts reuse the result. Each start checks the upstream
+revision with one Hub request of at most 5 seconds and installs a new commit
+before serving it; without the Hub, or when the new commit cannot be installed,
+the installed model starts. `--revision` selects an upstream branch, tag or
+commit (a commit is never checked again); otherwise the default branch is
+followed. Private repositories need `HF_TOKEN`. Downloads use the Hugging Face
+cache, and `brew upgrade splash` preserves models and agent sessions.
 
 For LM Studio Bionic, follow its [Splash setup guide](https://lmstudio.ai/blog/splash-engine):
 install the Splash runtime, then paste the full Hugging Face model link into its
@@ -167,9 +163,15 @@ Experimental cache offloading: [PR #3](https://github.com/incoai/splash/pull/3).
 
 ## Performance
 
-Measured on an M5 Pro (16-core GPU, 48 GB): selected SPEED-Bench coding prompts
-over HTTP, a 1,024-token output limit, reasoning on (medium for the 27B). The
-ratio in each cell is against the next-fastest engine we measured.
+Measured for the Splash 1.0 release (September 2026) on an M5 Pro (16-core
+GPU, 48 GB), serving the Qwen3.8-27B and Qwen3.6-35B-A3B Splash packages:
+selected SPEED-Bench coding prompts over HTTP, a 1,024-token output limit,
+reasoning on (medium for the 27B). The ratio in each cell is against the
+next-fastest engine we measured. The MLX 4-bit models prepare to the packages'
+target weights, byte for byte but for one 27B vector within a float ULP, and
+decode within 0.5% of them on this M5 Pro
+([upstream loading](dev/benchmarks/upstream-loading.md)). GGUF targets run
+other kernels and are not part of this comparison.
 
 | Metric | Qwen3.6-35B-A3B | Qwen3.8-27B |
 | --- | ---: | ---: |
@@ -178,8 +180,8 @@ ratio in each cell is against the next-fastest engine we measured.
 | Cached time to first token · 32K replay | 123 ms (6.6×) | 282 ms (7.3×) |
 | Aggregate decode · 4 concurrent short prompts | 357 tok/s (2.0×) | 170 tok/s (3.9×) |
 
-Splash led on every measure at every prompt length we tested, and the lead
-grows with load: 3.8× at four concurrent 32K requests on the 35B. The
+Splash 1.0 led on every measure at every prompt length we tested, and the lead
+grew with load: 3.8× at four concurrent 32K requests on the 35B. The
 [launch post](https://inco.ai/blog/splash/) has the method and the full
 comparison against oMLX, Lily, uzu, and Ollama.
 
@@ -194,10 +196,14 @@ per model:
   Splash, not an option. Each supported base model has a matching [DFlash
   2](https://inco.ai/blog/dflash2/) draft, and one pass of the target verifies a
   block of tokens in parallel.
-- **Kernels compiled for exact shapes.** Fused Metal kernels, written and tuned
-  by our in-house kernel agents for the model's dimensions, read weights packed
-  for them and mapped zero-copy from disk. They ship precompiled: no Xcode, no
-  compiler toolchain, nothing tuned on your machine.
+- **Kernels for the model's shapes.** Fused Metal kernels for the models'
+  attention, GDN and MoE dimensions, with dispatch policies measured offline
+  per GPU family and core count. MLX weights are prepared once into layouts
+  packed for these kernels. GGUF weights keep their llama.cpp quantization,
+  repacked once into planes that kernels chosen by GPU family and core count
+  decode directly, without per-shape tuning. Both are mapped zero-copy from
+  disk. Everything ships precompiled: no Xcode, no compiler toolchain, nothing
+  tuned on your machine.
 - **A memory plan computed for this machine.** Context, KV capacity, and batch
   limits are worked out at startup from the memory Metal recommends, less the
   weights, the draft, and each request's state.
@@ -206,6 +212,6 @@ The [launch post](https://inco.ai/blog/splash/) covers the design in depth.
 
 ## More
 
-- [DEVELOPMENT.md](DEVELOPMENT.md): building from source, tests, model packages,
+- [DEVELOPMENT.md](DEVELOPMENT.md): building from source, model loading, tests
   and release packaging.
 - Apache-2.0, see [LICENSE](LICENSE). Model weights keep their own licenses.
