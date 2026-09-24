@@ -186,9 +186,7 @@ def slot_labels(tokenizer):
     return labels
 
 
-def encode_prompt(
-    tokenizer, chat_template, messages, labels, *, admit=None, checkpoint=None
-):
+def encode_prompt(tokenizer, chat_template, messages, labels, *, admit, checkpoint):
     """Render messages with chat_template and verify single-token answer slots.
 
     Mirrors SemIf semif_phase1.direct.encode_prompt: each slot label must be
@@ -199,7 +197,7 @@ def encode_prompt(
     prompt with many options costs far more than the prompt itself. `admit`
     receives the prepared prompt token count before that pass begins and
     `checkpoint` runs once per slot inside it; either may raise to abandon
-    preparation. Omitting both reproduces the upstream behavior exactly.
+    preparation.
     """
     prompt = tokenizer.apply_chat_template(
         messages,
@@ -221,11 +219,9 @@ def encode_prompt(
         slots.append(encoded[0])
     if len(slots) != len(set(slots)):
         raise ScoringUnsupported("answer-slot tokens collide")
-    if admit is not None:
-        admit(len(ids))
+    admit(len(ids))
     for label, token in zip(labels, slots):
-        if checkpoint is not None:
-            checkpoint()
+        checkpoint()
         if tokenizer.encode(prompt + label, add_special_tokens=False) != ids + [token]:
             raise ScoringUnsupported(
                 f"answer boundary changes tokenization for slot {label!r}"
