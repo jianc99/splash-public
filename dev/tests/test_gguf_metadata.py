@@ -1,5 +1,6 @@
 import argparse
-import json
+import contextlib
+import io
 import struct
 import tempfile
 import threading
@@ -11,6 +12,7 @@ from unittest import mock
 from tokenizers import Tokenizer, pre_tokenizers
 from transformers import AutoTokenizer
 
+from dev.tests.test_upstream import MOE, draft_dir
 from install import gguf, models, upstream
 
 
@@ -275,11 +277,12 @@ class GgufMetadataTests(unittest.TestCase):
     def test_metadata_cache_hit_integrity_and_atomic_failure(self):
         path = write_gguf(self.root / "model.gguf", fixture())
         cache = self.root / "models"
-        files = upstream._gguf_metadata(cache, path, None)
+        key, files = upstream._gguf_metadata(cache, path, None)
+        self.assertEqual(files["config.json"].parent.name, key)
         with mock.patch.object(
             gguf, "Metadata", side_effect=AssertionError("reparsed")
         ):
-            self.assertEqual(upstream._gguf_metadata(cache, path, None), files)
+            self.assertEqual(upstream._gguf_metadata(cache, path, None), (key, files))
         files["tokenizer/tokenizer.json"].write_text("corrupt")
         with self.assertRaisesRegex(models.ModelError, "metadata changed"):
             upstream._gguf_metadata(cache, path, None)
@@ -313,8 +316,8 @@ class GgufMetadataTests(unittest.TestCase):
         values = fixture()
         values["tokenizer.chat_template"] = "updated template"
         write_gguf(path, values)
-        changed = upstream._gguf_metadata(cache, path, None)
-        self.assertNotEqual(changed, results[0])
+        _, changed = upstream._gguf_metadata(cache, path, None)
+        self.assertNotEqual(changed, results[0][1])
         self.assertEqual(
             changed["tokenizer/chat_template.jinja"].read_text(), "updated template"
         )
@@ -327,37 +330,34 @@ class GgufMetadataTests(unittest.TestCase):
         # Conflicting sidecars must not override the selected GGUF's metadata.
         for name in ("config.json", "tokenizer.json", "tokenizer_config.json"):
             (target / name).write_text("invalid sidecar")
-        draft = self.root / "draft/Qwen3.6-35B-A3B"
-        draft.mkdir(parents=True)
-        (draft / "config.json").write_text(
-            json.dumps(
-                {
-                    "architectures": ["DFlash2DraftModel"],
-                    "hidden_size": 2048,
-                    "num_hidden_layers": 6,
-                    "splash": {"format": "MDFD0004"},
-                }
-            )
-        )
-        for name in ("model.bin", *(f"layer-{i}.bin" for i in range(6))):
-            (draft / name).write_bytes(b"draft")
         source = upstream.Repository.local_directory(target)
-        draft_repo = upstream.Repository.local_directory(draft.parent)
+        draft_repo = upstream.Repository.local_directory(
+            draft_dir(self.root / "draft", MOE)
+        )
         for language_only in (True, False):
             args = argparse.Namespace(
                 model="unsloth/Qwen3.6-35B-A3B-GGUF:Q4_K_M",
                 models=self.root / "models",
+                revision=None,
                 language_only=language_only,
+                draft_model=None,
             )
             with mock.patch.object(
-                upstream.Repository, "resolve", return_value=draft_repo
+                upstream.Repository, "resolve", side_effect=[source, draft_repo]
             ) as resolve:
                 with mock.patch.object(
                     source, "download", wraps=source.download
                 ) as download:
-                    upstream.prepare(args, repo=source)
-                (moe,) = (f for f in upstream.FAMILIES if f.name == "Qwen3.6-35B-A3B")
-                resolve.assert_called_once_with(upstream.DRAFTS, moe.draft.revision)
+                    upstream.prepare(args)
+                self.assertEqual(
+                    resolve.call_args_list,
+                    [
+                        mock.call(
+                            "unsloth/Qwen3.6-35B-A3B-GGUF", None, installation=mock.ANY
+                        ),
+                        mock.call(upstream.DRAFTS, MOE.draft.revision),
+                    ],
+                )
                 expected = {"model-Q4_K_M.gguf"} | (
                     set() if language_only else {"mmproj-F32.gguf"}
                 )
@@ -370,3 +370,52 @@ class GgufMetadataTests(unittest.TestCase):
             self.assertEqual(config["text_config"]["num_hidden_layers"], 40)
             self.assertEqual("vision_config" in config, not language_only)
             self.assertEqual((root / "vision").exists(), not language_only)
+
+    def test_a_new_metadata_adapter_rebuilds_the_metadata_locally(self):
+        target = self.root / "target"
+        target.mkdir()
+        write_gguf(target / "model-Q4_K_M.gguf", fixture(native=True))
+        source = upstream.Repository.local_directory(target)
+        draft = draft_dir(self.root / "draft", MOE)
+        args = argparse.Namespace(
+            model="unsloth/Qwen3.6-35B-A3B-GGUF:Q4_K_M",
+            models=self.root / "models",
+            revision=None,
+            language_only=True,
+            draft_model=str(draft),
+        )
+        resolve = upstream.Repository.resolve
+
+        def hub(name, *arguments, **options):
+            # The target's Hub resolution; the draft is a local directory.
+            if name == "unsloth/Qwen3.6-35B-A3B-GGUF":
+                return source
+            return resolve(name, *arguments, **options)
+
+        with (
+            mock.patch.object(upstream.Repository, "resolve", side_effect=hub),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            upstream.prepare(args)
+        root = models.installed_root(
+            args.models, args.model, language_only=True, draft_model=str(draft)
+        )
+        installed = upstream.verify(root)["metadata"]
+        adapter = self.root / "gguf.py"
+        adapter.write_text("a new adapter\n")
+        with (
+            mock.patch.object(upstream.gguf, "__file__", str(adapter)),
+            # The unchanged target is re-assembled without the Hub.
+            mock.patch.object(
+                upstream.Repository, "resolve", side_effect=hub
+            ) as resolved,
+            contextlib.redirect_stdout(io.StringIO()) as output,
+        ):
+            self.assertTrue(upstream.prepare(args))
+        resolved.assert_called_once_with(
+            "unsloth/Qwen3.6-35B-A3B-GGUF", None, installation=mock.ANY
+        )
+        self.assertIn("the GGUF metadata adapter changed", output.getvalue())
+        rebuilt = upstream.verify(root)["metadata"]
+        self.assertNotEqual(rebuilt, installed)
+        self.assertEqual((root / "config.json").resolve().parent.name, rebuilt)

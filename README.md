@@ -93,10 +93,11 @@ and reports `vision: false` in `/status` and `/v1/models`.
 
 The first preparation stores an additional weight copy in
 `~/Library/Caches/Splash/weights`, using bounded temporary memory. Later starts
-reuse it. An installed model starts without contacting the Hub; `--update`
-resolves the upstream model and draft again. `--revision` optionally selects an
-upstream branch, tag or commit; otherwise the current default revision is
-resolved at installation. GGUF variants whose tensor types Splash cannot load are
+reuse it. Each start checks the upstream revision with one Hub request and
+installs a new commit before serving it; without the Hub, or when the new commit
+cannot be installed, the installed model starts. `--revision` optionally selects
+an upstream branch, tag or commit (a commit is never checked again); otherwise
+the default branch is followed. GGUF variants whose tensor types Splash cannot load are
 rejected before download. `--draft-model` overrides the matching draft
 repository or supplies a local draft directory.
 Private repositories need `HF_TOKEN`. Downloads use the Hugging Face cache, and

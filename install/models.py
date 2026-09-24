@@ -652,13 +652,13 @@ def resolve_snapshot(model_id: str):
         ) from error
 
 
-def hub_error(error, context: str, token=None) -> str:
-    """context: the Hub's reason, with the token redacted (the caller's, or the
-    configured one) and, for denied access, how to authenticate."""
+def hub_reason(error, token=None) -> str:
+    """The Hub's reason for error, with the token redacted (the caller's, or
+    the configured one) and, for denied access, how to authenticate."""
     from huggingface_hub import get_token
     from huggingface_hub.errors import HfHubHTTPError
 
-    message = str(error)
+    message = str(error) or type(error).__name__
     if token := token or os.environ.get("HF_TOKEN") or get_token():
         message = message.replace(token, "[redacted]")
     if (
@@ -669,7 +669,11 @@ def hub_error(error, context: str, token=None) -> str:
         message += (
             "; set HF_TOKEN or run 'hf auth login' with access to this repository"
         )
-    return f"{context}: {message}"
+    return message
+
+
+def hub_error(error, context: str, token=None) -> str:
+    return f"{context}: {hub_reason(error, token)}"
 
 
 @contextmanager
@@ -919,11 +923,6 @@ def parse_args(argv=None):
         "--language-only",
         action="store_true",
         help="skip vision preparation and loading",
-    )
-    parser.add_argument(
-        "--update",
-        action="store_true",
-        help="resolve the upstream model and draft again instead of using the installation",
     )
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("prepare")

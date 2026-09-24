@@ -16,6 +16,7 @@ from unittest import mock
 
 import httpx
 from huggingface_hub.errors import HfHubHTTPError
+from huggingface_hub.hf_api import RepoSibling
 
 from install import models as artifacts
 
@@ -160,13 +161,13 @@ class ModelArtifactTest(unittest.TestCase):
         self.api.return_value.model_info.return_value = SimpleNamespace(
             sha=self.REVISION,
             siblings=[
-                SimpleNamespace(
+                RepoSibling(
                     rfilename="manifest.json",
                     size=(snapshot / "manifest.json").stat().st_size,
                 )
             ]
             + [
-                SimpleNamespace(rfilename=r["path"], size=r["size"])
+                RepoSibling(rfilename=r["path"], size=r["size"])
                 for r in self.hub_records(snapshot)
                 if isinstance(r, dict) and "path" in r and "size" in r
             ],
@@ -668,6 +669,22 @@ class ModelArtifactTest(unittest.TestCase):
         second.assert_not_called()
         hash_file.assert_not_called()
         self.api.assert_not_called()
+
+    def test_installed_package_starts_through_prepare_without_the_hub(self):
+        snapshot, _ = self.package_fixture()
+        models = self.root / "models"
+        artifacts.install_snapshot(snapshot, models / self.MODEL_ID)
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(
+                artifacts.main(
+                    ["--models", str(models), "--model", self.MODEL_ID, "prepare"]
+                ),
+                0,
+            )
+        self.assertIn("is already installed", output.getvalue())
+        self.api.assert_not_called()
+        self.manifest_download.assert_not_called()
+        self.download.assert_not_called()
 
     def test_variant_model_ids_parse_and_name_installed_roots(self):
         self.assertEqual(

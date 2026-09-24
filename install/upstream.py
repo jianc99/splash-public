@@ -2,11 +2,13 @@
 
 The Hub owns downloads and snapshots; this module selects components and links
 immutable files, and the native source adapters own tensor validation and
-preparation. An installed assembly starts without contacting the Hub: each
-source is pinned to the commit it was installed from, and --update is the only
-way to follow a newer one. A target is identified by its own metadata (a GGUF
-header or an MLX config), read before any weight download, and paired with the
-draft trained for that architecture; repository names play no part.
+preparation. Every start follows the target's revision with one Hub request and
+publishes a new commit's assembly atomically; the installed assembly starts
+when the Hub cannot answer or the new commit cannot be installed, and a commit
+revision or HF_HUB_OFFLINE needs no request. A target is identified by its own
+metadata (a GGUF header or an MLX config), read before any weight download,
+and paired with the draft trained for that architecture, pinned per family;
+repository names play no part.
 """
 
 from __future__ import annotations
@@ -25,6 +27,10 @@ else:
     import gguf
     import models
 
+
+# Seconds the Hub may take to resolve a revision before the installed
+# assembly starts without it.
+HUB_TIMEOUT = 5
 
 # Splash's DFlash2 drafts share one repository, a folder per base model named
 # after it: config.json (the original DFlash2 configuration plus its "splash"
@@ -161,12 +167,17 @@ class Repository:
     at the commit its revision resolved to, read from the Hub or from the
     commit's cached snapshot."""
 
-    def __init__(self, name, revision, files, root=None):
+    def __init__(self, name, revision, files, root=None, *, sizes=None):
         for file in files:
             path = PurePosixPath(file)
             if path.is_absolute() or ".." in path.parts:
                 raise models.ModelError("invalid repository filename")
         self.name, self.revision, self.files, self.root = name, revision, files, root
+        # Hub filename -> (bytes, blob ID), to report what a download fetches.
+        self.sizes = sizes or {}
+        # Why the Hub could not resolve this source, when its cached snapshot
+        # stands in; None when the Hub resolved it.
+        self.unavailable = None
 
     @classmethod
     def local_directory(cls, path):
@@ -185,43 +196,67 @@ class Repository:
         return cls(name, commit, _listing(snapshot), snapshot)
 
     @classmethod
+    def recorded(cls, source):
+        """A source as an installed record names it, without the Hub."""
+        if source["revision"] is None:
+            return cls.local_directory(source["repo"])
+        return cls.cached(source["repo"], source["revision"])
+
+    @classmethod
     def resolve(cls, name, revision=None, *, installation=None):
-        """name at the commit revision names now. Only an absolute path is a
-        local directory: parse_draft_model makes a --draft-model directory
-        absolute, and a target is always a Hub ID, whatever the working
-        directory holds. Without the Hub, the cached snapshot of a commit this
-        selection already names stands in (_cached_commits); a different
-        revision is never substituted."""
+        """name at the commit revision names now, from one Hub request. Only
+        an absolute path is a local directory: parse_draft_model makes a
+        --draft-model directory absolute, and a target is always a Hub ID,
+        whatever the working directory holds. When the Hub cannot answer (or
+        HF_HUB_OFFLINE is set), the cached snapshot of a commit this selection
+        already names stands in, with the reason in unavailable
+        (_cached_commits); a different revision is never substituted."""
         import httpx
-        from huggingface_hub import HfApi
+        from huggingface_hub import HfApi, constants
 
         if Path(name).is_absolute():
             return cls.local_directory(name)
         models.validate_repo_id(name)
-        try:
-            info = HfApi().model_info(name, revision=revision)
-        except (OSError, httpx.HTTPError) as error:
-            commits = _cached_commits(name, revision, installation)
-            for commit in commits:
-                if _snapshot(name, commit).is_dir():
-                    print(
-                        f"Using the cached snapshot {commit} of {name}; "
-                        + models.hub_error(error, "the Hub is unavailable"),
-                        flush=True,
+        if constants.HF_HUB_OFFLINE:
+            reason = "HF_HUB_OFFLINE is set"
+        else:
+            try:
+                info = HfApi().model_info(
+                    name, revision=revision, files_metadata=True, timeout=HUB_TIMEOUT
+                )
+            except (OSError, httpx.HTTPError) as error:
+                reason = models.hub_reason(error)
+            else:
+                if not models.is_hex_digest(info.sha, 40):
+                    raise models.ModelError(
+                        f"the Hub did not resolve {name} to a commit"
                     )
-                    return cls.cached(name, commit)
-            cache = (
-                "the Hub cache has no snapshot of " + ", ".join(commits)
-                if commits
-                else "neither this installation nor the Hub cache records a "
-                f"commit for {revision or 'the default branch'}"
-            )
-            raise models.ModelError(
-                models.hub_error(error, f"cannot resolve {name}") + "; " + cache
-            ) from None
-        if not models.is_hex_digest(info.sha, 40):
-            raise models.ModelError(f"the Hub did not resolve {name} to a commit")
-        return cls(name, info.sha, {item.rfilename for item in info.siblings})
+                return cls(
+                    name,
+                    info.sha,
+                    {item.rfilename for item in info.siblings},
+                    sizes={
+                        item.rfilename: (
+                            item.size,
+                            item.lfs.sha256 if item.lfs else item.blob_id,
+                        )
+                        for item in info.siblings
+                        if item.size is not None
+                    },
+                )
+        commits = _cached_commits(name, revision, installation)
+        for commit in commits:
+            if _snapshot(name, commit).is_dir():
+                repo = cls.cached(name, commit)
+                repo.unavailable = reason
+                return repo
+        cache = (
+            "the Hub cache has no snapshot of " + ", ".join(commits)
+            if commits
+            else "neither this installation nor the Hub cache records a commit "
+            f"for {revision or 'the default branch'}"
+        )
+        raise models.ModelError(f"cannot resolve {name}: {reason}; {cache}")
 
     def file(self, name):
         if name not in self.files:
@@ -252,6 +287,18 @@ class Repository:
         if self.root is None:
             from huggingface_hub import snapshot_download
 
+            blobs = _hub_folder(self.name) / "blobs"
+            fetch = [
+                size
+                for size, blob in (self.sizes[n] for n in names if n in self.sizes)
+                if not (blob and (blobs / blob).exists())
+            ]
+            if fetch:
+                print(
+                    f"Fetching {len(fetch)} file(s), {sum(fetch) / 1e9:.2f} GB, "
+                    f"from {self.name}@{self.revision[:12]}; cached files are reused.",
+                    flush=True,
+                )
             root = Path(
                 snapshot_download(
                     self.name,
@@ -454,86 +501,136 @@ def _link(stage, relative, source):
     path.symlink_to(source.absolute())
 
 
-def _installed(root):
-    """The record of an installation that verifies, else None; verifying needs
-    no Hub access at all."""
+def _installed(root, model):
+    """The record of the installation at root if it verifies, else None;
+    verifying needs no Hub access."""
     if not (root / "model.json").exists():
         return None
     try:
         return verify(root)
     except (models.ModelError, OSError) as error:
-        print(f"Reinstalling {root.name}: {error}", flush=True)
+        print(f"Reinstalling {model}: {error}", flush=True)
         return None
 
 
-def prepare(args, repo=None):
-    """Return False for a legacy package; otherwise ensure the source assembly."""
+def prepare(args):
+    """Ensure the assembly of args's selection and return True, following the
+    Hub; return False for a legacy Splash package.
+
+    Every start resolves the target's revision with one Hub request. The
+    installed assembly starts when that is its commit, when the Hub cannot
+    answer, and when a new commit cannot be installed; a new commit is
+    installed and published atomically. A commit revision never moves and
+    HF_HUB_OFFLINE forbids the Hub, so both start a verified installation
+    without a request."""
+    from huggingface_hub import constants
+
     repo_id, variant = models.split_model_id(args.model)
-    revision = getattr(args, "revision", None)
-    language_only = getattr(args, "language_only", False)
-    draft_override = getattr(args, "draft_model", None)
     models_root = args.models.resolve()
     root = models.installed_root(
         models_root,
         args.model,
-        revision=revision,
-        language_only=language_only,
-        draft_model=draft_override,
+        revision=args.revision,
+        language_only=args.language_only,
+        draft_model=args.draft_model,
     )
-    # Old installed packages need no network lookup or migration.
+    # An installed legacy package needs no network lookup or migration.
     if (root / "manifest.json").exists() and not (root / "model.json").exists():
-        if revision or language_only or draft_override:
-            raise models.ModelError(
-                "source selection options require an upstream model ID"
-            )
         return False
-    if not getattr(args, "update", False) and (root / "model.json").exists():
-        # Verify and repin under the lock, so a concurrent update cannot
-        # replace the assembly between the two.
-        with models.installation_lock(models_root):
-            if (installed := _installed(root)) is not None:
-                models.retain_refs(root, _pins(installed))
+    installed = _installed(root, args.model)
+    kept = installed and installed["sources"]["target"]
+    if installed is not None and (
+        models.is_hex_digest(args.revision, 40) or constants.HF_HUB_OFFLINE
+    ):
+        repo = Repository.recorded(kept)
+    else:
+        repo = Repository.resolve(repo_id, args.revision, installation=root)
+        if installed is None and "manifest.json" in repo.files:
+            if args.revision or args.language_only or args.draft_model:
+                raise models.ModelError(
+                    "source selection options require an upstream model ID"
+                )
+            return False
+    current = installed is not None and repo.revision == kept["revision"]
+    if repo.unavailable:
+        print(
+            f"Could not reach the Hub ({repo.unavailable}); "
+            + (
+                f"using the installed {repo_id}@{repo.revision[:12]}."
+                if current
+                else f"installing {repo_id}@{repo.revision[:12]} from the Hub cache."
+            ),
+            flush=True,
+        )
+    elif installed is not None and not current:
+        print(
+            f"{repo_id} moved from {kept['revision'][:12]} to {repo.revision[:12]}.",
+            flush=True,
+        )
+    if current:
+        if not (changes := _changes(installed, args.draft_model)):
+            if _start(models_root, root, args.model):
                 print(
                     f"Splash model {args.model} is already installed in {root}",
                     flush=True,
                 )
                 return True
-    # Every Hub request (resolution, header reads, downloads) happens here.
-    with models.hub_errors(f"cannot install {args.model}"):
-        repo = repo or Repository.resolve(repo_id, revision, installation=root)
-        if "manifest.json" in repo.files:
-            if revision or language_only or draft_override:
-                raise models.ModelError(
-                    "source selection options require an upstream model ID"
-                )
-            return False
-        target = _target(repo, variant, language_only)
-        family = family_for(target.config)
-        draft = (
-            Repository.resolve(draft_override, installation=root)
-            if draft_override
-            else Repository.resolve(DRAFTS, family.draft.revision)
+        else:
+            print(f"Updating {args.model}: {'; '.join(changes)}.", flush=True)
+        # The target is unchanged; its cached snapshot holds what it needs.
+        repo = Repository.recorded(kept)
+    try:
+        _install(args, repo, variant, models_root, root, installed)
+    except (models.ModelError, OSError) as error:
+        # A revision that cannot be installed leaves the installed one in use.
+        if installed is None:
+            raise
+        rejected = "this release's changes" if current else f"{repo_id}@{repo.revision}"
+        print(
+            f"Warning: keeping the installed {repo_id}@{kept['revision'][:12]}; "
+            f"cannot install {rejected}: {error}",
+            flush=True,
         )
-        draft_names = _draft_files(draft, family)
+        if not _start(models_root, root, args.model):
+            raise
+    return True
+
+
+def _start(models_root, root, model):
+    """Pin the installation at root and return True if it verifies under the
+    lock; a concurrent installation may have replaced it since it was read."""
+    with models.installation_lock(models_root):
+        if (installed := _installed(root, model)) is None:
+            return False
+        models.retain_refs(root, _pins(installed))
+    return True
+
+
+def _install(args, repo, variant, models_root, root, installed):
+    """Assemble repo's target and its draft, and publish the assembly at root."""
+    # Every Hub request (header reads, downloads) happens here.
+    with models.hub_errors(f"cannot install {args.model}"):
+        target = _target(repo, variant, args.language_only)
+        family = family_for(target.config)
+        draft, drafts = _draft(family, args.draft_model, installed, root)
         print(
             f"Installing {args.model} as {family.name} ({target.format}); "
-            f"draft {draft.name}; vision {'disabled' if language_only else 'enabled'}.",
+            f"draft {draft.name}; "
+            f"vision {'disabled' if args.language_only else 'enabled'}.",
             flush=True,
         )
         components = target.metadata | target.vision
         sources = repo.download(target.weights | set(components.values()))
-        drafts = draft.download(draft_names)
     files = {name: sources[source] for name, source in components.items()}
     for name in sorted(target.weights):
         files["target/" + Path(name).name] = sources[name]
     if target.format == "gguf":
-        files.update(
-            _gguf_metadata(
-                models_root,
-                sources[next(iter(target.weights))],
-                files.get("vision/mmproj.gguf"),
-            )
+        metadata_key, metadata = _gguf_metadata(
+            models_root,
+            sources[next(iter(target.weights))],
+            files.get("vision/mmproj.gguf"),
         )
+        files.update(metadata)
     else:
         files["target/config.json"] = files["config.json"]
     files["tokenizer/config.json"] = files["config.json"]
@@ -546,7 +643,7 @@ def prepare(args, repo=None):
         "family": family.name,
         "target_format": target.format,
         "vision_format": "none"
-        if language_only
+        if args.language_only
         else "gguf"
         if target.format == "gguf"
         else "safetensors",
@@ -556,6 +653,8 @@ def prepare(args, repo=None):
             for name, path in sorted(files.items())
         },
     }
+    if target.format == "gguf":
+        record["metadata"] = metadata_key
     models_root.mkdir(parents=True, exist_ok=True)
     with models.installation_lock(models_root):
         # A new installation requires its pins before it is published; its
@@ -566,7 +665,58 @@ def prepare(args, repo=None):
         destination = _publish(models_root, record, files)
         models.install_snapshot(destination, root)
         models.retire_refs(refs)
-    return True
+
+
+def _draft_identity(family):
+    return {"repo": DRAFTS, "revision": family.draft.revision}
+
+
+def _changes(record, draft_override):
+    """What this release changes in a verified assembly, from local files
+    alone: another pinned draft for its family (unless --draft-model chose
+    the draft), or another adapter for its derived GGUF metadata."""
+    family = next((f for f in FAMILIES if f.name == record.get("family")), None)
+    changes = []
+    if family is None:
+        changes.append(f"no supported family is named {record.get('family')}")
+    elif not draft_override and record["sources"]["draft"] != _draft_identity(family):
+        changes.append(
+            f"this release pins the {family.name} draft at {family.draft.revision[:12]}"
+        )
+    if record.get("target_format") == "gguf" and record.get(
+        "metadata"
+    ) != _metadata_key(_metadata_sources(record["files"])):
+        changes.append("the GGUF metadata adapter changed")
+    return changes
+
+
+def _draft(family, draft_override, installed, root):
+    """The draft and its downloaded files: --draft-model, as resolved at
+    installation, or else the family's pinned draft. An installation keeps
+    its draft, from the cache, while it is the one to use, and when a newly
+    pinned one cannot be fetched."""
+    recorded = installed and installed["sources"]["draft"]
+    if recorded and (draft_override or recorded == _draft_identity(family)):
+        draft = Repository.recorded(recorded)
+        return draft, draft.download(_draft_files(draft, family))
+    try:
+        with models.hub_errors(f"cannot fetch the {family.name} draft"):
+            draft = (
+                Repository.resolve(draft_override, installation=root)
+                if draft_override
+                else Repository.resolve(DRAFTS, family.draft.revision)
+            )
+            return draft, draft.download(_draft_files(draft, family))
+    except models.ModelError as error:
+        if not recorded:
+            raise
+        print(
+            f"Warning: cannot fetch the {family.name} draft "
+            f"{family.draft.revision[:12]}; keeping the installed one: {error}",
+            flush=True,
+        )
+    draft = Repository.recorded(recorded)
+    return draft, draft.download(_draft_files(draft, family))
 
 
 def _publish(models_root, record, files):
@@ -622,16 +772,32 @@ def _pins(record):
     return sorted(pins.items())
 
 
-def _gguf_metadata(models_root, target, vision):
+def _metadata_sources(files):
+    """The file records an assembly's derived GGUF metadata comes from: the
+    target, then the vision projector."""
+    names = [
+        n for n in sorted(files) if n.startswith("target/") and n.endswith(".gguf")
+    ]
+    return [files[name] for name in (*names, "vision/mmproj.gguf") if name in files]
+
+
+def _metadata_key(sources):
+    """The .metadata entry this adapter derives from the source file records."""
     from importlib.metadata import version
 
-    source_paths = [target] + ([vision] if vision else [])
     identity = {
-        "sources": [_file_record(path) for path in source_paths],
+        "sources": sources,
         "adapter": models.sha256(Path(gguf.__file__)),
         "tokenizers": version("tokenizers"),
     }
-    key = hashlib.sha256(gguf.json_bytes(identity)).hexdigest()
+    return hashlib.sha256(gguf.json_bytes(identity)).hexdigest()
+
+
+def _gguf_metadata(models_root, target, vision):
+    """The key and files of target's derived metadata, prepared once."""
+    source_paths = [target] + ([vision] if vision else [])
+    sources = [_file_record(path) for path in source_paths]
+    key = _metadata_key(sources)
     cache = models_root / ".metadata"
     destination = cache / key
     names = {
@@ -653,7 +819,7 @@ def _gguf_metadata(models_root, target, vision):
             contents["processor/preprocessor_config.json"] = gguf.json_bytes(
                 gguf.processor_config(vision_metadata)
             )
-        if [_file_record(path) for path in source_paths] != identity["sources"]:
+        if [_file_record(path) for path in source_paths] != sources:
             raise models.ModelError("GGUF source changed while reading metadata")
         cache.mkdir(parents=True, exist_ok=True)
         stage = Path(tempfile.mkdtemp(prefix=".loading-", dir=cache))
@@ -679,7 +845,7 @@ def _gguf_metadata(models_root, target, vision):
     for name in names:
         if models.sha256(destination / name) != hashes[name]:
             raise models.ModelError("prepared GGUF metadata changed: " + name)
-    return {name: destination / name for name in names}
+    return key, {name: destination / name for name in names}
 
 
 def _file_record(path):

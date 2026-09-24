@@ -263,7 +263,9 @@ class LauncherTests(unittest.TestCase):
                         "proxy.local",
                     ]
                 )
-            install.assert_called_once_with(MODEL_ID, update=False)
+            install.assert_called_once_with(
+                MODEL_ID, revision=None, language_only=False, draft_model=None
+            )
             execute.assert_called_once()
             self.assertEqual(
                 {p.name for p in runtime.iterdir()}, {"serve.lock", "serve-8000.lock"}
@@ -535,7 +537,7 @@ class LauncherTests(unittest.TestCase):
                 "launcher.RUNTIME_DIR = launcher.ROOT / 'runtime'\n"
                 "launcher.paths.PYTHON = Path(sys.executable)\n"
                 "launcher._ensure_installed = lambda model, **options: None\n"
-                "launcher.model_artifacts.installed_root = lambda *args: launcher.ROOT\n"
+                "launcher.model_artifacts.installed_root = lambda *a, **k: launcher.ROOT\n"
                 "launcher.catalog.spawn_refresh = lambda: None\n"
                 "launcher.main(['serve', '--model', 'test/model', '--port', sys.argv[2]])\n"
             )
@@ -717,11 +719,9 @@ class LauncherTests(unittest.TestCase):
                         "--draft-model",
                         str(draft),
                         "--language-only",
-                        "--update",
                     ]
                 )
-            # --update re-resolves the sources; it does not select an installation.
-            install.assert_called_once_with(MODEL_ID, update=True, **selection)
+            install.assert_called_once_with(MODEL_ID, **selection)
             root.assert_called_once_with(launcher.paths.MODELS, MODEL_ID, **selection)
             argv = execute.call_args.args[1]
             self.assertEqual(
@@ -737,7 +737,7 @@ class LauncherTests(unittest.TestCase):
                 ) as run,
                 mock.patch.object(launcher.paths, "PACKAGED", True),
             ):
-                launcher._ensure_installed(MODEL_ID, update=True, **selection)
+                launcher._ensure_installed(MODEL_ID, **selection)
             command = run.call_args.args[0]
             self.assertEqual(run.call_args.kwargs["cwd"], launcher.ROOT)
             parsed = launcher.model_artifacts.parse_args(command[2:])
@@ -748,9 +748,8 @@ class LauncherTests(unittest.TestCase):
                     parsed.revision,
                     parsed.language_only,
                     parsed.draft_model,
-                    parsed.update,
                 ),
-                ("prepare", MODEL_ID, "v2", True, selection["draft_model"], True),
+                ("prepare", MODEL_ID, "v2", True, selection["draft_model"]),
             )
 
     def test_relative_draft_directory_is_resolved_for_the_installer(self):

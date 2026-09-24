@@ -153,15 +153,23 @@ Installation resolves each source's revision once to a commit, downloads by
 that commit and records it in `model.json`, so a repository update cannot mix
 files from different revisions. It pins those snapshots in the Hub cache
 (`refs/splash/<installation>/<commit>`), so pruning the cache cannot remove files
-an installed model links. An installed model starts without contacting the Hub:
-`prepare` checks the assembly's links, sizes and times and returns. `--update`
-resolves the target and draft again, and an assembly that no longer verifies is
-rebuilt. `--revision` can select a particular target branch, tag or commit.
-Without the Hub, installation reads a cached snapshot instead, of the commit
-the `--revision` names, or else the commit the installation recorded or pinned,
-or one the Hub cache records for the branch; it never substitutes another
-revision. Only files downloaded before are available, which is enough to
-rebuild a damaged or deleted assembly or to add a selection of a cached commit.
+an installed model links. Every start resolves the target's revision (the
+default branch, or `--revision`) with one Hub request of at most 5 seconds; if it
+is the installed commit, `prepare` checks the assembly's links, sizes and times
+and returns. A new commit is followed: only changed files are downloaded, and
+its assembly replaces the installed one atomically once published. When the Hub
+cannot answer, or the new commit cannot be installed, the installed assembly
+that verifies starts instead, with a message naming the reason. A commit
+`--revision` never moves and `HF_HUB_OFFLINE=1` forbids the Hub, so both start a
+verified installation without a request. An assembly that no longer verifies is
+rebuilt; without the Hub it is rebuilt from a cached snapshot, of the commit the
+`--revision` names, or else the one the installation recorded or pinned, or one
+the Hub cache records for the branch, never of another revision. Only files
+downloaded before are available, which is enough to rebuild a damaged or
+deleted assembly or to add a selection of a cached commit. When a release pins
+another draft for a family, the next start downloads it and re-assembles the
+installed target commit; if the draft cannot be fetched, the installed one is
+kept.
 The installer never rewrites upstream files. Older manifest-based packages use
 the legacy installer.
 
