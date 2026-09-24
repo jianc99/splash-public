@@ -416,15 +416,21 @@ def _snapshot_revision(snapshot: Path, model_id: str) -> str:
     return snapshot.name
 
 
+def pin_owner(installation: Path) -> str:
+    """The refs/splash folder holding an installation's pins. Each
+    installation owns its references; Hub branch updates and other
+    installations must not unpin this installation's current weights."""
+    owner = installation.parent.resolve() / installation.name
+    return hashlib.sha256(os.fsencode(owner)).hexdigest()
+
+
 def retain_ref(snapshot: Path, model_id: str, installation: Path) -> Path:
     """Pin snapshot for installation (refs/splash/<installation>/<commit>), so
     pruning the Hub cache cannot remove files the installation links."""
     revision = _snapshot_revision(snapshot, model_id)
-    # Each installation owns its references; Hub branch updates and other
-    # installations must not unpin this installation's current weights.
-    owner_path = installation.parent.resolve() / installation.name
-    owner = hashlib.sha256(os.fsencode(owner_path)).hexdigest()
-    ref = snapshot.parent.parent / "refs" / "splash" / owner / revision
+    ref = (
+        snapshot.parent.parent / "refs" / "splash" / pin_owner(installation) / revision
+    )
     try:
         existing = ref.read_text()
     except FileNotFoundError:

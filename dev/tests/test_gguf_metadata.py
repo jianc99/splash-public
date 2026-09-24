@@ -341,8 +341,8 @@ class GgufMetadataTests(unittest.TestCase):
         )
         for name in ("model.bin", *(f"layer-{i}.bin" for i in range(6))):
             (draft / name).write_bytes(b"draft")
-        source = upstream.Repository(target)
-        draft_repo = upstream.Repository(draft.parent)
+        source = upstream.Repository.local_directory(target)
+        draft_repo = upstream.Repository.local_directory(draft.parent)
         for language_only in (True, False):
             args = argparse.Namespace(
                 model="unsloth/Qwen3.6-35B-A3B-GGUF:Q4_K_M",
@@ -350,7 +350,7 @@ class GgufMetadataTests(unittest.TestCase):
                 language_only=language_only,
             )
             with mock.patch.object(
-                upstream, "Repository", return_value=draft_repo
+                upstream.Repository, "resolve", return_value=draft_repo
             ) as resolve:
                 with mock.patch.object(
                     source, "download", wraps=source.download

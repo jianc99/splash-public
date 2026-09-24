@@ -158,55 +158,70 @@ def select_vision(files):
 
 class Repository:
     """One source at one commit: a local draft directory, or a Hub repository
-    whose revision is resolved once, at installation, to an immutable commit."""
+    at the commit its revision resolved to, read from the Hub or from the
+    commit's cached snapshot."""
 
-    def __init__(self, name, revision=None):
-        from huggingface_hub import HfApi, snapshot_download
+    def __init__(self, name, revision, files, root=None):
+        for file in files:
+            path = PurePosixPath(file)
+            if path.is_absolute() or ".." in path.parts:
+                raise models.ModelError("invalid repository filename")
+        self.name, self.revision, self.files, self.root = name, revision, files, root
 
-        self.name = str(name)
-        # Only an absolute path is local: parse_draft_model makes a
-        # --draft-model directory absolute, and a target is always a Hub ID,
-        # whatever the working directory holds.
-        self.local = Path(self.name).is_absolute()
-        if self.local:
-            self.root = Path(self.name)
-            if not self.root.is_dir():
-                raise models.ModelError(f"local draft directory not found: {name}")
-            self.revision = None
-            self.files = {
-                p.relative_to(self.root).as_posix()
-                for p in self.root.rglob("*")
-                if p.is_file()
-            }
-            return
+    @classmethod
+    def local_directory(cls, path):
+        path = Path(path)
+        if not path.is_dir():
+            raise models.ModelError(f"local draft directory not found: {path}")
+        return cls(str(path), None, _listing(path), path)
+
+    @classmethod
+    def cached(cls, name, commit):
+        """name at commit from its snapshot in the Hub cache, without the Hub;
+        only the files downloaded before are available."""
+        snapshot = _snapshot(name, commit)
+        if not snapshot.is_dir():
+            raise models.ModelError(f"the Hub cache has no snapshot {commit} of {name}")
+        return cls(name, commit, _listing(snapshot), snapshot)
+
+    @classmethod
+    def resolve(cls, name, revision=None, *, installation=None):
+        """name at the commit revision names now. Only an absolute path is a
+        local directory: parse_draft_model makes a --draft-model directory
+        absolute, and a target is always a Hub ID, whatever the working
+        directory holds. Without the Hub, the cached snapshot of a commit this
+        selection already names stands in (_cached_commits); a different
+        revision is never substituted."""
+        import httpx
+        from huggingface_hub import HfApi
+
+        if Path(name).is_absolute():
+            return cls.local_directory(name)
         models.validate_repo_id(name)
         try:
             info = HfApi().model_info(name, revision=revision)
-        except Exception as error:
-            # Without the Hub, the cache can still resolve a branch it recorded
-            # or a commit; it never substitutes a different revision.
-            try:
-                self.root = Path(
-                    snapshot_download(name, revision=revision, local_files_only=True)
-                )
-            except Exception:
-                raise models.ModelError(
-                    models.hub_error(error, f"cannot resolve {name}")
-                ) from None
-            self.revision = self.root.name
-            self.files = {
-                p.relative_to(self.root).as_posix()
-                for p in self.root.rglob("*")
-                if p.is_file()
-            }
-        else:
-            self.root = None
-            self.revision = info.sha
-            self.files = {item.rfilename for item in info.siblings}
-        for name in self.files:
-            path = PurePosixPath(name)
-            if path.is_absolute() or ".." in path.parts:
-                raise models.ModelError("invalid repository filename")
+        except (OSError, httpx.HTTPError) as error:
+            commits = _cached_commits(name, revision, installation)
+            for commit in commits:
+                if _snapshot(name, commit).is_dir():
+                    print(
+                        f"Using the cached snapshot {commit} of {name}; "
+                        + models.hub_error(error, "the Hub is unavailable"),
+                        flush=True,
+                    )
+                    return cls.cached(name, commit)
+            cache = (
+                "the Hub cache has no snapshot of " + ", ".join(commits)
+                if commits
+                else "neither this installation nor the Hub cache records a "
+                f"commit for {revision or 'the default branch'}"
+            )
+            raise models.ModelError(
+                models.hub_error(error, f"cannot resolve {name}") + "; " + cache
+            ) from None
+        if not models.is_hex_digest(info.sha, 40):
+            raise models.ModelError(f"the Hub did not resolve {name} to a commit")
+        return cls(name, info.sha, {item.rfilename for item in info.siblings})
 
     def file(self, name):
         if name not in self.files:
@@ -266,6 +281,57 @@ class Target:
     # MLX: assembly path -> repository file for configuration, tokenizer and
     # processor. A GGUF describes these itself (gguf.tokenizer_files).
     metadata: dict[str, str] = field(default_factory=dict)
+
+
+def _listing(root):
+    return {p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file()}
+
+
+def _hub_folder(name):
+    """Where the Hub cache keeps repository name."""
+    from huggingface_hub import constants
+
+    return Path(constants.HF_HUB_CACHE) / models.hub_folder_name(name)
+
+
+def _snapshot(name, commit):
+    return _hub_folder(name) / "snapshots" / commit
+
+
+def _cached_commits(name, revision, installation):
+    """The commits of name whose cached snapshots may stand in for revision
+    without the Hub, most specific first: revision itself when it is a
+    commit; the commit installation recorded, then the ones it pinned
+    (refs/splash); then the commit the cache recorded for the branch or tag.
+    Splash downloads by commit, which never records a branch."""
+    if models.is_hex_digest(revision, 40):
+        return [revision.lower()]
+    folder = _hub_folder(name)
+    commits = []
+    if installation is not None:
+        try:
+            sources = models.read_json(installation / "model.json").get("sources")
+        except models.ModelError:
+            sources = None
+        if isinstance(sources, dict):
+            commits += [
+                source.get("revision")
+                for source in sources.values()
+                if isinstance(source, dict) and source.get("repo") == name
+            ]
+        pins = folder / "refs" / "splash" / models.pin_owner(installation)
+        if pins.is_dir():
+            commits += [
+                pin.name
+                for pin in sorted(
+                    pins.iterdir(), key=lambda pin: pin.stat().st_mtime_ns, reverse=True
+                )
+            ]
+    try:
+        commits.append((folder / "refs" / (revision or "main")).read_text().strip())
+    except OSError:
+        pass
+    return list(dict.fromkeys(c for c in commits if models.is_hex_digest(c, 40)))
 
 
 def _target(repo, variant, language_only):
@@ -434,7 +500,7 @@ def prepare(args, repo=None):
                 return True
     # Every Hub request (resolution, header reads, downloads) happens here.
     with models.hub_errors(f"cannot install {args.model}"):
-        repo = repo or Repository(repo_id, revision)
+        repo = repo or Repository.resolve(repo_id, revision, installation=root)
         if "manifest.json" in repo.files:
             if revision or language_only or draft_override:
                 raise models.ModelError(
@@ -444,9 +510,9 @@ def prepare(args, repo=None):
         target = _target(repo, variant, language_only)
         family = family_for(target.config)
         draft = (
-            Repository(draft_override)
+            Repository.resolve(draft_override, installation=root)
             if draft_override
-            else Repository(DRAFTS, family.draft.revision)
+            else Repository.resolve(DRAFTS, family.draft.revision)
         )
         draft_names = _draft_files(draft, family)
         print(

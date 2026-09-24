@@ -4,6 +4,7 @@ import errno
 import fcntl
 import io
 import json
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -49,15 +50,6 @@ def draft_dir(root, family):
     return root
 
 
-def hub_repository(cache, repo_id, commit, build):
-    """A Repository whose files sit in a Hub-cache snapshot, as a download leaves them."""
-    snapshot = cache / ("models--" + repo_id.replace("/", "--")) / "snapshots" / commit
-    build(snapshot)
-    repo = upstream.Repository(snapshot)
-    repo.name, repo.revision, repo.local = repo_id, commit, False
-    return repo
-
-
 def arguments(root, model, **options):
     return argparse.Namespace(
         model=model,
@@ -74,6 +66,19 @@ class UpstreamTest(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
+        self.cache = self.root / "hub"
+        for patch in (
+            mock.patch("huggingface_hub.constants.HF_HUB_CACHE", str(self.cache)),
+            mock.patch("huggingface_hub.get_token", return_value=None),
+        ):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def hub(self, repo_id, commit, build):
+        """repo_id at commit as a download leaves it in the Hub cache: a
+        snapshot of only the files downloaded."""
+        build(self.cache / models.hub_folder_name(repo_id) / "snapshots" / commit)
+        return upstream.Repository.cached(repo_id, commit)
 
     def test_family_is_identified_by_architecture_not_name(self):
         for family in upstream.FAMILIES:
@@ -144,10 +149,10 @@ class UpstreamTest(unittest.TestCase):
         target = mlx_target(
             self.root / "target", DENSE, changes={"num_hidden_layers": 48}
         )
-        source = upstream.Repository(target)
+        source = upstream.Repository.local_directory(target)
         with (
             mock.patch.object(source, "download") as download,
-            mock.patch.object(upstream, "Repository") as resolve,
+            mock.patch.object(upstream.Repository, "resolve") as resolve,
             self.assertRaisesRegex(models.ModelError, "no supported model"),
         ):
             upstream.prepare(arguments(self.root, "someone/renamed-27b"), repo=source)
@@ -168,7 +173,7 @@ class UpstreamTest(unittest.TestCase):
                 source.files = {"model.safetensors"} | (
                     required - {missing} if missing else set()
                 )
-                with mock.patch.object(upstream, "Repository") as resolve:
+                with mock.patch.object(upstream.Repository, "resolve") as resolve:
                     with self.assertRaisesRegex(
                         models.ModelError, "must come from the target repository"
                     ):
@@ -180,11 +185,13 @@ class UpstreamTest(unittest.TestCase):
 
     def test_source_assembly_pairs_the_draft_by_architecture(self):
         target = mlx_target(self.root / "target", MOE)
-        source = upstream.Repository(target)
-        draft = upstream.Repository(draft_dir(self.root / "draft", MOE))
+        source = upstream.Repository.local_directory(target)
+        draft = upstream.Repository.local_directory(draft_dir(self.root / "draft", MOE))
         # The name says nothing about the model; the configuration does.
         args = arguments(self.root, "someone/my-favourite-model")
-        with mock.patch.object(upstream, "Repository", return_value=draft) as resolve:
+        with mock.patch.object(
+            upstream.Repository, "resolve", return_value=draft
+        ) as resolve:
             self.assertTrue(upstream.prepare(args, repo=source))
         resolve.assert_called_once_with(upstream.DRAFTS, MOE.draft.revision)
         installed = models.installed_root(args.models, args.model, language_only=True)
@@ -233,12 +240,14 @@ class UpstreamTest(unittest.TestCase):
                 }
             )
         )
-        source = upstream.Repository(target)
-        draft = upstream.Repository(draft_dir(self.root / "draft", DENSE))
+        source = upstream.Repository.local_directory(target)
+        draft = upstream.Repository.local_directory(
+            draft_dir(self.root / "draft", DENSE)
+        )
         args = arguments(
             self.root, "mlx-community/Qwen3.8-27B-4bit", language_only=False
         )
-        with mock.patch.object(upstream, "Repository", return_value=draft):
+        with mock.patch.object(upstream.Repository, "resolve", return_value=draft):
             self.assertTrue(upstream.prepare(args, repo=source))
         installed = models.installed_root(args.models, args.model)
         self.assertEqual(upstream.verify(installed)["vision_format"], "safetensors")
@@ -258,17 +267,21 @@ class UpstreamTest(unittest.TestCase):
         with self.assertRaisesRegex(models.ModelError, "no vision tower"):
             upstream.prepare(
                 arguments(self.root, "someone/text-model", language_only=False),
-                repo=upstream.Repository(target),
+                repo=upstream.Repository.local_directory(target),
             )
 
     def test_installed_model_starts_without_the_hub(self):
-        source = upstream.Repository(mlx_target(self.root / "target", DENSE))
-        draft = upstream.Repository(draft_dir(self.root / "draft", DENSE))
+        source = upstream.Repository.local_directory(
+            mlx_target(self.root / "target", DENSE)
+        )
+        draft = upstream.Repository.local_directory(
+            draft_dir(self.root / "draft", DENSE)
+        )
         args = arguments(self.root, "mlx-community/Qwen3.8-27B-4bit")
-        with mock.patch.object(upstream, "Repository", return_value=draft):
+        with mock.patch.object(upstream.Repository, "resolve", return_value=draft):
             upstream.prepare(args, repo=source)
         offline = mock.Mock(side_effect=AssertionError("the Hub was contacted"))
-        with mock.patch.object(upstream, "Repository", offline):
+        with mock.patch.object(upstream.Repository, "resolve", offline):
             self.assertTrue(upstream.prepare(args))
         offline.assert_not_called()
         # --update resolves again, and so does an installation that no longer verifies.
@@ -277,7 +290,7 @@ class UpstreamTest(unittest.TestCase):
                 if damage:
                     (self.root / "target/model.safetensors").write_text("replaced")
                 resolve = mock.Mock(side_effect=[source, draft])
-                with mock.patch.object(upstream, "Repository", resolve):
+                with mock.patch.object(upstream.Repository, "resolve", resolve):
                     upstream.prepare(
                         argparse.Namespace(**vars(args) | {"update": update})
                     )
@@ -289,17 +302,13 @@ class UpstreamTest(unittest.TestCase):
     def test_hub_snapshots_are_pinned_and_old_pins_retired(self):
         cache = self.root / "hub"
         model = "mlx-community/Qwen3.8-27B-4bit"
-        draft = hub_repository(
-            cache, upstream.DRAFTS, "d" * 40, lambda p: draft_dir(p, DENSE)
-        )
+        draft = self.hub(upstream.DRAFTS, "d" * 40, lambda p: draft_dir(p, DENSE))
         args = arguments(self.root, model, update=True)
         installed = models.installed_root(args.models, model, language_only=True)
         owner_refs = None
         for commit in ("a" * 40, "b" * 40):
-            source = hub_repository(
-                cache, model, commit, lambda p: mlx_target(p, DENSE)
-            )
-            with mock.patch.object(upstream, "Repository", return_value=draft):
+            source = self.hub(model, commit, lambda p: mlx_target(p, DENSE))
+            with mock.patch.object(upstream.Repository, "resolve", return_value=draft):
                 upstream.prepare(args, repo=source)
             refs = sorted(
                 (cache / "models--mlx-community--Qwen3.8-27B-4bit/refs/splash").glob(
@@ -322,10 +331,8 @@ class UpstreamTest(unittest.TestCase):
     def test_pins_are_required_before_publishing_and_repaired_on_start(self):
         cache = self.root / "hub"
         model = "mlx-community/Qwen3.8-27B-4bit"
-        source = hub_repository(cache, model, "a" * 40, lambda p: mlx_target(p, DENSE))
-        draft = hub_repository(
-            cache, upstream.DRAFTS, "d" * 40, lambda p: draft_dir(p, DENSE)
-        )
+        source = self.hub(model, "a" * 40, lambda p: mlx_target(p, DENSE))
+        draft = self.hub(upstream.DRAFTS, "d" * 40, lambda p: draft_dir(p, DENSE))
         args = arguments(self.root, model)
         installed = models.installed_root(args.models, model, language_only=True)
 
@@ -333,7 +340,7 @@ class UpstreamTest(unittest.TestCase):
             return sorted(ref.name for ref in cache.glob("*/refs/splash/*/*"))
 
         with (
-            mock.patch.object(upstream, "Repository", return_value=draft),
+            mock.patch.object(upstream.Repository, "resolve", return_value=draft),
             mock.patch.object(
                 models, "retain_ref", side_effect=PermissionError(errno.EACCES, "no")
             ),
@@ -351,7 +358,7 @@ class UpstreamTest(unittest.TestCase):
             return retain(*arguments)
 
         with (
-            mock.patch.object(upstream, "Repository", return_value=draft),
+            mock.patch.object(upstream.Repository, "resolve", return_value=draft),
             mock.patch.object(models, "retain_ref", side_effect=locked) as pinned,
         ):
             upstream.prepare(args, repo=source)
@@ -362,7 +369,7 @@ class UpstreamTest(unittest.TestCase):
         for ref in cache.glob("*/refs/splash/*/*"):
             ref.unlink()
         with (
-            mock.patch.object(upstream, "Repository", offline),
+            mock.patch.object(upstream.Repository, "resolve", offline),
             mock.patch.object(models, "retain_ref", side_effect=locked),
         ):
             self.assertTrue(upstream.prepare(args))
@@ -372,7 +379,7 @@ class UpstreamTest(unittest.TestCase):
             ref.unlink()
         errors = io.StringIO()
         with (
-            mock.patch.object(upstream, "Repository", offline),
+            mock.patch.object(upstream.Repository, "resolve", offline),
             mock.patch.object(
                 models.os, "link", side_effect=OSError(errno.EROFS, "read only")
             ),
@@ -383,14 +390,18 @@ class UpstreamTest(unittest.TestCase):
         self.assertEqual(pins(), [])
 
     def test_damaged_assembly_is_rebuilt(self):
-        source = upstream.Repository(mlx_target(self.root / "target", DENSE))
-        draft = upstream.Repository(draft_dir(self.root / "draft", DENSE))
+        source = upstream.Repository.local_directory(
+            mlx_target(self.root / "target", DENSE)
+        )
+        draft = upstream.Repository.local_directory(
+            draft_dir(self.root / "draft", DENSE)
+        )
         args = arguments(self.root, "mlx-community/Qwen3.8-27B-4bit", update=True)
-        with mock.patch.object(upstream, "Repository", return_value=draft):
+        with mock.patch.object(upstream.Repository, "resolve", return_value=draft):
             upstream.prepare(args, repo=source)
         assembly = next((args.models / ".resolved").iterdir())
         (assembly / "tokenizer/tokenizer.json").unlink()
-        with mock.patch.object(upstream, "Repository", return_value=draft):
+        with mock.patch.object(upstream.Repository, "resolve", return_value=draft):
             upstream.prepare(args, repo=source)
         upstream.verify(assembly)
 
@@ -434,7 +445,7 @@ class UpstreamTest(unittest.TestCase):
             ) as snapshot,
         ):
             api.return_value.model_info.return_value = info
-            repo = upstream.Repository("mlx-community/Qwen3.8-27B-4bit")
+            repo = upstream.Repository.resolve("mlx-community/Qwen3.8-27B-4bit")
             api.return_value.model_info.assert_called_once_with(
                 repo.name, revision=None
             )
@@ -452,15 +463,20 @@ class UpstreamTest(unittest.TestCase):
             mock.patch("huggingface_hub.HfApi") as api,
         ):
             api.return_value.model_info.return_value = info
-            repo = upstream.Repository("mlx-community/Qwen3.8-27B-4bit", "branch")
+            repo = upstream.Repository.resolve(
+                "mlx-community/Qwen3.8-27B-4bit", "branch"
+            )
         api.return_value.model_info.assert_called_once_with(
             "mlx-community/Qwen3.8-27B-4bit", revision="branch"
         )
-        self.assertEqual((repo.local, repo.revision), (False, "a" * 40))
-        local = upstream.Repository(self.root / "mlx-community/Qwen3.8-27B-4bit")
-        self.assertEqual((local.local, local.revision), (True, None))
+        self.assertEqual((repo.root, repo.revision), (None, "a" * 40))
+        local = upstream.Repository.resolve(
+            str(self.root / "mlx-community/Qwen3.8-27B-4bit")
+        )
+        self.assertEqual(local.root, self.root / "mlx-community/Qwen3.8-27B-4bit")
+        self.assertIsNone(local.revision)
         with self.assertRaisesRegex(models.ModelError, "draft directory not found"):
-            upstream.Repository(self.root / "deleted-draft")
+            upstream.Repository.resolve(str(self.root / "deleted-draft"))
 
     def test_unreachable_hub_uses_the_cache_or_explains_access(self):
         import httpx
@@ -472,17 +488,88 @@ class UpstreamTest(unittest.TestCase):
         denied = HfHubHTTPError(
             "401 Client Error", response=httpx.Response(401, request=request)
         )
-        with (
-            mock.patch("huggingface_hub.HfApi") as api,
-            mock.patch(
-                "huggingface_hub.snapshot_download", side_effect=OSError("not cached")
-            ),
-        ):
+        with mock.patch("huggingface_hub.HfApi") as api:
             api.return_value.model_info.side_effect = denied
             with self.assertRaisesRegex(
-                models.ModelError, "cannot resolve owner/private: .*HF_TOKEN"
+                models.ModelError,
+                "cannot resolve owner/private: 401 Client Error; set HF_TOKEN .*; "
+                "neither this installation nor the Hub cache records a commit "
+                "for the default branch",
             ):
-                upstream.Repository("owner/private")
+                upstream.Repository.resolve("owner/private")
+            # A branch the cache recorded resolves to its cached snapshot.
+            self.hub("owner/private", "c" * 40, lambda p: mlx_target(p, DENSE))
+            refs = self.cache / "models--owner--private/refs"
+            refs.mkdir()
+            (refs / "main").write_text("c" * 40)
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                repo = upstream.Repository.resolve("owner/private")
+            self.assertEqual(repo.revision, "c" * 40)
+            self.assertIn("model.safetensors", repo.files)
+            self.assertIn("cached snapshot " + "c" * 40, output.getvalue())
+            (refs / "main").write_text("d" * 40)
+            with self.assertRaisesRegex(
+                models.ModelError, "the Hub cache has no snapshot of " + "d" * 40
+            ):
+                upstream.Repository.resolve("owner/private")
+
+    def test_offline_rebuild_uses_the_recorded_or_pinned_snapshot(self):
+        from huggingface_hub.errors import IncompleteSnapshotError, OfflineModeIsEnabled
+
+        model = "mlx-community/Qwen3.8-27B-4bit"
+        commit = "a" * 40
+        # Partial snapshots, holding only what the installation downloaded.
+        source = self.hub(model, commit, lambda p: mlx_target(p, DENSE))
+        draft = self.hub(
+            upstream.DRAFTS, DENSE.draft.revision, lambda p: draft_dir(p, DENSE)
+        )
+        args = arguments(self.root, model)
+        root = models.installed_root(args.models, model, language_only=True)
+        with mock.patch.object(
+            upstream.Repository, "resolve", side_effect=[source, draft]
+        ):
+            upstream.prepare(args)
+        output = io.StringIO()
+        with (
+            mock.patch("huggingface_hub.HfApi") as api,
+            # What huggingface_hub reports for a partial snapshot offline.
+            mock.patch(
+                "huggingface_hub.snapshot_download",
+                side_effect=IncompleteSnapshotError("incomplete", snapshot_path=""),
+            ),
+            contextlib.redirect_stdout(output),
+        ):
+            api.return_value.model_info.side_effect = OfflineModeIsEnabled("offline")
+            # A damaged assembly is rebuilt from the commit it recorded,
+            (root / "target/model.safetensors").unlink()
+            self.assertTrue(upstream.prepare(args))
+            upstream.verify(root)
+            # a deleted one from the installation's pins,
+            shutil.rmtree(root.resolve())
+            self.assertTrue(upstream.prepare(args))
+            self.assertEqual(
+                upstream.verify(root)["sources"]["target"]["revision"], commit
+            )
+            # and a new selection from the commit it names.
+            selection = arguments(self.root, model, revision=commit)
+            self.assertTrue(upstream.prepare(selection))
+            self.assertEqual(
+                upstream.verify(
+                    models.installed_root(
+                        args.models, model, revision=commit, language_only=True
+                    )
+                )["sources"],
+                upstream.verify(root)["sources"],
+            )
+            with self.assertRaisesRegex(
+                models.ModelError,
+                f"cannot resolve {model}: offline; neither this installation nor "
+                "the Hub cache records a commit for v2",
+            ):
+                upstream.prepare(arguments(self.root, model, revision="v2"))
+        self.assertIn(
+            f"Using the cached snapshot {commit} of {model}", output.getvalue()
+        )
 
     def test_hub_failures_during_installation_are_model_errors(self):
         import httpx

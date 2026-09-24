@@ -157,7 +157,11 @@ an installed model links. An installed model starts without contacting the Hub:
 `prepare` checks the assembly's links, sizes and times and returns. `--update`
 resolves the target and draft again, and an assembly that no longer verifies is
 rebuilt. `--revision` can select a particular target branch, tag or commit.
-Without a network, installation can still use a snapshot the cache resolves.
+Without the Hub, installation reads a cached snapshot instead, of the commit
+the `--revision` names, or else the commit the installation recorded or pinned,
+or one the Hub cache records for the branch; it never substitutes another
+revision. Only files downloaded before are available, which is enough to
+rebuild a damaged or deleted assembly or to add a selection of a cached commit.
 The installer never rewrites upstream files. Older manifest-based packages use
 the legacy installer.
 
