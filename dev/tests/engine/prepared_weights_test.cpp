@@ -1,3 +1,4 @@
+#include "TestChecks.hpp"
 #include "TestFiles.hpp"
 #include "model/PreparedWeights.hpp"
 
@@ -14,29 +15,14 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
-#include <string_view>
 #include <system_error>
 #include <vector>
 
 using namespace splash::model;
+using splash::test::rejects;
+using splash::test::require;
 
 namespace {
-
-void require(bool value, const std::string &message) {
-  if (!value) throw std::runtime_error(message);
-}
-
-// run must fail with an error whose message contains expected.
-template <class F> void rejects(F run, std::string_view expected, const std::string &message) {
-  try {
-    run();
-  } catch (const std::exception &error) {
-    if (std::string_view(error.what()).find(expected) != std::string_view::npos) return;
-    throw std::runtime_error(message + ": failed with \"" + error.what() + "\", not \"" + std::string(expected) +
-                             "\"");
-  }
-  throw std::runtime_error(message);
-}
 
 // Runs body in a child process. The child leaves through _exit with body's
 // status, 1 when it throws, so it never returns into the parent's scenarios
