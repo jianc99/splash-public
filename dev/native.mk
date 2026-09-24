@@ -174,7 +174,10 @@ TEST_CPU_TARGETS := $(TEST_VISION_PREPARATION) $(TEST_AFFINE_CHECKPOINT) $(TEST_
 	$(TEST_STATUS_TEST) \
 	$(TEST_Q8_CPU_TEST)
 
-TEST_METAL_TARGETS := $(TEST_AFFINE_PREPARATION) $(TEST_Q4_SGMATRIX_TEST) $(TEST_TUNING_WORKLOADS) \
+# The affine source oracle needs real checkpoints to run; the gate builds it so
+# it cannot break unnoticed.
+TEST_METAL_TARGETS := $(TEST_AFFINE_PREPARATION) $(ENGINE_TEST_BUILD)/affine-source-oracle \
+	$(TEST_Q4_SGMATRIX_TEST) $(TEST_TUNING_WORKLOADS) \
 	$(TEST_GGUF_PROJECTION) \
 	$(TEST_GGUF_MOE) \
 	$(TEST_GGUF_REPACK) \
@@ -207,7 +210,6 @@ TEST_UNIT_TEST_TARGETS := $(sort $(TEST_CPU_TARGETS) $(TEST_METAL_TARGETS))
 # Keep every output that uses a flag set together, including standalone
 # benchmarks, real-model tests and intermediate test AIRs/metallibs.
 TEST_CONFIG_TARGETS := $(filter-out $(LIB),$(TEST_UNIT_TEST_TARGETS)) \
-	$(ENGINE_TEST_BUILD)/affine-source-oracle \
 	$(TEST_MODEL_RUNTIME_ORACLE) $(TEST_VISION_ENCODER_TEST) \
 	$(TEST_DECODE_PROFILE) $(TEST_ATTENTION_SWEEP) \
 	$(TEST_Q8_AIR) $(TEST_Q8_KERNEL_AIRS) $(TEST_METAL_BACKEND_AIR)
@@ -617,7 +619,7 @@ METAL_TEST_ENV := MTL_SHADER_VALIDATION=1
 test-engine: test-engine-cpu test-engine-metal
 
 test-engine-cpu: $(TEST_CPU_TARGETS) $(TEST_ATTENTION_SWEEP) $(TUNE_KERNELS)
-	$(BUILD_ID_PYTHON) dev/tests/engine/test_vision_preparation.py $(TEST_VISION_PREPARATION)
+	$(BUILD_ID_PYTHON) dev/tests/engine/run_vision_preparation.py $(TEST_VISION_PREPARATION)
 	$(TEST_AFFINE_CHECKPOINT)
 	$(TEST_PREPARED_WEIGHTS)
 	$(TEST_GGUF_FILE)
@@ -657,7 +659,7 @@ $(TEST_Q4_SGMATRIX_TEST): dev/tests/engine/q4_sgmatrix_metal_test.mm $(ENGINE_LI
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< $(ENGINE_LIBRARY) $(ENGINE_LINKFLAGS) -o $@
 
 test-engine-metal: $(TEST_METAL_TARGETS)
-	$(METAL_TEST_ENV) $(BUILD_ID_PYTHON) dev/tests/engine/test_affine_preparation.py $(TEST_AFFINE_PREPARATION) $(LIB)
+	$(METAL_TEST_ENV) $(BUILD_ID_PYTHON) dev/tests/engine/run_affine_preparation.py $(TEST_AFFINE_PREPARATION) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_GGUF_REPACK) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_GGUF_PROJECTION) $(TEST_GGUF_DEQUANT_LIB) dequant
 	$(METAL_TEST_ENV) $(TEST_GGUF_PROJECTION) $(TEST_PRODUCTION_LIB) full
@@ -688,15 +690,18 @@ test-engine-metal: $(TEST_METAL_TARGETS)
 	$(METAL_TEST_ENV) $(TEST_METAL_BACKEND_TEST) $(TEST_METAL_BACKEND_LIB)
 
 .PHONY: test-real
-VISION_FIXTURE_incoai/Qwen3.8-27B-Splash := qwen3.8-27b
-VISION_FIXTURE_incoai/Qwen3.6-35B-A3B-Splash := qwen3.6-35b-a3b
-VISION_FIXTURE_incoai/Qwen3.8-27B-Splash := qwen3.8-27b
-VISION_FIXTURE_incoai/Qwen3.6-35B-A3B-Splash := qwen3.6-35b-a3b
+# The vision fixture is named after the installed model's family: model.json
+# for an upstream model, the manifest's model for a Splash package.
+VISION_FIXTURE_FAMILY := import json, pathlib, sys; root = pathlib.Path(sys.argv[1]); \
+	record = root / "model.json"; \
+	print((json.loads(record.read_text())["family"] if record.is_file() \
+	       else json.loads((root / "manifest.json").read_text())["model"]).lower())
 test-real: preflight $(TARGET) $(TEST_MODEL_RUNTIME_ORACLE) \
 		$(TEST_VISION_ENCODER_TEST) $(LIB)
-	$(METAL_TEST_ENV) $(TEST_VISION_ENCODER_TEST) $(LIB) $(MODEL_ROOT) \
-		dev/tests/fixtures/vision-parity/$(VISION_FIXTURE_$(MODEL))
-	$(TEST_MODEL_RUNTIME_ORACLE) $(LIB) $(MODEL_ROOT)
+	family=$$($(BUILD_ID_PYTHON) -c '$(VISION_FIXTURE_FAMILY)' "$(MODEL_ROOT)") && \
+		$(METAL_TEST_ENV) $(TEST_VISION_ENCODER_TEST) $(LIB) "$(MODEL_ROOT)" \
+		dev/tests/fixtures/vision-parity/$$family
+	$(TEST_MODEL_RUNTIME_ORACLE) $(LIB) "$(MODEL_ROOT)"
 
 .PHONY: benchmark-prefill benchmark-decode benchmark-backend \
 	benchmark-decode-profile benchmark-attention-sweep
