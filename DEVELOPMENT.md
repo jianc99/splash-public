@@ -384,11 +384,23 @@ backing does not make Metal-resident pages reclaimable: residency wires them
 until released. macOS page cache, driver allocations and other applications
 still affect memory pressure and swap.
 
-Operator plans use each projection's physical layout, independently of the source
-container. `Projection`, `MoeWeights` and `EmbeddingWeights` represent different
-operator contracts. Arena sizing collects each projection's actual layout (a
-GGUF target's block projections beside its affine draft's) and reserves the
-vocabulary head only for decode.
+`loadQwenTarget` (`QwenTargetLoader.hpp`) reads a target's files
+(`QwenTargetFiles`: packed files, or the files `AffineTargetLoader` or
+`GgufTargetLoader` prepared) through the format that stores them.
+`AffineTargetFormat`, for packed and MLX-prepared files, reads every
+projection, a fused one too, as one affine Q4 tensor and the norms as bf16.
+`BlockTargetFormat`, for prepared GGUF images, reads each GGUF tensor as one
+block-quantized `QuantizedSegment` (a fused projection's tensors in output
+column order), the norms as F32, and keeps the GDN output projection's input
+in llama.cpp's tiled value-head order. Both Qwen families share one layout
+(`QwenHybridLayout`) and its validator.
+
+Operator plans use each projection's physical layout, `Affine64` or `Block32`,
+independently of the source container. `Projection`, `MoeWeights` and
+`EmbeddingWeights` (`runtime/ops/Weights.hpp`, `MoE.hpp`) hold either layout
+and represent different operator contracts. Arena sizing collects each
+projection's actual layout (a GGUF target's block projections beside its
+affine draft's) and reserves the vocabulary head only for decode.
 
 ### GGUF targets
 
@@ -438,7 +450,8 @@ on both families, chunks of up to 32 rows on the decode tiles. Every projection 
 across threadgroups by one rule (`decodeSplits`: each tile's tiers of threadgroups per core and
 inputs per partition, from measured occupancy) that does not depend on the batch width. The MoE
 experts (`runtime/ops/MoE.cpp`) run the same numerics per family over the grouped rows. These
-plans are fixed rules of GPU family, core count and shape; they read no tuned choice. The ABIs
+plans are fixed rules of GPU family, core count and shape: `Linear::setChoices` and
+`ExecutionPlans::install` reject tuned entries for block projections and GGUF MoE blocks. The ABIs
 are in `runtime/metal/abi/Gguf.h` and `MoE.h`, the image formats in
 `runtime/metal/abi/QuantFormat.h`, their decoding in `runtime/metal/kernels/common/quant_formats.h`;
 weight preparation's repack ABI is `runtime/metal/abi/GgufRepack.h`.
