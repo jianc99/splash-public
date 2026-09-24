@@ -2,6 +2,7 @@
 
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/Linear.h"
+#include "ops/ChoiceTable.hpp"
 
 #include <algorithm>
 #include <array>
@@ -175,7 +176,7 @@ LinearScratchSize LinearPlan::scratchSize() const noexcept {
   // tile, which covers every lane. Every binding exists even without splits.
   if (config_.tile == LinearTile::GgufSimdgroup) {
     const uint64_t rows = workload_.rows;
-    return {rows * k * sizeof(uint16_t), rows / SPLASH_TARGET_VERIFY_ROWS * (k * 3 / 4) * sizeof(float),
+    return {tableBytes(k, workload_.rows), tableSumsBytes(LinearInput::Table16, k, workload_.rows),
             config_.splits > 1 ? config_.splits * rows * n * sizeof(float) : sizeof(float),
             config_.splits > 1 ? uint64_t{n / tileColumns()} * sizeof(uint32_t) : sizeof(uint32_t)};
   }
@@ -184,7 +185,7 @@ LinearScratchSize LinearPlan::scratchSize() const noexcept {
   const uint64_t lanes = rows / SPLASH_TARGET_VERIFY_ROWS;
   // Each row tile owns two fp32 fragment streams per K partition and one
   // completion counter per column tile. Single-partition kernels use neither.
-  return {rows * k * sizeof(uint16_t), rows * (k / kQuantGroup) * sizeof(float),
+  return {tableBytes(k, workload_.rows), tableSumsBytes(LinearInput::Table64, k, workload_.rows),
           config_.splits > 1 ? config_.splits * 2 * rows * n * sizeof(float) : sizeof(float),
           config_.splits > 1 ? lanes * (n / tileColumns()) * sizeof(uint32_t) : sizeof(uint32_t)};
 }
@@ -512,18 +513,13 @@ LinearConfig Linear::baseline(LinearWorkload w) const {
       (appleGpuFamily_ == 9 && w.epilogue == LinearEpilogue::None)))
     return {LinearTile::N128, groups(tiles128, kFourSimdgroupGroups),
             LinearSimdgroups::Four};
-  if (lanes >= 3 && w.epilogue == LinearEpilogue::None &&
-      tiles256 >= kWideDecodeTilesPerCore * gpuCores_)
-    return {LinearTile::N256, groups(tiles256, kN256Groups)};
+  if (widePlain) return {LinearTile::N256, groups(tiles256, kN256Groups)};
   return {LinearTile::N128,
           groups(tiles128, lanes == 2 ? kN128M16Groups : kN128Groups)};
 }
 
 LinearPlan Linear::plan(LinearWorkload workload) const {
-  const auto found = std::lower_bound(choices_.begin(), choices_.end(), workload,
-      [](const LinearChoice &choice, LinearWorkload key) { return choice.workload < key; });
-  return LinearPlan(workload, found != choices_.end() && found->workload == workload
-      ? found->configuration : baseline(workload));
+  return LinearPlan(workload, chosenConfiguration(choices_, workload, baseline(workload)));
 }
 LinearPlan Linear::plan(LinearWorkload workload, LinearConfig config) {
   return LinearPlan(workload, config);
@@ -539,12 +535,7 @@ void Linear::setChoices(std::span<const LinearChoice> choices) {
       throw std::invalid_argument("block projection plans are not tuned");
     (void)plan(choice.workload, choice.configuration);
   }
-  std::sort(pending.begin(), pending.end(), [](const auto &a, const auto &b) {
-    return a.workload < b.workload;
-  });
-  for (size_t i = 1; i < pending.size(); ++i)
-    if (pending[i - 1].workload == pending[i].workload)
-      throw std::invalid_argument("duplicate Q4 linear choice");
+  sortUniqueChoices(pending);
   choices_ = std::move(pending);
 }
 
@@ -615,13 +606,7 @@ LinearPlan Linear::prefillPlan(const Projection &p, uint32_t rows, LinearEpilogu
 }
 
 LinearScratchSize Linear::decodeScratchSize(LinearWorkload w) const {
-  auto size = LinearPlan(w, baseline(w)).scratchSize();
-  const auto selected = plan(w).scratchSize();
-  size.input = std::max(size.input, selected.input);
-  size.sums = std::max(size.sums, selected.sums);
-  size.partials = std::max(size.partials, selected.partials);
-  size.counters = std::max(size.counters, selected.counters);
-  return size;
+  return LinearPlan(w, baseline(w)).scratchSize().include(plan(w).scratchSize());
 }
 
 

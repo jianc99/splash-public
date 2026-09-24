@@ -110,7 +110,7 @@ uint32_t segmentColumns(const Projection &p) {
 } // namespace
 
 // Apple9 runs matrix operations on the FP32 pipe, so the exact register
-// kernel beats staging (scratchpad DESIGN).
+// kernel beats staging.
 LinearTile Linear::ggufDecodeTile() const noexcept {
   return appleGpuFamily_ == 9 ? LinearTile::GgufSimdgroup : LinearTile::GgufStaged;
 }

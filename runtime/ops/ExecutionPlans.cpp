@@ -1,5 +1,7 @@
 #include "ops/ExecutionPlans.hpp"
 
+#include "ops/ChoiceTable.hpp"
+
 #include <algorithm>
 #include <stdexcept>
 #include <utility>
@@ -32,29 +34,6 @@ VerifyAttentionPolicy verifyKey(uint32_t lanes, uint32_t queryHeads,
   for (uint32_t lane = 0; lane < lanes; ++lane)
     validateHistory(histories[lane], kDecodeRows);
   return {attentionShape(queryHeads, layout), lanes};
-}
-
-template <typename Choice>
-void sortUnique(std::vector<Choice> &choices) {
-  std::sort(choices.begin(), choices.end(), [](const auto &a, const auto &b) {
-    return a.workload < b.workload;
-  });
-  if (std::adjacent_find(choices.begin(), choices.end(),
-                        [](const auto &a, const auto &b) {
-                          return a.workload == b.workload;
-                        }) != choices.end())
-    throw std::invalid_argument("duplicate operator choice");
-}
-template <typename Choice, typename Workload, typename Configuration>
-Configuration configurationFor(const std::vector<Choice> &choices,
-                               const Workload &workload,
-                               Configuration baseline) {
-  const auto found = std::lower_bound(
-      choices.begin(), choices.end(), workload,
-      [](const auto &choice, const auto &key) { return choice.workload < key; });
-  return found != choices.end() && found->workload == workload
-             ? found->configuration
-             : baseline;
 }
 
 constexpr std::array attentionFields{
@@ -121,10 +100,10 @@ void ExecutionPlans::install(const OperatorChoices &choices) {
     else
       throw std::invalid_argument("invalid MoE choice phase or physical rows");
   }
-  sortUnique(pending.prefillAttention);
-  sortUnique(pending.verifyAttention);
-  sortUnique(pending.draftAttention);
-  sortUnique(pending.moe);
+  sortUniqueChoices(pending.prefillAttention);
+  sortUniqueChoices(pending.verifyAttention);
+  sortUniqueChoices(pending.draftAttention);
+  sortUniqueChoices(pending.moe);
   // All potentially throwing work is above. No partial table install can
   // affect a production lookup if validation or allocation fails.
   std::swap(linear_, nextLinear);
@@ -138,7 +117,7 @@ PrefillAttentionPlan ExecutionPlans::prefillAttention(
   const PrefillAttentionPolicy workload{attentionShape(queryHeads, layout), rows};
   return PagedAttention::prefillPlan(
       rows, queryHeads, layout, historyTokens,
-      configurationFor(choices_.prefillAttention, workload,
+      chosenConfiguration(choices_.prefillAttention, workload,
                        PrefillAttentionConfig{}));
 }
 
@@ -148,14 +127,14 @@ VerifyAttentionPlan ExecutionPlans::verifyAttention(
   const auto workload = verifyKey(lanes, queryHeads, layout, historyTokens);
   return PagedAttention::verifyPlan(
       lanes, queryHeads, layout, historyTokens,
-      configurationFor(choices_.verifyAttention, workload, VerifyAttentionConfig{}));
+      chosenConfiguration(choices_.verifyAttention, workload, VerifyAttentionConfig{}));
 }
 
 DraftAttentionPlan ExecutionPlans::draftAttention(DraftAttentionShape shape,
                                                  uint32_t lanes) const {
   return DraftAttention::plan(
       shape, lanes,
-      configurationFor(choices_.draftAttention,
+      chosenConfiguration(choices_.draftAttention,
                        DraftAttentionWorkload{shape, lanes},
                        DraftAttentionConfiguration{}));
 }
@@ -182,7 +161,7 @@ MoePlan ExecutionPlans::moePlan(const MoeWorkload &workload, MoeConfig config) c
 
 MoePlan ExecutionPlans::moePrefill(MoeShape shape, uint32_t rows) const {
   const MoeWorkload workload{shape, rows, MoePhase::Prefill};
-  return moePlan(workload, configurationFor(choices_.moe, workload, MoeConfig{MoeExpertTile::M32}));
+  return moePlan(workload, chosenConfiguration(choices_.moe, workload, MoeConfig{MoeExpertTile::M32}));
 }
 
 MoePlan ExecutionPlans::moeDecode(MoeShape shape, uint32_t lanes) const {
@@ -190,7 +169,7 @@ MoePlan ExecutionPlans::moeDecode(MoeShape shape, uint32_t lanes) const {
   if (!lanes || lanes > kMaximumLanes)
     throw std::invalid_argument("invalid MoE decode width");
   const MoeWorkload workload{shape, lanes * kDecodeRows, MoePhase::Decode};
-  return moePlan(workload, configurationFor(choices_.moe, workload, MoeConfig{MoeExpertTile::M8}));
+  return moePlan(workload, chosenConfiguration(choices_.moe, workload, MoeConfig{MoeExpertTile::M8}));
 }
 
 std::array<MoePlan, 2> ExecutionPlans::moeCandidates(const MoeWorkload &workload) const {

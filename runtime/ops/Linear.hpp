@@ -4,6 +4,7 @@
 #include "metal/CommandGraph.hpp"
 #include "ops/Weights.hpp"
 
+#include <algorithm>
 #include <compare>
 #include <cstddef>
 #include <cstdint>
@@ -96,6 +97,14 @@ struct LinearScratch final {
 struct LinearScratchSize final {
   uint64_t input = 0, sums = 0, partials = 0, counters = 0;
   [[nodiscard]] uint64_t bytes() const noexcept { return input + sums + partials + counters; }
+  // Grows each field to hold `other`'s too.
+  LinearScratchSize &include(const LinearScratchSize &other) noexcept {
+    input = std::max(input, other.input);
+    sums = std::max(sums, other.sums);
+    partials = std::max(partials, other.partials);
+    counters = std::max(counters, other.counters);
+    return *this;
+  }
 };
 
 // The activation layout a decode plan reads: the producer's bf16 rows, or an
@@ -107,10 +116,10 @@ enum class LinearInput : uint8_t {
   Table16,  // GGUF simdgroup table, sums per 16 and 32 inputs (kernels/common/gguf_sgmatrix.h)
 };
 // Scratch bytes a producer writes for `rows` rows of `width` inputs.
-[[nodiscard]] constexpr uint64_t tableBytes(uint32_t width, uint32_t rows) noexcept {
+[[nodiscard]] constexpr uint64_t tableBytes(uint32_t width, uint64_t rows) noexcept {
   return uint64_t{width} * rows * 2;
 }
-[[nodiscard]] constexpr uint64_t tableSumsBytes(LinearInput layout, uint32_t width, uint32_t rows) noexcept {
+[[nodiscard]] constexpr uint64_t tableSumsBytes(LinearInput layout, uint32_t width, uint64_t rows) noexcept {
   return layout == LinearInput::Table16 ? uint64_t{width} * rows * 3 / 8
        : layout == LinearInput::Table64 ? uint64_t{width} * rows / 16 : 0;
 }

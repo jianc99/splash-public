@@ -123,10 +123,8 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
     for (uint32_t rows = 1; rows <= decodeTileRows; ++rows)
       for (const auto epilogue : {ops::LinearEpilogue::None, ops::LinearEpilogue::Residual,
                                   ops::LinearEpilogue::UpWithGate}) {
-        const ops::LinearScratchSize size = operators.linear().plan(
-            {matrix, rows, ops::LinearPhase::Prefill, epilogue, projection.layout}).scratchSize();
-        linear.partials = std::max(linear.partials, size.partials);
-        linear.counters = std::max(linear.counters, size.counters);
+        linear.include(operators.linear().plan(
+            {matrix, rows, ops::LinearPhase::Prefill, epilogue, projection.layout}).scratchSize());
       }
   }
   put(PrefillTensor::LinearPartials, linear.partials);
@@ -338,12 +336,8 @@ ops::LinearScratchSize DecodeArena::linearScratchSize(
     for (uint32_t lanes = 1; lanes <= kLaneCount; ++lanes) {
       for (auto epilogue : {ops::LinearEpilogue::None, ops::LinearEpilogue::Residual,
                             ops::LinearEpilogue::GateUp}) {
-        const auto size = operators.linear().decodeScratchSize(
-            {matrix, lanes * kDecodeRows, ops::LinearPhase::Decode, epilogue, weightLayout});
-        result.input = std::max(result.input, size.input);
-        result.sums = std::max(result.sums, size.sums);
-        result.partials = std::max(result.partials, size.partials);
-        result.counters = std::max(result.counters, size.counters);
+        result.include(operators.linear().decodeScratchSize(
+            {matrix, lanes * kDecodeRows, ops::LinearPhase::Decode, epilogue, weightLayout}));
       }
     }
   };

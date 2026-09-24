@@ -8,18 +8,18 @@ namespace splash::model {
 namespace {
 
 // The planes of the affine Q4 and Q8 projections the collector keeps.
-const ops::AffineWeights &planes(const ops::Projection &projection) noexcept { return projection.affine(); }
+const ops::AffineWeights &planes(const ops::Projection &projection) { return projection.affine(); }
 const ops::AffineWeights &planes(const ops::Q8Projection &projection) noexcept { return projection.planes; }
 
 template <class Projection>
-bool sameProjection(const Projection &left, const Projection &right) noexcept {
+bool sameProjection(const Projection &left, const Projection &right) {
   const auto &l = planes(left), &r = planes(right);
   return left.inputSize == right.inputSize && left.outputSize == right.outputSize &&
          l.weights.sameView(r.weights) && l.scales.sameView(r.scales) && l.biases.sameView(r.biases);
 }
 
 bool sameWeights(const ops::tuning::LinearTuningWeights &left,
-                  const ops::tuning::LinearTuningWeights &right) noexcept {
+                  const ops::tuning::LinearTuningWeights &right) {
   return sameProjection(left.projection, right.projection) &&
          left.gate.has_value() == right.gate.has_value() &&
          (!left.gate || sameProjection(*left.gate, *right.gate));
@@ -33,7 +33,7 @@ bool sameExpert(const ops::ExpertProjection &left,
          left.packed.sameView(right.packed);
 }
 
-bool sameWeights(const ops::MoeWeights &leftWeights, const ops::MoeWeights &rightWeights) noexcept {
+bool sameWeights(const ops::MoeWeights &leftWeights, const ops::MoeWeights &rightWeights) {
   const auto &left = leftWeights.affine(), &right = rightWeights.affine();
   if (!sameProjection(left.router, right.router) ||
       !sameProjection(left.sharedExpertGate, right.sharedExpertGate))

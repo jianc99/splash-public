@@ -105,13 +105,12 @@ MoeWorkspace workspaceFor(MoeShape shape, uint32_t rows, uint32_t tileRows,
   // tiles there, and one tile's row sums take 3 K / 4 fp32
   // (kernels/common/gguf_sgmatrix.h).
   const uint64_t scoreBytes = uint64_t{rows} * 256 * sizeof(float);
-  const uint64_t sumsBytes = ggufTile == MoeGgufTile::Register
-      ? uint64_t{tiles} * (uint64_t{widest} * 3 / 4) * sizeof(float) : 0;
+  const bool table16 = ggufTile == MoeGgufTile::Register;
+  const uint64_t sumsBytes = table16 ? tableSumsBytes(LinearInput::Table16, widest, groupedRows) : 0;
   return {routes * sizeof(uint32_t), routes * sizeof(float),
           uint64_t{tiles} * sizeof(MoeTileDescriptor), sizeof(uint32_t),
           groupedRows * sizeof(uint32_t), routes * sizeof(uint32_t),
-          std::max(groupedRows * (ggufTile == MoeGgufTile::Register ? widest : shape.hiddenSize) *
-                       sizeof(uint16_t), scoreBytes),
+          std::max(tableBytes(table16 ? widest : shape.hiddenSize, groupedRows), scoreBytes),
           groupedRows * shape.expertIntermediateSize * sizeof(uint16_t),
           groupedRows * outputWidth * sizeof(uint16_t), sumsBytes};
 }
