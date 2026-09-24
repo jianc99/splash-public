@@ -15,8 +15,9 @@ there is nothing to configure.
 
 ## Quick start
 
-Apple M3 or newer, macOS 26.4 or later, [Homebrew](https://brew.sh), and 36 GB
-of unified memory (48 GB or more recommended).
+Apple M3 or newer, macOS 26.4 or later, [Homebrew](https://brew.sh), 36 GB
+of unified memory (48 GB or more recommended), and free disk for the model plus
+its prepared weights (about 35 GB for Qwen3.8-27B).
 
 ```bash
 brew install incoai/tap/splash
@@ -69,12 +70,14 @@ See [judgment contracts](DEVELOPMENT.md#judgment-contracts) for details.
 | Qwen3.8-27B | `mlx-community/Qwen3.8-27B-4bit` | `unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M` |
 | Qwen3.6-35B-A3B | `mlx-community/Qwen3.6-35B-A3B-4bit` | `unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M` |
 
-`--model` accepts the upstream repository directly. Splash identifies the model
-from its own metadata, its architecture and dimensions, before downloading any
-weights, and pairs the DFlash2 draft trained for it. MLX uses the target
-repository's tokenizer, configuration and chat template; GGUF reads these from
-the selected GGUF file itself. No tokenizer or configuration is downloaded from another model repository.
-Only the separate draft model is automatically paired. A separate Splash support
+`--model` accepts the upstream repository directly: an MLX affine 4-bit,
+group-64 checkpoint (such as the mlx-community `-4bit` conversions) or a GGUF.
+Splash identifies the model from its own metadata, its architecture and
+dimensions, before downloading any weights, and pairs the DFlash2 draft trained
+for it. MLX uses the target repository's tokenizer, configuration and chat
+template; GGUF reads these from the selected GGUF file itself. No tokenizer or
+configuration is downloaded from another model repository. Only the separate
+draft model is automatically paired. A separate Splash support
 package is not required. Existing Splash packages remain loadable.
 
 GGUF selection uses `--model OWNER/REPO:VARIANT` (for example `:UD-Q4_K_M`).
@@ -83,7 +86,7 @@ on later starts. Unsupported or incomplete tokenizer metadata causes an explicit
 error; Splash does not substitute another tokenizer.
 
 Vision comes from the same source: embedded vision tensors for MLX, or the
-companion `mmproj-BF16.gguf` or `mmproj-F32.gguf` for GGUF. Both are prepared as
+repository's companion BF16 or F32 `mmproj` GGUF. Both are prepared as
 BF16; an F32 or F16 tensor loads only when every value is exactly a BF16, as in
 Unsloth's mmproj files.
 Use `--language-only` to skip vision loading and preparation. It also skips the
@@ -91,13 +94,14 @@ GGUF mmproj download; MLX vision tensors share the language model's shards, so
 those shards still download in full. The server then rejects image and PDF input
 and reports `vision: false` in `/status` and `/v1/models`.
 
-The first preparation stores an additional weight copy in
-`~/Library/Caches/Splash/weights`, using bounded temporary memory. Later starts
-reuse it. Each start checks the upstream revision with one Hub request and
-installs a new commit before serving it; without the Hub, or when the new commit
-cannot be installed, the installed model starts. `--revision` optionally selects
-an upstream branch, tag or commit (a commit is never checked again); otherwise
-the default branch is followed. GGUF variants whose tensor types Splash cannot load are
+The first preparation stores an additional copy of the weights, about the
+model's size, in `~/Library/Caches/Splash/weights` (`SPLASH_WEIGHT_CACHE`
+relocates it), using bounded temporary memory. Later starts reuse it. Each
+start checks the upstream revision with one Hub request and installs a new
+commit before serving it; without the Hub, or when the new commit cannot be
+installed, the installed model starts. `--revision` optionally selects an
+upstream branch, tag or commit (a commit is never checked again); otherwise the
+default branch is followed. GGUF variants whose tensor types Splash cannot load are
 rejected before download. `--draft-model` overrides the matching draft
 repository or supplies a local draft directory.
 Private repositories need `HF_TOKEN`. Downloads use the Hugging Face cache, and
@@ -108,7 +112,7 @@ install the Splash runtime, then paste the full Hugging Face model link into its
 model search. These integrations manage their own runtime and settings.
 
 If a client’s model catalog does not list a model, the full model ID in
-this table still works with `splash serve --model OWNER/REPO`. The browser chat
+this table still works with `splash serve --model OWNER/REPO[:VARIANT]`. The browser chat
 and the agent launchers connect to that server without a catalog search.
 
 For a custom model download location, see [model cache](DEVELOPMENT.md#model-cache).

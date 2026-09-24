@@ -12,14 +12,22 @@ using that SDK. Packaged users need none of these development tools.
 git clone https://github.com/incoai/splash.git
 cd splash
 make -j4
-./splash serve --model incoai/Qwen3.8-27B-Splash
+./splash serve --model mlx-community/Qwen3.8-27B-4bit
 ```
 
-`--model` requires a full Hugging Face `owner/repo` containing a Splash package.
-The first serve sets up Python dependencies, resolves a repository commit and
-verifies its manifest and artifacts. Later launches reuse the installed snapshot
-offline. Public packages need no login; private/gated packages need `HF_TOKEN`
-or `hf auth login`. Ctrl+C stops serving; stop before upgrading.
+`--model` names an upstream Hugging Face model: an MLX affine 4-bit, group-64
+repository such as `mlx-community/Qwen3.8-27B-4bit`, or a GGUF repository and
+variant, `OWNER/REPO:VARIANT`, such as `unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M`.
+Splash identifies the model from its own metadata and pairs the DFlash2 draft
+trained for it ([Upstream model loading](#upstream-model-loading)). The first
+serve sets up Python dependencies, downloads the model and its draft, and
+prepares the weights once, which takes about the model's size again on disk
+([Model cache](#model-cache)). Each start checks the Hub for a newer revision
+and follows it; without a network, the installed model starts as is. Existing
+Splash packages such as `incoai/Qwen3.8-27B-Splash` remain loadable
+([Splash packages](#splash-packages)). Public repositories need no login;
+private or gated ones need `HF_TOKEN` or `hf auth login`. Ctrl+C stops serving;
+stop before upgrading.
 
 Use `--max-context 100K` or `--max-memory 28G` to set optional limits. Memory
 limits cap Metal allocations, not combined process RSS. Agents must already be
@@ -56,7 +64,7 @@ commands, bundled official model IDs and installed models without network access
 The default listener is `127.0.0.1:8000`. To accept LAN connections:
 
 ```sh
-splash serve --model incoai/Qwen3.8-27B-Splash --host 0.0.0.0 --api-key YOUR_KEY
+splash serve --model mlx-community/Qwen3.8-27B-4bit --host 0.0.0.0 --api-key YOUR_KEY
 ```
 
 Connect to the server's LAN IP. `--host` selects the IPv4 bind address;
@@ -71,13 +79,13 @@ loopback, so use a listener that includes loopback when launching agents locally
 ## API model aliases
 
 Repeat `--served-model-name NAME` to accept additional API model IDs. The full
-`--model OWNER/REPO` still selects the package. `/v1/models` lists that ID first,
-followed by unique aliases; each alias's `root` identifies the loaded package.
-Generation and scoring responses always report the real package ID, even when
-requested through an alias. The model list and lookup support both names.
+`--model` ID still selects the model. `/v1/models` lists that ID first, followed
+by unique aliases; each alias's `root` identifies the loaded model. Generation
+and scoring responses always report the real model ID, even when requested
+through an alias. The model list and lookup support both names.
 
 ```sh
-splash serve --model incoai/Qwen3.8-27B-Splash --served-model-name local-qwen
+splash serve --model mlx-community/Qwen3.8-27B-4bit --served-model-name local-qwen
 ```
 
 Aliases cannot contain whitespace, control characters, `\`, `%`, `?`, `#`,
@@ -94,7 +102,7 @@ passed to the template using the same mapping as per-request values, not token
 budgets.
 
 ```sh
-splash serve --model incoai/Qwen3.8-27B-Splash --default-reasoning-effort none
+splash serve --model mlx-community/Qwen3.8-27B-4bit --default-reasoning-effort none
 ```
 
 `/apply-template` uses the same default. Anthropic `thinking` keeps its protocol
@@ -105,18 +113,21 @@ semantics (off when omitted); judgment endpoints always disable thinking.
 To download new models to another disk, set the cache location before serving:
 
 ```sh
-HF_HUB_CACHE=/Volumes/Models/huggingface splash serve --model incoai/Qwen3.8-27B-Splash
+HF_HUB_CACHE=/Volumes/Models/huggingface splash serve --model mlx-community/Qwen3.8-27B-4bit
 ```
 
 `HF_HUB_CACHE` selects the Hugging Face download cache. Alternatively, set
 `HF_HOME` to relocate the Hugging Face home directory, including its default
 `hub` cache. Model links and agent sessions stay in Splash's data directory;
-existing downloads are not moved.
+existing downloads are not moved. Prepared weights have their own cache
+([Local weight preparation](#local-weight-preparation)), so moving downloads
+does not move them.
 
-## Model packages
+## Splash packages
 
-Packages contain `manifest.json`, packed `target/`, `draft/`, `vision/` weights
-and `tokenizer/`. The manifest lists artifact paths, sizes and SHA-256 hashes.
+Splash packages are the prebuilt format that predates upstream loading. They
+contain `manifest.json`, packed `target/`, `draft/`, `vision/` weights and
+`tokenizer/`. The manifest lists artifact paths, sizes and SHA-256 hashes.
 Dense packages use schema 3 / `splash-packed-q4`; MoE uses schema 4 /
 `splash-packed-q4-moe`.
 
@@ -127,8 +138,8 @@ New architectures require engine support.
 
 ### Upstream model loading
 
-`install/upstream.py` resolves target, tokenizer, processor and matching draft
-repositories, then atomically publishes a local assembly of links to their Hub
+`install/upstream.py` resolves the target repository and the draft paired with
+it, then atomically publishes a local assembly of links to their Hub
 snapshots. `model.json` describes those resolved sources and selected formats;
 it is local installation metadata, not a file model publishers must supply.
 A target is identified by its own metadata: an MLX config's `text_config`, or
@@ -315,11 +326,15 @@ mixed affine/block layers, and reserves the vocabulary head only for decode.
 
 ### GGUF targets
 
-Qwen3.8-27B and Qwen3.6-35B-A3B can be served straight from a llama.cpp GGUF (for example
-Unsloth's `Qwen3.8-27B-UD-Q4_K_M.gguf` and `Qwen3.6-35B-A3B-UD-Q4_K_M.gguf`). A `gguf` package
-ships only the shared `draft/`, `vision/` and `tokenizer/`; `schema_version` 3 describes a dense
-Qwen3.8 target and 4 a Qwen3.6 MoE target, and the loader checks the GGUF's architecture against
-it. The manifest names the source repository and the files a model ID may select:
+Qwen3.8-27B and Qwen3.6-35B-A3B can be served straight from a llama.cpp GGUF:
+`splash serve --model unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M` selects the root-level file whose
+name ends in `-UD-Q4_K_M` and installs it as described in
+[Upstream model loading](#upstream-model-loading).
+
+Prebuilt `gguf` Splash packages ship only the shared `draft/`, `vision/` and `tokenizer/`;
+`schema_version` 3 describes a dense Qwen3.8 target and 4 a Qwen3.6 MoE target, and the loader
+checks the GGUF's architecture against it. Their manifest names the source repository and the
+files a model ID may select:
 
 ```json
 "format": {"name": "gguf", "target_layer_magic": "MDGG0001", ...},
@@ -328,9 +343,9 @@ it. The manifest names the source repository and the files a model ID may select
                                                "size": 16464440224, "sha256": "..."}, ...}}}
 ```
 
-`splash serve --model incoai-internal/Qwen3.8-27B-Splash-GGUF:UD-Q4_K_M` downloads the shared
-files and that one GGUF into the Hub cache, checks them against the manifest, and installs
-`models/<owner>/<repo>:UD-Q4_K_M/` as a real directory of per-file symlinks whose
+For such a package, `--model OWNER/REPO:VARIANT` downloads the shared files and that one GGUF
+into the Hub cache, checks them against the manifest, and installs
+`models/<owner>/<repo>:<variant>/` as a real directory of per-file symlinks whose
 `target/<file>.gguf` links the cached GGUF (the engine requires `target/` and `draft/` to be
 subdirectories of one root). The original download remains unchanged.
 
@@ -348,8 +363,8 @@ and run in fp32, as llama.cpp keeps them (Apple10 prefill chunks multiply the ro
 alpha/beta on the neural accelerator as three bf16 parts per weight that sum to it exactly, so
 only fp32 accumulation rounds); the other small F32 tensors (the GDN convolution and
 time-step bias) become bf16 only when every value converts exactly, and loading fails otherwise.
-Prepared weight pages can be dropped and refaulted under memory pressure, just
-like existing packed packages. Supported tensor types are Q4_K,
+Prepared weight files are file-backed like existing packed packages; while Metal holds them
+resident, their pages stay wired. Supported tensor types are Q4_K,
 Q5_K, Q6_K, Q3_K, IQ4_XS, IQ4_NL, Q8_0 and IQ3_S for linears and experts, F32 for the tensors
 above, and Q4_K, Q6_K or Q8_0 token embeddings; the loader lists every unsupported tensor in one
 error. Of Unsloth's files that covers, for Qwen3.8-27B, UD-Q4_K_M and every larger file but
@@ -515,7 +530,7 @@ from typesafe_sdk import Choice, Noul, Score, TypeSafeClient
 with TypeSafeClient(
     base_url="http://127.0.0.1:8000",
     api_key="local",  # Use SPLASH_API_KEY's value if server authentication is on.
-    model="incoai/Qwen3.8-27B-Splash",
+    model="mlx-community/Qwen3.8-27B-4bit",
 ) as client:
     result = client.system_one(
         state={"message": "I was charged twice. Please fix this today."},
