@@ -846,6 +846,27 @@ class UpstreamTest(unittest.TestCase):
             errors.getvalue(), f"error: cannot install {MODEL}: timed out\n"
         )
 
+    def test_verifying_a_missing_installation_says_so(self):
+        for options in ([], ["--language-only"]):
+            with self.subTest(options=options):
+                errors = io.StringIO()
+                with contextlib.redirect_stderr(errors):
+                    code = models.main(
+                        [
+                            "--models",
+                            str(self.root),
+                            "--model",
+                            MODEL,
+                            *options,
+                            "verify",
+                        ]
+                    )
+                self.assertEqual(code, 1)
+                self.assertEqual(
+                    errors.getvalue(),
+                    f"error: {MODEL} is not installed in {self.root}\n",
+                )
+
     def test_selection_paths_do_not_conflict(self):
         root = Path("/models")
         paths = {

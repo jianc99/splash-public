@@ -955,10 +955,12 @@ def main(argv=None):
                     import upstream
                 upstream.verify(root, full=args.full)
                 selected = args.model
-            else:
+            elif (root / "manifest.json").exists():
                 selected = verify_installed(
                     args.models.resolve(), model_id=args.model, full=args.full
                 )
+            else:
+                raise ModelError(f"{args.model} is not installed in {args.models}")
             print(
                 f"Splash model {selected} preflight passed "
                 f"({'full' if args.full else 'quick'})."
