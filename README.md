@@ -71,9 +71,9 @@ See [judgment contracts](DEVELOPMENT.md#judgment-contracts) for details.
 
 `--model` accepts the upstream repository directly. Splash identifies the model
 from its own metadata, its architecture and dimensions, before downloading any
-weights, and pairs the DFlash2 draft trained for it. MLX uses the target repository's tokenizer,
-configuration and chat template; GGUF reads these from the selected GGUF file
-itself. No tokenizer or configuration is downloaded from another model repository.
+weights, and pairs the DFlash2 draft trained for it. MLX uses the target
+repository's tokenizer, configuration and chat template; GGUF reads these from
+the selected GGUF file itself. No tokenizer or configuration is downloaded from another model repository.
 Only the separate draft model is automatically paired. A separate Splash support
 package is not required. Existing Splash packages remain loadable.
 
@@ -83,8 +83,9 @@ on later starts. Unsupported or incomplete tokenizer metadata causes an explicit
 error; Splash does not substitute another tokenizer.
 
 Vision comes from the same source: embedded vision tensors for MLX, or the
-companion `mmproj` for GGUF. Both are prepared as BF16; an F32 or F16 tensor
-loads only when every value is exactly a BF16, as in Unsloth's mmproj files.
+companion `mmproj-BF16.gguf` or `mmproj-F32.gguf` for GGUF. Both are prepared as
+BF16; an F32 or F16 tensor loads only when every value is exactly a BF16, as in
+Unsloth's mmproj files.
 Use `--language-only` to skip vision loading and preparation. It also skips the
 GGUF mmproj download; MLX vision tensors share the language model's shards, so
 those shards still download in full. The server then rejects image and PDF input
