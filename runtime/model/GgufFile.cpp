@@ -92,6 +92,27 @@ uint64_t scalarBytes(uint32_t type) {
   }
 }
 
+// The longest metadata array kept: the vision metadata read from it has one
+// entry per block or channel, and tokenizer arrays are far longer.
+constexpr uint64_t kMaximumKeptArray = 1024;
+
+double numericValue(Reader &reader, uint32_t type) {
+  switch (type) {
+  case kUint8: return reader.scalar<uint8_t>();
+  case kInt8: return reader.scalar<int8_t>();
+  case kBool: return reader.scalar<uint8_t>() != 0;
+  case kUint16: return reader.scalar<uint16_t>();
+  case kInt16: return reader.scalar<int16_t>();
+  case kUint32: return reader.scalar<uint32_t>();
+  case kInt32: return reader.scalar<int32_t>();
+  case kFloat32: return reader.scalar<float>();
+  case kUint64: return double(reader.scalar<uint64_t>());
+  case kInt64: return double(reader.scalar<int64_t>());
+  case kFloat64: return reader.scalar<double>();
+  default: throw GgufError("unknown GGUF value type " + std::to_string(type));
+  }
+}
+
 // Skips a value whose contents are not kept (arrays, mostly the tokenizer).
 void skipValue(Reader &reader, uint32_t type, unsigned depth = 0) {
   if (depth > 16) throw GgufError("GGUF metadata nesting is too deep");
@@ -165,20 +186,20 @@ GgufFile::GgufFile(std::filesystem::path path) : path_(std::move(path)) {
     case kFloat32: floats_[key] = reader.scalar<float>(); break;
     case kFloat64: floats_[key] = reader.scalar<double>(); break;
     case kArray: {
-      if (key != "clip.vision.image_mean" && key != "clip.vision.image_std" &&
-          key != "clip.vision.is_deepstack_layers") {
-        skipValue(reader, type);
-        break;
-      }
+      // Small numeric arrays of any key are kept; strings and long arrays
+      // (vocabularies, merges, token types) are skipped without reading them.
       const uint32_t element = reader.scalar<uint32_t>();
       const uint64_t count = reader.scalar<uint64_t>();
-      if (count > 1024 || (element != kFloat32 && element != kFloat64 && element != kBool))
-        throw GgufError("unsupported vision metadata array: " + key);
+      if (count > kMaximumKeptArray || element == kString || element == kArray) {
+        if (element == kString || element == kArray)
+          for (uint64_t j = 0; j < count; ++j) skipValue(reader, element);
+        else
+          reader.skip(checkedMultiply(count, scalarBytes(element)));
+        break;
+      }
       auto &values = arrays_[key];
       values.reserve(count);
-      for (uint64_t j = 0; j < count; ++j)
-        values.push_back(element == kFloat32 ? double(reader.scalar<float>())
-                          : element == kFloat64 ? reader.scalar<double>() : double(reader.scalar<uint8_t>()));
+      for (uint64_t j = 0; j < count; ++j) values.push_back(numericValue(reader, element));
       break;
     }
     default: skipValue(reader, type); break;
