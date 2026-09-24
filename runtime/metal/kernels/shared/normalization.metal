@@ -184,7 +184,10 @@ inline void norm_rms_table(device const bfloat *input, device const W *weight,
     threadgroup float reductions[8]; \
     norm_rms_table<Table>(input, weight, output, table, sums, width, row, tid, lane, sg, reductions); \
   }
-// Table64 feeds the affine models, whose norms are bf16; Table16 a GGUF's, whose norms are F32.
+// The reachable pairs: Table64 feeds affine projections, from the affine targets' and the draft's bf16 norms.
+// Table16 feeds a GGUF target's register-tile projections, from its F32 norms, and also the target's vocabulary
+// head from the draft's bf16 final norm (DFlashDraft::addDecode). No F32 norm feeds an affine projection.
 NORM_RMS_TABLE(norm_rms_q4_decode, q4sg::Table64, bfloat)
+NORM_RMS_TABLE(norm_rms_q16_decode, q16sg::Table16, bfloat)
 NORM_RMS_TABLE(norm_rms_q16_decode_f32, q16sg::Table16, float)
 #undef NORM_RMS_TABLE

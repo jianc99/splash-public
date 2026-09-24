@@ -13,6 +13,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace splash;
@@ -416,10 +417,12 @@ int main(int argc,char **argv) {
           for (uint32_t fixture=0;fixture<4;++fixture)
             for (uint32_t rows : {8U,16U,24U,32U}) { runCase(backend,n,k,splits,e,fixture,rows); ++cases; }
       }
-    // Table64 feeds the affine models, whose norms are bf16; Table16 a GGUF's, whose norms are F32.
-    for (LinearInput layout : {LinearInput::Table64, LinearInput::Table16})
+    // The production pairs of table and norm weights (kernels/shared/normalization.metal): bf16 norms feed both
+    // tables, F32 norms only Table16.
+    for (auto [layout, float32] : {std::pair{LinearInput::Table64, false}, std::pair{LinearInput::Table16, false},
+                                   std::pair{LinearInput::Table16, true}})
       for (uint32_t width : {64U, 320U, 1984U, 2048U, 2112U, 5120U, 17408U})
-        for (uint32_t rows : {8U,16U,24U,32U}) fusedNorm(backend, width, rows, layout, layout == LinearInput::Table16);
+        for (uint32_t rows : {8U,16U,24U,32U}) fusedNorm(backend, width, rows, layout, float32);
     for (bool float32 : {false, true})
       for (uint32_t width : {64U, 2048U, 5120U, 17408U})
         for (uint32_t rows : {1U,37U,64U}) prefillNorm(backend, width, rows, float32);
