@@ -292,16 +292,30 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
   MemoryGovernor::HostAvailableMemoryProvider hostAvailableMemory =
       config.hostAvailableMemory ? config.hostAvailableMemory
                                  : queryHostAvailableMemory;
-  backend->setOperationGuard(
-      [cancelled = config.cancelled, pressure = config.memoryPressure,
-       hostAvailableMemory, hostReserveBytes] {
-        if (cancelled && cancelled())
-          throw metal::MetalBackendError("Metal operation cancelled");
-        requireStartupHeadroom(hostAvailableMemory, hostReserveBytes,
-            pressure ? pressure() : MemoryPressure::Normal);
-      });
+  // The one startup memory check: cancellation, then system pressure and
+  // reclaimable host memory against a reserve. Every Metal operation runs it
+  // with the desktop reserve; weight preparation adds its workspace to the
+  // reserve and needs normal pressure.
+  const auto admitStartup = [cancelled = config.cancelled,
+                             pressure = config.memoryPressure,
+                             hostAvailableMemory](uint64_t reserveBytes,
+                                                  bool preparingWeights) {
+    if (cancelled && cancelled())
+      throw metal::MetalBackendError("Metal operation cancelled");
+    const MemoryPressure level =
+        pressure ? pressure() : MemoryPressure::Normal;
+    if (preparingWeights && level != MemoryPressure::Normal)
+      throw metal::MetalAllocationError(
+          "weight preparation requires normal memory pressure",
+          metal::AllocationFailure::HostPressure);
+    requireStartupHeadroom(hostAvailableMemory, reserveBytes, level);
+  };
+  backend->setOperationGuard([admitStartup, hostReserveBytes] {
+    admitStartup(hostReserveBytes, false);
+  });
   try {
-    const uint64_t modelBytes = model::preparedModelWeightBytes(config.modelRoot, config.model);
+    const uint64_t modelBytes =
+        model::preparedModelWeightBytes(config.modelRoot, config.model);
     const uint64_t hardBudgetBytes = EngineMemoryPolicy::hardBudgetBytes(
         device.recommendedMaxWorkingSetBytes, config.maximumMemoryBytes);
     // Reject an impossible weight budget before registering model buffers.
@@ -316,8 +330,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
     }
     // Fail before opening the package when the machine has no headroom at
     // all; the guard installed above keeps checking as residency grows.
-    requireStartupHeadroom(hostAvailableMemory, hostReserveBytes,
-        config.memoryPressure ? config.memoryPressure() : MemoryPressure::Normal);
+    admitStartup(hostReserveBytes, false);
   } catch (const RuntimeResourcesError &) {
     throw;
   } catch (const metal::MetalAllocationError &error) {
@@ -331,17 +344,12 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
 
   model::ModelPackage package;
   try {
-    package = model::loadModelPackage(*backend, config.modelRoot, config.model,
-        [&] {
-          backend->checkOperation();
-          const auto pressure = config.memoryPressure ? config.memoryPressure() : MemoryPressure::Normal;
-          if (pressure != MemoryPressure::Normal)
-            throw metal::MetalAllocationError("weight preparation requires normal memory pressure",
-                                               metal::AllocationFailure::HostPressure);
-          requireStartupHeadroom(hostAvailableMemory,
-              checkedAdd(hostReserveBytes, model::kWeightPreparationWorkspaceBytes,
-                         "weight preparation reserve"), pressure);
-        });
+    const uint64_t preparationReserveBytes =
+        checkedAdd(hostReserveBytes, model::kWeightPreparationWorkspaceBytes,
+                   "weight preparation reserve");
+    package = model::loadModelPackage(
+        *backend, config.modelRoot, config.model,
+        [&] { admitStartup(preparationReserveBytes, true); });
     requireLoadedModel(package);
   } catch (const metal::MetalAllocationError &error) {
     throw RuntimeResourcesError(RuntimeResourceStage::ModelLoading,
