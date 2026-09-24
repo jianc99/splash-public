@@ -791,10 +791,11 @@ behavior and performance characterization. The hardware release gate
 for the two Splash packages only, so its real-model part exercises neither the
 preparation of a real MLX model nor a GGUF model.
 
-`make all build/engine-tests/affine-source-oracle` builds the affine source
-oracle, which no target runs; pass it `build/splash.metallib`, an installed MLX
-model's `target` directory and the matching installed package to compare every
-prepared byte.
+`make test-engine-cpu` builds the affine source oracle so it cannot break
+unnoticed, but no target runs it because it needs real models: after
+`make all build/engine-tests/affine-source-oracle`, pass it
+`build/splash.metallib`, an installed MLX model's `target` directory and the
+matching installed package to compare every prepared byte.
 
 Compare performance on the same idle Mac with the same model and workload.
 `make tune-kernels MODEL=...` measures the precompiled kernel candidates for the
