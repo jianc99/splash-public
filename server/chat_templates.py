@@ -147,9 +147,10 @@ def _prepare(render, source):
     original = _original(render, source)
     if original == RENDERS:
         return ChatTemplate(source, NATIVE, original)
-    patched = _patch(render, source, original)
-    if patched is not None and _verified(render, source, patched):
-        return ChatTemplate(patched, PATCHED, original)
+    if original in (REJECTS, DROPS):
+        patched = _patch(render, source, original)
+        if patched is not None and _verified(render, source, patched):
+            return ChatTemplate(patched, PATCHED, original)
     return ChatTemplate(source, UNSUPPORTED, original)
 
 
@@ -307,8 +308,6 @@ def _literal(text):
 
 def _patch(render, source, original):
     """The template with its rejecting or dropping construct replaced, or None."""
-    if original not in (REJECTS, DROPS):
-        return None
     try:
         tags = _tags(source)
         blocks, parents = _blocks(tags)
@@ -324,7 +323,9 @@ def _patch(render, source, original):
             else _skips(tags, blocks, parents, loop, variable)
         )
     }
-    block = _system_block(render, source) if len(constructs) == 1 else None
+    if len(constructs) != 1:
+        return None
+    block = _system_block(render, source)
     if block is None:
         return None
     ((tag, variable),) = constructs.values()
