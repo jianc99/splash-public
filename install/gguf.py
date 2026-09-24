@@ -7,6 +7,7 @@ special-token IDs and the chat template always come from the selected GGUF.
 from __future__ import annotations
 
 import collections
+import contextlib
 import struct
 from pathlib import Path
 
@@ -51,12 +52,16 @@ class Metadata:
 
     def __init__(self, source, *, tensors=False):
         """Read a local path, or a binary stream at the start of the file such
-        as a Hub range reader. tensors also reads each tensor's type."""
+        as a Hub range reader, which its caller closes. tensors also reads
+        each tensor's type."""
         self.values = {}
         self.tensors = {}
         self.consumed = 0
-        stream = Path(source).open("rb") if isinstance(source, (str, Path)) else source
-        with stream as self.stream:
+        with (
+            Path(source).open("rb")
+            if isinstance(source, (str, Path))
+            else contextlib.nullcontext(source)
+        ) as self.stream:
             if self.read(4) != b"GGUF" or self.scalar("I") not in (2, 3):
                 raise ModelError(
                     "unsupported GGUF header (expected little-endian v2/v3)"

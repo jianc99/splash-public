@@ -107,6 +107,10 @@ class GgufMetadataTests(unittest.TestCase):
             stream.write(b"tensor payload is not metadata")
         with mock.patch.object(gguf.Metadata, "MAX_BYTES", expected):
             self.assertEqual(gguf.Metadata(path).values, {"key": "value"})
+        # A caller's stream stays open, at the end of the metadata.
+        with path.open("rb") as stream:
+            self.assertEqual(gguf.Metadata(stream).values, {"key": "value"})
+            self.assertEqual(stream.tell(), expected)
         raw = path.read_bytes()[:expected]
         for size in range(len(raw)):
             path.write_bytes(raw[:size])
