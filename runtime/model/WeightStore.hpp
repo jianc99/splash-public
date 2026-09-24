@@ -61,9 +61,9 @@ private:
 void validateQ4Layout(uint32_t outputSize, uint32_t inputSize);
 
 [[nodiscard]] ops::Projection
-readProjection(WeightFile &file, metal::MetalBackend &backend,
-                 uint32_t outputSize, uint32_t inputSize,
-                 std::string_view label);
+readAffineProjection(WeightFile &file, metal::MetalBackend &backend,
+                     uint32_t outputSize, uint32_t inputSize,
+                     std::string_view label);
 
 // A norm of `width` multipliers: F32 when `float32` (a GGUF image keeps its
 // norms as the GGUF stores them), bf16 otherwise.

@@ -76,7 +76,7 @@ struct AffineTargetFormat final {
 
   [[nodiscard]] ops::Projection projection(WeightFile &file, uint32_t outputSize,
                                            uint32_t inputSize, std::string_view label) const {
-    return readProjection(file, backend, outputSize, inputSize, label);
+    return readAffineProjection(file, backend, outputSize, inputSize, label);
   }
   // The tensor `label`; block images keep the projection as `tensors`.
   [[nodiscard]] ops::Projection fused(WeightFile &file, uint32_t outputSize, uint32_t inputSize,

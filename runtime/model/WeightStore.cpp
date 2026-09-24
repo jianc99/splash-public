@@ -239,11 +239,11 @@ const WeightFileRecord &WeightFile::record() const noexcept {
     return impl_->record;
 }
 
-ops::Projection readProjection(WeightFile &file,
-                                   metal::MetalBackend &backend,
-                                   uint32_t outputSize,
-                                   uint32_t inputSize,
-                                   std::string_view label) {
+ops::Projection readAffineProjection(WeightFile &file,
+                                     metal::MetalBackend &backend,
+                                     uint32_t outputSize,
+                                     uint32_t inputSize,
+                                     std::string_view label) {
     validateQ4Layout(outputSize, inputSize);
     const uint64_t elements = q4Elements(outputSize, inputSize);
     const uint64_t weightBytes = elements / 2;
