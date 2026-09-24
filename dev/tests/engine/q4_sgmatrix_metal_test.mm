@@ -336,11 +336,11 @@ void fusedNorm(metal::MetalBackend &backend, uint32_t k, uint32_t rows, LinearIn
   require(!std::memcmp(a.contents(),b.contents(),tableBytes(k,rows)),"fused operand permutation mismatch");
   require(!std::memcmp(sa.contents(),sb.contents(),sumsBytes),"fused input sums mismatch");
 }
-// The packed prefill's norm, whose rows need not fill its 32-row sum tiles.
-// Its rows equal the plain norm's bit for bit, which a prefill feeding block
-// projections (which read no sums) runs instead.
-void prefillNorm(metal::MetalBackend &backend, uint32_t k, uint32_t rows, bool float32) {
-  const NormCase c=normCase(backend,k,rows,float32);
+// The affine prefill's norm, with bf16 weights only, whose rows need not fill
+// its 32-row sum tiles. Its rows equal the plain norm's bit for bit, which a
+// prefill whose consumer reads no sums runs instead.
+void prefillNorm(metal::MetalBackend &backend, uint32_t k, uint32_t rows) {
+  const NormCase c=normCase(backend,k,rows,false);
   auto output=backend.allocateBuffer(k*rows*2), plain=backend.allocateBuffer(k*rows*2);
   auto sums=backend.allocateBuffer((rows+31)/32*32*(k/64)*4);
   metal::CommandGraph graph;
@@ -409,9 +409,8 @@ int main(int argc,char **argv) {
                                    std::pair{LinearInput::Table16, true}})
       for (uint32_t width : {64U, 320U, 1984U, 2048U, 2112U, 5120U, 17408U})
         for (uint32_t rows : {8U,16U,24U,32U}) fusedNorm(backend, width, rows, layout, float32);
-    for (bool float32 : {false, true})
-      for (uint32_t width : {64U, 2048U, 5120U, 17408U})
-        for (uint32_t rows : {1U,37U,64U}) prefillNorm(backend, width, rows, float32);
+    for (uint32_t width : {64U, 2048U, 5120U, 17408U})
+      for (uint32_t rows : {1U,37U,64U}) prefillNorm(backend, width, rows);
     // 27B out_proj then down, and gdn_in then gate/up: K 6144, 17408 and 5120.
     for (uint32_t lanes : {1U, 4U}) {
       splitVisibility(backend, {{{{5120, 6144}, LinearEpilogue::Residual}, {{5120, 17408}, LinearEpilogue::Residual}}}, lanes);

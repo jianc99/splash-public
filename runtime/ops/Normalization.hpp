@@ -37,7 +37,8 @@ public:
                               LinearScratch scratch = {},
                               LinearInput layout = LinearInput::Plain);
 
-  // Fused RMS normalization plus Q4 input-group sums for packed prefill.
+  // Fused RMS normalization plus Q4 input-group sums for an affine prefill
+  // projection; its norm weights are bf16.
   static void addRmsWithQ4Sums(metal::CommandGraph &graph,
                                metal::MetalBuffer input,
                                const NormWeights &weight,
