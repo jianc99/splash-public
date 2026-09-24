@@ -184,11 +184,9 @@ TEST_METAL_TARGETS := $(TEST_AFFINE_PREPARATION) \
 	$(LIB) $(TEST_METAL_BACKEND_LIB) $(TEST_PRODUCTION_LIB) $(TEST_Q8_LIB) $(TEST_Q8_ATTENTION_LIB) \
 	$(TEST_GGUF_DEQUANT_LIB)
 
-TEST_UNIT_TEST_TARGETS := $(sort $(TEST_CPU_TARGETS) $(TEST_METAL_TARGETS))
-
 # Keep every output that uses a flag set together, including standalone
 # benchmarks, real-model tests and intermediate test AIRs/metallibs.
-TEST_CONFIG_TARGETS := $(filter-out $(LIB),$(TEST_UNIT_TEST_TARGETS)) \
+TEST_CONFIG_TARGETS := $(filter-out $(LIB),$(sort $(TEST_CPU_TARGETS) $(TEST_METAL_TARGETS))) \
 	$(TEST_MODEL_RUNTIME_ORACLE) $(TEST_VISION_ENCODER_TEST) $(TEST_AFFINE_SOURCE_ORACLE) \
 	$(TEST_DECODE_PROFILE) $(TEST_ATTENTION_SWEEP) \
 	$(TEST_Q8_AIR) $(TEST_Q8_KERNEL_AIRS) $(TEST_METAL_BACKEND_AIR) $(TEST_GGUF_DEQUANT_AIR)
@@ -235,7 +233,7 @@ $(TEST_GGUF_PROJECTION): dev/tests/engine/gguf_projection_test.mm dev/tests/engi
 		$(TEST_GGUF_DEQUANT_LIB) | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< $(ENGINE_LINKFLAGS) -o $@
 
-$(TEST_GGUF_REPACK): dev/tests/engine/gguf_repack_test.mm dev/tests/engine/GgufFormatReference.hpp \
+$(TEST_GGUF_REPACK): dev/tests/engine/gguf_repack_test.mm \
 		$(ENGINE_LIBRARY) | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< $(ENGINE_LIBRARY) $(ENGINE_LINKFLAGS) -o $@
 
@@ -325,8 +323,7 @@ $(TEST_STATUS_TEST): runtime/metal/DeviceCapabilities.cpp \
 		dev/tests/engine/runtime_status_test.cpp | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) -o $@
 
-$(TEST_Q8_CPU_TEST): dev/tests/engine/q8_paged_kv_test.cc \
-		dev/tests/engine/Q8PageFormatReference.hpp | $(ENGINE_TEST_BUILD)
+$(TEST_Q8_CPU_TEST): dev/tests/engine/q8_paged_kv_test.cc | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $< -o $@
 
 $(TEST_Q8_AIR): dev/tests/engine/q8_page_format_oracle.metal runtime/metal/abi/ExecutionGeometry.h \
@@ -346,13 +343,12 @@ $(TEST_Q8_ATTENTION_LIB): $(TEST_Q8_KERNEL_AIRS) $(TEST_Q8_AIR)
 	$(RUN_CONFIGURED) $(METALLIB) $(BUILD_INPUTS) -o $@
 
 $(TEST_Q8_ATTENTION_TEST): dev/tests/engine/q8_flash_attention_metal_test.mm \
-		dev/tests/engine/Q8PageFormatReference.hpp $(TEST_Q8_ATTENTION_LIB) | $(ENGINE_TEST_BUILD)
+		$(TEST_Q8_ATTENTION_LIB) | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< \
 		$(ENGINE_LINKFLAGS) -o $@
 
 $(TEST_Q8_PREFILL_TEST): dev/tests/engine/q8_chunked_prefill_metal_test.mm \
-		dev/tests/engine/Q8PageFormatReference.hpp $(ENGINE_LIBRARY) \
-		$(TEST_Q8_ATTENTION_LIB) | $(ENGINE_TEST_BUILD)
+		$(ENGINE_LIBRARY) $(TEST_Q8_ATTENTION_LIB) | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< $(ENGINE_LIBRARY) \
 		$(ENGINE_LINKFLAGS) -o $@
 
@@ -477,8 +473,7 @@ $(TEST_Q4_DECODE_PROFILE): dev/benchmarks/q4_decode_profile.mm \
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_CXXFLAGS) -fobjc-arc $< $(ENGINE_LIBRARY) \
 		$(ENGINE_LINKFLAGS) -o $@
 
-$(TEST_Q8_METAL_TEST): dev/tests/engine/q8_paged_kv_metal_test.mm \
-		dev/tests/engine/Q8PageFormatReference.hpp | $(ENGINE_TEST_BUILD)
+$(TEST_Q8_METAL_TEST): dev/tests/engine/q8_paged_kv_metal_test.mm | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< \
 		$(ENGINE_LINKFLAGS) -o $@
 
