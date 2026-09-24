@@ -208,6 +208,18 @@ $(ENGINE_TEST_BUILD):
 $(ENGINE_SANITIZER_BUILD):
 	mkdir -p $@
 
+$(TEST_PREPARED_WEIGHTS): dev/tests/engine/prepared_weights_test.cpp runtime/model/PreparedWeights.cpp | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) -o $@
+
+$(TEST_AFFINE_CHECKPOINT): dev/tests/engine/affine_checkpoint_test.cpp $(ENGINE_LIBRARY) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $< $(ENGINE_LIBRARY) $(ENGINE_LINKFLAGS) -o $@
+
+$(TEST_AFFINE_PREPARATION): dev/tests/engine/affine_preparation_test.mm $(ENGINE_LIBRARY) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< $(ENGINE_LIBRARY) $(ENGINE_LINKFLAGS) -o $@
+
+$(TEST_VISION_PREPARATION): dev/tests/engine/vision_preparation_test.cpp $(ENGINE_LIBRARY) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $< $(ENGINE_LIBRARY) $(ENGINE_LINKFLAGS) -o $@
+
 $(TEST_GGUF_FILE): dev/tests/engine/gguf_file_test.cpp runtime/model/GgufFile.cpp runtime/model/PreparedWeights.cpp \
 		| $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) -o $@
@@ -361,6 +373,9 @@ $(TEST_Q8_PREFILL_TEST): dev/tests/engine/q8_chunked_prefill_metal_test.mm \
 		$(TEST_Q8_ATTENTION_LIB) | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< $(ENGINE_LIBRARY) \
 		$(ENGINE_LINKFLAGS) -o $@
+
+$(TEST_Q4_SGMATRIX_TEST): dev/tests/engine/q4_sgmatrix_metal_test.mm $(ENGINE_LIBRARY) $(LIB) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< $(ENGINE_LIBRARY) $(ENGINE_LINKFLAGS) -o $@
 
 $(TEST_Q4_BATCH_TEST): dev/tests/engine/q4_batched_projection_metal_test.mm \
 		$(ENGINE_LIBRARY) $(LIB) | $(ENGINE_TEST_BUILD)
@@ -604,9 +619,6 @@ test-engine-cpu: $(TEST_CPU_TARGETS) $(TEST_ATTENTION_SWEEP) $(TUNE_KERNELS)
 	$(TEST_STATUS_TEST)
 	$(TEST_Q8_CPU_TEST)
 
-$(TEST_Q4_SGMATRIX_TEST): dev/tests/engine/q4_sgmatrix_metal_test.mm $(ENGINE_LIBRARY) $(LIB) | $(ENGINE_TEST_BUILD)
-	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< $(ENGINE_LIBRARY) $(ENGINE_LINKFLAGS) -o $@
-
 test-engine-metal: $(TEST_METAL_TARGETS)
 	$(METAL_TEST_ENV) $(BUILD_ID_PYTHON) dev/tests/engine/run_affine_preparation.py $(TEST_AFFINE_PREPARATION) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_GGUF_REPACK) $(LIB)
@@ -736,15 +748,3 @@ test-sanitizers: $(TEST_BACKEND_ASAN) $(TEST_BACKEND_TSAN) \
 		UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
 		$(TEST_OPERATOR_MEASUREMENT_ASAN)
 	TSAN_OPTIONS=halt_on_error=1 $(TEST_OPERATOR_MEASUREMENT_TSAN)
-
-$(TEST_PREPARED_WEIGHTS): dev/tests/engine/prepared_weights_test.cpp runtime/model/PreparedWeights.cpp | $(ENGINE_TEST_BUILD)
-	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) -o $@
-
-$(TEST_AFFINE_CHECKPOINT): dev/tests/engine/affine_checkpoint_test.cpp $(ENGINE_LIBRARY) | $(ENGINE_TEST_BUILD)
-	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $< $(ENGINE_LIBRARY) $(ENGINE_LINKFLAGS) -o $@
-
-$(TEST_AFFINE_PREPARATION): dev/tests/engine/affine_preparation_test.mm $(ENGINE_LIBRARY) | $(ENGINE_TEST_BUILD)
-	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< $(ENGINE_LIBRARY) $(ENGINE_LINKFLAGS) -o $@
-
-$(TEST_VISION_PREPARATION): dev/tests/engine/vision_preparation_test.cpp $(ENGINE_LIBRARY) | $(ENGINE_TEST_BUILD)
-	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $< $(ENGINE_LIBRARY) $(ENGINE_LINKFLAGS) -o $@
