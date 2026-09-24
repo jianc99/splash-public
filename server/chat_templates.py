@@ -27,7 +27,7 @@ Tokenizer files and the tokenizer object are never modified.
 import re
 from dataclasses import dataclass
 
-from jinja2 import Environment, TemplateSyntaxError, nodes
+from jinja2 import Environment, TemplateError, TemplateSyntaxError, nodes
 from jinja2.ext import Extension
 from jinja2.lexer import Token
 
@@ -50,6 +50,11 @@ class ChatTemplateError(ValueError):
     """The tokenizer has no chat template Splash can serve."""
 
 
+REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+# What a template that rejects one of these efforts renders instead.
+REASONING_EFFORT_ALIASES = {"high": "xhigh", "max": "xhigh", "minimal": "low"}
+
+
 def template_options(
     *, reasoning_effort, preserve_thinking, tools, add_generation_prompt
 ):
@@ -64,6 +69,20 @@ def template_options(
     if tools:
         options["tools"] = tools
     return options
+
+
+def render_chat_template(tokenizer, messages, options):
+    """Render as requests and the startup probe do: a template that rejects
+    the reasoning effort renders its alias instead."""
+    try:
+        return tokenizer.apply_chat_template(messages, **options)
+    except TemplateError:
+        alias = REASONING_EFFORT_ALIASES.get(options.get("reasoning_effort"))
+        if alias is None:
+            raise
+        return tokenizer.apply_chat_template(
+            messages, **{**options, "reasoning_effort": alias}
+        )
 
 
 def has_later_system(messages):
@@ -142,8 +161,8 @@ _DESCRIPTIONS = {
 
 def _renderer(tokenizer):
     def render(source, messages, options):
-        return tokenizer.apply_chat_template(
-            messages, chat_template=source, tokenize=False, **options
+        return render_chat_template(
+            tokenizer, messages, {**options, "chat_template": source, "tokenize": False}
         )
 
     return render
@@ -225,7 +244,7 @@ _OPTIONS = (
             add_generation_prompt=True,
         )
         for tools in (None, _TOOLS)
-        for effort in (None, "none", "minimal", "low", "medium", "high", "xhigh")
+        for effort in (None, *REASONING_EFFORTS)
         for preserve in (None, True, False)
     ),
     {"add_generation_prompt": False},

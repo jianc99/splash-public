@@ -343,6 +343,34 @@ class ChatTemplateProbeTests(unittest.TestCase):
         chosen = ChatTemplates(upstream).select(None)
         self.assertEqual((chosen.later_system, chosen.source), (UNSUPPORTED, text))
 
+    def test_patch_is_verified_under_every_reasoning_effort(self):
+        # The guard also raises for the leading system message under one
+        # effort, so there the patch would render that message twice.
+        guard = "{%- if not loop.first %}"
+        for effort in chat_templates.REASONING_EFFORTS:
+            if effort == "none":  # reaches the template as enable_thinking only
+                continue
+            text = source("qwen36").replace(
+                guard, f"{{%- if not loop.first or reasoning_effort == '{effort}' %}}"
+            )
+            with self.subTest(effort=effort):
+                chosen = ChatTemplates(tokenizer(text)).select(None)
+                self.assertEqual(
+                    (chosen.later_system, chosen.source), (UNSUPPORTED, text)
+                )
+
+    def test_probe_renders_every_option_as_a_request_does(self):
+        # An effort the template rejects renders its alias, as in a request,
+        # so every option compares rendered conversations.
+        for name in UPSTREAM:
+            render = chat_templates._renderer(tokenizer(source(name)))
+            for options in chat_templates._OPTIONS:
+                for messages in chat_templates._ORDINARY:
+                    with self.subTest(name=name, options=options, messages=messages):
+                        self.assertIsInstance(
+                            render(source(name), messages, options), str
+                        )
+
     def test_named_templates_are_probed_and_selected_like_the_tokenizer(self):
         native = (
             "{%- for message in messages %}{{- message.role + ': ' + message.content"

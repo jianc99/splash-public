@@ -12,8 +12,6 @@ from dataclasses import dataclass
 from itertools import count
 from pathlib import Path
 
-from jinja2 import TemplateError
-
 if __package__:
     from . import images as image_input
     from . import json_codec, judgments
@@ -28,9 +26,11 @@ if __package__:
     from .backend import REQUEST_PRIORITIES, Job, remaining_request_time
     from .chat_templates import (
         LATER_SYSTEM_UNSUPPORTED,
+        REASONING_EFFORTS,
         UNSUPPORTED,
         ChatTemplates,
         has_later_system,
+        render_chat_template,
         template_options,
     )
     from .diagnostics import print_status
@@ -62,9 +62,11 @@ else:
     from backend import REQUEST_PRIORITIES, Job, remaining_request_time
     from chat_templates import (
         LATER_SYSTEM_UNSUPPORTED,
+        REASONING_EFFORTS,
         UNSUPPORTED,
         ChatTemplates,
         has_later_system,
+        render_chat_template,
         template_options,
     )
     from diagnostics import print_status
@@ -84,8 +86,6 @@ else:
 
 
 PREPARATION_WAIT_SECONDS = 30.0
-REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
-REASONING_EFFORT_ALIASES = {"high": "xhigh", "max": "xhigh", "minimal": "low"}
 
 
 MIN_FLOAT32_SUBNORMAL = float.fromhex("0x1p-149")
@@ -757,18 +757,7 @@ class Frontend:
 
     def _apply_chat_template(self, messages, template):
         with self.latencies.measure("template"):
-            return self._render_template(messages, template)
-
-    def _render_template(self, messages, template):
-        try:
-            return self.tokenizer.apply_chat_template(messages, **template)
-        except TemplateError:
-            alias = REASONING_EFFORT_ALIASES.get(template.get("reasoning_effort"))
-            if alias is None:
-                raise
-            return self.tokenizer.apply_chat_template(
-                messages, **{**template, "reasoning_effort": alias}
-            )
+            return render_chat_template(self.tokenizer, messages, template)
 
     def _render_prompt(
         self, prompt, deadline, *, check_context=True, add_generation_prompt=True
