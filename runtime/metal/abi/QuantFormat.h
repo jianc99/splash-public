@@ -10,11 +10,12 @@
 // A meta unit is one native block and holds its scale fields.
 //
 // Its contents are hashed into SPLASH_GGUF_PREPARATION_ID
-// (dev/tools/weight_preparation_identity.py), so any edit prepares every GGUF
-// model again: it holds what defines prepared bytes, plus each format's kernel
-// name token, which the host reads. dev/tests/test_gguf_metadata.py reads the
-// GGUF type of each kQuantFormats row with a regex on the row's leading
-// number. The decode-only value tables are in metal/abi/QuantTables.h.
+// (dev/tools/weight_preparation_identity.py): it holds what defines prepared
+// bytes, plus each format's kernel name token, which the host reads.
+// Editing this file re-prepares every GGUF model.
+// dev/tests/test_gguf_metadata.py reads the GGUF type of each kQuantFormats
+// row with a regex on the row's leading number. The decode-only value tables
+// are in metal/abi/QuantTables.h.
 //
 // Inside a group of 32 the elements are in lane-owned chunk order: chunk c
 // (0..3) holds elements 4c..4c+3 and 16+4c..16+4c+3 as pairs p = 0..3, pair p
@@ -29,7 +30,6 @@
 //   IQ3_S word c: bits 0..7 and 8..15 the low grid index bits of elements
 //     4c..4c+3 and 16+4c..16+4c+3, 16..23 the sign bits of slots 8c..8c+7,
 //     24 and 25 the two ninth index bits, 26..29 the group's scale.
-// Editing this file re-prepares every GGUF model.
 #ifdef __METAL_VERSION__
 #include <metal_stdlib>
 #define QUANT_CONSTANT constant constexpr
