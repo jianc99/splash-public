@@ -1,8 +1,8 @@
 // GGUF weight preparation on the GPU: every format's planes through the
 // production executor against the CPU reference, the bytes the loader
-// prepares from the small dense and MoE targets, their golden hashes, warm
-// loads, the disk check, offsets past 4 GiB, the cache keys, and the target
-// loader's reading of a prepared GGUF.
+// prepares from the small dense and MoE targets, their golden hashes and
+// planned weights, warm loads, offsets past 4 GiB, the cache keys, and the
+// target loader's reading of a prepared GGUF.
 //   gguf-preparation METALLIB GOLDENS
 // GOLDENS is dev/tests/fixtures/weight-goldens/goldens.json; its README says
 // how to update it.
@@ -193,8 +193,8 @@ void checkDense(MetalBackend &backend, const std::filesystem::path &directory, c
   check(keys()[0] != original[0], "a changed tensor byte prepares its image again");
 }
 
-// The MoE layer: the F32 alpha/beta tensor, the golden images, warm loads,
-// the disk check and tensor offsets past 4 GiB.
+// The MoE layer: the F32 alpha/beta tensor, the golden images, warm loads
+// and tensor offsets past 4 GiB.
 void checkMoe(MetalBackend &backend, const std::filesystem::path &directory, const Goldens &hashes) {
   SmallTarget target = smallTarget(true);
   const model::gguf::TargetGeometry &g = target.geometry;

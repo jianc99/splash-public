@@ -787,7 +787,11 @@ int main(int argc, char **argv) {
             "available host memory does not cover the protected macOS reserve");
     const std::filesystem::path modelRoot(argv[2]);
     const auto descriptor = model::inspectModelPackage(modelRoot);
-    // Production's weight preflight, before any model mappings.
+    // Production's weight byte count with a different bound. Production checks
+    // it only against the Metal hard budget, then guards host headroom at every
+    // Metal operation while loading. This oracle has no such guard, so the
+    // prepared weights must fit in reclaimable memory above the macOS reserve
+    // before anything is mapped; it can refuse a package production starts.
     require(model::preparedModelWeightBytes(modelRoot, descriptor) <=
                 *hostAvailableBytes - hostReserveBytes,
             "oracle model loading exceeds available host memory after protecting " +
