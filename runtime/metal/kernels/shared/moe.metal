@@ -399,7 +399,7 @@ kernel void moe_route_select_q8(
 }
 
 // The GGUF router: fp32 scores (kernels/shared/gguf_float.metal) and the F32
-// shared-expert gate.
+// shared-expert scalar gate.
 kernel void moe_route_select_f32(
     device const float *scores [[buffer(0)]],
     device bfloat *input [[buffer(1)]],

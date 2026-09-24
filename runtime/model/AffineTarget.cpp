@@ -138,7 +138,7 @@ Image layerImage(const Layout &layout, uint32_t layer) {
     }
   };
   if constexpr (Layout::ffnKind == QwenFfnKind::SparseMoe) {
-    // The router and the shared-expert gate are 8-bit, their rows padded to
+    // The router and the shared-expert scalar gate are 8-bit, their rows padded to
     // whole 256-row tiles as the reader expects.
     projection(result, {{mlp + "gate", layout.experts}}, layout.experts, layout.hiddenSize, 8);
     ffn(mlp + "switch_mlp.", layout.expertIntermediateSize, layout.experts);

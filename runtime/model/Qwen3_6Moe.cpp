@@ -6,8 +6,8 @@
 namespace splash::model {
 namespace {
 
-// Affine files keep a Q8 router and shared-expert gate and one Q4 slab per
-// expert projection; the shared expert is a one-expert slab.
+// Affine files keep a Q8 router and shared-expert scalar gate and one Q4 slab
+// per expert projection; the shared expert is a one-expert slab.
 void readFfn(WeightFile &file, Qwen3_6MoeLayerWeights &layer, const Qwen3_6MoeLayout &layout,
              const AffineTargetFormat &) {
   const uint32_t hidden = layout.hiddenSize, width = layout.expertIntermediateSize;
@@ -25,7 +25,7 @@ void readFfn(WeightFile &file, Qwen3_6MoeLayerWeights &layer, const Qwen3_6MoeLa
 }
 
 // GGUF images keep the tensors as the GGUF stores them, the router and the
-// shared-expert gate in F32.
+// shared-expert scalar gate in F32.
 void readFfn(WeightFile &file, Qwen3_6MoeLayerWeights &layer, const Qwen3_6MoeLayout &,
              const BlockTargetFormat &) {
   ops::BlockMoeWeights ffn;

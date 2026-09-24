@@ -121,7 +121,7 @@ public:
   }
 
   // An F32 tensor [rows, columns] as stored (the MoE router and the
-  // shared-expert gate, which llama.cpp keeps unquantized).
+  // shared-expert scalar gate, which llama.cpp keeps unquantized).
   void floatTensor(const std::string &name, uint64_t rows, uint64_t columns) {
     const GgufTensor *tensor = find(name, floatType);
     if (!tensor) return;

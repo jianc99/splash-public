@@ -208,7 +208,7 @@ inline void randomize(std::vector<Tensor> &tensors, uint32_t seed) {
 // The targets the golden images were recorded from, seeds included. dense: a
 // GDN layer and a full-attention layer, all eight formats, Q8_0 alpha/beta
 // and permuted value-head rows, seeds 901-928. moe: one qwen35moe layer with
-// F32 alpha/beta, router and shared-expert gate and 3-D expert tensors, its
+// F32 alpha/beta, router and shared-expert scalar gate and 3-D expert tensors, its
 // seeds after dense's and output_norm first in its file.
 inline SmallTarget smallTarget(bool moe) {
   using namespace model::ggml;

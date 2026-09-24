@@ -106,7 +106,7 @@ def fixture(root, moe=False):
             sections.append(packed([a + "o_proj"], 256, 256))
         sections.append(add(p + "post_attention_layernorm.weight", [256]))
         if moe:
-            # The 8-bit router and shared-expert gate; the gate's one row is
+            # The 8-bit router and shared-expert scalar gate; the gate's one row is
             # padded to a 256-row tile.
             projection(p + "mlp.gate", 256, 256, bits=8)
             sections.append(packed([p + "mlp.gate"], 256, 256, bits=8))

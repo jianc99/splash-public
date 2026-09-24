@@ -30,7 +30,7 @@ struct AffineWeights final {
 };
 
 // A Q8 affine projection, quantized per 64 inputs in StorageN=256 order: the
-// MoE router and shared-expert gate.
+// MoE router and the shared expert's scalar gate.
 struct Q8Projection final {
   AffineWeights planes;
   uint32_t outputSize = 0;
