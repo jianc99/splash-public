@@ -18,6 +18,7 @@
 #include <filesystem>
 #include <functional>
 #include <initializer_list>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -27,7 +28,9 @@
 namespace splash::model {
 
 struct Qwen3_8Weights;
+struct Qwen3_8LayerWeights;
 struct Qwen3_6MoeWeights;
+struct Qwen3_6MoeLayerWeights;
 
 enum class QwenFfnKind : uint8_t { Dense, SparseMoe };
 
@@ -268,6 +271,13 @@ struct QwenTargetGeometry final {
   captureLayers() const noexcept {
     return {captureLayerValues.data(), captureLayerCount};
   }
+  // The capture slot of `layer`, whose output the draft reads.
+  [[nodiscard]] constexpr std::optional<uint32_t> captureSlot(uint32_t layer) const noexcept {
+    const auto layers = captureLayers();
+    const auto found = std::find(layers.begin(), layers.end(), layer);
+    if (found == layers.end()) return std::nullopt;
+    return static_cast<uint32_t>(found - layers.begin());
+  }
   [[nodiscard]] constexpr ops::GdnShape gdnShape() const noexcept {
     return {gdnKeyHeads, gdnValueHeads, gdnHeadDimension,
             convolutionDimension, packedGdnWidth};
@@ -443,7 +453,7 @@ public:
       ops::LinearDispatchStats &stats) const;
   void addHead(metal::CommandGraph &graph, metal::MetalBuffer hidden,
                metal::MetalBuffer finalHidden, metal::MetalBuffer logits,
-               uint32_t normalizedRows, ops::LinearScratch scratch = {}) const;
+               uint32_t normalizedRows, ops::LinearScratch scratch) const;
   void addEmbedding(metal::CommandGraph &graph, metal::MetalBuffer tokens,
                     metal::MetalBuffer hidden, uint32_t rows) const;
   void addStateCommit(metal::CommandGraph &graph,
@@ -452,21 +462,30 @@ public:
 private:
   using WeightView =
       std::variant<const Qwen3_8Weights *, const Qwen3_6MoeWeights *>;
+  struct PrefillStep;
+  struct VerifyStep;
 
-  template <class Weights>
-  void addPrefillImpl(
-      const Weights &weights, metal::CommandGraph &graph,
-      QwenTargetPrefillBuffers buffers,
-      std::span<const QwenTargetPrefillSequence> sequences, uint32_t rows,
-      std::span<const kv::LayerStorage> kvLayers) const;
-  template <class Weights>
-  void addVerifyImpl(
-      const Weights &weights, metal::CommandGraph &graph,
-      QwenTargetVerifyBuffers buffers,
-      std::span<const kv::LayerStorage> kvLayers,
-      std::span<const kv::Q8ChunkedPrefillParams> q8,
-      std::span<const kv::Q8VerifyAttentionParams> verify, uint32_t lanes,
-      ops::LinearDispatchStats &stats) const;
+  // A layer's parts in dispatch order: the mixer normalizes its input and
+  // returns the residual rows the FFN normalizes and adds to into `output`.
+  void addPrefillNorm(PrefillStep &step, metal::MetalBuffer input, const ops::NormWeights &norm) const;
+  void addPrefillOutput(PrefillStep &step, metal::MetalBuffer hidden, const ops::Projection &projection,
+                        metal::MetalBuffer input, metal::MetalBuffer output) const;
+  metal::MetalBuffer addPrefillMixer(PrefillStep &step, const QwenGdnWeights &mixer, const ops::NormWeights &norm,
+                                     metal::MetalBuffer input) const;
+  metal::MetalBuffer addPrefillMixer(PrefillStep &step, const QwenAttentionWeights &mixer,
+                                     const ops::NormWeights &norm, metal::MetalBuffer input) const;
+  void addPrefillFfn(PrefillStep &step, const Qwen3_8LayerWeights &layer, metal::MetalBuffer residual,
+                     metal::MetalBuffer output) const;
+  void addPrefillFfn(PrefillStep &step, const Qwen3_6MoeLayerWeights &layer, metal::MetalBuffer residual,
+                     metal::MetalBuffer output) const;
+  metal::MetalBuffer addVerifyMixer(VerifyStep &step, const QwenGdnWeights &mixer, const ops::NormWeights &norm,
+                                    metal::MetalBuffer input) const;
+  metal::MetalBuffer addVerifyMixer(VerifyStep &step, const QwenAttentionWeights &mixer,
+                                    const ops::NormWeights &norm, metal::MetalBuffer input) const;
+  void addVerifyFfn(VerifyStep &step, const Qwen3_8LayerWeights &layer, metal::MetalBuffer residual,
+                    metal::MetalBuffer output) const;
+  void addVerifyFfn(VerifyStep &step, const Qwen3_6MoeLayerWeights &layer, metal::MetalBuffer residual,
+                    metal::MetalBuffer output) const;
 
   WeightView weights_;
   QwenTargetGeometry geometry_;
