@@ -72,13 +72,6 @@ public:
   MoeWeights() = default;
   MoeWeights(AffineMoeWeights weights) : storage_(std::move(weights)) {}
   MoeWeights(BlockMoeWeights weights) : storage_(std::move(weights)) {}
-  MoeWeights(Q8Projection router, ExpertProjection gate, ExpertProjection up,
-             ExpertProjection down, ExpertProjection sharedGate,
-             ExpertProjection sharedUp, ExpertProjection sharedDown,
-             Q8Projection sharedExpertGate)
-      : storage_(AffineMoeWeights{std::move(router), std::move(gate), std::move(up),
-          std::move(down), std::move(sharedGate), std::move(sharedUp),
-          std::move(sharedDown), std::move(sharedExpertGate)}) {}
   [[nodiscard]] WeightLayout layout() const noexcept {
     return std::holds_alternative<AffineMoeWeights>(storage_)
         ? WeightLayout::Affine64 : WeightLayout::Block32;

@@ -67,7 +67,7 @@ template <class Weights, class Layout> Weights targetWeights(Layout layout) {
       auto sharedUp = up;
       auto sharedDown = down;
       sharedUp.experts = sharedDown.experts = 1;
-      layer.ffn = {router, up, up, down, sharedUp, sharedUp, sharedDown, router};
+      layer.ffn = AffineMoeWeights{router, up, up, down, sharedUp, sharedUp, sharedDown, router};
     }
   }
   return target;
@@ -403,9 +403,9 @@ void metadataViews(const char *metallib) {
           down ? layout.hiddenSize : layout.expertIntermediateSize,
           down ? layout.expertIntermediateSize : layout.hiddenSize, 16'384};
     };
-    return MoeWeights{router, expert(6, layout.experts, false),
+    return MoeWeights(AffineMoeWeights{router, expert(6, layout.experts, false),
         expert(7, layout.experts, false), expert(8, layout.experts, true),
-        expert(9, 1, false), expert(10, 1, false), expert(11, 1, true), sharedRouter};
+        expert(9, 1, false), expert(10, 1, false), expert(11, 1, true), sharedRouter});
   };
   enum class MoeVariation { Distinct, RouterOnly, SharedOnly, StrideOnly, Tied };
   for (const auto variation : {MoeVariation::Distinct, MoeVariation::RouterOnly,

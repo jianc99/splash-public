@@ -265,7 +265,7 @@ void nativeMeasurement(const char *library) {
   input.weights.clear();
   for (uint32_t representative = 0; representative < 3; ++representative) {
     const uint32_t salt = representative * 101;
-    input.weights.push_back({router(backend, false, representative),
+    input.weights.push_back(AffineMoeWeights{router(backend, false, representative),
         experts(backend, 4, salt), experts(backend, 4, salt + 1),
         experts(backend, 4, salt + 2), experts(backend, 1, salt + 3),
         experts(backend, 1, salt + 4), experts(backend, 1, salt + 5),
