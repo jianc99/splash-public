@@ -55,7 +55,9 @@ Timed-out uploads return 408 and release their input reservation.
 
 Source `install/completions/splash.bash` for Bash or
 `install/completions/_splash` for Zsh after `compinit`. Completion suggests
-commands, bundled official model IDs and installed models without network access.
+commands, the official model IDs (bundled, and as `splash serve` last refreshed
+them) and installed models, a GGUF's `OWNER/REPO:VARIANT` included, without
+network access.
 
 ## Server configuration
 
@@ -224,9 +226,9 @@ fallback; GGUF sidecar tokenizer/config files do not override embedded metadata.
 Model geometry is translated from the same metadata, subtracting any declared
 MTP layers from the layer count. Only the header is read before the download.
 The tokenizer and configuration are derived from the downloaded file once and
-cached under `models/.metadata`, keyed by the source files' content, `gguf.py`
-and the `tokenizers` version; publication is atomic and entries are hash-checked
-on use.
+cached under `models/.metadata`, keyed by the size and digest of each source
+GGUF, the SHA-256 of `gguf.py` and the `tokenizers` version; publication is
+atomic and entries are hash-checked on use.
 
 Request preparation merges the leading system and developer messages into one
 system message, joined by a blank line: Responses instructions and developer
