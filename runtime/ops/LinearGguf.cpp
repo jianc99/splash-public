@@ -149,7 +149,7 @@ void Linear::addGguf(metal::CommandGraph &graph, const LinearBuffers &b,
   const auto [n, k] = w.matrix;
   requireSegments(p, w.matrix);
   if (w.epilogue == LinearEpilogue::GateUp) {
-    if (!gate || gate->layout() != WeightLayout::Block32 || gate->segments().empty()) throw std::invalid_argument("GGUF gate projection is missing");
+    if (!gate || gate->layout() != WeightLayout::Block32) throw std::invalid_argument("GGUF gate projection is missing");
     requireSegments(*gate, w.matrix);
   } else if (gate) {
     throw std::invalid_argument("unexpected GGUF gate projection");

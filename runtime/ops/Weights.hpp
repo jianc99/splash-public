@@ -4,6 +4,7 @@
 
 #include <compare>
 #include <cstdint>
+#include <stdexcept>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -61,8 +62,11 @@ public:
              metal::MetalBuffer biases, uint32_t output, uint32_t input)
       : outputSize(output), inputSize(input),
         storage_(AffineWeights{std::move(weights), std::move(scales), std::move(biases)}) {}
+  // Every block projection holds at least one segment.
   Projection(uint32_t output, uint32_t input, BlockWeights weights)
-      : outputSize(output), inputSize(input), storage_(std::move(weights)) {}
+      : outputSize(output), inputSize(input), storage_(std::move(weights)) {
+    if (segments().empty()) throw std::invalid_argument("block projection has no segments");
+  }
 
   [[nodiscard]] WeightLayout layout() const noexcept {
     return std::holds_alternative<AffineWeights>(storage_) ? WeightLayout::Affine64

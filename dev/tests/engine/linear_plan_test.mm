@@ -773,6 +773,9 @@ void ggufPlans() {
     }
     return Projection(n, k, std::move(weights));
   };
+  // A block projection without segments would reach the dispatch paths with
+  // nothing to index or encode.
+  rejects([] { (void)Projection(5120, 17408, BlockWeights{}); });
   const LinearWorkload down{{5120, 17408}, 8, LinearPhase::Decode, LinearEpilogue::Residual};
   const LinearPlan single = linear.plan(down, projection(5120, 17408, 1));
   require(single.workload().weightLayout == WeightLayout::Block32 &&
