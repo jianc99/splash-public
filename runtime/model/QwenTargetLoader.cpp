@@ -27,10 +27,8 @@ QwenMixerWeights readQwenMixer(WeightFile &file, const Format &format,
     attention.inputProjection =
         format.fused(file, geometry.packedFullWidth, geometry.hiddenSize, "attention-input",
                      {"attn-q", "attn-k", "attn-v"});
-    attention.queryNorm =
-        readNorm(file, geometry.attentionHeadDimension, Format::float32Norms, "query-norm");
-    attention.keyNorm =
-        readNorm(file, geometry.attentionHeadDimension, Format::float32Norms, "key-norm");
+    attention.queryNorm = format.norm(file, geometry.attentionHeadDimension, "query-norm");
+    attention.keyNorm = format.norm(file, geometry.attentionHeadDimension, "key-norm");
     attention.outputProjection =
         format.projection(file, geometry.hiddenSize, geometry.attentionWidth, "attention-output");
     return attention;
@@ -52,7 +50,7 @@ QwenMixerWeights readQwenMixer(WeightFile &file, const Format &format,
       checkedWeightMultiply(geometry.gdnValueHeads, kBFloat16Bytes,
                             "GDN time bias bytes"),
       "gdn-time-bias");
-  gdn.mixerNorm = readNorm(file, geometry.gdnHeadDimension, Format::float32Norms, "gdn-norm");
+  gdn.mixerNorm = format.norm(file, geometry.gdnHeadDimension, "gdn-norm");
   gdn.outputProjection =
       format.projection(file, geometry.hiddenSize, geometry.attentionWidth, "gdn-output");
   gdn.outputHeadOrder = Format::gdnOutputOrder;

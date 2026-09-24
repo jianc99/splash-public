@@ -25,9 +25,11 @@ namespace splash::model {
 // files with their format. Affine files, packed or prepared from MLX, hold
 // every projection, a fused one too, as one affine Q4 tensor, and bf16 norms.
 struct AffineTargetFormat final {
-  static constexpr bool float32Norms = false;
   static constexpr ops::GdnHeadOrder gdnOutputOrder = ops::GdnHeadOrder::Grouped;
 
+  [[nodiscard]] ops::NormWeights norm(WeightFile &file, uint32_t width, std::string_view label) const {
+    return readNorm(file, width, false, label);
+  }
   [[nodiscard]] ops::Projection projection(WeightFile &file, uint32_t outputSize,
                                            uint32_t inputSize, std::string_view label) const {
     return readAffineProjection(file, outputSize, inputSize, label);
@@ -49,9 +51,11 @@ struct AffineTargetFormat final {
 // F32 norms. The GGUF keeps the GDN output projection's input columns in
 // llama.cpp's tiled value-head order, so the GDN writes its output in it.
 struct BlockTargetFormat final {
-  static constexpr bool float32Norms = true;
   static constexpr ops::GdnHeadOrder gdnOutputOrder = ops::GdnHeadOrder::Tiled;
 
+  [[nodiscard]] ops::NormWeights norm(WeightFile &file, uint32_t width, std::string_view label) const {
+    return readNorm(file, width, true, label);
+  }
   [[nodiscard]] ops::Projection projection(WeightFile &file, uint32_t outputSize,
                                            uint32_t inputSize, std::string_view label) const {
     return readBlockProjection(file, outputSize, inputSize, label);
@@ -111,10 +115,9 @@ readQwenTargetWeights(metal::MetalBackend &backend, const Layout &layout, Files 
     const bool fullAttention = layout.isFullAttentionLayer(layerIndex);
     WeightFile file = files.layer(layerIndex);
     auto &layer = result.layers.emplace_back();
-    layer.inputNorm = readNorm(file, layout.hiddenSize, Format::float32Norms, "input-norm");
+    layer.inputNorm = format.norm(file, layout.hiddenSize, "input-norm");
     layer.mixer = readQwenMixer(file, format, layout.mixerGeometry(), fullAttention);
-    layer.postAttentionNorm =
-        readNorm(file, layout.hiddenSize, Format::float32Norms, "post-attention-norm");
+    layer.postAttentionNorm = format.norm(file, layout.hiddenSize, "post-attention-norm");
     readFfn(file, layer, format);
     file.finish();
     result.files.push_back(file.record());
@@ -122,7 +125,7 @@ readQwenTargetWeights(metal::MetalBackend &backend, const Layout &layout, Files 
 
   {
     WeightFile file = files.head();
-    result.finalNorm = readNorm(file, layout.hiddenSize, Format::float32Norms, "final-norm");
+    result.finalNorm = format.norm(file, layout.hiddenSize, "final-norm");
     result.logitsProjection =
         format.projection(file, layout.vocabularySize, layout.hiddenSize, "logits");
     file.finish();
@@ -180,20 +183,20 @@ template <class Layout> void validateQwenLayout(const Layout &layout) {
 }
 
 // Validates the layout and loads a target from its files. The architecture
-// reads its FFN from affine files through readAffineFfn and from GGUF images
-// through readBlockFfn, each called with the file, the layer and the format.
-template <class Weights, class Layout, class ReadAffineFfn, class ReadBlockFfn>
+// reads its FFN through readFfn, called with the file, the layer and the
+// format.
+template <class Weights, class Layout, class ReadFfn>
 [[nodiscard]] Weights
 loadQwenTarget(metal::MetalBackend &backend, const Layout &layout, const QwenTargetFiles<Layout> &files,
-               ReadAffineFfn readAffineFfn, ReadBlockFfn readBlockFfn) {
+               ReadFfn readFfn) {
   validateQwenLayout(layout);
   if (const auto *gguf = std::get_if<std::reference_wrapper<GgufTargetLoader>>(&files))
-    return readQwenTargetWeights<Weights>(backend, layout, gguf->get(), BlockTargetFormat{}, readBlockFfn);
+    return readQwenTargetWeights<Weights>(backend, layout, gguf->get(), BlockTargetFormat{}, readFfn);
   const AffineTargetFormat affine{};
   if (const auto *mlx = std::get_if<std::reference_wrapper<AffineTargetLoader>>(&files))
-    return readQwenTargetWeights<Weights>(backend, layout, mlx->get(), affine, readAffineFfn);
+    return readQwenTargetWeights<Weights>(backend, layout, mlx->get(), affine, readFfn);
   return readQwenTargetWeights<Weights>(backend, layout, std::get<PackedTargetFiles<Layout>>(files), affine,
-                                        readAffineFfn);
+                                        readFfn);
 }
 
 } // namespace splash::model
