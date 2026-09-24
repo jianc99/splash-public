@@ -45,7 +45,7 @@ void requireLayout(const Qwen3_6MoeLayout &layout) {
 Qwen3_6MoeWeights
 loadQwen3_6MoeWeights(metal::MetalBackend &backend,
                       const std::filesystem::path &directory,
-                      Qwen3_6MoeLayout layout, TargetSource source, PreparationCheck prepareCheck,
+                      Qwen3_6MoeLayout layout, TargetSource source, PreparationCheck admitConversion,
                       std::span<const PreparedWeight> alsoPrepared) {
   requireLayout(layout);
   // Affine files keep a Q8 router and shared-expert gate and one Q4 slab per
@@ -81,7 +81,7 @@ loadQwen3_6MoeWeights(metal::MetalBackend &backend,
     layer.ffn = std::move(ffn);
   };
   return loadQwenTarget<Qwen3_6MoeWeights>(backend, directory, layout, source,
-                                           std::move(prepareCheck), alsoPrepared, readAffineFfn,
+                                           std::move(admitConversion), alsoPrepared, readAffineFfn,
                                            readBlockFfn);
 }
 

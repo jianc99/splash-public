@@ -48,9 +48,9 @@ template <class Layout>
 void prepare(metal::MetalBackend &backend, const std::filesystem::path &root, const Layout &layout, bool oracle) {
   const std::filesystem::path cache(std::getenv("SPLASH_WEIGHT_CACHE"));
   bool cold = true;
-  const auto admission = [&] { if (!cold) throw std::runtime_error("conversion forbidden on warm load"); };
+  const auto admitConversion = [&] { if (!cold) throw std::runtime_error("conversion forbidden on warm load"); };
   for (unsigned pass = 0; pass < 2; ++pass) {
-    model::AffineTargetLoader loader(backend, root, layout, admission);
+    model::AffineTargetLoader loader(backend, root, layout, admitConversion);
     const auto check = [&](model::WeightFile weights) {
       const auto &record = weights.record();
       const auto prepared = fileBytes(cache / record.contentIdentity / "weights");

@@ -197,7 +197,7 @@ readQwenTargetWeights(metal::MetalBackend &backend, const Layout &layout, Files 
 template <class Weights, class Layout, class ReadAffineFfn, class ReadBlockFfn>
 [[nodiscard]] Weights
 loadQwenTarget(metal::MetalBackend &backend, const std::filesystem::path &directory,
-               const Layout &layout, TargetSource source, PreparationCheck admission,
+               const Layout &layout, TargetSource source, PreparationCheck admitConversion,
                std::span<const PreparedWeight> alsoPrepared, ReadAffineFfn readAffineFfn,
                ReadBlockFfn readBlockFfn) {
   const AffineTargetFormat affine{backend};
@@ -206,12 +206,12 @@ loadQwenTarget(metal::MetalBackend &backend, const std::filesystem::path &direct
     return readQwenTargetWeights<Weights>(backend, layout, PackedTargetFiles<Layout>{backend, directory, layout},
                                           affine, readAffineFfn);
   case TargetSource::Affine: {
-    AffineTargetLoader loader(backend, directory, layout, std::move(admission), alsoPrepared);
+    AffineTargetLoader loader(backend, directory, layout, std::move(admitConversion), alsoPrepared);
     return readQwenTargetWeights<Weights>(backend, layout, loader, affine, readAffineFfn);
   }
   case TargetSource::Gguf: {
     GgufTargetLoader loader(backend, findTargetGguf(directory), ggufTargetGeometry(layout),
-                            std::move(admission), alsoPrepared);
+                            std::move(admitConversion), alsoPrepared);
     return readQwenTargetWeights<Weights>(backend, layout, loader, BlockTargetFormat{}, readBlockFfn);
   }
   }

@@ -33,7 +33,7 @@ void validateLayout(const Qwen3_8Layout &layout) {
 
 Qwen3_8Weights loadQwen3_8Weights(metal::MetalBackend &backend,
                                   const std::filesystem::path &directory,
-                                  Qwen3_8Layout layout, TargetSource source, PreparationCheck prepareCheck,
+                                  Qwen3_8Layout layout, TargetSource source, PreparationCheck admitConversion,
                                   std::span<const PreparedWeight> alsoPrepared) {
   validateLayout(layout);
   // The dense FFN reads the same projections from either format.
@@ -45,7 +45,7 @@ Qwen3_8Weights loadQwen3_8Weights(metal::MetalBackend &backend,
     layer.downProjection =
         format.projection(file, layout.hiddenSize, layout.intermediateSize, "mlp-down");
   };
-  return loadQwenTarget<Qwen3_8Weights>(backend, directory, layout, source, std::move(prepareCheck),
+  return loadQwenTarget<Qwen3_8Weights>(backend, directory, layout, source, std::move(admitConversion),
                                         alsoPrepared, readFfn, readFfn);
 }
 

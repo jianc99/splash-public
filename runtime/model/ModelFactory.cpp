@@ -29,7 +29,7 @@ namespace {
 
 ModelPackage loadPackage(metal::MetalBackend &backend,
                          const std::filesystem::path &root,
-                         ModelDescriptor descriptor, PreparationCheck prepareCheck = {}) {
+                         ModelDescriptor descriptor, PreparationCheck admitConversion = {}) {
   ModelPackage result;
   result.descriptor = std::move(descriptor);
   if (!result.descriptor.valid())
@@ -41,7 +41,7 @@ ModelPackage loadPackage(metal::MetalBackend &backend,
   if (result.descriptor.visionSource == VisionSource::Safetensors ||
       result.descriptor.visionSource == VisionSource::Gguf) {
     vision.emplace(root / "vision", result.descriptor.visionSource,
-                   result.descriptor.vision, [&backend] { backend.checkOperation(); }, prepareCheck);
+                   result.descriptor.vision, [&backend] { backend.checkOperation(); }, admitConversion);
     prepared.push_back(vision->weight());
   }
   result.target = std::visit(
@@ -49,10 +49,10 @@ ModelPackage loadPackage(metal::MetalBackend &backend,
         if constexpr (std::is_same_v<std::remove_cvref_t<decltype(layout)>,
                                      Qwen3_8Layout>)
           return loadQwen3_8Weights(backend, root / "target", layout,
-                                    result.descriptor.targetSource, prepareCheck, prepared);
+                                    result.descriptor.targetSource, admitConversion, prepared);
         else
           return loadQwen3_6MoeWeights(backend, root / "target", layout,
-                                       result.descriptor.targetSource, prepareCheck, prepared);
+                                       result.descriptor.targetSource, admitConversion, prepared);
       },
       result.descriptor.target);
   result.draft = loadDFlashDraftWeights(
@@ -82,8 +82,8 @@ ModelPackage loadModelPackage(metal::MetalBackend &backend,
 
 ModelPackage loadModelPackage(metal::MetalBackend &backend,
                               const std::filesystem::path &root,
-                              const ModelDescriptor &descriptor, PreparationCheck prepareCheck) {
-  return loadPackage(backend, root, descriptor, std::move(prepareCheck));
+                              const ModelDescriptor &descriptor, PreparationCheck admitConversion) {
+  return loadPackage(backend, root, descriptor, std::move(admitConversion));
 }
 
 uint64_t preparedModelWeightBytes(const std::filesystem::path &root, const ModelDescriptor &descriptor) {

@@ -86,7 +86,7 @@ loadModelPackage(metal::MetalBackend &backend,
 [[nodiscard]] ModelPackage
 loadModelPackage(metal::MetalBackend &backend,
                  const std::filesystem::path &root,
-                 const ModelDescriptor &descriptor, PreparationCheck prepareCheck = {});
+                 const ModelDescriptor &descriptor, PreparationCheck admitConversion = {});
 
 [[nodiscard]] ModelMemoryPlan
 plannedRuntimeMemory(const DeviceCapabilities &device,
