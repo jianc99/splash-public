@@ -106,6 +106,70 @@ class ArchitectureTests(unittest.TestCase):
                             )
                     source.unlink()
 
+    def test_only_engine_assembly_depends_on_concrete_models(self):
+        headers = (
+            "model/DFlashDraft.hpp",
+            "model/ModelFactory.hpp",
+            "model/Qwen3_6Moe.hpp",
+            "model/Qwen3_8.hpp",
+            "model/QwenHybridLayout.hpp",
+            "model/QwenState.hpp",
+            "model/QwenTarget.hpp",
+            "model/QwenTargetFiles.hpp",
+            "model/QwenTargetLoader.hpp",
+            "model/Runtime.hpp",
+            "model/WeightStore.hpp",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "runtime/engine").mkdir(parents=True)
+            for assembly in (
+                "Bootstrap.hpp",
+                "Bootstrap.mm",
+                "RuntimeResources.hpp",
+                "RuntimeResources.mm",
+            ):
+                (root / "runtime/engine" / assembly).write_text(
+                    "".join(f'#include "{header}"\n' for header in headers)
+                )
+            policy = root / "runtime/engine/Scheduler.cpp"
+            startup = root / "runtime/main.mm"
+            generic = (
+                '#include "model/Model.hpp"\n#include "model/ModelDescriptor.hpp"\n'
+            )
+            policy.write_text(generic)
+            startup.write_text(generic + "model::ModelDescriptor model;\n")
+            with mock.patch.object(check_architecture, "ROOT", root):
+                self.assertEqual(check_architecture.check(), [])
+                for header in headers:
+                    with self.subTest(source="engine policy", header=header):
+                        policy.write_text(f'#include "{header}"\n')
+                        self.assertEqual(
+                            check_architecture.check(),
+                            [
+                                "runtime/engine/Scheduler.cpp: engine policy "
+                                f"depends on concrete model {header}"
+                            ],
+                        )
+                policy.write_text(generic)
+                for header in headers:
+                    with self.subTest(source="startup", header=header):
+                        startup.write_text(f'#include "{header}"\n')
+                        self.assertEqual(
+                            check_architecture.check(),
+                            [
+                                "runtime/main.mm: startup depends on concrete "
+                                f"model {header}"
+                            ],
+                        )
+                for name in ("QwenTarget", "DFlashDraft", "Runtime"):
+                    with self.subTest(source="startup", symbol=name):
+                        startup.write_text(f"auto instance = model::{name}{{}};\n")
+                        self.assertEqual(
+                            check_architecture.check(),
+                            ["runtime/main.mm: startup names a concrete model type"],
+                        )
+
     def test_production_cannot_include_offline_tuning(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
