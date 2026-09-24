@@ -1,8 +1,10 @@
 #pragma once
 
-// The out-projection input tables a producer can write for its consumer,
-// prepared by the consumer's own kernel: the reference the Metal tests hold
-// the producers that write the table themselves to, byte for byte.
+// The input table a producer can write for the projection that consumes it
+// (the norm's for the input, gate/up and logits projections; the attention
+// gate's and the GDN decode's for the out-projection), prepared by the
+// consumer's own kernel: the reference the Metal tests hold the producers that
+// write the table themselves to, byte for byte.
 
 #include "metal/CommandGraph.hpp"
 #include "ops/Linear.hpp"
@@ -14,7 +16,8 @@ namespace splash::test {
 
 // Prepares `lanes` verify blocks of the plain bf16 rows in `input`, `width`
 // wide, as the `layout` table and sums, with the dispatch the projections
-// issue when no producer wrote the table.
+// issue when no producer wrote the table (the simdgroup branch of Linear::add
+// in ops/Linear.cpp and Linear::addGgufRegister in ops/LinearGguf.cpp).
 inline void addReferencePreparation(metal::CommandGraph &graph, ops::LinearInput layout,
                                     const metal::MetalBuffer &input,
                                     const metal::MetalBuffer &table,
