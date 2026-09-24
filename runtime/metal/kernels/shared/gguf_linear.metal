@@ -457,6 +457,3 @@ kernel void gguf_embed_q80(device const uint *tokens [[buffer(0)]], device const
   const half d = as_type<half>(ushort(blk[0] | (blk[1] << 8)));
   output[index] = bfloat(float(d) * float(as_type<char>(blk[2 + dim % 32])));
 }
-
-// dependency kernel for serialized profiling: touching the output forces the next dispatch to wait
-kernel void gguf_touch(device bfloat *y [[buffer(0)]], uint tid [[thread_position_in_grid]]) { if (tid == 0) y[0] = bfloat(float(y[0]) + 0.0f); }

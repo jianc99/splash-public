@@ -416,13 +416,13 @@ int main(int argc,char **argv) {
           for (uint32_t fixture=0;fixture<4;++fixture)
             for (uint32_t rows : {8U,16U,24U,32U}) { runCase(backend,n,k,splits,e,fixture,rows); ++cases; }
       }
-    for (bool float32 : {false, true}) {
-      for (LinearInput layout : {LinearInput::Table64, LinearInput::Table16})
-        for (uint32_t width : {64U, 320U, 1984U, 2048U, 2112U, 5120U, 17408U})
-          for (uint32_t rows : {8U,16U,24U,32U}) fusedNorm(backend, width, rows, layout, float32);
+    // Table64 feeds the affine models, whose norms are bf16; Table16 a GGUF's, whose norms are F32.
+    for (LinearInput layout : {LinearInput::Table64, LinearInput::Table16})
+      for (uint32_t width : {64U, 320U, 1984U, 2048U, 2112U, 5120U, 17408U})
+        for (uint32_t rows : {8U,16U,24U,32U}) fusedNorm(backend, width, rows, layout, layout == LinearInput::Table16);
+    for (bool float32 : {false, true})
       for (uint32_t width : {64U, 2048U, 5120U, 17408U})
         for (uint32_t rows : {1U,37U,64U}) prefillNorm(backend, width, rows, float32);
-    }
     // 27B out_proj then down, and gdn_in then gate/up: K 6144, 17408 and 5120.
     for (uint32_t lanes : {1U, 4U}) {
       splitVisibility(backend, {{{{5120, 6144}, LinearEpilogue::Residual}, {{5120, 17408}, LinearEpilogue::Residual}}}, lanes);

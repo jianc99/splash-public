@@ -184,8 +184,7 @@ inline void norm_rms_table(device const bfloat *input, device const W *weight,
     threadgroup float reductions[8]; \
     norm_rms_table<Table>(input, weight, output, table, sums, width, row, tid, lane, sg, reductions); \
   }
+// Table64 feeds the affine models, whose norms are bf16; Table16 a GGUF's, whose norms are F32.
 NORM_RMS_TABLE(norm_rms_q4_decode, q4sg::Table64, bfloat)
-NORM_RMS_TABLE(norm_rms_q16_decode, q16sg::Table16, bfloat)
-NORM_RMS_TABLE(norm_rms_q4_decode_f32, q4sg::Table64, float)
 NORM_RMS_TABLE(norm_rms_q16_decode_f32, q16sg::Table16, float)
 #undef NORM_RMS_TABLE

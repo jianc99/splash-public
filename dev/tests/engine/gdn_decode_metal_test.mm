@@ -628,8 +628,9 @@ void fusedPreparation(MetalBackend &backend, const GdnShape &shape, uint32_t lan
 // output, and the Q4 table prepared from it in the same dispatch, are the
 // grouped output with head h at (h % heads per key) * key heads + h / heads
 // per key, byte for byte.
-void tiledHeadOrder(MetalBackend &backend, const GdnShape &shape, uint32_t lanes, LinearInput layout) {
-  Fixture fixture(backend, shape, lanes);
+void tiledHeadOrder(MetalBackend &backend, const GdnShape &shape, uint32_t lanes, LinearInput layout,
+                    bool float32) {
+  Fixture fixture(backend, shape, lanes, float32);
   const uint32_t width = shape.valueHeads * shape.headDimension;
   const uint32_t headsPerKey = shape.valueHeads / shape.keyHeads;
   const uint64_t headBytes = uint64_t{shape.headDimension} * 2;
@@ -720,12 +721,12 @@ int main(int argc, char **argv) {
       throw std::invalid_argument("usage: gdn-decode METALLIB");
     MetalBackend backend(argv[1]);
     rejectsInvalid(backend);
+    // Table64 feeds the affine models, whose norms are bf16; Table16 a GGUF's, whose norms are F32.
     for (LinearInput layout : {LinearInput::Table64, LinearInput::Table16})
       for (const GdnShape &shape : kShapes)
         for (uint32_t lanes = 1; lanes <= kMaxLanes; ++lanes) {
-          for (bool float32 : {false, true})
-            fusedPreparation(backend, shape, lanes, layout, float32);
-          tiledHeadOrder(backend, shape, lanes, layout);
+          fusedPreparation(backend, shape, lanes, layout, layout == LinearInput::Table16);
+          tiledHeadOrder(backend, shape, lanes, layout, layout == LinearInput::Table16);
         }
     for (bool float32 : {false, true})
       for (const GdnShape &shape : kShapes)
