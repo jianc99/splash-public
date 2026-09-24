@@ -50,6 +50,14 @@ MoeConfig baselineMoeConfig(MoePhase phase) noexcept {
   return (phase == MoePhase::Prefill ? MoE::prefillCandidates() : MoE::decodeCandidates()).front();
 }
 
+// The operator plan of `config` for a MoE workload's phase and physical rows.
+MoePlan phasePlan(const MoeWorkload &workload, const MoeConfig &config) {
+  if (workload.phase == MoePhase::Prefill) return MoE::prefillPlan(workload.shape, workload.rows, config);
+  if (workload.phase != MoePhase::Decode || !workload.rows || workload.rows % kDecodeRows)
+    throw std::invalid_argument("invalid MoE phase or physical rows");
+  return MoE::decodePlan(workload.shape, workload.rows / kDecodeRows, config);
+}
+
 template <typename Workspace, size_t N>
 void include(Workspace &bound, const Workspace &required,
              const std::array<uint64_t Workspace::*, N> &fields,
@@ -93,12 +101,9 @@ void ExecutionPlans::install(const OperatorChoices &choices) {
     const auto &w = choice.workload;
     if (w.shape.weightLayout == WeightLayout::Block32)
       throw std::invalid_argument("block MoE plans are not tuned");
-    if (w.phase == MoePhase::Prefill)
-      (void)MoE::prefillPlan(w.shape, w.rows, choice.configuration);
-    else if (w.phase == MoePhase::Decode && w.rows && w.rows % kDecodeRows == 0)
-      (void)MoE::decodePlan(w.shape, w.rows / kDecodeRows, choice.configuration);
-    else
-      throw std::invalid_argument("invalid MoE choice phase or physical rows");
+    // The choice's own configuration: an invalid device field fails install
+    // although moePlan replaces it.
+    (void)phasePlan(w, choice.configuration);
   }
   sortUniqueChoices(pending.prefillAttention);
   sortUniqueChoices(pending.verifyAttention);
@@ -153,10 +158,7 @@ MoePlan ExecutionPlans::moePlan(const MoeWorkload &workload, MoeConfig config) c
     config.ggufTile = moeGgufTile_;
     config.ggufRouterTile = linear_.ggufFloatTile(workload.rows, shape.experts);
   }
-  if (prefill) return MoE::prefillPlan(shape, workload.rows, config);
-  if (workload.phase != MoePhase::Decode || !workload.rows || workload.rows % kDecodeRows)
-    throw std::invalid_argument("invalid MoE phase or physical rows");
-  return MoE::decodePlan(shape, workload.rows / kDecodeRows, config);
+  return phasePlan(workload, config);
 }
 
 MoePlan ExecutionPlans::moePrefill(MoeShape shape, uint32_t rows) const {
