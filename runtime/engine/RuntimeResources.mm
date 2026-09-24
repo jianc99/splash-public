@@ -175,7 +175,7 @@ canonicalRuntimeCacheNamespace(const RuntimeCacheIdentity &identity) {
 void requireLoadedModel(const model::ModelPackage &package) {
   if (!package.targetActualAllocatedBytes() ||
       !package.draft.actualAllocatedBytes ||
-      (package.descriptor.visionSource != model::VisionSource::None && !package.vision.actualAllocatedBytes) ||
+      (package.descriptor.hasVision() && !package.vision.actualAllocatedBytes) ||
       package.manifestFingerprintSha256.empty() ||
       package.targetManifestFingerprint().empty()) {
     throw std::invalid_argument(

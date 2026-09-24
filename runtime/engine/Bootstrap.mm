@@ -259,6 +259,10 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
       config.nativeLoop.engine.maxContext;
   config.nativeLoop.engine.vocabularySize =
       config.resources.model.capabilities.vocabularySize;
+  // Images fit the vision scratch; a model without vision admits none.
+  config.nativeLoop.engine.maxImagePatches =
+      config.resources.model.hasVision() ? config.resources.maximumImagePatches
+                                         : 0;
 
   std::unique_ptr<model::RuntimeModel> modelRuntime;
   try {

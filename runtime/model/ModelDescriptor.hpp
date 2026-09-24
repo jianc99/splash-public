@@ -34,6 +34,11 @@ struct ModelDescriptor final {
   TargetSource targetSource = TargetSource::Packed;
   VisionSource visionSource = VisionSource::Packed;
 
+  // A model installed with --language-only has no vision tower: it loads no
+  // vision weights and serves no image requests.
+  [[nodiscard]] bool hasVision() const noexcept {
+    return visionSource != VisionSource::None;
+  }
   [[nodiscard]] bool valid() const noexcept;
 };
 
