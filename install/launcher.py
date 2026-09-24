@@ -258,6 +258,7 @@ def coding_client(args):
         model,
         context,
         _runtime_dir(args.port),
+        vision=models[0].get("vision"),
         client_args=args.client_args,
         client_version=client_version,
     )

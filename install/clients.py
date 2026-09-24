@@ -62,7 +62,7 @@ def probe_major_version(path):
     return int(match.group(1)) if match else None
 
 
-def _hermes_config(home, model, endpoint, context, api_key):
+def _hermes_config(home, model, endpoint, context, api_key, vision):
     # HERMES_HOME is Hermes's supported profile boundary. Keep sessions and
     # the complete default tool surface, without touching ~/.hermes/config.yaml.
     import yaml
@@ -83,7 +83,7 @@ def _hermes_config(home, model, endpoint, context, api_key):
             base_url=endpoint,
             api_key=api_key,
             api_mode="chat_completions",
-            supports_vision=True,
+            supports_vision=vision,
             context_length=context,
             # Leave the input room expected by Hermes's 75% small-context
             # compaction threshold; do not inherit a cloud model's output cap.
@@ -148,12 +148,15 @@ def command(
     *,
     client_args=(),
     client_version=None,
+    vision=True,
 ):
     """Return argv and a private environment; never mutate the caller's env."""
     if not isinstance(model, str) or not model:
         raise ClientError("The server did not report a model name")
     if type(context) is not int or context <= 0:
         raise ClientError("The server did not report a valid context limit")
+    if type(vision) is not bool:
+        raise ClientError("The server did not report whether the model has vision")
     environment = dict(os.environ if environment is None else environment)
     endpoint = base_url.rstrip("/") + "/v1"
     api_key = environment.get("SPLASH_API_KEY") or "local"
@@ -227,9 +230,10 @@ def command(
                             "xhigh": {"reasoningEffort": "xhigh"},
                             **variants,
                         },
-                        "attachment": True,
+                        # Images and PDFs both need the vision tower.
+                        "attachment": vision,
                         "modalities": {
-                            "input": ["text", "image", "pdf"],
+                            "input": ["text", "image", "pdf"] if vision else ["text"],
                             "output": ["text"],
                         },
                         # The shared window includes the output allowance.
@@ -292,7 +296,7 @@ def command(
 
     if name == "hermes":
         home = runtime_dir / "hermes"
-        _hermes_config(home, model, endpoint, context, api_key)
+        _hermes_config(home, model, endpoint, context, api_key, vision)
         environment.update(
             HERMES_HOME=str(home),
             CUSTOM_BASE_URL=endpoint,

@@ -1925,6 +1925,31 @@ class ServerTest(unittest.TestCase):
         )
         self.assertEqual(status, 200, payload)
 
+    def test_vision_capability_is_advertised_by_status_and_models(self):
+        for vision, modalities in ((True, ["text", "image", "pdf"]), (False, ["text"])):
+            with self.subTest(vision=vision):
+                harness = self.harness(
+                    FakeRuntime(), vision=vision, served_model_names=("local",)
+                )
+                status, _, payload = harness.request("GET", "/status")
+                self.assertEqual(status, 200)
+                snapshot = json.loads(payload)
+                self.assertIs(snapshot["vision"], vision)
+                self.assertEqual(snapshot["input_modalities"], modalities)
+                status, _, payload = harness.request("GET", "/v1/models")
+                self.assertEqual(status, 200)
+                models = json.loads(payload)["data"]
+                self.assertEqual(
+                    [model["id"] for model in models], ["test-model", "local"]
+                )
+                for model in models:
+                    self.assertIs(model["vision"], vision)
+                    self.assertEqual(model["input_modalities"], modalities)
+                    status, _, detail = harness.request(
+                        "GET", f"/v1/models/{model['id']}"
+                    )
+                    self.assertEqual((status, json.loads(detail)), (200, model))
+
     def test_image_count_is_checked_before_decoding(self):
         app = self.harness(FakeRuntime(), tokenizer=self.ImagePadTokenizer()).app
         part = self._image_message()["content"][1]

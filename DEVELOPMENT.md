@@ -180,16 +180,22 @@ version; publication is atomic and cache contents are hash-checked. Only the
 header is read before the download; the tokenizer and configuration are derived
 from the downloaded file. Legacy manifest-based packages retain their explicitly
 declared component sources.
-Remote Python code is not loaded. Vision uses MLX's `vision_tower.*` tensors or
-the same GGUF repository's unquantized mmproj. Both source adapters prepare the
-packed `vision/model.bin` layout, which the one BF16 vision operator reads: BF16
-tensors are copied, and F32 or F16 tensors are converted only when every value is
-exactly a BF16. Otherwise preparation fails, naming the tensor and file. Unsloth's
-mmproj stores its 1-D tensors, patch embedding and position table as F32, all of
-them BF16-exact, and prepares byte-identical to the packed file. Quantized MLX
-towers, deepstack projectors and mmproj tensors the tower does not use are
-rejected. `--language-only` removes vision weights from startup and memory
-accounting and rejects image requests before decoding them.
+Remote Python code is not loaded. Vision uses MLX's `vision_tower.*` tensors,
+linking only `config.json` and the shards holding them, or the same GGUF
+repository's `mmproj-BF16.gguf` or `mmproj-F32.gguf`; F16 has a narrower exponent
+than BF16, so an F16 projector has already rounded small weights. Both source
+adapters prepare the packed `vision/model.bin` layout, which the one BF16 vision
+operator reads: BF16 tensors are copied, and F32 or F16 tensors are converted only
+when every value is exactly a BF16. Otherwise preparation fails, naming the tensor
+and file. Unsloth's mmproj stores its 1-D tensors, patch embedding and position
+table as F32, all of them BF16-exact, and prepares byte-identical to the packed
+file. Quantized MLX towers, deepstack projectors and mmproj tensors the tower does
+not use are rejected. `--language-only` removes vision weights from startup and
+memory accounting. The native Ready event announces vision only when the model
+loaded it. Without it, image and PDF parts fail with a 400 when their messages are
+converted, before decoding or rendering; `/status` and `/v1/models` report
+`vision: false`, and the launchers configure OpenCode and Hermes without
+attachments.
 
 ### Draft assets
 
@@ -412,6 +418,7 @@ Proxy consumers can use these fields; additional fields may be added:
 | `memory_actual.current_bytes`, `peak_bytes` | Metal allocations, not process RSS |
 | `metrics.decode_tokens_per_second` | Aggregate native decode throughput, not a request's end-to-end rate |
 | `maximum_context_tokens` | Declared context limit; available memory may limit admission |
+| `vision`, `input_modalities` | Whether image and PDF input is accepted; `false` and `["text"]` after `--language-only` |
 
 `GET /metrics` exposes the same counters in Prometheus text format. Both endpoints
 require the API key when authentication is enabled. Consumers should tolerate

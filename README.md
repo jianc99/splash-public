@@ -87,7 +87,8 @@ companion `mmproj` for GGUF. Both are prepared as BF16; an F32 or F16 tensor
 loads only when every value is exactly a BF16, as in Unsloth's mmproj files.
 Use `--language-only` to skip vision loading and preparation. It also skips the
 GGUF mmproj download; MLX vision tensors share the language model's shards, so
-those shards still download in full.
+those shards still download in full. The server then rejects image and PDF input
+and reports `vision: false` in `/status` and `/v1/models`.
 
 The first preparation stores an additional weight copy in
 `~/Library/Caches/Splash/weights`, using bounded temporary memory. Later starts

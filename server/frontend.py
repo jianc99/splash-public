@@ -273,8 +273,14 @@ class Frontend:
     def accepts_model(self, model):
         return isinstance(model, str) and model in self.model_names
 
+    @property
+    def input_modalities(self):
+        return ["text", "image", "pdf"] if self.vision else ["text"]
+
     def status(self):
         status = self.backend.status()
+        status["vision"] = self.vision
+        status["input_modalities"] = self.input_modalities
         with self.preparation_lock:
             status["frontend"] = {
                 "preparation_capacity": self.preparation_capacity,

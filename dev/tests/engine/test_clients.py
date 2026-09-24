@@ -57,6 +57,7 @@ class ClientTests(unittest.TestCase):
         env=None,
         client_args=(),
         client_version=None,
+        vision=True,
     ):
         return clients.command(
             name,
@@ -68,6 +69,7 @@ class ClientTests(unittest.TestCase):
             {} if env is None else env,
             client_args=client_args,
             client_version=client_version,
+            vision=vision,
         )
 
     def test_missing_clients_have_actionable_install_message(self):
@@ -246,6 +248,36 @@ class ClientTests(unittest.TestCase):
                 self.assertEqual(limits["input"] + limits["output"], context)
                 self.assertEqual(limits["output"], min(32768, context // 4))
                 self.assertNotIn("compaction", config)
+
+    def test_clients_offer_image_and_pdf_input_only_with_vision(self):
+        for vision in (True, False):
+            with self.subTest(vision=vision):
+                _, env = self.command("opencode", vision=vision)
+                model = json.loads(env["OPENCODE_CONFIG_CONTENT"])["provider"][
+                    "splash"
+                ]["models"]["incoai/Qwen3.6-35B-A3B-Splash"]
+                self.assertIs(model["attachment"], vision)
+                self.assertEqual(
+                    model["modalities"],
+                    {
+                        "input": ["text", "image", "pdf"] if vision else ["text"],
+                        "output": ["text"],
+                    },
+                )
+                _, env = self.command("hermes", vision=vision)
+                profile = Path(env["HERMES_HOME"]) / "config.yaml"
+                config = yaml.safe_load(profile.read_text())
+                self.assertIs(config["model"]["supports_vision"], vision)
+        # Claude Code and Codex configurations declare no input modalities.
+        for name in ("claude", "codex"):
+            with self.subTest(name=name):
+                self.assertEqual(
+                    self.command(name, vision=True), self.command(name, vision=False)
+                )
+        for name in clients.INSTALL_URLS:
+            with self.subTest(name=name, vision=None):
+                with self.assertRaisesRegex(clients.ClientError, "vision"):
+                    self.command(name, vision=None)
 
     def test_opencode_preserves_user_compaction_preferences(self):
         compaction = {"auto": True, "reserved": 12000, "prune": False}
@@ -593,6 +625,7 @@ class ClientLifecycleTests(unittest.TestCase):
                             {
                                 "id": "incoai/Qwen3.6-35B-A3B-Splash",
                                 "owned_by": "splash",
+                                "vision": True,
                             }
                         ]
                     },
@@ -645,6 +678,7 @@ class ClientLifecycleTests(unittest.TestCase):
                             {
                                 "id": "incoai/Qwen3.6-35B-A3B-Splash",
                                 "owned_by": "splash",
+                                "vision": True,
                             }
                         ]
                     },
@@ -655,6 +689,40 @@ class ClientLifecycleTests(unittest.TestCase):
                 launcher.main(["opencode"])
             self.assertEqual(execute.call_args.args[1], expected)
             probe.assert_called_once_with("/bin/opencode")
+
+    def test_launcher_configures_clients_from_the_served_model_vision(self):
+        for reported in (True, False, None):
+            model = {"id": "incoai/Qwen3.6-35B-A3B-Splash", "owned_by": "splash"}
+            if reported is not None:
+                model["vision"] = reported
+            with (
+                self.subTest(vision=reported),
+                mock.patch.object(
+                    clients, "find_executable", return_value="/bin/opencode"
+                ),
+                mock.patch.object(clients, "probe_major_version", return_value=1),
+                mock.patch.object(
+                    launcher,
+                    "_running_status",
+                    return_value={"ready": True, "maximum_context_tokens": 102400},
+                ),
+                mock.patch.object(
+                    launcher, "_request_json", return_value={"data": [model]}
+                ),
+                mock.patch.object(launcher.os, "execvpe") as execute,
+                mock.patch("sys.stdout", io.StringIO()),
+                mock.patch("sys.stderr", io.StringIO()) as error,
+            ):
+                result = launcher.main(["opencode"])
+            if reported is None:
+                self.assertEqual(result, 1)
+                self.assertIn("vision", error.getvalue())
+                execute.assert_not_called()
+                continue
+            config = json.loads(execute.call_args.args[2]["OPENCODE_CONFIG_CONTENT"])
+            served = config["provider"]["splash"]["models"][model["id"]]
+            self.assertIs(served["attachment"], reported)
+            self.assertEqual("image" in served["modalities"]["input"], reported)
 
     def test_unready_server_never_probes_or_launches(self):
         with (
@@ -691,6 +759,7 @@ class ClientLifecycleTests(unittest.TestCase):
                             {
                                 "id": "incoai/Qwen3.6-35B-A3B-Splash",
                                 "owned_by": "splash",
+                                "vision": True,
                             }
                         ]
                     },
