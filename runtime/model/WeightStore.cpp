@@ -13,6 +13,7 @@
 #include <limits>
 #include <sstream>
 #include <system_error>
+#include <tuple>
 #include <utility>
 
 #include <sys/mman.h>
@@ -64,15 +65,12 @@ void validateQ4Layout(uint32_t outputSize, uint32_t inputSize) {
 
 namespace {
 
-uint64_t alignPacked(uint64_t value) {
-    return checkedWeightAdd(value, kWeightFileAlignment - 1,
-                            "packed file alignment") &
-           ~(kWeightFileAlignment - 1);
-}
+// The header weightFileHeader writes, which the first section follows.
+constexpr uint64_t kHeaderBytes = std::tuple_size_v<decltype(weightFileHeader({}, 0, 0))>;
 
-uint32_t loadLittleEndian32(const uint8_t *bytes) {
-    return uint32_t(bytes[0]) | (uint32_t(bytes[1]) << 8) |
-        (uint32_t(bytes[2]) << 16) | (uint32_t(bytes[3]) << 24);
+uint64_t alignPacked(uint64_t value) {
+    static_cast<void>(checkedWeightAdd(value, kWeightFileAlignment - 1, "packed file alignment"));
+    return alignWeightOffset(value);
 }
 
 std::string systemError(std::string_view operation,
@@ -151,7 +149,7 @@ struct WeightFile::Impl {
     metal::MetalBuffer base;
     uint64_t bytes = 0;
     WeightFileRecord record;
-    uint64_t offset = 16;
+    uint64_t offset = kHeaderBytes;
     bool finished = false;
 };
 
@@ -162,13 +160,11 @@ void checkWeightHeader(const uint8_t *header, uint64_t bytes, std::string_view e
     if (expectedMagic.size() != 8) {
         throw WeightStoreError("packed file magic must contain eight bytes");
     }
-    if (bytes < 16 || bytes % kWeightFileAlignment) {
+    const auto expected = weightFileHeader(expectedMagic, expectedLayer, expectedType);
+    if (bytes < expected.size() || bytes % kWeightFileAlignment) {
         throw WeightStoreError("packed file size is not 16 KiB-aligned: " + what);
     }
-    uint32_t layer = loadLittleEndian32(header + 8);
-    uint32_t type = loadLittleEndian32(header + 12);
-    if (std::memcmp(header, expectedMagic.data(), 8) != 0 ||
-        layer != expectedLayer || type != expectedType) {
+    if (std::memcmp(header, expected.data(), expected.size()) != 0) {
         throw WeightStoreError("packed file header mismatch: " + what);
     }
 }
