@@ -109,9 +109,10 @@ const metal::MetalBuffer &epilogueInput(const LinearBuffers &b, LinearEpilogue e
                                               : b.gateScratch;
 }
 
-// The parameters and planes of a fused decode dispatch over `order`, the
-// segments in dispatch order. Slots past the last segment take no columns and
-// bind its planes again.
+// The parameters and planes of a fused decode dispatch, which runs every
+// segment of a fused projection (qkv|z|ab, q|k|v) in one dispatch, over
+// `order`, the segments in dispatch order. Slots past the last segment take
+// no columns and bind its planes again.
 GgufDecodeFusedParams fusedSegments(const LinearPlan &plan, std::span<const QuantizedSegment *const> order,
                                     std::vector<metal::MetalBuffer> &bindings) {
   const LinearWorkload w = plan.workload();
@@ -276,12 +277,10 @@ void Linear::addGguf(metal::CommandGraph &graph, const LinearBuffers &b,
 
 // The staged decode tiles, for decode and prefill chunks of up to 32 rows:
 // every row of the plan's storage in each threadgroup's tile, grid (64-column
-// tiles, K splits). Decode runs one dispatch per projection: single tensors
-// their format's kernel, fused projections (qkv|z|ab, q|k|v) every segment
-// in one dispatch, gate/up a gate pass into the gate scratch and an up pass
-// whose epilogue applies silu(gate) to the bf16 up value, as on Apple9 (the
-// fused gate/up kernel it replaces was within -4..+2% on the 27B gate/up at
-// 10-40 cores). Prefill chunks run one dispatch per segment.
+// tiles, K splits). Decode runs one dispatch per projection (addDecodeTensor,
+// fusedSegments); its two gate/up passes were within -4..+2% of the fused
+// gate/up kernel they replaced on the 27B gate/up at 10-40 cores. Prefill
+// chunks run one dispatch per segment.
 void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
                              const Projection &p, const LinearPlan &plan,
                              const Projection *gate) const {
@@ -327,10 +326,8 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
             {segmentColumns(p) / GGUF_TILE_COLUMNS, splits, 1}, {GGUF_STAGED_THREADS, 1, 1});
 }
 
-// All lanes in each threadgroup. Single tensors run their format's kernel;
-// fused projections (qkv|z|ab, q|k|v) run every segment in one dispatch.
-// Gate/up runs as a gate pass into the gate scratch and an up pass whose
-// epilogue applies silu(gate) to the bf16 up value, as the fused kernels do.
+// All lanes in each threadgroup, decode only: single tensors and gate/up
+// through addDecodeTensor, fused projections through fusedSegments.
 void Linear::addGgufRegister(metal::CommandGraph &graph, const LinearBuffers &b,
                              const Projection &p, const LinearPlan &plan,
                              const Projection *gate) const {
