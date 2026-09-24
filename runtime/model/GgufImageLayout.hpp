@@ -21,8 +21,7 @@ namespace splash::model {
 
 inline constexpr std::string_view kGgufImageMagic = "MDGG0001";
 
-// Rows of a plane tile (quant_tile_index); the ABI's QUANT_TILE_ROWS replaces
-// it once QuantFormat.h names it.
+// Rows of a plane tile: the 256 of quant_tile_index (metal/abi/QuantFormat.h).
 inline constexpr uint64_t kGgufTileRows = 256;
 // Columns of a superblock, the unit a quantized tensor's width is a multiple of.
 inline constexpr uint64_t kGgufBlockColumns = 256;
