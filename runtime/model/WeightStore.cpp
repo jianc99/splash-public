@@ -1,6 +1,7 @@
 #include "WeightStore.hpp"
 
 #include "metal/abi/Gguf.h"
+#include "model/GgufImageLayout.hpp"
 
 #include <CommonCrypto/CommonDigest.h>
 
@@ -281,32 +282,22 @@ ops::NormWeights readNorm(WeightFile &file, uint32_t width, bool float32,
 }
 
 namespace {
-struct GgufDescriptor {
-    uint32_t type, outputSize, inputSize, p0, p1, metaBytes, metaGroups;
-    uint64_t plane0Bytes, plane1Bytes, metaTotalBytes;
-};
-GgufDescriptor readGgufDescriptor(WeightFile &file, std::string_view label) {
-    metal::MetalBuffer section = file.section(64, std::string(label) + "-desc");
+GgufTensorDescriptor readGgufDescriptor(WeightFile &file, std::string_view label) {
+    metal::MetalBuffer section = file.section(sizeof(GgufTensorDescriptor), std::string(label) + "-desc");
     const uint8_t *bytes = static_cast<const uint8_t *>(section.contents());
     if (!bytes) throw WeightStoreError("GGUF descriptor is not host visible");
-    GgufDescriptor d{};
-    uint32_t words[7];
-    std::memcpy(words, bytes, sizeof words);
-    d.type = words[0]; d.outputSize = words[1]; d.inputSize = words[2]; d.p0 = words[3];
-    d.p1 = words[4]; d.metaBytes = words[5]; d.metaGroups = words[6];
-    std::memcpy(&d.plane0Bytes, bytes + 32, 8);
-    std::memcpy(&d.plane1Bytes, bytes + 40, 8);
-    std::memcpy(&d.metaTotalBytes, bytes + 48, 8);
-    // Float tensors are rows as stored; quantized ones fill 256-column tiles.
+    GgufTensorDescriptor d;
+    std::memcpy(&d, bytes, sizeof d);
+    // Float tensors are rows as stored; quantized ones fill whole tiles.
     if (!d.outputSize || !d.inputSize ||
-        (d.type != GGUF_TYPE_F32 && (d.outputSize % kQ4StorageN || d.inputSize % 256)))
+        (d.type != GGUF_TYPE_F32 && (d.outputSize % kGgufTileRows || d.inputSize % kGgufBlockColumns)))
         throw WeightStoreError("GGUF tensor shape is not tile aligned: " + std::string(label));
     return d;
 }
 } // namespace
 
 ops::QuantizedSegment readQuantizedSegment(WeightFile &file, std::string_view label) {
-    const GgufDescriptor d = readGgufDescriptor(file, label);
+    const GgufTensorDescriptor d = readGgufDescriptor(file, label);
     if (d.type == GGUF_TYPE_F32) {
         if (d.p0 || d.p1 || d.metaBytes || d.metaGroups || d.plane1Bytes || d.metaTotalBytes ||
             d.plane0Bytes != uint64_t{d.outputSize} * d.inputSize * sizeof(float))
@@ -351,7 +342,7 @@ ops::Projection readGgufProjection(WeightFile &file, uint32_t outputSize, uint32
 
 ops::EmbeddingWeights readGgufEmbedding(WeightFile &file, uint32_t outputSize, uint32_t inputSize,
                                         std::string_view label) {
-    const GgufDescriptor d = readGgufDescriptor(file, label);
+    const GgufTensorDescriptor d = readGgufDescriptor(file, label);
     if (d.outputSize != outputSize || d.inputSize != inputSize)
         throw WeightStoreError("GGUF embedding does not match the layout: " + std::string(label));
     // Native rows, gathered by gguf_embed_<type>: block_q4_K, block_q6_K or block_q8_0.

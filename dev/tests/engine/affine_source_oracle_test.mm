@@ -86,12 +86,12 @@ int main(int argc, char **argv) {
           const uint64_t decayOffset = model::kWeightFileAlignment + aligned(2 * layout.hiddenSize) +
               aligned(uint64_t(layout.packedGdnWidth) * layout.hiddenSize * 9 / 16) +
               aligned(uint64_t(layout.convolutionDimension) * 4 * 2);
-          compare(loader.layer(layer, full), package / "target", loadOnly,
+          compare(loader.layer(layer), package / "target", loadOnly,
                   full ? 0 : decayOffset, full ? 0 : layout.gdnValueHeads);
         }
         if (argc != 5 || loadOnly) {
-          compare(loader.head(layout.layers), package / "target", loadOnly);
-          compare(loader.embedding(layout.vocabularySize, layout.hiddenSize), package / "target", loadOnly);
+          compare(loader.head(), package / "target", loadOnly);
+          compare(loader.embedding(), package / "target", loadOnly);
         }
       }, descriptor.target);
       std::cout << "affine source oracle PASS seconds="

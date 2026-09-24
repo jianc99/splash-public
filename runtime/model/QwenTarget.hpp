@@ -124,23 +124,21 @@ inline constexpr std::string_view kEmbeddingMagic = "MDFE0001";
 
 // Opens the packed files of a target directory: one per hybrid layer, head.bin
 // and embedding.bin.
-struct PackedTargetFiles final {
+template <class Layout> struct PackedTargetFiles final {
   metal::MetalBackend &backend;
   std::filesystem::path directory;
-  std::string_view layerMagic;
-  std::string_view headMagic;
-  std::string_view embeddingMagic;
-  [[nodiscard]] WeightFile layer(uint32_t index, bool fullAttention) const {
+  const Layout &layout;
+  [[nodiscard]] WeightFile layer(uint32_t index) const {
     const std::string filename = "layer-" + std::to_string(index) + ".bin";
-    return WeightFile(backend, directory / filename, "target/" + filename, layerMagic, index,
-                      fullAttention ? 1U : 0U);
+    return WeightFile(backend, directory / filename, "target/" + filename, Layout::layerMagic, index,
+                      layout.isFullAttentionLayer(index) ? 1U : 0U);
   }
-  [[nodiscard]] WeightFile head(uint32_t layers) const {
-    return WeightFile(backend, directory / "head.bin", "target/head.bin", headMagic, layers, 2);
+  [[nodiscard]] WeightFile head() const {
+    return WeightFile(backend, directory / "head.bin", "target/head.bin", Layout::headMagic, layout.layers, 2);
   }
-  [[nodiscard]] WeightFile embedding(uint32_t vocabulary, uint32_t hidden) const {
-    return WeightFile(backend, directory / "embedding.bin", "target/embedding.bin",
-                      embeddingMagic, vocabulary, hidden);
+  [[nodiscard]] WeightFile embedding() const {
+    return WeightFile(backend, directory / "embedding.bin", "target/embedding.bin", kEmbeddingMagic,
+                      layout.vocabularySize, layout.hiddenSize);
   }
 };
 
@@ -159,7 +157,7 @@ readQwenTargetWeights(metal::MetalBackend &backend, const Layout &layout, Files 
 
   for (uint32_t layerIndex = 0; layerIndex < layout.layers; ++layerIndex) {
     const bool fullAttention = layout.isFullAttentionLayer(layerIndex);
-    WeightFile file = files.layer(layerIndex, fullAttention);
+    WeightFile file = files.layer(layerIndex);
     auto &layer = result.layers.emplace_back();
     layer.inputNorm = readNorm(file, layout.hiddenSize, Format::float32Norms, "input-norm");
     layer.mixer = readQwenMixer(file, format, layout.mixerGeometry(), fullAttention);
@@ -171,7 +169,7 @@ readQwenTargetWeights(metal::MetalBackend &backend, const Layout &layout, Files 
   }
 
   {
-    WeightFile file = files.head(layout.layers);
+    WeightFile file = files.head();
     result.finalNorm = readNorm(file, layout.hiddenSize, Format::float32Norms, "final-norm");
     result.logitsProjection =
         format.projection(file, layout.vocabularySize, layout.hiddenSize, "logits");
@@ -179,7 +177,7 @@ readQwenTargetWeights(metal::MetalBackend &backend, const Layout &layout, Files 
     result.files.push_back(file.record());
   }
   {
-    WeightFile file = files.embedding(layout.vocabularySize, layout.hiddenSize);
+    WeightFile file = files.embedding();
     result.tokenEmbedding = format.embedding(file, layout.vocabularySize, layout.hiddenSize);
     file.finish();
     result.files.push_back(file.record());
@@ -205,10 +203,8 @@ loadQwenTarget(metal::MetalBackend &backend, const std::filesystem::path &direct
   const AffineTargetFormat affine{backend};
   switch (source) {
   case TargetSource::Packed:
-    return readQwenTargetWeights<Weights>(
-        backend, layout,
-        PackedTargetFiles{backend, directory, Layout::layerMagic, Layout::headMagic, kEmbeddingMagic},
-        affine, readAffineFfn);
+    return readQwenTargetWeights<Weights>(backend, layout, PackedTargetFiles<Layout>{backend, directory, layout},
+                                          affine, readAffineFfn);
   case TargetSource::Affine: {
     AffineTargetLoader loader(backend, directory, layout, std::move(admission), alsoPrepared);
     return readQwenTargetWeights<Weights>(backend, layout, loader, affine, readAffineFfn);
@@ -216,8 +212,7 @@ loadQwenTarget(metal::MetalBackend &backend, const std::filesystem::path &direct
   case TargetSource::Gguf: {
     GgufTargetLoader loader(backend, findTargetGguf(directory), ggufTargetGeometry(layout),
                             std::move(admission), alsoPrepared);
-    return readQwenTargetWeights<Weights>(backend, layout, GgufTargetFiles{loader},
-                                          BlockTargetFormat{}, readBlockFfn);
+    return readQwenTargetWeights<Weights>(backend, layout, loader, BlockTargetFormat{}, readBlockFfn);
   }
   }
   throw WeightStoreError("unknown target source");

@@ -1,14 +1,11 @@
 #pragma once
 
-// Plans the prepared MDGG0001 images of a Qwen3.8 (qwen35) or Qwen3.6 MoE
-// (qwen35moe) target read straight from a llama.cpp GGUF, from its metadata
-// alone: section offsets, the header and descriptor bytes, and the source
-// rows each tensor section is written from (model/GgufPreparation.hpp).
-// Layout: 16-byte header (magic, layer, type), then 16 KiB-aligned sections;
-// each quantized tensor is a 64-byte descriptor, then its plane0, optional
-// plane1 and meta planes in the layout of its format (metal/abi/QuantFormat.h);
-// each float tensor (F32) a descriptor and its rows as stored. A 3-D expert
-// tensor is one quantized tensor of experts * N rows.
+// Plans the prepared images (model/GgufImageLayout.hpp) of a Qwen3.8 (qwen35)
+// or Qwen3.6 MoE (qwen35moe) target read straight from a llama.cpp GGUF, from
+// its metadata alone: section offsets, the header and descriptor bytes, and
+// the source rows each tensor section is written from
+// (model/GgufPreparation.hpp). A 3-D expert tensor is one quantized tensor of
+// experts * N rows.
 
 #include <cstdint>
 #include <string>
@@ -19,18 +16,18 @@
 namespace splash::model::gguf {
 
 struct TargetGeometry {
-  uint32_t layers = 64;
-  uint32_t hiddenSize = 5120;
-  uint32_t vocabularySize = 248320;
-  uint32_t intermediateSize = 17408; // dense FFN
-  uint32_t gdnKeyHeads = 16;
-  uint32_t gdnValueHeads = 48;
-  uint32_t gdnHeadDimension = 128;
-  uint32_t convolutionDimension = 10240;
-  uint32_t attentionWidth = 6144;
-  uint32_t attentionKvHeads = 4;
-  uint32_t attentionHeadDimension = 256;
-  uint32_t fullAttentionPeriod = 4;
+  uint32_t layers = 0;
+  uint32_t hiddenSize = 0;
+  uint32_t vocabularySize = 0;
+  uint32_t intermediateSize = 0; // dense FFN
+  uint32_t gdnKeyHeads = 0;
+  uint32_t gdnValueHeads = 0;
+  uint32_t gdnHeadDimension = 0;
+  uint32_t convolutionDimension = 0;
+  uint32_t attentionWidth = 0;
+  uint32_t attentionKvHeads = 0;
+  uint32_t attentionHeadDimension = 0;
+  uint32_t fullAttentionPeriod = 0;
   // A sparse MoE FFN (qwen35moe) when experts is set; the shared expert has
   // the routed experts' intermediate width.
   uint32_t experts = 0;
@@ -48,20 +45,20 @@ struct TargetGeometry {
 
 // The order of a tensor's rows in the image. Rows below `from` keep their
 // order; from there on, blocks of headRows rows are value heads, which
-// llama.cpp stores tiled (group * groupHeads + head) and splash groups by key
-// head.
+// llama.cpp stores tiled (value head of its key head * keyHeads + key head)
+// and splash groups by key head (key head * valueHeadsPerKey + value head).
 struct RowOrder {
   uint64_t from = UINT64_MAX; // UINT64_MAX: rows as stored
   uint32_t headRows = 0;
-  uint32_t groupHeads = 0; // heads per key group
-  uint32_t groups = 0;     // value heads per key head
+  uint32_t keyHeads = 0;
+  uint32_t valueHeadsPerKey = 0;
 };
 
 // Rows [0, rows) of one source tensor in image order.
 struct TensorRows {
   std::string name;
   uint32_t type = 0;   // ggml type
-  uint64_t offset = 0; // the tensor's data, from the start of the data section
+  uint64_t offset = 0; // in the file's tensor data
   uint64_t rows = 0;
   uint64_t rowBytes = 0;
   RowOrder order{};
@@ -100,19 +97,20 @@ struct Image {
 
 class ImagePlanner final {
 public:
-  // Validates architecture, geometry and every tensor's presence, shape and
-  // type; throws GgufError listing all offending tensors.
-  ImagePlanner(const GgufFile &file, TargetGeometry geometry);
-  [[nodiscard]] Image layer(uint32_t index) const;
-  [[nodiscard]] Image head() const;
-  [[nodiscard]] Image embedding() const;
-  [[nodiscard]] const TargetGeometry &geometry() const noexcept { return geometry_; }
+  // Checks the architecture and the geometry the metadata declares, then
+  // plans every image, checking each tensor's shape; throws GgufError naming
+  // every missing tensor and every tensor of a type this build cannot load.
+  ImagePlanner(const GgufFile &file, const TargetGeometry &geometry);
+  // The layers' images, then the head's and the embedding's.
+  [[nodiscard]] const std::vector<Image> &images() const noexcept { return images_; }
+  [[nodiscard]] const Image &layer(uint32_t index) const;
+  [[nodiscard]] const Image &head() const { return images_[images_.size() - 2]; }
+  [[nodiscard]] const Image &embedding() const { return images_.back(); }
   // Sum of all image bytes, for weight admission before preparation.
   [[nodiscard]] uint64_t totalBytes() const;
 
 private:
-  const GgufFile &file_;
-  TargetGeometry geometry_;
+  std::vector<Image> images_;
 };
 
 } // namespace splash::model::gguf

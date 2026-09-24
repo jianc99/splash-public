@@ -1,5 +1,6 @@
 #include "ModelDescriptor.hpp"
 #include "QwenVision.hpp"
+#include "model/GgufImageLayout.hpp"
 
 #import <Foundation/Foundation.h>
 

@@ -4,14 +4,12 @@
 // serving uses the same read-only WeightFile mappings as packaged weights.
 
 #include <filesystem>
-#include <memory>
+#include <span>
 #include <vector>
 
-#include "metal/MetalBackend.hpp"
 #include "model/GgufFile.hpp"
 #include "model/GgufImage.hpp"
-#include "model/PreparedWeights.hpp"
-#include "model/WeightStore.hpp"
+#include "model/PreparedFiles.hpp"
 
 namespace splash::model {
 
@@ -23,8 +21,8 @@ public:
   // Plans every image from the GGUF's metadata once. Before the first image
   // is written, the disk check budgets every missing image together with
   // alsoPrepared, the model's other prepared files.
-  GgufTargetLoader(metal::MetalBackend &backend, std::filesystem::path path,
-                   gguf::TargetGeometry geometry, PreparationCheck admitConversion = {},
+  GgufTargetLoader(metal::MetalBackend &backend, const std::filesystem::path &path,
+                   const gguf::TargetGeometry &geometry, PreparationCheck admitConversion = {},
                    std::span<const PreparedWeight> alsoPrepared = {});
   GgufTargetLoader(const GgufTargetLoader &) = delete;
   GgufTargetLoader &operator=(const GgufTargetLoader &) = delete;
@@ -34,17 +32,13 @@ public:
   [[nodiscard]] WeightFile embedding();
 
 private:
-  struct Planned {
-    gguf::Image image;
-    PreparedWeight weight;
-  };
-  [[nodiscard]] WeightFile build(const Planned &planned);
+  [[nodiscard]] WeightFile open(size_t index);
 
-  metal::MetalBackend *backend_;
-  PreparationCheck admitConversion_;
+  metal::MetalBackend &backend_;
   WeightSource source_;
-  std::vector<Planned> images_; // layers, head, embedding
-  PreparedWeights cache_;
+  std::vector<gguf::Image> images_; // layers, head, embedding
+  std::vector<PreparedWeight> weights_;
+  PreparedFiles files_;
 };
 
 // The GGUF geometry of a Qwen layout: a dense FFN, or a sparse MoE when the
@@ -64,7 +58,6 @@ template <class Layout>
   geometry.attentionHeadDimension = layout.attentionHeadDimension;
   geometry.fullAttentionPeriod = layout.fullAttentionPeriod;
   if constexpr (requires { layout.experts; }) {
-    geometry.intermediateSize = 0;
     geometry.experts = layout.experts;
     geometry.expertsPerToken = layout.expertsPerToken;
     geometry.expertIntermediateSize = layout.expertIntermediateSize;
@@ -73,13 +66,5 @@ template <class Layout>
   }
   return geometry;
 }
-
-// readQwenTargetWeights' files (QwenTarget.hpp): the images of a loader.
-struct GgufTargetFiles final {
-  GgufTargetLoader &loader;
-  [[nodiscard]] WeightFile layer(uint32_t index, bool) const { return loader.layer(index); }
-  [[nodiscard]] WeightFile head(uint32_t) const { return loader.head(); }
-  [[nodiscard]] WeightFile embedding(uint32_t, uint32_t) const { return loader.embedding(); }
-};
 
 } // namespace splash::model

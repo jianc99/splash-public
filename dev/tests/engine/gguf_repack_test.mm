@@ -263,10 +263,28 @@ const model::gguf::Copy *copyOf(const model::gguf::Image &image, const std::stri
   return found == image.copies.end() ? nullptr : &*found;
 }
 
+// The 27B's geometry, which each fixture shrinks.
+model::gguf::TargetGeometry baseGeometry() {
+  model::gguf::TargetGeometry g;
+  g.layers = 64;
+  g.hiddenSize = 5120;
+  g.vocabularySize = 248320;
+  g.intermediateSize = 17408;
+  g.gdnKeyHeads = 16;
+  g.gdnValueHeads = 48;
+  g.gdnHeadDimension = 128;
+  g.convolutionDimension = 10240;
+  g.attentionWidth = 6144;
+  g.attentionKvHeads = 4;
+  g.attentionHeadDimension = 256;
+  g.fullAttentionPeriod = 4;
+  return g;
+}
+
 bool grouped(const model::gguf::RowOrder &order, uint64_t from, uint32_t headRows,
              const model::gguf::TargetGeometry &g) {
-  return order.from == from && order.headRows == headRows && order.groupHeads == g.gdnKeyHeads &&
-         order.groups == g.gdnValueHeads / g.gdnKeyHeads;
+  return order.from == from && order.headRows == headRows && order.keyHeads == g.gdnKeyHeads &&
+         order.valueHeadsPerKey == g.gdnValueHeads / g.gdnKeyHeads;
 }
 
 // Rows of `bytes` (rowBytes each) in image order: row n reads source row
@@ -295,7 +313,7 @@ std::vector<uint8_t> bfloat16Halves(const std::vector<uint8_t> &floats) {
 // matter.
 void checkAlphaBeta(splash::metal::MetalBackend *backend) {
   using namespace model::ggml;
-  model::gguf::TargetGeometry geometry;
+  model::gguf::TargetGeometry geometry = baseGeometry();
   geometry.layers = 1;
   geometry.hiddenSize = 512;
   geometry.vocabularySize = 256;
@@ -367,7 +385,7 @@ void checkAlphaBeta(splash::metal::MetalBackend *backend) {
 // when every value is bf16-exact and are refused by name otherwise.
 void checkFloatTensors(splash::metal::MetalBackend *backend) {
   using namespace model::ggml;
-  model::gguf::TargetGeometry geometry;
+  model::gguf::TargetGeometry geometry = baseGeometry();
   geometry.layers = 2;
   geometry.hiddenSize = 512;
   geometry.vocabularySize = 256;
@@ -510,7 +528,7 @@ void checkFloatTensors(splash::metal::MetalBackend *backend) {
 // one tensor of experts * N rows. The metadata and architecture must match.
 void checkMoeLayer(splash::metal::MetalBackend *backend) {
   using namespace model::ggml;
-  model::gguf::TargetGeometry geometry;
+  model::gguf::TargetGeometry geometry = baseGeometry();
   geometry.layers = 1;
   geometry.hiddenSize = 512;
   geometry.vocabularySize = 256;
@@ -776,7 +794,7 @@ void checkDenseTarget(splash::metal::MetalBackend &backend) {
 // prepared image, and a changed tensor byte prepares the images again.
 void checkSourceIdentity(splash::metal::MetalBackend &backend) {
   using namespace model::ggml;
-  model::gguf::TargetGeometry geometry;
+  model::gguf::TargetGeometry geometry = baseGeometry();
   geometry.layers = 1;
   geometry.hiddenSize = 512;
   geometry.vocabularySize = 256;
@@ -905,7 +923,7 @@ void checkGoldenImages(splash::metal::MetalBackend &backend) {
     tensors.push_back({std::move(name), std::move(dims), type, std::move(data)});
   };
 
-  model::gguf::TargetGeometry dense;
+  model::gguf::TargetGeometry dense = baseGeometry();
   dense.layers = 2;
   dense.hiddenSize = 512;
   dense.vocabularySize = 256;
@@ -950,7 +968,7 @@ void checkGoldenImages(splash::metal::MetalBackend &backend) {
   add("token_embd.weight", {hidden, dense.vocabularySize}, kQ6_K);
   prepared("dense", tensors, dense);
 
-  model::gguf::TargetGeometry moe;
+  model::gguf::TargetGeometry moe = baseGeometry();
   moe.layers = 1;
   moe.hiddenSize = 512;
   moe.vocabularySize = 256;
@@ -1055,7 +1073,7 @@ void checkRepack(splash::metal::MetalBackend &backend, Fmt f, const Shape &shape
     const uint64_t before = backend.memoryStats().allocatedBytes;
     splash::model::WeightSource source(inputPath);
     source.setDataOffset(kSourceOffset);
-    splash::model::writeGgufImage(backend, source, outputFd, plan, {});
+    splash::model::writeGgufImage(backend, source, outputFd, plan, [] {});
     check(backend.memoryStats().allocatedBytes == before, "repack releases its staging buffers");
     check(backend.memoryStats().peakAllocatedBytes <= splash::model::kWeightPreparationStagingBytes,
           "repack staging stays within the preparation staging bound");

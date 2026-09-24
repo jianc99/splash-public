@@ -61,10 +61,10 @@ void prepare(metal::MetalBackend &backend, const std::filesystem::path &root, co
       weights.finish();
       if (pass == 0) std::cout << "prepared " << record.relativePath << ' ' << model::weightDigest(prepared) << '\n';
     };
-    check(loader.layer(0, false));
-    check(loader.layer(1, true));
-    check(loader.head(2));
-    check(loader.embedding(256, 256));
+    check(loader.layer(0));
+    check(loader.layer(1));
+    check(loader.head());
+    check(loader.embedding());
     cold = false;
   }
 }

@@ -40,10 +40,10 @@ struct Image {
 };
 
 // The identity of an image planned from a checkpoint at `source`.
-[[nodiscard]] PreparedWeight imageWeight(const Image &image, const std::string &source);
+[[nodiscard]] PreparedWeight affineImageWeight(const Image &image, const std::string &source);
 
 // Writes an image into its preallocated, zeroed destination within the
 // preparation staging bound; admit runs before each chunk.
-void writeImage(int destination, const Image &image, const PreparationCheck &admit);
+void writeAffineImage(int destination, const Image &image, const PreparationCheck &admit);
 
 } // namespace splash::model::affine
