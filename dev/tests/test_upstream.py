@@ -1,4 +1,8 @@
 import argparse
+import contextlib
+import errno
+import fcntl
+import io
 import json
 import tempfile
 import unittest
@@ -315,6 +319,69 @@ class UpstreamTest(unittest.TestCase):
             upstream.verify(installed)["sources"]["target"]["revision"], "b" * 40
         )
 
+    def test_pins_are_required_before_publishing_and_repaired_on_start(self):
+        cache = self.root / "hub"
+        model = "mlx-community/Qwen3.8-27B-4bit"
+        source = hub_repository(cache, model, "a" * 40, lambda p: mlx_target(p, DENSE))
+        draft = hub_repository(
+            cache, upstream.DRAFTS, "d" * 40, lambda p: draft_dir(p, DENSE)
+        )
+        args = arguments(self.root, model)
+        installed = models.installed_root(args.models, model, language_only=True)
+
+        def pins():
+            return sorted(ref.name for ref in cache.glob("*/refs/splash/*/*"))
+
+        with (
+            mock.patch.object(upstream, "Repository", return_value=draft),
+            mock.patch.object(
+                models, "retain_ref", side_effect=PermissionError(errno.EACCES, "no")
+            ),
+            self.assertRaises(PermissionError),
+        ):
+            upstream.prepare(args, repo=source)
+        self.assertFalse(installed.exists())
+        retain = models.retain_ref
+
+        def locked(*arguments):
+            # Pins change only under the installation lock.
+            with (args.models / ".install.lock").open("a+b") as lock:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return retain(*arguments)
+
+        with (
+            mock.patch.object(upstream, "Repository", return_value=draft),
+            mock.patch.object(models, "retain_ref", side_effect=locked) as pinned,
+        ):
+            upstream.prepare(args, repo=source)
+        self.assertEqual(pinned.call_count, 2)
+        self.assertEqual(pins(), ["a" * 40, "d" * 40])
+        # A verified start restores lost pins, without the Hub.
+        offline = mock.Mock(side_effect=AssertionError("the Hub was contacted"))
+        for ref in cache.glob("*/refs/splash/*/*"):
+            ref.unlink()
+        with (
+            mock.patch.object(upstream, "Repository", offline),
+            mock.patch.object(models, "retain_ref", side_effect=locked),
+        ):
+            self.assertTrue(upstream.prepare(args))
+        self.assertEqual(pins(), ["a" * 40, "d" * 40])
+        # A read-only cache leaves the verified installation usable.
+        for ref in cache.glob("*/refs/splash/*/*"):
+            ref.unlink()
+        errors = io.StringIO()
+        with (
+            mock.patch.object(upstream, "Repository", offline),
+            mock.patch.object(
+                models.os, "link", side_effect=OSError(errno.EROFS, "read only")
+            ),
+            contextlib.redirect_stderr(errors),
+        ):
+            self.assertTrue(upstream.prepare(args))
+        self.assertIn("external cache pruning", errors.getvalue())
+        self.assertEqual(pins(), [])
+
     def test_damaged_assembly_is_rebuilt(self):
         source = upstream.Repository(mlx_target(self.root / "target", DENSE))
         draft = upstream.Repository(draft_dir(self.root / "draft", DENSE))
@@ -333,7 +400,12 @@ class UpstreamTest(unittest.TestCase):
         assembly = self.root / "assembly"
         assembly.mkdir()
         (assembly / "weight").symlink_to(source)
-        record = {"version": 1, "files": {"weight": upstream._file_record(source)}}
+        local = {"repo": str(self.root), "revision": None}
+        record = {
+            "version": 1,
+            "sources": {"target": local, "draft": local},
+            "files": {"weight": upstream._file_record(source)},
+        }
         (assembly / "model.json").write_text(json.dumps(record))
         upstream.verify(assembly, full=True)
         source.write_bytes(b"abce")

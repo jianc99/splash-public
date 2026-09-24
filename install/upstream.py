@@ -385,15 +385,15 @@ def _link(stage, relative, source):
 
 
 def _installed(root):
-    """An installation that verifies starts with no Hub access at all."""
+    """The record of an installation that verifies, else None; verifying needs
+    no Hub access at all."""
     if not (root / "model.json").exists():
-        return False
+        return None
     try:
-        verify(root)
+        return verify(root)
     except (models.ModelError, OSError) as error:
         print(f"Reinstalling {root.name}: {error}", flush=True)
-        return False
-    return True
+        return None
 
 
 def prepare(args, repo=None):
@@ -417,9 +417,17 @@ def prepare(args, repo=None):
                 "source selection options require an upstream model ID"
             )
         return False
-    if not getattr(args, "update", False) and _installed(root):
-        print(f"Splash model {args.model} is already installed in {root}", flush=True)
-        return True
+    if not getattr(args, "update", False) and (root / "model.json").exists():
+        # Verify and repin under the lock, so a concurrent update cannot
+        # replace the assembly between the two.
+        with models.installation_lock(models_root):
+            if (installed := _installed(root)) is not None:
+                models.retain_refs(root, _pins(installed))
+                print(
+                    f"Splash model {args.model} is already installed in {root}",
+                    flush=True,
+                )
+                return True
     repo = repo or Repository(repo_id, revision)
     if "manifest.json" in repo.files:
         if revision or language_only or draft_override:
@@ -478,12 +486,14 @@ def prepare(args, repo=None):
     }
     models_root.mkdir(parents=True, exist_ok=True)
     with models.installation_lock(models_root):
+        # A new installation requires its pins before it is published; its
+        # older pins are retired once it is.
+        refs = [
+            models.retain_ref(snapshot, name, root) for snapshot, name in _pins(record)
+        ]
         destination = _publish(models_root, record, files)
         models.install_snapshot(destination, root)
-    _pin(
-        root,
-        [(repo, next(iter(sources.values()))), (draft, next(iter(drafts.values())))],
-    )
+        models.retire_refs(refs)
     return True
 
 
@@ -523,15 +533,21 @@ def _snapshot_of(path):
     return None
 
 
-def _pin(root, sources):
-    """Pin every Hub snapshot the installation links, so pruning the Hub cache
-    cannot remove them, then retire this installation's older pins."""
-    refs = [
-        models.retain_ref(snapshot, repo.name, root)
-        for repo, sample in sources
-        if not repo.local and (snapshot := _snapshot_of(sample))
-    ]
-    models.retire_refs(refs)
+def _pins(record):
+    """The Hub snapshot of each source an assembly links files from, with its
+    repository ID: the snapshots its installation pins."""
+    sources = {
+        (models.hub_folder_name(source["repo"]), source["revision"]): source["repo"]
+        for source in record["sources"].values()
+        if source["revision"] is not None
+    }
+    pins = {}
+    for entry in record["files"].values():
+        snapshot = _snapshot_of(entry["path"])
+        key = snapshot and (snapshot.parent.parent.name, snapshot.name)
+        if key in sources:
+            pins[snapshot] = sources[key]
+    return sorted(pins.items())
 
 
 def _gguf_metadata(models_root, target, vision):
@@ -611,7 +627,23 @@ def _file_record(path):
 
 def verify(root, *, full=False):
     record = models.read_json(root / "model.json")
-    if record.get("version") != 1 or not isinstance(record.get("files"), dict):
+    sources = record.get("sources")
+    if (
+        record.get("version") != 1
+        or not isinstance(record.get("files"), dict)
+        or not isinstance(sources, dict)
+        or set(sources) != {"target", "draft"}
+        or not all(
+            isinstance(source, dict)
+            and set(source) == {"repo", "revision"}
+            and isinstance(source["repo"], str)
+            and (
+                source["revision"] is None
+                or models.is_hex_digest(source["revision"], 40)
+            )
+            for source in sources.values()
+        )
+    ):
         raise models.ModelError("invalid resolved model record")
     for name, entry in record["files"].items():
         relative = PurePosixPath(name)

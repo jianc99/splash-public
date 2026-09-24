@@ -399,10 +399,15 @@ def verify_installed(
     return model_id
 
 
+def hub_folder_name(repo_id: str) -> str:
+    """The folder of a model repository in the Hub cache."""
+    return "models--" + repo_id.replace("/", "--")
+
+
 def _snapshot_revision(snapshot: Path, model_id: str) -> str:
     if (
         snapshot.parent.name != "snapshots"
-        or snapshot.parent.parent.name != "models--" + model_id.replace("/", "--")
+        or snapshot.parent.parent.name != hub_folder_name(model_id)
         or not is_hex_digest(snapshot.name, 40)
     ):
         raise ModelError(
