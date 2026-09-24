@@ -27,6 +27,8 @@ class HttpRegressionTests(unittest.TestCase):
             "incoai/Qwen3.8-27B-Splash",
             "incoai/Qwen3.6-35B-A3B-Splash",
             "community/custom-splash",
+            "mlx-community/Qwen3.8-27B-4bit",
+            "unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M",
         ):
             with self.subTest(model=selected):
                 arguments = smoke.parse_args(["--model", selected])

@@ -174,16 +174,41 @@ class AgentRunnerTests(unittest.TestCase):
         self.assertIn('--model "$(MODEL)" --http-smoke', makefile)
         self.assertIn('--model "$(MODEL)" $(HTTP_SMOKE_ARGS)', makefile)
 
-    def test_model_is_required_and_only_canonical_ids_are_accepted(self):
-        for arguments in ([], ["--preflight-only"], ["--model", "qwen3.8-27b"]):
+    def test_model_is_required(self):
+        for arguments in ([], ["--preflight-only"]):
             with (
                 self.subTest(arguments=arguments),
                 contextlib.redirect_stderr(io.StringIO()),
             ):
                 with self.assertRaises(SystemExit):
                     agent.parse_args(arguments)
-        for model in MODEL_IDS:
-            self.assertEqual(agent.parse_args(["--model", model]).model, model)
+
+    def test_real_harnesses_accept_exactly_the_ids_splash_serve_accepts(self):
+        parsers = {
+            "splash serve": lambda model: agent.launcher.parse_args(
+                ["serve", "--model", model]
+            ),
+            "agent_real": lambda model: agent.parse_args(["--model", model]),
+            "smoke_real": lambda model: agent.smoke_real.parse_args(["--model", model]),
+        }
+        for model, served in (
+            *((model, True) for model in MODEL_IDS),
+            ("mlx-community/Qwen3.8-27B-4bit", True),
+            ("unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M", True),
+            ("unsloth/Qwen3.6-35B-A3B-GGUF:", False),
+            ("unsloth/Qwen3.6-35B-A3B-GGUF:UD/Q4_K_M", False),
+            ("qwen3.8-27b", False),
+        ):
+            for name, parse in parsers.items():
+                with (
+                    self.subTest(parser=name, model=model),
+                    contextlib.redirect_stderr(io.StringIO()),
+                ):
+                    if served:
+                        self.assertEqual(parse(model).model, model)
+                    else:
+                        with self.assertRaises(SystemExit):
+                            parse(model)
 
     def test_complete_phase_handles_auxiliary_cancellation_and_retains_failures(self):
         finished = [
