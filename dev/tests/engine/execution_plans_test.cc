@@ -40,12 +40,11 @@ constexpr std::array draftFields{
     &DraftAttentionWorkspace::groupedQueriesBytes,
     &DraftAttentionWorkspace::queryKeysBytes,
     &DraftAttentionWorkspace::queryValuesBytes};
-constexpr std::array moeFields{
-    &MoeWorkspace::selectedExpertsBytes, &MoeWorkspace::routingWeightsBytes,
-    &MoeWorkspace::tileDescriptorsBytes, &MoeWorkspace::tileCountBytes,
-    &MoeWorkspace::groupedRoutesBytes, &MoeWorkspace::routeRowsBytes,
-    &MoeWorkspace::groupedInputBytes, &MoeWorkspace::expertIntermediateBytes,
-    &MoeWorkspace::expertOutputBytes, &MoeWorkspace::groupedSumsBytes};
+constexpr auto moeFields = [] {
+  std::array<uint64_t MoeWorkspace::*, kMoeScratchFields.size()> fields{};
+  for (size_t i = 0; i < fields.size(); ++i) fields[i] = kMoeScratchFields[i].bytes;
+  return fields;
+}();
 
 kv::Layout layout(AttentionShape shape, uint32_t layers = 1) {
   return {layers, shape.kvHeads, shape.headDimension, shape.format};
@@ -150,7 +149,7 @@ void baselinePlans() {
     }
     for (auto shape : moeShapes) {
       const auto stride = plans.moeDecodeWorkspacePerLane(shape);
-      equalWorkspace(stride, MoE::decodePlan(shape, 1).workspace(), moeFields);
+      require(stride == MoE::decodePlan(shape, 1).workspace(), "workspace bound changed");
       const auto prefill = plans.moePrefillWorkspace(shape, 2048);
       for (uint32_t rows = 1; rows <= 2048; ++rows)
         covers(prefill, plans.moePrefill(shape, rows).workspace(), 1, moeFields);

@@ -350,16 +350,7 @@ struct QwenTargetPrefillBuffers final {
   metal::MetalBuffer ropeSin;
   metal::MetalBuffer chunkKeys;
   metal::MetalBuffer chunkValues;
-  metal::MetalBuffer selectedExperts;
-  metal::MetalBuffer routingWeights;
-  metal::MetalBuffer tileDescriptors;
-  metal::MetalBuffer tileCount;
-  metal::MetalBuffer groupedRoutes;
-  metal::MetalBuffer routeRows;
-  metal::MetalBuffer groupedInput;
-  metal::MetalBuffer expertIntermediate;
-  metal::MetalBuffer expertOutput;
-  metal::MetalBuffer groupedSums;
+  ops::MoeScratch moe;
 };
 
 struct QwenTargetVerifyBuffers final {
@@ -397,16 +388,7 @@ struct QwenTargetVerifyBuffers final {
       nextGdnStates;
   std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth>
       pageTables;
-  metal::MetalBuffer selectedExperts;
-  metal::MetalBuffer routingWeights;
-  metal::MetalBuffer tileDescriptors;
-  metal::MetalBuffer tileCount;
-  metal::MetalBuffer groupedRoutes;
-  metal::MetalBuffer routeRows;
-  metal::MetalBuffer groupedInput;
-  metal::MetalBuffer expertIntermediate;
-  metal::MetalBuffer expertOutput;
-  metal::MetalBuffer groupedSums;
+  ops::MoeScratch moe;
 };
 
 struct QwenTargetCommitBuffers final {

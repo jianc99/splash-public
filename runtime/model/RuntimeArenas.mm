@@ -134,16 +134,9 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
   if (geometry.target.ffnKind == QwenFfnKind::SparseMoe) {
     const ops::MoeWorkspace workspace =
         operators.moePrefillWorkspace(geometry.target.moeShape(), kPrefillRows);
-    put(PrefillTensor::MoeSelectedExperts, workspace.selectedExpertsBytes);
-    put(PrefillTensor::MoeRoutingWeights, workspace.routingWeightsBytes);
-    put(PrefillTensor::MoeTileDescriptors, workspace.tileDescriptorsBytes);
-    put(PrefillTensor::MoeTileCount, workspace.tileCountBytes);
-    put(PrefillTensor::MoeGroupedRoutes, workspace.groupedRoutesBytes);
-    put(PrefillTensor::MoeRouteRows, workspace.routeRowsBytes);
-    put(PrefillTensor::MoeGroupedInput, workspace.groupedInputBytes);
-    put(PrefillTensor::MoeExpertIntermediate, workspace.expertIntermediateBytes);
-    put(PrefillTensor::MoeExpertOutput, workspace.expertOutputBytes);
-    put(PrefillTensor::MoeGroupedSums, workspace.groupedSumsBytes);
+    for (size_t field = 0; field < ops::kMoeScratchFields.size(); ++field)
+      put(moeScratchTensor(PrefillTensor::MoeSelectedExperts, field),
+          workspace.*ops::kMoeScratchFields[field].bytes);
   }
   return result;
 }
@@ -317,16 +310,9 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
   if (geometry.target.ffnKind == QwenFfnKind::SparseMoe) {
     const ops::MoeWorkspace workspace =
         operators.moeDecodeWorkspacePerLane(geometry.target.moeShape());
-    put(DecodeTensor::MoeSelectedExperts, workspace.selectedExpertsBytes);
-    put(DecodeTensor::MoeRoutingWeights, workspace.routingWeightsBytes);
-    put(DecodeTensor::MoeTileDescriptors, workspace.tileDescriptorsBytes);
-    put(DecodeTensor::MoeTileCount, workspace.tileCountBytes);
-    put(DecodeTensor::MoeGroupedRoutes, workspace.groupedRoutesBytes);
-    put(DecodeTensor::MoeRouteRows, workspace.routeRowsBytes);
-    put(DecodeTensor::MoeGroupedInput, workspace.groupedInputBytes);
-    put(DecodeTensor::MoeExpertIntermediate, workspace.expertIntermediateBytes);
-    put(DecodeTensor::MoeExpertOutput, workspace.expertOutputBytes);
-    put(DecodeTensor::MoeGroupedSums, workspace.groupedSumsBytes);
+    for (size_t field = 0; field < ops::kMoeScratchFields.size(); ++field)
+      put(moeScratchTensor(DecodeTensor::MoeSelectedExperts, field),
+          workspace.*ops::kMoeScratchFields[field].bytes);
   }
   return result;
 }

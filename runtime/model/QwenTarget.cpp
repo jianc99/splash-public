@@ -424,11 +424,7 @@ void QwenTarget::addPrefillImpl(
     } else {
       ops::MoE::add(
           graph,
-          {buffers.normalized, residual, output, buffers.selectedExperts,
-           buffers.routingWeights, buffers.tileDescriptors, buffers.tileCount,
-           buffers.groupedRoutes, buffers.routeRows, buffers.groupedInput,
-           buffers.expertIntermediate, buffers.expertOutput,
-           buffers.groupedSums},
+          {buffers.normalized, residual, output, buffers.moe},
           layer.ffn, moePlan);
     }
 
@@ -603,11 +599,7 @@ void QwenTarget::addVerifyImpl(
     } else {
       ops::MoE::add(
           graph,
-          {buffers.normalized, residual, output, buffers.selectedExperts,
-           buffers.routingWeights, buffers.tileDescriptors, buffers.tileCount,
-           buffers.groupedRoutes, buffers.routeRows, buffers.groupedInput,
-           buffers.expertIntermediate, buffers.expertOutput,
-           buffers.groupedSums},
+          {buffers.normalized, residual, output, buffers.moe},
           layer.ffn, moePlan);
     }
 

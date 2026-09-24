@@ -153,6 +153,15 @@ enum class PrefillTensor : uint32_t {
 constexpr uint32_t prefillTensorCount =
     static_cast<uint32_t>(PrefillTensor::Count);
 
+// The arena tensor of MoE scratch field `field` (ops::kMoeScratchFields), whose
+// tensors follow the field order from `first`.
+template <class Tensor>
+constexpr Tensor moeScratchTensor(Tensor first, size_t field) noexcept {
+  return static_cast<Tensor>(static_cast<uint32_t>(first) + field);
+}
+static_assert(moeScratchTensor(PrefillTensor::MoeSelectedExperts, ops::kMoeScratchFields.size() - 1) ==
+              PrefillTensor::MoeGroupedSums);
+
 // Sizes depend on the geometry and the installed operator choices; the arena
 // bounds include the operator defaults and every installed configuration.
 [[nodiscard]] std::array<uint64_t, prefillTensorCount>
@@ -200,6 +209,13 @@ public:
 
   [[nodiscard]] metal::MetalBuffer get(PrefillTensor tensor) const {
     return tensors_[static_cast<uint32_t>(tensor)];
+  }
+  [[nodiscard]] ops::MoeScratch moeScratch() const {
+    ops::MoeScratch scratch;
+    for (size_t field = 0; field < ops::kMoeScratchFields.size(); ++field)
+      scratch.*ops::kMoeScratchFields[field].buffer =
+          get(moeScratchTensor(PrefillTensor::MoeSelectedExperts, field));
+    return scratch;
   }
   [[nodiscard]] uint64_t bytes() const noexcept { return bytes_; }
 
@@ -294,6 +310,8 @@ enum class DecodeTensor : uint32_t {
 
 constexpr uint32_t decodeTensorCount =
     static_cast<uint32_t>(DecodeTensor::Count);
+static_assert(moeScratchTensor(DecodeTensor::MoeSelectedExperts, ops::kMoeScratchFields.size() - 1) ==
+              DecodeTensor::MoeGroupedSums);
 
 constexpr bool isGdnLayerTensor(DecodeTensor tensor) noexcept {
   return tensor == DecodeTensor::VerifyPackedBase ||
@@ -396,6 +414,14 @@ public:
       return {};
     return backend_.view(base_, offsets_[index],
                          uint64_t{lanes} * sizes_[index]);
+  }
+
+  [[nodiscard]] ops::MoeScratch moeScratch(uint32_t lanes) const {
+    ops::MoeScratch scratch;
+    for (size_t field = 0; field < ops::kMoeScratchFields.size(); ++field)
+      scratch.*ops::kMoeScratchFields[field].buffer =
+          packed(moeScratchTensor(DecodeTensor::MoeSelectedExperts, field), lanes);
+    return scratch;
   }
 
   [[nodiscard]] ops::LinearScratch linearScratch() const { return linearScratch_; }

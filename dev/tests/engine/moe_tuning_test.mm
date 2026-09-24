@@ -93,12 +93,6 @@ void devicePolicyPlans() {
 }
 
 void fixtureBounds() {
-  constexpr std::array fields{
-      &MoeWorkspace::selectedExpertsBytes, &MoeWorkspace::routingWeightsBytes,
-      &MoeWorkspace::tileDescriptorsBytes, &MoeWorkspace::tileCountBytes,
-      &MoeWorkspace::groupedRoutesBytes, &MoeWorkspace::routeRowsBytes,
-      &MoeWorkspace::groupedInputBytes, &MoeWorkspace::expertIntermediateBytes,
-      &MoeWorkspace::expertOutputBytes};
   for (const MoeShape shape : {MoeShape{256, 4, 2, 256},
                                MoeShape{2048, 256, 8, 512},
                                MoeShape{1024, 32, 4, 2048}}) {
@@ -109,9 +103,9 @@ void fixtureBounds() {
                                    uint32_t rows) {
       const uint64_t rowBytes = uint64_t{rows} * shape.hiddenSize * 2;
       uint64_t expected = 3 * aligned(rowBytes, 256) + aligned(2 * rowBytes, 256);
-      for (auto field : fields)
-        expected += aligned(std::max(candidates[0].workspace().*field,
-                                     candidates[1].workspace().*field), 256);
+      for (const MoeScratchField &field : kMoeScratchFields)
+        expected += aligned(std::max(candidates[0].workspace().*field.bytes,
+                                     candidates[1].workspace().*field.bytes), 256);
       return aligned(expected, 16 * 1024);
     };
     for (uint32_t cores : {0U, 1U, 20U, 80U}) {

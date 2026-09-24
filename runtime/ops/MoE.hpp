@@ -114,7 +114,49 @@ struct MoeWorkspace final {
   uint64_t expertOutputBytes = 0;
   // The row sums of the Table16 tiles the GGUF register expert tile reads.
   uint64_t groupedSumsBytes = 0;
+  bool operator==(const MoeWorkspace &) const = default;
 };
+
+// The scratch buffers of one MoE dispatch, sized by a plan's MoeWorkspace.
+struct MoeScratch final {
+  // rows * routesPerToken() routes: expert ids and fp32 routing weights.
+  metal::MetalBuffer selectedExperts;
+  metal::MetalBuffer routingWeights;
+  // Sized by moeMaximumTiles(): tile descriptors, one tile count, the route
+  // at each grouped row, each route's grouped row, and the grouped rows'
+  // inputs, intermediates and outputs. The router parks its fp32 scores in
+  // groupedInput until the gather claims it.
+  metal::MetalBuffer tileDescriptors;
+  metal::MetalBuffer tileCount;
+  metal::MetalBuffer groupedRoutes;
+  metal::MetalBuffer routeRows;
+  metal::MetalBuffer groupedInput;
+  metal::MetalBuffer expertIntermediate;
+  metal::MetalBuffer expertOutput;
+  // GGUF register plans: the row sums of the Table16 tiles in groupedInput.
+  metal::MetalBuffer groupedSums;
+};
+
+// Each scratch buffer with the workspace field that sizes it, in field order.
+struct MoeScratchField final {
+  metal::MetalBuffer MoeScratch::*buffer;
+  uint64_t MoeWorkspace::*bytes;
+};
+inline constexpr std::array<MoeScratchField, 10> kMoeScratchFields{{
+    {&MoeScratch::selectedExperts, &MoeWorkspace::selectedExpertsBytes},
+    {&MoeScratch::routingWeights, &MoeWorkspace::routingWeightsBytes},
+    {&MoeScratch::tileDescriptors, &MoeWorkspace::tileDescriptorsBytes},
+    {&MoeScratch::tileCount, &MoeWorkspace::tileCountBytes},
+    {&MoeScratch::groupedRoutes, &MoeWorkspace::groupedRoutesBytes},
+    {&MoeScratch::routeRows, &MoeWorkspace::routeRowsBytes},
+    {&MoeScratch::groupedInput, &MoeWorkspace::groupedInputBytes},
+    {&MoeScratch::expertIntermediate, &MoeWorkspace::expertIntermediateBytes},
+    {&MoeScratch::expertOutput, &MoeWorkspace::expertOutputBytes},
+    {&MoeScratch::groupedSums, &MoeWorkspace::groupedSumsBytes},
+}};
+static_assert(sizeof(MoeWorkspace) == kMoeScratchFields.size() * sizeof(uint64_t) &&
+              sizeof(MoeScratch) == kMoeScratchFields.size() * sizeof(metal::MetalBuffer),
+              "every scratch buffer is in kMoeScratchFields");
 
 // The tile applies to grouping, gather and both expert projections together;
 // changing it never changes the physical rows in a command. Affine plans
@@ -231,22 +273,7 @@ struct MoeBuffers final {
   metal::MetalBuffer input;
   metal::MetalBuffer residual;
   metal::MetalBuffer output;
-  // rows * routesPerToken() routes: expert ids and fp32 routing weights.
-  metal::MetalBuffer selectedExperts;
-  metal::MetalBuffer routingWeights;
-  // Sized by moeMaximumTiles(): tile descriptors, one tile count, the route
-  // at each grouped row, each route's grouped row, and the grouped rows'
-  // inputs, intermediates and outputs. The router parks its fp32 scores in
-  // groupedInput until the gather claims it.
-  metal::MetalBuffer tileDescriptors;
-  metal::MetalBuffer tileCount;
-  metal::MetalBuffer groupedRoutes;
-  metal::MetalBuffer routeRows;
-  metal::MetalBuffer groupedInput;
-  metal::MetalBuffer expertIntermediate;
-  metal::MetalBuffer expertOutput;
-  // GGUF register plans: the row sums of the Table16 tiles in groupedInput.
-  metal::MetalBuffer groupedSums;
+  MoeScratch scratch;
 };
 
 // Routes and executes grouped experts from immutable weight views.

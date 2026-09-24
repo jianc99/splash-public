@@ -113,20 +113,10 @@ void checkPackage(const model::ModelPackage &package, uint32_t family) {
 
   uint64_t decodeGrowth = 0;
   if (geometry.ffnKind == model::QwenFfnKind::SparseMoe) {
-    constexpr std::array fields{
-        &ops::MoeWorkspace::selectedExpertsBytes,
-        &ops::MoeWorkspace::routingWeightsBytes,
-        &ops::MoeWorkspace::tileDescriptorsBytes,
-        &ops::MoeWorkspace::tileCountBytes,
-        &ops::MoeWorkspace::groupedRoutesBytes,
-        &ops::MoeWorkspace::routeRowsBytes,
-        &ops::MoeWorkspace::groupedInputBytes,
-        &ops::MoeWorkspace::expertIntermediateBytes,
-        &ops::MoeWorkspace::expertOutputBytes};
     const auto oldMoe = baseline.moeDecodeWorkspacePerLane(geometry.moeShape());
     const auto newMoe = selected.moeDecodeWorkspacePerLane(geometry.moeShape());
-    for (auto field : fields)
-      decodeGrowth += aligned(4 * (newMoe.*field)) - aligned(4 * (oldMoe.*field));
+    for (const ops::MoeScratchField &field : ops::kMoeScratchFields)
+      decodeGrowth += aligned(4 * (newMoe.*field.bytes)) - aligned(4 * (oldMoe.*field.bytes));
     require(decodeGrowth > 0, "M24 expert plan did not reserve larger scratch");
   }
   require(after.sharedDecodePlannedAllocatedBytes ==

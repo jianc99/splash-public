@@ -92,7 +92,8 @@ void checkMoe(splash::ops::MoeWorkspace workspace,
               workspace.groupedInputBytes == grouped * shape.hiddenSize * 2 &&
               workspace.expertIntermediateBytes ==
                   grouped * shape.expertIntermediateSize * 2 &&
-              workspace.expertOutputBytes == grouped * outputWidth * 2,
+              workspace.expertOutputBytes == grouped * outputWidth * 2 &&
+              workspace.groupedSumsBytes == 0,
           "MoE workspace changed from baseline");
 }
 

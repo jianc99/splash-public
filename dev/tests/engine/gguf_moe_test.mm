@@ -57,6 +57,8 @@ using splash::ops::QuantizedSegment;
 using splash::ops::MoE;
 using splash::ops::MoeBuffers;
 using splash::ops::MoeConfig;
+using splash::ops::MoeScratchField;
+using splash::ops::kMoeScratchFields;
 using splash::ops::MoeExpertSimdgroups;
 using splash::ops::MoeExpertTile;
 using splash::ops::MoeGgufTile;
@@ -411,17 +413,8 @@ struct Buffers {
 
 void allocate(MetalBackend &backend, Buffers &b, const MoePlan &plan) {
   const auto &w = plan.workspace();
-  MoeBuffers &m = b.moe;
-  m.selectedExperts = zeros(backend, w.selectedExpertsBytes, "selected");
-  m.routingWeights = zeros(backend, w.routingWeightsBytes, "routing");
-  m.tileDescriptors = zeros(backend, w.tileDescriptorsBytes, "tiles");
-  m.tileCount = zeros(backend, w.tileCountBytes, "tile-count");
-  m.groupedRoutes = zeros(backend, w.groupedRoutesBytes, "grouped-routes");
-  m.routeRows = zeros(backend, w.routeRowsBytes, "route-rows");
-  m.groupedInput = zeros(backend, w.groupedInputBytes, "grouped-input");
-  m.expertIntermediate = zeros(backend, w.expertIntermediateBytes, "intermediate");
-  m.expertOutput = zeros(backend, w.expertOutputBytes, "expert-output");
-  m.groupedSums = zeros(backend, w.groupedSumsBytes, "grouped-sums");
+  for (const MoeScratchField &field : kMoeScratchFields)
+    b.moe.scratch.*field.buffer = zeros(backend, w.*field.bytes, "moe-scratch");
 }
 
 // The fp64 gate and up products of (row, expert), shared by every plan.
@@ -445,13 +438,13 @@ std::vector<uint16_t> runPlan(MetalBackend &backend, const Model &m, Buffers &b,
   CommandGraph graph;
   MoE::add(graph, b.moe, m.weights, plan);
   static_cast<void>(backend.submitCommand(graph.dispatches()));
-  const auto *selected = static_cast<const uint32_t *>(b.moe.selectedExperts.contents());
-  const auto *routing = static_cast<const float *>(b.moe.routingWeights.contents());
-  const auto *routeRows = static_cast<const uint32_t *>(b.moe.routeRows.contents());
-  const auto *intermediate = static_cast<const __bf16 *>(b.moe.expertIntermediate.contents());
-  const auto *down = static_cast<const __bf16 *>(b.moe.expertOutput.contents());
+  const auto *selected = static_cast<const uint32_t *>(b.moe.scratch.selectedExperts.contents());
+  const auto *routing = static_cast<const float *>(b.moe.scratch.routingWeights.contents());
+  const auto *routeRows = static_cast<const uint32_t *>(b.moe.scratch.routeRows.contents());
+  const auto *intermediate = static_cast<const __bf16 *>(b.moe.scratch.expertIntermediate.contents());
+  const auto *down = static_cast<const __bf16 *>(b.moe.scratch.expertOutput.contents());
   const auto *output = static_cast<const __bf16 *>(b.moe.output.contents());
-  const uint32_t tileRows = plan.tileRows(), tiles = *static_cast<const uint32_t *>(b.moe.tileCount.contents());
+  const uint32_t tileRows = plan.tileRows(), tiles = *static_cast<const uint32_t *>(b.moe.scratch.tileCount.contents());
   require(tiles <= plan.maximumTiles(), label + ": tile count exceeds its bound");
   for (uint32_t r = 0; r < rows; ++r) {
     const float *x = b.input.data() + uint64_t{r} * kHidden;

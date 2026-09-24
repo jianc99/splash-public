@@ -15,19 +15,6 @@ namespace {
 
 constexpr CandidateId kAlternative{1};
 constexpr std::array<WorkloadId, 2> kDistributions{{{0}, {1}}};
-constexpr std::array kScratchFields{
-    &MoeBuffers::selectedExperts, &MoeBuffers::routingWeights,
-    &MoeBuffers::tileDescriptors, &MoeBuffers::tileCount,
-    &MoeBuffers::groupedRoutes, &MoeBuffers::routeRows,
-    &MoeBuffers::groupedInput, &MoeBuffers::expertIntermediate,
-    &MoeBuffers::expertOutput, &MoeBuffers::groupedSums};
-constexpr std::array kWorkspaceFields{
-    &MoeWorkspace::selectedExpertsBytes, &MoeWorkspace::routingWeightsBytes,
-    &MoeWorkspace::tileDescriptorsBytes, &MoeWorkspace::tileCountBytes,
-    &MoeWorkspace::groupedRoutesBytes, &MoeWorkspace::routeRowsBytes,
-    &MoeWorkspace::groupedInputBytes, &MoeWorkspace::expertIntermediateBytes,
-    &MoeWorkspace::expertOutputBytes, &MoeWorkspace::groupedSumsBytes};
-
 uint64_t aligned(uint64_t value, uint64_t alignment) {
   if (value > std::numeric_limits<uint64_t>::max() - alignment + 1)
     throw std::overflow_error("MoE tuning fixture is too large");
@@ -41,7 +28,7 @@ struct Fixture final {
 };
 
 struct FixtureLayout final {
-  std::array<uint64_t, 4 + kWorkspaceFields.size()> sizes;
+  std::array<uint64_t, 4 + kMoeScratchFields.size()> sizes;
   uint64_t bytes = 0;
 };
 
@@ -53,10 +40,10 @@ FixtureLayout fixtureLayout(const std::array<MoePlan, 2> &plans) {
   // of whichever candidate happens to have the larger workspace.
   FixtureLayout layout{{rowBytes, rowBytes, rowBytes,
                          rowBytes * kDistributions.size()}};
-  for (size_t field = 0; field < kWorkspaceFields.size(); ++field)
+  for (size_t field = 0; field < kMoeScratchFields.size(); ++field)
     layout.sizes[field + 4] =
-        std::max(plans[0].workspace().*kWorkspaceFields[field],
-                 plans[1].workspace().*kWorkspaceFields[field]);
+        std::max(plans[0].workspace().*kMoeScratchFields[field].bytes,
+                 plans[1].workspace().*kMoeScratchFields[field].bytes);
   for (const uint64_t size : layout.sizes) {
     const uint64_t padded = aligned(size, 256);
     if (layout.bytes > std::numeric_limits<uint64_t>::max() - padded)
@@ -102,8 +89,8 @@ Fixture allocateFixture(metal::MetalBackend &backend,
   const auto references = view(3);
   for (size_t i = 0; i < fixture.references.size(); ++i)
     fixture.references[i] = backend.view(references, i * layout.sizes[0], layout.sizes[0]);
-  for (size_t field = 0; field < kScratchFields.size(); ++field)
-    fixture.buffers.*kScratchFields[field] = view(field + 4);
+  for (size_t field = 0; field < kMoeScratchFields.size(); ++field)
+    fixture.buffers.scratch.*kMoeScratchFields[field].buffer = view(field + 4);
   return fixture;
 }
 
@@ -136,8 +123,8 @@ void reset(Fixture &fixture, const MoeWorkload &workload,
   auto *output = static_cast<uint16_t *>(fixture.buffers.output.contents());
   std::fill_n(output, fixture.buffers.output.sizeBytes() / sizeof(uint16_t),
               uint16_t{0x7fc0});
-  for (auto field : kScratchFields) {
-    const auto &buffer = fixture.buffers.*field;
+  for (const MoeScratchField &field : kMoeScratchFields) {
+    const auto &buffer = fixture.buffers.scratch.*field.buffer;
     std::memset(buffer.contents(), 0, static_cast<size_t>(buffer.sizeBytes()));
   }
 }

@@ -74,12 +74,11 @@ constexpr std::array draftFields{
     &DraftAttentionWorkspace::groupedQueriesBytes,
     &DraftAttentionWorkspace::queryKeysBytes,
     &DraftAttentionWorkspace::queryValuesBytes};
-constexpr std::array moeFields{
-    &MoeWorkspace::selectedExpertsBytes, &MoeWorkspace::routingWeightsBytes,
-    &MoeWorkspace::tileDescriptorsBytes, &MoeWorkspace::tileCountBytes,
-    &MoeWorkspace::groupedRoutesBytes, &MoeWorkspace::routeRowsBytes,
-    &MoeWorkspace::groupedInputBytes, &MoeWorkspace::expertIntermediateBytes,
-    &MoeWorkspace::expertOutputBytes, &MoeWorkspace::groupedSumsBytes};
+constexpr auto moeFields = [] {
+  std::array<uint64_t MoeWorkspace::*, kMoeScratchFields.size()> fields{};
+  for (size_t i = 0; i < fields.size(); ++i) fields[i] = kMoeScratchFields[i].bytes;
+  return fields;
+}();
 
 template <typename Workspace, size_t N>
 void include(Workspace &bound, const Workspace &required,

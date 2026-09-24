@@ -1023,16 +1023,7 @@ struct Runtime::Impl {
     buffers.ropeSin = p(PrefillTensor::RopeSin);
     buffers.chunkKeys = p(PrefillTensor::ChunkKeys);
     buffers.chunkValues = p(PrefillTensor::ChunkValues);
-    buffers.selectedExperts = p(PrefillTensor::MoeSelectedExperts);
-    buffers.routingWeights = p(PrefillTensor::MoeRoutingWeights);
-    buffers.tileDescriptors = p(PrefillTensor::MoeTileDescriptors);
-    buffers.tileCount = p(PrefillTensor::MoeTileCount);
-    buffers.groupedRoutes = p(PrefillTensor::MoeGroupedRoutes);
-    buffers.routeRows = p(PrefillTensor::MoeRouteRows);
-    buffers.groupedInput = p(PrefillTensor::MoeGroupedInput);
-    buffers.expertIntermediate = p(PrefillTensor::MoeExpertIntermediate);
-    buffers.expertOutput = p(PrefillTensor::MoeExpertOutput);
-    buffers.groupedSums = p(PrefillTensor::MoeGroupedSums);
+    buffers.moe = prefillArena->moeScratch();
     std::vector<kv::LayerStorage> kvLayers(
         geometry.target.kvLayout.attentionLayers);
     for (uint32_t layer = 0; layer < kvLayers.size(); ++layer)
@@ -1263,16 +1254,7 @@ struct Runtime::Impl {
     buffers.gdnBeta = gdnBeta;
     buffers.chunkKeys = chunkKeys;
     buffers.chunkValues = chunkValues;
-    buffers.selectedExperts = d(DecodeTensor::MoeSelectedExperts);
-    buffers.routingWeights = d(DecodeTensor::MoeRoutingWeights);
-    buffers.tileDescriptors = d(DecodeTensor::MoeTileDescriptors);
-    buffers.tileCount = d(DecodeTensor::MoeTileCount);
-    buffers.groupedRoutes = d(DecodeTensor::MoeGroupedRoutes);
-    buffers.routeRows = d(DecodeTensor::MoeRouteRows);
-    buffers.groupedInput = d(DecodeTensor::MoeGroupedInput);
-    buffers.expertIntermediate = d(DecodeTensor::MoeExpertIntermediate);
-    buffers.expertOutput = d(DecodeTensor::MoeExpertOutput);
-    buffers.groupedSums = d(DecodeTensor::MoeGroupedSums);
+    buffers.moe = decodeArena->moeScratch(storage);
     for (uint32_t lane = 0; lane < kLaneCount; ++lane) {
       const ModelBatchItem &item = paddedItem(lane);
       q8[lane] = q8Params(item.logicalPosition, kDecodeRows, kTileRows,

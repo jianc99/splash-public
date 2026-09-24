@@ -35,9 +35,11 @@ using splash::model::q4PackedBytes;
 using splash::ops::AffineMoeWeights;
 using splash::ops::ExpertProjection;
 using splash::ops::kMoeRouteWideRows;
+using splash::ops::kMoeScratchFields;
 using splash::ops::MoE;
 using splash::ops::MoeBuffers;
 using splash::ops::MoeConfig;
+using splash::ops::MoeScratchField;
 using splash::ops::MoeExpertSimdgroups;
 using splash::ops::MoeExpertTile;
 using splash::ops::MoePlan;
@@ -283,17 +285,9 @@ Fixture makeFixture(MetalBackend &backend) {
 void allocateScratch(MetalBackend &backend, Fixture &fixture,
                      const MoePlan &plan) {
   const auto &w = plan.workspace();
-  auto &b = fixture.buffers;
-  b.selectedExperts = shared(backend, w.selectedExpertsBytes, "selected");
-  b.routingWeights = shared(backend, w.routingWeightsBytes, "routing");
-  b.tileDescriptors = shared(backend, w.tileDescriptorsBytes, "tiles");
-  b.tileCount = shared(backend, w.tileCountBytes, "tile-count");
-  b.groupedRoutes = shared(backend, w.groupedRoutesBytes, "grouped-routes");
-  b.routeRows = shared(backend, w.routeRowsBytes, "route-rows");
-  b.groupedInput = shared(backend, w.groupedInputBytes, "grouped-input");
-  b.expertIntermediate =
-      shared(backend, w.expertIntermediateBytes, "intermediate");
-  b.expertOutput = shared(backend, w.expertOutputBytes, "expert-output");
+  for (const MoeScratchField &field : kMoeScratchFields)
+    if (const uint64_t bytes = w.*field.bytes)
+      fixture.buffers.scratch.*field.buffer = shared(backend, bytes, "moe-scratch");
 }
 
 enum class Routing { Dispersed, Concentrated, Skewed };
@@ -324,23 +318,23 @@ const char *configureRouting(Fixture &fixture, Routing distribution) {
 void check(const Fixture &fixture, uint32_t rows, uint32_t tileRows,
            const std::string &label) {
   const auto *selected =
-      static_cast<const uint32_t *>(fixture.buffers.selectedExperts.contents());
+      static_cast<const uint32_t *>(fixture.buffers.scratch.selectedExperts.contents());
   const auto *routing =
-      static_cast<const float *>(fixture.buffers.routingWeights.contents());
+      static_cast<const float *>(fixture.buffers.scratch.routingWeights.contents());
   const auto *actual = static_cast<const __bf16 *>(fixture.buffers.output.contents());
   const auto *tileCount =
-      static_cast<const uint32_t *>(fixture.buffers.tileCount.contents());
+      static_cast<const uint32_t *>(fixture.buffers.scratch.tileCount.contents());
   require(*tileCount >= kTopK + 1 &&
               *tileCount <= rows * kTopK + (rows + tileRows - 1) / tileRows,
           label + ": grouped tile count is out of range");
 
   std::array<uint32_t, kExperts + 1> expertCounts{};
   const auto *routeRows =
-      static_cast<const uint32_t *>(fixture.buffers.routeRows.contents());
+      static_cast<const uint32_t *>(fixture.buffers.scratch.routeRows.contents());
   const auto *groupedRoutes =
-      static_cast<const uint32_t *>(fixture.buffers.groupedRoutes.contents());
+      static_cast<const uint32_t *>(fixture.buffers.scratch.groupedRoutes.contents());
   const auto *tiles =
-      static_cast<const uint32_t *>(fixture.buffers.tileDescriptors.contents());
+      static_cast<const uint32_t *>(fixture.buffers.scratch.tileDescriptors.contents());
   for (uint32_t route = 0; route < rows * kRoutesPerRow; ++route) {
     require(selected[route] <= kExperts, label + ": invalid selected expert");
     ++expertCounts[selected[route]];
@@ -426,10 +420,10 @@ void check(const Fixture &fixture, uint32_t rows, uint32_t tileRows,
       // through no fault of the down kernel.
       const uint32_t grouped = routeRows[row * kRoutesPerRow + slot];
       const auto *gpuIntermediate = static_cast<const __bf16 *>(
-          fixture.buffers.expertIntermediate.contents()) +
+          fixture.buffers.scratch.expertIntermediate.contents()) +
           uint64_t{grouped} * kIntermediate;
       const auto *gpuDown = static_cast<const __bf16 *>(
-          fixture.buffers.expertOutput.contents()) + uint64_t{grouped} * kHidden;
+          fixture.buffers.scratch.expertOutput.contents()) + uint64_t{grouped} * kHidden;
       for (uint32_t n = 0; n < kIntermediate; ++n) {
         require(std::isfinite(float(gpuIntermediate[n])) &&
                     std::abs(float(gpuIntermediate[n]) - intermediate[n]) <=
@@ -479,19 +473,6 @@ template <class Function> void rejects(Function function, const char *label) {
     return;
   }
   fail(std::string(label) + ": invalid plan or buffers were accepted");
-}
-
-bool sameWorkspace(const splash::ops::MoeWorkspace &a,
-                   const splash::ops::MoeWorkspace &b) {
-  return a.selectedExpertsBytes == b.selectedExpertsBytes &&
-         a.routingWeightsBytes == b.routingWeightsBytes &&
-         a.tileDescriptorsBytes == b.tileDescriptorsBytes &&
-         a.tileCountBytes == b.tileCountBytes &&
-         a.groupedRoutesBytes == b.groupedRoutesBytes &&
-         a.routeRowsBytes == b.routeRowsBytes &&
-         a.groupedInputBytes == b.groupedInputBytes &&
-         a.expertIntermediateBytes == b.expertIntermediateBytes &&
-         a.expertOutputBytes == b.expertOutputBytes;
 }
 
 void checkPlan(const MoePlan &plan) {
@@ -570,7 +551,7 @@ void planBounds() {
                     narrow[index].tileRows() == plans[index].tileRows() &&
                     narrow[index].maximumTiles() == plans[index].maximumTiles() &&
                     !narrow[index].splitExperts() &&
-                    sameWorkspace(narrow[index].workspace(), plans[index].workspace()),
+                    narrow[index].workspace() == plans[index].workspace(),
                 "four-simdgroup tiles changed the plan geometry or workspace");
         checkPlan(narrow[index]);
       }
@@ -718,14 +699,11 @@ void bufferBounds(MetalBackend &backend, Fixture &fixture) {
       projection.packed = backend.view(projection.packed, 0, bytes - 1);
       rejectWeights(changed, "undersized final expert boundary");
     }
-    for (auto member : {&MoeBuffers::selectedExperts, &MoeBuffers::routingWeights,
-                        &MoeBuffers::tileDescriptors, &MoeBuffers::tileCount,
-                        &MoeBuffers::groupedRoutes, &MoeBuffers::routeRows,
-                        &MoeBuffers::groupedInput, &MoeBuffers::expertIntermediate,
-                        &MoeBuffers::expertOutput}) {
+    for (const MoeScratchField &field : kMoeScratchFields) {
+      const auto &buffer = fixture.buffers.scratch.*field.buffer;
+      if (!(plan.workspace().*field.bytes)) continue;
       MoeBuffers shortBuffers = fixture.buffers;
-      const auto &buffer = fixture.buffers.*member;
-      shortBuffers.*member = backend.view(buffer, 0, buffer.sizeBytes() - 1);
+      shortBuffers.scratch.*field.buffer = backend.view(buffer, 0, buffer.sizeBytes() - 1);
       CommandGraph graph;
       rejects([&] { MoE::add(graph, shortBuffers, fixture.weights, plan); },
               "undersized scratch");
@@ -856,9 +834,9 @@ void run(const std::string &metallibPath) {
             " M" + std::to_string(plan.tileRows()));
       ++cases;
       const auto *selected = static_cast<const uint32_t *>(
-          fixture.buffers.selectedExperts.contents());
+          fixture.buffers.scratch.selectedExperts.contents());
       const auto *routing = static_cast<const float *>(
-          fixture.buffers.routingWeights.contents());
+          fixture.buffers.scratch.routingWeights.contents());
       const size_t routes = size_t{plan.rows()} * kRoutesPerRow;
       const size_t common = std::min(routes, sharedSelected.size());
       require(std::equal(selected, selected + common, sharedSelected.begin()) &&
