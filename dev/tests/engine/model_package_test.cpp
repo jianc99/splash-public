@@ -552,6 +552,89 @@ void testGgufImageLayout(MetalBackend &backend, const std::filesystem::path &roo
     }
 }
 
+// An unquantized MLX vision tower of layout, every value zero: the
+// vision_tower.* tensors the vision loader binds.
+void writeMlxVisionTower(const std::filesystem::path &directory, const VisionLayout &layout) {
+    std::vector<std::pair<std::string, std::vector<uint64_t>>> tensors;
+    const auto affine = [&](const std::string &name, uint64_t rows, uint64_t columns) {
+        tensors.push_back({name + ".weight", {rows, columns}});
+        tensors.push_back({name + ".bias", {rows}});
+    };
+    const auto norm = [&](const std::string &name) {
+        tensors.push_back({name + ".weight", {layout.hiddenSize}});
+        tensors.push_back({name + ".bias", {layout.hiddenSize}});
+    };
+    tensors.push_back({"patch_embed.proj.weight", {layout.hiddenSize, 2, layout.patchSize, layout.patchSize, 3}});
+    tensors.push_back({"patch_embed.proj.bias", {layout.hiddenSize}});
+    tensors.push_back({"pos_embed.weight",
+                       {uint64_t{layout.positionGridSide} * layout.positionGridSide, layout.hiddenSize}});
+    for (uint32_t block = 0; block < layout.depth; ++block) {
+        const std::string prefix = "blocks." + std::to_string(block) + ".";
+        norm(prefix + "norm1");
+        affine(prefix + "attn.qkv", 3 * layout.hiddenSize, layout.hiddenSize);
+        affine(prefix + "attn.proj", layout.hiddenSize, layout.hiddenSize);
+        norm(prefix + "norm2");
+        affine(prefix + "mlp.linear_fc1", layout.intermediateSize, layout.hiddenSize);
+        affine(prefix + "mlp.linear_fc2", layout.hiddenSize, layout.intermediateSize);
+    }
+    norm("merger.norm");
+    affine("merger.linear_fc1", layout.mergedHiddenSize, layout.mergedHiddenSize);
+    affine("merger.linear_fc2", layout.outputHiddenSize, layout.mergedHiddenSize);
+    std::string header;
+    uint64_t dataBytes = 0;
+    for (const auto &[name, shape] : tensors) {
+        uint64_t bytes = 2;
+        std::string dimensions;
+        for (uint64_t dimension : shape) {
+            bytes *= dimension;
+            dimensions += (dimensions.empty() ? "" : ",") + std::to_string(dimension);
+        }
+        header += (header.empty() ? "{" : ",") + std::string("\"vision_tower.") + name +
+                  "\":{\"dtype\":\"BF16\",\"shape\":[" + dimensions + "],\"data_offsets\":[" +
+                  std::to_string(dataBytes) + "," + std::to_string(dataBytes + bytes) + "]}";
+        dataBytes += bytes;
+    }
+    header += "}";
+    std::ofstream(directory / "config.json") << "{}";
+    std::ofstream file(directory / "model.safetensors", std::ios::binary);
+    const uint64_t headerBytes = header.size();
+    file.write(reinterpret_cast<const char *>(&headerBytes), sizeof headerBytes);
+    file << header << std::string(dataBytes, '\0');
+}
+
+// Every prepared file of a model is budgeted before the first is written: a
+// prepared vision tower beside a packed target that the disk cannot hold
+// fails the load before conversion is admitted and writes nothing.
+void testModelDiskCheck(MetalBackend &backend, const std::filesystem::path &root, const Qwen3_8Layout &target,
+                        const DFlashDraftLayout &draft, VisionLayout vision) {
+    const std::filesystem::path cache = root / "cache";
+    std::filesystem::create_directories(cache);
+    setenv("SPLASH_WEIGHT_CACHE", cache.c_str(), 1);
+    writeMlxVisionTower(root / "vision", vision);
+    // The padding sizes the prepared file alone; the source keeps its shapes.
+    // Grow it until the prepared tower exceeds this volume's free space.
+    const uint64_t available = std::filesystem::space(cache).available;
+    vision.paddedIntermediateSize = 1u << 20;
+    while (splash::model::preparedVisionBytes(vision) <= available && vision.paddedIntermediateSize < (1u << 31))
+        vision.paddedIntermediateSize *= 2;
+    const uint64_t bytes = splash::model::preparedVisionBytes(vision);
+    require(bytes > available, "the oversized vision tower fits on this volume");
+    auto descriptor = makeModelDescriptor("Qwen dense disk check", target, draft, vision);
+    descriptor.visionSource = splash::model::VisionSource::Mlx;
+    bool admitted = false;
+    std::string error;
+    try {
+        static_cast<void>(loadModelPackage(backend, root, descriptor, [&] { admitted = true; }));
+    } catch (const std::exception &failure) {
+        error = failure.what();
+    }
+    require(error.starts_with("not enough disk space to prepare weights: need " + std::to_string(bytes) + " bytes"),
+            "the model disk check did not budget the vision tower: " + error);
+    require(!admitted, "conversion was admitted before the model disk check");
+    const auto planned = splash::model::planVisionLoader(backend, root, descriptor, {});
+    require(!std::filesystem::exists(cache / planned->weight().key), "the model disk check wrote the vision tower");
+}
+
 void testSyntheticPackage(MetalBackend &backend,
                           const std::filesystem::path &root) {
     Qwen3_8Layout target;
@@ -675,6 +758,8 @@ void testSyntheticPackage(MetalBackend &backend,
     }
     require(backend.memoryStats().allocatedBytes == baseline,
             "model package allocations survived package destruction");
+
+    testModelDiskCheck(backend, root, target, draft, vision);
 
     std::cout << "synthetic declared_target=" << expected.targetBytes
               << " declared_draft=" << expected.draftBytes
