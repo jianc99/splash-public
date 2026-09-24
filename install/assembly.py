@@ -26,8 +26,8 @@ The paths an assembly links, and what reads each:
                          the DFlash2 draft (ModelDescriptor.mm, DFlashDraft.cpp)
   vision/config.json, vision/<shard>
                          the MLX shards holding vision_tower.*
-                         (VisionPreparation.cpp, through SafetensorsCheckpoint.mm)
-  vision/mmproj.gguf     the GGUF vision projector (VisionPreparation.cpp)
+                         (VisionLoader.cpp, through SafetensorsCheckpoint.mm)
+  vision/mmproj.gguf     the GGUF vision projector (VisionLoader.cpp)
 """
 
 from __future__ import annotations
