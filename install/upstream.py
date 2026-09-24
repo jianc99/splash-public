@@ -65,16 +65,18 @@ def _root_ggufs(files):
 
 
 def select_gguf(files, variant):
-    """The target GGUF among a repository's root files, and whether its name
-    matched :VARIANT exactly. :VARIANT names the file whose name is the model
-    name all of them share, then -VARIANT (X-Q4_K_M for Q4_K_M, not
-    X-UD-Q4_K_M); failing that, the only file whose name ends in -VARIANT.
-    Without :VARIANT, the only target GGUF. Anything else is an error listing
-    the candidates."""
+    """The target GGUF among a repository's root files, and whether it was
+    taken by its -VARIANT ending from several, which the caller reports.
+    :VARIANT names the file whose name is the model name all of them share,
+    then -VARIANT (X-Q4_K_M for Q4_K_M, not X-UD-Q4_K_M); failing that, the
+    only file whose name ends in -VARIANT. A repository of one GGUF names no
+    variant apart from its model, so its one match needs no report. Without
+    :VARIANT, the only target GGUF. Anything else is an error listing the
+    candidates."""
     candidates = [n for n in _root_ggufs(files) if not n.lower().startswith("mmproj")]
     if variant is None:
         if len(candidates) == 1:
-            return candidates[0], True
+            return candidates[0], False
         choice = "select a GGUF with OWNER/REPO:VARIANT"
     else:
         parts = [Path(name).stem.split("-") for name in candidates]
@@ -85,12 +87,11 @@ def select_gguf(files, variant):
             if "-".join(words[shared:]).lower() == variant.lower()
         ]
         if len(exact) == 1:
-            return exact[0], True
+            return exact[0], False
         suffix = "-" + variant.lower()
         ending = [n for n in candidates if Path(n).stem.lower().endswith(suffix)]
         if len(ending) == 1:
-            # A repository of one GGUF names no variant apart from its model.
-            return ending[0], len(candidates) == 1
+            return ending[0], len(candidates) > 1
         choice = "no single GGUF matches :" + variant
     listed = ", ".join(candidates) or "none"
     raise models.ModelError(f"{choice} (files in the repository root: {listed})")
@@ -146,7 +147,7 @@ def inspect_target(repo, variant, language_only):
 
 
 def _gguf_target(repo, variant, language_only):
-    name, exact = select_gguf(repo.files, variant)
+    name, by_ending = select_gguf(repo.files, variant)
     with repo.open(name) as stream:
         header = gguf.Metadata(stream, tensors=True)
     gguf.require_loadable(header)
@@ -157,10 +158,10 @@ def _gguf_target(repo, variant, language_only):
         _validate_processor(gguf.processor_config(vision_header))
     config = gguf.model_config(header, vision_header)
     print(
-        f"Selected {name} from {repo.name}."
-        if exact
-        else f"No GGUF is named for :{variant} alone; selected {name} from "
-        f"{repo.name}, the only one whose name ends in -{variant}.",
+        f"No GGUF is named for :{variant} alone; selected {name} from "
+        f"{repo.name}, the only one whose name ends in -{variant}."
+        if by_ending
+        else f"Selected {name} from {repo.name}.",
         flush=True,
     )
     return Target("gguf", "none" if language_only else "gguf", config, files)

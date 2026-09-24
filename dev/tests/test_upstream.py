@@ -91,20 +91,20 @@ class UpstreamTest(unittest.TestCase):
         }
         self.assertEqual(
             upstream.select_gguf(files, "UD-Q4_K_M"),
-            ("Qwen3.8-27B-UD-Q4_K_M.gguf", True),
+            ("Qwen3.8-27B-UD-Q4_K_M.gguf", False),
         )
         self.assertEqual(
-            upstream.select_gguf(files, "q4_0"), ("Qwen3.8-27B-Q4_0.gguf", True)
+            upstream.select_gguf(files, "q4_0"), ("Qwen3.8-27B-Q4_0.gguf", False)
         )
         # Q4_K_M names the plain file; without one, the one file ending so,
-        # which is not an exact match, and never one of several.
+        # which the caller reports, and never one of several.
         both = files | {"Qwen3.8-27B-Q4_K_M.gguf"}
         self.assertEqual(
-            upstream.select_gguf(both, "Q4_K_M"), ("Qwen3.8-27B-Q4_K_M.gguf", True)
+            upstream.select_gguf(both, "Q4_K_M"), ("Qwen3.8-27B-Q4_K_M.gguf", False)
         )
         self.assertEqual(
             upstream.select_gguf(files, "Q4_K_M"),
-            ("Qwen3.8-27B-UD-Q4_K_M.gguf", False),
+            ("Qwen3.8-27B-UD-Q4_K_M.gguf", True),
         )
         with self.assertRaisesRegex(
             models.ModelError,
@@ -117,7 +117,7 @@ class UpstreamTest(unittest.TestCase):
         for variant in ("UD-Q4_K_M", "Q4_K_M", None):
             self.assertEqual(
                 upstream.select_gguf({"Qwen3.8-27B-UD-Q4_K_M.gguf"}, variant),
-                ("Qwen3.8-27B-UD-Q4_K_M.gguf", True),
+                ("Qwen3.8-27B-UD-Q4_K_M.gguf", False),
             )
         for variant in (None, "Q4", "BF16", "missing"):
             with (
