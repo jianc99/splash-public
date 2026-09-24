@@ -31,6 +31,7 @@ using splash::metal::BufferStorage;
 using splash::metal::CommandGraph;
 using splash::metal::MetalBackend;
 using splash::metal::MetalBuffer;
+using splash::model::kBFloat16Bytes;
 using splash::model::q4PackedBytes;
 using splash::ops::AffineMoeWeights;
 using splash::ops::ExpertProjection;
@@ -475,29 +476,31 @@ template <class Function> void rejects(Function function, const char *label) {
   fail(std::string(label) + ": invalid plan or buffers were accepted");
 }
 
+// Expert ids, route rows and grouped routes are uint32, routing weights fp32
+// and activations bf16. The grouped input first holds the router's fp32
+// scores, one StorageN row per token.
 void checkPlan(const MoePlan &plan) {
   const auto shape = plan.shape();
   const uint64_t rows = plan.rows();
-  const uint64_t tileRows = plan.tileRows();
-  const uint64_t routed = rows * shape.expertsPerToken;
-  const uint64_t tiles = std::min(routed / tileRows + shape.experts, routed) +
-                         (rows + tileRows - 1) / tileRows;
-  const uint64_t grouped = tiles * tileRows;
-  const uint64_t routes = rows * (shape.expertsPerToken + 1);
+  const uint64_t tiles = splash::ops::moeMaximumTiles(plan.rows(), shape, plan.tileRows());
+  const uint64_t grouped = tiles * plan.tileRows();
+  const uint64_t routes = rows * shape.routesPerToken();
   const uint64_t outputWidth =
       plan.splitExperts()
           ? std::max(shape.hiddenSize, shape.expertIntermediateSize)
           : shape.hiddenSize;
   const auto &w = plan.workspace();
   require(plan.maximumTiles() == tiles &&
-              w.selectedExpertsBytes == routes * 4 &&
-              w.routingWeightsBytes == routes * 4 &&
-              w.tileDescriptorsBytes == tiles * 8 && w.tileCountBytes == 4 &&
-              w.groupedRoutesBytes == grouped * 4 && w.routeRowsBytes == routes * 4 &&
-              w.groupedInputBytes == std::max<uint64_t>(
-                  grouped * shape.hiddenSize * 2, rows * 256 * 4) &&
-              w.expertIntermediateBytes == grouped * shape.expertIntermediateSize * 2 &&
-              w.expertOutputBytes == grouped * outputWidth * 2,
+              w.selectedExpertsBytes == routes * sizeof(uint32_t) &&
+              w.routingWeightsBytes == routes * sizeof(float) &&
+              w.tileDescriptorsBytes == tiles * sizeof(MoeTileDescriptor) &&
+              w.tileCountBytes == sizeof(uint32_t) &&
+              w.groupedRoutesBytes == grouped * sizeof(uint32_t) &&
+              w.routeRowsBytes == routes * sizeof(uint32_t) &&
+              w.groupedInputBytes == std::max<uint64_t>(grouped * shape.hiddenSize * kBFloat16Bytes,
+                                                        rows * kStorageN * sizeof(float)) &&
+              w.expertIntermediateBytes == grouped * shape.expertIntermediateSize * kBFloat16Bytes &&
+              w.expertOutputBytes == grouped * outputWidth * kBFloat16Bytes && w.groupedSumsBytes == 0,
           "candidate workspace disagrees with independent geometry bound");
 }
 
