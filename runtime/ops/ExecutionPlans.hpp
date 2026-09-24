@@ -118,8 +118,7 @@ public:
       MoeShape shape, uint32_t maximumRows) const;
   [[nodiscard]] MoeWorkspace moeDecodeWorkspacePerLane(MoeShape shape) const;
   // This scratch is one whole-command buffer, not a per-lane arena field.
-  [[nodiscard]] uint64_t gateUpWorkspace(LinearMatrix matrix,
-                                         WeightLayout weightLayout = WeightLayout::Affine64) const;
+  [[nodiscard]] uint64_t gateUpWorkspace(ProjectionShape shape) const;
 
 private:
   // The plan of `config` with the device's fields.

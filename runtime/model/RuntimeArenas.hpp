@@ -417,10 +417,10 @@ public:
     // present) and the always-dense DFlash draft. Sparse target FFNs use their
     // own route-major arena tensors, but must not remove the draft's scratch.
     const uint64_t draft = operators.gateUpWorkspace(
-        {geometry.draft.intermediateSize, geometry.draft.hiddenSize});
+        {geometry.draft.intermediateSize, geometry.draft.hiddenSize, ops::WeightLayout::Affine64});
     uint64_t target = 0;
     for (const auto &p : geometry.target.gateUpProjections)
-      target = std::max(target, operators.gateUpWorkspace({p.outputSize, p.inputSize}, p.layout));
+      target = std::max(target, operators.gateUpWorkspace(p));
     return std::max(target, draft);
   }
 

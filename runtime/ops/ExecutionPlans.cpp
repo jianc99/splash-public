@@ -255,11 +255,11 @@ MoeWorkspace ExecutionPlans::moeDecodeWorkspacePerLane(MoeShape shape) const {
   return bound;
 }
 
-uint64_t ExecutionPlans::gateUpWorkspace(LinearMatrix matrix, WeightLayout weightLayout) const {
+uint64_t ExecutionPlans::gateUpWorkspace(ProjectionShape shape) const {
   uint64_t bound = 0;
   for (uint32_t lanes = 1; lanes <= kMaximumLanes; ++lanes) {
-    const LinearWorkload workload{matrix, lanes * kDecodeRows,
-                                  LinearPhase::Decode, LinearEpilogue::GateUp, weightLayout};
+    const LinearWorkload workload{{shape.outputSize, shape.inputSize}, lanes * kDecodeRows,
+                                  LinearPhase::Decode, LinearEpilogue::GateUp, shape.layout};
     bound = std::max({bound, baselineLinear_.plan(workload).gateScratchBytes(),
                       linear_.plan(workload).gateScratchBytes()});
   }

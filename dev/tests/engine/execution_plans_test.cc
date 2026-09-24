@@ -32,6 +32,10 @@ constexpr std::array matrices{
     LinearMatrix{17408, 5120}, LinearMatrix{6144, 5120},
     LinearMatrix{6144, 2048}, LinearMatrix{512, 2048},
     LinearMatrix{768, 768}};
+// The affine gate/up projection of `matrix`, which gateUpWorkspace sizes.
+constexpr ProjectionShape affineGateUp(LinearMatrix matrix) {
+  return {matrix.outputSize, matrix.inputSize, WeightLayout::Affine64};
+}
 constexpr std::array attentionFields{
     &AttentionWorkspace::partialsBytes, &AttentionWorkspace::statisticsBytes};
 constexpr std::array draftFields{
@@ -80,7 +84,7 @@ void baselinePlans() {
             gateBound = std::max(gateBound, baseline.plan(w).gateScratchBytes());
         }
       }
-      require(plans.gateUpWorkspace(matrix) == gateBound &&
+      require(plans.gateUpWorkspace(affineGateUp(matrix)) == gateBound &&
                   gateBound == (family == 9 ? 0 : uint64_t{32} * matrix.outputSize * 2),
               "gate/up workspace disagrees with fused or decomposed baseline");
       for (uint32_t rows : {1U, 17U, 2048U})
@@ -295,10 +299,10 @@ void allCandidates() {
                         selected.sumsBytes() == original.sumsBytes() &&
                         selected.gateScratchBytes() == original.gateScratchBytes() &&
                         selected.downSumsBytes() == original.downSumsBytes() &&
-                        plans.gateUpWorkspace(matrix) == shipped.gateUpWorkspace(matrix),
+                        plans.gateUpWorkspace(affineGateUp(matrix)) == shipped.gateUpWorkspace(affineGateUp(matrix)),
                     "four-SIMDgroup choice changed an external workspace requirement");
           }
-          require(plans.gateUpWorkspace(matrix) >= candidate.gateScratchBytes() ||
+          require(plans.gateUpWorkspace(affineGateUp(matrix)) >= candidate.gateScratchBytes() ||
                       phase == LinearPhase::Prefill,
                   "gate scratch omitted a selected decode width");
         }
@@ -480,8 +484,8 @@ void policyKeysAndBounds() {
               moe.expertIntermediateBytes == 2108075 && moe.groupedRoutesBytes == 8235 &&
               moe.tileDescriptorsBytes == 520 && moe.tileCountBytes == 4,
           "B3 MoE workspace must use componentwise ceiling, including baseline");
-  require(plans.gateUpWorkspace(matrices[0]) == 1114112 &&
-              plans.gateUpWorkspace(matrices[1]) == 393216,
+  require(plans.gateUpWorkspace(affineGateUp(matrices[0])) == 1114112 &&
+              plans.gateUpWorkspace(affineGateUp(matrices[1])) == 393216,
           "B1 gate choice hid the B3/B4 baseline requirement");
   const auto draft = plans.draftAttentionWorkspacePerLane(draftShapes[0]);
   // Grouped queries per lane plus eight heads x four splits of 32 x 130 fp32
