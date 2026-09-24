@@ -741,7 +741,7 @@ For a same-machine HTTP regression check, retain the previous `splash` binary
 
 ```sh
 .venv/bin/python -m dev.benchmarks.http_regression \
-  --model incoai/Qwen3.8-27B-Splash \
+  --model unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M \
   --baseline-binary /path/to/baseline/build/splash \
   --contexts 2048,10000 --samples 5
 ```
