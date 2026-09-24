@@ -135,11 +135,7 @@ struct Tensor {
 };
 
 Tensor quantized(MetalBackend &backend, Fmt f, uint32_t rows, uint32_t K) {
-  // Scales in realistic per-format ranges (as the dense GGUF checks).
-  std::uniform_real_distribution<float> dk(0.0005f, 0.004f), dx(0.00002f, 0.00015f), d6(0.00002f, 0.0001f),
-      d3s(0.0001f, 0.0005f);
-  std::uniform_real_distribution<float> &d = f == IQ4XS ? dx : f == Q6K ? d6 : f == IQ3S ? d3s : dk;
-  const std::vector<uint8_t> native = makeNative(f, rows, K, rng, [&] { return f2h(d(rng)); });
+  const std::vector<uint8_t> native = makeNative(f, rows, K, rng);
   Tensor t;
   t.rows = rows;
   t.columns = K;
@@ -171,36 +167,11 @@ MetalBuffer bfloatBuffer(MetalBackend &backend, const std::vector<float> &values
   return upload(backend, bits.data(), bits.size() * 2, label);
 }
 
-// The fp64 dot product of a bf16 row with a weight row and the magnitudes its
-// error bounds scale with.
-struct Dot {
-  double value = 0, magnitude = 0, inputs = 0, largest = 0;
-};
-Dot dot(const float *x, const float *w, uint32_t K) {
-  Dot d;
-  for (uint32_t k = 0; k < K; ++k) {
-    d.value += double(x[k]) * w[k];
-    d.magnitude += std::fabs(double(x[k]) * w[k]);
-    d.inputs += std::fabs(x[k]);
-    d.largest = std::max(d.largest, double(std::fabs(w[k])));
-  }
-  return d;
-}
-
 // fp32 accumulation of n exact products: at most n u sum |x w| (u = 2^-24).
 // The simdgroup float tile adds K products, the neural accelerator tile the
 // 3 K products of the weights' bf16 parts.
 double floatBound(const Dot &d, uint32_t K, FloatTile tile = FloatTile::Simdgroup) {
   return std::ldexp(d.magnitude * K * (tile == FloatTile::NeuralAccelerator ? 3 : 1), -24) + 1e-30;
-}
-
-// The fp64 interval a quantized projection's result lies in: the register
-// tile is exact up to fp32 accumulation (2^-16 sum|x| max|w|, the dense
-// register bound); staging rounds every weight once to half (2^-11 relative,
-// 2^-25 absolute below the normal range).
-double projectionBound(const Dot &d, bool staged) {
-  const double accumulation = std::ldexp(d.inputs * d.largest, -16);
-  return staged ? accumulation + std::ldexp(d.magnitude, -11) + std::ldexp(d.inputs, -25) : accumulation;
 }
 
 bool inside(float got, double exact, double bound) {
@@ -569,6 +540,7 @@ int moe(MetalBackend &backend) {
     std::string formats;
     for (Fmt format : m.formats) formats += std::string(formats.empty() ? "" : "/") + fmtName(format);
     for (const MoeGgufTile tile : {MoeGgufTile::Staged, MoeGgufTile::Register}) {
+      const int before = failures;
       Stats stats;
       std::vector<uint16_t> widest;
       for (uint32_t lanes = 4; lanes >= 1; --lanes) {
@@ -601,13 +573,14 @@ int moe(MetalBackend &backend) {
              "errors at most %.1e/%.1e of sum|x w| %s\n",
              formats.c_str(), tile == MoeGgufTile::Register ? "register" : "staged  ",
              100.0 * stats.gateUpFlips / (stats.outputs / 2), 100.0 * stats.downFlips / stats.outputs,
-             stats.gateUpWorst, stats.downWorst, "ok");
+             stats.gateUpWorst, stats.downWorst, failures > before ? "FAIL" : "ok");
     }
     // The 32-row tiles, whose 16- and 32-row matmuls both run at 263 rows,
     // with the router on each float tile: a row's result is the same in every
     // chunk on one tile (either tile's scores of a row depend on that row
     // alone).
     for (const FloatTile router : {FloatTile::Simdgroup, FloatTile::NeuralAccelerator}) {
+      const int before = failures;
       Stats stats;
       std::vector<uint16_t> widest;
       for (const uint32_t rows : {kMaximumRows, 33u, 16u}) {
@@ -624,10 +597,10 @@ int moe(MetalBackend &backend) {
         }
       }
       printf("%-20s staged   prefill 263/33/16 (32-row tiles, %s router): gate/up %.2f%% and down %.2f%% of outputs "
-             "differ from bf16(fp64), errors at most %.1e/%.1e of sum|x w| ok\n",
+             "differ from bf16(fp64), errors at most %.1e/%.1e of sum|x w| %s\n",
              formats.c_str(), router == FloatTile::NeuralAccelerator ? "accelerator" : "simdgroup",
              100.0 * stats.gateUpFlips / (stats.outputs / 2), 100.0 * stats.downFlips / stats.outputs, stats.gateUpWorst,
-             stats.downWorst);
+             stats.downWorst, failures > before ? "FAIL" : "ok");
     }
   }
   return failures;
