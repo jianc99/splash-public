@@ -50,7 +50,7 @@ public:
   // A norm as stored: F32, which the norm kernels read unrounded, as
   // llama.cpp does (ops::NormWeights).
   void floatNorm(const std::string &name, uint64_t elements) {
-    if (const GgufTensor *tensor = floatVector(name, elements)) copy(rows(*tensor, 1, tensor->bytes));
+    if (const GgufTensor *tensor = floatVector(name, elements)) copy(tensorRows(*tensor, 1, tensor->bytes));
   }
 
   // Quantized rows [N, K] repacked into planes, rows in `order`.
@@ -60,7 +60,7 @@ public:
     if (tensor->rows() != rows || tensor->columns() != columns) throw GgufError("unexpected shape for " + name);
     const uint32_t format = gguf_format_of(tensor->type);
     Repack repack = planes(format, rows, columns, name);
-    repack.sources.push_back(this->rows(*tensor, rows, ggufRowBytes(kQuantFormats[format], columns), order));
+    repack.sources.push_back(tensorRows(*tensor, rows, ggufRowBytes(kQuantFormats[format], columns), order));
     image_.repacks.push_back(std::move(repack));
   }
 
@@ -82,7 +82,7 @@ public:
       descriptor(ggml::kF32, 2ull * heads, hidden, {}, {beta->bytes + alpha->bytes, 0, 0}, betaName);
       uint64_t destination = section(beta->bytes + alpha->bytes);
       for (const GgufTensor *t : {beta, alpha}) {
-        image_.copies.push_back({destination, rows(*t, heads, t->bytes / heads, grouped(0, 1))});
+        image_.copies.push_back({destination, tensorRows(*t, heads, t->bytes / heads, grouped(0, 1))});
         destination += t->bytes;
       }
       return;
@@ -90,7 +90,7 @@ public:
     if (2 * heads > kGgufTileRows) throw GgufError("alpha/beta rows exceed one 256-row tile");
     Repack repack = planes(GGUF_FMT_Q80, kGgufTileRows, hidden, alphaName);
     for (const GgufTensor *t : {beta, alpha})
-      repack.sources.push_back(rows(*t, heads, ggufRowBytes(kQuantFormats[GGUF_FMT_Q80], hidden), grouped(0, 1)));
+      repack.sources.push_back(tensorRows(*t, heads, ggufRowBytes(kQuantFormats[GGUF_FMT_Q80], hidden), grouped(0, 1)));
     image_.repacks.push_back(std::move(repack));
   }
 
@@ -100,7 +100,7 @@ public:
   void convolution(const std::string &name, uint64_t keyRows) {
     const uint32_t channels = geometry_.convolutionDimension;
     if (const GgufTensor *tensor = floatVector(name, uint64_t{channels} * kGdnConvolutionTaps))
-      copy(rows(*tensor, channels, tensor->bytes / channels, grouped(keyRows, geometry_.gdnHeadDimension)), true);
+      copy(tensorRows(*tensor, channels, tensor->bytes / channels, grouped(keyRows, geometry_.gdnHeadDimension)), true);
   }
 
   // A per value head F32 vector in grouped head order: as stored, or as the
@@ -108,7 +108,7 @@ public:
   void headVector(const std::string &name, bool bfloat16) {
     const uint32_t heads = geometry_.gdnValueHeads;
     if (const GgufTensor *tensor = floatVector(name, heads))
-      copy(rows(*tensor, heads, tensor->bytes / heads, grouped(0, 1)), bfloat16);
+      copy(tensorRows(*tensor, heads, tensor->bytes / heads, grouped(0, 1)), bfloat16);
   }
 
   // Native token rows, gathered by the embedding kernel.
@@ -167,7 +167,7 @@ private:
     return start;
   }
 
-  static TensorRows rows(const GgufTensor &tensor, uint64_t count, uint64_t rowBytes, RowOrder order = {}) {
+  static TensorRows tensorRows(const GgufTensor &tensor, uint64_t count, uint64_t rowBytes, RowOrder order = {}) {
     if (!count || count * rowBytes != tensor.bytes) throw GgufError("unexpected size for " + tensor.name);
     return {tensor.name, tensor.type, tensor.offset, count, rowBytes, order};
   }
@@ -181,7 +181,7 @@ private:
   // A tensor's rows as stored, after their descriptor.
   void copiedRows(const GgufTensor &tensor) {
     descriptor(tensor.type, tensor.rows(), tensor.columns(), {}, {tensor.bytes, 0, 0}, tensor.name);
-    copy(rows(tensor, tensor.rows(), tensor.bytes / tensor.rows()));
+    copy(tensorRows(tensor, tensor.rows(), tensor.bytes / tensor.rows()));
   }
 
   // The descriptor and planes of a [rows, columns] quantized tensor.
