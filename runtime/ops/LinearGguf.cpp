@@ -73,8 +73,6 @@ constexpr SplitTier kSimdgroupTiers[] = {{4, 256}, {32, 1024}};
 // per core with 1024 inputs and unsplit fused and gate/up kernels: 6.4%).
 constexpr SplitTier kStagedTiers[] = {{6, 512}};
 
-const metal::MetalBuffer &plane1(const QuantizedSegment &s) { return s.plane1 ? s.plane1 : s.meta; }
-
 // The request lanes one decode dispatch fuses, whatever its tile height.
 void recordLanes(LinearDispatchStats *stats, uint32_t rows) {
   if (!stats || rows <= SPLASH_TARGET_VERIFY_ROWS) return;
@@ -197,7 +195,7 @@ void Linear::addGguf(metal::CommandGraph &graph, const LinearBuffers &b,
                         : w.epilogue == LinearEpilogue::Residual   ? 'r'
                                                                    : 'g';
     for (const QuantizedSegment &s : segments) {
-      std::vector<metal::MetalBuffer> bindings{b.input, s.plane0, plane1(s), s.meta, b.output};
+      std::vector<metal::MetalBuffer> bindings{b.input, s.plane0, s.plane1Slot(), s.meta, b.output};
       if (w.epilogue != LinearEpilogue::None) bindings.push_back(aux);
       graph.add(prefillKernel(std::string("pf") + epilogue, s.format), std::move(bindings),
                 GgufPrefillParams{s.outputSize, k, w.rows, n, s.columnOffset},
@@ -229,7 +227,7 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
   const auto tensor = [&](const QuantizedSegment &s, char epilogue, const metal::MetalBuffer &output,
                           const metal::MetalBuffer &aux) {
     graph.add(decodeKernel(s.format, rows, epilogue),
-              {b.input, s.plane0, plane1(s), s.meta, output, partials, counters, aux},
+              {b.input, s.plane0, s.plane1Slot(), s.meta, output, partials, counters, aux},
               GgufDecodeParams{k, splits, n, s.columnOffset}, {s.outputSize / kDecodeTileColumns, splits, 1},
               {kDecodeThreads, 1, 1});
   };
@@ -279,7 +277,7 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
       params.fmt[i] = s.formatId;
       params.offset[i] = s.columnOffset;
     }
-    bindings.insert(bindings.end(), {s.plane0, plane1(s), s.meta});
+    bindings.insert(bindings.end(), {s.plane0, s.plane1Slot(), s.meta});
   }
   bindings.insert(bindings.end(), {b.output, partials, counters});
   graph.add("gguf_decode_fused_m" + std::to_string(rows), std::move(bindings), params,
@@ -324,7 +322,7 @@ void Linear::addGgufSimdgroup(metal::CommandGraph &graph, const LinearBuffers &b
         params.fmt[i] = s.formatId;
         params.offset[i] = s.columnOffset;
       }
-      bindings.insert(bindings.end(), {s.plane0, plane1(s), s.meta});
+      bindings.insert(bindings.end(), {s.plane0, s.plane1Slot(), s.meta});
     }
     bindings.insert(bindings.end(), {b.output, b.scratch.partials, b.scratch.counters});
     graph.add("decode_linear_gguf_sg_fused" + suffix, std::move(bindings), params, grid, {128, 1, 1});
@@ -333,7 +331,7 @@ void Linear::addGgufSimdgroup(metal::CommandGraph &graph, const LinearBuffers &b
   const auto tensor = [&](const QuantizedSegment &s, char epilogue, const metal::MetalBuffer &output,
                           const metal::MetalBuffer &aux) {
     graph.add(std::string("decode_linear_gguf_sg_") + s.format + suffix + "_" + epilogue,
-              {b.scratch.input, b.scratch.sums, s.plane0, plane1(s), s.meta, output, b.scratch.partials,
+              {b.scratch.input, b.scratch.sums, s.plane0, s.plane1Slot(), s.meta, output, b.scratch.partials,
                b.scratch.counters, aux},
               GgufDecodeParams{k, config.splits, n, s.columnOffset}, grid, {128, 1, 1});
   };

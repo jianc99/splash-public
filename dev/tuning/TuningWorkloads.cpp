@@ -7,16 +7,15 @@
 namespace splash::model {
 namespace {
 
-bool sameProjection(const ops::Projection &left, const ops::Projection &right) noexcept {
-  return left.inputSize == right.inputSize && left.outputSize == right.outputSize &&
-         left.affine().weights.sameView(right.affine().weights) &&
-         left.affine().scales.sameView(right.affine().scales) && left.affine().biases.sameView(right.affine().biases);
-}
+// The planes of the affine Q4 and Q8 projections the collector keeps.
+const ops::AffineWeights &planes(const ops::Projection &projection) noexcept { return projection.affine(); }
+const ops::Q8Projection &planes(const ops::Q8Projection &projection) noexcept { return projection; }
 
-bool sameProjection(const ops::Q8Projection &left, const ops::Q8Projection &right) noexcept {
+template <class Projection>
+bool sameProjection(const Projection &left, const Projection &right) noexcept {
+  const auto &l = planes(left), &r = planes(right);
   return left.inputSize == right.inputSize && left.outputSize == right.outputSize &&
-         left.weights.sameView(right.weights) && left.scales.sameView(right.scales) &&
-         left.biases.sameView(right.biases);
+         l.weights.sameView(r.weights) && l.scales.sameView(r.scales) && l.biases.sameView(r.biases);
 }
 
 bool sameWeights(const ops::tuning::LinearTuningWeights &left,

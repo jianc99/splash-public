@@ -48,6 +48,9 @@ struct QuantizedSegment final {
   // MoE router): plane0 holds its [outputSize][inputSize] floats, multiplied
   // unrounded in fp32 (kernels/shared/gguf_float.metal).
   [[nodiscard]] bool isFloat() const noexcept;
+  // The buffer bound in plane1's slot: a format without a second plane binds
+  // its meta plane there, which its kernels never read as plane1.
+  [[nodiscard]] const metal::MetalBuffer &plane1Slot() const noexcept { return plane1 ? plane1 : meta; }
 };
 
 struct BlockWeights final {

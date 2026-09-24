@@ -209,7 +209,6 @@ void addGgufExperts(metal::CommandGraph &graph, const MoeBuffers &buffers,
   const MoeShape shape = plan.shape();
   const uint32_t tiles = plan.maximumTiles();
   const bool table16 = plan.config().ggufTile == MoeGgufTile::Register;
-  const auto plane1 = [](const QuantizedSegment &s) { return s.plane1 ? s.plane1 : s.meta; };
   const auto pass = [&](const BlockExpertProjection &projection, bool up,
                         const metal::MetalBuffer &input,
                         const metal::MetalBuffer &output, uint32_t n, uint32_t k) {
@@ -217,9 +216,9 @@ void addGgufExperts(metal::CommandGraph &graph, const MoeBuffers &buffers,
     if (table16) bindings.push_back(buffers.groupedSums);
     bindings.insert(bindings.end(),
                     {buffers.tileDescriptors, buffers.tileCount,
-                     projection.routed.plane0, plane1(projection.routed),
+                     projection.routed.plane0, projection.routed.plane1Slot(),
                      projection.routed.meta, projection.shared.plane0,
-                     plane1(projection.shared), projection.shared.meta, output,
+                     projection.shared.plane1Slot(), projection.shared.meta, output,
                      buffers.expertOutput});
     const std::string kernel = table16 ? "moe_expert_gguf_sg" : "moe_expert_gguf_m" + std::to_string(plan.tileRows());
     graph.add(kernel + (up ? "_up" : ""), std::move(bindings),
