@@ -11,6 +11,7 @@ from unittest import mock
 from tokenizers import Tokenizer, pre_tokenizers
 from transformers import AutoTokenizer
 
+from dev.tests import fixture_files
 from dev.tests.installer_fixtures import MOE, FakeHub, draft_dir, selection
 from install import assembly, families, gguf, hub, models, upstream
 
@@ -18,34 +19,10 @@ GGUF_REPO = "unsloth/Qwen3.6-35B-A3B-GGUF"
 
 
 def write_gguf(path, values, tensors=()):
-    def string(text):
-        data = text.encode()
-        return struct.pack("<Q", len(data)) + data
-
-    def typed(value):
-        if isinstance(value, str):
-            return 8, string(value)
-        if isinstance(value, bool):
-            return 7, struct.pack("<?", value)
-        if isinstance(value, int):
-            return 4, struct.pack("<I", value)
-        if isinstance(value, float):
-            return 6, struct.pack("<f", value)
-        if isinstance(value, list):
-            kind = typed(value[0])[0] if value else 4
-            return 9, struct.pack("<IQ", kind, len(value)) + b"".join(
-                typed(x)[1] for x in value
-            )
-        raise AssertionError(value)
-
-    data = struct.pack("<4sIQQ", b"GGUF", 3, len(tensors), len(values))
-    for key, value in values.items():
-        kind, encoded = typed(value)
-        data += string(key) + struct.pack("<I", kind) + encoded
-    for name, kind in tensors:
-        data += string(name) + struct.pack("<IQIQ", 1, 256, kind, 0)
-    path.write_bytes(data)
-    return path
+    """A GGUF header of the values and the tensors' (name, GGML type), each
+    tensor 256 values without data: the metadata reader reads no more."""
+    table = [(name, [256], kind, b"") for name, kind in tensors]
+    return fixture_files.write_gguf(path, values, table)
 
 
 def fixture(*, native=False):

@@ -3,7 +3,6 @@ serialized packed file; check the exact-BF16 rule, the MLX cache identity and
 that invalid sources fail with their message and publish nothing."""
 
 import hashlib
-import json
 import math
 import os
 import struct
@@ -12,7 +11,15 @@ import sys
 import tempfile
 from pathlib import Path
 
-ALIGN = 16384
+ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(ROOT))
+
+from dev.tests.fixture_files import (  # noqa: E402
+    weight_file,
+    write_gguf,
+    write_safetensors,
+)
+
 DTYPES = ("BF16", "F16", "F32")
 GGML_TYPES = {"F32": 0, "F16": 1, "Q4_0": 2, "BF16": 30}
 VISION_SHARD = "model-00001-of-00002.safetensors"
@@ -24,65 +31,17 @@ TEXT_SHARD = "model-00002-of-00002.safetensors"
 GOLDEN = "f1a165335c42384479f73d83e69146cfa46d4964d66ed13c663b158fed08cdd5"
 
 
-def encode(values, dtype):
-    if dtype == "BF16":
-        return b"".join(struct.pack("<f", x)[2:] for x in values)
-    code = {"F16": "e", "F32": "f", "F64": "d"}[dtype]
-    return struct.pack("<" + code * len(values), *values)
-
-
 def bfloat16(values):
     # The upper half of each value's F32 bits: the value itself when it is
     # exactly a BF16.
     return b"".join(struct.pack("<f", x)[2:] for x in values)
 
 
-def string(value):
-    data = value.encode()
-    return struct.pack("<Q", len(data)) + data
-
-
-def safetensors(path, tensors):
-    header, data = {}, bytearray()
-    for name, (shape, dtype, raw) in tensors.items():
-        header[name] = {
-            "shape": shape,
-            "dtype": dtype,
-            "data_offsets": [len(data), len(data) + len(raw)],
-        }
-        data.extend(raw)
-    encoded = json.dumps(header).encode()
-    path.write_bytes(struct.pack("<Q", len(encoded)) + encoded + data)
-
-
-def gguf(path, metadata, tensors):
-    def field(value):
-        if isinstance(value, str):
-            return 8, string(value)
-        if isinstance(value, bool):
-            return 7, bytes([value])
-        if isinstance(value, int):
-            return 4, struct.pack("<I", value)
-        if isinstance(value, float):
-            return 6, struct.pack("<f", value)
-        kind, _ = field(value[0])
-        return 9, struct.pack("<IQ", kind, len(value)) + b"".join(
-            field(x)[1] for x in value
-        )
-
-    header = bytearray(struct.pack("<4sIQQ", b"GGUF", 3, len(tensors), len(metadata)))
-    for name, value in metadata.items():
-        kind, data = field(value)
-        header.extend(string(name) + struct.pack("<I", kind) + data)
-    data = bytearray()
-    for name, (shape, dtype, raw) in tensors.items():
-        header.extend(string(name) + struct.pack("<I", len(shape)))
-        header.extend(struct.pack("<" + "Q" * len(shape), *shape))
-        header.extend(struct.pack("<IQ", GGML_TYPES[dtype], len(data)))
-        data.extend(raw)
-        data.extend(bytes(-len(data) % 32))
-    header.extend(bytes(-len(header) % 32))
-    path.write_bytes(header + data)
+def encode(values, dtype):
+    if dtype == "BF16":
+        return bfloat16(values)
+    code = {"F16": "e", "F32": "f", "F64": "d"}[dtype]
+    return struct.pack("<" + code * len(values), *values)
 
 
 def fixture(root, source, shift=0, case=None):
@@ -188,12 +147,7 @@ def fixture(root, source, shift=0, case=None):
     if case == "shape":
         shape, dtype, raw = tensors[first]
         tensors[first] = ([math.prod(shape)], dtype, raw)
-    expected = bytearray(struct.pack("<8sII", b"MDFV0001", 2, 0))
-    expected.extend(bytes(ALIGN - len(expected)))
-    for section in sections:
-        expected.extend(section)
-        expected.extend(bytes(-len(expected) % ALIGN))
-    (root / "expected.bin").write_bytes(expected)
+    (root / "expected.bin").write_bytes(weight_file("MDFV0001", 2, 0, sections))
     if source == "mlx":
         if case == "quantized":
             tensors["vision_tower.blocks.0.attn.qkv.scales"] = (
@@ -201,9 +155,9 @@ def fixture(root, source, shift=0, case=None):
                 "BF16",
                 bytes(48),
             )
-        safetensors(root / VISION_SHARD, tensors)
+        write_safetensors(root / VISION_SHARD, tensors)
         text = {"language_model.model.norm.weight": ([8], "BF16", bytes(16))}
-        safetensors(root / TEXT_SHARD, text)
+        write_safetensors(root / TEXT_SHARD, text)
         (root / "config.json").write_text("{}")
         return
     metadata = {
@@ -232,7 +186,11 @@ def fixture(root, source, shift=0, case=None):
         del metadata["clip.vision.is_deepstack_layers"]
     if case == "unused":
         tensors["v.deepstack.0.fc1.weight"] = ([8, 8], "BF16", bytes(128))
-    gguf(root / "mmproj.gguf", metadata, tensors)
+    gguf_tensors = [
+        (name, shape, GGML_TYPES[dtype], raw)
+        for name, (shape, dtype, raw) in tensors.items()
+    ]
+    write_gguf(root / "mmproj.gguf", metadata, gguf_tensors)
 
 
 def prepare(binary, directory, source, mode, expected=True):
@@ -314,7 +272,7 @@ def main():
         # model's shard and config.json do not enter it, a tower byte does.
         directory = root / "mlx-0"
         cached = prepare(binary, directory, "mlx", "warm").stdout.split()
-        safetensors(
+        write_safetensors(
             directory / TEXT_SHARD,
             {"language_model.model.norm.weight": ([8], "BF16", bytes(range(16)))},
         )

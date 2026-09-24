@@ -6,10 +6,19 @@ import json
 import math
 import struct
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
-ALIGN = 16384
+ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(ROOT))
+
+from dev.tests.fixture_files import (  # noqa: E402
+    read_safetensors,
+    safetensors_bytes,
+    weight_file,
+    write_safetensors,
+)
 
 # SHA-256 of every prepared image of the two fixtures. A change means the
 # prepared bytes changed: that needs a new preparation identity, so cached
@@ -68,12 +77,7 @@ def fixture(root, moe=False):
     expected.mkdir()
 
     def image(name, magic, index, kind, sections):
-        data = bytearray(struct.pack("<8sII", magic.encode(), index, kind))
-        data.extend(bytes(ALIGN - len(data)))
-        for section in sections:
-            data.extend(section)
-            data.extend(bytes((-len(data)) % ALIGN))
-        (expected / name).write_bytes(data)
+        (expected / name).write_bytes(weight_file(magic, index, kind, sections))
 
     for layer in range(2):
         p = f"language_model.model.layers.{layer}."
@@ -184,18 +188,7 @@ def fixture(root, moe=False):
     (root / "config.json").write_text(
         json.dumps({"text_config": config, "quantization": quantization})
     )
-    header, payload = {}, bytearray()
-    for name, (shape, dtype, data) in tensors.items():
-        header[name] = {
-            "shape": shape,
-            "dtype": dtype,
-            "data_offsets": [len(payload), len(payload) + len(data)],
-        }
-        payload.extend(data)
-    encoded = json.dumps(header).encode()
-    (root / "model.safetensors").write_bytes(
-        struct.pack("<Q", len(encoded)) + encoded + payload
-    )
+    write_safetensors(root / "model.safetensors", tensors)
 
 
 def prepare(binary, metallib, root, kind):
@@ -232,19 +225,14 @@ def main():
         # Raw checkpoints need a different normalization convention. Refuse
         # their unsanitized convolution layout before publishing any weights.
         source = root / "model.safetensors"
-        data = source.read_bytes()
-        length = struct.unpack("<Q", data[:8])[0]
-        header = json.loads(data[8 : 8 + length])
+        header, payload = read_safetensors(source)
         header["language_model.model.layers.0.linear_attn.conv1d.weight"]["shape"] = [
             512,
             1,
             4,
         ]
-        encoded = json.dumps(header).encode()
         before = set((root / "cache").glob("*/weights"))
-        source.write_bytes(
-            struct.pack("<Q", len(encoded)) + encoded + data[8 + length :]
-        )
+        source.write_bytes(safetensors_bytes(header, payload))
         result = subprocess.run(command, capture_output=True, text=True, check=False)
         assert result.returncode != 0 and "conv1d.weight" in result.stderr, (
             result.stderr
