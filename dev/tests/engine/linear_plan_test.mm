@@ -1,3 +1,4 @@
+#include "AffineQ4Fixture.hpp"
 #include "ops/Linear.hpp"
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/QuantFormat.h"
@@ -25,6 +26,8 @@ namespace {
 
 using namespace splash;
 using namespace splash::ops;
+using test::bf16;
+using test::mix;
 
 void require(bool condition, const char *message) {
   if (!condition)
@@ -38,12 +41,6 @@ template <class Function> void rejects(Function function) {
     return;
   }
   throw std::runtime_error("invalid Linear plan or buffer was accepted");
-}
-
-uint16_t bf16(float value) {
-  uint32_t bits = std::bit_cast<uint32_t>(value);
-  bits += 0x7fff + ((bits >> 16) & 1);
-  return uint16_t(bits >> 16);
 }
 
 float fp32(uint16_t value) {
@@ -1096,14 +1093,6 @@ metal::MetalBuffer allocate(metal::MetalBackend &backend, uint64_t bytes) {
   return buffer;
 }
 
-uint32_t mix(uint32_t value) {
-  value ^= value >> 16;
-  value *= 0x7feb352d;
-  value ^= value >> 15;
-  value *= 0x846ca68b;
-  return value ^ (value >> 16);
-}
-
 std::array<uint64_t, 3> projectionFingerprint(const Projection &projection) {
   std::array<uint64_t, 3> result{};
   const std::array buffers{projection.affine().weights, projection.affine().scales, projection.affine().biases};
@@ -1115,23 +1104,6 @@ std::array<uint64_t, 3> projectionFingerprint(const Projection &projection) {
     result[slot] = hash;
   }
   return result;
-}
-
-Projection projection(metal::MetalBackend &backend, LinearMatrix matrix, uint32_t seed) {
-  const uint64_t parameters = uint64_t{matrix.outputSize} * (matrix.inputSize / 64);
-  Projection p(matrix.outputSize, matrix.inputSize,
-               AffineWeights{allocate(backend, parameters * 32), allocate(backend, parameters * 2),
-                             allocate(backend, parameters * 2)});
-  auto *weights = static_cast<uint8_t *>(p.affine().weights.contents());
-  auto *scales = static_cast<uint16_t *>(p.affine().scales.contents());
-  auto *biases = static_cast<uint16_t *>(p.affine().biases.contents());
-  for (uint64_t i = 0; i < parameters * 32; ++i) weights[i] = mix(uint32_t(i) + seed);
-  for (uint64_t i = 0; i < parameters; ++i) {
-    const float scale = 0.004f + float(mix(uint32_t(i) + seed) % 17) * 0.0001f;
-    scales[i] = bf16(scale);
-    biases[i] = bf16(-7.5f * scale);
-  }
-  return p;
 }
 
 // Scalar reference uses the actual StorageN=256 bytes and FP32 per-group
@@ -1559,8 +1531,8 @@ int main(int argc, char **argv) {
                                       LinearMatrix{16640, 5120}, LinearMatrix{12544, 2048},
                                       LinearMatrix{5120, 17408},
                                       LinearMatrix{256, 64}, LinearMatrix{512, 320}}) {
-      const auto p = projection(backend, matrix, 31);
-      const auto gate = projection(backend, matrix, 157);
+      const auto p = test::deterministicQ4Projection(backend, matrix, 31);
+      const auto gate = test::deterministicQ4Projection(backend, matrix, 157);
       const auto immutableProjection = projectionFingerprint(p);
       const auto immutableGateProjection = projectionFingerprint(gate);
       if (matrix.inputSize % 256 == 0)

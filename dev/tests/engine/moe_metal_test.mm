@@ -4,6 +4,7 @@
 // Apple9 four-simdgroup decode tiles (bitwise against the shipped tile). Routing
 // fixtures cover dispersed, concentrated and skewed expert utilization with
 // hidden width 1024 and intermediate width 512.
+#include "AffineQ4Fixture.hpp"
 #include "../../../runtime/metal/CommandGraph.hpp"
 #include "../../../runtime/metal/MetalBackend.hpp"
 #include "../../../runtime/model/WeightStore.hpp"
@@ -127,22 +128,19 @@ ExpertSlab randomSlab(Random &random, uint32_t outputSize, uint32_t inputSize) {
   return slab;
 }
 
-void packSlab(const ExpertSlab &slab, uint8_t *destination) {
-  const uint64_t elements = uint64_t{slab.outputSize} * slab.inputSize;
+void packSlab(const ExpertSlab &slab, const splash::test::AffineQ4Planes &planes) {
   const uint32_t groups = slab.inputSize / 64;
-  auto *scales = reinterpret_cast<__bf16 *>(destination + elements / 2);
-  auto *biases = reinterpret_cast<__bf16 *>(destination + elements / 2 + elements / 32);
   for (uint32_t n = 0; n < slab.outputSize; ++n) {
     for (uint32_t k = 0; k < slab.inputSize; ++k) {
       const uint64_t nibble = uint64_t{slab.parameter(n, k / 64)} * 64 + k % 64;
-      uint8_t &byte = destination[nibble / 2];
+      uint8_t &byte = planes.weights[nibble / 2];
       const uint8_t value = slab.weight(n, k);
       byte = static_cast<uint8_t>((nibble & 1) ? (byte & 0x0F) | (value << 4)
                                                : (byte & 0xF0) | value);
     }
     for (uint32_t g = 0; g < groups; ++g) {
-      scales[slab.parameter(n, g)] = __bf16(slab.scales[slab.parameter(n, g)]);
-      biases[slab.parameter(n, g)] = __bf16(slab.biases[slab.parameter(n, g)]);
+      planes.scales[slab.parameter(n, g)] = std::bit_cast<uint16_t>(__bf16(slab.scales[slab.parameter(n, g)]));
+      planes.biases[slab.parameter(n, g)] = std::bit_cast<uint16_t>(__bf16(slab.biases[slab.parameter(n, g)]));
     }
   }
 }
@@ -207,14 +205,11 @@ Experts randomExperts(MetalBackend &backend, Random &random,
                       uint32_t experts, uint32_t outputSize,
                       uint32_t inputSize, const char *label) {
   Experts result;
-  const uint64_t stride = q4PackedBytes(outputSize, inputSize);
-  result.projection = {shared(backend, uint64_t{experts} * stride, label),
-                       experts, outputSize, inputSize, stride};
-  auto *bytes = static_cast<uint8_t *>(result.projection.packed.contents());
-  for (uint32_t expert = 0; expert < experts; ++expert) {
-    result.slabs.push_back(randomSlab(random, outputSize, inputSize));
-    packSlab(result.slabs.back(), bytes + uint64_t{expert} * stride);
-  }
+  result.projection = splash::test::expertSlabs(
+      backend, experts, outputSize, inputSize, label, [&](uint32_t, const splash::test::AffineQ4Planes &planes) {
+        result.slabs.push_back(randomSlab(random, outputSize, inputSize));
+        packSlab(result.slabs.back(), planes);
+      });
   return result;
 }
 

@@ -21,6 +21,7 @@
 #include "../../../runtime/ops/ExecutionPlans.hpp"
 #include "../../../runtime/ops/Linear.hpp"
 #include "../../../runtime/ops/MoE.hpp"
+#include "AffineQ4Fixture.hpp"
 #include "GgufFormatReference.hpp"
 #include "metal/abi/Gguf.h"
 #include "metal/abi/MoE.h"
@@ -29,6 +30,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -648,16 +650,14 @@ int timing(MetalBackend &backend, uint32_t rounds) {
   std::mt19937 local(9);
   // Affine: random Q4 slabs with finite scales, the router and shared gate of the routing fixture.
   const auto affineExperts = [&](uint32_t experts, uint32_t n, uint32_t k) {
-    const uint64_t elements = uint64_t{n} * k, stride = elements / 2 + elements / 16;
-    MetalBuffer packed = backend.allocateBuffer(experts * stride, BufferStorage::Shared, "affine-experts");
-    auto *bytes = static_cast<uint8_t *>(packed.contents());
-    for (uint64_t e = 0; e < experts; ++e) {
-      uint8_t *slab = bytes + e * stride;
-      for (uint64_t i = 0; i < elements / 2; ++i) slab[i] = uint8_t(local());
-      auto *parameters = reinterpret_cast<__bf16 *>(slab + elements / 2);
-      for (uint64_t i = 0; i < elements / 32; ++i) parameters[i] = __bf16(i < elements / 64 ? 0.01f : -0.05f);
-    }
-    return splash::ops::ExpertProjection{packed, experts, n, k, stride};
+    const uint64_t parameters = uint64_t{n} * k / 64;
+    const uint16_t scale = std::bit_cast<uint16_t>(__bf16(0.01f)), bias = std::bit_cast<uint16_t>(__bf16(-0.05f));
+    return splash::test::expertSlabs(
+        backend, experts, n, k, "affine-experts", [&](uint32_t, const splash::test::AffineQ4Planes &planes) {
+          for (uint64_t i = 0; i < parameters * 32; ++i) planes.weights[i] = uint8_t(local());
+          std::fill_n(planes.scales, parameters, scale);
+          std::fill_n(planes.biases, parameters, bias);
+        });
   };
   const auto affineRouter = [&](bool routes) {
     const uint64_t elements = uint64_t{256} * H;

@@ -1,8 +1,8 @@
+#include "AffineQ4Fixture.hpp"
 #include "tuning/MoeTuning.hpp"
 
 #include <algorithm>
 #include <array>
-#include <bit>
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
@@ -13,6 +13,7 @@ namespace {
 using namespace splash::metal;
 using namespace splash::ops;
 using namespace splash::ops::tuning;
+using splash::test::bf16;
 
 void require(bool condition, const char *message) {
   if (!condition)
@@ -155,12 +156,6 @@ void fixtureBounds() {
     }
 }
 
-uint16_t bf16(float value) {
-  uint32_t bits = std::bit_cast<uint32_t>(value);
-  bits += 0x7fff + ((bits >> 16) & 1);
-  return static_cast<uint16_t>(bits >> 16);
-}
-
 MetalBuffer zeroed(MetalBackend &backend, uint64_t bytes) {
   auto buffer = backend.allocateBuffer(bytes, BufferStorage::Shared, "moe-tuning-test");
   std::memset(buffer.contents(), 0, static_cast<size_t>(bytes));
@@ -186,25 +181,19 @@ Q8Projection router(MetalBackend &backend, bool shared, uint32_t representative 
 
 ExpertProjection experts(MetalBackend &backend, uint32_t count, uint32_t salt = 0) {
   constexpr uint32_t width = 256;
-  constexpr uint64_t elements = uint64_t{width} * width;
-  constexpr uint64_t stride = elements / 2 + elements / 16;
-  ExpertProjection result{zeroed(backend, count * stride), count, width, width, stride};
-  auto *base = static_cast<uint8_t *>(result.packed.contents());
-  for (uint32_t expert = 0; expert < count; ++expert) {
-    auto *slab = base + expert * stride;
-    uint32_t seed = 12345U + expert + salt;
-    for (uint64_t offset = 0; offset < elements / 2; ++offset) {
-      seed = seed * 1664525U + 1013904223U;
-      slab[offset] = static_cast<uint8_t>(seed >> 24);
-    }
-    auto *scales = reinterpret_cast<uint16_t *>(slab + elements / 2);
-    auto *biases = reinterpret_cast<uint16_t *>(slab + elements / 2 + elements / 32);
-    for (uint64_t index = 0; index < elements / 64; ++index) {
-      scales[index] = bf16(0.0078125F);
-      biases[index] = bf16(-0.05859375F);
-    }
-  }
-  return result;
+  constexpr uint64_t parameters = uint64_t{width} * width / 64;
+  return splash::test::expertSlabs(
+      backend, count, width, width, "moe-tuning-test", [&](uint32_t expert, const splash::test::AffineQ4Planes &planes) {
+        uint32_t seed = 12345U + expert + salt;
+        for (uint64_t offset = 0; offset < parameters * 32; ++offset) {
+          seed = seed * 1664525U + 1013904223U;
+          planes.weights[offset] = static_cast<uint8_t>(seed >> 24);
+        }
+        for (uint64_t index = 0; index < parameters; ++index) {
+          planes.scales[index] = bf16(0.0078125F);
+          planes.biases[index] = bf16(-0.05859375F);
+        }
+      });
 }
 
 void nativeMeasurement(const char *library) {
