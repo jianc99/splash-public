@@ -10,6 +10,7 @@
 #include "metal/abi/ExecutionGeometry.h"
 #include "model/StateLayout.hpp"
 #include "ops/GDN.hpp"
+#include "tuning/LinearNumerics.hpp"
 
 #import <Foundation/Foundation.h>
 
@@ -29,6 +30,8 @@ using splash::metal::CommandGraph;
 using splash::metal::MetalBackend;
 using splash::metal::MetalBuffer;
 using namespace splash::ops;
+using splash::ops::tuning::bf16ToFloat;
+using splash::ops::tuning::floatToBf16;
 
 constexpr uint32_t kRows = SPLASH_TARGET_VERIFY_ROWS;
 constexpr uint32_t kMaxLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
@@ -51,22 +54,8 @@ template <class Function> void rejects(Function function) {
   throw std::runtime_error("invalid GDN request was accepted");
 }
 
-uint16_t toBfloat(float value) {
-  uint32_t bits;
-  std::memcpy(&bits, &value, sizeof(bits));
-  bits += 0x7FFFU + ((bits >> 16) & 1U);
-  return static_cast<uint16_t>(bits >> 16);
-}
-
-float fromBfloat(uint16_t value) {
-  const uint32_t bits = uint32_t{value} << 16;
-  float result;
-  std::memcpy(&result, &bits, sizeof(result));
-  return result;
-}
-
 double roundBfloat(double value) {
-  return fromBfloat(toBfloat(static_cast<float>(value)));
+  return bf16ToFloat(floatToBf16(static_cast<float>(value)));
 }
 
 // One bf16 unit in the last place at the reference's magnitude.
@@ -77,7 +66,7 @@ double bfloatUlp(double reference) {
 }
 
 bool closeBfloat(uint16_t got, double reference, double ulps, double floor) {
-  return std::fabs(double(fromBfloat(got)) - reference) <=
+  return std::fabs(double(bf16ToFloat(got)) - reference) <=
          ulps * bfloatUlp(reference) + floor;
 }
 
@@ -153,7 +142,7 @@ struct Fixture final {
     auto fill = [&](MetalBuffer &buffer, float scale) {
       auto *values = static_cast<uint16_t *>(buffer.contents());
       for (uint64_t index = 0; index < buffer.sizeBytes() / 2; ++index)
-        values[index] = toBfloat(random.unit() * scale);
+        values[index] = floatToBf16(random.unit() * scale);
     };
     packed = alloc(kLayers * kMaxLanes * packedStride * 2, "gdn packed");
     fill(packed, 1.0F);
@@ -180,7 +169,7 @@ struct Fixture final {
       if (float32)
         static_cast<float *>(mixerNorm.buffer.contents())[dim] = weight;
       else
-        static_cast<uint16_t *>(mixerNorm.buffer.contents())[dim] = toBfloat(weight);
+        static_cast<uint16_t *>(mixerNorm.buffer.contents())[dim] = floatToBf16(weight);
     }
     arrived = alloc(kMaxLanes * 4, "gdn arrived");
     generation = alloc(kMaxLanes * 4, "gdn generation");
@@ -191,7 +180,7 @@ struct Fixture final {
       auto *bytes = static_cast<uint8_t *>(current[lane].contents());
       auto *conv = reinterpret_cast<uint16_t *>(bytes);
       for (uint64_t index = 0; index < cell.convBytes / 2; ++index)
-        conv[index] = toBfloat(random.unit());
+        conv[index] = floatToBf16(random.unit());
       auto *state = reinterpret_cast<float *>(bytes + cell.convBytes);
       for (uint64_t index = 0; index < (cell.bytes - cell.convBytes) / 4;
            ++index)
@@ -268,7 +257,7 @@ struct Fixture final {
   double normWeight(uint32_t dim) const {
     return mixerNorm.float32
                ? static_cast<const float *>(mixerNorm.buffer.contents())[dim]
-               : fromBfloat(static_cast<const uint16_t *>(mixerNorm.buffer.contents())[dim]);
+               : bf16ToFloat(static_cast<const uint16_t *>(mixerNorm.buffer.contents())[dim]);
   }
 };
 
@@ -288,7 +277,7 @@ double convolutionSilu(const Fixture &fixture, uint32_t layer, uint32_t lane,
         position < 3
             ? carried[position * fixture.shape.convolutionDimension + channel]
             : fixture.packedRow(layer, lane, position - 3)[channel];
-    value += double(fromBfloat(input)) * fromBfloat(weights[tap]);
+    value += double(bf16ToFloat(input)) * bf16ToFloat(weights[tap]);
   }
   value = roundBfloat(value);
   return roundBfloat(value * sigmoid(value));
@@ -354,20 +343,20 @@ void checkGates(const Fixture &fixture, uint32_t layer, uint32_t lane,
     const float *decay = fixture.decayRow(layer, lane, token);
     const uint16_t *beta = fixture.betaRow(layer, lane, token);
     for (uint32_t head = 0; head < shape.valueHeads; ++head) {
-      const double b = fromBfloat(packed[bOffset + head]);
+      const double b = bf16ToFloat(packed[bOffset + head]);
       require(closeBfloat(beta[head], sigmoid(b), 2.0, 1e-6),
               where + ": beta mismatch");
-      const double x = roundBfloat(double(fromBfloat(packed[aOffset + head])) +
-                                   fromBfloat(timeBias[head]));
+      const double x = roundBfloat(double(bf16ToFloat(packed[aOffset + head])) +
+                                   bf16ToFloat(timeBias[head]));
       const double softplus =
           std::max(x, 0.0) + std::log1p(std::exp(-std::fabs(x)));
       // The kernel rounds softplus to bf16 with fast transcendentals, so a
       // value near a rounding boundary may land one bf16 step away.
       bool matched = false;
-      const uint16_t rounded = toBfloat(static_cast<float>(softplus));
+      const uint16_t rounded = floatToBf16(static_cast<float>(softplus));
       for (int step = -1; step <= 1 && !matched; ++step) {
         const double candidate =
-            fromBfloat(static_cast<uint16_t>(rounded + step));
+            bf16ToFloat(static_cast<uint16_t>(rounded + step));
         matched = closeFloat(decay[head],
                              std::exp(double(decayWeights[head]) * candidate),
                              1e-4);
@@ -398,19 +387,19 @@ std::vector<double> recurrence(const Fixture &fixture, uint32_t layer,
     const uint16_t *key = mixed + keyWidth + keyHead * kHeadDim;
     const uint16_t *value = mixed + 2 * keyWidth + head * kHeadDim;
     const double decay = fixture.decayRow(layer, lane, token)[head];
-    const double beta = fromBfloat(fixture.betaRow(layer, lane, token)[head]);
+    const double beta = bf16ToFloat(fixture.betaRow(layer, lane, token)[head]);
     for (uint32_t valueDim = 0; valueDim < kHeadDim; ++valueDim) {
       double *row = state.data() + uint64_t{valueDim} * kHeadDim;
       double memory = 0.0;
       for (uint32_t keyDim = 0; keyDim < kHeadDim; ++keyDim) {
         row[keyDim] *= decay;
-        memory += row[keyDim] * fromBfloat(key[keyDim]);
+        memory += row[keyDim] * bf16ToFloat(key[keyDim]);
       }
-      const double delta = (fromBfloat(value[valueDim]) - memory) * beta;
+      const double delta = (bf16ToFloat(value[valueDim]) - memory) * beta;
       double output = 0.0;
       for (uint32_t keyDim = 0; keyDim < kHeadDim; ++keyDim) {
-        row[keyDim] += fromBfloat(key[keyDim]) * delta;
-        output += row[keyDim] * fromBfloat(query[keyDim]);
+        row[keyDim] += bf16ToFloat(key[keyDim]) * delta;
+        output += row[keyDim] * bf16ToFloat(query[keyDim]);
       }
       if (rows)
         (*rows)[uint64_t{token} * kHeadDim + valueDim] = output;
@@ -485,18 +474,18 @@ void checkDecode(const Fixture &fixture, uint32_t layer, uint32_t lane) {
           fixture.rowsOf(fixture.hidden, lane, token, head);
       double squares = 0.0;
       for (uint32_t dim = 0; dim < kHeadDim; ++dim) {
-        const double row = fromBfloat(recurrent[dim]);
+        const double row = bf16ToFloat(recurrent[dim]);
         squares += row * row;
       }
       const double inverse = 1.0 / std::sqrt(squares / kHeadDim + 1e-6);
       for (uint32_t dim = 0; dim < kHeadDim; ++dim) {
         const double normalized = roundBfloat(
-            fromBfloat(recurrent[dim]) * inverse * fixture.normWeight(dim));
-        const double gate = fromBfloat(packed[zOffset + head * kHeadDim + dim]);
+            bf16ToFloat(recurrent[dim]) * inverse * fixture.normWeight(dim));
+        const double gate = bf16ToFloat(packed[zOffset + head * kHeadDim + dim]);
         const double reference = normalized * gate * sigmoid(gate);
         require(closeBfloat(hidden[dim], reference, 2.0, 1e-6),
                 where + ": hidden mismatch");
-        inexact += fromBfloat(hidden[dim]) != roundBfloat(reference);
+        inexact += bf16ToFloat(hidden[dim]) != roundBfloat(reference);
       }
     }
   }

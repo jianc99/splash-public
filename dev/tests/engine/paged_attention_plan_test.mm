@@ -1,8 +1,8 @@
 #include "ops/PagedAttention.hpp"
+#include "tuning/LinearNumerics.hpp"
 
 #include <algorithm>
 #include <array>
-#include <bit>
 #include <cmath>
 #include <cstring>
 #include <iostream>
@@ -15,6 +15,9 @@
 namespace {
 
 using namespace splash;
+using ops::tuning::bf16ToFloat;
+using ops::tuning::floatToBf16;
+using ops::tuning::ulpBf16;
 
 static_assert(!std::is_aggregate_v<ops::PrefillAttentionPlan> &&
               !std::is_default_constructible_v<ops::PrefillAttentionPlan> &&
@@ -35,16 +38,6 @@ template <class Function> void rejects(Function function) {
     return;
   }
   throw std::runtime_error("invalid attention plan was accepted");
-}
-
-uint16_t bf16(float value) {
-  uint32_t bits = std::bit_cast<uint32_t>(value);
-  bits += 0x7fff + ((bits >> 16) & 1);
-  return uint16_t(bits >> 16);
-}
-
-float fp32(uint16_t value) {
-  return std::bit_cast<float>(uint32_t{value} << 16);
 }
 
 void checkPrefillSlotOrientation(uint32_t queryHeads, kv::Layout layout,
@@ -248,7 +241,7 @@ struct Case final {
              uint32_t dimension) const {
     const uint64_t index = scaleIndex(lane, head, token);
     if (layout.format == kv::Format::BFloat16)
-      return fp32(static_cast<const uint16_t *>(layer.keyData.contents())[index * 256 + dimension]);
+      return bf16ToFloat(static_cast<const uint16_t *>(layer.keyData.contents())[index * 256 + dimension]);
     return static_cast<const int8_t *>(layer.keyData.contents())[index * 256 +
                                                                  dimension] *
            static_cast<const float *>(layer.keyScales.contents())[index];
@@ -259,7 +252,7 @@ struct Case final {
     const uint64_t index = scaleIndex(lane, head, token);
     const uint64_t dataIndex = (index / 32 * 256 + dimension) * 32 + index % 32;
     if (layout.format == kv::Format::BFloat16)
-      return fp32(static_cast<const uint16_t *>(layer.valueData.contents())[dataIndex]);
+      return bf16ToFloat(static_cast<const uint16_t *>(layer.valueData.contents())[dataIndex]);
     return static_cast<const int8_t *>(layer.valueData.contents())[dataIndex] *
            static_cast<const float *>(layer.valueScales.contents())[index];
   }
@@ -326,8 +319,8 @@ Case makeCase(metal::MetalBackend &backend, uint32_t queryHeads,
             static_cast<int8_t *>(data.layer.keyData.contents())[scaleIndex * 256 + dimension] = key;
             static_cast<int8_t *>(data.layer.valueData.contents())[valueIndex] = value;
           } else {
-            static_cast<uint16_t *>(data.layer.keyData.contents())[scaleIndex * 256 + dimension] = bf16(key * 0.006f);
-            static_cast<uint16_t *>(data.layer.valueData.contents())[valueIndex] = bf16(value * 0.007f);
+            static_cast<uint16_t *>(data.layer.keyData.contents())[scaleIndex * 256 + dimension] = floatToBf16(key * 0.006f);
+            static_cast<uint16_t *>(data.layer.valueData.contents())[valueIndex] = floatToBf16(value * 0.007f);
           }
         }
       }
@@ -337,16 +330,16 @@ Case makeCase(metal::MetalBackend &backend, uint32_t queryHeads,
         const uint64_t base = (uint64_t{lane} * layout.kvHeads + head) * data.stride * 256;
         for (uint32_t dimension = 0; dimension < 256; ++dimension) {
           static_cast<uint16_t *>(data.keys.contents())[base + row * 256 + dimension] =
-              bf16(float(int((row * 37 + head * 101 + dimension * 17) % 255) - 127) * 0.006f);
+              floatToBf16(float(int((row * 37 + head * 101 + dimension * 17) % 255) - 127) * 0.006f);
           static_cast<uint16_t *>(data.values.contents())[base + dimension * data.stride + row] =
-              bf16(float(int((row * 53 + head * 79 + dimension * 29) % 255) - 127) * 0.007f);
+              floatToBf16(float(int((row * 53 + head * 79 + dimension * 29) % 255) - 127) * 0.007f);
         }
       }
       for (uint32_t head = 0; head < queryHeads; ++head)
         for (uint32_t dimension = 0; dimension < 256; ++dimension)
           static_cast<uint16_t *>(data.queries.contents())[
               data.queryIndex(lane, head, row, dimension)] =
-              bf16(float(int((row * 43 + head * 67 + dimension * 11 +
+              floatToBf16(float(int((row * 43 + head * 67 + dimension * 11 +
                               head * dimension * 7) % 1019) - 509) / 1018.0f);
     }
   }
@@ -380,7 +373,7 @@ void checkReference(const Case &data, const std::vector<uint16_t> &actual) {
         for (uint32_t token = 0; token < tokens; ++token) {
           float score = 0;
           for (uint32_t dimension = 0; dimension < 256; ++dimension)
-            score += fp32(static_cast<const uint16_t *>(data.queries.contents())[
+            score += bf16ToFloat(static_cast<const uint16_t *>(data.queries.contents())[
                               data.queryIndex(lane, head, row, dimension)]) *
                      data.key(lane, kvHead, token, dimension);
           scores[token] = score * 0.0625f;
@@ -396,7 +389,7 @@ void checkReference(const Case &data, const std::vector<uint16_t> &actual) {
           for (uint32_t token = 0; token < tokens; ++token)
             expected += scores[token] * data.value(lane, kvHead, token, dimension);
           expected /= denominator;
-          const float value = fp32(actual[data.queryIndex(lane, head, row, dimension)]);
+          const float value = bf16ToFloat(actual[data.queryIndex(lane, head, row, dimension)]);
           require(std::isfinite(value), "attention output is nonfinite");
           maximumError = std::max(maximumError, std::abs(value - expected));
           dot += value * expected;
@@ -424,8 +417,8 @@ void checkEquivalent(const Case &data, const std::vector<uint16_t> &baseline,
       for (uint32_t row = 0; row < data.rows; ++row)
         for (uint32_t dimension = 0; dimension < 256; ++dimension) {
           const uint64_t index = data.queryIndex(lane, head, row, dimension);
-          const float left = fp32(baseline[index]);
-          const float right = fp32(candidate[index]);
+          const float left = bf16ToFloat(baseline[index]);
+          const float right = bf16ToFloat(candidate[index]);
           require(std::isfinite(right), "attention candidate is nonfinite");
           maximumError = std::max(maximumError, std::abs(left - right));
           dot += left * right;
@@ -697,13 +690,6 @@ void checkVerify(metal::MetalBackend &backend, uint32_t heads, kv::Layout layout
             << " lanes=" << lanes << " PASS\n";
 }
 
-// Spacing of the bf16 binade holding value (7 fraction bits).
-double bf16Spacing(double value) {
-  int exponent = 0;
-  (void)std::frexp(std::max(std::fabs(value), 0x1p-126), &exponent);
-  return std::ldexp(1.0, exponent - 8);
-}
-
 // The q/k RMS norms, RoPE and V copy of the attention prepare, prefill and
 // verify, against fp64 with norm weights in bf16 or F32 (a GGUF's). Past the
 // rotary pairs a row holds the norm rounded once to bf16, up to the fp32
@@ -731,7 +717,7 @@ void checkProjection(metal::MetalBackend &backend, uint32_t queryHeads, kv::Layo
   };
   auto *packedData = static_cast<uint16_t *>(packed.contents());
   for (uint64_t i = 0; i < packed.sizeBytes() / 2; ++i)
-    packedData[i] = bf16(float(2 * unit()));
+    packedData[i] = floatToBf16(float(2 * unit()));
   for (uint64_t i = 0; i < ropeCos.sizeBytes() / 4; ++i) {
     const double angle = 3.14159265358979 * unit();
     static_cast<float *>(ropeCos.contents())[i] = float(std::cos(angle));
@@ -745,8 +731,8 @@ void checkProjection(metal::MetalBackend &backend, uint32_t queryHeads, kv::Layo
       if (float32)
         static_cast<float *>(norm.buffer.contents())[d] = value;
       else
-        static_cast<uint16_t *>(norm.buffer.contents())[d] = bf16(value);
-      weights[which][d] = float32 ? value : fp32(bf16(value));
+        static_cast<uint16_t *>(norm.buffer.contents())[d] = floatToBf16(value);
+      weights[which][d] = float32 ? value : bf16ToFloat(floatToBf16(value));
     }
   metal::CommandGraph graph;
   if (verify)
@@ -777,24 +763,25 @@ void checkProjection(metal::MetalBackend &backend, uint32_t queryHeads, kv::Layo
                   : keyData + ((uint64_t{lane} * kvHeads + h) * stride + row) * kDim;
         double squares = 0;
         for (uint32_t d = 0; d < kDim; ++d)
-          squares += double(fp32(source[d])) * fp32(source[d]);
+          squares += double(bf16ToFloat(source[d])) * bf16ToFloat(source[d]);
         const double inverse = 1 / std::sqrt(squares / kDim + 1e-6);
         std::array<double, kDim> normalized{};
         for (uint32_t d = 0; d < kDim; ++d)
-          normalized[d] = fp32(source[d]) * inverse * weights[query ? 0 : 1][d];
+          normalized[d] = bf16ToFloat(source[d]) * inverse * weights[query ? 0 : 1][d];
         for (uint32_t d = 2 * kPairs; d < kDim; ++d)
-          require(std::fabs(fp32(out[d]) - normalized[d]) <=
-                      0.5 * bf16Spacing(normalized[d]) * (1 + 1.0 / 256),
+          require(std::fabs(bf16ToFloat(out[d]) - normalized[d]) <=
+                      0.5 * ulpBf16(float(normalized[d])) * (1 + 1.0 / 256),
                   "attention prepare norm differs from the fp64 reference");
         for (uint32_t d = 0; d < kPairs; ++d) {
-          const double first = fp32(bf16(float(normalized[d])));
-          const double second = fp32(bf16(float(normalized[d + kPairs])));
+          const double first = bf16ToFloat(floatToBf16(float(normalized[d])));
+          const double second = bf16ToFloat(floatToBf16(float(normalized[d + kPairs])));
           const double c = static_cast<const float *>(ropeCos.contents())[rope + d];
           const double s = static_cast<const float *>(ropeSin.contents())[rope + d];
           const double rotated[2] = {first * c - second * s, second * c + first * s};
           for (uint32_t half = 0; half < 2; ++half)
-            require(std::fabs(fp32(out[d + half * kPairs]) - rotated[half]) <=
-                        bf16Spacing(rotated[half]) + bf16Spacing(std::max(std::fabs(first), std::fabs(second))),
+            require(std::fabs(bf16ToFloat(out[d + half * kPairs]) - rotated[half]) <=
+                        ulpBf16(float(rotated[half])) +
+                            ulpBf16(float(std::max(std::fabs(first), std::fabs(second)))),
                     "attention prepare rotation differs from the fp64 reference");
         }
         if (!query)

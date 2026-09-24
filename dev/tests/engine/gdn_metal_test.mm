@@ -6,11 +6,11 @@
 #include "../../../runtime/metal/CommandGraph.hpp"
 #include "../../../runtime/metal/MetalBackend.hpp"
 #include "../../../runtime/ops/GDN.hpp"
+#include "tuning/LinearNumerics.hpp"
 
 #import <Foundation/Foundation.h>
 
 #include <algorithm>
-#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -66,13 +66,9 @@ private:
 };
 
 uint16_t toBf16(double value) {
-  uint32_t bits = std::bit_cast<uint32_t>(static_cast<float>(value));
-  bits += 0x7FFFu + ((bits >> 16) & 1u);
-  return static_cast<uint16_t>(bits >> 16);
+  return splash::ops::tuning::floatToBf16(static_cast<float>(value));
 }
-double fromBf16(uint16_t value) {
-  return std::bit_cast<float>(static_cast<uint32_t>(value) << 16);
-}
+double fromBf16(uint16_t value) { return splash::ops::tuning::bf16ToFloat(value); }
 double roundBf16(double value) { return fromBf16(toBf16(value)); }
 double bf16Ulp(double value) {
   return std::max(std::fabs(value), 1e-30) * 0.0078125;
