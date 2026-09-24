@@ -265,14 +265,14 @@ inline void pf_tile(device TA *input, device uchar *w0, device uchar *w1, device
 #define IDS uint simd_lane [[thread_index_in_simdgroup]], uint simd_group [[simdgroup_index_in_threadgroup]]
 #define PF_ROWS(R, S) const uint first = group.x * (R * S), rows = p.rows > first ? p.rows - first : 0
 #define PFE_K(F, f, EP, ep, R, S, N, KS, P)                                                               \
-  kernel void pf##ep##_##f##_r##R##_sg##S##_n##N##_k##KS##_p##P(ABUFE(GgufPrefillParams), uint2 group [[threadgroup_position_in_grid]], IDS) { \
+  kernel void gguf_prefill_##f##_##ep(ABUFE(GgufPrefillParams), uint2 group [[threadgroup_position_in_grid]], IDS) { \
     constexpr ushort Threads = S * 32; TGLUT_INIT(F)                                                      \
     threadgroup half stage[2 * KS * N]; const uint rs = p.out_stride ? p.out_stride : p.output_size;      \
     PF_ROWS(R, S);                                                                                        \
     pf_tile<F, bfloat, R, S, N, KS, P, EP>(input + ulong(first) * p.input_size, w0, w1, meta, output + ulong(first) * rs, \
                                    p.output_size, p.input_size, group.y * N, rows, stage, tl, simd_lane, simd_group, p.out_stride, p.out_offset, aux + ulong(first) * rs); }
 #define PF_K(F, f, TA, ta, R, S, N, KS, P)                                                                \
-  kernel void pf##ta##_##f##_r##R##_sg##S##_n##N##_k##KS##_p##P(ABUF(TA, GgufPrefillParams), uint2 group [[threadgroup_position_in_grid]], IDS) { \
+  kernel void gguf_prefill_##f##_##ta(ABUF(TA, GgufPrefillParams), uint2 group [[threadgroup_position_in_grid]], IDS) { \
     constexpr ushort Threads = S * 32; TGLUT_INIT(F)                                                      \
     threadgroup half stage[2 * KS * N];                                                                   \
     PF_ROWS(R, S);                                                                                        \

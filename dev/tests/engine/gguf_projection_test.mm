@@ -623,7 +623,7 @@ int main(int argc, char **argv) { @autoreleasepool {
       std::vector<double> ref((size_t)rows * N); refGemm(Xref, s, rows, N, ref);
       if (ep == 'r') for (size_t i = 0; i < ref.size(); ++i) ref[i] += bf2f(((uint16_t *)A.contents)[i]);
       if (ep == 'g') for (size_t i = 0; i < ref.size(); ++i) { double gg = bf2f(((uint16_t *)A.contents)[i]); ref[i] *= gg / (1.0 + std::exp(-gg)); }
-      char name[80]; snprintf(name, sizeof name, "pf%c_%s_r32_sg4_n64_k64_p1", ep, fmtName(fi)); id<MTLComputePipelineState> ps = pso(lib, name); if (!ps) { ++failures; continue; }
+      char name[80]; snprintf(name, sizeof name, "gguf_prefill_%s_%c", fmtName(fi), ep); id<MTLComputePipelineState> ps = pso(lib, name); if (!ps) { ++failures; continue; }
       std::vector<id<MTLBuffer>> bufs{Xbf, s.w0, s.w1, s.meta, Y}; if (ep != 'a') bufs.push_back(A);
       std::fill_n((uint16_t *)Y.contents, size_t(storage) * N, uint16_t(0xFFFF));
       runOnce({Dispatch{ps, bufs, bytes(GgufPrefillParams{N, K, rows, 0, 0}), (int)bufs.size(), MTLSizeMake(storage / 128, N / 64, 1), MTLSizeMake(128, 1, 1)}}, 1);

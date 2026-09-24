@@ -38,8 +38,8 @@ constexpr uint32_t stagedTileRows(uint32_t rows) noexcept { return rows <= 8 ? 8
 std::string decodeKernel(const char *format, uint32_t rows, char epilogue) {
   return std::string("gguf_decode_") + format + "_m" + std::to_string(rows) + "_" + epilogue;
 }
-std::string prefillKernel(const std::string &family, const char *format) {
-  return family + "_" + format + "_r32_sg4_n64_k64_p1";
+std::string prefillKernel(const char *format, char epilogue) {
+  return std::string("gguf_prefill_") + format + "_" + epilogue;
 }
 
 // K splits of a decode tile, one rule for both tiles. A tier asks for more
@@ -274,7 +274,7 @@ void Linear::addGguf(metal::CommandGraph &graph, const LinearBuffers &b,
     for (const QuantizedSegment &s : segments) {
       std::vector<metal::MetalBuffer> bindings{b.input, s.plane0, s.plane1Slot(), s.meta, b.output};
       if (w.epilogue != LinearEpilogue::None) bindings.push_back(epilogueInput(b, w.epilogue));
-      graph.add(prefillKernel(std::string("pf") + epilogue, s.name()), std::move(bindings),
+      graph.add(prefillKernel(s.name(), epilogue), std::move(bindings),
                 GgufPrefillParams{s.outputSize, k, w.rows, n, s.columnOffset},
                 {plan.storageRows() / kPrefillTileRows, s.outputSize / kPrefillTileColumns, 1},
                 {kPrefillThreads, 1, 1});
