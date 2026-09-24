@@ -235,15 +235,15 @@ class Repository:
         Only an absolute path is a local directory: parse_draft_model makes a
         --draft-model directory absolute, and a target is always a Hub ID,
         whatever the working directory holds. installed is the commit a
-        verified installation of this selection records. A commit revision
-        never moves and HF_HUB_OFFLINE forbids requests, so with installed
-        either returns that commit, unlisted, without a request or a look at
-        the Hub cache, which HF_HUB_CACHE may place elsewhere now than when
-        the installation was built. Otherwise one request resolves revision.
-        When the Hub cannot answer, the cached snapshot of a commit this
-        selection already names stands in, with the reason in
-        unreachable_reason (_cached_commits); a different revision is never
-        substituted."""
+        verified installation of this selection records; its links name its
+        files, wherever HF_HUB_CACHE points now. A commit revision never
+        moves and HF_HUB_OFFLINE forbids requests, so with installed either
+        returns that commit, unlisted, without a request or a look at the
+        Hub cache. Otherwise one request resolves revision. When the Hub
+        cannot answer, installed stands in the same way, with the reason in
+        unreachable_reason; without it, the cached snapshot of a commit this
+        selection already names does (_cached_commits). A different revision
+        is never substituted."""
         import httpx
         from huggingface_hub import HfApi, constants
 
@@ -281,6 +281,8 @@ class Repository:
                         if item.size is not None
                     },
                 )
+        if installed:
+            return cls(name, installed, frozenset(), unreachable_reason=why)
         commits = _cached_commits(name, revision, installation)
         for commit in commits:
             if snapshot(name, commit).is_dir():

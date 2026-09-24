@@ -709,6 +709,27 @@ class UpstreamTest(unittest.TestCase):
         self.assertEqual(pins(self.cache), installed)
         self.assertEqual(list(moved.iterdir()), [])
 
+    def test_a_moved_hub_cache_and_an_unreachable_hub_start_the_installation(self):
+        fake = fake_hub(self, self.cache)
+        chosen = selection(self.root)
+        self.prepare(chosen)
+        installed = pins(self.cache)
+        moved = self.root / "moved"
+        moved.mkdir()
+        fake.failure = httpx.ConnectError("[Errno 8] nodename nor servname provided")
+        fake.downloads.clear()
+        with mock.patch("huggingface_hub.constants.HF_HUB_CACHE", str(moved)):
+            output, _ = self.prepare(chosen)
+        self.assertIn(
+            f"Could not reach the Hub ({hub.reason(fake.failure)}); "
+            f"using the installed {MODEL}@{'a' * 12}.\n",
+            output,
+        )
+        self.assertIn("is already installed", output)
+        self.assertEqual(fake.downloads, [])
+        self.assertEqual(pins(self.cache), installed)
+        self.assertEqual(list(moved.iterdir()), [])
+
     def test_a_moved_hub_cache_keeps_the_installation_an_update_needs(self):
         fake = fake_hub(self, self.cache)
         chosen = selection(self.root)
