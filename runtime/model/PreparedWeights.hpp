@@ -51,9 +51,10 @@ private:
   std::unique_ptr<Impl> impl_;
 };
 
+// The cache is SPLASH_WEIGHT_CACHE, or ~/Library/Caches/Splash/weights.
 class PreparedWeights final {
 public:
-  explicit PreparedWeights(std::filesystem::path root = {});
+  PreparedWeights();
   // Check the entire missing model before writing its first artifact. Completed
   // layers remain reusable after an interruption; they are not partial files.
   void requireSpace(std::span<const PreparedWeight> weights,

@@ -32,7 +32,7 @@ int main() {
   const std::filesystem::path root(directory);
   setenv("SPLASH_WEIGHT_CACHE", root.c_str(), 1);
   try {
-    PreparedWeights store(root);
+    const PreparedWeights store;
     std::vector<uint8_t> bytes(128 * 1024);
     for (size_t i = 0; i < bytes.size(); ++i) bytes[i] = static_cast<uint8_t>(i * 37);
     int builds = 0;

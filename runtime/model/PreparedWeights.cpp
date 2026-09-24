@@ -69,7 +69,7 @@ bool unchanged(const struct stat &a, const struct stat &b) {
          a.st_ctimespec.tv_nsec == b.st_ctimespec.tv_nsec;
 }
 
-std::filesystem::path defaultCacheRoot() {
+std::filesystem::path cacheRoot() {
   if (const char *path = std::getenv("SPLASH_WEIGHT_CACHE"); path && *path) return path;
   const char *home = std::getenv("HOME");
   if (!home || !*home) throw std::runtime_error("cannot locate prepared weight cache");
@@ -233,7 +233,7 @@ struct WeightSource::Impl {
   Impl(const std::filesystem::path &path, const PreparationCheck &check)
       : path(path), file(open(path.c_str(), O_RDONLY | O_CLOEXEC)) {
     if (fstat(file, &state)) fail("stat weight source");
-    digest = verifiedDigest(file, defaultCacheRoot(), check);
+    digest = verifiedDigest(file, cacheRoot(), check);
   }
 };
 
@@ -252,9 +252,7 @@ void WeightSource::checkUnchanged() const {
     throw std::runtime_error("source weights changed during preparation; retry with an immutable source");
 }
 
-PreparedWeights::PreparedWeights(std::filesystem::path root) : root_(std::move(root)) {
-  if (root_.empty()) root_ = defaultCacheRoot();
-}
+PreparedWeights::PreparedWeights() : root_(cacheRoot()) {}
 
 void requireWeightDiskSpace(uint64_t available, uint64_t required) {
   if (required && (available < kWeightCacheDiskReserve || required > available - kWeightCacheDiskReserve))
