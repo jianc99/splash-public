@@ -121,4 +121,3 @@ kernel void gguf_copy(device const uchar *src [[buffer(0)]], device uchar *dst [
   if (begin + 16 <= p.bytes) *(device uint4 *)(dst + p.dst_offset + begin) = *(device const uint4 *)(src + p.src_offset + begin);
   else for (uint i = begin; i < p.bytes; ++i) dst[p.dst_offset + i] = src[p.src_offset + i];
 }
-
