@@ -608,7 +608,7 @@ def prepare(args):
         repo = Repository.recorded(kept)
     else:
         repo = Repository.resolve(repo_id, args.revision, installation=root)
-        if installed is None and "manifest.json" in repo.files:
+        if installed is None and _legacy_package(repo, args.model):
             if args.revision or args.language_only or args.draft_model:
                 raise models.ModelError(
                     "source selection options require an upstream model ID"
@@ -657,6 +657,17 @@ def prepare(args):
         if not _start(models_root, root, args.model):
             raise
     return True
+
+
+def _legacy_package(repo, model):
+    """Whether repo is a legacy Splash package: its manifest.json names one
+    of the package formats, not merely exists."""
+    if "manifest.json" not in repo.files:
+        return False
+    with models.hub_errors(f"cannot install {model}"):
+        manifest = models.read_json(repo.file("manifest.json"))
+    format_ = manifest.get("format")
+    return isinstance(format_, dict) and format_.get("name") in models.PACKAGE_FORMATS
 
 
 def _start(models_root, root, model):

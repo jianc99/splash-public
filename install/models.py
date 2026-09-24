@@ -28,7 +28,6 @@ else:
 
 MODELS = paths.MODELS
 ALIGNMENT = 16384
-HUB_ENDPOINT = "https://huggingface.co"
 MAX_MANIFEST_BYTES = 4 * 1024 * 1024
 # The DFlash2 draft layout Splash loads: the magic that begins each draft
 # layer file, and the draft configuration's splash.format.
@@ -503,10 +502,9 @@ def _download_snapshot(model_id: str, token):
         "repo_id": model_id,
         "repo_type": "model",
         "token": token or False,
-        "endpoint": HUB_ENDPOINT,
     }
     for _ in range(3):
-        info = HfApi(endpoint=HUB_ENDPOINT, token=token or False).model_info(
+        info = HfApi(token=token or False).model_info(
             model_id, revision="main", files_metadata=True
         )
         if not is_hex_digest(info.sha, 40):
@@ -710,7 +708,7 @@ def resolve_target_gguf(manifest, variant: str) -> Path:
     )
     try:
         revision = table.get("revision") or "main"
-        info = HfApi(endpoint=HUB_ENDPOINT, token=token or False).model_info(
+        info = HfApi(token=token or False).model_info(
             table["repo_id"], revision=revision, files_metadata=True
         )
         item = next((i for i in info.siblings if i.rfilename == entry["file"]), None)
@@ -725,7 +723,6 @@ def resolve_target_gguf(manifest, variant: str) -> Path:
             revision=info.sha if is_hex_digest(info.sha, 40) else revision,
             repo_type="model",
             token=token or False,
-            endpoint=HUB_ENDPOINT,
         )
         # Keep the snapshot path: resolving its file symlink to a blob loses the
         # revision we must retain while an installed model uses these weights.

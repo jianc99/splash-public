@@ -286,6 +286,29 @@ class UpstreamTest(unittest.TestCase):
         self.assertEqual(hub.requests, [("someone/renamed-27b", None)])
         self.assertEqual(hub.downloads, ["someone/renamed-27b/config.json"])
 
+    def test_only_a_splash_manifest_makes_a_legacy_package(self):
+        def target(root):
+            mlx_target(root, DENSE)
+            (root / "manifest.json").write_text(json.dumps({"name": "a tool's file"}))
+
+        hub = self.fake_hub()
+        hub.publish(MODEL, "b" * 40, target)
+        self.assertTrue(self.prepare(arguments(self.root))[0])
+        package = {"format": {"name": "splash-packed-q4"}}
+        hub.publish(
+            "someone/package",
+            "c" * 40,
+            lambda p: (
+                p.mkdir(parents=True),
+                (p / "manifest.json").write_text(json.dumps(package)),
+            ),
+        )
+        self.assertFalse(
+            self.prepare(arguments(self.root, "someone/package", language_only=False))[
+                0
+            ]
+        )
+
     def test_only_mlx_affine_quantization_is_accepted(self):
         def target(quantization):
             def build(root):

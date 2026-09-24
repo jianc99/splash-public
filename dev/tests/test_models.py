@@ -390,7 +390,7 @@ class ModelArtifactTest(unittest.TestCase):
         snapshot, manifest = self.package_fixture()
         self.configure_hub(snapshot)
         self.assertEqual(artifacts.resolve_snapshot(self.MODEL_ID), snapshot.resolve())
-        self.api.assert_called_once_with(endpoint=artifacts.HUB_ENDPOINT, token=False)
+        self.api.assert_called_once_with(token=False)
         self.api.return_value.model_info.assert_called_once_with(
             self.MODEL_ID, revision="main", files_metadata=True
         )
@@ -399,7 +399,6 @@ class ModelArtifactTest(unittest.TestCase):
             repo_type="model",
             revision=self.REVISION,
             token=False,
-            endpoint=artifacts.HUB_ENDPOINT,
         )
         self.manifest_download.assert_called_once_with(
             filename="manifest.json", **{**common, "revision": "main"}
@@ -617,7 +616,8 @@ class ModelArtifactTest(unittest.TestCase):
                     self.download.call_args,
                 ):
                     self.assertEqual(call.kwargs["token"], expected)
-                    self.assertEqual(call.kwargs["endpoint"], "https://huggingface.co")
+                    # HF_ENDPOINT reaches the Hub library, which reads it.
+                    self.assertNotIn("endpoint", call.kwargs)
 
     def test_download_failure_is_actionable_and_redacts_credentials(self):
         self.api.return_value.model_info.side_effect = RuntimeError(
@@ -883,7 +883,6 @@ class ModelArtifactTest(unittest.TestCase):
             revision="c" * 40,
             repo_type="model",
             token=False,
-            endpoint=artifacts.HUB_ENDPOINT,
         )
         self.api.return_value.model_info.return_value.siblings[0].lfs.sha256 = "0" * 64
         with self.assertRaisesRegex(artifacts.ModelError, "hash does not match"):
@@ -1262,8 +1261,7 @@ class ModelArtifactTest(unittest.TestCase):
                     else:
                         login.assert_called_once()
                     self.api.assert_called_once_with(
-                        endpoint=artifacts.HUB_ENDPOINT,
-                        token="test-explicit" if explicit else "test-login",
+                        token="test-explicit" if explicit else "test-login"
                     )
                     if status in (401, 403):
                         self.assertIn("hf auth login", str(raised.exception))

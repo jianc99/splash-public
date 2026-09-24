@@ -113,6 +113,15 @@ class ModelCatalogTests(unittest.TestCase):
             self.output.unlink()
             process.side_effect = OSError("cannot spawn")
             catalog.spawn_refresh()
+            # The Hub is not asked while offline, as huggingface_hub reads it.
+            process.reset_mock(side_effect=True)
+            for name, value in (
+                ("HF_HUB_OFFLINE", "1"),
+                ("TRANSFORMERS_OFFLINE", "yes"),
+            ):
+                with mock.patch.dict(catalog.os.environ, {name: value}):
+                    catalog.spawn_refresh()
+            process.assert_not_called()
 
 
 if __name__ == "__main__":
