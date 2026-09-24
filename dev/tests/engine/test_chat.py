@@ -66,7 +66,8 @@ function createChat(storage = new Map(), writable = true, models = null) {
     fetch(url, options) {
       if (url === '/v1/models') {
         modelRequests.push(options.headers);
-        return models ? Promise.resolve({ok: true, json: async () => models})
+        // models answers from the request headers; without it the server is offline.
+        return models ? Promise.resolve(models(options.headers))
           : Promise.reject(new Error('offline'));
       }
       return new Promise((resolve, reject) => {
@@ -164,24 +165,35 @@ assert.equal(fresh.requests[0].headers.Authorization, undefined);
     def test_image_attachment_follows_the_served_input_modalities(self):
         self.run_chat(r"""
 (async () => {
+  const served = modalities => ({ok: true, json: async () => ({data: [{input_modalities: modalities}]})});
   for (const [modalities, accepted] of [
     [['text'], false], [['text', 'image', 'pdf'], true],
   ]) {
-    const chat = createChat(new Map(), true, {data: [{input_modalities: modalities}]});
+    const chat = createChat(new Map(), true, () => served(modalities));
     await flush();
     assert.equal(Boolean(chat.elements.attach.hidden), !accepted, `${modalities}`);
     assert.equal(pasteImages(chat, 'pasted').length, Number(accepted));
     assert.equal(selectImages(chat, 'selected').length, Number(accepted));
   }
-  // Unknown modalities (offline, or a key not entered yet) keep the button;
-  // entering a key asks again with it.
-  const chat = createChat();
+  // An offline server leaves the modalities unknown and keeps the button.
+  const offline = createChat();
   await flush();
-  assert.ok(!chat.elements.attach.hidden);
+  assert.ok(!offline.elements.attach.hidden, 'offline hid the button');
+  // A server that needs a key rejects the first request, which also keeps the
+  // button. Entering the key asks again with it; a text-only answer hides the
+  // button and drops the image attached meanwhile.
+  const chat = createChat(new Map(), true, headers => headers.Authorization ? served(['text'])
+    : {ok: false, json: async () => ({error: {type: 'authentication_error'}})});
+  await flush();
+  assert.ok(!chat.elements.attach.hidden, 'unauthorized hid the button');
+  selectImages(chat, 'early');
+  assert.equal(chat.elements.attachments.children.length, 1, 'early image not attached');
   chat.elements['api-key'].value = 'key';
   chat.elements['api-key'].handlers.change();
   await flush();
   assert.equal(chat.modelRequests.at(-1).Authorization, 'Bearer key');
+  assert.ok(chat.elements.attach.hidden, 'text-only model kept the button');
+  assert.equal(chat.elements.attachments.children.length, 0, 'early image kept');
 })().catch(error => { console.error(error); process.exitCode = 1; });
 """)
 
