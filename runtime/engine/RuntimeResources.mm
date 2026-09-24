@@ -78,13 +78,6 @@ uint8_t hexNibble(char value) {
   throw std::invalid_argument("manifest SHA-256 is not hexadecimal");
 }
 
-uint64_t checkedAdd(uint64_t left, uint64_t right, std::string_view label) {
-  if (right > std::numeric_limits<uint64_t>::max() - left) {
-    throw std::overflow_error(std::string(label) + " byte count overflows");
-  }
-  return left + right;
-}
-
 uint64_t mebibytes(uint64_t bytes) noexcept { return bytes / kMiB; }
 
 // The startup admission rule. Deliberately independent of the model size:
@@ -289,6 +282,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
 
   const uint64_t hostReserveBytes =
       EngineMemoryPolicy::hostAvailableReserveBytes(device.physicalMemoryBytes);
+  const uint64_t preparationReserveBytes =
+      hostReserveBytes + model::kWeightPreparationWorkspaceBytes;
   MemoryGovernor::HostAvailableMemoryProvider hostAvailableMemory =
       config.hostAvailableMemory ? config.hostAvailableMemory
                                  : queryHostAvailableMemory;
@@ -344,9 +339,6 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
 
   model::ModelPackage package;
   try {
-    const uint64_t preparationReserveBytes =
-        checkedAdd(hostReserveBytes, model::kWeightPreparationWorkspaceBytes,
-                   "weight preparation reserve");
     package = model::loadModelPackage(
         *backend, config.modelRoot, config.model,
         [&] { admitStartup(preparationReserveBytes, true); });
