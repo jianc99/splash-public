@@ -577,7 +577,7 @@ void planBounds() {
                                                   static_cast<MoeExpertSimdgroups>(6)}); },
             "uncompiled expert simdgroups");
   }
-  rejects([] { (void)MoE::prefillPlan({}, 1); }, "invalid shape");
+  rejects([] { (void)MoE::prefillPlan({}, 1, {MoeExpertTile::M32}); }, "invalid shape");
   // Only family 9 runs the four-simdgroup decode tiles; an unknown family
   // and families 10 and later keep the shipped tile.
   require(splash::ops::moeDecodeSimdgroups(9) == MoeExpertSimdgroups::Four &&

@@ -340,10 +340,6 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
             {rows, shape.hiddenSize / 256, 1});
 }
 
-MoePlan MoE::prefillPlan(MoeShape shape, uint32_t rows) {
-  return prefillPlan(shape, rows, {MoeExpertTile::M32});
-}
-
 MoePlan MoE::prefillPlan(MoeShape shape, uint32_t rows, MoeConfig config) {
   if (!rows || rows > SPLASH_PREFILL_TOKEN_BUDGET)
     throw std::invalid_argument("invalid MoE prefill rows");

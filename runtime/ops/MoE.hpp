@@ -289,13 +289,8 @@ struct MoeBuffers final {
 
 // Routes and executes grouped experts from immutable weight views.
 struct MoE final {
-  // The shipped prefill plan (M32 tiles) or the one of config.
-  [[nodiscard]] static MoePlan prefillPlan(MoeShape shape, uint32_t rows);
-  [[nodiscard]] static MoePlan prefillPlan(MoeShape shape, uint32_t rows,
-                                           MoeConfig config);
-  [[nodiscard]] static MoePlan decodePlan(
-      MoeShape shape, uint32_t lanes,
-      MoeConfig config = {MoeExpertTile::M8});
+  [[nodiscard]] static MoePlan prefillPlan(MoeShape shape, uint32_t rows, MoeConfig config);
+  [[nodiscard]] static MoePlan decodePlan(MoeShape shape, uint32_t lanes, MoeConfig config);
   // The precompiled configurations an affine shape is tuned over, shipped
   // baseline first; ExecutionPlans gives each one the device's fields.
   [[nodiscard]] static constexpr std::array<MoeConfig, 2> prefillCandidates() noexcept {

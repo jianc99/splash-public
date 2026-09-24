@@ -144,7 +144,7 @@ void baselinePlans() {
     }
     for (auto shape : moeShapes) {
       const auto stride = plans.moeDecodeWorkspacePerLane(shape);
-      require(stride == MoE::decodePlan(shape, 1).workspace(), "workspace bound changed");
+      require(stride == plans.moeDecode(shape, 1).workspace(), "workspace bound changed");
       const auto prefill = plans.moePrefillWorkspace(shape, 2048);
       for (uint32_t rows = 1; rows <= 2048; ++rows)
         covers(prefill, plans.moePrefill(shape, rows).workspace(), 1, kMoeWorkspaceFields);

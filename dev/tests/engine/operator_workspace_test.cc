@@ -110,22 +110,22 @@ void moe() {
     const uint32_t splitWidth =
         std::max(shape.hiddenSize, shape.expertIntermediateSize);
     for (uint32_t rows = 1; rows <= 2048; ++rows)
-      checkMoe(MoE::prefillPlan(shape, rows).workspace(), shape, rows, 32, splitWidth);
-    const auto single = MoE::decodePlan(shape, 1).workspace();
+      checkMoe(MoE::prefillPlan(shape, rows, {MoeExpertTile::M32}).workspace(), shape, rows, 32, splitWidth);
+    const auto single = MoE::decodePlan(shape, 1, {MoeExpertTile::M8}).workspace();
     for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
-      const auto workspace = MoE::decodePlan(shape, lanes).workspace();
+      const auto workspace = MoE::decodePlan(shape, lanes, {MoeExpertTile::M8}).workspace();
       checkMoe(workspace, shape, lanes * 8, 8, shape.hiddenSize);
       require(workspace.groupedInputBytes <= lanes * single.groupedInputBytes &&
                   workspace.tileDescriptorsBytes <=
                       lanes * single.tileDescriptorsBytes,
               "packed decode workspace exceeds per-lane allocation bound");
     }
-    rejects([&] { return MoE::prefillPlan(shape, 0); });
-    rejects([&] { return MoE::prefillPlan(shape, 2049); });
-    rejects([&] { return MoE::decodePlan(shape, 0); });
-    rejects([&] { return MoE::decodePlan(shape, 5); });
+    rejects([&] { return MoE::prefillPlan(shape, 0, {MoeExpertTile::M32}); });
+    rejects([&] { return MoE::prefillPlan(shape, 2049, {MoeExpertTile::M32}); });
+    rejects([&] { return MoE::decodePlan(shape, 0, {MoeExpertTile::M8}); });
+    rejects([&] { return MoE::decodePlan(shape, 5, {MoeExpertTile::M8}); });
   }
-  rejects([] { return MoE::prefillPlan({}, 1); });
+  rejects([] { return MoE::prefillPlan({}, 1, {MoeExpertTile::M32}); });
 }
 
 void sampling() {
