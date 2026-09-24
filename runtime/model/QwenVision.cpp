@@ -6,7 +6,7 @@
 namespace splash::model {
 namespace {
 
-void validateLayout(const ops::VisionLayout &layout) {
+void requireLayout(const ops::VisionLayout &layout) {
   if (!layout.depth || !layout.hiddenSize || !layout.patchDimension ||
       !layout.intermediateSize || !layout.paddedIntermediateSize ||
       !layout.mergedHiddenSize || !layout.outputHiddenSize || !layout.heads ||
@@ -96,12 +96,12 @@ QwenVisionWeights readVision(metal::MetalBackend &backend,
 QwenVisionWeights loadQwenVisionWeights(metal::MetalBackend &backend,
                                         const std::filesystem::path &directory,
                                         ops::VisionLayout layout) {
-  validateLayout(layout);
+  requireLayout(layout);
   return readVision(backend, directory / "model.bin", {}, layout);
 }
 
 QwenVisionWeights loadQwenVisionWeights(metal::MetalBackend &backend, const VisionLoader &source) {
-  validateLayout(source.layout());
+  requireLayout(source.layout());
   return readVision(backend, source.prepare(), source.weight().key, source.layout());
 }
 

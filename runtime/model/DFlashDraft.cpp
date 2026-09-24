@@ -7,7 +7,7 @@
 namespace splash::model {
 namespace {
 
-void validateLayout(const DFlashDraftLayout &layout) {
+void requireLayout(const DFlashDraftLayout &layout) {
   if (!layout.layers || !layout.hiddenSize || !layout.vocabularySize ||
       !layout.dynamicSize || !layout.qkvSize || !layout.attentionSize ||
       !layout.intermediateSize || !layout.attentionHeadDimension ||
@@ -70,7 +70,7 @@ DFlashDraft::DFlashDraft(const DFlashDraftWeights &weights,
     : weights_(weights), backend_(backend), operators_(operators),
       selector_(backend, weights.layout.vocabularySize,
                 ExecutionLimits::draftQueryRows) {
-  validateLayout(weights_.layout);
+  requireLayout(weights_.layout);
   if (weights_.layers.size() != weights_.layout.layers ||
       !weights_.layout.stateLayout().valid()) {
     throw std::invalid_argument("draft weights do not match state geometry");
@@ -271,7 +271,7 @@ DFlashDraftWeights
 loadDFlashDraftWeights(metal::MetalBackend &backend,
                        const std::filesystem::path &directory,
                        DFlashDraftLayout layout) {
-  validateLayout(layout);
+  requireLayout(layout);
   const uint64_t allocationBaseline = backend.memoryStats().allocatedBytes;
   DFlashDraftWeights result;
   result.layout = layout;
