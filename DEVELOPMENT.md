@@ -485,14 +485,23 @@ hashes of upstream GGML's dequantization (llama.cpp 7ab4ee7) in `gguf-reference`
 `make test-engine-metal` runs `gguf-preparation`, which checks every format's planes, as the
 production executor and its `gguf_repack` kernel prepare them, bitwise against the reference,
 the prepared alpha/beta, norm, convolution and router bytes and the golden images; then
-`gguf-projection dequant`, the shipped dequantizer, built with the production Metal flags,
-against the FP16 rounding of the reference's values, the projection kernels
-(`gguf-projection full`) against fp64, and `gguf-moe`: the float projections on both float
-tiles and the MoE layer on every GGUF plan, the staged 8- and 32-row tiles and the Apple9
-register tile whatever GPU runs it, in every format, against fp64. The
+`gguf-dequant`, the staged tile's dequantizer, built with the production Metal flags, against
+the half rounding of every reference weight; `gguf-projection`, every GGUF projection through
+`ops::Linear` with each tile forced, so both decode tiles run on every GPU, at one to four
+lanes, every K split and epilogue, fused segments, every gate/up format pair and the prefill
+tiles, each output inside the fp64 bound of `GgufFormatReference.hpp`; and `gguf-moe`: the float
+projections on both float tiles and the MoE layer on every GGUF plan, the staged 8- and 32-row
+tiles and the Apple9 register tile whatever GPU runs it, in every format, against fp64. The
 goldens and how to regenerate them are in `dev/tests/fixtures/weight-goldens/`; with
 `SPLASH_GGML_ORACLE=<libggml-base.dylib>`, `gguf-reference` also compares the reference with
 GGML directly and prints GGML's hashes.
+
+Two benchmark tools repeat the measurements behind the GGUF split tiers and MoE plans, with the
+weights DRAM-cold. `make benchmark-gguf-projection GGUF_PROJECTION_ARGS='q4k 5120 8192'` times one
+projection (up to three fused formats and widths, then `K` and an optional epilogue) on both
+decode tiles at one to four lanes and every K split, and marks the device policy's pick;
+`make benchmark-gguf-moe` times one MoE layer at the 35B shape, GGUF against affine Q4, on the
+device's plans and the other GGUF tile.
 
 ## Legacy Splash packages
 
