@@ -379,7 +379,7 @@ def processor_config(vision):
 
 
 # GGML tensor type names, and the quantized formats the native loader reads
-# (metal/abi/QuantFormat.h, checked by the tests).
+# (runtime/metal/abi/QuantFormat.h, checked by the tests).
 TENSOR_TYPES = {
     0: "F32",
     1: "F16",
