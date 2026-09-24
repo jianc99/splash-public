@@ -186,8 +186,10 @@ def slot_labels(tokenizer):
     return labels
 
 
-def encode_prompt(tokenizer, messages, labels, *, admit=None, checkpoint=None):
-    """Render messages and verify single-token answer slots.
+def encode_prompt(
+    tokenizer, chat_template, messages, labels, *, admit=None, checkpoint=None
+):
+    """Render messages with chat_template and verify single-token answer slots.
 
     Mirrors SemIf semif_phase1.direct.encode_prompt: each slot label must be
     one exact round-trip token, and appending the label to the rendered
@@ -201,6 +203,7 @@ def encode_prompt(tokenizer, messages, labels, *, admit=None, checkpoint=None):
     """
     prompt = tokenizer.apply_chat_template(
         messages,
+        chat_template=chat_template,
         tokenize=False,
         add_generation_prompt=True,
         enable_thinking=False,
