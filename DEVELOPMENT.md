@@ -707,45 +707,53 @@ make install test-real test-http-real MODEL=mlx-community/Qwen3.8-27B-4bit
 
 `make check` needs no model weights. `make check-native-cpu` builds production
 and runs native CPU tests without a GPU; `make check-native-metal` requires a
-supported Metal device and runs the kernel tests under shader validation.
-Hosted CI runs CPU checks and sanitizers.
+supported Metal device and runs the kernel tests under shader validation. They
+include the preparation of small synthetic MLX, GGUF and vision sources and the
+GGUF kernels on synthetic tensors. Hosted CI runs CPU checks and sanitizers.
 
-The model targets take `MODEL`, a model ID installed in this checkout's
-`install/models` by `make install MODEL=...`:
+The real-model targets take `MODEL` exactly as `splash serve --model` does and
+run the installation `make install MODEL=...` prepared in this checkout's
+`install/models`:
 
-| Target | Checks | Models |
-| --- | --- | --- |
-| `test-real` | vision parity with the family's fixture in `dev/tests/fixtures/vision-parity/`, and the native runtime oracle | MLX, GGUF, packages |
-| `test-http-real`, `test-release-real` | real HTTP, and with `test-release-real` the four agent clients | MLX, packages |
-| `test-performance-real`, `benchmark-backend`, `benchmark-decode-profile`, `tune-kernels` | native measurements of the installed model | MLX, GGUF, packages |
+| Target | Runs |
+| --- | --- |
+| `test-real` | vision parity with the family's fixture in `dev/tests/fixtures/vision-parity/`, and the native model runtime oracle |
+| `test-http-real` | the HTTP frontend on an isolated server (`dev/tests/smoke_real.py`) |
+| `test-agent-real` | the four official clients through `splash serve` (`dev/tests/agent_real.py`) |
+| `test-release-real` | the HTTP smoke and all four clients on one `splash serve` |
+| `test-performance-real` | the native prefill, decode and batch benchmark |
+| `release-check` | `check`, `verify-models`, sanitizers, `test-real`, `test-release-real`, `test-performance-real` |
 
-`dev/tests/smoke_real.py` and `dev/tests/agent_real.py`, which the HTTP and
-client targets run, do not accept a GGUF `:VARIANT` yet. Repeat the model tests
-with `MODEL=mlx-community/Qwen3.6-35B-A3B-4bit`. GGUF targets run their own
-projection and MoE kernels, which `make check` covers on synthetic tensors
-only: when those kernels or their preparation change, also run
-`make install test-real test-performance-real` with
-`MODEL=unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M` and
-`MODEL=unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M`.
+`benchmark-backend`, `benchmark-decode-profile` and `tune-kernels` take `MODEL`
+the same way. The models they are run with, one per family and source format:
 
-Before release, install all four agents and run `make release-check MODEL=...`
-for both MLX models from a clean checkout. It includes correctness, sanitizers,
-real HTTP/client behavior and performance characterization, and takes no GGUF
-model. The hardware release gate (`release-hardware` in
-`.github/workflows/ci.yml`) runs it on self-hosted Macs for the two Splash
-packages, which load the packed files directly: it exercises neither MLX
-preparation nor GGUF.
+| Family | MLX | GGUF | Splash package |
+| --- | --- | --- | --- |
+| Qwen3.8-27B | `mlx-community/Qwen3.8-27B-4bit` | `unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M` | `incoai/Qwen3.8-27B-Splash` |
+| Qwen3.6-35B-A3B | `mlx-community/Qwen3.6-35B-A3B-4bit` | `unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M` | `incoai/Qwen3.6-35B-A3B-Splash` |
 
-`make all build/engine-tests/affine-source-oracle` builds the affine source oracle, which
-no target runs; pass it `build/splash.metallib`, an installed MLX model's `target`
-directory and the matching installed package to compare every prepared byte.
+The source formats load differently: an MLX target is prepared into the packed
+layout, a GGUF target into its own layout for the GGUF projection and MoE
+kernels, and a package's packed files are mapped as they are. Before release,
+install all four agents and run `make release-check MODEL=...` for each model
+from a clean checkout. It includes correctness, sanitizers, real HTTP/client
+behavior and performance characterization. The hardware release gate
+(`release-hardware` in `.github/workflows/ci.yml`) runs it on self-hosted Macs
+for the two Splash packages only, so its real-model part exercises neither the
+preparation of a real MLX model nor a GGUF model.
+
+`make all build/engine-tests/affine-source-oracle` builds the affine source
+oracle, which no target runs; pass it `build/splash.metallib`, an installed MLX
+model's `target` directory and the matching installed package to compare every
+prepared byte.
 
 Compare performance on the same idle Mac with the same model and workload.
 `make tune-kernels MODEL=...` measures the precompiled kernel candidates for the
 installed model on this Mac against the policy defaults in `runtime/ops` and
-reports every key where one wins; it changes no default and saves no profile.
-For a GGUF model it measures the attention kernels and the affine draft's
-projections only, since GGUF projection and MoE plans read no tuned choice
+prints, per key, the winner with its paired GPU and wall-time gain or that the
+default is kept; it changes no default and saves no profile. For a GGUF model
+it measures only the attention kernels and the draft, and says so in its
+header, since GGUF projection and MoE plans read no tuned choice
 ([GGUF targets](#gguf-targets)). Keep generated reports, profiles, local paths
 and experiment notes out of the source tree and commits.
 
@@ -758,9 +766,9 @@ prefill, decode and batch measurements:
 make test-performance-real MODEL=mlx-community/Qwen3.8-27B-4bit
 ```
 
-It writes `build/release/backend-benchmark.json`. Repeat with the 35B model and,
-for the GGUF kernels, a GGUF of each family. This characterizes one build; it
-is not a comparison with another engine or a test of agent task quality.
+It writes `build/release/backend-benchmark.json`; repeat it for each model.
+This characterizes one build; it is not a comparison with another engine or a
+test of agent task quality.
 
 For a same-machine HTTP regression check, retain the previous `splash` binary
 **and its adjacent `splash.metallib`**, then run from the candidate checkout:
@@ -772,9 +780,10 @@ For a same-machine HTTP regression check, retain the previous `splash` binary
   --contexts 2048,10000 --samples 5
 ```
 
-It needs an installed Splash package: it checks the package's `manifest.json`.
-It starts isolated servers in alternating order, compares matched cold,
-exact-prefix and decode requests, and saves `build/release/http-regression.json`.
+It takes any installed model and, for an upstream one, holds its assembly for
+the whole run, so every round serves the same model. It starts isolated servers
+in alternating order, compares matched cold, exact-prefix and decode requests,
+and saves `build/release/http-regression.json`.
 It does not contact your running server. Use the same power mode and charger,
 stop other GPU workloads, and report chip/GPU cores, memory, Splash version,
 model revision, actual input/output token counts, and cache hits with results.
