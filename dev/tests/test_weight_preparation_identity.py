@@ -134,6 +134,19 @@ class PreparationIdentityTest(unittest.TestCase):
                     build_identity.source_digest(self.root, paths),
                 )
 
+    def test_every_input_says_which_models_editing_it_prepares_again(self):
+        names = {"AFFINE": "affine", "GGUF": "GGUF", "VISION": "vision"}
+        for name in {path for paths in INPUTS.values() for path in paths}:
+            with self.subTest(input=name):
+                kinds = " and ".join(
+                    names[kind] for kind, paths in INPUTS.items() if name in paths
+                )
+                text = (ROOT / name).read_text()
+                self.assertEqual(text.count("re-prepares every"), 1)
+                self.assertIn(
+                    f"Editing this file re-prepares every {kinds} model.", text
+                )
+
     def test_every_included_header_is_fingerprinted_or_reviewed(self):
         reached = set()
         for kind, paths in INPUTS.items():
