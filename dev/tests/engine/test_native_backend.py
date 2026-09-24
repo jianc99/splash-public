@@ -14,11 +14,12 @@ from server import errors as api_errors
 from server import frontend as request_frontend
 from server import images, runtime
 from server import protocol as wire
+from server.chat_templates import ChatTemplates
 
 
 class FakeTokenizer:
     backend_tokenizer = None
-    # Rendering ignores it; the frontend only probes it at startup.
+    # Rendering ignores it; only the startup probe reads it.
     chat_template = "{%- for message in messages %}{{- message.content }}{%- endfor %}"
 
     @staticmethod
@@ -250,8 +251,17 @@ class NativeBackendContractTests(unittest.TestCase):
 
     def test_http_fields_reach_native_generation_request(self):
         transport, runtime = self.make_transport()
+        tokenizer = FakeTokenizer()
         app = request_frontend.Frontend(
-            FakeTokenizer(), transport, "test-model", 128, 32, 10, 2, vision=True
+            tokenizer,
+            transport,
+            "test-model",
+            128,
+            32,
+            10,
+            2,
+            chat_templates=ChatTemplates(tokenizer),
+            vision=True,
         )
         job, _thinking, _tools = app.prepare(
             {

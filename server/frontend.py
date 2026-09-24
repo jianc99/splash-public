@@ -27,7 +27,6 @@ if __package__:
     from .chat_templates import (
         LATER_SYSTEM_UNSUPPORTED,
         REASONING_EFFORTS,
-        ChatTemplates,
         render_chat_template,
         template_options,
     )
@@ -61,7 +60,6 @@ else:
     from chat_templates import (
         LATER_SYSTEM_UNSUPPORTED,
         REASONING_EFFORTS,
-        ChatTemplates,
         render_chat_template,
         template_options,
     )
@@ -232,6 +230,7 @@ class Frontend:
         preparation_capacity,
         constraint_factory=None,
         *,
+        chat_templates,
         vision,
         max_image_pixels=image_input.MAX_PIXELS,
         thinking_codec=None,
@@ -245,8 +244,9 @@ class Frontend:
         self.vision = vision
         self.latencies = LatencyMetrics()
         self.tokenizer = tokenizer
-        # Probed once; requests choose among these, never the tokenizer's own.
-        self.chat_templates = ChatTemplates(tokenizer)
+        # Probed at startup; requests choose among these, never the
+        # tokenizer's own.
+        self.chat_templates = chat_templates
         self.prompt_tokenizer = PromptTokenizer(tokenizer)
         self.backend = backend
         self.model = model

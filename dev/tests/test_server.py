@@ -30,6 +30,7 @@ from server import output as model_output
 from server import protocol as native_wire
 from server import server as api
 from server.api_shapes import _namespace_alias, normalize_responses_input
+from server.chat_templates import ChatTemplates
 from server.tool_schema import MAX_JSON_NESTING, _grammar_compatible_schema
 
 
@@ -185,8 +186,8 @@ class TemplateTokenizer(FakeTokenizer):
 
 
 class BlockingTokenizer(FakeTokenizer):
-    """Holds each render until released, once armed after the frontend has
-    probed its chat template."""
+    """Holds each render until released, once armed after its chat template
+    was probed."""
 
     def __init__(self):
         super().__init__()
@@ -553,6 +554,14 @@ def main_args(**overrides):
     )
 
 
+def make_frontend(tokenizer, *args, **options):
+    """A frontend over the tokenizer, with its chat templates probed as
+    startup probes them."""
+    return request_frontend.Frontend(
+        tokenizer, *args, chat_templates=ChatTemplates(tokenizer), **options
+    )
+
+
 class Harness:
     def __init__(
         self,
@@ -580,7 +589,7 @@ class Harness:
         self.backend = backend_api.NativeBackend(
             runtime, self.tokenizer, request_logger=request_logger
         )
-        self.app = request_frontend.Frontend(
+        self.app = make_frontend(
             self.tokenizer,
             self.backend,
             model,
@@ -593,8 +602,8 @@ class Harness:
             vision=vision,
             **frontend_options,
         )
-        # The frontend probes its chat templates once, when it is built; keep
-        # only request renders in a recording tokenizer.
+        # The chat templates are probed once, before the frontend is built;
+        # keep only request renders in a recording tokenizer.
         if isinstance(getattr(self.tokenizer, "templates", None), list):
             self.tokenizer.templates.clear()
         self.server = api.FrontendServer(
@@ -1397,9 +1406,7 @@ class ServerTest(unittest.TestCase):
     def test_judgment_deadline_stops_the_slot_boundary_pass(self):
         clock = [100.0]
         tokenizer = self.BoundaryCountingTokenizer(clock, 0.5)
-        app = request_frontend.Frontend(
-            tokenizer, None, "test-model", 8192, 16, 10, 2, vision=True
-        )
+        app = make_frontend(tokenizer, None, "test-model", 8192, 16, 10, 2, vision=True)
         body = self.judgment_body(
             options=[
                 {"id": f"opt{index}", "description": f"case {index}"}
@@ -1420,9 +1427,7 @@ class ServerTest(unittest.TestCase):
 
     def test_judgment_context_budget_precedes_the_slot_boundary_pass(self):
         tokenizer = self.BoundaryCountingTokenizer()
-        app = request_frontend.Frontend(
-            tokenizer, None, "test-model", 8, 16, 10, 2, vision=True
-        )
+        app = make_frontend(tokenizer, None, "test-model", 8, 16, 10, 2, vision=True)
         with self.assertRaises(api.APIError) as error:
             app.prepare_judgment(
                 self.judgment_body(
@@ -3339,11 +3344,11 @@ class ServerTest(unittest.TestCase):
         tokenizer = FakeTokenizer()
         backend = backend_api.NativeBackend(FakeRuntime(), tokenizer)
         self.addCleanup(backend.close)
-        app = request_frontend.Frontend(
+        app = make_frontend(
             tokenizer, backend, "test-model", 40000, 32768, 1, 2, vision=True
         )
         self.assertEqual(app.prepare(self.body())[0].max_new_tokens, 32768)
-        app = request_frontend.Frontend(
+        app = make_frontend(
             tokenizer, backend, "test-model", 10, 32768, 1, 2, vision=True
         )
         self.assertEqual(app.prepare(self.body())[0].max_new_tokens, 8)
@@ -3374,10 +3379,10 @@ class ServerTest(unittest.TestCase):
         with mock.patch.object(
             api.secrets, "token_hex", side_effect=("boot_a", "boot_b")
         ):
-            first = request_frontend.Frontend(
+            first = make_frontend(
                 tokenizer, first_backend, "test-model", 128, 16, 1, 2, vision=True
             )
-            second = request_frontend.Frontend(
+            second = make_frontend(
                 tokenizer, second_backend, "test-model", 128, 16, 1, 2, vision=True
             )
         first_job, _, _ = first.prepare(self.body(seed=1))
@@ -3451,6 +3456,7 @@ class ServerTest(unittest.TestCase):
                 api.AutoTokenizer, "from_pretrained", return_value=tokenizer
             ),
             mock.patch.object(api, "validate_tokenizer"),
+            mock.patch.object(api, "ChatTemplates"),
             mock.patch.object(
                 api.engine_runtime, "MultiplexedRuntime", return_value=runtime
             ) as runtime_type,
@@ -3517,6 +3523,7 @@ class ServerTest(unittest.TestCase):
                         api.AutoTokenizer, "from_pretrained", return_value=object()
                     ),
                     mock.patch.object(api, "validate_tokenizer"),
+                    mock.patch.object(api, "ChatTemplates") as templates_type,
                     mock.patch.object(
                         api.engine_runtime,
                         "MultiplexedRuntime",
@@ -3535,7 +3542,11 @@ class ServerTest(unittest.TestCase):
                 ):
                     api.main()
                 self.assertIs(app_type.call_args.kwargs["vision"], vision)
-                describe = app_type.return_value.chat_templates.describe
+                self.assertIs(
+                    app_type.call_args.kwargs["chat_templates"],
+                    templates_type.return_value,
+                )
+                describe = templates_type.return_value.describe
                 describe.assert_called_once_with()
                 self.assertIn(
                     mock.call(f"Chat template · {describe.return_value}"),
@@ -3563,6 +3574,7 @@ class ServerTest(unittest.TestCase):
                 api.AutoTokenizer, "from_pretrained", return_value=object()
             ),
             mock.patch.object(api, "validate_tokenizer"),
+            mock.patch.object(api, "ChatTemplates"),
             mock.patch.object(
                 api.engine_runtime, "MultiplexedRuntime", return_value=runtime
             ),
@@ -3578,6 +3590,31 @@ class ServerTest(unittest.TestCase):
         server.server_close.assert_called_once_with()
         backend.close.assert_called_once()
         self.assertIn("Error · late", stderr.getvalue())
+
+    def test_main_rejects_an_unservable_chat_template_before_starting_native(self):
+        server = mock.Mock()
+        with (
+            mock.patch.object(api, "parse_args", return_value=main_args()),
+            mock.patch.object(api, "load_thinking_key", return_value=None),
+            mock.patch.object(
+                api.AutoTokenizer,
+                "from_pretrained",
+                return_value=SimpleNamespace(chat_template=None),
+            ),
+            mock.patch.object(api, "validate_tokenizer"),
+            mock.patch.object(api.engine_runtime, "MultiplexedRuntime") as runtime,
+            mock.patch.object(api, "FrontendServer", return_value=server),
+            mock.patch.object(api.signal, "signal"),
+            mock.patch("sys.stderr", new_callable=io.StringIO) as stderr,
+            self.assertRaisesRegex(SystemExit, "1"),
+        ):
+            api.main()
+        runtime.assert_not_called()
+        server.server_activate.assert_not_called()
+        server.server_close.assert_called_once_with()
+        self.assertIn(
+            "Error · the tokenizer defines no chat template", stderr.getvalue()
+        )
 
     def test_main_rejects_port_conflict_before_loading_or_starting_native(self):
         args = main_args(port=8000)
@@ -4992,7 +5029,7 @@ class ServerTest(unittest.TestCase):
         tokenizer = FakeTokenizer()
         backend = backend_api.NativeBackend(FakeRuntime(), tokenizer)
         self.addCleanup(backend.close)
-        app = request_frontend.Frontend(
+        app = make_frontend(
             tokenizer, backend, "test-model", 128, 16, 1, 2, vision=True
         )
         tools = [
@@ -5363,7 +5400,7 @@ class ServerTest(unittest.TestCase):
         tokenizer = FakeTokenizer()
         backend = backend_api.NativeBackend(FakeRuntime(), tokenizer)
         self.addCleanup(backend.close)
-        app = request_frontend.Frontend(
+        app = make_frontend(
             tokenizer, backend, "test-model", 128, 16, 1, 2, vision=True
         )
         for effort in ("xhigh", "medium", "low"):
@@ -5444,7 +5481,7 @@ class ServerTest(unittest.TestCase):
             }
         )
         factory = FakeConstraintFactory()
-        app = request_frontend.Frontend(
+        app = make_frontend(
             tokenizer, None, "test-model", 128, 16, 1, 2, factory, vision=True
         )
         for tools, expected in (([], False), ([self.rich_weather_tool()], True)):
@@ -5493,7 +5530,7 @@ class ServerTest(unittest.TestCase):
             ),
         ):
             tokenizer = TemplateTokenizer(self.reasoning_template(efforts=accepted))
-            app = request_frontend.Frontend(
+            app = make_frontend(
                 tokenizer, None, "test-model", 128, 16, 1, 2, vision=True
             )
             for effort in ("minimal", "low", "medium", "high", "xhigh", "max"):
@@ -5512,9 +5549,7 @@ class ServerTest(unittest.TestCase):
 
     def test_reasoning_template_errors_do_not_silently_drop_effort(self):
         tokenizer = TemplateTokenizer(self.reasoning_template(efforts=("medium",)))
-        app = request_frontend.Frontend(
-            tokenizer, None, "test-model", 128, 16, 1, 2, vision=True
-        )
+        app = make_frontend(tokenizer, None, "test-model", 128, 16, 1, 2, vision=True)
         tokenizer.templates.clear()
         with self.assertRaises(api.APIError):
             app.prepare(self.body(reasoning_effort="high"))
@@ -5532,9 +5567,7 @@ class ServerTest(unittest.TestCase):
 
     def test_reasoning_effort_accepts_only_standard_protocol_values(self):
         tokenizer = FakeTokenizer()
-        app = request_frontend.Frontend(
-            tokenizer, None, "test-model", 128, 16, 1, 2, vision=True
-        )
+        app = make_frontend(tokenizer, None, "test-model", 128, 16, 1, 2, vision=True)
         tokenizer.templates.clear()
         for effort in ("", "on", "off", "ultra", True, 1, [], {}):
             with (
@@ -5556,7 +5589,7 @@ class ServerTest(unittest.TestCase):
             tokenizer = TemplateTokenizer(
                 "{{ '<|im_start|>assistant\\n" + prefix + "' }}"
             )
-            app = request_frontend.Frontend(
+            app = make_frontend(
                 tokenizer, None, "test-model", 128, 16, 1, 2, vision=True
             )
             with (
@@ -5588,9 +5621,7 @@ class ServerTest(unittest.TestCase):
 
     def test_anthropic_thinking_off_is_not_reenabled_by_effort(self):
         tokenizer = TemplateTokenizer(self.reasoning_template())
-        app = request_frontend.Frontend(
-            tokenizer, None, "test-model", 128, 16, 1, 2, vision=True
-        )
+        app = make_frontend(tokenizer, None, "test-model", 128, 16, 1, 2, vision=True)
         for thinking in (None, {"type": "disabled"}):
             body = self.anthropic_body(output_config={"effort": "high"})
             if thinking is not None:
@@ -6025,7 +6056,7 @@ class ServerTest(unittest.TestCase):
 
     def test_frontend_limits_generation_and_token_count_preparation_to_two(self):
         tokenizer = BlockingTokenizer()
-        app = request_frontend.Frontend(
+        app = make_frontend(
             tokenizer,
             SimpleNamespace(status=lambda: {}),
             "test-model",
@@ -6071,7 +6102,7 @@ class ServerTest(unittest.TestCase):
 
     def test_frontend_rejects_invalid_preparation_capacity(self):
         with self.assertRaisesRegex(ValueError, "preparation capacity"):
-            request_frontend.Frontend(
+            make_frontend(
                 FakeTokenizer(),
                 SimpleNamespace(status=lambda: {}),
                 "test-model",
@@ -6153,7 +6184,7 @@ class ServerTest(unittest.TestCase):
             self.assertEqual(caught.exception.code, "context_length_exceeded")
 
     def test_preparation_consumes_original_deadline_and_releases_slots(self):
-        app = request_frontend.Frontend(
+        app = make_frontend(
             FakeTokenizer(), None, "test-model", 128, 16, 10, 1, vision=True
         )
         for elapsed in (0.25, 5):
@@ -6187,7 +6218,7 @@ class ServerTest(unittest.TestCase):
                 app.preparation_slots.release()
 
     def test_preparation_queue_respects_request_timeout(self):
-        app = request_frontend.Frontend(
+        app = make_frontend(
             FakeTokenizer(), None, "test-model", 128, 16, 10, 1, vision=True
         )
         app.tokenizer.templates.clear()
@@ -6204,7 +6235,7 @@ class ServerTest(unittest.TestCase):
             app.preparation_slots.release()
 
     def test_expired_preparation_skips_later_stages(self):
-        app = request_frontend.Frontend(
+        app = make_frontend(
             FakeTokenizer(), None, "test-model", 128, 16, 10, 1, vision=True
         )
         for stage in ("grammar", "images"):
@@ -6632,7 +6663,7 @@ class ServerTest(unittest.TestCase):
         tokenizer = FakeTokenizer()
         backend = backend_api.NativeBackend(FakeRuntime(), tokenizer)
         self.addCleanup(backend.close)
-        app = request_frontend.Frontend(
+        app = make_frontend(
             tokenizer, backend, "test-model", 128, 16, 1, 2, vision=True
         )
         body = self.body()

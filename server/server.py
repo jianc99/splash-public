@@ -39,7 +39,7 @@ if __package__:
         stream_chunk,
     )
     from .backend import NativeBackend, remaining_request_time
-    from .chat_templates import REASONING_EFFORTS, ChatTemplateError
+    from .chat_templates import REASONING_EFFORTS, ChatTemplateError, ChatTemplates
     from .constraints import ConstraintFactory, validate_tokenizer
     from .diagnostics import log_unexpected, print_request, print_status
     from .errors import APIError, ContextLengthError
@@ -80,7 +80,7 @@ else:
         stream_chunk,
     )
     from backend import NativeBackend, remaining_request_time
-    from chat_templates import REASONING_EFFORTS, ChatTemplateError
+    from chat_templates import REASONING_EFFORTS, ChatTemplateError, ChatTemplates
     from constraints import ConstraintFactory, validate_tokenizer
     from diagnostics import log_unexpected, print_request, print_status
     from errors import APIError, ContextLengthError
@@ -1967,6 +1967,8 @@ def main():
             args.tokenizer, local_files_only=True, trust_remote_code=False
         )
         validate_tokenizer(tokenizer)
+        chat_templates = ChatTemplates(tokenizer)
+        print_status(f"Chat template · {chat_templates.describe()}")
         runtime = engine_runtime.MultiplexedRuntime(
             _native_command(args),
             startup_timeout=NATIVE_START_TIMEOUT,
@@ -2003,13 +2005,13 @@ def main():
             args.request_timeout,
             readiness.max_concurrent_requests,
             constraint_factory,
+            chat_templates=chat_templates,
             max_image_pixels=args.max_image_pixels,
             thinking_codec=thinking_codec,
             served_model_names=args.served_model_name,
             default_reasoning_effort=args.default_reasoning_effort,
             vision=readiness.vision,
         )
-        print_status(f"Chat template · {app.chat_templates.describe()}")
         server.app = app
         server.server_activate()
         address = f"http://{args.host}:{server.server_port}"

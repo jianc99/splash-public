@@ -499,7 +499,15 @@ class ChatTemplateFrontendTests(unittest.TestCase):
     def test_scoring_prompts_use_the_template_chosen_at_startup(self):
         tokenizer = self.ScoringTokenizer(source("qwen36"))
         app = request_frontend.Frontend(
-            tokenizer, None, "test-model", 8192, 16, 10, 2, vision=True
+            tokenizer,
+            None,
+            "test-model",
+            8192,
+            16,
+            10,
+            2,
+            chat_templates=ChatTemplates(tokenizer),
+            vision=True,
         )
         tokenizer.templates.clear()
         app.prepare_judgment(ServerTest.judgment_body())
