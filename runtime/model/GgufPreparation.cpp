@@ -106,7 +106,7 @@ std::array<uint64_t, 3> planeOffsets(const gguf::Repack &repack) {
 }
 
 // The rows and columns of one repack step and its staging: complete rows
-// where they fit, so one read and one submission cover many 256-row tiles;
+// where they fit, so one read and one submission cover many plane tiles;
 // very wide rows split within the same bound.
 struct RepackChunk {
   uint64_t rows = 0, columns = 0, inputBytes = 0, outputBytes = 0;
@@ -119,14 +119,14 @@ RepackChunk repackChunk(const gguf::Repack &repack) {
       ggufRowBytes(format, kGgufBlockColumns) + total(planeBytes(format, 1, kGgufBlockColumns));
   RepackChunk chunk;
   chunk.columns = std::min<uint64_t>(repack.columns,
-      kWeightPreparationStagingBytes / (kGgufTileRows * blockStaging) * kGgufBlockColumns);
+      kWeightPreparationStagingBytes / (QUANT_TILE_ROWS * blockStaging) * kGgufBlockColumns);
   if (!chunk.columns) throw GgufError("weight row exceeds preparation bound");
   const auto input = [&](uint64_t rows) { return rows * ggufRowBytes(format, chunk.columns); };
   const auto output = [&](uint64_t rows) { return total(planeBytes(format, rows, chunk.columns)); };
   chunk.rows = chunk.columns == repack.columns
       ? std::min<uint64_t>(repack.rows,
-            kWeightPreparationStagingBytes / (input(kGgufTileRows) + output(kGgufTileRows)) * kGgufTileRows)
-      : kGgufTileRows;
+            kWeightPreparationStagingBytes / (input(QUANT_TILE_ROWS) + output(QUANT_TILE_ROWS)) * QUANT_TILE_ROWS)
+      : QUANT_TILE_ROWS;
   chunk.inputBytes = input(chunk.rows);
   chunk.outputBytes = output(chunk.rows);
   return chunk;
@@ -135,7 +135,7 @@ RepackChunk repackChunk(const gguf::Repack &repack) {
 // A repack's plan within an image of imageBytes: its format, tile-aligned
 // shape, sources of its row width and planes inside the image.
 void requireRepack(const gguf::Repack &repack, uint64_t imageBytes) {
-  if (repack.format >= GGUF_FMT_COUNT || !repack.rows || repack.rows % kGgufTileRows || !repack.columns ||
+  if (repack.format >= GGUF_FMT_COUNT || !repack.rows || repack.rows % QUANT_TILE_ROWS || !repack.columns ||
       repack.columns % kGgufBlockColumns)
     throw GgufError("invalid prepared weight repack");
   const QuantFormat &format = kQuantFormats[repack.format];
@@ -181,11 +181,11 @@ void writeRepack(metal::MetalBackend &backend, const WeightSource &source, int d
       }
       const uint64_t chunkGroups = columns / 32;
       const auto lengths = planeBytes(format, rows, columns);
-      // A plane is [rows / 256][units][256] tiles and a chunk starts on a
-      // tile: after the planes of the rows above it and, in its tile rows,
-      // of the columns before it.
+      // A plane is [rows / QUANT_TILE_ROWS][units][QUANT_TILE_ROWS] tiles and
+      // a chunk starts on a tile: after the planes of the rows above it and,
+      // in its tile rows, of the columns before it.
       const auto above = planeBytes(format, firstRow, repack.columns);
-      const auto before = planeBytes(format, kGgufTileRows, firstColumn);
+      const auto before = planeBytes(format, QUANT_TILE_ROWS, firstColumn);
       GgufRepackParams params{};
       params.rows = static_cast<uint32_t>(rows);
       params.input_size = static_cast<uint32_t>(columns);

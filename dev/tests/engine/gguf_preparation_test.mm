@@ -130,8 +130,8 @@ void checkDense(MetalBackend &backend, const std::filesystem::path &directory, c
     const auto ordered = orderedRows(target.data(source.name), stride, source.order);
     rows.insert(rows.end(), ordered.begin(), ordered.end());
   }
-  rows.resize(model::kGgufTileRows * stride);
-  const Packed expected = repack(Q80, rows, model::kGgufTileRows, g.hiddenSize, nullptr);
+  rows.resize(QUANT_TILE_ROWS * stride);
+  const Packed expected = repack(Q80, rows, QUANT_TILE_ROWS, g.hiddenSize, nullptr);
   check(slice(prepared[0], alphaBeta->plane0, expected.w0.size()) == expected.w0 &&
             slice(prepared[0], alphaBeta->meta, expected.meta.size()) == expected.meta,
         "prepared alpha/beta tensor matches the CPU reference");
@@ -334,7 +334,7 @@ void checkDenseTarget(MetalBackend &backend, const std::filesystem::path &direct
           at + "down block projection");
     if (const auto *gdn = std::get_if<model::QwenGdnWeights>(&layer.mixer)) {
       check(blockProjection(gdn->inputProjection, layout.packedGdnWidth, hidden,
-                            {layout.convolutionDimension, valueRows, uint32_t(model::kGgufTileRows)}),
+                            {layout.convolutionDimension, valueRows, QUANT_TILE_ROWS}),
             at + "GDN input segments qkv | z | alpha-beta tile");
       check(blockProjection(gdn->outputProjection, hidden, valueRows, {hidden}), at + "GDN output block projection");
       check(gdn->mixerNorm.float32, at + "F32 GDN norm");
@@ -369,7 +369,7 @@ uint32_t widerThanStaging(Fmt f) {
   const model::GgufPlaneBytes planes = model::ggufPlaneBytes(format, 1, model::kGgufBlockColumns);
   const uint64_t perBlock = model::ggufRowBytes(format, model::kGgufBlockColumns) + planes.plane0 + planes.plane1 +
                             planes.meta;
-  return uint32_t((model::kWeightPreparationStagingBytes / (model::kGgufTileRows * perBlock) + 1) *
+  return uint32_t((model::kWeightPreparationStagingBytes / (QUANT_TILE_ROWS * perBlock) + 1) *
                   model::kGgufBlockColumns);
 }
 

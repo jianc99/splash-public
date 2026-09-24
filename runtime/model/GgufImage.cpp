@@ -87,8 +87,8 @@ public:
       }
       return;
     }
-    if (2 * heads > kGgufTileRows) throw GgufError("alpha/beta rows exceed one 256-row tile");
-    Repack repack = planes(GGUF_FMT_Q80, kGgufTileRows, hidden, alphaName);
+    if (2 * heads > QUANT_TILE_ROWS) throw GgufError("alpha/beta rows exceed one 256-row tile");
+    Repack repack = planes(GGUF_FMT_Q80, QUANT_TILE_ROWS, hidden, alphaName);
     for (const GgufTensor *t : {beta, alpha})
       repack.sources.push_back(tensorRows(*t, heads, ggufRowBytes(kQuantFormats[GGUF_FMT_Q80], hidden), grouped(0, 1)));
     image_.repacks.push_back(std::move(repack));
@@ -186,7 +186,7 @@ private:
 
   // The descriptor and planes of a [rows, columns] quantized tensor.
   Repack planes(uint32_t format, uint64_t rows, uint64_t columns, const std::string &name) {
-    if (rows % kGgufTileRows || columns % kGgufBlockColumns) throw GgufError("tensor is not tile aligned: " + name);
+    if (rows % QUANT_TILE_ROWS || columns % kGgufBlockColumns) throw GgufError("tensor is not tile aligned: " + name);
     const QuantFormat &layout = kQuantFormats[format];
     const GgufPlaneBytes bytes = ggufPlaneBytes(layout, rows, columns);
     descriptor(layout.ggml_type, rows, columns, layout, bytes, name);

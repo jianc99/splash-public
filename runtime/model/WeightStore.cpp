@@ -286,7 +286,7 @@ GgufTensorDescriptor readGgufDescriptor(WeightFile &file, std::string_view label
     std::memcpy(&d, bytes, sizeof d);
     // Float tensors are rows as stored; quantized ones fill whole tiles.
     if (!d.outputSize || !d.inputSize ||
-        (d.type != GGUF_TYPE_F32 && (d.outputSize % kGgufTileRows || d.inputSize % kGgufBlockColumns)))
+        (d.type != GGUF_TYPE_F32 && (d.outputSize % QUANT_TILE_ROWS || d.inputSize % kGgufBlockColumns)))
         throw WeightStoreError("GGUF tensor shape is not tile aligned: " + std::string(label));
     return d;
 }

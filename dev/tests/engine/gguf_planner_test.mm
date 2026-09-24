@@ -70,7 +70,7 @@ void checkDense(const std::filesystem::path &directory) {
   const auto heads = [&](const model::gguf::TensorRows &rows, const char *name) {
     return rows.name == name && rows.rows == g.gdnValueHeads && grouped(rows.order, 0, 1, g);
   };
-  check(alphaBeta && alphaBeta->format == GGUF_FMT_Q80 && alphaBeta->rows == model::kGgufTileRows &&
+  check(alphaBeta && alphaBeta->format == GGUF_FMT_Q80 && alphaBeta->rows == QUANT_TILE_ROWS &&
             alphaBeta->sources.size() == 2 && heads(alphaBeta->sources[0], "blk.0.ssm_beta.weight") &&
             heads(alphaBeta->sources[1], "blk.0.ssm_alpha.weight"),
         "planner alpha/beta: one 256-row Q8_0 tensor of beta then alpha rows in grouped order");
