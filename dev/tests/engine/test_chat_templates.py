@@ -6,11 +6,11 @@ from pathlib import Path
 from jinja2 import TemplateError
 from transformers import PreTrainedTokenizerFast
 
+from dev.tests import test_server
 from dev.tests.test_server import (
     FakeRuntime,
     Harness,
     Plan,
-    ServerTest,
     TemplateTokenizer,
     _byte_backend,
 )
@@ -491,7 +491,7 @@ class ChatTemplateFrontendTests(unittest.TestCase):
         self.assertIn("<|image_pad|>", rendered)
         self.assertEqual(harness.tokenizer.renderer.chat_template, source("qwen36"))
 
-    class ScoringTokenizer(TemplateTokenizer, ServerTest.CharTokenizer):
+    class ScoringTokenizer(TemplateTokenizer, test_server.ServerTest.CharTokenizer):
         """Renders the real template; one token per character for answer slots."""
 
     def test_scoring_prompts_use_the_template_chosen_at_startup(self):
@@ -508,7 +508,7 @@ class ChatTemplateFrontendTests(unittest.TestCase):
             vision=True,
         )
         tokenizer.templates.clear()
-        app.prepare_judgment(ServerTest.judgment_body())
+        app.prepare_judgment(test_server.ServerTest.judgment_body())
         app.prepare_systemone(
             {"model": "test-model", "state": {}, "questions": {"q": {"type": "noul"}}}
         )
