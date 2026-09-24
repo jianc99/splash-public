@@ -15,9 +15,8 @@ Apple10 split-K tiles are offline candidates only. Their former one-lane
 defaults have been withdrawn after reproducible speculative-acceptance
 reductions on some M5 prompts. Those projections use the existing sequential
 tiles again; paired N256, M24, and Apple9 simdgroup selection are unchanged.
-Prefill and wider decode batches retain their existing rules. The obsolete
-Apple9 one-lane MPP branches have been removed; those kernels remain useful
-as qualification references and offline candidates.
+The obsolete Apple9 one-lane MPP branches have been removed; those kernels
+remain useful as qualification references and offline candidates.
 
 Core count comes from the Metal device's IORegistry property. Missing metadata
 uses one 32-core estimate across families, an intermediate value in the

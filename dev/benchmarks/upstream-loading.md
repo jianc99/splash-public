@@ -30,10 +30,10 @@ Preparation changes layout, never values:
 - Affine 35B: every byte of all 40 layers, head and embedding matches the
   released package.
 - Affine 27B: all packed weights, parameters, other tensors and padding across
-  64 layers, head and embedding match. The GDN decay vector differs by at most
-  one float ULP from the package's MLX exponential; the adapter computes
-  `float(-exp(double(A_log)))`, and the source oracle allows at most two ULP in
-  that one section.
+  64 layers, head and embedding match. The GDN decay vector of each of the 48
+  GDN layers differs by at most one float ULP from the package's MLX
+  exponential; the adapter computes `float(-exp(double(A_log)))`, and the
+  source oracle allows at most two ULP in that section.
 - GGUF: the bounded repack of all eight supported formats, with multiple row
   tiles, wide rows, head permutations and offsets above 4 GiB, matches the CPU
   reference bytewise on the M3 Max and the M5 Pro.
@@ -49,14 +49,14 @@ Each Unsloth mmproj holds 334 tensors: 110 BF16 matrices and 224 F32 tensors
 F32 values has non-zero low 16 bits (0 of 4,833,008 for 27B, 0 of 4,829,936 for
 35B), so they convert to BF16 exactly.
 
-The affine comparison is `affine-source-oracle`, given an MLX snapshot directory
-and the installed package of the same model; it prints `packed_exact=true` and
-the decay's `decay_max_ulp` per file. Give it a scratch `SPLASH_WEIGHT_CACHE`.
-The GGUF repack check is `gguf-repack` in `make test-engine-metal`.
+The affine comparison is `affine-source-oracle` (DEVELOPMENT.md, Validate),
+which prints `packed_exact=true` and the decay's `decay_max_ulp` per file; give
+it a scratch `SPLASH_WEIGHT_CACHE`. The GGUF repack check is `gguf-preparation`
+in `make test-engine-metal`.
 
 ```sh
-SPLASH_WEIGHT_CACHE=$(mktemp -d) build/engine-tests/affine-source-oracle \
-  build/splash.metallib MLX_SNAPSHOT install/models/incoai/Qwen3.6-35B-A3B-Splash
+SPLASH_WEIGHT_CACHE=$(mktemp -d) build/engine-tests/affine-source-oracle build/splash.metallib \
+  install/models/mlx-community/Qwen3.6-35B-A3B-4bit/target install/models/incoai/Qwen3.6-35B-A3B-Splash
 ```
 
 A prepared vision file is the `weights` file of the cache entry whose `source`

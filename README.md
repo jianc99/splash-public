@@ -168,8 +168,8 @@ GPU, 48 GB), serving the Qwen3.8-27B and Qwen3.6-35B-A3B Splash packages:
 selected SPEED-Bench coding prompts over HTTP, a 1,024-token output limit,
 reasoning on (medium for the 27B). The ratio in each cell is against the
 next-fastest engine we measured. The MLX 4-bit models prepare to the packages'
-target weights, byte for byte but for one 27B vector within a float ULP, and
-decode within 0.5% of them on this M5 Pro
+target weights, byte for byte but for the 27B's 48 per-layer GDN decay vectors,
+each within a float ULP, and decode within 0.5% of them on this M5 Pro
 ([upstream loading](dev/benchmarks/upstream-loading.md)). GGUF targets run
 other kernels and are not part of this comparison.
 
