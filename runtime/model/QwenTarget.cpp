@@ -126,7 +126,7 @@ QwenMixerWeights readQwenMixer(WeightFile &file, metal::MetalBackend &backend,
     attention.keyNorm =
         readNorm(file, geometry.attentionHeadDimension, ggufTarget, "key-norm");
     attention.outputProjection = ggufTarget
-        ? readGgufProjection(file, "attn-output")
+        ? readGgufProjection(file, geometry.hiddenSize, geometry.attentionWidth, "attn-output")
         : readProjection(file, backend, geometry.hiddenSize,
                            geometry.attentionWidth, "attention-output");
     return attention;
@@ -155,7 +155,8 @@ QwenMixerWeights readQwenMixer(WeightFile &file, metal::MetalBackend &backend,
   if (ggufTarget) {
     // The GGUF keeps out_proj's input columns in llama.cpp's tiled value-head
     // order, so the GDN writes its output in that order.
-    gdn.outputProjection = readGgufProjection(file, "gdn-output");
+    gdn.outputProjection =
+        readGgufProjection(file, geometry.hiddenSize, geometry.attentionWidth, "gdn-output");
     gdn.outputHeadOrder = ops::GdnHeadOrder::Tiled;
   } else {
     gdn.outputProjection = readProjection(
@@ -187,7 +188,7 @@ template <class Weights>
 QwenTargetGeometry targetGeometry(const Weights &weights) {
   auto geometry = geometryFor(weights.layout);
   const auto include = [&](const ops::Projection &p) {
-    if (p.outputSize && p.inputSize) geometry.decodeProjections.push_back(p.shape());
+    geometry.decodeProjections.push_back(p.shape());
   };
   for (const auto &layer : weights.layers) {
     std::visit([&](const auto &mixer) {
@@ -200,8 +201,7 @@ QwenTargetGeometry targetGeometry(const Weights &weights) {
       include(layer.gateProjection);
       include(layer.upProjection);
       include(layer.downProjection);
-      if (layer.upProjection.outputSize && layer.upProjection.inputSize)
-        geometry.gateUpProjections.push_back(layer.upProjection.shape());
+      geometry.gateUpProjections.push_back(layer.upProjection.shape());
     } else {
       const auto shape = geometry.moeShape(layer.ffn.layout());
       if (std::none_of(geometry.moeShapes.begin(), geometry.moeShapes.end(),

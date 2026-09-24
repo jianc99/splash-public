@@ -206,10 +206,22 @@ void checkMixedLayouts() {
           "MoE layout inventory must follow the expert layers, not the head");
 }
 
+// Arenas are sized from the projections the weights hold, so each must have
+// sizes; an empty one would drop its workspace from the bound silently.
+void checkUnsizedProjection() {
+  auto broken = package<model::Qwen3_8Weights>();
+  std::get<model::Qwen3_8Weights>(broken.target).layers.back().downProjection = ops::Projection();
+  bool rejected = false;
+  try { static_cast<void>(model::RuntimeGeometry::from(broken)); }
+  catch (const std::invalid_argument &) { rejected = true; }
+  require(rejected, "a target projection without sizes reached arena sizing");
+}
+
 } // namespace
 
 int main() {
   try {
+    checkUnsizedProjection();
     checkMixedLayouts();
     const auto dense = package<model::Qwen3_8Weights>();
     const auto sparse = package<model::Qwen3_6MoeWeights>();

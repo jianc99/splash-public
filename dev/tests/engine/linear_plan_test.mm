@@ -776,6 +776,17 @@ void ggufPlans() {
   // A block projection without segments would reach the dispatch paths with
   // nothing to index or encode.
   rejects([] { (void)Projection(5120, 17408, BlockWeights{}); });
+  // A projection runs only as the matrix it holds: the padding past its
+  // segments is part of it, not room for a narrower plan.
+  {
+    metal::CommandGraph graph;
+    QuantizedSegment segment;
+    segment.outputSize = 5120;
+    segment.inputSize = 17408;
+    const Projection padded(5376, 17408, BlockWeights{{segment}});
+    rejects([&] { (void)linear.addDecode(graph, {}, padded, {}, {5120, 17408}); });
+    require(graph.empty(), "a mismatched block projection encoded a dispatch");
+  }
   const LinearWorkload down{{5120, 17408}, 8, LinearPhase::Decode, LinearEpilogue::Residual};
   const LinearPlan single = linear.plan(down, projection(5120, 17408, 1));
   require(single.workload().weightLayout == WeightLayout::Block32 &&

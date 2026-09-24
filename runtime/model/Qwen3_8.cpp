@@ -48,9 +48,12 @@ Qwen3_8Weights loadQwen3_8Weights(metal::MetalBackend &backend,
   validateLayout(layout);
   auto readFfn = [&](WeightFile &file, Qwen3_8LayerWeights &layer) {
     if (source == TargetSource::Gguf) {
-      layer.gateProjection = readGgufProjection(file, "mlp-gate");
-      layer.upProjection = readGgufProjection(file, "mlp-up");
-      layer.downProjection = readGgufProjection(file, "mlp-down");
+      layer.gateProjection =
+          readGgufProjection(file, layout.intermediateSize, layout.hiddenSize, "mlp-gate");
+      layer.upProjection =
+          readGgufProjection(file, layout.intermediateSize, layout.hiddenSize, "mlp-up");
+      layer.downProjection =
+          readGgufProjection(file, layout.hiddenSize, layout.intermediateSize, "mlp-down");
       return;
     }
     layer.gateProjection = readProjection(

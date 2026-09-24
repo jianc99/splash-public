@@ -343,13 +343,19 @@ ops::QuantizedSegment readQuantizedSegment(WeightFile &file, std::string_view la
     return s;
 }
 
-ops::Projection readGgufProjection(WeightFile &file, std::string_view label) {
-    auto segment = readQuantizedSegment(file, label);
-    return {segment.outputSize, segment.inputSize, ops::BlockWeights{{std::move(segment)}}};
+ops::Projection readGgufProjection(WeightFile &file, uint32_t outputSize, uint32_t inputSize,
+                                   std::string_view label) {
+    ops::QuantizedSegment segment = readQuantizedSegment(file, label);
+    if (segment.outputSize != outputSize || segment.inputSize != inputSize)
+        throw WeightStoreError("GGUF tensor does not match the layout: " + std::string(label));
+    return {outputSize, inputSize, ops::BlockWeights{{std::move(segment)}}};
 }
 
-ops::EmbeddingWeights readGgufEmbedding(WeightFile &file, std::string_view label) {
+ops::EmbeddingWeights readGgufEmbedding(WeightFile &file, uint32_t outputSize, uint32_t inputSize,
+                                        std::string_view label) {
     const GgufDescriptor d = readGgufDescriptor(file, label);
+    if (d.outputSize != outputSize || d.inputSize != inputSize)
+        throw WeightStoreError("GGUF embedding does not match the layout: " + std::string(label));
     // Native rows, gathered by gguf_embed_<type>: block_q4_K, block_q6_K or block_q8_0.
     const uint32_t format = gguf_format_of(d.type);
     if ((format != GGUF_FMT_Q4K && format != GGUF_FMT_Q6K && format != GGUF_FMT_Q80) || d.inputSize % 256 ||

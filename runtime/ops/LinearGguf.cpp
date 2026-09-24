@@ -85,19 +85,21 @@ void recordLanes(LinearDispatchStats *stats, uint32_t rows) {
   else ++stats->m32Dispatches;
 }
 
-// Segments tile the leading columns of the destination rows; the columns past
-// the last segment are padding no kernel writes. The 35B GGUF's packed GDN row
-// is 12544 columns (the affine layout's), its qkv|z|alpha-beta segments 12352.
+// The projection is the plan's matrix, and its segments tile the leading
+// columns of the destination rows; the columns past the last segment are
+// padding no kernel writes. A fused projection keeps the layout's sizes: the
+// 35B GGUF's packed GDN row is 12544 columns (the affine layout's), its
+// qkv|z|alpha-beta segments 12352.
 void requireSegments(const Projection &p, LinearMatrix matrix) {
+  if (p.outputSize != matrix.outputSize || p.inputSize != matrix.inputSize)
+    throw std::invalid_argument("GGUF projection does not match plan");
   uint32_t covered = 0;
   for (const QuantizedSegment &s : p.segments()) {
-    if (s.inputSize != matrix.inputSize || s.columnOffset != covered ||
-        s.outputSize % kDecodeTileColumns)
+    if (s.inputSize != matrix.inputSize || s.columnOffset != covered || !s.outputSize ||
+        s.outputSize % kDecodeTileColumns || s.outputSize > matrix.outputSize - covered)
       throw std::invalid_argument("GGUF segments do not tile the projection");
     covered += s.outputSize;
   }
-  if (covered > matrix.outputSize)
-    throw std::invalid_argument("GGUF segments exceed the projection");
 }
 
 // Columns of the segments, which the fused kernels' grids cover.

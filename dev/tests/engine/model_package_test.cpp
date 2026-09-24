@@ -1,4 +1,5 @@
 #include "model/ModelFactory.hpp"
+#include "ops/Embedding.hpp"
 
 #include <algorithm>
 #include <array>
@@ -44,6 +45,7 @@ using splash::metal::MetalBackend;
 using splash::metal::MetalBuffer;
 
 constexpr std::string_view kDraftLayerMagic = "MDFD0004";
+constexpr std::string_view kGgufImageMagic = "MDGG0001";
 constexpr std::string_view kTargetEmbeddingMagic = "MDFE0001";
 constexpr std::string_view kTargetHeadMagic = "MDFL0002";
 constexpr std::string_view kTargetLayerMagic = "MDFL0006";
@@ -465,6 +467,84 @@ void testWeightFileValidationAndLifetime(MetalBackend &backend,
         "unaligned packed file size was accepted");
 }
 
+// One tensor of a GGUF image: its 64-byte descriptor, then its sections.
+std::filesystem::path writeGgufTensor(const std::filesystem::path &path, uint32_t type,
+                                      uint32_t rows, uint32_t columns,
+                                      std::array<uint32_t, 4> planeLayout,
+                                      std::array<uint64_t, 3> planes) {
+    std::vector<uint64_t> sections{64};
+    for (uint64_t bytes : planes)
+        if (bytes) sections.push_back(bytes);
+    writeWeightFile(path, kGgufImageMagic, 0, 0, sections);
+    std::array<uint8_t, 64> descriptor{};
+    const std::array<uint32_t, 7> words{type, rows, columns, planeLayout[0], planeLayout[1],
+                                        planeLayout[2], planeLayout[3]};
+    std::memcpy(descriptor.data(), words.data(), sizeof(words));
+    std::memcpy(descriptor.data() + 32, planes.data(), sizeof(planes));
+    int file = open(path.c_str(), O_WRONLY | O_CLOEXEC);
+    require(file >= 0 && pwrite(file, descriptor.data(), descriptor.size(),
+                                kWeightFileAlignment) == static_cast<ssize_t>(descriptor.size()),
+            "unable to write a synthetic GGUF descriptor");
+    close(file);
+    return path;
+}
+
+// GGUF image readers hold a tensor to the sizes the layout expects, and a
+// token gather writes only into buffers holding its rows.
+void testGgufImageLayout(MetalBackend &backend, const std::filesystem::path &root) {
+    constexpr uint32_t rows = 256, columns = 256;
+    // Q8_0 planes (metal/abi/QuantFormat.h): 32 value bytes and one half
+    // scale per row and group of 32; native rows are 34-byte blocks.
+    const auto projection = writeGgufTensor(root / "projection.bin", 8, rows, columns, {32, 0, 2, 1},
+                                            {rows * (columns / 32) * 32, 0, rows * (columns / 32) * 2});
+    const auto embedding = writeGgufTensor(root / "embedding.bin", 8, rows, columns, {0, 0, 0, 0},
+                                           {rows * (columns / 32) * 34, 0, 0});
+    const auto mapped = [&](const std::filesystem::path &path) {
+        return WeightFile(backend, path, "test/" + path.filename().string(), kGgufImageMagic, 0, 0);
+    };
+    {
+        WeightFile file = mapped(projection);
+        const auto read = splash::model::readGgufProjection(file, rows, columns, "projection");
+        file.finish();
+        require(read.outputSize == rows && read.inputSize == columns && read.segments().size() == 1,
+                "GGUF projection lost its layout sizes");
+    }
+    for (const auto [output, input] : {std::pair{2 * rows, columns}, std::pair{rows, 2 * columns}}) {
+        requirePackedError(
+            [&] {
+                WeightFile file = mapped(projection);
+                (void)splash::model::readGgufProjection(file, output, input, "projection");
+            },
+            "GGUF projection of other sizes than the layout's was accepted");
+        requirePackedError(
+            [&] {
+                WeightFile file = mapped(embedding);
+                (void)splash::model::readGgufEmbedding(file, output, input, "embedding");
+            },
+            "GGUF embedding of other sizes than the layout's was accepted");
+    }
+    WeightFile file = mapped(embedding);
+    const auto table = splash::model::readGgufEmbedding(file, rows, columns, "embedding");
+    file.finish();
+    constexpr uint32_t gathered = 8;
+    const MetalBuffer tokens = backend.allocateBuffer(gathered * sizeof(uint32_t), BufferStorage::Shared);
+    const MetalBuffer output = backend.allocateBuffer(uint64_t{gathered} * columns * 2, BufferStorage::Shared);
+    splash::metal::CommandGraph graph;
+    splash::ops::Embedding::add(graph, tokens, table, output, gathered);
+    for (const auto &[tokenBytes, outputBytes] :
+         {std::pair{tokens.sizeBytes() - 4, output.sizeBytes()},
+          std::pair{tokens.sizeBytes(), output.sizeBytes() - 2}}) {
+        bool rejected = false;
+        try {
+            splash::ops::Embedding::add(graph, backend.view(tokens, 0, tokenBytes), table,
+                                        backend.view(output, 0, outputBytes), gathered);
+        } catch (const std::invalid_argument &) {
+            rejected = true;
+        }
+        require(rejected, "token gather past its buffers was accepted");
+    }
+}
+
 void testSyntheticPackage(MetalBackend &backend,
                           const std::filesystem::path &root) {
     Qwen3_8Layout target;
@@ -698,6 +778,7 @@ int main(int argc, const char *argv[]) {
         MetalBackend backend(argv[1]);
         TempDirectory temporary;
         testWeightFileValidationAndLifetime(backend, temporary.path());
+        testGgufImageLayout(backend, temporary.path());
         testSyntheticPackage(backend, temporary.path() / "package");
         if (argc == 3) {
             testRealPackageMetadata(argv[2]);

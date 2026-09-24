@@ -27,6 +27,10 @@ void Embedding::add(metal::CommandGraph &graph, metal::MetalBuffer tokens,
                     uint32_t rows) {
   if (!rows || !table.outputSize || !table.inputSize)
     throw std::invalid_argument("invalid Q4 embedding shape");
+  // Both gathers read `rows` token ids and write `rows` bf16 rows of the table's width.
+  if (tokens.sizeBytes() < uint64_t{rows} * sizeof(uint32_t) ||
+      output.sizeBytes() < uint64_t{rows} * table.inputSize * sizeof(uint16_t))
+    throw std::invalid_argument("embedding buffers are smaller than the gathered rows");
   if (!table.isAffine()) {
     const GgufEmbedParams params{rows, table.outputSize, table.inputSize};
     const uint32_t type = table.nativeRows().type;

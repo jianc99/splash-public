@@ -10,6 +10,7 @@
 #include "ops/Normalization.hpp"
 #include "ops/PagedAttention.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <filesystem>
@@ -17,6 +18,7 @@
 #include <string>
 #include <string_view>
 #include <variant>
+#include <vector>
 
 namespace splash::model {
 
@@ -123,7 +125,7 @@ readQwenTargetWeights(metal::MetalBackend &backend, const Layout &layout, Files 
     WeightFile file = files.head(layout.layers);
     result.finalNorm = readNorm(file, layout.hiddenSize, ggufTarget, "final-norm");
     result.logitsProjection = ggufTarget
-        ? readGgufProjection(file, "logits")
+        ? readGgufProjection(file, layout.vocabularySize, layout.hiddenSize, "logits")
         : readProjection(file, backend, layout.vocabularySize,
                            layout.hiddenSize, "logits");
     file.finish();
@@ -132,7 +134,7 @@ readQwenTargetWeights(metal::MetalBackend &backend, const Layout &layout, Files 
   {
     WeightFile file = files.embedding(layout.vocabularySize, layout.hiddenSize);
     result.tokenEmbedding = ggufTarget
-        ? readGgufEmbedding(file, "embedding")
+        ? readGgufEmbedding(file, layout.vocabularySize, layout.hiddenSize, "embedding")
         : readAffineEmbedding(file, layout.vocabularySize,
                                      layout.hiddenSize, "embedding");
     file.finish();
@@ -218,7 +220,14 @@ struct QwenTargetGeometry final {
     return {gdnKeyHeads, gdnValueHeads, gdnHeadDimension,
             convolutionDimension, packedGdnWidth};
   }
-  [[nodiscard]] constexpr bool valid() const noexcept {
+  // The projection lists hold every projection the weights dispatch, which
+  // each have sizes.
+  [[nodiscard]] bool valid() const noexcept {
+    const auto sized = [](const std::vector<ops::ProjectionShape> &shapes) {
+      return !shapes.empty() && std::all_of(shapes.begin(), shapes.end(), [](const auto &shape) {
+        return shape.outputSize && shape.inputSize;
+      });
+    };
     return maximumContextTokens && layers && hiddenSize && vocabularySize &&
            packedGdnWidth && packedAttentionWidth && convolutionDimension &&
            gdnKeyHeads && gdnValueHeads && gdnHeadDimension &&
@@ -231,8 +240,10 @@ struct QwenTargetGeometry final {
            attentionWidth == attentionQueryHeads * attentionHeadDimension &&
            kvLayout.kvHeads == attentionKvHeads &&
            kvLayout.headDimension == attentionHeadDimension &&
-           ((ffnKind == QwenFfnKind::Dense && denseIntermediateSize) ||
-            (ffnKind == QwenFfnKind::SparseMoe && moeShape(ops::WeightLayout::Affine64).valid()));
+           sized(prefillProjections) && sized(decodeProjections) &&
+           ((ffnKind == QwenFfnKind::Dense && denseIntermediateSize && sized(gateUpProjections)) ||
+            (ffnKind == QwenFfnKind::SparseMoe && !moeShapes.empty() &&
+             std::all_of(moeShapes.begin(), moeShapes.end(), [](const auto &shape) { return shape.valid(); })));
   }
 };
 
