@@ -263,12 +263,6 @@ void QwenTarget::addPrefillImpl(
       throw std::invalid_argument("Qwen prefill state layer mismatch");
     }
   }
-  const ops::LinearMatrix gdnInput{geometry_.packedGdnWidth,
-                                     geometry_.hiddenSize};
-  const ops::LinearMatrix attentionInput{geometry_.packedAttentionWidth,
-                                           geometry_.hiddenSize};
-  const ops::LinearMatrix mixerOutput{geometry_.hiddenSize,
-                                        geometry_.attentionWidth};
   const auto moePlan = [&] {
     if constexpr (hasSparseFfn<Weights>) return operators_.moePrefill(geometry_.moeShape(), rows);
     else return std::monostate{};
@@ -301,7 +295,7 @@ void QwenTarget::addPrefillImpl(
           if constexpr (isGdnMixer<decltype(mixer)>) {
             operators_.linear().addPrefill(graph, buffers.normalized,
                            mixer.inputProjection, buffers.gdnPacked,
-                           buffers.projectionSums, gdnInput, rows, buffers.linearScratch);
+                           buffers.projectionSums, rows, buffers.linearScratch);
             for (const QwenTargetPrefillSequence &sequence : sequences) {
               ops::GDN::addPrefill(
                   graph,
@@ -330,17 +324,17 @@ void QwenTarget::addPrefillImpl(
                   geometry_.gdnShape(), sequence.rows, mixer.outputHeadOrder);
             }
             operators_.linear().addPrefillSums(graph, buffers.gdnHidden,
-                               buffers.projectionSums, mixerOutput, rows);
+                               buffers.projectionSums, mixer.outputProjection, rows);
             operators_.linear().addPrefillResidual(
                 graph, buffers.gdnHidden, mixer.outputProjection, input,
-                buffers.gdnOutput, buffers.projectionSums, mixerOutput,
+                buffers.gdnOutput, buffers.projectionSums,
                 rows, buffers.linearScratch);
             residual = buffers.gdnOutput;
             ++gdnIndex;
           } else {
             operators_.linear().addPrefill(graph, buffers.normalized,
                            mixer.inputProjection, buffers.fullPacked,
-                           buffers.projectionSums, attentionInput, rows, buffers.linearScratch);
+                           buffers.projectionSums, rows, buffers.linearScratch);
             for (const QwenTargetPrefillSequence &sequence : sequences) {
               const uint64_t queryBytes =
                   uint64_t{geometry_.attentionQueryHeads} *
@@ -392,10 +386,10 @@ void QwenTarget::addPrefillImpl(
                   geometry_.kvLayout);
             }
             operators_.linear().addPrefillSums(graph, buffers.attentionHidden,
-                               buffers.projectionSums, mixerOutput, rows);
+                               buffers.projectionSums, mixer.outputProjection, rows);
             operators_.linear().addPrefillResidual(
                 graph, buffers.attentionHidden, mixer.outputProjection, input,
-                buffers.attentionOutput, buffers.projectionSums, mixerOutput,
+                buffers.attentionOutput, buffers.projectionSums,
                 rows, buffers.linearScratch);
             residual = buffers.attentionOutput;
             ++attentionIndex;
@@ -407,20 +401,16 @@ void QwenTarget::addPrefillImpl(
         graph, residual, layer.postAttentionNorm, buffers.normalized,
         buffers.projectionSums, geometry_.hiddenSize, rows);
     if constexpr (hasDenseFfn<std::remove_cvref_t<decltype(layer)>>) {
-      const ops::LinearMatrix up{geometry_.denseIntermediateSize,
-                                   geometry_.hiddenSize};
-      const ops::LinearMatrix down{geometry_.hiddenSize,
-                                     geometry_.denseIntermediateSize};
       operators_.linear().addPrefill(graph, buffers.normalized, layer.gateProjection,
-                     buffers.denseGateScratch, buffers.projectionSums, up,
+                     buffers.denseGateScratch, buffers.projectionSums,
                      rows, buffers.linearScratch);
       operators_.linear().addPrefillUpWithGate(
           graph, buffers.normalized, layer.upProjection,
           buffers.denseGateScratch, buffers.denseIntermediate,
-          buffers.projectionSums, buffers.downProjectionSums, up, rows, buffers.linearScratch);
+          buffers.projectionSums, buffers.downProjectionSums, rows, buffers.linearScratch);
       operators_.linear().addPrefillResidual(
           graph, buffers.denseIntermediate, layer.downProjection, residual,
-          output, buffers.downProjectionSums, down, rows, buffers.linearScratch);
+          output, buffers.downProjectionSums, rows, buffers.linearScratch);
     } else {
       ops::MoE::add(
           graph,
@@ -491,9 +481,6 @@ void QwenTarget::addVerifyImpl(
     histories[lane] = verify[lane].committed_tokens;
   const auto attentionPlan = operators_.verifyAttention(
       lanes, geometry_.attentionQueryHeads, geometry_.kvLayout, histories);
-  const ops::LinearMatrix gdnInput{geometry_.packedGdnWidth, geometry_.hiddenSize};
-  const ops::LinearMatrix attentionInput{geometry_.packedAttentionWidth, geometry_.hiddenSize};
-  const ops::LinearMatrix mixerOutput{geometry_.hiddenSize, geometry_.attentionWidth};
   const auto moePlan = [&] {
     if constexpr (hasSparseFfn<Weights>) return operators_.moeDecode(geometry_.moeShape(), lanes);
     else return std::monostate{};
@@ -509,7 +496,7 @@ void QwenTarget::addVerifyImpl(
     // Each producer emits the table (if any) its consumer's plan reads.
     const ops::LinearInput mixerInput = std::visit(
         [&](const auto &mixer) {
-          return operators_.linear().decodeInput(mixer.inputProjection, lanes);
+          return operators_.linear().decodePlan(mixer.inputProjection, lanes).input();
         },
         layer.mixer);
     const ops::PreparedInput normalized = ops::Normalization::addRms(
@@ -519,12 +506,12 @@ void QwenTarget::addVerifyImpl(
     metal::MetalBuffer residual;
     std::visit(
         [&](const auto &mixer) {
-          const ops::LinearInput outputInput = operators_.linear().decodeInput(
-              mixer.outputProjection, lanes, ops::LinearEpilogue::Residual);
+          const ops::LinearInput outputInput = operators_.linear().decodePlan(
+              mixer.outputProjection, lanes, ops::LinearEpilogue::Residual).input();
           if constexpr (isGdnMixer<decltype(mixer)>) {
             operators_.linear().addDecodeBatch(graph,
                                buffers.normalized, mixer.inputProjection,
-                               buffers.gdnPacked[gdnIndex], gdnInput, lanes,
+                               buffers.gdnPacked[gdnIndex], lanes,
                                stats, buffers.linearScratch, normalized);
             const ops::PreparedInput hidden = ops::GDN::addDecode(
                 graph,
@@ -541,14 +528,14 @@ void QwenTarget::addVerifyImpl(
                 mixer.outputHeadOrder, outputInput);
             operators_.linear().addResidualBatch(
                 graph, buffers.gdnHidden,
-                mixer.outputProjection, input, buffers.gdnOutput, mixerOutput,
+                mixer.outputProjection, input, buffers.gdnOutput,
                 lanes, stats, buffers.linearScratch, hidden);
             residual = buffers.gdnOutput;
             ++gdnIndex;
           } else {
             operators_.linear().addDecodeBatch(graph,
                                buffers.normalized, mixer.inputProjection,
-                               buffers.fullPacked, attentionInput, lanes,
+                               buffers.fullPacked, lanes,
                                stats, buffers.linearScratch, normalized);
             ops::PagedAttention::addVerifyProjection(
                 graph, buffers.fullPacked, mixer.queryNorm, mixer.keyNorm,
@@ -572,7 +559,7 @@ void QwenTarget::addVerifyImpl(
             operators_.linear().addResidualBatch(
                 graph, buffers.attentionHidden,
                 mixer.outputProjection, input, buffers.attentionOutput,
-                mixerOutput, lanes, stats, buffers.linearScratch, hidden);
+                lanes, stats, buffers.linearScratch, hidden);
             residual = buffers.attentionOutput;
             ++attentionIndex;
           }
@@ -581,21 +568,19 @@ void QwenTarget::addVerifyImpl(
 
     ops::LinearInput ffnInput = ops::LinearInput::Plain;
     if constexpr (hasDenseFfn<std::remove_cvref_t<decltype(layer)>>)
-      ffnInput = operators_.linear().decodeInput(layer.upProjection, lanes,
-                                                 ops::LinearEpilogue::GateUp);
+      ffnInput = operators_.linear().decodePlan(layer.upProjection, lanes,
+                                                ops::LinearEpilogue::GateUp).input();
     const ops::PreparedInput ffnNormalized = ops::Normalization::addRms(
         graph, residual, layer.postAttentionNorm, buffers.normalized, geometry_.hiddenSize,
         rows, buffers.linearScratch, ffnInput);
     if constexpr (hasDenseFfn<std::remove_cvref_t<decltype(layer)>>) {
-      const ops::LinearMatrix up{geometry_.denseIntermediateSize, geometry_.hiddenSize};
-      const ops::LinearMatrix down{geometry_.hiddenSize, geometry_.denseIntermediateSize};
       operators_.linear().addGateUpBatch(graph, buffers.normalized, layer.gateProjection,
                          layer.upProjection, buffers.denseGateScratch,
-                         buffers.denseIntermediate, up, lanes, stats, buffers.linearScratch,
+                         buffers.denseIntermediate, lanes, stats, buffers.linearScratch,
                          ffnNormalized);
       operators_.linear().addResidualBatch(
           graph, buffers.denseIntermediate,
-          layer.downProjection, residual, output, down, lanes, stats, buffers.linearScratch);
+          layer.downProjection, residual, output, lanes, stats, buffers.linearScratch);
     } else {
       ops::MoE::add(
           graph,
@@ -622,10 +607,9 @@ void QwenTarget::addVerifyImpl(
       graph, buffers.hidden[geometry_.layers & 1],
       std::visit([](const auto *value) { return value->finalNorm; }, weights_),
       buffers.finalHidden, geometry_.hiddenSize, rows, buffers.linearScratch,
-      operators_.linear().decodeInput(vocabularyProjection(), lanes));
-  const ops::LinearMatrix head{geometry_.vocabularySize, geometry_.hiddenSize};
+      operators_.linear().decodePlan(vocabularyProjection(), lanes).input());
   operators_.linear().addDecodeBatch(graph, buffers.finalHidden,
-                     vocabularyProjection(), buffers.logits, head, lanes,
+                     vocabularyProjection(), buffers.logits, lanes,
                      stats, buffers.linearScratch, finalHidden);
 }
 
@@ -642,10 +626,9 @@ void QwenTarget::addHead(metal::CommandGraph &graph,
       [](const auto *weights) { return weights->finalNorm; }, weights_);
   ops::Normalization::addRms(graph, std::move(hidden), norm, finalHidden,
                              geometry_.hiddenSize, normalizedRows);
-  const ops::LinearMatrix head{geometry_.vocabularySize, geometry_.hiddenSize};
   operators_.linear().addDecode(graph,
                 std::move(finalHidden), vocabularyProjection(),
-                std::move(logits), head, scratch);
+                std::move(logits), scratch);
 }
 
 void QwenTarget::addEmbedding(metal::CommandGraph &graph,

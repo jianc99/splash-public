@@ -53,6 +53,7 @@ struct LinearMatrix final {
   auto operator<=>(const LinearMatrix &) const = default;
 };
 
+
 // Throws unless `projection` is an affine projection of `matrix` whose planes
 // hold all of its Q4 weights, scales and biases.
 void requireAffineProjection(const Projection &projection, LinearMatrix matrix);
@@ -216,9 +217,12 @@ public:
   // projection tiles (LinearPlan::storageRows of its decode plans): the step's
   // rows, or the staged GGUF tile's 8, 16 or 32.
   [[nodiscard]] uint32_t decodeStorageRows(uint32_t rows, WeightLayout weightLayout) const noexcept;
-  // The layout the decode plan of this projection reads, for its producer.
-  [[nodiscard]] LinearInput decodeInput(const Projection &projection, uint32_t lanes,
-                                        LinearEpilogue epilogue = LinearEpilogue::None) const;
+  // The plans of this projection's matrix in its layout. A decode plan's
+  // input() is the layout its producer writes.
+  [[nodiscard]] LinearPlan prefillPlan(const Projection &projection, uint32_t rows,
+                                       LinearEpilogue epilogue) const;
+  [[nodiscard]] LinearPlan decodePlan(const Projection &projection, uint32_t lanes,
+                                      LinearEpilogue epilogue = LinearEpilogue::None) const;
   [[nodiscard]] LinearScratchSize decodeScratchSize(LinearWorkload workload) const;
   // The tile of a float projection of `rows` rows into `outputSize` columns
   // on this device (LinearGguf.cpp).
@@ -234,51 +238,35 @@ public:
                     const Projection *gate = nullptr,
                     LinearDispatchStats *stats = nullptr) const;
 
-  void addPrefillSums(metal::CommandGraph &graph, metal::MetalBuffer input,
-                      metal::MetalBuffer sums, LinearMatrix matrix,
-                      uint32_t rows) const;
-  // `scratch` holds the partials and counters of split plans (GGUF chunks of
-  // up to 32 rows); reused serially within one command stream, as in decode.
-  void addPrefill(metal::CommandGraph &graph, metal::MetalBuffer input,
-                  const Projection &projection, metal::MetalBuffer output,
-                  metal::MetalBuffer sums, LinearMatrix matrix,
-                  uint32_t rows, LinearScratch scratch = {}) const;
-  void addPrefillUpWithGate(
-      metal::CommandGraph &graph, metal::MetalBuffer input,
-      const Projection &up, metal::MetalBuffer gateScratch,
-      metal::MetalBuffer output, metal::MetalBuffer sums,
-      metal::MetalBuffer downSums, LinearMatrix matrix,
-      uint32_t rows, LinearScratch scratch = {}) const;
-  void addPrefillResidual(metal::CommandGraph &graph,
-                          metal::MetalBuffer input,
-                          const Projection &projection,
-                          metal::MetalBuffer residual,
-                          metal::MetalBuffer output, metal::MetalBuffer sums,
-                          LinearMatrix matrix, uint32_t rows,
-                          LinearScratch scratch = {}) const;
+  // The Q4 input sums of `rows` rows an affine prefill projection reads.
+  void addPrefillSums(metal::CommandGraph &graph, metal::MetalBuffer input, metal::MetalBuffer sums,
+                      const Projection &consumer, uint32_t rows) const;
+  // The projections of `rows` rows through their own matrix. `scratch` holds
+  // the partials and counters of split plans (GGUF chunks of up to 32 rows);
+  // reused serially within one command stream, as in decode.
+  void addPrefill(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &projection,
+                  metal::MetalBuffer output, metal::MetalBuffer sums, uint32_t rows,
+                  LinearScratch scratch = {}) const;
+  void addPrefillUpWithGate(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &up,
+                            metal::MetalBuffer gateScratch, metal::MetalBuffer output, metal::MetalBuffer sums,
+                            metal::MetalBuffer downSums, uint32_t rows, LinearScratch scratch = {}) const;
+  void addPrefillResidual(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &projection,
+                          metal::MetalBuffer residual, metal::MetalBuffer output, metal::MetalBuffer sums,
+                          uint32_t rows, LinearScratch scratch = {}) const;
 
-  PreparedInput addDecode(metal::CommandGraph &graph,
-                          metal::MetalBuffer input, const Projection &projection,
-                          metal::MetalBuffer output, LinearMatrix matrix,
-                          LinearScratch scratch = {}) const;
-  PreparedInput addDecodeBatch(metal::CommandGraph &graph,
-                               metal::MetalBuffer input,
-                               const Projection &projection,
-                               metal::MetalBuffer output, LinearMatrix matrix,
-                               uint32_t lanes, LinearDispatchStats &stats,
-                               LinearScratch scratch = {}, PreparedInput prepared = {}) const;
-  PreparedInput addGateUpBatch(metal::CommandGraph &graph, metal::MetalBuffer input,
-                               const Projection &gate, const Projection &up,
-                               metal::MetalBuffer gateScratch,
-                               metal::MetalBuffer output, LinearMatrix matrix,
-                               uint32_t lanes, LinearDispatchStats &stats,
-                               LinearScratch scratch = {}, PreparedInput prepared = {}) const;
-  PreparedInput addResidualBatch(metal::CommandGraph &graph,
-                                 metal::MetalBuffer input,
-                                 const Projection &projection,
-                                 metal::MetalBuffer residual,
-                                 metal::MetalBuffer output, LinearMatrix matrix,
-                                 uint32_t lanes, LinearDispatchStats &stats,
+  PreparedInput addDecode(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &projection,
+                          metal::MetalBuffer output, LinearScratch scratch = {}) const;
+  PreparedInput addDecodeBatch(metal::CommandGraph &graph, metal::MetalBuffer input,
+                               const Projection &projection, metal::MetalBuffer output, uint32_t lanes,
+                               LinearDispatchStats &stats, LinearScratch scratch = {},
+                               PreparedInput prepared = {}) const;
+  PreparedInput addGateUpBatch(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &gate,
+                               const Projection &up, metal::MetalBuffer gateScratch, metal::MetalBuffer output,
+                               uint32_t lanes, LinearDispatchStats &stats, LinearScratch scratch = {},
+                               PreparedInput prepared = {}) const;
+  PreparedInput addResidualBatch(metal::CommandGraph &graph, metal::MetalBuffer input,
+                                 const Projection &projection, metal::MetalBuffer residual,
+                                 metal::MetalBuffer output, uint32_t lanes, LinearDispatchStats &stats,
                                  LinearScratch scratch = {}, PreparedInput prepared = {}) const;
 
 private:

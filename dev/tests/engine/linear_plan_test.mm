@@ -781,7 +781,7 @@ void ggufPlans() {
     metal::CommandGraph graph;
     const Projection padded(5376, 17408,
                             BlockWeights{{QuantizedSegment::planes(GGUF_FMT_Q4K, 5120, 17408, {}, {}, {})}});
-    rejects([&] { (void)linear.addDecode(graph, {}, padded, {}, {5120, 17408}); });
+    rejects([&] { (void)linear.add(graph, {}, padded, linear.plan({{5120, 17408}, 8}, padded)); });
     require(graph.empty(), "a mismatched block projection encoded a dispatch");
   }
   const LinearWorkload down{{5120, 17408}, 8, LinearPhase::Decode, LinearEpilogue::Residual};
@@ -1267,22 +1267,22 @@ void bufferContracts(metal::MetalBackend &backend, Linear &linear,
     rejects([&] {
       linear.addPrefillSums(graph,
           backend.view(buffers.input, 0, buffers.input.sizeBytes() - 1), buffers.sums,
-          workload.matrix, workload.rows);
+          p, workload.rows);
     });
     rejects([&] {
       linear.addPrefillSums(graph, buffers.input,
           backend.view(buffers.sums, 0, buffers.sums.sizeBytes() - 1),
-          workload.matrix, workload.rows);
+          p, workload.rows);
     });
     for (const LinearMatrix matrix : {LinearMatrix{0, workload.matrix.inputSize},
            LinearMatrix{128, workload.matrix.inputSize},
            LinearMatrix{workload.matrix.outputSize, 0},
            LinearMatrix{workload.matrix.outputSize, 63}})
       rejects([&] { linear.addPrefillSums(graph, buffers.input, buffers.sums,
-                                         matrix, workload.rows); });
+                                         Projection(matrix.outputSize, matrix.inputSize, p.affine()),
+                                         workload.rows); });
     for (uint32_t rows : {0U, SPLASH_PREFILL_TOKEN_BUDGET + 1U})
-      rejects([&] { linear.addPrefillSums(graph, buffers.input, buffers.sums,
-                                         workload.matrix, rows); });
+      rejects([&] { linear.addPrefillSums(graph, buffers.input, buffers.sums, p, rows); });
     require(graph.empty(), "invalid prefill sums input partially encoded graph");
   }
 }
@@ -1332,7 +1332,7 @@ void numericalCase(metal::MetalBackend &backend, Linear &linear,
     bufferContracts(backend, linear, b, p, gate, plan);
     metal::CommandGraph graph;
     if (workload.phase == LinearPhase::Prefill)
-      linear.addPrefillSums(graph, input, b.sums, workload.matrix, workload.rows);
+      linear.addPrefillSums(graph, input, b.sums, p, workload.rows);
     if (workload.epilogue == LinearEpilogue::UpWithGate) {
       const auto gatePlan = linear.plan({workload.matrix, workload.rows, LinearPhase::Prefill,
                                          LinearEpilogue::None});

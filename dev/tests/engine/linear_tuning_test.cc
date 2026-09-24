@@ -399,7 +399,7 @@ void gpuBatchEquivalence(metal::MetalBackend &backend,
     for (uint32_t i = 0; i < repetitions; ++i) {
       const auto &projection = projections[(first + i) % projections.size()];
       if (phase == LinearPhase::Prefill)
-        linear.addPrefillSums(graph, buffers.input, buffers.sums, workload.matrix, rows);
+        linear.addPrefillSums(graph, buffers.input, buffers.sums, projection, rows);
       linear.add(graph, buffers, projection, plan,
           epilogue == LinearEpilogue::GateUp ? &projection : nullptr);
     }

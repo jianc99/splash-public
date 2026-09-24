@@ -351,7 +351,7 @@ int floatSegments(MetalBackend &backend) {
       check(lanes * 8, plan.storageRows(), "decode B" + std::to_string(lanes),
             [&](CommandGraph &graph, MetalBuffer input, const Projection &p, MetalBuffer output) {
               splash::ops::LinearDispatchStats stats;
-              static_cast<void>(linear.addDecodeBatch(graph, input, p, output, matrix, lanes, stats, scratch));
+              static_cast<void>(linear.addDecodeBatch(graph, input, p, output, lanes, stats, scratch));
             });
     }
     for (const uint32_t rows : {1u, 24u, 33u, 263u}) {
@@ -360,7 +360,7 @@ int floatSegments(MetalBackend &backend) {
       const LinearScratch scratch = scratchFor(plan);
       check(rows, plan.storageRows(), "prefill rows=" + std::to_string(rows),
             [&](CommandGraph &graph, MetalBuffer input, const Projection &p, MetalBuffer output) {
-              linear.addPrefill(graph, input, p, output, {}, matrix, rows, scratch);
+              linear.addPrefill(graph, input, p, output, {}, rows, scratch);
             });
     }
   }

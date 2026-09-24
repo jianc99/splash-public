@@ -246,7 +246,7 @@ LinearTuningResult tuneLinear(metal::MetalBackend &backend,
       for (uint32_t repetition = 0; repetition < repetitions; ++repetition) {
         const auto &weights = input.weights[(first + repetition) % input.weights.size()];
         if (workload.phase == LinearPhase::Prefill)
-          linear.addPrefillSums(graph, buffers.input, buffers.sums, workload.matrix, workload.rows);
+          linear.addPrefillSums(graph, buffers.input, buffers.sums, weights.projection, workload.rows);
         linear.add(graph, buffers, weights.projection, plans.at(candidate.value),
                    weights.gate ? &*weights.gate : nullptr);
       }
