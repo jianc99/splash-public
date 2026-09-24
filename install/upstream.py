@@ -40,9 +40,8 @@ DRAFTS = "incoai-internal/Splash-DFlash2"
 
 @dataclass(frozen=True)
 class Draft:
-    # The commit of DRAFTS that holds this family's folder; None until it is
-    # published.
-    revision: str | None
+    # The commit of DRAFTS that published this family's folder.
+    revision: str
     layers: int
 
 

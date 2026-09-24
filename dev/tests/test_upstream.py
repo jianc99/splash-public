@@ -191,6 +191,12 @@ class UpstreamTest(unittest.TestCase):
     def pins(self):
         return sorted(ref.name for ref in self.cache.glob("*/refs/splash/*/*"))
 
+    def test_every_family_pins_a_published_draft_commit(self):
+        for family in upstream.FAMILIES:
+            with self.subTest(family=family.name):
+                self.assertTrue(models.is_hex_digest(family.draft.revision, 40))
+                self.assertEqual(family.draft.revision, family.draft.revision.lower())
+
     def test_family_is_identified_by_architecture_not_name(self):
         for family in upstream.FAMILIES:
             self.assertIs(
