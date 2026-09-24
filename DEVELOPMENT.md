@@ -710,6 +710,10 @@ model. The hardware release gate (`release-hardware` in
 packages, which load the packed files directly: it exercises neither MLX
 preparation nor GGUF.
 
+`make all build/engine-tests/affine-source-oracle` builds the affine source oracle, which
+no target runs; pass it `build/splash.metallib`, an installed MLX model's `target`
+directory and the matching installed package to compare every prepared byte.
+
 Compare performance on the same idle Mac with the same model and workload.
 `make tune-kernels MODEL=...` measures the precompiled kernel candidates for the
 installed model on this Mac against the policy defaults in `runtime/ops` and
