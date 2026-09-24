@@ -1,7 +1,7 @@
 #include "WeightPreparationIdentity.hpp"
 #include "model/GgufPreparation.hpp"
 
-#include "metal/abi/Gguf.h"
+#include "metal/abi/GgufRepack.h"
 
 #include <algorithm>
 #include <array>
@@ -171,7 +171,6 @@ void writeRepack(metal::MetalBackend &backend, int source, uint64_t dataOffset, 
       params.src_row_bytes = static_cast<uint32_t>(chunkRowBytes);
       params.dst_plane1 = static_cast<uint32_t>(lengths[0]);
       params.dst_meta = static_cast<uint32_t>(lengths[0] + lengths[1]);
-      params.permute_from_row = std::numeric_limits<uint32_t>::max();
       const metal::ComputeDispatch dispatch{"gguf_repack", {{0, input}, {1, output}},
           {{2, &params, sizeof(params)}}, {rows * chunkGroups / 256, 1, 1}, {256, 1, 1}};
       static_cast<void>(backend.submitCommand(std::span(&dispatch, 1)));

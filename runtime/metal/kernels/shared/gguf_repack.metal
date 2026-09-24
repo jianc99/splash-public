@@ -1,18 +1,11 @@
 #pragma clang fp reassociate(off)
-#include "metal/abi/Gguf.h"
+#include "metal/abi/GgufRepack.h"
 #include <metal_stdlib>
 
 using namespace metal;
 
-// ---- load-time repack: native GGUF rows -> MDGG0001 planes (metal/abi/QuantFormat.h) ----
-// One thread per (destination row n, 32-wide K group g). Rows >= permute_from_row are read from
-// llama.cpp's tiled value-head order so the image holds splash's grouped order.
-static inline uint gguf_repack_source_row(uint n, constant GgufRepackParams &p) {
-  if (n < p.permute_from_row) return n;
-  const uint head = (n - p.permute_from_row) / p.permute_head_rows, e = (n - p.permute_from_row) % p.permute_head_rows;
-  const uint source = (head % p.permute_groups) * p.permute_group_heads + head / p.permute_groups;
-  return p.permute_from_row + source * p.permute_head_rows + e;
-}
+// ---- weight preparation: native GGUF rows -> MDGG0001 planes (metal/abi/QuantFormat.h) ----
+// One thread per (row n, 32-wide K group g) of a chunk the host staged in image order.
 // Word w of the little-endian string of 32 slot values of `bits` bits each (1, 2, 4 or 8).
 static inline uint gguf_bit_word(thread const uchar *slots, uint bits, uint w) {
   const uint per = 32 / bits;
@@ -35,11 +28,11 @@ kernel void gguf_repack(device const uchar *src [[buffer(0)]], device uchar *dst
                       constant GgufRepackParams &p [[buffer(2)]], uint t [[thread_position_in_grid]]) {
   const uint G = p.input_size / 32;
   if (t >= p.rows * G) return;
-  const uint n = t / G, g = t % G, r = gguf_repack_source_row(n, p);
+  const uint n = t / G, g = t % G;
   constant QuantFormat &f = kQuantFormats[p.fmt];
   const uint b = g / f.meta_groups, j = g % f.meta_groups;   // native block b holds meta unit b
-  device const uchar *blk = src + p.src_offset + ulong(r) * p.src_row_bytes + ulong(b) * f.block_bytes;
-  device uchar *out0 = dst + p.dst_plane0 + quant_tile_index(n, g, G) * f.plane0_bytes;
+  device const uchar *blk = src + ulong(n) * p.src_row_bytes + ulong(b) * f.block_bytes;
+  device uchar *out0 = dst + quant_tile_index(n, g, G) * f.plane0_bytes;
   device uchar *out1 = dst + p.dst_plane1 + quant_tile_index(n, g, G) * f.plane1_bytes;
   device uchar *meta = dst + p.dst_meta + quant_tile_index(n, b, G / f.meta_groups) * f.meta_bytes;
   uchar lo[32], hi[32];   // per slot: the (low) code and its high bits
@@ -112,12 +105,4 @@ kernel void gguf_repack(device const uchar *src [[buffer(0)]], device uchar *dst
       break;
     }
   }
-}
-// byte copy for native embedding rows: one thread per 16 bytes
-kernel void gguf_copy(device const uchar *src [[buffer(0)]], device uchar *dst [[buffer(1)]],
-                    constant GgufCopyParams &p [[buffer(2)]], uint t [[thread_position_in_grid]]) {
-  const uint begin = t * 16;
-  if (begin >= p.bytes) return;
-  if (begin + 16 <= p.bytes) *(device uint4 *)(dst + p.dst_offset + begin) = *(device const uint4 *)(src + p.src_offset + begin);
-  else for (uint i = begin; i < p.bytes; ++i) dst[p.dst_offset + i] = src[p.src_offset + i];
 }

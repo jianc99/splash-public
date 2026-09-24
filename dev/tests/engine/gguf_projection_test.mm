@@ -666,13 +666,13 @@ int main(int argc, char **argv) { @autoreleasepool {
         ops.push_back(std::move(o));
       }
       id<MTLBuffer> partials = mkbuf(partialBytes), poison = mkbuf(partialBytes), counters = mkbuf(counterBytes); memset(counters.contents, 0, counterBytes);
-      id<MTLComputePipelineState> copy = pso(lib, "gguf_copy"); if (!copy) { ++failures; continue; }
+      id<MTLComputePipelineState> copy = pso(lib, "test_copy_u32"); if (!copy) { ++failures; continue; }
       std::vector<Dispatch> unsplit, split;
       for (size_t j = 0; j < 2; ++j) { const SplitCase &c = pair[j]; const Operand &o = ops[j]; const bool residual = c.epilogue == GGUF_EPILOGUE_RESIDUAL;
         id<MTLComputePipelineState> ps = pso(lib, decodeName(c.fmt, rows, residual ? 'r' : 'a'));
         unsplit.push_back({ps, {o.X, o.w0, o.w1, o.meta, o.Y, o.Y, o.Y, residual ? o.R : o.Y}, bytes(GgufDecodeParams{c.K, 1, c.N, 0}), 8, MTLSizeMake(c.N / 64, 1, 1), MTLSizeMake(64, 1, 1)});
-        // gguf_copy, the production byte copy, poisons the partials in dispatch order.
-        split.push_back({copy, {poison, partials}, bytes(GgufCopyParams{0, 0, uint32_t(partialBytes)}), 2, MTLSizeMake((partialBytes + 4095) / 4096, 1, 1), MTLSizeMake(256, 1, 1)});
+        // A test kernel's copy poisons the partials in dispatch order.
+        split.push_back({copy, {poison, partials}, bytes(uint32_t(partialBytes / 4)), 2, MTLSizeMake((partialBytes / 4 + 255) / 256, 1, 1), MTLSizeMake(256, 1, 1)});
         split.push_back({ps, {o.X, o.w0, o.w1, o.meta, o.Y, partials, counters, residual ? o.R : o.Y},
                          bytes(GgufDecodeParams{c.K, c.splits, c.N, 0}), 8, MTLSizeMake(c.N / 64, c.splits, 1), MTLSizeMake(64, 1, 1)}); }
       if (std::any_of(split.begin(), split.end(), [](const Dispatch &d) { return !d.p; }) ||

@@ -266,9 +266,9 @@ void splitVisibility(metal::MetalBackend &backend,
     const std::string what = shape + " splits " + std::to_string(splits[0]) + "/" + std::to_string(splits[1]);
     metal::CommandGraph graph;
     for (uint32_t i = 0; i < 2; ++i) {
-      // gguf_copy, the production byte copy, poisons the partials in order.
-      graph.add("gguf_copy", {poison, partials.view}, GgufCopyParams{0, 0, uint32_t(size.partials)},
-                {uint32_t((size.partials + 4095) / 4096), 1, 1}, {256, 1, 1});
+      // A test kernel's copy poisons the partials in order.
+      graph.add("test_copy_u32", {poison, partials.view}, uint32_t(size.partials / 4),
+                {uint32_t((size.partials / 4 + 255) / 256), 1, 1}, {256, 1, 1});
       add(graph, i, splits[i]);
     }
     std::vector<std::vector<uint8_t>> first;

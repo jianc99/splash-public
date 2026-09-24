@@ -384,15 +384,17 @@ across threadgroups by one rule (`decodeSplits`: each tile's tiers of threadgrou
 inputs per partition, from measured occupancy) that does not depend on the batch width. The MoE
 experts (`runtime/ops/MoE.cpp`) run the same numerics per family over the grouped rows. The ABIs
 are in `runtime/metal/abi/Gguf.h` and `MoE.h`, the image formats in
-`runtime/metal/abi/QuantFormat.h`, their decoding in `runtime/metal/kernels/common/quant_formats.h`.
+`runtime/metal/abi/QuantFormat.h`, their decoding in `runtime/metal/kernels/common/quant_formats.h`;
+weight preparation's repack ABI is `runtime/metal/abi/GgufRepack.h`.
 
 The tests' CPU reference (`dev/tests/engine/GgufFormatReference.hpp`) must reproduce checked-in
 hashes of upstream GGML's dequantization (llama.cpp 7ab4ee7) in `make test-engine-cpu`, which
-also checks the planner's CPU-built tensors against it; `make test-engine-metal` checks the
-production `gguf_repack` and `gguf_copy` kernels bitwise against it, the projection kernels
-(`gguf-projection full`) and the MoE layer in every format (`gguf-moe`) against fp64, and the
-F32 norm, router and alpha/beta paths. With `SPLASH_GGML_ORACLE=<libggml-base.dylib>` the
-reference is also compared with GGML directly and `gguf-repack --cpu` prints GGML's hashes.
+also checks the planner's plans; `make test-engine-metal` checks every format's planes, as the
+production executor and its `gguf_repack` kernel prepare them, bitwise against it, the prepared
+alpha/beta, norm, convolution and router bytes, golden hashes of prepared images, the projection
+kernels (`gguf-projection full`) and the MoE layer in every format (`gguf-moe`) against fp64.
+With `SPLASH_GGML_ORACLE=<libggml-base.dylib>` the reference is also compared with GGML directly
+and `gguf-repack --cpu` prints GGML's hashes.
 
 ## Code and API boundaries
 

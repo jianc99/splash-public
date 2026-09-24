@@ -21,7 +21,7 @@ INPUTS = {
         "runtime/model/GgufPreparation.cpp",
         "runtime/model/GgufImage.cpp",
         "runtime/model/GgufImage.hpp",
-        "runtime/metal/abi/Gguf.h",
+        "runtime/metal/abi/GgufRepack.h",
         "runtime/metal/abi/QuantFormat.h",
         "runtime/metal/kernels/shared/gguf_repack.metal",
     ),
