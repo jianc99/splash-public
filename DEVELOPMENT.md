@@ -296,16 +296,20 @@ launchers configure OpenCode and Hermes without attachments.
 
 ### Weight preparation
 
-Source adapters write a model's target and vision tensors into prepared files
-through `PreparedWeights`: an MLX target and any vision tower into the packed
-layouts of Splash packages, which run the same kernels, and a GGUF target into
-the `MDGG0001` layout of the GGUF kernels. `AffinePreparation` writes an MLX
-checkpoint's images as `AffineTarget` plans them: codes, scales and biases are
-reordered into 256-row tiles without requantization, and GDN decay is computed
-as `float(-exp(double(A_log)))`, which may differ by one float ULP in this small
+Source adapters write a model's target and vision tensors into prepared files:
+an MLX target and any vision tower into the packed layouts of Splash packages,
+which run the same kernels, and a GGUF target into the `MDGG0001` layout of the
+GGUF kernels. Each adapter is a loader, which validates the source's metadata
+and plans its files, and a writer: `AffineTargetLoader` (`AffineTarget.cpp`)
+and `AffinePreparation` for an MLX target, `GgufTargetLoader`
+(`GgufTarget.cpp`, planned by `GgufImage.cpp`) and `GgufPreparation` for a GGUF
+target, `VisionLoader` and `VisionPreparation` for an MLX or GGUF vision tower.
+They open their files through `PreparedFiles`, the `PreparedWeights` cache with
+the load's guards. `AffinePreparation` reorders codes, scales and biases into
+256-row tiles without requantization and computes GDN decay as
+`float(-exp(double(A_log)))`, which may differ by one float ULP in this small
 vector from packages produced with MLX's float exponential. `GgufPreparation`
-repacks GGUF blocks ([GGUF targets](#gguf-targets)), and `VisionPreparation`
-writes the vision layout.
+repacks GGUF blocks ([GGUF targets](#gguf-targets)).
 
 Preparation never rounds a weight. A tensor it converts to BF16 (vision tensors
 stored as F32 or F16, a GGUF's convolution taps and time-step bias) must be
@@ -316,8 +320,9 @@ The cache is `~/Library/Caches/Splash/weights`, or the directory
 `SPLASH_WEIGHT_CACHE` names; nothing else selects it. It holds an additional
 copy of the weights about the model's size, its prepared target and vision
 tensors. Preparing needs that much free disk space plus a 2 GiB reserve: before
-conversion, the adapters validate the whole source and budget every missing
-target and vision artifact plus the reserve. Uninstalling a model does not
+anything is written, the factory (`ModelFactory.cpp`) constructs the target's
+and the vision tower's loaders and checks the space of every missing file they
+plan, plus the reserve, once. Uninstalling a model does not
 delete possibly shared prepared weights. With Splash stopped, entry directories
 can be deleted; deleting the whole cache causes preparation at the next load.
 
@@ -368,14 +373,18 @@ its conversion steps to one staging bound, input and output together, of
 32 MiB (`kWeightPreparationStagingBytes`), whatever the tensor, layer or expert
 count, inside a 64 MiB admission reserve that also covers source metadata.
 Complete rows and multiple row tiles are processed together where possible,
-avoiding per-row I/O and small GPU waits. Warning/critical memory pressure or
-inadequate host headroom stops conversion. Cache hits and bounded source
-verification use normal startup admission instead; cancellation and critical
-pressure still abort loading.
+avoiding per-row I/O and small GPU waits. On a cache miss the runtime admits
+the conversion workspace (`admitConversion`) before anything is allocated and
+again before each chunk; warning/critical memory pressure or inadequate host
+headroom stops conversion. Cache hits and bounded source verification use
+normal startup admission instead; cancellation and critical pressure still
+abort loading.
 
 `WeightFile` maps completed files, prepared or packed, read-only into one
 no-copy Metal buffer, so no model-sized anonymous allocation holds the weights.
-Runtime admission counts prepared weights, draft and vision exactly once. File
+Runtime admission counts prepared weights, draft and vision exactly once
+(`preparedModelWeightBytes`, which `tune-kernels` and the runtime oracle use
+too). File
 backing does not make Metal-resident pages reclaimable: residency wires them
 until released. macOS page cache, driver allocations and other applications
 still affect memory pressure and swap.
