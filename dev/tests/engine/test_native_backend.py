@@ -8,13 +8,12 @@ import unittest
 from unittest import mock
 
 from dev.tests.engine.test_runtime import FakeFactory
+from dev.tests.test_server import make_frontend
 from server import backend as backend_api
 from server import constraints as generation_constraints
 from server import errors as api_errors
-from server import frontend as request_frontend
 from server import images, runtime
 from server import protocol as wire
-from server.chat_templates import ChatTemplates
 
 
 class FakeTokenizer:
@@ -251,17 +250,8 @@ class NativeBackendContractTests(unittest.TestCase):
 
     def test_http_fields_reach_native_generation_request(self):
         transport, runtime = self.make_transport()
-        tokenizer = FakeTokenizer()
-        app = request_frontend.Frontend(
-            tokenizer,
-            transport,
-            "test-model",
-            128,
-            32,
-            10,
-            2,
-            chat_templates=ChatTemplates(tokenizer),
-            vision=True,
+        app = make_frontend(
+            FakeTokenizer(), transport, "test-model", 128, 32, 10, 2, vision=True
         )
         job, _thinking, _tools = app.prepare(
             {

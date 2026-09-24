@@ -31,6 +31,7 @@ from server import protocol as native_wire
 from server import server as api
 from server.api_shapes import _namespace_alias, normalize_responses_input
 from server.chat_templates import ChatTemplates
+from server.thinking import ThinkingCodec
 from server.tool_schema import MAX_JSON_NESTING, _grammar_compatible_schema
 
 
@@ -525,6 +526,16 @@ class FakeConstraintFactory:
         return {}
 
 
+class PassThroughConstraintFactory:
+    """Leaves generation unconstrained, for tests that do not check grammars."""
+
+    def create(self, grammar, *, timeout=None):
+        return None
+
+    def stats(self):
+        return {}
+
+
 def main_args(**overrides):
     """Parsed command-line arguments for main() tests."""
     return SimpleNamespace(
@@ -554,11 +565,23 @@ def main_args(**overrides):
     )
 
 
-def make_frontend(tokenizer, *args, **options):
+def make_frontend(
+    tokenizer, *args, constraint_factory=None, thinking_codec=None, **options
+):
     """A frontend over the tokenizer, with its chat templates probed as
-    startup probes them."""
+    startup probes them. Unless a test passes its own, generation is
+    unconstrained and thinking is signed with a fresh key."""
+    if constraint_factory is None:
+        constraint_factory = PassThroughConstraintFactory()
+    if thinking_codec is None:
+        thinking_codec = ThinkingCodec()
     return request_frontend.Frontend(
-        tokenizer, *args, chat_templates=ChatTemplates(tokenizer), **options
+        tokenizer,
+        *args,
+        constraint_factory=constraint_factory,
+        chat_templates=ChatTemplates(tokenizer),
+        thinking_codec=thinking_codec,
+        **options,
     )
 
 
@@ -602,7 +625,7 @@ class Harness:
             default_max_new,
             timeout,
             2,
-            constraint_factory,
+            constraint_factory=constraint_factory,
             thinking_codec=thinking_codec,
             vision=vision,
             **frontend_options,
@@ -5505,7 +5528,15 @@ class ServerTest(unittest.TestCase):
         )
         factory = FakeConstraintFactory()
         app = make_frontend(
-            tokenizer, None, "test-model", 128, 16, 1, 2, factory, vision=True
+            tokenizer,
+            None,
+            "test-model",
+            128,
+            16,
+            1,
+            2,
+            constraint_factory=factory,
+            vision=True,
         )
         for tools, expected in (([], False), ([self.rich_weather_tool()], True)):
             body = self.body(tools=tools)

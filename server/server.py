@@ -2004,7 +2004,7 @@ def main():
             args.max_new_tokens,
             args.request_timeout,
             readiness.max_concurrent_requests,
-            constraint_factory,
+            constraint_factory=constraint_factory,
             chat_templates=chat_templates,
             max_image_pixels=args.max_image_pixels,
             thinking_codec=thinking_codec,
