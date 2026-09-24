@@ -88,6 +88,21 @@ private:
   std::ostringstream text_;
 };
 
+// The callbacks of one load. check runs throughout (cancellation, memory
+// pressure), also while waiting for the converter lock or hashing;
+// admitConversion admits the conversion workspace on a cache miss, before
+// anything is allocated and again before each chunk; unchanged throws when a
+// source changed after its tensor data was hashed.
+struct PreparationGuards {
+  PreparationCheck check{};
+  PreparationCheck admitConversion{};
+  PreparationCheck unchanged{};
+};
+
+// Writes a prepared file into its empty, preallocated destination; admit
+// runs before each chunk of conversion work.
+using WeightWriter = std::function<void(int destination, const PreparationCheck &admit)>;
+
 // The cache is SPLASH_WEIGHT_CACHE, or ~/Library/Caches/Splash/weights.
 class PreparedWeights final {
 public:
@@ -96,15 +111,13 @@ public:
   // layers remain reusable after an interruption; they are not partial files.
   void requireSpace(std::span<const PreparedWeight> weights,
                     const PreparationCheck &check = {}) const;
-  // key is a SHA-256 of source content, layout ABI and transformation parameters.
-  // The writer receives an empty, preallocated file. Writer failures never
-  // publish partial data. check applies to every load; prepareCheck admits
-  // the additional conversion workspace only on a cache miss.
-  [[nodiscard]] std::filesystem::path prepare(
-      const PreparedWeight &weight,
-      const std::function<void(int)> &write,
-      const PreparationCheck &check = {},
-      const PreparationCheck &prepareCheck = {}) const;
+  // The complete file of weight: reused, or written now under the converter
+  // lock and published atomically; writer failures never publish partial
+  // data. The sources are checked unchanged before, after writing and before
+  // the path is returned, so no file of a modified source is published or
+  // used.
+  [[nodiscard]] std::filesystem::path prepare(const PreparedWeight &weight, const WeightWriter &write,
+                                              const PreparationGuards &guards = {}) const;
 
 private:
   std::filesystem::path root_;

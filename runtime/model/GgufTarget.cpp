@@ -49,16 +49,11 @@ WeightFile GgufTargetLoader::embedding() { return build(images_.back()); }
 
 WeightFile GgufTargetLoader::build(const Planned &planned) {
   const gguf::Image &image = planned.image;
-  backend_->checkOperation();
-  source_.checkUnchanged();
   const auto path = cache_.prepare(planned.weight,
-      [&](int destination) {
-        prepareGgufImage(*backend_, source_.descriptor(), dataOffset_, destination, image,
-                         [&] { backend_->checkOperation(); if (admitConversion_) admitConversion_(); });
-        source_.checkUnchanged();
+      [&](int destination, const PreparationCheck &admit) {
+        prepareGgufImage(*backend_, source_.descriptor(), dataOffset_, destination, image, admit);
       },
-      [&] { backend_->checkOperation(); }, admitConversion_);
-  source_.checkUnchanged();
+      {[this] { backend_->checkOperation(); }, admitConversion_, [this] { source_.checkUnchanged(); }});
   return WeightFile(*backend_, path, planned.weight.component, kGgufImageMagic, image.layer, image.type,
                     planned.weight.key);
 }

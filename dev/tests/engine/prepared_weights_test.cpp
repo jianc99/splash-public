@@ -36,17 +36,17 @@ int main() {
     std::vector<uint8_t> bytes(128 * 1024);
     for (size_t i = 0; i < bytes.size(); ++i) bytes[i] = static_cast<uint8_t>(i * 37);
     int builds = 0;
-    const auto write = [&](int fd) { ++builds; writeWeightBytes(fd, 0, bytes); };
+    const auto write = [&](int fd, const PreparationCheck &) { ++builds; writeWeightBytes(fd, 0, bytes); };
     const auto cached = store.prepare({key(1), bytes.size()}, write);
     require(builds == 1 && std::filesystem::file_size(cached) == bytes.size(), "cold preparation");
     static_cast<void>(store.prepare({key(1), bytes.size()}, write));
     require(builds == 1, "warm preparation rebuilt weights");
     const auto noWorkspace = [] { throw std::runtime_error("conversion pressure"); };
-    static_cast<void>(store.prepare({key(1), bytes.size()}, write, {}, noWorkspace));
-    rejects([&] { static_cast<void>(store.prepare({key(10), bytes.size()}, write, {}, noWorkspace)); },
+    static_cast<void>(store.prepare({key(1), bytes.size()}, write, {{}, noWorkspace}));
+    rejects([&] { static_cast<void>(store.prepare({key(10), bytes.size()}, write, {{}, noWorkspace})); },
             "cold preparation ignored workspace admission");
     rejects([&] { static_cast<void>(store.prepare({key(1), bytes.size()}, write,
-        [] { throw std::runtime_error("cancelled"); }, {})); }, "warm hit ignored cancellation");
+        {[] { throw std::runtime_error("cancelled"); }})); }, "warm hit ignored cancellation");
     // A warm load must finish while an unrelated converter still holds its
     // lock. Use pipes for ordering; the alarm turns a deadlock into a failure.
     int ready[2], release[2];
@@ -65,7 +65,7 @@ int main() {
     require(read(ready[0], &signal, 1) == 1, "wait for converter lock");
     const std::array<PreparedWeight, 1> warm{{{key(1), bytes.size()}}};
     store.requireSpace(warm);
-    static_cast<void>(store.prepare({key(1), bytes.size()}, write, {}, noWorkspace));
+    static_cast<void>(store.prepare({key(1), bytes.size()}, write, {{}, noWorkspace}));
     require(::write(release[1], &signal, 1) == 1, "release converter");
     int lockStatus;
     waitpid(holder, &lockStatus, 0);
@@ -90,18 +90,18 @@ int main() {
     static_cast<void>(store.prepare({key(1), bytes.size()}, write));
     require(builds == 2 && WeightSource(cached).digest(0) == weightDigest(bytes), "corruption not repaired");
     // Interrupted and ENOSPC writes do not publish anything and can be retried.
-    rejects([&] { static_cast<void>(store.prepare({key(2), bytes.size()}, [&](int output) {
+    rejects([&] { static_cast<void>(store.prepare({key(2), bytes.size()}, [&](int output, const PreparationCheck &) {
       writeWeightBytes(output, 0, std::span(bytes).first(64));
       throw std::system_error(ENOSPC, std::generic_category());
     })); }, "failed write accepted");
     require(!std::filesystem::exists(root / key(2)), "partial file published");
     static_cast<void>(store.prepare({key(2), bytes.size()}, write));
-    rejects([&] { static_cast<void>(store.prepare({key(3), bytes.size()}, write, [] { throw std::runtime_error("pressure"); })); }, "pressure ignored");
+    rejects([&] { static_cast<void>(store.prepare({key(3), bytes.size()}, write, {[] { throw std::runtime_error("pressure"); }})); }, "pressure ignored");
     require(!std::filesystem::exists(root / key(3)), "pressure rejection published weights");
     rejects([&] { static_cast<void>(store.prepare({"../outside", bytes.size()}, write)); }, "unsafe cache key accepted");
     const pid_t crash = fork();
     if (crash == 0) {
-      static_cast<void>(store.prepare({key(4), bytes.size()}, [&](int output) {
+      static_cast<void>(store.prepare({key(4), bytes.size()}, [&](int output, const PreparationCheck &) {
         writeWeightBytes(output, 0, std::span(bytes).first(64));
         _exit(7);
       }));
@@ -118,7 +118,7 @@ int main() {
     static_cast<void>(store.prepare({key(4), bytes.size()}, write));
     // Two processes requesting the same identity must run its writer only once.
     const auto counter = root / "builds";
-    const auto competing = [&](int output) {
+    const auto competing = [&](int output, const PreparationCheck &) {
       const int count = open(counter.c_str(), O_CREAT | O_WRONLY | O_APPEND, 0600);
       require(count >= 0 && ::write(count, "x", 1) == 1, "write build counter");
       close(count);

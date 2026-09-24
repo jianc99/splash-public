@@ -102,9 +102,9 @@ QwenVisionWeights loadQwenVisionWeights(metal::MetalBackend &backend,
 
 QwenVisionWeights loadQwenVisionWeights(metal::MetalBackend &backend,
                                         const VisionPreparation &source,
-                                        PreparationCheck prepareCheck) {
+                                        PreparationCheck admitConversion) {
   validateLayout(source.layout());
-  return readVision(backend, source.prepare(prepareCheck), source.weight().key,
+  return readVision(backend, source.prepare(admitConversion), source.weight().key,
                     source.layout());
 }
 

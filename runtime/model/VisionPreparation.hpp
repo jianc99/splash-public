@@ -27,10 +27,11 @@ public:
   [[nodiscard]] const ops::VisionLayout &layout() const noexcept;
   // The prepared file's cache identity and size, for disk budgeting.
   [[nodiscard]] const PreparedWeight &weight() const noexcept;
-  // The prepared file, reused or written now. prepareCheck admits the
-  // conversion workspace on a cache miss.
+  // The prepared file, reused or written now. admitConversion admits the
+  // conversion workspace on a cache miss; check (the constructor's) runs on
+  // every load.
   [[nodiscard]] std::filesystem::path
-  prepare(const PreparationCheck &prepareCheck = {}) const;
+  prepare(const PreparationCheck &admitConversion = {}) const;
 
 private:
   struct Impl;

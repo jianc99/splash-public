@@ -241,12 +241,9 @@ struct AffineTargetLoader::Impl {
   WeightFile open(size_t index) {
     const Image &image = images.at(index);
     const PreparedWeight &weight = weights.at(index);
-    source.checkUnchanged();
-    const auto path = cache.prepare(weight, [&](int destination) {
-      affine::writeImage(destination, image, admitConversion);
-      source.checkUnchanged();
-    }, [this] { backend.checkOperation(); }, admitConversion);
-    source.checkUnchanged();
+    const auto path = cache.prepare(weight,
+        [&](int destination, const PreparationCheck &admit) { affine::writeImage(destination, image, admit); },
+        {[this] { backend.checkOperation(); }, admitConversion, [this] { source.checkUnchanged(); }});
     return WeightFile(backend, path, weight.component, image.magic, image.layer, image.type, weight.key);
   }
 };

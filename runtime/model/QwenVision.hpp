@@ -31,6 +31,6 @@ loadQwenVisionWeights(metal::MetalBackend &backend,
 [[nodiscard]] QwenVisionWeights
 loadQwenVisionWeights(metal::MetalBackend &backend,
                       const VisionPreparation &source,
-                      PreparationCheck prepareCheck = {});
+                      PreparationCheck admitConversion = {});
 
 } // namespace splash::model

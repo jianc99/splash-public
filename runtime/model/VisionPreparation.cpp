@@ -16,9 +16,6 @@
 namespace splash::model {
 namespace {
 
-// Staging for one batch of rows: source bytes, patch values and output rows.
-constexpr uint64_t kBatchBytes = 8 * 1024 * 1024;
-
 // Converts count values to BF16 bits. False when a value is not exactly a
 // BF16: preparation never rounds a weight.
 using Conversion = bool (*)(const uint8_t *source, uint16_t *destination,
@@ -223,13 +220,20 @@ void planMmproj(const GgufFile &gguf, const WeightSource &file,
                            unused + " (" + gguf.path().string() + ")");
 }
 
+// Source bytes, patch values and output rows of one batch, reused by every
+// section of a file.
+struct Staging {
+  std::vector<uint8_t> source;
+  std::vector<uint16_t> values, output;
+};
+
 // Writes a section in batches of whole rows converted to BF16. The packed
 // patch embedding orders a row [channel, frame, patch-row, patch-col]; MLX
 // stores [frame, patch-row, patch-col, channel] and GGUF one [channel,
 // patch-row, patch-col] tensor per frame. Padded rows, columns and alignment
 // stay zero: a prepared file starts zeroed.
-void writeSection(int destination, const Section &s, uint32_t pixels,
-                  const PreparationCheck &check) {
+void writeSection(int destination, const Section &s, uint32_t pixels, Staging &staging,
+                  const PreparationCheck &admit) {
   const auto frames = static_cast<uint32_t>(s.inputs.size());
   const uint32_t columns = s.columns / frames;
   uint32_t elementBytes = 0;
@@ -240,10 +244,11 @@ void writeSection(int destination, const Section &s, uint32_t pixels,
       uint64_t(columns) * elementBytes +
       (s.patch ? uint64_t(s.columns) * kBFloat16Bytes : 0) + storedRowBytes;
   const auto batchRows = static_cast<uint32_t>(
-      std::clamp<uint64_t>(kBatchBytes / rowBytes, 1, s.rows));
-  std::vector<uint8_t> source(uint64_t(batchRows) * columns * elementBytes);
-  std::vector<uint16_t> values(s.patch ? uint64_t(batchRows) * s.columns : 0);
-  std::vector<uint16_t> output(uint64_t(batchRows) * s.storedColumns);
+      std::clamp<uint64_t>(kWeightPreparationStagingBytes / rowBytes, 1, s.rows));
+  auto &[source, values, output] = staging;
+  source.resize(uint64_t(batchRows) * columns * elementBytes);
+  values.resize(s.patch ? uint64_t(batchRows) * s.columns : 0);
+  output.resize(uint64_t(batchRows) * s.storedColumns);
   // Converts count rows of one input to rows of stride BF16 values.
   const auto convert = [&](const Input &in, uint32_t row, uint32_t count,
                            uint16_t *to, uint32_t stride) {
@@ -257,8 +262,8 @@ void writeSection(int destination, const Section &s, uint32_t pixels,
                                " is not exactly representable in BF16");
   };
   for (uint32_t row = 0; row < s.rows; row += batchRows) {
-    if (check)
-      check();
+    if (admit)
+      admit();
     const uint32_t count = std::min(batchRows, s.rows - row);
     if (!s.patch) {
       convert(s.inputs.front(), row, count, output.data(), s.storedColumns);
@@ -292,6 +297,7 @@ struct VisionPreparation::Impl {
   std::unique_ptr<SafetensorsCheckpoint> checkpoint;
   std::unique_ptr<WeightSource> mmproj;
   PreparedWeight weight{};
+  PreparedWeights cache;
 
   void checkUnchanged() const {
     if (checkpoint)
@@ -349,25 +355,21 @@ const PreparedWeight &VisionPreparation::weight() const noexcept {
 }
 
 std::filesystem::path
-VisionPreparation::prepare(const PreparationCheck &prepareCheck) const {
+VisionPreparation::prepare(const PreparationCheck &admitConversion) const {
   const auto &i = *impl_;
-  i.checkUnchanged();
-  const auto path = PreparedWeights().prepare(
+  return i.cache.prepare(
       i.weight,
-      [&](int output) {
+      [&](int output, const PreparationCheck &admit) {
         // The packed header: magic, block count and file kind 0.
         std::array<uint8_t, 16> header{};
         std::memcpy(header.data(), kVisionMagic.data(), kVisionMagic.size());
         std::memcpy(header.data() + 8, &i.layout.depth, 4);
         writeWeightBytes(output, 0, header);
+        Staging staging;
         for (const auto &s : i.plan)
-          writeSection(output, s, i.layout.patchSize * i.layout.patchSize,
-                       prepareCheck);
-        i.checkUnchanged();
+          writeSection(output, s, i.layout.patchSize * i.layout.patchSize, staging, admit);
       },
-      i.check, prepareCheck);
-  i.checkUnchanged();
-  return path;
+      {i.check, admitConversion, [&] { i.checkUnchanged(); }});
 }
 
 uint64_t preparedVisionBytes(const ops::VisionLayout &layout) {

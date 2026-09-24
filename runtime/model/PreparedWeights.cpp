@@ -326,25 +326,33 @@ void PreparedWeights::requireSpace(std::span<const PreparedWeight> weights,
   requireWeightDiskSpace(std::filesystem::space(root_).available, missingBytes());
 }
 
-std::filesystem::path PreparedWeights::prepare(
-    const PreparedWeight &weight, const std::function<void(int)> &write,
-    const PreparationCheck &check, const PreparationCheck &prepareCheck) const {
+std::filesystem::path PreparedWeights::prepare(const PreparedWeight &weight, const WeightWriter &write,
+                                               const PreparationGuards &guards) const {
   const auto &key = weight.key;
   const auto bytes = weight.bytes;
   if (key.size() != 64 || key.find_first_not_of("0123456789abcdef") != key.npos ||
       !bytes || bytes > uint64_t(std::numeric_limits<off_t>::max()))
     throw std::invalid_argument("invalid prepared weight identity or size");
+  const auto &[check, admitConversion, sourceUnchanged] = guards;
+  const auto unchanged = [&] { if (sourceUnchanged) sourceUnchanged(); };
   if (check) check();
+  unchanged();
   const auto destination = root_ / key;
   // Immutable hits need neither conversion admission nor the converter lock.
-  if (complete(destination, bytes, check)) return destination / "weights";
+  if (complete(destination, bytes, check)) {
+    unchanged();
+    return destination / "weights";
+  }
   std::filesystem::create_directories(root_);
   // One converter per user cache: concurrent cold loads cannot multiply the
   // bounded conversion workspace. OS locks are released on crashes.
   PreparationLock lock(root_, check);
-  if (complete(destination, bytes, check)) return destination / "weights";
+  if (complete(destination, bytes, check)) {
+    unchanged();
+    return destination / "weights";
+  }
   if (check) check();
-  if (prepareCheck) prepareCheck();
+  if (admitConversion) admitConversion();
   // This name belongs only to this key under the converter lock. An abandoned
   // staging directory is never a cache hit and is safe to replace.
   const auto staging = root_ / (std::string(key) + ".partial");
@@ -363,8 +371,11 @@ std::filesystem::path PreparedWeights::prepare(
     allocation.fst_length = static_cast<off_t>(bytes);
     if (fcntl(file, F_PREALLOCATE, &allocation)) fail("reserve prepared weight disk space");
     if (ftruncate(file, static_cast<off_t>(bytes))) fail("size prepared weights");
-    write(file);
-    if (check) check();
+    write(file, [&] {
+      if (check) check();
+      if (admitConversion) admitConversion();
+    });
+    unchanged();
     struct stat state{};
     if (fstat(file, &state)) fail("stat prepared weights");
     if (state.st_size < 0 || uint64_t(state.st_size) != bytes)
@@ -397,6 +408,7 @@ std::filesystem::path PreparedWeights::prepare(
     const auto seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
     std::clog << "Prepared " << weight.component << " in " << seconds << " s" << std::endl;
   }
+  unchanged();
   return destination / "weights";
 }
 
