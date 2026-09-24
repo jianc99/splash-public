@@ -2011,7 +2011,7 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(status, 200, payload)
 
     def test_conversions_leave_media_to_message_normalization(self):
-        from dev.tests.engine.test_documents import document_block
+        from dev.tests.engine.test_documents import document_block, render_pdf
 
         image = self._png_data_url()
         document = document_block(title="Report", context="Fixture")
@@ -2071,12 +2071,16 @@ class ServerTest(unittest.TestCase):
                         [{"role": "user", "content": messages[0]["content"][1:]}],
                         vision=False,
                     )
-        # Normalization renders an Anthropic document as the block would.
+        # Normalization renders the document's PDF after its title and context.
         self.assertEqual(
             api_shapes.normalize_messages(converted["anthropic"], vision=True)[0][
                 "content"
             ][1:],
-            documents.document_content(document),
+            [
+                {"type": "text", "text": "Report\n"},
+                {"type": "text", "text": "Fixture\n"},
+                *render_pdf(),
+            ],
         )
 
     def test_vision_capability_is_advertised_by_status_and_models(self):

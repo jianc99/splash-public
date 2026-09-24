@@ -246,28 +246,10 @@ def document_parts(block):
     return parts
 
 
-def document_content(block, *, budget=None):
-    """Render an Anthropic PDF document block as canonical text/image parts."""
-    if budget is None:
-        budget = DocumentBudget()
-    parts = []
-    for part in document_parts(block):
-        if part["type"] == "file":
-            parts.extend(file_content(part["file"], budget=budget))
-        else:
-            budget.charge(len(part["text"]) * 4)
-            parts.append(part)
-    return parts
-
-
-def pdf_content(encoded, *, budget=None):
+def pdf_content(encoded, *, budget):
     """Render an inline PDF through the shared bounded document pipeline."""
-    if not isinstance(encoded, str):
-        raise APIError(400, "PDF data must be a base64 string")
     if len(encoded) > 4 * ((MAX_PDF_BYTES + 2) // 3):
         raise APIError(400, "PDF document exceeds the size limit")
-    if budget is None:
-        budget = DocumentBudget()
     parts = []
     for page in _pages(encoded, budget):
         parts.append({"type": "text", "text": page.text})
@@ -276,7 +258,7 @@ def pdf_content(encoded, *, budget=None):
 
 
 def file_content(file, *, budget):
-    """Translate OpenAI inline PDFs into canonical text/image parts."""
+    """Render a file part's inline PDF as canonical text/image parts."""
     if not isinstance(file, dict):
         raise APIError(400, "file must be an object")
     if file.get("file_id") is not None or file.get("file_url") is not None:

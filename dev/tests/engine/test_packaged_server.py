@@ -1,4 +1,4 @@
-import json
+import base64
 import shutil
 import subprocess
 import sys
@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from dev.tests.engine.test_documents import document_block
+from dev.tests.engine.test_documents import pdf_bytes
 from dev.tools import package
 
 
@@ -37,12 +37,14 @@ class PackagedServerTests(unittest.TestCase):
                     sys.executable,
                     "-I",
                     "-c",
-                    "import json, os, sys; sys.path.insert(0, os.getcwd()); "
+                    "import os, sys; sys.path.insert(0, os.getcwd()); "
                     "from server import server, documents; "
-                    "print(documents.document_content(json.load(sys.stdin))[0]['text'])",
+                    "file = {'file_data': sys.stdin.read()}; "
+                    "budget = documents.DocumentBudget(); "
+                    "print(documents.file_content(file, budget=budget)[0]['text'])",
                 ],
                 cwd=stage,
-                input=json.dumps(document_block()),
+                input=base64.b64encode(pdf_bytes()).decode(),
                 text=True,
                 capture_output=True,
                 timeout=40,

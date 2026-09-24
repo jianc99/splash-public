@@ -5,7 +5,7 @@ import unittest
 from unittest import mock
 
 from dev.tests import test_server
-from dev.tests.engine.test_documents import document_block, pdf_bytes
+from dev.tests.engine.test_documents import pdf_bytes, render_pdf
 from dev.tests.test_server import FakeRuntime, Harness, Plan
 from server import api_shapes, documents
 from server.errors import APIError
@@ -34,7 +34,7 @@ class PdfProtocolTests(unittest.TestCase):
         )
 
     def test_protocols_share_rendered_pages_and_preserve_order(self):
-        expected = documents.document_content(document_block(pdf_bytes(pages=2)))
+        expected = render_pdf(pdf_bytes(pages=2))
         chat = self.chat()[0]["content"]
         self.assertEqual(chat, expected)
         response = api_shapes.responses_to_chat_body(
