@@ -116,7 +116,7 @@ class FakeTokenizer:
         self.templates = []
 
     # Requests render as a fixed generation prefix; the source only has to be
-    # a template the frontend can probe.
+    # a template ChatTemplates can probe at startup.
     chat_template = (
         "{%- for message in messages %}"
         "{{- '<|im_start|>' + message.role + '\\n' + message.content + '<|im_end|>\\n' }}"
