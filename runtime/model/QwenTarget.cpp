@@ -346,7 +346,8 @@ void QwenTarget::addPrefillFfn(PrefillStep &step, const Qwen3_8LayerWeights &lay
 void QwenTarget::addPrefillFfn(PrefillStep &step, const Qwen3_6MoeLayerWeights &layer,
                                metal::MetalBuffer residual, metal::MetalBuffer output) const {
   const QwenTargetPrefillBuffers &b = step.buffers;
-  addPrefillNorm(step, residual, layer.postAttentionNorm, layer.ffn.layout());
+  ops::Normalization::addRms(step.graph, residual, layer.postAttentionNorm, b.normalized, geometry_.hiddenSize,
+                             step.rows);
   ops::MoE::add(step.graph, {b.normalized, residual, output, b.moe}, layer.ffn, *step.moe);
 }
 
