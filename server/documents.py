@@ -107,10 +107,9 @@ def _render(payload, budget):
     return pages
 
 
-def render_pages(payload, budget, limits=None):
+def render_pages(payload, budget, limits):
     import pypdfium2 as pdfium
 
-    limits = limits or _render_limits()
     try:
         budget.remaining_time()
         with pdfium.PdfDocument(payload) as document:

@@ -166,7 +166,9 @@ class DocumentTests(unittest.TestCase):
 
         with mock.patch.object(pdfium.PdfPage, "render", render):
             documents.render_pages(
-                pdf_bytes(width=14400, height=14400), documents.DocumentBudget()
+                pdf_bytes(width=14400, height=14400),
+                documents.DocumentBudget(),
+                documents._render_limits(),
             )
         self.assertEqual(len(sizes), 1)
 
@@ -359,7 +361,9 @@ class DocumentTests(unittest.TestCase):
 
         with mock.patch.object(pdfium.PdfPage, "render", render):
             with self.assertRaises(APIError) as raised:
-                documents.render_pages(pdf_bytes(pages=2), budget)
+                documents.render_pages(
+                    pdf_bytes(pages=2), budget, documents._render_limits()
+                )
         self.assertEqual(raised.exception.code, "request_timeout")
         self.assertEqual(len(handles), 3)
         self.assertTrue(all(handle.raw is None for handle in handles))
