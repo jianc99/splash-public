@@ -32,7 +32,10 @@ EngineMemoryPlan plan(uint64_t visionBytes = kGiB) {
       device, test::modelMemoryProfile(2 * kGiB, 1 * kGiB, visionBytes));
 }
 
-ActualMemoryReport report(const EngineMemoryPlan &memoryPlan) {
+// A consistent warmup report; `unclassifiedBytes` are backend buffers no
+// loader reported.
+ActualMemoryReport report(const EngineMemoryPlan &memoryPlan,
+                          uint64_t unclassifiedBytes = 0) {
   const auto &b = memoryPlan.breakdown();
   ActualMemoryReport result;
   result.targetWeightsBytes = b.targetWeightsBytes;
@@ -46,7 +49,7 @@ ActualMemoryReport report(const EngineMemoryPlan &memoryPlan) {
       result.targetWeightsBytes + result.draftWeightsBytes +
       result.visionWeightsBytes + result.stateResidentBytes +
       result.sharedPrefillBytes + result.sharedDecodeBytes +
-      result.kvResidentBytes;
+      result.kvResidentBytes + unclassifiedBytes;
   result.deviceCurrentAllocatedBytes = result.backendAllocatedBytes;
   result.devicePeakAllocatedBytes = result.backendAllocatedBytes + 16 * kMiB;
   result.estimatedWarmupPeakBytes = result.devicePeakAllocatedBytes;
@@ -78,8 +81,7 @@ void testUnifiedDynamicAudit() {
 
 void testOptionalVisionAudit() {
   const auto textOnly = plan(0);
-  auto actual = report(textOnly);
-  require(auditActualMemory(textOnly, actual).valid,
+  require(auditActualMemory(textOnly, report(textOnly)).valid,
           "text-only warmup requires nonexistent vision weights");
 }
 
@@ -90,18 +92,15 @@ void testUnreportedAllocationsCountAgainstReserves() {
   const auto &budget = memoryPlan.breakdown();
   const uint64_t reserves =
       budget.pipelineReserveBytes + budget.runtimeOverheadReserveBytes;
-  for (const uint64_t unreported : {reserves, reserves + 1}) {
-    auto actual = report(memoryPlan);
-    actual.backendAllocatedBytes += unreported;
-    actual.deviceCurrentAllocatedBytes = actual.backendAllocatedBytes;
-    actual.devicePeakAllocatedBytes = actual.backendAllocatedBytes + 16 * kMiB;
-    actual.estimatedWarmupPeakBytes = actual.devicePeakAllocatedBytes;
-    const auto result = auditActualMemory(memoryPlan, actual);
-    require(unreported == reserves
-                ? result.valid && result.backendUnclassifiedBytes == reserves
-                : result.error == MemoryAuditError::RuntimeReserveExceeded,
-            "an unreported weight allocation escaped the reserve bound");
-  }
+  const auto withinReserves =
+      auditActualMemory(memoryPlan, report(memoryPlan, reserves));
+  require(withinReserves.valid &&
+              withinReserves.backendUnclassifiedBytes == reserves,
+          "unreported allocations that fit the reserves were rejected or "
+          "not counted");
+  require(auditActualMemory(memoryPlan, report(memoryPlan, reserves + 1))
+                  .error == MemoryAuditError::RuntimeReserveExceeded,
+          "unreported allocations beyond the reserves were accepted");
 }
 
 void testFixedCategoryAndPeakFailures() {
