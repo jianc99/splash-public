@@ -2,6 +2,7 @@
 
 #include "Model.hpp"
 #include "QwenTarget.hpp"
+#include "QwenTargetFiles.hpp"
 #include "StateLayout.hpp"
 #include "WeightStore.hpp"
 #include "ops/Linear.hpp"

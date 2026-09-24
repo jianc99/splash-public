@@ -1,4 +1,5 @@
 #include "Qwen3_6Moe.hpp"
+#include "model/QwenTargetLoader.hpp"
 
 #include <utility>
 

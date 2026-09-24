@@ -10,6 +10,7 @@
 #include "model/GgufPreparation.hpp"
 #include "model/GgufTarget.hpp"
 #include "model/Qwen3_8.hpp"
+#include "model/QwenTargetLoader.hpp"
 #include "model/WeightLayout.hpp"
 
 #include <fcntl.h>

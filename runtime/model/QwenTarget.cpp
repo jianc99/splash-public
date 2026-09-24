@@ -2,6 +2,7 @@
 
 #include "model/Qwen3_6Moe.hpp"
 #include "model/Qwen3_8.hpp"
+#include "model/WeightStore.hpp"
 #include "ops/DraftAttention.hpp"
 #include "ops/Embedding.hpp"
 #include "ops/Normalization.hpp"
@@ -77,66 +78,6 @@ void requireWeights(const Weights &weights,
 }
 
 } // namespace
-
-ops::Projection BlockTargetFormat::fused(WeightFile &file, uint32_t outputSize, uint32_t inputSize,
-                                         std::string_view,
-                                         std::initializer_list<std::string_view> tensors) const {
-  ops::BlockWeights weights;
-  uint32_t offset = 0;
-  for (std::string_view tensor : tensors) {
-    ops::QuantizedSegment s = readQuantizedSegment(file, tensor);
-    s.columnOffset = offset;
-    offset += s.outputSize;
-    weights.segments.push_back(std::move(s));
-  }
-  return {outputSize, inputSize, std::move(weights)};
-}
-
-template <class Format>
-QwenMixerWeights readQwenMixer(WeightFile &file, const Format &format,
-                               const QwenMixerGeometry &geometry, bool fullAttention) {
-  constexpr uint64_t kFloat32Bytes = 4;
-  if (fullAttention) {
-    QwenAttentionWeights attention;
-    attention.inputProjection =
-        format.fused(file, geometry.packedFullWidth, geometry.hiddenSize, "attention-input",
-                     {"attn-q", "attn-k", "attn-v"});
-    attention.queryNorm =
-        readNorm(file, geometry.attentionHeadDimension, Format::float32Norms, "query-norm");
-    attention.keyNorm =
-        readNorm(file, geometry.attentionHeadDimension, Format::float32Norms, "key-norm");
-    attention.outputProjection =
-        format.projection(file, geometry.hiddenSize, geometry.attentionWidth, "attention-output");
-    return attention;
-  }
-  QwenGdnWeights gdn;
-  gdn.inputProjection = format.fused(file, geometry.packedGdnWidth, geometry.hiddenSize,
-                                     "gdn-input", {"gdn-qkv", "gdn-z", "gdn-ab"});
-  gdn.convolutionWeights = file.section(
-      checkedWeightMultiply(
-          checkedWeightMultiply(geometry.convolutionDimension, kGdnConvolutionTaps,
-                                "convolution elements"),
-          kBFloat16Bytes, "convolution bytes"),
-      "gdn-convolution");
-  gdn.decay = file.section(checkedWeightMultiply(geometry.gdnValueHeads,
-                                                 kFloat32Bytes,
-                                                 "GDN decay bytes"),
-                           "gdn-decay");
-  gdn.timeBias = file.section(
-      checkedWeightMultiply(geometry.gdnValueHeads, kBFloat16Bytes,
-                            "GDN time bias bytes"),
-      "gdn-time-bias");
-  gdn.mixerNorm = readNorm(file, geometry.gdnHeadDimension, Format::float32Norms, "gdn-norm");
-  gdn.outputProjection =
-      format.projection(file, geometry.hiddenSize, geometry.attentionWidth, "gdn-output");
-  gdn.outputHeadOrder = Format::gdnOutputOrder;
-  return gdn;
-}
-
-template QwenMixerWeights readQwenMixer(WeightFile &, const AffineTargetFormat &,
-                                        const QwenMixerGeometry &, bool);
-template QwenMixerWeights readQwenMixer(WeightFile &, const BlockTargetFormat &,
-                                        const QwenMixerGeometry &, bool);
 
 QwenTarget::QwenTarget(const Qwen3_8Weights &weights,
                        metal::MetalBackend &backend,

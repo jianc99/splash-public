@@ -1,6 +1,7 @@
 #include "ModelFactory.hpp"
 #include "model/AffineTarget.hpp"
 #include "model/GgufTarget.hpp"
+#include "model/QwenTargetLoader.hpp"
 
 #include <limits>
 #include <span>

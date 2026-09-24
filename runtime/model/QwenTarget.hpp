@@ -2,9 +2,6 @@
 
 #include "Model.hpp"
 #include "StateLayout.hpp"
-#include "WeightStore.hpp"
-#include "model/AffineTarget.hpp"
-#include "model/GgufTarget.hpp"
 #include "ops/GDN.hpp"
 #include "ops/ExecutionPlans.hpp"
 #include "ops/Linear.hpp"
@@ -15,12 +12,8 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
-#include <filesystem>
-#include <functional>
-#include <initializer_list>
 #include <optional>
 #include <span>
-#include <string>
 #include <string_view>
 #include <variant>
 #include <vector>
@@ -69,149 +62,7 @@ struct QwenMixerGeometry final {
   uint32_t attentionHeadDimension = 0;
 };
 
-// How a target's files store its tensors; loadQwenTarget pairs each source's
-// files with their format. Affine files, packed or prepared from MLX, hold
-// every projection, a fused one too, as one affine Q4 tensor, and bf16 norms.
-struct AffineTargetFormat final {
-  static constexpr bool float32Norms = false;
-  static constexpr ops::GdnHeadOrder gdnOutputOrder = ops::GdnHeadOrder::Grouped;
-
-  [[nodiscard]] ops::Projection projection(WeightFile &file, uint32_t outputSize,
-                                           uint32_t inputSize, std::string_view label) const {
-    return readAffineProjection(file, outputSize, inputSize, label);
-  }
-  // The tensor `label`; block images keep the projection as `tensors`.
-  [[nodiscard]] ops::Projection fused(WeightFile &file, uint32_t outputSize, uint32_t inputSize,
-                                      std::string_view label,
-                                      std::initializer_list<std::string_view>) const {
-    return projection(file, outputSize, inputSize, label);
-  }
-  [[nodiscard]] ops::EmbeddingWeights embedding(WeightFile &file, uint32_t outputSize,
-                                                uint32_t inputSize) const {
-    return readAffineEmbedding(file, outputSize, inputSize, "embedding");
-  }
-};
-
-// Prepared GGUF images hold each GGUF tensor as one block-quantized segment,
-// a fused projection as its tensors in output column order, and the GGUF's
-// F32 norms. The GGUF keeps the GDN output projection's input columns in
-// llama.cpp's tiled value-head order, so the GDN writes its output in it.
-struct BlockTargetFormat final {
-  static constexpr bool float32Norms = true;
-  static constexpr ops::GdnHeadOrder gdnOutputOrder = ops::GdnHeadOrder::Tiled;
-
-  [[nodiscard]] ops::Projection projection(WeightFile &file, uint32_t outputSize,
-                                           uint32_t inputSize, std::string_view label) const {
-    return readBlockProjection(file, outputSize, inputSize, label);
-  }
-  // The tensors, which may leave padding columns past the last one
-  // (LinearGguf.cpp requireSegments); affine files keep one tensor.
-  [[nodiscard]] ops::Projection fused(WeightFile &file, uint32_t outputSize, uint32_t inputSize,
-                                      std::string_view,
-                                      std::initializer_list<std::string_view> tensors) const;
-  [[nodiscard]] ops::EmbeddingWeights embedding(WeightFile &file, uint32_t outputSize,
-                                                uint32_t inputSize) const {
-    return readBlockEmbedding(file, outputSize, inputSize, "embedding");
-  }
-};
-
-// Reads the mixer sections that follow a layer's input norm, in file order
-// (instantiated for both formats).
-template <class Format>
-[[nodiscard]] QwenMixerWeights readQwenMixer(WeightFile &file, const Format &format,
-                                             const QwenMixerGeometry &geometry,
-                                             bool fullAttention);
-
 inline constexpr std::string_view kEmbeddingMagic = "MDFE0001";
-
-// Opens the packed files of a target directory: one per hybrid layer, head.bin
-// and embedding.bin.
-template <class Layout> struct PackedTargetFiles final {
-  metal::MetalBackend &backend;
-  std::filesystem::path directory;
-  const Layout &layout;
-  [[nodiscard]] WeightFile layer(uint32_t index) const {
-    const std::string filename = "layer-" + std::to_string(index) + ".bin";
-    return WeightFile(backend, directory / filename, "target/" + filename, Layout::layerMagic, index,
-                      layout.isFullAttentionLayer(index) ? 1U : 0U);
-  }
-  [[nodiscard]] WeightFile head() const {
-    return WeightFile(backend, directory / "head.bin", "target/head.bin", Layout::headMagic, layout.layers, 2);
-  }
-  [[nodiscard]] WeightFile embedding() const {
-    return WeightFile(backend, directory / "embedding.bin", "target/embedding.bin", kEmbeddingMagic,
-                      layout.vocabularySize, layout.hiddenSize);
-  }
-};
-
-// Reads a target through immutable WeightFiles, packaged or prepared locally,
-// in their format: per layer the input norm, mixer, post-attention norm and
-// the architecture's FFN through readFfn, then the head and the token
-// embedding. Weights is the architecture's weight struct.
-template <class Weights, class Layout, class Files, class Format, class ReadFfn>
-[[nodiscard]] Weights
-readQwenTargetWeights(metal::MetalBackend &backend, const Layout &layout, Files &&files,
-                      const Format &format, ReadFfn readFfn) {
-  const uint64_t allocationBaseline = backend.memoryStats().allocatedBytes;
-  Weights result;
-  result.layout = layout;
-  result.layers.reserve(layout.layers);
-
-  for (uint32_t layerIndex = 0; layerIndex < layout.layers; ++layerIndex) {
-    const bool fullAttention = layout.isFullAttentionLayer(layerIndex);
-    WeightFile file = files.layer(layerIndex);
-    auto &layer = result.layers.emplace_back();
-    layer.inputNorm = readNorm(file, layout.hiddenSize, Format::float32Norms, "input-norm");
-    layer.mixer = readQwenMixer(file, format, layout.mixerGeometry(), fullAttention);
-    layer.postAttentionNorm =
-        readNorm(file, layout.hiddenSize, Format::float32Norms, "post-attention-norm");
-    readFfn(file, layer, format);
-    file.finish();
-    result.files.push_back(file.record());
-  }
-
-  {
-    WeightFile file = files.head();
-    result.finalNorm = readNorm(file, layout.hiddenSize, Format::float32Norms, "final-norm");
-    result.logitsProjection =
-        format.projection(file, layout.vocabularySize, layout.hiddenSize, "logits");
-    file.finish();
-    result.files.push_back(file.record());
-  }
-  {
-    WeightFile file = files.embedding();
-    result.tokenEmbedding = format.embedding(file, layout.vocabularySize, layout.hiddenSize);
-    file.finish();
-    result.files.push_back(file.record());
-  }
-
-  result.manifestFingerprintSha256 = weightManifestFingerprint(result.files);
-  result.actualAllocatedBytes = metal::allocationDelta(
-      allocationBaseline, backend.memoryStats().allocatedBytes);
-  return result;
-}
-
-// The files a target is read from: packed files (splash-packed-q4 formats),
-// or the cached files a loader prepares from an MLX or GGUF source.
-template <class Layout>
-using QwenTargetFiles = std::variant<PackedTargetFiles<Layout>, std::reference_wrapper<AffineTargetLoader>,
-                                     std::reference_wrapper<GgufTargetLoader>>;
-
-// Loads a target from its files. The architecture reads its FFN from affine
-// files through readAffineFfn and from GGUF images through readBlockFfn, each
-// called with the file, the layer and the format.
-template <class Weights, class Layout, class ReadAffineFfn, class ReadBlockFfn>
-[[nodiscard]] Weights
-loadQwenTarget(metal::MetalBackend &backend, const Layout &layout, const QwenTargetFiles<Layout> &files,
-               ReadAffineFfn readAffineFfn, ReadBlockFfn readBlockFfn) {
-  if (const auto *gguf = std::get_if<std::reference_wrapper<GgufTargetLoader>>(&files))
-    return readQwenTargetWeights<Weights>(backend, layout, gguf->get(), BlockTargetFormat{}, readBlockFfn);
-  const AffineTargetFormat affine{};
-  if (const auto *mlx = std::get_if<std::reference_wrapper<AffineTargetLoader>>(&files))
-    return readQwenTargetWeights<Weights>(backend, layout, mlx->get(), affine, readAffineFfn);
-  return readQwenTargetWeights<Weights>(backend, layout, std::get<PackedTargetFiles<Layout>>(files), affine,
-                                        readAffineFfn);
-}
 
 // Runtime-visible tensor geometry shared by the supported Qwen hybrid
 // targets. It describes semantics only; operators remain responsible for

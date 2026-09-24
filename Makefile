@@ -239,6 +239,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/model/VisionPreparation.cpp \
 	runtime/model/VisionLoader.cpp \
 	runtime/model/QwenTarget.cpp \
+	runtime/model/QwenTargetLoader.cpp \
 	runtime/model/DFlashDraft.cpp \
 	runtime/model/ModelFactory.cpp \
 	runtime/model/QwenState.cpp

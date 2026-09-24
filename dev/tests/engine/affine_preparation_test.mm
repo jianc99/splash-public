@@ -7,6 +7,7 @@
 #include "model/AffineTarget.hpp"
 #include "model/Qwen3_6Moe.hpp"
 #include "model/Qwen3_8.hpp"
+#include "model/QwenTargetLoader.hpp"
 #include <cstdint>
 #include <cstring>
 #include <fstream>
