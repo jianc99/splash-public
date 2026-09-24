@@ -398,7 +398,7 @@ share, then `-UD-Q4_K_M`, or else the only one whose name ends in `-UD-Q4_K_M`
 (`upstream.select_gguf`). Before any weight download, its header must list
 every tensor the loader reads with a type it accepts for that tensor
 (`gguf.loaded_tensors`, checked by `gguf.require_loadable`; a test holds its
-quantized types to `metal/abi/QuantFormat.h`). The native loader checks again
+quantized types to `runtime/metal/abi/QuantFormat.h`). The native loader checks again
 and lists every unsupported tensor in one error:
 
 - linears and experts: Q4_K, Q5_K, Q6_K, Q3_K, IQ4_XS, IQ4_NL, Q8_0 or IQ3_S;
