@@ -31,15 +31,10 @@ using PreparationCheck = std::function<void()>;
 struct PreparedWeight {
   std::string key;
   uint64_t bytes;
-  std::string component{};
-  std::string inputs{};
-  std::string source{};
+  std::string component;
+  std::string inputs;
+  std::string source;
 };
-
-// Leave room for the OS and other applications; this is a disk reserve, not
-// a promise that concurrent system activity can never exhaust the volume.
-inline constexpr uint64_t kWeightCacheDiskReserve = uint64_t{2} << 30;
-void requireWeightDiskSpace(uint64_t available, uint64_t required);
 
 void readWeightBytes(int descriptor, uint64_t offset, std::span<uint8_t> bytes);
 void writeWeightBytes(int descriptor, uint64_t offset, std::span<const uint8_t> bytes);

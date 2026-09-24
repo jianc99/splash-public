@@ -24,6 +24,10 @@ template<class F> void rejects(F run, const char *message) {
   require(rejected, message);
 }
 std::string key(uint8_t value) { return weightDigest(std::span(&value, 1)); }
+// An entry of its own component, so that publishing it supersedes nothing.
+PreparedWeight entry(uint8_t value, uint64_t bytes) {
+  return {key(value), bytes, "test/" + std::to_string(value), key(value), "/test"};
+}
 }
 
 int main() {
@@ -38,15 +42,15 @@ int main() {
     for (size_t i = 0; i < bytes.size(); ++i) bytes[i] = static_cast<uint8_t>(i * 37);
     int builds = 0;
     const auto write = [&](int fd, const PreparationCheck &) { ++builds; writeWeightBytes(fd, 0, bytes); };
-    const auto cached = store.prepare({key(1), bytes.size()}, write);
+    const auto cached = store.prepare(entry(1, bytes.size()), write);
     require(builds == 1 && std::filesystem::file_size(cached) == bytes.size(), "cold preparation");
-    static_cast<void>(store.prepare({key(1), bytes.size()}, write));
+    static_cast<void>(store.prepare(entry(1, bytes.size()), write));
     require(builds == 1, "warm preparation rebuilt weights");
     const auto noWorkspace = [] { throw std::runtime_error("conversion pressure"); };
-    static_cast<void>(store.prepare({key(1), bytes.size()}, write, {{}, noWorkspace}));
-    rejects([&] { static_cast<void>(store.prepare({key(10), bytes.size()}, write, {{}, noWorkspace})); },
+    static_cast<void>(store.prepare(entry(1, bytes.size()), write, {{}, noWorkspace}));
+    rejects([&] { static_cast<void>(store.prepare(entry(10, bytes.size()), write, {{}, noWorkspace})); },
             "cold preparation ignored workspace admission");
-    rejects([&] { static_cast<void>(store.prepare({key(1), bytes.size()}, write,
+    rejects([&] { static_cast<void>(store.prepare(entry(1, bytes.size()), write,
         {[] { throw std::runtime_error("cancelled"); }})); }, "warm hit ignored cancellation");
     // A warm load must finish while an unrelated converter still holds its
     // lock. Use pipes for ordering; the alarm turns a deadlock into a failure.
@@ -64,19 +68,19 @@ int main() {
     require(holder > 0, "fork lock holder");
     char signal;
     require(read(ready[0], &signal, 1) == 1, "wait for converter lock");
-    const std::array<PreparedWeight, 1> warm{{{key(1), bytes.size()}}};
+    const std::array<PreparedWeight, 1> warm{{entry(1, bytes.size())}};
     store.requireSpace(warm);
-    static_cast<void>(store.prepare({key(1), bytes.size()}, write, {{}, noWorkspace}));
+    static_cast<void>(store.prepare(entry(1, bytes.size()), write, {{}, noWorkspace}));
     require(::write(release[1], &signal, 1) == 1, "release converter");
     int lockStatus;
     waitpid(holder, &lockStatus, 0);
     require(WIFEXITED(lockStatus) && WEXITSTATUS(lockStatus) == 0, "warm load waited for converter lock");
     for (int pipeFd : {ready[0], ready[1], release[0], release[1]}) close(pipeFd);
-    requireWeightDiskSpace(0, 0); // No disk reservation for a complete model.
-    requireWeightDiskSpace(kWeightCacheDiskReserve + 128, 128);
-    rejects([&] { requireWeightDiskSpace(kWeightCacheDiskReserve + 127, 128); }, "disk reserve ignored");
-    rejects([&] { requireWeightDiskSpace(UINT64_MAX, UINT64_MAX); }, "disk budget overflow");
-    const std::array<PreparedWeight, 2> tooLarge{{{key(20), UINT64_MAX / 2}, {key(21), UINT64_MAX / 2}}};
+    // The disk check keeps 2 GiB of the volume free.
+    const uint64_t available = std::filesystem::space(root).available;
+    const std::array<PreparedWeight, 1> reserve{{entry(22, available > (1u << 30) ? available - (1u << 30) : 1)}};
+    rejects([&] { store.requireSpace(reserve); }, "disk reserve ignored");
+    const std::array<PreparedWeight, 2> tooLarge{{entry(20, UINT64_MAX / 2), entry(21, UINT64_MAX / 2)}};
     rejects([&] { store.requireSpace(tooLarge); }, "model-wide disk budget ignored");
     require(!std::filesystem::exists(root / key(20)), "disk preflight wrote a partial model");
     require(weightDigest(bytes) == WeightSource(cached).digest(0), "cached content differs");
@@ -88,21 +92,21 @@ int main() {
     const uint8_t bad = 9;
     writeWeightBytes(fd, 0, std::span(&bad, 1));
     close(fd);
-    static_cast<void>(store.prepare({key(1), bytes.size()}, write));
+    static_cast<void>(store.prepare(entry(1, bytes.size()), write));
     require(builds == 2 && WeightSource(cached).digest(0) == weightDigest(bytes), "corruption not repaired");
     // Interrupted and ENOSPC writes do not publish anything and can be retried.
-    rejects([&] { static_cast<void>(store.prepare({key(2), bytes.size()}, [&](int output, const PreparationCheck &) {
+    rejects([&] { static_cast<void>(store.prepare(entry(2, bytes.size()), [&](int output, const PreparationCheck &) {
       writeWeightBytes(output, 0, std::span(bytes).first(64));
       throw std::system_error(ENOSPC, std::generic_category());
     })); }, "failed write accepted");
     require(!std::filesystem::exists(root / key(2)), "partial file published");
-    static_cast<void>(store.prepare({key(2), bytes.size()}, write));
-    rejects([&] { static_cast<void>(store.prepare({key(3), bytes.size()}, write, {[] { throw std::runtime_error("pressure"); }})); }, "pressure ignored");
+    static_cast<void>(store.prepare(entry(2, bytes.size()), write));
+    rejects([&] { static_cast<void>(store.prepare(entry(3, bytes.size()), write, {[] { throw std::runtime_error("pressure"); }})); }, "pressure ignored");
     require(!std::filesystem::exists(root / key(3)), "pressure rejection published weights");
-    rejects([&] { static_cast<void>(store.prepare({"../outside", bytes.size()}, write)); }, "unsafe cache key accepted");
+    rejects([&] { static_cast<void>(store.prepare({"../outside", bytes.size(), "test/outside", key(6), "/test"}, write)); }, "unsafe cache key accepted");
     const pid_t crash = fork();
     if (crash == 0) {
-      static_cast<void>(store.prepare({key(4), bytes.size()}, [&](int output, const PreparationCheck &) {
+      static_cast<void>(store.prepare(entry(4, bytes.size()), [&](int output, const PreparationCheck &) {
         writeWeightBytes(output, 0, std::span(bytes).first(64));
         _exit(7);
       }));
@@ -113,10 +117,10 @@ int main() {
     waitpid(crash, &status, 0);
     require(WIFEXITED(status) && WEXITSTATUS(status) == 7, "crash fixture failed");
     require(!std::filesystem::exists(root / key(4)), "crash published partial weights");
-    const std::array<PreparedWeight, 1> retry{{{key(4), bytes.size()}}};
+    const std::array<PreparedWeight, 1> retry{{entry(4, bytes.size())}};
     store.requireSpace(retry);
     require(!std::filesystem::exists(root / (key(4) + ".partial")), "abandoned staging not cleaned");
-    static_cast<void>(store.prepare({key(4), bytes.size()}, write));
+    static_cast<void>(store.prepare(entry(4, bytes.size()), write));
     // Two processes requesting the same identity must run its writer only once.
     const auto counter = root / "builds";
     const auto competing = [&](int output, const PreparationCheck &) {
@@ -127,11 +131,11 @@ int main() {
     };
     const pid_t child = fork();
     if (child == 0) {
-      try { static_cast<void>(store.prepare({key(5), bytes.size()}, competing)); _exit(0); }
+      try { static_cast<void>(store.prepare(entry(5, bytes.size()), competing)); _exit(0); }
       catch (...) { _exit(1); }
     }
     require(child > 0, "fork competitor");
-    static_cast<void>(store.prepare({key(5), bytes.size()}, competing));
+    static_cast<void>(store.prepare(entry(5, bytes.size()), competing));
     waitpid(child, &status, 0);
     require(WIFEXITED(status) && WEXITSTATUS(status) == 0 && std::filesystem::file_size(counter) == 1,
             "concurrent cache miss rebuilt or corrupted weights");
@@ -152,7 +156,7 @@ int main() {
       writeWeightBytes(proof, 0, std::span(&bad, 1));
       close(proof);
     }
-    static_cast<void>(store.prepare({key(2), bytes.size()}, write));
+    static_cast<void>(store.prepare(entry(2, bytes.size()), write));
     require(builds == 4, "damaged proof forced an unnecessary rebuild");
     // Publishing an entry removes the earlier preparations of its component
     // from the same source data, and the entries earlier versions prepared

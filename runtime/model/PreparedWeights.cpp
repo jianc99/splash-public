@@ -28,6 +28,32 @@ namespace {
   throw std::system_error(errno, std::generic_category(), operation);
 }
 
+void run(const PreparationCheck &check) {
+  if (check) check();
+}
+
+// Whether name is a cache key: 64 lowercase hex digits.
+bool isKey(std::string_view name) {
+  return name.size() == 64 && name.find_first_not_of("0123456789abcdef") == name.npos;
+}
+
+// Where an entry is written before it is published. Every staging entry a
+// converter finds under the lock is abandoned.
+std::filesystem::path stagingPath(const std::filesystem::path &root, std::string_view key) {
+  return root / (std::string(key) + ".partial");
+}
+
+// Leave room for the OS and other applications; this is a disk reserve, not
+// a promise that concurrent system activity can never exhaust the volume.
+constexpr uint64_t kDiskReserveBytes = uint64_t{2} << 30;
+
+void requireDiskSpace(const std::filesystem::path &root, uint64_t required) {
+  const uint64_t available = std::filesystem::space(root).available;
+  if (available < kDiskReserveBytes || required > available - kDiskReserveBytes)
+    throw std::runtime_error("not enough disk space to prepare weights: need " +
+        std::to_string(required) + " bytes plus a 2 GiB free-space reserve");
+}
+
 class Descriptor final {
 public:
   explicit Descriptor(int fd) : fd_(fd) { if (fd < 0) fail("open prepared weights"); }
@@ -45,7 +71,7 @@ public:
       : file_(open((root / "prepare.lock").c_str(), O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0600)) {
     while (flock(file_, LOCK_EX | LOCK_NB) < 0) {
       if (errno != EINTR && errno != EWOULDBLOCK) fail("lock weight preparation");
-      if (check) check();
+      run(check);
       std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
   }
@@ -63,7 +89,8 @@ std::string hex(const unsigned char *digest) {
   return result;
 }
 
-bool unchanged(const struct stat &a, const struct stat &b) {
+// Whether two stats describe the same, unmodified file.
+bool sameFile(const struct stat &a, const struct stat &b) {
   return a.st_dev == b.st_dev && a.st_ino == b.st_ino && a.st_size == b.st_size &&
          a.st_mtimespec.tv_sec == b.st_mtimespec.tv_sec &&
          a.st_mtimespec.tv_nsec == b.st_mtimespec.tv_nsec &&
@@ -84,18 +111,18 @@ std::string fileDigest(int fd, uint64_t from, const PreparationCheck &check) {
   if (fstat(fd, &before)) fail("stat source weights");
   if (!S_ISREG(before.st_mode) || before.st_size < 0 || uint64_t(before.st_size) < from)
     throw std::runtime_error("weights must be a regular file");
-  if (check) check();
+  run(check);
   std::vector<uint8_t> buffer(1024 * 1024);
   CC_SHA256_CTX context;
   CC_SHA256_Init(&context);
   for (uint64_t at = from; at < uint64_t(before.st_size); at += buffer.size()) {
-    if (check) check();
+    run(check);
     const auto part = std::span(buffer).first(std::min<uint64_t>(buffer.size(), before.st_size - at));
     readWeightBytes(fd, at, part);
     CC_SHA256_Update(&context, part.data(), static_cast<CC_LONG>(part.size()));
   }
   if (fstat(fd, &after)) fail("stat source weights after read");
-  if (!unchanged(before, after)) throw std::runtime_error("weight file changed while reading");
+  if (!sameFile(before, after)) throw std::runtime_error("weight file changed while reading");
   unsigned char digest[CC_SHA256_DIGEST_LENGTH];
   CC_SHA256_Final(digest, &context);
   return hex(digest);
@@ -112,6 +139,12 @@ std::string verificationKey(const struct stat &state, uint64_t from) {
   return weightDigest(identity.str());
 }
 
+// Writes contents to the empty file and flushes it.
+void writeSmallFile(int file, std::string_view contents, const char *what) {
+  writeWeightBytes(file, 0, {reinterpret_cast<const uint8_t *>(contents.data()), contents.size()});
+  if (fsync(file)) fail(what);
+}
+
 std::string verificationRecord(std::string_view key, std::string_view digest) {
   return std::string(digest) + weightDigest(std::string(key) + std::string(digest));
 }
@@ -124,9 +157,7 @@ void rememberDigest(const std::filesystem::path &root, const struct stat &state,
   std::string temporary = (directory / ".pending-XXXXXX").string();
   Descriptor file(mkstemp(temporary.data()));
   try {
-    const auto record = verificationRecord(key, digest);
-    writeWeightBytes(file, 0, {reinterpret_cast<const uint8_t *>(record.data()), record.size()});
-    if (fsync(file)) fail("flush weight verification");
+    writeSmallFile(file, verificationRecord(key, digest), "flush weight verification");
     std::filesystem::rename(temporary, directory / key);
   } catch (...) {
     unlink(temporary.c_str());
@@ -140,7 +171,7 @@ void rememberDigest(const std::filesystem::path &root, const struct stat &state,
 // modified. This avoids rereading two entire models at every warm startup.
 std::string verifiedDigest(int fd, uint64_t from, const std::filesystem::path &path,
                            const std::filesystem::path &root, const PreparationCheck &check) {
-  if (check) check();
+  run(check);
   struct stat before{}, after{};
   if (fstat(fd, &before)) fail("stat verified weights");
   if (!S_ISREG(before.st_mode) || before.st_size < 0) throw std::runtime_error("weights must be a regular file");
@@ -166,7 +197,7 @@ std::string verifiedDigest(int fd, uint64_t from, const std::filesystem::path &p
     digest = fileDigest(fd, from, check);
   }
   if (fstat(fd, &after)) fail("stat verified weights after read");
-  if (!unchanged(before, after)) throw std::runtime_error("weight file changed during verification");
+  if (!sameFile(before, after)) throw std::runtime_error("weight file changed during verification");
   if (missing) rememberDigest(root, before, from, digest);
   return digest;
 }
@@ -192,9 +223,8 @@ bool supersedes(const PreparedWeight &weight, const std::filesystem::path &direc
   std::vector<std::string> lines;
   for (std::string line; lines.size() < 5 && std::getline(stream, line);) lines.push_back(line);
   if (lines.size() == 4 && lines[0] == kProvenance)
-    return !weight.component.empty() && lines[1] == "component " + weight.component &&
-           lines[2] == "inputs " + weight.inputs;
-  return lines.size() == 2 && !weight.source.empty() && lines[0] == weight.source;
+    return lines[1] == "component " + weight.component && lines[2] == "inputs " + weight.inputs;
+  return lines.size() == 2 && lines[0] == weight.source;
 }
 
 // Removes a complete entry. Its directory is first renamed to staging, which
@@ -203,7 +233,7 @@ bool supersedes(const PreparedWeight &weight, const std::filesystem::path &direc
 void removeEntry(const std::filesystem::path &root, const std::filesystem::path &directory) {
   struct stat state{};
   const bool hashed = !stat((directory / "weights").c_str(), &state);
-  const auto staging = root / (directory.filename().string() + ".partial");
+  const auto staging = stagingPath(root, directory.filename().string());
   std::error_code error;
   std::filesystem::remove_all(staging, error);
   std::filesystem::rename(directory, staging, error);
@@ -236,6 +266,63 @@ bool complete(const std::filesystem::path &directory, uint64_t bytes,
   readWeightBytes(hashFile, 0, digest);
   return verifiedDigest(file, 0, directory / "weights", directory.parent_path(), check) ==
          std::string(digest.begin(), digest.end());
+}
+
+// Writes the file of weight into staging and seals it: read-only, flushed to
+// the drive, its digest remembered and recorded beside it with its provenance.
+void writeStaged(const std::filesystem::path &root, const std::filesystem::path &staging, const PreparedWeight &weight,
+                 const WeightWriter &write, const PreparationGuards &guards) {
+  Descriptor file(open((staging / "weights").c_str(), O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0600));
+  // Do not let dirty filesystem pages grow into a hidden model-sized buffer.
+  if (fcntl(file, F_NOCACHE, 1)) fail("set preparation uncached I/O");
+  fstore_t allocation{};
+  allocation.fst_flags = F_ALLOCATEALL;
+  allocation.fst_posmode = F_PEOFPOSMODE;
+  allocation.fst_length = static_cast<off_t>(weight.bytes);
+  if (fcntl(file, F_PREALLOCATE, &allocation)) fail("reserve prepared weight disk space");
+  if (ftruncate(file, static_cast<off_t>(weight.bytes))) fail("size prepared weights");
+  write(file, [&] {
+    run(guards.check);
+    run(guards.admitConversion);
+  });
+  run(guards.unchanged);
+  struct stat state{};
+  if (fstat(file, &state)) fail("stat prepared weights");
+  if (state.st_size < 0 || uint64_t(state.st_size) != weight.bytes)
+    throw std::runtime_error("prepared weight size changed");
+  const std::string digest = fileDigest(file, 0, guards.check);
+  // fsync leaves the data in the drive's cache on macOS; the proof below must
+  // not outlive a power loss that the data does not survive. F_FULLFSYNC
+  // fails on file systems that lack it, where fsync is the strongest flush.
+  if (fchmod(file, 0400) || (fcntl(file, F_FULLFSYNC) && fsync(file)))
+    fail("flush prepared weights");
+  if (fstat(file, &state)) fail("stat completed weights");
+  rememberDigest(root, state, 0, digest);
+  writeSmallFile(Descriptor(open((staging / "sha256").c_str(), O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0400)),
+                 digest, "flush prepared weight digest");
+  writeSmallFile(Descriptor(open((staging / "source").c_str(), O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0400)),
+                 provenance(weight), "flush prepared weight source");
+}
+
+// Renames the sealed staging entry to its key. Invalid cached generations may
+// be replaced; existing read-only mappings retain their inode. No valid
+// generation is rewritten in place.
+void publish(const std::filesystem::path &root, const std::filesystem::path &staging,
+             const std::filesystem::path &destination) {
+  std::filesystem::remove_all(destination);
+  std::filesystem::rename(staging, destination);
+  Descriptor directory(open(root.c_str(), O_RDONLY | O_CLOEXEC));
+  if (fsync(directory)) fail("flush prepared weight directory");
+}
+
+// Removes the earlier preparations weight supersedes, still under the
+// converter lock, which every writer holds.
+void evictSuperseded(const std::filesystem::path &root, const PreparedWeight &weight) {
+  std::error_code error;
+  for (const auto &entry : std::filesystem::directory_iterator(root, error)) {
+    const auto name = entry.path().filename().string();
+    if (name != weight.key && isKey(name) && supersedes(weight, entry.path())) removeEntry(root, entry.path());
+  }
 }
 
 } // namespace
@@ -272,7 +359,7 @@ void copyWeightBytes(int source, uint64_t from, int destination, uint64_t to, ui
                      std::span<uint8_t> staging, const PreparationCheck &check) {
   if (bytes && staging.empty()) throw std::invalid_argument("weight copy staging is empty");
   for (uint64_t at = 0; at < bytes; at += staging.size()) {
-    if (check) check();
+    run(check);
     const auto piece = staging.first(std::min<uint64_t>(staging.size(), bytes - at));
     readWeightBytes(source, from + at, piece);
     writeWeightBytes(destination, to + at, piece);
@@ -319,7 +406,7 @@ void WeightSource::checkUnchanged() const {
   if (fstat(impl_->file, &current)) fail("stat weight source");
   struct stat named{};
   if (stat(impl_->path.c_str(), &named)) fail("stat weight source path");
-  if (!unchanged(impl_->state, current) || !unchanged(impl_->state, named))
+  if (!sameFile(impl_->state, current) || !sameFile(impl_->state, named))
     throw std::runtime_error("source weights changed during preparation; retry with an immutable source");
 }
 
@@ -342,20 +429,14 @@ PreparedWeight WeightIdentity::weight(uint64_t bytes, std::string component, std
 
 PreparedWeights::PreparedWeights() : root_(cacheRoot()) {}
 
-void requireWeightDiskSpace(uint64_t available, uint64_t required) {
-  if (required && (available < kWeightCacheDiskReserve || required > available - kWeightCacheDiskReserve))
-    throw std::runtime_error("not enough disk space to prepare weights: need " +
-        std::to_string(required) + " bytes plus a 2 GiB free-space reserve");
-}
-
 void PreparedWeights::requireSpace(std::span<const PreparedWeight> weights,
                                    const PreparationCheck &check) const {
   const auto missingBytes = [&] {
     uint64_t missing = 0;
     for (const auto &weight : weights) {
-      if (weight.key.size() != 64 || weight.key.find_first_not_of("0123456789abcdef") != weight.key.npos || !weight.bytes)
+      if (!isKey(weight.key) || !weight.bytes)
         throw std::invalid_argument("invalid prepared weight identity or size");
-      if (check) check();
+      run(check);
       if (complete(root_ / weight.key, weight.bytes, check)) continue;
       if (weight.bytes > std::numeric_limits<uint64_t>::max() - missing)
         throw std::overflow_error("prepared model size overflow");
@@ -371,103 +452,51 @@ void PreparedWeights::requireSpace(std::span<const PreparedWeight> weights,
   // wrote it; complete generations are retained and excluded from the budget.
   for (const auto &entry : std::filesystem::directory_iterator(root_))
     if (entry.path().extension() == ".partial") std::filesystem::remove_all(entry.path());
-  requireWeightDiskSpace(std::filesystem::space(root_).available, missingBytes());
+  if (const uint64_t missing = missingBytes()) requireDiskSpace(root_, missing);
 }
 
 std::filesystem::path PreparedWeights::prepare(const PreparedWeight &weight, const WeightWriter &write,
                                                const PreparationGuards &guards) const {
-  const auto &key = weight.key;
-  const auto bytes = weight.bytes;
-  if (key.size() != 64 || key.find_first_not_of("0123456789abcdef") != key.npos ||
-      !bytes || bytes > uint64_t(std::numeric_limits<off_t>::max()))
+  if (!isKey(weight.key) || !weight.bytes || weight.bytes > uint64_t(std::numeric_limits<off_t>::max()))
     throw std::invalid_argument("invalid prepared weight identity or size");
-  const auto &[check, admitConversion, sourceUnchanged] = guards;
-  const auto unchanged = [&] { if (sourceUnchanged) sourceUnchanged(); };
-  if (check) check();
-  unchanged();
-  const auto destination = root_ / key;
+  run(guards.check);
+  run(guards.unchanged);
+  const auto destination = root_ / weight.key;
   // Immutable hits need neither conversion admission nor the converter lock.
-  if (complete(destination, bytes, check)) {
-    unchanged();
+  if (complete(destination, weight.bytes, guards.check)) {
+    run(guards.unchanged);
     return destination / "weights";
   }
   std::filesystem::create_directories(root_);
   // One converter per user cache: concurrent cold loads cannot multiply the
   // bounded conversion workspace. OS locks are released on crashes.
-  PreparationLock lock(root_, check);
-  if (complete(destination, bytes, check)) {
-    unchanged();
+  PreparationLock lock(root_, guards.check);
+  if (complete(destination, weight.bytes, guards.check)) {
+    run(guards.unchanged);
     return destination / "weights";
   }
-  if (check) check();
-  if (admitConversion) admitConversion();
+  run(guards.check);
+  run(guards.admitConversion);
+  const auto started = std::chrono::steady_clock::now();
+  std::clog << "Preparing weights: " << weight.component << std::endl;
   // This name belongs only to this key under the converter lock. An abandoned
   // staging directory is never a cache hit and is safe to replace.
-  const auto staging = root_ / (std::string(key) + ".partial");
+  const auto staging = stagingPath(root_, weight.key);
   std::filesystem::remove_all(staging);
-  requireWeightDiskSpace(std::filesystem::space(root_).available, bytes);
+  requireDiskSpace(root_, weight.bytes);
   std::filesystem::create_directory(staging);
-  const auto started = std::chrono::steady_clock::now();
-  if (!weight.component.empty()) std::clog << "Preparing weights: " << weight.component << std::endl;
   try {
-    Descriptor file(open((staging / "weights").c_str(), O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0600));
-    // Do not let dirty filesystem pages grow into a hidden model-sized buffer.
-    if (fcntl(file, F_NOCACHE, 1)) fail("set preparation uncached I/O");
-    fstore_t allocation{};
-    allocation.fst_flags = F_ALLOCATEALL;
-    allocation.fst_posmode = F_PEOFPOSMODE;
-    allocation.fst_length = static_cast<off_t>(bytes);
-    if (fcntl(file, F_PREALLOCATE, &allocation)) fail("reserve prepared weight disk space");
-    if (ftruncate(file, static_cast<off_t>(bytes))) fail("size prepared weights");
-    write(file, [&] {
-      if (check) check();
-      if (admitConversion) admitConversion();
-    });
-    unchanged();
-    struct stat state{};
-    if (fstat(file, &state)) fail("stat prepared weights");
-    if (state.st_size < 0 || uint64_t(state.st_size) != bytes)
-      throw std::runtime_error("prepared weight size changed");
-    const std::string digest = fileDigest(file, 0, check);
-    // fsync leaves the data in the drive's cache on macOS; the proof below must
-    // not outlive a power loss that the data does not survive.
-    if (fchmod(file, 0400) || (fcntl(file, F_FULLFSYNC) && fsync(file)))
-      fail("flush prepared weights");
-    if (fstat(file, &state)) fail("stat completed weights");
-    rememberDigest(root_, state, 0, digest);
-    Descriptor manifest(open((staging / "sha256").c_str(), O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0400));
-    writeWeightBytes(manifest, 0, {reinterpret_cast<const uint8_t *>(digest.data()), digest.size()});
-    if (fsync(manifest)) fail("flush prepared weight digest");
-    {
-      Descriptor origin(open((staging / "source").c_str(), O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0400));
-      const auto description = provenance(weight);
-      writeWeightBytes(origin, 0, {reinterpret_cast<const uint8_t *>(description.data()), description.size()});
-      if (fsync(origin)) fail("flush prepared weight source");
-    }
-    // Invalid cached generations may be replaced; existing read-only mappings
-    // retain their inode. No valid generation is rewritten in place.
-    std::filesystem::remove_all(destination);
-    std::filesystem::rename(staging, destination);
-    Descriptor directory(open(root_.c_str(), O_RDONLY | O_CLOEXEC));
-    if (fsync(directory)) fail("flush prepared weight directory");
+    writeStaged(root_, staging, weight, write, guards);
+    publish(root_, staging, destination);
   } catch (...) {
     std::error_code ignored;
     std::filesystem::remove_all(staging, ignored);
     throw;
   }
-  // Still under the converter lock, which every writer holds.
-  std::error_code error;
-  for (const auto &entry : std::filesystem::directory_iterator(root_, error)) {
-    const auto name = entry.path().filename().string();
-    if (name != key && name.size() == 64 && name.find_first_not_of("0123456789abcdef") == name.npos &&
-        supersedes(weight, entry.path()))
-      removeEntry(root_, entry.path());
-  }
-  if (!weight.component.empty()) {
-    const auto seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
-    std::clog << "Prepared " << weight.component << " in " << seconds << " s" << std::endl;
-  }
-  unchanged();
+  evictSuperseded(root_, weight);
+  const auto seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+  std::clog << "Prepared " << weight.component << " in " << seconds << " s" << std::endl;
+  run(guards.unchanged);
   return destination / "weights";
 }
 
