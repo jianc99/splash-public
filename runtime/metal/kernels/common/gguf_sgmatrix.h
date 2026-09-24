@@ -11,7 +11,7 @@
 // inputs (formats with a min) and the chain seed of every 16 inputs (formats
 // with a zero point) are stored row-minor, so a lane reads its two rows at
 // once.
-namespace q16sg {
+namespace gguf_sg {
 
 // Formats with a zero point (Q6_K, Q3_K) enter the MMA as 160 + code - zero,
 // exact in bf16 (160 = 128 + 32, Q6_K's zero point), so each 16-input chain
@@ -50,4 +50,4 @@ struct Table16 {
   }
 };
 
-} // namespace q16sg
+} // namespace gguf_sg

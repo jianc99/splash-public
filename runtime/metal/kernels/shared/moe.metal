@@ -545,7 +545,7 @@ inline void moe_table16_tile(Source source, device bfloat *table,
                              uint simd_lane, uint simd_group) {
   for (uint span = group.y * 4; span < group.y * 4 + 4; ++span) {
     const bfloat2 values = source(simd_group, span * 64 + 2 * simd_lane);
-    q16sg::write_input(table + ulong(group.x) * width * 8,
+    gguf_sg::write_input(table + ulong(group.x) * width * 8,
                        sums + ulong(group.x) * table16_sums_per_tile(width),
                        width, span, simd_group, simd_lane, values.x, values.y);
   }

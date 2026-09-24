@@ -499,7 +499,7 @@ inline void gdn_decode_batch_phase(
       constant GDNDecodeBatchParams &params [[buffer(20)]], GDN_DECODE_THREADS) { \
     GDN_DECODE_BODY(KeyHeads, ValueHeads, HeadDim, ConvDim, nullptr, nullptr, q4sg::Table64) \
   }
-// The out-projection's table (Layout: q4sg::Table64 affine, q16sg::Table16 GGUF).
+// The out-projection's table (Layout: q4sg::Table64 affine, gguf_sg::Table16 GGUF).
 #define GDN_DECODE_TABLE_ENTRY(Name, KeyHeads, ValueHeads, HeadDim, ConvDim, Layout, W) \
   kernel void Name(GDN_DECODE_BUFFERS(W), \
       device bfloat *q4_table [[buffer(20)]], device float *q4_sums [[buffer(21)]], \
@@ -515,8 +515,8 @@ GDN_DECODE_TABLE_ENTRY(verify_gdn_fused_q4, 16, 48, 128, 10240, q4sg::Table64, b
 GDN_DECODE_TABLE_ENTRY(verify_gdn_fused_q4_vh32, 16, 32, 128, 8192, q4sg::Table64, bfloat)
 GDN_DECODE_ENTRY(verify_gdn_fused_f32, 16, 48, 128, 10240, float)
 GDN_DECODE_ENTRY(verify_gdn_fused_vh32_f32, 16, 32, 128, 8192, float)
-GDN_DECODE_TABLE_ENTRY(verify_gdn_fused_q16_f32, 16, 48, 128, 10240, q16sg::Table16, float)
-GDN_DECODE_TABLE_ENTRY(verify_gdn_fused_q16_vh32_f32, 16, 32, 128, 8192, q16sg::Table16, float)
+GDN_DECODE_TABLE_ENTRY(verify_gdn_fused_q16_f32, 16, 48, 128, 10240, gguf_sg::Table16, float)
+GDN_DECODE_TABLE_ENTRY(verify_gdn_fused_q16_vh32_f32, 16, 32, 128, 8192, gguf_sg::Table16, float)
 #undef GDN_DECODE_ENTRY
 #undef GDN_DECODE_TABLE_ENTRY
 #undef GDN_DECODE_BODY

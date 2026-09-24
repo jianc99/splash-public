@@ -31,7 +31,7 @@ template <class F> struct Shape {
     HasMin = Linear && F::Zero == 0,                          // Q4_K, Q5_K: s code + m
     ZeroPoint = Linear && !HasMin,                            // Q6_K, Q3_K: s (code - zero)
     // bf16 bits of the operand of code 0: 128, or 160 - zero with a zero point
-    Operand = 0x4300 + (ZeroPoint ? q16sg::kZeroPointOffset - 128 - F::Zero : 0),
+    Operand = 0x4300 + (ZeroPoint ? kZeroPointOffset - 128 - F::Zero : 0),
     CG = ZeroPoint ? 2 : 1,                                   // coefficient groups per 32 inputs
     UnitSpans = F::MetaGroups == 8 ? 4 : 1,                   // spans decoded per coefficient unit
     J = 2 * UnitSpans * CG,                                   // coefficients per column and unit
@@ -275,7 +275,7 @@ kernel void decode_linear_gguf_prepare(device const bfloat *input [[buffer(0)]],
   const uint span = (tg.x * 4 + sg) / 8, row = (tg.x * 4 + sg) % 8;
   input += ulong(tg.y) * width * 8;
   const uint k = span * 64 + 2 * lane;
-  q16sg::write_input(table + ulong(tg.y) * width * 8, sums + ulong(tg.y) * table16_sums_per_tile(width), width,
+  gguf_sg::write_input(table + ulong(tg.y) * width * 8, sums + ulong(tg.y) * table16_sums_per_tile(width), width,
                      span, row, lane, input[row * width + k], input[row * width + k + 1]);
 }
 

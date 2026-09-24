@@ -117,7 +117,7 @@ NORM_RMS(norm_rms_f32, float)
 #undef NORM_RMS
 
 // Keep the ordinary output for non-matrix consumers, and emit the consumer's
-// matrix operand table (Table: q4sg::Table64 affine, q16sg::Table16 GGUF) from
+// matrix operand table (Table: q4sg::Table64 affine, gguf_sg::Table16 GGUF) from
 // the same rounded bfloat values. No additional dispatch is needed. The table
 // takes a simdgroup per 64-column span, so the first chunk's span pairs are
 // loaded (L2-hot input, weights) alongside the reduction's columns.
@@ -188,6 +188,6 @@ inline void norm_rms_table(device const bfloat *input, device const W *weight,
 // Table16 feeds a GGUF target's register-tile projections, from its F32 norms, and also the target's vocabulary
 // head from the draft's bf16 final norm (DFlashDraft::addDecode). No F32 norm feeds an affine projection.
 NORM_RMS_TABLE(norm_rms_q4_decode, q4sg::Table64, bfloat)
-NORM_RMS_TABLE(norm_rms_q16_decode, q16sg::Table16, bfloat)
-NORM_RMS_TABLE(norm_rms_q16_decode_f32, q16sg::Table16, float)
+NORM_RMS_TABLE(norm_rms_q16_decode, gguf_sg::Table16, bfloat)
+NORM_RMS_TABLE(norm_rms_q16_decode_f32, gguf_sg::Table16, float)
 #undef NORM_RMS_TABLE

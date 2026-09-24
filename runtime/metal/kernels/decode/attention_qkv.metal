@@ -139,6 +139,6 @@ kernel void verify_attention_gate_kv2_g8(
   }
 ATTENTION_GATE_TABLE(verify_attention_gate_q4, 24, 4, q4sg::Table64)
 ATTENTION_GATE_TABLE(verify_attention_gate_q4_kv2_g8, 16, 2, q4sg::Table64)
-ATTENTION_GATE_TABLE(verify_attention_gate_q16, 24, 4, q16sg::Table16)
-ATTENTION_GATE_TABLE(verify_attention_gate_q16_kv2_g8, 16, 2, q16sg::Table16)
+ATTENTION_GATE_TABLE(verify_attention_gate_q16, 24, 4, gguf_sg::Table16)
+ATTENTION_GATE_TABLE(verify_attention_gate_q16_kv2_g8, 16, 2, gguf_sg::Table16)
 #undef ATTENTION_GATE_TABLE
