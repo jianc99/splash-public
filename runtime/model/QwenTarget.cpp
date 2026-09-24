@@ -85,8 +85,6 @@ ops::Projection BlockTargetFormat::fused(WeightFile &file, uint32_t outputSize, 
   uint32_t offset = 0;
   for (std::string_view tensor : tensors) {
     ops::QuantizedSegment s = readQuantizedSegment(file, tensor);
-    if (s.inputSize != inputSize || s.outputSize > outputSize - offset)
-      throw WeightStoreError("GGUF fused projection does not match the layout: " + std::string(tensor));
     s.columnOffset = offset;
     offset += s.outputSize;
     weights.segments.push_back(std::move(s));

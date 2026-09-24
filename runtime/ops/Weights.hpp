@@ -116,8 +116,9 @@ private:
   std::variant<Affine, Block> storage_;
 };
 
-// A projection of outputSize x inputSize. A block projection holds at least
-// one segment; its segments tile the leading output columns (LinearGguf.cpp).
+// A projection of outputSize x inputSize. A block projection's segments tile
+// its leading output columns in order: each takes every input and starts
+// where the previous one ends; the columns past the last are padding.
 class Projection final : public LayoutWeights<AffineWeights, BlockWeights> {
 public:
   Projection() = default;
@@ -126,6 +127,12 @@ public:
   Projection(uint32_t output, uint32_t input, BlockWeights weights)
       : LayoutWeights(std::move(weights)), outputSize(output), inputSize(input) {
     if (blocks().segments.empty()) throw std::invalid_argument("block projection has no segments");
+    uint32_t covered = 0;
+    for (const QuantizedSegment &s : blocks().segments) {
+      if (s.inputSize != input || s.columnOffset != covered || !s.outputSize || s.outputSize > output - covered)
+        throw std::invalid_argument("block segments do not tile the projection");
+      covered += s.outputSize;
+    }
   }
 
   [[nodiscard]] ProjectionShape shape() const noexcept {

@@ -775,6 +775,20 @@ void ggufPlans() {
   // A block projection without segments would reach the dispatch paths with
   // nothing to index or encode.
   rejects([] { (void)Projection(5120, 17408, BlockWeights{}); });
+  // Its segments tile the leading columns in order: a gap, an overlap, another
+  // input width or a segment past the end is not a projection; padding past
+  // the last segment is.
+  const auto segment = [](uint32_t n, uint32_t k, uint32_t offset) {
+    QuantizedSegment s = QuantizedSegment::planes(GGUF_FMT_Q4K, n, k, {}, {}, {});
+    s.columnOffset = offset;
+    return s;
+  };
+  rejects([&] { (void)Projection(768, 256, BlockWeights{{segment(256, 256, 0), segment(256, 256, 320)}}); });
+  rejects([&] { (void)Projection(768, 256, BlockWeights{{segment(256, 256, 0), segment(256, 256, 128)}}); });
+  rejects([&] { (void)Projection(768, 256, BlockWeights{{segment(256, 512, 0)}}); });
+  rejects([&] { (void)Projection(768, 256, BlockWeights{{segment(256, 256, 0), segment(768, 256, 256)}}); });
+  require(Projection(768, 256, BlockWeights{{segment(256, 256, 0), segment(256, 256, 256)}}).blocks().segments.size() == 2,
+          "a projection with padding past its segments was rejected");
   // A projection runs only as the matrix it holds: the padding past its
   // segments is part of it, not room for a narrower plan.
   {
