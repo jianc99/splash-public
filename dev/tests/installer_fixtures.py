@@ -1,5 +1,9 @@
 """What the installer tests share: model and draft repositories, selections,
-Hub errors, and FakeHub, the one stand-in for the Hugging Face Hub."""
+Hub errors, and FakeHub, the stand-in for the Hugging Face Hub that the
+upstream and GGUF tests install from. The legacy package tests
+(test_models.py) mock huggingface_hub's functions directly: the frozen legacy
+installer calls them with other arguments (token, repo_type,
+force_download, and model_info without a timeout)."""
 
 import hashlib
 import json

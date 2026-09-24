@@ -16,9 +16,9 @@ from types import SimpleNamespace
 from unittest import mock
 
 import httpx
-from huggingface_hub.errors import HfHubHTTPError
 from huggingface_hub.hf_api import RepoSibling
 
+from dev.tests.installer_fixtures import http_error
 from install import hub, legacy
 from install import models as installer
 
@@ -861,7 +861,7 @@ class ModelArtifactTest(unittest.TestCase):
         installer.link_selection(destination, snapshot)
         ref = hub.pin(snapshot, self.MODEL_ID, destination)
         with mock.patch.object(
-            installer.os, "link", side_effect=AssertionError("cache write")
+            hub.os, "link", side_effect=AssertionError("cache write")
         ):
             with contextlib.redirect_stdout(io.StringIO()):
                 legacy.prepare(installer.Selection.of(models, self.MODEL_ID))
@@ -876,7 +876,7 @@ class ModelArtifactTest(unittest.TestCase):
             with self.subTest(errno=code):
                 errors = io.StringIO()
                 with mock.patch.object(
-                    installer.os, "link", side_effect=OSError(code, "read only")
+                    hub.os, "link", side_effect=OSError(code, "read only")
                 ):
                     with (
                         contextlib.redirect_stdout(io.StringIO()),
@@ -972,22 +972,12 @@ class ModelArtifactTest(unittest.TestCase):
             legacy.resolve_snapshot(self.MODEL_ID)
         self.download.assert_not_called()
 
-    @staticmethod
-    def authentication_failure(status):
-        response = httpx.Response(
-            status,
-            request=httpx.Request("GET", "https://huggingface.co/api/models/example"),
-        )
-        return HfHubHTTPError("denied", response=response)
-
     def test_authentication_failure_is_actionable_and_does_not_change_identity(self):
         for explicit in (False, True):
             for status in (401, 403, 404, 500):
                 with self.subTest(explicit=explicit, status=status):
                     self.api.reset_mock()
-                    self.api.return_value.model_info.side_effect = (
-                        self.authentication_failure(status)
-                    )
+                    self.api.return_value.model_info.side_effect = http_error(status)
                     environment = {"HF_TOKEN": "test-explicit"} if explicit else {}
                     with (
                         mock.patch.dict(os.environ, environment, clear=True),
