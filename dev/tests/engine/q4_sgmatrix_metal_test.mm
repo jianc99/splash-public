@@ -5,6 +5,7 @@
 #include "ops/PagedAttention.hpp"
 #include "tuning/LinearNumerics.hpp"
 
+#include "LinearInputReference.hpp"
 #include "NormReference.hpp"
 
 #include <algorithm>
@@ -293,11 +294,6 @@ void splitVisibility(metal::MetalBackend &backend,
   }
   for (auto *guard : {&table, &sums, &partials, &counters}) guard->check();
 }
-// The kernel that prepares a plain bf16 input in `layout`, the reference for
-// the producers that write the table themselves.
-const char *prepareKernel(LinearInput layout) {
-  return layout == LinearInput::Table16 ? "decode_linear_gguf_prepare" : "decode_linear_q4_prepare";
-}
 // Rows of widely spread values and a norm's weights, bf16 or F32 as a GGUF
 // stores them; the F32 weights carry bits a bf16 rounding would drop.
 struct NormCase {
@@ -329,9 +325,11 @@ void fusedNorm(metal::MetalBackend &backend, uint32_t k, uint32_t rows, LinearIn
   auto a=backend.allocateBuffer(tableBytes(k,rows)), b=backend.allocateBuffer(tableBytes(k,rows));
   auto sa=backend.allocateBuffer(sumsBytes), sb=backend.allocateBuffer(sumsBytes);
   metal::CommandGraph graph;
-  Normalization::addRms(graph,c.input,c.weight,output,k,rows);
-  graph.add(prepareKernel(layout),{output,a,sa},k,{k/32,rows/8,1},{128,1,1});
-  Normalization::addRms(graph,c.input,c.weight,fused,k,rows,{b,sb,{},{}},layout);
+  require(Normalization::addRms(graph,c.input,c.weight,output,k,rows).layout==LinearInput::Plain,
+          "plain norm claimed a table");
+  addReferencePreparation(graph,layout,output,a,sa,k,rows/8);
+  const PreparedInput prepared=Normalization::addRms(graph,c.input,c.weight,fused,k,rows,{b,sb,{},{}},layout);
+  require(prepared.layout==layout && prepared.source.sameView(fused),"fused norm did not report the table it wrote");
   (void)backend.submitCommand(graph.dispatches());
   requireNorm(c,output,k,rows,"norm differs from the fp64 reference");
   require(!std::memcmp(output.contents(),fused.contents(),k*rows*2),"fused norm changed bf16 output");
@@ -367,12 +365,15 @@ void fusedAttentionGate(metal::MetalBackend &backend, uint32_t heads, uint32_t k
   Guarded a(backend, tableBytes(width, rows)), b(backend, tableBytes(width, rows));
   Guarded sa(backend, sumsBytes), sb(backend, sumsBytes);
   metal::CommandGraph graph;
-  PagedAttention::addVerifyGate(graph, packed, attention, output.view, 8, 32, 32,
-                                heads, {1, kvHeads, 256}, lanes);
-  graph.add(prepareKernel(layout), {output.view, a.view, sa.view}, width,
-            {width / 32, lanes, 1}, {128, 1, 1});
-  PagedAttention::addVerifyGate(graph, packed, attention, fused.view, 8, 32, 32,
-                                heads, {1, kvHeads, 256}, lanes, {b.view, sb.view, {}, {}}, layout);
+  require(PagedAttention::addVerifyGate(graph, packed, attention, output.view, 8, 32, 32,
+                                        heads, {1, kvHeads, 256}, lanes).layout == LinearInput::Plain,
+          "plain attention gate claimed a table");
+  addReferencePreparation(graph, layout, output.view, a.view, sa.view, width, lanes);
+  const PreparedInput prepared =
+      PagedAttention::addVerifyGate(graph, packed, attention, fused.view, 8, 32, 32,
+                                    heads, {1, kvHeads, 256}, lanes, {b.view, sb.view, {}, {}}, layout);
+  require(prepared.layout == layout && prepared.source.sameView(fused.view),
+          "fused attention gate did not report the table it wrote");
   (void)backend.submitCommand(graph.dispatches());
   require(!std::memcmp(output.view.contents(), fused.view.contents(), width * 16 * lanes),
           "fused attention gate output");

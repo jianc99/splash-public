@@ -12,6 +12,7 @@
 #include "ops/GDN.hpp"
 #include "tuning/LinearNumerics.hpp"
 
+#include "LinearInputReference.hpp"
 #include "NormReference.hpp"
 
 #import <Foundation/Foundation.h>
@@ -490,12 +491,14 @@ void runDecode(MetalBackend &backend, const GdnShape &shape, uint32_t lanes,
                bool float32) {
   Fixture fixture(backend, shape, lanes, float32);
   CommandGraph graph;
-  for (uint32_t layer = 0; layer < kLayers; ++layer)
-    GDN::addDecode(graph, fixture.decodeBuffers(layer), shape, lanes, layer,
-                   fixture.cell.strides());
-  static_cast<void>(backend.submitCommand(graph.dispatches()));
   const std::string where =
       "lanes " + std::to_string(lanes) + (float32 ? " f32 norm" : "");
+  for (uint32_t layer = 0; layer < kLayers; ++layer)
+    require(GDN::addDecode(graph, fixture.decodeBuffers(layer), shape, lanes,
+                           layer, fixture.cell.strides())
+                    .layout == LinearInput::Plain,
+            where + ": plain GDN claimed a table");
+  static_cast<void>(backend.submitCommand(graph.dispatches()));
   for (uint32_t lane = 0; lane < kMaxLanes; ++lane) {
     const auto *generation =
         static_cast<const uint32_t *>(fixture.generation.contents());
@@ -562,40 +565,77 @@ void runDecode(MetalBackend &backend, const GdnShape &shape, uint32_t lanes,
   }
 }
 
-// The kernel that prepares a plain bf16 input in `layout`, the reference for
-// the GDN kernels that write the table themselves.
-const char *prepareKernel(LinearInput layout) {
-  return layout == LinearInput::Table16 ? "decode_linear_gguf_prepare" : "decode_linear_q4_prepare";
+// The out-projection table a fused decode writes into its scratch and the one
+// the projection's own preparation writes from the decoded hidden rows.
+struct PreparedTables final {
+  LinearInput layout;
+  uint32_t width, lanes;
+  uint64_t tableSize, sumsSize;
+  MetalBuffer table, sums, referenceTable, referenceSums;
+
+  PreparedTables(MetalBackend &backend, LinearInput tableLayout, uint32_t hiddenWidth,
+                 uint32_t laneCount)
+      : layout(tableLayout), width(hiddenWidth), lanes(laneCount),
+        tableSize(tableBytes(width, lanes * kRows)),
+        sumsSize(tableSumsBytes(layout, width, lanes * kRows)),
+        table(backend.allocateBuffer(tableSize)), sums(backend.allocateBuffer(sumsSize)),
+        referenceTable(backend.allocateBuffer(tableSize)),
+        referenceSums(backend.allocateBuffer(sumsSize)) {}
+
+  LinearScratch scratch() const { return {table, sums, {}, {}}; }
+  void addReference(CommandGraph &graph, const MetalBuffer &hidden) const {
+    addReferencePreparation(graph, layout, hidden, referenceTable, referenceSums, width, lanes);
+  }
+  // The decode reported the table it wrote, and wrote the reference's bytes.
+  void requireWritten(const PreparedInput &reported, const MetalBuffer &hidden,
+                      const std::string &what) const {
+    require(reported.layout == layout && reported.source.sameView(hidden),
+            what + " did not report the table it wrote");
+    require(!std::memcmp(table.contents(), referenceTable.contents(), tableSize),
+            what + " table mismatch");
+    require(!std::memcmp(sums.contents(), referenceSums.contents(), sumsSize),
+            what + " sums mismatch");
+  }
+};
+
+std::string caseName(const char *test, const GdnShape &shape, uint32_t lanes, LinearInput layout) {
+  return std::string(test) + " vh" + std::to_string(shape.valueHeads) + " lanes " +
+         std::to_string(lanes) +
+         (layout == LinearInput::Plain     ? " plain"
+          : layout == LinearInput::Table64 ? " Table64"
+                                           : " Table16");
 }
 
 void fusedPreparation(MetalBackend &backend, const GdnShape &shape, uint32_t lanes, LinearInput layout,
                       bool float32) {
+  const std::string what = caseName("fused GDN", shape, lanes, layout);
   Fixture fixture(backend, shape, lanes, float32);
-  const uint32_t width = shape.valueHeads * shape.headDimension, rows = lanes * kRows;
-  const uint64_t tableSize = tableBytes(width, rows), sumsSize = tableSumsBytes(layout, width, rows);
-  auto table = backend.allocateBuffer(tableSize);
-  auto sums = backend.allocateBuffer(sumsSize);
-  auto referenceTable = backend.allocateBuffer(tableSize);
-  auto referenceSums = backend.allocateBuffer(sumsSize);
+  const PreparedTables tables(backend, layout, shape.valueHeads * shape.headDimension, lanes);
   CommandGraph reference;
-  GDN::addDecode(reference, fixture.decodeBuffers(0), shape, lanes, 0, fixture.cell.strides());
-  reference.add(prepareKernel(layout), {fixture.hidden, referenceTable, referenceSums},
-                width, {width / 32, lanes, 1}, {128, 1, 1});
+  // Without scratch the table cannot be written: GDN runs the plain kernel and says so.
+  require(GDN::addDecode(reference, fixture.decodeBuffers(0), shape, lanes, 0, fixture.cell.strides(),
+                         GdnHeadOrder::Grouped, layout).layout == LinearInput::Plain,
+          what + " without scratch claimed a table");
+  tables.addReference(reference, fixture.hidden);
   (void)backend.submitCommand(reference.dispatches());
-  std::vector<uint8_t> expected(width * 16 * lanes);
+  // The active lanes' bf16 hidden rows.
+  std::vector<uint8_t> expected(uint64_t{lanes} * kRows * tables.width * 2);
   std::memcpy(expected.data(), fixture.hidden.contents(), expected.size());
   fixture.clear();
   auto buffers = fixture.decodeBuffers(0);
-  buffers.linearScratch = {table, sums, {}, {}};
+  buffers.linearScratch = tables.scratch();
+  // A plain consumer gets no table from the scratch it shares.
+  CommandGraph unprepared;
+  require(GDN::addDecode(unprepared, buffers, shape, lanes, 0, fixture.cell.strides(),
+                         GdnHeadOrder::Grouped, LinearInput::Plain).layout == LinearInput::Plain,
+          what + " claimed a table for a plain consumer");
   CommandGraph fused;
-  GDN::addDecode(fused, buffers, shape, lanes, 0, fixture.cell.strides(), GdnHeadOrder::Grouped, layout);
+  const PreparedInput prepared =
+      GDN::addDecode(fused, buffers, shape, lanes, 0, fixture.cell.strides(), GdnHeadOrder::Grouped, layout);
   (void)backend.submitCommand(fused.dispatches());
   require(!std::memcmp(expected.data(), fixture.hidden.contents(), expected.size()),
-          "fused GDN changed output");
-  require(!std::memcmp(table.contents(), referenceTable.contents(), tableSize),
-          "fused GDN table mismatch");
-  require(!std::memcmp(sums.contents(), referenceSums.contents(), sumsSize),
-          "fused GDN sums mismatch");
+          what + " changed output");
+  tables.requireWritten(prepared, fixture.hidden, what);
   for (uint32_t lane=0;lane<lanes;++lane) checkDecode(fixture, 0, lane);
 }
 
@@ -609,8 +649,11 @@ void tiledHeadOrder(MetalBackend &backend, const GdnShape &shape, uint32_t lanes
   const uint32_t width = shape.valueHeads * shape.headDimension;
   const uint32_t headsPerKey = shape.valueHeads / shape.keyHeads;
   const uint64_t headBytes = uint64_t{shape.headDimension} * 2;
+  const std::string what = caseName("tiled GDN", shape, lanes, layout);
   CommandGraph grouped;
-  GDN::addDecode(grouped, fixture.decodeBuffers(0), shape, lanes, 0, fixture.cell.strides());
+  require(GDN::addDecode(grouped, fixture.decodeBuffers(0), shape, lanes, 0, fixture.cell.strides())
+                  .layout == LinearInput::Plain,
+          what + " grouped reference claimed a table");
   (void)backend.submitCommand(grouped.dispatches());
   const auto *hidden = static_cast<const uint8_t *>(fixture.hidden.contents());
   std::vector<uint8_t> expected(fixture.hidden.sizeBytes());
@@ -621,25 +664,17 @@ void tiledHeadOrder(MetalBackend &backend, const GdnShape &shape, uint32_t lanes
                   hidden + (row * shape.valueHeads + head) * headBytes, headBytes);
     }
   fixture.clear();
-  const uint32_t rows = lanes * kRows;
-  const uint64_t tableSize = tableBytes(width, rows), sumsSize = tableSumsBytes(layout, width, rows);
-  auto table = backend.allocateBuffer(tableSize);
-  auto sums = backend.allocateBuffer(sumsSize);
-  auto referenceTable = backend.allocateBuffer(tableSize);
-  auto referenceSums = backend.allocateBuffer(sumsSize);
+  const PreparedTables tables(backend, layout, width, lanes);
   auto buffers = fixture.decodeBuffers(0);
-  buffers.linearScratch = {table, sums, {}, {}};
+  buffers.linearScratch = tables.scratch();
   CommandGraph tiled;
-  GDN::addDecode(tiled, buffers, shape, lanes, 0, fixture.cell.strides(), GdnHeadOrder::Tiled, layout);
-  tiled.add(prepareKernel(layout), {fixture.hidden, referenceTable, referenceSums},
-            width, {width / 32, lanes, 1}, {128, 1, 1});
+  const PreparedInput prepared =
+      GDN::addDecode(tiled, buffers, shape, lanes, 0, fixture.cell.strides(), GdnHeadOrder::Tiled, layout);
+  tables.addReference(tiled, fixture.hidden);
   (void)backend.submitCommand(tiled.dispatches());
   require(!std::memcmp(expected.data(), hidden, expected.size()),
-          "tiled GDN output is not the grouped output in tiled head order");
-  require(!std::memcmp(table.contents(), referenceTable.contents(), tableSize),
-          "tiled GDN table mismatch");
-  require(!std::memcmp(sums.contents(), referenceSums.contents(), sumsSize),
-          "tiled GDN sums mismatch");
+          what + " output is not the grouped output in tiled head order");
+  tables.requireWritten(prepared, fixture.hidden, what);
 }
 
 void rejectsInvalid(MetalBackend &backend) {
