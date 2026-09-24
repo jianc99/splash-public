@@ -31,7 +31,11 @@ class Metadata:
 
     MAX_BYTES = 128 * 1024 * 1024
     MAX_ITEMS = 1_000_000
-    SCALARS = {
+    # GGUF value types (gguf_type): a string, an array of one other type, and
+    # the struct format of each scalar type.
+    STRING = 8
+    ARRAY = 9
+    SCALAR_FORMATS = {
         0: "B",
         1: "b",
         2: "H",
@@ -96,17 +100,20 @@ class Metadata:
         except UnicodeDecodeError as error:
             raise ModelError("invalid UTF-8 in GGUF metadata") from error
 
-    def value(self, kind):
-        if kind == 8:
+    def value(self, value_type):
+        if value_type == self.STRING:
             return self.string()
-        if kind == 9:
+        if value_type == self.ARRAY:
             element, count = self.scalar("I"), self.scalar("Q")
-            if element not in (*self.SCALARS, 8) or count > self.MAX_ITEMS:
+            if (
+                element not in (*self.SCALAR_FORMATS, self.STRING)
+                or count > self.MAX_ITEMS
+            ):
                 raise ModelError("unsupported or oversized GGUF metadata array")
             return [self.value(element) for _ in range(count)]
-        if kind not in self.SCALARS:
+        if value_type not in self.SCALAR_FORMATS:
             raise ModelError("unknown GGUF metadata type")
-        return self.scalar(self.SCALARS[kind])
+        return self.scalar(self.SCALAR_FORMATS[value_type])
 
     def require(self, key, kind):
         value = self.values.get(key)
@@ -127,6 +134,13 @@ QWEN35_PATTERN = (
     r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}"
     r"| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
 )
+# The GGUF token types (llama_token_type) a byte-level BPE vocabulary uses:
+# control tokens are special added tokens, user-defined ones added tokens
+# that are not special, and unused ones fill the vocabulary to its size.
+NORMAL_TOKEN = 1
+CONTROL_TOKEN = 3
+USER_DEFINED_TOKEN = 4
+UNUSED_TOKEN = 5
 
 
 def derived_files(target, vision=None):
@@ -163,7 +177,11 @@ def tokenizer_files(metadata):
         or not all(isinstance(t, str) and t for t in tokens)
         or len(set(tokens)) != len(tokens)
         or len(types) != len(tokens)
-        or any(type(t) is not int or t not in (1, 3, 4, 5) for t in types)
+        or any(
+            type(t) is not int
+            or t not in (NORMAL_TOKEN, CONTROL_TOKEN, USER_DEFINED_TOKEN, UNUSED_TOKEN)
+            for t in types
+        )
     ):
         raise ModelError("invalid or unsupported GGUF tokenizer vocabulary")
     if not set(pre_tokenizers.ByteLevel.alphabet()) <= set(tokens):
@@ -196,9 +214,9 @@ def tokenizer_files(metadata):
     )
     backend.decoder = decoders.ByteLevel()
     added = [
-        AddedToken(t, normalized=False, special=kind == 3)
+        AddedToken(t, normalized=False, special=kind == CONTROL_TOKEN)
         for t, kind in zip(tokens, types, strict=True)
-        if kind in (3, 4)
+        if kind in (CONTROL_TOKEN, USER_DEFINED_TOKEN)
     ]
     backend.add_tokens(added)
 
@@ -207,7 +225,7 @@ def tokenizer_files(metadata):
         if optional and key not in m.values:
             return None
         index = m.require(key, int)
-        if not 0 <= index < len(tokens) or types[index] != 3:
+        if not 0 <= index < len(tokens) or types[index] != CONTROL_TOKEN:
             raise ModelError("invalid GGUF special token: " + key)
         return tokens[index]
 
@@ -224,14 +242,14 @@ def tokenizer_files(metadata):
         "added_tokens_decoder": {
             str(i): {
                 "content": tokens[i],
-                "special": types[i] == 3,
+                "special": types[i] == CONTROL_TOKEN,
                 "normalized": False,
                 "single_word": False,
                 "lstrip": False,
                 "rstrip": False,
             }
             for i in range(len(tokens))
-            if types[i] in (3, 4)
+            if types[i] in (CONTROL_TOKEN, USER_DEFINED_TOKEN)
         },
     }
     return {

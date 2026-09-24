@@ -9,6 +9,12 @@ import struct
 WEIGHT_FILE_ALIGNMENT = 16384
 # The alignment of GGUF tensor data without a general.alignment key.
 GGUF_ALIGNMENT = 32
+# The GGUF value types (gguf_type) of the values write_gguf encodes.
+GGUF_TYPE_UINT32 = 4
+GGUF_TYPE_FLOAT32 = 6
+GGUF_TYPE_BOOL = 7
+GGUF_TYPE_STRING = 8
+GGUF_TYPE_ARRAY = 9
 
 
 def weight_file(magic, layer, kind, sections):
@@ -56,16 +62,16 @@ def _gguf_value(value):
     """The GGUF value type and encoding of a string, bool, int (uint32),
     float (float32) or list of one of them."""
     if isinstance(value, str):
-        return 8, _gguf_string(value)
+        return GGUF_TYPE_STRING, _gguf_string(value)
     if isinstance(value, bool):
-        return 7, struct.pack("<?", value)
+        return GGUF_TYPE_BOOL, struct.pack("<?", value)
     if isinstance(value, int):
-        return 4, struct.pack("<I", value)
+        return GGUF_TYPE_UINT32, struct.pack("<I", value)
     if isinstance(value, float):
-        return 6, struct.pack("<f", value)
+        return GGUF_TYPE_FLOAT32, struct.pack("<f", value)
     if isinstance(value, list):
-        kind = _gguf_value(value[0])[0] if value else 4
-        return 9, struct.pack("<IQ", kind, len(value)) + b"".join(
+        kind = _gguf_value(value[0])[0] if value else GGUF_TYPE_UINT32
+        return GGUF_TYPE_ARRAY, struct.pack("<IQ", kind, len(value)) + b"".join(
             _gguf_value(x)[1] for x in value
         )
     raise AssertionError(value)

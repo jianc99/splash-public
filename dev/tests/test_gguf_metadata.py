@@ -17,6 +17,10 @@ from install import assembly, families, gguf, hub, models, upstream
 
 GGUF_REPO = "unsloth/Qwen3.6-35B-A3B-GGUF"
 
+# The GGUF specification's token types (llama_token_type), stated
+# independently of the reader under test.
+NORMAL, UNKNOWN, CONTROL, USER_DEFINED, UNUSED, BYTE = 1, 2, 3, 4, 5, 6
+
 
 def write_gguf(path, values, tensors=()):
     """A GGUF header of the values and the tensors' (name, GGML type), each
@@ -28,11 +32,11 @@ def write_gguf(path, values, tensors=()):
 def fixture(*, native=False):
     tokens = sorted(pre_tokenizers.ByteLevel.alphabet())
     tokens += ["ab", "<|endoftext|>", "<|im_end|>", "<think>"]
-    types = [1] * 257 + [3, 3, 4]
+    types = [NORMAL] * 257 + [CONTROL, CONTROL, USER_DEFINED]
     if native:
         padding = 248320 - len(tokens)
         tokens += [f"[unused{i}]" for i in range(padding)]
-        types += [5] * padding
+        types += [UNUSED] * padding
     return {
         "general.architecture": "qwen35moe",
         "qwen35moe.embedding_length": 2048,
@@ -176,14 +180,22 @@ class GgufMetadataTests(unittest.TestCase):
         )
 
     def test_invalid_tokenizer_metadata_is_rejected(self):
+        types = fixture()["tokenizer.ggml.token_type"]
         for key, value in (
             ("tokenizer.ggml.pre", "unknown"),
             ("tokenizer.ggml.model", "llama"),
             ("tokenizer.ggml.tokens", ["a", "a"]),
-            ("tokenizer.ggml.token_type", [1]),
+            ("tokenizer.ggml.token_type", [NORMAL]),
+            # Token types outside the byte-level BPE profile.
+            ("tokenizer.ggml.token_type", types[:-1] + [UNKNOWN]),
+            ("tokenizer.ggml.token_type", types[:-1] + [BYTE]),
             ("tokenizer.ggml.merges", ["a"]),
             ("tokenizer.ggml.merges", ["a absent"]),
             ("tokenizer.ggml.eos_token_id", 99999),
+            # A special token must be a control token: not a normal token,
+            # not the user-defined <think>.
+            ("tokenizer.ggml.eos_token_id", 0),
+            ("tokenizer.ggml.eos_token_id", 259),
             ("tokenizer.ggml.add_bos_token", True),
             ("tokenizer.ggml.add_eos_token", True),
             ("tokenizer.chat_template", ""),
