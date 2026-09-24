@@ -7,7 +7,7 @@
 // half above eight rows; no phase here rounds them.
 #pragma clang fp reassociate(off)
 #include "metal/abi/Gguf.h"
-#include "metal/kernels/common/q4_sgmatrix.h"
+#include "metal/kernels/common/sgmatrix.h"
 
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 using namespace mpp::tensor_ops;
@@ -24,11 +24,11 @@ constant constexpr uint kSplits = 16;
 // One threadgroup: output columns [8 tg.x, 8 tg.x + 8) of rows [32 tg.y, 32 tg.y + 32). Simdgroup s accumulates
 // K part s of every fragment; simdgroup f then adds fragment f's parts in order, so a result depends neither on
 // the grid nor on the row count. Lane (fm, fn) holds x[row fm][k + fn, k + fn + 1] as A,
-// W[column fn, fn + 1][k + fm] as B and the destination [row fm][column fn, fn + 1] (q4sg::lane_map).
+// W[column fn, fn + 1][k + fm] as B and the destination [row fm][column fn, fn + 1] (sgmatrix::lane_map).
 template <typename T>
 inline void project(device const bfloat *input, device const float *weights, device T *output,
                     constant GgufFloatParams &p, uint2 tg, uint sg, uint lane, threadgroup float2 *parts) {
-  const q4sg::Lane l = q4sg::lane_map(lane);
+  const sgmatrix::Lane l = sgmatrix::lane_map(lane);
   const uint K = p.input_size, column = tg.x * 8 + l.fn, row0 = tg.y * kRows;
   const uint live = min(kRows, p.rows - row0);
   const uint steps = K / 8, first = sg * steps / kSplits, last = (sg + 1) * steps / kSplits;
@@ -47,7 +47,7 @@ inline void project(device const bfloat *input, device const float *weights, dev
       const float2 a = row < live
           ? float2(*reinterpret_cast<device const bfloat2 *>(input + ulong(row0 + row) * K + k + l.fn))
           : float2(0);
-      q4sg::mma_acc<float>(acc[f], a, b);
+      sgmatrix::mma_acc<float>(acc[f], a, b);
     }
   }
 #pragma unroll

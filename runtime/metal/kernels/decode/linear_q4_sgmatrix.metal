@@ -3,6 +3,7 @@
 // before the includes, so it also holds for their code compiled here.
 #pragma clang fp reassociate(off)
 #include "metal/kernels/common/q4_sgmatrix.h"
+#include "metal/kernels/common/sgmatrix.h"
 #include "metal/kernels/common/split_reduce.h"
 
 // Packed Q4 stays in its shipped StorageN=256 layout. Each simdgroup computes
@@ -37,7 +38,7 @@ __attribute__((always_inline)) inline void decode(device const bfloat *table, de
   }
   const uint first = tg.y * (groups / splits);
   const uint end = tg.y + 1 == splits ? groups : first + groups / splits;
-  const Lane l = lane_map(lane);
+  const sgmatrix::Lane l = sgmatrix::lane_map(lane);
   const uint fm = l.fm, fn = l.fn, c = fn / 2;
   const uint base = tg.x * tileN + sg * (gateUp ? 8 : 16);
   const uint tile = base / 256;
@@ -69,7 +70,7 @@ __attribute__((always_inline)) inline void decode(device const bfloat *table, de
         const uint word = j < 4 ? words[nf].x : words[nf].y;
         const uint pair = ((word >> (4 * (j & 3))) & 0x000F000Fu) | 0x43004300u;
         if (j < 2) dot[nf][j & 1] = float2(0);
-        mma_acc<bfloat>(dot[nf][j & 1], as_type<bfloat2>(pair), b);
+        sgmatrix::mma_acc<bfloat>(dot[nf][j & 1], as_type<bfloat2>(pair), b);
       }
     }
     const ulong prm0 = (ulong(tile) * groups + g) * 256 + col0;

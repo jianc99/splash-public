@@ -20,6 +20,7 @@
 #include "metal/kernels/common/gguf_tile.h"
 #include "metal/kernels/common/moe_expert_slab.h"
 #include "metal/kernels/common/quant_formats.h"
+#include "metal/kernels/common/sgmatrix.h"
 #include "metal/kernels/common/split_reduce.h"
 
 namespace gguf_sg {
@@ -114,7 +115,7 @@ inline void decode(device const bfloat *table, device const float *sums, device 
   const ulong tileSums = table16_sums_per_tile(K);
   const uint units = spans / S::UnitSpans;
   const uint u0 = tg.y * units / splits, u1 = (tg.y + 1) * units / splits;
-  const q4sg::Lane l = q4sg::lane_map(lane);
+  const sgmatrix::Lane l = sgmatrix::lane_map(lane);
   const uint fm = l.fm, fn = l.fn, c = fn / 2;
   const uint base = tg.x * GGUF_TILE_COLUMNS + sg * GGUF_REGISTER_COLUMNS, tile = base / QUANT_TILE_ROWS,
              col0 = base % QUANT_TILE_ROWS;
@@ -203,7 +204,7 @@ inline void decode(device const bfloat *table, device const float *sums, device 
               float2 dot = seed[h];
 #pragma unroll
               for (uint f = h * FG; f < (h + 1) * FG; ++f)
-                q4sg::mma_acc<bfloat>(dot, a[nf][f], reinterpret_cast<thread const bfloat2 *>(&bq)[f]);
+                sgmatrix::mma_acc<bfloat>(dot, a[nf][f], reinterpret_cast<thread const bfloat2 *>(&bq)[f]);
               if constexpr (S::HasMin) {
                 acc[r][nf] = fma(dot, cs[h][nf].x, acc[r][nf]);
                 acc[r][nf] = fma(sum, cs[h][nf].y, acc[r][nf]);
