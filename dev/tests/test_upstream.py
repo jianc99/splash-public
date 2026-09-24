@@ -455,6 +455,57 @@ class UpstreamTest(unittest.TestCase):
                 arguments(self.root, "someone/text-model", language_only=False)
             )
 
+    def test_a_single_checkpoint_file_is_searched_for_the_tower_by_header(self):
+        def checkpoint(tensors):
+            def build(root):
+                mlx_target(root, DENSE)
+                header = json.dumps(
+                    {
+                        t: {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]}
+                        for t in tensors
+                    }
+                    | {"__metadata__": {"format": "mlx"}}
+                ).encode()
+                (root / "model.safetensors").write_bytes(
+                    len(header).to_bytes(8, "little") + header + b"\0"
+                )
+                (root / "preprocessor_config.json").write_text(
+                    json.dumps(
+                        {
+                            "patch_size": 16,
+                            "temporal_patch_size": 2,
+                            "merge_size": 2,
+                            "image_mean": [0.5] * 3,
+                            "image_std": [0.5] * 3,
+                        }
+                    )
+                )
+
+            return build
+
+        hub = self.fake_hub()
+        hub.publish(
+            MODEL,
+            "b" * 40,
+            checkpoint(
+                ["vision_tower.patch_embed.weight", "language_model.lm_head.weight"]
+            ),
+        )
+        args = arguments(self.root, language_only=False)
+        self.assertTrue(self.prepare(args)[0])
+        installed = models.installed_root(args.models, MODEL)
+        self.assertEqual(
+            sorted(p.name for p in (installed / "vision").iterdir()),
+            ["config.json", "model.safetensors"],
+        )
+        hub.publish(
+            "someone/text", "c" * 40, checkpoint(["language_model.lm_head.weight"])
+        )
+        with self.assertRaisesRegex(models.ModelError, "no vision tower"):
+            self.prepare(arguments(self.root, "someone/text", language_only=False))
+        # Its header was read by range requests, not a download.
+        self.assertNotIn("someone/text/model.safetensors", hub.downloads)
+
     def test_unchanged_commit_starts_with_one_request_and_no_download(self):
         hub = self.fake_hub()
         args = arguments(self.root)

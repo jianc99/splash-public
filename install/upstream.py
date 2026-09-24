@@ -14,6 +14,7 @@ repository names play no part.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import shutil
 import tempfile
@@ -480,7 +481,12 @@ def _weight_files(repo, prefix=""):
             raise models.ModelError("invalid safetensors shard filename")
         names = {file for tensor, file in weights.items() if tensor.startswith(prefix)}
     elif "model.safetensors" in repo.files:
-        names = {"model.safetensors"}
+        # One file: its header says whether it holds such a tensor.
+        holds = not prefix or any(
+            tensor.startswith(prefix)
+            for tensor in _safetensors_tensors(repo, "model.safetensors")
+        )
+        names = {"model.safetensors"} if holds else set()
     else:
         raise models.ModelError("model has no safetensors checkpoint")
     if not all(
@@ -492,6 +498,23 @@ def _weight_files(repo, prefix=""):
     ):
         raise models.ModelError("checkpoint has missing or unsupported shards")
     return names
+
+
+def _safetensors_tensors(repo, name):
+    """The tensor names in a safetensors file's header: its length (8 bytes,
+    little-endian), then a JSON object, read on demand, without a download."""
+    with repo.open(name) as stream:
+        size = int.from_bytes(stream.read(8), "little")
+        # The native checkpoint reader's bound on one header.
+        if not 2 <= size <= 1 << 20:
+            raise models.ModelError(f"invalid safetensors header in {name}")
+        try:
+            header = json.loads(stream.read(size))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise models.ModelError(f"invalid safetensors header in {name}") from error
+    if not isinstance(header, dict):
+        raise models.ModelError(f"invalid safetensors header in {name}")
+    return set(header) - {"__metadata__"}
 
 
 def _draft_files(repo, family):
