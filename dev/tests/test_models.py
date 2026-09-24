@@ -80,7 +80,7 @@ class ModelArtifactTest(unittest.TestCase):
             self.packed_file(snapshot / name)
         tokenizer = snapshot / "tokenizer"
         tokenizer.mkdir()
-        for name in artifacts.TOKENIZER_FILES:
+        for name in artifacts.PACKAGE_TOKENIZER_FILES:
             (tokenizer / name).write_text(f"{name}\n")
         if schema == 4:
             (snapshot / "layout.json").write_text("{}\n")

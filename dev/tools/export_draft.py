@@ -39,7 +39,11 @@ def export(package, config_path, destination):
         if name.startswith("layer-"):
             with source.open("rb") as stream:
                 magic, layer, kind = struct.unpack("<8sII", stream.read(16))
-            if magic != b"MDFD0004" or layer != int(name[6:-4]) or kind != 0:
+            if (
+                magic != models.DRAFT_LAYER_MAGIC.encode()
+                or layer != int(name[6:-4])
+                or kind != 0
+            ):
                 raise models.ModelError("incompatible draft layout: " + name)
     destination.mkdir(parents=True, exist_ok=False)
     try:
@@ -48,7 +52,7 @@ def export(package, config_path, destination):
         # The package names the DFlash2 checkpoint its draft was converted from.
         source = manifest.get("upstream", {}).get("draft", {})
         config["splash"] = {
-            "format": "MDFD0004",
+            "format": models.DRAFT_LAYER_MAGIC,
             "source": {
                 "repo": source.get("repo_id"),
                 "revision": source.get("revision"),

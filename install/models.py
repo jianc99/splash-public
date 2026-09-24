@@ -30,7 +30,11 @@ MODELS = paths.MODELS
 ALIGNMENT = 16384
 HUB_ENDPOINT = "https://huggingface.co"
 MAX_MANIFEST_BYTES = 4 * 1024 * 1024
-TOKENIZER_FILES = {
+# The DFlash2 draft layout Splash loads: the magic that begins each draft
+# layer file, and the draft configuration's splash.format.
+DRAFT_LAYER_MAGIC = "MDFD0004"
+# The tokenizer/ files a legacy Splash package ships.
+PACKAGE_TOKENIZER_FILES = {
     "chat_template.jinja",
     "config.json",
     "tokenizer.json",
@@ -197,7 +201,7 @@ def validate_package_manifest(path: Path):
     expected_format = {
         "section_alignment_bytes": ALIGNMENT,
         "target_layer_magic": layout[1],
-        "draft_layer_magic": "MDFD0004",
+        "draft_layer_magic": DRAFT_LAYER_MAGIC,
         "vision_magic": "MDFV0001",
     }
     if any(
@@ -282,7 +286,7 @@ def validate_package_manifest(path: Path):
         "draft/model.bin",
         "vision/model.bin",
         *(f"draft/layer-{index}.bin" for index in range(draft_layers)),
-        *(f"tokenizer/{name}" for name in TOKENIZER_FILES),
+        *(f"tokenizer/{name}" for name in PACKAGE_TOKENIZER_FILES),
     }
     if format_name not in VARIANT_FORMATS:
         required_files.update(

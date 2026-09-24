@@ -33,7 +33,7 @@ HUB_TIMEOUT = 5
 
 # Splash's DFlash2 drafts share one repository, a folder per base model named
 # after it: config.json (the original DFlash2 configuration plus its "splash"
-# format and source), model.bin and layer-N.bin in the MDFD0004 layout.
+# format and source), model.bin and layer-N.bin (models.DRAFT_LAYER_MAGIC).
 DRAFTS = "incoai-internal/Splash-DFlash2"
 
 
@@ -83,6 +83,7 @@ FAMILIES = (
         Draft("b36f132a9c832599c6d08a1443cb8bbe4c2ac6cb", 6),
     ),
 )
+# The tokenizer files an MLX target may supply, linked when present.
 TOKENIZER_FILES = (
     "tokenizer.json",
     "tokenizer_config.json",
@@ -490,7 +491,7 @@ def _draft_files(repo, family):
         config.get("architectures") != ["DFlash2DraftModel"]
         or config.get("hidden_size") != hidden
         or config.get("num_hidden_layers") != family.draft.layers
-        or config.get("splash", {}).get("format") != "MDFD0004"
+        or config.get("splash", {}).get("format") != models.DRAFT_LAYER_MAGIC
     ):
         raise models.ModelError(
             "draft configuration is incompatible with " + family.name
