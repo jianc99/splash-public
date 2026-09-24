@@ -297,26 +297,42 @@ def prepare(args, repo=None):
     gguf = variant is not None or not any(
         name.endswith(".safetensors") for name in repo.files
     )
-    required = {"config.json", "tokenizer.json", "tokenizer_config.json"}
-    if not language_only:
-        required.add("preprocessor_config.json")
-    missing = required - repo.files
-    if missing:
-        raise models.ModelError(
-            f"target repository {repo_id} is missing: {', '.join(sorted(missing))}. "
-            "Configuration, tokenizer and processor must come from the target "
-            "repository; Splash does not download replacements from another repository."
-            + (
-                " Embedded GGUF tokenizer/configuration loading is not yet supported."
-                if gguf
-                else ""
-            )
-        )
-    # Cache the model card too, so renamed repositories can still resolve their
-    # declared base model without contacting the Hub on the next offline load.
+    # Cache the card so renamed repositories also resolve while offline.
     if "README.md" in repo.files:
         repo.file("README.md")
-    config = models.read_json(repo.file("config.json"))
+    files = {}
+    if gguf:
+        target_name = select_gguf(repo.files, variant)
+        vision_name = select_vision(repo.files) if not language_only else None
+        sources = repo.download(
+            {target_name} | ({vision_name} if vision_name else set())
+        )
+        files["target/" + Path(target_name).name] = sources[target_name]
+        vision_path = sources[vision_name] if vision_name else None
+        if vision_path:
+            files["vision/mmproj.gguf"] = vision_path
+        files.update(
+            _gguf_metadata(args.models.resolve(), sources[target_name], vision_path)
+        )
+    else:
+        required = {"config.json", "tokenizer.json", "tokenizer_config.json"}
+        if not language_only:
+            required.add("preprocessor_config.json")
+        missing = required - repo.files
+        if missing:
+            raise models.ModelError(
+                f"target repository {repo_id} is missing: {', '.join(sorted(missing))}. "
+                "Configuration, tokenizer and processor must come from the target repository."
+            )
+        files["config.json"] = repo.file("config.json")
+        for name in TOKENIZER_FILES:
+            if name in repo.files:
+                files["tokenizer/" + name] = repo.file(name)
+        if not language_only:
+            for name in PROCESSOR_FILES:
+                if name in repo.files:
+                    files["processor/" + name] = repo.file(name)
+    config = models.read_json(files["config.json"])
     validate_config(config, family)
     if not gguf:
         quant = config.get("quantization", config.get("quantization_config", {}))
@@ -329,40 +345,27 @@ def prepare(args, repo=None):
             raise models.ModelError(
                 "this model requires an MLX affine 4-bit/group-64 checkpoint or a supported GGUF"
             )
+    if not language_only:
+        _validate_processor(
+            models.read_json(files["processor/preprocessor_config.json"])
+        )
     draft = Repository(draft_override or family.draft_model)
     draft_names = _draft_files(draft, family)
-    target_names = {select_gguf(repo.files, variant)} if gguf else _weight_files(repo)
-    vision_name = select_vision(repo.files) if gguf and not language_only else None
-    if not language_only:
-        _validate_processor(models.read_json(repo.file("preprocessor_config.json")))
     print(
         f"Loading {args.model}; draft {draft.name}; vision {'disabled' if language_only else 'enabled'}.",
         flush=True,
     )
-    files = {}
-    for name, path in repo.download(
-        target_names | ({vision_name} if vision_name else set())
-    ).items():
-        files[
-            "vision/mmproj.gguf" if name == vision_name else "target/" + Path(name).name
-        ] = path
-    files["config.json"] = repo.file("config.json")
     if not gguf:
+        for name, path in repo.download(_weight_files(repo)).items():
+            files["target/" + name] = path
+            if not language_only:
+                files["vision/" + name] = path
         files["target/config.json"] = files["config.json"]
         if not language_only:
-            for name in target_names:
-                files["vision/" + name] = files["target/" + name]
             files["vision/config.json"] = files["config.json"]
-    for name in TOKENIZER_FILES:
-        if name in repo.files:
-            files["tokenizer/" + name] = repo.file(name)
     files["tokenizer/config.json"] = files["config.json"]
     for name, path in draft.download(draft_names).items():
         files["draft/" + Path(name).name] = path
-    if not language_only:
-        for name in PROCESSOR_FILES:
-            if name in repo.files:
-                files["processor/" + name] = repo.file(name)
     record = {
         "version": 1,
         "model": args.model,
@@ -394,6 +397,70 @@ def prepare(args, repo=None):
         verify(destination)
         models.install_snapshot(destination, root)
     return True
+
+
+def _gguf_metadata(models_root, target, vision):
+    if __package__:
+        from . import gguf
+    else:
+        import gguf
+    from importlib.metadata import version
+
+    source_paths = [target] + ([vision] if vision else [])
+    identity = {
+        "sources": [_file_record(path) for path in source_paths],
+        "adapter": models.sha256(Path(gguf.__file__)),
+        "tokenizers": version("tokenizers"),
+    }
+    key = hashlib.sha256(gguf.json_bytes(identity)).hexdigest()
+    cache = models_root / ".metadata"
+    destination = cache / key
+    names = {
+        "config.json",
+        "tokenizer/tokenizer.json",
+        "tokenizer/tokenizer_config.json",
+        "tokenizer/chat_template.jinja",
+    }
+    if vision:
+        names.add("processor/preprocessor_config.json")
+    if not destination.exists():
+        metadata = gguf.Metadata(target)
+        vision_metadata = gguf.Metadata(vision) if vision else None
+        contents = gguf.tokenizer_files(metadata)
+        contents["config.json"] = gguf.json_bytes(
+            gguf.model_config(metadata, vision_metadata)
+        )
+        if vision_metadata:
+            contents["processor/preprocessor_config.json"] = gguf.json_bytes(
+                gguf.processor_config(vision_metadata)
+            )
+        if [_file_record(path) for path in source_paths] != identity["sources"]:
+            raise models.ModelError("GGUF source changed while reading metadata")
+        cache.mkdir(parents=True, exist_ok=True)
+        stage = Path(tempfile.mkdtemp(prefix=".loading-", dir=cache))
+        try:
+            for name, data in contents.items():
+                path = stage / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(data)
+            hashes = {
+                name: hashlib.sha256(data).hexdigest()
+                for name, data in contents.items()
+            }
+            (stage / "files.json").write_bytes(gguf.json_bytes(hashes))
+            with models.installation_lock(models_root):
+                if not destination.exists():
+                    os.rename(stage, destination)
+        finally:
+            if stage.exists():
+                shutil.rmtree(stage)
+    hashes = models.read_json(destination / "files.json")
+    if set(hashes) != names:
+        raise models.ModelError("invalid prepared GGUF metadata record")
+    for name in names:
+        if models.sha256(destination / name) != hashes[name]:
+            raise models.ModelError("prepared GGUF metadata changed: " + name)
+    return {name: destination / name for name in names}
 
 
 def _file_record(path):

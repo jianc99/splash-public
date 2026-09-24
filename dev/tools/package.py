@@ -25,6 +25,7 @@ INSTALL_FILES = (
     "paths.py",
     "models.py",
     "upstream.py",
+    "gguf.py",
     "catalog.py",
     "requirements.txt",
 )

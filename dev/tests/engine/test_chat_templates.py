@@ -20,7 +20,7 @@ class ChatTemplateTests(unittest.TestCase):
         return tokenizer
 
     def test_default_and_named_templates_are_unchanged_for_ordinary_requests(self):
-        for name in ("qwen36", "qwen38"):
+        for name in ("qwen36", "qwen38", "qwen36_gguf", "qwen38_gguf"):
             tokenizer = self.tokenizer(name)
             original = tokenizer.chat_template
             for source in (original, {"default": original, "tool_use": original}):
@@ -36,7 +36,7 @@ class ChatTemplateTests(unittest.TestCase):
                 self.assertEqual(tokenizer.chat_template, source)
 
     def test_later_system_is_rendered_in_place_without_mutating_the_tokenizer(self):
-        for name in ("qwen36", "qwen38"):
+        for name in ("qwen36", "qwen38", "qwen36_gguf", "qwen38_gguf"):
             tokenizer = self.tokenizer(name)
             original = tokenizer.chat_template
             messages = [
@@ -48,8 +48,14 @@ class ChatTemplateTests(unittest.TestCase):
                 {"role": "user", "content": "Next question"},
             ]
             saved = copy.deepcopy(messages)
-            with self.assertRaises(TemplateError):
-                tokenizer.apply_chat_template(messages, tokenize=False)
+            if name == "qwen36_gguf":
+                self.assertNotIn(
+                    "New instructions",
+                    tokenizer.apply_chat_template(messages, tokenize=False),
+                )
+            else:
+                with self.assertRaises(TemplateError):
+                    tokenizer.apply_chat_template(messages, tokenize=False)
             override = compatible_chat_template(tokenizer, messages)
             rendered = tokenizer.apply_chat_template(
                 messages, chat_template=override, tokenize=False
