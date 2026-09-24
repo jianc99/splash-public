@@ -157,17 +157,21 @@ def select_vision(files):
 
 
 class Repository:
-    """One source at one commit: a local directory, or a Hub repository whose
-    revision is resolved once, at installation, to an immutable commit."""
+    """One source at one commit: a local draft directory, or a Hub repository
+    whose revision is resolved once, at installation, to an immutable commit."""
 
     def __init__(self, name, revision=None):
         from huggingface_hub import HfApi, snapshot_download
 
         self.name = str(name)
-        local = Path(name).expanduser()
-        self.local = local.is_dir()
+        # Only an absolute path is local: parse_draft_model makes a
+        # --draft-model directory absolute, and a target is always a Hub ID,
+        # whatever the working directory holds.
+        self.local = Path(self.name).is_absolute()
         if self.local:
-            self.root = local.resolve()
+            self.root = Path(self.name)
+            if not self.root.is_dir():
+                raise models.ModelError(f"local draft directory not found: {name}")
             self.revision = None
             self.files = {
                 p.relative_to(self.root).as_posix()

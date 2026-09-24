@@ -443,6 +443,25 @@ class UpstreamTest(unittest.TestCase):
             repo.download({"config.json"})
             self.assertEqual(snapshot.call_args.kwargs["revision"], info.sha)
 
+    def test_only_an_absolute_path_is_a_local_repository(self):
+        # A relative path in the working directory is still a Hub repository ID.
+        (self.root / "mlx-community/Qwen3.8-27B-4bit").mkdir(parents=True)
+        info = SimpleNamespace(sha="a" * 40, siblings=[])
+        with (
+            contextlib.chdir(self.root),
+            mock.patch("huggingface_hub.HfApi") as api,
+        ):
+            api.return_value.model_info.return_value = info
+            repo = upstream.Repository("mlx-community/Qwen3.8-27B-4bit", "branch")
+        api.return_value.model_info.assert_called_once_with(
+            "mlx-community/Qwen3.8-27B-4bit", revision="branch"
+        )
+        self.assertEqual((repo.local, repo.revision), (False, "a" * 40))
+        local = upstream.Repository(self.root / "mlx-community/Qwen3.8-27B-4bit")
+        self.assertEqual((local.local, local.revision), (True, None))
+        with self.assertRaisesRegex(models.ModelError, "draft directory not found"):
+            upstream.Repository(self.root / "deleted-draft")
+
     def test_unreachable_hub_uses_the_cache_or_explains_access(self):
         import httpx
         from huggingface_hub.errors import HfHubHTTPError
