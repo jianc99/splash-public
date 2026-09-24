@@ -8,6 +8,7 @@
 #pragma clang fp reassociate(off)
 #include "metal/abi/Gguf.h"
 #include "metal/kernels/common/gguf_staged.h"
+#include "metal/kernels/common/gguf_tile.h"
 #include "metal/kernels/common/moe_expert_slab.h"
 #include "metal/kernels/common/split_reduce.h"
 
@@ -15,8 +16,6 @@
 #include <metal_stdlib>
 using namespace metal;
 using namespace mpp::tensor_ops;
-enum Epilogue : ushort { EpNone = GGUF_EPILOGUE_NONE, EpResidual = GGUF_EPILOGUE_RESIDUAL, EpUpWithGate = GGUF_EPILOGUE_UP_WITH_GATE };
-inline float silu_gate(float g) { return g / (1.0f + fast::exp2(-1.44269504089f * g)); }
 
 // ---------------- decode tiles: each simdgroup stages its own Cols x KS sub-tile privately and runs matmul2d alone.
 // MPP computes 16-row fragments, so a tile holds 8, 16 or 32 rows: a 3-lane step runs the 32-row tile over the storage
@@ -132,7 +131,7 @@ inline void gguf_store_sums(thread Acc &acc, uint splits, uint split, device coh
 // rows. `rows` counts the chunk's rows from the tile's first: simdgroups past them (the last tile of a chunk that is not
 // a multiple of the tile) still stage but skip their matmuls and stores, so a chunk costs its rows rounded up to
 // RowsPerSG rather than to the tile (a 33-row Q4_K 17408 x 5120 chunk: 1.7x faster on M5 and M3 than a 128-row tile).
-template <class F, typename TA, ushort RowsPerSG, ushort Simdgroups, ushort TileN, ushort KS, ushort Prefetch, ushort Ep = EpNone>
+template <class F, typename TA, ushort RowsPerSG, ushort Simdgroups, ushort TileN, ushort KS, ushort Prefetch, GgufEpilogue Ep = EpNone>
 inline void pf_tile(device TA *input, device uchar *w0, device uchar *w1, device uchar *meta, device bfloat *output,
                     uint output_size, uint input_size, uint output_origin, uint rows, threadgroup half *stage,
                     threadgroup half2 *tl, uint simd_lane, uint simd_group, uint out_stride = 0, uint out_offset = 0,
@@ -206,10 +205,7 @@ inline void pf_tile(device TA *input, device uchar *w0, device uchar *w1, device
     if (!acc.is_valid_element(i)) continue;
     auto index = acc.get_multidimensional_index(i);
     const ulong o = (ulong(simd_group) * RowsPerSG + index[1]) * out_stride + out_offset + output_origin + index[0];
-    float v = acc[i];
-    if constexpr (Ep == EpResidual) v += float(aux[o]);
-    if constexpr (Ep == EpUpWithGate) v = float(bfloat(v)) * silu_gate(float(aux[o]));
-    output[o] = bfloat(v);
+    output[o] = gguf_epilogue<Ep>(acc[i], aux, o);
   }
 }
 
@@ -250,7 +246,7 @@ inline void gguf_accum_any(uint fmt, device TA *input, device uchar *w0, device 
 // threadgroup, every request lane in its tile, `splits` partitions of K (grid.y; kernels/common/split_reduce.h).
 // Gate/up runs as a gate pass (a) into the gate scratch and an up pass (g) whose epilogue applies silu(gate) to the bf16
 // up value, as the Apple9 register kernels do.
-template <class F, ushort Rows, ushort Ep>
+template <class F, ushort Rows, GgufEpilogue Ep>
 inline void gguf_decode_tile(device bfloat *input, device uchar *w0, device uchar *w1, device uchar *meta, device bfloat *output,
                              device coherent(device) float *partials, device atomic_uint *counters, device bfloat *aux,
                              constant GgufDecodeParams &p, uint2 group, uint simd_lane, uint simd_group,
@@ -263,9 +259,10 @@ inline void gguf_decode_tile(device bfloat *input, device uchar *w0, device ucha
                                           (group.y + 1) * per, acc);
   gguf_store_sums<Rows>(acc, p.splits, group.y, partials, counters + p.out_offset / 64 + group.x, p.out_stride, column0,
                         simd_group * 32 + simd_lane, arrival, [&](uint row, uint column, float v) {
+    // gguf_epilogue inline: calling it here reorders the lambda's captures.
     const ulong o = ulong(row) * p.out_stride + column0 + column;
     if constexpr (Ep == EpResidual) v += float(aux[o]);
-    if constexpr (Ep == EpUpWithGate) v = float(bfloat(v)) * silu_gate(float(aux[o]));
+    if constexpr (Ep == EpUpWithGate) v = float(bfloat(v)) * gguf_silu(float(aux[o]));
     output[o] = bfloat(v);
   });
 }
@@ -324,7 +321,7 @@ QUANT_FORMATS(PROD_SET)
 // routes (wikitext, chat, code; the three passes of a layer on a 16-core M5 Pro) 32-row tiles take 2.42-2.78 ms at
 // 512 rows and 6.70-6.83 ms at 2048 rows against 3.44-3.86 and 8.20-8.23 for 64-row tiles sharing one 64-column stage
 // over four 16-row simdgroups, and 1.29-1.71 ms against 1.59-2.60 for 8-row tiles at 128-256 rows.
-template <ushort Rows, ushort Ep>
+template <ushort Rows, GgufEpilogue Ep>
 inline void moe_gguf_expert_tile(device bfloat *input, device const MoeTileDescriptor *tiles, device const uint *tile_count,
                                  device uchar *w0, device uchar *w1, device uchar *meta, device uchar *sw0, device uchar *sw1,
                                  device uchar *smeta, device bfloat *output, device bfloat *aux,
@@ -345,8 +342,8 @@ inline void moe_gguf_expert_tile(device bfloat *input, device const MoeTileDescr
     gguf_accum_any<bfloat, R, 32, 32, 2, 1>(s.format, x, s.w0, s.w1, s.meta, p.input_size, origin, my, tl, simd_lane, 0,
                                             p.input_size / 32, acc);
     gguf_elements(acc, [&](uint row, uint column, float v) {
-      const ulong o = out + ulong(row) * p.output_size + origin + column;
-      if constexpr (Ep == EpUpWithGate) v = float(bfloat(v)) * silu_gate(float(aux[o]));
+      const ulong o = out + ulong(row) * p.output_size + origin + column;   // gguf_epilogue inline, as above
+      if constexpr (Ep == EpUpWithGate) v = float(bfloat(v)) * gguf_silu(float(aux[o]));
       output[o] = bfloat(v);
     });
   };

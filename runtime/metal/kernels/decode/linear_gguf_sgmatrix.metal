@@ -17,6 +17,7 @@
 #pragma clang fp reassociate(off)
 #include "metal/abi/Gguf.h"
 #include "metal/kernels/common/gguf_sgmatrix.h"
+#include "metal/kernels/common/gguf_tile.h"
 #include "metal/kernels/common/moe_expert_slab.h"
 #include "metal/kernels/common/quant_formats.h"
 #include "metal/kernels/common/split_reduce.h"
@@ -97,11 +98,9 @@ template <class F> inline Coef<F> coefficient(CoefSource<F> src, uint u, uint j)
   else return h ? k.s.y : k.s.x;
 }
 
-inline float silu(float g) { return g / (1.0f + fast::exp2(-1.44269504089f * g)); }
-
 // One threadgroup: 4 simdgroups x 16 columns = 64 columns of one segment,
 // L request lanes of eight rows, one K partition (tg.y) of `splits`.
-template <class F, uint L, uint Ep>
+template <class F, uint L, GgufEpilogue Ep>
 inline void decode(device const bfloat *table, device const float *sums, device uchar *w0,
                    device uchar *w1, device uchar *meta, device bfloat *out,
                    device coherent(device) float *partials, device atomic_uint *counters,
@@ -258,10 +257,7 @@ inline void decode(device const bfloat *table, device const float *sums, device 
 #pragma unroll
       for (uint i = 0; i < 2; ++i) {
         const ulong at = ulong(r * 8 + fn + i) * p.out_stride + column;
-        float v = acc[r][nf][i];
-        if (Ep == GGUF_EPILOGUE_RESIDUAL) v += float(aux[at]);
-        if (Ep == GGUF_EPILOGUE_UP_WITH_GATE) v = float(bfloat(v)) * silu(float(aux[at]));
-        out[at] = bfloat(v);
+        out[at] = gguf_epilogue<Ep>(acc[r][nf][i], aux, at);
       }
     }
 }
@@ -309,9 +305,9 @@ template <class F> inline void codebook_lut(threadgroup bfloat2 *lut, uint tid) 
                               lut, coefs, &arrival);                                                        \
   }
 #define GGUF_SG_EPILOGUES(F, f, L)                                                                            \
-  GGUF_SG_KERNEL(decode_linear_gguf_sg_##f##_l##L##_a, F, L, GGUF_EPILOGUE_NONE)                            \
-  GGUF_SG_KERNEL(decode_linear_gguf_sg_##f##_l##L##_r, F, L, GGUF_EPILOGUE_RESIDUAL)                        \
-  GGUF_SG_KERNEL(decode_linear_gguf_sg_##f##_l##L##_g, F, L, GGUF_EPILOGUE_UP_WITH_GATE)
+  GGUF_SG_KERNEL(decode_linear_gguf_sg_##f##_l##L##_a, F, L, EpNone)                                        \
+  GGUF_SG_KERNEL(decode_linear_gguf_sg_##f##_l##L##_r, F, L, EpResidual)                                    \
+  GGUF_SG_KERNEL(decode_linear_gguf_sg_##f##_l##L##_g, F, L, EpUpWithGate)
 #define GGUF_SG_FORMAT(F, f) \
   GGUF_SG_EPILOGUES(F, f, 1) GGUF_SG_EPILOGUES(F, f, 2) GGUF_SG_EPILOGUES(F, f, 3) GGUF_SG_EPILOGUES(F, f, 4)
 QUANT_FORMATS(GGUF_SG_FORMAT)
@@ -341,7 +337,7 @@ inline void gguf_sg_fused(device const bfloat *table, device const float *sums, 
   quant_format_switch(p.fmt[s], [&](auto format) {
     typedef decltype(format) F;
     codebook_lut<F>(lut, tid);
-    gguf_sg::decode<F, L, GGUF_EPILOGUE_NONE>(table, sums, w0, w1, meta, out, partials, counters, out, q, local,
+    gguf_sg::decode<F, L, EpNone>(table, sums, w0, w1, meta, out, partials, counters, out, q, local,
                                               tid, sg, lane, lut,
                                               reinterpret_cast<threadgroup gguf_sg::Coef<F> *>(coefs), &arrival);
   });
@@ -372,7 +368,7 @@ GGUF_SG_FUSED(4)
 // at run time: on the 40-core M3 Max one run-time-format kernel is within +1.6% of the per-format kernels
 // (time-sg at 23040x2048 Q4_K and 92160x512 Q5_K, one to four lanes). No K splits, so no partials or counters.
 // aux is the gate of the up pass. Grid (N / 64, tiles), 128 threads.
-template <uint Ep>
+template <GgufEpilogue Ep>
 inline void gguf_sg_expert(device const bfloat *table, device const float *sums, device const MoeTileDescriptor *tiles,
                            device const uint *tile_count, device uchar *w0, device uchar *w1, device uchar *meta,
                            device uchar *sw0, device uchar *sw1, device uchar *smeta, device bfloat *out,
@@ -407,6 +403,6 @@ inline void gguf_sg_expert(device const bfloat *table, device const float *sums,
     gguf_sg_expert<EP>(table, sums, tiles, tile_count, w0, w1, meta, sw0, sw1, smeta, out, aux, p, tg, tid, sg, lane, \
                        lut, coefs, &arrival);                                                                       \
   }
-GGUF_SG_EXPERT(moe_expert_gguf_sg, GGUF_EPILOGUE_NONE)
-GGUF_SG_EXPERT(moe_expert_gguf_sg_up, GGUF_EPILOGUE_UP_WITH_GATE)
+GGUF_SG_EXPERT(moe_expert_gguf_sg, EpNone)
+GGUF_SG_EXPERT(moe_expert_gguf_sg_up, EpUpWithGate)
 #undef GGUF_SG_EXPERT
