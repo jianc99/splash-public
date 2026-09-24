@@ -9,10 +9,11 @@
 //   meta   [N / T][G / meta_groups][T][meta_bytes]
 // A meta unit is one native block and holds its scale fields.
 //
-// Keep this file to what defines prepared bytes: its contents are hashed into
-// SPLASH_GGUF_PREPARATION_ID (dev/tools/weight_preparation_identity.py), so any
-// edit prepares every GGUF model again. dev/tests/test_gguf_metadata.py reads
-// the GGUF type of each kQuantFormats row with a regex on the row's leading
+// Its contents are hashed into SPLASH_GGUF_PREPARATION_ID
+// (dev/tools/weight_preparation_identity.py), so any edit prepares every GGUF
+// model again: it holds what defines prepared bytes, plus each format's kernel
+// name token, which the host reads. dev/tests/test_gguf_metadata.py reads the
+// GGUF type of each kQuantFormats row with a regex on the row's leading
 // number. The decode-only value tables are in metal/abi/QuantTables.h.
 //
 // Inside a group of 32 the elements are in lane-owned chunk order: chunk c
@@ -86,18 +87,6 @@ inline constexpr uint32_t quant_slot(uint32_t e) { return 8 * ((e >> 2) & 3) + 4
 // plane (blocks = meta units per row).
 inline constexpr uint64_t quant_tile_index(uint32_t row, uint32_t block, uint32_t blocks) {
   return (uint64_t(row / QUANT_TILE_ROWS) * blocks + block) * QUANT_TILE_ROWS + row % QUANT_TILE_ROWS;
-}
-
-// Bytes of `rows` rows of a plane with `units` units per row (groups of 32 in
-// plane0 and plane1, meta units in meta) of `unit_bytes` bytes each.
-inline constexpr uint64_t quant_plane_bytes(uint64_t rows, uint64_t units, uint32_t unit_bytes) {
-  return rows * units * unit_bytes;
-}
-// Bytes of one row of `input_size` inputs over all planes of a format.
-inline constexpr uint64_t quant_row_bytes(QuantFormat f, uint32_t input_size) {
-  const uint32_t groups = input_size / 32;
-  return quant_plane_bytes(1, groups, f.plane0_bytes + f.plane1_bytes) +
-         quant_plane_bytes(1, groups / f.meta_groups, f.meta_bytes);
 }
 
 #undef QUANT_CONSTANT

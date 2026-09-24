@@ -226,8 +226,10 @@ inline void quant_format_switch(uint format, Body body) {
   }
 }
 
-// The switch and QUANT_FORMATS name every format, the latter by its kQuantFormats name.
-static_assert(GGUF_FMT_COUNT == 8, "quant_format_switch and QUANT_FORMATS list every format");
+// QUANT_FORMATS lists every format, by its kQuantFormats name; the switch above names each one.
+#define QUANT_FORMAT_ONE(F, f) +1
+static_assert(0 QUANT_FORMATS(QUANT_FORMAT_ONE) == GGUF_FMT_COUNT, "QUANT_FORMATS lists every format");
+#undef QUANT_FORMAT_ONE
 template <uint N> constexpr bool quant_format_named(uint id, const constant char (&token)[N]) {
   for (uint i = 0; i < N; ++i)
     if (kQuantFormats[id].name[i] != token[i]) return false;
