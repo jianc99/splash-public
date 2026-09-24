@@ -50,16 +50,27 @@ float fp32(uint16_t value) {
   return std::bit_cast<float>(uint32_t{value} << 16);
 }
 
-// Expected policy across GPU families, core counts and workload tile counts.
-// expectedGroups restates the group distribution independently; expectedOneLane
-// mirrors the one-lane rule. The literal anchors below independently guard
-// selected policy boundaries and production shapes.
-struct ExpectedConfig final {
-  LinearTile tile;
-  uint32_t groups;
-  LinearSimdgroups simdgroups = LinearSimdgroups::Eight;
-  uint32_t splits = 1;
-};
+Linear gpu(uint32_t family, uint32_t cores) {
+  DeviceCapabilities device;
+  device.appleGpuFamily = family;
+  device.gpuCoreCount = cores;
+  return Linear(device);
+}
+
+// Throws naming the rule a plan broke and the plan.
+[[noreturn]] void broke(const char *rule, uint32_t family, uint32_t cores, LinearWorkload w) {
+  throw std::runtime_error(std::string(rule) + ": family " + std::to_string(family) + ", " +
+                           std::to_string(cores) + " cores, N " + std::to_string(w.matrix.outputSize) +
+                           ", K " + std::to_string(w.matrix.inputSize) + ", " + std::to_string(w.rows) +
+                           (w.phase == LinearPhase::Decode ? " decode" : " prefill") + " rows, epilogue " +
+                           std::to_string(unsigned(w.epilogue)));
+}
+
+// The affine policy across GPU families, core counts and workload tile counts,
+// stated independently of the operator: expectedGroups restates the group
+// distribution, expectedOneLane the one-lane rule, expectedDecode and
+// expectedPrefill the tile rules. The literal anchors below independently
+// guard selected policy boundaries and production shapes.
 
 // Tiles on the busiest core when `groups` threadgroups are placed round-robin
 // on `cores` and group g streams tiles g, g + groups, ...; the operator's
@@ -90,19 +101,19 @@ uint32_t expectedGroups(uint32_t tiles, uint32_t cores, GroupRule rule) {
 
 // Apple10 one-lane MPP rules: paired N256 from eight tiles per core.
 // Split-K is available for offline experiments but never selected by default.
-std::optional<ExpectedConfig> expectedOneLane(uint32_t cores,
-                                              LinearMatrix matrix, LinearEpilogue epilogue) {
+std::optional<LinearConfig> expectedOneLane(uint32_t cores,
+                                            LinearMatrix matrix, LinearEpilogue epilogue) {
   const uint32_t n = matrix.outputSize;
   const uint32_t tiles256 = n / 256;
   if (epilogue == LinearEpilogue::None && tiles256 >= 8 * cores)
-    return ExpectedConfig{LinearTile::Paired256,
-                          std::min(tiles256, 4 * cores),
-                          LinearSimdgroups::Four};
+    return LinearConfig{LinearTile::Paired256,
+                        std::min(tiles256, 4 * cores),
+                        LinearSimdgroups::Four};
   return std::nullopt;
 }
 
-ExpectedConfig expectedDecode(uint32_t family, uint32_t cores, LinearMatrix matrix,
-                              uint32_t lanes, LinearEpilogue epilogue) {
+LinearConfig expectedDecode(uint32_t family, uint32_t cores, LinearMatrix matrix,
+                            uint32_t lanes, LinearEpilogue epilogue) {
   if (family == 9 && !(lanes >= 3 && epilogue == LinearEpilogue::None &&
                       matrix.outputSize / 256 >= 2 * cores)) {
     const uint32_t columns = epilogue == LinearEpilogue::GateUp ? 32 : 64;
@@ -141,18 +152,21 @@ ExpectedConfig expectedDecode(uint32_t family, uint32_t cores, LinearMatrix matr
   return {LinearTile::N128, groups(tiles128, lanes == 2 ? m16 : n128)};
 }
 
-std::string expectedPipeline(const ExpectedConfig &expected, uint32_t lanes,
-                             LinearEpilogue epilogue) {
+// Apple10 and later, and Apple9 up to the measured 32-core device, prefill
+// with the four-simdgroup N128 tile; larger Apple9 GPUs keep the wide-tile
+// rule: N256 for the fused up projection and once the N256 grid holds eight
+// threadgroups per core.
+LinearConfig expectedPrefill(uint32_t family, uint32_t cores, LinearWorkload w) {
+  if (family >= 10 || cores <= 32) return {LinearTile::N128, 0, LinearSimdgroups::Four};
+  const uint64_t grid = uint64_t{(w.rows + 31) / 32} * (w.matrix.outputSize / 256);
+  return {w.epilogue == LinearEpilogue::UpWithGate || grid >= 8ULL * cores ? LinearTile::N256
+                                                                           : LinearTile::N128, 0};
+}
+
+std::string expectedPipeline(LinearConfig expected, uint32_t lanes, LinearEpilogue epilogue) {
   if (expected.tile == LinearTile::Simdgroup)
     return epilogue == LinearEpilogue::GateUp ? "decode_linear_q4_sg_gate_up" :
         epilogue == LinearEpilogue::Residual ? "decode_linear_q4_sg_residual" : "decode_linear_q4_sg";
-  if (expected.tile == LinearTile::Split32 || expected.tile == LinearTile::Split64) {
-    std::string name = expected.tile == LinearTile::Split32 ? "decode_linear_q4_n32_split4"
-                                                            : "decode_linear_q4_n64_split4";
-    if (epilogue == LinearEpilogue::GateUp) name += "_gate_up";
-    if (epilogue == LinearEpilogue::Residual) name += "_residual";
-    return name;
-  }
   if (expected.tile == LinearTile::Paired256) return "decode_linear_q4_n256_paired_sg4";
   if (epilogue == LinearEpilogue::GateUp)
     return lanes == 1 ? "decode_linear_q4_n256_gate_up" : lanes == 2 ? "decode_linear_q4_n256_gate_up_m16"
@@ -163,6 +177,79 @@ std::string expectedPipeline(const ExpectedConfig &expected, uint32_t lanes,
   if (lanes > 1) name += "_m" + std::to_string(lanes * 8);
   if (expected.simdgroups == LinearSimdgroups::Four) name += "_sg4";
   return name;
+}
+
+// The N256 gate/up tile runs three and four lanes as the gate projection and
+// then the up projection with the SiLU product.
+std::string expectedSecondPipeline(LinearConfig expected, uint32_t lanes, LinearEpilogue epilogue) {
+  if (epilogue != LinearEpilogue::GateUp || lanes < 3 || expected.tile == LinearTile::Simdgroup) return {};
+  return "decode_linear_q4_n256_up_silu_m" + std::to_string(lanes * 8);
+}
+
+std::string expectedPrefillPipeline(LinearConfig expected, LinearEpilogue epilogue) {
+  std::string name = expected.tile == LinearTile::N256 ? "prefill_linear_q4_n256" : "prefill_linear_q4_n128";
+  if (epilogue == LinearEpilogue::UpWithGate) name += "_up_silu_sums";
+  if (epilogue == LinearEpilogue::Residual) name += "_residual";
+  if (expected.simdgroups == LinearSimdgroups::Four) name += "_sg4";
+  return name;
+}
+
+// The simdgroup tile reads the Table64 activation table its producer writes
+// (tableBytes and tableSumsBytes) and, split over K, reduces two fp32 fragment
+// streams per partition, row and column with one completion counter per lane
+// and column tile; one partition binds one-element placeholders. Every other
+// affine tile reads the plain rows and binds no scratch.
+constexpr uint64_t kFragmentStreams = 2;
+LinearScratchSize expectedScratch(LinearConfig expected, LinearWorkload w, uint32_t tileColumns) {
+  if (expected.tile != LinearTile::Simdgroup) return {};
+  const auto [n, k] = w.matrix;
+  const uint64_t lanes = w.rows / 8;
+  const bool split = expected.splits > 1;
+  return {tableBytes(k, w.rows), tableSumsBytes(LinearInput::Table64, k, w.rows),
+          split ? expected.splits * kFragmentStreams * w.rows * n * sizeof(float) : sizeof(float),
+          split ? lanes * (n / tileColumns) * sizeof(uint32_t) : sizeof(uint32_t)};
+}
+
+bool sameScratch(LinearScratchSize a, LinearScratchSize b) {
+  return a.input == b.input && a.sums == b.sums && a.partials == b.partials && a.counters == b.counters;
+}
+
+// Every stated decode rule for the plan `linear` makes of `w`, on a GPU that
+// reports `reportedCores` (zero: unknown, planned as 32).
+void checkAffineDecode(const Linear &linear, uint32_t family, uint32_t reportedCores, LinearWorkload w) {
+  const uint32_t lanes = w.rows / 8;
+  const LinearPlan plan = linear.plan(w);
+  const LinearConfig expected = expectedDecode(family, reportedCores ? reportedCores : 32U, w.matrix, lanes, w.epilogue);
+  const auto rule = [&](bool holds, const char *name) { if (!holds) broke(name, family, reportedCores, w); };
+  rule(plan.configuration() == expected, "affine decode configuration differs from its stated rules");
+  rule(plan.threadsPerThreadgroup() == static_cast<uint32_t>(expected.simdgroups) * 32,
+       "affine decode scope differs from its configuration");
+  rule(plan.pipeline() == expectedPipeline(expected, lanes, w.epilogue),
+       "affine decode pipeline differs from its configuration");
+  rule(plan.secondPipeline() == expectedSecondPipeline(expected, lanes, w.epilogue),
+       "gate/up dispatch decomposition changed");
+  const bool simdgroup = expected.tile == LinearTile::Simdgroup;
+  const uint32_t columns = simdgroup ? (w.epilogue == LinearEpilogue::GateUp ? 32U : 64U)
+      : expected.tile == LinearTile::N256 || expected.tile == LinearTile::Paired256 ? 256U : 128U;
+  rule(plan.tileColumns() == columns && plan.partialSums() == (simdgroup ? expected.splits : 1U),
+       "affine decode tile geometry differs from its configuration");
+  rule(plan.input() == (simdgroup ? LinearInput::Table64 : LinearInput::Plain),
+       "affine decode input layout differs from its tile");
+  rule(sameScratch(plan.scratchSize(), expectedScratch(expected, w, columns)),
+       "affine decode scratch differs from its tile");
+}
+
+void checkAffinePrefill(const Linear &linear, uint32_t family, uint32_t reportedCores, LinearWorkload w) {
+  const LinearPlan plan = linear.plan(w);
+  const LinearConfig expected = expectedPrefill(family, reportedCores ? reportedCores : 32U, w);
+  const auto rule = [&](bool holds, const char *name) { if (!holds) broke(name, family, reportedCores, w); };
+  rule(plan.configuration() == expected, "affine prefill configuration differs from its stated rule");
+  rule(plan.threadsPerThreadgroup() == static_cast<uint32_t>(expected.simdgroups) * 32,
+       "affine prefill cooperative execution scope changed");
+  rule(plan.pipeline() == expectedPrefillPipeline(expected, w.epilogue) && plan.secondPipeline().empty(),
+       "affine prefill pipeline differs from its configuration");
+  rule(plan.input() == LinearInput::Plain && !plan.scratchSize().bytes(),
+       "affine prefill reads more than its plain rows");
 }
 
 struct ProductionShape final { LinearMatrix matrix; LinearEpilogue epilogue; };
@@ -190,6 +277,7 @@ constexpr std::array kProductionShapes{
     ProductionShape{{2048, 4096}, LinearEpilogue::None},
     ProductionShape{{6144, 2048}, LinearEpilogue::GateUp},
     ProductionShape{{2048, 6144}, LinearEpilogue::None},
+    ProductionShape{{2048, 6144}, LinearEpilogue::Residual},
     ProductionShape{{2048, 16384}, LinearEpilogue::None},
     ProductionShape{{256, 2048}, LinearEpilogue::None},
     ProductionShape{{5120, 4352}, LinearEpilogue::None},
@@ -199,10 +287,7 @@ constexpr std::array kProductionShapes{
 
 void narrowM24BoundaryPlans() {
   for (uint32_t cores : {16U, 20U}) {
-    DeviceCapabilities device;
-    device.appleGpuFamily = 10;
-    device.gpuCoreCount = cores;
-    Linear linear(device);
+    const Linear linear = gpu(10, cores);
     for (auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual}) {
       // Explicit values on both sides of the tile and K boundaries.
       for (auto [matrix, threads] : std::array<std::pair<LinearMatrix, uint32_t>, 4>{{
@@ -220,93 +305,21 @@ void narrowM24BoundaryPlans() {
 void baselinePlans() {
   for (const uint32_t family : {9U, 10U, 11U}) {
     for (const uint32_t reportedCores : {0U, 8U, 10U, 16U, 18U, 20U, 31U, 32U, 33U, 40U, 80U}) {
-      const uint32_t cores = reportedCores ? reportedCores : 32U;
-      DeviceCapabilities device;
-      device.appleGpuFamily = family;
-      device.gpuCoreCount = reportedCores;
-      Linear linear(device);
-      for (const auto &shape : kProductionShapes) {
-        for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
-          const LinearWorkload workload{shape.matrix, lanes * 8, LinearPhase::Decode, shape.epilogue};
-          const auto plan = linear.plan(workload);
-          const auto expected = expectedDecode(family, cores, shape.matrix, lanes, shape.epilogue);
-          require(plan.configuration() ==
-                      LinearConfig{expected.tile, expected.groups, expected.simdgroups, expected.splits},
-                  "Linear one-lane policy differs from its stated rules");
-          require(plan.threadsPerThreadgroup() ==
-                      (expected.simdgroups == LinearSimdgroups::Four ? 128U : 256U),
-                  "Linear one-lane scope differs from its configuration");
-          require(plan.pipeline() == expectedPipeline(expected, lanes, shape.epilogue),
-                  "Linear one-lane pipeline differs from its configuration");
-          const bool split = expected.tile == LinearTile::Split32 ||
-              expected.tile == LinearTile::Split64;
-          require(plan.partialSums() == (expected.tile == LinearTile::Simdgroup ? expected.splits : split ? 4U : 1U) &&
-                      plan.tileColumns() == (expected.tile == LinearTile::Simdgroup ? (shape.epilogue == LinearEpilogue::GateUp ? 32U : 64U) : expected.tile == LinearTile::Split32 ? 32U
-                          : expected.tile == LinearTile::Split64 ? 64U
-                          : expected.tile == LinearTile::N256 ||
-                            expected.tile == LinearTile::Paired256 ? 256U : 128U) &&
-                      (!split || plan.configuration().groups ==
-                           shape.matrix.outputSize / plan.tileColumns()),
-                  "Linear one-lane tile geometry differs from its configuration");
-        }
-      }
+      const Linear linear = gpu(family, reportedCores);
+      for (const auto &shape : kProductionShapes)
+        for (uint32_t lanes = 1; lanes <= 4; ++lanes)
+          checkAffineDecode(linear, family, reportedCores,
+                            {shape.matrix, lanes * 8, LinearPhase::Decode, shape.epilogue});
       for (const uint32_t hidden : {5120U, 2048U}) {
         const bool large = hidden == 5120;
         const uint32_t intermediate = large ? 17408U : 6144U;
-        struct Call final { LinearMatrix matrix; LinearEpilogue epilogue; };
-        const std::array calls{
-            Call{{large ? 16640U : 12544U, hidden}, LinearEpilogue::None},
-            Call{{large ? 14336U : 9216U, hidden}, LinearEpilogue::None},
-            Call{{hidden, large ? 6144U : 4096U}, LinearEpilogue::Residual},
-            Call{{intermediate, hidden}, LinearEpilogue::GateUp},
-            Call{{hidden, intermediate}, LinearEpilogue::Residual},
-            Call{{hidden, intermediate}, LinearEpilogue::None},
-            Call{{hidden, large ? 25600U : 16384U}, LinearEpilogue::None},
-            Call{{248320, hidden}, LinearEpilogue::None},
-            Call{{hidden / 4, hidden}, LinearEpilogue::None},
-            Call{{6144, hidden}, LinearEpilogue::None},
-            Call{{256, hidden}, LinearEpilogue::None}};
-        for (const auto &call : calls) {
-          for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
-            const auto plan = linear.plan({call.matrix, lanes * 8, LinearPhase::Decode, call.epilogue});
-            const auto expected = expectedDecode(family, cores, call.matrix, lanes, call.epilogue);
-            require(plan.configuration() ==
-                        LinearConfig{expected.tile, expected.groups, expected.simdgroups, expected.splits},
-                    "Linear decode policy differs from its stated rules");
-            require(plan.threadsPerThreadgroup() ==
-                        (expected.simdgroups == LinearSimdgroups::Four ? 128U : 256U),
-                    "Linear decode scope differs from its configuration");
-            require(plan.pipeline() == expectedPipeline(expected, lanes, call.epilogue),
-                    "Linear decode pipeline differs from its configuration");
-            require(plan.secondPipeline().empty() ==
-                        !(call.epilogue == LinearEpilogue::GateUp && lanes >= 3 && !plan.usesSimdgroup()),
-                    "gate/up dispatch decomposition changed");
-          }
-        }
         for (const LinearMatrix matrix :
              {LinearMatrix{6144, hidden}, LinearMatrix{large ? 16640U : 12544U, hidden},
-              LinearMatrix{hidden, large ? 6144U : 4096U}, LinearMatrix{intermediate, hidden}}) {
-          for (const uint32_t rows : {1U, 7U, 31U, 32U, 33U, 127U, 2048U}) {
+              LinearMatrix{hidden, large ? 6144U : 4096U}, LinearMatrix{intermediate, hidden}})
+          for (const uint32_t rows : {1U, 7U, 31U, 32U, 33U, 127U, 2048U})
             for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual,
-                                       LinearEpilogue::UpWithGate}) {
-              const auto plan = linear.plan({matrix, rows, LinearPhase::Prefill, epilogue});
-              const double rowTiles = (rows + 31) / 32;
-              const bool wide = rowTiles * (matrix.outputSize / 256) >= 8.0 * cores;
-              // Apple10 everywhere, and Apple9 up to the measured 32-core
-              // device, prefill with the four-simdgroup N128 tile; larger
-              // Apple9 GPUs keep the wide-tile rule.
-              const LinearConfig expected = family >= 10 || cores <= 32
-                  ? LinearConfig{LinearTile::N128, 0, LinearSimdgroups::Four}
-                  : LinearConfig{epilogue == LinearEpilogue::UpWithGate || wide
-                                     ? LinearTile::N256 : LinearTile::N128, 0};
-              require(plan.configuration() == expected,
-                      "prefill policy differs from its stated rule");
-              require(plan.threadsPerThreadgroup() ==
-                          (family >= 10 || cores <= 32 ? 128U : 256U),
-                      "prefill cooperative execution scope changed");
-            }
-          }
-        }
+                                       LinearEpilogue::UpWithGate})
+              checkAffinePrefill(linear, family, reportedCores, {matrix, rows, LinearPhase::Prefill, epilogue});
       }
     }
   }
@@ -314,10 +327,7 @@ void baselinePlans() {
   // and a 40-core Apple9 GPU (M3 Max). Changing a rule must change these
   // knowingly.
   const auto configured = [](uint32_t family, uint32_t cores, LinearWorkload workload) {
-    DeviceCapabilities device;
-    device.appleGpuFamily = family;
-    device.gpuCoreCount = cores;
-    return Linear(device).plan(workload).configuration();
+    return gpu(family, cores).plan(workload).configuration();
   };
   const LinearWorkload gateUp{{17408, 5120}, 8, LinearPhase::Decode, LinearEpilogue::GateUp};
   require(configured(10, 16, gateUp) == LinearConfig{LinearTile::N256, 36} &&
@@ -436,10 +446,7 @@ void baselinePlans() {
 // `widestCandidates` accumulates the largest candidate set seen, so main() can
 // check that the bound below is reached and not merely respected.
 void planContracts(uint32_t family, uint32_t cores, size_t &widestCandidates) {
-  DeviceCapabilities device;
-  device.appleGpuFamily = family;
-  device.gpuCoreCount = cores;
-  Linear linear(device);
+  Linear linear = gpu(family, cores);
   // Include a wide Apple9 projection with four distinct persistent grids,
   // both paired N256 grids and all four K splits to reach the candidate bound.
   for (const LinearMatrix matrix : {LinearMatrix{512, 256}, LinearMatrix{768, 768},
@@ -582,8 +589,6 @@ void planContracts(uint32_t family, uint32_t cores, size_t &widestCandidates) {
   const LinearWorkload splitResidual{{512, 1024}, 8, LinearPhase::Decode, LinearEpilogue::Residual};
   const LinearWorkload splitGateUp{{512, 1024}, 8, LinearPhase::Decode, LinearEpilogue::GateUp};
   const LinearConfig matrixTile{LinearTile::Simdgroup, 8, LinearSimdgroups::Four, 4};
-  require(Linear::plan(splitWorkload, matrixTile).scratchSize().partials == 4ULL * 64 * 512,
-          "simdgroup partial workspace does not cover both fragment streams");
   for (const uint32_t splits : {0U, 3U, 16U}) {
     auto invalid = matrixTile;
     invalid.splits = splits;
@@ -591,11 +596,11 @@ void planContracts(uint32_t family, uint32_t cores, size_t &widestCandidates) {
   }
   rejects([&] { (void)Linear::plan({{512, 768}, 8},
       {LinearTile::Simdgroup, 8, LinearSimdgroups::Four, 8}); });
-  for (uint32_t rows : {8U,16U,24U,32U}) {
-    const auto size = Linear::plan({{512,1024},rows}, matrixTile).scratchSize();
-    require(size.input == uint64_t(rows)*1024*2 && size.sums == uint64_t(rows)*16*4 &&
-                size.partials == uint64_t(rows)*512*2*4*4 && size.counters == uint64_t(rows/8)*8*4,
-            "matrix row tiles must own disjoint input, sums, partials and counters");
+  for (uint32_t rows : {8U, 16U, 24U, 32U}) {
+    const LinearWorkload workload{{512, 1024}, rows};
+    const LinearPlan plan = Linear::plan(workload, matrixTile);
+    require(sameScratch(plan.scratchSize(), expectedScratch(matrixTile, workload, plan.tileColumns())),
+            "matrix row tiles must own disjoint input, sums, both fragment streams' partials and counters");
   }
   rejects([&] { (void)Linear::plan(splitWorkload,
       {LinearTile::Simdgroup, 4, LinearSimdgroups::Four, 4}); });
@@ -701,58 +706,25 @@ void planContracts(uint32_t family, uint32_t cores, size_t &widestCandidates) {
           "clearing choices did not restore the shipped execution scope");
 }
 
-// Exercise continuous core counts, not just measured SKU anchors. These
-// contracts check legal grids, bounded candidates and override workspace;
-// they do not claim performance on simulated hardware.
-// Every affine plan (configuration, pipelines, input layout and scratch) for
-// families 9-11, core counts 0-128 and a grid of shapes covering the rule
-// boundaries, hashed. The expected value was recorded from the policy before
-// GGUF projections joined LinearPlan; affine planning must not move. Run with
-// LINEAR_POLICY_HASH=print to see the current value.
-void affinePolicyIdentity() {
-  constexpr uint64_t kExpected = 0xcb12687a116bc240ULL;  // 893970 plans
-  uint64_t hash = 1469598103934665603ULL;
-  const auto mix = [&](const void *data, size_t bytes) {
-    const auto *p = static_cast<const unsigned char *>(data);
-    for (size_t i = 0; i < bytes; ++i) hash = (hash ^ p[i]) * 1099511628211ULL;
-  };
-  const auto mixValue = [&](uint64_t value) { mix(&value, sizeof value); };
-  const auto mixText = [&](std::string_view text) { mixValue(text.size()); mix(text.data(), text.size()); };
-  uint64_t plans = 0;
+// Every affine plan for families 9-11, reported core counts 0-128 and a grid
+// of shapes covering the rule boundaries follows the stated rules: its
+// configuration, execution scope, pipelines, tile geometry, input layout and
+// scratch. A policy change fails here with the rule and the plan it changed.
+void affinePolicyLaws() {
   for (const uint32_t family : {9U, 10U, 11U})
     for (uint32_t cores = 0; cores <= 128; ++cores) {
-      DeviceCapabilities device;
-      device.appleGpuFamily = family;
-      device.gpuCoreCount = cores;
-      const Linear linear(device);
+      const Linear linear = gpu(family, cores);
       for (const uint32_t n : {256U, 512U, 1024U, 2048U, 4096U, 5120U, 6144U, 9216U, 10240U,
                                12544U, 14336U, 16640U, 17408U, 248320U})
         for (const uint32_t k : {2048U, 4096U, 5120U, 6144U, 17408U}) {
-          const auto record = [&](LinearWorkload w) {
-            const LinearPlan plan = linear.plan(w);
-            const LinearConfig c = plan.configuration();
-            const LinearScratchSize scratch = plan.scratchSize();
-            for (const uint64_t v : {uint64_t{family}, uint64_t{cores}, uint64_t{n}, uint64_t{k},
-                                     uint64_t{w.rows}, uint64_t(w.phase), uint64_t(w.epilogue),
-                                     uint64_t(c.tile), uint64_t{c.groups}, uint64_t(c.simdgroups),
-                                     uint64_t{c.splits}, uint64_t(plan.input()), scratch.input,
-                                     scratch.sums, scratch.partials, scratch.counters})
-              mixValue(v);
-            mixText(plan.pipeline());
-            mixText(plan.secondPipeline());
-            ++plans;
-          };
           for (uint32_t lanes = 1; lanes <= 4; ++lanes)
             for (const auto e : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::GateUp})
-              record({{n, k}, lanes * 8, LinearPhase::Decode, e});
+              checkAffineDecode(linear, family, cores, {{n, k}, lanes * 8, LinearPhase::Decode, e});
           for (const uint32_t rows : {1U, 8U, 32U, 33U, 128U, 512U, 2048U})
             for (const auto e : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::UpWithGate})
-              record({{n, k}, rows, LinearPhase::Prefill, e});
+              checkAffinePrefill(linear, family, cores, {{n, k}, rows, LinearPhase::Prefill, e});
         }
     }
-  if (const char *mode = std::getenv("LINEAR_POLICY_HASH"); mode && std::string_view(mode) == "print")
-    std::cout << "affine policy hash " << plans << " plans 0x" << std::hex << hash << std::dec << '\n';
-  require(hash == kExpected, "affine Linear policy changed (LINEAR_POLICY_HASH=print shows the new hash)");
 }
 
 // GGUF projections plan with their segments: the staged split policy for
@@ -1051,15 +1023,15 @@ void ggufCoreLaws() {
     }
 }
 
+// Exercise continuous core counts, not just measured SKU anchors. These
+// contracts check legal grids, bounded candidates and override workspace;
+// they do not claim performance on simulated hardware.
 void scalingContracts() {
   for (uint32_t family : {9U, 10U, 11U}) {
     for (uint32_t index = 0; index <= 129; ++index) {
       const uint32_t reported = index == 129 ? 4096 : index;
       const uint32_t cores = reported ? reported : 32U;
-      DeviceCapabilities device;
-      device.appleGpuFamily = family;
-      device.gpuCoreCount = reported;
-      Linear linear(device);
+      Linear linear = gpu(family, reported);
       for (uint32_t n : {256U, 5120U, 131072U}) {
         for (uint32_t k : {256U, 768U, 1024U, 4096U, 5120U, 17408U}) {
           for (uint32_t rows : {8U, 16U, 24U, 32U}) {
@@ -1550,7 +1522,7 @@ int main(int argc, char **argv) {
   try {
     require(argc == 2, "usage: linear-plan <production.metallib|--cpu>");
     baselinePlans();
-    affinePolicyIdentity();
+    affinePolicyLaws();
     ggufPlans();
     ggufCoreLaws();
     narrowM24BoundaryPlans();
