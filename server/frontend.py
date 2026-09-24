@@ -26,7 +26,13 @@ if __package__:
         template_messages,
     )
     from .backend import REQUEST_PRIORITIES, Job, remaining_request_time
-    from .chat_templates import compatible_chat_template
+    from .chat_templates import (
+        LATER_SYSTEM_UNSUPPORTED,
+        UNSUPPORTED,
+        ChatTemplates,
+        has_later_system,
+        template_options,
+    )
     from .diagnostics import print_status
     from .errors import APIError, ContextLengthError
     from .latency import LatencyMetrics
@@ -54,7 +60,13 @@ else:
         template_messages,
     )
     from backend import REQUEST_PRIORITIES, Job, remaining_request_time
-    from chat_templates import compatible_chat_template
+    from chat_templates import (
+        LATER_SYSTEM_UNSUPPORTED,
+        UNSUPPORTED,
+        ChatTemplates,
+        has_later_system,
+        template_options,
+    )
     from diagnostics import print_status
     from errors import APIError, ContextLengthError
     from latency import LatencyMetrics
@@ -236,6 +248,8 @@ class Frontend:
         self.vision = vision
         self.latencies = LatencyMetrics()
         self.tokenizer = tokenizer
+        # Probed once; requests choose among these, never the tokenizer's own.
+        self.chat_templates = ChatTemplates(tokenizer)
         self.prompt_tokenizer = PromptTokenizer(tokenizer)
         self.backend = backend
         self.model = model
@@ -281,6 +295,7 @@ class Frontend:
         status = self.backend.status()
         status["vision"] = self.vision
         status["input_modalities"] = self.input_modalities
+        status["chat_template"] = self.chat_templates.status()
         with self.preparation_lock:
             status["frontend"] = {
                 "preparation_capacity": self.preparation_capacity,
@@ -360,15 +375,14 @@ class Frontend:
         each real image to its placeholder even when a coding agent has read
         documentation or source containing literal vision tokens.
         """
-        source = template.get("chat_template") or self.tokenizer.get_chat_template(
-            tools=template.get("tools")
-        )
         rendered = self._apply_chat_template(
             messages,
             {
                 **template,
                 "tokenize": False,
-                "chat_template": source.replace(IMAGE_PAD_TOKEN, IMAGE_RENDER_MARKER),
+                "chat_template": template["chat_template"].replace(
+                    IMAGE_PAD_TOKEN, IMAGE_RENDER_MARKER
+                ),
             },
         )
         parts = rendered.split(IMAGE_RENDER_MARKER)
@@ -757,19 +771,22 @@ class Frontend:
     def _render_prompt(
         self, prompt, deadline, *, check_context=True, add_generation_prompt=True
     ):
+        chat_template = self.chat_templates.select(prompt.tools)
+        if chat_template.later_system == UNSUPPORTED and has_later_system(
+            prompt.messages
+        ):
+            raise APIError(400, LATER_SYSTEM_UNSUPPORTED)
         template = {
             "tokenize": False,
             "return_dict": False,
-            "add_generation_prompt": add_generation_prompt,
+            "chat_template": chat_template.source,
+            **template_options(
+                reasoning_effort=prompt.reasoning_effort,
+                preserve_thinking=prompt.preserve_thinking,
+                tools=prompt.tools,
+                add_generation_prompt=add_generation_prompt,
+            ),
         }
-        if prompt.reasoning_effort is not None:
-            template["enable_thinking"] = prompt.reasoning_effort != "none"
-            if prompt.reasoning_effort != "none":
-                template["reasoning_effort"] = prompt.reasoning_effort
-        if prompt.preserve_thinking is not None:
-            template["preserve_thinking"] = prompt.preserve_thinking
-        if prompt.tools:
-            template["tools"] = prompt.tools
         with self.latencies.measure("images"):
             images = self._prepare_images(prompt.messages, check_context=check_context)
         remaining_request_time(deadline)
@@ -777,11 +794,6 @@ class Frontend:
             raise APIError(400, "the tokenizer does not define the image pad token")
         positions = []
         try:
-            override = compatible_chat_template(
-                self.tokenizer, prompt.messages, tools=template.get("tools")
-            )
-            if override is not None:
-                template["chat_template"] = override
             if images:
                 tokens, positions, rendered = self._render_image_tokens(
                     prompt.messages, template

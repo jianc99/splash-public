@@ -232,15 +232,29 @@ another Hub repository with the same layout.
 
 ### Upstream tokenizer and chat templates
 
-The server uses the upstream chat template. For a non-initial system message,
-`server/chat_templates.py` recognizes two verified Qwen template fingerprints and
-replaces only their system-position rejection in a cached, in-memory override.
-Message order, tokenizer data and upstream files stay unchanged. Ordinary
-requests use the original template; unknown templates retain their own behavior.
-Existing Splash templates already accepting later system messages need no patch.
-Text, image rendering and token counting share this selection path. This supports
-agent clients introducing instructions during a conversation without moving those
-instructions to the beginning or discarding them. It does not add model support.
+The server uses the upstream tokenizer and chat template. Request preparation
+merges the leading system and developer messages into one system message, joined
+by a blank line: Responses instructions and developer items, or an Anthropic
+`system` and a leading system message. A system message after that, as agent
+clients send when they change instructions during a conversation, renders where
+it occurs as a system turn in the template's own markup.
+
+`server/chat_templates.py` probes each of the tokenizer's templates, including
+each named variant such as `tool_use`, once at startup: it renders a canary
+conversation whose later system message carries a marker. A template that renders
+it in place is used unchanged (`native`). The official Qwen templates raise for
+it, and Unsloth's Qwen3.6 GGUF template skips it. Such a template is patched at
+the construct responsible, found by parsing its tags: the `raise_exception` in
+the message loop's system branch, or the loop condition that excludes system
+messages. The patch renders the message with the block the template gives a
+leading system message (`patched`), and is kept only if ordinary conversations
+(with and without tools, every reasoning effort, preserved thinking, tool calls
+and results, images) still render byte-identically and the canary renders in
+place. Otherwise a request with a later system message fails with a 400 instead
+of losing it (`unsupported`). Startup logs the outcome once and `/status` reports
+it as `chat_template.later_system`. Every request, including image placeholder
+and token-count rendering, uses the template chosen at startup; tokenizer files
+and the tokenizer object are unchanged.
 
 `response_format` constrains generation and validates final output; it does not
 inject formatting instructions into the prompt. Clients should describe their
@@ -429,6 +443,7 @@ Proxy consumers can use these fields; additional fields may be added:
 | `metrics.decode_tokens_per_second` | Aggregate native decode throughput, not a request's end-to-end rate |
 | `maximum_context_tokens` | Declared context limit; available memory may limit admission |
 | `vision`, `input_modalities` | Whether image and PDF input is accepted; `false` and `["text"]` after `--language-only` |
+| `chat_template.later_system` | `native`, `patched` or `unsupported`: how system messages after the first render (per name for named templates) |
 
 `GET /metrics` exposes the same counters in Prometheus text format. Both endpoints
 require the API key when authentication is enabled. Consumers should tolerate

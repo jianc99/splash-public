@@ -39,6 +39,7 @@ if __package__:
         stream_chunk,
     )
     from .backend import NativeBackend, remaining_request_time
+    from .chat_templates import ChatTemplateError
     from .constraints import ConstraintFactory, validate_tokenizer
     from .diagnostics import log_unexpected, print_request, print_status
     from .errors import APIError, ContextLengthError
@@ -79,6 +80,7 @@ else:
         stream_chunk,
     )
     from backend import NativeBackend, remaining_request_time
+    from chat_templates import ChatTemplateError
     from constraints import ConstraintFactory, validate_tokenizer
     from diagnostics import log_unexpected, print_request, print_status
     from errors import APIError, ContextLengthError
@@ -2013,6 +2015,7 @@ def main():
             default_reasoning_effort=args.default_reasoning_effort,
             vision=readiness.vision,
         )
+        print_status(f"Chat template · {app.chat_templates.describe()}")
         server.app = app
         server.server_activate()
         address = f"http://{args.host}:{server.server_port}"
@@ -2024,7 +2027,11 @@ def main():
         mode = "" if readiness.vision else " · language only"
         print_status(f"Ready · {args.model} · context {context}{mode} · {address}")
         server.serve_forever()
-    except (engine_runtime.EngineUnhealthy, ThinkingKeyError) as error:
+    except (
+        engine_runtime.EngineUnhealthy,
+        ThinkingKeyError,
+        ChatTemplateError,
+    ) as error:
         print_status(f"Error · {error}", error=True)
         raise SystemExit(1) from None
     except OSError as error:

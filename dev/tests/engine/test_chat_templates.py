@@ -1,156 +1,521 @@
 import copy
+import json
 import unittest
 from pathlib import Path
 
 from jinja2 import TemplateError
 from transformers import PreTrainedTokenizerFast
 
-from dev.tests.test_server import FakeRuntime, Harness, TemplateTokenizer, _byte_backend
-from server import api_shapes
-from server.chat_templates import compatible_chat_template
+from dev.tests.test_server import (
+    FakeRuntime,
+    Harness,
+    Plan,
+    TemplateTokenizer,
+    _byte_backend,
+)
+from server import api_shapes, chat_templates
+from server import frontend as request_frontend
+from server.chat_templates import (
+    LATER_SYSTEM_UNSUPPORTED,
+    NATIVE,
+    PATCHED,
+    UNSUPPORTED,
+    ChatTemplateError,
+    ChatTemplates,
+)
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures/chat_templates"
-
-
-class ChatTemplateTests(unittest.TestCase):
-    def tokenizer(self, name):
-        tokenizer = PreTrainedTokenizerFast(
-            tokenizer_object=_byte_backend({0: "hello"})
-        )
-        tokenizer.chat_template = (FIXTURES / f"{name}.jinja").read_text()
-        return tokenizer
-
-    def test_default_and_named_templates_are_unchanged_for_ordinary_requests(self):
-        for name in ("qwen36", "qwen38", "qwen36_gguf", "qwen38_gguf"):
-            tokenizer = self.tokenizer(name)
-            original = tokenizer.chat_template
-            for source in (original, {"default": original, "tool_use": original}):
-                tokenizer.chat_template = source
-                for messages in (
-                    [{"role": "user", "content": "Hello"}],
-                    [
-                        {"role": "system", "content": "Be brief"},
-                        {"role": "user", "content": "Hello"},
-                    ],
-                ):
-                    self.assertIsNone(compatible_chat_template(tokenizer, messages))
-                self.assertEqual(tokenizer.chat_template, source)
-
-    def test_later_system_is_rendered_in_place_without_mutating_the_tokenizer(self):
-        for name in ("qwen36", "qwen38", "qwen36_gguf", "qwen38_gguf"):
-            tokenizer = self.tokenizer(name)
-            original = tokenizer.chat_template
-            messages = [
-                {"role": "system", "content": "Original instructions"},
-                {"role": "user", "content": "First question"},
-                {"role": "assistant", "content": "First answer"},
-                {"role": "system", "content": "New instructions"},
-                {"role": "system", "content": "More instructions"},
-                {"role": "user", "content": "Next question"},
-            ]
-            saved = copy.deepcopy(messages)
-            if name == "qwen36_gguf":
-                self.assertNotIn(
-                    "New instructions",
-                    tokenizer.apply_chat_template(messages, tokenize=False),
-                )
-            else:
-                with self.assertRaises(TemplateError):
-                    tokenizer.apply_chat_template(messages, tokenize=False)
-            override = compatible_chat_template(tokenizer, messages)
-            rendered = tokenizer.apply_chat_template(
-                messages, chat_template=override, tokenize=False
-            )
-            self.assertIn(
-                "First answer<|im_end|>\n"
-                "<|im_start|>system\nNew instructions<|im_end|>\n"
-                "<|im_start|>system\nMore instructions<|im_end|>\n",
-                rendered,
-            )
-            self.assertEqual(tokenizer.chat_template, original)
-            self.assertEqual(messages, saved)
-            # Legacy Splash templates already support these messages.
-            tokenizer.chat_template = override
-            self.assertIsNone(compatible_chat_template(tokenizer, messages))
-
-    def test_unknown_templates_keep_their_own_validation(self):
-        tokenizer = self.tokenizer("qwen36")
-        tokenizer.chat_template += "{# an unverified upstream change #}"
-        messages = [
-            {"role": "user", "content": "Hi"},
-            {"role": "system", "content": "Later"},
-        ]
-        self.assertIsNone(compatible_chat_template(tokenizer, messages))
-        with self.assertRaises(TemplateError):
-            tokenizer.apply_chat_template(messages, tokenize=False)
-
-    def test_named_tool_template_is_selected_before_compatibility(self):
-        tokenizer = self.tokenizer("qwen36")
-        source = tokenizer.chat_template
-        tokenizer.chat_template = {"default": "unknown template", "tool_use": source}
-        messages = [
-            {"role": "user", "content": "Hi"},
-            {"role": "system", "content": "Later"},
-        ]
-        self.assertIsNone(compatible_chat_template(tokenizer, messages))
-        tools = [
-            {
-                "type": "function",
-                "function": {"name": "lookup", "parameters": {"type": "object"}},
-            }
-        ]
-        override = compatible_chat_template(tokenizer, messages, tools=tools)
-        self.assertIsNotNone(override)
-        rendered = tokenizer.apply_chat_template(
-            messages, tools=tools, chat_template=override, tokenize=False
-        )
-        self.assertIn("lookup", rendered)
-        self.assertIn("<|im_start|>system\nLater<|im_end|>", rendered)
-
-    def test_frontend_uses_compatibility_for_generation_and_image_rendering(self):
-        # Exercise the shared entry point, including image placeholder tracking.
-        source = (FIXTURES / "qwen36.jinja").read_text()
-
-        class OffsetTokenizer(TemplateTokenizer):
-            def __call__(self, text, **kwargs):
-                return self.renderer(text, **kwargs)
-
-        tokenizer = OffsetTokenizer(source)
-        harness = Harness(FakeRuntime(), tokenizer=tokenizer)
-        self.addCleanup(harness.close)
-        messages = [
-            {"role": "user", "content": "Hi"},
-            {"role": "system", "content": "Later"},
-        ]
-        prompt = harness.app._prepare_prompt({"messages": messages})
-        harness.app._render_prompt(prompt, float("inf"))
-        override = tokenizer.templates[-1][1]["chat_template"]
-        self.assertIsNotNone(override)
-        self.assertEqual(tokenizer.renderer.chat_template, source)
-        status, _, payload = harness.request(
-            "POST",
-            "/v1/messages/count_tokens",
-            {"model": "test-model", "messages": messages},
-        )
-        self.assertEqual(status, 200, payload)
-        self.assertEqual(tokenizer.templates[-1][1]["chat_template"], override)
-        image_messages = [
-            *messages,
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image", "image": "unused"},
-                    {"type": "text", "text": "Describe"},
-                ],
+UPSTREAM = ("qwen36", "qwen38", "qwen36_gguf", "qwen38_gguf")
+# How each unmodified upstream template treats a later system message.
+ORIGINAL = {
+    "qwen36": chat_templates.REJECTS,
+    "qwen38": chat_templates.REJECTS,
+    "qwen36_gguf": chat_templates.DROPS,
+    "qwen38_gguf": chat_templates.REJECTS,
+}
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read a file.",
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
             },
+        },
+    },
+    {"type": "function", "function": {"name": "list", "parameters": {}}},
+]
+# Normalized as request preparation leaves them: one leading system message.
+AGENT_TURNS = [
+    {"role": "system", "content": "You are a coding agent.\n\nWork in /repo."},
+    {"role": "user", "content": "Fix the failing test"},
+    {
+        "role": "assistant",
+        "content": "",
+        "reasoning_content": "Read the test first.",
+        "tool_calls": [
+            {
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "read_file", "arguments": {"path": "t.py"}},
+            }
+        ],
+    },
+    {"role": "tool", "tool_call_id": "call_1", "content": "def test(): ..."},
+    {"role": "system", "content": "Approval mode changed: never ask."},
+    {"role": "user", "content": "Continue"},
+]
+
+
+def source(name):
+    return (FIXTURES / f"{name}.jinja").read_text()
+
+
+def tokenizer(template):
+    result = PreTrainedTokenizerFast(tokenizer_object=_byte_backend({0: "hello"}))
+    result.chat_template = template
+    return result
+
+
+def render(template_tokenizer, messages, template=None, **options):
+    return template_tokenizer.apply_chat_template(
+        messages,
+        chat_template=template,
+        tokenize=False,
+        add_generation_prompt=True,
+        **options,
+    )
+
+
+def variants(name):
+    """Formatting changes the byte-hash list rejected, at and around the
+    construct each upstream template is patched at."""
+    text = source(name)
+    yield "space after endmacro", text.replace("{%- endmacro %}", "{%- endmacro %} ", 1)
+    yield "trailing newlines", text + "\n\n"
+    yield "CRLF line endings", text.replace("\n", "\r\n")
+    raise_tag = "{{- raise_exception('System message must be at the beginning.') }}"
+    if raise_tag in text:
+        yield (
+            "reformatted raise",
+            text.replace(
+                raise_tag,
+                '{{-   raise_exception( "System message must be at the beginning." )   -}}',
+            ),
+        )
+        yield (
+            "reworded raise",
+            text.replace(
+                raise_tag, "{{- raise_exception('Put system messages first.') }}"
+            ),
+        )
+    skip = '{%- if loop.index0 >= num_sys and message.role != "system" and message.role != "developer" %}'
+    if skip in text:
+        yield (
+            "reformatted skip",
+            text.replace(
+                skip,
+                "{%-if loop.index0>=num_sys and message['role']!='system' "
+                "and message.role != 'developer'-%}",
+            ),
+        )
+
+
+class ChatTemplateProbeTests(unittest.TestCase):
+    def test_upstream_templates_are_classified_and_patched(self):
+        for name in UPSTREAM:
+            with self.subTest(name=name):
+                templates = ChatTemplates(tokenizer(source(name)))
+                chosen = templates.select(None)
+                self.assertEqual(chosen.original, ORIGINAL[name])
+                self.assertEqual(chosen.later_system, PATCHED)
+                self.assertEqual(templates.status(), {"later_system": PATCHED})
+                self.assertIn("patched", templates.describe())
+
+    def test_original_templates_reject_or_drop_what_the_patch_renders(self):
+        for name in UPSTREAM:
+            with self.subTest(name=name):
+                upstream = tokenizer(source(name))
+                if ORIGINAL[name] == chat_templates.REJECTS:
+                    with self.assertRaises(TemplateError):
+                        render(upstream, AGENT_TURNS)
+                else:
+                    self.assertNotIn("Approval mode", render(upstream, AGENT_TURNS))
+
+    def test_later_system_message_renders_in_place_as_a_system_turn(self):
+        for name in UPSTREAM:
+            upstream = tokenizer(source(name))
+            patched = ChatTemplates(upstream).select(TOOLS).source
+            for options in (
+                {},
+                {"tools": TOOLS},
+                {"enable_thinking": False},
+                {"enable_thinking": True, "reasoning_effort": "low"},
+                {"preserve_thinking": True},
+            ):
+                with self.subTest(name=name, options=options):
+                    messages = copy.deepcopy(AGENT_TURNS)
+                    rendered = render(upstream, messages, patched, **options)
+                    self.assertIn(
+                        "</tool_response><|im_end|>\n"
+                        "<|im_start|>system\nApproval mode changed: never ask."
+                        "<|im_end|>\n<|im_start|>user\nContinue<|im_end|>\n",
+                        rendered,
+                    )
+                    self.assertEqual(rendered.count("Approval mode"), 1)
+                    self.assertEqual(messages, AGENT_TURNS)
+            self.assertEqual(upstream.chat_template, source(name))
+
+    def test_consecutive_later_system_messages_each_render_in_place(self):
+        messages = [
+            {"role": "system", "content": "Original instructions"},
+            {"role": "user", "content": "First question"},
+            {"role": "assistant", "content": "First answer"},
+            {"role": "system", "content": "New instructions"},
+            {"role": "system", "content": "More instructions"},
+            {"role": "user", "content": "Next question"},
         ]
-        # The marker substitution must happen after choosing the compatibility
-        # template. Using the original here would raise on the later system.
+        for name in UPSTREAM:
+            with self.subTest(name=name):
+                upstream = tokenizer(source(name))
+                patched = ChatTemplates(upstream).select(None).source
+                self.assertIn(
+                    "First answer<|im_end|>\n"
+                    "<|im_start|>system\nNew instructions<|im_end|>\n"
+                    "<|im_start|>system\nMore instructions<|im_end|>\n"
+                    "<|im_start|>user\nNext question",
+                    render(upstream, messages, patched),
+                )
+
+    def test_ordinary_conversations_render_byte_identically(self):
+        image = {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Compare"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,"}},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,"}},
+            ],
+        }
+        two_calls = copy.deepcopy(AGENT_TURNS[2])
+        two_calls["tool_calls"].append(
+            {"type": "function", "function": {"name": "list", "arguments": {}}}
+        )
+        conversations = (
+            AGENT_TURNS[:2],
+            AGENT_TURNS[:4],
+            [*AGENT_TURNS[:4], {"role": "assistant", "content": "Done"}, image],
+            [AGENT_TURNS[1], two_calls, AGENT_TURNS[3], AGENT_TURNS[3]],
+            [image, {"role": "assistant", "content": "<think>\nx\n</think>\n\nSame"}],
+        )
+        for name in UPSTREAM:
+            upstream = tokenizer(source(name))
+            patched = ChatTemplates(upstream).select(None).source
+            for messages in conversations:
+                for options in (
+                    {},
+                    {"tools": TOOLS},
+                    {"enable_thinking": False},
+                    {"enable_thinking": True, "reasoning_effort": "medium"},
+                    {"preserve_thinking": False},
+                    {"add_generation_prompt": False},
+                ):
+                    with self.subTest(name=name, messages=messages, options=options):
+                        expected = upstream.apply_chat_template(
+                            messages, tokenize=False, **options
+                        )
+                        self.assertEqual(
+                            upstream.apply_chat_template(
+                                messages,
+                                chat_template=patched,
+                                tokenize=False,
+                                **options,
+                            ),
+                            expected,
+                        )
+
+    def test_formatting_variants_are_patched_at_the_same_construct(self):
+        for name in UPSTREAM:
+            for variant, text in variants(name):
+                with self.subTest(name=name, variant=variant):
+                    chosen = ChatTemplates(tokenizer(text)).select(None)
+                    self.assertEqual(chosen.later_system, PATCHED)
+                    upstream = tokenizer(text)
+                    self.assertIn(
+                        "<|im_start|>system\nApproval mode changed: never ask."
+                        "<|im_end|>\n<|im_start|>user\nContinue",
+                        render(upstream, AGENT_TURNS, chosen.source).replace(
+                            "\r\n", "\n"
+                        ),
+                    )
+                    self.assertEqual(
+                        render(upstream, AGENT_TURNS[:4], chosen.source),
+                        render(upstream, AGENT_TURNS[:4]),
+                    )
+
+    def test_native_template_is_used_unchanged(self):
+        native = (
+            "{%- for message in messages %}"
+            "{{- '<|im_start|>' + message.role + '\\n' + message.content"
+            " + '<|im_end|>\\n' }}{%- endfor %}"
+            "{%- if add_generation_prompt %}{{- '<|im_start|>assistant\\n' }}"
+            "{%- endif %}"
+        )
+        chosen = ChatTemplates(tokenizer(native)).select(None)
+        self.assertEqual((chosen.later_system, chosen.source), (NATIVE, native))
+
+    def test_templates_without_the_construct_are_unsupported(self):
+        chatml = (
+            "{{- '<|im_start|>' + message.role + '\\n' + message.content"
+            " + '<|im_end|>\\n' }}"
+        )
+        cases = {
+            # The check lives outside the message loop.
+            "rejects before the loop": (
+                "{%- for message in messages[1:] %}{%- if message.role == 'system' %}"
+                "{{- raise_exception('System message must be at the beginning.') }}"
+                "{%- endif %}{%- endfor %}"
+                "{%- for message in messages %}" + chatml + "{%- endfor %}"
+            ),
+            # A filtered loop drops system messages, with no condition to patch.
+            "drops by loop filter": (
+                "{%- if messages[0].role == 'system' %}"
+                "{{- '<|im_start|>system\\n' + messages[0].content + '<|im_end|>\\n' }}"
+                "{%- endif %}"
+                "{%- for message in messages if message.role != 'system' %}"
+                + chatml
+                + "{%- endfor %}"
+            ),
+            # Moves every system message to the front.
+            "misplaces": (
+                "{%- for message in messages if message.role == 'system' %}"
+                + chatml
+                + "{%- endfor %}"
+                "{%- for message in messages if message.role != 'system' %}"
+                + chatml
+                + "{%- endfor %}"
+            ),
+            "unbalanced": source("qwen36").replace("{%- endmacro %}", "", 1),
+        }
+        for name, text in cases.items():
+            with self.subTest(name=name):
+                chosen = ChatTemplates(tokenizer(text)).select(None)
+                self.assertEqual(
+                    (chosen.later_system, chosen.source), (UNSUPPORTED, text)
+                )
+
+    def test_patch_that_changes_ordinary_conversations_is_not_kept(self):
+        # Tool results share the rejecting branch: the construct is found, but
+        # replacing its raise would render them as system turns.
+        text = source("qwen36").replace(
+            '{%- if message.role == "system" %}',
+            '{%- if message.role == "system" or message.role == "tool" %}',
+            1,
+        )
+        upstream = tokenizer(text)
+        with self.assertRaises(TemplateError):
+            render(upstream, AGENT_TURNS[:4])
+        patch = chat_templates._patch(
+            chat_templates._renderer(upstream), text, chat_templates.REJECTS
+        )
+        # The patch alone renders the later system message...
+        self.assertIn(
+            "<|im_start|>system\nApproval",
+            render(upstream, [*AGENT_TURNS[:2], *AGENT_TURNS[4:]], patch),
+        )
+        # ...but verification sees the tool result it would change.
+        chosen = ChatTemplates(upstream).select(None)
+        self.assertEqual((chosen.later_system, chosen.source), (UNSUPPORTED, text))
+
+    def test_named_templates_are_probed_and_selected_like_the_tokenizer(self):
+        native = (
+            "{%- for message in messages %}{{- message.role + ': ' + message.content"
+            " + '\\n' }}{%- endfor %}"
+        )
+        upstream = tokenizer({"default": native, "tool_use": source("qwen36")})
+        templates = ChatTemplates(upstream)
+        self.assertEqual(templates.select(None).later_system, NATIVE)
+        self.assertEqual(templates.select(TOOLS).later_system, PATCHED)
+        self.assertEqual(
+            templates.status(),
+            {"later_system": {"default": NATIVE, "tool_use": PATCHED}},
+        )
+        self.assertIn("tool_use patched to render", templates.describe())
+        for defined, message in (
+            (None, "defines no chat template"),
+            ("", "defines no chat template"),
+            ({"tool_use": native}, "have no default"),
+        ):
+            with (
+                self.subTest(defined=defined),
+                self.assertRaisesRegex(ChatTemplateError, message),
+            ):
+                ChatTemplates(tokenizer(defined))
+
+
+class ChatTemplateFrontendTests(unittest.TestCase):
+    class OffsetTokenizer(TemplateTokenizer):
+        def __call__(self, text, **kwargs):
+            return self.renderer(text, **kwargs)
+
+    def harness(self, template, runtime=None):
+        harness = Harness(
+            runtime or FakeRuntime(), tokenizer=self.OffsetTokenizer(template)
+        )
+        self.addCleanup(harness.close)
+        return harness
+
+    def post(self, harness, path, body, status=200):
+        code, _, payload = harness.request(
+            "POST", path, {"model": "test-model", **body}
+        )
+        self.assertEqual(code, status, payload)
+        return json.loads(payload)
+
+    def test_every_request_path_uses_the_template_chosen_at_startup(self):
+        harness = self.harness(source("qwen36"), FakeRuntime(Plan([[1]])))
+        chosen = harness.app.chat_templates.select(None)
+        status, _, payload = harness.request("GET", "/status")
+        self.assertEqual(
+            json.loads(payload)["chat_template"], {"later_system": PATCHED}
+        )
+        messages = [
+            {"role": "user", "content": "Hi"},
+            {"role": "system", "content": "Later"},
+            {"role": "user", "content": "Again"},
+        ]
+        image = {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": "unused"},
+                {"type": "text", "text": "Describe"},
+            ],
+        }
+        # Image rendering swaps the pad token for a marker in that template.
+        chosen_sources = {
+            chosen.source,
+            chosen.source.replace(
+                api_shapes.IMAGE_PAD_TOKEN, request_frontend.IMAGE_RENDER_MARKER
+            ),
+        }
+        for path, render in (
+            (
+                "/apply-template",
+                lambda: self.post(harness, "/apply-template", {"messages": messages}),
+            ),
+            (
+                "/v1/chat/completions",
+                lambda: self.post(
+                    harness,
+                    "/v1/chat/completions",
+                    {"messages": messages, "max_tokens": 1},
+                ),
+            ),
+            (
+                "/v1/messages/count_tokens",
+                lambda: self.post(
+                    harness, "/v1/messages/count_tokens", {"messages": messages}
+                ),
+            ),
+            (
+                "image render",
+                lambda: harness.app._render_image_tokens(
+                    [*messages, image], {"chat_template": chosen.source}
+                ),
+            ),
+        ):
+            with self.subTest(path=path):
+                harness.tokenizer.templates.clear()
+                render()
+                used = {
+                    kwargs["chat_template"] for _, kwargs in harness.tokenizer.templates
+                }
+                self.assertTrue(used)
+                self.assertLessEqual(used, chosen_sources)
+        prompt = self.post(harness, "/apply-template", {"messages": messages})["prompt"]
+        self.assertIn(
+            "<|im_start|>system\nLater<|im_end|>\n<|im_start|>user\nAgain", prompt
+        )
         _, _, rendered = harness.app._render_image_tokens(
-            image_messages, {"chat_template": override}
+            [*messages, image], {"chat_template": chosen.source}
         )
         self.assertIn("<|im_start|>system\nLater<|im_end|>", rendered)
         self.assertIn("<|image_pad|>", rendered)
+        self.assertEqual(harness.tokenizer.renderer.chat_template, source("qwen36"))
+
+    def test_codex_shaped_responses_render_instructions_first_and_later_in_place(self):
+        harness = self.harness(source("qwen36_gguf"), FakeRuntime())
+        body = {
+            "instructions": "Base instructions",
+            "input": [
+                {"type": "message", "role": "developer", "content": "Permissions"},
+                {"type": "message", "role": "developer", "content": "Environment"},
+                {"type": "message", "role": "user", "content": "Start"},
+                {"type": "message", "role": "developer", "content": "Mode changed"},
+                {"type": "message", "role": "user", "content": "Continue"},
+            ],
+        }
+        chat = api_shapes.responses_to_chat_body(body)
+        prompt = harness.app._render_prompt(
+            harness.app._prepare_prompt(chat), float("inf"), check_context=False
+        ).text
+        self.assertTrue(
+            prompt.startswith(
+                "<|im_start|>system\nBase instructions\n\nPermissions\n\nEnvironment"
+                "<|im_end|>\n<|im_start|>user\nStart<|im_end|>\n"
+                "<|im_start|>system\nMode changed<|im_end|>\n"
+                "<|im_start|>user\nContinue<|im_end|>\n"
+            ),
+            prompt,
+        )
+
+    def test_unsupported_template_rejects_later_system_messages(self):
+        text = source("qwen36").replace(
+            "{{- raise_exception('System message must be at the beginning.') }}",
+            "{{- '' }}",
+        )
+        runtime = FakeRuntime()
+        harness = self.harness(text, runtime)
+        self.assertEqual(
+            harness.app.chat_templates.select(None).later_system, UNSUPPORTED
+        )
+        later = [
+            {"role": "user", "content": "Hi"},
+            {"role": "developer", "content": "Later"},
+            {"role": "user", "content": "Again"},
+        ]
+        for path, body in (
+            ("/v1/chat/completions", {"messages": later}),
+            ("/apply-template", {"messages": later}),
+            (
+                "/v1/responses",
+                {
+                    "input": [
+                        {"role": message["role"], "content": message["content"]}
+                        for message in later
+                    ]
+                },
+            ),
+            (
+                "/v1/messages/count_tokens",
+                {"messages": [later[0], {"role": "system", "content": "x"}, later[2]]},
+            ),
+        ):
+            with self.subTest(path=path):
+                harness.tokenizer.templates.clear()
+                error = self.post(harness, path, body, 400)["error"]
+                self.assertEqual(error["message"], LATER_SYSTEM_UNSUPPORTED)
+                self.assertEqual(harness.tokenizer.templates, [])
+        self.assertEqual(runtime.requests, [])
+        # A leading system message is not a later one.
+        prompt = self.post(
+            harness,
+            "/apply-template",
+            {"messages": [{"role": "system", "content": "First"}, later[0]]},
+        )["prompt"]
+        self.assertTrue(prompt.startswith("<|im_start|>system\nFirst<|im_end|>"))
 
 
 class LeadingSystemMergeTests(unittest.TestCase):
@@ -214,3 +579,7 @@ class LeadingSystemMergeTests(unittest.TestCase):
                         {"role": "user", "content": "Ask"},
                     ],
                 )
+
+
+if __name__ == "__main__":
+    unittest.main()
