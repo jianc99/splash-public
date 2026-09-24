@@ -1,6 +1,7 @@
 import contextlib
 import io
 import json
+import re
 import sqlite3
 import subprocess
 import tempfile
@@ -173,6 +174,31 @@ class AgentRunnerTests(unittest.TestCase):
         self.assertIn('dev/tests/agent_real.py --model "$(MODEL)"', makefile)
         self.assertIn('--model "$(MODEL)" --http-smoke', makefile)
         self.assertIn('--model "$(MODEL)" $(HTTP_SMOKE_ARGS)', makefile)
+
+    def test_native_make_gates_run_the_installers_selection_link(self):
+        # MODEL_ROOT repeats the installer's layout; a GGUF variant's link is
+        # where the two could disagree.
+        model = "unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M"
+        artifacts = agent.launcher.model_artifacts
+        link = str(
+            artifacts.installed_root(artifacts.MODELS, model).relative_to(agent.ROOT)
+        )
+        for target, tools in (
+            ("test-real", ("vision-encoder", "model-runtime-oracle")),
+            ("test-performance-real", ("backend-benchmark",)),
+        ):
+            with self.subTest(target=target):
+                commands = subprocess.run(
+                    ["make", "-n", target, f"MODEL={model}"],
+                    cwd=agent.ROOT,
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                ).stdout
+                roots = re.findall(
+                    r'engine-tests/(\S+) \S+splash\.metallib "?([^"\s]+)', commands
+                )
+                self.assertEqual(dict(roots), dict.fromkeys(tools, link))
 
     def test_model_is_required(self):
         for arguments in ([], ["--preflight-only"]):

@@ -61,7 +61,7 @@ _install: model-selection _install-environment
 
 model-selection:
 	@test -n "$(MODEL)" || { \
-		echo "error: set MODEL to a supported full Hugging Face repository ID" >&2; \
+		echo "error: set MODEL to a model ID as splash serve --model takes it (OWNER/REPO[:VARIANT])" >&2; \
 		exit 1; \
 	}
 
