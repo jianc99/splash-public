@@ -47,13 +47,6 @@ std::filesystem::path stagingPath(const std::filesystem::path &root, std::string
 // a promise that concurrent system activity can never exhaust the volume.
 constexpr uint64_t kDiskReserveBytes = uint64_t{2} << 30;
 
-void requireDiskSpace(const std::filesystem::path &root, uint64_t required) {
-  const uint64_t available = std::filesystem::space(root).available;
-  if (available < kDiskReserveBytes || required > available - kDiskReserveBytes)
-    throw std::runtime_error("not enough disk space to prepare weights: need " +
-        std::to_string(required) + " bytes plus a 2 GiB free-space reserve");
-}
-
 class Descriptor final {
 public:
   explicit Descriptor(int fd) : fd_(fd) { if (fd < 0) fail("open prepared weights"); }
@@ -445,6 +438,12 @@ PreparedWeight WeightIdentity::weight(uint64_t bytes, std::string component, std
   return {weightDigest(text_.str()), bytes, std::move(component), weightDigest(inputs), std::move(source)};
 }
 
+void requireWeightDiskSpace(uint64_t available, uint64_t required) {
+  if (required && (available < kDiskReserveBytes || required > available - kDiskReserveBytes))
+    throw std::runtime_error("not enough disk space to prepare weights: need " +
+        std::to_string(required) + " bytes plus a 2 GiB free-space reserve");
+}
+
 PreparedWeights::PreparedWeights() : root_(cacheRoot()) {}
 
 void PreparedWeights::requireSpace(std::span<const PreparedWeight> weights,
@@ -470,7 +469,7 @@ void PreparedWeights::requireSpace(std::span<const PreparedWeight> weights,
   // wrote it; complete generations are retained and excluded from the budget.
   for (const auto &entry : std::filesystem::directory_iterator(root_))
     if (entry.path().extension() == ".partial") std::filesystem::remove_all(entry.path());
-  if (const uint64_t missing = missingBytes()) requireDiskSpace(root_, missing);
+  requireWeightDiskSpace(std::filesystem::space(root_).available, missingBytes());
 }
 
 std::filesystem::path PreparedWeights::prepare(const PreparedWeight &weight, const WeightWriter &write,
@@ -501,7 +500,7 @@ std::filesystem::path PreparedWeights::prepare(const PreparedWeight &weight, con
   // staging directory is never a cache hit and is safe to replace.
   const auto staging = stagingPath(root_, weight.key);
   std::filesystem::remove_all(staging);
-  requireDiskSpace(root_, weight.bytes);
+  requireWeightDiskSpace(std::filesystem::space(root_).available, weight.bytes);
   std::filesystem::create_directory(staging);
   try {
     writeStaged(root_, staging, weight, write, guards);

@@ -154,8 +154,13 @@ void warmLoadDoesNotWaitForTheConverterLock(Cache &cache) {
 }
 
 void diskChecksKeepTheReserveAndCoverTheModel(Cache &cache) {
-  // The check keeps 2 GiB of the volume free: a file 1 GiB smaller than the
-  // free space does not fit.
+  // 2 GiB stay free, to the byte, and nothing to write needs no reserve.
+  constexpr uint64_t kReserve = uint64_t{2} << 30;
+  requireWeightDiskSpace(0, 0);
+  requireWeightDiskSpace(kReserve + 128, 128);
+  rejects([] { requireWeightDiskSpace(kReserve + 127, 128); }, "not enough disk space", "disk reserve boundary");
+  // The store checks its volume: a file 1 GiB smaller than the free space
+  // does not fit.
   const uint64_t available = std::filesystem::space(cache.root).available;
   const std::array<PreparedWeight, 1> reserve{{cache.entry(22, available > kGiB ? available - kGiB : 1)}};
   rejects([&] { cache.store.requireSpace(reserve); }, "not enough disk space", "disk reserve ignored");

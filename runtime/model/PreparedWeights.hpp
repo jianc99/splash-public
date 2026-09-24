@@ -144,6 +144,10 @@ struct PreparationGuards {
 // runs before each chunk of conversion work.
 using WeightWriter = std::function<void(int destination, const PreparationCheck &admit)>;
 
+// Throws unless `required` bytes fit in `available` free bytes and leave a
+// 2 GiB free-space reserve; a model with nothing to write needs no reserve.
+void requireWeightDiskSpace(uint64_t available, uint64_t required);
+
 // The cache is SPLASH_WEIGHT_CACHE, or ~/Library/Caches/Splash/weights.
 class PreparedWeights final {
 public:
