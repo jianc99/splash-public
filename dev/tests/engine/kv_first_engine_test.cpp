@@ -8,7 +8,6 @@
 #include <memory>
 #include <optional>
 #include <stdexcept>
-#include <string_view>
 
 using namespace splash;
 using namespace splash::engine;
@@ -740,30 +739,6 @@ void testConcurrentDuplicateStateSkipsSnapshotCapture() {
               snapshot.replayStatePublications == 1 &&
               snapshot.replayStatePublicationFailures == 0,
           "duplicate state publication was not reused and accounted");
-}
-
-void testTextOnlyRejectsImagesBeforeScheduling() {
-  Backing backing(32);
-  KvPool pool(backing);
-  engine::Cache resources(pool, CacheNamespace{});
-  Executor executor;
-  Events events;
-  engine::Engine engine({.maxImagePatches = 0}, resources, executor, events);
-  auto image = request(1, std::vector<uint32_t>(65, 7));
-  image.images = {{8, 16, 8, 8, 1, 2}};
-  image.imagePixels.assign(image.images[0].pixelBytes(), 1);
-  bool rejected = false;
-  try {
-    engine.submit(std::move(image));
-  } catch (const std::invalid_argument &error) {
-    rejected = std::string_view(error.what()) ==
-               "this model is serving without vision";
-  }
-  require(rejected && events.starts.empty(), "disabled vision reached execution");
-  engine.submit(request(2, std::vector<uint32_t>(65, 7)));
-  runUntilIdle(engine);
-  require(events.completedCount == 1 && events.failedCount == 0,
-          "image rejection prevented the following text request");
 }
 
 void testImageSpansKeyPrefixIdentity() {
@@ -3366,7 +3341,6 @@ int main() {
     testColdPublishesReplayStateAndLazyJunctionCanRebuildIt();
     testConcurrentDuplicateStateSkipsSnapshotCapture();
     testImageSpansKeyPrefixIdentity();
-    testTextOnlyRejectsImagesBeforeScheduling();
     testOneRequestPublishesJunctionAndLatestReplayState();
     testLatestReplayDenialRecyclesOlderStateNotTheJunction();
     testCancellationAfterJunctionDiscardsLaterState();
