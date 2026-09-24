@@ -250,6 +250,8 @@ struct QwenTargetGeometry final {
   uint32_t expertsPerToken = 0;
   uint32_t expertIntermediateSize = 0;
   QwenFfnKind ffnKind = QwenFfnKind::Dense;
+  // The weight layout every sparse MoE block of the target shares.
+  ops::WeightLayout moeLayout = ops::WeightLayout::Affine64;
   uint32_t maskToken = 0;
   std::array<uint32_t, 2> stopTokens{};
   std::array<uint32_t, maximumCaptureLayers> captureLayerValues{};
@@ -260,7 +262,6 @@ struct QwenTargetGeometry final {
   std::vector<ops::ProjectionShape> prefillProjections;
   std::vector<ops::ProjectionShape> decodeProjections;
   std::vector<ops::ProjectionShape> gateUpProjections;
-  std::vector<ops::MoeShape> moeShapes;
 
   [[nodiscard]] constexpr uint32_t gdnKeyWidth() const noexcept {
     return gdnKeyHeads * gdnHeadDimension;
@@ -268,8 +269,8 @@ struct QwenTargetGeometry final {
   [[nodiscard]] constexpr uint32_t capturedHiddenSize() const noexcept {
     return hiddenSize * captureLayerCount;
   }
-  [[nodiscard]] constexpr ops::MoeShape moeShape(ops::WeightLayout layout) const noexcept {
-    return {hiddenSize, experts, expertsPerToken, expertIntermediateSize, layout};
+  [[nodiscard]] constexpr ops::MoeShape moeShape() const noexcept {
+    return {hiddenSize, experts, expertsPerToken, expertIntermediateSize, moeLayout};
   }
   [[nodiscard]] constexpr uint32_t ffnScratchWidth() const noexcept {
     return ffnKind == QwenFfnKind::Dense ? denseIntermediateSize
@@ -305,8 +306,7 @@ struct QwenTargetGeometry final {
            kvLayout.headDimension == attentionHeadDimension &&
            sized(prefillProjections) && sized(decodeProjections) &&
            ((ffnKind == QwenFfnKind::Dense && denseIntermediateSize && sized(gateUpProjections)) ||
-            (ffnKind == QwenFfnKind::SparseMoe && !moeShapes.empty() &&
-             std::all_of(moeShapes.begin(), moeShapes.end(), [](const auto &shape) { return shape.valid(); })));
+            (ffnKind == QwenFfnKind::SparseMoe && moeShape().valid()));
   }
 };
 

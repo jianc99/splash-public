@@ -219,9 +219,9 @@ void checkPair(ModelPackage package, bool sparse) {
   std::set<MoeWorkload> expectedMoe;
   if (sparse) {
     for (uint32_t rows : prefill)
-      expectedMoe.insert({geometry.moeShape(WeightLayout::Affine64), rows, MoePhase::Prefill});
+      expectedMoe.insert({geometry.moeShape(), rows, MoePhase::Prefill});
     for (uint32_t width : decode)
-      expectedMoe.insert({geometry.moeShape(WeightLayout::Affine64), width * 8, MoePhase::Decode});
+      expectedMoe.insert({geometry.moeShape(), width * 8, MoePhase::Decode});
   }
   require(actualMoe == expectedMoe, "dense/sparse FFN inventory is incorrect");
 

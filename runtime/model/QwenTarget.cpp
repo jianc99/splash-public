@@ -7,10 +7,10 @@
 #include "ops/Normalization.hpp"
 
 #include <algorithm>
-#include <optional>
 #include <stdexcept>
 #include <type_traits>
 #include <utility>
+#include <variant>
 
 namespace splash::model {
 namespace {
@@ -82,6 +82,9 @@ constexpr bool hasDenseFfn = requires(const Layer &layer) {
   layer.upProjection;
   layer.downProjection;
 };
+
+template <class Weights>
+constexpr bool hasSparseFfn = !hasDenseFfn<typename decltype(Weights::layers)::value_type>;
 
 template <class Mixer>
 constexpr bool isGdnMixer =
@@ -176,6 +179,9 @@ QwenTargetGeometry targetGeometry(const Weights &weights) {
   const auto include = [&](const ops::Projection &p) {
     geometry.decodeProjections.push_back(p.shape());
   };
+  // No source mixes MoE layouts, so one plan runs every block of a step.
+  if constexpr (hasSparseFfn<Weights>)
+    if (!weights.layers.empty()) geometry.moeLayout = weights.layers.front().ffn.layout();
   for (const auto &layer : weights.layers) {
     std::visit([&](const auto &mixer) {
       include(mixer.inputProjection);
@@ -188,11 +194,8 @@ QwenTargetGeometry targetGeometry(const Weights &weights) {
       include(layer.upProjection);
       include(layer.downProjection);
       geometry.gateUpProjections.push_back(layer.upProjection.shape());
-    } else {
-      const auto shape = geometry.moeShape(layer.ffn.layout());
-      if (std::none_of(geometry.moeShapes.begin(), geometry.moeShapes.end(),
-          [&](const auto &s) { return s.weightLayout == shape.weightLayout; }))
-        geometry.moeShapes.push_back(shape);
+    } else if (layer.ffn.layout() != geometry.moeLayout) {
+      throw WeightStoreError("the MoE blocks of a target must share one weight layout");
     }
   }
   geometry.prefillProjections = geometry.decodeProjections;
@@ -266,9 +269,10 @@ void QwenTarget::addPrefillImpl(
                                            geometry_.hiddenSize};
   const ops::LinearMatrix mixerOutput{geometry_.hiddenSize,
                                         geometry_.attentionWidth};
-  std::array<std::optional<ops::MoePlan>, 2> moePlans;
-  for (const auto &shape : geometry_.moeShapes)
-    moePlans.at(static_cast<size_t>(shape.weightLayout)) = operators_.moePrefill(shape, rows);
+  const auto moePlan = [&] {
+    if constexpr (hasSparseFfn<Weights>) return operators_.moePrefill(geometry_.moeShape(), rows);
+    else return std::monostate{};
+  }();
 
   auto u16 = [&](const metal::MetalBuffer &buffer, uint32_t begin,
                  uint32_t count, uint32_t width) {
@@ -425,7 +429,7 @@ void QwenTarget::addPrefillImpl(
            buffers.groupedRoutes, buffers.routeRows, buffers.groupedInput,
            buffers.expertIntermediate, buffers.expertOutput,
            buffers.groupedSums},
-          layer.ffn, *moePlans.at(static_cast<size_t>(layer.ffn.layout())));
+          layer.ffn, moePlan);
     }
 
     const auto captureLayers = geometry_.captureLayers();
@@ -494,9 +498,10 @@ void QwenTarget::addVerifyImpl(
   const ops::LinearMatrix gdnInput{geometry_.packedGdnWidth, geometry_.hiddenSize};
   const ops::LinearMatrix attentionInput{geometry_.packedAttentionWidth, geometry_.hiddenSize};
   const ops::LinearMatrix mixerOutput{geometry_.hiddenSize, geometry_.attentionWidth};
-  std::array<std::optional<ops::MoePlan>, 2> moePlans;
-  for (const auto &shape : geometry_.moeShapes)
-    moePlans.at(static_cast<size_t>(shape.weightLayout)) = operators_.moeDecode(shape, lanes);
+  const auto moePlan = [&] {
+    if constexpr (hasSparseFfn<Weights>) return operators_.moeDecode(geometry_.moeShape(), lanes);
+    else return std::monostate{};
+  }();
   constexpr uint32_t tileRows = kv::kPageTokens;
 
   uint32_t gdnIndex = 0;
@@ -603,7 +608,7 @@ void QwenTarget::addVerifyImpl(
            buffers.groupedRoutes, buffers.routeRows, buffers.groupedInput,
            buffers.expertIntermediate, buffers.expertOutput,
            buffers.groupedSums},
-          layer.ffn, *moePlans.at(static_cast<size_t>(layer.ffn.layout())));
+          layer.ffn, moePlan);
     }
 
     const auto captureLayers = geometry_.captureLayers();

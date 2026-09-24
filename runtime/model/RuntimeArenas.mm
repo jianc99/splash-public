@@ -131,9 +131,9 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
   }
   put(PrefillTensor::LinearPartials, linear.partials);
   put(PrefillTensor::LinearCounters, linear.counters);
-  for (const auto &shape : geometry.target.moeShapes) {
+  if (geometry.target.ffnKind == QwenFfnKind::SparseMoe) {
     const ops::MoeWorkspace workspace =
-        operators.moePrefillWorkspace(shape, kPrefillRows);
+        operators.moePrefillWorkspace(geometry.target.moeShape(), kPrefillRows);
     put(PrefillTensor::MoeSelectedExperts, workspace.selectedExpertsBytes);
     put(PrefillTensor::MoeRoutingWeights, workspace.routingWeightsBytes);
     put(PrefillTensor::MoeTileDescriptors, workspace.tileDescriptorsBytes);
@@ -314,9 +314,9 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
   put(DecodeTensor::ChunkValuesBase,
       uint64_t{geometry.target.kvLayout.attentionLayers} *
           decodeChunkLayerBytes(geometry));
-  for (const auto &shape : geometry.target.moeShapes) {
+  if (geometry.target.ffnKind == QwenFfnKind::SparseMoe) {
     const ops::MoeWorkspace workspace =
-        operators.moeDecodeWorkspacePerLane(shape);
+        operators.moeDecodeWorkspacePerLane(geometry.target.moeShape());
     put(DecodeTensor::MoeSelectedExperts, workspace.selectedExpertsBytes);
     put(DecodeTensor::MoeRoutingWeights, workspace.routingWeightsBytes);
     put(DecodeTensor::MoeTileDescriptors, workspace.tileDescriptorsBytes);

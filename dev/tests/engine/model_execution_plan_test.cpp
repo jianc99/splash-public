@@ -84,7 +84,7 @@ void checkPackage(const model::ModelPackage &package, uint32_t family) {
   choices.draftAttention.push_back(
       {{package.draft.layout.attentionShape(), 3}, {80}});
   if (geometry.ffnKind == model::QwenFfnKind::SparseMoe)
-    choices.moe.push_back({{geometry.moeShape(ops::WeightLayout::Affine64), 24, ops::MoePhase::Decode},
+    choices.moe.push_back({{geometry.moeShape(), 24, ops::MoePhase::Decode},
                            {ops::MoeExpertTile::M32}});
   ops::ExecutionPlans selected(device);
   selected.install(choices);
@@ -123,8 +123,8 @@ void checkPackage(const model::ModelPackage &package, uint32_t family) {
         &ops::MoeWorkspace::groupedInputBytes,
         &ops::MoeWorkspace::expertIntermediateBytes,
         &ops::MoeWorkspace::expertOutputBytes};
-    const auto oldMoe = baseline.moeDecodeWorkspacePerLane(geometry.moeShape(ops::WeightLayout::Affine64));
-    const auto newMoe = selected.moeDecodeWorkspacePerLane(geometry.moeShape(ops::WeightLayout::Affine64));
+    const auto oldMoe = baseline.moeDecodeWorkspacePerLane(geometry.moeShape());
+    const auto newMoe = selected.moeDecodeWorkspacePerLane(geometry.moeShape());
     for (auto field : fields)
       decodeGrowth += aligned(4 * (newMoe.*field)) - aligned(4 * (oldMoe.*field));
     require(decodeGrowth > 0, "M24 expert plan did not reserve larger scratch");
@@ -197,13 +197,21 @@ void checkMixedLayouts() {
               "mixed short-prefill split scratch is too small");
     }
   }
+  // Every MoE block of a target shares one layout, which the geometry's one
+  // MoE shape records: no source mixes them.
   auto sparse = package<model::Qwen3_6MoeWeights>();
   auto &moe = std::get<model::Qwen3_6MoeWeights>(sparse.target);
-  moe.layers.front().ffn = ops::BlockMoeWeights{};
-  const auto geometry = model::qwenTargetGeometry(moe);
-  require(geometry.moeShapes.size() == 2 &&
+  require(model::qwenTargetGeometry(moe).moeShape().weightLayout == ops::WeightLayout::Affine64,
+          "the MoE shape lost the blocks' layout");
+  for (auto &layer : moe.layers) layer.ffn = ops::BlockMoeWeights{};
+  require(model::qwenTargetGeometry(moe).moeShape().weightLayout == ops::WeightLayout::Block32 &&
               moe.logitsProjection.layout() == ops::WeightLayout::Affine64,
-          "MoE layout inventory must follow the expert layers, not the head");
+          "the MoE shape must follow the expert layers, not the head");
+  moe.layers.back().ffn = ops::AffineMoeWeights{};
+  bool mixedRejected = false;
+  try { static_cast<void>(model::qwenTargetGeometry(moe)); }
+  catch (const model::WeightStoreError &) { mixedRejected = true; }
+  require(mixedRejected, "a target mixing MoE layouts reached execution");
 }
 
 // Arenas are sized from the projections the weights hold, so each must have
