@@ -32,8 +32,8 @@ def write_gguf(path, values, tensors=()):
 
 def fixture(*, native=False):
     tokens = sorted(pre_tokenizers.ByteLevel.alphabet())
-    tokens += ["ab", "<|endoftext|>", "<|im_end|>", "<think>"]
-    types = [NORMAL] * 257 + [CONTROL, CONTROL, USER_DEFINED]
+    tokens += ["ab", "<|endoftext|>", "<|im_end|>", "<think>", "<|im_start|>"]
+    types = [NORMAL] * 257 + [CONTROL, CONTROL, USER_DEFINED, CONTROL]
     if native:
         padding = 248320 - len(tokens)
         tokens += [f"[unused{i}]" for i in range(padding)]
@@ -203,8 +203,11 @@ class GgufMetadataTests(unittest.TestCase):
             [256, 259, 258],
         )
         self.assertEqual(tokenizer.encode("ab"), [256])  # No implicit BOS/EOS.
+        # Control tokens are special whether or not a special-token ID names
+        # them; the user-defined <think> is not.
         self.assertEqual(
-            tokenizer.decode([256, 259, 258], skip_special_tokens=True), "ab<think>"
+            tokenizer.decode([260, 256, 259, 258], skip_special_tokens=True),
+            "ab<think>",
         )
         self.assertEqual(tokenizer.encode("e\u0301"), tokenizer.encode("é"))
         # Combining marks stay with letters; Qwen2's older pattern splits these.
