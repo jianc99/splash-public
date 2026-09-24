@@ -14,6 +14,7 @@ REPO = Path(__file__).resolve().parents[3]
 COMPLETIONS = REPO / "install/completions"
 OFFICIAL = ("official/Model-A", "official/Model-B")
 LOCAL = ("community/custom-splash", "community/linked-splash")
+UPSTREAM = ("unsloth/Model-GGUF:UD-Q4_K_M", "mlx-community/Model-4bit")
 
 
 def bash_paths():
@@ -95,10 +96,21 @@ class CompletionTests(unittest.TestCase):
         (models / "community/directory-manifest/manifest.json").mkdir(
             parents=True, exist_ok=True
         )
+        # Upstream installations link assemblies that record model.json.
+        for model in UPSTREAM:
+            assembly = self.root / (name + " assembly " + model.replace("/", " "))
+            assembly.mkdir()
+            (assembly / "model.json").write_text("{}")
+            (models / model).parent.mkdir(parents=True, exist_ok=True)
+            (models / model).symlink_to(assembly, target_is_directory=True)
+        (models / ".selections").mkdir(exist_ok=True)
+        (models / ".selections/0123").symlink_to(assembly, target_is_directory=True)
         for invalid in (
             "bad owner/model",
             "community/bad--name",
             "community/bad..name",
+            "community/model:bad variant",
+            "community/model:a:b",
         ):
             path = models / invalid
             path.mkdir(parents=True, exist_ok=True)
@@ -163,8 +175,9 @@ class CompletionTests(unittest.TestCase):
             with self.subTest(release=release):
                 _, directory = self.layout(str(release), release=release)
                 self.assertEqual(
-                    self.run_helper(directory), sorted((*OFFICIAL, *LOCAL))
+                    self.run_helper(directory), sorted((*OFFICIAL, *LOCAL, *UPSTREAM))
                 )
+                self.assertEqual(self.run_helper(directory, "unsloth/"), [UPSTREAM[0]])
                 self.assertEqual(self.run_helper(directory, "community/l"), [LOCAL[1]])
                 self.assertEqual(self.run_helper(directory, "community/*"), [])
                 self.assertEqual(self.run_helper(directory, "["), [])
@@ -185,14 +198,14 @@ class CompletionTests(unittest.TestCase):
                 )
                 self.assertEqual(
                     self.run_helper(directory),
-                    sorted((*OFFICIAL, *LOCAL, "official/New")),
+                    sorted((*OFFICIAL, *LOCAL, *UPSTREAM, "official/New")),
                 )
                 self.assertEqual(
                     self.run_helper(directory, "official/N"), ["official/New"]
                 )
                 cache.write_text("invalid\n")
                 self.assertEqual(
-                    self.run_helper(directory), sorted((*OFFICIAL, *LOCAL))
+                    self.run_helper(directory), sorted((*OFFICIAL, *LOCAL, *UPSTREAM))
                 )
 
     def test_actual_bash_completion(self):
@@ -200,11 +213,17 @@ class CompletionTests(unittest.TestCase):
         cases = (
             (["splash", ""], ["serve", "claude", "codex", "opencode", "hermes"]),
             (["splash", "co"], ["codex"]),
-            (["splash", "serve", "--model", ""], sorted((*OFFICIAL, *LOCAL))),
+            (
+                ["splash", "serve", "--model", ""],
+                sorted((*OFFICIAL, *LOCAL, *UPSTREAM)),
+            ),
             (["splash", "serve", "--model", "community/l"], [LOCAL[1]]),
             (["splash", "serve", "--model=community/l"], [LOCAL[1]]),
             (["splash", "serve", "--model", "=", "community/l"], [LOCAL[1]]),
-            (["splash", "serve", "--model", "="], sorted((*OFFICIAL, *LOCAL))),
+            (
+                ["splash", "serve", "--model", "="],
+                sorted((*OFFICIAL, *LOCAL, *UPSTREAM)),
+            ),
             (["splash", "serve", "--", "--model", ""], []),
             (["splash", "serve", "--max-context", ""], []),
         )

@@ -21,9 +21,11 @@ cache_file="$data_dir/catalog/official-models.txt"
         cat "$catalog"
         printf '\n'
     done
-    for manifest in "$models_dir"/*/*/manifest.json; do
-        [ -f "$manifest" ] || continue
-        directory=${manifest%/manifest.json}
+    # Upstream installations record model.json, legacy packages manifest.json;
+    # a GGUF variant's root is named repo:VARIANT.
+    for record in "$models_dir"/*/*/model.json "$models_dir"/*/*/manifest.json; do
+        [ -f "$record" ] || continue
+        directory=${record%/*}
         repository=${directory##*/}
         owner_directory=${directory%/*}
         printf '%s/%s\n' "${owner_directory##*/}" "$repository"
@@ -32,10 +34,12 @@ cache_file="$data_dir/catalog/official-models.txt"
     BEGIN {
         prefix = ENVIRON["SPLASH_COMPLETION_PREFIX"]
         component = "^[A-Za-z0-9_]([A-Za-z0-9._-]*[A-Za-z0-9_])?$"
+        variant = "^[A-Za-z0-9][A-Za-z0-9._-]*$"
     }
-    split($0, parts, "/") == 2 &&
-        parts[1] ~ component && parts[2] ~ component &&
-        length(parts[2]) <= 96 && parts[2] !~ /\.git$/ &&
+    split($0, parts, "/") == 2 && split(parts[2], names, ":") <= 2 &&
+        parts[1] ~ component && names[1] ~ component &&
+        length(names[1]) <= 96 && names[1] !~ /\.git$/ &&
+        (!(2 in names) || (names[2] ~ variant && length(names[2]) <= 64)) &&
         !index($0, "..") && !index($0, "--") &&
         index($0, prefix) == 1 { print }
 ' | LC_ALL=C sort -u
