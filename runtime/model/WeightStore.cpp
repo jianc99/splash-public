@@ -332,7 +332,7 @@ ops::EmbeddingWeights readBlockEmbedding(WeightFile &file, uint32_t outputSize, 
     if (d.outputSize != outputSize || d.inputSize != inputSize)
         throw WeightStoreError("GGUF embedding does not match the layout: " + std::string(label));
     const uint32_t format = gguf_format_of(d.type);
-    if (format == GGUF_FMT_COUNT || d.inputSize % kGgufBlockColumns ||
+    if (format == GGUF_FMT_COUNT ||
         d.plane0Bytes != d.outputSize * ggufRowBytes(kQuantFormats[format], d.inputSize))
         throw WeightStoreError("GGUF embedding rows are not native GGUF blocks: " + std::string(label));
     return {outputSize, inputSize,
