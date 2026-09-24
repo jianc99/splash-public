@@ -256,6 +256,59 @@ void checkPair(ModelPackage package, bool sparse) {
   rejects([&] { (void)collectTuningWorkloads(package, prefill, decode); });
 }
 
+// A GGUF target is not tuned: block plans never read installed choices
+// (Linear::plan, ExecutionPlans::moePrefill/moeDecode), so the collector
+// takes none of its projections or MoE blocks, only the affine draft's, and
+// a choice installed for its MoE shape leaves its plans as they were.
+void blockTarget() {
+  ModelPackage package;
+  const Qwen3_6MoeLayout layout;
+  auto target = targetWeights<Qwen3_6MoeWeights>(layout);
+  const auto block = [](const Projection &p) {
+    QuantizedSegment segment;
+    segment.outputSize = p.outputSize;
+    segment.inputSize = p.inputSize;
+    return Projection(p.outputSize, p.inputSize, BlockWeights{{segment}});
+  };
+  target.logitsProjection = block(target.logitsProjection);
+  for (auto &layer : target.layers) {
+    std::visit([&](auto &mixer) {
+      mixer.inputProjection = block(mixer.inputProjection);
+      mixer.outputProjection = block(mixer.outputProjection);
+    }, layer.mixer);
+    layer.ffn = BlockMoeWeights{};
+  }
+  const MoeShape shape = qwenTargetGeometry(target).moeShape();
+  package.target = std::move(target);
+  DFlashDraftLayout draft;
+  draft.layers = 6;
+  draft.hiddenSize = 2048;
+  draft.dynamicSize = 512;
+  draft.intermediateSize = 6144;
+  draft.targetHiddenSize = 16384;
+  package.draft = draftWeights(draft);
+  const auto inventory = collectTuningWorkloads(package, tuning::kPrefillProbeRows,
+                                                tuning::kDecodeProbeWidths);
+  require(inventory.moe.empty(), "a GGUF target's MoE blocks were collected for tuning");
+  for (const auto &input : linearKeys(inventory))
+    require(input.epilogue != LinearEpilogue::Residual &&
+                input.matrix != LinearMatrix{layout.vocabularySize, layout.hiddenSize} &&
+                input.matrix != LinearMatrix{layout.packedGdnWidth, layout.hiddenSize} &&
+                input.matrix != LinearMatrix{layout.packedFullWidth, layout.hiddenSize},
+            "a GGUF target's projections were collected for tuning");
+  require(shape.weightLayout == WeightLayout::Block32, "the block target lost its MoE layout");
+  splash::DeviceCapabilities device;
+  device.appleGpuFamily = 10;
+  device.gpuCoreCount = 16;
+  ExecutionPlans plans(device);
+  const MoeConfig before = plans.moePrefill(shape, 512).config();
+  OperatorChoices choices;
+  choices.moe.push_back({{shape, 512, MoePhase::Prefill}, {MoeExpertTile::M8}});
+  plans.install(choices);
+  require(before.expertTile == MoeExpertTile::M32 && plans.moePrefill(shape, 512).config() == before,
+          "an installed choice changed a GGUF MoE plan");
+}
+
 void run() {
   ModelPackage dense;
   dense.target = targetWeights<Qwen3_8Weights>(Qwen3_8Layout{});
@@ -469,6 +522,7 @@ int main(int argc, char **argv) {
     if (argc > 2)
       throw std::invalid_argument("usage: tuning-workloads [metallib]");
     run();
+    blockTarget();
     if (argc == 2)
       metadataViews(argv[1]);
     std::cout << "Tuning workload inventory tests passed\n";
