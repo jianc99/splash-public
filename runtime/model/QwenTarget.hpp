@@ -61,7 +61,7 @@ using QwenMixerWeights = std::variant<QwenGdnWeights, QwenAttentionWeights>;
 struct QwenMixerGeometry final {
   uint32_t hiddenSize = 0;
   uint32_t packedGdnWidth = 0;
-  uint32_t packedAttentionWidth = 0;
+  uint32_t packedFullWidth = 0;
   uint32_t convolutionDimension = 0;
   uint32_t gdnValueHeads = 0;
   uint32_t gdnHeadDimension = 0;
@@ -224,7 +224,7 @@ struct QwenTargetGeometry final {
   uint32_t hiddenSize = 0;
   uint32_t vocabularySize = 0;
   uint32_t packedGdnWidth = 0;
-  uint32_t packedAttentionWidth = 0;
+  uint32_t packedFullWidth = 0;
   uint32_t convolutionDimension = 0;
   uint32_t gdnKeyHeads = 0;
   uint32_t gdnValueHeads = 0;
@@ -290,7 +290,7 @@ struct QwenTargetGeometry final {
       });
     };
     return maximumContextTokens && layers && hiddenSize && vocabularySize &&
-           packedGdnWidth && packedAttentionWidth && convolutionDimension &&
+           packedGdnWidth && packedFullWidth && convolutionDimension &&
            gdnKeyHeads && gdnValueHeads && gdnHeadDimension &&
            attentionWidth && attentionQueryHeads && attentionKvHeads &&
            attentionHeadDimension && rotaryPairs && rotaryTheta > 0.0F &&

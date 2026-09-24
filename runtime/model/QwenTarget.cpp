@@ -23,7 +23,7 @@ QwenTargetGeometry commonGeometry(const Layout &layout) {
   result.hiddenSize = layout.hiddenSize;
   result.vocabularySize = layout.vocabularySize;
   result.packedGdnWidth = layout.packedGdnWidth;
-  result.packedAttentionWidth = layout.packedFullWidth;
+  result.packedFullWidth = layout.packedFullWidth;
   result.convolutionDimension = layout.convolutionDimension;
   result.attentionWidth = layout.attentionWidth;
   result.attentionQueryHeads = layout.attentionQueryHeads;
@@ -99,7 +99,7 @@ QwenMixerWeights readQwenMixer(WeightFile &file, const Format &format,
   if (fullAttention) {
     QwenAttentionWeights attention;
     attention.inputProjection =
-        format.fused(file, geometry.packedAttentionWidth, geometry.hiddenSize, "attention-input",
+        format.fused(file, geometry.packedFullWidth, geometry.hiddenSize, "attention-input",
                      {"attn-q", "attn-k", "attn-v"});
     attention.queryNorm =
         readNorm(file, geometry.attentionHeadDimension, Format::float32Norms, "query-norm");
@@ -379,7 +379,7 @@ metal::MetalBuffer QwenTarget::addPrefillMixer(PrefillStep &step, const QwenAtte
     const metal::MetalBuffer keys = backend_.view(b.chunkKeys, sequence.kvOffset, kvBytes);
     const metal::MetalBuffer values = backend_.view(b.chunkValues, sequence.kvOffset, kvBytes);
     ops::PagedAttention::addPrefillProjection(
-        step.graph, u16(b.fullPacked, geometry_.packedAttentionWidth), mixer.queryNorm, mixer.keyNorm,
+        step.graph, u16(b.fullPacked, geometry_.packedFullWidth), mixer.queryNorm, mixer.keyNorm,
         f32(b.ropeCos, geometry_.rotaryPairs), f32(b.ropeSin, geometry_.rotaryPairs), queries, keys, values,
         sequence.rows, sequence.attentionStride, sequence.attentionStride, geometry_.attentionQueryHeads,
         geometry_.kvLayout);
@@ -391,7 +391,7 @@ metal::MetalBuffer QwenTarget::addPrefillMixer(PrefillStep &step, const QwenAtte
         operators_.prefillAttention(sequence.rows, geometry_.attentionQueryHeads, geometry_.kvLayout,
                                     sequence.q8.committed_tokens));
     ops::PagedAttention::addPrefillGate(
-        step.graph, u16(b.fullPacked, geometry_.packedAttentionWidth), attentionRows,
+        step.graph, u16(b.fullPacked, geometry_.packedFullWidth), attentionRows,
         u16(b.attentionHidden, geometry_.attentionWidth), sequence.rows, sequence.attentionStride,
         sequence.attentionStride, geometry_.attentionQueryHeads, geometry_.kvLayout);
   }

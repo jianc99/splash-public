@@ -139,7 +139,7 @@ std::set<LinearWorkload> expectedLinear(
   };
   for (auto phase : {LinearPhase::Prefill, LinearPhase::Decode}) {
     for (auto matrix : {LinearMatrix{target.packedGdnWidth, target.hiddenSize},
-                         LinearMatrix{target.packedAttentionWidth, target.hiddenSize},
+                         LinearMatrix{target.packedFullWidth, target.hiddenSize},
                          LinearMatrix{draft.hiddenSize, draft.targetHiddenSize},
                          LinearMatrix{draft.qkvSize, draft.hiddenSize}})
       add(matrix, phase, LinearEpilogue::None);

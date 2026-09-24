@@ -55,7 +55,7 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
                          geometry.target.denseIntermediateSize));
   put(PrefillTensor::FullPacked,
       bytesFor<uint16_t>(uint64_t{kPrefillRows} *
-                         geometry.target.packedAttentionWidth));
+                         geometry.target.packedFullWidth));
   put(PrefillTensor::FullQueries,
       bytesFor<uint16_t>(uint64_t{geometry.target.attentionQueryHeads} *
                          kPackedAttentionRows *
@@ -189,7 +189,7 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
   put(DecodeTensor::Intermediate,
       bytesFor<uint16_t>(r * geometry.target.denseIntermediateSize));
   put(DecodeTensor::FullPacked,
-      bytesFor<uint16_t>(r * geometry.target.packedAttentionWidth));
+      bytesFor<uint16_t>(r * geometry.target.packedFullWidth));
   put(DecodeTensor::FullQueries,
       bytesFor<uint16_t>(uint64_t{geometry.target.attentionQueryHeads} *
                          kTileRows * geometry.target.attentionHeadDimension));
