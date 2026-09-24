@@ -194,7 +194,7 @@ def fixture(root, source, shift=0, case=None):
 
 
 def prepare(binary, directory, source, mode, expected=True):
-    command = [binary, source, str(directory), "tiny", mode]
+    command = [binary, source, str(directory), mode]
     if expected:
         command.append(str(directory / "expected.bin"))
     env = {**os.environ, "SPLASH_WEIGHT_CACHE": str(directory / "cache")}
