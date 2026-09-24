@@ -77,10 +77,10 @@ class Metadata:
                     "unsupported GGUF header (expected little-endian v2/v3)"
                 )
             tensor_count = self.scalar("Q")
-            count = self.scalar("Q")
-            if count > self.MAX_ITEMS or tensor_count > self.MAX_ITEMS:
+            key_count = self.scalar("Q")
+            if key_count > self.MAX_ITEMS or tensor_count > self.MAX_ITEMS:
                 raise ModelError("GGUF metadata has too many fields")
-            for _ in range(count):
+            for _ in range(key_count):
                 key = self.string()
                 if key in self.values:
                     raise ModelError("duplicate GGUF metadata key: " + key)
