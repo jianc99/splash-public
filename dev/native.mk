@@ -24,14 +24,21 @@ TUNING_SOURCES := \
 	dev/tuning/DraftAttentionTuning.cpp \
 	dev/tuning/MoeTuning.cpp \
 	dev/tuning/TuningWorkloads.cpp
-BACKEND_CONTROL_SOURCES := \
-	runtime/engine/Scheduler.cpp \
-	runtime/model/DraftContextPlan.cpp \
+# Control-plane tests compile the runtime sources they check: their sanitizer
+# builds cannot use the unsanitized engine library, and none links a framework.
+CACHE_SOURCES := \
 	runtime/engine/KvPool.cpp \
 	runtime/engine/KvCache.cpp \
 	runtime/engine/StateCache.cpp \
-	runtime/engine/Cache.cpp \
+	runtime/engine/Cache.cpp
+BACKEND_CONTROL_SOURCES := \
+	runtime/engine/Scheduler.cpp \
+	runtime/model/DraftContextPlan.cpp \
+	$(CACHE_SOURCES) \
 	runtime/engine/Engine.cpp
+NATIVE_RUNTIME_SOURCES := $(BACKEND_CONTROL_SOURCES) \
+	runtime/engine/Protocol.cpp \
+	runtime/engine/NativeRuntime.cpp
 TEST_BACKEND_ASAN := $(ENGINE_SANITIZER_BUILD)/kv-first-engine-asan-ubsan
 TEST_BACKEND_TSAN := $(ENGINE_SANITIZER_BUILD)/kv-first-engine-tsan
 TEST_FD_TRANSPORT_ASAN := $(ENGINE_SANITIZER_BUILD)/native-fd-asan-ubsan
@@ -264,17 +271,11 @@ $(TEST_RAGGED_SCHEDULER_TEST): runtime/engine/Scheduler.cpp \
 		dev/tests/engine/ragged_scheduler_test.cpp | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) -o $@
 
-$(TEST_CACHE_TEST): runtime/engine/KvPool.cpp \
-		runtime/engine/KvCache.cpp \
-		runtime/engine/StateCache.cpp \
-		runtime/engine/Cache.cpp \
+$(TEST_CACHE_TEST): $(CACHE_SOURCES) \
 		dev/tests/engine/cache_test.cpp | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) -o $@
 
-$(TEST_KV_FIRST_CACHE_TEST): runtime/engine/KvPool.cpp \
-		runtime/engine/KvCache.cpp \
-		runtime/engine/StateCache.cpp \
-		runtime/engine/Cache.cpp \
+$(TEST_KV_FIRST_CACHE_TEST): $(CACHE_SOURCES) \
 		dev/tests/engine/kv_first_cache_test.cpp | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) -o $@
 
@@ -286,9 +287,7 @@ $(TEST_PROTOCOL_TEST): runtime/engine/Protocol.cpp \
 		dev/tests/engine/protocol_test.cpp | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) -o $@
 
-$(TEST_NATIVE_LOOP_TEST): $(BACKEND_CONTROL_SOURCES) \
-		runtime/engine/Protocol.cpp \
-		runtime/engine/NativeRuntime.cpp \
+$(TEST_NATIVE_LOOP_TEST): $(NATIVE_RUNTIME_SOURCES) \
 		dev/tests/engine/native_engine_loop_test.cpp | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) -o $@
 
@@ -666,9 +665,7 @@ $(TEST_KV_FIRST_ENGINE_TEST) $(TEST_BACKEND_ASAN) $(TEST_BACKEND_TSAN): \
 		$(BACKEND_CONTROL_SOURCES) \
 		dev/tests/engine/kv_first_engine_test.cpp
 $(TEST_FD_TRANSPORT_TEST) $(TEST_FD_TRANSPORT_ASAN) $(TEST_FD_TRANSPORT_TSAN): \
-		$(BACKEND_CONTROL_SOURCES) \
-		runtime/engine/Protocol.cpp \
-		runtime/engine/NativeRuntime.cpp \
+		$(NATIVE_RUNTIME_SOURCES) \
 		runtime/engine/FdTransport.cpp \
 		dev/tests/engine/native_fd_transport_test.cpp
 $(TEST_OPERATOR_TUNING) $(TEST_OPERATOR_TUNING_ASAN) $(TEST_OPERATOR_TUNING_TSAN): \
