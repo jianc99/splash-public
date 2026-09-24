@@ -31,15 +31,15 @@ static_assert(GGUF_TABLE16_SPAN_VALUES == q4sg::kXtPerGroup, "a span is one q4sg
 inline void write_input(device bfloat *table, device float *sums, uint width, uint span,
                         uint row, uint lane, bfloat a, bfloat b) {
   const uint2 l = klogical(2 * lane);
-  table[span * q4sg::kXtPerGroup + q4sg::xt_offset(l.x, l.y, row)] = a;
-  table[span * q4sg::kXtPerGroup + q4sg::xt_offset(l.x, l.y + 1, row)] = b;
+  table[span * GGUF_TABLE16_SPAN_VALUES + q4sg::xt_offset(l.x, l.y, row)] = a;
+  table[span * GGUF_TABLE16_SPAN_VALUES + q4sg::xt_offset(l.x, l.y + 1, row)] = b;
   float s = float(a) + float(b);
   s += simd_shuffle_xor(s, 1u);
   s += simd_shuffle_xor(s, 2u);
   s += simd_shuffle_xor(s, 4u);
-  if ((lane & 7) == 0) sums[(span * 4 + lane / 8) * 8 + row] = -float(kZeroPointOffset) * s;
+  if ((lane & 7) == 0) sums[(span * (GGUF_TABLE16_SPAN_SEEDS / q4sg::kRows) + lane / 8) * q4sg::kRows + row] = -float(kZeroPointOffset) * s;
   const float s32 = s + simd_shuffle_xor(s, 8u);
-  if ((lane & 15) == 0) sums[table16_sums32_offset(width) + (span * 2 + lane / 16) * 8 + row] = s32;
+  if ((lane & 15) == 0) sums[table16_sums32_offset(width) + (span * (GGUF_TABLE16_SPAN_SUMS / q4sg::kRows) + lane / 16) * q4sg::kRows + row] = s32;
 }
 
 struct Table16 {

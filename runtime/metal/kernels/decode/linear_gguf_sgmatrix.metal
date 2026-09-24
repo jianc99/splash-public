@@ -42,6 +42,7 @@ template <class F> using Coef = metal::conditional_t<Shape<F>::HasMin != 0, floa
 // The coefficients of a threadgroup's simdgroups for one unit; the run-time-format kernels hold every format's in
 // storage of the largest size.
 template <class F> constant constexpr uint kCoefs = GGUF_TILE_COLUMNS * Shape<F>::J;
+static_assert(GGUF_REGISTER_COLUMNS == 2 * 8, "a simdgroup's columns are its two 8-column MMA fragments");
 constant constexpr uint kCoefFloat2s = kCoefs<FmtQ4K>;
 #define GGUF_SG_COEF_BYTES(F, f) static_assert(kCoefs<F> * sizeof(Coef<F>) <= kCoefFloat2s * sizeof(float2), #f " coefficients fit");
 QUANT_FORMATS(GGUF_SG_COEF_BYTES)
@@ -99,7 +100,7 @@ template <class F> inline Coef<F> coefficient(CoefSource<F> src, uint u, uint j)
   else return h ? k.s.y : k.s.x;
 }
 
-// One threadgroup: 4 simdgroups x 16 columns = 64 columns of one segment,
+// One threadgroup: 4 simdgroups x GGUF_REGISTER_COLUMNS = GGUF_TILE_COLUMNS columns of one segment,
 // L request lanes of eight rows, one K partition (tg.y) of `splits`.
 template <class F, uint L, GgufEpilogue Ep>
 inline void decode(device const bfloat *table, device const float *sums, device uchar *w0,
@@ -119,7 +120,8 @@ inline void decode(device const bfloat *table, device const float *sums, device 
   const uint fm = l.fm, fn = l.fn, c = fn / 2;
   const uint base = tg.x * GGUF_TILE_COLUMNS + sg * GGUF_REGISTER_COLUMNS, plane_tile = base / QUANT_TILE_ROWS,
              plane_row = base % QUANT_TILE_ROWS;
-  threadgroup C *cu = coefs + sg * GGUF_REGISTER_COLUMNS * S::J;
+  constexpr uint NC = GGUF_REGISTER_COLUMNS;
+  threadgroup C *cu = coefs + sg * NC * S::J;
 
   // Weight streams: lane c reads chunk c of each group; a span's two groups
   // of one column are a plane tile of payloads apart.
@@ -149,23 +151,23 @@ inline void decode(device const bfloat *table, device const float *sums, device 
   for (uint r = 0; r < L; ++r) acc[r][0] = acc[r][1] = float2(0);
   load(cur);
   for (uint u = u0; u < u1; ++u) {
-    // This unit's coefficients for the simdgroup's 16 columns, each decoded
+    // This unit's coefficients for the simdgroup's NC columns, each decoded
     // once. Every source load is issued before the first decode waits for one:
     // on the 40-core M3 the zero-point formats (16 coefficients per column and
     // unit) gain at one to four lanes, Q6_K 5120x17408 2.5/3.8/3.1/1.1% and
     // Q3_K 7.6/4.3/3.3/2.2%; the other formats stay within 0.7%.
-    constexpr uint I = (16 * S::J + 31) / 32;
+    constexpr uint I = (NC * S::J + 31) / 32;
     CoefSource<F> src[I];
 #pragma unroll
     for (uint i = 0; i < I; ++i) {
       const uint e = lane + 32 * i;
-      if (e < 16 * S::J) src[i] = coefficient_source<F>(w0, w1, meta, plane_tile, groups, plane_row + (e & 15), u, e >> 4);
+      if (e < NC * S::J) src[i] = coefficient_source<F>(w0, w1, meta, plane_tile, groups, plane_row + e % NC, u, e / NC);
     }
     simdgroup_barrier(mem_flags::mem_threadgroup);
 #pragma unroll
     for (uint i = 0; i < I; ++i) {
       const uint e = lane + 32 * i;
-      if (e < 16 * S::J) cu[e] = coefficient<F>(src[i], u, e >> 4);
+      if (e < NC * S::J) cu[e] = coefficient<F>(src[i], u, e / NC);
     }
     simdgroup_barrier(mem_flags::mem_threadgroup);
 #pragma unroll
@@ -186,7 +188,7 @@ inline void decode(device const bfloat *table, device const float *sums, device 
 #pragma unroll
           for (uint f = 0; f < 4; ++f) a[nf][f] = operand<F>(cur[nf][q], f, lut);
 #pragma unroll
-          for (uint h = 0; h < S::CG; ++h) cs[h][nf] = cu[((us * 2 + q) * S::CG + h) * 16 + nf * 8 + fm];
+          for (uint h = 0; h < S::CG; ++h) cs[h][nf] = cu[((us * 2 + q) * S::CG + h) * NC + nf * 8 + fm];
         }
 #pragma unroll
         for (uint r = 0; r < L; ++r) {
