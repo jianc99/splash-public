@@ -624,19 +624,8 @@ def _install(args, repo, variant, models_root, root, installed):
     files = {name: sources[source] for name, source in components.items()}
     for name in sorted(target.weights):
         files["target/" + Path(name).name] = sources[name]
-    if target.format == "gguf":
-        metadata_key, metadata = _gguf_metadata(
-            models_root,
-            sources[next(iter(target.weights))],
-            files.get("vision/mmproj.gguf"),
-        )
-        files.update(metadata)
-    else:
-        files["target/config.json"] = files["config.json"]
-    files["tokenizer/config.json"] = files["config.json"]
     for name, path in drafts.items():
         files["draft/" + Path(name).name] = path
-    records = {}
     record = {
         "version": 1,
         "model": args.model,
@@ -648,15 +637,25 @@ def _install(args, repo, variant, models_root, root, installed):
         if target.format == "gguf"
         else "safetensors",
         "sources": {"target": repo.identity(), "draft": draft.identity()},
-        "files": {
+    }
+    models_root.mkdir(parents=True, exist_ok=True)
+    # Everything written under the models root is written under the lock.
+    with models.installation_lock(models_root):
+        if target.format == "gguf":
+            record["metadata"], metadata = _gguf_metadata(
+                models_root,
+                sources[next(iter(target.weights))],
+                files.get("vision/mmproj.gguf"),
+            )
+            files.update(metadata)
+        else:
+            files["target/config.json"] = files["config.json"]
+        files["tokenizer/config.json"] = files["config.json"]
+        records = {}
+        record["files"] = {
             name: records.setdefault(str(path.absolute()), _file_record(path))
             for name, path in sorted(files.items())
-        },
-    }
-    if target.format == "gguf":
-        record["metadata"] = metadata_key
-    models_root.mkdir(parents=True, exist_ok=True)
-    with models.installation_lock(models_root):
+        }
         # A new installation requires its pins before it is published; its
         # older pins are retired once it is.
         refs = [
@@ -794,7 +793,9 @@ def _metadata_key(sources):
 
 
 def _gguf_metadata(models_root, target, vision):
-    """The key and files of target's derived metadata, prepared once."""
+    """The key and files of target's derived metadata, prepared once and
+    derived again when an entry is damaged. Call it under the installation
+    lock, which also serializes the derivation."""
     source_paths = [target] + ([vision] if vision else [])
     sources = [_file_record(path) for path in source_paths]
     key = _metadata_key(sources)
@@ -808,44 +809,51 @@ def _gguf_metadata(models_root, target, vision):
     }
     if vision:
         names.add("processor/preprocessor_config.json")
-    if not destination.exists():
-        metadata = gguf.Metadata(target)
-        vision_metadata = gguf.Metadata(vision) if vision else None
-        contents = gguf.tokenizer_files(metadata)
-        contents["config.json"] = gguf.json_bytes(
-            gguf.model_config(metadata, vision_metadata)
-        )
-        if vision_metadata:
-            contents["processor/preprocessor_config.json"] = gguf.json_bytes(
-                gguf.processor_config(vision_metadata)
-            )
-        if [_file_record(path) for path in source_paths] != sources:
-            raise models.ModelError("GGUF source changed while reading metadata")
-        cache.mkdir(parents=True, exist_ok=True)
-        stage = Path(tempfile.mkdtemp(prefix=".loading-", dir=cache))
+    if destination.exists():
         try:
-            for name, data in contents.items():
-                path = stage / name
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_bytes(data)
-            hashes = {
-                name: hashlib.sha256(data).hexdigest()
-                for name, data in contents.items()
-            }
-            (stage / "files.json").write_bytes(gguf.json_bytes(hashes))
-            with models.installation_lock(models_root):
-                if not destination.exists():
-                    os.rename(stage, destination)
-        finally:
-            if stage.exists():
-                shutil.rmtree(stage)
+            return key, _metadata_files(destination, names)
+        except (models.ModelError, OSError) as error:
+            print(f"Deriving damaged GGUF metadata again: {error}", flush=True)
+            shutil.rmtree(destination)
+    metadata = gguf.Metadata(target)
+    vision_metadata = gguf.Metadata(vision) if vision else None
+    contents = gguf.tokenizer_files(metadata)
+    contents["config.json"] = gguf.json_bytes(
+        gguf.model_config(metadata, vision_metadata)
+    )
+    if vision_metadata:
+        contents["processor/preprocessor_config.json"] = gguf.json_bytes(
+            gguf.processor_config(vision_metadata)
+        )
+    if [_file_record(path) for path in source_paths] != sources:
+        raise models.ModelError("GGUF source changed while reading metadata")
+    cache.mkdir(parents=True, exist_ok=True)
+    stage = Path(tempfile.mkdtemp(prefix=".loading-", dir=cache))
+    try:
+        for name, data in contents.items():
+            path = stage / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+        hashes = {
+            name: hashlib.sha256(data).hexdigest() for name, data in contents.items()
+        }
+        (stage / "files.json").write_bytes(gguf.json_bytes(hashes))
+        os.rename(stage, destination)
+    finally:
+        if stage.exists():
+            shutil.rmtree(stage)
+    return key, _metadata_files(destination, names)
+
+
+def _metadata_files(destination, names):
+    """The files of a metadata entry, checked against its files.json."""
     hashes = models.read_json(destination / "files.json")
     if set(hashes) != names:
         raise models.ModelError("invalid prepared GGUF metadata record")
     for name in names:
         if models.sha256(destination / name) != hashes[name]:
             raise models.ModelError("prepared GGUF metadata changed: " + name)
-    return key, {name: destination / name for name in names}
+    return {name: destination / name for name in names}
 
 
 def _file_record(path):

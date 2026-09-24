@@ -3,7 +3,6 @@ import contextlib
 import io
 import struct
 import tempfile
-import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -274,49 +273,59 @@ class GgufMetadataTests(unittest.TestCase):
         self.assertEqual(gguf.vision_config(vision)["num_position_embeddings"], 2304)
         upstream._validate_processor(gguf.processor_config(vision))
 
+    def derived(self, models_root, path):
+        """_gguf_metadata as installations call it, under the lock."""
+        models_root.mkdir(parents=True, exist_ok=True)
+        with models.installation_lock(models_root):
+            return upstream._gguf_metadata(models_root, path, None)
+
     def test_metadata_cache_hit_integrity_and_atomic_failure(self):
         path = write_gguf(self.root / "model.gguf", fixture())
         cache = self.root / "models"
-        key, files = upstream._gguf_metadata(cache, path, None)
+        key, files = self.derived(cache, path)
         self.assertEqual(files["config.json"].parent.name, key)
+        expected = files["tokenizer/tokenizer.json"].read_bytes()
         with mock.patch.object(
             gguf, "Metadata", side_effect=AssertionError("reparsed")
         ):
-            self.assertEqual(upstream._gguf_metadata(cache, path, None), (key, files))
-        files["tokenizer/tokenizer.json"].write_text("corrupt")
-        with self.assertRaisesRegex(models.ModelError, "metadata changed"):
-            upstream._gguf_metadata(cache, path, None)
+            self.assertEqual(self.derived(cache, path), (key, files))
+        # A damaged entry is derived again, not left to block installation.
+        for damage in (
+            lambda: files["tokenizer/tokenizer.json"].write_text("corrupt"),
+            lambda: files["config.json"].unlink(),
+            lambda: (files["config.json"].parent / "files.json").write_text("{}"),
+        ):
+            damage()
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(self.derived(cache, path), (key, files))
+            self.assertIn("Deriving damaged GGUF metadata again", output.getvalue())
+            self.assertEqual(files["tokenizer/tokenizer.json"].read_bytes(), expected)
         with mock.patch(
             "install.upstream.os.rename", side_effect=OSError("interrupted")
         ):
             with self.assertRaises(OSError):
-                upstream._gguf_metadata(self.root / "interrupted", path, None)
+                self.derived(self.root / "interrupted", path)
         self.assertEqual(list((self.root / "interrupted/.metadata").iterdir()), [])
-        self.assertTrue(upstream._gguf_metadata(self.root / "interrupted", path, None))
+        self.assertTrue(self.derived(self.root / "interrupted", path))
 
-    def test_concurrent_preparation_and_source_change(self):
+    def test_concurrent_preparation_derives_once_and_follows_the_source(self):
         path = write_gguf(self.root / "model.gguf", fixture())
         cache = self.root / "models"
-        barrier = threading.Barrier(2)
-        original = gguf.tokenizer_files
-
-        def synchronized(metadata):
-            barrier.wait(timeout=5)
-            return original(metadata)
-
-        with mock.patch.object(gguf, "tokenizer_files", side_effect=synchronized):
-            with ThreadPoolExecutor(max_workers=2) as pool:
-                results = list(
-                    pool.map(
-                        lambda _: upstream._gguf_metadata(cache, path, None), range(2)
-                    )
-                )
+        with (
+            mock.patch.object(
+                gguf, "tokenizer_files", wraps=gguf.tokenizer_files
+            ) as derive,
+            ThreadPoolExecutor(max_workers=2) as pool,
+        ):
+            results = list(pool.map(lambda _: self.derived(cache, path), range(2)))
+        # The lock serializes installations: the second reuses the entry.
+        derive.assert_called_once()
         self.assertEqual(results[0], results[1])
         self.assertEqual(len(list((cache / ".metadata").iterdir())), 1)
         values = fixture()
         values["tokenizer.chat_template"] = "updated template"
         write_gguf(path, values)
-        _, changed = upstream._gguf_metadata(cache, path, None)
+        _, changed = self.derived(cache, path)
         self.assertNotEqual(changed, results[0][1])
         self.assertEqual(
             changed["tokenizer/chat_template.jinja"].read_text(), "updated template"
