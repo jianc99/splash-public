@@ -1,8 +1,10 @@
 # Upstream model loading
 
-Measurements behind serving MLX and GGUF upstream models directly (September
-2026). Devices: M3 Max 40 GPU cores (Apple9), M5 Pro 16 and 20 GPU cores
-(Apple10), AC power, one GPU job at a time.
+Measurements behind serving MLX and GGUF upstream models directly, taken in
+September 2026 while upstream loading was built; each section names what was
+measured and how to repeat it. Devices: M3 Max 40 GPU cores (Apple9), M5 Pro 16
+and 20 GPU cores (Apple10), AC power, one GPU job at a time. Build the tools
+below with `make all build/engine-tests/<tool>`.
 
 ## Sources
 
@@ -47,10 +49,26 @@ Each Unsloth mmproj holds 334 tensors: 110 BF16 matrices and 224 F32 tensors
 F32 values has non-zero low 16 bits (0 of 4,833,008 for 27B, 0 of 4,829,936 for
 35B), so they convert to BF16 exactly.
 
+The affine comparison is `affine-source-oracle`, given an MLX snapshot directory
+and the installed package of the same model; it prints `packed_exact=true` and
+the decay's `decay_max_ulp` per file. Give it a scratch `SPLASH_WEIGHT_CACHE`.
+The GGUF repack check is `gguf-repack` in `make test-engine-metal`.
+
+```sh
+SPLASH_WEIGHT_CACHE=$(mktemp -d) build/engine-tests/affine-source-oracle \
+  build/splash.metallib MLX_SNAPSHOT install/models/incoai/Qwen3.6-35B-A3B-Splash
+```
+
+A prepared vision file is the `weights` file of the cache entry whose `source`
+names `component vision/model.bin` (`grep -l '^component vision/model.bin'
+~/Library/Caches/Splash/weights/*/source`).
+
 The vision fixture embedding is unchanged, with Metal shader validation:
 `7946f077435ef45d0a596461a9d9a234ff458c805c007bb3ea1af7296bd230f9` for 35B on
 both M5 Pro devices, `011d9121bf52f85a26e7eff28e9c9459a48eb0bb36d585ff8e7ef7621cd3a37b`
 for 27B on the M3 Max. The 35B mmproj and MLX sources give the packed embedding.
+`make test-real MODEL=...` prints it (`embedding SHA-256`) with the vision
+parity check.
 
 ## GGUF tokenizer
 
@@ -73,9 +91,16 @@ which shares vocabulary, merges and pre-tokenizer (used only as a test reference
   (system messages, tool calls and results, image placeholders, tools and
   thinking on and off) match the original template and the reference token IDs.
 
+That comparison script is not in the repository. The committed checks are
+`python -m unittest dev.tests.test_gguf_metadata` (synthetic metadata) and the
+chat-template probe tests over the embedded templates in
+`dev/tests/fixtures/chat_templates/`.
+
 ## Preparation cost
 
-35B UD-Q4_K_M GGUF: 42 artifacts, 22,143,172,608 bytes.
+35B UD-Q4_K_M GGUF: 42 artifacts, 22,143,172,608 bytes, prepared by the
+batched executor of `2ca5691`; later preparation changes did not repeat this
+timing.
 
 | Device | Cold preparation | Reuse of prepared files |
 | --- | ---: | ---: |
@@ -87,13 +112,24 @@ backend creation, source verification, planning, conversion, output hashing and
 publication, not tokenizer, server startup or warmup. Peak process RSS is about
 65–68 MB; staging is bounded to 32 MiB inside a 64 MiB admission reserve and does
 not grow with tensor, layer or expert count. No run increased the system swap
-counters. Reopening the prepared affine 35B files takes 0.064 s on the M5 Pro 20.
+counters. Reopening the prepared affine 35B files takes 0.064 s on the M5 Pro 20
+(`affine-source-oracle ... --load-only`, which prints `seconds=`). The GGUF
+timing harness is not in the repository; a cold start logs each artifact's
+`Prepared <component> in N s`.
 
 ## Decode throughput
 
-`backend-benchmark --scenario decode --samples 3`, 64 tokens per lane at B1–B4,
-baseline/candidate/candidate/baseline. Ratios are baseline median GPU time over
-candidate median GPU time against PR 114 (`d25020e`), so 1.000 is unchanged.
+Baseline: PR 114 (`d25020e`), serving the Splash packages. Candidate: its child
+`f72b411`, which introduced source preparation, serving the packages
+("packed"), the MLX checkpoints with the packages' drafts ("prepared"), and the
+Unsloth GGUFs through the GGUF packages of that time ("GGUF"). 64 tokens per lane at B1–B4, run
+baseline/candidate/candidate/baseline; ratios are baseline median GPU time over
+candidate median GPU time, so 1.000 is unchanged.
+
+```sh
+build/engine-tests/backend-benchmark build/splash.metallib MODEL_ROOT \
+  --scenario decode --samples 3
+```
 
 | Device | Target | B1 | B2 | B3 | B4 |
 | --- | --- | ---: | ---: | ---: | ---: |
@@ -110,12 +146,15 @@ Output hashes, accepted draft counts and decode batch counts matched the baselin
 in every run. The M3 Max prepared-affine 27B round drifted strongly within and
 across runs (B2–B4 1.04–1.07) and is not claimed as a gain. A repeated 2048-token
 prefill probe on the M5 Pro 16 (GGUF 35B, seven repetitions per process, ABBA)
-gave 683.9 ms baseline and 683.5 ms candidate.
+gave 683.9 ms baseline and 683.5 ms candidate; the probe, derived from
+`decode_profile.mm`, is not in the repository.
 
 ## End to end
 
 `splash serve` installs of all four upstream models on the M5 Pro 16, with the
 draft fetched from the shared draft repository, produce the same answers as the
 released packages for two text and two image prompts (greedy decoding, same
-binary), and their prepared vision files match the hashes above. An installed model restarts
-in 0.1 s with `HF_HUB_OFFLINE=1`.
+binary), and their prepared vision files match the hashes above. With
+`HF_HUB_OFFLINE=1`, the installer's check of an installed model takes 0.1 s;
+engine startup follows it. This comparison was run by hand, with prompts not in
+the repository.
