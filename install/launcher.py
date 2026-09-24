@@ -174,10 +174,13 @@ def serve(args):
             # A concurrent install may advance the selection link. Keep this
             # process's tokenizer, draft and target on one immutable assembly,
             # held until the server exits: installations remove only
-            # assemblies no selection links and no server holds.
-            root = root.resolve(strict=True)
-            assembly = (root / "model.json").open("rb")
-            fcntl.flock(assembly, fcntl.LOCK_SH)
+            # assemblies no selection links and no server holds. They collect
+            # under the installation lock, so resolving and holding under it
+            # leaves no moment the assembly is neither linked nor held.
+            with model_artifacts.installation_lock(paths.MODELS):
+                root = root.resolve(strict=True)
+                assembly = (root / "model.json").open("rb")
+                fcntl.flock(assembly, fcntl.LOCK_SH)
             os.set_inheritable(assembly.fileno(), True)
         command = [
             str(paths.PYTHON),

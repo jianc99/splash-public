@@ -779,6 +779,7 @@ class LauncherTests(unittest.TestCase):
 
             with (
                 mock.patch.object(launcher, "RUNTIME_DIR", runtime),
+                mock.patch.object(launcher.paths, "MODELS", runtime / "models"),
                 mock.patch.object(launcher.socket, "socket"),
                 mock.patch.object(launcher.catalog, "spawn_refresh"),
                 mock.patch.object(launcher, "_ensure_installed"),
