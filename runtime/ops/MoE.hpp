@@ -228,6 +228,8 @@ enum class MoeGgufTile : uint8_t { Staged, Register };
              : MoeExpertTile::M32;
 }
 
+enum class MoePhase : uint8_t { Prefill, Decode };
+
 struct MoeConfig final {
   MoeExpertTile expertTile = MoeExpertTile::M32;
   // Rows from which the router uses the 32-row scores tile; the execution
@@ -249,7 +251,7 @@ class MoePlan final {
 public:
   [[nodiscard]] MoeShape shape() const noexcept { return shape_; }
   [[nodiscard]] uint32_t rows() const noexcept { return rows_; }
-  [[nodiscard]] MoeConfig config() const noexcept { return config_; }
+  [[nodiscard]] MoeConfig configuration() const noexcept { return config_; }
   [[nodiscard]] uint32_t tileRows() const noexcept {
     return static_cast<uint32_t>(config_.expertTile);
   }
@@ -261,7 +263,7 @@ public:
 
 private:
   friend struct MoE;
-  MoePlan(MoeShape shape, uint32_t rows, MoeConfig config, bool prefill);
+  MoePlan(MoeShape shape, uint32_t rows, MoeConfig config, MoePhase phase);
 
   MoeShape shape_;
   uint32_t rows_;

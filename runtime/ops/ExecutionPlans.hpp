@@ -40,8 +40,6 @@ struct DraftAttentionWorkload final {
   auto operator<=>(const DraftAttentionWorkload &) const = default;
 };
 
-enum class MoePhase : uint8_t { Prefill, Decode };
-
 struct MoeWorkload final {
   MoeShape shape;
   // Physical rows in both phases: decode uses 8, 16, 24 or 32.

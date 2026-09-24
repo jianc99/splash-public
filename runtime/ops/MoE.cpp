@@ -181,7 +181,7 @@ void addAffineExperts(metal::CommandGraph &graph, const MoeScratch &scratch,
   } else {
     // The workspace holds the same grouped rows whatever the column tile;
     // only the grid's column count and the threadgroup width follow it.
-    const ExpertPasses passes = fusedExpertPasses(plan.config());
+    const ExpertPasses passes = fusedExpertPasses(plan.configuration());
     graph.add(passes.gateUp,
               {scratch.groupedInput, scratch.tileDescriptors,
                scratch.tileCount, weights.expertGate.packed,
@@ -208,7 +208,7 @@ void addGgufExperts(metal::CommandGraph &graph, const MoeScratch &scratch,
                     const BlockMoeWeights &weights, const MoePlan &plan) {
   const MoeShape shape = plan.shape();
   const uint32_t tiles = plan.maximumTiles();
-  const bool table16 = plan.config().ggufTile == MoeGgufTile::Register;
+  const bool table16 = plan.configuration().ggufTile == MoeGgufTile::Register;
   const auto pass = [&](const BlockExpertProjection &projection, bool up,
                         const metal::MetalBuffer &input,
                         const metal::MetalBuffer &output, uint32_t n, uint32_t k) {
@@ -246,15 +246,15 @@ void addGgufExperts(metal::CommandGraph &graph, const MoeScratch &scratch,
 
 // GGUF plans always run the three expert passes of the split plan.
 MoePlan::MoePlan(MoeShape shape, uint32_t rows, MoeConfig config,
-                 bool prefill)
+                 MoePhase phase)
     : shape_(shape), rows_(rows), config_(config),
       splitExperts_(shape.weightLayout == WeightLayout::Block32 ||
-                    (prefill && config.expertTile == MoeExpertTile::M32)) {
+                    (phase == MoePhase::Prefill && config.expertTile == MoeExpertTile::M32)) {
   // Affine plans have 8- and 32-row kernels in both phases, GGUF plans 8-row
   // kernels in both phases and 32-row prefill kernels.
   const bool gguf = shape.weightLayout == WeightLayout::Block32;
   if ((config.expertTile != MoeExpertTile::M8 && config.expertTile != MoeExpertTile::M32) ||
-      (gguf && !prefill && config.expertTile != MoeExpertTile::M8))
+      (gguf && phase == MoePhase::Decode && config.expertTile != MoeExpertTile::M8))
     throw std::invalid_argument("invalid MoE expert tile configuration");
   if (config.m8Simdgroups != MoeExpertSimdgroups::Eight &&
       config.m8Simdgroups != MoeExpertSimdgroups::Four)
@@ -289,7 +289,7 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
   if (block) {
     // fp32 scores of the F32 router in rows of 256, as the select kernel reads.
     addGgufFloat(graph, buffers.input, weights.blocks().router, scratch.groupedInput, rows,
-                 256, 0, FloatOutput::Float32, plan.config().ggufRouterTile);
+                 256, 0, FloatOutput::Float32, plan.configuration().ggufRouterTile);
     graph.add("moe_route_select_f32",
               {scratch.groupedInput, buffers.input,
                weights.blocks().sharedExpertGate.plane0, scratch.selectedExperts,
@@ -297,7 +297,7 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
               routeParams, {rows, 1, 1});
   } else {
     const AffineMoeWeights &affine = weights.affine();
-    const MoeRouteTile route = moeRouteTile(rows, plan.config().routeWideRows);
+    const MoeRouteTile route = moeRouteTile(rows, plan.configuration().routeWideRows);
     graph.add(route.rows == 8 ? "moe_route_scores_q8_m8"
                               : "moe_route_scores_q8_m32",
               {buffers.input, affine.router.planes.weights, affine.router.planes.scales,
@@ -319,7 +319,7 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
                            shape.experts},
             {1, 1, 1});
   const MoeGatherParams gather{tileRows, shape.hiddenSize, shape.routesPerToken()};
-  if (plan.config().ggufTile == MoeGgufTile::Register)
+  if (plan.configuration().ggufTile == MoeGgufTile::Register)
     graph.add("moe_gather_table16",
               {buffers.input, scratch.groupedRoutes, scratch.tileCount,
                scratch.groupedInput, scratch.groupedSums},
@@ -347,13 +347,13 @@ MoePlan MoE::prefillPlan(MoeShape shape, uint32_t rows) {
 MoePlan MoE::prefillPlan(MoeShape shape, uint32_t rows, MoeConfig config) {
   if (!rows || rows > SPLASH_PREFILL_TOKEN_BUDGET)
     throw std::invalid_argument("invalid MoE prefill rows");
-  return MoePlan(shape, rows, config, true);
+  return MoePlan(shape, rows, config, MoePhase::Prefill);
 }
 
 MoePlan MoE::decodePlan(MoeShape shape, uint32_t lanes, MoeConfig config) {
   if (!lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH)
     throw std::invalid_argument("invalid MoE decode batch width");
-  return MoePlan(shape, lanes * SPLASH_TARGET_VERIFY_ROWS, config, false);
+  return MoePlan(shape, lanes * SPLASH_TARGET_VERIFY_ROWS, config, MoePhase::Decode);
 }
 
 std::array<MoePlan, 2> MoE::prefillCandidates(MoeShape shape, uint32_t rows,

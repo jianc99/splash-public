@@ -156,7 +156,7 @@ MoeTuningResult tuneMoe(metal::MetalBackend &backend,
   using Clock = std::chrono::steady_clock;
   const auto start = Clock::now();
   const auto plans = ExecutionPlans(backend.capabilities()).moeCandidates(input.workload);
-  MoeTuningResult result{{input.workload, plans[0].config()}, {}, false, {}};
+  MoeTuningResult result{{input.workload, plans[0].configuration()}, {}, false, {}};
   WorkloadId current = kDistributions[0];
   auto recordFailure = [&](MeasurementStatus status,
                            std::exception_ptr failure = {}) {
@@ -340,7 +340,7 @@ MoeTuningResult tuneMoe(metal::MetalBackend &backend,
     if (gpuSelection.verdict == SelectionVerdict::Selected &&
         wallSelection.verdict == SelectionVerdict::Selected &&
         gpuSelection.candidate == wallSelection.candidate)
-      result.choice.configuration = plans[1].config();
+      result.choice.configuration = plans[1].configuration();
     result.complete = true;
   } catch (const Interrupted &interruption) {
     recordFailure(interruption.status);

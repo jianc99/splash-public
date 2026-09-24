@@ -517,8 +517,8 @@ void planBounds() {
                               MoeShape{2048, 256, 8, 512}}) {
     for (uint32_t rows = 1; rows <= 2048; ++rows) {
       const auto plans = MoE::prefillCandidates(shape, rows, kMoeRouteWideRows);
-      require(plans[0].config() == MoeConfig{MoeExpertTile::M32} &&
-                  plans[1].config() == MoeConfig{MoeExpertTile::M8},
+      require(plans[0].configuration() == MoeConfig{MoeExpertTile::M32} &&
+                  plans[1].configuration() == MoeConfig{MoeExpertTile::M8},
               "prefill candidates must preserve the shipped baseline first");
       require(plans[0].splitExperts() && !plans[1].splitExperts(),
               "only the M32 prefill plan runs the split expert passes");
@@ -529,8 +529,8 @@ void planBounds() {
     }
     for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
       const auto plans = MoE::decodeCandidates(shape, lanes, kMoeRouteWideRows, MoeExpertSimdgroups::Eight);
-      require(plans[0].config() == MoeConfig{MoeExpertTile::M8} &&
-                  plans[1].config() == MoeConfig{MoeExpertTile::M32},
+      require(plans[0].configuration() == MoeConfig{MoeExpertTile::M8} &&
+                  plans[1].configuration() == MoeConfig{MoeExpertTile::M32},
               "decode candidates must preserve the shipped baseline first");
       for (const auto &plan : plans) {
         require(plan.rows() == lanes * 8, "decode candidate changed DFlash rows");
@@ -541,9 +541,9 @@ void planBounds() {
       // grid: same rows, tiles and scratch as the shipped candidates.
       const auto narrow = MoE::decodeCandidates(shape, lanes, kMoeRouteWideRows,
                                                 MoeExpertSimdgroups::Four);
-      require(narrow[0].config() == MoeConfig{MoeExpertTile::M8, kMoeRouteWideRows,
+      require(narrow[0].configuration() == MoeConfig{MoeExpertTile::M8, kMoeRouteWideRows,
                                               MoeExpertSimdgroups::Four} &&
-                  narrow[1].config() == MoeConfig{MoeExpertTile::M32, kMoeRouteWideRows,
+                  narrow[1].configuration() == MoeConfig{MoeExpertTile::M32, kMoeRouteWideRows,
                                                   MoeExpertSimdgroups::Four},
               "four-simdgroup decode candidates must carry the device tile policy");
       for (size_t index = 0; index < narrow.size(); ++index) {
@@ -583,9 +583,9 @@ void checkEncoding(const CommandGraph &graph, const MoePlan &plan) {
   // Two router dispatches, grouping, gather, the expert passes and combine.
   require(dispatches.size() == 5 + expertPasses,
           "MoE plan must encode the entire operator");
-  const bool m8 = plan.config().expertTile == MoeExpertTile::M8;
+  const bool m8 = plan.configuration().expertTile == MoeExpertTile::M8;
   const auto route =
-      splash::ops::moeRouteTile(plan.rows(), plan.config().routeWideRows);
+      splash::ops::moeRouteTile(plan.rows(), plan.configuration().routeWideRows);
   const std::string scores = route.rows == 8 ? "moe_route_scores_q8_m8"
                                              : "moe_route_scores_q8_m32";
   const size_t experts = 4;
@@ -615,7 +615,7 @@ void checkEncoding(const CommandGraph &graph, const MoePlan &plan) {
   } else {
     // Four-simdgroup 8-row tiles launch 128 threads and widen the down tile
     // to N256; every other fused pass keeps N128 at 256 threads.
-    const bool four = m8 && plan.config().m8Simdgroups == MoeExpertSimdgroups::Four;
+    const bool four = m8 && plan.configuration().m8Simdgroups == MoeExpertSimdgroups::Four;
     const std::string gateUp = four ? "moe_expert_gate_up_q4_m8_n128_sg4"
                                : m8 ? "moe_expert_gate_up_q4_m8"
                                     : "moe_expert_gate_up_q4_m32";

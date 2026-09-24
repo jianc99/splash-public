@@ -156,7 +156,7 @@ void baselinePlans() {
       for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
         const auto selected = plans.moeDecode(shape, lanes);
         require(selected.tileRows() == 8 &&
-                    selected.config().m8Simdgroups == moeDecodeSimdgroups(family),
+                    selected.configuration().m8Simdgroups == moeDecodeSimdgroups(family),
                 "MoE decode baseline changed");
         covers(stride, selected.workspace(), lanes, moeFields);
       }
@@ -178,27 +178,27 @@ void moeDeviceTiles() {
     for (auto shape : moeShapes) {
       for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
         const MoeWorkload workload{shape, lanes * 8, MoePhase::Decode};
-        require(plans.moeDecode(shape, lanes).config().m8Simdgroups == expected,
+        require(plans.moeDecode(shape, lanes).configuration().m8Simdgroups == expected,
                 "MoE decode plan departed from the device tile policy");
         for (const auto &candidate : plans.moeCandidates(workload)) {
-          require(candidate.config().m8Simdgroups == expected,
+          require(candidate.configuration().m8Simdgroups == expected,
                   "MoE decode candidate departed from the device tile policy");
           OperatorChoices choices;
-          choices.moe.push_back({workload, candidate.config()});
+          choices.moe.push_back({workload, candidate.configuration()});
           choices.moe.back().configuration.m8Simdgroups =
               expected == MoeExpertSimdgroups::Four ? MoeExpertSimdgroups::Eight
                                                     : MoeExpertSimdgroups::Four;
           plans.install(choices);
-          require(plans.moeDecode(shape, lanes).config() == candidate.config(),
+          require(plans.moeDecode(shape, lanes).configuration() == candidate.configuration(),
                   "installed MoE choice overrode the device tile policy");
         }
       }
       for (uint32_t rows : {1U, 8U, 17U, 2048U}) {
-        require(plans.moePrefill(shape, rows).config().m8Simdgroups ==
+        require(plans.moePrefill(shape, rows).configuration().m8Simdgroups ==
                     MoeExpertSimdgroups::Eight,
                 "MoE prefill plan left the shipped expert tile");
         for (const auto &candidate : plans.moeCandidates({shape, rows, MoePhase::Prefill}))
-          require(candidate.config().m8Simdgroups == MoeExpertSimdgroups::Eight,
+          require(candidate.configuration().m8Simdgroups == MoeExpertSimdgroups::Eight,
                   "MoE prefill candidate left the shipped expert tile");
       }
     }
@@ -222,17 +222,17 @@ void ggufMoePlans() {
     rejects([&] { plans.install(choices); });
     for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
       const MoePlan plan = plans.moeDecode(shape, lanes);
-      require(plan.config().ggufTile == expected && plan.tileRows() == 8 && plan.splitExperts() &&
-                  plan.config().ggufRouterTile == FloatTile::Simdgroup,
+      require(plan.configuration().ggufTile == expected && plan.tileRows() == 8 && plan.splitExperts() &&
+                  plan.configuration().ggufRouterTile == FloatTile::Simdgroup,
               "GGUF MoE decode plan left its device tile");
       for (const MoePlan &candidate : plans.moeCandidates({shape, lanes * 8, MoePhase::Decode}))
-        require(candidate.config() == plan.config(), "GGUF MoE decode candidate is not the device's plan");
+        require(candidate.configuration() == plan.configuration(), "GGUF MoE decode candidate is not the device's plan");
       // Sums of the widest input (hidden, 3 K / 4 fp32) per 8-row tile.
       require(plan.workspace().groupedSumsBytes ==
                   (expected == MoeGgufTile::Register ? uint64_t{plan.maximumTiles()} * 2048 * 3 : 0),
               "GGUF register plan sums its Table16 tiles");
       covers(plans.moeDecodeWorkspacePerLane(shape), plan.workspace(), lanes, moeFields);
-      require(plans.moeDecode(routedShape, lanes).config().ggufTile == MoeGgufTile::Staged &&
+      require(plans.moeDecode(routedShape, lanes).configuration().ggufTile == MoeGgufTile::Staged &&
                   plans.moeDecode(routedShape, lanes).workspace().groupedSumsBytes == 0,
               "affine MoE plan took the GGUF register tile");
     }
@@ -244,13 +244,13 @@ void ggufMoePlans() {
       const MoePlan plan = plans.moePrefill(shape, rows);
       const uint32_t tileRows = expected == MoeGgufTile::Register || rows <= 32 ? 8 : 32;
       const FloatTile router = family != 9 && rows > 320 ? FloatTile::NeuralAccelerator : FloatTile::Simdgroup;
-      require(plan.config().ggufTile == expected && plan.tileRows() == tileRows && plan.splitExperts() &&
+      require(plan.configuration().ggufTile == expected && plan.tileRows() == tileRows && plan.splitExperts() &&
                   (plan.workspace().groupedSumsBytes > 0) == (expected == MoeGgufTile::Register) &&
-                  plan.config().ggufRouterTile == router,
+                  plan.configuration().ggufRouterTile == router,
               "GGUF MoE prefill plan left the device's tile");
       covers(plans.moePrefillWorkspace(shape, 2048), plan.workspace(), 1, moeFields);
       for (const MoePlan &candidate : plans.moeCandidates({shape, rows, MoePhase::Prefill}))
-        require(candidate.config() == plan.config(), "GGUF MoE prefill candidate is not the device's plan");
+        require(candidate.configuration() == plan.configuration(), "GGUF MoE prefill candidate is not the device's plan");
     }
   }
   // The register tile reads GGUF 8-row tiles only.
@@ -343,9 +343,9 @@ void allCandidates() {
     for (uint32_t rows : {1U, 17U, 2048U})
       for (const auto &candidate : plans.moeCandidates({shape, rows, MoePhase::Prefill})) {
         OperatorChoices choices;
-        choices.moe.push_back({{shape, rows, MoePhase::Prefill}, candidate.config()});
+        choices.moe.push_back({{shape, rows, MoePhase::Prefill}, candidate.configuration()});
         plans.install(choices);
-        require(plans.moePrefill(shape, rows).config() == candidate.config(),
+        require(plans.moePrefill(shape, rows).configuration() == candidate.configuration(),
                 "MoE prefill candidate not selected");
         covers(plans.moePrefillWorkspace(shape, 2048), candidate.workspace(), 1,
                moeFields);
@@ -353,9 +353,9 @@ void allCandidates() {
     for (uint32_t lanes = 1; lanes <= 4; ++lanes)
       for (const auto &candidate : plans.moeCandidates({shape, lanes * 8, MoePhase::Decode})) {
         OperatorChoices choices;
-        choices.moe.push_back({{shape, lanes * 8, MoePhase::Decode}, candidate.config()});
+        choices.moe.push_back({{shape, lanes * 8, MoePhase::Decode}, candidate.configuration()});
         plans.install(choices);
-        require(plans.moeDecode(shape, lanes).config() == candidate.config(),
+        require(plans.moeDecode(shape, lanes).configuration() == candidate.configuration(),
                 "MoE decode candidate not selected");
         covers(plans.moeDecodeWorkspacePerLane(shape), candidate.workspace(), lanes,
                moeFields);

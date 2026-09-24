@@ -49,28 +49,28 @@ void devicePolicyPlans() {
         // and every other family keep the shipped eight.
         const auto simdgroups = workload.phase == MoePhase::Decode && family == 9
             ? MoeExpertSimdgroups::Four : MoeExpertSimdgroups::Eight;
-        require(candidates.front().config() == baseline.config() &&
-                    baseline.config().expertTile == (workload.phase == MoePhase::Prefill
+        require(candidates.front().configuration() == baseline.configuration() &&
+                    baseline.configuration().expertTile == (workload.phase == MoePhase::Prefill
                         ? MoeExpertTile::M32 : MoeExpertTile::M8) &&
-                    baseline.config().m8Simdgroups == simdgroups,
+                    baseline.configuration().m8Simdgroups == simdgroups,
                 "MoE measurement/reporting baseline differs from production");
         for (const auto &candidate : candidates) {
-          const auto route = moeRouteTile(workload.rows, candidate.config().routeWideRows);
+          const auto route = moeRouteTile(workload.rows, candidate.configuration().routeWideRows);
           const bool wide = workload.rows >= threshold;
-          require(candidate.config().routeWideRows == threshold &&
+          require(candidate.configuration().routeWideRows == threshold &&
                       route.rows == (wide ? 32U : 8U) && route.experts == (wide ? 128U : 32U) &&
-                      candidate.config().m8Simdgroups == simdgroups,
+                      candidate.configuration().m8Simdgroups == simdgroups,
                   "MoE candidate departed from device router or expert-tile policy");
           OperatorChoices choices;
-          choices.moe.push_back({workload, candidate.config()});
+          choices.moe.push_back({workload, candidate.configuration()});
           production.install(choices);
           const auto selected = lookup();
-          require(selected.config() == candidate.config() &&
+          require(selected.configuration() == candidate.configuration() &&
                       selected.rows() == candidate.rows() &&
                       selected.splitExperts() == candidate.splitExperts() &&
                       selected.maximumTiles() == candidate.maximumTiles(),
                   "installed MoE candidate differs from its measured plan");
-          require(production.moeCandidates(workload).front().config() == baseline.config(),
+          require(production.moeCandidates(workload).front().configuration() == baseline.configuration(),
                   "installed choice changed the shipped tuning baseline");
           // Imported expert choices must retain this device's router and
           // expert-tile policy.
@@ -79,7 +79,7 @@ void devicePolicyPlans() {
               simdgroups == MoeExpertSimdgroups::Four ? MoeExpertSimdgroups::Eight
                                                       : MoeExpertSimdgroups::Four;
           production.install(choices);
-          require(lookup().config() == candidate.config(),
+          require(lookup().configuration() == candidate.configuration(),
                   "installed MoE choice overrode the device router or tile policy");
         }
       };
@@ -220,7 +220,7 @@ void nativeMeasurement(const char *library) {
   const auto deniedResult = tuneMoe(backend, denied, input);
   require(admissions == 1 && !deniedResult.complete && !deniedResult.failure &&
               deniedResult.choice.configuration == ExecutionPlans(backend.capabilities())
-                  .moeDecode(workload.shape, workload.rows / 8).config(),
+                  .moeDecode(workload.shape, workload.rows / 8).configuration(),
           "allocation denial did not retain baseline");
   admissions = 0;
   const auto cancelled = tuneMoe(backend, denied, input, {}, {}, [] { return true; });

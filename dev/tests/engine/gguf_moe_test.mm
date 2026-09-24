@@ -448,7 +448,7 @@ std::vector<uint16_t> runPlan(MetalBackend &backend, const Model &m, Buffers &b,
     for (uint32_t e = 0; e < kExperts; ++e) {
       const Dot d = dot(x, m.router.row(e), kHidden);
       score[e] = d.value;
-      bound[e] = floatBound(d, kHidden, plan.config().ggufRouterTile);
+      bound[e] = floatBound(d, kHidden, plan.configuration().ggufRouterTile);
     }
     std::array<uint32_t, kExperts> order;
     std::iota(order.begin(), order.end(), 0u);
@@ -739,7 +739,7 @@ int timing(MetalBackend &backend, uint32_t rounds) {
   printf("  prefill %u rows: affine %.3f  gguf %.3f\n", kRowsMax, affinePrefill, time(gguf, plans.moePrefill(ggufShape, kRowsMax)));
   for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
     b.moe.input = bfloatBuffer(backend, input(lanes * 8, 24), "input");
-    MoeConfig config = plans.moeDecode(ggufShape, lanes).config();
+    MoeConfig config = plans.moeDecode(ggufShape, lanes).configuration();
     config.ggufTile = other;
     const double a = time(affine, plans.moeDecode(affineShape, lanes)), g = time(gguf, plans.moeDecode(ggufShape, lanes));
     const double o = time(gguf, MoE::decodePlan(ggufShape, lanes, config));

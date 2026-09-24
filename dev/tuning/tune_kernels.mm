@@ -253,8 +253,6 @@ std::optional<CandidateId> candidateOf(const Plans &plans, const Config &config)
   for (size_t index = 0; index < plans.size(); ++index) {
     if constexpr (requires { plans[index].configuration(); }) {
       if (plans[index].configuration() == config) return CandidateId{uint32_t(index)};
-    } else if constexpr (requires { plans[index].config(); }) {
-      if (plans[index].config() == config) return CandidateId{uint32_t(index)};
     } else {
       if (plans[index] == config) return CandidateId{uint32_t(index)};
     }
@@ -528,7 +526,7 @@ int main(int argc, char **argv) {
         if (interrupted) break;
         const auto result = tuneMoe(backend, admit, input, options.measurement, underPressure, stop);
         const auto candidates = ExecutionPlans(backend.capabilities()).moeCandidates(input.workload);
-        const MoeConfig baseline = candidates.front().config();
+        const MoeConfig baseline = candidates.front().configuration();
         const bool didChange = result.complete && result.choice.configuration != baseline;
         if (didChange) choices.moe.push_back(result.choice);
         outcome("moe", describe(input.workload), result.complete, didChange,
