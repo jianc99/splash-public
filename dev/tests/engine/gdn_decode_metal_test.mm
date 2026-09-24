@@ -8,6 +8,7 @@
 // checked against the reference, so their tolerances stay at fp32 accuracy.
 #include "metal/MetalBackend.hpp"
 #include "metal/abi/ExecutionGeometry.h"
+#include "model/StateLayout.hpp"
 #include "ops/GDN.hpp"
 
 #import <Foundation/Foundation.h>
@@ -97,24 +98,23 @@ private:
   uint64_t state_;
 };
 
-uint64_t align16k(uint64_t bytes) { return (bytes + 16383) & ~uint64_t{16383}; }
-
 double sigmoid(double value) { return 1.0 / (1.0 + std::exp(-value)); }
 
 // The production state cell layout: every layer's conv rows, then every
 // layer's recurrent state, both padded to 16 KiB.
 struct Cell final {
+  splash::model::GdnStateLayout layout;
   uint64_t convLayerBytes = 0;
   uint64_t recurrentLayerBytes = 0;
   uint64_t convBytes = 0;
   uint64_t bytes = 0;
 
   explicit Cell(const GdnShape &shape)
-      : convLayerBytes(align16k(uint64_t{3} * shape.convolutionDimension * 2)),
-        recurrentLayerBytes(align16k(uint64_t{shape.valueHeads} * kHeadDim *
-                                     kHeadDim * 4)),
-        convBytes(kLayers * convLayerBytes),
-        bytes(convBytes + kLayers * recurrentLayerBytes) {}
+      : layout{kLayers, splash::model::kGdnConvolutionTaps - 1, shape.convolutionDimension,
+               shape.valueHeads, shape.headDimension, shape.headDimension},
+        convLayerBytes(layout.convolutionLayerBytes()),
+        recurrentLayerBytes(layout.recurrentLayerBytes()),
+        convBytes(layout.convolutionBytes()), bytes(layout.cellBytes()) {}
 
   GdnStateStrides strides() const {
     return {convLayerBytes, recurrentLayerBytes, convBytes};
