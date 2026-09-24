@@ -79,15 +79,12 @@ int main(int argc, char **argv) {
         const uint32_t begin = argc == 5 && !loadOnly ? std::stoul(argv[4]) : 0;
         const uint32_t end = argc == 5 && !loadOnly ? begin + 1 : layout.layers;
         for (uint32_t layer = begin; layer < end; ++layer) {
-          const bool full = layout.isFullAttentionLayer(layer);
-          const auto aligned = [](uint64_t size) {
-            return (size + model::kWeightFileAlignment - 1) & ~(model::kWeightFileAlignment - 1);
-          };
-          const uint64_t decayOffset = model::kWeightFileAlignment + aligned(2 * layout.hiddenSize) +
-              aligned(uint64_t(layout.packedGdnWidth) * layout.hiddenSize * 9 / 16) +
-              aligned(uint64_t(layout.convolutionDimension) * 4 * 2);
-          compare(loader.layer(layer), package / "target", loadOnly,
-                  full ? 0 : decayOffset, full ? 0 : layout.gdnValueHeads);
+          const auto sections = model::affineLayerImage(layout, layer).sections;
+          const auto decay = std::ranges::find(sections, model::affine::SectionKind::Decay,
+                                               &model::affine::Section::kind);
+          const bool gdn = decay != sections.end();
+          compare(loader.layer(layer), package / "target", loadOnly, gdn ? decay->offset : 0,
+                  gdn ? uint32_t(decay->bytes / sizeof(float)) : 0);
         }
         if (argc != 5 || loadOnly) {
           compare(loader.head(), package / "target", loadOnly);

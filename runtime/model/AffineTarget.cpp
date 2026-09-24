@@ -251,5 +251,7 @@ WeightFile AffineTargetLoader::embedding() { return impl_->open(impl_->images.si
 
 uint64_t preparedAffineBytes(const Qwen3_8Layout &layout) { return preparedBytes(layout); }
 uint64_t preparedAffineBytes(const Qwen3_6MoeLayout &layout) { return preparedBytes(layout); }
+Image affineLayerImage(const Qwen3_8Layout &layout, uint32_t layer) { return layerImage(layout, layer); }
+Image affineLayerImage(const Qwen3_6MoeLayout &layout, uint32_t layer) { return layerImage(layout, layer); }
 
 } // namespace splash::model

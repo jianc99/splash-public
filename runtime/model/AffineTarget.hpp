@@ -1,5 +1,6 @@
 #pragma once
 
+#include "model/AffinePreparation.hpp"
 #include "model/PreparedFiles.hpp"
 
 #include <memory>
@@ -34,5 +35,8 @@ private:
 
 [[nodiscard]] uint64_t preparedAffineBytes(const Qwen3_8Layout &layout);
 [[nodiscard]] uint64_t preparedAffineBytes(const Qwen3_6MoeLayout &layout);
+// The planned image of target layer `layer`: its sections at their offsets.
+[[nodiscard]] affine::Image affineLayerImage(const Qwen3_8Layout &layout, uint32_t layer);
+[[nodiscard]] affine::Image affineLayerImage(const Qwen3_6MoeLayout &layout, uint32_t layer);
 
 } // namespace splash::model
