@@ -20,12 +20,11 @@ REVIEWED = {
     "runtime/model/GgufImage.hpp": "the GGUF plan, which keys record whole",
     "runtime/model/AffinePreparation.hpp": "the affine plan, which keys record whole",
     "runtime/model/GgufPreparation.hpp": "the executor's declarations",
-    "runtime/model/VisionPreparation.hpp": "the adapter's declarations",
+    "runtime/model/VisionPreparation.hpp": "the vision plan, which keys record whole",
     "runtime/model/WeightStore.hpp": "the reader; preparation uses its error type",
     "runtime/metal/MetalBackend.hpp": "the backend the repack is dispatched through",
     "runtime/metal/DeviceCapabilities.hpp": "device queries of the backend",
     "runtime/metal/CommandGraph.hpp": "dispatch recording of the backend",
-    "runtime/ops/Vision.hpp": "the vision layout, whose values keys record",
     "runtime/ops/Weights.hpp": "inference weight views",
     "runtime/ops/Linear.hpp": "inference projections",
     "runtime/ops/Normalization.hpp": "inference norms",
@@ -78,6 +77,8 @@ class PreparationIdentityTest(unittest.TestCase):
             "runtime/model/WeightStore.hpp",
             "runtime/model/GgufImage.cpp",
             "runtime/model/SafetensorsCheckpoint.mm",
+            "runtime/model/VisionLoader.cpp",
+            "runtime/model/AffineTarget.cpp",
         }:
             (self.root / name).parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(ROOT / name, self.root / name)
@@ -102,6 +103,8 @@ class PreparationIdentityTest(unittest.TestCase):
             "runtime/model/WeightStore.hpp",
             "runtime/model/GgufImage.cpp",
             "runtime/model/SafetensorsCheckpoint.mm",
+            "runtime/model/VisionLoader.cpp",
+            "runtime/model/AffineTarget.cpp",
         ):
             with self.subTest(unrelated=name):
                 self.assertEqual(self.changed_by(name), set())

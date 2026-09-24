@@ -5,7 +5,7 @@
 #include "Qwen3_6Moe.hpp"
 #include "Qwen3_8.hpp"
 #include "ops/Vision.hpp"
-#include "model/VisionPreparation.hpp"
+#include "model/VisionLoader.hpp"
 
 #include <array>
 #include <cstdint>

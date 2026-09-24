@@ -100,12 +100,9 @@ QwenVisionWeights loadQwenVisionWeights(metal::MetalBackend &backend,
   return readVision(backend, directory / "model.bin", {}, layout);
 }
 
-QwenVisionWeights loadQwenVisionWeights(metal::MetalBackend &backend,
-                                        const VisionPreparation &source,
-                                        PreparationCheck admitConversion) {
+QwenVisionWeights loadQwenVisionWeights(metal::MetalBackend &backend, const VisionLoader &source) {
   validateLayout(source.layout());
-  return readVision(backend, source.prepare(admitConversion), source.weight().key,
-                    source.layout());
+  return readVision(backend, source.prepare(), source.weight().key, source.layout());
 }
 
 } // namespace splash::model

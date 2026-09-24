@@ -1,223 +1,40 @@
+// Editing this file re-prepares every vision model.
 #include "model/VisionPreparation.hpp"
 #include "WeightPreparationIdentity.hpp"
-#include "model/GgufFile.hpp"
-#include "model/SafetensorsCheckpoint.hpp"
+#include "model/Bfloat16.hpp"
 #include "model/WeightLayout.hpp"
 #include "model/WeightStore.hpp"
 
 #include <algorithm>
-#include <array>
-#include <bit>
-#include <cmath>
 #include <cstring>
-#include <set>
 #include <span>
 
-namespace splash::model {
+namespace splash::model::vision {
 namespace {
 
-// Converts count values to BF16 bits. False when a value is not exactly a
-// BF16: preparation never rounds a weight.
-using Conversion = bool (*)(const uint8_t *source, uint16_t *destination,
-                            uint64_t count);
+uint32_t elementBytes(const SourceTensor &tensor) { return tensor.dtype == "F32" ? 4 : 2; }
 
-bool copyBfloat16(const uint8_t *source, uint16_t *destination,
-                  uint64_t count) {
-  std::memcpy(destination, source, count * kBFloat16Bytes);
-  return true;
-}
-
-template <class T>
-bool exactBfloat16(const uint8_t *source, uint16_t *destination,
-                   uint64_t count) {
+// Converts count values of tensor to BF16 bits. False when a value is not
+// exactly a BF16.
+bool convert(const SourceTensor &tensor, const uint8_t *source, uint16_t *destination, uint64_t count) {
+  if (tensor.dtype == "BF16") {
+    std::memcpy(destination, source, count * kBFloat16Bytes);
+    return true;
+  }
   for (uint64_t i = 0; i < count; ++i) {
-    T value;
-    std::memcpy(&value, source + i * sizeof(T), sizeof(T));
-    const auto bits = std::bit_cast<uint32_t>(static_cast<float>(value));
-    if (bits & 0xFFFFu)
-      return false;
-    destination[i] = static_cast<uint16_t>(bits >> 16);
+    float value;
+    if (tensor.dtype == "F32") {
+      std::memcpy(&value, source + i * 4, 4);
+    } else {
+      _Float16 half;
+      std::memcpy(&half, source + i * 2, 2);
+      value = static_cast<float>(half);
+    }
+    const auto bits = exactBfloat16(value);
+    if (!bits) return false;
+    destination[i] = *bits;
   }
   return true;
-}
-
-// A source tensor and the conversion of its dtype, resolved once.
-struct Input {
-  std::string name;
-  SourceTensor tensor;
-  uint32_t elementBytes = 2;
-  Conversion convert = copyBfloat16;
-};
-
-Input input(std::string name, SourceTensor tensor) {
-  Input result{std::move(name), std::move(tensor)};
-  const std::string &dtype = result.tensor.dtype;
-  if (dtype == "F16") {
-    result.convert = exactBfloat16<_Float16>;
-  } else if (dtype == "F32") {
-    result.elementBytes = 4;
-    result.convert = exactBfloat16<float>;
-  } else if (dtype != "BF16") {
-    throw WeightStoreError("vision tensor " + result.name + " in " +
-                           result.tensor.file->path().string() + " is " +
-                           dtype + "; preparation reads BF16, F16 or F32");
-  }
-  return result;
-}
-
-struct Section {
-  std::string mlx, gguf;
-  uint32_t rows, columns, storedRows, storedColumns;
-  bool patch = false;
-  uint64_t offset = 0;
-  // One tensor, or the two temporal frames of a GGUF patch embedding.
-  std::vector<Input> inputs{};
-};
-
-std::vector<Section> sections(const ops::VisionLayout &l) {
-  std::vector<Section> result;
-  const auto add = [&](std::string mlx, std::string gguf, uint32_t rows,
-                       uint32_t columns = 1, uint32_t paddedRows = 0,
-                       uint32_t paddedColumns = 0) {
-    result.push_back({"vision_tower." + mlx, std::move(gguf), rows, columns,
-                      paddedRows ? paddedRows : rows,
-                      paddedColumns ? paddedColumns : columns});
-  };
-  const auto affine = [&](const std::string &mlx, const std::string &gguf,
-                          uint32_t rows, uint32_t columns,
-                          uint32_t paddedRows = 0, uint32_t paddedColumns = 0) {
-    add(mlx + ".weight", gguf + ".weight", rows, columns, paddedRows,
-        paddedColumns);
-    add(mlx + ".bias", gguf + ".bias", rows, 1, paddedRows);
-  };
-  const auto norm = [&](const std::string &mlx, const std::string &gguf) {
-    add(mlx + ".weight", gguf + ".weight", l.hiddenSize);
-    add(mlx + ".bias", gguf + ".bias", l.hiddenSize);
-  };
-  affine("patch_embed.proj", "v.patch_embd", l.hiddenSize, l.patchDimension);
-  result.front().patch = true;
-  add("pos_embed.weight", "v.position_embd.weight",
-      l.positionGridSide * l.positionGridSide, l.hiddenSize);
-  for (uint32_t i = 0; i < l.depth; ++i) {
-    const auto mlx = "blocks." + std::to_string(i) + ".",
-               gguf = "v.blk." + std::to_string(i) + ".";
-    norm(mlx + "norm1", gguf + "ln1");
-    affine(mlx + "attn.qkv", gguf + "attn_qkv", 3 * l.hiddenSize, l.hiddenSize);
-    affine(mlx + "attn.proj", gguf + "attn_out", l.hiddenSize, l.hiddenSize);
-    norm(mlx + "norm2", gguf + "ln2");
-    affine(mlx + "mlp.linear_fc1", gguf + "ffn_up", l.intermediateSize,
-           l.hiddenSize, l.paddedIntermediateSize);
-    affine(mlx + "mlp.linear_fc2", gguf + "ffn_down", l.hiddenSize,
-           l.intermediateSize, 0, l.paddedIntermediateSize);
-  }
-  norm("merger.norm", "v.post_ln");
-  affine("merger.linear_fc1", "mm.0", l.mergedHiddenSize, l.mergedHiddenSize);
-  affine("merger.linear_fc2", "mm.2", l.outputHiddenSize, l.mergedHiddenSize);
-  return result;
-}
-
-uint64_t arrange(std::vector<Section> &plan) {
-  uint64_t at = kWeightFileAlignment;
-  for (auto &s : plan) {
-    s.offset = at;
-    at += uint64_t(s.storedRows) * s.storedColumns * kBFloat16Bytes;
-    at = (at + kWeightFileAlignment - 1) & ~(kWeightFileAlignment - 1);
-  }
-  return at;
-}
-
-// MLX: an unquantized vision_tower.*, whose patch embedding is one Conv3d
-// weight [output, frame, patch-row, patch-col, channel].
-void planCheckpoint(const SafetensorsCheckpoint &checkpoint,
-                    const ops::VisionLayout &layout,
-                    std::vector<Section> &plan) {
-  const uint64_t p = layout.patchSize;
-  for (auto &s : plan) {
-    // A quantized module keeps its scales beside the packed weight.
-    const auto scales = s.mlx.substr(0, s.mlx.rfind('.')) + ".scales";
-    if (const SourceTensor *quantized = checkpoint.find(scales))
-      throw WeightStoreError(
-          "the MLX vision tower is quantized (" + scales + " in " +
-          quantized->file->path().string() +
-          "); preparation needs BF16, F16 or F32 vision weights");
-    const auto &tensor = checkpoint.require(s.mlx);
-    const std::vector<uint64_t> shape =
-        s.patch          ? std::vector<uint64_t>{s.rows, 2, p, p, 3}
-        : s.columns == 1 ? std::vector<uint64_t>{s.rows}
-                         : std::vector<uint64_t>{s.rows, s.columns};
-    if (tensor.shape != shape)
-      throw WeightStoreError("vision tensor shape mismatch: " + s.mlx);
-    s.inputs.push_back(input(s.mlx, tensor));
-  }
-}
-
-// GGUF: a qwen3vl_merger mmproj describing this tower, all of whose tensors
-// preparation uses. The patch embedding is one [channel, patch-row,
-// patch-col] weight per temporal frame (v.patch_embd.weight and .weight.1).
-void planMmproj(const GgufFile &gguf, const WeightSource &file,
-                const ops::VisionLayout &layout, std::vector<Section> &plan) {
-  if (gguf.architecture() != "clip" ||
-      gguf.stringValue("clip.projector_type") != "qwen3vl_merger")
-    throw WeightStoreError("unsupported vision GGUF architecture");
-  for (const auto &[key, expected] :
-       std::initializer_list<std::pair<const char *, uint64_t>>{
-           {"clip.vision.projection_dim", layout.outputHiddenSize},
-           {"clip.vision.patch_size", layout.patchSize},
-           {"clip.vision.embedding_length", layout.hiddenSize},
-           {"clip.vision.feed_forward_length", layout.intermediateSize},
-           {"clip.vision.block_count", layout.depth},
-           {"clip.vision.attention.head_count", layout.heads},
-           {"clip.vision.spatial_merge_size", layout.spatialMerge},
-           {"clip.use_gelu", 1}})
-    if (gguf.unsignedValue(key) != expected)
-      throw WeightStoreError(std::string("vision metadata mismatch: ") + key);
-  const auto epsilon =
-      gguf.floatValue("clip.vision.attention.layer_norm_epsilon");
-  if (!epsilon || !std::isfinite(*epsilon) || std::abs(*epsilon - 1e-6) > 1e-12)
-    throw WeightStoreError("vision LayerNorm epsilon mismatch");
-  for (const char *key : {"clip.vision.image_mean", "clip.vision.image_std"}) {
-    const auto values = gguf.numericArray(key);
-    if (!values || values->size() != 3 ||
-        !std::all_of(values->begin(), values->end(),
-                     [](double x) { return x == 0.5; }))
-      throw WeightStoreError("vision image normalization mismatch");
-  }
-  // Each block must be declared: a deepstack block feeds the language model
-  // through tensors this tower does not have.
-  const auto deepstack = gguf.numericArray("clip.vision.is_deepstack_layers");
-  if (!deepstack || deepstack->size() != layout.depth)
-    throw WeightStoreError(
-        "vision metadata must list clip.vision.is_deepstack_layers per block");
-  if (std::any_of(deepstack->begin(), deepstack->end(),
-                  [](double x) { return x != 0; }))
-    throw WeightStoreError("vision deepstack layers are unsupported");
-  const uint64_t p = layout.patchSize;
-  std::set<std::string, std::less<>> used;
-  for (auto &s : plan) {
-    for (uint32_t frame = 0; frame < (s.patch ? 2u : 1u); ++frame) {
-      std::string name = s.gguf + (frame ? ".1" : "");
-      const GgufTensor &t = gguf.require(name);
-      const std::vector<uint64_t> shape =
-          s.patch          ? std::vector<uint64_t>{p, p, 3, s.rows}
-          : s.columns == 1 ? std::vector<uint64_t>{s.rows}
-                           : std::vector<uint64_t>{s.columns, s.rows};
-      if (t.dims != shape)
-        throw WeightStoreError("vision tensor shape mismatch: " + name);
-      const std::string dtype = t.type == ggml::kBF16  ? "BF16"
-                                : t.type == ggml::kF16 ? "F16"
-                                : t.type == ggml::kF32 ? "F32"
-                                                       : ggmlTypeName(t.type);
-      s.inputs.push_back(input(name, {&file, dtype, t.dims, t.offset, t.bytes}));
-      used.insert(std::move(name));
-    }
-  }
-  std::string unused;
-  for (const auto &t : gguf.tensors())
-    if (!used.contains(t.name))
-      unused += (unused.empty() ? "" : ", ") + t.name;
-  if (!unused.empty())
-    throw WeightStoreError("mmproj tensors the vision tower does not use: " +
-                           unused + " (" + gguf.source().path().string() + ")");
 }
 
 // Source bytes, patch values and output rows of one batch, reused by every
@@ -236,145 +53,65 @@ void writeSection(int destination, const Section &s, uint32_t pixels, Staging &s
                   const PreparationCheck &admit) {
   const auto frames = static_cast<uint32_t>(s.inputs.size());
   const uint32_t columns = s.columns / frames;
-  uint32_t elementBytes = 0;
-  for (const auto &in : s.inputs)
-    elementBytes = std::max(elementBytes, in.elementBytes);
+  uint32_t widest = 0;
+  for (const auto &in : s.inputs) widest = std::max(widest, elementBytes(in.tensor));
   const uint64_t storedRowBytes = uint64_t(s.storedColumns) * kBFloat16Bytes;
-  const uint64_t rowBytes =
-      uint64_t(columns) * elementBytes +
-      (s.patch ? uint64_t(s.columns) * kBFloat16Bytes : 0) + storedRowBytes;
+  const uint64_t rowBytes = uint64_t(columns) * widest + (s.patch ? uint64_t(s.columns) * kBFloat16Bytes : 0) +
+                            storedRowBytes;
   const auto batchRows = static_cast<uint32_t>(
       std::clamp<uint64_t>(kWeightPreparationStagingBytes / rowBytes, 1, s.rows));
   auto &[source, values, output] = staging;
-  source.resize(uint64_t(batchRows) * columns * elementBytes);
+  source.resize(uint64_t(batchRows) * columns * widest);
   values.resize(s.patch ? uint64_t(batchRows) * s.columns : 0);
   output.resize(uint64_t(batchRows) * s.storedColumns);
   // Converts count rows of one input to rows of stride BF16 values.
-  const auto convert = [&](const Input &in, uint32_t row, uint32_t count,
-                           uint16_t *to, uint32_t stride) {
-    const uint64_t bytes = uint64_t(columns) * in.elementBytes;
+  const auto convertRows = [&](const Input &in, uint32_t row, uint32_t count, uint16_t *to, uint32_t stride) {
+    const uint64_t bytes = uint64_t(columns) * elementBytes(in.tensor);
     in.tensor.read(row * bytes, std::span(source).first(count * bytes));
     for (uint32_t r = 0; r < count; ++r)
-      if (!in.convert(source.data() + r * bytes, to + uint64_t(r) * stride,
-                      columns))
-        throw WeightStoreError("vision tensor " + in.name + " in " +
-                               in.tensor.file->path().string() +
+      if (!convert(in.tensor, source.data() + r * bytes, to + uint64_t(r) * stride, columns))
+        throw WeightStoreError("vision tensor " + in.name + " in " + in.tensor.file->path().string() +
                                " is not exactly representable in BF16");
   };
   for (uint32_t row = 0; row < s.rows; row += batchRows) {
-    if (admit)
-      admit();
+    admit();
     const uint32_t count = std::min(batchRows, s.rows - row);
     if (!s.patch) {
-      convert(s.inputs.front(), row, count, output.data(), s.storedColumns);
+      convertRows(s.inputs.front(), row, count, output.data(), s.storedColumns);
     } else {
       for (uint32_t frame = 0; frame < frames; ++frame)
-        convert(s.inputs[frame], row, count,
-                values.data() + uint64_t(frame) * count * columns, columns);
+        convertRows(s.inputs[frame], row, count, values.data() + uint64_t(frame) * count * columns, columns);
       for (uint32_t r = 0; r < count; ++r)
         for (uint32_t c = 0; c < s.columns; ++c) {
-          const uint32_t channel = c / (2 * pixels), frame = c / pixels % 2,
-                         pixel = c % pixels;
+          const uint32_t channel = c / (2 * pixels), frame = c / pixels % 2, pixel = c % pixels;
           output[uint64_t(r) * s.storedColumns + c] =
-              frames == 1 ? values[uint64_t(r) * columns +
-                                   (frame * pixels + pixel) * 3 + channel]
-                          : values[(uint64_t(frame) * count + r) * columns +
-                                   channel * pixels + pixel];
+              frames == 1 ? values[uint64_t(r) * columns + (frame * pixels + pixel) * 3 + channel]
+                          : values[(uint64_t(frame) * count + r) * columns + channel * pixels + pixel];
         }
     }
     writeWeightBytes(destination, s.offset + row * storedRowBytes,
-                     {reinterpret_cast<const uint8_t *>(output.data()),
-                      count * storedRowBytes});
+                     {reinterpret_cast<const uint8_t *>(output.data()), count * storedRowBytes});
   }
 }
 
 } // namespace
 
-struct VisionPreparation::Impl {
-  ops::VisionLayout layout;
-  PreparationCheck check;
-  std::vector<Section> plan;
-  std::unique_ptr<SafetensorsCheckpoint> checkpoint;
-  std::unique_ptr<WeightSource> mmproj;
-  PreparedWeight weight{};
-  PreparedWeights cache;
-
-  void checkUnchanged() const {
-    if (checkpoint)
-      checkpoint->checkUnchanged();
-    else
-      mmproj->checkUnchanged();
-  }
-};
-
-VisionPreparation::VisionPreparation(const std::filesystem::path &directory,
-                                     VisionSource source,
-                                     const ops::VisionLayout &layout,
-                                     PreparationCheck check)
-    : impl_(std::make_unique<Impl>()) {
-  auto &i = *impl_;
-  i.layout = layout;
-  i.check = std::move(check);
-  // The writer relies on the packed patch width and on padding that only adds
-  // rows or columns.
-  if (layout.patchDimension != 6 * layout.patchSize * layout.patchSize ||
-      layout.paddedIntermediateSize < layout.intermediateSize)
-    throw WeightStoreError("Qwen vision layout is inconsistent");
-  i.plan = sections(layout);
-  if (source == VisionSource::Safetensors) {
-    i.checkpoint = std::make_unique<SafetensorsCheckpoint>(directory, i.check);
-    planCheckpoint(*i.checkpoint, layout, i.plan);
-  } else if (source == VisionSource::Gguf) {
-    const auto path = directory / "mmproj.gguf";
-    i.mmproj = std::make_unique<WeightSource>(path, i.check);
-    planMmproj(GgufFile(*i.mmproj), *i.mmproj, layout, i.plan);
-  } else {
-    throw WeightStoreError("only MLX and GGUF vision sources are prepared");
-  }
-  i.checkUnchanged();
-  const uint64_t bytes = arrange(i.plan);
-  // The layout and the source tensors are all these bytes depend on; no
-  // configuration value enters them.
+// The plan and the source tensors are all these bytes depend on; no
+// configuration value enters them.
+PreparedWeight visionWeight(const Plan &plan, const std::string &source) {
   WeightIdentity identity("splash-vision-preparation-v2 " SPLASH_VISION_PREPARATION_ID);
-  identity.record("file", layout.depth, layout.patchSize, bytes);
-  for (const auto &s : i.plan) {
+  identity.record("file", plan.depth, plan.patchSize, plan.bytes);
+  for (const auto &s : plan.sections) {
     identity.record("section", s.offset, s.rows, s.columns, s.storedRows, s.storedColumns, s.patch);
     for (const auto &in : s.inputs) in.tensor.identify(identity);
   }
-  i.weight = identity.weight(bytes, "vision/model.bin", directory.string());
+  return identity.weight(plan.bytes, "vision/model.bin", source);
 }
 
-VisionPreparation::~VisionPreparation() = default;
-
-const ops::VisionLayout &VisionPreparation::layout() const noexcept {
-  return impl_->layout;
+void writeVision(int destination, const Plan &plan, const PreparationCheck &admit) {
+  writeWeightBytes(destination, 0, weightFileHeader(kVisionMagic, plan.depth, 0));
+  Staging staging;
+  for (const auto &s : plan.sections) writeSection(destination, s, plan.patchSize * plan.patchSize, staging, admit);
 }
 
-const PreparedWeight &VisionPreparation::weight() const noexcept {
-  return impl_->weight;
-}
-
-std::filesystem::path
-VisionPreparation::prepare(const PreparationCheck &admitConversion) const {
-  const auto &i = *impl_;
-  return i.cache.prepare(
-      i.weight,
-      [&](int output, const PreparationCheck &admit) {
-        // The packed header: magic, block count and file kind 0.
-        std::array<uint8_t, 16> header{};
-        std::memcpy(header.data(), kVisionMagic.data(), kVisionMagic.size());
-        std::memcpy(header.data() + 8, &i.layout.depth, 4);
-        writeWeightBytes(output, 0, header);
-        Staging staging;
-        for (const auto &s : i.plan)
-          writeSection(output, s, i.layout.patchSize * i.layout.patchSize, staging, admit);
-      },
-      {i.check, admitConversion, [&] { i.checkUnchanged(); }});
-}
-
-uint64_t preparedVisionBytes(const ops::VisionLayout &layout) {
-  auto plan = sections(layout);
-  return arrange(plan);
-}
-
-} // namespace splash::model
+} // namespace splash::model::vision

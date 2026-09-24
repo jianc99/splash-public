@@ -1,7 +1,7 @@
 #pragma once
 
 #include "WeightStore.hpp"
-#include "VisionPreparation.hpp"
+#include "VisionLoader.hpp"
 #include "ops/Vision.hpp"
 
 #include <cstdint>
@@ -29,8 +29,6 @@ loadQwenVisionWeights(metal::MetalBackend &backend,
                       ops::VisionLayout layout = {});
 // The same layout, prepared from an upstream source.
 [[nodiscard]] QwenVisionWeights
-loadQwenVisionWeights(metal::MetalBackend &backend,
-                      const VisionPreparation &source,
-                      PreparationCheck admitConversion = {});
+loadQwenVisionWeights(metal::MetalBackend &backend, const VisionLoader &source);
 
 } // namespace splash::model

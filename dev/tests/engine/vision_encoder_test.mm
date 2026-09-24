@@ -200,7 +200,7 @@ int main(int argc, char **argv) {
               ? splash::model::loadQwenVisionWeights(backend, vision,
                                                      descriptor.vision)
               : splash::model::loadQwenVisionWeights(
-                    backend, splash::model::VisionPreparation(
+                    backend, splash::model::VisionLoader(
                                  vision, descriptor.visionSource,
                                  descriptor.vision));
       const std::string fixture = argv[3];

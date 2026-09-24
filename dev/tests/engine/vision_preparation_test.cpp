@@ -5,7 +5,7 @@
 // warm requires a cache hit. EXPECTED is an independently serialized file the
 // prepared bytes must equal.
 
-#include "model/VisionPreparation.hpp"
+#include "model/VisionLoader.hpp"
 
 #include <algorithm>
 #include <filesystem>
@@ -48,12 +48,13 @@ int main(int argc, char **argv) {
     const auto forbidden = [] {
       throw std::runtime_error("unexpected warm conversion");
     };
-    const model::VisionPreparation preparation(argv[2], source, layout);
+    const model::VisionLoader preparation(argv[2], source, layout, {},
+                                          mode == "warm" ? model::PreparationCheck(forbidden)
+                                                         : model::PreparationCheck());
     if (preparation.weight().bytes != model::preparedVisionBytes(layout))
       throw std::runtime_error("vision size estimate differs");
-    const auto path = mode == "warm" ? preparation.prepare(forbidden)
-                                     : preparation.prepare();
-    if (model::VisionPreparation(argv[2], source, layout).prepare(forbidden) !=
+    const auto path = preparation.prepare();
+    if (model::VisionLoader(argv[2], source, layout, {}, forbidden).prepare() !=
         path)
       throw std::runtime_error("warm cache miss");
     if (argc == 6) {

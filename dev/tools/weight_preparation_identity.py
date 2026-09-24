@@ -28,6 +28,8 @@ INPUTS = {
     ),
     "GGUF": (
         "runtime/model/GgufPreparation.cpp",
+        "runtime/model/GgufImageLayout.hpp",
+        "runtime/model/Bfloat16.hpp",
         "runtime/metal/abi/GgufRepack.h",
         "runtime/metal/abi/QuantFormat.h",
         "runtime/metal/kernels/shared/gguf_repack.metal",
@@ -35,6 +37,7 @@ INPUTS = {
     "VISION": (
         "runtime/model/VisionPreparation.cpp",
         "runtime/model/WeightLayout.hpp",
+        "runtime/model/Bfloat16.hpp",
     ),
 }
 

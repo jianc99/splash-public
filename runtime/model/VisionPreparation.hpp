@@ -1,44 +1,48 @@
 #pragma once
 
+// The packed vision/model.bin (MDFV0001, every tensor BF16) of a vision
+// tower, as model/VisionLoader.cpp plans it from an MLX checkpoint or a GGUF
+// mmproj: its identity and its writer. A BF16 tensor is copied; an F32 or F16
+// tensor is converted only when every value is exactly a BF16, and
+// preparation fails otherwise.
+
 #include "model/PreparedWeights.hpp"
-#include "ops/Vision.hpp"
 
-#include <filesystem>
-#include <memory>
+#include <string>
+#include <vector>
 
-namespace splash::model {
+namespace splash::model::vision {
 
-enum class VisionSource : uint8_t { Packed, Safetensors, Gguf, None };
-
-// Source adapter for the vision tower: the vision_tower.* tensors of an MLX
-// checkpoint or a GGUF mmproj. Both prepare the packed vision/model.bin layout
-// (MDFV0001, every tensor BF16). A BF16 tensor is copied; an F32 or F16 tensor
-// is converted only when every value is exactly a BF16, and preparation fails
-// otherwise. Construction validates the source's metadata and plans the
-// prepared file; tensor values are read only when preparing.
-class VisionPreparation final {
-public:
-  VisionPreparation(const std::filesystem::path &directory, VisionSource source,
-                    const ops::VisionLayout &layout, PreparationCheck check = {});
-  ~VisionPreparation();
-  VisionPreparation(const VisionPreparation &) = delete;
-  VisionPreparation &operator=(const VisionPreparation &) = delete;
-
-  [[nodiscard]] const ops::VisionLayout &layout() const noexcept;
-  // The prepared file's cache identity and size, for disk budgeting.
-  [[nodiscard]] const PreparedWeight &weight() const noexcept;
-  // The prepared file, reused or written now. admitConversion admits the
-  // conversion workspace on a cache miss; check (the constructor's) runs on
-  // every load.
-  [[nodiscard]] std::filesystem::path
-  prepare(const PreparationCheck &admitConversion = {}) const;
-
-private:
-  struct Impl;
-  std::unique_ptr<Impl> impl_;
+// A source tensor and the name it has in its file.
+struct Input {
+  std::string name;
+  SourceTensor tensor;
 };
 
-// Bytes of the packed layout, which every source prepares.
-[[nodiscard]] uint64_t preparedVisionBytes(const ops::VisionLayout &layout);
+// A section of rows x columns values, stored as storedRows x storedColumns
+// (padding stays zero), written from one source tensor, or from the two
+// temporal frames of a GGUF patch embedding.
+struct Section {
+  std::string mlx, gguf; // the tensor's names in either source
+  uint32_t rows, columns, storedRows, storedColumns;
+  bool patch = false; // the patch embedding, whose rows the writer reorders
+  uint64_t offset = 0;
+  std::vector<Input> inputs{};
+};
 
-} // namespace splash::model
+// The header (magic, block count, file kind 0) in a 16 KiB block, then
+// 16 KiB-aligned sections.
+struct Plan {
+  uint32_t depth = 0, patchSize = 0;
+  uint64_t bytes = 0;
+  std::vector<Section> sections;
+};
+
+// The identity of a plan of the source at `source`.
+[[nodiscard]] PreparedWeight visionWeight(const Plan &plan, const std::string &source);
+
+// Writes a plan into its preallocated, zeroed destination within the
+// preparation staging bound; admit runs before each chunk.
+void writeVision(int destination, const Plan &plan, const PreparationCheck &admit);
+
+} // namespace splash::model::vision

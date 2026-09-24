@@ -36,12 +36,12 @@ ModelPackage loadPackage(metal::MetalBackend &backend,
     throw std::invalid_argument("model descriptor is invalid");
   // A vision source is planned first: the target's whole-model disk check
   // budgets its prepared file together with the target images.
-  std::optional<VisionPreparation> vision;
+  std::optional<VisionLoader> vision;
   std::vector<PreparedWeight> prepared;
   if (result.descriptor.visionSource == VisionSource::Safetensors ||
       result.descriptor.visionSource == VisionSource::Gguf) {
     vision.emplace(root / "vision", result.descriptor.visionSource,
-                   result.descriptor.vision, [&backend] { backend.checkOperation(); });
+                   result.descriptor.vision, [&backend] { backend.checkOperation(); }, prepareCheck);
     prepared.push_back(vision->weight());
   }
   result.target = std::visit(
@@ -58,7 +58,7 @@ ModelPackage loadPackage(metal::MetalBackend &backend,
   result.draft = loadDFlashDraftWeights(
       backend, root / "draft", result.descriptor.draft);
   if (vision)
-    result.vision = loadQwenVisionWeights(backend, *vision, prepareCheck);
+    result.vision = loadQwenVisionWeights(backend, *vision);
   else if (result.descriptor.visionSource == VisionSource::Packed)
     result.vision = loadQwenVisionWeights(backend, root / "vision", result.descriptor.vision);
 
