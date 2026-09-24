@@ -353,13 +353,18 @@ void fusedNorm(metal::MetalBackend &backend, uint32_t k, uint32_t rows, LinearIn
   require(!std::memcmp(sa.contents(),sb.contents(),sumsBytes),"fused input sums mismatch");
 }
 // The packed prefill's norm, whose rows need not fill its 32-row sum tiles.
+// Its rows equal the plain norm's bit for bit, which a prefill feeding block
+// projections (which read no sums) runs instead.
 void prefillNorm(metal::MetalBackend &backend, uint32_t k, uint32_t rows, bool float32) {
   const NormCase c=normCase(backend,k,rows,float32);
-  auto output=backend.allocateBuffer(k*rows*2), sums=backend.allocateBuffer((rows+31)/32*32*(k/64)*4);
+  auto output=backend.allocateBuffer(k*rows*2), plain=backend.allocateBuffer(k*rows*2);
+  auto sums=backend.allocateBuffer((rows+31)/32*32*(k/64)*4);
   metal::CommandGraph graph;
   Normalization::addRmsWithQ4Sums(graph,c.input,c.weight,output,sums,k,rows);
+  Normalization::addRms(graph,c.input,c.weight,plain,k,rows);
   (void)backend.submitCommand(graph.dispatches());
   requireNorm(c,output,k,rows,"prefill norm differs from the fp64 reference");
+  require(!std::memcmp(output.contents(),plain.contents(),k*rows*2),"prefill norm rows differ from the plain norm's");
 }
 void fusedAttentionGate(metal::MetalBackend &backend, uint32_t heads, uint32_t kvHeads, uint32_t lanes,
                         LinearInput layout) {
@@ -415,7 +420,7 @@ int main(int argc,char **argv) {
       for (LinearInput layout : {LinearInput::Table64, LinearInput::Table16})
         for (uint32_t width : {64U, 320U, 1984U, 2048U, 2112U, 5120U, 17408U})
           for (uint32_t rows : {8U,16U,24U,32U}) fusedNorm(backend, width, rows, layout, float32);
-      for (uint32_t width : {64U, 5120U, 17408U})
+      for (uint32_t width : {64U, 2048U, 5120U, 17408U})
         for (uint32_t rows : {1U,37U,64U}) prefillNorm(backend, width, rows, float32);
     }
     // 27B out_proj then down, and gdn_in then gate/up: K 6144, 17408 and 5120.

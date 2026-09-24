@@ -309,18 +309,24 @@ void QwenTarget::addPrefill(
   requireLayerPartition(geometry_, step.gdnLayer, step.attentionLayer);
 }
 
-// The norm also writes the Q4 input sums of its rows.
-void QwenTarget::addPrefillNorm(PrefillStep &step, metal::MetalBuffer input, const ops::NormWeights &norm) const {
+// An affine prefill projection reads the Q4 input sums of its rows, which the
+// norm writes beside them; a block projection reads none.
+void QwenTarget::addPrefillNorm(PrefillStep &step, metal::MetalBuffer input, const ops::NormWeights &norm,
+                                ops::WeightLayout consumer) const {
   const QwenTargetPrefillBuffers &b = step.buffers;
-  ops::Normalization::addRmsWithQ4Sums(step.graph, input, norm, b.normalized, b.projectionSums,
-                                       geometry_.hiddenSize, step.rows);
+  if (consumer == ops::WeightLayout::Affine64)
+    ops::Normalization::addRmsWithQ4Sums(step.graph, input, norm, b.normalized, b.projectionSums,
+                                         geometry_.hiddenSize, step.rows);
+  else
+    ops::Normalization::addRms(step.graph, input, norm, b.normalized, geometry_.hiddenSize, step.rows);
 }
 
 // The mixer output projection adds the mixer's rows to `input`.
 void QwenTarget::addPrefillOutput(PrefillStep &step, metal::MetalBuffer hidden, const ops::Projection &projection,
                                   metal::MetalBuffer input, metal::MetalBuffer output) const {
   const QwenTargetPrefillBuffers &b = step.buffers;
-  operators_.linear().addPrefillSums(step.graph, hidden, b.projectionSums, projection, step.rows);
+  if (projection.layout() == ops::WeightLayout::Affine64)
+    operators_.linear().addPrefillSums(step.graph, hidden, b.projectionSums, projection, step.rows);
   operators_.linear().addPrefillResidual(step.graph, hidden, projection, input, output, b.projectionSums,
                                          step.rows, b.linearScratch);
 }
@@ -329,7 +335,7 @@ metal::MetalBuffer QwenTarget::addPrefillMixer(PrefillStep &step, const QwenGdnW
                                                const ops::NormWeights &norm, metal::MetalBuffer input) const {
   const QwenTargetPrefillBuffers &b = step.buffers;
   const uint32_t layer = step.gdnLayer++;
-  addPrefillNorm(step, input, norm);
+  addPrefillNorm(step, input, norm, mixer.inputProjection.layout());
   operators_.linear().addPrefill(step.graph, b.normalized, mixer.inputProjection, b.gdnPacked, b.projectionSums,
                                  step.rows, b.linearScratch);
   for (const QwenTargetPrefillSequence &sequence : step.sequences) {
@@ -357,7 +363,7 @@ metal::MetalBuffer QwenTarget::addPrefillMixer(PrefillStep &step, const QwenAtte
                                                const ops::NormWeights &norm, metal::MetalBuffer input) const {
   const QwenTargetPrefillBuffers &b = step.buffers;
   const uint32_t layer = step.attentionLayer++;
-  addPrefillNorm(step, input, norm);
+  addPrefillNorm(step, input, norm, mixer.inputProjection.layout());
   operators_.linear().addPrefill(step.graph, b.normalized, mixer.inputProjection, b.fullPacked, b.projectionSums,
                                  step.rows, b.linearScratch);
   for (const QwenTargetPrefillSequence &sequence : step.sequences) {
@@ -399,7 +405,7 @@ void QwenTarget::addPrefillFfn(PrefillStep &step, const Qwen3_8LayerWeights &lay
                                metal::MetalBuffer output) const {
   const QwenTargetPrefillBuffers &b = step.buffers;
   const ops::Linear &linear = operators_.linear();
-  addPrefillNorm(step, residual, layer.postAttentionNorm);
+  addPrefillNorm(step, residual, layer.postAttentionNorm, layer.gateProjection.layout());
   linear.addPrefill(step.graph, b.normalized, layer.gateProjection, b.denseGateScratch, b.projectionSums,
                     step.rows, b.linearScratch);
   linear.addPrefillUpWithGate(step.graph, b.normalized, layer.upProjection, b.denseGateScratch,
@@ -412,7 +418,7 @@ void QwenTarget::addPrefillFfn(PrefillStep &step, const Qwen3_8LayerWeights &lay
 void QwenTarget::addPrefillFfn(PrefillStep &step, const Qwen3_6MoeLayerWeights &layer,
                                metal::MetalBuffer residual, metal::MetalBuffer output) const {
   const QwenTargetPrefillBuffers &b = step.buffers;
-  addPrefillNorm(step, residual, layer.postAttentionNorm);
+  addPrefillNorm(step, residual, layer.postAttentionNorm, layer.ffn.layout());
   ops::MoE::add(step.graph, {b.normalized, residual, output, b.moe}, layer.ffn, *step.moe);
 }
 
