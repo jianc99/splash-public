@@ -8,12 +8,14 @@
 #include "../../../runtime/metal/CommandGraph.hpp"
 #include "../../../runtime/metal/MetalBackend.hpp"
 #include "../../../runtime/model/WeightStore.hpp"
+#include "../../../runtime/ops/ExecutionPlans.hpp"
 #include "../../../runtime/ops/MoE.hpp"
 #include "metal/abi/MoE.h"
 
 #import <Foundation/Foundation.h>
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cmath>
 #include <cstdint>
@@ -35,6 +37,7 @@ using splash::metal::MetalBuffer;
 using splash::model::kBFloat16Bytes;
 using splash::model::q4PackedBytes;
 using splash::ops::AffineMoeWeights;
+using splash::ops::ExecutionPlans;
 using splash::ops::ExpertProjection;
 using splash::ops::kMoeRouteWideRows;
 using splash::ops::kMoeScratchFields;
@@ -44,6 +47,7 @@ using splash::ops::MoeConfig;
 using splash::ops::MoeScratchField;
 using splash::ops::MoeExpertSimdgroups;
 using splash::ops::MoeExpertTile;
+using splash::ops::MoePhase;
 using splash::ops::MoePlan;
 using splash::ops::MoeShape;
 using splash::ops::MoeWeights;
@@ -83,6 +87,16 @@ public:
 private:
   uint64_t state_;
 };
+
+// The production candidates on a GPU of `family` whose core count is
+// unknown, so every plan keeps the shipped router threshold
+// (kMoeRouteWideRows): family 9 decodes with the four-simdgroup 8-row tiles,
+// other families with the shipped eight.
+std::array<MoePlan, 2> candidates(uint32_t family, MoeShape shape, uint32_t rows, MoePhase phase) {
+  splash::DeviceCapabilities device;
+  device.appleGpuFamily = family;
+  return ExecutionPlans(device).moeCandidates({shape, rows, phase});
+}
 
 MetalBuffer shared(MetalBackend &backend, uint64_t bytes, const char *label) {
   MetalBuffer buffer = backend.allocateBuffer(bytes, BufferStorage::Shared, label);
@@ -514,7 +528,7 @@ void planBounds() {
   for (const MoeShape shape : {MoeShape{256, 8, 2, 512},
                               MoeShape{2048, 256, 8, 512}}) {
     for (uint32_t rows = 1; rows <= 2048; ++rows) {
-      const auto plans = MoE::prefillCandidates(shape, rows, kMoeRouteWideRows);
+      const auto plans = candidates(10, shape, rows, MoePhase::Prefill);
       require(plans[0].configuration() == MoeConfig{MoeExpertTile::M32} &&
                   plans[1].configuration() == MoeConfig{MoeExpertTile::M8},
               "prefill candidates must preserve the shipped baseline first");
@@ -526,7 +540,7 @@ void planBounds() {
       }
     }
     for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
-      const auto plans = MoE::decodeCandidates(shape, lanes, kMoeRouteWideRows, MoeExpertSimdgroups::Eight);
+      const auto plans = candidates(10, shape, lanes * 8, MoePhase::Decode);
       require(plans[0].configuration() == MoeConfig{MoeExpertTile::M8} &&
                   plans[1].configuration() == MoeConfig{MoeExpertTile::M32},
               "decode candidates must preserve the shipped baseline first");
@@ -537,8 +551,7 @@ void planBounds() {
       }
       // The Apple9 four-simdgroup tiles change only the down pass's column
       // grid: same rows, tiles and scratch as the shipped candidates.
-      const auto narrow = MoE::decodeCandidates(shape, lanes, kMoeRouteWideRows,
-                                                MoeExpertSimdgroups::Four);
+      const auto narrow = candidates(9, shape, lanes * 8, MoePhase::Decode);
       require(narrow[0].configuration() == MoeConfig{MoeExpertTile::M8, kMoeRouteWideRows,
                                               MoeExpertSimdgroups::Four} &&
                   narrow[1].configuration() == MoeConfig{MoeExpertTile::M32, kMoeRouteWideRows,
@@ -554,10 +567,10 @@ void planBounds() {
         checkPlan(narrow[index]);
       }
     }
-    rejects([&] { (void)MoE::prefillCandidates(shape, 0, kMoeRouteWideRows); }, "zero prefill");
-    rejects([&] { (void)MoE::prefillCandidates(shape, 2049, kMoeRouteWideRows); }, "large prefill");
-    rejects([&] { (void)MoE::decodeCandidates(shape, 0, kMoeRouteWideRows, MoeExpertSimdgroups::Eight); }, "zero batch");
-    rejects([&] { (void)MoE::decodeCandidates(shape, 5, kMoeRouteWideRows, MoeExpertSimdgroups::Eight); }, "large batch");
+    rejects([&] { (void)candidates(10, shape, 0, MoePhase::Prefill); }, "zero prefill");
+    rejects([&] { (void)candidates(10, shape, 2049, MoePhase::Prefill); }, "large prefill");
+    rejects([&] { (void)candidates(10, shape, 0, MoePhase::Decode); }, "zero batch");
+    rejects([&] { (void)candidates(10, shape, 40, MoePhase::Decode); }, "large batch");
     rejects([&] { (void)MoE::prefillPlan(shape, 1, {static_cast<MoeExpertTile>(16)}); },
             "uncompiled expert tile");
     rejects([&] { (void)MoE::decodePlan(shape, 1, {MoeExpertTile::M8, kMoeRouteWideRows,
@@ -651,7 +664,7 @@ void checkEncoding(const CommandGraph &graph, const MoePlan &plan) {
 
 void bufferBounds(MetalBackend &backend, Fixture &fixture) {
   const uint64_t submissions = backend.submissionCount();
-  for (const auto &plan : MoE::prefillCandidates(fixture.shape, 33, kMoeRouteWideRows)) {
+  for (const auto &plan : candidates(10, fixture.shape, 33, MoePhase::Prefill)) {
     allocateScratch(backend, fixture, plan);
     const auto rejectWeights = [&](const MoeWeights &weights, const char *label) {
       CommandGraph graph;
@@ -869,17 +882,16 @@ void run(const std::string &metallibPath) {
       }
     };
     for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
-      const auto candidates = MoE::decodeCandidates(fixture.shape, lanes, kMoeRouteWideRows, MoeExpertSimdgroups::Eight);
+      const auto shipped = candidates(10, fixture.shape, lanes * 8, MoePhase::Decode);
       const std::string label = "decode B" + std::to_string(lanes);
-      const auto baseline = execute(candidates[0], label);
-      requireEqual(execute(candidates[1], label), baseline, label + " M32");
+      const auto baseline = execute(shipped[0], label);
+      requireEqual(execute(shipped[1], label), baseline, label + " M32");
       // The Apple9 four-simdgroup tiles (gate/up N128, down N256, 128
       // threads) must reproduce the shipped N128 x 8 tile bit for bit: each
       // output element sums its quant groups in the same order, so no
       // tolerance is granted. The M32 candidate carries the device policy
       // but keeps its eight-simdgroup tiles.
-      const auto narrow = MoE::decodeCandidates(fixture.shape, lanes, kMoeRouteWideRows,
-                                                MoeExpertSimdgroups::Four);
+      const auto narrow = candidates(9, fixture.shape, lanes * 8, MoePhase::Decode);
       requireEqual(execute(narrow[0], label + " sg4"), baseline,
                    label + " four-simdgroup M8");
       requireEqual(execute(narrow[1], label + " sg4"), baseline,
@@ -890,10 +902,10 @@ void run(const std::string &metallibPath) {
     // wide router tile threshold.
     for (uint32_t rows : {1U, 3U, 7U, 8U, 9U, 12U, 31U, 32U, 33U, 48U, 100U,
                           255U, 256U, 263U, 511U, 512U, kMaximumRows}) {
-      const auto candidates = MoE::prefillCandidates(fixture.shape, rows, kMoeRouteWideRows);
+      const auto shipped = candidates(10, fixture.shape, rows, MoePhase::Prefill);
       const std::string label = "prefill rows=" + std::to_string(rows);
-      const auto baseline = execute(candidates[0], label);
-      requireEqual(execute(candidates[1], label), baseline, label);
+      const auto baseline = execute(shipped[0], label);
+      requireEqual(execute(shipped[1], label), baseline, label);
     }
   }
   std::cout << "moe_metal_test: PASS cases=" << cases

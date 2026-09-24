@@ -173,12 +173,9 @@ std::array<MoePlan, 2> ExecutionPlans::moeCandidates(const MoeWorkload &workload
     const MoePlan plan = moePlan(workload, {});
     return {plan, plan};
   }
-  if (workload.phase == MoePhase::Prefill)
-    return MoE::prefillCandidates(workload.shape, workload.rows, moeRouteWideRows_);
-  if (workload.phase != MoePhase::Decode || workload.rows % kDecodeRows)
-    throw std::invalid_argument("invalid MoE candidate workload");
-  return MoE::decodeCandidates(workload.shape, workload.rows / kDecodeRows, moeRouteWideRows_,
-                               moeDecodeSimdgroups_);
+  const std::array<MoeConfig, 2> configs =
+      workload.phase == MoePhase::Prefill ? MoE::prefillCandidates() : MoE::decodeCandidates();
+  return {moePlan(workload, configs[0]), moePlan(workload, configs[1])};
 }
 
 AttentionWorkspace ExecutionPlans::prefillAttentionWorkspace(

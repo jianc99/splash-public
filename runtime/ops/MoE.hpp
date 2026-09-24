@@ -296,14 +296,14 @@ struct MoE final {
   [[nodiscard]] static MoePlan decodePlan(
       MoeShape shape, uint32_t lanes,
       MoeConfig config = {MoeExpertTile::M8});
-  // Bounded precompiled candidates of an affine shape, shipped baseline
-  // first. ExecutionPlans supplies the device's router threshold to every
-  // expert-tile candidate and its 8-row tile simdgroups to the decode ones.
-  [[nodiscard]] static std::array<MoePlan, 2>
-  prefillCandidates(MoeShape shape, uint32_t rows, uint32_t routeWideRows);
-  [[nodiscard]] static std::array<MoePlan, 2>
-  decodeCandidates(MoeShape shape, uint32_t lanes, uint32_t routeWideRows,
-                   MoeExpertSimdgroups m8Simdgroups);
+  // The precompiled configurations an affine shape is tuned over, shipped
+  // baseline first; ExecutionPlans gives each one the device's fields.
+  [[nodiscard]] static constexpr std::array<MoeConfig, 2> prefillCandidates() noexcept {
+    return {{{MoeExpertTile::M32}, {MoeExpertTile::M8}}};
+  }
+  [[nodiscard]] static constexpr std::array<MoeConfig, 2> decodeCandidates() noexcept {
+    return {{{MoeExpertTile::M8}, {MoeExpertTile::M32}}};
+  }
   static void add(metal::CommandGraph &graph, const MoeBuffers &buffers,
                   const MoeWeights &weights, const MoePlan &plan);
 };
