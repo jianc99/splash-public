@@ -92,19 +92,17 @@ void writeCopy(const WeightSource &source, int destination, const gguf::Copy &co
   }
 }
 
-// One of a repack's three planes: where it starts in the image, its bytes
-// per unit of a row and the 32-column groups a unit covers.
-struct Plane {
-  uint64_t offset, unitBytes, unitGroups;
-  // Bytes of `rows` rows of `groups` 32-column groups.
-  [[nodiscard]] uint64_t bytes(uint64_t rows, uint64_t groups) const { return rows * (groups / unitGroups) * unitBytes; }
-};
+// The plane0, plane1 and meta bytes of a [rows, columns] tensor in format.
+std::array<uint64_t, 3> planeBytes(const QuantFormat &format, uint64_t rows, uint64_t columns) {
+  const GgufPlaneBytes bytes = ggufPlaneBytes(format, rows, columns);
+  return {bytes.plane0, bytes.plane1, bytes.meta};
+}
 
-std::array<Plane, 3> planes(const gguf::Repack &repack) {
-  const QuantFormat &format = kQuantFormats[repack.format];
-  return {{{repack.plane0, format.plane0_bytes, 1},
-           {repack.plane1, format.plane1_bytes, 1},
-           {repack.meta, format.meta_bytes, format.meta_groups}}};
+uint64_t total(const std::array<uint64_t, 3> &planes) { return planes[0] + planes[1] + planes[2]; }
+
+// Where a repack's plane0, plane1 and meta start in the image.
+std::array<uint64_t, 3> planeOffsets(const gguf::Repack &repack) {
+  return {repack.plane0, repack.plane1, repack.meta};
 }
 
 // The rows and columns of one repack step and its staging: complete rows
@@ -116,19 +114,15 @@ struct RepackChunk {
 
 RepackChunk repackChunk(const gguf::Repack &repack) {
   const QuantFormat &format = kQuantFormats[repack.format];
-  // Input and output staging of 256 columns of one row.
-  const uint64_t stagingPer256Columns = ggufRowBytes(format, 256) +
-      ggufPlaneBytes(format, 1, 256).plane0 + ggufPlaneBytes(format, 1, 256).plane1 +
-      ggufPlaneBytes(format, 1, 256).meta;
+  // Input and output staging of one block of columns of one row.
+  const uint64_t blockStaging =
+      ggufRowBytes(format, kGgufBlockColumns) + total(planeBytes(format, 1, kGgufBlockColumns));
   RepackChunk chunk;
   chunk.columns = std::min<uint64_t>(repack.columns,
-      kWeightPreparationStagingBytes / (kGgufTileRows * stagingPer256Columns) * 256);
+      kWeightPreparationStagingBytes / (kGgufTileRows * blockStaging) * kGgufBlockColumns);
   if (!chunk.columns) throw GgufError("weight row exceeds preparation bound");
   const auto input = [&](uint64_t rows) { return rows * ggufRowBytes(format, chunk.columns); };
-  const auto output = [&](uint64_t rows) {
-    const GgufPlaneBytes bytes = ggufPlaneBytes(format, rows, chunk.columns);
-    return bytes.plane0 + bytes.plane1 + bytes.meta;
-  };
+  const auto output = [&](uint64_t rows) { return total(planeBytes(format, rows, chunk.columns)); };
   chunk.rows = chunk.columns == repack.columns
       ? std::min<uint64_t>(repack.rows,
             kWeightPreparationStagingBytes / (input(kGgufTileRows) + output(kGgufTileRows)) * kGgufTileRows)
@@ -144,23 +138,25 @@ void requireRepack(const gguf::Repack &repack, uint64_t imageBytes) {
   if (repack.format >= GGUF_FMT_COUNT || !repack.rows || repack.rows % kGgufTileRows || !repack.columns ||
       repack.columns % kGgufBlockColumns)
     throw GgufError("invalid prepared weight repack");
-  const uint64_t rowBytes = ggufRowBytes(kQuantFormats[repack.format], repack.columns);
+  const QuantFormat &format = kQuantFormats[repack.format];
+  const uint64_t rowBytes = ggufRowBytes(format, repack.columns);
   uint64_t sourceRows = 0;
   for (const gguf::TensorRows &rows : repack.sources) {
     if (rows.rowBytes != rowBytes) throw GgufError("invalid prepared weight source size");
     sourceRows += rows.rows;
   }
   if (sourceRows > repack.rows) throw GgufError("invalid prepared weight source size");
-  for (const Plane &plane : planes(repack))
-    if (plane.unitBytes) requireRange(plane.offset, plane.bytes(repack.rows, repack.columns / 32), imageBytes);
+  // A format without plane1 has an empty plane1 at offset 0.
+  const auto offsets = planeOffsets(repack);
+  const auto sizes = planeBytes(format, repack.rows, repack.columns);
+  for (size_t plane = 0; plane < sizes.size(); ++plane) requireRange(offsets[plane], sizes[plane], imageBytes);
 }
 
 void writeRepack(metal::MetalBackend &backend, const WeightSource &source, int destination,
                  const gguf::Repack &repack, const RepackChunk &chunk, metal::MetalBuffer &input,
                  metal::MetalBuffer &output, const PreparationCheck &admit) {
   const QuantFormat &format = kQuantFormats[repack.format];
-  const std::array<Plane, 3> plane = planes(repack);
-  const uint64_t groups = repack.columns / 32;
+  const auto offsets = planeOffsets(repack);
   auto *host = static_cast<uint8_t *>(input.contents());
   const auto *prepared = static_cast<const uint8_t *>(output.contents());
   for (uint64_t firstRow = 0; firstRow < repack.rows; firstRow += chunk.rows) {
@@ -184,8 +180,12 @@ void writeRepack(metal::MetalBackend &backend, const WeightSource &source, int d
         std::memset(host + (zero - firstRow) * chunkRowBytes, 0, (firstRow + rows - zero) * chunkRowBytes);
       }
       const uint64_t chunkGroups = columns / 32;
-      std::array<uint64_t, 3> lengths{};
-      for (size_t i = 0; i < lengths.size(); ++i) lengths[i] = plane[i].bytes(rows, chunkGroups);
+      const auto lengths = planeBytes(format, rows, columns);
+      // A plane is [rows / 256][units][256] tiles and a chunk starts on a
+      // tile: after the planes of the rows above it and, in its tile rows,
+      // of the columns before it.
+      const auto above = planeBytes(format, firstRow, repack.columns);
+      const auto before = planeBytes(format, kGgufTileRows, firstColumn);
       GgufRepackParams params{};
       params.rows = static_cast<uint32_t>(rows);
       params.input_size = static_cast<uint32_t>(columns);
@@ -197,11 +197,9 @@ void writeRepack(metal::MetalBackend &backend, const WeightSource &source, int d
           {{2, &params, sizeof(params)}}, {rows * chunkGroups / 256, 1, 1}, {256, 1, 1}};
       static_cast<void>(backend.submit(dispatch));
       uint64_t offset = 0;
-      for (size_t i = 0; i < lengths.size(); ++i) {
-        const uint64_t position = (firstRow / kGgufTileRows * (groups / plane[i].unitGroups) +
-                                   firstColumn / 32 / plane[i].unitGroups) * kGgufTileRows * plane[i].unitBytes;
-        writeWeightBytes(destination, plane[i].offset + position, {prepared + offset, lengths[i]});
-        offset += lengths[i];
+      for (size_t plane = 0; plane < lengths.size(); ++plane) {
+        writeWeightBytes(destination, offsets[plane] + above[plane] + before[plane], {prepared + offset, lengths[plane]});
+        offset += lengths[plane];
       }
     }
   }
