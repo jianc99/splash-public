@@ -358,8 +358,10 @@ PreparedInput PagedAttention::addVerifyGate(
         scratch.sums.sizeBytes() < tableSumsBytes(input, width, rows))
       throw std::invalid_argument("Q4 attention gate scratch is below requirement");
     graph.add(std::string(input == LinearInput::Table16
-                              ? pipeline(kernel, "verify_attention_gate_q16", "verify_attention_gate_q16_kv2_g8")
-                              : pipeline(kernel, "verify_attention_gate_q4", "verify_attention_gate_q4_kv2_g8")),
+                              ? pipeline(kernel, "verify_attention_gate_table16",
+                                         "verify_attention_gate_table16_kv2_g8")
+                              : pipeline(kernel, "verify_attention_gate_table64",
+                                         "verify_attention_gate_table64_kv2_g8")),
               {packed, attention, hidden, scratch.input, scratch.sums}, params,
               {width / 64 * lanes, 1, 1}, {256, 1, 1});
     return {std::move(hidden), input};

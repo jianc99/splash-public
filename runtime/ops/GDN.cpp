@@ -100,8 +100,8 @@ PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffer
                                     state.recurrentLayerBytes,
                                     state.convolutionStateBytes};
   const std::string name = !prepare ? kernelName(kernel, "verify_gdn_fused", "verify_gdn_fused_vh32")
-      : input == LinearInput::Table16 ? kernelName(kernel, "verify_gdn_fused_q16", "verify_gdn_fused_q16_vh32")
-                                      : kernelName(kernel, "verify_gdn_fused_q4", "verify_gdn_fused_q4_vh32");
+      : input == LinearInput::Table16 ? kernelName(kernel, "verify_gdn_fused_table16", "verify_gdn_fused_table16_vh32")
+                                      : kernelName(kernel, "verify_gdn_fused_table64", "verify_gdn_fused_table64_vh32");
   graph.add(normKernel(name, buffers.mixerNorm, shape.headDimension), std::move(bindings), params,
             {shape.valueHeads, lanes, 1});
   if (!prepare) return {};
