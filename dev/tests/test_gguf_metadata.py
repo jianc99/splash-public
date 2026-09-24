@@ -160,6 +160,26 @@ class GgufMetadataTests(unittest.TestCase):
             ):
                 gguf.Metadata(path)
 
+    def test_reader_checks_counts_tensor_ranks_and_duplicate_tensors(self):
+        path = write_gguf(self.root / "tensors.gguf", {"key": "value"}, [("t", 0)])
+        with mock.patch.object(gguf.Metadata, "MAX_ITEMS", 0):
+            for tensors in (False, True):
+                with (
+                    self.subTest(tensors=tensors),
+                    self.assertRaisesRegex(models.ModelError, "too many fields"),
+                ):
+                    gguf.Metadata(path, tensors=tensors)
+        # Ranks up to the native reader's limit, GGML_MAX_DIMS.
+        for rank in (1, 4):
+            fixture_files.write_gguf(path, {}, [("t", [2] * rank, 0, b"")])
+            self.assertEqual(gguf.Metadata(path, tensors=True).tensors, {"t": 0})
+        fixture_files.write_gguf(path, {}, [("t", [2] * 5, 0, b"")])
+        with self.assertRaisesRegex(models.ModelError, "invalid GGUF tensor rank: t"):
+            gguf.Metadata(path, tensors=True)
+        write_gguf(path, {}, [("t", 0), ("t", 0)])
+        with self.assertRaisesRegex(models.ModelError, "duplicate GGUF tensor: t"):
+            gguf.Metadata(path, tensors=True)
+
     def test_bpe_ids_special_tokens_normalization_and_local_reload(self):
         metadata = self.metadata(fixture())
         files = gguf.tokenizer_files(metadata)

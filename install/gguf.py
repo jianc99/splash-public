@@ -36,8 +36,12 @@ DERIVED_FILES = (
 class Metadata:
     """Bounded little-endian GGUF v2/v3 metadata reader."""
 
+    VERSIONS = (2, 3)
     MAX_BYTES = 128 * 1024 * 1024
     MAX_ITEMS = 1_000_000
+    # GGML_MAX_DIMS, the highest tensor rank the native reader
+    # (runtime/model/GgufFile.cpp) accepts.
+    MAX_DIMENSIONS = 4
     # GGUF value types (gguf_type): a string, an array of one other type, and
     # the struct format of each scalar type.
     STRING = 8
@@ -68,7 +72,7 @@ class Metadata:
             if isinstance(source, (str, Path))
             else contextlib.nullcontext(source)
         ) as self.stream:
-            if self.read(4) != b"GGUF" or self.scalar("I") not in (2, 3):
+            if self.read(4) != b"GGUF" or self.scalar("I") not in self.VERSIONS:
                 raise ModelError(
                     "unsupported GGUF header (expected little-endian v2/v3)"
                 )
@@ -84,9 +88,9 @@ class Metadata:
             for _ in range(tensor_count if tensors else 0):
                 name = self.string()
                 dimensions = self.scalar("I")
-                if dimensions > 8:
+                if dimensions > self.MAX_DIMENSIONS:
                     raise ModelError("invalid GGUF tensor rank: " + name)
-                self.read(8 * dimensions)
+                self.read(dimensions * struct.calcsize("<Q"))  # Its extents.
                 kind = self.scalar("I")
                 self.scalar("Q")  # Data offset; the payload is never read here.
                 if name in self.tensors:
