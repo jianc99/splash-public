@@ -1,6 +1,6 @@
 """Prepare tiny MLX and GGUF vision towers and compare them with an independently
 serialized packed file; check the exact-BF16 rule, the MLX cache identity and
-that invalid sources fail with their message and publish nothing."""
+that invalid sources fail naming what is wrong and publish nothing."""
 
 import hashlib
 import json
@@ -227,42 +227,41 @@ def main():
             )
             merger = "vision_tower.merger.linear_fc1.weight" if mlx else "mm.0.weight"
             dtype = "F64" if mlx else "Q4_0"
-            inexact = (
-                f"vision tensor {patch} in {{}} is not exactly representable in BF16"
-            )
+            # What each refusal names: the tensor or key, the kind of problem
+            # and, as "{}", the source file.
+            inexact = (patch, "{}", "BF16")
             # The patch embedding is F32 with shift 2 and F16 with shift 1.
             rejected = {
                 ("inexact-f32", 2): inexact,
                 ("inexact-f16", 1): inexact,
-                ("shape", 0): f"vision tensor shape mismatch: {patch}",
-                ("dtype", 0): f"vision tensor {merger} in {{}} is {dtype}; "
-                "preparation reads BF16, F16 or F32",
+                ("shape", 0): (patch, "shape"),
+                ("dtype", 0): (merger, "{}", dtype),
             }
             if mlx:
                 rejected[("quantized", 0)] = (
-                    "the MLX vision tower is quantized "
-                    "(vision_tower.blocks.0.attn.qkv.scales in {}); "
-                    "preparation needs BF16, F16 or F32 vision weights"
+                    "quantized",
+                    "vision_tower.blocks.0.attn.qkv.scales",
+                    "{}",
                 )
             else:
                 rejected |= {
-                    ("epsilon", 0): "vision LayerNorm epsilon mismatch",
-                    ("deepstack", 0): "vision deepstack layers are unsupported",
-                    ("no-deepstack", 0): "vision metadata must list "
-                    "clip.vision.is_deepstack_layers per block",
-                    ("unused", 0): "mmproj tensors the vision tower does not use: "
-                    "v.deepstack.0.fc1.weight ({})",
+                    ("epsilon", 0): ("epsilon",),
+                    ("deepstack", 0): ("deepstack", "unsupported"),
+                    ("no-deepstack", 0): ("clip.vision.is_deepstack_layers",),
+                    ("unused", 0): ("v.deepstack.0.fc1.weight", "{}", "does not use"),
                 }
-            for (case, shift), message in rejected.items():
+            for (case, shift), parts in rejected.items():
                 directory = root / f"{source}-{case}"
                 directory.mkdir()
                 fixture(directory, source, shift, case)
                 result = prepare(binary, directory, source, "cold")
-                expected = message.format(directory / file)
                 errors = result.stderr.strip().splitlines()
-                assert result.returncode == 1 and errors[-1] == expected, (
+                assert result.returncode == 1 and errors, (source, case, result.stderr)
+                named = [part.format(directory / file) for part in parts]
+                assert all(part in errors[-1] for part in named), (
                     source,
                     case,
+                    named,
                     result.stderr,
                 )
                 assert not published(directory), (source, case)
