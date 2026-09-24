@@ -428,7 +428,13 @@ int main(int argc, char **argv) {
                 << SPLASH_BUILD_ID << "\n  " << options.measurement.samplePairs
                 << " pairs per candidate, " << options.measurement.maximumWallSeconds
                 << " s per key (attention " << options.measurement.maximumWallSeconds * 4
-                << " s per policy)\n\n";
+                << " s per policy)\n";
+      // The workloads keep only Affine64 weights, and a GGUF source prepares
+      // every target projection and expert as Block32.
+      if (descriptor.targetSource == model::TargetSource::Gguf)
+        std::cout << "  GGUF target: its projections and experts follow the device policy; "
+                     "only attention and the draft are measured\n";
+      std::cout << '\n';
 
       MeasurementOptions attention = options.measurement;
       attention.maximumWallSeconds = options.measurement.maximumWallSeconds * 4;
