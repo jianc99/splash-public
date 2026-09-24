@@ -686,6 +686,62 @@ class ModelArtifactTest(unittest.TestCase):
         self.manifest_download.assert_not_called()
         self.download.assert_not_called()
 
+    def test_draft_export_copies_verified_weights_and_names_their_source(self):
+        from dev.tools import export_draft
+
+        snapshot, manifest = self.package_fixture()
+        for index, name in enumerate(
+            (*(f"layer-{i}.bin" for i in range(5)), "model.bin")
+        ):
+            with (snapshot / "draft" / name).open("r+b") as file:
+                file.write(
+                    struct.pack("<8sII", b"MDFD0004", index, name == "model.bin")
+                )
+        for record in manifest["artifacts"]:
+            # Digests compare case-insensitively, as installation checks them.
+            record["sha256"] = artifacts.sha256(snapshot / record["path"]).upper()
+        manifest["upstream"] = {
+            "draft": {"repo_id": "z-lab/draft", "revision": "e" * 40}
+        }
+        self.write_manifest(snapshot, manifest)
+        config = self.root / "dflash2.json"
+        config.write_text(
+            json.dumps({"architectures": ["DFlash2DraftModel"], "num_hidden_layers": 5})
+        )
+        destination = self.root / "exported"
+        with contextlib.redirect_stdout(io.StringIO()):
+            export_draft.export(snapshot, config, destination)
+        exported = json.loads((destination / "config.json").read_text())
+        self.assertEqual(
+            exported["splash"],
+            {
+                "format": "MDFD0004",
+                "source": {"repo": "z-lab/draft", "revision": "e" * 40},
+            },
+        )
+        self.assertEqual(
+            (destination / "layer-4.bin").read_bytes(),
+            (snapshot / "draft/layer-4.bin").read_bytes(),
+        )
+        for mutate, message in (
+            (lambda m: m.pop("upstream"), "names no upstream draft"),
+            (
+                lambda m: m["upstream"]["draft"].update(revision="main"),
+                "names no upstream draft",
+            ),
+        ):
+            broken = copy.deepcopy(manifest)
+            mutate(broken)
+            self.write_manifest(snapshot, broken)
+            with self.assertRaisesRegex(artifacts.ModelError, message):
+                export_draft.export(snapshot, config, self.root / "other")
+        self.write_manifest(snapshot, manifest)
+        with (snapshot / "draft/layer-2.bin").open("r+b") as file:
+            file.write(struct.pack("<8sII", b"MDFD0004", 3, 0))
+        with self.assertRaisesRegex(artifacts.ModelError, "checksum changed"):
+            export_draft.export(snapshot, config, self.root / "other")
+        self.assertFalse((self.root / "other").exists())
+
     def test_variant_model_ids_parse_and_name_installed_roots(self):
         self.assertEqual(
             artifacts.split_model_id("owner/repo:UD-Q4_K_M"),

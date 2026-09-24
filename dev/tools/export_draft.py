@@ -25,38 +25,39 @@ def export(package, config_path, destination):
     if type(layers) is not int or layers <= 0:
         raise models.ModelError("invalid draft layer count")
     manifest = models.validate_package_manifest(package / "manifest.json")
+    # The package names the DFlash2 checkpoint its draft was converted from.
+    source = manifest.get("upstream", {}).get("draft", {})
+    if not isinstance(source.get("repo_id"), str) or not models.is_hex_digest(
+        source.get("revision"), 40
+    ):
+        raise models.ModelError(
+            "the package names no upstream draft repository and commit"
+        )
     records = {item["path"]: item for item in manifest["artifacts"]}
     names = ["model.bin", *(f"layer-{i}.bin" for i in range(layers))]
+    if missing := [n for n in names if "draft/" + n not in records]:
+        raise models.ModelError(
+            "the package lists no draft weight " + ", ".join(missing)
+        )
+    models.verify_artifacts(
+        package, {"artifacts": [records["draft/" + n] for n in names]}, full=True
+    )
     for name in names:
-        source = package / "draft" / name
-        record = records.get("draft/" + name)
-        if (
-            not record
-            or source.stat().st_size != record["size"]
-            or models.sha256(source) != record["sha256"]
-        ):
-            raise models.ModelError("unverified draft weight: " + name)
-        if name.startswith("layer-"):
-            with source.open("rb") as stream:
-                magic, layer, kind = struct.unpack("<8sII", stream.read(16))
-            if (
-                magic != models.DRAFT_LAYER_MAGIC.encode()
-                or layer != int(name[6:-4])
-                or kind != 0
-            ):
-                raise models.ModelError("incompatible draft layout: " + name)
+        # Each file begins as the native loader requires (DFlashDraft.cpp):
+        # the magic, then layer-N.bin's index N and kind 0 (a decoder layer),
+        # or model.bin's layer count and kind 1 (the shared projections).
+        expected = (layers, 1) if name == "model.bin" else (int(name[6:-4]), 0)
+        with (package / "draft" / name).open("rb") as stream:
+            magic, *header = struct.unpack("<8sII", stream.read(16))
+        if magic != models.DRAFT_LAYER_MAGIC.encode() or tuple(header) != expected:
+            raise models.ModelError("incompatible draft layout: " + name)
     destination.mkdir(parents=True, exist_ok=False)
     try:
         for name in names:
             shutil.copyfile(package / "draft" / name, destination / name)
-        # The package names the DFlash2 checkpoint its draft was converted from.
-        source = manifest.get("upstream", {}).get("draft", {})
         config["splash"] = {
             "format": models.DRAFT_LAYER_MAGIC,
-            "source": {
-                "repo": source.get("repo_id"),
-                "revision": source.get("revision"),
-            },
+            "source": {"repo": source["repo_id"], "revision": source["revision"]},
         }
         (destination / "config.json").write_text(json.dumps(config, indent=2) + "\n")
     except BaseException:
