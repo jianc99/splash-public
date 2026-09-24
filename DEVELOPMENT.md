@@ -486,8 +486,10 @@ hashes of upstream GGML's dequantization (llama.cpp 7ab4ee7) in `gguf-reference`
 production executor and its `gguf_repack` kernel prepare them, bitwise against the reference,
 the prepared alpha/beta, norm, convolution and router bytes and the golden images; then
 `gguf-projection dequant`, the shipped dequantizer, built with the production Metal flags,
-against the FP16 rounding of the reference's values, and the projection kernels
-(`gguf-projection full`) and the MoE layer in every format (`gguf-moe`) against fp64. The
+against the FP16 rounding of the reference's values, the projection kernels
+(`gguf-projection full`) against fp64, and `gguf-moe`: the float projections on both float
+tiles and the MoE layer on every GGUF plan, the staged 8- and 32-row tiles and the Apple9
+register tile whatever GPU runs it, in every format, against fp64. The
 goldens and how to regenerate them are in `dev/tests/fixtures/weight-goldens/`; with
 `SPLASH_GGML_ORACLE=<libggml-base.dylib>`, `gguf-reference` also compares the reference with
 GGML directly and prints GGML's hashes.
