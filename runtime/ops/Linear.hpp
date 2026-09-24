@@ -123,10 +123,7 @@ enum class LinearInput : uint8_t {
 [[nodiscard]] constexpr uint64_t tableBytes(uint32_t width, uint64_t rows) noexcept {
   return uint64_t{width} * rows * 2;
 }
-[[nodiscard]] constexpr uint64_t tableSumsBytes(LinearInput layout, uint32_t width, uint64_t rows) noexcept {
-  return layout == LinearInput::Table16 ? uint64_t{width} * rows * 3 / 8
-       : layout == LinearInput::Table64 ? uint64_t{width} * rows / 16 : 0;
-}
+[[nodiscard]] uint64_t tableSumsBytes(LinearInput layout, uint32_t width, uint64_t rows) noexcept;
 // The scratch table currently holds `source` in `layout`. Plain means the
 // scratch describes nothing. Producers return it, consumers accept it and
 // return what the scratch describes after their dispatch.

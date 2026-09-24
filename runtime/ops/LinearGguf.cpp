@@ -182,9 +182,9 @@ uint32_t LinearPlan::blockStorageRows() const noexcept {
 
 LinearScratchSize LinearPlan::blockScratchSize() const noexcept {
   const auto [n, k] = workload_.matrix;
-  // Register tile: the Table16 table and sums (3 K / 4 fp32 per eight rows),
-  // [lane][split][row][column] partials and one counter per 64-column tile,
-  // which covers every lane. Every binding exists even without splits.
+  // Register tile: the Table16 table and sums, [lane][split][row][column]
+  // partials and one counter per 64-column tile, which covers every lane.
+  // Every binding exists even without splits.
   if (config_.tile == LinearTile::GgufRegister) {
     const uint64_t rows = workload_.rows;
     return {tableBytes(k, rows), tableSumsBytes(LinearInput::Table16, k, rows),

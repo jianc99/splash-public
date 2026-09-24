@@ -1,8 +1,8 @@
 #include "ops/MoE.hpp"
 
 #include "metal/abi/ExecutionGeometry.h"
+#include "metal/abi/Gguf.h"
 #include "metal/abi/MoE.h"
-#include "metal/abi/QuantFormat.h"
 
 #include <cstddef>
 #include <stdexcept>
@@ -102,8 +102,7 @@ MoeWorkspace workspaceFor(MoeShape shape, uint32_t rows, uint32_t tileRows,
   const uint32_t outputWidth = splitExperts ? widest : shape.hiddenSize;
   // The router's rows x 256 fp32 scores live in the grouped input until the
   // gather overwrites them. Register plans also hold the down pass's Table16
-  // tiles there, and one tile's row sums take 3 K / 4 fp32
-  // (kernels/common/gguf_sgmatrix.h).
+  // tiles there.
   const uint64_t scoreBytes = uint64_t{rows} * 256 * sizeof(float);
   const bool table16 = ggufTile == MoeGgufTile::Register;
   const uint64_t sumsBytes = table16 ? tableSumsBytes(LinearInput::Table16, widest, groupedRows) : 0;
@@ -224,7 +223,7 @@ void addGgufExperts(metal::CommandGraph &graph, const MoeScratch &scratch,
     graph.add(kernel + (up ? "_g" : "_a"), std::move(bindings),
               MoeGgufExpertParams{k, n, shape.experts, projection.routed.formatId,
                                   projection.shared.formatId},
-              {n / 64, tiles, 1}, {table16 ? 128u : 64u, 1, 1});
+              {n / GGUF_TILE_COLUMNS, tiles, 1}, {table16 ? GGUF_REGISTER_THREADS : GGUF_STAGED_THREADS, 1, 1});
   };
   const uint32_t hidden = shape.hiddenSize;
   const uint32_t intermediate = shape.expertIntermediateSize;

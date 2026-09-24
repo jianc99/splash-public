@@ -1,6 +1,7 @@
 #include "Linear.hpp"
 
 #include "metal/abi/ExecutionGeometry.h"
+#include "metal/abi/Gguf.h"
 #include "metal/abi/Linear.h"
 #include "ops/ChoiceTable.hpp"
 
@@ -103,6 +104,13 @@ bool supportsFourSimdgroups(LinearWorkload w, LinearTile tile) noexcept {
 }
 
 } // namespace
+
+// Table16 holds its sums per eight-row tile (metal/abi/Gguf.h), a lane's rows.
+uint64_t tableSumsBytes(LinearInput layout, uint32_t width, uint64_t rows) noexcept {
+  return layout == LinearInput::Table16
+             ? rows / SPLASH_TARGET_VERIFY_ROWS * table16_sums_per_tile(width) * sizeof(float)
+       : layout == LinearInput::Table64 ? uint64_t{width} * rows / 16 : 0;
+}
 
 void requireAffineProjection(const Projection &p, LinearMatrix matrix) {
   if (p.layout() != WeightLayout::Affine64 || p.outputSize != matrix.outputSize ||
