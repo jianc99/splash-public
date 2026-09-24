@@ -432,28 +432,31 @@ def prepare(args, repo=None):
                     flush=True,
                 )
                 return True
-    repo = repo or Repository(repo_id, revision)
-    if "manifest.json" in repo.files:
-        if revision or language_only or draft_override:
-            raise models.ModelError(
-                "source selection options require an upstream model ID"
-            )
-        return False
-    target = _target(repo, variant, language_only)
-    family = family_for(target.config)
-    draft = (
-        Repository(draft_override)
-        if draft_override
-        else Repository(DRAFTS, family.draft.revision)
-    )
-    draft_names = _draft_files(draft, family)
-    print(
-        f"Installing {args.model} as {family.name} ({target.format}); draft {draft.name}; "
-        f"vision {'disabled' if language_only else 'enabled'}.",
-        flush=True,
-    )
-    components = target.metadata | target.vision
-    sources = repo.download(target.weights | set(components.values()))
+    # Every Hub request (resolution, header reads, downloads) happens here.
+    with models.hub_errors(f"cannot install {args.model}"):
+        repo = repo or Repository(repo_id, revision)
+        if "manifest.json" in repo.files:
+            if revision or language_only or draft_override:
+                raise models.ModelError(
+                    "source selection options require an upstream model ID"
+                )
+            return False
+        target = _target(repo, variant, language_only)
+        family = family_for(target.config)
+        draft = (
+            Repository(draft_override)
+            if draft_override
+            else Repository(DRAFTS, family.draft.revision)
+        )
+        draft_names = _draft_files(draft, family)
+        print(
+            f"Installing {args.model} as {family.name} ({target.format}); "
+            f"draft {draft.name}; vision {'disabled' if language_only else 'enabled'}.",
+            flush=True,
+        )
+        components = target.metadata | target.vision
+        sources = repo.download(target.weights | set(components.values()))
+        drafts = draft.download(draft_names)
     files = {name: sources[source] for name, source in components.items()}
     for name in sorted(target.weights):
         files["target/" + Path(name).name] = sources[name]
@@ -468,7 +471,6 @@ def prepare(args, repo=None):
     else:
         files["target/config.json"] = files["config.json"]
     files["tokenizer/config.json"] = files["config.json"]
-    drafts = draft.download(draft_names)
     for name, path in drafts.items():
         files["draft/" + Path(name).name] = path
     records = {}

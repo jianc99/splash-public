@@ -484,6 +484,76 @@ class UpstreamTest(unittest.TestCase):
             ):
                 upstream.Repository("owner/private")
 
+    def test_hub_failures_during_installation_are_model_errors(self):
+        import httpx
+        from huggingface_hub.errors import HfHubHTTPError
+
+        def status(code):
+            request = httpx.Request("GET", "https://huggingface.co/owner/model")
+            return HfHubHTTPError(
+                f"{code} Client Error", response=httpx.Response(code, request=request)
+            )
+
+        info = SimpleNamespace(
+            sha="a" * 40, siblings=[SimpleNamespace(rfilename="model-Q4_K_M.gguf")]
+        )
+        for failure, hint in (
+            (httpx.ConnectError("connection reset"), False),
+            (status(401), True),
+            (status(404), False),
+        ):
+            with (
+                self.subTest(failure=failure),
+                mock.patch("huggingface_hub.get_token", return_value=None),
+                mock.patch("huggingface_hub.HfApi") as api,
+                mock.patch("huggingface_hub.try_to_load_from_cache", return_value=None),
+                mock.patch("huggingface_hub.HfFileSystem") as filesystem,
+            ):
+                api.return_value.model_info.return_value = info
+                # The GGUF header read, before any download.
+                filesystem.return_value.open.side_effect = failure
+                with self.assertRaises(models.ModelError) as raised:
+                    upstream.prepare(arguments(self.root, "owner/model:Q4_K_M"))
+            message = str(raised.exception)
+            self.assertTrue(message.startswith("cannot install owner/model:Q4_K_M: "))
+            self.assertIn(str(failure), message)
+            self.assertEqual("hf auth login" in message, hint)
+        # A download that fails mid-transfer is reported without a traceback.
+        info.siblings = [
+            SimpleNamespace(rfilename=name)
+            for name in (
+                "config.json",
+                "tokenizer.json",
+                "tokenizer_config.json",
+                "model.safetensors",
+            )
+        ]
+        errors = io.StringIO()
+        with (
+            mock.patch("huggingface_hub.get_token", return_value=None),
+            mock.patch("huggingface_hub.HfApi") as api,
+            mock.patch(
+                "huggingface_hub.hf_hub_download",
+                side_effect=httpx.ReadTimeout("timed out"),
+            ),
+            contextlib.redirect_stderr(errors),
+        ):
+            api.return_value.model_info.return_value = info
+            code = models.main(
+                [
+                    "--models",
+                    str(self.root / "models"),
+                    "--model",
+                    "owner/model",
+                    "--language-only",
+                    "prepare",
+                ]
+            )
+        self.assertEqual(code, 1)
+        self.assertEqual(
+            errors.getvalue(), "error: cannot install owner/model: timed out\n"
+        )
+
     def test_selection_paths_do_not_conflict(self):
         root = Path("/models")
         repo = "mlx-community/Qwen3.8-27B-4bit"

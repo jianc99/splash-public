@@ -666,6 +666,18 @@ def hub_error(error, context: str, token=None) -> str:
     return f"{context}: {message}"
 
 
+@contextmanager
+def hub_errors(context: str):
+    """Report a Hub, network or cache failure in the block as a ModelError
+    (see hub_error), which callers print without a traceback."""
+    import httpx
+
+    try:
+        yield
+    except (OSError, httpx.HTTPError) as error:
+        raise ModelError(hub_error(error, context)) from error
+
+
 def resolve_target_gguf(manifest, variant: str) -> Path:
     """Download the variant's GGUF from its source repository into the Hub
     cache, checked against the manifest; offline, a verified cached copy."""
