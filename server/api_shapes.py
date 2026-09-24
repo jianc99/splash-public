@@ -211,9 +211,15 @@ def normalize_messages(messages, *, deadline=None, vision=True):
             raise APIError(400, "each message must be an object")
         role = message.get("role")
         if role in ("system", "developer"):
-            normalized.append(
-                {"role": "system", "content": _text_content(message.get("content"))}
-            )
+            text = _text_content(message.get("content"))
+            if len(normalized) == 1 and normalized[0]["role"] == "system":
+                # Responses instructions and developer items, or an Anthropic
+                # system and a system message, lead as one system message.
+                normalized[0]["content"] = "\n\n".join(
+                    part for part in (normalized[0]["content"], text) if part
+                )
+            else:
+                normalized.append({"role": "system", "content": text})
             continue
         if role not in ("user", "assistant", "tool"):
             raise APIError(400, f"unsupported message role: {role}")

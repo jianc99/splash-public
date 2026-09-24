@@ -6,6 +6,7 @@ from jinja2 import TemplateError
 from transformers import PreTrainedTokenizerFast
 
 from dev.tests.test_server import FakeRuntime, Harness, TemplateTokenizer, _byte_backend
+from server import api_shapes
 from server.chat_templates import compatible_chat_template
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures/chat_templates"
@@ -150,3 +151,66 @@ class ChatTemplateTests(unittest.TestCase):
         )
         self.assertIn("<|im_start|>system\nLater<|im_end|>", rendered)
         self.assertIn("<|image_pad|>", rendered)
+
+
+class LeadingSystemMergeTests(unittest.TestCase):
+    def test_leading_system_and_developer_messages_merge_into_one(self):
+        merged = api_shapes.normalize_messages(
+            [
+                {"role": "system", "content": "One"},
+                {"role": "developer", "content": [{"type": "text", "text": "Two"}]},
+                {"role": "system", "content": ""},
+                {"role": "developer", "content": "Three"},
+                {"role": "user", "content": "Ask"},
+                {"role": "developer", "content": "Later"},
+                {"role": "system", "content": "Later still"},
+            ]
+        )
+        self.assertEqual(
+            merged,
+            [
+                {"role": "system", "content": "One\n\nTwo\n\nThree"},
+                {"role": "user", "content": "Ask"},
+                {"role": "system", "content": "Later"},
+                {"role": "system", "content": "Later still"},
+            ],
+        )
+        self.assertEqual(
+            api_shapes.normalize_messages(
+                [
+                    {"role": "system", "content": "  Only  "},
+                    {"role": "user", "content": "x"},
+                ]
+            )[0],
+            {"role": "system", "content": "  Only  "},
+        )
+
+    def test_every_api_shape_leads_with_one_system_message(self):
+        responses = api_shapes.responses_to_chat_body(
+            {
+                "instructions": "Base",
+                "input": [
+                    {"role": "developer", "content": "Developer"},
+                    {"role": "user", "content": "Ask"},
+                ],
+            }
+        )["messages"]
+        anthropic = api_shapes.anthropic_to_chat_prompt(
+            {
+                "model": "m",
+                "system": "Base",
+                "messages": [
+                    {"role": "system", "content": "Developer"},
+                    {"role": "user", "content": "Ask"},
+                ],
+            }
+        )["messages"]
+        for messages in (responses, anthropic):
+            with self.subTest(messages=messages):
+                self.assertEqual(
+                    api_shapes.normalize_messages(messages),
+                    [
+                        {"role": "system", "content": "Base\n\nDeveloper"},
+                        {"role": "user", "content": "Ask"},
+                    ],
+                )
