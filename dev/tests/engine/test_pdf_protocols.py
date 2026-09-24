@@ -218,11 +218,17 @@ class PdfProtocolTests(unittest.TestCase):
         )
 
     def test_user_and_tool_files_share_one_request_budget(self):
-        parts = documents.file_content(self.file, budget=documents.DocumentBudget())
-        size = sum(
-            len(p.get("text", "")) * 4 + len(p.get("image_url", {}).get("url", ""))
-            for p in parts
-        )
+        budget = documents.DocumentBudget()
+        documents.file_content(self.file, budget=budget)
+        one_file = documents.MAX_REQUEST_DOCUMENT_BYTES - budget.remaining_bytes
+
+        def normalize(messages, remaining_bytes):
+            request_budget = documents.DocumentBudget(remaining_bytes=remaining_bytes)
+            with mock.patch.object(
+                api_shapes, "DocumentBudget", return_value=request_budget
+            ):
+                api_shapes.normalize_messages(messages, vision=True)
+
         for dialect in ("chat", "responses"):
             with self.subTest(dialect=dialect):
                 if dialect == "chat":
@@ -252,15 +258,9 @@ class PdfProtocolTests(unittest.TestCase):
                         ]
                     }
                     messages = api_shapes.responses_to_chat_body(body)["messages"]
-                with (
-                    mock.patch.object(
-                        api_shapes,
-                        "DocumentBudget",
-                        return_value=documents.DocumentBudget(remaining_bytes=size),
-                    ),
-                    self.assertRaisesRegex(APIError, "request size limit"),
-                ):
-                    api_shapes.normalize_messages(messages, vision=True)
+                normalize(messages, 2 * one_file)
+                with self.assertRaisesRegex(APIError, "request size limit"):
+                    normalize(messages, 2 * one_file - 1)
 
     def test_deadline_applies_even_to_cached_pdf(self):
         self.chat()
