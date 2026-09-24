@@ -85,11 +85,6 @@ def render_chat_template(tokenizer, messages, options):
         )
 
 
-def has_later_system(messages):
-    """Whether normalized messages carry a system message after the first."""
-    return any(message["role"] == "system" for message in messages[1:])
-
-
 @dataclass(frozen=True, slots=True)
 class ChatTemplate:
     source: str
@@ -97,6 +92,13 @@ class ChatTemplate:
     later_system: str
     # RENDERS, REJECTS, DROPS or MISPLACES.
     original: str
+
+    def accepts(self, messages):
+        """Whether requests with these normalized messages are served: a
+        system message after the first needs a template that renders it."""
+        return self.later_system != UNSUPPORTED or all(
+            message["role"] != "system" for message in messages[1:]
+        )
 
 
 class ChatTemplates:

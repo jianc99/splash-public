@@ -27,9 +27,7 @@ if __package__:
     from .chat_templates import (
         LATER_SYSTEM_UNSUPPORTED,
         REASONING_EFFORTS,
-        UNSUPPORTED,
         ChatTemplates,
-        has_later_system,
         render_chat_template,
         template_options,
     )
@@ -63,9 +61,7 @@ else:
     from chat_templates import (
         LATER_SYSTEM_UNSUPPORTED,
         REASONING_EFFORTS,
-        UNSUPPORTED,
         ChatTemplates,
-        has_later_system,
         render_chat_template,
         template_options,
     )
@@ -763,9 +759,7 @@ class Frontend:
         self, prompt, deadline, *, check_context=True, add_generation_prompt=True
     ):
         chat_template = self.chat_templates.select(prompt.tools)
-        if chat_template.later_system == UNSUPPORTED and has_later_system(
-            prompt.messages
-        ):
+        if not chat_template.accepts(prompt.messages):
             raise APIError(400, LATER_SYSTEM_UNSUPPORTED)
         template = {
             "tokenize": False,
