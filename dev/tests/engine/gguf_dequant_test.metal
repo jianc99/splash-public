@@ -1,5 +1,7 @@
 // Test-only entry points expose the production dequantizer before matmul/output rounding.
-#include "metal/kernels/shared/gguf_linear.metal"
+#pragma clang fp reassociate(off)
+#include "metal/abi/Gguf.h"
+#include "metal/kernels/common/gguf_staged.h"
 
 #define DEQUANT_TEST(F, name) \
 kernel void gguf_test_dequant_##name(device uchar *w0 [[buffer(0)]], \

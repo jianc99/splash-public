@@ -249,7 +249,7 @@ $(TEST_GGUF_PREPARATION): dev/tests/engine/gguf_preparation_test.mm $(ENGINE_LIB
 # Production flags, not TEST_METALFLAGS: dequant mode compares the shipped
 # dequantizer with GGML bitwise, and -O3 changes its AIR under Metal's fast math.
 $(TEST_GGUF_DEQUANT_AIR): dev/tests/engine/gguf_dequant_test.metal \
-		runtime/metal/kernels/shared/gguf_linear.metal $(KERNEL_HEADERS) | $(ENGINE_TEST_BUILD)
+		$(KERNEL_HEADERS) | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(METAL) $(PROD_METALFLAGS) -c $< -o $@
 
 $(TEST_GGUF_DEQUANT_LIB): $(TEST_GGUF_DEQUANT_AIR)
