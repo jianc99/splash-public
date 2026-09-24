@@ -46,7 +46,7 @@ struct GgufPrefillParams {
   uint32_t output_size; // columns of this segment
   uint32_t input_size;  // K
   uint32_t rows;        // rows of the chunk
-  uint32_t out_stride;  // row stride of the destination
+  uint32_t out_stride;  // row stride of the destination (0 = output_size)
   uint32_t out_offset;  // first destination column of this segment
 };
 static_assert(sizeof(GgufPrefillParams) == 20, "GGUF prefill parameters are 20 bytes on both sides");

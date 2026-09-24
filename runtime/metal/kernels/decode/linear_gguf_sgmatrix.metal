@@ -111,7 +111,7 @@ inline void decode(device const bfloat *table, device const float *sums, device 
   typedef Shape<F> S;
   typedef Coef<F> C;
   constexpr uint FG = 4 / S::CG;  // fragments per coefficient group
-  const uint K = p.input_size, spans = K / 64, groups = K / 32, splits = p.splits;
+  const uint K = p.input_size, spans = K / GGUF_TABLE16_SPAN_INPUTS, groups = K / 32, splits = p.splits;
   const ulong tileSums = table16_sums_per_tile(K);
   const uint units = spans / S::UnitSpans;
   const uint u0 = tg.y * units / splits, u1 = (tg.y + 1) * units / splits;
@@ -274,7 +274,7 @@ kernel void decode_linear_gguf_prepare(device const bfloat *input [[buffer(0)]],
                                        uint lane [[thread_index_in_simdgroup]]) {
   const uint span = (tg.x * 4 + sg) / 8, row = (tg.x * 4 + sg) % 8;
   input += ulong(tg.y) * width * 8;
-  const uint k = span * 64 + 2 * lane;
+  const uint k = span * GGUF_TABLE16_SPAN_INPUTS + 2 * lane;
   gguf_sg::write_input(table + ulong(tg.y) * width * 8, sums + ulong(tg.y) * table16_sums_per_tile(width), width,
                      span, row, lane, input[row * width + k], input[row * width + k + 1]);
 }
@@ -368,7 +368,7 @@ GGUF_SG_FUSED(4)
 // (kernels/shared/moe.metal) with the weights of the tile's expert (moe_gguf_segment), in the format the tile picks
 // at run time: on the 40-core M3 Max one run-time-format kernel is within +1.6% of the per-format kernels
 // (time-sg at 23040x2048 Q4_K and 92160x512 Q5_K, one to four lanes). No K splits, so no partials or counters.
-// aux is the gate of the up pass. Grid (N / 64, tiles), 128 threads.
+// aux is the gate of the up pass. Grid (column tiles, expert tiles), GGUF_REGISTER_THREADS threads.
 template <GgufEpilogue Ep>
 inline void gguf_sg_expert(device const bfloat *table, device const float *sums, device const MoeTileDescriptor *tiles,
                            device const uint *tile_count, device uchar *w0, device uchar *w1, device uchar *meta,
