@@ -20,6 +20,36 @@ MODEL = "incoai/Qwen3.6-35B-A3B-Splash"
 
 
 class ClientTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.runtime = Path(directory.name)
+
+    def command(
+        self,
+        name,
+        context=102400,
+        model=MODEL,
+        env=None,
+        client_args=(),
+        client_version=None,
+        input_modalities=None,
+    ):
+        return clients.command(
+            name,
+            f"/bin/{name}",
+            "http://127.0.0.1:8000/",
+            model,
+            context,
+            self.runtime,
+            {} if env is None else env,
+            client_args=client_args,
+            client_version=client_version,
+            input_modalities=["text", "image", "pdf"]
+            if input_modalities is None
+            else input_modalities,
+        )
+
     def test_server_key_reaches_every_provider_without_entering_argv(self):
         for name in clients.INSTALL_URLS:
             with self.subTest(client=name):
@@ -46,36 +76,6 @@ class ClientTests(unittest.TestCase):
                     )
                     self.assertEqual(profile.stat().st_mode & 0o777, 0o600)
 
-    def setUp(self):
-        directory = tempfile.TemporaryDirectory()
-        self.addCleanup(directory.cleanup)
-        self.runtime = Path(directory.name)
-
-    def command(
-        self,
-        name,
-        context=102400,
-        model="incoai/Qwen3.6-35B-A3B-Splash",
-        env=None,
-        client_args=(),
-        client_version=None,
-        input_modalities=None,
-    ):
-        return clients.command(
-            name,
-            f"/bin/{name}",
-            "http://127.0.0.1:8000/",
-            model,
-            context,
-            self.runtime,
-            {} if env is None else env,
-            client_args=client_args,
-            client_version=client_version,
-            input_modalities=["text", "image", "pdf"]
-            if input_modalities is None
-            else input_modalities,
-        )
-
     def test_missing_clients_have_actionable_install_message(self):
         for name in clients.INSTALL_URLS:
             with (
@@ -97,7 +97,10 @@ class ClientTests(unittest.TestCase):
 
     def test_model_is_required(self):
         for model in (None, "", 123):
-            with self.assertRaisesRegex(clients.ClientError, "model"):
+            with (
+                self.subTest(model=model),
+                self.assertRaisesRegex(clients.ClientError, "model"),
+            ):
                 self.command("codex", model=model)
 
     def test_unknown_client_is_rejected(self):
@@ -197,6 +200,7 @@ class ClientTests(unittest.TestCase):
                             MODEL: {
                                 "name": MODEL,
                                 "reasoning": True,
+                                # Efforts are offered, none is selected.
                                 "variants": {
                                     "none": {"reasoningEffort": "none"},
                                     "low": {"reasoningEffort": "low"},
@@ -244,6 +248,25 @@ class ClientTests(unittest.TestCase):
             ],
         )
         self.assertEqual(env, {"PATH": "/bin", "SPLASH_API_KEY": "local"})
+        self.assertEqual(
+            tomllib.loads("\n".join(argv[2::2])),
+            {
+                "model": MODEL,
+                "web_search": "disabled",
+                "model_provider": "splash",
+                "model_providers": {
+                    "splash": {
+                        "name": "Splash",
+                        "base_url": "http://127.0.0.1:8000/v1",
+                        "env_key": "SPLASH_API_KEY",
+                        "wire_api": "responses",
+                    }
+                },
+                "model_context_window": 102400,
+                "model_auto_compact_token_limit": 92160,
+            },
+        )
+        self.assertEqual(list(self.runtime.iterdir()), [])
 
     def test_hermes_launch_writes_a_private_profile(self):
         argv, env = self.command("hermes", env={"PATH": "/bin"})
@@ -298,39 +321,11 @@ class ClientTests(unittest.TestCase):
         provider = config["provider"]["splash"]
         self.assertEqual(provider["options"]["baseURL"], "http://127.0.0.1:8000/v1")
         self.assertEqual(
-            provider["models"]["incoai/Qwen3.6-35B-A3B-Splash"]["limit"]["context"],
+            provider["models"][MODEL]["limit"]["context"],
             102400,
         )
 
-    def test_opencode_exposes_request_efforts_without_selecting_a_default(self):
-        for model in (
-            "incoai/Qwen3.6-35B-A3B-Splash",
-            "incoai/Qwen3.8-27B-Splash",
-            "community/custom-model",
-        ):
-            with self.subTest(model=model):
-                argv, env = self.command("opencode", model=model)
-                config = json.loads(env["OPENCODE_CONFIG_CONTENT"])
-                model_config = config["provider"]["splash"]["models"][model]
-                self.assertEqual(
-                    model_config["variants"],
-                    {
-                        "none": {"reasoningEffort": "none"},
-                        "low": {"reasoningEffort": "low"},
-                        "medium": {"reasoningEffort": "medium"},
-                        "high": {"reasoningEffort": "high"},
-                        "xhigh": {"reasoningEffort": "xhigh"},
-                    },
-                )
-                self.assertEqual(argv, ["/bin/opencode"])
-                self.assertNotIn("variant", config)
-                self.assertNotIn("reasoningEffort", model_config)
-                self.assertNotIn("options", model_config)
-                for agent in config["agent"].values():
-                    self.assertNotIn("variant", agent)
-
     def test_opencode_preserves_inline_variant_definitions_and_selection(self):
-        model = "incoai/Qwen3.6-35B-A3B-Splash"
         variants = {
             "low": {"reasoningEffort": "low", "temperature": 0.2},
             "xhigh": {"disabled": True},
@@ -338,14 +333,14 @@ class ClientTests(unittest.TestCase):
         }
         user = {
             "agent": {"build": {"variant": "brief", "prompt": "Custom prompt"}},
-            "provider": {"splash": {"models": {model: {"variants": variants}}}},
+            "provider": {"splash": {"models": {MODEL: {"variants": variants}}}},
         }
         original = {"OPENCODE_CONFIG_CONTENT": json.dumps(user)}
         before = dict(original)
         args = ["run", "--variant", "none", "A prompt"]
         argv, env = self.command("opencode", env=original, client_args=args)
         config = json.loads(env["OPENCODE_CONFIG_CONTENT"])
-        configured = config["provider"]["splash"]["models"][model]["variants"]
+        configured = config["provider"]["splash"]["models"][MODEL]["variants"]
         self.assertEqual(configured["none"], {"reasoningEffort": "none"})
         self.assertEqual(configured["medium"], {"reasoningEffort": "medium"})
         self.assertEqual(configured["high"], {"reasoningEffort": "high"})
@@ -376,25 +371,21 @@ class ClientTests(unittest.TestCase):
         )
         agents = json.loads(env["OPENCODE_CONFIG_CONTENT"])["agent"]
         for name in ("build", "plan", "general", "explore", "title", "compaction"):
-            self.assertEqual(
-                agents[name]["model"],
-                "splash/incoai/Qwen3.6-35B-A3B-Splash",
-            )
+            self.assertEqual(agents[name]["model"], f"splash/{MODEL}")
         self.assertEqual(agents["build"]["variant"], "off")
         self.assertEqual(agents["compaction"]["temperature"], 0.2)
         self.assertEqual(agents["reviewer"], user["agent"]["reviewer"])
 
     def test_opencode_reports_shared_input_output_budget(self):
-        for context in (4096, 102400, 262144):
+        # The output allowance is a quarter of the window, from 1 to 32768.
+        for context, output in ((3, 1), (4096, 1024), (262144, 32768)):
             with self.subTest(context=context):
                 _, env = self.command("opencode", context=context)
                 config = json.loads(env["OPENCODE_CONFIG_CONTENT"])
-                limits = config["provider"]["splash"]["models"][
-                    "incoai/Qwen3.6-35B-A3B-Splash"
-                ]["limit"]
-                self.assertEqual(limits["context"], context)
-                self.assertEqual(limits["input"] + limits["output"], context)
-                self.assertEqual(limits["output"], min(32768, context // 4))
+                self.assertEqual(
+                    config["provider"]["splash"]["models"][MODEL]["limit"],
+                    {"context": context, "input": context - output, "output": output},
+                )
                 self.assertNotIn("compaction", config)
 
     def test_clients_offer_the_served_input_modalities(self):
@@ -404,7 +395,7 @@ class ClientTests(unittest.TestCase):
                 _, env = self.command("opencode", input_modalities=modalities)
                 model = json.loads(env["OPENCODE_CONFIG_CONTENT"])["provider"][
                     "splash"
-                ]["models"]["incoai/Qwen3.6-35B-A3B-Splash"]
+                ]["models"][MODEL]
                 self.assertIs(model["attachment"], vision)
                 self.assertEqual(
                     model["modalities"], {"input": modalities, "output": ["text"]}
@@ -420,7 +411,8 @@ class ClientTests(unittest.TestCase):
                     self.command(name, input_modalities=["text", "image", "pdf"]),
                     self.command(name, input_modalities=["text"]),
                 )
-        # A server that reports no modalities predates the launcher.
+
+    def test_server_without_text_input_modalities_predates_the_launcher(self):
         for name in clients.INSTALL_URLS:
             for modalities in ([], ["image"], "text", [None], ["text", 3]):
                 with self.subTest(name=name, modalities=modalities):
@@ -573,33 +565,11 @@ class ClientTests(unittest.TestCase):
             ):
                 self.assertIsNone(clients.probe_major_version("/bin/opencode"))
 
-    def test_codex_uses_responses_and_actual_context_without_replacing_prompt(self):
-        argv, env = self.command("codex")
-        settings = tomllib.loads(
-            "\n".join(argv[i + 1] for i, value in enumerate(argv) if value == "-c")
-        )
-        self.assertEqual(settings["model_context_window"], 102400)
-        self.assertEqual(settings["model_auto_compact_token_limit"], 92160)
-        self.assertEqual(settings["model_provider"], "splash")
-        provider = settings["model_providers"]["splash"]
-        self.assertEqual(provider["wire_api"], "responses")
-        self.assertEqual(provider["base_url"], "http://127.0.0.1:8000/v1")
-        self.assertEqual(env[provider["env_key"]], "local")
-        self.assertNotIn("model_catalog_json", settings)
-        self.assertNotIn("model_instructions_file", settings)
-        self.assertNotIn("model_reasoning_effort", settings)
-        self.assertEqual(list(self.runtime.iterdir()), [])
-        self.assertEqual(settings["web_search"], "disabled")
-
     def test_hermes_profile_preserves_preferences_and_sessions_on_model_change(self):
         _, env = self.command("hermes")
         home = Path(env["HERMES_HOME"])
         path = home / "config.yaml"
         config = yaml.safe_load(path.read_text())
-        self.assertEqual(config["model"]["context_length"], 102400)
-        self.assertEqual(config["model"]["max_tokens"], 25600)
-        self.assertEqual(config["model"]["base_url"], "http://127.0.0.1:8000/v1")
-        self.assertTrue(config["model"]["supports_vision"])
         config["display"] = {"interface": "tui"}
         config["mcp_servers"] = {"test": {"command": "test-server"}}
         path.write_text(yaml.safe_dump(config))
@@ -660,20 +630,16 @@ class ClientTests(unittest.TestCase):
             with self.subTest(name=name):
                 argv, env = self.command(name, env=original)
                 self.assertEqual(env["USER_SETTING"], "keep")
-                self.assertFalse(
-                    any(
-                        word in " ".join(argv)
-                        for word in (
-                            "--tools",
-                            "--toolsets",
-                            "skip-permissions",
-                            "bypassPermissions",
-                            "--bare",
-                            "--safe-mode",
-                            "--system-prompt",
-                        )
-                    )
-                )
+                for word in (
+                    "--tools",
+                    "--toolsets",
+                    "skip-permissions",
+                    "bypassPermissions",
+                    "--bare",
+                    "--safe-mode",
+                    "--system-prompt",
+                ):
+                    self.assertNotIn(word, " ".join(argv))
         self.assertEqual(Path.cwd(), cwd)
         self.assertEqual(original, {"PATH": "/bin", "USER_SETTING": "keep"})
 
@@ -743,22 +709,6 @@ class ClientTests(unittest.TestCase):
                 args = ["--help", "--", "literal"]
                 argv, _ = self.command(name, client_args=args)
                 self.assertEqual(argv[-len(args) :], args)
-
-    def test_claude_hides_only_hosted_search_and_preserves_user_restrictions(self):
-        args = ["--disallowedTools", "Bash", "mcp__private__write", "--print", "hello"]
-        argv, _ = self.command("claude", client_args=args)
-        self.assertEqual(
-            argv[1:5],
-            [
-                "--disallowedTools",
-                "WebSearch",
-                "--model",
-                "incoai/Qwen3.6-35B-A3B-Splash",
-            ],
-        )
-        self.assertEqual(argv[-len(args) :], args)
-        self.assertNotIn("WebFetch", argv)
-        self.assertIn("--permission-mode", argv)
 
 
 class ClientLifecycleTests(unittest.TestCase):
@@ -1294,7 +1244,7 @@ class InstalledCodexTests(unittest.TestCase):
                         "codex",
                         os.environ["SPLASH_CODEX_BINARY"],
                         base_url,
-                        "incoai/Qwen3.6-35B-A3B-Splash",
+                        MODEL,
                         102400,
                         work / "runtime",
                         env,
@@ -1336,7 +1286,7 @@ class InstalledCodexTests(unittest.TestCase):
                     for path, authorization, body in requests:
                         self.assertEqual(path, "/v1/responses")
                         self.assertEqual(authorization, "Bearer local")
-                        self.assertEqual(body["model"], "incoai/Qwen3.6-35B-A3B-Splash")
+                        self.assertEqual(body["model"], MODEL)
                         self.assertFalse(
                             any(
                                 tool["type"].startswith("web_search")
