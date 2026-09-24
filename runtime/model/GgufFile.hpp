@@ -1,10 +1,12 @@
 #pragma once
 
-// Header parser for llama.cpp GGUF files (version 3): metadata scalars, tensor
-// table and data section offset. Tensor data is never read here.
+// Header parser for llama.cpp GGUF files (version 3): metadata scalars,
+// strings and small numeric arrays, the tensor table and where the tensor
+// data starts. Tensor data is never read here.
+
+#include "model/PreparedWeights.hpp"
 
 #include <cstdint>
-#include <filesystem>
 #include <map>
 #include <optional>
 #include <span>
@@ -40,7 +42,7 @@ struct GgufTensor {
   std::string name;
   uint32_t type = 0;
   std::vector<uint64_t> dims; // dims[0] is the fastest (row length)
-  uint64_t offset = 0;        // relative to the data section
+  uint64_t offset = 0;        // in the file's tensor data
   uint64_t bytes = 0;
   [[nodiscard]] uint64_t columns() const noexcept { return dims.empty() ? 0 : dims[0]; }
   [[nodiscard]] uint64_t rows() const;
@@ -49,12 +51,10 @@ struct GgufTensor {
 
 class GgufFile final {
 public:
-  explicit GgufFile(std::filesystem::path path);
+  // Parses the header of source and sets where its tensor data starts.
+  explicit GgufFile(WeightSource &source);
 
-  [[nodiscard]] const std::filesystem::path &path() const noexcept { return path_; }
-  [[nodiscard]] uint64_t fileBytes() const noexcept { return fileBytes_; }
-  [[nodiscard]] uint64_t dataOffset() const noexcept { return dataOffset_; }
-  [[nodiscard]] uint32_t alignment() const noexcept { return alignment_; }
+  [[nodiscard]] const WeightSource &source() const noexcept { return source_; }
   [[nodiscard]] const std::string &architecture() const noexcept { return architecture_; }
 
   [[nodiscard]] std::optional<uint64_t> unsignedValue(std::string_view key) const;
@@ -65,16 +65,9 @@ public:
   [[nodiscard]] const std::vector<GgufTensor> &tensors() const noexcept { return tensors_; }
   [[nodiscard]] const GgufTensor *find(std::string_view name) const noexcept;
   [[nodiscard]] const GgufTensor &require(std::string_view name) const;
-  // Absolute byte offset of a tensor's data in the file.
-  [[nodiscard]] uint64_t absoluteOffset(const GgufTensor &tensor) const noexcept {
-    return dataOffset_ + tensor.offset;
-  }
 
 private:
-  std::filesystem::path path_;
-  uint64_t fileBytes_ = 0;
-  uint64_t dataOffset_ = 0;
-  uint32_t alignment_ = 32;
+  const WeightSource &source_;
   std::string architecture_;
   std::map<std::string, uint64_t, std::less<>> unsigned_;
   std::map<std::string, std::string, std::less<>> strings_;

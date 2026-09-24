@@ -355,17 +355,6 @@ void writeWeightBytes(int fd, uint64_t offset, std::span<const uint8_t> bytes) {
   }
 }
 
-void copyWeightBytes(int source, uint64_t from, int destination, uint64_t to, uint64_t bytes,
-                     std::span<uint8_t> staging, const PreparationCheck &check) {
-  if (bytes && staging.empty()) throw std::invalid_argument("weight copy staging is empty");
-  for (uint64_t at = 0; at < bytes; at += staging.size()) {
-    run(check);
-    const auto piece = staging.first(std::min<uint64_t>(staging.size(), bytes - at));
-    readWeightBytes(source, from + at, piece);
-    writeWeightBytes(destination, to + at, piece);
-  }
-}
-
 std::string weightDigest(std::span<const uint8_t> bytes) {
   if (bytes.size() > std::numeric_limits<CC_LONG>::max())
     throw std::overflow_error("weight identity is too large");
@@ -383,8 +372,9 @@ struct WeightSource::Impl {
   Descriptor file;
   struct stat state{};
   PreparationCheck check;
-  // The tensor data offset and digest, once hashed.
-  std::optional<std::pair<uint64_t, std::string>> digest;
+  uint64_t dataOffset = 0;
+  // The tensor data's digest, once hashed.
+  std::optional<std::string> digest;
   Impl(const std::filesystem::path &path, PreparationCheck check)
       : path(path), file(open(path.c_str(), O_RDONLY | O_CLOEXEC)), check(std::move(check)) {
     if (fstat(file, &state)) fail("stat weight source");
@@ -396,10 +386,21 @@ WeightSource::WeightSource(const std::filesystem::path &path, PreparationCheck c
 WeightSource::~WeightSource() = default;
 const std::filesystem::path &WeightSource::path() const noexcept { return impl_->path; }
 int WeightSource::descriptor() const noexcept { return impl_->file; }
-const std::string &WeightSource::digest(uint64_t dataOffset) const {
-  if (!impl_->digest || impl_->digest->first != dataOffset)
-    impl_->digest.emplace(dataOffset, verifiedDigest(impl_->file, dataOffset, impl_->path, cacheRoot(), impl_->check));
-  return impl_->digest->second;
+uint64_t WeightSource::bytes() const noexcept { return uint64_t(impl_->state.st_size); }
+void WeightSource::setDataOffset(uint64_t offset) {
+  if (offset > bytes()) throw std::runtime_error("weight source data starts past its end: " + impl_->path.string());
+  impl_->dataOffset = offset;
+}
+uint64_t WeightSource::dataOffset() const noexcept { return impl_->dataOffset; }
+void WeightSource::readData(uint64_t offset, std::span<uint8_t> bytes) const {
+  if (offset > std::numeric_limits<uint64_t>::max() - impl_->dataOffset)
+    throw std::overflow_error("weight read offset overflow");
+  readWeightBytes(impl_->file, impl_->dataOffset + offset, bytes);
+}
+const std::string &WeightSource::digest() const {
+  if (!impl_->digest)
+    impl_->digest = verifiedDigest(impl_->file, impl_->dataOffset, impl_->path, cacheRoot(), impl_->check);
+  return *impl_->digest;
 }
 void WeightSource::checkUnchanged() const {
   struct stat current{};
@@ -410,12 +411,29 @@ void WeightSource::checkUnchanged() const {
     throw std::runtime_error("source weights changed during preparation; retry with an immutable source");
 }
 
-WeightIdentity &WeightIdentity::input(const WeightSource &source, uint64_t dataOffset, uint64_t offset,
-                                      uint64_t bytes, std::string_view type, std::span<const uint64_t> shape) {
-  if (offset < dataOffset) throw std::invalid_argument("source tensor precedes its file's tensor data");
-  const std::string &digest = source.digest(dataOffset);
+void SourceTensor::read(uint64_t at, std::span<uint8_t> destination) const {
+  if (at > bytes || destination.size() > bytes - at) throw std::out_of_range("source tensor read is out of bounds");
+  file->readData(offset + at, destination);
+}
+
+void SourceTensor::copy(int destination, uint64_t to, std::span<uint8_t> staging,
+                        const PreparationCheck &check) const {
+  if (bytes && staging.empty()) throw std::invalid_argument("weight copy staging is empty");
+  for (uint64_t at = 0; at < bytes; at += staging.size()) {
+    run(check);
+    const auto piece = staging.first(std::min<uint64_t>(staging.size(), bytes - at));
+    read(at, piece);
+    writeWeightBytes(destination, to + at, piece);
+  }
+}
+
+void SourceTensor::identify(WeightIdentity &identity) const { identity.input(*file, offset, bytes, dtype, shape); }
+
+WeightIdentity &WeightIdentity::input(const WeightSource &source, uint64_t offset, uint64_t bytes,
+                                      std::string_view type, std::span<const uint64_t> shape) {
+  const std::string &digest = source.digest();
   digests_.insert(digest);
-  text_ << "input " << digest << ' ' << offset - dataOffset << ' ' << bytes << ' ' << type;
+  text_ << "input " << digest << ' ' << offset << ' ' << bytes << ' ' << type;
   for (uint64_t dimension : shape) text_ << ' ' << dimension;
   text_ << '\n';
   return *this;

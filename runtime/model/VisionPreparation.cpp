@@ -207,7 +207,7 @@ void planMmproj(const GgufFile &gguf, const WeightSource &file,
                                 : t.type == ggml::kF16 ? "F16"
                                 : t.type == ggml::kF32 ? "F32"
                                                        : ggmlTypeName(t.type);
-      s.inputs.push_back(input(name, {&file, dtype, t.dims, gguf.absoluteOffset(t), t.bytes, gguf.dataOffset()}));
+      s.inputs.push_back(input(name, {&file, dtype, t.dims, t.offset, t.bytes}));
       used.insert(std::move(name));
     }
   }
@@ -217,7 +217,7 @@ void planMmproj(const GgufFile &gguf, const WeightSource &file,
       unused += (unused.empty() ? "" : ", ") + t.name;
   if (!unused.empty())
     throw WeightStoreError("mmproj tensors the vision tower does not use: " +
-                           unused + " (" + gguf.path().string() + ")");
+                           unused + " (" + gguf.source().path().string() + ")");
 }
 
 // Source bytes, patch values and output rows of one batch, reused by every
@@ -327,7 +327,7 @@ VisionPreparation::VisionPreparation(const std::filesystem::path &directory,
   } else if (source == VisionSource::Gguf) {
     const auto path = directory / "mmproj.gguf";
     i.mmproj = std::make_unique<WeightSource>(path, i.check);
-    planMmproj(GgufFile(path), *i.mmproj, layout, i.plan);
+    planMmproj(GgufFile(*i.mmproj), *i.mmproj, layout, i.plan);
   } else {
     throw WeightStoreError("only MLX and GGUF vision sources are prepared");
   }

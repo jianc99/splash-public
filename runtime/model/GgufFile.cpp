@@ -1,8 +1,8 @@
 #include "model/GgufFile.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstring>
-#include <fstream>
 #include <limits>
 
 namespace splash::model {
@@ -14,8 +14,8 @@ uint64_t checkedMultiply(uint64_t a, uint64_t b) {
   return a * b;
 }
 
-// (id, name, block elements, block bytes) for every ggml type that can appear
-// in a Qwen3.8 GGUF; sizes follow ggml-common.h.
+// (id, name, block elements, block bytes) of the ggml types this parser can
+// size, as ggml-common.h defines them; a tensor of another type is rejected.
 constexpr std::array<std::pair<uint32_t, GgmlTypeTraits>, 30> kTypes{{
     {0, {"F32", 1, 4}},         {1, {"F16", 1, 2}},         {2, {"Q4_0", 32, 18}},
     {3, {"Q4_1", 32, 20}},      {6, {"Q5_0", 32, 22}},      {7, {"Q5_1", 32, 24}},
@@ -35,23 +35,25 @@ enum ValueType : uint32_t {
   kFloat64 = 12,
 };
 
+// Reads the header sequentially through a buffer.
 class Reader {
 public:
-  Reader(const std::filesystem::path &path, uint64_t size) : stream_(path, std::ios::binary), size_(size) {
-    if (!stream_) throw GgufError("cannot open GGUF file: " + path.string());
-  }
+  explicit Reader(const WeightSource &source) : source_(source) {}
   void bytes(void *destination, uint64_t count) {
     requireRemaining(count);
-    if (count > std::numeric_limits<std::streamsize>::max())
-      throw GgufError("GGUF field is too large");
-    stream_.read(static_cast<char *>(destination), static_cast<std::streamsize>(count));
-    if (!stream_) throw GgufError("GGUF header is truncated");
-    position_ += count;
+    auto *to = static_cast<uint8_t *>(destination);
+    while (count) {
+      if (position_ < bufferStart_ || position_ >= bufferStart_ + buffered_) fill();
+      const uint64_t at = position_ - bufferStart_;
+      const uint64_t part = std::min(count, buffered_ - at);
+      std::memcpy(to, buffer_.data() + at, part);
+      to += part;
+      count -= part;
+      position_ += part;
+    }
   }
   void skip(uint64_t count) {
     requireRemaining(count);
-    stream_.seekg(static_cast<std::streamoff>(count), std::ios::cur);
-    if (!stream_) throw GgufError("GGUF header is truncated");
     position_ += count;
   }
   template <class T> T scalar() {
@@ -73,11 +75,16 @@ public:
 
 private:
   void requireRemaining(uint64_t count) const {
-    if (count > size_ - position_ || count > std::numeric_limits<std::streamoff>::max())
-      throw GgufError("GGUF header is truncated");
+    if (count > source_.bytes() - position_) throw GgufError("GGUF header is truncated");
   }
-  std::ifstream stream_;
-  uint64_t size_;
+  void fill() {
+    bufferStart_ = position_;
+    buffered_ = std::min<uint64_t>(buffer_.size(), source_.bytes() - position_);
+    readWeightBytes(source_.descriptor(), bufferStart_, std::span(buffer_).first(buffered_));
+  }
+  const WeightSource &source_;
+  std::vector<uint8_t> buffer_ = std::vector<uint8_t>(1024 * 1024);
+  uint64_t bufferStart_ = 0, buffered_ = 0;
   uint64_t position_ = 0;
   uint64_t retainedStrings_ = 0;
 };
@@ -113,19 +120,25 @@ double numericValue(Reader &reader, uint32_t type) {
   }
 }
 
-// Skips a value whose contents are not kept (arrays, mostly the tokenizer).
-void skipValue(Reader &reader, uint32_t type, unsigned depth = 0) {
+void skipValue(Reader &reader, uint32_t type, unsigned depth);
+
+// Skips the count elements of an array whose contents are not kept (mostly
+// the tokenizer's).
+void skipArray(Reader &reader, uint32_t element, uint64_t count, unsigned depth) {
+  if (element == kString || element == kArray) {
+    for (uint64_t i = 0; i < count; ++i) skipValue(reader, element, depth + 1);
+  } else {
+    reader.skip(checkedMultiply(count, scalarBytes(element)));
+  }
+}
+
+void skipValue(Reader &reader, uint32_t type, unsigned depth) {
   if (depth > 16) throw GgufError("GGUF metadata nesting is too deep");
   if (type == kString) {
     reader.skipString();
   } else if (type == kArray) {
     const uint32_t element = reader.scalar<uint32_t>();
-    const uint64_t count = reader.scalar<uint64_t>();
-    if (element == kString || element == kArray) {
-      for (uint64_t i = 0; i < count; ++i) skipValue(reader, element, depth + 1);
-    } else {
-      reader.skip(checkedMultiply(count, scalarBytes(element)));
-    }
+    skipArray(reader, element, reader.scalar<uint64_t>(), depth);
   } else {
     reader.skip(scalarBytes(type));
   }
@@ -156,14 +169,11 @@ uint64_t GgufTensor::elements() const {
   return elements;
 }
 
-GgufFile::GgufFile(std::filesystem::path path) : path_(std::move(path)) {
-  std::error_code error;
-  fileBytes_ = std::filesystem::file_size(path_, error);
-  if (error) throw GgufError("cannot stat GGUF file: " + path_.string());
-  Reader reader(path_, fileBytes_);
+GgufFile::GgufFile(WeightSource &source) : source_(source) {
+  Reader reader(source);
   char magic[4];
   reader.bytes(magic, 4);
-  if (std::memcmp(magic, "GGUF", 4) != 0) throw GgufError("not a GGUF file: " + path_.string());
+  if (std::memcmp(magic, "GGUF", 4) != 0) throw GgufError("not a GGUF file: " + source.path().string());
   const uint32_t version = reader.scalar<uint32_t>();
   if (version != 3) throw GgufError("unsupported GGUF version " + std::to_string(version));
   const uint64_t tensorCount = reader.scalar<uint64_t>();
@@ -191,10 +201,7 @@ GgufFile::GgufFile(std::filesystem::path path) : path_(std::move(path)) {
       const uint32_t element = reader.scalar<uint32_t>();
       const uint64_t count = reader.scalar<uint64_t>();
       if (count > kMaximumKeptArray || element == kString || element == kArray) {
-        if (element == kString || element == kArray)
-          for (uint64_t j = 0; j < count; ++j) skipValue(reader, element);
-        else
-          reader.skip(checkedMultiply(count, scalarBytes(element)));
+        skipArray(reader, element, count, 0);
         break;
       }
       auto &values = arrays_[key];
@@ -202,14 +209,12 @@ GgufFile::GgufFile(std::filesystem::path path) : path_(std::move(path)) {
       for (uint64_t j = 0; j < count; ++j) values.push_back(numericValue(reader, element));
       break;
     }
-    default: skipValue(reader, type); break;
+    default: skipValue(reader, type, 0); break;
     }
   }
-  if (auto alignment = unsignedValue("general.alignment")) {
-    if (*alignment == 0 || *alignment > 65536 || (*alignment & (*alignment - 1)))
-      throw GgufError("invalid GGUF alignment");
-    alignment_ = static_cast<uint32_t>(*alignment);
-  }
+  const uint64_t alignment = unsignedValue("general.alignment").value_or(32);
+  if (alignment == 0 || alignment > 65536 || (alignment & (alignment - 1)))
+    throw GgufError("invalid GGUF alignment");
   architecture_ = stringValue("general.architecture").value_or("");
   tensors_.reserve(tensorCount);
   for (uint64_t i = 0; i < tensorCount; ++i) {
@@ -236,13 +241,13 @@ GgufFile::GgufFile(std::filesystem::path path) : path_(std::move(path)) {
     tensors_.push_back(std::move(tensor));
   }
   const uint64_t headerEnd = reader.position();
-  const uint64_t padding = (alignment_ - headerEnd % alignment_) % alignment_;
-  if (padding > fileBytes_ - headerEnd) throw GgufError("GGUF data section is truncated");
-  dataOffset_ = headerEnd + padding;
+  const uint64_t padding = (alignment - headerEnd % alignment) % alignment;
+  if (padding > source.bytes() - headerEnd) throw GgufError("GGUF data section is truncated");
+  source.setDataOffset(headerEnd + padding);
+  const uint64_t dataBytes = source.bytes() - source.dataOffset();
   for (const GgufTensor &tensor : tensors_) {
-    if (tensor.offset % alignment_) throw GgufError("tensor data is misaligned: " + tensor.name);
-    if (tensor.offset > fileBytes_ - dataOffset_ ||
-        tensor.bytes > fileBytes_ - dataOffset_ - tensor.offset)
+    if (tensor.offset % alignment) throw GgufError("tensor data is misaligned: " + tensor.name);
+    if (tensor.offset > dataBytes || tensor.bytes > dataBytes - tensor.offset)
       throw GgufError("tensor data runs past the end of the file: " + tensor.name);
   }
 }

@@ -60,17 +60,21 @@ int main() {
   };
   const auto rejects = [&](const char *name, const Bytes &data) {
     write(data);
-    try { splash::model::GgufFile file(path); }
+    try {
+      splash::model::WeightSource source(path);
+      splash::model::GgufFile file(source);
+    }
     catch (const splash::model::GgufError &) { return; }
     throw std::runtime_error(std::string("accepted invalid GGUF: ") + name);
   };
   try {
     write(model({256, 1}));
-    splash::model::GgufFile valid(path);
+    splash::model::WeightSource source(path);
+    splash::model::GgufFile valid(source);
     const auto &weight = valid.require("weight");
     require(weight.bytes == 144 && weight.elements() == 256 && weight.rows() == 1,
             "valid Q4_K shape/size changed");
-    require(valid.absoluteOffset(weight) + weight.bytes == valid.fileBytes(),
+    require(source.dataOffset() + weight.offset + weight.bytes == source.bytes(),
             "valid data must end exactly at EOF");
 
     rejects("shape overflow", model({256, uint64_t{1} << 60}));

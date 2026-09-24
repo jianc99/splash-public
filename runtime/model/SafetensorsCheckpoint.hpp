@@ -2,25 +2,10 @@
 
 #include "model/PreparedWeights.hpp"
 
-#include <map>
 #include <memory>
-#include <string>
-#include <vector>
+#include <string_view>
 
 namespace splash::model {
-
-struct SourceTensor final {
-  const WeightSource *file = nullptr;
-  std::string dtype;
-  std::vector<uint64_t> shape;
-  uint64_t offset = 0;     // in the file
-  uint64_t bytes = 0;
-  uint64_t dataOffset = 0; // where the file's tensor data starts
-  void read(uint64_t at, std::span<uint8_t> destination) const;
-  // Records the tensor as an input of a prepared file: its bytes in its
-  // file's tensor data, dtype and shape.
-  void identify(WeightIdentity &identity) const;
-};
 
 // Checkpoint configuration and safetensors index. Opening parses only
 // metadata; tensor data is hashed when a prepared file's identity first

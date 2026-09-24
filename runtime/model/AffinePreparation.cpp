@@ -144,8 +144,7 @@ void writeImage(int destination, const Image &image, const PreparationCheck &adm
       writeDecay(destination, section);
     } else {
       if (section.bytes != section.tensor->bytes) throw std::runtime_error("affine tensor size differs from its plan");
-      copyWeightBytes(section.tensor->file->descriptor(), section.tensor->offset, destination, section.offset,
-                      section.bytes, input, admit);
+      section.tensor->copy(destination, section.offset, input, admit);
     }
   }
 }

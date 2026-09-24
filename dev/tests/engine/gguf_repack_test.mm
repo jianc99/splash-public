@@ -337,7 +337,8 @@ void checkAlphaBeta(splash::metal::MetalBackend *backend) {
     const TemporaryDirectory directory;
     const auto path = directory.path() / "alpha-beta.gguf";
     writeGguf(path, list.tensors, geometry);
-    const model::GgufFile gguf(path);
+    model::WeightSource source(path);
+    const model::GgufFile gguf(source);
     const model::gguf::Image plan = model::gguf::ImagePlanner(gguf, geometry).layer(0);
     const auto repack = std::find_if(plan.repacks.begin(), plan.repacks.end(), [](const model::gguf::Repack &r) {
       return r.format == GGUF_FMT_Q80 && r.rows == 256;
@@ -423,7 +424,8 @@ void checkFloatTensors(splash::metal::MetalBackend *backend) {
     const auto plan = [&](const std::vector<Tensor> &tensors, std::vector<model::gguf::Image> &images) {
       writeGguf(path, tensors, geometry);
       try {
-        const model::GgufFile gguf(path);
+        model::WeightSource source(path);
+        const model::GgufFile gguf(source);
         const model::gguf::ImagePlanner planner(gguf, geometry);
         images = {planner.layer(0), planner.layer(1), planner.head()};
       } catch (const model::GgufError &error) {
@@ -552,7 +554,8 @@ void checkMoeLayer(splash::metal::MetalBackend *backend) {
     const auto planError = [&](const model::gguf::TargetGeometry &declared) {
       writeGguf(path, list.tensors, declared);
       try {
-        const model::GgufFile gguf(path);
+        model::WeightSource source(path);
+        const model::GgufFile gguf(source);
         static_cast<void>(model::gguf::ImagePlanner(gguf, geometry));
       } catch (const model::GgufError &error) {
         return std::string(error.what());
@@ -569,7 +572,8 @@ void checkMoeLayer(splash::metal::MetalBackend *backend) {
     check(planError(dense).find("GGUF architecture is qwen35, but the package's target is qwen35moe") != std::string::npos,
           "planner checks the architecture against the package");
     writeGguf(path, list.tensors, geometry);
-    const model::GgufFile gguf(path);
+    model::WeightSource source(path);
+    const model::GgufFile gguf(source);
     const model::gguf::Image plan = model::gguf::ImagePlanner(gguf, geometry).layer(0);
     const auto *beta = copyOf(plan, "blk.0.ssm_beta.weight"), *alpha = copyOf(plan, "blk.0.ssm_alpha.weight");
     check(beta && alpha && alpha->destination == beta->destination + uint64_t{heads} * hidden * 4 &&
@@ -613,7 +617,7 @@ void checkMoeLayer(splash::metal::MetalBackend *backend) {
     allowPreparation = false;
     check(load() == image, "GGUF warm load does not require conversion headroom");
     // The model's other prepared files join the target's disk check.
-    const model::PreparedWeight vision{std::string(64, 'a'), UINT64_MAX / 2};
+    const model::PreparedWeight vision{std::string(64, 'a'), UINT64_MAX / 2, "vision/model.bin", std::string(64, 'b'), "/vision"};
     std::string budget;
     try {
       model::GgufTargetLoader loader(*backend, path, geometry, {}, {&vision, 1});
@@ -628,8 +632,9 @@ void checkMoeLayer(splash::metal::MetalBackend *backend) {
     allowPreparation = true;
     for (const char *name : {"blk.0.ffn_down_exps.weight", "blk.0.ffn_gate_inp.weight"}) {
       writeGguf(path, list.tensors, geometry);
-      const model::GgufFile original(path);
-      const uint64_t offset = original.absoluteOffset(original.require(name));
+      model::WeightSource source(path);
+      const model::GgufFile original(source);
+      const uint64_t offset = source.dataOffset() + original.require(name).offset;
       const std::vector<uint8_t> &data = list.data(name);
       auto bytes = ggufFile(list.tensors, geometry, name);
       std::fill_n(bytes.begin() + offset, data.size(), 0);
@@ -1048,7 +1053,9 @@ void checkRepack(splash::metal::MetalBackend &backend, Fmt f, const Shape &shape
     plan.bytes = bytes;
     plan.repacks.push_back(step);
     const uint64_t before = backend.memoryStats().allocatedBytes;
-    splash::model::prepareGgufImage(backend, inputFd, kSourceOffset, outputFd, plan);
+    splash::model::WeightSource source(inputPath);
+    source.setDataOffset(kSourceOffset);
+    splash::model::writeGgufImage(backend, source, outputFd, plan, {});
     check(backend.memoryStats().allocatedBytes == before, "repack releases its staging buffers");
     check(backend.memoryStats().peakAllocatedBytes <= splash::model::kWeightPreparationStagingBytes,
           "repack staging stays within the preparation staging bound");

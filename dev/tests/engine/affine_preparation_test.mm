@@ -114,7 +114,7 @@ int main(int argc, char **argv) {
       }
       if (!read) throw std::runtime_error("the target loader misread the prepared affine files");
       // The model's other prepared files join the target's disk check.
-      const model::PreparedWeight vision{std::string(64, 'a'), UINT64_MAX / 2};
+      const model::PreparedWeight vision{std::string(64, 'a'), UINT64_MAX / 2, "vision/model.bin", std::string(64, 'b'), "/vision"};
       std::string budget;
       try {
         model::AffineTargetLoader loader(backend, root, layout, {}, {&vision, 1});

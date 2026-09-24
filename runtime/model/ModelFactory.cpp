@@ -89,9 +89,10 @@ ModelPackage loadModelPackage(metal::MetalBackend &backend,
 uint64_t preparedModelWeightBytes(const std::filesystem::path &root, const ModelDescriptor &descriptor) {
   uint64_t bytes = 0;
   if (descriptor.targetSource == TargetSource::Gguf) {
-    const GgufFile source(findTargetGguf(root / "target"));
+    WeightSource source(findTargetGguf(root / "target"));
+    const GgufFile file(source);
     bytes = std::visit([&](const auto &layout) {
-      return gguf::ImagePlanner(source, ggufTargetGeometry(layout)).totalBytes();
+      return gguf::ImagePlanner(file, ggufTargetGeometry(layout)).totalBytes();
     }, descriptor.target);
   } else if (descriptor.targetSource == TargetSource::Affine) {
     bytes = std::visit([](const auto &layout) { return preparedAffineBytes(layout); }, descriptor.target);

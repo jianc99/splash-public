@@ -236,7 +236,8 @@ $(ENGINE_TEST_BUILD):
 $(ENGINE_SANITIZER_BUILD):
 	mkdir -p $@
 
-$(TEST_GGUF_FILE): dev/tests/engine/gguf_file_test.cpp runtime/model/GgufFile.cpp | $(ENGINE_TEST_BUILD)
+$(TEST_GGUF_FILE): dev/tests/engine/gguf_file_test.cpp runtime/model/GgufFile.cpp runtime/model/PreparedWeights.cpp \
+		| $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) -o $@
 
 $(TEST_GGUF_PROJECTION): dev/tests/engine/gguf_projection_test.mm dev/tests/engine/GgufFormatReference.hpp \

@@ -35,7 +35,7 @@ void requireRange(uint64_t offset, uint64_t bytes, uint64_t available) {
 
 // Image rows [first, first + count) of `rows`, bytes [column, column + span)
 // of each, back to back. Consecutive source rows are read together.
-void readRows(int source, uint64_t dataOffset, const gguf::TensorRows &rows, uint64_t first,
+void readRows(const WeightSource &source, const gguf::TensorRows &rows, uint64_t first,
               uint64_t count, uint64_t column, uint64_t span, uint8_t *to) {
   if (first > rows.rows || count > rows.rows - first || column > rows.rowBytes || span > rows.rowBytes - column)
     throw GgufError("prepared weight rows are out of bounds");
@@ -44,7 +44,7 @@ void readRows(int source, uint64_t dataOffset, const gguf::TensorRows &rows, uin
     uint64_t run = 1;
     if (span == rows.rowBytes)
       while (row + run < count && sourceRow(rows, first + row + run) == start + run) ++run;
-    readWeightBytes(source, dataOffset + rows.offset + start * rows.rowBytes + column, {to + row * span, run * span});
+    source.readData(rows.offset + start * rows.rowBytes + column, {to + row * span, run * span});
     row += run;
   }
 }
@@ -67,7 +67,7 @@ uint64_t copyBytes(const gguf::Copy &copy) {
   return copy.source.rows * copy.source.rowBytes / (copy.bfloat16 ? 2 : 1);
 }
 
-void writeCopy(int source, uint64_t dataOffset, int destination, const gguf::Copy &copy,
+void writeCopy(const WeightSource &source, int destination, const gguf::Copy &copy,
                std::span<uint8_t> staging, const PreparationCheck &admit) {
   const gguf::TensorRows &rows = copy.source;
   // Whole rows per read where they fit; a wider row in pieces of whole values.
@@ -79,7 +79,7 @@ void writeCopy(int source, uint64_t dataOffset, int destination, const gguf::Cop
       if (admit) admit();
       const uint64_t width = std::min(span, rows.rowBytes - column);
       auto bytes = staging.first(count * width);
-      readRows(source, dataOffset, rows, first, count, column, width, bytes.data());
+      readRows(source, rows, first, count, column, width, bytes.data());
       if (copy.bfloat16) bytes = narrowToBfloat16(bytes, rows.name);
       writeWeightBytes(destination, copy.destination + (first * rows.rowBytes + column) / (copy.bfloat16 ? 2 : 1),
                        bytes);
@@ -115,7 +115,7 @@ RepackChunk repackChunk(const gguf::Repack &repack) {
   return chunk;
 }
 
-void writeRepack(metal::MetalBackend &backend, int source, uint64_t dataOffset, int destination,
+void writeRepack(metal::MetalBackend &backend, const WeightSource &source, int destination,
                  const gguf::Repack &repack, uint64_t imageBytes, metal::MetalBuffer &input,
                  metal::MetalBuffer &output, const PreparationCheck &admit) {
   if (repack.format >= GGUF_FMT_COUNT || !repack.rows || repack.rows % kTileRows || !repack.columns ||
@@ -151,7 +151,7 @@ void writeRepack(metal::MetalBackend &backend, int source, uint64_t dataOffset, 
       for (const gguf::TensorRows &source_ : repack.sources) {
         const uint64_t begin = std::max(firstRow, start), end = std::min(firstRow + rows, start + source_.rows);
         if (begin < end)
-          readRows(source, dataOffset, source_, begin - start, end - begin, column, chunkRowBytes,
+          readRows(source, source_, begin - start, end - begin, column, chunkRowBytes,
                    host + (begin - firstRow) * chunkRowBytes);
         start += source_.rows;
       }
@@ -186,15 +186,14 @@ void writeRepack(metal::MetalBackend &backend, int source, uint64_t dataOffset, 
 
 } // namespace
 
-PreparedWeight ggufImageWeight(const WeightSource &source, uint64_t dataOffset, const gguf::Image &image) {
+PreparedWeight ggufImageWeight(const WeightSource &source, const gguf::Image &image) {
   // The envelope version covers identity serialization. Conversion code and
   // its storage ABI are fingerprinted at build time, independently of tuning.
   WeightIdentity identity("splash-gguf-preparation-v2 " SPLASH_GGUF_PREPARATION_ID);
   identity.record("image", image.layer, image.type, image.bytes);
   const auto rows = [&](const gguf::TensorRows &rows) {
     const uint64_t shape[] = {rows.rows, rows.rowBytes};
-    identity.input(source, dataOffset, dataOffset + rows.offset, rows.rows * rows.rowBytes, ggmlTypeName(rows.type),
-                   shape);
+    identity.input(source, rows.offset, rows.rows * rows.rowBytes, ggmlTypeName(rows.type), shape);
     identity.record("order", rows.order.from, rows.order.headRows, rows.order.groupHeads, rows.order.groups);
   };
   for (const gguf::Fill &fill : image.fills) identity.record("fill", fill.offset, weightDigest(fill.bytes));
@@ -209,8 +208,8 @@ PreparedWeight ggufImageWeight(const WeightSource &source, uint64_t dataOffset, 
   return identity.weight(image.bytes, "target/" + image.name, source.path().string());
 }
 
-void prepareGgufImage(metal::MetalBackend &backend, int source, uint64_t dataOffset, int destination,
-                      const gguf::Image &image, const PreparationCheck &admit) {
+void writeGgufImage(metal::MetalBackend &backend, const WeightSource &source, int destination,
+                    const gguf::Image &image, const PreparationCheck &admit) {
   if (admit) admit();
   for (const gguf::Fill &fill : image.fills) {
     requireRange(fill.offset, fill.bytes.size(), image.bytes);
@@ -227,7 +226,7 @@ void prepareGgufImage(metal::MetalBackend &backend, int source, uint64_t dataOff
   }
   {
     std::vector<uint8_t> staging(copyStaging);
-    for (const gguf::Copy &copy : image.copies) writeCopy(source, dataOffset, destination, copy, staging, admit);
+    for (const gguf::Copy &copy : image.copies) writeCopy(source, destination, copy, staging, admit);
   }
   // One pair of staging buffers serves every repack of the image.
   RepackChunk largest;
@@ -242,7 +241,7 @@ void prepareGgufImage(metal::MetalBackend &backend, int source, uint64_t dataOff
     auto input = backend.allocateBuffer(largest.inputBytes, metal::BufferStorage::Shared, "prepare/source");
     auto output = backend.allocateBuffer(largest.outputBytes, metal::BufferStorage::Shared, "prepare/planes");
     for (const gguf::Repack &repack : image.repacks)
-      writeRepack(backend, source, dataOffset, destination, repack, image.bytes, input, output, admit);
+      writeRepack(backend, source, destination, repack, image.bytes, input, output, admit);
   }
   if (admit) admit();
 }

@@ -7,8 +7,11 @@
 #include <set>
 #include <span>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
+#include <type_traits>
+#include <vector>
 
 namespace splash::model {
 
@@ -38,17 +41,15 @@ struct PreparedWeight {
 
 void readWeightBytes(int descriptor, uint64_t offset, std::span<uint8_t> bytes);
 void writeWeightBytes(int descriptor, uint64_t offset, std::span<const uint8_t> bytes);
-// Copies bytes [from, from + bytes) of source to destination at `to` through
-// staging; check runs before each piece.
-void copyWeightBytes(int source, uint64_t from, int destination, uint64_t to, uint64_t bytes,
-                     std::span<uint8_t> staging, const PreparationCheck &check = {});
 [[nodiscard]] std::string weightDigest(std::span<const uint8_t> bytes);
 [[nodiscard]] std::string weightDigest(std::string_view text);
 
 // A source file, opened once; checkUnchanged throws when it was modified or
-// replaced since. The digest of its tensor data is computed on first use,
-// after the caller has validated the metadata, and remembered for this file
-// identity, so a warm start does not read the file again.
+// replaced since. Its parser reads the metadata through descriptor() and
+// sets where the tensor data starts; tensor offsets are relative to it. The
+// digest of the tensor data is computed on first use, after the parser has
+// validated the metadata, and remembered for this file identity, so a warm
+// start does not read the file again.
 class WeightSource final {
 public:
   explicit WeightSource(const std::filesystem::path &path, PreparationCheck check = {});
@@ -57,14 +58,47 @@ public:
   WeightSource &operator=(const WeightSource &) = delete;
   [[nodiscard]] const std::filesystem::path &path() const noexcept;
   [[nodiscard]] int descriptor() const noexcept;
-  // SHA-256 of bytes [dataOffset, end), the file's tensor data: editing only
-  // its metadata keeps the identity of every tensor.
-  [[nodiscard]] const std::string &digest(uint64_t dataOffset) const;
+  // The file's size when it was opened.
+  [[nodiscard]] uint64_t bytes() const noexcept;
+  void setDataOffset(uint64_t offset);
+  [[nodiscard]] uint64_t dataOffset() const noexcept;
+  // Bytes [offset, offset + size) of the tensor data.
+  void readData(uint64_t offset, std::span<uint8_t> bytes) const;
+  // SHA-256 of the tensor data: editing only the metadata keeps the identity
+  // of every tensor.
+  [[nodiscard]] const std::string &digest() const;
   void checkUnchanged() const;
 private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };
+
+class WeightIdentity;
+
+// A tensor of a source file: dtype and shape as the file names them, and
+// where its bytes are in the file's tensor data.
+struct SourceTensor final {
+  const WeightSource *file = nullptr;
+  std::string dtype;
+  std::vector<uint64_t> shape;
+  uint64_t offset = 0;
+  uint64_t bytes = 0;
+  void read(uint64_t at, std::span<uint8_t> destination) const;
+  // Copies the tensor to destination at `to` through staging; check runs
+  // before each piece.
+  void copy(int destination, uint64_t to, std::span<uint8_t> staging, const PreparationCheck &check) const;
+  // Records the tensor as an input of a prepared file.
+  void identify(WeightIdentity &identity) const;
+};
+
+// A field of a plan record: an integer, which prints as its value (a
+// character type would print as a character), or a string without
+// whitespace (the separator).
+template <class T>
+concept IdentityField =
+    (std::is_integral_v<T> && !std::is_same_v<T, char> && !std::is_same_v<T, signed char> &&
+     !std::is_same_v<T, unsigned char> && !std::is_same_v<T, char8_t>) ||
+    std::is_convertible_v<const T &, std::string_view>;
 
 // What a prepared file's key is the SHA-256 of: the adapter's preparation
 // identity, its plan as one record per line, and every source tensor it
@@ -73,17 +107,26 @@ private:
 class WeightIdentity final {
 public:
   explicit WeightIdentity(std::string_view preparation) { text_ << preparation << '\n'; }
-  template <class... Fields> WeightIdentity &record(const Fields &...fields) {
-    ((text_ << fields << ' '), ...);
+  template <IdentityField... Fields> WeightIdentity &record(const Fields &...fields) {
+    (field(fields), ...);
     text_ << '\n';
     return *this;
   }
-  // Bytes [offset, offset + bytes) of source, whose tensor data starts at
-  // dataOffset.
-  WeightIdentity &input(const WeightSource &source, uint64_t dataOffset, uint64_t offset, uint64_t bytes,
-                        std::string_view type, std::span<const uint64_t> shape);
+  // Bytes [offset, offset + bytes) of source's tensor data.
+  WeightIdentity &input(const WeightSource &source, uint64_t offset, uint64_t bytes, std::string_view type,
+                        std::span<const uint64_t> shape);
   [[nodiscard]] PreparedWeight weight(uint64_t bytes, std::string component, std::string source) const;
 private:
+  template <class T> void field(const T &value) {
+    if constexpr (std::is_integral_v<T>) {
+      text_ << +value << ' ';
+    } else {
+      const std::string_view text(value);
+      if (text.empty() || text.find_first_of(" \t\n") != text.npos)
+        throw std::invalid_argument("prepared weight identity field is empty or has whitespace");
+      text_ << text << ' ';
+    }
+  }
   std::ostringstream text_;
   std::set<std::string> digests_;
 };

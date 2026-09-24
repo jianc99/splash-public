@@ -43,7 +43,6 @@ private:
   metal::MetalBackend *backend_;
   PreparationCheck admitConversion_;
   WeightSource source_;
-  uint64_t dataOffset_ = 0;
   std::vector<Planned> images_; // layers, head, embedding
   PreparedWeights cache_;
 };

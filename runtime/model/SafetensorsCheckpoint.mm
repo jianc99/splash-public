@@ -7,7 +7,7 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
-#include <sys/stat.h>
+#include <map>
 
 namespace splash::model {
 namespace {
@@ -38,94 +38,113 @@ uint32_t elementBytes(const std::string &type) {
   throw WeightStoreError("unsupported safetensors dtype: " + type);
 }
 
+
+using TensorIndex = std::map<std::string, SourceTensor, std::less<>>;
+
+// A shard's tensor record: its dtype, shape and bytes [begin, end) of the
+// file's dataBytes of tensor data.
+SourceTensor tensorRecord(NSDictionary *record, const WeightSource &file, uint64_t dataBytes) {
+  if (![record isKindOfClass:[NSDictionary class]] || ![record[@"dtype"] isKindOfClass:[NSString class]] ||
+      ![record[@"shape"] isKindOfClass:[NSArray class]] || ![record[@"data_offsets"] isKindOfClass:[NSArray class]] ||
+      [record[@"data_offsets"] count] != 2)
+    throw WeightStoreError("invalid safetensors record");
+  if ([record[@"shape"] count] > 8) throw WeightStoreError("source tensor metadata exceeds bounds");
+  SourceTensor tensor;
+  tensor.file = &file;
+  tensor.dtype = [record[@"dtype"] UTF8String];
+  tensor.bytes = elementBytes(tensor.dtype);
+  for (id dimension in record[@"shape"]) {
+    tensor.shape.push_back(number(dimension));
+    tensor.bytes = checkedWeightMultiply(tensor.bytes, tensor.shape.back(), "source tensor size");
+  }
+  const uint64_t begin = number(record[@"data_offsets"][0]);
+  const uint64_t end = number(record[@"data_offsets"][1]);
+  if (end < begin || end - begin != tensor.bytes || end > dataBytes)
+    throw WeightStoreError("safetensors data range is invalid");
+  tensor.offset = begin;
+  return tensor;
+}
+
+// Adds the tensors of a shard's header to tensors, whose count and the
+// checkpoint's metadataBytes are bounded, and sets where its data starts.
+void indexShard(WeightSource &file, TensorIndex &tensors, uint64_t &metadataBytes) {
+  if (file.bytes() < 8) throw WeightStoreError("truncated safetensors file");
+  uint64_t headerBytes = 0;
+  readWeightBytes(file.descriptor(), 0, {reinterpret_cast<uint8_t *>(&headerBytes), 8});
+  if (!headerBytes || headerBytes > 1024 * 1024 || headerBytes > file.bytes() - 8 ||
+      (metadataBytes += headerBytes) > 4 * 1024 * 1024)
+    throw WeightStoreError("safetensors header exceeds metadata or file bounds");
+  file.setDataOffset(8 + headerBytes);
+  NSMutableData *header = [NSMutableData dataWithLength:headerBytes];
+  readWeightBytes(file.descriptor(), 8, {static_cast<uint8_t *>(header.mutableBytes), static_cast<size_t>(headerBytes)});
+  NSDictionary *index = object(header);
+  std::vector<std::pair<uint64_t, uint64_t>> ranges;
+  for (id key in index) {
+    if (![key isKindOfClass:[NSString class]] || [key lengthOfBytesUsingEncoding:NSUTF8StringEncoding] > 1024)
+      throw WeightStoreError("invalid tensor name");
+    if ([key isEqualToString:@"__metadata__"]) continue;
+    if (tensors.size() == 16384) throw WeightStoreError("source tensor metadata exceeds bounds");
+    SourceTensor tensor = tensorRecord(index[key], file, file.bytes() - file.dataOffset());
+    if (tensor.bytes) ranges.emplace_back(tensor.offset, tensor.offset + tensor.bytes);
+    const std::string name = [key UTF8String];
+    if (!tensors.emplace(name, std::move(tensor)).second)
+      throw WeightStoreError("duplicate source tensor: " + name);
+  }
+  std::sort(ranges.begin(), ranges.end());
+  for (size_t i = 1; i < ranges.size(); ++i)
+    if (ranges[i].first < ranges[i - 1].second) throw WeightStoreError("overlapping source tensors");
+}
+
+// The .safetensors shards of directory, in name order.
+std::vector<std::filesystem::path> shardPaths(const std::filesystem::path &directory) {
+  std::vector<std::filesystem::path> paths;
+  for (const auto &entry : std::filesystem::directory_iterator(directory))
+    if (entry.path().extension() == ".safetensors") {
+      if (paths.size() == 1024) throw WeightStoreError("too many source shards");
+      paths.push_back(entry.path());
+    }
+  if (paths.empty()) throw WeightStoreError("source contains no safetensors weights");
+  std::sort(paths.begin(), paths.end());
+  return paths;
+}
+
 } // namespace
 
 struct SafetensorsCheckpoint::Impl {
   std::vector<std::unique_ptr<WeightSource>> files;
-  std::map<std::string, SourceTensor, std::less<>> tensors;
+  TensorIndex tensors;
   NSDictionary *quantization = nil;
   NSDictionary *textConfig = nil;
+
+  void readConfiguration(const std::filesystem::path &path) {
+    if (std::filesystem::file_size(path) > 1024 * 1024)
+      throw WeightStoreError("source configuration exceeds metadata bound");
+    NSData *configuration = [NSData dataWithContentsOfFile:[NSString stringWithUTF8String:path.c_str()]];
+    if (!configuration) throw WeightStoreError("cannot read " + path.string());
+    NSDictionary *config = object(configuration);
+    id quantizationConfig = config[@"quantization"] ?: config[@"quantization_config"];
+    if (quantizationConfig && ![quantizationConfig isKindOfClass:[NSDictionary class]])
+      throw WeightStoreError("invalid source quantization configuration");
+    quantization = quantizationConfig;
+    textConfig = config[@"text_config"] ?: config;
+    if (![textConfig isKindOfClass:[NSDictionary class]])
+      throw WeightStoreError("source has no text model configuration");
+  }
 };
 
 SafetensorsCheckpoint::SafetensorsCheckpoint(const std::filesystem::path &directory, const PreparationCheck &check)
     : impl_(std::make_unique<Impl>()) {
   @autoreleasepool {
     if (check) check();
-    const auto configPath = directory / "config.json";
-    if (std::filesystem::file_size(configPath) > 1024 * 1024)
-      throw WeightStoreError("source configuration exceeds metadata bound");
-    NSData *configuration = [NSData dataWithContentsOfFile:[NSString stringWithUTF8String:configPath.c_str()]];
-    if (!configuration) throw WeightStoreError("cannot read " + configPath.string());
-    NSDictionary *config = object(configuration);
-    id quantization = config[@"quantization"] ?: config[@"quantization_config"];
-    if (quantization && ![quantization isKindOfClass:[NSDictionary class]])
-      throw WeightStoreError("invalid source quantization configuration");
-    impl_->quantization = quantization;
-    impl_->textConfig = config[@"text_config"] ?: config;
-    if (![impl_->textConfig isKindOfClass:[NSDictionary class]])
-      throw WeightStoreError("source has no text model configuration");
-    std::vector<std::filesystem::path> paths;
-    for (const auto &entry : std::filesystem::directory_iterator(directory))
-      if (entry.path().extension() == ".safetensors") {
-        if (paths.size() == 1024) throw WeightStoreError("too many source shards");
-        paths.push_back(entry.path());
-      }
-    std::sort(paths.begin(), paths.end());
-    if (paths.empty()) throw WeightStoreError("source contains no safetensors weights");
+    impl_->readConfiguration(directory / "config.json");
     uint64_t metadataBytes = 0;
-    for (const auto &path : paths) {
+    for (const auto &path : shardPaths(directory)) {
       @autoreleasepool {
         if (check) check();
-        auto source = std::make_unique<WeightSource>(path, check);
-        struct stat status{};
-        if (fstat(source->descriptor(), &status) || status.st_size < 8)
-          throw WeightStoreError("truncated safetensors file");
-        uint64_t headerBytes = 0;
-        readWeightBytes(source->descriptor(), 0, {reinterpret_cast<uint8_t *>(&headerBytes), 8});
-        if (!headerBytes || headerBytes > 1024 * 1024 || headerBytes > uint64_t(status.st_size) - 8 ||
-            (metadataBytes += headerBytes) > 4 * 1024 * 1024)
-          throw WeightStoreError("safetensors header exceeds metadata or file bounds");
-        NSMutableData *header = [NSMutableData dataWithLength:headerBytes];
-        readWeightBytes(source->descriptor(), 8, {static_cast<uint8_t *>(header.mutableBytes), static_cast<size_t>(headerBytes)});
-        NSDictionary *index = object(header);
-        std::vector<std::pair<uint64_t, uint64_t>> ranges;
-        for (id key in index) {
-          if (![key isKindOfClass:[NSString class]] || [key lengthOfBytesUsingEncoding:NSUTF8StringEncoding] > 1024)
-            throw WeightStoreError("invalid tensor name");
-          if ([key isEqualToString:@"__metadata__"]) continue;
-          NSDictionary *record = index[key];
-          if (![record isKindOfClass:[NSDictionary class]] || ![record[@"dtype"] isKindOfClass:[NSString class]] ||
-              ![record[@"shape"] isKindOfClass:[NSArray class]] || ![record[@"data_offsets"] isKindOfClass:[NSArray class]] ||
-              [record[@"data_offsets"] count] != 2)
-            throw WeightStoreError("invalid safetensors record");
-          if ([record[@"shape"] count] > 8 || impl_->tensors.size() == 16384)
-            throw WeightStoreError("source tensor metadata exceeds bounds");
-          SourceTensor tensor;
-          tensor.file = source.get();
-          tensor.dtype = [record[@"dtype"] UTF8String];
-          uint64_t bytes = elementBytes(tensor.dtype);
-          for (id dimension in record[@"shape"]) {
-            const uint64_t size = number(dimension);
-            tensor.shape.push_back(size);
-            bytes = checkedWeightMultiply(bytes, size, "source tensor size");
-          }
-          const uint64_t begin = number(record[@"data_offsets"][0]);
-          const uint64_t end = number(record[@"data_offsets"][1]);
-          if (end < begin || end - begin != bytes || end > uint64_t(status.st_size) - 8 - headerBytes)
-            throw WeightStoreError("safetensors data range is invalid");
-          tensor.offset = 8 + headerBytes + begin;
-          tensor.bytes = bytes;
-          tensor.dataOffset = 8 + headerBytes;
-          const std::string name = [key UTF8String];
-          if (!impl_->tensors.emplace(name, std::move(tensor)).second)
-            throw WeightStoreError("duplicate source tensor: " + name);
-          if (bytes) ranges.emplace_back(begin, end);
-        }
-        std::sort(ranges.begin(), ranges.end());
-        for (size_t i = 1; i < ranges.size(); ++i)
-          if (ranges[i].first < ranges[i - 1].second) throw WeightStoreError("overlapping source tensors");
-        source->checkUnchanged();
-        impl_->files.push_back(std::move(source));
+        auto file = std::make_unique<WeightSource>(path, check);
+        indexShard(*file, impl_->tensors, metadataBytes);
+        file->checkUnchanged();
+        impl_->files.push_back(std::move(file));
       }
     }
   }
@@ -193,12 +212,5 @@ void SafetensorsCheckpoint::requireLayerTypes(uint32_t layers, uint32_t fullAtte
   }
 }
 void SafetensorsCheckpoint::checkUnchanged() const { for (const auto &source : impl_->files) source->checkUnchanged(); }
-void SourceTensor::read(uint64_t at, std::span<uint8_t> destination) const {
-  if (at > bytes || destination.size() > bytes - at) throw WeightStoreError("source tensor read is out of bounds");
-  readWeightBytes(file->descriptor(), offset + at, destination);
-}
-void SourceTensor::identify(WeightIdentity &identity) const {
-  identity.input(*file, dataOffset, offset, bytes, dtype, shape);
-}
 
 } // namespace splash::model
