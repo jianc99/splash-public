@@ -1,48 +1,28 @@
 #include "TestFiles.hpp"
+#include "TestGguf.hpp"
 #include "model/GgufFile.hpp"
 
-#include <fstream>
 #include <iostream>
 #include <limits>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace {
-using Bytes = std::vector<char>;
+namespace gguf = splash::test::gguf;
+using splash::model::ggml::kF32;
+using splash::model::ggml::kQ4_K;
 
-template <class T> void append(Bytes &out, T value) {
-  const auto *p = reinterpret_cast<const char *>(&value);
-  out.insert(out.end(), p, p + sizeof value);
+constexpr uint64_t kQ4KBlockBytes = 144;
+
+// A file of one tensor, "weight", with one Q4_K block of data.
+gguf::Bytes model(const std::vector<uint64_t> &dims, uint64_t displacement = 0, uint32_t type = kQ4_K) {
+  return gguf::file({}, {{"weight", dims, type, gguf::Bytes(kQ4KBlockBytes), displacement}});
 }
 
-void string(Bytes &out, const std::string &value) {
-  append<uint64_t>(out, value.size());
-  out.insert(out.end(), value.begin(), value.end());
-}
-
-Bytes header(uint64_t tensors, uint64_t keys = 0) {
-  Bytes out{'G', 'G', 'U', 'F'};
-  append<uint32_t>(out, 3);
-  append(out, tensors);
-  append(out, keys);
-  return out;
-}
-
-void tensor(Bytes &out, const std::vector<uint64_t> &dims, uint64_t offset = 0,
-            uint32_t type = splash::model::ggml::kQ4_K) {
-  string(out, "weight");
-  append<uint32_t>(out, dims.size());
-  for (auto dim : dims) append(out, dim);
-  append(out, type);
-  append(out, offset);
-}
-
-Bytes model(const std::vector<uint64_t> &dims, uint64_t offset = 0,
-            uint32_t type = splash::model::ggml::kQ4_K) {
-  auto out = header(1);
-  tensor(out, dims, offset, type);
-  out.resize((out.size() + 31) / 32 * 32 + 144);
-  return out;
-}
+// A file whose only key, "unused", is an array: its element type and count,
+// then the encoded elements.
+gguf::Bytes array(const gguf::Bytes &value) { return gguf::file({{"unused", gguf::kArray, value}}, {}); }
 
 void require(bool ok, const std::string &message) {
   if (!ok) throw std::runtime_error(message);
@@ -53,12 +33,8 @@ int main() {
   try {
     const splash::test::TemporaryDirectory directory("splash-gguf-file");
     const auto path = directory.path() / "test.gguf";
-    const auto write = [&](const Bytes &data) {
-      std::ofstream file(path, std::ios::binary);
-      file.write(data.data(), data.size());
-    };
-    const auto rejects = [&](const char *name, const Bytes &data) {
-      write(data);
+    const auto rejects = [&](const char *name, const gguf::Bytes &data) {
+      splash::test::writeFile(path, data);
       try {
         splash::model::WeightSource source(path);
         splash::model::GgufFile file(source);
@@ -66,18 +42,22 @@ int main() {
       catch (const splash::model::GgufError &) { return; }
       throw std::runtime_error(std::string("accepted invalid GGUF: ") + name);
     };
-    write(model({256, 1}));
+    splash::test::writeFile(path, gguf::file({gguf::stringKey("general.architecture", "fixture"),
+                                              gguf::uint32Key("fixture.block_count", 2)},
+                                             {{"weight", {256, 1}, kQ4_K, gguf::Bytes(kQ4KBlockBytes)}}));
     splash::model::WeightSource source(path);
     splash::model::GgufFile valid(source);
+    require(valid.architecture() == "fixture" && valid.unsignedValue("fixture.block_count") == 2,
+            "metadata values changed");
     const auto &weight = valid.require("weight");
-    require(weight.bytes == 144 && weight.elements() == 256 && weight.rows() == 1,
+    require(weight.bytes == kQ4KBlockBytes && weight.elements() == 256 && weight.rows() == 1,
             "valid Q4_K shape/size changed");
     require(source.dataOffset() + weight.offset + weight.bytes == source.bytes(),
             "valid data must end exactly at EOF");
 
     rejects("shape overflow", model({256, uint64_t{1} << 60}));
     rejects("row product overflow", model({256, uint64_t{1} << 63, 2}));
-    rejects("byte size overflow", model({uint64_t{1} << 62}, 0, splash::model::ggml::kF32));
+    rejects("byte size overflow", model({uint64_t{1} << 62}, 0, kF32));
     rejects("offset addition overflow", model({256, 1}, std::numeric_limits<uint64_t>::max() - 31));
     rejects("offset past EOF", model({256, 1}, 160));
     rejects("zero dimension", model({256, 0}));
@@ -86,27 +66,20 @@ int main() {
     auto truncated = model({256, 1});
     truncated.pop_back();
     rejects("truncated tensor", truncated);
-    auto duplicate = header(2);
-    tensor(duplicate, {256, 1});
-    tensor(duplicate, {256, 1});
-    duplicate.resize((duplicate.size() + 31) / 32 * 32 + 144);
-    rejects("duplicate name", duplicate);
+    const gguf::Tensor block{"weight", {256, 1}, kQ4_K, gguf::Bytes(kQ4KBlockBytes)};
+    rejects("duplicate name", gguf::file({}, {block, block}));
     for (auto count : {uint64_t{1} << 62, uint64_t{100}}) {
-      auto metadata = header(0, 1);
-      string(metadata, "unused");
-      append<uint32_t>(metadata, 9); // array
-      append<uint32_t>(metadata, 10); // uint64
-      append(metadata, count);
-      rejects("overflowing/truncated skipped array", metadata);
+      gguf::Bytes elements;
+      gguf::append(elements, gguf::kUint64);
+      gguf::append(elements, count);
+      rejects("overflowing/truncated skipped array", array(elements));
     }
-    auto nested = header(0, 1);
-    string(nested, "unused");
-    append<uint32_t>(nested, 9);
+    gguf::Bytes nested;
     for (int i = 0; i < 18; ++i) {
-      append<uint32_t>(nested, 9);
-      append<uint64_t>(nested, 1);
+      gguf::append(nested, gguf::kArray);
+      gguf::append<uint64_t>(nested, 1);
     }
-    rejects("excessive nesting", nested);
+    rejects("excessive nesting", array(nested));
     std::cout << "GGUF parser bounds tests passed\n";
     return 0;
   } catch (const std::exception &error) {
