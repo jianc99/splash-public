@@ -1,4 +1,3 @@
-#include "ops/Vision.hpp"
 #include "engine/MemoryPlan.hpp"
 #include "engine/FdTransport.hpp"
 #include "engine/Bootstrap.hpp"
@@ -36,10 +35,6 @@
 namespace splash {
 namespace {
 
-// One image may cover at most this many 16x16 patches (4,194,304 pixels).
-// The wire limit, the engine's request validation, and the model's vision
-// scratch are all sized from this one value.
-constexpr uint32_t kMaximumImagePatches = ops::kMaximumImagePatches;
 // Temporary host/driver allocation failures can recover during startup.
 // Preserve the desktop reserve and bound retries; configuration and compute
 // failures remain immediate and fail-closed.
@@ -241,9 +236,7 @@ bootstrapConfig(const NativeArguments &arguments) {
   config.resources.buildId = SPLASH_BUILD_ID;
   config.resources.maximumMemoryBytes = arguments.maxMemoryBytes;
   config.resources.kvFormat = arguments.kvFormat;
-  config.resources.maximumImagePatches = kMaximumImagePatches;
   config.nativeLoop.engine.maxContext = arguments.maxContext;
-  config.protocolLimits.maxImagePatches = kMaximumImagePatches;
   config.nativeLoop.engineInstanceId = engineInstanceId();
   config.nativeLoop.maskWordsPerToken = maskWordsPerToken;
   config.protocolLimits.maxTokenBatch =
