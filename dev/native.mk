@@ -32,36 +32,6 @@ BACKEND_CONTROL_SOURCES := \
 	runtime/engine/StateCache.cpp \
 	runtime/engine/Cache.cpp \
 	runtime/engine/Engine.cpp
-MODEL_SOURCES := $(WEIGHT_PREPARATION_HEADER) \
-	runtime/model/AffineTarget.cpp \
-	runtime/model/AffinePreparation.cpp \
-	runtime/model/SafetensorsCheckpoint.mm \
-	runtime/model/PreparedWeights.cpp \
-	runtime/model/GgufPreparation.cpp \
-	runtime/model/WeightStore.cpp \
-	runtime/model/GgufFile.cpp \
-	runtime/model/GgufImage.cpp \
-	runtime/model/GgufTarget.cpp \
-	runtime/model/Qwen3_6Moe.cpp \
-	runtime/model/Qwen3_8.cpp \
-	runtime/model/QwenVision.cpp \
-	runtime/model/VisionPreparation.cpp \
-	runtime/model/VisionLoader.cpp \
-	runtime/model/QwenTarget.cpp \
-	runtime/model/DFlashDraft.cpp \
-	runtime/model/ModelFactory.cpp \
-	runtime/model/ModelDescriptor.mm
-MODEL_OPERATOR_SOURCES := \
-	runtime/ops/DraftAttention.cpp \
-	runtime/ops/Embedding.cpp \
-	runtime/ops/ExecutionPlans.cpp \
-	runtime/ops/GDN.cpp \
-	runtime/ops/Linear.cpp \
-	runtime/ops/LinearGguf.cpp \
-	runtime/ops/MoE.cpp \
-	runtime/ops/Normalization.cpp \
-	runtime/ops/PagedAttention.cpp \
-	runtime/ops/Sampling.cpp
 TEST_BACKEND_ASAN := $(ENGINE_SANITIZER_BUILD)/kv-first-engine-asan-ubsan
 TEST_BACKEND_TSAN := $(ENGINE_SANITIZER_BUILD)/kv-first-engine-tsan
 TEST_FD_TRANSPORT_ASAN := $(ENGINE_SANITIZER_BUILD)/native-fd-asan-ubsan
@@ -341,12 +311,9 @@ $(TEST_RESOURCES_TEST): dev/tests/engine/runtime_resources_test.mm \
 $(TEST_METRICS_TEST): dev/tests/engine/runtime_metrics_test.cpp | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) -o $@
 
-$(TEST_MODEL_PACKAGE_TEST): runtime/metal/DeviceCapabilities.cpp \
-		runtime/metal/MetalBackend.mm \
-		$(MODEL_SOURCES) \
-		$(MODEL_OPERATOR_SOURCES) \
-		dev/tests/engine/model_package_test.cpp | $(ENGINE_TEST_BUILD)
-	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $(TEST_INPUTS) \
+$(TEST_MODEL_PACKAGE_TEST): dev/tests/engine/model_package_test.cpp \
+		$(ENGINE_LIBRARY) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $< $(ENGINE_LIBRARY) \
 		$(ENGINE_LINKFLAGS) -o $@
 
 $(TEST_MEMORY_AUDIT_TEST): runtime/metal/DeviceCapabilities.cpp \
@@ -354,16 +321,9 @@ $(TEST_MEMORY_AUDIT_TEST): runtime/metal/DeviceCapabilities.cpp \
 		dev/tests/engine/memory_audit_test.cpp | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) -o $@
 
-$(TEST_QWEN_STATE_TEST): runtime/metal/DeviceCapabilities.cpp \
-		runtime/metal/MetalBackend.mm \
-		runtime/engine/MemoryGovernor.cpp \
-		runtime/ops/PageStorage.mm \
-		runtime/model/WeightStore.cpp \
-		runtime/model/DFlashDraft.cpp \
-		$(MODEL_OPERATOR_SOURCES) \
-		runtime/model/QwenState.cpp \
-		dev/tests/engine/qwen_state_storage_test.mm | $(ENGINE_TEST_BUILD)
-	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $(TEST_INPUTS) \
+$(TEST_QWEN_STATE_TEST): dev/tests/engine/qwen_state_storage_test.mm \
+		$(ENGINE_LIBRARY) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< $(ENGINE_LIBRARY) \
 		$(ENGINE_LINKFLAGS) -o $@
 
 $(TEST_STATUS_TEST): runtime/metal/DeviceCapabilities.cpp \
@@ -403,37 +363,29 @@ $(TEST_Q8_PREFILL_TEST): dev/tests/engine/q8_chunked_prefill_metal_test.mm \
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< $(ENGINE_LIBRARY) \
 		$(ENGINE_LINKFLAGS) -o $@
 
-$(TEST_Q4_BATCH_TEST): runtime/metal/DeviceCapabilities.cpp \
-		runtime/metal/MetalBackend.mm \
-		dev/tests/engine/q4_batched_projection_metal_test.mm $(LIB) | $(ENGINE_TEST_BUILD)
-	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $(TEST_INPUTS) \
+$(TEST_Q4_BATCH_TEST): dev/tests/engine/q4_batched_projection_metal_test.mm \
+		$(ENGINE_LIBRARY) $(LIB) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< $(ENGINE_LIBRARY) \
 		$(ENGINE_LINKFLAGS) -o $@
 
-$(TEST_Q4_PREFILL_TEST): runtime/metal/DeviceCapabilities.cpp \
-		runtime/metal/MetalBackend.mm \
-		dev/tests/engine/q4_prefill_projection_metal_test.mm $(LIB) | $(ENGINE_TEST_BUILD)
-	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $(TEST_INPUTS) \
+$(TEST_Q4_PREFILL_TEST): dev/tests/engine/q4_prefill_projection_metal_test.mm \
+		$(ENGINE_LIBRARY) $(LIB) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< $(ENGINE_LIBRARY) \
 		$(ENGINE_LINKFLAGS) -o $@
 
-$(TEST_MOE_METAL_TEST): runtime/metal/DeviceCapabilities.cpp \
-		runtime/metal/MetalBackend.mm runtime/model/WeightStore.cpp \
-		runtime/ops/Linear.cpp runtime/ops/LinearGguf.cpp runtime/ops/MoE.cpp \
-		dev/tests/engine/moe_metal_test.mm $(LIB) | $(ENGINE_TEST_BUILD)
-	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $(TEST_INPUTS) \
+$(TEST_MOE_METAL_TEST): dev/tests/engine/moe_metal_test.mm \
+		$(ENGINE_LIBRARY) $(LIB) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< $(ENGINE_LIBRARY) \
 		$(ENGINE_LINKFLAGS) -o $@
 
-$(TEST_GGUF_MOE): runtime/metal/DeviceCapabilities.cpp \
-		runtime/metal/MetalBackend.mm runtime/ops/Linear.cpp runtime/ops/LinearGguf.cpp \
-		runtime/ops/MoE.cpp runtime/ops/ExecutionPlans.cpp runtime/ops/PagedAttention.cpp \
-		runtime/ops/DraftAttention.cpp runtime/ops/Normalization.cpp dev/tests/engine/gguf_moe_test.mm \
-		dev/tests/engine/GgufFormatReference.hpp $(LIB) | $(ENGINE_TEST_BUILD)
-	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $(TEST_INPUTS) \
+$(TEST_GGUF_MOE): dev/tests/engine/gguf_moe_test.mm \
+		$(ENGINE_LIBRARY) $(LIB) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< $(ENGINE_LIBRARY) \
 		$(ENGINE_LINKFLAGS) -o $@
 
-$(TEST_GDN_METAL_TEST): runtime/metal/DeviceCapabilities.cpp \
-		runtime/metal/MetalBackend.mm runtime/ops/GDN.cpp runtime/ops/Normalization.cpp \
-		dev/tests/engine/gdn_metal_test.mm $(LIB) | $(ENGINE_TEST_BUILD)
-	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $(TEST_INPUTS) \
+$(TEST_GDN_METAL_TEST): dev/tests/engine/gdn_metal_test.mm \
+		$(ENGINE_LIBRARY) $(LIB) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< $(ENGINE_LIBRARY) \
 		$(ENGINE_LINKFLAGS) -o $@
 
 $(TEST_OPERATOR_WORKSPACE): dev/tests/engine/operator_workspace_test.cc \
@@ -497,40 +449,34 @@ $(TUNE_KERNELS): dev/tuning/tune_kernels.mm $(TUNING_SOURCES) \
 tune-kernels: preflight $(TARGET) $(TUNE_KERNELS) $(LIB)
 	$(TUNE_KERNELS) $(LIB) $(MODEL_ROOT) $(TUNE_ARGS)
 
-$(TEST_ATTENTION_PLAN): runtime/metal/DeviceCapabilities.cpp \
-		runtime/metal/MetalBackend.mm runtime/ops/PagedAttention.cpp runtime/ops/Normalization.cpp \
-		dev/tests/engine/paged_attention_plan_test.mm $(LIB) | $(ENGINE_TEST_BUILD)
-	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $(TEST_INPUTS) \
+$(TEST_ATTENTION_PLAN): dev/tests/engine/paged_attention_plan_test.mm \
+		$(ENGINE_LIBRARY) $(LIB) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< $(ENGINE_LIBRARY) \
 		$(ENGINE_LINKFLAGS) -o $@
 
-$(TEST_LINEAR_PLAN): runtime/metal/DeviceCapabilities.cpp \
-		runtime/metal/MetalBackend.mm runtime/ops/Linear.cpp runtime/ops/LinearGguf.cpp \
-		dev/tests/engine/linear_plan_test.mm $(LIB) | $(ENGINE_TEST_BUILD)
-	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $(TEST_INPUTS) \
+$(TEST_LINEAR_PLAN): dev/tests/engine/linear_plan_test.mm \
+		$(ENGINE_LIBRARY) $(LIB) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< $(ENGINE_LIBRARY) \
 		$(ENGINE_LINKFLAGS) -o $@
 
-$(TEST_DFLASH_BATCH_CONTROL_TEST): runtime/metal/DeviceCapabilities.cpp \
-		runtime/metal/MetalBackend.mm \
-		dev/tests/engine/dflash_batch_control_metal_test.mm $(LIB) | $(ENGINE_TEST_BUILD)
-	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $(TEST_INPUTS) \
+$(TEST_DFLASH_BATCH_CONTROL_TEST): dev/tests/engine/dflash_batch_control_metal_test.mm \
+		$(ENGINE_LIBRARY) $(LIB) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< $(ENGINE_LIBRARY) \
 		$(ENGINE_LINKFLAGS) -o $@
 
-$(TEST_DRAFT_ATTENTION_TEST): runtime/metal/DeviceCapabilities.cpp \
-		runtime/metal/MetalBackend.mm runtime/ops/DraftAttention.cpp \
-		dev/tests/engine/draft_attention_metal_test.mm $(LIB) | $(ENGINE_TEST_BUILD)
-	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $(TEST_INPUTS) \
+$(TEST_DRAFT_ATTENTION_TEST): dev/tests/engine/draft_attention_metal_test.mm \
+		$(ENGINE_LIBRARY) $(LIB) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< $(ENGINE_LIBRARY) \
 		$(ENGINE_LINKFLAGS) -o $@
 
-$(TEST_GDN_DECODE_TEST): runtime/metal/DeviceCapabilities.cpp \
-		runtime/metal/MetalBackend.mm runtime/ops/GDN.cpp runtime/ops/Normalization.cpp \
-		dev/tests/engine/gdn_decode_metal_test.mm $(LIB) | $(ENGINE_TEST_BUILD)
-	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $(TEST_INPUTS) \
+$(TEST_GDN_DECODE_TEST): dev/tests/engine/gdn_decode_metal_test.mm \
+		$(ENGINE_LIBRARY) $(LIB) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< $(ENGINE_LIBRARY) \
 		$(ENGINE_LINKFLAGS) -o $@
 
-$(TEST_DRAFT_SELECTOR_TEST): runtime/metal/DeviceCapabilities.cpp \
-		runtime/metal/MetalBackend.mm runtime/ops/Sampling.cpp \
-		dev/tests/engine/draft_selector_metal_test.mm $(LIB) | $(ENGINE_TEST_BUILD)
-	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $(TEST_INPUTS) \
+$(TEST_DRAFT_SELECTOR_TEST): dev/tests/engine/draft_selector_metal_test.mm \
+		$(ENGINE_LIBRARY) $(LIB) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< $(ENGINE_LIBRARY) \
 		$(ENGINE_LINKFLAGS) -o $@
 
 $(TEST_Q4_PREFILL_PROFILE): dev/benchmarks/q4_prefill_profile.mm \
@@ -548,12 +494,9 @@ $(TEST_Q8_METAL_TEST): dev/tests/engine/q8_paged_kv_metal_test.mm \
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< \
 		$(ENGINE_LINKFLAGS) -o $@
 
-$(TEST_Q8_STORAGE_TEST): runtime/metal/DeviceCapabilities.cpp \
-		runtime/metal/MetalBackend.mm \
-		runtime/engine/MemoryGovernor.cpp \
-		runtime/ops/PageStorage.mm \
-		dev/tests/engine/q8_page_storage_test.mm | $(ENGINE_TEST_BUILD)
-	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $(TEST_INPUTS) \
+$(TEST_Q8_STORAGE_TEST): dev/tests/engine/q8_page_storage_test.mm \
+		$(ENGINE_LIBRARY) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< $(ENGINE_LIBRARY) \
 		$(ENGINE_LINKFLAGS) -o $@
 
 $(TEST_METAL_BACKEND_AIR): dev/tests/engine/metal_backend_test.metal \
@@ -569,19 +512,14 @@ $(TEST_METAL_BACKEND_LIB): $(TEST_METAL_BACKEND_AIR)
 $(TEST_PRODUCTION_LIB): $(PRODUCTION_AIRS) $(TEST_METAL_BACKEND_AIR) $(LIB)
 	$(RUN_CONFIGURED) $(METALLIB) $(filter %.air,$^) -o $@
 
-$(TEST_METAL_BACKEND_TEST): runtime/metal/DeviceCapabilities.cpp \
-		runtime/metal/MetalBackend.mm \
-		dev/tests/engine/metal_backend_test.mm | $(ENGINE_TEST_BUILD)
-	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $(TEST_INPUTS) \
+$(TEST_METAL_BACKEND_TEST): dev/tests/engine/metal_backend_test.mm \
+		$(ENGINE_LIBRARY) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< $(ENGINE_LIBRARY) \
 		$(ENGINE_LINKFLAGS) -o $@
 
-$(TEST_VISION_ENCODER_TEST): runtime/metal/DeviceCapabilities.cpp \
-		runtime/metal/MetalBackend.mm \
-		$(MODEL_SOURCES) \
-		$(MODEL_OPERATOR_SOURCES) \
-		runtime/ops/Vision.mm \
-		dev/tests/engine/vision_encoder_test.mm | $(ENGINE_TEST_BUILD)
-	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $(TEST_INPUTS) \
+$(TEST_VISION_ENCODER_TEST): dev/tests/engine/vision_encoder_test.mm \
+		$(ENGINE_LIBRARY) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< $(ENGINE_LIBRARY) \
 		$(ENGINE_LINKFLAGS) -o $@
 
 $(TEST_MODEL_RUNTIME_ORACLE): dev/tests/engine/model_runtime_oracle_test.mm \
