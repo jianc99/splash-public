@@ -104,51 +104,76 @@ Options parse(int argc, char **argv) {
   return options;
 }
 
+// The choice lines are pasted as code, so an enumerator prints as the token of
+// its own case label: a rename changes both, and -Wswitch catches a new one.
+#define ENUMERATOR_NAME(enumerator) \
+  case enumerator:                  \
+    return #enumerator
+[[noreturn]] void unnamed() { throw std::logic_error("value outside its enumeration"); }
+
 std::string_view name(LinearTile tile) {
   switch (tile) {
-  case LinearTile::N128: return "LinearTile::N128";
-  case LinearTile::N256: return "LinearTile::N256";
-  case LinearTile::Paired128: return "LinearTile::Paired128";
-  case LinearTile::Simdgroup: return "Simdgroup";
-  case LinearTile::Split32: return "LinearTile::Split32";
-  case LinearTile::Split64: return "LinearTile::Split64";
-  case LinearTile::Paired256: return "LinearTile::Paired256";
-  case LinearTile::GgufStaged: return "LinearTile::GgufStaged";
-  case LinearTile::GgufSimdgroup: return "LinearTile::GgufSimdgroup";
+    ENUMERATOR_NAME(LinearTile::N128);
+    ENUMERATOR_NAME(LinearTile::N256);
+    ENUMERATOR_NAME(LinearTile::Paired128);
+    ENUMERATOR_NAME(LinearTile::Split32);
+    ENUMERATOR_NAME(LinearTile::Split64);
+    ENUMERATOR_NAME(LinearTile::Paired256);
+    ENUMERATOR_NAME(LinearTile::Simdgroup);
+    ENUMERATOR_NAME(LinearTile::GgufStaged);
+    ENUMERATOR_NAME(LinearTile::GgufSimdgroup);
   }
-  return "LinearTile::N128";
+  unnamed();
 }
 std::string_view name(LinearPhase phase) {
-  return phase == LinearPhase::Prefill ? "LinearPhase::Prefill" : "LinearPhase::Decode";
+  switch (phase) {
+    ENUMERATOR_NAME(LinearPhase::Prefill);
+    ENUMERATOR_NAME(LinearPhase::Decode);
+  }
+  unnamed();
 }
 std::string_view name(LinearEpilogue epilogue) {
   switch (epilogue) {
-  case LinearEpilogue::None: return "LinearEpilogue::None";
-  case LinearEpilogue::Residual: return "LinearEpilogue::Residual";
-  case LinearEpilogue::GateUp: return "LinearEpilogue::GateUp";
-  case LinearEpilogue::UpWithGate: return "LinearEpilogue::UpWithGate";
+    ENUMERATOR_NAME(LinearEpilogue::None);
+    ENUMERATOR_NAME(LinearEpilogue::Residual);
+    ENUMERATOR_NAME(LinearEpilogue::GateUp);
+    ENUMERATOR_NAME(LinearEpilogue::UpWithGate);
   }
-  return "LinearEpilogue::None";
+  unnamed();
 }
 std::string_view name(LinearSimdgroups groups) {
-  return groups == LinearSimdgroups::Two    ? "LinearSimdgroups::Two"
-         : groups == LinearSimdgroups::Four ? "LinearSimdgroups::Four"
-                                            : "LinearSimdgroups::Eight";
+  switch (groups) {
+    ENUMERATOR_NAME(LinearSimdgroups::Two);
+    ENUMERATOR_NAME(LinearSimdgroups::Four);
+    ENUMERATOR_NAME(LinearSimdgroups::Eight);
+  }
+  unnamed();
 }
 std::string_view name(AttentionScalePlacement placement) {
-  return placement == AttentionScalePlacement::Softmax ? "AttentionScalePlacement::Softmax"
-                                                       : "AttentionScalePlacement::Cooperative";
+  switch (placement) {
+    ENUMERATOR_NAME(AttentionScalePlacement::Softmax);
+    ENUMERATOR_NAME(AttentionScalePlacement::Cooperative);
+  }
+  unnamed();
 }
 std::string_view name(PrefillSplitMultiplier value) {
-  return value == PrefillSplitMultiplier::One ? "PrefillSplitMultiplier::One"
-                                              : "PrefillSplitMultiplier::Two";
+  switch (value) {
+    ENUMERATOR_NAME(PrefillSplitMultiplier::One);
+    ENUMERATOR_NAME(PrefillSplitMultiplier::Two);
+  }
+  unnamed();
 }
 std::string name(VerifySplitCount value) {
   return "VerifySplitCount(" + std::to_string(static_cast<uint32_t>(value)) + ")";
 }
 std::string_view name(MoePhase phase) {
-  return phase == MoePhase::Prefill ? "MoePhase::Prefill" : "MoePhase::Decode";
+  switch (phase) {
+    ENUMERATOR_NAME(MoePhase::Prefill);
+    ENUMERATOR_NAME(MoePhase::Decode);
+  }
+  unnamed();
 }
+#undef ENUMERATOR_NAME
 std::string name(MoeExpertTile tile) {
   return "MoeExpertTile::M" + std::to_string(static_cast<uint32_t>(tile));
 }
