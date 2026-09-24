@@ -19,7 +19,7 @@ below with `make all build/engine-tests/<tool>`.
 | 27B `mmproj-BF16.gguf` | `83ee4f4f205fa514161778c41df1ea14144faa0f713510893b63c2395f5c2d53` |
 | 35B `mmproj-BF16.gguf` | `356dfaa3111376a4f7165e32e8749713378d1700b37cf52e0c50d9f23322334d` |
 
-Drafts come from the shared draft repository (`upstream.DRAFTS`): `Qwen3.8-27B/`
+Drafts come from the shared draft repository (`families.DRAFTS`): `Qwen3.8-27B/`
 at `f0ce2ff5` and `Qwen3.6-35B-A3B/` at `b36f132a`, byte-identical to the drafts
 of the released Qwen3.8-27B and Qwen3.6-35B-A3B packages.
 

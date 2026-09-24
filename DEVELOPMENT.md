@@ -117,7 +117,7 @@ not a file model publishers supply.
 
 A target is identified by its own metadata: an MLX config's `text_config`, or
 the one `gguf.model_config` derives from the selected GGUF's header, read with a
-few HTTP range requests before any weight download. The registry (`FAMILIES`)
+few HTTP range requests before any weight download. The registry (`families.FAMILIES`)
 states each supported architecture's signature and the draft trained for it;
 repository names and model-card `base_model` fields play no part. An MLX
 target must declare affine 4-bit, group-64 `quantization` in `config.json`.
@@ -179,7 +179,7 @@ which this does not move ([Weight preparation](#weight-preparation)).
 
 ### Draft assets
 
-Splash's DFlash2 drafts share one Hub repository, `upstream.DRAFTS`, with a
+Splash's DFlash2 drafts share one Hub repository, `families.DRAFTS`, with a
 folder per base model named after it: `Qwen3.8-27B/` and `Qwen3.6-35B-A3B/`.
 Each folder holds `config.json`, `model.bin` and `layer-N.bin`. The
 configuration is the original DFlash2 configuration with
@@ -187,7 +187,7 @@ configuration is the original DFlash2 configuration with
 weights came from; native loading validates it against the target. The weights
 are the verified Q4 drafts of the Splash packages, not a quantization made at
 startup. Each family pins the commit that published its folder
-(`Draft.revision` in `FAMILIES`), and installation downloads only that folder.
+(`Draft.revision` in `families.FAMILIES`), and installation downloads only that folder.
 
 To prepare a folder from a verified existing package:
 
