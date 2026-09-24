@@ -27,7 +27,7 @@ int main(int argc, char **argv) {
         (size != "tiny" && size != "27b" && size != "35b") ||
         (mode != "cold" && mode != "warm"))
       throw std::runtime_error("invalid vision-preparation arguments");
-    const auto source = format == "mlx" ? model::VisionSource::Safetensors
+    const auto source = format == "mlx" ? model::VisionSource::Mlx
                                         : model::VisionSource::Gguf;
     ops::VisionLayout layout;
     if (size == "35b")

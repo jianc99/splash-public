@@ -174,7 +174,7 @@ VisionLoader::VisionLoader(const std::filesystem::path &directory, VisionSource 
       layout.paddedIntermediateSize < layout.intermediateSize)
     throw WeightStoreError("Qwen vision layout is inconsistent");
   i.plan = plan(layout);
-  if (source == VisionSource::Safetensors) {
+  if (source == VisionSource::Mlx) {
     i.checkpoint = std::make_unique<SafetensorsCheckpoint>(directory, check);
     bindCheckpoint(*i.checkpoint, layout, i.plan);
   } else if (source == VisionSource::Gguf) {

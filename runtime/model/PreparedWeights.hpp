@@ -23,8 +23,6 @@ inline constexpr uint64_t kWeightPreparationWorkspaceBytes = 64 * 1024 * 1024;
 // adapter sizes its chunks to it, whatever the tensor, layer or expert count.
 inline constexpr uint64_t kWeightPreparationStagingBytes = kWeightPreparationWorkspaceBytes / 2;
 
-enum class TargetSource : uint8_t { Packed, Affine, Gguf };
-
 using PreparationCheck = std::function<void()>;
 
 // A prepared file: its cache key and size, the component it is (such as

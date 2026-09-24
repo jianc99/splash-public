@@ -50,7 +50,7 @@ ModelPackage loadPackage(metal::MetalBackend &backend,
   // planned before the first is written, so one disk check budgets them all.
   std::vector<PreparedWeight> prepared;
   std::optional<VisionLoader> vision;
-  if (result.descriptor.visionSource == VisionSource::Safetensors ||
+  if (result.descriptor.visionSource == VisionSource::Mlx ||
       result.descriptor.visionSource == VisionSource::Gguf) {
     vision.emplace(root / "vision", result.descriptor.visionSource,
                    result.descriptor.vision, check, admitConversion);
@@ -69,7 +69,7 @@ ModelPackage loadPackage(metal::MetalBackend &backend,
         switch (result.descriptor.targetSource) {
         case TargetSource::Packed:
           return read(PackedTargetFiles<Layout>{backend, directory, layout}, {});
-        case TargetSource::Affine: {
+        case TargetSource::Mlx: {
           AffineTargetLoader loader(backend, directory, layout, admitConversion);
           return read(loader, loader.weights());
         }
@@ -121,10 +121,10 @@ uint64_t preparedModelWeightBytes(const std::filesystem::path &root, const Model
     bytes = std::visit([&](const auto &layout) {
       return gguf::ImagePlanner(file, ggufTargetGeometry(layout)).totalBytes();
     }, descriptor.target);
-  } else if (descriptor.targetSource == TargetSource::Affine) {
+  } else if (descriptor.targetSource == TargetSource::Mlx) {
     bytes = std::visit([](const auto &layout) { return preparedAffineBytes(layout); }, descriptor.target);
   }
-  if (descriptor.visionSource == VisionSource::Safetensors || descriptor.visionSource == VisionSource::Gguf)
+  if (descriptor.visionSource == VisionSource::Mlx || descriptor.visionSource == VisionSource::Gguf)
     bytes += preparedVisionBytes(descriptor.vision);
   for (std::string_view directory : {"target", "draft", "vision"}) {
     if (directory == "vision" && descriptor.visionSource != VisionSource::Packed) continue;

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "model/ModelDescriptor.hpp"
 #include "model/PreparedFiles.hpp"
 #include "ops/Vision.hpp"
 
@@ -7,8 +8,6 @@
 #include <memory>
 
 namespace splash::model {
-
-enum class VisionSource : uint8_t { Packed, Safetensors, Gguf, None };
 
 // Source adapter for the vision tower: the vision_tower.* tensors of an MLX
 // checkpoint or a GGUF mmproj, both prepared into the packed vision/model.bin

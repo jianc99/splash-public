@@ -342,7 +342,7 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
         {"head_dim", layout.attentionHeadDimension}});
   }, result.target);
   const auto target = requireString(record, @"target_format", "target format");
-  if (target == "mlx-affine") result.targetSource = TargetSource::Affine;
+  if (target == "mlx-affine") result.targetSource = TargetSource::Mlx;
   else if (target == "gguf") result.targetSource = TargetSource::Gguf;
   else throw std::invalid_argument("unsupported target source format: " + target);
 
@@ -384,7 +384,7 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
   const auto vision = requireString(record, @"vision_format", "vision format");
   if (vision == "none") result.visionSource = VisionSource::None;
   else {
-    if (vision == "safetensors") result.visionSource = VisionSource::Safetensors;
+    if (vision == "safetensors") result.visionSource = VisionSource::Mlx;
     else if (vision == "gguf") result.visionSource = VisionSource::Gguf;
     else throw std::invalid_argument("unsupported vision source format: " + vision);
     NSDictionary *v = requireObject(config, @"vision_config", "vision config");
@@ -432,7 +432,7 @@ ModelDescriptor makeModelDescriptor(std::string name, TargetLayout target,
 }
 
 bool ModelDescriptor::valid() const noexcept {
-  if ((targetSource != TargetSource::Packed && targetSource != TargetSource::Affine && targetSource != TargetSource::Gguf) ||
+  if ((targetSource != TargetSource::Packed && targetSource != TargetSource::Mlx && targetSource != TargetSource::Gguf) ||
       name.empty() || !capabilities.vocabularySize ||
       !capabilities.maximumContextTokens ||
       capabilities.maximumBatchWidth != ExecutionLimits::maximumBatchWidth ||
