@@ -12,6 +12,7 @@ from tokenizers import Tokenizer, pre_tokenizers
 from transformers import AutoTokenizer
 
 from dev.tests import fixture_files
+from dev.tests.fixture_files import GGUF_TYPE_ARRAY, GGUF_TYPE_STRING
 from dev.tests.installer_fixtures import MOE, FakeHub, draft_dir, selection
 from install import assembly, families, gguf, hub, models, upstream
 
@@ -109,30 +110,50 @@ class GgufMetadataTests(unittest.TestCase):
         raw = path.read_bytes()[:expected]
         for size in range(len(raw)):
             path.write_bytes(raw[:size])
-            with self.assertRaises(models.ModelError):
+            with (
+                self.subTest(size=size),
+                self.assertRaisesRegex(models.ModelError, "truncated"),
+            ):
                 gguf.Metadata(path)
         path.write_bytes(raw)
         with mock.patch.object(gguf.Metadata, "MAX_BYTES", 24):
             with self.assertRaisesRegex(models.ModelError, "size limit"):
                 gguf.Metadata(path)
         path.write_bytes(raw[:4] + struct.pack(">I", 3) + raw[8:])
-        with self.assertRaises(models.ModelError):
+        with self.assertRaisesRegex(models.ModelError, "unsupported GGUF header"):
             gguf.Metadata(path)
 
     def test_reader_rejects_duplicate_keys_unknown_types_and_nested_arrays(self):
         path = write_gguf(self.root / "bad.gguf", {"key": "value"})
         raw = path.read_bytes()
-        path.write_bytes(raw[:16] + struct.pack("<Q", 2) + raw[24:] * 2)
+        # The header is the magic, the version, the tensor count and the key
+        # count; the one key's value type follows its length and bytes.
+        header = struct.calcsize("<4sIQQ")
+        key_count = header - struct.calcsize("<Q")
+        value_type = header + struct.calcsize("<Q") + len("key")
+        path.write_bytes(raw[:key_count] + struct.pack("<Q", 2) + raw[header:] * 2)
         with self.assertRaisesRegex(models.ModelError, "duplicate"):
             gguf.Metadata(path)
-        for kind, data in (
-            (99, b""),
-            (9, struct.pack("<IQ", 9, 1)),
-            (9, struct.pack("<IQ", 8, gguf.Metadata.MAX_ITEMS + 1)),
-            (8, struct.pack("<Q", 1) + b"\xff"),
+        # Each is rejected for its own reason, not read on to the end.
+        for kind, data, reason in (
+            (99, b"", "unknown GGUF metadata type"),
+            (
+                GGUF_TYPE_ARRAY,
+                struct.pack("<IQ", GGUF_TYPE_ARRAY, 1),
+                "unsupported or oversized",
+            ),
+            (
+                GGUF_TYPE_ARRAY,
+                struct.pack("<IQ", GGUF_TYPE_STRING, gguf.Metadata.MAX_ITEMS + 1),
+                "unsupported or oversized",
+            ),
+            (GGUF_TYPE_STRING, struct.pack("<Q", 1) + b"\xff", "invalid UTF-8"),
         ):
-            path.write_bytes(raw[:35] + struct.pack("<I", kind) + data)
-            with self.assertRaises(models.ModelError):
+            path.write_bytes(raw[:value_type] + struct.pack("<I", kind) + data)
+            with (
+                self.subTest(kind=kind, data=data),
+                self.assertRaisesRegex(models.ModelError, reason),
+            ):
                 gguf.Metadata(path)
 
     def test_bpe_ids_special_tokens_normalization_and_local_reload(self):
