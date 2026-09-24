@@ -103,6 +103,7 @@ class CompletionTests(unittest.TestCase):
             assembly.mkdir()
             (assembly / "model.json").write_text("{}")
             (models / model).parent.mkdir(parents=True, exist_ok=True)
+            (models / model).unlink(missing_ok=True)
             (models / model).symlink_to(assembly, target_is_directory=True)
         # A selection root (.selections/<sha256>) records model.json too, but
         # it is a hidden installation, not a model id.
@@ -110,6 +111,7 @@ class CompletionTests(unittest.TestCase):
         selection.mkdir()
         (selection / "model.json").write_text("{}")
         (models / ".selections").mkdir(exist_ok=True)
+        (models / ".selections/0123").unlink(missing_ok=True)
         (models / ".selections/0123").symlink_to(selection, target_is_directory=True)
         for invalid in (
             "bad owner/model",
