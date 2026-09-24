@@ -631,8 +631,6 @@ PreparedInput Linear::add(metal::CommandGraph &graph, LinearBuffers b,
     return selected.input() == LinearInput::Plain ? b.prepared
                                                   : PreparedInput{b.input, selected.input()};
   }
-  if (selected.workload().weightLayout != WeightLayout::Affine64)
-    throw std::invalid_argument("affine projection requires an affine plan");
   const LinearWorkload w = selected.workload();
   const auto [n, k] = w.matrix;
   requireAffineProjection(p, w.matrix);
