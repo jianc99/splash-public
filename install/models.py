@@ -969,4 +969,12 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    # upstream.py and gguf.py import this file by its module name. Run that
+    # module, not this __main__ copy, so the ModelError they raise is the one
+    # main() reports.
+    import importlib
+
+    installer = importlib.import_module(
+        f"{__package__}.models" if __package__ else "models"
+    )
+    raise SystemExit(installer.main())

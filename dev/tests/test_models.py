@@ -1369,5 +1369,36 @@ class ModelArtifactTest(unittest.TestCase):
         self.assertEqual(list(destination.parent.iterdir()), [destination])
 
 
+class ScriptEntryTests(unittest.TestCase):
+    def test_script_reports_installer_errors_without_a_traceback(self):
+        # The launcher runs install/models.py as a script; errors raised in
+        # upstream.py must reach the user as one line, as in package imports.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(Path(artifacts.__file__).resolve()),
+                    "--models",
+                    str(root / "models"),
+                    "--model",
+                    "someone/not-cached",
+                    "prepare",
+                ],
+                env={
+                    "HOME": str(root / "home"),
+                    "HF_HUB_OFFLINE": "1",
+                    "HF_HUB_CACHE": str(root / "hub"),
+                },
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+        output = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 1, output)
+        self.assertIn("error: cannot resolve someone/not-cached", output)
+        self.assertNotIn("Traceback", output)
+
+
 if __name__ == "__main__":
     unittest.main()
