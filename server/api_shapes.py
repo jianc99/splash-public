@@ -392,10 +392,7 @@ def normalize_responses_input(instructions, items):
             if role == "user":
                 flush()
                 messages.append(
-                    {
-                        "role": role,
-                        "content": _responses_content(item.get("content")),
-                    }
+                    {"role": role, "content": _responses_content(item.get("content"))}
                 )
                 continue
             text = _responses_text(item.get("content"))
