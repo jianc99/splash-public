@@ -74,8 +74,13 @@ struct LinearConfig final {
   // cooperative scope of one tile, or for split tiles the four partitions
   // together (Split32 is 4 x 1, Split64 is 4 x 2; Paired256 runs four).
   LinearSimdgroups simdgroups = LinearSimdgroups::Eight;
-  // Cross-threadgroup K partitions for Simdgroup; all other tiles use one.
+  // Cross-threadgroup K partitions for Simdgroup and the GGUF tiles, a power
+  // of two up to kMaximumSplits; all other tiles use one.
   uint32_t splits = 1;
+  static constexpr uint32_t kMaximumSplits = 8;
+  [[nodiscard]] constexpr bool validSplits() const noexcept {
+    return splits && splits <= kMaximumSplits && !(splits & (splits - 1));
+  }
   bool operator==(const LinearConfig &) const = default;
 };
 
@@ -157,6 +162,10 @@ public:
 private:
   friend class Linear;
   LinearPlan(LinearWorkload workload, LinearConfig config);
+  // Block plans (LinearGguf.cpp).
+  void requireBlockConfiguration() const;
+  [[nodiscard]] uint32_t blockStorageRows() const noexcept;
+  [[nodiscard]] LinearScratchSize blockScratchSize() const noexcept;
   LinearWorkload workload_;
   LinearConfig config_;
   std::string_view pipeline_;
@@ -201,10 +210,9 @@ public:
   [[nodiscard]] LinearPlan plan(LinearWorkload workload) const;
   // The plan of `workload` in the projection's weight layout.
   [[nodiscard]] LinearPlan plan(LinearWorkload workload, const Projection &projection) const;
-  // Rows of storage a decode step of `rows` rows binds for this device's
-  // projection tiles (LinearPlan::storageRows of its decode plans): the step's
-  // rows, or the staged GGUF tile's 8, 16 or 32.
-  [[nodiscard]] uint32_t decodeStorageRows(uint32_t rows, WeightLayout weightLayout) const noexcept;
+  // Rows of storage a decode step of `rows` rows binds for a projection of
+  // `shape`: the storageRows of its decode plans, which every epilogue shares.
+  [[nodiscard]] uint32_t decodeStorageRows(uint32_t rows, ProjectionShape shape) const;
   // The plans of this projection's matrix in its layout. A decode plan's
   // input() is the layout its producer writes.
   [[nodiscard]] LinearPlan prefillPlan(const Projection &projection, uint32_t rows,
@@ -212,6 +220,10 @@ public:
   [[nodiscard]] LinearPlan decodePlan(const Projection &projection, uint32_t lanes,
                                       LinearEpilogue epilogue = LinearEpilogue::None) const;
   [[nodiscard]] LinearScratchSize decodeScratchSize(LinearWorkload workload) const;
+  // The scratch of every prefill chunk and epilogue of a projection of
+  // `shape`: the split partials and counters of the chunks that run the GGUF
+  // decode tiles (LinearGguf.cpp).
+  [[nodiscard]] LinearScratchSize prefillScratchSize(ProjectionShape shape) const;
   // The tile of a float projection of `rows` rows into `outputSize` columns
   // on this device (LinearGguf.cpp).
   [[nodiscard]] FloatTile ggufFloatTile(uint32_t rows, uint32_t outputSize) const noexcept;
@@ -259,8 +271,9 @@ public:
 
 private:
   [[nodiscard]] LinearConfig baseline(LinearWorkload workload) const;
+  // Counts `dispatches` dispatches that each fuse `lanes` request lanes.
+  static void account(LinearDispatchStats &stats, uint32_t lanes, uint32_t dispatches) noexcept;
   // GGUF policy and dispatch (LinearGguf.cpp).
-  [[nodiscard]] LinearTile ggufDecodeTile() const noexcept;
   [[nodiscard]] LinearConfig ggufBaseline(LinearWorkload workload) const;
   void addGguf(metal::CommandGraph &graph, const LinearBuffers &buffers,
                const Projection &projection, const LinearPlan &plan,

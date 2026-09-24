@@ -113,22 +113,12 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
       bytesFor<uint16_t>(uint64_t{geometry.target.attentionKvHeads} *
                          kPackedAttentionRows *
                          geometry.target.attentionHeadDimension));
-  // Chunks of up to 32 rows run the decode tiles with the decode split rule
-  // (LinearGguf.cpp): fp32 partials and counters for the largest such plan.
-  ops::LinearScratchSize linear;
-  const uint32_t decodeTileRows =
-      ExecutionLimits::maximumBatchWidth * ExecutionLimits::targetVerifyRows;
+  // The split partials and counters of the largest prefill plan.
   for (const auto &projection : geometry.target.prefillProjections) {
-    const ops::LinearMatrix matrix{projection.outputSize, projection.inputSize};
-    for (uint32_t rows = 1; rows <= decodeTileRows; ++rows)
-      for (const auto epilogue : {ops::LinearEpilogue::None, ops::LinearEpilogue::Residual,
-                                  ops::LinearEpilogue::UpWithGate}) {
-        linear.include(operators.linear().plan(
-            {matrix, rows, ops::LinearPhase::Prefill, epilogue, projection.layout}).scratchSize());
-      }
+    const ops::LinearScratchSize linear = operators.linear().prefillScratchSize(projection);
+    put(PrefillTensor::LinearPartials, linear.partials);
+    put(PrefillTensor::LinearCounters, linear.counters);
   }
-  put(PrefillTensor::LinearPartials, linear.partials);
-  put(PrefillTensor::LinearCounters, linear.counters);
   if (geometry.target.ffnKind == QwenFfnKind::SparseMoe) {
     const ops::MoeWorkspace workspace =
         operators.moePrefillWorkspace(geometry.target.moeShape(), kPrefillRows);

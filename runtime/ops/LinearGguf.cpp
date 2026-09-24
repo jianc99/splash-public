@@ -9,6 +9,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace splash::ops {
@@ -18,9 +19,21 @@ namespace {
 // columns each. Prefill tiles: 64 columns, four simdgroups of 32 rows.
 constexpr uint32_t kDecodeTileColumns = 64;
 constexpr uint32_t kDecodeThreads = 64;
+// The Apple9 register tile: four simdgroups over every lane of 64 columns.
+constexpr uint32_t kRegisterThreads = 128;
 constexpr uint32_t kPrefillTileColumns = 64;
 constexpr uint32_t kPrefillThreads = 128;
-constexpr uint32_t kPrefillRows = 128;
+constexpr uint32_t kPrefillTileRows = 128;
+// The staged decode tiles hold at most a full decode batch; prefill chunks of
+// up to this many rows run them (Linear::ggufBaseline).
+constexpr uint32_t kMaximumDecodeTileRows = SPLASH_MAXIMUM_BATCH_WIDTH * SPLASH_TARGET_VERIFY_ROWS;
+// The segments one fused decode dispatch runs.
+constexpr size_t kFusedSegments = std::extent_v<decltype(GgufDecodeFusedParams::cols)>;
+
+// The staged decode tile that holds `rows` rows: MPP computes 16-row
+// fragments, so the tile holds 8, 16 or 32 rows and a three-lane step runs
+// the 32-row tile over four lanes of storage.
+constexpr uint32_t stagedTileRows(uint32_t rows) noexcept { return rows <= 8 ? 8 : rows <= 16 ? 16 : 32; }
 
 std::string decodeKernel(const char *format, uint32_t rows, char epilogue) {
   return std::string("gguf_decode_") + format + "_m" + std::to_string(rows) + "_" + epilogue;
@@ -32,7 +45,7 @@ std::string prefillKernel(const std::string &family, const char *format) {
 // K splits of a decode tile, one rule for both tiles. A tier asks for more
 // partitions while the grid holds fewer than `threadgroups` threadgroups per
 // core and each partition would still keep `inputs` inputs; the split count
-// doubles, up to eight, while some tier asks. Decode K is a multiple of 256,
+// doubles, up to the maximum, while some tier asks. Decode K is a multiple of 256,
 // so eight partitions always hold whole 32-input groups. The rule ignores the
 // batch width: bounds that depended on it did not pay on either family.
 struct SplitTier {
@@ -45,7 +58,7 @@ uint32_t decodeSplits(uint32_t n, uint32_t k, uint32_t cores, std::span<const Sp
   const auto asks = [&](const SplitTier &t) {
     return grid * splits < uint64_t{t.threadgroups} * cores && k / (2 * splits) >= t.inputs;
   };
-  while (splits < 8 && std::any_of(tiers.begin(), tiers.end(), asks)) splits *= 2;
+  while (splits < LinearConfig::kMaximumSplits && std::any_of(tiers.begin(), tiers.end(), asks)) splits *= 2;
   return splits;
 }
 
@@ -73,16 +86,6 @@ constexpr SplitTier kSimdgroupTiers[] = {{4, 256}, {32, 1024}};
 // per core with 1024 inputs and unsplit fused and gate/up kernels: 6.4%).
 constexpr SplitTier kStagedTiers[] = {{6, 512}};
 
-// The request lanes one decode dispatch fuses, whatever its tile height.
-void recordLanes(LinearDispatchStats *stats, uint32_t rows) {
-  if (!stats || rows <= SPLASH_TARGET_VERIFY_ROWS) return;
-  const uint32_t lanes = rows / SPLASH_TARGET_VERIFY_ROWS;
-  stats->fusedSourceOperations += lanes;
-  if (lanes == 2) ++stats->m16Dispatches;
-  else if (lanes == 3) ++stats->m24Dispatches;
-  else ++stats->m32Dispatches;
-}
-
 // The projection is the plan's matrix, and each of its segments (which tile
 // its leading columns) fills whole column tiles; the columns past the last
 // segment are padding no kernel writes. A fused projection keeps the
@@ -90,10 +93,10 @@ void recordLanes(LinearDispatchStats *stats, uint32_t rows) {
 // layout's), its qkv|z|alpha-beta segments 12352.
 void requireSegments(const Projection &p, LinearMatrix matrix) {
   if (p.outputSize != matrix.outputSize || p.inputSize != matrix.inputSize)
-    throw std::invalid_argument("GGUF projection does not match plan");
+    throw std::invalid_argument("block projection does not match plan");
   for (const QuantizedSegment &s : p.blocks().segments)
     if (s.outputSize % kDecodeTileColumns)
-      throw std::invalid_argument("GGUF segments do not fill whole column tiles");
+      throw std::invalid_argument("block segments do not fill whole column tiles");
 }
 
 // Columns of the segments, which the fused kernels' grids cover.
@@ -103,12 +106,116 @@ uint32_t segmentColumns(const Projection &p) {
   return columns;
 }
 
+// The kernel name suffix of an epilogue and the buffer it reads besides the
+// input (the output for a plain projection, which reads none): 'r' adds the
+// residual, 'g' multiplies silu(gate) from the gate scratch.
+char epilogueSuffix(LinearEpilogue epilogue) noexcept {
+  return epilogue == LinearEpilogue::None ? 'a' : epilogue == LinearEpilogue::Residual ? 'r' : 'g';
+}
+const metal::MetalBuffer &epilogueInput(const LinearBuffers &b, LinearEpilogue epilogue) noexcept {
+  return epilogue == LinearEpilogue::Residual ? b.residual
+       : epilogue == LinearEpilogue::None     ? b.output
+                                              : b.gateScratch;
+}
+
+// The parameters and planes of a fused decode dispatch over `order`, the
+// segments in dispatch order. Slots past the last segment take no columns and
+// bind its planes again.
+GgufDecodeFusedParams fusedSegments(const LinearPlan &plan, std::span<const QuantizedSegment *const> order,
+                                    std::vector<metal::MetalBuffer> &bindings) {
+  const LinearWorkload w = plan.workload();
+  if (order.size() > kFusedSegments || w.epilogue != LinearEpilogue::None)
+    throw std::invalid_argument("a fused block projection takes at most three segments and no epilogue");
+  GgufDecodeFusedParams params{w.matrix.inputSize, plan.configuration().splits, w.matrix.outputSize,
+                               {0, 0, 0}, {0, 0, 0}, {0, 0, 0}};
+  for (size_t i = 0; i < kFusedSegments; ++i) {
+    const QuantizedSegment &s = *order[std::min(i, order.size() - 1)];
+    if (i < order.size()) {
+      params.cols[i] = s.outputSize;
+      params.fmt[i] = s.formatId;
+      params.offset[i] = s.columnOffset;
+    }
+    bindings.insert(bindings.end(), {s.plane0, s.plane1Slot(), s.meta});
+  }
+  return params;
+}
+
+// A single tensor's decode dispatches through `tensor(segment, epilogue
+// suffix, output, epilogue input)`: gate/up as a gate pass into the gate
+// scratch and an up pass whose epilogue applies silu(gate) to the bf16 up
+// value, any other epilogue in one dispatch.
+template <class Tensor>
+void addDecodeTensor(const LinearBuffers &b, LinearEpilogue epilogue, const QuantizedSegment &segment,
+                     const Projection *gate, const Tensor &tensor) {
+  if (epilogue != LinearEpilogue::GateUp) {
+    tensor(segment, epilogueSuffix(epilogue), b.output, epilogueInput(b, epilogue));
+    return;
+  }
+  const std::vector<QuantizedSegment> &gates = gate->blocks().segments;
+  if (gates.size() != 1) throw std::invalid_argument("block gate/up takes single tensors");
+  tensor(gates.front(), epilogueSuffix(LinearEpilogue::None), b.gateScratch, b.gateScratch);
+  tensor(segment, epilogueSuffix(LinearEpilogue::UpWithGate), b.output, b.gateScratch);
+}
+
 } // namespace
 
-// Apple9 runs matrix operations on the FP32 pipe, so the exact register
-// kernel beats staging.
-LinearTile Linear::ggufDecodeTile() const noexcept {
-  return appleGpuFamily_ == 9 ? LinearTile::GgufSimdgroup : LinearTile::GgufStaged;
+void LinearPlan::requireBlockConfiguration() const {
+  const auto [n, k] = workload_.matrix;
+  const LinearConfig &c = config_;
+  if (c.tile == LinearTile::GgufSimdgroup) {
+    // Split boundaries fall on 256-input coefficient units.
+    if (workload_.phase != LinearPhase::Decode || c.groups != n / tileColumns() ||
+        c.simdgroups != LinearSimdgroups::Four || !c.validSplits() || k / 256 < c.splits)
+      throw std::invalid_argument("the register block decode tile takes the full column grid and a K unit per split");
+    return;
+  }
+  if (!c.validSplits() || (k / 32) % c.splits)
+    throw std::invalid_argument("staged block splits take whole 32-input groups");
+  if (workload_.phase == LinearPhase::Prefill) {
+    // Four simdgroups: 128-row prefill tiles. Two: the decode tiles, which
+    // split K as in decode.
+    const bool decodeTile = c.simdgroups == LinearSimdgroups::Two && workload_.rows <= kMaximumDecodeTileRows;
+    if (c.groups || (c.simdgroups != LinearSimdgroups::Four && !decodeTile) || (c.splits > 1 && !decodeTile))
+      throw std::invalid_argument("invalid block prefill configuration");
+  } else if (c.groups != n / tileColumns() || c.simdgroups != LinearSimdgroups::Two) {
+    throw std::invalid_argument("the staged block decode tile takes the full column grid");
+  }
+}
+
+uint32_t LinearPlan::blockStorageRows() const noexcept {
+  if (config_.tile == LinearTile::GgufSimdgroup) return workload_.rows;
+  return config_.simdgroups == LinearSimdgroups::Four
+      ? (workload_.rows + kPrefillTileRows - 1) / kPrefillTileRows * kPrefillTileRows
+      : stagedTileRows(workload_.rows);
+}
+
+LinearScratchSize LinearPlan::blockScratchSize() const noexcept {
+  const auto [n, k] = workload_.matrix;
+  // Register tile: the Table16 table and sums (3 K / 4 fp32 per eight rows),
+  // [lane][split][row][column] partials and one counter per 64-column tile,
+  // which covers every lane. Every binding exists even without splits.
+  if (config_.tile == LinearTile::GgufSimdgroup) {
+    const uint64_t rows = workload_.rows;
+    return {tableBytes(k, rows), tableSumsBytes(LinearInput::Table16, k, rows),
+            config_.splits > 1 ? config_.splits * rows * n * sizeof(float) : sizeof(float),
+            config_.splits > 1 ? uint64_t{n / tileColumns()} * sizeof(uint32_t) : sizeof(uint32_t)};
+  }
+  // Staged split-K: [split][row][column] fp32 partials over the tile's rows
+  // and one counter per 64-column tile (a tile covers every row of the
+  // dispatch).
+  return config_.splits > 1
+      ? LinearScratchSize{0, 0, uint64_t{config_.splits} * storageRows() * n * sizeof(float),
+                          uint64_t{n / tileColumns()} * sizeof(uint32_t)}
+      : LinearScratchSize{};
+}
+
+LinearScratchSize Linear::prefillScratchSize(ProjectionShape shape) const {
+  LinearScratchSize bound;
+  for (uint32_t rows = 1; rows <= kMaximumDecodeTileRows; ++rows)
+    for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::UpWithGate})
+      bound.include(
+          plan({{shape.outputSize, shape.inputSize}, rows, LinearPhase::Prefill, epilogue, shape.layout}).scratchSize());
+  return bound;
 }
 
 LinearConfig Linear::ggufBaseline(LinearWorkload w) const {
@@ -123,11 +230,13 @@ LinearConfig Linear::ggufBaseline(LinearWorkload w) const {
   // 8 rows to 16) and 1.1-2.8x on a 40-core M3 Max; the 27B down and output
   // projections split in two gain 24-37% more on the 16-core M5 Pro.
   if (w.phase == LinearPhase::Prefill)
-    return w.rows <= SPLASH_MAXIMUM_BATCH_WIDTH * SPLASH_TARGET_VERIFY_ROWS
+    return w.rows <= kMaximumDecodeTileRows
         ? LinearConfig{LinearTile::GgufStaged, 0, LinearSimdgroups::Two,
                        decodeSplits(n, k, gpuCores_, kStagedTiers)}
         : LinearConfig{LinearTile::GgufStaged, 0, LinearSimdgroups::Four};
-  if (ggufDecodeTile() == LinearTile::GgufSimdgroup)
+  // Apple9 runs matrix operations on the FP32 pipe, so the exact register
+  // kernel beats staging.
+  if (appleGpuFamily_ == 9)
     return {LinearTile::GgufSimdgroup, n / kDecodeTileColumns, LinearSimdgroups::Four,
             decodeSplits(n, k, gpuCores_, kSimdgroupTiers)};
   return {LinearTile::GgufStaged, n / kDecodeTileColumns, LinearSimdgroups::Two,
@@ -139,17 +248,9 @@ void Linear::addGguf(metal::CommandGraph &graph, const LinearBuffers &b,
                        const Projection *gate, LinearDispatchStats *stats) const {
   const LinearWorkload w = plan.workload();
   const LinearConfig config = plan.configuration();
-  if ((config.tile != LinearTile::GgufStaged && config.tile != LinearTile::GgufSimdgroup) ||
-      w.weightLayout != WeightLayout::Block32)
-    throw std::invalid_argument("GGUF projection requires a GGUF plan");
   const auto [n, k] = w.matrix;
   requireSegments(p, w.matrix);
-  if (w.epilogue == LinearEpilogue::GateUp) {
-    if (!gate || gate->layout() != WeightLayout::Block32) throw std::invalid_argument("GGUF gate projection is missing");
-    requireSegments(*gate, w.matrix);
-  } else if (gate) {
-    throw std::invalid_argument("unexpected GGUF gate projection");
-  }
+  if (gate) requireSegments(*gate, w.matrix);
   const std::vector<QuantizedSegment> &segments = p.blocks().segments;
   if (std::any_of(segments.begin(), segments.end(), [](const QuantizedSegment &s) { return s.isFloat(); })) {
     // The quantized segments, which precede the float ones, run the plan's tiles.
@@ -160,45 +261,26 @@ void Linear::addGguf(metal::CommandGraph &graph, const LinearBuffers &b,
       addGguf(graph, b, Projection(p.outputSize, p.inputSize, std::move(weights)), plan, gate, stats);
     return;
   }
-  const uint32_t rows = plan.storageRows();
-  const auto need = [&](const metal::MetalBuffer &buffer, uint64_t bytes, const char *what) {
-    if (buffer.sizeBytes() < bytes)
-      throw std::invalid_argument(std::string("GGUF ") + what + " buffer holds " +
-                                  std::to_string(buffer.sizeBytes()) + " bytes, needs " +
-                                  std::to_string(bytes) + " (rows " + std::to_string(rows) +
-                                  ", n " + std::to_string(n) + ")");
-  };
-  need(b.input, uint64_t{rows} * k * 2, "input");
-  need(b.output, uint64_t{rows} * n * 2, "output");
-  if (w.epilogue == LinearEpilogue::Residual) need(b.residual, uint64_t{rows} * n * 2, "residual");
-  need(b.gateScratch, plan.gateScratchBytes(), "gate scratch");
   if (config.tile == LinearTile::GgufSimdgroup) {
     addGgufSimdgroup(graph, b, p, plan, gate);
   } else if (config.simdgroups == LinearSimdgroups::Two) {
-    const LinearScratchSize scratch = plan.scratchSize();
-    need(b.scratch.partials, scratch.partials, "partials");
-    need(b.scratch.counters, scratch.counters, "counters");
     addGgufStaged(graph, b, p, plan, gate);
   } else {
-    // Prefill chunks of more than 32 rows: one dispatch per segment over
-    // 128-row tiles; rows past w.rows stay inside the budget-sized prefill
-    // buffers, and the simdgroups of a tile that only hold them skip their
-    // matmuls.
-    const metal::MetalBuffer aux = w.epilogue == LinearEpilogue::Residual ? b.residual
-                                 : w.epilogue == LinearEpilogue::UpWithGate ? b.gateScratch
-                                                                             : b.output;
-    const char epilogue = w.epilogue == LinearEpilogue::None       ? 'a'
-                        : w.epilogue == LinearEpilogue::Residual   ? 'r'
-                                                                   : 'g';
+    // Prefill chunks of more than kMaximumDecodeTileRows rows: one dispatch
+    // per segment over 128-row tiles; rows past w.rows stay inside the
+    // budget-sized prefill buffers, and the simdgroups of a tile that only
+    // hold them skip their matmuls.
+    const char epilogue = epilogueSuffix(w.epilogue);
     for (const QuantizedSegment &s : segments) {
       std::vector<metal::MetalBuffer> bindings{b.input, s.plane0, s.plane1Slot(), s.meta, b.output};
-      if (w.epilogue != LinearEpilogue::None) bindings.push_back(aux);
+      if (w.epilogue != LinearEpilogue::None) bindings.push_back(epilogueInput(b, w.epilogue));
       graph.add(prefillKernel(std::string("pf") + epilogue, s.name()), std::move(bindings),
                 GgufPrefillParams{s.outputSize, k, w.rows, n, s.columnOffset},
-                {rows / kPrefillRows, s.outputSize / kPrefillTileColumns, 1}, {kPrefillThreads, 1, 1});
+                {plan.storageRows() / kPrefillTileRows, s.outputSize / kPrefillTileColumns, 1},
+                {kPrefillThreads, 1, 1});
     }
   }
-  if (w.phase == LinearPhase::Decode) recordLanes(stats, w.rows);
+  if (stats && w.phase == LinearPhase::Decode) account(*stats, w.rows / SPLASH_TARGET_VERIFY_ROWS, 1);
 }
 
 // The staged decode tiles, for decode and prefill chunks of up to 32 rows:
@@ -228,32 +310,14 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
               {kDecodeThreads, 1, 1});
   };
   if (w.phase == LinearPhase::Prefill) {
-    const char epilogue = w.epilogue == LinearEpilogue::None ? 'a' : w.epilogue == LinearEpilogue::Residual ? 'r' : 'g';
-    const metal::MetalBuffer aux = w.epilogue == LinearEpilogue::Residual ? b.residual
-                                 : w.epilogue == LinearEpilogue::UpWithGate ? b.gateScratch
-                                                                             : b.output;
-    for (const QuantizedSegment &s : segments) tensor(s, epilogue, b.output, aux);
+    for (const QuantizedSegment &s : segments)
+      tensor(s, epilogueSuffix(w.epilogue), b.output, epilogueInput(b, w.epilogue));
     return;
-  }
-  switch (w.epilogue) {
-  case LinearEpilogue::GateUp:
-    if (gate->blocks().segments.size() != 1 || segments.size() != 1)
-      throw std::invalid_argument("GGUF gate/up requires single tensors");
-    tensor(gate->blocks().segments.front(), 'a', b.gateScratch, b.gateScratch);
-    tensor(segments.front(), 'g', b.output, b.gateScratch);
-    return;
-  case LinearEpilogue::Residual:
-    if (segments.size() != 1) throw std::invalid_argument("GGUF residual projection requires a single tensor");
-    tensor(segments.front(), 'r', b.output, b.residual);
-    return;
-  case LinearEpilogue::UpWithGate: throw std::invalid_argument("GGUF decode has no up-with-gate projection");
-  case LinearEpilogue::None: break;
   }
   if (segments.size() == 1) {
-    tensor(segments.front(), 'a', b.output, b.output);
+    addDecodeTensor(b, w.epilogue, segments.front(), gate, tensor);
     return;
   }
-  if (segments.size() > 3) throw std::invalid_argument("GGUF fused projection needs <= 3 segments");
   // Dispatch order is tile order: segments with the most bytes per tile
   // first, so their threadgroups do not form the tail (alpha/beta are Q8_0).
   std::vector<const QuantizedSegment *> order;
@@ -265,17 +329,8 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
   std::stable_sort(order.begin(), order.end(), [&](const QuantizedSegment *a, const QuantizedSegment *c) {
     return bitsPerWeight(*a) > bitsPerWeight(*c);
   });
-  GgufDecodeFusedParams params{k, splits, n, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}};
   std::vector<metal::MetalBuffer> bindings{b.input};
-  for (size_t i = 0; i < 3; ++i) {
-    const QuantizedSegment &s = *order[std::min(i, order.size() - 1)];
-    if (i < order.size()) {
-      params.cols[i] = s.outputSize;
-      params.fmt[i] = s.formatId;
-      params.offset[i] = s.columnOffset;
-    }
-    bindings.insert(bindings.end(), {s.plane0, s.plane1Slot(), s.meta});
-  }
+  const GgufDecodeFusedParams params = fusedSegments(plan, order, bindings);
   bindings.insert(bindings.end(), {b.output, partials, counters});
   graph.add("gguf_decode_fused_m" + std::to_string(rows), std::move(bindings), params,
             {segmentColumns(p) / kDecodeTileColumns, splits, 1}, {kDecodeThreads, 1, 1});
@@ -293,36 +348,18 @@ void Linear::addGgufSimdgroup(metal::CommandGraph &graph, const LinearBuffers &b
   const auto [n, k] = w.matrix;
   const uint32_t lanes = w.rows / SPLASH_TARGET_VERIFY_ROWS;
   const std::vector<QuantizedSegment> &segments = p.blocks().segments;
-  const LinearScratchSize size = plan.scratchSize();
-  const auto need = [](const metal::MetalBuffer &buffer, uint64_t bytes, const char *what) {
-    if (buffer.sizeBytes() < bytes)
-      throw std::invalid_argument(std::string("GGUF simdgroup ") + what + " scratch is below the plan");
-  };
-  need(b.scratch.input, size.input, "table");
-  need(b.scratch.sums, size.sums, "sums");
-  need(b.scratch.partials, size.partials, "partials");
-  need(b.scratch.counters, size.counters, "counters");
   if (b.prepared.layout != LinearInput::Table16 || !b.prepared.source.sameView(b.input))
     graph.add("decode_linear_gguf_prepare", {b.input, b.scratch.input, b.scratch.sums}, k,
               {k / 32, lanes, 1}, {128, 1, 1});
   const metal::DispatchSize grid{segmentColumns(p) / kDecodeTileColumns, config.splits, 1};
   const std::string suffix = "_l" + std::to_string(lanes);
   if (segments.size() > 1) {
-    if (segments.size() > 3 || w.epilogue != LinearEpilogue::None)
-      throw std::invalid_argument("GGUF fused projection needs <= 3 segments and no epilogue");
-    GgufDecodeFusedParams params{k, config.splits, n, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}};
+    std::vector<const QuantizedSegment *> order;
+    for (const QuantizedSegment &s : segments) order.push_back(&s);
     std::vector<metal::MetalBuffer> bindings{b.scratch.input, b.scratch.sums};
-    for (size_t i = 0; i < 3; ++i) {
-      const QuantizedSegment &s = segments[std::min(i, segments.size() - 1)];
-      if (i < segments.size()) {
-        params.cols[i] = s.outputSize;
-        params.fmt[i] = s.formatId;
-        params.offset[i] = s.columnOffset;
-      }
-      bindings.insert(bindings.end(), {s.plane0, s.plane1Slot(), s.meta});
-    }
+    const GgufDecodeFusedParams params = fusedSegments(plan, order, bindings);
     bindings.insert(bindings.end(), {b.output, b.scratch.partials, b.scratch.counters});
-    graph.add("decode_linear_gguf_sg_fused" + suffix, std::move(bindings), params, grid, {128, 1, 1});
+    graph.add("decode_linear_gguf_sg_fused" + suffix, std::move(bindings), params, grid, {kRegisterThreads, 1, 1});
     return;
   }
   const auto tensor = [&](const QuantizedSegment &s, char epilogue, const metal::MetalBuffer &output,
@@ -330,18 +367,9 @@ void Linear::addGgufSimdgroup(metal::CommandGraph &graph, const LinearBuffers &b
     graph.add(std::string("decode_linear_gguf_sg_") + s.name() + suffix + "_" + epilogue,
               {b.scratch.input, b.scratch.sums, s.plane0, s.plane1Slot(), s.meta, output, b.scratch.partials,
                b.scratch.counters, aux},
-              GgufDecodeParams{k, config.splits, n, s.columnOffset}, grid, {128, 1, 1});
+              GgufDecodeParams{k, config.splits, n, s.columnOffset}, grid, {kRegisterThreads, 1, 1});
   };
-  switch (w.epilogue) {
-  case LinearEpilogue::None: tensor(segments.front(), 'a', b.output, b.output); break;
-  case LinearEpilogue::Residual: tensor(segments.front(), 'r', b.output, b.residual); break;
-  case LinearEpilogue::GateUp:
-    if (gate->blocks().segments.size() != 1) throw std::invalid_argument("GGUF gate/up requires single tensors");
-    tensor(gate->blocks().segments.front(), 'a', b.gateScratch, b.gateScratch);
-    tensor(segments.front(), 'g', b.output, b.gateScratch);
-    break;
-  case LinearEpilogue::UpWithGate: throw std::invalid_argument("GGUF decode has no up-with-gate projection");
-  }
+  addDecodeTensor(b, w.epilogue, segments.front(), gate, tensor);
 }
 
 // Float segments of a projection (QuantizedSegment::isFloat): a float projection

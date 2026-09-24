@@ -218,7 +218,7 @@ uint32_t QwenTarget::decodeStorageLanes(uint32_t lanes) const {
   const uint32_t rows = lanes * ExecutionLimits::targetVerifyRows;
   uint32_t storageRows = rows;
   for (const auto &shape : geometry_.decodeProjections)
-    storageRows = std::max(storageRows, operators_.linear().decodeStorageRows(rows, shape.layout));
+    storageRows = std::max(storageRows, operators_.linear().decodeStorageRows(rows, shape));
   return storageRows / ExecutionLimits::targetVerifyRows;
 }
 
