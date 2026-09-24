@@ -93,7 +93,9 @@ void writeProjection(int destination, const Section &section, std::vector<uint8_
   }
 }
 
-// float(-exp(double(A_log))) of a BF16 or F32 vector.
+// float(-exp(double(A_log))) of a BF16 or F32 vector. The A_log it reads and
+// the decay it writes are staged together, within the staging bound of every
+// conversion step.
 void writeDecay(int destination, const Section &section) {
   const SourceTensor &tensor = *section.input.tensor;
   if (tensor.bytes + section.bytes > kWeightPreparationStagingBytes)
