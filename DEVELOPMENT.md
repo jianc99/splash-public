@@ -108,21 +108,30 @@ semantics (off when omitted); judgment endpoints always disable thinking.
 
 ## Upstream model loading
 
-`install/upstream.py` installs a model from its upstream repository. It
-resolves the target and the draft paired with it, then atomically publishes a
-local assembly of links to their Hub snapshots. The assembly's `model.json`
-records the resolved sources and selected formats; the native loader reads it,
-and the launcher holds it while serving. It is local installation metadata,
-not a file model publishers supply.
+`install/upstream.py` installs a model from its upstream repository: it
+inspects the target, pairs the draft trained for it and decides when to follow
+the Hub. The result is an assembly, a local directory of links to the sources'
+Hub snapshots, published atomically. The other installer modules each own one
+part: `hub.py` the sources, the Hub cache and its pins; `assembly.py` the
+assembly layout, its build, verification and garbage collection, and the
+metadata derived from a GGUF; `families.py` the registry; `legacy.py` Splash
+packages; and `models.py` model IDs, selections, the installation lock and the
+command line (`install/models.py --model ID prepare|verify`). The assembly's
+`model.json` records the resolved sources and selected formats. The native
+loader reads it, and `splash serve`, `test-http-real` and the HTTP regression
+benchmark hold it while they run, so a concurrent installation cannot collect
+the assembly they serve. It is local installation metadata, not a file model
+publishers supply.
 
 A target is identified by its own metadata: an MLX config's `text_config`, or
 the one `gguf.model_config` derives from the selected GGUF's header, read with a
-few HTTP range requests before any weight download. The registry (`families.FAMILIES`)
-states each supported architecture's signature and the draft trained for it;
-repository names and model-card `base_model` fields play no part. An MLX
-target must declare affine 4-bit, group-64 `quantization` in `config.json`.
-Native source adapters validate model geometry, quantization, tensor shapes and
-draft compatibility again before execution. Remote Python code is not loaded.
+few HTTP range requests before any weight download. The registry
+(`families.FAMILIES`) states each supported architecture's signature and the
+draft trained for it; repository names and model-card `base_model` fields play
+no part. An MLX target must declare affine 4-bit, group-64 `quantization` in
+`config.json`. Native source adapters validate model geometry, quantization,
+tensor shapes and draft compatibility again before execution. Remote Python
+code is not loaded.
 
 ```bash
 splash serve --model mlx-community/Qwen3.6-35B-A3B-4bit
@@ -142,7 +151,8 @@ files from different revisions. It pins those snapshots in the Hub cache
 an installed model links.
 
 Every start resolves the target's revision (the default branch, or
-`--revision`) with one Hub request of at most 5 seconds (`HUB_TIMEOUT`):
+`--revision`) with one Hub request of at most 5 seconds (`hub.HUB_TIMEOUT`);
+`hub.Repository.resolve` alone decides whether the Hub is asked:
 
 - The installed commit: the assembly's links, sizes and times are checked and
   it starts. It is re-assembled first when this release pins another draft for
@@ -151,7 +161,8 @@ Every start resolves the target's revision (the default branch, or
 - A new commit: only changed files are downloaded, and the new assembly
   replaces the installed one atomically once published.
 - No answer, or a new commit that cannot be installed: the installed model
-  starts, with a one-line message naming the reason.
+  starts, with one line naming the Hub's reason or, on stderr, the
+  installation attempt that failed.
 - A 40-hex `--revision` never moves and `HF_HUB_OFFLINE=1` forbids the Hub:
   both start a verified installation without a request.
 
@@ -187,7 +198,8 @@ configuration is the original DFlash2 configuration with
 weights came from; native loading validates it against the target. The weights
 are the verified Q4 drafts of the Splash packages, not a quantization made at
 startup. Each family pins the commit that published its folder
-(`Draft.revision` in `families.FAMILIES`), and installation downloads only that folder.
+(`Draft.revision` in `families.FAMILIES`), and installation downloads only that
+folder.
 
 To prepare a folder from a verified existing package:
 
@@ -375,9 +387,10 @@ vocabulary head only for decode.
 root-level GGUF for that variant: the file named with the model name its GGUFs
 share, then `-UD-Q4_K_M`, or else the only one whose name ends in `-UD-Q4_K_M`
 (`upstream.select_gguf`). Before any weight download, its header must list
-every tensor the loader reads, with a type it accepts for that tensor
-(`gguf.require_loadable`); the native loader checks again and lists every
-unsupported tensor in one error:
+every tensor the loader reads with a type it accepts for that tensor
+(`gguf.loaded_tensors`, checked by `gguf.require_loadable`; a test holds its
+quantized types to `metal/abi/QuantFormat.h`). The native loader checks again
+and lists every unsupported tensor in one error:
 
 - linears and experts: Q4_K, Q5_K, Q6_K, Q3_K, IQ4_XS, IQ4_NL, Q8_0 or IQ3_S;
 - token embeddings: Q4_K, Q6_K or Q8_0;
@@ -440,9 +453,11 @@ Qwen3.8-27B packages use schema 3 / `splash-packed-q4`, Qwen3.6-35B-A3B
 packages schema 4 / `splash-packed-q4-moe`. Compatible community fine-tunes may
 use any nonempty manifest model name. Native loading validates geometry, tensor
 sizes, binary headers, tokenizer and target/draft compatibility, and maps the
-packed files without preparation. An installed package starts without a Hub
-request; `--revision`, `--language-only` and `--draft-model` require an
-upstream model ID.
+packed files without preparation. `install/legacy.py` installs a package as a
+selection link to its verified Hub snapshot, pinned like an assembly's
+sources. An installed package starts without a Hub request. A package has no
+variants, so a `:VARIANT` suffix is rejected, and `--revision`,
+`--language-only` and `--draft-model` require an upstream model ID.
 
 ## Code and API boundaries
 
