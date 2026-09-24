@@ -30,7 +30,7 @@ from install import clients, launcher  # noqa: E402
 
 CLIENTS = tuple(clients.INSTALL_URLS)
 # The server this harness starts or finds, on the default port.
-BASE_URL = f"http://127.0.0.1:{launcher.PORT}"
+BASE_URL = launcher._base_url(launcher.PORT)
 TEST_COMMAND = "python3 -m unittest -v"
 
 
