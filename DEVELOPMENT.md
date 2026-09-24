@@ -324,9 +324,9 @@ copy of the weights about the model's size, its prepared target and vision
 tensors. Preparing needs that much free disk space plus a 2 GiB reserve: before
 anything is written, the factory (`ModelFactory.cpp`) constructs the target's
 and the vision tower's loaders and checks the space of every missing file they
-plan, plus the reserve, once. Uninstalling a model does not
-delete possibly shared prepared weights. With Splash stopped, entry directories
-can be deleted; deleting the whole cache causes preparation at the next load.
+plan, plus the reserve, once. Uninstalling a model does not delete possibly
+shared prepared weights. With Splash stopped, entry directories can be deleted;
+deleting the whole cache causes preparation at the next load.
 
 A prepared file's key hashes its adapter's preparation identity, its plan, and
 the bytes, type and shape of every source tensor it reads, located and hashed
@@ -337,9 +337,9 @@ of only the code that writes the bytes, the files listed per adapter in
 `INPUTS` of `dev/tools/weight_preparation_identity.py`; inference, parser,
 planner and reader changes keep it. The hashes of the images prepared from the
 test fixtures, in `dev/tests/fixtures/weight-goldens/goldens.json`, fail the
-tests on any change of prepared bytes. Its README gives the procedure for an
-intended change: the key the new bytes need, and the order in which the
-independent layout oracles and the hashes are updated.
+tests on any change of prepared bytes. The README beside it gives the
+procedure for an intended change: the key the new bytes need, and the order in
+which the independent layout oracles and the hashes are updated.
 
 Each entry records in `source` its component (such as `target/layer-0.bin`),
 the digest of the source data it was written from and the source path.
