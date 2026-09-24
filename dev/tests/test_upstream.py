@@ -369,6 +369,7 @@ class UpstreamTest(unittest.TestCase):
         self.assertTrue(self.prepare(args)[0])
         installed = models.installed_root(args.models, args.model)
         self.assertEqual(upstream.verify(installed)["vision_format"], "safetensors")
+        self.assertFalse((installed / "processor").exists())
         self.assertEqual(
             sorted(p.name for p in (installed / "vision").iterdir()),
             ["config.json", "model-00001-of-00002.safetensors"],

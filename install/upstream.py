@@ -94,11 +94,6 @@ TOKENIZER_FILES = (
     "added_tokens.json",
     "special_tokens_map.json",
 )
-PROCESSOR_FILES = (
-    "preprocessor_config.json",
-    "processor_config.json",
-    "video_preprocessor_config.json",
-)
 
 
 def family_for(config):
@@ -325,8 +320,8 @@ class Target:
     # or MLX config.json and the shards holding vision_tower.*; empty without
     # vision.
     vision: dict[str, str] = field(default_factory=dict)
-    # MLX: assembly path -> repository file for configuration, tokenizer and
-    # processor. A GGUF describes these itself (gguf.tokenizer_files).
+    # MLX: assembly path -> repository file for configuration and tokenizer.
+    # A GGUF describes these itself (gguf.tokenizer_files).
     metadata: dict[str, str] = field(default_factory=dict)
 
 
@@ -392,6 +387,7 @@ def _target(repo, variant, language_only):
         if vision:
             with repo.open(vision) as stream:
                 vision_header = gguf.Metadata(stream)
+            _validate_processor(gguf.processor_config(vision_header))
         config = gguf.model_config(header, vision_header)
         print(f"Selected {name} from {repo.name}.", flush=True)
         return Target(
@@ -421,9 +417,6 @@ def _target(repo, variant, language_only):
     vision = {}
     if not language_only:
         _validate_processor(models.read_json(repo.file("preprocessor_config.json")))
-        metadata.update(
-            {"processor/" + n: n for n in PROCESSOR_FILES if n in repo.files}
-        )
         shards = _weight_files(repo, "vision_tower.")
         if not shards:
             raise models.ModelError(
@@ -484,6 +477,10 @@ def _draft_files(repo, family):
 
 
 def _validate_processor(config):
+    """Splash prepares images one way (server/images.py): 16-pixel patches in
+    two temporal slices, merged 2x2 and normalized to [-1, 1]. A processor
+    configuration asking for another is rejected before any download; it is
+    not installed, since nothing reads it."""
     expected = {
         "patch_size": 16,
         "temporal_patch_size": 2,
@@ -807,8 +804,6 @@ def _gguf_metadata(models_root, target, vision):
         "tokenizer/tokenizer_config.json",
         "tokenizer/chat_template.jinja",
     }
-    if vision:
-        names.add("processor/preprocessor_config.json")
     if destination.exists():
         try:
             return key, _metadata_files(destination, names)
@@ -821,10 +816,6 @@ def _gguf_metadata(models_root, target, vision):
     contents["config.json"] = gguf.json_bytes(
         gguf.model_config(metadata, vision_metadata)
     )
-    if vision_metadata:
-        contents["processor/preprocessor_config.json"] = gguf.json_bytes(
-            gguf.processor_config(vision_metadata)
-        )
     if [_file_record(path) for path in source_paths] != sources:
         raise models.ModelError("GGUF source changed while reading metadata")
     cache.mkdir(parents=True, exist_ok=True)

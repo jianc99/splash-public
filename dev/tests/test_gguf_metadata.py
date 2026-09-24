@@ -379,6 +379,20 @@ class GgufMetadataTests(unittest.TestCase):
             self.assertEqual(config["text_config"]["num_hidden_layers"], 40)
             self.assertEqual("vision_config" in config, not language_only)
             self.assertEqual((root / "vision").exists(), not language_only)
+            self.assertFalse((root / "processor").exists())
+        # An image normalization the server does not implement is rejected
+        # from the projector's header, before any download.
+        values = vision_fixture()
+        values["clip.vision.image_mean"] = [0.48, 0.46, 0.41]
+        write_gguf(target / "mmproj-F32.gguf", values)
+        args.models = self.root / "rejected"
+        with (
+            mock.patch.object(upstream.Repository, "resolve", return_value=source),
+            mock.patch.object(source, "download") as download,
+            self.assertRaisesRegex(models.ModelError, "vision preprocessing"),
+        ):
+            upstream.prepare(args)
+        download.assert_not_called()
 
     def test_a_new_metadata_adapter_rebuilds_the_metadata_locally(self):
         target = self.root / "target"
