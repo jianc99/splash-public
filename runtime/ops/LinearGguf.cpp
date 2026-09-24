@@ -359,12 +359,12 @@ void Linear::addGgufRegister(metal::CommandGraph &graph, const LinearBuffers &b,
     std::vector<metal::MetalBuffer> bindings{b.scratch.input, b.scratch.sums};
     const GgufDecodeFusedParams params = fusedSegments(plan, order, bindings);
     bindings.insert(bindings.end(), {b.output, b.scratch.partials, b.scratch.counters});
-    graph.add("decode_linear_gguf_sg_fused" + suffix, std::move(bindings), params, grid, {kRegisterThreads, 1, 1});
+    graph.add("gguf_decode_sg_fused" + suffix, std::move(bindings), params, grid, {kRegisterThreads, 1, 1});
     return;
   }
   const auto tensor = [&](const QuantizedSegment &s, char epilogue, const metal::MetalBuffer &output,
                           const metal::MetalBuffer &aux) {
-    graph.add(std::string("decode_linear_gguf_sg_") + s.name() + suffix + "_" + epilogue,
+    graph.add(std::string("gguf_decode_sg_") + s.name() + suffix + "_" + epilogue,
               {b.scratch.input, b.scratch.sums, s.plane0, s.plane1Slot(), s.meta, output, b.scratch.partials,
                b.scratch.counters, aux},
               GgufDecodeParams{k, config.splits, n, s.columnOffset}, grid, {kRegisterThreads, 1, 1});

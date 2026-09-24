@@ -74,15 +74,15 @@ template <class F> struct CoefSource {
   typename F::Chunk chunk;
 };
 template <class F>
-inline CoefSource<F> coefficient_source(device uchar *w0, device uchar *w1, device uchar *meta, uint tile,
+inline CoefSource<F> coefficient_source(device uchar *w0, device uchar *w1, device uchar *meta, uint plane_tile,
                                         uint groups, uint column, uint u, uint j) {
   typedef Shape<F> S;
   const uint g = u * 2 * S::UnitSpans + j / S::CG;
   const uint units = groups / F::MetaGroups;
   CoefSource<F> src;
-  src.meta = F::loadMeta(meta + ((ulong(tile) * units + g / F::MetaGroups) * QUANT_TILE_ROWS + column) * F::MetaBytes);
+  src.meta = F::loadMeta(meta + ((ulong(plane_tile) * units + g / F::MetaGroups) * QUANT_TILE_ROWS + column) * F::MetaBytes);
   if constexpr (F::ScaleInPlane0) {
-    const ulong at = (ulong(tile) * groups + g) * QUANT_TILE_ROWS + column;
+    const ulong at = (ulong(plane_tile) * groups + g) * QUANT_TILE_ROWS + column;
     src.chunk = F::loadChunk(w0 + at * F::P0, w1 + at * F::P1, 0);
   }
   return src;
@@ -117,17 +117,17 @@ inline void decode(device const bfloat *table, device const float *sums, device 
   const uint u0 = tg.y * units / splits, u1 = (tg.y + 1) * units / splits;
   const sgmatrix::Lane l = sgmatrix::lane_map(lane);
   const uint fm = l.fm, fn = l.fn, c = fn / 2;
-  const uint base = tg.x * GGUF_TILE_COLUMNS + sg * GGUF_REGISTER_COLUMNS, tile = base / QUANT_TILE_ROWS,
-             col0 = base % QUANT_TILE_ROWS;
+  const uint base = tg.x * GGUF_TILE_COLUMNS + sg * GGUF_REGISTER_COLUMNS, plane_tile = base / QUANT_TILE_ROWS,
+             plane_row = base % QUANT_TILE_ROWS;
   threadgroup C *cu = coefs + sg * GGUF_REGISTER_COLUMNS * S::J;
 
   // Weight streams: lane c reads chunk c of each group; a span's two groups
-  // of one column are a tile of payloads apart.
+  // of one column are a plane tile of payloads apart.
   const uint first = u0 * S::UnitSpans;
   device uchar *p0[2], *p1[2];
 #pragma unroll
   for (uint nf = 0; nf < 2; ++nf) {
-    const ulong at = (ulong(tile) * groups + 2 * first) * QUANT_TILE_ROWS + col0 + nf * 8 + fm;
+    const ulong at = (ulong(plane_tile) * groups + 2 * first) * QUANT_TILE_ROWS + plane_row + nf * 8 + fm;
     p0[nf] = w0 + at * F::P0;
     p1[nf] = w1 + at * F::P1;
   }
@@ -159,7 +159,7 @@ inline void decode(device const bfloat *table, device const float *sums, device 
 #pragma unroll
     for (uint i = 0; i < I; ++i) {
       const uint e = lane + 32 * i;
-      if (e < 16 * S::J) src[i] = coefficient_source<F>(w0, w1, meta, tile, groups, col0 + (e & 15), u, e >> 4);
+      if (e < 16 * S::J) src[i] = coefficient_source<F>(w0, w1, meta, plane_tile, groups, plane_row + (e & 15), u, e >> 4);
     }
     simdgroup_barrier(mem_flags::mem_threadgroup);
 #pragma unroll
@@ -306,9 +306,9 @@ template <class F> inline void codebook_lut(threadgroup bfloat2 *lut, uint tid) 
                               lut, coefs, &arrival);                                                        \
   }
 #define GGUF_SG_EPILOGUES(F, f, L)                                                                            \
-  GGUF_SG_KERNEL(decode_linear_gguf_sg_##f##_l##L##_a, F, L, EpNone)                                        \
-  GGUF_SG_KERNEL(decode_linear_gguf_sg_##f##_l##L##_r, F, L, EpResidual)                                    \
-  GGUF_SG_KERNEL(decode_linear_gguf_sg_##f##_l##L##_g, F, L, EpUpWithGate)
+  GGUF_SG_KERNEL(gguf_decode_sg_##f##_l##L##_a, F, L, EpNone)                                        \
+  GGUF_SG_KERNEL(gguf_decode_sg_##f##_l##L##_r, F, L, EpResidual)                                    \
+  GGUF_SG_KERNEL(gguf_decode_sg_##f##_l##L##_g, F, L, EpUpWithGate)
 #define GGUF_SG_FORMAT(F, f) \
   GGUF_SG_EPILOGUES(F, f, 1) GGUF_SG_EPILOGUES(F, f, 2) GGUF_SG_EPILOGUES(F, f, 3) GGUF_SG_EPILOGUES(F, f, 4)
 QUANT_FORMATS(GGUF_SG_FORMAT)
@@ -344,7 +344,7 @@ inline void gguf_sg_fused(device const bfloat *table, device const float *sums, 
   });
 }
 #define GGUF_SG_FUSED(L)                                                                                          \
-  kernel void decode_linear_gguf_sg_fused_l##L(                                                                   \
+  kernel void gguf_decode_sg_fused_l##L(                                                                   \
       device const bfloat *table [[buffer(0)]], device const float *sums [[buffer(1)]],                          \
       GGUF_SG_SEGMENT(2, w0a, w1a, ma), GGUF_SG_SEGMENT(5, w0b, w1b, mb), GGUF_SG_SEGMENT(8, w0c, w1c, mc),       \
       device bfloat *out [[buffer(11)]], device coherent(device) float *partials [[buffer(12)]],                  \
@@ -404,6 +404,6 @@ inline void gguf_sg_expert(device const bfloat *table, device const float *sums,
     gguf_sg_expert<EP>(table, sums, tiles, tile_count, w0, w1, meta, sw0, sw1, smeta, out, aux, p, tg, tid, sg, lane, \
                        lut, coefs, &arrival);                                                                       \
   }
-GGUF_SG_EXPERT(moe_expert_gguf_sg, EpNone)
-GGUF_SG_EXPERT(moe_expert_gguf_sg_up, EpUpWithGate)
+GGUF_SG_EXPERT(moe_expert_gguf_sg_a, EpNone)
+GGUF_SG_EXPERT(moe_expert_gguf_sg_g, EpUpWithGate)
 #undef GGUF_SG_EXPERT

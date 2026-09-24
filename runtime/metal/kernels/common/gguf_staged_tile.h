@@ -19,7 +19,7 @@ constant constexpr uint kStagedStages = GGUF_TILE_COLUMNS / GGUF_STAGED_COLUMNS 
 // The destination of a Rows-row tile, zeroed by the caller: returning an initialized cooperative tensor loses its
 // initial values on Apple9 in runtime-format kernels (also with shader validation).
 template <ushort Rows, ushort Cols, ushort KS>
-inline auto gguf_make_acc(device bfloat *input, uint input_size, threadgroup half *stage) {
+inline auto staged_accumulator(device bfloat *input, uint input_size, threadgroup half *stage) {
   auto a = tensor(input, dextents<int, 2>{int(input_size), Rows}, array<int, 2>{1, int(input_size)});
   constexpr auto descriptor = matmul2d_descriptor(Rows, Cols, KS, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
   matmul2d<descriptor, execution_simdgroups<1>> operation;
@@ -45,17 +45,17 @@ template <class Acc, class Fn> inline void gguf_elements(thread Acc &acc, Fn fn)
 // The decode tile loop without the store: dequantize one KS-input step of the Cols columns into the stage, then run
 // the tile's matmul2d on it, over steps [step_begin, step_end) of K.
 template <class F, ushort Rows, ushort Cols, ushort KS, ushort Prefetch, class Acc>
-inline void sg_accum(device bfloat *input, device uchar *w0, device uchar *w1, device uchar *meta, uint input_size, uint output_origin,
+inline void staged_accumulate(device bfloat *input, device uchar *w0, device uchar *w1, device uchar *meta, uint input_size, uint output_origin,
                      threadgroup half *stage, threadgroup half2 *tl, uint simd_lane, uint step_begin, uint step_end, thread Acc &acc) {
   constexpr ushort GPS = KS / 32, Items = Cols * GPS, IPT = (Items + 31) / 32;
   auto a = tensor(input, dextents<int, 2>{int(input_size), Rows}, array<int, 2>{1, int(input_size)});
   constexpr auto descriptor = matmul2d_descriptor(Rows, Cols, KS, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
   matmul2d<descriptor, execution_simdgroups<1>> operation;
   const uint groups = input_size / 32, units = groups / F::MetaGroups;
-  const uint tile = output_origin / QUANT_TILE_ROWS, tile_offset = output_origin % QUANT_TILE_ROWS;
-  device uchar *tw0 = w0 + (ulong(tile) * groups * QUANT_TILE_ROWS + tile_offset) * F::P0;
-  device uchar *tw1 = w1 + (ulong(tile) * groups * QUANT_TILE_ROWS + tile_offset) * F::P1;
-  device uchar *tmeta = meta + (ulong(tile) * units * QUANT_TILE_ROWS + tile_offset) * F::MetaBytes;
+  const uint plane_tile = output_origin / QUANT_TILE_ROWS, plane_row = output_origin % QUANT_TILE_ROWS;
+  device uchar *tw0 = w0 + (ulong(plane_tile) * groups * QUANT_TILE_ROWS + plane_row) * F::P0;
+  device uchar *tw1 = w1 + (ulong(plane_tile) * groups * QUANT_TILE_ROWS + plane_row) * F::P1;
+  device uchar *tmeta = meta + (ulong(plane_tile) * units * QUANT_TILE_ROWS + plane_row) * F::MetaBytes;
   tensor<threadgroup half, dextents<int, 2>, tensor_inline> bt0(stage, dextents<int, 2>{KS, Cols}, array<int, 2>{1, KS});
   tensor<threadgroup half, dextents<int, 2>, tensor_inline> bt1(stage + KS * Cols, dextents<int, 2>{KS, Cols}, array<int, 2>{1, KS});
   auto b0 = bt0.slice<KS, Cols>(0, 0), b1 = bt1.slice<KS, Cols>(0, 0);
@@ -102,10 +102,10 @@ inline void sg_accum(device bfloat *input, device uchar *w0, device uchar *w1, d
 
 // runtime dequantizer selection (uniform per threadgroup)
 template <ushort Rows, ushort Cols, ushort KS, ushort Prefetch, class Acc>
-inline void gguf_accum_any(uint fmt, device bfloat *input, device uchar *w0, device uchar *w1, device uchar *meta, uint input_size, uint origin,
+inline void staged_accumulate_any(uint fmt, device bfloat *input, device uchar *w0, device uchar *w1, device uchar *meta, uint input_size, uint origin,
                            threadgroup half *stage, threadgroup half2 *tl, uint simd_lane, uint sb, uint se, thread Acc &acc) {
   quant_format_switch(fmt, [&](auto format) {
-    sg_accum<decltype(format), Rows, Cols, KS, Prefetch>(input, w0, w1, meta, input_size, origin, stage, tl,
+    staged_accumulate<decltype(format), Rows, Cols, KS, Prefetch>(input, w0, w1, meta, input_size, origin, stage, tl,
                                                                      simd_lane, sb, se, acc);
   });
 }

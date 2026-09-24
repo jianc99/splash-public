@@ -6,7 +6,10 @@
 // Apple9 register tile of kernels/decode/linear_gguf_sgmatrix.metal.
 #include "metal/abi/QuantFormat.h"
 
-// Every tile covers GGUF_TILE_COLUMNS output columns (grid.x counts tiles).
+// Vocabulary: a group is 32 inputs (the image's quantization unit), a span 64
+// (Table16's); a plane tile is QUANT_TILE_ROWS rows of the weight image, a
+// column tile the GGUF_TILE_COLUMNS output columns of one threadgroup (grid.x
+// counts column tiles), and an expert tile the grouped rows of one MoE expert.
 #define GGUF_TILE_COLUMNS 64u
 // Decode tile of the staged kernels, which also runs prefill chunks of up to
 // 32 rows: two simdgroups, each staging its own GGUF_STAGED_COLUMNS columns

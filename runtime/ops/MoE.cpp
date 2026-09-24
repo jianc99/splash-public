@@ -221,7 +221,7 @@ void addGgufExperts(metal::CommandGraph &graph, const MoeScratch &scratch,
                      projection.shared.plane1Slot(), projection.shared.meta, output,
                      scratch.expertOutput});
     const std::string kernel = table16 ? "moe_expert_gguf_sg" : "moe_expert_gguf_m" + std::to_string(plan.tileRows());
-    graph.add(kernel + (up ? "_up" : ""), std::move(bindings),
+    graph.add(kernel + (up ? "_g" : "_a"), std::move(bindings),
               MoeGgufExpertParams{k, n, shape.experts, projection.routed.formatId,
                                   projection.shared.formatId},
               {n / 64, tiles, 1}, {table16 ? 128u : 64u, 1, 1});

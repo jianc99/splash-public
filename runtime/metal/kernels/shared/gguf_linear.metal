@@ -9,7 +9,7 @@
 #include "metal/kernels/common/gguf_staged_tile.h"
 #include "metal/kernels/common/split_reduce.h"
 
-// ---------------- decode tiles: each simdgroup stages its own Cols x KS sub-tile privately and runs matmul2d alone.
+// ---------------- decode tiles: each simdgroup stages its own columns privately and runs matmul2d alone.
 // MPP computes 16-row fragments, so a tile holds 8, 16 or 32 rows: a 3-lane step runs the 32-row tile over the storage
 // of four lanes (LinearPlan::storageRows) and the padding lane's rows are computed and discarded. Rows are independent,
 // so every active row is the bits of any other tile height (gguf-projection full); on a 16-core M5 Pro the 32-row tile
@@ -34,12 +34,12 @@ inline void gguf_store_sums(thread Acc &acc, uint splits, uint split, device coh
   split_release(counter, thread_index);
 }
 
-// ---------------- pf: prefill with a shared B stage (TileN x KS, all threads dequantize), each simdgroup owns RowsPerSG
+// ---------------- prefill tiles: a shared B stage (TileN x KS, all threads dequantize), each simdgroup owns RowsPerSG
 // rows. `rows` counts the chunk's rows from the tile's first: simdgroups past them (the last tile of a chunk that is not
 // a multiple of the tile) still stage but skip their matmuls and stores, so a chunk costs its rows rounded up to
 // RowsPerSG rather than to the tile (a 33-row Q4_K 17408 x 5120 chunk: 1.7x faster on M5 and M3 than a 128-row tile).
 template <class F, ushort RowsPerSG, ushort Simdgroups, ushort TileN, ushort KS, ushort Prefetch, GgufEpilogue Ep = EpNone>
-inline void pf_tile(device bfloat *input, device uchar *w0, device uchar *w1, device uchar *meta, device bfloat *output,
+inline void gguf_prefill_tile(device bfloat *input, device uchar *w0, device uchar *w1, device uchar *meta, device bfloat *output,
                     uint output_size, uint input_size, uint output_origin, uint rows, threadgroup half *stage,
                     threadgroup half2 *tl, uint simd_lane, uint simd_group, uint out_stride = 0, uint out_offset = 0,
                     device bfloat *aux = nullptr) {
@@ -50,10 +50,10 @@ inline void pf_tile(device bfloat *input, device uchar *w0, device uchar *w1, de
   constexpr auto descriptor = matmul2d_descriptor(RowsPerSG, TileN, KS, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
   matmul2d<descriptor, execution_simdgroups<1>> operation;
   const uint groups = input_size / 32, steps = groups / GPS, units = groups / F::MetaGroups;
-  const uint tile = output_origin / QUANT_TILE_ROWS, tile_offset = output_origin % QUANT_TILE_ROWS;
-  device uchar *tw0 = w0 + (ulong(tile) * groups * QUANT_TILE_ROWS + tile_offset) * F::P0;
-  device uchar *tw1 = w1 + (ulong(tile) * groups * QUANT_TILE_ROWS + tile_offset) * F::P1;
-  device uchar *tmeta = meta + (ulong(tile) * units * QUANT_TILE_ROWS + tile_offset) * F::MetaBytes;
+  const uint plane_tile = output_origin / QUANT_TILE_ROWS, plane_row = output_origin % QUANT_TILE_ROWS;
+  device uchar *tw0 = w0 + (ulong(plane_tile) * groups * QUANT_TILE_ROWS + plane_row) * F::P0;
+  device uchar *tw1 = w1 + (ulong(plane_tile) * groups * QUANT_TILE_ROWS + plane_row) * F::P1;
+  device uchar *tmeta = meta + (ulong(plane_tile) * units * QUANT_TILE_ROWS + plane_row) * F::MetaBytes;
   auto a0 = a.template slice<KS, RowsPerSG>(0, 0);
   tensor<threadgroup half, dextents<int, 2>, tensor_inline> bt0(stage, dextents<int, 2>{KS, TileN}, array<int, 2>{1, KS});
   tensor<threadgroup half, dextents<int, 2>, tensor_inline> bt1(stage + KS * TileN, dextents<int, 2>{KS, TileN}, array<int, 2>{1, KS});
@@ -131,9 +131,9 @@ inline void gguf_decode_tile(device bfloat *input, device uchar *w0, device ucha
   const uint per = p.input_size / GGUF_STAGED_STEP / p.splits,
              origin = group.x * GGUF_TILE_COLUMNS + simd_group * GGUF_STAGED_COLUMNS, column0 = p.out_offset + origin;
   threadgroup half *my = stage + simd_group * kStagedSimdgroupStage;
-  auto acc = gguf_make_acc<Rows, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP>(input, p.input_size, my);
+  auto acc = staged_accumulator<Rows, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP>(input, p.input_size, my);
   gguf_zero(acc);
-  sg_accum<F, Rows, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP, 1>(input, w0, w1, meta, p.input_size, origin, my, tl, simd_lane, group.y * per,
+  staged_accumulate<F, Rows, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP, 1>(input, w0, w1, meta, p.input_size, origin, my, tl, simd_lane, group.y * per,
                                           (group.y + 1) * per, acc);
   gguf_store_sums<Rows>(acc, p.splits, group.y, partials, counters + p.out_offset / GGUF_TILE_COLUMNS + group.x, p.out_stride, column0,
                         simd_group * 32 + simd_lane, arrival, [&](uint row, uint column, float v) {
@@ -197,9 +197,9 @@ QUANT_FORMATS(GGUF_DECODE_FORMAT)
     const uint local = group.x - (s == 0 ? 0 : s == 1 ? t0 : t1), per = p.input_size / GGUF_STAGED_STEP / p.splits; \
     const uint origin = local * GGUF_TILE_COLUMNS + simd_group * GGUF_STAGED_COLUMNS, column0 = p.offset[s] + origin; \
     threadgroup half *my = stage + simd_group * kStagedSimdgroupStage;                                            \
-    auto acc = gguf_make_acc<R, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP>(input, p.input_size, my);                                         \
+    auto acc = staged_accumulator<R, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP>(input, p.input_size, my);                                         \
     gguf_zero(acc);                                                                                               \
-    gguf_accum_any<R, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP, 1>(p.fmt[s], input, w0, w1, meta, p.input_size, origin, my, tl, simd_lane, \
+    staged_accumulate_any<R, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP, 1>(p.fmt[s], input, w0, w1, meta, p.input_size, origin, my, tl, simd_lane, \
                                             group.y * per, (group.y + 1) * per, acc);                            \
     gguf_store_sums<R>(acc, p.splits, group.y, partials, counters + p.offset[s] / GGUF_TILE_COLUMNS + local,       \
                        p.out_stride, column0, simd_group * 32 + simd_lane, &arrival,                              \
@@ -226,7 +226,7 @@ GGUF_DECODE_FUSED(8) GGUF_DECODE_FUSED(16) GGUF_DECODE_FUSED(32)
                                    GGUF_PREFILL_THREAD) {                                                          \
     GGUF_PREFILL_TABLES(F);                                                                                        \
     const uint first = group.x * GGUF_PREFILL_ROWS, rows = p.rows > first ? p.rows - first : 0;                    \
-    pf_tile<F, GGUF_PREFILL_SIMDGROUP_ROWS, GGUF_PREFILL_SIMDGROUPS, GGUF_TILE_COLUMNS, GGUF_PREFILL_STEP, 1>(input + ulong(first) * p.input_size, w0, w1, meta,                        \
+    gguf_prefill_tile<F, GGUF_PREFILL_SIMDGROUP_ROWS, GGUF_PREFILL_SIMDGROUPS, GGUF_TILE_COLUMNS, GGUF_PREFILL_STEP, 1>(input + ulong(first) * p.input_size, w0, w1, meta,                        \
                                          output + ulong(first) * (p.out_stride ? p.out_stride : p.output_size),   \
                                          p.output_size, p.input_size, group.y * GGUF_TILE_COLUMNS, rows, stage, tl, \
                                          simd_lane, simd_group, p.out_stride, p.out_offset);                      \
@@ -237,7 +237,7 @@ GGUF_DECODE_FUSED(8) GGUF_DECODE_FUSED(16) GGUF_DECODE_FUSED(32)
     GGUF_PREFILL_TABLES(F);                                                                                        \
     const uint rs = p.out_stride ? p.out_stride : p.output_size;                                                   \
     const uint first = group.x * GGUF_PREFILL_ROWS, rows = p.rows > first ? p.rows - first : 0;                    \
-    pf_tile<F, GGUF_PREFILL_SIMDGROUP_ROWS, GGUF_PREFILL_SIMDGROUPS, GGUF_TILE_COLUMNS, GGUF_PREFILL_STEP, 1, Ep>(input + ulong(first) * p.input_size, w0, w1, meta,                    \
+    gguf_prefill_tile<F, GGUF_PREFILL_SIMDGROUP_ROWS, GGUF_PREFILL_SIMDGROUPS, GGUF_TILE_COLUMNS, GGUF_PREFILL_STEP, 1, Ep>(input + ulong(first) * p.input_size, w0, w1, meta,                    \
                                              output + ulong(first) * rs, p.output_size, p.input_size,              \
                                              group.y * GGUF_TILE_COLUMNS, rows, stage, tl, simd_lane, simd_group,  \
                                              p.out_stride, p.out_offset, aux + ulong(first) * rs);                 \

@@ -30,9 +30,9 @@ inline void moe_gguf_expert_tile(device bfloat *input, device const MoeTileDescr
   quant_iq4_pair_table(tl, simd_group * 32 + simd_lane, GGUF_STAGED_THREADS);
   const auto run = [&](auto rows) {
     constexpr ushort R = decltype(rows)::value;
-    auto acc = gguf_make_acc<R, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP>(x, p.input_size, my);
+    auto acc = staged_accumulator<R, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP>(x, p.input_size, my);
     gguf_zero(acc);
-    gguf_accum_any<R, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP, 1>(s.format, x, s.w0, s.w1, s.meta, p.input_size, origin, my, tl, simd_lane, 0,
+    staged_accumulate_any<R, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP, 1>(s.format, x, s.w0, s.w1, s.meta, p.input_size, origin, my, tl, simd_lane, 0,
                                             p.input_size / GGUF_STAGED_STEP, acc);
     gguf_elements(acc, [&](uint row, uint column, float v) {
       const ulong o = out + ulong(row) * p.output_size + origin + column;   // gguf_epilogue inline, as above
@@ -59,7 +59,7 @@ kernel void moe_expert_gguf(device bfloat *input [[buffer(0)]], device const Moe
 using MoeExpertGgufKernel = void(device bfloat *, device const MoeTileDescriptor *, device const uint *, device uchar *,
                                  device uchar *, device uchar *, device uchar *, device uchar *, device uchar *,
                                  device bfloat *, device bfloat *, constant MoeGgufExpertParams &, uint2, uint, uint);
-template [[host_name("moe_expert_gguf_m8")]] kernel MoeExpertGgufKernel moe_expert_gguf<8, EpNone>;
-template [[host_name("moe_expert_gguf_m8_up")]] kernel MoeExpertGgufKernel moe_expert_gguf<8, EpUpWithGate>;
-template [[host_name("moe_expert_gguf_m32")]] kernel MoeExpertGgufKernel moe_expert_gguf<32, EpNone>;
-template [[host_name("moe_expert_gguf_m32_up")]] kernel MoeExpertGgufKernel moe_expert_gguf<32, EpUpWithGate>;
+template [[host_name("moe_expert_gguf_m8_a")]] kernel MoeExpertGgufKernel moe_expert_gguf<8, EpNone>;
+template [[host_name("moe_expert_gguf_m8_g")]] kernel MoeExpertGgufKernel moe_expert_gguf<8, EpUpWithGate>;
+template [[host_name("moe_expert_gguf_m32_a")]] kernel MoeExpertGgufKernel moe_expert_gguf<32, EpNone>;
+template [[host_name("moe_expert_gguf_m32_g")]] kernel MoeExpertGgufKernel moe_expert_gguf<32, EpUpWithGate>;
