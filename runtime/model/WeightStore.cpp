@@ -305,12 +305,10 @@ ops::QuantizedSegment readQuantizedSegment(WeightFile &file, std::string_view la
     if (format == GGUF_FMT_COUNT)
         throw WeightStoreError("unsupported GGUF tensor type " + std::to_string(d.type));
     const QuantFormat &layout = kQuantFormats[format];
-    const uint64_t groups = uint64_t{d.inputSize} / 32;
+    const GgufPlaneBytes planes = ggufPlaneBytes(layout, d.outputSize, d.inputSize);
     if (d.p0 != layout.plane0_bytes || d.p1 != layout.plane1_bytes ||
         d.metaBytes != layout.meta_bytes || d.metaGroups != layout.meta_groups ||
-        d.plane0Bytes != uint64_t{d.outputSize} * groups * layout.plane0_bytes ||
-        d.plane1Bytes != uint64_t{d.outputSize} * groups * layout.plane1_bytes ||
-        d.metaTotalBytes != uint64_t{d.outputSize} * (groups / layout.meta_groups) * layout.meta_bytes)
+        d.plane0Bytes != planes.plane0 || d.plane1Bytes != planes.plane1 || d.metaTotalBytes != planes.meta)
         throw WeightStoreError("GGUF section sizes are inconsistent: " + std::string(label));
     metal::MetalBuffer plane0 = file.section(d.plane0Bytes, std::string(label) + "-plane0");
     metal::MetalBuffer plane1 =
@@ -334,9 +332,8 @@ ops::EmbeddingWeights readGgufEmbedding(WeightFile &file, uint32_t outputSize, u
     if (d.outputSize != outputSize || d.inputSize != inputSize)
         throw WeightStoreError("GGUF embedding does not match the layout: " + std::string(label));
     const uint32_t format = gguf_format_of(d.type);
-    if (format == GGUF_FMT_COUNT || d.inputSize % 256 ||
-        d.plane0Bytes != uint64_t{d.outputSize} * (d.inputSize / kQuantFormats[format].block_elements) *
-                             kQuantFormats[format].block_bytes)
+    if (format == GGUF_FMT_COUNT || d.inputSize % kGgufBlockColumns ||
+        d.plane0Bytes != d.outputSize * ggufRowBytes(kQuantFormats[format], d.inputSize))
         throw WeightStoreError("GGUF embedding rows are not native GGUF blocks: " + std::string(label));
     return {outputSize, inputSize,
             ops::NativeRows(file.section(d.plane0Bytes, std::string(label) + "-native"), format)};
