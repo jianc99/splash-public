@@ -5,10 +5,10 @@
 #include "model/QwenState.hpp"
 #include "ops/PageStorage.hpp"
 #include "ops/Vision.hpp"
+#include "tuning/LinearNumerics.hpp"
 
 #include <algorithm>
 #include <array>
-#include <bit>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -74,10 +74,6 @@ private:
   double maximumAbsolute_ = 0.0;
 };
 
-float bfloatToFloat(uint16_t value) {
-  return std::bit_cast<float>(uint32_t{value} << 16);
-}
-
 const uint16_t *bfloatContents(const metal::MetalBuffer &buffer,
                                const std::string &label) {
   if (!buffer.contents() || buffer.sizeBytes() % sizeof(uint16_t)) {
@@ -97,7 +93,7 @@ Similarity compareBfloat(const metal::MetalBuffer &left,
   const uint16_t *b = bfloatContents(right, "right BF16 buffer");
   SimilarityAccumulator accumulator;
   for (uint64_t index = 0; index < elements; index += stride) {
-    accumulator.add(bfloatToFloat(a[index]), bfloatToFloat(b[index]));
+    accumulator.add(ops::tuning::bf16ToFloat(a[index]), ops::tuning::bf16ToFloat(b[index]));
   }
   return accumulator.result();
 }
@@ -319,7 +315,7 @@ StateSamples sampleCommittedState(const model::QwenStateStorage &states,
     const uint64_t count = buffer.sizeBytes() / (bfloat ? 2 : 4);
     const uint64_t stride = std::max<uint64_t>(1, count / 65536);
     for (uint64_t index = 0; index < count; index += stride) {
-      values.push_back(bfloat ? bfloatToFloat(static_cast<const uint16_t *>(
+      values.push_back(bfloat ? ops::tuning::bf16ToFloat(static_cast<const uint16_t *>(
                                                  buffer.contents())[index])
                              : static_cast<const float *>(buffer.contents())[index]);
     }
@@ -345,9 +341,9 @@ StateSamples sampleCommittedState(const model::QwenStateStorage &states,
       const uint32_t position = (index / layout.headDimension) % lengths.draftLength;
       const uint32_t head = index / (uint64_t{layout.headDimension} * lengths.draftLength);
       const uint32_t ring = (lengths.draftBase + position) % layout.tokens;
-      keySamples.push_back(bfloatToFloat(
+      keySamples.push_back(ops::tuning::bf16ToFloat(
           keys[(uint64_t{head} * layout.tokens + ring) * layout.headDimension + dimension]));
-      valueSamples.push_back(bfloatToFloat(
+      valueSamples.push_back(ops::tuning::bf16ToFloat(
           values[(uint64_t{head} * layout.headDimension + dimension) * layout.tokens + ring]));
     }
     result.emplace_back("draft_key_" + std::to_string(layer), std::move(keySamples));

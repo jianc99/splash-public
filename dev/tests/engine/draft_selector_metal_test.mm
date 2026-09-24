@@ -7,6 +7,7 @@
 // than a single register chunk per thread.
 #include "metal/MetalBackend.hpp"
 #include "ops/Sampling.hpp"
+#include "tuning/LinearNumerics.hpp"
 
 #import <Foundation/Foundation.h>
 
@@ -48,20 +49,6 @@ template <class Function> void rejects(Function function) {
   throw std::runtime_error("invalid draft selector request was accepted");
 }
 
-uint16_t toBfloat(float value) {
-  uint32_t bits;
-  std::memcpy(&bits, &value, sizeof(bits));
-  bits += 0x7FFFU + ((bits >> 16) & 1U);
-  return static_cast<uint16_t>(bits >> 16);
-}
-
-float fromBfloat(uint16_t value) {
-  const uint32_t bits = uint32_t{value} << 16;
-  float result;
-  std::memcpy(&result, &bits, sizeof(result));
-  return result;
-}
-
 class Random final {
 public:
   explicit Random(uint64_t seed) : state_(seed) {}
@@ -89,7 +76,7 @@ MetalBuffer randomBfloat(MetalBackend &backend, uint64_t count, Random &random,
   MetalBuffer buffer = allocate(backend, count * sizeof(uint16_t));
   auto *values = static_cast<uint16_t *>(buffer.contents());
   for (uint64_t index = 0; index < count; ++index)
-    values[index] = toBfloat(random.unit() * scale);
+    values[index] = tuning::floatToBf16(random.unit() * scale);
   return buffer;
 }
 
@@ -118,15 +105,15 @@ void fillRow(uint16_t *row, uint32_t vocabulary, Pattern pattern,
       value = -INFINITY;
       break;
     }
-    row[token] = toBfloat(value);
+    row[token] = tuning::floatToBf16(value);
   }
   if (pattern == Pattern::Peaked) {
     for (uint32_t spike = 0; spike < 40; ++spike)
-      row[random.next() % vocabulary] = toBfloat(4.0F + 6.0F * random.unit());
+      row[random.next() % vocabulary] = tuning::floatToBf16(4.0F + 6.0F * random.unit());
   }
   if (pattern == Pattern::Sparse) {
     for (uint32_t finite = 0; finite < 10; ++finite)
-      row[random.next() % vocabulary] = toBfloat(random.unit());
+      row[random.next() % vocabulary] = tuning::floatToBf16(random.unit());
   }
 }
 
@@ -135,7 +122,7 @@ std::vector<uint32_t> referenceTop16(const uint16_t *row, uint32_t vocabulary) {
   std::vector<uint32_t> order(vocabulary);
   std::iota(order.begin(), order.end(), 0U);
   const auto beats = [&](uint32_t a, uint32_t b) {
-    const float va = fromBfloat(row[a]), vb = fromBfloat(row[b]);
+    const float va = tuning::bf16ToFloat(row[a]), vb = tuning::bf16ToFloat(row[b]);
     return va > vb || (va == vb && a < b);
   };
   const size_t keep = std::min<size_t>(kCandidates, vocabulary);
@@ -220,7 +207,7 @@ void runCase(MetalBackend &backend, const Case &c) {
           require(id == expected[rank] && value == row[expected[rank]],
                   "draft top-16 candidates differ from the exact sorted order");
         } else {
-          require(id == 0xFFFFFFFFU && value == toBfloat(-INFINITY),
+          require(id == 0xFFFFFFFFU && value == tuning::floatToBf16(-INFINITY),
                   "draft top-16 padding lost the empty sentinel");
         }
       }
@@ -232,11 +219,11 @@ void runCase(MetalBackend &backend, const Case &c) {
             std::min(candidates[global * kCandidates + rank], c.vocabulary - 1);
         double edge = 0.0;
         for (uint32_t dim = 0; dim < kRank; ++dim) {
-          edge += double(fromBfloat(predecessors[uint64_t{predecessor} * kRank + dim])) *
-                  fromBfloat(hidden[(uint64_t{lane} * kRows + position + 1) * kRank + dim]) *
-                  fromBfloat(successors[uint64_t{candidate} * kRank + dim]);
+          edge += double(tuning::bf16ToFloat(predecessors[uint64_t{predecessor} * kRank + dim])) *
+                  tuning::bf16ToFloat(hidden[(uint64_t{lane} * kRows + position + 1) * kRank + dim]) *
+                  tuning::bf16ToFloat(successors[uint64_t{candidate} * kRank + dim]);
         }
-        scores[rank] = double(fromBfloat(unary[global * kCandidates + rank])) + edge;
+        scores[rank] = double(tuning::bf16ToFloat(unary[global * kCandidates + rank])) + edge;
       }
       const uint32_t token = tokens[global];
       uint32_t selected = kCandidates;
@@ -374,7 +361,7 @@ void targetTop1(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes) {
   for (uint32_t row = 0; row < rows; ++row)
     for (uint32_t token = 0; token < vocabulary; ++token)
       logits[uint64_t{row} * vocabulary + token] =
-          toBfloat(float(int((token * 7 + row * 13) % 23) - 11));
+          tuning::floatToBf16(float(int((token * 7 + row * 13) % 23) - 11));
   for (uint32_t row = 0; row < lanes * (kRows + 1); ++row)
     for (uint32_t token = 0; token < vocabulary; ++token)
       if ((token + row) % 17 == 0)
@@ -385,7 +372,7 @@ void targetTop1(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes) {
     for (uint32_t token = 0; token < vocabulary; ++token) {
       if (!(masks[uint64_t{maskRow} * words + token / 32] & (1U << (token % 32))))
         continue;
-      const float value = fromBfloat(logits[uint64_t{row} * vocabulary + token]);
+      const float value = tuning::bf16ToFloat(logits[uint64_t{row} * vocabulary + token]);
       if (value > best) { best = value; id = token; }
     }
     return id;
