@@ -19,15 +19,13 @@ make -j4
 repository such as `mlx-community/Qwen3.8-27B-4bit`, or a GGUF repository and
 variant, `OWNER/REPO:VARIANT`, such as `unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M`.
 Splash identifies the model from its own metadata and pairs the DFlash2 draft
-trained for it ([Upstream model loading](#upstream-model-loading)). The first
-serve sets up Python dependencies, downloads the model and its draft, and
-prepares the weights once, which takes about the model's size again on disk
-([Model cache](#model-cache)). Each start checks the Hub for a newer revision
-and follows it; without a network, the installed model starts as is. Existing
-Splash packages such as `incoai/Qwen3.8-27B-Splash` remain loadable
-([Splash packages](#splash-packages)). Public repositories need no login;
-private or gated ones need `HF_TOKEN` or `hf auth login`. Ctrl+C stops serving;
-stop before upgrading.
+trained for it. The first serve sets up Python dependencies, downloads the
+model and its draft, and prepares the weights once
+([Weight preparation](#weight-preparation)); each start follows the model's
+revision ([Revisions](#revisions)). Legacy Splash packages remain loadable
+([Legacy Splash packages](#legacy-splash-packages)). Public repositories need
+no login; private or gated ones need `HF_TOKEN` or `hf auth login`. Ctrl+C
+stops serving; stop before upgrading.
 
 Use `--max-context 100K` or `--max-memory 28G` to set optional limits. Memory
 limits cap Metal allocations, not combined process RSS. Agents must already be
@@ -108,7 +106,64 @@ splash serve --model mlx-community/Qwen3.8-27B-4bit --default-reasoning-effort n
 `/apply-template` uses the same default. Anthropic `thinking` keeps its protocol
 semantics (off when omitted); judgment endpoints always disable thinking.
 
-## Model cache
+## Upstream model loading
+
+`install/upstream.py` installs a model from its upstream repository. It
+resolves the target and the draft paired with it, then atomically publishes a
+local assembly of links to their Hub snapshots. The assembly's `model.json`
+records the resolved sources and selected formats; the native loader reads it,
+and the launcher holds it while serving. It is local installation metadata,
+not a file model publishers supply.
+
+A target is identified by its own metadata: an MLX config's `text_config`, or
+the one `gguf.model_config` derives from the selected GGUF's header, read with a
+few HTTP range requests before any weight download. The registry (`FAMILIES`)
+states each supported architecture's signature and the draft trained for it;
+repository names and model-card `base_model` fields play no part. An MLX
+target must declare affine 4-bit, group-64 `quantization` in `config.json`.
+Native source adapters validate model geometry, quantization, tensor shapes and
+draft compatibility again before execution. Remote Python code is not loaded.
+
+```bash
+splash serve --model mlx-community/Qwen3.6-35B-A3B-4bit
+splash serve --model unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M
+splash serve --model mlx-community/Qwen3.8-27B-4bit --language-only
+```
+
+A model ID with `--revision`, `--language-only` or `--draft-model` is a
+separate installation from the same ID without them.
+
+### Revisions
+
+Installation resolves each source's revision to a commit once, downloads by
+that commit and records it in `model.json`, so a repository update cannot mix
+files from different revisions. It pins those snapshots in the Hub cache
+(`refs/splash/<installation>/<commit>`), so pruning the cache cannot remove files
+an installed model links.
+
+Every start resolves the target's revision (the default branch, or
+`--revision`) with one Hub request of at most 5 seconds (`HUB_TIMEOUT`):
+
+- The installed commit: the assembly's links, sizes and times are checked and
+  it starts. It is re-assembled first when this release pins another draft for
+  the family or changed the GGUF metadata adapter; if that draft cannot be
+  fetched, the installed one is kept.
+- A new commit: only changed files are downloaded, and the new assembly
+  replaces the installed one atomically once published.
+- No answer, or a new commit that cannot be installed: the installed model
+  starts, with a one-line message naming the reason.
+- A 40-hex `--revision` never moves and `HF_HUB_OFFLINE=1` forbids the Hub:
+  both start a verified installation without a request.
+
+There is no update flag; to stay on one commit, pass it as `--revision`. A
+missing assembly, or one that no longer verifies, is built again. Without the
+Hub it is built from a cached snapshot, of the commit the `--revision` names,
+or else the one the installation recorded or pinned, or one the Hub cache
+records for the branch, never of another revision. Only files downloaded before
+are available, which is enough to rebuild a damaged or deleted assembly. The
+installer never rewrites upstream files.
+
+### Model cache
 
 To download new models to another disk, set the cache location before serving:
 
@@ -119,120 +174,20 @@ HF_HUB_CACHE=/Volumes/Models/huggingface splash serve --model mlx-community/Qwen
 `HF_HUB_CACHE` selects the Hugging Face download cache. Alternatively, set
 `HF_HOME` to relocate the Hugging Face home directory, including its default
 `hub` cache. Model links and agent sessions stay in Splash's data directory;
-existing downloads are not moved. Prepared weights have their own cache
-([Local weight preparation](#local-weight-preparation)), so moving downloads
-does not move them.
-
-## Splash packages
-
-Splash packages are the prebuilt format that predates upstream loading. They
-contain `manifest.json`, packed `target/`, `draft/`, `vision/` weights and
-`tokenizer/`. The manifest lists artifact paths, sizes and SHA-256 hashes.
-Dense packages use schema 3 / `splash-packed-q4`; MoE uses schema 4 /
-`splash-packed-q4-moe`.
-
-These formats encode Qwen3.8-27B and Qwen3.6-35B-A3B layouts. Compatible community
-fine-tunes may use any nonempty manifest model name. Native loading validates
-geometry, tensor sizes, binary headers, tokenizer and target/draft compatibility.
-New architectures require engine support.
-
-### Upstream model loading
-
-`install/upstream.py` resolves the target repository and the draft paired with
-it, then atomically publishes a local assembly of links to their Hub
-snapshots. `model.json` describes those resolved sources and selected formats;
-it is local installation metadata, not a file model publishers must supply.
-A target is identified by its own metadata: an MLX config's `text_config`, or
-the one `gguf.model_config` derives from the selected GGUF's header, read with a
-few HTTP range requests before any weight download. The registry (`FAMILIES`)
-states each supported architecture's signature and the draft trained for it;
-repository names and model-card `base_model` fields play no part. The same
-header rejects a GGUF whose tensor types the native loader cannot read
-(`gguf.LOADABLE_TYPES`, checked against `metal/abi/QuantFormat.h`) before it is
-downloaded. Native source adapters validate model geometry, quantization, tensor
-shapes and draft compatibility again before execution.
-
-Examples:
-
-```bash
-splash serve --model mlx-community/Qwen3.6-35B-A3B-4bit
-splash serve --model unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M
-splash serve --model mlx-community/Qwen3.8-27B-4bit --language-only
-```
-
-Installation resolves each source's revision once to a commit, downloads by
-that commit and records it in `model.json`, so a repository update cannot mix
-files from different revisions. It pins those snapshots in the Hub cache
-(`refs/splash/<installation>/<commit>`), so pruning the cache cannot remove files
-an installed model links. Every start resolves the target's revision (the
-default branch, or `--revision`) with one Hub request of at most 5 seconds; if it
-is the installed commit, `prepare` checks the assembly's links, sizes and times
-and returns. A new commit is followed: only changed files are downloaded, and
-its assembly replaces the installed one atomically once published. When the Hub
-cannot answer, or the new commit cannot be installed, the installed assembly
-that verifies starts instead, with a message naming the reason. A commit
-`--revision` never moves and `HF_HUB_OFFLINE=1` forbids the Hub, so both start a
-verified installation without a request. An assembly that no longer verifies is
-rebuilt; without the Hub it is rebuilt from a cached snapshot, of the commit the
-`--revision` names, or else the one the installation recorded or pinned, or one
-the Hub cache records for the branch, never of another revision. Only files
-downloaded before are available, which is enough to rebuild a damaged or
-deleted assembly or to add a selection of a cached commit. When a release pins
-another draft for a family, the next start downloads it and re-assembles the
-installed target commit; if the draft cannot be fetched, the installed one is
-kept.
-The installer never rewrites upstream files. Older manifest-based packages use
-the legacy installer.
-
-MLX configuration, tokenizer, chat template and processor come from the same
-resolved target snapshot. For GGUF, `install/gguf.py` reads the selected file's
-metadata without mapping or decoding weight tensors. Vocabulary IDs, BPE merge
-ranks, control/user-defined token types, BOS/EOS/padding IDs and template text
-come from that file. The supported `gpt2/qwen35` profile supplies the NFC and
-byte-level pre-tokenization algorithms. Unknown profiles and malformed metadata
-are rejected, with no cross-repository fallback. GGUF sidecar tokenizer/config
-files do not override embedded metadata.
-
-Model geometry is translated from GGUF metadata, subtracting any declared MTP
-layers from the transformer layer count. Vision configuration and preprocessing
-come from the same snapshot's mmproj. Native loaders independently validate the
-model geometry and all tensor shapes. Derived metadata is cached under
-`models/.metadata`, keyed by source identity, adapter code and tokenizer-library
-version; publication is atomic and cache contents are hash-checked. Only the
-header is read before the download; the tokenizer and configuration are derived
-from the downloaded file.
-Remote Python code is not loaded. Vision uses MLX's `vision_tower.*` tensors,
-linking only `config.json` and the shards holding them, or the same GGUF
-repository's `mmproj` projector, chosen by its header: a `clip` projector with BF16
-or F32 weights, BF16 preferred. F16 has a narrower exponent than BF16, so an F16
-projector has already rounded small weights. Both source adapters prepare the packed `vision/model.bin` layout, which the one BF16 vision
-operator reads: BF16 tensors are copied, and F32 or F16 tensors are converted only
-when every value is exactly a BF16. Otherwise preparation fails, naming the tensor
-and file. Unsloth's mmproj stores its 1-D tensors, patch embedding and position
-table as F32, all of them BF16-exact, and prepares byte-identical to the packed
-file. Quantized MLX towers, deepstack projectors and mmproj tensors the tower does
-not use are rejected. `--language-only` removes vision weights from startup and
-memory accounting. The native Ready event announces vision only when the model
-loaded it. Without it, image and PDF input fails with a 400 naming the modality.
-Every API shape converts its media to image and file parts, and message
-normalization, the one place that accepts or rejects them, checks before any
-image is decoded or PDF rendered, in user turns, tool results and stored
-Responses history alike. `/status` and `/v1/models` report `vision: false` and
-`input_modalities: ["text"]`, and the launchers configure OpenCode and Hermes
-without attachments.
+existing downloads are not moved. Prepared weights have their own cache,
+which this does not move ([Weight preparation](#weight-preparation)).
 
 ### Draft assets
 
-Splash's DFlash2 drafts share one Hub repository, `upstream.DRAFTS`
-(`incoai-internal/Splash-DFlash2`), with a folder per base model named after it:
-`Qwen3.8-27B/` and `Qwen3.6-35B-A3B/`. Each folder holds `config.json`,
-`model.bin` and `layer-N.bin`. The configuration is the original DFlash2
-configuration with `splash.format = "MDFD0004"` and `splash.source`, the DFlash2
-checkpoint the weights came from; native loading validates it against the
-target. These are the existing verified Q4 draft weights, not a new
-quantization of the draft at startup. Each family pins the commit that published
-its folder (`Draft.revision` in `FAMILIES`), and installation downloads only that
-folder.
+Splash's DFlash2 drafts share one Hub repository, `upstream.DRAFTS`, with a
+folder per base model named after it: `Qwen3.8-27B/` and `Qwen3.6-35B-A3B/`.
+Each folder holds `config.json`, `model.bin` and `layer-N.bin`. The
+configuration is the original DFlash2 configuration with
+`splash.format = "MDFD0004"` and `splash.source`, the DFlash2 checkpoint the
+weights came from; native loading validates it against the target. The weights
+are the verified Q4 drafts of the Splash packages, not a quantization made at
+startup. Each family pins the commit that published its folder
+(`Draft.revision` in `FAMILIES`), and installation downloads only that folder.
 
 To prepare a folder from a verified existing package:
 
@@ -244,145 +199,210 @@ The exporter verifies existing artifact hashes and copies only draft files.
 `--draft-model` accepts such a folder, a local copy of the whole repository, or
 another Hub repository with the same layout.
 
-### Upstream tokenizer and chat templates
+### Tokenizer and chat templates
 
-The server uses the upstream tokenizer and chat template. Request preparation
-merges the leading system and developer messages into one system message, joined
-by a blank line: Responses instructions and developer items, or an Anthropic
-`system` and a leading system message. A system message after that, as agent
-clients send when they change instructions during a conversation, renders where
-it occurs as a system turn in the template's own markup.
+An MLX target's configuration, tokenizer files and chat template come from its
+resolved snapshot. For GGUF, `install/gguf.py` reads the selected file's
+metadata without mapping or decoding weight tensors. Vocabulary IDs, BPE merge
+ranks, control/user-defined token types, BOS/EOS/padding IDs and template text
+come from that file; the supported `gpt2/qwen35` profile supplies the NFC and
+byte-level pre-tokenization algorithms. Unknown profiles, malformed metadata
+and automatic BOS/EOS insertion are rejected, with no cross-repository
+fallback; GGUF sidecar tokenizer/config files do not override embedded metadata.
+Model geometry is translated from the same metadata, subtracting any declared
+MTP layers from the layer count. Only the header is read before the download.
+The tokenizer and configuration are derived from the downloaded file once and
+cached under `models/.metadata`, keyed by the source files' content, `gguf.py`
+and the `tokenizers` version; publication is atomic and entries are hash-checked
+on use.
+
+Request preparation merges the leading system and developer messages into one
+system message, joined by a blank line: Responses instructions and developer
+items, or an Anthropic `system` and a leading system message. A system message
+after that, as agent clients send when they change instructions during a
+conversation, renders where it occurs as a system turn in the template's own
+markup.
 
 `server/chat_templates.py` probes each of the tokenizer's templates, including
 each named variant such as `tool_use`, once at startup: it renders a canary
-conversation whose later system message carries a marker. A template that renders
-it in place is used unchanged (`native`). The official Qwen templates raise for
-it, and Unsloth's Qwen3.6 GGUF template skips it. Such a template is patched at
-the construct responsible, found by parsing its tags: the `raise_exception` in
-the message loop's system branch, or the loop condition that excludes system
-messages. The patch renders the message with the block the template gives a
-leading system message (`patched`), and is kept only if ordinary conversations
-(with and without tools, every reasoning effort, preserved thinking, tool calls
-and results, images) still render byte-identically and the canary renders in
-place. Otherwise a request with a later system message fails with a 400 instead
-of losing it (`unsupported`). Startup logs the outcome once and `/status` reports
-it as `chat_template.later_system`. Every request, including image placeholder
-and token-count rendering, uses the template chosen at startup; tokenizer files
-and the tokenizer object are unchanged.
+conversation whose later system message carries a marker. Startup logs the
+outcome once, and `/status` reports it as `chat_template.later_system`:
 
-`response_format` constrains generation and validates final output; it does not
-inject formatting instructions into the prompt. Clients should describe their
-output requirements in their own messages.
+- `native`: the marker renders in place; the template is used unchanged.
+- `patched`: the template rejects the message (the official Qwen templates
+  raise) or drops it (Unsloth's Qwen3.6 GGUF template skips it). The construct
+  responsible, found by parsing the template's tags, is patched: the
+  `raise_exception` in the message loop's system branch, or the loop condition
+  that excludes system messages. The patch renders the message with the block
+  the template gives a leading system message, and is kept only if ordinary
+  conversations (with and without tools, every reasoning effort, preserved
+  thinking, tool calls and results, images) still render byte-identically and
+  the canary renders in place.
+- `unsupported`: no such construct, or the patch failed a probe. A request
+  with a later system message fails with a 400 instead of losing it.
 
-### Local weight preparation
+Every request, including image placeholder and token-count rendering, uses the
+template chosen at startup; tokenizer files and the tokenizer object are
+unchanged. The probe's upstream fixtures are in
+`dev/tests/fixtures/chat_templates/`.
 
-`AffineTarget` reorders codes, scales and biases into the existing affine ABI
-without requantization. GDN decay is computed as `float(-exp(double(A_log)))`;
-older packages produced using MLX's float exponential may differ by a few float
-ULPs in this small vector. The existing inference kernels are unchanged.
+### Vision
 
-Target and vision source adapters use `PreparedWeights`. Its cache is
-`~/Library/Caches/Splash/weights`, or the directory `SPLASH_WEIGHT_CACHE` names;
-nothing else selects it. Preparing a model needs free disk space for about the
-model's size again, its prepared target and vision tensors, plus a 2 GiB reserve;
-packed artifacts are used directly. A prepared file's key hashes its adapter's
-preparation identity, its plan, and the bytes, type and shape of every source tensor
-it reads, located and hashed within its file's tensor data: an edit to a source's
-metadata only (a GGUF chat template, a safetensors header), `config.json` or files
-the component does not read keeps every key. The preparation identity is a
-build-generated fingerprint of only the code that writes the bytes
-(`dev/tools/weight_preparation_identity.py`); inference, parser, planner and reader
-changes keep it, and golden hashes of prepared fixtures fail the tests when bytes
-change without it. Completed files are read-only.
-One writer per cache serializes conversion; complete cache hits bypass this lock.
-Interruption, disk-full errors and memory-pressure rejection cannot publish partial
-files. Before conversion, the adapters validate the whole source and budget every
-missing target and vision artifact plus the disk reserve. Each output's disk space is preallocated
-before writing. Concurrent external disk activity can still exhaust the volume;
-write errors leave no published partial artifact. Retrying removes abandoned writes
-under the converter lock and reuses previously completed layers.
+Vision comes from the target repository: MLX's `vision_tower.*` tensors,
+linking only `config.json` and the shards holding them, or the GGUF
+repository's root `mmproj*.gguf` projector, chosen by its header: a `clip`
+projector whose weights are BF16, or F32; BF16 is preferred. F16 has a narrower
+exponent than BF16, so an F16 projector has already rounded small weights and
+is not used. The processor configuration (MLX `preprocessor_config.json`, the
+GGUF's `clip.vision` metadata) must describe the one preprocessing Splash
+implements (`server/images.py`); it is checked before any weight download and
+not installed.
 
-Cold preparation reports each artifact's progress. Each entry records in `source`
-its component (such as `target/layer-0.bin`), the digest of the source data it was
-written from and the source path. Publishing an entry removes the complete entries
-it supersedes: the same component from the same source data under another key, which
-an earlier preparation identity wrote, and entries of earlier Splash versions prepared
-from the same source path. Entries of other sources or revisions, which installations
-may share, stay. Removal happens under the converter lock, so no entry being written is
-touched, and a running process keeps the files it has mapped until it unmaps them. Two
-builds of different preparation identities sharing one cache supersede each other's
-entries at every start; give a development build its own `SPLASH_WEIGHT_CACHE`. With
-Splash stopped, other entry directories can be deleted; deleting the whole cache
-causes preparation at the next load. Uninstalling a model does not delete possibly
-shared prepared weights.
+Both sources prepare the packed `vision/model.bin` layout, which the one BF16
+vision operator reads: BF16 tensors are copied, and F32 or F16 tensors are
+converted under the exact-BF16 rule of [weight preparation](#weight-preparation).
+Unsloth's mmproj stores its 1-D tensors, patch embedding and position table as
+F32, all of them BF16-exact, and prepares byte-identical to the packed file.
+Quantized MLX towers, deepstack projectors and mmproj tensors the tower does not
+use are rejected.
+
+`--language-only` links and loads no vision weights and removes them from
+memory accounting. It skips a GGUF's mmproj download; MLX vision tensors share
+shards with the language model, which download in full. The native Ready event
+announces vision only when the model loaded it. Without it, image and PDF input
+fails with a 400 naming the modality. Every API shape converts its media to
+image and file parts, and message normalization, the one place that accepts or
+rejects them, checks before any image is decoded or PDF rendered, in user
+turns, tool results and stored Responses history alike. `/status` and
+`/v1/models` report `vision: false` and `input_modalities: ["text"]`, and the
+launchers configure OpenCode and Hermes without attachments.
+
+### Weight preparation
+
+Source adapters write a model's target and vision tensors into prepared files
+through `PreparedWeights`: an MLX target and any vision tower into the packed
+layouts of Splash packages, which run the same kernels, and a GGUF target into
+the `MDGG0001` layout of the GGUF kernels. `AffinePreparation` writes an MLX checkpoint's
+images as `AffineTarget` plans them: codes, scales and biases are reordered
+into 256-row tiles without requantization, and GDN decay is computed as
+`float(-exp(double(A_log)))`, which may differ by one float ULP in this small
+vector from packages produced with MLX's float exponential.
+`GgufPreparation` repacks GGUF blocks ([GGUF targets](#gguf-targets)), and
+`VisionPreparation` writes the vision layout.
+
+Preparation never rounds a weight. A tensor it converts to BF16 (vision tensors
+stored as F32 or F16, a GGUF's convolution taps and time-step bias) must be
+exactly representable in BF16; otherwise preparation fails, naming the tensor
+and file.
+
+The cache is `~/Library/Caches/Splash/weights`, or the directory
+`SPLASH_WEIGHT_CACHE` names; nothing else selects it. It holds an additional
+copy of the weights about the model's size, its prepared target and vision
+tensors. Preparing needs that much free disk space plus a 2 GiB reserve: before
+conversion, the adapters validate the whole source and budget every missing
+target and vision artifact plus the reserve. Uninstalling a model does not
+delete possibly shared prepared weights. With Splash stopped, entry directories
+can be deleted; deleting the whole cache causes preparation at the next load.
+
+A prepared file's key hashes its adapter's preparation identity, its plan, and
+the bytes, type and shape of every source tensor it reads, located and hashed
+within its file's tensor data. An edit to a source's metadata only (a GGUF chat
+template, a safetensors header), `config.json` or files the component does not
+read keeps every key. The preparation identity is a build-generated fingerprint
+of only the code that writes the bytes, the files listed per adapter in
+`INPUTS` of `dev/tools/weight_preparation_identity.py`; inference, parser,
+planner and reader changes keep it. Golden hashes of prepared fixtures fail the
+tests on any change of prepared bytes: `GOLDEN` in
+`dev/tests/engine/run_affine_preparation.py` and
+`run_vision_preparation.py`, and `kGoldenImages` in `gguf_repack_test.mm`.
+For an intended byte change:
+
+1. Make the change in a file listed for the adapter in `INPUTS`, or add the
+   file there; either changes the identity, so cached files of the old bytes
+   are never served.
+2. Run `make test-engine-cpu test-engine-metal`, and replace the golden hashes
+   with the ones the failing checks print.
+
+Each entry records in `source` its component (such as `target/layer-0.bin`),
+the digest of the source data it was written from and the source path.
+Publishing an entry removes the complete entries it supersedes: the same
+component from the same source data under another key, which an earlier
+preparation identity wrote, and entries of earlier Splash versions prepared from
+the same source path. Entries of other sources or revisions, which
+installations may share, stay. Removal happens under the converter lock, so no
+entry being written is touched, and a running process keeps the files it has
+mapped until it unmaps them. Two builds of different preparation identities
+sharing one cache supersede each other's entries at every start; give a
+development build its own `SPLASH_WEIGHT_CACHE`.
+
+One writer per cache serializes conversion; complete cache hits bypass this
+lock. Each output's disk space is preallocated before writing. Interruption,
+disk-full errors and memory-pressure rejection cannot publish partial files;
+concurrent external disk activity can still exhaust the volume. Retrying removes
+abandoned writes under the converter lock and reuses previously completed
+files, which are read-only. Cold preparation reports each artifact's progress.
 
 Cold source hashing and output validation stream bounded buffers. Unchanged
-files reuse a digest proof tied to device, inode, size, birth time, mtime and ctime;
-a write or replacement invalidates it. This is not a full disk scrub on every
-startup. Preparation uses uncached destination I/O and bounded tensor tiles,
-with a 64 MiB admission reserve for staging and capped metadata. The input/output
-staging buffers together stay within 32 MiB. Complete rows and multiple row tiles
-are processed together where possible, avoiding per-row I/O and small GPU waits.
-Warning/critical memory pressure or inadequate host headroom stops conversion.
-Cache hits and bounded source verification use normal startup admission instead;
-cancellation and critical pressure still abort loading. Runtime admission
-counts prepared weights, draft and vision exactly once. File backing removes the
-whole-model anonymous repack allocation. It does not make Metal-resident pages
-reclaimable: residency can wire them until released. macOS page cache, driver
-allocations and other applications still affect memory pressure and swap.
+files reuse a digest proof tied to device, inode, size, birth time, mtime and
+ctime; a write or replacement invalidates it. This is not a full disk scrub on
+every startup. Preparation uses uncached destination I/O. Every adapter sizes
+its conversion steps to one staging bound, input and output together, of
+32 MiB (`kWeightPreparationStagingBytes`), whatever the tensor, layer or expert
+count, inside a 64 MiB admission reserve that also covers source metadata.
+Complete rows and multiple row tiles are processed together where possible,
+avoiding per-row I/O and small GPU waits. Warning/critical memory pressure or
+inadequate host headroom stops conversion. Cache hits and bounded source
+verification use normal startup admission instead; cancellation and critical
+pressure still abort loading.
+
+`WeightFile` maps completed files, prepared or packed, read-only into one
+no-copy Metal buffer, so no model-sized anonymous allocation holds the weights.
+Runtime admission counts prepared weights, draft and vision exactly once. File
+backing does not make Metal-resident pages reclaimable: residency wires them
+until released. macOS page cache, driver allocations and other applications
+still affect memory pressure and swap.
 
 Operator plans use each projection's physical layout, independently of the source
 container. `Projection`, `MoeWeights` and `EmbeddingWeights` represent different
-operator contracts. Arena sizing collects the actual layer layouts, including
-mixed affine/block layers, and reserves the vocabulary head only for decode.
+operator contracts. Arena sizing collects each projection's actual layout (a
+GGUF target's block projections beside its affine draft's) and reserves the
+vocabulary head only for decode.
 
 ### GGUF targets
 
-Qwen3.8-27B and Qwen3.6-35B-A3B can be served straight from a llama.cpp GGUF:
-`splash serve --model unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M` selects the root-level file whose
-name ends in `-UD-Q4_K_M` and installs it as described in
-[Upstream model loading](#upstream-model-loading).
+`--model unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M` selects the repository's
+root-level GGUF for that variant: the file named with the model name its GGUFs
+share, then `-UD-Q4_K_M`, or else the only one whose name ends in `-UD-Q4_K_M`
+(`upstream.select_gguf`). Before any weight download, its header must list
+every tensor the loader reads, with a type it accepts for that tensor
+(`gguf.require_loadable`); the native loader checks again and lists every
+unsupported tensor in one error:
 
-Prebuilt `gguf` Splash packages ship only the shared `draft/`, `vision/` and `tokenizer/`;
-`schema_version` 3 describes a dense Qwen3.8 target and 4 a Qwen3.6 MoE target, and the loader
-checks the GGUF's architecture against it. Their manifest names the source repository and the
-files a model ID may select:
+- linears and experts: Q4_K, Q5_K, Q6_K, Q3_K, IQ4_XS, IQ4_NL, Q8_0 or IQ3_S;
+- token embeddings: Q4_K, Q6_K or Q8_0;
+- norms, the MoE router and shared-expert gate, and the GDN convolution, decay
+  and time-step bias: F32;
+- GDN alpha and beta: both Q8_0 or both F32.
 
-```json
-"format": {"name": "gguf", "target_layer_magic": "MDGG0001", ...},
-"target": {"gguf": {"repo_id": "unsloth/Qwen3.8-27B-GGUF", "revision": "<commit>",
-                    "variants": {"UD-Q4_K_M": {"file": "Qwen3.8-27B-UD-Q4_K_M.gguf",
-                                               "size": 16464440224, "sha256": "..."}, ...}}}
-```
+Of Unsloth's files in September 2026 that covers, for Qwen3.8-27B, UD-Q4_K_M
+and every larger file but Q4_1, UD-Q8_K_XL and BF16, and for Qwen3.6-35B-A3B,
+UD-IQ4_XS and every larger file but MXFP4_MOE, UD-Q8_K_XL and BF16. The smaller
+files need IQ3_XXS, IQ2, IQ1 or Q2_K kernels and the others Q4_0/Q4_1, MXFP4 or
+BF16 ones, which do not exist yet.
 
-For such a package, `--model OWNER/REPO:VARIANT` downloads the shared files and that one GGUF
-into the Hub cache, checks them against the manifest, and installs
-`models/<owner>/<repo>:<variant>/` as a real directory of per-file symlinks whose
-`target/<file>.gguf` links the cached GGUF (the engine requires `target/` and `draft/` to be
-subdirectories of one root). The original download remains unchanged.
+At load time the engine validates the GGUF metadata and plans the `MDGG0001`
+layout. `GgufPreparation` stages rows in image order on the CPU within the
+staging bound, splitting rows wider than it into column chunks, runs the
+`gguf_repack` kernel, and writes its planes into a prepared file. Embeddings
+and F32 sections use bounded direct copies.
 
-At load time the engine validates the GGUF metadata and plans the existing
-`MDGG0001` layout. `GgufPreparation` sizes row batches to a fixed 32 MiB total
-staging budget, uses contiguous reads where possible, runs the existing repack
-kernel, and writes its planes into a prepared file. Rows wider than this budget
-are split into column chunks. Embeddings and F32 sections use bounded direct copies. `PreparedWeights`
-publishes only completed files; `WeightFile` maps them read-only without copying
-into a model-sized Metal allocation. Later starts reuse these files.
-
-Every tensor keeps its stored format: the F32 norm multipliers,
-the MoE router and shared-expert gate, and GDN alpha/beta when a file stores them as F32 stay F32
-and run in fp32, as llama.cpp keeps them (Apple10 prefill chunks multiply the router and
-alpha/beta on the neural accelerator as three bf16 parts per weight that sum to it exactly, so
-only fp32 accumulation rounds); the other small F32 tensors (the GDN convolution and
-time-step bias) become bf16 only when every value converts exactly, and loading fails otherwise.
-Prepared weight files are file-backed like existing packed packages; while Metal holds them
-resident, their pages stay wired. Supported tensor types are Q4_K,
-Q5_K, Q6_K, Q3_K, IQ4_XS, IQ4_NL, Q8_0 and IQ3_S for linears and experts, F32 for the tensors
-above, and Q4_K, Q6_K or Q8_0 token embeddings; the loader lists every unsupported tensor in one
-error. Of Unsloth's files that covers, for Qwen3.8-27B, UD-Q4_K_M and every larger file but
-Q4_1, UD-Q8_K_XL and BF16, and for Qwen3.6-35B-A3B, UD-IQ4_XS and every larger file but
-MXFP4_MOE, UD-Q8_K_XL and BF16. The smaller files need IQ3_XXS, IQ2, IQ1 or Q2_K kernels and the
-others Q4_0/Q4_1, MXFP4 or BF16 ones, which do not exist yet.
+Every tensor keeps its stored format: the F32 norm multipliers, GDN decay, the
+MoE router and shared-expert gate, and GDN alpha/beta when a file stores them
+as F32 stay F32 and run in fp32, as llama.cpp keeps them (Apple10 prefill
+chunks multiply the router and alpha/beta on the neural accelerator as three
+bf16 parts per weight that sum to it exactly, so only fp32 accumulation
+rounds). The GDN convolution and time-step bias become bf16 under the exact
+rule.
 
 Decode runs one of two kernel families, chosen by GPU family in `runtime/ops/LinearGguf.cpp`. On
 Apple9 (M3, M4) the register kernels of `runtime/metal/kernels/decode/linear_gguf_sgmatrix.metal`
@@ -394,7 +414,8 @@ request lanes runs the 32-row tile over four lanes of storage. Prefill runs the 
 on both families, chunks of up to 32 rows on the decode tiles. Every projection splits its K
 across threadgroups by one rule (`decodeSplits`: each tile's tiers of threadgroups per core and
 inputs per partition, from measured occupancy) that does not depend on the batch width. The MoE
-experts (`runtime/ops/MoE.cpp`) run the same numerics per family over the grouped rows. The ABIs
+experts (`runtime/ops/MoE.cpp`) run the same numerics per family over the grouped rows. These
+plans are fixed rules of GPU family, core count and shape; they read no tuned choice. The ABIs
 are in `runtime/metal/abi/Gguf.h` and `MoE.h`, the image formats in
 `runtime/metal/abi/QuantFormat.h`, their decoding in `runtime/metal/kernels/common/quant_formats.h`;
 weight preparation's repack ABI is `runtime/metal/abi/GgufRepack.h`.
@@ -407,6 +428,20 @@ alpha/beta, norm, convolution and router bytes, golden hashes of prepared images
 kernels (`gguf-projection full`) and the MoE layer in every format (`gguf-moe`) against fp64.
 With `SPLASH_GGML_ORACLE=<libggml-base.dylib>` the reference is also compared with GGML directly
 and `gguf-repack --cpu` prints GGML's hashes.
+
+## Legacy Splash packages
+
+Splash packages, such as `incoai/Qwen3.8-27B-Splash`, are the prebuilt format
+that predates upstream loading, and `--model` still accepts them. They contain
+`manifest.json`, packed `target/`, `draft/` and `vision/` weights and
+`tokenizer/`; the manifest lists artifact paths, sizes and SHA-256 hashes.
+Qwen3.8-27B packages use schema 3 / `splash-packed-q4`, Qwen3.6-35B-A3B
+packages schema 4 / `splash-packed-q4-moe`. Compatible community fine-tunes may
+use any nonempty manifest model name. Native loading validates geometry, tensor
+sizes, binary headers, tokenizer and target/draft compatibility, and maps the
+packed files without preparation. An installed package starts without a Hub
+request; `--revision`, `--language-only` and `--draft-model` require an
+upstream model ID.
 
 ## Code and API boundaries
 
@@ -433,6 +468,9 @@ properties use JSON-encoded values; statically typed strings retain raw text.
 Remote schema references and parameter names containing XML delimiters are
 unsupported. Hosted search is unsupported; configure client-owned tools such as
 MCP. Omitted effort uses the model default.
+`response_format` constrains generation and validates final output; it does not
+inject formatting instructions into the prompt. Clients should describe their
+output requirements in their own messages.
 Hidden thinking signatures use a persistent user key; imported encrypted thinking
 preserves visible history without recovering the private reasoning.
 
