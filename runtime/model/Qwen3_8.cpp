@@ -43,7 +43,8 @@ void validateLayout(const Qwen3_8Layout &layout) {
 
 Qwen3_8Weights loadQwen3_8Weights(metal::MetalBackend &backend,
                                   const std::filesystem::path &directory,
-                                  Qwen3_8Layout layout, TargetSource source, PreparationCheck prepareCheck) {
+                                  Qwen3_8Layout layout, TargetSource source, PreparationCheck prepareCheck,
+                                  std::span<const PreparedWeight> alsoPrepared) {
   validateLayout(layout);
   auto readFfn = [&](WeightFile &file, Qwen3_8LayerWeights &layer) {
     if (source == TargetSource::Gguf) {
@@ -65,11 +66,12 @@ Qwen3_8Weights loadQwen3_8Weights(metal::MetalBackend &backend,
   Qwen3_8Weights weights;
   if (source == TargetSource::Gguf) {
     // Source-specific preparation ends at immutable WeightFile views.
-    GgufTargetLoader loader(backend, findTargetGguf(directory), ggufTargetGeometry(layout), std::move(prepareCheck));
+    GgufTargetLoader loader(backend, findTargetGguf(directory), ggufTargetGeometry(layout), std::move(prepareCheck),
+                            alsoPrepared);
     weights = readQwenTargetWeights<Qwen3_8Weights>(backend, layout, GgufTargetFiles{loader},
                                                     readFfn, true);
   } else if (source == TargetSource::Affine) {
-    AffineTargetLoader loader(backend, directory, layout, std::move(prepareCheck));
+    AffineTargetLoader loader(backend, directory, layout, std::move(prepareCheck), alsoPrepared);
     weights = readQwenTargetWeights<Qwen3_8Weights>(backend, layout, loader, readFfn, false);
   } else {
     weights = loadQwenTargetWeights<Qwen3_8Weights>(backend, directory, layout, kHeadMagic,

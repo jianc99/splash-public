@@ -50,12 +50,13 @@ void requireLayout(const Qwen3_6MoeLayout &layout) {
 Qwen3_6MoeWeights
 loadQwen3_6MoeWeights(metal::MetalBackend &backend,
                       const std::filesystem::path &directory,
-                      Qwen3_6MoeLayout layout, TargetSource source, PreparationCheck prepareCheck) {
+                      Qwen3_6MoeLayout layout, TargetSource source, PreparationCheck prepareCheck,
+                      std::span<const PreparedWeight> alsoPrepared) {
   requireLayout(layout);
   if (source == TargetSource::Gguf) {
     // Source-specific preparation ends at immutable WeightFile views.
     GgufTargetLoader loader(backend, findTargetGguf(directory),
-                            ggufTargetGeometry(layout), std::move(prepareCheck));
+                            ggufTargetGeometry(layout), std::move(prepareCheck), alsoPrepared);
     return readQwenTargetWeights<Qwen3_6MoeWeights>(
         backend, layout, GgufTargetFiles{loader},
         [](WeightFile &file, Qwen3_6MoeLayerWeights &layer) {
@@ -99,7 +100,7 @@ loadQwen3_6MoeWeights(metal::MetalBackend &backend,
             "shared-expert-scalar-gate");
       };
   if (source == TargetSource::Affine) {
-    AffineTargetLoader loader(backend, directory, layout, std::move(prepareCheck));
+    AffineTargetLoader loader(backend, directory, layout, std::move(prepareCheck), alsoPrepared);
     return readQwenTargetWeights<Qwen3_6MoeWeights>(backend, layout, loader, readFfn, false);
   }
   return loadQwenTargetWeights<Qwen3_6MoeWeights>(backend, directory, layout, kHeadMagic, readFfn);

@@ -19,8 +19,11 @@ namespace splash::model {
 
 class GgufTargetLoader final {
 public:
+  // Before the first image is written, the disk check budgets every missing
+  // image together with alsoPrepared, the model's other prepared files.
   GgufTargetLoader(metal::MetalBackend &backend, std::filesystem::path path,
-                   gguf::TargetGeometry geometry, PreparationCheck check = {});
+                   gguf::TargetGeometry geometry, PreparationCheck check = {},
+                   std::span<const PreparedWeight> alsoPrepared = {});
   GgufTargetLoader(const GgufTargetLoader &) = delete;
   GgufTargetLoader &operator=(const GgufTargetLoader &) = delete;
 

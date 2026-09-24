@@ -16,11 +16,12 @@ std::filesystem::path findTargetGguf(const std::filesystem::path &directory) {
 }
 
 GgufTargetLoader::GgufTargetLoader(metal::MetalBackend &backend, std::filesystem::path path,
-                                   gguf::TargetGeometry geometry, PreparationCheck check)
+                                   gguf::TargetGeometry geometry, PreparationCheck check,
+                                   std::span<const PreparedWeight> alsoPrepared)
     : backend_(&backend), check_(std::move(check)), source_(path, [&backend] { backend.checkOperation(); }),
       file_(std::move(path)), planner_(file_, geometry) {
   source_.checkUnchanged();
-  std::vector<PreparedWeight> weights;
+  std::vector<PreparedWeight> weights(alsoPrepared.begin(), alsoPrepared.end());
   const auto include = [&](const gguf::Image &image) {
     weights.push_back({ggufImageKey(source_.digest(), image), image.bytes});
   };

@@ -330,11 +330,11 @@ struct AffineTargetLoader::Impl {
   PreparedWeights cache;
   template<class Layout>
   Impl(metal::MetalBackend &backend, const std::filesystem::path &directory,
-       const Layout &layout, PreparationCheck check)
+       const Layout &layout, PreparationCheck check, std::span<const PreparedWeight> alsoPrepared)
       : backend(backend), check(std::move(check)),
         source(directory, [&backend] { backend.checkOperation(); }), sourceDirectory(directory), layout(layout) {
     validateConfiguration(source, layout);
-    std::vector<PreparedWeight> weights;
+    std::vector<PreparedWeight> weights(alsoPrepared.begin(), alsoPrepared.end());
     const auto include = [&](const Image &image) {
       weights.push_back({imageKey(source, image), image.bytes});
     };
@@ -358,11 +358,13 @@ struct AffineTargetLoader::Impl {
   }
 };
 AffineTargetLoader::AffineTargetLoader(metal::MetalBackend &backend, const std::filesystem::path &directory,
-                                       const Qwen3_8Layout &layout, PreparationCheck check)
-    : impl_(std::make_unique<Impl>(backend, directory, layout, std::move(check))) {}
+                                       const Qwen3_8Layout &layout, PreparationCheck check,
+                                       std::span<const PreparedWeight> alsoPrepared)
+    : impl_(std::make_unique<Impl>(backend, directory, layout, std::move(check), alsoPrepared)) {}
 AffineTargetLoader::AffineTargetLoader(metal::MetalBackend &backend, const std::filesystem::path &directory,
-                                       const Qwen3_6MoeLayout &layout, PreparationCheck check)
-    : impl_(std::make_unique<Impl>(backend, directory, layout, std::move(check))) {}
+                                       const Qwen3_6MoeLayout &layout, PreparationCheck check,
+                                       std::span<const PreparedWeight> alsoPrepared)
+    : impl_(std::make_unique<Impl>(backend, directory, layout, std::move(check), alsoPrepared)) {}
 AffineTargetLoader::~AffineTargetLoader() = default;
 WeightFile AffineTargetLoader::layer(uint32_t index, bool fullAttention) {
   return std::visit([&](const auto &layout) {

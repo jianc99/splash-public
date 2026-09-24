@@ -248,7 +248,7 @@ counts and support-asset updates do not. Completed files are read-only.
 One writer per cache serializes conversion; complete cache hits bypass this lock.
 Interruption, disk-full errors and memory-pressure rejection cannot publish partial
 files. Before conversion, the adapters validate the whole source and budget every
-missing target artifact plus a 2 GiB disk reserve. Each output's disk space is preallocated
+missing target and vision artifact plus a 2 GiB disk reserve. Each output's disk space is preallocated
 before writing. Concurrent external disk activity can still exhaust the volume;
 write errors leave no published partial artifact. Retrying removes abandoned writes
 under the converter lock and reuses previously completed layers.

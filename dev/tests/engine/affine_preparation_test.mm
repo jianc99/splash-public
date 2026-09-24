@@ -1,8 +1,10 @@
 #include "model/AffineTarget.hpp"
 #include "model/Qwen3_8.hpp"
+#include <cstdint>
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <string>
 #include <vector>
 
 using namespace splash;
@@ -50,7 +52,19 @@ int main(int argc, char **argv) {
         check(loader.embedding(256, 256));
         cold = false;
       }
-      std::cout << "affine preparation: exact independent fixture, padding, fused order, gate/up and warm admission PASS\n";
+      // The model's other prepared files join the target's disk check.
+      const model::PreparedWeight vision{std::string(64, 'a'), UINT64_MAX / 2};
+      std::string budget;
+      try {
+        model::AffineTargetLoader loader(backend, root, layout, admission, {&vision, 1});
+      } catch (const std::runtime_error &error) {
+        budget = error.what();
+      }
+      if (!budget.starts_with("not enough disk space to prepare weights: need " +
+                              std::to_string(vision.bytes) + " bytes"))
+        throw std::runtime_error("other prepared files escaped the disk check: " + budget);
+      std::cout << "affine preparation: exact independent fixture, padding, fused order, gate/up, warm admission and "
+                   "model disk budget PASS\n";
     } catch (const std::exception &error) {
       std::cerr << error.what() << '\n';
       return 1;

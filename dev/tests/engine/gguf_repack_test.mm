@@ -22,6 +22,7 @@
 #include <CommonCrypto/CommonDigest.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -561,6 +562,16 @@ void checkMoeLayer(const char *metallib) {
       const auto expected = load();
       allowPreparation = false;
       check(load() == expected, "GGUF warm load does not require conversion headroom");
+      // The model's other prepared files join the target's disk check.
+      const model::PreparedWeight vision{std::string(64, 'a'), UINT64_MAX / 2};
+      std::string budget;
+      try {
+        model::GgufTargetLoader loader(backend, path, geometry, {}, {&vision, 1});
+      } catch (const std::runtime_error &error) {
+        budget = error.what();
+      }
+      check(budget.starts_with("not enough disk space to prepare weights"),
+            "GGUF target disk check budgets the model's other prepared files: " + budget);
       allowPreparation = true;
       for (const char *name : {"blk.0.ffn_down_exps.weight", "blk.0.ffn_gate_inp.weight"}) {
         write(geometry);

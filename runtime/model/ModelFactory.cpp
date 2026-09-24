@@ -3,6 +3,7 @@
 #include "model/GgufTarget.hpp"
 #include <limits>
 
+#include <optional>
 #include <stdexcept>
 #include <type_traits>
 #include <vector>
@@ -33,26 +34,31 @@ ModelPackage loadPackage(metal::MetalBackend &backend,
   result.descriptor = std::move(descriptor);
   if (!result.descriptor.valid())
     throw std::invalid_argument("model descriptor is invalid");
+  // A vision source is planned first: the target's whole-model disk check
+  // budgets its prepared file together with the target images.
+  std::optional<VisionPreparation> vision;
+  std::vector<PreparedWeight> prepared;
+  if (result.descriptor.visionSource == VisionSource::Safetensors ||
+      result.descriptor.visionSource == VisionSource::Gguf) {
+    vision.emplace(root / "vision", result.descriptor.visionSource,
+                   result.descriptor.vision, [&backend] { backend.checkOperation(); });
+    prepared.push_back(vision->weight());
+  }
   result.target = std::visit(
       [&](const auto &layout) -> TargetWeights {
         if constexpr (std::is_same_v<std::remove_cvref_t<decltype(layout)>,
                                      Qwen3_8Layout>)
           return loadQwen3_8Weights(backend, root / "target", layout,
-                                    result.descriptor.targetSource, prepareCheck);
+                                    result.descriptor.targetSource, prepareCheck, prepared);
         else
           return loadQwen3_6MoeWeights(backend, root / "target", layout,
-                                       result.descriptor.targetSource, prepareCheck);
+                                       result.descriptor.targetSource, prepareCheck, prepared);
       },
       result.descriptor.target);
   result.draft = loadDFlashDraftWeights(
       backend, root / "draft", result.descriptor.draft);
-  if (result.descriptor.visionSource == VisionSource::Safetensors ||
-      result.descriptor.visionSource == VisionSource::Gguf)
-    result.vision = loadQwenVisionWeights(
-        backend,
-        VisionPreparation(root / "vision", result.descriptor.visionSource, result.descriptor.vision,
-                          [&backend] { backend.checkOperation(); }),
-        prepareCheck);
+  if (vision)
+    result.vision = loadQwenVisionWeights(backend, *vision, prepareCheck);
   else if (result.descriptor.visionSource == VisionSource::Packed)
     result.vision = loadQwenVisionWeights(backend, root / "vision", result.descriptor.vision);
 
