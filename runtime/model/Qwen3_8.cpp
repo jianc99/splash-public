@@ -1,19 +1,9 @@
 #include "model/Qwen3_8.hpp"
 
-#include "model/GgufTarget.hpp"
-#include "model/AffineTarget.hpp"
-
-#include <algorithm>
-#include <cstring>
-#include <string_view>
-#include <variant>
-
-#include "metal/abi/ExecutionGeometry.h"
+#include <utility>
 
 namespace splash::model {
 namespace {
-
-constexpr std::string_view kHeadMagic = "MDFL0002";
 
 void validateLayout(const Qwen3_8Layout &layout) {
   if (!layout.maximumContextTokens || !layout.layers || !layout.hiddenSize ||
@@ -46,41 +36,17 @@ Qwen3_8Weights loadQwen3_8Weights(metal::MetalBackend &backend,
                                   Qwen3_8Layout layout, TargetSource source, PreparationCheck prepareCheck,
                                   std::span<const PreparedWeight> alsoPrepared) {
   validateLayout(layout);
-  auto readFfn = [&](WeightFile &file, Qwen3_8LayerWeights &layer) {
-    if (source == TargetSource::Gguf) {
-      layer.gateProjection =
-          readGgufProjection(file, layout.intermediateSize, layout.hiddenSize, "mlp-gate");
-      layer.upProjection =
-          readGgufProjection(file, layout.intermediateSize, layout.hiddenSize, "mlp-up");
-      layer.downProjection =
-          readGgufProjection(file, layout.hiddenSize, layout.intermediateSize, "mlp-down");
-      return;
-    }
-    layer.gateProjection = readProjection(
-        file, backend, layout.intermediateSize, layout.hiddenSize,
-        "mlp-gate");
-    layer.upProjection = readProjection(
-        file, backend, layout.intermediateSize, layout.hiddenSize,
-        "mlp-up");
-    layer.downProjection = readProjection(
-        file, backend, layout.hiddenSize, layout.intermediateSize,
-        "mlp-down");
+  // The dense FFN reads the same projections from either format.
+  const auto readFfn = [&](WeightFile &file, Qwen3_8LayerWeights &layer, const auto &format) {
+    layer.gateProjection =
+        format.projection(file, layout.intermediateSize, layout.hiddenSize, "mlp-gate");
+    layer.upProjection =
+        format.projection(file, layout.intermediateSize, layout.hiddenSize, "mlp-up");
+    layer.downProjection =
+        format.projection(file, layout.hiddenSize, layout.intermediateSize, "mlp-down");
   };
-  Qwen3_8Weights weights;
-  if (source == TargetSource::Gguf) {
-    // Source-specific preparation ends at immutable WeightFile views.
-    GgufTargetLoader loader(backend, findTargetGguf(directory), ggufTargetGeometry(layout), std::move(prepareCheck),
-                            alsoPrepared);
-    weights = readQwenTargetWeights<Qwen3_8Weights>(backend, layout, GgufTargetFiles{loader},
-                                                    readFfn, true);
-  } else if (source == TargetSource::Affine) {
-    AffineTargetLoader loader(backend, directory, layout, std::move(prepareCheck), alsoPrepared);
-    weights = readQwenTargetWeights<Qwen3_8Weights>(backend, layout, loader, readFfn, false);
-  } else {
-    weights = loadQwenTargetWeights<Qwen3_8Weights>(backend, directory, layout, kHeadMagic,
-                                                    readFfn);
-  }
-  return weights;
+  return loadQwenTarget<Qwen3_8Weights>(backend, directory, layout, source, std::move(prepareCheck),
+                                        alsoPrepared, readFfn, readFfn);
 }
 
 } // namespace splash::model

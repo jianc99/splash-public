@@ -20,6 +20,7 @@ namespace splash::model {
 
 struct Qwen3_8Layout final {
   static constexpr std::string_view layerMagic = "MDFL0006";
+  static constexpr std::string_view headMagic = "MDFL0002";
   static constexpr std::array<uint32_t, 5> hiddenCaptureLayers{
       5, 19, 33, 47, 61};
 

@@ -91,6 +91,28 @@ int main(int argc, char **argv) {
       auto layout = tinyLayout<model::Qwen3_8Layout>();
       layout.intermediateSize = 512;
       prepare(backend, root, layout, true);
+      // The target loader reads the prepared files as affine Q4 projections of
+      // the layout's sizes with bf16 norms.
+      const model::Qwen3_8Weights weights =
+          model::loadQwen3_8Weights(backend, root, layout, model::TargetSource::Affine);
+      const auto affine = [](const ops::Projection &p, uint32_t n, uint32_t k) {
+        return p.layout() == ops::WeightLayout::Affine64 && p.outputSize == n && p.inputSize == k;
+      };
+      bool read = weights.layers.size() == layout.layers && !weights.finalNorm.float32 &&
+                  affine(weights.logitsProjection, layout.vocabularySize, layout.hiddenSize) &&
+                  weights.tokenEmbedding.isAffine();
+      for (const auto &layer : weights.layers) {
+        read = read && !layer.inputNorm.float32 && !layer.postAttentionNorm.float32 &&
+               affine(layer.gateProjection, layout.intermediateSize, layout.hiddenSize) &&
+               affine(layer.downProjection, layout.hiddenSize, layout.intermediateSize);
+        if (const auto *gdn = std::get_if<model::QwenGdnWeights>(&layer.mixer))
+          read = read && affine(gdn->inputProjection, layout.packedGdnWidth, layout.hiddenSize) &&
+                 gdn->outputHeadOrder == ops::GdnHeadOrder::Grouped && !gdn->mixerNorm.float32;
+        else
+          read = read && affine(std::get<model::QwenAttentionWeights>(layer.mixer).inputProjection,
+                                layout.packedFullWidth, layout.hiddenSize);
+      }
+      if (!read) throw std::runtime_error("the target loader misread the prepared affine files");
       // The model's other prepared files join the target's disk check.
       const model::PreparedWeight vision{std::string(64, 'a'), UINT64_MAX / 2};
       std::string budget;
@@ -103,7 +125,7 @@ int main(int argc, char **argv) {
                               std::to_string(vision.bytes) + " bytes"))
         throw std::runtime_error("other prepared files escaped the disk check: " + budget);
       std::cout << "affine preparation: exact independent fixture, padding, fused order, gate/up, warm admission and "
-                   "model disk budget PASS\n";
+                   "model disk budget, target read PASS\n";
     } catch (const std::exception &error) {
       std::cerr << error.what() << '\n';
       return 1;

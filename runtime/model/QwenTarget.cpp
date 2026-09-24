@@ -89,54 +89,42 @@ constexpr bool isGdnMixer =
 
 } // namespace
 
-namespace {
-// Concatenates GGUF tensors into one fused projection along output columns.
-ops::Projection readGgufFused(WeightFile &file, uint32_t outputSize,
-                                  uint32_t inputSize,
-                                  std::initializer_list<const char *> labels) {
+ops::Projection BlockTargetFormat::fused(WeightFile &file, uint32_t outputSize, uint32_t inputSize,
+                                         std::string_view,
+                                         std::initializer_list<std::string_view> tensors) const {
   ops::BlockWeights weights;
   uint32_t offset = 0;
-  for (const char *label : labels) {
-    ops::QuantizedSegment s = readQuantizedSegment(file, label);
+  for (std::string_view tensor : tensors) {
+    ops::QuantizedSegment s = readQuantizedSegment(file, tensor);
+    if (s.inputSize != inputSize || s.outputSize > outputSize - offset)
+      throw WeightStoreError("GGUF fused projection does not match the layout: " + std::string(tensor));
     s.columnOffset = offset;
     offset += s.outputSize;
     weights.segments.push_back(std::move(s));
   }
-  // The segments may leave the padding columns of a destination row
-  // unwritten (LinearGguf.cpp requireSegments).
-  if (offset > outputSize || weights.segments.front().inputSize != inputSize)
-    throw WeightStoreError("GGUF fused projection does not match the layout");
   return {outputSize, inputSize, std::move(weights)};
 }
-} // namespace
 
-QwenMixerWeights readQwenMixer(WeightFile &file, metal::MetalBackend &backend,
-                               const QwenMixerGeometry &geometry,
-                               bool fullAttention, bool ggufTarget) {
+template <class Format>
+QwenMixerWeights readQwenMixer(WeightFile &file, const Format &format,
+                               const QwenMixerGeometry &geometry, bool fullAttention) {
   constexpr uint64_t kFloat32Bytes = 4;
   if (fullAttention) {
     QwenAttentionWeights attention;
-    attention.inputProjection = ggufTarget
-        ? readGgufFused(file, geometry.packedAttentionWidth, geometry.hiddenSize,
-                          {"attn-q", "attn-k", "attn-v"})
-        : readProjection(file, backend, geometry.packedAttentionWidth,
-                           geometry.hiddenSize, "attention-input");
+    attention.inputProjection =
+        format.fused(file, geometry.packedAttentionWidth, geometry.hiddenSize, "attention-input",
+                     {"attn-q", "attn-k", "attn-v"});
     attention.queryNorm =
-        readNorm(file, geometry.attentionHeadDimension, ggufTarget, "query-norm");
+        readNorm(file, geometry.attentionHeadDimension, Format::float32Norms, "query-norm");
     attention.keyNorm =
-        readNorm(file, geometry.attentionHeadDimension, ggufTarget, "key-norm");
-    attention.outputProjection = ggufTarget
-        ? readGgufProjection(file, geometry.hiddenSize, geometry.attentionWidth, "attn-output")
-        : readProjection(file, backend, geometry.hiddenSize,
-                           geometry.attentionWidth, "attention-output");
+        readNorm(file, geometry.attentionHeadDimension, Format::float32Norms, "key-norm");
+    attention.outputProjection =
+        format.projection(file, geometry.hiddenSize, geometry.attentionWidth, "attention-output");
     return attention;
   }
   QwenGdnWeights gdn;
-  gdn.inputProjection = ggufTarget
-      ? readGgufFused(file, geometry.packedGdnWidth, geometry.hiddenSize,
-                        {"gdn-qkv", "gdn-z", "gdn-ab"})
-      : readProjection(file, backend, geometry.packedGdnWidth,
-                         geometry.hiddenSize, "gdn-input");
+  gdn.inputProjection = format.fused(file, geometry.packedGdnWidth, geometry.hiddenSize,
+                                     "gdn-input", {"gdn-qkv", "gdn-z", "gdn-ab"});
   gdn.convolutionWeights = file.section(
       checkedWeightMultiply(
           checkedWeightMultiply(geometry.convolutionDimension, kGdnConvolutionTaps,
@@ -151,19 +139,17 @@ QwenMixerWeights readQwenMixer(WeightFile &file, metal::MetalBackend &backend,
       checkedWeightMultiply(geometry.gdnValueHeads, kBFloat16Bytes,
                             "GDN time bias bytes"),
       "gdn-time-bias");
-  gdn.mixerNorm = readNorm(file, geometry.gdnHeadDimension, ggufTarget, "gdn-norm");
-  if (ggufTarget) {
-    // The GGUF keeps out_proj's input columns in llama.cpp's tiled value-head
-    // order, so the GDN writes its output in that order.
-    gdn.outputProjection =
-        readGgufProjection(file, geometry.hiddenSize, geometry.attentionWidth, "gdn-output");
-    gdn.outputHeadOrder = ops::GdnHeadOrder::Tiled;
-  } else {
-    gdn.outputProjection = readProjection(
-        file, backend, geometry.hiddenSize, geometry.attentionWidth, "gdn-output");
-  }
+  gdn.mixerNorm = readNorm(file, geometry.gdnHeadDimension, Format::float32Norms, "gdn-norm");
+  gdn.outputProjection =
+      format.projection(file, geometry.hiddenSize, geometry.attentionWidth, "gdn-output");
+  gdn.outputHeadOrder = Format::gdnOutputOrder;
   return gdn;
 }
+
+template QwenMixerWeights readQwenMixer(WeightFile &, const AffineTargetFormat &,
+                                        const QwenMixerGeometry &, bool);
+template QwenMixerWeights readQwenMixer(WeightFile &, const BlockTargetFormat &,
+                                        const QwenMixerGeometry &, bool);
 
 QwenTarget::QwenTarget(const Qwen3_8Weights &weights,
                        metal::MetalBackend &backend,

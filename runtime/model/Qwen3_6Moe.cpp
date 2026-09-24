@@ -1,14 +1,9 @@
 #include "Qwen3_6Moe.hpp"
 
-#include "model/GgufTarget.hpp"
-#include "model/AffineTarget.hpp"
-
-#include <string_view>
+#include <utility>
 
 namespace splash::model {
 namespace {
-
-constexpr std::string_view kHeadMagic = "MDFM0002";
 
 void requireLayout(const Qwen3_6MoeLayout &layout) {
   if (!layout.maximumContextTokens || !layout.layers || !layout.hiddenSize ||
@@ -53,57 +48,41 @@ loadQwen3_6MoeWeights(metal::MetalBackend &backend,
                       Qwen3_6MoeLayout layout, TargetSource source, PreparationCheck prepareCheck,
                       std::span<const PreparedWeight> alsoPrepared) {
   requireLayout(layout);
-  if (source == TargetSource::Gguf) {
-    // Source-specific preparation ends at immutable WeightFile views.
-    GgufTargetLoader loader(backend, findTargetGguf(directory),
-                            ggufTargetGeometry(layout), std::move(prepareCheck), alsoPrepared);
-    return readQwenTargetWeights<Qwen3_6MoeWeights>(
-        backend, layout, GgufTargetFiles{loader},
-        [](WeightFile &file, Qwen3_6MoeLayerWeights &layer) {
-          ops::BlockMoeWeights ffn;
-          ffn.router = readQuantizedSegment(file, "router");
-          ffn.gate.routed = readQuantizedSegment(file, "experts-gate");
-          ffn.up.routed = readQuantizedSegment(file, "experts-up");
-          ffn.down.routed = readQuantizedSegment(file, "experts-down");
-          ffn.gate.shared = readQuantizedSegment(file, "shared-expert-gate");
-          ffn.up.shared = readQuantizedSegment(file, "shared-expert-up");
-          ffn.down.shared = readQuantizedSegment(file, "shared-expert-down");
-          ffn.sharedExpertGate =
-              readQuantizedSegment(file, "shared-expert-scalar-gate");
-          layer.ffn = std::move(ffn);
-        },
-        true);
-  }
-  auto readFfn = [&](WeightFile &file, Qwen3_6MoeLayerWeights &layer) {
-        layer.ffn.affine().router = readQ8Projection(
-            file, backend, layout.experts, layout.hiddenSize, "router");
-        layer.ffn.affine().expertGate = readExpertProjection(
-            file, layout.experts, layout.expertIntermediateSize,
-            layout.hiddenSize, "experts-gate");
-        layer.ffn.affine().expertUp = readExpertProjection(
-            file, layout.experts, layout.expertIntermediateSize,
-            layout.hiddenSize, "experts-up");
-        layer.ffn.affine().expertDown = readExpertProjection(
-            file, layout.experts, layout.hiddenSize,
-            layout.expertIntermediateSize, "experts-down");
-        layer.ffn.affine().sharedGate = readExpertProjection(
-            file, 1, layout.expertIntermediateSize, layout.hiddenSize,
-            "shared-expert-gate");
-        layer.ffn.affine().sharedUp = readExpertProjection(
-            file, 1, layout.expertIntermediateSize, layout.hiddenSize,
-            "shared-expert-up");
-        layer.ffn.affine().sharedDown = readExpertProjection(
-            file, 1, layout.hiddenSize, layout.expertIntermediateSize,
-            "shared-expert-down");
-        layer.ffn.affine().sharedExpertGate = readQ8Projection(
-            file, backend, kQ4StorageN, layout.hiddenSize,
-            "shared-expert-scalar-gate");
-      };
-  if (source == TargetSource::Affine) {
-    AffineTargetLoader loader(backend, directory, layout, std::move(prepareCheck), alsoPrepared);
-    return readQwenTargetWeights<Qwen3_6MoeWeights>(backend, layout, loader, readFfn, false);
-  }
-  return loadQwenTargetWeights<Qwen3_6MoeWeights>(backend, directory, layout, kHeadMagic, readFfn);
+  // Affine files keep a Q8 router and shared-expert gate and one Q4 slab per
+  // expert projection; the shared expert is a one-expert slab.
+  const auto readAffineFfn = [&](WeightFile &file, Qwen3_6MoeLayerWeights &layer,
+                                 const AffineTargetFormat &) {
+    const uint32_t hidden = layout.hiddenSize, width = layout.expertIntermediateSize;
+    layer.ffn = ops::AffineMoeWeights{
+        .router = readQ8Projection(file, backend, layout.experts, hidden, "router"),
+        .expertGate = readExpertProjection(file, layout.experts, width, hidden, "experts-gate"),
+        .expertUp = readExpertProjection(file, layout.experts, width, hidden, "experts-up"),
+        .expertDown = readExpertProjection(file, layout.experts, hidden, width, "experts-down"),
+        .sharedGate = readExpertProjection(file, 1, width, hidden, "shared-expert-gate"),
+        .sharedUp = readExpertProjection(file, 1, width, hidden, "shared-expert-up"),
+        .sharedDown = readExpertProjection(file, 1, hidden, width, "shared-expert-down"),
+        .sharedExpertGate =
+            readQ8Projection(file, backend, kQ4StorageN, hidden, "shared-expert-scalar-gate"),
+    };
+  };
+  // GGUF images keep the tensors as the GGUF stores them, the router and the
+  // shared-expert gate in F32.
+  const auto readBlockFfn = [](WeightFile &file, Qwen3_6MoeLayerWeights &layer,
+                               const BlockTargetFormat &) {
+    ops::BlockMoeWeights ffn;
+    ffn.router = readQuantizedSegment(file, "router");
+    ffn.gate.routed = readQuantizedSegment(file, "experts-gate");
+    ffn.up.routed = readQuantizedSegment(file, "experts-up");
+    ffn.down.routed = readQuantizedSegment(file, "experts-down");
+    ffn.gate.shared = readQuantizedSegment(file, "shared-expert-gate");
+    ffn.up.shared = readQuantizedSegment(file, "shared-expert-up");
+    ffn.down.shared = readQuantizedSegment(file, "shared-expert-down");
+    ffn.sharedExpertGate = readQuantizedSegment(file, "shared-expert-scalar-gate");
+    layer.ffn = std::move(ffn);
+  };
+  return loadQwenTarget<Qwen3_6MoeWeights>(backend, directory, layout, source,
+                                           std::move(prepareCheck), alsoPrepared, readAffineFfn,
+                                           readBlockFfn);
 }
 
 } // namespace splash::model

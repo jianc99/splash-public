@@ -15,6 +15,7 @@
 #include "model/GgufImage.hpp"
 #include "model/GgufTarget.hpp"
 #include "model/GgufPreparation.hpp"
+#include "model/Qwen3_8.hpp"
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -645,6 +646,123 @@ void checkMoeLayer(splash::metal::MetalBackend *backend) {
   }
 }
 
+// A qwen35 target read from a GGUF through the production loader: every
+// projection a block projection of the layout's sizes, a fused one a segment
+// per tensor in the layout's padded width, the norms F32 and the GDN output in
+// the GGUF's tiled head order; the head and token table as the GGUF stores them.
+void checkDenseTarget(splash::metal::MetalBackend &backend) {
+  namespace model = splash::model;
+  namespace ops = splash::ops;
+  using namespace model::ggml;
+  model::Qwen3_8Layout layout;
+  layout.layers = 4;
+  layout.hiddenSize = 256;
+  layout.vocabularySize = 256;
+  layout.gdnKeyHeads = 1;
+  layout.gdnValueHeads = 2;
+  layout.gdnHeadDimension = 128;
+  layout.convolutionDimension = 512; // q and k of one head, v of two
+  layout.packedGdnWidth = 1280;      // qkv | z | alpha-beta and one padding tile
+  layout.attentionWidth = 256;
+  layout.attentionQueryHeads = 2;
+  layout.attentionKvHeads = 2;
+  layout.attentionHeadDimension = 128;
+  layout.packedFullWidth = 1024;     // q and its gate | k | v
+  layout.intermediateSize = 512;
+  const uint32_t hidden = layout.hiddenSize, heads = layout.gdnValueHeads;
+  const uint32_t valueRows = heads * layout.gdnHeadDimension, kvRows = layout.attentionKvHeads * layout.attentionHeadDimension;
+  std::vector<Tensor> tensors;
+  const auto add = [&](std::string name, std::vector<uint64_t> dims, uint32_t type) {
+    const model::GgmlTypeTraits &traits = *model::ggmlTypeTraits(type);
+    uint64_t elements = 1;
+    for (uint64_t dim : dims) elements *= dim;
+    tensors.push_back({std::move(name), std::move(dims), type,
+                       std::vector<uint8_t>(elements / traits.blockElements * traits.blockBytes, 0)});
+  };
+  add("output_norm.weight", {hidden}, kF32);
+  for (uint32_t layer = 0; layer < layout.layers; ++layer) {
+    const std::string p = "blk." + std::to_string(layer) + ".";
+    add(p + "attn_norm.weight", {hidden}, kF32);
+    if (layout.isFullAttentionLayer(layer)) {
+      add(p + "attn_q.weight", {hidden, 2 * layout.attentionWidth}, kQ8_0);
+      add(p + "attn_k.weight", {hidden, kvRows}, kQ4_K);
+      add(p + "attn_v.weight", {hidden, kvRows}, kQ6_K);
+      add(p + "attn_q_norm.weight", {layout.attentionHeadDimension}, kF32);
+      add(p + "attn_k_norm.weight", {layout.attentionHeadDimension}, kF32);
+      add(p + "attn_output.weight", {layout.attentionWidth, hidden}, kQ8_0);
+    } else {
+      add(p + "attn_qkv.weight", {hidden, layout.convolutionDimension}, kQ8_0);
+      add(p + "attn_gate.weight", {hidden, valueRows}, kQ4_K);
+      add(p + "ssm_beta.weight", {hidden, heads}, kQ8_0);
+      add(p + "ssm_alpha.weight", {hidden, heads}, kQ8_0);
+      add(p + "ssm_conv1d.weight", {4, layout.convolutionDimension}, kF32);
+      add(p + "ssm_a", {heads}, kF32);
+      add(p + "ssm_dt.bias", {heads}, kF32);
+      add(p + "ssm_norm.weight", {layout.gdnHeadDimension}, kF32);
+      add(p + "ssm_out.weight", {valueRows, hidden}, kQ8_0);
+    }
+    add(p + "post_attention_norm.weight", {hidden}, kF32);
+    add(p + "ffn_gate.weight", {hidden, layout.intermediateSize}, kQ4_K);
+    add(p + "ffn_up.weight", {hidden, layout.intermediateSize}, kQ4_K);
+    add(p + "ffn_down.weight", {layout.intermediateSize, hidden}, kQ6_K);
+  }
+  add("output.weight", {hidden, layout.vocabularySize}, kQ6_K);
+  add("token_embd.weight", {hidden, layout.vocabularySize}, kQ8_0);
+  char directory[] = "/tmp/splash-gguf-dense-XXXXXX";
+  if (!mkdtemp(directory)) {
+    check(false, "create a temporary directory");
+    return;
+  }
+  const std::vector<uint8_t> file = ggufFile(tensors, model::ggufTargetGeometry(layout));
+  std::ofstream(std::filesystem::path(directory) / "target.gguf", std::ios::binary)
+      .write(reinterpret_cast<const char *>(file.data()), file.size());
+  // The segments of a block projection of `n` x `k` by output width.
+  const auto blocks = [](const ops::Projection &p, uint32_t n, uint32_t k, std::vector<uint32_t> widths) {
+    if (p.layout() != ops::WeightLayout::Block32 || p.outputSize != n || p.inputSize != k ||
+        p.segments().size() != widths.size())
+      return false;
+    uint32_t offset = 0;
+    for (size_t i = 0; i < widths.size(); ++i) {
+      const ops::QuantizedSegment &s = p.segments()[i];
+      if (s.columnOffset != offset || s.outputSize != widths[i] || s.inputSize != k) return false;
+      offset += widths[i];
+    }
+    return true;
+  };
+  bool read = false;
+  try {
+    const model::Qwen3_8Weights weights =
+        model::loadQwen3_8Weights(backend, directory, layout, model::TargetSource::Gguf);
+    read = weights.layers.size() == layout.layers && weights.finalNorm.float32 &&
+           blocks(weights.logitsProjection, layout.vocabularySize, hidden, {layout.vocabularySize}) &&
+           std::string_view(weights.logitsProjection.segments().front().format) == "q6k" &&
+           !weights.tokenEmbedding.isAffine() && weights.tokenEmbedding.outputSize == layout.vocabularySize &&
+           weights.tokenEmbedding.inputSize == hidden && model::qwenTargetGeometry(weights).valid();
+    for (const auto &layer : weights.layers) {
+      read = read && layer.inputNorm.float32 && layer.postAttentionNorm.float32 &&
+             blocks(layer.gateProjection, layout.intermediateSize, hidden, {layout.intermediateSize}) &&
+             blocks(layer.upProjection, layout.intermediateSize, hidden, {layout.intermediateSize}) &&
+             blocks(layer.downProjection, hidden, layout.intermediateSize, {hidden});
+      if (const auto *gdn = std::get_if<model::QwenGdnWeights>(&layer.mixer))
+        read = read && blocks(gdn->inputProjection, layout.packedGdnWidth, hidden,
+                              {layout.convolutionDimension, valueRows, 256}) &&
+               blocks(gdn->outputProjection, hidden, valueRows, {hidden}) && gdn->mixerNorm.float32 &&
+               gdn->outputHeadOrder == ops::GdnHeadOrder::Tiled;
+      else {
+        const auto &attention = std::get<model::QwenAttentionWeights>(layer.mixer);
+        read = read && blocks(attention.inputProjection, layout.packedFullWidth, hidden,
+                              {2 * layout.attentionWidth, kvRows, kvRows}) &&
+               blocks(attention.outputProjection, hidden, layout.attentionWidth, {hidden}) &&
+               attention.queryNorm.float32 && attention.keyNorm.float32;
+      }
+    }
+  } catch (const std::exception &error) {
+    std::fprintf(stderr, "%s\n", error.what());
+  }
+  std::filesystem::remove_all(directory);
+  check(read, "the target loader reads a GGUF as block projections of the layout's sizes");
+}
+
 // Keys follow the tensor data the images read: a GGUF whose metadata alone
 // changes (a chat template, so every tensor moves in the file) keeps every
 // prepared image, and a changed tensor byte prepares the images again.
@@ -977,6 +1095,7 @@ int main(int argc, char **argv) {
     if (gpu) {
       checkGoldenImages(*gpu);
       checkSourceIdentity(*gpu);
+      checkDenseTarget(*gpu);
       const Shape shapes[] = {{512, 1024, kNoPermute, 0, 0, 0},
                               {768, 1280, 256, 16, 8, 4},
                               {768, 8448, 128, 16, 8, 5}};
