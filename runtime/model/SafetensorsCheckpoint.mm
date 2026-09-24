@@ -24,6 +24,7 @@ uint64_t number(id value) {
 }
 
 NSDictionary *object(NSData *data) {
+  if (!data) throw WeightStoreError("unreadable safetensors JSON");
   id parsed = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
   if (![parsed isKindOfClass:[NSDictionary class]]) throw WeightStoreError("invalid safetensors JSON object");
   return parsed;
@@ -54,6 +55,7 @@ SafetensorsCheckpoint::SafetensorsCheckpoint(const std::filesystem::path &direct
     if (std::filesystem::file_size(configPath) > 1024 * 1024)
       throw WeightStoreError("source configuration exceeds metadata bound");
     NSData *configuration = [NSData dataWithContentsOfFile:[NSString stringWithUTF8String:configPath.c_str()]];
+    if (!configuration) throw WeightStoreError("cannot read " + configPath.string());
     NSDictionary *config = object(configuration);
     id quantization = config[@"quantization"] ?: config[@"quantization_config"];
     if (quantization && ![quantization isKindOfClass:[NSDictionary class]])
