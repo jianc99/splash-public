@@ -785,27 +785,15 @@ int main(int argc, char **argv) {
             "cannot measure available host memory before loading the oracle model");
     require(*hostAvailableBytes > hostReserveBytes,
             "available host memory does not cover the protected macOS reserve");
-    uint64_t remainingModelBytes = *hostAvailableBytes - hostReserveBytes;
     const std::filesystem::path modelRoot(argv[2]);
-    bool hasModelBytes = false;
-    // Match production's packed-file preflight before any model mappings.
-    // Subtract from available capacity so package sizes cannot overflow a sum.
-    for (const char *directory : {"target", "draft", "vision"}) {
-      for (const auto &entry :
-           std::filesystem::recursive_directory_iterator(modelRoot / directory)) {
-        if (!entry.is_regular_file())
-          continue;
-        const auto bytes = entry.file_size();
-        require(bytes <= remainingModelBytes,
-                "oracle model loading exceeds available host memory after protecting " +
-                    std::to_string(hostReserveBytes) + " bytes for macOS");
-        remainingModelBytes -= bytes;
-        hasModelBytes |= bytes != 0;
-      }
-    }
-    require(hasModelBytes, "oracle model package contains no nonempty regular files");
+    const auto descriptor = model::inspectModelPackage(modelRoot);
+    // Production's weight preflight, before any model mappings.
+    require(model::preparedModelWeightBytes(modelRoot, descriptor) <=
+                *hostAvailableBytes - hostReserveBytes,
+            "oracle model loading exceeds available host memory after protecting " +
+                std::to_string(hostReserveBytes) + " bytes for macOS");
     model::ModelPackage model =
-        model::loadModelPackage(backend, modelRoot);
+        model::loadModelPackage(backend, modelRoot, descriptor);
     ops::ExecutionPlans operators(backend.capabilities());
     model::ModelMemoryPlan executorPlan =
         model::plannedRuntimeMemory(backend.capabilities(), model, operators, format);

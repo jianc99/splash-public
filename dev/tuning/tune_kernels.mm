@@ -104,19 +104,6 @@ Options parse(int argc, char **argv) {
   return options;
 }
 
-uint64_t packageBytes(const std::filesystem::path &root) {
-  uint64_t total = 0;
-  for (const std::string_view directory : {"target", "draft", "vision"}) {
-    for (const auto &entry : std::filesystem::recursive_directory_iterator(root / directory)) {
-      if (!entry.is_regular_file()) continue;
-      constexpr uint64_t padding = model::kWeightFileAlignment - 1;
-      total += (entry.file_size() + padding) & ~padding;
-    }
-  }
-  if (!total) throw std::invalid_argument("empty model package");
-  return total;
-}
-
 std::string_view name(LinearTile tile) {
   switch (tile) {
   case LinearTile::N128: return "LinearTile::N128";
@@ -402,9 +389,10 @@ int main(int argc, char **argv) {
         return !interrupted && !underPressure() && governed(bytes, allocate);
       };
 
+      const auto descriptor = model::inspectModelPackage(modelRoot);
       std::optional<model::ModelPackage> package;
-      if (!admit(packageBytes(modelRoot),
-                 [&] { package.emplace(model::loadModelPackage(backend, modelRoot)); }))
+      if (!admit(model::preparedModelWeightBytes(modelRoot, descriptor),
+                 [&] { package.emplace(model::loadModelPackage(backend, modelRoot, descriptor)); }))
         throw std::runtime_error("model package memory admission denied or interrupted");
       const auto workloads =
           model::collectTuningWorkloads(*package, kPrefillProbeRows, kDecodeProbeWidths);
