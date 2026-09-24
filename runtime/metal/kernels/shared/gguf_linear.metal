@@ -17,20 +17,20 @@ using namespace metal;
 using namespace mpp::tensor_ops;
 enum Epilogue : ushort { EpNone = GGUF_EPILOGUE_NONE, EpResidual = GGUF_EPILOGUE_RESIDUAL, EpUpWithGate = GGUF_EPILOGUE_UP_WITH_GATE };
 inline float silu_gate(float g) { return g / (1.0f + fast::exp2(-1.44269504089f * g)); }
-constant constexpr ushort kStorageN = 256;
 
 // ---- staged dequantization (kernels/common/quant_formats.h): one thread writes one column's group of 32 as half,
 // each value rounded once; chunk c's pairs 0, 1 go to dst + 4c and pairs 2, 3 to dst + 16 + 4c.
 template <class F>
 inline half2 staged_linear(uint pair, float s, float m) {
-  const float2 code = float2(as_type<half2>(pair | 0x64006400u) - half2(half(1024 + F::Zero)));   // exact
+  // 0x6400 is half 1024, whose ulp is 1: or-ing a code into its mantissa makes 1024 + code, exactly.
+  const float2 code = float2(as_type<half2>(pair | 0x64006400u) - half2(half(1024 + F::Zero)));
   if constexpr (F::Zero) return half2(code * s);
   else return half2(fma(code, float2(s), float2(m)));
 }
 template <class F>
 inline void dequant32(typename F::Payload w, typename F::Meta meta, ushort j, threadgroup half2 *tl, threadgroup half *dst) {
   QuantCoef k;
-  if constexpr (F::Kind == QuantGrid) k = F::coef(meta, F::chunk(w, 0)); else k = F::coef(meta, j);
+  if constexpr (F::ScaleInPlane0) k = F::coef(meta, F::chunk(w, 0)); else k = F::coef(meta, j);
 #pragma unroll
   for (ushort c = 0; c < 4; ++c) {
     const typename F::Chunk q = F::chunk(w, c);
@@ -103,10 +103,10 @@ inline void sg_accum(device TA *input, device uchar *w0, device uchar *w1, devic
   constexpr auto descriptor = matmul2d_descriptor(Rows, Cols, KS, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
   matmul2d<descriptor, execution_simdgroups<1>> operation;
   const uint groups = input_size / 32, units = groups / F::MetaGroups;
-  const uint tile = output_origin / kStorageN, tile_offset = output_origin % kStorageN;
-  device uchar *tw0 = w0 + (ulong(tile) * groups * kStorageN + tile_offset) * F::P0;
-  device uchar *tw1 = w1 + (ulong(tile) * groups * kStorageN + tile_offset) * F::P1;
-  device uchar *tmeta = meta + (ulong(tile) * units * kStorageN + tile_offset) * F::MetaBytes;
+  const uint tile = output_origin / QUANT_TILE_ROWS, tile_offset = output_origin % QUANT_TILE_ROWS;
+  device uchar *tw0 = w0 + (ulong(tile) * groups * QUANT_TILE_ROWS + tile_offset) * F::P0;
+  device uchar *tw1 = w1 + (ulong(tile) * groups * QUANT_TILE_ROWS + tile_offset) * F::P1;
+  device uchar *tmeta = meta + (ulong(tile) * units * QUANT_TILE_ROWS + tile_offset) * F::MetaBytes;
   tensor<threadgroup half, dextents<int, 2>, tensor_inline> bt0(stage, dextents<int, 2>{KS, Cols}, array<int, 2>{1, KS});
   tensor<threadgroup half, dextents<int, 2>, tensor_inline> bt1(stage + (Buffers > 1 ? KS * Cols : 0), dextents<int, 2>{KS, Cols}, array<int, 2>{1, KS});
   auto b0 = bt0.slice<KS, Cols>(0, 0), b1 = bt1.slice<KS, Cols>(0, 0);
@@ -119,9 +119,9 @@ inline void sg_accum(device TA *input, device uchar *w0, device uchar *w1, devic
 #pragma unroll
     for (ushort pf = 0; pf < Prefetch; ++pf) {
       const ulong g = ulong(step_begin + pf) * GPS + gi;
-      if (live && step_begin + pf < step_end) packed[pf][it] = F::load(tw0 + (g * kStorageN + col) * F::P0, tw1 + (g * kStorageN + col) * F::P1);
+      if (live && step_begin + pf < step_end) packed[pf][it] = F::load(tw0 + (g * QUANT_TILE_ROWS + col) * F::P0, tw1 + (g * QUANT_TILE_ROWS + col) * F::P1);
     }
-    hdr[it] = F::loadMeta(tmeta + (ulong(unit0) * kStorageN + col) * F::MetaBytes); hdr_unit[it] = unit0;
+    hdr[it] = F::loadMeta(tmeta + (ulong(unit0) * QUANT_TILE_ROWS + col) * F::MetaBytes); hdr_unit[it] = unit0;
   }
   for (uint step = step_begin; step < step_end; ++step) {
     threadgroup half *buf = stage + (Buffers > 1 ? (step & 1) * (KS * Cols) : 0);
@@ -130,7 +130,7 @@ inline void sg_accum(device TA *input, device uchar *w0, device uchar *w1, devic
     for (ushort it = 0; it < IPT; ++it) {
       const uint item = simd_lane + it * 32; if (item >= Items) break;
       const uint col = item % Cols, gi = item / Cols, g = step * GPS + gi, unit = g / F::MetaGroups; const ushort j = g % F::MetaGroups;
-      if (unit != hdr_unit[it]) { hdr[it] = F::loadMeta(tmeta + (ulong(unit) * kStorageN + col) * F::MetaBytes); hdr_unit[it] = unit; }
+      if (unit != hdr_unit[it]) { hdr[it] = F::loadMeta(tmeta + (ulong(unit) * QUANT_TILE_ROWS + col) * F::MetaBytes); hdr_unit[it] = unit; }
       dequant32<F>(packed[0][it], hdr[it], j, tl, buf + col * KS + gi * 32);
     }
     simdgroup_barrier(mem_flags::mem_threadgroup);
@@ -143,7 +143,7 @@ inline void sg_accum(device TA *input, device uchar *w0, device uchar *w1, devic
       for (ushort it = 0; it < IPT; ++it) {
         const uint item = simd_lane + it * 32; if (item >= Items) break;
         const uint col = item % Cols, gi = item / Cols; const ulong g = ulong(step + Prefetch) * GPS + gi;
-        packed[Prefetch - 1][it] = F::load(tw0 + (g * kStorageN + col) * F::P0, tw1 + (g * kStorageN + col) * F::P1);
+        packed[Prefetch - 1][it] = F::load(tw0 + (g * QUANT_TILE_ROWS + col) * F::P0, tw1 + (g * QUANT_TILE_ROWS + col) * F::P1);
       }
     }
     auto a_slice = a.template slice<KS, Rows>(step * KS, 0);
@@ -186,10 +186,10 @@ inline void pf_tile(device TA *input, device uchar *w0, device uchar *w1, device
   constexpr auto descriptor = matmul2d_descriptor(RowsPerSG, TileN, KS, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
   matmul2d<descriptor, execution_simdgroups<1>> operation;
   const uint groups = input_size / 32, steps = groups / GPS, units = groups / F::MetaGroups;
-  const uint tile = output_origin / kStorageN, tile_offset = output_origin % kStorageN;
-  device uchar *tw0 = w0 + (ulong(tile) * groups * kStorageN + tile_offset) * F::P0;
-  device uchar *tw1 = w1 + (ulong(tile) * groups * kStorageN + tile_offset) * F::P1;
-  device uchar *tmeta = meta + (ulong(tile) * units * kStorageN + tile_offset) * F::MetaBytes;
+  const uint tile = output_origin / QUANT_TILE_ROWS, tile_offset = output_origin % QUANT_TILE_ROWS;
+  device uchar *tw0 = w0 + (ulong(tile) * groups * QUANT_TILE_ROWS + tile_offset) * F::P0;
+  device uchar *tw1 = w1 + (ulong(tile) * groups * QUANT_TILE_ROWS + tile_offset) * F::P1;
+  device uchar *tmeta = meta + (ulong(tile) * units * QUANT_TILE_ROWS + tile_offset) * F::MetaBytes;
   auto a0 = a.template slice<KS, RowsPerSG>(0, 0);
   tensor<threadgroup half, dextents<int, 2>, tensor_inline> bt0(stage, dextents<int, 2>{KS, TileN}, array<int, 2>{1, KS});
   tensor<threadgroup half, dextents<int, 2>, tensor_inline> bt1(stage + KS * TileN, dextents<int, 2>{KS, TileN}, array<int, 2>{1, KS});
@@ -206,7 +206,7 @@ inline void pf_tile(device TA *input, device uchar *w0, device uchar *w1, device
 #pragma unroll
     for (ushort pf = 0; pf < Prefetch; ++pf) {
       const ulong g = ulong(pf) * GPS + gi;
-      if (live && pf < steps) packed[pf][it] = F::load(tw0 + (g * kStorageN + col) * F::P0, tw1 + (g * kStorageN + col) * F::P1);
+      if (live && pf < steps) packed[pf][it] = F::load(tw0 + (g * QUANT_TILE_ROWS + col) * F::P0, tw1 + (g * QUANT_TILE_ROWS + col) * F::P1);
     }
     hdr[it] = F::loadMeta(tmeta + col * F::MetaBytes); hdr_unit[it] = 0;
   }
@@ -219,7 +219,7 @@ inline void pf_tile(device TA *input, device uchar *w0, device uchar *w1, device
       for (ushort it = 0; it < IPT; ++it) {
         const uint item = thread_index + it * Threads; if (item >= Items) break;
         const uint col = item % TileN, gi = item / TileN, g = step * GPS + gi, unit = g / F::MetaGroups; const ushort j = g % F::MetaGroups;
-        if (unit != hdr_unit[it]) { hdr[it] = F::loadMeta(tmeta + (ulong(unit) * kStorageN + col) * F::MetaBytes); hdr_unit[it] = unit; }
+        if (unit != hdr_unit[it]) { hdr[it] = F::loadMeta(tmeta + (ulong(unit) * QUANT_TILE_ROWS + col) * F::MetaBytes); hdr_unit[it] = unit; }
         dequant32<F>(packed[0][it], hdr[it], j, tl, buf + col * KS + gi * 32);
       }
       threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -232,7 +232,7 @@ inline void pf_tile(device TA *input, device uchar *w0, device uchar *w1, device
         for (ushort it = 0; it < IPT; ++it) {
           const uint item = thread_index + it * Threads; if (item >= Items) break;
           const uint col = item % TileN, gi = item / TileN; const ulong g = ulong(step + Prefetch) * GPS + gi;
-          packed[Prefetch - 1][it] = F::load(tw0 + (g * kStorageN + col) * F::P0, tw1 + (g * kStorageN + col) * F::P1);
+          packed[Prefetch - 1][it] = F::load(tw0 + (g * QUANT_TILE_ROWS + col) * F::P0, tw1 + (g * QUANT_TILE_ROWS + col) * F::P1);
         }
       }
       if constexpr (decltype(with_matmuls)::value) {
@@ -321,8 +321,7 @@ inline void gguf_decode_tile(device bfloat *input, device uchar *w0, device ucha
     gguf_decode_tile<F, R, EP>(input, w0, w1, meta, output, partials, counters, aux, p, group, simd_lane, simd_group, stage, tl, &arrival); }
 #define GGUF_DECODE_ROWS(F, f, EP, ep) GGUF_DECODE_K(F, f, 8, EP, ep) GGUF_DECODE_K(F, f, 16, EP, ep) GGUF_DECODE_K(F, f, 32, EP, ep)
 #define GGUF_DECODE_SET(F, f) GGUF_DECODE_ROWS(F, f, EpNone, a) GGUF_DECODE_ROWS(F, f, EpResidual, r) GGUF_DECODE_ROWS(F, f, EpUpWithGate, g)
-GGUF_DECODE_SET(FmtQ4K, q4k) GGUF_DECODE_SET(FmtIQ4XS, iq4xs) GGUF_DECODE_SET(FmtIQ4NL, iq4nl) GGUF_DECODE_SET(FmtQ5K, q5k)
-GGUF_DECODE_SET(FmtQ6K, q6k) GGUF_DECODE_SET(FmtQ3K, q3k) GGUF_DECODE_SET(FmtQ80, q80) GGUF_DECODE_SET(FmtIQ3S, iq3s)
+QUANT_FORMATS(GGUF_DECODE_SET)
 
 // Fused projections (qkv|z|ab, q|k|v): up to three column segments of any formats in one dispatch, so the small
 // segments do not run as dispatches of their own. The threadgroup's tile picks its segment, and the segment's format
@@ -355,14 +354,7 @@ GGUF_DECODE_FUSED_K(8) GGUF_DECODE_FUSED_K(16) GGUF_DECODE_FUSED_K(32)
 
 #define PROD_SET(F, f) \
   PF_K(F, f, bfloat, a, 32, 4, 64, 64, 1) PFE_K(F, f, EpResidual, r, 32, 4, 64, 64, 1) PFE_K(F, f, EpUpWithGate, g, 32, 4, 64, 64, 1)
-PROD_SET(FmtQ4K, q4k)
-PROD_SET(FmtIQ4XS, iq4xs)
-PROD_SET(FmtIQ4NL, iq4nl)
-PROD_SET(FmtQ5K, q5k)
-PROD_SET(FmtQ6K, q6k)
-PROD_SET(FmtQ3K, q3k)
-PROD_SET(FmtQ80, q80)
-PROD_SET(FmtIQ3S, iq3s)
+QUANT_FORMATS(PROD_SET)
 
 // ---------------- MoE experts (ops/MoE.cpp; kernels/shared/moe.metal groups the rows): threadgroup (x, y) computes
 // 64 columns of grouped tile y with the weights of the tile's expert (moe_gguf_segment), in the format the tile picks

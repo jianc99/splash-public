@@ -1,23 +1,59 @@
 #pragma once
 
-// GGUF quantized projection parameters shared by host dispatch code and Metal
-// kernels (kernels/shared/gguf_linear.metal).
+// GGUF quantized projection parameters and tile geometry shared by host
+// dispatch code and Metal kernels: the staged tiles of
+// kernels/shared/gguf_linear.metal and kernels/shared/moe_gguf.metal, and the
+// Apple9 register tile of kernels/decode/linear_gguf_sgmatrix.metal.
 #include "metal/abi/QuantFormat.h"
 
-// Prefill tiles (pf kernels): the grid covers whole 128-row tiles of the chunk; the simdgroups of the last tile
-// whose rows start past `rows` skip their matmuls.
+// Every tile covers GGUF_TILE_COLUMNS output columns (grid.x counts tiles).
+#define GGUF_TILE_COLUMNS 64u
+// Decode tile of the staged kernels, which also runs prefill chunks of up to
+// 32 rows: two simdgroups, each staging its own GGUF_STAGED_COLUMNS columns
+// GGUF_STAGED_STEP inputs at a time over 8, 16 or 32 rows.
+#define GGUF_STAGED_COLUMNS 32u
+#define GGUF_STAGED_STEP 32u
+#define GGUF_STAGED_THREADS (GGUF_TILE_COLUMNS / GGUF_STAGED_COLUMNS * 32u)
+// Prefill tile of the staged kernels: GGUF_PREFILL_SIMDGROUPS simdgroups of
+// GGUF_PREFILL_SIMDGROUP_ROWS rows share one stage of GGUF_PREFILL_STEP
+// inputs of the tile's columns, which all threads dequantize.
+#define GGUF_PREFILL_SIMDGROUP_ROWS 32u
+#define GGUF_PREFILL_SIMDGROUPS 4u
+#define GGUF_PREFILL_STEP 64u
+#define GGUF_PREFILL_ROWS (GGUF_PREFILL_SIMDGROUP_ROWS * GGUF_PREFILL_SIMDGROUPS)
+#define GGUF_PREFILL_THREADS (GGUF_PREFILL_SIMDGROUPS * 32u)
+// Apple9 register tile: four simdgroups of GGUF_REGISTER_COLUMNS columns.
+#define GGUF_REGISTER_COLUMNS 16u
+#define GGUF_REGISTER_THREADS (GGUF_TILE_COLUMNS / GGUF_REGISTER_COLUMNS * 32u)
+
+// The register tile's activations, Table16 (kernels/common/gguf_sgmatrix.h):
+// per eight-row tile of `width` inputs, the X^T table of width * 8 bfloat,
+// then the fp32 chain seeds [width / 16][8 rows] and sums [width / 32][8
+// rows]. Each 64-input span holds these values, seeds and sums per tile.
+#define GGUF_TABLE16_SPAN_INPUTS 64u
+#define GGUF_TABLE16_SPAN_VALUES 512u
+#define GGUF_TABLE16_SPAN_SEEDS 32u
+#define GGUF_TABLE16_SPAN_SUMS 16u
+inline constexpr uint64_t table16_sums32_offset(uint32_t width) { return uint64_t(width) / 16 * 8; }
+inline constexpr uint64_t table16_sums_per_tile(uint32_t width) {
+  return table16_sums32_offset(width) + uint64_t(width) / 32 * 8;
+}
+
+// Prefill tiles: the grid covers whole GGUF_PREFILL_ROWS-row tiles of the
+// chunk; the simdgroups of the last tile whose rows start past `rows` skip
+// their matmuls.
 struct GgufPrefillParams {
   uint32_t output_size; // columns of this segment
   uint32_t input_size;  // K
   uint32_t rows;        // rows of the chunk
-  uint32_t out_stride;  // row stride of the destination (0 = output_size)
+  uint32_t out_stride;  // row stride of the destination
   uint32_t out_offset;  // first destination column of this segment
 };
 static_assert(sizeof(GgufPrefillParams) == 20, "GGUF prefill parameters are 20 bytes on both sides");
 
-// Decode tiles of both families (kernels/decode/linear_gguf_sgmatrix.metal on
-// Apple9, kernels/shared/gguf_linear.metal elsewhere): one tensor per dispatch,
-// over the dispatch's 64-column tiles (grid.x) and K partitions (grid.y).
+// Decode tiles of both families (the register tile on Apple9, the staged
+// tile elsewhere and for prefill chunks of up to 32 rows): one tensor per
+// dispatch, over the dispatch's tiles (grid.x) and K partitions (grid.y).
 struct GgufDecodeParams {
   uint32_t input_size;  // K
   uint32_t splits;      // K partitions; 1 = no cross-threadgroup reduction

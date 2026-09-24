@@ -18,11 +18,5 @@ kernel void gguf_test_dequant_##name(device uchar *w0 [[buffer(0)]], \
   for (uint i = 0; i < 32; ++i) output[ulong(tid) * 32 + i] = stage[lane * 32 + i]; \
 }
 
-DEQUANT_TEST(FmtQ4K, q4k)
-DEQUANT_TEST(FmtIQ4XS, iq4xs)
-DEQUANT_TEST(FmtIQ4NL, iq4nl)
-DEQUANT_TEST(FmtQ5K, q5k)
-DEQUANT_TEST(FmtQ6K, q6k)
-DEQUANT_TEST(FmtQ3K, q3k)
-DEQUANT_TEST(FmtQ80, q80)
-DEQUANT_TEST(FmtIQ3S, iq3s)
+QUANT_FORMATS(DEQUANT_TEST)
+#undef DEQUANT_TEST

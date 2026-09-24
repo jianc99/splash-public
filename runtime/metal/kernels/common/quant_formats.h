@@ -8,12 +8,14 @@ using namespace metal;
 // by the GEMM kernels. A group is read by chunk (metal/abi/QuantFormat.h):
 // chunk c holds pairs p = 0..3; pairs 0, 1 are elements 4c..4c+3 of the first
 // 16-group and pairs 2, 3 are elements 16+4c..16+4c+3 of the second. A format
-// has its sizes P0, P1, MetaBytes and MetaGroups from kQuantFormats and
+// has its id, its sizes P0, P1, MetaBytes and MetaGroups from kQuantFormats,
+// its code offset Zero (0 but for the linear formats with a zero point) and
 //   load(plane0, plane1) -> Payload, loadMeta(meta) -> Meta
 //   chunk(Payload, c) -> Chunk
 //   loadChunk(plane0, plane1, c) -> Chunk, the same chunk read on its own
 //   coef(Meta, j) -> QuantCoef of group j of the meta unit
-//     (IQ3_S: coef(Meta, Chunk), its group scale is in every chunk)
+//     (ScaleInPlane0, only IQ3_S: coef(Meta, Chunk), the group's scale is in
+//     every chunk of plane0 rather than in the meta unit)
 // and one element accessor, by Kind:
 //   QuantLinear    codes(Chunk) -> uint4, pair p in component p with e0 at
 //                  bit 0 and e1 at bit 16; value = s * (code - Zero) + m
@@ -33,16 +35,21 @@ struct QuantCoef {
   float m;
 };
 
-#define QUANT_FORMAT(F, K)                                                                                      \
-  enum : uint { P0 = kQuantFormats[F].plane0_bytes, P1 = kQuantFormats[F].plane1_bytes, MetaBytes = kQuantFormats[F].meta_bytes }; \
-  enum : ushort { MetaGroups = kQuantFormats[F].meta_groups };                                                   \
-  static constexpr constant QuantKind Kind = K
+// The id, sizes and traits of format F of kind K with code offset Z. IQ3_S, the one grid format, is also the one
+// irregular format, whose group scales are in plane0.
+#define QUANT_FORMAT(F, K, Z)                                                                                   \
+  enum : uint { Id = F, P0 = kQuantFormats[F].plane0_bytes, P1 = kQuantFormats[F].plane1_bytes, MetaBytes = kQuantFormats[F].meta_bytes }; \
+  enum : ushort { MetaGroups = kQuantFormats[F].meta_groups, Zero = Z };                                         \
+  static constexpr constant QuantKind Kind = K;                                                                  \
+  static constexpr constant bool ScaleInPlane0 = K == QuantGrid
 
+// Entries of the IQ4 pair table: one per index byte.
+constant constexpr uint kQuantPairTableEntries = 256;
 // Fills the codebook formats' threadgroup table of IQ4 value pairs, entry b =
 // (kIQ4NLValues[b & 15], kIQ4NLValues[b >> 4]) for the index byte b of a pair;
 // called by all threads of the threadgroup.
 inline void quant_iq4_pair_table(threadgroup half2 *table, uint thread_index, uint threads) {
-  for (uint i = thread_index; i < 256; i += threads) table[i] = half2(half(kIQ4NLValues[i & 15]), half(kIQ4NLValues[i >> 4]));
+  for (uint i = thread_index; i < kQuantPairTableEntries; i += threads) table[i] = half2(half(kIQ4NLValues[i & 15]), half(kIQ4NLValues[i >> 4]));
   threadgroup_barrier(mem_flags::mem_threadgroup);
 }
 
@@ -75,7 +82,7 @@ inline QuantCoef quant_k4_coef(uint4 hdr, ushort j) {
 
 // Q4_K: plane0 4-bit codes; meta the 16-byte block header.
 struct FmtQ4K {
-  QUANT_FORMAT(GGUF_FMT_Q4K, QuantLinear); enum : ushort { Zero = 0 };
+  QUANT_FORMAT(GGUF_FMT_Q4K, QuantLinear, 0);
   struct Payload { uint4 a; }; typedef uint Chunk; typedef uint4 Meta;
   static Payload load(device uchar *p0, device uchar *) { return {*((device uint4 *)p0)}; }
   static Meta loadMeta(device uchar *m) { return *((device uint4 *)m); }
@@ -86,7 +93,7 @@ struct FmtQ4K {
 };
 // Q5_K: plane0 low 4 bits, plane1 the fifth bits (byte c = chunk c); meta as Q4_K.
 struct FmtQ5K {
-  QUANT_FORMAT(GGUF_FMT_Q5K, QuantLinear); enum : ushort { Zero = 0 };
+  QUANT_FORMAT(GGUF_FMT_Q5K, QuantLinear, 0);
   struct Payload { uint4 a; uint b; }; typedef uint2 Chunk; typedef uint4 Meta;
   static Payload load(device uchar *p0, device uchar *p1) { return {*((device uint4 *)p0), *((device uint *)p1)}; }
   static Meta loadMeta(device uchar *m) { return *((device uint4 *)m); }
@@ -100,7 +107,7 @@ struct FmtQ5K {
 // Q6_K: plane0 low 4 bits, plane1 the high 2 bits (halfword c = chunk c); meta 16 int8 scales, then half d.
 // value = d * sc * (q - 32) with one scale per 16-group.
 struct FmtQ6K {
-  QUANT_FORMAT(GGUF_FMT_Q6K, QuantLinear); enum : ushort { Zero = 32 };
+  QUANT_FORMAT(GGUF_FMT_Q6K, QuantLinear, 32);
   struct Payload { uint4 a; uint2 b; }; typedef uint2 Chunk; struct Meta { packed_uint4 sc; uint d; };
   static Payload load(device uchar *p0, device uchar *p1) { return {*((device uint4 *)p0), *((device uint2 *)p1)}; }
   static Meta loadMeta(device uchar *m) { Meta r; r.sc = *((device packed_uint4 *)m); r.d = *((device uint *)(m + 16)); return r; }
@@ -119,7 +126,7 @@ struct FmtQ6K {
 // Q3_K: plane0 low 2 bits (halfword c = chunk c), plane1 the hmask bits (byte c = chunk c); meta half d, 2 zero
 // bytes, the 12 packed scale bytes. value = d * (sc - 32) * (q - 4) with one scale per 16-group.
 struct FmtQ3K {
-  QUANT_FORMAT(GGUF_FMT_Q3K, QuantLinear); enum : ushort { Zero = 4 };
+  QUANT_FORMAT(GGUF_FMT_Q3K, QuantLinear, 4);
   struct Payload { uint2 a; uint b; }; typedef uint2 Chunk; typedef uint4 Meta;
   static Payload load(device uchar *p0, device uchar *p1) { return {*((device uint2 *)p0), *((device uint *)p1)}; }
   static Meta loadMeta(device uchar *m) { return *((device uint4 *)m); }
@@ -146,7 +153,7 @@ struct FmtQ3K {
 };
 // IQ4_XS: plane0 codebook indices; meta half d, scales_h, scales_l[4]. value = d * (ls - 32) * codebook.
 struct FmtIQ4XS {
-  QUANT_FORMAT(GGUF_FMT_IQ4XS, QuantCodebook);
+  QUANT_FORMAT(GGUF_FMT_IQ4XS, QuantCodebook, 0);
   struct Payload { uint4 a; }; typedef uint Chunk; typedef uint2 Meta; typedef float Scale;
   static Payload load(device uchar *p0, device uchar *) { return {*((device uint4 *)p0)}; }
   static Meta loadMeta(device uchar *m) { return *((device uint2 *)m); }
@@ -161,7 +168,7 @@ struct FmtIQ4XS {
 };
 // IQ4_NL: plane0 codebook indices; meta half d per group. value = d * codebook.
 struct FmtIQ4NL {
-  QUANT_FORMAT(GGUF_FMT_IQ4NL, QuantCodebook);
+  QUANT_FORMAT(GGUF_FMT_IQ4NL, QuantCodebook, 0);
   struct Payload { uint4 a; }; typedef uint Chunk; typedef ushort Meta; typedef half Scale;
   static Payload load(device uchar *p0, device uchar *) { return {*((device uint4 *)p0)}; }
   static Meta loadMeta(device uchar *m) { return *((device ushort *)m); }
@@ -172,7 +179,7 @@ struct FmtIQ4NL {
 };
 // Q8_0: plane0 int8 values (bytes 8c..8c+7 = chunk c); meta half d per group.
 struct FmtQ80 {
-  QUANT_FORMAT(GGUF_FMT_Q80, QuantInt8);
+  QUANT_FORMAT(GGUF_FMT_Q80, QuantInt8, 0);
   struct Payload { uint4 a; uint4 b; }; typedef uint2 Chunk; typedef ushort Meta; typedef half Scale;
   static Payload load(device uchar *p0, device uchar *) { return {*((device uint4 *)p0), *((device uint4 *)(p0 + 16))}; }
   static Meta loadMeta(device uchar *m) { return *((device ushort *)m); }
@@ -184,7 +191,7 @@ struct FmtQ80 {
 // IQ3_S: plane0 word c = the 8-bit grid indices of pairs 0, 1 and 2, 3, chunk c's sign bits, the two ninth index
 // bits and the group's 4-bit scale; meta half d per super-block. value = d * (1 + 2 * scale) * signed grid value.
 struct FmtIQ3S {
-  QUANT_FORMAT(GGUF_FMT_IQ3S, QuantGrid);
+  QUANT_FORMAT(GGUF_FMT_IQ3S, QuantGrid, 0);
   struct Payload { uint4 a; }; typedef uint Chunk; typedef ushort Meta;
   static Payload load(device uchar *p0, device uchar *) { return {*((device uint4 *)p0)}; }
   static Meta loadMeta(device uchar *m) { return *((device ushort *)m); }
@@ -197,8 +204,13 @@ struct FmtIQ3S {
 
 #undef QUANT_FORMAT
 
+// Every format as X(format type, kernel name token), the token being its kQuantFormats name.
+#define QUANT_FORMATS(X) \
+  X(FmtQ4K, q4k) X(FmtIQ4XS, iq4xs) X(FmtIQ4NL, iq4nl) X(FmtQ5K, q5k) X(FmtQ6K, q6k) X(FmtQ3K, q3k) X(FmtQ80, q80) X(FmtIQ3S, iq3s)
+
 // Runs body(F()) with the format type of run-time format id `format` (GGUF_FMT_*), for kernels whose tiles pick
-// their tensor, and so its format, at run time. The branch is uniform in a threadgroup.
+// their tensor, and so its format, at run time. The branch is uniform in a threadgroup. The host passes known ids
+// only; any other decodes as IQ3_S.
 template <class Body>
 inline void quant_format_switch(uint format, Body body) {
   switch (format) {
@@ -209,6 +221,18 @@ inline void quant_format_switch(uint format, Body body) {
   case GGUF_FMT_Q6K: body(FmtQ6K()); break;
   case GGUF_FMT_Q3K: body(FmtQ3K()); break;
   case GGUF_FMT_Q80: body(FmtQ80()); break;
+  case GGUF_FMT_IQ3S:
   default: body(FmtIQ3S()); break;
   }
 }
+
+// The switch and QUANT_FORMATS name every format, the latter by its kQuantFormats name.
+static_assert(GGUF_FMT_COUNT == 8, "quant_format_switch and QUANT_FORMATS list every format");
+template <uint N> constexpr bool quant_format_named(uint id, const constant char (&token)[N]) {
+  for (uint i = 0; i < N; ++i)
+    if (kQuantFormats[id].name[i] != token[i]) return false;
+  return true;
+}
+#define QUANT_FORMAT_NAME(F, f) static_assert(quant_format_named(F::Id, #f), #f " is not its kQuantFormats name");
+QUANT_FORMATS(QUANT_FORMAT_NAME)
+#undef QUANT_FORMAT_NAME
