@@ -738,6 +738,64 @@ void testInvalidPromptTokensStayRequestScoped() {
           "invalid tokens reached admission or prevented subsequent completion");
 }
 
+// Ready announces vision exactly when the engine admits images. Without
+// vision an image request fails by itself and the engine keeps serving.
+void testImageRequestWithoutVisionStaysRequestScoped() {
+  for (const bool vision : {true, false}) {
+    Backing backing(32);
+    KvPool pool(backing);
+    engine::Cache resources(pool, CacheNamespace{});
+    Executor executor;
+    std::vector<uint8_t> output;
+    engine::NativeLoopConfig config;
+    config.engine.maxContext = 1024;
+    if (!vision)
+      config.engine.maxImagePatches = 0;
+    engine::NativeRuntime loop(
+        config, resources, executor,
+        [&](std::span<const uint8_t> bytes) {
+          output.insert(output.end(), bytes.begin(), bytes.end());
+        },
+        [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
+        {[] { return uint64_t{1'000'000}; }, [] { return 100.0; }});
+    loop.announceReady();
+    const auto announced = decodeMessages(output);
+    const auto *ready = std::get_if<protocol::ReadyEvent>(&announced.front());
+    require(ready && ready->featureBits ==
+                         (vision ? protocol::kNativeFeatureBits |
+                                       protocol::FeatureVision
+                                 : protocol::kNativeFeatureBits),
+            "Ready did not announce whether the model has vision");
+    if (vision)
+      continue;
+    auto image = request(9);
+    image.imageSpans = {{8, 16, 8, 8, 1, 2}};
+    image.imagePixels.assign(image.imageSpans[0].pixelBytes(), 1);
+    for (const protocol::RequestFrame &frame : {image, request(1)}) {
+      const auto wire = protocol::serializeMessage(protocol::Message{frame});
+      require(wire && loop.receive(*wire.value),
+              "image request closed the native connection");
+    }
+    runUntilIdle(loop);
+    uint32_t errors = 0, done = 0;
+    for (const auto &message : decodeMessages(output)) {
+      if (const auto *error = std::get_if<protocol::ErrorEvent>(&message)) {
+        require(error->requestId == 9 && error->code == "invalid_request" &&
+                    error->failureClass ==
+                        protocol::FailureClass::RequestError &&
+                    error->message == "this model is serving without vision "
+                                      "(started with --language-only)",
+                "image request did not produce its own vision error");
+        ++errors;
+      }
+      done += std::holds_alternative<protocol::DoneEvent>(message);
+    }
+    require(errors == 1 && done == 1 && loop.engineHealthy() &&
+                loop.snapshot().submitted == 1,
+            "image request reached admission or stopped the engine");
+  }
+}
+
 void testStepTokensFitTheWire() {
   for (uint32_t limit : {model::ExecutionLimits::maximumStepTokens, 1U}) {
     Backing backing(32);
@@ -1007,6 +1065,7 @@ int main() {
     testDuplicateLiveRequestClosesWithoutAmbiguousError();
     testControlFailureUsesExecutionBoundary();
     testInvalidPromptTokensStayRequestScoped();
+    testImageRequestWithoutVisionStaysRequestScoped();
     testStepTokensFitTheWire();
     testScoreRequestCompletesAfterFullPrompt();
     testCancelledScoreReturnsEmptyLogits();

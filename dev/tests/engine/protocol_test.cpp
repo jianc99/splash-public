@@ -368,7 +368,8 @@ std::vector<Message> everyOtherMessage() {
       StatusRequestFrame{808},
       ReadyEvent{1001, 4, 524'288,
                  FeatureCancellation | FeatureTokenMasks | FeatureStatusJson |
-                     FeatureMultiplexing},
+                     FeatureMultiplexing | FeatureVision},
+      ReadyEvent{1002, 4, 524'288, kNativeFeatureBits},
       StartEvent{91, CacheDisposition::PrefixHit, 2, 4096, 131'072},
       PromptProgressEvent{91, 2048, 123456},
       TokensEvent{91, 17, {10, 11, 12}},

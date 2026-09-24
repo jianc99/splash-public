@@ -187,10 +187,12 @@ void NativeRuntime::announceReady() {
   }
   if (ready_)
     throw std::logic_error("ready was already announced");
+  uint64_t features = protocol::kNativeFeatureBits;
+  if (config_.engine.maxImagePatches)
+    features |= protocol::FeatureVision;
   if (!send(protocol::ReadyEvent{config_.engineInstanceId,
                                  model::ExecutionLimits::maximumBatchWidth,
-                                 config_.engine.maxContext,
-                                 protocol::kNativeFeatureBits})) {
+                                 config_.engine.maxContext, features})) {
     throw std::runtime_error("failed to serialize ready event");
   }
   ready_ = true;

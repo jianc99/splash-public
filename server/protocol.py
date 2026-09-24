@@ -245,6 +245,8 @@ class ReadyFeature(IntFlag):
     TOKEN_MASKS = 1 << 1
     STATUS_JSON = 1 << 2
     MULTIPLEXING = 1 << 3
+    # Requests may carry image spans; clear for a model serving without vision.
+    VISION = 1 << 4
 
 
 @dataclass(slots=True, frozen=True)
@@ -253,6 +255,10 @@ class ReadyEvent:
     max_concurrent_requests: int
     max_context_tokens: int
     feature_bits: int | ReadyFeature
+
+    @property
+    def vision(self) -> bool:
+        return bool(int(self.feature_bits) & ReadyFeature.VISION)
 
 
 class CacheDisposition(IntEnum):

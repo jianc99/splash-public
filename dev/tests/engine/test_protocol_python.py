@@ -92,7 +92,8 @@ int main() {
                     uint64_t(FeatureCancellation) |
                         uint64_t(FeatureTokenMasks) |
                         uint64_t(FeatureStatusJson) |
-                        uint64_t(FeatureMultiplexing)});
+                        uint64_t(FeatureMultiplexing) |
+                        uint64_t(FeatureVision)});
     show(StartEvent{91, CacheDisposition::PrefixHit, 2, 4096, 131072});
     show(PromptProgressEvent{91, 2048, 123456});
     show(TokensEvent{91, 17, {10, 11, 12}});
@@ -175,6 +176,7 @@ def all_messages():
                 | p.ReadyFeature.TOKEN_MASKS
                 | p.ReadyFeature.STATUS_JSON
                 | p.ReadyFeature.MULTIPLEXING
+                | p.ReadyFeature.VISION
             ),
         ),
         p.StartEvent(91, p.CacheDisposition.PREFIX_HIT, 2, 4096, 131_072),
@@ -361,6 +363,20 @@ class ProtocolPythonTests(unittest.TestCase):
             result.stdout.splitlines(),
             [p.serialize_message(message).hex() for message in all_messages()],
         )
+
+    def test_ready_vision_feature_is_bit_four(self):
+        common = int(
+            p.ReadyFeature.CANCELLATION
+            | p.ReadyFeature.TOKEN_MASKS
+            | p.ReadyFeature.STATUS_JSON
+            | p.ReadyFeature.MULTIPLEXING
+        )
+        for bits, vision in ((common, False), (common | 1 << 4, True)):
+            with self.subTest(vision=vision):
+                wire = p.serialize_message(p.ReadyEvent(1, 4, 131_072, bits))
+                self.assertEqual(struct.unpack_from("<Q", wire, len(wire) - 8)[0], bits)
+                ready = p.decode_frame(parse_all(wire)[0])
+                self.assertIs(ready.vision, vision)
 
     def test_progress_wire_validation(self):
         request = replace(example_request(), return_progress=True)
