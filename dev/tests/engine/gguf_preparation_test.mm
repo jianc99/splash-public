@@ -313,11 +313,10 @@ void checkDenseTarget(MetalBackend &backend, const std::filesystem::path &direct
   check(weights.layers.size() == layout.layers, "GGUF target: every layer");
   check(weights.finalNorm.float32, "GGUF target: F32 final norm");
   check(blockProjection(weights.logitsProjection, layout.vocabularySize, hidden, {layout.vocabularySize}) &&
-            std::string_view(weights.logitsProjection.blocks().segments.front().format) == "q6k",
+            std::string_view(weights.logitsProjection.blocks().segments.front().name()) == "q6k",
         "GGUF target: logits a Q6_K block projection of vocabulary x hidden");
   check(weights.tokenEmbedding.layout() == ops::WeightLayout::Block32 &&
             weights.tokenEmbedding.blocks().formatId == GGUF_FMT_Q80 &&
-            std::string_view(weights.tokenEmbedding.blocks().format) == "q80" &&
             weights.tokenEmbedding.outputSize == layout.vocabularySize && weights.tokenEmbedding.inputSize == hidden,
         "GGUF target: token table Q8_0 blocks of vocabulary x hidden");
   check(model::qwenTargetGeometry(weights).valid(), "GGUF target: a valid target geometry");

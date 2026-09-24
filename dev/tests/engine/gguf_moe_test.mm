@@ -114,6 +114,20 @@ MetalBuffer zeros(MetalBackend &backend, uint64_t bytes, const char *label) {
   return buffer;
 }
 
+// The segments of a repacked [rows, K] tensor in format f and of [rows, K] floats.
+QuantizedSegment planeSegment(MetalBackend &backend, Fmt f, const Packed &planes, uint32_t rows, uint32_t K) {
+  return QuantizedSegment::planes(
+      f, rows, K, upload(backend, planes.w0.data(), planes.w0.size(), "gguf-plane0"),
+      kQuantFormats[f].plane1_bytes ? upload(backend, planes.w1.data(), planes.w1.size(), "gguf-plane1")
+                                    : MetalBuffer{},
+      upload(backend, planes.meta.data(), planes.meta.size(), "gguf-meta"));
+}
+QuantizedSegment floatSegment(MetalBackend &backend, const std::vector<float> &values, uint32_t rows,
+                              uint32_t K) {
+  return QuantizedSegment::floats(rows, K, upload(backend, values.data(), values.size() * sizeof(float),
+                                                  "gguf-floats"));
+}
+
 // A GGUF tensor [rows, K]: its segment and GGML's fp32 values of it.
 struct Tensor {
   QuantizedSegment segment;
@@ -131,21 +145,7 @@ Tensor quantized(MetalBackend &backend, Fmt f, uint32_t rows, uint32_t K) {
   Tensor t;
   t.rows = rows;
   t.columns = K;
-  const Packed planes = repack(f, native, rows, K, &t.values);
-  const QuantFormat &layout = kQuantFormats[f];
-  QuantizedSegment &s = t.segment;
-  s.plane0 = upload(backend, planes.w0.data(), planes.w0.size(), "gguf-plane0");
-  if (layout.plane1_bytes) s.plane1 = upload(backend, planes.w1.data(), planes.w1.size(), "gguf-plane1");
-  s.meta = upload(backend, planes.meta.data(), planes.meta.size(), "gguf-meta");
-  s.type = layout.ggml_type;
-  s.outputSize = rows;
-  s.inputSize = K;
-  s.p0 = layout.plane0_bytes;
-  s.p1 = layout.plane1_bytes;
-  s.metaBytes = layout.meta_bytes;
-  s.metaGroups = layout.meta_groups;
-  s.formatId = f;
-  s.format = layout.name;
+  t.segment = planeSegment(backend, f, repack(f, native, rows, K, &t.values), rows, K);
   return t;
 }
 
@@ -156,13 +156,7 @@ Tensor floating(MetalBackend &backend, uint32_t rows, uint32_t K, float scale) {
   t.columns = K;
   t.values.resize(uint64_t{rows} * K);
   for (float &v : t.values) v = normal(rng);
-  QuantizedSegment &s = t.segment;
-  s.plane0 = upload(backend, t.values.data(), t.values.size() * sizeof(float), "gguf-floats");
-  s.type = GGUF_TYPE_F32;
-  s.outputSize = rows;
-  s.inputSize = K;
-  s.formatId = GGUF_FMT_COUNT;
-  s.format = "f32";
+  t.segment = floatSegment(backend, t.values, rows, K);
   return t;
 }
 
@@ -692,35 +686,12 @@ int timing(MetalBackend &backend, uint32_t rounds) {
   const auto planes = [&](Fmt f, uint32_t rows, uint32_t k) {
     std::uniform_real_distribution<float> d(0.0005f, 0.004f);
     const std::vector<uint8_t> native = makeNative(f, rows, k, local, [&] { return f2h(d(local)); });
-    const Packed packed = repack(f, native, rows, k, nullptr);
-    const QuantFormat &layout = kQuantFormats[f];
-    QuantizedSegment s;
-    s.plane0 = upload(backend, packed.w0.data(), packed.w0.size(), "gguf-plane0");
-    if (layout.plane1_bytes) s.plane1 = upload(backend, packed.w1.data(), packed.w1.size(), "gguf-plane1");
-    s.meta = upload(backend, packed.meta.data(), packed.meta.size(), "gguf-meta");
-    s.type = layout.ggml_type;
-    s.outputSize = rows;
-    s.inputSize = k;
-    s.p0 = layout.plane0_bytes;
-    s.p1 = layout.plane1_bytes;
-    s.metaBytes = layout.meta_bytes;
-    s.metaGroups = layout.meta_groups;
-    s.formatId = f;
-    s.format = layout.name;
-    return s;
+    return planeSegment(backend, f, repack(f, native, rows, k, nullptr), rows, k);
   };
   std::vector<float> router(uint64_t{E} * H, 0.0f), sharedGate(H, 0.0f);
   for (uint32_t e = 0; e < E; ++e) router[uint64_t{e} * H + e] = 4.0f;
-  QuantizedSegment routerSegment, sharedGateSegment;
-  routerSegment.plane0 = upload(backend, router.data(), router.size() * 4, "router");
-  sharedGateSegment.plane0 = upload(backend, sharedGate.data(), sharedGate.size() * 4, "shared-gate");
-  for (QuantizedSegment *s : {&routerSegment, &sharedGateSegment}) {
-    s->type = GGUF_TYPE_F32;
-    s->inputSize = H;
-    s->formatId = GGUF_FMT_COUNT;
-  }
-  routerSegment.outputSize = E;
-  sharedGateSegment.outputSize = 1;
+  const QuantizedSegment routerSegment = floatSegment(backend, router, E, H);
+  const QuantizedSegment sharedGateSegment = floatSegment(backend, sharedGate, 1, H);
   MoeWeights gguf;
   gguf = BlockMoeWeights{routerSegment, sharedGateSegment,
                              {planes(Q4K, E * I, H), planes(Q80, I, H)},

@@ -1,6 +1,8 @@
 #include "model/ModelFactory.hpp"
 #include "model/RuntimeArenas.hpp"
 
+#include "metal/abi/QuantFormat.h"
+
 #include <algorithm>
 #include <array>
 #include <iostream>
@@ -143,10 +145,9 @@ void checkMixedLayouts() {
   auto mixed = package<model::Qwen3_8Weights>();
   auto &target = std::get<model::Qwen3_8Weights>(mixed.target);
   auto &up = target.layers.front().upProjection;
-  ops::QuantizedSegment segment;
-  segment.outputSize = up.outputSize;
-  segment.inputSize = up.inputSize;
-  up = ops::Projection(up.outputSize, up.inputSize, ops::BlockWeights{{segment}});
+  up = ops::Projection(up.outputSize, up.inputSize,
+                       ops::BlockWeights{{ops::QuantizedSegment::planes(GGUF_FMT_Q4K, up.outputSize,
+                                                                        up.inputSize, {}, {}, {})}});
   bool mismatchRejected = false;
   try { static_cast<void>(model::qwenTargetGeometry(target)); }
   catch (const model::WeightStoreError &) { mismatchRejected = true; }

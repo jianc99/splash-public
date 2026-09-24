@@ -1,5 +1,7 @@
 #include "tuning/LinearTuning.hpp"
 
+#include "metal/abi/QuantFormat.h"
+
 #include <array>
 #include <bit>
 #include <chrono>
@@ -118,10 +120,9 @@ uint64_t fingerprint(const Projection &projection) {
 // reaches the tuner's reads of affine planes (which would throw
 // std::bad_variant_access instead).
 void blockInputs(metal::MetalBackend &backend, const Projection &projection) {
-  QuantizedSegment segment;
-  segment.outputSize = projection.outputSize;
-  segment.inputSize = projection.inputSize;
-  const Projection block(projection.outputSize, projection.inputSize, BlockWeights{{segment}});
+  const Projection block(projection.outputSize, projection.inputSize,
+                         BlockWeights{{QuantizedSegment::planes(GGUF_FMT_Q4K, projection.outputSize,
+                                                                projection.inputSize, {}, {}, {})}});
   const LinearWorkload affine{{projection.outputSize, projection.inputSize}, 8};
   LinearWorkload blocks = affine;
   blocks.weightLayout = WeightLayout::Block32;

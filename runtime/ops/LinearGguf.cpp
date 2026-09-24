@@ -197,7 +197,7 @@ void Linear::addGguf(metal::CommandGraph &graph, const LinearBuffers &b,
     for (const QuantizedSegment &s : segments) {
       std::vector<metal::MetalBuffer> bindings{b.input, s.plane0, s.plane1Slot(), s.meta, b.output};
       if (w.epilogue != LinearEpilogue::None) bindings.push_back(aux);
-      graph.add(prefillKernel(std::string("pf") + epilogue, s.format), std::move(bindings),
+      graph.add(prefillKernel(std::string("pf") + epilogue, s.name()), std::move(bindings),
                 GgufPrefillParams{s.outputSize, k, w.rows, n, s.columnOffset},
                 {rows / kPrefillRows, s.outputSize / kPrefillTileColumns, 1}, {kPrefillThreads, 1, 1});
     }
@@ -226,7 +226,7 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
   const metal::MetalBuffer counters = splits > 1 ? b.scratch.counters : b.output;
   const auto tensor = [&](const QuantizedSegment &s, char epilogue, const metal::MetalBuffer &output,
                           const metal::MetalBuffer &aux) {
-    graph.add(decodeKernel(s.format, rows, epilogue),
+    graph.add(decodeKernel(s.name(), rows, epilogue),
               {b.input, s.plane0, s.plane1Slot(), s.meta, output, partials, counters, aux},
               GgufDecodeParams{k, splits, n, s.columnOffset}, {s.outputSize / kDecodeTileColumns, splits, 1},
               {kDecodeThreads, 1, 1});
@@ -263,7 +263,8 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
   std::vector<const QuantizedSegment *> order;
   for (const QuantizedSegment &s : segments) order.push_back(&s);
   const auto bitsPerWeight = [](const QuantizedSegment &s) {
-    return (s.p0 + s.p1) * 8.0 / 32.0 + s.metaBytes * 8.0 / (32.0 * s.metaGroups);
+    const QuantFormat &f = s.format();
+    return (f.plane0_bytes + f.plane1_bytes) * 8.0 / 32.0 + f.meta_bytes * 8.0 / (32.0 * f.meta_groups);
   };
   std::stable_sort(order.begin(), order.end(), [&](const QuantizedSegment *a, const QuantizedSegment *c) {
     return bitsPerWeight(*a) > bitsPerWeight(*c);
@@ -330,7 +331,7 @@ void Linear::addGgufSimdgroup(metal::CommandGraph &graph, const LinearBuffers &b
   }
   const auto tensor = [&](const QuantizedSegment &s, char epilogue, const metal::MetalBuffer &output,
                           const metal::MetalBuffer &aux) {
-    graph.add(std::string("decode_linear_gguf_sg_") + s.format + suffix + "_" + epilogue,
+    graph.add(std::string("decode_linear_gguf_sg_") + s.name() + suffix + "_" + epilogue,
               {b.scratch.input, b.scratch.sums, s.plane0, s.plane1Slot(), s.meta, output, b.scratch.partials,
                b.scratch.counters, aux},
               GgufDecodeParams{k, config.splits, n, s.columnOffset}, grid, {128, 1, 1});
@@ -376,7 +377,6 @@ FloatTile Linear::ggufFloatTile(uint32_t rows, uint32_t outputSize) const noexce
                                                                                      : FloatTile::Simdgroup;
 }
 
-bool QuantizedSegment::isFloat() const noexcept { return type == GGUF_TYPE_F32; }
 
 // Simdgroup: 8 columns of 32 rows per threadgroup of 16 simdgroups. Neural
 // accelerator: 32 columns of 64 rows per threadgroup of 4 simdgroups, at least

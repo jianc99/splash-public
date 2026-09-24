@@ -1,5 +1,6 @@
 #include "ops/Linear.hpp"
 #include "metal/abi/ExecutionGeometry.h"
+#include "metal/abi/QuantFormat.h"
 #include "tuning/LinearNumerics.hpp"
 
 #import <Foundation/Foundation.h>
@@ -765,9 +766,7 @@ void ggufPlans() {
   const auto projection = [](uint32_t n, uint32_t k, uint32_t segments) {
     BlockWeights weights;
     for (uint32_t i = 0; i < segments; ++i) {
-      QuantizedSegment s;
-      s.outputSize = n / segments;
-      s.inputSize = k;
+      QuantizedSegment s = QuantizedSegment::planes(GGUF_FMT_Q4K, n / segments, k, {}, {}, {});
       s.columnOffset = i * (n / segments);
       weights.segments.push_back(s);
     }
@@ -780,10 +779,8 @@ void ggufPlans() {
   // segments is part of it, not room for a narrower plan.
   {
     metal::CommandGraph graph;
-    QuantizedSegment segment;
-    segment.outputSize = 5120;
-    segment.inputSize = 17408;
-    const Projection padded(5376, 17408, BlockWeights{{segment}});
+    const Projection padded(5376, 17408,
+                            BlockWeights{{QuantizedSegment::planes(GGUF_FMT_Q4K, 5120, 17408, {}, {}, {})}});
     rejects([&] { (void)linear.addDecode(graph, {}, padded, {}, {5120, 17408}); });
     require(graph.empty(), "a mismatched block projection encoded a dispatch");
   }
@@ -964,9 +961,7 @@ void ggufCoreLaws() {
   const auto projection = [](uint32_t n, uint32_t k, uint32_t segments) {
     BlockWeights weights;
     for (uint32_t i = 0; i < segments; ++i) {
-      QuantizedSegment s;
-      s.outputSize = n / segments;
-      s.inputSize = k;
+      QuantizedSegment s = QuantizedSegment::planes(GGUF_FMT_Q4K, n / segments, k, {}, {}, {});
       s.columnOffset = i * (n / segments);
       weights.segments.push_back(s);
     }

@@ -1,5 +1,7 @@
 #include "tuning/TuningWorkloads.hpp"
 
+#include "metal/abi/QuantFormat.h"
+
 #include <algorithm>
 #include <array>
 #include <iostream>
@@ -265,10 +267,8 @@ void blockTarget() {
   const Qwen3_6MoeLayout layout;
   auto target = targetWeights<Qwen3_6MoeWeights>(layout);
   const auto block = [](const Projection &p) {
-    QuantizedSegment segment;
-    segment.outputSize = p.outputSize;
-    segment.inputSize = p.inputSize;
-    return Projection(p.outputSize, p.inputSize, BlockWeights{{segment}});
+    return Projection(p.outputSize, p.inputSize,
+                      BlockWeights{{QuantizedSegment::planes(GGUF_FMT_Q4K, p.outputSize, p.inputSize, {}, {}, {})}});
   };
   target.logitsProjection = block(target.logitsProjection);
   for (auto &layer : target.layers) {

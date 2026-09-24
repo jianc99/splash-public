@@ -302,12 +302,8 @@ ops::QuantizedSegment readQuantizedSegment(WeightFile &file, std::string_view la
         if (d.p0 || d.p1 || d.metaBytes || d.metaGroups || d.plane1Bytes || d.metaTotalBytes ||
             d.plane0Bytes != uint64_t{d.outputSize} * d.inputSize * sizeof(float))
             throw WeightStoreError("GGUF float section sizes are inconsistent: " + std::string(label));
-        ops::QuantizedSegment s;
-        s.plane0 = file.section(d.plane0Bytes, std::string(label) + "-floats");
-        s.type = d.type; s.outputSize = d.outputSize; s.inputSize = d.inputSize;
-        s.formatId = GGUF_FMT_COUNT;
-        s.format = "f32";
-        return s;
+        return ops::QuantizedSegment::floats(d.outputSize, d.inputSize,
+                                             file.section(d.plane0Bytes, std::string(label) + "-floats"));
     }
     const uint32_t format = gguf_format_of(d.type);
     if (format == GGUF_FMT_COUNT)
@@ -320,16 +316,12 @@ ops::QuantizedSegment readQuantizedSegment(WeightFile &file, std::string_view la
         d.plane1Bytes != uint64_t{d.outputSize} * groups * layout.plane1_bytes ||
         d.metaTotalBytes != uint64_t{d.outputSize} * (groups / layout.meta_groups) * layout.meta_bytes)
         throw WeightStoreError("GGUF section sizes are inconsistent: " + std::string(label));
-    ops::QuantizedSegment s;
-    s.plane0 = file.section(d.plane0Bytes, std::string(label) + "-plane0");
-    if (d.plane1Bytes) s.plane1 = file.section(d.plane1Bytes, std::string(label) + "-plane1");
-    s.meta = file.section(d.metaTotalBytes, std::string(label) + "-meta");
-    s.type = d.type; s.outputSize = d.outputSize; s.inputSize = d.inputSize;
-    s.p0 = layout.plane0_bytes; s.p1 = layout.plane1_bytes;
-    s.metaBytes = layout.meta_bytes; s.metaGroups = layout.meta_groups;
-    s.formatId = format;
-    s.format = layout.name;
-    return s;
+    metal::MetalBuffer plane0 = file.section(d.plane0Bytes, std::string(label) + "-plane0");
+    metal::MetalBuffer plane1 =
+        d.plane1Bytes ? file.section(d.plane1Bytes, std::string(label) + "-plane1") : metal::MetalBuffer{};
+    metal::MetalBuffer meta = file.section(d.metaTotalBytes, std::string(label) + "-meta");
+    return ops::QuantizedSegment::planes(format, d.outputSize, d.inputSize, std::move(plane0),
+                                         std::move(plane1), std::move(meta));
 }
 
 ops::Projection readGgufProjection(WeightFile &file, uint32_t outputSize, uint32_t inputSize,
@@ -345,18 +337,13 @@ ops::EmbeddingWeights readGgufEmbedding(WeightFile &file, uint32_t outputSize, u
     const GgufTensorDescriptor d = readGgufDescriptor(file, label);
     if (d.outputSize != outputSize || d.inputSize != inputSize)
         throw WeightStoreError("GGUF embedding does not match the layout: " + std::string(label));
-    // Native rows, gathered by gguf_embed_<type>: block_q4_K, block_q6_K or block_q8_0.
     const uint32_t format = gguf_format_of(d.type);
-    if ((format != GGUF_FMT_Q4K && format != GGUF_FMT_Q6K && format != GGUF_FMT_Q80) || d.inputSize % 256 ||
+    if (format == GGUF_FMT_COUNT || d.inputSize % 256 ||
         d.plane0Bytes != uint64_t{d.outputSize} * (d.inputSize / kQuantFormats[format].block_elements) *
                              kQuantFormats[format].block_bytes)
-        throw WeightStoreError("GGUF embedding must be native block_q4_K, block_q6_K or block_q8_0 rows");
-    ops::QuantizedSegment s;
-    s.plane0 = file.section(d.plane0Bytes, std::string(label) + "-native");
-    s.type = d.type; s.outputSize = d.outputSize; s.inputSize = d.inputSize;
-    s.formatId = format;
-    s.format = kQuantFormats[format].name;
-    return {outputSize, inputSize, std::move(s)};
+        throw WeightStoreError("GGUF embedding rows are not native GGUF blocks: " + std::string(label));
+    return {outputSize, inputSize,
+            ops::NativeRows(file.section(d.plane0Bytes, std::string(label) + "-native"), format)};
 }
 
 ops::Q8Projection readQ8Projection(WeightFile &file,

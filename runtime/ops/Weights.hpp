@@ -1,6 +1,7 @@
 #pragma once
 
 #include "metal/MetalBackend.hpp"
+#include "metal/abi/QuantFormat.h"
 
 #include <compare>
 #include <cstdint>
@@ -27,27 +28,40 @@ struct AffineWeights final {
   metal::MetalBuffer biases;
 };
 
-// A prepared block-quantized or F32 tensor occupying a projection's output
-// columns [columnOffset, columnOffset + outputSize). The packing ABI is in
-// metal/abi/QuantFormat.h; the source container is not part of this view.
+// A prepared GGUF tensor occupying a projection's output columns
+// [columnOffset, columnOffset + outputSize): repacked planes in the GGUF_FMT_*
+// format formatId (metal/abi/QuantFormat.h), or a float tensor the GGUF keeps
+// unquantized (F32, as llama.cpp keeps the MoE router), whose plane0 holds
+// [outputSize][inputSize] floats multiplied unrounded in fp32
+// (kernels/shared/gguf_float.metal). The source container is not part of it.
 struct QuantizedSegment final {
+  // The formatId of a float segment.
+  static constexpr uint32_t kFloat32 = 0xffffffff;
+
+  [[nodiscard]] static QuantizedSegment planes(uint32_t formatId, uint32_t outputSize, uint32_t inputSize,
+                                               metal::MetalBuffer plane0, metal::MetalBuffer plane1,
+                                               metal::MetalBuffer meta) {
+    if (formatId >= GGUF_FMT_COUNT) throw std::invalid_argument("unknown GGUF segment format");
+    return {std::move(plane0), std::move(plane1), std::move(meta), outputSize, inputSize, 0, formatId};
+  }
+  [[nodiscard]] static QuantizedSegment floats(uint32_t outputSize, uint32_t inputSize,
+                                               metal::MetalBuffer values) {
+    return {std::move(values), {}, {}, outputSize, inputSize, 0, kFloat32};
+  }
+
   metal::MetalBuffer plane0;
   metal::MetalBuffer plane1;
   metal::MetalBuffer meta;
-  uint32_t type = 0;
   uint32_t outputSize = 0;
   uint32_t inputSize = 0;
-  uint32_t p0 = 0;
-  uint32_t p1 = 0;
-  uint32_t metaBytes = 0;
-  uint32_t metaGroups = 0;
   uint32_t columnOffset = 0;
-  uint32_t formatId = 0;    // GGUF_FMT_* (metal/abi/QuantFormat.h)
-  const char *format = "";
-  // A float tensor the GGUF keeps unquantized (F32, as llama.cpp keeps the
-  // MoE router): plane0 holds its [outputSize][inputSize] floats, multiplied
-  // unrounded in fp32 (kernels/shared/gguf_float.metal).
-  [[nodiscard]] bool isFloat() const noexcept;
+  uint32_t formatId = kFloat32;
+
+  [[nodiscard]] bool isFloat() const noexcept { return formatId == kFloat32; }
+  // The plane geometry of a quantized segment.
+  [[nodiscard]] const QuantFormat &format() const noexcept { return kQuantFormats[formatId]; }
+  // The kernel name suffix of its format ("f32" for a float segment).
+  [[nodiscard]] const char *name() const noexcept { return isFloat() ? "f32" : format().name; }
   // The buffer bound in plane1's slot: a format without a second plane binds
   // its meta plane there, which its kernels never read as plane1.
   [[nodiscard]] const metal::MetalBuffer &plane1Slot() const noexcept { return plane1 ? plane1 : meta; }
@@ -103,20 +117,29 @@ public:
   uint32_t inputSize = 0;
 };
 
+// A token table's rows as the GGUF stores them: block_q4_K, block_q6_K or
+// block_q8_0 (GGUF_FMT_Q4K, _Q6K or _Q80), gathered, never multiplied
+// (Embedding.cpp).
+struct NativeRows final {
+  NativeRows(metal::MetalBuffer rows, uint32_t formatId) : rows(std::move(rows)), formatId(formatId) {
+    if (formatId != GGUF_FMT_Q4K && formatId != GGUF_FMT_Q6K && formatId != GGUF_FMT_Q80)
+      throw std::invalid_argument("unsupported native embedding format");
+  }
+  metal::MetalBuffer rows;
+  uint32_t formatId;
+  [[nodiscard]] const char *name() const noexcept { return kQuantFormats[formatId].name; }
+};
+
 // A token table of outputSize rows of inputSize values, which Embedding
-// gathers: affine Q4 rows, or one segment of native GGUF rows (block_q4_K,
-// block_q6_K or block_q8_0). It is intentionally a separate type: no table
-// may be bound as a projection.
-class EmbeddingWeights final : public LayoutWeights<AffineWeights, QuantizedSegment> {
+// gathers: affine Q4 rows or native GGUF rows. It is intentionally a separate
+// type: no table may be bound as a projection.
+class EmbeddingWeights final : public LayoutWeights<AffineWeights, NativeRows> {
 public:
   EmbeddingWeights() = default;
   EmbeddingWeights(uint32_t output, uint32_t input, AffineWeights weights)
       : LayoutWeights(std::move(weights)), outputSize(output), inputSize(input) {}
-  EmbeddingWeights(uint32_t output, uint32_t input, QuantizedSegment rows)
-      : LayoutWeights(std::move(rows)), outputSize(output), inputSize(input) {
-    if (blocks().outputSize != output || blocks().inputSize != input)
-      throw std::invalid_argument("native embedding rows do not match the table");
-  }
+  EmbeddingWeights(uint32_t output, uint32_t input, NativeRows rows)
+      : LayoutWeights(std::move(rows)), outputSize(output), inputSize(input) {}
 
   uint32_t outputSize = 0;
   uint32_t inputSize = 0;
