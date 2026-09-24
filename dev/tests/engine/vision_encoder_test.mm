@@ -193,16 +193,12 @@ int main(int argc, char **argv) {
     try {
       verifyComparison();
       const auto descriptor = splash::model::inspectModelPackage(argv[2]);
+      if (descriptor.visionSource == splash::model::VisionSource::None)
+        throw std::runtime_error("the model has no vision role");
       MetalBackend backend(argv[1]);
-      const auto vision = std::filesystem::path(argv[2]) / "vision";
+      const auto loader = splash::model::planVisionLoader(backend, argv[2], descriptor);
       const splash::model::QwenVisionWeights model =
-          descriptor.visionSource == splash::model::VisionSource::Packed
-              ? splash::model::loadQwenVisionWeights(backend, vision,
-                                                     descriptor.vision)
-              : splash::model::loadQwenVisionWeights(
-                    backend, splash::model::VisionLoader(
-                                 vision, descriptor.visionSource,
-                                 descriptor.vision));
+          splash::model::loadVisionWeights(backend, argv[2], descriptor, loader.get());
       const std::string fixture = argv[3];
 
       ImageGrid grid;

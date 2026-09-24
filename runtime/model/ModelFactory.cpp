@@ -3,7 +3,6 @@
 #include "model/GgufTarget.hpp"
 
 #include <limits>
-#include <optional>
 #include <span>
 #include <stdexcept>
 #include <type_traits>
@@ -48,14 +47,9 @@ ModelPackage loadPackage(metal::MetalBackend &backend,
   const PreparationCheck check = [&backend] { backend.checkOperation(); };
   // Every prepared file of the model, the vision tower's and the target's, is
   // planned before the first is written, so one disk check budgets them all.
+  const auto vision = planVisionLoader(backend, root, result.descriptor, admitConversion);
   std::vector<PreparedWeight> prepared;
-  std::optional<VisionLoader> vision;
-  if (result.descriptor.visionSource == VisionSource::Mlx ||
-      result.descriptor.visionSource == VisionSource::Gguf) {
-    vision.emplace(root / "vision", result.descriptor.visionSource,
-                   result.descriptor.vision, check, admitConversion);
-    prepared.push_back(vision->weight());
-  }
+  if (vision) prepared.push_back(vision->weight());
   result.target = std::visit(
       [&](const auto &layout) -> TargetWeights {
         using Layout = std::remove_cvref_t<decltype(layout)>;
@@ -84,10 +78,7 @@ ModelPackage loadPackage(metal::MetalBackend &backend,
       result.descriptor.target);
   result.draft = loadDFlashDraftWeights(
       backend, root / "draft", result.descriptor.draft);
-  if (vision)
-    result.vision = loadQwenVisionWeights(backend, *vision);
-  else if (result.descriptor.visionSource == VisionSource::Packed)
-    result.vision = loadQwenVisionWeights(backend, root / "vision", result.descriptor.vision);
+  result.vision = loadVisionWeights(backend, root, result.descriptor, vision.get());
 
   std::vector<WeightFileRecord> records(result.targetFiles().begin(),
                                         result.targetFiles().end());
@@ -111,6 +102,24 @@ ModelPackage loadModelPackage(metal::MetalBackend &backend,
                               const std::filesystem::path &root,
                               const ModelDescriptor &descriptor, PreparationCheck admitConversion) {
   return loadPackage(backend, root, descriptor, std::move(admitConversion));
+}
+
+std::unique_ptr<VisionLoader> planVisionLoader(metal::MetalBackend &backend, const std::filesystem::path &root,
+                                               const ModelDescriptor &descriptor,
+                                               PreparationCheck admitConversion) {
+  if (descriptor.visionSource != VisionSource::Mlx && descriptor.visionSource != VisionSource::Gguf)
+    return nullptr;
+  return std::make_unique<VisionLoader>(root / "vision", descriptor.visionSource, descriptor.vision,
+                                        [&backend] { backend.checkOperation(); },
+                                        std::move(admitConversion));
+}
+
+QwenVisionWeights loadVisionWeights(metal::MetalBackend &backend, const std::filesystem::path &root,
+                                    const ModelDescriptor &descriptor, const VisionLoader *loader) {
+  if (loader) return loadQwenVisionWeights(backend, *loader);
+  if (descriptor.visionSource == VisionSource::Packed)
+    return loadQwenVisionWeights(backend, root / "vision", descriptor.vision);
+  return {};
 }
 
 uint64_t preparedModelWeightBytes(const std::filesystem::path &root, const ModelDescriptor &descriptor) {
