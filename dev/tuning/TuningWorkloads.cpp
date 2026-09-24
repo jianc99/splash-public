@@ -89,7 +89,7 @@ TuningWorkloads collectTuningWorkloads(
                          const ops::Projection *gate = nullptr) {
     if (!weight.inputSize || !weight.outputSize)
       throw std::invalid_argument("operator probe projection has no geometry");
-    // GGUF projections are not tuned yet; their plans ignore installed choices.
+    // Block projections are not tuned: a choice table may not hold their workloads.
     if (weight.layout() != ops::WeightLayout::Affine64 ||
         (gate && gate->layout() != ops::WeightLayout::Affine64)) return;
     const auto sizes = phase == LinearPhase::Prefill ? prefillRows : decodeWidths;
@@ -131,6 +131,7 @@ TuningWorkloads collectTuningWorkloads(
                      LinearEpilogue::GateUp, &layer.gateProjection);
         bothPhases(layer.downProjection, LinearEpilogue::Residual);
       } else {
+        // GGUF MoE blocks are not tuned either: a choice table may not hold them.
         if (layer.ffn.layout() != ops::WeightLayout::Affine64) continue;
         for (uint32_t rows : prefillRows) {
           ops::MoeWorkload workload{geometry.moeShape(), rows, ops::MoePhase::Prefill};
