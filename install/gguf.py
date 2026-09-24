@@ -7,14 +7,23 @@ special-token IDs and the chat template always come from the selected GGUF.
 from __future__ import annotations
 
 import collections
-import json
 import struct
 from pathlib import Path
 
 if __package__:
+    from . import models
     from .models import ModelError
 else:
+    import models
     from models import ModelError
+
+# The files derived_files derives from a target GGUF, by assembly path.
+DERIVED_FILES = (
+    "config.json",
+    "tokenizer/tokenizer.json",
+    "tokenizer/tokenizer_config.json",
+    "tokenizer/chat_template.jinja",
+)
 
 
 class Metadata:
@@ -120,6 +129,14 @@ QWEN35_PATTERN = (
 )
 
 
+def derived_files(target, vision=None):
+    """DERIVED_FILES' contents, derived from a target GGUF's metadata and its
+    vision projector's (local paths)."""
+    metadata = Metadata(target)
+    config = model_config(metadata, None if vision is None else Metadata(vision))
+    return {"config.json": models.json_bytes(config), **tokenizer_files(metadata)}
+
+
 def tokenizer_files(metadata):
     from tokenizers import (
         AddedToken,
@@ -221,7 +238,7 @@ def tokenizer_files(metadata):
     }
     return {
         "tokenizer/tokenizer.json": backend.to_str().encode(),
-        "tokenizer/tokenizer_config.json": json_bytes(config),
+        "tokenizer/tokenizer_config.json": models.json_bytes(config),
         "tokenizer/chat_template.jinja": template.encode(),
     }
 
@@ -425,9 +442,3 @@ def require_loadable(m):
         raise ModelError(
             f"this GGUF stores tensors Splash cannot load: {listed}; choose another variant"
         )
-
-
-def json_bytes(value):
-    return (
-        json.dumps(value, sort_keys=True, ensure_ascii=False, indent=2) + "\n"
-    ).encode()

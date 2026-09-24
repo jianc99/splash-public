@@ -3,7 +3,7 @@
 
 Copies only draft weights, without requantizing them, into DESTINATION: the
 folder of the shared draft repository named after the base model
-(install/upstream.py DRAFTS), or a directory for --draft-model.
+(install/families.py DRAFTS), or a directory for --draft-model.
 """
 
 import argparse
@@ -14,7 +14,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from install import models  # noqa: E402
+from install import legacy, models  # noqa: E402
 
 
 def export(package, config_path, destination):
@@ -24,7 +24,7 @@ def export(package, config_path, destination):
     layers = config.get("num_hidden_layers")
     if type(layers) is not int or layers <= 0:
         raise models.ModelError("invalid draft layer count")
-    manifest = models.validate_package_manifest(package / "manifest.json")
+    manifest = legacy.validate_manifest(package / "manifest.json")
     # The package names the DFlash2 checkpoint its draft was converted from.
     source = manifest.get("upstream", {}).get("draft", {})
     if not isinstance(source.get("repo_id"), str) or not models.is_hex_digest(
@@ -39,7 +39,7 @@ def export(package, config_path, destination):
         raise models.ModelError(
             "the package lists no draft weight " + ", ".join(missing)
         )
-    models.verify_artifacts(
+    legacy.verify_artifacts(
         package, {"artifacts": [records["draft/" + n] for n in names]}, full=True
     )
     for name in names:

@@ -4,6 +4,7 @@ import copy
 import errno
 import io
 import json
+import os
 import shutil
 import struct
 import subprocess
@@ -18,7 +19,8 @@ import httpx
 from huggingface_hub.errors import HfHubHTTPError
 from huggingface_hub.hf_api import RepoSibling
 
-from install import models as artifacts
+from install import hub, legacy
+from install import models as installer
 
 
 class ModelArtifactTest(unittest.TestCase):
@@ -32,7 +34,7 @@ class ModelArtifactTest(unittest.TestCase):
         self.fixture_number = 0
         # Never use real user credentials or contact the network in these tests.
         for patch in (
-            mock.patch.dict(artifacts.os.environ, {}, clear=True),
+            mock.patch.dict(os.environ, {}, clear=True),
             mock.patch("huggingface_hub.get_token", return_value=None),
         ):
             patch.start()
@@ -52,7 +54,7 @@ class ModelArtifactTest(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("wb") as file:
             file.write(struct.pack("<8sII", b"MDFT0001", 0, 0))
-            file.seek(artifacts.ALIGNMENT - 1)
+            file.seek(legacy.ALIGNMENT - 1)
             file.write(b"\0")
 
     def package_fixture(self, *, schema=3, model_id=None, revision=None):
@@ -79,7 +81,7 @@ class ModelArtifactTest(unittest.TestCase):
             self.packed_file(snapshot / name)
         tokenizer = snapshot / "tokenizer"
         tokenizer.mkdir()
-        for name in artifacts.PACKAGE_TOKENIZER_FILES:
+        for name in legacy.PACKAGE_TOKENIZER_FILES:
             (tokenizer / name).write_text(f"{name}\n")
         if schema == 4:
             (snapshot / "layout.json").write_text("{}\n")
@@ -87,7 +89,7 @@ class ModelArtifactTest(unittest.TestCase):
             {
                 "path": path.relative_to(snapshot).as_posix(),
                 "size": path.stat().st_size,
-                "sha256": artifacts.sha256(path),
+                "sha256": installer.sha256(path),
             }
             for path in sorted(item for item in snapshot.rglob("*") if item.is_file())
         ]
@@ -96,7 +98,7 @@ class ModelArtifactTest(unittest.TestCase):
             "model": "Community fine-tuned model",
             "format": {
                 "name": "splash-packed-q4" + ("-moe" if schema == 4 else ""),
-                "section_alignment_bytes": artifacts.ALIGNMENT,
+                "section_alignment_bytes": legacy.ALIGNMENT,
                 "target_layer_magic": "MDFM0001" if schema == 4 else "MDFL0006",
                 "draft_layer_magic": "MDFD0004",
                 "vision_magic": "MDFV0001",
@@ -152,10 +154,10 @@ class ModelArtifactTest(unittest.TestCase):
             "incoai/anything",
         ):
             with self.subTest(model=model_id):
-                self.assertEqual(artifacts.validate_repo_id(model_id), model_id)
-                self.assertEqual(artifacts.parse_repo_id(model_id), model_id)
+                self.assertEqual(installer.validate_repo_id(model_id), model_id)
+                self.assertEqual(installer.parse_model_id(model_id), model_id)
                 self.assertEqual(
-                    artifacts.installed_root(self.root, model_id), self.root / model_id
+                    installer.installed_root(self.root, model_id), self.root / model_id
                 )
 
     def test_missing_or_invalid_model_fails_before_creating_or_downloading(self):
@@ -179,7 +181,7 @@ class ModelArtifactTest(unittest.TestCase):
             " owner/repo",
             "",
         ]
-        with mock.patch.object(artifacts, "resolve_snapshot") as download:
+        with mock.patch.object(legacy, "resolve_snapshot") as download:
             for model in cases:
                 args = (
                     [*base, "prepare"]
@@ -191,34 +193,34 @@ class ModelArtifactTest(unittest.TestCase):
                     contextlib.redirect_stderr(io.StringIO()),
                 ):
                     with self.assertRaises(SystemExit) as raised:
-                        artifacts.main(args)
+                        installer.main(args)
                     self.assertEqual(raised.exception.code, 2)
             download.assert_not_called()
         self.assertFalse(destination.exists())
-        with self.assertRaises(artifacts.ModelError):
-            artifacts.validate_repo_id(None)
+        with self.assertRaises(installer.ModelError):
+            installer.validate_repo_id(None)
         with self.assertRaises(argparse.ArgumentTypeError):
-            artifacts.parse_repo_id("short-name")
+            installer.parse_model_id("short-name")
 
     def test_prepare_also_validates_direct_call_before_creating_paths(self):
         models = self.root / "uncreated"
-        with self.assertRaises(artifacts.ModelError):
-            artifacts.prepare_legacy(SimpleNamespace(models=models, model="../outside"))
+        with self.assertRaises(installer.ModelError):
+            legacy.prepare(installer.Selection.of(models, "../outside"))
         self.assertFalse(models.exists())
 
     def test_quick_and_full_verification(self):
         snapshot, _ = self.package_fixture()
         models = self.root / "models"
-        artifacts.install_snapshot(snapshot, models / self.MODEL_ID)
+        installer.link_selection(models / self.MODEL_ID, snapshot)
         for full in (False, True):
-            artifacts.verify_installed(models, model_id=self.MODEL_ID, full=full)
+            legacy.verify(models / self.MODEL_ID, self.MODEL_ID, full=full)
         packed = snapshot / "target/embedding.bin"
         with packed.open("r+b") as file:
             file.seek(128)
             file.write(b"x")
-        artifacts.verify_installed(models, model_id=self.MODEL_ID, full=False)
-        with self.assertRaisesRegex(artifacts.ModelError, "checksum changed"):
-            artifacts.verify_installed(models, model_id=self.MODEL_ID, full=True)
+        legacy.verify(models / self.MODEL_ID, self.MODEL_ID, full=False)
+        with self.assertRaisesRegex(installer.ModelError, "checksum changed"):
+            legacy.verify(models / self.MODEL_ID, self.MODEL_ID, full=True)
 
     def test_accepts_both_formats_with_arbitrary_display_name_and_metadata(self):
         for schema in (3, 4):
@@ -228,10 +230,8 @@ class ModelArtifactTest(unittest.TestCase):
                 manifest["artifact_set_sha256"] = "producer-specific metadata"
                 manifest["execution_geometry"]["extra_metadata"] = 1
                 self.write_manifest(snapshot, manifest)
-                validated = artifacts.validate_package_manifest(
-                    snapshot / "manifest.json"
-                )
-                artifacts.verify_artifacts(snapshot, validated, full=True)
+                validated = legacy.validate_manifest(snapshot / "manifest.json")
+                legacy.verify_artifacts(snapshot, validated, full=True)
 
     def test_bad_manifest_fails_before_downloading_weights(self):
         snapshot, original = self.package_fixture()
@@ -252,8 +252,8 @@ class ModelArtifactTest(unittest.TestCase):
                 manifest[field] = value
                 self.write_manifest(snapshot, manifest)
                 self.configure_hub(snapshot)
-                with self.assertRaises(artifacts.ModelError):
-                    artifacts.resolve_snapshot(self.MODEL_ID)
+                with self.assertRaises(installer.ModelError):
+                    legacy.resolve_snapshot(self.MODEL_ID)
                 self.download.assert_not_called()
 
     def test_format_magic_and_moe_architecture_are_checked(self):
@@ -268,8 +268,8 @@ class ModelArtifactTest(unittest.TestCase):
                 manifest = copy.deepcopy(original)
                 manifest[section][key] = value
                 self.write_manifest(snapshot, manifest)
-                with self.assertRaises(artifacts.ModelError):
-                    artifacts.validate_package_manifest(snapshot / "manifest.json")
+                with self.assertRaises(installer.ModelError):
+                    legacy.validate_manifest(snapshot / "manifest.json")
 
     def test_manifest_must_list_every_file_the_runtime_reads(self):
         for schema in (3, 4):
@@ -294,9 +294,9 @@ class ModelArtifactTest(unittest.TestCase):
                     self.write_manifest(snapshot, manifest)
                     self.configure_hub(snapshot)
                     with self.assertRaisesRegex(
-                        artifacts.ModelError, "missing: " + name
+                        installer.ModelError, "missing: " + name
                     ):
-                        artifacts.resolve_snapshot(self.MODEL_ID)
+                        legacy.resolve_snapshot(self.MODEL_ID)
                     self.download.assert_not_called()
 
     def test_manifest_rejects_unsafe_ambiguous_and_glob_paths(self):
@@ -322,8 +322,8 @@ class ModelArtifactTest(unittest.TestCase):
                 manifest = copy.deepcopy(original)
                 manifest["artifacts"][0]["path"] = path
                 self.write_manifest(snapshot, manifest)
-                with self.assertRaisesRegex(artifacts.ModelError, "invalid artifact"):
-                    artifacts.validate_package_manifest(snapshot / "manifest.json")
+                with self.assertRaisesRegex(installer.ModelError, "invalid artifact"):
+                    legacy.validate_manifest(snapshot / "manifest.json")
 
     def test_manifest_rejects_duplicate_overlapping_and_invalid_records(self):
         snapshot, original = self.package_fixture()
@@ -341,24 +341,24 @@ class ModelArtifactTest(unittest.TestCase):
         ):
             with self.subTest(records=records):
                 self.write_manifest(snapshot, {**original, "artifacts": records})
-                with self.assertRaises(artifacts.ModelError):
-                    artifacts.validate_package_manifest(snapshot / "manifest.json")
+                with self.assertRaises(installer.ModelError):
+                    legacy.validate_manifest(snapshot / "manifest.json")
 
     def test_full_verification_accepts_uppercase_sha256(self):
         snapshot, manifest = self.package_fixture()
         for record in manifest["artifacts"]:
             record["sha256"] = record["sha256"].upper()
         self.write_manifest(snapshot, manifest)
-        artifacts.verify_artifacts(
+        legacy.verify_artifacts(
             snapshot,
-            artifacts.validate_package_manifest(snapshot / "manifest.json"),
+            legacy.validate_manifest(snapshot / "manifest.json"),
             full=True,
         )
 
     def test_download_pins_manifest_and_artifacts_to_one_resolved_commit(self):
         snapshot, manifest = self.package_fixture()
         self.configure_hub(snapshot)
-        self.assertEqual(artifacts.resolve_snapshot(self.MODEL_ID), snapshot.resolve())
+        self.assertEqual(legacy.resolve_snapshot(self.MODEL_ID), snapshot.resolve())
         self.api.assert_called_once_with(token=False)
         self.api.return_value.model_info.assert_called_once_with(
             self.MODEL_ID, revision="main", files_metadata=True
@@ -396,7 +396,7 @@ class ModelArtifactTest(unittest.TestCase):
                 result = subprocess.run(
                     [
                         sys.executable,
-                        str(Path(artifacts.__file__).resolve()),
+                        str(Path(installer.__file__).resolve()),
                         "--models",
                         str(models),
                         "--model",
@@ -429,15 +429,15 @@ class ModelArtifactTest(unittest.TestCase):
             [],
             [
                 SimpleNamespace(
-                    rfilename="manifest.json", size=artifacts.MAX_MANIFEST_BYTES + 1
+                    rfilename="manifest.json", size=installer.MAX_JSON_BYTES + 1
                 )
             ],
         ):
             with self.subTest(siblings=siblings):
                 self.configure_hub(snapshot)
                 self.api.return_value.model_info.return_value.siblings = siblings
-                with self.assertRaisesRegex(artifacts.ModelError, "manifest.json"):
-                    artifacts.resolve_snapshot(self.MODEL_ID)
+                with self.assertRaisesRegex(installer.ModelError, "manifest.json"):
+                    legacy.resolve_snapshot(self.MODEL_ID)
                 self.manifest_download.assert_not_called()
                 self.download.assert_not_called()
 
@@ -445,8 +445,8 @@ class ModelArtifactTest(unittest.TestCase):
         snapshot, _ = self.package_fixture()
         self.configure_hub(snapshot)
         self.api.return_value.model_info.return_value.sha = "main"
-        with self.assertRaisesRegex(artifacts.ModelError, "snapshot commit"):
-            artifacts.resolve_snapshot(self.MODEL_ID)
+        with self.assertRaisesRegex(installer.ModelError, "snapshot commit"):
+            legacy.resolve_snapshot(self.MODEL_ID)
         self.manifest_download.assert_not_called()
         self.download.assert_not_called()
 
@@ -454,8 +454,8 @@ class ModelArtifactTest(unittest.TestCase):
         snapshot, _ = self.package_fixture()
         self.configure_hub(snapshot)
         (snapshot / "target/embedding.bin").write_bytes(b"bad")
-        with self.assertRaisesRegex(artifacts.ModelError, "wrong size"):
-            artifacts.resolve_snapshot(self.MODEL_ID)
+        with self.assertRaisesRegex(installer.ModelError, "wrong size"):
+            legacy.resolve_snapshot(self.MODEL_ID)
         self.assertEqual(self.download.call_count, 1)
         self.assertEqual(
             self.manifest_download.call_args_list[0].kwargs["revision"], "main"
@@ -480,7 +480,7 @@ class ModelArtifactTest(unittest.TestCase):
             return str(manifest_path)
 
         self.manifest_download.side_effect = download_manifest
-        self.assertEqual(artifacts.resolve_snapshot(self.MODEL_ID), snapshot.resolve())
+        self.assertEqual(legacy.resolve_snapshot(self.MODEL_ID), snapshot.resolve())
         self.assertEqual(self.manifest_download.call_count, 2)
         self.assertEqual(
             self.manifest_download.call_args_list[0].kwargs["revision"], "main"
@@ -497,8 +497,8 @@ class ModelArtifactTest(unittest.TestCase):
         snapshot, _ = self.package_fixture()
         self.configure_hub(snapshot)
         (snapshot / "manifest.json").write_text("{truncated")
-        with self.assertRaises(artifacts.ModelError):
-            artifacts.resolve_snapshot(self.MODEL_ID)
+        with self.assertRaises(installer.ModelError):
+            legacy.resolve_snapshot(self.MODEL_ID)
         self.assertEqual(self.manifest_download.call_count, 2)
         self.assertEqual(
             self.manifest_download.call_args.kwargs["revision"], self.REVISION
@@ -515,8 +515,8 @@ class ModelArtifactTest(unittest.TestCase):
         self.write_manifest(other, manifest)
         self.configure_hub(snapshot)
         self.download.return_value = str(other)
-        with self.assertRaisesRegex(artifacts.ModelError, "manifest changed"):
-            artifacts.resolve_snapshot(self.MODEL_ID)
+        with self.assertRaisesRegex(installer.ModelError, "manifest changed"):
+            legacy.resolve_snapshot(self.MODEL_ID)
 
     def test_incomplete_hub_package_fails_before_weights_download(self):
         snapshot, _ = self.package_fixture()
@@ -525,8 +525,8 @@ class ModelArtifactTest(unittest.TestCase):
         info.siblings = [
             item for item in info.siblings if item.rfilename != "target/head.bin"
         ]
-        with self.assertRaisesRegex(artifacts.ModelError, "Hub artifact"):
-            artifacts.resolve_snapshot(self.MODEL_ID)
+        with self.assertRaisesRegex(installer.ModelError, "Hub artifact"):
+            legacy.resolve_snapshot(self.MODEL_ID)
         self.download.assert_not_called()
 
     def test_complete_cached_snapshot_can_be_relinked_offline(self):
@@ -536,9 +536,7 @@ class ModelArtifactTest(unittest.TestCase):
             "huggingface_hub.try_to_load_from_cache",
             return_value=str(snapshot / "manifest.json"),
         ):
-            self.assertEqual(
-                artifacts.resolve_snapshot(self.MODEL_ID), snapshot.resolve()
-            )
+            self.assertEqual(legacy.resolve_snapshot(self.MODEL_ID), snapshot.resolve())
         self.download.assert_not_called()
 
     def test_corrupt_artifact_is_repaired_without_redownloading_others(self):
@@ -555,7 +553,7 @@ class ModelArtifactTest(unittest.TestCase):
             return str(snapshot / kwargs["filename"])
 
         self.manifest_download.side_effect = download_file
-        self.assertEqual(artifacts.resolve_snapshot(self.MODEL_ID), snapshot.resolve())
+        self.assertEqual(legacy.resolve_snapshot(self.MODEL_ID), snapshot.resolve())
         self.download.assert_called_once()
         self.assertEqual(self.manifest_download.call_count, 2)
 
@@ -575,10 +573,10 @@ class ModelArtifactTest(unittest.TestCase):
                 if env:
                     environment["HF_TOKEN"] = env
                 with (
-                    mock.patch.dict(artifacts.os.environ, environment, clear=True),
+                    mock.patch.dict(os.environ, environment, clear=True),
                     mock.patch("huggingface_hub.get_token", return_value=login),
                 ):
-                    artifacts.resolve_snapshot(model_id)
+                    legacy.resolve_snapshot(model_id)
                 for call in (
                     self.api.call_args,
                     self.manifest_download.call_args,
@@ -592,18 +590,16 @@ class ModelArtifactTest(unittest.TestCase):
         self.api.return_value.model_info.side_effect = RuntimeError(
             "network unavailable hf_testdistributiontoken"
         )
-        with mock.patch.dict(
-            artifacts.os.environ, {"HF_TOKEN": "hf_testdistributiontoken"}
-        ):
-            with self.assertRaises(artifacts.ModelError) as raised:
-                artifacts.resolve_snapshot("incoai/model")
+        with mock.patch.dict(os.environ, {"HF_TOKEN": "hf_testdistributiontoken"}):
+            with self.assertRaises(installer.ModelError) as raised:
+                legacy.resolve_snapshot("incoai/model")
         self.assertIn("incoai/model@main", str(raised.exception))
         self.assertIn("network unavailable [redacted]", str(raised.exception))
         self.assertNotIn("hf_testdistributiontoken", str(raised.exception))
-        self.assertNotIn("HF_TOKEN", artifacts.os.environ)
+        self.assertNotIn("HF_TOKEN", os.environ)
 
     def test_command_line_takes_required_model_before_command(self):
-        args = artifacts.parse_args(["--model", self.MODEL_ID, "prepare"])
+        args = installer.parse_args(["--model", self.MODEL_ID, "prepare"])
         self.assertEqual((args.command, args.model), ("prepare", self.MODEL_ID))
         makefile = (Path(__file__).resolve().parents[2] / "Makefile").read_text()
         self.assertIn('$(MODEL_INSTALL) --model "$(MODEL)" prepare', makefile)
@@ -613,25 +609,25 @@ class ModelArtifactTest(unittest.TestCase):
     ):
         snapshot, _ = self.package_fixture()
         models = self.root / "models"
-        args = SimpleNamespace(models=models, model=self.MODEL_ID)
+        args = installer.Selection.of(models, self.MODEL_ID)
         with (
             mock.patch.object(
-                artifacts, "resolve_snapshot", return_value=snapshot
+                legacy, "resolve_snapshot", return_value=snapshot
             ) as resolve,
             contextlib.redirect_stdout(io.StringIO()),
         ):
-            artifacts.prepare_legacy(args)
+            legacy.prepare(args)
         destination = models / self.MODEL_ID
         self.assertTrue(destination.is_symlink())
         self.assertEqual(destination.resolve(), snapshot.resolve())
         resolve.assert_called_once_with(self.MODEL_ID)
         with (
-            mock.patch.object(artifacts, "resolve_snapshot") as second,
-            mock.patch.object(artifacts, "sha256") as hash_file,
+            mock.patch.object(legacy, "resolve_snapshot") as second,
+            mock.patch.object(installer, "sha256") as hash_file,
             contextlib.redirect_stdout(io.StringIO()),
         ):
-            artifacts.prepare_legacy(args)
-            result = artifacts.main(
+            legacy.prepare(args)
+            result = installer.main(
                 ["--models", str(models), "--model", self.MODEL_ID, "verify"]
             )
         self.assertEqual(result, 0)
@@ -642,10 +638,10 @@ class ModelArtifactTest(unittest.TestCase):
     def test_installed_package_starts_through_prepare_without_the_hub(self):
         snapshot, _ = self.package_fixture()
         models = self.root / "models"
-        artifacts.install_snapshot(snapshot, models / self.MODEL_ID)
+        installer.link_selection(models / self.MODEL_ID, snapshot)
         with contextlib.redirect_stdout(io.StringIO()) as output:
             self.assertEqual(
-                artifacts.main(
+                installer.main(
                     ["--models", str(models), "--model", self.MODEL_ID, "prepare"]
                 ),
                 0,
@@ -668,7 +664,7 @@ class ModelArtifactTest(unittest.TestCase):
                 )
         for record in manifest["artifacts"]:
             # Digests compare case-insensitively, as installation checks them.
-            record["sha256"] = artifacts.sha256(snapshot / record["path"]).upper()
+            record["sha256"] = installer.sha256(snapshot / record["path"]).upper()
         manifest["upstream"] = {
             "draft": {"repo_id": "z-lab/draft", "revision": "e" * 40}
         }
@@ -702,47 +698,45 @@ class ModelArtifactTest(unittest.TestCase):
             broken = copy.deepcopy(manifest)
             mutate(broken)
             self.write_manifest(snapshot, broken)
-            with self.assertRaisesRegex(artifacts.ModelError, message):
+            with self.assertRaisesRegex(installer.ModelError, message):
                 export_draft.export(snapshot, config, self.root / "other")
         self.write_manifest(snapshot, manifest)
         with (snapshot / "draft/layer-2.bin").open("r+b") as file:
             file.write(struct.pack("<8sII", b"MDFD0004", 3, 0))
-        with self.assertRaisesRegex(artifacts.ModelError, "checksum changed"):
+        with self.assertRaisesRegex(installer.ModelError, "checksum changed"):
             export_draft.export(snapshot, config, self.root / "other")
         self.assertFalse((self.root / "other").exists())
 
     def test_variant_model_ids_parse_and_name_installed_roots(self):
         self.assertEqual(
-            artifacts.split_model_id("owner/repo:UD-Q4_K_M"),
+            installer.split_model_id("owner/repo:UD-Q4_K_M"),
             ("owner/repo", "UD-Q4_K_M"),
         )
-        self.assertEqual(artifacts.split_model_id("owner/repo"), ("owner/repo", None))
+        self.assertEqual(installer.split_model_id("owner/repo"), ("owner/repo", None))
         self.assertEqual(
-            artifacts.validate_model_id("owner/repo:UD-Q4_K_M"),
+            installer.parse_model_id("owner/repo:UD-Q4_K_M"),
             "owner/repo:UD-Q4_K_M",
         )
         for bad in ("owner/repo:", "owner/repo:a b", "owner/repo:..", "owner:v"):
-            with self.assertRaises(artifacts.ModelError):
-                artifacts.split_model_id(bad)
+            with self.assertRaises(installer.ModelError):
+                installer.split_model_id(bad)
         with self.assertRaises(argparse.ArgumentTypeError):
-            artifacts.parse_model_id("owner/repo:")
+            installer.parse_model_id("owner/repo:")
         models = self.root / "models"
         self.assertEqual(
-            artifacts.installed_root(models, "owner/repo:UD-Q4_K_M"),
+            installer.installed_root(models, "owner/repo:UD-Q4_K_M"),
             models / "owner" / "repo:UD-Q4_K_M",
         )
         self.assertEqual(
-            artifacts.installed_root(models, "owner/repo"), models / "owner/repo"
+            installer.installed_root(models, "owner/repo"), models / "owner/repo"
         )
 
     def test_a_package_takes_no_variant(self):
         snapshot, _ = self.package_fixture()
         self.configure_hub(snapshot)
         models = self.root / "models"
-        with self.assertRaisesRegex(artifacts.ModelError, "no variants"):
-            artifacts.prepare_legacy(
-                SimpleNamespace(models=models, model=self.MODEL_ID + ":Q4_K_M")
-            )
+        with self.assertRaisesRegex(installer.ModelError, "no variants"):
+            legacy.prepare(installer.Selection.of(models, self.MODEL_ID + ":Q4_K_M"))
         self.api.assert_not_called()
         self.assertFalse(models.exists())
 
@@ -750,8 +744,8 @@ class ModelArtifactTest(unittest.TestCase):
         snapshot, _ = self.package_fixture()
         destination = self.root / "occupied"
         destination.mkdir()
-        with self.assertRaisesRegex(artifacts.ModelError, "non-symlink"):
-            artifacts.install_snapshot(snapshot, destination)
+        with self.assertRaisesRegex(installer.ModelError, "non-symlink"):
+            installer.link_selection(destination, snapshot)
 
     def test_legacy_packages_are_preserved_and_never_given_an_official_id(self):
         model_id = "incoai/Qwen3.6-35B-A3B-Splash"
@@ -762,29 +756,29 @@ class ModelArtifactTest(unittest.TestCase):
                 self.write_manifest(old, manifest)
                 models = self.root / f"models-{self.fixture_number}"
                 models.mkdir()
-                legacy = models / "qwen3.6-35b-a3b"
+                old_package = models / "qwen3.6-35b-a3b"
                 if kind == "directory":
-                    shutil.copytree(old, legacy)
+                    shutil.copytree(old, old_package)
                 else:
-                    legacy.symlink_to(
+                    old_package.symlink_to(
                         old
                         if kind == "absolute link"
-                        else artifacts.os.path.relpath(old, models),
+                        else os.path.relpath(old, models),
                         target_is_directory=True,
                     )
-                expected = (legacy / "manifest.json").read_bytes()
+                expected = (old_package / "manifest.json").read_bytes()
                 official, _ = self.package_fixture(schema=4, model_id=model_id)
                 self.configure_hub(official)
-                args = SimpleNamespace(models=models, model=model_id)
+                args = installer.Selection.of(models, model_id)
                 output = io.StringIO()
                 with contextlib.redirect_stdout(output):
-                    artifacts.prepare_legacy(args)
+                    legacy.prepare(args)
                 self.assertEqual((models / model_id).resolve(), official.resolve())
-                self.assertEqual((legacy / "manifest.json").read_bytes(), expected)
+                self.assertEqual((old_package / "manifest.json").read_bytes(), expected)
                 self.assertIn("missing artifacts will be downloaded", output.getvalue())
-                with mock.patch.object(artifacts, "resolve_snapshot") as download:
+                with mock.patch.object(legacy, "resolve_snapshot") as download:
                     with contextlib.redirect_stdout(io.StringIO()):
-                        artifacts.prepare_legacy(args)
+                        legacy.prepare(args)
                     download.assert_not_called()
 
     def test_existing_link_to_a_different_repository_is_replaced_after_verification(
@@ -794,11 +788,9 @@ class ModelArtifactTest(unittest.TestCase):
         official, _ = self.package_fixture()
         self.configure_hub(official)
         models = self.root / "models"
-        artifacts.install_snapshot(old, models / self.MODEL_ID)
+        installer.link_selection(models / self.MODEL_ID, old)
         with contextlib.redirect_stdout(io.StringIO()):
-            artifacts.prepare_legacy(
-                SimpleNamespace(models=models, model=self.MODEL_ID)
-            )
+            legacy.prepare(installer.Selection.of(models, self.MODEL_ID))
         self.assertEqual((models / self.MODEL_ID).resolve(), official.resolve())
         self.assertTrue(old.is_dir())
         self.assertFalse((old.parent.parent / "refs").exists())
@@ -811,11 +803,9 @@ class ModelArtifactTest(unittest.TestCase):
         self.configure_hub(current)
         models = self.root / "models"
         destination = models / self.MODEL_ID
-        artifacts.install_snapshot(old, destination)
+        installer.link_selection(destination, old)
         with contextlib.redirect_stdout(io.StringIO()):
-            artifacts.prepare_legacy(
-                SimpleNamespace(models=models, model=self.MODEL_ID)
-            )
+            legacy.prepare(installer.Selection.of(models, self.MODEL_ID))
         self.assertEqual(destination.resolve(), current.resolve())
         self.assertTrue(old.is_dir())
         self.assertEqual(json.loads((old / "manifest.json").read_text()), manifest)
@@ -825,22 +815,18 @@ class ModelArtifactTest(unittest.TestCase):
         models = self.root / "models"
         destination = models / self.MODEL_ID
         shutil.copytree(snapshot, destination)
-        with self.assertRaisesRegex(artifacts.ModelError, "move it aside"):
-            artifacts.prepare_legacy(
-                SimpleNamespace(models=models, model=self.MODEL_ID)
-            )
+        with self.assertRaisesRegex(installer.ModelError, "move it aside"):
+            legacy.prepare(installer.Selection.of(models, self.MODEL_ID))
         self.download.assert_not_called()
         self.assertTrue(destination.is_dir())
 
     def test_existing_canonical_snapshot_repairs_missing_ref_offline(self):
         snapshot, _ = self.package_fixture()
         models = self.root / "models"
-        artifacts.install_snapshot(snapshot, models / self.MODEL_ID)
-        with mock.patch.object(artifacts, "resolve_snapshot") as download:
+        installer.link_selection(models / self.MODEL_ID, snapshot)
+        with mock.patch.object(legacy, "resolve_snapshot") as download:
             with contextlib.redirect_stdout(io.StringIO()):
-                artifacts.prepare_legacy(
-                    SimpleNamespace(models=models, model=self.MODEL_ID)
-                )
+                legacy.prepare(installer.Selection.of(models, self.MODEL_ID))
             download.assert_not_called()
         refs = list((snapshot.parent.parent / "refs/splash").glob("*/*"))
         self.assertEqual([ref.read_text() for ref in refs], [self.REVISION])
@@ -857,8 +843,8 @@ class ModelArtifactTest(unittest.TestCase):
         (refs / "main").write_text("b" * 40)
         install_a = self.root / "install-a" / self.MODEL_ID
         install_b = self.root / "install-b" / self.MODEL_ID
-        pin_a = artifacts.retain_ref(first, self.MODEL_ID, install_a)
-        pin_b = artifacts.retain_ref(second, self.MODEL_ID, install_b)
+        pin_a = hub.pin(first, self.MODEL_ID, install_a)
+        pin_b = hub.pin(second, self.MODEL_ID, install_b)
         self.assertNotEqual(pin_a.parent, pin_b.parent)
         self.assertEqual((refs / "main").read_text(), "b" * 40)
         scanned = scan_cache_dir(cache)
@@ -871,35 +857,31 @@ class ModelArtifactTest(unittest.TestCase):
         snapshot, _ = self.package_fixture()
         models = self.root / "models"
         destination = models / self.MODEL_ID
-        artifacts.install_snapshot(snapshot, destination)
-        ref = artifacts.retain_ref(snapshot, self.MODEL_ID, destination)
+        installer.link_selection(destination, snapshot)
+        ref = hub.pin(snapshot, self.MODEL_ID, destination)
         with mock.patch.object(
-            artifacts.os, "link", side_effect=AssertionError("cache write")
+            installer.os, "link", side_effect=AssertionError("cache write")
         ):
             with contextlib.redirect_stdout(io.StringIO()):
-                artifacts.prepare_legacy(
-                    SimpleNamespace(models=models, model=self.MODEL_ID)
-                )
+                legacy.prepare(installer.Selection.of(models, self.MODEL_ID))
         self.assertEqual(ref.read_text(), self.REVISION)
 
     def test_verified_model_starts_when_cache_ref_cannot_be_written(self):
         snapshot, _ = self.package_fixture()
         models = self.root / "models"
         destination = models / self.MODEL_ID
-        artifacts.install_snapshot(snapshot, destination)
+        installer.link_selection(destination, snapshot)
         for code in (errno.EACCES, errno.EPERM, errno.EROFS):
             with self.subTest(errno=code):
                 errors = io.StringIO()
                 with mock.patch.object(
-                    artifacts.os, "link", side_effect=OSError(code, "read only")
+                    installer.os, "link", side_effect=OSError(code, "read only")
                 ):
                     with (
                         contextlib.redirect_stdout(io.StringIO()),
                         contextlib.redirect_stderr(errors),
                     ):
-                        artifacts.prepare_legacy(
-                            SimpleNamespace(models=models, model=self.MODEL_ID)
-                        )
+                        legacy.prepare(installer.Selection.of(models, self.MODEL_ID))
                 self.assertEqual(destination.resolve(), snapshot.resolve())
                 self.assertIn("external cache pruning", errors.getvalue())
         self.download.assert_not_called()
@@ -909,38 +891,34 @@ class ModelArtifactTest(unittest.TestCase):
         models = self.root / "models"
         self.configure_hub(snapshot)
         with mock.patch.object(
-            artifacts,
-            "retain_ref",
+            hub,
+            "pin",
             side_effect=OSError(errno.EROFS, "read only"),
         ):
             with contextlib.redirect_stdout(io.StringIO()):
                 with self.assertRaises(OSError):
-                    artifacts.prepare_legacy(
-                        SimpleNamespace(models=models, model=self.MODEL_ID)
-                    )
+                    legacy.prepare(installer.Selection.of(models, self.MODEL_ID))
         self.assertFalse((models / self.MODEL_ID).exists())
 
     def test_invalid_existing_ref_is_not_ignored(self):
         snapshot, _ = self.package_fixture()
         models = self.root / "models"
         destination = models / self.MODEL_ID
-        artifacts.install_snapshot(snapshot, destination)
-        ref = artifacts.retain_ref(snapshot, self.MODEL_ID, destination)
+        installer.link_selection(destination, snapshot)
+        ref = hub.pin(snapshot, self.MODEL_ID, destination)
         ref.write_text("wrong")
         with contextlib.redirect_stdout(io.StringIO()):
             with self.assertRaisesRegex(
-                artifacts.ModelError, "invalid installed snapshot reference"
+                installer.ModelError, "invalid installed snapshot reference"
             ):
-                artifacts.prepare_legacy(
-                    SimpleNamespace(models=models, model=self.MODEL_ID)
-                )
+                legacy.prepare(installer.Selection.of(models, self.MODEL_ID))
 
     def test_retiring_old_pin_failure_keeps_verified_installation_usable(self):
         snapshot, _ = self.package_fixture()
         models = self.root / "models"
         destination = models / self.MODEL_ID
-        artifacts.install_snapshot(snapshot, destination)
-        ref = artifacts.retain_ref(snapshot, self.MODEL_ID, destination)
+        installer.link_selection(destination, snapshot)
+        ref = hub.pin(snapshot, self.MODEL_ID, destination)
         old = ref.parent / ("b" * 40)
         old.write_text("b" * 40)
         errors = io.StringIO()
@@ -951,9 +929,7 @@ class ModelArtifactTest(unittest.TestCase):
                 contextlib.redirect_stdout(io.StringIO()),
                 contextlib.redirect_stderr(errors),
             ):
-                artifacts.prepare_legacy(
-                    SimpleNamespace(models=models, model=self.MODEL_ID)
-                )
+                legacy.prepare(installer.Selection.of(models, self.MODEL_ID))
         self.assertEqual(ref.read_text(), self.REVISION)
         self.assertTrue(old.exists())
         self.assertIn("could not retire", errors.getvalue())
@@ -965,13 +941,11 @@ class ModelArtifactTest(unittest.TestCase):
         models = self.root / "install-a"
         destination = models / self.MODEL_ID
         other = self.root / "install-b" / self.MODEL_ID
-        old_pin = artifacts.retain_ref(first, self.MODEL_ID, destination)
-        other_pin = artifacts.retain_ref(first, self.MODEL_ID, other)
-        artifacts.install_snapshot(second, destination)
+        old_pin = hub.pin(first, self.MODEL_ID, destination)
+        other_pin = hub.pin(first, self.MODEL_ID, other)
+        installer.link_selection(destination, second)
         with contextlib.redirect_stdout(io.StringIO()):
-            artifacts.prepare_legacy(
-                SimpleNamespace(models=models, model=self.MODEL_ID)
-            )
+            legacy.prepare(installer.Selection.of(models, self.MODEL_ID))
         self.assertFalse(old_pin.exists())
         self.assertTrue(other_pin.exists())
         self.assertEqual([p.read_text() for p in old_pin.parent.iterdir()], ["b" * 40])
@@ -984,7 +958,7 @@ class ModelArtifactTest(unittest.TestCase):
             SimpleNamespace(sha=self.REVISION, siblings=info.siblings),
             SimpleNamespace(sha="b" * 40, siblings=info.siblings),
         ]
-        self.assertEqual(artifacts.resolve_snapshot(self.MODEL_ID), current.resolve())
+        self.assertEqual(legacy.resolve_snapshot(self.MODEL_ID), current.resolve())
         self.assertEqual(self.manifest_download.call_count, 2)
         self.assertEqual(self.download.call_count, 1)
         self.assertEqual(self.download.call_args.kwargs["revision"], "b" * 40)
@@ -993,8 +967,8 @@ class ModelArtifactTest(unittest.TestCase):
         self.api.return_value.model_info.return_value = SimpleNamespace(
             sha=self.REVISION, siblings=info.siblings
         )
-        with self.assertRaisesRegex(artifacts.ModelError, "main changed repeatedly"):
-            artifacts.resolve_snapshot(self.MODEL_ID)
+        with self.assertRaisesRegex(installer.ModelError, "main changed repeatedly"):
+            legacy.resolve_snapshot(self.MODEL_ID)
         self.download.assert_not_called()
 
     @staticmethod
@@ -1015,13 +989,13 @@ class ModelArtifactTest(unittest.TestCase):
                     )
                     environment = {"HF_TOKEN": "test-explicit"} if explicit else {}
                     with (
-                        mock.patch.dict(artifacts.os.environ, environment, clear=True),
+                        mock.patch.dict(os.environ, environment, clear=True),
                         mock.patch(
                             "huggingface_hub.get_token", return_value="test-login"
                         ) as login,
                     ):
-                        with self.assertRaises(artifacts.ModelError) as raised:
-                            artifacts.resolve_snapshot(self.MODEL_ID)
+                        with self.assertRaises(installer.ModelError) as raised:
+                            legacy.resolve_snapshot(self.MODEL_ID)
                     if explicit:
                         login.assert_not_called()
                     else:
@@ -1033,33 +1007,33 @@ class ModelArtifactTest(unittest.TestCase):
                         self.assertIn("hf auth login", str(raised.exception))
 
     def test_installation_lock_is_exclusive(self):
-        with mock.patch.object(artifacts.fcntl, "flock") as flock:
-            with artifacts.installation_lock(self.root):
+        with mock.patch.object(installer.fcntl, "flock") as flock:
+            with installer.installation_lock(self.root):
                 pass
         self.assertEqual(
             [call.args[1] for call in flock.call_args_list],
             [
-                artifacts.fcntl.LOCK_EX | artifacts.fcntl.LOCK_NB,
-                artifacts.fcntl.LOCK_UN,
+                installer.fcntl.LOCK_EX | installer.fcntl.LOCK_NB,
+                installer.fcntl.LOCK_UN,
             ],
         )
 
 
 class ScriptEntryTests(unittest.TestCase):
-    def test_script_reports_installer_errors_without_a_traceback(self):
-        # The launcher runs install/models.py as a script; errors raised in
-        # upstream.py must reach the user as one line, as in package imports.
+    """The launcher runs install/models.py as a script: errors raised in the
+    other installer modules must reach the user as one line, as they do
+    through package imports."""
+
+    def run_script(self, *arguments):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             result = subprocess.run(
                 [
                     sys.executable,
-                    str(Path(artifacts.__file__).resolve()),
+                    str(Path(installer.__file__).resolve()),
                     "--models",
                     str(root / "models"),
-                    "--model",
-                    "someone/not-cached",
-                    "prepare",
+                    *arguments,
                 ],
                 env={
                     "HOME": str(root / "home"),
@@ -1072,8 +1046,16 @@ class ScriptEntryTests(unittest.TestCase):
             )
         output = result.stdout + result.stderr
         self.assertEqual(result.returncode, 1, output)
-        self.assertIn("error: cannot resolve someone/not-cached", output)
         self.assertNotIn("Traceback", output)
+        return output
+
+    def test_an_uncached_model_offline_is_one_error_line(self):
+        output = self.run_script("--model", "someone/not-cached", "prepare")
+        self.assertIn("error: cannot resolve someone/not-cached", output)
+
+    def test_verifying_nothing_installed_is_one_error_line(self):
+        output = self.run_script("--model", "someone/model:Q4_K_M", "verify")
+        self.assertIn("error: someone/model:Q4_K_M is not installed in ", output)
 
 
 if __name__ == "__main__":

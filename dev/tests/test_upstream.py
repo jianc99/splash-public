@@ -1,155 +1,34 @@
-import argparse
 import contextlib
 import dataclasses
 import errno
 import fcntl
-import hashlib
 import io
 import json
 import shutil
 import tempfile
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
 from unittest import mock
 
 import httpx
-from huggingface_hub.errors import HfHubHTTPError, IncompleteSnapshotError
-from huggingface_hub.hf_api import RepoSibling
+from huggingface_hub.errors import IncompleteSnapshotError
 
-from install import models, upstream
-
-DENSE = next(f for f in upstream.FAMILIES if f.name == "Qwen3.8-27B")
-MOE = next(f for f in upstream.FAMILIES if f.name == "Qwen3.6-35B-A3B")
-MODEL = "mlx-community/Qwen3.8-27B-4bit"
-
-
-def text_config(family, **changes):
-    return dict(family.signature) | changes
-
-
-def mlx_target(root, family, *, changes=None):
-    root.mkdir(parents=True, exist_ok=True)
-    config = {
-        "text_config": text_config(family, **(changes or {})),
-        "quantization": {"bits": 4, "group_size": 64},
-    }
-    (root / "config.json").write_text(json.dumps(config))
-    for name in ("tokenizer.json", "tokenizer_config.json", "model.safetensors"):
-        (root / name).write_text("{}")
-    return root
-
-
-def draft_dir(root, family):
-    folder = root / family.name
-    folder.mkdir(parents=True, exist_ok=True)
-    (folder / "config.json").write_text(
-        json.dumps(
-            {
-                "architectures": ["DFlash2DraftModel"],
-                "hidden_size": dict(family.signature)["hidden_size"],
-                "num_hidden_layers": family.draft.layers,
-                "splash": {"format": "MDFD0004"},
-            }
-        )
-    )
-    for name in ("model.bin", *(f"layer-{i}.bin" for i in range(family.draft.layers))):
-        (folder / name).write_bytes(b"draft")
-    return root
-
-
-def arguments(root, model=MODEL, **options):
-    return argparse.Namespace(
-        model=model,
-        models=root / "models",
-        revision=options.get("revision"),
-        language_only=options.get("language_only", True),
-        draft_model=options.get("draft_model"),
-    )
-
-
-def http_error(status):
-    request = httpx.Request("GET", "https://huggingface.co/api/models/owner/model")
-    return HfHubHTTPError(
-        f"{status} Client Error.\n\nRevision Not Found for url: {request.url}.",
-        response=httpx.Response(status, request=request),
-    )
-
-
-class FakeHub:
-    """The Hub as huggingface_hub presents it to the installer: repositories
-    whose branches name commits, and downloads that fill the test's Hub cache
-    with snapshots of only the files requested."""
-
-    def __init__(self, test):
-        self.cache = test.cache
-        self.remote = test.root / "remote"
-        self.branches = {}
-        # What the next Hub request raises: resolution, or downloads.
-        self.failure = self.download_failure = None
-        self.requests, self.downloads = [], []
-        for name, replacement in (
-            ("huggingface_hub.HfApi", lambda **options: self),
-            ("huggingface_hub.snapshot_download", self.snapshot_download),
-            ("huggingface_hub.hf_hub_download", self.hf_hub_download),
-            ("huggingface_hub.HfFileSystem", lambda: self),
-            ("huggingface_hub.try_to_load_from_cache", lambda *a, **k: None),
-        ):
-            patch = mock.patch(name, replacement)
-            patch.start()
-            test.addCleanup(patch.stop)
-
-    def publish(self, repo_id, commit, build, branch="main"):
-        build(self.remote / repo_id / commit)
-        self.branches[repo_id, branch] = commit
-
-    def model_info(self, repo_id, *, revision=None, files_metadata, timeout):
-        self.requests.append((repo_id, revision))
-        assert files_metadata and timeout == upstream.HUB_TIMEOUT
-        if self.failure:
-            raise self.failure
-        commit = revision
-        if not models.is_hex_digest(revision, 40):
-            commit = self.branches.get((repo_id, revision or "main"))
-        root = self.remote / repo_id / str(commit)
-        if not root.is_dir():
-            raise http_error(404)
-        return SimpleNamespace(
-            sha=commit,
-            siblings=[
-                RepoSibling(
-                    rfilename=name,
-                    size=(root / name).stat().st_size,
-                    blob_id=hashlib.sha1((root / name).read_bytes()).hexdigest(),
-                )
-                for name in sorted(upstream._listing(root))
-            ],
-        )
-
-    def fetch(self, repo_id, name, revision):
-        if self.download_failure:
-            raise self.download_failure
-        snapshot = self.cache / models.hub_folder_name(repo_id) / "snapshots"
-        path = snapshot / revision / name
-        # As huggingface_hub does, a cached file is returned as it is.
-        if not path.exists():
-            path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(self.remote / repo_id / revision / name, path)
-            self.downloads.append(f"{repo_id}/{name}")
-        return path
-
-    def snapshot_download(self, repo_id, *, revision, allow_patterns, max_workers):
-        for name in allow_patterns:
-            self.fetch(repo_id, name, revision)
-        snapshot = self.cache / models.hub_folder_name(repo_id) / "snapshots"
-        return str(snapshot / revision)
-
-    def hf_hub_download(self, repo_id, filename, *, revision):
-        return str(self.fetch(repo_id, filename, revision))
-
-    def open(self, path, mode, *, revision, block_size):
-        owner, name, filename = path.split("/", 2)
-        return (self.remote / owner / name / revision / filename).open(mode)
+from dev.tests.installer_fixtures import (
+    DENSE,
+    MODEL,
+    MOE,
+    PROCESSOR,
+    FakeHub,
+    cached_snapshot,
+    draft_dir,
+    fake_hub,
+    http_error,
+    mlx_target,
+    pins,
+    selection,
+    text_config,
+)
+from install import assembly, families, hub, legacy, models, upstream
 
 
 class UpstreamTest(unittest.TestCase):
@@ -158,50 +37,27 @@ class UpstreamTest(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
         self.cache = self.root / "hub"
-        for patch in (
-            mock.patch("huggingface_hub.constants.HF_HUB_CACHE", str(self.cache)),
-            mock.patch("huggingface_hub.constants.HF_HUB_OFFLINE", False),
-            mock.patch("huggingface_hub.get_token", return_value=None),
-        ):
-            patch.start()
-            self.addCleanup(patch.stop)
-
-    def hub(self, repo_id, commit, build):
-        """repo_id at commit as a download leaves it in the Hub cache: a
-        snapshot of only the files downloaded."""
-        build(self.cache / models.hub_folder_name(repo_id) / "snapshots" / commit)
-        return upstream.Repository.cached(repo_id, commit)
-
-    def fake_hub(self, *, target=DENSE, commit="a" * 40):
-        """A Hub publishing MODEL at commit on main and the drafts' repository
-        at every family's pinned commit."""
-        hub = FakeHub(self)
-        hub.publish(MODEL, commit, lambda p: mlx_target(p, target))
-        for family in upstream.FAMILIES:
-            hub.publish(
-                upstream.DRAFTS, family.draft.revision, lambda p: draft_dir(p, family)
-            )
-        return hub
 
     @staticmethod
-    def prepare(args):
-        with contextlib.redirect_stdout(io.StringIO()) as output:
-            result = upstream.prepare(args)
-        return result, output.getvalue()
-
-    def pins(self):
-        return sorted(ref.name for ref in self.cache.glob("*/refs/splash/*/*"))
+    def prepare(chosen):
+        """upstream.prepare's output and warnings."""
+        with (
+            contextlib.redirect_stdout(io.StringIO()) as output,
+            contextlib.redirect_stderr(io.StringIO()) as warnings,
+        ):
+            upstream.prepare(chosen)
+        return output.getvalue(), warnings.getvalue()
 
     def test_every_family_pins_a_published_draft_commit(self):
-        for family in upstream.FAMILIES:
+        for family in families.FAMILIES:
             with self.subTest(family=family.name):
                 self.assertTrue(models.is_hex_digest(family.draft.revision, 40))
                 self.assertEqual(family.draft.revision, family.draft.revision.lower())
 
     def test_family_is_identified_by_architecture_not_name(self):
-        for family in upstream.FAMILIES:
+        for family in families.FAMILIES:
             self.assertIs(
-                upstream.family_for({"text_config": text_config(family)}), family
+                families.family_for({"text_config": text_config(family)}), family
             )
         # A differing field is another architecture, whatever the repository is called.
         for changes in (
@@ -219,9 +75,9 @@ class UpstreamTest(unittest.TestCase):
                 ),
             ):
                 family = MOE if "num_experts" in changes else DENSE
-                upstream.family_for({"text_config": text_config(family, **changes)})
+                families.family_for({"text_config": text_config(family, **changes)})
         with self.assertRaises(models.ModelError):
-            upstream.family_for({"hidden_size": 5120})
+            families.family_for({"hidden_size": 5120})
 
     def test_gguf_selection_is_exact_and_ignores_subfolders(self):
         files = {
@@ -234,24 +90,21 @@ class UpstreamTest(unittest.TestCase):
             "mmproj-BF16.gguf",
         }
         self.assertEqual(
-            upstream.select_gguf(files, "UD-Q4_K_M"), "Qwen3.8-27B-UD-Q4_K_M.gguf"
+            upstream.select_gguf(files, "UD-Q4_K_M"),
+            ("Qwen3.8-27B-UD-Q4_K_M.gguf", True),
         )
-        self.assertEqual(upstream.select_gguf(files, "q4_0"), "Qwen3.8-27B-Q4_0.gguf")
+        self.assertEqual(
+            upstream.select_gguf(files, "q4_0"), ("Qwen3.8-27B-Q4_0.gguf", True)
+        )
         # Q4_K_M names the plain file; without one, the one file ending so,
-        # which is said, and never one of several.
+        # which is not an exact match, and never one of several.
         both = files | {"Qwen3.8-27B-Q4_K_M.gguf"}
-        with contextlib.redirect_stdout(io.StringIO()) as output:
-            self.assertEqual(
-                upstream.select_gguf(both, "Q4_K_M"), "Qwen3.8-27B-Q4_K_M.gguf"
-            )
-        self.assertEqual(output.getvalue(), "")
-        with contextlib.redirect_stdout(io.StringIO()) as output:
-            self.assertEqual(
-                upstream.select_gguf(files, "Q4_K_M"), "Qwen3.8-27B-UD-Q4_K_M.gguf"
-            )
-        self.assertIn(
-            "No GGUF is named for :Q4_K_M alone; using Qwen3.8-27B-UD-Q4_K_M.gguf",
-            output.getvalue(),
+        self.assertEqual(
+            upstream.select_gguf(both, "Q4_K_M"), ("Qwen3.8-27B-Q4_K_M.gguf", True)
+        )
+        self.assertEqual(
+            upstream.select_gguf(files, "Q4_K_M"),
+            ("Qwen3.8-27B-UD-Q4_K_M.gguf", False),
         )
         with self.assertRaisesRegex(
             models.ModelError,
@@ -259,14 +112,13 @@ class UpstreamTest(unittest.TestCase):
             "Qwen3.8-27B-XL-Q4_K_M.gguf",
         ):
             upstream.select_gguf(files | {"Qwen3.8-27B-XL-Q4_K_M.gguf"}, "Q4_K_M")
-        # A repository of one GGUF has no shared name to strip.
-        for variant in ("UD-Q4_K_M", "Q4_K_M"):
-            with contextlib.redirect_stdout(io.StringIO()) as output:
-                self.assertEqual(
-                    upstream.select_gguf({"Qwen3.8-27B-UD-Q4_K_M.gguf"}, variant),
-                    "Qwen3.8-27B-UD-Q4_K_M.gguf",
-                )
-            self.assertEqual(output.getvalue(), "")
+        # A repository of one GGUF has no shared name to strip, and needs no
+        # variant.
+        for variant in ("UD-Q4_K_M", "Q4_K_M", None):
+            self.assertEqual(
+                upstream.select_gguf({"Qwen3.8-27B-UD-Q4_K_M.gguf"}, variant),
+                ("Qwen3.8-27B-UD-Q4_K_M.gguf", True),
+            )
         for variant in (None, "Q4", "BF16", "missing"):
             with (
                 self.subTest(variant=variant),
@@ -275,27 +127,26 @@ class UpstreamTest(unittest.TestCase):
                 upstream.select_gguf(files, variant)
 
     def test_architecture_is_checked_before_weight_downloads(self):
-        hub = FakeHub(self)
-        hub.publish(
+        fake = FakeHub(self, self.cache)
+        fake.publish(
             "someone/renamed-27b",
             "a" * 40,
             lambda p: mlx_target(p, DENSE, changes={"num_hidden_layers": 48}),
         )
         with self.assertRaisesRegex(models.ModelError, "no supported model"):
-            self.prepare(arguments(self.root, "someone/renamed-27b"))
-        self.assertEqual(hub.requests, [("someone/renamed-27b", None)])
-        self.assertEqual(hub.downloads, ["someone/renamed-27b/config.json"])
+            self.prepare(selection(self.root, "someone/renamed-27b"))
+        self.assertEqual(fake.requests, [("someone/renamed-27b", None)])
+        self.assertEqual(fake.downloads, ["someone/renamed-27b/config.json"])
 
     def test_only_a_splash_manifest_makes_a_legacy_package(self):
         def target(root):
             mlx_target(root, DENSE)
             (root / "manifest.json").write_text(json.dumps({"name": "a tool's file"}))
 
-        hub = self.fake_hub()
-        hub.publish(MODEL, "b" * 40, target)
-        self.assertTrue(self.prepare(arguments(self.root))[0])
+        fake = fake_hub(self, self.cache)
+        fake.publish(MODEL, "b" * 40, target)
         package = {"format": {"name": "splash-packed-q4"}}
-        hub.publish(
+        fake.publish(
             "someone/package",
             "c" * 40,
             lambda p: (
@@ -303,11 +154,41 @@ class UpstreamTest(unittest.TestCase):
                 (p / "manifest.json").write_text(json.dumps(package)),
             ),
         )
-        self.assertFalse(
-            self.prepare(arguments(self.root, "someone/package", language_only=False))[
-                0
-            ]
+        packaged = selection(self.root, "someone/package", language_only=False)
+        with mock.patch.object(legacy, "prepare") as install_package:
+            self.prepare(selection(self.root))
+            self.prepare(packaged)
+        install_package.assert_called_once_with(packaged)
+        self.assertEqual(
+            assembly.verify(selection(self.root).link)["sources"]["target"]["revision"],
+            "b" * 40,
         )
+
+    def test_a_package_rejects_source_options(self):
+        fake = FakeHub(self, self.cache)
+        fake.publish(
+            "someone/package",
+            "c" * 40,
+            lambda p: (
+                p.mkdir(parents=True),
+                (p / "manifest.json").write_text(
+                    json.dumps({"format": {"name": "splash-packed-q4"}})
+                ),
+            ),
+        )
+        for options in ({"revision": "c" * 40}, {"language_only": True}):
+            with (
+                self.subTest(options=options),
+                self.assertRaisesRegex(models.ModelError, "require an upstream"),
+            ):
+                self.prepare(
+                    selection(
+                        self.root,
+                        "someone/package",
+                        **{"language_only": False} | options,
+                    )
+                )
+        self.assertEqual(fake.downloads, ["someone/package/manifest.json"])
 
     def test_only_mlx_affine_quantization_is_accepted(self):
         def target(quantization):
@@ -319,7 +200,7 @@ class UpstreamTest(unittest.TestCase):
 
             return build
 
-        hub = self.fake_hub()
+        fake = fake_hub(self, self.cache)
         for name, quantization in (
             # A transformers quantization_config alone is another method.
             (
@@ -346,87 +227,92 @@ class UpstreamTest(unittest.TestCase):
             ("q8", {"quantization": {"bits": 8, "group_size": 64}}),
         ):
             with self.subTest(name=name):
-                hub.publish(f"someone/{name}", "b" * 40, target(quantization))
+                fake.publish(f"someone/{name}", "b" * 40, target(quantization))
                 with self.assertRaisesRegex(
                     models.ModelError, "requires an MLX affine 4-bit/group-64"
                 ):
-                    self.prepare(arguments(self.root, f"someone/{name}"))
+                    self.prepare(selection(self.root, f"someone/{name}"))
         # MLX writes both keys, and states the mode only in newer versions.
         affine = {"bits": 4, "group_size": 64, "mode": "affine"}
-        hub.publish(
+        fake.publish(
             "someone/mlx",
             "c" * 40,
             target({"quantization": affine, "quantization_config": affine}),
         )
-        self.assertTrue(self.prepare(arguments(self.root, "someone/mlx"))[0])
+        self.prepare(selection(self.root, "someone/mlx"))
+        assembly.verify(selection(self.root, "someone/mlx").link)
 
     def test_missing_metadata_never_falls_back_to_another_repository(self):
-        required = {
+        required = (
             "config.json",
             "tokenizer.json",
             "tokenizer_config.json",
             "preprocessor_config.json",
-        }
-        for missing in (*sorted(required), None):
+        )
+        fake = FakeHub(self, self.cache)
+        for missing in required:
             with self.subTest(missing=missing):
-                args = arguments(self.root, "user/custom", language_only=False)
-                source = mock.Mock(unavailable=None)
-                source.files = {"model.safetensors"} | (
-                    required - {missing} if missing else set()
+                fake.publish(
+                    "user/custom",
+                    "a" * 40,
+                    lambda p: (
+                        p.mkdir(parents=True, exist_ok=True),
+                        [
+                            (p / name).write_text("{}")
+                            for name in ("model.safetensors", *required)
+                            if name != missing
+                        ],
+                    ),
                 )
-                with mock.patch.object(
-                    upstream.Repository, "resolve", return_value=source
-                ) as resolve:
-                    with self.assertRaisesRegex(
-                        models.ModelError, "must come from the target repository"
-                    ):
-                        self.prepare(args)
-                resolve.assert_called_once_with(
-                    "user/custom", None, installation=mock.ANY
-                )
-                source.file.assert_not_called()
-                source.download.assert_not_called()
-                self.assertFalse(args.models.exists())
+                chosen = selection(self.root, "user/custom", language_only=False)
+                with self.assertRaisesRegex(
+                    models.ModelError, "must come from the target repository"
+                ):
+                    self.prepare(chosen)
+                self.assertEqual(fake.downloads, [])
+                self.assertFalse(chosen.models_root.exists())
+                shutil.rmtree(fake.remote)
 
     def test_source_assembly_pairs_the_draft_by_architecture(self):
-        hub = FakeHub(self)
-        hub.publish(
+        fake = FakeHub(self, self.cache)
+        fake.publish(
             "someone/my-favourite-model", "a" * 40, lambda p: mlx_target(p, MOE)
         )
-        hub.publish(upstream.DRAFTS, MOE.draft.revision, lambda p: draft_dir(p, MOE))
+        fake.publish(families.DRAFTS, MOE.draft.revision, lambda p: draft_dir(p, MOE))
         # The name says nothing about the model; the configuration does.
-        args = arguments(self.root, "someone/my-favourite-model")
-        self.assertTrue(self.prepare(args)[0])
+        chosen = selection(self.root, "someone/my-favourite-model")
+        self.prepare(chosen)
         self.assertEqual(
-            hub.requests,
+            fake.requests,
             [
                 ("someone/my-favourite-model", None),
-                (upstream.DRAFTS, MOE.draft.revision),
+                (families.DRAFTS, MOE.draft.revision),
             ],
         )
-        installed = models.installed_root(args.models, args.model, language_only=True)
-        record = upstream.verify(installed)
+        record = assembly.verify(chosen.link)
         self.assertEqual(record["family"], MOE.name)
         self.assertEqual(
             record["sources"],
             {
-                "target": {"repo": args.model, "revision": "a" * 40},
-                "draft": {"repo": upstream.DRAFTS, "revision": MOE.draft.revision},
+                "target": {"repo": chosen.model, "revision": "a" * 40},
+                "draft": {"repo": families.DRAFTS, "revision": MOE.draft.revision},
             },
         )
         self.assertEqual(record["vision_format"], "none")
-        self.assertFalse((installed / "manifest.json").exists())
-        self.assertFalse((installed / "vision").exists())
-        snapshot = self.cache / "models--someone--my-favourite-model/snapshots"
+        self.assertFalse((chosen.link / "manifest.json").exists())
+        self.assertFalse((chosen.link / "vision").exists())
+        snapshot = fake.snapshot(chosen.model, "a" * 40)
         for name in ("tokenizer.json", "tokenizer_config.json"):
             self.assertEqual(
-                (installed / "tokenizer" / name).readlink(),
-                snapshot / ("a" * 40) / name,
+                (chosen.link / "tokenizer" / name).readlink(), snapshot / name
             )
-        self.assertEqual((installed / "draft/model.bin").read_bytes(), b"draft")
-        (snapshot / ("a" * 40) / "tokenizer.json").write_text("changed size")
+        # The paths the native loaders and the tokenizer read (assembly.py).
+        for name in ("config.json", "target/config.json", "tokenizer/config.json"):
+            self.assertEqual((chosen.link / name).readlink(), snapshot / "config.json")
+        self.assertEqual((chosen.link / "draft/model.bin").read_bytes(), b"draft")
+        (snapshot / "tokenizer.json").write_text("changed size")
         with self.assertRaises(models.ModelError):
-            upstream.verify(installed)
+            assembly.verify(chosen.link)
 
     def test_mlx_vision_links_only_the_shards_holding_the_tower(self):
         shards = {
@@ -443,40 +329,44 @@ class UpstreamTest(unittest.TestCase):
             )
             for name in set(shards.values()):
                 (root / name).write_text(name)
-            (root / "preprocessor_config.json").write_text(
-                json.dumps(
-                    {
-                        "patch_size": 16,
-                        "temporal_patch_size": 2,
-                        "merge_size": 2,
-                        "image_mean": [0.5] * 3,
-                        "image_std": [0.5] * 3,
-                    }
-                )
-            )
+            (root / "preprocessor_config.json").write_text(json.dumps(PROCESSOR))
 
-        hub = self.fake_hub()
-        hub.publish(MODEL, "a" * 40, target)
-        args = arguments(self.root, language_only=False)
-        self.assertTrue(self.prepare(args)[0])
-        installed = models.installed_root(args.models, args.model)
-        self.assertEqual(upstream.verify(installed)["vision_format"], "safetensors")
-        self.assertFalse((installed / "processor").exists())
+        fake = fake_hub(self, self.cache)
+        fake.publish(MODEL, "a" * 40, target)
+        chosen = selection(self.root, language_only=False)
+        self.prepare(chosen)
+        self.assertEqual(assembly.verify(chosen.link)["vision_format"], "safetensors")
+        self.assertFalse((chosen.link / "processor").exists())
         self.assertEqual(
-            sorted(p.name for p in (installed / "vision").iterdir()),
+            sorted(p.name for p in (chosen.link / "vision").iterdir()),
             ["config.json", "model-00001-of-00002.safetensors"],
         )
         self.assertEqual(
-            sorted(p.name for p in (installed / "target").iterdir()),
+            sorted(p.name for p in (chosen.link / "target").iterdir()),
             ["config.json", *sorted(set(shards.values()))],
         )
         # A checkpoint without the tower cannot serve images.
         del shards["vision_tower.blocks.0.attn.qkv.weight"]
-        hub.publish("someone/text-model", "b" * 40, target)
+        fake.publish("someone/text-model", "b" * 40, target)
         with self.assertRaisesRegex(models.ModelError, "no vision tower"):
             self.prepare(
-                arguments(self.root, "someone/text-model", language_only=False)
+                selection(self.root, "someone/text-model", language_only=False)
             )
+
+    def test_a_shard_name_read_as_a_glob_is_never_downloaded(self):
+        def target(root):
+            mlx_target(root, DENSE)
+            (root / "model.safetensors").unlink()
+            (root / "model.safetensors.index.json").write_text(
+                json.dumps({"weight_map": {"lm_head.weight": "model-*.safetensors"}})
+            )
+            (root / "model-*.safetensors").write_text("{}")
+
+        fake = fake_hub(self, self.cache)
+        fake.publish(MODEL, "a" * 40, target)
+        with self.assertRaisesRegex(models.ModelError, "unsupported file name"):
+            self.prepare(selection(self.root))
+        self.assertNotIn(f"{MODEL}/model-*.safetensors", fake.downloads)
 
     def test_a_single_checkpoint_file_is_searched_for_the_tower_by_header(self):
         def checkpoint(tensors):
@@ -492,122 +382,118 @@ class UpstreamTest(unittest.TestCase):
                 (root / "model.safetensors").write_bytes(
                     len(header).to_bytes(8, "little") + header + b"\0"
                 )
-                (root / "preprocessor_config.json").write_text(
-                    json.dumps(
-                        {
-                            "patch_size": 16,
-                            "temporal_patch_size": 2,
-                            "merge_size": 2,
-                            "image_mean": [0.5] * 3,
-                            "image_std": [0.5] * 3,
-                        }
-                    )
-                )
+                (root / "preprocessor_config.json").write_text(json.dumps(PROCESSOR))
 
             return build
 
-        hub = self.fake_hub()
-        hub.publish(
+        fake = fake_hub(self, self.cache)
+        fake.publish(
             MODEL,
             "b" * 40,
             checkpoint(
                 ["vision_tower.patch_embed.weight", "language_model.lm_head.weight"]
             ),
         )
-        args = arguments(self.root, language_only=False)
-        self.assertTrue(self.prepare(args)[0])
-        installed = models.installed_root(args.models, MODEL)
+        chosen = selection(self.root, language_only=False)
+        self.prepare(chosen)
         self.assertEqual(
-            sorted(p.name for p in (installed / "vision").iterdir()),
+            sorted(p.name for p in (chosen.link / "vision").iterdir()),
             ["config.json", "model.safetensors"],
         )
-        hub.publish(
+        fake.publish(
             "someone/text", "c" * 40, checkpoint(["language_model.lm_head.weight"])
         )
         with self.assertRaisesRegex(models.ModelError, "no vision tower"):
-            self.prepare(arguments(self.root, "someone/text", language_only=False))
+            self.prepare(selection(self.root, "someone/text", language_only=False))
         # Its header was read by range requests, not a download.
-        self.assertNotIn("someone/text/model.safetensors", hub.downloads)
+        self.assertNotIn("someone/text/model.safetensors", fake.downloads)
+        self.assertIn("someone/text/model.safetensors", fake.range_reads)
+
+    def test_a_cached_file_is_read_from_the_cache(self):
+        fake = FakeHub(self, self.cache)
+        fake.publish(MODEL, "a" * 40, lambda p: mlx_target(p, DENSE))
+        repo = hub.Repository.resolve(MODEL)
+        repo.download({"config.json"})
+        with repo.open("config.json") as stream:
+            self.assertEqual(json.load(stream)["quantization"]["bits"], 4)
+        with repo.open("tokenizer.json") as stream:
+            self.assertEqual(stream.read(), b"{}")
+        self.assertEqual(fake.range_reads, [f"{MODEL}/tokenizer.json"])
 
     def test_unchanged_commit_starts_with_one_request_and_no_download(self):
-        hub = self.fake_hub()
-        args = arguments(self.root)
-        self.prepare(args)
-        hub.requests.clear(), hub.downloads.clear()
-        result, output = self.prepare(args)
-        self.assertTrue(result)
-        self.assertEqual(hub.requests, [(MODEL, None)])
-        self.assertEqual(hub.downloads, [])
+        fake = fake_hub(self, self.cache)
+        chosen = selection(self.root)
+        self.prepare(chosen)
+        fake.requests.clear(), fake.downloads.clear()
+        output, _ = self.prepare(chosen)
+        self.assertEqual(fake.requests, [(MODEL, None)])
+        self.assertEqual(fake.downloads, [])
         self.assertIn("is already installed", output)
 
     def test_moved_commit_is_installed_and_published_atomically(self):
-        hub = self.fake_hub()
-        args = arguments(self.root)
-        root = models.installed_root(args.models, MODEL, language_only=True)
-        _, output = self.prepare(args)
+        fake = fake_hub(self, self.cache)
+        chosen = selection(self.root)
+        output, _ = self.prepare(chosen)
         self.assertIn("Fetching 4 file(s), 0.00 GB, from " + MODEL, output)
-        old = root.resolve()
-        hub.publish(MODEL, "b" * 40, lambda p: mlx_target(p, DENSE))
-        hub.requests.clear(), hub.downloads.clear()
-        rename = upstream.os.rename
+        old = chosen.link.resolve()
+        fake.publish(MODEL, "b" * 40, lambda p: mlx_target(p, DENSE))
+        fake.requests.clear(), fake.downloads.clear()
+        rename = assembly.os.rename
 
         def publish(stage, destination):
             # The old assembly stays in use until the new one is complete.
-            self.assertEqual(root.resolve(), old)
+            self.assertEqual(chosen.link.resolve(), old)
             rename(stage, destination)
 
-        with mock.patch.object(upstream.os, "rename", side_effect=publish):
-            result, output = self.prepare(args)
-        self.assertTrue(result)
+        with mock.patch.object(assembly.os, "rename", side_effect=publish):
+            output, _ = self.prepare(chosen)
         self.assertIn(f"{MODEL} moved from {'a' * 12} to {'b' * 12}.", output)
         self.assertEqual(
-            upstream.verify(root)["sources"]["target"]["revision"], "b" * 40
+            assembly.verify(chosen.link)["sources"]["target"]["revision"], "b" * 40
         )
-        self.assertEqual(hub.requests, [(MODEL, None)])
-        self.assertNotIn(f"{upstream.DRAFTS}/{DENSE.name}/model.bin", hub.downloads)
-        self.assertEqual(self.pins(), sorted(["b" * 40, DENSE.draft.revision]))
+        self.assertEqual(fake.requests, [(MODEL, None)])
+        self.assertNotIn(f"{families.DRAFTS}/{DENSE.name}/model.bin", fake.downloads)
+        self.assertEqual(pins(self.cache), sorted(["b" * 40, DENSE.draft.revision]))
 
     def test_publishing_removes_what_no_installation_uses(self):
-        hub = self.fake_hub()
-        args = arguments(self.root)
-        root = models.installed_root(args.models, MODEL, language_only=True)
-        self.prepare(args)
-        first = root.resolve()
+        fake = fake_hub(self, self.cache)
+        chosen = selection(self.root)
+        self.prepare(chosen)
+        first = chosen.link.resolve()
         # A server holds the assembly it serves.
-        server = (first / "model.json").open("rb")
+        _, server = assembly.hold(chosen.link, chosen.models_root)
         self.addCleanup(server.close)
-        fcntl.flock(server, fcntl.LOCK_SH)
         # Staging an interrupted installation left behind.
         stale = [
-            args.models / ".resolved/.loading-x",
-            args.models / ".metadata/.loading-y",
-            args.models / "mlx-community/.prepare-Qwen3.8-27B-4bit-z",
-            args.models / ".selections/.retired-w",
+            chosen.models_root / ".resolved/.loading-x",
+            chosen.models_root / ".metadata/.loading-y",
+            chosen.models_root / "mlx-community/.prepare-Qwen3.8-27B-4bit-z",
+            chosen.models_root / ".selections/.prepare-w",
         ]
         for path in stale:
             path.mkdir(parents=True)
-        hub.publish(MODEL, "b" * 40, lambda p: mlx_target(p, DENSE))
-        self.prepare(args)
-        second = root.resolve()
+        fake.publish(MODEL, "b" * 40, lambda p: mlx_target(p, DENSE))
+        self.prepare(chosen)
+        second = chosen.link.resolve()
         self.assertEqual(
-            sorted(p.name for p in (args.models / ".resolved").iterdir()),
+            sorted(p.name for p in (chosen.models_root / ".resolved").iterdir()),
             sorted([first.name, second.name]),
         )
         self.assertFalse(any(path.exists() for path in stale))
         # Released by its server and linked by no selection, it goes next.
         server.close()
-        hub.publish(MODEL, "c" * 40, lambda p: mlx_target(p, DENSE))
-        self.prepare(args)
+        fake.publish(MODEL, "c" * 40, lambda p: mlx_target(p, DENSE))
+        self.prepare(chosen)
         self.assertEqual(
-            [p.name for p in (args.models / ".resolved").iterdir()],
-            [root.resolve().name],
+            [p.name for p in (chosen.models_root / ".resolved").iterdir()],
+            [chosen.link.resolve().name],
         )
-        upstream.verify(root)
+        assembly.verify(chosen.link)
 
     def test_unreachable_hub_starts_the_installed_assembly(self):
-        hub = self.fake_hub()
-        args = arguments(self.root)
-        self.prepare(args)
+        fake = fake_hub(self, self.cache)
+        chosen = selection(self.root)
+        self.prepare(chosen)
         for failure in (
             httpx.ConnectError("[Errno 8] nodename nor servname provided"),
             httpx.ConnectTimeout(""),
@@ -617,10 +503,9 @@ class UpstreamTest(unittest.TestCase):
             http_error(404),
         ):
             with self.subTest(failure=failure):
-                hub.failure = failure
-                result, output = self.prepare(args)
-                self.assertTrue(result)
-                reason = models.hub_reason(failure)
+                fake.failure = failure
+                output, _ = self.prepare(chosen)
+                reason = hub.reason(failure)
                 self.assertNotIn("\n", reason)
                 self.assertIn(
                     f"Could not reach the Hub ({reason}); "
@@ -628,108 +513,125 @@ class UpstreamTest(unittest.TestCase):
                     output,
                 )
                 self.assertIn("is already installed", output)
-        # Without an installation, the failure is the error.
+
+    def test_unreachable_hub_without_an_installation_is_the_error(self):
+        fake = fake_hub(self, self.cache)
+        fake.failure = http_error(404)
         with self.assertRaisesRegex(
             models.ModelError,
             "cannot resolve someone/other: 404 Client Error.*; neither this "
             "installation nor the Hub cache records a commit for the default branch",
         ):
-            self.prepare(arguments(self.root, "someone/other"))
+            self.prepare(selection(self.root, "someone/other"))
 
     def test_commit_and_offline_selections_make_no_request(self):
-        hub = self.fake_hub()
-        pinned = arguments(self.root, revision="a" * 40)
+        fake = fake_hub(self, self.cache)
+        pinned = selection(self.root, revision="a" * 40)
         self.prepare(pinned)
-        self.prepare(arguments(self.root))
-        hub.requests.clear(), hub.downloads.clear()
-        self.assertTrue(self.prepare(pinned)[0])
+        self.prepare(selection(self.root))
+        fake.requests.clear(), fake.downloads.clear()
+        output, _ = self.prepare(pinned)
+        self.assertIn("is already installed", output)
         with mock.patch("huggingface_hub.constants.HF_HUB_OFFLINE", True):
-            self.assertTrue(self.prepare(arguments(self.root))[0])
-        self.assertEqual((hub.requests, hub.downloads), ([], []))
+            output, _ = self.prepare(selection(self.root))
+        self.assertIn("is already installed", output)
+        self.assertEqual((fake.requests, fake.downloads), ([], []))
 
-    def test_new_commit_that_cannot_be_installed_keeps_the_installed_one(self):
-        hub = self.fake_hub()
-        args = arguments(self.root)
-        root = models.installed_root(args.models, MODEL, language_only=True)
-        self.prepare(args)
-        installed = root.resolve()
-        # The new commit's architecture is rejected before any weight download,
-        hub.publish(
+    def test_new_commit_rejected_before_download_keeps_the_installed_one(self):
+        fake = fake_hub(self, self.cache)
+        chosen = selection(self.root)
+        self.prepare(chosen)
+        installed = chosen.link.resolve()
+        fake.publish(
             MODEL, "b" * 40, lambda p: mlx_target(p, DENSE, changes={"head_dim": 128})
         )
-        result, output = self.prepare(args)
-        self.assertTrue(result)
+        _, warnings = self.prepare(chosen)
         self.assertIn(
-            f"keeping the installed {MODEL}@{'a' * 12}; cannot install "
+            f"Warning: keeping the installed {MODEL}@{'a' * 12}; cannot install "
             f"{MODEL}@{'b' * 40}: no supported model has this architecture",
-            output,
+            warnings,
         )
-        # and a download that fails keeps it too.
-        hub.publish(MODEL, "c" * 40, lambda p: mlx_target(p, DENSE))
-        hub.download_failure = httpx.ReadTimeout("timed out")
-        result, output = self.prepare(args)
-        self.assertTrue(result)
+        self.assertEqual(chosen.link.resolve(), installed)
+
+    def test_new_commit_whose_download_fails_keeps_the_installed_one(self):
+        fake = fake_hub(self, self.cache)
+        chosen = selection(self.root)
+        self.prepare(chosen)
+        installed = chosen.link.resolve()
+        fake.publish(MODEL, "c" * 40, lambda p: mlx_target(p, DENSE))
+        fake.download_failure = httpx.ReadTimeout("timed out")
+        _, warnings = self.prepare(chosen)
         self.assertIn(
             f"cannot install {MODEL}@{'c' * 40}: cannot install {MODEL}: timed out",
-            output,
+            warnings,
         )
-        self.assertEqual(root.resolve(), installed)
-        self.assertEqual(self.pins(), sorted(["a" * 40, DENSE.draft.revision]))
+        self.assertEqual(chosen.link.resolve(), installed)
+        self.assertEqual(pins(self.cache), sorted(["a" * 40, DENSE.draft.revision]))
         # Nothing installed: the rejection is the error.
         with self.assertRaisesRegex(models.ModelError, "timed out"):
-            self.prepare(arguments(self.root, revision="c" * 40))
+            self.prepare(selection(self.root, revision="c" * 40))
 
     def test_a_release_pinning_another_draft_reassembles_the_installed_target(self):
-        hub = self.fake_hub()
-        args = arguments(self.root)
-        root = models.installed_root(args.models, MODEL, language_only=True)
-        self.prepare(args)
+        fake = fake_hub(self, self.cache)
+        chosen = selection(self.root)
+        self.prepare(chosen)
         moved = dataclasses.replace(
-            DENSE, draft=upstream.Draft("e" * 40, DENSE.draft.layers)
+            DENSE, draft=families.Draft("e" * 40, DENSE.draft.layers)
         )
-        hub.publish(upstream.DRAFTS, "e" * 40, lambda p: draft_dir(p, DENSE))
-        hub.requests.clear(), hub.downloads.clear()
-        with mock.patch.object(upstream, "FAMILIES", (moved, MOE)):
-            result, output = self.prepare(args)
-            self.assertTrue(result)
-            self.assertIn(f"pins the {DENSE.name} draft at {'e' * 12}", output)
-            record = upstream.verify(root)
-            self.assertEqual(
-                record["sources"],
-                {
-                    "target": {"repo": MODEL, "revision": "a" * 40},
-                    "draft": {"repo": upstream.DRAFTS, "revision": "e" * 40},
-                },
-            )
-            # Only the new draft is fetched; the target is not downloaded again.
-            self.assertEqual(hub.requests, [(MODEL, None), (upstream.DRAFTS, "e" * 40)])
-            self.assertTrue(
-                all(name.startswith(upstream.DRAFTS) for name in hub.downloads)
-            )
-            self.assertEqual(self.pins(), sorted(["a" * 40, "e" * 40]))
-            # A draft that cannot be fetched keeps the installed one.
-            newer = dataclasses.replace(
-                DENSE, draft=upstream.Draft("f" * 40, DENSE.draft.layers)
-            )
-        with mock.patch.object(upstream, "FAMILIES", (newer, MOE)):
-            result, output = self.prepare(args)
-        self.assertTrue(result)
+        fake.publish(families.DRAFTS, "e" * 40, lambda p: draft_dir(p, DENSE))
+        fake.requests.clear(), fake.downloads.clear()
+        with mock.patch.object(families, "FAMILIES", (moved, MOE)):
+            output, _ = self.prepare(chosen)
+        self.assertIn(f"pins the {DENSE.name} draft at {'e' * 12}", output)
+        self.assertEqual(
+            assembly.verify(chosen.link)["sources"],
+            {
+                "target": {"repo": MODEL, "revision": "a" * 40},
+                "draft": {"repo": families.DRAFTS, "revision": "e" * 40},
+            },
+        )
+        # Only the new draft is fetched; the target is not downloaded again.
+        self.assertEqual(fake.requests, [(MODEL, None), (families.DRAFTS, "e" * 40)])
+        self.assertTrue(
+            all(name.startswith(families.DRAFTS) for name in fake.downloads)
+        )
+        self.assertEqual(pins(self.cache), sorted(["a" * 40, "e" * 40]))
+
+    def test_a_draft_that_cannot_be_fetched_keeps_the_installed_one(self):
+        fake = fake_hub(self, self.cache)
+        chosen = selection(self.root)
+        self.prepare(chosen)
+        unpublished = dataclasses.replace(
+            DENSE, draft=families.Draft("f" * 40, DENSE.draft.layers)
+        )
+        fake.downloads.clear()
+        with mock.patch.object(families, "FAMILIES", (unpublished, MOE)):
+            _, warnings = self.prepare(chosen)
         self.assertIn(
             f"Warning: cannot fetch the {DENSE.name} draft {'f' * 12}; keeping the "
-            f"installed one: cannot resolve {upstream.DRAFTS}: 404 Client Error",
-            output,
+            f"installed one: cannot resolve {families.DRAFTS}: 404 Client Error",
+            warnings,
         )
         self.assertEqual(
-            upstream.verify(root)["sources"]["draft"]["revision"], "e" * 40
+            assembly.verify(chosen.link)["sources"]["draft"]["revision"],
+            DENSE.draft.revision,
         )
+        self.assertEqual(fake.downloads, [])
+
+    def test_an_incompatible_draft_is_an_error_not_a_crash(self):
+        fake_hub(self, self.cache)
+        local = draft_dir(self.root / "draft", DENSE) / DENSE.name
+        config = json.loads((local / "config.json").read_text())
+        (local / "config.json").write_text(json.dumps(config | {"splash": "MDFD0004"}))
+        with self.assertRaisesRegex(models.ModelError, "draft configuration"):
+            self.prepare(selection(self.root, draft_model=str(local)))
 
     def test_hub_snapshots_are_pinned_and_old_pins_retired(self):
-        hub = self.fake_hub()
-        args = arguments(self.root)
-        installed = models.installed_root(args.models, MODEL, language_only=True)
+        fake = fake_hub(self, self.cache)
+        chosen = selection(self.root)
         for commit in ("a" * 40, "b" * 40):
-            hub.publish(MODEL, commit, lambda p: mlx_target(p, DENSE))
-            self.prepare(args)
+            fake.publish(MODEL, commit, lambda p: mlx_target(p, DENSE))
+            self.prepare(chosen)
             refs = sorted(
                 (
                     self.cache / "models--mlx-community--Qwen3.8-27B-4bit/refs/splash"
@@ -744,110 +646,139 @@ class UpstreamTest(unittest.TestCase):
             self.assertEqual([ref.name for ref in draft_refs], [DENSE.draft.revision])
         self.assertEqual(refs[0].parent.name, draft_refs[0].parent.name)
         self.assertEqual(
-            upstream.verify(installed)["sources"]["target"]["revision"], "b" * 40
+            assembly.verify(chosen.link)["sources"]["target"]["revision"], "b" * 40
         )
 
-    def test_pins_are_required_before_publishing_and_repaired_on_start(self):
-        self.fake_hub()
-        args = arguments(self.root)
-        installed = models.installed_root(args.models, MODEL, language_only=True)
-        expected = sorted(["a" * 40, DENSE.draft.revision])
+    def test_pins_are_required_before_publishing(self):
+        fake_hub(self, self.cache)
+        chosen = selection(self.root)
         with (
             mock.patch.object(
-                models, "retain_ref", side_effect=PermissionError(errno.EACCES, "no")
+                hub, "pin", side_effect=PermissionError(errno.EACCES, "no")
             ),
             self.assertRaises(PermissionError),
         ):
-            self.prepare(args)
-        self.assertFalse(installed.exists())
-        retain = models.retain_ref
+            self.prepare(chosen)
+        self.assertFalse(chosen.link.exists())
+
+    def test_pins_change_under_the_lock_and_are_repaired_on_start(self):
+        fake_hub(self, self.cache)
+        chosen = selection(self.root)
+        expected = sorted(["a" * 40, DENSE.draft.revision])
+        pin = hub.pin
 
         def locked(*arguments):
-            # Pins change only under the installation lock.
-            with (args.models / ".install.lock").open("a+b") as lock:
+            with (chosen.models_root / ".install.lock").open("a+b") as lock:
                 with self.assertRaises(BlockingIOError):
                     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return retain(*arguments)
+            return pin(*arguments)
 
-        with mock.patch.object(models, "retain_ref", side_effect=locked) as pinned:
-            self.prepare(args)
+        with mock.patch.object(hub, "pin", side_effect=locked) as pinned:
+            self.prepare(chosen)
         self.assertEqual(pinned.call_count, 2)
-        self.assertEqual(self.pins(), expected)
+        self.assertEqual(pins(self.cache), expected)
         # A verified start restores lost pins.
         for ref in self.cache.glob("*/refs/splash/*/*"):
             ref.unlink()
-        with mock.patch.object(models, "retain_ref", side_effect=locked):
-            self.assertTrue(self.prepare(args)[0])
-        self.assertEqual(self.pins(), expected)
-        # A read-only cache leaves the verified installation usable.
+        with mock.patch.object(hub, "pin", side_effect=locked):
+            self.prepare(chosen)
+        self.assertEqual(pins(self.cache), expected)
+
+    def test_a_read_only_cache_leaves_the_installation_usable(self):
+        fake_hub(self, self.cache)
+        chosen = selection(self.root)
+        self.prepare(chosen)
         for ref in self.cache.glob("*/refs/splash/*/*"):
             ref.unlink()
-        errors = io.StringIO()
-        with (
-            mock.patch.object(
-                models.os, "link", side_effect=OSError(errno.EROFS, "read only")
-            ),
-            contextlib.redirect_stderr(errors),
+        with mock.patch.object(
+            hub.os, "link", side_effect=OSError(errno.EROFS, "read only")
         ):
-            self.assertTrue(self.prepare(args)[0])
-        self.assertIn("external cache pruning", errors.getvalue())
-        self.assertEqual(self.pins(), [])
+            output, warnings = self.prepare(chosen)
+        self.assertIn("is already installed", output)
+        self.assertIn("external cache pruning", warnings)
+        self.assertEqual(pins(self.cache), [])
 
     def test_damaged_assembly_is_rebuilt(self):
-        hub = self.fake_hub()
-        args = arguments(self.root)
-        self.prepare(args)
-        assembly = next((args.models / ".resolved").iterdir())
-        (assembly / "tokenizer/tokenizer.json").unlink()
-        hub.downloads.clear()
-        _, output = self.prepare(args)
+        fake = fake_hub(self, self.cache)
+        chosen = selection(self.root)
+        self.prepare(chosen)
+        built = next((chosen.models_root / ".resolved").iterdir())
+        (built / "tokenizer/tokenizer.json").unlink()
+        fake.downloads.clear()
+        output, _ = self.prepare(chosen)
         self.assertIn("Reinstalling " + MODEL, output)
-        upstream.verify(assembly)
+        self.assertIn(f"Rebuilding the damaged {built}", output)
+        assembly.verify(built)
         # The cached snapshot is complete; nothing is downloaded again.
-        self.assertNotIn(f"{MODEL}/model.safetensors", hub.downloads)
+        self.assertNotIn(f"{MODEL}/model.safetensors", fake.downloads)
 
     def test_verify_checks_full_content_and_rejects_same_size_changes(self):
         source = self.root / "source"
         source.write_bytes(b"abcd")
-        assembly = self.root / "assembly"
-        assembly.mkdir()
-        (assembly / "weight").symlink_to(source)
+        built = self.root / "assembly"
+        built.mkdir()
+        (built / "weight").symlink_to(source)
         local = {"repo": str(self.root), "revision": None}
         record = {
             "version": 1,
+            "model": MODEL,
+            "family": DENSE.name,
+            "target_format": "mlx-affine",
+            "vision_format": "none",
             "sources": {"target": local, "draft": local},
-            "files": {"weight": upstream._file_record(source)},
+            "files": {"weight": assembly.file_record(source)},
         }
-        (assembly / "model.json").write_text(json.dumps(record))
-        upstream.verify(assembly, full=True)
+        (built / "model.json").write_text(json.dumps(record))
+        assembly.verify(built, full=True)
         source.write_bytes(b"abce")
         with self.assertRaises(models.ModelError):
-            upstream.verify(assembly)
+            assembly.verify(built)
         stat = source.stat()
         record["files"]["weight"].update(
             mtime_ns=stat.st_mtime_ns, ctime_ns=stat.st_ctime_ns
         )
-        (assembly / "model.json").write_text(json.dumps(record))
+        (built / "model.json").write_text(json.dumps(record))
         with self.assertRaisesRegex(models.ModelError, "hash mismatch"):
-            upstream.verify(assembly, full=True)
+            assembly.verify(built, full=True)
+
+    def test_verify_rejects_a_record_of_another_shape(self):
+        fake_hub(self, self.cache)
+        chosen = selection(self.root)
+        self.prepare(chosen)
+        record = json.loads((chosen.link / "model.json").read_text())
+        for change in (
+            lambda r: r.pop("family"),
+            lambda r: r.update(metadata="0" * 64),
+            lambda r: r.update(target_format="safetensors"),
+            lambda r: r.update(version=True),
+            lambda r: r["sources"]["draft"].update(revision="main"),
+            lambda r: r["files"]["config.json"].pop("mtime_ns"),
+            lambda r: r["files"]["config.json"].update(digest="z" * 64),
+            lambda r: r["files"].update({"../escape": r["files"]["config.json"]}),
+        ):
+            changed = json.loads(json.dumps(record))
+            change(changed)
+            built = self.root / "copy"
+            shutil.rmtree(built, ignore_errors=True)
+            shutil.copytree(chosen.link, built, symlinks=True)
+            (built / "model.json").unlink()
+            (built / "model.json").write_text(json.dumps(changed))
+            with self.assertRaisesRegex(models.ModelError, "invalid resolved model"):
+                assembly.verify(built)
 
     def test_hub_resolution_pins_one_commit(self):
-        hub = FakeHub(self)
-        hub.publish(MODEL, "a" * 40, lambda p: mlx_target(p, DENSE), branch="v2")
-        repo = upstream.Repository.resolve(MODEL, "v2")
-        self.assertEqual(hub.requests, [(MODEL, "v2")])
+        fake = FakeHub(self, self.cache)
+        fake.publish(MODEL, "a" * 40, lambda p: mlx_target(p, DENSE), branch="v2")
+        repo = hub.Repository.resolve(MODEL, "v2")
+        self.assertEqual(fake.requests, [(MODEL, "v2")])
         self.assertEqual(repo.revision, "a" * 40)
         self.assertEqual(
-            repo.file("config.json"),
-            self.cache
-            / "models--mlx-community--Qwen3.8-27B-4bit/snapshots"
-            / ("a" * 40)
-            / "config.json",
+            repo.file("config.json"), fake.snapshot(MODEL, "a" * 40) / "config.json"
         )
         self.assertEqual(
             set(repo.download({"model.safetensors"})), {"model.safetensors"}
         )
-        hub.publish(MODEL, "b" * 40, lambda p: mlx_target(p, DENSE), branch="v2")
+        fake.publish(MODEL, "b" * 40, lambda p: mlx_target(p, DENSE), branch="v2")
         # The branch moved; the resolved repository still reads its commit.
         self.assertEqual(
             json.loads(repo.file("config.json").read_text())["quantization"]["bits"], 4
@@ -857,48 +788,49 @@ class UpstreamTest(unittest.TestCase):
     def test_only_an_absolute_path_is_a_local_repository(self):
         # A relative path in the working directory is still a Hub repository ID.
         (self.root / MODEL).mkdir(parents=True)
-        hub = FakeHub(self)
-        hub.publish(MODEL, "a" * 40, lambda p: mlx_target(p, DENSE), branch="branch")
+        fake = FakeHub(self, self.cache)
+        fake.publish(MODEL, "a" * 40, lambda p: mlx_target(p, DENSE), branch="branch")
         with contextlib.chdir(self.root):
-            repo = upstream.Repository.resolve(MODEL, "branch")
-        self.assertEqual(hub.requests, [(MODEL, "branch")])
-        self.assertEqual((repo.root, repo.revision), (None, "a" * 40))
-        local = upstream.Repository.resolve(str(self.root / MODEL))
-        self.assertEqual((local.root, local.revision), (self.root / MODEL, None))
+            repo = hub.Repository.resolve(MODEL, "branch")
+        self.assertEqual(fake.requests, [(MODEL, "branch")])
+        self.assertEqual((repo.directory, repo.revision), (None, "a" * 40))
+        local = hub.Repository.resolve(str(self.root / MODEL))
+        self.assertEqual((local.directory, local.revision), (self.root / MODEL, None))
         with self.assertRaisesRegex(models.ModelError, "draft directory not found"):
-            upstream.Repository.resolve(str(self.root / "deleted-draft"))
+            hub.Repository.resolve(str(self.root / "deleted-draft"))
 
     def test_unreachable_hub_uses_the_cache_or_explains_access(self):
-        hub = FakeHub(self)
-        hub.failure = http_error(401)
+        fake = FakeHub(self, self.cache)
+        fake.failure = http_error(401)
         with self.assertRaisesRegex(
             models.ModelError,
             "cannot resolve owner/private: 401 Client Error.*; set HF_TOKEN .*; "
             "neither this installation nor the Hub cache records a commit "
             "for the default branch",
         ):
-            upstream.Repository.resolve("owner/private")
+            hub.Repository.resolve("owner/private")
         # A branch the cache recorded resolves to its cached snapshot.
-        self.hub("owner/private", "c" * 40, lambda p: mlx_target(p, DENSE))
+        cached_snapshot(
+            self.cache, "owner/private", "c" * 40, lambda p: mlx_target(p, DENSE)
+        )
         refs = self.cache / "models--owner--private/refs"
         refs.mkdir()
         (refs / "main").write_text("c" * 40)
-        repo = upstream.Repository.resolve("owner/private")
+        repo = hub.Repository.resolve("owner/private")
         self.assertEqual(repo.revision, "c" * 40)
         self.assertIn("model.safetensors", repo.files)
-        self.assertIn("401 Client Error", repo.unavailable)
+        self.assertIn("401 Client Error", repo.unreachable_reason)
         (refs / "main").write_text("d" * 40)
         with self.assertRaisesRegex(
             models.ModelError, "the Hub cache has no snapshot of " + "d" * 40
         ):
-            upstream.Repository.resolve("owner/private")
+            hub.Repository.resolve("owner/private")
 
     def test_offline_rebuild_uses_the_recorded_or_pinned_snapshot(self):
-        hub = self.fake_hub()
-        args = arguments(self.root)
-        root = models.installed_root(args.models, MODEL, language_only=True)
-        self.prepare(args)
-        hub.requests.clear()
+        fake = fake_hub(self, self.cache)
+        chosen = selection(self.root)
+        self.prepare(chosen)
+        fake.requests.clear()
         # What huggingface_hub reports for a partial snapshot offline.
         incomplete = IncompleteSnapshotError("incomplete", snapshot_path="")
         with (
@@ -906,32 +838,33 @@ class UpstreamTest(unittest.TestCase):
             mock.patch("huggingface_hub.snapshot_download", side_effect=incomplete),
         ):
             # A damaged assembly is rebuilt from the commit it recorded,
-            (root / "target/model.safetensors").unlink()
-            result, output = self.prepare(args)
-            self.assertTrue(result)
+            (chosen.link / "target/model.safetensors").unlink()
+            output, _ = self.prepare(chosen)
             self.assertIn(
                 "Could not reach the Hub (HF_HUB_OFFLINE is set); installing "
                 f"{MODEL}@{'a' * 12} from the Hub cache.",
                 output,
             )
-            upstream.verify(root)
+            assembly.verify(chosen.link)
             # a deleted one from the installation's pins,
-            shutil.rmtree(root.resolve())
-            self.assertTrue(self.prepare(args)[0])
+            shutil.rmtree(chosen.link.resolve())
+            self.prepare(chosen)
             self.assertEqual(
-                upstream.verify(root)["sources"]["target"]["revision"], "a" * 40
+                assembly.verify(chosen.link)["sources"]["target"]["revision"],
+                "a" * 40,
             )
             # and a new selection from the commit it names.
-            self.assertTrue(self.prepare(arguments(self.root, revision="a" * 40))[0])
+            self.prepare(selection(self.root, revision="a" * 40))
+            assembly.verify(selection(self.root, revision="a" * 40).link)
             with self.assertRaisesRegex(
                 models.ModelError,
                 f"cannot resolve {MODEL}: HF_HUB_OFFLINE is set; neither this "
                 "installation nor the Hub cache records a commit for v2",
             ):
-                self.prepare(arguments(self.root, revision="v2"))
-        self.assertEqual(hub.requests, [])
+                self.prepare(selection(self.root, revision="v2"))
+        self.assertEqual(fake.requests, [])
 
-    def test_hub_failures_during_installation_are_model_errors(self):
+    def test_hub_failures_reading_a_header_are_model_errors(self):
         def gguf_repository(root):
             root.mkdir(parents=True, exist_ok=True)
             (root / "m-Q4_K_M.gguf").touch()
@@ -942,23 +875,24 @@ class UpstreamTest(unittest.TestCase):
             (http_error(404), False),
         ):
             with self.subTest(failure=failure):
-                hub = FakeHub(self)
-                hub.publish("owner/model", "a" * 40, gguf_repository)
+                fake = FakeHub(self, self.cache)
+                fake.publish("owner/model", "a" * 40, gguf_repository)
                 # The GGUF header read, before any download.
                 with (
-                    mock.patch.object(hub, "open", side_effect=failure),
+                    mock.patch.object(fake, "open", side_effect=failure),
                     self.assertRaises(models.ModelError) as raised,
                 ):
-                    self.prepare(arguments(self.root, "owner/model:Q4_K_M"))
+                    self.prepare(selection(self.root, "owner/model:Q4_K_M"))
                 message = str(raised.exception)
                 self.assertTrue(
                     message.startswith("cannot install owner/model:Q4_K_M: "), message
                 )
                 self.assertIn(" ".join(str(failure).split()), message)
                 self.assertEqual("hf auth login" in message, hint)
-        # A download that fails mid-transfer is reported without a traceback.
-        hub = self.fake_hub()
-        hub.download_failure = httpx.ReadTimeout("timed out")
+
+    def test_a_failed_download_is_reported_without_a_traceback(self):
+        fake = fake_hub(self, self.cache)
+        fake.download_failure = httpx.ReadTimeout("timed out")
         errors = io.StringIO()
         with (
             contextlib.redirect_stderr(errors),
@@ -1009,3 +943,13 @@ class UpstreamTest(unittest.TestCase):
             models.installed_root(root, MODEL, draft_model="mine/draft"),
         }
         self.assertEqual(len(paths), 4)
+        # Each is where garbage collection finds the selection links.
+        links = {self.root / path.relative_to("/") for path in paths}
+        for link in links:
+            link.parent.mkdir(parents=True, exist_ok=True)
+            link.symlink_to(self.root)
+        self.assertEqual(set(models.selection_links(self.root / "models")), links)
+
+
+if __name__ == "__main__":
+    unittest.main()

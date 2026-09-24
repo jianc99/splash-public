@@ -1041,7 +1041,7 @@ def add_server_arguments(parser):
         type=Path,
         help="installed model package root (target, draft and tokenizer)",
     )
-    parser.add_argument("--model", type=model_artifacts.parse_repo_id, required=True)
+    parser.add_argument("--model", type=model_artifacts.parse_model_id, required=True)
     parser.add_argument("--max-context", type=int)
     parser.add_argument("--max-memory")
     parser.add_argument("--kv-format", choices=("int8", "bf16"), default="int8")

@@ -136,6 +136,11 @@ class PackageTests(unittest.TestCase):
                 "catalog_sha256", json.loads((stage / "release.json").read_text())
             )
 
+    def test_every_installer_module_ships(self):
+        # The packaged launcher and installer import these by module name.
+        modules = {path.name for path in (package.ROOT / "install").glob("*.py")}
+        self.assertLessEqual(modules, set(package.INSTALL_FILES))
+
     def test_packaged_paths_keep_user_data_outside_versioned_prefix(self):
         source = Path(paths.__file__).read_text()
         with tempfile.TemporaryDirectory() as temporary:

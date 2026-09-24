@@ -1,4 +1,3 @@
-import argparse
 import contextlib
 import io
 import shutil
@@ -12,8 +11,10 @@ from unittest import mock
 from tokenizers import Tokenizer, pre_tokenizers
 from transformers import AutoTokenizer
 
-from dev.tests.test_upstream import MOE, draft_dir
-from install import gguf, models, upstream
+from dev.tests.installer_fixtures import MOE, FakeHub, draft_dir, selection
+from install import assembly, families, gguf, hub, models, upstream
+
+GGUF_REPO = "unsloth/Qwen3.6-35B-A3B-GGUF"
 
 
 def write_gguf(path, values, tensors=()):
@@ -289,7 +290,7 @@ class GgufMetadataTests(unittest.TestCase):
         config = gguf.model_config(self.metadata(fixture(native=True)))
         text = config["text_config"]
         self.assertEqual((text["num_experts"], text["num_experts_per_tok"]), (256, 8))
-        self.assertEqual(upstream.family_for(config).name, "Qwen3.6-35B-A3B")
+        self.assertEqual(families.family_for(config).name, "Qwen3.6-35B-A3B")
 
     def test_config_uses_metadata_and_subtracts_only_mtp_layers(self):
         values = fixture()
@@ -304,13 +305,16 @@ class GgufMetadataTests(unittest.TestCase):
             gguf.model_config(self.metadata(values))
         vision = self.metadata(vision_fixture())
         self.assertEqual(gguf.vision_config(vision)["num_position_embeddings"], 2304)
-        upstream._validate_processor(gguf.processor_config(vision))
 
     def derived(self, models_root, path):
-        """_gguf_metadata as installations call it, under the lock."""
+        """The metadata derived from a target GGUF, as installations derive
+        it, under the lock."""
         models_root.mkdir(parents=True, exist_ok=True)
-        with models.installation_lock(models_root):
-            return upstream._gguf_metadata(models_root, path, None)
+        with (
+            models.installation_lock(models_root),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            return assembly.derived_metadata(models_root, {"target/m.gguf": path})
 
     def test_vision_projector_is_chosen_by_its_header(self):
         tensors = (("v.blk.0.attn_qkv.weight", 30), ("v.patch_embd.weight", 0))
@@ -321,7 +325,7 @@ class GgufMetadataTests(unittest.TestCase):
             root.mkdir()
             for name, (values, kinds) in files.items():
                 write_gguf(root / (name + ".gguf"), values, kinds)
-            return upstream.Repository.local_directory(root)
+            return hub.Repository.local_directory(root)
 
         bf16 = (vision_fixture(), tensors)
         f32 = (vision_fixture(), [(name, 0) for name, _ in tensors])
@@ -375,12 +379,10 @@ class GgufMetadataTests(unittest.TestCase):
             lambda: (files["config.json"].parent / "files.json").write_text("{}"),
         ):
             damage()
-            with contextlib.redirect_stdout(io.StringIO()) as output:
-                self.assertEqual(self.derived(cache, path), (key, files))
-            self.assertIn("Deriving damaged GGUF metadata again", output.getvalue())
+            self.assertEqual(self.derived(cache, path), (key, files))
             self.assertEqual(files["tokenizer/tokenizer.json"].read_bytes(), expected)
-        with mock.patch(
-            "install.upstream.os.rename", side_effect=OSError("interrupted")
+        with mock.patch.object(
+            assembly.os, "rename", side_effect=OSError("interrupted")
         ):
             with self.assertRaises(OSError):
                 self.derived(self.root / "interrupted", path)
@@ -410,130 +412,118 @@ class GgufMetadataTests(unittest.TestCase):
             changed["tokenizer/chat_template.jinja"].read_text(), "updated template"
         )
 
+    def gguf_repository(self, *, vision=True):
+        """unsloth/Qwen3.6-35B-A3B-GGUF on a FakeHub, with the drafts'
+        repository: a loadable target GGUF, an F32 projector and conflicting
+        sidecars, which must not override the selected GGUF's metadata."""
+
+        def build(root):
+            root.mkdir(parents=True)
+            values = fixture(native=True)
+            write_gguf(
+                root / "model-Q4_K_M.gguf",
+                values,
+                loadable_tensors(values, self.root).items(),
+            )
+            if vision:
+                write_gguf(
+                    root / "mmproj-F32.gguf",
+                    vision_fixture(),
+                    [("v.patch_embd.weight", 0)],
+                )
+            for name in ("config.json", "tokenizer.json", "tokenizer_config.json"):
+                (root / name).write_text("invalid sidecar")
+
+        fake = FakeHub(self, self.root / "hub")
+        fake.publish(GGUF_REPO, "a" * 40, build)
+        fake.publish(families.DRAFTS, MOE.draft.revision, lambda p: draft_dir(p, MOE))
+        return fake
+
+    @staticmethod
+    def prepare(chosen):
+        with (
+            contextlib.redirect_stdout(io.StringIO()) as output,
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            upstream.prepare(chosen)
+        return output.getvalue()
+
     def test_gguf_only_repository_assembly_never_resolves_other_target_sources(self):
-        target = self.root / "target"
-        target.mkdir()
-        values = fixture(native=True)
-        write_gguf(
-            target / "model-Q4_K_M.gguf",
-            values,
-            loadable_tensors(values, self.root).items(),
-        )
-        write_gguf(
-            target / "mmproj-F32.gguf", vision_fixture(), [("v.patch_embd.weight", 0)]
-        )
-        # Conflicting sidecars must not override the selected GGUF's metadata.
-        for name in ("config.json", "tokenizer.json", "tokenizer_config.json"):
-            (target / name).write_text("invalid sidecar")
-        source = upstream.Repository.local_directory(target)
-        draft_repo = upstream.Repository.local_directory(
-            draft_dir(self.root / "draft", MOE)
-        )
+        fake = self.gguf_repository()
         for language_only in (True, False):
-            args = argparse.Namespace(
-                model="unsloth/Qwen3.6-35B-A3B-GGUF:Q4_K_M",
-                models=self.root / "models",
-                revision=None,
-                language_only=language_only,
-                draft_model=None,
-            )
-            with mock.patch.object(
-                upstream.Repository, "resolve", side_effect=[source, draft_repo]
-            ) as resolve:
-                with mock.patch.object(
-                    source, "download", wraps=source.download
-                ) as download:
-                    upstream.prepare(args)
+            with self.subTest(language_only=language_only):
+                fake.requests.clear()
+                chosen = selection(
+                    self.root, GGUF_REPO + ":Q4_K_M", language_only=language_only
+                )
+                output = self.prepare(chosen)
+                self.assertIn(f"Selected model-Q4_K_M.gguf from {GGUF_REPO}.", output)
                 self.assertEqual(
-                    resolve.call_args_list,
-                    [
-                        mock.call(
-                            "unsloth/Qwen3.6-35B-A3B-GGUF", None, installation=mock.ANY
-                        ),
-                        mock.call(upstream.DRAFTS, MOE.draft.revision),
-                    ],
+                    fake.requests,
+                    [(GGUF_REPO, None), (families.DRAFTS, MOE.draft.revision)],
                 )
-                expected = {"model-Q4_K_M.gguf"} | (
-                    set() if language_only else {"mmproj-F32.gguf"}
+                assembly.verify(chosen.link, full=True)
+                config = models.read_json(chosen.link / "config.json")
+                self.assertEqual(config["text_config"]["num_hidden_layers"], 40)
+                self.assertEqual("vision_config" in config, not language_only)
+                self.assertEqual((chosen.link / "vision").exists(), not language_only)
+                self.assertFalse((chosen.link / "processor").exists())
+                self.assertEqual(
+                    (chosen.link / "tokenizer/config.json").resolve(),
+                    (chosen.link / "config.json").resolve(),
                 )
-                download.assert_called_once_with(expected)
-            root = models.installed_root(
-                args.models, args.model, language_only=language_only
-            )
-            upstream.verify(root, full=True)
-            config = models.read_json(root / "config.json")
-            self.assertEqual(config["text_config"]["num_hidden_layers"], 40)
-            self.assertEqual("vision_config" in config, not language_only)
-            self.assertEqual((root / "vision").exists(), not language_only)
-            self.assertFalse((root / "processor").exists())
-        # An image normalization the server does not implement is rejected
-        # from the projector's header, before any download.
+        # Only the selected GGUF and its projector are downloaded.
+        self.assertEqual(
+            sorted(fake.downloads),
+            sorted(
+                [
+                    f"{GGUF_REPO}/mmproj-F32.gguf",
+                    f"{GGUF_REPO}/model-Q4_K_M.gguf",
+                    *(
+                        f"{families.DRAFTS}/{MOE.name}/{name}"
+                        for name in (
+                            "config.json",
+                            "model.bin",
+                            *(f"layer-{i}.bin" for i in range(MOE.draft.layers)),
+                        )
+                    ),
+                ]
+            ),
+        )
+
+    def test_an_unsupported_projector_normalization_is_rejected_before_download(self):
+        fake = self.gguf_repository(vision=False)
         values = vision_fixture()
         values["clip.vision.image_mean"] = [0.48, 0.46, 0.41]
-        write_gguf(target / "mmproj-F32.gguf", values, [("v.patch_embd.weight", 0)])
-        args.models = self.root / "rejected"
-        with (
-            mock.patch.object(upstream.Repository, "resolve", return_value=source),
-            mock.patch.object(source, "download") as download,
-            self.assertRaisesRegex(models.ModelError, "vision preprocessing"),
-        ):
-            upstream.prepare(args)
-        download.assert_not_called()
+        write_gguf(
+            fake.remote / GGUF_REPO / ("a" * 40) / "mmproj-F32.gguf",
+            values,
+            [("v.patch_embd.weight", 0)],
+        )
+        with self.assertRaisesRegex(models.ModelError, "vision preprocessing"):
+            self.prepare(
+                selection(self.root, GGUF_REPO + ":Q4_K_M", language_only=False)
+            )
+        self.assertEqual(fake.downloads, [])
 
     def test_a_new_metadata_adapter_rebuilds_the_metadata_locally(self):
-        target = self.root / "target"
-        target.mkdir()
-        values = fixture(native=True)
-        write_gguf(
-            target / "model-Q4_K_M.gguf",
-            values,
-            loadable_tensors(values, self.root).items(),
-        )
-        source = upstream.Repository.local_directory(target)
-        draft = draft_dir(self.root / "draft", MOE)
-        args = argparse.Namespace(
-            model="unsloth/Qwen3.6-35B-A3B-GGUF:Q4_K_M",
-            models=self.root / "models",
-            revision=None,
-            language_only=True,
-            draft_model=str(draft),
-        )
-        resolve = upstream.Repository.resolve
-
-        def hub(name, *arguments, **options):
-            # The target's Hub resolution; the draft is a local directory.
-            if name == "unsloth/Qwen3.6-35B-A3B-GGUF":
-                return source
-            return resolve(name, *arguments, **options)
-
-        with (
-            mock.patch.object(upstream.Repository, "resolve", side_effect=hub),
-            contextlib.redirect_stdout(io.StringIO()),
-        ):
-            upstream.prepare(args)
-        root = models.installed_root(
-            args.models, args.model, language_only=True, draft_model=str(draft)
-        )
-        installed = upstream.verify(root)["metadata"]
+        fake = self.gguf_repository(vision=False)
+        chosen = selection(self.root, GGUF_REPO + ":Q4_K_M")
+        self.prepare(chosen)
+        installed = assembly.verify(chosen.link)["metadata"]
         adapter = self.root / "gguf.py"
         adapter.write_text("a new adapter\n")
-        with (
-            mock.patch.object(upstream.gguf, "__file__", str(adapter)),
-            # The unchanged target is re-assembled without the Hub.
-            mock.patch.object(
-                upstream.Repository, "resolve", side_effect=hub
-            ) as resolved,
-            contextlib.redirect_stdout(io.StringIO()) as output,
-        ):
-            self.assertTrue(upstream.prepare(args))
-        resolved.assert_called_once_with(
-            "unsloth/Qwen3.6-35B-A3B-GGUF", None, installation=mock.ANY
-        )
-        self.assertIn("the GGUF metadata adapter changed", output.getvalue())
-        rebuilt = upstream.verify(root)["metadata"]
+        fake.requests.clear(), fake.downloads.clear()
+        with mock.patch.object(gguf, "__file__", str(adapter)):
+            output = self.prepare(chosen)
+        # The unchanged target is assembled again from the cache.
+        self.assertEqual(fake.requests, [(GGUF_REPO, None)])
+        self.assertEqual(fake.downloads, [])
+        self.assertIn("the GGUF metadata adapter changed", output)
+        rebuilt = assembly.verify(chosen.link)["metadata"]
         self.assertNotEqual(rebuilt, installed)
-        self.assertEqual((root / "config.json").resolve().parent.name, rebuilt)
+        self.assertEqual((chosen.link / "config.json").resolve().parent.name, rebuilt)
         # The entry no assembly links any more is removed.
         self.assertEqual(
-            [p.name for p in (args.models / ".metadata").iterdir()], [rebuilt]
+            [p.name for p in (chosen.models_root / ".metadata").iterdir()], [rebuilt]
         )

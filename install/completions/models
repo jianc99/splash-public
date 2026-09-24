@@ -21,8 +21,8 @@ cache_file="$data_dir/catalog/official-models.txt"
         cat "$catalog"
         printf '\n'
     done
-    # Upstream installations record model.json, legacy packages manifest.json;
-    # a GGUF variant's root is named repo:VARIANT.
+    # The files models.installation_kind reads: an assembly's model.json or a
+    # legacy package's manifest.json; a GGUF selection's link is repo:VARIANT.
     for record in "$models_dir"/*/*/model.json "$models_dir"/*/*/manifest.json; do
         [ -f "$record" ] || continue
         directory=${record%/*}

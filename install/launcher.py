@@ -13,9 +13,10 @@ import urllib.error
 import urllib.request
 
 try:
-    from . import catalog, clients, paths
+    from . import assembly, catalog, clients, paths
     from . import models as model_artifacts
 except ImportError:  # Executed directly by the source or packaged entry point.
+    import assembly
     import catalog
     import clients
     import models as model_artifacts
@@ -25,7 +26,6 @@ ROOT = paths.ROOT
 RUNTIME_DIR = paths.RUNTIME
 PORT = 8000
 REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
-BASE_URL = f"http://127.0.0.1:{PORT}"
 
 
 class LauncherError(RuntimeError):
@@ -70,9 +70,7 @@ def _running_status(port=PORT):
     return status
 
 
-def _ensure_installed(
-    model_id, *, revision=None, language_only=False, draft_model=None
-):
+def _ensure_installed(selection):
     if not paths.PACKAGED:
         # Serialize builds across ports; make keeps the lock if the launcher exits.
         with (RUNTIME_DIR / "build.lock").open("a+") as lock:
@@ -89,15 +87,18 @@ def _ensure_installed(
         str(paths.PYTHON),
         str(ROOT / "install/models.py"),
         "--models",
-        str(paths.MODELS),
+        str(selection.models_root),
         "--model",
-        model_id,
+        selection.model,
         "prepare",
     ]
-    for flag, value in (("--revision", revision), ("--draft-model", draft_model)):
+    for flag, value in (
+        ("--revision", selection.revision),
+        ("--draft-model", selection.draft_model),
+    ):
         if value is not None:
             command[-1:-1] = [flag, value]
-    if language_only:
+    if selection.language_only:
         command.insert(-1, "--language-only")
     if subprocess.run(command, cwd=ROOT).returncode:
         raise LauncherError("model download or verification failed")
@@ -163,25 +164,21 @@ def serve(args):
                 raise LauncherError(
                     f"cannot bind {args.host}:{args.port}: {error}"
                 ) from None
-        selection = {
-            "revision": args.revision,
-            "language_only": args.language_only,
-            "draft_model": args.draft_model,
-        }
-        _ensure_installed(args.model, **selection)
-        root = model_artifacts.installed_root(paths.MODELS, args.model, **selection)
-        if (root / "model.json").is_file():
+        selection = model_artifacts.Selection.of(
+            paths.MODELS,
+            args.model,
+            revision=args.revision,
+            language_only=args.language_only,
+            draft_model=args.draft_model,
+        )
+        _ensure_installed(selection)
+        root = selection.link
+        if model_artifacts.installation_kind(root) == model_artifacts.ASSEMBLY:
             # A concurrent install may advance the selection link. Keep this
-            # process's tokenizer, draft and target on one immutable assembly,
-            # held until the server exits: installations remove only
-            # assemblies no selection links and no server holds. They collect
-            # under the installation lock, so resolving and holding under it
-            # leaves no moment the assembly is neither linked nor held.
-            with model_artifacts.installation_lock(paths.MODELS):
-                root = root.resolve(strict=True)
-                assembly = (root / "model.json").open("rb")
-                fcntl.flock(assembly, fcntl.LOCK_SH)
-            os.set_inheritable(assembly.fileno(), True)
+            # process's tokenizer, draft and target on one immutable
+            # assembly, held until the server exits.
+            root, record = assembly.hold(root, selection.models_root)
+            os.set_inheritable(record.fileno(), True)
         command = [
             str(paths.PYTHON),
             "-u",
@@ -241,8 +238,8 @@ def coding_client(args):
             "Run 'splash serve --model <HF_REPO_ID>' "
             "in another terminal first."
         )
-    catalog = _request_json("/v1/models", port=args.port)
-    models = catalog.get("data", []) if isinstance(catalog, dict) else []
+    listing = _request_json("/v1/models", port=args.port)
+    models = listing.get("data", []) if isinstance(listing, dict) else []
     if (
         not isinstance(models, list)
         or not models

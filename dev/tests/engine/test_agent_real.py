@@ -455,7 +455,7 @@ class AgentRunnerTests(unittest.TestCase):
                     adapter.assert_called_once_with(
                         name,
                         runner.path,
-                        agent.launcher.BASE_URL,
+                        agent.BASE_URL,
                         "Actual-model",
                         102400,
                         agent.launcher.RUNTIME_DIR,

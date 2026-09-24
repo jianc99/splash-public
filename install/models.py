@@ -1,15 +1,24 @@
 #!/usr/bin/env python3
 
-"""Verify and atomically install Splash packages from Hugging Face snapshots.
+"""Install and verify the model a Splash selection names.
 
-The native model descriptor validates architecture, tensors, headers, and
-execution geometry before mapping weights.
+Terms the installer modules share:
+- selection: what `--model OWNER/REPO[:VARIANT]` and its source options name
+  (Selection); its selection link, under the models root, points to what
+  serves it.
+- assembly: the directory an upstream model is served from, of links to
+  source snapshot files and its record, model.json (assembly.py), built and
+  published by upstream.py. A legacy Splash package is served from its own
+  Hub snapshot instead (legacy.py).
+- source snapshot: a repository at one commit in the Hub cache, or a local
+  draft directory (hub.py).
+
+This module holds what the installers share, and the command line.
 """
 
 from __future__ import annotations
 
 import argparse
-import errno
 import fcntl
 import hashlib
 import json
@@ -18,6 +27,7 @@ import re
 import sys
 import tempfile
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 if __package__:
@@ -26,41 +36,55 @@ else:
     import paths
 
 MODELS = paths.MODELS
-ALIGNMENT = 16384
-MAX_MANIFEST_BYTES = 4 * 1024 * 1024
-# The DFlash2 draft layout Splash loads: the magic that begins each draft
-# layer file, and the draft configuration's splash.format.
+# The bound on one JSON metadata file.
+MAX_JSON_BYTES = 4 * 1024 * 1024
+# The magic that begins each DFlash2 draft layer file Splash loads, and the
+# draft configuration's splash.format.
 DRAFT_LAYER_MAGIC = "MDFD0004"
-# The tokenizer/ files a legacy Splash package ships.
-PACKAGE_TOKENIZER_FILES = {
-    "chat_template.jinja",
-    "config.json",
-    "tokenizer.json",
-    "tokenizer_config.json",
-    "vocab.json",
-}
 REPO_ID = re.compile(
     r"[A-Za-z0-9_](?:[A-Za-z0-9._-]*[A-Za-z0-9_])?/"
     r"[A-Za-z0-9_](?:[A-Za-z0-9._-]{0,94}[A-Za-z0-9_])?"
 )
-# Format name -> (schema version, target layer magic). The schema names the
-# target: 3 a Qwen3.8 (64 layers, 5 draft layers), 4 a Qwen3.6 MoE (40, 6).
-PACKAGE_FORMATS = {
-    "splash-packed-q4": (3, "MDFL0006"),
-    "splash-packed-q4-moe": (4, "MDFM0001"),
-}
 VARIANT_SEPARATOR = ":"
 VARIANT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+# What installation_kind finds at a selection link.
+ASSEMBLY, PACKAGE = "assembly", "package"
+# Staging an interrupted installation leaves, which garbage collection
+# removes: a selection link being replaced (beside the link), and an assembly
+# or derived metadata entry being written (beside the published entries).
+LINK_STAGING = ".prepare-"
+ENTRY_STAGING = ".loading-"
 
 
 class ModelError(RuntimeError):
     pass
 
 
+def warn(message):
+    """Report something the user may need to act on, on stderr."""
+    print(f"Warning: {message}", file=sys.stderr, flush=True)
+
+
 def is_hex_digest(value, length: int) -> bool:
     return (
         isinstance(value, str)
         and re.fullmatch(rf"[0-9a-fA-F]{{{length}}}", value) is not None
+    )
+
+
+def is_safe_path(name) -> bool:
+    """Whether name is a plain relative POSIX path: no absolute, empty, "."
+    or ".." part, no backslash or control character, and none of the
+    characters Hub download patterns read as globs (* ? [ ])."""
+    if not isinstance(name, str) or not name:
+        return False
+    path = PurePosixPath(name)
+    return (
+        not path.is_absolute()
+        and path.as_posix() == name
+        and ".." not in path.parts
+        and not any(character in name for character in "\\*?[]")
+        and all(ord(character) >= 32 for character in name)
     )
 
 
@@ -75,13 +99,6 @@ def validate_repo_id(value: str) -> str:
     ):
         raise ModelError("model must be a full Hugging Face repository ID (owner/repo)")
     return value
-
-
-def parse_repo_id(value: str) -> str:
-    try:
-        return validate_repo_id(value)
-    except ModelError as error:
-        raise argparse.ArgumentTypeError(str(error)) from error
 
 
 def split_model_id(value: str) -> tuple[str, str | None]:
@@ -100,16 +117,12 @@ def split_model_id(value: str) -> tuple[str, str | None]:
     return repo_id, variant
 
 
-def validate_model_id(value: str) -> str:
-    repo_id, variant = split_model_id(value)
-    return repo_id if variant is None else f"{repo_id}{VARIANT_SEPARATOR}{variant}"
-
-
 def parse_model_id(value: str) -> str:
     try:
-        return validate_model_id(value)
+        split_model_id(value)
     except ModelError as error:
         raise argparse.ArgumentTypeError(str(error)) from error
+    return value
 
 
 def parse_draft_model(value: str) -> str:
@@ -126,17 +139,21 @@ def parse_draft_model(value: str) -> str:
         ) from None
 
 
-def sha256(path: Path) -> str:
-    digest = hashlib.sha256()
+def hash_file(path: Path, digest) -> str:
+    """The hex digest of path's content fed to digest, a hashlib object."""
     with path.open("rb") as file:
         while chunk := file.read(8 * 1024 * 1024):
             digest.update(chunk)
     return digest.hexdigest()
 
 
+def sha256(path: Path) -> str:
+    return hash_file(path, hashlib.sha256())
+
+
 def read_json(path: Path):
     try:
-        if path.stat().st_size > MAX_MANIFEST_BYTES:
+        if path.stat().st_size > MAX_JSON_BYTES:
             raise ModelError(f"JSON metadata is too large: {path}")
         value = json.loads(path.read_text())
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -146,120 +163,19 @@ def read_json(path: Path):
     return value
 
 
-def _validate_records(records, artifact_paths):
-    for record in records:
-        if (
-            not isinstance(record, dict)
-            or set(record) != {"path", "size", "sha256"}
-            or not isinstance(record["path"], str)
-        ):
-            raise ModelError("runtime package manifest has an invalid artifact")
-        pure = PurePosixPath(record["path"])
-        if (
-            pure.is_absolute()
-            or not pure.parts
-            or ".." in pure.parts
-            or pure.as_posix() != record["path"]
-            or any(character in record["path"] for character in "\\*?[]")
-            or any(ord(character) < 32 for character in record["path"])
-            or record["path"] == "manifest.json"
-            or type(record["size"]) is not int
-            or record["size"] <= 0
-            or not is_hex_digest(record["sha256"], 64)
-        ):
-            raise ModelError("runtime package manifest has an invalid artifact")
-        if record["path"] in artifact_paths:
-            raise ModelError("runtime package artifact paths are not unique")
-        if pure.suffix == ".bin" and record["size"] % ALIGNMENT:
-            raise ModelError(
-                f"runtime package packed file is unaligned: {record['path']}"
-            )
-        artifact_paths.add(record["path"])
-
-
-def validate_package_manifest(path: Path):
-    manifest = read_json(path)
-    format_ = manifest.get("format")
-    format_name = format_.get("name") if isinstance(format_, dict) else None
-    layout = PACKAGE_FORMATS.get(format_name) if isinstance(format_name, str) else None
-    if (
-        layout is None
-        or type(manifest.get("schema_version")) is not int
-        or manifest["schema_version"] != layout[0]
-        or not isinstance(manifest.get("model"), str)
-        or not manifest["model"].strip()
-        or not isinstance(manifest.get("execution_geometry"), dict)
-    ):
-        raise ModelError("repository is not a supported Splash runtime package")
-    expected_format = {
-        "section_alignment_bytes": ALIGNMENT,
-        "target_layer_magic": layout[1],
-        "draft_layer_magic": DRAFT_LAYER_MAGIC,
-        "vision_magic": "MDFV0001",
-    }
-    if any(
-        type(format_.get(key)) is not type(value) or format_[key] != value
-        for key, value in expected_format.items()
-    ):
-        raise ModelError("runtime package has an unsupported packed weight format")
-    schema = manifest["schema_version"]
-    if schema == 4:
-        for key, architecture in (
-            ("target", "qwen3_5_moe"),
-            ("draft", "DFlash2DraftModel"),
-        ):
-            declaration = manifest.get(key)
-            if (
-                not isinstance(declaration, dict)
-                or declaration.get("architecture") != architecture
-            ):
-                raise ModelError(
-                    f"runtime package has an unsupported {key} architecture"
-                )
-
-    records = manifest.get("artifacts")
-    if not isinstance(records, list) or not records:
-        raise ModelError("runtime package manifest has no artifact list")
-    artifact_paths = set()
-    _validate_records(records, artifact_paths)
-    if any(
-        parent.as_posix() in artifact_paths
-        for name in artifact_paths
-        for parent in PurePosixPath(name).parents
-    ):
-        raise ModelError("runtime package artifact paths overlap")
-    target_layers, draft_layers = (64, 5) if schema == 3 else (40, 6)
-    required_files = {
-        "target/embedding.bin",
-        "target/head.bin",
-        *(f"target/layer-{index}.bin" for index in range(target_layers)),
-        "draft/model.bin",
-        *(f"draft/layer-{index}.bin" for index in range(draft_layers)),
-        "vision/model.bin",
-        *(f"tokenizer/{name}" for name in PACKAGE_TOKENIZER_FILES),
-    }
-    missing = required_files - artifact_paths
-    if missing:
-        raise ModelError(
-            "runtime package artifact list is missing: " + ", ".join(sorted(missing))
-        )
-    return manifest
-
-
-def verify_artifacts(root: Path, manifest, *, full: bool):
-    for record in manifest["artifacts"]:
-        path = root / record["path"]
-        if not path.is_file() or path.stat().st_size != record["size"]:
-            raise ModelError(f"installed artifact has the wrong size: {record['path']}")
-        if path.suffix == ".bin" and record["size"] % ALIGNMENT:
-            raise ModelError(f"installed packed file is unaligned: {record['path']}")
-        if full and sha256(path) != record["sha256"].lower():
-            raise ModelError(f"installed artifact checksum changed: {record['path']}")
+def json_bytes(value) -> bytes:
+    """Canonical JSON: the same value always encodes to the same bytes."""
+    return (
+        json.dumps(value, sort_keys=True, ensure_ascii=False, indent=2) + "\n"
+    ).encode()
 
 
 def installed_root(
     models: Path, model_id: str, *, revision=None, language_only=False, draft_model=None
 ) -> Path:
+    """The selection link of model_id with these source options:
+    OWNER/REPO[:VARIANT] under models for the model alone, else
+    .selections/<hash of the selection>."""
     repo_id, variant = split_model_id(model_id)
     if revision or language_only or draft_model:
         selection = json.dumps(
@@ -271,287 +187,62 @@ def installed_root(
     return models / f"{repo_id}{VARIANT_SEPARATOR}{variant}"
 
 
-def installed_snapshot(root: Path) -> Path:
-    """The Hub snapshot an installed package root links."""
-    if not root.is_symlink():
-        raise ModelError(f"installed model root is not a Splash installation: {root}")
-    return root.resolve()
+def selection_links(models: Path):
+    """Every selection link under models, in the places installed_root names."""
+    return [path for path in models.glob("*/*") if path.is_symlink()]
 
 
-def verify_installed(
-    models: Path,
-    *,
-    model_id: str,
-    full: bool,
-):
-    root = installed_root(models, model_id)
-    manifest = validate_package_manifest(root / "manifest.json")
-    _snapshot_revision(installed_snapshot(root), model_id)
-    verify_artifacts(root, manifest, full=full)
-    return model_id
+@dataclass(frozen=True)
+class Selection:
+    """What --model and its source options select, and its selection link."""
 
+    model: str
+    repo_id: str
+    variant: str | None
+    revision: str | None
+    language_only: bool
+    draft_model: str | None
+    models_root: Path
+    link: Path
 
-def hub_folder_name(repo_id: str) -> str:
-    """The folder of a model repository in the Hub cache."""
-    return "models--" + repo_id.replace("/", "--")
-
-
-def _snapshot_revision(snapshot: Path, model_id: str) -> str:
-    if (
-        snapshot.parent.name != "snapshots"
-        or snapshot.parent.parent.name != hub_folder_name(model_id)
-        or not is_hex_digest(snapshot.name, 40)
+    @classmethod
+    def of(
+        cls, models_root, model, *, revision=None, language_only=False, draft_model=None
     ):
-        raise ModelError(
-            "installed package is not a snapshot of the requested Hub repository"
+        repo_id, variant = split_model_id(model)
+        models_root = Path(models_root).resolve()
+        link = installed_root(
+            models_root,
+            model,
+            revision=revision,
+            language_only=language_only,
+            draft_model=draft_model,
         )
-    return snapshot.name
-
-
-def pin_owner(installation: Path) -> str:
-    """The refs/splash folder holding an installation's pins. Each
-    installation owns its references; Hub branch updates and other
-    installations must not unpin this installation's current weights."""
-    owner = installation.parent.resolve() / installation.name
-    return hashlib.sha256(os.fsencode(owner)).hexdigest()
-
-
-def retain_ref(snapshot: Path, model_id: str, installation: Path) -> Path:
-    """Pin snapshot for installation (refs/splash/<installation>/<commit>), so
-    pruning the Hub cache cannot remove files the installation links."""
-    revision = _snapshot_revision(snapshot, model_id)
-    ref = (
-        snapshot.parent.parent / "refs" / "splash" / pin_owner(installation) / revision
-    )
-    try:
-        existing = ref.read_text()
-    except FileNotFoundError:
-        pass
-    else:
-        if existing != revision:
-            raise ModelError(f"invalid installed snapshot reference: {ref}")
-        return ref
-    ref.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(dir=ref.parent) as temporary:
-        temporary.write(revision.encode())
-        temporary.flush()
-        try:
-            os.link(temporary.name, ref)
-        except FileExistsError:
-            if ref.read_text() != revision:
-                raise ModelError(f"invalid installed snapshot reference: {ref}")
-    return ref
-
-
-def retire_refs(refs):
-    """Remove the installation's other pins beside refs. Call it only after
-    publishing and verifying the installation refs pin; other installations
-    own other folders."""
-    try:
-        for ref in refs:
-            for previous in ref.parent.iterdir():
-                if previous not in refs and is_hex_digest(previous.name, 40):
-                    previous.unlink()
-    except OSError as error:
-        # Keeping an old pin uses cache space but cannot invalidate the
-        # verified installation or its successfully retained current pin.
-        print(
-            f"Warning: could not retire old Hub cache references: {error}",
-            file=sys.stderr,
+        return cls(
+            model,
+            repo_id,
+            variant,
+            revision,
+            language_only,
+            draft_model,
+            models_root,
+            link,
         )
 
 
-def retain_refs(installation: Path, snapshots):
-    """Pin a verified installation's (snapshot, repository ID) pairs again,
-    repairing a pin that was lost or never written, and retire its older pins.
-    Only local files are written; a read-only cache leaves the verified model
-    usable, with a warning."""
-    try:
-        refs = [
-            retain_ref(snapshot, repo, installation) for snapshot, repo in snapshots
-        ]
-    except OSError as error:
-        if error.errno not in (errno.EACCES, errno.EPERM, errno.EROFS):
-            raise
-        print(
-            "Warning: the verified model can be used, but its Hub cache "
-            "reference could not be retained; protect this snapshot from "
-            f"external cache pruning: {error}",
-            file=sys.stderr,
-        )
-        return
-    retire_refs(refs)
-
-
-def _download_snapshot(model_id: str, token):
-    from huggingface_hub import HfApi, hf_hub_download, snapshot_download
-
-    options = {
-        "repo_id": model_id,
-        "repo_type": "model",
-        "token": token or False,
-    }
-    for _ in range(3):
-        info = HfApi(token=token or False).model_info(
-            model_id, revision="main", files_metadata=True
-        )
-        if not is_hex_digest(info.sha, 40):
-            raise ModelError("Hub did not resolve the model to a snapshot commit")
-        manifest_file = next(
-            (item for item in info.siblings if item.rfilename == "manifest.json"), None
-        )
-        if manifest_file is None:
-            raise ModelError("repository has no Splash runtime package manifest.json")
-        if (
-            type(manifest_file.size) is not int
-            or not 0 < manifest_file.size <= MAX_MANIFEST_BYTES
-        ):
-            raise ModelError("runtime package manifest.json has an invalid size")
-        # Resolve the named revision through the Hub cache before pinning every
-        # artifact. A branch update between metadata and download retries before
-        # any weights are downloaded.
-        manifest_path = Path(
-            hf_hub_download(filename="manifest.json", revision="main", **options)
-        )
-        revision = _snapshot_revision(manifest_path.parent, model_id)
-        if revision == info.sha:
-            break
-    else:
-        raise ModelError("Hub main changed repeatedly during installation; retry")
-
-    options["revision"] = revision
-    try:
-        manifest = validate_package_manifest(manifest_path)
-    except ModelError:
-        manifest_path = Path(
-            hf_hub_download(
-                filename="manifest.json",
-                force_download=True,
-                **options,
-            )
-        )
-        manifest = validate_package_manifest(manifest_path)
-    manifest_sha = sha256(manifest_path)
-    records = manifest["artifacts"]
-    published = {item.rfilename: item for item in info.siblings}
-    for record in records:
-        item = published.get(record["path"])
-        if item is None or item.size != record["size"]:
-            raise ModelError(f"Hub artifact does not match manifest: {record['path']}")
-        lfs = getattr(item, "lfs", None)
-        if lfs is not None and lfs.sha256.lower() != record["sha256"].lower():
-            raise ModelError(
-                f"Hub artifact hash does not match manifest: {record['path']}"
-            )
-    snapshot = Path(
-        snapshot_download(
-            allow_patterns=["manifest.json", *(r["path"] for r in records)],
-            **options,
-        )
-    )
-    if sha256(snapshot / "manifest.json") != manifest_sha:
-        raise ModelError("runtime package manifest changed during download")
-    if _snapshot_revision(snapshot, model_id) != revision:
-        raise ModelError("Hub returned a different runtime package revision")
-    # Repair only corrupt cached artifacts. A manifest error is deterministic
-    # and must not trigger a second download of all model weights.
-    for record in records:
-        path = snapshot / record["path"]
-        if (
-            not path.is_file()
-            or path.stat().st_size != record["size"]
-            or sha256(path) != record["sha256"].lower()
-        ):
-            hf_hub_download(filename=record["path"], force_download=True, **options)
-            verify_artifacts(snapshot, {"artifacts": [record]}, full=True)
-    return snapshot.resolve()
-
-
-def _cached_snapshot(model_id):
-    from huggingface_hub import try_to_load_from_cache
-
-    path = try_to_load_from_cache(model_id, "manifest.json", revision="main")
-    if not isinstance(path, str):
-        return None
-    snapshot = Path(path).parent
-    try:
-        _snapshot_revision(snapshot, model_id)
-        manifest = validate_package_manifest(snapshot / "manifest.json")
-        verify_artifacts(snapshot, manifest, full=True)
-    except (ModelError, OSError):
-        return None
-    return snapshot.resolve()
-
-
-def resolve_snapshot(model_id: str):
-    validate_repo_id(model_id)
-    try:
-        from huggingface_hub import get_token
-    except ImportError as error:
-        raise ModelError(
-            "missing dependency huggingface_hub; reinstall Splash"
-        ) from error
-    token = os.environ.get("HF_TOKEN") or get_token()
-    import httpx
-    from huggingface_hub.errors import OfflineModeIsEnabled
-
-    try:
-        return _download_snapshot(model_id, token)
-    except Exception as error:
-        if isinstance(error, (OfflineModeIsEnabled, httpx.TransportError)):
-            if cached := _cached_snapshot(model_id):
-                print("Using a verified cached model while offline.", flush=True)
-                return cached
-        if isinstance(error, ModelError):
-            raise
-        raise ModelError(
-            hub_error(
-                error,
-                f"could not download Splash runtime package {model_id}@main",
-                token,
-            )
-        ) from error
-
-
-def hub_reason(error, token=None) -> str:
-    """The Hub's reason for error, with the token redacted (the caller's, or
-    the configured one) and, for denied access, how to authenticate."""
-    from huggingface_hub import get_token
-    from huggingface_hub.errors import HfHubHTTPError
-
-    # One line: the Hub's messages span several.
-    message = " ".join(str(error).split()) or type(error).__name__
-    if token := token or os.environ.get("HF_TOKEN") or get_token():
-        message = message.replace(token, "[redacted]")
-    if (
-        isinstance(error, HfHubHTTPError)
-        and error.response is not None
-        and error.response.status_code in (401, 403)
-    ):
-        message += (
-            "; set HF_TOKEN or run 'hf auth login' with access to this repository"
-        )
-    return message
-
-
-def hub_error(error, context: str, token=None) -> str:
-    return f"{context}: {hub_reason(error, token)}"
-
-
-@contextmanager
-def hub_errors(context: str):
-    """Report a Hub, network or cache failure in the block as a ModelError
-    (see hub_error), which callers print without a traceback."""
-    import httpx
-
-    try:
-        yield
-    except (OSError, httpx.HTTPError) as error:
-        raise ModelError(hub_error(error, context)) from error
+def installation_kind(link: Path):
+    """What serves a selection link: an assembly (its model.json), a legacy
+    Splash package (its manifest.json), or nothing (None)."""
+    if (link / "model.json").exists():
+        return ASSEMBLY
+    if (link / "manifest.json").exists():
+        return PACKAGE
+    return None
 
 
 @contextmanager
 def installation_lock(models: Path):
+    """Exclusive access to everything written under models."""
     lock_path = models / ".install.lock"
     with lock_path.open("a+b") as lock:
         try:
@@ -568,65 +259,22 @@ def installation_lock(models: Path):
             fcntl.flock(lock, fcntl.LOCK_UN)
 
 
-def install_snapshot(snapshot: Path, destination: Path):
-    if destination.exists() and not destination.is_symlink():
-        raise ModelError(f"refusing to replace non-symlink model path: {destination}")
-    destination.parent.mkdir(parents=True, exist_ok=True)
+def link_selection(link: Path, target: Path):
+    """Point the selection link at target, atomically. Only a link is ever
+    replaced: a directory at its path is someone's own files."""
+    if link.exists() and not link.is_symlink():
+        raise ModelError(f"refusing to replace non-symlink model path: {link}")
+    link.parent.mkdir(parents=True, exist_ok=True)
     stage = Path(
-        tempfile.mkdtemp(prefix=f".prepare-{destination.name}-", dir=destination.parent)
+        tempfile.mkdtemp(prefix=f"{LINK_STAGING}{link.name}-", dir=link.parent)
     )
     temporary = stage / "model"
     try:
-        os.symlink(snapshot, temporary, target_is_directory=True)
-        os.replace(temporary, destination)
+        os.symlink(target, temporary, target_is_directory=True)
+        os.replace(temporary, link)
     finally:
         temporary.unlink(missing_ok=True)
         stage.rmdir()
-
-
-def prepare_legacy(args):
-    repo_id, variant = split_model_id(args.model)
-    if variant is not None:
-        raise ModelError(
-            "this runtime package has no variants; drop the :VARIANT suffix"
-        )
-    models = args.models.resolve()
-    models.mkdir(parents=True, exist_ok=True)
-    root = installed_root(models, args.model)
-    with installation_lock(models):
-        try:
-            _snapshot_revision(installed_snapshot(root), repo_id)
-            manifest = validate_package_manifest(root / "manifest.json")
-            verify_artifacts(root, manifest, full=False)
-        except (ModelError, OSError):
-            if root.exists() and not root.is_symlink():
-                raise ModelError(
-                    f"cannot identify the local package at {root}; move it aside before installing"
-                ) from None
-            print(
-                f"Installing {args.model}; missing artifacts will be downloaded.",
-                flush=True,
-            )
-            snapshot = resolve_snapshot(repo_id)
-            # A new installation requires its pin before it is published.
-            ref = retain_ref(snapshot, repo_id, root)
-            install_snapshot(snapshot, root)
-            manifest = validate_package_manifest(root / "manifest.json")
-            verify_artifacts(root, manifest, full=False)
-            print(f"Installed verified Splash model {args.model} in {root}")
-            retire_refs([ref])
-        else:
-            print(f"Splash model {args.model} is already installed in {root}")
-            retain_refs(root, [(installed_snapshot(root), repo_id)])
-
-
-def prepare(args):
-    if __package__:
-        from . import upstream
-    else:
-        import upstream
-    if not upstream.prepare(args):
-        prepare_legacy(args)
 
 
 def parse_args(argv=None):
@@ -657,32 +305,33 @@ def parse_args(argv=None):
 
 def main(argv=None):
     args = parse_args(argv)
+    # The installers import this module, so it imports them once it exists.
+    if __package__:
+        from . import assembly, legacy, upstream
+    else:
+        import assembly
+        import legacy
+        import upstream
+    selection = Selection.of(
+        args.models,
+        args.model,
+        revision=args.revision,
+        language_only=args.language_only,
+        draft_model=args.draft_model,
+    )
     try:
         if args.command == "prepare":
-            prepare(args)
+            upstream.prepare(selection)
         else:
-            root = installed_root(
-                args.models.resolve(),
-                args.model,
-                revision=args.revision,
-                language_only=args.language_only,
-                draft_model=args.draft_model,
-            )
-            if (root / "model.json").exists():
-                if __package__:
-                    from . import upstream
-                else:
-                    import upstream
-                upstream.verify(root, full=args.full)
-                selected = args.model
-            elif (root / "manifest.json").exists():
-                selected = verify_installed(
-                    args.models.resolve(), model_id=args.model, full=args.full
-                )
+            kind = installation_kind(selection.link)
+            if kind == ASSEMBLY:
+                assembly.verify(selection.link, full=args.full)
+            elif kind == PACKAGE:
+                legacy.verify(selection.link, selection.repo_id, full=args.full)
             else:
                 raise ModelError(f"{args.model} is not installed in {args.models}")
             print(
-                f"Splash model {selected} preflight passed "
+                f"Splash model {args.model} preflight passed "
                 f"({'full' if args.full else 'quick'})."
             )
     except (ModelError, OSError) as error:
@@ -692,9 +341,9 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    # upstream.py and gguf.py import this file by its module name. Run that
-    # module, not this __main__ copy, so the ModelError they raise is the one
-    # main() reports.
+    # The other installer modules import this file by its module name. Run
+    # that module, not this __main__ copy, so the ModelError they raise is the
+    # one main() reports.
     import importlib
 
     installer = importlib.import_module(

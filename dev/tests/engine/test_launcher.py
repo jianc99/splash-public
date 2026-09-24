@@ -17,6 +17,12 @@ from unittest import mock
 from install import launcher
 
 MODEL_ID = "community/custom-splash"
+
+
+def selection(models_root, **options):
+    return launcher.model_artifacts.Selection.of(models_root, MODEL_ID, **options)
+
+
 MODEL_IDS = (
     "incoai/Qwen3.8-27B-Splash",
     "incoai/Qwen3.6-35B-A3B-Splash",
@@ -193,7 +199,7 @@ class LauncherTests(unittest.TestCase):
                 "port": launcher.PORT,
             }
 
-            def check_install(model, **options):
+            def check_install(chosen):
                 self.assertEqual(json.loads(lock_path.read_text()), owner)
 
             def check_exec(binary, argv, environment):
@@ -263,9 +269,7 @@ class LauncherTests(unittest.TestCase):
                         "proxy.local",
                     ]
                 )
-            install.assert_called_once_with(
-                MODEL_ID, revision=None, language_only=False, draft_model=None
-            )
+            install.assert_called_once_with(selection(launcher.paths.MODELS))
             execute.assert_called_once()
             self.assertEqual(
                 {p.name for p in runtime.iterdir()}, {"serve.lock", "serve-8000.lock"}
@@ -536,7 +540,7 @@ class LauncherTests(unittest.TestCase):
                 "launcher.ROOT = Path(sys.argv[1])\n"
                 "launcher.RUNTIME_DIR = launcher.ROOT / 'runtime'\n"
                 "launcher.paths.PYTHON = Path(sys.executable)\n"
-                "launcher._ensure_installed = lambda model, **options: None\n"
+                "launcher._ensure_installed = lambda selection: None\n"
                 "launcher.model_artifacts.installed_root = lambda *a, **k: launcher.ROOT\n"
                 "launcher.catalog.spawn_refresh = lambda: None\n"
                 "launcher.main(['serve', '--model', 'test/model', '--port', sys.argv[2]])\n"
@@ -686,9 +690,9 @@ class LauncherTests(unittest.TestCase):
                         with self.assertRaisesRegex(
                             launcher.LauncherError, "source build failed"
                         ):
-                            launcher._ensure_installed(MODEL_ID)
+                            launcher._ensure_installed(selection(runtime))
                     else:
-                        launcher._ensure_installed(MODEL_ID)
+                        launcher._ensure_installed(selection(runtime))
                 self.assertEqual(len(calls), 1 if fail else 3)
                 with (runtime / "build.lock").open("a+") as probe:
                     fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -698,7 +702,7 @@ class LauncherTests(unittest.TestCase):
             runtime = Path(temporary)
             draft = runtime / "local-draft"
             draft.mkdir()
-            selection = {
+            options = {
                 "revision": "v2",
                 "language_only": True,
                 "draft_model": str(draft.resolve()),
@@ -727,8 +731,12 @@ class LauncherTests(unittest.TestCase):
                         "--language-only",
                     ]
                 )
-            install.assert_called_once_with(MODEL_ID, **selection)
-            root.assert_called_once_with(launcher.paths.MODELS, MODEL_ID, **selection)
+            (chosen,) = install.call_args.args
+            self.assertEqual(
+                (chosen.model, chosen.link),
+                (MODEL_ID, runtime / "selected"),
+            )
+            root.assert_called_once_with(chosen.models_root, MODEL_ID, **options)
             argv = execute.call_args.args[1]
             self.assertEqual(
                 argv[3:5],
@@ -743,7 +751,7 @@ class LauncherTests(unittest.TestCase):
                 ) as run,
                 mock.patch.object(launcher.paths, "PACKAGED", True),
             ):
-                launcher._ensure_installed(MODEL_ID, **selection)
+                launcher._ensure_installed(chosen)
             command = run.call_args.args[0]
             self.assertEqual(run.call_args.kwargs["cwd"], launcher.ROOT)
             parsed = launcher.model_artifacts.parse_args(command[2:])
@@ -755,7 +763,7 @@ class LauncherTests(unittest.TestCase):
                     parsed.language_only,
                     parsed.draft_model,
                 ),
-                ("prepare", MODEL_ID, "v2", True, selection["draft_model"]),
+                ("prepare", MODEL_ID, "v2", True, options["draft_model"]),
             )
 
     def test_server_holds_the_assembly_it_serves(self):
@@ -841,7 +849,7 @@ class LauncherTests(unittest.TestCase):
                 return_value=subprocess.CompletedProcess([], 0),
             ) as run,
         ):
-            launcher._ensure_installed(MODEL_ID)
+            launcher._ensure_installed(selection(launcher.paths.MODELS))
         run.assert_called_once()
         command = run.call_args.args[0]
         self.assertEqual(command[0], str(launcher.paths.PYTHON))
