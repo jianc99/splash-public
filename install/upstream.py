@@ -61,7 +61,7 @@ FAMILIES = (
             ("num_key_value_heads", 4),
             ("head_dim", 256),
         ),
-        Draft(None, 5),
+        Draft("f0ce2ff58f760c7e251a2a2454528273c3fa870b", 5),
     ),
     ModelFamily(
         "Qwen3.6-35B-A3B",
