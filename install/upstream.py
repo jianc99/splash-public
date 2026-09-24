@@ -14,7 +14,6 @@ repository names play no part.
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 import shutil
 import tempfile
@@ -671,11 +670,9 @@ def _install(args, repo, variant, models_root, root, installed):
         else:
             files["target/config.json"] = files["config.json"]
         files["tokenizer/config.json"] = files["config.json"]
-        records = {}
-        record["files"] = {
-            name: records.setdefault(str(path.absolute()), _file_record(path))
-            for name, path in sorted(files.items())
-        }
+        # One record per linked file, however many assembly paths link it.
+        records = {path: _file_record(path) for path in set(files.values())}
+        record["files"] = {name: records[path] for name, path in sorted(files.items())}
         # A new installation requires its pins before it is published; its
         # older pins are retired once it is.
         refs = [
@@ -740,10 +737,10 @@ def _draft(family, draft_override, installed, root):
 
 def _publish(models_root, record, files):
     """The verified assembly for record, rebuilding a damaged one."""
-    encoded = json.dumps(record, sort_keys=True, indent=2) + "\n"
+    encoded = gguf.json_bytes(record)
     cache = models_root / ".resolved"
     cache.mkdir(parents=True, exist_ok=True)
-    destination = cache / hashlib.sha256(encoded.encode()).hexdigest()
+    destination = cache / hashlib.sha256(encoded).hexdigest()
     if destination.exists():
         try:
             verify(destination)
@@ -754,7 +751,7 @@ def _publish(models_root, record, files):
     try:
         for name, path in files.items():
             _link(stage, name, path)
-        with (stage / "model.json").open("w") as stream:
+        with (stage / "model.json").open("wb") as stream:
             stream.write(encoded)
             stream.flush()
             os.fsync(stream.fileno())
@@ -874,7 +871,7 @@ def _file_record(path):
     stat = path.stat()
     resolved = path.resolve()
     digest = resolved.name if resolved.parent.name == "blobs" else ""
-    if len(digest) not in (40, 64) or any(c not in "0123456789abcdef" for c in digest):
+    if not (models.is_hex_digest(digest, 40) or models.is_hex_digest(digest, 64)):
         digest = models.sha256(path)
     return {
         "path": str(path.absolute()),
