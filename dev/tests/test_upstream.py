@@ -237,14 +237,36 @@ class UpstreamTest(unittest.TestCase):
             upstream.select_gguf(files, "UD-Q4_K_M"), "Qwen3.8-27B-UD-Q4_K_M.gguf"
         )
         self.assertEqual(upstream.select_gguf(files, "q4_0"), "Qwen3.8-27B-Q4_0.gguf")
-        # Q4_K_M names the UD file when it is the only one; a plain file wins over it.
-        self.assertEqual(
-            upstream.select_gguf(files, "Q4_K_M"), "Qwen3.8-27B-UD-Q4_K_M.gguf"
-        )
+        # Q4_K_M names the plain file; without one, the one file ending so,
+        # which is said, and never one of several.
         both = files | {"Qwen3.8-27B-Q4_K_M.gguf"}
-        self.assertEqual(
-            upstream.select_gguf(both, "Q4_K_M"), "Qwen3.8-27B-Q4_K_M.gguf"
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(
+                upstream.select_gguf(both, "Q4_K_M"), "Qwen3.8-27B-Q4_K_M.gguf"
+            )
+        self.assertEqual(output.getvalue(), "")
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(
+                upstream.select_gguf(files, "Q4_K_M"), "Qwen3.8-27B-UD-Q4_K_M.gguf"
+            )
+        self.assertIn(
+            "No GGUF is named for :Q4_K_M alone; using Qwen3.8-27B-UD-Q4_K_M.gguf",
+            output.getvalue(),
         )
+        with self.assertRaisesRegex(
+            models.ModelError,
+            "no single GGUF matches :Q4_K_M .*Qwen3.8-27B-UD-Q4_K_M.gguf, "
+            "Qwen3.8-27B-XL-Q4_K_M.gguf",
+        ):
+            upstream.select_gguf(files | {"Qwen3.8-27B-XL-Q4_K_M.gguf"}, "Q4_K_M")
+        # A repository of one GGUF has no shared name to strip.
+        for variant in ("UD-Q4_K_M", "Q4_K_M"):
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(
+                    upstream.select_gguf({"Qwen3.8-27B-UD-Q4_K_M.gguf"}, variant),
+                    "Qwen3.8-27B-UD-Q4_K_M.gguf",
+                )
+            self.assertEqual(output.getvalue(), "")
         for variant in (None, "Q4", "BF16", "missing"):
             with (
                 self.subTest(variant=variant),

@@ -115,9 +115,11 @@ def family_for(config):
 
 
 def select_gguf(files, variant):
-    """The target GGUF: a file in the repository root named ...-<variant>.gguf.
-    Of several that end so (X-Q4_K_M and X-UD-Q4_K_M for Q4_K_M), the one with
-    the shortest name wins; subfolders (split BF16, MTP heads) never count."""
+    """The target GGUF among the repository's root files; subfolders (split
+    BF16, MTP heads) never count. :VARIANT names the file whose name is the
+    model name all of them share, then -VARIANT (X-Q4_K_M for Q4_K_M, not
+    X-UD-Q4_K_M). Without one, the only file whose name ends in -VARIANT is
+    taken, and the choice is printed; several are an error."""
     candidates = sorted(
         name
         for name in files
@@ -125,13 +127,25 @@ def select_gguf(files, variant):
         and name.lower().endswith(".gguf")
         and not name.lower().startswith("mmproj")
     )
+    matches = candidates
     if variant:
-        suffix = "-" + variant.lower()
-        matches = [n for n in candidates if Path(n).stem.lower().endswith(suffix)]
-        shortest = min((len(n) for n in matches), default=0)
-        matches = [n for n in matches if len(n) == shortest]
-    else:
-        matches = candidates
+        parts = [Path(name).stem.split("-") for name in candidates]
+        shared = len(os.path.commonprefix(parts))
+        matches = [
+            name
+            for name, words in zip(candidates, parts, strict=True)
+            if "-".join(words[shared:]).lower() == variant.lower()
+        ]
+        if len(matches) != 1:
+            suffix = "-" + variant.lower()
+            matches = [n for n in candidates if Path(n).stem.lower().endswith(suffix)]
+            # A repository of one GGUF names no variant apart from its model.
+            if len(matches) == 1 and len(candidates) > 1:
+                print(
+                    f"No GGUF is named for :{variant} alone; using {matches[0]}, "
+                    f"the only one whose name ends in -{variant}.",
+                    flush=True,
+                )
     if len(matches) != 1:
         listed = ", ".join(candidates) or "none"
         raise models.ModelError(
