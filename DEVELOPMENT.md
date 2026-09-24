@@ -418,8 +418,8 @@ and lists every unsupported tensor in one error:
 
 - linears and experts: Q4_K, Q5_K, Q6_K, Q3_K, IQ4_XS, IQ4_NL, Q8_0 or IQ3_S;
 - token embeddings: Q4_K, Q6_K or Q8_0;
-- norms, the MoE router and shared-expert gate, and the GDN convolution, decay
-  and time-step bias: F32;
+- norms, the MoE router and shared-expert scalar gate, and the GDN
+  convolution, decay and time-step bias: F32;
 - GDN alpha and beta: both Q8_0 or both F32.
 
 Of Unsloth's files in September 2026 that covers, for Qwen3.8-27B, UD-Q4_K_M
@@ -435,10 +435,10 @@ staging bound, splitting rows wider than it into column chunks, runs the
 and F32 sections use bounded direct copies.
 
 Every tensor keeps its stored format: the F32 norm multipliers, GDN decay, the
-MoE router and shared-expert gate, and GDN alpha/beta when a file stores them
-as F32 stay F32 and run in fp32, as llama.cpp keeps them (Apple10 prefill
-chunks multiply the router and alpha/beta on the neural accelerator as three
-bf16 parts per weight that sum to it exactly, so only fp32 accumulation
+MoE router and shared-expert scalar gate, and GDN alpha/beta when a file
+stores them as F32 stay F32 and run in fp32, as llama.cpp keeps them (Apple10
+prefill chunks multiply the router and alpha/beta on the neural accelerator as
+three bf16 parts per weight that sum to it exactly, so only fp32 accumulation
 rounds). The GDN convolution and time-step bias become bf16 under the exact
 rule.
 
