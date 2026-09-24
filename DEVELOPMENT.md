@@ -282,13 +282,13 @@ launchers configure OpenCode and Hermes without attachments.
 Source adapters write a model's target and vision tensors into prepared files
 through `PreparedWeights`: an MLX target and any vision tower into the packed
 layouts of Splash packages, which run the same kernels, and a GGUF target into
-the `MDGG0001` layout of the GGUF kernels. `AffinePreparation` writes an MLX checkpoint's
-images as `AffineTarget` plans them: codes, scales and biases are reordered
-into 256-row tiles without requantization, and GDN decay is computed as
-`float(-exp(double(A_log)))`, which may differ by one float ULP in this small
-vector from packages produced with MLX's float exponential.
-`GgufPreparation` repacks GGUF blocks ([GGUF targets](#gguf-targets)), and
-`VisionPreparation` writes the vision layout.
+the `MDGG0001` layout of the GGUF kernels. `AffinePreparation` writes an MLX
+checkpoint's images as `AffineTarget` plans them: codes, scales and biases are
+reordered into 256-row tiles without requantization, and GDN decay is computed
+as `float(-exp(double(A_log)))`, which may differ by one float ULP in this small
+vector from packages produced with MLX's float exponential. `GgufPreparation`
+repacks GGUF blocks ([GGUF targets](#gguf-targets)), and `VisionPreparation`
+writes the vision layout.
 
 Preparation never rounds a weight. A tensor it converts to BF16 (vision tensors
 stored as F32 or F16, a GGUF's convolution taps and time-step bias) must be
@@ -317,9 +317,10 @@ tests on any change of prepared bytes: `GOLDEN` in
 `run_vision_preparation.py`, and `kGoldenImages` in `gguf_repack_test.mm`.
 For an intended byte change:
 
-1. Make the change in a file listed for the adapter in `INPUTS`, or add the
-   file there; either changes the identity, so cached files of the old bytes
-   are never served.
+1. Make sure the change reaches the key, so cached files of the old bytes are
+   never served: an edit to a file listed for the adapter in `INPUTS` changes
+   its identity, and a changed plan changes the key that records it. A byte
+   change from any other file needs that file added to `INPUTS`.
 2. Run `make test-engine-cpu test-engine-metal`, and replace the golden hashes
    with the ones the failing checks print.
 
@@ -646,7 +647,7 @@ Prompts that exceed the context limit are rejected, not truncated.
 
 System One validation uses 422 `detail` arrays; successful responses contain
 `model`, `answers`, and `usage`, plus an `x-typesafe-request-id` header. SDK model
-discovery reports an empty `release_date` because packages do not record one.
+discovery reports an empty `release_date` because Splash records none for a model.
 The official SDK is a client only, not a server dependency. API compatibility does
 not imply Jev weights, accuracy, proprietary confidence semantics or calibration.
 
