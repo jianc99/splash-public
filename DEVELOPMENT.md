@@ -314,7 +314,7 @@ repacks GGUF blocks ([GGUF targets](#gguf-targets)).
 Preparation never rounds a weight. A tensor it converts to BF16 (vision tensors
 stored as F32 or F16, a GGUF's convolution taps and time-step bias) must be
 exactly representable in BF16; otherwise preparation fails, naming the tensor
-and file.
+and, for a vision tensor, its file.
 
 The cache is `~/Library/Caches/Splash/weights`, or the directory
 `SPLASH_WEIGHT_CACHE` names; nothing else selects it. It holds an additional
@@ -333,18 +333,11 @@ template, a safetensors header), `config.json` or files the component does not
 read keeps every key. The preparation identity is a build-generated fingerprint
 of only the code that writes the bytes, the files listed per adapter in
 `INPUTS` of `dev/tools/weight_preparation_identity.py`; inference, parser,
-planner and reader changes keep it. Golden hashes of prepared fixtures fail the
-tests on any change of prepared bytes: `GOLDEN` in
-`dev/tests/engine/run_affine_preparation.py` and
-`run_vision_preparation.py`, and `kGoldenImages` in `gguf_repack_test.mm`.
-For an intended byte change:
-
-1. Make sure the change reaches the key, so cached files of the old bytes are
-   never served: an edit to a file listed for the adapter in `INPUTS` changes
-   its identity, and a changed plan changes the key that records it. A byte
-   change from any other file needs that file added to `INPUTS`.
-2. Run `make test-engine-cpu test-engine-metal`, and replace the golden hashes
-   with the ones the failing checks print.
+planner and reader changes keep it. The hashes of the images prepared from the
+test fixtures, in `dev/tests/fixtures/weight-goldens/goldens.json`, fail the
+tests on any change of prepared bytes. Its README gives the procedure for an
+intended change: the key the new bytes need, and the order in which the
+independent layout oracles and the hashes are updated.
 
 Each entry records in `source` its component (such as `target/layer-0.bin`),
 the digest of the source data it was written from and the source path.
@@ -448,14 +441,18 @@ are in `runtime/metal/abi/Gguf.h` and `MoE.h`, the image formats in
 `runtime/metal/abi/QuantFormat.h`, their decoding in `runtime/metal/kernels/common/quant_formats.h`;
 weight preparation's repack ABI is `runtime/metal/abi/GgufRepack.h`.
 
-The tests' CPU reference (`dev/tests/engine/GgufFormatReference.hpp`) must reproduce checked-in
-hashes of upstream GGML's dequantization (llama.cpp 7ab4ee7) in `make test-engine-cpu`, which
-also checks the planner's plans; `make test-engine-metal` checks every format's planes, as the
-production executor and its `gguf_repack` kernel prepare them, bitwise against it, the prepared
-alpha/beta, norm, convolution and router bytes, golden hashes of prepared images, the projection
-kernels (`gguf-projection full`) and the MoE layer in every format (`gguf-moe`) against fp64.
-With `SPLASH_GGML_ORACLE=<libggml-base.dylib>` the reference is also compared with GGML directly
-and `gguf-repack --cpu` prints GGML's hashes.
+The tests' CPU reference (`dev/tests/engine/GgufFormatReference.hpp`) must reproduce the golden
+hashes of upstream GGML's dequantization (llama.cpp 7ab4ee7) in `gguf-reference`, and
+`gguf-planner` checks the planner's plans; both run in `make test-engine-cpu`.
+`make test-engine-metal` runs `gguf-preparation`, which checks every format's planes, as the
+production executor and its `gguf_repack` kernel prepare them, bitwise against the reference,
+the prepared alpha/beta, norm, convolution and router bytes and the golden images; then
+`gguf-projection dequant`, the shipped dequantizer, built with the production Metal flags,
+against the FP16 rounding of the reference's values, and the projection kernels
+(`gguf-projection full`) and the MoE layer in every format (`gguf-moe`) against fp64. The
+goldens and how to regenerate them are in `dev/tests/fixtures/weight-goldens/`; with
+`SPLASH_GGML_ORACLE=<libggml-base.dylib>`, `gguf-reference` also compares the reference with
+GGML directly and prints GGML's hashes.
 
 ## Legacy Splash packages
 
