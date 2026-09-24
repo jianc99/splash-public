@@ -43,7 +43,7 @@ std::optional<LinearSimdgroups> fixedSimdgroups(LinearTile tile) noexcept {
   case LinearTile::N256:
   case LinearTile::Paired128:
   case LinearTile::GgufStaged:
-  case LinearTile::GgufSimdgroup: return std::nullopt;
+  case LinearTile::GgufRegister: return std::nullopt;
   }
   return std::nullopt;
 }
@@ -125,7 +125,7 @@ uint32_t LinearPlan::tileColumns() const noexcept {
   case LinearTile::Split32: return 32;
   case LinearTile::Split64:
   case LinearTile::GgufStaged:
-  case LinearTile::GgufSimdgroup: return 64;
+  case LinearTile::GgufRegister: return 64;
   case LinearTile::N256:
   case LinearTile::Paired256: return 256;
   case LinearTile::N128:
@@ -138,13 +138,13 @@ uint32_t LinearPlan::threadsPerThreadgroup() const noexcept {
 }
 uint32_t LinearPlan::partialSums() const noexcept {
   if (usesSimdgroup() || config_.tile == LinearTile::GgufStaged ||
-      config_.tile == LinearTile::GgufSimdgroup)
+      config_.tile == LinearTile::GgufRegister)
     return config_.splits;
   return splitTile(config_.tile) ? kSplitPartitions : 1;
 }
 bool LinearPlan::usesSimdgroup() const noexcept { return config_.tile == LinearTile::Simdgroup; }
 LinearInput LinearPlan::input() const noexcept {
-  if (config_.tile == LinearTile::GgufSimdgroup) return LinearInput::Table16;
+  if (config_.tile == LinearTile::GgufRegister) return LinearInput::Table16;
   return usesSimdgroup() ? LinearInput::Table64 : LinearInput::Plain;
 }
 LinearScratchSize LinearPlan::scratchSize() const noexcept {
@@ -179,7 +179,7 @@ uint64_t LinearPlan::downSumsBytes() const noexcept {
 LinearPlan::LinearPlan(LinearWorkload w, LinearConfig config)
     : workload_(w), config_(config) {
   validate(w);
-  const bool ggufTile = config.tile == LinearTile::GgufStaged || config.tile == LinearTile::GgufSimdgroup;
+  const bool ggufTile = config.tile == LinearTile::GgufStaged || config.tile == LinearTile::GgufRegister;
   if (ggufTile != (w.weightLayout == WeightLayout::Block32))
     throw std::invalid_argument("block projections run the GGUF tiles, affine ones the Q4 tiles");
   if (ggufTile) {

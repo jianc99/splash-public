@@ -49,11 +49,11 @@ enum class LinearEpilogue : uint8_t { None, Residual, GateUp, UpWithGate };
 // GgufStaged dequantizes GGUF weights per simdgroup into threadgroup memory
 // for matmul2d: 64 columns per decode threadgroup (two simdgroups) of 8, 16
 // or 32 rows with optional K splits; prefill runs 128-row tiles, or the
-// decode tiles for chunks of up to 32 rows. GgufSimdgroup is the GGUF
-// register kernel on bf16 8x8 matrix operations (Apple9): 64 columns per
+// decode tiles for chunks of up to 32 rows. GgufRegister is the exact
+// register tile on bf16 8x8 matrix operations (Apple9): 64 columns per
 // threadgroup, every request lane in one threadgroup, optional K splits.
 enum class LinearTile : uint8_t {
-  N128, N256, Paired128, Split32, Split64, Paired256, Simdgroup, GgufStaged, GgufSimdgroup
+  N128, N256, Paired128, Split32, Split64, Paired256, Simdgroup, GgufStaged, GgufRegister
 };
 enum class LinearSimdgroups : uint8_t { Two = 2, Four = 4, Eight = 8 };
 
@@ -281,9 +281,9 @@ private:
   void addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &buffers,
                      const Projection &projection, const LinearPlan &plan,
                      const Projection *gate) const;
-  void addGgufSimdgroup(metal::CommandGraph &graph, const LinearBuffers &buffers,
-                        const Projection &projection, const LinearPlan &plan,
-                        const Projection *gate) const;
+  void addGgufRegister(metal::CommandGraph &graph, const LinearBuffers &buffers,
+                       const Projection &projection, const LinearPlan &plan,
+                       const Projection *gate) const;
   void addGgufFloatSegments(metal::CommandGraph &graph, const LinearBuffers &buffers,
                             const Projection &projection, const LinearPlan &plan) const;
   uint32_t appleGpuFamily_ = 0;

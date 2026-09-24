@@ -121,7 +121,7 @@ std::string_view name(LinearTile tile) {
     ENUMERATOR_NAME(LinearTile::Paired256);
     ENUMERATOR_NAME(LinearTile::Simdgroup);
     ENUMERATOR_NAME(LinearTile::GgufStaged);
-    ENUMERATOR_NAME(LinearTile::GgufSimdgroup);
+    ENUMERATOR_NAME(LinearTile::GgufRegister);
   }
   unnamed();
 }

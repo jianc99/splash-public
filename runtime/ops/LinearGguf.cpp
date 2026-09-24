@@ -73,7 +73,7 @@ uint32_t decodeSplits(uint32_t n, uint32_t k, uint32_t cores, std::span<const Sp
 // 10-80 cores emulated by width, the decode step's projections run 0.95%
 // slower than the fastest split of each shape on average and 2.3% at worst
 // (sixteen threadgroups per core with two units per partition: 2.8%, 7.8%).
-constexpr SplitTier kSimdgroupTiers[] = {{4, 256}, {32, 1024}};
+constexpr SplitTier kRegisterTiers[] = {{4, 256}, {32, 1024}};
 
 // Staged tile (64 threads): one fitted tier, six threadgroups per core with
 // 512 inputs per partition. Six is not a residency (12-17 of these
@@ -162,7 +162,7 @@ void addDecodeTensor(const LinearBuffers &b, LinearEpilogue epilogue, const Quan
 void LinearPlan::requireBlockConfiguration() const {
   const auto [n, k] = workload_.matrix;
   const LinearConfig &c = config_;
-  if (c.tile == LinearTile::GgufSimdgroup) {
+  if (c.tile == LinearTile::GgufRegister) {
     // Split boundaries fall on 256-input coefficient units.
     if (workload_.phase != LinearPhase::Decode || c.groups != n / tileColumns() ||
         c.simdgroups != LinearSimdgroups::Four || !c.validSplits() || k / 256 < c.splits)
@@ -183,7 +183,7 @@ void LinearPlan::requireBlockConfiguration() const {
 }
 
 uint32_t LinearPlan::blockStorageRows() const noexcept {
-  if (config_.tile == LinearTile::GgufSimdgroup) return workload_.rows;
+  if (config_.tile == LinearTile::GgufRegister) return workload_.rows;
   return config_.simdgroups == LinearSimdgroups::Four
       ? (workload_.rows + kPrefillTileRows - 1) / kPrefillTileRows * kPrefillTileRows
       : stagedTileRows(workload_.rows);
@@ -194,7 +194,7 @@ LinearScratchSize LinearPlan::blockScratchSize() const noexcept {
   // Register tile: the Table16 table and sums (3 K / 4 fp32 per eight rows),
   // [lane][split][row][column] partials and one counter per 64-column tile,
   // which covers every lane. Every binding exists even without splits.
-  if (config_.tile == LinearTile::GgufSimdgroup) {
+  if (config_.tile == LinearTile::GgufRegister) {
     const uint64_t rows = workload_.rows;
     return {tableBytes(k, rows), tableSumsBytes(LinearInput::Table16, k, rows),
             config_.splits > 1 ? config_.splits * rows * n * sizeof(float) : sizeof(float),
@@ -237,8 +237,8 @@ LinearConfig Linear::ggufBaseline(LinearWorkload w) const {
   // Apple9 runs matrix operations on the FP32 pipe, so the exact register
   // kernel beats staging.
   if (appleGpuFamily_ == 9)
-    return {LinearTile::GgufSimdgroup, n / kDecodeTileColumns, LinearSimdgroups::Four,
-            decodeSplits(n, k, gpuCores_, kSimdgroupTiers)};
+    return {LinearTile::GgufRegister, n / kDecodeTileColumns, LinearSimdgroups::Four,
+            decodeSplits(n, k, gpuCores_, kRegisterTiers)};
   return {LinearTile::GgufStaged, n / kDecodeTileColumns, LinearSimdgroups::Two,
           decodeSplits(n, k, gpuCores_, kStagedTiers)};
 }
@@ -261,8 +261,8 @@ void Linear::addGguf(metal::CommandGraph &graph, const LinearBuffers &b,
       addGguf(graph, b, Projection(p.outputSize, p.inputSize, std::move(weights)), plan, gate, stats);
     return;
   }
-  if (config.tile == LinearTile::GgufSimdgroup) {
-    addGgufSimdgroup(graph, b, p, plan, gate);
+  if (config.tile == LinearTile::GgufRegister) {
+    addGgufRegister(graph, b, p, plan, gate);
   } else if (config.simdgroups == LinearSimdgroups::Two) {
     addGgufStaged(graph, b, p, plan, gate);
   } else {
@@ -340,9 +340,9 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
 // fused projections (qkv|z|ab, q|k|v) run every segment in one dispatch.
 // Gate/up runs as a gate pass into the gate scratch and an up pass whose
 // epilogue applies silu(gate) to the bf16 up value, as the fused kernels do.
-void Linear::addGgufSimdgroup(metal::CommandGraph &graph, const LinearBuffers &b,
-                                const Projection &p, const LinearPlan &plan,
-                                const Projection *gate) const {
+void Linear::addGgufRegister(metal::CommandGraph &graph, const LinearBuffers &b,
+                             const Projection &p, const LinearPlan &plan,
+                             const Projection *gate) const {
   const LinearWorkload w = plan.workload();
   const LinearConfig config = plan.configuration();
   const auto [n, k] = w.matrix;

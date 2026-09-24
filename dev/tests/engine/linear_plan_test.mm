@@ -885,7 +885,7 @@ void ggufPlans() {
     apple9.gpuCoreCount = cores;
     const LinearPlan plan = Linear(apple9).plan({{n, k}, rows, LinearPhase::Decode, epilogue},
                                                   projection(n, k, segments));
-    require(plan.configuration().tile == LinearTile::GgufSimdgroup &&
+    require(plan.configuration().tile == LinearTile::GgufRegister &&
                 plan.configuration().groups == n / 64 &&
                 plan.configuration().simdgroups == LinearSimdgroups::Four &&
                 plan.input() == LinearInput::Table16,
@@ -944,19 +944,19 @@ void ggufPlans() {
   registerDown.weightLayout = WeightLayout::Block32;
   require(m3.decodeScratchSize(registerDown).partials == uint64_t{8} * 8 * 5120 * 4,
           "Apple9 GGUF decode scratch bound");
-  for (const LinearConfig config : {LinearConfig{LinearTile::GgufSimdgroup, 80, LinearSimdgroups::Four, 3},
-                                    LinearConfig{LinearTile::GgufSimdgroup, 80, LinearSimdgroups::Four, 16},
-                                    LinearConfig{LinearTile::GgufSimdgroup, 40, LinearSimdgroups::Four, 8},
-                                    LinearConfig{LinearTile::GgufSimdgroup, 80, LinearSimdgroups::Two, 8}})
+  for (const LinearConfig config : {LinearConfig{LinearTile::GgufRegister, 80, LinearSimdgroups::Four, 3},
+                                    LinearConfig{LinearTile::GgufRegister, 80, LinearSimdgroups::Four, 16},
+                                    LinearConfig{LinearTile::GgufRegister, 40, LinearSimdgroups::Four, 8},
+                                    LinearConfig{LinearTile::GgufRegister, 80, LinearSimdgroups::Two, 8}})
     rejects([&] { (void)Linear::plan(registerDown, config); });
   // Split boundaries fall on 256-input units, and prefill has no register tile.
   rejects([&] {
     (void)Linear::plan({{5120, 512}, 8, LinearPhase::Decode, LinearEpilogue::None, WeightLayout::Block32},
-                         {LinearTile::GgufSimdgroup, 80, LinearSimdgroups::Four, 4});
+                         {LinearTile::GgufRegister, 80, LinearSimdgroups::Four, 4});
   });
   rejects([&] {
     (void)Linear::plan({{5120, 17408}, 128, LinearPhase::Prefill, LinearEpilogue::None, WeightLayout::Block32},
-                         {LinearTile::GgufSimdgroup, 0, LinearSimdgroups::Four, 1});
+                         {LinearTile::GgufRegister, 0, LinearSimdgroups::Four, 1});
   });
 }
 
@@ -1011,7 +1011,7 @@ void ggufCoreLaws() {
               }
               const uint32_t s = c.splits;
               const bool staged = c.tile == LinearTile::GgufStaged;
-              require(c.tile == (family == 9 ? LinearTile::GgufSimdgroup : LinearTile::GgufStaged) &&
+              require(c.tile == (family == 9 ? LinearTile::GgufRegister : LinearTile::GgufStaged) &&
                           c.groups == n / 64 && s >= 1 && s <= 8 && (s & (s - 1)) == 0,
                       "GGUF decode plan tile or split count");
               require(s == 1 || (staged ? k / s >= 512 && (k / 32) % s == 0 : k / 256 / s >= 1),
