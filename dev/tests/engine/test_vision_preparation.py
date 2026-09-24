@@ -2,6 +2,7 @@
 serialized packed file; check the exact-BF16 rule, the MLX cache identity and
 that invalid sources fail with their message and publish nothing."""
 
+import hashlib
 import json
 import math
 import os
@@ -16,6 +17,11 @@ DTYPES = ("BF16", "F16", "F32")
 GGML_TYPES = {"F32": 0, "F16": 1, "Q4_0": 2, "BF16": 30}
 VISION_SHARD = "model-00001-of-00002.safetensors"
 TEXT_SHARD = "model-00002-of-00002.safetensors"
+# SHA-256 of the file every fixture below prepares: the values do not depend
+# on the source format or the dtypes. A change means the prepared bytes
+# changed: that needs a new preparation identity, so cached files of the old
+# layout are never served.
+GOLDEN = "f1a165335c42384479f73d83e69146cfa46d4964d66ed13c663b158fed08cdd5"
 
 
 def encode(values, dtype):
@@ -256,6 +262,9 @@ def main():
                 fixture(directory, source, shift)
                 result = prepare(binary, directory, source, "cold")
                 assert result.returncode == 0, (source, shift, result.stderr)
+                path = Path(result.stdout.split()[0])
+                digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                assert digest == GOLDEN, (source, shift, digest)
             patch = (
                 "vision_tower.patch_embed.proj.weight" if mlx else "v.patch_embd.weight"
             )

@@ -1,4 +1,5 @@
-"""Small standalone affine checkpoint and an independent byte-layout oracle."""
+"""Small standalone affine checkpoints, an independent byte-layout oracle and
+golden hashes of the prepared images."""
 
 import argparse
 import json
@@ -10,23 +11,46 @@ from pathlib import Path
 
 ALIGN = 16384
 
+# SHA-256 of every prepared image of the two fixtures. A change means the
+# prepared bytes changed: that needs a new preparation identity, so cached
+# images of the old layout are never served.
+GOLDEN = {
+    "dense": {
+        "target/layer-0.bin": "475768a2f36a25870f844e3c99d5cd1b85c00c8c3569f3f0abc3a1bffc14fd0b",
+        "target/layer-1.bin": "228844988bdd3ecf8cd32395b2a1fd3820f4bd7f91c68683f5b633e1c1919d1f",
+        "target/head.bin": "3dde9dffefd58b1b0bb06e445b4347eb2cf5412b203f1b2f6ebe00d681dc1c8f",
+        "target/embedding.bin": "5bfea1223081c0b006d617ee0fc044517937a4cd9fe9503421537e8d8c459211",
+    },
+    "moe": {
+        "target/layer-0.bin": "5b9926e5cbd89f8c772ed8308abc1e4dae140a67e2c44cddbd4ce8e688dcda61",
+        "target/layer-1.bin": "76e65f55a4b9ed13103583bd44da12fe2dc4258584b82a7df3f0f7cb0aebae69",
+        "target/head.bin": "25556e9c9b5c9629e2707cd4f90f82008a722cf82a64ec0dc97665ae242aefc6",
+        "target/embedding.bin": "3623464c3b923b290f556b1a66612f9012c0e249d3d49982b13300003dd81edf",
+    },
+}
 
-def fixture(root):
+
+def fixture(root, moe=False):
     tensors = {}
+    quantization = {"bits": 4, "group_size": 64}
 
-    def add(name, shape, dtype="BF16"):
+    def add(name, shape, dtype="BF16", data=None):
         size = math.prod(shape) * {"BF16": 2, "U32": 4, "F32": 4}[dtype]
-        seed = len(tensors) + 1
-        data = bytes((i * 31 + seed * 17) % 256 for i in range(size))
-        if name.endswith("A_log"):
-            data = bytes(size)
+        if data is None:
+            # Byte i is (i * 31 + seed * 17) % 256, which repeats every 256.
+            seed = len(tensors) + 1
+            period = bytes((i * 31 + seed * 17) % 256 for i in range(256))
+            data = (period * (size // 256 + 1))[:size]
         tensors[name] = (shape, dtype, data)
         return data
 
-    def projection(name, rows, columns):
-        add(name + ".weight", [rows, columns // 8], "U32")
-        add(name + ".scales", [rows, columns // 64])
-        add(name + ".biases", [rows, columns // 64])
+    def projection(name, rows, columns, bits=4, experts=1):
+        lead = [experts] if experts > 1 else []
+        add(name + ".weight", lead + [rows, columns * bits // 32], "U32")
+        add(name + ".scales", lead + [rows, columns // 64])
+        add(name + ".biases", lead + [rows, columns // 64])
+        if bits != 4:
+            quantization[name] = {"bits": bits, "group_size": 64}
 
     def packed(parts, rows, columns):
         result = bytearray()
@@ -63,8 +87,12 @@ def fixture(root):
                 projection(name, rows, 256)
             sections.append(packed(names, 1024, 256))
             sections.append(add(g + "conv1d.weight", [512, 4, 1]))
-            add(g + "A_log", [4], "F32")
-            sections.append(struct.pack("<4f", -1, -1, -1, -1))
+            if moe:
+                # BF16 decay logarithms: 0.5, -1, 2 and 0.
+                add(g + "A_log", [4], data=bytes.fromhex("003f80bf00400000"))
+            else:
+                add(g + "A_log", [4], "F32", bytes(16))
+                sections.append(struct.pack("<4f", -1, -1, -1, -1))
             sections.append(add(g + "dt_bias", [4]))
             sections.append(add(g + "norm.weight", [64]))
             projection(g + "out_proj", 256, 256)
@@ -80,6 +108,14 @@ def fixture(root):
             projection(a + "o_proj", 256, 256)
             sections.append(packed([a + "o_proj"], 256, 256))
         sections.append(add(p + "post_attention_layernorm.weight", [256]))
+        if moe:
+            projection(p + "mlp.gate", 256, 256, bits=8)
+            for name in ("gate_proj", "up_proj", "down_proj"):
+                projection(p + "mlp.switch_mlp." + name, 256, 256, experts=256)
+            for name in ("gate_proj", "up_proj", "down_proj"):
+                projection(p + "mlp.shared_expert." + name, 256, 256)
+            projection(p + "mlp.shared_expert_gate", 1, 256, bits=8)
+            continue
         for name, rows, columns in (
             ("gate_proj", 512, 256),
             ("up_proj", 512, 256),
@@ -136,10 +172,17 @@ def fixture(root):
             "rope_type": "default",
         },
     }
+    if moe:
+        del config["intermediate_size"]
+        config |= {
+            "model_type": "qwen3_5_moe_text",
+            "num_experts": 256,
+            "num_experts_per_tok": 8,
+            "moe_intermediate_size": 256,
+            "shared_expert_intermediate_size": 256,
+        }
     (root / "config.json").write_text(
-        json.dumps(
-            {"text_config": config, "quantization": {"bits": 4, "group_size": 64}}
-        )
+        json.dumps({"text_config": config, "quantization": quantization})
     )
     header, payload = {}, bytearray()
     for name, (shape, dtype, data) in tensors.items():
@@ -155,16 +198,37 @@ def fixture(root):
     )
 
 
+def prepare(binary, metallib, root, kind):
+    command = [str(binary.resolve()), str(metallib.resolve()), str(root), kind]
+    result = subprocess.run(command, capture_output=True, text=True, check=False)
+    assert result.returncode == 0, result.stderr
+    hashes = {
+        name: digest
+        for marker, name, digest in (
+            line.split()
+            for line in result.stdout.splitlines()
+            if line.startswith("prepared ")
+        )
+    }
+    assert hashes == GOLDEN[kind], (kind, hashes)
+    print(result.stdout.splitlines()[-1])
+    return command
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", type=Path)
     parser.add_argument("metallib", type=Path)
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="splash-affine-preparation-") as directory:
-        root = Path(directory)
+        root = Path(directory) / "moe"
+        root.mkdir()
+        fixture(root, moe=True)
+        prepare(args.binary, args.metallib, root, "moe")
+        root = Path(directory) / "dense"
+        root.mkdir()
         fixture(root)
-        command = [str(args.binary.resolve()), str(args.metallib.resolve()), str(root)]
-        subprocess.run(command, check=True)
+        command = prepare(args.binary, args.metallib, root, "dense")
         # Raw checkpoints need a different normalization convention. Refuse
         # their unsanitized convolution layout before publishing any weights.
         source = root / "model.safetensors"

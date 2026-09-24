@@ -596,6 +596,179 @@ void checkMoeLayer(const char *metallib) {
   std::filesystem::remove_all(directory);
 }
 
+// F32 values in [-1, -0.5] and [0.5, 1], optionally exact bf16 values (the
+// low half of every word zero), as a bf16 checkpoint converted to F32 has.
+std::vector<uint8_t> floatValues(uint64_t count, uint32_t seed, bool bfloat16 = false) {
+  std::vector<uint8_t> bytes(count * 4);
+  for (uint64_t i = 0; i < count; ++i) {
+    uint32_t bits = 0x3F000000u | uint32_t((i * 2654435761u + seed * 40503u) & 0x7FFFFFu);
+    if ((i + seed) % 3 == 0) bits |= 0x80000000u;
+    if (bfloat16) bits &= 0xFFFF0000u;
+    std::memcpy(bytes.data() + i * 4, &bits, 4);
+  }
+  return bytes;
+}
+
+// SHA-256 of every image the loader prepares from two small GGUFs: a dense
+// qwen35 target (both layer kinds, all eight formats, permuted value-head rows,
+// Q8_0 alpha/beta, F32 norms, bf16-exact convolution and time bias, Q6_K token
+// rows) and a qwen35moe layer (F32 alpha/beta, F32 router and shared-expert
+// gate, 3-D expert tensors). A different hash means the prepared bytes
+// changed; that needs a new preparation identity, so no cache entry of the
+// old bytes is served.
+struct GoldenImage {
+  const char *model, *image, *sha256;
+};
+constexpr GoldenImage kGoldenImages[] = {
+    {"dense", "target/layer-0.bin",
+     "3cb6434604cdcae0d93b72844939421eff05f98cff74196392c2153a5c0b4ab3"},
+    {"dense", "target/layer-1.bin",
+     "f7e1f9a7dec53a1a2396898a302d39e7877ee13bcb493f7240b7c9479df91bfe"},
+    {"dense", "target/head.bin",
+     "568caf2ce1c20591bbb6da095f1e94b47f868addf0ca3865fede7bafe7486e36"},
+    {"dense", "target/embedding.bin",
+     "6d17df18962f4941a0ce6538aa0092dba1073c78848a62f577a666b81a89e159"},
+    {"moe", "target/layer-0.bin",
+     "70d9d2727f5a8883507b6f7c3680913f6f8c3c131fbb90b01bffa05e831b637e"},
+    {"moe", "target/head.bin",
+     "3f61a8a408a40624b12f9564472930c655a84cdf5e1782191990f678fe80305c"},
+    {"moe", "target/embedding.bin",
+     "86a749f41cab45849eb9a2753025779ef1c58e74842b65290534eff4e29403e9"},
+};
+
+void checkGoldenImages(splash::metal::MetalBackend &backend) {
+  namespace model = splash::model;
+  using namespace model::ggml;
+  char directory[] = "/tmp/splash-gguf-golden-XXXXXX";
+  if (!mkdtemp(directory)) {
+    check(false, "create a temporary directory");
+    return;
+  }
+  const std::filesystem::path cache(std::getenv("SPLASH_WEIGHT_CACHE"));
+  uint32_t seed = 900;
+  const auto prepared = [&](const char *name, const std::vector<Tensor> &tensors,
+                            const model::gguf::TargetGeometry &geometry) {
+    const auto path = std::filesystem::path(directory) / (std::string(name) + ".gguf");
+    const std::vector<uint8_t> file = ggufFile(tensors, geometry);
+    std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char *>(file.data()), file.size());
+    try {
+      model::GgufTargetLoader loader(backend, path, geometry);
+      const auto hash = [&](model::WeightFile weights) {
+        const auto &record = weights.record();
+        std::ifstream stream(cache / record.contentIdentity / "weights", std::ios::binary);
+        const std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(stream)), {});
+        const std::string actual = sha256(bytes.data(), bytes.size());
+        const auto golden = std::find_if(std::begin(kGoldenImages), std::end(kGoldenImages), [&](const GoldenImage &g) {
+          return name == std::string_view(g.model) && record.relativePath == g.image;
+        });
+        check(golden != std::end(kGoldenImages) && actual == golden->sha256,
+              std::string("golden prepared bytes: ") + name + " " + record.relativePath + " " + actual);
+      };
+      for (uint32_t layer = 0; layer < geometry.layers; ++layer) hash(loader.layer(layer));
+      hash(loader.head());
+      hash(loader.embedding());
+    } catch (const std::exception &error) {
+      check(false, std::string("golden prepared images: ") + name + ": " + error.what());
+    }
+  };
+  std::vector<Tensor> tensors;
+  const auto add = [&](std::string name, std::vector<uint64_t> dims, uint32_t type, std::vector<uint8_t> data = {}) {
+    if (data.empty()) {
+      const uint32_t format = gguf_format_of(type);
+      data = format == GGUF_FMT_COUNT ? floatValues(dims[0] * (dims.size() > 1 ? dims[1] : 1), ++seed)
+                                      : fixture(Fmt(format), uint32_t(dims[1] * (dims.size() > 2 ? dims[2] : 1)),
+                                                uint32_t(dims[0]), ++seed);
+    }
+    tensors.push_back({std::move(name), std::move(dims), type, std::move(data)});
+  };
+
+  model::gguf::TargetGeometry dense;
+  dense.layers = 2;
+  dense.hiddenSize = 512;
+  dense.vocabularySize = 256;
+  dense.intermediateSize = 256;
+  dense.gdnKeyHeads = 4;
+  dense.gdnValueHeads = 12;
+  dense.gdnHeadDimension = 64;
+  dense.convolutionDimension = 1280; // q and k of 4 heads, v of 12
+  dense.attentionWidth = 512;        // two query heads of 256
+  dense.attentionKvHeads = 2;
+  dense.fullAttentionPeriod = 2;     // layer 1
+  const uint32_t hidden = dense.hiddenSize, heads = dense.gdnValueHeads, head = dense.attentionHeadDimension;
+  const uint64_t valueRows = uint64_t{heads} * dense.gdnHeadDimension;
+  add("blk.0.attn_norm.weight", {hidden}, kF32);
+  add("blk.0.attn_qkv.weight", {hidden, dense.convolutionDimension}, kQ4_K);
+  add("blk.0.attn_gate.weight", {hidden, valueRows}, kQ5_K);
+  add("blk.0.ssm_beta.weight", {hidden, heads}, kQ8_0);
+  add("blk.0.ssm_alpha.weight", {hidden, heads}, kQ8_0);
+  add("blk.0.ssm_conv1d.weight", {4, dense.convolutionDimension}, kF32,
+      floatValues(uint64_t{4} * dense.convolutionDimension, ++seed, true));
+  add("blk.0.ssm_a", {heads}, kF32);
+  add("blk.0.ssm_dt.bias", {heads}, kF32, floatValues(heads, ++seed, true));
+  add("blk.0.ssm_norm.weight", {dense.gdnHeadDimension}, kF32);
+  add("blk.0.ssm_out.weight", {valueRows, hidden}, kIQ4_XS);
+  add("blk.0.post_attention_norm.weight", {hidden}, kF32);
+  add("blk.0.ffn_gate.weight", {hidden, dense.intermediateSize}, kQ3_K);
+  add("blk.0.ffn_up.weight", {hidden, dense.intermediateSize}, kIQ3_S);
+  add("blk.0.ffn_down.weight", {dense.intermediateSize, hidden}, kIQ4_NL);
+  add("blk.1.attn_norm.weight", {hidden}, kF32);
+  add("blk.1.attn_q.weight", {hidden, 2 * dense.attentionWidth}, kQ6_K);
+  add("blk.1.attn_k.weight", {hidden, dense.attentionKvHeads * head}, kQ8_0);
+  add("blk.1.attn_v.weight", {hidden, dense.attentionKvHeads * head}, kQ4_K);
+  add("blk.1.attn_q_norm.weight", {head}, kF32);
+  add("blk.1.attn_k_norm.weight", {head}, kF32);
+  add("blk.1.attn_output.weight", {dense.attentionWidth, hidden}, kQ5_K);
+  add("blk.1.post_attention_norm.weight", {hidden}, kF32);
+  add("blk.1.ffn_gate.weight", {hidden, dense.intermediateSize}, kQ4_K);
+  add("blk.1.ffn_up.weight", {hidden, dense.intermediateSize}, kQ6_K);
+  add("blk.1.ffn_down.weight", {dense.intermediateSize, hidden}, kQ8_0);
+  add("output_norm.weight", {hidden}, kF32);
+  add("output.weight", {hidden, dense.vocabularySize}, kQ6_K);
+  add("token_embd.weight", {hidden, dense.vocabularySize}, kQ6_K);
+  prepared("dense", tensors, dense);
+
+  model::gguf::TargetGeometry moe;
+  moe.layers = 1;
+  moe.hiddenSize = 512;
+  moe.vocabularySize = 256;
+  moe.intermediateSize = 0;
+  moe.gdnKeyHeads = 4;
+  moe.gdnValueHeads = 8;
+  moe.gdnHeadDimension = 64;
+  moe.convolutionDimension = 1024; // q and k of 4 heads, v of 8
+  moe.experts = 4;
+  moe.expertsPerToken = 2;
+  moe.expertIntermediateSize = 256;
+  const uint32_t experts = moe.experts, width = moe.expertIntermediateSize;
+  const uint32_t moeHeads = moe.gdnValueHeads, moeValueRows = moeHeads * moe.gdnHeadDimension;
+  tensors.clear();
+  add("output_norm.weight", {hidden}, kF32);
+  add("blk.0.attn_norm.weight", {hidden}, kF32);
+  add("blk.0.attn_qkv.weight", {hidden, moe.convolutionDimension}, kQ8_0);
+  add("blk.0.attn_gate.weight", {hidden, moeValueRows}, kQ6_K);
+  add("blk.0.ssm_beta.weight", {hidden, moeHeads}, kF32);
+  add("blk.0.ssm_alpha.weight", {hidden, moeHeads}, kF32);
+  add("blk.0.ssm_conv1d.weight", {4, moe.convolutionDimension}, kF32,
+      floatValues(uint64_t{4} * moe.convolutionDimension, ++seed, true));
+  add("blk.0.ssm_a", {moeHeads}, kF32);
+  add("blk.0.ssm_dt.bias", {moeHeads}, kF32, floatValues(moeHeads, ++seed, true));
+  add("blk.0.ssm_norm.weight", {moe.gdnHeadDimension}, kF32);
+  add("blk.0.ssm_out.weight", {moeValueRows, hidden}, kQ4_K);
+  add("blk.0.post_attention_norm.weight", {hidden}, kF32);
+  add("blk.0.ffn_gate_inp.weight", {hidden, experts}, kF32);
+  add("blk.0.ffn_gate_exps.weight", {hidden, width, experts}, kQ4_K);
+  add("blk.0.ffn_up_exps.weight", {hidden, width, experts}, kQ4_K);
+  add("blk.0.ffn_down_exps.weight", {width, hidden, experts}, kQ5_K);
+  add("blk.0.ffn_gate_shexp.weight", {hidden, width}, kQ8_0);
+  add("blk.0.ffn_up_shexp.weight", {hidden, width}, kQ8_0);
+  add("blk.0.ffn_down_shexp.weight", {width, hidden}, kQ8_0);
+  add("blk.0.ffn_gate_inp_shexp.weight", {hidden}, kF32);
+  add("output.weight", {hidden, moe.vocabularySize}, kQ6_K);
+  add("token_embd.weight", {hidden, moe.vocabularySize}, kQ8_0);
+  prepared("moe", tensors, moe);
+  std::filesystem::remove_all(directory);
+}
+
 constexpr uint64_t kSection = 16384; // image section alignment, as the planner lays out images
 constexpr uint32_t kSourceOffset = 96; // tensor data offset inside the mapped source window
 constexpr uint8_t kPoison = 0xA5;
@@ -774,6 +947,7 @@ int main(int argc, char **argv) {
       gpu.copy = pipeline(gpu.device, library, "gguf_copy");
       if (!gpu.repack || !gpu.copy) return 1;
       splash::metal::MetalBackend backend(argv[1]);
+      checkGoldenImages(backend);
       const Shape shapes[] = {{512, 1024, kNoPermute, 0, 0, 0},
                               {768, 1280, 256, 16, 8, 4},
                               {768, 8448, 128, 16, 8, 5}};
