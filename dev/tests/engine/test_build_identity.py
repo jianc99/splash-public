@@ -78,6 +78,7 @@ class BuildIdentityTests(unittest.TestCase):
         self.assertIn("runtime/metal/abi/KernelABI.h", inputs)
         self.assertIn("runtime/metal/kernels/common/paged_attention_tile.h", inputs)
         self.assertIn("dev/tools/build_identity.py", inputs)
+        self.assertIn("dev/tools/weight_preparation_identity.py", inputs)
         self.assertFalse(any(path.startswith("dev/tests/") for path in inputs))
         self.assertFalse(any(path.startswith("dev/benchmarks/") for path in inputs))
         self.assertFalse(any(path.startswith("install/models/") for path in inputs))
