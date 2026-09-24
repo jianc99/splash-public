@@ -15,7 +15,7 @@
 namespace splash::ops {
 namespace {
 
-constexpr uint32_t kPrefillRows = 32;
+constexpr uint32_t kAffinePrefillTileRows = 32;
 constexpr uint32_t kQuantGroup = 64;
 static_assert(SPLASH_TARGET_VERIFY_ROWS == 8,
               "simdgroup Q4 tiles require eight verify rows per lane");
@@ -53,22 +53,22 @@ void validate(LinearWorkload w) {
     throw std::invalid_argument("invalid linear weight layout");
   if (!w.matrix.outputSize || w.matrix.outputSize % 256 ||
       !w.matrix.inputSize || w.matrix.inputSize % kQuantGroup)
-    throw std::invalid_argument("invalid Q4 linear matrix");
+    throw std::invalid_argument("invalid linear matrix");
   if (w.phase == LinearPhase::Prefill) {
     if (!w.rows || w.rows > SPLASH_PREFILL_TOKEN_BUDGET ||
         w.epilogue == LinearEpilogue::GateUp)
-      throw std::invalid_argument("invalid Q4 prefill workload");
+      throw std::invalid_argument("invalid linear prefill workload");
   } else if (w.phase == LinearPhase::Decode) {
     if (w.matrix.inputSize % 256 || !w.rows || w.rows % SPLASH_TARGET_VERIFY_ROWS ||
         w.rows > SPLASH_TARGET_VERIFY_ROWS * SPLASH_MAXIMUM_BATCH_WIDTH ||
         w.epilogue == LinearEpilogue::UpWithGate)
-      throw std::invalid_argument("invalid Q4 decode workload");
+      throw std::invalid_argument("invalid linear decode workload");
   } else {
-    throw std::invalid_argument("invalid Q4 linear phase");
+    throw std::invalid_argument("invalid linear phase");
   }
   if (w.epilogue != LinearEpilogue::None && w.epilogue != LinearEpilogue::Residual &&
       w.epilogue != LinearEpilogue::GateUp && w.epilogue != LinearEpilogue::UpWithGate)
-    throw std::invalid_argument("invalid Q4 linear epilogue");
+    throw std::invalid_argument("invalid linear epilogue");
 }
 
 // A buffer a plan does not use needs no bytes and may be absent.
@@ -80,7 +80,7 @@ void requireBytes(const metal::MetalBuffer &buffer, uint64_t bytes, const char *
 
 LinearWorkload decode(LinearMatrix matrix, uint32_t lanes, LinearEpilogue epilogue) {
   if (!lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH)
-    throw std::invalid_argument("invalid Q4 decode batch width");
+    throw std::invalid_argument("invalid linear decode batch width");
   return {matrix, lanes * SPLASH_TARGET_VERIFY_ROWS, LinearPhase::Decode, epilogue};
 }
 
@@ -117,7 +117,7 @@ void requireAffineProjection(const Projection &p, LinearMatrix matrix) {
 uint32_t LinearPlan::storageRows() const noexcept {
   if (workload_.weightLayout == WeightLayout::Block32) return blockStorageRows();
   if (workload_.phase != LinearPhase::Prefill) return workload_.rows;
-  return ((workload_.rows + kPrefillRows - 1) / kPrefillRows) * kPrefillRows;
+  return ((workload_.rows + kAffinePrefillTileRows - 1) / kAffinePrefillTileRows) * kAffinePrefillTileRows;
 }
 uint32_t LinearPlan::tileColumns() const noexcept {
   switch (config_.tile) {
@@ -414,7 +414,7 @@ LinearConfig Linear::baseline(LinearWorkload w) const {
   if (w.phase == LinearPhase::Prefill) {
     if (appleGpuFamily_ >= 10 || gpuCores_ <= kApple9MeasuredPrefillCores)
       return {LinearTile::N128, 0, LinearSimdgroups::Four};
-    const uint32_t rowTiles = (w.rows + kPrefillRows - 1) / kPrefillRows;
+    const uint32_t rowTiles = (w.rows + kAffinePrefillTileRows - 1) / kAffinePrefillTileRows;
     const bool wide = double(rowTiles) * tiles256 >=
         kApple9WidePrefillGroupsPerCore * gpuCores_;
     return {w.epilogue == LinearEpilogue::UpWithGate || wide ? LinearTile::N256
@@ -613,7 +613,7 @@ PreparedInput Linear::add(metal::CommandGraph &graph, LinearBuffers b,
     if (w.phase == LinearPhase::Prefill)
       graph.add(std::string(name), bindings,
           Q4PrefillParams{w.matrix.outputSize, w.matrix.inputSize},
-          {selected.storageRows() / kPrefillRows, n / selected.tileColumns(), 1},
+          {selected.storageRows() / kAffinePrefillTileRows, n / selected.tileColumns(), 1},
           {selected.threadsPerThreadgroup(), 1, 1});
     else {
       const uint32_t groups = selected.configuration().groups;
@@ -653,8 +653,8 @@ PreparedInput Linear::add(metal::CommandGraph &graph, LinearBuffers b,
 void Linear::addPrefillSums(metal::CommandGraph &graph, metal::MetalBuffer input, metal::MetalBuffer sums,
                             const Projection &consumer, uint32_t rows) const {
   validate({{consumer.outputSize, consumer.inputSize}, rows, LinearPhase::Prefill});
-  const uint32_t tiles = (rows + kPrefillRows - 1) / kPrefillRows;
-  const uint64_t storageRows = uint64_t{tiles} * kPrefillRows;
+  const uint32_t tiles = (rows + kAffinePrefillTileRows - 1) / kAffinePrefillTileRows;
+  const uint64_t storageRows = uint64_t{tiles} * kAffinePrefillTileRows;
   requireBytes(input, storageRows * consumer.inputSize * 2, "input");
   requireBytes(sums, storageRows * (consumer.inputSize / kQuantGroup) * 4, "sums");
   graph.add("prefill_linear_q4_sums32", {input, sums},

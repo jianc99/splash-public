@@ -92,7 +92,7 @@ void ExecutionPlans::install(const OperatorChoices &choices) {
   for (const auto &choice : pending.moe) {
     const auto &w = choice.workload;
     if (w.shape.weightLayout == WeightLayout::Block32)
-      throw std::invalid_argument("GGUF MoE plans are not tuned");
+      throw std::invalid_argument("block MoE plans are not tuned");
     if (w.phase == MoePhase::Prefill)
       (void)MoE::prefillPlan(w.shape, w.rows, choice.configuration);
     else if (w.phase == MoePhase::Decode && w.rows && w.rows % kDecodeRows == 0)

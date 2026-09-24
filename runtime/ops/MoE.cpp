@@ -75,7 +75,7 @@ void validate(const MoeWeights &weights, MoeShape shape) {
         !matches(blocks.gate, shape.experts, intermediate, hidden) ||
         !matches(blocks.up, shape.experts, intermediate, hidden) ||
         !matches(blocks.down, shape.experts, hidden, intermediate))
-      throw std::invalid_argument("GGUF MoE weights do not match execution shape");
+      throw std::invalid_argument("block MoE weights do not match execution shape");
     return;
   }
   const AffineMoeWeights &affine = weights.affine();
@@ -261,7 +261,7 @@ MoePlan::MoePlan(MoeShape shape, uint32_t rows, MoeConfig config,
     throw std::invalid_argument("invalid MoE expert simdgroup configuration");
   if (config.ggufTile == MoeGgufTile::Register &&
       (shape.weightLayout != WeightLayout::Block32 || config.expertTile != MoeExpertTile::M8))
-    throw std::invalid_argument("the GGUF register expert tile takes GGUF 8-row tiles");
+    throw std::invalid_argument("the register expert tile takes block 8-row tiles");
   workspace_ = workspaceFor(shape, rows, tileRows(), splitExperts_, config.ggufTile);
   maximumTiles_ = moeMaximumTiles(rows, shape, tileRows());
 }

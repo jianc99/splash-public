@@ -193,8 +193,8 @@ struct LinearDispatchStats final {
   uint64_t m32Dispatches = 0;
 };
 
-// Owns Q4 pipeline selection and dispatch. Device policy uses GPU family,
-// core count and workload tile counts.
+// Owns projection pipeline selection and dispatch for both weight layouts.
+// Device policy uses GPU family, core count and workload tile counts.
 class Linear final {
 public:
   explicit Linear(const DeviceCapabilities &device) noexcept;

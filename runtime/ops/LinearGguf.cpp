@@ -377,7 +377,7 @@ void Linear::addGgufRegister(metal::CommandGraph &graph, const LinearBuffers &b,
 void Linear::addGgufFloatSegments(metal::CommandGraph &graph, const LinearBuffers &b,
                                     const Projection &p, const LinearPlan &plan) const {
   const LinearWorkload w = plan.workload();
-  if (w.epilogue != LinearEpilogue::None) throw std::invalid_argument("GGUF float segments take no epilogue");
+  if (w.epilogue != LinearEpilogue::None) throw std::invalid_argument("float segments take no epilogue");
   for (const QuantizedSegment &s : p.blocks().segments)
     if (s.isFloat())
       addGgufFloat(graph, b.input, s, b.output, w.rows, w.matrix.outputSize, s.columnOffset, FloatOutput::BFloat16,
@@ -415,7 +415,7 @@ void addGgufFloat(metal::CommandGraph &graph, metal::MetalBuffer input, const Qu
       (accelerator && (rows < 16 || k % 32)) || weights.plane0.sizeBytes() < uint64_t{n} * k * sizeof(float) ||
       input.sizeBytes() < uint64_t{rows} * k * 2 ||
       output.sizeBytes() < (uint64_t{rows - 1} * outStride + outOffset + n) * element)
-    throw std::invalid_argument("invalid GGUF float projection");
+    throw std::invalid_argument("invalid float projection");
   const std::string kernel = std::string(accelerator ? "gguf_float_na_" : "gguf_float_") +
                              (type == FloatOutput::Float32 ? "f32" : "bf16");
   const metal::DispatchSize grid = accelerator ? metal::DispatchSize{(n + 31) / 32, (rows + 63) / 64, 1}
