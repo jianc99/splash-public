@@ -514,6 +514,9 @@ void runDecode(MetalBackend &backend, const GdnShape &shape, uint32_t lanes,
     for (uint32_t layer = 0; layer < kLayers; ++layer)
       checkDecode(fixture, layer, lane);
   }
+  // The commit reads no norm weights; the bf16 pass covers it.
+  if (float32)
+    return;
 
   // The commit replays the retained rows from the incoming cell over the
   // decoded q/k/v and gates; eight retained rows leave the decoded cell.
