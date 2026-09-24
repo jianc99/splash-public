@@ -18,9 +18,13 @@ marker. The outcome is one of:
   renders it with the template's own system block. The patch is kept only if
   ordinary conversations still render byte-identically and the canary renders
   in place.
-- ``unsupported``: no such construct, or the patched template failed a probe.
-  Requests with a later system message are rejected instead of dropped.
+- ``unsupported``: the template renders the message out of place, has no
+  single such construct, renders something before its system block (such as
+  a BOS token), or its patch failed a probe. A request with a later system
+  message fails with a 400 instead of losing it.
 
+Requests and the probe share the reasoning efforts, template options and
+alias retry defined here, so the probe renders exactly as requests do.
 Tokenizer files and the tokenizer object are never modified.
 """
 
