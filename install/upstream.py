@@ -143,14 +143,16 @@ def select_gguf(files, variant):
 
 
 def select_vision(files):
-    for dtype in ("BF16", "F32", "F16"):
+    # The tower runs in BF16 and preparation never rounds a weight. F16 has a
+    # narrower exponent than BF16, so an F16 projector has rounded small weights.
+    for dtype in ("BF16", "F32"):
         name = f"mmproj-{dtype}.gguf"
         matches = [n for n in files if n.lower() == name.lower()]
         if len(matches) == 1:
             return matches[0]
     raise models.ModelError(
-        "the GGUF repository has no mmproj-BF16/F32/F16.gguf vision projector; "
-        "use --language-only to serve text only"
+        "the GGUF repository has no mmproj-BF16.gguf or mmproj-F32.gguf vision "
+        "projector; use --language-only to serve text only"
     )
 
 
@@ -253,7 +255,10 @@ class Target:
     format: str
     config: dict
     weights: set[str]
-    vision: str | None = None
+    # Assembly path -> repository file for the vision tower: the GGUF mmproj,
+    # or MLX config.json and the shards holding vision_tower.*; empty without
+    # vision.
+    vision: dict[str, str] = field(default_factory=dict)
     # MLX: assembly path -> repository file for configuration, tokenizer and
     # processor. A GGUF describes these itself (gguf.tokenizer_files).
     metadata: dict[str, str] = field(default_factory=dict)
@@ -272,7 +277,9 @@ def _target(repo, variant, language_only):
                 vision_header = gguf.Metadata(stream)
         config = gguf.model_config(header, vision_header)
         print(f"Selected {name} from {repo.name}.", flush=True)
-        return Target("gguf", config, {name}, vision)
+        return Target(
+            "gguf", config, {name}, {"vision/mmproj.gguf": vision} if vision else {}
+        )
     required = {"config.json", "tokenizer.json", "tokenizer_config.json"}
     if not language_only:
         required.add("preprocessor_config.json")
@@ -294,15 +301,24 @@ def _target(repo, variant, language_only):
         )
     metadata = {"config.json": "config.json"}
     metadata.update({"tokenizer/" + n: n for n in TOKENIZER_FILES if n in repo.files})
+    vision = {}
     if not language_only:
         _validate_processor(models.read_json(repo.file("preprocessor_config.json")))
         metadata.update(
             {"processor/" + n: n for n in PROCESSOR_FILES if n in repo.files}
         )
-    return Target("mlx-affine", config, _weight_files(repo), metadata=metadata)
+        shards = _weight_files(repo, "vision_tower.")
+        if not shards:
+            raise models.ModelError(
+                f"{repo.name} has no vision tower; use --language-only to serve text only"
+            )
+        vision = {"vision/config.json": "config.json"}
+        vision.update({"vision/" + n: n for n in shards})
+    return Target("mlx-affine", config, _weight_files(repo), vision, metadata)
 
 
-def _weight_files(repo):
+def _weight_files(repo, prefix=""):
+    """The checkpoint's shards holding a tensor whose name starts with prefix."""
     if "model.safetensors.index.json" in repo.files:
         index = models.read_json(repo.file("model.safetensors.index.json"))
         weights = index.get("weight_map")
@@ -310,7 +326,7 @@ def _weight_files(repo):
             raise models.ModelError("invalid safetensors shard index")
         if not all(isinstance(name, str) for name in weights.values()):
             raise models.ModelError("invalid safetensors shard filename")
-        names = set(weights.values())
+        names = {file for tensor, file in weights.items() if tensor.startswith(prefix)}
     elif "model.safetensors" in repo.files:
         names = {"model.safetensors"}
     else:
@@ -424,26 +440,21 @@ def prepare(args, repo=None):
         f"vision {'disabled' if language_only else 'enabled'}.",
         flush=True,
     )
-    wanted = target.weights | set(target.metadata.values())
-    if target.vision:
-        wanted.add(target.vision)
-    sources = repo.download(wanted)
-    files = {name: sources[source] for name, source in target.metadata.items()}
+    components = target.metadata | target.vision
+    sources = repo.download(target.weights | set(components.values()))
+    files = {name: sources[source] for name, source in components.items()}
     for name in sorted(target.weights):
         files["target/" + Path(name).name] = sources[name]
     if target.format == "gguf":
-        vision = sources[target.vision] if target.vision else None
-        if vision:
-            files["vision/mmproj.gguf"] = vision
         files.update(
-            _gguf_metadata(models_root, sources[next(iter(target.weights))], vision)
+            _gguf_metadata(
+                models_root,
+                sources[next(iter(target.weights))],
+                files.get("vision/mmproj.gguf"),
+            )
         )
     else:
         files["target/config.json"] = files["config.json"]
-        if not language_only:
-            files["vision/config.json"] = files["config.json"]
-            for name in target.weights:
-                files["vision/" + name] = sources[name]
     files["tokenizer/config.json"] = files["config.json"]
     drafts = draft.download(draft_names)
     for name, path in drafts.items():

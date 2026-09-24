@@ -124,8 +124,17 @@ class UpstreamTest(unittest.TestCase):
                 self.assertRaisesRegex(models.ModelError, "Qwen3.8-27B-Q8_0.gguf"),
             ):
                 upstream.select_gguf(files, variant)
-        with self.assertRaisesRegex(models.ModelError, "--language-only"):
-            upstream.select_vision({"mmproj-Q8_0.gguf"})
+        self.assertEqual(
+            upstream.select_vision({"mmproj-F16.gguf", "mmproj-F32.gguf"}),
+            "mmproj-F32.gguf",
+        )
+        # F16 has already rounded small weights of the BF16 tower.
+        for projectors in ({"mmproj-Q8_0.gguf"}, {"mmproj-F16.gguf"}):
+            with (
+                self.subTest(projectors=projectors),
+                self.assertRaisesRegex(models.ModelError, "--language-only"),
+            ):
+                upstream.select_vision(projectors)
 
     def test_architecture_is_checked_before_weight_downloads(self):
         target = mlx_target(
@@ -195,6 +204,58 @@ class UpstreamTest(unittest.TestCase):
         (target / "tokenizer.json").write_text("changed size")
         with self.assertRaises(models.ModelError):
             upstream.verify(installed)
+
+    def test_mlx_vision_links_only_the_shards_holding_the_tower(self):
+        target = mlx_target(self.root / "target", DENSE)
+        (target / "model.safetensors").unlink()
+        shards = {
+            "vision_tower.blocks.0.attn.qkv.weight": "model-00001-of-00002.safetensors",
+            "language_model.model.embed_tokens.weight": "model-00001-of-00002.safetensors",
+            "language_model.lm_head.weight": "model-00002-of-00002.safetensors",
+        }
+        (target / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": shards})
+        )
+        for name in set(shards.values()):
+            (target / name).write_text(name)
+        (target / "preprocessor_config.json").write_text(
+            json.dumps(
+                {
+                    "patch_size": 16,
+                    "temporal_patch_size": 2,
+                    "merge_size": 2,
+                    "image_mean": [0.5] * 3,
+                    "image_std": [0.5] * 3,
+                }
+            )
+        )
+        source = upstream.Repository(target)
+        draft = upstream.Repository(draft_dir(self.root / "draft", DENSE))
+        args = arguments(
+            self.root, "mlx-community/Qwen3.8-27B-4bit", language_only=False
+        )
+        with mock.patch.object(upstream, "Repository", return_value=draft):
+            self.assertTrue(upstream.prepare(args, repo=source))
+        installed = models.installed_root(args.models, args.model)
+        self.assertEqual(upstream.verify(installed)["vision_format"], "safetensors")
+        self.assertEqual(
+            sorted(p.name for p in (installed / "vision").iterdir()),
+            ["config.json", "model-00001-of-00002.safetensors"],
+        )
+        self.assertEqual(
+            sorted(p.name for p in (installed / "target").iterdir()),
+            ["config.json", *sorted(set(shards.values()))],
+        )
+        # A checkpoint without the tower cannot serve images.
+        del shards["vision_tower.blocks.0.attn.qkv.weight"]
+        (target / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": shards})
+        )
+        with self.assertRaisesRegex(models.ModelError, "no vision tower"):
+            upstream.prepare(
+                arguments(self.root, "someone/text-model", language_only=False),
+                repo=upstream.Repository(target),
+            )
 
     def test_installed_model_starts_without_the_hub(self):
         source = upstream.Repository(mlx_target(self.root / "target", DENSE))
