@@ -202,10 +202,10 @@ class ModelArtifactTest(unittest.TestCase):
         with self.assertRaises(argparse.ArgumentTypeError):
             installer.parse_model_id("short-name")
 
-    def test_prepare_also_validates_direct_call_before_creating_paths(self):
+    def test_a_selection_validates_its_model_before_creating_paths(self):
         models = self.root / "uncreated"
         with self.assertRaises(installer.ModelError):
-            legacy.prepare(installer.Selection.of(models, "../outside"))
+            installer.Selection.of(models, "../outside")
         self.assertFalse(models.exists())
 
     def test_quick_and_full_verification(self):
