@@ -10,7 +10,6 @@ import random
 import signal
 import socket
 import struct
-import tempfile
 import threading
 import time
 import unittest
@@ -523,6 +522,35 @@ class FakeConstraintFactory:
 
     def stats(self):
         return {}
+
+
+def main_args(**overrides):
+    """Parsed command-line arguments for main() tests."""
+    return SimpleNamespace(
+        **{
+            "target": "target",
+            "draft": "draft",
+            "tokenizer": "tokenizer",
+            "model": "test-model",
+            "served_model_name": [],
+            "default_reasoning_effort": None,
+            "max_context": None,
+            "max_memory": None,
+            "max_image_pixels": api.image_input.MAX_PIXELS,
+            "max_new_tokens": 16,
+            "request_timeout": 2,
+            "queue_size": 1,
+            "host": "127.0.0.1",
+            "allowed_host": [],
+            "api_key": None,
+            "no_webui": False,
+            "max_request_size": api.DEFAULT_MAX_REQUEST_BYTES,
+            "port": 0,
+            "binary": "splash",
+            "kv_format": "int8",
+            **overrides,
+        }
+    )
 
 
 class Harness:
@@ -3383,28 +3411,7 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(response["created_at"], 123)
 
     def test_sigterm_uses_the_normal_main_cleanup_path(self):
-        args = SimpleNamespace(
-            target="target",
-            served_model_name=[],
-            default_reasoning_effort=None,
-            draft="draft",
-            tokenizer="tokenizer",
-            model="test-model",
-            max_context=None,
-            max_memory=None,
-            max_image_pixels=api.image_input.MAX_PIXELS,
-            max_new_tokens=16,
-            request_timeout=2,
-            queue_size=1,
-            host="127.0.0.1",
-            allowed_host=[],
-            api_key=None,
-            no_webui=False,
-            max_request_size=api.DEFAULT_MAX_REQUEST_BYTES,
-            port=0,
-            binary="splash",
-            kv_format="int8",
-        )
+        args = main_args()
         runtime = mock.Mock()
         runtime.readiness = native_wire.ReadyEvent(
             engine_instance_id=1,
@@ -3486,111 +3493,65 @@ class ServerTest(unittest.TestCase):
         server.server_activate.assert_called_once_with()
         self.assertEqual(order, ["bind", "runtime"])
 
-    def test_main_takes_vision_from_ready_not_the_model_record(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            (root / "target").mkdir()
-            # A stale record must not decide; only the native engine knows.
-            (root / "model.json").write_text('{"vision_format": "none"}')
-            args = SimpleNamespace(
-                target=str(root / "target"),
-                served_model_name=[],
-                default_reasoning_effort=None,
-                draft=str(root / "draft"),
-                tokenizer="tokenizer",
-                model="test-model",
-                max_context=None,
-                max_memory=None,
-                max_image_pixels=api.image_input.MAX_PIXELS,
-                max_new_tokens=16,
-                request_timeout=2,
-                queue_size=1,
-                host="127.0.0.1",
-                allowed_host=[],
-                api_key=None,
-                no_webui=False,
-                max_request_size=api.DEFAULT_MAX_REQUEST_BYTES,
-                port=0,
-                binary="splash",
-                kv_format="int8",
-            )
-            features = int(
-                native_wire.ReadyFeature.CANCELLATION
-                | native_wire.ReadyFeature.TOKEN_MASKS
-                | native_wire.ReadyFeature.STATUS_JSON
-                | native_wire.ReadyFeature.MULTIPLEXING
-            )
-            for vision in (True, False):
-                with self.subTest(vision=vision):
-                    runtime = mock.Mock()
-                    runtime.readiness = native_wire.ReadyEvent(
-                        1,
-                        4,
-                        131072,
-                        features | (native_wire.ReadyFeature.VISION if vision else 0),
-                    )
-                    with (
-                        mock.patch.object(api, "parse_args", return_value=args),
-                        mock.patch.object(api, "load_thinking_key", return_value=None),
-                        mock.patch.object(
-                            api.AutoTokenizer, "from_pretrained", return_value=object()
-                        ),
-                        mock.patch.object(api, "validate_tokenizer"),
-                        mock.patch.object(
-                            api.engine_runtime,
-                            "MultiplexedRuntime",
-                            return_value=runtime,
-                        ),
-                        mock.patch.object(api, "NativeBackend"),
-                        mock.patch.object(api, "ConstraintFactory"),
-                        mock.patch.object(api, "Frontend") as app_type,
-                        mock.patch.object(
-                            api,
-                            "FrontendServer",
-                            return_value=mock.Mock(server_port=8000),
-                        ),
-                        mock.patch.object(api.signal, "signal"),
-                        mock.patch.object(api, "print_status") as status,
-                    ):
-                        api.main()
-                    self.assertIs(app_type.call_args.kwargs["vision"], vision)
-                    describe = app_type.return_value.chat_templates.describe
-                    describe.assert_called_once_with()
-                    self.assertIn(
-                        mock.call(f"Chat template · {describe.return_value}"),
-                        status.call_args_list,
-                    )
-                    self.assertIn(
-                        mock.call(
-                            "Ready · test-model · context 128K"
-                            + ("" if vision else " · language only")
-                            + " · http://127.0.0.1:8000"
-                        ),
-                        status.call_args_list,
-                    )
+    def test_main_takes_vision_from_the_ready_event(self):
+        args = main_args()
+        features = int(
+            native_wire.ReadyFeature.CANCELLATION
+            | native_wire.ReadyFeature.TOKEN_MASKS
+            | native_wire.ReadyFeature.STATUS_JSON
+            | native_wire.ReadyFeature.MULTIPLEXING
+        )
+        for vision in (True, False):
+            with self.subTest(vision=vision):
+                runtime = mock.Mock()
+                runtime.readiness = native_wire.ReadyEvent(
+                    1,
+                    4,
+                    131072,
+                    features | (native_wire.ReadyFeature.VISION if vision else 0),
+                )
+                with (
+                    mock.patch.object(api, "parse_args", return_value=args),
+                    mock.patch.object(api, "load_thinking_key", return_value=None),
+                    mock.patch.object(
+                        api.AutoTokenizer, "from_pretrained", return_value=object()
+                    ),
+                    mock.patch.object(api, "validate_tokenizer"),
+                    mock.patch.object(
+                        api.engine_runtime,
+                        "MultiplexedRuntime",
+                        return_value=runtime,
+                    ),
+                    mock.patch.object(api, "NativeBackend"),
+                    mock.patch.object(api, "ConstraintFactory"),
+                    mock.patch.object(api, "Frontend") as app_type,
+                    mock.patch.object(
+                        api,
+                        "FrontendServer",
+                        return_value=mock.Mock(server_port=8000),
+                    ),
+                    mock.patch.object(api.signal, "signal"),
+                    mock.patch.object(api, "print_status") as status,
+                ):
+                    api.main()
+                self.assertIs(app_type.call_args.kwargs["vision"], vision)
+                describe = app_type.return_value.chat_templates.describe
+                describe.assert_called_once_with()
+                self.assertIn(
+                    mock.call(f"Chat template · {describe.return_value}"),
+                    status.call_args_list,
+                )
+                self.assertIn(
+                    mock.call(
+                        "Ready · test-model · context 128K"
+                        + ("" if vision else " · language only")
+                        + " · http://127.0.0.1:8000"
+                    ),
+                    status.call_args_list,
+                )
 
     def test_main_cleans_up_when_native_startup_fails_after_reserved_bind(self):
-        args = SimpleNamespace(
-            target="target",
-            served_model_name=[],
-            default_reasoning_effort=None,
-            draft="draft",
-            tokenizer="tokenizer",
-            model="test-model",
-            max_context=128,
-            max_memory=32 * 1024**3,
-            max_new_tokens=16,
-            request_timeout=2,
-            queue_size=1,
-            host="127.0.0.1",
-            allowed_host=[],
-            api_key=None,
-            no_webui=False,
-            max_request_size=api.DEFAULT_MAX_REQUEST_BYTES,
-            port=0,
-            binary="splash",
-            kv_format="int8",
-        )
+        args = main_args(max_context=128, max_memory=32 * 1024**3)
         runtime = mock.Mock()
         runtime.wait_ready.side_effect = api.engine_runtime.EngineUnhealthy("late")
         backend = mock.Mock()
@@ -3619,28 +3580,7 @@ class ServerTest(unittest.TestCase):
         self.assertIn("Error · late", stderr.getvalue())
 
     def test_main_rejects_port_conflict_before_loading_or_starting_native(self):
-        args = SimpleNamespace(
-            target="target",
-            served_model_name=[],
-            default_reasoning_effort=None,
-            draft="draft",
-            tokenizer="tokenizer",
-            model="test-model",
-            max_context=None,
-            max_memory=None,
-            max_image_pixels=api.image_input.MAX_PIXELS,
-            max_new_tokens=16,
-            request_timeout=2,
-            queue_size=1,
-            host="127.0.0.1",
-            allowed_host=[],
-            api_key=None,
-            no_webui=False,
-            max_request_size=api.DEFAULT_MAX_REQUEST_BYTES,
-            port=8000,
-            binary="splash",
-            kv_format="int8",
-        )
+        args = main_args(port=8000)
         server = mock.Mock()
         server.server_bind.side_effect = OSError(48, "Address already in use")
         with (
