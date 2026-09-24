@@ -54,7 +54,7 @@ class HttpRegressionTests(unittest.TestCase):
                     with self.assertRaises(SystemExit):
                         parse(arguments)
 
-    def test_benchmark_runs_any_installation(self):
+    def test_benchmark_runs_any_installation_and_holds_its_assembly(self):
         with TemporaryDirectory() as directory:
             root = Path(directory).resolve()
             binary = root / "splash"
@@ -86,9 +86,16 @@ class HttpRegressionTests(unittest.TestCase):
                         ]
                     )
 
-            for model in (legacy, upstream):
-                with self.subTest(model=model):
-                    self.assertEqual(parse(model).package, models / model)
+            arguments = parse(legacy)
+            self.assertEqual(arguments.package, models / legacy)
+            arguments = parse(upstream)
+            try:
+                # Installations collect an unlinked assembly unless it is held.
+                self.assertEqual(arguments.package, assembly)
+                self.assertTrue(smoke.assembly.is_held(assembly))
+            finally:
+                arguments.held_record.close()
+            self.assertFalse(smoke.assembly.is_held(assembly))
             error = io.StringIO()
             with contextlib.redirect_stderr(error), self.assertRaises(SystemExit):
                 parse("community/not-installed")

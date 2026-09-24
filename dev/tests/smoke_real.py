@@ -21,6 +21,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
+from install import assembly  # noqa: E402
 from install import models as model_artifacts  # noqa: E402
 
 
@@ -1050,9 +1051,14 @@ def add_server_arguments(parser):
 
 def resolve_server_arguments(arguments):
     if arguments.package is None:
-        arguments.package = model_artifacts.installed_root(
-            model_artifacts.MODELS, arguments.model
-        )
+        link = model_artifacts.installed_root(model_artifacts.MODELS, arguments.model)
+        arguments.package = link
+        if model_artifacts.installation_kind(link) == model_artifacts.ASSEMBLY:
+            # As splash serve does: every server this process starts, and its
+            # tokenizer, use one assembly, which installations keep while held.
+            arguments.package, arguments.held_record = assembly.hold(
+                link, model_artifacts.MODELS
+            )
     return arguments
 
 
