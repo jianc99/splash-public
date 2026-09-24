@@ -54,29 +54,45 @@ class HttpRegressionTests(unittest.TestCase):
                     with self.assertRaises(SystemExit):
                         parse(arguments)
 
-    def test_benchmark_resolves_the_selected_model_package(self):
-        model = "incoai/Qwen3.6-35B-A3B-Splash"
+    def test_benchmark_runs_any_installation(self):
         with TemporaryDirectory() as directory:
-            root = Path(directory)
+            root = Path(directory).resolve()
             binary = root / "splash"
             binary.touch()
             (root / "splash.metallib").touch()
-            package = root / "models" / model
-            (package / "tokenizer").mkdir(parents=True)
-            (package / "manifest.json").write_text("{}")
-            with mock.patch.object(smoke.model_artifacts, "MODELS", root / "models"):
-                arguments = benchmark.parse_args(
-                    [
-                        "--model",
-                        model,
-                        "--binary",
-                        str(binary),
-                        "--baseline-binary",
-                        str(binary),
-                    ]
-                )
-            self.assertEqual(arguments.model, model)
-            self.assertEqual(arguments.package, package)
+            models = root / "models"
+            # A Splash package records manifest.json; an upstream selection
+            # links an assembly that records model.json.
+            legacy = "incoai/Qwen3.6-35B-A3B-Splash"
+            (models / legacy).mkdir(parents=True)
+            (models / legacy / "manifest.json").write_text("{}")
+            upstream = "unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M"
+            assembly = models / ".resolved/assembly"
+            assembly.mkdir(parents=True)
+            (assembly / "model.json").write_text("{}")
+            (models / upstream).parent.mkdir(parents=True)
+            (models / upstream).symlink_to(assembly, target_is_directory=True)
+
+            def parse(model):
+                with mock.patch.object(smoke.model_artifacts, "MODELS", models):
+                    return benchmark.parse_args(
+                        [
+                            "--model",
+                            model,
+                            "--binary",
+                            str(binary),
+                            "--baseline-binary",
+                            str(binary),
+                        ]
+                    )
+
+            for model in (legacy, upstream):
+                with self.subTest(model=model):
+                    self.assertEqual(parse(model).package, models / model)
+            error = io.StringIO()
+            with contextlib.redirect_stderr(error), self.assertRaises(SystemExit):
+                parse("community/not-installed")
+            self.assertIn("missing installed model", error.getvalue())
 
     def row(self, version, sample=0, latency=10):
         return {

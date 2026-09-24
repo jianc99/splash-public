@@ -190,9 +190,8 @@ def parse_args(argv=None):
         for path in (binary, binary.parent / "splash.metallib"):
             if not path.is_file():
                 parser.error(f"missing retained executable/library: {path}")
-    for path in (args.package / "manifest.json", args.package / "tokenizer"):
-        if not path.exists():
-            parser.error(f"missing installed package: {path}")
+    if smoke.model_artifacts.installation_kind(args.package) is None:
+        parser.error(f"missing installed model: {args.package}")
     return args
 
 
