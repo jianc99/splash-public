@@ -114,6 +114,31 @@ uint64_t fingerprint(const Projection &projection) {
   return hash;
 }
 
+// Block-quantized workloads are not tuned, and a block projection never
+// reaches the tuner's reads of affine planes (which would throw
+// std::bad_variant_access instead).
+void blockInputs(metal::MetalBackend &backend, const Projection &projection) {
+  QuantizedSegment segment;
+  segment.outputSize = projection.outputSize;
+  segment.inputSize = projection.inputSize;
+  const Projection block(projection.outputSize, projection.inputSize, BlockWeights{{segment}});
+  const LinearWorkload affine{{projection.outputSize, projection.inputSize}, 8};
+  LinearWorkload blocks = affine;
+  blocks.weightLayout = WeightLayout::Block32;
+  const uint64_t before = backend.submissionCount();
+  const auto admit = [](uint64_t, const std::function<void()> &) -> metal::AllocationResult {
+    throw std::logic_error("invalid tuning input reached admission");
+  };
+  for (const LinearTuningInput &input : {LinearTuningInput{blocks, {{block, std::nullopt}}},
+                                         LinearTuningInput{affine, {{block, std::nullopt}}}}) {
+    const auto result = tuneLinear(backend, admit, input);
+    require(!result.complete && result.failure && result.measurements.empty(),
+            "a block tuning input was accepted");
+    rejects([&] { std::rethrow_exception(result.failure); });
+  }
+  require(backend.submissionCount() == before, "a block tuning input submitted GPU work");
+}
+
 void gpuControls(metal::MetalBackend &backend, const Projection &projection) {
   const LinearWorkload workload{{projection.outputSize, projection.inputSize}, 8};
   const LinearTuningInput input{workload, {{projection, std::nullopt}}};
@@ -451,6 +476,7 @@ int main(int argc, char **argv) {
     std::array small{projection(backend, {512, 256}), projection(backend, {512, 256}, 131),
                     projection(backend, {512, 256}, 233)};
     gpuControls(backend, small[0]);
+    blockInputs(backend, small[0]);
     for (uint32_t rows : {8U, 16U, 24U, 32U}) {
       gpuSweep(backend, small, rows, LinearPhase::Decode, LinearEpilogue::None);
       gpuSweep(backend, small, rows, LinearPhase::Decode, LinearEpilogue::Residual);

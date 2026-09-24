@@ -81,16 +81,6 @@ Layout layout(const DeviceCapabilities &device,
   return result;
 }
 
-void requireProjection(const Projection &projection, LinearMatrix matrix) {
-  const uint64_t parameters = uint64_t{matrix.outputSize} * (matrix.inputSize / 64);
-  if (projection.outputSize != matrix.outputSize ||
-      projection.inputSize != matrix.inputSize ||
-      !projection.affine().weights || projection.affine().weights.sizeBytes() < parameters * 32 ||
-      !projection.affine().scales || projection.affine().scales.sizeBytes() < parameters * 2 ||
-      !projection.affine().biases || projection.affine().biases.sizeBytes() < parameters * 2)
-    throw std::invalid_argument("Linear tuning projection does not match workload");
-}
-
 uint32_t mix(uint32_t value) {
   value ^= value >> 16;
   value *= 0x7feb352d;
@@ -192,12 +182,15 @@ LinearTuningResult tuneLinear(metal::MetalBackend &backend,
       throw std::invalid_argument("invalid Linear tuning measurement options or admission");
     if (input.weights.empty() || input.weights.size() > kMaximumLinearTuningRepresentatives)
       throw std::invalid_argument("Linear tuning requires 1..8 representative weight views");
+    // Block-quantized plans are not tuned: their only candidate is the baseline.
+    if (input.workload.weightLayout != WeightLayout::Affine64)
+      throw std::invalid_argument("Linear tuning takes affine workloads");
     result.representativeCount = static_cast<uint32_t>(input.weights.size());
     for (const auto &weights : input.weights) {
-      requireProjection(weights.projection, input.workload.matrix);
+      requireAffineProjection(weights.projection, input.workload.matrix);
       if ((input.workload.epilogue == LinearEpilogue::GateUp) != weights.gate.has_value())
         throw std::invalid_argument("Linear tuning gate projection is required only for GateUp");
-      if (weights.gate) requireProjection(*weights.gate, input.workload.matrix);
+      if (weights.gate) requireAffineProjection(*weights.gate, input.workload.matrix);
     }
     const auto fixture = layout(backend.capabilities(), plans);
     auto control = [&] {

@@ -76,15 +76,6 @@ void requireBytes(const metal::MetalBuffer &buffer, uint64_t bytes) {
     throw std::invalid_argument("Q4 buffer is below plan requirement");
 }
 
-void requireProjection(const Projection &p, LinearMatrix matrix) {
-  if (p.outputSize != matrix.outputSize || p.inputSize != matrix.inputSize)
-    throw std::invalid_argument("Q4 projection does not match plan");
-  requireBytes(p.affine().weights, uint64_t{matrix.outputSize} * matrix.inputSize / 2);
-  const uint64_t bytes = uint64_t{matrix.outputSize} * (matrix.inputSize / kQuantGroup) * 2;
-  requireBytes(p.affine().scales, bytes);
-  requireBytes(p.affine().biases, bytes);
-}
-
 void account(LinearDispatchStats &stats, uint32_t lanes, uint32_t count) noexcept {
   if (lanes == 1) return;
   stats.fusedSourceOperations += uint64_t{lanes} * count;
@@ -123,6 +114,16 @@ bool supportsFourSimdgroups(LinearWorkload w, LinearTile tile) noexcept {
 constexpr uint32_t stagedTileRows(uint32_t rows) noexcept { return rows <= 8 ? 8 : rows <= 16 ? 16 : 32; }
 
 } // namespace
+
+void requireAffineProjection(const Projection &p, LinearMatrix matrix) {
+  if (p.layout() != WeightLayout::Affine64 || p.outputSize != matrix.outputSize ||
+      p.inputSize != matrix.inputSize)
+    throw std::invalid_argument("Q4 projection does not match plan");
+  requireBytes(p.affine().weights, uint64_t{matrix.outputSize} * matrix.inputSize / 2);
+  const uint64_t bytes = uint64_t{matrix.outputSize} * (matrix.inputSize / kQuantGroup) * 2;
+  requireBytes(p.affine().scales, bytes);
+  requireBytes(p.affine().biases, bytes);
+}
 
 uint32_t LinearPlan::storageRows() const noexcept {
   // GGUF staged tiles: the decode tile, or 128-row prefill tiles.
@@ -634,7 +635,7 @@ PreparedInput Linear::add(metal::CommandGraph &graph, LinearBuffers b,
     throw std::invalid_argument("affine projection requires an affine plan");
   const LinearWorkload w = selected.workload();
   const auto [n, k] = w.matrix;
-  requireProjection(p, w.matrix);
+  requireAffineProjection(p, w.matrix);
   requireBytes(b.input, uint64_t{selected.storageRows()} * k * 2);
   requireBytes(b.output, uint64_t{selected.storageRows()} * n * 2);
   requireBytes(b.sums, selected.sumsBytes());
@@ -646,7 +647,7 @@ PreparedInput Linear::add(metal::CommandGraph &graph, LinearBuffers b,
     if (!gate) throw std::invalid_argument("Q4 gate projection is missing");
     if (gate->layout() != WeightLayout::Affine64)
       throw std::invalid_argument("fused affine gate/up requires matching weight layouts");
-    requireProjection(*gate, w.matrix);
+    requireAffineProjection(*gate, w.matrix);
   } else if (gate) throw std::invalid_argument("unexpected Q4 gate projection");
   if (selected.usesSimdgroup()) {
     const auto size = selected.scratchSize();

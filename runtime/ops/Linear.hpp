@@ -53,6 +53,10 @@ struct LinearMatrix final {
   auto operator<=>(const LinearMatrix &) const = default;
 };
 
+// Throws unless `projection` is an affine projection of `matrix` whose planes
+// hold all of its Q4 weights, scales and biases.
+void requireAffineProjection(const Projection &projection, LinearMatrix matrix);
+
 enum class LinearPhase : uint8_t { Prefill, Decode };
 enum class LinearEpilogue : uint8_t { None, Residual, GateUp, UpWithGate };
 // Compute tiles over the StorageN=256 packing. Paired tiles pipeline two
