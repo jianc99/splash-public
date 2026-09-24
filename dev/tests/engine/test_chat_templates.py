@@ -6,15 +6,7 @@ from pathlib import Path
 from jinja2 import TemplateError
 from transformers import PreTrainedTokenizerFast
 
-from dev.tests import test_server
-from dev.tests.test_server import (
-    FakeRuntime,
-    Harness,
-    Plan,
-    TemplateTokenizer,
-    _byte_backend,
-    no_signed_thinking,
-)
+from dev.tests import test_server as fixtures
 from server import api_shapes, chat_templates
 from server import frontend as request_frontend
 from server.chat_templates import (
@@ -77,7 +69,9 @@ def source(name):
 
 
 def tokenizer(template):
-    result = PreTrainedTokenizerFast(tokenizer_object=_byte_backend({0: "hello"}))
+    result = PreTrainedTokenizerFast(
+        tokenizer_object=fixtures._byte_backend({0: "hello"})
+    )
     result.chat_template = template
     return result
 
@@ -403,13 +397,13 @@ class ChatTemplateProbeTests(unittest.TestCase):
 
 
 class ChatTemplateFrontendTests(unittest.TestCase):
-    class OffsetTokenizer(TemplateTokenizer):
+    class OffsetTokenizer(fixtures.TemplateTokenizer):
         def __call__(self, text, **kwargs):
             return self.renderer(text, **kwargs)
 
     def harness(self, template, runtime=None):
-        harness = Harness(
-            runtime or FakeRuntime(), tokenizer=self.OffsetTokenizer(template)
+        harness = fixtures.Harness(
+            runtime or fixtures.FakeRuntime(), tokenizer=self.OffsetTokenizer(template)
         )
         self.addCleanup(harness.close)
         return harness
@@ -422,7 +416,9 @@ class ChatTemplateFrontendTests(unittest.TestCase):
         return json.loads(payload)
 
     def test_every_request_path_uses_the_template_chosen_at_startup(self):
-        harness = self.harness(source("qwen36"), FakeRuntime(Plan([[1]])))
+        harness = self.harness(
+            source("qwen36"), fixtures.FakeRuntime(fixtures.Plan([[1]]))
+        )
         chosen = harness.app.chat_templates.select(None)
         status, _, payload = harness.request("GET", "/status")
         self.assertEqual(
@@ -492,24 +488,18 @@ class ChatTemplateFrontendTests(unittest.TestCase):
         self.assertIn("<|image_pad|>", rendered)
         self.assertEqual(harness.tokenizer.renderer.chat_template, source("qwen36"))
 
-    class ScoringTokenizer(TemplateTokenizer, test_server.ServerTest.CharTokenizer):
+    class ScoringTokenizer(
+        fixtures.TemplateTokenizer, fixtures.ServerTest.CharTokenizer
+    ):
         """Renders the real template; one token per character for answer slots."""
 
     def test_scoring_prompts_use_the_template_chosen_at_startup(self):
         tokenizer = self.ScoringTokenizer(source("qwen36"))
-        app = request_frontend.Frontend(
-            tokenizer,
-            None,
-            "test-model",
-            8192,
-            16,
-            10,
-            2,
-            chat_templates=ChatTemplates(tokenizer),
-            vision=True,
+        app = fixtures.make_frontend(
+            tokenizer, None, "test-model", 8192, 16, 10, 2, vision=True
         )
         tokenizer.templates.clear()
-        app.prepare_judgment(test_server.ServerTest.judgment_body())
+        app.prepare_judgment(fixtures.ServerTest.judgment_body())
         app.prepare_systemone(
             {"model": "test-model", "state": {}, "questions": {"q": {"type": "noul"}}}
         )
@@ -519,7 +509,7 @@ class ChatTemplateFrontendTests(unittest.TestCase):
         )
 
     def test_codex_shaped_responses_render_instructions_first_and_later_in_place(self):
-        harness = self.harness(source("qwen36_gguf"), FakeRuntime())
+        harness = self.harness(source("qwen36_gguf"), fixtures.FakeRuntime())
         body = {
             "instructions": "Base instructions",
             "input": [
@@ -549,7 +539,7 @@ class ChatTemplateFrontendTests(unittest.TestCase):
             "{{- raise_exception('System message must be at the beginning.') }}",
             "{{- '' }}",
         )
-        runtime = FakeRuntime()
+        runtime = fixtures.FakeRuntime()
         harness = self.harness(text, runtime)
         self.assertEqual(
             harness.app.chat_templates.select(None).later_system, UNSUPPORTED
@@ -644,7 +634,7 @@ class LeadingSystemMergeTests(unittest.TestCase):
                     {"role": "user", "content": "Ask"},
                 ],
             },
-            thinking_resolver=no_signed_thinking,
+            thinking_resolver=fixtures.no_signed_thinking,
         )["messages"]
         for messages in (responses, anthropic):
             with self.subTest(messages=messages):
