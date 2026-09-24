@@ -53,13 +53,14 @@ check-native-cpu: platform-check $(TARGET) test-engine-cpu
 
 check-native-metal: platform-check $(TARGET) test-engine-metal
 
-# Discovering dev/tests/engine keeps this gate complete as new current runtime Python tests are
-# added.  dev/tests/test_models.py validates the installer and model manifests
-# without downloading or loading the real weights.
+# Discovering dev/tests/engine keeps this gate complete as new current runtime
+# Python tests are added.
 test-python: install-development
 	$(PYTHON) -m unittest discover -s dev/tests/engine -p '$(ENGINE_PYTHON_TEST_PATTERN)'
 	$(PYTHON) -m unittest dev/tests/test_server.py
 
+# Installer, model manifest, upstream resolution, GGUF metadata and
+# prepared-weight identity tests; none downloads or loads real weights.
 test-models: install-development
 	$(PYTHON) -m unittest dev/tests/test_models.py dev/tests/test_upstream.py \
 		dev/tests/test_weight_preparation_identity.py dev/tests/test_gguf_metadata.py
