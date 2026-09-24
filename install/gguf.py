@@ -251,19 +251,16 @@ def model_config(metadata, vision=None):
         raise ModelError("unsupported GGUF model architecture: " + arch)
     fields = {
         "hidden_size": "embedding_length",
-        "num_hidden_layers": "block_count",
         "max_position_embeddings": "context_length",
         "num_attention_heads": "attention.head_count",
         "num_key_value_heads": "attention.head_count_kv",
         "head_dim": "attention.key_length",
     }
     text = {name: m.positive(arch + "." + key) for name, key in fields.items()}
-    mtp = m.values.get(arch + ".nextn_predict_layers", 0)
-    if type(mtp) is not int or not 0 <= mtp < text["num_hidden_layers"]:
-        raise ModelError("invalid GGUF MTP layer count")
-    text["num_hidden_layers"] -= mtp
     text.update(
-        model_type=types[arch], vocab_size=len(m.require("tokenizer.ggml.tokens", list))
+        num_hidden_layers=loaded_layers(m, arch),
+        model_type=types[arch],
+        vocab_size=len(m.require("tokenizer.ggml.tokens", list)),
     )
     if arch == "qwen35moe":
         text.update(
@@ -274,6 +271,16 @@ def model_config(metadata, vision=None):
     if vision is not None:
         config["vision_config"] = vision_config(vision)
     return config
+
+
+def loaded_layers(m, arch):
+    """The target's layer count without its MTP layers, which are never
+    loaded."""
+    layers = m.positive(arch + ".block_count")
+    mtp = m.values.get(arch + ".nextn_predict_layers", 0)
+    if type(mtp) is not int or not 0 <= mtp < layers:
+        raise ModelError("invalid GGUF MTP layer count")
+    return layers - mtp
 
 
 def vision_config(m):
@@ -402,13 +409,10 @@ def loaded_tensors(m):
     the types it accepts. MTP layers are not loaded; every
     full_attention_interval-th layer is full attention, the others GDN."""
     arch = m.require("general.architecture", str)
-    layers = m.positive(arch + ".block_count") - m.values.get(
-        arch + ".nextn_predict_layers", 0
-    )
     period = m.positive(arch + ".full_attention_interval")
     ffn = MOE_TENSORS if arch == "qwen35moe" else DENSE_TENSORS
     tensors = dict(MODEL_TENSORS)
-    for layer in range(layers):
+    for layer in range(loaded_layers(m, arch)):
         mixer = ATTENTION_TENSORS if (layer + 1) % period == 0 else GDN_TENSORS
         for name, types in (LAYER_TENSORS | mixer | ffn).items():
             tensors[f"blk.{layer}.{name}"] = types

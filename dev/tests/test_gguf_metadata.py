@@ -277,9 +277,19 @@ class GgufMetadataTests(unittest.TestCase):
         self.assertEqual(text["num_hidden_layers"], 40)
         self.assertEqual(text["hidden_size"], 2048)
         self.assertEqual(text["max_position_embeddings"], 262144)
-        values["qwen35moe.nextn_predict_layers"] = 41
-        with self.assertRaises(models.ModelError):
-            gguf.model_config(self.metadata(values))
+        # Tensor screening reads the layer count first, and rejects an
+        # invalid MTP count as configuration derivation does.
+        for mtp in (41, "1"):
+            values["qwen35moe.nextn_predict_layers"] = mtp
+            metadata = self.metadata(values)
+            for derive in (gguf.require_loadable, gguf.model_config):
+                with (
+                    self.subTest(mtp=mtp, derive=derive.__name__),
+                    self.assertRaisesRegex(
+                        models.ModelError, "invalid GGUF MTP layer count"
+                    ),
+                ):
+                    derive(metadata)
         vision = self.metadata(vision_fixture())
         self.assertEqual(gguf.vision_config(vision)["num_position_embeddings"], 2304)
 
