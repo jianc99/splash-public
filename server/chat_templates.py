@@ -29,9 +29,15 @@ from dataclasses import dataclass
 
 from jinja2 import Environment, TemplateSyntaxError, nodes
 
+# What Splash does with a later system message.
 NATIVE = "native"
 PATCHED = "patched"
 UNSUPPORTED = "unsupported"
+# What the unmodified template does with the canary's later system message.
+RENDERS = "renders"
+REJECTS = "rejects"
+DROPS = "drops"
+MISPLACES = "misplaces"
 
 LATER_SYSTEM_UNSUPPORTED = (
     "this model's chat template does not accept system messages after the first message"
@@ -68,8 +74,7 @@ class ChatTemplate:
     source: str
     # NATIVE, PATCHED or UNSUPPORTED.
     later_system: str
-    # What the unmodified template does with a later system message:
-    # IN_PLACE, REJECTS, DROPS or MISPLACES.
+    # RENDERS, REJECTS, DROPS or MISPLACES.
     original: str
 
 
@@ -129,13 +134,6 @@ class ChatTemplates:
         return " · ".join(parts)
 
 
-# How the unmodified template renders the canary's later system message.
-IN_PLACE = "renders"
-REJECTS = "rejects"
-DROPS = "drops"
-MISPLACES = "misplaces"
-
-
 def _renderer(tokenizer):
     def render(source, messages, options):
         return tokenizer.apply_chat_template(
@@ -146,8 +144,8 @@ def _renderer(tokenizer):
 
 
 def _prepare(render, source):
-    original = _later_system(render, source)
-    if original == IN_PLACE:
+    original = _original(render, source)
+    if original == RENDERS:
         return ChatTemplate(source, NATIVE, original)
     patched = _patch(render, source, original)
     if patched is not None and _verified(render, source, patched):
@@ -246,7 +244,8 @@ def _in_place(rendered):
     )
 
 
-def _later_system(render, source):
+def _original(render, source):
+    """How the unmodified template treats the canaries' later system message."""
     for canary, _ in _CANARIES:
         try:
             rendered = render(source, canary, {"add_generation_prompt": True})
@@ -256,7 +255,7 @@ def _later_system(render, source):
             return DROPS
         if not _in_place(rendered):
             return MISPLACES
-    return IN_PLACE
+    return RENDERS
 
 
 def _verified(render, original, patched):
