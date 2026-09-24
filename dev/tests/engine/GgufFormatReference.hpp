@@ -2,11 +2,14 @@
 
 // CPU reference for the GGUF image formats (metal/abi/QuantFormat.h): native
 // blocks, their fp32 values with llama.cpp's dequantize_row_* semantics and
-// the planes the load-time repack writes. Shared by the GGUF Metal tests.
+// the planes the load-time repack writes, and the fp64 bound a GGUF
+// projection's result lies within. Shared by the GGUF tests.
 
 #include "metal/abi/QuantFormat.h"
 #include "metal/abi/QuantTables.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <dlfcn.h>
@@ -51,6 +54,24 @@ std::vector<uint8_t> makeNative(Fmt f, uint32_t N, uint32_t K, std::mt19937 &rng
   }
   return v;
 }
+// The range of a format's half scales that gives its weights the magnitudes a
+// model's have (a few hundredths), so the GEMM checks see realistic sums.
+inline std::uniform_real_distribution<float> scaleRange(Fmt f) {
+  switch (f) {
+    case Q4K: case Q5K: case Q3K: case IQ4NL: case Q80: return std::uniform_real_distribution<float>(0.0005f, 0.004f);
+    case IQ4XS: return std::uniform_real_distribution<float>(0.00002f, 0.00015f);
+    case Q6K: return std::uniform_real_distribution<float>(0.00002f, 0.0001f);
+    case IQ3S: return std::uniform_real_distribution<float>(0.0001f, 0.0005f);
+    case FMT_COUNT: break;
+  }
+  unknownFormat(f);
+}
+// N native rows with scales in the format's realistic range.
+inline std::vector<uint8_t> makeNative(Fmt f, uint32_t N, uint32_t K, std::mt19937 &rng) {
+  std::uniform_real_distribution<float> range = scaleRange(f);
+  return makeNative(f, N, K, rng, [&] { return f2h(range(rng)); });
+}
+
 inline void scale_min_k4(const uint8_t *sc, int j, uint8_t &s, uint8_t &m) {
   if (j < 4) { s = sc[j] & 63; m = sc[j + 4] & 63; }
   else { s = (sc[j + 4] & 0xF) | ((sc[j - 4] >> 6) << 4); m = (sc[j + 4] >> 4) | ((sc[j] >> 6) << 4); }
@@ -207,6 +228,11 @@ inline void metaPack(Fmt f, const uint8_t *row, uint32_t unit, uint8_t *dst) {
   }
   unknownFormat(f);
 }
+// GGML's fp32 values of one native row of K weights.
+inline void rowValues(Fmt f, const uint8_t *row, uint32_t K, float *values) {
+  uint8_t p0[32], p1[8];
+  for (uint32_t g = 0; g < K / 32; ++g) groupPack(f, row, g, values + g * 32, p0, p1);
+}
 struct Packed { std::vector<uint8_t> w0, w1, meta; };
 inline Packed repack(Fmt f, const std::vector<uint8_t> &native, uint32_t N, uint32_t K, std::vector<float> *Wf,
                      std::vector<float> *Ws = nullptr) {
@@ -246,6 +272,36 @@ inline bool ggmlDequantize(void *ggml, Fmt f, const std::vector<uint8_t> &native
   values.assign(native.size() / kQuantFormats[f].block_bytes * kQuantFormats[f].block_elements, 0.f);
   decode(native.data(), values.data(), (int64_t)values.size());
   return true;
+}
+
+// The fp64 dot product of a bf16 row with a weight row and the magnitudes its
+// error bounds scale with.
+struct Dot {
+  double value = 0, magnitude = 0, inputs = 0, largest = 0;
+};
+inline Dot dot(const float *x, const float *w, uint32_t K) {
+  Dot d;
+  for (uint32_t k = 0; k < K; ++k) {
+    d.value += double(x[k]) * w[k];
+    d.magnitude += std::fabs(double(x[k]) * w[k]);
+    d.inputs += std::fabs(x[k]);
+    d.largest = std::max(d.largest, double(std::fabs(w[k])));
+  }
+  return d;
+}
+
+// The distance from the fp64 dot product within which a GGUF projection's
+// fp32 result lies, before its epilogue and bf16 rounding. Both tiles
+// multiply bf16 inputs by exactly represented weight operands and accumulate
+// in fp32: 2^-16 sum|x| max|w| = 256 u sum|x| max|w| (u = 2^-24) bounds a
+// chain of 256 fp32 additions over sum|x w| <= sum|x| max|w|; the longer
+// chains of a large K round independently, so their error grows with the
+// square root of their length. The register tile (Apple9) is exact up to that
+// accumulation. The staged tile rounds every weight once to half: 2^-11 of
+// each product, and 2^-25 of each |x| for weights below half's normal range.
+inline double projectionBound(const Dot &d, bool staged) {
+  const double accumulation = std::ldexp(d.inputs * d.largest, -16);
+  return staged ? accumulation + std::ldexp(d.magnitude, -11) + std::ldexp(d.inputs, -25) : accumulation;
 }
 
 } // namespace gguf_reference
