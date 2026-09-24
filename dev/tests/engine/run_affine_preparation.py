@@ -1,5 +1,5 @@
-"""Small standalone affine checkpoints, an independent byte-layout oracle and
-golden hashes of the prepared images."""
+"""Small standalone dense and MoE affine checkpoints, an independent
+byte-layout oracle of every prepared image and their golden hashes."""
 
 import argparse
 import json
@@ -43,16 +43,24 @@ def fixture(root, moe=False):
         if bits != 4:
             quantization[name] = {"bits": bits, "group_size": 64}
 
-    def packed(parts, rows, columns):
+    def packed(parts, rows, columns, bits=4, experts=1):
+        # Per expert, each field's rows of the parts, then zero rows, in
+        # [rows / 256][groups][256] tiles of the field's group bytes.
         result = bytearray()
-        for field, unit in (("weight", 32), ("scales", 2), ("biases", 2)):
-            source = b"".join(tensors[name + "." + field][2] for name in parts)
-            source = source.ljust(rows * columns // 64 * unit, b"\0")
-            for tile in range(0, rows, 256):
-                for group in range(columns // 64):
-                    for row in range(tile, tile + 256):
-                        offset = (row * (columns // 64) + group) * unit
-                        result.extend(source[offset : offset + unit])
+        groups = columns // 64
+        for expert in range(experts):
+            for field, unit in (("weight", 8 * bits), ("scales", 2), ("biases", 2)):
+                source = bytearray()
+                for name in parts:
+                    data = tensors[name + "." + field][2]
+                    size = len(data) // experts
+                    source += data[expert * size : (expert + 1) * size]
+                source = source.ljust(rows * groups * unit, b"\0")
+                for tile in range(0, rows, 256):
+                    for group in range(groups):
+                        for row in range(tile, tile + 256):
+                            offset = (row * groups + group) * unit
+                            result.extend(source[offset : offset + unit])
         return result
 
     expected = root / "expected"
@@ -75,10 +83,13 @@ def fixture(root, moe=False):
             sections.append(add(g + "conv1d.weight", [512, 4, 1]))
             if moe:
                 # BF16 decay logarithms: 0.5, -1, 2 and 0.
+                logarithms = (0.5, -1, 2, 0)
                 add(g + "A_log", [4], data=bytes.fromhex("003f80bf00400000"))
             else:
+                logarithms = (0, 0, 0, 0)
                 add(g + "A_log", [4], "F32", bytes(16))
-                sections.append(struct.pack("<4f", -1, -1, -1, -1))
+            # The decay -exp(A_log), rounded once from double to F32.
+            sections.append(struct.pack("<4f", *(-math.exp(x) for x in logarithms)))
             sections.append(add(g + "dt_bias", [4]))
             sections.append(add(g + "norm.weight", [64]))
             projection(g + "out_proj", 256, 256)
@@ -95,27 +106,36 @@ def fixture(root, moe=False):
             sections.append(packed([a + "o_proj"], 256, 256))
         sections.append(add(p + "post_attention_layernorm.weight", [256]))
         if moe:
+            # The 8-bit router and shared-expert gate; the gate's one row is
+            # padded to a 256-row tile.
             projection(p + "mlp.gate", 256, 256, bits=8)
+            sections.append(packed([p + "mlp.gate"], 256, 256, bits=8))
             for name in ("gate_proj", "up_proj", "down_proj"):
-                projection(p + "mlp.switch_mlp." + name, 256, 256, experts=256)
+                name = p + "mlp.switch_mlp." + name
+                projection(name, 256, 256, experts=256)
+                sections.append(packed([name], 256, 256, experts=256))
             for name in ("gate_proj", "up_proj", "down_proj"):
-                projection(p + "mlp.shared_expert." + name, 256, 256)
+                name = p + "mlp.shared_expert." + name
+                projection(name, 256, 256)
+                sections.append(packed([name], 256, 256))
             projection(p + "mlp.shared_expert_gate", 1, 256, bits=8)
-            continue
-        for name, rows, columns in (
-            ("gate_proj", 512, 256),
-            ("up_proj", 512, 256),
-            ("down_proj", 256, 512),
-        ):
-            name = p + "mlp." + name
-            projection(name, rows, columns)
-            sections.append(packed([name], rows, columns))
-        image(f"layer-{layer}.bin", "MDFL0006", layer, layer, sections)
+            sections.append(packed([p + "mlp.shared_expert_gate"], 256, 256, bits=8))
+        else:
+            for name, rows, columns in (
+                ("gate_proj", 512, 256),
+                ("up_proj", 512, 256),
+                ("down_proj", 256, 512),
+            ):
+                name = p + "mlp." + name
+                projection(name, rows, columns)
+                sections.append(packed([name], rows, columns))
+        magic = "MDFM0001" if moe else "MDFL0006"
+        image(f"layer-{layer}.bin", magic, layer, layer, sections)
     norm = add("language_model.model.norm.weight", [256])
     projection("language_model.lm_head", 256, 256)
     image(
         "head.bin",
-        "MDFL0002",
+        "MDFM0002" if moe else "MDFL0002",
         2,
         2,
         [norm, packed(["language_model.lm_head"], 256, 256)],

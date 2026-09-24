@@ -1,6 +1,6 @@
 // Prepares a tiny dense or MoE affine checkpoint twice (cold, then warm
 // without conversion headroom) and prints each prepared image's SHA-256.
-// Dense images must also equal the independently serialized files in
+// Every image must also equal the independently serialized file in
 // FIXTURE/expected.
 //
 //   affine-preparation METALLIB FIXTURE dense|moe
@@ -45,7 +45,7 @@ template <class Layout> Layout tinyLayout() {
 }
 
 template <class Layout>
-void prepare(metal::MetalBackend &backend, const std::filesystem::path &root, const Layout &layout, bool oracle) {
+void prepare(metal::MetalBackend &backend, const std::filesystem::path &root, const Layout &layout) {
   const std::filesystem::path cache(std::getenv("SPLASH_WEIGHT_CACHE"));
   bool cold = true;
   const auto admitConversion = [&] { if (!cold) throw std::runtime_error("conversion forbidden on warm load"); };
@@ -64,7 +64,7 @@ void prepare(metal::MetalBackend &backend, const std::filesystem::path &root, co
         throw std::runtime_error("the loader's planned weights differ from its " + record.relativePath);
       const auto prepared = fileBytes(cache / record.contentIdentity / "weights");
       if (prepared.size() != record.declaredBytes) throw std::runtime_error("wrong image size");
-      if (oracle && prepared != fileBytes(root / "expected" / std::filesystem::path(record.relativePath).filename()))
+      if (prepared != fileBytes(root / "expected" / std::filesystem::path(record.relativePath).filename()))
         throw std::runtime_error("affine fixture differs: " + record.relativePath);
       static_cast<void>(weights.section(record.declaredBytes - model::kWeightFileAlignment));
       weights.finish();
@@ -94,14 +94,14 @@ int main(int argc, char **argv) {
         layout.experts = 256;
         layout.expertsPerToken = 8;
         layout.expertIntermediateSize = 256;
-        prepare(backend, root, layout, false);
-        std::cout << "affine preparation: MoE experts, 8-bit router and shared-expert gate, warm admission, planned "
-                     "weights PASS\n";
+        prepare(backend, root, layout);
+        std::cout << "affine preparation: exact independent fixture, MoE experts, 8-bit router and shared-expert "
+                     "gate, warm admission, planned weights PASS\n";
         return 0;
       }
       auto layout = tinyLayout<model::Qwen3_8Layout>();
       layout.intermediateSize = 512;
-      prepare(backend, root, layout, true);
+      prepare(backend, root, layout);
       // The target loader reads the prepared files as affine Q4 projections of
       // the layout's sizes with bf16 norms.
       model::AffineTargetLoader files(backend, root, layout);
