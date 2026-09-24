@@ -774,7 +774,9 @@ class ModelArtifactTest(unittest.TestCase):
         models = self.root / "models"
         model_id = f"{self.MODEL_ID}:UD-Q5_K_M"
         with (
-            mock.patch.object(artifacts, "resolve_gguf", return_value=gguf) as fetch,
+            mock.patch.object(
+                artifacts, "resolve_target_gguf", return_value=gguf
+            ) as fetch,
             contextlib.redirect_stdout(io.StringIO()),
         ):
             self.assertEqual(
@@ -806,7 +808,7 @@ class ModelArtifactTest(unittest.TestCase):
         self.assertEqual(artifacts.installed_snapshot(root), snapshot.resolve())
         self.download.assert_called_once()
         with (
-            mock.patch.object(artifacts, "resolve_gguf") as second,
+            mock.patch.object(artifacts, "resolve_target_gguf") as second,
             contextlib.redirect_stdout(io.StringIO()),
         ):
             self.assertEqual(
@@ -821,7 +823,7 @@ class ModelArtifactTest(unittest.TestCase):
         # A damaged variant root is rebuilt; a foreign directory is left alone.
         (root / "target/Model-UD-Q5_K_M.gguf").unlink()
         with (
-            mock.patch.object(artifacts, "resolve_gguf", return_value=gguf),
+            mock.patch.object(artifacts, "resolve_target_gguf", return_value=gguf),
             contextlib.redirect_stdout(io.StringIO()),
         ):
             artifacts.main(["--models", str(models), "--model", model_id, "prepare"])
@@ -836,6 +838,11 @@ class ModelArtifactTest(unittest.TestCase):
             artifacts.prepare_legacy(
                 SimpleNamespace(models=models, model="owner/repo:v")
             )
+
+    @staticmethod
+    def fetch_gguf(manifest):
+        with contextlib.redirect_stdout(io.StringIO()):
+            return artifacts.resolve_target_gguf(manifest, "UD-Q4_K_M")
 
     def test_gguf_download_checks_hub_metadata_against_the_manifest(self):
         snapshot, manifest = self.package_fixture(variants=("UD-Q4_K_M",))
@@ -852,7 +859,7 @@ class ModelArtifactTest(unittest.TestCase):
             ],
         )
         self.manifest_download.return_value = str(gguf)
-        self.assertEqual(artifacts.resolve_gguf(manifest, "UD-Q4_K_M", None), gguf)
+        self.assertEqual(self.fetch_gguf(manifest), gguf)
         self.manifest_download.assert_called_with(
             repo_id=self.GGUF_REPO,
             filename=entry["file"],
@@ -863,10 +870,10 @@ class ModelArtifactTest(unittest.TestCase):
         )
         self.api.return_value.model_info.return_value.siblings[0].lfs.sha256 = "0" * 64
         with self.assertRaisesRegex(artifacts.ModelError, "hash does not match"):
-            artifacts.resolve_gguf(manifest, "UD-Q4_K_M", None)
+            self.fetch_gguf(manifest)
         self.api.return_value.model_info.return_value.siblings = []
         with self.assertRaisesRegex(artifacts.ModelError, "does not match"):
-            artifacts.resolve_gguf(manifest, "UD-Q4_K_M", None)
+            self.fetch_gguf(manifest)
 
     def test_gguf_install_retains_source_snapshot_and_repairs_pin_offline(self):
         from huggingface_hub import scan_cache_dir
@@ -878,7 +885,7 @@ class ModelArtifactTest(unittest.TestCase):
             models=self.root / "models", model=self.MODEL_ID + ":UD-Q4_K_M"
         )
         with (
-            mock.patch.object(artifacts, "resolve_gguf", return_value=source),
+            mock.patch.object(artifacts, "resolve_target_gguf", return_value=source),
             contextlib.redirect_stdout(io.StringIO()),
         ):
             artifacts.prepare_legacy(args)
@@ -939,7 +946,7 @@ class ModelArtifactTest(unittest.TestCase):
             return str(gguf)
 
         self.manifest_download.side_effect = fetch
-        self.assertEqual(artifacts.resolve_gguf(manifest, "UD-Q4_K_M", None), gguf)
+        self.assertEqual(self.fetch_gguf(manifest), gguf)
         self.assertEqual(self.manifest_download.call_count, 2)
         self.assertTrue(self.manifest_download.call_args.kwargs["force_download"])
         self.assertEqual(gguf.read_bytes(), good)
@@ -948,7 +955,7 @@ class ModelArtifactTest(unittest.TestCase):
         self.manifest_download.reset_mock(side_effect=True)
         self.manifest_download.return_value = str(gguf)
         with self.assertRaisesRegex(artifacts.ModelError, "checksum"):
-            artifacts.resolve_gguf(manifest, "UD-Q4_K_M", None)
+            self.fetch_gguf(manifest)
         self.assertEqual(self.manifest_download.call_count, 2)
         with mock.patch(
             "huggingface_hub.try_to_load_from_cache", return_value=str(gguf)
@@ -1256,150 +1263,11 @@ class ModelArtifactTest(unittest.TestCase):
             ],
         )
 
-    def affine_source_fixture(self, schema=3):
-        snapshot, manifest = self.package_fixture(schema=schema)
-        manifest["format"]["name"] = "mlx-affine"
-        manifest["artifacts"] = [
-            r for r in manifest["artifacts"] if not r["path"].startswith("target/")
-        ]
-        repo = "quantizer/Affine-Model"
-        upstream = (
-            self.root
-            / "source-cache"
-            / ("models--" + repo.replace("/", "--"))
-            / "snapshots"
-            / ("d" * 40)
-        )
-        upstream.mkdir(parents=True, exist_ok=True)
-        for name, data in (
-            ("config.json", b'{"quantization":{"bits":4,"group_size":64}}'),
-            ("model-00001-of-00002.safetensors", b"first shard"),
-            ("model-00002-of-00002.safetensors", b"second shard"),
-        ):
-            (upstream / name).write_bytes(data)
-        source = {
-            "repo_id": repo,
-            "revision": "d" * 40,
-            "files": [
-                {
-                    "path": path.name,
-                    "size": path.stat().st_size,
-                    "sha256": artifacts.sha256(path),
-                }
-                for path in sorted(upstream.iterdir())
-            ],
-        }
-        manifest.setdefault("target", {})["source"] = source
-        self.write_manifest(snapshot, manifest)
-        return snapshot, manifest, upstream
-
-    def test_affine_source_install_reuses_shared_assets_and_pins_weights(self):
-        for schema in (3, 4):
-            snapshot, manifest, source = self.affine_source_fixture(schema)
-            validated = artifacts.validate_package_manifest(snapshot / "manifest.json")
-            self.assertEqual(
-                artifacts.target_source(validated, None), manifest["target"]["source"]
-            )
-            self.assertIsNone(artifacts.select_variant(validated, None))
-            destination = self.root / f"models-{schema}"
-            args = SimpleNamespace(models=destination, model=self.MODEL_ID)
-            with (
-                mock.patch.object(artifacts, "resolve_snapshot", return_value=snapshot),
-                mock.patch.object(
-                    artifacts,
-                    "resolve_target_source",
-                    return_value={p.name: p for p in source.iterdir()},
-                ),
-                contextlib.redirect_stdout(io.StringIO()),
-            ):
-                artifacts.prepare_legacy(args)
-            installed = destination / self.MODEL_ID
-            for path in source.iterdir():
-                self.assertEqual(
-                    (installed / "target" / path.name).resolve(), path.resolve()
-                )
-            self.assertEqual(
-                (installed / "draft/model.bin").resolve(),
-                (snapshot / "draft/model.bin").resolve(),
-            )
-            artifacts.verify_installed(destination, model_id=self.MODEL_ID, full=True)
-            with (
-                mock.patch.object(
-                    artifacts, "resolve_snapshot", side_effect=AssertionError("network")
-                ),
-                mock.patch.object(
-                    artifacts,
-                    "resolve_target_source",
-                    side_effect=AssertionError("network"),
-                ),
-                contextlib.redirect_stdout(io.StringIO()),
-            ):
-                artifacts.prepare_legacy(args)
-            shard = source / "model-00001-of-00002.safetensors"
-            shard.write_bytes(b"x" * shard.stat().st_size)
-            with self.assertRaisesRegex(artifacts.ModelError, "checksum"):
-                artifacts.verify_installed(
-                    destination, model_id=self.MODEL_ID, full=True
-                )
-
-    def test_gguf_source_uses_the_same_pinned_assembly(self):
-        snapshot, manifest, upstream = self.affine_source_fixture()
-        weight = upstream / "model.gguf"
-        weight.write_bytes(b"GGUF fixture")
-        manifest["format"].update(name="gguf", target_layer_magic="MDGG0001")
-        manifest["target"]["source"]["files"] = [
-            {
-                "path": weight.name,
-                "size": weight.stat().st_size,
-                "sha256": artifacts.sha256(weight),
-            }
-        ]
-        self.write_manifest(snapshot, manifest)
-        validated = artifacts.validate_package_manifest(snapshot / "manifest.json")
-        self.assertIsNone(artifacts.select_variant(validated, None))
-        self.assertEqual(
-            artifacts.target_source(validated, None), manifest["target"]["source"]
-        )
-        destination = self.root / "source-gguf"
-        artifacts.install_source(snapshot, destination, manifest, {weight.name: weight})
-        self.assertEqual(
-            (destination / "target" / weight.name).resolve(), weight.resolve()
-        )
-        self.assertEqual(
-            (destination / "vision/model.bin").resolve(),
-            (snapshot / "vision/model.bin").resolve(),
-        )
-
-    def test_source_manifest_rejects_unsafe_or_incomplete_assemblies(self):
-        snapshot, manifest, _ = self.affine_source_fixture()
-        mutations = [
-            lambda m: m["target"]["source"].update(revision="main"),
-            lambda m: m["target"]["source"].update(files=[]),
-            lambda m: m["target"]["source"]["files"][0].update(path="../config.json"),
-            lambda m: m["target"]["source"]["files"][0].update(
-                path="shard/config.json"
-            ),
-            lambda m: m["target"]["source"]["files"].pop(0),
-            lambda m: m["target"]["source"].update(
-                files=m["target"]["source"]["files"][:1]
-            ),
-            lambda m: m["artifacts"].append(
-                {"path": "target/old.bin", "size": 16384, "sha256": "0" * 64}
-            ),
-            lambda m: m["target"].update(gguf={}),
-        ]
-        for mutate in mutations:
-            changed = copy.deepcopy(manifest)
-            mutate(changed)
-            self.write_manifest(snapshot, changed)
-            with self.assertRaises(artifacts.ModelError):
-                artifacts.validate_package_manifest(snapshot / "manifest.json")
-
-    def test_source_publication_failure_restores_previous_installation(self):
-        snapshot, manifest, source = self.affine_source_fixture()
-        destination = self.root / "installed"
-        files = {p.name: p for p in source.iterdir()}
-        artifacts.install_source(snapshot, destination, manifest, files)
+    def test_variant_publication_is_verified_and_restores_previous_installation(self):
+        snapshot, manifest = self.package_fixture(variants=("UD-Q4_K_M",))
+        gguf = self.gguf_fixture("UD-Q4_K_M", 0)
+        destination = self.root / "models/owner/repo:UD-Q4_K_M"
+        artifacts.install_variant(snapshot, destination, manifest, "UD-Q4_K_M", gguf)
         previous = (destination / "manifest.json").readlink()
         rename = artifacts.os.rename
 
@@ -1415,276 +1283,19 @@ class ModelArtifactTest(unittest.TestCase):
             mock.patch.object(artifacts.os, "rename", side_effect=fail_publish),
             self.assertRaises(OSError),
         ):
-            artifacts.install_source(snapshot, destination, manifest, files)
+            artifacts.install_variant(
+                snapshot, destination, manifest, "UD-Q4_K_M", gguf
+            )
+        # A staged root that does not verify never replaces the installation.
+        truncated = self.root / "truncated.gguf"
+        truncated.write_bytes(gguf.read_bytes()[:-1])
+        with self.assertRaisesRegex(artifacts.ModelError, "wrong size"):
+            artifacts.install_variant(
+                snapshot, destination, manifest, "UD-Q4_K_M", truncated
+            )
         self.assertEqual((destination / "manifest.json").readlink(), previous)
-        self.assertTrue((destination / "target/config.json").is_file())
-
-    def test_affine_source_download_is_pinned_and_checks_all_shards(self):
-        _, manifest, upstream = self.affine_source_fixture()
-        source = manifest["target"]["source"]
-        self.api.return_value.model_info.return_value = SimpleNamespace(
-            sha=source["revision"],
-            siblings=[
-                SimpleNamespace(
-                    rfilename=r["path"],
-                    size=r["size"],
-                    lfs=SimpleNamespace(sha256=r["sha256"]),
-                )
-                for r in source["files"]
-            ],
-        )
-        self.manifest_download.side_effect = lambda **kwargs: str(
-            upstream / kwargs["filename"]
-        )
-        result = artifacts.resolve_target_source(source)
-        self.assertEqual(set(result), {r["path"] for r in source["files"]})
-        self.assertEqual(self.manifest_download.call_count, 3)
-        for call in self.manifest_download.call_args_list:
-            self.assertEqual(call.kwargs["revision"], source["revision"])
-
-    def tokenizer_source_fixture(self, *, affine=False):
-        if affine:
-            snapshot, manifest, upstream = self.affine_source_fixture()
-            identity = manifest["target"]["source"]
-        else:
-            snapshot, manifest = self.package_fixture()
-            identity = {"repo_id": "upstream/Original-Model", "revision": "e" * 40}
-            upstream = (
-                self.root
-                / "tokenizer-cache"
-                / ("models--" + identity["repo_id"].replace("/", "--"))
-                / "snapshots"
-                / identity["revision"]
-            )
-            upstream.mkdir(parents=True)
-        names = {
-            "config.json",
-            "tokenizer.json",
-            "tokenizer_config.json",
-            "chat_template.jinja",
-        }
-        for name in names:
-            if not (upstream / name).exists():
-                (upstream / name).write_text(name + " upstream")
-        files = [
-            {
-                "path": name,
-                "size": (upstream / name).stat().st_size,
-                "sha256": artifacts.sha256(upstream / name),
-            }
-            for name in sorted(names)
-        ]
-        manifest["tokenizer"] = {"source": {"files": files}}
-        if not affine:
-            manifest["tokenizer"]["source"].update(identity)
-        manifest["artifacts"] = [
-            r for r in manifest["artifacts"] if not r["path"].startswith("tokenizer/")
-        ]
-        self.write_manifest(snapshot, manifest)
-        return snapshot, manifest, upstream
-
-    def test_upstream_tokenizer_assembly_pins_and_reuses_files_offline(self):
-        for affine in (False, True):
-            with self.subTest(affine=affine):
-                snapshot, manifest, upstream = self.tokenizer_source_fixture(
-                    affine=affine
-                )
-                artifacts.validate_package_manifest(snapshot / "manifest.json")
-                source = artifacts.tokenizer_source(manifest)
-                files = {r["path"]: upstream / r["path"] for r in source["files"]}
-                weights = artifacts.target_source(manifest, None)
-                weight_files = (
-                    {r["path"]: upstream / r["path"] for r in weights["files"]}
-                    if weights
-                    else {}
-                )
-                models = self.root / f"tokenizer-models-{affine}"
-                args = SimpleNamespace(models=models, model=self.MODEL_ID)
-                with (
-                    mock.patch.object(
-                        artifacts, "resolve_snapshot", return_value=snapshot
-                    ),
-                    mock.patch.object(artifacts, "resolve_source", return_value=files),
-                    mock.patch.object(
-                        artifacts, "resolve_target_source", return_value=weight_files
-                    ),
-                    contextlib.redirect_stdout(io.StringIO()),
-                ):
-                    artifacts.prepare_legacy(args)
-                root = models / self.MODEL_ID
-                self.assertEqual(
-                    (root / "config.json").readlink(), upstream / "config.json"
-                )
-                for name, path in files.items():
-                    self.assertEqual((root / "tokenizer" / name).readlink(), path)
-                artifacts.verify_installed(models, model_id=self.MODEL_ID, full=True)
-                refs = list((upstream.parent.parent / "refs/splash").glob("*/*"))
-                self.assertEqual(len(refs), 1)
-                refs[0].unlink()
-                with (
-                    mock.patch.object(
-                        artifacts,
-                        "resolve_snapshot",
-                        side_effect=AssertionError("network"),
-                    ),
-                    mock.patch.object(
-                        artifacts,
-                        "resolve_source",
-                        side_effect=AssertionError("network"),
-                    ),
-                    contextlib.redirect_stdout(io.StringIO()),
-                ):
-                    artifacts.prepare_legacy(args)
-                self.assertTrue(refs[0].is_file())
-                damaged = root / "tokenizer/tokenizer.json"
-                damaged.write_bytes(b"x" * damaged.stat().st_size)
-                with self.assertRaisesRegex(artifacts.ModelError, "checksum"):
-                    artifacts.verify_installed(
-                        models, model_id=self.MODEL_ID, full=False
-                    )
-
-    def test_gguf_variant_can_use_a_separate_upstream_tokenizer(self):
-        snapshot, manifest = self.package_fixture(variants=("UD-Q4_K_M",))
-        _, tokenizer_manifest, upstream = self.tokenizer_source_fixture()
-        manifest["tokenizer"] = tokenizer_manifest["tokenizer"]
-        manifest["artifacts"] = [
-            r for r in manifest["artifacts"] if not r["path"].startswith("tokenizer/")
-        ]
-        self.write_manifest(snapshot, manifest)
-        source = self.gguf_fixture("UD-Q4_K_M", 0)
-        files = {
-            r["path"]: upstream / r["path"]
-            for r in artifacts.tokenizer_source(manifest)["files"]
-        }
-        models = self.root / "gguf-tokenizer-models"
-        model_id = self.MODEL_ID + ":UD-Q4_K_M"
-        args = SimpleNamespace(models=models, model=model_id)
-        with (
-            mock.patch.object(artifacts, "resolve_snapshot", return_value=snapshot),
-            mock.patch.object(artifacts, "resolve_gguf", return_value=source),
-            mock.patch.object(artifacts, "resolve_source", return_value=files),
-            contextlib.redirect_stdout(io.StringIO()),
-        ):
-            artifacts.prepare_legacy(args)
-        root = models / model_id
-        self.assertEqual((root / "config.json").readlink(), upstream / "config.json")
-        self.assertEqual((root / "target" / source.name).readlink(), source)
-        artifacts.verify_installed(models, model_id=model_id, full=True)
-        for path in (source.parent, upstream):
-            refs = list((path.parent.parent / "refs/splash").glob("*/*"))
-            self.assertEqual(len(refs), 1)
-        with (
-            mock.patch.object(
-                artifacts, "resolve_source", side_effect=AssertionError("network")
-            ),
-            mock.patch.object(
-                artifacts, "resolve_snapshot", side_effect=AssertionError("network")
-            ),
-            contextlib.redirect_stdout(io.StringIO()),
-        ):
-            artifacts.prepare_legacy(args)
-
-    def test_tokenizer_manifest_rejects_conflicts_and_unpinned_sources(self):
-        snapshot, manifest, _ = self.tokenizer_source_fixture()
-        mutations = [
-            lambda m: m.update(tokenizer=None),
-            lambda m: m["tokenizer"]["source"].update(revision="main"),
-            lambda m: m["tokenizer"]["source"].pop("repo_id"),
-            lambda m: m["tokenizer"]["source"].update(files=[]),
-            lambda m: m["tokenizer"]["source"]["files"][0].update(
-                path="../config.json"
-            ),
-            lambda m: m["tokenizer"]["source"]["files"][0].update(path="model.py"),
-            lambda m: m["tokenizer"]["source"].update(
-                files=m["tokenizer"]["source"]["files"][:1]
-            ),
-            lambda m: m["artifacts"].append(
-                {"path": "tokenizer/local.json", "size": 1, "sha256": "0" * 64}
-            ),
-            lambda m: m["artifacts"].append(
-                {"path": "config.json", "size": 1, "sha256": "0" * 64}
-            ),
-        ]
-        for mutate in mutations:
-            changed = copy.deepcopy(manifest)
-            mutate(changed)
-            self.write_manifest(snapshot, changed)
-            with self.assertRaises(artifacts.ModelError):
-                artifacts.validate_package_manifest(snapshot / "manifest.json")
-
-    def test_tokenizer_source_can_use_an_embedded_chat_template_without_vocab_file(
-        self,
-    ):
-        snapshot, manifest, _ = self.tokenizer_source_fixture()
-        manifest["tokenizer"]["source"]["files"] = [
-            r
-            for r in manifest["tokenizer"]["source"]["files"]
-            if r["path"] != "chat_template.jinja"
-        ]
-        self.write_manifest(snapshot, manifest)
-        artifacts.validate_package_manifest(snapshot / "manifest.json")
-
-    def test_tokenizer_download_reuses_only_matching_pinned_cache_offline(self):
-        from huggingface_hub.errors import OfflineModeIsEnabled
-
-        _, manifest, upstream = self.tokenizer_source_fixture()
-        source = artifacts.tokenizer_source(manifest)
-        with (
-            mock.patch.object(
-                artifacts, "_resolve_source_files", side_effect=OfflineModeIsEnabled()
-            ),
-            mock.patch(
-                "huggingface_hub.try_to_load_from_cache",
-                side_effect=lambda repo, name, **kw: str(upstream / name),
-            ) as cache,
-            contextlib.redirect_stdout(io.StringIO()),
-        ):
-            result = artifacts.resolve_source(source, "tokenizer")
-            self.assertEqual(set(result), {r["path"] for r in source["files"]})
-            self.assertTrue(
-                all(
-                    c.kwargs["revision"] == source["revision"]
-                    for c in cache.call_args_list
-                )
-            )
-            (upstream / "tokenizer.json").write_text("corrupt")
-            with self.assertRaises(artifacts.ModelError):
-                artifacts.resolve_source(source, "tokenizer")
-
-    def test_tokenizer_corruption_cannot_replace_existing_installation(self):
-        snapshot, manifest, upstream = self.tokenizer_source_fixture()
-        files = {
-            r["path"]: upstream / r["path"]
-            for r in artifacts.tokenizer_source(manifest)["files"]
-        }
-        root = self.root / "installed-tokenizer"
-        artifacts.install_source(snapshot, root, manifest, {}, tokenizer_files=files)
-        previous = root.stat().st_ino
-        (upstream / "tokenizer.json").write_text("corrupt")
-        with self.assertRaises(artifacts.ModelError):
-            artifacts.install_source(
-                snapshot, root, manifest, {}, tokenizer_files=files
-            )
-        self.assertEqual(root.stat().st_ino, previous)
-        self.assertFalse(list(root.parent.glob(".prepare-*")))
-
-    def test_tokenizer_revision_mismatch_is_rejected_even_for_identical_bytes(self):
-        snapshot, manifest, upstream = self.tokenizer_source_fixture()
-        files = {
-            r["path"]: upstream / r["path"]
-            for r in artifacts.tokenizer_source(manifest)["files"]
-        }
-        models = self.root / "revision-models"
-        root = models / self.MODEL_ID
-        artifacts.install_source(snapshot, root, manifest, {}, tokenizer_files=files)
-        wrong = upstream.with_name("f" * 40)
-        shutil.copytree(upstream, wrong)
-        for name in files:
-            path = root / "tokenizer" / name
-            path.unlink()
-            path.symlink_to(wrong / name)
-        with self.assertRaisesRegex(artifacts.ModelError, "revision"):
-            artifacts.verify_installed(models, model_id=self.MODEL_ID, full=True)
+        self.assertEqual((destination / "target/Model-UD-Q4_K_M.gguf").readlink(), gguf)
+        self.assertEqual(list(destination.parent.iterdir()), [destination])
 
 
 if __name__ == "__main__":

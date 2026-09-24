@@ -181,15 +181,11 @@ ModelDescriptor qwen36Descriptor(std::string name) {
                              vision);
 }
 
-void validateModelConfig(NSDictionary *manifest, const std::filesystem::path &root,
-                         const ModelDescriptor &descriptor,
-                         std::string_view expectedTextModelType) {
-  // Source assemblies expose model metadata separately; legacy packages keep
-  // this file beside their bundled tokenizer.
-  const auto configPath = manifest[@"tokenizer"] != nil
-                              ? root / "config.json"
-                              : root / "tokenizer" / "config.json";
-  NSDictionary *config = readObject(configPath, "model config");
+void validateTokenizer(const std::filesystem::path &root,
+                       const ModelDescriptor &descriptor,
+                       std::string_view expectedTextModelType) {
+  NSDictionary *config = readObject(root / "tokenizer" / "config.json",
+                                    "tokenizer model config");
   NSDictionary *text =
       requireObject(config, @"text_config", "text model config");
   requireEqual(requireString(text, @"model_type", "text model type"),
@@ -220,7 +216,7 @@ void validateQwen38(NSDictionary *manifest,
   requireEqual(requireUnsigned(format, @"q4_storage_n", "q4_storage_n"),
                kQ4StorageN, "q4_storage_n");
   validateCommonFormat(format, Qwen3_8Layout::layerMagic);
-  validateModelConfig(manifest, root, descriptor, "qwen3_5_text");
+  validateTokenizer(root, descriptor, "qwen3_5_text");
 }
 
 void validateLayerTypes(NSDictionary *target,
@@ -304,7 +300,7 @@ void validateQwen36Declarations(NSDictionary *manifest,
                  field.value, field.name);
   }
   validateCaptureLayers(draft);
-  validateModelConfig(manifest, root, descriptor, "qwen3_5_moe_text");
+  validateTokenizer(root, descriptor, "qwen3_5_moe_text");
 }
 
 void validateQwen36(NSDictionary *manifest,
@@ -484,25 +480,24 @@ ModelDescriptor inspectModelPackage(const std::filesystem::path &root) {
     if (format == "splash-packed-q4") {
       descriptor = qwen38Descriptor(model);
       validateQwen38(manifest, root, descriptor);
-    } else if (format == "gguf" || format == "mlx-affine") {
+    } else if (format == "gguf") {
       // The schema names the target as for the packed formats: 3 Qwen3.8,
-      // 4 Qwen3.6 MoE. The source adapter checks the architecture against it.
+      // 4 Qwen3.6 MoE. The loader checks the GGUF's architecture against it.
       const uint64_t schema =
           requireUnsigned(manifest, @"schema_version", "schema_version");
       if (schema == 3) {
         descriptor = qwen38Descriptor(model);
-        validateModelConfig(manifest, root, descriptor, "qwen3_5_text");
+        validateTokenizer(root, descriptor, "qwen3_5_text");
       } else if (schema == 4) {
         descriptor = qwen36Descriptor(model);
         validateQwen36Declarations(manifest, root, descriptor);
       } else {
-        throw std::invalid_argument("unsupported source package schema_version " +
+        throw std::invalid_argument("unsupported GGUF package schema_version " +
                                     std::to_string(schema));
       }
       validateCommonFormat(requireObject(manifest, @"format", "model weight format"),
-                           format == "gguf" ? kGgufImageMagic
-                             : schema == 3 ? Qwen3_8Layout::layerMagic : Qwen3_6MoeLayout::layerMagic);
-      descriptor.targetSource = format == "gguf" ? TargetSource::Gguf : TargetSource::Affine;
+                           kGgufImageMagic);
+      descriptor.targetSource = TargetSource::Gguf;
     } else if (format == "splash-packed-q4-moe") {
       descriptor = qwen36Descriptor(model);
       validateQwen36(manifest, root, descriptor);

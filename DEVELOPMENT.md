@@ -123,8 +123,7 @@ Dense packages use schema 3 / `splash-packed-q4`; MoE uses schema 4 /
 These formats encode Qwen3.8-27B and Qwen3.6-35B-A3B layouts. Compatible community
 fine-tunes may use any nonempty manifest model name. Native loading validates
 geometry, tensor sizes, binary headers, tokenizer and target/draft compatibility.
-New architectures require engine support. Source packages bind upstream weights
-to these same validated target, draft, vision and tokenizer interfaces.
+New architectures require engine support.
 
 ### Upstream model loading
 
@@ -178,8 +177,7 @@ model geometry and all tensor shapes. Derived metadata is cached under
 `models/.metadata`, keyed by source identity, adapter code and tokenizer-library
 version; publication is atomic and cache contents are hash-checked. Only the
 header is read before the download; the tokenizer and configuration are derived
-from the downloaded file. Legacy manifest-based packages retain their explicitly
-declared component sources.
+from the downloaded file.
 Remote Python code is not loaded. Vision uses MLX's `vision_tower.*` tensors,
 linking only `config.json` and the shards holding them, or the same GGUF
 repository's `mmproj-BF16.gguf` or `mmproj-F32.gguf`; F16 has a narrower exponent
