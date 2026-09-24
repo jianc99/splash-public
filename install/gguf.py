@@ -174,15 +174,14 @@ def tokenizer_files(metadata):
     )
     from tokenizers import models as token_models
 
-    m = metadata
     if (
-        m.require("tokenizer.ggml.model", str) != "gpt2"
-        or m.require("tokenizer.ggml.pre", str) != "qwen35"
+        metadata.require("tokenizer.ggml.model", str) != "gpt2"
+        or metadata.require("tokenizer.ggml.pre", str) != "qwen35"
     ):
         raise ModelError("unsupported GGUF tokenizer profile; expected gpt2/qwen35")
-    tokens = m.require("tokenizer.ggml.tokens", list)
-    types = m.require("tokenizer.ggml.token_type", list)
-    merges = m.require("tokenizer.ggml.merges", list)
+    tokens = metadata.require("tokenizer.ggml.tokens", list)
+    types = metadata.require("tokenizer.ggml.token_type", list)
+    merges = metadata.require("tokenizer.ggml.merges", list)
     if (
         not tokens
         or not all(isinstance(t, str) and t for t in tokens)
@@ -203,7 +202,7 @@ def tokenizer_files(metadata):
             raise ModelError("invalid GGUF BPE merge")
         pairs.append(tuple(parts))
     for key in ("tokenizer.ggml.add_bos_token", "tokenizer.ggml.add_eos_token"):
-        if m.values.get(key, False) is not False:
+        if metadata.values.get(key, False) is not False:
             raise ModelError("GGUF automatic BOS/EOS insertion is unsupported: " + key)
     try:
         backend = Tokenizer(
@@ -239,19 +238,21 @@ def tokenizer_files(metadata):
 
     def special_token(name, *, optional=False):
         key = "tokenizer.ggml." + name + "_token_id"
-        if optional and key not in m.values:
+        if optional and key not in metadata.values:
             return None
-        index = m.require(key, int)
+        index = metadata.require(key, int)
         if not 0 <= index < len(tokens) or types[index] != CONTROL_TOKEN:
             raise ModelError("invalid GGUF special token: " + key)
         return tokens[index]
 
-    template = m.require("tokenizer.chat_template", str)
+    template = metadata.require("tokenizer.chat_template", str)
     if not template.strip():
         raise ModelError("GGUF chat template is empty")
     config = {
         "tokenizer_class": "TokenizersBackend",
-        "model_max_length": m.positive(text_architecture(m) + ".context_length"),
+        "model_max_length": metadata.positive(
+            text_architecture(metadata) + ".context_length"
+        ),
         "clean_up_tokenization_spaces": False,
         "bos_token": special_token("bos", optional=True),
         "eos_token": special_token("eos"),
@@ -280,16 +281,15 @@ def tokenizer_files(metadata):
 TEXT_MODEL_TYPES = {"qwen35": "qwen3_5_text", "qwen35moe": "qwen3_5_moe_text"}
 
 
-def text_architecture(m):
-    arch = m.require("general.architecture", str)
+def text_architecture(metadata):
+    arch = metadata.require("general.architecture", str)
     if arch not in TEXT_MODEL_TYPES:
         raise ModelError("unsupported GGUF model architecture: " + arch)
     return arch
 
 
 def model_config(metadata, vision=None):
-    m = metadata
-    arch = text_architecture(m)
+    arch = text_architecture(metadata)
     fields = {
         "hidden_size": "embedding_length",
         "max_position_embeddings": "context_length",
@@ -297,16 +297,16 @@ def model_config(metadata, vision=None):
         "num_key_value_heads": "attention.head_count_kv",
         "head_dim": "attention.key_length",
     }
-    text = {name: m.positive(arch + "." + key) for name, key in fields.items()}
+    text = {name: metadata.positive(arch + "." + key) for name, key in fields.items()}
     text.update(
-        num_hidden_layers=loaded_layers(m, arch),
+        num_hidden_layers=loaded_layers(metadata, arch),
         model_type=TEXT_MODEL_TYPES[arch],
-        vocab_size=len(m.require("tokenizer.ggml.tokens", list)),
+        vocab_size=len(metadata.require("tokenizer.ggml.tokens", list)),
     )
     if arch == "qwen35moe":
         text.update(
-            num_experts=m.positive(arch + ".expert_count"),
-            num_experts_per_tok=m.positive(arch + ".expert_used_count"),
+            num_experts=metadata.positive(arch + ".expert_count"),
+            num_experts_per_tok=metadata.positive(arch + ".expert_used_count"),
         )
     config = {
         "model_type": TEXT_MODEL_TYPES[arch].removesuffix("_text"),
@@ -317,21 +317,21 @@ def model_config(metadata, vision=None):
     return config
 
 
-def loaded_layers(m, arch):
+def loaded_layers(metadata, arch):
     """The target's layer count without its MTP layers, which are never
     loaded."""
-    layers = m.positive(arch + ".block_count")
-    mtp = m.values.get(arch + ".nextn_predict_layers", 0)
+    layers = metadata.positive(arch + ".block_count")
+    mtp = metadata.values.get(arch + ".nextn_predict_layers", 0)
     if type(mtp) is not int or not 0 <= mtp < layers:
         raise ModelError("invalid GGUF MTP layer count")
     return layers - mtp
 
 
-def vision_config(m):
+def vision_config(vision):
     if (
-        m.require("general.architecture", str) != "clip"
-        or m.require("clip.projector_type", str) != "qwen3vl_merger"
-        or m.require("clip.use_gelu", bool) is not True
+        vision.require("general.architecture", str) != "clip"
+        or vision.require("clip.projector_type", str) != "qwen3vl_merger"
+        or vision.require("clip.use_gelu", bool) is not True
     ):
         raise ModelError("unsupported GGUF vision architecture")
     fields = {
@@ -343,11 +343,13 @@ def vision_config(m):
         "patch_size": "patch_size",
         "spatial_merge_size": "spatial_merge_size",
     }
-    result = {name: m.positive("clip.vision." + key) for name, key in fields.items()}
-    image_size = m.positive("clip.vision.image_size")
+    result = {
+        name: vision.positive("clip.vision." + key) for name, key in fields.items()
+    }
+    image_size = vision.positive("clip.vision.image_size")
     if image_size % result["patch_size"]:
         raise ModelError("invalid GGUF vision position grid")
-    if any(m.require("clip.vision.is_deepstack_layers", list)):
+    if any(vision.require("clip.vision.is_deepstack_layers", list)):
         raise ModelError("GGUF vision deepstack layers are unsupported")
     # qwen3vl_merger uses RGB patches with two temporal slices; the native loader
     # independently checks both patch tensors and every other weight shape.
@@ -361,14 +363,14 @@ def vision_config(m):
     return result
 
 
-def processor_config(m):
-    v = vision_config(m)
+def processor_config(vision):
+    config = vision_config(vision)
     return {
-        "patch_size": v["patch_size"],
-        "temporal_patch_size": v["temporal_patch_size"],
-        "merge_size": v["spatial_merge_size"],
-        "image_mean": m.require("clip.vision.image_mean", list),
-        "image_std": m.require("clip.vision.image_std", list),
+        "patch_size": config["patch_size"],
+        "temporal_patch_size": config["temporal_patch_size"],
+        "merge_size": config["spatial_merge_size"],
+        "image_mean": vision.require("clip.vision.image_mean", list),
+        "image_std": vision.require("clip.vision.image_std", list),
     }
 
 
@@ -448,35 +450,35 @@ MOE_TENSORS = {
 }
 
 
-def loaded_tensors(m):
-    """Each tensor name the native loader reads from target header m, with
-    the types it accepts. MTP layers are not loaded; every
+def loaded_tensors(metadata):
+    """Each tensor the native loader reads from the target that metadata
+    describes, with the types it accepts. MTP layers are not loaded; every
     full_attention_interval-th layer is full attention, the others GDN."""
-    arch = text_architecture(m)
-    period = m.positive(arch + ".full_attention_interval")
+    arch = text_architecture(metadata)
+    period = metadata.positive(arch + ".full_attention_interval")
     ffn = MOE_TENSORS if arch == "qwen35moe" else DENSE_TENSORS
     tensors = dict(MODEL_TENSORS)
-    for layer in range(loaded_layers(m, arch)):
+    for layer in range(loaded_layers(metadata, arch)):
         mixer = ATTENTION_TENSORS if (layer + 1) % period == 0 else GDN_TENSORS
         for name, types in (LAYER_TENSORS | mixer | ffn).items():
             tensors[f"blk.{layer}.{name}"] = types
     return tensors
 
 
-def require_loadable(m):
+def require_loadable(metadata):
     """Reject a target the native loader cannot read, from its header alone,
     so an unusable file is never downloaded: every tensor it reads must be
     present, with a type it accepts for that tensor."""
     unsupported = collections.Counter()
-    for name, types in loaded_tensors(m).items():
-        kind = m.tensors.get(name)
+    for name, types in loaded_tensors(metadata).items():
+        kind = metadata.tensors.get(name)
         found = "missing" if kind is None else TENSOR_TYPES.get(kind, f"type {kind}")
         if found not in types:
             unsupported[
                 name.split(".", 2)[-1] if name.startswith("blk.") else name, found
             ] += 1
         # The two GDN input gates run as one segment of their shared format.
-        if name.endswith(".ssm_beta.weight") and kind != m.tensors.get(
+        if name.endswith(".ssm_beta.weight") and kind != metadata.tensors.get(
             name.replace("ssm_beta", "ssm_alpha")
         ):
             unsupported[
