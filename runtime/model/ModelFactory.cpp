@@ -127,9 +127,10 @@ uint64_t preparedModelWeightBytes(const std::filesystem::path &root, const Model
   if (descriptor.targetSource == TargetSource::Gguf) {
     WeightSource source(findTargetGguf(root / "target"));
     const GgufFile file(source);
-    bytes = std::visit([&](const auto &layout) {
-      return gguf::ImagePlanner(file, ggufTargetGeometry(layout)).totalBytes();
-    }, descriptor.target);
+    for (const gguf::Image &image :
+         std::visit([&](const auto &layout) { return gguf::planImages(file, ggufTargetGeometry(layout)); },
+                    descriptor.target))
+      bytes += image.bytes;
   } else if (descriptor.targetSource == TargetSource::Mlx) {
     bytes = std::visit([](const auto &layout) { return preparedAffineBytes(layout); }, descriptor.target);
   }

@@ -95,22 +95,10 @@ struct Image {
   std::vector<Repack> repacks;
 };
 
-class ImagePlanner final {
-public:
-  // Checks the architecture and the geometry the metadata declares, then
-  // plans every image, checking each tensor's shape; throws GgufError naming
-  // every missing tensor and every tensor of a type this build cannot load.
-  ImagePlanner(const GgufFile &file, const TargetGeometry &geometry);
-  // The layers' images, then the head's and the embedding's.
-  [[nodiscard]] const std::vector<Image> &images() const noexcept { return images_; }
-  [[nodiscard]] const Image &layer(uint32_t index) const;
-  [[nodiscard]] const Image &head() const { return images_[images_.size() - 2]; }
-  [[nodiscard]] const Image &embedding() const { return images_.back(); }
-  // Sum of all image bytes, for weight admission before preparation.
-  [[nodiscard]] uint64_t totalBytes() const;
-
-private:
-  std::vector<Image> images_;
-};
+// The layers' images, then the head's and the embedding's. Checks the
+// architecture and the geometry the metadata declares and each tensor's
+// shape; throws GgufError naming every missing tensor and every tensor of a
+// type this build cannot load.
+[[nodiscard]] std::vector<Image> planImages(const GgufFile &file, const TargetGeometry &geometry);
 
 } // namespace splash::model::gguf

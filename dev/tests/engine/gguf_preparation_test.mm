@@ -77,7 +77,7 @@ std::vector<model::gguf::Image> planned(const std::filesystem::path &path,
                                         const model::gguf::TargetGeometry &geometry) {
   model::WeightSource source(path);
   const model::GgufFile gguf(source);
-  return model::gguf::ImagePlanner(gguf, geometry).images();
+  return model::gguf::planImages(gguf, geometry);
 }
 
 // Every image the loader prepares from the GGUF at path against the goldens of

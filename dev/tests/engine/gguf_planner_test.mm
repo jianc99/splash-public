@@ -21,7 +21,7 @@ Plan plan(const std::filesystem::path &path, const model::gguf::TargetGeometry &
   try {
     model::WeightSource source(path);
     const model::GgufFile gguf(source);
-    return {model::gguf::ImagePlanner(gguf, geometry).images(), std::nullopt};
+    return {model::gguf::planImages(gguf, geometry), std::nullopt};
   } catch (const model::GgufError &error) {
     return {{}, error.what()};
   }

@@ -24,7 +24,7 @@ GgufTargetLoader::GgufTargetLoader(metal::MetalBackend &backend, const std::file
   const GgufFile file(source_);
   source_.checkUnchanged();
   // Validates the whole source before its tensor data is hashed.
-  images_ = gguf::ImagePlanner(file, geometry).images();
+  images_ = gguf::planImages(file, geometry);
   for (const gguf::Image &image : images_) {
     backend.checkOperation();
     weights_.push_back(ggufImageWeight(source_, image));

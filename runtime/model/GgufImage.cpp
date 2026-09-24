@@ -314,34 +314,25 @@ Image layerImage(const GgufFile &file, const TargetGeometry &g, std::vector<std:
 
 } // namespace
 
-ImagePlanner::ImagePlanner(const GgufFile &file, const TargetGeometry &geometry) {
+std::vector<Image> planImages(const GgufFile &file, const TargetGeometry &geometry) {
   requireMetadata(file, geometry);
   std::vector<std::string> problems;
+  std::vector<Image> images;
   for (uint32_t layer = 0; layer < geometry.layers; ++layer)
-    images_.push_back(layerImage(file, geometry, problems, layer));
+    images.push_back(layerImage(file, geometry, problems, layer));
   Builder head(file, geometry, problems, "head.bin", geometry.layers, 2);
   head.floatNorm("output_norm.weight", geometry.hiddenSize);
   head.quantized("output.weight", geometry.vocabularySize, geometry.hiddenSize);
-  images_.push_back(head.finish());
+  images.push_back(head.finish());
   Builder embedding(file, geometry, problems, "embedding.bin", geometry.vocabularySize, geometry.hiddenSize);
   embedding.embeddingRows("token_embd.weight");
-  images_.push_back(embedding.finish());
+  images.push_back(embedding.finish());
   if (!problems.empty()) {
     std::string names;
     for (const std::string &problem : problems) names += (names.empty() ? "" : ", ") + problem;
     throw GgufError("GGUF tensors this build cannot load: " + names);
   }
-}
-
-const Image &ImagePlanner::layer(uint32_t index) const {
-  if (index >= images_.size() - 2) throw GgufError("target layer is out of range");
-  return images_[index];
-}
-
-uint64_t ImagePlanner::totalBytes() const {
-  uint64_t total = 0;
-  for (const Image &image : images_) total += image.bytes;
-  return total;
+  return images;
 }
 
 } // namespace splash::model::gguf
