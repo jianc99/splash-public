@@ -454,14 +454,16 @@ void runSplitCase(MetalBackend &backend, const GdnShape &shape,
 // The tiled head order only moves each value head's output block: over the
 // same inputs, the tiled hidden rows are the grouped ones with head h at
 // (h % heads per key) * key heads + h / heads per key, byte for byte, and the
-// recurrent rows and state are unchanged.
+// recurrent rows and state are unchanged. Tiled is a GGUF's order, so the
+// norm is F32 as a GGUF stores it.
 void runTiledCase(MetalBackend &backend, const GdnShape &shape,
                   uint32_t tokens) {
   const std::string label = "vh" + std::to_string(shape.valueHeads) +
-                            " tokens=" + std::to_string(tokens) + " tiled: ";
+                            " tokens=" + std::to_string(tokens) +
+                            " tiled f32 norm: ";
   const uint32_t headsPerKey = shape.valueHeads / shape.keyHeads;
   const uint64_t headBytes = uint64_t{kHeadDim} * 2;
-  GdnPrefillBuffers grouped = randomPrefill(backend, shape, tokens);
+  GdnPrefillBuffers grouped = randomPrefill(backend, shape, tokens, true);
   submitPrefill(backend, grouped, shape, tokens, label);
   GdnPrefillBuffers tiled = prefillBuffers(
       backend, shape, tokens, grouped.packed, grouped.convolutionIn,

@@ -640,7 +640,7 @@ void fusedPreparation(MetalBackend &backend, const GdnShape &shape, uint32_t lan
 }
 
 // The tiled head order only moves each value head's output block: the tiled
-// output, and the Q4 table prepared from it in the same dispatch, are the
+// output, and the table prepared from it in the same dispatch, are the
 // grouped output with head h at (h % heads per key) * key heads + h / heads
 // per key, byte for byte.
 void tiledHeadOrder(MetalBackend &backend, const GdnShape &shape, uint32_t lanes, LinearInput layout,
@@ -664,17 +664,24 @@ void tiledHeadOrder(MetalBackend &backend, const GdnShape &shape, uint32_t lanes
                   hidden + (row * shape.valueHeads + head) * headBytes, headBytes);
     }
   fixture.clear();
-  const PreparedTables tables(backend, layout, width, lanes);
-  auto buffers = fixture.decodeBuffers(0);
-  buffers.linearScratch = tables.scratch();
   CommandGraph tiled;
-  const PreparedInput prepared =
-      GDN::addDecode(tiled, buffers, shape, lanes, 0, fixture.cell.strides(), GdnHeadOrder::Tiled, layout);
-  tables.addReference(tiled, fixture.hidden);
-  (void)backend.submitCommand(tiled.dispatches());
+  if (layout == LinearInput::Plain) {
+    require(GDN::addDecode(tiled, fixture.decodeBuffers(0), shape, lanes, 0, fixture.cell.strides(),
+                           GdnHeadOrder::Tiled).layout == LinearInput::Plain,
+            what + " claimed a table");
+    (void)backend.submitCommand(tiled.dispatches());
+  } else {
+    const PreparedTables tables(backend, layout, width, lanes);
+    auto buffers = fixture.decodeBuffers(0);
+    buffers.linearScratch = tables.scratch();
+    const PreparedInput prepared =
+        GDN::addDecode(tiled, buffers, shape, lanes, 0, fixture.cell.strides(), GdnHeadOrder::Tiled, layout);
+    tables.addReference(tiled, fixture.hidden);
+    (void)backend.submitCommand(tiled.dispatches());
+    tables.requireWritten(prepared, fixture.hidden, what);
+  }
   require(!std::memcmp(expected.data(), hidden, expected.size()),
           what + " output is not the grouped output in tiled head order");
-  tables.requireWritten(prepared, fixture.hidden, what);
 }
 
 void rejectsInvalid(MetalBackend &backend) {
@@ -738,6 +745,10 @@ int main(int argc, char **argv) {
           fusedPreparation(backend, shape, lanes, layout, layout == LinearInput::Table16);
           tiledHeadOrder(backend, shape, lanes, layout, layout == LinearInput::Table16);
         }
+    // A GGUF's out-projection on the staged tile reads the tiled rows plain.
+    for (const GdnShape &shape : kShapes)
+      for (uint32_t lanes = 1; lanes <= kMaxLanes; ++lanes)
+        tiledHeadOrder(backend, shape, lanes, LinearInput::Plain, true);
     for (bool float32 : {false, true})
       for (const GdnShape &shape : kShapes)
         for (uint32_t lanes = 1; lanes <= kMaxLanes; ++lanes)
