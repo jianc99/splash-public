@@ -71,7 +71,7 @@ def _running_status(port=PORT):
 
 
 def _ensure_installed(
-    model_id, *, revision=None, language_only=False, draft_model=None
+    model_id, *, revision=None, language_only=False, draft_model=None, update=False
 ):
     if not paths.PACKAGED:
         # Serialize builds across ports; make keeps the lock if the launcher exits.
@@ -97,8 +97,9 @@ def _ensure_installed(
     for flag, value in (("--revision", revision), ("--draft-model", draft_model)):
         if value is not None:
             command[-1:-1] = [flag, value]
-    if language_only:
-        command.insert(-1, "--language-only")
+    for flag, enabled in (("--language-only", language_only), ("--update", update)):
+        if enabled:
+            command.insert(-1, flag)
     if subprocess.run(command, cwd=ROOT).returncode:
         raise LauncherError("model download or verification failed")
 
@@ -167,7 +168,7 @@ def serve(args):
         for key in ("revision", "language_only", "draft_model"):
             if value := getattr(args, key, None):
                 selection[key] = value
-        _ensure_installed(args.model, **selection)
+        _ensure_installed(args.model, update=args.update, **selection)
         root = model_artifacts.installed_root(paths.MODELS, args.model, **selection)
         if (root / "model.json").is_file():
             # A concurrent install may advance the selection link. Keep this
@@ -436,6 +437,11 @@ def parse_args(argv=None):
         "--language-only",
         action="store_true",
         help="skip vision preparation and loading",
+    )
+    server.add_argument(
+        "--update",
+        action="store_true",
+        help="resolve the model and its draft again instead of starting the installed copy",
     )
     server.add_argument(
         "--served-model-name",
