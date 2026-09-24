@@ -28,8 +28,9 @@ def mlx_target(root, family, *, changes=None):
 
 
 def draft_dir(root, family):
-    (root / "splash").mkdir(parents=True, exist_ok=True)
-    (root / "splash/config.json").write_text(
+    folder = root / family.name
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "config.json").write_text(
         json.dumps(
             {
                 "architectures": ["DFlash2DraftModel"],
@@ -40,7 +41,7 @@ def draft_dir(root, family):
         )
     )
     for name in ("model.bin", *(f"layer-{i}.bin" for i in range(family.draft.layers))):
-        (root / "splash" / name).write_bytes(b"draft")
+        (folder / name).write_bytes(b"draft")
     return root
 
 
@@ -172,7 +173,7 @@ class UpstreamTest(unittest.TestCase):
         args = arguments(self.root, "someone/my-favourite-model")
         with mock.patch.object(upstream, "Repository", return_value=draft) as resolve:
             self.assertTrue(upstream.prepare(args, repo=source))
-        resolve.assert_called_once_with(MOE.draft.repo, MOE.draft.revision)
+        resolve.assert_called_once_with(upstream.DRAFTS, MOE.draft.revision)
         installed = models.installed_root(args.models, args.model, language_only=True)
         record = upstream.verify(installed)
         self.assertEqual(record["family"], MOE.name)
@@ -224,7 +225,7 @@ class UpstreamTest(unittest.TestCase):
         cache = self.root / "hub"
         model = "mlx-community/Qwen3.8-27B-4bit"
         draft = hub_repository(
-            cache, DENSE.draft.repo, "d" * 40, lambda p: draft_dir(p, DENSE)
+            cache, upstream.DRAFTS, "d" * 40, lambda p: draft_dir(p, DENSE)
         )
         args = arguments(self.root, model, update=True)
         installed = models.installed_root(args.models, model, language_only=True)
@@ -243,7 +244,9 @@ class UpstreamTest(unittest.TestCase):
             self.assertEqual([ref.name for ref in refs], [commit])
             owner_refs = refs[0].parent
             draft_refs = sorted(
-                (cache / "models--incoai--Qwen3.8-27B-DFlash2/refs/splash").glob("*/*")
+                (cache / "models--incoai-internal--Splash-DFlash2/refs/splash").glob(
+                    "*/*"
+                )
             )
             self.assertEqual([ref.name for ref in draft_refs], ["d" * 40])
         self.assertEqual(owner_refs.name, draft_refs[0].parent.name)

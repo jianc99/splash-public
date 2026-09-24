@@ -327,7 +327,7 @@ class GgufMetadataTests(unittest.TestCase):
         # Conflicting sidecars must not override the selected GGUF's metadata.
         for name in ("config.json", "tokenizer.json", "tokenizer_config.json"):
             (target / name).write_text("invalid sidecar")
-        draft = self.root / "draft/splash"
+        draft = self.root / "draft/Qwen3.6-35B-A3B"
         draft.mkdir(parents=True)
         (draft / "config.json").write_text(
             json.dumps(
@@ -356,7 +356,7 @@ class GgufMetadataTests(unittest.TestCase):
                     source, "download", wraps=source.download
                 ) as download:
                     upstream.prepare(args, repo=source)
-                resolve.assert_called_once_with("incoai/Qwen3.6-35B-A3B-DFlash2", None)
+                resolve.assert_called_once_with(upstream.DRAFTS, None)
                 expected = {"model-Q4_K_M.gguf"} | (
                     set() if language_only else {"mmproj-F32.gguf"}
                 )

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Export an existing verified Q4 draft as independent DFlash2 assets.
+"""Export an existing verified Q4 draft as a Splash DFlash2 draft folder.
 
-Copies only draft weights, without requantizing them. The destination is a
-DFlash2 repository directory; its splash/ subdirectory holds native weights.
+Copies only draft weights, without requantizing them, into DESTINATION: the
+folder of the shared draft repository named after the base model
+(install/upstream.py DRAFTS), or a directory for --draft-model.
 """
 
 import argparse
@@ -40,17 +41,24 @@ def export(package, config_path, destination):
                 magic, layer, kind = struct.unpack("<8sII", stream.read(16))
             if magic != b"MDFD0004" or layer != int(name[6:-4]) or kind != 0:
                 raise models.ModelError("incompatible draft layout: " + name)
-    output = destination / "splash"
-    output.mkdir(parents=True, exist_ok=False)
+    destination.mkdir(parents=True, exist_ok=False)
     try:
         for name in names:
-            shutil.copyfile(package / "draft" / name, output / name)
-        config["splash"] = {"format": "MDFD0004"}
-        (output / "config.json").write_text(json.dumps(config, indent=2) + "\n")
+            shutil.copyfile(package / "draft" / name, destination / name)
+        # The package names the DFlash2 checkpoint its draft was converted from.
+        source = manifest.get("upstream", {}).get("draft", {})
+        config["splash"] = {
+            "format": "MDFD0004",
+            "source": {
+                "repo": source.get("repo_id"),
+                "revision": source.get("revision"),
+            },
+        }
+        (destination / "config.json").write_text(json.dumps(config, indent=2) + "\n")
     except BaseException:
-        shutil.rmtree(output)
+        shutil.rmtree(destination)
         raise
-    print(f"Exported {layers} unchanged draft layers to {output}")
+    print(f"Exported {layers} unchanged draft layers to {destination}")
 
 
 if __name__ == "__main__":

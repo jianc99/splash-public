@@ -188,24 +188,28 @@ parameters and position tables use F32. Intermediate activations remain BF16.
 `--language-only` removes vision weights from startup and memory accounting and
 rejects image requests before decoding them.
 
-### Independent draft assets
+### Draft assets
 
-The automatic pairing expects the DFlash2 repository to contain `splash/config.json`,
-`splash/model.bin` and `splash/layer-N.bin`. The configuration is the original
-DFlash2 configuration with `splash.format = "MDFD0004"`; native loading validates
-it against the target. These are the existing verified Q4 draft weights, not a
-new quantization of the draft at startup.
+Splash's DFlash2 drafts share one Hub repository, `upstream.DRAFTS`
+(`incoai-internal/Splash-DFlash2`), with a folder per base model named after it:
+`Qwen3.8-27B/` and `Qwen3.6-35B-A3B/`. Each folder holds `config.json`,
+`model.bin` and `layer-N.bin`. The configuration is the original DFlash2
+configuration with `splash.format = "MDFD0004"` and `splash.source`, the DFlash2
+checkpoint the weights came from; native loading validates it against the
+target. These are the existing verified Q4 draft weights, not a new
+quantization of the draft at startup. Each family pins the commit that published
+its folder (`Draft.revision` in `FAMILIES`), and installation downloads only that
+folder.
 
-To prepare the assets from a verified existing package:
+To prepare a folder from a verified existing package:
 
 ```bash
-python dev/tools/export_draft.py PACKAGE ORIGINAL_DRAFT_CONFIG OUTPUT_REPOSITORY
+python dev/tools/export_draft.py PACKAGE ORIGINAL_DRAFT_CONFIG DRAFTS/Qwen3.6-35B-A3B
 ```
 
 The exporter verifies existing artifact hashes and copies only draft files.
-For local validation, pass `--draft-model OUTPUT_REPOSITORY`. Publishing these
-assets to the automatically selected DFlash2 repositories is a release prerequisite;
-the resolver reports a missing-assets error until they are available.
+`--draft-model` accepts such a folder, a local copy of the whole repository, or
+another Hub repository with the same layout.
 
 ### Upstream tokenizer and chat templates
 

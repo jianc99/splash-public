@@ -26,11 +26,16 @@ else:
     import models
 
 
+# Splash's DFlash2 drafts share one repository, a folder per base model named
+# after it: config.json (the original DFlash2 configuration plus its "splash"
+# format and source), model.bin and layer-N.bin in the MDFD0004 layout.
+DRAFTS = "incoai-internal/Splash-DFlash2"
+
+
 @dataclass(frozen=True)
 class Draft:
-    repo: str
-    # The published commit of the draft's Splash assets; None follows the
-    # repository's main branch until a release pins it.
+    # The commit of DRAFTS that holds this family's folder; None until it is
+    # published.
     revision: str | None
     layers: int
 
@@ -56,7 +61,7 @@ FAMILIES = (
             ("num_key_value_heads", 4),
             ("head_dim", 256),
         ),
-        Draft("incoai/Qwen3.8-27B-DFlash2", None, 5),
+        Draft(None, 5),
     ),
     ModelFamily(
         "Qwen3.6-35B-A3B",
@@ -71,7 +76,7 @@ FAMILIES = (
             ("num_experts", 256),
             ("num_experts_per_tok", 8),
         ),
-        Draft("incoai/Qwen3.6-35B-A3B-DFlash2", None, 6),
+        Draft(None, 6),
     ),
 )
 TOKENIZER_FILES = (
@@ -322,16 +327,16 @@ def _weight_files(repo):
 
 
 def _draft_files(repo, family):
-    names = {
-        "splash/config.json",
-        "splash/model.bin",
-        *(f"splash/layer-{i}.bin" for i in range(family.draft.layers)),
-    }
+    """The family's draft files in repo: its folder of the shared repository,
+    or, for a --draft-model directory, the directory itself."""
+    folder = family.name + "/" if f"{family.name}/config.json" in repo.files else ""
+    layers = (f"layer-{i}.bin" for i in range(family.draft.layers))
+    names = {folder + name for name in ("config.json", "model.bin", *layers)}
     if not names <= repo.files:
         raise models.ModelError(
-            f"{repo.name} does not contain the prepared DFlash2 weights (splash/); use a draft repository with these assets"
+            f"{repo.name} does not contain the Splash DFlash2 draft for {family.name}"
         )
-    config = models.read_json(repo.file("splash/config.json"))
+    config = models.read_json(repo.file(folder + "config.json"))
     hidden = dict(family.signature)["hidden_size"]
     if (
         config.get("architectures") != ["DFlash2DraftModel"]
@@ -408,9 +413,10 @@ def prepare(args, repo=None):
         return False
     target = _target(repo, variant, language_only)
     family = family_for(target.config)
-    draft = Repository(
-        draft_override or family.draft.repo,
-        None if draft_override else family.draft.revision,
+    draft = (
+        Repository(draft_override)
+        if draft_override
+        else Repository(DRAFTS, family.draft.revision)
     )
     draft_names = _draft_files(draft, family)
     print(
