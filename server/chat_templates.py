@@ -283,8 +283,10 @@ def _verified(render, original, patched):
 def _system_block(render, source):
     """The template's own block around a system message's content.
 
-    It is what a leading system message adds to a one-question conversation
-    without tools or thinking instructions.
+    It is what a leading system message adds to the front of a one-question
+    conversation without tools or thinking instructions, so a template that
+    renders anything before its system block, such as a BOS token, is not
+    patched.
     """
     ask = [_ASK]
     options = {"add_generation_prompt": False, "enable_thinking": False}
