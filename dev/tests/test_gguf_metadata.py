@@ -612,6 +612,12 @@ class GgufMetadataTests(unittest.TestCase):
         self.assertEqual(fake.downloads, [])
 
     def test_a_new_metadata_adapter_rebuilds_the_metadata_locally(self):
+        self.rebuild_metadata_with_a_new_adapter(offline=False)
+
+    def test_offline_a_new_metadata_adapter_rebuilds_the_metadata_locally(self):
+        self.rebuild_metadata_with_a_new_adapter(offline=True)
+
+    def rebuild_metadata_with_a_new_adapter(self, *, offline):
         fake = self.gguf_repository(vision=False)
         chosen = selection(self.root, GGUF_REPO + ":Q4_K_M")
         self.prepare(chosen)
@@ -619,10 +625,13 @@ class GgufMetadataTests(unittest.TestCase):
         adapter = self.root / "gguf.py"
         adapter.write_text("a new adapter\n")
         fake.requests.clear(), fake.downloads.clear()
-        with mock.patch.object(gguf, "__file__", str(adapter)):
+        with (
+            mock.patch.object(gguf, "__file__", str(adapter)),
+            mock.patch("huggingface_hub.constants.HF_HUB_OFFLINE", offline),
+        ):
             output = self.prepare(chosen)
         # The unchanged target is assembled again from the cache.
-        self.assertEqual(fake.requests, [(GGUF_REPO, None)])
+        self.assertEqual(fake.requests, [] if offline else [(GGUF_REPO, None)])
         self.assertEqual(fake.downloads, [])
         self.assertIn("the GGUF metadata adapter changed", output)
         rebuilt = assembly.verify(chosen.link)["metadata"]

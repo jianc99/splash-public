@@ -180,7 +180,9 @@ def repair_pins(installation: Path, snapshots):
 class Repository:
     """One source at one commit: a Hub repository at the commit its revision
     resolved to, listed by the Hub (directory None) or read from that
-    commit's cached snapshot, or a local draft directory (revision None)."""
+    commit's cached snapshot, or a local draft directory (revision None).
+    The commit of a verified installation that starts without the Hub is
+    not listed at all: that installation's links name its files."""
 
     def __init__(
         self,
@@ -233,11 +235,11 @@ class Repository:
         Only an absolute path is a local directory: parse_draft_model makes a
         --draft-model directory absolute, and a target is always a Hub ID,
         whatever the working directory holds. installed is the commit a
-        verified installation of this selection records; its snapshot holds
-        every file that installation uses. A commit revision never moves and
-        HF_HUB_OFFLINE forbids requests, so with installed either reads that
-        snapshot without one. Otherwise one request resolves revision, and a
-        resolved commit already installed is read from its snapshot too.
+        verified installation of this selection records. A commit revision
+        never moves and HF_HUB_OFFLINE forbids requests, so with installed
+        either returns that commit, unlisted, without a request or a look at
+        the Hub cache, which HF_HUB_CACHE may place elsewhere now than when
+        the installation was built. Otherwise one request resolves revision.
         When the Hub cannot answer, the cached snapshot of a commit this
         selection already names stands in, with the reason in
         unreachable_reason (_cached_commits); a different revision is never
@@ -251,7 +253,7 @@ class Repository:
         if installed and (
             constants.HF_HUB_OFFLINE or models.is_hex_digest(revision, 40)
         ):
-            return cls.cached(name, installed)
+            return cls(name, installed, frozenset())
         if constants.HF_HUB_OFFLINE:
             why = "HF_HUB_OFFLINE is set"
         else:
@@ -266,8 +268,6 @@ class Repository:
                     raise models.ModelError(
                         f"the Hub did not resolve {name} to a commit"
                     )
-                if info.sha == installed:
-                    return cls.cached(name, installed)
                 return cls(
                     name,
                     info.sha,

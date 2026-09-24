@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -313,18 +314,22 @@ def _is_legacy_package(repo, model):
 
 def _start_installed(selection, target, installed):
     """Start the verified installation of the target's commit, assembled again
-    first when this release changes it (_changes)."""
+    first when this release changes it (_changes). The installation's links
+    name its files; only assembling it again reads the commit's snapshot in
+    the current Hub cache."""
     if target.unreachable_reason:
         print(
             f"Could not reach the Hub ({target.unreachable_reason}); "
             f"using the installed {selection.repo_id}@{target.revision[:12]}.",
             flush=True,
         )
+    recorded = installed["sources"]["target"]
     if changes := _changes(installed, selection):
         print(f"Updating {selection.model}: {'; '.join(changes)}.", flush=True)
-        _install_or_keep(
-            selection, target, installed, f"update it ({'; '.join(changes)})"
-        )
+        with _keeping_installation(
+            selection, installed, f"update it ({'; '.join(changes)})"
+        ):
+            _install(selection, hub.Repository.recorded(recorded), installed)
         return
     if (replaced := _retain_installed(selection)) is None:
         print(
@@ -335,7 +340,7 @@ def _start_installed(selection, target, installed):
     # A concurrent installation replaced or damaged the assembly after it was
     # verified: no verified installation is left to keep.
     print(f"Reinstalling {selection.model}: {replaced}", flush=True)
-    _install(selection, target, installed)
+    _install(selection, hub.Repository.recorded(recorded), installed)
 
 
 def _install_commit(selection, target, installed):
@@ -356,20 +361,19 @@ def _install_commit(selection, target, installed):
         )
     if installed is None:
         _install(selection, target, None)
-    else:
-        _install_or_keep(
-            selection,
-            target,
-            installed,
-            f"install {selection.repo_id}@{target.revision}",
-        )
-
-
-def _install_or_keep(selection, target, installed, attempt):
-    """_install, or else start the verified installation with a warning
-    naming the attempt that failed."""
-    try:
+        return
+    with _keeping_installation(
+        selection, installed, f"install {selection.repo_id}@{target.revision}"
+    ):
         _install(selection, target, installed)
+
+
+@contextmanager
+def _keeping_installation(selection, installed, attempt):
+    """Run the block; if it fails, start the verified installation instead,
+    with a warning naming the attempt that failed."""
+    try:
+        yield
     except (models.ModelError, OSError) as error:
         commit = installed["sources"]["target"]["revision"]
         models.warn(

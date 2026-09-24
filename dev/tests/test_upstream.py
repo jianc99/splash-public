@@ -618,6 +618,65 @@ class UpstreamTest(unittest.TestCase):
         )
         self.assertEqual(fake.downloads, [])
 
+    def test_a_moved_hub_cache_starts_the_installation_it_links(self):
+        # HF_HUB_CACHE may name another folder than the one an installation
+        # was built from; its links still name its files there.
+        fake = fake_hub(self, self.cache)
+        chosen = selection(self.root)
+        pinned = selection(self.root, revision="a" * 40)
+        self.prepare(chosen)
+        self.prepare(pinned)
+        installed = pins(self.cache)
+        moved = self.root / "moved"
+        moved.mkdir()
+        fake.requests.clear(), fake.downloads.clear()
+        for name, start, requests in (
+            ("the Hub answers", lambda: self.prepare(chosen), [(MODEL, None)]),
+            ("a commit revision", lambda: self.prepare(pinned), []),
+            ("offline", lambda: self.prepare(chosen), []),
+        ):
+            with (
+                self.subTest(start=name),
+                mock.patch("huggingface_hub.constants.HF_HUB_CACHE", str(moved)),
+                mock.patch(
+                    "huggingface_hub.constants.HF_HUB_OFFLINE", name == "offline"
+                ),
+            ):
+                output, _ = start()
+                self.assertIn("is already installed", output)
+                self.assertEqual(fake.requests, requests)
+                self.assertEqual(fake.downloads, [])
+                fake.requests.clear()
+        self.assertEqual(pins(self.cache), installed)
+        self.assertEqual(list(moved.iterdir()), [])
+
+    def test_a_moved_hub_cache_keeps_the_installation_an_update_needs(self):
+        fake = fake_hub(self, self.cache)
+        chosen = selection(self.root)
+        self.prepare(chosen)
+        installed = chosen.link.resolve()
+        moved = self.root / "moved"
+        moved.mkdir()
+        fake.publish(families.DRAFTS, "e" * 40, lambda p: draft_dir(p, DENSE))
+        repinned = dataclasses.replace(
+            DENSE, draft=families.Draft("e" * 40, DENSE.draft.layers)
+        )
+        fake.downloads.clear()
+        with (
+            mock.patch("huggingface_hub.constants.HF_HUB_CACHE", str(moved)),
+            mock.patch.object(families, "FAMILIES", (repinned, MOE)),
+        ):
+            _, warnings = self.prepare(chosen)
+        self.assertIn(
+            f"Warning: keeping the installed {MODEL}@{'a' * 12}; cannot update it "
+            f"(this release pins the {DENSE.name} draft at {'e' * 12}): the Hub "
+            f"cache has no snapshot {'a' * 40} of {MODEL}",
+            warnings,
+        )
+        self.assertEqual(chosen.link.resolve(), installed)
+        self.assertEqual(fake.downloads, [])
+        self.assertEqual(list(moved.iterdir()), [])
+
     def test_an_incompatible_draft_is_an_error_not_a_crash(self):
         fake_hub(self, self.cache)
         local = draft_dir(self.root / "draft", DENSE) / DENSE.name
