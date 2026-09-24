@@ -24,7 +24,7 @@ static_assert(GGUF_TYPE_F32 == ggml::kF32, "float segments carry the GGUF type i
 constexpr uint32_t kNoPermute = 0xFFFFFFFFu;
 
 uint64_t alignUp(uint64_t value) {
-  return (value + kSectionAlignment - 1) / kSectionAlignment * kSectionAlignment;
+  return (value + kWeightFileAlignment - 1) / kWeightFileAlignment * kWeightFileAlignment;
 }
 
 void appendLittle32(std::vector<uint8_t> &out, uint32_t value) {
@@ -99,7 +99,7 @@ public:
     image_.name = std::move(name);
     image_.layer = layer;
     image_.type = type;
-    std::vector<uint8_t> header(kImageMagic, kImageMagic + 8);
+    std::vector<uint8_t> header(kGgufImageMagic.begin(), kGgufImageMagic.end());
     appendLittle32(header, layer);
     appendLittle32(header, type);
     image_.fills.push_back({0, std::move(header)});

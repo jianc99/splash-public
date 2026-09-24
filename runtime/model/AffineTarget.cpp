@@ -3,6 +3,7 @@
 #include "model/Qwen3_8.hpp"
 #include "model/Qwen3_6Moe.hpp"
 #include "model/SafetensorsCheckpoint.hpp"
+#include "model/WeightLayout.hpp"
 
 #include <algorithm>
 #include <array>

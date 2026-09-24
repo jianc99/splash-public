@@ -2,6 +2,7 @@
 #include "WeightPreparationIdentity.hpp"
 #include "model/GgufFile.hpp"
 #include "model/SafetensorsCheckpoint.hpp"
+#include "model/WeightLayout.hpp"
 #include "model/WeightStore.hpp"
 
 #include <algorithm>
@@ -363,7 +364,7 @@ VisionPreparation::prepare(const PreparationCheck &prepareCheck) const {
       [&](int output) {
         // The packed header: magic, block count and file kind 0.
         std::array<uint8_t, 16> header{};
-        std::memcpy(header.data(), "MDFV0001", 8);
+        std::memcpy(header.data(), kVisionMagic.data(), kVisionMagic.size());
         std::memcpy(header.data() + 8, &i.layout.depth, 4);
         writeWeightBytes(output, 0, header);
         for (const auto &s : i.plan)

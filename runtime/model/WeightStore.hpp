@@ -1,6 +1,7 @@
 #pragma once
 
 #include "metal/MetalBackend.hpp"
+#include "model/WeightLayout.hpp"
 #include "ops/Linear.hpp"
 #include "ops/Normalization.hpp"
 
@@ -13,12 +14,6 @@
 #include <string_view>
 
 namespace splash::model {
-
-inline constexpr uint32_t kQ4GroupElements = 64;
-inline constexpr uint64_t kBFloat16Bytes = 2;
-
-inline constexpr uint64_t kWeightFileAlignment = 16 * 1024;
-inline constexpr uint32_t kQ4StorageN = 256;
 
 class WeightStoreError : public std::runtime_error {
 public:
@@ -77,7 +72,6 @@ readProjection(WeightFile &file, metal::MetalBackend &backend,
 
 // GGUF GGUF sections: a 64-byte descriptor, then plane0, optional plane1
 // and metadata, each 16 KiB aligned (layout in model/GgufImage.hpp).
-inline constexpr std::string_view kGgufImageMagic = "MDGG0001";
 [[nodiscard]] ops::QuantizedSegment readQuantizedSegment(WeightFile &file,
                                                    std::string_view label);
 [[nodiscard]] ops::Projection readGgufProjection(WeightFile &file,

@@ -16,11 +16,9 @@
 
 #include "metal/abi/Gguf.h"
 #include "model/GgufFile.hpp"
+#include "model/WeightLayout.hpp"
 
 namespace splash::model::gguf {
-
-inline constexpr uint64_t kSectionAlignment = 16384;
-inline constexpr char kImageMagic[9] = "MDGG0001";
 
 struct TargetGeometry {
   uint32_t layers = 64;

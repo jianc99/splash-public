@@ -22,8 +22,6 @@ struct QwenVisionWeights final {
   std::string manifestFingerprintSha256;
 };
 
-inline constexpr std::string_view kVisionMagic = "MDFV0001";
-
 // The packed vision/model.bin of directory.
 [[nodiscard]] QwenVisionWeights
 loadQwenVisionWeights(metal::MetalBackend &backend,

@@ -15,7 +15,7 @@ INPUTS = {
     "AFFINE": (
         "runtime/model/AffineTarget.cpp",
         "runtime/model/SafetensorsCheckpoint.mm",
-        "runtime/model/WeightStore.hpp",
+        "runtime/model/WeightLayout.hpp",
     ),
     "GGUF": (
         "runtime/model/GgufPreparation.cpp",
@@ -30,7 +30,7 @@ INPUTS = {
         "runtime/model/SafetensorsCheckpoint.mm",
         "runtime/model/GgufFile.cpp",
         "runtime/model/GgufFile.hpp",
-        "runtime/model/WeightStore.hpp",
+        "runtime/model/WeightLayout.hpp",
     ),
 }
 
