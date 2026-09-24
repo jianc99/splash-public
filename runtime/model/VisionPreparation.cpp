@@ -320,7 +320,8 @@ VisionPreparation::VisionPreparation(const std::filesystem::path &directory,
   if (source == VisionSource::Safetensors) {
     i.checkpoint = std::make_unique<SafetensorsCheckpoint>(directory, i.check);
     planCheckpoint(*i.checkpoint, layout, i.plan);
-    digest = i.checkpoint->digest();
+    // config.json and the shards holding the tower, not the language model's.
+    digest = i.checkpoint->digest("vision_tower.");
   } else if (source == VisionSource::Gguf) {
     const auto path = directory / "mmproj.gguf";
     i.mmproj = std::make_unique<WeightSource>(path, i.check);

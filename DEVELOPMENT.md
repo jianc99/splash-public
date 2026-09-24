@@ -241,7 +241,8 @@ Target and vision source adapters use `PreparedWeights`. Its default cache is
 `~/Library/Caches/Splash/weights`; `SPLASH_WEIGHT_CACHE` overrides that location.
 Preparation costs an additional on-disk copy of the prepared target and vision tensors. Existing
 packed artifacts are used directly. Source-content hashes, a build-generated fingerprint of preparation code and its
-storage ABI, and transformation parameters identify the cache. Changing that
+storage ABI, and transformation parameters identify the cache. An MLX vision artifact hashes
+`config.json` and only the shards holding `vision_tower.*`. Changing that
 code invalidates its artifacts automatically; unrelated app releases, core
 counts and support-asset updates do not. Completed files are read-only.
 One writer per cache serializes conversion; complete cache hits bypass this lock.

@@ -32,6 +32,9 @@ public:
   void requireConfigString(std::string_view key, std::string_view expected) const;
   void requireLayerTypes(uint32_t layers, uint32_t fullAttentionPeriod) const;
   [[nodiscard]] const std::string &digest() const noexcept;
+  // Identity of config.json and only the shards holding a tensor whose name
+  // starts with prefix, so a component keeps its identity when others change.
+  [[nodiscard]] std::string digest(std::string_view prefix) const;
   void checkUnchanged() const;
 private:
   struct Impl;

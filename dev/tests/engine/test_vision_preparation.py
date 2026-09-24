@@ -1,6 +1,6 @@
 """Prepare tiny MLX and GGUF vision towers and compare them with an independently
-serialized packed file; check the exact-BF16 rule and that invalid sources fail
-with their message and publish nothing."""
+serialized packed file; check the exact-BF16 rule, the MLX cache identity and
+that invalid sources fail with their message and publish nothing."""
 
 import json
 import math
@@ -14,7 +14,8 @@ from pathlib import Path
 ALIGN = 16384
 DTYPES = ("BF16", "F16", "F32")
 GGML_TYPES = {"F32": 0, "F16": 1, "Q4_0": 2, "BF16": 30}
-SHARD = "model.safetensors"
+VISION_SHARD = "model-00001-of-00002.safetensors"
+TEXT_SHARD = "model-00002-of-00002.safetensors"
 
 
 def encode(values, dtype):
@@ -194,7 +195,9 @@ def fixture(root, source, shift=0, case=None):
                 "BF16",
                 bytes(48),
             )
-        safetensors(root / SHARD, tensors)
+        safetensors(root / VISION_SHARD, tensors)
+        text = {"language_model.model.norm.weight": ([8], "BF16", bytes(16))}
+        safetensors(root / TEXT_SHARD, text)
         (root / "config.json").write_text("{}")
         return
     metadata = {
@@ -244,7 +247,7 @@ def main():
         root = Path(temp)
         for source in ("mlx", "gguf"):
             mlx = source == "mlx"
-            file = SHARD if mlx else "mmproj.gguf"
+            file = VISION_SHARD if mlx else "mmproj.gguf"
             # Every tensor as BF16, F16 and F32; BF16 is copied and exact F32
             # or F16 values become their BF16 bits.
             for shift in range(3):
@@ -297,9 +300,27 @@ def main():
                     result.stderr,
                 )
                 assert not published(directory), (source, case)
+
+        # The MLX tower's identity is config.json and the shard holding it.
+        directory = root / "mlx-0"
+        cached = prepare(binary, directory, "mlx", "warm").stdout.split()
+        safetensors(
+            directory / TEXT_SHARD,
+            {"language_model.model.norm.weight": ([8], "BF16", bytes(range(16)))},
+        )
+        result = prepare(binary, directory, "mlx", "warm")
+        assert result.returncode == 0 and result.stdout.split() == cached, result.stderr
+        (directory / "config.json").write_text('{"text_config": {}}')
+        result = prepare(binary, directory, "mlx", "warm", expected=False)
+        assert result.stderr.strip() == "unexpected warm conversion", result.stderr
+        data = bytearray((directory / VISION_SHARD).read_bytes())
+        data[-1] ^= 1
+        (directory / VISION_SHARD).write_bytes(data)
+        result = prepare(binary, directory, "mlx", "warm", expected=False)
+        assert result.stderr.strip() == "unexpected warm conversion", result.stderr
         print(
-            "Vision layouts from MLX and GGUF, exact BF16 conversion and rejected "
-            "sources PASS"
+            "Vision layouts from MLX and GGUF, exact BF16 conversion, MLX identity "
+            "and rejected sources PASS"
         )
 
 

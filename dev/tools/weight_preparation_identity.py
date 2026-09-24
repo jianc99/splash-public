@@ -28,6 +28,8 @@ INPUTS = {
     "VISION": (
         "runtime/model/VisionPreparation.cpp",
         "runtime/model/SafetensorsCheckpoint.mm",
+        "runtime/model/GgufFile.cpp",
+        "runtime/model/GgufFile.hpp",
         "runtime/model/WeightStore.hpp",
     ),
 }
