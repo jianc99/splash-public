@@ -830,15 +830,6 @@ void ggufPlans() {
   rejects([&] { (void)Projection(768, 256, BlockWeights{{segment(256, 256, 0), segment(768, 256, 256)}}); });
   require(Projection(768, 256, BlockWeights{{segment(256, 256, 0), segment(256, 256, 256)}}).blocks().segments.size() == 2,
           "a projection with padding past its segments was rejected");
-  // A projection runs only as the matrix it holds: the padding past its
-  // segments is part of it, not room for a narrower plan.
-  {
-    metal::CommandGraph graph;
-    const Projection padded(5376, 17408,
-                            BlockWeights{{QuantizedSegment::planes(GGUF_FMT_Q4K, 5120, 17408, {}, {}, {})}});
-    rejects([&] { (void)linear.add(graph, {}, padded, linear.plan({{5120, 17408}, 8}, padded)); });
-    require(graph.empty(), "a mismatched block projection encoded a dispatch");
-  }
   const LinearWorkload down{{5120, 17408}, 8, LinearPhase::Decode, LinearEpilogue::Residual};
   const LinearPlan single = linear.plan(down, blockProjection(5120, 17408, 1));
   require(single.workload().weightLayout == WeightLayout::Block32 &&
@@ -1091,6 +1082,43 @@ metal::MetalBuffer allocate(metal::MetalBackend &backend, uint64_t bytes) {
   auto buffer = backend.allocateBuffer(bytes);
   std::memset(buffer.contents(), 0, bytes);
   return buffer;
+}
+
+// A block projection dispatches only as the plan's matrix, and each segment
+// fills whole 64-column tiles, with every buffer the plan needs: the matching
+// projection encodes its dispatch, so only the projection can reject.
+void ggufProjectionMatrix(metal::MetalBackend &backend) {
+  const Linear linear = gpu(10, 16);
+  const auto segment = [](uint32_t n, uint32_t offset) {
+    QuantizedSegment s = QuantizedSegment::planes(GGUF_FMT_Q4K, n, 17408, {}, {}, {});
+    s.columnOffset = offset;
+    return s;
+  };
+  const Projection matching(5120, 17408, BlockWeights{{segment(5120, 0)}});
+  const LinearPlan plan = linear.plan({{5120, 17408}, 8}, matching);
+  const uint64_t rows = plan.storageRows();
+  const LinearScratchSize scratch = plan.scratchSize();
+  const LinearBuffers buffers{
+      .input = allocate(backend, rows * 17408 * 2),
+      .output = allocate(backend, rows * 5120 * 2),
+      .sums = allocate(backend, plan.sumsBytes()),
+      .gateScratch = allocate(backend, plan.gateScratchBytes()),
+      .downSums = allocate(backend, plan.downSumsBytes()),
+      .scratch = {allocate(backend, scratch.input), allocate(backend, scratch.sums),
+                  allocate(backend, scratch.partials), allocate(backend, scratch.counters)}};
+  {
+    metal::CommandGraph graph;
+    (void)linear.add(graph, buffers, matching, plan);
+    require(graph.dispatches().size() == 1, "the matching block projection did not encode its dispatch");
+  }
+  // The padding past a projection's segments is part of it, not room for a
+  // narrower plan; a segment of 32 columns leaves a partial tile.
+  for (const Projection &projection : {Projection(5376, 17408, BlockWeights{{segment(5120, 0)}}),
+                                       Projection(5120, 17408, BlockWeights{{segment(5088, 0), segment(32, 5088)}})}) {
+    metal::CommandGraph graph;
+    rejects([&] { (void)linear.add(graph, buffers, projection, plan); });
+    require(graph.empty(), "a block projection that is not the plan's tiles encoded a dispatch");
+  }
 }
 
 std::array<uint64_t, 3> projectionFingerprint(const Projection &projection) {
@@ -1522,6 +1550,7 @@ int main(int argc, char **argv) {
       return 0;
     }
     metal::MetalBackend backend(argv[1]);
+    ggufProjectionMatrix(backend);
     Linear linear(backend.capabilities());
     // Instrumented shader builds can report additional validation storage;
     // inspect production requirements in the ordinary/API-validation run.
