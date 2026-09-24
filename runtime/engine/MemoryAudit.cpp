@@ -45,7 +45,7 @@ MemoryAuditResult auditActualMemory(const EngineMemoryPlan &plan,
                                     ActualMemoryReport actual) {
   const EngineMemoryBreakdown &budget = plan.breakdown();
   // Vision weights are absent without a vision tower. Loading already
-  // requires them for a model with vision, and the plan counts what loaded.
+  // requires them for a model with vision.
   if (!actual.targetWeightsBytes || !actual.draftWeightsBytes ||
       !actual.stateResidentBytes || !actual.sharedPrefillBytes ||
       !actual.sharedDecodeBytes || !actual.kvResidentBytes ||
@@ -55,20 +55,29 @@ MemoryAuditResult auditActualMemory(const EngineMemoryPlan &plan,
                 "warmup memory report is incomplete", actual);
   }
 
+  // The plan takes the weight categories from what loaded, so they are
+  // counted but have no bound of their own. A buffer a loader does not report
+  // is unclassified backend memory, which the pipeline and runtime reserves
+  // bound; only the arenas and KV storage have planned category bounds.
+  uint64_t categorized = 0;
+  for (const uint64_t weights : {actual.targetWeightsBytes,
+                                 actual.draftWeightsBytes,
+                                 actual.visionWeightsBytes}) {
+    if (!checkedAdd(categorized, weights, categorized)) {
+      return fail(MemoryAuditError::ArithmeticOverflow,
+                  "categorized memory sum overflowed", actual);
+    }
+  }
   struct Category {
     const char *name;
     uint64_t actual;
     uint64_t planned;
   };
   const Category categories[] = {
-      {"target weights", actual.targetWeightsBytes, budget.targetWeightsBytes},
-      {"draft weights", actual.draftWeightsBytes, budget.draftWeightsBytes},
-      {"vision weights", actual.visionWeightsBytes, budget.visionWeightsBytes},
       {"shared prefill", actual.sharedPrefillBytes, budget.sharedPrefillBytes},
       {"shared decode", actual.sharedDecodeBytes, budget.sharedDecodeBytes},
       {"Q8 virtual storage", actual.kvResidentBytes, budget.kvVirtualBytes},
   };
-  uint64_t categorized = 0;
   for (const Category &category : categories) {
     if (category.actual > category.planned) {
       std::ostringstream message;

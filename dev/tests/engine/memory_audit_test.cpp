@@ -81,9 +81,27 @@ void testOptionalVisionAudit() {
   auto actual = report(textOnly);
   require(auditActualMemory(textOnly, actual).valid,
           "text-only warmup requires nonexistent vision weights");
-  actual.visionWeightsBytes = 1;
-  require(auditActualMemory(textOnly, actual).error == MemoryAuditError::CategoryExceedsPlan,
-          "unexpected vision allocation was accepted in text-only mode");
+}
+
+// Weights are planned from what loaded, so their rows have no bound of their
+// own; a buffer a loader does not report counts against the reserves.
+void testUnreportedAllocationsCountAgainstReserves() {
+  const auto memoryPlan = plan();
+  const auto &budget = memoryPlan.breakdown();
+  const uint64_t reserves =
+      budget.pipelineReserveBytes + budget.runtimeOverheadReserveBytes;
+  for (const uint64_t unreported : {reserves, reserves + 1}) {
+    auto actual = report(memoryPlan);
+    actual.backendAllocatedBytes += unreported;
+    actual.deviceCurrentAllocatedBytes = actual.backendAllocatedBytes;
+    actual.devicePeakAllocatedBytes = actual.backendAllocatedBytes + 16 * kMiB;
+    actual.estimatedWarmupPeakBytes = actual.devicePeakAllocatedBytes;
+    const auto result = auditActualMemory(memoryPlan, actual);
+    require(unreported == reserves
+                ? result.valid && result.backendUnclassifiedBytes == reserves
+                : result.error == MemoryAuditError::RuntimeReserveExceeded,
+            "an unreported weight allocation escaped the reserve bound");
+  }
 }
 
 void testFixedCategoryAndPeakFailures() {
@@ -114,6 +132,7 @@ int main() {
   try {
     testUnifiedDynamicAudit();
     testOptionalVisionAudit();
+    testUnreportedAllocationsCountAgainstReserves();
     testFixedCategoryAndPeakFailures();
     std::cout << "elastic memory audit tests passed\n";
     return EXIT_SUCCESS;
