@@ -694,8 +694,10 @@ void checkVerify(metal::MetalBackend &backend, uint32_t heads, kv::Layout layout
 
 // The q/k RMS norms, RoPE and V copy of the attention prepare, prefill and
 // verify, against fp64 with norm weights in bf16 or F32 (a GGUF's). Past the
-// rotary pairs a row holds the norm rounded once to bf16; the rotated pairs
-// are within an ulp of the fp64 rotation of the rounded norms.
+// rotary pairs a row holds the norm rounded once to bf16; each rotated value
+// is within an ulp of the fp64 rotation of the bf16-rounded norms plus an ulp
+// of the larger input, which covers the fp32 kernel rounding a norm to the
+// other bf16 neighbour and a rotation that cancels.
 void checkProjection(metal::MetalBackend &backend, uint32_t queryHeads, kv::Layout layout,
                      bool float32, bool verify) {
   constexpr uint32_t kDim = 256, kPairs = 32;
@@ -724,15 +726,18 @@ void checkProjection(metal::MetalBackend &backend, uint32_t queryHeads, kv::Layo
   const auto weight = [&](uint32_t) { return float(1.0 + 0.3 * unit()); };
   const ops::NormWeights queryNorm = test::makeNormWeights(backend, kDim, float32, weight);
   const ops::NormWeights keyNorm = test::makeNormWeights(backend, kDim, float32, weight);
+  const auto addProjection = [&](metal::CommandGraph &graph, const ops::NormWeights &keyWeights) {
+    if (verify)
+      ops::PagedAttention::addVerifyProjection(graph, packed, queryNorm, keyWeights, ropeCos, ropeSin,
+                                               queries, keys, values, rows, stride, stride,
+                                               queryHeads, layout, lanes);
+    else
+      ops::PagedAttention::addPrefillProjection(graph, packed, queryNorm, keyWeights, ropeCos, ropeSin,
+                                                queries, keys, values, rows, stride, stride,
+                                                queryHeads, layout);
+  };
   metal::CommandGraph graph;
-  if (verify)
-    ops::PagedAttention::addVerifyProjection(graph, packed, queryNorm, keyNorm, ropeCos, ropeSin,
-                                             queries, keys, values, rows, stride, stride,
-                                             queryHeads, layout, lanes);
-  else
-    ops::PagedAttention::addPrefillProjection(graph, packed, queryNorm, keyNorm, ropeCos, ropeSin,
-                                              queries, keys, values, rows, stride, stride,
-                                              queryHeads, layout);
+  addProjection(graph, keyNorm);
   (void)backend.submitCommand(graph.dispatches());
 
   const auto *queryData = static_cast<const uint16_t *>(queries.contents());
@@ -775,13 +780,17 @@ void checkProjection(metal::MetalBackend &backend, uint32_t queryHeads, kv::Layo
                     "attention prepare value copy differs");
       }
     }
-  if (float32)
-    rejects([&] {
-      metal::CommandGraph rejected;
-      ops::PagedAttention::addPrefillProjection(
-          rejected, packed, queryNorm, {keyNorm.buffer, false}, ropeCos, ropeSin, queries, keys,
-          values, rows, stride, stride, queryHeads, layout);
-    });
+  // One dispatch normalizes the queries and the keys, so it takes one norm type.
+  if (float32) {
+    metal::CommandGraph rejected;
+    try {
+      addProjection(rejected, {keyNorm.buffer, false});
+      throw std::runtime_error("mixed q/k norm types were accepted");
+    } catch (const std::invalid_argument &error) {
+      require(std::string_view(error.what()) == "query and key norms differ in type",
+              "mixed q/k norm types rejected for the wrong reason");
+    }
+  }
   std::cout << "attention prepare: q=" << queryHeads << (verify ? " verify" : " prefill")
             << (float32 ? " f32" : " bf16") << " norms PASS\n";
 }
