@@ -80,6 +80,7 @@
   textarea { display: block; width: 100%; max-height: 180px; padding: 6px 0; resize: none; border: 0; outline: 0; background: transparent }
   textarea::placeholder { color: var(--muted) }
   .toolbar { display: flex; flex: none; align-items: center; gap: 5px }
+  #attach[hidden] { display: none }
   #attach { display: grid; width: 34px; height: 34px; place-items: center; border-radius: 50%; color: var(--muted) }
   #attach:hover { color: var(--text); background: var(--hover) }
   .effort { position: relative; display: flex; align-items: center; gap: 5px; padding: 5px 21px 5px 8px; border-radius: 10px; color: var(--muted); font-size: 13px; line-height: 24px }
@@ -176,9 +177,27 @@
   let messages = [];
   let attachments = [];
   let controller;
+  // Until /v1/models says otherwise; a text-only model takes no images.
+  let imagesAccepted = true;
 
   const savedEffort = storageGet(effortKey);
   effort.value = allowedEfforts.has(savedEffort) ? savedEffort : 'xhigh';
+
+  function authorization() {
+    return apiKey.value ? {Authorization: `Bearer ${apiKey.value}`} : {};
+  }
+
+  async function loadModalities() {
+    try {
+      const response = await fetch('/v1/models', {headers: authorization()});
+      if (!response.ok) return;
+      const modalities = (await response.json()).data?.[0]?.input_modalities;
+      if (!Array.isArray(modalities)) return;
+      imagesAccepted = modalities.includes('image');
+      attach.hidden = !imagesAccepted;
+      if (!imagesAccepted) clearAttachments();
+    } catch { /* The server still rejects input the model cannot take. */ }
+  }
 
   function storageGet(key) {
     try {
@@ -422,6 +441,7 @@
   }
 
   async function addImages(files) {
+    if (!imagesAccepted) return;
     const images = Array.from(files).filter(file => file.type.startsWith('image/'));
     if (!images.length) return;
     // Readers update stable entries, even if rollback moves them to a new draft.
@@ -511,7 +531,7 @@
     try {
       const response = await fetch('/v1/chat/completions', {
         method: 'POST',
-        headers: {'Content-Type': 'application/json', ...(apiKey.value ? {Authorization: `Bearer ${apiKey.value}`} : {})},
+        headers: {'Content-Type': 'application/json', ...authorization()},
         body: JSON.stringify({messages: requestMessages(), stream: true, stream_options: {include_usage: true}, reasoning_effort: effort.value}),
         signal: controller.signal
       });
@@ -566,7 +586,7 @@
   });
   input.addEventListener('paste', event => {
     const images = Array.from(event.clipboardData?.items || [])
-      .filter(item => item.type.startsWith('image/'))
+      .filter(item => imagesAccepted && item.type.startsWith('image/'))
       .map(item => item.getAsFile())
       .filter(Boolean);
     if (!images.length) return;
@@ -579,6 +599,7 @@
     if (event.isComposing || event.keyCode === 229) return;
     if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); complete(); }
   });
+  apiKey.addEventListener('change', loadModalities);
   $('#new-chat').addEventListener('click', newChat);
   $('#mobile-new').addEventListener('click', newChat);
   $('#menu').addEventListener('click', () => document.body.classList.add('menu-open'));
@@ -586,5 +607,6 @@
   renderChat();
   renderRecents();
   updateComposer();
+  loadModalities();
 </script>
 </html>

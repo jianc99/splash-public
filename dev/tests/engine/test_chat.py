@@ -33,9 +33,10 @@ class Element {
   querySelector() { return new Element(); }
 }
 
-function createChat(storage = new Map(), writable = true) {
+function createChat(storage = new Map(), writable = true, models = null) {
   const elements = {};
   const requests = [];
+  const modelRequests = [];
   const reads = [];
   for (const id of ['chat', 'form', 'input', 'attachments', 'image-input',
                    'attach', 'effort', 'api-key', 'send', 'recents', 'new-chat',
@@ -63,6 +64,11 @@ function createChat(storage = new Map(), writable = true) {
     scrollTo() {}, AbortController, TextDecoder, Uint8Array, console, FileReader,
     crypto: require('node:crypto').webcrypto,
     fetch(url, options) {
+      if (url === '/v1/models') {
+        modelRequests.push(options.headers);
+        return models ? Promise.resolve({ok: true, json: async () => models})
+          : Promise.reject(new Error('offline'));
+      }
       return new Promise((resolve, reject) => {
         requests.push({url, headers: options.headers, body: JSON.parse(options.body), resolve, reject});
         options.signal.addEventListener('abort', () => {
@@ -72,7 +78,7 @@ function createChat(storage = new Map(), writable = true) {
     },
   });
   vm.runInContext(script, context);
-  return {elements, requests, reads};
+  return {elements, requests, reads, modelRequests};
 }
 
 const flush = () => new Promise(resolve => setImmediate(resolve));
@@ -153,6 +159,30 @@ assert.equal(fresh.elements['api-key'].value, '');
 setText(fresh, 'hello');
 submit(fresh);
 assert.equal(fresh.requests[0].headers.Authorization, undefined);
+""")
+
+    def test_image_attachment_follows_the_served_input_modalities(self):
+        self.run_chat(r"""
+(async () => {
+  for (const [modalities, accepted] of [
+    [['text'], false], [['text', 'image', 'pdf'], true],
+  ]) {
+    const chat = createChat(new Map(), true, {data: [{input_modalities: modalities}]});
+    await flush();
+    assert.equal(Boolean(chat.elements.attach.hidden), !accepted, `${modalities}`);
+    assert.equal(pasteImages(chat, 'pasted').length, Number(accepted));
+    assert.equal(selectImages(chat, 'selected').length, Number(accepted));
+  }
+  // Unknown modalities (offline, or a key not entered yet) keep the button;
+  // entering a key asks again with it.
+  const chat = createChat();
+  await flush();
+  assert.ok(!chat.elements.attach.hidden);
+  chat.elements['api-key'].value = 'key';
+  chat.elements['api-key'].handlers.change();
+  await flush();
+  assert.equal(chat.modelRequests.at(-1).Authorization, 'Bearer key');
+})().catch(error => { console.error(error); process.exitCode = 1; });
 """)
 
     def test_restores_saved_chats_and_effort_with_read_only_storage(self):
