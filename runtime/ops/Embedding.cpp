@@ -4,6 +4,7 @@
 #include "metal/abi/Gguf.h"
 
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 namespace splash::ops {
@@ -32,14 +33,15 @@ void Embedding::add(metal::CommandGraph &graph, metal::MetalBuffer tokens,
       output.sizeBytes() < uint64_t{rows} * table.inputSize * sizeof(uint16_t))
     throw std::invalid_argument("embedding buffers are smaller than the gathered rows");
   if (table.layout() == WeightLayout::Block32) {
+    // Native rows gather in their format: gguf_embed_q4k, _q6k or _q80.
+    const QuantizedSegment &native = table.blocks();
+    if (native.formatId != GGUF_FMT_Q4K && native.formatId != GGUF_FMT_Q6K &&
+        native.formatId != GGUF_FMT_Q80)
+      throw std::invalid_argument("unsupported native embedding format");
     const GgufEmbedParams params{rows, table.outputSize, table.inputSize};
-    const uint32_t type = table.blocks().type;
-    const char *kernel = type == 12 ? "gguf_embed_q4k"
-                         : type == 14 ? "gguf_embed_q6k"
-                         : type == 8 ? "gguf_embed_q80" : nullptr;
-    if (!kernel) throw std::invalid_argument("unsupported GGUF embedding type");
-    graph.add(kernel, {std::move(tokens), table.blocks().plane0, std::move(output)},
-              params, {(rows * table.inputSize + 255) / 256, 1, 1}, {256, 1, 1});
+    graph.add(std::string("gguf_embed_") + native.format,
+              {std::move(tokens), native.plane0, std::move(output)}, params,
+              {(rows * table.inputSize + 255) / 256, 1, 1}, {256, 1, 1});
     return;
   }
   const uint32_t hiddenGroups = (table.inputSize + 127) / 128;

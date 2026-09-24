@@ -737,6 +737,8 @@ void checkDenseTarget(splash::metal::MetalBackend &backend) {
            blocks(weights.logitsProjection, layout.vocabularySize, hidden, {layout.vocabularySize}) &&
            std::string_view(weights.logitsProjection.blocks().segments.front().format) == "q6k" &&
            weights.tokenEmbedding.layout() == ops::WeightLayout::Block32 &&
+           weights.tokenEmbedding.blocks().formatId == GGUF_FMT_Q80 &&
+           std::string_view(weights.tokenEmbedding.blocks().format) == "q80" &&
            weights.tokenEmbedding.outputSize == layout.vocabularySize &&
            weights.tokenEmbedding.inputSize == hidden && model::qwenTargetGeometry(weights).valid();
     for (const auto &layer : weights.layers) {

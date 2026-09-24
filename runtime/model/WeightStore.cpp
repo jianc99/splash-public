@@ -363,6 +363,8 @@ ops::EmbeddingWeights readGgufEmbedding(WeightFile &file, uint32_t outputSize, u
     ops::QuantizedSegment s;
     s.plane0 = file.section(d.plane0Bytes, std::string(label) + "-native");
     s.type = d.type; s.outputSize = d.outputSize; s.inputSize = d.inputSize;
+    s.formatId = format;
+    s.format = kQuantFormats[format].name;
     return {outputSize, inputSize, std::move(s)};
 }
 
