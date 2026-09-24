@@ -5,6 +5,7 @@
 
 #include <filesystem>
 #include <memory>
+#include <vector>
 
 #include "metal/MetalBackend.hpp"
 #include "model/GgufFile.hpp"
@@ -19,10 +20,11 @@ namespace splash::model {
 
 class GgufTargetLoader final {
 public:
-  // Before the first image is written, the disk check budgets every missing
-  // image together with alsoPrepared, the model's other prepared files.
+  // Plans every image from the GGUF's metadata once. Before the first image
+  // is written, the disk check budgets every missing image together with
+  // alsoPrepared, the model's other prepared files.
   GgufTargetLoader(metal::MetalBackend &backend, std::filesystem::path path,
-                   gguf::TargetGeometry geometry, PreparationCheck check = {},
+                   gguf::TargetGeometry geometry, PreparationCheck admitConversion = {},
                    std::span<const PreparedWeight> alsoPrepared = {});
   GgufTargetLoader(const GgufTargetLoader &) = delete;
   GgufTargetLoader &operator=(const GgufTargetLoader &) = delete;
@@ -30,18 +32,19 @@ public:
   [[nodiscard]] WeightFile layer(uint32_t index);
   [[nodiscard]] WeightFile head();
   [[nodiscard]] WeightFile embedding();
-  [[nodiscard]] const GgufFile &file() const noexcept { return file_; }
-  [[nodiscard]] const gguf::ImagePlanner &planner() const noexcept { return planner_; }
 
 private:
-  [[nodiscard]] WeightFile build(const gguf::Image &image, uint32_t expectedLayer,
-                                 uint32_t expectedType);
+  struct Planned {
+    gguf::Image image;
+    std::string key;
+  };
+  [[nodiscard]] WeightFile build(const Planned &planned);
 
   metal::MetalBackend *backend_;
-  PreparationCheck check_;
+  PreparationCheck admitConversion_;
   WeightSource source_;
-  GgufFile file_;
-  gguf::ImagePlanner planner_;
+  uint64_t dataOffset_ = 0;
+  std::vector<Planned> images_; // layers, head, embedding
   PreparedWeights cache_;
 };
 

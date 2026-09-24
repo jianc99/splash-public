@@ -16,54 +16,50 @@ std::filesystem::path findTargetGguf(const std::filesystem::path &directory) {
 }
 
 GgufTargetLoader::GgufTargetLoader(metal::MetalBackend &backend, std::filesystem::path path,
-                                   gguf::TargetGeometry geometry, PreparationCheck check,
+                                   gguf::TargetGeometry geometry, PreparationCheck admitConversion,
                                    std::span<const PreparedWeight> alsoPrepared)
-    : backend_(&backend), check_(std::move(check)), source_(path, [&backend] { backend.checkOperation(); }),
-      file_(std::move(path)), planner_(file_, geometry) {
+    : backend_(&backend), admitConversion_(std::move(admitConversion)),
+      source_(path, [&backend] { backend.checkOperation(); }) {
+  const GgufFile file(std::move(path));
   source_.checkUnchanged();
+  dataOffset_ = file.dataOffset();
+  const gguf::ImagePlanner planner(file, geometry);
   std::vector<PreparedWeight> weights(alsoPrepared.begin(), alsoPrepared.end());
-  const auto include = [&](const gguf::Image &image) {
-    weights.push_back({ggufImageKey(source_.digest(), image), image.bytes});
-  };
-  for (uint32_t layer = 0; layer < geometry.layers; ++layer) {
+  const auto plan = [&](gguf::Image image) {
     backend.checkOperation();
-    include(planner_.layer(layer));
-  }
-  include(planner_.head());
-  include(planner_.embedding());
+    auto key = ggufImageKey(source_.digest(), image);
+    weights.push_back({key, image.bytes});
+    images_.push_back({std::move(image), std::move(key)});
+  };
+  for (uint32_t layer = 0; layer < geometry.layers; ++layer) plan(planner.layer(layer));
+  plan(planner.head());
+  plan(planner.embedding());
   cache_.requireSpace(weights, [&backend] { backend.checkOperation(); });
 }
 
 WeightFile GgufTargetLoader::layer(uint32_t index) {
-  backend_->checkOperation();
-  const gguf::Image image = planner_.layer(index);
-  return build(image, index, planner_.geometry().isFullAttentionLayer(index) ? 1u : 0u);
+  if (index + 2 >= images_.size()) throw GgufError("target layer is out of range");
+  return build(images_[index]);
 }
 
-WeightFile GgufTargetLoader::head() {
-  backend_->checkOperation();
-  return build(planner_.head(), planner_.geometry().layers, 2u);
-}
+WeightFile GgufTargetLoader::head() { return build(images_[images_.size() - 2]); }
 
-WeightFile GgufTargetLoader::embedding() {
-  backend_->checkOperation();
-  return build(planner_.embedding(), planner_.geometry().vocabularySize,
-               planner_.geometry().hiddenSize);
-}
+WeightFile GgufTargetLoader::embedding() { return build(images_.back()); }
 
-WeightFile GgufTargetLoader::build(const gguf::Image &image, uint32_t expectedLayer,
-                                   uint32_t expectedType) {
+WeightFile GgufTargetLoader::build(const Planned &planned) {
+  const gguf::Image &image = planned.image;
+  backend_->checkOperation();
   source_.checkUnchanged();
-  const auto key = ggufImageKey(source_.digest(), image);
-  const auto path = cache_.prepare({key, image.bytes, image.name, file_.path().string()},
+  const auto path = cache_.prepare({planned.key, image.bytes, image.name, source_.path().string()},
       [&](int destination) {
-        prepareGgufImage(*backend_, source_.descriptor(), destination, image, check_);
+        prepareGgufImage(*backend_, source_.descriptor(), dataOffset_, destination, image,
+                         [&] { backend_->checkOperation(); if (admitConversion_) admitConversion_(); });
         source_.checkUnchanged();
       },
-      [&] { backend_->checkOperation(); }, check_);
+      [&] { backend_->checkOperation(); }, admitConversion_);
   source_.checkUnchanged();
-  return WeightFile(*backend_, path, "target/" + image.name, kGgufImageMagic,
-                    expectedLayer, expectedType, key);
+  return WeightFile(*backend_, path, "target/" + image.name, kGgufImageMagic, image.layer, image.type,
+                    planned.key);
 }
 
 } // namespace splash::model

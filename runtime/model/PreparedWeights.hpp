@@ -14,6 +14,9 @@ namespace splash::model {
 // opens completed, immutable artifacts through WeightFile. The admission reserve
 // includes source metadata and small staging buffers; it is not a model copy.
 inline constexpr uint64_t kWeightPreparationWorkspaceBytes = 64 * 1024 * 1024;
+// The staging of one conversion step, its input and output together. Every
+// adapter sizes its chunks to it, whatever the tensor, layer or expert count.
+inline constexpr uint64_t kWeightPreparationStagingBytes = kWeightPreparationWorkspaceBytes / 2;
 
 enum class TargetSource : uint8_t { Packed, Affine, Gguf };
 
@@ -34,6 +37,7 @@ void requireWeightDiskSpace(uint64_t available, uint64_t required);
 void readWeightBytes(int descriptor, uint64_t offset, std::span<uint8_t> bytes);
 void writeWeightBytes(int descriptor, uint64_t offset, std::span<const uint8_t> bytes);
 [[nodiscard]] std::string weightDigest(std::span<const uint8_t> bytes);
+[[nodiscard]] std::string weightDigest(std::string_view text);
 [[nodiscard]] std::string weightFileDigest(int descriptor, const PreparationCheck &check = {});
 
 class WeightSource final {

@@ -1,22 +1,20 @@
 #pragma once
 
 // Plans the prepared MDGG0001 images of a Qwen3.8 (qwen35) or Qwen3.6 MoE
-// (qwen35moe) target read straight from a llama.cpp GGUF: section offsets, the
-// bytes the CPU fills (header, descriptors, norms, convolution, decay, time
-// bias, alpha/beta) and the GPU repacks/copies that move quantized rows into
-// 256-column tiles. Layout: 16-byte header (magic, layer, type), then 16
-// KiB-aligned sections; each quantized tensor is a 64-byte descriptor, then its
-// plane0, optional plane1 and meta planes in the layout of its format
-// (metal/abi/QuantFormat.h); each float tensor (F32) a descriptor and its rows
-// as stored. A 3-D expert tensor is one quantized tensor of experts * N rows.
+// (qwen35moe) target read straight from a llama.cpp GGUF, from its metadata
+// alone: section offsets, the header and descriptor bytes, and the source
+// rows each tensor section is written from (model/GgufPreparation.hpp).
+// Layout: 16-byte header (magic, layer, type), then 16 KiB-aligned sections;
+// each quantized tensor is a 64-byte descriptor, then its plane0, optional
+// plane1 and meta planes in the layout of its format (metal/abi/QuantFormat.h);
+// each float tensor (F32) a descriptor and its rows as stored. A 3-D expert
+// tensor is one quantized tensor of experts * N rows.
 
 #include <cstdint>
 #include <string>
 #include <vector>
 
-#include "metal/abi/Gguf.h"
 #include "model/GgufFile.hpp"
-#include "model/WeightLayout.hpp"
 
 namespace splash::model::gguf {
 
@@ -48,19 +46,47 @@ struct TargetGeometry {
   }
 };
 
+// The order of a tensor's rows in the image. Rows below `from` keep their
+// order; from there on, blocks of headRows rows are value heads, which
+// llama.cpp stores tiled (group * groupHeads + head) and splash groups by key
+// head.
+struct RowOrder {
+  uint64_t from = UINT64_MAX; // UINT64_MAX: rows as stored
+  uint32_t headRows = 0;
+  uint32_t groupHeads = 0; // heads per key group
+  uint32_t groups = 0;     // value heads per key head
+};
+
+// Rows [0, rows) of one source tensor in image order.
+struct TensorRows {
+  std::string name;
+  uint32_t type = 0;   // ggml type
+  uint64_t offset = 0; // the tensor's data, from the start of the data section
+  uint64_t rows = 0;
+  uint64_t rowBytes = 0;
+  RowOrder order{};
+};
+
+// Header and descriptor bytes.
 struct Fill {
   uint64_t offset = 0;
   std::vector<uint8_t> bytes;
 };
-struct Repack {
-  GgufRepackParams params{}; // src_offset is zero: the executor binds a tensor-local view
-  uint64_t sourceOffset = 0; // absolute file offset of the tensor data
-  uint64_t sourceBytes = 0;
-};
+// Rows written back to back as stored or, for F32 rows the kernels read as
+// bf16, as the bf16 values they equal exactly.
 struct Copy {
-  GgufCopyParams params{};
-  uint64_t sourceOffset = 0;
-  uint64_t sourceBytes = 0;
+  uint64_t destination = 0;
+  TensorRows source;
+  bool bfloat16 = false;
+};
+// Quantized rows repacked into the planes of their format; the rows of the
+// sources in order, then zero rows up to `rows`.
+struct Repack {
+  uint32_t format = 0; // GGUF_FMT_*
+  uint64_t rows = 0;
+  uint64_t columns = 0;
+  uint64_t plane0 = 0, plane1 = 0, meta = 0; // image offsets; plane1 when the format has one
+  std::vector<TensorRows> sources;
 };
 struct Image {
   std::string name; // layer-N.bin, head.bin, embedding.bin
@@ -68,8 +94,8 @@ struct Image {
   uint32_t type = 0;
   uint64_t bytes = 0;
   std::vector<Fill> fills;
-  std::vector<Repack> repacks;
   std::vector<Copy> copies;
+  std::vector<Repack> repacks;
 };
 
 class ImagePlanner final {

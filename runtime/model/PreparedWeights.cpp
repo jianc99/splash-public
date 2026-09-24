@@ -203,6 +203,10 @@ std::string weightDigest(std::span<const uint8_t> bytes) {
   return hex(digest);
 }
 
+std::string weightDigest(std::string_view text) {
+  return weightDigest({reinterpret_cast<const uint8_t *>(text.data()), text.size()});
+}
+
 std::string weightFileDigest(int fd, const PreparationCheck &check) {
   struct stat before{}, after{};
   if (fstat(fd, &before)) fail("stat source weights");

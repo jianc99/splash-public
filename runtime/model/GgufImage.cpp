@@ -1,10 +1,9 @@
 #include "model/GgufImage.hpp"
 
+#include "metal/abi/Gguf.h"
 #include "model/StateLayout.hpp"
+#include "model/WeightLayout.hpp"
 
-#include <cstring>
-#include <fstream>
-#include <limits>
 #include <optional>
 
 namespace splash::model::gguf {
@@ -21,8 +20,6 @@ static_assert(kQuantFormats[GGUF_FMT_Q4K].ggml_type == ggml::kQ4_K &&
               "format table types are the GGUF type ids");
 static_assert(GGUF_TYPE_F32 == ggml::kF32, "float segments carry the GGUF type id");
 
-constexpr uint32_t kNoPermute = 0xFFFFFFFFu;
-
 uint64_t alignUp(uint64_t value) {
   return (value + kWeightFileAlignment - 1) / kWeightFileAlignment * kWeightFileAlignment;
 }
@@ -32,63 +29,6 @@ void appendLittle32(std::vector<uint8_t> &out, uint32_t value) {
 }
 void appendLittle64(std::vector<uint8_t> &out, uint64_t value) {
   for (int i = 0; i < 8; ++i) out.push_back(static_cast<uint8_t>(value >> (8 * i)));
-}
-
-// llama.cpp stores value-head-major tensors in tiled order (group * keyHeads +
-// head); splash uses the grouped order. Destination head h maps to source head
-// (h % groups) * groupHeads + h / groups.
-uint32_t sourceHead(uint32_t destinationHead, uint32_t groupHeads, uint32_t groups) {
-  return (destinationHead % groups) * groupHeads + destinationHead / groups;
-}
-
-std::vector<uint8_t> readBytes(const GgufFile &file, const GgufTensor &tensor) {
-  if (tensor.bytes > 1024 * 1024)
-    throw GgufError("small weight tensor exceeds preparation bound: " + tensor.name);
-  std::ifstream stream(file.path(), std::ios::binary);
-  if (!stream) throw GgufError("cannot open GGUF file: " + file.path().string());
-  std::vector<uint8_t> bytes(tensor.bytes);
-  stream.seekg(static_cast<std::streamoff>(file.absoluteOffset(tensor)));
-  stream.read(reinterpret_cast<char *>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
-  if (!stream) throw GgufError("cannot read tensor " + tensor.name);
-  return bytes;
-}
-
-std::vector<float> readFloats(const GgufFile &file, const GgufTensor &tensor) {
-  if (tensor.type != ggml::kF32) throw GgufError("expected an F32 tensor: " + tensor.name);
-  std::vector<uint8_t> bytes = readBytes(file, tensor);
-  std::vector<float> values(bytes.size() / 4);
-  std::memcpy(values.data(), bytes.data(), bytes.size());
-  return values;
-}
-
-// Reorders rows [from, end) in blocks of headRows from tiled to grouped order.
-template <class T>
-std::vector<T> unreorderRows(std::vector<T> values, uint32_t rowWidth, uint32_t from,
-                             uint32_t headRows, uint32_t groupHeads, uint32_t groups) {
-  std::vector<T> out = values;
-  const uint32_t rows = static_cast<uint32_t>(values.size() / rowWidth);
-  for (uint32_t n = from; n < rows; ++n) {
-    const uint32_t head = (n - from) / headRows, element = (n - from) % headRows;
-    const uint32_t source = from + sourceHead(head, groupHeads, groups) * headRows + element;
-    std::copy_n(values.begin() + size_t(source) * rowWidth, rowWidth, out.begin() + size_t(n) * rowWidth);
-  }
-  return out;
-}
-
-// The GDN kernels read the convolution weights and the time bias as bf16,
-// which holds them exactly when they come from a bf16 checkpoint. Any other
-// value would be rounded silently, so the tensor is refused by name.
-std::vector<uint8_t> exactBfloat16(const std::vector<float> &values, const std::string &name) {
-  std::vector<uint8_t> out;
-  out.reserve(values.size() * 2);
-  for (float value : values) {
-    uint32_t bits;
-    std::memcpy(&bits, &value, sizeof bits);
-    if (bits & 0xFFFFu) throw GgufError(name + " is not bf16-exact; it needs an F32 path");
-    out.push_back(static_cast<uint8_t>(bits >> 16));
-    out.push_back(static_cast<uint8_t>(bits >> 24));
-  }
-  return out;
 }
 
 class Builder {
@@ -106,98 +46,72 @@ public:
     cursor_ = 16;
   }
 
-  uint64_t section(uint64_t bytes) {
-    if (!bytes) throw GgufError("empty image section in " + image_.name);
-    const uint64_t start = alignUp(cursor_);
-    cursor_ = start + bytes;
-    return start;
-  }
-
-  void fill(std::vector<uint8_t> bytes) {
-    uint64_t total = bytes.size();
-    for (const auto &fill : image_.fills) total += fill.bytes.size();
-    if (total > 4 * 1024 * 1024) throw GgufError("image metadata exceeds preparation bound");
-    const uint64_t offset = section(bytes.size());
-    image_.fills.push_back({offset, std::move(bytes)});
-  }
-
   // A norm as stored: F32, which the norm kernels read unrounded, as
   // llama.cpp does (ops::NormWeights).
-  void floatNorm(const char *name, uint64_t elements) {
-    const GgufTensor &tensor = file_.require(name);
-    if (tensor.elements() != elements) throw GgufError("unexpected shape for " + tensor.name);
-    if (tensor.type != ggml::kF32) throw GgufError("expected an F32 tensor: " + tensor.name);
-    fill(readBytes(file_, tensor));
+  void floatNorm(const std::string &name, uint64_t elements) {
+    const GgufTensor &tensor = requireFloat(name, elements);
+    copy(rows(tensor, 1, tensor.bytes));
   }
 
-  // Quantized rows [N, K] repacked into planes; rows >= permuteFrom come from
-  // llama.cpp's tiled value-head order.
-  void quantized(const GgufTensor &tensor, uint64_t rows, uint64_t columns,
-                 uint32_t permuteFrom = kNoPermute, uint32_t headRows = 0) {
+  // Quantized rows [N, K] repacked into planes, rows in `order`.
+  void quantized(const GgufTensor &tensor, uint64_t rows, uint64_t columns, RowOrder order = {}) {
     const uint32_t format = gguf_format_of(tensor.type);
     if (format == GGUF_FMT_COUNT)
       throw GgufError("unsupported tensor type " + ggmlTypeName(tensor.type) + " for " + tensor.name);
-    const QuantFormat &layout = kQuantFormats[format];
     if (tensor.rows() != rows || tensor.columns() != columns)
       throw GgufError("unexpected shape for " + tensor.name);
-    if (rows % 256 || columns % 256) throw GgufError("tensor is not tile aligned: " + tensor.name);
-    const uint64_t rowBytes = columns / layout.block_elements * layout.block_bytes;
-    if (tensor.bytes != rows * rowBytes) throw GgufError("unexpected size for " + tensor.name);
-    const uint64_t groups = columns / 32;
-    const uint64_t plane0 = rows * groups * layout.plane0_bytes;
-    const uint64_t plane1 = rows * groups * layout.plane1_bytes;
-    const uint64_t meta = rows * (groups / layout.meta_groups) * layout.meta_bytes;
-    descriptor(layout.ggml_type, rows, columns, layout.plane0_bytes, layout.plane1_bytes,
-               layout.meta_bytes, layout.meta_groups, plane0, plane1, meta);
-    Repack repack;
-    repack.params.rows = static_cast<uint32_t>(rows);
-    repack.params.input_size = static_cast<uint32_t>(columns);
-    repack.params.fmt = format;
-    repack.params.src_row_bytes = static_cast<uint32_t>(rowBytes);
-    repack.params.dst_plane0 = offset32(section(plane0));
-    repack.params.dst_plane1 = plane1 ? offset32(section(plane1)) : 0;
-    repack.params.dst_meta = offset32(section(meta));
-    repack.params.permute_from_row = permuteFrom;
-    repack.params.permute_head_rows = headRows;
-    repack.params.permute_group_heads = geometry_.gdnKeyHeads;
-    repack.params.permute_groups = geometry_.gdnValueHeads / geometry_.gdnKeyHeads;
-    repack.sourceOffset = file_.absoluteOffset(tensor);
-    repack.sourceBytes = tensor.bytes;
-    image_.repacks.push_back(repack);
+    Repack repack = planes(format, rows, columns, tensor.name);
+    repack.sources.push_back(this->rows(tensor, rows, rowBytes(format, columns), order));
+    image_.repacks.push_back(std::move(repack));
   }
 
-  // beta (48 rows) | alpha (48 rows) | zeros as one 256-row Q8_0 tensor, rows in
-  // grouped head order; built on the CPU (half a megabyte).
+  // beta (value heads rows) | alpha (value heads rows) | zero rows as one
+  // 256-row Q8_0 tensor, rows in grouped head order.
   void alphaBeta(const GgufTensor &beta, const GgufTensor &alpha) {
     const uint32_t heads = geometry_.gdnValueHeads, hidden = geometry_.hiddenSize;
     for (const GgufTensor *t : {&beta, &alpha})
       if (t->type != ggml::kQ8_0 || t->rows() != heads || t->columns() != hidden)
         throw GgufError("alpha/beta must be Q8_0 [" + std::to_string(heads) + ", hidden]: " + t->name);
-    const QuantFormat &q8 = kQuantFormats[GGUF_FMT_Q80];
-    const uint32_t groups = hidden / 32, rows = 256;
-    const uint64_t plane0 = uint64_t{rows} * groups * q8.plane0_bytes;
-    const uint64_t meta = uint64_t{rows} * groups * q8.meta_bytes;
-    descriptor(q8.ggml_type, rows, hidden, q8.plane0_bytes, q8.plane1_bytes, q8.meta_bytes,
-               q8.meta_groups, plane0, 0, meta);
-    if (heads > 128 || plane0 + meta > 2 * 1024 * 1024)
-      throw GgufError("alpha/beta exceeds preparation bound");
-    std::vector<uint8_t> betaBytes = readBytes(file_, beta), alphaBytes = readBytes(file_, alpha);
-    std::vector<uint8_t> plane(plane0, 0), metaBytes(meta, 0);
-    const uint32_t groupHeads = geometry_.gdnKeyHeads, valueGroups = heads / groupHeads;
-    for (uint32_t n = 0; n < 2 * heads; ++n) {
-      const std::vector<uint8_t> &source = n < heads ? betaBytes : alphaBytes;
-      const uint32_t row = sourceHead(n % heads, groupHeads, valueGroups);
-      for (uint32_t g = 0; g < groups; ++g) {
-        const uint8_t *block = source.data() + (size_t(row) * groups + g) * q8.block_bytes;
-        const uint64_t tile = quant_tile_index(n, g, groups);
-        for (uint32_t e = 0; e < 32; ++e) plane[tile * q8.plane0_bytes + quant_slot(e)] = block[2 + e];
-        std::memcpy(metaBytes.data() + tile * q8.meta_bytes, block, 2);
-      }
-    }
-    fill(std::move(plane));
-    fill(std::move(metaBytes));
+    if (2 * heads > kQ4StorageN) throw GgufError("alpha/beta rows exceed one 256-row tile");
+    Repack repack = planes(GGUF_FMT_Q80, kQ4StorageN, hidden, alpha.name);
+    for (const GgufTensor *t : {&beta, &alpha})
+      repack.sources.push_back(rows(*t, heads, rowBytes(GGUF_FMT_Q80, hidden), grouped(0, 1)));
+    image_.repacks.push_back(std::move(repack));
   }
 
+  // F32 beta (value heads rows) | alpha (value heads rows), rows in grouped
+  // head order, as one float tensor.
+  void floatAlphaBeta(const GgufTensor &beta, const GgufTensor &alpha) {
+    const uint32_t heads = geometry_.gdnValueHeads, hidden = geometry_.hiddenSize;
+    for (const GgufTensor *t : {&beta, &alpha})
+      if (t->type != ggml::kF32 || t->rows() != heads || t->columns() != hidden)
+        throw GgufError("alpha/beta must be [" + std::to_string(heads) + ", hidden]: " + t->name);
+    descriptor(ggml::kF32, 2ull * heads, hidden, 0, 0, 0, 0, beta.bytes + alpha.bytes, 0, 0);
+    uint64_t destination = section(beta.bytes + alpha.bytes);
+    for (const GgufTensor *t : {&beta, &alpha}) {
+      image_.copies.push_back({destination, rows(*t, heads, t->bytes / heads, grouped(0, 1))});
+      destination += t->bytes;
+    }
+  }
+
+  // The convolution taps of every channel, q and k channels as stored, then
+  // value channels in grouped head order, as the exact bf16 values the GDN
+  // kernels read.
+  void convolution(const GgufTensor &tensor, uint64_t keyRows) {
+    const uint32_t channels = geometry_.convolutionDimension;
+    const GgufTensor &conv = requireFloat(tensor.name, uint64_t{channels} * kGdnConvolutionTaps);
+    copy(rows(conv, channels, conv.bytes / channels, grouped(keyRows, geometry_.gdnHeadDimension)), true);
+  }
+
+  // A per value head F32 vector in grouped head order: as stored, or as the
+  // exact bf16 values the kernels read.
+  void headVector(const std::string &name, bool bfloat16) {
+    const uint32_t heads = geometry_.gdnValueHeads;
+    const GgufTensor &tensor = requireFloat(name, heads);
+    copy(rows(tensor, heads, tensor.bytes / heads, grouped(0, 1)), bfloat16);
+  }
+
+  // Native token rows, gathered by the embedding kernel.
   void embeddingRows(const GgufTensor &tensor) {
     if (tensor.type != ggml::kQ4_K && tensor.type != ggml::kQ6_K && tensor.type != ggml::kQ8_0)
       throw GgufError("unsupported token embedding type " + ggmlTypeName(tensor.type));
@@ -215,30 +129,71 @@ public:
     copiedRows(tensor);
   }
 
-  // F32 beta (value heads rows) | alpha (value heads rows), rows in grouped
-  // head order, as one float tensor; built on the CPU (512 KB for the 35B).
-  void floatAlphaBeta(const GgufTensor &beta, const GgufTensor &alpha) {
-    const uint32_t heads = geometry_.gdnValueHeads, hidden = geometry_.hiddenSize;
-    const uint32_t groupHeads = geometry_.gdnKeyHeads, valueGroups = heads / groupHeads;
-    std::vector<float> rows;
-    for (const GgufTensor *t : {&beta, &alpha}) {
-      if (t->rows() != heads || t->columns() != hidden)
-        throw GgufError("alpha/beta must be [" + std::to_string(heads) + ", hidden]: " + t->name);
-      const std::vector<float> grouped = unreorderRows(readFloats(file_, *t), hidden, 0, 1, groupHeads, valueGroups);
-      rows.insert(rows.end(), grouped.begin(), grouped.end());
-    }
-    std::vector<uint8_t> bytes(rows.size() * sizeof(float));
-    std::memcpy(bytes.data(), rows.data(), bytes.size());
-    descriptor(ggml::kF32, 2ull * heads, hidden, 0, 0, 0, 0, bytes.size(), 0, 0);
-    fill(std::move(bytes));
-  }
-
   Image finish() {
     image_.bytes = alignUp(cursor_);
     return std::move(image_);
   }
 
 private:
+  uint64_t section(uint64_t bytes) {
+    if (!bytes) throw GgufError("empty image section in " + image_.name);
+    const uint64_t start = alignUp(cursor_);
+    cursor_ = start + bytes;
+    return start;
+  }
+
+  const GgufTensor &requireFloat(const std::string &name, uint64_t elements) const {
+    const GgufTensor &tensor = file_.require(name);
+    if (tensor.elements() != elements) throw GgufError("unexpected shape for " + tensor.name);
+    if (tensor.type != ggml::kF32) throw GgufError("expected an F32 tensor: " + tensor.name);
+    return tensor;
+  }
+
+  RowOrder grouped(uint64_t from, uint32_t headRows) const {
+    return {from, headRows, geometry_.gdnKeyHeads, geometry_.gdnValueHeads / geometry_.gdnKeyHeads};
+  }
+
+  static uint64_t rowBytes(uint32_t format, uint64_t columns) {
+    return columns / kQuantFormats[format].block_elements * kQuantFormats[format].block_bytes;
+  }
+
+  static TensorRows rows(const GgufTensor &tensor, uint64_t rows, uint64_t rowBytes, RowOrder order = {}) {
+    if (!rows || rows * rowBytes != tensor.bytes) throw GgufError("unexpected size for " + tensor.name);
+    return {tensor.name, tensor.type, tensor.offset, rows, rowBytes, order};
+  }
+
+  // Rows written as stored, or converted to bf16, into their own section.
+  void copy(TensorRows source, bool bfloat16 = false) {
+    const uint64_t bytes = source.rows * source.rowBytes / (bfloat16 ? 2 : 1);
+    image_.copies.push_back({section(bytes), std::move(source), bfloat16});
+  }
+
+  // A tensor's rows as stored, after their descriptor.
+  void copiedRows(const GgufTensor &tensor) {
+    descriptor(tensor.type, tensor.rows(), tensor.columns(), 0, 0, 0, 0, tensor.bytes, 0, 0);
+    copy(rows(tensor, tensor.rows(), tensor.bytes / tensor.rows()));
+  }
+
+  // The descriptor and planes of a [rows, columns] quantized tensor.
+  Repack planes(uint32_t format, uint64_t rows, uint64_t columns, const std::string &name) {
+    if (rows % kQ4StorageN || columns % 256) throw GgufError("tensor is not tile aligned: " + name);
+    const QuantFormat &layout = kQuantFormats[format];
+    const uint64_t groups = columns / 32;
+    const uint64_t plane0 = rows * groups * layout.plane0_bytes;
+    const uint64_t plane1 = rows * groups * layout.plane1_bytes;
+    const uint64_t meta = rows * (groups / layout.meta_groups) * layout.meta_bytes;
+    descriptor(layout.ggml_type, rows, columns, layout.plane0_bytes, layout.plane1_bytes,
+               layout.meta_bytes, layout.meta_groups, plane0, plane1, meta);
+    Repack repack;
+    repack.format = format;
+    repack.rows = rows;
+    repack.columns = columns;
+    repack.plane0 = section(plane0);
+    repack.plane1 = plane1 ? section(plane1) : 0;
+    repack.meta = section(meta);
+    return repack;
+  }
+
   // Word 7 is reserved (0).
   void descriptor(uint32_t type, uint64_t rows, uint64_t columns, uint32_t p0, uint32_t p1,
                   uint32_t metaBytes, uint32_t metaGroups,
@@ -251,23 +206,7 @@ private:
     appendLittle64(bytes, plane1Bytes);
     appendLittle64(bytes, metaTotal);
     bytes.resize(64, 0);
-    fill(std::move(bytes));
-  }
-
-  // A tensor's rows as stored, copied by the GPU from the mapped file.
-  void copiedRows(const GgufTensor &tensor) {
-    descriptor(tensor.type, tensor.rows(), tensor.columns(), 0, 0, 0, 0, tensor.bytes, 0, 0);
-    Copy copy;
-    copy.params.dst_offset = offset32(section(tensor.bytes));
-    copy.params.bytes = static_cast<uint32_t>(tensor.bytes);
-    copy.sourceOffset = file_.absoluteOffset(tensor);
-    copy.sourceBytes = tensor.bytes;
-    image_.copies.push_back(copy);
-  }
-
-  static uint32_t offset32(uint64_t offset) {
-    if (offset > std::numeric_limits<uint32_t>::max()) throw GgufError("image exceeds 4 GiB");
-    return static_cast<uint32_t>(offset);
+    image_.fills.push_back({section(bytes.size()), std::move(bytes)});
   }
 
   const GgufFile &file_;
@@ -368,41 +307,33 @@ Image ImagePlanner::layer(uint32_t index) const {
   const std::string p = prefix(index);
   const bool full = g.isFullAttentionLayer(index);
   Builder b(file_, g, "layer-" + std::to_string(index) + ".bin", index, full ? 1u : 0u);
-  b.floatNorm((p + "attn_norm.weight").c_str(), g.hiddenSize);
+  b.floatNorm(p + "attn_norm.weight", g.hiddenSize);
   if (full) {
     b.quantized(file_.require(p + "attn_q.weight"), 2ull * g.attentionHeadDimension * (g.attentionWidth / g.attentionHeadDimension), g.hiddenSize);
     const uint64_t kvRows = uint64_t{g.attentionKvHeads} * g.attentionHeadDimension;
     b.quantized(file_.require(p + "attn_k.weight"), kvRows, g.hiddenSize);
     b.quantized(file_.require(p + "attn_v.weight"), kvRows, g.hiddenSize);
-    b.floatNorm((p + "attn_q_norm.weight").c_str(), g.attentionHeadDimension);
-    b.floatNorm((p + "attn_k_norm.weight").c_str(), g.attentionHeadDimension);
+    b.floatNorm(p + "attn_q_norm.weight", g.attentionHeadDimension);
+    b.floatNorm(p + "attn_k_norm.weight", g.attentionHeadDimension);
     b.quantized(file_.require(p + "attn_output.weight"), g.hiddenSize, g.attentionWidth);
   } else {
     const uint32_t valueRows = g.gdnValueHeads * g.gdnHeadDimension;
-    const uint32_t keyRows = g.convolutionDimension - valueRows;             // q and k
-    const uint32_t groups = g.gdnValueHeads / g.gdnKeyHeads;
-    b.quantized(file_.require(p + "attn_qkv.weight"), g.convolutionDimension, g.hiddenSize, keyRows, g.gdnHeadDimension);
-    b.quantized(file_.require(p + "attn_gate.weight"), valueRows, g.hiddenSize, 0, g.gdnHeadDimension);
+    const uint32_t keyRows = g.convolutionDimension - valueRows; // q and k
+    const RowOrder qkvOrder{keyRows, g.gdnHeadDimension, g.gdnKeyHeads, g.gdnValueHeads / g.gdnKeyHeads};
+    b.quantized(file_.require(p + "attn_qkv.weight"), g.convolutionDimension, g.hiddenSize, qkvOrder);
+    RowOrder gateOrder = qkvOrder;
+    gateOrder.from = 0;
+    b.quantized(file_.require(p + "attn_gate.weight"), valueRows, g.hiddenSize, gateOrder);
     const GgufTensor &beta = file_.require(p + "ssm_beta.weight"), &alpha = file_.require(p + "ssm_alpha.weight");
     if (beta.type == ggml::kF32) b.floatAlphaBeta(beta, alpha);
     else b.alphaBeta(beta, alpha);
-    const GgufTensor &conv = file_.require(p + "ssm_conv1d.weight");
-    if (conv.elements() != uint64_t{g.convolutionDimension} * 4) throw GgufError("unexpected shape for " + conv.name);
-    b.fill(exactBfloat16(unreorderRows(readFloats(file_, conv), 4, keyRows, g.gdnHeadDimension, g.gdnKeyHeads, groups),
-                         conv.name));
-    const GgufTensor &decay = file_.require(p + "ssm_a");
-    if (decay.elements() != g.gdnValueHeads) throw GgufError("unexpected shape for " + decay.name);
-    std::vector<float> decayValues = unreorderRows(readFloats(file_, decay), 1, 0, 1, g.gdnKeyHeads, groups);
-    std::vector<uint8_t> decayBytes(decayValues.size() * 4);
-    std::memcpy(decayBytes.data(), decayValues.data(), decayBytes.size());
-    b.fill(std::move(decayBytes));
-    const GgufTensor &timeBias = file_.require(p + "ssm_dt.bias");
-    if (timeBias.elements() != g.gdnValueHeads) throw GgufError("unexpected shape for " + timeBias.name);
-    b.fill(exactBfloat16(unreorderRows(readFloats(file_, timeBias), 1, 0, 1, g.gdnKeyHeads, groups), timeBias.name));
-    b.floatNorm((p + "ssm_norm.weight").c_str(), g.gdnHeadDimension);
+    b.convolution(file_.require(p + "ssm_conv1d.weight"), keyRows);
+    b.headVector(p + "ssm_a", false);
+    b.headVector(p + "ssm_dt.bias", true);
+    b.floatNorm(p + "ssm_norm.weight", g.gdnHeadDimension);
     b.quantized(file_.require(p + "ssm_out.weight"), g.hiddenSize, valueRows);
   }
-  b.floatNorm((p + "post_attention_norm.weight").c_str(), g.hiddenSize);
+  b.floatNorm(p + "post_attention_norm.weight", g.hiddenSize);
   if (g.sparseMoe()) {
     const uint64_t routed = g.experts, width = g.expertIntermediateSize;
     b.floatTensor(file_.require(p + "ffn_gate_inp.weight"), routed, g.hiddenSize);

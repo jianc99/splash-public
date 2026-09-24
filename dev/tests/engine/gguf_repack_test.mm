@@ -1,18 +1,17 @@
-// The GGUF load kernels (gguf_repack, gguf_copy) of the production metallib,
-// the image planner's CPU-built alpha/beta tensors and its sparse MoE layer
-// (qwen35moe) against the CPU reference, and that reference's values against
-// hashes of upstream GGML's dequantization; the planner's norms are the GGUF's
-// F32 values as stored and its bf16 tensors exact conversions.
-//   gguf-repack --cpu        golden hashes, the alpha/beta tensors, the float tensors and the MoE layer
-//   gguf-repack <metallib>   also the kernels
+// The GGUF image planner and preparation against the CPU reference, and that
+// reference's values against hashes of upstream GGML's dequantization: the
+// alpha/beta tensor, the float tensors (norms as stored, exact bf16
+// conversions refused when inexact), the sparse MoE layer (qwen35moe), every
+// format's planes through the production executor, and golden hashes of the
+// images the loader prepares.
+//   gguf-repack --cpu        the golden dequantization hashes and the plans
+//   gguf-repack <metallib>   also the prepared bytes
 // With SPLASH_GGML_ORACLE=<libggml-base.dylib> the reference is also compared
 // with GGML directly and GGML's hashes are printed; a build of llama.cpp
 // 7ab4ee7 regenerates kGolden.
 #import <Foundation/Foundation.h>
-#import <Metal/Metal.h>
 
 #include "GgufFormatReference.hpp"
-#include "metal/abi/Gguf.h"
 #include "model/GgufImage.hpp"
 #include "model/GgufTarget.hpp"
 #include "model/GgufPreparation.hpp"
@@ -27,6 +26,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -99,9 +99,9 @@ void checkGoldens(void *ggml) {
 
 // Rows [from, rows) of the image come from llama.cpp's tiled value-head order:
 // destination head h reads source head (h % groups) * groupHeads + h / groups.
-uint32_t sourceRow(uint32_t n, uint32_t from, uint32_t headRows, uint32_t groupHeads, uint32_t groups) {
+uint64_t sourceRow(uint64_t n, uint64_t from, uint64_t headRows, uint64_t groupHeads, uint64_t groups) {
   if (n < from) return n;
-  const uint32_t head = (n - from) / headRows;
+  const uint64_t head = (n - from) / headRows;
   return from + ((head % groups) * groupHeads + head / groups) * headRows + (n - from) % headRows;
 }
 
@@ -175,13 +175,117 @@ std::vector<uint8_t> ggufFile(const std::vector<Tensor> &tensors, const splash::
   return out;
 }
 
-// The planner builds the GDN alpha/beta projection on the CPU: beta rows, alpha
-// rows, then zero rows up to one 256-row tile, as one Q8_0 tensor with rows in
-// grouped head order. Its plane0 and meta must equal the reference's repack of
-// those native rows. The layer's other tensors are zero; only their shapes and
-// types matter to the planner.
-void checkAlphaBeta() {
-  namespace model = splash::model;
+// F32 values in [-1, -0.5] and [0.5, 1], optionally exact bf16 values (the
+// low half of every word zero), as a bf16 checkpoint converted to F32 has.
+std::vector<uint8_t> floatValues(uint64_t count, uint32_t seed, bool bfloat16 = false) {
+  std::vector<uint8_t> bytes(count * 4);
+  for (uint64_t i = 0; i < count; ++i) {
+    uint32_t bits = 0x3F000000u | uint32_t((i * 2654435761u + seed * 40503u) & 0x7FFFFFu);
+    if ((i + seed) % 3 == 0) bits |= 0x80000000u;
+    if (bfloat16) bits &= 0xFFFF0000u;
+    std::memcpy(bytes.data() + i * 4, &bits, 4);
+  }
+  return bytes;
+}
+
+namespace model = splash::model;
+
+// A temporary directory, removed with its contents.
+class TemporaryDirectory {
+public:
+  TemporaryDirectory() {
+    char path[] = "/tmp/splash-gguf-repack-XXXXXX";
+    if (!mkdtemp(path)) throw std::runtime_error("cannot create a temporary directory");
+    path_ = path;
+  }
+  ~TemporaryDirectory() { std::filesystem::remove_all(path_); }
+  TemporaryDirectory(const TemporaryDirectory &) = delete;
+  TemporaryDirectory &operator=(const TemporaryDirectory &) = delete;
+  [[nodiscard]] const std::filesystem::path &path() const noexcept { return path_; }
+
+private:
+  std::filesystem::path path_;
+};
+
+void writeGguf(const std::filesystem::path &path, const std::vector<Tensor> &tensors,
+               const model::gguf::TargetGeometry &geometry) {
+  const std::vector<uint8_t> file = ggufFile(tensors, geometry);
+  std::ofstream(path, std::ios::binary | std::ios::trunc).write(reinterpret_cast<const char *>(file.data()), file.size());
+}
+
+// Adds a tensor, zero unless data is given: only the shapes and types of most
+// tensors matter to a check.
+struct TensorList {
+  std::vector<Tensor> tensors;
+  void add(std::string name, std::vector<uint64_t> dims, uint32_t type, std::vector<uint8_t> data = {}) {
+    if (data.empty()) {
+      const model::GgmlTypeTraits &traits = *model::ggmlTypeTraits(type);
+      uint64_t elements = 1;
+      for (uint64_t dim : dims) elements *= dim;
+      data.assign(elements / traits.blockElements * traits.blockBytes, 0);
+    }
+    tensors.push_back({std::move(name), std::move(dims), type, std::move(data)});
+  }
+  std::vector<uint8_t> &data(const std::string &name) {
+    return std::find_if(tensors.begin(), tensors.end(), [&](const Tensor &t) { return t.name == name; })->data;
+  }
+};
+
+// Every byte of the image the loader prepares for layer `index`, the head for
+// index == layers.
+std::vector<uint8_t> preparedImage(splash::metal::MetalBackend &backend, const std::filesystem::path &path,
+                                   const model::gguf::TargetGeometry &geometry, uint32_t index) {
+  model::GgufTargetLoader loader(backend, path, geometry);
+  const model::WeightFile weights = index < geometry.layers ? loader.layer(index) : loader.head();
+  std::ifstream stream(std::filesystem::path(std::getenv("SPLASH_WEIGHT_CACHE")) / weights.record().contentIdentity /
+                           "weights",
+                       std::ios::binary);
+  return {std::istreambuf_iterator<char>(stream), {}};
+}
+
+std::vector<uint8_t> slice(const std::vector<uint8_t> &bytes, uint64_t offset, uint64_t size) {
+  if (offset > bytes.size() || size > bytes.size() - offset) return {};
+  return {bytes.begin() + offset, bytes.begin() + offset + size};
+}
+
+// The plan's copy of the named tensor, or nullptr.
+const model::gguf::Copy *copyOf(const model::gguf::Image &image, const std::string &name) {
+  const auto found = std::find_if(image.copies.begin(), image.copies.end(),
+                                  [&](const model::gguf::Copy &copy) { return copy.source.name == name; });
+  return found == image.copies.end() ? nullptr : &*found;
+}
+
+bool grouped(const model::gguf::RowOrder &order, uint64_t from, uint32_t headRows,
+             const model::gguf::TargetGeometry &g) {
+  return order.from == from && order.headRows == headRows && order.groupHeads == g.gdnKeyHeads &&
+         order.groups == g.gdnValueHeads / g.gdnKeyHeads;
+}
+
+// Rows of `bytes` (rowBytes each) in image order: row n reads source row
+// sourceRow(n, from, headRows, ...), the tiled-to-grouped head order.
+std::vector<uint8_t> groupedRows(const std::vector<uint8_t> &bytes, uint64_t rowBytes, uint64_t from,
+                                 uint32_t headRows, const model::gguf::TargetGeometry &g) {
+  std::vector<uint8_t> out(bytes.size());
+  for (uint64_t n = 0; n < bytes.size() / rowBytes; ++n)
+    std::memcpy(out.data() + n * rowBytes,
+                bytes.data() + sourceRow(n, from, headRows, g.gdnKeyHeads, g.gdnValueHeads / g.gdnKeyHeads) * rowBytes,
+                rowBytes);
+  return out;
+}
+
+// The bf16 upper halves of F32 values.
+std::vector<uint8_t> bfloat16Halves(const std::vector<uint8_t> &floats) {
+  std::vector<uint8_t> out;
+  for (size_t i = 0; i < floats.size(); i += 4) out.insert(out.end(), floats.begin() + i + 2, floats.begin() + i + 4);
+  return out;
+}
+
+// The GDN alpha/beta projection: beta rows, alpha rows, then zero rows up to
+// one 256-row tile, as one Q8_0 tensor with rows in grouped head order. Its
+// prepared plane0 and meta must equal the reference's repack of those native
+// rows. The layer's other tensors are zero; only their shapes and types
+// matter.
+void checkAlphaBeta(splash::metal::MetalBackend *backend) {
   using namespace model::ggml;
   model::gguf::TargetGeometry geometry;
   geometry.layers = 1;
@@ -196,33 +300,24 @@ void checkAlphaBeta() {
   const uint32_t groupHeads = geometry.gdnKeyHeads, groups = heads / groupHeads;
   const uint64_t valueRows = uint64_t{heads} * geometry.gdnHeadDimension;
   const std::vector<uint8_t> beta = fixture(Q80, heads, hidden, 200), alpha = fixture(Q80, heads, hidden, 201);
-
-  std::vector<Tensor> tensors;
-  auto add = [&](std::string name, std::vector<uint64_t> dims, uint32_t type, std::vector<uint8_t> data = {}) {
-    if (data.empty()) {
-      const model::GgmlTypeTraits &traits = *model::ggmlTypeTraits(type);
-      uint64_t elements = 1;
-      for (uint64_t dim : dims) elements *= dim;
-      data.assign(elements / traits.blockElements * traits.blockBytes, 0);
-    }
-    tensors.push_back({std::move(name), std::move(dims), type, std::move(data)});
-  };
-  add("blk.0.attn_norm.weight", {hidden}, kF32);
-  add("blk.0.attn_qkv.weight", {hidden, geometry.convolutionDimension}, kQ4_K);
-  add("blk.0.attn_gate.weight", {hidden, valueRows}, kQ4_K);
-  add("blk.0.ssm_beta.weight", {hidden, heads}, kQ8_0, beta);
-  add("blk.0.ssm_alpha.weight", {hidden, heads}, kQ8_0, alpha);
-  add("blk.0.ssm_conv1d.weight", {4, geometry.convolutionDimension}, kF32);
-  add("blk.0.ssm_a", {heads}, kF32);
-  add("blk.0.ssm_dt.bias", {heads}, kF32);
-  add("blk.0.ssm_norm.weight", {geometry.gdnHeadDimension}, kF32);
-  add("blk.0.ssm_out.weight", {valueRows, hidden}, kQ4_K);
-  add("blk.0.post_attention_norm.weight", {hidden}, kF32);
-  add("blk.0.ffn_gate.weight", {hidden, geometry.intermediateSize}, kQ4_K);
-  add("blk.0.ffn_up.weight", {hidden, geometry.intermediateSize}, kQ4_K);
-  add("blk.0.ffn_down.weight", {geometry.intermediateSize, hidden}, kQ4_K);
-  add("output.weight", {hidden, geometry.vocabularySize}, kQ4_K);
-  add("token_embd.weight", {hidden, geometry.vocabularySize}, kQ4_K);
+  TensorList list;
+  list.add("blk.0.attn_norm.weight", {hidden}, kF32);
+  list.add("blk.0.attn_qkv.weight", {hidden, geometry.convolutionDimension}, kQ4_K);
+  list.add("blk.0.attn_gate.weight", {hidden, valueRows}, kQ4_K);
+  list.add("blk.0.ssm_beta.weight", {hidden, heads}, kQ8_0, beta);
+  list.add("blk.0.ssm_alpha.weight", {hidden, heads}, kQ8_0, alpha);
+  list.add("blk.0.ssm_conv1d.weight", {4, geometry.convolutionDimension}, kF32);
+  list.add("blk.0.ssm_a", {heads}, kF32);
+  list.add("blk.0.ssm_dt.bias", {heads}, kF32);
+  list.add("blk.0.ssm_norm.weight", {geometry.gdnHeadDimension}, kF32);
+  list.add("blk.0.ssm_out.weight", {valueRows, hidden}, kQ4_K);
+  list.add("blk.0.post_attention_norm.weight", {hidden}, kF32);
+  list.add("blk.0.ffn_gate.weight", {hidden, geometry.intermediateSize}, kQ4_K);
+  list.add("blk.0.ffn_up.weight", {hidden, geometry.intermediateSize}, kQ4_K);
+  list.add("blk.0.ffn_down.weight", {geometry.intermediateSize, hidden}, kQ4_K);
+  list.add("output_norm.weight", {hidden}, kF32);
+  list.add("output.weight", {hidden, geometry.vocabularySize}, kQ4_K);
+  list.add("token_embd.weight", {hidden, geometry.vocabularySize}, kQ4_K);
 
   const uint32_t stride = rowBytes(Q80, hidden);
   std::vector<uint8_t> rows(size_t{256} * stride, 0);
@@ -230,41 +325,38 @@ void checkAlphaBeta() {
     std::memcpy(rows.data() + size_t{n} * stride,
                 (n < heads ? beta : alpha).data() + size_t{sourceRow(n % heads, 0, 1, groupHeads, groups)} * stride, stride);
   const Packed expected = repack(Q80, rows, 256, hidden, nullptr);
-
-  char directory[] = "/tmp/splash-gguf-repack-XXXXXX";
-  if (!mkdtemp(directory)) {
-    check(false, "create a temporary directory");
-    return;
-  }
-  const std::filesystem::path path = std::filesystem::path(directory) / "alpha-beta.gguf";
-  const std::vector<uint8_t> file = ggufFile(tensors, geometry);
-  std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char *>(file.data()), file.size());
-  bool matches = false;
   try {
+    const TemporaryDirectory directory;
+    const auto path = directory.path() / "alpha-beta.gguf";
+    writeGguf(path, list.tensors, geometry);
     const model::GgufFile gguf(path);
-    const model::gguf::Image image = model::gguf::ImagePlanner(gguf, geometry).layer(0);
-    // The layer's only Q8_0 descriptor is alpha/beta's; its plane0 and meta fills follow it.
-    for (size_t i = 0; i + 2 < image.fills.size(); ++i) {
-      const std::vector<uint8_t> &descriptor = image.fills[i].bytes;
-      uint32_t type = 0;
-      if (descriptor.size() == 64) std::memcpy(&type, descriptor.data(), sizeof type);
-      if (type != kQ8_0) continue;
-      matches = image.fills[i + 1].bytes == expected.w0 && image.fills[i + 2].bytes == expected.meta;
-      break;
+    const model::gguf::Image plan = model::gguf::ImagePlanner(gguf, geometry).layer(0);
+    const auto repack = std::find_if(plan.repacks.begin(), plan.repacks.end(), [](const model::gguf::Repack &r) {
+      return r.format == GGUF_FMT_Q80 && r.rows == 256;
+    });
+    const auto sourceRows = [&](const model::gguf::TensorRows &r, const char *name) {
+      return r.name == name && r.rows == heads && grouped(r.order, 0, 1, geometry);
+    };
+    const bool planned = repack != plan.repacks.end() && repack->sources.size() == 2 &&
+                         sourceRows(repack->sources[0], "blk.0.ssm_beta.weight") &&
+                         sourceRows(repack->sources[1], "blk.0.ssm_alpha.weight");
+    check(planned, "planner alpha/beta: one 256-row Q8_0 tensor of beta then alpha rows in grouped order");
+    if (backend && planned) {
+      const std::vector<uint8_t> image = preparedImage(*backend, path, geometry, 0);
+      check(slice(image, repack->plane0, expected.w0.size()) == expected.w0 &&
+                slice(image, repack->meta, expected.meta.size()) == expected.meta,
+            "prepared alpha/beta tensor matches the CPU reference");
     }
-  } catch (const model::GgufError &error) {
-    std::fprintf(stderr, "%s\n", error.what());
+  } catch (const std::exception &error) {
+    check(false, std::string("alpha/beta: ") + error.what());
   }
-  std::filesystem::remove_all(directory);
-  check(matches, "planner alpha/beta tensor matches the CPU reference");
 }
 
 // Every norm of a GDN layer, a full-attention layer and the head goes into
 // its image as the GGUF stores it: F32 values that bf16 would round. The
 // convolution and time-bias tensors, which the kernels read as bf16, convert
 // when every value is bf16-exact and are refused by name otherwise.
-void checkFloatTensors() {
-  namespace model = splash::model;
+void checkFloatTensors(splash::metal::MetalBackend *backend) {
   using namespace model::ggml;
   model::gguf::TargetGeometry geometry;
   geometry.layers = 2;
@@ -280,135 +372,133 @@ void checkFloatTensors() {
   geometry.fullAttentionPeriod = 2;     // layer 1
   const uint32_t hidden = geometry.hiddenSize, heads = geometry.gdnValueHeads, head = 256;
   const uint64_t valueRows = uint64_t{heads} * geometry.gdnHeadDimension;
-  std::mt19937 rng(400);
-  std::uniform_real_distribution<float> spread(0.5f, 2.5f);
-  bool bfloatExact = true;
-  const auto norm = [&](uint64_t elements) {
-    std::vector<uint8_t> bytes(elements * 4);
-    for (uint64_t i = 0; i < elements; ++i) {
-      const float value = spread(rng);
-      uint32_t bits;
-      std::memcpy(&bits, &value, 4);
-      bfloatExact &= (bits & 0xFFFF) == 0;
-      std::memcpy(bytes.data() + i * 4, &value, 4);
-    }
-    return bytes;
-  };
-  // F32 values of a bf16 checkpoint: the low half of every word is zero.
-  const auto bfloatValues = [&](uint64_t elements) {
-    std::vector<uint8_t> bytes(elements * 4);
-    for (uint64_t i = 0; i < elements; ++i) {
-      const float value = spread(rng);
-      uint32_t bits;
-      std::memcpy(&bits, &value, 4);
-      bits &= 0xFFFF0000u;
-      std::memcpy(bytes.data() + i * 4, &bits, 4);
-    }
-    return bytes;
-  };
-  std::vector<Tensor> tensors;
-  auto add = [&](std::string name, std::vector<uint64_t> dims, uint32_t type, std::vector<uint8_t> data = {}) {
-    if (data.empty()) {
-      const model::GgmlTypeTraits &traits = *model::ggmlTypeTraits(type);
-      uint64_t elements = 1;
-      for (uint64_t dim : dims) elements *= dim;
-      data.assign(elements / traits.blockElements * traits.blockBytes, 0);
-    }
-    tensors.push_back({std::move(name), std::move(dims), type, std::move(data)});
-  };
+  const uint32_t keyRows = geometry.convolutionDimension - uint32_t(valueRows);
+  TensorList list;
   const std::vector<std::string> norms{"blk.0.attn_norm.weight", "blk.0.ssm_norm.weight",
                                        "blk.0.post_attention_norm.weight", "blk.1.attn_norm.weight",
                                        "blk.1.attn_q_norm.weight", "blk.1.attn_k_norm.weight",
                                        "blk.1.post_attention_norm.weight", "output_norm.weight"};
-  add(norms[0], {hidden}, kF32, norm(hidden));
-  add("blk.0.attn_qkv.weight", {hidden, geometry.convolutionDimension}, kQ4_K);
-  add("blk.0.attn_gate.weight", {hidden, valueRows}, kQ4_K);
-  add("blk.0.ssm_beta.weight", {hidden, heads}, kQ8_0);
-  add("blk.0.ssm_alpha.weight", {hidden, heads}, kQ8_0);
-  add("blk.0.ssm_conv1d.weight", {4, geometry.convolutionDimension}, kF32,
-      bfloatValues(uint64_t{4} * geometry.convolutionDimension));
-  add("blk.0.ssm_a", {heads}, kF32);
-  add("blk.0.ssm_dt.bias", {heads}, kF32, bfloatValues(heads));
-  add(norms[1], {geometry.gdnHeadDimension}, kF32, norm(geometry.gdnHeadDimension));
-  add("blk.0.ssm_out.weight", {valueRows, hidden}, kQ4_K);
-  add(norms[2], {hidden}, kF32, norm(hidden));
-  add(norms[3], {hidden}, kF32, norm(hidden));
-  add("blk.1.attn_q.weight", {hidden, 2 * geometry.attentionWidth}, kQ4_K);
-  add("blk.1.attn_k.weight", {hidden, geometry.attentionKvHeads * head}, kQ4_K);
-  add("blk.1.attn_v.weight", {hidden, geometry.attentionKvHeads * head}, kQ4_K);
-  add(norms[4], {head}, kF32, norm(head));
-  add(norms[5], {head}, kF32, norm(head));
-  add("blk.1.attn_output.weight", {geometry.attentionWidth, hidden}, kQ4_K);
-  add(norms[6], {hidden}, kF32, norm(hidden));
+  uint32_t seed = 400;
+  list.add(norms[0], {hidden}, kF32, floatValues(hidden, ++seed));
+  list.add("blk.0.attn_qkv.weight", {hidden, geometry.convolutionDimension}, kQ4_K);
+  list.add("blk.0.attn_gate.weight", {hidden, valueRows}, kQ4_K);
+  list.add("blk.0.ssm_beta.weight", {hidden, heads}, kQ8_0);
+  list.add("blk.0.ssm_alpha.weight", {hidden, heads}, kQ8_0);
+  list.add("blk.0.ssm_conv1d.weight", {4, geometry.convolutionDimension}, kF32,
+           floatValues(uint64_t{4} * geometry.convolutionDimension, ++seed, true));
+  list.add("blk.0.ssm_a", {heads}, kF32, floatValues(heads, ++seed));
+  list.add("blk.0.ssm_dt.bias", {heads}, kF32, floatValues(heads, ++seed, true));
+  list.add(norms[1], {geometry.gdnHeadDimension}, kF32, floatValues(geometry.gdnHeadDimension, ++seed));
+  list.add("blk.0.ssm_out.weight", {valueRows, hidden}, kQ4_K);
+  list.add(norms[2], {hidden}, kF32, floatValues(hidden, ++seed));
+  list.add(norms[3], {hidden}, kF32, floatValues(hidden, ++seed));
+  list.add("blk.1.attn_q.weight", {hidden, 2 * geometry.attentionWidth}, kQ4_K);
+  list.add("blk.1.attn_k.weight", {hidden, geometry.attentionKvHeads * head}, kQ4_K);
+  list.add("blk.1.attn_v.weight", {hidden, geometry.attentionKvHeads * head}, kQ4_K);
+  list.add(norms[4], {head}, kF32, floatValues(head, ++seed));
+  list.add(norms[5], {head}, kF32, floatValues(head, ++seed));
+  list.add("blk.1.attn_output.weight", {geometry.attentionWidth, hidden}, kQ4_K);
+  list.add(norms[6], {hidden}, kF32, floatValues(hidden, ++seed));
   for (uint32_t layer = 0; layer < 2; ++layer) {
     const std::string p = "blk." + std::to_string(layer) + ".";
-    add(p + "ffn_gate.weight", {hidden, geometry.intermediateSize}, kQ4_K);
-    add(p + "ffn_up.weight", {hidden, geometry.intermediateSize}, kQ4_K);
-    add(p + "ffn_down.weight", {geometry.intermediateSize, hidden}, kQ4_K);
+    list.add(p + "ffn_gate.weight", {hidden, geometry.intermediateSize}, kQ4_K);
+    list.add(p + "ffn_up.weight", {hidden, geometry.intermediateSize}, kQ4_K);
+    list.add(p + "ffn_down.weight", {geometry.intermediateSize, hidden}, kQ4_K);
   }
-  add(norms[7], {hidden}, kF32, norm(hidden));
-  add("output.weight", {hidden, geometry.vocabularySize}, kQ4_K);
-  add("token_embd.weight", {hidden, geometry.vocabularySize}, kQ4_K);
-
-  char directory[] = "/tmp/splash-gguf-floats-XXXXXX";
-  if (!mkdtemp(directory)) {
-    check(false, "create a temporary directory");
-    return;
-  }
-  const std::filesystem::path path = std::filesystem::path(directory) / "floats.gguf";
-  const auto tensor = [&](std::vector<Tensor> &list, const std::string &name) -> std::vector<uint8_t> & {
-    return std::find_if(list.begin(), list.end(), [&](const Tensor &t) { return t.name == name; })->data;
-  };
-  // Plans every image of the file of `list`; the error, empty if none.
-  const auto plan = [&](const std::vector<Tensor> &list, std::vector<model::gguf::Image> &images) {
-    const std::vector<uint8_t> file = ggufFile(list, geometry);
-    std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char *>(file.data()), file.size());
-    try {
-      const model::GgufFile gguf(path);
-      const model::gguf::ImagePlanner planner(gguf, geometry);
-      images = {planner.layer(0), planner.layer(1), planner.head()};
-    } catch (const model::GgufError &error) {
-      return std::string(error.what());
+  list.add(norms[7], {hidden}, kF32, floatValues(hidden, ++seed));
+  list.add("output.weight", {hidden, geometry.vocabularySize}, kQ4_K);
+  list.add("token_embd.weight", {hidden, geometry.vocabularySize}, kQ4_K);
+  try {
+    const TemporaryDirectory directory;
+    const auto path = directory.path() / "floats.gguf";
+    // The images of the file of `tensors`; the planner's error, empty if none.
+    const auto plan = [&](const std::vector<Tensor> &tensors, std::vector<model::gguf::Image> &images) {
+      writeGguf(path, tensors, geometry);
+      try {
+        const model::GgufFile gguf(path);
+        const model::gguf::ImagePlanner planner(gguf, geometry);
+        images = {planner.layer(0), planner.layer(1), planner.head()};
+      } catch (const model::GgufError &error) {
+        return std::string(error.what());
+      }
+      return std::string();
+    };
+    std::vector<model::gguf::Image> images, scratch;
+    const std::string error = plan(list.tensors, images);
+    if (!error.empty()) throw std::runtime_error(error);
+    // image index and copy of every norm
+    std::vector<std::pair<size_t, const model::gguf::Copy *>> copies;
+    for (const std::string &name : norms)
+      for (size_t i = 0; i < images.size(); ++i)
+        if (const auto *copy = copyOf(images[i], name)) copies.push_back({i, copy});
+    check(copies.size() == norms.size() && std::all_of(copies.begin(), copies.end(), [&](const auto &entry) {
+            const model::gguf::Copy &copy = *entry.second;
+            return !copy.bfloat16 && copy.source.rows * copy.source.rowBytes == list.data(copy.source.name).size() &&
+                   copy.source.order.from == UINT64_MAX;
+          }),
+          "planner keeps every norm's F32 values as stored");
+    const auto *conv = copyOf(images[0], "blk.0.ssm_conv1d.weight");
+    const auto *decay = copyOf(images[0], "blk.0.ssm_a");
+    const auto *bias = copyOf(images[0], "blk.0.ssm_dt.bias");
+    check(conv && conv->bfloat16 && conv->source.rows == geometry.convolutionDimension &&
+              grouped(conv->source.order, keyRows, geometry.gdnHeadDimension, geometry) && decay && !decay->bfloat16 &&
+              grouped(decay->source.order, 0, 1, geometry) && bias && bias->bfloat16 &&
+              grouped(bias->source.order, 0, 1, geometry),
+          "planner narrows the convolution and time bias to bf16 and groups their value heads");
+    for (const char *name : {"blk.1.attn_k.weight", "blk.1.attn_v.weight"}) {
+      for (uint64_t rows : {uint64_t{head}, uint64_t{3 * head}}) {
+        std::vector<Tensor> malformed = list.tensors;
+        auto &t = *std::find_if(malformed.begin(), malformed.end(),
+                                [&](const Tensor &value) { return value.name == name; });
+        t.dims[1] = rows;
+        t.data.resize(rows * hidden / 256 * 144);
+        check(plan(malformed, scratch) == std::string("unexpected shape for ") + name,
+              std::string("planner rejects mismatched KV rows: ") + name + " rows=" + std::to_string(rows));
+      }
     }
-    return std::string();
-  };
-  std::vector<model::gguf::Image> images;
-  const std::string error = plan(tensors, images);
-  const bool stored = error.empty() && std::all_of(norms.begin(), norms.end(), [&](const std::string &name) {
-    return std::any_of(images.begin(), images.end(), [&](const model::gguf::Image &image) {
-      return std::any_of(image.fills.begin(), image.fills.end(),
-                         [&](const model::gguf::Fill &fill) { return fill.bytes == tensor(tensors, name); });
-    });
-  });
-  if (!error.empty()) std::fprintf(stderr, "%s\n", error.c_str());
-  check(stored && !bfloatExact, "planner keeps every norm's F32 values as stored");
-  for (const char *name : {"blk.1.attn_k.weight", "blk.1.attn_v.weight"}) {
-    for (uint64_t rows : {uint64_t{head}, uint64_t{3 * head}}) {
-      std::vector<Tensor> malformed = tensors;
-      auto &t = *std::find_if(malformed.begin(), malformed.end(),
-                              [&](const Tensor &value) { return value.name == name; });
-      t.dims[1] = rows;
-      t.data.resize(rows * hidden / 256 * 144);
-      check(plan(malformed, images) == std::string("unexpected shape for ") + name,
-            std::string("planner rejects mismatched KV rows: ") + name + " rows=" + std::to_string(rows));
+    if (!backend) return;
+    writeGguf(path, list.tensors, geometry);
+    std::vector<std::vector<uint8_t>> prepared;
+    for (uint32_t index = 0; index <= geometry.layers; ++index)
+      prepared.push_back(preparedImage(*backend, path, geometry, index));
+    bool stored = true;
+    for (const auto &[index, copy] : copies) {
+      const std::vector<uint8_t> &values = list.data(copy->source.name);
+      stored &= slice(prepared[index], copy->destination, values.size()) == values;
     }
+    check(stored, "prepared norms are the GGUF's F32 values as stored");
+    const auto prepares = [&](const model::gguf::Copy &copy, const std::vector<uint8_t> &expected) {
+      return slice(prepared[0], copy.destination, expected.size()) == expected;
+    };
+    check(prepares(*conv, bfloat16Halves(groupedRows(list.data(conv->source.name), 16, keyRows,
+                                                     geometry.gdnHeadDimension, geometry))) &&
+              prepares(*decay, groupedRows(list.data(decay->source.name), 4, 0, 1, geometry)) &&
+              prepares(*bias, bfloat16Halves(groupedRows(list.data(bias->source.name), 4, 0, 1, geometry))),
+          "prepared convolution, decay and time bias in grouped head order, exact bf16 where narrowed");
+    for (const char *name : {"blk.0.ssm_conv1d.weight", "blk.0.ssm_dt.bias"}) {
+      TensorList inexact = list;
+      const float value = 1.0f + 0x1p-10f;
+      std::memcpy(inexact.data(name).data() + 12, &value, 4);
+      writeGguf(path, inexact.tensors, geometry);
+      std::string refused;
+      try {
+        static_cast<void>(preparedImage(*backend, path, geometry, 0));
+      } catch (const model::GgufError &error) {
+        refused = error.what();
+      }
+      check(refused == std::string(name) + " is not bf16-exact; it needs an F32 path",
+            std::string("preparation refuses to round ") + name + " to bf16");
+    }
+  } catch (const std::exception &error) {
+    check(false, std::string("float tensors: ") + error.what());
   }
-  for (const char *name : {"blk.0.ssm_conv1d.weight", "blk.0.ssm_dt.bias"}) {
-    std::vector<Tensor> inexact = tensors;
-    const float value = 1.0f + 0x1p-10f;
-    std::memcpy(tensor(inexact, name).data() + 12, &value, 4);
-    check(plan(inexact, images) == std::string(name) + " is not bf16-exact; it needs an F32 path",
-          std::string("planner refuses to round ") + name + " to bf16");
-  }
-  std::filesystem::remove_all(directory);
 }
 
 // A qwen35moe layer: F32 alpha/beta as one float tensor (beta rows, then alpha
 // rows, in grouped head order, values as stored), the F32 router and
 // shared-expert gate copied as stored, and each 3-D expert tensor repacked as
 // one tensor of experts * N rows. The metadata and architecture must match.
-void checkMoeLayer(const char *metallib) {
-  namespace model = splash::model;
+void checkMoeLayer(splash::metal::MetalBackend *backend) {
   using namespace model::ggml;
   model::gguf::TargetGeometry geometry;
   geometry.layers = 1;
@@ -424,189 +514,128 @@ void checkMoeLayer(const char *metallib) {
   geometry.expertIntermediateSize = 256;
   const uint32_t hidden = geometry.hiddenSize, heads = geometry.gdnValueHeads, experts = geometry.experts;
   const uint32_t width = geometry.expertIntermediateSize, valueRows = heads * geometry.gdnHeadDimension;
-  std::mt19937 rng(300);
-  std::normal_distribution<float> normal(0.0f, 1.0f);
-  const auto floats = [&](uint64_t elements) {
-    std::vector<uint8_t> bytes(elements * 4);
-    for (uint64_t i = 0; i < elements; ++i) {
-      const float value = normal(rng);
-      std::memcpy(bytes.data() + i * 4, &value, 4);
-    }
-    return bytes;
-  };
-  const std::vector<uint8_t> beta = floats(uint64_t{heads} * hidden), alpha = floats(uint64_t{heads} * hidden);
-  const std::vector<uint8_t> router = floats(uint64_t{experts} * hidden), sharedGate = floats(hidden);
-  std::vector<Tensor> tensors;
-  auto add = [&](std::string name, std::vector<uint64_t> dims, uint32_t type, std::vector<uint8_t> data = {}) {
-    if (data.empty()) {
-      const model::GgmlTypeTraits &traits = *model::ggmlTypeTraits(type);
-      uint64_t elements = 1;
-      for (uint64_t dim : dims) elements *= dim;
-      data.assign(elements / traits.blockElements * traits.blockBytes, 0);
-    }
-    tensors.push_back({std::move(name), std::move(dims), type, std::move(data)});
-  };
-  add("output_norm.weight", {hidden}, kF32);
-  add("blk.0.attn_norm.weight", {hidden}, kF32);
-  add("blk.0.attn_qkv.weight", {hidden, geometry.convolutionDimension}, kQ8_0);
-  add("blk.0.attn_gate.weight", {hidden, valueRows}, kQ8_0);
-  add("blk.0.ssm_beta.weight", {hidden, heads}, kF32, beta);
-  add("blk.0.ssm_alpha.weight", {hidden, heads}, kF32, alpha);
-  add("blk.0.ssm_conv1d.weight", {4, geometry.convolutionDimension}, kF32);
-  add("blk.0.ssm_a", {heads}, kF32);
-  add("blk.0.ssm_dt.bias", {heads}, kF32);
-  add("blk.0.ssm_norm.weight", {geometry.gdnHeadDimension}, kF32);
-  add("blk.0.ssm_out.weight", {valueRows, hidden}, kQ8_0);
-  add("blk.0.post_attention_norm.weight", {hidden}, kF32);
-  add("blk.0.ffn_gate_inp.weight", {hidden, experts}, kF32, router);
-  add("blk.0.ffn_gate_exps.weight", {hidden, width, experts}, kQ4_K);
-  add("blk.0.ffn_up_exps.weight", {hidden, width, experts}, kQ4_K);
-  add("blk.0.ffn_down_exps.weight", {width, hidden, experts}, kQ5_K);
-  add("blk.0.ffn_gate_shexp.weight", {hidden, width}, kQ8_0);
-  add("blk.0.ffn_up_shexp.weight", {hidden, width}, kQ8_0);
-  add("blk.0.ffn_down_shexp.weight", {width, hidden}, kQ8_0);
-  add("blk.0.ffn_gate_inp_shexp.weight", {hidden}, kF32, sharedGate);
-  add("output.weight", {hidden, geometry.vocabularySize}, kQ6_K);
-  add("token_embd.weight", {hidden, geometry.vocabularySize}, kQ8_0);
-
-  // beta then alpha rows, each in grouped head order.
-  std::vector<uint8_t> gates;
-  for (const std::vector<uint8_t> *rows : {&beta, &alpha})
-    for (uint32_t n = 0; n < heads; ++n) {
-      const uint8_t *row = rows->data() + size_t{sourceRow(n, 0, 1, geometry.gdnKeyHeads, heads / geometry.gdnKeyHeads)} * hidden * 4;
-      gates.insert(gates.end(), row, row + size_t{hidden} * 4);
-    }
-  char directory[] = "/tmp/splash-gguf-moe-XXXXXX";
-  if (!mkdtemp(directory)) {
-    check(false, "create a temporary directory");
-    return;
-  }
-  const std::filesystem::path path = std::filesystem::path(directory) / "moe.gguf";
-  const auto write = [&](const model::gguf::TargetGeometry &declared) {
-    const std::vector<uint8_t> file = ggufFile(tensors, declared);
-    std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char *>(file.data()), file.size());
-  };
-  // The error of planning a file that declares `declared`, empty if none.
-  const auto planError = [&](const model::gguf::TargetGeometry &declared) {
-    write(declared);
-    try {
-      const model::GgufFile gguf(path);
-      static_cast<void>(model::gguf::ImagePlanner(gguf, geometry));
-    } catch (const model::GgufError &error) {
-      return std::string(error.what());
-    }
-    return std::string();
-  };
-  bool gatesMatch = false, copies = false, experts3d = false;
-  write(geometry);
+  TensorList list;
+  list.add("output_norm.weight", {hidden}, kF32);
+  list.add("blk.0.attn_norm.weight", {hidden}, kF32);
+  list.add("blk.0.attn_qkv.weight", {hidden, geometry.convolutionDimension}, kQ8_0);
+  list.add("blk.0.attn_gate.weight", {hidden, valueRows}, kQ8_0);
+  list.add("blk.0.ssm_beta.weight", {hidden, heads}, kF32, floatValues(uint64_t{heads} * hidden, 301));
+  list.add("blk.0.ssm_alpha.weight", {hidden, heads}, kF32, floatValues(uint64_t{heads} * hidden, 302));
+  list.add("blk.0.ssm_conv1d.weight", {4, geometry.convolutionDimension}, kF32);
+  list.add("blk.0.ssm_a", {heads}, kF32);
+  list.add("blk.0.ssm_dt.bias", {heads}, kF32);
+  list.add("blk.0.ssm_norm.weight", {geometry.gdnHeadDimension}, kF32);
+  list.add("blk.0.ssm_out.weight", {valueRows, hidden}, kQ8_0);
+  list.add("blk.0.post_attention_norm.weight", {hidden}, kF32);
+  list.add("blk.0.ffn_gate_inp.weight", {hidden, experts}, kF32, floatValues(uint64_t{experts} * hidden, 303));
+  list.add("blk.0.ffn_gate_exps.weight", {hidden, width, experts}, kQ4_K);
+  list.add("blk.0.ffn_up_exps.weight", {hidden, width, experts}, kQ4_K);
+  list.add("blk.0.ffn_down_exps.weight", {width, hidden, experts}, kQ5_K, fixture(Q5K, experts * hidden, width, 507));
+  list.add("blk.0.ffn_gate_shexp.weight", {hidden, width}, kQ8_0);
+  list.add("blk.0.ffn_up_shexp.weight", {hidden, width}, kQ8_0);
+  list.add("blk.0.ffn_down_shexp.weight", {width, hidden}, kQ8_0);
+  list.add("blk.0.ffn_gate_inp_shexp.weight", {hidden}, kF32, floatValues(hidden, 304));
+  list.add("output.weight", {hidden, geometry.vocabularySize}, kQ6_K);
+  list.add("token_embd.weight", {hidden, geometry.vocabularySize}, kQ8_0);
   try {
-    const model::GgufFile gguf(path);
-    const model::gguf::Image image = model::gguf::ImagePlanner(gguf, geometry).layer(0);
-    for (size_t i = 0; i + 1 < image.fills.size(); ++i) {
-      const std::vector<uint8_t> &descriptor = image.fills[i].bytes;
-      uint32_t words[3] = {};
-      if (descriptor.size() == 64) std::memcpy(words, descriptor.data(), sizeof words);
-      if (words[0] == kF32 && words[1] == 2 * heads && words[2] == hidden) gatesMatch = image.fills[i + 1].bytes == gates;
-    }
-    const auto copied = [&](const char *name) {
-      const model::GgufTensor &tensor = gguf.require(name);
-      return std::any_of(image.copies.begin(), image.copies.end(), [&](const model::gguf::Copy &copy) {
-        return copy.sourceOffset == gguf.absoluteOffset(tensor) && copy.params.bytes == tensor.bytes;
-      });
+    const TemporaryDirectory directory;
+    const auto path = directory.path() / "moe.gguf";
+    // The error of planning a file that declares `declared`, empty if none.
+    const auto planError = [&](const model::gguf::TargetGeometry &declared) {
+      writeGguf(path, list.tensors, declared);
+      try {
+        const model::GgufFile gguf(path);
+        static_cast<void>(model::gguf::ImagePlanner(gguf, geometry));
+      } catch (const model::GgufError &error) {
+        return std::string(error.what());
+      }
+      return std::string();
     };
-    copies = image.copies.size() == 2 && copied("blk.0.ffn_gate_inp.weight") && copied("blk.0.ffn_gate_inp_shexp.weight");
-    std::vector<std::pair<uint32_t, uint32_t>> shapes;
-    for (const model::gguf::Repack &repack : image.repacks) shapes.push_back({repack.params.rows, repack.params.input_size});
-    const std::vector<std::pair<uint32_t, uint32_t>> expected{
+    model::gguf::TargetGeometry wrongExperts = geometry;
+    wrongExperts.experts = 5;
+    check(planError(wrongExperts).find("expert_count 5 (expected 4)") != std::string::npos,
+          "planner names a metadata mismatch");
+    model::gguf::TargetGeometry dense = geometry;
+    dense.experts = 0;
+    dense.intermediateSize = 256;
+    check(planError(dense).find("GGUF architecture is qwen35, but the package's target is qwen35moe") != std::string::npos,
+          "planner checks the architecture against the package");
+    writeGguf(path, list.tensors, geometry);
+    const model::GgufFile gguf(path);
+    const model::gguf::Image plan = model::gguf::ImagePlanner(gguf, geometry).layer(0);
+    const auto *beta = copyOf(plan, "blk.0.ssm_beta.weight"), *alpha = copyOf(plan, "blk.0.ssm_alpha.weight");
+    check(beta && alpha && alpha->destination == beta->destination + uint64_t{heads} * hidden * 4 &&
+              grouped(beta->source.order, 0, 1, geometry) && grouped(alpha->source.order, 0, 1, geometry) &&
+              !beta->bfloat16 && !alpha->bfloat16,
+          "planner F32 alpha/beta tensor: beta then alpha rows in grouped order");
+    const auto stored = [&](const char *name) {
+      const auto *copy = copyOf(plan, name);
+      return copy && !copy->bfloat16 && copy->source.order.from == UINT64_MAX &&
+             copy->source.rows * copy->source.rowBytes == gguf.require(name).bytes;
+    };
+    check(stored("blk.0.ffn_gate_inp.weight") && stored("blk.0.ffn_gate_inp_shexp.weight"),
+          "planner copies the F32 router and shared-expert gate as stored");
+    std::vector<std::pair<uint64_t, uint64_t>> shapes;
+    for (const model::gguf::Repack &repack : plan.repacks) shapes.push_back({repack.rows, repack.columns});
+    const std::vector<std::pair<uint64_t, uint64_t>> expected{
         {geometry.convolutionDimension, hidden}, {valueRows, hidden}, {hidden, valueRows}, {experts * width, hidden},
         {experts * width, hidden}, {experts * hidden, width}, {width, hidden}, {width, hidden}, {hidden, width}};
-    experts3d = shapes == expected;
-  } catch (const model::GgufError &error) {
-    std::fprintf(stderr, "%s\n", error.what());
-  }
-  check(gatesMatch, "planner F32 alpha/beta tensor: beta then alpha rows in grouped order");
-  check(copies, "planner copies the F32 router and shared-expert gate as stored");
-  check(experts3d, "planner repacks each expert tensor as experts * N rows");
-  model::gguf::TargetGeometry wrongExperts = geometry;
-  wrongExperts.experts = 5;
-  check(planError(wrongExperts).find("expert_count 5 (expected 4)") != std::string::npos,
-        "planner names a metadata mismatch");
-  model::gguf::TargetGeometry dense = geometry;
-  dense.experts = 0;
-  dense.intermediateSize = 256;
-  check(planError(dense).find("GGUF architecture is qwen35, but the package's target is qwen35moe") != std::string::npos,
-        "planner checks the architecture against the package");
-  if (metallib) {
-    // A layer may have tensors on opposite sides of the 4 GiB boundary.
-    // Keep the file sparse and poison the old location so a truncated offset
-    // cannot accidentally read the right data. Exercise both repack and copy.
-    try {
-      splash::metal::MetalBackend backend(metallib);
-      auto &down = *std::find_if(tensors.begin(), tensors.end(), [](const Tensor &t) {
-        return t.name == "blk.0.ffn_down_exps.weight";
+    check(shapes == expected, "planner repacks each expert tensor as experts * N rows");
+    if (!backend) return;
+    // beta then alpha rows, each in grouped head order.
+    std::vector<uint8_t> gates = groupedRows(list.data(beta->source.name), uint64_t{hidden} * 4, 0, 1, geometry);
+    const auto alphaRows = groupedRows(list.data(alpha->source.name), uint64_t{hidden} * 4, 0, 1, geometry);
+    gates.insert(gates.end(), alphaRows.begin(), alphaRows.end());
+    bool allowPreparation = true;
+    const auto load = [&] {
+      model::GgufTargetLoader loader(*backend, path, geometry, [&] {
+        if (!allowPreparation) throw std::runtime_error("conversion forbidden on warm load");
       });
-      down.data = fixture(Q5K, experts * hidden, width, 507);
-      bool allowPreparation = true;
-      const auto load = [&] {
-        model::GgufTargetLoader loader(backend, path, geometry, [&] {
-          if (!allowPreparation) throw std::runtime_error("conversion forbidden on warm load");
-        });
-        auto weights = loader.layer(0);
-        const auto bytes = weights.section(weights.record().declaredBytes - model::kWeightFileAlignment);
-        const auto *begin = static_cast<const uint8_t *>(bytes.contents());
-        std::vector<uint8_t> image(begin, begin + bytes.sizeBytes());
-        weights.finish();
-        return image;
-      };
-      write(geometry);
-      const auto expected = load();
-      allowPreparation = false;
-      check(load() == expected, "GGUF warm load does not require conversion headroom");
-      // The model's other prepared files join the target's disk check.
-      const model::PreparedWeight vision{std::string(64, 'a'), UINT64_MAX / 2};
-      std::string budget;
-      try {
-        model::GgufTargetLoader loader(backend, path, geometry, {}, {&vision, 1});
-      } catch (const std::runtime_error &error) {
-        budget = error.what();
-      }
-      check(budget.starts_with("not enough disk space to prepare weights"),
-            "GGUF target disk check budgets the model's other prepared files: " + budget);
-      allowPreparation = true;
-      for (const char *name : {"blk.0.ffn_down_exps.weight", "blk.0.ffn_gate_inp.weight"}) {
-        write(geometry);
-        const model::GgufFile original(path);
-        const uint64_t offset = original.absoluteOffset(original.require(name));
-        const auto &tensor = *std::find_if(tensors.begin(), tensors.end(),
-                                          [&](const Tensor &t) { return t.name == name; });
-        auto bytes = ggufFile(tensors, geometry, name);
-        std::fill_n(bytes.begin() + offset, tensor.data.size(), 0);
-        {
-          std::ofstream stream(path, std::ios::binary | std::ios::trunc);
-          stream.write(reinterpret_cast<const char *>(bytes.data()), bytes.size());
-          stream.seekp(static_cast<std::streamoff>(offset + (uint64_t{1} << 32)));
-          stream.write(reinterpret_cast<const char *>(tensor.data.data()), tensor.data.size());
-        }
-        check(load() == expected, std::string("loader keeps weights exact beyond 4 GiB: ") + name);
-      }
-    } catch (const std::exception &error) {
-      check(false, std::string("large-offset loader: ") + error.what());
+      auto weights = loader.layer(0);
+      const auto bytes = weights.section(weights.record().declaredBytes - model::kWeightFileAlignment);
+      const auto *begin = static_cast<const uint8_t *>(bytes.contents());
+      std::vector<uint8_t> image(model::kWeightFileAlignment, 0);
+      image.insert(image.end(), begin, begin + bytes.sizeBytes());
+      weights.finish();
+      return image;
+    };
+    const auto image = load();
+    check(slice(image, beta->destination, gates.size()) == gates,
+          "prepared F32 alpha/beta tensor: beta then alpha rows in grouped order");
+    allowPreparation = false;
+    check(load() == image, "GGUF warm load does not require conversion headroom");
+    // The model's other prepared files join the target's disk check.
+    const model::PreparedWeight vision{std::string(64, 'a'), UINT64_MAX / 2};
+    std::string budget;
+    try {
+      model::GgufTargetLoader loader(*backend, path, geometry, {}, {&vision, 1});
+    } catch (const std::runtime_error &error) {
+      budget = error.what();
     }
+    check(budget.starts_with("not enough disk space to prepare weights"),
+          "GGUF target disk check budgets the model's other prepared files: " + budget);
+    // A layer may have tensors on opposite sides of the 4 GiB boundary. Keep
+    // the file sparse and poison the old location so a truncated offset
+    // cannot accidentally read the right data.
+    allowPreparation = true;
+    for (const char *name : {"blk.0.ffn_down_exps.weight", "blk.0.ffn_gate_inp.weight"}) {
+      writeGguf(path, list.tensors, geometry);
+      const model::GgufFile original(path);
+      const uint64_t offset = original.absoluteOffset(original.require(name));
+      const std::vector<uint8_t> &data = list.data(name);
+      auto bytes = ggufFile(list.tensors, geometry, name);
+      std::fill_n(bytes.begin() + offset, data.size(), 0);
+      {
+        std::ofstream stream(path, std::ios::binary | std::ios::trunc);
+        stream.write(reinterpret_cast<const char *>(bytes.data()), bytes.size());
+        stream.seekp(static_cast<std::streamoff>(offset + (uint64_t{1} << 32)));
+        stream.write(reinterpret_cast<const char *>(data.data()), data.size());
+      }
+      check(load() == image, std::string("loader keeps weights exact beyond 4 GiB: ") + name);
+    }
+  } catch (const std::exception &error) {
+    check(false, std::string("MoE layer: ") + error.what());
   }
-  std::filesystem::remove_all(directory);
-}
-
-// F32 values in [-1, -0.5] and [0.5, 1], optionally exact bf16 values (the
-// low half of every word zero), as a bf16 checkpoint converted to F32 has.
-std::vector<uint8_t> floatValues(uint64_t count, uint32_t seed, bool bfloat16 = false) {
-  std::vector<uint8_t> bytes(count * 4);
-  for (uint64_t i = 0; i < count; ++i) {
-    uint32_t bits = 0x3F000000u | uint32_t((i * 2654435761u + seed * 40503u) & 0x7FFFFFu);
-    if ((i + seed) % 3 == 0) bits |= 0x80000000u;
-    if (bfloat16) bits &= 0xFFFF0000u;
-    std::memcpy(bytes.data() + i * 4, &bits, 4);
-  }
-  return bytes;
 }
 
 // SHA-256 of every image the loader prepares from two small GGUFs: a dense
@@ -769,102 +798,47 @@ void checkGoldenImages(splash::metal::MetalBackend &backend) {
   std::filesystem::remove_all(directory);
 }
 
-constexpr uint64_t kSection = 16384; // image section alignment, as the planner lays out images
-constexpr uint32_t kSourceOffset = 96; // tensor data offset inside the mapped source window
-constexpr uint8_t kPoison = 0xA5;
-constexpr uint32_t kNoPermute = 0xFFFFFFFFu;
+constexpr uint64_t kSection = 16384;      // image section alignment, as the planner lays out images
+constexpr uint64_t kSourceOffset = 96;    // the tensor data section's offset in the source file
 
 uint64_t alignUp(uint64_t value) { return (value + kSection - 1) / kSection * kSection; }
-
-struct Gpu {
-  id<MTLDevice> device;
-  id<MTLCommandQueue> queue;
-  id<MTLComputePipelineState> repack, copy;
-};
-
-id<MTLComputePipelineState> pipeline(id<MTLDevice> device, id<MTLLibrary> library, const char *name) {
-  id<MTLFunction> function = [library newFunctionWithName:[NSString stringWithUTF8String:name]];
-  NSError *error = nil;
-  id<MTLComputePipelineState> state = function ? [device newComputePipelineStateWithFunction:function error:&error] : nil;
-  if (!state) std::fprintf(stderr, "no pipeline %s\n", name);
-  return state;
-}
-
-id<MTLBuffer> buffer(id<MTLDevice> device, uint64_t bytes, uint8_t fill) {
-  id<MTLBuffer> result = [device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
-  std::memset(result.contents, fill, bytes);
-  return result;
-}
-
-template <class Params>
-bool run(const Gpu &gpu, id<MTLComputePipelineState> state, id<MTLBuffer> source, id<MTLBuffer> image,
-         const Params &params, uint64_t threads) {
-  id<MTLCommandBuffer> command = [gpu.queue commandBuffer];
-  id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
-  [encoder setComputePipelineState:state];
-  [encoder setBuffer:source offset:0 atIndex:0];
-  [encoder setBuffer:image offset:0 atIndex:1];
-  [encoder setBytes:&params length:sizeof params atIndex:2];
-  [encoder dispatchThreadgroups:MTLSizeMake((threads + 255) / 256, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-  [encoder endEncoding];
-  [command commit];
-  [command waitUntilCompleted];
-  if (command.error) std::fprintf(stderr, "GPU error: %s\n", command.error.localizedDescription.UTF8String);
-  return !command.error;
-}
-
-// Bytes [begin, end) of the image equal expected, bytes outside every such range stay poison.
-struct Expected {
-  uint64_t begin;
-  const std::vector<uint8_t> *bytes;
-};
-bool imageMatches(id<MTLBuffer> image, const std::vector<Expected> &sections) {
-  const auto *data = static_cast<const uint8_t *>(image.contents);
-  std::vector<bool> covered(image.length, false);
-  for (const Expected &section : sections) {
-    if (memcmp(data + section.begin, section.bytes->data(), section.bytes->size())) return false;
-    std::fill_n(covered.begin() + section.begin, section.bytes->size(), true);
-  }
-  for (uint64_t i = 0; i < image.length; ++i)
-    if (!covered[i] && data[i] != kPoison) return false;
-  return true;
-}
 
 // Row tiles are whole (the planner requires rows and K to be multiples of 256);
 // the shapes cover several tiles, super-blocks and groups, and a permuted row range.
 struct Shape {
-  uint32_t rows, K, permuteFrom, headRows, groupHeads, groups;
+  uint32_t rows, K;
+  uint64_t permuteFrom;
+  uint32_t headRows, groupHeads, groups;
 };
+constexpr uint64_t kNoPermute = UINT64_MAX;
 
-void checkRepack(const Gpu &gpu, splash::metal::MetalBackend &backend, Fmt f, const Shape &shape, uint32_t seed) {
+// The narrowest K whose 256-row tile of source and plane bytes exceeds the
+// preparation staging, so preparation must split the rows by columns.
+uint32_t widerThanStaging(Fmt f) {
   const QuantFormat &layout = kQuantFormats[f];
-  const uint32_t rows = shape.rows, K = shape.K, G = K / 32, stride = rowBytes(f, K);
+  const uint64_t perBlock = uint64_t(layout.block_bytes) * (256 / layout.block_elements) +
+      8 * (layout.plane0_bytes + layout.plane1_bytes) + (8 / layout.meta_groups) * layout.meta_bytes;
+  return uint32_t((splash::model::kWeightPreparationStagingBytes / (256 * perBlock) + 1) * 256);
+}
+
+// One quantized tensor through the production executor, from a file whose
+// data section starts at kSourceOffset, against the CPU reference's planes.
+void checkRepack(splash::metal::MetalBackend &backend, Fmt f, const Shape &shape, uint32_t seed) {
+  const QuantFormat &layout = kQuantFormats[f];
+  const uint32_t rows = shape.rows, K = shape.K, stride = rowBytes(f, K);
   const std::vector<uint8_t> native = fixture(f, rows, K, seed);
   std::vector<uint8_t> ordered(native.size());
   for (uint32_t n = 0; n < rows; ++n)
     std::memcpy(ordered.data() + uint64_t{n} * stride,
-                native.data() + uint64_t{sourceRow(n, shape.permuteFrom, shape.headRows, shape.groupHeads, shape.groups)} * stride,
+                native.data() + sourceRow(n, shape.permuteFrom, shape.headRows, shape.groupHeads, shape.groups) * stride,
                 stride);
   const Packed expected = repack(f, ordered, rows, K, nullptr);
-
   const uint64_t plane0 = kSection, plane1 = alignUp(plane0 + expected.w0.size());
   const uint64_t meta = layout.plane1_bytes ? alignUp(plane1 + expected.w1.size()) : plane1;
   const uint64_t bytes = alignUp(meta + expected.meta.size()) + kSection;
-  id<MTLBuffer> source = buffer(gpu.device, kSourceOffset + native.size(), 0);
-  std::memcpy(static_cast<uint8_t *>(source.contents) + kSourceOffset, native.data(), native.size());
-  id<MTLBuffer> image = buffer(gpu.device, bytes, kPoison);
-  const GgufRepackParams params{rows, K, uint32_t(f), kSourceOffset, stride,
-                                uint32_t(plane0), layout.plane1_bytes ? uint32_t(plane1) : 0u, uint32_t(meta),
-                                shape.permuteFrom, shape.headRows, shape.groupHeads, shape.groups};
-  const bool ran = run(gpu, gpu.repack, source, image, params, uint64_t{rows} * G);
-  std::vector<Expected> sections{{plane0, &expected.w0}, {meta, &expected.meta}};
-  if (layout.plane1_bytes) sections.push_back({plane1, &expected.w1});
   char what[96];
-  std::snprintf(what, sizeof what, "gguf_repack %s rows=%u K=%u%s", fmtName(f), rows, K,
+  std::snprintf(what, sizeof what, "prepared %s rows=%u K=%u%s", fmtName(f), rows, K,
                 shape.permuteFrom == kNoPermute ? "" : " permuted");
-  check(ran && imageMatches(image, sections), what);
-  // Independent CPU oracle above also checks a bounded, file-backed repack.
-  // The last shape crosses both a row tile and the 8192-column chunk boundary.
   char inputPath[] = "/tmp/splash-repack-source-XXXXXX";
   char outputPath[] = "/tmp/splash-repack-output-XXXXXX";
   const int inputFd = mkstemp(inputPath), outputFd = mkstemp(outputPath);
@@ -872,40 +846,36 @@ void checkRepack(const Gpu &gpu, splash::metal::MetalBackend &backend, Fmt f, co
     if (inputFd < 0 || outputFd < 0 || ftruncate(outputFd, bytes))
       throw std::runtime_error("cannot create repack fixture");
     splash::model::writeWeightBytes(inputFd, kSourceOffset, native);
+    splash::model::gguf::Repack step;
+    step.format = f;
+    step.rows = rows;
+    step.columns = K;
+    step.plane0 = plane0;
+    step.plane1 = layout.plane1_bytes ? plane1 : 0;
+    step.meta = meta;
+    step.sources = {{"fixture", layout.ggml_type, 0, rows, stride,
+                     {shape.permuteFrom, shape.headRows, shape.groupHeads, shape.groups}}};
     splash::model::gguf::Image plan;
     plan.bytes = bytes;
-    auto chunkParams = params;
-    chunkParams.src_offset = 0;
-    plan.repacks.push_back({chunkParams, kSourceOffset, native.size()});
+    plan.repacks.push_back(step);
     const uint64_t before = backend.memoryStats().allocatedBytes;
-    splash::model::prepareGgufImage(backend, inputFd, outputFd, plan);
-    check(backend.memoryStats().allocatedBytes == before, "chunked repack releases staging buffers");
-    check(backend.memoryStats().peakAllocatedBytes <= splash::model::kWeightPreparationWorkspaceBytes,
-          "repack staging stays within the fixed preparation reserve");
+    splash::model::prepareGgufImage(backend, inputFd, kSourceOffset, outputFd, plan);
+    check(backend.memoryStats().allocatedBytes == before, "repack releases its staging buffers");
+    check(backend.memoryStats().peakAllocatedBytes <= splash::model::kWeightPreparationStagingBytes,
+          "repack staging stays within the preparation staging bound");
     std::vector<uint8_t> actual(bytes), reference(bytes, 0);
     splash::model::readWeightBytes(outputFd, 0, actual);
-    for (const auto &section : sections)
-      std::copy(section.bytes->begin(), section.bytes->end(), reference.begin() + section.begin);
-    check(actual == reference, std::string("chunked file repack: ") + what);
+    std::copy(expected.w0.begin(), expected.w0.end(), reference.begin() + plane0);
+    if (layout.plane1_bytes) std::copy(expected.w1.begin(), expected.w1.end(), reference.begin() + plane1);
+    std::copy(expected.meta.begin(), expected.meta.end(), reference.begin() + meta);
+    check(actual == reference, what);
   } catch (const std::exception &error) {
-    check(false, std::string("chunked repack: ") + error.what());
+    check(false, std::string(what) + ": " + error.what());
   }
   if (inputFd >= 0) close(inputFd);
   if (outputFd >= 0) close(outputFd);
   unlink(inputPath);
   unlink(outputPath);
-}
-
-void checkCopy(const Gpu &gpu, uint32_t bytes) {
-  std::mt19937 rng(bytes);
-  std::vector<uint8_t> rows(bytes);
-  for (uint8_t &byte : rows) byte = static_cast<uint8_t>(rng());
-  id<MTLBuffer> source = buffer(gpu.device, kSourceOffset + bytes, 0);
-  std::memcpy(static_cast<uint8_t *>(source.contents) + kSourceOffset, rows.data(), bytes);
-  id<MTLBuffer> image = buffer(gpu.device, alignUp(kSection + bytes) + kSection, kPoison);
-  const GgufCopyParams params{kSourceOffset, uint32_t(kSection), bytes};
-  const bool ran = run(gpu, gpu.copy, source, image, params, (uint64_t{bytes} + 15) / 16);
-  check(ran && imageMatches(image, {{kSection, &rows}}), "gguf_copy bytes=" + std::to_string(bytes));
 }
 
 } // namespace
@@ -930,37 +900,24 @@ int main(int argc, char **argv) {
     } cleanup{cachePath};
     setenv("SPLASH_WEIGHT_CACHE", cachePath, 1);
     checkGoldens(ggml);
-    checkAlphaBeta();
-    checkFloatTensors();
-    checkMoeLayer(std::string(argv[1]) == "--cpu" ? nullptr : argv[1]);
-    if (std::string(argv[1]) != "--cpu") {
-      Gpu gpu{MTLCreateSystemDefaultDevice(), nil, nil, nil};
-      gpu.queue = [gpu.device newCommandQueue];
-      NSError *error = nil;
-      id<MTLLibrary> library = [gpu.device newLibraryWithURL:[NSURL fileURLWithPath:[NSString stringWithUTF8String:argv[1]]]
-                                                       error:&error];
-      if (!library) {
-        std::fprintf(stderr, "cannot load %s\n", argv[1]);
-        return 1;
-      }
-      gpu.repack = pipeline(gpu.device, library, "gguf_repack");
-      gpu.copy = pipeline(gpu.device, library, "gguf_copy");
-      if (!gpu.repack || !gpu.copy) return 1;
-      splash::metal::MetalBackend backend(argv[1]);
-      checkGoldenImages(backend);
+    std::optional<splash::metal::MetalBackend> backend;
+    if (std::string(argv[1]) != "--cpu") backend.emplace(argv[1]);
+    splash::metal::MetalBackend *gpu = backend ? &*backend : nullptr;
+    checkAlphaBeta(gpu);
+    checkFloatTensors(gpu);
+    checkMoeLayer(gpu);
+    if (gpu) {
+      checkGoldenImages(*gpu);
       const Shape shapes[] = {{512, 1024, kNoPermute, 0, 0, 0},
                               {768, 1280, 256, 16, 8, 4},
                               {768, 8448, 128, 16, 8, 5}};
       for (int s = 0; s < 3; ++s)
-        for (int f = 0; f < FMT_COUNT; ++f) checkRepack(gpu, backend, Fmt(f), shapes[s], 100 + 8 * s + f);
-      // Multiple bounded row batches and a row wider than the staging budget.
+        for (int f = 0; f < FMT_COUNT; ++f) checkRepack(*gpu, Fmt(f), shapes[s], 100 + 8 * s + f);
+      // Several bounded row batches, and rows wider than one staging step.
       for (Fmt format : {Q3K, Q80}) {
-        checkRepack(gpu, backend, format, {8704, 2048, kNoPermute, 0, 0, 0}, 741);
-        checkRepack(gpu, backend, format, {256, 131328, kNoPermute, 0, 0, 0}, 742);
+        checkRepack(*gpu, format, {8704, 2048, kNoPermute, 0, 0, 0}, 741);
+        checkRepack(*gpu, format, {256, widerThanStaging(format), kNoPermute, 0, 0, 0}, 742);
       }
-      // 768 whole 16-byte chunks and a 5-byte tail, then an exact multiple.
-      checkCopy(gpu, 768 * 16 + 5);
-      checkCopy(gpu, 1024 * 16);
     }
     std::printf("%s (%d failures)\n", failures ? "GGUF repack tests FAILED" : "GGUF repack tests passed", failures);
     return failures ? 1 : 0;
