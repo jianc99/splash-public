@@ -84,11 +84,6 @@ void testOptionalVisionAudit() {
   actual.visionWeightsBytes = 1;
   require(auditActualMemory(textOnly, actual).error == MemoryAuditError::CategoryExceedsPlan,
           "unexpected vision allocation was accepted in text-only mode");
-  const auto multimodal = plan();
-  actual = report(multimodal);
-  actual.visionWeightsBytes = 0;
-  require(auditActualMemory(multimodal, actual).error == MemoryAuditError::MissingMeasurement,
-          "missing multimodal vision measurement was accepted");
 }
 
 void testFixedCategoryAndPeakFailures() {

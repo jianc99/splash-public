@@ -63,6 +63,10 @@ makeRuntimeCacheIdentity(std::string_view combinedManifestSha256,
                          std::string_view buildId,
                          kv::Layout targetKvLayout);
 
+// The memory plan counts each weight category from the loaded package, so
+// every category the model has must report its allocation and identity.
+void requireLoadedModel(const model::ModelPackage &package);
+
 struct RuntimeResourcesConfig {
   kv::Format kvFormat = kv::Format::Int8;
   std::filesystem::path metallibPath;

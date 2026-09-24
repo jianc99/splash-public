@@ -44,13 +44,13 @@ std::string_view memoryAuditErrorName(MemoryAuditError error) {
 MemoryAuditResult auditActualMemory(const EngineMemoryPlan &plan,
                                     ActualMemoryReport actual) {
   const EngineMemoryBreakdown &budget = plan.breakdown();
+  // Vision weights are absent without a vision tower. Loading already
+  // requires them for a model with vision, and the plan counts what loaded.
   if (!actual.targetWeightsBytes || !actual.draftWeightsBytes ||
-      (budget.visionWeightsBytes && !actual.visionWeightsBytes) ||
-      !actual.stateResidentBytes ||
-      !actual.sharedPrefillBytes || !actual.sharedDecodeBytes ||
-      !actual.kvResidentBytes || !actual.backendAllocatedBytes ||
-      !actual.deviceCurrentAllocatedBytes || !actual.devicePeakAllocatedBytes ||
-      !actual.estimatedWarmupPeakBytes) {
+      !actual.stateResidentBytes || !actual.sharedPrefillBytes ||
+      !actual.sharedDecodeBytes || !actual.kvResidentBytes ||
+      !actual.backendAllocatedBytes || !actual.deviceCurrentAllocatedBytes ||
+      !actual.devicePeakAllocatedBytes || !actual.estimatedWarmupPeakBytes) {
     return fail(MemoryAuditError::MissingMeasurement,
                 "warmup memory report is incomplete", actual);
   }

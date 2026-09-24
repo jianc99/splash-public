@@ -164,12 +164,41 @@ void testStartupAdmissionIgnoresPackageSize(const char *metallibPath) {
   }
 }
 
+// The memory plan takes the vision category from what loaded, so a model
+// with vision whose loader produced no vision bytes must stop here.
+void testLoadedVisionIsRequiredOnlyWithVision() {
+  model::ModelPackage package;
+  package.descriptor = model::makeModelDescriptor(
+      "loaded-test", model::Qwen3_8Layout{}, model::DFlashDraftLayout{},
+      ops::VisionLayout{});
+  model::Qwen3_8Weights target;
+  target.actualAllocatedBytes = 1;
+  target.manifestFingerprintSha256 = "target";
+  package.target = std::move(target);
+  package.draft.actualAllocatedBytes = 1;
+  package.manifestFingerprintSha256 = "package";
+  bool rejected = false;
+  try {
+    requireLoadedModel(package);
+  } catch (const std::invalid_argument &) {
+    rejected = true;
+  }
+  require(rejected && package.descriptor.hasVision(),
+          "a multimodal model without loaded vision weights was accepted");
+  package.vision.actualAllocatedBytes = 1;
+  requireLoadedModel(package);
+  package.vision.actualAllocatedBytes = 0;
+  package.descriptor.visionSource = model::VisionSource::None;
+  requireLoadedModel(package);
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
   @autoreleasepool {
     try {
       require(argc == 2, "expected metallib path");
+      testLoadedVisionIsRequiredOnlyWithVision();
       testWeightBudgetBeforeLoading(argv[1]);
       testStartupAdmissionIgnoresPackageSize(argv[1]);
       std::cout << "runtime resources tests passed\n";
