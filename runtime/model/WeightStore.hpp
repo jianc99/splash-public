@@ -70,14 +70,15 @@ readProjection(WeightFile &file, metal::MetalBackend &backend,
 [[nodiscard]] ops::NormWeights readNorm(WeightFile &file, uint32_t width,
                                         bool float32, std::string_view label);
 
-// GGUF GGUF sections: a 64-byte descriptor, then plane0, optional plane1
+// GGUF image sections: a 64-byte descriptor, then plane0, optional plane1
 // and metadata, each 16 KiB aligned (layout in model/GgufImage.hpp).
 [[nodiscard]] ops::QuantizedSegment readQuantizedSegment(WeightFile &file,
                                                    std::string_view label);
 // A single-tensor projection; its descriptor must hold the layout's sizes.
 [[nodiscard]] ops::Projection readGgufProjection(WeightFile &file, uint32_t outputSize,
                                                  uint32_t inputSize, std::string_view label);
-// Native block_q4_K rows for the token table (gathered, never multiplied).
+// Native block_q4_K, block_q6_K or block_q8_0 rows for the token table
+// (gathered, never multiplied).
 [[nodiscard]] ops::EmbeddingWeights readGgufEmbedding(WeightFile &file, uint32_t outputSize,
                                                       uint32_t inputSize, std::string_view label);
 

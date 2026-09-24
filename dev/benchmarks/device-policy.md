@@ -37,7 +37,7 @@ Q4 candidates always start with the shipped baseline. Persistent grids now
 include two, three and four threadgroups per reported core plus the full grid,
 instead of fixed counts 36/60/80. Apple9 additionally exposes every valid
 simdgroup split in 1/2/4/8. The maximum candidate count is 20, derived beside
-`Q4Linear::kMaximumCandidates`; deduplication handles small grids. Prefill
+`Linear::kMaximumCandidates`; deduplication handles small grids. Prefill
 candidates are unchanged. New candidates do not automatically change serving.
 
 The existing offline tuner qualifies numerical results, admits the maximum
