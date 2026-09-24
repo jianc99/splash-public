@@ -203,7 +203,7 @@ SANITIZER_CONFIG_TARGETS := $(TEST_BACKEND_ASAN) $(TEST_BACKEND_TSAN) \
 # prerequisites and the force dependency are not compiler input files.
 ENGINE_TEST_HEADERS := $(filter %.h %.hpp,$(PRODUCTION_ENGINE_INPUTS)) \
 	$(wildcard dev/tuning/*.hpp dev/tests/engine/*.hpp)
-TEST_INPUTS = $(filter-out %.h %.hpp %.metallib,$(BUILD_INPUTS))
+TEST_INPUTS = $(filter-out %.h %.hpp,$(BUILD_INPUTS))
 $(filter-out %.air %.metallib,$(TEST_CONFIG_TARGETS)) $(PRODUCTION_FLAG_TOOLS) \
 	$(SANITIZER_CONFIG_TARGETS): $(ENGINE_TEST_HEADERS)
 
@@ -423,8 +423,7 @@ $(TEST_TUNING_WORKLOADS): dev/tests/engine/tuning_workloads_test.cpp $(TUNING_SO
 $(TUNE_KERNELS): dev/tuning/tune_kernels.mm $(TUNING_SOURCES) \
 		$(ENGINE_LIBRARY) $(BUILD_ID_HEADER) | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_CXXFLAGS) -Idev -fobjc-arc -include $(BUILD_ID_HEADER) \
-		$(filter-out $(BUILD_ID_HEADER),$(TEST_INPUTS)) \
-		$(ENGINE_LINKFLAGS) -o $@
+		$(TEST_INPUTS) $(ENGINE_LINKFLAGS) -o $@
 
 # Offline kernel measurement for this device and model: reports every key
 # where a precompiled candidate beats the policy default in runtime/ops.
