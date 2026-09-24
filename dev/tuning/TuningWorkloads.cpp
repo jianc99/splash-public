@@ -122,7 +122,7 @@ TuningWorkloads collectTuningWorkloads(
         bothPhases(mixer.inputProjection);
         bothPhases(mixer.outputProjection, LinearEpilogue::Residual);
       }, layer.mixer);
-      if constexpr (requires { layer.gateProjection; }) {
+      if constexpr (decltype(target.layout)::ffnKind == QwenFfnKind::Dense) {
         projection(layer.gateProjection, LinearPhase::Prefill,
                      LinearEpilogue::None);
         projection(layer.upProjection, LinearPhase::Prefill,

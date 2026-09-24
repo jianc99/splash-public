@@ -37,6 +37,7 @@ QwenTargetGeometry commonGeometry(const Layout &layout) {
   result.gdnHeadDimension = layout.gdnHeadDimension;
   result.maskToken = layout.maskToken;
   result.stopTokens = layout.stopTokens;
+  result.ffnKind = Layout::ffnKind;
   result.kvLayout = layout.kvLayout();
   result.stateLayout = layout.gdnStateLayout();
   result.captureLayerCount =
@@ -50,7 +51,6 @@ QwenTargetGeometry commonGeometry(const Layout &layout) {
 QwenTargetGeometry geometryFor(const Qwen3_8Layout &layout) {
   QwenTargetGeometry result = commonGeometry(layout);
   result.denseIntermediateSize = layout.intermediateSize;
-  result.ffnKind = QwenFfnKind::Dense;
   return result;
 }
 
@@ -59,7 +59,6 @@ QwenTargetGeometry geometryFor(const Qwen3_6MoeLayout &layout) {
   result.experts = layout.experts;
   result.expertsPerToken = layout.expertsPerToken;
   result.expertIntermediateSize = layout.expertIntermediateSize;
-  result.ffnKind = QwenFfnKind::SparseMoe;
   return result;
 }
 
@@ -79,23 +78,20 @@ void requireWeights(const Weights &weights,
 
 } // namespace
 
-QwenTarget::QwenTarget(const Qwen3_8Weights &weights,
+template <class Layout, class Layer>
+QwenTarget::QwenTarget(const QwenTargetWeights<Layout, Layer> &weights,
                        metal::MetalBackend &backend,
                        const ops::ExecutionPlans &operators, kv::Format format)
-    : weights_(&weights), geometry_(qwenTargetGeometry(weights)),
+    : weights_(&weights), weightsBase_(weights), geometry_(qwenTargetGeometry(weights)),
       backend_(backend), operators_(operators) {
   geometry_.kvLayout.format = format;
   requireWeights(weights, geometry_);
 }
 
-QwenTarget::QwenTarget(const Qwen3_6MoeWeights &weights,
-                       metal::MetalBackend &backend,
-                       const ops::ExecutionPlans &operators, kv::Format format)
-    : weights_(&weights), geometry_(qwenTargetGeometry(weights)),
-      backend_(backend), operators_(operators) {
-  geometry_.kvLayout.format = format;
-  requireWeights(weights, geometry_);
-}
+template QwenTarget::QwenTarget(const Qwen3_8Weights &, metal::MetalBackend &, const ops::ExecutionPlans &,
+                                kv::Format);
+template QwenTarget::QwenTarget(const Qwen3_6MoeWeights &, metal::MetalBackend &,
+                                const ops::ExecutionPlans &, kv::Format);
 
 namespace {
 
@@ -119,8 +115,10 @@ void includeFfn(QwenTargetGeometry &geometry, const Qwen3_6MoeLayerWeights &laye
     throw WeightStoreError("the MoE blocks of a target must share one weight layout");
 }
 
-template <class Weights>
-QwenTargetGeometry targetGeometry(const Weights &weights) {
+} // namespace
+
+template <class Layout, class Layer>
+QwenTargetGeometry qwenTargetGeometry(const QwenTargetWeights<Layout, Layer> &weights) {
   auto geometry = geometryFor(weights.layout);
   for (const auto &layer : weights.layers) {
     std::visit([&](const auto &mixer) {
@@ -139,20 +137,11 @@ QwenTargetGeometry targetGeometry(const Weights &weights) {
   return geometry;
 }
 
-} // namespace
-
-QwenTargetGeometry qwenTargetGeometry(const Qwen3_8Weights &weights) {
-  return targetGeometry(weights);
-}
-
-QwenTargetGeometry qwenTargetGeometry(const Qwen3_6MoeWeights &weights) {
-  return targetGeometry(weights);
-}
+template QwenTargetGeometry qwenTargetGeometry(const Qwen3_8Weights &);
+template QwenTargetGeometry qwenTargetGeometry(const Qwen3_6MoeWeights &);
 
 const ops::Projection &QwenTarget::vocabularyProjection() const noexcept {
-  return std::visit([](const auto *weights) -> const ops::Projection & {
-    return weights->logitsProjection;
-  }, weights_);
+  return weightsBase_.logitsProjection;
 }
 
 uint32_t QwenTarget::decodeStorageLanes(uint32_t lanes) const {
@@ -493,9 +482,7 @@ void QwenTarget::addHead(metal::CommandGraph &graph,
       normalizedRows > ExecutionLimits::targetVerifyRows) {
     throw std::invalid_argument("invalid Qwen head row count");
   }
-  const ops::NormWeights norm = std::visit(
-      [](const auto *weights) { return weights->finalNorm; }, weights_);
-  ops::Normalization::addRms(graph, std::move(hidden), norm, finalHidden,
+  ops::Normalization::addRms(graph, std::move(hidden), weightsBase_.finalNorm, finalHidden,
                              geometry_.hiddenSize, normalizedRows);
   operators_.linear().addDecode(graph,
                 std::move(finalHidden), vocabularyProjection(),
@@ -506,12 +493,7 @@ void QwenTarget::addEmbedding(metal::CommandGraph &graph,
                               metal::MetalBuffer tokens,
                               metal::MetalBuffer hidden,
                               uint32_t rows) const {
-  const ops::EmbeddingWeights &embedding = std::visit(
-      [](const auto *weights) -> const ops::EmbeddingWeights & {
-        return weights->tokenEmbedding;
-      },
-      weights_);
-  ops::Embedding::add(graph, std::move(tokens), embedding, std::move(hidden),
+  ops::Embedding::add(graph, std::move(tokens), weightsBase_.tokenEmbedding, std::move(hidden),
                       rows);
 }
 

@@ -24,7 +24,7 @@ std::vector<uint8_t> fileBytes(const std::filesystem::path &path) {
 }
 
 // The dimensions both fixtures share: two layers (GDN, then full attention)
-// of width 256.
+// of width 256, every draft capture reading the last.
 template <class Layout> Layout tinyLayout() {
   Layout layout;
   layout.layers = 2;
@@ -42,6 +42,7 @@ template <class Layout> Layout tinyLayout() {
   layout.attentionHeadDimension = 64;
   layout.rotaryPairs = 8;
   layout.fullAttentionPeriod = 2;
+  layout.hiddenCaptureLayers.fill(1);
   return layout;
 }
 
@@ -125,8 +126,26 @@ int main(int argc, char **argv) {
                                 layout.packedFullWidth, layout.hiddenSize);
       }
       if (!read) throw std::runtime_error("the target loader misread the prepared affine files");
+      // The dense layout is checked like the MoE one, before any file is
+      // opened: its capture layers and its convolution width against its GDN
+      // heads.
+      const auto inconsistent = [&](const model::Qwen3_8Layout &broken) {
+        try {
+          static_cast<void>(model::loadQwen3_8Weights(
+              backend, broken, model::PackedTargetFiles<model::Qwen3_8Layout>{backend, root, broken}));
+        } catch (const model::WeightStoreError &error) {
+          return std::string_view(error.what()) == "Qwen target layout is inconsistent";
+        }
+        return false;
+      };
+      auto capturePastLastLayer = layout;
+      capturePastLastLayer.hiddenCaptureLayers.back() = layout.layers;
+      auto convolutionMismatch = layout;
+      convolutionMismatch.convolutionDimension += layout.gdnHeadDimension;
+      if (!inconsistent(capturePastLastLayer) || !inconsistent(convolutionMismatch))
+        throw std::runtime_error("the target loader accepted an inconsistent dense layout");
       std::cout << "affine preparation: exact independent fixture, padding, fused order, gate/up, warm admission, "
-                   "planned weights, target read PASS\n";
+                   "planned weights, target read, layout checks PASS\n";
     } catch (const std::exception &error) {
       std::cerr << error.what() << '\n';
       return 1;

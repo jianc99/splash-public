@@ -10,6 +10,7 @@
 #include "model/GgufFile.hpp"
 #include "model/GgufImage.hpp"
 #include "model/PreparedFiles.hpp"
+#include "model/QwenHybridLayout.hpp"
 
 namespace splash::model {
 
@@ -42,8 +43,8 @@ private:
   PreparedFiles files_;
 };
 
-// The GGUF geometry of a Qwen layout: a dense FFN, or a sparse MoE when the
-// layout has experts.
+// The GGUF geometry of a Qwen layout with its family's dense or sparse MoE
+// FFN.
 template <class Layout>
 [[nodiscard]] gguf::TargetGeometry ggufTargetGeometry(const Layout &layout) {
   gguf::TargetGeometry geometry;
@@ -58,7 +59,7 @@ template <class Layout>
   geometry.attentionKvHeads = layout.attentionKvHeads;
   geometry.attentionHeadDimension = layout.attentionHeadDimension;
   geometry.fullAttentionPeriod = layout.fullAttentionPeriod;
-  if constexpr (requires { layout.experts; }) {
+  if constexpr (Layout::ffnKind == QwenFfnKind::SparseMoe) {
     geometry.experts = layout.experts;
     geometry.expertsPerToken = layout.expertsPerToken;
     geometry.expertIntermediateSize = layout.expertIntermediateSize;

@@ -1,7 +1,9 @@
 #pragma once
 
 #include "Model.hpp"
+#include "QwenHybridLayout.hpp"
 #include "StateLayout.hpp"
+#include "WeightStore.hpp"
 #include "ops/GDN.hpp"
 #include "ops/ExecutionPlans.hpp"
 #include "ops/Linear.hpp"
@@ -14,18 +16,16 @@
 #include <cstdint>
 #include <optional>
 #include <span>
-#include <string_view>
+#include <string>
 #include <variant>
 #include <vector>
 
 namespace splash::model {
 
-struct Qwen3_8Weights;
+struct Qwen3_8Layout;
 struct Qwen3_8LayerWeights;
-struct Qwen3_6MoeWeights;
+struct Qwen3_6MoeLayout;
 struct Qwen3_6MoeLayerWeights;
-
-enum class QwenFfnKind : uint8_t { Dense, SparseMoe };
 
 // Both supported targets bind the same mixer tensors per hybrid layer; only
 // the FFN differs between them.
@@ -50,19 +50,22 @@ struct QwenAttentionWeights final {
 
 using QwenMixerWeights = std::variant<QwenGdnWeights, QwenAttentionWeights>;
 
-// Sizes of the mixer sections in a packed layer file.
-struct QwenMixerGeometry final {
-  uint32_t hiddenSize = 0;
-  uint32_t packedGdnWidth = 0;
-  uint32_t packedFullWidth = 0;
-  uint32_t convolutionDimension = 0;
-  uint32_t gdnValueHeads = 0;
-  uint32_t gdnHeadDimension = 0;
-  uint32_t attentionWidth = 0;
-  uint32_t attentionHeadDimension = 0;
+// A Qwen target's weights outside its layers and the record of every file
+// its weights were read from.
+struct QwenTargetWeightsBase {
+  ops::NormWeights finalNorm;
+  ops::Projection logitsProjection;
+  ops::EmbeddingWeights tokenEmbedding;
+  std::vector<WeightFileRecord> files;
+  uint64_t actualAllocatedBytes = 0;
+  std::string manifestFingerprintSha256;
 };
 
-inline constexpr std::string_view kEmbeddingMagic = "MDFE0001";
+// The weights of a target of Layout, whose layers the family keeps in Layer.
+template <class Layout, class Layer> struct QwenTargetWeights final : QwenTargetWeightsBase {
+  Layout layout;
+  std::vector<Layer> layers;
+};
 
 // Runtime-visible tensor geometry shared by the supported Qwen hybrid
 // targets. It describes semantics only; operators remain responsible for
@@ -263,19 +266,16 @@ struct QwenTargetCommitBuffers final {
   metal::MetalBuffer retainedCounts;
 };
 
+template <class Layout, class Layer>
 [[nodiscard]] QwenTargetGeometry
-qwenTargetGeometry(const Qwen3_8Weights &weights);
-[[nodiscard]] QwenTargetGeometry
-qwenTargetGeometry(const Qwen3_6MoeWeights &weights);
+qwenTargetGeometry(const QwenTargetWeights<Layout, Layer> &weights);
 
 // Builds the shared Qwen GDN/attention layer graph with the target's dense
 // or sparse-MoE FFN. Architecture-specific loaders supply the package tensors.
 class QwenTarget final {
 public:
-  QwenTarget(const Qwen3_8Weights &weights, metal::MetalBackend &backend,
-             const ops::ExecutionPlans &operators,
-             kv::Format format = kv::Format::Int8);
-  QwenTarget(const Qwen3_6MoeWeights &weights, metal::MetalBackend &backend,
+  template <class Layout, class Layer>
+  QwenTarget(const QwenTargetWeights<Layout, Layer> &weights, metal::MetalBackend &backend,
              const ops::ExecutionPlans &operators,
              kv::Format format = kv::Format::Int8);
 
@@ -311,7 +311,8 @@ public:
 
 private:
   using WeightView =
-      std::variant<const Qwen3_8Weights *, const Qwen3_6MoeWeights *>;
+      std::variant<const QwenTargetWeights<Qwen3_8Layout, Qwen3_8LayerWeights> *,
+                   const QwenTargetWeights<Qwen3_6MoeLayout, Qwen3_6MoeLayerWeights> *>;
   struct PrefillStep;
   struct VerifyStep;
 
@@ -339,6 +340,7 @@ private:
                     metal::MetalBuffer output) const;
 
   WeightView weights_;
+  const QwenTargetWeightsBase &weightsBase_;
   QwenTargetGeometry geometry_;
   metal::MetalBackend &backend_;
   const ops::ExecutionPlans &operators_;

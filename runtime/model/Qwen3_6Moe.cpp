@@ -4,49 +4,10 @@
 #include <utility>
 
 namespace splash::model {
-namespace {
-
-void requireLayout(const Qwen3_6MoeLayout &layout) {
-  if (!layout.maximumContextTokens || !layout.layers || !layout.hiddenSize ||
-      !layout.vocabularySize || !layout.packedGdnWidth ||
-      !layout.packedFullWidth || !layout.convolutionDimension ||
-      !layout.gdnKeyHeads || !layout.gdnValueHeads ||
-      !layout.gdnHeadDimension || !layout.attentionWidth ||
-      !layout.attentionQueryHeads || !layout.attentionKvHeads ||
-      !layout.attentionHeadDimension || !layout.rotaryPairs ||
-      !(layout.rotaryTheta > 0.0F) || !layout.fullAttentionPeriod ||
-      !layout.experts || !layout.expertsPerToken ||
-      !layout.expertIntermediateSize) {
-    throw WeightStoreError("Qwen3.6 MoE layout contains a zero dimension");
-  }
-  if (layout.gdnValueHeads % layout.gdnKeyHeads ||
-      layout.convolutionDimension !=
-          (2 * layout.gdnKeyHeads + layout.gdnValueHeads) *
-              layout.gdnHeadDimension ||
-      layout.attentionWidth !=
-          layout.attentionQueryHeads * layout.attentionHeadDimension ||
-      layout.packedFullWidth !=
-          2 * layout.attentionWidth +
-              2 * layout.attentionKvHeads * layout.attentionHeadDimension ||
-      layout.expertsPerToken > layout.experts ||
-      layout.hiddenCaptureLayers.back() >= layout.layers ||
-      !layout.kvLayout().valid() || !layout.gdnStateLayout().valid()) {
-    throw WeightStoreError("Qwen3.6 MoE layout is inconsistent");
-  }
-  validateQ4Layout(layout.packedGdnWidth, layout.hiddenSize);
-  validateQ4Layout(layout.packedFullWidth, layout.hiddenSize);
-  validateQ4Layout(layout.hiddenSize, layout.attentionWidth);
-  validateQ4Layout(layout.expertIntermediateSize, layout.hiddenSize);
-  validateQ4Layout(layout.hiddenSize, layout.expertIntermediateSize);
-  validateQ4Layout(layout.vocabularySize, layout.hiddenSize);
-}
-
-} // namespace
 
 Qwen3_6MoeWeights
 loadQwen3_6MoeWeights(metal::MetalBackend &backend, Qwen3_6MoeLayout layout,
                       const QwenTargetFiles<Qwen3_6MoeLayout> &files) {
-  requireLayout(layout);
   // Affine files keep a Q8 router and shared-expert gate and one Q4 slab per
   // expert projection; the shared expert is a one-expert slab.
   const auto readAffineFfn = [&](WeightFile &file, Qwen3_6MoeLayerWeights &layer,

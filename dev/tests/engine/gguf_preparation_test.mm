@@ -288,6 +288,7 @@ void checkDenseTarget(MetalBackend &backend, const std::filesystem::path &direct
   layout.attentionHeadDimension = 128;
   layout.packedFullWidth = 1024;     // q and its gate | k | v
   layout.intermediateSize = 512;
+  layout.hiddenCaptureLayers.fill(layout.layers - 1);
   const uint32_t hidden = layout.hiddenSize, valueRows = layout.gdnValueHeads * layout.gdnHeadDimension;
   const uint32_t kvRows = layout.attentionKvHeads * layout.attentionHeadDimension;
   const model::gguf::TargetGeometry geometry = model::ggufTargetGeometry(layout);

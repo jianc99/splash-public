@@ -236,17 +236,17 @@ void validateLayerTypes(NSDictionary *target,
   }
 }
 
-void validateCaptureLayers(NSDictionary *draft) {
+void validateCaptureLayers(NSDictionary *draft, const Qwen3_6MoeLayout &layout) {
   NSArray *layers =
       requireArray(draft, @"target_capture_layers", "target capture layers");
-  requireEqual(layers.count, Qwen3_6MoeLayout::hiddenCaptureLayers.size(),
+  requireEqual(layers.count, layout.hiddenCaptureLayers.size(),
                "target capture layer count");
   for (uint32_t index = 0; index < layers.count; ++index) {
     id value = layers[index];
     if (![value isKindOfClass:[NSNumber class]])
       throw std::invalid_argument("target capture layer must be an integer");
     requireEqual(static_cast<NSNumber *>(value).unsignedLongLongValue,
-                 Qwen3_6MoeLayout::hiddenCaptureLayers[index],
+                 layout.hiddenCaptureLayers[index],
                  "target capture layer " + std::to_string(index));
   }
 }
@@ -313,7 +313,7 @@ void validateQwen36(NSDictionary *manifest,
                                  field.name),
                  field.value, field.name);
   }
-  validateCaptureLayers(draft);
+  validateCaptureLayers(draft, targetLayout);
   validateTokenizer(root, descriptor, "qwen3_5_moe_text");
 }
 

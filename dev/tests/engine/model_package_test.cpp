@@ -561,8 +561,8 @@ void testSyntheticPackage(MetalBackend &backend,
     target.packedGdnWidth = 256;
     target.packedFullWidth = 256;
     target.convolutionDimension = 256;
-    target.gdnKeyHeads = 2;
-    target.gdnValueHeads = 4;
+    target.gdnKeyHeads = 1;
+    target.gdnValueHeads = 2;
     target.gdnHeadDimension = 64;
     target.attentionWidth = 64;
     target.intermediateSize = 256;
@@ -570,6 +570,7 @@ void testSyntheticPackage(MetalBackend &backend,
     target.attentionKvHeads = 1;
     target.attentionHeadDimension = 64;
     target.fullAttentionPeriod = 4;
+    target.hiddenCaptureLayers.fill(target.layers - 1);
 
     DFlashDraftLayout draft;
     draft.layers = 2;

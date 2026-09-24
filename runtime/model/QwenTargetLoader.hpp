@@ -2,6 +2,7 @@
 
 #include "model/AffineTarget.hpp"
 #include "model/GgufTarget.hpp"
+#include "model/QwenHybridLayout.hpp"
 #include "model/QwenTarget.hpp"
 #include "model/QwenTargetFiles.hpp"
 #include "model/WeightStore.hpp"
@@ -9,6 +10,7 @@
 #include "ops/Linear.hpp"
 #include "ops/Normalization.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -139,13 +141,52 @@ readQwenTargetWeights(metal::MetalBackend &backend, const Layout &layout, Files 
   return result;
 }
 
-// Loads a target from its files. The architecture reads its FFN from affine
-// files through readAffineFfn and from GGUF images through readBlockFfn, each
-// called with the file, the layer and the format.
+// Throws unless every dimension of a family's layout is set, the dimensions
+// agree with each other and every projection fits the Q4 storage tiles.
+template <class Layout> void validateQwenLayout(const Layout &layout) {
+  const auto zero = [](auto... dimensions) { return ((dimensions == 0) || ...); };
+  uint32_t ffnWidth = 0;
+  bool ffnZero = false;
+  bool routingInconsistent = false;
+  if constexpr (Layout::ffnKind == QwenFfnKind::Dense) {
+    ffnWidth = layout.intermediateSize;
+    ffnZero = zero(ffnWidth);
+  } else {
+    ffnWidth = layout.expertIntermediateSize;
+    ffnZero = zero(layout.experts, layout.expertsPerToken, ffnWidth);
+    routingInconsistent = layout.expertsPerToken > layout.experts;
+  }
+  if (ffnZero || !(layout.rotaryTheta > 0.0F) ||
+      zero(layout.maximumContextTokens, layout.layers, layout.hiddenSize, layout.vocabularySize,
+           layout.packedGdnWidth, layout.packedFullWidth, layout.convolutionDimension, layout.gdnKeyHeads,
+           layout.gdnValueHeads, layout.gdnHeadDimension, layout.attentionWidth, layout.attentionQueryHeads,
+           layout.attentionKvHeads, layout.attentionHeadDimension, layout.rotaryPairs,
+           layout.fullAttentionPeriod))
+    throw WeightStoreError("Qwen target layout contains a zero dimension");
+  if (routingInconsistent || layout.gdnValueHeads % layout.gdnKeyHeads ||
+      layout.convolutionDimension != (2 * layout.gdnKeyHeads + layout.gdnValueHeads) * layout.gdnHeadDimension ||
+      layout.attentionWidth != layout.attentionQueryHeads * layout.attentionHeadDimension ||
+      layout.packedFullWidth !=
+          2 * layout.attentionWidth + 2 * layout.attentionKvHeads * layout.attentionHeadDimension ||
+      std::ranges::any_of(layout.hiddenCaptureLayers, [&](uint32_t layer) { return layer >= layout.layers; }) ||
+      !layout.kvLayout().valid() || !layout.gdnStateLayout().valid())
+    throw WeightStoreError("Qwen target layout is inconsistent");
+  validateQ4Layout(layout.packedGdnWidth, layout.hiddenSize);
+  validateQ4Layout(layout.packedFullWidth, layout.hiddenSize);
+  validateQ4Layout(layout.hiddenSize, layout.attentionWidth);
+  validateQ4Layout(ffnWidth, layout.hiddenSize);
+  validateQ4Layout(layout.hiddenSize, ffnWidth);
+  validateQ4Layout(layout.vocabularySize, layout.hiddenSize);
+}
+
+// Validates the layout and loads a target from its files. The architecture
+// reads its FFN from affine files through readAffineFfn and from GGUF images
+// through readBlockFfn, each called with the file, the layer and the format.
 template <class Weights, class Layout, class ReadAffineFfn, class ReadBlockFfn>
 [[nodiscard]] Weights
 loadQwenTarget(metal::MetalBackend &backend, const Layout &layout, const QwenTargetFiles<Layout> &files,
                ReadAffineFfn readAffineFfn, ReadBlockFfn readBlockFfn) {
+  validateQwenLayout(layout);
   if (const auto *gguf = std::get_if<std::reference_wrapper<GgufTargetLoader>>(&files))
     return readQwenTargetWeights<Weights>(backend, layout, gguf->get(), BlockTargetFormat{}, readBlockFfn);
   const AffineTargetFormat affine{};
