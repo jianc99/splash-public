@@ -1,8 +1,6 @@
 #include "model/Qwen3_8.hpp"
 #include "model/QwenTargetLoader.hpp"
 
-#include <utility>
-
 namespace splash::model {
 
 Qwen3_8Weights loadQwen3_8Weights(metal::MetalBackend &backend, Qwen3_8Layout layout,
