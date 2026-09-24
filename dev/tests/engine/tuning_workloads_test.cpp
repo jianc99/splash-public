@@ -61,7 +61,7 @@ template <class Weights, class Layout> Weights targetWeights(Layout layout) {
       layer.upProjection = layer.gateProjection;
       layer.downProjection = projection(layout.hiddenSize, layout.intermediateSize);
     } else {
-      const Q8Projection router{{}, {}, {}, 256, layout.hiddenSize};
+      const Q8Projection router{{}, 256, layout.hiddenSize};
       const ExpertProjection up{{}, layout.experts, layout.expertIntermediateSize,
                                   layout.hiddenSize, 16'384};
       const ExpertProjection down{{}, layout.experts, layout.hiddenSize,
@@ -454,8 +454,8 @@ void metadataViews(const char *metallib) {
       return backend.view(backing, uint64_t{index * 12 + component} * 128, 128);
     };
     const auto &layout = sparse.layout;
-    const Q8Projection router{buffer(0), buffer(1), buffer(2), 256, layout.hiddenSize};
-    const Q8Projection sharedRouter{buffer(3), buffer(4), buffer(5), 256, layout.hiddenSize};
+    const Q8Projection router{{buffer(0), buffer(1), buffer(2)}, 256, layout.hiddenSize};
+    const Q8Projection sharedRouter{{buffer(3), buffer(4), buffer(5)}, 256, layout.hiddenSize};
     auto expert = [&](uint32_t component, uint32_t count, bool down) {
       return ExpertProjection{buffer(component), count,
           down ? layout.hiddenSize : layout.expertIntermediateSize,
@@ -473,7 +473,7 @@ void metadataViews(const char *metallib) {
       const uint32_t representative = index / 2;
       AffineMoeWeights weights = moeView(variation == MoeVariation::Distinct ? representative : 0);
       if (variation == MoeVariation::RouterOnly)
-        weights.router.scales = moeView(representative).router.scales;
+        weights.router.planes.scales = moeView(representative).router.planes.scales;
       if (variation == MoeVariation::SharedOnly)
         weights.sharedDown.packed = moeView(representative).sharedDown.packed;
       if (variation == MoeVariation::StrideOnly)
@@ -494,8 +494,8 @@ void metadataViews(const char *metallib) {
         const auto &actual = input.weights[index];
         const auto &source = sparse.layers[sourceLayers[index]].ffn;
         for (auto field : {&AffineMoeWeights::router, &AffineMoeWeights::sharedExpertGate}) {
-          const auto &left = actual.affine().*field;
-          const auto &right = source.affine().*field;
+          const auto &left = (actual.affine().*field).planes;
+          const auto &right = (source.affine().*field).planes;
           require(left.weights.sameView(right.weights) &&
                       left.scales.sameView(right.scales) && left.biases.sameView(right.biases),
                   "MoE representatives missed router layer depth");

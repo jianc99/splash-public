@@ -26,27 +26,6 @@ void addGgufFloat(metal::CommandGraph &graph, metal::MetalBuffer input, const Qu
                   metal::MetalBuffer output, uint32_t rows, uint32_t outStride, uint32_t outOffset,
                   FloatOutput type, FloatTile tile);
 
-// Q8 affine projections use per-64-input quantization and StorageN=256 order.
-// Used by the MoE router and shared-expert gate.
-struct Q8Projection final {
-  metal::MetalBuffer weights;
-  metal::MetalBuffer scales;
-  metal::MetalBuffer biases;
-  uint32_t outputSize = 0;
-  uint32_t inputSize = 0;
-};
-
-// Expert-major Q4 slabs keep one complete StorageN-packed projection per
-// expert. The operator selects expertStrideBytes directly; no per-expert
-// MetalBuffer objects or weight copies are created at runtime.
-struct ExpertProjection final {
-  metal::MetalBuffer packed;
-  uint32_t experts = 0;
-  uint32_t outputSize = 0;
-  uint32_t inputSize = 0;
-  uint64_t expertStrideBytes = 0;
-};
-
 struct LinearMatrix final {
   uint32_t outputSize = 0;
   uint32_t inputSize = 0;

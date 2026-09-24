@@ -9,7 +9,7 @@ namespace {
 
 // The planes of the affine Q4 and Q8 projections the collector keeps.
 const ops::AffineWeights &planes(const ops::Projection &projection) noexcept { return projection.affine(); }
-const ops::Q8Projection &planes(const ops::Q8Projection &projection) noexcept { return projection; }
+const ops::AffineWeights &planes(const ops::Q8Projection &projection) noexcept { return projection.planes; }
 
 template <class Projection>
 bool sameProjection(const Projection &left, const Projection &right) noexcept {

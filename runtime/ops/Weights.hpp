@@ -28,6 +28,25 @@ struct AffineWeights final {
   metal::MetalBuffer biases;
 };
 
+// A Q8 affine projection, quantized per 64 inputs in StorageN=256 order: the
+// MoE router and shared-expert gate.
+struct Q8Projection final {
+  AffineWeights planes;
+  uint32_t outputSize = 0;
+  uint32_t inputSize = 0;
+};
+
+// An expert-major Q4 slab holding one complete StorageN-packed projection per
+// expert, expertStrideBytes apart: the operator selects an expert by its
+// offset, so no per-expert buffer or copy exists at run time.
+struct ExpertProjection final {
+  metal::MetalBuffer packed;
+  uint32_t experts = 0;
+  uint32_t outputSize = 0;
+  uint32_t inputSize = 0;
+  uint64_t expertStrideBytes = 0;
+};
+
 // A prepared GGUF tensor occupying a projection's output columns
 // [columnOffset, columnOffset + outputSize): repacked planes in the GGUF_FMT_*
 // format formatId (metal/abi/QuantFormat.h), or a float tensor the GGUF keeps

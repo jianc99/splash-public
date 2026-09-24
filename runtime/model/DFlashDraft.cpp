@@ -294,26 +294,26 @@ loadDFlashDraftWeights(metal::MetalBackend &backend,
     layer.attentionConvolution =
         file.section(convolutionBytes, "attention-convolution");
     layer.attentionDynamic = readAffineProjection(
-        file, backend, layout.dynamicSize, layout.hiddenSize,
+        file, layout.dynamicSize, layout.hiddenSize,
         "attention-dynamic");
     layer.qkvProjection = readAffineProjection(
-        file, backend, layout.qkvSize, layout.hiddenSize, "qkv");
+        file, layout.qkvSize, layout.hiddenSize, "qkv");
     layer.queryNorm = file.section(headNormBytes, "query-norm");
     layer.keyNorm = file.section(headNormBytes, "key-norm");
     layer.outputProjection = readAffineProjection(
-        file, backend, layout.hiddenSize, layout.attentionSize,
+        file, layout.hiddenSize, layout.attentionSize,
         "attention-output");
     layer.postAttentionNorm =
         readNorm(file, layout.hiddenSize, false, "post-attention-norm");
     layer.mlpConvolution = file.section(convolutionBytes, "mlp-convolution");
     layer.mlpDynamic = readAffineProjection(
-        file, backend, layout.dynamicSize, layout.hiddenSize, "mlp-dynamic");
+        file, layout.dynamicSize, layout.hiddenSize, "mlp-dynamic");
     layer.gateProjection = readAffineProjection(
-        file, backend, layout.intermediateSize, layout.hiddenSize, "mlp-gate");
+        file, layout.intermediateSize, layout.hiddenSize, "mlp-gate");
     layer.upProjection = readAffineProjection(
-        file, backend, layout.intermediateSize, layout.hiddenSize, "mlp-up");
+        file, layout.intermediateSize, layout.hiddenSize, "mlp-up");
     layer.downProjection = readAffineProjection(
-        file, backend, layout.hiddenSize, layout.intermediateSize, "mlp-down");
+        file, layout.hiddenSize, layout.intermediateSize, "mlp-down");
     file.finish();
     result.files.push_back(file.record());
     result.layers.push_back(std::move(layer));
@@ -323,12 +323,12 @@ loadDFlashDraftWeights(metal::MetalBackend &backend,
     WeightFile file(backend, directory / "model.bin", "draft/model.bin",
                     kDFlashLayerMagic, layout.layers, 1);
     result.contextProjection = readAffineProjection(
-        file, backend, layout.hiddenSize, layout.targetHiddenSize,
+        file, layout.hiddenSize, layout.targetHiddenSize,
         "context-projection");
     result.hiddenNorm = readNorm(file, layout.hiddenSize, false, "hidden-norm");
     result.finalNorm = readNorm(file, layout.hiddenSize, false, "final-norm");
     result.selectorProjection = readAffineProjection(
-        file, backend, layout.selectorRank, layout.hiddenSize, "selector");
+        file, layout.selectorRank, layout.hiddenSize, "selector");
     const uint64_t codebookBytes = checkedWeightMultiply(
         checkedWeightMultiply(layout.vocabularySize, layout.selectorRank,
                               "draft codebook elements"),

@@ -170,11 +170,12 @@ MetalBuffer zeroed(MetalBackend &backend, uint64_t bytes) {
 Q8Projection router(MetalBackend &backend, bool shared, uint32_t representative = 0) {
   constexpr uint32_t hidden = 256;
   constexpr uint64_t elements = 256 * hidden;
-  Q8Projection result{zeroed(backend, elements), zeroed(backend, elements / 32),
-                       zeroed(backend, elements / 32), 256, hidden};
+  Q8Projection result{{zeroed(backend, elements), zeroed(backend, elements / 32),
+                        zeroed(backend, elements / 32)},
+                       256, hidden};
   if (!shared) {
-    auto *weights = static_cast<uint8_t *>(result.weights.contents());
-    auto *scales = static_cast<uint16_t *>(result.scales.contents());
+    auto *weights = static_cast<uint8_t *>(result.planes.weights.contents());
+    auto *scales = static_cast<uint16_t *>(result.planes.scales.contents());
     for (uint32_t expert = 0; expert < 4; ++expert) {
       weights[expert * 64 + expert + representative * 4] = 1;
       scales[expert] = bf16(4.0F);

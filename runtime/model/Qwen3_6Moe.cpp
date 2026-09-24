@@ -52,7 +52,7 @@ loadQwen3_6MoeWeights(metal::MetalBackend &backend, Qwen3_6MoeLayout layout,
                                  const AffineTargetFormat &) {
     const uint32_t hidden = layout.hiddenSize, width = layout.expertIntermediateSize;
     layer.ffn = ops::AffineMoeWeights{
-        .router = readQ8Projection(file, backend, layout.experts, hidden, "router"),
+        .router = readQ8Projection(file, layout.experts, hidden, "router"),
         .expertGate = readExpertProjection(file, layout.experts, width, hidden, "experts-gate"),
         .expertUp = readExpertProjection(file, layout.experts, width, hidden, "experts-up"),
         .expertDown = readExpertProjection(file, layout.experts, hidden, width, "experts-down"),
@@ -60,7 +60,7 @@ loadQwen3_6MoeWeights(metal::MetalBackend &backend, Qwen3_6MoeLayout layout,
         .sharedUp = readExpertProjection(file, 1, width, hidden, "shared-expert-up"),
         .sharedDown = readExpertProjection(file, 1, hidden, width, "shared-expert-down"),
         .sharedExpertGate =
-            readQ8Projection(file, backend, kQ4StorageN, hidden, "shared-expert-scalar-gate"),
+            readQ8Projection(file, kQ4StorageN, hidden, "shared-expert-scalar-gate"),
     };
   };
   // GGUF images keep the tensors as the GGUF stores them, the router and the

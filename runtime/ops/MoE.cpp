@@ -18,11 +18,12 @@ bool matches(const Q8Projection &projection, uint32_t output,
              uint32_t input) noexcept {
   const uint64_t elements = uint64_t{output} * input;
   const uint64_t parameterBytes = elements / 32;
-  return projection.weights && projection.scales && projection.biases &&
+  const AffineWeights &planes = projection.planes;
+  return planes.weights && planes.scales && planes.biases &&
          projection.outputSize == output && projection.inputSize == input &&
-         projection.weights.sizeBytes() >= elements &&
-         projection.scales.sizeBytes() >= parameterBytes &&
-         projection.biases.sizeBytes() >= parameterBytes;
+         planes.weights.sizeBytes() >= elements &&
+         planes.scales.sizeBytes() >= parameterBytes &&
+         planes.biases.sizeBytes() >= parameterBytes;
 }
 
 bool matches(const ExpertProjection &projection, uint32_t experts,
@@ -300,15 +301,15 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
     const MoeRouteTile route = moeRouteTile(rows, plan.config().routeWideRows);
     graph.add(route.rows == 8 ? "moe_route_scores_q8_m8"
                               : "moe_route_scores_q8_m32",
-              {buffers.input, affine.router.weights, affine.router.scales,
-               affine.router.biases, scratch.groupedInput},
+              {buffers.input, affine.router.planes.weights, affine.router.planes.scales,
+               affine.router.planes.biases, scratch.groupedInput},
               routeParams,
               {(rows + route.rows - 1) / route.rows, 256 / route.experts, 1});
     graph.add("moe_route_select_q8",
               {scratch.groupedInput, buffers.input,
-               affine.sharedExpertGate.weights,
-               affine.sharedExpertGate.scales,
-               affine.sharedExpertGate.biases, scratch.selectedExperts,
+               affine.sharedExpertGate.planes.weights,
+               affine.sharedExpertGate.planes.scales,
+               affine.sharedExpertGate.planes.biases, scratch.selectedExperts,
                scratch.routingWeights},
               routeParams, {rows, 1, 1});
   }

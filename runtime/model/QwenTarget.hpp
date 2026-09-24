@@ -75,11 +75,10 @@ struct QwenMixerGeometry final {
 struct AffineTargetFormat final {
   static constexpr bool float32Norms = false;
   static constexpr ops::GdnHeadOrder gdnOutputOrder = ops::GdnHeadOrder::Grouped;
-  metal::MetalBackend &backend;
 
   [[nodiscard]] ops::Projection projection(WeightFile &file, uint32_t outputSize,
                                            uint32_t inputSize, std::string_view label) const {
-    return readAffineProjection(file, backend, outputSize, inputSize, label);
+    return readAffineProjection(file, outputSize, inputSize, label);
   }
   // The tensor `label`; block images keep the projection as `tensors`.
   [[nodiscard]] ops::Projection fused(WeightFile &file, uint32_t outputSize, uint32_t inputSize,
@@ -207,7 +206,7 @@ loadQwenTarget(metal::MetalBackend &backend, const Layout &layout, const QwenTar
                ReadAffineFfn readAffineFfn, ReadBlockFfn readBlockFfn) {
   if (const auto *gguf = std::get_if<std::reference_wrapper<GgufTargetLoader>>(&files))
     return readQwenTargetWeights<Weights>(backend, layout, gguf->get(), BlockTargetFormat{}, readBlockFfn);
-  const AffineTargetFormat affine{backend};
+  const AffineTargetFormat affine{};
   if (const auto *mlx = std::get_if<std::reference_wrapper<AffineTargetLoader>>(&files))
     return readQwenTargetWeights<Weights>(backend, layout, mlx->get(), affine, readAffineFfn);
   return readQwenTargetWeights<Weights>(backend, layout, std::get<PackedTargetFiles<Layout>>(files), affine,

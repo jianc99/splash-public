@@ -174,20 +174,20 @@ float silu(float value) { return value / (1.0F + std::exp(-value)); }
 // injection. The shared gate remains a scalar bias-only Q8 projection.
 Q8Projection fixtureRouter(MetalBackend &backend, bool sharedGate) {
   const uint64_t elements = uint64_t{kStorageN} * kHidden;
-  Q8Projection projection{shared(backend, elements, "moe-router-weights"),
-                          shared(backend, elements / 32, "moe-router-scales"),
-                          shared(backend, elements / 32, "moe-router-biases"),
+  Q8Projection projection{{shared(backend, elements, "moe-router-weights"),
+                           shared(backend, elements / 32, "moe-router-scales"),
+                           shared(backend, elements / 32, "moe-router-biases")},
                           kStorageN, kHidden};
   if (!sharedGate) {
-    auto *weights = static_cast<uint8_t *>(projection.weights.contents());
-    auto *scales = static_cast<__bf16 *>(projection.scales.contents());
+    auto *weights = static_cast<uint8_t *>(projection.planes.weights.contents());
+    auto *scales = static_cast<__bf16 *>(projection.planes.scales.contents());
     for (uint32_t expert = 0; expert < kExperts; ++expert) {
       weights[expert * 64 + expert] = 1;
       scales[expert] = __bf16(4.0F);
     }
     return projection;
   }
-  auto *values = static_cast<__bf16 *>(projection.biases.contents());
+  auto *values = static_cast<__bf16 *>(projection.planes.biases.contents());
   for (uint32_t group = 0; group < kHidden / 64; ++group) {
     for (uint32_t output = 0; output < kStorageN; ++output) {
       const float value = output ? 0.0F : 0.003F;
@@ -661,10 +661,10 @@ void bufferBounds(MetalBackend &backend, Fixture &fixture) {
       require(graph.empty(), "invalid weights partially encoded MoE");
     };
     for (auto projection : {&splash::ops::AffineMoeWeights::router, &splash::ops::AffineMoeWeights::sharedExpertGate}) {
-      for (auto field : {&Q8Projection::weights, &Q8Projection::scales,
-                         &Q8Projection::biases}) {
+      for (auto field : {&splash::ops::AffineWeights::weights, &splash::ops::AffineWeights::scales,
+                         &splash::ops::AffineWeights::biases}) {
         AffineMoeWeights shortWeights = fixture.weights.affine();
-        auto &buffer = (shortWeights.*projection).*field;
+        auto &buffer = (shortWeights.*projection).planes.*field;
         buffer = backend.view(buffer, 0, buffer.sizeBytes() - 1);
         rejectWeights(shortWeights, "undersized Q8 weight view");
       }
@@ -734,13 +734,13 @@ void bufferBounds(MetalBackend &backend, Fixture &fixture) {
 // expose accumulation-order differences between the scores tiles.
 Q8Projection randomRouter(MetalBackend &backend, Random &random) {
   const uint64_t elements = uint64_t{kStorageN} * kHidden;
-  Q8Projection projection{shared(backend, elements, "dense-router-weights"),
-                          shared(backend, elements / 32, "dense-router-scales"),
-                          shared(backend, elements / 32, "dense-router-biases"),
+  Q8Projection projection{{shared(backend, elements, "dense-router-weights"),
+                           shared(backend, elements / 32, "dense-router-scales"),
+                           shared(backend, elements / 32, "dense-router-biases")},
                           kStorageN, kHidden};
-  auto *weights = static_cast<uint8_t *>(projection.weights.contents());
-  auto *scales = static_cast<__bf16 *>(projection.scales.contents());
-  auto *biases = static_cast<__bf16 *>(projection.biases.contents());
+  auto *weights = static_cast<uint8_t *>(projection.planes.weights.contents());
+  auto *scales = static_cast<__bf16 *>(projection.planes.scales.contents());
+  auto *biases = static_cast<__bf16 *>(projection.planes.biases.contents());
   for (uint64_t index = 0; index < elements; ++index)
     weights[index] = static_cast<uint8_t>(random.next());
   for (uint64_t index = 0; index < elements / 64; ++index) {
@@ -757,9 +757,9 @@ Q8Projection randomRouter(MetalBackend &backend, Random &random) {
 void routerTiles(MetalBackend &backend, const Fixture &fixture) {
   Random random(0x7a11);
   const Q8Projection router = randomRouter(backend, random);
-  const auto *weights = static_cast<const uint8_t *>(router.weights.contents());
-  const auto *scales = static_cast<const __bf16 *>(router.scales.contents());
-  const auto *biases = static_cast<const __bf16 *>(router.biases.contents());
+  const auto *weights = static_cast<const uint8_t *>(router.planes.weights.contents());
+  const auto *scales = static_cast<const __bf16 *>(router.planes.scales.contents());
+  const auto *biases = static_cast<const __bf16 *>(router.planes.biases.contents());
   const uint64_t scoreBytes = uint64_t{kMaximumRows} * kStorageN * 4;
   MetalBuffer narrow = shared(backend, scoreBytes, "scores-m8");
   MetalBuffer wide = shared(backend, scoreBytes, "scores-m32");
@@ -767,12 +767,12 @@ void routerTiles(MetalBackend &backend, const Fixture &fixture) {
     const MoeRouteParams params{rows, kHidden, kExperts, kTopK};
     CommandGraph graph;
     graph.add("moe_route_scores_q8_m8",
-              {fixture.buffers.input, router.weights, router.scales,
-               router.biases, narrow},
+              {fixture.buffers.input, router.planes.weights, router.planes.scales,
+               router.planes.biases, narrow},
               params, {(rows + 7) / 8, kStorageN / 32, 1});
     graph.add("moe_route_scores_q8_m32",
-              {fixture.buffers.input, router.weights, router.scales,
-               router.biases, wide},
+              {fixture.buffers.input, router.planes.weights, router.planes.scales,
+               router.planes.biases, wide},
               params, {(rows + 31) / 32, kStorageN / 128, 1});
     (void)backend.submitCommand(graph.dispatches());
     const std::string label = "router tiles rows=" + std::to_string(rows);

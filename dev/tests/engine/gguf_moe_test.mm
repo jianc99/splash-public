@@ -670,7 +670,7 @@ int timing(MetalBackend &backend, uint32_t rounds) {
       w[(uint64_t(e / 64) * 256 + e) * 64 + e % 64] = 1;
       sc[(e / 64) * 256 + e] = __bf16(4.0f);
     }
-    return splash::ops::Q8Projection{weights, scales, biases, 256, H};
+    return splash::ops::Q8Projection{{weights, scales, biases}, 256, H};
   };
   MoeWeights affine = splash::ops::AffineMoeWeights{
       .router = affineRouter(true),

@@ -7,11 +7,13 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <initializer_list>
 #include <memory>
 #include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace splash::model {
 
@@ -46,6 +48,9 @@ public:
 
   [[nodiscard]] metal::MetalBuffer section(uint64_t bytes,
                                             std::string_view label = {});
+  // One section of the parts' total bytes, as a view of each part in order.
+  [[nodiscard]] std::vector<metal::MetalBuffer> split(std::initializer_list<uint64_t> parts,
+                                                      std::string_view label);
   void finish();
   [[nodiscard]] const WeightFileRecord &record() const noexcept;
 
@@ -61,8 +66,7 @@ private:
 void validateQ4Layout(uint32_t outputSize, uint32_t inputSize);
 
 [[nodiscard]] ops::Projection
-readAffineProjection(WeightFile &file, metal::MetalBackend &backend,
-                     uint32_t outputSize, uint32_t inputSize,
+readAffineProjection(WeightFile &file, uint32_t outputSize, uint32_t inputSize,
                      std::string_view label);
 
 // A norm of `width` multipliers: F32 when `float32` (a GGUF image keeps its
@@ -89,8 +93,7 @@ readAffineEmbedding(WeightFile &file, uint32_t outputSize,
                            uint32_t inputSize, std::string_view label);
 
 [[nodiscard]] ops::Q8Projection
-readQ8Projection(WeightFile &file, metal::MetalBackend &backend,
-                 uint32_t outputSize, uint32_t inputSize,
+readQ8Projection(WeightFile &file, uint32_t outputSize, uint32_t inputSize,
                  std::string_view label);
 
 [[nodiscard]] ops::ExpertProjection
