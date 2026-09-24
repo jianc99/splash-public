@@ -148,6 +148,12 @@ def inspect_target(repo, variant, language_only):
 
 def _gguf_target(repo, variant, language_only):
     name, by_ending = select_gguf(repo.files, variant)
+    if by_ending:
+        print(
+            f"No GGUF is named for :{variant} alone; using {name}, the only one "
+            f"whose name ends in -{variant}.",
+            flush=True,
+        )
     with repo.open(name) as stream:
         header = gguf.Metadata(stream, tensors=True)
     gguf.require_loadable(header)
@@ -157,13 +163,7 @@ def _gguf_target(repo, variant, language_only):
         files[assembly.GGUF_VISION], vision_header = select_vision(repo)
         _validate_processor(gguf.processor_config(vision_header))
     config = gguf.model_config(header, vision_header)
-    print(
-        f"No GGUF is named for :{variant} alone; selected {name} from "
-        f"{repo.name}, the only one whose name ends in -{variant}."
-        if by_ending
-        else f"Selected {name} from {repo.name}.",
-        flush=True,
-    )
+    print(f"Selected {name} from {repo.name}.", flush=True)
     return Target("gguf", "none" if language_only else "gguf", config, files)
 
 

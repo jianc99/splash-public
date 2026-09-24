@@ -1004,6 +1004,24 @@ class UpstreamTest(unittest.TestCase):
                 self.prepare(selection(self.root, revision="v2"))
         self.assertEqual(fake.requests, [])
 
+    def test_a_gguf_taken_by_its_ending_is_named_before_it_is_checked(self):
+        def repository(root):
+            root.mkdir(parents=True)
+            (root / "m-UD-Q4_K_M.gguf").write_bytes(b"not a GGUF")
+            (root / "m-Q8_0.gguf").touch()
+
+        FakeHub(self, self.cache).publish("owner/model", "a" * 40, repository)
+        with (
+            contextlib.redirect_stdout(io.StringIO()) as output,
+            self.assertRaisesRegex(models.ModelError, "unsupported GGUF header"),
+        ):
+            upstream.prepare(selection(self.root, "owner/model:Q4_K_M"))
+        self.assertIn(
+            "No GGUF is named for :Q4_K_M alone; using m-UD-Q4_K_M.gguf, the only "
+            "one whose name ends in -Q4_K_M.",
+            output.getvalue(),
+        )
+
     def test_hub_failures_reading_a_header_are_model_errors(self):
         def gguf_repository(root):
             root.mkdir(parents=True, exist_ok=True)
