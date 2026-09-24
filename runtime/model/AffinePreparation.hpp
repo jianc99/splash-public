@@ -17,26 +17,38 @@ namespace splash::model::affine {
 
 enum class SectionKind { Copy, Decay, Projection };
 
+// A checkpoint tensor a section reads: its name, the dtypes it is read in and
+// its shape, planned from the layout; tensor is bound once the checkpoint is
+// opened.
+struct Input {
+  std::string name;
+  std::vector<std::string> dtypes;
+  std::vector<uint64_t> shape;
+  const SourceTensor *tensor = nullptr;
+};
+
 // Source rows of a fused projection: weight, scales and biases.
 struct ProjectionPart {
   uint32_t rows = 0;
-  std::array<const SourceTensor *, 3> fields{};
+  std::array<Input, 3> fields{};
 };
 
 struct Section {
   SectionKind kind = SectionKind::Copy;
   uint64_t offset = 0, bytes = 0;
-  const SourceTensor *tensor = nullptr; // Copy and Decay
-  std::vector<ProjectionPart> parts;    // Projection: parts in row order, then zero rows
+  Input input;                       // Copy and Decay
+  std::vector<ProjectionPart> parts; // Projection: parts in row order, then zero rows
   uint32_t rows = 0, columns = 0, experts = 1, bits = 4;
 };
 
-// A 16-byte header (magic, layer, type) in a 16 KiB block, then 16 KiB-aligned sections.
+// A 16-byte header (magic, layer, type) in a 16 KiB block, then 16 KiB-aligned
+// sections; quantized lists the affine modules it reads and their bits.
 struct Image {
   std::string name, magic;
   uint32_t layer = 0, type = 0;
   uint64_t bytes = 0;
   std::vector<Section> sections;
+  std::vector<std::pair<std::string, uint32_t>> quantized;
 };
 
 // The identity of an image planned from a checkpoint at `source`.

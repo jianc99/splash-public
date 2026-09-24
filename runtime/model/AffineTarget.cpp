@@ -6,17 +6,20 @@
 #include "model/StateLayout.hpp"
 #include "model/WeightLayout.hpp"
 
+#include <algorithm>
+
 namespace splash::model {
 namespace {
 
 using affine::Image;
+using affine::Input;
 using affine::ProjectionPart;
 using affine::Section;
 using affine::SectionKind;
 
 // An image of a header block and sections; append places each section.
 Image image(std::string name, std::string_view magic, uint32_t layer, uint32_t type) {
-  return {std::move(name), std::string(magic), layer, type, kWeightFileAlignment, {}};
+  return {std::move(name), std::string(magic), layer, type, kWeightFileAlignment, {}, {}};
 }
 
 void append(Image &image, Section section) {
@@ -25,26 +28,17 @@ void append(Image &image, Section section) {
   image.sections.push_back(std::move(section));
 }
 
-const SourceTensor &requireTensor(const SafetensorsCheckpoint &source, const std::string &name,
-                                 const std::string &dtype, const std::vector<uint64_t> &shape) {
-  const auto &tensor = source.require(name);
-  if (tensor.dtype != dtype || tensor.shape != shape)
-    throw WeightStoreError("source tensor type or shape does not match: " + name);
-  return tensor;
-}
-
-void copy(Image &image, const SafetensorsCheckpoint *source, const std::string &name,
-          const std::vector<uint64_t> &shape) {
+// A tensor copied as stored, BF16 or U32.
+void copy(Image &image, const std::string &name, std::vector<uint64_t> shape, const std::string &dtype = "BF16") {
   Section section;
-  section.bytes = kBFloat16Bytes;
+  section.bytes = dtype == "U32" ? 4 : kBFloat16Bytes;
   for (uint64_t dimension : shape) section.bytes = checkedWeightMultiply(section.bytes, dimension, "affine tensor");
-  if (source) section.tensor = &requireTensor(*source, name, "BF16", shape);
+  section.input = {name, {dtype}, std::move(shape)};
   append(image, std::move(section));
 }
 
 // Projection parts, stacked in row order, padded with zero rows to `rows`.
-void projection(Image &image, const SafetensorsCheckpoint *source,
-                std::initializer_list<std::pair<std::string, uint32_t>> parts,
+void projection(Image &image, std::initializer_list<std::pair<std::string, uint32_t>> parts,
                 uint32_t rows, uint32_t columns, uint32_t bits = 4, uint32_t experts = 1) {
   validateQ4Layout(rows, columns);
   Section section;
@@ -57,13 +51,13 @@ void projection(Image &image, const SafetensorsCheckpoint *source,
                                         uint64_t(rows) * columns / 16, experts, "affine projection");
   uint64_t sourceRows = 0;
   for (const auto &[name, count] : parts) {
-    if (source) source->requireQuantization(name, bits);
+    image.quantized.emplace_back(name, bits);
     ProjectionPart part{count, {}};
     for (size_t field = 0; field < part.fields.size(); ++field) {
       std::vector<uint64_t> shape{count, field ? columns / kQ4GroupElements : columns * bits / 32};
       if (experts > 1) shape.insert(shape.begin(), experts);
-      if (source) part.fields[field] = &requireTensor(*source, name + (field == 0 ? ".weight" : field == 1 ? ".scales" : ".biases"),
-                                          field ? "BF16" : "U32", shape);
+      part.fields[field] = {name + (field == 0 ? ".weight" : field == 1 ? ".scales" : ".biases"),
+                            {field ? "BF16" : "U32"}, std::move(shape)};
     }
     sourceRows += count;
     section.parts.push_back(std::move(part));
@@ -102,60 +96,54 @@ void validateConfiguration(const SafetensorsCheckpoint &source, const Layout &la
 }
 
 template<class Layout>
-Image layerImage(const SafetensorsCheckpoint *source, const Layout &layout, uint32_t layer) {
-  if (layer >= layout.layers) throw WeightStoreError("target layer is out of range");
+Image layerImage(const Layout &layout, uint32_t layer) {
   const bool full = layout.isFullAttentionLayer(layer);
   Image result = image("layer-" + std::to_string(layer) + ".bin", Layout::layerMagic, layer, full ? 1u : 0u);
   const std::string prefix = "language_model.model.layers." + std::to_string(layer) + ".";
-  copy(result, source, prefix + "input_layernorm.weight", {layout.hiddenSize});
+  copy(result, prefix + "input_layernorm.weight", {layout.hiddenSize});
   if (full) {
     const std::string attention = prefix + "self_attn.";
-    projection(result, source, {{attention + "q_proj", 2 * layout.attentionWidth},
+    projection(result, {{attention + "q_proj", 2 * layout.attentionWidth},
                                 {attention + "k_proj", layout.attentionKvHeads * layout.attentionHeadDimension},
                                 {attention + "v_proj", layout.attentionKvHeads * layout.attentionHeadDimension}},
                layout.packedFullWidth, layout.hiddenSize);
-    copy(result, source, attention + "q_norm.weight", {layout.attentionHeadDimension});
-    copy(result, source, attention + "k_norm.weight", {layout.attentionHeadDimension});
-    projection(result, source, {{attention + "o_proj", layout.hiddenSize}}, layout.hiddenSize, layout.attentionWidth);
+    copy(result, attention + "q_norm.weight", {layout.attentionHeadDimension});
+    copy(result, attention + "k_norm.weight", {layout.attentionHeadDimension});
+    projection(result, {{attention + "o_proj", layout.hiddenSize}}, layout.hiddenSize, layout.attentionWidth);
   } else {
     const std::string gdn = prefix + "linear_attn.";
-    projection(result, source, {{gdn + "in_proj_qkv", layout.convolutionDimension},
+    projection(result, {{gdn + "in_proj_qkv", layout.convolutionDimension},
                                 {gdn + "in_proj_z", layout.attentionWidth},
                                 {gdn + "in_proj_b", layout.gdnValueHeads},
                                 {gdn + "in_proj_a", layout.gdnValueHeads}},
                layout.packedGdnWidth, layout.hiddenSize);
-    copy(result, source, gdn + "conv1d.weight", {layout.convolutionDimension, kGdnConvolutionTaps, 1});
+    copy(result, gdn + "conv1d.weight", {layout.convolutionDimension, kGdnConvolutionTaps, 1});
     Section decay;
     decay.kind = SectionKind::Decay;
-    if (source) {
-      const auto &a = source->require(gdn + "A_log");
-      if (a.shape != std::vector<uint64_t>{layout.gdnValueHeads} || (a.dtype != "BF16" && a.dtype != "F32"))
-        throw WeightStoreError("invalid GDN decay source");
-      decay.tensor = &a;
-    }
+    decay.input = {gdn + "A_log", {"BF16", "F32"}, {layout.gdnValueHeads}};
     decay.bytes = uint64_t(layout.gdnValueHeads) * sizeof(float);
     append(result, std::move(decay));
-    copy(result, source, gdn + "dt_bias", {layout.gdnValueHeads});
-    copy(result, source, gdn + "norm.weight", {layout.gdnHeadDimension});
-    projection(result, source, {{gdn + "out_proj", layout.hiddenSize}}, layout.hiddenSize, layout.attentionWidth);
+    copy(result, gdn + "dt_bias", {layout.gdnValueHeads});
+    copy(result, gdn + "norm.weight", {layout.gdnHeadDimension});
+    projection(result, {{gdn + "out_proj", layout.hiddenSize}}, layout.hiddenSize, layout.attentionWidth);
   }
-  copy(result, source, prefix + "post_attention_layernorm.weight", {layout.hiddenSize});
+  copy(result, prefix + "post_attention_layernorm.weight", {layout.hiddenSize});
   const std::string mlp = prefix + "mlp.";
   const auto ffn = [&](const std::string &name, uint32_t intermediate, uint32_t experts = 1) {
     for (const std::string projectionName : {"gate_proj", "up_proj", "down_proj"}) {
       const bool down = projectionName == "down_proj";
       const uint32_t n = down ? layout.hiddenSize : intermediate;
       const uint32_t k = down ? intermediate : layout.hiddenSize;
-      projection(result, source, {{name + projectionName, n}}, n, k, 4, experts);
+      projection(result, {{name + projectionName, n}}, n, k, 4, experts);
     }
   };
   if constexpr (requires { layout.experts; }) {
     // The router and the shared-expert gate are 8-bit, their rows padded to
     // whole 256-row tiles as the reader expects.
-    projection(result, source, {{mlp + "gate", layout.experts}}, layout.experts, layout.hiddenSize, 8);
+    projection(result, {{mlp + "gate", layout.experts}}, layout.experts, layout.hiddenSize, 8);
     ffn(mlp + "switch_mlp.", layout.expertIntermediateSize, layout.experts);
     ffn(mlp + "shared_expert.", layout.expertIntermediateSize);
-    projection(result, source, {{mlp + "shared_expert_gate", 1}}, kQ4StorageN, layout.hiddenSize, 8);
+    projection(result, {{mlp + "shared_expert_gate", 1}}, kQ4StorageN, layout.hiddenSize, 8);
   } else {
     ffn(mlp, layout.intermediateSize);
   }
@@ -163,44 +151,58 @@ Image layerImage(const SafetensorsCheckpoint *source, const Layout &layout, uint
 }
 
 template<class Layout>
-Image headImage(const SafetensorsCheckpoint *source, const Layout &layout) {
+Image headImage(const Layout &layout) {
   Image result = image("head.bin", Layout::headMagic, layout.layers, 2);
-  copy(result, source, "language_model.model.norm.weight", {layout.hiddenSize});
-  projection(result, source, {{"language_model.lm_head", layout.vocabularySize}}, layout.vocabularySize, layout.hiddenSize);
+  copy(result, "language_model.model.norm.weight", {layout.hiddenSize});
+  projection(result, {{"language_model.lm_head", layout.vocabularySize}}, layout.vocabularySize, layout.hiddenSize);
   return result;
 }
 
+// The token rows as stored: 4-bit codes, scales and biases.
 template<class Layout>
-Image embeddingImage(const SafetensorsCheckpoint *source, const Layout &layout) {
+Image embeddingImage(const Layout &layout) {
   Image result = image("embedding.bin", kEmbeddingMagic, layout.vocabularySize, layout.hiddenSize);
   const std::string prefix = "language_model.model.embed_tokens";
-  if (source) source->requireQuantization(prefix, 4);
-  for (const std::string field : {"weight", "scales", "biases"}) {
-    const bool weight = field == "weight";
-    Section section;
-    section.bytes = uint64_t(layout.vocabularySize) * layout.hiddenSize / (weight ? 2 : 32);
-    if (source) section.tensor = &requireTensor(*source, prefix + "." + field, weight ? "U32" : "BF16",
-        {layout.vocabularySize, layout.hiddenSize / (weight ? 8 : kQ4GroupElements)});
-    append(result, std::move(section));
-  }
+  result.quantized.emplace_back(prefix, 4);
+  copy(result, prefix + ".weight", {layout.vocabularySize, layout.hiddenSize / 8}, "U32");
+  copy(result, prefix + ".scales", {layout.vocabularySize, layout.hiddenSize / kQ4GroupElements});
+  copy(result, prefix + ".biases", {layout.vocabularySize, layout.hiddenSize / kQ4GroupElements});
   return result;
 }
 
 // Every image of a layout: the layers, the head, the embedding.
 template<class Layout>
-std::vector<Image> images(const SafetensorsCheckpoint *source, const Layout &layout) {
+std::vector<Image> images(const Layout &layout) {
   std::vector<Image> result;
-  for (uint32_t layer = 0; layer < layout.layers; ++layer) result.push_back(layerImage(source, layout, layer));
-  result.push_back(headImage(source, layout));
-  result.push_back(embeddingImage(source, layout));
+  for (uint32_t layer = 0; layer < layout.layers; ++layer) result.push_back(layerImage(layout, layer));
+  result.push_back(headImage(layout));
+  result.push_back(embeddingImage(layout));
   return result;
 }
 
 template<class Layout>
 uint64_t preparedBytes(const Layout &layout) {
   uint64_t bytes = 0;
-  for (const Image &image : images(nullptr, layout)) bytes += image.bytes;
+  for (const Image &image : images(layout)) bytes += image.bytes;
   return bytes;
+}
+
+void bind(Input &input, const SafetensorsCheckpoint &source) {
+  const SourceTensor &tensor = source.require(input.name);
+  if (std::find(input.dtypes.begin(), input.dtypes.end(), tensor.dtype) == input.dtypes.end() ||
+      tensor.shape != input.shape)
+    throw WeightStoreError("source tensor type or shape does not match: " + input.name);
+  input.tensor = &tensor;
+}
+
+// Binds every input of image to its checkpoint tensor.
+void bind(Image &image, const SafetensorsCheckpoint &source) {
+  for (const auto &[module, bits] : image.quantized) source.requireQuantization(module, bits);
+  for (Section &section : image.sections) {
+    if (section.kind != SectionKind::Projection) bind(section.input, source);
+    for (ProjectionPart &part : section.parts)
+      for (Input &field : part.fields) bind(field, source);
+  }
 }
 
 } // namespace
@@ -218,9 +220,10 @@ struct AffineTargetLoader::Impl {
         files([&backend] { backend.checkOperation(); }, std::move(admitConversion),
               [this] { source.checkUnchanged(); }) {
     validateConfiguration(source, layout);
-    images = model::images(&source, layout);
-    for (const Image &image : images) {
+    images = model::images(layout);
+    for (Image &image : images) {
       backend.checkOperation();
+      bind(image, source);
       weights.push_back(affine::affineImageWeight(image, directory.string()));
     }
     files.requireSpace(weights, alsoPrepared);

@@ -42,10 +42,10 @@ void gatherRows(const Section &section, uint32_t expert, size_t field, uint32_t 
                               uint64_t(firstGroup) * unit;
       uint8_t *to = input.data() + (begin - firstRow) * rowBytes;
       if (count == groups) {
-        part.fields[field]->read(offset, {to, (end - begin) * rowBytes});
+        part.fields[field].tensor->read(offset, {to, (end - begin) * rowBytes});
       } else {
         for (uint32_t row = 0; row < end - begin; ++row)
-          part.fields[field]->read(offset + row * sourceRowBytes, {to + row * rowBytes, rowBytes});
+          part.fields[field].tensor->read(offset + row * sourceRowBytes, {to + row * rowBytes, rowBytes});
       }
     }
     partStart += part.rows;
@@ -95,14 +95,15 @@ void writeProjection(int destination, const Section &section, std::vector<uint8_
 
 // float(-exp(double(A_log))) of a BF16 or F32 vector.
 void writeDecay(int destination, const Section &section) {
-  if (section.tensor->bytes + section.bytes > kWeightPreparationStagingBytes)
+  const SourceTensor &tensor = *section.input.tensor;
+  if (tensor.bytes + section.bytes > kWeightPreparationStagingBytes)
     throw std::runtime_error("decay tensor exceeds the preparation staging bound");
-  std::vector<uint8_t> bytes(section.tensor->bytes);
-  section.tensor->read(0, bytes);
+  std::vector<uint8_t> bytes(tensor.bytes);
+  tensor.read(0, bytes);
   std::vector<float> values(section.bytes / sizeof(float));
   for (size_t i = 0; i < values.size(); ++i) {
     float logarithm;
-    if (section.tensor->dtype == "BF16") {
+    if (tensor.dtype == "BF16") {
       uint16_t bfloat;
       std::memcpy(&bfloat, bytes.data() + i * 2, 2);
       const uint32_t bits = uint32_t(bfloat) << 16;
@@ -126,10 +127,10 @@ PreparedWeight affineImageWeight(const Image &image, const std::string &source) 
   for (const Section &section : image.sections) {
     identity.record("section", int(section.kind), section.offset, section.bytes, section.rows, section.columns,
                     section.experts, section.bits);
-    if (section.tensor) section.tensor->identify(identity);
+    if (section.kind != SectionKind::Projection) section.input.tensor->identify(identity);
     for (const ProjectionPart &part : section.parts) {
       identity.record("part", part.rows);
-      for (const SourceTensor *field : part.fields) field->identify(identity);
+      for (const Input &field : part.fields) field.tensor->identify(identity);
     }
   }
   return identity.weight(image.bytes, "target/" + image.name, source);
@@ -166,7 +167,7 @@ void writeAffineImage(int destination, const Image &image, const PreparationChec
       writeDecay(destination, section);
       break;
     case SectionKind::Copy:
-      section.tensor->copy(destination, section.offset, input, admit);
+      section.input.tensor->copy(destination, section.offset, input, admit);
       break;
     }
   }
