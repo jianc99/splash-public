@@ -444,6 +444,8 @@ struct Runtime::Impl {
   metal::AllocationResult stageImages(const ModelRequest &request) {
     if (request.images.empty() || stagedImages.contains(request.id))
       return true;
+    if (package.descriptor.visionSource == VisionSource::None)
+      throw std::invalid_argument("images are unavailable in language-only mode");
     std::vector<ImageState> staged;
     staged.reserve(request.images.size());
     uint64_t bytes = 0;

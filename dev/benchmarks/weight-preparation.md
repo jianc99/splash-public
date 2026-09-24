@@ -7,7 +7,7 @@ new quantization kernel. The production metallib is byte-identical to baseline:
 
 ## Implementation boundaries
 
-- `AffineCheckpoint` reads checkpoint configuration and a bounded safetensors
+- `SafetensorsCheckpoint` reads checkpoint configuration and a bounded safetensors
   index. `AffineTarget` maps architectural tensor names to the existing affine
   ABI; it does not dequantize and requantize the target.
 - `GgufImage` retains the existing format planner. `GgufPreparation` executes it

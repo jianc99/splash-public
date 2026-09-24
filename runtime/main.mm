@@ -243,7 +243,8 @@ bootstrapConfig(const NativeArguments &arguments) {
   config.resources.kvFormat = arguments.kvFormat;
   config.resources.maximumImagePatches = kMaximumImagePatches;
   config.nativeLoop.engine.maxContext = arguments.maxContext;
-  config.nativeLoop.engine.maxImagePatches = kMaximumImagePatches;
+  config.nativeLoop.engine.maxImagePatches =
+      arguments.model.visionSource == model::VisionSource::None ? 0 : kMaximumImagePatches;
   config.protocolLimits.maxImagePatches = kMaximumImagePatches;
   config.nativeLoop.engineInstanceId = engineInstanceId();
   config.nativeLoop.maskWordsPerToken = maskWordsPerToken;

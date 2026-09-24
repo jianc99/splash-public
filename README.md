@@ -20,11 +20,12 @@ of unified memory (48 GB or more recommended).
 
 ```bash
 brew install incoai/tap/splash
-splash serve --model incoai/Qwen3.8-27B-Splash
+splash serve --model mlx-community/Qwen3.8-27B-4bit
 ```
 
-The first run downloads and verifies the model package, checks available
-memory, and starts serving on `127.0.0.1:8000`.
+The first run downloads the model and its matching DFlash2 draft, prepares
+weights for the Metal kernels, checks available memory, and starts serving on
+`127.0.0.1:8000`. Later starts reuse the prepared weights.
 
 Once it prints `Ready`, leave this terminal open. Open <http://127.0.0.1:8000>
 in your browser, or run an installed coding agent from another terminal:
@@ -47,12 +48,12 @@ model.
 curl http://127.0.0.1:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "incoai/Qwen3.8-27B-Splash",
+    "model": "mlx-community/Qwen3.8-27B-4bit",
     "messages": [{"role": "user", "content": "Explain speculative decoding in one sentence."}]
   }'
 ```
 
-`model` is optional. If set, use the served package ID or a configured
+`model` is optional. If set, use the served model ID or a configured
 [model alias](DEVELOPMENT.md#api-model-aliases).
 Reasoning follows the model default unless a [server default](DEVELOPMENT.md#default-reasoning-effort)
 is configured. `"reasoning_effort": "none"` turns it off, and
@@ -63,28 +64,36 @@ See [judgment contracts](DEVELOPMENT.md#judgment-contracts) for details.
 
 ## Models
 
-| Package (`--model`) | Contents | Download |
-| --- | --- | ---: |
-| [`incoai/Qwen3.8-27B-Splash`](https://huggingface.co/incoai/Qwen3.8-27B-Splash) | Qwen3.8-27B, 4-bit, with its DFlash 2 draft | 17.4 GB |
-| [`incoai/Qwen3.6-35B-A3B-Splash`](https://huggingface.co/incoai/Qwen3.6-35B-A3B-Splash) | Qwen3.6-35B-A3B, 4-bit, with its DFlash 2 draft | 20.9 GB |
+| Base model | MLX affine example | GGUF example |
+| --- | --- | --- |
+| Qwen3.8-27B | `mlx-community/Qwen3.8-27B-4bit` | `unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M` |
+| Qwen3.6-35B-A3B | `mlx-community/Qwen3.6-35B-A3B-4bit` | `unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M` |
 
-`--model` takes any `owner/repo` that holds a Splash package, a format
-[DEVELOPMENT.md](DEVELOPMENT.md#model-packages) describes. Plain MLX or
-Transformers checkpoints need a compatible Splash support package. Such a package
-can reference upstream GGUF or MLX affine weights and prepare them locally on first
-load. Preparation keeps the original download and stores an additional weight
-copy in `~/Library/Caches/Splash/weights`; later starts reuse it. Existing packed
-packages need no conversion. Support packages can also reference the model’s
-original tokenizer and chat template, without bundling another copy.
-Private repositories need `HF_TOKEN`.
-Packages download into the Hugging Face cache, and `brew upgrade splash` keeps
-them, along with model links and agent sessions.
+`--model` accepts the upstream repository directly. Splash automatically matches
+its DFlash2 draft by base model and uses the model's tokenizer and chat template.
+When a GGUF repository has no tokenizer or configuration, these come from the
+base model's Hugging Face repository. A separate Splash support package is not
+required. Existing Splash packages remain loadable.
+
+Vision comes from the same source: embedded vision tensors for MLX, or the
+companion `mmproj` for GGUF. GGUF F32 weights stay F32; BF16 matrices stay BF16.
+Use `--language-only` to skip vision loading and preparation. It also skips the
+GGUF mmproj download; MLX vision tensors share the language model's shards, so
+those shards still download in full.
+
+The first preparation stores an additional weight copy in
+`~/Library/Caches/Splash/weights`, using bounded temporary memory. Later starts
+reuse it. `--revision` optionally selects an upstream branch, tag or commit;
+otherwise the current default revision is resolved automatically. `--draft-model`
+overrides the matching draft repository or supplies a local draft directory.
+Private repositories need `HF_TOKEN`. Downloads use the Hugging Face cache, and
+`brew upgrade splash` preserves models and agent sessions.
 
 For LM Studio Bionic, follow its [Splash setup guide](https://lmstudio.ai/blog/splash-engine):
 install the Splash runtime, then paste the full Hugging Face model link into its
 model search. These integrations manage their own runtime and settings.
 
-If a client’s model catalog does not list a package, the full repository ID in
+If a client’s model catalog does not list a model, the full model ID in
 this table still works with `splash serve --model OWNER/REPO`. The browser chat
 and the agent launchers connect to that server without a catalog search.
 
@@ -118,7 +127,7 @@ that a long uncached prompt will reach its first token quickly.
 To use BF16 target KV, select it when starting the server:
 
 ```bash
-splash serve --model incoai/Qwen3.8-27B-Splash --kv-format bf16
+splash serve --model mlx-community/Qwen3.8-27B-4bit --kv-format bf16
 ```
 
 BF16 avoids target KV quantization, uses approximately twice the target KV
@@ -164,7 +173,7 @@ The runtime, scheduler, cache, and API are shared. Everything else is rebuilt
 per model:
 
 - **A draft trained for the model.** Speculative decoding is the decode path in
-  Splash, not an option. Every model ships with its own [DFlash
+  Splash, not an option. Each supported base model has a matching [DFlash
   2](https://inco.ai/blog/dflash2/) draft, and one pass of the target verifies a
   block of tokens in parallel.
 - **Kernels compiled for exact shapes.** Fused Metal kernels, written and tuned

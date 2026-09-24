@@ -227,9 +227,11 @@ class Frontend:
         thinking_codec=None,
         served_model_names=(),
         default_reasoning_effort=None,
+        images_enabled=True,
     ):
         if not isinstance(preparation_capacity, int) or preparation_capacity <= 0:
             raise ValueError("frontend preparation capacity must be positive")
+        self.images_enabled = images_enabled
         self.latencies = LatencyMetrics()
         self.tokenizer = tokenizer
         self.prompt_tokenizer = PromptTokenizer(tokenizer)
@@ -295,6 +297,8 @@ class Frontend:
             for part in message["content"]
             if part.get("type") == "image_url"
         ]
+        if parts and not self.images_enabled:
+            raise APIError(400, "images are unavailable in language-only mode")
         limit = wire.ProtocolLimits().max_image_spans
         if len(parts) > limit:
             raise APIError(400, f"requests support at most {limit} images")

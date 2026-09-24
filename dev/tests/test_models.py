@@ -233,7 +233,7 @@ class ModelArtifactTest(unittest.TestCase):
     def test_prepare_also_validates_direct_call_before_creating_paths(self):
         models = self.root / "uncreated"
         with self.assertRaises(artifacts.ModelError):
-            artifacts.prepare(SimpleNamespace(models=models, model="../outside"))
+            artifacts.prepare_legacy(SimpleNamespace(models=models, model="../outside"))
         self.assertFalse(models.exists())
 
     def test_quick_and_full_verification(self):
@@ -650,7 +650,7 @@ class ModelArtifactTest(unittest.TestCase):
             ) as resolve,
             contextlib.redirect_stdout(io.StringIO()),
         ):
-            artifacts.prepare(args)
+            artifacts.prepare_legacy(args)
         destination = models / self.MODEL_ID
         self.assertTrue(destination.is_symlink())
         self.assertEqual(destination.resolve(), snapshot.resolve())
@@ -660,7 +660,7 @@ class ModelArtifactTest(unittest.TestCase):
             mock.patch.object(artifacts, "sha256") as hash_file,
             contextlib.redirect_stdout(io.StringIO()),
         ):
-            artifacts.prepare(args)
+            artifacts.prepare_legacy(args)
             result = artifacts.main(
                 ["--models", str(models), "--model", self.MODEL_ID, "verify"]
             )
@@ -833,7 +833,9 @@ class ModelArtifactTest(unittest.TestCase):
             self.assertRaisesRegex(artifacts.ModelError, "move it aside"),
             contextlib.redirect_stdout(io.StringIO()),
         ):
-            artifacts.prepare(SimpleNamespace(models=models, model="owner/repo:v"))
+            artifacts.prepare_legacy(
+                SimpleNamespace(models=models, model="owner/repo:v")
+            )
 
     def test_gguf_download_checks_hub_metadata_against_the_manifest(self):
         snapshot, manifest = self.package_fixture(variants=("UD-Q4_K_M",))
@@ -879,7 +881,7 @@ class ModelArtifactTest(unittest.TestCase):
             mock.patch.object(artifacts, "resolve_gguf", return_value=source),
             contextlib.redirect_stdout(io.StringIO()),
         ):
-            artifacts.prepare(args)
+            artifacts.prepare_legacy(args)
         cache = self.root / "gguf-cache"
         scanned = scan_cache_dir(cache)
         self.assertFalse(scanned.warnings)
@@ -911,7 +913,7 @@ class ModelArtifactTest(unittest.TestCase):
             ),
             contextlib.redirect_stdout(io.StringIO()),
         ):
-            artifacts.prepare(args)
+            artifacts.prepare_legacy(args)
         self.assertEqual(refs[0].read_text(), "b" * 40)
 
     def test_gguf_repairs_same_size_corruption_and_rejects_bad_download(self):
@@ -987,13 +989,13 @@ class ModelArtifactTest(unittest.TestCase):
                 args = SimpleNamespace(models=models, model=model_id)
                 output = io.StringIO()
                 with contextlib.redirect_stdout(output):
-                    artifacts.prepare(args)
+                    artifacts.prepare_legacy(args)
                 self.assertEqual((models / model_id).resolve(), official.resolve())
                 self.assertEqual((legacy / "manifest.json").read_bytes(), expected)
                 self.assertIn("missing artifacts will be downloaded", output.getvalue())
                 with mock.patch.object(artifacts, "resolve_snapshot") as download:
                     with contextlib.redirect_stdout(io.StringIO()):
-                        artifacts.prepare(args)
+                        artifacts.prepare_legacy(args)
                     download.assert_not_called()
 
     def test_existing_link_to_a_different_repository_is_replaced_after_verification(
@@ -1005,7 +1007,9 @@ class ModelArtifactTest(unittest.TestCase):
         models = self.root / "models"
         artifacts.install_snapshot(old, models / self.MODEL_ID)
         with contextlib.redirect_stdout(io.StringIO()):
-            artifacts.prepare(SimpleNamespace(models=models, model=self.MODEL_ID))
+            artifacts.prepare_legacy(
+                SimpleNamespace(models=models, model=self.MODEL_ID)
+            )
         self.assertEqual((models / self.MODEL_ID).resolve(), official.resolve())
         self.assertTrue(old.is_dir())
         self.assertFalse((old.parent.parent / "refs").exists())
@@ -1020,7 +1024,9 @@ class ModelArtifactTest(unittest.TestCase):
         destination = models / self.MODEL_ID
         artifacts.install_snapshot(old, destination)
         with contextlib.redirect_stdout(io.StringIO()):
-            artifacts.prepare(SimpleNamespace(models=models, model=self.MODEL_ID))
+            artifacts.prepare_legacy(
+                SimpleNamespace(models=models, model=self.MODEL_ID)
+            )
         self.assertEqual(destination.resolve(), current.resolve())
         self.assertTrue(old.is_dir())
         self.assertEqual(json.loads((old / "manifest.json").read_text()), manifest)
@@ -1031,7 +1037,9 @@ class ModelArtifactTest(unittest.TestCase):
         destination = models / self.MODEL_ID
         shutil.copytree(snapshot, destination)
         with self.assertRaisesRegex(artifacts.ModelError, "move it aside"):
-            artifacts.prepare(SimpleNamespace(models=models, model=self.MODEL_ID))
+            artifacts.prepare_legacy(
+                SimpleNamespace(models=models, model=self.MODEL_ID)
+            )
         self.download.assert_not_called()
         self.assertTrue(destination.is_dir())
 
@@ -1041,7 +1049,9 @@ class ModelArtifactTest(unittest.TestCase):
         artifacts.install_snapshot(snapshot, models / self.MODEL_ID)
         with mock.patch.object(artifacts, "resolve_snapshot") as download:
             with contextlib.redirect_stdout(io.StringIO()):
-                artifacts.prepare(SimpleNamespace(models=models, model=self.MODEL_ID))
+                artifacts.prepare_legacy(
+                    SimpleNamespace(models=models, model=self.MODEL_ID)
+                )
             download.assert_not_called()
         refs = list((snapshot.parent.parent / "refs/splash").glob("*/*"))
         self.assertEqual([ref.read_text() for ref in refs], [self.REVISION])
@@ -1078,7 +1088,9 @@ class ModelArtifactTest(unittest.TestCase):
             artifacts.os, "link", side_effect=AssertionError("cache write")
         ):
             with contextlib.redirect_stdout(io.StringIO()):
-                artifacts.prepare(SimpleNamespace(models=models, model=self.MODEL_ID))
+                artifacts.prepare_legacy(
+                    SimpleNamespace(models=models, model=self.MODEL_ID)
+                )
         self.assertEqual(ref.read_text(), self.REVISION)
 
     def test_verified_model_starts_when_cache_ref_cannot_be_written(self):
@@ -1096,7 +1108,7 @@ class ModelArtifactTest(unittest.TestCase):
                         contextlib.redirect_stdout(io.StringIO()),
                         contextlib.redirect_stderr(errors),
                     ):
-                        artifacts.prepare(
+                        artifacts.prepare_legacy(
                             SimpleNamespace(models=models, model=self.MODEL_ID)
                         )
                 self.assertEqual(destination.resolve(), snapshot.resolve())
@@ -1114,7 +1126,7 @@ class ModelArtifactTest(unittest.TestCase):
         ):
             with contextlib.redirect_stdout(io.StringIO()):
                 with self.assertRaises(OSError):
-                    artifacts.prepare(
+                    artifacts.prepare_legacy(
                         SimpleNamespace(models=models, model=self.MODEL_ID)
                     )
         self.assertFalse((models / self.MODEL_ID).exists())
@@ -1130,7 +1142,9 @@ class ModelArtifactTest(unittest.TestCase):
             with self.assertRaisesRegex(
                 artifacts.ModelError, "invalid installed snapshot reference"
             ):
-                artifacts.prepare(SimpleNamespace(models=models, model=self.MODEL_ID))
+                artifacts.prepare_legacy(
+                    SimpleNamespace(models=models, model=self.MODEL_ID)
+                )
 
     def test_retiring_old_pin_failure_keeps_verified_installation_usable(self):
         snapshot, _ = self.package_fixture()
@@ -1148,7 +1162,9 @@ class ModelArtifactTest(unittest.TestCase):
                 contextlib.redirect_stdout(io.StringIO()),
                 contextlib.redirect_stderr(errors),
             ):
-                artifacts.prepare(SimpleNamespace(models=models, model=self.MODEL_ID))
+                artifacts.prepare_legacy(
+                    SimpleNamespace(models=models, model=self.MODEL_ID)
+                )
         self.assertEqual(ref.read_text(), self.REVISION)
         self.assertTrue(old.exists())
         self.assertIn("could not retire", errors.getvalue())
@@ -1164,7 +1180,9 @@ class ModelArtifactTest(unittest.TestCase):
         other_pin = artifacts._retain_snapshot_ref(first, self.MODEL_ID, other)
         artifacts.install_snapshot(second, destination)
         with contextlib.redirect_stdout(io.StringIO()):
-            artifacts.prepare(SimpleNamespace(models=models, model=self.MODEL_ID))
+            artifacts.prepare_legacy(
+                SimpleNamespace(models=models, model=self.MODEL_ID)
+            )
         self.assertFalse(old_pin.exists())
         self.assertTrue(other_pin.exists())
         self.assertEqual([p.read_text() for p in old_pin.parent.iterdir()], ["b" * 40])
@@ -1294,7 +1312,7 @@ class ModelArtifactTest(unittest.TestCase):
                 ),
                 contextlib.redirect_stdout(io.StringIO()),
             ):
-                artifacts.prepare(args)
+                artifacts.prepare_legacy(args)
             installed = destination / self.MODEL_ID
             for path in source.iterdir():
                 self.assertEqual(
@@ -1316,7 +1334,7 @@ class ModelArtifactTest(unittest.TestCase):
                 ),
                 contextlib.redirect_stdout(io.StringIO()),
             ):
-                artifacts.prepare(args)
+                artifacts.prepare_legacy(args)
             shard = source / "model-00001-of-00002.safetensors"
             shard.write_bytes(b"x" * shard.stat().st_size)
             with self.assertRaisesRegex(artifacts.ModelError, "checksum"):
@@ -1492,7 +1510,7 @@ class ModelArtifactTest(unittest.TestCase):
                     ),
                     contextlib.redirect_stdout(io.StringIO()),
                 ):
-                    artifacts.prepare(args)
+                    artifacts.prepare_legacy(args)
                 root = models / self.MODEL_ID
                 self.assertEqual(
                     (root / "config.json").readlink(), upstream / "config.json"
@@ -1516,7 +1534,7 @@ class ModelArtifactTest(unittest.TestCase):
                     ),
                     contextlib.redirect_stdout(io.StringIO()),
                 ):
-                    artifacts.prepare(args)
+                    artifacts.prepare_legacy(args)
                 self.assertTrue(refs[0].is_file())
                 damaged = root / "tokenizer/tokenizer.json"
                 damaged.write_bytes(b"x" * damaged.stat().st_size)
@@ -1547,7 +1565,7 @@ class ModelArtifactTest(unittest.TestCase):
             mock.patch.object(artifacts, "resolve_source", return_value=files),
             contextlib.redirect_stdout(io.StringIO()),
         ):
-            artifacts.prepare(args)
+            artifacts.prepare_legacy(args)
         root = models / model_id
         self.assertEqual((root / "config.json").readlink(), upstream / "config.json")
         self.assertEqual((root / "target" / source.name).readlink(), source)
@@ -1564,7 +1582,7 @@ class ModelArtifactTest(unittest.TestCase):
             ),
             contextlib.redirect_stdout(io.StringIO()),
         ):
-            artifacts.prepare(args)
+            artifacts.prepare_legacy(args)
 
     def test_tokenizer_manifest_rejects_conflicts_and_unpinned_sources(self):
         snapshot, manifest, _ = self.tokenizer_source_fixture()

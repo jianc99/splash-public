@@ -46,8 +46,9 @@ ModelPackage loadPackage(metal::MetalBackend &backend,
       result.descriptor.target);
   result.draft = loadDFlashDraftWeights(
       backend, root / "draft", result.descriptor.draft);
-  result.vision = loadQwenVisionWeights(
-      backend, root / "vision", result.descriptor.vision);
+  if (result.descriptor.visionSource != VisionSource::None)
+    result.vision = loadQwenVisionWeights(
+        backend, root / "vision", result.descriptor.vision, result.descriptor.visionSource, prepareCheck);
 
   std::vector<WeightFileRecord> records(result.targetFiles().begin(),
                                         result.targetFiles().end());
@@ -83,7 +84,10 @@ uint64_t preparedModelWeightBytes(const std::filesystem::path &root, const Model
   } else if (descriptor.targetSource == TargetSource::Affine) {
     bytes = std::visit([](const auto &layout) { return preparedAffineBytes(layout); }, descriptor.target);
   }
+  if (descriptor.visionSource == VisionSource::Safetensors || descriptor.visionSource == VisionSource::Gguf)
+    bytes += preparedVisionBytes(root / "vision", descriptor.visionSource, descriptor.vision);
   for (std::string_view directory : {"target", "draft", "vision"}) {
+    if (directory == "vision" && descriptor.visionSource != VisionSource::Packed) continue;
     if (directory == "target" && descriptor.targetSource != TargetSource::Packed) continue;
     for (const auto &entry : std::filesystem::recursive_directory_iterator(root / directory)) {
       if (!entry.is_regular_file()) continue;

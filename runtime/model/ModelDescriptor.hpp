@@ -5,6 +5,7 @@
 #include "Qwen3_6Moe.hpp"
 #include "Qwen3_8.hpp"
 #include "ops/Vision.hpp"
+#include "model/VisionPreparation.hpp"
 
 #include <array>
 #include <cstdint>
@@ -31,6 +32,7 @@ struct ModelDescriptor final {
   std::array<uint8_t, 32> packageManifestSha256{};
   // Container selection belongs to loading; runtime dispatch follows each weight.
   TargetSource targetSource = TargetSource::Packed;
+  VisionSource visionSource = VisionSource::Packed;
 
   [[nodiscard]] bool valid() const noexcept;
 };

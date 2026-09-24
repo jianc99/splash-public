@@ -15,6 +15,7 @@
 #include "ops/Vision.hpp"
 
 #import <Foundation/Foundation.h>
+#include <CommonCrypto/CommonDigest.h>
 
 #include <algorithm>
 #include <cmath>
@@ -183,8 +184,8 @@ bool verifyInjectionWidth(MetalBackend &backend, uint32_t hiddenSize) {
 } // namespace
 
 int main(int argc, char **argv) {
-  if (argc != 4) {
-    std::cerr << "usage: vision-encoder METALLIB MODEL_ROOT FIXTURE_DIR\n";
+  if (argc != 4 && argc != 6) {
+    std::cerr << "usage: vision-encoder METALLIB MODEL_ROOT FIXTURE_DIR [mlx|gguf VISION_DIR]\n";
     return 2;
   }
   @autoreleasepool {
@@ -194,8 +195,10 @@ int main(int argc, char **argv) {
       MetalBackend backend(argv[1]);
       const splash::model::QwenVisionWeights model =
           splash::model::loadQwenVisionWeights(
-              backend, std::filesystem::path(argv[2]) / "vision",
-              descriptor.vision);
+              backend, argc == 6 ? std::filesystem::path(argv[5]) : std::filesystem::path(argv[2]) / "vision",
+              descriptor.vision, argc == 6
+                ? (std::string(argv[4]) == "gguf" ? splash::model::VisionSource::Gguf : splash::model::VisionSource::Safetensors)
+                : descriptor.visionSource);
       const std::string fixture = argv[3];
 
       ImageGrid grid;
@@ -225,6 +228,11 @@ int main(int argc, char **argv) {
       const std::vector<float> first =
           encodeOnce(backend, encoder, grid, pixels,
                      model.tensors.layout.outputHiddenSize, &gpuSeconds);
+      unsigned char digest[CC_SHA256_DIGEST_LENGTH];
+      CC_SHA256(first.data(), static_cast<CC_LONG>(first.size() * sizeof(float)), digest);
+      std::printf("embedding SHA-256: ");
+      for (unsigned char byte : digest) std::printf("%02x", byte);
+      std::printf("\n");
       const Parity parity =
           compare(first, expected, descriptor.vision.outputHiddenSize);
       std::printf("grid %ux%u: relative_error %.4f max_abs %.4f worst_cosine "

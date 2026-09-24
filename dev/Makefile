@@ -61,7 +61,8 @@ test-python: install-development
 	$(PYTHON) -m unittest dev/tests/test_server.py
 
 test-models: install-development
-	$(PYTHON) -m unittest dev/tests/test_models.py
+	$(PYTHON) -m unittest dev/tests/test_models.py dev/tests/test_upstream.py \
+		dev/tests/test_weight_preparation_identity.py
 
 check-python-engine: install-development test-python test-models
 	$(PYTHON) -m compileall -q server install/*.py \

@@ -1796,6 +1796,16 @@ class ServerTest(unittest.TestCase):
         with self.assertRaisesRegex(api.APIError, "request size limit"):
             app._expand_image_pads([pad], [image], [0])
 
+    def test_language_only_rejects_images_before_decoding(self):
+        app = self.harness(FakeRuntime(), tokenizer=self.ImagePadTokenizer()).app
+        app.images_enabled = False
+        with mock.patch.object(api.image_input, "decode_data_url") as decode:
+            with self.assertRaisesRegex(api.APIError, "language-only"):
+                app._prepare_images([self._image_message()])
+            decode.assert_not_called()
+        self.assertEqual(app.images.stats()["request_bytes"], 0)
+        app._prepare_images([{"role": "user", "content": "hello"}])
+
     def test_image_count_is_checked_before_decoding(self):
         app = self.harness(FakeRuntime(), tokenizer=self.ImagePadTokenizer()).app
         part = self._image_message()["content"][1]

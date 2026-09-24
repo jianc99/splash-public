@@ -34,7 +34,7 @@ BACKEND_CONTROL_SOURCES := \
 	runtime/engine/Engine.cpp
 MODEL_SOURCES := $(WEIGHT_PREPARATION_HEADER) \
 	runtime/model/AffineTarget.cpp \
-	runtime/model/AffineCheckpoint.mm \
+	runtime/model/SafetensorsCheckpoint.mm \
 	runtime/model/PreparedWeights.cpp \
 	runtime/model/GgufPreparation.cpp \
 	runtime/model/WeightStore.cpp \
@@ -44,6 +44,7 @@ MODEL_SOURCES := $(WEIGHT_PREPARATION_HEADER) \
 	runtime/model/Qwen3_6Moe.cpp \
 	runtime/model/Qwen3_8.cpp \
 	runtime/model/QwenVision.cpp \
+	runtime/model/VisionPreparation.cpp \
 	runtime/model/QwenTarget.cpp \
 	runtime/model/DFlashDraft.cpp \
 	runtime/model/ModelFactory.cpp \
@@ -69,6 +70,8 @@ TEST_OPERATOR_MEASUREMENT_ASAN := $(ENGINE_SANITIZER_BUILD)/operator-measurement
 TEST_OPERATOR_MEASUREMENT_TSAN := $(ENGINE_SANITIZER_BUILD)/operator-measurement-tsan
 TEST_MEMORY_TEST := $(ENGINE_TEST_BUILD)/engine-memory-plan
 TEST_DEVICE_QUERIES := $(ENGINE_TEST_BUILD)/device-queries
+TEST_VISION_PREPARATION := $(ENGINE_TEST_BUILD)/vision-preparation
+TEST_VISION_PRECISION := $(ENGINE_TEST_BUILD)/vision-precision
 TEST_AFFINE_PREPARATION := $(ENGINE_TEST_BUILD)/affine-preparation
 TEST_AFFINE_CHECKPOINT := $(ENGINE_TEST_BUILD)/affine-checkpoint
 TEST_PREPARED_WEIGHTS := $(ENGINE_TEST_BUILD)/prepared-weights
@@ -142,7 +145,7 @@ TEST_METAL_BACKEND_TEST := $(ENGINE_TEST_BUILD)/metal-backend
 TEST_METAL_BACKEND_AIR := $(ENGINE_TEST_BUILD)/metal-backend.air
 TEST_METAL_BACKEND_LIB := $(ENGINE_TEST_BUILD)/metal-backend.metallib
 
-TEST_CPU_TARGETS := $(TEST_AFFINE_CHECKPOINT) $(TEST_PREPARED_WEIGHTS) $(TEST_OPERATOR_WORKSPACE) \
+TEST_CPU_TARGETS := $(TEST_VISION_PREPARATION) $(TEST_AFFINE_CHECKPOINT) $(TEST_PREPARED_WEIGHTS) $(TEST_OPERATOR_WORKSPACE) \
 	$(TEST_GGUF_FILE) \
 	$(TEST_GGUF_REPACK) \
 	$(TEST_DEVICE_QUERIES) \
@@ -170,7 +173,7 @@ TEST_CPU_TARGETS := $(TEST_AFFINE_CHECKPOINT) $(TEST_PREPARED_WEIGHTS) $(TEST_OP
 	$(TEST_STATUS_TEST) \
 	$(TEST_Q8_CPU_TEST)
 
-TEST_METAL_TARGETS := $(TEST_AFFINE_PREPARATION) $(TEST_Q4_SGMATRIX_TEST) $(TEST_TUNING_WORKLOADS) \
+TEST_METAL_TARGETS := $(TEST_VISION_PRECISION) $(TEST_AFFINE_PREPARATION) $(TEST_Q4_SGMATRIX_TEST) $(TEST_TUNING_WORKLOADS) \
 	$(TEST_GGUF_PROJECTION) \
 	$(TEST_GGUF_MOE) \
 	$(TEST_GGUF_REPACK) \
@@ -607,6 +610,7 @@ METAL_TEST_ENV := MTL_SHADER_VALIDATION=1
 test-engine: test-engine-cpu test-engine-metal
 
 test-engine-cpu: $(TEST_CPU_TARGETS) $(TEST_ATTENTION_SWEEP) $(TUNE_KERNELS)
+	$(BUILD_ID_PYTHON) dev/tests/engine/test_vision_preparation.py $(TEST_VISION_PREPARATION)
 	$(TEST_AFFINE_CHECKPOINT)
 	$(TEST_PREPARED_WEIGHTS)
 	$(TEST_GGUF_FILE)
@@ -646,6 +650,7 @@ $(TEST_Q4_SGMATRIX_TEST): dev/tests/engine/q4_sgmatrix_metal_test.mm $(ENGINE_LI
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< $(ENGINE_LIBRARY) $(ENGINE_LINKFLAGS) -o $@
 
 test-engine-metal: $(TEST_METAL_TARGETS)
+	$(METAL_TEST_ENV) $(TEST_VISION_PRECISION) $(LIB)
 	$(METAL_TEST_ENV) $(BUILD_ID_PYTHON) dev/tests/engine/test_affine_preparation.py $(TEST_AFFINE_PREPARATION) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_GGUF_REPACK) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_GGUF_PROJECTION) $(TEST_GGUF_DEQUANT_LIB) dequant
@@ -784,4 +789,10 @@ $(TEST_AFFINE_CHECKPOINT): dev/tests/engine/affine_checkpoint_test.cpp $(ENGINE_
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $< $(ENGINE_LIBRARY) $(ENGINE_LINKFLAGS) -o $@
 
 $(TEST_AFFINE_PREPARATION): dev/tests/engine/affine_preparation_test.mm $(ENGINE_LIBRARY) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< $(ENGINE_LIBRARY) $(ENGINE_LINKFLAGS) -o $@
+
+$(TEST_VISION_PREPARATION): dev/tests/engine/vision_preparation_test.cpp $(ENGINE_LIBRARY) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $< $(ENGINE_LIBRARY) $(ENGINE_LINKFLAGS) -o $@
+
+$(TEST_VISION_PRECISION): dev/tests/engine/vision_precision_test.mm $(ENGINE_LIBRARY) $(LIB) | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< $(ENGINE_LIBRARY) $(ENGINE_LINKFLAGS) -o $@

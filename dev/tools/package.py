@@ -24,6 +24,7 @@ INSTALL_FILES = (
     "clients.py",
     "paths.py",
     "models.py",
+    "upstream.py",
     "catalog.py",
     "requirements.txt",
 )

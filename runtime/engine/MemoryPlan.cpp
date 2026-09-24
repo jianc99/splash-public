@@ -73,7 +73,6 @@ std::optional<std::string> ModelMemoryProfile::validationError() const {
   if (!targetKvLayout.valid()) return "invalid_target_kv_layout";
   if (!footprint.targetWeightsBytes) return "target_weight_bytes_required";
   if (!footprint.draftWeightsBytes) return "draft_weight_bytes_required";
-  if (!footprint.visionWeightsBytes) return "vision_weight_bytes_required";
   if (!footprint.activeStateCellBytes) {
     return "active_state_cell_bytes_required";
   }

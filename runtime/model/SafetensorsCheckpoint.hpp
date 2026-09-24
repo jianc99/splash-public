@@ -18,13 +18,13 @@ struct SourceTensor final {
   void read(uint64_t at, std::span<uint8_t> destination) const;
 };
 
-// MLX affine checkpoint configuration and safetensors index. Tensor data is
+// Checkpoint configuration and safetensors index. Tensor data is
 // read in bounded slices without loading the MLX runtime or allocating tensors.
-class AffineCheckpoint final {
+class SafetensorsCheckpoint final {
 public:
-  explicit AffineCheckpoint(const std::filesystem::path &directory,
+  explicit SafetensorsCheckpoint(const std::filesystem::path &directory,
                         const PreparationCheck &check = {});
-  ~AffineCheckpoint();
+  ~SafetensorsCheckpoint();
   [[nodiscard]] const SourceTensor &require(std::string_view name) const;
   void requireQuantization(std::string_view projection, uint32_t bits) const;
   void requireConfigNumber(std::string_view key, double expected) const;

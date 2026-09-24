@@ -126,68 +126,60 @@ geometry, tensor sizes, binary headers, tokenizer and target/draft compatibility
 New architectures require engine support. Source packages bind upstream weights
 to these same validated target, draft, vision and tokenizer interfaces.
 
-### Upstream target weights
+### Upstream model loading
 
-A support package can contain only `draft/`, `vision/` and its manifest.
-`target.source` pins the upstream target independently:
+`install/upstream.py` resolves target, tokenizer, processor and matching draft
+repositories, then atomically publishes a local assembly of links to their Hub
+snapshots. `model.json` describes those resolved sources and selected formats;
+it is local installation metadata, not a file model publishers must supply.
+The registry maps supported base models to drafts, independently of quantizer
+and quantization variant. Native source adapters validate model geometry,
+quantization, tensor shapes and draft compatibility before execution.
 
-```json
-"target": {
-  "source": {
-    "repo_id": "mlx-community/Qwen3.8-27B-4bit",
-    "revision": "<40-character commit SHA>",
-    "files": [
-      {"path": "config.json", "size": 1234, "sha256": "<SHA-256>"},
-      {"path": "model-00001-of-00003.safetensors", "size": 5678, "sha256": "<SHA-256>"}
-    ]
-  }
-}
+Examples:
+
+```bash
+splash serve --model mlx-community/Qwen3.6-35B-A3B-4bit
+splash serve --model unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M
+splash serve --model mlx-community/Qwen3.8-27B-4bit --language-only
 ```
 
-The example is schematic: list every required shard with its actual size and
-hash. Affine sources use `format.name = "mlx-affine"`, schema 3 or 4, and the same
-layer magic and support declarations as their packed counterpart. Configuration,
-tensor shapes, dtypes, group size and per-projection quantization are validated.
-GGUF can use this same declaration with `format.name = "gguf"` and one GGUF file,
-or retain the variant declaration below. These declarations are mutually exclusive.
-The installer verifies pinned files and assembles links to them; it never rewrites
-an upstream snapshot. `--model` still identifies the compatible support package.
-Automatic support-asset discovery for arbitrary upstream repository IDs is not
-implemented by this format change.
+A revision is optional. One resolution fixes the snapshot for every download
+in that loading operation, so a repository update cannot mix files from different
+revisions. `--revision` can select a particular target branch, tag or commit.
+A complete cached snapshot can be used offline. The installer never rewrites
+upstream files. Older manifest-based packages use the legacy installer.
+
+The tokenizer and chat template come from the target repository when it includes
+a complete tokenizer, otherwise from the supported base model repository.
+Remote Python code is not loaded. Vision uses MLX's `vision_tower.*` tensors or
+the same GGUF repository's unquantized mmproj. Source adapters share one vision
+operator implementation: BF16 matrices retain their representation, F32 weights
+are read directly, and F16 values are promoted losslessly to F32. GGUF norm/bias
+parameters and position tables use F32. Intermediate activations remain BF16.
+`--language-only` removes vision weights from startup and memory accounting and
+rejects image requests before decoding them.
+
+### Independent draft assets
+
+The automatic pairing expects the DFlash2 repository to contain `splash/config.json`,
+`splash/model.bin` and `splash/layer-N.bin`. The configuration is the original
+DFlash2 configuration with `splash.format = "MDFD0004"`; native loading validates
+it against the target. These are the existing verified Q4 draft weights, not a
+new quantization of the draft at startup.
+
+To prepare the assets from a verified existing package:
+
+```bash
+python dev/tools/export_draft.py PACKAGE ORIGINAL_DRAFT_CONFIG OUTPUT_REPOSITORY
+```
+
+The exporter verifies existing artifact hashes and copies only draft files.
+For local validation, pass `--draft-model OUTPUT_REPOSITORY`. Publishing these
+assets to the automatically selected DFlash2 repositories is a release prerequisite;
+the resolver reports a missing-assets error until they are available.
 
 ### Upstream tokenizer and chat templates
-
-New support packages can omit `tokenizer/` and declare `tokenizer.source`:
-
-```json
-"tokenizer": {
-  "source": {
-    "files": [
-      {"path": "config.json", "size": 1234, "sha256": "<SHA-256>"},
-      {"path": "tokenizer.json", "size": 5678, "sha256": "<SHA-256>"},
-      {"path": "tokenizer_config.json", "size": 123, "sha256": "<SHA-256>"},
-      {"path": "chat_template.jinja", "size": 456, "sha256": "<SHA-256>"}
-    ]
-  }
-}
-```
-
-This short form inherits the repository and pinned revision from `target.source`.
-To use a different repository (including a GGUF model's original HF tokenizer),
-add both `repo_id` and a 40-character `revision` to `tokenizer.source`. Include
-all tokenizer files required by that revision with their real sizes and hashes.
-`config.json`, `tokenizer.json` and `tokenizer_config.json` are required for the
-currently supported models; `chat_template.jinja` is optional when the template
-is embedded in the tokenizer configuration. Vocabulary, merges, added-token and
-special-token JSON files can also be listed. Remote Python code is not loaded.
-
-The installer verifies and links these files into the local assembly, and retains
-the source snapshots in the HF cache. It does not modify or copy tokenizer data.
-Warm startup verifies these small files without rehashing target weights. Complete
-cached sources support offline installation. Model metadata is exposed separately
-as the assembly's `config.json`: from the target source when it provides one,
-otherwise from the explicitly declared HF tokenizer source. Legacy packages with
-bundled `tokenizer/` retain their existing loading path.
 
 The server uses the upstream chat template. For a non-initial system message,
 `server/chat_templates.py` recognizes two verified Qwen template fingerprints and
@@ -210,9 +202,9 @@ without requantization. GDN decay is computed as `float(-exp(double(A_log)))`;
 older packages produced using MLX's float exponential may differ by a few float
 ULPs in this small vector. The existing inference kernels are unchanged.
 
-Both adapters use `PreparedWeights`. Its default cache is
+Target and vision source adapters use `PreparedWeights`. Its default cache is
 `~/Library/Caches/Splash/weights`; `SPLASH_WEIGHT_CACHE` overrides that location.
-Preparation costs an additional on-disk copy of the prepared target. Existing
+Preparation costs an additional on-disk copy of the prepared target and vision tensors. Existing
 packed artifacts are used directly. Source-content hashes, a build-generated fingerprint of preparation code and its
 storage ABI, and transformation parameters identify the cache. Changing that
 code invalidates its artifacts automatically; unrelated app releases, core
@@ -220,7 +212,7 @@ counts and support-asset updates do not. Completed files are read-only.
 One writer per cache serializes conversion; complete cache hits bypass this lock.
 Interruption, disk-full errors and memory-pressure rejection cannot publish partial
 files. Before conversion, the adapters validate the whole source and budget every
-missing artifact plus a 2 GiB disk reserve. Each output's disk space is preallocated
+missing target artifact plus a 2 GiB disk reserve. Each output's disk space is preallocated
 before writing. Concurrent external disk activity can still exhaust the volume;
 write errors leave no published partial artifact. Retrying removes abandoned writes
 under the converter lock and reuses previously completed layers.
@@ -229,7 +221,7 @@ Cold preparation reports each artifact's progress. Each new cache entry records
 its source path and artifact name in `source`. There is no automatic eviction:
 completed entries can be shared by installations and pinned source revisions.
 With Splash stopped, unused entry directories can be deleted; deleting the whole
-cache causes preparation at the next load. Uninstalling one support package does
+cache causes preparation at the next load. Uninstalling one model does
 not delete possibly shared prepared weights.
 
 Cold source hashing and output validation stream bounded buffers. Unchanged

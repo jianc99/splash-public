@@ -15,7 +15,7 @@ void require(bool value, const char *message) {
     throw std::runtime_error(message);
 }
 
-EngineMemoryPlan plan() {
+EngineMemoryPlan plan(uint64_t visionBytes = kGiB) {
   DeviceCapabilities device;
   device.deviceName = "test";
   device.appleGpuFamily = 9;
@@ -29,7 +29,7 @@ EngineMemoryPlan plan() {
   device.hasUnifiedMemory = true;
   device.supportsPlacementSparse = true;
   return requireEngineMemoryPlan(
-      device, test::modelMemoryProfile(2 * kGiB, 1 * kGiB, 1 * kGiB));
+      device, test::modelMemoryProfile(2 * kGiB, 1 * kGiB, visionBytes));
 }
 
 ActualMemoryReport report(const EngineMemoryPlan &memoryPlan) {
@@ -76,6 +76,21 @@ void testUnifiedDynamicAudit() {
           "dynamic state/KV budget overflow was accepted");
 }
 
+void testOptionalVisionAudit() {
+  const auto textOnly = plan(0);
+  auto actual = report(textOnly);
+  require(auditActualMemory(textOnly, actual).valid,
+          "text-only warmup requires nonexistent vision weights");
+  actual.visionWeightsBytes = 1;
+  require(auditActualMemory(textOnly, actual).error == MemoryAuditError::CategoryExceedsPlan,
+          "unexpected vision allocation was accepted in text-only mode");
+  const auto multimodal = plan();
+  actual = report(multimodal);
+  actual.visionWeightsBytes = 0;
+  require(auditActualMemory(multimodal, actual).error == MemoryAuditError::MissingMeasurement,
+          "missing multimodal vision measurement was accepted");
+}
+
 void testFixedCategoryAndPeakFailures() {
   EngineMemoryPlan memoryPlan = plan();
   ActualMemoryReport actual = report(memoryPlan);
@@ -103,6 +118,7 @@ void testFixedCategoryAndPeakFailures() {
 int main() {
   try {
     testUnifiedDynamicAudit();
+    testOptionalVisionAudit();
     testFixedCategoryAndPeakFailures();
     std::cout << "elastic memory audit tests passed\n";
     return EXIT_SUCCESS;

@@ -14,7 +14,7 @@ else:
 INPUTS = {
     "AFFINE": (
         "runtime/model/AffineTarget.cpp",
-        "runtime/model/AffineCheckpoint.mm",
+        "runtime/model/SafetensorsCheckpoint.mm",
         "runtime/model/WeightStore.hpp",
     ),
     "GGUF": (
@@ -24,6 +24,11 @@ INPUTS = {
         "runtime/metal/abi/Gguf.h",
         "runtime/metal/abi/QuantFormat.h",
         "runtime/metal/kernels/shared/gguf_repack.metal",
+    ),
+    "VISION": (
+        "runtime/model/VisionPreparation.cpp",
+        "runtime/model/SafetensorsCheckpoint.mm",
+        "runtime/model/WeightStore.hpp",
     ),
 }
 

@@ -162,6 +162,25 @@ GgufFile::GgufFile(std::filesystem::path path) : path_(std::move(path)) {
     case kInt64: unsigned_[key] = static_cast<uint64_t>(reader.scalar<int64_t>()); break;
     case kBool: unsigned_[key] = reader.scalar<uint8_t>() != 0; break;
     case kString: strings_[key] = reader.string(); break;
+    case kFloat32: floats_[key] = reader.scalar<float>(); break;
+    case kFloat64: floats_[key] = reader.scalar<double>(); break;
+    case kArray: {
+      if (key != "clip.vision.image_mean" && key != "clip.vision.image_std" &&
+          key != "clip.vision.is_deepstack_layers") {
+        skipValue(reader, type);
+        break;
+      }
+      const uint32_t element = reader.scalar<uint32_t>();
+      const uint64_t count = reader.scalar<uint64_t>();
+      if (count > 1024 || (element != kFloat32 && element != kFloat64 && element != kBool))
+        throw GgufError("unsupported vision metadata array: " + key);
+      auto &values = arrays_[key];
+      values.reserve(count);
+      for (uint64_t j = 0; j < count; ++j)
+        values.push_back(element == kFloat32 ? double(reader.scalar<float>())
+                          : element == kFloat64 ? reader.scalar<double>() : double(reader.scalar<uint8_t>()));
+      break;
+    }
     default: skipValue(reader, type); break;
     }
   }
@@ -217,6 +236,15 @@ std::optional<std::string> GgufFile::stringValue(std::string_view key) const {
   auto it = strings_.find(key);
   if (it == strings_.end()) return std::nullopt;
   return it->second;
+}
+
+std::optional<double> GgufFile::floatValue(std::string_view key) const {
+  const auto it = floats_.find(key);
+  return it == floats_.end() ? std::nullopt : std::optional<double>(it->second);
+}
+std::span<const double> GgufFile::numericArray(std::string_view key) const {
+  const auto it = arrays_.find(key);
+  return it == arrays_.end() ? std::span<const double>{} : std::span<const double>(it->second);
 }
 
 const GgufTensor *GgufFile::find(std::string_view name) const noexcept {

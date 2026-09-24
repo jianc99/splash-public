@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <map>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -58,6 +59,8 @@ public:
 
   [[nodiscard]] std::optional<uint64_t> unsignedValue(std::string_view key) const;
   [[nodiscard]] std::optional<std::string> stringValue(std::string_view key) const;
+  [[nodiscard]] std::optional<double> floatValue(std::string_view key) const;
+  [[nodiscard]] std::span<const double> numericArray(std::string_view key) const;
 
   [[nodiscard]] const std::vector<GgufTensor> &tensors() const noexcept { return tensors_; }
   [[nodiscard]] const GgufTensor *find(std::string_view name) const noexcept;
@@ -75,6 +78,8 @@ private:
   std::string architecture_;
   std::map<std::string, uint64_t, std::less<>> unsigned_;
   std::map<std::string, std::string, std::less<>> strings_;
+  std::map<std::string, double, std::less<>> floats_;
+  std::map<std::string, std::vector<double>, std::less<>> arrays_;
   std::vector<GgufTensor> tensors_;
   std::map<std::string, size_t, std::less<>> index_;
 };

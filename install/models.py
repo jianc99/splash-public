@@ -481,8 +481,15 @@ def verify_artifacts(
             raise ModelError(f"installed artifact checksum changed: {record['path']}")
 
 
-def installed_root(models: Path, model_id: str) -> Path:
+def installed_root(
+    models: Path, model_id: str, *, revision=None, language_only=False, draft_model=None
+) -> Path:
     repo_id, variant = split_model_id(model_id)
+    if revision or language_only or draft_model:
+        selection = json.dumps(
+            [model_id, revision, language_only, draft_model], separators=(",", ":")
+        )
+        return models / ".selections" / hashlib.sha256(selection.encode()).hexdigest()
     if variant is None:
         return models / repo_id
     return models / f"{repo_id}{VARIANT_SEPARATOR}{variant}"
@@ -976,7 +983,7 @@ def _installed_source_snapshots(root, manifest, variant):
     return result
 
 
-def prepare(args):
+def prepare_legacy(args):
     repo_id, variant = split_model_id(args.model)
     models = args.models.resolve()
     models.mkdir(parents=True, exist_ok=True)
@@ -1079,6 +1086,15 @@ def prepare(args):
             )
 
 
+def prepare(args):
+    if __package__:
+        from . import upstream
+    else:
+        import upstream
+    if not upstream.prepare(args):
+        prepare_legacy(args)
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Install Splash runtime weights")
     parser.add_argument("--models", type=Path, default=MODELS)
@@ -1087,6 +1103,16 @@ def parse_args(argv=None):
         required=True,
         type=parse_model_id,
         help="Hugging Face repository ID (owner/repo[:variant])",
+    )
+    parser.add_argument("--revision", help="optional upstream branch, tag or commit")
+    parser.add_argument(
+        "--draft-model",
+        help="override the automatically selected DFlash2 repository or local directory",
+    )
+    parser.add_argument(
+        "--language-only",
+        action="store_true",
+        help="skip vision preparation and loading",
     )
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("prepare")
@@ -1100,11 +1126,24 @@ def main(argv=None):
         if args.command == "prepare":
             prepare(args)
         else:
-            selected = verify_installed(
+            root = installed_root(
                 args.models.resolve(),
-                model_id=args.model,
-                full=args.full,
+                args.model,
+                revision=args.revision,
+                language_only=args.language_only,
+                draft_model=args.draft_model,
             )
+            if (root / "model.json").exists():
+                if __package__:
+                    from . import upstream
+                else:
+                    import upstream
+                upstream.verify(root, full=args.full)
+                selected = args.model
+            else:
+                selected = verify_installed(
+                    args.models.resolve(), model_id=args.model, full=args.full
+                )
             print(
                 f"Splash model {selected} preflight passed "
                 f"({'full' if args.full else 'quick'})."

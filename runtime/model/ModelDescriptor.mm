@@ -327,6 +327,91 @@ void validateQwen36(NSDictionary *manifest,
   validateQwen36Declarations(manifest, root, descriptor);
 }
 
+
+void requireNumbers(NSDictionary *object, std::initializer_list<GeometryField> fields) {
+  for (const auto &field : fields)
+    requireEqual(requireUnsigned(object, [NSString stringWithUTF8String:field.name], field.name), field.value, field.name);
+}
+
+ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
+  std::array<uint8_t, 32> identity{};
+  NSDictionary *record = readObject(root / "model.json", "resolved model", &identity);
+  requireEqual(requireUnsigned(record, @"version", "model record version"), 1, "model record version");
+  NSDictionary *config = readObject(root / "config.json", "upstream model config");
+  NSDictionary *text = requireObject(config, @"text_config", "text config");
+  const auto type = requireString(text, @"model_type", "text model type");
+  const auto name = requireString(record, @"model", "model name");
+  ModelDescriptor result;
+  if (type == "qwen3_5_moe_text") result = qwen36Descriptor(name);
+  else if (type == "qwen3_5_text") result = qwen38Descriptor(name);
+  else throw std::invalid_argument("unsupported model architecture: " + type);
+  std::visit([&](const auto &layout) {
+    requireNumbers(text, {{"hidden_size", layout.hiddenSize}, {"num_hidden_layers", layout.layers},
+        {"vocab_size", layout.vocabularySize}, {"max_position_embeddings", layout.maximumContextTokens},
+        {"num_attention_heads", layout.attentionQueryHeads}, {"num_key_value_heads", layout.attentionKvHeads},
+        {"head_dim", layout.attentionHeadDimension}});
+  }, result.target);
+  const auto target = requireString(record, @"target_format", "target format");
+  if (target == "mlx-affine") result.targetSource = TargetSource::Affine;
+  else if (target == "gguf") result.targetSource = TargetSource::Gguf;
+  else throw std::invalid_argument("unsupported target source format: " + target);
+
+  NSDictionary *draft = readObject(root / "draft" / "config.json", "draft config");
+  NSArray *architectures = requireArray(draft, @"architectures", "draft architectures");
+  if (architectures.count != 1 || ![architectures[0] isEqual:@"DFlash2DraftModel"])
+    throw std::invalid_argument("draft is not a DFlash2 model");
+  const auto &d = result.draft;
+  requireNumbers(draft, {{"num_hidden_layers", d.layers}, {"hidden_size", d.hiddenSize},
+      {"vocab_size", d.vocabularySize}, {"intermediate_size", d.intermediateSize},
+      {"num_attention_heads", d.attentionSize / d.attentionHeadDimension},
+      {"num_key_value_heads", d.kvHeads}, {"head_dim", d.attentionHeadDimension},
+      {"sliding_window", ExecutionLimits::draftContextTokens}});
+  if (![draft[@"is_causal"] isEqual:@NO] ||
+      ![draft[@"attention_bias"] isEqual:@NO] ||
+      ![draft[@"tie_word_embeddings"] isEqual:@NO] ||
+      ![draft[@"rms_norm_eps"] isEqual:@(1e-6)] ||
+      ![draft[@"hidden_act"] isEqual:@"silu"])
+    throw std::invalid_argument("unsupported draft attention or normalization configuration");
+  NSDictionary *rope = requireObject(draft, @"rope_parameters", "draft rotary configuration");
+  requireEqual(requireString(rope, @"rope_type", "draft rope type"), "default", "draft rope type");
+  requireEqual(requireUnsigned(rope, @"rope_theta", "draft rotary theta"), 10000000, "draft rotary theta");
+  NSDictionary *flash = requireObject(draft, @"dflash_config", "draft configuration");
+  requireNumbers(flash, {{"block_size", ExecutionLimits::draftQueryRows}, {"conv_group_size", 16},
+      {"conv_kernel_size", 2}, {"selector_rank", d.selectorRank}, {"selector_top_k", 16}});
+  NSArray *capture = requireArray(flash, @"target_layer_ids", "draft target layers");
+  std::visit([&](const auto &layout) {
+    requireEqual(requireUnsigned(flash, @"mask_token_id", "draft mask token"), layout.maskToken, "draft mask token");
+    requireEqual(capture.count, layout.hiddenCaptureLayers.size(), "draft target layer count");
+    for (size_t i = 0; i < layout.hiddenCaptureLayers.size(); ++i) {
+      id value = capture[i];
+      if (![value isKindOfClass:[NSNumber class]] || [value unsignedLongLongValue] != layout.hiddenCaptureLayers[i])
+        throw std::invalid_argument("draft target capture layers do not match this model");
+    }
+  }, result.target);
+  NSDictionary *storage = requireObject(draft, @"splash", "draft storage");
+  requireEqual(requireString(storage, @"format", "draft storage format"), kDFlashLayerMagic, "draft storage format");
+
+  const auto vision = requireString(record, @"vision_format", "vision format");
+  if (vision == "none") result.visionSource = VisionSource::None;
+  else {
+    if (vision == "safetensors") result.visionSource = VisionSource::Safetensors;
+    else if (vision == "gguf") result.visionSource = VisionSource::Gguf;
+    else throw std::invalid_argument("unsupported vision source format: " + vision);
+    NSDictionary *v = requireObject(config, @"vision_config", "vision config");
+    const auto &l = result.vision;
+    requireNumbers(v, {{"depth", l.depth}, {"hidden_size", l.hiddenSize}, {"num_heads", l.heads},
+        {"intermediate_size", l.intermediateSize}, {"out_hidden_size", l.outputHiddenSize},
+        {"patch_size", l.patchSize}, {"spatial_merge_size", l.spatialMerge},
+        {"temporal_patch_size", 2}, {"in_channels", 3}, {"num_position_embeddings", l.positionGridSide * l.positionGridSide}});
+    requireEqual(requireString(v, @"hidden_act", "vision activation"), "gelu_pytorch_tanh", "vision activation");
+    NSArray *deepstack = requireArray(v, @"deepstack_visual_indexes", "vision deepstack layers");
+    if (deepstack.count) throw std::invalid_argument("vision deepstack layers are unsupported");
+  }
+  result.packageManifestSha256 = identity;
+  if (!result.valid()) throw std::invalid_argument("incompatible target and draft model");
+  return result;
+}
+
 } // namespace
 
 ModelDescriptor makeModelDescriptor(std::string name, TargetLayout target,
@@ -386,6 +471,7 @@ bool ModelDescriptor::valid() const noexcept {
 
 ModelDescriptor inspectModelPackage(const std::filesystem::path &root) {
   @autoreleasepool {
+    if (std::filesystem::exists(root / "model.json")) return inspectSourceModel(root);
     std::array<uint8_t, 32> packageManifestSha256{};
     NSDictionary *manifest =
         readObject(root / "manifest.json", "model manifest", &packageManifestSha256);

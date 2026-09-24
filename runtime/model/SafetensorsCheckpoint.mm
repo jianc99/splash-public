@@ -1,4 +1,4 @@
-#include "model/AffineCheckpoint.hpp"
+#include "model/SafetensorsCheckpoint.hpp"
 #include "model/WeightStore.hpp"
 
 #import <Foundation/Foundation.h>
@@ -39,7 +39,7 @@ uint32_t elementBytes(const std::string &type) {
 
 } // namespace
 
-struct AffineCheckpoint::Impl {
+struct SafetensorsCheckpoint::Impl {
   std::vector<std::unique_ptr<WeightSource>> files;
   std::map<std::string, SourceTensor, std::less<>> tensors;
   std::string digest;
@@ -47,7 +47,7 @@ struct AffineCheckpoint::Impl {
   NSDictionary *textConfig = nil;
 };
 
-AffineCheckpoint::AffineCheckpoint(const std::filesystem::path &directory, const PreparationCheck &check)
+SafetensorsCheckpoint::SafetensorsCheckpoint(const std::filesystem::path &directory, const PreparationCheck &check)
     : impl_(std::make_unique<Impl>()) {
   @autoreleasepool {
     if (check) check();
@@ -57,11 +57,10 @@ AffineCheckpoint::AffineCheckpoint(const std::filesystem::path &directory, const
     NSData *configuration = [NSData dataWithContentsOfFile:[NSString stringWithUTF8String:configPath.c_str()]];
     NSDictionary *config = object(configuration);
     id quantization = config[@"quantization"] ?: config[@"quantization_config"];
-    if (![quantization isKindOfClass:[NSDictionary class]]) throw WeightStoreError("source has no affine quantization configuration");
-    if (quantization[@"mode"] && ![quantization[@"mode"] isEqual:@"affine"])
-      throw WeightStoreError("source quantization mode is not affine");
+    if (quantization && ![quantization isKindOfClass:[NSDictionary class]])
+      throw WeightStoreError("invalid source quantization configuration");
     impl_->quantization = quantization;
-    impl_->textConfig = config[@"text_config"];
+    impl_->textConfig = config[@"text_config"] ?: config;
     if (![impl_->textConfig isKindOfClass:[NSDictionary class]])
       throw WeightStoreError("source has no text model configuration");
     std::vector<std::filesystem::path> paths;
@@ -133,20 +132,21 @@ AffineCheckpoint::AffineCheckpoint(const std::filesystem::path &directory, const
     impl_->digest = weightDigest({reinterpret_cast<const uint8_t *>(identity.data()), identity.size()});
   }
 }
-AffineCheckpoint::~AffineCheckpoint() = default;
+SafetensorsCheckpoint::~SafetensorsCheckpoint() = default;
 
-const SourceTensor &AffineCheckpoint::require(std::string_view name) const {
+const SourceTensor &SafetensorsCheckpoint::require(std::string_view name) const {
   const auto found = impl_->tensors.find(name);
   if (found == impl_->tensors.end()) throw WeightStoreError("missing source tensor: " + std::string(name));
   return found->second;
 }
-void AffineCheckpoint::requireQuantization(std::string_view projection, uint32_t bits) const {
+void SafetensorsCheckpoint::requireQuantization(std::string_view projection, uint32_t bits) const {
   @autoreleasepool {
     NSString *key = [[NSString alloc] initWithBytes:projection.data() length:projection.size() encoding:NSUTF8StringEncoding];
     NSDictionary *entry = impl_->quantization[key] ?: impl_->quantization;
+    id mode = [entry isKindOfClass:[NSDictionary class]] ? entry[@"mode"] ?: impl_->quantization[@"mode"] : nil;
     if (![entry isKindOfClass:[NSDictionary class]] || number(entry[@"bits"] ?: impl_->quantization[@"bits"]) != bits ||
         number(entry[@"group_size"] ?: impl_->quantization[@"group_size"]) != 64 ||
-        (entry[@"mode"] && ![entry[@"mode"] isEqual:@"affine"]))
+        (mode && ![mode isEqual:@"affine"]))
       throw WeightStoreError("unsupported affine quantization for " + std::string(projection));
   }
 }
@@ -165,21 +165,21 @@ id configValue(NSDictionary *config, std::string_view key) {
   return value;
 }
 }
-void AffineCheckpoint::requireConfigNumber(std::string_view key, double expected) const {
+void SafetensorsCheckpoint::requireConfigNumber(std::string_view key, double expected) const {
   @autoreleasepool {
     id value = configValue(impl_->textConfig, key);
     if (![value isKindOfClass:[NSNumber class]] || [value doubleValue] != expected)
       throw WeightStoreError("source model configuration does not match: " + std::string(key));
   }
 }
-void AffineCheckpoint::requireConfigString(std::string_view key, std::string_view expected) const {
+void SafetensorsCheckpoint::requireConfigString(std::string_view key, std::string_view expected) const {
   @autoreleasepool {
     id value = configValue(impl_->textConfig, key);
     if (![value isKindOfClass:[NSString class]] || std::string_view([value UTF8String]) != expected)
       throw WeightStoreError("source model configuration does not match: " + std::string(key));
   }
 }
-void AffineCheckpoint::requireLayerTypes(uint32_t layers, uint32_t fullAttentionPeriod) const {
+void SafetensorsCheckpoint::requireLayerTypes(uint32_t layers, uint32_t fullAttentionPeriod) const {
   @autoreleasepool {
     id types = impl_->textConfig[@"layer_types"];
     if (![types isKindOfClass:[NSArray class]] || [types count] != layers)
@@ -190,8 +190,8 @@ void AffineCheckpoint::requireLayerTypes(uint32_t layers, uint32_t fullAttention
     }
   }
 }
-const std::string &AffineCheckpoint::digest() const noexcept { return impl_->digest; }
-void AffineCheckpoint::checkUnchanged() const { for (const auto &source : impl_->files) source->checkUnchanged(); }
+const std::string &SafetensorsCheckpoint::digest() const noexcept { return impl_->digest; }
+void SafetensorsCheckpoint::checkUnchanged() const { for (const auto &source : impl_->files) source->checkUnchanged(); }
 void SourceTensor::read(uint64_t at, std::span<uint8_t> destination) const {
   if (at > bytes || destination.size() > bytes - at) throw WeightStoreError("source tensor read is out of bounds");
   readWeightBytes(file->descriptor(), offset + at, destination);

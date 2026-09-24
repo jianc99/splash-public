@@ -23,7 +23,7 @@ struct EngineConfig final {
   // Zero disables progress checkpoints without changing reusable end states.
   uint32_t prefillCheckpointTokens =
       2 * model::ExecutionLimits::draftContextTokens;
-  // Patches per image the model's vision scratch covers.
+  // Patches per image the model's vision scratch covers; zero rejects images.
   uint32_t maxImagePatches = ops::kMaximumImagePatches;
   double resourceWaitTimeoutMilliseconds = 30000.0;
   // Host growth admission, supplied by the runtime governor. Queried only on

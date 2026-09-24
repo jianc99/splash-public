@@ -1,6 +1,7 @@
 #pragma once
 
 #include "WeightStore.hpp"
+#include "VisionPreparation.hpp"
 #include "ops/Vision.hpp"
 
 #include <cstdint>
@@ -26,6 +27,8 @@ inline constexpr std::string_view kVisionMagic = "MDFV0001";
 [[nodiscard]] QwenVisionWeights
 loadQwenVisionWeights(metal::MetalBackend &backend,
                       const std::filesystem::path &directory,
-                      ops::VisionLayout layout = {});
+                      ops::VisionLayout layout = {},
+                      VisionSource source = VisionSource::Packed,
+                      PreparationCheck prepareCheck = {});
 
 } // namespace splash::model

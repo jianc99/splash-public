@@ -70,7 +70,9 @@ def _running_status(port=PORT):
     return status
 
 
-def _ensure_installed(model_id):
+def _ensure_installed(
+    model_id, *, revision=None, language_only=False, draft_model=None
+):
     if not paths.PACKAGED:
         # Serialize builds across ports; make keeps the lock if the launcher exits.
         with (RUNTIME_DIR / "build.lock").open("a+") as lock:
@@ -92,6 +94,11 @@ def _ensure_installed(model_id):
         model_id,
         "prepare",
     ]
+    for flag, value in (("--revision", revision), ("--draft-model", draft_model)):
+        if value is not None:
+            command[-1:-1] = [flag, value]
+    if language_only:
+        command.insert(-1, "--language-only")
     if subprocess.run(command, cwd=ROOT).returncode:
         raise LauncherError("model download or verification failed")
 
@@ -156,8 +163,16 @@ def serve(args):
                 raise LauncherError(
                     f"cannot bind {args.host}:{args.port}: {error}"
                 ) from None
-        _ensure_installed(args.model)
-        root = model_artifacts.installed_root(paths.MODELS, args.model)
+        selection = {}
+        for key in ("revision", "language_only", "draft_model"):
+            if value := getattr(args, key, None):
+                selection[key] = value
+        _ensure_installed(args.model, **selection)
+        root = model_artifacts.installed_root(paths.MODELS, args.model, **selection)
+        if (root / "model.json").is_file():
+            # A concurrent install may advance the selection link. Keep this
+            # process's tokenizer, draft and target on one immutable assembly.
+            root = root.resolve(strict=True)
         command = [
             str(paths.PYTHON),
             "-u",
@@ -367,7 +382,7 @@ def parse_args(argv=None):
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Quick start:\n"
-            "  splash serve --model incoai/Qwen3.8-27B-Splash\n"
+            "  splash serve --model mlx-community/Qwen3.8-27B-4bit\n"
             "  splash opencode  # in another terminal, after Ready\n\n"
             "Use splash serve --help for server settings. Client arguments,\n"
             "including --help, are passed through to the installed agent."
@@ -378,12 +393,12 @@ def parse_args(argv=None):
     server = commands.add_parser(
         "serve",
         help="run the local server; Ctrl+C stops it",
-        description="Download a Splash model package if needed, then serve in the foreground.",
+        description="Load an upstream model, automatically select its DFlash2 draft, and serve in the foreground.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  splash serve --model incoai/Qwen3.8-27B-Splash\n"
-            "  splash serve --model incoai/Qwen3.6-35B-A3B-Splash --max-context 128K\n\n"
+            "  splash serve --model mlx-community/Qwen3.8-27B-4bit\n"
+            "  splash serve --model unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M --max-context 128K\n\n"
             "After Ready, open http://127.0.0.1:8000 or connect an installed agent.\n"
             "The startup summary and /status report the effective context limit.\n"
             "A client may impose a smaller limit. Keep this terminal open; Ctrl+C stops serving."
@@ -405,8 +420,20 @@ def parse_args(argv=None):
         type=model_artifacts.parse_model_id,
         required=True,
         metavar="OWNER/REPO[:VARIANT]",
-        help="Hugging Face repository containing a Splash package, with the "
-        "variant of a GGUF package after ':' (e.g. :UD-Q4_K_M)",
+        help="upstream Hugging Face model, with a GGUF variant after ':' (e.g. :UD-Q4_K_M)",
+    )
+    server.add_argument(
+        "--revision",
+        help="optional model branch, tag or commit (default: repository default)",
+    )
+    server.add_argument(
+        "--draft-model",
+        help="override the automatically selected DFlash2 repository or local directory",
+    )
+    server.add_argument(
+        "--language-only",
+        action="store_true",
+        help="skip vision preparation and loading",
     )
     server.add_argument(
         "--served-model-name",

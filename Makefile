@@ -235,12 +235,13 @@ ENGINE_CPP_SOURCES := \
 	runtime/model/Qwen3_6Moe.cpp \
 	runtime/model/Qwen3_8.cpp \
 	runtime/model/QwenVision.cpp \
+	runtime/model/VisionPreparation.cpp \
 	runtime/model/QwenTarget.cpp \
 	runtime/model/DFlashDraft.cpp \
 	runtime/model/ModelFactory.cpp \
 	runtime/model/QwenState.cpp
 ENGINE_MM_SOURCES := \
-	runtime/model/AffineCheckpoint.mm \
+	runtime/model/SafetensorsCheckpoint.mm \
 	runtime/model/ModelDescriptor.mm \
 	runtime/model/Runtime.mm \
 	runtime/model/RuntimeArenas.mm \
@@ -279,7 +280,7 @@ WEIGHT_PREPARATION_INPUTS := $(shell $(BUILD_ID_PYTHON) dev/tools/weight_prepara
 $(WEIGHT_PREPARATION_HEADER): $(WEIGHT_PREPARATION_INPUTS) dev/tools/weight_preparation_identity.py dev/tools/build_identity.py | $(ENGINE_BUILD)
 	@$(BUILD_ID_PYTHON) dev/tools/weight_preparation_identity.py --root . --header $@
 
-$(ENGINE_BUILD)/model/AffineTarget.o $(ENGINE_BUILD)/model/GgufPreparation.o: $(WEIGHT_PREPARATION_HEADER)
+$(ENGINE_BUILD)/model/AffineTarget.o $(ENGINE_BUILD)/model/GgufPreparation.o $(ENGINE_BUILD)/model/VisionPreparation.o: $(WEIGHT_PREPARATION_HEADER)
 
 $(ENGINE_BUILD)/%.o: runtime/%.cpp
 	@mkdir -p $(dir $@)

@@ -1,4 +1,4 @@
-#include "model/AffineCheckpoint.hpp"
+#include "model/SafetensorsCheckpoint.hpp"
 
 #include <array>
 #include <cstdlib>
@@ -35,7 +35,7 @@ int main() {
   try {
     std::ofstream(root / "config.json") << R"({"quantization":{"bits":4,"group_size":64,"router":{"bits":8}},"text_config":{"layers":2,"model_type":"fixture","layer_types":["linear_attention","full_attention"]}})";
     shard(root / "model.safetensors", valid);
-    AffineCheckpoint source(root);
+    SafetensorsCheckpoint source(root);
     source.requireQuantization("projection", 4);
     source.requireQuantization("router", 8);
     source.requireConfigNumber("layers", 2);
@@ -52,9 +52,9 @@ int main() {
     const auto first = source.digest();
     shard(root / "model.safetensors", valid);
     rejects([&] { source.checkUnchanged(); }, "changed source accepted");
-    require(AffineCheckpoint(root).digest() == first, "same content changed identity");
+    require(SafetensorsCheckpoint(root).digest() == first, "same content changed identity");
     shard(root / "extra.safetensors", valid);
-    rejects([&] { AffineCheckpoint invalid(root); }, "duplicate tensor accepted");
+    rejects([&] { SafetensorsCheckpoint invalid(root); }, "duplicate tensor accepted");
     std::filesystem::remove(root / "extra.safetensors");
     for (const auto header : {
         R"({"a":{"dtype":"U32","shape":[2,2],"data_offsets":[0,15]}})",
@@ -65,10 +65,10 @@ int main() {
         R"({"a":{"dtype":"U32","shape":[4],"data_offsets":[0,16]},"b":{"dtype":"U32","shape":[2],"data_offsets":[8,16]}})",
         R"({"a":{"dtype":"FP4","shape":[4],"data_offsets":[0,16]}})"}) {
       shard(root / "model.safetensors", header);
-      rejects([&] { AffineCheckpoint invalid(root); }, "malformed tensor accepted");
+      rejects([&] { SafetensorsCheckpoint invalid(root); }, "malformed tensor accepted");
     }
     shard(root / "model.safetensors", valid, 8);
-    rejects([&] { AffineCheckpoint invalid(root); }, "truncated tensor accepted");
+    rejects([&] { SafetensorsCheckpoint invalid(root); }, "truncated tensor accepted");
     std::filesystem::remove_all(root);
     std::cout << "affine checkpoint: bounded reads, metadata, quantization, identity and malformed sources PASS\n";
   } catch (const std::exception &error) {

@@ -1994,6 +1994,12 @@ def main():
             )
         effective_context = readiness.max_context_tokens
         constraint_factory = ConstraintFactory(tokenizer)
+        source_record = Path(args.target).parent / "model.json"
+        images_enabled = True
+        if source_record.is_file():
+            images_enabled = (
+                json.loads(source_record.read_text())["vision_format"] != "none"
+            )
         app = Frontend(
             tokenizer,
             backend,
@@ -2007,6 +2013,7 @@ def main():
             thinking_codec=thinking_codec,
             served_model_names=args.served_model_name,
             default_reasoning_effort=args.default_reasoning_effort,
+            images_enabled=images_enabled,
         )
         server.app = app
         server.server_activate()

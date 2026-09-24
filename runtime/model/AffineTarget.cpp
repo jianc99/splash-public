@@ -2,7 +2,7 @@
 #include "model/AffineTarget.hpp"
 #include "model/Qwen3_8.hpp"
 #include "model/Qwen3_6Moe.hpp"
-#include "model/AffineCheckpoint.hpp"
+#include "model/SafetensorsCheckpoint.hpp"
 
 #include <algorithm>
 #include <array>
@@ -45,7 +45,7 @@ struct Image {
   }
 };
 
-const SourceTensor &requireTensor(const AffineCheckpoint &source, const std::string &name,
+const SourceTensor &requireTensor(const SafetensorsCheckpoint &source, const std::string &name,
                                  const std::string &dtype, const std::vector<uint64_t> &shape) {
   const auto &tensor = source.require(name);
   if (tensor.dtype != dtype || tensor.shape != shape)
@@ -53,7 +53,7 @@ const SourceTensor &requireTensor(const AffineCheckpoint &source, const std::str
   return tensor;
 }
 
-void copy(Image &image, const AffineCheckpoint *source, const std::string &name,
+void copy(Image &image, const SafetensorsCheckpoint *source, const std::string &name,
            const std::vector<uint64_t> &shape) {
   Section section;
   section.bytes = 2;
@@ -62,7 +62,7 @@ void copy(Image &image, const AffineCheckpoint *source, const std::string &name,
   image.append(std::move(section));
 }
 
-void projection(Image &image, const AffineCheckpoint *source,
+void projection(Image &image, const SafetensorsCheckpoint *source,
                  std::initializer_list<std::pair<std::string, uint32_t>> parts,
                  uint32_t rows, uint32_t columns, uint32_t bits = 4, uint32_t experts = 1) {
   validateQ4Layout(rows, columns);
@@ -93,7 +93,7 @@ void projection(Image &image, const AffineCheckpoint *source,
 }
 
 template<class Layout>
-void validateConfiguration(const AffineCheckpoint &source, const Layout &layout) {
+void validateConfiguration(const SafetensorsCheckpoint &source, const Layout &layout) {
   const std::pair<const char *, double> fields[] = {
       {"num_hidden_layers", layout.layers}, {"hidden_size", layout.hiddenSize},
       {"vocab_size", layout.vocabularySize}, {"head_dim", layout.attentionHeadDimension},
@@ -121,7 +121,7 @@ void validateConfiguration(const AffineCheckpoint &source, const Layout &layout)
 }
 
 template<class Layout>
-Image layerImage(const AffineCheckpoint *source, const Layout &layout, uint32_t layer) {
+Image layerImage(const SafetensorsCheckpoint *source, const Layout &layout, uint32_t layer) {
   if (layer >= layout.layers) throw WeightStoreError("target layer is out of range");
   const bool full = layout.isFullAttentionLayer(layer);
   Image image{"layer-" + std::to_string(layer) + ".bin", std::string(Layout::layerMagic), layer, full ? 1u : 0u};
@@ -187,7 +187,7 @@ Image layerImage(const AffineCheckpoint *source, const Layout &layout, uint32_t 
 }
 
 template<class Layout>
-Image headImage(const AffineCheckpoint *source, const Layout &layout) {
+Image headImage(const SafetensorsCheckpoint *source, const Layout &layout) {
   constexpr bool moe = requires { layout.experts; };
   Image image{"head.bin", moe ? "MDFM0002" : "MDFL0002", layout.layers, 2};
   copy(image, source, "language_model.model.norm.weight", {layout.hiddenSize});
@@ -196,7 +196,7 @@ Image headImage(const AffineCheckpoint *source, const Layout &layout) {
 }
 
 template<class Layout>
-Image embeddingImage(const AffineCheckpoint *source, const Layout &layout) {
+Image embeddingImage(const SafetensorsCheckpoint *source, const Layout &layout) {
   Image image{"embedding.bin", "MDFE0001", layout.vocabularySize, layout.hiddenSize};
   const std::string prefix = "language_model.model.embed_tokens";
   if (source) source->requireQuantization(prefix, 4);
@@ -211,7 +211,7 @@ Image embeddingImage(const AffineCheckpoint *source, const Layout &layout) {
   return image;
 }
 
-std::string imageKey(const AffineCheckpoint &source, const Image &image) {
+std::string imageKey(const SafetensorsCheckpoint &source, const Image &image) {
   std::ostringstream identity;
   identity << "splash-affine64-preparation-v1\n" SPLASH_AFFINE_PREPARATION_ID "\n" << source.digest() << '\n'
            << image.magic << ' ' << image.layer << ' ' << image.type << ' ' << image.bytes << '\n';
@@ -324,7 +324,7 @@ uint64_t preparedBytes(const Layout &layout) {
 struct AffineTargetLoader::Impl {
   metal::MetalBackend &backend;
   PreparationCheck check;
-  AffineCheckpoint source;
+  SafetensorsCheckpoint source;
   std::filesystem::path sourceDirectory;
   std::variant<Qwen3_8Layout, Qwen3_6MoeLayout> layout;
   PreparedWeights cache;

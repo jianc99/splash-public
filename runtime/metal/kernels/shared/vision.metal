@@ -87,14 +87,15 @@ inline void vision_bilinear_taps(uint index, uint size, thread uint *tap,
     }
 }
 
-kernel void vision_prepare_positions(
-    device const bfloat *table [[buffer(0)]],
-    device bfloat *positions [[buffer(1)]],
-    device float *rope_cos [[buffer(2)]],
-    device float *rope_sin [[buffer(3)]],
-    constant VisionGridParams &params [[buffer(4)]],
-    uint token [[threadgroup_position_in_grid]],
-    uint thread_index [[thread_index_in_threadgroup]])
+template <typename T>
+inline void vision_prepare_positions_impl(
+    device const T *table,
+    device bfloat *positions,
+    device float *rope_cos,
+    device float *rope_sin,
+    constant VisionGridParams &params,
+    uint token,
+    uint thread_index)
 {
     uint2 position = vision_patch_position(token, params.grid_width);
     uint row_taps[2], col_taps[2];
@@ -127,6 +128,21 @@ kernel void vision_prepare_positions(
     }
 }
 
+#define VISION_POSITIONS(name, T)                                             \
+kernel void name(                                                             \
+    device const T *table [[buffer(0)]],                                      \
+    device bfloat *positions [[buffer(1)]],                                   \
+    device float *rope_cos [[buffer(2)]],                                     \
+    device float *rope_sin [[buffer(3)]],                                     \
+    constant VisionGridParams &params [[buffer(4)]],                          \
+    uint token [[threadgroup_position_in_grid]],                              \
+    uint thread_index [[thread_index_in_threadgroup]]) {                      \
+    vision_prepare_positions_impl(table, positions, rope_cos, rope_sin,       \
+                                  params, token, thread_index);               \
+}
+VISION_POSITIONS(vision_prepare_positions, bfloat)
+VISION_POSITIONS(vision_prepare_positions_f32, float)
+
 // Dense bf16 GEMM: output[M, N] = input[M, K] * weights[N, K]^T + bias[N]
 
 enum VisionActivation { VisionNone, VisionGeluTanh, VisionGeluErf };
@@ -142,11 +158,11 @@ inline float vision_erf(float x) {
 }
 
 template <ushort TileM, ushort TileN, VisionActivation Activation,
-          bool AddResidual>
+          bool AddResidual, typename W, typename B>
 inline void vision_gemm_tile(
     device bfloat *input,
-    device bfloat *weights,
-    device bfloat *bias,
+    device W *weights,
+    device B *bias,
     device bfloat *output,
     device bfloat *residual,
     uint output_size,
@@ -155,7 +171,7 @@ inline void vision_gemm_tile(
     uint row_origin)
 {
     device bfloat *rows = input + ulong(row_origin) * input_size;
-    device bfloat *tile_weights = weights + ulong(output_origin) * input_size;
+    device W *tile_weights = weights + ulong(output_origin) * input_size;
     auto a = tensor(rows,
                     dextents<int, 2>{int(input_size), TileM},
                     array<int, 2>{1, int(input_size)});
@@ -215,11 +231,11 @@ inline void vision_gemm_tile(
     converted.store(c.slice<TileN, TileM>(output_origin, 0));
 }
 
-#define VISION_GEMM_KERNEL(name, tile_m, tile_n, activation, add_residual)    \
+#define VISION_GEMM_TYPED(name, tile_m, tile_n, activation, add_residual, W, B)    \
 kernel void name(                                                             \
     device bfloat *input [[buffer(0)]],                                       \
-    device bfloat *weights [[buffer(1)]],                                     \
-    device bfloat *bias [[buffer(2)]],                                        \
+    device W *weights [[buffer(1)]],                                     \
+    device B *bias [[buffer(2)]],                                        \
     device bfloat *output [[buffer(3)]],                                      \
     device bfloat *residual [[buffer(4)]],                                    \
     constant VisionGemmParams &params [[buffer(5)]],                          \
@@ -231,6 +247,11 @@ kernel void name(                                                             \
         group.y * tile_n, group.x * tile_m);                                  \
 }
 
+#define VISION_GEMM_KERNEL(name, tile_m, tile_n, activation, add_residual) \
+  VISION_GEMM_TYPED(name, tile_m, tile_n, activation, add_residual, bfloat, bfloat) \
+  VISION_GEMM_TYPED(name##_f32_bias, tile_m, tile_n, activation, add_residual, bfloat, float) \
+  VISION_GEMM_TYPED(name##_f32, tile_m, tile_n, activation, add_residual, float, float)
+
 VISION_GEMM_KERNEL(vision_gemm_m64n128, 64, 128, VisionNone, false)
 VISION_GEMM_KERNEL(vision_gemm_m64n128_residual, 64, 128, VisionNone, true)
 VISION_GEMM_KERNEL(vision_gemm_m64n128_gelu_tanh, 64, 128, VisionGeluTanh, false)
@@ -241,18 +262,18 @@ VISION_GEMM_KERNEL(vision_gemm_m32n256_gelu_erf, 32, 256, VisionGeluErf,
 
 // LayerNorm with bias (fp32 statistics), one threadgroup per row.
 
-kernel void vision_layer_norm(
-    device const bfloat *input [[buffer(0)]],
-    device const bfloat *weight [[buffer(1)]],
-    device const bfloat *bias [[buffer(2)]],
-    device bfloat *output [[buffer(3)]],
-    constant VisionNormParams &params [[buffer(4)]],
-    uint group [[threadgroup_position_in_grid]],
-    uint thread_index [[thread_index_in_threadgroup]],
-    uint simd_lane [[thread_index_in_simdgroup]],
-    uint simd_group [[simdgroup_index_in_threadgroup]])
+template <typename T>
+inline void vision_layer_norm_impl(
+    device const bfloat *input,
+    device const T *weight,
+    device const T *bias,
+    device bfloat *output,
+    constant VisionNormParams &params,
+    uint group,
+    uint thread_index,
+    uint simd_lane,
+    uint simd_group, threadgroup float *reductions)
 {
-    threadgroup float reductions[8];
     device const bfloat *row = input + ulong(group) * params.width;
     device bfloat *out = output + ulong(group) * params.width;
 
@@ -289,6 +310,24 @@ kernel void vision_layer_norm(
                              float(bias[column]));
     }
 }
+
+#define VISION_NORM(name, T)                                                  \
+kernel void name(                                                             \
+    device const bfloat *input [[buffer(0)]],                                 \
+    device const T *weight [[buffer(1)]],                                     \
+    device const T *bias [[buffer(2)]],                                       \
+    device bfloat *output [[buffer(3)]],                                      \
+    constant VisionNormParams &params [[buffer(4)]],                          \
+    uint group [[threadgroup_position_in_grid]],                              \
+    uint thread_index [[thread_index_in_threadgroup]],                        \
+    uint lane [[thread_index_in_simdgroup]],                                  \
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {                     \
+    threadgroup float reductions[8];                                          \
+    vision_layer_norm_impl(input, weight, bias, output, params, group,        \
+                           thread_index, lane, simd_group, reductions);       \
+}
+VISION_NORM(vision_layer_norm, bfloat)
+VISION_NORM(vision_layer_norm_f32, float)
 
 // QKV preparation: apply 2D rope to Q and K, scatter into per-head layouts.
 // Q, K: (heads, padded_tokens, 80); V: (heads, key_tile, 128, 72). Padded

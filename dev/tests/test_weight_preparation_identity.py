@@ -32,5 +32,7 @@ class PreparationIdentityTest(unittest.TestCase):
                     path.write_text(previous + "changed preparation")
                     changed = header(root)
                     self.assertEqual(changed.splitlines()[2], original.splitlines()[2])
-                    self.assertNotEqual(changed.splitlines()[3], original.splitlines()[3])
+                    self.assertNotEqual(
+                        changed.splitlines()[3], original.splitlines()[3]
+                    )
                     path.write_text(previous)
