@@ -146,7 +146,7 @@ readQwenTargetWeights(metal::MetalBackend &backend, const Layout &layout, Files 
 
 // Throws unless every dimension of a family's layout is set, the dimensions
 // agree with each other and every projection fits the Q4 storage tiles.
-template <class Layout> void validateQwenLayout(const Layout &layout) {
+template <class Layout> void requireQwenLayout(const Layout &layout) {
   const auto zero = [](auto... dimensions) { return ((dimensions == 0) || ...); };
   uint32_t ffnWidth = 0;
   bool ffnZero = false;
@@ -182,14 +182,14 @@ template <class Layout> void validateQwenLayout(const Layout &layout) {
   validateQ4Layout(layout.vocabularySize, layout.hiddenSize);
 }
 
-// Validates the layout and loads a target from its files. The architecture
+// Checks the layout and loads a target from its files. The architecture
 // reads its FFN through readFfn, called with the file, the layer and the
 // format.
 template <class Weights, class Layout, class ReadFfn>
 [[nodiscard]] Weights
 loadQwenTarget(metal::MetalBackend &backend, const Layout &layout, const QwenTargetFiles<Layout> &files,
                ReadFfn readFfn) {
-  validateQwenLayout(layout);
+  requireQwenLayout(layout);
   if (const auto *gguf = std::get_if<std::reference_wrapper<GgufTargetLoader>>(&files))
     return readQwenTargetWeights<Weights>(backend, layout, gguf->get(), BlockTargetFormat{}, readFfn);
   const AffineTargetFormat affine{};
