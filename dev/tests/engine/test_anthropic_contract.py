@@ -4,7 +4,13 @@ import unittest
 
 from dev.tests import test_server
 from dev.tests.engine.test_documents import document_block
-from dev.tests.test_server import FakeConstraintFactory, FakeRuntime, Harness, Plan
+from dev.tests.test_server import (
+    FakeConstraintFactory,
+    FakeRuntime,
+    Harness,
+    Plan,
+    no_signed_thinking,
+)
 from server import documents
 from server.api_shapes import (
     anthropic_to_chat_body,
@@ -70,7 +76,10 @@ class AnthropicAdapterTest(unittest.TestCase):
             ]
         )
         original = copy.deepcopy(body)
-        messages = anthropic_to_chat_prompt(body)["messages"]
+        translated = anthropic_to_chat_prompt(
+            body, thinking_resolver=no_signed_thinking
+        )
+        messages = translated["messages"]
         self.assertEqual(messages[1]["content"], "Checking.")
         self.assertNotIn("reasoning_content", messages[1])
         self.assertEqual(
@@ -101,7 +110,8 @@ class AnthropicAdapterTest(unittest.TestCase):
                                 ],
                             }
                         ]
-                    )
+                    ),
+                    thinking_resolver=no_signed_thinking,
                 )
             self.assertEqual(caught.exception.status, 400)
 
@@ -115,7 +125,9 @@ class AnthropicAdapterTest(unittest.TestCase):
             with self.subTest(fields=fields):
                 self.assertNotIn(
                     "preserve_thinking",
-                    anthropic_to_chat_prompt(request_body(**fields)),
+                    anthropic_to_chat_prompt(
+                        request_body(**fields), thinking_resolver=no_signed_thinking
+                    ),
                 )
 
     def test_format_aliases_preserve_schema_and_input(self):
@@ -126,7 +138,9 @@ class AnthropicAdapterTest(unittest.TestCase):
             with self.subTest(fields=fields):
                 body = request_body(**fields)
                 original = copy.deepcopy(body)
-                translated = anthropic_to_chat_body(body)
+                translated = anthropic_to_chat_body(
+                    body, thinking_resolver=no_signed_thinking
+                )
                 self.assertEqual(body, original)
                 self.assertEqual(
                     translated["response_format"],
@@ -140,7 +154,9 @@ class AnthropicAdapterTest(unittest.TestCase):
             output_config={"effort": "xhigh", "format": FORMAT},
             tools=[{"name": "lookup", "input_schema": {"type": "object"}}],
         )
-        translated = anthropic_to_chat_prompt(body)
+        translated = anthropic_to_chat_prompt(
+            body, thinking_resolver=no_signed_thinking
+        )
         self.assertEqual(translated["reasoning_effort"], "xhigh")
         self.assertEqual(translated["response_format"]["json_schema"]["schema"], SCHEMA)
         self.assertEqual(translated["tools"][0]["function"]["name"], "lookup")
@@ -170,7 +186,8 @@ class AnthropicAdapterTest(unittest.TestCase):
                 with self.subTest(fields=fields, thinking=thinking):
                     with self.assertRaises(APIError):
                         anthropic_to_chat_prompt(
-                            request_body(thinking=thinking, **fields)
+                            request_body(thinking=thinking, **fields),
+                            thinking_resolver=no_signed_thinking,
                         )
 
 
@@ -372,7 +389,9 @@ class AnthropicHTTPContractTest(unittest.TestCase):
         ):
             with self.subTest(tool_result=len(messages) > 1):
                 body = request_body(messages=messages)
-                translated = anthropic_to_chat_body(body)
+                translated = anthropic_to_chat_body(
+                    body, thinking_resolver=no_signed_thinking
+                )
                 # Conversion leaves the PDF to request preparation.
                 self.assertEqual(
                     translated["messages"][-1]["content"],

@@ -13,6 +13,7 @@ from dev.tests.test_server import (
     Plan,
     TemplateTokenizer,
     _byte_backend,
+    no_signed_thinking,
 )
 from server import api_shapes, chat_templates
 from server import frontend as request_frontend
@@ -642,7 +643,8 @@ class LeadingSystemMergeTests(unittest.TestCase):
                     {"role": "system", "content": "Developer"},
                     {"role": "user", "content": "Ask"},
                 ],
-            }
+            },
+            thinking_resolver=no_signed_thinking,
         )["messages"]
         for messages in (responses, anthropic):
             with self.subTest(messages=messages):

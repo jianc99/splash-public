@@ -5,6 +5,7 @@ import unittest
 from llguidance import LLMatcher
 
 from dev.tests.engine import test_structured_tools as structured
+from dev.tests.test_server import no_signed_thinking
 from server import api_shapes, output, tool_schema
 from server.errors import APIError
 
@@ -123,7 +124,8 @@ class ToolSchemaCompositionTests(unittest.TestCase):
                 "max_tokens": 128,
                 "messages": [{"role": "user", "content": "Create a note"}],
                 "tools": [{"name": "test", "input_schema": schema}],
-            }
+            },
+            thinking_resolver=no_signed_thinking,
         )
         for body in (chat, responses, messages):
             with self.subTest(body=body):

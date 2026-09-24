@@ -562,6 +562,11 @@ def make_frontend(tokenizer, *args, **options):
     )
 
 
+def no_signed_thinking(signature):
+    """The thinking resolver for converted requests that carry no signature."""
+    raise AssertionError(f"unexpected thinking signature {signature!r}")
+
+
 class Harness:
     def __init__(
         self,
@@ -2056,7 +2061,8 @@ class ServerTest(unittest.TestCase):
                                 ],
                             }
                         ],
-                    }
+                    },
+                    thinking_resolver=no_signed_thinking,
                 )["messages"],
             }
         for shape, messages in converted.items():
@@ -2608,7 +2614,9 @@ class ServerTest(unittest.TestCase):
                         counted = json.loads(payload)
                         self.assertEqual(set(counted), {"input_tokens"})
                 job, *_ = harness.app.prepare(
-                    api.anthropic_to_chat_body({**body, "max_tokens": 8})
+                    api.anthropic_to_chat_body(
+                        {**body, "max_tokens": 8}, thinking_resolver=no_signed_thinking
+                    )
                 )
                 self.assertEqual(counted["input_tokens"], len(job.prompt_tokens))
                 self.assertEqual(job.request_id, index + 1)
@@ -2644,10 +2652,16 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(json.loads(payload), {"input_tokens": 130})
         self.assertEqual(harness.app.images.stats()["request_bytes"], 0)
         with self.assertRaisesRegex(api.APIError, "context window"):
-            harness.app.prepare(api.anthropic_to_chat_body({**body, "max_tokens": 1}))
+            harness.app.prepare(
+                api.anthropic_to_chat_body(
+                    {**body, "max_tokens": 1}, thinking_resolver=no_signed_thinking
+                )
+            )
         harness.app.max_context = 256
         job, *_ = harness.app.prepare(
-            api.anthropic_to_chat_body({**body, "max_tokens": 1})
+            api.anthropic_to_chat_body(
+                {**body, "max_tokens": 1}, thinking_resolver=no_signed_thinking
+            )
         )
         self.assertEqual(len(job.prompt_tokens), 130)
         del job
@@ -2765,7 +2779,8 @@ class ServerTest(unittest.TestCase):
                     "name": "read_file",
                     "disable_parallel_tool_use": True,
                 },
-            )
+            ),
+            thinking_resolver=no_signed_thinking,
         )
         self.assertEqual(
             translated["messages"][0], {"role": "system", "content": "be exact"}
@@ -2784,14 +2799,16 @@ class ServerTest(unittest.TestCase):
             self.anthropic_body(
                 thinking={"type": "adaptive"},
                 output_config={"effort": "high"},
-            )
+            ),
+            thinking_resolver=no_signed_thinking,
         )
         self.assertEqual(translated["reasoning_effort"], "high")
         translated = api.anthropic_to_chat_body(
             self.anthropic_body(
                 thinking={"type": "adaptive"},
                 output_config={"effort": "low"},
-            )
+            ),
+            thinking_resolver=no_signed_thinking,
         )
         self.assertEqual(translated["reasoning_effort"], "low")
 
@@ -2839,7 +2856,8 @@ class ServerTest(unittest.TestCase):
                         },
                         {"type": "text", "text": "dynamic status"},
                     ]
-                )
+                ),
+                thinking_resolver=no_signed_thinking,
             )
 
         first = translated("one")
@@ -2857,7 +2875,8 @@ class ServerTest(unittest.TestCase):
                     {"role": "system", "content": "dynamic system update"},
                     {"role": "assistant", "content": "acknowledged"},
                 ]
-            )
+            ),
+            thinking_resolver=no_signed_thinking,
         )
         self.assertEqual(
             translated["messages"],
@@ -2872,7 +2891,7 @@ class ServerTest(unittest.TestCase):
         with self.assertRaisesRegex(
             api.APIError, "require user/assistant/system roles"
         ):
-            api.anthropic_to_chat_body(body)
+            api.anthropic_to_chat_body(body, thinking_resolver=no_signed_thinking)
 
     def test_health_stays_live_when_native_is_not_ready(self):
         runtime = FakeRuntime()
@@ -5630,12 +5649,18 @@ class ServerTest(unittest.TestCase):
             body = self.anthropic_body(output_config={"effort": "high"})
             if thinking is not None:
                 body["thinking"] = thinking
-            chat = api.anthropic_to_chat_body(body)
+            chat = api.anthropic_to_chat_body(
+                body, thinking_resolver=no_signed_thinking
+            )
             job, active, _ = app.prepare(chat)
             self.assertFalse(active)
             self.assertFalse(job.thinking)
             self.assertEqual(
-                app.count_tokens(api.anthropic_to_chat_prompt(body)),
+                app.count_tokens(
+                    api.anthropic_to_chat_prompt(
+                        body, thinking_resolver=no_signed_thinking
+                    )
+                ),
                 len(job.prompt_tokens),
             )
             self.assertFalse(tokenizer.templates[-1][1]["enable_thinking"])
@@ -5655,7 +5680,9 @@ class ServerTest(unittest.TestCase):
                     self.subTest(thinking=thinking, effort=effort),
                     self.assertRaisesRegex(api.APIError, "output_config.effort"),
                 ):
-                    api.anthropic_to_chat_prompt(body)
+                    api.anthropic_to_chat_prompt(
+                        body, thinking_resolver=no_signed_thinking
+                    )
 
     def test_structured_output_validation_and_constraint(self):
         schema = {

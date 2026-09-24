@@ -6,7 +6,7 @@ from unittest import mock
 from referencing import Registry
 
 from dev.tests.engine.test_runtime import FakeFactory, request
-from dev.tests.test_server import FakeRuntime, Harness
+from dev.tests.test_server import FakeRuntime, Harness, no_signed_thinking
 from server import frontend as request_frontend
 from server import protocol as wire
 from server import runtime, schema_validation, tool_schema
@@ -45,7 +45,8 @@ class RequestContractTests(unittest.TestCase):
                     "max_tokens": 4096,
                     "thinking": {"type": "enabled", "budget_tokens": 1024},
                     "output_config": {"effort": effort},
-                }
+                },
+                thinking_resolver=no_signed_thinking,
             )
             self.assertEqual(converted["reasoning_effort"], effort)
 
