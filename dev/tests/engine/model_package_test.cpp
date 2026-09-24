@@ -1,4 +1,6 @@
+#include "model/GgufImageLayout.hpp"
 #include "model/ModelFactory.hpp"
+#include "model/WeightLayout.hpp"
 #include "ops/Embedding.hpp"
 
 #include <algorithm>
@@ -493,21 +495,25 @@ std::filesystem::path writeGgufTensor(const std::filesystem::path &path, uint32_
 // token gather writes only into buffers holding its rows.
 void testGgufImageLayout(MetalBackend &backend, const std::filesystem::path &root) {
     constexpr uint32_t rows = 256, columns = 256;
-    // Q8_0 planes (metal/abi/QuantFormat.h): 32 value bytes and one half
-    // scale per row and group of 32; native rows are 34-byte blocks.
-    const auto projection = writeGgufTensor(root / "projection.bin", 8, rows, columns, {32, 0, 2, 1},
-                                            {rows * (columns / 32) * 32, 0, rows * (columns / 32) * 2});
-    const auto embedding = writeGgufTensor(root / "embedding.bin", 8, rows, columns, {0, 0, 0, 0},
-                                           {rows * (columns / 32) * 34, 0, 0});
+    // Q8_0 planes and native rows as the planner lays them out.
+    const QuantFormat &q80 = kQuantFormats[GGUF_FMT_Q80];
+    const splash::model::GgufPlaneBytes planes = splash::model::ggufPlaneBytes(q80, rows, columns);
+    const auto projection = writeGgufTensor(root / "projection.bin", q80.ggml_type, rows, columns,
+                                            {q80.plane0_bytes, q80.plane1_bytes, q80.meta_bytes, q80.meta_groups},
+                                            {planes.plane0, planes.plane1, planes.meta});
+    const auto embedding = writeGgufTensor(root / "embedding.bin", q80.ggml_type, rows, columns, {0, 0, 0, 0},
+                                           {rows * splash::model::ggufRowBytes(q80, columns), 0, 0});
     const auto mapped = [&](const std::filesystem::path &path) {
         return WeightFile(backend, path, "test/" + path.filename().string(), kGgufImageMagic, 0, 0);
     };
     {
+        // finish() proves the reader took exactly the descriptor, plane0 and
+        // meta sections; the segment's format comes from the descriptor.
         WeightFile file = mapped(projection);
         const auto read = splash::model::readBlockProjection(file, rows, columns, "projection");
         file.finish();
-        require(read.outputSize == rows && read.inputSize == columns && read.blocks().segments.size() == 1,
-                "GGUF projection lost its layout sizes");
+        const auto &segment = read.blocks().segments.at(0);
+        require(segment.formatId == GGUF_FMT_Q80 && !segment.plane1, "GGUF projection did not read a Q8_0 segment");
     }
     for (const auto [output, input] : {std::pair{2 * rows, columns}, std::pair{rows, 2 * columns}}) {
         requirePackedError(
@@ -528,12 +534,13 @@ void testGgufImageLayout(MetalBackend &backend, const std::filesystem::path &roo
     file.finish();
     constexpr uint32_t gathered = 8;
     const MetalBuffer tokens = backend.allocateBuffer(gathered * sizeof(uint32_t), BufferStorage::Shared);
-    const MetalBuffer output = backend.allocateBuffer(uint64_t{gathered} * columns * 2, BufferStorage::Shared);
+    const MetalBuffer output =
+        backend.allocateBuffer(uint64_t{gathered} * columns * splash::model::kBFloat16Bytes, BufferStorage::Shared);
     splash::metal::CommandGraph graph;
     splash::ops::Embedding::add(graph, tokens, table, output, gathered);
     for (const auto &[tokenBytes, outputBytes] :
-         {std::pair{tokens.sizeBytes() - 4, output.sizeBytes()},
-          std::pair{tokens.sizeBytes(), output.sizeBytes() - 2}}) {
+         {std::pair{tokens.sizeBytes() - sizeof(uint32_t), output.sizeBytes()},
+          std::pair{tokens.sizeBytes(), output.sizeBytes() - splash::model::kBFloat16Bytes}}) {
         bool rejected = false;
         try {
             splash::ops::Embedding::add(graph, backend.view(tokens, 0, tokenBytes), table,
