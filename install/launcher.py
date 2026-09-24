@@ -429,6 +429,7 @@ def parse_args(argv=None):
     )
     server.add_argument(
         "--draft-model",
+        type=model_artifacts.parse_draft_model,
         help="override the automatically selected DFlash2 repository or local directory",
     )
     server.add_argument(

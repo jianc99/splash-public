@@ -116,6 +116,20 @@ def parse_model_id(value: str) -> str:
         raise argparse.ArgumentTypeError(str(error)) from error
 
 
+def parse_draft_model(value: str) -> str:
+    # A local draft directory is recorded as an absolute path, so the
+    # installation it selects does not depend on the working directory.
+    if value and (local := Path(value).expanduser()).is_dir():
+        return str(local.resolve())
+    try:
+        return validate_repo_id(value)
+    except ModelError:
+        raise argparse.ArgumentTypeError(
+            "must be a local DFlash2 draft directory or a Hugging Face "
+            "repository ID (owner/repo)"
+        ) from None
+
+
 def sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as file:
@@ -1119,6 +1133,7 @@ def parse_args(argv=None):
     parser.add_argument("--revision", help="optional upstream branch, tag or commit")
     parser.add_argument(
         "--draft-model",
+        type=parse_draft_model,
         help="override the automatically selected DFlash2 repository or local directory",
     )
     parser.add_argument(

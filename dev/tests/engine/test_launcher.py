@@ -1,3 +1,4 @@
+import contextlib
 import fcntl
 import io
 import json
@@ -683,6 +684,112 @@ class LauncherTests(unittest.TestCase):
                 self.assertEqual(len(calls), 1 if fail else 3)
                 with (runtime / "build.lock").open("a+") as probe:
                     fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def test_source_selection_reaches_installation_and_served_root(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = Path(temporary)
+            draft = runtime / "local-draft"
+            draft.mkdir()
+            selection = {
+                "revision": "v2",
+                "language_only": True,
+                "draft_model": str(draft.resolve()),
+            }
+            with (
+                mock.patch.object(launcher, "RUNTIME_DIR", runtime),
+                mock.patch.object(launcher.socket, "socket"),
+                mock.patch.object(launcher.catalog, "spawn_refresh"),
+                mock.patch.object(launcher, "_ensure_installed") as install,
+                mock.patch.object(
+                    launcher.model_artifacts,
+                    "installed_root",
+                    return_value=runtime / "selected",
+                ) as root,
+                mock.patch.object(launcher.os, "execve") as execute,
+            ):
+                launcher.main(
+                    [
+                        "serve",
+                        "--model",
+                        MODEL_ID,
+                        "--revision",
+                        "v2",
+                        "--draft-model",
+                        str(draft),
+                        "--language-only",
+                    ]
+                )
+            install.assert_called_once_with(MODEL_ID, **selection)
+            root.assert_called_once_with(launcher.paths.MODELS, MODEL_ID, **selection)
+            argv = execute.call_args.args[1]
+            self.assertEqual(
+                argv[3:5],
+                [str(runtime / "selected/target"), str(runtime / "selected/draft")],
+            )
+
+            with (
+                mock.patch.object(
+                    launcher.subprocess,
+                    "run",
+                    return_value=subprocess.CompletedProcess([], 0),
+                ) as run,
+                mock.patch.object(launcher.paths, "PACKAGED", True),
+            ):
+                launcher._ensure_installed(MODEL_ID, **selection)
+            command = run.call_args.args[0]
+            self.assertEqual(run.call_args.kwargs["cwd"], launcher.ROOT)
+            parsed = launcher.model_artifacts.parse_args(command[2:])
+            self.assertEqual(
+                (
+                    parsed.command,
+                    parsed.model,
+                    parsed.revision,
+                    parsed.language_only,
+                    parsed.draft_model,
+                ),
+                ("prepare", MODEL_ID, "v2", True, selection["draft_model"]),
+            )
+
+    def test_relative_draft_directory_is_resolved_for_the_installer(self):
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            contextlib.chdir(temporary),
+        ):
+            base = Path(temporary).resolve()
+            (base / "drafts/local").mkdir(parents=True)
+            for value in ("drafts/local", "./drafts/local", "drafts/../drafts/local"):
+                with self.subTest(value=value):
+                    args = launcher.parse_args(
+                        ["serve", "--model", MODEL_ID, "--draft-model", value]
+                    )
+                    self.assertEqual(args.draft_model, str(base / "drafts/local"))
+                    # The installer, run directly, records the same directory.
+                    args = launcher.model_artifacts.parse_args(
+                        ["--model", MODEL_ID, "--draft-model", value, "prepare"]
+                    )
+                    self.assertEqual(args.draft_model, str(base / "drafts/local"))
+            repository = "incoai/Qwen3.8-27B-DFlash2"
+            args = launcher.parse_args(
+                ["serve", "--model", MODEL_ID, "--draft-model", repository]
+            )
+            self.assertEqual(args.draft_model, repository)
+            for value in ("./missing", "missing", "", "drafts/local/../../missing/"):
+                with (
+                    self.subTest(value=value),
+                    mock.patch.object(launcher, "_ensure_installed") as install,
+                    mock.patch("sys.stderr", io.StringIO()) as error,
+                    self.assertRaises(SystemExit) as failed,
+                ):
+                    launcher.main(
+                        ["serve", "--model", MODEL_ID, "--draft-model", value]
+                    )
+                self.assertEqual(failed.exception.code, 2)
+                self.assertIn(
+                    "argument --draft-model: must be a local DFlash2 draft "
+                    "directory or a Hugging Face repository ID",
+                    error.getvalue(),
+                )
+                install.assert_not_called()
 
     def test_packaged_serve_never_invokes_make_or_system_python(self):
         with (
