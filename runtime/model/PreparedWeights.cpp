@@ -367,8 +367,10 @@ void PreparedWeights::requireSpace(std::span<const PreparedWeight> weights,
   std::filesystem::create_directories(root_);
   PreparationLock lock(root_, check);
   // Reclaim abandoned writes before budgeting a retry. Live converters hold
-  // the lock; complete generations are retained and excluded from the budget.
-  for (const auto &weight : weights) std::filesystem::remove_all(root_ / (weight.key + ".partial"));
+  // the lock, so every staging entry is abandoned, whichever model or version
+  // wrote it; complete generations are retained and excluded from the budget.
+  for (const auto &entry : std::filesystem::directory_iterator(root_))
+    if (entry.path().extension() == ".partial") std::filesystem::remove_all(entry.path());
   requireWeightDiskSpace(std::filesystem::space(root_).available, missingBytes());
 }
 
@@ -427,7 +429,10 @@ std::filesystem::path PreparedWeights::prepare(const PreparedWeight &weight, con
     if (state.st_size < 0 || uint64_t(state.st_size) != bytes)
       throw std::runtime_error("prepared weight size changed");
     const std::string digest = fileDigest(file, 0, check);
-    if (fchmod(file, 0400) || fsync(file)) fail("flush prepared weights");
+    // fsync leaves the data in the drive's cache on macOS; the proof below must
+    // not outlive a power loss that the data does not survive.
+    if (fchmod(file, 0400) || (fcntl(file, F_FULLFSYNC) && fsync(file)))
+      fail("flush prepared weights");
     if (fstat(file, &state)) fail("stat completed weights");
     rememberDigest(root_, state, 0, digest);
     Descriptor manifest(open((staging / "sha256").c_str(), O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0400));
