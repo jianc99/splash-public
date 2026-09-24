@@ -39,7 +39,6 @@ uint32_t elementBytes(const std::string &type) {
   throw WeightStoreError("unsupported safetensors dtype: " + type);
 }
 
-
 using TensorIndex = std::map<std::string, SourceTensor, std::less<>>;
 
 // A shard's tensor record: its dtype, shape and bytes [begin, end) of the

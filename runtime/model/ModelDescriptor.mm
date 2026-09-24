@@ -1,6 +1,5 @@
 #include "ModelDescriptor.hpp"
 #include "QwenVision.hpp"
-#include "model/GgufImageLayout.hpp"
 
 #import <Foundation/Foundation.h>
 
@@ -316,7 +315,6 @@ void validateQwen36(NSDictionary *manifest,
   validateCaptureLayers(draft, targetLayout);
   validateTokenizer(root, descriptor, "qwen3_5_moe_text");
 }
-
 
 void requireNumbers(NSDictionary *object, std::initializer_list<GeometryField> fields) {
   for (const auto &field : fields)
