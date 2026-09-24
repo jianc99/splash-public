@@ -52,10 +52,7 @@ def _image_part(url):
 
 
 def _media_content(parts):
-    """Converted parts, or their text when they carry no image or file.
-
-    Images and files stay as parts; request preparation accepts or rejects
-    them and renders files with one shared document budget."""
+    """Canonical parts, or their text when they carry no image or file."""
     if any(part["type"] != "text" for part in parts):
         return parts
     return "".join(part["text"] for part in parts)
@@ -77,7 +74,6 @@ def _user_content(content, document_budget, vision):
     if not isinstance(content, list):
         return _text_content(content)
     parts = []
-    images = 0
     for part in content:
         if not isinstance(part, dict):
             raise APIError(400, "message content parts must be objects")
@@ -87,7 +83,6 @@ def _user_content(content, document_budget, vision):
             image_url = part.get("image_url")
             url = image_url.get("url") if isinstance(image_url, dict) else image_url
             parts.append(_image_part(url))
-            images += 1
         elif kind in ("text", "input_text"):
             text = part.get("text", "")
             if not isinstance(text, str):
@@ -95,16 +90,12 @@ def _user_content(content, document_budget, vision):
             parts.append({"type": "text", "text": text})
         elif kind == "file":
             _require_vision("PDF", vision)
-            rendered = file_content(part.get("file"), budget=document_budget)
-            parts.extend(rendered)
-            images += sum(p["type"] == "image_url" for p in rendered)
+            parts.extend(file_content(part.get("file"), budget=document_budget))
         elif kind in ("video", "video_url", "input_audio"):
             raise APIError(400, f"{kind} content is not supported")
         else:
             raise APIError(400, "unsupported message content part")
-    if not images:
-        return "".join(part["text"] for part in parts)
-    return parts
+    return _media_content(parts)
 
 
 _JSON_NUMBER = re.compile(r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?")
