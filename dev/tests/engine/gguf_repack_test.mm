@@ -634,16 +634,6 @@ void checkMoeLayer(splash::metal::MetalBackend *backend) {
           "prepared F32 alpha/beta tensor: beta then alpha rows in grouped order");
     allowPreparation = false;
     check(load() == image, "GGUF warm load does not require conversion headroom");
-    // The model's other prepared files join the target's disk check.
-    const model::PreparedWeight vision{std::string(64, 'a'), UINT64_MAX / 2, "vision/model.bin", std::string(64, 'b'), "/vision"};
-    std::string budget;
-    try {
-      model::GgufTargetLoader loader(*backend, path, geometry, {}, {&vision, 1});
-    } catch (const std::runtime_error &error) {
-      budget = error.what();
-    }
-    check(budget.starts_with("not enough disk space to prepare weights"),
-          "GGUF target disk check budgets the model's other prepared files: " + budget);
     // A layer may have tensors on opposite sides of the 4 GiB boundary. Keep
     // the file sparse and poison the old location so a truncated offset
     // cannot accidentally read the right data.
@@ -754,8 +744,8 @@ void checkDenseTarget(splash::metal::MetalBackend &backend) {
   };
   bool read = false;
   try {
-    const model::Qwen3_8Weights weights =
-        model::loadQwen3_8Weights(backend, directory, layout, model::TargetSource::Gguf);
+    model::GgufTargetLoader files(backend, model::findTargetGguf(directory), model::ggufTargetGeometry(layout));
+    const model::Qwen3_8Weights weights = model::loadQwen3_8Weights(backend, layout, files);
     read = weights.layers.size() == layout.layers && weights.finalNorm.float32 &&
            blocks(weights.logitsProjection, layout.vocabularySize, hidden, {layout.vocabularySize}) &&
            std::string_view(weights.logitsProjection.blocks().segments.front().format) == "q6k" &&
@@ -894,8 +884,17 @@ void checkGoldenImages(splash::metal::MetalBackend &backend) {
     std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char *>(file.data()), file.size());
     try {
       model::GgufTargetLoader loader(backend, path, geometry);
+      size_t opened = 0;
       const auto hash = [&](model::WeightFile weights) {
         const auto &record = weights.record();
+        // The model's disk check budgets weights(): it must be the files the
+        // loader writes, in order.
+        const bool planned = opened < loader.weights().size() &&
+                             loader.weights()[opened].key == record.contentIdentity &&
+                             loader.weights()[opened].bytes == record.declaredBytes &&
+                             loader.weights()[opened].component == record.relativePath;
+        ++opened;
+        check(planned, std::string("GGUF loader plans the file it writes: ") + name + " " + record.relativePath);
         std::ifstream stream(cache / record.contentIdentity / "weights", std::ios::binary);
         const std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(stream)), {});
         const std::string actual = sha256(bytes.data(), bytes.size());
@@ -908,6 +907,7 @@ void checkGoldenImages(splash::metal::MetalBackend &backend) {
       for (uint32_t layer = 0; layer < geometry.layers; ++layer) hash(loader.layer(layer));
       hash(loader.head());
       hash(loader.embedding());
+      check(opened == loader.weights().size(), std::string("GGUF loader plans only the files it writes: ") + name);
     } catch (const std::exception &error) {
       check(false, std::string("golden prepared images: ") + name + ": " + error.what());
     }

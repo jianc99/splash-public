@@ -1,7 +1,5 @@
 #pragma once
 
-#include "model/PreparedWeights.hpp"
-
 #include "Model.hpp"
 #include "QwenTarget.hpp"
 #include "StateLayout.hpp"
@@ -11,7 +9,6 @@
 
 #include <array>
 #include <cstdint>
-#include <filesystem>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -92,12 +89,8 @@ struct Qwen3_8Weights final {
   std::string manifestFingerprintSha256;
 };
 
-// A prepared target's disk check also budgets alsoPrepared, the model's other
-// prepared files.
 [[nodiscard]] Qwen3_8Weights
-loadQwen3_8Weights(metal::MetalBackend &backend,
-                   const std::filesystem::path &directory,
-                   Qwen3_8Layout layout = {}, TargetSource source = TargetSource::Packed, PreparationCheck admitConversion = {},
-                   std::span<const PreparedWeight> alsoPrepared = {});
+loadQwen3_8Weights(metal::MetalBackend &backend, Qwen3_8Layout layout,
+                   const QwenTargetFiles<Qwen3_8Layout> &files);
 
 } // namespace splash::model

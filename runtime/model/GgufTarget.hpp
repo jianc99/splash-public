@@ -18,14 +18,15 @@ namespace splash::model {
 
 class GgufTargetLoader final {
 public:
-  // Plans every image from the GGUF's metadata once. Before the first image
-  // is written, the disk check budgets every missing image together with
-  // alsoPrepared, the model's other prepared files.
+  // Plans every image from the GGUF's metadata once.
   GgufTargetLoader(metal::MetalBackend &backend, const std::filesystem::path &path,
-                   const gguf::TargetGeometry &geometry, PreparationCheck admitConversion = {},
-                   std::span<const PreparedWeight> alsoPrepared = {});
+                   const gguf::TargetGeometry &geometry, PreparationCheck admitConversion = {});
   GgufTargetLoader(const GgufTargetLoader &) = delete;
   GgufTargetLoader &operator=(const GgufTargetLoader &) = delete;
+
+  // Every image's cache identity and size, layers first, for the model's
+  // disk check before the first image is written.
+  [[nodiscard]] std::span<const PreparedWeight> weights() const noexcept { return weights_; }
 
   [[nodiscard]] WeightFile layer(uint32_t index);
   [[nodiscard]] WeightFile head();

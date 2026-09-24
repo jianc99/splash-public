@@ -51,8 +51,17 @@ void prepare(metal::MetalBackend &backend, const std::filesystem::path &root, co
   const auto admitConversion = [&] { if (!cold) throw std::runtime_error("conversion forbidden on warm load"); };
   for (unsigned pass = 0; pass < 2; ++pass) {
     model::AffineTargetLoader loader(backend, root, layout, admitConversion);
+    size_t opened = 0;
     const auto check = [&](model::WeightFile weights) {
       const auto &record = weights.record();
+      // The model's disk check budgets weights(): it must be the files the
+      // loader writes, in order.
+      if (opened == loader.weights().size())
+        throw std::runtime_error("the loader writes a file it did not plan: " + record.relativePath);
+      const model::PreparedWeight &planned = loader.weights()[opened++];
+      if (record.contentIdentity != planned.key || record.declaredBytes != planned.bytes ||
+          record.relativePath != planned.component)
+        throw std::runtime_error("the loader's planned weights differ from its " + record.relativePath);
       const auto prepared = fileBytes(cache / record.contentIdentity / "weights");
       if (prepared.size() != record.declaredBytes) throw std::runtime_error("wrong image size");
       if (oracle && prepared != fileBytes(root / "expected" / std::filesystem::path(record.relativePath).filename()))
@@ -65,6 +74,7 @@ void prepare(metal::MetalBackend &backend, const std::filesystem::path &root, co
     check(loader.layer(1));
     check(loader.head());
     check(loader.embedding());
+    if (opened != loader.weights().size()) throw std::runtime_error("the loader plans files it never writes");
     cold = false;
   }
 }
@@ -85,7 +95,8 @@ int main(int argc, char **argv) {
         layout.expertsPerToken = 8;
         layout.expertIntermediateSize = 256;
         prepare(backend, root, layout, false);
-        std::cout << "affine preparation: MoE experts, 8-bit router and shared-expert gate, warm admission PASS\n";
+        std::cout << "affine preparation: MoE experts, 8-bit router and shared-expert gate, warm admission, planned "
+                     "weights PASS\n";
         return 0;
       }
       auto layout = tinyLayout<model::Qwen3_8Layout>();
@@ -93,8 +104,8 @@ int main(int argc, char **argv) {
       prepare(backend, root, layout, true);
       // The target loader reads the prepared files as affine Q4 projections of
       // the layout's sizes with bf16 norms.
-      const model::Qwen3_8Weights weights =
-          model::loadQwen3_8Weights(backend, root, layout, model::TargetSource::Affine);
+      model::AffineTargetLoader files(backend, root, layout);
+      const model::Qwen3_8Weights weights = model::loadQwen3_8Weights(backend, layout, files);
       const auto affine = [](const ops::Projection &p, uint32_t n, uint32_t k) {
         return p.layout() == ops::WeightLayout::Affine64 && p.outputSize == n && p.inputSize == k;
       };
@@ -113,19 +124,8 @@ int main(int argc, char **argv) {
                                 layout.packedFullWidth, layout.hiddenSize);
       }
       if (!read) throw std::runtime_error("the target loader misread the prepared affine files");
-      // The model's other prepared files join the target's disk check.
-      const model::PreparedWeight vision{std::string(64, 'a'), UINT64_MAX / 2, "vision/model.bin", std::string(64, 'b'), "/vision"};
-      std::string budget;
-      try {
-        model::AffineTargetLoader loader(backend, root, layout, {}, {&vision, 1});
-      } catch (const std::runtime_error &error) {
-        budget = error.what();
-      }
-      if (!budget.starts_with("not enough disk space to prepare weights: need " +
-                              std::to_string(vision.bytes) + " bytes"))
-        throw std::runtime_error("other prepared files escaped the disk check: " + budget);
-      std::cout << "affine preparation: exact independent fixture, padding, fused order, gate/up, warm admission and "
-                   "model disk budget, target read PASS\n";
+      std::cout << "affine preparation: exact independent fixture, padding, fused order, gate/up, warm admission, "
+                   "planned weights, target read PASS\n";
     } catch (const std::exception &error) {
       std::cerr << error.what() << '\n';
       return 1;

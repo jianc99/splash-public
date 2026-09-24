@@ -215,7 +215,7 @@ struct AffineTargetLoader::Impl {
   PreparedFiles files;
   template<class Layout>
   Impl(metal::MetalBackend &backend, const std::filesystem::path &directory, const Layout &layout,
-       PreparationCheck admitConversion, std::span<const PreparedWeight> alsoPrepared)
+       PreparationCheck admitConversion)
       : backend(backend), source(directory, [&backend] { backend.checkOperation(); }),
         files([&backend] { backend.checkOperation(); }, std::move(admitConversion),
               [this] { source.checkUnchanged(); }) {
@@ -226,7 +226,6 @@ struct AffineTargetLoader::Impl {
       bind(image, source);
       weights.push_back(affine::affineImageWeight(image, directory.string()));
     }
-    files.requireSpace(weights, alsoPrepared);
   }
   WeightFile open(size_t index) {
     const Image &image = images[index];
@@ -236,14 +235,13 @@ struct AffineTargetLoader::Impl {
   }
 };
 AffineTargetLoader::AffineTargetLoader(metal::MetalBackend &backend, const std::filesystem::path &directory,
-                                       const Qwen3_8Layout &layout, PreparationCheck admitConversion,
-                                       std::span<const PreparedWeight> alsoPrepared)
-    : impl_(std::make_unique<Impl>(backend, directory, layout, std::move(admitConversion), alsoPrepared)) {}
+                                       const Qwen3_8Layout &layout, PreparationCheck admitConversion)
+    : impl_(std::make_unique<Impl>(backend, directory, layout, std::move(admitConversion))) {}
 AffineTargetLoader::AffineTargetLoader(metal::MetalBackend &backend, const std::filesystem::path &directory,
-                                       const Qwen3_6MoeLayout &layout, PreparationCheck admitConversion,
-                                       std::span<const PreparedWeight> alsoPrepared)
-    : impl_(std::make_unique<Impl>(backend, directory, layout, std::move(admitConversion), alsoPrepared)) {}
+                                       const Qwen3_6MoeLayout &layout, PreparationCheck admitConversion)
+    : impl_(std::make_unique<Impl>(backend, directory, layout, std::move(admitConversion))) {}
 AffineTargetLoader::~AffineTargetLoader() = default;
+std::span<const PreparedWeight> AffineTargetLoader::weights() const noexcept { return impl_->weights; }
 WeightFile AffineTargetLoader::layer(uint32_t index) {
   if (index >= impl_->images.size() - 2) throw WeightStoreError("target layer is out of range");
   return impl_->open(index);

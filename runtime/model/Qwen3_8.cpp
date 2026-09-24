@@ -31,10 +31,8 @@ void validateLayout(const Qwen3_8Layout &layout) {
 
 } // namespace
 
-Qwen3_8Weights loadQwen3_8Weights(metal::MetalBackend &backend,
-                                  const std::filesystem::path &directory,
-                                  Qwen3_8Layout layout, TargetSource source, PreparationCheck admitConversion,
-                                  std::span<const PreparedWeight> alsoPrepared) {
+Qwen3_8Weights loadQwen3_8Weights(metal::MetalBackend &backend, Qwen3_8Layout layout,
+                                  const QwenTargetFiles<Qwen3_8Layout> &files) {
   validateLayout(layout);
   // The dense FFN reads the same projections from either format.
   const auto readFfn = [&](WeightFile &file, Qwen3_8LayerWeights &layer, const auto &format) {
@@ -45,8 +43,7 @@ Qwen3_8Weights loadQwen3_8Weights(metal::MetalBackend &backend,
     layer.downProjection =
         format.projection(file, layout.hiddenSize, layout.intermediateSize, "mlp-down");
   };
-  return loadQwenTarget<Qwen3_8Weights>(backend, directory, layout, source, std::move(admitConversion),
-                                        alsoPrepared, readFfn, readFfn);
+  return loadQwenTarget<Qwen3_8Weights>(backend, layout, files, readFfn, readFfn);
 }
 
 } // namespace splash::model

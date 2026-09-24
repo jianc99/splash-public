@@ -17,8 +17,7 @@ std::filesystem::path findTargetGguf(const std::filesystem::path &directory) {
 }
 
 GgufTargetLoader::GgufTargetLoader(metal::MetalBackend &backend, const std::filesystem::path &path,
-                                   const gguf::TargetGeometry &geometry, PreparationCheck admitConversion,
-                                   std::span<const PreparedWeight> alsoPrepared)
+                                   const gguf::TargetGeometry &geometry, PreparationCheck admitConversion)
     : backend_(backend), source_(path, [&backend] { backend.checkOperation(); }),
       files_([&backend] { backend.checkOperation(); }, std::move(admitConversion),
              [this] { source_.checkUnchanged(); }) {
@@ -30,7 +29,6 @@ GgufTargetLoader::GgufTargetLoader(metal::MetalBackend &backend, const std::file
     backend.checkOperation();
     weights_.push_back(ggufImageWeight(source_, image));
   }
-  files_.requireSpace(weights_, alsoPrepared);
 }
 
 WeightFile GgufTargetLoader::layer(uint32_t index) {

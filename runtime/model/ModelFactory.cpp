@@ -1,9 +1,10 @@
 #include "ModelFactory.hpp"
 #include "model/AffineTarget.hpp"
 #include "model/GgufTarget.hpp"
-#include <limits>
 
+#include <limits>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <type_traits>
 #include <vector>
@@ -27,6 +28,16 @@ void requireCompatibleModelPackage(const ModelPackage &package) {
 
 namespace {
 
+TargetWeights readTarget(metal::MetalBackend &backend, const Qwen3_8Layout &layout,
+                         const QwenTargetFiles<Qwen3_8Layout> &files) {
+  return loadQwen3_8Weights(backend, layout, files);
+}
+
+TargetWeights readTarget(metal::MetalBackend &backend, const Qwen3_6MoeLayout &layout,
+                         const QwenTargetFiles<Qwen3_6MoeLayout> &files) {
+  return loadQwen3_6MoeWeights(backend, layout, files);
+}
+
 ModelPackage loadPackage(metal::MetalBackend &backend,
                          const std::filesystem::path &root,
                          ModelDescriptor descriptor, PreparationCheck admitConversion = {}) {
@@ -34,25 +45,41 @@ ModelPackage loadPackage(metal::MetalBackend &backend,
   result.descriptor = std::move(descriptor);
   if (!result.descriptor.valid())
     throw std::invalid_argument("model descriptor is invalid");
-  // A vision source is planned first: the target's whole-model disk check
-  // budgets its prepared file together with the target images.
-  std::optional<VisionLoader> vision;
+  const PreparationCheck check = [&backend] { backend.checkOperation(); };
+  // Every prepared file of the model, the vision tower's and the target's, is
+  // planned before the first is written, so one disk check budgets them all.
   std::vector<PreparedWeight> prepared;
+  std::optional<VisionLoader> vision;
   if (result.descriptor.visionSource == VisionSource::Safetensors ||
       result.descriptor.visionSource == VisionSource::Gguf) {
     vision.emplace(root / "vision", result.descriptor.visionSource,
-                   result.descriptor.vision, [&backend] { backend.checkOperation(); }, admitConversion);
+                   result.descriptor.vision, check, admitConversion);
     prepared.push_back(vision->weight());
   }
   result.target = std::visit(
       [&](const auto &layout) -> TargetWeights {
-        if constexpr (std::is_same_v<std::remove_cvref_t<decltype(layout)>,
-                                     Qwen3_8Layout>)
-          return loadQwen3_8Weights(backend, root / "target", layout,
-                                    result.descriptor.targetSource, admitConversion, prepared);
-        else
-          return loadQwen3_6MoeWeights(backend, root / "target", layout,
-                                       result.descriptor.targetSource, admitConversion, prepared);
+        using Layout = std::remove_cvref_t<decltype(layout)>;
+        const std::filesystem::path directory = root / "target";
+        const auto read = [&](const QwenTargetFiles<Layout> &files,
+                              std::span<const PreparedWeight> target) {
+          prepared.insert(prepared.end(), target.begin(), target.end());
+          if (!prepared.empty()) PreparedWeights().requireSpace(prepared, check);
+          return readTarget(backend, layout, files);
+        };
+        switch (result.descriptor.targetSource) {
+        case TargetSource::Packed:
+          return read(PackedTargetFiles<Layout>{backend, directory, layout}, {});
+        case TargetSource::Affine: {
+          AffineTargetLoader loader(backend, directory, layout, admitConversion);
+          return read(loader, loader.weights());
+        }
+        case TargetSource::Gguf: {
+          GgufTargetLoader loader(backend, findTargetGguf(directory), ggufTargetGeometry(layout),
+                                  admitConversion);
+          return read(loader, loader.weights());
+        }
+        }
+        throw std::invalid_argument("unknown target source");
       },
       result.descriptor.target);
   result.draft = loadDFlashDraftWeights(

@@ -43,10 +43,8 @@ void requireLayout(const Qwen3_6MoeLayout &layout) {
 } // namespace
 
 Qwen3_6MoeWeights
-loadQwen3_6MoeWeights(metal::MetalBackend &backend,
-                      const std::filesystem::path &directory,
-                      Qwen3_6MoeLayout layout, TargetSource source, PreparationCheck admitConversion,
-                      std::span<const PreparedWeight> alsoPrepared) {
+loadQwen3_6MoeWeights(metal::MetalBackend &backend, Qwen3_6MoeLayout layout,
+                      const QwenTargetFiles<Qwen3_6MoeLayout> &files) {
   requireLayout(layout);
   // Affine files keep a Q8 router and shared-expert gate and one Q4 slab per
   // expert projection; the shared expert is a one-expert slab.
@@ -80,9 +78,7 @@ loadQwen3_6MoeWeights(metal::MetalBackend &backend,
     ffn.sharedExpertGate = readQuantizedSegment(file, "shared-expert-scalar-gate");
     layer.ffn = std::move(ffn);
   };
-  return loadQwenTarget<Qwen3_6MoeWeights>(backend, directory, layout, source,
-                                           std::move(admitConversion), alsoPrepared, readAffineFfn,
-                                           readBlockFfn);
+  return loadQwenTarget<Qwen3_6MoeWeights>(backend, layout, files, readAffineFfn, readBlockFfn);
 }
 
 } // namespace splash::model

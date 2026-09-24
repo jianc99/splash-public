@@ -5,7 +5,6 @@
 #include "WeightStore.hpp"
 #include "model/AffineTarget.hpp"
 #include "model/GgufTarget.hpp"
-#include "model/PreparedWeights.hpp"
 #include "ops/GDN.hpp"
 #include "ops/ExecutionPlans.hpp"
 #include "ops/Linear.hpp"
@@ -17,6 +16,7 @@
 #include <array>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <initializer_list>
 #include <span>
 #include <string>
@@ -189,33 +189,26 @@ readQwenTargetWeights(metal::MetalBackend &backend, const Layout &layout, Files 
   return result;
 }
 
-// Loads a target from its source: packed files (splash-packed-q4 formats), or
-// an MLX or GGUF source prepared into cached files, whose disk check budgets
-// alsoPrepared, the model's other prepared files, too. The architecture reads
-// its FFN from affine files through readAffineFfn and from GGUF images through
-// readBlockFfn, each called with the file, the layer and the format.
+// The files a target is read from: packed files (splash-packed-q4 formats),
+// or the cached files a loader prepares from an MLX or GGUF source.
+template <class Layout>
+using QwenTargetFiles = std::variant<PackedTargetFiles<Layout>, std::reference_wrapper<AffineTargetLoader>,
+                                     std::reference_wrapper<GgufTargetLoader>>;
+
+// Loads a target from its files. The architecture reads its FFN from affine
+// files through readAffineFfn and from GGUF images through readBlockFfn, each
+// called with the file, the layer and the format.
 template <class Weights, class Layout, class ReadAffineFfn, class ReadBlockFfn>
 [[nodiscard]] Weights
-loadQwenTarget(metal::MetalBackend &backend, const std::filesystem::path &directory,
-               const Layout &layout, TargetSource source, PreparationCheck admitConversion,
-               std::span<const PreparedWeight> alsoPrepared, ReadAffineFfn readAffineFfn,
-               ReadBlockFfn readBlockFfn) {
+loadQwenTarget(metal::MetalBackend &backend, const Layout &layout, const QwenTargetFiles<Layout> &files,
+               ReadAffineFfn readAffineFfn, ReadBlockFfn readBlockFfn) {
+  if (const auto *gguf = std::get_if<std::reference_wrapper<GgufTargetLoader>>(&files))
+    return readQwenTargetWeights<Weights>(backend, layout, gguf->get(), BlockTargetFormat{}, readBlockFfn);
   const AffineTargetFormat affine{backend};
-  switch (source) {
-  case TargetSource::Packed:
-    return readQwenTargetWeights<Weights>(backend, layout, PackedTargetFiles<Layout>{backend, directory, layout},
-                                          affine, readAffineFfn);
-  case TargetSource::Affine: {
-    AffineTargetLoader loader(backend, directory, layout, std::move(admitConversion), alsoPrepared);
-    return readQwenTargetWeights<Weights>(backend, layout, loader, affine, readAffineFfn);
-  }
-  case TargetSource::Gguf: {
-    GgufTargetLoader loader(backend, findTargetGguf(directory), ggufTargetGeometry(layout),
-                            std::move(admitConversion), alsoPrepared);
-    return readQwenTargetWeights<Weights>(backend, layout, loader, BlockTargetFormat{}, readBlockFfn);
-  }
-  }
-  throw WeightStoreError("unknown target source");
+  if (const auto *mlx = std::get_if<std::reference_wrapper<AffineTargetLoader>>(&files))
+    return readQwenTargetWeights<Weights>(backend, layout, mlx->get(), affine, readAffineFfn);
+  return readQwenTargetWeights<Weights>(backend, layout, std::get<PackedTargetFiles<Layout>>(files), affine,
+                                        readAffineFfn);
 }
 
 // Runtime-visible tensor geometry shared by the supported Qwen hybrid
