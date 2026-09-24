@@ -544,6 +544,43 @@ class UpstreamTest(unittest.TestCase):
         self.assertNotIn(f"{upstream.DRAFTS}/{DENSE.name}/model.bin", hub.downloads)
         self.assertEqual(self.pins(), sorted(["b" * 40, DENSE.draft.revision]))
 
+    def test_publishing_removes_what_no_installation_uses(self):
+        hub = self.fake_hub()
+        args = arguments(self.root)
+        root = models.installed_root(args.models, MODEL, language_only=True)
+        self.prepare(args)
+        first = root.resolve()
+        # A server holds the assembly it serves.
+        server = (first / "model.json").open("rb")
+        self.addCleanup(server.close)
+        fcntl.flock(server, fcntl.LOCK_SH)
+        # Staging an interrupted installation left behind.
+        stale = [
+            args.models / ".resolved/.loading-x",
+            args.models / ".metadata/.loading-y",
+            args.models / "mlx-community/.prepare-Qwen3.8-27B-4bit-z",
+            args.models / ".selections/.retired-w",
+        ]
+        for path in stale:
+            path.mkdir(parents=True)
+        hub.publish(MODEL, "b" * 40, lambda p: mlx_target(p, DENSE))
+        self.prepare(args)
+        second = root.resolve()
+        self.assertEqual(
+            sorted(p.name for p in (args.models / ".resolved").iterdir()),
+            sorted([first.name, second.name]),
+        )
+        self.assertFalse(any(path.exists() for path in stale))
+        # Released by its server and linked by no selection, it goes next.
+        server.close()
+        hub.publish(MODEL, "c" * 40, lambda p: mlx_target(p, DENSE))
+        self.prepare(args)
+        self.assertEqual(
+            [p.name for p in (args.models / ".resolved").iterdir()],
+            [root.resolve().name],
+        )
+        upstream.verify(root)
+
     def test_unreachable_hub_starts_the_installed_assembly(self):
         hub = self.fake_hub()
         args = arguments(self.root)

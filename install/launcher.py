@@ -172,8 +172,13 @@ def serve(args):
         root = model_artifacts.installed_root(paths.MODELS, args.model, **selection)
         if (root / "model.json").is_file():
             # A concurrent install may advance the selection link. Keep this
-            # process's tokenizer, draft and target on one immutable assembly.
+            # process's tokenizer, draft and target on one immutable assembly,
+            # held until the server exits: installations remove only
+            # assemblies no selection links and no server holds.
             root = root.resolve(strict=True)
+            assembly = (root / "model.json").open("rb")
+            fcntl.flock(assembly, fcntl.LOCK_SH)
+            os.set_inheritable(assembly.fileno(), True)
         command = [
             str(paths.PYTHON),
             "-u",

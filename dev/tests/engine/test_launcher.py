@@ -758,6 +758,38 @@ class LauncherTests(unittest.TestCase):
                 ("prepare", MODEL_ID, "v2", True, selection["draft_model"]),
             )
 
+    def test_server_holds_the_assembly_it_serves(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = Path(temporary)
+            assembly = runtime / "models/.resolved/assembly"
+            assembly.mkdir(parents=True)
+            (assembly / "model.json").write_text("{}")
+            selection = runtime / "models/owner/model"
+            selection.parent.mkdir()
+            selection.symlink_to(assembly)
+            held = []
+
+            def execute(program, argv, environment):
+                # Installations remove no assembly a server holds.
+                with (assembly / "model.json").open("rb") as record:
+                    try:
+                        fcntl.flock(record, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        held.append(argv[3])
+
+            with (
+                mock.patch.object(launcher, "RUNTIME_DIR", runtime),
+                mock.patch.object(launcher.socket, "socket"),
+                mock.patch.object(launcher.catalog, "spawn_refresh"),
+                mock.patch.object(launcher, "_ensure_installed"),
+                mock.patch.object(
+                    launcher.model_artifacts, "installed_root", return_value=selection
+                ),
+                mock.patch.object(launcher.os, "execve", side_effect=execute),
+            ):
+                launcher.main(["serve", "--model", MODEL_ID])
+            self.assertEqual(held, [str(assembly.resolve() / "target")])
+
     def test_relative_draft_directory_is_resolved_for_the_installer(self):
         with (
             tempfile.TemporaryDirectory() as temporary,

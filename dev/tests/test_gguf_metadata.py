@@ -363,6 +363,11 @@ class GgufMetadataTests(unittest.TestCase):
             gguf, "Metadata", side_effect=AssertionError("reparsed")
         ):
             self.assertEqual(self.derived(cache, path), (key, files))
+            # The entry is keyed by content: the same file elsewhere shares it.
+            copy = self.root / "elsewhere/model.gguf"
+            copy.parent.mkdir()
+            shutil.copyfile(path, copy)
+            self.assertEqual(self.derived(cache, copy), (key, files))
         # A damaged entry is derived again, not left to block installation.
         for damage in (
             lambda: files["tokenizer/tokenizer.json"].write_text("corrupt"),
@@ -528,3 +533,7 @@ class GgufMetadataTests(unittest.TestCase):
         rebuilt = upstream.verify(root)["metadata"]
         self.assertNotEqual(rebuilt, installed)
         self.assertEqual((root / "config.json").resolve().parent.name, rebuilt)
+        # The entry no assembly links any more is removed.
+        self.assertEqual(
+            [p.name for p in (args.models / ".metadata").iterdir()], [rebuilt]
+        )

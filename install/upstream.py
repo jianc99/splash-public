@@ -13,6 +13,7 @@ repository names play no part.
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
@@ -724,6 +725,7 @@ def _install(args, repo, variant, models_root, root, installed):
         destination = _publish(models_root, record, files)
         models.install_snapshot(destination, root)
         models.retire_refs(refs)
+        _collect_garbage(models_root)
 
 
 def _draft_identity(family):
@@ -806,6 +808,46 @@ def _publish(models_root, record, files):
     return destination
 
 
+def _collect_garbage(models_root):
+    """Remove what no installation uses: assemblies that no selection links
+    and no server holds (the launcher holds a shared lock on the model.json
+    of the assembly it serves), metadata entries the others do not link, and
+    staging an interrupted installation left. Call it under the installation
+    lock, where all of these are written."""
+    resolved, derived = models_root / ".resolved", models_root / ".metadata"
+    linked = {link.resolve() for link in models_root.glob("*/*") if link.is_symlink()}
+    used = set()
+    for assembly in sorted(resolved.iterdir()) if resolved.is_dir() else ():
+        if assembly not in linked and not _held(assembly):
+            shutil.rmtree(assembly)
+            continue
+        try:
+            files = models.read_json(assembly / "model.json").get("files")
+        except models.ModelError:
+            continue
+        for entry in files.values() if isinstance(files, dict) else ():
+            path = Path(entry.get("path", "")) if isinstance(entry, dict) else None
+            if path and path.is_relative_to(derived):
+                used.add(path.relative_to(derived).parts[0])
+    for entry in sorted(derived.iterdir()) if derived.is_dir() else ():
+        if entry.name not in used:
+            shutil.rmtree(entry)
+    for stage in (*models_root.glob("*/.prepare-*"), *models_root.glob("*/.retired-*")):
+        shutil.rmtree(stage)
+
+
+def _held(assembly):
+    """Whether a server holds the assembly's model.json."""
+    try:
+        with (assembly / "model.json").open("rb") as record:
+            fcntl.flock(record, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
 def _snapshot_of(path):
     """The Hub snapshot folder a cached file belongs to; None for local files."""
     for parent in Path(path).absolute().parents:
@@ -844,8 +886,9 @@ def _metadata_key(sources):
     """The .metadata entry this adapter derives from the source file records."""
     from importlib.metadata import version
 
+    # Content identity: the same file at another path or time is the same.
     identity = {
-        "sources": sources,
+        "sources": [{"bytes": s["bytes"], "digest": s["digest"]} for s in sources],
         "adapter": models.sha256(Path(gguf.__file__)),
         "tokenizers": version("tokenizers"),
     }
