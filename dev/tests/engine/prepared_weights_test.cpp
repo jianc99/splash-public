@@ -9,6 +9,7 @@
 #include <array>
 #include <cerrno>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <stdexcept>
 #include <vector>
@@ -153,8 +154,26 @@ int main() {
     }
     static_cast<void>(store.prepare({key(2), bytes.size()}, write));
     require(builds == 4, "damaged proof forced an unnecessary rebuild");
+    // Publishing an entry removes the earlier preparations of its component
+    // from the same source data, and the entries earlier versions prepared
+    // from its source path; others stay.
+    const PreparedWeight older{key(30), bytes.size(), "target/layer-0.bin", key(40), "/models/a"};
+    const PreparedWeight otherData{key(31), bytes.size(), "target/layer-0.bin", key(41), "/models/b"};
+    const PreparedWeight otherComponent{key(32), bytes.size(), "target/head.bin", key(40), "/models/a"};
+    for (const auto &weight : {older, otherData, otherComponent}) static_cast<void>(store.prepare(weight, write));
+    std::filesystem::create_directory(root / key(33));
+    std::ofstream(root / key(33) / "source") << "/models/a\nhead.bin\n";
+    std::filesystem::create_directory(root / key(34));
+    std::ofstream(root / key(34) / "source") << "/models/c\nhead.bin\n";
+    static_cast<void>(store.prepare({key(35), bytes.size(), "target/layer-0.bin", key(40), "/models/a"}, write));
+    require(!std::filesystem::exists(root / key(30)) && !std::filesystem::exists(root / key(33)) &&
+                std::filesystem::exists(root / key(31)) && std::filesystem::exists(root / key(32)) &&
+                std::filesystem::exists(root / key(34)) && std::filesystem::exists(root / key(35)) &&
+                std::filesystem::exists(root / key(1)),
+            "superseded entries were kept or others removed");
     std::filesystem::remove_all(root);
-    std::cout << "prepared weights: content, reuse, corruption, interruption, pressure and concurrency PASS\n";
+    std::cout << "prepared weights: content, reuse, corruption, interruption, pressure, concurrency and "
+                 "superseded entries PASS\n";
   } catch (const std::exception &error) {
     std::cerr << error.what() << '\n';
     std::filesystem::remove_all(root);

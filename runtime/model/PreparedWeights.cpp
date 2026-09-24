@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <fstream>
 #include <thread>
 #include <cerrno>
 #include <cstdlib>
@@ -170,6 +171,47 @@ std::string verifiedDigest(int fd, uint64_t from, const std::filesystem::path &p
   return digest;
 }
 
+// What an entry records in its source file: the component, the digest of the
+// source data it was written from and the source path. Entries of earlier
+// versions recorded only the source path and the file name.
+constexpr std::string_view kProvenance = "splash-prepared-weight-v1";
+
+std::string provenance(const PreparedWeight &weight) {
+  std::ostringstream text;
+  text << kProvenance << "\ncomponent " << weight.component << "\ninputs " << weight.inputs << "\nsource "
+       << weight.source << '\n';
+  return text.str();
+}
+
+// Whether the entry at `directory` is an earlier preparation of what weight
+// holds: the same component from the same source data under another key (a
+// new preparation identity or plan), or an entry of an earlier version
+// prepared from the same source path.
+bool supersedes(const PreparedWeight &weight, const std::filesystem::path &directory) {
+  std::ifstream stream(directory / "source");
+  std::vector<std::string> lines;
+  for (std::string line; lines.size() < 5 && std::getline(stream, line);) lines.push_back(line);
+  if (lines.size() == 4 && lines[0] == kProvenance)
+    return !weight.component.empty() && lines[1] == "component " + weight.component &&
+           lines[2] == "inputs " + weight.inputs;
+  return lines.size() == 2 && !weight.source.empty() && lines[0] == weight.source;
+}
+
+// Removes a complete entry. Its directory is first renamed to staging, which
+// any converter reclaims if the removal is interrupted; a process mapping
+// its file keeps the file until it unmaps it.
+void removeEntry(const std::filesystem::path &root, const std::filesystem::path &directory) {
+  struct stat state{};
+  const bool hashed = !stat((directory / "weights").c_str(), &state);
+  const auto staging = root / (directory.filename().string() + ".partial");
+  std::error_code error;
+  std::filesystem::remove_all(staging, error);
+  std::filesystem::rename(directory, staging, error);
+  if (error) return;
+  std::filesystem::remove_all(staging, error);
+  if (hashed) unlink((root / "verified" / verificationKey(state, 0)).c_str());
+}
+
 bool complete(const std::filesystem::path &directory, uint64_t bytes,
               const PreparationCheck &check) {
   const int input = open((directory / "weights").c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
@@ -284,14 +326,18 @@ void WeightSource::checkUnchanged() const {
 WeightIdentity &WeightIdentity::input(const WeightSource &source, uint64_t dataOffset, uint64_t offset,
                                       uint64_t bytes, std::string_view type, std::span<const uint64_t> shape) {
   if (offset < dataOffset) throw std::invalid_argument("source tensor precedes its file's tensor data");
-  text_ << "input " << source.digest(dataOffset) << ' ' << offset - dataOffset << ' ' << bytes << ' ' << type;
+  const std::string &digest = source.digest(dataOffset);
+  digests_.insert(digest);
+  text_ << "input " << digest << ' ' << offset - dataOffset << ' ' << bytes << ' ' << type;
   for (uint64_t dimension : shape) text_ << ' ' << dimension;
   text_ << '\n';
   return *this;
 }
 
 PreparedWeight WeightIdentity::weight(uint64_t bytes, std::string component, std::string source) const {
-  return {weightDigest(text_.str()), bytes, std::move(component), std::move(source)};
+  std::string inputs;
+  for (const auto &digest : digests_) inputs += digest;
+  return {weightDigest(text_.str()), bytes, std::move(component), weightDigest(inputs), std::move(source)};
 }
 
 PreparedWeights::PreparedWeights() : root_(cacheRoot()) {}
@@ -387,9 +433,9 @@ std::filesystem::path PreparedWeights::prepare(const PreparedWeight &weight, con
     Descriptor manifest(open((staging / "sha256").c_str(), O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0400));
     writeWeightBytes(manifest, 0, {reinterpret_cast<const uint8_t *>(digest.data()), digest.size()});
     if (fsync(manifest)) fail("flush prepared weight digest");
-    if (!weight.source.empty()) {
+    {
       Descriptor origin(open((staging / "source").c_str(), O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0400));
-      const auto description = weight.source + "\n" + weight.component + "\n";
+      const auto description = provenance(weight);
       writeWeightBytes(origin, 0, {reinterpret_cast<const uint8_t *>(description.data()), description.size()});
       if (fsync(origin)) fail("flush prepared weight source");
     }
@@ -403,6 +449,14 @@ std::filesystem::path PreparedWeights::prepare(const PreparedWeight &weight, con
     std::error_code ignored;
     std::filesystem::remove_all(staging, ignored);
     throw;
+  }
+  // Still under the converter lock, which every writer holds.
+  std::error_code error;
+  for (const auto &entry : std::filesystem::directory_iterator(root_, error)) {
+    const auto name = entry.path().filename().string();
+    if (name != key && name.size() == 64 && name.find_first_not_of("0123456789abcdef") == name.npos &&
+        supersedes(weight, entry.path()))
+      removeEntry(root_, entry.path());
   }
   if (!weight.component.empty()) {
     const auto seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();

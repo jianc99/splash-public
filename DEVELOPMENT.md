@@ -281,28 +281,40 @@ without requantization. GDN decay is computed as `float(-exp(double(A_log)))`;
 older packages produced using MLX's float exponential may differ by a few float
 ULPs in this small vector. The existing inference kernels are unchanged.
 
-Target and vision source adapters use `PreparedWeights`. Its default cache is
-`~/Library/Caches/Splash/weights`; `SPLASH_WEIGHT_CACHE` overrides that location.
-Preparation costs an additional on-disk copy of the prepared target and vision tensors. Existing
-packed artifacts are used directly. Source-content hashes, a build-generated fingerprint of preparation code and its
-storage ABI, and transformation parameters identify the cache. An MLX vision artifact hashes
-`config.json` and only the shards holding `vision_tower.*`. Changing that
-code invalidates its artifacts automatically; unrelated app releases, core
-counts and support-asset updates do not. Completed files are read-only.
+Target and vision source adapters use `PreparedWeights`. Its cache is
+`~/Library/Caches/Splash/weights`, or the directory `SPLASH_WEIGHT_CACHE` names;
+nothing else selects it. Preparing a model needs free disk space for about the
+model's size again, its prepared target and vision tensors, plus a 2 GiB reserve;
+packed artifacts are used directly. A prepared file's key hashes its adapter's
+preparation identity, its plan, and the bytes, type and shape of every source tensor
+it reads, located and hashed within its file's tensor data: an edit to a source's
+metadata only (a GGUF chat template, a safetensors header), `config.json` or files
+the component does not read keeps every key. The preparation identity is a
+build-generated fingerprint of only the code that writes the bytes
+(`dev/tools/weight_preparation_identity.py`); inference, parser, planner and reader
+changes keep it, and golden hashes of prepared fixtures fail the tests when bytes
+change without it. Completed files are read-only.
 One writer per cache serializes conversion; complete cache hits bypass this lock.
 Interruption, disk-full errors and memory-pressure rejection cannot publish partial
 files. Before conversion, the adapters validate the whole source and budget every
-missing target and vision artifact plus a 2 GiB disk reserve. Each output's disk space is preallocated
+missing target and vision artifact plus the disk reserve. Each output's disk space is preallocated
 before writing. Concurrent external disk activity can still exhaust the volume;
 write errors leave no published partial artifact. Retrying removes abandoned writes
 under the converter lock and reuses previously completed layers.
 
-Cold preparation reports each artifact's progress. Each new cache entry records
-its source path and artifact name in `source`. There is no automatic eviction:
-completed entries can be shared by installations and pinned source revisions.
-With Splash stopped, unused entry directories can be deleted; deleting the whole
-cache causes preparation at the next load. Uninstalling one model does
-not delete possibly shared prepared weights.
+Cold preparation reports each artifact's progress. Each entry records in `source`
+its component (such as `target/layer-0.bin`), the digest of the source data it was
+written from and the source path. Publishing an entry removes the complete entries
+it supersedes: the same component from the same source data under another key, which
+an earlier preparation identity wrote, and entries of earlier Splash versions prepared
+from the same source path. Entries of other sources or revisions, which installations
+may share, stay. Removal happens under the converter lock, so no entry being written is
+touched, and a running process keeps the files it has mapped until it unmaps them. Two
+builds of different preparation identities sharing one cache supersede each other's
+entries at every start; give a development build its own `SPLASH_WEIGHT_CACHE`. With
+Splash stopped, other entry directories can be deleted; deleting the whole cache
+causes preparation at the next load. Uninstalling a model does not delete possibly
+shared prepared weights.
 
 Cold source hashing and output validation stream bounded buffers. Unchanged
 files reuse a digest proof tied to device, inode, size, birth time, mtime and ctime;

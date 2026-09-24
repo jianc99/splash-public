@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <set>
 #include <span>
 #include <sstream>
 #include <string>
@@ -24,11 +25,14 @@ enum class TargetSource : uint8_t { Packed, Affine, Gguf };
 using PreparationCheck = std::function<void()>;
 
 // A prepared file: its cache key and size, the component it is (such as
-// target/layer-0.bin) and the source it is prepared from.
+// target/layer-0.bin), the digest of the source data it is written from and
+// where that source is. An entry of the same component and inputs under
+// another key is an earlier preparation, which publishing this one removes.
 struct PreparedWeight {
   std::string key;
   uint64_t bytes;
   std::string component{};
+  std::string inputs{};
   std::string source{};
 };
 
@@ -86,6 +90,7 @@ public:
   [[nodiscard]] PreparedWeight weight(uint64_t bytes, std::string component, std::string source) const;
 private:
   std::ostringstream text_;
+  std::set<std::string> digests_;
 };
 
 // The callbacks of one load. check runs throughout (cancellation, memory
