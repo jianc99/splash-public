@@ -205,7 +205,7 @@ moeDecodeSimdgroups(uint32_t appleGpuFamily) noexcept {
 
 // The expert tile of GGUF plans, which run three grouped passes (gate, up
 // with silu(gate), down) over the GGUF image: the half-staged tiles of
-// kernels/shared/gguf_linear.metal, or Register, the exact register tile of
+// kernels/shared/moe_gguf.metal, or Register, the exact register tile of
 // kernels/decode/linear_gguf_sgmatrix.metal over Table16 tiles of the
 // grouped rows (8-row tiles only). Apple9 runs Register in both phases. In
 // decode, as its dense GGUF projections do (LinearGguf.cpp): its matrix

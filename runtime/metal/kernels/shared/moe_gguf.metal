@@ -35,7 +35,8 @@ inline void moe_gguf_expert_tile(device bfloat *input, device const MoeTileDescr
     staged_accumulate_any<R, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP>(s.format, x, s.w0, s.w1, s.meta, p.input_size, origin, my, tl, simd_lane, 0,
                                             p.input_size / GGUF_STAGED_STEP, acc);
     gguf_elements(acc, [&](uint row, uint column, float v) {
-      const ulong o = out + ulong(row) * p.output_size + origin + column;   // gguf_epilogue inline, as above
+      // gguf_epilogue inline: calling it here reorders the lambda's captures.
+      const ulong o = out + ulong(row) * p.output_size + origin + column;
       if constexpr (Ep == EpUpWithGate) v = float(bfloat(v)) * gguf_silu(float(aux[o]));
       output[o] = bfloat(v);
     });

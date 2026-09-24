@@ -1,11 +1,12 @@
 #pragma once
 #include "metal/kernels/common/quant_formats.h"
 
-// The staged kernels' dequantization (kernels/shared/gguf_linear.metal), shared
-// with the dequantization test. Includers set `#pragma clang fp
+// The staged kernels' dequantization (kernels/shared/gguf_linear.metal and
+// kernels/shared/moe_gguf.metal, through kernels/common/gguf_staged_tile.h),
+// shared with the dequantization test. Includers set `#pragma clang fp
 // reassociate(off)` first, so the source order of float operations holds here.
-// ---- staged dequantization (kernels/common/quant_formats.h): one thread writes one column's group of 32 as half,
-// each value rounded once; chunk c's pairs 0, 1 go to dst + 4c and pairs 2, 3 to dst + 16 + 4c.
+// One thread writes one column's group of 32 (kernels/common/quant_formats.h) as half, each value rounded once;
+// chunk c's pairs 0, 1 go to dst + 4c and pairs 2, 3 to dst + 16 + 4c.
 template <class F>
 inline half2 staged_linear(uint pair, float s, float m) {
   // 0x6400 is half 1024, whose ulp is 1: or-ing a code into its mantissa makes 1024 + code, exactly.

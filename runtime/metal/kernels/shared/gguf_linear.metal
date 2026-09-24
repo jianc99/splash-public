@@ -9,13 +9,6 @@
 #include "metal/kernels/common/gguf_staged_tile.h"
 #include "metal/kernels/common/split_reduce.h"
 
-// ---------------- decode tiles: each simdgroup stages its own columns privately and runs matmul2d alone.
-// MPP computes 16-row fragments, so a tile holds 8, 16 or 32 rows: a 3-lane step runs the 32-row tile over the storage
-// of four lanes (LinearPlan::storageRows) and the padding lane's rows are computed and discarded. Rows are independent,
-// so every active row is the bits of any other tile height (gguf-projection full); on a 16-core M5 Pro the 32-row tile
-// at three lanes costs what it costs at four, 3-15% less than a 16-row plus an 8-row matmul per stage (0.207 vs 0.218 ms,
-// Q4_K 12288 x 5120, DRAM-cold; 20-core: 0.173 vs 0.203).
-
 // A tile's sums over every K partition, handed to store(row, column, sum). One partition stores its own; more publish
 // fp32 partials [split][Rows][destination column] (kernels/common/split_reduce.h) and the last arriving partition adds
 // them in split order. `column0` is the simdgroup's first destination column, `counter` its threadgroup's (one per 64
@@ -43,6 +36,8 @@ inline void gguf_prefill_tile(device bfloat *input, device uchar *w0, device uch
                     uint output_size, uint input_size, uint output_origin, uint rows, threadgroup half *stage,
                     threadgroup half2 *tl, uint simd_lane, uint simd_group, uint out_stride = 0, uint out_offset = 0,
                     device bfloat *aux = nullptr) {
+  // 0 = output_size (Gguf.h). The host always passes the stride, but dropping the fallback changes these kernels'
+  // code, a change to measure on its own.
   if (out_stride == 0) out_stride = output_size;
   const bool owns_rows = simd_group * RowsPerSG < rows;   // uniform per simdgroup
   // Prefetch: the steps whose weights are loaded ahead of the one being staged.
@@ -119,6 +114,12 @@ constant constexpr uint kPrefillStages = 2 * GGUF_TILE_COLUMNS * GGUF_PREFILL_ST
 
 // ---------------- decode dispatches over (64-column tiles, K partitions): two simdgroups of 32 columns per
 // threadgroup, every request lane in its tile, `splits` partitions of K (grid.y; kernels/common/split_reduce.h).
+// MPP computes 16-row fragments, so a tile holds 8, 16 or 32 rows (these kernels and the fused ones): a 3-lane step
+// runs the 32-row tile over the storage of four lanes (LinearPlan::storageRows) and the padding lane's rows are
+// computed and discarded. Rows are independent, so every active row is the bits of any other tile height
+// (gguf-projection full); on a 16-core M5 Pro the 32-row tile at three lanes costs what it costs at four, 3-15% less
+// than a 16-row plus an 8-row matmul per stage (0.207 vs 0.218 ms, Q4_K 12288 x 5120, DRAM-cold; 20-core: 0.173 vs
+// 0.203).
 // Gate/up runs as a gate pass (a) into the gate scratch and an up pass (g) whose epilogue applies silu(gate) to the bf16
 // up value, as the Apple9 register kernels do.
 template <class F, ushort Rows, GgufEpilogue Ep>
