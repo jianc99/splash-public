@@ -247,6 +247,16 @@ void ggufMoePlans() {
       for (const MoePlan &candidate : plans.moeCandidates({shape, rows, MoePhase::Prefill}))
         require(candidate.configuration() == plan.configuration(), "GGUF MoE prefill candidate is not the device's plan");
     }
+    // The prefill bound holds the device's plans and nothing else: on Apple9
+    // the register tile's 8-row tiles (20480 grouped rows at 2048 rows), not
+    // the staged 32-row tiles it never runs (26624).
+    MoeWorkspace devicePlans;
+    for (uint32_t rows = 1; rows <= 2048; ++rows) {
+      const MoeWorkspace workspace = plans.moePrefill(shape, rows).workspace();
+      for (const auto field : kMoeWorkspaceFields) devicePlans.*field = std::max(devicePlans.*field, workspace.*field);
+    }
+    require(plans.moePrefillWorkspace(shape, 2048) == devicePlans,
+            "GGUF MoE prefill bound is not the bound of the device's plans");
   }
   // The register tile reads GGUF 8-row tiles only.
   rejects([&] { (void)MoE::decodePlan(routedShape, 1, {MoeExpertTile::M8, kMoeRouteWideRows,
