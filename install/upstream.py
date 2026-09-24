@@ -76,7 +76,7 @@ FAMILIES = (
             ("num_experts", 256),
             ("num_experts_per_tok", 8),
         ),
-        Draft(None, 6),
+        Draft("b36f132a9c832599c6d08a1443cb8bbe4c2ac6cb", 6),
     ),
 )
 TOKENIZER_FILES = (

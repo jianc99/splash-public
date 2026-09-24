@@ -356,7 +356,8 @@ class GgufMetadataTests(unittest.TestCase):
                     source, "download", wraps=source.download
                 ) as download:
                     upstream.prepare(args, repo=source)
-                resolve.assert_called_once_with(upstream.DRAFTS, None)
+                (moe,) = (f for f in upstream.FAMILIES if f.name == "Qwen3.6-35B-A3B")
+                resolve.assert_called_once_with(upstream.DRAFTS, moe.draft.revision)
                 expected = {"model-Q4_K_M.gguf"} | (
                     set() if language_only else {"mmproj-F32.gguf"}
                 )
