@@ -271,16 +271,6 @@ $(TEST_CACHE_TEST): runtime/engine/KvPool.cpp \
 		dev/tests/engine/cache_test.cpp | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) -o $@
 
-$(TEST_KV_FIRST_ENGINE_TEST): runtime/engine/Scheduler.cpp \
-		runtime/model/DraftContextPlan.cpp \
-		runtime/engine/KvPool.cpp \
-		runtime/engine/KvCache.cpp \
-		runtime/engine/StateCache.cpp \
-		runtime/engine/Cache.cpp \
-		runtime/engine/Engine.cpp \
-		dev/tests/engine/kv_first_engine_test.cpp | $(ENGINE_TEST_BUILD)
-	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) -o $@
-
 $(TEST_KV_FIRST_CACHE_TEST): runtime/engine/KvPool.cpp \
 		runtime/engine/KvCache.cpp \
 		runtime/engine/StateCache.cpp \
@@ -300,13 +290,6 @@ $(TEST_NATIVE_LOOP_TEST): $(BACKEND_CONTROL_SOURCES) \
 		runtime/engine/Protocol.cpp \
 		runtime/engine/NativeRuntime.cpp \
 		dev/tests/engine/native_engine_loop_test.cpp | $(ENGINE_TEST_BUILD)
-	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) -o $@
-
-$(TEST_FD_TRANSPORT_TEST): $(BACKEND_CONTROL_SOURCES) \
-		runtime/engine/Protocol.cpp \
-		runtime/engine/NativeRuntime.cpp \
-		runtime/engine/FdTransport.cpp \
-		dev/tests/engine/native_fd_transport_test.cpp | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) -o $@
 
 $(TEST_BOOTSTRAP_TEST): dev/tests/engine/runtime_bootstrap_test.mm \
@@ -406,14 +389,6 @@ $(TEST_OPERATOR_WORKSPACE): dev/tests/engine/operator_workspace_test.cc \
 		$(ENGINE_LIBRARY) | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $< $(ENGINE_LIBRARY) \
 		$(ENGINE_LINKFLAGS) -o $@
-
-$(TEST_OPERATOR_TUNING): dev/tuning/Tuning.cpp \
-		dev/tests/engine/operator_tuning_test.cpp | $(ENGINE_TEST_BUILD)
-	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) -o $@
-
-$(TEST_OPERATOR_MEASUREMENT): dev/tuning/Tuning.cpp dev/tuning/Measurement.cpp \
-		dev/tests/engine/operator_measurement_test.cpp | $(ENGINE_TEST_BUILD)
-	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) -o $@
 
 $(TEST_EXECUTION_PLANS): dev/tests/engine/execution_plans_test.cc \
 		$(ENGINE_LIBRARY) | $(ENGINE_TEST_BUILD)
@@ -685,66 +660,44 @@ benchmark-attention-sweep: $(TEST_ATTENTION_SWEEP) $(LIB)
 benchmark-backend: preflight $(TARGET) $(TEST_BACKEND_BENCHMARK) $(LIB)
 	$(TEST_BACKEND_BENCHMARK) $(LIB) $(MODEL_ROOT)
 
-$(TEST_BACKEND_ASAN): $(BACKEND_CONTROL_SOURCES) \
-		dev/tests/engine/kv_first_engine_test.cpp | $(ENGINE_SANITIZER_BUILD)
-	$(RUN_CONFIGURED) $(CXX) $(ENGINE_SANITIZER_CXXFLAGS) -fsanitize=address,undefined \
-		$(TEST_INPUTS) -o $@
-
-$(TEST_BACKEND_TSAN): $(BACKEND_CONTROL_SOURCES) \
-		dev/tests/engine/kv_first_engine_test.cpp | $(ENGINE_SANITIZER_BUILD)
-	$(RUN_CONFIGURED) $(CXX) $(ENGINE_SANITIZER_CXXFLAGS) -fsanitize=thread $(TEST_INPUTS) -o $@
-
-$(TEST_FD_TRANSPORT_ASAN): $(BACKEND_CONTROL_SOURCES) \
+# CPU tests that also run under the sanitizers: each is built three times
+# from the same sources.
+$(TEST_KV_FIRST_ENGINE_TEST) $(TEST_BACKEND_ASAN) $(TEST_BACKEND_TSAN): \
+		$(BACKEND_CONTROL_SOURCES) \
+		dev/tests/engine/kv_first_engine_test.cpp
+$(TEST_FD_TRANSPORT_TEST) $(TEST_FD_TRANSPORT_ASAN) $(TEST_FD_TRANSPORT_TSAN): \
+		$(BACKEND_CONTROL_SOURCES) \
 		runtime/engine/Protocol.cpp \
 		runtime/engine/NativeRuntime.cpp \
 		runtime/engine/FdTransport.cpp \
-		dev/tests/engine/native_fd_transport_test.cpp | $(ENGINE_SANITIZER_BUILD)
-	$(RUN_CONFIGURED) $(CXX) $(ENGINE_SANITIZER_CXXFLAGS) -fsanitize=address,undefined \
+		dev/tests/engine/native_fd_transport_test.cpp
+$(TEST_OPERATOR_TUNING) $(TEST_OPERATOR_TUNING_ASAN) $(TEST_OPERATOR_TUNING_TSAN): \
+		dev/tuning/Tuning.cpp \
+		dev/tests/engine/operator_tuning_test.cpp
+$(TEST_OPERATOR_MEASUREMENT) $(TEST_OPERATOR_MEASUREMENT_ASAN) $(TEST_OPERATOR_MEASUREMENT_TSAN): \
+		dev/tuning/Tuning.cpp dev/tuning/Measurement.cpp \
+		dev/tests/engine/operator_measurement_test.cpp
+
+$(TEST_KV_FIRST_ENGINE_TEST) $(TEST_FD_TRANSPORT_TEST) $(TEST_OPERATOR_TUNING) \
+		$(TEST_OPERATOR_MEASUREMENT): | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) -o $@
+
+$(filter %-asan-ubsan,$(SANITIZER_CONFIG_TARGETS)): SANITIZERS := address,undefined
+$(filter %-tsan,$(SANITIZER_CONFIG_TARGETS)): SANITIZERS := thread
+$(SANITIZER_CONFIG_TARGETS): | $(ENGINE_SANITIZER_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_SANITIZER_CXXFLAGS) -fsanitize=$(SANITIZERS) \
 		$(TEST_INPUTS) -o $@
-
-$(TEST_FD_TRANSPORT_TSAN): $(BACKEND_CONTROL_SOURCES) \
-		runtime/engine/Protocol.cpp \
-		runtime/engine/NativeRuntime.cpp \
-		runtime/engine/FdTransport.cpp \
-		dev/tests/engine/native_fd_transport_test.cpp | $(ENGINE_SANITIZER_BUILD)
-	$(RUN_CONFIGURED) $(CXX) $(ENGINE_SANITIZER_CXXFLAGS) -fsanitize=thread $(TEST_INPUTS) -o $@
-
-$(TEST_OPERATOR_TUNING_ASAN): dev/tuning/Tuning.cpp \
-		dev/tests/engine/operator_tuning_test.cpp | $(ENGINE_SANITIZER_BUILD)
-	$(RUN_CONFIGURED) $(CXX) $(ENGINE_SANITIZER_CXXFLAGS) -fsanitize=address,undefined \
-		$(TEST_INPUTS) -o $@
-
-$(TEST_OPERATOR_TUNING_TSAN): dev/tuning/Tuning.cpp \
-		dev/tests/engine/operator_tuning_test.cpp | $(ENGINE_SANITIZER_BUILD)
-	$(RUN_CONFIGURED) $(CXX) $(ENGINE_SANITIZER_CXXFLAGS) -fsanitize=thread $(TEST_INPUTS) -o $@
-
-$(TEST_OPERATOR_MEASUREMENT_ASAN): dev/tuning/Tuning.cpp dev/tuning/Measurement.cpp \
-		dev/tests/engine/operator_measurement_test.cpp | $(ENGINE_SANITIZER_BUILD)
-	$(RUN_CONFIGURED) $(CXX) $(ENGINE_SANITIZER_CXXFLAGS) -fsanitize=address,undefined \
-		$(TEST_INPUTS) -o $@
-
-$(TEST_OPERATOR_MEASUREMENT_TSAN): dev/tuning/Tuning.cpp dev/tuning/Measurement.cpp \
-		dev/tests/engine/operator_measurement_test.cpp | $(ENGINE_SANITIZER_BUILD)
-	$(RUN_CONFIGURED) $(CXX) $(ENGINE_SANITIZER_CXXFLAGS) -fsanitize=thread $(TEST_INPUTS) -o $@
 
 .PHONY: test-sanitizers
-test-sanitizers: $(TEST_BACKEND_ASAN) $(TEST_BACKEND_TSAN) \
-		$(TEST_FD_TRANSPORT_ASAN) $(TEST_FD_TRANSPORT_TSAN) \
-		$(TEST_OPERATOR_TUNING_ASAN) $(TEST_OPERATOR_TUNING_TSAN) \
-		$(TEST_OPERATOR_MEASUREMENT_ASAN) $(TEST_OPERATOR_MEASUREMENT_TSAN)
-	ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 \
-		UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
-		$(TEST_BACKEND_ASAN)
-	TSAN_OPTIONS=halt_on_error=1 $(TEST_BACKEND_TSAN)
-	ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 \
-		UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
-		$(TEST_FD_TRANSPORT_ASAN)
-	TSAN_OPTIONS=halt_on_error=1 $(TEST_FD_TRANSPORT_TSAN)
-	ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 \
-		UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
-		$(TEST_OPERATOR_TUNING_ASAN)
-	TSAN_OPTIONS=halt_on_error=1 $(TEST_OPERATOR_TUNING_TSAN)
-	ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 \
-		UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
-		$(TEST_OPERATOR_MEASUREMENT_ASAN)
-	TSAN_OPTIONS=halt_on_error=1 $(TEST_OPERATOR_MEASUREMENT_TSAN)
+ASAN_TEST_ENV := ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 \
+	UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1
+TSAN_TEST_ENV := TSAN_OPTIONS=halt_on_error=1
+test-sanitizers: $(SANITIZER_CONFIG_TARGETS)
+	$(ASAN_TEST_ENV) $(TEST_BACKEND_ASAN)
+	$(TSAN_TEST_ENV) $(TEST_BACKEND_TSAN)
+	$(ASAN_TEST_ENV) $(TEST_FD_TRANSPORT_ASAN)
+	$(TSAN_TEST_ENV) $(TEST_FD_TRANSPORT_TSAN)
+	$(ASAN_TEST_ENV) $(TEST_OPERATOR_TUNING_ASAN)
+	$(TSAN_TEST_ENV) $(TEST_OPERATOR_TUNING_TSAN)
+	$(ASAN_TEST_ENV) $(TEST_OPERATOR_MEASUREMENT_ASAN)
+	$(TSAN_TEST_ENV) $(TEST_OPERATOR_MEASUREMENT_TSAN)
