@@ -78,7 +78,7 @@ int main() {
     const std::array<PreparedWeight, 2> tooLarge{{{key(20), UINT64_MAX / 2}, {key(21), UINT64_MAX / 2}}};
     rejects([&] { store.requireSpace(tooLarge); }, "model-wide disk budget ignored");
     require(!std::filesystem::exists(root / key(20)), "disk preflight wrote a partial model");
-    require(weightDigest(bytes) == WeightSource(cached).digest(), "cached content differs");
+    require(weightDigest(bytes) == WeightSource(cached).digest(0), "cached content differs");
     struct stat info{};
     require(stat(cached.c_str(), &info) == 0 && !(info.st_mode & 0222), "cache is writable");
     // Same-size corruption must not pass a metadata-only check.
@@ -88,7 +88,7 @@ int main() {
     writeWeightBytes(fd, 0, std::span(&bad, 1));
     close(fd);
     static_cast<void>(store.prepare({key(1), bytes.size()}, write));
-    require(builds == 2 && WeightSource(cached).digest() == weightDigest(bytes), "corruption not repaired");
+    require(builds == 2 && WeightSource(cached).digest(0) == weightDigest(bytes), "corruption not repaired");
     // Interrupted and ENOSPC writes do not publish anything and can be retried.
     rejects([&] { static_cast<void>(store.prepare({key(2), bytes.size()}, [&](int output) {
       writeWeightBytes(output, 0, std::span(bytes).first(64));

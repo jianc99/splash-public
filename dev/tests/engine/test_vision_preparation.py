@@ -310,23 +310,23 @@ def main():
                 )
                 assert not published(directory), (source, case)
 
-        # The MLX tower's identity is config.json and the shard holding it.
+        # The MLX tower's identity is the tensors it reads: the language
+        # model's shard and config.json do not enter it, a tower byte does.
         directory = root / "mlx-0"
         cached = prepare(binary, directory, "mlx", "warm").stdout.split()
         safetensors(
             directory / TEXT_SHARD,
             {"language_model.model.norm.weight": ([8], "BF16", bytes(range(16)))},
         )
+        (directory / "config.json").write_text('{"text_config": {}}')
         result = prepare(binary, directory, "mlx", "warm")
         assert result.returncode == 0 and result.stdout.split() == cached, result.stderr
-        (directory / "config.json").write_text('{"text_config": {}}')
-        result = prepare(binary, directory, "mlx", "warm", expected=False)
-        assert result.stderr.strip() == "unexpected warm conversion", result.stderr
         data = bytearray((directory / VISION_SHARD).read_bytes())
         data[-1] ^= 1
         (directory / VISION_SHARD).write_bytes(data)
         result = prepare(binary, directory, "mlx", "warm", expected=False)
-        assert result.stderr.strip() == "unexpected warm conversion", result.stderr
+        errors = result.stderr.strip().splitlines()
+        assert errors[-1] == "unexpected warm conversion", result.stderr
         print(
             "Vision layouts from MLX and GGUF, exact BF16 conversion, MLX identity "
             "and rejected sources PASS"

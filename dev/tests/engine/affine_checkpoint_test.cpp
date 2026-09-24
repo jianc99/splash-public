@@ -18,12 +18,12 @@ template<class F> void rejects(F run, const char *message) {
   try { run(); } catch (const std::exception &) { rejected = true; }
   require(rejected, message);
 }
-void shard(const std::filesystem::path &path, std::string_view header, size_t bytes = 16) {
+void shard(const std::filesystem::path &path, std::string_view header, size_t bytes = 16, size_t first = 1) {
   std::ofstream file(path, std::ios::binary | std::ios::trunc);
   const uint64_t length = header.size();
   file.write(reinterpret_cast<const char *>(&length), sizeof(length));
   file << header;
-  for (size_t i = 0; i < bytes; ++i) file.put(static_cast<char>(i + 1));
+  for (size_t i = 0; i < bytes; ++i) file.put(static_cast<char>(i + first));
 }
 constexpr auto valid = R"({"a":{"dtype":"U32","shape":[2,2],"data_offsets":[0,16]}})";
 }
@@ -49,10 +49,23 @@ int main() {
     rejects([&] { (void)source.require("missing"); }, "missing tensor accepted");
     rejects([&] { source.requireQuantization("router", 4); }, "wrong quantization accepted");
     rejects([&] { source.requireLayerTypes(2, 1); }, "wrong layer schedule accepted");
-    const auto first = source.digest();
+    // A tensor's identity is its bytes in its shard's tensor data, dtype and
+    // shape: rewriting the same content keeps it, a header-only edit keeps it,
+    // a changed data byte changes it.
+    const auto identity = [](const SafetensorsCheckpoint &checkpoint) {
+      WeightIdentity identity("fixture");
+      checkpoint.require("a").identify(identity);
+      return identity.weight(16, "fixture", "").key;
+    };
+    const auto first = identity(source);
     shard(root / "model.safetensors", valid);
     rejects([&] { source.checkUnchanged(); }, "changed source accepted");
-    require(SafetensorsCheckpoint(root).digest() == first, "same content changed identity");
+    require(identity(SafetensorsCheckpoint(root)) == first, "same content changed identity");
+    shard(root / "model.safetensors", R"({"__metadata__":{"format":"mlx"},"a":{"dtype":"U32","shape":[2,2],"data_offsets":[0,16]}})");
+    require(identity(SafetensorsCheckpoint(root)) == first, "a header-only edit changed the tensor identity");
+    shard(root / "model.safetensors", valid, 16, 9);
+    require(identity(SafetensorsCheckpoint(root)) != first, "changed tensor data kept its identity");
+    shard(root / "model.safetensors", valid);
     shard(root / "extra.safetensors", valid);
     rejects([&] { SafetensorsCheckpoint invalid(root); }, "duplicate tensor accepted");
     std::filesystem::remove(root / "extra.safetensors");

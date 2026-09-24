@@ -5,6 +5,7 @@
 #include <functional>
 #include <memory>
 #include <span>
+#include <sstream>
 #include <string>
 #include <string_view>
 
@@ -22,10 +23,12 @@ enum class TargetSource : uint8_t { Packed, Affine, Gguf };
 
 using PreparationCheck = std::function<void()>;
 
+// A prepared file: its cache key and size, the component it is (such as
+// target/layer-0.bin) and the source it is prepared from.
 struct PreparedWeight {
   std::string key;
   uint64_t bytes;
-  std::string name{};
+  std::string component{};
   std::string source{};
 };
 
@@ -36,23 +39,53 @@ void requireWeightDiskSpace(uint64_t available, uint64_t required);
 
 void readWeightBytes(int descriptor, uint64_t offset, std::span<uint8_t> bytes);
 void writeWeightBytes(int descriptor, uint64_t offset, std::span<const uint8_t> bytes);
+// Copies bytes [from, from + bytes) of source to destination at `to` through
+// staging; check runs before each piece.
+void copyWeightBytes(int source, uint64_t from, int destination, uint64_t to, uint64_t bytes,
+                     std::span<uint8_t> staging, const PreparationCheck &check = {});
 [[nodiscard]] std::string weightDigest(std::span<const uint8_t> bytes);
 [[nodiscard]] std::string weightDigest(std::string_view text);
-[[nodiscard]] std::string weightFileDigest(int descriptor, const PreparationCheck &check = {});
 
+// A source file, opened once; checkUnchanged throws when it was modified or
+// replaced since. The digest of its tensor data is computed on first use,
+// after the caller has validated the metadata, and remembered for this file
+// identity, so a warm start does not read the file again.
 class WeightSource final {
 public:
-  explicit WeightSource(const std::filesystem::path &path, const PreparationCheck &check = {});
+  explicit WeightSource(const std::filesystem::path &path, PreparationCheck check = {});
   ~WeightSource();
   WeightSource(const WeightSource &) = delete;
   WeightSource &operator=(const WeightSource &) = delete;
   [[nodiscard]] const std::filesystem::path &path() const noexcept;
   [[nodiscard]] int descriptor() const noexcept;
-  [[nodiscard]] const std::string &digest() const noexcept;
+  // SHA-256 of bytes [dataOffset, end), the file's tensor data: editing only
+  // its metadata keeps the identity of every tensor.
+  [[nodiscard]] const std::string &digest(uint64_t dataOffset) const;
   void checkUnchanged() const;
 private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
+};
+
+// What a prepared file's key is the SHA-256 of: the adapter's preparation
+// identity, its plan as one record per line, and every source tensor it
+// reads, by the digest of its file's tensor data, its offset there, size,
+// type and shape.
+class WeightIdentity final {
+public:
+  explicit WeightIdentity(std::string_view preparation) { text_ << preparation << '\n'; }
+  template <class... Fields> WeightIdentity &record(const Fields &...fields) {
+    ((text_ << fields << ' '), ...);
+    text_ << '\n';
+    return *this;
+  }
+  // Bytes [offset, offset + bytes) of source, whose tensor data starts at
+  // dataOffset.
+  WeightIdentity &input(const WeightSource &source, uint64_t dataOffset, uint64_t offset, uint64_t bytes,
+                        std::string_view type, std::span<const uint64_t> shape);
+  [[nodiscard]] PreparedWeight weight(uint64_t bytes, std::string component, std::string source) const;
+private:
+  std::ostringstream text_;
 };
 
 // The cache is SPLASH_WEIGHT_CACHE, or ~/Library/Caches/Splash/weights.

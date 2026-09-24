@@ -7,7 +7,6 @@
 #include <array>
 #include <cstring>
 #include <limits>
-#include <sstream>
 #include <vector>
 
 namespace splash::model {
@@ -187,29 +186,27 @@ void writeRepack(metal::MetalBackend &backend, int source, uint64_t dataOffset, 
 
 } // namespace
 
-std::string ggufImageKey(const std::string &sourceDigest, const gguf::Image &image) {
+PreparedWeight ggufImageWeight(const WeightSource &source, uint64_t dataOffset, const gguf::Image &image) {
   // The envelope version covers identity serialization. Conversion code and
   // its storage ABI are fingerprinted at build time, independently of tuning.
-  std::ostringstream identity;
-  identity << "splash-gguf-preparation-v2\n" SPLASH_GGUF_PREPARATION_ID "\n" << sourceDigest << '\n'
-           << "image " << image.layer << ' ' << image.type << ' ' << image.bytes << '\n';
+  WeightIdentity identity("splash-gguf-preparation-v2 " SPLASH_GGUF_PREPARATION_ID);
+  identity.record("image", image.layer, image.type, image.bytes);
   const auto rows = [&](const gguf::TensorRows &rows) {
-    identity << "rows " << rows.type << ' ' << rows.offset << ' ' << rows.rows << ' ' << rows.rowBytes << ' '
-             << rows.order.from << ' ' << rows.order.headRows << ' ' << rows.order.groupHeads << ' '
-             << rows.order.groups << '\n';
+    const uint64_t shape[] = {rows.rows, rows.rowBytes};
+    identity.input(source, dataOffset, dataOffset + rows.offset, rows.rows * rows.rowBytes, ggmlTypeName(rows.type),
+                   shape);
+    identity.record("order", rows.order.from, rows.order.headRows, rows.order.groupHeads, rows.order.groups);
   };
-  for (const gguf::Fill &fill : image.fills)
-    identity << "fill " << fill.offset << ' ' << weightDigest(fill.bytes) << '\n';
+  for (const gguf::Fill &fill : image.fills) identity.record("fill", fill.offset, weightDigest(fill.bytes));
   for (const gguf::Copy &copy : image.copies) {
-    identity << "copy " << copy.destination << ' ' << copy.bfloat16 << '\n';
+    identity.record("copy", copy.destination, copy.bfloat16);
     rows(copy.source);
   }
   for (const gguf::Repack &repack : image.repacks) {
-    identity << "repack " << repack.format << ' ' << repack.rows << ' ' << repack.columns << ' '
-             << repack.plane0 << ' ' << repack.plane1 << ' ' << repack.meta << '\n';
-    for (const gguf::TensorRows &source : repack.sources) rows(source);
+    identity.record("repack", repack.format, repack.rows, repack.columns, repack.plane0, repack.plane1, repack.meta);
+    for (const gguf::TensorRows &sourceRows : repack.sources) rows(sourceRows);
   }
-  return weightDigest(identity.str());
+  return identity.weight(image.bytes, "target/" + image.name, source.path().string());
 }
 
 void prepareGgufImage(metal::MetalBackend &backend, int source, uint64_t dataOffset, int destination,

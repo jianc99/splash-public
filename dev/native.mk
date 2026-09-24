@@ -34,6 +34,7 @@ BACKEND_CONTROL_SOURCES := \
 	runtime/engine/Engine.cpp
 MODEL_SOURCES := $(WEIGHT_PREPARATION_HEADER) \
 	runtime/model/AffineTarget.cpp \
+	runtime/model/AffinePreparation.cpp \
 	runtime/model/SafetensorsCheckpoint.mm \
 	runtime/model/PreparedWeights.cpp \
 	runtime/model/GgufPreparation.cpp \

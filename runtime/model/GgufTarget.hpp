@@ -36,7 +36,7 @@ public:
 private:
   struct Planned {
     gguf::Image image;
-    std::string key;
+    PreparedWeight weight;
   };
   [[nodiscard]] WeightFile build(const Planned &planned);
 

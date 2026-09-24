@@ -7,7 +7,6 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
-#include <set>
 #include <sys/stat.h>
 
 namespace splash::model {
@@ -43,8 +42,6 @@ uint32_t elementBytes(const std::string &type) {
 struct SafetensorsCheckpoint::Impl {
   std::vector<std::unique_ptr<WeightSource>> files;
   std::map<std::string, SourceTensor, std::less<>> tensors;
-  std::string configDigest;
-  std::string digest;
   NSDictionary *quantization = nil;
   NSDictionary *textConfig = nil;
 };
@@ -73,9 +70,6 @@ SafetensorsCheckpoint::SafetensorsCheckpoint(const std::filesystem::path &direct
       }
     std::sort(paths.begin(), paths.end());
     if (paths.empty()) throw WeightStoreError("source contains no safetensors weights");
-    impl_->configDigest = weightDigest(
-        {static_cast<const uint8_t *>(configuration.bytes), configuration.length});
-    std::string identity = "splash-safetensors-v1\n" + impl_->configDigest;
     uint64_t metadataBytes = 0;
     for (const auto &path : paths) {
       @autoreleasepool {
@@ -119,6 +113,7 @@ SafetensorsCheckpoint::SafetensorsCheckpoint(const std::filesystem::path &direct
             throw WeightStoreError("safetensors data range is invalid");
           tensor.offset = 8 + headerBytes + begin;
           tensor.bytes = bytes;
+          tensor.dataOffset = 8 + headerBytes;
           const std::string name = [key UTF8String];
           if (!impl_->tensors.emplace(name, std::move(tensor)).second)
             throw WeightStoreError("duplicate source tensor: " + name);
@@ -128,11 +123,9 @@ SafetensorsCheckpoint::SafetensorsCheckpoint(const std::filesystem::path &direct
         for (size_t i = 1; i < ranges.size(); ++i)
           if (ranges[i].first < ranges[i - 1].second) throw WeightStoreError("overlapping source tensors");
         source->checkUnchanged();
-        identity += source->digest(); // fixed-length hashes in sorted shard order
         impl_->files.push_back(std::move(source));
       }
     }
-    impl_->digest = weightDigest({reinterpret_cast<const uint8_t *>(identity.data()), identity.size()});
   }
 }
 SafetensorsCheckpoint::~SafetensorsCheckpoint() = default;
@@ -197,21 +190,13 @@ void SafetensorsCheckpoint::requireLayerTypes(uint32_t layers, uint32_t fullAtte
     }
   }
 }
-const std::string &SafetensorsCheckpoint::digest() const noexcept { return impl_->digest; }
-std::string SafetensorsCheckpoint::digest(std::string_view prefix) const {
-  std::set<const WeightSource *> holding;
-  for (auto it = impl_->tensors.lower_bound(prefix); it != impl_->tensors.end() && it->first.starts_with(prefix); ++it)
-    holding.insert(it->second.file);
-  if (holding.empty()) throw WeightStoreError("source holds no tensor named " + std::string(prefix) + "*");
-  std::string identity = "splash-safetensors-v1\n" + impl_->configDigest;
-  for (const auto &source : impl_->files)
-    if (holding.contains(source.get())) identity += source->digest(); // sorted shard order
-  return weightDigest({reinterpret_cast<const uint8_t *>(identity.data()), identity.size()});
-}
 void SafetensorsCheckpoint::checkUnchanged() const { for (const auto &source : impl_->files) source->checkUnchanged(); }
 void SourceTensor::read(uint64_t at, std::span<uint8_t> destination) const {
   if (at > bytes || destination.size() > bytes - at) throw WeightStoreError("source tensor read is out of bounds");
   readWeightBytes(file->descriptor(), offset + at, destination);
+}
+void SourceTensor::identify(WeightIdentity &identity) const {
+  identity.input(*file, dataOffset, offset, bytes, dtype, shape);
 }
 
 } // namespace splash::model

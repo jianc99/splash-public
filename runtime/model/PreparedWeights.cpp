@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <limits>
 #include <iostream>
+#include <optional>
 #include <stdexcept>
 #include <sstream>
 #include <system_error>
@@ -76,25 +77,49 @@ std::filesystem::path cacheRoot() {
   return std::filesystem::path(home) / "Library/Caches/Splash/weights";
 }
 
-std::string verificationKey(const struct stat &state) {
+// SHA-256 of bytes [from, end) of fd, which must not change while it is read.
+std::string fileDigest(int fd, uint64_t from, const PreparationCheck &check) {
+  struct stat before{}, after{};
+  if (fstat(fd, &before)) fail("stat source weights");
+  if (!S_ISREG(before.st_mode) || before.st_size < 0 || uint64_t(before.st_size) < from)
+    throw std::runtime_error("weights must be a regular file");
+  if (check) check();
+  std::vector<uint8_t> buffer(1024 * 1024);
+  CC_SHA256_CTX context;
+  CC_SHA256_Init(&context);
+  for (uint64_t at = from; at < uint64_t(before.st_size); at += buffer.size()) {
+    if (check) check();
+    const auto part = std::span(buffer).first(std::min<uint64_t>(buffer.size(), before.st_size - at));
+    readWeightBytes(fd, at, part);
+    CC_SHA256_Update(&context, part.data(), static_cast<CC_LONG>(part.size()));
+  }
+  if (fstat(fd, &after)) fail("stat source weights after read");
+  if (!unchanged(before, after)) throw std::runtime_error("weight file changed while reading");
+  unsigned char digest[CC_SHA256_DIGEST_LENGTH];
+  CC_SHA256_Final(digest, &context);
+  return hex(digest);
+}
+
+// The proof of a hashed file names the digest of its bytes [from, end) and
+// holds for this device, inode, length, birth time, mtime and ctime only.
+std::string verificationKey(const struct stat &state, uint64_t from) {
   std::ostringstream identity;
-  identity << "splash-verified-file-v1 " << state.st_dev << ' ' << state.st_ino << ' ' << state.st_size << ' '
+  identity << "splash-verified-file-v2 " << state.st_dev << ' ' << state.st_ino << ' ' << state.st_size << ' '
            << state.st_mtimespec.tv_sec << ' ' << state.st_mtimespec.tv_nsec << ' '
            << state.st_ctimespec.tv_sec << ' ' << state.st_ctimespec.tv_nsec << ' '
-           << state.st_birthtimespec.tv_sec << ' ' << state.st_birthtimespec.tv_nsec;
-  const auto value = identity.str();
-  return weightDigest({reinterpret_cast<const uint8_t *>(value.data()), value.size()});
+           << state.st_birthtimespec.tv_sec << ' ' << state.st_birthtimespec.tv_nsec << ' ' << from;
+  return weightDigest(identity.str());
 }
 
 std::string verificationRecord(std::string_view key, std::string_view digest) {
-  const std::string value = std::string(key) + std::string(digest);
-  return std::string(digest) + weightDigest({reinterpret_cast<const uint8_t *>(value.data()), value.size()});
+  return std::string(digest) + weightDigest(std::string(key) + std::string(digest));
 }
 
-void rememberDigest(const std::filesystem::path &root, const struct stat &state, const std::string &digest) {
+void rememberDigest(const std::filesystem::path &root, const struct stat &state, uint64_t from,
+                    const std::string &digest) {
   const auto directory = root / "verified";
   std::filesystem::create_directories(directory);
-  const auto key = verificationKey(state);
+  const auto key = verificationKey(state, from);
   std::string temporary = (directory / ".pending-XXXXXX").string();
   Descriptor file(mkstemp(temporary.data()));
   try {
@@ -112,12 +137,13 @@ void rememberDigest(const std::filesystem::path &root, const struct stat &state,
 // same inode, length, birth time, mtime and ctime. Replacing or writing even a
 // same-size file invalidates it. No upstream file or extended attribute is
 // modified. This avoids rereading two entire models at every warm startup.
-std::string verifiedDigest(int fd, const std::filesystem::path &root, const PreparationCheck &check) {
+std::string verifiedDigest(int fd, uint64_t from, const std::filesystem::path &path,
+                           const std::filesystem::path &root, const PreparationCheck &check) {
   if (check) check();
   struct stat before{}, after{};
   if (fstat(fd, &before)) fail("stat verified weights");
   if (!S_ISREG(before.st_mode) || before.st_size < 0) throw std::runtime_error("weights must be a regular file");
-  const auto key = verificationKey(before);
+  const auto key = verificationKey(before, from);
   const int existing = open((root / "verified" / key).c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
   std::string digest;
   if (existing >= 0) {
@@ -133,10 +159,14 @@ std::string verifiedDigest(int fd, const std::filesystem::path &root, const Prep
     }
   } else if (errno != ENOENT) fail("open weight verification");
   const bool missing = digest.empty();
-  if (missing) digest = weightFileDigest(fd, check);
+  if (missing) {
+    std::clog << "Hashing " << path.string() << " (" << (uint64_t(before.st_size) - from) / (1024 * 1024)
+              << " MiB) once; later starts reuse the result" << std::endl;
+    digest = fileDigest(fd, from, check);
+  }
   if (fstat(fd, &after)) fail("stat verified weights after read");
   if (!unchanged(before, after)) throw std::runtime_error("weight file changed during verification");
-  if (missing) rememberDigest(root, before, digest);
+  if (missing) rememberDigest(root, before, from, digest);
   return digest;
 }
 
@@ -162,7 +192,8 @@ bool complete(const std::filesystem::path &directory, uint64_t bytes,
   if (!S_ISREG(state.st_mode) || state.st_size != 64) return false;
   std::array<uint8_t, 64> digest{};
   readWeightBytes(hashFile, 0, digest);
-  return verifiedDigest(file, directory.parent_path(), check) == std::string(digest.begin(), digest.end());
+  return verifiedDigest(file, 0, directory / "weights", directory.parent_path(), check) ==
+         std::string(digest.begin(), digest.end());
 }
 
 } // namespace
@@ -195,6 +226,17 @@ void writeWeightBytes(int fd, uint64_t offset, std::span<const uint8_t> bytes) {
   }
 }
 
+void copyWeightBytes(int source, uint64_t from, int destination, uint64_t to, uint64_t bytes,
+                     std::span<uint8_t> staging, const PreparationCheck &check) {
+  if (bytes && staging.empty()) throw std::invalid_argument("weight copy staging is empty");
+  for (uint64_t at = 0; at < bytes; at += staging.size()) {
+    if (check) check();
+    const auto piece = staging.first(std::min<uint64_t>(staging.size(), bytes - at));
+    readWeightBytes(source, from + at, piece);
+    writeWeightBytes(destination, to + at, piece);
+  }
+}
+
 std::string weightDigest(std::span<const uint8_t> bytes) {
   if (bytes.size() > std::numeric_limits<CC_LONG>::max())
     throw std::overflow_error("weight identity is too large");
@@ -207,46 +249,29 @@ std::string weightDigest(std::string_view text) {
   return weightDigest({reinterpret_cast<const uint8_t *>(text.data()), text.size()});
 }
 
-std::string weightFileDigest(int fd, const PreparationCheck &check) {
-  struct stat before{}, after{};
-  if (fstat(fd, &before)) fail("stat source weights");
-  if (!S_ISREG(before.st_mode) || before.st_size < 0)
-    throw std::runtime_error("weights must be a regular file");
-  if (check) check();
-  std::vector<uint8_t> buffer(1024 * 1024);
-  CC_SHA256_CTX context;
-  CC_SHA256_Init(&context);
-  for (uint64_t at = 0; at < uint64_t(before.st_size); at += buffer.size()) {
-    if (check) check();
-    const auto part = std::span(buffer).first(std::min<uint64_t>(buffer.size(), before.st_size - at));
-    readWeightBytes(fd, at, part);
-    CC_SHA256_Update(&context, part.data(), static_cast<CC_LONG>(part.size()));
-  }
-  if (fstat(fd, &after)) fail("stat source weights after read");
-  if (!unchanged(before, after)) throw std::runtime_error("weight file changed while reading");
-  unsigned char digest[CC_SHA256_DIGEST_LENGTH];
-  CC_SHA256_Final(digest, &context);
-  return hex(digest);
-}
-
 struct WeightSource::Impl {
   std::filesystem::path path;
   Descriptor file;
   struct stat state{};
-  std::string digest;
-  Impl(const std::filesystem::path &path, const PreparationCheck &check)
-      : path(path), file(open(path.c_str(), O_RDONLY | O_CLOEXEC)) {
+  PreparationCheck check;
+  // The tensor data offset and digest, once hashed.
+  std::optional<std::pair<uint64_t, std::string>> digest;
+  Impl(const std::filesystem::path &path, PreparationCheck check)
+      : path(path), file(open(path.c_str(), O_RDONLY | O_CLOEXEC)), check(std::move(check)) {
     if (fstat(file, &state)) fail("stat weight source");
-    digest = verifiedDigest(file, cacheRoot(), check);
   }
 };
 
-WeightSource::WeightSource(const std::filesystem::path &path, const PreparationCheck &check)
-    : impl_(std::make_unique<Impl>(path, check)) { checkUnchanged(); }
+WeightSource::WeightSource(const std::filesystem::path &path, PreparationCheck check)
+    : impl_(std::make_unique<Impl>(path, std::move(check))) { checkUnchanged(); }
 WeightSource::~WeightSource() = default;
 const std::filesystem::path &WeightSource::path() const noexcept { return impl_->path; }
 int WeightSource::descriptor() const noexcept { return impl_->file; }
-const std::string &WeightSource::digest() const noexcept { return impl_->digest; }
+const std::string &WeightSource::digest(uint64_t dataOffset) const {
+  if (!impl_->digest || impl_->digest->first != dataOffset)
+    impl_->digest.emplace(dataOffset, verifiedDigest(impl_->file, dataOffset, impl_->path, cacheRoot(), impl_->check));
+  return impl_->digest->second;
+}
 void WeightSource::checkUnchanged() const {
   struct stat current{};
   if (fstat(impl_->file, &current)) fail("stat weight source");
@@ -254,6 +279,19 @@ void WeightSource::checkUnchanged() const {
   if (stat(impl_->path.c_str(), &named)) fail("stat weight source path");
   if (!unchanged(impl_->state, current) || !unchanged(impl_->state, named))
     throw std::runtime_error("source weights changed during preparation; retry with an immutable source");
+}
+
+WeightIdentity &WeightIdentity::input(const WeightSource &source, uint64_t dataOffset, uint64_t offset,
+                                      uint64_t bytes, std::string_view type, std::span<const uint64_t> shape) {
+  if (offset < dataOffset) throw std::invalid_argument("source tensor precedes its file's tensor data");
+  text_ << "input " << source.digest(dataOffset) << ' ' << offset - dataOffset << ' ' << bytes << ' ' << type;
+  for (uint64_t dimension : shape) text_ << ' ' << dimension;
+  text_ << '\n';
+  return *this;
+}
+
+PreparedWeight WeightIdentity::weight(uint64_t bytes, std::string component, std::string source) const {
+  return {weightDigest(text_.str()), bytes, std::move(component), std::move(source)};
 }
 
 PreparedWeights::PreparedWeights() : root_(cacheRoot()) {}
@@ -314,7 +352,7 @@ std::filesystem::path PreparedWeights::prepare(
   requireWeightDiskSpace(std::filesystem::space(root_).available, bytes);
   std::filesystem::create_directory(staging);
   const auto started = std::chrono::steady_clock::now();
-  if (!weight.name.empty()) std::clog << "Preparing target weights: " << weight.name << std::endl;
+  if (!weight.component.empty()) std::clog << "Preparing weights: " << weight.component << std::endl;
   try {
     Descriptor file(open((staging / "weights").c_str(), O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0600));
     // Do not let dirty filesystem pages grow into a hidden model-sized buffer.
@@ -331,16 +369,16 @@ std::filesystem::path PreparedWeights::prepare(
     if (fstat(file, &state)) fail("stat prepared weights");
     if (state.st_size < 0 || uint64_t(state.st_size) != bytes)
       throw std::runtime_error("prepared weight size changed");
-    const std::string digest = weightFileDigest(file, check);
+    const std::string digest = fileDigest(file, 0, check);
     if (fchmod(file, 0400) || fsync(file)) fail("flush prepared weights");
     if (fstat(file, &state)) fail("stat completed weights");
-    rememberDigest(root_, state, digest);
+    rememberDigest(root_, state, 0, digest);
     Descriptor manifest(open((staging / "sha256").c_str(), O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0400));
     writeWeightBytes(manifest, 0, {reinterpret_cast<const uint8_t *>(digest.data()), digest.size()});
     if (fsync(manifest)) fail("flush prepared weight digest");
     if (!weight.source.empty()) {
       Descriptor origin(open((staging / "source").c_str(), O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0400));
-      const auto description = weight.source + "\n" + weight.name + "\n";
+      const auto description = weight.source + "\n" + weight.component + "\n";
       writeWeightBytes(origin, 0, {reinterpret_cast<const uint8_t *>(description.data()), description.size()});
       if (fsync(origin)) fail("flush prepared weight source");
     }
@@ -355,9 +393,9 @@ std::filesystem::path PreparedWeights::prepare(
     std::filesystem::remove_all(staging, ignored);
     throw;
   }
-  if (!weight.name.empty()) {
+  if (!weight.component.empty()) {
     const auto seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
-    std::clog << "Prepared " << weight.name << " in " << seconds << " s" << std::endl;
+    std::clog << "Prepared " << weight.component << " in " << seconds << " s" << std::endl;
   }
   return destination / "weights";
 }

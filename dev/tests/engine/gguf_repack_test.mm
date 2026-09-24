@@ -21,6 +21,7 @@
 #include <CommonCrypto/CommonDigest.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -143,17 +144,23 @@ std::vector<std::pair<std::string, uint32_t>> metadata(const splash::model::gguf
 // A version 3 GGUF of the tensors of the geometry's architecture, in order and
 // 32-byte aligned.
 std::vector<uint8_t> ggufFile(const std::vector<Tensor> &tensors, const splash::model::gguf::TargetGeometry &geometry,
-                             const std::string &displaced = {}) {
+                             const std::string &displaced = {},
+                             const std::vector<std::pair<std::string, std::string>> &strings = {}) {
   constexpr uint32_t kString = 8, kUint32 = 4, kAlignment = 32;
   const std::string architecture = geometry.architecture();
   const auto keys = metadata(geometry);
   std::vector<uint8_t> out{'G', 'G', 'U', 'F'};
   append<uint32_t>(out, 3);
   append<uint64_t>(out, tensors.size());
-  append<uint64_t>(out, keys.size() + 1);
+  append<uint64_t>(out, keys.size() + 1 + strings.size());
   appendString(out, "general.architecture");
   append(out, kString);
   appendString(out, architecture);
+  for (const auto &[key, value] : strings) {
+    appendString(out, key);
+    append(out, kString);
+    appendString(out, value);
+  }
   for (const auto &[key, value] : keys) {
     appendString(out, architecture + "." + key);
     append(out, kUint32);
@@ -638,6 +645,67 @@ void checkMoeLayer(splash::metal::MetalBackend *backend) {
   }
 }
 
+// Keys follow the tensor data the images read: a GGUF whose metadata alone
+// changes (a chat template, so every tensor moves in the file) keeps every
+// prepared image, and a changed tensor byte prepares the images again.
+void checkSourceIdentity(splash::metal::MetalBackend &backend) {
+  using namespace model::ggml;
+  model::gguf::TargetGeometry geometry;
+  geometry.layers = 1;
+  geometry.hiddenSize = 512;
+  geometry.vocabularySize = 256;
+  geometry.intermediateSize = 256;
+  geometry.gdnKeyHeads = 4;
+  geometry.gdnValueHeads = 12;
+  geometry.gdnHeadDimension = 64;
+  geometry.convolutionDimension = 1280;
+  const uint32_t hidden = geometry.hiddenSize, heads = geometry.gdnValueHeads;
+  const uint64_t valueRows = uint64_t{heads} * geometry.gdnHeadDimension;
+  TensorList list;
+  list.add("blk.0.attn_norm.weight", {hidden}, kF32, floatValues(hidden, 601));
+  list.add("blk.0.attn_qkv.weight", {hidden, geometry.convolutionDimension}, kQ4_K);
+  list.add("blk.0.attn_gate.weight", {hidden, valueRows}, kQ4_K);
+  list.add("blk.0.ssm_beta.weight", {hidden, heads}, kQ8_0);
+  list.add("blk.0.ssm_alpha.weight", {hidden, heads}, kQ8_0);
+  list.add("blk.0.ssm_conv1d.weight", {4, geometry.convolutionDimension}, kF32);
+  list.add("blk.0.ssm_a", {heads}, kF32);
+  list.add("blk.0.ssm_dt.bias", {heads}, kF32);
+  list.add("blk.0.ssm_norm.weight", {geometry.gdnHeadDimension}, kF32);
+  list.add("blk.0.ssm_out.weight", {valueRows, hidden}, kQ4_K, fixture(Q4K, hidden, uint32_t(valueRows), 602));
+  list.add("blk.0.post_attention_norm.weight", {hidden}, kF32);
+  list.add("blk.0.ffn_gate.weight", {hidden, geometry.intermediateSize}, kQ4_K);
+  list.add("blk.0.ffn_up.weight", {hidden, geometry.intermediateSize}, kQ4_K);
+  list.add("blk.0.ffn_down.weight", {geometry.intermediateSize, hidden}, kQ4_K);
+  list.add("output_norm.weight", {hidden}, kF32);
+  list.add("output.weight", {hidden, geometry.vocabularySize}, kQ4_K);
+  list.add("token_embd.weight", {hidden, geometry.vocabularySize}, kQ4_K);
+  try {
+    const TemporaryDirectory directory;
+    const auto path = directory.path() / "identity.gguf";
+    bool allowPreparation = true;
+    // The keys of layer 0 and the head.
+    const auto keys = [&] {
+      model::GgufTargetLoader loader(backend, path, geometry, [&] {
+        if (!allowPreparation) throw std::runtime_error("conversion forbidden");
+      });
+      return std::array<std::string, 2>{loader.layer(0).record().contentIdentity,
+                                        loader.head().record().contentIdentity};
+    };
+    writeGguf(path, list.tensors, geometry);
+    const auto original = keys();
+    std::vector<uint8_t> file = ggufFile(list.tensors, geometry, {}, {{"tokenizer.chat_template", std::string(100, 'x')}});
+    std::ofstream(path, std::ios::binary | std::ios::trunc).write(reinterpret_cast<const char *>(file.data()), file.size());
+    allowPreparation = false;
+    check(keys() == original, "a GGUF metadata edit keeps every prepared image");
+    list.data("blk.0.ssm_out.weight")[100] ^= 1;
+    writeGguf(path, list.tensors, geometry);
+    allowPreparation = true;
+    check(keys()[0] != original[0], "a changed tensor byte prepares its image again");
+  } catch (const std::exception &error) {
+    check(false, std::string("source identity: ") + error.what());
+  }
+}
+
 // SHA-256 of every image the loader prepares from two small GGUFs: a dense
 // qwen35 target (both layer kinds, all eight formats, permuted value-head rows,
 // Q8_0 alpha/beta, F32 norms, bf16-exact convolution and time bias, Q6_K token
@@ -908,6 +976,7 @@ int main(int argc, char **argv) {
     checkMoeLayer(gpu);
     if (gpu) {
       checkGoldenImages(*gpu);
+      checkSourceIdentity(*gpu);
       const Shape shapes[] = {{512, 1024, kNoPermute, 0, 0, 0},
                               {768, 1280, 256, 16, 8, 4},
                               {768, 8448, 128, 16, 8, 5}};

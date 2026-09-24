@@ -23,13 +23,14 @@ GgufTargetLoader::GgufTargetLoader(metal::MetalBackend &backend, std::filesystem
   const GgufFile file(std::move(path));
   source_.checkUnchanged();
   dataOffset_ = file.dataOffset();
+  // Validates the whole source before its tensor data is hashed.
   const gguf::ImagePlanner planner(file, geometry);
   std::vector<PreparedWeight> weights(alsoPrepared.begin(), alsoPrepared.end());
   const auto plan = [&](gguf::Image image) {
     backend.checkOperation();
-    auto key = ggufImageKey(source_.digest(), image);
-    weights.push_back({key, image.bytes});
-    images_.push_back({std::move(image), std::move(key)});
+    auto weight = ggufImageWeight(source_, dataOffset_, image);
+    weights.push_back(weight);
+    images_.push_back({std::move(image), std::move(weight)});
   };
   for (uint32_t layer = 0; layer < geometry.layers; ++layer) plan(planner.layer(layer));
   plan(planner.head());
@@ -50,7 +51,7 @@ WeightFile GgufTargetLoader::build(const Planned &planned) {
   const gguf::Image &image = planned.image;
   backend_->checkOperation();
   source_.checkUnchanged();
-  const auto path = cache_.prepare({planned.key, image.bytes, image.name, source_.path().string()},
+  const auto path = cache_.prepare(planned.weight,
       [&](int destination) {
         prepareGgufImage(*backend_, source_.descriptor(), dataOffset_, destination, image,
                          [&] { backend_->checkOperation(); if (admitConversion_) admitConversion_(); });
@@ -58,8 +59,8 @@ WeightFile GgufTargetLoader::build(const Planned &planned) {
       },
       [&] { backend_->checkOperation(); }, admitConversion_);
   source_.checkUnchanged();
-  return WeightFile(*backend_, path, "target/" + image.name, kGgufImageMagic, image.layer, image.type,
-                    planned.key);
+  return WeightFile(*backend_, path, planned.weight.component, kGgufImageMagic, image.layer, image.type,
+                    planned.weight.key);
 }
 
 } // namespace splash::model

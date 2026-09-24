@@ -6,10 +6,11 @@
 
 namespace splash::model {
 
-// The cache key of a planned image of a GGUF whose content hashes to
-// sourceDigest: the preparation identity and the whole plan.
-[[nodiscard]] std::string ggufImageKey(const std::string &sourceDigest,
-                                      const gguf::Image &image);
+// The identity of a planned image of source, whose tensor data starts at
+// dataOffset: the preparation identity, the whole plan and the bytes and type
+// of every tensor it reads.
+[[nodiscard]] PreparedWeight ggufImageWeight(const WeightSource &source, uint64_t dataOffset,
+                                            const gguf::Image &image);
 
 // Writes a planned image into its preallocated, zeroed destination file: the
 // header and descriptors, the copied rows and the planes the GPU repacks.

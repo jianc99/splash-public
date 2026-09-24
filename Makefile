@@ -230,6 +230,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/model/GgufImage.cpp \
 	runtime/model/GgufTarget.cpp \
 	runtime/model/AffineTarget.cpp \
+	runtime/model/AffinePreparation.cpp \
 	runtime/model/PreparedWeights.cpp \
 	runtime/model/GgufPreparation.cpp \
 	runtime/model/Qwen3_6Moe.cpp \
@@ -272,15 +273,20 @@ $(BUILD_ID_STAMP): force-build-identity | $(ENGINE_BUILD)
 $(BUILD_ID_HEADER): $(BUILD_ID_STAMP)
 	@:
 
-# Cache identities follow only preparation code and its storage ABI. Updating
-# inference kernels or an unrelated app component does not rebuild weights.
+# Cache identities follow only the code that writes prepared bytes
+# (dev/tools/weight_preparation_identity.py). Make compares the header's
+# content with the identities when it starts, read-only, and rewrites it
+# only when they differ: an edited input, a new one or a tree copied with old
+# timestamps regenerates it, and an unchanged tree leaves every object that
+# uses it current.
 WEIGHT_PREPARATION_HEADER := $(ENGINE_BUILD)/WeightPreparationIdentity.hpp
+WEIGHT_PREPARATION_STALE := $(shell $(BUILD_ID_PYTHON) dev/tools/weight_preparation_identity.py \
+	--root . --header $(WEIGHT_PREPARATION_HEADER) --stale)
 
-WEIGHT_PREPARATION_INPUTS := $(shell $(BUILD_ID_PYTHON) dev/tools/weight_preparation_identity.py --inputs)
-$(WEIGHT_PREPARATION_HEADER): $(WEIGHT_PREPARATION_INPUTS) dev/tools/weight_preparation_identity.py dev/tools/build_identity.py | $(ENGINE_BUILD)
+$(WEIGHT_PREPARATION_HEADER): $(if $(WEIGHT_PREPARATION_STALE),force-build-identity) | $(ENGINE_BUILD)
 	@$(BUILD_ID_PYTHON) dev/tools/weight_preparation_identity.py --root . --header $@
 
-$(ENGINE_BUILD)/model/AffineTarget.o $(ENGINE_BUILD)/model/GgufPreparation.o $(ENGINE_BUILD)/model/VisionPreparation.o: $(WEIGHT_PREPARATION_HEADER)
+$(ENGINE_BUILD)/model/AffinePreparation.o $(ENGINE_BUILD)/model/GgufPreparation.o $(ENGINE_BUILD)/model/VisionPreparation.o: $(WEIGHT_PREPARATION_HEADER)
 
 $(ENGINE_BUILD)/%.o: runtime/%.cpp
 	@mkdir -p $(dir $@)

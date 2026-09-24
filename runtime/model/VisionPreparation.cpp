@@ -12,7 +12,6 @@
 #include <cstring>
 #include <set>
 #include <span>
-#include <sstream>
 
 namespace splash::model {
 namespace {
@@ -211,8 +210,7 @@ void planMmproj(const GgufFile &gguf, const WeightSource &file,
                                 : t.type == ggml::kF16 ? "F16"
                                 : t.type == ggml::kF32 ? "F32"
                                                        : ggmlTypeName(t.type);
-      s.inputs.push_back(
-          input(name, {&file, dtype, {}, gguf.absoluteOffset(t), t.bytes}));
+      s.inputs.push_back(input(name, {&file, dtype, t.dims, gguf.absoluteOffset(t), t.bytes, gguf.dataOffset()}));
       used.insert(std::move(name));
     }
   }
@@ -317,32 +315,27 @@ VisionPreparation::VisionPreparation(const std::filesystem::path &directory,
       layout.paddedIntermediateSize < layout.intermediateSize)
     throw WeightStoreError("Qwen vision layout is inconsistent");
   i.plan = sections(layout);
-  std::string digest;
   if (source == VisionSource::Safetensors) {
     i.checkpoint = std::make_unique<SafetensorsCheckpoint>(directory, i.check);
     planCheckpoint(*i.checkpoint, layout, i.plan);
-    // config.json and the shards holding the tower, not the language model's.
-    digest = i.checkpoint->digest("vision_tower.");
   } else if (source == VisionSource::Gguf) {
     const auto path = directory / "mmproj.gguf";
     i.mmproj = std::make_unique<WeightSource>(path, i.check);
     planMmproj(GgufFile(path), *i.mmproj, layout, i.plan);
-    digest = i.mmproj->digest();
   } else {
     throw WeightStoreError("only MLX and GGUF vision sources are prepared");
   }
   i.checkUnchanged();
-  std::ostringstream identity;
-  identity << SPLASH_VISION_PREPARATION_ID << '\n'
-           << digest << '\n'
-           << int(source) << '\n';
-  for (const auto &s : i.plan)
-    identity << s.mlx << ' ' << s.rows << ' ' << s.columns << ' '
-             << s.storedRows << ' ' << s.storedColumns << '\n';
-  const auto text = identity.str();
-  i.weight = {weightDigest({reinterpret_cast<const uint8_t *>(text.data()),
-                            text.size()}),
-              arrange(i.plan), "vision.bin", directory.string()};
+  const uint64_t bytes = arrange(i.plan);
+  // The layout and the source tensors are all these bytes depend on; no
+  // configuration value enters them.
+  WeightIdentity identity("splash-vision-preparation-v2 " SPLASH_VISION_PREPARATION_ID);
+  identity.record("file", layout.depth, layout.patchSize, bytes);
+  for (const auto &s : i.plan) {
+    identity.record("section", s.offset, s.rows, s.columns, s.storedRows, s.storedColumns, s.patch);
+    for (const auto &in : s.inputs) in.tensor.identify(identity);
+  }
+  i.weight = identity.weight(bytes, "vision/model.bin", directory.string());
 }
 
 VisionPreparation::~VisionPreparation() = default;
