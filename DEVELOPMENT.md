@@ -322,9 +322,10 @@ The cache is `~/Library/Caches/Splash/weights`, or the directory
 `SPLASH_WEIGHT_CACHE` names; nothing else selects it. It holds an additional
 copy of the weights about the model's size, its prepared target and vision
 tensors. Preparing needs that much free disk space plus a 2 GiB reserve: before
-anything is written, the factory (`ModelFactory.cpp`) constructs the target's
-and the vision tower's loaders and checks the space of every missing file they
-plan, plus the reserve, once. Uninstalling a model does not delete possibly
+anything is written, the factory (`ModelFactory.cpp`) constructs the vision
+tower's loader (`planVisionLoader`, which the vision encoder test shares) and
+the target's, and checks the space of every missing file they plan, plus the
+reserve, once. Uninstalling a model does not delete possibly
 shared prepared weights. With Splash stopped, entry directories can be deleted;
 deleting the whole cache causes preparation at the next load.
 
@@ -368,12 +369,14 @@ its conversion steps to one staging bound, input and output together, of
 32 MiB (`kWeightPreparationStagingBytes`), whatever the tensor, layer or expert
 count, inside a 64 MiB admission reserve that also covers source metadata.
 Complete rows and multiple row tiles are processed together where possible,
-avoiding per-row I/O and small GPU waits. On a cache miss the runtime admits
-the conversion workspace (`admitConversion`) before anything is allocated and
-again before each chunk; warning/critical memory pressure or inadequate host
-headroom stops conversion. Cache hits and bounded source verification use
-normal startup admission instead; cancellation and critical pressure still
-abort loading.
+avoiding per-row I/O and small GPU waits. Startup runs two checks
+(`RuntimeResources.mm`), both stopped by cancellation. `admitWeightPreparation`,
+which the loaders receive as `admitConversion`, admits the conversion workspace
+on a cache miss, before anything is allocated and again before each chunk: it
+requires normal memory pressure and host headroom for the startup reserve plus
+the 64 MiB workspace. Cache hits, bounded source verification and every other
+Metal operation of startup pass `admitMetalOperation` instead, which critical
+pressure or too little headroom for the startup reserve still fails.
 
 `WeightFile` maps completed files, prepared or packed, read-only into one
 no-copy Metal buffer, so no model-sized anonymous allocation holds the weights.
@@ -785,8 +788,9 @@ prepared byte.
 Compare performance on the same idle Mac with the same model and workload.
 `make tune-kernels MODEL=...` measures the precompiled kernel candidates for the
 installed model on this Mac against the policy defaults in `runtime/ops` and
-prints, per key, the winner with its paired GPU and wall-time gain or that the
-default is kept; it changes no default and saves no profile. For a GGUF model
+prints, per key, the winner with its paired GPU and wall-time gain, spelled as
+the enumerators it would install, or that the default is kept; it changes no
+default and saves no profile. For a GGUF model
 it measures only the attention kernels and the draft, and says so in its
 header, since GGUF projection and MoE plans read no tuned choice
 ([GGUF targets](#gguf-targets)). Keep generated reports, profiles, local paths
