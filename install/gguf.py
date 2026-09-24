@@ -224,14 +224,20 @@ def tokenizer_files(metadata):
         add_prefix_space=False, use_regex=False, trim_offsets=False
     )
     backend.decoder = decoders.ByteLevel()
-    added = [
-        AddedToken(t, normalized=False, special=kind == CONTROL_TOKEN)
-        for t, kind in zip(tokens, types, strict=True)
+    # The index of each added token, and whether it is special.
+    added = {
+        index: kind == CONTROL_TOKEN
+        for index, kind in enumerate(types)
         if kind in (CONTROL_TOKEN, USER_DEFINED_TOKEN)
-    ]
-    backend.add_tokens(added)
+    }
+    backend.add_tokens(
+        [
+            AddedToken(tokens[index], normalized=False, special=is_special)
+            for index, is_special in added.items()
+        ]
+    )
 
-    def special(name, *, optional=False):
+    def special_token(name, *, optional=False):
         key = "tokenizer.ggml." + name + "_token_id"
         if optional and key not in m.values:
             return None
@@ -247,20 +253,19 @@ def tokenizer_files(metadata):
         "tokenizer_class": "TokenizersBackend",
         "model_max_length": m.positive(text_architecture(m) + ".context_length"),
         "clean_up_tokenization_spaces": False,
-        "bos_token": special("bos", optional=True),
-        "eos_token": special("eos"),
-        "pad_token": special("padding", optional=True),
+        "bos_token": special_token("bos", optional=True),
+        "eos_token": special_token("eos"),
+        "pad_token": special_token("padding", optional=True),
         "added_tokens_decoder": {
-            str(i): {
-                "content": tokens[i],
-                "special": types[i] == CONTROL_TOKEN,
+            str(index): {
+                "content": tokens[index],
+                "special": is_special,
                 "normalized": False,
                 "single_word": False,
                 "lstrip": False,
                 "rstrip": False,
             }
-            for i in range(len(tokens))
-            if types[i] in (CONTROL_TOKEN, USER_DEFINED_TOKEN)
+            for index, is_special in added.items()
         },
     }
     return {
