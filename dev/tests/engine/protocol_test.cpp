@@ -366,10 +366,7 @@ std::vector<Message> everyOtherMessage() {
       CancelFrame{91},
       MaskResponseFrame{91, 7, {0xffffffffU, 0, 0xa5a5a5a5U}},
       StatusRequestFrame{808},
-      ReadyEvent{1001, 4, 524'288,
-                 FeatureCancellation | FeatureTokenMasks | FeatureStatusJson |
-                     FeatureMultiplexing | FeatureVision},
-      ReadyEvent{1002, 4, 524'288, kNativeFeatureBits},
+      ReadyEvent{1001, 4, 524'288, kNativeFeatureBits | FeatureVision},
       StartEvent{91, CacheDisposition::PrefixHit, 2, 4096, 131'072},
       PromptProgressEvent{91, 2048, 123456},
       TokensEvent{91, 17, {10, 11, 12}},
