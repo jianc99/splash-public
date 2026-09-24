@@ -410,7 +410,7 @@ inline void gdn_decode_batch_phase(
     device atomic_uint *generation, constant GDNDecodeBatchParams &params,
     uint2 group, uint thread_index, uint lane, uint simd_group,
     threadgroup GdnDecodeShared<HeadDim> &shared,
-    device bfloat *q4_table = nullptr, device float *q4_sums = nullptr) {
+    device bfloat *table, device float *sums) {
   constexpr uint Rows = SPLASH_TARGET_VERIFY_ROWS;
   constexpr uint ValueWidth = ValueHeads * HeadDim;
   uint batch = group.y;
@@ -453,7 +453,7 @@ inline void gdn_decode_batch_phase(
   gdn_decode_gate<KeyHeads, ValueHeads, HeadDim, ConvDim>(
       shared, packed, gdn_norm_weight, lane_recurrent, lane_hidden,
       params.packed_width, tiled, group.x, lane, simd_group);
-  if (q4_table) {
+  if (table) {
     // Each group owns this head for all eight rows; each simdgroup writes
     // the table of the row it just gated.
     simdgroup_barrier(mem_flags::mem_threadgroup);
@@ -461,8 +461,8 @@ inline void gdn_decode_batch_phase(
     for (uint g = 0; g < HeadDim / 64; ++g) {
       const uint column = head * HeadDim + g * 64 + 2 * lane;
       const uint local = simd_group * HeadDim + g * 64 + 2 * lane;
-      Table::write(q4_table + ulong(batch) * ValueWidth * Rows,
-                   q4_sums + ulong(batch) * Table::sums_per_tile(ValueWidth), ValueWidth,
+      Table::write(table + ulong(batch) * ValueWidth * Rows,
+                   sums + ulong(batch) * Table::sums_per_tile(ValueWidth), ValueWidth,
                    column / 64, simd_group, lane, shared.rows[local], shared.rows[local + 1]);
     }
   }
@@ -487,13 +487,14 @@ inline void gdn_decode_batch_phase(
     uint2 group [[threadgroup_position_in_grid]], \
     uint thread_index [[thread_index_in_threadgroup]], \
     uint lane [[thread_index_in_simdgroup]], uint simd_group [[simdgroup_index_in_threadgroup]]
-#define GDN_DECODE_BODY(KeyHeads, ValueHeads, HeadDim, ConvDim, Table, Sums, Layout) \
+#define GDN_DECODE_BODY(KeyHeads, ValueHeads, HeadDim, ConvDim, table, sums, Layout) \
     threadgroup GdnDecodeShared<HeadDim> shared; \
     gdn_decode_batch_phase<KeyHeads, ValueHeads, HeadDim, ConvDim, 2, Layout>( \
         packed, conv_weights, current0, current1, current2, current3, next0, \
         next1, next2, next3, mixed, a_scale, dt_bias, decay, beta, recurrent, \
         gdn_norm_weight, gdn_hidden, arrived, generation, params, group, \
-        thread_index, lane, simd_group, shared, Table, Sums);
+        thread_index, lane, simd_group, shared, table, sums);
+// Entries without a table pass null pointers, which skip the write; their Layout only completes the template.
 #define GDN_DECODE_ENTRY(Name, KeyHeads, ValueHeads, HeadDim, ConvDim, W) \
   kernel void Name(GDN_DECODE_BUFFERS(W), \
       constant GDNDecodeBatchParams &params [[buffer(20)]], GDN_DECODE_THREADS) { \
@@ -502,9 +503,9 @@ inline void gdn_decode_batch_phase(
 // The out-projection's table (Layout: q4sg::Table64 affine, gguf_sg::Table16 GGUF).
 #define GDN_DECODE_TABLE_ENTRY(Name, KeyHeads, ValueHeads, HeadDim, ConvDim, Layout, W) \
   kernel void Name(GDN_DECODE_BUFFERS(W), \
-      device bfloat *q4_table [[buffer(20)]], device float *q4_sums [[buffer(21)]], \
+      device bfloat *table [[buffer(20)]], device float *sums [[buffer(21)]], \
       constant GDNDecodeBatchParams &params [[buffer(22)]], GDN_DECODE_THREADS) { \
-    GDN_DECODE_BODY(KeyHeads, ValueHeads, HeadDim, ConvDim, q4_table, q4_sums, Layout) \
+    GDN_DECODE_BODY(KeyHeads, ValueHeads, HeadDim, ConvDim, table, sums, Layout) \
   }
 
 // Two rows overlap reductions and arithmetic without the register cost of four.
