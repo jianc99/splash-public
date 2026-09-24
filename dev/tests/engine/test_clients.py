@@ -8,6 +8,7 @@ import tempfile
 import threading
 import tomllib
 import unittest
+from contextlib import contextmanager
 from itertools import product
 from pathlib import Path
 from unittest import mock
@@ -712,6 +713,31 @@ class ClientTests(unittest.TestCase):
 
 
 class ClientLifecycleTests(unittest.TestCase):
+    @contextmanager
+    def ready_server(self, client, context=102400, model=None):
+        """Serve model from a ready server; yields the patched exec."""
+        if model is None:
+            model = {
+                "id": MODEL,
+                "owned_by": "splash",
+                "input_modalities": ["text", "image", "pdf"],
+            }
+        status = {"ready": True, "maximum_context_tokens": context}
+        with (
+            tempfile.TemporaryDirectory() as runtime,
+            mock.patch.object(launcher, "RUNTIME_DIR", Path(runtime)),
+            mock.patch.object(
+                clients, "find_executable", return_value=f"/bin/{client}"
+            ),
+            mock.patch.object(launcher, "_running_status", return_value=status),
+            mock.patch.object(
+                launcher, "_request_json", return_value={"data": [model]}
+            ),
+            mock.patch.object(launcher.os, "execvpe") as execute,
+            mock.patch("sys.stdout", io.StringIO()),
+        ):
+            yield execute
+
     def test_clients_accept_arguments_with_or_without_separator(self):
         payloads = (
             [],
@@ -773,29 +799,7 @@ class ClientLifecycleTests(unittest.TestCase):
         for context, separator in product((102400, 262144), ([], ["--"])):
             with (
                 self.subTest(context=context, separator=separator),
-                mock.patch.object(
-                    clients, "find_executable", return_value="/bin/codex"
-                ),
-                mock.patch.object(
-                    launcher,
-                    "_running_status",
-                    return_value={"ready": True, "maximum_context_tokens": context},
-                ),
-                mock.patch.object(
-                    launcher,
-                    "_request_json",
-                    return_value={
-                        "data": [
-                            {
-                                "id": "incoai/Qwen3.6-35B-A3B-Splash",
-                                "owned_by": "splash",
-                                "input_modalities": ["text", "image", "pdf"],
-                            }
-                        ]
-                    },
-                ),
-                mock.patch.object(launcher.os, "execvpe") as execute,
-                mock.patch("sys.stdout", io.StringIO()),
+                self.ready_server("codex", context=context) as execute,
             ):
                 launcher.main(
                     [
@@ -808,7 +812,7 @@ class ClientLifecycleTests(unittest.TestCase):
                     ]
                 )
             argv = execute.call_args.args[1]
-            self.assertEqual(argv[1:3], ["-c", 'model="incoai/Qwen3.6-35B-A3B-Splash"'])
+            self.assertEqual(argv[1:3], ["-c", f'model="{MODEL}"'])
             self.assertIn(f"model_context_window={context}", argv)
             self.assertLess(
                 argv.index('model_reasoning_effort="low"'), argv.index("exec")
@@ -824,31 +828,9 @@ class ClientLifecycleTests(unittest.TestCase):
             with (
                 self.subTest(version=version),
                 mock.patch.object(
-                    clients, "find_executable", return_value="/bin/opencode"
-                ),
-                mock.patch.object(
                     clients, "probe_major_version", return_value=version
                 ) as probe,
-                mock.patch.object(
-                    launcher,
-                    "_running_status",
-                    return_value={"ready": True, "maximum_context_tokens": 102400},
-                ),
-                mock.patch.object(
-                    launcher,
-                    "_request_json",
-                    return_value={
-                        "data": [
-                            {
-                                "id": "incoai/Qwen3.6-35B-A3B-Splash",
-                                "owned_by": "splash",
-                                "input_modalities": ["text", "image", "pdf"],
-                            }
-                        ]
-                    },
-                ),
-                mock.patch.object(launcher.os, "execvpe") as execute,
-                mock.patch("sys.stdout", io.StringIO()),
+                self.ready_server("opencode") as execute,
             ):
                 launcher.main(["opencode"])
             self.assertEqual(execute.call_args.args[1], expected)
@@ -856,25 +838,13 @@ class ClientLifecycleTests(unittest.TestCase):
 
     def test_launcher_configures_clients_from_the_served_input_modalities(self):
         for reported in (["text", "image", "pdf"], ["text"], None):
-            model = {"id": "incoai/Qwen3.6-35B-A3B-Splash", "owned_by": "splash"}
+            model = {"id": MODEL, "owned_by": "splash"}
             if reported is not None:
                 model["input_modalities"] = reported
             with (
                 self.subTest(modalities=reported),
-                mock.patch.object(
-                    clients, "find_executable", return_value="/bin/opencode"
-                ),
                 mock.patch.object(clients, "probe_major_version", return_value=1),
-                mock.patch.object(
-                    launcher,
-                    "_running_status",
-                    return_value={"ready": True, "maximum_context_tokens": 102400},
-                ),
-                mock.patch.object(
-                    launcher, "_request_json", return_value={"data": [model]}
-                ),
-                mock.patch.object(launcher.os, "execvpe") as execute,
-                mock.patch("sys.stdout", io.StringIO()),
+                self.ready_server("opencode", model=model) as execute,
                 mock.patch("sys.stderr", io.StringIO()) as error,
             ):
                 result = launcher.main(["opencode"])
@@ -904,37 +874,14 @@ class ClientLifecycleTests(unittest.TestCase):
         execute.assert_not_called()
 
     def test_version_probe_is_scoped_to_opencode(self):
-        # hermes is excluded here, not from the guarantee: its launch writes a
-        # real profile into the runtime directory, which tests must not touch.
-        for name in ("claude", "codex"):
+        for name in ("claude", "codex", "hermes"):
             with (
                 self.subTest(name=name),
-                mock.patch.object(
-                    clients, "find_executable", return_value=f"/bin/{name}"
-                ),
                 mock.patch.object(clients, "probe_major_version") as probe,
-                mock.patch.object(
-                    launcher,
-                    "_running_status",
-                    return_value={"ready": True, "maximum_context_tokens": 102400},
-                ),
-                mock.patch.object(
-                    launcher,
-                    "_request_json",
-                    return_value={
-                        "data": [
-                            {
-                                "id": "incoai/Qwen3.6-35B-A3B-Splash",
-                                "owned_by": "splash",
-                                "input_modalities": ["text", "image", "pdf"],
-                            }
-                        ]
-                    },
-                ),
-                mock.patch.object(launcher.os, "execvpe"),
-                mock.patch("sys.stdout", io.StringIO()),
+                self.ready_server(name) as execute,
             ):
                 launcher.main([name])
+            execute.assert_called_once()
             probe.assert_not_called()
 
     def test_unready_server_never_launches_or_downloads(self):
