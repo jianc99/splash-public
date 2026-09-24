@@ -473,26 +473,29 @@ def _draft(family, selection, installed):
     """The draft repository and its downloaded files, by assembly path:
     --draft-model as resolved at installation, or else the family's pinned
     draft. An installation keeps its draft, from the cache, while it is the
-    one to use, and when a newly pinned one cannot be resolved."""
+    one to use, and when a newly pinned one cannot be fetched."""
     recorded = installed and installed["sources"]["draft"]
     keep = recorded and (selection.draft_model or recorded == _pinned_draft(family))
-    repo = None if keep else _new_draft(family, selection, recorded)
-    if repo is None:
-        repo = hub.Repository.recorded(recorded)
+    if not keep and (chosen := _new_draft(family, selection, recorded)) is not None:
+        return chosen
+    repo = hub.Repository.recorded(recorded)
     return repo, _draft_files(repo, family)
 
 
 def _new_draft(family, selection, recorded):
-    """The draft chosen anew: --draft-model, or the family's pinned draft.
-    None, with a warning, when it cannot be resolved and the installation
-    recorded a draft to keep."""
+    """The draft chosen anew, --draft-model or the family's pinned draft, and
+    its downloaded files. None, with a warning, when it cannot be fetched
+    (resolved, downloaded and checked) and the installation recorded a draft
+    to keep."""
     try:
         with hub.as_model_errors(f"cannot fetch the {family.name} draft"):
             if selection.draft_model:
-                return hub.Repository.resolve(
+                repo = hub.Repository.resolve(
                     selection.draft_model, installation=selection.link
                 )
-            return hub.Repository.resolve(families.DRAFTS, family.draft.revision)
+            else:
+                repo = hub.Repository.resolve(families.DRAFTS, family.draft.revision)
+            return repo, _draft_files(repo, family)
     except models.ModelError as error:
         if not recorded:
             raise

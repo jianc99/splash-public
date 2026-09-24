@@ -618,6 +618,65 @@ class UpstreamTest(unittest.TestCase):
         )
         self.assertEqual(fake.downloads, [])
 
+    def move_target_and_pin_a_new_draft(self, build_draft, failing_revision=None):
+        """Install MODEL, then start with MODEL moved to b*40 while this
+        release pins DENSE's draft at e*40, built by build_draft; fetches of
+        failing_revision fail. The warnings of that start."""
+        fake = fake_hub(self, self.cache)
+        chosen = selection(self.root)
+        self.prepare(chosen)
+        fake.publish(MODEL, "b" * 40, lambda p: mlx_target(p, DENSE))
+        fake.publish(families.DRAFTS, "e" * 40, build_draft)
+        fetch = fake.fetch
+
+        def fetch_or_fail(repo_id, name, revision):
+            if revision == failing_revision:
+                raise OSError(errno.ECONNRESET, "connection reset by peer")
+            return fetch(repo_id, name, revision)
+
+        repinned = dataclasses.replace(
+            DENSE, draft=families.Draft("e" * 40, DENSE.draft.layers)
+        )
+        with (
+            mock.patch.object(families, "FAMILIES", (repinned, MOE)),
+            mock.patch.object(fake, "fetch", side_effect=fetch_or_fail),
+        ):
+            _, warnings = self.prepare(chosen)
+        # The new target is installed with the installed draft.
+        self.assertEqual(
+            assembly.verify(chosen.link)["sources"],
+            {
+                "target": {"repo": MODEL, "revision": "b" * 40},
+                "draft": {"repo": families.DRAFTS, "revision": DENSE.draft.revision},
+            },
+        )
+        self.assertEqual(pins(self.cache), sorted(["b" * 40, DENSE.draft.revision]))
+        return warnings
+
+    def test_a_new_draft_whose_download_fails_keeps_the_installed_draft(self):
+        warnings = self.move_target_and_pin_a_new_draft(
+            lambda p: draft_dir(p, DENSE), failing_revision="e" * 40
+        )
+        self.assertIn(
+            f"Warning: cannot fetch the {DENSE.name} draft {'e' * 12}; keeping the "
+            "installed one: cannot fetch the Qwen3.8-27B draft: [Errno 54] "
+            "connection reset by peer",
+            warnings,
+        )
+
+    def test_a_new_draft_missing_a_layer_keeps_the_installed_draft(self):
+        def incomplete(root):
+            draft_dir(root, DENSE)
+            (root / DENSE.name / "layer-0.bin").unlink()
+
+        warnings = self.move_target_and_pin_a_new_draft(incomplete)
+        self.assertIn(
+            f"Warning: cannot fetch the {DENSE.name} draft {'e' * 12}; keeping the "
+            f"installed one: {families.DRAFTS} does not contain the Splash DFlash2 "
+            f"draft for {DENSE.name}",
+            warnings,
+        )
+
     def test_a_moved_hub_cache_starts_the_installation_it_links(self):
         # HF_HUB_CACHE may name another folder than the one an installation
         # was built from; its links still name its files there.
