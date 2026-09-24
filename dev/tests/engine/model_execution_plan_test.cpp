@@ -18,11 +18,6 @@ void require(bool condition, const char *message) {
     throw std::runtime_error(message);
 }
 
-uint64_t aligned(uint64_t bytes) {
-  constexpr uint64_t alignment = 16 * 1024;
-  return (bytes + alignment - 1) & ~(alignment - 1);
-}
-
 template <class Weights>
 model::ModelPackage package() {
   model::ModelPackage result;
@@ -96,8 +91,8 @@ void checkPackage(const model::ModelPackage &package, uint32_t family) {
   const auto prefillAfter = selected.prefillAttentionWorkspace(
       2048, attention.queryHeads, geometry.kvLayout);
   const uint64_t prefillGrowth =
-      aligned(prefillAfter.partialsBytes) - aligned(prefillBefore.partialsBytes) +
-      aligned(prefillAfter.statisticsBytes) - aligned(prefillBefore.statisticsBytes);
+      model::alignArena(prefillAfter.partialsBytes) - model::alignArena(prefillBefore.partialsBytes) +
+      model::alignArena(prefillAfter.statisticsBytes) - model::alignArena(prefillBefore.statisticsBytes);
   // The selected split count and the fallback baseline share an arena whose
   // governed bound includes the larger candidate's exact scratch requirement.
   require(prefillGrowth > 0 &&
@@ -118,7 +113,8 @@ void checkPackage(const model::ModelPackage &package, uint32_t family) {
     const auto oldMoe = baseline.moeDecodeWorkspacePerLane(geometry.moeShape());
     const auto newMoe = selected.moeDecodeWorkspacePerLane(geometry.moeShape());
     for (const ops::MoeScratchField &field : ops::kMoeScratchFields)
-      decodeGrowth += aligned(4 * (newMoe.*field.bytes)) - aligned(4 * (oldMoe.*field.bytes));
+      decodeGrowth += model::alignArena(model::kLaneCount * (newMoe.*field.bytes)) -
+                      model::alignArena(model::kLaneCount * (oldMoe.*field.bytes));
     require(decodeGrowth > 0, "M24 expert plan did not reserve larger scratch");
   }
   require(after.sharedDecodePlannedAllocatedBytes ==
@@ -169,8 +165,8 @@ void checkMixedLayouts() {
                 containsHead(geometry.target.decodeProjections),
             "vocabulary head must reserve workspace only in decode");
     const auto scratch = model::DecodeArena::linearScratchSize(geometry, plans);
-    for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
-      const auto plan = plans.linear().plan({{up.outputSize, up.inputSize}, lanes * 8,
+    for (uint32_t lanes = 1; lanes <= model::kLaneCount; ++lanes) {
+      const auto plan = plans.linear().plan({{up.outputSize, up.inputSize}, lanes * model::kDecodeRows,
           ops::LinearPhase::Decode, ops::LinearEpilogue::GateUp}, up);
       const auto required = plan.scratchSize();
       require(scratch.input >= required.input && scratch.sums >= required.sums &&
