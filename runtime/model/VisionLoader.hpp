@@ -38,4 +38,9 @@ private:
 // Bytes of the packed layout, which every source prepares.
 [[nodiscard]] uint64_t preparedVisionBytes(const ops::VisionLayout &layout);
 
+// Throws unless the layout is one the packed file can hold: every size set,
+// the heads covering the width, the merger's width the merged patches' and
+// the patch embedding's width that of two frames of RGB patches.
+void requireVisionLayout(const ops::VisionLayout &layout);
+
 } // namespace splash::model

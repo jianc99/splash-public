@@ -170,11 +170,7 @@ VisionLoader::VisionLoader(const std::filesystem::path &directory, VisionSource 
                            const ops::VisionLayout &layout, PreparationCheck check, PreparationCheck admitConversion)
     : impl_(std::make_unique<Impl>(layout, check, std::move(admitConversion))) {
   auto &i = *impl_;
-  // The writer relies on the packed patch width and on padding that only adds
-  // rows or columns.
-  if (layout.patchDimension != 6 * layout.patchSize * layout.patchSize ||
-      layout.paddedIntermediateSize < layout.intermediateSize)
-    throw WeightStoreError("Qwen vision layout is inconsistent");
+  requireVisionLayout(layout);
   i.plan = plan(layout);
   if (source == VisionSource::Mlx) {
     i.checkpoint = std::make_unique<SafetensorsCheckpoint>(directory, check);
@@ -203,5 +199,18 @@ std::filesystem::path VisionLoader::prepare() const {
 }
 
 uint64_t preparedVisionBytes(const ops::VisionLayout &layout) { return plan(layout).bytes; }
+
+// The writer relies on the packed patch width and on padding that only adds
+// rows or columns.
+void requireVisionLayout(const ops::VisionLayout &layout) {
+  if (!layout.depth || !layout.hiddenSize || !layout.patchDimension || !layout.intermediateSize ||
+      !layout.paddedIntermediateSize || !layout.mergedHiddenSize || !layout.outputHiddenSize || !layout.heads ||
+      !layout.headDimension || !layout.positionGridSide || !layout.patchSize || !layout.spatialMerge ||
+      layout.heads * layout.headDimension != layout.hiddenSize ||
+      layout.paddedIntermediateSize < layout.intermediateSize ||
+      layout.mergedHiddenSize != layout.hiddenSize * layout.spatialMerge * layout.spatialMerge ||
+      layout.patchDimension != 3 * 2 * layout.patchSize * layout.patchSize)
+    throw WeightStoreError("Qwen vision layout is inconsistent");
+}
 
 } // namespace splash::model

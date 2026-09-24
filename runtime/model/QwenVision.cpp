@@ -6,21 +6,6 @@
 namespace splash::model {
 namespace {
 
-void requireLayout(const ops::VisionLayout &layout) {
-  if (!layout.depth || !layout.hiddenSize || !layout.patchDimension ||
-      !layout.intermediateSize || !layout.paddedIntermediateSize ||
-      !layout.mergedHiddenSize || !layout.outputHiddenSize || !layout.heads ||
-      !layout.headDimension || !layout.positionGridSide || !layout.patchSize ||
-      !layout.spatialMerge ||
-      layout.heads * layout.headDimension != layout.hiddenSize ||
-      layout.paddedIntermediateSize < layout.intermediateSize ||
-      layout.mergedHiddenSize !=
-          layout.hiddenSize * layout.spatialMerge * layout.spatialMerge ||
-      layout.patchDimension != 3 * 2 * layout.patchSize * layout.patchSize) {
-    throw WeightStoreError("Qwen vision layout is inconsistent");
-  }
-}
-
 ops::VisionAffine readAffine(WeightFile &file, uint32_t outputSize,
                              uint32_t inputSize, std::string_view label) {
   return {
@@ -96,12 +81,12 @@ QwenVisionWeights readVision(metal::MetalBackend &backend,
 QwenVisionWeights loadQwenVisionWeights(metal::MetalBackend &backend,
                                         const std::filesystem::path &directory,
                                         ops::VisionLayout layout) {
-  requireLayout(layout);
+  requireVisionLayout(layout);
   return readVision(backend, directory / "model.bin", {}, layout);
 }
 
+// The loader checked its layout when it was built.
 QwenVisionWeights loadQwenVisionWeights(metal::MetalBackend &backend, const VisionLoader &source) {
-  requireLayout(source.layout());
   return readVision(backend, source.prepare(), source.weight().key, source.layout());
 }
 

@@ -4,7 +4,7 @@
 //   vision-preparation mlx|gguf DIRECTORY cold|warm [EXPECTED]
 //
 // warm requires a cache hit. EXPECTED is an independently serialized file the
-// prepared bytes must equal.
+// prepared bytes and the size estimate must equal.
 
 #include "TestFiles.hpp"
 #include "model/VisionLoader.hpp"
@@ -45,8 +45,6 @@ int main(int argc, char **argv) {
     const model::VisionLoader preparation(argv[2], source, layout, {},
                                           mode == "warm" ? model::PreparationCheck(forbidden)
                                                          : model::PreparationCheck());
-    if (preparation.weight().bytes != model::preparedVisionBytes(layout))
-      throw std::runtime_error("vision size estimate differs");
     const auto path = preparation.prepare();
     if (model::VisionLoader(argv[2], source, layout, {}, forbidden).prepare() !=
         path)
@@ -61,6 +59,8 @@ int main(int argc, char **argv) {
             std::to_string(differs.first - actual.begin()) + " (" +
             std::to_string(actual.size()) + " prepared, " +
             std::to_string(expected.size()) + " expected)");
+      if (model::preparedVisionBytes(layout) != expected.size())
+        throw std::runtime_error("vision size estimate differs from the oracle");
     }
     std::cout << path.string() << '\n' << preparation.weight().key << '\n';
   } catch (const std::exception &e) {
