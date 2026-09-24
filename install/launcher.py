@@ -173,12 +173,11 @@ def serve(args):
             draft_model=args.draft_model,
         )
         _ensure_installed(selection)
-        root = selection.link
-        if model_artifacts.installation_kind(root) == model_artifacts.ASSEMBLY:
-            # A concurrent install may advance the selection link. Keep this
-            # process's tokenizer, draft and target on one immutable
-            # assembly, held until the server exits.
-            root, record = assembly.hold(root, selection.models_root)
+        # A concurrent install may advance the selection link. Keep this
+        # process's tokenizer, draft and target on one immutable assembly,
+        # held until the server exits.
+        root, record = assembly.hold(selection.link, selection.models_root)
+        if record is not None:
             os.set_inheritable(record.fileno(), True)
         command = [
             str(paths.PYTHON),

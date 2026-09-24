@@ -86,9 +86,21 @@ class HttpRegressionTests(unittest.TestCase):
                         ]
                     )
 
+            def hold(arguments):
+                with mock.patch.object(smoke.model_artifacts, "MODELS", models):
+                    smoke.hold_package(arguments)
+
             arguments = parse(legacy)
             self.assertEqual(arguments.package, models / legacy)
+            hold(arguments)
+            self.assertEqual(
+                (arguments.package, arguments.held_record), (models / legacy, None)
+            )
+            # Parsing only names the selection link; the servers' run holds it.
             arguments = parse(upstream)
+            self.assertEqual(arguments.package, models / upstream)
+            self.assertFalse(smoke.assembly.is_held(assembly))
+            hold(arguments)
             try:
                 # Installations collect an unlinked assembly unless it is held.
                 self.assertEqual(arguments.package, assembly)

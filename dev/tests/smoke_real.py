@@ -1050,16 +1050,22 @@ def add_server_arguments(parser):
 
 
 def resolve_server_arguments(arguments):
+    """Serve --package, or else the selection link of --model."""
     if arguments.package is None:
-        link = model_artifacts.selection_link(model_artifacts.MODELS, arguments.model)
-        arguments.package = link
-        if model_artifacts.installation_kind(link) == model_artifacts.ASSEMBLY:
-            # As splash serve does: every server this process starts, and its
-            # tokenizer, use one assembly, which installations keep while held.
-            arguments.package, arguments.held_record = assembly.hold(
-                link, model_artifacts.MODELS
-            )
+        arguments.package = model_artifacts.selection_link(
+            model_artifacts.MODELS, arguments.model
+        )
     return arguments
+
+
+def hold_package(arguments):
+    """As splash serve does, serve every server this process starts, and its
+    tokenizer, from one assembly, which installations keep while it is held:
+    point arguments.package at the assembly it links now, held until the
+    process exits by arguments.held_record (None for a legacy package)."""
+    arguments.package, arguments.held_record = assembly.hold(
+        arguments.package, model_artifacts.MODELS
+    )
 
 
 def parse_args(argv=None):
@@ -1070,6 +1076,7 @@ def parse_args(argv=None):
 
 def main(argv=None) -> int:
     arguments = parse_args(argv)
+    hold_package(arguments)
     server = RealServer(arguments)
     try:
         validate_status(

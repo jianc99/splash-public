@@ -197,6 +197,7 @@ def parse_args(argv=None):
 
 def main(argv=None):
     args = parse_args(argv)
+    smoke.hold_package(args)
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(
