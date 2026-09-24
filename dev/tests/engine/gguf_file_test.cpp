@@ -1,11 +1,10 @@
+#include "TestFiles.hpp"
 #include "model/GgufFile.hpp"
 
-#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <limits>
 #include <vector>
-#include <unistd.h>
 
 namespace {
 using Bytes = std::vector<char>;
@@ -51,23 +50,22 @@ void require(bool ok, const std::string &message) {
 } // namespace
 
 int main() {
-  char directory[] = "/tmp/splash-gguf-test-XXXXXX";
-  if (!mkdtemp(directory)) return 1;
-  const auto path = std::filesystem::path(directory) / "test.gguf";
-  const auto write = [&](const Bytes &data) {
-    std::ofstream file(path, std::ios::binary);
-    file.write(data.data(), data.size());
-  };
-  const auto rejects = [&](const char *name, const Bytes &data) {
-    write(data);
-    try {
-      splash::model::WeightSource source(path);
-      splash::model::GgufFile file(source);
-    }
-    catch (const splash::model::GgufError &) { return; }
-    throw std::runtime_error(std::string("accepted invalid GGUF: ") + name);
-  };
   try {
+    const splash::test::TemporaryDirectory directory("splash-gguf-file");
+    const auto path = directory.path() / "test.gguf";
+    const auto write = [&](const Bytes &data) {
+      std::ofstream file(path, std::ios::binary);
+      file.write(data.data(), data.size());
+    };
+    const auto rejects = [&](const char *name, const Bytes &data) {
+      write(data);
+      try {
+        splash::model::WeightSource source(path);
+        splash::model::GgufFile file(source);
+      }
+      catch (const splash::model::GgufError &) { return; }
+      throw std::runtime_error(std::string("accepted invalid GGUF: ") + name);
+    };
     write(model({256, 1}));
     splash::model::WeightSource source(path);
     splash::model::GgufFile valid(source);
@@ -109,11 +107,9 @@ int main() {
       append<uint64_t>(nested, 1);
     }
     rejects("excessive nesting", nested);
-    std::filesystem::remove_all(directory);
     std::cout << "GGUF parser bounds tests passed\n";
     return 0;
   } catch (const std::exception &error) {
-    std::filesystem::remove_all(directory);
     std::cerr << error.what() << '\n';
     return 1;
   }

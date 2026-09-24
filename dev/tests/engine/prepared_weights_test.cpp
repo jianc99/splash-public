@@ -1,3 +1,4 @@
+#include "TestFiles.hpp"
 #include "model/PreparedWeights.hpp"
 
 #include <sys/wait.h>
@@ -9,7 +10,6 @@
 #include <array>
 #include <cerrno>
 #include <filesystem>
-#include <fstream>
 #include <iostream>
 #include <stdexcept>
 #include <vector>
@@ -31,12 +31,10 @@ PreparedWeight entry(uint8_t value, uint64_t bytes) {
 }
 
 int main() {
-  char path[] = "/tmp/splash-prepared-weights-XXXXXX";
-  const char *directory = mkdtemp(path);
-  if (!directory) return 1;
-  const std::filesystem::path root(directory);
-  setenv("SPLASH_WEIGHT_CACHE", root.c_str(), 1);
   try {
+    const splash::test::TemporaryDirectory directory("splash-prepared-weights");
+    const std::filesystem::path &root = directory.path();
+    setenv("SPLASH_WEIGHT_CACHE", root.c_str(), 1);
     const PreparedWeights store;
     std::vector<uint8_t> bytes(128 * 1024);
     for (size_t i = 0; i < bytes.size(); ++i) bytes[i] = static_cast<uint8_t>(i * 37);
@@ -166,21 +164,19 @@ int main() {
     const PreparedWeight otherComponent{key(32), bytes.size(), "target/head.bin", key(40), "/models/a"};
     for (const auto &weight : {older, otherData, otherComponent}) static_cast<void>(store.prepare(weight, write));
     std::filesystem::create_directory(root / key(33));
-    std::ofstream(root / key(33) / "source") << "/models/a\nhead.bin\n";
+    splash::test::writeFile(root / key(33) / "source", "/models/a\nhead.bin\n");
     std::filesystem::create_directory(root / key(34));
-    std::ofstream(root / key(34) / "source") << "/models/c\nhead.bin\n";
+    splash::test::writeFile(root / key(34) / "source", "/models/c\nhead.bin\n");
     static_cast<void>(store.prepare({key(35), bytes.size(), "target/layer-0.bin", key(40), "/models/a"}, write));
     require(!std::filesystem::exists(root / key(30)) && !std::filesystem::exists(root / key(33)) &&
                 std::filesystem::exists(root / key(31)) && std::filesystem::exists(root / key(32)) &&
                 std::filesystem::exists(root / key(34)) && std::filesystem::exists(root / key(35)) &&
                 std::filesystem::exists(root / key(1)),
             "superseded entries were kept or others removed");
-    std::filesystem::remove_all(root);
     std::cout << "prepared weights: content, reuse, corruption, interruption, pressure, concurrency and "
                  "superseded entries PASS\n";
   } catch (const std::exception &error) {
     std::cerr << error.what() << '\n';
-    std::filesystem::remove_all(root);
     return 1;
   }
 }

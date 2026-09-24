@@ -1,12 +1,13 @@
+#include "TestFiles.hpp"
 #include "model/SafetensorsCheckpoint.hpp"
 
 #include <array>
 #include <cstdlib>
-#include <unistd.h>
+#include <cstring>
 #include <filesystem>
-#include <fstream>
 #include <iostream>
 #include <stdexcept>
+#include <vector>
 
 using namespace splash::model;
 namespace {
@@ -18,22 +19,22 @@ template<class F> void rejects(F run, const char *message) {
   try { run(); } catch (const std::exception &) { rejected = true; }
   require(rejected, message);
 }
-void shard(const std::filesystem::path &path, std::string_view header, size_t bytes = 16, size_t first = 1) {
-  std::ofstream file(path, std::ios::binary | std::ios::trunc);
+void shard(const std::filesystem::path &path, std::string_view header, size_t bytes = 16, uint8_t first = 1) {
   const uint64_t length = header.size();
-  file.write(reinterpret_cast<const char *>(&length), sizeof(length));
-  file << header;
-  for (size_t i = 0; i < bytes; ++i) file.put(static_cast<char>(i + first));
+  std::vector<uint8_t> file(sizeof length);
+  std::memcpy(file.data(), &length, sizeof length);
+  file.insert(file.end(), header.begin(), header.end());
+  for (size_t i = 0; i < bytes; ++i) file.push_back(static_cast<uint8_t>(i + first));
+  splash::test::writeFile(path, file);
 }
 constexpr auto valid = R"({"a":{"dtype":"U32","shape":[2,2],"data_offsets":[0,16]}})";
 }
 int main() {
-  char temporary[] = "/tmp/splash-affine-checkpoint-XXXXXX";
-  if (!mkdtemp(temporary)) return 1;
-  const std::filesystem::path root(temporary);
-  setenv("SPLASH_WEIGHT_CACHE", (root / "cache").c_str(), 1);
   try {
-    std::ofstream(root / "config.json") << R"({"quantization":{"bits":4,"group_size":64,"router":{"bits":8}},"text_config":{"layers":2,"model_type":"fixture","layer_types":["linear_attention","full_attention"]}})";
+    const splash::test::TemporaryDirectory directory("splash-affine-checkpoint");
+    const std::filesystem::path &root = directory.path();
+    setenv("SPLASH_WEIGHT_CACHE", (root / "cache").c_str(), 1);
+    splash::test::writeFile(root / "config.json", R"({"quantization":{"bits":4,"group_size":64,"router":{"bits":8}},"text_config":{"layers":2,"model_type":"fixture","layer_types":["linear_attention","full_attention"]}})");
     shard(root / "model.safetensors", valid);
     SafetensorsCheckpoint source(root);
     source.requireQuantization("projection", 4);
@@ -82,11 +83,9 @@ int main() {
     }
     shard(root / "model.safetensors", valid, 8);
     rejects([&] { SafetensorsCheckpoint invalid(root); }, "truncated tensor accepted");
-    std::filesystem::remove_all(root);
     std::cout << "affine checkpoint: bounded reads, metadata, quantization, identity and malformed sources PASS\n";
   } catch (const std::exception &error) {
     std::cerr << error.what() << '\n';
-    std::filesystem::remove_all(root);
     return 1;
   }
 }
