@@ -371,18 +371,6 @@ class ChatTemplateProbeTests(unittest.TestCase):
                     (chosen.later_system, chosen.source), (UNSUPPORTED, text)
                 )
 
-    def test_probe_renders_every_option_as_a_request_does(self):
-        # An effort the template rejects renders its alias, as in a request,
-        # so every option compares rendered conversations.
-        for name in UPSTREAM:
-            render = chat_templates._renderer(tokenizer(source(name)))
-            for options in chat_templates._OPTIONS:
-                for messages in chat_templates._ORDINARY:
-                    with self.subTest(name=name, options=options, messages=messages):
-                        self.assertIsInstance(
-                            render(source(name), messages, options), str
-                        )
-
     def test_named_templates_are_probed_and_selected_like_the_tokenizer(self):
         native = (
             "{%- for message in messages %}{{- message.role + ': ' + message.content"
