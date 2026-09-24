@@ -84,9 +84,8 @@ void bindCheckpoint(const SafetensorsCheckpoint &checkpoint, const ops::VisionLa
   }
 }
 
-// GGUF: a qwen3vl_merger mmproj describing this tower, all of whose tensors
-// preparation uses. The patch embedding is one [channel, patch-row,
-// patch-col] weight per temporal frame (v.patch_embd.weight and .weight.1).
+// The metadata of a clip qwen3vl_merger mmproj of this layout, with no
+// deepstack block.
 void requireMmprojMetadata(const GgufFile &gguf, const ops::VisionLayout &layout) {
   if (gguf.architecture() != "clip" || gguf.stringValue("clip.projector_type") != "qwen3vl_merger")
     throw WeightStoreError("unsupported vision GGUF architecture");
@@ -118,6 +117,9 @@ void requireMmprojMetadata(const GgufFile &gguf, const ops::VisionLayout &layout
     throw WeightStoreError("vision deepstack layers are unsupported");
 }
 
+// GGUF: a qwen3vl_merger mmproj describing this tower, all of whose tensors
+// preparation uses. The patch embedding is one [channel, patch-row,
+// patch-col] weight per temporal frame (v.patch_embd.weight and .weight.1).
 void bindMmproj(const GgufFile &gguf, const ops::VisionLayout &layout, Plan &plan) {
   requireMmprojMetadata(gguf, layout);
   const uint64_t p = layout.patchSize;

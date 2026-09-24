@@ -19,7 +19,7 @@ class VisionLoader final {
 public:
   // check runs on every load, admitConversion on a cache miss.
   VisionLoader(const std::filesystem::path &directory, VisionSource source, const ops::VisionLayout &layout,
-               PreparationCheck check = {}, PreparationCheck admitConversion = {});
+               PreparationCheck check, PreparationCheck admitConversion);
   ~VisionLoader();
   VisionLoader(const VisionLoader &) = delete;
   VisionLoader &operator=(const VisionLoader &) = delete;
