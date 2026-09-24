@@ -396,12 +396,12 @@ int main(int argc, char **argv) {
       deviceName = device.deviceName;
       gpuFamily = device.appleGpuFamily;
       if (const auto error = device.validationError()) throw std::runtime_error(*error);
-      const uint64_t margin =
-          engine::EngineMemoryPolicy::workingSetMarginBytes(device.recommendedMaxWorkingSetBytes);
-      if (device.recommendedMaxWorkingSetBytes <= margin)
+      const uint64_t budget =
+          engine::EngineMemoryPolicy::hardBudgetBytes(device.recommendedMaxWorkingSetBytes);
+      if (!budget)
         throw std::runtime_error("device working set does not cover its protected margin");
       engine::MemoryGovernor governor(
-          backend, device.recommendedMaxWorkingSetBytes - margin,
+          backend, budget,
           engine::EngineMemoryPolicy::hostAvailableReserveBytes(device.physicalMemoryBytes));
       const MeasurementStop underPressure = [&] {
         const auto state = governor.snapshot();
