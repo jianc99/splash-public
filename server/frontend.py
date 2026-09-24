@@ -227,11 +227,13 @@ class Frontend:
         thinking_codec=None,
         served_model_names=(),
         default_reasoning_effort=None,
-        images_enabled=True,
+        vision=True,
     ):
         if not isinstance(preparation_capacity, int) or preparation_capacity <= 0:
             raise ValueError("frontend preparation capacity must be positive")
-        self.images_enabled = images_enabled
+        # Announced by the engine: without vision, image and document parts
+        # are rejected when their messages are converted.
+        self.vision = vision
         self.latencies = LatencyMetrics()
         self.tokenizer = tokenizer
         self.prompt_tokenizer = PromptTokenizer(tokenizer)
@@ -297,8 +299,6 @@ class Frontend:
             for part in message["content"]
             if part.get("type") == "image_url"
         ]
-        if parts and not self.images_enabled:
-            raise APIError(400, "images are unavailable in language-only mode")
         limit = wire.ProtocolLimits().max_image_spans
         if len(parts) > limit:
             raise APIError(400, f"requests support at most {limit} images")
@@ -706,7 +706,9 @@ class Frontend:
         if preserve_thinking is not None and not isinstance(preserve_thinking, bool):
             raise APIError(400, "preserve_thinking must be a boolean")
         messages = template_messages(
-            normalize_messages(body.get("messages"), deadline=deadline)
+            normalize_messages(
+                body.get("messages"), deadline=deadline, vision=self.vision
+            )
         )
         tools, tool_policy = normalize_tools(
             body.get("tools"),
@@ -999,7 +1001,7 @@ class Frontend:
                 if reserve_input is not None:
                     reserve_input(len(previous.history_json))
                 previous_items = json_codec.loads(previous.history_json)
-            chat = responses_to_chat_body(body, previous_items)
+            chat = responses_to_chat_body(body, previous_items, vision=self.vision)
             namespaces = chat.pop("_tool_namespaces")
             job, thinking, has_tools = self._prepare(chat, namespaces, deadline)
             job.response_store = store

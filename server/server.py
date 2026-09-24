@@ -519,6 +519,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
                         body,
                         deadline=deadline,
                         thinking_resolver=self.app.thinking_codec.decode,
+                        vision=self.app.vision,
                     ),
                     deadline=deadline,
                 )
@@ -554,6 +555,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
                         body,
                         deadline=deadline,
                         thinking_resolver=self.app.thinking_codec.decode,
+                        vision=self.app.vision,
                     ),
                     deadline=deadline,
                     clamp_output_budget=True,
@@ -1994,12 +1996,6 @@ def main():
             )
         effective_context = readiness.max_context_tokens
         constraint_factory = ConstraintFactory(tokenizer)
-        source_record = Path(args.target).parent / "model.json"
-        images_enabled = True
-        if source_record.is_file():
-            images_enabled = (
-                json.loads(source_record.read_text())["vision_format"] != "none"
-            )
         app = Frontend(
             tokenizer,
             backend,
@@ -2013,7 +2009,7 @@ def main():
             thinking_codec=thinking_codec,
             served_model_names=args.served_model_name,
             default_reasoning_effort=args.default_reasoning_effort,
-            images_enabled=images_enabled,
+            vision=readiness.vision,
         )
         server.app = app
         server.server_activate()
@@ -2023,7 +2019,8 @@ def main():
             if effective_context % 1024 == 0
             else f"{effective_context:,}"
         )
-        print_status(f"Ready · {args.model} · context {context} · {address}")
+        mode = "" if readiness.vision else " · language only"
+        print_status(f"Ready · {args.model} · context {context}{mode} · {address}")
         server.serve_forever()
     except (engine_runtime.EngineUnhealthy, ThinkingKeyError) as error:
         print_status(f"Error · {error}", error=True)

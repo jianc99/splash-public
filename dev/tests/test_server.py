@@ -10,6 +10,7 @@ import random
 import signal
 import socket
 import struct
+import tempfile
 import threading
 import time
 import unittest
@@ -20,7 +21,8 @@ from unittest import mock
 from openai import OpenAI
 from tokenizers import Tokenizer, decoders, models
 
-from server import api_shapes, diagnostics, judgments, tool_schema
+from dev.tests.engine.test_documents import pdf_bytes
+from server import api_shapes, diagnostics, documents, judgments, tool_schema
 from server import backend as backend_api
 from server import constraints as generation_constraints
 from server import errors as api_errors
@@ -1796,15 +1798,132 @@ class ServerTest(unittest.TestCase):
         with self.assertRaisesRegex(api.APIError, "request size limit"):
             app._expand_image_pads([pad], [image], [0])
 
-    def test_language_only_rejects_images_before_decoding(self):
-        app = self.harness(FakeRuntime(), tokenizer=self.ImagePadTokenizer()).app
-        app.images_enabled = False
-        with mock.patch.object(api.image_input, "decode_data_url") as decode:
-            with self.assertRaisesRegex(api.APIError, "language-only"):
-                app._prepare_images([self._image_message()])
+    def test_language_only_rejects_media_before_decoding_or_rendering(self):
+        runtime = FakeRuntime()
+        harness = self.harness(
+            runtime, tokenizer=self.ImagePadTokenizer(), max_context=65536, vision=False
+        )
+        image = self._png_data_url()
+        pdf = base64.b64encode(pdf_bytes()).decode()
+        pdf_url = "data:application/pdf;base64," + pdf
+        chat = {
+            "image_url": {"type": "image_url", "image_url": {"url": image}},
+            "file": {
+                "type": "file",
+                "file": {"filename": "a.pdf", "file_data": pdf_url},
+            },
+        }
+        responses = {
+            "input_image": {"type": "input_image", "image_url": image},
+            "input_file": {
+                "type": "input_file",
+                "filename": "a.pdf",
+                "file_data": pdf_url,
+            },
+        }
+        anthropic = {
+            "image": {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": image.partition(",")[2],
+                },
+            },
+            "document": {
+                "type": "document",
+                "source": {
+                    "type": "base64",
+                    "media_type": "application/pdf",
+                    "data": pdf,
+                },
+            },
+        }
+        call = {
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "look", "arguments": "{}"},
+        }
+        # Every API, with each part in a user turn and in a tool result.
+        cases = []
+        for kind, part in chat.items():
+            tool_result = [
+                {"role": "user", "content": "look"},
+                {"role": "assistant", "content": "", "tool_calls": [call]},
+                {"role": "tool", "tool_call_id": "call_1", "content": [part]},
+            ]
+            for path in ("/v1/chat/completions", "/apply-template"):
+                for messages in ([{"role": "user", "content": [part]}], tool_result):
+                    cases.append((path, kind, self.body(messages=messages)))
+        for kind, part in responses.items():
+            tool_result = [
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "look",
+                    "arguments": "{}",
+                },
+                {"type": "function_call_output", "call_id": "call_1", "output": [part]},
+            ]
+            for items in ([{"role": "user", "content": [part]}], tool_result):
+                cases.append(("/v1/responses", kind, self.responses_body(input=items)))
+        for kind, block in anthropic.items():
+            tool_result = [
+                {"role": "user", "content": "look"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_1",
+                            "name": "look",
+                            "input": {},
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_1",
+                            "content": [block],
+                        }
+                    ],
+                },
+            ]
+            for path in ("/v1/messages", "/v1/messages/count_tokens"):
+                for messages in ([{"role": "user", "content": [block]}], tool_result):
+                    cases.append((path, kind, self.anthropic_body(messages=messages)))
+        with (
+            mock.patch.object(
+                api.image_input,
+                "decode_data_url",
+                wraps=api.image_input.decode_data_url,
+            ) as decode,
+            mock.patch.object(
+                documents, "pdf_content", wraps=documents.pdf_content
+            ) as render,
+        ):
+            for path, kind, body in cases:
+                with self.subTest(path=path, kind=kind):
+                    status, _, payload = harness.request("POST", path, body)
+                    self.assertEqual(status, 400, payload)
+                    self.assertEqual(
+                        json.loads(payload)["error"]["message"],
+                        f"{kind} content is not supported: "
+                        "this model is serving without vision "
+                        "(started with --language-only)",
+                    )
             decode.assert_not_called()
-        self.assertEqual(app.images.stats()["request_bytes"], 0)
-        app._prepare_images([{"role": "user", "content": "hello"}])
+            render.assert_not_called()
+        self.assertEqual(runtime.requests, [])
+        self.assertEqual(harness.app.images.stats()["request_bytes"], 0)
+        self._wait_for_http_active(harness.server.request_bodies, 0)
+        status, _, payload = harness.request(
+            "POST", "/v1/chat/completions", self.body()
+        )
+        self.assertEqual(status, 200, payload)
 
     def test_image_count_is_checked_before_decoding(self):
         app = self.harness(FakeRuntime(), tokenizer=self.ImagePadTokenizer()).app
@@ -3220,6 +3339,83 @@ class ServerTest(unittest.TestCase):
         server.server_bind.assert_called_once_with()
         server.server_activate.assert_called_once_with()
         self.assertEqual(order, ["bind", "runtime"])
+
+    def test_main_takes_vision_from_ready_not_the_model_record(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "target").mkdir()
+            # A stale record must not decide; only the native engine knows.
+            (root / "model.json").write_text('{"vision_format": "none"}')
+            args = SimpleNamespace(
+                target=str(root / "target"),
+                served_model_name=[],
+                default_reasoning_effort=None,
+                draft=str(root / "draft"),
+                tokenizer="tokenizer",
+                model="test-model",
+                max_context=None,
+                max_memory=None,
+                max_image_pixels=api.image_input.MAX_PIXELS,
+                max_new_tokens=16,
+                request_timeout=2,
+                queue_size=1,
+                host="127.0.0.1",
+                allowed_host=[],
+                api_key=None,
+                no_webui=False,
+                max_request_size=api.DEFAULT_MAX_REQUEST_BYTES,
+                port=0,
+                binary="splash",
+                kv_format="int8",
+            )
+            features = int(
+                native_wire.ReadyFeature.CANCELLATION
+                | native_wire.ReadyFeature.TOKEN_MASKS
+                | native_wire.ReadyFeature.STATUS_JSON
+                | native_wire.ReadyFeature.MULTIPLEXING
+            )
+            for vision in (True, False):
+                with self.subTest(vision=vision):
+                    runtime = mock.Mock()
+                    runtime.readiness = native_wire.ReadyEvent(
+                        1,
+                        4,
+                        131072,
+                        features | (native_wire.ReadyFeature.VISION if vision else 0),
+                    )
+                    with (
+                        mock.patch.object(api, "parse_args", return_value=args),
+                        mock.patch.object(api, "load_thinking_key", return_value=None),
+                        mock.patch.object(
+                            api.AutoTokenizer, "from_pretrained", return_value=object()
+                        ),
+                        mock.patch.object(api, "validate_tokenizer"),
+                        mock.patch.object(
+                            api.engine_runtime,
+                            "MultiplexedRuntime",
+                            return_value=runtime,
+                        ),
+                        mock.patch.object(api, "NativeBackend"),
+                        mock.patch.object(api, "ConstraintFactory"),
+                        mock.patch.object(api, "Frontend") as app_type,
+                        mock.patch.object(
+                            api,
+                            "FrontendServer",
+                            return_value=mock.Mock(server_port=8000),
+                        ),
+                        mock.patch.object(api.signal, "signal"),
+                        mock.patch.object(api, "print_status") as status,
+                    ):
+                        api.main()
+                    self.assertIs(app_type.call_args.kwargs["vision"], vision)
+                    self.assertIn(
+                        mock.call(
+                            "Ready · test-model · context 128K"
+                            + ("" if vision else " · language only")
+                            + " · http://127.0.0.1:8000"
+                        ),
+                        status.call_args_list,
+                    )
 
     def test_main_cleans_up_when_native_startup_fails_after_reserved_bind(self):
         args = SimpleNamespace(
