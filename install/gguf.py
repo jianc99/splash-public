@@ -216,9 +216,7 @@ def tokenizer_files(metadata):
         raise ModelError("GGUF chat template is empty")
     config = {
         "tokenizer_class": "TokenizersBackend",
-        "model_max_length": m.positive(
-            m.require("general.architecture", str) + ".context_length"
-        ),
+        "model_max_length": m.positive(text_architecture(m) + ".context_length"),
         "clean_up_tokenization_spaces": False,
         "bos_token": special("bos", optional=True),
         "eos_token": special("eos"),
@@ -243,12 +241,21 @@ def tokenizer_files(metadata):
     }
 
 
+# The GGUF text architectures Splash serves, and the model type of each one's
+# text configuration.
+TEXT_MODEL_TYPES = {"qwen35": "qwen3_5_text", "qwen35moe": "qwen3_5_moe_text"}
+
+
+def text_architecture(m):
+    arch = m.require("general.architecture", str)
+    if arch not in TEXT_MODEL_TYPES:
+        raise ModelError("unsupported GGUF model architecture: " + arch)
+    return arch
+
+
 def model_config(metadata, vision=None):
     m = metadata
-    arch = m.require("general.architecture", str)
-    types = {"qwen35": "qwen3_5_text", "qwen35moe": "qwen3_5_moe_text"}
-    if arch not in types:
-        raise ModelError("unsupported GGUF model architecture: " + arch)
+    arch = text_architecture(m)
     fields = {
         "hidden_size": "embedding_length",
         "max_position_embeddings": "context_length",
@@ -259,7 +266,7 @@ def model_config(metadata, vision=None):
     text = {name: m.positive(arch + "." + key) for name, key in fields.items()}
     text.update(
         num_hidden_layers=loaded_layers(m, arch),
-        model_type=types[arch],
+        model_type=TEXT_MODEL_TYPES[arch],
         vocab_size=len(m.require("tokenizer.ggml.tokens", list)),
     )
     if arch == "qwen35moe":
@@ -267,7 +274,10 @@ def model_config(metadata, vision=None):
             num_experts=m.positive(arch + ".expert_count"),
             num_experts_per_tok=m.positive(arch + ".expert_used_count"),
         )
-    config = {"model_type": types[arch].removesuffix("_text"), "text_config": text}
+    config = {
+        "model_type": TEXT_MODEL_TYPES[arch].removesuffix("_text"),
+        "text_config": text,
+    }
     if vision is not None:
         config["vision_config"] = vision_config(vision)
     return config
@@ -408,7 +418,7 @@ def loaded_tensors(m):
     """Each tensor name the native loader reads from target header m, with
     the types it accepts. MTP layers are not loaded; every
     full_attention_interval-th layer is full attention, the others GDN."""
-    arch = m.require("general.architecture", str)
+    arch = text_architecture(m)
     period = m.positive(arch + ".full_attention_interval")
     ffn = MOE_TENSORS if arch == "qwen35moe" else DENSE_TENSORS
     tensors = dict(MODEL_TENSORS)

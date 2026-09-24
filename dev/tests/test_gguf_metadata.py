@@ -263,6 +263,19 @@ class GgufMetadataTests(unittest.TestCase):
         self.assertEqual(native, gguf.QUANTIZED_TYPES)
         self.assertLessEqual(gguf.EMBEDDING_TYPES, gguf.QUANTIZED_TYPES)
 
+    def test_every_derivation_names_an_unsupported_architecture(self):
+        values = fixture()
+        values["general.architecture"] = "llama"
+        metadata = self.metadata(values)
+        for derive in (gguf.require_loadable, gguf.model_config, gguf.tokenizer_files):
+            with (
+                self.subTest(derive=derive.__name__),
+                self.assertRaisesRegex(
+                    models.ModelError, "unsupported GGUF model architecture: llama"
+                ),
+            ):
+                derive(metadata)
+
     def test_moe_config_states_its_experts_and_identifies_the_family(self):
         config = gguf.model_config(self.metadata(fixture(native=True)))
         text = config["text_config"]
