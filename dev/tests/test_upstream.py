@@ -237,24 +237,12 @@ class UpstreamTest(unittest.TestCase):
         self.assertEqual(
             upstream.select_gguf(both, "Q4_K_M"), "Qwen3.8-27B-Q4_K_M.gguf"
         )
-        self.assertEqual(upstream.select_vision(files), "mmproj-BF16.gguf")
         for variant in (None, "Q4", "BF16", "missing"):
             with (
                 self.subTest(variant=variant),
                 self.assertRaisesRegex(models.ModelError, "Qwen3.8-27B-Q8_0.gguf"),
             ):
                 upstream.select_gguf(files, variant)
-        self.assertEqual(
-            upstream.select_vision({"mmproj-F16.gguf", "mmproj-F32.gguf"}),
-            "mmproj-F32.gguf",
-        )
-        # F16 has already rounded small weights of the BF16 tower.
-        for projectors in ({"mmproj-Q8_0.gguf"}, {"mmproj-F16.gguf"}):
-            with (
-                self.subTest(projectors=projectors),
-                self.assertRaisesRegex(models.ModelError, "--language-only"),
-            ):
-                upstream.select_vision(projectors)
 
     def test_architecture_is_checked_before_weight_downloads(self):
         hub = FakeHub(self)

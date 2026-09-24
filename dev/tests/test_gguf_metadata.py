@@ -1,6 +1,7 @@
 import argparse
 import contextlib
 import io
+import shutil
 import struct
 import tempfile
 import unittest
@@ -279,6 +280,47 @@ class GgufMetadataTests(unittest.TestCase):
         with models.installation_lock(models_root):
             return upstream._gguf_metadata(models_root, path, None)
 
+    def test_vision_projector_is_chosen_by_its_header(self):
+        tensors = (("v.blk.0.attn_qkv.weight", 30), ("v.patch_embd.weight", 0))
+
+        def projectors(**files):
+            root = self.root / "projectors"
+            shutil.rmtree(root, ignore_errors=True)
+            root.mkdir()
+            for name, (values, kinds) in files.items():
+                write_gguf(root / (name + ".gguf"), values, kinds)
+            return upstream.Repository.local_directory(root)
+
+        bf16 = (vision_fixture(), tensors)
+        f32 = (vision_fixture(), [(name, 0) for name, _ in tensors])
+        f16 = (vision_fixture(), [(tensors[0][0], 1), tensors[1]])
+        text = (fixture(), tensors)
+        # Other publishers' names; F16 and non-vision files never count.
+        repo = projectors(
+            **{"mmproj-Model-bf16": bf16, "mmproj-Model-f16": f16, "mmproj-x": text}
+        )
+        name, header = upstream.select_vision(repo)
+        self.assertEqual(name, "mmproj-Model-bf16.gguf")
+        self.assertEqual(header.values["general.architecture"], "clip")
+        self.assertEqual(
+            upstream.select_vision(
+                projectors(**{"mmproj-f16": f16, "mmproj-f32": f32})
+            )[0],
+            "mmproj-f32.gguf",
+        )
+        with self.assertRaisesRegex(
+            models.ModelError,
+            r"no BF16 or F32 vision projector \(mmproj-f16.gguf \(clip: F16, F32\); "
+            r"mmproj-x.gguf \(qwen35moe: BF16, F32\)\); use --language-only",
+        ):
+            upstream.select_vision(projectors(**{"mmproj-f16": f16, "mmproj-x": text}))
+        with self.assertRaisesRegex(
+            models.ModelError, "several BF16 vision projectors"
+        ):
+            upstream.select_vision(projectors(**{"mmproj-a": bf16, "mmproj-b": bf16}))
+        with self.assertRaisesRegex(models.ModelError, "no mmproj"):
+            upstream.select_vision(projectors())
+
     def test_metadata_cache_hit_integrity_and_atomic_failure(self):
         path = write_gguf(self.root / "model.gguf", fixture())
         cache = self.root / "models"
@@ -335,7 +377,9 @@ class GgufMetadataTests(unittest.TestCase):
         target = self.root / "target"
         target.mkdir()
         write_gguf(target / "model-Q4_K_M.gguf", fixture(native=True))
-        write_gguf(target / "mmproj-F32.gguf", vision_fixture())
+        write_gguf(
+            target / "mmproj-F32.gguf", vision_fixture(), [("v.patch_embd.weight", 0)]
+        )
         # Conflicting sidecars must not override the selected GGUF's metadata.
         for name in ("config.json", "tokenizer.json", "tokenizer_config.json"):
             (target / name).write_text("invalid sidecar")
@@ -384,7 +428,7 @@ class GgufMetadataTests(unittest.TestCase):
         # from the projector's header, before any download.
         values = vision_fixture()
         values["clip.vision.image_mean"] = [0.48, 0.46, 0.41]
-        write_gguf(target / "mmproj-F32.gguf", values)
+        write_gguf(target / "mmproj-F32.gguf", values, [("v.patch_embd.weight", 0)])
         args.models = self.root / "rejected"
         with (
             mock.patch.object(upstream.Repository, "resolve", return_value=source),
