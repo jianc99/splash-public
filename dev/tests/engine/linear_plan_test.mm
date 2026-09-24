@@ -9,7 +9,6 @@
 
 #include <algorithm>
 #include <array>
-#include <bit>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -26,7 +25,6 @@ namespace {
 
 using namespace splash;
 using namespace splash::ops;
-using test::bf16;
 using test::mix;
 
 void require(bool condition, const char *message) {
@@ -43,9 +41,6 @@ template <class Function> void rejects(Function function) {
   throw std::runtime_error("invalid Linear plan or buffer was accepted");
 }
 
-float fp32(uint16_t value) {
-  return std::bit_cast<float>(uint32_t{value} << 16);
-}
 
 Linear gpu(uint32_t family, uint32_t cores) {
   DeviceCapabilities device;
@@ -1149,13 +1144,13 @@ float affineReference(const Projection &p, const uint16_t *input,
     for (uint32_t k = 0; k < 64; ++k) {
       const uint8_t byte = weights[parameter * 32 + k / 2];
       const uint32_t quantized = (byte >> ((k & 1) * 4)) & 15;
-      const float x = fp32(input[uint64_t{row} * p.inputSize + group * 64 + k]);
+      const float x = tuning::bf16ToFloat(input[uint64_t{row} * p.inputSize + group * 64 + k]);
       sum += x;
       partial += x * quantized;
     }
-    result += partial * fp32(scales[parameter]) + sum * fp32(biases[parameter]);
+    result += partial * tuning::bf16ToFloat(scales[parameter]) + sum * tuning::bf16ToFloat(biases[parameter]);
   }
-  return fp32(bf16(result));
+  return tuning::bf16ToFloat(tuning::floatToBf16(result));
 }
 
 void checkReference(const Projection &p, const Projection &gate,
@@ -1174,16 +1169,16 @@ void checkReference(const Projection &p, const Projection &gate,
       float residualValue = 0, gateValue = 0;
       const uint64_t index = uint64_t{row} * p.outputSize + column;
       if (workload.epilogue == LinearEpilogue::Residual) {
-        residualValue = fp32(residual[index]);
+        residualValue = tuning::bf16ToFloat(residual[index]);
         expected += residualValue;
       }
       if (workload.epilogue == LinearEpilogue::GateUp ||
           workload.epilogue == LinearEpilogue::UpWithGate) {
         gateValue = workload.epilogue == LinearEpilogue::GateUp
-            ? affineReference(gate, input, row, column) : fp32(gateValues[index]);
+            ? affineReference(gate, input, row, column) : tuning::bf16ToFloat(gateValues[index]);
         expected *= gateValue / (1 + std::exp(-gateValue));
       }
-      expected = fp32(bf16(expected));
+      expected = tuning::bf16ToFloat(tuning::floatToBf16(expected));
       // The oracle accumulates in the sequential kernel's order. A split tile
       // reassociates that sum, so it is held to the derived bf16 bound
       // (tuning/LinearNumerics.hpp) on top of the oracle's own margin.
@@ -1191,7 +1186,7 @@ void checkReference(const Projection &p, const Projection &gate,
       if (split)
         tolerance += tuning::splitTolerance(workload.epilogue,
             {expected, residualValue, gateValue, projection}, slack);
-      const float actual = fp32(output[index]);
+      const float actual = tuning::bf16ToFloat(output[index]);
       if (!std::isfinite(actual) || std::abs(actual - expected) > tolerance) {
         std::cerr << "reference row=" << row << " col=" << column
                   << " actual=" << actual << " expected=" << expected << '\n';
@@ -1206,7 +1201,7 @@ void checkReference(const Projection &p, const Projection &gate,
       for (uint32_t group = 0; group < quantGroups; ++group) {
         double expected = 0;
         for (uint32_t k = 0; k < 64; ++k)
-          expected += fp32(output[uint64_t{row} * p.outputSize + group * 64 + k]);
+          expected += tuning::bf16ToFloat(output[uint64_t{row} * p.outputSize + group * 64 + k]);
         const uint64_t index = uint64_t{row / 32} * 32 * quantGroups + group * 32 + row % 32;
         require(std::abs(sums[index] - expected) <= 1e-6 * std::max(1.0, std::abs(expected)),
                 "fused prefill output sums have wrong layout/value");
@@ -1294,7 +1289,7 @@ void numericalCase(metal::MetalBackend &backend, Linear &linear,
   auto input = allocate(backend, uint64_t{storageRows} * p.inputSize * 2);
   auto *inputValues = static_cast<uint16_t *>(input.contents());
   for (uint64_t i = 0; i < uint64_t{workload.rows} * p.inputSize; ++i)
-    inputValues[i] = bf16(float(int(mix(uint32_t(i) + 1949) % 257) - 128) / 257.0f);
+    inputValues[i] = tuning::floatToBf16(float(int(mix(uint32_t(i) + 1949) % 257) - 128) / 257.0f);
   // Sequential candidates share their output bytes; split-K candidates are
   // held to the derived bound against them once every candidate has run.
   std::vector<uint16_t> baseline;
@@ -1324,7 +1319,7 @@ void numericalCase(metal::MetalBackend &backend, Linear &linear,
       b.residual = inPlaceResidual ? b.output : allocate(backend, b.output.sizeBytes());
       auto *residual = static_cast<uint16_t *>(b.residual.contents());
       for (uint64_t i = 0; i < uint64_t{workload.rows} * p.outputSize; ++i)
-        residual[i] = bf16(float(int(mix(uint32_t(i) + 7919) % 257) - 128) / 257.0f);
+        residual[i] = tuning::floatToBf16(float(int(mix(uint32_t(i) + 7919) % 257) - 128) / 257.0f);
     }
     bufferContracts(backend, linear, b, p, gate, plan);
     metal::CommandGraph graph;
@@ -1455,21 +1450,22 @@ void numericalCase(metal::MetalBackend &backend, Linear &linear,
     upReference.assign(u, u + baseline.size());
   }
   float maxAbs = 0;
-  for (const uint16_t value : baseline) maxAbs = std::max(maxAbs, std::fabs(fp32(value)));
+  for (const uint16_t value : baseline) maxAbs = std::max(maxAbs, std::fabs(tuning::bf16ToFloat(value)));
   const float slack = tuning::reassociationSlack(p.inputSize, maxAbs);
   const float operandSlack = std::max(tuning::simdgroupSlack(workload, input, p),
                                       tuning::simdgroupSlack(workload, input, gate));
   for (const auto &split : splitOutputs) {
     const float toleranceSlack = slack + (split.simdgroup ? operandSlack : 0);
     for (uint64_t i = 0; i < uint64_t{workload.rows} * p.outputSize; ++i) {
-      tuning::SplitReference reference{fp32(baseline[i])};
-      if (workload.epilogue == LinearEpilogue::Residual) reference.residual = fp32(split.residual[i]);
+      tuning::SplitReference reference{tuning::bf16ToFloat(baseline[i])};
+      if (workload.epilogue == LinearEpilogue::Residual) reference.residual = tuning::bf16ToFloat(split.residual[i]);
       if (workload.epilogue == LinearEpilogue::GateUp) {
-        reference.gate = fp32(gateReference[i]);
-        reference.up = fp32(upReference[i]);
+        reference.gate = tuning::bf16ToFloat(gateReference[i]);
+        reference.up = tuning::bf16ToFloat(upReference[i]);
       }
-      if (!tuning::withinSplitTolerance(fp32(split.output[i]), workload.epilogue, reference, toleranceSlack)) {
-        std::cerr << "split element=" << i << " actual=" << fp32(split.output[i])
+      if (!tuning::withinSplitTolerance(tuning::bf16ToFloat(split.output[i]), workload.epilogue, reference,
+                                        toleranceSlack)) {
+        std::cerr << "split element=" << i << " actual=" << tuning::bf16ToFloat(split.output[i])
                   << " reference=" << reference.value << " residual=" << reference.residual
                   << " gate=" << reference.gate << " up=" << reference.up
                   << " bound=" << tuning::splitTolerance(workload.epilogue, reference, toleranceSlack)

@@ -4,7 +4,6 @@
 
 #include <algorithm>
 #include <array>
-#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -88,16 +87,11 @@ uint32_t mix(uint32_t value) {
   value *= 0x846ca68b;
   return value ^ (value >> 16);
 }
-uint16_t bf16(float value) {
-  uint32_t bits = std::bit_cast<uint32_t>(value);
-  bits += 0x7fff + ((bits >> 16) & 1);
-  return uint16_t(bits >> 16);
-}
 void initialize(metal::MetalBuffer buffer, uint64_t active, uint32_t seed) {
   auto *values = static_cast<uint16_t *>(buffer.contents());
   for (uint64_t i = 0; i < buffer.sizeBytes() / 2; ++i)
     values[i] = i < active
-        ? bf16(float(int(mix(uint32_t(i) + seed) % 257) - 128) / 257.0f) : 0;
+        ? floatToBf16(float(int(mix(uint32_t(i) + seed) % 257) - 128) / 257.0f) : 0;
 }
 void poisonBf16(metal::MetalBuffer buffer) {
   if (!buffer) return;

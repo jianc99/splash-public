@@ -13,7 +13,6 @@ namespace {
 using namespace splash::metal;
 using namespace splash::ops;
 using namespace splash::ops::tuning;
-using splash::test::bf16;
 
 void require(bool condition, const char *message) {
   if (!condition)
@@ -173,7 +172,7 @@ Q8Projection router(MetalBackend &backend, bool shared, uint32_t representative 
     auto *scales = static_cast<uint16_t *>(result.planes.scales.contents());
     for (uint32_t expert = 0; expert < 4; ++expert) {
       weights[expert * 64 + expert + representative * 4] = 1;
-      scales[expert] = bf16(4.0F);
+      scales[expert] = floatToBf16(4.0F);
     }
   }
   return result;
@@ -190,8 +189,8 @@ ExpertProjection experts(MetalBackend &backend, uint32_t count, uint32_t salt = 
           planes.weights[offset] = static_cast<uint8_t>(seed >> 24);
         }
         for (uint64_t index = 0; index < parameters; ++index) {
-          planes.scales[index] = bf16(0.0078125F);
-          planes.biases[index] = bf16(-0.05859375F);
+          planes.scales[index] = floatToBf16(0.0078125F);
+          planes.biases[index] = floatToBf16(-0.05859375F);
         }
       });
 }

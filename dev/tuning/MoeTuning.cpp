@@ -1,8 +1,9 @@
 #include "tuning/MoeTuning.hpp"
 
+#include "tuning/LinearNumerics.hpp"
+
 #include <algorithm>
 #include <array>
-#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -94,12 +95,6 @@ Fixture allocateFixture(metal::MetalBackend &backend,
   return fixture;
 }
 
-uint16_t bf16(float value) noexcept {
-  uint32_t bits = std::bit_cast<uint32_t>(value);
-  bits += 0x7fff + ((bits >> 16) & 1);
-  return static_cast<uint16_t>(bits >> 16);
-}
-
 // Approximately unit-variance normalized inputs, reproducible without libc's
 // random state. Distinct rows leave routing to the learned weights; repeated
 // rows exercise a concentrated route pattern without reading routes back.
@@ -116,8 +111,8 @@ void reset(Fixture &fixture, const MoeWorkload &workload,
     };
     for (uint32_t column = 0; column < workload.shape.hiddenSize; ++column) {
       const uint64_t index = uint64_t{row} * workload.shape.hiddenSize + column;
-      input[index] = bf16(1.7320508F * random());
-      residual[index] = bf16(0.125F * random());
+      input[index] = floatToBf16(1.7320508F * random());
+      residual[index] = floatToBf16(0.125F * random());
     }
   }
   auto *output = static_cast<uint16_t *>(fixture.buffers.output.contents());

@@ -16,7 +16,6 @@ namespace {
 using namespace splash;
 using namespace splash::ops;
 using namespace splash::ops::tuning;
-using splash::test::bf16;
 using splash::test::deterministicQ4Projection;
 using splash::test::mix;
 
@@ -352,7 +351,7 @@ void gpuBatchEquivalence(metal::MetalBackend &backend,
     auto *values = static_cast<uint16_t *>(buffer.contents());
     for (uint64_t i = 0; i < buffer.sizeBytes() / 2; ++i)
       values[i] = i < uint64_t{rows} * width
-          ? bf16(float(int(mix(uint32_t(i) + seed) % 257) - 128) / 257.0f) : 0;
+          ? floatToBf16(float(int(mix(uint32_t(i) + seed) % 257) - 128) / 257.0f) : 0;
   };
   fill(buffers.input, workload.matrix.inputSize, 1949);
   if (buffers.residual) fill(buffers.residual, workload.matrix.outputSize, 7919);

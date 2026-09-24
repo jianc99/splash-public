@@ -9,19 +9,12 @@
 #include "metal/MetalBackend.hpp"
 #include "model/WeightStore.hpp"
 #include "ops/Linear.hpp"
+#include "tuning/LinearNumerics.hpp"
 
-#include <bit>
 #include <cstdint>
 #include <cstring>
 
 namespace splash::test {
-
-// bf16 bits of `value`, rounded to nearest even.
-inline uint16_t bf16(float value) {
-  uint32_t bits = std::bit_cast<uint32_t>(value);
-  bits += 0x7fff + ((bits >> 16) & 1);
-  return uint16_t(bits >> 16);
-}
 
 // A 32-bit integer hash for deterministic fixture values.
 inline uint32_t mix(uint32_t value) {
@@ -52,8 +45,8 @@ inline ops::Projection deterministicQ4Projection(metal::MetalBackend &backend, o
   for (uint64_t i = 0; i < parameters * 32; ++i) planes.weights[i] = mix(uint32_t(i) + seed);
   for (uint64_t i = 0; i < parameters; ++i) {
     const float scale = 0.004f + float(mix(uint32_t(i) + seed) % 17) * 0.0001f;
-    planes.scales[i] = bf16(scale);
-    planes.biases[i] = bf16(-7.5f * scale);
+    planes.scales[i] = ops::tuning::floatToBf16(scale);
+    planes.biases[i] = ops::tuning::floatToBf16(-7.5f * scale);
   }
   return p;
 }
