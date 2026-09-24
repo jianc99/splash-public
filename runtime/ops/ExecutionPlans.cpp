@@ -45,6 +45,11 @@ constexpr std::array draftFields{
     &DraftAttentionWorkspace::queryKeysBytes,
     &DraftAttentionWorkspace::queryValuesBytes};
 
+// The shipped configuration of a MoE workload's phase, the first candidate.
+MoeConfig baselineMoeConfig(MoePhase phase) noexcept {
+  return (phase == MoePhase::Prefill ? MoE::prefillCandidates() : MoE::decodeCandidates()).front();
+}
+
 template <typename Workspace, size_t N>
 void include(Workspace &bound, const Workspace &required,
              const std::array<uint64_t Workspace::*, N> &fields,
@@ -156,7 +161,7 @@ MoePlan ExecutionPlans::moePlan(const MoeWorkload &workload, MoeConfig config) c
 
 MoePlan ExecutionPlans::moePrefill(MoeShape shape, uint32_t rows) const {
   const MoeWorkload workload{shape, rows, MoePhase::Prefill};
-  return moePlan(workload, chosenConfiguration(choices_.moe, workload, MoeConfig{MoeExpertTile::M32}));
+  return moePlan(workload, chosenConfiguration(choices_.moe, workload, baselineMoeConfig(MoePhase::Prefill)));
 }
 
 MoePlan ExecutionPlans::moeDecode(MoeShape shape, uint32_t lanes) const {
@@ -164,7 +169,7 @@ MoePlan ExecutionPlans::moeDecode(MoeShape shape, uint32_t lanes) const {
   if (!lanes || lanes > kMaximumLanes)
     throw std::invalid_argument("invalid MoE decode width");
   const MoeWorkload workload{shape, lanes * kDecodeRows, MoePhase::Decode};
-  return moePlan(workload, chosenConfiguration(choices_.moe, workload, MoeConfig{MoeExpertTile::M8}));
+  return moePlan(workload, chosenConfiguration(choices_.moe, workload, baselineMoeConfig(MoePhase::Decode)));
 }
 
 std::array<MoePlan, 2> ExecutionPlans::moeCandidates(const MoeWorkload &workload) const {
@@ -231,7 +236,8 @@ MoeWorkspace ExecutionPlans::moePrefillWorkspace(MoeShape shape,
   // future grouped layout's largest field is not monotone in row count.
   auto bound = moePrefill(shape, maximumRows).workspace();
   for (uint32_t rows = 1; rows <= maximumRows; ++rows) {
-    include(bound, moePlan({shape, rows, MoePhase::Prefill}, {MoeExpertTile::M32}).workspace(), kMoeWorkspaceFields);
+    include(bound, moePlan({shape, rows, MoePhase::Prefill}, baselineMoeConfig(MoePhase::Prefill)).workspace(),
+            kMoeWorkspaceFields);
     include(bound, moePrefill(shape, rows).workspace(), kMoeWorkspaceFields);
   }
   return bound;
@@ -240,8 +246,8 @@ MoeWorkspace ExecutionPlans::moePrefillWorkspace(MoeShape shape,
 MoeWorkspace ExecutionPlans::moeDecodeWorkspacePerLane(MoeShape shape) const {
   MoeWorkspace bound;
   for (uint32_t lanes = 1; lanes <= kMaximumLanes; ++lanes) {
-    include(bound, moePlan({shape, lanes * kDecodeRows, MoePhase::Decode}, {MoeExpertTile::M8}).workspace(),
-            kMoeWorkspaceFields, lanes);
+    const MoeWorkload workload{shape, lanes * kDecodeRows, MoePhase::Decode};
+    include(bound, moePlan(workload, baselineMoeConfig(MoePhase::Decode)).workspace(), kMoeWorkspaceFields, lanes);
     include(bound, moeDecode(shape, lanes).workspace(), kMoeWorkspaceFields, lanes);
   }
   return bound;

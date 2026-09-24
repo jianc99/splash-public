@@ -72,13 +72,6 @@ struct AffineMoeWeights final {
 // this value only exposes semantic projections to the operator.
 using MoeWeights = LayoutWeights<AffineMoeWeights, BlockMoeWeights>;
 
-// Grouped-row scratch. Routes are sorted by expert into tiles of tileRows
-// rows; every routed expert may leave one partially filled tile and no tile
-// is empty, and the shared expert fills one tile per tileRows rows. A split
-// prefill plan also parks the gate projection in expertOutput before the
-// down pass overwrites it, so that field spans the wider of the two widths.
-inline constexpr uint32_t kMoeDecodeTileRows = 8;
-inline constexpr uint32_t kMoePrefillTileRows = 32;
 // Router score tiles: 8 x 32 for short chunks, 32 x 128 for longer chunks.
 // The measured Apple10 crossover is about 26 rows per GPU core, with a
 // 20-core fallback when the core count is unknown. Both tiles preserve scores.
@@ -98,6 +91,11 @@ moeRouteTile(uint32_t rows, uint32_t wideRows) noexcept {
   return rows >= wideRows ? MoeRouteTile{32, 128} : MoeRouteTile{8, 32};
 }
 
+// Grouped-row scratch. Routes are sorted by expert into tiles of tileRows
+// rows; every routed expert may leave one partially filled tile and no tile
+// is empty, and the shared expert fills one tile per tileRows rows. A split
+// prefill plan also parks the gate projection in expertOutput before the
+// down pass overwrites it, so that field spans the wider of the two widths.
 [[nodiscard]] constexpr uint32_t moeMaximumTiles(uint32_t rows, MoeShape shape,
                                                  uint32_t tileRows) noexcept {
   const uint32_t routed = rows * shape.expertsPerToken;
