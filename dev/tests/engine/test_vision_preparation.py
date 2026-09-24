@@ -188,6 +188,12 @@ def fixture(root, source, shift=0, case=None):
         expected.extend(bytes(-len(expected) % ALIGN))
     (root / "expected.bin").write_bytes(expected)
     if source == "mlx":
+        if case == "quantized":
+            tensors["vision_tower.blocks.0.attn.qkv.scales"] = (
+                [24, 1],
+                "BF16",
+                bytes(48),
+            )
         safetensors(root / SHARD, tensors)
         (root / "config.json").write_text("{}")
         return
@@ -213,6 +219,10 @@ def fixture(root, source, shift=0, case=None):
         metadata["clip.vision.attention.layer_norm_epsilon"] = 1e-5
     if case == "deepstack":
         metadata["clip.vision.is_deepstack_layers"] = [True, False]
+    if case == "no-deepstack":
+        del metadata["clip.vision.is_deepstack_layers"]
+    if case == "unused":
+        tensors["v.deepstack.0.fc1.weight"] = ([8, 8], "BF16", bytes(128))
     gguf(root / "mmproj.gguf", metadata, tensors)
 
 
@@ -259,10 +269,20 @@ def main():
                 ("dtype", 0): f"vision tensor {merger} in {{}} is {dtype}; "
                 "preparation reads BF16, F16 or F32",
             }
-            if not mlx:
+            if mlx:
+                rejected[("quantized", 0)] = (
+                    "the MLX vision tower is quantized "
+                    "(vision_tower.blocks.0.attn.qkv.scales in {}); "
+                    "preparation needs BF16, F16 or F32 vision weights"
+                )
+            else:
                 rejected |= {
                     ("epsilon", 0): "vision LayerNorm epsilon mismatch",
                     ("deepstack", 0): "vision deepstack layers are unsupported",
+                    ("no-deepstack", 0): "vision metadata must list "
+                    "clip.vision.is_deepstack_layers per block",
+                    ("unused", 0): "mmproj tensors the vision tower does not use: "
+                    "v.deepstack.0.fc1.weight ({})",
                 }
             for (case, shift), message in rejected.items():
                 directory = root / f"{source}-{case}"

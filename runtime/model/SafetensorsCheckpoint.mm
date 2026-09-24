@@ -134,10 +134,14 @@ SafetensorsCheckpoint::SafetensorsCheckpoint(const std::filesystem::path &direct
 }
 SafetensorsCheckpoint::~SafetensorsCheckpoint() = default;
 
-const SourceTensor &SafetensorsCheckpoint::require(std::string_view name) const {
+const SourceTensor *SafetensorsCheckpoint::find(std::string_view name) const noexcept {
   const auto found = impl_->tensors.find(name);
-  if (found == impl_->tensors.end()) throw WeightStoreError("missing source tensor: " + std::string(name));
-  return found->second;
+  return found == impl_->tensors.end() ? nullptr : &found->second;
+}
+const SourceTensor &SafetensorsCheckpoint::require(std::string_view name) const {
+  const SourceTensor *tensor = find(name);
+  if (!tensor) throw WeightStoreError("missing source tensor: " + std::string(name));
+  return *tensor;
 }
 void SafetensorsCheckpoint::requireQuantization(std::string_view projection, uint32_t bits) const {
   @autoreleasepool {

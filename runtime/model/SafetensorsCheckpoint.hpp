@@ -25,6 +25,7 @@ public:
   explicit SafetensorsCheckpoint(const std::filesystem::path &directory,
                         const PreparationCheck &check = {});
   ~SafetensorsCheckpoint();
+  [[nodiscard]] const SourceTensor *find(std::string_view name) const noexcept;
   [[nodiscard]] const SourceTensor &require(std::string_view name) const;
   void requireQuantization(std::string_view projection, uint32_t bits) const;
   void requireConfigNumber(std::string_view key, double expected) const;

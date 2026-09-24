@@ -186,9 +186,10 @@ packed `vision/model.bin` layout, which the one BF16 vision operator reads: BF16
 tensors are copied, and F32 or F16 tensors are converted only when every value is
 exactly a BF16. Otherwise preparation fails, naming the tensor and file. Unsloth's
 mmproj stores its 1-D tensors, patch embedding and position table as F32, all of
-them BF16-exact, and prepares byte-identical to the packed file.
-`--language-only` removes vision weights from startup and memory accounting and
-rejects image requests before decoding them.
+them BF16-exact, and prepares byte-identical to the packed file. Quantized MLX
+towers, deepstack projectors and mmproj tensors the tower does not use are
+rejected. `--language-only` removes vision weights from startup and memory
+accounting and rejects image requests before decoding them.
 
 ### Draft assets
 

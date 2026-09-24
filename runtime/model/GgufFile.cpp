@@ -242,9 +242,10 @@ std::optional<double> GgufFile::floatValue(std::string_view key) const {
   const auto it = floats_.find(key);
   return it == floats_.end() ? std::nullopt : std::optional<double>(it->second);
 }
-std::span<const double> GgufFile::numericArray(std::string_view key) const {
+std::optional<std::span<const double>> GgufFile::numericArray(std::string_view key) const {
   const auto it = arrays_.find(key);
-  return it == arrays_.end() ? std::span<const double>{} : std::span<const double>(it->second);
+  if (it == arrays_.end()) return std::nullopt;
+  return std::span<const double>(it->second);
 }
 
 const GgufTensor *GgufFile::find(std::string_view name) const noexcept {

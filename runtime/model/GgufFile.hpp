@@ -60,7 +60,7 @@ public:
   [[nodiscard]] std::optional<uint64_t> unsignedValue(std::string_view key) const;
   [[nodiscard]] std::optional<std::string> stringValue(std::string_view key) const;
   [[nodiscard]] std::optional<double> floatValue(std::string_view key) const;
-  [[nodiscard]] std::span<const double> numericArray(std::string_view key) const;
+  [[nodiscard]] std::optional<std::span<const double>> numericArray(std::string_view key) const;
 
   [[nodiscard]] const std::vector<GgufTensor> &tensors() const noexcept { return tensors_; }
   [[nodiscard]] const GgufTensor *find(std::string_view name) const noexcept;

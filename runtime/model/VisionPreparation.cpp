@@ -9,6 +9,7 @@
 #include <bit>
 #include <cmath>
 #include <cstring>
+#include <set>
 #include <span>
 #include <sstream>
 
@@ -128,13 +129,20 @@ uint64_t arrange(std::vector<Section> &plan) {
   return at;
 }
 
-// MLX: vision_tower.*, whose patch embedding is one Conv3d weight [output,
-// frame, patch-row, patch-col, channel].
+// MLX: an unquantized vision_tower.*, whose patch embedding is one Conv3d
+// weight [output, frame, patch-row, patch-col, channel].
 void planCheckpoint(const SafetensorsCheckpoint &checkpoint,
                     const ops::VisionLayout &layout,
                     std::vector<Section> &plan) {
   const uint64_t p = layout.patchSize;
   for (auto &s : plan) {
+    // A quantized module keeps its scales beside the packed weight.
+    const auto scales = s.mlx.substr(0, s.mlx.rfind('.')) + ".scales";
+    if (const SourceTensor *quantized = checkpoint.find(scales))
+      throw WeightStoreError(
+          "the MLX vision tower is quantized (" + scales + " in " +
+          quantized->file->path().string() +
+          "); preparation needs BF16, F16 or F32 vision weights");
     const auto &tensor = checkpoint.require(s.mlx);
     const std::vector<uint64_t> shape =
         s.patch          ? std::vector<uint64_t>{s.rows, 2, p, p, 3}
@@ -146,9 +154,9 @@ void planCheckpoint(const SafetensorsCheckpoint &checkpoint,
   }
 }
 
-// GGUF: a qwen3vl_merger mmproj describing this tower. The patch embedding is
-// one [channel, patch-row, patch-col] weight per temporal frame
-// (v.patch_embd.weight and .weight.1).
+// GGUF: a qwen3vl_merger mmproj describing this tower, all of whose tensors
+// preparation uses. The patch embedding is one [channel, patch-row,
+// patch-col] weight per temporal frame (v.patch_embd.weight and .weight.1).
 void planMmproj(const GgufFile &gguf, const WeightSource &file,
                 const ops::VisionLayout &layout, std::vector<Section> &plan) {
   if (gguf.architecture() != "clip" ||
@@ -172,18 +180,25 @@ void planMmproj(const GgufFile &gguf, const WeightSource &file,
     throw WeightStoreError("vision LayerNorm epsilon mismatch");
   for (const char *key : {"clip.vision.image_mean", "clip.vision.image_std"}) {
     const auto values = gguf.numericArray(key);
-    if (values.size() != 3 || !std::all_of(values.begin(), values.end(),
-                                           [](double x) { return x == 0.5; }))
+    if (!values || values->size() != 3 ||
+        !std::all_of(values->begin(), values->end(),
+                     [](double x) { return x == 0.5; }))
       throw WeightStoreError("vision image normalization mismatch");
   }
+  // Each block must be declared: a deepstack block feeds the language model
+  // through tensors this tower does not have.
   const auto deepstack = gguf.numericArray("clip.vision.is_deepstack_layers");
-  if (std::any_of(deepstack.begin(), deepstack.end(),
+  if (!deepstack || deepstack->size() != layout.depth)
+    throw WeightStoreError(
+        "vision metadata must list clip.vision.is_deepstack_layers per block");
+  if (std::any_of(deepstack->begin(), deepstack->end(),
                   [](double x) { return x != 0; }))
     throw WeightStoreError("vision deepstack layers are unsupported");
   const uint64_t p = layout.patchSize;
+  std::set<std::string, std::less<>> used;
   for (auto &s : plan) {
     for (uint32_t frame = 0; frame < (s.patch ? 2u : 1u); ++frame) {
-      const std::string name = s.gguf + (frame ? ".1" : "");
+      std::string name = s.gguf + (frame ? ".1" : "");
       const GgufTensor &t = gguf.require(name);
       const std::vector<uint64_t> shape =
           s.patch          ? std::vector<uint64_t>{p, p, 3, s.rows}
@@ -197,8 +212,16 @@ void planMmproj(const GgufFile &gguf, const WeightSource &file,
                                                        : ggmlTypeName(t.type);
       s.inputs.push_back(
           input(name, {&file, dtype, {}, gguf.absoluteOffset(t), t.bytes}));
+      used.insert(std::move(name));
     }
   }
+  std::string unused;
+  for (const auto &t : gguf.tensors())
+    if (!used.contains(t.name))
+      unused += (unused.empty() ? "" : ", ") + t.name;
+  if (!unused.empty())
+    throw WeightStoreError("mmproj tensors the vision tower does not use: " +
+                           unused + " (" + gguf.path().string() + ")");
 }
 
 // Writes a section in batches of whole rows converted to BF16. The packed
