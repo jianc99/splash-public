@@ -77,7 +77,10 @@ Measured on a 24 GB M6 (12-core GPU), with each model's DFlash2 draft:
 
 The context column reports capacity, not the prompt length of the decode
 measurement. Host memory pressure can suspend a long request. Startup
-suggests `--max-cache-disk` when memory may not hold that context.
+suggests `--max-cache-disk` when memory may not hold that context. The tier
+then writes whenever memory runs short: serving Ternary-Bonsai-2-27B PQ2_0 to
+six clients' mixed traffic for 30 minutes, a 16 GiB tier on the M6 wrote
+26 GB, about 50 GB an hour, and read 36 GB.
 
 See [the low-bit GGUF measurements](https://github.com/incoai/splash/pull/160)
 for the workloads, memory pressure, SSD settings and limitations, and
