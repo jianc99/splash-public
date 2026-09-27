@@ -2,7 +2,7 @@ build/
 .venv
 .venv.install.lock
 install/models/
-install/profiles/
+install/agents/
 .DS_Store
 __pycache__/
 .ruff_cache/
