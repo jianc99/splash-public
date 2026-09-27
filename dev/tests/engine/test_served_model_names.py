@@ -204,6 +204,7 @@ class ServedModelNamesTests(unittest.TestCase):
             mock.patch.object(launcher.socket, "socket"),
             mock.patch.object(launcher, "_ensure_installed"),
             mock.patch.object(launcher.catalog, "spawn_refresh"),
+            mock.patch.object(launcher, "signal"),
             mock.patch.object(launcher.os, "execve") as execute,
         ):
             launcher.main(
