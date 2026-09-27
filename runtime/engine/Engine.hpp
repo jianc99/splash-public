@@ -30,6 +30,9 @@ struct EngineConfig final {
   // failed allocation and, after a suspension the pause caused, while
   // resident lanes drain; never on the ordinary decode path.
   std::function<bool()> growthPaused;
+  // What refuses growth, supplied by the governor, for the error of a
+  // resource wait that expires.
+  std::function<std::string()> memoryShortage;
 };
 
 struct ResourceWaitSnapshot final {

@@ -343,6 +343,10 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
         [governor = &resources->memoryGovernor()] {
           return !governor->snapshot().hostGrowthAllowed;
         };
+    config.nativeLoop.engine.memoryShortage =
+        [governor = &resources->memoryGovernor()] {
+          return describeMemoryShortage(governor->snapshot());
+        };
     nativeLoop = std::make_unique<NativeRuntime>(
         config.nativeLoop, resources->cache(), *modelRuntime,
         std::move(output), std::move(statusProvider), NativeLoopClocks{},

@@ -186,7 +186,11 @@ bool Engine::tick(double now) {
     }
     const double deadline = resourceDeadline(active);
     if (!active.finalized && deadline > 0.0 && now >= deadline) {
-      finishFailure(active, {"resource_timeout", "memory did not become available within the resource wait limit", true});
+      std::string message = "memory did not become available within the resource wait limit";
+      if (const std::string shortage = config_.memoryShortage ? config_.memoryShortage() : "";
+          !shortage.empty())
+        message += ": " + shortage;
+      finishFailure(active, {"resource_timeout", std::move(message), true});
       progressed = true;
     }
   }

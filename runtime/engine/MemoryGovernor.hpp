@@ -6,6 +6,7 @@
 #include <functional>
 #include <mutex>
 #include <optional>
+#include <string>
 
 namespace splash::engine {
 
@@ -85,6 +86,10 @@ struct MemoryGovernorSnapshot {
   bool growthAllowed = true;
   bool hostGrowthAllowed = true;
 };
+
+// What refuses growth, for the error of a resource wait that expired: host
+// memory, or the engine's Metal budget. Empty when neither does.
+[[nodiscard]] std::string describeMemoryShortage(const MemoryGovernorSnapshot &snapshot);
 
 struct MemoryReclaimDirective {
   bool reclaimEmptyKvExtents = false;

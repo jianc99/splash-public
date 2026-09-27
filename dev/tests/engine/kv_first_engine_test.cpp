@@ -1711,6 +1711,7 @@ void testSingletonHostPressureWaitRecoversOrTerminates() {
     EngineConfig config;
     config.growthPaused = [&] { return pressure != MemoryPressure::Normal; };
     config.resourceWaitTimeoutMilliseconds = outcome == 3 ? 100.0 : 30000.0;
+    config.memoryShortage = [] { return std::string("macOS has 1 MiB available"); };
     engine::Engine engine(config, resources, executor, events);
     engine.submit(request(220, std::vector<uint32_t>(65, 220)));
     runUntilIdle(engine);
@@ -1759,8 +1760,12 @@ void testSingletonHostPressureWaitRecoversOrTerminates() {
     } else if (outcome == 3) {
       static_cast<void>(engine.tick(150.0));
       require(events.failures == std::vector<std::string>{"resource_timeout"} &&
-                  events.failureDetails.back().second,
-              "persistent memory pressure did not fail with a retryable timeout");
+                  events.failureDetails.back().second &&
+                  events.failureDetails.back().first ==
+                      "memory did not become available within the resource wait "
+                      "limit: macOS has 1 MiB available",
+              "persistent memory pressure did not fail with a retryable timeout "
+              "that names the shortage");
     } else {
       static_cast<void>(engine.tick(301.0));
       require(events.completedCount + events.failedCount == 2,

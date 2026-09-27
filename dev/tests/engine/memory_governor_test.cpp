@@ -320,6 +320,28 @@ void testExhaustedReclaimWaivesTheHold() {
           "an earlier episode's exhausted reclaim waived the hold");
 }
 
+// An expired resource wait names what refused growth: the host's memory with
+// what macOS keeps and the margin, or the engine's Metal budget.
+void testShortageNamesWhatRefusedGrowth() {
+  const MemoryGovernorSnapshot host{.hostAvailableBytes = 2540 * kMiB,
+                                    .hostReserveBytes = 2 * kGiB,
+                                    .hostGrowthAllowed = false};
+  const std::string hostShortage = describeMemoryShortage(host);
+  require(hostShortage.find("macOS has 2540 MiB available and keeps 2048 MiB") !=
+                  std::string::npos &&
+              hostShortage.find("1024 MiB margin") != std::string::npos &&
+              hostShortage.find("close memory-heavy applications") != std::string::npos,
+          "a host shortage did not name what macOS has and keeps");
+  const MemoryGovernorSnapshot budget{.limitBytes = 16 * kGiB,
+                                      .observedResidentBytes = 16 * kGiB - 10 * kMiB,
+                                      .reservedBytes = 10 * kMiB,
+                                      .growthAllowed = false};
+  require(describeMemoryShortage(budget).find("16384 of its 16384 MiB Metal memory budget") !=
+              std::string::npos,
+          "a budget shortage did not name the budget");
+  require(describeMemoryShortage({}).empty(), "growth that nothing refuses named a shortage");
+}
+
 } // namespace
 
 int main() {
@@ -329,6 +351,7 @@ int main() {
     testHostRefusalStartsReclaim();
     testPolicyContinuesHeldBackTarget();
     testExhaustedReclaimWaivesTheHold();
+    testShortageNamesWhatRefusedGrowth();
     std::cout << "memory governor tests passed\n";
     return EXIT_SUCCESS;
   } catch (const std::exception &error) {

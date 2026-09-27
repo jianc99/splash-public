@@ -78,6 +78,10 @@ Measured on a 24 GB M6 (12-core GPU), with each model's DFlash2 draft:
 The context column reports capacity, not the prompt length of the decode
 measurement. Host memory pressure can suspend a long request. Startup
 suggests `--max-cache-disk` when memory may not hold that context.
+Splash keeps 2 GiB free for macOS and grows its caches only while 1 GiB more
+is free, so these models leave other applications little room. A request that
+cannot get memory waits for it, then fails with `resource_timeout`, whose
+message says what macOS has available.
 
 See [the low-bit GGUF measurements](https://github.com/incoai/splash/pull/160)
 for the workloads, memory pressure, SSD settings and limitations, and

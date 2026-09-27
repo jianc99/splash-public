@@ -179,6 +179,22 @@ std::optional<uint64_t> MemoryGovernor::sampleHostAvailable() const noexcept {
   }
 }
 
+std::string describeMemoryShortage(const MemoryGovernorSnapshot &snapshot) {
+  const auto mebibytes = [](uint64_t bytes) { return std::to_string(bytes >> 20); };
+  if (!snapshot.hostGrowthAllowed)
+    return "macOS has " + mebibytes(snapshot.hostAvailableBytes) + " MiB available and keeps " +
+           mebibytes(snapshot.hostReserveBytes) + " MiB, and Splash leaves a " +
+           mebibytes(kHostWarningMarginBytes) +
+           " MiB margin above that as it grows; close memory-heavy applications, or "
+           "serve with --language-only or a lower --max-context";
+  if (!snapshot.growthAllowed)
+    return "Splash holds " + mebibytes(snapshot.observedResidentBytes + snapshot.reservedBytes) +
+           " of its " + mebibytes(snapshot.limitBytes) +
+           " MiB Metal memory budget; serve with a lower --max-context or fewer "
+           "concurrent requests";
+  return {};
+}
+
 uint64_t MemoryGovernor::hostHeadroomBytes(
     const std::optional<uint64_t> &hostAvailable,
     uint64_t reservedBytes) const noexcept {
