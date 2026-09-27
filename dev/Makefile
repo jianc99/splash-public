@@ -139,9 +139,8 @@ else
 			--progress "$(MODEL_RESULTS)/backend-benchmark-progress.jsonl" \
 			> "$(MODEL_RESULTS)/backend-benchmark.json"; \
 		status=$$?; \
-		$(PYTHON) -m json.tool "$(MODEL_RESULTS)/backend-benchmark.json" >/dev/null \
-			|| exit 1; \
-		test $$status -eq 0 || exit $$status
+		test $$status -eq 0 || exit $$status; \
+		$(PYTHON) -m json.tool "$(MODEL_RESULTS)/backend-benchmark.json" >/dev/null
 	@echo "native backend characterization: PASS ($(MODEL_RESULTS)/backend-benchmark.json)"
 endif
 
