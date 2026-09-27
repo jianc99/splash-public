@@ -766,6 +766,10 @@ Higher-priority work does not wait for a lower-priority producer. `/status` expo
 Greedy and sampled requests can share an unconstrained decode batch; each lane
 keeps its own sampling policy and RNG. Pure greedy batches retain their argmax
 path. Constrained requests use a separate batch for the host mask exchange.
+A lane's arithmetic can depend on the batch it decodes in and on how its
+prompt is chunked, both of which concurrent requests change, so a greedy or
+seeded request repeats its output when it runs alone but can differ when it
+runs alongside others.
 
 Long prefill uses disposable rolling checkpoints every 4096 tokens. Contended
 prefill adapts toward a 500 ms slice, keeping 2048-token chunks for long unopposed
