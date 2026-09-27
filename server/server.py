@@ -167,10 +167,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
         self._header_timer.start()
 
     def _expire_headers(self):
-        try:
-            self.connection.shutdown(socket.SHUT_RDWR)
-        except OSError:
-            pass
+        self.server.connections.expire(self.connection)
 
     def finish(self):
         self._header_timer.cancel()
@@ -181,7 +178,9 @@ class FrontendHandler(BaseHTTPRequestHandler):
     def _discard_unread_body(self):
         # Closing with request bytes unread resets the connection, and the
         # reset can destroy the response before a client still uploading
-        # reads it. Half-close, then discard the upload for a bounded time.
+        # reads it. Half-close, then discard the upload for a bounded time,
+        # waiting on the client as a connection with no request yet does.
+        self.server.connections.waiting(self.connection)
         deadline = time.monotonic() + HTTP_UNREAD_BODY_DRAIN_SECONDS
         try:
             self.connection.shutdown(socket.SHUT_WR)
@@ -200,6 +199,9 @@ class FrontendHandler(BaseHTTPRequestHandler):
             parsed = super().parse_request()
         finally:
             self._header_timer.cancel()
+        if not self.server.connections.serving(self.connection):
+            self.close_connection = True
+            return False
         if not parsed:
             return False
         if self.request_version not in {"HTTP/1.0", "HTTP/1.1"}:
@@ -1639,6 +1641,87 @@ class HttpAdmission:
             return {"active": self.active, "capacity": self.capacity}
 
 
+class ConnectionSlots:
+    """The connections the server gives a thread, at most `capacity`.
+
+    One that waits on its client, for its request headers or to drain an
+    upload refused unread, gives its slot to a new connection when no slot
+    is free, the longest waiting first. A client sends its request at once,
+    so only a stalled connection waits that long, and stalled connections,
+    however many and from however many addresses, cannot keep others out.
+    Only connections with a request in progress can fill every slot.
+    """
+
+    def __init__(self, capacity):
+        self.capacity = capacity
+        # Each connection with a slot, mapped to whether it waits on its
+        # client; the waiting ones in the order they began to.
+        self.holders = {}
+        self.lock = threading.Lock()
+        self.idle = threading.Event()
+        self.idle.set()
+
+    def admit(self, connection):
+        """Give `connection` a slot, waiting on its client for its request;
+        False when every slot has a request in progress."""
+        with self.lock:
+            if len(self.holders) >= self.capacity:
+                stalled = next(
+                    (held for held, waiting in self.holders.items() if waiting), None
+                )
+                if stalled is None:
+                    return False
+                self._close(stalled)
+            self.holders[connection] = True
+            self.idle.clear()
+            return True
+
+    def expire(self, connection):
+        """Close `connection`, and free its slot, if it still waits on its
+        client."""
+        with self.lock:
+            if self.holders.get(connection):
+                self._close(connection)
+
+    def _close(self, connection):
+        # Under the lock, which a connection's release takes before the
+        # connection is closed, so the descriptor is still its own. Its
+        # thread sees the end of input; it has lost its slot, so a request
+        # whose headers the shutdown cut short is not served.
+        del self.holders[connection]
+        try:
+            connection.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+    def serving(self, connection):
+        """Mark the request on `connection` in progress; False once the
+        connection has lost its slot."""
+        with self.lock:
+            if connection not in self.holders:
+                return False
+            self.holders[connection] = False
+            return True
+
+    def waiting(self, connection):
+        """`connection` waits on its client again, last in line."""
+        with self.lock:
+            if self.holders.pop(connection, None) is not None:
+                self.holders[connection] = True
+
+    def release(self, connection):
+        """Give back the slot of `connection`, if it still has one, before
+        the connection is closed."""
+        with self.lock:
+            self.holders.pop(connection, None)
+            if not self.holders:
+                self.idle.set()
+
+    def stats(self):
+        with self.lock:
+            return {"active": len(self.holders), "capacity": self.capacity}
+
+
 class RequestBodyReservation:
     """Account input bytes until preparation and any retained input are released."""
 
@@ -1731,7 +1814,7 @@ class FrontendServer(ThreadingHTTPServer):
         self.started_at = time.time()
         self.requests = HttpAdmission(request_capacity)
         self.token_counts = HttpAdmission(request_capacity)
-        self.connections = HttpAdmission(
+        self.connections = ConnectionSlots(
             request_capacity + self.control_connection_capacity
         )
         super().__init__(address, FrontendHandler, bind_and_activate)
@@ -1757,11 +1840,11 @@ class FrontendServer(ThreadingHTTPServer):
         return status
 
     def process_request(self, request, client_address):
-        if not self.connections.acquire():
-            # Header-only/idle connections must also be bounded. Do not create
-            # a thread or block the accept loop to reject an excess socket.
-            # The request path has not been read, so no API dialect is known.
-            # Keep a generic server error and its stable diagnostic code.
+        if not self.connections.admit(request):
+            # Do not create a thread or block the accept loop to reject an
+            # excess socket. The request path has not been read, so no API
+            # dialect is known. Keep a generic server error and its stable
+            # diagnostic code.
             payload = b'{"error":{"type":"server_error","code":"frontend_overloaded","message":"HTTP connection capacity is exhausted"}}'
             response = (
                 b"HTTP/1.1 503 Service Unavailable\r\n"
@@ -1780,14 +1863,12 @@ class FrontendServer(ThreadingHTTPServer):
         try:
             super().process_request(request, client_address)
         except BaseException:
-            self.connections.release()
+            self.connections.release(request)
             raise
 
-    def process_request_thread(self, request, client_address):
-        try:
-            super().process_request_thread(request, client_address)
-        finally:
-            self.connections.release()
+    def shutdown_request(self, request):
+        self.connections.release(request)
+        super().shutdown_request(request)
 
     def server_close(self):
         super().server_close()
