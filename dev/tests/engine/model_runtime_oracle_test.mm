@@ -37,6 +37,32 @@ void require(bool condition, const std::string &message) {
     fail(message);
 }
 
+std::string mebibytes(uint64_t bytes) {
+  return std::to_string(bytes >> 20) + " MiB";
+}
+
+// The oracle loads and allocates without production's memory guard, and it
+// injects every refusal its checks expect. When other programs hold memory it
+// needs, the run stops here with the numbers: a check would otherwise fail
+// for the wrong reason, or catch the refusal as its own.
+[[noreturn]] void stopForHostMemory(const std::string &need, uint64_t bytes,
+                                    uint64_t reserveBytes) {
+  std::cerr << "model_runtime_oracle_test: FAIL: the oracle needs "
+            << mebibytes(bytes) << " for " << need << " above the "
+            << mebibytes(reserveBytes) << " macOS keeps, and macOS has "
+            << mebibytes(queryHostAvailableMemory().value_or(0))
+            << " available; close other programs and retry\n";
+  std::exit(1);
+}
+
+void requireHostMemory(const std::string &need, uint64_t bytes,
+                       uint64_t reserveBytes) {
+  const std::optional<uint64_t> available = queryHostAvailableMemory();
+  require(available.has_value(), "cannot measure available host memory");
+  if (*available <= reserveBytes || bytes > *available - reserveBytes)
+    stopForHostMemory(need, bytes, reserveBytes);
+}
+
 constexpr uint32_t kVocabulary = 248320;
 constexpr uint32_t kMaskWords = (kVocabulary + 31) / 32;
 
@@ -803,11 +829,6 @@ int main(int argc, char **argv) {
       fail(*error);
     const uint64_t hostReserveBytes =
         EngineMemoryPolicy::hostAvailableReserveBytes(device.physicalMemoryBytes);
-    const auto hostAvailableBytes = queryHostAvailableMemory();
-    require(hostAvailableBytes.has_value(),
-            "cannot measure available host memory before loading the oracle model");
-    require(*hostAvailableBytes > hostReserveBytes,
-            "available host memory does not cover the protected macOS reserve");
     const std::filesystem::path modelRoot(argv[2]);
     const auto descriptor = model::inspectModelPackage(modelRoot);
     // Production's weight byte count with a different bound. Production checks
@@ -815,10 +836,9 @@ int main(int argc, char **argv) {
     // Metal operation while loading. This oracle has no such guard, so the
     // prepared weights must fit in reclaimable memory above the macOS reserve
     // before anything is mapped; it can refuse a package production starts.
-    require(model::preparedModelWeightBytes(modelRoot, descriptor) <=
-                *hostAvailableBytes - hostReserveBytes,
-            "oracle model loading exceeds available host memory after protecting " +
-                std::to_string(hostReserveBytes) + " bytes for macOS");
+    requireHostMemory("the prepared weights",
+                      model::preparedModelWeightBytes(modelRoot, descriptor),
+                      hostReserveBytes);
     model::ModelPackage model =
         model::loadModelPackage(backend, modelRoot, descriptor);
     ops::ExecutionPlans operators(backend.capabilities());
@@ -850,10 +870,29 @@ int main(int argc, char **argv) {
             "runtime reserves consume the oracle Metal budget");
     const uint64_t elasticGrowthCeiling = budget.hardBudgetBytes -
         budget.pipelineReserveBytes - budget.runtimeOverheadReserveBytes;
+    require(executorPlan.sharedDecodePlannedAllocatedBytes <=
+                std::numeric_limits<uint64_t>::max() -
+                    executorPlan.sharedPrefillPlannedAllocatedBytes,
+            "oracle runtime arena reservation overflows");
+    const uint64_t arenaBytes = executorPlan.sharedPrefillPlannedAllocatedBytes +
+                                executorPlan.sharedDecodePlannedAllocatedBytes;
+    // Loading can take more than the estimate above. From here the governor
+    // admits every allocation with its margin above the reserve.
+    requireHostMemory("the runtime arenas and the growth margin",
+                      arenaBytes + kHostWarningMarginBytes, hostReserveBytes);
     MemoryGovernor governor(backend, elasticGrowthCeiling, hostReserveBytes);
+    const metal::AllocationAdmission governed =
+        [admit = governor.allocationAdmission(), hostReserveBytes](
+            uint64_t bytes, const std::function<void()> &allocate) {
+          const metal::AllocationResult result = admit(bytes, allocate);
+          if (result.failure == metal::AllocationFailure::HostPressure)
+            stopForHostMemory("an allocation and the growth margin",
+                              bytes + kHostWarningMarginBytes, hostReserveBytes);
+          return result;
+        };
     AllocationFault allocationFault;
     const metal::AllocationAdmission admission =
-        [admit = governor.allocationAdmission(), &allocationFault, &backend](
+        [admit = governed, &allocationFault, &backend](
             uint64_t bytes, const std::function<void()> &allocate) {
           if (bytes > allocationFault.remainingBytes)
             return false;
@@ -879,7 +918,7 @@ int main(int argc, char **argv) {
     metal::AllocationFailure kvAdmissionFailure = metal::AllocationFailure::None;
     kv::PageStorage pages(
         backend,
-        [governed = governor.allocationAdmission(), &kvAdmissionFailure](
+        [&governed, &kvAdmissionFailure](
             uint64_t bytes, const std::function<void()> &allocate)
             -> metal::AllocationResult {
           if (kvAdmissionFailure != metal::AllocationFailure::None)
@@ -894,13 +933,7 @@ int main(int argc, char **argv) {
         backend, admission, model, pages, states, operators,
         ops::kMaximumImagePatches, budget.pipelineReserveBytes,
         budget.runtimeOverheadReserveBytes};
-    require(executorPlan.sharedDecodePlannedAllocatedBytes <=
-                std::numeric_limits<uint64_t>::max() -
-                    executorPlan.sharedPrefillPlannedAllocatedBytes,
-            "oracle runtime arena reservation overflows");
-    auto arenaReservation = governor.tryReserve(
-        executorPlan.sharedPrefillPlannedAllocatedBytes +
-        executorPlan.sharedDecodePlannedAllocatedBytes);
+    auto arenaReservation = governor.tryReserve(arenaBytes);
     require(arenaReservation.has_value(),
             "oracle runtime arenas would consume the protected macOS memory reserve");
     if (warmupEosOnly) {
