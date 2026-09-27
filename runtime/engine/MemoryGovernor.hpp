@@ -188,6 +188,10 @@ public:
   // A pass that releases or waits for memory again, or the host's recovery,
   // ends the waiver.
   void reclaimed(ReclaimOutcome outcome) noexcept;
+  // Records what is resident once warmup has released all but one lane's
+  // state and the KV runway: the footprint a request is served from. Growth
+  // back to it needs only the host's reserve (tryReserve).
+  void markServingFootprint() noexcept;
   [[nodiscard]] MemoryGovernorSnapshot snapshot() const noexcept;
 
 private:
@@ -213,6 +217,7 @@ private:
   uint64_t untrackedReserveBytes_ = 0;
   mutable std::mutex mutex_;
   uint64_t reservedBytes_ = 0;
+  uint64_t servingFootprintBytes_ = 0;
   uint64_t deniedReservations_ = 0;
   MemoryPressure systemPressure_ = MemoryPressure::Normal;
   mutable bool hostConstrained_ = false;
