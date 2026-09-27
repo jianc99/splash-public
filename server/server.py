@@ -123,6 +123,15 @@ SSE_KEEPALIVE_SECONDS = 2.0
 NATIVE_START_TIMEOUT = 600.0
 ROOT = Path(__file__).parents[1]
 CHAT_HTML = Path(__file__).with_name("chat.html").read_bytes()
+# The chat page's brand mark, in its text colors. Browsers, and other
+# clients, ask for a site's icon at /favicon.ico.
+FAVICON_SVG = (
+    b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"'
+    b' stroke="#171717" stroke-width="1.8" stroke-linecap="round"'
+    b' stroke-linejoin="round"><style>@media (prefers-color-scheme: dark)'
+    b" { svg { stroke: #ececec } }</style>"
+    b'<path d="M13.5 2 5 13h6l-.5 9L19 11h-6z"/></svg>'
+)
 
 
 def _normalize_path(raw_path):
@@ -219,7 +228,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             path = self.path.partition("?")[0]
             public = self.command == "OPTIONS" or (
                 self.command in ("GET", "HEAD")
-                and path in ("/", "/index.html", "/health", "/ready")
+                and path in ("/", "/index.html", "/favicon.ico", "/health", "/ready")
             )
             if not public:
                 authenticate(self.headers, self.server.api_key)
@@ -382,11 +391,13 @@ class FrontendHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = self.path.partition("?")[0]
-        if path in ("/", "/index.html"):
-            if self.server.webui:
-                self._send(200, CHAT_HTML, "text/html; charset=utf-8")
-            else:
+        if path in ("/", "/index.html", "/favicon.ico"):
+            if not self.server.webui:
                 self._safe_error(APIError(404, "not found", "not_found"))
+            elif path == "/favicon.ico":
+                self._send(200, FAVICON_SVG, "image/svg+xml")
+            else:
+                self._send(200, CHAT_HTML, "text/html; charset=utf-8")
             return
         if path == "/health":
             self._json(200, {"status": "ok"})
