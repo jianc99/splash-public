@@ -375,8 +375,11 @@ print('independent oracle passed')
         )
     if not (workspace / "test_ledger.py").is_file():
         raise AgentFailure("client did not create the requested unit tests")
+    # The client's tests, as its test command runs them, with the harness's
+    # Python like the oracle above: whichever python3 PATH finds first is not
+    # the harness's to depend on.
     result = subprocess.run(
-        TEST_COMMAND.split(),
+        [sys.executable, *TEST_COMMAND.split()[1:]],
         cwd=workspace,
         capture_output=True,
         text=True,
