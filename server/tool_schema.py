@@ -6,10 +6,11 @@ import copy
 import json
 import re
 from dataclasses import dataclass, field
-from functools import cached_property
+from functools import cached_property, lru_cache
 from urllib.parse import unquote
 
 from jsonschema.exceptions import SchemaError
+from llguidance import LLMatcher
 from referencing import Registry
 
 if __package__:
@@ -191,13 +192,24 @@ GRAMMAR_BOUND_KEYWORDS = ("minItems", "maxItems", "multipleOf")
 MAX_GRAMMAR_BOUND = 64
 
 
+@lru_cache(maxsize=1024)
+def _grammar_takes_pattern(pattern):
+    """Whether the grammar compiler takes a JSON Schema ``pattern``. It keeps
+    the pattern's search semantics but rejects look-around, word boundaries
+    and backreferences, which are left to validation of the complete output."""
+    string = json.dumps({"type": "string", "pattern": pattern})
+    return not LLMatcher.validate_grammar(f"%llguidance {{}}\nstart: %json {string}\n")
+
+
 def _grammar_compatible_schema(schema):
     """Guide generation with supported constraints; validate the original."""
     output = copy.deepcopy(schema)
     for node in _schemas(output):
         if isinstance(node, dict):
             node.pop("propertyNames", None)
-            node.pop("pattern", None)
+            pattern = node.pop("pattern", None)
+            if isinstance(pattern, str) and _grammar_takes_pattern(pattern):
+                node["pattern"] = pattern
     # A local reference can point anywhere in the document, so any object may
     # be compiled as a schema.
     for node in json_objects(output):
