@@ -45,6 +45,14 @@ public:
                                metal::MetalBuffer output,
                                metal::MetalBuffer sums, uint32_t width,
                                uint32_t rows);
+
+  // RMS normalization of prefill rows that also writes what the consumer's
+  // plan reads beside them: its Q4 input sums (addRmsWithQ4Sums) or its
+  // table (addRms). Returns what the scratch then describes.
+  static PreparedInput addPrefillRms(metal::CommandGraph &graph, metal::MetalBuffer input,
+                                     const NormWeights &weight, metal::MetalBuffer output,
+                                     metal::MetalBuffer sums, uint32_t width, uint32_t rows,
+                                     LinearScratch scratch, const LinearPlan &consumer);
 };
 
 } // namespace splash::ops

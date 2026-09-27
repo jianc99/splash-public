@@ -188,7 +188,7 @@ struct QwenTargetPrefillSequence final {
 };
 
 struct QwenTargetPrefillBuffers final {
-  // Split projections of chunks of up to 32 rows (LinearGguf.cpp).
+  // The projections of chunks of up to 32 rows that run decode tiles.
   ops::LinearScratch linearScratch{};
   std::array<metal::MetalBuffer, 2> hidden;
   metal::MetalBuffer normalized;
@@ -323,8 +323,8 @@ private:
 
   // A layer's parts in dispatch order: the mixer normalizes its input and
   // returns the residual rows the FFN normalizes and adds to into `output`.
-  void addPrefillNorm(PrefillStep &step, metal::MetalBuffer input, const ops::NormWeights &norm,
-                      ops::WeightLayout consumer) const;
+  ops::PreparedInput addPrefillNorm(PrefillStep &step, metal::MetalBuffer input, const ops::NormWeights &norm,
+                                    const ops::LinearPlan &consumer) const;
   void addPrefillOutput(PrefillStep &step, metal::MetalBuffer hidden, const ops::Projection &projection,
                         metal::MetalBuffer input, metal::MetalBuffer output) const;
   metal::MetalBuffer addPrefillMixer(PrefillStep &step, const QwenGdnWeights &mixer, const ops::NormWeights &norm,

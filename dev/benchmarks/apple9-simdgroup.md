@@ -3,8 +3,10 @@
 Apple9 Q4 decode uses eight-row bfloat matrix operands, one independent tile
 per request lane at one to four lanes. Plain projections at three or four lanes
 whose grid holds at least two N256 tiles per core keep the broad-column path
-(`widePlain` in `runtime/ops/Linear.cpp`). Apple10 and prefill retain their
-policies. The packed Q4 weights and the `Q4Params` ABI are unchanged. The
+(`widePlain` in `runtime/ops/Linear.cpp`). Prefill chunks of up to 32 rows run
+the same tile and split rule over their rows padded to whole lanes, as GGUF
+chunks run its decode tiles; longer chunks and Apple10 retain their policies.
+The packed Q4 weights and the `Q4Params` ABI are unchanged. The
 measurements below are of the one-lane version; `3a20983` extended it to two
 through four lanes with identical output hashes and acceptance counts.
 
@@ -26,12 +28,15 @@ Apple10 GPU validation; the dedicated regression test covers this case.
 
 The decode arena owns one reusable activation table, row-sum buffer, partial
 buffer and counter buffer, charged to the memory budget. It is private to the
-serial decode command stream. Counters are zeroed at allocation and reset by
-each completed dispatch. Startup choices reserve the maximum of the default
-and selected plans. No scratch allocation occurs while encoding a projection.
+serial decode command stream; the prefill arena holds its own for the target's
+and the draft's prefill projections. Counters are zeroed at allocation and
+reset by each completed dispatch. Startup choices reserve the maximum of the
+default and selected plans. No scratch allocation occurs while encoding a
+projection.
 
 RMSNorm writes its ordinary output and the matrix operand layout from the same
-rounded bfloat values. Its next Q4 consumer marks the input prepared. GDN and the attention gate also emit
+rounded bfloat values. Its next Q4 consumer marks the input prepared; a prefill
+chunk whose rows do not fill whole lanes prepares it instead. GDN and the attention gate also emit
 the prepared layout from their rounded output. The FFN gate/up producer still
 uses a separate preparation dispatch. Reused draft head/selector and
 context inputs share their prepared table until another producer overwrites it.
@@ -46,11 +51,14 @@ make -j8 all test-engine-cpu test-engine-metal
 ```
 
 The Metal target enables GPU shader validation. `q4-sgmatrix` compares against
-an independent fp64 packed-weight reference for all three epilogues, every
+an independent fp64 packed-weight reference for all four epilogues, every
 valid split count in 1/2/4/8, small and irregular K, and real FFN widths. Inputs
 include values above half's range, cancellation and zero weights. It also
 checks guard bytes, repeated workspace use, deterministic reductions, zeroed
 counters, and bitwise equality of separate versus fused RMSNorm preparation.
+`q4-prefill-projection` holds every simdgroup candidate of 1–32-row prefill
+chunks to the split-K bound around the MPP prefill tile, and `linear-plan`
+runs the Apple9 short-chunk plans against its oracle on any GPU.
 
 Error bounds use input and weight magnitudes, so cancellation does not hide
 behind a relative-output threshold. They cover fp32 dot/affine reassociation,

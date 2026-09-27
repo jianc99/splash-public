@@ -24,6 +24,7 @@ REVIEWED = {
     "runtime/metal/MetalBackend.hpp": "the backend the repack is dispatched through",
     "runtime/metal/DeviceCapabilities.hpp": "device queries of the backend",
     "runtime/metal/CommandGraph.hpp": "dispatch recording of the backend",
+    "runtime/metal/abi/ExecutionGeometry.h": "inference batch and tile widths",
     "runtime/ops/Weights.hpp": "inference weight views",
     "runtime/ops/Linear.hpp": "inference projections",
     "runtime/ops/Normalization.hpp": "inference norms",

@@ -128,6 +128,7 @@ struct DFlashPrefillSpan final {
 };
 
 struct DFlashPrefillBuffers final {
+  ops::LinearScratch linearScratch{};
   metal::MetalBuffer capturedTargetHidden;
   metal::MetalBuffer projectionSums;
   metal::MetalBuffer projected;

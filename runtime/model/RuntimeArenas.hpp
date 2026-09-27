@@ -138,9 +138,12 @@ enum class PrefillTensor : uint32_t {
   // One tensor per ops::kMoeScratchFields entry, in its order (moeScratchTensor).
   MoeScratch,
   MoeScratchLast = MoeScratch + ops::kMoeScratchFields.size() - 1,
+  // ops::LinearScratch: the simdgroup tile's input table and its sums, split
+  // partials and counters, and the rotated input of a rotated projection.
+  LinearTable,
+  LinearTableSums,
   LinearPartials,
   LinearCounters,
-  // The rotated input of a rotated projection (ops::LinearScratch::rotated).
   LinearRotated,
   Count,
 };
@@ -208,6 +211,12 @@ public:
       scratch.*ops::kMoeScratchFields[field].buffer =
           get(moeScratchTensor<PrefillTensor>(field));
     return scratch;
+  }
+  // Reused serially by the target's and the draft's prefill projections.
+  [[nodiscard]] ops::LinearScratch linearScratch() const {
+    return {get(PrefillTensor::LinearTable), get(PrefillTensor::LinearTableSums),
+            get(PrefillTensor::LinearPartials), get(PrefillTensor::LinearCounters),
+            get(PrefillTensor::LinearRotated)};
   }
   [[nodiscard]] uint64_t bytes() const noexcept { return bytes_; }
 

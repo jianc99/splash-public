@@ -2,6 +2,7 @@
 
 #include "metal/DeviceCapabilities.hpp"
 #include "metal/CommandGraph.hpp"
+#include "metal/abi/ExecutionGeometry.h"
 #include "ops/Weights.hpp"
 
 #include <algorithm>
@@ -43,12 +44,16 @@ void requireAffineProjection(const Projection &projection, LinearMatrix matrix);
 
 enum class LinearPhase : uint8_t { Prefill, Decode };
 enum class LinearEpilogue : uint8_t { None, Residual, GateUp, UpWithGate };
+// The decode tiles hold at most a full decode batch; prefill chunks of up to
+// this many rows can run them too (Linear::baseline).
+inline constexpr uint32_t kMaximumDecodeTileRows = SPLASH_MAXIMUM_BATCH_WIDTH * SPLASH_TARGET_VERIFY_ROWS;
 // Compute tiles over the StorageN=256 packing. Paired tiles pipeline two
 // quant groups of one lane. Split tiles keep one 8-row tile per threadgroup
 // and split K into four partitions whose fp32 partial sums are reduced before
 // the bf16 rounding; they take one lane, K % 1024 == 0 and one threadgroup
 // per tile. Paired256 is the four-simdgroup N256 paired tile. Simdgroup
-// uses bf16 8x8 matrix operations and an explicit activation/split workspace.
+// uses bf16 8x8 matrix operations and an explicit activation/split workspace,
+// in decode and in prefill chunks of up to 32 rows padded to whole lanes.
 // GgufStaged dequantizes GGUF weights per simdgroup into threadgroup memory
 // for matmul2d: 64 columns per decode threadgroup (two simdgroups) of 8, 16
 // or 32 rows with optional K splits; prefill runs 128-row tiles, or the
@@ -76,7 +81,8 @@ struct LinearWorkload final {
 
 struct LinearConfig final {
   LinearTile tile = LinearTile::N128;
-  // Decode grid size. Prefill uses its matrix grid and requires zero here.
+  // Decode grid size, which the simdgroup tile also takes in prefill. The
+  // other prefill tiles use their matrix grid and require zero here.
   uint32_t groups = 0;
   // Simdgroups per threadgroup, independent of the persistent grid size: the
   // cooperative scope of one tile, or for split tiles the four partitions
@@ -97,7 +103,8 @@ struct LinearChoice final {
   LinearConfig configuration;
 };
 
-// Reused serially within one decode command stream. Counters are zeroed at
+// Reused serially within one command stream: a decode step's, or a prefill
+// chunk's whose plans run the decode tiles. Counters are zeroed at
 // allocation and restored by each completed split dispatch. Never share this
 // workspace between concurrent command streams. Within a batched dispatch,
 // each eight-row tile owns disjoint input, sums, partials and counters.
@@ -166,6 +173,9 @@ public:
   [[nodiscard]] bool usesSimdgroup() const noexcept;
   [[nodiscard]] LinearInput input() const noexcept;
   [[nodiscard]] LinearScratchSize scratchSize() const noexcept;
+  // The Q4 input sums an affine MPP prefill tile reads, and those its fused
+  // up projection writes for the down projection; the simdgroup tile reads
+  // its table's sums instead (scratchSize).
   [[nodiscard]] uint64_t sumsBytes() const noexcept;
   [[nodiscard]] uint64_t gateScratchBytes() const noexcept;
   [[nodiscard]] uint64_t downSumsBytes() const noexcept;
@@ -241,8 +251,8 @@ public:
                                       const Projection *gate = nullptr) const;
   [[nodiscard]] LinearScratchSize decodeScratchSize(LinearWorkload workload) const;
   // The scratch of every prefill chunk and epilogue of a projection of
-  // `shape`: the split partials and counters of the chunks that run the GGUF
-  // decode tiles (LinearGguf.cpp).
+  // `shape`: that of the chunks of up to kMaximumDecodeTileRows rows that run
+  // a decode tile (its input table and split scratch); longer chunks take none.
   [[nodiscard]] LinearScratchSize prefillScratchSize(ProjectionShape shape) const;
   // The tile of a float projection of `rows` rows into `outputSize` columns
   // on this device (LinearGguf.cpp).
@@ -259,21 +269,22 @@ public:
                     const Projection *gate = nullptr,
                     LinearDispatchStats *stats = nullptr) const;
 
-  // The Q4 input sums of `rows` rows an affine prefill projection reads.
+  // The Q4 input sums of `rows` rows an affine prefill plan reads (sumsBytes).
   void addPrefillSums(metal::CommandGraph &graph, metal::MetalBuffer input, metal::MetalBuffer sums,
                       const Projection &consumer, uint32_t rows) const;
   // The projections of `rows` rows through their own matrix. `scratch` holds
-  // the partials and counters of split plans (GGUF chunks of up to 32 rows);
+  // the input table and split scratch of the chunks that run a decode tile;
   // reused serially within one command stream, as in decode.
-  void addPrefill(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &projection,
-                  metal::MetalBuffer output, metal::MetalBuffer sums, uint32_t rows,
-                  LinearScratch scratch = {}) const;
-  void addPrefillUpWithGate(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &up,
-                            metal::MetalBuffer gateScratch, metal::MetalBuffer output, metal::MetalBuffer sums,
-                            metal::MetalBuffer downSums, uint32_t rows, LinearScratch scratch = {}) const;
-  void addPrefillResidual(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &projection,
-                          metal::MetalBuffer residual, metal::MetalBuffer output, metal::MetalBuffer sums,
-                          uint32_t rows, LinearScratch scratch = {}) const;
+  PreparedInput addPrefill(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &projection,
+                           metal::MetalBuffer output, metal::MetalBuffer sums, uint32_t rows,
+                           LinearScratch scratch = {}, PreparedInput prepared = {}) const;
+  PreparedInput addPrefillUpWithGate(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &up,
+                                     metal::MetalBuffer gateScratch, metal::MetalBuffer output,
+                                     metal::MetalBuffer sums, metal::MetalBuffer downSums, uint32_t rows,
+                                     LinearScratch scratch = {}, PreparedInput prepared = {}) const;
+  PreparedInput addPrefillResidual(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &projection,
+                                   metal::MetalBuffer residual, metal::MetalBuffer output, metal::MetalBuffer sums,
+                                   uint32_t rows, LinearScratch scratch = {}, PreparedInput prepared = {}) const;
 
   PreparedInput addDecode(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &projection,
                           metal::MetalBuffer output, LinearScratch scratch = {}) const;

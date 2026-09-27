@@ -40,7 +40,8 @@ inline float silu(float value) noexcept { return value / (1.0f + std::exp(-value
 
 // The sequential kernel's values an element of a split-K output is compared
 // against: the output itself and, per epilogue, the residual it added or the
-// exact gate and up projections it combined.
+// gate and exact up projection it combined (for GateUp, the exact gate
+// projection; for UpWithGate, the gate rows it read).
 struct SplitReference final {
   float value = 0;
   float residual = 0;
@@ -106,6 +107,7 @@ inline float simdgroupSlack(LinearWorkload w, const metal::MetalBuffer &input,
 //             slack: |d(silu(g) u)| <= |u| max|silu'| dg + |silu(g)| du,
 //             max|silu'| = 1.0998 < 1.1, and the output rounding adds
 //             ulp(out).
+//   UpWithGate: the same product with the exact gate rows, dg = 0.
 inline float splitTolerance(LinearEpilogue epilogue, SplitReference reference,
                             float slack) noexcept {
   float bound = ulpBf16(reference.value) + slack;
@@ -114,6 +116,8 @@ inline float splitTolerance(LinearEpilogue epilogue, SplitReference reference,
   if (epilogue == LinearEpilogue::GateUp)
     bound += 1.1f * (std::fabs(reference.up) + ulpBf16(reference.up) + slack) * (ulpBf16(reference.gate) + slack) +
         std::fabs(silu(reference.gate)) * (ulpBf16(reference.up) + slack);
+  if (epilogue == LinearEpilogue::UpWithGate)
+    bound += std::fabs(silu(reference.gate)) * (ulpBf16(reference.up) + slack);
   return bound;
 }
 

@@ -7,8 +7,8 @@ production allocations, startup benchmarks or per-model/per-SKU tables.
 
 ## Policy ownership
 
-`runtime/ops/Linear.cpp` owns Q4 selection. Apple9 decode uses bfloat
-simdgroup matrices with 1/2/4/8 K partitions
+`runtime/ops/Linear.cpp` owns Q4 selection. Apple9 decode, and prefill chunks
+of up to 32 rows, use bfloat simdgroup matrices with 1/2/4/8 K partitions
 ([apple9-simdgroup.md](apple9-simdgroup.md)). Apple10 uses MPP tiles, with
 shape and core count selecting grids and the narrow M24 variant.
 Apple10 split-K tiles are offline candidates only. Their former one-lane
@@ -37,8 +37,11 @@ Q4 candidates always start with the shipped baseline. Persistent grids now
 include two, three and four threadgroups per reported core plus the full grid,
 instead of fixed counts 36/60/80. Apple9 additionally exposes every valid
 simdgroup split in 1/2/4/8. The maximum candidate count is 20, derived beside
-`Linear::kMaximumCandidates`; deduplication handles small grids. Prefill
-candidates are unchanged. New candidates do not automatically change serving.
+`Linear::kMaximumCandidates`; deduplication handles small grids. Apple9 prefill
+chunks of up to 32 rows list only the simdgroup splits, whose fixtures differ
+from the MPP prefill tile's; the tuner does not probe them (`kPrefillProbeRows`).
+Other prefill candidates are unchanged. New candidates do not automatically
+change serving.
 
 The existing offline tuner qualifies numerical results, admits the maximum
 candidate workspace, alternates baseline/candidate timing and requires both

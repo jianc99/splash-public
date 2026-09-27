@@ -103,18 +103,21 @@ void DFlashDraft::addContextPrefill(
     if (span.ring.size() != layout.layers)
       throw std::invalid_argument("draft prefill ring layer mismatch");
   }
-  operators_.linear().addPrefillSums(graph, buffers.capturedTargetHidden, buffers.projectionSums,
-                                     weights_.contextProjection, rows);
-  operators_.linear().addPrefill(graph, buffers.capturedTargetHidden, weights_.contextProjection,
-                                 buffers.projected, buffers.projectionSums, rows);
-  ops::Normalization::addRmsWithQ4Sums(
-      graph, buffers.projected, weights_.hiddenNorm, buffers.hidden,
-      buffers.projectionSums, layout.hiddenSize, rows);
+  const ops::Linear &linear = operators_.linear();
+  if (linear.prefillPlan(weights_.contextProjection, rows, ops::LinearEpilogue::None).sumsBytes())
+    linear.addPrefillSums(graph, buffers.capturedTargetHidden, buffers.projectionSums, weights_.contextProjection,
+                          rows);
+  linear.addPrefill(graph, buffers.capturedTargetHidden, weights_.contextProjection, buffers.projected,
+                    buffers.projectionSums, rows, buffers.linearScratch);
+  // Every layer's qkv projection reads the same normalized rows.
+  ops::PreparedInput hidden = ops::Normalization::addPrefillRms(
+      graph, buffers.projected, weights_.hiddenNorm, buffers.hidden, buffers.projectionSums, layout.hiddenSize,
+      rows, buffers.linearScratch,
+      linear.prefillPlan(weights_.layers[0].qkvProjection, rows, ops::LinearEpilogue::None));
 
   for (uint32_t layer = 0; layer < layout.layers; ++layer) {
-    operators_.linear().addPrefill(graph, buffers.hidden,
-                      weights_.layers[layer].qkvProjection, buffers.qkv,
-                      buffers.projectionSums, rows);
+    hidden = linear.addPrefill(graph, buffers.hidden, weights_.layers[layer].qkvProjection, buffers.qkv,
+                               buffers.projectionSums, rows, buffers.linearScratch, hidden);
     for (const DFlashPrefillSpan &span : spans) {
       const uint64_t qkvOffset =
           uint64_t{span.compactRow} * layout.qkvSize * sizeof(uint16_t);

@@ -9,6 +9,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <type_traits>
+#include <vector>
 
 namespace {
 
@@ -65,10 +66,39 @@ model::ModelPackage package() {
   return result;
 }
 
+// The prefill arena holds the Linear scratch of every plan of a chunk of up
+// to 32 rows, over the target's projections and the draft's context and qkv
+// projections: Apple9 runs them on the simdgroup tile, with its input table,
+// which Apple10 prefill never binds.
+void checkPrefillScratch(const model::RuntimeGeometry &geometry, const ops::ExecutionPlans &plans,
+                         uint32_t family) {
+  const auto sizes = model::prefillTensorBytes(geometry, plans);
+  const auto size = [&](model::PrefillTensor tensor) { return sizes[uint32_t(tensor)]; };
+  std::vector<ops::ProjectionShape> shapes = geometry.target.prefillProjections;
+  shapes.insert(shapes.end(), {{geometry.draft.hiddenSize, geometry.draft.targetHiddenSize},
+                               {geometry.draft.qkvSize, geometry.draft.hiddenSize}});
+  for (const auto &shape : shapes)
+    for (uint32_t rows : {1U, 8U, 17U, 32U})
+      for (const auto epilogue : {ops::LinearEpilogue::None, ops::LinearEpilogue::Residual,
+                                  ops::LinearEpilogue::UpWithGate}) {
+        const auto required = plans.linear().plan({{shape.outputSize, shape.inputSize}, rows,
+            ops::LinearPhase::Prefill, epilogue, shape.layout}).scratchSize();
+        require(size(model::PrefillTensor::LinearTable) >= required.input &&
+                    size(model::PrefillTensor::LinearTableSums) >= required.sums &&
+                    size(model::PrefillTensor::LinearPartials) >= required.partials &&
+                    size(model::PrefillTensor::LinearCounters) >= required.counters,
+                "short-prefill Linear scratch is too small");
+      }
+  require((size(model::PrefillTensor::LinearTable) != 0) == (family == 9) &&
+              (size(model::PrefillTensor::LinearTableSums) != 0) == (family == 9),
+          "prefill arena reserved a table no prefill plan reads");
+}
+
 void checkPackage(const model::ModelPackage &package, uint32_t family) {
   DeviceCapabilities device;
   device.appleGpuFamily = family;
   ops::ExecutionPlans baseline(device);
+  checkPrefillScratch(model::RuntimeGeometry::from(package), baseline, family);
   const auto before = model::plannedRuntimeMemory(device, package, baseline);
   const auto geometry = std::visit([](const auto &weights) {
     return model::qwenTargetGeometry(weights);
@@ -176,14 +206,7 @@ void checkMixedLayouts() {
       require(model::DecodeArena::gateScratchBytes(geometry, plans) >= plan.gateScratchBytes(),
               "mixed gate/up workspace is too small");
     }
-    const auto sizes = model::prefillTensorBytes(geometry, plans);
-    for (uint32_t rows : {1U, 8U, 17U, 32U}) {
-      const auto required = plans.linear().plan({{up.outputSize, up.inputSize}, rows,
-          ops::LinearPhase::Prefill, ops::LinearEpilogue::None}, up).scratchSize();
-      require(sizes[uint32_t(model::PrefillTensor::LinearPartials)] >= required.partials &&
-                  sizes[uint32_t(model::PrefillTensor::LinearCounters)] >= required.counters,
-              "mixed short-prefill split scratch is too small");
-    }
+    checkPrefillScratch(geometry, plans, family);
   }
   // Every MoE block of a target shares one layout, which the geometry's one
   // MoE shape records: no source mixes them.
