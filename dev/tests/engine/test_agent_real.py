@@ -594,8 +594,13 @@ class AgentRunnerTests(unittest.TestCase):
                     runner.codex_home = Path(directory) / "codex-home"
                     runner.pi_home = Path(directory) / "pi-agent"
                     runner.session = session
+                    runner.version = 2 if name == "opencode" else None
+
+                    def launch(*_, client_args, **__):
+                        return [runner.path, *client_args], {}
+
                     with mock.patch.object(
-                        agent.clients, "command", return_value=([runner.path], {})
+                        agent.clients, "command", side_effect=launch
                     ) as adapter:
                         argv, env = runner.argv()
                     # Pi configures itself in a private agent directory.
@@ -617,6 +622,8 @@ class AgentRunnerTests(unittest.TestCase):
                         agent.launcher.PROFILES_DIR,
                         environment,
                         input_modalities=["text"],
+                        client_args=argv[1:],
+                        client_version=runner.version,
                     )
                     for forbidden in (
                         "--ephemeral",
@@ -643,6 +650,23 @@ class AgentRunnerTests(unittest.TestCase):
                         if session:
                             expected += ["--session", session]
                         self.assertEqual(argv[1:], expected)
+
+    def test_opencode_runs_as_splash_launches_it(self):
+        # OpenCode 2 reaches the inline configuration only through a private
+        # server, whose flag follows the subcommand; a background service
+        # would outlive the run. Version 1 rejects the flag.
+        for version, run in (
+            (2, ["run", "--format", "json", "--standalone"]),
+            (1, ["run", "--format", "json"]),
+        ):
+            with self.subTest(version=version):
+                runner = agent.ClientRun.__new__(agent.ClientRun)
+                runner.name, runner.path = "opencode", "/test/opencode"
+                runner.model, runner.context = "Actual-model", 102400
+                runner.input_modalities = ["text"]
+                runner.workspace = Path("/test/project")
+                runner.session, runner.version = None, version
+                self.assertEqual(runner.argv()[0][1:], run)
 
     def test_artifact_oracle_rejects_stub_and_wrong_semantics(self):
         with tempfile.TemporaryDirectory() as directory:

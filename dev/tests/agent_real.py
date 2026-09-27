@@ -407,6 +407,8 @@ class ClientRun:
         self.phases = []
         self.codex_home = (folder / "codex-home").resolve()
         self.pi_home = (folder / "pi-agent").resolve()
+        # Only OpenCode's launch depends on its major version, as for splash.
+        self.version = clients.probe_major_version(path) if name == "opencode" else None
         folder.mkdir(parents=True)
         fixture(self.workspace)
 
@@ -418,24 +420,11 @@ class ClientRun:
             if self.name == "pi"
             else None
         )
-        argv, env = clients.command(
-            self.name,
-            self.path,
-            BASE_URL,
-            self.model,
-            self.context,
-            launcher.PROFILES_DIR,
-            environment,
-            input_modalities=self.input_modalities,
-        )
-        # subprocess(cwd=...) does not update inherited PWD. Keep both views
-        # consistent, just as a user shell entering the project would.
-        env["PWD"] = str(self.workspace)
         if self.name == "claude":
             # Normal edit authorization and one explicit project test command;
             # --allowedTools grants permission, unlike --tools it does not filter
             # the registered tool inventory. Production still defaults to default.
-            argv += [
+            arguments = [
                 "--print",
                 "--output-format",
                 "stream-json",
@@ -446,28 +435,53 @@ class ClientRun:
                 f"Bash({TEST_COMMAND})",
             ]
             if self.session:
-                argv += ["--resume", self.session]
+                arguments += ["--resume", self.session]
         elif self.name == "opencode":
-            argv += ["run", "--format", "json"]
+            arguments = ["run", "--format", "json"]
             if self.session:
-                argv += ["--session", self.session]
+                arguments += ["--session", self.session]
         elif self.name == "codex":
+            # Test overrides leave the shipped launcher profile unchanged.
+            arguments = [
+                "exec",
+                "--sandbox",
+                "workspace-write",
+                *os.environ.get("SPLASH_TEST_CODEX_ARGS", "").split(),
+            ]
+            if self.session:
+                arguments += ["resume", self.session]
+            arguments += ["--json", "-"]
+        elif self.name == "pi":
+            arguments = ["--print", "--mode", "json"]
+            if self.session:
+                arguments += ["--session", self.session]
+        else:
+            arguments = ["--oneshot", "--query-file", "-"]
+            if self.session:
+                arguments += ["--resume", self.session]
+        argv, env = self.command(arguments, environment)
+        if self.name == "codex":
             self.codex_home.mkdir(exist_ok=True)
             env["CODEX_HOME"] = str(self.codex_home)
-            argv += ["exec", "--sandbox", "workspace-write"]
-            # Test overrides leave the shipped launcher profile unchanged.
-            argv += os.environ.get("SPLASH_TEST_CODEX_ARGS", "").split()
-            if self.session:
-                argv += ["resume", self.session]
-            argv += ["--json", "-"]
-        elif self.name == "pi":
-            argv += ["--print", "--mode", "json"]
-            if self.session:
-                argv += ["--session", self.session]
-        else:
-            argv += ["--oneshot", "--query-file", "-"]
-            if self.session:
-                argv += ["--resume", self.session]
+        return argv, env
+
+    def command(self, arguments, environment=None):
+        """The client's command, as `splash NAME -- ARGUMENTS` runs it."""
+        argv, env = clients.command(
+            self.name,
+            self.path,
+            BASE_URL,
+            self.model,
+            self.context,
+            launcher.PROFILES_DIR,
+            environment,
+            input_modalities=self.input_modalities,
+            client_args=arguments,
+            client_version=self.version,
+        )
+        # subprocess(cwd=...) does not update inherited PWD. Keep both views
+        # consistent, just as a user shell entering the project would.
+        env["PWD"] = str(self.workspace)
         return argv, env
 
     def hermes_messages(self):
@@ -713,21 +727,12 @@ class ClientRun:
                 if entry.get("type") == "compaction"
             ]
         if self.name == "opencode":
-            argv, env = clients.command(
-                self.name,
-                self.path,
-                BASE_URL,
-                self.model,
-                self.context,
-                launcher.PROFILES_DIR,
-                input_modalities=self.input_modalities,
-            )
-            env["PWD"] = str(self.workspace)
+            argv, env = self.command(["export", self.session])
             # A regular file avoids losing buffered pipe output when the CLI
             # exits immediately after printing a large session export.
             with tempfile.TemporaryFile(mode="w+") as output:
                 result = subprocess.run(
-                    argv + ["export", self.session],
+                    argv,
                     env=env,
                     cwd=self.workspace,
                     stdout=output,
