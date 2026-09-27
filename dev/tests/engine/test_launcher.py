@@ -916,6 +916,14 @@ class LauncherTests(unittest.TestCase):
                 launcher.main(["serve", "--model", MODEL_ID])
             self.assertEqual(held, [str(assembly.resolve() / "target")])
 
+    def test_agent_homes_are_not_named_profiles(self):
+        # Hermes reads <root>/profiles/<name> as a profile of <root> and writes
+        # its shared files into <root>: the checkout's install/ directory, had
+        # Splash kept its agent homes in install/profiles.
+        for port in (launcher.PORT, 8126):
+            home = launcher._profiles_dir(port) / "hermes"
+            self.assertNotEqual(home.parent.name, "profiles")
+
     def test_relative_draft_directory_is_resolved_for_the_installer(self):
         with (
             tempfile.TemporaryDirectory() as temporary,
