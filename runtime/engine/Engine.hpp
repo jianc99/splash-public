@@ -276,6 +276,8 @@ private:
   std::function<void()> completionNotifier_;
   std::optional<Pending> pending_;
   uint64_t resourceEpoch_ = 1;
+  // The last tick with lane work in flight; resource waits count from it.
+  double lanesProgressedMilliseconds_ = 0.0;
   // The resource wait limit after the latest suspension; zero once passed
   // or when no request is suspended.
   double drainEndMilliseconds_ = 0.0;

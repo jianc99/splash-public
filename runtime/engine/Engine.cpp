@@ -167,6 +167,8 @@ void Engine::setCompletionNotifier(std::function<void()> notifier) {
 bool Engine::tick(double now) {
   model_.checkHealth();
   nextHealthCheckMilliseconds_ = now + kHealthCheckIntervalMilliseconds;
+  if (pending_ && !pending_->plan.empty())
+    lanesProgressedMilliseconds_ = now;
   bool progressed = scheduler_.expireDeadlines(now);
   if (now >= drainEndMilliseconds_)
     drainEndMilliseconds_ = 0.0;
@@ -720,8 +722,12 @@ void Engine::deferResourceRetry(Request &active, double now,
 
 double Engine::resourceDeadline(const Request &active) const noexcept {
   const ResourceWait &wait = active.resourceWait;
-  return wait.pending && wait.epoch != resourceEpoch_ ? 0.0
-                                                      : wait.deadlineMilliseconds;
+  if ((wait.pending && wait.epoch != resourceEpoch_) || wait.deadlineMilliseconds <= 0.0)
+    return 0.0;
+  // A wait counts only time in which no lane progressed: lanes that run hold
+  // the memory it waits for until they finish, however long that takes.
+  return std::max(wait.deadlineMilliseconds,
+                  lanesProgressedMilliseconds_ + config_.resourceWaitTimeoutMilliseconds);
 }
 
 void Engine::signalResourceProgress() noexcept {
