@@ -136,10 +136,14 @@ def executed_commands(name, parsed, messages=()):
         if name == "opencode" and event.get("type") == "tool_use":
             part = event.get("part", {})
             state = part.get("state", {})
+            # OpenCode 2 calls its bash tool shell and nests the tool's own
+            # metadata, its exit status included, one level deeper.
+            metadata = state.get("metadata", {})
+            metadata = metadata.get("metadata", metadata)
             if (
-                part.get("tool") == "bash"
+                part.get("tool") in ("bash", "shell")
                 and state.get("status") == "completed"
-                and state.get("metadata", {}).get("exit", 0) == 0
+                and metadata.get("exit", 0) == 0
             ):
                 commands.append(state.get("input", {}).get("command", ""))
         if name == "claude":
@@ -176,6 +180,56 @@ def pi_completed(parsed):
         )
         and any(event.get("type") == "agent_end" for event in parsed)
     )
+
+
+def opencode_messages(history):
+    """(role, finish, parts) of each message in OpenCode's session export:
+    1.x keeps role and finish in a message's info and its parts in parts,
+    2.x keeps them on the message, the role as its type, the parts in
+    content, among entries such as the idle marker that ends a turn."""
+    for message in history["messages"]:
+        info = message.get("info", message)
+        yield (
+            info.get("role", message.get("type")),
+            info.get("finish"),
+            message.get("parts", message.get("content", [])),
+        )
+
+
+def opencode_completed(history):
+    """OpenCode's last turn ended on a stopped assistant message, with text."""
+    turn = []
+    for role, finish, parts in opencode_messages(history):
+        if role == "user":
+            turn = []
+        elif role == "assistant":
+            turn.append((finish, parts))
+    return bool(
+        turn
+        and turn[-1][0] == "stop"
+        and any(
+            part.get("type") == "text" and part.get("text", "").strip()
+            for _, parts in turn
+            for part in parts
+        )
+    )
+
+
+def opencode_compactions(history):
+    """OpenCode's automatic compactions: 1.x marks the message that asks for
+    one with an automatic compaction part, 2.x records each compaction as a
+    message of its own, kept here without its copy of the recent turns."""
+    compactions = []
+    for message in history["messages"]:
+        if message.get("type") != "compaction":
+            compactions += [
+                part
+                for part in message.get("parts", [])
+                if part.get("type") == "compaction" and part.get("auto")
+            ]
+        elif message.get("reason") == "auto" and message.get("status") == "completed":
+            compactions.append({k: v for k, v in message.items() if k != "recent"})
+    return compactions
 
 
 # The engine's own critical verdict drops every evictable cache entry and
@@ -685,18 +739,12 @@ class ClientRun:
             else:
                 if any(e.get("type") == "error" for e in parsed):
                     raise AgentFailure("OpenCode reported a request error")
-                if not any(
-                    e.get("type") == "step_finish"
-                    and e.get("part", {}).get("reason") == "stop"
-                    for e in parsed
-                ):
-                    raise AgentFailure("OpenCode did not finish its user turn")
-                if not any(
-                    e.get("type") == "text"
-                    and e.get("part", {}).get("text", "").strip()
-                    for e in parsed
-                ):
-                    raise AgentFailure("OpenCode produced no assistant text")
+                # Its session records how the turn ended; OpenCode 2 prints no
+                # final step_finish to say so.
+                if not opencode_completed(self.opencode_history()):
+                    raise AgentFailure(
+                        "OpenCode did not finish its user turn with assistant text"
+                    )
         print(
             f"{self.name}/{label}: completed ({row['wall_seconds']:.1f}s)", flush=True
         )
@@ -727,30 +775,7 @@ class ClientRun:
                 if entry.get("type") == "compaction"
             ]
         if self.name == "opencode":
-            argv, env = self.command(["export", self.session])
-            # A regular file avoids losing buffered pipe output when the CLI
-            # exits immediately after printing a large session export.
-            with tempfile.TemporaryFile(mode="w+") as output:
-                result = subprocess.run(
-                    argv,
-                    env=env,
-                    cwd=self.workspace,
-                    stdout=output,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    timeout=20,
-                )
-                if result.returncode:
-                    raise AgentFailure("OpenCode session export failed")
-                output.seek(0)
-                history = json.load(output)
-            atomic_json(self.folder / "history.json", history)
-            return [
-                part
-                for message in history["messages"]
-                for part in message["parts"]
-                if part.get("type") == "compaction" and part.get("auto")
-            ]
+            return opencode_compactions(self.opencode_history())
         return [
             e
             for p in self.folder.glob("*.log")
@@ -759,6 +784,30 @@ class ClientRun:
             and e.get("subtype") == "compact_boundary"
             and e.get("compact_metadata", {}).get("trigger") == "auto"
         ]
+
+    def opencode_history(self):
+        """OpenCode's own record of the session, which OpenCode 2 exports
+        with its session command."""
+        export = ["session", "export"] if (self.version or 1) >= 2 else ["export"]
+        argv, env = self.command([*export, self.session])
+        # A regular file avoids losing buffered pipe output when the CLI
+        # exits immediately after printing a large session export.
+        with tempfile.TemporaryFile(mode="w+") as output:
+            result = subprocess.run(
+                argv,
+                env=env,
+                cwd=self.workspace,
+                stdout=output,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=20,
+            )
+            if result.returncode:
+                raise AgentFailure("OpenCode session export failed")
+            output.seek(0)
+            history = json.load(output)
+        atomic_json(self.folder / "history.json", history)
+        return history
 
     def check_artifact(self, stage):
         if not any(
