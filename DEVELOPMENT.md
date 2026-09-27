@@ -1081,7 +1081,11 @@ make test-performance-real MODEL=mlx-community/Qwen3.8-27B-4bit BASELINE=/path/t
 The first characterizes this build: the decode widths B1-B4 and a 14,096-token
 partial-prefix request, three samples each, in
 `build/release/<owner>--<repo>[--VARIANT]/backend-benchmark.json`;
-`make benchmark-backend MODEL=...` adds the 2K to 128K contexts. The second
+`make benchmark-backend MODEL=...` adds the 2K to 128K contexts the memory
+plan holds, listing the others in the report. Its cache checks reuse each
+context's cached prefix, so they need that memory free: when other programs
+leave too little, the engine evicts cached prefixes and the checks fail,
+naming what each lookup found. The second
 compares this build with a retained checkout's in ABBA order, as the release
 check does ([Release check](#release-check)), and writes
 `backend-regression.json` there. Neither is a comparison with another engine

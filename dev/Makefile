@@ -139,6 +139,7 @@ else
 			--progress "$(MODEL_RESULTS)/backend-benchmark-progress.jsonl" \
 			> "$(MODEL_RESULTS)/backend-benchmark.json"; \
 		status=$$?; \
+		test -s "$(MODEL_RESULTS)/backend-benchmark.json" || exit $$status; \
 		$(PYTHON) -m json.tool "$(MODEL_RESULTS)/backend-benchmark.json" >/dev/null \
 			|| exit 1; \
 		test $$status -eq 0 || exit $$status
