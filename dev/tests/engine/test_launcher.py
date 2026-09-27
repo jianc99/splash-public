@@ -148,6 +148,7 @@ class LauncherTests(unittest.TestCase):
             ("--max-context", ("0", "-1", "257K", "bad")),
             ("--max-memory", ("0", "-1G", "bad", str(2**64))),
             ("--max-request-size", ("auto", "0", "-1G", "bad", str(2**64))),
+            ("--request-timeout", ("0", "-1", "nan", "inf", "bad")),
         ):
             for value in values:
                 with self.subTest(value=value), mock.patch("sys.stderr", io.StringIO()):
@@ -249,6 +250,7 @@ class LauncherTests(unittest.TestCase):
                 self.assertEqual(
                     argv[argv.index("--max-cache-disk") + 1], str(5 * 1024**3)
                 )
+                self.assertEqual(argv[argv.index("--request-timeout") + 1], "3600.0")
                 self.assertEqual(
                     argv[-4:],
                     ["--allowed-host", "splash.local", "--allowed-host", "proxy.local"],
@@ -290,6 +292,8 @@ class LauncherTests(unittest.TestCase):
                         "--no-webui",
                         "--max-request-size",
                         "256M",
+                        "--request-timeout",
+                        "3600",
                         "--max-context",
                         "100K",
                         "--max-memory",

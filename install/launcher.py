@@ -6,6 +6,7 @@ import errno
 import fcntl
 import http.client
 import json
+import math
 import os
 import socket
 import subprocess
@@ -245,6 +246,8 @@ def serve(args):
             )
         if args.max_request_size is not None:
             command.extend(["--max-request-size", str(args.max_request_size)])
+        if args.request_timeout is not None:
+            command.extend(["--request-timeout", str(args.request_timeout)])
         if args.max_cache_disk:
             command.extend(["--max-cache-disk", str(args.max_cache_disk)])
         if args.max_image_pixels is not None:
@@ -373,6 +376,20 @@ def _parse_request_size(value):
     if size is None:
         raise argparse.ArgumentTypeError("use a positive byte count such as 128M")
     return size
+
+
+def _parse_request_timeout(value):
+    try:
+        seconds = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            "use a number of seconds such as 3600"
+        ) from None
+    if not (math.isfinite(seconds) and seconds > 0):
+        raise argparse.ArgumentTypeError(
+            "use a positive number of seconds such as 3600"
+        )
+    return seconds
 
 
 def _parse_max_context(value):
@@ -542,6 +559,11 @@ def parse_args(argv=None):
         type=_parse_request_size,
         help="maximum HTTP request body size, e.g. 128M (default: 128M); "
         "shared input budget is max(512M, twice this limit)",
+    )
+    server.add_argument(
+        "--request-timeout",
+        type=_parse_request_timeout,
+        help="seconds a request may take from its arrival, e.g. 3600 (default: 1800)",
     )
     server.add_argument(
         "--max-image-pixels",

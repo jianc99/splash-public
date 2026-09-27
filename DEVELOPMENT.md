@@ -33,7 +33,10 @@ An engine that fails is restarted at once, and failed restarts back off from
 whose message names the last failure.
 
 Use `--max-context 100K` or `--max-memory 28G` to set optional limits. Memory
-limits cap Metal allocations, not combined process RSS. Agents must already be
+limits cap Metal allocations, not combined process RSS. A request may take 30
+minutes from its arrival (`--request-timeout 3600` allows an hour); a request's
+own `timeout` field can only shorten that, and one that runs out gets 504
+`request_timeout`. Agents must already be
 installed; `./splash claude|opencode|codex|hermes|pi` connects to the running server.
 Arguments pass through, for example `./splash codex resume --last`.
 
