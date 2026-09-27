@@ -7,6 +7,7 @@ import fcntl
 import http.client
 import json
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -29,10 +30,34 @@ PROFILES_DIR = paths.PROFILES
 PORT = 8000
 # A copy: the launcher runs before .venv exists; server/chat_templates imports Jinja2.
 REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+# Either stops `splash serve` wherever it is. A program it starts holds them
+# blocked, not ignored, until its handler is in place, so one sent meanwhile
+# waits for that handler instead of being lost or ending it in a traceback.
+STOP_SIGNALS = (signal.SIGINT, signal.SIGTERM)
 
 
 class LauncherError(RuntimeError):
     pass
+
+
+def _interrupt(_signum, _frame):
+    raise KeyboardInterrupt
+
+
+def _run_held(command, **options):
+    """Run a program that unblocks the stop signals itself, holding them from
+    its spawn. One the launcher takes meanwhile ends the program too."""
+    signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS)
+    try:
+        with subprocess.Popen(command, **options) as program:
+            try:
+                signal.pthread_sigmask(signal.SIG_UNBLOCK, STOP_SIGNALS)
+                return program.wait()
+            except BaseException:
+                program.kill()
+                raise
+    finally:
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, STOP_SIGNALS)
 
 
 def _base_url(port):
@@ -117,7 +142,7 @@ def _ensure_installed(selection):
             command[-1:-1] = [flag, value]
     if selection.language_only:
         command.insert(-1, "--language-only")
-    if subprocess.run(command, cwd=ROOT).returncode:
+    if _run_held(command, cwd=ROOT):
         raise LauncherError("model download or verification failed")
 
 
@@ -167,6 +192,10 @@ def _check_port(host, port):
 
 
 def serve(args):
+    # Started in the background from a non-interactive shell, the launcher
+    # inherits SIGINT as ignored; take both stop signals from the start.
+    for number in STOP_SIGNALS:
+        signal.signal(number, _interrupt)
     # Keep both locks across exec until the foreground server exits.
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
     with (
@@ -263,6 +292,9 @@ def serve(args):
         catalog.spawn_refresh()
         os.set_inheritable(installation.fileno(), True)
         os.set_inheritable(lock.fileno(), True)
+        # The exec resets the handlers; the server unblocks the signals once
+        # its own are in place, past its imports.
+        signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS)
         os.execve(command[0], command, environment)
 
 
