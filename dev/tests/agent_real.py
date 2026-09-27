@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import random
+import re
 import signal
 import sqlite3
 import subprocess
@@ -32,6 +33,9 @@ CLIENTS = tuple(clients.INSTALL_URLS)
 # The server this harness starts or finds, on the default port.
 BASE_URL = launcher._base_url(launcher.PORT)
 TEST_COMMAND = "python3 -m unittest -v"
+# A successful command running the unittest module: the prompt names python3,
+# but an agent may run the tests with its own interpreter or its full path.
+RAN_TESTS = re.compile(r"\bpython[\d.]*\s+-m\s+unittest\b")
 
 
 class AgentFailure(RuntimeError):
@@ -817,7 +821,7 @@ class ClientRun:
 
     def check_artifact(self, stage):
         if not any(
-            "python3 -m unittest" in command
+            RAN_TESTS.search(command)
             for command in self.phases[-1]["executed_commands"]
         ):
             raise AgentFailure(
