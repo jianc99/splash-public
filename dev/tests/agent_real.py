@@ -428,8 +428,11 @@ print('independent oracle passed')
         )
     if not (workspace / "test_ledger.py").is_file():
         raise AgentFailure("client did not create the requested unit tests")
+    # Rerun the client's tests as its test command does, with the harness's
+    # Python like the oracle above: the python3 first on PATH can be a shim
+    # that refuses to run, as Xcode's does until its license is accepted.
     result = subprocess.run(
-        TEST_COMMAND.split(),
+        [sys.executable, *TEST_COMMAND.split()[1:]],
         cwd=workspace,
         capture_output=True,
         text=True,
