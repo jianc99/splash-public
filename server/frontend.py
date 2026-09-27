@@ -90,16 +90,31 @@ RESPONSE_STORE_BUDGET_BYTES = 64 * 1024 * 1024
 IMAGE_RENDER_MARKER = f"__splash_image_{secrets.token_hex(16)}__"
 
 
+# Every turn opens with it, including the assistant generation prefix that a
+# chat template must end with.
+TURN_START = "<|im_start|>"
+
+
 def _thinking_from_prefix(rendered):
-    marker = "<|im_start|>"
-    start = rendered.rfind(marker)
-    prefix = rendered[start + len(marker) :] if start >= 0 else ""
+    start = rendered.rfind(TURN_START)
+    prefix = rendered[start + len(TURN_START) :] if start >= 0 else ""
     if not prefix.startswith("assistant\n") or "<|im_end|>" in prefix:
         raise APIError(
             400, "chat template must end with an assistant generation prefix"
         )
     content = prefix[len("assistant\n") :]
     return content.rfind("<think>") > content.rfind(THINK_END)
+
+
+def _generation_prompt_tokens(tokens, turn_start):
+    """Prompt tokens from the last turn start on: the generation prefix, in
+    whose place the next turn renders the reply. Zero when the tokenizer has
+    no turn-start token or nothing precedes it."""
+    if turn_start is not None:
+        for start in range(len(tokens) - 1, 0, -1):
+            if tokens[start] == turn_start:
+                return len(tokens) - start
+    return 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -201,6 +216,8 @@ class RenderedPrompt:
     images: list
     image_positions: list[int]
     thinking: bool
+    # Images precede the generation prompt; expanding them keeps this count.
+    generation_prompt_tokens: int
 
 
 def validate_served_model_name(value):
@@ -803,7 +820,12 @@ class Frontend:
             )
             raise APIError(400, "messages could not be rendered") from error
         remaining_request_time(deadline)
-        thinking = _thinking_from_prefix(rendered) if add_generation_prompt else False
+        thinking, generation_prompt_tokens = False, 0
+        if add_generation_prompt:
+            thinking = _thinking_from_prefix(rendered)
+            generation_prompt_tokens = _generation_prompt_tokens(
+                tokens, self.tokenizer.convert_tokens_to_ids(TURN_START)
+            )
         if (
             add_generation_prompt
             and prompt.reasoning_effort is not None
@@ -812,7 +834,9 @@ class Frontend:
             raise APIError(
                 400, "chat template does not support the requested thinking mode"
             )
-        return RenderedPrompt(rendered, tokens, images, positions, thinking)
+        return RenderedPrompt(
+            rendered, tokens, images, positions, thinking, generation_prompt_tokens
+        )
 
     def _prepare(self, body, tool_namespaces, deadline, clamp_output_budget=False):
         nullable = {
@@ -977,6 +1001,7 @@ class Frontend:
             image_owner=prepared_images if prepared_images else None,
             public_id=secrets.token_hex(16),
             tools_signature=tools_signature,
+            generation_prompt_tokens=rendered.generation_prompt_tokens,
         )
         return job, thinking, bool(tools)
 

@@ -756,6 +756,9 @@ with large images, is kept only as a marker with its size and SHA-256
 (`omitted_frames` counts them), and a trace missing engine input that way
 cannot be replayed.
 
+A request keeps its reusable model state at the last whole 32-token page before
+its generation prompt, the assistant header that ends a rendered chat prompt:
+the next turn renders the reply in its place, so a follow-up resumes from there.
 Requests sharing a cold prefix can wait for a resident request's planned recovery
 point, then enter through the ordinary cache restore path. Waiting requests hold
 no active state cell or KV pages and return to ordinary admission when no useful

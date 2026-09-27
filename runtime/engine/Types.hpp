@@ -30,6 +30,10 @@ struct EngineRequest final {
   RequestPriority priority = RequestPriority::Normal;
   BatchCohort cohort = BatchCohort::Greedy;
   std::vector<uint32_t> prompt;
+  // Trailing prompt tokens of the chat template's generation prompt: the
+  // next turn renders the reply in their place, so reusable state ends
+  // before them. Zero when unknown; it must leave at least one prompt token.
+  uint32_t generationPromptTokens = 0;
   std::vector<ImageSpan> images;
   std::vector<uint8_t> imagePixels;
   uint32_t maxNewTokens = 0;

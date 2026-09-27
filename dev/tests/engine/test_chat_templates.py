@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 
 from jinja2 import TemplateError
+from tokenizers import AddedToken, Tokenizer, decoders, models, pre_tokenizers, trainers
 from transformers import PreTrainedTokenizerFast
 
 from dev.tests import test_server as fixtures
@@ -72,6 +73,30 @@ def tokenizer(template):
     result = PreTrainedTokenizerFast(
         tokenizer_object=fixtures._byte_backend({0: "hello"})
     )
+    result.chat_template = template
+    return result
+
+
+def chat_tokenizer(template, *special):
+    """A byte-level BPE tokenizer for `template`, with `special` and the think
+    tags as added tokens. Like Qwen's, it encodes `assistant` and a blank line
+    as one token each."""
+    backend = Tokenizer(models.BPE())
+    backend.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    backend.decoder = decoders.ByteLevel()
+    backend.train_from_iterator(
+        ["assistant\n\n"],
+        trainers.BpeTrainer(
+            vocab_size=300,
+            initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
+            show_progress=False,
+        ),
+    )
+    backend.add_special_tokens([AddedToken(text, normalized=False) for text in special])
+    backend.add_tokens(
+        [AddedToken(text, normalized=False) for text in ("<think>", "</think>")]
+    )
+    result = PreTrainedTokenizerFast(tokenizer_object=backend)
     result.chat_template = template
     return result
 
@@ -493,6 +518,73 @@ class ChatTemplateFrontendTests(unittest.TestCase):
         self.assertIn("<|im_start|>system\nLater<|im_end|>", rendered)
         self.assertIn("<|image_pad|>", rendered)
         self.assertEqual(harness.tokenizer.renderer.chat_template, source("qwen36"))
+
+    def test_requests_carry_the_length_of_their_generation_prompt(self):
+        messages = [
+            {"role": "user", "content": "Hi"},
+            {"role": "assistant", "content": "Hello"},
+            {"role": "user", "content": "Again"},
+        ]
+        image = {"url": fixtures.ServerTest._png_data_url()}
+        with_image = [
+            *messages[:-1],
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": image},
+                    {"type": "text", "text": "Again"},
+                ],
+            },
+        ]
+
+        def frontend(name, *special):
+            return fixtures.make_frontend(
+                chat_tokenizer(source(name), *special),
+                None,
+                "test-model",
+                4096,
+                16,
+                10,
+                2,
+                vision=True,
+            )
+
+        for name in ("qwen36_gguf", "qwen38_gguf"):
+            app = frontend(
+                name, "<|im_start|>", "<|im_end|>", api_shapes.IMAGE_PAD_TOKEN
+            )
+            # <|im_start|> assistant \n <think> \n\n </think> \n\n; with
+            # thinking, the first four and \n.
+            for effort, expected in (("none", 7), ("high", 5)):
+                with self.subTest(name=name, effort=effort):
+                    body = {
+                        "model": "test-model",
+                        "messages": messages,
+                        "reasoning_effort": effort,
+                    }
+                    job, _thinking, _tools = app.prepare(body)
+                    self.assertEqual(job.generation_prompt_tokens, expected)
+                    history = app.apply_template(
+                        {**body, "add_generation_prompt": False}
+                    )
+                    self.assertEqual(
+                        job.prompt_tokens[:-expected],
+                        app.tokenizer(history, add_special_tokens=False)["input_ids"],
+                    )
+                    # Images precede it, so expanding them keeps its length.
+                    image_job, _thinking, _tools = app.prepare(
+                        {**body, "messages": with_image}
+                    )
+                    self.assertEqual(image_job.generation_prompt_tokens, expected)
+                    self.assertEqual(
+                        image_job.prompt_tokens[-expected:],
+                        job.prompt_tokens[-expected:],
+                    )
+        # Without a turn-start token the generation prompt is unknown.
+        job, _thinking, _tools = frontend("qwen36_gguf", "<|im_end|>").prepare(
+            {"model": "test-model", "messages": messages}
+        )
+        self.assertEqual(job.generation_prompt_tokens, 0)
 
     class ScoringTokenizer(
         fixtures.TemplateTokenizer, fixtures.ServerTest.CharTokenizer

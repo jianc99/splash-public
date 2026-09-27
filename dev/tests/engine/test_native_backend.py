@@ -284,6 +284,7 @@ class NativeBackendContractTests(unittest.TestCase):
         )
         transport, _runtime = self.make_transport(native)
         job = make_job(404, temperature=0.6)
+        job.generation_prompt_tokens = 2
 
         self.assertTrue(transport.submit(job))
         process = factory.processes[0]
@@ -291,6 +292,7 @@ class NativeBackendContractTests(unittest.TestCase):
         self.assertEqual(frame.priority, wire.RequestPriority.FOREGROUND)
         self.assertEqual(frame.logical_max_output_tokens, 37)
         self.assertEqual(frame.prompt_tokens, (11, 12, 13, 14))
+        self.assertEqual(frame.generation_prompt_tokens, 2)
         self.assertAlmostEqual(frame.sampling.temperature, 0.6)
         self.assertEqual((frame.sampling.top_p, frame.sampling.top_k), (0.75, 17))
         self.assertEqual(frame.seed, 0x123456789ABCDEF0)
