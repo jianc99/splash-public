@@ -57,7 +57,10 @@ independently.
 Stored Responses history is charged before decoding. Uploads allow 30 seconds
 of inactivity; total upload time is limited to 30 seconds plus the body size
 at 512 KiB/s (286 seconds for 128 MiB), capped by the overall request deadline.
-Timed-out uploads return 408 and release their input reservation.
+Timed-out uploads return 408 and release their input reservation. An upload
+refused before it is read, such as one over the shared budget, is still
+received on these terms, so a client that sends its whole body before reading
+the response gets the refusal.
 `/status` reports `http.request_body_bytes` and `http.max_request_bytes`.
 
 Source `install/completions/splash.bash` for Bash or
