@@ -772,8 +772,10 @@ prefill adapts toward a 500 ms slice, keeping 2048-token chunks for long unoppos
 work. These policies do not extend client deadlines. Memory recovery waits are
 bounded: after a suspension, new work waits for resident requests only while
 memory is still short, and at most for the 30 s resource wait; suspended
-requests then resume first, each within its own resource wait. Readiness does
-not guarantee that a request-sized allocation fits.
+requests then resume first, each within its own resource wait. A resource
+wait counts only time in which no lane has work in flight: lanes that run hold
+the memory it waits for until they finish. Readiness does not guarantee that a
+request-sized allocation fits.
 
 ### Disk cache
 

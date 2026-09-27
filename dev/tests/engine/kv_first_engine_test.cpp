@@ -1700,6 +1700,49 @@ void testSingletonHostPressureReusesIdleCacheInsteadOfSuspending() {
           "idle-cache reuse grew the resident footprint");
 }
 
+// A request that cannot start while a resident lane holds memory waits for
+// that lane as it would for a free one, however long the lane runs. Its wait
+// expires only once no lane is resident, when memory may never come.
+void testAdmissionWaitsOutResidentLanes() {
+  for (const bool hostRecovers : {true, false}) {
+    Backing backing(32);
+    KvPool pool(backing);
+    engine::Cache resources(pool, CacheNamespace{});
+    Executor executor;
+    executor.decodeFinishes = false;
+    Events events;
+    EngineConfig config;
+    config.resourceWaitTimeoutMilliseconds = 100;
+    engine::Engine engine(config, resources, executor, events);
+    auto running = request(310, {310});
+    running.maxNewTokens = 1000;
+    engine.submit(std::move(running));
+    static_cast<void>(engine.tick(1));
+    // The host has no memory for a second lane while the first runs.
+    executor.beginAllocationFailure = metal::AllocationFailure::HostPressure;
+    executor.beginGrowthBlocked = [&] { return !hostRecovers || !events.completedCount; };
+    engine.submit(request(311, {311}));
+    double now = 1;
+    while (now < 500)
+      static_cast<void>(engine.tick(now += 50));
+    require(!events.completedCount && events.failedCount == 0,
+            "a request waiting for a resident lane's memory timed out while it ran");
+    executor.decodeFinishes = true;
+    while (!events.completedCount && now < 1000)
+      static_cast<void>(engine.tick(now += 10));
+    for (const double end = now + 150; now < end && !engine.idle();)
+      static_cast<void>(engine.tick(now += 10));
+    if (hostRecovers)
+      require(events.completedCount == 2 && events.failedCount == 0,
+              "the waiting request did not start once the lane finished");
+    else
+      require(events.completedCount == 1 &&
+                  events.failures == std::vector<std::string>{"resource_timeout"},
+              "a wait that no resident lane could end did not expire");
+    require(engine.idle() && executor.requests.empty(), "the resource wait leaked a request");
+  }
+}
+
 void testSingletonHostPressureWaitRecoversOrTerminates() {
   for (uint32_t outcome = 0; outcome < 4; ++outcome) {
     Backing backing(32);
@@ -4970,6 +5013,7 @@ int main() {
     testHostPressureStillRecyclesLruStateForDeniedSnapshot();
     testSingletonHostPressureReusesIdleCacheInsteadOfSuspending();
     testSingletonHostPressureWaitRecoversOrTerminates();
+    testAdmissionWaitsOutResidentLanes();
     testKvPressureNarrowsTheRealBatch();
     testKvGrowthReclaimsCachedStateWhenBudgetIsShared();
     testRequiredWorkDoesNotReserveAnExtraPage();

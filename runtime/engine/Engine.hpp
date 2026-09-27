@@ -251,7 +251,8 @@ private:
                           StateFailure reason = StateFailure::MemoryPressure,
                           bool pending = false) noexcept;
   // The wait limit tick() enforces, or zero while it enforces none: a
-  // pending wait that has seen progress waits for its next attempt.
+  // pending wait that has seen progress waits for its next attempt. The
+  // limit runs only while no lane has work in flight.
   [[nodiscard]] double resourceDeadline(const Request &request) const noexcept;
   void signalResourceProgress() noexcept;
   void apply(const BatchPlan &plan, std::span<const ModelStepResult> results,
@@ -276,6 +277,8 @@ private:
   std::function<void()> completionNotifier_;
   std::optional<Pending> pending_;
   uint64_t resourceEpoch_ = 1;
+  // The last tick with lane work in flight; resource waits count from it.
+  double lanesProgressedMilliseconds_ = 0.0;
   // The resource wait limit after the latest suspension; zero once passed
   // or when no request is suspended.
   double drainEndMilliseconds_ = 0.0;
