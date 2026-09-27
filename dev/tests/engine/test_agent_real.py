@@ -357,6 +357,30 @@ class AgentRunnerTests(unittest.TestCase):
                 if mode == "interrupt":
                     self.assertEqual(row["error"], "test interrupted")
 
+    def test_os_memory_pressure_stop_names_its_setting(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner = agent.ClientRun.__new__(agent.ClientRun)
+            runner.name, runner.session = "codex", None
+            runner.folder = runner.workspace = Path(directory)
+            runner.timeout, runner.phases = 10, []
+            process = mock.Mock(returncode=0)
+            process.poll.return_value = None
+            counts = ("submitted", "completed", "cancelled", "failed")
+            idle = {"requests": dict.fromkeys(counts, 0)}
+            with (
+                mock.patch.object(runner, "argv", return_value=(["client"], {})),
+                mock.patch.object(agent, "idle_status", return_value=idle),
+                mock.patch.object(agent.subprocess, "Popen", return_value=process),
+                mock.patch.object(agent, "stop_process"),
+                mock.patch.object(agent, "memory_sample", return_value={"pressure": 2}),
+                mock.patch.object(agent, "status", return_value=None),
+                mock.patch.dict(agent.os.environ, {"SPLASH_TEST_PRESSURE_STOP": "2"}),
+                self.assertRaisesRegex(
+                    agent.AgentFailure, "reached SPLASH_TEST_PRESSURE_STOP=2;"
+                ),
+            ):
+                runner.phase("test", "task")
+
     def test_pi_phase_resumes_its_session_and_requires_a_finished_turn(self):
         header = {"type": "session", "id": "pi-session"}
         answer = {

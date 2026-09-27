@@ -977,6 +977,16 @@ and `REVISION`, `DRAFT_MODEL` and `LANGUAGE_ONLY=1` as its `--revision`,
 | `test-performance-real` | the native decode and partial-prefix benchmark, or with `BASELINE` its ABBA comparison with that build (`dev/benchmarks/backend_regression.py`) |
 | `release-check` | one model on this Mac ([Release check](#release-check)) |
 
+On a 24 GB Mac, `test-agent-real` stops a client's workflow at macOS's warning
+memory pressure, which the 24 GB formats can reach under an agent's load;
+`SPLASH_TEST_PRESSURE_STOP=4` stops only at critical pressure, to observe how
+the engine sheds its cache. The runtime oracle in `test-real` has no production
+memory guard: the prepared weights, then 2 to 3 GiB more as it runs, must fit
+in what macOS has available above its reserve, so it stops, naming what it
+needs, while other programs hold that memory. With only desktop applications
+open, a 24 GB M6 runs it for both `unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q2_K_XL` and
+`unsloth/Qwen3.8-27B-GGUF:UD-IQ3_XXS`.
+
 `benchmark-backend`, `benchmark-decode-profile` and `tune-kernels` take `MODEL`
 the same way. The models they are run with, one per family and source format:
 
