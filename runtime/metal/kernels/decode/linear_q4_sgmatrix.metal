@@ -11,16 +11,17 @@
 // 128+q is exact for every nibble; subtracting 128*sum(x) in fp32 recovers q*x.
 // This preserves the bf16 activation range without relying on half denormals.
 namespace q4sg {
-enum class Epilogue { Affine, Residual, GateUp };
+enum class Epilogue { Affine, Residual, GateUp, UpWithGate };
 
 // The destination's type Out is bf16, or fp32 for a plain projection's
-// logits (ops::Projection::destination), which keeps the sum unrounded.
+// logits (ops::Projection::destination), which keeps the sum unrounded. The
+// auxiliary rows are the residual or the gate an epilogue reads.
 template <Epilogue E, class Out>
 __attribute__((always_inline)) inline void decode(device const bfloat *table, device const uchar *w0,
                    device const bfloat *sc0, device const bfloat *bi0,
                    device Out *out, device const float *sums,
                    device coherent(device) float *partials, device atomic_uint *counters,
-                   device const bfloat *residual, device const uchar *w1,
+                   device const bfloat *auxiliary, device const uchar *w1,
                    device const bfloat *sc1, device const bfloat *bi1,
                    constant Q4Params &p, uint3 tg, uint tid, uint sg, uint lane,
                    threadgroup uint *arrival) {
@@ -33,7 +34,7 @@ __attribute__((always_inline)) inline void decode(device const bfloat *table, de
   table += ulong(tg.z) * p.input_size * 8;
   sums += ulong(tg.z) * p.input_size / 8;
   out += ulong(tg.z) * 8 * N;
-  residual += ulong(tg.z) * 8 * N;
+  auxiliary += ulong(tg.z) * 8 * N;
   if (splits > 1) {
     partials += ulong(tg.z) * splits * 16 * N;
     counters += ulong(tg.z) * N / tileN;
@@ -121,7 +122,13 @@ __attribute__((always_inline)) inline void decode(device const bfloat *table, de
       float2 value = acc[nf];
       if constexpr (!is_same_v<Out, float>) value = float2(bfloat2(value));
       if (E == Epilogue::Residual)
-        value += float2(float(residual[fn * N + n]), float(residual[(fn + 1) * N + n]));
+        value += float2(float(auxiliary[fn * N + n]), float(auxiliary[(fn + 1) * N + n]));
+      if (E == Epilogue::UpWithGate) {
+        // silu(gate) times the bf16 up value, as the MPP prefill tile's fused
+        // up projection computes it.
+        const float2 gate = float2(float(auxiliary[fn * N + n]), float(auxiliary[(fn + 1) * N + n]));
+        value = gate / (1.0f + fast::exp2(-1.44269504089f * gate)) * value;
+      }
       out[fn * N + n] = Out(value.x);
       out[(fn + 1) * N + n] = Out(value.y);
     }
@@ -168,6 +175,14 @@ kernel void decode_linear_q4_sg_residual(Q4_SG_INPUTS(bfloat),
   threadgroup uint arrival;
   q4sg::decode<q4sg::Epilogue::Residual>(table, weights, scales, biases, output, sums,
       partials, counters, residual, weights, scales, biases, p, tg, tid, sg, lane, &arrival);
+}
+// The up projection times silu of the gate rows a prefill chunk's gate
+// projection wrote (ops::LinearEpilogue::UpWithGate).
+kernel void decode_linear_q4_sg_up_silu(Q4_SG_INPUTS(bfloat),
+    device const bfloat *gate [[buffer(8)]], constant Q4Params &p [[buffer(9)]], Q4_SG_THREADS) {
+  threadgroup uint arrival;
+  q4sg::decode<q4sg::Epilogue::UpWithGate>(table, weights, scales, biases, output, sums,
+      partials, counters, gate, weights, scales, biases, p, tg, tid, sg, lane, &arrival);
 }
 kernel void decode_linear_q4_sg_gate_up(Q4_SG_INPUTS(bfloat), device const uchar *up [[buffer(8)]],
     device const bfloat *upScales [[buffer(9)]], device const bfloat *upBiases [[buffer(10)]],

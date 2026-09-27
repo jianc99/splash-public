@@ -92,10 +92,10 @@ Reference reference(const Exact &e, uint32_t groups, uint32_t splits) {
           error + ulpBf16(float(e.value))};
 }
 // The reference of an output after its epilogue: plus the residual, or
-// times silu(gate) for GateUp.
+// times silu(gate) for GateUp and UpWithGate, whose gate rows are exact.
 Reference withEpilogue(Reference ref, LinearEpilogue epilogue, double residual, Reference gate) {
   if (epilogue == LinearEpilogue::Residual) ref.value += residual;
-  if (epilogue == LinearEpilogue::GateUp) {
+  if (epilogue == LinearEpilogue::GateUp || epilogue == LinearEpilogue::UpWithGate) {
     const double activation = gate.value / (1 + std::exp(-gate.value));
     ref.error = 1.1 * gate.error * (std::abs(ref.value) + ref.error) + std::abs(activation) * ref.error;
     ref.value *= activation;
@@ -109,9 +109,11 @@ bool within(const Reference &ref, uint16_t actual) {
   return std::isfinite(value) &&
          std::abs(value - expected) <= ref.error + ulpBf16(float(expected)) + ulpBf16(float(value));
 }
+// UpWithGate runs in prefill chunks, reading its gate from the residual's rows.
 void runCase(metal::MetalBackend &backend, uint32_t n, uint32_t k, uint32_t splits,
              LinearEpilogue epilogue, uint32_t fixture, uint32_t rows) {
-  const LinearWorkload workload{{n, k}, rows, LinearPhase::Decode, epilogue};
+  const bool upWithGate = epilogue == LinearEpilogue::UpWithGate;
+  const LinearWorkload workload{{n, k}, rows, upWithGate ? LinearPhase::Prefill : LinearPhase::Decode, epilogue};
   const auto plan = Linear::plan(workload,
       {LinearTile::Simdgroup, n / (epilogue == LinearEpilogue::GateUp ? 32 : 64), LinearSimdgroups::Four, splits});
   const auto size = plan.scratchSize();
@@ -132,7 +134,8 @@ void runCase(metal::MetalBackend &backend, uint32_t n, uint32_t k, uint32_t spli
   const auto p = weights(backend, {n,k}, 31, fixture == 3);
   const auto gate = weights(backend, {n,k}, 177, fixture == 3);
   Linear linear(backend.capabilities());
-  LinearBuffers b{input.view, output.view, {}, epilogue == LinearEpilogue::Residual ? residual.view : metal::MetalBuffer{}, {}, {}, scratch};
+  LinearBuffers b{input.view, output.view, {}, epilogue == LinearEpilogue::Residual ? residual.view : metal::MetalBuffer{},
+                  upWithGate ? residual.view : metal::MetalBuffer{}, {}, scratch};
   metal::CommandGraph graph;
   // Reuse one workspace repeatedly in a single command to expose incomplete
   // publication, stale counters and dependencies between consecutive dispatches.
@@ -162,7 +165,8 @@ void runCase(metal::MetalBackend &backend, uint32_t n, uint32_t k, uint32_t spli
       const auto ref = withEpilogue(reference(exact(p, x, row, col), k / 64, splits), epilogue,
                                     bf16ToFloat(r[row * n + col]),
                                     epilogue == LinearEpilogue::GateUp
-                                        ? reference(exact(gate, x, row, col), k / 64, splits) : Reference{});
+                                        ? reference(exact(gate, x, row, col), k / 64, splits)
+                                        : upWithGate ? Reference{bf16ToFloat(r[row * n + col]), 0} : Reference{});
       const uint16_t value = actual[row * n + col];
       if (!within(ref, value)) {
         std::cerr << "M=" << rows << " N=" << n << " K=" << k << " S=" << splits << " epilogue=" << int(epilogue)
@@ -404,7 +408,7 @@ int main(int argc,char **argv) {
     for (auto [n,k] : std::array<std::array<uint32_t,2>,4>{{{256,256},{768,768},{512,5120},{512,17408}}})
       for (uint32_t splits : {1U,2U,4U,8U}) {
         if ((k/64)%splits) continue;
-        for (auto e : {LinearEpilogue::None,LinearEpilogue::Residual,LinearEpilogue::GateUp})
+        for (auto e : {LinearEpilogue::None,LinearEpilogue::Residual,LinearEpilogue::GateUp,LinearEpilogue::UpWithGate})
           for (uint32_t fixture=0;fixture<4;++fixture)
             for (uint32_t rows : {8U,16U,24U,32U}) { runCase(backend,n,k,splits,e,fixture,rows); ++cases; }
       }

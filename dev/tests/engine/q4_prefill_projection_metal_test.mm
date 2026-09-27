@@ -1,8 +1,11 @@
 #include "../../../runtime/metal/MetalBackend.hpp"
+#include "AffineQ4Fixture.hpp"
 #include "metal/abi/Linear.h"
 
 #import <Foundation/Foundation.h>
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -228,8 +231,9 @@ void runShape(MetalBackend &backend, const ProjectionShape &shape,
 // A 32-row prefill chunk and the decode M32 kernels cover the same rows with
 // different grid strategies (matrix grid vs persistent groups). Pin the shared
 // accumulation-order claim across the phase boundary: both routes must
-// produce identical bytes, so any future execution placement that moves small
-// prefill chunks onto decode kernels stays numerics-neutral by construction.
+// produce identical bytes, so an execution placement that moves small prefill
+// chunks onto the MPP decode kernels stays numerics-neutral by construction
+// (Apple9's simdgroup tile does not: runSimdgroupCrossCheck).
 void runDecodeCrossCheck(MetalBackend &backend, std::mt19937 &random) {
   const ProjectionShape shape{32, 6144, 5120};
   const uint64_t inputElements = uint64_t{shape.rows} * shape.inputSize;
@@ -413,6 +417,93 @@ void runDecodeCrossCheck(MetalBackend &backend, std::mt19937 &random) {
   }
 }
 
+// Apple9 runs prefill chunks of up to 32 rows on the simdgroup decode tile
+// (ops::Linear::baseline), which reassociates the MPP prefill tile's fp32
+// sums, so their bytes differ. Every simdgroup candidate of each chunk size
+// and prefill epilogue is held to the derived bf16 bound around the MPP tile
+// (tuning/LinearNumerics.hpp); the fused up projection's bound takes the gate
+// rows and the MPP tile's plain up projection.
+void runSimdgroupCrossCheck(MetalBackend &backend, std::mt19937 &random) {
+  using namespace splash::ops;
+  splash::DeviceCapabilities apple9;
+  apple9.appleGpuFamily = 9;
+  apple9.gpuCoreCount = 40;
+  const Linear linear(apple9);
+  const LinearMatrix matrix{5120, 6144};
+  const auto [n, k] = matrix;
+  const Projection projection = splash::test::deterministicQ4Projection(backend, matrix, 61);
+  const auto zeroed = [&](uint64_t bytes, const char *name) {
+    if (!bytes) return MetalBuffer{};
+    MetalBuffer buffer = shared(backend, bytes, name);
+    std::memset(buffer.contents(), 0, bytes);
+    return buffer;
+  };
+  // Every buffer holds the MPP tile's 32 rows of storage.
+  std::uniform_real_distribution<float> values(-1.0f, 1.0f);
+  const auto rowsOf = [&](uint32_t width, const char *name) {
+    MetalBuffer buffer = shared(backend, uint64_t{kTileRows} * width * sizeof(__bf16), name);
+    auto *data = static_cast<__bf16 *>(buffer.contents());
+    for (uint64_t index = 0; index < uint64_t{kTileRows} * width; ++index) data[index] = __bf16(values(random));
+    return buffer;
+  };
+  const MetalBuffer input = rowsOf(k, "q4-simdgroup-input");
+  const MetalBuffer residual = rowsOf(n, "q4-simdgroup-residual");
+  const MetalBuffer gate = rowsOf(n, "q4-simdgroup-gate");
+  const MetalBuffer sums = zeroed(uint64_t{kTileRows} * (k / kQuantGroup) * sizeof(float), "q4-simdgroup-sums");
+  const MetalBuffer downSums =
+      zeroed(uint64_t{kTileRows} * (n / kQuantGroup) * sizeof(float), "q4-simdgroup-down-sums");
+  const auto *residualRows = static_cast<const __bf16 *>(residual.contents());
+  const auto *gateRows = static_cast<const __bf16 *>(gate.contents());
+  // The first `rows` rows of a plan's output, after the Q4 sums it reads.
+  const auto run = [&](const LinearPlan &plan) {
+    const uint32_t rows = plan.workload().rows;
+    const LinearScratchSize size = plan.scratchSize();
+    const LinearBuffers buffers{
+        .input = input,
+        .output = zeroed(uint64_t{plan.storageRows()} * n * sizeof(__bf16), "q4-simdgroup-output"),
+        .sums = sums,
+        .residual = residual,
+        .gateScratch = gate,
+        .downSums = downSums,
+        .scratch = {zeroed(size.input, "q4-simdgroup-table"), zeroed(size.sums, "q4-simdgroup-table-sums"),
+                    zeroed(size.partials, "q4-simdgroup-partials"), zeroed(size.counters, "q4-simdgroup-counters")}};
+    splash::metal::CommandGraph graph;
+    if (plan.sumsBytes()) linear.addPrefillSums(graph, input, sums, projection, rows);
+    linear.add(graph, buffers, projection, plan);
+    (void)backend.submitCommand(graph.dispatches());
+    const auto *output = static_cast<const __bf16 *>(buffers.output.contents());
+    return std::vector<float>(output, output + uint64_t{rows} * n);
+  };
+  const LinearConfig mpp{LinearTile::N128, 0, LinearSimdgroups::Four};
+  for (const uint32_t rows : {1U, 7U, 8U, 17U, 24U, 32U}) {
+    const std::vector<float> up = run(Linear::plan({matrix, rows, LinearPhase::Prefill}, mpp));
+    for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::UpWithGate}) {
+      const LinearWorkload workload{matrix, rows, LinearPhase::Prefill, epilogue};
+      const std::vector<float> reference = run(Linear::plan(workload, mpp));
+      float maxAbs = 0;
+      for (const float value : reference) maxAbs = std::max(maxAbs, std::fabs(value));
+      const float slack = tuning::reassociationSlack(k, maxAbs) + tuning::simdgroupSlack(workload, input, projection);
+      for (const LinearPlan &plan : linear.candidates(workload)) {
+        const std::string label = std::string(plan.pipeline()) + " S" + std::to_string(plan.configuration().splits) +
+            " K" + std::to_string(k) + "N" + std::to_string(n) + "R" + std::to_string(rows);
+        if (!plan.usesSimdgroup()) fail(label + " is not the simdgroup tile");
+        const std::vector<float> actual = run(plan);
+        for (uint64_t index = 0; index < actual.size(); ++index) {
+          tuning::SplitReference expected{reference[index]};
+          if (epilogue == LinearEpilogue::Residual) expected.residual = float(residualRows[index]);
+          if (epilogue == LinearEpilogue::UpWithGate) {
+            expected.gate = float(gateRows[index]);
+            expected.up = up[index];
+          }
+          if (!tuning::withinSplitTolerance(actual[index], epilogue, expected, slack))
+            fail(label + " exceeds its bf16 bound around the MPP prefill tile at element " + std::to_string(index));
+        }
+        std::cout << "PASS q4 prefill " << label << " bounded=true\n";
+      }
+    }
+  }
+}
+
 void run(const std::string &metallibPath) {
   MetalBackend backend(metallibPath);
   std::mt19937 random(20260920);
@@ -424,6 +515,7 @@ void run(const std::string &metallibPath) {
            {64, 6144, 5120}, {256, 5120, 14336}, {2048, 17408, 5120}})
     runShape(backend, shape, random);
   runDecodeCrossCheck(backend, random);
+  runSimdgroupCrossCheck(backend, random);
 }
 
 } // namespace

@@ -47,4 +47,14 @@ void Normalization::addRmsWithQ4Sums(
             width, {rows, 1, 1});
 }
 
+PreparedInput Normalization::addPrefillRms(metal::CommandGraph &graph, metal::MetalBuffer input,
+                                           const NormWeights &weight, metal::MetalBuffer output,
+                                           metal::MetalBuffer sums, uint32_t width, uint32_t rows,
+                                           LinearScratch scratch, const LinearPlan &consumer) {
+  if (!consumer.sumsBytes())
+    return addRms(graph, std::move(input), weight, std::move(output), width, rows, scratch, consumer.input());
+  addRmsWithQ4Sums(graph, std::move(input), weight, std::move(output), std::move(sums), width, rows);
+  return {};
+}
+
 } // namespace splash::ops

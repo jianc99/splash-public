@@ -257,35 +257,34 @@ metal::MetalBuffer QwenTarget::addPrefill(
   return buffers.hidden[geometry_.layers & 1];
 }
 
-// An affine prefill projection reads the Q4 input sums of its rows, which the
-// norm writes beside them; a block projection reads none.
-void QwenTarget::addPrefillNorm(PrefillStep &step, metal::MetalBuffer input, const ops::NormWeights &norm,
-                                ops::WeightLayout consumer) const {
+// The norm also writes the Q4 input sums or the table its consumer's plan reads.
+ops::PreparedInput QwenTarget::addPrefillNorm(PrefillStep &step, metal::MetalBuffer input,
+                                              const ops::NormWeights &norm, const ops::LinearPlan &consumer) const {
   const QwenTargetPrefillBuffers &b = step.buffers;
-  if (consumer == ops::WeightLayout::Affine64)
-    ops::Normalization::addRmsWithQ4Sums(step.graph, input, norm, b.normalized, b.projectionSums,
-                                         geometry_.hiddenSize, step.rows);
-  else
-    ops::Normalization::addRms(step.graph, input, norm, b.normalized, geometry_.hiddenSize, step.rows);
+  return ops::Normalization::addPrefillRms(step.graph, input, norm, b.normalized, b.projectionSums,
+                                           geometry_.hiddenSize, step.rows, b.linearScratch, consumer);
 }
 
 // The mixer output projection adds the mixer's rows to `input`.
 void QwenTarget::addPrefillOutput(PrefillStep &step, metal::MetalBuffer hidden, const ops::Projection &projection,
                                   metal::MetalBuffer input, metal::MetalBuffer output) const {
   const QwenTargetPrefillBuffers &b = step.buffers;
-  if (projection.layout() == ops::WeightLayout::Affine64)
-    operators_.linear().addPrefillSums(step.graph, hidden, b.projectionSums, projection, step.rows);
-  operators_.linear().addPrefillResidual(step.graph, hidden, projection, input, output, b.projectionSums,
-                                         step.rows, b.linearScratch);
+  const ops::Linear &linear = operators_.linear();
+  if (linear.prefillPlan(projection, step.rows, ops::LinearEpilogue::Residual).sumsBytes())
+    linear.addPrefillSums(step.graph, hidden, b.projectionSums, projection, step.rows);
+  linear.addPrefillResidual(step.graph, hidden, projection, input, output, b.projectionSums, step.rows,
+                            b.linearScratch);
 }
 
 metal::MetalBuffer QwenTarget::addPrefillMixer(PrefillStep &step, const QwenGdnWeights &mixer,
                                                const ops::NormWeights &norm, metal::MetalBuffer input) const {
   const QwenTargetPrefillBuffers &b = step.buffers;
+  const ops::Linear &linear = operators_.linear();
   const uint32_t layer = step.gdnLayer++;
-  addPrefillNorm(step, input, norm, mixer.inputProjection.layout());
-  operators_.linear().addPrefill(step.graph, b.normalized, mixer.inputProjection, b.gdnPacked, b.projectionSums,
-                                 step.rows, b.linearScratch);
+  const ops::PreparedInput normalized = addPrefillNorm(
+      step, input, norm, linear.prefillPlan(mixer.inputProjection, step.rows, ops::LinearEpilogue::None));
+  linear.addPrefill(step.graph, b.normalized, mixer.inputProjection, b.gdnPacked, b.projectionSums, step.rows,
+                    b.linearScratch, normalized);
   for (const QwenTargetPrefillSequence &sequence : step.sequences) {
     const auto u16 = [&](const metal::MetalBuffer &buffer, uint32_t width) {
       return rowsOf<uint16_t>(backend_, buffer, sequence.rowBegin, sequence.rows, width);
@@ -310,10 +309,12 @@ metal::MetalBuffer QwenTarget::addPrefillMixer(PrefillStep &step, const QwenGdnW
 metal::MetalBuffer QwenTarget::addPrefillMixer(PrefillStep &step, const QwenAttentionWeights &mixer,
                                                const ops::NormWeights &norm, metal::MetalBuffer input) const {
   const QwenTargetPrefillBuffers &b = step.buffers;
+  const ops::Linear &linear = operators_.linear();
   const uint32_t layer = step.attentionLayer++;
-  addPrefillNorm(step, input, norm, mixer.inputProjection.layout());
-  operators_.linear().addPrefill(step.graph, b.normalized, mixer.inputProjection, b.fullPacked, b.projectionSums,
-                                 step.rows, b.linearScratch);
+  const ops::PreparedInput normalized = addPrefillNorm(
+      step, input, norm, linear.prefillPlan(mixer.inputProjection, step.rows, ops::LinearEpilogue::None));
+  linear.addPrefill(step.graph, b.normalized, mixer.inputProjection, b.fullPacked, b.projectionSums, step.rows,
+                    b.linearScratch, normalized);
   for (const QwenTargetPrefillSequence &sequence : step.sequences) {
     const auto u16 = [&](const metal::MetalBuffer &buffer, uint32_t width) {
       return rowsOf<uint16_t>(backend_, buffer, sequence.rowBegin, sequence.rows, width);
@@ -353,12 +354,23 @@ void QwenTarget::addPrefillFfn(PrefillStep &step, const Qwen3_8LayerWeights &lay
                                metal::MetalBuffer output) const {
   const QwenTargetPrefillBuffers &b = step.buffers;
   const ops::Linear &linear = operators_.linear();
-  addPrefillNorm(step, residual, layer.postAttentionNorm, layer.gateProjection.layout());
-  linear.addPrefill(step.graph, b.normalized, layer.gateProjection, b.denseGateScratch, b.projectionSums,
-                    step.rows, b.linearScratch);
+  const ops::LinearPlan gate = linear.prefillPlan(layer.gateProjection, step.rows, ops::LinearEpilogue::None);
+  const ops::LinearPlan up = linear.prefillPlan(layer.upProjection, step.rows, ops::LinearEpilogue::UpWithGate);
+  // The gate and up projections share the norm's rows and table. Q4 sums come
+  // from the norm (as the gate plan reads them) and the MPP tile's fused up
+  // (for the down plan); a plan whose producer wrote none, as installed
+  // choices mixing tiles leave it, computes its own.
+  ops::PreparedInput normalized = addPrefillNorm(step, residual, layer.postAttentionNorm, gate);
+  normalized = linear.addPrefill(step.graph, b.normalized, layer.gateProjection, b.denseGateScratch,
+                                 b.projectionSums, step.rows, b.linearScratch, normalized);
+  if (up.sumsBytes() && !gate.sumsBytes())
+    linear.addPrefillSums(step.graph, b.normalized, b.projectionSums, layer.upProjection, step.rows);
   linear.addPrefillUpWithGate(step.graph, b.normalized, layer.upProjection, b.denseGateScratch,
                               b.denseIntermediate, b.projectionSums, b.downProjectionSums, step.rows,
-                              b.linearScratch);
+                              b.linearScratch, normalized);
+  if (linear.prefillPlan(layer.downProjection, step.rows, ops::LinearEpilogue::Residual).sumsBytes() &&
+      !up.downSumsBytes())
+    linear.addPrefillSums(step.graph, b.denseIntermediate, b.downProjectionSums, layer.downProjection, step.rows);
   linear.addPrefillResidual(step.graph, b.denseIntermediate, layer.downProjection, residual, output,
                             b.downProjectionSums, step.rows, b.linearScratch);
 }
