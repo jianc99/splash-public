@@ -107,10 +107,14 @@ Q4_DECODE_GATE_UP(decode_linear_q4_n256_gate_up_m16,
                   (q4_mpp_tile_batched<16, 256, true, false>), 128, 256)
 Q4_DECODE_AFFINE(decode_linear_q4_n128_m32,
                  (q4_mpp_tile_batched<32, 128, false, false, 256>), 256, 128)
+Q4_DECODE_AFFINE(decode_linear_q4_n128_m32_sg4,
+                 (q4_mpp_tile_batched<32, 128, false, false, 256, false, 4>), 256, 128)
 Q4_DECODE_AFFINE(decode_linear_q4_n256_m32,
                  (q4_mpp_tile_batched<32, 256, false, false>), 256, 256)
 Q4_DECODE_AUXILIARY(decode_linear_q4_n128_residual_m32, residual,
                     (q4_mpp_tile_batched<32, 128, false, true, 256>), 256, 128)
+Q4_DECODE_AUXILIARY(decode_linear_q4_n128_residual_m32_sg4, residual,
+                    (q4_mpp_tile_batched<32, 128, false, true, 256, false, 4>), 256, 128)
 Q4_DECODE_AUXILIARY(decode_linear_q4_n256_up_silu_m32, gate,
                     (q4_mpp_tile_batched<32, 256, false, false, 256, true>),
                     256, 256)

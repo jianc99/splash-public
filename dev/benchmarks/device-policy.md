@@ -240,5 +240,5 @@ The split tiers stay measured: the characterization's model-derived split
 law has the higher regret at 24 and 32 rows. A four-simdgroup N128 instance
 at 32 rows (32 columns per simdgroup) wins only from 3.25 tiles per core
 (the 27B's residual projections on 10-12 cores: B4 Q4 time -4.0% on the M6,
--5.0% and -7.4% at 10 and 12 emulated cores), a rule of its own; it is kept
-off this law.
+-5.0% and -7.4% at 10 and 12 emulated cores), a rule of its own
+(`kAffineTensorTiles.fourLaneFourSimdgroups`).

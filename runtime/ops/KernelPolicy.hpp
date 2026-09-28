@@ -154,13 +154,21 @@ inline constexpr TensorTileConcurrency kTensorConcurrency{};
 //   cores, 3.1 per core) runs 2.4-3.8% faster paired in every run of two
 //   sets, so "fewer waves wins" (unpaired from any fourth threadgroup) would
 //   cost that step 0.95%.
+// - Four lanes, N128 on four simdgroups (32 columns per simdgroup, the
+//   M32 instances) from 3.25 N128 tiles per core, below on eight: the
+//   27B's residual projections (5120 x 6144 and 17408) on 12 cores (3.33)
+//   take 0.88-0.89 of the eight-simdgroup time on the M6, while grids of
+//   3 or fewer per core lose up to 17% (the 35B draft's query/key/value
+//   projection). A plain projection below the N256 threshold (1.6) never
+//   reaches 3.25, so the rule moves residual projections only.
 struct AffineTileLaw final {
   std::array<std::optional<TilesPerCore>, SPLASH_MAXIMUM_BATCH_WIDTH> wide;
   TilesPerCore unpaired;
+  TilesPerCore fourLaneFourSimdgroups;
 };
 inline constexpr AffineTileLaw kAffineTensorTiles{
     {TilesPerCore{5}, std::nullopt, TilesPerCore{7, 2}, TilesPerCore{8, 5}},
-    TilesPerCore{5 * kTensorConcurrency.paired128 + 1, 5}};
+    TilesPerCore{5 * kTensorConcurrency.paired128 + 1, 5}, TilesPerCore{13, 4}};
 
 // The rows of one MPP fragment: the neural accelerator computes 16-row
 // fragments, so 8- and 16-row tiles run one and 24- and 32-row tiles two (a

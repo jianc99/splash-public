@@ -442,12 +442,13 @@ void planContracts(uint32_t family, uint32_t cores, size_t &widestCandidates) {
             const bool oneLane = lanes == 1 &&
                 (tile == LinearTile::Split32 ||
                  (tile == LinearTile::Paired256 && epilogue == LinearEpilogue::None));
-            require(((lanes == 3 && tile == LinearTile::N128 && epilogue != LinearEpilogue::GateUp) ||
+            require(((lanes >= 3 && tile == LinearTile::N128 && epilogue != LinearEpilogue::GateUp) ||
                      oneLane || plan.usesSimdgroup()) && plan.secondPipeline().empty(),
                     "four-SIMDgroup candidate escaped its precompiled workload set");
-            if (lanes == 3 && !plan.usesSimdgroup())
-              require(plan.pipeline() == (epilogue == LinearEpilogue::Residual
-                          ? "decode_linear_q4_n128_residual_m24_sg4" : "decode_linear_q4_n128_m24_sg4"),
+            if (lanes >= 3 && !plan.usesSimdgroup())
+              require(plan.pipeline() == std::string(epilogue == LinearEpilogue::Residual
+                          ? "decode_linear_q4_n128_residual_m" : "decode_linear_q4_n128_m") +
+                          std::to_string(lanes * 8) + "_sg4",
                       "four-SIMDgroup plan chose the wrong pipeline");
           }
           require(plan.threadsPerThreadgroup() == (four ? 128 : 256),
@@ -466,7 +467,7 @@ void planContracts(uint32_t family, uint32_t cores, size_t &widestCandidates) {
         // the split tiles when K allows them: Split32 for every decode
         // epilogue, Split64 for the single-stream ones.
         require((fourScopeCandidates != 0) ==
-                    (family == 9 || (lanes == 3 && epilogue != LinearEpilogue::GateUp) ||
+                    (family == 9 || (lanes >= 3 && epilogue != LinearEpilogue::GateUp) ||
                      (lanes == 1 && (family == 9 || epilogue == LinearEpilogue::None || matrix.inputSize % 1024 == 0))),
                 "Linear candidate set omitted or added four-SIMDgroup plans");
         uint32_t legalSplits = 0;
@@ -669,14 +670,19 @@ void planContracts(uint32_t family, uint32_t cores, size_t &widestCandidates) {
   for (uint32_t scope : {0U, 1U, 2U, 3U, 16U, 255U})
     rejects([&] { (void)Linear::plan(fourWorkload,
         {LinearTile::N128, 1, static_cast<LinearSimdgroups>(scope)}); });
-  for (uint32_t rows : {8U, 16U, 32U})
+  for (uint32_t rows : {8U, 16U})
     rejects([&] { (void)Linear::plan({{512, 256}, rows}, fourConfig); });
+  require(Linear::plan({{512, 256}, 32}, fourConfig).pipeline() == std::string("decode_linear_q4_n128_m32_sg4") &&
+              Linear::plan({{512, 256}, 32, LinearPhase::Decode, LinearEpilogue::Residual}, fourConfig).pipeline() ==
+                  std::string("decode_linear_q4_n128_residual_m32_sg4"),
+          "four-SIMDgroup M32 decode plan was rejected");
   for (const auto tile : {LinearTile::N256, LinearTile::Paired128})
     rejects([&] { (void)Linear::plan(fourWorkload,
         {tile, 1, LinearSimdgroups::Four}); });
-  for (const auto epilogue : {LinearEpilogue::GateUp, LinearEpilogue::UpWithGate})
-    rejects([&] { (void)Linear::plan({{512, 256}, 24, LinearPhase::Decode, epilogue},
-                                      fourConfig); });
+  for (uint32_t rows : {24U, 32U})
+    for (const auto epilogue : {LinearEpilogue::GateUp, LinearEpilogue::UpWithGate})
+      rejects([&] { (void)Linear::plan({{512, 256}, rows, LinearPhase::Decode, epilogue},
+                                        fourConfig); });
   for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual,
                              LinearEpilogue::UpWithGate}) {
     const LinearWorkload prefill{{512, 256}, 24, LinearPhase::Prefill, epilogue};

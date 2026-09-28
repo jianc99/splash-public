@@ -90,8 +90,8 @@ LinearWorkload decode(LinearMatrix matrix, uint32_t lanes, LinearEpilogue epilog
   return {matrix, lanes * SPLASH_TARGET_VERIFY_ROWS, LinearPhase::Decode, epilogue};
 }
 
-// The four-simdgroup kernels: every prefill N128 tile, the decode M24 N128
-// plain and residual projections, all matrix row tiles of up to a decode
+// The four-simdgroup kernels: every prefill N128 tile, the decode M24 and M32
+// N128 plain and residual projections, all matrix row tiles of up to a decode
 // batch, and the one-lane Split32 (plain, residual and gate/up) and Paired256
 // (plain) tiles.
 bool supportsFourSimdgroups(LinearWorkload w, LinearTile tile) noexcept {
@@ -105,8 +105,8 @@ bool supportsFourSimdgroups(LinearWorkload w, LinearTile tile) noexcept {
         w.epilogue == LinearEpilogue::None;
   if (tile != LinearTile::N128) return false;
   return w.phase == LinearPhase::Prefill ||
-      (w.rows == 24 && (w.epilogue == LinearEpilogue::None ||
-                        w.epilogue == LinearEpilogue::Residual));
+      ((w.rows == 24 || w.rows == 32) &&
+       (w.epilogue == LinearEpilogue::None || w.epilogue == LinearEpilogue::Residual));
 }
 
 } // namespace
@@ -316,8 +316,10 @@ LinearPlan::LinearPlan(LinearWorkload w, LinearConfig config, FloatOutput destin
     return;
   }
   if (four) {
-    pipeline_ = residual ? "decode_linear_q4_n128_residual_m24_sg4"
-                         : "decode_linear_q4_n128_m24_sg4";
+    if (lane == 2)
+      pipeline_ = residual ? "decode_linear_q4_n128_residual_m24_sg4" : "decode_linear_q4_n128_m24_sg4";
+    else
+      pipeline_ = residual ? "decode_linear_q4_n128_residual_m32_sg4" : "decode_linear_q4_n128_m32_sg4";
     return;
   }
   if (w.epilogue == LinearEpilogue::GateUp) {
@@ -447,7 +449,7 @@ LinearConfig tensorSequentialConfig(LinearWorkload w, uint32_t cores) {
     return {unpaired ? LinearTile::N128 : LinearTile::Paired128, decodeGroups(tiles128, cores, kN128Groups)};
   }
   if (widePlain) return {LinearTile::N256, decodeGroups(tiles256, cores, kN256Groups)};
-  if (lanes == 3)
+  if (lanes == 3 || (lanes == 4 && kAffineTensorTiles.fourLaneFourSimdgroups.reachedBy(tiles128, cores)))
     return {LinearTile::N128, decodeGroups(tiles128, cores, kFourSimdgroupGroups), LinearSimdgroups::Four};
   return {LinearTile::N128, decodeGroups(tiles128, cores, lanes == 2 ? kN128M16Groups : kN128Groups)};
 }
