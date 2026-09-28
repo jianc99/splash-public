@@ -15,8 +15,10 @@ struct DeviceCapabilities {
     uint32_t macosMajor = 0;
     uint32_t macosMinor = 0;
     uint32_t macosPatch = 0;
-    // Highest supported MTLGPUFamilyAppleN.
+    // Highest supported MTLGPUFamilyAppleN. The probe starts at the newest
+    // family this build knows, so a later GPU reports that family.
     static constexpr uint32_t kMinimumAppleGpuFamily = 9;
+    static constexpr uint32_t kNewestAppleGpuFamily = 11;
     uint32_t appleGpuFamily = 0;
     // IORegistry gpu-core-count; zero means unavailable. Kernel policy then
     // uses its fallback for unknown core counts; keep the missing value here.
