@@ -124,6 +124,7 @@ TEST_DECODE_PROFILE := $(ENGINE_TEST_BUILD)/decode-profile
 TEST_ATTENTION_SWEEP := $(ENGINE_TEST_BUILD)/attention-sweep
 TEST_GGUF_PROJECTION_BENCHMARK := $(ENGINE_TEST_BUILD)/gguf-projection-benchmark
 TEST_GGUF_MOE_BENCHMARK := $(ENGINE_TEST_BUILD)/gguf-moe-benchmark
+TEST_POLICY_BENCH := $(ENGINE_TEST_BUILD)/policy-bench
 TEST_MODEL_RUNTIME_ORACLE := $(ENGINE_TEST_BUILD)/model-runtime-oracle
 TEST_AFFINE_SOURCE_ORACLE := $(ENGINE_TEST_BUILD)/affine-source-oracle
 TEST_VISION_ENCODER_TEST := $(ENGINE_TEST_BUILD)/vision-encoder
@@ -211,7 +212,7 @@ TEST_METAL_TARGETS := $(TEST_AFFINE_PREPARATION) \
 TEST_CONFIG_TARGETS := $(filter-out $(LIB),$(sort $(TEST_CPU_TARGETS) $(TEST_METAL_TARGETS))) \
 	$(TEST_MODEL_RUNTIME_ORACLE) $(TEST_VISION_ENCODER_TEST) $(TEST_AFFINE_SOURCE_ORACLE) \
 	$(TEST_DECODE_PROFILE) $(TEST_ATTENTION_SWEEP) \
-	$(TEST_GGUF_PROJECTION_BENCHMARK) $(TEST_GGUF_MOE_BENCHMARK) \
+	$(TEST_GGUF_PROJECTION_BENCHMARK) $(TEST_GGUF_MOE_BENCHMARK) $(TEST_POLICY_BENCH) \
 	$(TEST_Q8_AIR) $(TEST_Q8_KERNEL_AIRS) $(TEST_METAL_BACKEND_AIR) $(TEST_GGUF_DEQUANT_AIR)
 # Benchmarks and the tuning tool that build with the production flags.
 PRODUCTION_FLAG_TOOLS := $(TEST_Q4_PREFILL_PROFILE) $(TEST_Q4_DECODE_PROFILE) \
@@ -597,6 +598,13 @@ $(TEST_GGUF_MOE_BENCHMARK): dev/benchmarks/gguf_moe_benchmark.mm \
 		$(ENGINE_LIBRARY) \
 		$(ENGINE_LINKFLAGS) -o $@
 
+# The kernel policy's DRAM-cold bench (affine, prefill, GGUF, bandwidth); test-engine-cpu builds it.
+$(TEST_POLICY_BENCH): dev/benchmarks/policy_bench.mm dev/tests/engine/GgufFormatReference.hpp \
+		dev/tuning/LinearNumerics.hpp $(ENGINE_LIBRARY) $(LIB) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< \
+		$(ENGINE_LIBRARY) \
+		$(ENGINE_LINKFLAGS) -o $@
+
 $(TEST_BACKEND_BENCHMARK): dev/benchmarks/backend_benchmark.mm \
 		dev/benchmarks/PrefillWork.hpp \
 		$(ENGINE_LIBRARY) $(LIB) $(BUILD_ID_HEADER) \
@@ -619,7 +627,7 @@ METAL_TEST_ENV := MTL_SHADER_VALIDATION=1
 test-engine: test-engine-cpu test-engine-metal
 
 test-engine-cpu: $(TEST_CPU_TARGETS) $(TEST_ATTENTION_SWEEP) $(TUNE_KERNELS) \
-		$(TEST_GGUF_PROJECTION_BENCHMARK) $(TEST_GGUF_MOE_BENCHMARK) \
+		$(TEST_GGUF_PROJECTION_BENCHMARK) $(TEST_GGUF_MOE_BENCHMARK) $(TEST_POLICY_BENCH) \
 		$(TEST_AFFINE_SOURCE_ORACLE)
 	$(TEST_SLOT_FILE)
 	$(BUILD_ID_PYTHON) dev/tests/engine/run_vision_preparation.py $(TEST_VISION_PREPARATION) $(WEIGHT_GOLDENS)
@@ -718,7 +726,7 @@ test-real: preflight $(TARGET) $(TEST_MODEL_RUNTIME_ORACLE) \
 
 .PHONY: benchmark-prefill benchmark-decode benchmark-backend \
 	benchmark-decode-profile benchmark-attention-sweep \
-	benchmark-gguf-projection benchmark-gguf-moe
+	benchmark-gguf-projection benchmark-gguf-moe benchmark-policy
 benchmark-prefill: all $(TEST_Q4_PREFILL_PROFILE)
 	$(TEST_Q4_PREFILL_PROFILE) $(LIB)
 
@@ -747,6 +755,12 @@ benchmark-gguf-projection: $(TEST_GGUF_PROJECTION_BENCHMARK) $(LIB)
 # [gate/up format] [down format] (q4k q5k by default).
 benchmark-gguf-moe: $(TEST_GGUF_MOE_BENCHMARK) $(LIB)
 	$(TEST_GGUF_MOE_BENCHMARK) $(LIB) $(GGUF_MOE_ARGS)
+
+# The kernel policy's DRAM-cold bench; POLICY_BENCH_ARGS passes --suite/--shapes/--emulate/--check/--csv
+# (dev/benchmarks/policy_bench.mm). Run --check under MTL_SHADER_VALIDATION=1 before timing.
+POLICY_BENCH_ARGS ?= --suite affine --shapes 27b,35b
+benchmark-policy: $(TEST_POLICY_BENCH) $(LIB)
+	$(TEST_POLICY_BENCH) $(LIB) $(POLICY_BENCH_ARGS)
 
 benchmark-backend: preflight $(TARGET) $(TEST_BACKEND_BENCHMARK) $(LIB)
 	$(TEST_BACKEND_BENCHMARK) $(LIB) "$(MODEL_ROOT)"

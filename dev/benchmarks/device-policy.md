@@ -115,6 +115,11 @@ prints every production plan, with its tuning candidates and arena bounds, of
 the 27B and 35B targets and drafts, affine and GGUF, and of the 35B MoE layer,
 on families 9–11 at an unknown and 14 known core counts from 10 to 80. Run in
 two builds, the diff of its outputs lists exactly the plans a change moves.
+`policy-bench` (`make benchmark-policy`, `dev/benchmarks/policy_bench.mm`)
+times those plans DRAM-cold beside every configuration a law could pick, at
+the native core count and others emulated by width; runs of the two builds,
+alternated and summarized by `dev/benchmarks/policy_summary.py --new`, give a
+change's projection time per decode step against its parent's.
 Earlier serving results remain in
 [remaining-decode-optimizations.md](remaining-decode-optimizations.md) and
 [apple9-simdgroup.md](apple9-simdgroup.md).
