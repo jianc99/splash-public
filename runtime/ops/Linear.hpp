@@ -56,9 +56,9 @@ inline constexpr uint32_t kMaximumDecodeTileRows = SPLASH_MAXIMUM_BATCH_WIDTH * 
 // threadgroups, grid (column tiles, splits), every lane's rows in each tile;
 // the last threadgroup of a tile to finish reduces the fp32 partial sums
 // before the bf16 rounding. Paired256 is the four-simdgroup N256 paired tile.
-// Simdgroup uses bf16 8x8 matrix operations and an explicit activation/split
-// workspace, in decode and in prefill chunks of up to 32 rows padded to whole
-// lanes.
+// The decode tiles also run prefill chunks of up to 32 rows padded to whole
+// lanes (Linear::baseline). Simdgroup uses bf16 8x8 matrix operations and an
+// explicit activation/split workspace.
 // GgufStaged dequantizes GGUF weights per simdgroup into threadgroup memory
 // for matmul2d: 64 columns per decode threadgroup (two simdgroups) of 8, 16
 // or 32 rows with optional K splits; prefill runs 128-row tiles, or the
@@ -86,8 +86,8 @@ struct LinearWorkload final {
 
 struct LinearConfig final {
   LinearTile tile = LinearTile::N128;
-  // Decode grid size, which the simdgroup tile also takes in prefill. The
-  // other prefill tiles use their matrix grid and require zero here.
+  // Decode grid size, which a decode tile also takes in a prefill chunk. The
+  // prefill tiles use their matrix grid and require zero here.
   uint32_t groups = 0;
   // Simdgroups per threadgroup, independent of the persistent grid size: the
   // cooperative scope of one tile, or for Split32 and Split64 the four
@@ -185,8 +185,8 @@ public:
   [[nodiscard]] LinearInput input() const noexcept;
   [[nodiscard]] LinearScratchSize scratchSize() const noexcept;
   // The Q4 input sums an affine MPP prefill tile reads, and those its fused
-  // up projection writes for the down projection; the simdgroup tile reads
-  // its table's sums instead (scratchSize).
+  // up projection writes for the down projection; the decode tiles compute
+  // their own (the simdgroup tile from its table, scratchSize).
   [[nodiscard]] uint64_t sumsBytes() const noexcept;
   [[nodiscard]] uint64_t gateScratchBytes() const noexcept;
   [[nodiscard]] uint64_t downSumsBytes() const noexcept;
@@ -199,6 +199,11 @@ public:
 private:
   friend class Linear;
   LinearPlan(LinearWorkload workload, LinearConfig config, FloatOutput destination = FloatOutput::BFloat16);
+  // Whether an affine plan runs a prefill tile: a prefill chunk's plan with
+  // no decode grid (GGUF plans tell their tiles by their scope).
+  [[nodiscard]] bool prefillTile() const noexcept {
+    return workload_.phase == LinearPhase::Prefill && !config_.groups;
+  }
   // Block plans (LinearGguf.cpp).
   void requireBlockConfiguration() const;
   [[nodiscard]] LinearScratchSize blockScratchSize() const noexcept;

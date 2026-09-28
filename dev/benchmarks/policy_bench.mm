@@ -478,10 +478,11 @@ std::string tileName(LinearTile tile) {
   }
   return "?";
 }
+// A decode tile's label names its persistent groups, in a prefill chunk too.
 std::string configLabel(const LinearConfig &c, LinearPhase phase) {
   std::string label = tileName(c.tile) + ".sg" + std::to_string(uint32_t(c.simdgroups));
-  if (phase == LinearPhase::Decode && c.tile != LinearTile::GgufStaged && c.tile != LinearTile::GgufRegister &&
-      c.tile != LinearTile::Split128)
+  if ((phase == LinearPhase::Decode || c.groups) && c.tile != LinearTile::GgufStaged &&
+      c.tile != LinearTile::GgufRegister && c.tile != LinearTile::Split128)
     label += ".g" + std::to_string(c.groups);
   if (c.splits > 1 || c.tile == LinearTile::Split128 || c.tile == LinearTile::GgufStaged ||
       c.tile == LinearTile::GgufRegister)
@@ -641,9 +642,10 @@ void prefillVariants(const Linear &linear, const Shape &s, uint32_t rows, std::v
   for (const LinearConfig &config : configs) {
     Variant v;
     try {
-      // The gate pass of a pair runs the plain kernel of the up pass's tile; the fused up-with-gate kernel has an
-      // N128 instance only at four simdgroups.
-      if (gateUp) v.plans.push_back(Linear::plan(gate, config));
+      // The gate pass of a pair: beside the device's up-with-gate plan the device's gate plan, beside the others the
+      // plain kernel of the up pass's tile (the fused up-with-gate kernel has an N128 instance only at four
+      // simdgroups).
+      if (gateUp) v.plans.push_back(config == policy ? linear.plan(gate) : Linear::plan(gate, config));
       v.plans.push_back(Linear::plan(w, config));
     } catch (const std::invalid_argument &) {
       continue;
@@ -654,8 +656,10 @@ void prefillVariants(const Linear &linear, const Shape &s, uint32_t rows, std::v
     v.label = "prefill." + configLabel(main.configuration(), LinearPhase::Prefill) + (gateUp ? ".gate+up" : "");
     for (const LinearPlan &p : v.plans) v.pipeline += (v.pipeline.empty() ? "" : "+") + std::string(p.pipeline());
     v.threads = main.threadsPerThreadgroup();
-    v.gridX = main.storageRows() / 32;
-    v.gridY = s.n / main.tileColumns();
+    // A prefill chunk on a decode tile runs its decode grid.
+    const LinearConfig c = main.configuration();
+    v.gridX = c.groups ? c.groups : main.storageRows() / 32;
+    v.gridY = c.groups ? c.splits : s.n / main.tileColumns();
     out.push_back(std::move(v));
   }
   // The mixer output and draft context projections read sums of their own input (Linear::addPrefillSums).
@@ -665,7 +669,8 @@ void prefillVariants(const Linear &linear, const Shape &s, uint32_t rows, std::v
     sums.sums = true;
     sums.label = "prefill.sums32";
     sums.pipeline = "prefill_linear_q4_sums32";
-    sums.plans.push_back(linear.plan(gate));
+    // The prefill tile's plan: the rows its sums cover.
+    sums.plans.push_back(Linear::plan(gate, {LinearTile::N128, 0, LinearSimdgroups::Four}));
     sums.threads = 256;
     sums.gridX = (rows + 31) / 32;
     sums.gridY = 1;
@@ -828,7 +833,12 @@ void encodeAffine(const Linear &linear, CommandGraph &graph, const Variant &v, c
                   const Projection *gate, const Buffers &b, bool sums) {
   const LinearPlan &first = v.plans.front();
   const bool prefill = first.workload().phase == LinearPhase::Prefill;
-  if (v.sums || (sums && prefill)) linear.addPrefillSums(graph, b.input.view, b.sums.view, p, v.logicalRows);
+  // Only the prefill tiles read the sums; the decode tiles compute their own.
+  const bool readsSums = std::any_of(v.plans.begin(), v.plans.end(), [](const LinearPlan &plan) {
+    return plan.sumsBytes() != 0;
+  });
+  if (v.sums || (sums && prefill && readsSums))
+    linear.addPrefillSums(graph, b.input.view, b.sums.view, p, v.logicalRows);
   if (v.sums) return;
   if (prefill && v.plans.size() == 2) {
     (void)linear.add(graph, {.input = b.input.view, .output = b.gateScratch.view, .sums = b.sums.view,

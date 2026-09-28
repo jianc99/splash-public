@@ -93,20 +93,19 @@ LinearWorkload decode(LinearMatrix matrix, uint32_t lanes, LinearEpilogue epilog
 // The four-simdgroup kernels: every prefill N128 tile, the decode M24 N128
 // plain and residual projections, all matrix row tiles of up to a decode
 // batch, and the one-lane Split32 (plain, residual and gate/up) and Paired256
-// (plain) tiles.
-bool supportsFourSimdgroups(LinearWorkload w, LinearTile tile) noexcept {
+// (plain) tiles. A decode tile (`decodeTile`) runs the rows of its storage.
+bool supportsFourSimdgroups(LinearWorkload w, LinearTile tile, bool decodeTile) noexcept {
+  const uint32_t rows = decodeTile ? kAffineTensorDecode.rows.round(w.rows) : w.rows;
   if (tile == LinearTile::Simdgroup) return w.rows <= kMaximumDecodeTileRows;
   if (tile == LinearTile::Split32)
     return w.phase == LinearPhase::Decode && w.rows == SPLASH_TARGET_VERIFY_ROWS;
   // Only the affine paired N256 kernel is instantiated: this tile is used
   // for wide plain projections; residual and gate/up retain their own tiles.
   if (tile == LinearTile::Paired256)
-    return w.phase == LinearPhase::Decode && w.rows == SPLASH_TARGET_VERIFY_ROWS &&
-        w.epilogue == LinearEpilogue::None;
+    return decodeTile && rows == SPLASH_TARGET_VERIFY_ROWS && w.epilogue == LinearEpilogue::None;
   if (tile != LinearTile::N128) return false;
-  return w.phase == LinearPhase::Prefill ||
-      (w.rows == 24 && (w.epilogue == LinearEpilogue::None ||
-                        w.epilogue == LinearEpilogue::Residual));
+  return !decodeTile ||
+      (rows == 24 && (w.epilogue == LinearEpilogue::None || w.epilogue == LinearEpilogue::Residual));
 }
 
 } // namespace
@@ -142,7 +141,7 @@ const KernelFamily &LinearPlan::kernelFamily() const noexcept {
   case LinearTile::Split64:
   case LinearTile::Paired256: break;
   }
-  return workload_.phase == LinearPhase::Prefill ? kAffineTensorPrefill : kAffineTensorDecode;
+  return prefillTile() ? kAffineTensorPrefill : kAffineTensorDecode;
 }
 uint32_t LinearPlan::storageRows() const noexcept { return kernelFamily().rows.round(workload_.rows); }
 uint32_t LinearPlan::tileColumns() const noexcept {
@@ -174,10 +173,10 @@ LinearInput LinearPlan::input() const noexcept {
 LinearScratchSize LinearPlan::scratchSize() const noexcept {
   if (workload_.weightLayout == WeightLayout::Block32) return blockScratchSize();
   const auto [n, k] = workload_.matrix;
-  // Split128: [split][row][column] fp32 partials over every row of the step
-  // and one counter per column tile.
+  // Split128: [split][row][column] fp32 partials over every row of its
+  // storage and one counter per column tile.
   if (config_.tile == LinearTile::Split128)
-    return {0, 0, uint64_t{config_.splits} * workload_.rows * n * sizeof(float),
+    return {0, 0, uint64_t{config_.splits} * storageRows() * n * sizeof(float),
             uint64_t{n / tileColumns()} * sizeof(uint32_t)};
   if (!usesSimdgroup()) return {};
   const uint64_t rows = storageRows();
@@ -190,8 +189,8 @@ LinearScratchSize LinearPlan::scratchSize() const noexcept {
 }
 
 uint64_t LinearPlan::sumsBytes() const noexcept {
-  return workload_.phase == LinearPhase::Prefill && workload_.weightLayout == WeightLayout::Affine64 &&
-      !usesSimdgroup() ? uint64_t{storageRows()} * (workload_.matrix.inputSize / kQuantGroup) * 4 : 0;
+  return prefillTile() && workload_.weightLayout == WeightLayout::Affine64
+             ? uint64_t{storageRows()} * (workload_.matrix.inputSize / kQuantGroup) * 4 : 0;
 }
 uint64_t LinearPlan::gateScratchBytes() const noexcept {
   // GGUF tiles run gate/up as a gate pass and an up-with-gate pass.
@@ -201,8 +200,9 @@ uint64_t LinearPlan::gateScratchBytes() const noexcept {
   return needed ? uint64_t{storageRows()} * workload_.matrix.outputSize * 2 : 0;
 }
 uint64_t LinearPlan::downSumsBytes() const noexcept {
-  return workload_.epilogue == LinearEpilogue::UpWithGate && workload_.weightLayout == WeightLayout::Affine64 &&
-      !usesSimdgroup() ? uint64_t{storageRows()} * (workload_.matrix.outputSize / kQuantGroup) * 4 : 0;
+  return workload_.epilogue == LinearEpilogue::UpWithGate && prefillTile() &&
+      workload_.weightLayout == WeightLayout::Affine64
+             ? uint64_t{storageRows()} * (workload_.matrix.outputSize / kQuantGroup) * 4 : 0;
 }
 
 LinearPlan::LinearPlan(LinearWorkload w, LinearConfig config, FloatOutput destination)
@@ -228,7 +228,7 @@ LinearPlan::LinearPlan(LinearWorkload w, LinearConfig config, FloatOutput destin
   if ((config.simdgroups != LinearSimdgroups::Four &&
        config.simdgroups != LinearSimdgroups::Eight) ||
       (config.simdgroups == LinearSimdgroups::Four &&
-       !supportsFourSimdgroups(w, config.tile)))
+       !supportsFourSimdgroups(w, config.tile, !prefillTile())))
     throw std::invalid_argument("invalid Q4 cooperative execution scope");
   if (const auto fixed = fixedSimdgroups(config.tile); fixed && config.simdgroups != *fixed)
     throw std::invalid_argument("Q4 tile requires its kernel's simdgroup count");
@@ -247,8 +247,8 @@ LinearPlan::LinearPlan(LinearWorkload w, LinearConfig config, FloatOutput destin
         residual ? "decode_linear_q4_sg_residual" : "decode_linear_q4_sg";
     return;
   }
-  if (w.phase == LinearPhase::Prefill) {
-    if (config.groups || oneLaneTile(config.tile) || config.tile == LinearTile::Split128)
+  if (prefillTile()) {
+    if (oneLaneTile(config.tile) || config.tile == LinearTile::Split128)
       throw std::invalid_argument("invalid Q4 prefill configuration");
     if (four) {
       pipeline_ = w.epilogue == LinearEpilogue::UpWithGate
@@ -268,9 +268,14 @@ LinearPlan::LinearPlan(LinearWorkload w, LinearConfig config, FloatOutput destin
     }
     return;
   }
+  // A decode tile: a decode step, or a prefill chunk of up to a decode batch
+  // over its rows in whole lanes and whole 256-input blocks, as in decode.
+  if (w.phase == LinearPhase::Prefill &&
+      (w.rows > kMaximumDecodeTileRows || w.matrix.inputSize % kInputSumBlock || oneLaneSplit(config.tile)))
+    throw std::invalid_argument("a prefill chunk runs the decode tiles at up to 32 rows and 256-input blocks");
   if (!config.groups || config.groups > w.matrix.outputSize / tileColumns())
     throw std::invalid_argument("invalid Q4 decode group count");
-  const uint32_t lane = w.rows / SPLASH_TARGET_VERIFY_ROWS - 1;
+  const uint32_t lane = storageRows() / SPLASH_TARGET_VERIFY_ROWS - 1;
   if (oneLaneTile(config.tile) && (lane != 0 || w.matrix.outputSize % 256))
     throw std::invalid_argument("paired or split Q4 tile requires one lane and paired columns");
   if (oneLaneSplit(config.tile)) {
@@ -306,9 +311,21 @@ LinearPlan::LinearPlan(LinearWorkload w, LinearConfig config, FloatOutput destin
         "decode_linear_q4_n128_split_up_silu_m16", "decode_linear_q4_n128_split_up_silu_m24",
         "decode_linear_q4_n128_split_up_silu_m32"};
     // Gate/up at every lane count: a plain gate pass into the gate scratch,
-    // then the up pass whose epilogue applies the SiLU gate.
-    pipeline_ = residual ? residualNames[lane] : plainNames[lane];
+    // then the up pass whose epilogue applies the SiLU gate. A prefill
+    // chunk's up-with-gate projection runs that up pass.
+    pipeline_ = residual ? residualNames[lane]
+        : w.epilogue == LinearEpilogue::UpWithGate ? upSiluNames[lane] : plainNames[lane];
     if (w.epilogue == LinearEpilogue::GateUp) secondPipeline_ = upSiluNames[lane];
+    return;
+  }
+  if (w.epilogue == LinearEpilogue::UpWithGate) {
+    // A prefill chunk's up-with-gate projection on the sequential decode
+    // tiles: the up pass of the N256 gate/up plan, at every lane count.
+    if (config.tile != LinearTile::N256)
+      throw std::invalid_argument("Q4 up-with-gate decode tiles are N256 and Split128");
+    constexpr std::array names{"decode_linear_q4_n256_up_silu", "decode_linear_q4_n256_up_silu_m16",
+        "decode_linear_q4_n256_up_silu_m24", "decode_linear_q4_n256_up_silu_m32"};
+    pipeline_ = names[lane];
     return;
   }
   if (config.tile == LinearTile::Paired256) {
@@ -452,6 +469,15 @@ LinearConfig tensorSequentialConfig(LinearWorkload w, uint32_t cores) {
   return {LinearTile::N128, decodeGroups(tiles128, cores, lanes == 2 ? kN128M16Groups : kN128Groups)};
 }
 
+// Apple10's decode plan: Split128 where its split law splits K, else the
+// sequential tiles.
+LinearConfig tensorDecodeConfig(LinearWorkload w, const DevicePolicy &device) {
+  const uint32_t tiles128 = w.matrix.outputSize / 128;
+  if (const uint32_t splits = splitK(kAffineTensorSplit, device, tiles128, w.matrix.inputSize, w.rows); splits > 1)
+    return {LinearTile::Split128, tiles128, LinearSimdgroups::Eight, splits};
+  return tensorSequentialConfig(w, device.cores);
+}
+
 // Apple9's simdgroup tile over the full column grid, 32 columns per gate/up
 // threadgroup and 64 otherwise, split by its family's law. It ignores the
 // rows, so a lane's outputs are the same at every batch width and in prefill
@@ -492,6 +518,18 @@ LinearConfig Linear::baseline(LinearWorkload w, std::span<const Projection *cons
     // 40-core M3 Max it took 1.25 ms for the 27B FFN down projection (17408
     // inputs, 5120 outputs) at 17-32 rows, about ten times its bandwidth floor.
     if (registerTiles && w.rows <= kMaximumDecodeTileRows) return simdgroupConfig(w, device_);
+    // On the tensor primitive such a chunk runs the decode plan of its rows
+    // in whole lanes (an up-with-gate projection the up pass of the decode
+    // gate/up plan) where that plan's tiles compute fewer MPP rows than the
+    // prefill tile's 32, one 16-row fragment at 8 and 16 rows, or where it
+    // splits K: at 17-32 rows both compute two fragments and only the split
+    // grid helps (kMppFragmentRows).
+    if (!registerTiles && w.rows <= kMaximumDecodeTileRows && w.matrix.inputSize % kInputSumBlock == 0) {
+      const LinearWorkload step{w.matrix, kAffineTensorDecode.rows.round(w.rows), LinearPhase::Decode,
+                                w.epilogue == LinearEpilogue::UpWithGate ? LinearEpilogue::GateUp : w.epilogue};
+      const LinearConfig decode = tensorDecodeConfig(step, device_);
+      if (RowQuanta{kMppFragmentRows}.round(step.rows) < kAffinePrefillTileRows || decode.splits > 1) return decode;
+    }
     if (!registerTiles || device_.cores <= kApple9MeasuredPrefillCores)
       return {LinearTile::N128, 0, LinearSimdgroups::Four};
     const uint32_t rowTiles = (w.rows + kAffinePrefillTileRows - 1) / kAffinePrefillTileRows;
@@ -510,9 +548,7 @@ LinearConfig Linear::baseline(LinearWorkload w, std::span<const Projection *cons
     return lanes == 3 ? LinearConfig{LinearTile::N128, tiles128, LinearSimdgroups::Four}
                       : LinearConfig{LinearTile::N256, tiles256};
   }
-  if (const uint32_t splits = splitK(kAffineTensorSplit, device_, tiles128, w.matrix.inputSize, w.rows); splits > 1)
-    return {LinearTile::Split128, tiles128, LinearSimdgroups::Eight, splits};
-  return tensorSequentialConfig(w, device_.cores);
+  return tensorDecodeConfig(w, device_);
 }
 
 LinearPlan Linear::plan(LinearWorkload workload) const {
@@ -547,10 +583,11 @@ std::vector<LinearPlan> Linear::candidates(LinearWorkload w) const {
       if (existing.configuration() == config) return;
     result.push_back(LinearPlan(w, config));
   };
-  // Prefill chunks the simdgroup tile runs list only its K splits, so a tuning
-  // fixture never mixes its lanes and table with the MPP tiles' padded rows
-  // and Q4 sums.
+  // Prefill chunks a decode tile runs list only that tile's K splits (Apple9)
+  // or none (Apple10), so a tuning fixture never mixes their lanes and table
+  // with the MPP prefill tiles' padded rows and Q4 sums.
   const bool simdgroupPrefill = w.phase == LinearPhase::Prefill && result.front().usesSimdgroup();
+  if (w.phase == LinearPhase::Prefill && !simdgroupPrefill && !result.front().prefillTile()) return result;
   for (const auto tile : {LinearTile::N128, LinearTile::N256, LinearTile::Paired128}) {
     const uint32_t columns = tile == LinearTile::N256 ? 256 : 128;
     if (simdgroupPrefill || w.matrix.outputSize % columns ||
@@ -563,7 +600,7 @@ std::vector<LinearPlan> Linear::candidates(LinearWorkload w) const {
       // The fused up projection has no eight-simdgroup N128 kernel.
       if (tile == LinearTile::N256 || w.epilogue != LinearEpilogue::UpWithGate)
         append({tile, 0});
-      if (supportsFourSimdgroups(w, tile))
+      if (supportsFourSimdgroups(w, tile, false))
         append({tile, 0, LinearSimdgroups::Four});
     } else {
       const uint32_t tiles = w.matrix.outputSize / columns;
@@ -572,7 +609,7 @@ std::vector<LinearPlan> Linear::candidates(LinearWorkload w) const {
       // group count. Fixed counts tied to one GPU miss these waves elsewhere.
       for (const uint32_t groups : {2 * device_.cores, 3 * device_.cores, 4 * device_.cores, tiles}) {
         append({tile, std::min(groups, tiles)});
-        if (supportsFourSimdgroups(w, tile))
+        if (supportsFourSimdgroups(w, tile, true))
           append({tile, std::min(groups, tiles), LinearSimdgroups::Four});
       }
     }
@@ -682,16 +719,18 @@ PreparedInput Linear::add(metal::CommandGraph &graph, LinearBuffers b,
     if (stats && w.phase == LinearPhase::Decode) account(*stats, lanes, 1);
     return {b.input, LinearInput::Table64};
   }
+  const bool prefillTile = selected.prefillTile();
   const auto dispatch = [&](std::string_view name,
       std::initializer_list<metal::MetalBuffer> bindings) {
-    if (w.phase == LinearPhase::Prefill)
+    if (prefillTile)
       graph.add(std::string(name), bindings,
           Q4PrefillParams{w.matrix.outputSize, w.matrix.inputSize},
           {selected.storageRows() / kAffinePrefillTileRows, n / selected.tileColumns(), 1},
           {selected.threadsPerThreadgroup(), 1, 1});
     else {
-      // Split128 binds its partials and counters after the sequential
-      // kernel's buffers; every other decode tile runs one K split.
+      // Decode tiles, in decode steps and prefill chunks: Split128 binds its
+      // partials and counters after the sequential kernel's buffers; every
+      // other decode tile runs one K split.
       const LinearConfig config = selected.configuration();
       std::vector<metal::MetalBuffer> buffers(bindings);
       if (config.tile == LinearTile::Split128)
@@ -700,7 +739,6 @@ PreparedInput Linear::add(metal::CommandGraph &graph, LinearBuffers b,
                 {config.groups, config.splits, 1}, {selected.threadsPerThreadgroup(), 1, 1});
     }
   };
-  const bool prefill = w.phase == LinearPhase::Prefill;
   if (w.epilogue == LinearEpilogue::GateUp) {
     const AffineWeights &g = gate->affine();
     if (selected.secondPipeline().empty())
@@ -711,20 +749,24 @@ PreparedInput Linear::add(metal::CommandGraph &graph, LinearBuffers b,
       dispatch(selected.secondPipeline(),
                {b.input, weights.weights, weights.scales, weights.biases, b.gateScratch, b.output});
     }
-  } else if (w.epilogue == LinearEpilogue::UpWithGate)
-    dispatch(selected.pipeline(), {b.input, weights.weights, weights.scales, weights.biases,
-                                   b.gateScratch, b.output, b.sums, b.downSums});
-  else if (w.epilogue == LinearEpilogue::Residual) {
-    if (prefill)
+  } else if (w.epilogue == LinearEpilogue::UpWithGate) {
+    if (prefillTile)
+      dispatch(selected.pipeline(), {b.input, weights.weights, weights.scales, weights.biases,
+                                     b.gateScratch, b.output, b.sums, b.downSums});
+    else
+      dispatch(selected.pipeline(), {b.input, weights.weights, weights.scales, weights.biases,
+                                     b.gateScratch, b.output});
+  } else if (w.epilogue == LinearEpilogue::Residual) {
+    if (prefillTile)
       dispatch(selected.pipeline(), {b.input, weights.weights, weights.scales, weights.biases,
                                      b.residual, b.output, b.sums});
     else
       dispatch(selected.pipeline(), {b.input, weights.weights, weights.scales, weights.biases,
                                      b.residual, b.output});
-  } else if (prefill)
+  } else if (prefillTile)
     dispatch(selected.pipeline(), {b.input, weights.weights, weights.scales, weights.biases, b.output, b.sums});
   else dispatch(selected.pipeline(), {b.input, weights.weights, weights.scales, weights.biases, b.output});
-  if (stats && !prefill)
+  if (stats && w.phase == LinearPhase::Decode)
     account(*stats, w.rows / SPLASH_TARGET_VERIFY_ROWS, selected.secondPipeline().empty() ? 1 : 2);
   return b.prepared;
 }

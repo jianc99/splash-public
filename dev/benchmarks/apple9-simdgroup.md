@@ -5,7 +5,8 @@ per request lane at one to four lanes. Plain projections at three or four lanes
 whose grid holds at least two N256 tiles per core keep the broad-column path
 (`widePlain` in `runtime/ops/Linear.cpp`). Prefill chunks of up to 32 rows run
 the same tile and split rule over their rows padded to whole lanes, as GGUF
-chunks run its decode tiles; longer chunks and Apple10 retain their policies.
+chunks run its decode tiles; longer chunks retain their policy, and Apple10
+chunks follow their own rule ([device-policy.md](device-policy.md)).
 The packed Q4 weights and the `Q4Params` ABI are unchanged. The
 measurements below are of the one-lane version; `3a20983` extended it to two
 through four lanes with identical output hashes and acceptance counts.

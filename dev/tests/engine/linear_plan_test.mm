@@ -74,8 +74,15 @@ std::string simdgroupPipeline(LinearEpilogue epilogue) {
 // The rows suffix of a batched decode kernel.
 std::string rowsSuffix(uint32_t lanes) { return lanes > 1 ? "_m" + std::to_string(lanes * 8) : ""; }
 
+// Decode tiles in decode steps and, over their rows in whole lanes, in
+// prefill chunks: there an up-with-gate projection runs the up pass of the
+// decode gate/up plan (Split128 or N256).
 std::string expectedPipeline(LinearConfig expected, uint32_t lanes, LinearEpilogue epilogue) {
   if (expected.tile == LinearTile::Simdgroup) return simdgroupPipeline(epilogue);
+  if (epilogue == LinearEpilogue::UpWithGate)
+    return std::string(expected.tile == LinearTile::Split128 ? "decode_linear_q4_n128_split_up_silu"
+                                                             : "decode_linear_q4_n256_up_silu") +
+        rowsSuffix(lanes);
   // Gate/up runs the plain split kernel as its gate pass.
   if (expected.tile == LinearTile::Split128)
     return std::string("decode_linear_q4_n128_split") +
@@ -121,10 +128,10 @@ std::string expectedPrefillPipeline(LinearConfig expected, LinearEpilogue epilog
 constexpr uint64_t kFragmentStreams = 2;
 LinearScratchSize expectedScratch(LinearConfig expected, LinearWorkload w, uint32_t tileColumns) {
   const auto [n, k] = w.matrix;
-  if (expected.tile == LinearTile::Split128)
-    return {0, 0, uint64_t{expected.splits} * w.rows * n * sizeof(float), uint64_t{n / tileColumns} * sizeof(uint32_t)};
-  if (expected.tile != LinearTile::Simdgroup) return {};
   const uint64_t lanes = (w.rows + 7) / 8, rows = lanes * 8;
+  if (expected.tile == LinearTile::Split128)
+    return {0, 0, uint64_t{expected.splits} * rows * n * sizeof(float), uint64_t{n / tileColumns} * sizeof(uint32_t)};
+  if (expected.tile != LinearTile::Simdgroup) return {};
   const bool split = expected.splits > 1;
   return {tableBytes(k, rows), tableSumsBytes(LinearInput::Table64, k, rows),
           split ? expected.splits * kFragmentStreams * rows * n * sizeof(float) : sizeof(float),
@@ -159,16 +166,22 @@ void requireRunnable(const LinearPlan &plan, LinearScratchSize arena, uint32_t f
   const bool simdgroup = c.tile == LinearTile::Simdgroup;
   const uint32_t columns = simdgroup ? (w.epilogue == LinearEpilogue::GateUp ? 32U : 64U)
       : c.tile == LinearTile::N256 || c.tile == LinearTile::Paired256 ? 256U : 128U;
-  const uint32_t lanes = w.rows / 8;
-  const bool decode = w.phase == LinearPhase::Decode;
+  // A decode tile runs its rows in whole lanes, a prefill chunk's too; the
+  // prefill tiles take no decode grid.
+  const uint32_t lanes = (w.rows + 7) / 8;
+  const bool decodeTile = w.phase == LinearPhase::Decode || c.groups;
   rule(plan.tileColumns() == columns && plan.input() == (simdgroup ? LinearInput::Table64 : LinearInput::Plain) &&
-           sameScratch(scratch, expectedScratch(c, w, columns)),
-       "affine plan geometry, input layout or scratch differs from its tile");
-  rule(plan.pipeline() == (decode ? expectedPipeline(c, lanes, w.epilogue) : expectedPrefillPipeline(c, w.epilogue)) &&
-           plan.secondPipeline() == (decode ? expectedSecondPipeline(c, lanes, w.epilogue) : ""),
+           sameScratch(scratch, expectedScratch(c, w, columns)) &&
+           plan.storageRows() == (decodeTile ? lanes * 8 : (w.rows + 31) / 32 * 32),
+       "affine plan geometry, input layout, storage or scratch differs from its tile");
+  rule(plan.pipeline() ==
+               (decodeTile ? expectedPipeline(c, lanes, w.epilogue) : expectedPrefillPipeline(c, w.epilogue)) &&
+           plan.secondPipeline() == (decodeTile ? expectedSecondPipeline(c, lanes, w.epilogue) : ""),
        "affine plan pipelines differ from its configuration");
-  // The simdgroup tile reads its table's sums instead of the MPP tile's Q4 sums.
-  rule(decode || (plan.sumsBytes() == 0) == simdgroup, "affine prefill sums differ from its tile");
+  // The decode tiles compute their own sums (the simdgroup tile from its
+  // table) instead of reading the MPP prefill tile's Q4 sums.
+  rule((plan.sumsBytes() == 0) == decodeTile && (plan.downSumsBytes() == 0) == (decodeTile || w.epilogue != LinearEpilogue::UpWithGate),
+       "affine prefill sums differ from its tile");
 }
 
 struct ProductionShape final { LinearMatrix matrix; LinearEpilogue epilogue; };
@@ -373,15 +386,36 @@ void anchorPlans() {
               LinearConfig{LinearTile::N256, 0},
           "one-lane pipelining or prefill tile rule changed for the measured shapes");
   // Apple9 prefill chunks of up to 32 rows take the decode tile's grid and
-  // split; Apple10 keeps its prefill tile.
+  // split. Apple10 chunks take the decode plan of their rows in whole lanes
+  // where its tiles compute one MPP fragment (up to 16 rows) or it splits K,
+  // an up-with-gate projection the up pass of the decode gate/up plan: on the
+  // 20-core M5 Pro and the 12-core M6 (device-policy.md, "Tensor short
+  // prefill").
   require(configured(9, 40, {{6144, 5120}, 32, LinearPhase::Prefill}) ==
               LinearConfig{LinearTile::Simdgroup, 96, LinearSimdgroups::Four, 4} &&
           configured(9, 40, {{17408, 5120}, 17, LinearPhase::Prefill, LinearEpilogue::UpWithGate}) ==
               LinearConfig{LinearTile::Simdgroup, 272, LinearSimdgroups::Four, 4} &&
           configured(9, 40, {{5120, 17408}, 1, LinearPhase::Prefill, LinearEpilogue::Residual}) ==
               configured(9, 40, {{5120, 17408}, 24, LinearPhase::Decode, LinearEpilogue::Residual}) &&
-          configured(10, 16, {{6144, 5120}, 32, LinearPhase::Prefill}) ==
-              LinearConfig{LinearTile::N128, 0, LinearSimdgroups::Four},
+          configured(10, 20, {{16640, 5120}, 7, LinearPhase::Prefill}) == LinearConfig{LinearTile::Paired128, 70} &&
+          configured(10, 20, {{16640, 5120}, 12, LinearPhase::Prefill}) == LinearConfig{LinearTile::N128, 75} &&
+          configured(10, 20, {{16640, 5120}, 24, LinearPhase::Prefill}) ==
+              LinearConfig{LinearTile::N128, 0, LinearSimdgroups::Four} &&
+          configured(11, 12, {{16640, 5120}, 1, LinearPhase::Prefill}) ==
+              LinearConfig{LinearTile::Paired256, 48, LinearSimdgroups::Four} &&
+          configured(10, 20, {{5120, 17408}, 24, LinearPhase::Prefill, LinearEpilogue::Residual}) ==
+              split(5120, 2) &&
+          configured(10, 20, {{2048, 4096}, 32, LinearPhase::Prefill, LinearEpilogue::Residual}) ==
+              split(2048, 4) &&
+          configured(10, 12, {{5120, 6144}, 20, LinearPhase::Prefill, LinearEpilogue::Residual}) ==
+              LinearConfig{LinearTile::N128, 0, LinearSimdgroups::Four} &&
+          configured(10, 20, {{17408, 5120}, 8, LinearPhase::Prefill, LinearEpilogue::UpWithGate}) ==
+              LinearConfig{LinearTile::N256, 48} &&
+          configured(10, 20, {{17408, 5120}, 16, LinearPhase::Prefill, LinearEpilogue::UpWithGate}) ==
+              LinearConfig{LinearTile::N256, 48} &&
+          configured(10, 12, {{17408, 5120}, 32, LinearPhase::Prefill, LinearEpilogue::UpWithGate}) ==
+              LinearConfig{LinearTile::N128, 0, LinearSimdgroups::Four} &&
+          configured(10, 16, {{6144, 5120}, 32, LinearPhase::Prefill}) == split(6144, 2),
           "short prefill chunks changed tiles for the measured shapes");
 }
 
@@ -497,16 +531,19 @@ void planContracts(uint32_t family, uint32_t cores, size_t &widestCandidates) {
                       linear.plan({matrix, 2048, LinearPhase::Prefill, epilogue}).configuration(),
               "prefill candidate set changed");
       // Chunks of up to 32 rows list the same tiles, but on Apple9 only its
-      // simdgroup tile at every legal K split.
+      // simdgroup tile at every legal K split, and on Apple10 only a decode
+      // plan they run.
       for (const uint32_t rows : {1U, 17U, 32U}) {
         const LinearWorkload chunk{matrix, rows, LinearPhase::Prefill, epilogue};
         const auto chunkCandidates = linear.candidates(chunk);
         uint32_t simdgroups = 0, legalSplits = 0;
         for (const auto &plan : chunkCandidates) simdgroups += plan.usesSimdgroup();
         for (const uint32_t split : {1U, 2U, 4U, 8U}) legalSplits += matrix.inputSize % (64 * split) == 0;
+        const bool decodeTile = chunkCandidates.front().configuration().groups != 0;
         require(chunkCandidates.front().configuration() == linear.plan(chunk).configuration() &&
                     (family == 9 ? simdgroups == chunkCandidates.size() && simdgroups == legalSplits
-                                 : !simdgroups && chunkCandidates.size() == (up ? 2U : 3U)),
+                     : decodeTile ? chunkCandidates.size() == 1
+                                  : !simdgroups && chunkCandidates.size() == (up ? 2U : 3U)),
                 "short prefill candidate set changed");
       }
       for (const auto &plan : candidates) {
@@ -519,14 +556,16 @@ void planContracts(uint32_t family, uint32_t cores, size_t &widestCandidates) {
       }
       for (uint32_t rows = 1; rows <= 2048; ++rows) {
         const auto plan = linear.plan({matrix, rows, LinearPhase::Prefill, epilogue});
-        // Apple9's simdgroup tile pads to whole lanes and reads no Q4 sums.
+        // The decode tiles (Apple9's simdgroup tile, Apple10's short chunks)
+        // pad to whole lanes and read no Q4 sums.
         const bool simdgroup = family == 9 && rows <= 32;
-        const uint64_t storageRows = simdgroup ? (rows + 7) / 8 * 8 : (rows + 31) / 32 * 32;
+        const bool decodeTile = simdgroup || (rows <= 32 && plan.configuration().groups);
+        const uint64_t storageRows = decodeTile ? (rows + 7) / 8 * 8 : (rows + 31) / 32 * 32;
         require(plan.usesSimdgroup() == simdgroup && plan.storageRows() == storageRows &&
-                    plan.sumsBytes() == (simdgroup ? 0 : storageRows * (matrix.inputSize / 64) * 4),
+                    plan.sumsBytes() == (decodeTile ? 0 : storageRows * (matrix.inputSize / 64) * 4),
                 "prefill padding or sums bound incorrect");
         require(plan.gateScratchBytes() == (up ? storageRows * matrix.outputSize * 2 : 0) &&
-                    plan.downSumsBytes() == (up && !simdgroup ? storageRows * (matrix.outputSize / 64) * 4 : 0),
+                    plan.downSumsBytes() == (up && !decodeTile ? storageRows * (matrix.outputSize / 64) * 4 : 0),
                 "prefill gate/output sums bound incorrect");
       }
     }
@@ -549,7 +588,14 @@ void planContracts(uint32_t family, uint32_t cores, size_t &widestCandidates) {
            LinearConfig{static_cast<LinearTile>(255), 1}})
     rejects([&] { (void)Linear::plan(valid, invalid); });
   rejects([&] { (void)Linear::plan({{512, 256}, 16}, {LinearTile::Paired128, 1}); });
-  rejects([&] { (void)Linear::plan({{512, 256}, 32, LinearPhase::Prefill}, {LinearTile::N128, 1}); });
+  // A decode tile runs prefill chunks of up to 32 rows, in whole lanes and
+  // whole 256-input blocks as in decode.
+  require(Linear::plan({{512, 256}, 25, LinearPhase::Prefill}, {LinearTile::N128, 1}).storageRows() == 32,
+          "a decode tile did not take a prefill chunk's rows in whole lanes");
+  rejects([&] { (void)Linear::plan({{512, 256}, 33, LinearPhase::Prefill}, {LinearTile::N128, 1}); });
+  rejects([&] { (void)Linear::plan({{512, 320}, 32, LinearPhase::Prefill}, {LinearTile::N128, 1}); });
+  rejects([&] { (void)Linear::plan({{512, 1024}, 8, LinearPhase::Prefill},
+                                   {LinearTile::Split32, 16, LinearSimdgroups::Four}); });
   rejects([&] { (void)Linear::plan({{512, 256}, 32, LinearPhase::Prefill}, {LinearTile::Paired128, 0}); });
   rejects([&] { (void)Linear::plan({{512, 256}, 8, LinearPhase::Decode, LinearEpilogue::Residual}, {LinearTile::N256, 1}); });
   rejects([&] { (void)Linear::plan({{512, 256}, 8, LinearPhase::Decode, LinearEpilogue::GateUp}, {LinearTile::N128, 1}); });
@@ -684,7 +730,15 @@ void planContracts(uint32_t family, uint32_t cores, size_t &widestCandidates) {
                     .threadsPerThreadgroup() == 128,
             "four-SIMDgroup prefill plan was rejected");
     rejects([&] { (void)Linear::plan(prefill, {LinearTile::N256, 0, LinearSimdgroups::Four}); });
-    rejects([&] { (void)Linear::plan(prefill, {LinearTile::N128, 1, LinearSimdgroups::Four}); });
+    // The four-simdgroup decode tile holds 24 rows.
+    rejects([&] { (void)Linear::plan({{512, 256}, 16, LinearPhase::Prefill, epilogue},
+                                     {LinearTile::N128, 1, LinearSimdgroups::Four}); });
+    if (epilogue == LinearEpilogue::UpWithGate)
+      rejects([&] { (void)Linear::plan(prefill, {LinearTile::N128, 1, LinearSimdgroups::Four}); });
+    else
+      require(Linear::plan(prefill, {LinearTile::N128, 1, LinearSimdgroups::Four}).pipeline() ==
+                  expectedPipeline({LinearTile::N128, 1, LinearSimdgroups::Four}, 3, epilogue),
+              "a prefill chunk of three lanes did not run the four-simdgroup decode tile");
   }
 
   const LinearWorkload other{{768, 768}, 16, LinearPhase::Decode, LinearEpilogue::None};
@@ -1153,7 +1207,10 @@ void ggufPlans() {
 //   an affine K-split plan the same at every width whose rows the same tiers
 //   of its split law hold for and whose width runs one, and Apple10 splits K
 //   at all or none of those widths. A prefill chunk runs a decode tile exactly
-//   when it has at most 32 rows and is GGUF or on Apple9.
+//   when it has at most 32 rows and is GGUF, on Apple9, or on Apple10 where
+//   the decode plan of its rows in whole lanes computes one MPP fragment (at
+//   most 16 rows) or splits K; then it runs that decode plan (the up pass of
+//   the decode gate/up plan for an up-with-gate projection).
 // - Scale: doubling the width and the core count keeps the tile, scope and
 //   split count, and whether a decode plan takes the full column grid, but for
 //   Apple9 prefill across its one absolute core count (32).
@@ -1178,7 +1235,7 @@ void policyLaws() {
   // 4352 and 6400 inputs leave Apple9's eight even partitions short of whole
   // quant groups.
   constexpr std::array<uint32_t, 12> inputs{256, 512, 768, 1024, 2048, 4096, 4352, 5120, 6144, 6400, 17408, 25600};
-  constexpr std::array<uint32_t, 8> prefillRows{1, 8, 17, 32, 33, 64, 127, 2048};
+  constexpr std::array<uint32_t, 11> prefillRows{1, 8, 12, 16, 17, 24, 32, 33, 64, 127, 2048};
   for (const uint32_t n : widths)
     for (const uint32_t k : inputs)
       // No segments: affine weights.
@@ -1282,10 +1339,17 @@ void policyLaws() {
                 const LinearPlan p = plan(linear, weights, rows, LinearPhase::Prefill, e);
                 common(p, prefillArena);
                 const LinearConfig c = p.configuration();
-                const bool decodeTile = c.tile == LinearTile::Simdgroup ||
-                    (c.tile == LinearTile::GgufStaged && c.simdgroups == LinearSimdgroups::Two);
-                rule(decodeTile == (rows <= kMaximumDecodeTileRows && (gguf || primitive == Primitive::Register)),
-                     "a prefill chunk ran the wrong tile for its rows", p);
+                const bool decodeTile = gguf ? c.simdgroups == LinearSimdgroups::Two : c.groups != 0;
+                bool shortChunk = rows <= kMaximumDecodeTileRows && (gguf || primitive == Primitive::Register);
+                if (!gguf && primitive == Primitive::Tensor && rows <= kMaximumDecodeTileRows && k % 256 == 0) {
+                  const LinearPlan step =
+                      plan(linear, weights, (rows + 7) / 8 * 8, LinearPhase::Decode,
+                           e == LinearEpilogue::UpWithGate ? LinearEpilogue::GateUp : e);
+                  shortChunk = rows <= kMppFragmentRows || step.configuration().splits > 1;
+                  rule(!shortChunk || c == step.configuration(), "a short chunk's decode tile is not its decode plan",
+                       p);
+                }
+                rule(decodeTile == shortChunk, "a prefill chunk ran the wrong tile for its rows", p);
               }
           }
       }
@@ -1672,6 +1736,13 @@ void numericalCase(metal::MetalBackend &backend, Linear &linear,
                   last.threadgroups.y == plan.configuration().splits && last.threadgroups.z == storageRows / 8 &&
                   graph.dispatches().size() == prepasses + 2,
               "Linear simdgroup prefill plan/graph geometry mismatch");
+    } else if (plan.configuration().groups) {
+      // An MPP decode tile over the chunk's rows in whole lanes: its decode
+      // grid, every lane in each threadgroup.
+      require(last.threadgroups.x == plan.configuration().groups &&
+                  last.threadgroups.y == plan.configuration().splits && last.threadgroups.z == 1 &&
+                  storageRows == (workload.rows + 7) / 8 * 8 && graph.dispatches().size() == prepasses + 1,
+              "Linear decode-tile prefill plan/graph geometry mismatch");
     } else {
       require(last.threadgroups.x == storageRows / 32 &&
                   last.threadgroups.y == p.outputSize / plan.tileColumns() &&
@@ -1863,7 +1934,7 @@ std::map<std::string, uint32_t> pipelineScopes() {
           collect(linear, {{16640, 5120}, lanes * 8, LinearPhase::Decode, epilogue});
       for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual,
                                  LinearEpilogue::UpWithGate})
-        for (const uint32_t rows : {17U, 33U})
+        for (const uint32_t rows : {7U, 12U, 17U, 33U})
           collect(linear, {{16640, 5120}, rows, LinearPhase::Prefill, epilogue});
     }
   return names;
@@ -1940,6 +2011,7 @@ int main(int argc, char **argv) {
     // Apple9's short prefill chunks run the simdgroup kernels, which every
     // family's GPU runs too.
     Linear apple9 = gpu(9, 40);
+    Linear apple10Wide = gpu(10, 80);
     for (const LinearMatrix matrix : {LinearMatrix{512, 256}, LinearMatrix{768, 768},
                                       LinearMatrix{16640, 5120}, LinearMatrix{12544, 2048},
                                       LinearMatrix{5120, 17408},
@@ -1967,6 +2039,14 @@ int main(int argc, char **argv) {
         for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual,
                                    LinearEpilogue::UpWithGate})
           numericalCase(backend, apple9, p, gate, {matrix, rows, LinearPhase::Prefill, epilogue});
+      // Apple10's short chunks on its decode tiles, of one and two MPP
+      // fragments: the device's plans, and an 80-core GPU's, which split K
+      // on more shapes.
+      for (Linear *tensor : {&linear, &apple10Wide})
+        for (const uint32_t rows : {7U, 12U, 17U, 24U, 32U})
+          for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual,
+                                     LinearEpilogue::UpWithGate})
+            numericalCase(backend, *tensor, p, gate, {matrix, rows, LinearPhase::Prefill, epilogue});
       require(projectionFingerprint(p) == immutableProjection &&
                   projectionFingerprint(gate) == immutableGateProjection,
               "Linear changed immutable Q4 weights or quantization metadata");
