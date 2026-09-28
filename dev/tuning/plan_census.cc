@@ -70,14 +70,20 @@ constexpr std::array kShapes{
 // GGUF segment formats: Q4_K keeps Apple9's register tile, IQ2_XS stages
 // wherever the staged tile holds the lanes' rows, Q2_K stages from two lanes,
 // and a projection mixing a staged format with Q4_K keeps the register tile.
+// IQ4_XS and Q8_0 take the tensor primitive's register tile at one lane,
+// alone and together, but not mixed with Q4_K.
 struct Formats final {
   const char *name;
   std::vector<uint32_t> segments;
 };
-const std::array<Formats, 4> kFormats{{{"q4k", {GGUF_FMT_Q4K}},
+const std::array<Formats, 8> kFormats{{{"q4k", {GGUF_FMT_Q4K}},
                                        {"iq2xs", {GGUF_FMT_IQ2XS}},
                                        {"q2k", {GGUF_FMT_Q2K}},
-                                       {"iq3xxs+q4k", {GGUF_FMT_IQ3XXS, GGUF_FMT_Q4K}}}};
+                                       {"iq3xxs+q4k", {GGUF_FMT_IQ3XXS, GGUF_FMT_Q4K}},
+                                       {"iq4xs", {GGUF_FMT_IQ4XS}},
+                                       {"q80", {GGUF_FMT_Q80}},
+                                       {"iq4xs+q80", {GGUF_FMT_IQ4XS, GGUF_FMT_Q80}},
+                                       {"iq4xs+q4k", {GGUF_FMT_IQ4XS, GGUF_FMT_Q4K}}}};
 
 constexpr std::array<uint32_t, 3> kFamilies{9, 10, 11};
 // Zero is the unknown count.

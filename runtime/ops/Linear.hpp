@@ -73,6 +73,10 @@ enum class LinearTile : uint8_t {
 // register tiles build from grid lookups beside their matrix operations
 // (LinearGguf.cpp, MoE.hpp).
 [[nodiscard]] bool apple9StagesFormat(uint32_t format) noexcept;
+// The GGUF formats the tensor primitive (Apple10 and later) decodes faster at
+// one lane on the register tile than on its staged tile, on every measured
+// machine: IQ4_XS and Q8_0 (LinearGguf.cpp).
+[[nodiscard]] bool tensorRegistersFormat(uint32_t format) noexcept;
 enum class LinearSimdgroups : uint8_t { Two = 2, Four = 4, Eight = 8 };
 
 struct LinearWorkload final {

@@ -577,7 +577,10 @@ takes wherever the tile holds its lanes' rows unpadded. On Apple10 (M5) the stag
 (`LinearTile::GgufStaged`) runs the kernels of `runtime/metal/kernels/shared/gguf_linear.metal`,
 which dequantize each weight once to half in threadgroup memory (`kernels/common/gguf_staged.h`)
 for MPP `matmul2d`, the neural accelerator's path, on bf16 activations; a step of three request
-lanes runs the 32-row tile over four lanes of storage. Prefill runs the staged kernels on both
+lanes runs the 32-row tile over four lanes of storage. A one-lane projection there whose quantized
+segments are all IQ4_XS or Q8_0 (`tensorRegistersFormat`) takes the register tile instead, faster
+at one lane on both measured Apple10/11 machines, so as on Apple9 a projection's outputs at one lane
+can differ from its batched ones. Prefill runs the staged kernels on both
 families, chunks of up to 32 rows on the decode tiles. Every projection splits its K across
 threadgroups by one law (`splitK` in `runtime/ops/KernelPolicy.hpp`: each tile's tiers of
 threadgroups per core and inputs per partition, from measured occupancy, Apple9's staged tile

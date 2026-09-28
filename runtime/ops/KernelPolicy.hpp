@@ -205,8 +205,10 @@ inline constexpr KernelFamily kAffineTensorSplit{{SPLASH_TARGET_VERIFY_ROWS},
 inline constexpr uint32_t kAffinePrefillTileRows = 32;
 inline constexpr KernelFamily kAffineTensorPrefill{{kAffinePrefillTileRows}, {}};
 
-// Apple9's GGUF register tile (gguf_decode_sg_*, 128 threads), every lane in
-// each threadgroup, over K partitions of whole 256-input coefficient units.
+// The GGUF register tile (gguf_decode_sg_*, 128 threads): Apple9's, and the
+// tensor primitive's at one lane for the formats of tensorRegistersFormat.
+// Every lane in each threadgroup, over K partitions of whole 256-input
+// coefficient units.
 // Four of its threadgroups are resident on a core at once: on a 40-core M3
 // Max its time steps every four per core (Q4_K, K = 8192, one lane, ms: 3 per
 // core 0.156, 4 0.157, 5 0.220, 7 0.281, 8 0.286; the same steps at two to
@@ -217,10 +219,13 @@ inline constexpr KernelFamily kAffineTensorPrefill{{kAffinePrefillTileRows}, {}}
 // four lanes and 10-80 cores emulated by width, 2026-09-24 (417a4fc), the
 // decode step's projections run 0.95% slower than the fastest split of each
 // shape on average and 2.3% at worst (sixteen threadgroups per core with two
-// units per partition: 2.8%, 7.8%).
+// units per partition: 2.8%, 7.8%). The tensor primitive takes the same
+// tiers: at one lane on IQ4_XS and Q8_0 they come within 2% (20-core M5
+// Pro) and 3.5% (12-core M6) of each shape's fastest register split,
+// 2026-09-27 (policy-bench, b6752e1).
 inline constexpr SplitTier kGgufRegisterTiers[] = {{4, 256}, {32, 1024}};
 inline constexpr KernelFamily kGgufRegisterTile{{SPLASH_TARGET_VERIFY_ROWS},
-                                                {kGgufRegisterTiers, {}, false, 256, false}};
+                                                {kGgufRegisterTiers, kGgufRegisterTiers, false, 256, false}};
 
 // The GGUF staged decode tile (gguf_decode_*_m<rows>, 64 threads), which also
 // runs prefill chunks of up to 32 rows: MPP computes 16-row fragments, so it

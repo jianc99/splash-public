@@ -1059,8 +1059,13 @@ void ggufPlans() {
   rejects([&] { (void)Linear::plan(gguf, {LinearTile::N128, 40}); });
   rejects([&] { (void)Linear::plan(gguf, {LinearTile::GgufStaged, 40, LinearSimdgroups::Two, 8}); });
   rejects([&] { (void)Linear::plan(gguf, {LinearTile::GgufStaged, 80, LinearSimdgroups::Two, 3}); });
-  // The arena bound is the single-tensor plan, which fused and gate/up plans share.
-  require(linear.decodeScratchSize(gguf).partials == single.scratchSize().partials,
+  // The arena bound covers the single-tensor plan, which fused and gate/up
+  // plans share, and at one lane the register tile of IQ4_XS and Q8_0.
+  const LinearPlan registers = linear.plan(down, blockProjection(5120, 17408, 1, GGUF_FMT_Q80));
+  require(registers.configuration().tile == LinearTile::GgufRegister &&
+              linear.decodeScratchSize(gguf).partials ==
+                  std::max(single.scratchSize().partials, registers.scratchSize().partials) &&
+              linear.decodeScratchSize(gguf).input == registers.scratchSize().input,
           "GGUF decode scratch bound");
   // Float projections take the neural accelerator tile from three of its
   // 64 x 32 tiles per two cores: on 16 cores the 35B router (N 256) from 129
@@ -1159,7 +1164,40 @@ void ggufPlans() {
   }
   require(linear.plan({{5120, 17408}, 24, LinearPhase::Decode, LinearEpilogue::Residual},
                       blockProjection(5120, 17408, 1, GGUF_FMT_IQ2XXS)).configuration().tile == LinearTile::GgufStaged,
-          "Apple10 stages every format");
+          "Apple10 stages the IQ formats");
+  // The tensor primitive takes the register tile at one lane where every
+  // quantized segment is IQ4_XS or Q8_0 (tensorRegistersFormat), its split
+  // tiers as on Apple9, and stages everything else; the decode scratch bound
+  // covers both tiles at one lane.
+  for (const uint32_t family : {10U, 11U})
+    for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
+      const Linear tensor = gpu(family, 20);
+      const auto tile = [&](std::initializer_list<uint32_t> formats, LinearEpilogue epilogue = LinearEpilogue::None) {
+        const uint32_t n = uint32_t(formats.size()) * 1024;
+        const Projection p = blockProjection(n, 5120, formats);
+        return tensor.plan({{n, 5120}, lanes * 8, LinearPhase::Decode, epilogue}, p,
+                           epilogue == LinearEpilogue::GateUp ? &p : nullptr).configuration().tile;
+      };
+      const LinearTile registers = lanes == 1 ? LinearTile::GgufRegister : LinearTile::GgufStaged;
+      require(tile({GGUF_FMT_IQ4XS}) == registers && tile({GGUF_FMT_Q80}) == registers &&
+                  tile({GGUF_FMT_IQ4XS, GGUF_FMT_Q80}) == registers &&
+                  tile({GGUF_FMT_IQ4XS}, LinearEpilogue::GateUp) == registers &&
+                  tile({GGUF_FMT_Q80}, LinearEpilogue::Residual) == registers,
+              "the tensor primitive decodes one lane of IQ4_XS and Q8_0 on the register tile");
+      for (const uint32_t format : {GGUF_FMT_Q4K, GGUF_FMT_Q5K, GGUF_FMT_Q6K, GGUF_FMT_IQ3XXS, GGUF_FMT_IQ2XS,
+                                    GGUF_FMT_Q2K, GGUF_FMT_Q40})
+        require(tile({format}) == LinearTile::GgufStaged && tile({GGUF_FMT_IQ4XS, format}) == LinearTile::GgufStaged,
+                "the tensor primitive stages every other format and mixed projections");
+      const LinearWorkload one{{5120, 17408}, lanes * 8, LinearPhase::Decode, LinearEpilogue::Residual,
+                               WeightLayout::Block32};
+      const LinearScratchSize bound = tensor.decodeScratchSize(one);
+      for (const uint32_t format : {GGUF_FMT_Q80, GGUF_FMT_Q4K}) {
+        const LinearScratchSize size = tensor.plan(one, blockProjection(5120, 17408, 1, format)).scratchSize();
+        require(bound.input >= size.input && bound.sums >= size.sums && bound.partials >= size.partials &&
+                    bound.counters >= size.counters,
+                "the tensor primitive's GGUF decode scratch bound covers both tiles");
+      }
+    }
   // Apple9's staged tile, in decode and in prefill chunks, splits K by the
   // register tile's tiers: on 40 cores 17408 x 5120 in four, 5120 x 17408 in
   // eight.
