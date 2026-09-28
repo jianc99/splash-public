@@ -633,6 +633,16 @@ decode tiles at one to four lanes and every K split, and marks the device policy
 `make benchmark-gguf-moe` times one MoE layer at the 35B shape, GGUF against affine Q4, on the
 device's plans and the other GGUF tile.
 
+`make benchmark-policy POLICY_BENCH_ARGS='...'` (`dev/benchmarks/policy_bench.mm`) is the gate for
+kernel policy changes. It times, DRAM-cold and interleaved, the device's plan beside every
+configuration a law could pick: affine decode tiles, K splits and persistent group counts at 8-32
+rows (`--suite affine`), affine prefill chunks against the decode plans of their rows (`prefill`),
+the GGUF tiles per format (`gguf`) and the stream bandwidth (`bandwidth`), over the 27B and 35B
+shapes with their per-step counts, the fitting grid (`--shapes grid`) and other core counts
+emulated by width (`--emulate 10,40`). `--check` holds every configuration to fp64 with guard bands
+and NaN split partials; run it under `MTL_SHADER_VALIDATION=1` with the same options before
+timing. `--csv` writes one row per configuration for `dev/benchmarks/policy_summary.py`.
+
 ## Legacy Splash packages
 
 Splash packages, such as `incoai/Qwen3.8-27B-Splash`, are the prebuilt format
