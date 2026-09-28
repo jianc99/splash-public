@@ -113,9 +113,15 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
       bytesFor<uint16_t>(uint64_t{geometry.target.attentionKvHeads} *
                          kPackedAttentionRows *
                          geometry.target.attentionHeadDimension));
-  // The split partials and counters of the largest prefill plan.
-  for (const auto &projection : geometry.target.prefillProjections) {
+  // The Linear scratch of the largest prefill plan of the target's projections
+  // and the draft's context and qkv projections (DFlashDraft::addContextPrefill).
+  std::vector<ops::ProjectionShape> projections = geometry.target.prefillProjections;
+  projections.insert(projections.end(), {{geometry.draft.hiddenSize, geometry.draft.targetHiddenSize},
+                                         {geometry.draft.qkvSize, geometry.draft.hiddenSize}});
+  for (const auto &projection : projections) {
     const ops::LinearScratchSize linear = operators.linear().prefillScratchSize(projection);
+    put(PrefillTensor::LinearTable, linear.input);
+    put(PrefillTensor::LinearTableSums, linear.sums);
     put(PrefillTensor::LinearPartials, linear.partials);
     put(PrefillTensor::LinearCounters, linear.counters);
     // A chunk's plans store at most kPrefillRows rows (whole 128-row tiles).
