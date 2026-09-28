@@ -77,18 +77,20 @@ struct AffineMoeWeights final {
 using MoeWeights = LayoutWeights<AffineMoeWeights, BlockMoeWeights>;
 
 // Router score tiles: 8 x 32 for short chunks, 32 x 128 for longer chunks.
-// The measured Apple10 crossover is about 26 rows per GPU core, with a
-// 20-core fallback when the core count is unknown. Both tiles preserve scores.
+// The measured Apple10 crossover is about 26 rows per GPU core. Both tiles
+// preserve scores.
 struct MoeRouteTile final {
   uint32_t rows;
   uint32_t experts;
 };
-inline constexpr uint32_t kMoeRouteWideRows = 512;
 inline constexpr uint32_t kMoeRouteRowsPerCore = 26;
 
-[[nodiscard]] constexpr uint32_t moeRouteWideRows(uint32_t gpuCores) noexcept {
-  return gpuCores ? gpuCores * kMoeRouteRowsPerCore : kMoeRouteWideRows;
+[[nodiscard]] constexpr uint32_t moeRouteWideRows(uint32_t cores) noexcept {
+  return cores * kMoeRouteRowsPerCore;
 }
+// The threshold at the assumed core count, which a plan takes unless the
+// execution plans give it the device's.
+inline constexpr uint32_t kMoeRouteWideRows = moeRouteWideRows(kAssumedGpuCores);
 
 [[nodiscard]] constexpr MoeRouteTile
 moeRouteTile(uint32_t rows, uint32_t wideRows) noexcept {
@@ -197,12 +199,11 @@ enum class MoeExpertTile : uint8_t { M8 = 8, M32 = 32 };
 // pass's column grid changes.
 enum class MoeExpertSimdgroups : uint8_t { Eight = 8, Four = 4 };
 
-// Families below 9 are rejected at startup; 10 and later keep the shipped
-// tile, as does an unknown family.
+// Apple9 decode plans take four; Apple10 and later keep the shipped eight.
 [[nodiscard]] constexpr MoeExpertSimdgroups
-moeDecodeSimdgroups(uint32_t appleGpuFamily) noexcept {
-  return appleGpuFamily == 9 ? MoeExpertSimdgroups::Four
-                             : MoeExpertSimdgroups::Eight;
+moeDecodeSimdgroups(Primitive primitive) noexcept {
+  return primitive == Primitive::Register ? MoeExpertSimdgroups::Four
+                                          : MoeExpertSimdgroups::Eight;
 }
 
 // The expert tile of GGUF plans, which run three grouped passes (gate, up
@@ -222,9 +223,9 @@ enum class MoeGgufTile : uint8_t { Staged, Register };
 // 35B-shaped layer on a 40-core M3 Max decodes UD-Q2_K_XL's IQ2_XS and
 // IQ3_XXS experts, and the IQ2, IQ3_XXS and IQ1 formats alone, 4-21% faster
 // staged at B1-B4, where Q4_K/Q5_K, Q2_K and IQ4_XS experts take 3-34% longer.
-[[nodiscard]] inline MoeGgufTile moeGgufTile(uint32_t appleGpuFamily, MoeShape shape) noexcept {
-  return appleGpuFamily == 9 && !apple9StagesFormat(shape.expertFormat) ? MoeGgufTile::Register
-                                                                         : MoeGgufTile::Staged;
+[[nodiscard]] inline MoeGgufTile moeGgufTile(Primitive primitive, MoeShape shape) noexcept {
+  return primitive == Primitive::Register && !apple9StagesFormat(shape.expertFormat) ? MoeGgufTile::Register
+                                                                                      : MoeGgufTile::Staged;
 }
 
 // The rows of a GGUF prefill plan's tiles on the device's `tile`: 8 on the

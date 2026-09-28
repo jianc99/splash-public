@@ -124,11 +124,11 @@ private:
   // The plan of `config` with the device's fields.
   [[nodiscard]] MoePlan moePlan(const MoeWorkload &workload, MoeConfig config) const;
 
+  // Every plan's device inputs (KernelPolicy.hpp), which both Linear
+  // operators share.
+  DevicePolicy device_;
   Linear linear_;
   Linear baselineLinear_;
-  uint32_t moeRouteWideRows_ = kMoeRouteWideRows;
-  MoeExpertSimdgroups moeDecodeSimdgroups_ = MoeExpertSimdgroups::Eight;
-  uint32_t appleGpuFamily_ = 0;
   OperatorChoices choices_;
 };
 

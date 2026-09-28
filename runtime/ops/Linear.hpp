@@ -3,6 +3,7 @@
 #include "metal/DeviceCapabilities.hpp"
 #include "metal/CommandGraph.hpp"
 #include "metal/abi/ExecutionGeometry.h"
+#include "ops/KernelPolicy.hpp"
 #include "ops/Weights.hpp"
 
 #include <algorithm>
@@ -168,6 +169,9 @@ public:
   [[nodiscard]] LinearWorkload workload() const noexcept { return workload_; }
   [[nodiscard]] LinearConfig configuration() const noexcept { return config_; }
   [[nodiscard]] FloatOutput destination() const noexcept { return destination_; }
+  // The kernel family of the plan's tile, whose row quanta give its storage
+  // rows (KernelPolicy.hpp).
+  [[nodiscard]] const KernelFamily &kernelFamily() const noexcept;
   [[nodiscard]] uint32_t storageRows() const noexcept;
   [[nodiscard]] uint32_t tileColumns() const noexcept;
   [[nodiscard]] uint32_t threadsPerThreadgroup() const noexcept;
@@ -197,7 +201,6 @@ private:
   LinearPlan(LinearWorkload workload, LinearConfig config, FloatOutput destination = FloatOutput::BFloat16);
   // Block plans (LinearGguf.cpp).
   void requireBlockConfiguration() const;
-  [[nodiscard]] uint32_t blockStorageRows() const noexcept;
   [[nodiscard]] LinearScratchSize blockScratchSize() const noexcept;
   LinearWorkload workload_;
   LinearConfig config_;
@@ -228,10 +231,11 @@ struct LinearDispatchStats final {
 };
 
 // Owns projection pipeline selection and dispatch for both weight layouts.
-// Device policy uses GPU family, core count and workload tile counts.
+// Device policy uses the primitive, core count and workload tile counts.
 class Linear final {
 public:
-  explicit Linear(const DeviceCapabilities &device) noexcept;
+  explicit Linear(const DeviceCapabilities &device) noexcept : Linear(DevicePolicy(device)) {}
+  explicit Linear(DevicePolicy device) noexcept : device_(device) {}
 
   // One lane: at most 3 tiles * 4 group counts, 2 split tiles, 2 paired
   // N256 grids, and 4 Apple9 simdgroup K splits (including its baseline):
@@ -331,8 +335,7 @@ private:
                        const Projection *gate) const;
   void addGgufFloatSegments(metal::CommandGraph &graph, const LinearBuffers &buffers,
                             const Projection &projection, const LinearPlan &plan) const;
-  uint32_t appleGpuFamily_ = 0;
-  uint32_t gpuCores_ = 0;
+  DevicePolicy device_;
   std::vector<LinearChoice> choices_;
 };
 

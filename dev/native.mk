@@ -112,6 +112,7 @@ TEST_DRAFT_ATTENTION_TUNING := $(ENGINE_TEST_BUILD)/draft-attention-tuning
 TEST_MOE_TUNING := $(ENGINE_TEST_BUILD)/moe-tuning
 TEST_TUNING_WORKLOADS := $(ENGINE_TEST_BUILD)/tuning-workloads
 TUNE_KERNELS := $(ENGINE_TEST_BUILD)/tune-kernels
+PLAN_CENSUS := $(ENGINE_TEST_BUILD)/plan-census
 TEST_DFLASH_BATCH_CONTROL_TEST := $(ENGINE_TEST_BUILD)/dflash-batch-control
 TEST_DRAFT_ATTENTION_TEST := $(ENGINE_TEST_BUILD)/draft-attention
 TEST_GDN_DECODE_TEST := $(ENGINE_TEST_BUILD)/gdn-decode
@@ -148,7 +149,7 @@ TEST_CPU_TARGETS := $(TEST_SLOT_FILE) $(TEST_VISION_PREPARATION) $(TEST_AFFINE_C
 	$(TEST_GGUF_REFERENCE) $(TEST_GGUF_PLANNER) \
 	$(TEST_DEVICE_QUERIES) \
 	$(TEST_TUNING_WORKLOADS) \
-	$(TEST_LINEAR_PLAN) $(TEST_LINEAR_TUNING) $(TEST_ATTENTION_TUNING) \
+	$(TEST_LINEAR_PLAN) $(PLAN_CENSUS) $(TEST_LINEAR_TUNING) $(TEST_ATTENTION_TUNING) \
 	$(TEST_DRAFT_ATTENTION_TUNING) $(TEST_MOE_TUNING) \
 	$(TEST_OPERATOR_TUNING) \
 	$(TEST_OPERATOR_MEASUREMENT) \
@@ -469,6 +470,13 @@ $(TUNE_KERNELS): dev/tuning/tune_kernels.mm $(TUNING_SOURCES) \
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_CXXFLAGS) -Idev -fobjc-arc -include $(BUILD_ID_HEADER) \
 		$(TEST_INPUTS) $(ENGINE_LINKFLAGS) -o $@
 
+# Every production plan of the kernel policy, one line each: run it in two
+# builds and diff the outputs (dev/benchmarks/device-policy.md).
+# test-engine-cpu runs it, so every production shape plans on every device.
+$(PLAN_CENSUS): dev/tuning/plan_census.cc $(ENGINE_LIBRARY) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $< $(ENGINE_LIBRARY) \
+		$(ENGINE_LINKFLAGS) -o $@
+
 # Offline kernel measurement for this device and model: reports every key
 # where a precompiled candidate beats the policy default in runtime/ops.
 # Run on an idle host after a kernel or policy change.
@@ -623,6 +631,7 @@ test-engine-cpu: $(TEST_CPU_TARGETS) $(TEST_ATTENTION_SWEEP) $(TUNE_KERNELS) \
 	$(TEST_DEVICE_QUERIES)
 	$(TEST_TUNING_WORKLOADS)
 	$(TEST_LINEAR_PLAN) --cpu
+	$(PLAN_CENSUS) > /dev/null
 	$(TEST_LINEAR_TUNING) --cpu
 	$(TEST_ATTENTION_TUNING)
 	$(TEST_DRAFT_ATTENTION_TUNING)
@@ -727,7 +736,7 @@ benchmark-attention-sweep: $(TEST_ATTENTION_SWEEP) $(LIB)
 	$(TEST_ATTENTION_SWEEP) $(LIB) $(ATTENTION_SWEEP_ARGS)
 
 # One GGUF projection on both decode tiles at every lane count and K split
-# (the split tiers of runtime/ops/LinearGguf.cpp); GGUF_PROJECTION_ARGS passes
+# (the split tiers of runtime/ops/KernelPolicy.hpp); GGUF_PROJECTION_ARGS passes
 # <fmt[+fmt+fmt]> <N[+N+N]> <K> [none|residual|gateup] [rounds].
 GGUF_PROJECTION_ARGS ?= q4k 5120 8192
 benchmark-gguf-projection: $(TEST_GGUF_PROJECTION_BENCHMARK) $(LIB)
