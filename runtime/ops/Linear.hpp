@@ -48,12 +48,16 @@ enum class LinearEpilogue : uint8_t { None, Residual, GateUp, UpWithGate };
 // this many rows can run them too (Linear::baseline).
 inline constexpr uint32_t kMaximumDecodeTileRows = SPLASH_MAXIMUM_BATCH_WIDTH * SPLASH_TARGET_VERIFY_ROWS;
 // Compute tiles over the StorageN=256 packing. Paired tiles pipeline two
-// quant groups of one lane. Split tiles keep one 8-row tile per threadgroup
-// and split K into four partitions whose fp32 partial sums are reduced before
-// the bf16 rounding; they take one lane, K % 1024 == 0 and one threadgroup
-// per tile. Paired256 is the four-simdgroup N256 paired tile. Simdgroup
-// uses bf16 8x8 matrix operations and an explicit activation/split workspace,
-// in decode and in prefill chunks of up to 32 rows padded to whole lanes.
+// quant groups of one lane. Split32 and Split64 keep one 8-row tile per
+// threadgroup and split K into four partitions whose fp32 partial sums are
+// reduced before the bf16 rounding; they take one lane, K % 1024 == 0 and one
+// threadgroup per tile. Split128 is the N128 tile with K split across `splits`
+// threadgroups, grid (column tiles, splits), every lane's rows in each tile;
+// the last threadgroup of a tile to finish reduces the fp32 partial sums
+// before the bf16 rounding. Paired256 is the four-simdgroup N256 paired tile.
+// Simdgroup uses bf16 8x8 matrix operations and an explicit activation/split
+// workspace, in decode and in prefill chunks of up to 32 rows padded to whole
+// lanes.
 // GgufStaged dequantizes GGUF weights per simdgroup into threadgroup memory
 // for matmul2d: 64 columns per decode threadgroup (two simdgroups) of 8, 16
 // or 32 rows with optional K splits; prefill runs 128-row tiles, or the
@@ -61,7 +65,7 @@ inline constexpr uint32_t kMaximumDecodeTileRows = SPLASH_MAXIMUM_BATCH_WIDTH * 
 // register tile on bf16 8x8 matrix operations (Apple9): 64 columns per
 // threadgroup, every request lane in one threadgroup, optional K splits.
 enum class LinearTile : uint8_t {
-  N128, N256, Paired128, Split32, Split64, Paired256, Simdgroup, GgufStaged, GgufRegister
+  N128, N256, Paired128, Split32, Split64, Split128, Paired256, Simdgroup, GgufStaged, GgufRegister
 };
 // The GGUF formats Apple9's staged tiles decode faster than its register
 // tiles, dense and MoE: IQ3_XXS, the IQ2 formats and IQ1, whose operands the
@@ -85,11 +89,12 @@ struct LinearConfig final {
   // other prefill tiles use their matrix grid and require zero here.
   uint32_t groups = 0;
   // Simdgroups per threadgroup, independent of the persistent grid size: the
-  // cooperative scope of one tile, or for split tiles the four partitions
-  // together (Split32 is 4 x 1, Split64 is 4 x 2; Paired256 runs four).
+  // cooperative scope of one tile, or for Split32 and Split64 the four
+  // partitions together (4 x 1 and 4 x 2; Paired256 runs four).
   LinearSimdgroups simdgroups = LinearSimdgroups::Eight;
-  // Cross-threadgroup K partitions for Simdgroup and the GGUF tiles, a power
-  // of two up to kMaximumSplits; all other tiles use one.
+  // Cross-threadgroup K partitions for Split128, Simdgroup and the GGUF
+  // tiles, a power of two up to kMaximumSplits (Split128 takes at least two);
+  // all other tiles use one.
   uint32_t splits = 1;
   static constexpr uint32_t kMaximumSplits = 8;
   [[nodiscard]] constexpr bool validSplits() const noexcept {
@@ -106,8 +111,9 @@ struct LinearChoice final {
 // Reused serially within one command stream: a decode step's, or a prefill
 // chunk's whose plans run the decode tiles. Counters are zeroed at
 // allocation and restored by each completed split dispatch. Never share this
-// workspace between concurrent command streams. Within a batched dispatch,
-// each eight-row tile owns disjoint input, sums, partials and counters.
+// workspace between concurrent command streams. Within a batched dispatch of
+// the Simdgroup tile, each eight-row tile owns disjoint input, sums, partials
+// and counters; Split128 holds every row of the step in each tile.
 struct LinearScratch final {
   metal::MetalBuffer input;
   metal::MetalBuffer sums;
@@ -167,8 +173,9 @@ public:
   [[nodiscard]] uint32_t threadsPerThreadgroup() const noexcept;
   // fp32 partial sums the kernel reduces before the single bf16 rounding of
   // the projection: 1 for the sequential tiles, whose outputs are bitwise
-  // identical for a workload; 4 for split tiles; 1-8 for Simdgroup. The latter
-  // also reassociates within each quantization group, even with one split.
+  // identical for a workload; 4 for the one-lane split tiles; the K splits of
+  // Split128, Simdgroup and the GGUF tiles. Simdgroup also reassociates within
+  // each quantization group, even with one split.
   [[nodiscard]] uint32_t partialSums() const noexcept;
   [[nodiscard]] bool usesSimdgroup() const noexcept;
   [[nodiscard]] LinearInput input() const noexcept;
@@ -228,10 +235,10 @@ public:
 
   // One lane: at most 3 tiles * 4 group counts, 2 split tiles, 2 paired
   // N256 grids, and 4 Apple9 simdgroup K splits (including its baseline):
-  // 3 * 4 + 2 + 2 + 4 = 20. Other families have no simdgroup candidates
-  // and at most one additional baseline (17). M24 replaces Paired128 with
-  // N128/four-simdgroup candidates and adds up to four matrix K splits,
-  // with no one-lane tiles (at most 17).
+  // 3 * 4 + 2 + 2 + 4 = 20. Apple10 and later list up to 3 Split128 K splits
+  // instead and at most one additional baseline (20). M24 replaces Paired128
+  // with N128/four-simdgroup candidates and adds up to four matrix or three
+  // Split128 K splits, with no one-lane tiles (at most 17).
   static constexpr std::size_t kMaximumCandidates = 20;
 
   [[nodiscard]] LinearPlan plan(LinearWorkload workload) const;
