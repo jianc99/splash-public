@@ -352,22 +352,26 @@ namespace {
 
 // Decode groups stream output tiles. Under round-robin group placement, the
 // most loaded core sets dispatch latency. Use the full grid for small workloads,
-// balanced two-tile groups at intermediate sizes, and one resident wave for
-// longer chains; sufficiently large grids balance themselves.
+// balanced two-tile groups at intermediate sizes, and one wave for longer
+// chains; sufficiently large grids balance themselves.
 struct DecodeGroupPolicy final {
   // The one-tile grid wins up to this many groups per core.
   uint32_t fullGridGroupsPerCore;
-  // Resident groups per core: one wave for this kernel's register footprint.
+  // Groups per core of one wave.
   uint32_t waveGroupsPerCore;
   // From this many tiles per core the many-wave grid wins again.
   uint32_t manyWaveTilesPerCore;
 };
-// Resident-wave and full-grid thresholds measured on 16/20-core Apple10 GPUs.
-// Gate/up uses the conservative limit shared by both devices. Its many-wave
-// threshold follows N256; the four-simdgroup threshold scales from N128. Those
-// two extrapolations remain unmeasured.
-constexpr DecodeGroupPolicy kN128Groups{4, 4, 12}, kN128M16Groups{5, 4, 12},
-    kN256Groups{3, 3, 8}, kGateUpGroups{3, 3, 8},
+// N128 runs one wave of its effective concurrency (kTensorConcurrency), and
+// its full grid up to one such wave per core (up to five at 16 rows). The
+// others were measured on 16/20-core Apple10 GPUs: N256 and gate/up keep
+// three per core although their k is 2 (two per core, the 2026-09-27
+// hardware characterization's k, loses up to 16% of a three- or four-lane
+// step), four simdgroups keep eight (k = 5 loses up to 1.4%). Gate/up's
+// many-wave threshold follows N256; the four-simdgroup threshold scales from
+// N128. Those two extrapolations remain unmeasured.
+constexpr DecodeGroupPolicy kN128Groups{kTensorConcurrency.n128, kTensorConcurrency.n128, 12},
+    kN128M16Groups{5, kTensorConcurrency.n128, 12}, kN256Groups{3, 3, 8}, kGateUpGroups{3, 3, 8},
     kFourSimdgroupGroups{8, 8, 24};
 
 // Tiles on the most loaded core when `groups` threadgroups are placed
@@ -402,9 +406,10 @@ uint32_t decodeGroups(uint32_t tiles, uint32_t cores,
   while (maxCoreTiles(tiles, groups, cores) != balanced) ++groups;
   return groups;
 }
-// A multi-row N256 decode tile halves the input re-reads of N128 but also
-// halves the grid; it pays only while the N256 grid keeps two tiles per core.
-constexpr uint32_t kWideDecodeTilesPerCore = 2;
+// Apple9 leaves its register tile for plain projections of three and four
+// lanes whose N256 grid keeps two tiles per core: its register tile runs one
+// lane per threadgroup and so streams the weights once per lane.
+constexpr uint32_t kApple9WidePlainTilesPerCore = 2;
 // Apple9 N256 prefill needs eight threadgroups per core to amortize its larger
 // tile. Paired-A/B tuning (tune-kernels) and the per-shape microprofile
 // (benchmark-prefill) on a 32-core Apple9 GPU (M4 Max) measured the
@@ -416,24 +421,35 @@ constexpr uint32_t kWideDecodeTilesPerCore = 2;
 constexpr uint32_t kApple9MeasuredPrefillCores = 32;
 constexpr double kApple9WidePrefillGroupsPerCore = 8.0;
 
-// Apple10 wide plain projections reduce input re-reads with paired N256
-// tiles at one resident wave, measured on 16/20-core GPUs. The one-lane split
-// tiles remain offline candidates: they beat Split128 or the sequential tile
-// on a few 35B one-lane shapes (by up to 7% at 20 cores), 0.55% of a one-lane
-// step, too little for a second split rule. Apple9's simdgroup policy is
-// independent.
-constexpr uint32_t kPaired256TilesPerCore = 8;
-constexpr uint32_t kPaired256WaveGroupsPerCore = 4;
+// The paired N256 tile runs one wave of its effective concurrency, four
+// threadgroups per core (kTensorConcurrency). The one-lane split tiles remain offline
+// candidates: they beat Split128 or the sequential tile on a few 35B one-lane
+// shapes (by up to 7% at 20 cores), 0.55% of a one-lane step, too little for a
+// second split rule.
+constexpr uint32_t kPaired256WaveGroupsPerCore = kTensorConcurrency.paired256;
 
-std::optional<LinearConfig> apple10OneLaneConfig(LinearWorkload w, uint32_t cores) {
+// Apple10's sequential tiles, for steps Split128 does not split: the tile law
+// (kAffineTensorTiles) over decodeGroups' persistent grids. Gate/up runs N256,
+// its fused kernel at one and two lanes; the N128 steps of three lanes run
+// four simdgroups.
+LinearConfig tensorSequentialConfig(LinearWorkload w, uint32_t cores) {
   // validate() requires outputSize % 256 == 0, so every tile width divides it.
-  const uint32_t n = w.matrix.outputSize;
-  const uint32_t tiles256 = n / 256;
-  if (w.epilogue == LinearEpilogue::None && tiles256 >= kPaired256TilesPerCore * cores)
-    return LinearConfig{LinearTile::Paired256,
-                        std::min(tiles256, kPaired256WaveGroupsPerCore * cores),
-                        LinearSimdgroups::Four};
-  return std::nullopt;
+  const uint32_t tiles128 = w.matrix.outputSize / 128, tiles256 = w.matrix.outputSize / 256;
+  const uint32_t lanes = w.rows / SPLASH_TARGET_VERIFY_ROWS;
+  if (w.epilogue == LinearEpilogue::GateUp) return {LinearTile::N256, decodeGroups(tiles256, cores, kGateUpGroups)};
+  const std::optional<TilesPerCore> &wide = kAffineTensorTiles.wide[lanes - 1];
+  const bool widePlain = w.epilogue == LinearEpilogue::None && wide && wide->reachedBy(tiles256, cores);
+  if (lanes == 1) {
+    if (widePlain)
+      return {LinearTile::Paired256, std::min(tiles256, kPaired256WaveGroupsPerCore * cores), LinearSimdgroups::Four};
+    const bool unpaired = kAffineTensorTiles.unpaired.reachedBy(tiles128, cores) &&
+                          tiles128 <= kTensorConcurrency.n128 * cores;
+    return {unpaired ? LinearTile::N128 : LinearTile::Paired128, decodeGroups(tiles128, cores, kN128Groups)};
+  }
+  if (widePlain) return {LinearTile::N256, decodeGroups(tiles256, cores, kN256Groups)};
+  if (lanes == 3)
+    return {LinearTile::N128, decodeGroups(tiles128, cores, kFourSimdgroupGroups), LinearSimdgroups::Four};
+  return {LinearTile::N128, decodeGroups(tiles128, cores, lanes == 2 ? kN128M16Groups : kN128Groups)};
 }
 
 // Apple9's simdgroup tile over the full column grid, 32 columns per gate/up
@@ -443,7 +459,7 @@ std::optional<LinearConfig> apple10OneLaneConfig(LinearWorkload w, uint32_t core
 LinearConfig simdgroupConfig(LinearWorkload w, const DevicePolicy &device) {
   const uint32_t grid = w.matrix.outputSize / (w.epilogue == LinearEpilogue::GateUp ? 32 : 64);
   return {LinearTile::Simdgroup, grid, LinearSimdgroups::Four,
-          splitK(kAffineRegisterTile, device, grid, w.matrix.inputSize)};
+          splitK(kAffineRegisterTile, device, grid, w.matrix.inputSize, kAffineRegisterTile.rows.round(w.rows))};
 }
 
 } // namespace
@@ -484,35 +500,19 @@ LinearConfig Linear::baseline(LinearWorkload w, std::span<const Projection *cons
     return {w.epilogue == LinearEpilogue::UpWithGate || wide ? LinearTile::N256
                                                               : LinearTile::N128, 0};
   }
-  const uint32_t lanes = w.rows / SPLASH_TARGET_VERIFY_ROWS;
-  // Keep the existing broad-column plain projection path for wider batches:
-  // independent row tiles repeat its weight stream. Reuse the existing
-  // two-N256-tiles-per-core boundary rather than model-specific dimensions.
-  const bool widePlain = lanes >= 3 && w.epilogue == LinearEpilogue::None &&
-      tiles256 >= kWideDecodeTilesPerCore * device_.cores;
-  if (registerTiles && !widePlain) return simdgroupConfig(w, device_);
-  if (!registerTiles) {
-    if (const uint32_t splits = splitK(kAffineTensorSplit, device_, tiles128, w.matrix.inputSize); splits > 1)
-      return {LinearTile::Split128, tiles128, LinearSimdgroups::Eight, splits};
-    if (lanes == 1)
-      if (const auto config = apple10OneLaneConfig(w, device_.cores)) return *config;
+  if (registerTiles) {
+    // Apple9's wide plain projections run MPP tiles over one-tile grids (the
+    // round-robin groups were measured on Apple10): four-simdgroup N128 at
+    // three lanes, N256 at four.
+    const uint32_t lanes = w.rows / SPLASH_TARGET_VERIFY_ROWS;
+    if (lanes < 3 || w.epilogue != LinearEpilogue::None || tiles256 < kApple9WidePlainTilesPerCore * device_.cores)
+      return simdgroupConfig(w, device_);
+    return lanes == 3 ? LinearConfig{LinearTile::N128, tiles128, LinearSimdgroups::Four}
+                      : LinearConfig{LinearTile::N256, tiles256};
   }
-  // Past this point Apple9 runs only the wide plain projections, on one-tile
-  // grids: the round-robin groups were measured on Apple10.
-  const auto groups = [&](uint32_t tiles, DecodeGroupPolicy policy) {
-    return registerTiles ? tiles : decodeGroups(tiles, device_.cores, policy);
-  };
-  if (w.epilogue == LinearEpilogue::GateUp) return {LinearTile::N256, groups(tiles256, kGateUpGroups)};
-  // Pipelined N128 hides the latency of a single lane's weight stream.
-  if (lanes == 1) return {LinearTile::Paired128, groups(tiles128, kN128Groups)};
-  // The M24 projections left run four SIMD groups: Apple10's plain and
-  // residual ones it does not split, and Apple9's wide plain ones.
-  if (lanes == 3)
-    return {LinearTile::N128, groups(tiles128, kFourSimdgroupGroups),
-            LinearSimdgroups::Four};
-  if (widePlain) return {LinearTile::N256, groups(tiles256, kN256Groups)};
-  return {LinearTile::N128,
-          groups(tiles128, lanes == 2 ? kN128M16Groups : kN128Groups)};
+  if (const uint32_t splits = splitK(kAffineTensorSplit, device_, tiles128, w.matrix.inputSize, w.rows); splits > 1)
+    return {LinearTile::Split128, tiles128, LinearSimdgroups::Eight, splits};
+  return tensorSequentialConfig(w, device_.cores);
 }
 
 LinearPlan Linear::plan(LinearWorkload workload) const {
@@ -591,7 +591,7 @@ std::vector<LinearPlan> Linear::candidates(LinearWorkload w) const {
          splits <= LinearConfig::kMaximumSplits && splits <= w.matrix.inputSize / kInputSumBlock; splits *= 2)
       append({LinearTile::Split128, w.matrix.outputSize / 128, LinearSimdgroups::Eight, splits});
   // One-lane tiles: the split forms at their full grid and the paired N256
-  // tile at one resident wave and at its full grid.
+  // tile at one wave and at its full grid.
   if (w.phase == LinearPhase::Decode && w.rows == SPLASH_TARGET_VERIFY_ROWS) {
     const uint32_t n = w.matrix.outputSize;
     if (w.matrix.inputSize % kSplitInputBlock == 0) {

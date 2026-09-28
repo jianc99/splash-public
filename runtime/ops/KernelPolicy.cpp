@@ -10,7 +10,8 @@ DevicePolicy::DevicePolicy(const DeviceCapabilities &device) noexcept
     : primitive(device.appleGpuFamily == 9 ? Primitive::Register : Primitive::Tensor),
       cores(device.gpuCoreCount ? device.gpuCoreCount : kAssumedGpuCores) {}
 
-uint32_t splitK(const KernelFamily &family, const DevicePolicy &device, uint32_t grid, uint32_t inputs) noexcept {
+uint32_t splitK(const KernelFamily &family, const DevicePolicy &device, uint32_t grid, uint32_t inputs,
+                uint32_t rows) noexcept {
   const SplitLaw &law = family.split;
   const std::span<const SplitTier> tiers = law.tiers(device.primitive);
   uint32_t splits = 1;
@@ -20,7 +21,7 @@ uint32_t splitK(const KernelFamily &family, const DevicePolicy &device, uint32_t
   };
   const auto asks = [&](const SplitTier &tier) {
     const uint64_t threadgroups = uint64_t{grid} * splits, target = uint64_t{tier.groupsPerCore} * device.cores;
-    return (law.inclusive ? threadgroups <= target : threadgroups < target) &&
+    return tier.holds(rows) && (law.inclusive ? threadgroups <= target : threadgroups < target) &&
            inputs >= uint64_t{2 * splits} * tier.inputs;
   };
   while (splits < LinearConfig::kMaximumSplits && std::any_of(tiers.begin(), tiers.end(), asks) &&

@@ -25,15 +25,17 @@ std::string prefillKernel(const char *format, char epilogue) {
   return std::string("gguf_prefill_") + format + "_" + epilogue;
 }
 
-// The decode tile configurations over an n x k matrix, split by their
-// families' laws.
-LinearConfig registerDecode(uint32_t n, uint32_t k, const DevicePolicy &device) {
+// The decode tile configurations over an n x k matrix for `rows` rows, split
+// by their families' laws.
+LinearConfig registerDecode(uint32_t n, uint32_t k, uint32_t rows, const DevicePolicy &device) {
   const uint32_t grid = n / GGUF_TILE_COLUMNS;
-  return {LinearTile::GgufRegister, grid, LinearSimdgroups::Four, splitK(kGgufRegisterTile, device, grid, k)};
+  return {LinearTile::GgufRegister, grid, LinearSimdgroups::Four,
+          splitK(kGgufRegisterTile, device, grid, k, kGgufRegisterTile.rows.round(rows))};
 }
-LinearConfig stagedDecode(uint32_t n, uint32_t k, const DevicePolicy &device) {
+LinearConfig stagedDecode(uint32_t n, uint32_t k, uint32_t rows, const DevicePolicy &device) {
   const uint32_t grid = n / GGUF_TILE_COLUMNS;
-  return {LinearTile::GgufStaged, grid, LinearSimdgroups::Two, splitK(kGgufStagedTile, device, grid, k)};
+  return {LinearTile::GgufStaged, grid, LinearSimdgroups::Two,
+          splitK(kGgufStagedTile, device, grid, k, kGgufStagedTile.rows.round(rows))};
 }
 
 // Whether Apple9 decodes a plan's projections (a gate/up plan's two) on the
@@ -191,21 +193,21 @@ LinearConfig Linear::ggufBaseline(LinearWorkload w, std::span<const Projection *
   // 8 rows to 16) and 1.1-2.8x on a 40-core M3 Max; the 27B down and output
   // projections split in two gain 24-37% more on the 16-core M5 Pro.
   if (w.phase == LinearPhase::Prefill)
-    return w.rows <= kMaximumDecodeTileRows
-        ? LinearConfig{LinearTile::GgufStaged, 0, LinearSimdgroups::Two,
-                       splitK(kGgufStagedTile, device_, n / GGUF_TILE_COLUMNS, k)}
-        : LinearConfig{LinearTile::GgufStaged, 0, LinearSimdgroups::Four};
+    return w.rows <= kMaximumDecodeTileRows ? LinearConfig{LinearTile::GgufStaged, 0, LinearSimdgroups::Two,
+                                                           stagedDecode(n, k, w.rows, device_).splits}
+                                            : LinearConfig{LinearTile::GgufStaged, 0, LinearSimdgroups::Four};
   // Apple9 runs matrix operations on the FP32 pipe, so the exact register
   // kernel beats staging but for the projections apple9Stages names.
   if (device_.primitive == Primitive::Register && !apple9Stages(w, projections))
-    return registerDecode(n, k, device_);
-  return stagedDecode(n, k, device_);
+    return registerDecode(n, k, w.rows, device_);
+  return stagedDecode(n, k, w.rows, device_);
 }
 
 LinearScratchSize Linear::ggufDecodeScratchSize(LinearWorkload w) const {
   const auto [n, k] = w.matrix;
   LinearScratchSize size = LinearPlan(w, baseline(w)).scratchSize();
-  if (device_.primitive == Primitive::Register) size.include(LinearPlan(w, stagedDecode(n, k, device_)).scratchSize());
+  if (device_.primitive == Primitive::Register)
+    size.include(LinearPlan(w, stagedDecode(n, k, w.rows, device_)).scratchSize());
   return size;
 }
 
