@@ -155,7 +155,8 @@ void baselinePlans() {
       for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
         const auto selected = plans.moeDecode(shape, lanes);
         require(selected.tileRows() == 8 &&
-                    selected.configuration().m8Simdgroups == moeDecodeSimdgroups(family),
+                    selected.configuration().m8Simdgroups ==
+                        moeDecodeSimdgroups(DevicePolicy(device(family)).primitive),
                 "MoE decode baseline changed");
         covers(stride, selected.workspace(), lanes, kMoeWorkspaceFields);
       }
@@ -171,7 +172,7 @@ void moeDeviceTiles() {
   for (uint32_t family : {0U, 9U, 10U, 11U}) {
     const auto expected = family == 9 ? MoeExpertSimdgroups::Four
                                       : MoeExpertSimdgroups::Eight;
-    require(moeDecodeSimdgroups(family) == expected,
+    require(moeDecodeSimdgroups(DevicePolicy(device(family)).primitive) == expected,
             "decode expert simdgroups are not gated on GPU family 9");
     ExecutionPlans plans(device(family));
     for (auto shape : moeShapes) {
@@ -214,7 +215,8 @@ void ggufMoePlans() {
   for (uint32_t family : {0U, 9U, 10U, 11U}) {
     ExecutionPlans plans(device(family));
     const MoeGgufTile expected = family == 9 ? MoeGgufTile::Register : MoeGgufTile::Staged;
-    require(moeGgufTile(family, shape) == expected, "GGUF expert tile is not gated on GPU family 9");
+    const Primitive primitive = DevicePolicy(device(family)).primitive;
+    require(moeGgufTile(primitive, shape) == expected, "GGUF expert tile is not gated on GPU family 9");
     // GGUF plans are not tuned: a table may not hold a choice for them.
     OperatorChoices choices;
     choices.moe.push_back({MoeWorkload{shape, 16, MoePhase::Decode}, MoeConfig{MoeExpertTile::M8}});
@@ -240,7 +242,7 @@ void ggufMoePlans() {
     MoeShape staged = shape, q4k = shape;
     staged.expertFormat = GGUF_FMT_IQ2XS;
     q4k.expertFormat = GGUF_FMT_Q4K;
-    require(moeGgufTile(family, staged) == MoeGgufTile::Staged && moeGgufTile(family, q4k) == expected,
+    require(moeGgufTile(primitive, staged) == MoeGgufTile::Staged && moeGgufTile(primitive, q4k) == expected,
             "GGUF expert tile does not follow the experts' format on GPU family 9");
     for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
       const MoePlan plan = plans.moeDecode(staged, lanes);

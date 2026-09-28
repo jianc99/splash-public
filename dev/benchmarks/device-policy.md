@@ -7,6 +7,13 @@ production allocations, startup benchmarks or per-model/per-SKU tables.
 
 ## Policy ownership
 
+`runtime/ops/KernelPolicy.hpp` holds what the projection policies read of the
+device, the primitive its GPU family runs (register tiles on Apple9, tensor
+tiles on Apple10 and later) and its core count, and the laws the kernel
+families share: the row quanta of each family's tile and one split-K law,
+whose tiers, comparator and partition steps each family records with the
+machine and date they were measured on.
+
 `runtime/ops/Linear.cpp` owns Q4 selection. Apple9 decode, and prefill chunks
 of up to 32 rows, use bfloat simdgroup matrices with 1/2/4/8 K partitions
 ([apple9-simdgroup.md](apple9-simdgroup.md)). Apple10 uses MPP tiles, with
@@ -28,13 +35,14 @@ have been removed; those kernels remain useful as qualification references
 and offline candidates.
 
 Core count comes from the Metal device's IORegistry property. Missing metadata
-uses one 32-core estimate across families, an intermediate value in the
-16–40-core range of our reference machines. This is not a calibrated optimum
-or a performance guarantee for unidentified GPUs. A nonzero reported count
-always overrides it. Family 11 (the M6) runs the family 10 policy, and a CPU
-test holds every family 11 plan equal to family 10's; the measurements behind
-the policy come from families 9 and 10. Core count alone cannot describe
-memory bandwidth, cache capacity, power state or compiler behavior.
+uses one 32-core estimate for every kernel (`kAssumedGpuCores`), an
+intermediate value in the 16–40-core range of our reference machines. This is
+not a calibrated optimum or a performance guarantee for unidentified GPUs. A
+nonzero reported count always overrides it. Family 11 (the M6) runs the
+family 10 policy, and a CPU test holds every family 11 plan equal to family
+10's; the measurements behind the policy come from families 9 and 10. Core
+count alone cannot describe memory bandwidth, cache capacity, power state or
+compiler behavior.
 
 MoE routing scales its row threshold with core count. The expert tile's
 four-SIMD-group Apple9 decode default remains a family rule, measured on the
@@ -101,8 +109,13 @@ on the missing hardware; the existing MoE tuner does not vary that rule.
   calibration; it does not claim a new serving speedup or repeat the previous
   whole-model ABBA measurements.
 
-The policy snapshot harness is not in the repository. Earlier serving results
-remain in
+The policy snapshot harness of this pass is not in the repository.
+`plan-census` (`dev/tuning/plan_census.cc`, built by `test-engine-cpu`)
+prints every production plan, with its tuning candidates and arena bounds, of
+the 27B and 35B targets and drafts, affine and GGUF, and of the 35B MoE layer,
+on families 9–11 at an unknown and 14 known core counts from 10 to 80. Run in
+two builds, the diff of its outputs lists exactly the plans a change moves.
+Earlier serving results remain in
 [remaining-decode-optimizations.md](remaining-decode-optimizations.md) and
 [apple9-simdgroup.md](apple9-simdgroup.md).
 
@@ -114,3 +127,7 @@ intentionally differ. Existing CPU policy tests cover unknown counts in both
 prefill and decode, including equivalence to an explicitly reported 32-core
 GPU. Known-core plans remain byte-identical in a separate before/after
 comparison. This fallback does not require startup or user-run calibration.
+The MoE router kept its own 512-row wide-tile threshold for unknown counts
+(about 20 cores) until it joined this estimate: it now takes 32 cores' 832
+rows, so on an unknown GPU a prefill chunk of 512–831 rows scores its routes
+on the 8-row tile instead of the 32-row one. Both tiles give the same scores.

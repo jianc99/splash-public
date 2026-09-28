@@ -25,9 +25,10 @@ uint64_t aligned(uint64_t bytes, uint64_t alignment) {
 
 void devicePolicyPlans() {
   constexpr MoeShape shape{2048, 256, 8, 512};
-  // Include unknown cores, a decode crossover, measured parts and a part
-  // whose prefill crossover is beyond the 2048-row production chunk.
-  constexpr std::array devices{std::array{0U, 512U}, std::array{1U, 26U},
+  // Include unknown cores (the assumed 32), a decode crossover, measured
+  // parts and a part whose prefill crossover is beyond the 2048-row
+  // production chunk.
+  constexpr std::array devices{std::array{0U, 832U}, std::array{1U, 26U},
       std::array{10U, 260U}, std::array{16U, 416U}, std::array{20U, 520U},
       std::array{40U, 1040U}, std::array{80U, 2080U}};
   for (uint32_t family : {9U, 10U}) {

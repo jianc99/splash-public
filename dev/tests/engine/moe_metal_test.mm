@@ -62,7 +62,8 @@ constexpr uint32_t kTopK = 2;
 constexpr uint32_t kRoutesPerRow = kTopK + 1;
 // Covers both router tiles: 8-row tiles below kMoeRouteWideRows and 32-row
 // tiles with a ragged 8-row tail above it.
-constexpr uint32_t kMaximumRows = 520;
+constexpr uint32_t kMaximumRows = kMoeRouteWideRows + 8;
+static_assert(kMaximumRows % 32 == 8 && kMaximumRows <= SPLASH_PREFILL_TOKEN_BUDGET);
 constexpr uint32_t kStorageN = 256;
 
 [[noreturn]] void fail(const std::string &message) {
@@ -514,16 +515,16 @@ void checkPlan(const MoePlan &plan) {
 }
 
 void planBounds() {
-  // The wide-tile threshold scales with core count; unknown counts use the
-  // measured 512-row fallback.
+  // The wide-tile threshold scales with the core count; a plan without the
+  // device's takes the assumed count's.
   require(splash::ops::moeRouteWideRows(20) == 520 &&
               splash::ops::moeRouteWideRows(40) == 1040 &&
               splash::ops::moeRouteWideRows(10) == 260 &&
-              splash::ops::moeRouteWideRows(0) == 512,
+              kMoeRouteWideRows == splash::ops::moeRouteWideRows(splash::ops::kAssumedGpuCores),
           "router wide-tile threshold does not scale with the core count");
   require(splash::ops::moeRouteTile(519, 520).rows == 8 &&
               splash::ops::moeRouteTile(520, 520).rows == 32 &&
-              splash::ops::moeRouteTile(512, kMoeRouteWideRows).rows == 32,
+              splash::ops::moeRouteTile(kMoeRouteWideRows, kMoeRouteWideRows).rows == 32,
           "router tile selection ignores the configured threshold");
   for (const MoeShape shape : {MoeShape{256, 8, 2, 512},
                               MoeShape{2048, 256, 8, 512}}) {
@@ -578,13 +579,11 @@ void planBounds() {
             "uncompiled expert simdgroups");
   }
   rejects([] { (void)MoE::prefillPlan({}, 1, {MoeExpertTile::M32}); }, "invalid shape");
-  // Only family 9 runs the four-simdgroup decode tiles; an unknown family
-  // and families 10 and later keep the shipped tile.
-  require(splash::ops::moeDecodeSimdgroups(9) == MoeExpertSimdgroups::Four &&
-              splash::ops::moeDecodeSimdgroups(10) == MoeExpertSimdgroups::Eight &&
-              splash::ops::moeDecodeSimdgroups(11) == MoeExpertSimdgroups::Eight &&
-              splash::ops::moeDecodeSimdgroups(0) == MoeExpertSimdgroups::Eight,
-          "decode expert simdgroups are not gated on GPU family 9");
+  // Only the register primitive (Apple9) runs the four-simdgroup decode
+  // tiles; the tensor one keeps the shipped tile.
+  require(splash::ops::moeDecodeSimdgroups(splash::ops::Primitive::Register) == MoeExpertSimdgroups::Four &&
+              splash::ops::moeDecodeSimdgroups(splash::ops::Primitive::Tensor) == MoeExpertSimdgroups::Eight,
+          "decode expert simdgroups are not gated on the register primitive");
 }
 
 void checkEncoding(const CommandGraph &graph, const MoePlan &plan) {
@@ -898,10 +897,10 @@ void run(const std::string &metallibPath) {
                    label + " four-simdgroup M32");
     }
     // 12 and 48 rows leave 16-row ragged tiles in every routing fixture; 9,
-    // 33 and 263 leave 8-row ones next to full tiles; 511/512 straddle the
-    // wide router tile threshold.
+    // 33 and 263 leave 8-row ones next to full tiles; the rows around
+    // kMoeRouteWideRows straddle the wide router tile threshold.
     for (uint32_t rows : {1U, 3U, 7U, 8U, 9U, 12U, 31U, 32U, 33U, 48U, 100U,
-                          255U, 256U, 263U, 511U, 512U, kMaximumRows}) {
+                          255U, 256U, 263U, kMoeRouteWideRows - 1, kMoeRouteWideRows, kMaximumRows}) {
       const auto shipped = candidates(10, fixture.shape, rows, MoePhase::Prefill);
       const std::string label = "prefill rows=" + std::to_string(rows);
       const auto baseline = execute(shipped[0], label);

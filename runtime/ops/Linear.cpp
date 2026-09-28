@@ -7,7 +7,6 @@
 
 #include <algorithm>
 #include <array>
-#include <cmath>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -16,7 +15,6 @@
 namespace splash::ops {
 namespace {
 
-constexpr uint32_t kAffinePrefillTileRows = 32;
 constexpr uint32_t kQuantGroup = 64;
 static_assert(SPLASH_TARGET_VERIFY_ROWS == 8,
               "simdgroup Q4 tiles require eight verify rows per lane");
@@ -26,6 +24,9 @@ static_assert(SPLASH_TARGET_VERIFY_ROWS == 8,
 constexpr uint32_t kInputSumBlock = 4 * kQuantGroup;
 constexpr uint32_t kSplitPartitions = 4;
 constexpr uint32_t kSplitInputBlock = kSplitPartitions * kInputSumBlock;
+static_assert(kAffineRegisterTile.split.partitionInputs == kQuantGroup &&
+                  kAffineTensorSplit.split.partitionInputs == kInputSumBlock,
+              "the affine split laws partition K in the kernels' steps");
 static_assert(sizeof(LinearMatrix) == 8);
 
 bool oneLaneSplit(LinearTile tile) noexcept {
@@ -127,14 +128,23 @@ void requireAffineProjection(const Projection &p, LinearMatrix matrix) {
   requireBytes(p.affine().biases, bytes, "bias");
 }
 
-uint32_t LinearPlan::storageRows() const noexcept {
-  if (workload_.weightLayout == WeightLayout::Block32) return blockStorageRows();
-  // The simdgroup tile runs whole eight-row lanes.
-  if (usesSimdgroup())
-    return (workload_.rows + SPLASH_TARGET_VERIFY_ROWS - 1) / SPLASH_TARGET_VERIFY_ROWS * SPLASH_TARGET_VERIFY_ROWS;
-  if (workload_.phase != LinearPhase::Prefill) return workload_.rows;
-  return ((workload_.rows + kAffinePrefillTileRows - 1) / kAffinePrefillTileRows) * kAffinePrefillTileRows;
+const KernelFamily &LinearPlan::kernelFamily() const noexcept {
+  switch (config_.tile) {
+  case LinearTile::Simdgroup: return kAffineRegisterTile;
+  case LinearTile::Split128: return kAffineTensorSplit;
+  case LinearTile::GgufRegister: return kGgufRegisterTile;
+  case LinearTile::GgufStaged:
+    return config_.simdgroups == LinearSimdgroups::Two ? kGgufStagedTile : kGgufStagedPrefill;
+  case LinearTile::N128:
+  case LinearTile::N256:
+  case LinearTile::Paired128:
+  case LinearTile::Split32:
+  case LinearTile::Split64:
+  case LinearTile::Paired256: break;
+  }
+  return workload_.phase == LinearPhase::Prefill ? kAffineTensorPrefill : kAffineTensorDecode;
 }
+uint32_t LinearPlan::storageRows() const noexcept { return kernelFamily().rows.round(workload_.rows); }
 uint32_t LinearPlan::tileColumns() const noexcept {
   switch (config_.tile) {
   case LinearTile::Simdgroup: return workload_.epilogue == LinearEpilogue::GateUp ? 32 : 64;
@@ -359,9 +369,6 @@ struct DecodeGroupPolicy final {
 constexpr DecodeGroupPolicy kN128Groups{4, 4, 12}, kN128M16Groups{5, 4, 12},
     kN256Groups{3, 3, 8}, kGateUpGroups{3, 3, 8},
     kFourSimdgroupGroups{8, 8, 24};
-// Apple9 retains its measured gate/up clamp. The round-robin policy above was
-// measured on Apple10; applying it to Apple9 requires separate calibration.
-constexpr double kApple9GateUpGroupsPerCore = 2.25;
 
 // Tiles on the most loaded core when `groups` threadgroups are placed
 // round-robin on `cores` and group g streams tiles g, g + groups, ...
@@ -408,34 +415,6 @@ constexpr uint32_t kWideDecodeTilesPerCore = 2;
 // wide-tile rule below; it was sized for them and remains unremeasured there.
 constexpr uint32_t kApple9MeasuredPrefillCores = 32;
 constexpr double kApple9WidePrefillGroupsPerCore = 8.0;
-// Missing core metadata uses one intermediate estimate for all families.
-// This is a fallback, not a calibrated optimum. Reported counts always win.
-constexpr uint32_t kAssumedGpuCores = 32;
-
-// Apple10 decode splits K across the threadgroups of the Split128 tile (256
-// threads) by one rule at every batch width: the largest power of two up to
-// LinearConfig::kMaximumSplits whose split grid still fits four threadgroups
-// per core (1024 threads, twice the 512-thread occupancy knee), with at least
-// one 256-input block per partition; one split keeps the sequential tiles.
-// Measured DRAM-cold on a 20-core M5 Pro over the 27B and 35B MLX 4-bit
-// decode projections and their drafts at one to four lanes, and 16 and 40
-// cores emulated by width: grids that only reach the knee leave time (the
-// 20 tiles of 2560 x 4096 take 0.48-0.60 of the sequential time with four
-// splits, 0.60-0.71 with two), and a grid past four per core loses to its
-// second wave (6144 x 5120 in two splits is 9% slower at one lane). The rule
-// is within 5% of each shape's fastest split in 145 of 172 shapes and lanes
-// and never slower than the sequential tiles; partitions longer than one
-// block gained nothing measurable.
-constexpr uint32_t kSplitGroupsPerCore = 4;
-
-uint32_t apple10Splits(LinearMatrix matrix, uint32_t cores) noexcept {
-  const uint64_t grid = matrix.outputSize / 128;
-  uint32_t splits = 1;
-  while (splits < LinearConfig::kMaximumSplits && grid * 2 * splits <= uint64_t{kSplitGroupsPerCore} * cores &&
-         2 * splits <= matrix.inputSize / kInputSumBlock)
-    splits *= 2;
-  return splits;
-}
 
 // Apple10 wide plain projections reduce input re-reads with paired N256
 // tiles at one resident wave, measured on 16/20-core GPUs. The one-lane split
@@ -457,25 +436,17 @@ std::optional<LinearConfig> apple10OneLaneConfig(LinearWorkload w, uint32_t core
   return std::nullopt;
 }
 
-// Apple9's simdgroup tile over the full column grid. K splits aim for sixteen
-// independent column/K groups per core, retaining at least twelve quant groups
-// per partition to amortize the reduction. The rule ignores the rows, so a
-// lane's outputs are the same at every batch width and in prefill chunks.
-LinearConfig simdgroupConfig(LinearWorkload w, uint32_t cores) {
-  const uint32_t columns = w.epilogue == LinearEpilogue::GateUp ? 32 : 64;
-  const uint32_t grid = w.matrix.outputSize / columns, groups = w.matrix.inputSize / 64;
-  uint32_t splits = 1;
-  while (splits < LinearConfig::kMaximumSplits && uint64_t(grid) * splits < 16ULL * cores &&
-         groups % (2 * splits) == 0 && groups / (2 * splits) >= 12)
-    splits *= 2;
-  return {LinearTile::Simdgroup, grid, LinearSimdgroups::Four, splits};
+// Apple9's simdgroup tile over the full column grid, 32 columns per gate/up
+// threadgroup and 64 otherwise, split by its family's law. It ignores the
+// rows, so a lane's outputs are the same at every batch width and in prefill
+// chunks.
+LinearConfig simdgroupConfig(LinearWorkload w, const DevicePolicy &device) {
+  const uint32_t grid = w.matrix.outputSize / (w.epilogue == LinearEpilogue::GateUp ? 32 : 64);
+  return {LinearTile::Simdgroup, grid, LinearSimdgroups::Four,
+          splitK(kAffineRegisterTile, device, grid, w.matrix.inputSize)};
 }
 
 } // namespace
-
-Linear::Linear(const DeviceCapabilities &device) noexcept
-    : appleGpuFamily_(device.appleGpuFamily),
-      gpuCores_(device.gpuCoreCount ? device.gpuCoreCount : kAssumedGpuCores) {}
 
 uint32_t Linear::decodeStorageRows(uint32_t rows, ProjectionShape shape) const {
   return plan({{shape.outputSize, shape.inputSize}, rows, LinearPhase::Decode, LinearEpilogue::None, shape.layout})
@@ -490,25 +461,26 @@ void Linear::account(LinearDispatchStats &stats, uint32_t lanes, uint32_t dispat
   else stats.m32Dispatches += dispatches;
 }
 
-// GPU family selects variants; core count and workload tile counts determine
-// parallelism.
+// The primitive selects variants; core count and workload tile counts
+// determine parallelism.
 LinearConfig Linear::baseline(LinearWorkload w, std::span<const Projection *const> projections) const {
   validate(w);
   if (w.weightLayout == WeightLayout::Block32) return ggufBaseline(w, projections);
   const uint32_t tiles128 = w.matrix.outputSize / 128;
   const uint32_t tiles256 = w.matrix.outputSize / 256;
+  const bool registerTiles = device_.primitive == Primitive::Register;
   if (w.phase == LinearPhase::Prefill) {
     // Apple9 runs chunks of up to a decode batch on its decode tile with the
     // decode split rule, as ggufBaseline does. The MPP tile's grid of such a
     // chunk is one row of 128-column tiles, each streaming all of K: on a
     // 40-core M3 Max it took 1.25 ms for the 27B FFN down projection (17408
     // inputs, 5120 outputs) at 17-32 rows, about ten times its bandwidth floor.
-    if (appleGpuFamily_ == 9 && w.rows <= kMaximumDecodeTileRows) return simdgroupConfig(w, gpuCores_);
-    if (appleGpuFamily_ >= 10 || gpuCores_ <= kApple9MeasuredPrefillCores)
+    if (registerTiles && w.rows <= kMaximumDecodeTileRows) return simdgroupConfig(w, device_);
+    if (!registerTiles || device_.cores <= kApple9MeasuredPrefillCores)
       return {LinearTile::N128, 0, LinearSimdgroups::Four};
     const uint32_t rowTiles = (w.rows + kAffinePrefillTileRows - 1) / kAffinePrefillTileRows;
     const bool wide = double(rowTiles) * tiles256 >=
-        kApple9WidePrefillGroupsPerCore * gpuCores_;
+        kApple9WidePrefillGroupsPerCore * device_.cores;
     return {w.epilogue == LinearEpilogue::UpWithGate || wide ? LinearTile::N256
                                                               : LinearTile::N128, 0};
   }
@@ -517,34 +489,25 @@ LinearConfig Linear::baseline(LinearWorkload w, std::span<const Projection *cons
   // independent row tiles repeat its weight stream. Reuse the existing
   // two-N256-tiles-per-core boundary rather than model-specific dimensions.
   const bool widePlain = lanes >= 3 && w.epilogue == LinearEpilogue::None &&
-      tiles256 >= kWideDecodeTilesPerCore * gpuCores_;
-  if (appleGpuFamily_ == 9 && !widePlain) return simdgroupConfig(w, gpuCores_);
-  if (appleGpuFamily_ >= 10) {
-    if (const uint32_t splits = apple10Splits(w.matrix, gpuCores_); splits > 1)
+      tiles256 >= kWideDecodeTilesPerCore * device_.cores;
+  if (registerTiles && !widePlain) return simdgroupConfig(w, device_);
+  if (!registerTiles) {
+    if (const uint32_t splits = splitK(kAffineTensorSplit, device_, tiles128, w.matrix.inputSize); splits > 1)
       return {LinearTile::Split128, tiles128, LinearSimdgroups::Eight, splits};
     if (lanes == 1)
-      if (const auto config = apple10OneLaneConfig(w, gpuCores_)) return *config;
+      if (const auto config = apple10OneLaneConfig(w, device_.cores)) return *config;
   }
-  // Apple9 keeps its one-tile grids (see kApple9GateUpGroupsPerCore).
+  // Past this point Apple9 runs only the wide plain projections, on one-tile
+  // grids: the round-robin groups were measured on Apple10.
   const auto groups = [&](uint32_t tiles, DecodeGroupPolicy policy) {
-    return appleGpuFamily_ >= 10 ? decodeGroups(tiles, gpuCores_, policy)
-                                 : tiles;
+    return registerTiles ? tiles : decodeGroups(tiles, device_.cores, policy);
   };
-  if (w.epilogue == LinearEpilogue::GateUp) {
-    if (appleGpuFamily_ < 10) {
-      const auto resident = static_cast<uint32_t>(
-          std::max(1L, std::lround(kApple9GateUpGroupsPerCore * gpuCores_)));
-      return {LinearTile::N256, std::min(tiles256, resident)};
-    }
-    return {LinearTile::N256, groups(tiles256, kGateUpGroups)};
-  }
+  if (w.epilogue == LinearEpilogue::GateUp) return {LinearTile::N256, groups(tiles256, kGateUpGroups)};
   // Pipelined N128 hides the latency of a single lane's weight stream.
   if (lanes == 1) return {LinearTile::Paired128, groups(tiles128, kN128Groups)};
-  // M24 plain projections benefit from four SIMD groups on Apple9 too.
-  // Apple9 residual projections retain eight groups with compact prefix
-  // traversal; Apple10 uses four for every M24 projection it does not split.
-  if (lanes == 3 && (appleGpuFamily_ >= 10 ||
-      (appleGpuFamily_ == 9 && w.epilogue == LinearEpilogue::None)))
+  // The M24 projections left run four SIMD groups: Apple10's plain and
+  // residual ones it does not split, and Apple9's wide plain ones.
+  if (lanes == 3)
     return {LinearTile::N128, groups(tiles128, kFourSimdgroupGroups),
             LinearSimdgroups::Four};
   if (widePlain) return {LinearTile::N256, groups(tiles256, kN256Groups)};
@@ -607,14 +570,14 @@ std::vector<LinearPlan> Linear::candidates(LinearWorkload w) const {
       // Sample two, three and four groups per core plus the full grid.
       // Always retain the measured baseline above, including its balanced
       // group count. Fixed counts tied to one GPU miss these waves elsewhere.
-      for (const uint32_t groups : {2 * gpuCores_, 3 * gpuCores_, 4 * gpuCores_, tiles}) {
+      for (const uint32_t groups : {2 * device_.cores, 3 * device_.cores, 4 * device_.cores, tiles}) {
         append({tile, std::min(groups, tiles)});
         if (supportsFourSimdgroups(w, tile))
           append({tile, std::min(groups, tiles), LinearSimdgroups::Four});
       }
     }
   }
-  if ((w.phase == LinearPhase::Decode && appleGpuFamily_ == 9) || simdgroupPrefill) {
+  if ((w.phase == LinearPhase::Decode && device_.primitive == Primitive::Register) || simdgroupPrefill) {
     const uint32_t n = w.matrix.outputSize;
     const uint32_t columns = w.epilogue == LinearEpilogue::GateUp ? 32 : 64;
     for (uint32_t splits = 1; splits <= LinearConfig::kMaximumSplits; splits *= 2)
@@ -623,7 +586,7 @@ std::vector<LinearPlan> Linear::candidates(LinearWorkload w) const {
   }
   // Apple10 lists Split128 at every K split its 256-input blocks allow, at
   // every lane count.
-  if (w.phase == LinearPhase::Decode && appleGpuFamily_ >= 10)
+  if (w.phase == LinearPhase::Decode && device_.primitive == Primitive::Tensor)
     for (uint32_t splits = 2;
          splits <= LinearConfig::kMaximumSplits && splits <= w.matrix.inputSize / kInputSumBlock; splits *= 2)
       append({LinearTile::Split128, w.matrix.outputSize / 128, LinearSimdgroups::Eight, splits});
@@ -637,7 +600,7 @@ std::vector<LinearPlan> Linear::candidates(LinearWorkload w) const {
         append({LinearTile::Split64, n / 64, LinearSimdgroups::Eight});
     }
     if (w.epilogue == LinearEpilogue::None)
-      for (const uint32_t groups : {kPaired256WaveGroupsPerCore * gpuCores_, n / 256})
+      for (const uint32_t groups : {kPaired256WaveGroupsPerCore * device_.cores, n / 256})
         append({LinearTile::Paired256, std::min(groups, n / 256), LinearSimdgroups::Four});
   }
   return result;
@@ -769,12 +732,11 @@ PreparedInput Linear::add(metal::CommandGraph &graph, LinearBuffers b,
 void Linear::addPrefillSums(metal::CommandGraph &graph, metal::MetalBuffer input, metal::MetalBuffer sums,
                             const Projection &consumer, uint32_t rows) const {
   validate({{consumer.outputSize, consumer.inputSize}, rows, LinearPhase::Prefill});
-  const uint32_t tiles = (rows + kAffinePrefillTileRows - 1) / kAffinePrefillTileRows;
-  const uint64_t storageRows = uint64_t{tiles} * kAffinePrefillTileRows;
-  requireBytes(input, storageRows * consumer.inputSize * 2, "input");
-  requireBytes(sums, storageRows * (consumer.inputSize / kQuantGroup) * 4, "sums");
-  graph.add("prefill_linear_q4_sums32", {input, sums},
-            Q4PrefillParams{consumer.outputSize, consumer.inputSize}, {tiles, 1, 1});
+  const uint32_t storageRows = kAffineTensorPrefill.rows.round(rows);
+  requireBytes(input, uint64_t{storageRows} * consumer.inputSize * 2, "input");
+  requireBytes(sums, uint64_t{storageRows} * (consumer.inputSize / kQuantGroup) * 4, "sums");
+  graph.add("prefill_linear_q4_sums32", {input, sums}, Q4PrefillParams{consumer.outputSize, consumer.inputSize},
+            {storageRows / kAffinePrefillTileRows, 1, 1});
 }
 PreparedInput Linear::addPrefill(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &p,
                                  metal::MetalBuffer output, metal::MetalBuffer sums, uint32_t rows,

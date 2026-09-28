@@ -18,11 +18,6 @@ namespace {
 // The segments one fused decode dispatch runs.
 constexpr size_t kFusedSegments = std::extent_v<decltype(GgufDecodeFusedParams::cols)>;
 
-// The staged decode tile that holds `rows` rows: MPP computes 16-row
-// fragments, so the tile holds 8, 16 or 32 rows and a three-lane step runs
-// the 32-row tile over four lanes of storage.
-constexpr uint32_t stagedTileRows(uint32_t rows) noexcept { return rows <= 8 ? 8 : rows <= 16 ? 16 : 32; }
-
 std::string decodeKernel(const char *format, uint32_t rows, char epilogue) {
   return std::string("gguf_decode_") + format + "_m" + std::to_string(rows) + "_" + epilogue;
 }
@@ -30,69 +25,15 @@ std::string prefillKernel(const char *format, char epilogue) {
   return std::string("gguf_prefill_") + format + "_" + epilogue;
 }
 
-// K splits of a decode tile, one rule for both tiles. A tier asks for more
-// partitions while the grid holds fewer than `threadgroups` threadgroups per
-// core and each partition would still keep `inputs` inputs; the split count
-// doubles, up to the maximum, while some tier asks. Decode K is a multiple of 256,
-// so eight partitions always hold whole 32-input groups. The rule ignores the
-// batch width: bounds that depended on it did not pay on either family.
-struct SplitTier {
-  uint32_t threadgroups;
-  uint32_t inputs;
-};
-uint32_t decodeSplits(uint32_t n, uint32_t k, uint32_t cores, std::span<const SplitTier> tiers) {
-  const uint64_t grid = n / GGUF_TILE_COLUMNS;
-  uint32_t splits = 1;
-  const auto asks = [&](const SplitTier &t) {
-    return grid * splits < uint64_t{t.threadgroups} * cores && k / (2 * splits) >= t.inputs;
-  };
-  while (splits < LinearConfig::kMaximumSplits && std::any_of(tiers.begin(), tiers.end(), asks)) splits *= 2;
-  return splits;
+// The decode tile configurations over an n x k matrix, split by their
+// families' laws.
+LinearConfig registerDecode(uint32_t n, uint32_t k, const DevicePolicy &device) {
+  const uint32_t grid = n / GGUF_TILE_COLUMNS;
+  return {LinearTile::GgufRegister, grid, LinearSimdgroups::Four, splitK(kGgufRegisterTile, device, grid, k)};
 }
-
-// Apple9 register tile (128 threads). Four of its threadgroups are resident
-// on a core at once: on a 40-core M3 Max its time steps every four per core
-// (Q4_K, K = 8192, one lane, ms: 3 per core 0.156, 4 0.157, 5 0.220, 7 0.281,
-// 8 0.286; the same steps at two to four lanes and for Q8_0). Below one wave
-// a core must fill it, down to one 256-input coefficient unit per partition;
-// below eight waves more threadgroups shrink the last wave's tail while
-// partitions of 1024 inputs amortize the partial sums (flat from eight to 32
-// waves). Over every 27B and 35B projection kind at one to four lanes and
-// 10-80 cores emulated by width, the decode step's projections run 0.95%
-// slower than the fastest split of each shape on average and 2.3% at worst
-// (sixteen threadgroups per core with two units per partition: 2.8%, 7.8%).
-constexpr SplitTier kRegisterTiers[] = {{4, 256}, {32, 1024}};
-
-// Staged tile (64 threads): one fitted tier, six threadgroups per core with
-// 512 inputs per partition. Six is not a residency (12-17 of these
-// threadgroups run at once per core on the M5 Pro): past it a core's memory
-// and neural accelerator are busy and more partitions only add reduction.
-// Over the 27B and 35B dense shapes, all formats, one to four lanes, on the
-// 16- and 20-core M5 Pro and 10-, 30- and 40-core GPUs emulated by width:
-// 3.6% over the fastest split of each shape in total and 36% at worst on a
-// 15-us shape (the register tiers in threads per core: 6.6%; the previous 32
-// per core with 1024 inputs and unsplit fused and gate/up kernels: 6.4%).
-constexpr SplitTier kStagedTiers[] = {{6, 512}};
-
-// The staged tile's tiers on a family. Apple9 cores take as many of its
-// threadgroups as of the register tile's, and its tiers: on a 40-core M3 Max
-// over the 27B and 35B dense shapes at one to four lanes they come within
-// 0-9% of each shape's fastest split (20% at one lane on 2048 x 512, a
-// 0.012 ms projection), where the fitted tier above is 13-27% slower on
-// 17408 x 5120 and 12288 x 5120 and 50% on 2048 x 512.
-std::span<const SplitTier> stagedTiers(uint32_t appleGpuFamily) noexcept {
-  if (appleGpuFamily == 9) return kRegisterTiers;
-  return kStagedTiers;
-}
-
-// The decode tile configurations over an n x k matrix on `cores` cores.
-LinearConfig registerDecode(uint32_t n, uint32_t k, uint32_t cores) {
-  return {LinearTile::GgufRegister, n / GGUF_TILE_COLUMNS, LinearSimdgroups::Four,
-          decodeSplits(n, k, cores, kRegisterTiers)};
-}
-LinearConfig stagedDecode(uint32_t n, uint32_t k, uint32_t cores, uint32_t appleGpuFamily) {
-  return {LinearTile::GgufStaged, n / GGUF_TILE_COLUMNS, LinearSimdgroups::Two,
-          decodeSplits(n, k, cores, stagedTiers(appleGpuFamily))};
+LinearConfig stagedDecode(uint32_t n, uint32_t k, const DevicePolicy &device) {
+  const uint32_t grid = n / GGUF_TILE_COLUMNS;
+  return {LinearTile::GgufStaged, grid, LinearSimdgroups::Two, splitK(kGgufStagedTile, device, grid, k)};
 }
 
 // Whether Apple9 decodes a plan's projections (a gate/up plan's two) on the
@@ -115,7 +56,7 @@ bool apple9Stages(LinearWorkload w, std::span<const Projection *const> projectio
       quantized = true;
     }
   }
-  return quantized && stagedTileRows(w.rows) == w.rows;
+  return quantized && kGgufStagedTile.rows.round(w.rows) == w.rows;
 }
 
 // The projection is the plan's matrix, and each of its segments (which tile
@@ -200,11 +141,12 @@ void LinearPlan::requireBlockConfiguration() const {
   if (c.tile == LinearTile::GgufRegister) {
     // Split boundaries fall on 256-input coefficient units.
     if (workload_.phase != LinearPhase::Decode || c.groups != n / tileColumns() ||
-        c.simdgroups != LinearSimdgroups::Four || !c.validSplits() || k / 256 < c.splits)
+        c.simdgroups != LinearSimdgroups::Four || !c.validSplits() ||
+        k / kGgufRegisterTile.split.partitionInputs < c.splits)
       throw std::invalid_argument("the register block decode tile takes the full column grid and a K unit per split");
     return;
   }
-  if (!c.validSplits() || (k / 32) % c.splits)
+  if (!c.validSplits() || (k / kGgufStagedTile.split.partitionInputs) % c.splits)
     throw std::invalid_argument("staged block splits take whole 32-input groups");
   if (workload_.phase == LinearPhase::Prefill) {
     // Four simdgroups: 128-row prefill tiles. Two: the decode tiles, which
@@ -215,13 +157,6 @@ void LinearPlan::requireBlockConfiguration() const {
   } else if (c.groups != n / tileColumns() || c.simdgroups != LinearSimdgroups::Two) {
     throw std::invalid_argument("the staged block decode tile takes the full column grid");
   }
-}
-
-uint32_t LinearPlan::blockStorageRows() const noexcept {
-  if (config_.tile == LinearTile::GgufRegister) return workload_.rows;
-  return config_.simdgroups == LinearSimdgroups::Four
-      ? (workload_.rows + GGUF_PREFILL_ROWS - 1) / GGUF_PREFILL_ROWS * GGUF_PREFILL_ROWS
-      : stagedTileRows(workload_.rows);
 }
 
 LinearScratchSize LinearPlan::blockScratchSize() const noexcept {
@@ -258,18 +193,19 @@ LinearConfig Linear::ggufBaseline(LinearWorkload w, std::span<const Projection *
   if (w.phase == LinearPhase::Prefill)
     return w.rows <= kMaximumDecodeTileRows
         ? LinearConfig{LinearTile::GgufStaged, 0, LinearSimdgroups::Two,
-                       decodeSplits(n, k, gpuCores_, stagedTiers(appleGpuFamily_))}
+                       splitK(kGgufStagedTile, device_, n / GGUF_TILE_COLUMNS, k)}
         : LinearConfig{LinearTile::GgufStaged, 0, LinearSimdgroups::Four};
   // Apple9 runs matrix operations on the FP32 pipe, so the exact register
   // kernel beats staging but for the projections apple9Stages names.
-  if (appleGpuFamily_ == 9 && !apple9Stages(w, projections)) return registerDecode(n, k, gpuCores_);
-  return stagedDecode(n, k, gpuCores_, appleGpuFamily_);
+  if (device_.primitive == Primitive::Register && !apple9Stages(w, projections))
+    return registerDecode(n, k, device_);
+  return stagedDecode(n, k, device_);
 }
 
 LinearScratchSize Linear::ggufDecodeScratchSize(LinearWorkload w) const {
   const auto [n, k] = w.matrix;
   LinearScratchSize size = LinearPlan(w, baseline(w)).scratchSize();
-  if (appleGpuFamily_ == 9) size.include(LinearPlan(w, stagedDecode(n, k, gpuCores_, appleGpuFamily_)).scratchSize());
+  if (device_.primitive == Primitive::Register) size.include(LinearPlan(w, stagedDecode(n, k, device_)).scratchSize());
   return size;
 }
 
@@ -447,8 +383,9 @@ void Linear::addGgufFloatSegments(metal::CommandGraph &graph, const LinearBuffer
 // 0.81 -> 0.36 and 0.20 -> 0.083 on 16 cores.
 FloatTile Linear::ggufFloatTile(uint32_t rows, uint32_t outputSize) const noexcept {
   const uint64_t tiles = uint64_t{(rows + 63) / 64} * ((outputSize + 31) / 32);
-  return appleGpuFamily_ != 9 && rows >= 16 && 2 * tiles >= uint64_t{3} * gpuCores_ ? FloatTile::NeuralAccelerator
-                                                                                     : FloatTile::Simdgroup;
+  return device_.primitive == Primitive::Tensor && rows >= 16 && 2 * tiles >= uint64_t{3} * device_.cores
+             ? FloatTile::NeuralAccelerator
+             : FloatTile::Simdgroup;
 }
 
 // Simdgroup: 8 columns of 32 rows per threadgroup of 16 simdgroups. Neural
