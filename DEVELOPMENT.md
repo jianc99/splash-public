@@ -497,9 +497,11 @@ cannot fill four 256-thread threadgroups per core runs that tile over two to
 eight K partitions (`LinearTile::Split128`,
 `kernels/decode/linear_q4_grid_split.metal`); the last partition of each tile
 adds the fp32 partials in split order. The split count depends on the grid per
-core, never on the batch width, so a request's sums are the same alone and
-batched. Every other projection keeps the sequential tiles
-(`dev/benchmarks/device-policy.md`).
+core and on the 16-row MPP fragments of the step's tiles (`kAffineSplitTiers`):
+one and two lanes split alike, and so do three and four, so a request's sums
+are the same alone and beside one other lane, and can differ at three and four
+lanes. Every other projection runs a sequential tile, whose outputs do not
+depend on which one (`dev/benchmarks/device-policy.md`).
 
 ### GGUF targets
 
@@ -579,7 +581,7 @@ lanes runs the 32-row tile over four lanes of storage. Prefill runs the staged k
 families, chunks of up to 32 rows on the decode tiles. Every projection splits its K across
 threadgroups by one law (`splitK` in `runtime/ops/KernelPolicy.hpp`: each tile's tiers of
 threadgroups per core and inputs per partition, from measured occupancy, Apple9's staged tile
-taking the register tile's) that does not depend on the batch width. The MoE experts
+taking the register tile's), whose GGUF tiers hold at every batch width. The MoE experts
 (`runtime/ops/MoE.cpp`) run the same numerics per family over the grouped rows: the register form in `linear_gguf_sgmatrix.metal`, the staged
 one in `kernels/shared/moe_gguf.metal`, which Apple9 takes for experts mostly in the formats it
 stages (`MoeShape::expertFormat`). The float router and alpha/beta projections run in

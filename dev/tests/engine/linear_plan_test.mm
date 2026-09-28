@@ -243,7 +243,7 @@ void anchorPlans() {
               configured(10, 16, mixer35) == split(2048, 4) &&
               configured(10, 10, mixer35) == split(2048, 2) &&
               configured(10, 40, mixer35) == split(2048, 8) &&
-              configured(10, 10, {{5120, 17408}, 8}) == LinearConfig{LinearTile::Paired128, 40} &&
+              configured(10, 10, {{5120, 17408}, 8}) == LinearConfig{LinearTile::N128, 40} &&
               configured(10, 20, {{1280, 5120}, 8}) == split(1280, 8) &&
               configured(10, 16, {{1280, 5120}, 8}) == split(1280, 4) &&
               configured(10, 16, {{256, 5120}, 8}) == split(256, 8) &&
@@ -270,9 +270,9 @@ void anchorPlans() {
                   LinearConfig{LinearTile::Simdgroup, 3880, LinearSimdgroups::Four, 1} &&
               configured(9, 80, {{248320, 2048}, 8}) ==
                   LinearConfig{LinearTile::Simdgroup, 3880, LinearSimdgroups::Four, 1} &&
-              configured(10, 20, {{40960, 5120}, 8}) ==
+              configured(10, 20, {{25600, 5120}, 8}) ==
                   LinearConfig{LinearTile::Paired256, 80, LinearSimdgroups::Four} &&
-              configured(10, 20, {{40704, 5120}, 8}) == LinearConfig{LinearTile::Paired128, 318},
+              configured(10, 20, {{25344, 5120}, 8}) == LinearConfig{LinearTile::Paired128, 80},
           "one-lane paired N256 anchors changed");
   // K % 1024 != 0 is legal for matrix tiles, and Split128 partitions differ by
   // at most one 256-input block (17 into 8 and 9, 3 into 1 and 2).
@@ -298,8 +298,7 @@ void anchorPlans() {
               configured(10, 20, {{16640, 5120}, 16}) == LinearConfig{LinearTile::N128, 75} &&
               configured(10, 16, {{16640, 5120}, 16}) == LinearConfig{LinearTile::N128, 64} &&
               configured(10, 20, {{12544, 2048}, 16}) == LinearConfig{LinearTile::N128, 98} &&
-              configured(10, 16, {{16640, 5120}, 24}) ==
-                  LinearConfig{LinearTile::N128, 96, LinearSimdgroups::Four} &&
+              configured(10, 16, {{16640, 5120}, 24}) == LinearConfig{LinearTile::N256, 36} &&
               configured(10, 20, {{16640, 5120}, 24}) ==
                   LinearConfig{LinearTile::N128, 130, LinearSimdgroups::Four} &&
               configured(10, 20, {{16640, 5120}, 32}) == LinearConfig{LinearTile::N256, 45} &&
@@ -307,10 +306,9 @@ void anchorPlans() {
               configured(9, 20, {{16640, 5120}, 8}) == LinearConfig{LinearTile::Simdgroup, 260, LinearSimdgroups::Four, 2} &&
               configured(10, 0, {{16640, 5120}, 8}) == configured(10, 32, {{16640, 5120}, 8}),
           "persistent decode groups changed for the measured shapes");
-  require(configured(10, 16, {{14336, 5120}, 24}) ==
-              LinearConfig{LinearTile::N128, 112, LinearSimdgroups::Four} &&
+  require(configured(10, 16, {{14336, 5120}, 24}) == LinearConfig{LinearTile::N256, 40} &&
           configured(10, 16, {{14336, 5120}, 32}) == LinearConfig{LinearTile::N256, 40} &&
-          configured(10, 40, {{14336, 5120}, 32}) == LinearConfig{LinearTile::N128, 112} &&
+          configured(10, 40, {{14336, 5120}, 32}) == split(14336, 2) &&
           configured(9, 40, {{14336, 5120}, 24}) ==
               LinearConfig{LinearTile::Simdgroup, 224, LinearSimdgroups::Four, 4} &&
           configured(9, 40, {{248320, 5120}, 24}) ==
@@ -318,6 +316,47 @@ void anchorPlans() {
           configured(9, 40, {{5120, 17408}, 24, LinearPhase::Decode, LinearEpilogue::Residual}) ==
               LinearConfig{LinearTile::Simdgroup, 80, LinearSimdgroups::Four, 8},
           "decode tile rules changed for the measured shapes");
+  // The tensor decode law (kAffineTensorTiles, kAffineSplitTiers), measured
+  // DRAM-cold on the 20-core M5 Pro and the 12-core M6 with other core counts
+  // emulated, and on Splish's 40-core M5 Max (device-policy.md, "Tensor decode
+  // law"). One lane: unpaired N128 from 3.2 to 4 N128 tiles per core (M6 27B
+  // mixer output, 3.33: 0.82 of the paired time; 20 cores, 35B attention
+  // input, 3.6: 0.85; 40 cores, 27B GDN input, 3.25: 0.93), paired just past
+  // three (35B GDN input on 32 cores, 3.06: paired 2.4% faster emulated) and
+  // paired N256 from five N256 tiles per core (27B attention input on 10
+  // cores: 0.86-0.89).
+  const LinearWorkload mixer27Residual{{5120, 6144}, 8, LinearPhase::Decode, LinearEpilogue::Residual};
+  require(configured(10, 12, mixer27Residual) == LinearConfig{LinearTile::N128, 40} &&
+              configured(11, 12, mixer27Residual) == LinearConfig{LinearTile::N128, 40} &&
+              configured(10, 20, {{9216, 2048}, 8}) == LinearConfig{LinearTile::N128, 72} &&
+              configured(10, 40, {{16640, 5120}, 8}) == LinearConfig{LinearTile::N128, 130} &&
+              configured(10, 32, {{12544, 2048}, 8}) == LinearConfig{LinearTile::Paired128, 98} &&
+              configured(10, 12, {{14336, 5120}, 8}) == LinearConfig{LinearTile::Paired128, 48} &&
+              configured(10, 10, {{14336, 5120}, 8}) ==
+                  LinearConfig{LinearTile::Paired256, 40, LinearSimdgroups::Four} &&
+              configured(10, 12, {{16640, 5120}, 8}) ==
+                  LinearConfig{LinearTile::Paired256, 48, LinearSimdgroups::Four},
+          "one-lane tensor tile law anchors changed");
+  // Three lanes: N256 from 3.5 N256 tiles per core (M6 27B attention input,
+  // 4.67: 0.82 of the four-simdgroup N128 time); four lanes from 1.6 (20
+  // cores, 35B attention input, 1.8: 0.80; M6, the 27B draft output, 1.67:
+  // 0.84). Steps of two MPP fragments split partitions of at least 512 inputs
+  // (35B draft 512 x 2048: eight splits at one lane, four at four lanes,
+  // 0.93 of the eight-split time) and long partitions up to three
+  // threadgroups per core (27B draft qkv on 20 cores: 0.89 of its sequential
+  // time at four lanes).
+  require(configured(10, 12, {{14336, 5120}, 24}) == LinearConfig{LinearTile::N256, 32} &&
+              configured(10, 20, {{9216, 2048}, 24}) ==
+                  LinearConfig{LinearTile::N128, 72, LinearSimdgroups::Four} &&
+              configured(10, 20, {{9216, 2048}, 32}) == LinearConfig{LinearTile::N256, 36} &&
+              configured(10, 12, {{5120, 4096}, 32}) == LinearConfig{LinearTile::N256, 20} &&
+              configured(10, 20, {{512, 2048}, 8}) == split(512, 8) &&
+              configured(10, 20, {{512, 2048}, 16}) == split(512, 8) &&
+              configured(10, 20, {{512, 2048}, 24}) == split(512, 4) &&
+              configured(10, 20, {{512, 2048}, 32}) == split(512, 4) &&
+              configured(10, 20, {{6144, 5120}, 16}) == LinearConfig{LinearTile::N128, 48} &&
+              configured(10, 20, {{6144, 5120}, 32}) == split(6144, 2),
+          "multi-lane tensor tile or split law anchors changed");
   require(configured(10, 16, {{5120, 17408}, 8}) == LinearConfig{LinearTile::Paired128, 40} &&
           configured(10, 16, {{5120, 17408}, 16}) == LinearConfig{LinearTile::N128, 40} &&
           configured(10, 16, {{6144, 5120}, 2048, LinearPhase::Prefill}) ==
@@ -1104,12 +1143,17 @@ void ggufPlans() {
 //   Apple10 tile and leaves its register tile only for plain decode
 //   projections at three and four lanes (the wide-plain rule).
 // - Floors: a split count is a power of two up to eight whose partitions keep
-//   whole steps of its kernel family and the inputs of its smallest tier.
+//   whole steps of its kernel family and the inputs of its smallest tier that
+//   holds for the plan's rows.
 // - Rows: decode plans bind their lanes' rows, but for the GGUF staged tile at
-//   three lanes (32 rows). A GGUF decode plan is the same at every batch
-//   width, and so is an affine K-split plan wherever a width runs one; Apple10
-//   splits K at every width or at none. A prefill chunk runs a decode tile
-//   exactly when it has at most 32 rows and is GGUF or on Apple9.
+//   three lanes (32 rows). The rules declared rows-dependent are the only ones
+//   that read them: the row quanta, the tensor tile law (kAffineTensorTiles:
+//   per lane count) and the split tiers' row ranges (Split128: one MPP
+//   fragment or two). So a GGUF decode plan is the same at every batch width,
+//   an affine K-split plan the same at every width whose rows the same tiers
+//   of its split law hold for and whose width runs one, and Apple10 splits K
+//   at all or none of those widths. A prefill chunk runs a decode tile exactly
+//   when it has at most 32 rows and is GGUF or on Apple9.
 // - Scale: doubling the width and the core count keeps the tile, scope and
 //   split count, and whether a decode plan takes the full column grid, but for
 //   Apple9 prefill across its one absolute core count (32).
@@ -1171,12 +1215,12 @@ void policyLaws() {
                        : t != LinearTile::Simdgroup && t != LinearTile::GgufRegister,
                    "a plan's tile is not its primitive's", p);
               const SplitLaw &law = p.kernelFamily().split;
-              const std::span<const SplitTier> tiers = law.tiers(primitive);
-              const auto smallest = [](const SplitTier &a, const SplitTier &b) { return a.inputs < b.inputs; };
+              uint32_t floor = 0;
+              for (const SplitTier &tier : law.tiers(primitive))
+                if (tier.holds(p.storageRows()) && (!floor || tier.inputs < floor)) floor = tier.inputs;
               rule(c.validSplits() &&
                        (c.splits == 1 ||
-                        (!tiers.empty() &&
-                         k >= c.splits * std::min_element(tiers.begin(), tiers.end(), smallest)->inputs &&
+                        (floor && k >= c.splits * floor &&
                          (law.evenPartitions ? k % (c.splits * law.partitionInputs) == 0
                                              : k / law.partitionInputs >= c.splits))),
                    "a split count breaks its kernel family's floors", p);
@@ -1214,13 +1258,23 @@ void policyLaws() {
                 const LinearTile t = p.configuration().tile;
                 return t == LinearTile::Simdgroup || t == LinearTile::Split128;
               };
+              // The split law deciding whether a width splits, and the tiers
+              // of it that hold for each width's rows.
+              const SplitLaw &splitLaw = gguf ? lanePlans.front().kernelFamily().split
+                                         : primitive == Primitive::Register ? kAffineRegisterTile.split
+                                                                            : kAffineTensorSplit.split;
+              const auto heldTiers = [&](const LinearPlan &p) {
+                std::vector<bool> held;
+                for (const SplitTier &tier : splitLaw.tiers(primitive)) held.push_back(tier.holds(p.storageRows()));
+                return held;
+              };
               for (const LinearPlan &p : lanePlans)
-                rule((gguf ? p.configuration() == lanePlans.front().configuration()
-                           : !splitsK(p) || std::all_of(lanePlans.begin(), lanePlans.end(), [&](const LinearPlan &q) {
-                               return !splitsK(q) || q.configuration() == p.configuration();
-                             })) &&
-                         (primitive == Primitive::Register || splitsK(p) == splitsK(lanePlans.front())),
-                     "a K-split plan depends on the batch width", p);
+                for (const LinearPlan &q : lanePlans)
+                  if (heldTiers(p) == heldTiers(q))
+                    rule(gguf ? p.configuration() == q.configuration()
+                              : (!splitsK(p) || !splitsK(q) || q.configuration() == p.configuration()) &&
+                                    (primitive == Primitive::Register || splitsK(p) == splitsK(q)),
+                         "a K-split plan depends on the batch width beyond its tiers' row ranges", p);
             }
             const LinearScratchSize prefillArena = linear.prefillScratchSize(weights.shape());
             for (const LinearEpilogue e : epilogues(LinearPhase::Prefill))
