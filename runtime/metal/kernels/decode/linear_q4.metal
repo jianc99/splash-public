@@ -117,6 +117,14 @@ Q4_DECODE_AUXILIARY(decode_linear_q4_n256_up_silu_m32, gate,
 Q4_DECODE_AUXILIARY(decode_linear_q4_n256_up_silu_m24, gate,
                     (q4_mpp_tile_batched<24, 256, false, false, 256, true>),
                     192, 256)
+// The up pass at one and two lanes, for prefill chunks of up to 16 rows on
+// the decode tiles (their decode steps run the fused gate/up kernels).
+Q4_DECODE_AUXILIARY(decode_linear_q4_n256_up_silu, gate,
+                    (q4_mpp_tile_batched<8, 256, false, false, 256, true>),
+                    64, 256)
+Q4_DECODE_AUXILIARY(decode_linear_q4_n256_up_silu_m16, gate,
+                    (q4_mpp_tile_batched<16, 256, false, false, 256, true>),
+                    128, 256)
 #undef Q4_DECODE_AFFINE
 #undef Q4_DECODE_OUTPUT
 #undef Q4_DECODE_AUXILIARY

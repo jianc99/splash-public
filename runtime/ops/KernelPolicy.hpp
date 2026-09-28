@@ -198,7 +198,10 @@ inline constexpr SplitTier kAffineSplitTiers[] = {
 inline constexpr KernelFamily kAffineTensorSplit{{SPLASH_TARGET_VERIFY_ROWS},
                                                  {{}, kAffineSplitTiers, true, 256, false}};
 
-// The affine MPP prefill tiles (prefill_linear_q4_*).
+// The affine MPP prefill tiles (prefill_linear_q4_*): 32 rows, two MPP
+// fragments, whatever the chunk holds. On the tensor primitive a chunk of up
+// to 32 rows runs its decode plan instead where that plan's tiles compute one
+// fragment or it splits K (Linear::baseline).
 inline constexpr uint32_t kAffinePrefillTileRows = 32;
 inline constexpr KernelFamily kAffineTensorPrefill{{kAffinePrefillTileRows}, {}};
 

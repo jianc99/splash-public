@@ -36,8 +36,12 @@ M5 prompts, remain offline candidates: they beat Split128 or the sequential
 tile on a few 35B one-lane shapes, together 0.55% of a one-lane step on a
 20-core M5 Pro. The obsolete Apple9 one-lane MPP branches have been removed;
 those kernels remain useful as qualification references and offline
-candidates. The measurements behind the tensor rules are in "Tensor decode
-law" below.
+candidates. Apple10 prefill chunks of up to 32 rows run the decode plan of
+their rows in whole lanes, an up-with-gate projection the up pass of the decode
+gate/up plan, where that plan's tiles compute one 16-row MPP fragment (up to
+16 rows) or it splits K; at 17-32 rows both it and the 32-row prefill tile
+compute two fragments, and only a split grid gains. The measurements behind
+the tensor rules are in "Tensor decode law" and "Tensor short prefill" below.
 
 Core count comes from the Metal device's IORegistry property. Missing metadata
 uses one 32-core estimate for every kernel (`kAssumedGpuCores`), an
@@ -64,7 +68,8 @@ when K % 1024 == 0. Apple9 additionally exposes every valid simdgroup split in
 every lane count. The maximum candidate count is 20, derived beside
 `Linear::kMaximumCandidates`; deduplication handles small grids. Apple9 prefill
 chunks of up to 32 rows list only the simdgroup splits, whose fixtures differ
-from the MPP prefill tile's; the tuner does not probe them (`kPrefillProbeRows`).
+from the MPP prefill tile's, and Apple10 chunks that run a decode plan list
+only it; the tuner does not probe them (`kPrefillProbeRows`).
 Other prefill candidates are unchanged. New candidates do not automatically
 change serving.
 
@@ -242,3 +247,55 @@ at 32 rows (32 columns per simdgroup) wins only from 3.25 tiles per core
 (the 27B's residual projections on 10-12 cores: B4 Q4 time -4.0% on the M6,
 -5.0% and -7.4% at 10 and 12 emulated cores), a rule of its own; it is kept
 off this law.
+
+## Tensor short prefill (2026-09-27)
+
+Apple10 and Apple11 prefill chunks of up to 32 rows ran the 32-row MPP
+prefill tile (`prefill_linear_q4_*`): one row of 128-column tiles, each
+streaming all of K and computing two 16-row MPP fragments however few rows
+the chunk held. Such a chunk now runs the decode plan of its rows in whole
+lanes where that plan's tiles compute one fragment (up to 16 rows) or split
+K (`Linear::baseline`); an up-with-gate projection runs the up pass of the
+decode gate/up plan (N256 up-SiLU instances, new at one and two lanes). At
+17-32 rows both tiles compute two fragments and only a split grid gains.
+Most prompts end in such a chunk: prefill stops at the last 32-token page
+boundary before the reply's generation prompt, where the state the next
+turn reuses ends, and runs the rest apart.
+
+`policy-bench --suite prefill`, the previous plans and these alternated over
+four DRAM-cold runs each after `--check` of every configuration under
+`MTL_SHADER_VALIDATION=1` (7,042 on the M5 Pro, 5,854 on the M6): projection
+time of one prefill pass (the targets' and draft-context projections by
+their counts per pass, the prefill tile's input sums included), this rule
+over the previous plans, and over each shape's fastest measured
+configuration (the decode tiles at the chunk's padded rows included):
+
+| host | cores | model | 1-8 rows | 12-16 | 20-32 | rule / fastest |
+|---|---:|---|---:|---:|---:|---:|
+| M5 Pro | 20 | 27B | 0.553 | 0.620 | 0.911 | 1.000-1.004 |
+| M5 Pro | 20 | 35B | 0.44 | 0.517 | 0.634 | 1.000-1.037 |
+| M5 Pro | 10-80 (emulated) | 27B | 0.27-0.73 | 0.31-0.80 | 0.53-1.00 | 1.000-1.081 |
+| M5 Pro | 10-80 (emulated) | 35B | 0.20-0.60 | 0.24-0.63 | 0.37-0.99 | 1.000-1.092 |
+| M6 | 12 | 27B | 0.81 | 0.854 | 1.000 | 1.002-1.026 |
+| M6 | 12 | 35B | 0.576 | 0.626 | 0.78-0.80 | 1.003-1.047 |
+| M6 | 10-20 (emulated) | 27B | 0.67-0.81 | 0.71-0.87 | 0.90-1.00 | 1.001-1.029 |
+| M6 | 10-20 (emulated) | 35B | 0.46-0.66 | 0.53-0.66 | 0.65-0.87 | 1.000-1.065 |
+
+No machine, core count, model and row count is slower. On the 20-core M5
+Pro a whole prefill pass of the MLX 4-bit models (GPU time of a chunk after
+a 512-row prefix, two alternated rounds of five repetitions) takes, for the
+27B, 65 instead of 115 ms at 1-8 rows, 72 at 12-16 and 104-105 at 20-32
+(0.90-0.92), and for the 35B 11.9 instead of 19.7 ms at one row, 0.77 of the
+time at 8, 0.84 at 16 and 0.90-0.95 at 20-32; from 33 rows nothing changes.
+Served (SPEED-Bench short row, 8 prompts of 1024 tokens, two alternated
+rounds) the time to first token falls from 541 to 506 ms (27B) and from 162.5
+to 156.3 ms (35B), and the second turn of two-turn chats from 808 to 783 ms
+and from 117.7 to 110.3 ms. The last chunk's numerics change, so outputs
+differ and with them the drafts' acceptance: over 30 prompts (each build's
+outputs repeat exactly) tokens per cycle move from 6.13 to 6.10 for the 27B
+(9 prompts up, 10 down, 11 unchanged) and from 5.152 to 5.147 for the 35B
+(14 up, 11 down, 5 unchanged).
+
+Not adopted: the decode plan wherever its padded rows are fewer than 32 (also
+at 17-24 rows without a split) takes 0.95-1.07 of this rule's time on the
+M6 (the 35B at 16 emulated cores 1.07).
