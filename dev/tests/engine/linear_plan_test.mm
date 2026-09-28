@@ -1,4 +1,5 @@
 #include "AffineQ4Fixture.hpp"
+#include "ops/ExecutionPlans.hpp"
 #include "ops/Linear.hpp"
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/QuantFormat.h"
@@ -898,6 +899,93 @@ std::set<std::string_view> floatOutputPlans() {
       rejects([&] { (void)linear.plan(w, fp32(p)); });
     }
   return kernels;
+}
+
+// Every property of a plan that encoding and arena sizing read.
+bool samePlan(const LinearPlan &a, const LinearPlan &b) {
+  return a.workload() == b.workload() && a.configuration() == b.configuration() &&
+         a.destination() == b.destination() && a.pipeline() == b.pipeline() &&
+         a.secondPipeline() == b.secondPipeline() && a.storageRows() == b.storageRows() && a.input() == b.input() &&
+         sameScratch(a.scratchSize(), b.scratchSize()) && a.sumsBytes() == b.sumsBytes() &&
+         a.gateScratchBytes() == b.gateScratchBytes() && a.downSumsBytes() == b.downSumsBytes();
+}
+bool sameMoePlan(const MoePlan &a, const MoePlan &b) {
+  return a.shape() == b.shape() && a.rows() == b.rows() && a.configuration() == b.configuration() &&
+         a.splitExperts() == b.splitExperts() && a.maximumTiles() == b.maximumTiles() &&
+         a.workspace() == b.workspace();
+}
+
+// The GPU families after Apple10 (Apple11 is the M6) run its policy: every
+// Linear plan and candidate, GGUF plan and float tile, MoE plan and arena
+// bound equals Apple10's at every core count, the unknown one included.
+void newerFamilyPlans() {
+  constexpr MoeShape affineMoe{2048, 256, 8, 512};
+  constexpr MoeShape q4kMoe{2048, 256, 8, 512, WeightLayout::Block32, GGUF_FMT_Q4K};
+  constexpr MoeShape iq2Moe{2048, 256, 8, 512, WeightLayout::Block32, GGUF_FMT_IQ2XS};
+  for (uint32_t family = 11; family <= DeviceCapabilities::kNewestAppleGpuFamily; ++family)
+    for (uint32_t cores = 0; cores <= 128; ++cores) {
+      DeviceCapabilities device;
+      device.appleGpuFamily = 10;
+      device.gpuCoreCount = cores;
+      const ExecutionPlans apple10(device);
+      device.appleGpuFamily = family;
+      const ExecutionPlans newer(device);
+      const Linear &a = apple10.linear(), &b = newer.linear();
+      const auto check = [&](bool same, const char *what, LinearWorkload w) {
+        if (!same) broke(what, family, cores, w);
+      };
+      for (const ProductionShape &shape : kProductionShapes) {
+        const auto [n, k] = shape.matrix;
+        // Apple9 stages IQ2_XS where it keeps Q4_K on its register tile.
+        const Projection affine(n, k, AffineWeights{}), q4k = blockProjection(n, k, 1),
+            iq2 = blockProjection(n, k, 1, GGUF_FMT_IQ2XS), fused = blockProjection(n, k, 3);
+        for (const Projection *p : {&affine, &q4k, &iq2, &fused}) {
+          for (uint32_t lanes = 1; lanes <= 4; ++lanes)
+            for (const auto e : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::GateUp}) {
+              if (p == &fused && e != LinearEpilogue::None) continue;
+              const LinearWorkload w{shape.matrix, lanes * 8, LinearPhase::Decode, e, p->layout()};
+              const Projection *gate = e == LinearEpilogue::GateUp ? p : nullptr;
+              check(samePlan(a.plan(w, *p, gate), b.plan(w, *p, gate)) &&
+                        std::ranges::equal(a.candidates(w), b.candidates(w), samePlan) &&
+                        sameScratch(a.decodeScratchSize(w), b.decodeScratchSize(w)),
+                    "a newer family's decode plan differs from Apple10's", w);
+            }
+          for (const uint32_t rows : {1U, 8U, 17U, 32U, 33U, 128U, 2048U})
+            for (const auto e : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::UpWithGate}) {
+              if (p == &fused && e != LinearEpilogue::None) continue;
+              const LinearWorkload w{shape.matrix, rows, LinearPhase::Prefill, e, p->layout()};
+              check(samePlan(a.plan(w, *p), b.plan(w, *p)) &&
+                        std::ranges::equal(a.candidates(w), b.candidates(w), samePlan),
+                    "a newer family's prefill plan differs from Apple10's", w);
+            }
+          const ProjectionShape projection = p->shape();
+          check(sameScratch(a.prefillScratchSize(projection), b.prefillScratchSize(projection)) &&
+                    apple10.gateUpWorkspace(projection) == newer.gateUpWorkspace(projection),
+                "a newer family's prefill or gate/up arena bound differs from Apple10's",
+                {shape.matrix, 8, LinearPhase::Decode, shape.epilogue, p->layout()});
+        }
+      }
+      for (const uint32_t n : {64U, 256U})
+        for (uint32_t rows = 1; rows <= 2048; ++rows)
+          check(a.ggufFloatTile(rows, n) == b.ggufFloatTile(rows, n), "a newer family's float tile differs from Apple10's",
+                {{n, 256}, rows, LinearPhase::Prefill});
+      for (const MoeShape shape : {affineMoe, MoeShape{768, 7, 3, 256}, q4kMoe, iq2Moe}) {
+        const auto sameCandidates = [&](const MoeWorkload &w) {
+          return std::ranges::equal(apple10.moeCandidates(w), newer.moeCandidates(w), sameMoePlan);
+        };
+        for (uint32_t lanes = 1; lanes <= 4; ++lanes)
+          require(sameMoePlan(apple10.moeDecode(shape, lanes), newer.moeDecode(shape, lanes)) &&
+                      sameCandidates({shape, lanes * 8, MoePhase::Decode}),
+                  "a newer family's MoE decode plan differs from Apple10's");
+        for (const uint32_t rows : {1U, 8U, 17U, 32U, 33U, 256U, 257U, 320U, 321U, 1040U, 2048U})
+          require(sameMoePlan(apple10.moePrefill(shape, rows), newer.moePrefill(shape, rows)) &&
+                      sameCandidates({shape, rows, MoePhase::Prefill}),
+                  "a newer family's MoE prefill plan differs from Apple10's");
+        require(apple10.moeDecodeWorkspacePerLane(shape) == newer.moeDecodeWorkspacePerLane(shape) &&
+                    apple10.moePrefillWorkspace(shape, 2048) == newer.moePrefillWorkspace(shape, 2048),
+                "a newer family's MoE arena bound differs from Apple10's");
+      }
+    }
 }
 
 // A GGUF decode projection whose split count is pinned on one core count.
@@ -1905,6 +1993,7 @@ int main(int argc, char **argv) {
       return 0;
     }
     baselinePlans();
+    newerFamilyPlans();
     affinePolicyLaws();
     ggufPlans();
     ggufCoreLaws();
