@@ -739,10 +739,11 @@ int main(int argc, char **argv) {
         gateUpPairs(backend, linear, tile);
       }
       prefill(backend, linear);
-      // The 27B out_proj then down, and gdn_in then gate/up: K 6144, 17408 and 5120.
+      // The 27B out_proj then down, and gdn_in then gate/up: K 6144, 17408 and 5120, in formats both families keep
+      // on the tile under test (Apple10 decodes one-lane IQ4_XS and Q8_0 on the register tile, tensorRegistersFormat).
       const SplitOperand out = splitOperand(backend, Q4K, {5120, 6144}, LinearEpilogue::Residual);
       const SplitOperand down = splitOperand(backend, Q6K, {5120, 17408}, LinearEpilogue::Residual);
-      const SplitOperand gdn = splitOperand(backend, IQ4XS, {12288, 5120}, LinearEpilogue::None);
+      const SplitOperand gdn = splitOperand(backend, Q5K, {12288, 5120}, LinearEpilogue::None);
       const SplitOperand gateUp = splitOperand(backend, Q4K, {17408, 5120}, LinearEpilogue::GateUp);
       for (const LinearTile tile : {LinearTile::GgufRegister, LinearTile::GgufStaged})
         for (const uint32_t lanes : {1u, kMaximumLanes}) {

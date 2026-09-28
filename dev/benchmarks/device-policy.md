@@ -299,3 +299,39 @@ outputs repeat exactly) tokens per cycle move from 6.13 to 6.10 for the 27B
 Not adopted: the decode plan wherever its padded rows are fewer than 32 (also
 at 17-24 rows without a split) takes 0.95-1.07 of this rule's time on the
 M6 (the 35B at 16 emulated cores 1.07).
+
+## GGUF register tile on the tensor primitive (2026-09-27)
+
+Apple10 and Apple11 decoded every GGUF projection on the staged tile. At one
+lane the exact register tile is faster there for two formats on both
+measured machines: over the 27B and 35B dense projections of each format
+(policy-bench `--suite gguf`, b6752e1 kernels, each tile at its split tier)
+it takes of the staged tile's time
+
+| format | M5 Pro, 20 cores | M6, 12 cores |
+|---|---:|---:|
+| IQ4_XS | 0.99 | 0.91 |
+| Q8_0 | 0.92 | 0.99 |
+| Q4_K | 1.01 | 0.99 |
+| Q5_K, Q6_K | 1.02-1.05 | 1.04-1.05 |
+| IQ3_S, IQ3_XXS, IQ2_S | 1.17-1.42 | 1.19-1.48 |
+
+and 1.1-2.5 times its time at two lanes and more. A one-lane projection (a
+gate/up plan's two) whose quantized segments are all IQ4_XS or Q8_0
+(`tensorRegistersFormat`) takes the register tile, split by Apple9's tiers,
+which come within 2% (M5 Pro) and 3.5% (M6) of each shape's fastest register
+split; Q4_K, faster on the M6 only, stays staged. The decode scratch bound
+covers both tiles at one lane, as formats are not part of a workload.
+
+The gate (four alternated runs per build, each timing both builds' plans):
+one-lane GGUF projection time falls to 0.989 (27B, IQ4_XS) and 0.928 (35B,
+Q8_0) on the M5 Pro and to 0.909 and 0.987 on the M6; every other format and
+width is unchanged. Decode steps (four ABBA rounds, 512 prompt tokens): the
+35B UD-Q4_K_M at one lane takes 26.49 instead of 26.96 ms on the M5 Pro
+(0.983) and the 27B UD-Q4_K_M 0.994 there and 0.983 on the M6 (131.2 instead
+of 133.5 ms; only one lane fits in its 24 GB), the 27B UD-IQ3_XXS 0.996 on the
+M6; no width is slower beyond its noise. The one-lane numerics change, so
+outputs differ:
+over 96 prompts of the SPEED-Bench short, 8k and 16k rows the 35B's tokens
+per cycle move from 4.571 to 4.543 (42 prompts up, 52 down), over the 32
+short ones the 27B's from 6.153 to 6.130 (16 up, 12 down).

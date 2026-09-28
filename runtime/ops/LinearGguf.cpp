@@ -61,6 +61,29 @@ bool apple9Stages(LinearWorkload w, std::span<const Projection *const> projectio
   return quantized && kGgufStagedTile.rows.round(w.rows) == w.rows;
 }
 
+// Whether the tensor primitive decodes a plan's projections on the register
+// tile: at one lane, where every quantized segment is in a format of
+// tensorRegistersFormat. Measured DRAM-cold (policy-bench, b6752e1) over the
+// 27B and 35B dense GGUF shapes, each at its split tier, 2026-09-27
+// (device-policy.md, "GGUF register tile on the tensor primitive"): at one
+// lane the register tile takes 0.99 (20-core M5 Pro) and 0.91 (12-core M6) of
+// the staged tile's time on IQ4_XS, 0.92 and 0.99 on Q8_0, and 1.01-1.47 on
+// the other formats but Q4_K on the M6 (0.99); at two lanes and more it takes
+// 1.1-2.5x.
+bool tensorRegisters(LinearWorkload w, std::span<const Projection *const> projections) {
+  if (w.rows != SPLASH_TARGET_VERIFY_ROWS) return false;
+  bool quantized = false;
+  for (const Projection *p : projections) {
+    if (!p) continue;
+    for (const QuantizedSegment &s : p->blocks().segments) {
+      if (s.isFloat()) continue;
+      if (!tensorRegistersFormat(s.formatId)) return false;
+      quantized = true;
+    }
+  }
+  return quantized;
+}
+
 // The projection is the plan's matrix, and each of its segments (which tile
 // its leading columns) fills whole column tiles of its kernels: 64 columns
 // for a quantized segment, 8 for a float one (addGgufFloat; F32 alpha/beta
@@ -197,17 +220,23 @@ LinearConfig Linear::ggufBaseline(LinearWorkload w, std::span<const Projection *
                                                            stagedDecode(n, k, w.rows, device_).splits}
                                             : LinearConfig{LinearTile::GgufStaged, 0, LinearSimdgroups::Four};
   // Apple9 runs matrix operations on the FP32 pipe, so the exact register
-  // kernel beats staging but for the projections apple9Stages names.
-  if (device_.primitive == Primitive::Register && !apple9Stages(w, projections))
-    return registerDecode(n, k, w.rows, device_);
-  return stagedDecode(n, k, w.rows, device_);
+  // kernel beats staging but for the projections apple9Stages names; the
+  // tensor primitive stages but for those tensorRegisters names.
+  const bool registerTile = device_.primitive == Primitive::Register ? !apple9Stages(w, projections)
+                                                                     : tensorRegisters(w, projections);
+  return registerTile ? registerDecode(n, k, w.rows, device_) : stagedDecode(n, k, w.rows, device_);
 }
 
+// Formats are not part of a workload: the bound covers both tiles wherever a
+// projection's formats may choose either (Apple9 at every width, the tensor
+// primitive at one lane).
 LinearScratchSize Linear::ggufDecodeScratchSize(LinearWorkload w) const {
   const auto [n, k] = w.matrix;
   LinearScratchSize size = LinearPlan(w, baseline(w)).scratchSize();
   if (device_.primitive == Primitive::Register)
     size.include(LinearPlan(w, stagedDecode(n, k, w.rows, device_)).scratchSize());
+  else if (w.rows == SPLASH_TARGET_VERIFY_ROWS)
+    size.include(LinearPlan(w, registerDecode(n, k, w.rows, device_)).scratchSize());
   return size;
 }
 
@@ -418,6 +447,9 @@ bool apple9StagesFormat(uint32_t format) noexcept {
   case GGUF_FMT_IQ1S: case GGUF_FMT_IQ1M: return true;
   default: return false;
   }
+}
+bool tensorRegistersFormat(uint32_t format) noexcept {
+  return format == GGUF_FMT_IQ4XS || format == GGUF_FMT_Q80;
 }
 
 QuantizedSegment QuantizedSegment::planes(uint32_t formatId, uint32_t outputSize, uint32_t inputSize,
