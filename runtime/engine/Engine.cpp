@@ -17,9 +17,10 @@ constexpr double kHealthCheckIntervalMilliseconds = 1000.0;
 // A mask request the server leaves unanswered this long fails its request;
 // the batch's command slot is not held longer.
 constexpr int kMaskWaitLimitMilliseconds = 5000;
-// A junction costs a snapshot, a command split and up to a draft window of
-// draft-context rows; a later request must save at least that much prefill.
-constexpr uint32_t kMinimumJunctionGain = model::ExecutionLimits::draftContextTokens;
+// A state off the checkpoint grid, such as a junction, costs a snapshot, a
+// command split and up to a draft window of draft-context rows; a later
+// request must save at least that much prefill.
+constexpr uint32_t kMinimumStateGain = model::ExecutionLimits::draftContextTokens;
 
 // What the request's KV blocks are cached under beside its tokens.
 PromptIdentity promptIdentity(const EngineRequest &request) noexcept {
@@ -971,8 +972,19 @@ DraftContextPlan Engine::configureDraftStatePlan(Request &active,
            stateBoundary, latestReplayBoundary, config_.prefillCheckpointTokens)) {
     addStateBoundary(active, stateBoundary, checkpoint, true);
   }
-  if (junctionBoundary >= stateBoundary + kMinimumJunctionGain)
+  if (junctionBoundary >= stateBoundary + kMinimumStateGain)
     addStateBoundary(active, stateBoundary, junctionBoundary, false);
+  // A request that changes the prompt's last user message diverges where it
+  // starts: a progress point there, when it saves a draft window over the
+  // point before it.
+  const uint32_t lastUserMessage = active.request.lastUserMessageTokens /
+                                   KvCache::pageTokens * KvCache::pageTokens;
+  uint32_t previous = stateBoundary;
+  for (const Request::StateBoundary &point : active.stateBoundaries)
+    if (point.tokens < lastUserMessage)
+      previous = point.tokens;
+  if (lastUserMessage >= previous + kMinimumStateGain)
+    addStateBoundary(active, stateBoundary, lastUserMessage, true);
   addStateBoundary(active, stateBoundary, latestReplayBoundary,
                    latestReplayBoundary != promptReplayBoundary(active));
   // A resumed lane below its prompt's replay point lost that state; it

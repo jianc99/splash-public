@@ -44,7 +44,7 @@ _MAGIC = b"SPLH"
 _HEADER = struct.Struct("<4sHHQ")
 # Replay can update the integer deadlines without decoding sampling floats.
 _REQUEST_HEAD = struct.Struct("<QBBQQ")
-_REQUEST = struct.Struct(_REQUEST_HEAD.format + "IIIffIffffQIIIQQ")
+_REQUEST = struct.Struct(_REQUEST_HEAD.format + "IIIffIffffQIIIQQI")
 _IMAGE_SPAN = struct.Struct("<IIIIQQ")
 _CANCEL = struct.Struct("<Q")
 _MASK_RESPONSE = struct.Struct("<QQI")
@@ -65,7 +65,7 @@ assert (
     and sys.byteorder == "little"
 )
 assert _HEADER.size == FRAME_HEADER_BYTES
-assert _REQUEST.size == 102
+assert _REQUEST.size == 106
 assert _IMAGE_SPAN.size == 32
 assert _READY.size == 9
 assert _START.size == 16
@@ -263,6 +263,9 @@ class RequestFrame:
     # The request's cache_salt hashed to 128 bits (Frontend._cache_salt);
     # zero without one.
     cache_salt: int
+    # The prompt tokens before its last user message, where the engine may
+    # keep a state; zero when unknown. It ends before the generation prompt.
+    last_user_message_tokens: int = 0
 
 
 @dataclass(slots=True, frozen=True)
@@ -667,6 +670,13 @@ def _validated_request(
         generation = _u32(request.generation_prompt_tokens, "generation prompt tokens")
         if generation >= len(prompt):
             raise ValueError("generation prompt must leave a prompt token")
+        last_user_message = _u32(
+            request.last_user_message_tokens, "last user message tokens"
+        )
+        if last_user_message > len(prompt) - generation:
+            raise ValueError(
+                "last user message must start before the generation prompt"
+            )
         if scores and (request.image_spans or request.image_pixels):
             raise ValueError("score requests are text-only")
         if scores and (
@@ -777,6 +787,7 @@ def _request_frame(request: RequestFrame) -> bytearray:
         request.flags,
         request.cache_salt & 0xFFFFFFFFFFFFFFFF,
         request.cache_salt >> 64,
+        request.last_user_message_tokens,
     )
     for index, span in enumerate(request.image_spans):
         _IMAGE_SPAN.pack_into(

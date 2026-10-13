@@ -334,6 +334,11 @@ std::optional<ProtocolIssue> validateRequest(const RequestFrame &request,
     return invalid(IssueCode::InvalidCount,
                    "generation prompt must leave a prompt token");
   }
+  if (request.lastUserMessageTokens >
+      request.promptTokens.size() - request.generationPromptTokens) {
+    return invalid(IssueCode::InvalidCount,
+                   "last user message must start before the generation prompt");
+  }
   if (scoring) {
     if (!request.imageSpans.empty()) {
       return invalid(IssueCode::InvalidCount,
@@ -690,7 +695,8 @@ ProtocolResult<ClientMessage> decodeRequest(std::vector<uint8_t> &&payload,
       !reader.u64(request.sampling.seed) || !reader.u32(scoreCount) ||
       !reader.u32(request.generationPromptTokens) ||
       !reader.u32(request.flags) || !reader.u64(request.cacheSalt.lo) ||
-      !reader.u64(request.cacheSalt.hi)) {
+      !reader.u64(request.cacheSalt.hi) ||
+      !reader.u32(request.lastUserMessageTokens)) {
     return failure<ClientMessage>(
         makeIssue(FailureClass::ProtocolFatal, IssueCode::InvalidPayloadLength,
                   0, "request fixed payload is truncated"));

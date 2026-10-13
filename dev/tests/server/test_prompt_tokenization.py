@@ -54,6 +54,33 @@ class PromptTokenizationTests(unittest.TestCase):
         self.assertEqual(actual, expected)
         return actual
 
+    def test_tokens_before_end_at_the_last_message_end(self):
+        text = (
+            "<|im_start|>system\nRelease notes.<|im_end|>\n"
+            "<|im_start|>user\nHello world!<|im_end|>\n<|im_start|>assistant\n"
+        )
+        tokens = self.assert_encoding(text)
+        first_end = text.index("<|im_end|>") + len("<|im_end|>")
+        last_end = text.rindex("<|im_end|>") + len("<|im_end|>")
+        for end, prefix in (
+            (text.index("Hello"), text[:first_end]),
+            (len(text), text[:last_end]),
+            (text.index("Release"), ""),
+        ):
+            with self.subTest(end=end):
+                expected = self.tokenizer(prefix, add_special_tokens=False)["input_ids"]
+                count = self.cache.tokens_before(text, tokens, end)
+                self.assertEqual(count, len(expected))
+                self.assertEqual(tokens[:count], expected)
+        # Tokens holding fewer markers than the text, as when another added
+        # token consumed one, give no boundary; nor does a tokenizer that may
+        # not split at a marker.
+        consumed = list(tokens)
+        consumed.remove(self.cache.marker_id)
+        self.assertEqual(self.cache.tokens_before(text, consumed, len(text)), 0)
+        self.cache.enabled = False
+        self.assertEqual(self.cache.tokens_before(text, tokens, len(text)), 0)
+
     def test_extensions_unicode_and_changed_history_match_full_encoding(self):
         randomizer = random.Random(4321)
         fragments = [

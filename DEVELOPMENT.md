@@ -1996,7 +1996,18 @@ well: reclaim takes checkpoints first and writes the states it evicts to the
 SSD, this one too (153 MiB for 27B), and one published straight to the SSD,
 when no RAM slot took it, stays there. The persistent cache's hourly write limit
 does not pause these writes, and a full quota makes room for one by dropping the
-oldest copy, perhaps an older conversation's restore point.
+oldest copy, perhaps an older conversation's restore point. A chat request also
+plans a checkpoint where its last user message starts (at the end of the message
+before it), when that lies at least a draft window (2048 tokens) past the point
+before it. Unless a long last message holds a later one, that is the checkpoint
+the prompt keeps, so a request that changes the message, such as an edited or
+retried question, resumes there. It replaces the grid checkpoint before it where
+the prefill planned one; a prefill that planned none, such as a chat turn of a
+few thousand tokens, keeps one more checkpoint than before, which reclaim takes
+first like any other. The frontend places that start by rendering the prompt
+again with a mark where the message's content begins, and places none when the
+mark changes the rest of the render or the tokenizer may not split where the
+message before ends.
 Contended prefill adapts toward a 500 ms slice, keeping
 2048-token chunks for long unopposed work. Without contention, a prompt that can
 finish within one 2048-token chunk ends its chunk at its last row instead of

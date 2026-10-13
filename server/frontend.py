@@ -123,6 +123,12 @@ COMPLETION_DEFAULT_MAX_TOKENS = 16
 
 # A stable marker lets repeated image requests reuse the compiled template.
 IMAGE_RENDER_MARKER = f"__splash_image_{secrets.token_hex(16)}__"
+# Marks where the last user message's content starts in a second render.
+USER_MESSAGE_MARKER = f"__splash_user_{secrets.token_hex(16)}__"
+# The engine keeps a state where the last user message starts only when that
+# saves a draft window of prefill (Engine.cpp kMinimumStateGain), so a shorter
+# prompt is not rendered again to place it.
+MIN_STATE_GAIN_TOKENS = 2048
 
 
 def _generation_prompt(probed, rendered, tokens):
@@ -225,6 +231,8 @@ class RenderedPrompt:
     thinking: bool
     # Images precede the generation prompt; expanding them keeps this count.
     generation_prompt_tokens: int
+    # The tokens before the last user message, images unexpanded; 0 unknown.
+    last_user_message_tokens: int = 0
 
 
 @dataclass(frozen=True)
@@ -934,11 +942,16 @@ class Frontend:
             )
             raise APIError(400, "messages could not be rendered") from error
         remaining_request_time(deadline)
-        thinking, generation_prompt_tokens = False, 0
+        thinking, generation_prompt_tokens, last_user_message_tokens = False, 0, 0
         if add_generation_prompt:
             thinking, generation_prompt_tokens = _generation_prompt(
                 chat_template.generation_prompt(template), rendered, tokens
             )
+            expanded = len(tokens) + sum(image.tokens - 1 for image in images)
+            if expanded - generation_prompt_tokens >= MIN_STATE_GAIN_TOKENS:
+                last_user_message_tokens = self._last_user_message_tokens(
+                    prompt.messages, template, rendered, tokens
+                )
         requested = template.get("enable_thinking")
         if (
             add_generation_prompt
@@ -949,8 +962,47 @@ class Frontend:
                 400, "chat template does not support the requested thinking mode"
             )
         return RenderedPrompt(
-            rendered, tokens, images, positions, thinking, generation_prompt_tokens
+            rendered,
+            tokens,
+            images,
+            positions,
+            thinking,
+            generation_prompt_tokens,
+            last_user_message_tokens,
         )
+
+    def _last_user_message_tokens(self, messages, template, rendered, tokens):
+        """The prompt tokens before its last user message, where a request that
+        changes that message diverges from this one; 0 when none precede it or
+        the template's rendering cannot place it. A second render marks the
+        start of that message's content and counts only if removing the mark
+        gives the prompt as rendered; the count ends at the last message end
+        before the mark, where the tokenizer splits."""
+        last = max(
+            (i for i, message in enumerate(messages) if message["role"] == "user"),
+            default=None,
+        )
+        content = None if last is None else messages[last].get("content")
+        if isinstance(content, str):
+            content = USER_MESSAGE_MARKER + content
+        elif isinstance(content, list):
+            content = [{"type": "text", "text": USER_MESSAGE_MARKER}, *content]
+        else:
+            return 0
+        marked = [
+            *messages[:last],
+            {**messages[last], "content": content},
+            *messages[last + 1 :],
+        ]
+        try:
+            text = self._apply_chat_template(marked, template)
+        except Exception:
+            # A template may refuse the changed content; the count is optional.
+            return 0
+        prefix, found, suffix = text.partition(USER_MESSAGE_MARKER)
+        if not found or prefix + suffix != rendered:
+            return 0
+        return self.prompt_tokenizer.tokens_before(rendered, tokens, len(prefix))
 
     def _prepare(
         self,
@@ -1069,6 +1121,12 @@ class Frontend:
             image_owner=prepared_images if prepared_images else None,
             tools_signature=tools_signature,
             generation_prompt_tokens=rendered.generation_prompt_tokens,
+            last_user_message_tokens=rendered.last_user_message_tokens
+            + sum(
+                image.tokens - 1
+                for image, position in zip(prepared_images, image_positions)
+                if position < rendered.last_user_message_tokens
+            ),
             output_clamped_to_context=requested is not None and max_new < requested,
         )
 

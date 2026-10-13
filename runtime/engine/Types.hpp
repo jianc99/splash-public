@@ -60,6 +60,9 @@ struct EngineRequest final {
   // reusable state is kept before them. Zero when unknown; it must leave at
   // least one prompt token.
   uint32_t generationPromptTokens = 0;
+  // The prompt tokens before its last user message, where a request that
+  // changes that message diverges; zero when unknown.
+  uint32_t lastUserMessageTokens = 0;
   std::vector<ImageSpan> images;
   std::vector<uint8_t> imagePixels;
   uint32_t maxNewTokens = 0;

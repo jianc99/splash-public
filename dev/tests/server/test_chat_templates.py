@@ -4,7 +4,15 @@ import unittest
 from pathlib import Path
 
 from jinja2 import TemplateError
-from tokenizers import AddedToken, Tokenizer, decoders, models, pre_tokenizers, trainers
+from tokenizers import (
+    AddedToken,
+    Tokenizer,
+    decoders,
+    models,
+    pre_tokenizers,
+    processors,
+    trainers,
+)
 from transformers import PreTrainedTokenizerFast
 
 from dev.tests import server_fixtures as fixtures
@@ -94,9 +102,11 @@ def tokenizer(template):
 def chat_tokenizer(template, *special):
     """A byte-level BPE tokenizer for `template`, with `special` and the think
     tags as added tokens. Like Qwen's, it encodes `assistant` and a blank line
-    as one token each."""
+    as one token each, and its byte-level post-processing lets prompts split
+    where a message ends."""
     backend = Tokenizer(models.BPE())
     backend.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    backend.post_processor = processors.ByteLevel(trim_offsets=False)
     backend.decoder = decoders.ByteLevel()
     backend.train_from_iterator(
         ["assistant\n\n"],
@@ -624,6 +634,144 @@ class ChatTemplateFrontendTests(unittest.TestCase):
             job.prompt_tokens[: -job.generation_prompt_tokens],
             app.tokenizer(history, add_special_tokens=False)["input_ids"],
         )
+
+    def test_requests_carry_where_their_last_user_message_starts(self):
+        """A request that changes its last user message parts from this one
+        where the message before it ends. Every upstream template places that
+        end, with thinking or without and with the assistant's tool turns
+        after the message, and a sibling that changes the message shares every
+        token before it; an image before it widens it as it expands."""
+        history = [
+            {"role": "system", "content": "Release notes. " * 200},
+            {"role": "user", "content": "Earlier question."},
+            {
+                "role": "assistant",
+                "content": "Earlier answer.",
+                "reasoning_content": "Earlier reasoning.",
+            },
+        ]
+        tool_turns = [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "bash", "arguments": '{"command": "ls"}'},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "README.md"},
+        ]
+        image = {
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": fixtures.png_data_url()}},
+                {"type": "text", "text": "Earlier question."},
+            ],
+        }
+        for name in UPSTREAM:
+            app = fixtures.make_frontend(
+                chat_tokenizer(
+                    source(name),
+                    "<|im_start|>",
+                    "<|im_end|>",
+                    api_shapes.IMAGE_PAD_TOKEN,
+                ),
+                None,
+                "test-model",
+                8192,
+                10,
+                2,
+                vision=True,
+            )
+            end = app.tokenizer.convert_tokens_to_ids("<|im_end|>")
+            for effort in ("none", "high"):
+                for turns in ([], tool_turns):
+                    with self.subTest(name=name, effort=effort, tools=bool(turns)):
+
+                        def prepare(question, earlier=history):
+                            messages = [
+                                *earlier,
+                                {"role": "user", "content": question},
+                                *turns,
+                            ]
+                            body = {
+                                "model": "test-model",
+                                "reasoning_effort": effort,
+                                "messages": messages,
+                            }
+                            return app.prepare(body, deadline=fixtures.FOREVER)
+
+                        job, sibling = prepare("Latest."), prepare("Changed.")
+                        boundary = job.last_user_message_tokens
+                        self.assertEqual(job.prompt_tokens[boundary - 1], end)
+                        self.assertTrue(
+                            app.tokenizer.decode(
+                                job.prompt_tokens[boundary:]
+                            ).startswith("\n<|im_start|>user\nLatest.")
+                        )
+                        self.assertEqual(sibling.last_user_message_tokens, boundary)
+                        self.assertEqual(
+                            job.prompt_tokens[:boundary],
+                            sibling.prompt_tokens[:boundary],
+                        )
+                        # The image's expansion moves the start, not what follows.
+                        with_image = prepare(
+                            "Latest.", [*history[:1], image, *history[2:]]
+                        )
+                        start = with_image.last_user_message_tokens
+                        span = with_image.image_spans[0]
+                        self.assertLess(span.offset + span.tokens, start)
+                        self.assertEqual(
+                            with_image.prompt_tokens[start:],
+                            job.prompt_tokens[boundary:],
+                        )
+
+    def test_last_user_message_start_is_optional(self):
+        """A prompt too short to save a draft window renders once and places no
+        start, as does a template that refuses the marked content or renders it
+        other than as the prompt it marks; the request still renders."""
+        app = chat_frontend(source("qwen36"))
+        original = app._apply_chat_template
+        renders = []
+
+        def counting(messages, template):
+            renders.append(messages)
+            return original(messages, template)
+
+        def refusing(messages, template):
+            if request_frontend.USER_MESSAGE_MARKER in str(messages):
+                raise TemplateError("the template refuses the marked content")
+            return original(messages, template)
+
+        def changing(messages, template):
+            text = original(messages, template)
+            if request_frontend.USER_MESSAGE_MARKER in str(messages):
+                text = text.replace("Release", "Changed")
+            return text
+
+        def body(system):
+            messages = [
+                {"role": "system", "content": system},
+                {"role": "user", "content": "Question."},
+            ]
+            return {"model": "test-model", "messages": messages}
+
+        app._apply_chat_template = counting
+        short = app.prepare(body("Release notes."), deadline=fixtures.FOREVER)
+        self.assertEqual((short.last_user_message_tokens, len(renders)), (0, 1))
+        long = body("Release notes. " * 200)
+        self.assertGreater(
+            app.prepare(long, deadline=fixtures.FOREVER).last_user_message_tokens, 0
+        )
+        for render in (refusing, changing):
+            with self.subTest(render=render.__name__):
+                app._apply_chat_template = render
+                job = app.prepare(long, deadline=fixtures.FOREVER)
+                self.assertEqual(job.last_user_message_tokens, 0)
+                self.assertGreater(len(job.prompt_tokens), 0)
 
     def test_generation_prompts_need_no_turn_marker(self):
         """Whatever a chat format's markers, the generation prompt is what its

@@ -119,6 +119,8 @@ class Job:
     # Trailing prompt tokens of the chat template's generation prompt; zero
     # when unknown.
     generation_prompt_tokens: int = 0
+    # The prompt tokens before its last user message; zero when unknown.
+    last_user_message_tokens: int = 0
     flags: wire.RequestFlag = wire.RequestFlag(0)
     # The request asked for more output than the context leaves, and
     # max_new_tokens was lowered to what it leaves.
@@ -614,6 +616,7 @@ class NativeBackend:
             generation_prompt_tokens=job.generation_prompt_tokens,
             flags=job.flags,
             cache_salt=job.cache_salt,
+            last_user_message_tokens=job.last_user_message_tokens,
         )
         return engine_runtime.GenerationRequest(
             frame, job.deadline, self._mask_provider(job), job.image_owner

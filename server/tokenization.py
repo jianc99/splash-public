@@ -121,6 +121,22 @@ class PromptTokenizer:
                     self.entries.put(prefix, token_bytes, size)
         return tokens + self._encode(text[boundary:])
 
+    def tokens_before(self, text, tokens, end):
+        """How many of `tokens`, the encoding of `text`, encode its text up to
+        the last MARKER before `end`, where the tokenizer splits; 0 when there
+        is none or this tokenizer does not split there."""
+        if not self.enabled:
+            return 0
+        boundary = text.rfind(self.MARKER, 0, end)
+        # Each literal MARKER is a token boundary unless another added token
+        # consumed part of one (see encode), which leaves fewer marker tokens.
+        if boundary < 0 or text.count(self.MARKER) != tokens.count(self.marker_id):
+            return 0
+        position = -1
+        for _ in range(text.count(self.MARKER, 0, boundary + len(self.MARKER))):
+            position = tokens.index(self.marker_id, position + 1)
+        return position + 1
+
     def split(self, text):
         """`text` cut just past its last MARKER where the tokenizer splits it
         there: the tokens before the cut, and the text after it, which

@@ -101,6 +101,7 @@ FrameType write(Writer &out, const RequestFrame &request) {
   out.u32(request.flags);
   out.u64(request.cacheSalt.lo);
   out.u64(request.cacheSalt.hi);
+  out.u32(request.lastUserMessageTokens);
   out.words(request.promptTokens);
   for (const ImageSpan &span : request.imageSpans) {
     out.u32(span.offset);

@@ -8,7 +8,7 @@ from dataclasses import replace
 from server import protocol as wire
 
 _HEADER = struct.Struct("<4sHHQ")
-_REQUEST = struct.Struct("<QBBQQIIIffIffffQIIIQQ")
+_REQUEST = struct.Struct("<QBBQQIIIffIffffQIIIQQI")
 _IMAGE_SPAN = struct.Struct("<IIIIQQ")
 _MASK_RESPONSE = struct.Struct("<QQI")
 _ID = struct.Struct("<Q")
@@ -156,6 +156,7 @@ def _decode_request(payload: bytes) -> wire.RequestFrame:
         flags,
         salt_lo,
         salt_hi,
+        last_user_message_tokens,
     ) = _REQUEST.unpack_from(payload)
     offset = _REQUEST.size
     prompt = _words(payload, offset, prompt_count)
@@ -186,6 +187,7 @@ def _decode_request(payload: bytes) -> wire.RequestFrame:
         generation_prompt_tokens,
         wire.RequestFlag(flags),
         salt_lo | salt_hi << 64,
+        last_user_message_tokens,
     )
 
 

@@ -6432,6 +6432,53 @@ void testSecondConversationResumesFromTheLastCheckpoint() {
           "the third conversation did not resume from the junction");
 }
 
+// A request that changes the prompt's last user message, an edited or
+// retried question, parts from it where that message starts. A checkpoint
+// is planned there when it lies a draft window past the one before it, and
+// as the last it is the one the prompt keeps, so the sibling resumes there;
+// the prompt keeps no more checkpoints than without it. Closer to the
+// checkpoint before, it is not planned, and the sibling resumes from that.
+void testSiblingResumesWhereTheLastUserMessageStarts() {
+  // An 11201-token prompt, the history before its last user message shared:
+  // checkpoints at 4096 and 8192, the replay state at 11200.
+  std::vector<uint32_t> history(11000);
+  std::iota(history.begin(), history.end(), 1);
+  const auto ask = [&](uint64_t id, uint32_t messageStart, uint32_t first) {
+    std::vector<uint32_t> prompt(history.begin(), history.begin() + messageStart);
+    prompt.resize(11201);
+    std::iota(prompt.begin() + messageStart, prompt.end(), first);
+    EngineRequest value = request(id, prompt);
+    value.lastUserMessageTokens = messageStart;
+    return value;
+  };
+  // The message starts at 11000 (its page at 10976), or at 9000, under a
+  // draft window past the checkpoint at 8192.
+  for (const auto [messageStart, kept] :
+       {std::pair<uint32_t, uint32_t>{11000, 10976}, {9000, 8192}}) {
+    test::TestKvStorage storage(1024, 4096, 4);
+    KvPool pool(storage, 0);
+    engine::Cache resources(pool, nullptr, nullptr);
+    Executor executor(1);
+    Events events;
+    engine::Engine engine(test::engineConfig(), resources, executor, events);
+    guardReleases(storage, engine);
+    engine.submit(ask(1, messageStart, 100'000));
+    runUntilIdle(engine);
+    const auto counters = engine.snapshot();
+    require(counters.checkpointPublications == (kept == 8192 ? 2u : 3u) &&
+                counters.resources.stateCache.checkpointEntries == 1 &&
+                counters.resources.stateCache.entries == 2,
+            "the prompt did not keep one checkpoint, at its last user message");
+    const uint32_t computed = executor.prefillRows;
+    engine.submit(ask(2, messageStart, 200'000));
+    runUntilIdle(engine);
+    require(events.starts.back() == kept &&
+                executor.prefillRows - computed == 11201 - kept &&
+                events.completedCount == 2 && events.failedCount == 0,
+            "a changed last user message did not resume where it starts");
+  }
+}
+
 // A prompt that shares less than one checkpoint interval with a cached one
 // finds no checkpoint below where they part, and one shorter than an
 // interval plans none: such a request starts from the start and keeps no
@@ -9298,6 +9345,7 @@ int main() {
     testFinalStateRecyclesItsCheckpointBeforeUnrelatedHotState();
     testJunctionRetiresEarlierProgressPoint();
     testSecondConversationResumesFromTheLastCheckpoint();
+    testSiblingResumesWhereTheLastUserMessageStarts();
     testShortSharedPrefixFindsAndKeepsNoCheckpoint();
     testKeptCheckpointGoesFirstUnderPressure();
     testSharedCheckpointSurvivesPeerReplayPoint();

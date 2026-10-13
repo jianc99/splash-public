@@ -36,6 +36,7 @@ REQUEST_FIELDS = (
     "flags",
     "cache_salt_lo",
     "cache_salt_hi",
+    "last_user_message_tokens",
 )
 assert len(REQUEST_FIELDS) == len(p._REQUEST.format) - 1
 OFFSET = dict(
@@ -68,6 +69,7 @@ def example_request():
         constraint=p.ConstraintMode.TOKEN_MASK,
         generation_prompt_tokens=2,
         cache_salt=0x00112233445566778899AABBCCDDEEFF,
+        last_user_message_tokens=1,
     )
 
 
@@ -422,6 +424,7 @@ class ProtocolPythonTests(unittest.TestCase):
                 int(request.flags),
                 request.cache_salt & 0xFFFFFFFFFFFFFFFF,
                 request.cache_salt >> 64,
+                request.last_user_message_tokens,
             )
             + struct.pack(f"<{len(request.prompt_tokens)}I", *request.prompt_tokens)
             + struct.pack(p._IMAGE_SPAN.format, *astuple(span))
@@ -435,6 +438,24 @@ class ProtocolPythonTests(unittest.TestCase):
             len(payload),
         )
         self.assertEqual(frame, header + payload)
+
+    def test_last_user_message_starts_before_the_generation_prompt(self):
+        request = example_request()
+        reusable = len(request.prompt_tokens) - request.generation_prompt_tokens
+        for value in (-1, True, 1.5, reusable + 1, 0xFFFFFFFF):
+            with self.subTest(value=value):
+                issue = self.assert_protocol_error(
+                    p.FailureClass.REQUEST_ERROR,
+                    p.IssueCode.INVALID_COUNT,
+                    lambda value=value: p.serialize_message(
+                        replace(request, last_user_message_tokens=value)
+                    ),
+                )
+                self.assertEqual(issue.request_id, request.request_id)
+        for value in (0, reusable):
+            with self.subTest(value=value):
+                valid = replace(request, last_user_message_tokens=value)
+                self.assertEqual(decode_client(p.serialize_message(valid)), valid)
 
     def test_request_validation_runs_once(self):
         labels = []
@@ -623,6 +644,12 @@ class ProtocolPythonTests(unittest.TestCase):
                 "<II", wire, p.FRAME_HEADER_BYTES + OFFSET["generation_prompt_tokens"]
             ),
             (request.generation_prompt_tokens, request.flags),
+        )
+        self.assertEqual(
+            struct.unpack_from(
+                "<I", wire, p.FRAME_HEADER_BYTES + OFFSET["last_user_message_tokens"]
+            )[0],
+            request.last_user_message_tokens,
         )
         self.assertEqual(
             struct.unpack_from(
