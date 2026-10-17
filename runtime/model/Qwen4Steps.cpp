@@ -58,11 +58,9 @@ uint32_t priorCount(const QwenTargetGeometry &g) { return g.pleNgram - 1; }
 
 // A scratch tensor (Qwen4Scratch): its bytes per row of a step and its fixed
 // bytes, and whether a prefill group's chunks each hold their own: the
-// residual streams, the injection weights and the branch, which a chunk's
-// MoE writes after the group's load of the layer's experts and the next
-// layer's first mix of the chunk adds to its streams
-// (QwenTarget::addPrefillLayers), and the inputs the CPU writes before the
-// command runs.
+// residual streams and injection weights, which a layer's combine reads after
+// the group's load of the layer's experts (QwenTarget::addPrefill), and the
+// inputs the CPU writes before the command runs.
 struct Tensor final {
   metal::MetalBuffer Qwen4Scratch::*field;
   uint64_t rowBytes;
@@ -78,8 +76,8 @@ uint64_t keyFixedBytes(const QwenTargetGeometry &g, bool decode) {
   return decode ? bytesFor<uint16_t>(uint64_t{g.attentionLayerCount()} * kStepRows * QWEN4_QSA_DIMENSION) : 0;
 }
 
-// A prefill's or a decode step's tensors; a streamed PLE table's rows are
-// `pleRowBytes` each (zero for a table in memory).
+// A prefill chunk's or a decode step's tensors; a streamed PLE table's rows
+// are `pleRowBytes` each (zero for a table in memory).
 std::vector<Tensor> tensors(const QwenTargetGeometry &g, uint64_t pleRowBytes, bool decode) {
   const uint32_t scoreRows = decode ? kStepRows : kPrefillScoreRows;
   std::vector<Tensor> result{
@@ -87,9 +85,8 @@ std::vector<Tensor> tensors(const QwenTargetGeometry &g, uint64_t pleRowBytes, b
       {&Qwen4Scratch::normalized, bytesFor<uint16_t>(g.streamWidth()), 0, false},
       {&Qwen4Scratch::low, bytesFor<uint16_t>(g.hyperRank), 0, false},
       {&Qwen4Scratch::gate, bytesFor<uint16_t>(g.streamWidth()), 0, false},
-      {&Qwen4Scratch::mixerWeights, bytesFor<float>(g.hyperConnections), 0, true},
-      {&Qwen4Scratch::ffnWeights, bytesFor<float>(g.hyperConnections), 0, true},
-      {&Qwen4Scratch::branch, bytesFor<uint16_t>(g.hiddenSize), 0, true},
+      {&Qwen4Scratch::weights, bytesFor<float>(g.hyperConnections), 0, true},
+      {&Qwen4Scratch::branch, bytesFor<uint16_t>(g.hiddenSize), 0, false},
       {&Qwen4Scratch::zeros, bytesFor<uint16_t>(g.hiddenSize), 0, false},
       {&Qwen4Scratch::pleIndices, bytesFor<uint32_t>(g.pleHeads()), 0, true},
       {&Qwen4Scratch::pleRows, bytesFor<uint16_t>(g.pleWidth()), 0, false},
@@ -134,8 +131,7 @@ Layout layout(const QwenTargetGeometry &g, uint64_t pleRowBytes, uint32_t chunks
   for (const Tensor &tensor : tensors(g, pleRowBytes, false))
     result.prefillBlocks += alignUp(bytesOf(tensor, kChunkRows)) * (tensor.carried ? chunks : 1);
   result.prefillBytes = result.prefillBlocks + alignUp(kChunkBlockBytes) * chunks;
-  for (const Tensor &tensor : tensors(g, pleRowBytes, true))
-    result.decodeBlocks += alignUp(bytesOf(tensor, kStepRows));
+  for (const Tensor &tensor : tensors(g, pleRowBytes, true)) result.decodeBlocks += alignUp(bytesOf(tensor, kStepRows));
   result.decodePrior = result.decodeBlocks + alignUp(kLanes * kLaneBlockBytes);
   result.decodeBytes = result.decodePrior + alignUp(bytesFor<uint32_t>(kLanes * priorCount(g)));
   return result;

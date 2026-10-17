@@ -10,8 +10,6 @@
 
 #include "model/Qwen4Steps.hpp"
 #include "model/QwenTarget.hpp"
-#include "ops/HyperConnection.hpp"
-#include "ops/Qwen4.hpp"
 
 #include <cstdint>
 #include <span>
@@ -45,8 +43,8 @@ public:
   // that gathers them.
   void addVerifyInput(metal::CommandGraph &graph, metal::MetalBuffer draftInput, metal::MetalBuffer proposals,
                       metal::MetalBuffer verifyInput, uint32_t lanes) const override;
-  // Each lane's PLE history after its retained rows, from the convolution
-  // inputs its verify wrote.
+  // Each lane's PLE history and QSA pending keys after its retained rows,
+  // from the convolution inputs and keys its verify wrote.
   void addStateCommit(metal::CommandGraph &graph, QwenTargetCommitBuffers buffers, uint32_t lanes) const override;
 
   // The PLE rows of batch lane `lane`'s verify rows of the last step, each
@@ -58,14 +56,12 @@ private:
   friend class QwenTarget;
 
   // A prefill chunk's step: the shared one, the chunk's scratch, the QSA
-  // blocks each sequence's rows complete, where each attention layer's QSA
-  // index sits in the KV extents, and the block output the streams have not
-  // taken yet, which the next mix adds first.
+  // blocks each sequence's rows complete and where each attention layer's
+  // QSA index sits in the KV extents.
   struct PrefillStep : QwenTarget::PrefillStep {
     Qwen4Scratch scratch{};
     std::vector<Qwen4Blocks> blocks{};
     std::span<const uint32_t> indexOffsets{};
-    ops::HyperBranch pending{};
   };
   // The family's prefill layers. The streams start as the embedding's rows;
   // every MoE adds its rows to zeros into the branch the next mix adds to the
@@ -77,26 +73,21 @@ private:
   [[nodiscard]] metal::MetalBuffer addPrefillEnd(PrefillStep &step) const;
 
   // A verify step: the shared one, its scratch, the QSA blocks its lanes
-  // complete, where each attention layer's QSA index sits and the block
-  // output the streams have not taken yet.
+  // complete and where each attention layer's QSA index sits.
   struct VerifyStep : QwenTarget::VerifyStep {
     Qwen4Scratch scratch{};
     Qwen4LaneBlocks blocks{};
     std::span<const uint32_t> indexOffsets{};
-    ops::HyperBranch pending{};
   };
 
-  // A prefill step's mix of the streams through `hyper` into `output`, its
-  // norm adding the step's pending block output to the streams first; when it
-  // injects, its injection weights into `weights`, with which the block it
-  // feeds is pending after it.
-  void addPrefillMix(PrefillStep &step, const Qwen4HyperWeights &hyper, metal::MetalBuffer output,
-                     metal::MetalBuffer weights) const;
-  // A verify step's mix, likewise; its projections read the tables its norm
-  // and low step write, and with `next`, the decode projection that reads
-  // `output` first takes the table the mix writes (the returned input).
+  // A prefill step's mix of the streams through `hyper` into `output` and,
+  // when it injects, the injection weights into the step's scratch.
+  void addPrefillMix(PrefillStep &step, const Qwen4HyperWeights &hyper, metal::MetalBuffer output) const;
+  // A verify step's mix into `output`; its projections read the tables its
+  // norm and low step write, and with `next`, the decode projection that
+  // reads `output` first takes the table the mix writes (the returned input).
   ops::PreparedInput addVerifyMix(VerifyStep &step, const Qwen4HyperWeights &hyper, metal::MetalBuffer output,
-                                  metal::MetalBuffer weights, const ops::Projection *next = nullptr) const;
+                                  const ops::Projection *next = nullptr) const;
   // The QSA of the attention layer the step reaches next: the indexer's
   // projections of the step's rows and the QSA keys and block index of each
   // sequence or lane (writing its rows' and its completed blocks' entries);

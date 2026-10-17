@@ -58,8 +58,8 @@ struct QwenTargetDimensions {
   // attends sparsely; and a PLE n-gram embedding (hasPle), its layer, n-gram
   // size, heads per n-gram, head width and convolution taps. Shared code
   // reads them only where zero means none: the KV pages' index region, a
-  // state cell's PLE history and the rows a mixer adds to (kvLayout,
-  // gdnStateLayout, QwenTargetGeometry::mixersAddToHidden).
+  // state cell's PLE history and QSA pending keys, and the rows a mixer adds
+  // to (kvLayout, gdnStateLayout, QwenTargetGeometry::mixersAddToHidden).
   uint32_t hyperConnections = 0;
   uint32_t hyperRank = 0;
   uint32_t indexerHeads = 0;

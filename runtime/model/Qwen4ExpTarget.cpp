@@ -35,15 +35,6 @@ void addIndexerProjection(metal::CommandGraph &graph, const ops::Linear &linear,
                     ops::FloatOutput::Float32, linear.ggufFloatTile(rows, projection.outputSize));
 }
 
-// Adds a pending block output to the streams of `rows` rows, which then
-// have none.
-void addPendingCombine(metal::CommandGraph &graph, metal::MetalBuffer streams, ops::HyperBranch &pending,
-                       uint32_t rows, ops::HyperShape shape) {
-  if (!pending) return;
-  ops::HyperConnection::addCombine(graph, std::move(streams), pending.rows, pending.weights, shape, rows);
-  pending = {};
-}
-
 // Where each attention layer's QSA index sits in the KV extents of `kv`.
 std::vector<uint32_t> indexOffsets(const kv::PageStorage &kv, uint32_t layers) {
   std::vector<uint32_t> result;
@@ -92,14 +83,14 @@ std::vector<metal::MetalBuffer> Qwen4ExpTarget::addPrefill(metal::CommandGraph &
   return addPrefillLayers(std::span(steps), *this);
 }
 
-void Qwen4ExpTarget::addPrefillMix(PrefillStep &step, const Qwen4HyperWeights &hyper, metal::MetalBuffer output,
-                                   metal::MetalBuffer weights) const {
+void Qwen4ExpTarget::addPrefillMix(PrefillStep &step, const Qwen4HyperWeights &hyper,
+                                   metal::MetalBuffer output) const {
   const QwenTargetPrefillBuffers &b = step.buffers;
   const Qwen4Scratch &h = step.scratch;
   const ops::Linear &linear = operators_.linear();
   const ops::HyperShape hs = hyperShape(geometry_);
-  ops::HyperConnection::addNorm(step.graph, h.streams, std::exchange(step.pending, {}), hyper.norm, hyper.inject,
-                                h.normalized, std::move(weights), hs, step.rows);
+  ops::HyperConnection::addNorm(step.graph, h.streams, hyper.norm, hyper.inject, h.normalized, h.weights, hs,
+                                step.rows);
   linear.addPrefill(step.graph, h.normalized, hyper.down, h.low, step.rows, b.linearScratch);
   ops::HyperConnection::addLow(step.graph, h.low, hs, step.rows);
   linear.addPrefill(step.graph, h.low, hyper.up, h.gate, step.rows, b.linearScratch);
@@ -109,7 +100,6 @@ void Qwen4ExpTarget::addPrefillMix(PrefillStep &step, const Qwen4HyperWeights &h
 void Qwen4ExpTarget::addPrefillBegin(PrefillStep &step) const {
   const QwenTargetPrefillBuffers &b = step.buffers;
   step.ffn = {b.normalized, step.scratch.zeros, step.scratch.branch, b.moe};
-  step.pending = {};
   ops::HyperConnection::addInit(step.graph, b.hidden[0], step.scratch.streams, hyperShape(geometry_), step.rows);
 }
 
@@ -128,7 +118,6 @@ void Qwen4ExpTarget::addPrefillLayer(PrefillStep &step, uint32_t index) const {
     const Qwen4PleWeights &ple = *layer.ple;
     const ops::NgramShape ps = ngramShape(geometry_);
     const ops::Linear &linear = operators_.linear();
-    addPendingCombine(step.graph, h.streams, step.pending, rows, hyperShape(geometry_));
     addPleGather(step.graph, h, rows * geometry_.pleHeads());
     linear.addPrefill(step.graph, h.pleRows, ple.key, h.gate, rows, b.linearScratch);
     linear.addPrefill(step.graph, h.pleRows, ple.value, h.pleValue, rows, b.linearScratch);
@@ -147,7 +136,7 @@ void Qwen4ExpTarget::addPrefillLayer(PrefillStep &step, uint32_t index) const {
                                         sequence.auxiliaryIn, capture.auxiliary, ps, capture.row);
     }
   }
-  addPrefillMix(step, layer.mixerHyper, b.normalized, h.mixerWeights);
+  addPrefillMix(step, layer.mixerHyper, b.normalized);
   std::visit(
       [&](const auto &mixer) {
         if constexpr (std::is_same_v<std::remove_cvref_t<decltype(mixer)>, QwenGdnWeights>)
@@ -156,8 +145,8 @@ void Qwen4ExpTarget::addPrefillLayer(PrefillStep &step, uint32_t index) const {
           addPrefillMixer(step, mixer, {h.branch, {}}, addPrefillQsa(step, *layer.indexer));
       },
       layer.mixer);
-  step.pending = {h.branch, h.mixerWeights};
-  addPrefillMix(step, layer.ffnHyper, b.normalized, h.ffnWeights);
+  ops::HyperConnection::addCombine(step.graph, h.streams, h.branch, h.weights, hyperShape(geometry_), rows);
+  addPrefillMix(step, layer.ffnHyper, b.normalized);
   ops::MoE::addRouting(step.graph, step.ffn, layer.ffn, *step.moe);
 }
 
@@ -166,10 +155,7 @@ const ops::BlockMoeWeights *Qwen4ExpTarget::moe(uint32_t index) const { return &
 void Qwen4ExpTarget::addPrefillExperts(PrefillStep &step, uint32_t index) const {
   const Qwen4Scratch &h = step.scratch;
   ops::MoE::addRouted(step.graph, step.ffn, weights_.layers[index].ffn, *step.moe);
-  step.pending = {h.branch, h.ffnWeights};
-  // The draft reads the layer's output streams.
-  if (geometry_.captureSlot(index))
-    addPendingCombine(step.graph, h.streams, step.pending, step.rows, hyperShape(geometry_));
+  ops::HyperConnection::addCombine(step.graph, h.streams, h.branch, h.weights, hyperShape(geometry_), step.rows);
   forEachPrefillCapture(step, index, [&](uint32_t slot, uint32_t source, uint32_t destination, uint32_t rows) {
     addStreamCapture(step.graph, geometry_, slot, rowsOf<float>(h.streams, source, rows, geometry_.streamWidth()),
                      step.buffers.captured, destination, rows);
@@ -177,14 +163,15 @@ void Qwen4ExpTarget::addPrefillExperts(PrefillStep &step, uint32_t index) const 
 }
 
 metal::MetalBuffer Qwen4ExpTarget::addPrefillEnd(PrefillStep &step) const {
-  addPrefillMix(step, weights_.finalHyper, step.buffers.hidden[1], {});
+  addPrefillMix(step, weights_.finalHyper, step.buffers.hidden[1]);
   return step.buffers.hidden[1];
 }
 
-// Each sequence's QSA is a dispatch of one lane: its rows' blocks pooled, the
-// keys of the block they leave open (and of any state captured inside them)
-// kept, before any selection; the lists of the sequences that select follow
-// each other.
+// Each sequence's QSA is a dispatch of one lane: its indexer projects its
+// rows, pools the blocks they complete and keeps the keys of the block they
+// leave open, and those of any state captured inside them; a sequence whose
+// rows attend sparsely then selects their blocks, its lists after those of
+// the sequences before it.
 std::vector<ops::AttentionBlocks> Qwen4ExpTarget::addPrefillQsa(PrefillStep &step,
                                                                 const Qwen4IndexerWeights &indexer) const {
   const QwenTargetPrefillBuffers &b = step.buffers;
@@ -216,19 +203,19 @@ std::vector<ops::AttentionBlocks> Qwen4ExpTarget::addPrefillQsa(PrefillStep &ste
   for (size_t index = 0; index < step.sequences.size(); ++index) {
     const QwenTargetPrefillSequence &sequence = step.sequences[index];
     const metal::MetalBuffer keys = u16Rows(h.qsaKeys, sequence, keyWidth);
-    const metal::MetalBuffer pendingKeys = steps_.qsaPending(sequence.auxiliaryIn, layer);
+    const metal::MetalBuffer pending = steps_.qsaPending(sequence.auxiliaryIn, layer);
     ops::Qwen4::addQsaProject(step.graph, f32Rows(h.indexerQuery, sequence, queryWidth),
                               f32Rows(h.indexerKey, sequence, keyWidth), indexer.queryNorm,
                               f32Rows(b.ropeCos, sequence, geometry_.rotaryPairs),
                               f32Rows(b.ropeSin, sequence, geometry_.rotaryPairs),
                               u16Rows(h.qsaQueries, sequence, queryWidth), keys, qsaRows(index));
     ops::Qwen4::addQsaPool(step.graph,
-                           {step.blocks[index].records, {&step.blocks[index].count, 1}, 0, keys, {&pendingKeys, 1}},
+                           {step.blocks[index].records, {&step.blocks[index].count, 1}, 0, keys, {&pending, 1}},
                            indexer.keyNorm, b.ropeInverseFrequencies, qsaRows(index));
-    ops::Qwen4::addQsaPending(step.graph, keys, pendingKeys, steps_.qsaPending(sequence.auxiliaryOut, layer),
+    ops::Qwen4::addQsaPending(step.graph, keys, pending, steps_.qsaPending(sequence.auxiliaryOut, layer),
                               firstPositions[index], sequence.rows);
     for (const QwenTargetStateCapture &capture : sequence.stateCaptures)
-      ops::Qwen4::addQsaPending(step.graph, keys, pendingKeys, steps_.qsaPending(capture.auxiliary, layer),
+      ops::Qwen4::addQsaPending(step.graph, keys, pending, steps_.qsaPending(capture.auxiliary, layer),
                                 firstPositions[index], capture.row);
     if (!ops::Qwen4::qsaSparse(firstPositions[index], sequence.rows, topBlocks)) continue;
     ops::Qwen4::addQsaSelect(step.graph, u16Rows(h.qsaQueries, sequence, queryWidth), h.qsaScores, h.scoreRows,
@@ -257,15 +244,13 @@ void Qwen4ExpTarget::addVerifyInput(metal::CommandGraph &graph, metal::MetalBuff
 }
 
 ops::PreparedInput Qwen4ExpTarget::addVerifyMix(VerifyStep &step, const Qwen4HyperWeights &hyper,
-                                                metal::MetalBuffer output, metal::MetalBuffer weights,
-                                                const ops::Projection *next) const {
+                                                metal::MetalBuffer output, const ops::Projection *next) const {
   const Qwen4Scratch &h = step.scratch;
   const ops::LinearScratch scratch = step.buffers.linearScratch;
   const ops::HyperShape hs = hyperShape(geometry_);
   ops::PreparedInput prepared =
-      ops::HyperConnection::addNorm(step.graph, h.streams, std::exchange(step.pending, {}), hyper.norm, hyper.inject,
-                                    h.normalized, std::move(weights), hs, step.rows, scratch,
-                                    decodeInput(hyper.down, step.lanes));
+      ops::HyperConnection::addNorm(step.graph, h.streams, hyper.norm, hyper.inject, h.normalized, h.weights, hs,
+                                    step.rows, scratch, decodeInput(hyper.down, step.lanes));
   addDecodeProjection(step.graph, h.normalized, hyper.down, h.low, step.lanes, scratch, std::move(prepared));
   prepared = ops::HyperConnection::addLow(step.graph, h.low, hs, step.rows, scratch, decodeInput(hyper.up, step.lanes));
   addDecodeProjection(step.graph, h.low, hyper.up, h.gate, step.lanes, scratch, std::move(prepared));
@@ -297,15 +282,15 @@ ops::AttentionBlocks Qwen4ExpTarget::addVerifyQsa(VerifyStep &step, const Qwen4I
   // The layer's keys, which the commit reads after the last layer, and each
   // lane's pending keys before the step.
   const metal::MetalBuffer keys = rowsOf<uint16_t>(h.qsaKeys, layer * h.keyLayerRows, step.rows, keyWidth);
-  std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth> pendingKeys;
-  for (uint32_t lane = 0; lane < step.lanes; ++lane) pendingKeys[lane] = steps_.qsaPending(b.auxiliary[lane], layer);
+  std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth> pending;
+  for (uint32_t lane = 0; lane < step.lanes; ++lane) pending[lane] = steps_.qsaPending(b.auxiliary[lane], layer);
   ops::Qwen4::addQsaProject(step.graph, rowsOf<float>(h.indexerQuery, 0, step.rows, queryWidth),
                             rowsOf<float>(h.indexerKey, 0, step.rows, keyWidth), indexer.queryNorm,
                             rowsOf<float>(b.ropeCos, 0, step.rows, geometry_.rotaryPairs),
                             rowsOf<float>(b.ropeSin, 0, step.rows, geometry_.rotaryPairs), queries, keys, qsa);
   ops::Qwen4::addQsaPool(step.graph,
                          {step.blocks.records, std::span(step.blocks.counts).first(step.lanes),
-                          step.blocks.laneRecords, keys, std::span(pendingKeys).first(step.lanes)},
+                          step.blocks.laneRecords, keys, std::span(pending).first(step.lanes)},
                          indexer.keyNorm, b.ropeInverseFrequencies, qsa);
   if (!sparse) return {h.qsaLists, h.qsaListCounts, 0, 0};
   const ops::AttentionBlocks blocks{h.qsaLists, h.qsaListCounts, h.listStride, 0};
@@ -342,12 +327,11 @@ void Qwen4ExpTarget::addVerify(metal::CommandGraph &graph, QwenTargetVerifyBuffe
     if (layer.ple) {
       const Qwen4PleWeights &ple = *layer.ple;
       const ops::NgramShape ps = ngramShape(geometry_);
-      addPendingCombine(step.graph, h.streams, step.pending, rows, hyperShape(geometry_));
       addPleGather(step.graph, h, rows * geometry_.pleHeads());
       addDecodeProjection(step.graph, h.pleRows, ple.key, h.gate, lanes, b.linearScratch);
       addDecodeProjection(step.graph, h.pleRows, ple.value, h.pleValue, lanes, b.linearScratch);
       ops::NgramEmbedding::addGate(step.graph, h.gate, h.pleValue, h.streams, ple.keyNorm, ple.queryNorm,
-                                   ple.convolutionNorm, h.pleGated, h.pleConvolution, ps, rows);
+                             ple.convolutionNorm, h.pleGated, h.pleConvolution, ps, rows);
       // Each lane's rows after its history; the commit writes the history
       // after its retained rows.
       for (uint32_t lane = 0; lane < lanes; ++lane)
@@ -359,27 +343,23 @@ void Qwen4ExpTarget::addVerify(metal::CommandGraph &graph, QwenTargetVerifyBuffe
     }
     std::visit(
         [&](const auto &mixer) {
-          const ops::PreparedInput input =
-              addVerifyMix(step, layer.mixerHyper, b.normalized, h.mixerWeights, &mixer.inputProjection);
+          const ops::PreparedInput input = addVerifyMix(step, layer.mixerHyper, b.normalized, &mixer.inputProjection);
           if constexpr (std::is_same_v<std::remove_cvref_t<decltype(mixer)>, QwenGdnWeights>)
             addVerifyMixer(step, mixer, input, {h.branch, {}});
           else
             addVerifyMixer(step, mixer, input, {h.branch, {}}, addVerifyQsa(step, *layer.indexer));
         },
         layer.mixer);
-    step.pending = {h.branch, h.mixerWeights};
-    addVerifyMix(step, layer.ffnHyper, b.normalized, h.ffnWeights);
+    ops::HyperConnection::addCombine(step.graph, h.streams, h.branch, h.weights, hs, rows);
+    addVerifyMix(step, layer.ffnHyper, b.normalized);
     ops::MoE::add(step.graph, {b.normalized, h.zeros, h.branch, b.moe}, layer.ffn, *step.moe);
-    step.pending = {h.branch, h.ffnWeights};
-    // The draft reads the layer's output streams.
-    if (const auto slot = geometry_.captureSlot(index)) {
-      addPendingCombine(step.graph, h.streams, step.pending, rows, hyperShape(geometry_));
+    ops::HyperConnection::addCombine(step.graph, h.streams, h.branch, h.weights, hs, rows);
+    if (const auto slot = geometry_.captureSlot(index))
       addStreamCapture(step.graph, geometry_, *slot, h.streams, b.capturedTargetHidden, 0, rows);
-    }
   }
   requireLayerPartition(step.gdnLayer, step.attentionLayer);
   addDecodeProjection(step.graph, b.finalHidden, weights_.logitsProjection, b.logits, lanes, b.linearScratch,
-                      addVerifyMix(step, weights_.finalHyper, b.finalHidden, {}, &weights_.logitsProjection));
+                      addVerifyMix(step, weights_.finalHyper, b.finalHidden, &weights_.logitsProjection));
 }
 
 void Qwen4ExpTarget::addHeadBatch(metal::CommandGraph &graph, metal::MetalBuffer hidden, metal::MetalBuffer,
@@ -390,8 +370,6 @@ void Qwen4ExpTarget::addHeadBatch(metal::CommandGraph &graph, metal::MetalBuffer
 void Qwen4ExpTarget::addStateCommit(metal::CommandGraph &graph, QwenTargetCommitBuffers buffers,
                                     uint32_t lanes) const {
   QwenTarget::addStateCommit(graph, buffers, lanes);
-  // Each lane's PLE history and QSA pending keys after its retained rows,
-  // from the convolution inputs and the keys its verify wrote.
   const ops::NgramShape shape = ngramShape(geometry_);
   const Qwen4Scratch scratch = steps_.verifyScratch(lanes * kVerifyRows);
   const uint64_t laneBytes = uint64_t{kVerifyRows} * shape.width() * sizeof(uint16_t);
