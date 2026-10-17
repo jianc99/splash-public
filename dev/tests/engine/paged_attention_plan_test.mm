@@ -184,7 +184,8 @@ void checkPlans(uint32_t queryHeads, kv::Layout layout) {
       "verify attention history exceeds physical context",
       "verify rows past the physical context were accepted");
   rejects([&] { (void)ops::PagedAttention::verifyPlan(1, queryHeads + 1, layout, zeroHistory); },
-          "no paged-attention kernel for layout", "a query head count without a kernel was accepted");
+          layout.valuesTokenMajor ? "no sparse attention kernel for layout" : "no paged-attention kernel for layout",
+          "a query head count without a kernel was accepted");
 }
 
 // The attention layer under test is the second of a pool's two, so its region
@@ -940,9 +941,10 @@ void bufferExtents(metal::MetalBackend &backend, uint32_t queryHeads, kv::Layout
   });
 }
 
-// Block lists (ops::AttentionBlocks): only the group of twelve over two KV
-// heads runs the sparse kernels, on a layout of token-major values, which no
-// other plan takes. A sparse split binds the lists and their counts after its
+// Block lists (ops::AttentionBlocks): a layout of token-major values runs
+// the sparse kernels, compiled for the group of twelve over two KV heads
+// alone, and one of dimension-major values the page loop, which has no group
+// of twelve. A sparse split binds the lists and their counts after its
 // page tables and its reduce the counts, before their parameters, which hold
 // the lists' stride and the dispatch's first list (verifying, each lane's
 // own); without lists both bind another buffer of the dispatch there. The
@@ -956,11 +958,9 @@ void attentionBlocks(metal::MetalBackend &backend) {
   tokenMajor.valuesTokenMajor = true;
   const std::array<uint32_t, lanes> histories{100, 2000, 0};
   rejects([&] { (void)ops::PagedAttention::prefillPlan(tokens, 24, dense); },
-          "no paged-attention kernel for the layout's value order",
-          "the sparse kernels took dimension-major values");
+          "no paged-attention kernel for layout", "the sparse kernels took dimension-major values");
   rejects([&] { (void)ops::PagedAttention::verifyPlan(lanes, 16, tokenMajor, histories); },
-          "no paged-attention kernel for the layout's value order",
-          "the page loop took token-major values");
+          "no sparse attention kernel for layout", "the page loop took token-major values");
   const auto chunk = ops::PagedAttention::prefillParams(100, tokens, stride, 8);
   std::array<kv::ChunkedPrefillParams, lanes> chunks{};
   for (uint32_t lane = 0; lane < lanes; ++lane)
