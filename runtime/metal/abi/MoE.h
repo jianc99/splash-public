@@ -99,7 +99,7 @@ struct MoeGgufExpertParams {
 static_assert(sizeof(MoeGgufExpertParams) == 20,
               "MoE GGUF expert parameters are 20 bytes on both sides");
 
-// The gate and up passes in one (moe_expert_gguf_m<rows>_gate_up): their
+// The gate and up passes in one (moe_expert_gguf_m<rows>_gate_up[_mixed]): their
 // sizes and expert count, as MoeGgufExpertParams holds them, and each pass's
 // routed and shared formats.
 struct MoeGgufGateUpParams {

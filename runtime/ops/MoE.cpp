@@ -73,7 +73,7 @@ std::string routingKernel(std::string name, MoeShape shape) {
 }
 
 // Whether a plan runs gate and up in one pass
-// (moe_expert_gguf_m<rows>_gate_up): on the staged tile, whose simdgroups
+// (moe_expert_gguf_m<rows>_gate_up[_mixed]): on the staged tile, whose simdgroups
 // each decode their own pass's formats. The register tile runs two passes.
 bool oneGateUpPass(const MoePlan &plan) noexcept { return plan.configuration().ggufTile == MoeGgufTile::Staged; }
 
@@ -123,7 +123,9 @@ void addExperts(metal::CommandGraph &graph, const MoeScratch &scratch, const Blo
   const uint32_t intermediate = shape.expertIntermediateSize;
   if (oneGateUpPass(plan)) {
     const BlockExpertProjection &gate = weights.gate, &up = weights.up;
-    graph.add(kernel + "_gate_up",
+    // One pair table where gate and up share their formats, one each otherwise.
+    const bool mixed = gate.routed.formatId != up.routed.formatId || gate.shared.formatId != up.shared.formatId;
+    graph.add(kernel + (mixed ? "_gate_up_mixed" : "_gate_up"),
               {scratch.groupedInput, scratch.tileDescriptors, scratch.tileCount,
                gate.routed.plane0, gate.routed.plane1Slot(), gate.routed.meta,
                gate.shared.plane0, gate.shared.plane1Slot(), gate.shared.meta,

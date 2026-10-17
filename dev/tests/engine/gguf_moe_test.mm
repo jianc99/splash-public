@@ -558,7 +558,8 @@ MoeRun runPlan(MetalBackend &backend, const Model &m, Buffers &b, const MoePlan 
   require(tiles <= plan.maximumTiles(), label + ": tile count exceeds its bound");
   checkGrouping(b.moe.scratch, plan, label);
   // Each expert pass runs the live tiles of its column tiles; gate and up run
-  // in one pass (_gate_up) or as the gate and up passes (_a, then _g).
+  // in one pass (_gate_up, _gate_up_mixed where their formats differ) or as
+  // the gate and up passes (_a, then _g).
   uint32_t gateUpPasses = 0, upPasses = 0;
   for (const ComputeDispatch &dispatch : graph.dispatches()) {
     const uint32_t *grid = nullptr;
@@ -568,7 +569,7 @@ MoeRun runPlan(MetalBackend &backend, const Model &m, Buffers &b, const MoePlan 
                 (!grid || (grid[0] == dispatch.threadgroups.x && grid[1] == tiles && grid[2] == 1 &&
                            dispatch.threadgroups.y == plan.maximumTiles())),
             label + ": " + dispatch.pipelineName + " runs another grid than its live tiles");
-    gateUpPasses += dispatch.pipelineName.ends_with("_gate_up");
+    gateUpPasses += dispatch.pipelineName.ends_with("_gate_up") || dispatch.pipelineName.ends_with("_gate_up_mixed");
     upPasses += dispatch.pipelineName.ends_with("_g");
   }
   require(gateUpPasses == staged && upPasses == !staged,

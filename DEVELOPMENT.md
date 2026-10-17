@@ -1999,8 +1999,9 @@ MoE layers, so one F16 routed or shared expert tensor in any layer stages every 
 there. Their
 passes launch the live tiles alone: the grouping kernel writes each pass's grid with the tile
 count, and the pass reads it as an indirect dispatch (`ComputeDispatch::indirectThreadgroups`).
-The staged tile runs gate and up in one pass where they share their routed and their shared
-formats, a gate and an up simdgroup on the same columns, bitwise the two passes' intermediate.
+The staged tile runs gate and up in one pass, a gate and an up simdgroup on the same columns,
+bitwise the two passes' intermediate, which share one pair table where they share their routed and
+their shared formats.
 An expert's only tile of at most `MOE_GGUF_COLUMN_ROWS` live rows runs on the column tile
 (`kernels/common/gguf_column_tile.h`) rather than the staged one, and the two sum a row's
 products in different orders: a route's output depends on how many rows the step routes to its
