@@ -32,7 +32,8 @@ Qwen4QsaParams qsaParams(const QsaRows &rows) {
                         .top_blocks = rows.topBlocks,
                         .mask_words = rows.maskWords,
                         .score_stride = rows.scoreStride,
-                        .index_offset = rows.index.offset};
+                        .index_offset = rows.index.offset,
+                        .rope_scale = 0.0F};
   std::ranges::copy(rows.firstPositions, std::begin(params.first_position));
   return params;
 }
@@ -59,12 +60,14 @@ void Qwen4::addQsaProject(metal::CommandGraph &graph, metal::MetalBuffer query, 
 }
 
 void Qwen4::addQsaPool(metal::CommandGraph &graph, const QsaBlocks &blocks, const NormWeights &keyNorm,
-                       metal::MetalBuffer inverseFrequencies, const QsaRows &rows) {
+                       metal::MetalBuffer inverseFrequencies, float ropeScale, const QsaRows &rows) {
   Qwen4QsaParams params = qsaParams(rows);
   if (blocks.counts.size() != params.lanes || blocks.pending.size() != params.lanes ||
       (params.lanes > 1 && !blocks.laneRecords))
     throw std::invalid_argument("invalid QSA blocks");
+  if (!(ropeScale > 0.0F)) throw std::invalid_argument("invalid QSA RoPE scale");
   params.lane_records = blocks.laneRecords;
+  params.rope_scale = ropeScale;
   uint32_t most = 0;
   for (uint32_t lane = 0; lane < params.lanes; ++lane) {
     const uint32_t count = blocks.counts[lane];

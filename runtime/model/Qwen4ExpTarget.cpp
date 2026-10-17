@@ -211,7 +211,8 @@ std::vector<ops::AttentionBlocks> Qwen4ExpTarget::addPrefillQsa(PrefillStep &ste
                               u16Rows(h.qsaQueries, sequence, queryWidth), keys, qsaRows(index));
     ops::Qwen4::addQsaPool(step.graph,
                            {step.blocks[index].records, {&step.blocks[index].count, 1}, 0, keys, {&pending, 1}},
-                           indexer.keyNorm, b.ropeInverseFrequencies, qsaRows(index));
+                           indexer.keyNorm, b.ropeInverseFrequencies, geometry_.ropeScaling.attentionFactor(),
+                           qsaRows(index));
     ops::Qwen4::addQsaPending(step.graph, keys, pending, steps_.qsaPending(sequence.auxiliaryOut, layer),
                               firstPositions[index], sequence.rows);
     for (const QwenTargetStateCapture &capture : sequence.stateCaptures)
@@ -291,7 +292,7 @@ ops::AttentionBlocks Qwen4ExpTarget::addVerifyQsa(VerifyStep &step, const Qwen4I
   ops::Qwen4::addQsaPool(step.graph,
                          {step.blocks.records, std::span(step.blocks.counts).first(step.lanes),
                           step.blocks.laneRecords, keys, std::span(pending).first(step.lanes)},
-                         indexer.keyNorm, b.ropeInverseFrequencies, qsa);
+                         indexer.keyNorm, b.ropeInverseFrequencies, geometry_.ropeScaling.attentionFactor(), qsa);
   if (!sparse) return {h.qsaLists, h.qsaListCounts, 0, 0};
   const ops::AttentionBlocks blocks{h.qsaLists, h.qsaListCounts, h.listStride, 0};
   ops::Qwen4::addQsaSelect(step.graph, queries, h.qsaScores, h.scoreRows,

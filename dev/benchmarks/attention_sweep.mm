@@ -327,7 +327,7 @@ metal::CommandGraph caseGraph(const AttentionFixture &fixture, bool prefill, con
                          indexer->ropeSin, indexer->queries, indexer->keys, rows);
     Qwen4::addQsaPool(graph,
                       {indexer->records, indexer->counts, indexer->laneRecords, indexer->keys, indexer->pending},
-                      {indexer->norm, true}, indexer->inverseFrequencies, rows);
+                      {indexer->norm, true}, indexer->inverseFrequencies, 1.0F, rows);
     Qwen4::addQsaSelect(graph, indexer->queries, indexer->scores, indexer->scoreRows, qsa.bitmaps, rows);
   }
   if (qsa.words) {
