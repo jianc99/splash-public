@@ -1237,14 +1237,7 @@ struct MetalBackend::Impl {
         ticketState->sequence =
             asyncState->beginSubmission(dispatches.size());
 
-        // Metal failing to create an encoder or a buffer marks the backend
-        // unhealthy; the buffers already committed run on, with the host
-        // steps after them.
-        auto failEncoding = [&](std::string message) {
-            markUnhealthy(message);
-            asyncState->releaseSubmission(ticketState->sequence);
-            throw MetalBackendError(std::move(message));
-        };
+        auto failEncoding = [](std::string message) { throw MetalBackendError(std::move(message)); };
 
         auto wallStart = AwakeClock::now();
         // The buffers before the last commit as their encoding ends, so the
@@ -1256,121 +1249,139 @@ struct MetalBackend::Impl {
         // command holds every member of its queue's residency set). The
         // command retains everything the GPU still needs.
         @autoreleasepool {
-            id<MTLCommandBuffer> command = [queue commandBuffer];
-            if (!command) {
-                failEncoding("unable to create Metal command buffer");
-            }
-            ticketState->wallStart = wallStart;
             // The buffers before `command`, each ended by an event signal or
             // a host step.
             std::vector<id<MTLCommandBuffer>> leading;
-            id<MTLComputeCommandEncoder> encoder = nil;
-            // Encodes the event steps that follow the first `encoded`
-            // dispatches.
-            auto step = events.begin();
-            const auto encodeSteps = [&](size_t encoded) {
-                for (; step != events.end() && step->before == encoded; ++step) {
-                    if (encoder) {
-                        [encoder endEncoding];
-                        encoder = nil;
-                    }
-                    if (step->kind == EventStep::Kind::Host) {
-                        command = encodeHostStep(command, leading, ticketState->hostSteps, *step, failEncoding);
-                        continue;
-                    }
-                    id<MTLSharedEvent> event =
-                        (__bridge id<MTLSharedEvent>)step->event.nativeHandle();
-                    if (step->kind == EventStep::Kind::Wait) {
-                        [command encodeWaitForEvent:event value:step->value];
-                        continue;
-                    }
-                    [command encodeSignalEvent:event value:step->value];
-                    // A buffer that fails may end without its signal; the
-                    // work after it, waiting on an agent that waits on the
-                    // signal, would then stall until a timeout ends it. The
-                    // CPU delivers the signal instead, so the command ends
-                    // with the failure at once.
-                    const SharedEvent signaled = step->event;
-                    const uint64_t value = step->value;
-                    [command addCompletedHandler:^(id<MTLCommandBuffer> ended) {
-                        if (ended.status == MTLCommandBufferStatusError)
-                            signaled.signal(value);
-                    }];
-                    leading.push_back(command);
-                    [command commit];
-                    command = [queue commandBuffer];
-                    if (!command) {
-                        failEncoding("unable to create Metal command buffer");
-                    }
+            // Any failure while encoding, such as Metal creating no buffer or
+            // encoder, marks the backend unhealthy. The buffers already
+            // committed run on, with the host steps after them, so the backend
+            // keeps their command's state, and with it its allocations.
+            try {
+                id<MTLCommandBuffer> command = [queue commandBuffer];
+                if (!command) {
+                    failEncoding("unable to create Metal command buffer");
                 }
-            };
-            // Indexed by argument table entry. The ticket and the dispatches
-            // keep the buffers alive.
-            __unsafe_unretained id<MTLBuffer> buffers[kBufferArgumentEntries];
-            NSUInteger offsets[kBufferArgumentEntries];
-            for (size_t index = 0; index < dispatches.size(); ++index) {
-                encodeSteps(index);
-                const PreparedDispatch &item = dispatches[index];
-                const ComputeDispatch &dispatch = *item.source;
-                if (!encoder) {
-                    encoder = [command computeCommandEncoder];
+                ticketState->wallStart = wallStart;
+                id<MTLComputeCommandEncoder> encoder = nil;
+                // Encodes the event steps that follow the first `encoded`
+                // dispatches.
+                auto step = events.begin();
+                const auto encodeSteps = [&](size_t encoded) {
+                    for (; step != events.end() && step->before == encoded; ++step) {
+                        if (encoder) {
+                            [encoder endEncoding];
+                            encoder = nil;
+                        }
+                        if (step->kind == EventStep::Kind::Host) {
+                            command = encodeHostStep(command, leading, ticketState->hostSteps, *step, failEncoding);
+                            continue;
+                        }
+                        id<MTLSharedEvent> event =
+                            (__bridge id<MTLSharedEvent>)step->event.nativeHandle();
+                        if (step->kind == EventStep::Kind::Wait) {
+                            [command encodeWaitForEvent:event value:step->value];
+                            continue;
+                        }
+                        [command encodeSignalEvent:event value:step->value];
+                        // A buffer that fails may end without its signal; the
+                        // work after it, waiting on an agent that waits on the
+                        // signal, would then stall until a timeout ends it. The
+                        // CPU delivers the signal instead, so the command ends
+                        // with the failure at once.
+                        const SharedEvent signaled = step->event;
+                        const uint64_t value = step->value;
+                        [command addCompletedHandler:^(id<MTLCommandBuffer> ended) {
+                            if (ended.status == MTLCommandBufferStatusError)
+                                signaled.signal(value);
+                        }];
+                        leading.push_back(command);
+                        [command commit];
+                        command = [queue commandBuffer];
+                        if (!command) {
+                            failEncoding("unable to create Metal command buffer");
+                        }
+                    }
+                };
+                // Indexed by argument table entry. The ticket and the dispatches
+                // keep the buffers alive.
+                __unsafe_unretained id<MTLBuffer> buffers[kBufferArgumentEntries];
+                NSUInteger offsets[kBufferArgumentEntries];
+                for (size_t index = 0; index < dispatches.size(); ++index) {
+                    encodeSteps(index);
+                    const PreparedDispatch &item = dispatches[index];
+                    const ComputeDispatch &dispatch = *item.source;
                     if (!encoder) {
-                        failEncoding("unable to create Metal compute encoder");
+                        encoder = [command computeCommandEncoder];
+                        if (!encoder) {
+                            failEncoding("unable to create Metal compute encoder");
+                        }
+                    }
+                    [encoder setComputePipelineState:item.pipeline];
+                    for (const BufferBinding &binding : dispatch.buffers) {
+                        const MetalBuffer::Impl &buffer = *binding.buffer.impl_;
+                        buffers[binding.index] = buffer.allocation->buffer;
+                        offsets[binding.index] = buffer.offsetBytes;
+                    }
+                    // One call per run of consecutive entries: a command graph's
+                    // dispatch binds a single run.
+                    for (uint32_t unbound = item.bufferIndices; unbound;) {
+                        const uint32_t first = std::countr_zero(unbound);
+                        const uint32_t count = std::countr_one(unbound >> first);
+                        [encoder setBuffers:buffers + first
+                                    offsets:offsets + first
+                                  withRange:NSMakeRange(first, count)];
+                        unbound &= ~(((uint32_t{1} << count) - 1) << first);
+                    }
+                    for (const BytesBinding &binding : dispatch.bytes) {
+                        [encoder setBytes:binding.data
+                                   length:binding.sizeBytes
+                                  atIndex:binding.index];
+                    }
+                    const IndirectGrid &grid = dispatch.indirectThreadgroups;
+                    if (grid.buffer) {
+                        const MetalBuffer::Impl &arguments = *grid.buffer.impl_;
+                        [encoder
+                            dispatchThreadgroupsWithIndirectBuffer:
+                                arguments.allocation->buffer
+                                              indirectBufferOffset:
+                                arguments.offsetBytes + grid.offsetBytes
+                                             threadsPerThreadgroup:item.threads];
+                    } else {
+                        [encoder dispatchThreadgroups:item.groups
+                                 threadsPerThreadgroup:item.threads];
                     }
                 }
-                [encoder setComputePipelineState:item.pipeline];
-                for (const BufferBinding &binding : dispatch.buffers) {
-                    const MetalBuffer::Impl &buffer = *binding.buffer.impl_;
-                    buffers[binding.index] = buffer.allocation->buffer;
-                    offsets[binding.index] = buffer.offsetBytes;
-                }
-                // One call per run of consecutive entries: a command graph's
-                // dispatch binds a single run.
-                for (uint32_t unbound = item.bufferIndices; unbound;) {
-                    const uint32_t first = std::countr_zero(unbound);
-                    const uint32_t count = std::countr_one(unbound >> first);
-                    [encoder setBuffers:buffers + first
-                                offsets:offsets + first
-                              withRange:NSMakeRange(first, count)];
-                    unbound &= ~(((uint32_t{1} << count) - 1) << first);
-                }
-                for (const BytesBinding &binding : dispatch.bytes) {
-                    [encoder setBytes:binding.data
-                               length:binding.sizeBytes
-                              atIndex:binding.index];
-                }
-                const IndirectGrid &grid = dispatch.indirectThreadgroups;
-                if (grid.buffer) {
-                    const MetalBuffer::Impl &arguments = *grid.buffer.impl_;
-                    [encoder
-                        dispatchThreadgroupsWithIndirectBuffer:
-                            arguments.allocation->buffer
-                                          indirectBufferOffset:
-                            arguments.offsetBytes + grid.offsetBytes
-                                         threadsPerThreadgroup:item.threads];
-                } else {
-                    [encoder dispatchThreadgroups:item.groups
-                             threadsPerThreadgroup:item.threads];
-                }
-            }
-            encodeSteps(dispatches.size());
-            if (encoder) [encoder endEncoding];
-            ticketState->leadingCommands = leading;
+                encodeSteps(dispatches.size());
+                if (encoder) [encoder endEncoding];
+                ticketState->leadingCommands = leading;
 
-            // Driver callbacks only complete the ticket. Device-wide memory
-            // telemetry is sampled on the host when consuming the result. The
-            // handler holds the ticket's state strongly: once a waiter gives
-            // up on the command, it keeps the retained allocations until the
-            // GPU ends.
-            [command addCompletedHandler:^(id<MTLCommandBuffer> completed) {
-                ticketState->finishCommand(completed);
-            }];
-            asyncState->commitSubmission(ticketState->sequence, command,
-                [weakTicket = std::weak_ptr(ticketState)](
-                    id<MTLCommandBuffer> completed) {
-                    if (auto ticket = weakTicket.lock())
-                        ticket->finishCommand(completed);
-                });
+                // Driver callbacks only complete the ticket. Device-wide memory
+                // telemetry is sampled on the host when consuming the result. The
+                // handler holds the ticket's state strongly: once a waiter gives
+                // up on the command, it keeps the retained allocations until the
+                // GPU ends.
+                [command addCompletedHandler:^(id<MTLCommandBuffer> completed) {
+                    ticketState->finishCommand(completed);
+                }];
+                asyncState->commitSubmission(ticketState->sequence, command,
+                    [weakTicket = std::weak_ptr(ticketState)](
+                        id<MTLCommandBuffer> completed) {
+                        if (auto ticket = weakTicket.lock())
+                            ticket->finishCommand(completed);
+                    });
+            } catch (...) {
+                std::string reason = "Metal command encoding failed";
+                try {
+                    throw;
+                } catch (const std::exception &error) {
+                    reason += std::string(": ") + error.what();
+                } catch (...) {
+                }
+                markUnhealthy(std::move(reason));
+                asyncState->releaseSubmission(ticketState->sequence);
+                if (!leading.empty()) abandonedCommands.push_back(ticketState);
+                throw;
+            }
         }
         return CommandTicket(std::move(ticketState));
     }
@@ -1427,6 +1438,9 @@ struct MetalBackend::Impl {
     // kHostStepSpinRecheck after a check that decided nothing; never once a
     // check decided.
     AwakeClock::time_point nextSpinCheck{};
+    // Commands whose encoding failed after their first buffers were
+    // committed (commit): those still run, on these commands' allocations.
+    std::vector<std::shared_ptr<CommandTicket::State>> abandonedCommands;
     // Last, so that it stops first, raising the steps it holds.
     std::unique_ptr<HostStepRunner> hostStepRunner;
 };

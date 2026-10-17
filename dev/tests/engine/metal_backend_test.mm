@@ -1781,6 +1781,50 @@ void earlyBuffersRunWhileTheRestEncodes(const std::string &metallibPath) {
     std::cout << "PASS a command's early buffers run while the rest encodes\n";
 }
 
+std::atomic<unsigned> encodersLeft{0};
+IMP originalEncoderAfterCommit = nullptr;
+// Hands out encoders until encodersLeft runs out, then none.
+id encoderUntilExhausted(id command, SEL selector) {
+    if (encodersLeft.fetch_sub(1) == 0) {
+        encodersLeft = 0;
+        return nil;
+    }
+    return reinterpret_cast<id (*)(id, SEL)>(originalEncoderAfterCommit)(command, selector);
+}
+
+// A command whose encoding fails after its first buffer was committed (Metal
+// creates no encoder for the work after a host step) throws, releases the
+// submission and marks the backend unhealthy with the reason; the committed
+// buffer still runs, and so does the host step after it.
+void encodingFailureAfterACommit(const std::string &metallibPath) {
+    MetalBackend backend(metallibPath);
+    MetalBuffer buffer = sharedBuffer(backend, sizeof(uint32_t));
+    auto *value = static_cast<volatile uint32_t *>(buffer.contents());
+    *value = 0;
+    const uint32_t count = 1, one = 1;
+    const std::vector<ComputeDispatch> dispatches(2, addition(buffer, count, one));
+    std::atomic<bool> ran{false};
+    const std::vector<EventStep> steps{{1, {}, 0, EventStep::Kind::Host, [&] { ran = true; }}};
+    id<MTLCommandBuffer> command = [[MTLCreateSystemDefaultDevice() newCommandQueue] commandBuffer];
+    {
+        encodersLeft = 1;
+        MethodReplacement encoders(command, @selector(computeCommandEncoder),
+                                   reinterpret_cast<IMP>(encoderUntilExhausted));
+        originalEncoderAfterCommit = encoders.original;
+        rejects([&] { (void)backend.submitCommandAsync(Command{dispatches, steps}); },
+                "unable to create Metal compute encoder", "a command Metal gave no encoder was submitted");
+    }
+    require(!backend.healthy() &&
+                backend.unhealthyReason().find("Metal command encoding failed: unable to create Metal compute encoder") !=
+                    std::string::npos &&
+                !backend.commandInFlight(),
+            "a failed encoding left the backend healthy or its submission held: " + backend.unhealthyReason());
+    require(waitFor([&] { return ran.load(); }, std::chrono::seconds(5)) && waitFor([&] { return *value == 1; },
+                                                                                       std::chrono::seconds(5)),
+            "the buffer committed before a failed encoding or the host step after it did not run");
+    std::cout << "PASS an encoding failure after a commit marks the backend unhealthy\n";
+}
+
 // A host step that throws fails its command with its message once the
 // command ends; the work after it still runs, the backend is unhealthy, and
 // the failed command reports no round trip. A `timed` that throws leaves its
@@ -2235,6 +2279,7 @@ int main(int argc, const char *argv[]) {
             hostSteps(argv[1]);
             hostStepSpinFallsBack(argv[1]);
             earlyBuffersRunWhileTheRestEncodes(argv[1]);
+            encodingFailureAfterACommit(argv[1]);
             throwingHostStepFailsItsCommand(argv[1]);
             hostStepThen(argv[1]);
             hostStepAfterALongWait(argv[1]);
