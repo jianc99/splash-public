@@ -64,7 +64,7 @@ void addStreamCapture(metal::CommandGraph &graph, const QwenTargetGeometry &geom
   if (slot >= capturedWidth / width)
     throw std::logic_error("Qwen target capture slot past the captured hidden rows");
   ops::HyperConnection::addStreamMean(graph, std::move(streams), std::move(captured),
-                            {destinationRow, capturedWidth, slot * width}, hyperShape(geometry), rows);
+                                      {destinationRow, capturedWidth, slot * width}, hyperShape(geometry), rows);
 }
 
 } // namespace
@@ -136,7 +136,7 @@ void Qwen4ExpTarget::addPrefillLayer(PrefillStep &step, uint32_t index) const {
     linear.addPrefill(step.graph, h.pleRows, ple.key, h.gate, rows, b.linearScratch);
     linear.addPrefill(step.graph, h.pleRows, ple.value, h.pleValue, rows, b.linearScratch);
     ops::NgramEmbedding::addGate(step.graph, h.gate, h.pleValue, h.streams, ple.keyNorm, ple.queryNorm,
-                           ple.convolutionNorm, h.pleGated, h.pleConvolution, ps, rows);
+                                 ple.convolutionNorm, h.pleGated, h.pleConvolution, ps, rows);
     for (const QwenTargetPrefillSequence &sequence : step.sequences) {
       ops::NgramEmbedding::addConvolution(
           step.graph, u16Rows(h.pleConvolution, sequence.rowBegin, sequence.rows, ps.width()),
@@ -146,8 +146,8 @@ void Qwen4ExpTarget::addPrefillLayer(PrefillStep &step, uint32_t index) const {
       // A state captured inside the command holds the history after its row.
       for (const QwenTargetStateCapture &capture : sequence.stateCaptures)
         ops::NgramEmbedding::addHistory(step.graph,
-                                  u16Rows(h.pleConvolution, sequence.rowBegin, capture.row, ps.width()),
-                                  sequence.auxiliaryIn, capture.auxiliary, ps, capture.row);
+                                        u16Rows(h.pleConvolution, sequence.rowBegin, capture.row, ps.width()),
+                                        sequence.auxiliaryIn, capture.auxiliary, ps, capture.row);
     }
   }
   addPrefillMix(step, layer.mixerHyper, b.normalized, h.mixerWeights);
@@ -264,7 +264,7 @@ ops::PreparedInput Qwen4ExpTarget::addVerifyMix(VerifyStep &step, const Qwen4Hyp
   prepared = ops::HyperConnection::addLow(step.graph, h.low, hs, step.rows, scratch, decodeInput(hyper.up, step.lanes));
   addDecodeProjection(step.graph, h.low, hyper.up, h.gate, step.lanes, scratch, std::move(prepared));
   return ops::HyperConnection::addMix(step.graph, h.normalized, h.gate, std::move(output), hs, step.rows, scratch,
-                            next ? decodeInput(*next, step.lanes) : ops::LinearInput::Plain);
+                                      next ? decodeInput(*next, step.lanes) : ops::LinearInput::Plain);
 }
 
 // Every lane's QSA in one dispatch of each kernel. Once a lane's rows attend
@@ -385,8 +385,9 @@ void Qwen4ExpTarget::addStateCommit(metal::CommandGraph &graph, QwenTargetCommit
   const uint64_t laneBytes = uint64_t{kVerifyRows} * shape.width() * sizeof(uint16_t);
   for (uint32_t lane = 0; lane < lanes; ++lane)
     ops::NgramEmbedding::addCommit(graph, backend_.view(convolution, lane * laneBytes, laneBytes),
-                             buffers.auxiliaryIn[lane], buffers.auxiliaryOut[lane],
-                             backend_.view(buffers.retainedCounts, lane * sizeof(uint32_t), sizeof(uint32_t)), shape);
+                                   buffers.auxiliaryIn[lane], buffers.auxiliaryOut[lane],
+                                   backend_.view(buffers.retainedCounts, lane * sizeof(uint32_t), sizeof(uint32_t)),
+                                   shape);
 }
 
 void Qwen4ExpTarget::addPleGather(metal::CommandGraph &graph, const Qwen4Scratch &scratch, uint32_t count) const {
