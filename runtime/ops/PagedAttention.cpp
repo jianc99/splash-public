@@ -35,23 +35,21 @@ KernelLayout storageKernelLayout(kv::Layout layout) {
   throw std::invalid_argument("no KV store kernel for layout");
 }
 
-// The dense page loop's GQA groups read dimension-major values; the sparse
-// group of twelve (Qwen3.8-Flash-Next's QSA) gathers blocks of token-major
-// ones.
-bool sparse(KernelLayout layout) noexcept { return layout == KernelLayout::Kv2Group12; }
-
 KernelLayout attentionKernelLayout(uint32_t queryHeads, kv::Layout layout) {
-  // Select a compiled GQA variant so kernels need no geometry branches.
-  KernelLayout result = storageKernelLayout(layout);
-  // 24 query heads over two KV heads, on the two-head layout's KV storage.
-  if (result == KernelLayout::Kv2Group8 && queryHeads == 24)
-    result = KernelLayout::Kv2Group12;
-  else if (!((result == KernelLayout::Kv4Group6 && queryHeads == 24) ||
-             (result == KernelLayout::Kv2Group8 && queryHeads == 16)))
+  // Select a compiled GQA variant so kernels need no geometry branches. The
+  // value order picks the family: the sparse kernels gather blocks of
+  // token-major values (compiled for Qwen3.8-Flash-Next's 24 query heads
+  // over two KV heads), and the dense page loop reads dimension-major ones.
+  const KernelLayout storage = storageKernelLayout(layout);
+  if (layout.valuesTokenMajor) {
+    if (storage != KernelLayout::Kv2Group8 || queryHeads != 24)
+      throw std::invalid_argument("no sparse attention kernel for layout");
+    return KernelLayout::Kv2Group12;
+  }
+  if (!((storage == KernelLayout::Kv4Group6 && queryHeads == 24) ||
+        (storage == KernelLayout::Kv2Group8 && queryHeads == 16)))
     throw std::invalid_argument("no paged-attention kernel for layout");
-  if (sparse(result) != layout.valuesTokenMajor)
-    throw std::invalid_argument("no paged-attention kernel for the layout's value order");
-  return result;
+  return storage;
 }
 
 // The KV store of a layout's format, KV heads and value order.
@@ -189,7 +187,7 @@ PrefillAttentionPlan PagedAttention::prefillPlan(
                          "prefill_attention_q8_sparse_kv2_g12"),
           pipeline(kernel, "prefill_attention_reduce",
                    "prefill_attention_reduce_kv2_g8", "prefill_attention_sparse_reduce_kv2_g12"),
-          {layout.kvHeads, tiles, splits}, {layout.kvHeads, fusedRows, tiles}, sparse(kernel),
+          {layout.kvHeads, tiles, splits}, {layout.kvHeads, fusedRows, tiles}, layout.valuesTokenMajor,
           layout, queryHeads};
 }
 
@@ -225,7 +223,7 @@ VerifyAttentionPlan PagedAttention::verifyPlan(
           {layout.kvHeads, splits, lanes},
           {layout.kvHeads,
            kv::kVerifyRows * (queryHeads / layout.kvHeads), lanes},
-          sparse(kernel), storePipeline(layout, true),
+          layout.valuesTokenMajor, storePipeline(layout, true),
           {uint64_t{lanes} * 2 * kv::kVerifyRows * layout.kvHeads, 1, 1},
           {layout.headDimension, 1, 1}, layout, queryHeads};
 }
