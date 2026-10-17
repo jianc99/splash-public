@@ -40,6 +40,13 @@ struct MoeTileDescriptor {
 static_assert(sizeof(MoeTileDescriptor) == 8,
               "MoE tile descriptors are 8 bytes on both sides");
 
+// The staged GGUF expert passes (kernels/shared/moe_gguf.metal) run an
+// expert's only tile of at most this many live rows on the column tile, which
+// reads those rows alone, and every other tile on the staged tile's matmuls
+// (moe_column_tile): a route's output depends on its expert's rows in the
+// step.
+#define MOE_GGUF_COLUMN_ROWS 2u
+
 // The column tiles of the gate/up and down passes, whose grids the grouping
 // writes (MoeTileCount).
 struct MoeGroupParams {
