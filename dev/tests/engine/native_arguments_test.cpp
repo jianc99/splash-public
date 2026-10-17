@@ -166,6 +166,7 @@ void testServerCommandLines(const char *path) {
          read.maxContext = 655360;
          read.model.ropeScaling = {2.5, 262144};
        }},
+      {"expert_memory", [](NativeArguments &read) { read.expertMemoryBytes = 16 * kGiB; }},
   };
   // Every field but the model inspected from the directory, whose RoPE
   // scaling --yarn-factor sets.
@@ -183,7 +184,7 @@ void testServerCommandLines(const char *path) {
            read.maxImagePatches == meant.maxImagePatches &&
            read.idleReleaseSeconds == meant.idleReleaseSeconds &&
            read.preventIdleSleep == meant.preventIdleSleep &&
-           read.neuralEngine == meant.neuralEngine;
+           read.neuralEngine == meant.neuralEngine && read.expertMemoryBytes == meant.expertMemoryBytes;
   };
   const auto golden = readGolden(path);
   require(golden.size() == changes.size(),
@@ -237,6 +238,9 @@ void testRefusals() {
   refuses({"auto", "auto", "--idle-sleep", "never"},
           "--idle-sleep requires prevent or allow");
   refuses({"auto", "auto", "--ane", "gpu"}, "--ane requires on or off");
+  // The server passes bytes.
+  for (const char *size : {"0", "16G", ""})
+    refuses({"auto", "auto", "--expert-memory", size}, "--expert-memory requires a positive byte count");
   refuses({"auto", "auto", "--persistent-cache", "yes"}, "--persistent-cache requires on or off");
   refuses({"auto", "auto", "0", "--persistent-cache", "on"},
           "--persistent-cache requires an SSD cache, which MAX_CACHE_DISK_BYTES 0 turns off");
