@@ -2366,7 +2366,10 @@ any, runs on the same thread once the step let the work after it go: CPU work
 the GPU need not wait for, such as starting reads that would hold the GPU's
 start back if they began as the step ends. It does not run after work that
 threw, and must not throw: the command may have completed by then, so a
-`then` that throws marks the backend unhealthy.
+`then` that throws marks the backend unhealthy. A step's work may run after
+its command's wait() threw (the watchdog or a shutdown gave the command up,
+or its encoding failed after its first buffers were committed), so the work
+owns what it touches.
 
 A step about as short as the GPU's wake-up can keep the GPU awake: one GPU
 thread spins through it until the CPU ends it, so the work after it starts at
