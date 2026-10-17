@@ -2358,7 +2358,7 @@ holds with the split it runs.
 A command can run CPU work between its GPU work. A host step
 (`metal::EventStep`, `CommandGraph::host`) runs once all the work before it
 has completed, on one thread of the backend's, and holds the work after it
-until it returns, through a shared event of the backend's: it reads what the
+until it returns, through a shared event of its command's: it reads what the
 GPU wrote before it and writes Shared buffers the GPU reads after it, and it
 must not call the backend. A step after a failed command buffer is skipped,
 and one that throws fails its command with its message. A step's `then`, if

@@ -567,9 +567,10 @@ struct HostSteps {
 // work. Streamed decode runs 4% faster than with a runner that blocks at once
 // (M5 Max, ISTA Q2_0 with 16G of experts: pickup 26 against 70 us), for
 // about half a core while a streamed command runs; waking through
-// MTLSharedEventListener took about 0.3 ms. Once stopping it raises the steps
-// it still holds without running them, so their commands drain; it waits for
-// the work of a step that is running, which nothing can interrupt.
+// MTLSharedEventListener took about 0.3 ms. Once stopping it no longer waits:
+// a step whose work before it has completed still runs, and the others are
+// raised without running, so their commands drain; it waits for the work of a
+// step that is running, which nothing can interrupt.
 class HostStepRunner final {
 public:
     HostStepRunner() : thread_([this] { run(); }) {}
@@ -1600,10 +1601,12 @@ MetalBackend::MetalBackend(std::string metallibPath, double residencyKeepAliveSe
         }
         impl_->asyncState->device = impl_->device;
         // A command takes one Metal command buffer, and one more per buffer
-        // its event steps add (addedBuffers), all created before the first is
-        // committed, and creating one waits while the queue's limit of them
-        // is outstanding: at the default of 64, a 64-layer prefill with a
-        // Neural Engine step each would wait forever.
+        // its event steps add (addedBuffers), and creating one waits while
+        // the queue's limit of them is outstanding. The buffers a command
+        // committed stay outstanding while they wait on its later steps, so
+        // the queue holds as many as a command may take: at the default of
+        // 64, a 64-layer prefill with a Neural Engine step each would wait on
+        // itself.
         impl_->queue = [impl_->device
             newCommandQueueWithMaxCommandBufferCount:kMaximumCommandBuffers];
         if (!impl_->queue) {
