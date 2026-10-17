@@ -122,9 +122,10 @@ void checkDense(const std::filesystem::path &directory) {
 // alpha/beta of any one GGUF tensor type of a format but BF16 and F16
 // (llama.cpp's NVFP4 as NVFP4), on either architecture: one plane tile of rows of
 // that format, the beta then the alpha rows at its native row bytes in grouped
-// head order; a pair of two types or of BF16 or F16, one F32 tensor of the
-// beta then the alpha rows, each decoded unless F32; a type the loader does
-// not read, refused by name.
+// head order; a BF16 pair, one BF16 tensor of the beta then the alpha rows as
+// stored; a pair of two types or of F16, one F32 tensor of the beta then the
+// alpha rows, each decoded unless F32; a type the loader does not read,
+// refused by name.
 void checkQuantizedAlphaBeta(const std::filesystem::path &directory) {
   for (bool moe : {false, true}) {
     const SmallTarget target = smallTarget(moe);
@@ -159,10 +160,6 @@ void checkQuantizedAlphaBeta(const std::filesystem::path &directory) {
                 model::gguf::architecture(g.ffnKind) + ")" + (result.error ? ": " + *result.error : ""));
     }
     using model::gguf::Conversion;
-    const auto conversion = [](uint32_t type) {
-      return type == model::ggml::kF32 ? Conversion::None : Conversion::DequantizeToFloat32;
-    };
-    const uint64_t floatRows = uint64_t{g.gdnValueHeads} * g.hiddenSize * sizeof(float);
     for (const auto &[beta, alpha] : {std::pair{kIQ4_XS, kQ8_0}, std::pair{kQ4_K, model::ggml::kF32},
                                       std::pair{model::ggml::kBF16, model::ggml::kNVFP4},
                                       std::pair{model::ggml::kF32, model::ggml::kBF16},
@@ -171,12 +168,18 @@ void checkQuantizedAlphaBeta(const std::filesystem::path &directory) {
                                       std::pair{model::ggml::kF16, model::ggml::kF16}}) {
       writeGguf(path, tensorsWith(beta, alpha), g);
       const Plan result = plan(path, g);
+      const bool bfloat16 = beta == model::ggml::kBF16 && alpha == model::ggml::kBF16;
+      const auto conversion = [&](uint32_t type) {
+        return type == model::ggml::kF32 || bfloat16 ? Conversion::None : Conversion::DequantizeToFloat32;
+      };
+      const uint64_t rows = uint64_t{g.gdnValueHeads} * g.hiddenSize * (bfloat16 ? sizeof(uint16_t) : sizeof(float));
       const auto *b = copyIn(result, "blk.0.ssm_beta.weight"), *a = copyIn(result, "blk.0.ssm_alpha.weight");
       check(b && a && b->conversion == conversion(beta) && a->conversion == conversion(alpha) &&
-                a->destination == b->destination + floatRows && grouped(b->source.order, 0, 1, g) &&
+                a->destination == b->destination + rows && grouped(b->source.order, 0, 1, g) &&
                 grouped(a->source.order, 0, 1, g) && !repackOf(result.images[0], "blk.0.ssm_beta.weight"),
-            "planner widens alpha/beta into one F32 tensor: " + model::ggmlTypeName(beta) + " beta, " +
-                model::ggmlTypeName(alpha) + " alpha" + (result.error ? ": " + *result.error : ""));
+            std::string("planner makes alpha/beta one ") + (bfloat16 ? "BF16" : "F32") + " tensor: " +
+                model::ggmlTypeName(beta) + " beta, " + model::ggmlTypeName(alpha) + " alpha" +
+                (result.error ? ": " + *result.error : ""));
     }
     writeGguf(path, tensorsWith(kQ8_0, kQ8_1), g);
     check(names(plan(path, g), {"blk.0.ssm_alpha.weight (Q8_1)"}) &&
@@ -214,6 +217,43 @@ void checkMoe(const std::filesystem::path &directory) {
         "planner F32 alpha/beta tensor: beta then alpha rows in grouped order");
   for (const std::string name : {"blk.0.ffn_gate_inp.weight", "blk.0.ffn_gate_inp_shexp.weight"})
     check(asStored(copyOf(layer, name), target.data(name)), "planner copies the F32 tensor as stored: " + name);
+
+  // 16-bit floats as some GGUFs store them: a BF16 router as stored, which the
+  // float projection runs; a BF16 shared-expert scalar gate and BF16 and F16
+  // norms widened to the F32 values they hold. A router of another type is
+  // refused by name.
+  {
+    const auto sixteenPath = directory / "moe-16-bit-floats.gguf";
+    std::vector<Tensor> sixteen = target.tensors;
+    const std::pair<std::string, uint32_t> types[] = {{"blk.0.ffn_gate_inp.weight", model::ggml::kBF16},
+                                                      {"blk.0.ffn_gate_inp_shexp.weight", model::ggml::kBF16},
+                                                      {"blk.0.attn_norm.weight", model::ggml::kF16},
+                                                      {"blk.0.post_attention_norm.weight", model::ggml::kBF16}};
+    for (const auto &[name, type] : types) {
+      Tensor &tensor = tensorNamed(sixteen, name);
+      tensor.type = type;
+      tensor.data.resize(tensor.data.size() / 2);
+    }
+    writeGguf(sixteenPath, sixteen, g);
+    const Plan narrow = plan(sixteenPath, g);
+    check(!narrow.error, "planner plans 16-bit float routers, gates and norms" +
+                             (narrow.error ? ": " + *narrow.error : ""));
+    if (!narrow.error) {
+      const auto *router = copyOf(narrow.images[0], "blk.0.ffn_gate_inp.weight");
+      check(asStored(router, tensorNamed(sixteen, "blk.0.ffn_gate_inp.weight").data) &&
+                router->source.type == model::ggml::kBF16,
+            "planner keeps a BF16 router as stored");
+      for (const auto &[name, type] : types) {
+        if (name == "blk.0.ffn_gate_inp.weight") continue;
+        const auto *copy = copyOf(narrow.images[0], name);
+        check(copy && copy->conversion == model::gguf::Conversion::WidenToFloat32,
+              "planner widens the " + model::ggmlTypeName(type) + " " + name + " to F32");
+      }
+    }
+    tensorNamed(sixteen, "blk.0.ffn_gate_inp.weight").type = model::ggml::kF16;
+    writeGguf(sixteenPath, sixteen, g);
+    check(names(plan(sixteenPath, g), {"blk.0.ffn_gate_inp.weight (F16)"}), "planner refuses an F16 router by name");
+  }
 
   // Each quantized tensor is repacked on its own, a 3-D expert tensor as one
   // tensor of experts * N rows.

@@ -207,6 +207,11 @@ void quantizeRows(const gguf::TensorRows &rows, uint64_t start, uint64_t count, 
   }
 }
 
+// The float the bits of a BF16 or, with float16, an F16 value hold.
+float widenFloat16(uint16_t bits, bool float16) {
+  return float16 ? static_cast<float>(std::bit_cast<__fp16>(bits)) : widenBfloat16(bits);
+}
+
 // Native NVFP4 bytes [column, column + span) of `count` rows of llama.cpp's
 // NVFP4 from source row `start` on, back to back: per 256 elements the 16
 // UE4M3 scales of four block_nvfp4 as the E4M3 scales they are (llama.cpp
@@ -282,12 +287,12 @@ void narrowToBfloat16(const uint8_t *values, uint64_t count, uint8_t *to, const 
   }
 }
 
-// Writes the F32 values `count` BF16 values equal.
-void widenToFloat32(const uint8_t *values, uint64_t count, uint8_t *to) {
+// Writes the F32 values `count` BF16 (or, with float16, F16) values equal.
+void widenToFloat32(const uint8_t *values, uint64_t count, bool float16, uint8_t *to) {
   for (uint64_t i = 0; i < count; ++i) {
-    uint16_t value;
-    std::memcpy(&value, values + 2 * i, 2);
-    const uint32_t widened = uint32_t{value} << 16;
+    uint16_t bits;
+    std::memcpy(&bits, values + 2 * i, 2);
+    const float widened = widenFloat16(bits, float16);
     std::memcpy(to + 4 * i, &widened, 4);
   }
 }
@@ -313,12 +318,16 @@ uint64_t copyBytes(const gguf::Copy &copy) {
 
 // The tasks that write a copy into image, each of whole rows within
 // kLoadStepBytes or, for a wider row, a piece of whole values (whole native
-// blocks of rows a reader builds) of one row: a copy as stored reads in
-// place, a converted one through its thread's staging.
+// blocks of rows a reader builds, whole blocks of a GGUF tensor decoded to
+// F32) of one row: a copy as stored reads in place, a converted one through
+// its thread's staging.
 void addCopyTasks(uint8_t *image, const gguf::Copy &copy,
                   std::vector<std::function<void(std::vector<uint8_t> &)>> &tasks) {
   const gguf::TensorRows &rows = copy.source;
-  const uint64_t unit = rowReader(rows) == RowReader::Stored ? 4 : nativeFormat(rows).block_bytes;
+  const uint64_t unit = rowReader(rows) != RowReader::Stored ? nativeFormat(rows).block_bytes
+                        : copy.conversion == gguf::Conversion::DequantizeToFloat32
+                            ? kQuantFormats[gguf_format_of(rows.type)].block_bytes
+                            : 4;
   const uint64_t span = std::min<uint64_t>(rows.rowBytes, kLoadStepBytes / unit * unit);
   const uint64_t batch = span == rows.rowBytes ? kLoadStepBytes / rows.rowBytes : 1;
   for (uint64_t first = 0; first < rows.rows; first += batch) {
@@ -338,7 +347,9 @@ void addCopyTasks(uint8_t *image, const gguf::Copy &copy,
         case gguf::Conversion::NarrowToBfloat16:
           narrowToBfloat16(staging.data(), count * width / 4, to, rows.name);
           break;
-        case gguf::Conversion::WidenToFloat32: widenToFloat32(staging.data(), count * width / 2, to); break;
+        case gguf::Conversion::WidenToFloat32:
+          widenToFloat32(staging.data(), count * width / 2, rows.type == ggml::kF16, to);
+          break;
         case gguf::Conversion::CenteredNorm: centeredNorm(staging.data(), count * width / 2, to); break;
         case gguf::Conversion::Decay: {
           const bool bfloat16 = rows.type == ggml::kBF16;
