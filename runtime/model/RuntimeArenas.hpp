@@ -65,11 +65,13 @@ struct RuntimeGeometry final {
         model.target);
     result.target.kvLayout = model.targetKvLayout(kvFormat);
     result.target.stateLayout = model.stateLayout(stateFormat).target;
+    result.target.ropeScaling = model.descriptor.ropeScaling;
     if (model.expertStore()) result.prefillChunks = kPrefillGroupChunks;
     result.targetScratch = std::visit(
         [&](const auto &weights) { return qwenTargetScratchBytes(weights, result.target, result.prefillChunks); },
         model.target);
     if (!result.target.valid() || !result.draft.stateLayout().valid() ||
+        result.target.contextTokens() != model.descriptor.capabilities.maximumContextTokens ||
         result.target.hiddenSize != result.draft.hiddenSize ||
         result.target.vocabularySize != result.draft.vocabularySize ||
         result.target.capturedHiddenSize() != result.draft.targetHiddenSize()) {
@@ -226,11 +228,9 @@ public:
         get(PrefillTensor::DraftInverseFrequencies).contents());
     if (!target || !draft)
       throw std::logic_error("RoPE frequencies are not CPU-visible");
-    for (uint32_t dim = 0; dim < geometry.target.rotaryPairs; ++dim) {
-      target[dim] =
-          std::pow(geometry.target.rotaryTheta,
-                   -static_cast<float>(dim) / geometry.target.rotaryPairs);
-    }
+    rotaryInverseFrequencies(geometry.target.rotaryTheta, geometry.target.rotaryPairs,
+                             geometry.target.ropeScaling,
+                             {target, geometry.target.rotaryPairs});
     for (uint32_t dim = 0; dim < geometry.draftRotaryPairs(); ++dim) {
       draft[dim] = std::pow(geometry.draft.rotaryTheta,
                             -static_cast<float>(dim) / geometry.draftRotaryPairs());
