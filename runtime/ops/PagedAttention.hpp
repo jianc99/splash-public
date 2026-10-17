@@ -138,7 +138,7 @@ struct VerifyAttentionPlan final {
   const kv::Layout layout;
   const uint32_t queryHeads;
   const uint32_t lanes;
-  // Each lane's history-scaled split count (a sparse lane's, the most a
+  // Each lane's history-scaled split count (a sparse lane's, the most its
   // list takes); splits is their maximum, the split grid and the slot stride
   // of every lane's partials. The workspace covers the maximum split count
   // for every lane regardless of history.
