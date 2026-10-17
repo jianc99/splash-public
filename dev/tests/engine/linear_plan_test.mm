@@ -8,6 +8,7 @@
 #include "metal/abi/Gguf.h"
 #include "metal/abi/QuantFormat.h"
 
+#include <algorithm>
 #include <array>
 #include <cstring>
 #include <initializer_list>
@@ -129,13 +130,17 @@ void requireAnchorSplits(const LinearPlan &plan, const SplitAnchor &anchor, cons
 constexpr auto kNone = LinearEpilogue::None, kResidual = LinearEpilogue::Residual, kGateUp = LinearEpilogue::GateUp;
 
 // Six threadgroups per core, at least 512 inputs per partition, for every
-// projection kind.
+// projection kind; at most four partitions on the 32-row tile.
 constexpr std::array kStagedSplitAnchors{
     SplitAnchor{"27B down", 16, 5120, 17408, 8, kResidual, 1, 2},
     SplitAnchor{"27B down", 20, 5120, 17408, 8, kResidual, 1, 2},
     SplitAnchor{"27B down", 10, 5120, 17408, 8, kResidual, 1, 1},
     SplitAnchor{"27B down", 40, 5120, 17408, 8, kResidual, 1, 4},
     SplitAnchor{"35B output projection", 16, 2048, 4096, 8, kResidual, 1, 4},
+    SplitAnchor{"35B output projection", 32, 2048, 4096, 8, kResidual, 1, 8},
+    SplitAnchor{"35B output projection, two lanes", 32, 2048, 4096, 16, kResidual, 1, 8},
+    SplitAnchor{"35B output projection, three lanes", 32, 2048, 4096, 24, kResidual, 1, 4},
+    SplitAnchor{"35B output projection, four lanes", 32, 2048, 4096, 32, kResidual, 1, 4},
     SplitAnchor{"35B shared-expert gate/up", 16, 512, 2048, 8, kGateUp, 1, 4},
     SplitAnchor{"27B gate/up", 16, 17408, 5120, 8, kGateUp, 1, 1},
     SplitAnchor{"two-segment fused projection", 16, 4096, 5120, 8, kNone, 2, 2},
@@ -461,8 +466,9 @@ void scratchBoundsRotated() {
 // The GGUF decode split rules are per-core laws, checked at every core count
 // (zero is the fallback), both families and a grid of widths, inputs, epilogues
 // and segment counts rather than at the measured machines:
-// - a request's sums do not depend on the requests it is batched with: the whole
-//   plan is the same at every batch width;
+// - the tile, its walk and its input are the same at every batch width, and so
+//   is the split count but on the 32-row staged tile of Apple10 and later,
+//   which takes at most four partitions;
 // - a split count is a power of two up to eight whose partitions keep the kernel's
 //   floor (register: one 256-input unit, staged: 512 inputs in whole 32-input
 //   groups);
@@ -490,8 +496,11 @@ void ggufCoreLaws() {
               const LinearConfig c = one.configuration();
               for (const uint32_t rows : {16U, 24U, 32U}) {
                 const LinearPlan wider = plan(linear, n, rows);
-                require(wider.configuration() == c && wider.input() == one.input(),
-                        "GGUF decode plan depends on the batch width");
+                LinearConfig expected = c;
+                if (family != 9 && c.tile == LinearTile::GgufStaged && rows > 16)
+                  expected.splits = std::min(c.splits, 4U);
+                require(wider.configuration() == expected && wider.input() == one.input(),
+                        "GGUF decode plan depends on the batch width past the staged tile's split bound");
               }
               const uint32_t s = c.splits;
               const bool staged = c.tile == LinearTile::GgufStaged;

@@ -1851,7 +1851,9 @@ storage. Prefill runs the staged kernels on both families: the 128-row prefill t
 (`LinearTile::GgufPrefill`), and the staged tile for chunks of up to 32 rows. Every projection
 splits its K across threadgroups by one rule (`decodeSplits`: each tile's tiers of threadgroups
 per core and inputs per partition, from measured occupancy, Apple9's staged tile taking the
-register tile's) that does not depend on the batch width. The MoE experts
+register tile's) that does not depend on the batch width, but that on Apple10 and later the
+32-row staged tile (three and four lanes, prefill chunks of 17 to 32 rows) takes at most four partitions
+(`stagedMaximumSplits`), so there a lane's sums can depend on the lanes beside it. The MoE experts
 (`runtime/ops/MoE.cpp`) run the same numerics per family over the grouped rows: the register
 form in `linear_gguf_sgmatrix.metal`, the staged one in `kernels/shared/moe_gguf.metal`, which
 Apple9 takes for experts mostly in the formats it stages (`MoeShape::expertFormat`) and for

@@ -34,20 +34,22 @@ std::string prefillKernel(const char *format, char epilogue) {
 // K splits of a decode tile, one rule for both tiles. A tier asks for more
 // partitions while the grid holds fewer than `threadgroups` threadgroups per
 // core and each partition would still keep `inputs` inputs; the split count
-// doubles, up to the maximum, while some tier asks. Decode K is a multiple of 256,
-// so eight partitions always hold whole 32-input groups. The rule ignores the
-// batch width: bounds that depended on it did not pay on either family.
+// doubles, up to `maximum`, while some tier asks. Decode K is a multiple of
+// 256, so eight partitions always hold whole 32-input groups. The tiers ignore
+// the batch width (bounds on threadgroups that depended on it did not pay on
+// either family); the staged tile's maximum does not (stagedMaximumSplits).
 struct SplitTier {
   uint32_t threadgroups;
   uint32_t inputs;
 };
-uint32_t decodeSplits(uint32_t n, uint32_t k, uint32_t cores, std::span<const SplitTier> tiers) {
+uint32_t decodeSplits(uint32_t n, uint32_t k, uint32_t cores, std::span<const SplitTier> tiers,
+                      uint32_t maximum = LinearConfig::kMaximumSplits) {
   const uint64_t grid = n / GGUF_TILE_COLUMNS;
   uint32_t splits = 1;
   const auto asks = [&](const SplitTier &t) {
     return grid * splits < uint64_t{t.threadgroups} * cores && k / (2 * splits) >= t.inputs;
   };
-  while (splits < LinearConfig::kMaximumSplits && std::any_of(tiers.begin(), tiers.end(), asks)) splits *= 2;
+  while (splits < maximum && std::any_of(tiers.begin(), tiers.end(), asks)) splits *= 2;
   return splits;
 }
 
@@ -79,12 +81,27 @@ std::span<const SplitTier> stagedTiers(GpuFamilyClass family) noexcept {
   return kStagedTiers;
 }
 
+// The most K partitions the staged tile of a decode step or short prefill
+// chunk of `rows` rows takes on `family`: four on its 32-row tile (three and
+// four lanes), whose 32 rows of fp32 partials every partition writes and the
+// last one to arrive reads back. Where the tier asks for eight, four took less
+// time at three and four lanes on every 27B and 35B decode shape measured
+// (MLX 4-bit, Q4_K, Q5_K, Q6_K): on a 32-core M5 Max 26% on the 35B's
+// 2048 x 4096 output projections, 18-21% on 2048 x 5120 and 6-8% on 1024 and
+// 1280 x 5120; on a 20-core M5 Pro 13-15% on 1024 and 1280 x 5120. At one lane
+// eight stay 5-24% faster there, and at two lanes as fast (-8..+6%). Apple9
+// keeps its tiers' rule, which was fitted at one to four lanes.
+constexpr uint32_t stagedMaximumSplits(GpuFamilyClass family, uint32_t rows) noexcept {
+  return family != GpuFamilyClass::Apple9 && stagedTileRows(rows) == 32 ? 4 : LinearConfig::kMaximumSplits;
+}
+
 // The decode tile configurations over an n x k matrix on `cores` cores.
 LinearConfig registerDecode(uint32_t n, uint32_t k, uint32_t cores) {
   return {.tile = LinearTile::GgufRegister, .splits = decodeSplits(n, k, cores, kRegisterTiers)};
 }
-LinearConfig stagedDecode(uint32_t n, uint32_t k, uint32_t cores, GpuFamilyClass family) {
-  return {.tile = LinearTile::GgufStaged, .splits = decodeSplits(n, k, cores, stagedTiers(family))};
+LinearConfig stagedDecode(uint32_t n, uint32_t k, uint32_t cores, GpuFamilyClass family, uint32_t rows) {
+  return {.tile = LinearTile::GgufStaged,
+          .splits = decodeSplits(n, k, cores, stagedTiers(family), stagedMaximumSplits(family, rows))};
 }
 
 // Whether the staged decode tiles on `cores` cores of `family` spread their
@@ -95,8 +112,9 @@ constexpr bool spreadsStagedDecode(GpuFamilyClass family, uint32_t cores) noexce
 }
 // A gate/up pair of n x k tensors in one pass, its K split as one projection
 // of the pair's 2n columns.
-LinearConfig oneGateUpPassDecode(uint32_t n, uint32_t k, uint32_t cores, GpuFamilyClass family) {
-  return {.tile = LinearTile::GgufStaged, .splits = decodeSplits(2 * n, k, cores, stagedTiers(family)),
+LinearConfig oneGateUpPassDecode(uint32_t n, uint32_t k, uint32_t cores, GpuFamilyClass family, uint32_t rows) {
+  return {.tile = LinearTile::GgufStaged,
+          .splits = decodeSplits(2 * n, k, cores, stagedTiers(family), stagedMaximumSplits(family, rows)),
           .spread = true, .oneGateUpPass = true};
 }
 // Whether a gate/up plan's projections, up then gate, are single tensors of
@@ -283,7 +301,8 @@ LinearConfig Linear::ggufBaseline(LinearWorkload w, std::span<const Projection *
   if (w.phase == LinearPhase::Prefill)
     return w.rows <= kMaximumDecodeTileRows
         ? LinearConfig{.tile = LinearTile::GgufStaged,
-                       .splits = decodeSplits(n, k, gpuCores_, stagedTiers(family_))}
+                       .splits = decodeSplits(n, k, gpuCores_, stagedTiers(family_),
+                                              stagedMaximumSplits(family_, w.rows))}
         : LinearConfig{.tile = LinearTile::GgufPrefill};
   // Apple9 runs matrix operations on the FP32 pipe, so the exact register
   // kernel beats staging but for the projections apple9Stages names.
@@ -309,19 +328,20 @@ LinearConfig Linear::ggufBaseline(LinearWorkload w, std::span<const Projection *
   // Pro); 8-bit, whose pair streams near DRAM's rate either way, takes 0.1-0.6%
   // more. A 12-core M6 holds 45 chains of the pair per core, saturated, where
   // one pass took 2-11% more.
-  LinearConfig config = stagedDecode(n, k, gpuCores_, family_);
+  LinearConfig config = stagedDecode(n, k, gpuCores_, family_, w.rows);
   config.spread = spreadsStagedDecode(family_, gpuCores_);
   if (config.spread && w.epilogue == LinearEpilogue::GateUp && oneFormat(projections))
-    return oneGateUpPassDecode(n, k, gpuCores_, family_);
+    return oneGateUpPassDecode(n, k, gpuCores_, family_, w.rows);
   return config;
 }
 
 LinearScratchSize Linear::ggufDecodeScratchSize(LinearWorkload w) const {
   const auto [n, k] = w.matrix;
   LinearScratchSize size = LinearPlan(w, ggufBaseline(w)).scratchSize();
-  if (family_ == GpuFamilyClass::Apple9) size.include(LinearPlan(w, stagedDecode(n, k, gpuCores_, family_)).scratchSize());
+  if (family_ == GpuFamilyClass::Apple9)
+    size.include(LinearPlan(w, stagedDecode(n, k, gpuCores_, family_, w.rows)).scratchSize());
   if (w.epilogue == LinearEpilogue::GateUp && spreadsStagedDecode(family_, gpuCores_))
-    size.include(LinearPlan(w, oneGateUpPassDecode(n, k, gpuCores_, family_)).scratchSize());
+    size.include(LinearPlan(w, oneGateUpPassDecode(n, k, gpuCores_, family_, w.rows)).scratchSize());
   return size;
 }
 
