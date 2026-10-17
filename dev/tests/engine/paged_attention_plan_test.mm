@@ -11,8 +11,10 @@
 #include <array>
 #include <cmath>
 #include <cstring>
+#include <functional>
 #include <iostream>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <tuple>
@@ -527,8 +529,12 @@ void checkBf16StoreEdges(metal::MetalBackend &backend) {
 
 enum class Phase : uint8_t { Prefill, Verify };
 
+// With `locate`, the lists are made in a command of their own, which locate
+// then reads to give the attention their entries' locations
+// (ops::AttentionBlocks::locations).
 template <Phase phase>
-std::vector<uint16_t> run(metal::MetalBackend &backend, Case &data, bool testBounds) {
+std::vector<uint16_t> run(metal::MetalBackend &backend, Case &data, bool testBounds,
+                          const std::function<void(ops::AttentionBlocks &)> &locate = {}) {
   constexpr bool prefill = phase == Phase::Prefill;
   const auto plan = [&] {
     if constexpr (prefill)
@@ -586,6 +592,11 @@ std::vector<uint16_t> run(metal::MetalBackend &backend, Case &data, bool testBou
     ops::PagedAttention::addBlockLists(graph, masks, data.maskWords, sequences,
                                        prefill ? kv::kPrefillAttentionTileRows : kv::kVerifyRows, blocks);
   }
+  if (locate) {
+    (void)backend.submitCommandAsync(graph.dispatches()).wait();
+    graph = {};
+    locate(blocks);
+  }
   const size_t first = graph.dispatches().size();
   if constexpr (prefill) {
     ops::PagedAttention::addPrefillStore(graph, data.layer, data.keys, data.values,
@@ -623,7 +634,12 @@ std::vector<uint16_t> run(metal::MetalBackend &backend, Case &data, bool testBou
     require(graph.dispatches().size() == first + 3, "production verify should encode store/split/reduce");
     const auto &split = graph.dispatches()[first + 1];
     const auto &reduce = graph.dispatches()[first + 2];
-    require(split.pipelineName == plan.splitPipeline && reduce.pipelineName == plan.reducePipeline &&
+    // Through locations the verify runs the plan's located split.
+    const std::string_view splitPipeline =
+        !blocks.locations                            ? plan.splitPipeline
+        : data.layout.format == kv::Format::BFloat16 ? "verify_attention_bf16_sparse_located_kv2_g12"
+                                                     : "verify_attention_q8_sparse_located_kv2_g12";
+    require(split.pipelineName == splitPipeline && reduce.pipelineName == plan.reducePipeline &&
                 split.threadgroups.y == plan.splits && split.threadgroups.z == plan.splitGroups.z &&
                 reduce.threadgroups.y == plan.reduceGroups.y &&
                 reduce.threadgroups.z == plan.reduceGroups.z,
@@ -689,6 +705,78 @@ void checkPrefill(metal::MetalBackend &backend, uint32_t heads, kv::Layout layou
   }
   std::cout << "paged prefill: format=" << kv::formatName(layout.format) << " q=" << heads << " history=" << history
             << " rows=" << rows << " PASS\n";
+}
+
+// Verify through block locations (ops::AttentionBlocks::locations, as a
+// sparse KV store gives them): each lane's listed blocks of its committed
+// history copied to pages of a pool of their own, in reverse order and to
+// other places in their pages, every third entry and the blocks the step
+// writes left to the page table, attend as the lists alone do, bit for bit.
+void checkVerifyLocations(metal::MetalBackend &backend, uint32_t heads, kv::Layout layout) {
+  auto data = makeCase(backend, heads, layout, 3, 8, 1023, true);
+  setQsaMasks(data);
+  const std::vector<uint16_t> baseline = run<Phase::Verify>(backend, data, false);
+  constexpr uint32_t kBlockTokens = SPLASH_ATTENTION_BLOCK_TOKENS, kPageBlocks = kv::kPageTokens / kBlockTokens;
+  const auto *counts = static_cast<const uint32_t *>(nullptr);
+  std::optional<HostKvExtents> located;
+  metal::MetalBuffer locations, locationPages;
+  uint32_t placed = 0, paged = 0;
+  const std::vector<uint16_t> output = run<Phase::Verify>(backend, data, false, [&](ops::AttentionBlocks &blocks) {
+    counts = static_cast<const uint32_t *>(blocks.counts.contents());
+    uint32_t entries = 0;
+    for (uint32_t lane = 0; lane < data.lanes; ++lane) entries += counts[lane];
+    const uint32_t pages = (entries + kPageBlocks - 1) / kPageBlocks + 1;
+    kv::Layout poolLayout = data.layout;
+    poolLayout.attentionLayers = kLayer + 1;
+    located.emplace(backend, poolLayout, data.pool.extentPages(),
+                    (pages + data.pool.extentPages() - 1) / data.pool.extentPages());
+    locations = allocate(backend, uint64_t{data.lanes} * blocks.stride * sizeof(uint32_t));
+    std::vector<uint32_t> all(located->pageCount());
+    for (uint32_t page = 0; page < all.size(); ++page) all[page] = page;
+    locationPages = allocate(backend, all.size() * sizeof(SplashKvPage));
+    located->writeTable(all, locationPages.contents());
+    const auto *lists = static_cast<const uint32_t *>(blocks.lists.contents());
+    auto *out = static_cast<uint32_t *>(locations.contents());
+    uint32_t slot = located->pageCount() * kPageBlocks;
+    const bool int8 = data.layout.format == kv::Format::Int8;
+    for (uint32_t lane = 0; lane < data.lanes; ++lane)
+      for (uint32_t entry = 0; entry < counts[lane]; ++entry) {
+        const uint32_t block = lists[lane * blocks.stride + entry] >> SPLASH_ATTENTION_BLOCK_ROW_BITS;
+        uint32_t &location = out[lane * blocks.stride + entry];
+        if (entry % 3 == 0 || (block + 1) * kBlockTokens > data.stores[lane].committed_tokens) {
+          location = SPLASH_ATTENTION_PAGED;
+          ++paged;
+          continue;
+        }
+        location = --slot;
+        ++placed;
+        const uint32_t source = data.page(lane, block * kBlockTokens), target = slot / kPageBlocks;
+        for (uint32_t head = 0; head < data.layout.kvHeads; ++head)
+          for (uint32_t token = 0; token < kBlockTokens; ++token) {
+            const uint32_t from = block % kPageBlocks * kBlockTokens + token;
+            const uint32_t to = slot % kPageBlocks * kBlockTokens + token;
+            const uint64_t bytes = 256 * (int8 ? 1 : 2);
+            for (const uint32_t tensor : {SPLASH_KV_KEYS, SPLASH_KV_VALUES})
+              std::memcpy(located->slab<std::byte>(kLayer, tensor, target) +
+                              (tensor == SPLASH_KV_KEYS ? splash_kv_key_element(head, to, 0)
+                                                        : data.pool.valueElement(head, to, 0)) * bytes / 256,
+                          data.pool.slab<std::byte>(kLayer, tensor, source) +
+                              (tensor == SPLASH_KV_KEYS ? splash_kv_key_element(head, from, 0)
+                                                        : data.pool.valueElement(head, from, 0)) * bytes / 256,
+                          bytes);
+            if (int8)
+              for (const uint32_t tensor : {SPLASH_KV_KEY_SCALES, SPLASH_KV_VALUE_SCALES})
+                located->slab<float>(kLayer, tensor, target)[splash_kv_scale_element(head, to)] =
+                    data.pool.slab<float>(kLayer, tensor, source)[splash_kv_scale_element(head, from)];
+          }
+      }
+    blocks.locations = locations;
+    blocks.locationPages = locationPages;
+  });
+  require(placed && paged, "the location test placed no block or left none to the page table");
+  require(output == baseline, "verify through block locations differs from the lists alone");
+  std::cout << "paged sparse verify through locations: format=" << kv::formatName(layout.format) << " blocks="
+            << placed << " paged=" << paged << " PASS\n";
 }
 
 void checkVerify(metal::MetalBackend &backend, uint32_t heads, kv::Layout layout,
@@ -1009,17 +1097,34 @@ void attentionBlocks(metal::MetalBackend &backend) {
       metal::CommandGraph prefillGraph, verifyGraph;
       addPrefill(prefillGraph, {listBuffer, counts, listStride, first});
       addVerify(verifyGraph, {listBuffer, counts, listStride, first});
+      // The located verify split also binds the lists' locations and their
+      // pages.
       const auto bindsLists = [&](const metal::ComputeDispatch &split, const metal::ComputeDispatch &reduce,
-                                  uint32_t tablesEnd) {
-        return split.buffers.size() == tablesEnd + 2 && split.buffers[tablesEnd].buffer.sameView(boundLists) &&
+                                  uint32_t tablesEnd, uint32_t after) {
+        return split.buffers.size() == tablesEnd + 2 + after && split.buffers[tablesEnd].buffer.sameView(boundLists) &&
                split.buffers[tablesEnd + 1].buffer.sameView(boundCounts) && split.bytes.size() == 1 &&
-               split.bytes[0].index == tablesEnd + 2 && reduce.buffers.size() == 4 &&
+               split.bytes[0].index == tablesEnd + 2 + after && reduce.buffers.size() == 4 &&
                reduce.buffers[3].buffer.sameView(boundCounts) && reduce.bytes.size() == 1 &&
                reduce.bytes[0].index == 4;
       };
-      require(bindsLists(prefillGraph.dispatches()[0], prefillGraph.dispatches()[1], 4) &&
-                  bindsLists(verifyGraph.dispatches()[1], verifyGraph.dispatches()[2], 7),
+      require(bindsLists(prefillGraph.dispatches()[0], prefillGraph.dispatches()[1], 4, 0) &&
+                  bindsLists(verifyGraph.dispatches()[1], verifyGraph.dispatches()[2], 7, 0) &&
+                  verifyGraph.dispatches()[1].pipelineName == verify.splitPipeline,
               "a sparse kernel's block lists are not bound before its parameters");
+      if (listStride) {
+        metal::CommandGraph located;
+        const metal::MetalBuffer locations = buffer(uint64_t{lists} * entries * 4), pages = buffer(64);
+        addVerify(located, {listBuffer, counts, listStride, first, locations, pages});
+        const metal::ComputeDispatch &split = located.dispatches()[1];
+        require(bindsLists(split, located.dispatches()[2], 7, 2) && split.buffers[9].buffer.sameView(locations) &&
+                    split.buffers[10].buffer.sameView(pages) &&
+                    split.pipelineName == "verify_attention_q8_sparse_located_kv2_g12",
+                "a verify split does not bind its lists' locations and their pages before its parameters");
+        rejects([&] {
+          metal::CommandGraph refused;
+          addVerify(refused, {listBuffer, counts, listStride, first, locations, {}});
+        }, "attention block locations need lists and their pages", "locations without their pages were taken");
+      }
       kv::PrefillAttentionParams prefillParams;
       std::memcpy(&prefillParams, prefillGraph.dispatches()[0].bytes[0].data, sizeof(prefillParams));
       bool listed = prefillParams.block_stride == listStride && prefillParams.block_list == first;
@@ -1276,6 +1381,7 @@ int main(int argc, char **argv) {
         setQsaMasks(verify);
         checkReference(verify, run<Phase::Verify>(backend, verify, false));
         std::cout << "paged sparse attention: format=" << kv::formatName(format) << " PASS\n";
+        checkVerifyLocations(backend, heads, layout);
       }
     }
     std::cout << "paged attention plans: PASS\n";
