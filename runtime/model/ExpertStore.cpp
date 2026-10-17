@@ -115,18 +115,18 @@ struct Places final {
 };
 
 // What a store's blocks alone decide (the store and ExpertStore::
-// fixedBytes): each block's size, the sizes' layouts and blocks, and the
-// native bytes of each projection of a place, the most of a streamed size's
-// expert (of any size's when none streams: the staging then only reads the
-// sizes of one block, Impl::fill).
+// fixedBytes): each block's layout, the layouts and their blocks, and the
+// native bytes of each projection of a place, the most of a streamed
+// layout's expert (of any layout's when none streams: the staging then only
+// reads the sizes of one block, Impl::fill).
 struct Geometry final {
-  std::vector<uint32_t> sizeOf;
+  std::vector<uint32_t> layoutOf;
   std::vector<ExpertLayout> layouts;
   std::vector<uint32_t> blocks;
   std::array<uint64_t, 3> nativeBytes{};
 
-  // A size of several blocks streams; one of one block holds every expert.
-  [[nodiscard]] bool streams(uint32_t size) const noexcept { return blocks[size] > 1; }
+  // A layout of several blocks streams; one of one block holds every expert.
+  [[nodiscard]] bool streams(uint32_t layout) const noexcept { return blocks[layout] > 1; }
 };
 
 Geometry geometryOf(const StreamedBlocks &streamed, ops::MoeShape shape) {
@@ -135,18 +135,19 @@ Geometry geometryOf(const StreamedBlocks &streamed, ops::MoeShape shape) {
   for (const gguf::StreamedExperts &experts : streamed.blocks) {
     const ExpertLayout layout = expertLayout(experts, shape);
     const auto found = std::ranges::find(g.layouts, layout);
-    const uint32_t size = static_cast<uint32_t>(found - g.layouts.begin());
+    const uint32_t index = static_cast<uint32_t>(found - g.layouts.begin());
     if (found == g.layouts.end()) {
       g.layouts.push_back(layout);
       g.blocks.push_back(0);
     }
-    ++g.blocks[size];
-    g.sizeOf.push_back(size);
+    ++g.blocks[index];
+    g.layoutOf.push_back(index);
   }
   const bool streaming = std::ranges::any_of(g.blocks, [](uint32_t blocks) { return blocks > 1; });
-  for (uint32_t size = 0; size < g.layouts.size(); ++size)
-    if (g.streams(size) || !streaming)
-      for (size_t z = 0; z < 3; ++z) g.nativeBytes[z] = std::max(g.nativeBytes[z], g.layouts[size][z].nativeBytes());
+  for (uint32_t layout = 0; layout < g.layouts.size(); ++layout)
+    if (g.streams(layout) || !streaming)
+      for (size_t z = 0; z < 3; ++z)
+        g.nativeBytes[z] = std::max(g.nativeBytes[z], g.layouts[layout][z].nativeBytes());
   return g;
 }
 
@@ -193,12 +194,15 @@ struct ExpertStore::Impl {
     std::vector<Group> groups;
     std::vector<Piece> pieces;
   };
-  // The experts of one size: their slots in an arena; a streamed size's
-  // recycled least recently used first, a long prefill chunk's loads before
-  // the others.
+  // The experts of one layout in one arena (of some of its blocks, when the
+  // layout's would exceed the largest buffer): their slots, a streamed
+  // size's recycled least recently used first, a long prefill chunk's loads
+  // before the others.
   struct Size final {
     ExpertLayout layout;
     uint32_t blocks = 0;
+    // Whether its layout is of several blocks (Geometry::streams).
+    bool streams = false;
     uint32_t slots = 0;
     // Projection z's plane i from regions[z][i] of the arena on.
     std::array<std::array<uint64_t, 3>, 3> regions{};
@@ -290,7 +294,7 @@ struct ExpertStore::Impl {
   [[nodiscard]] uint32_t roundPlaces(ops::MoePhase phase, uint64_t routable) const noexcept {
     return phase == ops::MoePhase::Decode && routable <= places.count ? places.count : places.count / 2;
   }
-  [[nodiscard]] bool streams(uint32_t block) const noexcept { return geometry.streams(blocks[block].size); }
+  [[nodiscard]] bool streams(uint32_t block) const noexcept { return sizes[blocks[block].size].streams; }
   // Adds to `reads` a group of the experts from `expert` on at the places
   // from `place` on of `staged`, `count` of them, read in pieces of at most
   // pieceBytes (whole pages, or whole rows for a built run), and returns it.
@@ -797,20 +801,20 @@ ExpertStore::ExpertStore(metal::MetalBackend &backend, StreamedBlocks streamed, 
   const Geometry &geometry = impl.geometry;
   if (!options.memoryBytes || !impl.readers) throw std::invalid_argument("invalid expert store");
   impl.checks = std::move(streamed.checks);
-  for (uint32_t size = 0; size < geometry.layouts.size(); ++size)
-    impl.sizes.push_back({.layout = geometry.layouts[size], .blocks = geometry.blocks[size]});
   for (uint32_t block = 0; block < streamed.blocks.size(); ++block)
-    impl.blocks.push_back({.size = geometry.sizeOf[block],
-                           .experts = std::move(streamed.blocks[block]),
-                           .slot = std::vector<uint32_t>(shape.experts, kNoSlot)});
+    impl.blocks.push_back(
+        {.experts = std::move(streamed.blocks[block]), .slot = std::vector<uint32_t>(shape.experts, kNoSlot)});
   const uint64_t fixed = fixedBytesOf(geometry, static_cast<uint32_t>(impl.blocks.size()), shape);
   const uint64_t arenaBudget = options.memoryBytes > fixed ? options.memoryBytes - fixed : 0;
+  const uint64_t largest = options.bufferBytes && options.bufferBytes < backend.capabilities().maxBufferLengthBytes
+                               ? options.bufferBytes
+                               : backend.capabilities().maxBufferLengthBytes;
   // Every streamed size holds the same share of its experts, but at least a
   // block's (a prefill chunk may route them all) and at most all of them; a
   // size of one block all of its: the largest share the arena holds.
   const auto slotsAt = [&](uint32_t size, double share) {
-    const uint64_t all = uint64_t{geometry.blocks[size]} * shape.experts;
-    if (!geometry.streams(size)) return all;
+    const uint64_t all = uint64_t{impl.sizes[size].blocks} * shape.experts;
+    if (!impl.sizes[size].streams) return all;
     return std::clamp<uint64_t>(static_cast<uint64_t>(share * double(all)), shape.experts, all);
   };
   const auto bytesAt = [&](double share) {
@@ -819,17 +823,46 @@ ExpertStore::ExpertStore(metal::MetalBackend &backend, StreamedBlocks streamed, 
       bytes += arenaBytes(impl.sizes[size].layout, slotsAt(size, share));
     return bytes;
   };
-  if (bytesAt(0.0) > arenaBudget)
-    throw std::invalid_argument("expert memory of " + std::to_string(options.memoryBytes >> 20) +
-                                " MiB holds fewer slots (" + std::to_string(bytesAt(0.0) >> 20) +
-                                " MiB) than a block's experts of each size and every expert of a size of one block, "
-                                "beside the staging and tables (" +
-                                std::to_string(fixed >> 20) + " MiB)");
-  double low = 0.0, high = 1.0;
-  if (bytesAt(high) <= arenaBudget) low = high;
-  for (int step = 0; step < 64 && low < high; ++step) {
-    const double middle = (low + high) / 2;
-    (bytesAt(middle) <= arenaBudget ? low : high) = middle;
+  // Each layout's blocks in parts[layout] sizes of consecutive blocks: one,
+  // and one more while a size's arena takes more than the largest buffer.
+  std::vector<uint32_t> parts(geometry.layouts.size(), 1), sizeLayout;
+  double low = 0.0;
+  for (;;) {
+    impl.sizes.clear();
+    sizeLayout.clear();
+    for (uint32_t layout = 0; layout < geometry.layouts.size(); ++layout) {
+      std::vector<uint32_t> members;
+      for (uint32_t block = 0; block < impl.blocks.size(); ++block)
+        if (geometry.layoutOf[block] == layout) members.push_back(block);
+      for (uint32_t part = 0; part < parts[layout]; ++part) {
+        const size_t from = members.size() * part / parts[layout], to = members.size() * (part + 1) / parts[layout];
+        for (size_t member = from; member < to; ++member)
+          impl.blocks[members[member]].size = static_cast<uint32_t>(impl.sizes.size());
+        impl.sizes.push_back({.layout = geometry.layouts[layout],
+                              .blocks = static_cast<uint32_t>(to - from),
+                              .streams = geometry.streams(layout)});
+        sizeLayout.push_back(layout);
+      }
+    }
+    if (bytesAt(0.0) > arenaBudget)
+      throw std::invalid_argument("expert memory of " + std::to_string(options.memoryBytes >> 20) +
+                                  " MiB holds fewer slots (" + std::to_string(bytesAt(0.0) >> 20) +
+                                  " MiB) than a block's experts of each size and arena and every expert of a size "
+                                  "of one block, beside the staging and tables (" +
+                                  std::to_string(fixed >> 20) + " MiB)");
+    double high = 1.0;
+    low = 0.0;
+    if (bytesAt(high) <= arenaBudget) low = high;
+    for (int step = 0; step < 64 && low < high; ++step) {
+      const double middle = (low + high) / 2;
+      (bytesAt(middle) <= arenaBudget ? low : high) = middle;
+    }
+    uint32_t over = 0;
+    while (over < impl.sizes.size() && arenaBytes(impl.sizes[over].layout, slotsAt(over, low)) <= largest) ++over;
+    if (over == impl.sizes.size()) break;
+    if (impl.sizes[over].blocks == 1)
+      throw std::invalid_argument("a block's experts take more than the device's largest buffer");
+    ++parts[sizeLayout[over]];
   }
   for (uint32_t index = 0; index < impl.sizes.size(); ++index) {
     Impl::Size &size = impl.sizes[index];

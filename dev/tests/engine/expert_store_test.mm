@@ -11,8 +11,9 @@
 // across a release while the next block's experts are read ahead; a read
 // ahead that fails fails no load that does not route its expert, a read of a
 // routed expert that fails fails the load, and a source written since it was
-// opened fails the load's command, which the store reports; and memory one
-// byte short of a block's slots is refused.
+// opened fails the load's command, which the store reports; memory one
+// byte short of a block's slots is refused; and a size whose slots would take
+// more than the largest buffer keeps its blocks in arenas that fit.
 #include "MoeFixture.hpp"
 #include "TestAdmission.hpp"
 #include "TestChecks.hpp"
@@ -680,6 +681,50 @@ int streamedRefusal(MetalBackend &backend, const MoeShape &shape, const std::fil
   return 0;
 }
 
+// A streamed size whose slots would take more than the largest buffer
+// (ExpertStoreOptions::bufferBytes) keeps its blocks in arenas that each fit,
+// each recycling its own slots: four blocks of one layout, in memory for two
+// arenas of a block's experts and three more, under a largest buffer of one,
+// take two arenas of two blocks. Each block's long chunk and decode step give
+// the resident experts' bits.
+int streamedSplitArenas(MetalBackend &backend, const MoeShape &shape, const std::filesystem::path &directory) {
+  const Model m = makeModel(backend, shape, Q4K, true);
+  ExpertFile file(m, directory / "experts.bin");
+  StreamedBlocks blocks = file.blocks;
+  blocks.blocks.insert(blocks.blocks.end(), file.blocks.blocks.begin(), file.blocks.blocks.end());
+  const uint64_t arena = arenaBytes(m, shape.experts + 3);
+  ExpertStoreOptions options = storeOptions(2 * arena + kSpareBytes, blocks, shape);
+  options.bufferBytes = arena + kSpareBytes;
+  ExpertStore store(backend, blocks, shape, options);
+  std::array<BlockMoeWeights, 4> streamed{m.weights, m.weights, m.weights, m.weights};
+  for (uint32_t block = 0; block < 4; ++block) store.bind(block, streamed[block]);
+  const auto arenaOf = [&](uint32_t block) { return streamed[block].gate.routed.plane0.contents(); };
+  int failures = 0;
+  if (arenaOf(0) != arenaOf(1) || arenaOf(2) != arenaOf(3) || arenaOf(0) == arenaOf(2) ||
+      store.stats().slots < 2 * shape.experts || store.stats().arenaBytes > 2 * (arena + kSpareBytes)) {
+    printf("  split arenas: blocks are not in two arenas of two, or they hold %llu slots in %llu bytes FAIL\n",
+           (unsigned long long)store.stats().slots, (unsigned long long)store.stats().arenaBytes);
+    ++failures;
+  }
+  const MoePlan chunk = prefillPlan(shape, kMaximumRows), decode = MoE::decodePlan(shape, 2, MoeConfig{});
+  Buffers b;
+  for (const MoePlan *plan : {&chunk, &decode})
+    for (uint32_t block = 0; block < 4; ++block) {
+      freshRows(backend, b, shape);
+      const std::vector<uint16_t> want = runWeights(backend, m.weights, b, *plan);
+      if (runWeights(backend, streamed[block], b, *plan) != want ||
+          !slotsHoldTheirExperts(m, streamed[block], b, *plan)) {
+        printf("  split arenas, block %u %s: output or slots differ from the resident experts' FAIL\n", block,
+               plan == &chunk ? "chunk" : "decode step");
+        ++failures;
+      }
+    }
+  printf("streamed experts in arenas of at most the largest buffer, two of two blocks: bitwise the resident "
+         "experts' %s\n",
+         failures ? "FAIL" : "ok");
+  return failures;
+}
+
 // A source written since it was opened fails the load that reads it, which
 // fails its command, and every later load; the store reports why.
 int streamedSourceChanges(const std::string &metallibPath, const MoeShape &shape,
@@ -743,6 +788,7 @@ int main(int argc, const char *argv[]) {
                     streamedRounds(backend, shape, directory.path()) +
                     streamedReadFailures(argv[1], shape, directory.path()) +
                     streamedRefusal(backend, shape, directory.path()) +
+                    streamedSplitArenas(backend, shape, directory.path()) +
                     streamedSourceChanges(argv[1], shape, directory.path());
       }
       if (failures) {

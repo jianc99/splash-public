@@ -285,6 +285,9 @@ place (`target_weights_bytes`). Off by default.
   chunk's last repack, one more host step reads nearly all of the next
   layer's into the whole staging. A read ahead of an expert no load routes may
   fail without failing anything.
+- Experts of one format share an arena of slots; when it would take more than
+  the device's largest buffer (`maxBufferLength`), their layers are split
+  between arenas that each fit, each recycling its own slots.
 - A host step (`metal::EventStep`) runs CPU work between a command's GPU work
   and holds the work after it until it returns. A decode step's keep the GPU
   awake: one GPU thread spins through each until the CPU ends it, so the work

@@ -7,8 +7,10 @@
 // resident and streamed experts run the same kernels.
 //
 // Experts of one size (the formats and shapes of their gate, up and down
-// projections) share an arena of slots. A size of several blocks streams:
-// its slots are recycled least recently used first across its blocks,
+// projections) share an arena of slots, or several, each of some of its
+// blocks, when one would take more than the device's largest buffer. A size
+// of several blocks streams: an arena's slots are recycled least recently
+// used first across its blocks,
 // those a long prefill chunk loaded before the others (Impl::route). A size
 // of one block (a layer whose experts take formats no other layer's do, as a
 // dynamic quantization leaves some) holds every one of its experts: they are
@@ -95,6 +97,9 @@ struct ExpertStoreOptions final {
   uint64_t memoryBytes = 0;
   // The readers its reads run on, which a model's streamed weights share.
   std::shared_ptr<WeightReaders> readers;
+  // The most bytes one arena takes: the device's largest buffer
+  // (maxBufferLength) when zero or more.
+  uint64_t bufferBytes = 0;
 };
 
 class ExpertStore final : public ops::MoeExpertStream, public WeightMemory {
