@@ -43,11 +43,12 @@ inline constexpr uint32_t kVerifySplits = 32;
 inline constexpr uint32_t kVerifyPagesPerSplit = 16;
 static_assert(kVerifySplits <= kVerifyMaximumSplits);
 
-// One lane's verify split count: one split per kVerifyPagesPerSplit
-// pages its history and verify rows fill, never fewer than kVerifySplits
-// and never more than the maximum the partial workspace is sized for. It
-// depends only on the lane's own history, so batching never changes a
-// lane's arithmetic.
+// One lane's verify split count of the page loop: one split per
+// kVerifyPagesPerSplit pages its history and verify rows fill, never fewer
+// than kVerifySplits and never more than the maximum the partial workspace
+// is sized for. It depends only on the lane's own history, so batching never
+// changes a lane's arithmetic; a sparse lane's splits likewise follow its own
+// block list alone (kernels/common/sparse_attention_tile.h).
 [[nodiscard]] constexpr uint32_t
 verifyAttentionSplits(uint32_t committedTokens) noexcept {
   const uint64_t visible = uint64_t{committedTokens} + kVerifyRows;
@@ -131,9 +132,10 @@ struct VerifyAttentionPlan final {
   const kv::Layout layout;
   const uint32_t queryHeads;
   const uint32_t lanes;
-  // Each lane's history-scaled split count; splits is their maximum, the
-  // split grid and the slot stride of every lane's partials. The workspace
-  // covers the maximum split count for every lane regardless of history.
+  // Each lane's history-scaled split count (a sparse lane's, the most a
+  // list takes); splits is their maximum, the split grid and the slot stride
+  // of every lane's partials. The workspace covers the maximum split count
+  // for every lane regardless of history.
   const std::array<uint32_t, SPLASH_MAXIMUM_BATCH_WIDTH> laneSplits;
   const uint32_t splits;
   const AttentionWorkspace workspace;

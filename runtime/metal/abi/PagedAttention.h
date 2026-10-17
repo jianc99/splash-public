@@ -58,6 +58,9 @@ static_assert(sizeof(SplashChunkedPrefillParams) == 24,
 // its history.
 #define SPLASH_ATTENTION_BLOCK_TOKENS 4u
 #define SPLASH_ATTENTION_BLOCK_ROW_BITS 8u
+// A sparse split takes at least this many entries of its tile's list, so
+// that a lane's split count follows its list, not its history.
+#define SPLASH_SPARSE_SPLIT_BLOCKS 48u
 
 static_assert(SPLASH_MAXIMUM_PHYSICAL_KV_TOKENS / SPLASH_ATTENTION_BLOCK_TOKENS <
                   1u << (32 - SPLASH_ATTENTION_BLOCK_ROW_BITS),

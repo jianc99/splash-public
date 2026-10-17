@@ -877,15 +877,19 @@ void checkReduce(id<MTLDevice> device, id<MTLCommandQueue> queue,
   };
   // The prefill tile holds as many rows as a verify lane.
   static_assert(SPLASH_PREFILL_ATTENTION_TILE_ROWS == SPLASH_TARGET_VERIFY_ROWS);
-  const uint32_t committed = splits * 32 - activeRows;
+  // A history every split takes a share of: a page each of the page loop's,
+  // and of a sparse reduce without lists the least blocks a split takes.
+  const uint32_t splitTokens = shape.sparse() ? SPLASH_SPARSE_SPLIT_BLOCKS * SPLASH_ATTENTION_BLOCK_TOKENS : 32;
+  const uint32_t committed = splits * splitTokens - activeRows;
+  const uint32_t pages = splits * splitTokens / 32;
   id<MTLBuffer> verify;
   if (activeRows == kRows) {
-    const VerifyAttentionParams params{committed, splits, {1, 0}, splits, splits, 0, 0};
+    const VerifyAttentionParams params{committed, pages, {1, 0}, splits, splits, 0, 0};
     verify = reduce("verify", params);
     check(verify);
   }
   if (splits <= SPLASH_PREFILL_ATTENTION_MAXIMUM_SPLITS) {
-    const PrefillAttentionParams params{committed, activeRows, kStride, splits, {1, 0}, splits, 0, 0};
+    const PrefillAttentionParams params{committed, activeRows, kStride, pages, {1, 0}, splits, 0, 0};
     id<MTLBuffer> prefill = reduce("prefill", params);
     check(prefill);
     if (verify)
@@ -949,6 +953,13 @@ void run(const char *libraryPath) {
       runCase(device, queue, pipelines, shape, 4'093, 8, 3, false, 65, true);
       runCase(device, queue, pipelines, shape, 32'768, 7, 1, false, kVerifySplits, true);
       runCase(device, queue, pipelines, shape, 32'768, 8, 2, false, 65, true);
+      // At a long history the sparse kernels agree with the reference
+      // through a list, whose count sets a split's share, and without one,
+      // over every block as the page loop attends them (past 64K tokens of
+      // full attention the bf16 probabilities' rounding alone moves the
+      // output past the cosine bound).
+      runCase(device, queue, pipelines, shape, 131'072, 8, 2, false, kVerifyMaximumSplits, true);
+      runCase(device, queue, pipelines, shape, 65'536, 8, 1, false, kVerifyMaximumSplits);
     }
   }
   std::cout << "q8_flash_attention_metal_test: ok\n";
