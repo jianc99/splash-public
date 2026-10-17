@@ -1475,7 +1475,7 @@ and lists every unsupported tensor in one error:
 
 - linears and experts: Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, Q4_0, Q4_1,
   Q5_0, Q5_1, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS,
-  IQ4_NL, MXFP4, NVFP4, PQ2_0, BF16 or F16;
+  IQ4_NL, MXFP4, NVFP4, PQ2_0, Q2_0, BF16 or F16;
 - token embeddings: any of the linears' formats;
 - norms, the MoE router and shared-expert scalar gate, and the GDN
   convolution, decay and time-step bias: F32;
@@ -1493,7 +1493,7 @@ a quantized file keeps unquantized: UD-Q8_K_XL keeps the 27B's attention
 projections and LM head and some of the 35B-A3B's projections and experts in
 BF16, and other publishers keep alpha and beta, GDN projections, experts or
 the token table in F16. Their planes hold the values as stored, with an FP32
-scale of 1 per 256 values; the staged tiles round each value once to half, the
+scale of 1 per 64 values; the staged tiles round each value once to half, the
 Apple9 register tile reads BF16 exactly and takes no F16, so a projection with
 an F16 weight stages there, as do all of a model's experts when any expert
 weight is F16. Whole-BF16 and F16 models are not a target: before any weight
@@ -1509,7 +1509,12 @@ selection stores alpha and beta in the file type's format (Q4_K in a Q4_K_M),
 as in lmstudio-community's files, so those load too. A format's image takes
 the bits per weight of its GGUF blocks, but for Q3_K's and Q6_K's padded meta
 units (1/16 bit more), IQ3_S's chunk words (4.06 bits for its 3.44) and BF16's
-and F16's scales (1/8 bit more).
+and F16's scales (1/2 bit more). Qwen3.8-Flash-Next's hyper-connection
+projections are the exception to loading a GGUF's formats as stored: those of
+BF16 or F16 (ISTA-DASLab's files keep them so) load as Q8_0, the type Unsloth's
+files store them in, quantized from their values as llama.cpp quantizes:
+every decode cycle reads all of them, and Q8_0 holds a value in little more
+than half the bytes. The gates they make move by less than one bf16 step.
 
 A MoE layer may hold its routed experts' gate and up weights in llama.cpp's
 fused `ffn_gate_up_exps` (`create_tensor_gate_up_exps`, as byteshape's files
@@ -1814,14 +1819,16 @@ for the draft, `GgufTargetLoader` (`GgufTarget.cpp`, planned by
 `GgufImage.cpp`) and `GgufPreparation` for a GGUF target, `VisionLoader` and
 `VisionPreparation` for a safetensors or GGUF vision tower. `GgufPreparation`
 repacks GGUF blocks ([GGUF targets](#gguf-targets)) and safetensors tensors
-without requantization, quantizes the draft's BF16 projections
+without requantization, but for the Q8_0 of Flash-Next's BF16 or F16
+hyper-connection projections, quantizes the draft's BF16 projections
 ([Drafts](#drafts)), and computes a safetensors target's GDN decay as
 `float(-exp(double(A_log)))`, which may differ by one float ULP from MLX's float
 exponential.
 
 Loading never rounds a target or vision weight but in the F32 values of
-quantized tensors the kernels read unquantized, and in two conversions: the
-GDN decay above and the RMSNorm weights below. The first are a safetensors
+quantized tensors the kernels read unquantized, in the Q8_0 of Flash-Next's
+BF16 or F16 hyper-connection projections ([GGUF targets](#gguf-targets)), and
+in two conversions: the GDN decay above and the RMSNorm weights below. The first are a safetensors
 target's quantized router and shared-expert gate, and its quantized GDN alpha
 or beta beside one of another format or an unquantized one, an MLX target's
 ([MLX targets](#mlx-targets)) or a Model Optimizer or compressed-tensors
