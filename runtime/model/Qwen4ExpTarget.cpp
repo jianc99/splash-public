@@ -2,6 +2,7 @@
 
 #include "metal/abi/Qwen4.h"
 #include "model/Qwen4Exp.hpp"
+#include "model/SparseRowStore.hpp"
 #include "ops/Embedding.hpp"
 #include "ops/HyperConnection.hpp"
 #include "ops/NgramEmbedding.hpp"
@@ -78,6 +79,7 @@ std::vector<metal::MetalBuffer> Qwen4ExpTarget::addPrefill(metal::CommandGraph &
     steps[index].blocks = steps_.preparePrefill(index, chunks[index]);
     steps[index].indexOffsets = offsets;
   }
+  steps_.readAhead(chunks);
   return addPrefillLayers(std::span(steps), *this);
 }
 
@@ -391,7 +393,16 @@ void Qwen4ExpTarget::addStateCommit(metal::CommandGraph &graph, QwenTargetCommit
 }
 
 void Qwen4ExpTarget::addPleGather(metal::CommandGraph &graph, const Qwen4Scratch &scratch, uint32_t count) const {
-  ops::Embedding::add(graph, scratch.pleIndices, weights_.pleTable, scratch.pleRows, count);
+  if (!weights_.pleStore) {
+    ops::Embedding::add(graph, scratch.pleIndices, weights_.pleTable, scratch.pleRows, count);
+    return;
+  }
+  // At most `count` distinct rows, each slot below it: the gather of the
+  // table's rows with the staging as a table of `count` rows, so a row's
+  // values are computed exactly as from the table.
+  const ops::EmbeddingWeights staged{count, geometry_.pleHeadDimension,
+                                     ops::NativeRows(scratch.pleStaging, weights_.pleFormat)};
+  ops::Embedding::add(graph, scratch.pleSlots, staged, scratch.pleRows, count);
 }
 
 void includeFamilyProjections(QwenTargetGeometry &geometry, const Qwen4ExpWeights &weights) {
@@ -420,9 +431,9 @@ std::unique_ptr<QwenTarget> makeQwenTarget(const Qwen4ExpWeights &weights, const
   return std::make_unique<Qwen4ExpTarget>(weights, geometry, backend, operators, prefillChunks);
 }
 
-QwenTargetScratchBytes qwenTargetScratchBytes(const Qwen4ExpWeights &, const QwenTargetGeometry &geometry,
+QwenTargetScratchBytes qwenTargetScratchBytes(const Qwen4ExpWeights &weights, const QwenTargetGeometry &geometry,
                                               uint32_t prefillChunks) {
-  return Qwen4Steps::scratchBytes(geometry, prefillChunks);
+  return Qwen4Steps::scratchBytes(weights, geometry, prefillChunks);
 }
 
 } // namespace splash::model
