@@ -30,17 +30,19 @@
 // A mix over `streams` streams of `hidden` values per row: its norm and
 // injection (norm), its low-rank gate (low, `rank` values) and its average
 // (mix); or the injection of a block's output (combine) and the streams'
-// start (init).
+// start (init). With `combine`, the norm first adds a block's pending output
+// to the streams, as combine would.
 struct HyperConnectionParams {
   uint32_t rows;
   uint32_t hidden;
   uint32_t streams;
   uint32_t rank;
-  uint32_t inject; // norm: whether to compute injection weights
+  uint32_t inject;  // norm: whether to compute injection weights
+  uint32_t combine; // norm: whether to add a pending block output first
 };
 
-static_assert(sizeof(HyperConnectionParams) == 20,
-              "hyper-connection parameters are 20 bytes on both sides");
+static_assert(sizeof(HyperConnectionParams) == 24,
+              "hyper-connection parameters are 24 bytes on both sides");
 
 // The mean of each of `rows` rows of `streams` streams of `hidden` fp32
 // values (hyper_connection_stream_mean), written as bf16 at column `column`

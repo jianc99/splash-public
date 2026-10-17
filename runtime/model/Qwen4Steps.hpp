@@ -25,9 +25,10 @@ struct Qwen4ExpWeights;
 class SparseRowStore;
 
 // The scratch of a step's rows (a prefill chunk's or a decode step's): the
-// fp32 residual streams, a mix's normalized streams, low-rank and gate rows
-// and injection weights, a block's branch and the zero rows the MoE adds its
-// output to, the PLE layer's row ids, gathered rows, projections, gated
+// fp32 residual streams, a mix's normalized streams, low-rank and gate rows,
+// the injection weights of a layer's mixer mix and of its FFN mix (the next
+// mix's norm adds a block's output with them while writing its own), a
+// block's branch and the zero rows the MoE adds its output to, the PLE layer's row ids, gathered rows, projections, gated
 // values and convolution inputs, and the QSA indexer's projections, prepared
 // queries, scores of scoreRows rows of scoreStride each, block bitmaps of
 // maskWords words per row, and the block lists of the attention's tiles of rows (listStride
@@ -39,7 +40,8 @@ struct Qwen4Scratch final {
   metal::MetalBuffer normalized;
   metal::MetalBuffer low;
   metal::MetalBuffer gate;
-  metal::MetalBuffer weights;
+  metal::MetalBuffer mixerWeights;
+  metal::MetalBuffer ffnWeights;
   metal::MetalBuffer branch;
   metal::MetalBuffer zeros;
   metal::MetalBuffer pleIndices;

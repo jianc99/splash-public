@@ -24,19 +24,31 @@ struct HyperShape final {
   [[nodiscard]] constexpr uint32_t width() const noexcept { return hidden * streams; }
 };
 
+// A block's output the streams have not taken yet: its rows (bf16, hidden
+// values each) and the injection weights of the mix before the block (fp32
+// [rows][streams]), which the next mix's norm adds to the streams first, as
+// HyperConnection::addCombine would. Empty when the streams have taken every
+// block's output.
+struct HyperBranch final {
+  metal::MetalBuffer rows;
+  metal::MetalBuffer weights;
+  explicit operator bool() const noexcept { return static_cast<bool>(rows); }
+};
+
 struct HyperConnection final {
   // streams[r] = rows of fp32 [streams][hidden], each a copy of embedding[r].
   static void addInit(metal::CommandGraph &graph, metal::MetalBuffer embedding, metal::MetalBuffer streams,
                       HyperShape shape, uint32_t rows);
   // The normalized streams (bf16) and, with inject, the injection weights
   // (fp32 [rows][streams]), of the shape its kernels are compiled for
-  // (HYPER_CONNECTION_NORM_HIDDEN). With a table `layout` (decode rows), also
-  // the table in `scratch` that the projection reading the output takes,
-  // which then prepares none (ops::Linear PreparedInput).
-  static PreparedInput addNorm(metal::CommandGraph &graph, metal::MetalBuffer streams, const NormWeights &norm,
-                               metal::MetalBuffer inject, metal::MetalBuffer normalized, metal::MetalBuffer weights,
-                               HyperShape shape, uint32_t rows, LinearScratch scratch = {},
-                               LinearInput layout = LinearInput::Plain);
+  // (HYPER_CONNECTION_NORM_HIDDEN), after the `pending` block output joins the
+  // streams, which it stores. With a table `layout` (decode rows), also the
+  // table in `scratch` that the projection reading the output takes, which
+  // then prepares none (ops::Linear PreparedInput).
+  static PreparedInput addNorm(metal::CommandGraph &graph, metal::MetalBuffer streams, const HyperBranch &pending,
+                               const NormWeights &norm, metal::MetalBuffer inject, metal::MetalBuffer normalized,
+                               metal::MetalBuffer weights, HyperShape shape, uint32_t rows,
+                               LinearScratch scratch = {}, LinearInput layout = LinearInput::Plain);
   // silu(low / streams) in place or, with a table layout, into the table
   // alone, leaving `low` as it was.
   static PreparedInput addLow(metal::CommandGraph &graph, metal::MetalBuffer low, HyperShape shape, uint32_t rows,
