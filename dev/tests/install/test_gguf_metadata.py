@@ -244,6 +244,55 @@ class GgufMetadataTests(unittest.TestCase):
         with self.assertRaisesRegex(models.ModelError, "duplicate GGUF tensor: t"):
             gguf.Metadata(path, tensors=True)
 
+    def test_split_headers_merge_in_split_order_or_are_refused(self):
+        # A GGUF split in two as llama.cpp's gguf-split writes it: every
+        # part's split keys, the first part's other keys, tensors in both.
+        def part(number, tensors, *, count=2, total=4):
+            values = {"general.architecture": "qwen35"} if number == 0 else {}
+            values |= {"split.no": number, "split.count": count}
+            values["split.tensors.count"] = total
+            path = write_gguf(self.root / "part.gguf", values, tensors.items())
+            return gguf.Metadata(path, tensors=True)
+
+        first = {"a": GGML["Q4_K"], "b": GGML["F32"]}
+        second = {"c": GGML["Q8_0"], "d": GGML["F32"]}
+        merged = gguf.merged_split([part(0, first), part(1, second)])
+        self.assertEqual(merged.values["general.architecture"], "qwen35")
+        self.assertEqual(merged.tensors, first | second)
+        for case, headers, reason in (
+            ("a lone part", [part(0, first)], "do not match its split.count"),
+            (
+                "parts out of order",
+                [part(1, second), part(0, first)],
+                "GGUF split file 1 is out of order",
+            ),
+            (
+                "a wrong split.no",
+                [part(0, first), part(2, second)],
+                "GGUF split file 2 is out of order",
+            ),
+            (
+                "a part of another split.count",
+                [part(0, first), part(1, second, count=3)],
+                "GGUF split file 2 is out of order",
+            ),
+            (
+                "a tensor in both parts",
+                [part(0, first), part(1, {"b": GGML["F32"]} | second)],
+                "duplicate GGUF tensor across split files: b",
+            ),
+            (
+                "a split.tensors.count the parts do not hold",
+                [part(0, first, total=5), part(1, second, total=5)],
+                "the GGUF's split files hold another number of tensors",
+            ),
+        ):
+            with (
+                self.subTest(case),
+                self.assertRaisesRegex(models.ModelError, reason),
+            ):
+                gguf.merged_split(headers)
+
     def test_bpe_ids_special_tokens_normalization_and_local_reload(self):
         metadata = self.metadata(fixture())
         files = gguf.tokenizer_files(metadata)
