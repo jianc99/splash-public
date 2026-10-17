@@ -196,17 +196,18 @@ struct HostStepTiming {
 // thread spins through the step so the GPU stays awake and starts the work
 // after it at once and at full clocks: for steps about as short as the GPU's
 // wake-up (a streamed decode load), not for long ones, where the spin saves
-// little. The spin sees the CPU end it through a memory scope Metal's public
-// headers leave out, so the backend checks once, before the first command
-// with an awake step, that it does; if not, awake steps run as plain ones,
-// with a warning. The steps of the committed commands run in order on one
-// thread of the backend's; a step is skipped when the command buffer before
-// it failed. If it throws, the command fails with its message (its ticket's
-// wait() throws); the work after it still runs. Once a command completed
-// without a failure, `timed` gets the round trip of each of its host steps
-// (HostStepTiming); one that throws marks the backend unhealthy, as a
-// completion callback that throws does. A command run under dispatch
-// profiling reports no round trip.
+// little. The spin, host_step_wait of host-step.metallib beside the
+// backend's metallib, sees the CPU end it through a memory scope Metal's
+// public headers leave out, so the backend checks, before the first command
+// with an awake step, that it does; without that library, or if it does not,
+// awake steps run as plain ones, with a warning. The steps of the committed
+// commands run in order on one thread of the backend's; a step is skipped
+// when the command buffer before it failed. If it throws, the command fails
+// with its message (its ticket's wait() throws); the work after it still
+// runs. Once a command completed without a failure, `timed` gets the round
+// trip of each of its host steps (HostStepTiming); one that throws marks the
+// backend unhealthy, as a completion callback that throws does. A command
+// run under dispatch profiling reports no round trip.
 struct EventStep {
   enum class Kind : uint8_t { Signal, Wait, Host };
 

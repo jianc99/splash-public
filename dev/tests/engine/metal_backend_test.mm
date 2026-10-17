@@ -2,6 +2,7 @@
 #include "../../../runtime/metal/MetalBackend.hpp"
 #include "TestBuffers.hpp"
 #include "TestChecks.hpp"
+#include "TestFiles.hpp"
 #include "TestStderr.hpp"
 
 #import <Foundation/Foundation.h>
@@ -48,9 +49,11 @@ using splash::metal::IndirectGrid;
 using splash::metal::MetalBackend;
 using splash::metal::MetalBackendError;
 using splash::metal::SharedEvent;
+using splash::test::TemporaryDirectory;
 using splash::test::capturedStderr;
 using splash::test::rejects;
 using splash::test::sharedBuffer;
+using splash::test::writeFile;
 using splash::metal::MetalBuffer;
 using splash::metal::kResidencyKeepAliveSeconds;
 
@@ -1683,10 +1686,15 @@ id noCommandQueue(id, SEL) { return nil; }
 CFTimeInterval startedLate(id, SEL) { return std::numeric_limits<CFTimeInterval>::max(); }
 
 // Awake host steps run as plain ones, with one warning, when the backend
-// cannot check their spin, as when Metal creates no queue for the check. A
-// check whose every spin started after its release, as when the GPU is busy
-// with other work, decides nothing and warns of nothing: a later check spins.
+// cannot build or check their spin or a spin ran past its release: without
+// host-step.metallib beside the backend's library, with one Metal cannot
+// load, with one whose host_step_wait never sees its release (the test
+// library's, metal_backend_test.metal), and when Metal creates no queue for
+// the check. A check whose every spin started after its release, as when the
+// GPU is busy with other work, decides nothing and warns of nothing: a later
+// check spins.
 void hostStepSpinFallsBack(const std::string &metallibPath) {
+    namespace fs = std::filesystem;
     constexpr std::string_view kWarning = "Metal host steps run without keeping the GPU awake";
     const auto runAwakeSteps = [](MetalBackend &backend) {
         MetalBuffer buffer = sharedBuffer(backend, sizeof(uint32_t));
@@ -1711,6 +1719,24 @@ void hostStepSpinFallsBack(const std::string &metallibPath) {
         require(backend.healthy() && !BackendInstrumentation::awakeHostStepsSpin(backend),
                 "awake host steps without their spin marked the backend unhealthy or spun");
     };
+    TemporaryDirectory directory("splash-host-step");
+    const fs::path library = directory.path() / "test.metallib";
+    const fs::path spinLibrary = directory.path() / "host-step.metallib";
+    fs::copy_file(metallibPath, library);
+    {
+        MetalBackend backend(library.string());
+        fallsBack(backend, spinLibrary.string());
+    }
+    writeFile(spinLibrary, "not a metallib");
+    {
+        MetalBackend backend(library.string());
+        fallsBack(backend, "unable to load metallib");
+    }
+    fs::copy_file(library, spinLibrary, fs::copy_options::overwrite_existing);
+    {
+        MetalBackend backend(library.string());
+        fallsBack(backend, "did not see the CPU's release");
+    }
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
     {
         MetalBackend backend(metallibPath);

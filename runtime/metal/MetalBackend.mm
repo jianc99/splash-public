@@ -21,6 +21,7 @@
 #include <condition_variable>
 #include <cstring>
 #include <deque>
+#include <filesystem>
 #include <limits>
 #include <mutex>
 #include <new>
@@ -156,6 +157,9 @@ constexpr uint32_t kHostStepWaitLoads = 1u << 18;
 // Where in the spin's release buffer (HostStepSpin) host_step_wait writes the
 // release it saw: a cache line past the counter the CPU raises (word 0).
 constexpr NSUInteger kHostStepSeenOffset = 128;
+// The library of host_step_wait, beside the backend's own: built apart, as
+// its compiler may refuse it (Makefile), and loaded only for awake steps.
+constexpr std::string_view kHostStepLibrary = "host-step.metallib";
 // How long after a spin check that decided nothing (every spin started after
 // its release, the GPU busy with other work) awake steps check it again.
 constexpr auto kHostStepSpinRecheck = std::chrono::seconds(10);
@@ -242,6 +246,31 @@ NSString *checkedNSString(std::string_view value, std::string_view field) {
         throw MetalBackendError(std::string(field) + " is not UTF-8");
     }
     return result;
+}
+
+id<MTLLibrary> loadLibrary(id<MTLDevice> device, const std::string &metallibPath) {
+    NSString *path = checkedNSString(metallibPath, "metallib path");
+    NSError *error = nil;
+    NSData *fileData = [NSData dataWithContentsOfFile:path
+                                             options:0
+                                               error:&error];
+    if (!fileData) {
+        throw MetalBackendError(
+            "unable to read metallib " + metallibPath + ": " +
+            errorDescription(error));
+    }
+    // The library keeps the bytes read here, whatever later replaces the
+    // path; the dispatch data retains them rather than copying them.
+    dispatch_data_t data = dispatch_data_create(
+        fileData.bytes, fileData.length, nullptr, ^{ (void)fileData; });
+    error = nil;
+    id<MTLLibrary> library = [device newLibraryWithData:data error:&error];
+    if (!library) {
+        throw MetalBackendError(
+            "unable to load metallib " + metallibPath + ": " +
+            errorDescription(error));
+    }
+    return library;
 }
 
 }  // namespace
@@ -874,15 +903,15 @@ struct MetalBackend::Impl {
         }
         if (const auto cached = pipelines.find(name); cached != pipelines.end())
             return cached->second;
-        id<MTLComputePipelineState> result = newPipeline(name);
+        id<MTLComputePipelineState> result = newPipeline(library, name);
         pipelines.emplace(name, result);
         sampleDeviceMemory();
         return result;
     }
 
-    id<MTLComputePipelineState> newPipeline(std::string_view name) {
+    id<MTLComputePipelineState> newPipeline(id<MTLLibrary> source, std::string_view name) {
         NSString *key = checkedNSString(name, "pipeline name");
-        id<MTLFunction> function = [library newFunctionWithName:key];
+        id<MTLFunction> function = [source newFunctionWithName:key];
         if (!function) {
             throw MetalBackendError(
                 "missing Metal function: " + std::string(name));
@@ -1163,11 +1192,11 @@ struct MetalBackend::Impl {
         }
     }
 
-    // The spin of awake host steps, with a release buffer whose counter
-    // starts at zero.
+    // The spin of awake host steps, from host_step_wait of the library beside
+    // the backend's, with a release buffer whose counter starts at zero.
     HostStepSpin newHostStepSpin() {
         HostStepSpin spin;
-        spin.pipeline = newPipeline("host_step_wait");
+        spin.pipeline = newPipeline(loadLibrary(device, hostStepLibraryPath), "host_step_wait");
         spin.releases = newBuffer(kHostStepSeenOffset + sizeof(uint32_t), BufferStorage::Shared,
                                   @"host-step releases");
         std::memset(spin.releases.contents, 0, spin.releases.length);
@@ -1362,6 +1391,8 @@ struct MetalBackend::Impl {
     }
 #endif
 
+    // host-step.metallib beside the backend's library (kHostStepLibrary).
+    std::string hostStepLibraryPath;
     // The spin of awake host steps, once checked (checkHostStepSpin); until
     // then they run as plain ones.
     std::optional<HostStepSpin> hostStepSpin;
@@ -1531,33 +1562,14 @@ MetalBackend::MetalBackend(std::string metallibPath, double residencyKeepAliveSe
                     DISPATCH_QUEUE_SERIAL,
                     DISPATCH_AUTORELEASE_FREQUENCY_WORK_ITEM))];
 
-        NSString *path = checkedNSString(metallibPath, "metallib path");
-        NSError *error = nil;
-        NSData *fileData = [NSData dataWithContentsOfFile:path
-                                                 options:0
-                                                   error:&error];
-        if (!fileData) {
-            throw MetalBackendError(
-                "unable to read metallib " + metallibPath + ": " +
-                errorDescription(error));
-        }
-        // The library keeps the bytes read here, whatever later replaces the
-        // path; the dispatch data retains them rather than copying them.
-        dispatch_data_t data = dispatch_data_create(
-            fileData.bytes, fileData.length, nullptr, ^{ (void)fileData; });
-        error = nil;
-        impl_->library =
-            [impl_->device newLibraryWithData:data error:&error];
-        if (!impl_->library) {
-            throw MetalBackendError(
-                "unable to load metallib " + metallibPath + ": " +
-                errorDescription(error));
-        }
+        impl_->library = loadLibrary(impl_->device, metallibPath);
+        impl_->hostStepLibraryPath =
+            std::filesystem::path(metallibPath).replace_filename(kHostStepLibrary).string();
         // Ending residency dispatches a kernel built here, so no pipeline or
         // driver program is compiled when a keep-alive lapses.
         impl_->residency = std::make_shared<Residency>(
             impl_->device, impl_->queue,
-            impl_->newPipeline(Residency::kKickPipeline), residencyKeepAliveSeconds);
+            impl_->newPipeline(impl_->library, Residency::kKickPipeline), residencyKeepAliveSeconds);
     }
     impl_->sampleDeviceMemory();
 }

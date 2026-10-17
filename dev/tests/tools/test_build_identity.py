@@ -370,16 +370,14 @@ class CompileConfigurationTests(unittest.TestCase):
                 for name in ("paged_attention.metal", "paged_attention_store.metal")
             ]
             # Every test library a MetalBackend loads links the kernel that
-            # ends residency, and metal-backend.metallib the host step's;
-            # q8-attention.metallib is loaded by raw MTLDevice tests.
+            # ends residency; q8-attention.metallib is loaded by raw MTLDevice
+            # tests.
             residency_source = kernel_root / "shared/residency.metal"
-            host_step_source = kernel_root / "shared/host_step.metal"
             removed_source = kernel_root / "shared/removed.metal"
             removed_header = kernel_root / "common/removed.h"
             for relative in (
                 *paged_sources,
                 residency_source,
-                host_step_source,
                 removed_source,
                 removed_header,
                 Path("runtime/engine/Status.cpp"),
@@ -406,12 +404,7 @@ class CompileConfigurationTests(unittest.TestCase):
                     / "metal"
                     / source.relative_to(kernel_root).with_suffix(".air")
                 )
-                for source in (
-                    *paged_sources,
-                    residency_source,
-                    host_step_source,
-                    removed_source,
-                )
+                for source in (*paged_sources, residency_source, removed_source)
             }
             test_airs = {
                 str(
@@ -460,6 +453,25 @@ class CompileConfigurationTests(unittest.TestCase):
             self.assertEqual(rebuild(native, unrelated), {residency_air})
             self.assertEqual(self.query(*options, *targets), 0)
             self.assertEqual(rebuild(*targets), set())
+
+    def test_refused_host_step_kernel_leaves_the_build_a_warning(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.build_files(root)
+            source = root / "runtime/metal/kernels/host_step.metal"
+            source.parent.mkdir(parents=True)
+            source.write_text("// fixture\n")
+            compiler, _ = self.recording_compiler(root)
+            refusing = root / "refusing.py"
+            refusing.write_text("raise SystemExit(1)\n")
+            build = root / "build"
+            library = build / "host-step.metallib"
+            options = ["-C", str(root), f"BUILD={build}", str(library)]
+            refused = self.build(*options, f"METAL={sys.executable} {refusing}")
+            self.assertIn("awake host steps will run as plain ones", refused.stderr)
+            self.assertFalse(library.exists())
+            self.build(*options, f"METAL={sys.executable} {compiler}")
+            self.assertTrue(library.exists())
 
     def test_failed_compiler_invalidates_previous_configuration(self):
         with tempfile.TemporaryDirectory() as directory:
