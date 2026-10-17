@@ -277,13 +277,21 @@ std::string persistentCacheNamespace(const RuntimeCacheIdentity &identity,
   canonical << "splash-persistent-cache-v" << kPersistentCacheFormat << '\n'
             << identity.modelLayoutSha256 << '\n'
             << "kv " << kv::kPageTokens << ' ' << kv.attentionLayers << ' ' << kv.kvHeads << ' '
-            << kv.headDimension << ' ' << kv::formatName(kv.format) << '\n'
+            << kv.headDimension << ' ' << kv::formatName(kv.format)
+            // Dimension-major values add nothing, so dense layouts keep the
+            // caches they wrote.
+            << (kv.valuesTokenMajor ? " values-token-major" : "");
+  // A QSA index's pooled keys, bf16 (kv::Layout::indexDimension). A change
+  // to how a block's key is pooled, normalized or rotated changes this line.
+  if (kv.indexDimension) canonical << " qsa-pooled " << kv.indexDimension << " bf16";
+  canonical << '\n'
             << "gdn " << gdn.layers << ' ' << gdn.convolutionHistory << ' '
             << gdn.convolutionChannels << ' ' << gdn.recurrentGroups << ' ' << gdn.recurrentRows
             << ' ' << gdn.recurrentColumns
             // fp32 states keep the line they had before states had a format,
             // so the caches they wrote stay valid.
-            << (gdn.format == ops::GdnStateFormat::BFloat16 ? " bf16" : "") << '\n'
+            << (gdn.format == ops::GdnStateFormat::BFloat16 ? " bf16" : "");
+  canonical << '\n'
             << "draft " << draft.layers << ' ' << draft.kvHeads << ' ' << draft.headDimension << ' '
             << SPLASH_DRAFT_SLIDING_WINDOW << '\n'
             << "context " << draft.contextWidth << " q4 " << SPLASH_DRAFT_CONTEXT_GROUP << '\n';
