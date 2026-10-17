@@ -4,7 +4,8 @@
 // completes while the readers are blocked; never caches a row of a failed
 // read or of a written source, and fails every later stage once poisoned;
 // and reads a prefetch's rows ahead, below stages, within its bound,
-// dropping a row it fails to read.
+// skipping rows an earlier prefetch still reads and dropping a row it fails
+// to read.
 #include "TestChecks.hpp"
 #include "TestFiles.hpp"
 #include "model/SparseRowStore.hpp"
@@ -304,11 +305,27 @@ void boundsQueuedPrefetch() {
   std::vector<uint32_t> ids(25);
   for (uint32_t i = 0; i < ids.size(); ++i) ids[i] = i;
   f.store->prefetch(ids);
-  f.store->prefetch(ids); // the bound is full
-  require(f.store->stats().prefetchDroppedRows == 40, "rows past the prefetch bound were not dropped");
+  f.store->prefetch(ids); // the bound is full, and ten rows are being read
+  require(f.store->stats().prefetchDroppedRows == 30, "rows past the prefetch bound were not dropped");
   gate.release();
   f.store->drainPrefetch();
   require(f.store->stats().prefetchReadRows == 10, "a bounded prefetch read the wrong rows");
+}
+
+// A prefetch skips the rows an earlier one is still reading.
+void skipsRowsInFlight() {
+  Fixture f(1000, 500, 1, 100);
+  Gate gate;
+  f.reader->hook = [&](uint64_t) { gate.wait(); };
+  std::vector<uint32_t> first(10), second(20);
+  for (uint32_t i = 0; i < first.size(); ++i) first[i] = i;
+  for (uint32_t i = 0; i < second.size(); ++i) second[i] = i;
+  f.store->prefetch(first);
+  f.store->prefetch(second);
+  gate.release();
+  f.store->drainPrefetch();
+  require(f.reader->reads.load() == 20 && f.store->stats().prefetchReadRows == 20,
+          "a prefetch read again a row another was reading");
 }
 
 // A row a prefetch fails to read (twice) is dropped, a hint: the store stays
@@ -465,6 +482,7 @@ int main() {
       stagesWhileReadersAreBlocked();
       adoptsPrefetchedRows();
       boundsQueuedPrefetch();
+      skipsRowsInFlight();
       dropsAFailedPrefetch();
       concurrentUse();
       readsAnOpenFile(directory.path());

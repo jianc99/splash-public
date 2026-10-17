@@ -11,6 +11,7 @@
 #include <exception>
 #include <limits>
 #include <mutex>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -157,8 +158,8 @@ struct SparseRowStore::Impl {
   uint64_t evictions = 0;
 
   // Stages, which are serialized, and prefetches: the distinct ids of the
-  // last of each, and the prefetches not yet stopped or finished, which
-  // prefetchingRows count until they end.
+  // last of each, and the prefetches not yet stopped or finished, whose rows
+  // prefetchingRows count and prefetchingIds hold until they end.
   std::mutex stageMutex;
   DistinctIds distinct;
   std::vector<uint32_t> unique, missing;
@@ -167,6 +168,7 @@ struct SparseRowStore::Impl {
   DistinctIds prefetchDistinct;
   std::vector<std::shared_ptr<Prefetch>> prefetching;
   uint64_t prefetchingRows = 0;
+  std::unordered_set<uint32_t> prefetchingIds;
 
   // Failure.
   std::atomic<bool> poisoned{false};
@@ -313,6 +315,7 @@ struct SparseRowStore::Impl {
     const std::lock_guard lock(prefetchMutex);
     prefetch.ended = true;
     prefetchingRows -= prefetch.ids.size();
+    for (const uint32_t id : prefetch.ids) prefetchingIds.erase(id);
   }
 
   // The prefetches in flight; forgets those that ended, whose readers no
@@ -442,13 +445,15 @@ void SparseRowStore::prefetch(std::span<const uint32_t> ids) {
   if (ids.empty() || s.poisoned.load(std::memory_order_acquire)) return;
   const std::lock_guard prefetchLock(s.prefetchMutex);
   s.prefetchRequested.fetch_add(ids.size(), std::memory_order_relaxed);
-  // Distinct ids within the table, not cached, up to the bound.
+  // Distinct ids within the table, neither cached nor being read ahead, up
+  // to the bound.
   s.prefetchDistinct.begin(ids.size());
   auto prefetch = std::make_shared<Impl::Prefetch>();
   {
     const std::lock_guard lock(s.cacheMutex);
     for (const uint32_t id : ids)
-      if (id < s.table.rows && s.prefetchDistinct.add(id).second && s.find(id) == kNoSlot)
+      if (id < s.table.rows && s.prefetchDistinct.add(id).second && s.find(id) == kNoSlot &&
+          !s.prefetchingIds.contains(id))
         prefetch->ids.push_back(id);
   }
   std::erase_if(s.prefetching, [](const std::shared_ptr<Impl::Prefetch> &each) { return each->ended; });
@@ -460,6 +465,7 @@ void SparseRowStore::prefetch(std::span<const uint32_t> ids) {
   if (prefetch->ids.empty()) return;
   prefetch->rows.resize(prefetch->ids.size() * s.table.rowBytes);
   s.prefetchingRows += prefetch->ids.size();
+  s.prefetchingIds.insert(prefetch->ids.begin(), prefetch->ids.end());
   s.prefetching.push_back(prefetch);
   // The batch ends its prefetch, which the store holds until then.
   Impl::Prefetch *const reading = prefetch.get();
