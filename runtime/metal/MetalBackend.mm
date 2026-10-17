@@ -711,7 +711,10 @@ struct CommandTicket::State {
 
         std::string error;
         // The first buffer that failed names the error: the buffers after a
-        // failed one still run, as its signal is delivered (EventStep).
+        // failed one still run, as its signal is delivered (EventStep). A
+        // host step that threw comes first: it ran only after the buffers
+        // before it succeeded, and the work after it may then fail on what
+        // it left.
         id<MTLCommandBuffer> failed =
             command.status != MTLCommandBufferStatusCompleted ? command : nil;
         for (id<MTLCommandBuffer> earlier : leadingCommands) {
@@ -720,16 +723,16 @@ struct CommandTicket::State {
                 break;
             }
         }
-        if (failed) {
+        const std::string host = hostSteps ? hostSteps->firstFailure() : std::string();
+        if (failed || !host.empty()) {
             std::ostringstream message;
             message << "Metal command " << sequence << " failed";
-            if (failed.error) {
+            if (!host.empty()) message << ": " << host;
+            if (failed && !host.empty()) message << "; then a command buffer failed";
+            if (failed && failed.error) {
                 message << ": " << errorDescription(failed.error);
             }
             error = message.str();
-        } else if (hostSteps) {
-            if (std::string host = hostSteps->firstFailure(); !host.empty())
-                error = "Metal command " + std::to_string(sequence) + " failed: " + host;
         }
         if (hostSteps && error.empty()) {
             try {
