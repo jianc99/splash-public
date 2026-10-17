@@ -190,6 +190,10 @@ def _store_size(value, example):
     return size
 
 
+def parse_ple_memory(value):
+    return _store_size(value, "2G")
+
+
 def parse_expert_memory(value):
     return _store_size(value, "16G")
 
@@ -465,6 +469,18 @@ SERVE_OPTIONS = (
             help="stretch the model's 256K window by FACTOR with YaRN RoPE "
             "scaling, up to 4 for 1010000 tokens; static, so it applies to short "
             "prompts too (default: off)",
+        ),
+    ),
+    ServeOption(
+        "--ple-memory",
+        "memory",
+        dict(
+            type=parse_ple_memory,
+            default=None,
+            metavar="SIZE",
+            help="stream the PLE n-gram table of a Qwen3.8-Flash-Next GGUF from "
+            "the SSD through a RAM row cache of SIZE, e.g. 2G, instead of "
+            "keeping the whole table, tens of GB, in memory (default: off)",
         ),
     ),
     ServeOption(
