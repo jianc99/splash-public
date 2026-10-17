@@ -44,6 +44,7 @@ using splash::metal::CommandTicket;
 using splash::metal::CommandTiming;
 using splash::metal::ComputeDispatch;
 using splash::metal::EventStep;
+using splash::metal::HostStepGpu;
 using splash::metal::HostStepTiming;
 using splash::metal::IndirectGrid;
 using splash::metal::MetalBackend;
@@ -1377,10 +1378,10 @@ void eventSteps(const std::string &metallibPath) {
 }
 
 // Submission refuses event steps it cannot encode before it submits anything:
-// a step without an event or a value, out of dispatch order or past the
-// dispatches, and a command of more signals (one command buffer each) or host
-// steps (one each, two when awake) than its queue holds command buffers for
-// besides its last. The backend stays healthy, and a command of the most
+// a step without an event or a value, one not a host step that would keep the
+// GPU awake, out of dispatch order or past the dispatches, and a command of
+// more signals (one command buffer each) or host steps (one each, two when
+// awake) than its queue holds command buffers for besides its last. The backend stays healthy, and a command of the most
 // signals it takes runs.
 void malformedEventStepsRefused(const std::string &metallibPath) {
     using enum EventStep::Kind;
@@ -1398,6 +1399,8 @@ void malformedEventStepsRefused(const std::string &metallibPath) {
             "an event step without an event was submitted");
     rejects([&] { (void)submit({{1, event, 0, Wait}}); }, "nonzero value",
             "an event step of value 0 was submitted");
+    rejects([&] { (void)submit({{1, event, 1, Signal, {}, {}, HostStepGpu::Awake}}); },
+            "only a host step keeps the GPU awake", "a signal that keeps the GPU awake was submitted");
     rejects([&] { (void)submit({{2, event, 1, Signal}, {1, event, 2, Wait}}); },
             "out of dispatch order", "event steps out of dispatch order were submitted");
     rejects([&] { (void)submit({{3, event, 1, Signal}}); },
@@ -1413,7 +1416,7 @@ void malformedEventStepsRefused(const std::string &metallibPath) {
     const std::vector<EventStep> hostSteps(512, EventStep{2, {}, 0, Host, [] {}});
     rejects([&] { (void)submit(hostSteps); }, "more command buffers than its queue holds",
             "a command of 512 host steps was submitted");
-    const std::vector<EventStep> awakeSteps(256, EventStep{2, {}, 0, Host, [] {}, {}, true});
+    const std::vector<EventStep> awakeSteps(256, EventStep{2, {}, 0, Host, [] {}, {}, HostStepGpu::Awake});
     rejects([&] { (void)submit(awakeSteps); }, "more command buffers than its queue holds",
             "a command of 256 awake host steps was submitted");
     require(backend.healthy() && BackendInstrumentation::submittedCommands(backend) == 0,
@@ -1597,7 +1600,7 @@ void hostSteps(const std::string &metallibPath) {
                                  std::lock_guard lock(timedMutex);
                                  timings.push_back({step, timing});
                              },
-                             awake});
+                             awake ? HostStepGpu::Awake : HostStepGpu::Idle});
         const Command command{dispatches, steps};
         const auto started = std::chrono::steady_clock::now();
         const CommandTiming commandTiming = backend.submitCommandAsync(command).wait();
@@ -1674,7 +1677,7 @@ void firstCommandWithAnAwakeHostStep(const std::string &metallibPath) {
     uint32_t seen = 0;
     HostStepTiming timing;
     const std::vector<EventStep> steps{{1, {}, 0, EventStep::Kind::Host, [&] { seen = *value; },
-                                        [&](const HostStepTiming &step) { timing = step; }, true}};
+                                        [&](const HostStepTiming &step) { timing = step; }, HostStepGpu::Awake}};
     (void)backend.submitCommandAsync(Command{dispatches, steps}).wait();
     require(seen == 1 && *value == 2 && backend.healthy(),
             "an awake host step in a fresh backend's first command did not run between its work");
@@ -1706,7 +1709,7 @@ void hostStepSpinFallsBack(const std::string &metallibPath) {
         for (int command = 0; command < 2; ++command) {
             *value = 0;
             uint32_t seen = 0;
-            const std::vector<EventStep> steps{{1, {}, 0, EventStep::Kind::Host, [&] { seen = *value; }, {}, true}};
+            const std::vector<EventStep> steps{{1, {}, 0, EventStep::Kind::Host, [&] { seen = *value; }, {}, HostStepGpu::Awake}};
             (void)backend.submitCommandAsync(Command{dispatches, steps}).wait();
             require(seen == 1 && *value == 2, "an awake host step without its spin did not run between its work");
         }
@@ -1875,7 +1878,7 @@ void hostStepThen(const std::string &metallibPath) {
     const std::vector<ComputeDispatch> dispatches(2, addition(buffer, count, one));
     uint32_t seen = 0;
     std::atomic<bool> after{false};
-    const std::vector<EventStep> steps{{1, {}, 0, EventStep::Kind::Host, [&] { seen = *value; }, {}, false, [&] {
+    const std::vector<EventStep> steps{{1, {}, 0, EventStep::Kind::Host, [&] { seen = *value; }, {}, HostStepGpu::Idle, [&] {
                                             const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(5);
                                             while (*value != 2 && std::chrono::steady_clock::now() < end) {}
                                             after = *value == 2;
@@ -1885,7 +1888,7 @@ void hostStepThen(const std::string &metallibPath) {
             "a host step's then did not run once the work after the step went");
     *value = 0;
     std::vector<uint32_t> order;
-    const std::vector<EventStep> profiled{{1, {}, 0, EventStep::Kind::Host, [&] { order.push_back(uint32_t{*value}); }, {}, false,
+    const std::vector<EventStep> profiled{{1, {}, 0, EventStep::Kind::Host, [&] { order.push_back(uint32_t{*value}); }, {}, HostStepGpu::Idle,
                                            [&] { order.push_back(uint32_t{*value} + 10); }}};
     BackendInstrumentation::setDispatchProfiling(backend, true);
     (void)backend.submitCommandAsync(Command{dispatches, profiled}).wait();
@@ -1894,7 +1897,7 @@ void hostStepThen(const std::string &metallibPath) {
     require(order == std::vector<uint32_t>{1, 11}, "dispatch profiling did not run a host step's then after its work");
     std::atomic<bool> ran{false};
     const std::vector<EventStep> throwing{{1, {}, 0, EventStep::Kind::Host,
-                                           [] { throw std::runtime_error("test host failure"); }, {}, false,
+                                           [] { throw std::runtime_error("test host failure"); }, {}, HostStepGpu::Idle,
                                            [&] { ran = true; }}};
     MetalBackend failing(metallibPath);
     MetalBuffer failingBuffer = sharedBuffer(failing, sizeof(uint32_t));
@@ -1905,7 +1908,7 @@ void hostStepThen(const std::string &metallibPath) {
     MetalBackend thenFails(metallibPath);
     MetalBuffer thenBuffer = sharedBuffer(thenFails, sizeof(uint32_t));
     const std::vector<ComputeDispatch> thenDispatches(2, addition(thenBuffer, count, one));
-    const std::vector<EventStep> throwingThen{{1, {}, 0, EventStep::Kind::Host, [] {}, {}, false,
+    const std::vector<EventStep> throwingThen{{1, {}, 0, EventStep::Kind::Host, [] {}, {}, HostStepGpu::Idle,
                                                [] { throw std::runtime_error("test then failure"); }}};
     (void)thenFails.submitCommandAsync(Command{thenDispatches, throwingThen}).wait();
     require(waitFor([&] { return !thenFails.healthy(); }, std::chrono::seconds(5)) &&

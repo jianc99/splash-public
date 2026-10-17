@@ -171,7 +171,7 @@ NSUInteger addedBuffers(const EventStep &step) noexcept {
     switch (step.kind) {
     case EventStep::Kind::Signal: return 1;
     case EventStep::Kind::Wait: return 0;
-    case EventStep::Kind::Host: return step.awake ? 2 : 1;
+    case EventStep::Kind::Host: return step.gpu == HostStepGpu::Awake ? 2 : 1;
     }
     return 0;
 }
@@ -186,6 +186,8 @@ void checkEvents(std::span<const EventStep> events, size_t dispatches) {
             throw MetalBackendError(step.kind == EventStep::Kind::Host
                                         ? "host step needs work"
                                         : "event step needs an event and a nonzero value");
+        if (step.gpu == HostStepGpu::Awake && step.kind != EventStep::Kind::Host)
+            throw MetalBackendError("only a host step keeps the GPU awake");
         if (step.before < before)
             throw MetalBackendError("event steps are out of dispatch order");
         if (step.before > dispatches)
@@ -1105,7 +1107,7 @@ struct MetalBackend::Impl {
         [command encodeSignalEvent:event value:ready];
         leading.push_back(command);
         std::optional<uint32_t> released;
-        if (step.awake && hostStepSpin) {
+        if (step.gpu == HostStepGpu::Awake && hostStepSpin) {
             id<MTLCommandBuffer> awake = [queue commandBuffer];
             if (!awake) failEncoding("unable to create Metal command buffer");
             released = encodeSpin(*hostStepSpin, awake, failEncoding);
@@ -1235,7 +1237,7 @@ struct MetalBackend::Impl {
                          std::vector<std::shared_ptr<MetalAllocation>> retained,
                          CommandCompletion completion) {
         if (!hostStepSpin && AwakeClock::now() >= nextSpinCheck &&
-            std::ranges::any_of(events, [](const EventStep &step) { return step.awake; }))
+            std::ranges::any_of(events, [](const EventStep &step) { return step.gpu == HostStepGpu::Awake; }))
             checkHostStepSpin();
         // The runner starts with the first command that has a host step,
         // before the submission: one that cannot start leaves nothing held.

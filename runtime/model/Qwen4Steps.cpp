@@ -350,11 +350,11 @@ void Qwen4Steps::addVerifyInput(metal::CommandGraph &graph, metal::MetalBuffer t
   ops::NgramEmbedding::addHash(graph, std::move(tokens), priorTokens(), scratch.pleIndices, params, heads);
   // A verify step stages a few rows per lane, most of them already in the
   // cache, so its host step is short and keeps the GPU awake
-  // (metal::EventStep::awake).
+  // (metal::HostStepGpu::Awake).
   if (weights_.pleStore)
     graph.host([store = weights_.pleStore, rowBytes = pleRowBytes_, scratch,
                 count = params.rows * heads] { stage(*store, rowBytes, scratch, count, false); },
-               {}, true);
+               {}, metal::HostStepGpu::Awake);
 }
 
 std::vector<uint32_t> Qwen4Steps::verifyPleRows(uint32_t lane) const {

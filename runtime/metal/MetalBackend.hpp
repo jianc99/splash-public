@@ -184,6 +184,13 @@ struct HostStepTiming {
   double resumeSeconds = 0.0;
 };
 
+// What the GPU does through a host step (EventStep::Kind::Host): it idles,
+// or one GPU thread spins through the step and keeps it awake.
+enum class HostStepGpu : uint8_t {
+  Idle,
+  Awake,
+};
+
 // Orders a command against another agent, such as the Neural Engine, after
 // the first `before` of its dispatches. A Signal raises the event to `value`
 // once all earlier work has completed; a Wait holds all later work until the
@@ -195,7 +202,7 @@ struct HostStepTiming {
 // holds all later work until it returned, through a shared event the backend
 // creates for the command's host steps (the step's event and value are
 // unused): the work reads what the GPU wrote before it and writes Shared
-// buffers the GPU reads after it. With `awake`, one GPU
+// buffers the GPU reads after it. With HostStepGpu::Awake, one GPU
 // thread spins through the step so the GPU stays awake and starts the work
 // after it at once and at full clocks: for steps about as short as the GPU's
 // wake-up (a streamed decode load), not for long ones, where the spin saves
@@ -232,7 +239,7 @@ struct EventStep {
   Kind kind = Kind::Signal;
   std::function<void()> work{};
   std::function<void(const HostStepTiming &)> timed{};
-  bool awake = false;
+  HostStepGpu gpu = HostStepGpu::Idle;
   std::function<void()> then{};
 };
 

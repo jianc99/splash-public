@@ -991,7 +991,7 @@ void ExpertStore::addLoad(metal::CommandGraph &graph, std::span<const ops::MoeLo
   // A decode step's loads keep the GPU awake: they come about every
   // millisecond and most end within one, about as long as an idle GPU takes
   // to come back to full speed; a prefill chunk's read for tens of ms.
-  const bool awake = phase == ops::MoePhase::Decode;
+  const metal::HostStepGpu gpu = phase == ops::MoePhase::Decode ? metal::HostStepGpu::Awake : metal::HostStepGpu::Idle;
   const auto timed = [impl = impl_, phase](const metal::HostStepTiming &timing) {
     Impl::StepTimes &times = impl->stepTimes[static_cast<size_t>(phase)];
     const auto nanoseconds = [](double seconds) { return uint64_t(seconds * 1e9); };
@@ -1006,7 +1006,7 @@ void ExpertStore::addLoad(metal::CommandGraph &graph, std::span<const ops::MoeLo
         [impl = impl_, block, phase, rows, predicted, tiles, round, rounds] {
           impl->load(block, phase, rows, predicted, tiles, round, rounds);
         },
-        timed, awake, startAhead);
+        timed, gpu, startAhead);
     ops::MoE::addExpertLoad(graph, impl.staging, size.arena, impl.jobs, impl.sources, size.load,
                             static_cast<uint32_t>(std::min<uint64_t>(routable, impl.places.count)),
                             metal::IndirectGrid{impl.grid, 0});
@@ -1017,7 +1017,8 @@ void ExpertStore::addLoad(metal::CommandGraph &graph, std::span<const ops::MoeLo
   // next block's mixing, as many as the next load would otherwise read
   // with the GPU waiting.
   if (impl.longChunk(phase, rows) && block + 1 < impl.blocks.size() && impl.streams(block + 1))
-    graph.host([impl = impl_, block, phase] { impl->readBlockAhead(block + 1, phase); }, timed, false, startAhead);
+    graph.host([impl = impl_, block, phase] { impl->readBlockAhead(block + 1, phase); }, timed,
+               metal::HostStepGpu::Idle, startAhead);
 }
 
 ExpertStoreStats ExpertStore::stats() const {
