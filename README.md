@@ -74,13 +74,13 @@ one released for the family, selected automatically, or the one
 No DFlash2 draft of Qwen3.8-Flash-Next is released yet: its installation
 names one with `--draft-model`, a Hub repository or a local directory
 ([Drafts](DEVELOPMENT.md#drafts)). Its routed experts and PLE n-gram table
-can stay on the SSD: `UD-IQ3_XXS` runs on a 36 GB Mac with
-`--expert-memory 16G --ple-memory 2G`, and on a 64 GB Mac
+can stay on the SSD: `UD-IQ3_XXS` ran on a 36 GB M5 Max with
+`--expert-memory 12G --ple-memory 2G` (about 23 tokens/s on one request), and on a 64 GB Mac
 `ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF:Q2_0` keeps every expert in
 memory with `--ple-memory 2G`.
 
 ```bash
-splash serve --model unsloth/Qwen3.8-Flash-Next-GGUF:UD-IQ3_XXS --draft-model ./Qwen3.8-Flash-Next-DFlash2 --expert-memory 16G --ple-memory 2G
+splash serve --model unsloth/Qwen3.8-Flash-Next-GGUF:UD-IQ3_XXS --draft-model ./Qwen3.8-Flash-Next-DFlash2 --expert-memory 12G --ple-memory 2G
 ```
 
 Unsloth GGUF variants span **1–8 bits**, including mixed-precision UD formats
