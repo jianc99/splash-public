@@ -161,18 +161,6 @@ void requireNumbers(NSDictionary *object, std::string_view source, std::string_v
                   std::string(where) + " " + field.key);
 }
 
-// The numbers of an array, in order.
-void requireNumbers(NSArray *values, std::span<const uint32_t> expected,
-                    std::string_view source, std::string_view label) {
-  if (values.count != expected.size())
-    throw std::invalid_argument(std::string(label) + " count mismatch: " + std::string(source) +
-                                " " + std::to_string(values.count) + ", runtime " +
-                                std::to_string(expected.size()));
-  for (size_t index = 0; index < expected.size(); ++index)
-    requireNumber(values[index], expected[index], source,
-                  std::string(label) + " " + std::to_string(index));
-}
-
 // The JSON booleans, never numbers, object holds at the keys.
 void requireBooleans(NSDictionary *object, std::string_view where,
                      std::initializer_list<std::pair<const char *, bool>> fields) {
@@ -212,20 +200,6 @@ template <class Layout> constexpr bool fitsKvCeiling(const Layout &layout) {
 }
 static_assert(fitsKvCeiling(Qwen3_8Layout{}) && fitsKvCeiling(Qwen3_6MoeLayout{}),
               "a family's window exceeds the runtime's KV ceiling");
-
-ModelDescriptor qwen38Descriptor(std::string name, TargetSource targetSource,
-                                 VisionSource visionSource) {
-  return makeModelDescriptor(std::move(name), Qwen3_8Layout{},
-                             kQwen3_8DraftLayout, kQwen3_8VisionLayout,
-                             targetSource, visionSource);
-}
-
-ModelDescriptor qwen36Descriptor(std::string name, TargetSource targetSource,
-                                 VisionSource visionSource) {
-  return makeModelDescriptor(std::move(name), Qwen3_6MoeLayout{},
-                             kQwen3_6MoeDraftLayout, kQwen3_6MoeVisionLayout,
-                             targetSource, visionSource);
-}
 
 // The name errors give an upstream target's source: its format, safetensors
 // for MLX, Model Optimizer and compressed-tensors checkpoints alike.
@@ -544,26 +518,23 @@ void requireQuantization(NSDictionary *config, const QwenTargetDimensions &geome
       "nvfp4), an NVFP4 or FP8 checkpoint of Model Optimizer or compressed-tensors, or a supported GGUF");
 }
 
-// A DFlash2 checkpoint's config: the draft's layout; the block, window,
-// convolutions and selector the draft kernels are built for; and the target's
-// mask token and the layers the draft reads.
-void validateDraftConfig(NSDictionary *draft, const DFlashDraftLayout &layout,
-                         uint32_t maskToken,
-                         std::span<const uint32_t> captureLayers) {
+// A DFlash2 checkpoint's config: the draft's layout. Its attention widths,
+// block, window, convolutions and selector must be those the draft kernels
+// are built for; its hidden size, vocabulary and mask token the target's;
+// and the target layers it reads (target_layer_ids) some of the target's,
+// ascending. Its layers, intermediate size and rotary base are its own.
+DFlashDraftLayout readDraftLayout(NSDictionary *draft, const QwenTargetDimensions &target) {
   NSArray *architectures =
       requireArray(draft, @"architectures", "draft architectures");
   if (architectures.count != 1 ||
       ![architectures[0] isEqual:@"DFlash2DraftModel"])
     throw std::invalid_argument("draft is not a DFlash2 model");
   requireNumbers(draft, "checkpoint", "draft config",
-                 {{"num_hidden_layers", layout.layers},
-                  {"hidden_size", layout.hiddenSize},
-                  {"vocab_size", layout.vocabularySize},
-                  {"intermediate_size", layout.intermediateSize},
-                  {"num_attention_heads",
-                   layout.attentionSize / layout.attentionHeadDimension},
-                  {"num_key_value_heads", layout.kvHeads},
-                  {"head_dim", layout.attentionHeadDimension},
+                 {{"hidden_size", target.hiddenSize},
+                  {"vocab_size", target.vocabularySize},
+                  {"num_attention_heads", SPLASH_DRAFT_QUERY_HEADS},
+                  {"num_key_value_heads", SPLASH_DRAFT_KV_HEADS},
+                  {"head_dim", SPLASH_DRAFT_HEAD_DIMENSION},
                   {"sliding_window", ExecutionLimits::draftContextTokens},
                   {"rms_norm_eps", SPLASH_RMS_EPSILON}});
   requireBooleans(draft, "draft config",
@@ -577,20 +548,30 @@ void validateDraftConfig(NSDictionary *draft, const DFlashDraftLayout &layout,
   requireEqual(requireString(rope, @"rope_type",
                              "draft config rope_parameters rope_type"),
                "default", "checkpoint", "draft config rope_parameters rope_type");
-  requireNumbers(rope, "checkpoint", "draft config rope_parameters",
-                 {{"rope_theta", layout.rotaryTheta}});
   NSDictionary *flash =
       requireObject(draft, @"dflash_config", "draft config dflash_config");
   requireNumbers(flash, "checkpoint", "draft config dflash_config",
                  {{"block_size", ExecutionLimits::draftQueryRows},
                   {"conv_group_size", SPLASH_DRAFT_CONVOLUTION_GROUP},
                   {"conv_kernel_size", SPLASH_DRAFT_CONVOLUTION_TAPS},
-                  {"selector_rank", layout.selectorRank},
+                  {"selector_rank", SPLASH_DRAFT_SELECTOR_RANK},
                   {"selector_top_k", SPLASH_DRAFT_CANDIDATES},
-                  {"mask_token_id", maskToken}});
-  requireNumbers(requireArray(flash, @"target_layer_ids",
-                              "draft config target_layer_ids"),
-                 captureLayers, "checkpoint", "draft config target_layer_ids");
+                  {"mask_token_id", target.maskToken}});
+  NSArray *ids = requireArray(flash, @"target_layer_ids", "draft config target_layer_ids");
+  std::vector<uint32_t> targetLayers;
+  for (id value : ids) {
+    targetLayers.push_back(
+        requireWhole(value, "draft config target_layer_ids " + std::to_string(targetLayers.size())));
+    if (targetLayers.back() >= target.layers)
+      throw std::invalid_argument("draft config target_layer_ids names a layer past the target's");
+  }
+  const DFlashDraftLayout layout =
+      draftLayout(target.hiddenSize, target.vocabularySize,
+                  requireWhole(draft[@"num_hidden_layers"], "draft config num_hidden_layers"),
+                  requireWhole(draft[@"intermediate_size"], "draft config intermediate_size"),
+                  requireNumber(rope[@"rope_theta"], "draft config rope_parameters rope_theta").floatValue,
+                  targetLayers);
+  return layout;
 }
 
 // The vision tower's config, config.json's vision_config, which the
@@ -617,8 +598,9 @@ void validateVisionConfig(NSDictionary *vision, const ops::VisionLayout &layout,
 
 // The descriptor, named name, of an upstream model of the family its text
 // config's model type names, from the source formats its record names, with
-// each config checked: the target's, as those formats require, and the
-// draft's unless draft is nil.
+// each config checked: the target's, as those formats require, its vision
+// tower's, and its DFlash2 draft's, whose layout it reads (readDraftLayout),
+// unless draft is nil.
 ModelDescriptor describeSourceModel(std::string name, std::string_view targetFormat,
                                     std::string_view visionFormat, NSDictionary *config,
                                     NSDictionary *draft) {
@@ -637,13 +619,20 @@ ModelDescriptor describeSourceModel(std::string name, std::string_view targetFor
   else if (visionFormat == "safetensors") visionSource = VisionSource::Safetensors;
   else if (visionFormat == "gguf") visionSource = VisionSource::Gguf;
   else throw std::invalid_argument("unsupported vision source format: " + std::string(visionFormat));
-  ModelDescriptor result = moe ? qwen36Descriptor(std::move(name), targetSource, visionSource)
-                               : qwen38Descriptor(std::move(name), targetSource, visionSource);
+  // Without a draft config the descriptor names the family but has no draft
+  // (inspectSourceConfiguration), and is not valid; a model root always
+  // holds its draft's.
+  const TargetLayout target = moe ? TargetLayout{Qwen3_6MoeLayout{}} : TargetLayout{Qwen3_8Layout{}};
+  DFlashDraftLayout dflashLayout;
   std::visit([&](const auto &layout) {
-    validateTextConfig(text, layout, layout.family, result.targetSource);
-    if (result.targetSource == TargetSource::Safetensors) requireQuantization(config, layout);
-    if (draft) validateDraftConfig(draft, result.draft, layout.maskToken, layout.hiddenCaptureLayers);
-  }, result.target);
+    validateTextConfig(text, layout, layout.family, targetSource);
+    if (targetSource == TargetSource::Safetensors) requireQuantization(config, layout);
+    if (draft) dflashLayout = readDraftLayout(draft, layout);
+  }, target);
+  ModelDescriptor result = makeModelDescriptor(std::move(name), target, dflashLayout,
+                                               {.outputHiddenSize = std::visit(
+                                                    [](const auto &layout) { return layout.hiddenSize; }, target)},
+                                               targetSource, visionSource);
   if (result.hasVision())
     validateVisionConfig(requireObject(config, @"vision_config", "vision config"), result.vision,
                          result.targetSource);
@@ -722,7 +711,8 @@ bool ModelDescriptor::valid() const noexcept {
                (!ropeScaling.yarn() ||
                 ropeScaling.originalContextTokens == layout.nativeContextTokens) &&
                layout.hiddenSize == draft.hiddenSize &&
-               layout.capturedHiddenSize() == draft.targetHiddenSize &&
+               draft.targetLayerCount && draft.targetLayerCount <= ExecutionLimits::maximumDraftTargetLayers &&
+               draft.targetLayers[draft.targetLayerCount - 1] < layout.layers &&
                layout.kvLayout() == targetKvLayout &&
                layout.gdnStateLayout() == stateLayout.target;
       },
@@ -755,6 +745,9 @@ ModelDescriptor inspectModelRoot(const std::filesystem::path &root) {
     const std::string targetFormat = requireString(record, @"target_format", "target format");
     const std::string visionFormat = requireString(record, @"vision_format", "vision format");
     NSDictionary *config = readObject(root / "config.json", "upstream model config");
+    // Every family decodes with its DFlash2 draft, in draft/.
+    if (!std::filesystem::exists(root / "draft"))
+      throw std::invalid_argument("the model's root holds no draft/ for its DFlash2 draft");
     NSDictionary *draft = readObject(root / "draft" / "config.json", "draft config");
     ModelDescriptor result = describeSourceModel(std::move(name), targetFormat, visionFormat, config, draft);
     result.sourceIdentity = std::move(sourceIdentity);
