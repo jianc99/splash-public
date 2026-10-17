@@ -2602,7 +2602,7 @@ does, and `REVISION`, `DRAFT_MODEL` and `LANGUAGE_ONLY=1` as its `--revision`,
 | Target | Runs |
 | --- | --- |
 | `verify-models` | the installer's restarts without the Hub, `verify --full`, and the record of the weight images (`dev/tools/installer_restarts.py`, `weight-digests`, [Release check](#release-check)) |
-| `test-real` | vision parity with the family's fixture in `dev/tests/fixtures/vision-parity/` when the installation serves vision, and the native model runtime oracle |
+| `test-real` | vision parity with the family's fixture in `dev/tests/fixtures/vision-parity/` when the installation serves vision, and the native model runtime oracle, each of its three runs with `ORACLE_ARGS` added (`ORACLE_ARGS="--kv-format bf16"`) |
 | `test-http-real` | the HTTP frontend on an isolated server (`dev/tests/smoke_real.py`); with `HTTP_SMOKE_ARGS="--persistent-cache --max-cache-disk 8G"`, instead of that smoke, the [persistent cache](#persistent-cache) across a restart in a fresh cache directory: a clean stop, a restart that takes the restore point back, and a next turn that restores the prompt from disk; `release-check` runs both |
 | `test-agent-real` | the five official clients through `splash serve` (`dev/tests/agent_real.py`), in `AGENT_SCENARIO` `complete` (the default) or `smoke` |
 | `test-release-real` | the HTTP smoke and all five clients on one `splash serve` |
@@ -2754,6 +2754,11 @@ plan holds. The second compares this build with a retained checkout's in ABBA
 order, as the release check does ([Release check](#release-check)), and writes
 `backend-regression.json` there. Neither is a comparison with another engine
 or a test of agent task quality.
+
+A change of the weight images' layout (`EXPECT_IMAGE_CHANGE=1`) makes
+`backend_regression` report the images it changed instead of failing on them.
+`decode-profile --dispatch-list FILE` writes the profiled B1 cycles'
+dispatches in order with their GPU time.
 
 `benchmark-backend` lists the contexts the memory plan cannot hold in its
 report. Its cache checks reuse each context's cached prefix, so they need that
