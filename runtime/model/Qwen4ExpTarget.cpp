@@ -236,10 +236,11 @@ std::vector<ops::AttentionBlocks> Qwen4ExpTarget::addPrefillQsa(PrefillStep &ste
                              qsaRows(index));
     blocks[index] = {h.qsaLists, h.qsaListCounts, h.listStride, lists};
     sparseRows.push_back({sequence.rowBegin, sequence.rows, firstPositions[index], lists});
-    lists += kv::prefillAttentionTiles(sequence.rows);
+    lists += step.attention[index].tiles;
   }
   if (!sparseRows.empty())
-    ops::PagedAttention::addBlockLists(step.graph, h.qsaMask, h.maskWords, sparseRows, kv::kPrefillAttentionTileRows,
+    ops::PagedAttention::addBlockLists(step.graph, h.qsaMask, h.maskWords, sparseRows,
+                                       ops::PrefillAttentionPlan::tileRows,
                                        {h.qsaLists, h.qsaListCounts, h.listStride, 0});
   return blocks;
 }

@@ -104,9 +104,15 @@ struct AttentionWorkspace final {
 // encoding. Each prefill uses one split dispatch followed by one reduction.
 // Callers cannot replace a dispatch or reduce its scratch bound.
 struct PrefillAttentionPlan final {
+  // The rows of a query tile; the plan's rows fill `tiles` of them, the last
+  // holding the rest. A sparse plan's tile t attends through list t of its
+  // block lists (AttentionBlocks), which addBlockLists makes in tiles of as
+  // many rows.
+  static constexpr uint32_t tileRows = kv::kPrefillAttentionTileRows;
   const kv::Layout layout;
   const uint32_t queryHeads;
   const uint32_t rows;
+  const uint32_t tiles;
   const uint32_t splits;
   const AttentionWorkspace workspace;
   const std::string_view splitPipeline;
@@ -122,7 +128,7 @@ private:
                        std::string_view splitPipeline, std::string_view reducePipeline,
                        metal::DispatchSize splitGroups, metal::DispatchSize reduceGroups,
                        bool sparse, kv::Layout layout, uint32_t queryHeads)
-      : layout(layout), queryHeads(queryHeads), rows(rows),
+      : layout(layout), queryHeads(queryHeads), rows(rows), tiles(kv::prefillAttentionTiles(rows)),
         splits(splits), workspace(workspace),
         splitPipeline(splitPipeline), reducePipeline(reducePipeline),
         splitGroups(splitGroups), reduceGroups(reduceGroups), sparse(sparse) {}
