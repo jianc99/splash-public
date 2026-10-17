@@ -285,8 +285,9 @@ place (`target_weights_bytes`). Off by default.
   the next layer's likely experts are read ahead: those the next layer's
   router picks from this layer's input in a decode step; after a long prefill
   chunk's last repack, one more host step reads nearly all of the next
-  layer's into the whole staging. A read ahead of an expert no load routes may
-  fail without failing anything.
+  layer's into the whole staging. A load takes the read-ahead over without
+  waiting for its reads of experts it does not route, and a read ahead of an
+  expert no load routes may fail without failing anything.
 - Experts of one format share an arena of slots; when it would take more than
   the device's largest buffer (`maxBufferLength`), their layers are split
   between arenas that each fit, each recycling its own slots.

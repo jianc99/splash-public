@@ -18,6 +18,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -271,12 +272,13 @@ struct ExpertStore::Impl {
   void readPiece(const Group &group, const Piece &piece) const;
   void stage(uint32_t block, uint32_t capacity, ExpertStoreStats::Use &use);
   std::span<const uint32_t> predictedExperts(uint32_t rows);
-  void readAhead(uint32_t block, std::span<const uint32_t> experts, ExpertStoreStats::Use &use);
+  void planAhead(uint32_t block, std::span<const uint32_t> experts, ExpertStoreStats::Use &use);
   void startAhead();
   // The host step after a long chunk's load: block `block`'s experts that
   // are not resident read ahead into the whole staging.
   void readBlockAhead(uint32_t block, ops::MoePhase phase);
-  void stopAhead();
+  void countAhead(size_t group, size_t from, size_t to);
+  void retireAhead();
   void evict(Size &size, uint32_t slot);
   void abandon();
   void fill();
@@ -306,16 +308,24 @@ struct ExpertStore::Impl {
   metal::MetalBuffer predictionScores, predictionRoutes, predictionWeights;
   std::vector<float> predictionSum;
   std::vector<uint32_t> everyExpert, predictionOrder;
-  // A read-ahead (readAhead) of block `block`'s experts, one a group, on the
-  // readers (`batch`), until the next round stops it: then `read` tells which
-  // of its pieces the readers read, and its use counts their bytes.
+  // A read-ahead (startAhead) of block `block`'s experts, one a group, on the
+  // readers (`batch`), until the next round halts it (stage takes what it
+  // read) and the next read-ahead retires it (retireAhead); its use counts
+  // each group once (`counted`). And the read-ahead a step plans
+  // (planAhead), which its `then` starts: block `block`'s experts, most
+  // likely first, counted in `use`.
   struct Ahead final {
     uint32_t block = kNoSlot;
     Reads reads;
     std::shared_ptr<WeightReaders::Batch> batch;
     ExpertStoreStats::Use *use = nullptr;
-    std::vector<uint8_t> read;
+    std::vector<uint8_t> counted;
   } ahead;
+  struct Plan final {
+    uint32_t block = kNoSlot;
+    std::vector<uint32_t> experts;
+    ExpertStoreStats::Use *use = nullptr;
+  } plan;
   uint64_t arenaTotal = 0;
 
   // A load and release() or restore(), which never overlap (no command is in
@@ -464,16 +474,33 @@ void ExpertStore::Impl::stage(uint32_t index, uint32_t capacity, ExpertStoreStat
     waiting[expert] = 0;
   };
   // A read-ahead's group is one expert, and its pieces follow one another.
+  // Of the pieces its readers still read (it is halted), the round waits for
+  // those of an expert it stages, a few hundred us at most, and keeps the
+  // places of the others.
   const std::vector<Piece> &aheadPieces = ahead.reads.pieces;
-  for (size_t piece = 0, end = 0; ahead.block == index && piece < aheadPieces.size(); piece = end) {
-    const Group &group = ahead.reads.groups[aheadPieces[piece].group];
-    while (end < aheadPieces.size() && aheadPieces[end].group == aheadPieces[piece].group) ++end;
-    if (!waiting[group.expert]) continue;
+  const WeightReaders::Batch *batch = ahead.batch.get();
+  const auto reading = [&](size_t piece) { return piece < batch->taken() && !batch->ended(piece); };
+  for (size_t piece = 0, end = 0; batch && piece < aheadPieces.size(); piece = end) {
+    const uint32_t at = aheadPieces[piece].group;
+    const Group &group = ahead.reads.groups[at];
+    while (end < aheadPieces.size() && aheadPieces[end].group == at) ++end;
+    const bool routed = ahead.block == index && waiting[group.expert];
+    bool ended = true;
+    for (size_t rest = piece; rest < end; ++rest) {
+      while (routed && reading(rest)) std::this_thread::yield();
+      ended = ended && !reading(rest);
+    }
+    if (!ended) {
+      taken[group.place] = 1;
+      continue;
+    }
+    countAhead(at, piece, end);
+    if (!routed) continue;
     taken[group.place] = 1;
     now.groups.push_back(group);
     bool whole = true;
     for (size_t rest = piece; rest < end; ++rest)
-      if (!ahead.read[rest]) {
+      if (rest >= batch->taken() || batch->failed(rest)) {
         const Piece &unread = aheadPieces[rest];
         now.pieces.push_back({static_cast<uint32_t>(now.groups.size() - 1), unread.z, unread.from, unread.to});
         whole = false;
@@ -546,31 +573,36 @@ std::span<const uint32_t> ExpertStore::Impl::predictedExperts(uint32_t rows) {
   return predictionOrder;
 }
 
-// Lays out a read-ahead of block `index`'s experts `experts` (most likely
-// first) in that order into the places the round just staged left free, as
-// many as there are; the step's `then` starts it (startAhead).
-void ExpertStore::Impl::readAhead(uint32_t index, std::span<const uint32_t> experts, ExpertStoreStats::Use &use) {
-  ahead.reads.groups.clear();
-  ahead.reads.pieces.clear();
+// Plans a read-ahead of block `index`'s experts `experts` (most likely
+// first), which the step's `then` starts (startAhead).
+void ExpertStore::Impl::planAhead(uint32_t index, std::span<const uint32_t> experts, ExpertStoreStats::Use &use) {
+  plan.block = index;
+  plan.experts.assign(experts.begin(), experts.end());
+  plan.use = &use;
+}
+
+// Once the GPU went on (readers that start reading as the step ends hold its
+// release back: 35B decode on an M6, 30-60 us a step with four of them),
+// retires the last read-ahead and reads the planned experts ahead, in that
+// order, into the places the round just staged left free, as many as there
+// are. A release forgets the plan.
+void ExpertStore::Impl::startAhead() {
+  std::lock_guard lock(mutex);
+  if (plan.block == kNoSlot) return;
+  retireAhead();
   uint32_t place = 0;
-  for (const uint32_t expert : experts) {
+  for (const uint32_t expert : plan.experts) {
     while (place < places.count && taken[place]) ++place;
     if (place == places.count) break;
     // Expert after expert, so that the experts a round finds read whole are
     // the likeliest; a piece starts on a page and so ends on one.
-    addGroup(ahead.reads, index, expert, 1, place++, places, kAheadPieceBytes);
+    addGroup(ahead.reads, plan.block, expert, 1, place++, places, kAheadPieceBytes);
   }
+  const uint32_t block = std::exchange(plan.block, kNoSlot);
   if (ahead.reads.groups.empty()) return;
-  ahead.block = index;
-  ahead.use = &use;
-}
-
-// Starts the read-ahead the step laid out, on the readers, once the GPU went
-// on: readers that start reading as the step ends hold its release back (35B
-// decode on an M6: 30-60 us a step with four of them). A release forgets it.
-void ExpertStore::Impl::startAhead() {
-  std::lock_guard lock(mutex);
-  if (ahead.block == kNoSlot || ahead.batch) return;
+  ahead.block = block;
+  ahead.use = plan.use;
+  ahead.counted.assign(ahead.reads.groups.size(), 0);
   ahead.batch = readers->start(
       ahead.reads.pieces.size(),
       [this](size_t task) {
@@ -580,23 +612,37 @@ void ExpertStore::Impl::startAhead() {
       kAheadReaders);
 }
 
-// Stops the read-ahead: once its readers ended the pieces they took, `read`
-// tells which of them they read (none of one that never started), the
-// experts they read whole count, and their bytes.
-void ExpertStore::Impl::stopAhead() {
-  ahead.read.assign(ahead.reads.pieces.size(), 0);
-  if (!ahead.batch) return;
-  readers->stop(*ahead.batch);
+// Counts group `group` of the read-ahead, its pieces [from, to), which
+// ended or were never taken, once: the bytes its readers read, and its
+// expert if they read all of it.
+void ExpertStore::Impl::countAhead(size_t group, size_t from, size_t to) {
+  if (ahead.counted[group]) return;
+  ahead.counted[group] = 1;
   const WeightReaders::Batch &batch = *ahead.batch;
-  std::vector<uint8_t> whole(ahead.reads.groups.size(), 1);
-  for (size_t p = 0; p < ahead.read.size(); ++p) {
+  bool whole = true;
+  for (size_t p = from; p < to; ++p) {
     const Piece &piece = ahead.reads.pieces[p];
-    ahead.read[p] = p < batch.taken() && !batch.failed(p);
-    if (ahead.read[p]) ahead.use->readBytes += piece.to - piece.from;
-    else whole[piece.group] = 0;
+    if (p < batch.taken() && !batch.failed(p)) ahead.use->readBytes += piece.to - piece.from;
+    else whole = false;
   }
-  ahead.use->readAhead += std::ranges::count(whole, uint8_t{1});
-  ahead.batch.reset();
+  ahead.use->readAhead += whole;
+}
+
+// Ends the read-ahead once its readers ended the pieces they took; what it
+// read that no round counted counts in its use.
+void ExpertStore::Impl::retireAhead() {
+  if (ahead.batch) {
+    readers->stop(*ahead.batch);
+    const std::vector<Piece> &pieces = ahead.reads.pieces;
+    for (size_t piece = 0, end = 0; piece < pieces.size(); piece = end) {
+      while (end < pieces.size() && pieces[end].group == pieces[piece].group) ++end;
+      countAhead(pieces[piece].group, piece, end);
+    }
+    ahead.batch.reset();
+  }
+  ahead.reads.groups.clear();
+  ahead.reads.pieces.clear();
+  ahead.block = kNoSlot;
 }
 
 // Frees the slots of the experts a failed load had not repacked: those
@@ -704,9 +750,8 @@ void ExpertStore::Impl::load(uint32_t index, ops::MoePhase phase, uint32_t rows,
       // block runs on.
       return;
     }
-    // The read-ahead ends: its readers end the pieces they took, a few
-    // hundred KiB each.
-    stopAhead();
+    // The read-ahead halts: its readers take no more pieces.
+    if (ahead.batch) readers->halt(*ahead.batch);
     stage(index, roundPlaces(phase, routable(rows)), use);
     // Once the round is staged, what comes next is read ahead while the GPU
     // repacks it: the load's experts still waiting, else the next block's
@@ -716,7 +761,7 @@ void ExpertStore::Impl::load(uint32_t index, ops::MoePhase phase, uint32_t rows,
       if (round + 1 == rounds) throw std::logic_error("an expert load routes more experts than its rounds stage");
       std::vector<uint32_t> waitingExperts;
       for (const auto &entry : pending) waitingExperts.push_back(entry.first);
-      readAhead(index, waitingExperts, use);
+      planAhead(index, waitingExperts, use);
       return;
     }
     // A long chunk's next block is read ahead by the host step after its
@@ -725,7 +770,7 @@ void ExpertStore::Impl::load(uint32_t index, ops::MoePhase phase, uint32_t rows,
       std::vector<uint32_t> experts;
       for (const uint32_t expert : predictedExperts(rows))
         if (blocks[index + 1].slot[expert] == kNoSlot) experts.push_back(expert);
-      readAhead(index + 1, experts, use);
+      planAhead(index + 1, experts, use);
     }
   } catch (const std::exception &error) {
     abandon();
@@ -744,7 +789,7 @@ void ExpertStore::Impl::readBlockAhead(uint32_t index, ops::MoePhase phase) {
   std::vector<uint32_t> experts;
   for (const uint32_t expert : everyExpert)
     if (blocks[index].slot[expert] == kNoSlot) experts.push_back(expert);
-  readAhead(index, experts, counters.uses[static_cast<size_t>(phase)]);
+  planAhead(index, experts, counters.uses[static_cast<size_t>(phase)]);
 }
 
 ExpertStore::ExpertStore(metal::MetalBackend &backend, StreamedBlocks streamed, ops::MoeShape shape,
@@ -990,8 +1035,8 @@ void ExpertStore::release() {
   if (impl.released) return;
   // A read-ahead in flight writes into the memory released below: its
   // readers end the pieces they took, and it is forgotten.
-  impl.stopAhead();
-  impl.ahead.block = kNoSlot;
+  impl.retireAhead();
+  impl.ahead.block = impl.plan.block = kNoSlot;
   for (Impl::Block &block : impl.blocks) std::ranges::fill(block.slot, kNoSlot);
   std::memset(impl.tables.contents(), 0, impl.tables.sizeBytes());
   for (Impl::Size &size : impl.sizes) {
