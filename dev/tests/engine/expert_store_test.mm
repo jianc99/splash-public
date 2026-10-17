@@ -1,14 +1,18 @@
-// Streamed experts (model::ExpertStore) at two MoE shapes in turn, a small
-// one and Qwen3.8-Flash-Next's routing: routed experts read from a file into
-// an arena of one block's experts and three more, which two blocks share, run
-// decode steps and prefill chunks bitwise as the resident experts do, their
-// slots holding the reference repack's planes, and read ahead the next
-// block's experts a long chunk routes or a decode step predicts; a decode
-// step's experts outlive long chunks of other blocks; the union of a block's
-// steps loads in one host step; a size of one block holds every expert,
-// through a release and a restore; long chunks stage in slots they borrow and
-// give back; and a source written since it was opened fails the load's
-// command, which the store reports.
+// Streamed experts (model::ExpertStore) at three MoE shapes in turn, a small
+// one, the 35B's routing and Qwen3.8-Flash-Next's: routed experts read from a
+// file into an arena of one block's experts and three more, which two blocks
+// share, run decode steps and prefill chunks bitwise as the resident experts
+// do, their slots holding the reference repack's planes, in as many rounds as
+// the staging needs, and read ahead the next round's experts or the next
+// block's a long chunk routes or a decode step predicts; a decode step's
+// experts outlive long chunks of other blocks; the union of a block's steps
+// loads at once; a size of one block holds every expert, through a release
+// and a restore; long chunks load in rounds through half the staging, also
+// across a release while the next block's experts are read ahead; a read
+// ahead that fails fails no load that does not route its expert, a read of a
+// routed expert that fails fails the load, and a source written since it was
+// opened fails the load's command, which the store reports; and memory one
+// byte short of a block's slots is refused.
 #include "MoeFixture.hpp"
 #include "TestAdmission.hpp"
 #include "TestChecks.hpp"
@@ -17,6 +21,7 @@
 #include "metal/MetalBackend.hpp"
 #include "model/ExpertStore.hpp"
 #include "model/GgufImageLayout.hpp"
+#include "model/Model.hpp"
 #include "model/WeightLayout.hpp"
 #include "model/WeightSource.hpp"
 #include "ops/MoE.hpp"
@@ -44,6 +49,7 @@ using splash::metal::MetalBackend;
 using splash::metal::MetalBackendError;
 using splash::metal::MetalBuffer;
 using splash::model::ExpertStore;
+using splash::model::ExpertStoreOptions;
 using splash::model::ExpertStoreStats;
 using splash::model::StreamedBlocks;
 using splash::ops::BlockExpertProjection;
@@ -60,9 +66,10 @@ using splash::test::require;
 using namespace gguf_reference;
 using namespace moe_fixture;
 
-// The shapes the store runs at: 16 experts, top 4, hidden 1024, 512 wide, and
+// The shapes the store runs at: 16 experts, top 4, hidden 1024, 512 wide; the
+// 35B's 256 experts, top 8, at hidden 256 and 512 wide; and
 // Qwen3.8-Flash-Next's 512 experts, top 10, hidden 256, 640 wide.
-constexpr MoeShape kShapes[] = {{1024, 16, 4, 512}, {256, 512, 10, 640}};
+constexpr MoeShape kShapes[] = {{1024, 16, 4, 512}, {256, 256, 8, 512}, {256, 512, 10, 640}};
 
 // Memory a store gets past the slots a test asks for, less than any slot
 // takes: the store, which takes the most slots its memory holds, takes
@@ -122,10 +129,30 @@ uint64_t arenaBytes(const Model &m, uint64_t slots) {
   return bytes;
 }
 
-// The memory of a store of `blocks` whose arenas hold `arena` bytes of
-// slots (ExpertStoreOptions::memoryBytes): the slots, its staging and tables.
-uint64_t storeBytes(uint64_t arena, const StreamedBlocks &blocks, const MoeShape &shape) {
-  return arena + ExpertStore::fixedBytes(blocks, shape);
+// The readers every store of the test reads on.
+const std::shared_ptr<splash::model::WeightReaders> &readers() {
+  static const auto shared = std::make_shared<splash::model::WeightReaders>(splash::model::kWeightReaders);
+  return shared;
+}
+
+// The options of a store of `blocks` whose arenas hold `arena` bytes of slots
+// (ExpertStoreOptions::memoryBytes: the slots, its staging and tables).
+ExpertStoreOptions storeOptions(uint64_t arena, const StreamedBlocks &blocks, const MoeShape &shape) {
+  return {.memoryBytes = arena + ExpertStore::fixedBytes(blocks, shape), .readers = readers()};
+}
+
+// The rounds of a load of `plan`'s rows: the staging places the experts of a
+// block a decode cycle's rows may route, and at least two; a decode step's
+// load that they hold stages them all in one round, any other load half of
+// them a round.
+uint32_t loadRounds(const MoeShape &shape, const MoePlan &plan) {
+  using splash::model::ExecutionLimits;
+  const uint64_t places = std::max<uint64_t>(
+      2, std::min<uint64_t>(shape.experts, uint64_t{ExecutionLimits::maximumBatchWidth} *
+                                               ExecutionLimits::targetVerifyRows * shape.expertsPerToken));
+  const uint64_t routable = std::min<uint64_t>(shape.experts, uint64_t{plan.rows()} * shape.expertsPerToken);
+  const uint64_t perRound = plan.phase() == MoePhase::Decode && routable <= places ? places : places / 2;
+  return static_cast<uint32_t>((routable + perRound - 1) / perRound);
 }
 
 // A step's rows of input and residual and its output, fresh.
@@ -185,11 +212,10 @@ int streamedExperts(MetalBackend &backend, const MoeShape &shape, const std::fil
     const Model m = makeModel(backend, shape, f, true);
     const std::string formats = formatNames(m);
     ExpertFile file(m, directory / "experts.bin");
-    const uint64_t borrowed = ExpertStore::borrowedSlots(file.blocks, shape), slots = shape.experts + 3 + borrowed;
+    const uint64_t slots = shape.experts + 3;
     ExpertStore store(backend, file.blocks, shape,
-                      {.memoryBytes = storeBytes(arenaBytes(m, slots) + kSpareBytes, file.blocks, shape)});
-    require(store.stats().slots == slots && store.stats().borrowed == borrowed,
-            formats + ": the arena holds another number of slots");
+                      storeOptions(arenaBytes(m, slots) + kSpareBytes, file.blocks, shape));
+    require(store.stats().slots == slots, formats + ": the arena holds another number of slots");
     std::array<BlockMoeWeights, 2> streamed{m.weights, m.weights};
     for (uint32_t block = 0; block < 2; ++block) store.bind(block, streamed[block]);
     Buffers b;
@@ -205,8 +231,10 @@ int streamedExperts(MetalBackend &backend, const MoeShape &shape, const std::fil
                              MoE::decodePlan(shape, 3, MoeConfig{}), prefillPlan(shape, 9),
                              MoE::decodePlan(shape, 2, MoeConfig{}), prefillPlan(shape, 64)};
     uint32_t index = 0;
+    std::array<uint64_t, 2> rounds{};
     for (const MoePlan &plan : plans)
       for (uint32_t block = 0; block < 2; ++block, ++index) {
+        rounds[static_cast<size_t>(plan.phase())] += loadRounds(shape, plan);
         const bool prefill = plan.phase() == MoePhase::Prefill;
         if (block == 0 || prefill) freshRows(backend, b, shape);
         const std::string label = formats + (prefill ? " prefill rows=" : " decode rows=") +
@@ -242,20 +270,24 @@ int streamedExperts(MetalBackend &backend, const MoeShape &shape, const std::fil
              (unsigned long long)stats.slots, stats.failure.empty() ? "" : ", failed: ", stats.failure.c_str());
       ++failures;
     }
-    // Every load is one host step, whose round trip its command's completion
-    // reported.
-    for (const ExpertStoreStats::Use &use : stats.uses)
-      if (use.pickup.count != use.loads || use.work.count != use.pickup.count || use.resume.count != use.pickup.count) {
-        printf("  %s: %llu loads reported %llu/%llu/%llu host-step round trips FAIL\n", formats.c_str(),
-               (unsigned long long)use.loads, (unsigned long long)use.pickup.count,
-               (unsigned long long)use.work.count, (unsigned long long)use.resume.count);
+    // Every round of a load is one host step, whose round trip its command's
+    // completion reported.
+    for (size_t use = 0; use < 2; ++use)
+      if (const ExpertStoreStats::Use &counted = stats.uses[use];
+          counted.pickup.count != rounds[use] || counted.work.count != rounds[use] ||
+          counted.resume.count != rounds[use]) {
+        printf("  %s: %llu loads in %llu rounds reported %llu/%llu/%llu host-step round trips FAIL\n",
+               formats.c_str(), (unsigned long long)counted.loads, (unsigned long long)rounds[use],
+               (unsigned long long)counted.pickup.count, (unsigned long long)counted.work.count,
+               (unsigned long long)counted.resume.count);
         ++failures;
       }
-    printf("%-20s streamed decode B1-4, prefill 9/27/64/263 over two blocks: %llu of %llu routed experts read "
-           "(ahead: prefill %llu, decode %llu of %llu), %.1f MiB, bitwise the resident experts' %s\n",
+    printf("%-20s streamed decode B1-4, prefill 9/27/64/263 over two blocks: %llu of %llu routed experts read in "
+           "%llu rounds (ahead: prefill %llu, decode %llu of %llu), %.1f MiB, bitwise the resident experts' %s\n",
            formats.c_str(), (unsigned long long)read, (unsigned long long)routed,
-           (unsigned long long)prefill.prefetched, (unsigned long long)decode.prefetched,
-           (unsigned long long)decode.read, double(readBytes) / (1 << 20), failures > before ? "FAIL" : "ok");
+           (unsigned long long)(rounds[0] + rounds[1]), (unsigned long long)prefill.prefetched,
+           (unsigned long long)decode.prefetched, (unsigned long long)decode.read, double(readBytes) / (1 << 20),
+           failures > before ? "FAIL" : "ok");
   }
   // The first block's prediction is exact, and the second block's load
   // follows it by two commands: some of its misses were read ahead whole.
@@ -268,10 +300,10 @@ int streamedExperts(MetalBackend &backend, const MoeShape &shape, const std::fil
 
 // A long prefill chunk's loads are recycled before the experts a decode step
 // routed: three blocks share an arena of one block and the decode step's
-// experts and three slots (besides those prefill loads borrow), and after a
-// decode step of the last block two long chunks of the others load every
-// expert of each, yet the same decode step reads nothing again (one recency
-// order would evict its experts for the second chunk).
+// experts and three slots, and after a decode step of the last block two
+// long chunks of the others load every expert of each, yet the same decode
+// step reads nothing again (one recency order would evict its experts for
+// the second chunk).
 int streamedChunkOrder(MetalBackend &backend, const MoeShape &shape, const std::filesystem::path &directory) {
   const Model m = makeModel(backend, shape, Q4K, true);
   ExpertFile file(m, directory / "experts.bin");
@@ -288,9 +320,8 @@ int streamedChunkOrder(MetalBackend &backend, const MoeShape &shape, const std::
   std::set<uint32_t> routed;
   for (uint32_t route = 0; route < decode.rows() * shape.routesPerToken(); ++route)
     if (selected[route] < shape.experts) routed.insert(selected[route]);
-  const uint64_t slots = shape.experts + routed.size() + 3 + ExpertStore::borrowedSlots(blocks, shape);
-  ExpertStore store(backend, blocks, shape,
-                    {.memoryBytes = storeBytes(arenaBytes(m, slots) + kSpareBytes, blocks, shape)});
+  const uint64_t slots = shape.experts + routed.size() + 3;
+  ExpertStore store(backend, blocks, shape, storeOptions(arenaBytes(m, slots) + kSpareBytes, blocks, shape));
   std::array<BlockMoeWeights, 3> streamed{m.weights, m.weights, m.weights};
   for (uint32_t block = 0; block < 3; ++block) store.bind(block, streamed[block]);
   int failures = 0;
@@ -328,18 +359,18 @@ int streamedChunkOrder(MetalBackend &backend, const MoeShape &shape, const std::
 }
 
 // Steps of one block that share a load (the chunks of a layer-major prefill
-// group): each routes into its own scratch, one load, one host step, stages
-// the union of their experts, and each step's routed work then gives the
-// resident experts' bits. The two blocks take turns, so each union evicts
-// the other block's experts; each load counts once.
+// group): each routes into its own scratch, one load of their rows' rounds
+// stages the union of their experts, and each step's routed work then gives
+// the resident experts' bits. The two blocks take turns, so each union
+// evicts the other block's experts; each load counts once.
 int streamedUnionLoads(MetalBackend &backend, const MoeShape &shape, const std::filesystem::path &directory) {
   int failures = 0;
   for (const Fmt f : {Q4K, IQ3XXS}) {
     const Model m = makeModel(backend, shape, f, true);
     ExpertFile file(m, directory / "experts.bin");
-    const uint64_t slots = shape.experts + 3 + ExpertStore::borrowedSlots(file.blocks, shape);
+    const uint64_t slots = shape.experts + 3;
     ExpertStore store(backend, file.blocks, shape,
-                      {.memoryBytes = storeBytes(arenaBytes(m, slots) + kSpareBytes, file.blocks, shape)});
+                      storeOptions(arenaBytes(m, slots) + kSpareBytes, file.blocks, shape));
     std::array<BlockMoeWeights, 2> streamed{m.weights, m.weights};
     for (uint32_t block = 0; block < 2; ++block) store.bind(block, streamed[block]);
     constexpr std::array<uint32_t, 3> kRows{kMaximumRows, 27, 9};
@@ -377,14 +408,15 @@ int streamedUnionLoads(MetalBackend &backend, const MoeShape &shape, const std::
         }
       }
       const ExpertStoreStats::Use &use = store.stats().uses[0];
-      if (use.loads != used.loads + 1 || use.pickup.count != used.pickup.count + 1) {
-        printf("  %s: a union load counted %llu loads in %llu host steps FAIL\n", fmtName(f),
+      const uint32_t rounds = loadRounds(shape, prefillPlan(shape, kRows[0] + kRows[1] + kRows[2]));
+      if (use.loads != used.loads + 1 || use.pickup.count != used.pickup.count + rounds) {
+        printf("  %s: a union load counted %llu loads in %llu host steps, not %u FAIL\n", fmtName(f),
                (unsigned long long)(use.loads - used.loads),
-               (unsigned long long)(use.pickup.count - used.pickup.count));
+               (unsigned long long)(use.pickup.count - used.pickup.count), rounds);
         ++failures;
       }
     }
-    printf("%-20s streamed union loads of three steps (263/27/9 rows), two blocks in turn, one host step each: "
+    printf("%-20s streamed union loads of three steps (263/27/9 rows), two blocks in turn, one load each: "
            "bitwise the resident experts' %s\n",
            fmtName(f), failures > before ? "FAIL" : "ok");
   }
@@ -395,18 +427,17 @@ int streamedUnionLoads(MetalBackend &backend, const MoeShape &shape, const std::
 // gave other formats) holds every one of its experts: the store reads them
 // when it is built and again when it is restored, and that block's steps
 // load nothing (no host step, no read), while each load of the streamed size
-// is one host step. Each step gives the resident experts' bits.
+// runs its rounds. Each step gives the resident experts' bits.
 int streamedLoneBlockSize(MetalBackend &backend, const MoeShape &shape, const std::filesystem::path &directory) {
   const Model trunk = makeModel(backend, shape, Q4K, true), head = makeModel(backend, shape, Q80, true);
   ExpertFile trunkFile(trunk, directory / "trunk.bin"), headFile(head, directory / "head.bin");
   StreamedBlocks blocks = trunkFile.blocks;
   blocks.blocks.push_back(headFile.blocks.blocks.front());
   blocks.checks.push_back(headFile.blocks.checks.front());
-  const uint64_t trunkSlots = shape.experts + 3 + ExpertStore::borrowedSlots(blocks, shape);
-  ExpertStore store(
-      backend, blocks, shape,
-      {.memoryBytes = storeBytes(arenaBytes(trunk, trunkSlots) + arenaBytes(head, shape.experts) + kSpareBytes, blocks,
-                                 shape)});
+  const uint64_t trunkSlots = shape.experts + 3;
+  ExpertStore store(backend, blocks, shape,
+                    storeOptions(arenaBytes(trunk, trunkSlots) + arenaBytes(head, shape.experts) + kSpareBytes,
+                                 blocks, shape));
   require(store.stats().slots == trunkSlots + shape.experts && store.stats().resident == shape.experts,
           "a size of one block holds another number of slots, or not every expert of its block");
   std::array<BlockMoeWeights, 3> streamed{trunk.weights, trunk.weights, head.weights};
@@ -441,7 +472,8 @@ int streamedLoneBlockSize(MetalBackend &backend, const MoeShape &shape, const st
       read += after.uses[use].read - before.uses[use].read;
     }
     if (got != want || !slotsHoldTheirExperts(m, streamed[step.block], b, *step.plan) ||
-        hostSteps != (step.block == 2 ? 0 : 1) || (step.block == 2 && read)) {
+        hostSteps != (step.block == 2 ? 0 : loadRounds(shape, *step.plan)) ||
+        (step.block == 2 && read)) {
       printf("  block %u%s: %llu host steps read %llu experts, or its output or slots differ from the resident "
              "experts' FAIL\n",
              step.block, step.restores ? " after a restore" : "", (unsigned long long)hostSteps,
@@ -455,22 +487,20 @@ int streamedLoneBlockSize(MetalBackend &backend, const MoeShape &shape, const st
   return failures;
 }
 
-// Prefill chunks whose rows may route more experts than the staging places
-// stage in slots borrowed from the end of the streamed size's arena,
-// whatever the formats, and the decode step after them gives them back:
-// while they are borrowed no routed expert lives there, and that decode
-// step's misses take them first. Without borrowed slots (the staging places
-// a whole block) every load stages in the staging. Each load is one host
-// step, and each step gives the resident experts' bits.
-int streamedBorrowedStaging(MetalBackend &backend, const MoeShape &shape, const std::filesystem::path &directory) {
+// Long prefill chunks load in rounds through half the staging each, the
+// readers reading the next round's experts ahead into the other half while
+// the GPU repacks, and after the last round the next block's: an arena of
+// two blocks' slots holds both blocks' experts, so a decode step of the first
+// chunk's rows after the chunks reads nothing. A release while the
+// read-ahead of the second
+// block's experts runs ends it: the chunks after the restore read every
+// expert they route again. Each step gives the resident experts' bits, and
+// each load's host steps are its rounds.
+int streamedRounds(MetalBackend &backend, const MoeShape &shape, const std::filesystem::path &directory) {
   const Model m = makeModel(backend, shape, Q4K, true);
   ExpertFile file(m, directory / "experts.bin");
-  const uint64_t borrowed = ExpertStore::borrowedSlots(file.blocks, shape), slots = 2 * shape.experts + borrowed;
-  ExpertStore store(backend, file.blocks, shape,
-                    {.memoryBytes = storeBytes(arenaBytes(m, slots) + kSpareBytes, file.blocks, shape)});
-  require(store.stats().slots == slots && store.stats().borrowed == borrowed,
-          "the streamed size holds or lends another number of slots");
-  const uint64_t lent = slots - borrowed;
+  const uint64_t slots = 2 * shape.experts;
+  ExpertStore store(backend, file.blocks, shape, storeOptions(arenaBytes(m, slots), file.blocks, shape));
   std::array<BlockMoeWeights, 2> streamed{m.weights, m.weights};
   for (uint32_t block = 0; block < 2; ++block) store.bind(block, streamed[block]);
   const MoePlan decode = MoE::decodePlan(shape, 1, MoeConfig{});
@@ -479,37 +509,172 @@ int streamedBorrowedStaging(MetalBackend &backend, const MoeShape &shape, const 
   const struct Step {
     uint32_t block;
     bool prefill;
-    bool givesBack; // the decode step after the chunks, whose misses take the borrowed slots first
-  } steps[] = {{0, false, false}, {1, false, false}, {0, true, false}, {1, true, false},
-               {0, false, true},  {1, false, false}, {0, true, false}};
+    bool releases; // before the step, while the last step's read-ahead runs
+    bool reads;    // every expert it routes, else none
+  } steps[] = {{0, true, false, true},
+               {1, true, false, true},
+               {0, false, false, false},
+               {0, true, true, true},
+               {1, true, true, true}};
+  Buffers b;
+  std::vector<float> firstInput, firstResidual;
   for (const Step &step : steps) {
+    if (step.releases) {
+      store.release();
+      require(store.restore(splash::test::admitAll), "the store was not restored");
+    }
     const MoePlan &plan = step.prefill ? chunk : decode;
-    Buffers b;
-    freshRows(backend, b, shape);
+    if (step.prefill) {
+      freshRows(backend, b, shape);
+      if (firstInput.empty()) {
+        firstInput = b.input;
+        firstResidual = b.residual;
+      }
+    } else {
+      b.input = firstInput;
+      b.residual = firstResidual;
+      b.moe.input = bfloatBuffer(backend, b.input, "moe-input");
+      b.moe.residual = bfloatBuffer(backend, b.residual, "moe-residual");
+    }
     const std::vector<uint16_t> want = runWeights(backend, m.weights, b, plan);
     const ExpertStoreStats::Use used = store.stats().uses[step.prefill ? 0 : 1];
     const std::vector<uint16_t> got = runWeights(backend, streamed[step.block], b, plan);
     const ExpertStoreStats::Use &use = store.stats().uses[step.prefill ? 0 : 1];
-    const uint64_t hostSteps = use.pickup.count - used.pickup.count, read = use.read - used.read;
-    // The highest slot of an expert the step routed.
-    const auto *selected = static_cast<const uint32_t *>(b.moe.scratch.selectedExperts.contents());
-    const auto *table = static_cast<const uint32_t *>(streamed[step.block].slotTable.contents());
-    uint32_t highest = 0;
-    for (uint64_t route = 0; route < uint64_t{plan.rows()} * shape.routesPerToken(); ++route)
-      if (selected[route] < shape.experts) highest = std::max(highest, table[selected[route]]);
-    const bool placed = !borrowed || (step.prefill ? highest < lent : !step.givesBack || !read || highest >= lent);
-    if (got != want || !slotsHoldTheirExperts(m, streamed[step.block], b, plan) || hostSteps != 1 || !placed) {
-      printf("  block %u %s: %llu host steps, %llu read, highest routed slot %u of %llu lent from %llu, or its "
-             "output or slots differ from the resident experts' FAIL\n",
-             step.block, step.prefill ? "chunk" : "decode step", (unsigned long long)hostSteps,
-             (unsigned long long)read, highest, (unsigned long long)borrowed, (unsigned long long)lent);
+    const uint64_t hostSteps = use.pickup.count - used.pickup.count, read = use.read - used.read,
+                   routed = use.routed - used.routed;
+    const uint32_t rounds = loadRounds(shape, plan);
+    if (got != want || !slotsHoldTheirExperts(m, streamed[step.block], b, plan) || hostSteps != rounds ||
+        read != (step.reads ? routed : 0) || !store.stats().failure.empty()) {
+      printf("  block %u %s%s: %llu host steps of %u rounds, %llu of %llu routed experts read, or its output or "
+             "slots differ from the resident experts' FAIL\n",
+             step.block, step.prefill ? "chunk" : "decode step", step.releases ? " after a release" : "",
+             (unsigned long long)hostSteps, rounds, (unsigned long long)read, (unsigned long long)routed);
       ++failures;
     }
   }
-  printf("streamed experts staging long chunks in %llu borrowed slots of %llu, one host step a load: bitwise the "
-         "resident experts' %s\n",
-         (unsigned long long)borrowed, (unsigned long long)slots, failures ? "FAIL" : "ok");
+  printf("streamed experts loading long chunks in %u rounds through a staging of %llu KiB, across a release: "
+         "bitwise the resident experts' %s\n",
+         loadRounds(shape, chunk), (unsigned long long)(store.stats().stagingBytes >> 10),
+         failures ? "FAIL" : "ok");
   return failures;
+}
+
+// A read that fails twice fails a load only when the load routes its
+// expert. Of two blocks, the second reads a file whose last bytes were cut,
+// so its last expert's rows cannot be read (and those whose rows,
+// widened to whole pages, end past the cut). A decode step of the first
+// block predicts the second block's routes and reads them ahead, the last
+// expert among them, which fails; a chunk of the second block that routes
+// none of the experts cut runs as the resident experts do, and the store
+// reports no failure. A chunk that routes the last expert fails its command
+// and frees the slots it claimed; the backend then refuses every later
+// command, and the store keeps its failure.
+int streamedReadFailures(const std::string &metallibPath, const MoeShape &shape,
+                         const std::filesystem::path &directory) {
+  MetalBackend backend(metallibPath);
+  const Model m = makeModel(backend, shape, Q4K, true);
+  ExpertFile intact(m, directory / "intact.bin"), cut(m, directory / "cut.bin");
+  StreamedBlocks blocks;
+  blocks.blocks = {intact.blocks.blocks.front(), cut.blocks.blocks.front()};
+  const uint64_t slots = 2 * shape.experts;
+  ExpertStore store(backend, blocks, shape, storeOptions(arenaBytes(m, slots), blocks, shape));
+  std::array<BlockMoeWeights, 2> streamed{m.weights, m.weights};
+  for (uint32_t block = 0; block < 2; ++block) store.bind(block, streamed[block]);
+  // The down rows are the file's last: cut half of the last expert's.
+  const uint64_t fileBytes = std::filesystem::file_size(cut.path);
+  const uint64_t downBytes = m.routed[2].native.size() / shape.experts;
+  std::filesystem::resize_file(cut.path, fileBytes - downBytes / 2);
+  const uint64_t downStart = fileBytes - m.routed[2].native.size();
+  constexpr uint64_t kPage = 16 << 10;
+  std::set<uint32_t> unreadable;
+  for (uint32_t expert = 0; expert < shape.experts; ++expert)
+    if ((downStart + (expert + 1) * downBytes + kPage - 1) / kPage * kPage > fileBytes - downBytes / 2)
+      unreadable.insert(expert);
+  // Fresh rows until the resident experts' routing of `plan`'s rows routes
+  // the last expert or, with !last, none of the unreadable ones.
+  const auto rowsRouting = [&](Buffers &b, const MoePlan &plan, bool last) {
+    for (int attempt = 0; attempt < 1000; ++attempt) {
+      freshRows(backend, b, shape);
+      static_cast<void>(runWeights(backend, m.weights, b, plan));
+      const auto *selected = static_cast<const uint32_t *>(b.moe.scratch.selectedExperts.contents());
+      bool routesLast = false, routesUnreadable = false;
+      for (uint64_t route = 0; route < uint64_t{plan.rows()} * shape.routesPerToken(); ++route) {
+        routesLast |= selected[route] == shape.experts - 1;
+        routesUnreadable |= unreadable.contains(selected[route]);
+      }
+      if (last ? routesLast : !routesUnreadable) return;
+    }
+    throw std::runtime_error("no rows route as the test needs");
+  };
+  int failures = 0;
+  const MoePlan decode = MoE::decodePlan(shape, 1, MoeConfig{}), row = prefillPlan(shape, 1);
+  Buffers b;
+  // The first block's decode step twice: the second finds its experts
+  // resident and reads the predicted ones ahead into all but its places.
+  rowsRouting(b, decode, true);
+  for (int pass = 0; pass < 2; ++pass) static_cast<void>(runWeights(backend, streamed[0], b, decode));
+  rowsRouting(b, row, false);
+  const std::vector<uint16_t> want = runWeights(backend, m.weights, b, row);
+  if (runWeights(backend, streamed[1], b, row) != want || !store.stats().failure.empty()) {
+    printf("  streamed read failures: a chunk that routes no expert cut differs or fails (%s) FAIL\n",
+           store.stats().failure.c_str());
+    ++failures;
+  }
+  const uint64_t resident = store.stats().resident;
+  rowsRouting(b, row, true);
+  std::string error;
+  try {
+    static_cast<void>(runWeights(backend, streamed[1], b, row));
+  } catch (const MetalBackendError &caught) {
+    error = caught.what();
+  }
+  const ExpertStoreStats stats = store.stats();
+  if (error.find("host step failed") == std::string::npos || stats.failure.find("truncated") == std::string::npos ||
+      stats.resident != resident) {
+    printf("  streamed read failures: a chunk that routes the expert cut did not fail its command (%s), the store "
+           "reports \"%s\", or %llu experts are resident, not %llu FAIL\n",
+           error.c_str(), stats.failure.c_str(), (unsigned long long)stats.resident, (unsigned long long)resident);
+    ++failures;
+  }
+  error.clear();
+  try {
+    static_cast<void>(runWeights(backend, streamed[0], b, row));
+  } catch (const MetalBackendError &caught) {
+    error = caught.what();
+  }
+  if (error.empty() || store.stats().failure.find("truncated") == std::string::npos) {
+    printf("  streamed read failures: a load after a failed one ran, or the store forgot its failure FAIL\n");
+    ++failures;
+  }
+  printf("streamed experts: a failed read ahead of an expert no load routes fails nothing; a failed read of a routed "
+         "expert fails its command, and the store keeps its failure %s\n",
+         failures ? "FAIL" : "ok");
+  return failures;
+}
+
+// A store refuses memory a byte short of a block's slots beside its staging
+// and tables, and takes exactly that much.
+int streamedRefusal(MetalBackend &backend, const MoeShape &shape, const std::filesystem::path &directory) {
+  const Model m = makeModel(backend, shape, Q4K, true);
+  ExpertFile file(m, directory / "experts.bin");
+  ExpertStoreOptions options = storeOptions(arenaBytes(m, shape.experts), file.blocks, shape);
+  --options.memoryBytes;
+  std::string refusal;
+  try {
+    ExpertStore refused(backend, file.blocks, shape, options);
+  } catch (const std::invalid_argument &error) {
+    refusal = error.what();
+  }
+  ++options.memoryBytes;
+  ExpertStore store(backend, file.blocks, shape, options);
+  if (refusal.find("holds fewer slots") == std::string::npos || store.stats().slots != shape.experts) {
+    printf("streamed experts: memory a byte short of a block's slots was not refused (%s), or exactly enough holds "
+           "%llu slots FAIL\n",
+           refusal.c_str(), (unsigned long long)store.stats().slots);
+    return 1;
+  }
+  printf("streamed experts: memory a byte short of a block's slots is refused, exactly enough taken ok\n");
+  return 0;
 }
 
 // A source written since it was opened fails the load that reads it, which
@@ -519,8 +684,8 @@ int streamedSourceChanges(const std::string &metallibPath, const MoeShape &shape
   MetalBackend backend(metallibPath);
   const Model m = makeModel(backend, shape, Q4K, true);
   ExpertFile file(m, directory / "experts.bin");
-  const uint64_t slots = shape.experts + ExpertStore::borrowedSlots(file.blocks, shape);
-  ExpertStore store(backend, file.blocks, shape, {.memoryBytes = storeBytes(arenaBytes(m, slots), file.blocks, shape)});
+  const uint64_t slots = shape.experts;
+  ExpertStore store(backend, file.blocks, shape, storeOptions(arenaBytes(m, slots), file.blocks, shape));
   std::array<BlockMoeWeights, 2> blocks{m.weights, m.weights};
   for (uint32_t block = 0; block < 2; ++block) store.bind(block, blocks[block]);
   const BlockMoeWeights &streamed = blocks[0];
@@ -572,7 +737,9 @@ int main(int argc, const char *argv[]) {
                     streamedChunkOrder(backend, shape, directory.path()) +
                     streamedUnionLoads(backend, shape, directory.path()) +
                     streamedLoneBlockSize(backend, shape, directory.path()) +
-                    streamedBorrowedStaging(backend, shape, directory.path()) +
+                    streamedRounds(backend, shape, directory.path()) +
+                    streamedReadFailures(argv[1], shape, directory.path()) +
+                    streamedRefusal(backend, shape, directory.path()) +
                     streamedSourceChanges(argv[1], shape, directory.path());
       }
       if (failures) {

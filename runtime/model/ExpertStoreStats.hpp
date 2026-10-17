@@ -13,17 +13,17 @@ namespace splash::model {
 
 struct ExpertStoreStats final {
   uint64_t arenaBytes = 0;
+  uint64_t stagingBytes = 0;
   uint64_t slots = 0;
-  uint64_t borrowed = 0; // of them, those prefill loads borrow to stage in
   uint64_t experts = 0;  // every block's routed experts
   uint64_t resident = 0; // slots holding an expert
   // Per ops::MoePhase, at its value (uses[0] prefill, uses[1] decode): the
   // blocks loaded, the distinct experts they routed, those not resident and
   // of them those read ahead, the experts read ahead whole (routed or not),
   // the bytes read from the sources (ahead or not, routed or not), and the
-  // round trips of the loads' host steps (metal::HostStepTiming: the GPU's
-  // work before a step to the runner taking it up, its work, its end to the
-  // GPU's work after it).
+  // round trips of the loads' host steps, one per round (metal::
+  // HostStepTiming: the GPU's work before a step to the runner taking it up,
+  // its work, its end to the GPU's work after it).
   struct Use final {
     uint64_t loads = 0;
     uint64_t routed = 0;

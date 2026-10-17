@@ -263,14 +263,24 @@ weights shrink by the routed experts' bytes, and the store counts in their
 place (`target_weights_bytes`). Off by default.
 
 - Each MoE layer of a command loads the experts its rows route that are not
-  resident: after the layer's routing, a host step of the command reads them
-  from their files into a staging pool from several threads, and a repack
-  kernel writes them into slots, the least recently used first, before the
-  expert passes run. The kernels read every routed expert through the layer's
-  slot table, so resident and streamed experts run the same kernels.
-- While the GPU runs a layer, the next layer's likely experts are read ahead:
-  those the next layer's router picks from this layer's input in a decode
-  step, nearly all of them in a long prefill chunk.
+  resident: after the layer's routing, a host step of the command claims
+  slots for them, the least recently used first, and reads them from their
+  files into a staging of a decode cycle's experts on the model's weight
+  readers, and a repack kernel writes them into their slots before the expert
+  passes run. A decode step's load is one such round; a prefill command's
+  loads take as many rounds as its rows may route experts, each staging half
+  of the staging while the other half is read ahead. The kernels read every
+  routed expert through the layer's slot table, so resident and streamed
+  experts run the same kernels.
+- An expert's rows a GGUF stores as they are are read straight into the
+  staging (`F_NOCACHE`, widened to whole 16 KiB pages, which the kernel reads
+  without the buffer cache: an M5 Pro reads 460 KiB pieces from four threads
+  at 9.3 GB/s instead of 8.1, with less than half the CPU).
+- While the GPU repacks a round or runs a layer, the next round's experts or
+  the next layer's likely experts are read ahead: those the next layer's
+  router picks from this layer's input in a decode step, nearly all of them in
+  a long prefill chunk. A read ahead of an expert no load routes may fail
+  without failing anything.
 - A host step (`metal::EventStep`) runs CPU work between a command's GPU work
   and holds the work after it until it returns. A decode step's keep the GPU
   awake: one GPU thread spins through each until the CPU ends it, so the work
@@ -284,17 +294,17 @@ place (`target_weights_bytes`). Off by default.
   images runs one chunk per command. A contended prefill command's slice
   counts the time its GPU work waited on the reads as a fixed cost
   ([Admission and eviction](#admission-and-eviction)).
-- A load checks its files unchanged after it read them. A load that fails
-  fails its command, and every later load fails too.
+- A load checks its files unchanged after it read them. A read is tried once
+  more when it fails. A load that fails (a routed expert cannot be read, or
+  a file was written) fails its command, and every later load fails too.
 - The store's memory is released while idle with the weights and restored
   with them ([Weight loading](#weight-loading)).
-- `/status` reports the store under `streamed_experts`: its arena bytes,
-  slots, the slots prefill loads borrow to stage in, its experts and those
-  resident; per use (`prefill`, `decode`) its loads, the distinct experts they
-  routed, those read and of them those read ahead, the experts read ahead
-  whole, the hit rate, the bytes read and the host steps' round trips
-  (`host_steps`: `pickup_ms`, `work_ms`, `resume_ms`); and the `failure` that
-  stopped it.
+- `/status` reports the store under `streamed_experts`: its arena and
+  staging bytes, slots, its experts and those resident; per use (`prefill`,
+  `decode`) its loads, the distinct experts they routed, those read and of
+  them those read ahead, the experts read ahead whole, the hit rate, the bytes
+  read and the host steps' round trips, one per round (`host_steps`:
+  `pickup_ms`, `work_ms`, `resume_ms`); and the `failure` that stopped it.
 
 ### KV cache precision
 
