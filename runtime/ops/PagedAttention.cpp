@@ -223,7 +223,11 @@ VerifyAttentionPlan PagedAttention::verifyPlan(
           {layout.kvHeads, splits, lanes},
           {layout.kvHeads,
            kv::kVerifyRows * (queryHeads / layout.kvHeads), lanes},
-          layout.valuesTokenMajor, storePipeline(layout, true),
+          layout.valuesTokenMajor,
+          !layout.valuesTokenMajor ? std::string_view()
+          : layout.format == kv::Format::BFloat16 ? "verify_attention_bf16_sparse_located_kv2_g12"
+                                                  : "verify_attention_q8_sparse_located_kv2_g12",
+          storePipeline(layout, true),
           {uint64_t{lanes} * 2 * kv::kVerifyRows * layout.kvHeads, 1, 1},
           {layout.headDimension, 1, 1}, layout, queryHeads};
 }
@@ -446,6 +450,12 @@ void PagedAttention::addVerify(metal::CommandGraph &graph, SplashKvLayer layer,
   for (uint32_t lane = 0; lane < plan.lanes; ++lane)
     requirePageTable(buffers.pageTables[lane], chunks[lane]);
   requireBlocks(blocks, plan.sparse, plan.lanes);
+  if (blocks.locations) {
+    if (!blocks.stride || !blocks.locationPages)
+      throw std::invalid_argument("attention block locations need lists and their pages");
+    requireBytes(blocks.locations, (uint64_t{blocks.list} + plan.lanes) * blocks.stride * sizeof(uint32_t),
+                 "attention block locations");
+  }
   // verifyParams validated each chunk, and the plan scaled each lane's
   // split count from the same committed history; every lane's partials use
   // the plan-wide slot stride.
@@ -470,9 +480,12 @@ void PagedAttention::addVerify(metal::CommandGraph &graph, SplashKvLayer layer,
   if (plan.sparse) {
     const auto [lists, counts] = blockBindings(blocks, buffers.partials);
     split.insert(split.end(), {lists, counts});
+    // The located split also reads the lists' locations and their pages.
+    if (blocks.locations) split.insert(split.end(), {blocks.locations, blocks.locationPages});
     reduce.push_back(counts);
   }
-  graph.add(std::string(plan.splitPipeline), std::move(split), attention, plan.splitGroups);
+  graph.add(std::string(blocks.locations ? plan.locatedSplitPipeline_ : plan.splitPipeline), std::move(split),
+            attention, plan.splitGroups);
   graph.add(std::string(plan.reducePipeline), std::move(reduce), attention, plan.reduceGroups);
 }
 

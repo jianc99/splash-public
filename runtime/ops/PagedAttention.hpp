@@ -154,6 +154,8 @@ struct VerifyAttentionPlan final {
 
 private:
   friend class PagedAttention;
+  // A sparse plan's split for lists with locations (AttentionBlocks).
+  const std::string_view locatedSplitPipeline_;
   const std::string_view storePipeline_;
   const metal::DispatchSize storeGroups_;
   const metal::DispatchSize storeThreads_;
@@ -162,13 +164,15 @@ private:
                       uint32_t splits, AttentionWorkspace workspace,
                       std::string_view splitPipeline, std::string_view reducePipeline,
                       metal::DispatchSize splitGroups, metal::DispatchSize reduceGroups,
-                      bool sparse, std::string_view storePipeline, metal::DispatchSize storeGroups,
-                      metal::DispatchSize storeThreads, kv::Layout layout, uint32_t queryHeads)
+                      bool sparse, std::string_view locatedSplitPipeline, std::string_view storePipeline,
+                      metal::DispatchSize storeGroups, metal::DispatchSize storeThreads, kv::Layout layout,
+                      uint32_t queryHeads)
       : layout(layout), queryHeads(queryHeads), lanes(lanes), laneSplits(laneSplits),
         splits(splits), workspace(workspace),
         splitPipeline(splitPipeline), reducePipeline(reducePipeline),
         splitGroups(splitGroups), reduceGroups(reduceGroups), sparse(sparse),
-        storePipeline_(storePipeline), storeGroups_(storeGroups), storeThreads_(storeThreads) {}
+        locatedSplitPipeline_(locatedSplitPipeline), storePipeline_(storePipeline),
+        storeGroups_(storeGroups), storeThreads_(storeThreads) {}
 };
 
 // The block lists a sparse plan's tiles attend through (metal/abi/
@@ -176,11 +180,17 @@ private:
 // each list's count in `counts`; a verify lane's tile reads list `list` +
 // lane, a prefill tile list `list` + tile. Without a stride every tile
 // attends to every block of its history. Only a sparse plan takes lists.
+// With `locations`, an array of the lists' shape, a verify reads each
+// entry's block where its location names (SPLASH_ATTENTION_PAGED or a page
+// of locationPages and the block's place in it), as a store that holds
+// blocks in pages of its own gives them.
 struct AttentionBlocks final {
   metal::MetalBuffer lists;
   metal::MetalBuffer counts;
   uint32_t stride = 0;
   uint32_t list = 0;
+  metal::MetalBuffer locations{};
+  metal::MetalBuffer locationPages{};
 };
 
 // Rows whose block masks become block lists (PagedAttention::addBlockLists):

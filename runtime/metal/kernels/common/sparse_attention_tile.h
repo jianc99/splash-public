@@ -75,14 +75,17 @@ inline uint splash_sparse_history_blocks(uint first_position, uint active_rows) 
          SplashSparseBlockTokens;
 }
 
-// The scratch of a sparse tile: the step's list entries and their pages, its
-// staged keys or values [token][dimension] and, for INT8, their scales, and
-// the page loop's scores, probabilities and row statistics.
-template <typename CacheElement, uint M> struct SplashSparseScratch {
+// The scratch of a sparse tile: the step's list entries, their pages and,
+// for a tile that reads its blocks where their locations name, each block's
+// place in its page, its staged keys or values [token][dimension] and, for
+// INT8, their scales, and the page loop's scores, probabilities and row
+// statistics.
+template <typename CacheElement, uint M, bool Located = false> struct SplashSparseScratch {
   static constexpr constant uint Blocks = SplashSparseStep<CacheElement>::Blocks;
   static constexpr constant uint Tokens = SplashSparseStep<CacheElement>::Tokens;
   uint entries[Blocks];
   SplashKvPage pages[Blocks];
+  uint page_blocks[Located ? Blocks : 1];
   alignas(16) CacheElement stage[Tokens * SplashKvHeadDimension];
   alignas(16) float key_scales[Tokens];
   alignas(16) float value_scales[Tokens];
@@ -94,13 +97,23 @@ template <typename CacheElement, uint M> struct SplashSparseScratch {
   atomic_uint rescale;
 };
 
+// The place in its page of a step slot's block: its own, or with locations
+// the one its location names.
+template <bool Located>
+inline uint splash_sparse_place(threadgroup const uint *entries, threadgroup const uint *page_blocks, uint slot) {
+  if constexpr (Located)
+    return page_blocks[slot];
+  else
+    return (entries[slot] >> SPLASH_ATTENTION_BLOCK_ROW_BITS) % (SplashKvPageTokens / SplashSparseBlockTokens);
+}
+
 // Copies one tensor's rows of the step's tokens (keys or values, both
 // token-major) into the stage, 16 bytes a thread at a time; tokens of a slot
 // past the list's end are zero, so that their products are too.
-template <uint KVHeads, typename CacheElement, uint Tokens>
+template <uint KVHeads, typename CacheElement, uint Tokens, bool Located>
 inline void splash_sparse_gather(
     threadgroup CacheElement *stage, threadgroup const uint *entries,
-    threadgroup const SplashKvPage *pages,
+    threadgroup const SplashKvPage *pages, threadgroup const uint *page_blocks,
     const SplashKvAddressing<KVHeads, CacheElement> addressing, bool values,
     uint thread_index) {
   constexpr uint D = SplashKvHeadDimension;
@@ -110,10 +123,8 @@ inline void splash_sparse_gather(
     const uint slot = token / SplashSparseBlockTokens;
     uint4 data = 0;
     if (entries[slot] != SplashSparseNoEntry) {
-      const uint block = entries[slot] >> SPLASH_ATTENTION_BLOCK_ROW_BITS;
-      const uint page_token =
-          block % (SplashKvPageTokens / SplashSparseBlockTokens) * SplashSparseBlockTokens +
-          token % SplashSparseBlockTokens;
+      const uint page_token = splash_sparse_place<Located>(entries, page_blocks, slot) * SplashSparseBlockTokens +
+                              token % SplashSparseBlockTokens;
       const SplashKvPageTensors<CacheElement> tensors = addressing.page(pages[slot]);
       device const CacheElement *row =
           (values ? tensors.values : tensors.keys) + ulong(page_token) * D;
@@ -206,20 +217,23 @@ inline void splash_sparse_softmax_lane(
 // or with a null list over its history's blocks, writing the split's partials
 // and statistics as the page loop does. The tile's rows are at first_position
 // on; queries are its fused rows [row][query head][dimension] of one KV head.
-// An entry past the tile's history counts as none, so no list makes the tile
-// read past its page table. Five barriers a step order the step's entries
+// A Located tile reads an entry's block where `locations` (the list's,
+// metal/abi/PagedAttention.h) names, a page of location_pages, unless it is
+// SPLASH_ATTENTION_PAGED. An entry past the tile's history counts as none,
+// so no list makes the tile read past its page table. Five barriers a step order the step's entries
 // and pages before the gather; the staged keys and scales before QK; the
 // scores before the softmax, and QK's reads of the keys before the values
 // replace them; the probabilities and values before PV; and PV's reads before
 // the next step's entries and stage.
 template <uint KVHeads, uint QueryHeadsPerKVHead, uint RowsPerTile,
-          typename CacheElement>
+          typename CacheElement, bool Located = false>
 inline void splash_sparse_attention_tile(
     device bfloat *tile_queries, device const SplashKvPage *page_table,
     SplashKvLayer kv, uint kv_head, uint first_position, uint active_rows,
-    device const uint *list, uint count, uint splits, uint split,
+    device const uint *list, uint count, device const uint *locations,
+    device const SplashKvPage *location_pages, uint splits, uint split,
     device float *partials, device float *statistics, ulong slot,
-    threadgroup SplashSparseScratch<CacheElement, RowsPerTile * QueryHeadsPerKVHead> &scratch,
+    threadgroup SplashSparseScratch<CacheElement, RowsPerTile * QueryHeadsPerKVHead, Located> &scratch,
     uint thread_index) {
   constexpr ushort M = RowsPerTile * QueryHeadsPerKVHead;
   constexpr ushort N = SplashSparseStep<CacheElement>::Tokens;
@@ -275,18 +289,27 @@ inline void splash_sparse_attention_tile(
         entry = list ? list[index] : index << SPLASH_ATTENTION_BLOCK_ROW_BITS | AllRows;
       if ((entry >> SPLASH_ATTENTION_BLOCK_ROW_BITS) >= history)
         entry = SplashSparseNoEntry;
+      constexpr uint PageBlocks = SplashKvPageTokens / SplashSparseBlockTokens;
+      const uint block = entry >> SPLASH_ATTENTION_BLOCK_ROW_BITS;
       scratch.entries[thread_index] = entry;
-      scratch.pages[thread_index] =
-          entry == SplashSparseNoEntry
-              ? SplashKvPage(0)
-              : page_table[(entry >> SPLASH_ATTENTION_BLOCK_ROW_BITS) /
-                           (SplashKvPageTokens / SplashSparseBlockTokens)];
+      if constexpr (Located) {
+        const uint location = entry != SplashSparseNoEntry ? locations[index] : SPLASH_ATTENTION_PAGED;
+        scratch.pages[thread_index] =
+            entry == SplashSparseNoEntry          ? SplashKvPage(0)
+            : location == SPLASH_ATTENTION_PAGED ? page_table[block / PageBlocks]
+                                                 : location_pages[location >> SPLASH_ATTENTION_LOCATION_BLOCK_BITS];
+        scratch.page_blocks[thread_index] =
+            location == SPLASH_ATTENTION_PAGED ? block % PageBlocks : location % PageBlocks;
+      } else {
+        scratch.pages[thread_index] =
+            entry == SplashSparseNoEntry ? SplashKvPage(0) : page_table[block / PageBlocks];
+      }
     }
     if (thread_index == 0)
       atomic_store_explicit(&scratch.rescale, 0u, memory_order_relaxed);
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    splash_sparse_gather<KVHeads, CacheElement, N>(scratch.stage, scratch.entries, scratch.pages,
-                                                    addressing, false, thread_index);
+    splash_sparse_gather<KVHeads, CacheElement, N, Located>(scratch.stage, scratch.entries, scratch.pages,
+                                                             scratch.page_blocks, addressing, false, thread_index);
     if constexpr (Quantized) {
       if (thread_index < N) {
         const uint slot_index = thread_index / SplashSparseBlockTokens;
@@ -295,8 +318,8 @@ inline void splash_sparse_attention_tile(
         if (entry != SplashSparseNoEntry) {
           const SplashKvPageTensors<CacheElement> tensors = addressing.page(scratch.pages[slot_index]);
           const uint page_token =
-              (entry >> SPLASH_ATTENTION_BLOCK_ROW_BITS) %
-                  (SplashKvPageTokens / SplashSparseBlockTokens) * SplashSparseBlockTokens +
+              splash_sparse_place<Located>(scratch.entries, scratch.page_blocks, slot_index) *
+                  SplashSparseBlockTokens +
               thread_index % SplashSparseBlockTokens;
           key_scale = tensors.key_scales[page_token];
           value_scale = tensors.value_scales[page_token];
@@ -315,8 +338,8 @@ inline void splash_sparse_attention_tile(
 
     // The values replace the keys in the stage while the softmax reads only
     // the scores and scales.
-    splash_sparse_gather<KVHeads, CacheElement, N>(scratch.stage, scratch.entries, scratch.pages,
-                                                    addressing, true, thread_index);
+    splash_sparse_gather<KVHeads, CacheElement, N, Located>(scratch.stage, scratch.entries, scratch.pages,
+                                                             scratch.page_blocks, addressing, true, thread_index);
     for (uint lane = thread_index; lane < M * N / 8; lane += 256)
       splash_sparse_softmax_lane<QueryHeadsPerKVHead, N, Quantized>(
           scratch.scores, scratch.probabilities, scratch.row_max, scratch.row_sum,

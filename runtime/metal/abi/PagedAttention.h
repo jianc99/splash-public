@@ -69,6 +69,20 @@ static_assert(SPLASH_MAXIMUM_PHYSICAL_KV_TOKENS / SPLASH_ATTENTION_BLOCK_TOKENS 
                   1u << (32 - SPLASH_ATTENTION_BLOCK_ROW_BITS),
               "A list entry's bits above its rows' hold any block");
 
+// A list's blocks may sit outside the tile's page table (ops::AttentionBlocks
+// locations, the blocks a sparse KV store holds), which the located verify
+// split reads: a location per entry, in an array of the lists' shape, names a
+// page of the locations' own page table (location >>
+// SPLASH_ATTENTION_LOCATION_BLOCK_BITS) and the block's place in it (the low
+// bits), or is SPLASH_ATTENTION_PAGED for a block whose page the page table
+// holds, at its own place.
+#define SPLASH_ATTENTION_PAGED 0xffffffffu
+#define SPLASH_ATTENTION_LOCATION_BLOCK_BITS 3u
+
+static_assert(SPLASH_TARGET_KV_BLOCK_TOKENS / SPLASH_ATTENTION_BLOCK_TOKENS ==
+                  1u << SPLASH_ATTENTION_LOCATION_BLOCK_BITS,
+              "A location's low bits hold a block's place in its page");
+
 // The block lists of up to SPLASH_MAXIMUM_BATCH_WIDTH sequences of rows (a
 // verify step's lanes, or a prefill chunk's sequences), in tiles of
 // `tile_rows` rows: sequence s's `rows` rows, whose block masks are rows
