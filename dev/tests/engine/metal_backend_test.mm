@@ -1047,27 +1047,29 @@ private:
 // The command queue holds one residency set, of the buffers kernels reach
 // only through their addresses, and none other: a command buffer waits for
 // its queue's set to be resident before it starts (Residency). Only a Shared
-// buffer is reached by its address.
+// buffer is reached by its address, and only such a buffer has one, zero
+// while its memory is released.
 void queueHoldsAddressedBuffers(const std::string &metallibPath) {
     QueueSets sets;
     MetalBackend backend(metallibPath);
     require(sets.added.size() == 1, "the command queue does not hold exactly one residency set");
     const uint64_t page = static_cast<uint64_t>(getpagesize());
-    MetalBuffer bound = sharedBuffer(backend, page);
+    MetalBuffer bound = backend.allocateBuffer(page, BufferStorage::Shared, "bound");
     MetalBuffer addressed = backend.allocateBuffer(page, BufferStorage::Shared, "addressed",
                                                    BufferReach::Addressed);
-    const auto held = [&](const MetalBuffer &buffer) {
-        for (id<MTLAllocation> allocation in sets.added.front().allAllocations)
-            if (((id<MTLBuffer>)allocation).gpuAddress == buffer.gpuAddress()) return true;
-        return false;
-    };
-    require(held(addressed) && !held(bound) && sets.added.front().allocationCount == 1,
+    NSArray<id<MTLAllocation>> *held = sets.added.front().allAllocations;
+    require(held.count == 1 && [((id<MTLBuffer>)held.firstObject).label isEqualToString:@"addressed"],
             "the command queue's set does not hold exactly the addressed buffer");
     rejects([&] {
                 (void)backend.allocateBuffer(page, BufferStorage::Private, "private", BufferReach::Addressed);
             },
             "only a Shared Metal buffer is reached by its address",
             "a Private buffer was reached by its address");
+    rejects([&] { (void)bound.gpuAddress(); }, "allocated BufferReach::Addressed has a GPU address",
+            "a buffer kernels reach bound had a GPU address");
+    require(addressed.gpuAddress(), "an addressed buffer has no GPU address");
+    backend.releaseMemory(addressed);
+    require(!addressed.gpuAddress(), "released memory kept its GPU address");
     std::cout << "PASS the command queue holds the addressed buffers\n";
 }
 
@@ -1262,7 +1264,7 @@ void releasedMemory(const std::string &metallibPath) {
     rejects([&] { backend.restoreMemory(buffer); }, "not released", "allocated memory was restored");
     const unsigned removals = calls.removals;
     backend.releaseMemory(buffer);
-    require(!buffer.contents() && !view.contents() && !view.gpuAddress() &&
+    require(!buffer.contents() && !view.contents() &&
                 backend.memoryStats().allocatedBytes == before && calls.removals == removals + 1,
             "released memory kept its contents, its accounting or its residency");
     rejects([&] { backend.releaseMemory(buffer); }, "already released", "memory was released twice");

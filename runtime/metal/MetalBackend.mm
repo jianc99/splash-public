@@ -1473,7 +1473,9 @@ void *MetalBuffer::contents() const noexcept {
            impl_->offsetBytes;
 }
 
-uint64_t MetalBuffer::gpuAddress() const noexcept {
+uint64_t MetalBuffer::gpuAddress() const {
+    if (impl_ && impl_->allocation->reach != BufferReach::Addressed)
+        throw MetalBackendError("only a Metal buffer allocated BufferReach::Addressed has a GPU address");
     if (!impl_ || !impl_->allocation->buffer) return 0;
     return impl_->allocation->buffer.gpuAddress + impl_->offsetBytes;
 }

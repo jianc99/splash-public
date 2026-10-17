@@ -87,8 +87,10 @@ public:
   // (MetalBackend::releaseMemory). The pointer covers this view only.
   [[nodiscard]] void *contents() const noexcept;
   // GPU address of the view's first byte, for kernels that reach a buffer
-  // through an address another buffer holds.
-  [[nodiscard]] uint64_t gpuAddress() const noexcept;
+  // through an address another buffer holds; zero for released memory. Only
+  // a buffer allocated BufferReach::Addressed has one: no command names the
+  // buffers kernels reach that way, so only that keeps them resident.
+  [[nodiscard]] uint64_t gpuAddress() const;
   // Allocation identity and exact view range, including Private storage.
   // This compares metadata only; it never maps or reads device contents.
   [[nodiscard]] bool sameView(const MetalBuffer &other) const noexcept;
