@@ -206,7 +206,10 @@ struct HostStepTiming {
 // without a failure, `timed` gets the round trip of each of its host steps
 // (HostStepTiming); one that throws marks the backend unhealthy, as a
 // completion callback that throws does. A command run under dispatch
-// profiling reports no round trip.
+// profiling reports no round trip. `then`, when the work returned, runs on
+// the same thread right after the step let the work after it go: CPU work
+// that the GPU need not wait for and that would slow its start (reads the
+// work begins in the background); if it throws, the command fails.
 struct EventStep {
   enum class Kind : uint8_t { Signal, Wait, Host };
 
@@ -217,6 +220,7 @@ struct EventStep {
   std::function<void()> work{};
   std::function<void(const HostStepTiming &)> timed{};
   bool awake = false;
+  std::function<void()> then{};
 };
 
 // What one submission encodes: its dispatches in order, and the event steps

@@ -1691,6 +1691,45 @@ void throwingHostStepFailsItsCommand(const std::string &metallibPath) {
     std::cout << "PASS a throwing host step fails its command\n";
 }
 
+// A host step's `then` runs after its work, once the work after the step
+// may go: it sees that work's result; it does not run after work that threw,
+// and one that throws fails its command.
+void hostStepThen(const std::string &metallibPath) {
+    MetalBackend backend(metallibPath);
+    MetalBuffer buffer = sharedBuffer(backend, sizeof(uint32_t));
+    auto *value = static_cast<volatile uint32_t *>(buffer.contents());
+    *value = 0;
+    const uint32_t count = 1, one = 1;
+    const std::vector<ComputeDispatch> dispatches(2, addition(buffer, count, one));
+    uint32_t seen = 0;
+    bool after = false;
+    const std::vector<EventStep> steps{{1, {}, 0, EventStep::Kind::Host, [&] { seen = *value; }, {}, false, [&] {
+                                            const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+                                            while (*value != 2 && std::chrono::steady_clock::now() < end) {}
+                                            after = *value == 2;
+                                        }}};
+    (void)backend.submitCommandAsync(Command{dispatches, steps}).wait();
+    require(seen == 1 && after, "a host step's then did not run once the work after the step went");
+    bool ran = false;
+    const std::vector<EventStep> throwing{{1, {}, 0, EventStep::Kind::Host,
+                                           [] { throw std::runtime_error("test host failure"); }, {}, false,
+                                           [&] { ran = true; }}};
+    MetalBackend failing(metallibPath);
+    MetalBuffer failingBuffer = sharedBuffer(failing, sizeof(uint32_t));
+    const std::vector<ComputeDispatch> failingDispatches(2, addition(failingBuffer, count, one));
+    rejects([&] { (void)failing.submitCommandAsync(Command{failingDispatches, throwing}).wait(); },
+            "test host failure", "a command whose host step threw did not fail");
+    require(!ran, "a host step's then ran after its work threw");
+    MetalBackend thenFails(metallibPath);
+    MetalBuffer thenBuffer = sharedBuffer(thenFails, sizeof(uint32_t));
+    const std::vector<ComputeDispatch> thenDispatches(2, addition(thenBuffer, count, one));
+    const std::vector<EventStep> throwingThen{{1, {}, 0, EventStep::Kind::Host, [] {}, {}, false,
+                                               [] { throw std::runtime_error("test then failure"); }}};
+    rejects([&] { (void)thenFails.submitCommandAsync(Command{thenDispatches, throwingThen}).wait(); },
+            "host step failed: test then failure", "a command whose host step's then threw did not fail");
+    std::cout << "PASS a host step's then runs once the work after it went\n";
+}
+
 // A host step whose work before it ends long after the runner began to wait
 // for it (the command held 50 ms on an event, past the runner's spin, so the
 // runner blocks on the step's event) still runs once that work ended, taken
@@ -2054,6 +2093,7 @@ int main(int argc, const char *argv[]) {
             failedBufferStillSignals(argv[1]);
             hostSteps(argv[1]);
             throwingHostStepFailsItsCommand(argv[1]);
+            hostStepThen(argv[1]);
             hostStepAfterALongWait(argv[1]);
             blockedHostStepRunnerStops(argv[1]);
             allocationDoesNotRequestResidency(argv[1]);

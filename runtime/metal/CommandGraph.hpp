@@ -71,12 +71,12 @@ public:
   }
   // A host step after the dispatches added so far (EventStep::Kind::Host):
   // `work` runs on the CPU between the work before and the work after it,
-  // `timed` gets its round trip once the command completed, and with `awake`
-  // the GPU spins through it.
+  // `timed` gets its round trip once the command completed, with `awake`
+  // the GPU spins through it, and `then` runs once the work after it may go.
   void host(std::function<void()> work, std::function<void(const HostStepTiming &)> timed = {},
-            bool awake = false) {
-    events_.push_back(
-        {dispatches_.size(), {}, 0, EventStep::Kind::Host, std::move(work), std::move(timed), awake});
+            bool awake = false, std::function<void()> then = {}) {
+    events_.push_back({dispatches_.size(), {}, 0, EventStep::Kind::Host, std::move(work), std::move(timed), awake,
+                       std::move(then)});
   }
 
   [[nodiscard]] bool empty() const noexcept { return dispatches_.empty(); }

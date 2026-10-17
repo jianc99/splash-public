@@ -297,7 +297,9 @@ place (`target_weights_bytes`). Off by default.
   wake-up. The spin sees the CPU end it only through a memory scope Metal's
   public headers leave out (`runtime/metal/kernels/shared/host_step.metal`):
   the backend checks once, before the first command with such a step, that it
-  does, and otherwise runs the steps without the spin, with a warning.
+  does, and otherwise runs the steps without the spin, with a warning. CPU
+  work the GPU need not wait for runs after the step let the work after it go
+  (`then`): reads begun as the step ends hold the GPU's start back.
 - A prefill command runs a group of up to four chunks of 2048 rows layer by
   layer, so each layer's experts are read once for all of them; a prompt with
   images runs one chunk per command. A contended prefill command's slice

@@ -453,8 +453,9 @@ struct BackendAsyncState {
 // raises through an event of their own: the work before step i has completed
 // at 2i + 1 (ready), and step i has run at 2i + 2; past the event of a step
 // that keeps the GPU awake the runner raises the backend's release counter to
-// the step's value, which ends the GPU's spin through it (host_step_wait).
-// Each step runs unless the command buffer before it failed; the first step
+// the step's value, which ends the GPU's spin through it (host_step_wait),
+// and then runs the step's `then` once its work returned. Each step runs
+// unless the command buffer before it failed; the first step (or `then`)
 // that throws names the command's failure. The runner notes when it took each
 // step up and when its work returned, which the command's completion reports
 // (timed) against the GPU times of the buffers before and after the step.
@@ -463,6 +464,7 @@ struct HostSteps {
         uint64_t ready = 0;
         std::function<void()> work;
         std::function<void(const HostStepTiming &)> timed;
+        std::function<void()> then;
         __weak id<MTLCommandBuffer> before = nil;
         __weak id<MTLCommandBuffer> after = nil;
         // AwakeClock seconds, zero while the step has not run.
@@ -589,22 +591,29 @@ private:
                 id<MTLSharedEvent> event = steps->event;
                 for (HostSteps::Step &step : steps->steps) {
                     id<MTLCommandBuffer> before = step.before;
-                    if (before && reached(event, step.ready, before) &&
-                        before.status != MTLCommandBufferStatusError) {
-                        const double pickup = awakeSeconds();
+                    const auto attempt = [&](const std::function<void()> &work) {
                         try {
-                            step.work();
+                            work();
+                            return true;
                         } catch (const std::exception &error) {
                             steps->fail(std::string("host step failed: ") + error.what());
                         } catch (...) {
                             steps->fail("host step failed");
                         }
+                        return false;
+                    };
+                    bool worked = false;
+                    if (before && reached(event, step.ready, before) &&
+                        before.status != MTLCommandBufferStatusError) {
+                        const double pickup = awakeSeconds();
+                        worked = attempt(step.work);
                         steps->ran(step, pickup, awakeSeconds());
                     } else if (stopping_) {
                         steps->fail("host step not run: the backend stopped");
                     }
                     event.signaledValue = step.ready + 1;
                     if (step.release) release(steps->releases, *step.release);
+                    if (worked && step.then) attempt(step.then);
                 }
             }
         }
@@ -1047,7 +1056,7 @@ struct MetalBackend::Impl {
         id<MTLCommandBuffer> next = [queue commandBuffer];
         if (!next) failBeforeCommit("unable to create Metal command buffer");
         [next encodeWaitForEvent:event value:ready + 1];
-        steps->steps.push_back({ready, step.work, step.timed, command, next, 0.0, 0.0, released});
+        steps->steps.push_back({ready, step.work, step.timed, step.then, command, next, 0.0, 0.0, released});
         return next;
     }
 
