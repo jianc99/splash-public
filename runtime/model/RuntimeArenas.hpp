@@ -52,6 +52,8 @@ struct RuntimeGeometry final {
   // The chunks of a prefill command: a group's for a target whose experts
   // stream, otherwise one.
   uint32_t prefillChunks = 1;
+  // The step scratch the target keeps itself beside the arenas.
+  QwenTargetScratchBytes targetScratch{};
 
   [[nodiscard]] static RuntimeGeometry from(const LoadedModel &model,
                                             kv::Format kvFormat,
@@ -64,6 +66,9 @@ struct RuntimeGeometry final {
     result.target.kvLayout = model.targetKvLayout(kvFormat);
     result.target.stateLayout = model.stateLayout(stateFormat).target;
     if (model.expertStore()) result.prefillChunks = kPrefillGroupChunks;
+    result.targetScratch = std::visit(
+        [&](const auto &weights) { return qwenTargetScratchBytes(weights, result.target, result.prefillChunks); },
+        model.target);
     if (!result.target.valid() || !result.draft.stateLayout().valid() ||
         result.target.hiddenSize != result.draft.hiddenSize ||
         result.target.vocabularySize != result.draft.vocabularySize ||
@@ -185,7 +190,7 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
                    const ops::ExecutionPlans &operators);
 [[nodiscard]] uint64_t prefillArenaBytes(const RuntimeGeometry &geometry,
                                          const ops::ExecutionPlans &operators);
-// The arena's and the target's own prefill scratch (QwenTarget::scratchBytes).
+// The arena's and the target's own prefill scratch (qwenTargetScratchBytes).
 [[nodiscard]] uint64_t plannedPrefillBytes(const RuntimeGeometry &geometry,
                                            const ops::ExecutionPlans &operators);
 
@@ -372,7 +377,7 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
 // The arena's base, its gate and linear scratch.
 [[nodiscard]] uint64_t decodeArenaBytes(const RuntimeGeometry &geometry,
                                         const ops::ExecutionPlans &operators);
-// The arena's and the target's own decode scratch (QwenTarget::scratchBytes).
+// The arena's and the target's own decode scratch (qwenTargetScratchBytes).
 [[nodiscard]] uint64_t plannedDecodeBytes(const RuntimeGeometry &geometry,
                                           const ops::ExecutionPlans &operators);
 

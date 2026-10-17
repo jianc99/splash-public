@@ -152,7 +152,7 @@ uint64_t prefillArenaBytes(const RuntimeGeometry &geometry,
 uint64_t plannedPrefillBytes(const RuntimeGeometry &geometry,
                             const ops::ExecutionPlans &operators) {
   return checkedAdd(prefillArenaBytes(geometry, operators),
-                    QwenTarget::scratchBytes(geometry.target, geometry.prefillChunks).prefill,
+                    geometry.targetScratch.prefill,
                     "prefill scratch");
 }
 
@@ -344,7 +344,7 @@ uint64_t decodeArenaBytes(const RuntimeGeometry &geometry,
 uint64_t plannedDecodeBytes(const RuntimeGeometry &geometry,
                            const ops::ExecutionPlans &operators) {
   return checkedAdd(decodeArenaBytes(geometry, operators),
-                    QwenTarget::scratchBytes(geometry.target, geometry.prefillChunks).decode,
+                    geometry.targetScratch.decode,
                     "decode scratch");
 }
 

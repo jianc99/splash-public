@@ -1,6 +1,6 @@
 #include "model/Runtime.hpp"
 #ifdef SPLASH_RUNTIME_INSTRUMENTATION
-#include "model/Qwen4Steps.hpp"
+#include "model/Qwen4ExpTarget.hpp"
 #include "model/RuntimeInstrumentation.hpp"
 #endif
 #include "AwakeClock.hpp"
@@ -378,7 +378,7 @@ struct Runtime::Impl {
   std::array<PageTableBinding, kLaneCount> pageTableBindings{};
   ModelTelemetry counters;
   ops::Sampling sampling;
-  QwenTarget targetModel;
+  std::unique_ptr<QwenTarget> targetModel;
   DFlashDraft draftModel;
   ops::AneFfn *aneFfn;
   explicit Impl(RuntimeContext value)
@@ -392,8 +392,8 @@ struct Runtime::Impl {
         sampling(geometry.target.vocabularySize),
         targetModel(std::visit(
                         [&](const auto &weights) {
-                          return QwenTarget(weights, geometry.target, value.backend, operators,
-                                            geometry.prefillChunks);
+                          return makeQwenTarget(weights, geometry.target, value.backend, operators,
+                                                geometry.prefillChunks);
                         },
                         value.model.target)),
         draftModel(value.model.draft, value.backend, operators),
@@ -1080,11 +1080,11 @@ struct Runtime::Impl {
   void encodeInitialSelections(CommandGraph &graph,
                                std::span<const InitialSelection> lanes,
                                uint32_t width) {
-    const uint32_t storage = targetModel.decodeStorageLanes(width);
+    const uint32_t storage = targetModel->decodeStorageLanes(width);
     auto d = [&](DecodeTensor tensor) {
       return decodeArena->batchSlice(tensor, storage);
     };
-    targetModel.addHeadBatch(graph, d(DecodeTensor::Hidden0),
+    targetModel->addHeadBatch(graph, d(DecodeTensor::Hidden0),
                              d(DecodeTensor::FinalHidden),
                              d(DecodeTensor::Logits), width,
                              decodeArena->linearScratch());
@@ -1572,7 +1572,7 @@ struct Runtime::Impl {
       addRopeTables(graph, p(PrefillTensor::TargetPositions), chunk.rows, p(PrefillTensor::DraftPositions),
                     chunk.capturedRows, model.buffers.ropeCos, model.buffers.ropeSin, p(PrefillTensor::DraftRopeCos),
                     p(PrefillTensor::DraftRopeSin));
-      targetModel.addEmbedding(graph, p(PrefillTensor::InputTokens), model.buffers.hidden[0], chunk.rows);
+      targetModel->addEmbedding(graph, p(PrefillTensor::InputTokens), model.buffers.hidden[0], chunk.rows);
       for (uint32_t s = 0; s < chunk.sequences.size(); ++s) {
         const PrefillSequence &sequence = chunk.sequences[s];
         const ModelBatchItem &part = sequence.part;
@@ -1609,7 +1609,7 @@ struct Runtime::Impl {
       }
       model.sequences = sequences[c];
     }
-    const std::vector<MetalBuffer> finalHidden = targetModel.addPrefill(graph, modelChunks, kvPages, aneFfn);
+    const std::vector<MetalBuffer> finalHidden = targetModel->addPrefill(graph, modelChunks, kvPages, aneFfn);
     for (uint32_t c = 0; c < chunks.size(); ++c) addDraftContext(graph, chunks, c);
 
     PrefillOutputs outputs;
@@ -1658,7 +1658,7 @@ struct Runtime::Impl {
     draftInput[0] = *entry.pendingToken;
     std::fill(draftInput + 1, draftInput + kDecodeRows,
               geometry.target.maskToken);
-    targetModel.prepareVerifyLane(lane, item.logicalPosition, targetRequest(entry));
+    targetModel->prepareVerifyLane(lane, item.logicalPosition, targetRequest(entry));
 
     auto *positions =
         contents<uint32_t>(decodeArena->get(lane, DecodeTensor::Positions),
@@ -1709,7 +1709,7 @@ struct Runtime::Impl {
     }
     const uint32_t lanes = static_cast<uint32_t>(entries.size());
     // The draft shares the target's vocabulary head and its storage rows.
-    const uint32_t storage = targetModel.decodeStorageLanes(lanes);
+    const uint32_t storage = targetModel->decodeStorageLanes(lanes);
     auto d = [&](DecodeTensor tensor) {
       return decodeArena->batchSlice(tensor, storage);
     };
@@ -1741,7 +1741,7 @@ struct Runtime::Impl {
     buffers.gateScratch = decodeArena->gateScratch();
     bindDraftRings(entries, buffers.persistentKeys, buffers.persistentValues);
     draftModel.addDecode(graph, std::move(buffers),
-                         targetModel.vocabularyProjection(),
+                         targetModel->vocabularyProjection(),
                          std::span(cacheLengths).first(lanes));
     std::array<uint32_t, kLaneCount> anchors{};
     std::array<ops::SamplingPolicy, kLaneCount> policies{};
@@ -1772,7 +1772,7 @@ struct Runtime::Impl {
       throw std::invalid_argument("invalid target verify batch");
     }
     const uint32_t lanes = static_cast<uint32_t>(entries.size());
-    const uint32_t storage = targetModel.decodeStorageLanes(lanes);
+    const uint32_t storage = targetModel->decodeStorageLanes(lanes);
     auto d = [&](DecodeTensor tensor) {
       return decodeArena->batchSlice(tensor, storage);
     };
@@ -1833,7 +1833,7 @@ struct Runtime::Impl {
       chunkValues[layer] = decodeArena->attentionBatchSlice(
           DecodeTensor::ChunkValuesBase, layer, storage);
     }
-    targetModel.addVerify(graph, std::move(buffers), kvPages,
+    targetModel->addVerify(graph, std::move(buffers), kvPages,
                           std::span(chunks).first(lanes), lanes);
   }
 
@@ -1866,7 +1866,7 @@ struct Runtime::Impl {
     const uint32_t lanes = static_cast<uint32_t>(entries.size());
     // The draft's projections take the target's storage rows, as in its
     // decode (encodeDraftBatchGraph).
-    const uint32_t storage = targetModel.decodeStorageLanes(lanes);
+    const uint32_t storage = targetModel->decodeStorageLanes(lanes);
     auto d = [&](DecodeTensor tensor) {
       return decodeArena->batchSlice(tensor, storage);
     };
@@ -1933,7 +1933,7 @@ struct Runtime::Impl {
       buffers.auxiliaryIn[lane] = states.current(entry.stateLane).auxiliary;
       buffers.auxiliaryOut[lane] = states.next(entry.stateLane).auxiliary;
     }
-    targetModel.addStateCommit(graph, std::move(buffers), width);
+    targetModel->addStateCommit(graph, std::move(buffers), width);
   }
 
   // A verify's selection, acceptance and commits, which end its cycle's last
@@ -1953,14 +1953,14 @@ struct Runtime::Impl {
     if (!lanes || lanes > kLaneCount)
       throw std::invalid_argument("invalid embedding batch width");
     const uint32_t rows = lanes * kDecodeRows;
-    targetModel.addEmbedding(graph, decodeArena->batchSlice(tokens, lanes),
+    targetModel->addEmbedding(graph, decodeArena->batchSlice(tokens, lanes),
                              decodeArena->batchSlice(output, lanes), rows);
   }
 
   void encodeBatchVerifyInput(CommandGraph &graph, uint32_t lanes) {
     if (!lanes || lanes > kLaneCount)
       throw std::invalid_argument("invalid verify-input batch width");
-    targetModel.addVerifyInput(
+    targetModel->addVerifyInput(
         graph, decodeArena->batchSlice(DecodeTensor::DraftInputTokens, lanes),
         decodeArena->batchSlice(DecodeTensor::ProposedTokens, lanes),
         decodeArena->batchSlice(DecodeTensor::InputTokens, lanes), lanes);
@@ -3130,7 +3130,7 @@ WarmupStepResult Runtime::warmupCompositeStateRestore() {
 }
 
 ModelMemoryActual Runtime::actualRuntimeMemory() const {
-  const QwenTargetScratchBytes target = impl_->targetModel.allocatedScratchBytes();
+  const QwenTargetScratchBytes target = impl_->targetModel->allocatedScratchBytes();
   return {impl_->states.actualAllocatedBytes(), impl_->prefillArena->bytes() + target.prefill,
           impl_->decodeArena->bytes() + target.decode, impl_->states.stagingBytes()};
 }
@@ -3186,8 +3186,8 @@ std::unique_ptr<RuntimeModel> createRuntime(RuntimeContext context) {
 
 #ifdef SPLASH_RUNTIME_INSTRUMENTATION
 std::vector<uint32_t> RuntimeInstrumentation::lastPleRows(const Runtime &runtime, uint32_t lane) {
-  const QwenTarget &target = runtime.impl_->targetModel;
-  return target.qwen4Steps_ ? target.qwen4Steps_->verifyPleRows(lane) : std::vector<uint32_t>{};
+  const auto *target = dynamic_cast<const Qwen4ExpTarget *>(runtime.impl_->targetModel.get());
+  return target ? target->verifyPleRows(lane) : std::vector<uint32_t>{};
 }
 #endif
 

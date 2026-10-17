@@ -36,11 +36,6 @@ struct Qwen3_8Layout;
 struct Qwen3_8LayerWeights;
 struct Qwen3_6MoeLayout;
 struct Qwen3_6MoeLayerWeights;
-struct Qwen4ExpWeights;
-struct Qwen4ExpLayerWeights;
-struct Qwen4HyperWeights;
-struct Qwen4Scratch;
-class Qwen4Steps;
 
 // Both supported targets bind the same mixer tensors per hybrid layer; only
 // the FFN differs between them.
@@ -71,7 +66,6 @@ class ExpertStore;
 // its weights were read from. A MoE target whose routed experts stream reads
 // them through `experts` (model/ExpertStore.hpp).
 struct QwenTargetWeightsBase {
-  ops::NormWeights finalNorm;
   ops::Projection logitsProjection;
   ops::EmbeddingWeights tokenEmbedding;
   std::vector<WeightFileRecord> files;
@@ -80,10 +74,13 @@ struct QwenTargetWeightsBase {
   std::shared_ptr<ExpertStore> experts;
 };
 
-// The weights of a target of Layout, whose layers the family keeps in Layer.
+// The weights of a Qwen3.5-architecture target of Layout, whose layers the
+// family keeps in Layer, and the norm the head reads its last layer's output
+// through.
 template <class Layout, class Layer> struct QwenTargetWeights final : QwenTargetWeightsBase {
   Layout layout;
   std::vector<Layer> layers;
+  ops::NormWeights finalNorm;
 };
 
 // Runtime-visible tensor geometry shared by the supported Qwen hybrid
@@ -113,15 +110,16 @@ struct QwenTargetGeometry final : QwenTargetDimensions {
   // GDN state layout.
   kv::Layout kvLayout{};
   GdnStateLayout stateLayout{};
-  // Qwen3.8-Flash-Next's PLE table when it streams from its file: the bytes
-  // and format (GGUF_FMT_*) of its native rows, which a step stages
-  // (Qwen4Scratch::pleStaging); zero bytes when the table is in memory.
-  uint32_t pleStreamRowBytes = 0;
-  uint32_t pleStreamFormat = 0;
-  // Distinct operator requirements, collected from the loaded weights.
+  // Distinct operator requirements, collected from the loaded weights
+  // (qwenTargetGeometry): include adds a projection the weights dispatch,
+  // finish the formats of their MoE blocks' expert weights and the head's
+  // logits projection, which decode alone runs.
   std::vector<ops::ProjectionShape> prefillProjections;
   std::vector<ops::ProjectionShape> decodeProjections;
   std::vector<ops::ProjectionShape> gateUpProjections;
+
+  void include(const ops::Projection &projection) { decodeProjections.push_back(projection.shape()); }
+  void finish(std::span<const ops::BlockMoeWeights *const> moeBlocks, const ops::Projection &logits);
 
   [[nodiscard]] constexpr uint32_t gdnKeyWidth() const noexcept {
     return gdnKeyHeads * gdnHeadDimension;
@@ -146,7 +144,7 @@ struct QwenTargetGeometry final : QwenTargetDimensions {
   // Whether a layer's mixer adds its output to the layer's input rows, which
   // its FFN then adds to; the mixers of a target whose residual is
   // hyper-connected streams write their output to a branch of the target's
-  // own scratch instead (QwenTarget::scratchBytes).
+  // own scratch instead (qwenTargetScratchBytes).
   [[nodiscard]] constexpr bool mixersAddToHidden() const noexcept { return !hyperConnections; }
   [[nodiscard]] constexpr ops::GdnShape gdnShape() const noexcept {
     return {gdnKeyHeads, gdnValueHeads, gdnHeadDimension,
@@ -325,42 +323,67 @@ struct QwenTargetCommitBuffers final {
 };
 
 // The bytes of a target's own step scratch beside the runtime's arenas, a
-// prefill's and a decode's (QwenTarget::scratchBytes).
+// prefill's and a decode's (qwenTargetScratchBytes).
 struct QwenTargetScratchBytes final {
   uint64_t prefill = 0;
   uint64_t decode = 0;
 };
 
-// The geometry of a target whose DFlash2 draft reads the output rows of
-// `captureLayers` (DFlashDraftLayout::targetLayerIds).
-template <class Layout, class Layer>
-[[nodiscard]] QwenTargetGeometry qwenTargetGeometry(const QwenTargetWeights<Layout, Layer> &weights,
-                                                    std::span<const uint32_t> captureLayers);
-[[nodiscard]] QwenTargetGeometry qwenTargetGeometry(const Qwen4ExpWeights &weights,
-                                                    std::span<const uint32_t> captureLayers);
+// A layer's MoE block, null for a dense FFN.
+[[nodiscard]] const ops::BlockMoeWeights *qwenMoeBlock(const Qwen3_8LayerWeights &layer) noexcept;
+template <class Layer> [[nodiscard]] const ops::BlockMoeWeights *qwenMoeBlock(const Layer &layer) noexcept {
+  return &layer.ffn;
+}
 
-// Builds the shared Qwen GDN/attention layer graph with the target's dense
-// or sparse-MoE FFN. Architecture-specific loaders supply the model's tensors.
-// A target that needs more of a step than the buffers the runtime binds
-// (Qwen3.8-Flash-Next: model/Qwen4Steps.hpp) keeps that scratch itself and
-// makes its own inputs of the step's tokens; the runtime calls the same
-// functions for every target, which do nothing for one without them.
-class QwenTarget final {
+// The projections a family's layers and head dispatch beyond their mixers'
+// and MoE blocks' (qwenTargetGeometry): Qwen3.8-27B's dense FFN; the
+// Qwen3.6-35B-A3B's none (Qwen3.8-Flash-Next's: model/Qwen4Exp.hpp).
+void includeFamilyProjections(QwenTargetGeometry &geometry,
+                              const QwenTargetWeights<Qwen3_8Layout, Qwen3_8LayerWeights> &weights);
+void includeFamilyProjections(QwenTargetGeometry &geometry,
+                              const QwenTargetWeights<Qwen3_6MoeLayout, Qwen3_6MoeLayerWeights> &weights);
+
+// The geometry of a target of `weights` whose DFlash2 draft reads the output
+// rows of `captureLayers` (DFlashDraftLayout::targetLayerIds): its layout's,
+// every projection its weights dispatch and the formats of its MoE blocks'
+// expert weights.
+template <class Weights>
+[[nodiscard]] QwenTargetGeometry qwenTargetGeometry(const Weights &weights, std::span<const uint32_t> captureLayers) {
+  QwenTargetGeometry geometry(weights.layout, captureLayers);
+  geometry.kvLayout = weights.layout.kvLayout();
+  geometry.stateLayout = weights.layout.gdnStateLayout();
+  std::vector<const ops::BlockMoeWeights *> moeBlocks;
+  for (const auto &layer : weights.layers) {
+    std::visit([&](const auto &mixer) {
+      geometry.include(mixer.inputProjection);
+      geometry.include(mixer.outputProjection);
+    }, layer.mixer);
+    if (const ops::BlockMoeWeights *block = qwenMoeBlock(layer)) moeBlocks.push_back(block);
+  }
+  includeFamilyProjections(geometry, weights);
+  geometry.finish(moeBlocks, weights.logitsProjection);
+  return geometry;
+}
+
+// The target the runtime drives: a family's layers over the blocks every
+// Qwen hybrid family shares, made for its weights by makeQwenTarget. The
+// shared blocks are a step's checks and plans, the GDN and full-attention
+// mixers (one wiring each for prefill and for verify), the draft's captures
+// and the head's projection; each family composes them into its layers and
+// residual: the Qwen3.5 architecture's (Qwen3.8-27B and Qwen3.6-35B-A3B,
+// model/QwenTarget.cpp) and Qwen3.8-Flash-Next's (model/Qwen4ExpTarget.cpp).
+// A family that needs more of a step than the buffers the runtime binds
+// keeps that scratch itself (qwenTargetScratchBytes) and makes its own
+// inputs of the step's tokens; the runtime calls the same functions for
+// every target, which do nothing for one without them.
+class QwenTarget {
 public:
-  // A target whose prefill commands run up to `prefillChunks` chunks.
-  template <class Layout, class Layer>
-  QwenTarget(const QwenTargetWeights<Layout, Layer> &weights, const QwenTargetGeometry &geometry,
-             metal::MetalBackend &backend, const ops::ExecutionPlans &operators, uint32_t prefillChunks);
-  QwenTarget(const Qwen4ExpWeights &weights, const QwenTargetGeometry &geometry, metal::MetalBackend &backend,
-             const ops::ExecutionPlans &operators, uint32_t prefillChunks);
-  QwenTarget(QwenTarget &&) noexcept;
-  ~QwenTarget();
+  QwenTarget(const QwenTarget &) = delete;
+  QwenTarget &operator=(const QwenTarget &) = delete;
+  virtual ~QwenTarget();
 
-  // The step scratch a target of `geometry` keeps itself (none for most),
-  // and what this one allocated of it.
-  [[nodiscard]] static QwenTargetScratchBytes scratchBytes(const QwenTargetGeometry &geometry,
-                                                           uint32_t prefillChunks);
-  [[nodiscard]] QwenTargetScratchBytes allocatedScratchBytes() const noexcept;
+  // The step scratch the target allocated itself (qwenTargetScratchBytes).
+  [[nodiscard]] virtual QwenTargetScratchBytes allocatedScratchBytes() const noexcept;
 
   [[nodiscard]] const ops::Projection &
   vocabularyProjection() const noexcept;
@@ -384,136 +407,200 @@ public:
   // ahead the rows of the prompt rows after them: the command is submitted
   // once it returns, while no other command reading the target's prefill
   // scratch is in flight.
-  [[nodiscard]] std::vector<metal::MetalBuffer> addPrefill(metal::CommandGraph &graph,
-                                                           std::span<const QwenTargetPrefillChunk> chunks,
-                                                           const kv::PageStorage &kv,
-                                                           ops::AneFfn *aneFfn = nullptr);
+  [[nodiscard]] virtual std::vector<metal::MetalBuffer> addPrefill(metal::CommandGraph &graph,
+                                                                   std::span<const QwenTargetPrefillChunk> chunks,
+                                                                   const kv::PageStorage &kv,
+                                                                   ops::AneFfn *aneFfn = nullptr) = 0;
   // Writes the inputs the target makes on the CPU of batch lane `lane`'s
   // verify rows, those from `position` on of `request`, before the cycle's
   // commands are encoded.
-  void prepareVerifyLane(uint32_t lane, uint64_t position, const QwenTargetRequest &request);
-  void addVerify(
+  virtual void prepareVerifyLane(uint32_t lane, uint64_t position, const QwenTargetRequest &request);
+  // A verify's layers and head over `lanes` lanes.
+  virtual void addVerify(
       metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers,
       const kv::PageStorage &kv,
       std::span<const kv::ChunkedPrefillParams> chunks,
-      uint32_t lanes) const;
-  // The final norm and LM head over `lanes` lanes of targetVerifyRows rows,
-  // as verify ends: one sweep of the vocabulary projection for every lane.
-  void addHeadBatch(metal::CommandGraph &graph, metal::MetalBuffer hidden,
-                    metal::MetalBuffer finalHidden, metal::MetalBuffer logits,
-                    uint32_t lanes, ops::LinearScratch scratch) const;
+      uint32_t lanes) const = 0;
+  // The head over `lanes` lanes of targetVerifyRows rows of the last layer's
+  // output, as verify ends: one sweep of the vocabulary projection for every
+  // lane.
+  virtual void addHeadBatch(metal::CommandGraph &graph, metal::MetalBuffer hidden,
+                            metal::MetalBuffer finalHidden, metal::MetalBuffer logits,
+                            uint32_t lanes, ops::LinearScratch scratch) const = 0;
   // The verify input tokens addEmbedding then gathers: each lane's anchor,
   // row 0 of its draft input, and the draft's proposals; then the inputs the
-  // target makes of them itself. Qwen3.8-Flash-Next's GPU hashes their PLE
-  // rows, and when its table streams a host step of the command stages them,
-  // between the hash and the verify that gathers them.
-  void addVerifyInput(metal::CommandGraph &graph, metal::MetalBuffer draftInput,
-                      metal::MetalBuffer proposals,
-                      metal::MetalBuffer verifyInput, uint32_t lanes) const;
+  // target makes of them itself.
+  virtual void addVerifyInput(metal::CommandGraph &graph, metal::MetalBuffer draftInput,
+                              metal::MetalBuffer proposals,
+                              metal::MetalBuffer verifyInput, uint32_t lanes) const;
   void addEmbedding(metal::CommandGraph &graph, metal::MetalBuffer tokens,
                     metal::MetalBuffer hidden, uint32_t rows) const;
   // The commit after acceptance of a verify of `lanes` lanes, in the same
   // command after the verify (addVerify): each lane's auxiliary state after
   // its retained rows, from what the verify computed of its rows. None for a
   // target without auxiliary state.
-  void addStateCommit(metal::CommandGraph &graph, QwenTargetCommitBuffers buffers, uint32_t lanes) const;
+  virtual void addStateCommit(metal::CommandGraph &graph, QwenTargetCommitBuffers buffers, uint32_t lanes) const;
 
-private:
-  // Tests read the target's step scratch (RuntimeInstrumentation).
-  friend class RuntimeInstrumentation;
-  using WeightView =
-      std::variant<const QwenTargetWeights<Qwen3_8Layout, Qwen3_8LayerWeights> *,
-                   const QwenTargetWeights<Qwen3_6MoeLayout, Qwen3_6MoeLayerWeights> *,
-                   const Qwen4ExpWeights *>;
-  struct PrefillStep;
-  struct PrefillQsa;
-  struct VerifyStep;
+protected:
+  QwenTarget(const QwenTargetWeightsBase &weights, const QwenTargetGeometry &geometry, metal::MetalBackend &backend,
+             const ops::ExecutionPlans &operators);
 
-  // Qwen3.8-Flash-Next's weights, or null for another family.
-  [[nodiscard]] const Qwen4ExpWeights *qwen4() const noexcept;
+  // The state a prefill command's layers share for one of its chunks: its
+  // rows, their buffers and plans, the buffers the layer's MoE routes and
+  // runs through, and the next GDN and attention layer of the step. A family
+  // whose steps need more extends it.
+  struct PrefillStep {
+    metal::CommandGraph &graph;
+    const QwenTargetPrefillBuffers &buffers;
+    std::span<const QwenTargetPrefillSequence> sequences;
+    uint32_t rows;
+    std::span<const SplashKvLayer> kvLayers;
+    // Each sequence's attention plan, which every attention layer runs.
+    std::vector<ops::PrefillAttentionPlan> attention{};
+    std::optional<ops::MoePlan> moe{};
+    // The layer's MoE buffers, which its routing (addPrefillLayer), the
+    // layer's load and its routed work (addPrefillExperts) share.
+    ops::MoeBuffers ffn{};
+    ops::AneFfn *aneFfn = nullptr;
+    uint32_t gdnLayer = 0;
+    uint32_t attentionLayer = 0;
+  };
 
-  // A prefill's layers over its chunks' steps (addPrefill): each step's
-  // begin; per layer, each step through its FFN's routing (addPrefillLayer),
-  // the layer's load of streamed experts, and each step's routed work
-  // (addPrefillExperts); then each step's end, which returns its last
-  // layer's output rows. Each family has its overloads: Qwen3.5 and Qwen3.6
-  // (QwenTargetWeights: hidden rows each layer adds to) and
-  // Qwen3.8-Flash-Next (Qwen4ExpWeights: residual streams, the PLE and QSA).
-  template <class Weights>
-  [[nodiscard]] std::vector<metal::MetalBuffer> addPrefillLayers(std::span<PrefillStep> steps,
-                                                                 const Weights &weights) const;
-  template <class Layout, class Layer>
-  void addPrefillBegin(PrefillStep &step, const QwenTargetWeights<Layout, Layer> &weights) const;
-  template <class Layout, class Layer>
-  void addPrefillLayer(PrefillStep &step, const QwenTargetWeights<Layout, Layer> &weights, uint32_t index) const;
-  template <class Layout, class Layer>
-  void addPrefillExperts(PrefillStep &step, const QwenTargetWeights<Layout, Layer> &weights, uint32_t index) const;
-  template <class Layout, class Layer>
-  [[nodiscard]] metal::MetalBuffer addPrefillEnd(PrefillStep &step,
-                                                 const QwenTargetWeights<Layout, Layer> &weights) const;
-  void addPrefillBegin(PrefillStep &step, const Qwen4ExpWeights &weights) const;
-  void addPrefillLayer(PrefillStep &step, const Qwen4ExpWeights &weights, uint32_t index) const;
-  void addPrefillExperts(PrefillStep &step, const Qwen4ExpWeights &weights, uint32_t index) const;
-  [[nodiscard]] metal::MetalBuffer addPrefillEnd(PrefillStep &step, const Qwen4ExpWeights &weights) const;
-  // Every family's mixers, of the step's normalized rows into the rows their
-  // output projection reads: a GDN (buffers.gdnHidden) and a full attention
-  // (buffers.attentionHidden), which, with `qsa`, attends only the blocks
-  // Qwen3.8-Flash-Next's sparse attention selects.
-  [[nodiscard]] metal::MetalBuffer addPrefillGdn(PrefillStep &step, const QwenGdnWeights &mixer) const;
-  [[nodiscard]] metal::MetalBuffer addPrefillAttention(PrefillStep &step, const QwenAttentionWeights &mixer,
-                                                       const PrefillQsa *qsa) const;
-  // Qwen3.5/3.6: the RMS norm of `input` into buffers.normalized; a mixer's
-  // output projection added to `input` into `output`; the FFN of layer
-  // `index` adding to the mixer's `residual` rows into `output` (a MoE's
-  // routing, whose routed work addPrefillExperts adds).
-  void addPrefillNorm(PrefillStep &step, metal::MetalBuffer input, const ops::NormWeights &norm) const;
-  void addPrefillOutput(PrefillStep &step, metal::MetalBuffer hidden, const ops::Projection &projection,
-                        metal::MetalBuffer input, metal::MetalBuffer output) const;
-  void addPrefillFfn(PrefillStep &step, uint32_t index, const Qwen3_8LayerWeights &layer,
-                     metal::MetalBuffer residual, metal::MetalBuffer output) const;
-  void addPrefillFfn(PrefillStep &step, uint32_t index, const Qwen3_6MoeLayerWeights &layer,
-                     metal::MetalBuffer residual, metal::MetalBuffer output) const;
-  // Qwen3.8-Flash-Next: the mix of `streams` through `hyper` into `output`
-  // and, when it injects, the injection weights into the step's scratch.
-  void addQwen4PrefillMix(PrefillStep &step, const Qwen4HyperWeights &hyper, metal::MetalBuffer output,
-                          const metal::MetalBuffer &streams) const;
-  metal::MetalBuffer addVerifyMixer(VerifyStep &step, const QwenGdnWeights &mixer, const ops::NormWeights &norm,
-                                    metal::MetalBuffer input) const;
-  metal::MetalBuffer addVerifyMixer(VerifyStep &step, const QwenAttentionWeights &mixer,
-                                    const ops::NormWeights &norm, metal::MetalBuffer input) const;
-  void addVerifyFfn(VerifyStep &step, const Qwen3_8LayerWeights &layer, metal::MetalBuffer residual,
-                    metal::MetalBuffer output) const;
-  void addVerifyFfn(VerifyStep &step, const Qwen3_6MoeLayerWeights &layer, metal::MetalBuffer residual,
-                    metal::MetalBuffer output) const;
+  struct VerifyStep {
+    metal::CommandGraph &graph;
+    const QwenTargetVerifyBuffers &buffers;
+    std::span<const SplashKvLayer> kvLayers;
+    std::span<const kv::ChunkedPrefillParams> chunks;
+    uint32_t lanes;
+    uint32_t rows;
+    ops::VerifyAttentionPlan attention;
+    std::optional<ops::MoePlan> moe{};
+    uint32_t gdnLayer = 0;
+    uint32_t attentionLayer = 0;
+  };
 
-  // A verify's layers and head (addVerify), each family's: Qwen3.5 and
-  // Qwen3.6's hidden rows each layer adds to, then the final norm and head;
-  // Qwen3.8-Flash-Next's residual streams, the PLE and QSA, then its final
-  // mix, which the head reads without a norm (addQwen4*).
-  template <class Layout, class Layer>
-  void addVerifyLayers(VerifyStep &step, const QwenTargetWeights<Layout, Layer> &weights) const;
-  void addVerifyLayers(VerifyStep &step, const Qwen4ExpWeights &weights) const;
-  // The PLE layer's `count` rows into h.pleRows: from the table by
-  // h.pleIndices, or, when the table streams, from the rows staged by
-  // h.pleSlots, with the table's own gather.
-  void addPleGather(metal::CommandGraph &graph, const Qwen4Scratch &h, uint32_t count) const;
-  // A mix into `output`; its projections read the tables its norm and low
-  // step write, and with `next`, the decode projection that reads `output`
-  // first takes the table the mix writes (the returned input).
-  ops::PreparedInput addQwen4VerifyMix(VerifyStep &step, const Qwen4HyperWeights &hyper, metal::MetalBuffer streams,
-                                       metal::MetalBuffer output, const ops::Projection *next = nullptr) const;
-  // A full-attention block over the step's rows into its scratch's branch.
-  void addQwen4VerifyAttention(VerifyStep &step, const Qwen4ExpLayerWeights &layer,
-                               const QwenAttentionWeights &mixer, uint32_t attentionLayer,
-                               ops::PreparedInput input = {}) const;
+  // Where a mixer's output projection writes: `rows`, adding the projection
+  // to `residual` when given.
+  struct BlockOutput final {
+    metal::MetalBuffer rows;
+    metal::MetalBuffer residual;
+  };
 
-  WeightView weights_;
+  // The checked steps of a prefill's chunks, each with its plans, as a
+  // family's Step (a PrefillStep or one extending it).
+  template <class Step = PrefillStep>
+  [[nodiscard]] std::vector<Step> prefillSteps(metal::CommandGraph &graph,
+                                               std::span<const QwenTargetPrefillChunk> chunks,
+                                               const kv::PageStorage &kv, ops::AneFfn *aneFfn) const {
+    requirePrefill(chunks, kv, aneFfn);
+    std::vector<Step> steps;
+    steps.reserve(chunks.size());
+    for (const QwenTargetPrefillChunk &chunk : chunks) steps.push_back(Step{prefillStep(graph, chunk, kv, aneFfn)});
+    return steps;
+  }
+  // A prefill's layers over its steps (addPrefill), through a family's
+  // `layers`: each step's begin (addPrefillBegin); per layer, each step
+  // through its FFN's routing (addPrefillLayer), one load of the streamed
+  // experts any step's rows route (of the layer's MoE block, moe), and each
+  // step's routed work (addPrefillExperts); then each step's end, which
+  // returns its last layer's output rows (addPrefillEnd).
+  template <class Step, class Layers>
+  [[nodiscard]] std::vector<metal::MetalBuffer> addPrefillLayers(std::span<Step> steps, const Layers &layers) const {
+    for (Step &step : steps) layers.addPrefillBegin(step);
+    std::vector<ops::MoeLoadPart> parts;
+    if (geometry_.ffnKind == QwenFfnKind::SparseMoe)
+      for (const Step &step : steps) parts.push_back({&step.ffn, &*step.moe});
+    for (uint32_t index = 0; index < geometry_.layers; ++index) {
+      for (Step &step : steps) layers.addPrefillLayer(step, index);
+      if (const ops::BlockMoeWeights *ffn = layers.moe(index); ffn && ffn->stream)
+        ffn->stream->addLoad(steps.front().graph, parts, ffn->streamBlock);
+      for (Step &step : steps) layers.addPrefillExperts(step, index);
+    }
+    std::vector<metal::MetalBuffer> outputs;
+    outputs.reserve(steps.size());
+    for (Step &step : steps) {
+      requireLayerPartition(step.gdnLayer, step.attentionLayer);
+      outputs.push_back(layers.addPrefillEnd(step));
+    }
+    return outputs;
+  }
+  // The checked step of a verify of `lanes` lanes, with its plans.
+  [[nodiscard]] VerifyStep verifyStep(metal::CommandGraph &graph, const QwenTargetVerifyBuffers &buffers,
+                                      const kv::PageStorage &kv, std::span<const kv::ChunkedPrefillParams> chunks,
+                                      uint32_t lanes) const;
+  // Throws unless a family's `layers` match the geometry's layers and its
+  // attention layers.
+  template <class Layer> void requireLayers(std::span<const Layer> layers) const {
+    requireLayers(layers.size(), static_cast<size_t>(std::ranges::count_if(layers, [](const Layer &layer) {
+                    return std::holds_alternative<QwenAttentionWeights>(layer.mixer);
+                  })));
+  }
+  void requireLayers(size_t layers, size_t attentionLayers) const;
+  void requireLayerPartition(uint32_t gdnLayers, uint32_t attentionLayers) const;
+
+  // The mixers, of a step's normalized rows (buffers.normalized) into their
+  // output projection's `output`: a GDN, and a full attention whose rows
+  // attend, when given, only the blocks of their lists (`blocks`, a prefill's
+  // per sequence, a verify's for the step).
+  void addPrefillMixer(PrefillStep &step, const QwenGdnWeights &mixer, BlockOutput output) const;
+  void addPrefillMixer(PrefillStep &step, const QwenAttentionWeights &mixer, BlockOutput output,
+                       std::span<const ops::AttentionBlocks> blocks = {}) const;
+  // A verify's normalized rows are in the table `normalized` describes,
+  // which the mixer's input projection reads (decodeInput).
+  void addVerifyMixer(VerifyStep &step, const QwenGdnWeights &mixer, ops::PreparedInput normalized,
+                      BlockOutput output) const;
+  void addVerifyMixer(VerifyStep &step, const QwenAttentionWeights &mixer, ops::PreparedInput normalized,
+                      BlockOutput output, const ops::AttentionBlocks &blocks = {}) const;
+  // The input the decode plan of `projection` over `lanes` lanes reads, a
+  // table its producer writes or plain rows.
+  [[nodiscard]] ops::LinearInput decodeInput(const ops::Projection &projection, uint32_t lanes) const;
+  // A decode projection over `lanes` lanes through its own plan; `prepared`
+  // describes the table its producer wrote for the plan's input.
+  void addDecodeProjection(metal::CommandGraph &graph, metal::MetalBuffer input, const ops::Projection &projection,
+                           metal::MetalBuffer output, uint32_t lanes, ops::LinearScratch scratch,
+                           ops::PreparedInput prepared = {}) const;
+  // Each of a prefill step's captures of layer `index`'s output rows, when
+  // the draft reads the layer: capture(slot, source row, destination row,
+  // rows) of the captured hidden rows' slot `slot`.
+  template <class Capture> void forEachPrefillCapture(const PrefillStep &step, uint32_t index, Capture capture) const {
+    if (const auto slot = geometry_.captureSlot(index))
+      for (const QwenTargetPrefillSequence &sequence : step.sequences)
+        for (uint32_t c = 0; c < sequence.captureCount; ++c)
+          capture(*slot, sequence.captures[c].sourceStart, sequence.captures[c].destinationStart,
+                  sequence.captures[c].rows);
+  }
+  // Rows [begin, begin + count) of a row-major buffer of `width` values of T.
+  template <class T>
+  [[nodiscard]] metal::MetalBuffer rowsOf(const metal::MetalBuffer &buffer, uint32_t begin, uint32_t count,
+                                          uint32_t width) const {
+    return backend_.view(buffer, uint64_t{begin} * width * sizeof(T), uint64_t{count} * width * sizeof(T));
+  }
+
   const QwenTargetWeightsBase &weightsBase_;
   QwenTargetGeometry geometry_;
   metal::MetalBackend &backend_;
   const ops::ExecutionPlans &operators_;
-  // Qwen3.8-Flash-Next's step scratch and inputs; null for another family.
-  std::unique_ptr<Qwen4Steps> qwen4Steps_;
+
+private:
+  void requirePrefill(std::span<const QwenTargetPrefillChunk> chunks, const kv::PageStorage &kv,
+                      const ops::AneFfn *aneFfn) const;
+  [[nodiscard]] PrefillStep prefillStep(metal::CommandGraph &graph, const QwenTargetPrefillChunk &chunk,
+                                        const kv::PageStorage &kv, ops::AneFfn *aneFfn) const;
 };
+
+// The target of a Qwen3.5-architecture family's weights (Qwen3.8-27B,
+// Qwen3.6-35B-A3B), whose prefill commands run up to `prefillChunks` chunks,
+// and the step scratch it keeps itself (none).
+template <class Layout, class Layer>
+[[nodiscard]] std::unique_ptr<QwenTarget> makeQwenTarget(const QwenTargetWeights<Layout, Layer> &weights,
+                                                         const QwenTargetGeometry &geometry,
+                                                         metal::MetalBackend &backend,
+                                                         const ops::ExecutionPlans &operators,
+                                                         uint32_t prefillChunks);
+template <class Layout, class Layer>
+[[nodiscard]] QwenTargetScratchBytes qwenTargetScratchBytes(const QwenTargetWeights<Layout, Layer> &,
+                                                            const QwenTargetGeometry &, uint32_t) {
+  return {};
+}
 
 } // namespace splash::model
