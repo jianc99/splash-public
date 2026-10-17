@@ -1,8 +1,9 @@
 #pragma once
 
 // A large table of fixed-size native rows that stays in its source file and
-// is read a row at a time: a bounded host cache of rows, a pool of readers
-// and the staging of one command's rows into memory the GPU reads. Its user
+// is read a row at a time: a bounded host cache of rows, read on the model's
+// weight readers (model::WeightReaders), and the staging of one command's
+// rows into memory the GPU reads. Its user
 // names the table (SparseRowTable) and sizes the working memory of its
 // stages and prefetches (SparseRowStoreOptions). The store knows nothing of
 // what the rows mean: its user computes the row ids, and gathers the staged
@@ -13,18 +14,22 @@
 // every row is in place, so the staging needs no protocol with the GPU: the
 // caller stages before it submits the command that reads them, and no reader
 // writes into it after stage() returned. The calling thread reads rows too,
-// so a stage can finish while readers are blocked on unrelated rows.
-// A row already claimed by a reader still waits for that reader.
+// so a stage can finish while readers are blocked on unrelated rows; a stage
+// runs ahead of every read in the background, a prefetch's or a streamed
+// expert's read-ahead.
 //
 // A row enters the cache only after the source file was checked unchanged
-// after it was read. A failed read (after one retry), a short file, or a
-// source written since it was opened poisons the store: that stage and every
-// later one throw SparseRowError, and no row of the failing batch is cached.
+// after it was read. A read is tried once more when it fails (WeightReaders).
+// A stage's failed read, a short file, or a source written since it was
+// opened poisons the store: that stage and every later one throw
+// SparseRowError, and no row of the failing batch is cached. A prefetch is a
+// hint: a row it fails to read is dropped, and the stage that needs it reads
+// it again.
 
 #include "model/LatencyHistogram.hpp"
+#include "model/WeightReaders.hpp"
 
 #include <cstdint>
-#include <filesystem>
 #include <memory>
 #include <span>
 #include <stdexcept>
@@ -53,7 +58,7 @@ struct SparseRowTable final {
 // The widest row a store takes.
 inline constexpr uint32_t kSparseRowMaximumBytes = 64 << 10;
 
-// How a store reads its source. Production stores read a WeightSource's file
+// How a store reads its source. Production stores read a WeightSource
 // (openRowReader); tests inject failures and delays.
 class RowReader {
 public:
@@ -67,26 +72,19 @@ public:
   [[nodiscard]] virtual uint64_t size() const = 0;
 };
 
-// A reader of the file open at `descriptor`, the descriptor whose file the
-// table's metadata was parsed from (a WeightSource's). It reads through a
-// duplicate, which shares the descriptor's open file description and with it
-// its status flags: it sets F_NOCACHE there (a WeightSource has set it
-// already), so both read uncached. It holds that file for as long as it
-// lives, so a new file at `path` changes nothing (as a WeightSource); a write
-// to the open file (its size or modification time) is a change. `path` names
-// the file in errors only.
-[[nodiscard]] std::unique_ptr<RowReader> openRowReader(int descriptor, const std::filesystem::path &path);
-// Keeps the identity of the source the metadata was parsed from across the
-// descriptor handoff; a write before the reader's fresh snapshot is refused.
-[[nodiscard]] std::unique_ptr<RowReader> openRowReader(const WeightSource &source);
+// A reader of the source the table's metadata was parsed from, uncached, as
+// it was opened: a new file at its path changes nothing, and a write to the
+// open file since it was opened is a change. It holds the source.
+[[nodiscard]] std::unique_ptr<RowReader> openRowReader(std::shared_ptr<const WeightSource> source);
 
 struct SparseRowStoreOptions final {
   // The cache and working-memory reservation (committedBytes): workingBytes
   // and, in the rest, rows with their ids, recency links and index. This is
   // not a bound on all host allocations (see workingBytes).
   uint64_t cacheBytes = 0;
-  // Reader threads besides the staging thread.
-  uint32_t readers = 16;
+  // The readers its reads run on besides the staging thread, which a model's
+  // streamed weights share.
+  std::shared_ptr<WeightReaders> readers;
   // The most rows prefetches may have queued or in flight, whose bytes are
   // working memory; more are dropped, and with 0 every one.
   uint32_t prefetchRows = 0;
@@ -152,10 +150,10 @@ public:
   [[nodiscard]] static uint64_t workingBytes(uint32_t rowBytes, uint32_t prefetchRows, uint32_t stageRows) noexcept;
 
   // Allocates the cache now. Throws std::invalid_argument when the table is
-  // invalid, ends past the reader's file, or no row fits in
-  // options.cacheBytes beside the working memory.
+  // invalid, ends past the reader's file, the options name no readers, or no
+  // row fits in options.cacheBytes beside the working memory.
   SparseRowStore(SparseRowTable table, std::unique_ptr<RowReader> reader, SparseRowStoreOptions options);
-  // Stops the readers; a read in progress finishes first.
+  // Stops its prefetches; a read in progress finishes first.
   ~SparseRowStore();
   SparseRowStore(const SparseRowStore &) = delete;
   SparseRowStore &operator=(const SparseRowStore &) = delete;
@@ -180,13 +178,14 @@ public:
 
   // Starts reading the rows of `ids` that are not cached into the cache, on
   // the readers, below any stage's reads. Returns at once. Rows beyond the
-  // bound of queued rows are dropped and counted. Ids past the table are
-  // ignored (a prefetch is only a hint). A failure poisons the store, which
-  // the next stage reports.
+  // bound of queued rows, and rows it fails to read, are dropped and
+  // counted. Ids past the table are ignored (a prefetch is only a hint). A
+  // source written since it was opened poisons the store, which the next
+  // stage reports.
   void prefetch(std::span<const uint32_t> ids);
 
-  // Waits until no prefetch is queued or in flight, reading them on this
-  // thread when the store has no readers: tests wait for prefetched rows so.
+  // Finishes the prefetches queued or in flight, reading them here too:
+  // tests wait for prefetched rows so.
   void drainPrefetch();
 
   [[nodiscard]] SparseRowStats stats() const;

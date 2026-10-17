@@ -222,11 +222,12 @@ default.
 - A step's rows are staged before its PLE layer gathers them: the CPU copies
   each distinct row the step reads once into a small Shared buffer of the
   step's scratch, from the cache or, for the rows it lacks, with uncached
-  (`F_NOCACHE`) row reads (90 bytes for IQ4_NL, 170 for Q8_0) by 16 reader
-  threads and the staging thread itself (`SparseRowStore`,
-  `runtime/model/SparseRowStore.hpp`). The gather then reads them with the
-  table's own kernel, so a row's values are computed exactly as from the
-  table.
+  (`F_NOCACHE`) row reads (90 bytes for IQ4_NL, 170 for Q8_0) by the model's
+  16 weight readers, which streamed experts share (`WeightReaders`,
+  `runtime/model/WeightReaders.hpp`), and the staging thread itself
+  (`SparseRowStore`, `runtime/model/SparseRowStore.hpp`). The gather then
+  reads them with the table's own kernel, so a row's values are computed
+  exactly as from the table.
 - A prefill knows its rows on the CPU and stages them before its command is
   submitted. A decode cycle's rows are those of the draft's proposals, which
   only the GPU has: the verify hashes them on the GPU, and a host step of the
@@ -234,13 +235,15 @@ default.
   awake through it ([Streamed experts](#streamed-experts)).
 - A prefill command reads ahead the rows of the prompt tokens that follow its
   rows while it runs; the next command's stage finds them cached or finishes
-  what is still in flight.
+  what is still in flight. A read ahead runs only while no stage or expert
+  load reads.
 - A row enters the cache only after the file was found unchanged since it was
-  read. The table is read from the descriptor its metadata was parsed from, so
-  a new file at its path changes nothing; a write to that file, a failed read
+  read. The table is read from the source its metadata was parsed from, so a
+  new file at its path changes nothing; a write to that file, a failed read
   (after one retry) or a short file fails the step before the command that
   requires those rows is submitted. The engine stops as it does for a weight
-  read error, and the server starts it again.
+  read error, and the server starts it again. A row a read-ahead fails to
+  read is dropped, and the stage that needs it reads it again.
 - The cache counts as fixed runtime memory in the plan
   (`streamed_table_bytes`): the governor charges it beside Metal's
   allocations, and the startup memory audit bounds it by the plan and counts

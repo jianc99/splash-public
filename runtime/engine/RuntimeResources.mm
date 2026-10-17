@@ -492,7 +492,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
       const model::SparseRowStats stats = table->stats();
       logLine("PLE table streams from its file: ", stats.tableBytes / kMiB, " MiB stay on the SSD; row cache of ",
               stats.cacheCapacityRows, " rows in ", table->committedBytes() / kMiB, " MiB, ",
-              model::SparseRowStoreOptions{}.readers, " readers.");
+              model::kWeightReaders, " readers.");
     }
     if (const model::ExpertStore *experts = loaded.expertStore()) {
       const model::ExpertStoreStats stats = experts->stats();

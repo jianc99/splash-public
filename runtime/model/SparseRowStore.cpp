@@ -2,24 +2,15 @@
 #include "model/WeightSource.hpp"
 #include "AwakeClock.hpp"
 
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <unistd.h>
-
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <bit>
-#include <cerrno>
 #include <chrono>
-#include <condition_variable>
 #include <cstring>
-#include <deque>
 #include <exception>
 #include <limits>
 #include <mutex>
-#include <system_error>
-#include <thread>
 #include <utility>
 #include <vector>
 
@@ -43,60 +34,18 @@ namespace {
 using Clock = AwakeClock;
 constexpr uint32_t kNoSlot = std::numeric_limits<uint32_t>::max();
 
-class FileRowReader final : public RowReader {
+// Reads the source a table's metadata was parsed from, as it was opened
+// (WeightSource): a new file at its path changes nothing, and a write to it
+// is a change.
+class SourceRowReader final : public RowReader {
 public:
-  FileRowReader(int descriptor, std::filesystem::path path) : path_(std::move(path)) {
-    file_ = fcntl(descriptor, F_DUPFD_CLOEXEC, 0);
-    if (file_ < 0) fail("unable to open");
-    // Rows are read once into the cache, uncached: through the page cache
-    // each row read would hold a page of the file in memory besides. The
-    // flag belongs to the open file description, which the duplicate shares
-    // with `descriptor`: a WeightSource's has it already.
-    if (fstat(file_, &opened_) || fcntl(file_, F_NOCACHE, 1)) {
-      const int error = errno;
-      close(file_);
-      errno = error;
-      fail("unable to open");
-    }
-    if (!S_ISREG(opened_.st_mode)) {
-      close(file_);
-      throw SparseRowError("streamed table source is not a regular file: " + path_.string());
-    }
-  }
-  ~FileRowReader() override { close(file_); }
-
-  void read(uint64_t offset, std::span<uint8_t> bytes) override {
-    if (bytes.size() > uint64_t(std::numeric_limits<off_t>::max()) ||
-        offset > uint64_t(std::numeric_limits<off_t>::max()) - bytes.size())
-      throw SparseRowError("row read offset overflow: " + path_.string());
-    while (!bytes.empty()) {
-      const ssize_t count = pread(file_, bytes.data(), bytes.size(), static_cast<off_t>(offset));
-      if (count < 0 && errno == EINTR) continue;
-      if (count < 0)
-        throw SparseRowError(std::string("unable to read rows: ") + std::strerror(errno) + ": " + path_.string());
-      if (!count) throw SparseRowError("truncated streamed table: " + path_.string());
-      offset += uint64_t(count);
-      bytes = bytes.subspan(size_t(count));
-    }
-  }
-
-  void checkUnchanged() override {
-    struct stat current{};
-    if (fstat(file_, &current)) fail("unable to stat");
-    if (current.st_size != opened_.st_size || current.st_mtimespec.tv_sec != opened_.st_mtimespec.tv_sec ||
-        current.st_mtimespec.tv_nsec != opened_.st_mtimespec.tv_nsec)
-      throw SparseRowError("streamed table source was written while the model is loaded: " + path_.string());
-  }
-
-  [[nodiscard]] uint64_t size() const override { return uint64_t(opened_.st_size); }
+  explicit SourceRowReader(std::shared_ptr<const WeightSource> source) : source_(std::move(source)) {}
+  void read(uint64_t offset, std::span<uint8_t> bytes) override { source_->readFile(offset, bytes); }
+  void checkUnchanged() override { source_->checkUnchanged(); }
+  [[nodiscard]] uint64_t size() const override { return source_->bytes(); }
 
 private:
-  [[noreturn]] void fail(const char *operation) const {
-    throw SparseRowError(std::string(operation) + " " + path_.string() + ": " + std::strerror(errno));
-  }
-  std::filesystem::path path_;
-  int file_ = -1;
-  struct stat opened_{};
+  std::shared_ptr<const WeightSource> source_;
 };
 
 uint64_t nanosecondsSince(Clock::time_point start) {
@@ -182,18 +131,13 @@ uint64_t SparseRowStore::cacheRowsFor(uint64_t cacheBytes, uint32_t rowBytes) no
 }
 
 struct SparseRowStore::Impl {
-  // Rows a reader reads: ids[i]'s row into destinations[i].
-  struct ReadJob final {
+  // A prefetch: ids[i]'s row into its own rows, read on the readers
+  // (`batch`); `ended` once its rows were cached.
+  struct Prefetch final {
     std::vector<uint32_t> ids;
-    std::vector<uint8_t *> destinations;
-    std::vector<uint8_t> buffer; // a prefetch's own rows
-    bool prefetch = false;
-    std::atomic<size_t> next{0};
-    std::atomic<size_t> done{0};
-    std::mutex mutex;
-    std::condition_variable finished;
-    bool complete = false; // every row read (and a prefetch's rows cached)
-    std::exception_ptr failure;
+    std::vector<uint8_t> rows;
+    std::shared_ptr<WeightReaders::Batch> batch;
+    bool ended = false; // under prefetchMutex
   };
 
   SparseRowTable table;
@@ -212,24 +156,17 @@ struct SparseRowStore::Impl {
   uint32_t head = kNoSlot, tail = kNoSlot;
   uint64_t evictions = 0;
 
-  // Readers.
-  std::mutex poolMutex;
-  std::condition_variable poolWake;
-  std::condition_variable prefetchIdle;
-  std::deque<std::shared_ptr<ReadJob>> critical, background;
-  std::vector<std::shared_ptr<ReadJob>> prefetching;
-  uint64_t prefetchingRows = 0;
-  std::atomic<uint32_t> criticalWaiting{0};
-  bool stopping = false;
-  std::vector<std::thread> threads;
-
   // Stages, which are serialized, and prefetches: the distinct ids of the
-  // last of each.
+  // last of each, and the prefetches not yet stopped or finished, which
+  // prefetchingRows count until they end.
   std::mutex stageMutex;
   DistinctIds distinct;
   std::vector<uint32_t> unique, missing;
+  std::vector<uint8_t *> destinations;
   std::mutex prefetchMutex;
   DistinctIds prefetchDistinct;
+  std::vector<std::shared_ptr<Prefetch>> prefetching;
+  uint64_t prefetchingRows = 0;
 
   // Failure.
   std::atomic<bool> poisoned{false};
@@ -247,7 +184,7 @@ struct SparseRowStore::Impl {
   LatencyHistogram readLatency;
 
   Impl(SparseRowTable table, std::unique_ptr<RowReader> reader, SparseRowStoreOptions options)
-      : table(std::move(table)), reader(std::move(reader)), options(options) {}
+      : table(std::move(table)), reader(std::move(reader)), options(std::move(options)) {}
 
   [[nodiscard]] uint8_t *slotRow(uint32_t slot) const noexcept { return rows.get() + uint64_t{slot} * table.rowBytes; }
   [[nodiscard]] uint64_t bucketOf(uint32_t id) const noexcept { return hashBucket(id, bucketShift); }
@@ -341,152 +278,54 @@ struct SparseRowStore::Impl {
   }
 
   void readRow(uint32_t id, uint8_t *destination) {
-    const uint64_t offset = table.offset + uint64_t{id} * table.rowBytes;
     const auto started = Clock::now();
-    try {
-      reader->read(offset, {destination, table.rowBytes});
-    } catch (...) {
-      // A transient error gets one more read; a second failure is final.
-      readRetries.fetch_add(1, std::memory_order_relaxed);
-      try {
-        reader->read(offset, {destination, table.rowBytes});
-      } catch (...) {
-        readErrors.fetch_add(1, std::memory_order_relaxed);
-        throw;
-      }
-    }
+    reader->read(table.offset + uint64_t{id} * table.rowBytes, {destination, table.rowBytes});
     readLatency.add(nanosecondsSince(started));
     readBytes.fetch_add(table.rowBytes, std::memory_order_relaxed);
   }
-
-  // Reads the job's unclaimed rows on this thread. A reader working on a
-  // prefetch returns once a stage waits, leaving the rest for later.
-  void work(const std::shared_ptr<ReadJob> &job, bool yieldToStages) {
-    const size_t count = job->ids.size();
-    for (;;) {
-      if (yieldToStages && criticalWaiting.load(std::memory_order_acquire)) return;
-      const size_t index = job->next.fetch_add(1, std::memory_order_relaxed);
-      if (index >= count) return;
-      try {
-        readRow(job->ids[index], job->destinations[index]);
-      } catch (...) {
-        const std::lock_guard lock(job->mutex);
-        if (!job->failure) job->failure = std::current_exception();
-      }
-      if (job->done.fetch_add(1, std::memory_order_acq_rel) + 1 == count) complete(job);
-    }
+  void count(const WeightReaders::Tally &tally) {
+    readRetries.fetch_add(tally.retries, std::memory_order_relaxed);
+    readErrors.fetch_add(tally.failures, std::memory_order_relaxed);
   }
 
-  // Runs on the thread that read a job's last row.
-  void complete(const std::shared_ptr<ReadJob> &job) {
-    if (job->prefetch) finishPrefetch(*job);
-    {
-      const std::lock_guard lock(job->mutex);
-      job->complete = true;
-    }
-    {
-      const std::lock_guard lock(poolMutex);
-      std::erase(critical, job);
-      std::erase(background, job);
-      if (job->prefetch) {
-        std::erase(prefetching, job);
-        prefetchingRows -= job->ids.size();
-        if (prefetching.empty()) prefetchIdle.notify_all();
-      }
-    }
-    job->finished.notify_all();
-  }
-
-  // A prefetch's rows enter the cache once the source is unchanged since
-  // they were read; a failure poisons the store for the next stage.
-  void finishPrefetch(ReadJob &job) {
-    std::exception_ptr failed;
-    {
-      const std::lock_guard lock(job.mutex);
-      failed = job.failure;
-    }
+  // Runs on the thread that read a prefetch's last row: its rows enter the
+  // cache once the source is unchanged since they were read, but a row that
+  // could not be read, a hint, is dropped; a written source poisons the
+  // store for the next stage.
+  void endPrefetch(Prefetch &prefetch, const WeightReaders::Batch &batch) {
+    count(batch.tally());
     try {
-      if (failed) std::rethrow_exception(failed);
       reader->checkUnchanged();
     } catch (const std::exception &error) {
       poison(error.what());
-      return;
-    } catch (...) {
-      poison("unknown read failure");
-      return;
     }
-    if (poisoned.load(std::memory_order_acquire)) return;
-    const std::lock_guard lock(cacheMutex);
-    for (size_t index = 0; index < job.ids.size(); ++index) insert(job.ids[index], job.destinations[index]);
-    prefetchRead.fetch_add(job.ids.size(), std::memory_order_relaxed);
+    uint64_t read = 0;
+    if (!poisoned.load(std::memory_order_acquire)) {
+      const std::lock_guard lock(cacheMutex);
+      for (size_t index = 0; index < prefetch.ids.size(); ++index)
+        if (!batch.failed(index)) {
+          insert(prefetch.ids[index], prefetch.rows.data() + index * table.rowBytes);
+          ++read;
+        }
+    }
+    prefetchRead.fetch_add(read, std::memory_order_relaxed);
+    prefetchDropped.fetch_add(prefetch.ids.size() - read, std::memory_order_relaxed);
+    const std::lock_guard lock(prefetchMutex);
+    prefetch.ended = true;
+    prefetchingRows -= prefetch.ids.size();
   }
 
-  static void waitComplete(ReadJob &job) {
-    std::unique_lock lock(job.mutex);
-    job.finished.wait(lock, [&] { return job.complete; });
+  // The prefetches in flight; forgets those that ended, whose readers no
+  // longer run them.
+  std::vector<std::shared_ptr<Prefetch>> inFlight() {
+    const std::lock_guard lock(prefetchMutex);
+    std::erase_if(prefetching, [](const std::shared_ptr<Prefetch> &prefetch) { return prefetch->ended; });
+    return prefetching;
   }
 
-  // The first job of `queue` with unclaimed rows; drops the exhausted ones.
-  static std::shared_ptr<ReadJob> frontWithWork(std::deque<std::shared_ptr<ReadJob>> &queue) {
-    while (!queue.empty()) {
-      if (queue.front()->next.load(std::memory_order_relaxed) < queue.front()->ids.size()) return queue.front();
-      queue.pop_front();
-    }
-    return nullptr;
-  }
-
-  void readerLoop() {
-    for (;;) {
-      std::shared_ptr<ReadJob> job;
-      bool fromBackground = false;
-      {
-        std::unique_lock lock(poolMutex);
-        // Prefetches wait while a stage does.
-        poolWake.wait(lock, [&] {
-          if (stopping) return true;
-          job = frontWithWork(critical);
-          if (!job && !criticalWaiting.load(std::memory_order_relaxed)) {
-            job = frontWithWork(background);
-            fromBackground = job != nullptr;
-          }
-          return job != nullptr;
-        });
-        if (stopping) return;
-      }
-      work(job, fromBackground);
-    }
-  }
-
-  // Reads a stage's or an adopted prefetch's rows here and on the readers,
-  // and returns once every row was read.
-  void readNow(const std::shared_ptr<ReadJob> &job) {
-    {
-      const std::lock_guard lock(poolMutex);
-      criticalWaiting.fetch_add(1, std::memory_order_acq_rel);
-      critical.push_back(job);
-    }
-    poolWake.notify_all();
-    work(job, false);
-    waitComplete(*job);
-    {
-      // Under the lock, so that a reader that saw a stage waiting and
-      // passed the prefetches over is woken for them.
-      const std::lock_guard lock(poolMutex);
-      // Adoption may have queued a job after its completion retired it.
-      std::erase(critical, job);
-      std::erase(background, job);
-      criticalWaiting.fetch_sub(1, std::memory_order_acq_rel);
-    }
-    poolWake.notify_all();
-  }
-
+  // Finishes the prefetches in flight here and on the readers.
   void adoptPrefetches() {
-    std::vector<std::shared_ptr<ReadJob>> adopted;
-    {
-      const std::lock_guard lock(poolMutex);
-      adopted = prefetching;
-    }
-    for (const std::shared_ptr<ReadJob> &job : adopted) readNow(job);
+    for (const std::shared_ptr<Prefetch> &prefetch : inFlight()) options.readers->finish(*prefetch->batch);
   }
 };
 
@@ -496,30 +335,16 @@ SparseRowStore::SparseRowStore(SparseRowTable table, std::unique_ptr<RowReader> 
   if (!reader) throw std::invalid_argument("streamed table " + table.name + " has no reader");
   if (table.offset + table.rows * table.rowBytes > reader->size())
     throw std::invalid_argument("streamed table " + table.name + " ends past its file");
-  impl_ = std::make_unique<Impl>(std::move(table), std::move(reader), options);
-  impl_->allocate(options.cacheBytes);
-  impl_->threads.reserve(options.readers);
-  try {
-    for (uint32_t index = 0; index < options.readers; ++index)
-      impl_->threads.emplace_back([impl = impl_.get()] { impl->readerLoop(); });
-  } catch (...) {
-    {
-      const std::lock_guard lock(impl_->poolMutex);
-      impl_->stopping = true;
-    }
-    impl_->poolWake.notify_all();
-    for (std::thread &thread : impl_->threads) thread.join();
-    throw;
-  }
+  if (!options.readers) throw std::invalid_argument("streamed table " + table.name + " has no readers");
+  const uint64_t cacheBytes = options.cacheBytes;
+  impl_ = std::make_unique<Impl>(std::move(table), std::move(reader), std::move(options));
+  impl_->allocate(cacheBytes);
 }
 
 SparseRowStore::~SparseRowStore() {
-  {
-    const std::lock_guard lock(impl_->poolMutex);
-    impl_->stopping = true;
-  }
-  impl_->poolWake.notify_all();
-  for (std::thread &thread : impl_->threads) thread.join();
+  // A prefetch's rows enter the cache, which goes with the store.
+  for (const std::shared_ptr<Impl::Prefetch> &prefetch : impl_->inFlight())
+    impl_->options.readers->stop(*prefetch->batch);
 }
 
 const SparseRowTable &SparseRowStore::table() const noexcept { return impl_->table; }
@@ -577,25 +402,24 @@ SparseRowStageResult SparseRowStore::stage(std::span<const uint32_t> ids, std::s
   }
 
   if (!s.missing.empty()) {
-    auto job = std::make_shared<Impl::ReadJob>();
-    job->ids.reserve(s.missing.size());
-    job->destinations.reserve(s.missing.size());
-    for (const uint32_t u : s.missing) {
-      job->ids.push_back(s.unique[u]);
-      job->destinations.push_back(rows.data() + uint64_t{u} * rowBytes);
-    }
-    s.readNow(job);
-    // No reader writes into `rows` from here on: every row of the job was
-    // claimed and read.
+    s.destinations.clear();
+    for (const uint32_t u : s.missing) s.destinations.push_back(rows.data() + uint64_t{u} * rowBytes);
+    // No reader writes into `rows` once the reads returned.
+    WeightReaders::Tally tally;
     try {
-      if (job->failure) std::rethrow_exception(job->failure);
+      s.options.readers->run(
+          s.missing.size(), [&](size_t index) { s.readRow(s.unique[s.missing[index]], s.destinations[index]); },
+          &tally);
+      s.count(tally);
       s.reader->checkUnchanged();
     } catch (const std::exception &error) {
+      s.count(tally);
       s.poison(error.what());
       s.throwPoisoned();
     }
     const std::lock_guard lock(s.cacheMutex);
-    for (size_t index = 0; index < job->ids.size(); ++index) s.insert(job->ids[index], job->destinations[index]);
+    for (size_t index = 0; index < s.missing.size(); ++index)
+      s.insert(s.unique[s.missing[index]], s.destinations[index]);
   }
 
   SparseRowStageResult result;
@@ -618,50 +442,37 @@ void SparseRowStore::prefetch(std::span<const uint32_t> ids) {
   if (ids.empty() || s.poisoned.load(std::memory_order_acquire)) return;
   const std::lock_guard prefetchLock(s.prefetchMutex);
   s.prefetchRequested.fetch_add(ids.size(), std::memory_order_relaxed);
-  // Distinct ids within the table, not cached.
+  // Distinct ids within the table, not cached, up to the bound.
   s.prefetchDistinct.begin(ids.size());
-  auto job = std::make_shared<Impl::ReadJob>();
-  job->prefetch = true;
+  auto prefetch = std::make_shared<Impl::Prefetch>();
   {
     const std::lock_guard lock(s.cacheMutex);
     for (const uint32_t id : ids)
-      if (id < s.table.rows && s.prefetchDistinct.add(id).second && s.find(id) == kNoSlot) job->ids.push_back(id);
+      if (id < s.table.rows && s.prefetchDistinct.add(id).second && s.find(id) == kNoSlot)
+        prefetch->ids.push_back(id);
   }
-  {
-    const std::lock_guard lock(s.poolMutex);
-    const uint64_t room =
-        s.options.prefetchRows > s.prefetchingRows ? s.options.prefetchRows - s.prefetchingRows : 0;
-    if (job->ids.size() > room) {
-      s.prefetchDropped.fetch_add(job->ids.size() - room, std::memory_order_relaxed);
-      job->ids.resize(room);
-    }
-    if (job->ids.empty()) return;
-    job->buffer.resize(job->ids.size() * s.table.rowBytes);
-    job->destinations.reserve(job->ids.size());
-    for (size_t index = 0; index < job->ids.size(); ++index)
-      job->destinations.push_back(job->buffer.data() + index * s.table.rowBytes);
-    s.prefetchingRows += job->ids.size();
-    s.prefetching.push_back(job);
-    s.background.push_back(job);
+  std::erase_if(s.prefetching, [](const std::shared_ptr<Impl::Prefetch> &each) { return each->ended; });
+  const uint64_t room = s.options.prefetchRows > s.prefetchingRows ? s.options.prefetchRows - s.prefetchingRows : 0;
+  if (prefetch->ids.size() > room) {
+    s.prefetchDropped.fetch_add(prefetch->ids.size() - room, std::memory_order_relaxed);
+    prefetch->ids.resize(room);
   }
-  s.poolWake.notify_all();
+  if (prefetch->ids.empty()) return;
+  prefetch->rows.resize(prefetch->ids.size() * s.table.rowBytes);
+  s.prefetchingRows += prefetch->ids.size();
+  s.prefetching.push_back(prefetch);
+  // The batch ends its prefetch, which the store holds until then.
+  Impl::Prefetch *const reading = prefetch.get();
+  prefetch->batch = s.options.readers->start(
+      reading->ids.size(),
+      [&s, reading](size_t index) {
+        s.readRow(reading->ids[index], reading->rows.data() + index * s.table.rowBytes);
+      },
+      std::max(1u, s.options.readers->readers()),
+      [&s, reading](const WeightReaders::Batch &batch) { s.endPrefetch(*reading, batch); });
 }
 
-void SparseRowStore::drainPrefetch() {
-  Impl &s = *impl_;
-  if (s.options.readers == 0) {
-    for (;;) {
-      {
-        const std::lock_guard lock(s.poolMutex);
-        if (s.prefetching.empty() || s.stopping) return;
-      }
-      // A concurrent prefetch may enqueue after the last adoption snapshot.
-      s.adoptPrefetches();
-    }
-  }
-  std::unique_lock lock(s.poolMutex);
-  s.prefetchIdle.wait(lock, [&] { return s.prefetching.empty() || s.stopping; });
-}
+void SparseRowStore::drainPrefetch() { impl_->adoptPrefetches(); }
 
 SparseRowStats SparseRowStore::stats() const {
   const Impl &s = *impl_;
@@ -695,16 +506,8 @@ SparseRowStats SparseRowStore::stats() const {
   return result;
 }
 
-std::unique_ptr<RowReader> openRowReader(int descriptor, const std::filesystem::path &path) {
-  return std::make_unique<FileRowReader>(descriptor, path);
-}
-
-std::unique_ptr<RowReader> openRowReader(const WeightSource &source) {
-  auto reader = openRowReader(source.descriptor(), source.path());
-  // Recheck the original snapshot after the reader has taken its own. A
-  // later write is then caught by the reader's checks before staging.
-  source.checkUnchanged();
-  return reader;
+std::unique_ptr<RowReader> openRowReader(std::shared_ptr<const WeightSource> source) {
+  return std::make_unique<SourceRowReader>(std::move(source));
 }
 
 } // namespace splash::model

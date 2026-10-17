@@ -84,7 +84,9 @@ LoadedModel loadModel(metal::MetalBackend &backend,
   const auto vision = planVisionLoader(root, result.descriptor);
   DraftCheckpointLoader draft(backend, images, root / "draft", result.descriptor.draft);
   // The weights that stream from their files read on one set of readers.
-  const auto readers = options.expertMemoryBytes ? std::make_shared<WeightReaders>(kWeightReaders) : nullptr;
+  const auto readers = options.pleCacheBytes || options.expertMemoryBytes
+                           ? std::make_shared<WeightReaders>(kWeightReaders)
+                           : nullptr;
   const ExpertStoreOptions experts{.memoryBytes = options.expertMemoryBytes, .readers = readers};
   result.target = std::visit(
       [&](const auto &layout) -> TargetWeights {
@@ -100,8 +102,10 @@ LoadedModel loadModel(metal::MetalBackend &backend,
           // prefillTokenBudget tokens, and prefetches, each a chunk's
           // read-ahead, may have the rows of two chunks queued or in flight.
           const uint32_t stageRows = ExecutionLimits::prefillTokenBudget * layout.pleHeads();
-          const SparseRowStoreOptions table{
-              .cacheBytes = options.pleCacheBytes, .prefetchRows = 2 * stageRows, .stageRows = stageRows};
+          const SparseRowStoreOptions table{.cacheBytes = options.pleCacheBytes,
+                                            .readers = readers,
+                                            .prefetchRows = 2 * stageRows,
+                                            .stageRows = stageRows};
           GgufTargetLoader loader(backend, images, findTargetGgufs(directory), layout.ggufArchitecture, layout, table,
                                   experts);
           return readTarget(backend, layout, std::ref(loader));

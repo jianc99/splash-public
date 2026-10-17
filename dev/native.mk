@@ -618,7 +618,8 @@ $(TEST_SLOT_FILE) $(TEST_SLOT_FILE_ASAN) $(TEST_SLOT_FILE_TSAN): \
 $(TEST_CACHE_DIRECTORY) $(TEST_CACHE_DIRECTORY_ASAN) $(TEST_CACHE_DIRECTORY_TSAN): \
 		runtime/engine/CacheDirectory.cpp dev/tests/engine/cache_directory_test.cpp
 $(TEST_SPARSE_ROW_STORE) $(TEST_SPARSE_ROW_STORE_ASAN) $(TEST_SPARSE_ROW_STORE_TSAN): \
-		runtime/model/SparseRowStore.cpp runtime/model/WeightSource.cpp dev/tests/engine/sparse_row_store_test.cpp
+		runtime/model/SparseRowStore.cpp runtime/model/WeightReaders.cpp runtime/model/WeightSource.cpp \
+		dev/tests/engine/sparse_row_store_test.cpp
 $(TEST_WEIGHT_READERS) $(TEST_WEIGHT_READERS_ASAN) $(TEST_WEIGHT_READERS_TSAN): \
 		runtime/model/WeightReaders.cpp dev/tests/engine/weight_readers_test.cpp
 $(TEST_PERSISTENT_CACHE) $(TEST_PERSISTENT_CACHE_ASAN) $(TEST_PERSISTENT_CACHE_TSAN): \

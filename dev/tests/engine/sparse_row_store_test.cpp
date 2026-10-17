@@ -3,7 +3,8 @@
 // used first out; reads with its readers and the staging thread, so a stage
 // completes while the readers are blocked; never caches a row of a failed
 // read or of a written source, and fails every later stage once poisoned;
-// and reads a prefetch's rows ahead, below stages, within its bound.
+// and reads a prefetch's rows ahead, below stages, within its bound,
+// dropping a row it fails to read.
 #include "TestChecks.hpp"
 #include "TestFiles.hpp"
 #include "model/SparseRowStore.hpp"
@@ -98,6 +99,12 @@ uint64_t bytesFor(uint64_t rows, uint32_t prefetchRows) {
          SparseRowStore::workingBytes(rowBytes, prefetchRows, kStageRows);
 }
 
+// A store's options: its bytes, `readers` readers of its own, the prefetch
+// bound and the stage scratch.
+SparseRowStoreOptions optionsOf(uint64_t bytes, uint32_t readers, uint32_t prefetchRows) {
+  return {bytes, std::make_shared<WeightReaders>(readers), prefetchRows, kStageRows};
+}
+
 struct Fixture final {
   std::vector<uint8_t> bytes;
   MemoryReader *reader = nullptr;
@@ -106,9 +113,8 @@ struct Fixture final {
     bytes = randomBytes(kOffset + rows * rowBytes, uint32_t(rows));
     auto owned = std::make_unique<MemoryReader>(bytes);
     reader = owned.get();
-    store = std::make_unique<SparseRowStore>(
-        tableOf(rows), std::move(owned),
-        SparseRowStoreOptions{bytesFor(cacheRows, prefetchRows), readers, prefetchRows, kStageRows});
+    store = std::make_unique<SparseRowStore>(tableOf(rows), std::move(owned),
+                                             optionsOf(bytesFor(cacheRows, prefetchRows), readers, prefetchRows));
     require(store->stats().cacheCapacityRows == cacheRows, "a store's cache holds other than its rows");
     require(store->committedBytes() <= bytesFor(cacheRows, prefetchRows), "a store holds more than its bytes");
   }
@@ -228,7 +234,7 @@ void rejectsBadCallsWithoutPoison() {
   // A table past its file is refused.
   rejects([] {
     SparseRowStore(tableOf(10), std::make_unique<MemoryReader>(std::vector<uint8_t>(kOffset + 9 * rowBytes)),
-                   {bytesFor(10, 16), 1, 16, kStageRows});
+                   optionsOf(bytesFor(10, 16), 1, 16));
   }, "ends past its file", "a table past its file was accepted");
   rejects([] { SparseRowTable{"wide", uint64_t{1} << 32, rowBytes, 0}.validate(); }, "32-bit",
           "a table past 32-bit ids was accepted");
@@ -305,6 +311,23 @@ void boundsQueuedPrefetch() {
   require(f.store->stats().prefetchReadRows == 10, "a bounded prefetch read the wrong rows");
 }
 
+// A row a prefetch fails to read (twice) is dropped, a hint: the store stays
+// usable, and the stage that needs the row reads it.
+void dropsAFailedPrefetch() {
+  Fixture f(1000, 500, 2);
+  std::atomic<int> failures{2};
+  f.reader->hook = [&](uint64_t row) {
+    if (row == 21 && failures.fetch_sub(1) > 0) throw SparseRowError("injected EIO");
+  };
+  f.store->prefetch(std::vector<uint32_t>{20, 21, 22});
+  f.store->drainPrefetch();
+  const SparseRowStats stats = f.store->stats();
+  require(!stats.poisoned && stats.prefetchReadRows == 2 && stats.prefetchDroppedRows == 1 &&
+              stats.readRetries == 1 && stats.readErrors == 1,
+          "a failed prefetch poisoned the store, or its rows are miscounted");
+  require(f.stage({20, 21, 22}).readRows == 1, "a stage did not read the row its prefetch failed to");
+}
+
 // Stages, prefetches and statistics from several threads (also under TSan).
 void concurrentUse() {
   Fixture f(200'000, 30'000, 6, 20'000);
@@ -348,26 +371,24 @@ void concurrentUse() {
   require(!failures.load() && !f.store->stats().poisoned, "concurrent stages failed");
 }
 
-// A same-size write between the metadata source's check and the reader's
-// new snapshot must not become an accepted baseline at descriptor handoff.
-void keepsMetadataSourceIdentity(const std::filesystem::path &directory) {
+// The production reader checks the identity its source was opened with: a
+// same-size write after the source was opened is a change, and a new file at
+// its path is not.
+void keepsTheSourceIdentity(const std::filesystem::path &directory) {
   const auto path = directory / "handoff.bin";
   splash::test::writeFile(path, randomBytes(kOffset + 8 * rowBytes, 31));
-  WeightSource source(path);
-  source.checkUnchanged();
+  const auto source = std::make_shared<WeightSource>(path);
+  source->checkUnchanged();
   std::this_thread::sleep_for(std::chrono::milliseconds(10));
   const int writer = open(path.c_str(), O_WRONLY);
   const uint8_t changed = 7;
-  require(writer >= 0 && pwrite(writer, &changed, 1, kOffset) == 1, "write at reader handoff");
+  require(writer >= 0 && pwrite(writer, &changed, 1, kOffset) == 1, "write after the source was opened");
   close(writer);
-  // The descriptor-only reader would accept the new bytes as its snapshot.
-  openRowReader(source.descriptor(), source.path())->checkUnchanged();
-  rejects([&] { (void)openRowReader(source); }, "written while",
-          "a write at descriptor handoff replaced the metadata identity");
-  // Replacement at the path still leaves the open descriptor's identity intact.
+  rejects([&] { openRowReader(source)->checkUnchanged(); }, "written while",
+          "a write after the source was opened was accepted");
   const auto original = directory / "handoff-original.bin";
   splash::test::writeFile(original, randomBytes(kOffset + 8 * rowBytes, 32));
-  WeightSource unchanged(original);
+  const auto unchanged = std::make_shared<WeightSource>(original);
   const auto replacement = directory / "handoff-replacement.bin";
   splash::test::writeFile(replacement, randomBytes(kOffset + 8 * rowBytes, 33));
   std::filesystem::rename(replacement, original);
@@ -381,11 +402,8 @@ void readsAnOpenFile(const std::filesystem::path &directory) {
   const uint64_t rows = 4096;
   const std::vector<uint8_t> bytes = randomBytes(kOffset + rows * rowBytes, 5);
   splash::test::writeFile(path, bytes);
-  const int parsed = open(path.c_str(), O_RDONLY | O_CLOEXEC);
-  require(parsed >= 0, "open the table fixture");
-  SparseRowStore store(tableOf(rows), openRowReader(parsed, path),
-                       {bytesFor(1024, 64), 2, 64, kStageRows});
-  close(parsed); // the reader holds its own descriptor
+  SparseRowStore store(tableOf(rows), openRowReader(std::make_shared<WeightSource>(path)),
+                       optionsOf(bytesFor(1024, 64), 2, 64));
   const auto check = [&](const std::vector<uint32_t> &ids) {
     std::vector<uint8_t> staged(ids.size() * rowBytes);
     std::vector<uint32_t> slots(ids.size());
@@ -405,10 +423,8 @@ void readsAnOpenFile(const std::filesystem::path &directory) {
   // second fixture and its store.
   const auto second = directory / "second.bin";
   splash::test::writeFile(second, bytes);
-  const int secondFile = open(second.c_str(), O_RDONLY | O_CLOEXEC);
-  SparseRowStore written(tableOf(rows), openRowReader(secondFile, second),
-                         {bytesFor(1024, 64), 2, 64, kStageRows});
-  close(secondFile);
+  SparseRowStore written(tableOf(rows), openRowReader(std::make_shared<WeightSource>(second)),
+                         optionsOf(bytesFor(1024, 64), 2, 64));
   std::this_thread::sleep_for(std::chrono::milliseconds(10)); // a distinct modification time
   const int writer = open(second.c_str(), O_WRONLY);
   const uint8_t value = 1;
@@ -422,10 +438,8 @@ void readsAnOpenFile(const std::filesystem::path &directory) {
   // A file cut short after it was opened: its size shows the write.
   const auto third = directory / "third.bin";
   splash::test::writeFile(third, bytes);
-  const int thirdFile = open(third.c_str(), O_RDONLY | O_CLOEXEC);
-  SparseRowStore truncated(tableOf(rows), openRowReader(thirdFile, third),
-                           {bytesFor(1024, 64), 2, 64, kStageRows});
-  close(thirdFile);
+  SparseRowStore truncated(tableOf(rows), openRowReader(std::make_shared<WeightSource>(third)),
+                           optionsOf(bytesFor(1024, 64), 2, 64));
   require(truncate(third.c_str(), off_t(kOffset + 10 * rowBytes)) == 0, "truncate the table fixture");
   const std::vector<uint32_t> late{4000};
   rejects([&] { truncated.stage(late, staged, slots, SparseRowUse::Decode); }, "written while",
@@ -451,9 +465,10 @@ int main() {
       stagesWhileReadersAreBlocked();
       adoptsPrefetchedRows();
       boundsQueuedPrefetch();
+      dropsAFailedPrefetch();
       concurrentUse();
       readsAnOpenFile(directory.path());
-      keepsMetadataSourceIdentity(directory.path());
+      keepsTheSourceIdentity(directory.path());
     }
   } catch (const std::exception &error) {
     std::cerr << "sparse row store test failed at " << rowBytes << "-byte rows: " << error.what() << '\n';
