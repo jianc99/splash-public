@@ -155,7 +155,8 @@ constexpr NSUInteger kMaximumCommandBuffers = 512;
 // us a load), longer than nearly every step's work.
 constexpr uint32_t kHostStepWaitLoads = 1u << 18;
 // Where in the spin's release buffer (HostStepSpin) host_step_wait writes the
-// release it saw: a cache line past the counter the CPU raises (word 0).
+// release it saw and the loads it made before: a cache line past the counter
+// the CPU raises (word 0).
 constexpr NSUInteger kHostStepSeenOffset = 128;
 // The library of host_step_wait, beside the backend's own: built apart, as
 // its compiler may refuse it (Makefile), and loaded only for awake steps.
@@ -1164,7 +1165,10 @@ struct MetalBackend::Impl {
             if (buffer.status != MTLCommandBufferStatusCompleted)
                 fail("a GPU spin failed: " + errorDescription(buffer.error));
             if (buffer.GPUStartTime >= released) continue;
-            return *seen == value ? SpinCheck::Seen : SpinCheck::Unseen;
+            // A spin that saw its release at its first load proves nothing:
+            // a release that came before that load shows to any load.
+            if (seen[0] == value && seen[1] == 0) continue;
+            return seen[0] == value ? SpinCheck::Seen : SpinCheck::Unseen;
         }
         return SpinCheck::Late;
     }
@@ -1217,7 +1221,7 @@ struct MetalBackend::Impl {
     HostStepSpin newHostStepSpin() {
         HostStepSpin spin;
         spin.pipeline = newPipeline(loadLibrary(device, hostStepLibraryPath), "host_step_wait");
-        spin.releases = newBuffer(kHostStepSeenOffset + sizeof(uint32_t), BufferStorage::Shared,
+        spin.releases = newBuffer(kHostStepSeenOffset + 2 * sizeof(uint32_t), BufferStorage::Shared,
                                   @"host-step releases");
         std::memset(spin.releases.contents, 0, spin.releases.length);
         return spin;
