@@ -94,7 +94,7 @@ struct ExpertFile {
       bytes.insert(bytes.end(), m.routed[p].native.begin(), m.routed[p].native.end());
     }
     splash::test::writeFile(path, bytes);
-    source = std::make_unique<splash::model::WeightSource>(path);
+    source = std::make_shared<splash::model::WeightSource>(path);
     splash::model::gguf::StreamedExperts experts;
     for (size_t p = 0; p < 3; ++p) {
       const Tensor &t = m.routed[p];
@@ -107,13 +107,14 @@ struct ExpertFile {
                                 rowBytes(f, t.columns), {}, source.get()});
     }
     blocks.blocks = {experts, experts};
+    blocks.sources = source;
     blocks.checks = {[file = source.get()] { file->checkUnchanged(); }};
   }
   ExpertFile(const ExpertFile &) = delete;
   ExpertFile &operator=(const ExpertFile &) = delete;
 
   std::filesystem::path path;
-  std::unique_ptr<splash::model::WeightSource> source;
+  std::shared_ptr<splash::model::WeightSource> source;
   StreamedBlocks blocks;
 };
 

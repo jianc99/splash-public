@@ -285,6 +285,8 @@ struct ExpertStore::Impl {
   const ops::MoeShape shape;
   const Geometry geometry;
   const std::shared_ptr<WeightReaders> readers;
+  // What holds the sources open, and their checks (StreamedBlocks).
+  std::shared_ptr<const void> files;
   std::vector<std::function<void()>> checks;
   std::vector<Size> sizes;
   std::vector<Block> blocks;
@@ -742,6 +744,7 @@ ExpertStore::ExpertStore(metal::MetalBackend &backend, StreamedBlocks streamed, 
   Impl &impl = *impl_;
   const Geometry &geometry = impl.geometry;
   if (!options.memoryBytes || !impl.readers) throw std::invalid_argument("invalid expert store");
+  impl.files = std::move(streamed.sources);
   impl.checks = std::move(streamed.checks);
   for (uint32_t block = 0; block < streamed.blocks.size(); ++block)
     impl.blocks.push_back(

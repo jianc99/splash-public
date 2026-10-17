@@ -14,7 +14,7 @@ SafetensorsTargetLoader::SafetensorsTargetLoader(metal::MetalBackend &backend, W
 }
 
 StreamedBlocks SafetensorsTargetLoader::streamedExperts() const {
-  return {gguf::streamedExperts(std::span(planned_->images).first(planned_->images.size() - 2)),
+  return {gguf::streamedExperts(std::span(planned_->images).first(planned_->images.size() - 2)), planned_,
           {[planned = planned_] { planned->checkpoint.checkUnchanged(); }}};
 }
 

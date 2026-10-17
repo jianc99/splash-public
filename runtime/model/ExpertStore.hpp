@@ -82,11 +82,12 @@ namespace splash::model {
 
 // The blocks of a target whose routed experts stream (gguf::PlanOptions::
 // streamExperts): each block's experts as its plan left them out of its
-// image, in block order (the target's `layers` layers), and a check of each
-// source they read, which holds it open and throws once it was written since
-// it was opened.
+// image, in block order (the target's `layers` layers), what holds the
+// sources their rows name open (the store keeps it), and a check of each
+// source, which throws once it was written since it was opened.
 struct StreamedBlocks final {
   std::vector<gguf::StreamedExperts> blocks;
+  std::shared_ptr<const void> sources;
   std::vector<std::function<void()>> checks;
 };
 

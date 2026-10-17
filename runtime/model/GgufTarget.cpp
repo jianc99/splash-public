@@ -43,7 +43,7 @@ GgufTargetLoader::GgufTargetLoader(metal::MetalBackend &backend, WeightImages &i
 }
 
 StreamedBlocks GgufTargetLoader::streamedExperts() const {
-  return {gguf::streamedExperts(std::span(planned_->images).first(planned_->layers)),
+  return {gguf::streamedExperts(std::span(planned_->images).first(planned_->layers)), planned_,
           {[planned = planned_] { planned->source.checkUnchanged(); }}};
 }
 
