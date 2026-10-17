@@ -159,6 +159,11 @@ Qwen4Steps::Qwen4Steps(const Qwen4ExpWeights &weights, const QwenTargetGeometry 
   if (!prefillChunks_ || static_cast<bool>(weights_.pleStore) != static_cast<bool>(geometry_.pleStreamRowBytes) ||
       geometry_.pleNgram < 2 || geometry_.pleNgram > QWEN4_PLE_MAXIMUM_NGRAM)
     throw std::invalid_argument("invalid Qwen3.8-Flash-Next step geometry");
+  // The QSA kernels are compiled for one indexer (metal/abi/Qwen4.h), which
+  // must be the layout's, as must the KV pages' index.
+  if (geometry_.indexerHeads != QWEN4_QSA_HEADS || geometry_.indexerHeadDimension != QWEN4_QSA_DIMENSION ||
+      geometry_.indexerBlockTokens != QWEN4_QSA_BLOCK || geometry_.kvLayout.indexDimension != QWEN4_QSA_DIMENSION)
+    throw std::invalid_argument("no QSA kernels for the Qwen3.8-Flash-Next indexer's shape");
   const Layout bytes = layout(geometry_, prefillChunks_);
   prefill_ = backend_.allocateBuffer(bytes.prefillBytes, metal::BufferStorage::Shared, "qwen4-prefill-scratch");
   decode_ = backend_.allocateBuffer(bytes.decodeBytes, metal::BufferStorage::Shared, "qwen4-decode-scratch");
