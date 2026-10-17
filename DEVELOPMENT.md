@@ -2116,7 +2116,9 @@ run as its keys are; the dense page loop of the other targets keeps them
 dimension-major, on which its PV runs faster.
 `make benchmark-attention-sweep ATTENTION_SWEEP_ARGS='--shapes fn --qsa shared'`
 times the sparse kernels over synthetic selections (`--qsa` also takes
-`independent` and `pages`).
+`independent`, `overlapping`, whose unions are the ~1,500 blocks real
+selections make, and `pages`), and `--qsa indexer` the indexer itself before
+them; each case reports the mean entries of its lists.
 
 ### Neural Engine prefill
 
