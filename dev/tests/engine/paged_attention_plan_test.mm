@@ -137,9 +137,7 @@ void checkPlans(uint32_t queryHeads, kv::Layout layout) {
             "verify plan runs the wrong pipelines");
     uint32_t maximum = 0;
     for (uint32_t lane = 0; lane < lanes; ++lane) {
-      // A sparse lane's list takes up to the most splits.
-      const uint32_t expected =
-          layout.valuesTokenMajor ? kv::kVerifyMaximumSplits : kv::verifyAttentionSplits(histories[lane]);
+      const uint32_t expected = kv::verifyAttentionSplits(histories[lane]);
       require(plan.laneSplits[lane] == expected && expected >= kv::kVerifySplits &&
                   expected <= kv::kVerifyMaximumSplits,
               "verify lane split count does not follow its own history");
@@ -155,7 +153,7 @@ void checkPlans(uint32_t queryHeads, kv::Layout layout) {
                 plan.reduceGroups.y == 8 * queryHeads / layout.kvHeads &&
                 plan.reduceGroups.z == lanes,
             "verify split/reduce/scratch disagree");
-    require(plan.laneSplits[0] == (layout.valuesTokenMajor ? kv::kVerifyMaximumSplits : 32) &&
+    require(plan.laneSplits[0] == 32 &&
                 (lanes < 4 || plan.laneSplits[3] == kv::kVerifyMaximumSplits),
             "verify partition changed");
   }

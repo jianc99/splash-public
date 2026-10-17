@@ -21,10 +21,15 @@ constant uint SplashSparseNoEntry = 0xffffffffu;
 // format's step, so that the split and reduce kernels of either format share
 // one partition.
 constant uint SplashSparsePartitionBlocks = 8;
-// A split takes at least this many entries of its tile's list: it writes
+// A split takes at least this many entries of a long list: it writes
 // partials of every fused row of the tile, which the reduce reads back, and
-// fewer blocks per split would move more partials than KV.
+// fewer blocks per split would move more partials than KV. A short list
+// (one below the QSA budget, or a lane's without one) spreads over at least
+// SplashSparseMinimumSplits splits of a partition unit each instead, as the
+// page loop's history does, so that a single lane's few threadgroups do not
+// leave the GPU idle.
 constant uint SplashSparseSplitBlocks = SPLASH_SPARSE_SPLIT_BLOCKS;
+constant uint SplashSparseMinimumSplits = SPLASH_SPARSE_MINIMUM_SPLITS;
 constant uint SplashSparseBlockTokens = SPLASH_ATTENTION_BLOCK_TOKENS;
 
 template <typename CacheElement> struct SplashSparseStep {
@@ -44,11 +49,15 @@ static_assert(SplashKvPageTokens % SplashSparseBlockTokens == 0,
 
 // The entries one split takes of a list of `count`, of at most `splits`
 // splits: an equal share in whole partition units, of at least
-// SplashSparseSplitBlocks entries. It depends on the list alone, so a lane's
-// partition is its own whatever lanes run with it. Every split past the
-// written ones takes none.
+// SplashSparseSplitBlocks entries, over at least SplashSparseMinimumSplits
+// splits where the list has as many units. It depends on the list alone, so
+// a lane's partition is its own whatever lanes run with it. Every split past
+// the written ones takes none.
 inline uint splash_sparse_split_entries(uint count, uint splits) {
-  const uint used = clamp((count + SplashSparseSplitBlocks - 1) / SplashSparseSplitBlocks, 1u, splits);
+  const uint units = (count + SplashSparsePartitionBlocks - 1) / SplashSparsePartitionBlocks;
+  const uint used = clamp(max((count + SplashSparseSplitBlocks - 1) / SplashSparseSplitBlocks,
+                              min(SplashSparseMinimumSplits, units)),
+                          1u, splits);
   const uint share = (count + used - 1) / used;
   return (share + SplashSparsePartitionBlocks - 1) / SplashSparsePartitionBlocks *
          SplashSparsePartitionBlocks;

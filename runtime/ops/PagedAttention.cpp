@@ -206,11 +206,7 @@ VerifyAttentionPlan PagedAttention::verifyPlan(
         kv::kMaximumPhysicalTokens)
       throw std::invalid_argument(
           "verify attention history exceeds physical context");
-    // A sparse lane's list decides its splits, up to the most the workspace
-    // holds (kernels/common/sparse_attention_tile.h); the page loop's follow
-    // its history.
-    laneSplits[lane] = layout.valuesTokenMajor ? kv::kVerifyMaximumSplits
-                                               : kv::verifyAttentionSplits(historyTokens[lane]);
+    laneSplits[lane] = kv::verifyAttentionSplits(historyTokens[lane]);
     splits = std::max(splits, laneSplits[lane]);
   }
   return {lanes, laneSplits, splits,
