@@ -2963,6 +2963,16 @@ order, as the release check does ([Release check](#release-check)), and writes
 `backend-regression.json` there. Neither is a comparison with another engine
 or a test of agent task quality.
 
+To compare the model's numerics with another engine on the same weights,
+`make teacher-logits MODEL=... TEACHER_LOGITS_ARGS='TOKENS OUTPUT --window END:ROWS ...'`
+writes the installed model's teacher-forced next-token logits over windows of
+a file of uint32 token ids (`dev/benchmarks/teacher_logits.mm`): for each
+window, the fp32 logits of the prefill's final position and of ROWS decode
+positions after it, each computed by a verify row forced to the true next
+token, in `OUTPUT-END.f32`, and prints how well they predict the true ids. It
+also takes `--kv-format`, `--state-format`, `--expert-memory` and
+`--ple-ssd-cache`.
+
 `benchmark-backend` lists the contexts the memory plan cannot hold in its
 report. Its cache checks reuse each context's cached prefix, so they need that
 memory free: when other programs leave too little, the engine evicts cached

@@ -3,6 +3,7 @@
 #include "model/Runtime.hpp"
 
 #include <cstdint>
+#include <span>
 #include <vector>
 
 namespace splash::model {
@@ -16,6 +17,11 @@ public:
   // verify rows, each row's heads' in order (Qwen3.8-Flash-Next), until the
   // next decode step; none for a target without them.
   [[nodiscard]] static std::vector<uint32_t> lastPleRows(const Runtime &runtime, uint32_t lane);
+  // The fp32 logits the last command left in batch lane `lane`'s rows, each
+  // the target's vocabulary wide, until the next command: a decode step's
+  // verify rows, or in row 0 the final position of the prefill chunk that
+  // ended a prompt.
+  [[nodiscard]] static std::span<const float> lastLogits(const Runtime &runtime, uint32_t lane);
 };
 
 } // namespace splash::model

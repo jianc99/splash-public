@@ -3189,6 +3189,12 @@ std::vector<uint32_t> RuntimeInstrumentation::lastPleRows(const Runtime &runtime
   const auto *target = dynamic_cast<const Qwen4ExpTarget *>(runtime.impl_->targetModel.get());
   return target ? target->verifyPleRows(lane) : std::vector<uint32_t>{};
 }
+
+std::span<const float> RuntimeInstrumentation::lastLogits(const Runtime &runtime, uint32_t lane) {
+  const Runtime::Impl &impl = *runtime.impl_;
+  return {contents<float>(impl.decodeArena->get(lane, DecodeTensor::Logits), "logits"),
+          uint64_t{ExecutionLimits::targetVerifyRows} * impl.geometry.target.vocabularySize};
+}
 #endif
 
 } // namespace splash::model
