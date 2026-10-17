@@ -1,6 +1,8 @@
 // The system memory scope, which Metal's public headers leave out: the only
-// fence under which a running kernel sees a store of the CPU. Device-scope atomics, volatile and coherent(device)
-// loads never do (M5 Max, M5 Pro, M3 Max).
+// fence under which a running kernel sees a store of the CPU. Device-scope
+// atomics, volatile and coherent(device) loads never do (M5 Max, M5 Pro, M3
+// Max), nor do coherent(device) loads or relaxed device-scope atomic loads
+// behind a device-scope seq_cst fence (M5 Max, M5 Pro, M6).
 #pragma METAL internals : enable
 #include <metal_stdlib>
 
