@@ -49,6 +49,7 @@ GGML = {
     "TQ2_0": 35,
     "MXFP4": 39,
     "NVFP4": 40,
+    "Q2_0": 42,
     "PQ2_0": 142,
 }
 
@@ -390,6 +391,9 @@ class GgufMetadataTests(unittest.TestCase):
         tensors |= {"blk.5.ffn_gate_exps.weight": GGML["BF16"]}
         tensors |= {"blk.5.ssm_alpha.weight": GGML["F16"]}
         tensors |= {"blk.5.ssm_beta.weight": GGML["F16"]}
+        # llama.cpp's Q2_0 (type 42), one d per 64 weights, as some GGUFs
+        # store their experts.
+        tensors |= {"blk.1.ffn_down_exps.weight": GGML["Q2_0"]}
         path = write_gguf(self.root / "ok.gguf", values, tensors.items())
         gguf.require_loadable(gguf.Metadata(path, tensors=True))
         for changes, reason in (
