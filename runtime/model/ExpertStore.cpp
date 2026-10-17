@@ -391,7 +391,7 @@ void ExpertStore::Impl::route(uint32_t index, std::span<const std::span<const Mo
   std::ranges::sort(pending);
   uint32_t *table = static_cast<uint32_t *>(tables.contents()) + uint64_t{index} * shape.experts;
   for (auto &[expert, slot] : pending) {
-    slot = size.recycling.claim(serial, chunk);
+    slot = size.recycling.claim(uint64_t{index} << 32 | expert, serial, chunk);
     evict(size, slot);
     size.ownerBlock[slot] = index;
     size.ownerExpert[slot] = expert;

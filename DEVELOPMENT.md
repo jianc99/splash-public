@@ -267,7 +267,9 @@ place (`target_weights_bytes`). Off by default.
 
 - Each MoE layer of a command loads the experts its rows route that are not
   resident: after the layer's routing, a host step of the command claims
-  slots for them, the least recently used first, and reads them from their
+  slots for them, recycled by adaptive replacement (ARC: the experts decode
+  steps route again stay while the others pass through, and a prompt's
+  experts go first), and reads them from their
   files into a staging of a decode cycle's experts on the model's weight
   readers, and a repack kernel writes them into their slots before the expert
   passes run. A decode step's load is one such round; a prefill command's

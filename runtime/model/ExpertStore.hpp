@@ -9,10 +9,10 @@
 // Experts of one size (the formats and shapes of their gate, up and down
 // projections) share an arena of slots, or several, each of some of its
 // blocks, when one would take more than the device's largest buffer. A size
-// of several blocks streams: an arena's slots are recycled least recently
-// used first across its blocks,
-// those a long prefill chunk loaded before the others (Impl::route). A size
-// of one block (a layer whose experts take formats no other layer's do, as a
+// of several blocks streams: an arena's slots are recycled across its blocks
+// by adaptive replacement (ExpertSlots), which keeps the experts decode steps
+// route again and again, and recycles a long prefill chunk's loads first. A
+// size of one block (a layer whose experts take formats no other layer's do, as a
 // dynamic quantization leaves some) holds every one of its experts: they are
 // read when the store is built or restored, and nothing loads them again.
 //
