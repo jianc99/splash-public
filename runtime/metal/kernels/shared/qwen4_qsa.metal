@@ -277,9 +277,52 @@ kernel void qwen4_qsa_score(device const bfloat *queries [[buffer(0)]],
 // score over its bits below the sign (a score is never negative),
 // kSelectBits a pass from the highest: every thread sums a run of the pass's
 // histogram from its top, and the runs' prefix sums find the bin of the
-// threshold. Once that bin holds just the scores still wanted, all of them
-// are taken and the select ends.
+// threshold. The first pass reads the row; its threshold bin's scores, a few
+// hundred of a long row, then go to threadgroup memory, where the later
+// passes run, unless more than kCandidates fall in it, when they read the
+// row again. Once a pass's bin holds just the scores still wanted, all of
+// them are taken and the select ends. Each simdgroup then writes a run of the
+// bitmap's words from ballots of 32 consecutive scores: those above the
+// threshold are taken, and of those equal to it the earliest still wanted. A row
+// writes the words the tiles that hold it list from (attention_block_lists:
+// up to their last row's tail, at most two blocks past its own).
 constant constexpr uint kSelectBits = 11;
+constant constexpr uint kSelectThreads = QWEN4_QSA_SELECT_THREADS;
+constant constexpr uint kCandidates = 4096;
+
+// A pass's threshold over its histogram of `bins` bins: the bin of the
+// `wanted`-th highest value and how many of it are wanted, in threshold[0]
+// and [1], and in threshold[2] whether that is all of it.
+inline void qsa_threshold(threadgroup atomic_uint *histogram, uint bins, uint wanted,
+                          threadgroup uint *simd_counts, threadgroup uint *threshold, uint tid, uint lane, uint sg) {
+  constexpr uint kRun = (1u << kSelectBits) / kSelectThreads;
+  static_assert((1u << kSelectBits) % kSelectThreads == 0, "the threads share the bins out evenly");
+  // Thread t sums the t-th run of bins below the top.
+  uint run[kRun];
+  uint local = 0;
+  for (uint j = 0; j < kRun; ++j) {
+    const uint below = tid * kRun + j;
+    run[j] = below < bins ? atomic_load_explicit(&histogram[bins - 1 - below], memory_order_relaxed) : 0u;
+    local += run[j];
+  }
+  const uint inclusive = simd_prefix_inclusive_sum(local);
+  if (lane == 31) simd_counts[sg] = inclusive;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  uint above = inclusive - local;
+  for (uint g = 0; g < sg; ++g) above += simd_counts[g];
+  if (above < wanted && above + local >= wanted)
+    for (uint j = 0; j < kRun; ++j) {
+      if (above + run[j] >= wanted) {
+        threshold[0] = bins - 1 - (tid * kRun + j);
+        threshold[1] = wanted - above;
+        threshold[2] = run[j] == wanted - above;
+        break;
+      }
+      above += run[j];
+    }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
 kernel void qwen4_qsa_select(device const float *scores [[buffer(0)]],
                              device uint *mask [[buffer(1)]],
                              constant Qwen4QsaParams &p [[buffer(2)]],
@@ -287,24 +330,21 @@ kernel void qwen4_qsa_select(device const float *scores [[buffer(0)]],
                              uint tid [[thread_index_in_threadgroup]],
                              uint lane [[thread_index_in_simdgroup]],
                              uint sg [[simdgroup_index_in_threadgroup]]) {
-  constexpr uint kThreads = QWEN4_QSA_SELECT_THREADS;
   constexpr uint kBins = 1u << kSelectBits;
-  // The bins a thread sums.
-  constexpr uint kRun = kBins / kThreads;
-  static_assert(kBins % kThreads == 0, "the threads share the bins out evenly");
   threadgroup atomic_uint histogram[kBins];
-  threadgroup uint simd_counts[kThreads / 32];
-  // The threshold's bin, the scores in it still wanted, and whether they
-  // are all of its scores.
+  threadgroup uint candidates[kCandidates];
+  threadgroup atomic_uint candidate_count;
+  threadgroup uint simd_counts[kSelectThreads / 32];
   threadgroup uint threshold[3];
   const uint batch = group.y;
   if (group.x >= p.rows || !qsa_lane(batch, p)) return;
   const uint position = p.first_position[batch] + p.row_offset + group.x;
   const uint complete = (position + 1) / kBlock;
+  const uint words = min(p.mask_words, (complete + 2) / 32 + 1);
   device uint *bits = mask + (ulong(batch) * p.rows + p.row_offset + group.x) * p.mask_words;
   if (complete <= p.top_blocks) {
     // Blocks 0..complete, the tail included; later bits stay clear.
-    for (uint w = tid; w < p.mask_words; w += kThreads) {
+    for (uint w = tid; w < words; w += kSelectThreads) {
       const uint first = w * 32;
       const uint end = complete + 1;
       bits[w] = first >= end ? 0u : (end - first >= 32 ? ~0u : (1u << (end - first)) - 1u);
@@ -313,82 +353,74 @@ kernel void qwen4_qsa_select(device const float *scores [[buffer(0)]],
   }
   device const float *s = scores + (ulong(batch) * p.rows + group.x) * p.score_stride;
   uint prefix = 0, prefix_mask = 0, wanted = p.top_blocks;
-  for (int high = 30; high >= 0; high -= int(kSelectBits)) {
+  bool gathered = false, all = false;
+  for (int high = 30; high >= 0 && !all; high -= int(kSelectBits)) {
     const uint width = min(kSelectBits, uint(high) + 1), shift = uint(high) + 1 - width;
     const uint bins = 1u << width;
-    for (uint i = tid; i < kBins; i += kThreads) atomic_store_explicit(&histogram[i], 0u, memory_order_relaxed);
+    for (uint i = tid; i < kBins; i += kSelectThreads) atomic_store_explicit(&histogram[i], 0u, memory_order_relaxed);
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint b = tid; b < complete; b += kThreads) {
-      const uint v = as_type<uint>(s[b]);
-      if ((v & prefix_mask) == prefix)
-        atomic_fetch_add_explicit(&histogram[(v >> shift) & (bins - 1)], 1u, memory_order_relaxed);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    // Thread t sums the t-th run of bins below the top.
-    uint run[kRun];
-    uint local = 0;
-    for (uint j = 0; j < kRun; ++j) {
-      const uint below = tid * kRun + j;
-      run[j] = below < bins ? atomic_load_explicit(&histogram[bins - 1 - below], memory_order_relaxed) : 0u;
-      local += run[j];
-    }
-    const uint inclusive = simd_prefix_inclusive_sum(local);
-    if (lane == 31) simd_counts[sg] = inclusive;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    uint above = inclusive - local;
-    for (uint g = 0; g < sg; ++g) above += simd_counts[g];
-    if (above < wanted && above + local >= wanted)
-      for (uint j = 0; j < kRun; ++j) {
-        if (above + run[j] >= wanted) {
-          threshold[0] = bins - 1 - (tid * kRun + j);
-          threshold[1] = wanted - above;
-          threshold[2] = run[j] == wanted - above;
-          break;
-        }
-        above += run[j];
+    if (gathered) {
+      const uint count = atomic_load_explicit(&candidate_count, memory_order_relaxed);
+      for (uint i = tid; i < count; i += kSelectThreads) {
+        const uint v = candidates[i];
+        if ((v & prefix_mask) == prefix)
+          atomic_fetch_add_explicit(&histogram[(v >> shift) & (bins - 1)], 1u, memory_order_relaxed);
       }
+    } else {
+      for (uint b = tid; b < complete; b += kSelectThreads) {
+        const uint v = as_type<uint>(s[b]);
+        if ((v & prefix_mask) == prefix)
+          atomic_fetch_add_explicit(&histogram[(v >> shift) & (bins - 1)], 1u, memory_order_relaxed);
+      }
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    qsa_threshold(histogram, bins, wanted, simd_counts, threshold, tid, lane, sg);
     prefix |= threshold[0] << shift;
     prefix_mask |= (bins - 1) << shift;
     wanted = threshold[1];
-    const bool all = threshold[2];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (all) break;
-  }
-  // A score whose resolved bits exceed the threshold's is taken, and of
-  // those equal to it the `wanted` earliest: each thread owns a contiguous
-  // run of words.
-  const uint words = (complete + 31) / 32;
-  const uint per = (words + kThreads - 1) / kThreads;
-  const uint w0 = min(tid * per, words), w1 = min(w0 + per, words);
-  uint equal = 0;
-  for (uint b = w0 * 32; b < min(w1 * 32, complete); ++b)
-    equal += (as_type<uint>(s[b]) & prefix_mask) == prefix ? 1u : 0u;
-  const uint inclusive = simd_prefix_inclusive_sum(equal);
-  if (lane == 31) simd_counts[sg] = inclusive;
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  uint before = inclusive - equal;
-  for (uint g = 0; g < sg; ++g) before += simd_counts[g];
-  for (uint w = w0; w < w1; ++w) {
-    uint word = 0;
-    for (uint i = 0; i < 32; ++i) {
-      const uint b = w * 32 + i;
-      if (b >= complete) break;
-      const uint v = as_type<uint>(s[b]) & prefix_mask;
-      bool take = v > prefix;
-      if (v == prefix) {
-        take = before < wanted;
-        ++before;
+    all = threshold[2];
+    // The first pass's bin, if it holds fewer than kCandidates scores, for
+    // the passes after it.
+    if (high == 30 && !all && atomic_load_explicit(&histogram[threshold[0]], memory_order_relaxed) <= kCandidates) {
+      if (tid == 0) atomic_store_explicit(&candidate_count, 0u, memory_order_relaxed);
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      for (uint b = tid; b < complete; b += kSelectThreads) {
+        const uint v = as_type<uint>(s[b]);
+        if ((v & prefix_mask) == prefix)
+          candidates[atomic_fetch_add_explicit(&candidate_count, 1u, memory_order_relaxed)] = v;
       }
-      if (take) word |= 1u << i;
+      gathered = true;
     }
-    // The tail block, from the thread that writes its word: a threadgroup
-    // barrier does not order another thread's device stores.
-    if (w == complete / 32) word |= 1u << (complete % 32);
-    bits[w] = word;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
   }
-  // Past the complete blocks: the tail block when it starts a word, then
-  // nothing.
-  for (uint w = words + tid; w < p.mask_words; w += kThreads)
-    bits[w] = w == complete / 32 ? 1u << (complete % 32) : 0u;
+  // Each simdgroup writes a run of whole words, a ballot of 32 consecutive
+  // scores each. Unless every score equal to the threshold is taken, a pass
+  // first counts each run's, so that the earliest are.
+  constexpr uint kSimdgroups = kSelectThreads / 32;
+  const uint per = (words + kSimdgroups - 1) / kSimdgroups;
+  const uint w0 = min(sg * per, words), w1 = min(w0 + per, words);
+  uint before = 0;
+  if (!all) {
+    uint equal = 0;
+    for (uint w = w0; w < w1; ++w) {
+      const uint b = w * 32 + lane;
+      equal += b < complete && (as_type<uint>(s[b]) & prefix_mask) == prefix ? 1u : 0u;
+    }
+    equal = simd_sum(equal);
+    if (lane == 0) simd_counts[sg] = equal;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint g = 0; g < sg; ++g) before += simd_counts[g];
+  }
+  for (uint w = w0; w < w1; ++w) {
+    const uint b = w * 32 + lane;
+    const uint v = b < complete ? as_type<uint>(s[b]) & prefix_mask : 0u;
+    const bool equal = b < complete && v == prefix;
+    const uint equals = uint(static_cast<simd_vote::vote_t>(simd_ballot(equal)));
+    const bool take =
+        (b < complete && v > prefix) || (equal && (all || before + popcount(equals & ((1u << lane) - 1u)) < wanted));
+    uint word = uint(static_cast<simd_vote::vote_t>(simd_ballot(take)));
+    if (w == complete / 32) word |= 1u << (complete % 32);
+    if (lane == 0) bits[w] = word;
+    before += popcount(equals);
+  }
 }

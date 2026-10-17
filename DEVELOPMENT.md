@@ -2083,7 +2083,9 @@ keys, pools the blocks they complete from its rows' keys and, for the tokens
 of a block before its first row, the sequence's pending keys, scores every
 complete block for each row in one MPP product per tile of 8 rows by 32
 blocks, and selects each row's blocks into a bitmap by a radix select of its
-scores, 11 bits a pass (`kernels/shared/qwen4_qsa.metal`). The pending keys,
+scores, 11 bits a pass, the first over the row and the later ones over the
+threshold bin's scores in threadgroup memory, the bitmap written a word per
+simdgroup from ballots (`kernels/shared/qwen4_qsa.metal`). The pending keys,
 the raw keys of the up to 3 tokens of the block a sequence has not completed,
 are its state's (after the PLE history in a state cell,
 `QwenTargetDimensions::indexerPendingBytes`): a prefill writes them after its
