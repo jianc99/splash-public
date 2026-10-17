@@ -128,6 +128,8 @@ class RealServer:
             command.extend(("--ple-memory", arguments.ple_memory))
         if arguments.expert_memory is not None:
             command.extend(("--expert-memory", arguments.expert_memory))
+        if arguments.yarn_factor is not None:
+            command.extend(("--yarn-factor", str(arguments.yarn_factor)))
         if cache_dir is not None:
             command.extend(("--persistent-cache", "--cache-dir", str(cache_dir)))
         if arguments.max_image_pixels is not None:
@@ -1701,6 +1703,11 @@ def add_server_arguments(parser):
         "--expert-memory",
         help="serve a MoE model's routed experts from RAM slots of this size in "
         "all, reading the others from the SSD (splash serve --expert-memory)",
+    )
+    parser.add_argument(
+        "--yarn-factor",
+        type=serve_options.parse_yarn_factor,
+        help="serve with YaRN by this factor (splash serve --yarn-factor)",
     )
     parser.add_argument("--max-image-pixels", type=int)
     parser.add_argument("--kv-format", choices=("int8", "bf16"), default="int8")
