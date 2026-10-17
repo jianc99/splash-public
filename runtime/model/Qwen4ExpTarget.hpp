@@ -53,6 +53,10 @@ public:
   // row's heads' in order.
   [[nodiscard]] std::vector<uint32_t> verifyPleRows(uint32_t lane) const;
 
+private:
+  // The shared prefill's layer loop runs the family's (QwenTarget::addPrefillLayers).
+  friend class QwenTarget;
+
   // A prefill chunk's step: the shared one, the chunk's scratch, the QSA
   // blocks each sequence's rows complete, where each attention layer's QSA
   // index sits in the KV extents, and the block output the streams have not
@@ -63,17 +67,15 @@ public:
     std::span<const ops::QsaIndex> qsaIndex{};
     ops::HyperBranch pending{};
   };
-  // The family's prefill layers (QwenTarget::addPrefillLayers). The streams
-  // start as the embedding's rows; every MoE adds its rows to zeros into the
-  // branch the combine adds to the streams; the final mix goes into
-  // buffers.hidden[1].
+  // The family's prefill layers. The streams start as the embedding's rows;
+  // every MoE adds its rows to zeros into the branch the next mix adds to the
+  // streams; the final mix goes into buffers.hidden[1].
   void addPrefillBegin(PrefillStep &step) const;
   void addPrefillLayer(PrefillStep &step, uint32_t index) const;
   [[nodiscard]] const ops::BlockMoeWeights *moe(uint32_t index) const;
   void addPrefillExperts(PrefillStep &step, uint32_t index) const;
   [[nodiscard]] metal::MetalBuffer addPrefillEnd(PrefillStep &step) const;
 
-private:
   // A verify step: the shared one, its scratch, the QSA blocks its lanes
   // complete, where each attention layer's QSA index sits and the block
   // output the streams have not taken yet.

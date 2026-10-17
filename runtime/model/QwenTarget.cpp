@@ -413,7 +413,10 @@ public:
                         normalized);
   }
 
-  // The family's prefill layers (QwenTarget::addPrefillLayers).
+private:
+  // The shared prefill's layer loop runs the family's (QwenTarget::addPrefillLayers).
+  friend class QwenTarget;
+
   void addPrefillBegin(PrefillStep &) const {}
   void addPrefillLayer(PrefillStep &step, uint32_t index) const {
     const Layer &layer = weights_.layers[index];
@@ -441,7 +444,6 @@ public:
     return step.buffers.hidden[geometry_.layers & 1];
   }
 
-private:
   // The FFN of layer `index`, of the RMS norm of the mixer's `residual` rows,
   // adding to them into `output`: a dense FFN, or a MoE's routing, whose
   // routed work addPrefillExperts adds.
