@@ -1,12 +1,13 @@
 // The GGUF image planner on the small dense and MoE targets, a rotated dense
 // one and a small Flash-Next one: where each tensor goes and in which row
 // order, which F32 tensors it narrows to bf16, which float projections it
-// quantizes to Q8_0, where a streamed table's rows are, and the sources it
-// refuses.
+// quantizes to Q8_0, where a streamed table's rows are, which part of a split
+// GGUF each tensor is read from, and the sources it refuses.
 //   gguf-planner
 #include "GgufFixtures.hpp"
 #include "metal/abi/Gguf.h"
 #include "model/GgufPreparation.hpp"
+#include "model/GgufTarget.hpp"
 #include "model/Qwen4Exp.hpp"
 
 #include <fcntl.h>
@@ -673,6 +674,98 @@ void checkPleTable(const std::filesystem::path &directory) {
   check(names(plan(path, g), {"ple.layers"}), "planner refuses a GGUF that declares another PLE layer");
 }
 
+// The dense target split in two as llama.cpp's gguf-split writes it, half
+// its tensors in each part, last part written first: findTargetGgufs takes
+// the parts in split order, past a file that is not a GGUF, and refuses
+// another GGUF beside them or parts of another count. The plan of the parts
+// writes the whole file's images, each tensor read from the part that holds
+// it, at its offset in that part.
+void checkSplit(const std::filesystem::path &directory) {
+  SmallTarget target = smallTarget(false);
+  const model::QwenTargetDimensions &g = target.geometry;
+  const auto whole = directory / "whole.gguf";
+  writeGguf(whole, target.tensors, g);
+  const auto split = directory / "split";
+  std::filesystem::create_directory(split);
+  const std::vector<std::filesystem::path> parts{split / "target-00001-of-00002.gguf",
+                                                 split / "target-00002-of-00002.gguf"};
+  const auto half = target.tensors.begin() + target.tensors.size() / 2;
+  const std::vector<Tensor> held[2]{{target.tensors.begin(), half}, {half, target.tensors.end()}};
+  std::map<std::string, uint32_t> partOf;
+  for (uint16_t number : {1, 0}) {
+    std::vector<test_gguf::Key> keys = number ? std::vector<test_gguf::Key>{} : metadata(g);
+    for (test_gguf::Key &key : test_gguf::splitKeys(number, 2, int32_t(target.tensors.size())))
+      keys.push_back(std::move(key));
+    splash::test::writeFile(parts[number], test_gguf::file(keys, held[number]));
+    for (const Tensor &tensor : held[number]) partOf[tensor.name] = number;
+  }
+  splash::test::writeFile(split / "target-00002-of-00002.gguf.incomplete", "a download in progress");
+  check(model::findTargetGgufs(split) == parts, "findTargetGgufs takes a split GGUF's parts in split order");
+  const auto refused = [&] {
+    try {
+      (void)model::findTargetGgufs(split);
+    } catch (const model::GgufError &error) {
+      return std::string_view(error.what()).find("not the parts of one split GGUF") != std::string_view::npos;
+    }
+    return false;
+  };
+  std::filesystem::copy_file(whole, split / "whole.gguf");
+  check(refused(), "findTargetGgufs refuses another GGUF beside a split GGUF's parts");
+  std::filesystem::remove(split / "whole.gguf");
+  std::filesystem::rename(parts[1], split / "target-00002-of-00003.gguf");
+  check(refused(), "findTargetGgufs refuses the parts of a split GGUF of another count");
+  std::filesystem::rename(split / "target-00002-of-00003.gguf", parts[1]);
+
+  // Both plans read their files, which stay open.
+  const model::OpenGguf wholeGguf({whole}), splitGguf(model::findTargetGgufs(split));
+  const model::GgufFile &file = splitGguf.file();
+  const std::vector<model::gguf::Image> reference = model::gguf::planImages(wholeGguf.file(), architecture(g), g),
+                                        images = model::gguf::planImages(file, architecture(g), g);
+  // Whether a source of the parts' plan reads the part that holds its
+  // tensor, whose bytes are at the source's offset in that part.
+  bool partRead[2]{};
+  const auto fromItsPart = [&](const model::gguf::TensorRows &rows) {
+    const uint32_t number = partOf.at(rows.name);
+    const test_gguf::Bytes &data = target.data(rows.name);
+    test_gguf::Bytes read(data.size());
+    if (rows.file != &file.source(number)) return false;
+    rows.file->readData(rows.offset, read);
+    partRead[number] = true;
+    return read == data;
+  };
+  bool same = images.size() == reference.size();
+  for (size_t index = 0; same && index < images.size(); ++index) {
+    const model::gguf::Image &image = images[index], &expected = reference[index];
+    same = image.name == expected.name && image.bytes == expected.bytes &&
+           image.fills.size() == expected.fills.size() && image.copies.size() == expected.copies.size() &&
+           image.repacks.size() == expected.repacks.size();
+    for (size_t fill = 0; same && fill < image.fills.size(); ++fill)
+      same = image.fills[fill].offset == expected.fills[fill].offset &&
+             image.fills[fill].bytes == expected.fills[fill].bytes;
+    for (size_t copy = 0; same && copy < image.copies.size(); ++copy)
+      same = image.copies[copy].destination == expected.copies[copy].destination &&
+             image.copies[copy].source.name == expected.copies[copy].source.name &&
+             fromItsPart(image.copies[copy].source);
+    for (size_t at = 0; same && at < image.repacks.size(); ++at) {
+      const model::gguf::Repack &repack = image.repacks[at], &wholeRepack = expected.repacks[at];
+      uint64_t rows = 0;
+      for (const model::gguf::TensorRows &source : repack.sources) rows += source.rows;
+      same = repack.format == wholeRepack.format && repack.columns == wholeRepack.columns &&
+             repack.plane0 == wholeRepack.plane0 && repack.sources.size() == wholeRepack.sources.size() &&
+             std::all_of(repack.sources.begin(), repack.sources.end(), fromItsPart);
+      if (!same) break;
+      // The rows the GPU repacks, which each source reads from its file.
+      std::vector<uint8_t> read(rows * model::ggufRowBytes(kQuantFormats[repack.format], repack.columns)),
+          wholeRead(read.size());
+      model::readRepackRows(repack, 0, rows, read.data());
+      model::readRepackRows(wholeRepack, 0, rows, wholeRead.data());
+      same = read == wholeRead;
+    }
+  }
+  check(same && partRead[0] && partRead[1],
+        "planner reads each tensor of a split GGUF from its part into the whole file's images");
+}
+
 } // namespace
 
 int main() {
@@ -686,6 +779,7 @@ int main() {
     guarded("planner on a streamed PLE table", [&] { checkPleTableRows(directory.path()); });
     guarded("planner on Flash-Next hyper-connections", [&] { checkHyperConnections(directory.path()); });
     guarded("planner on Flash-Next's PLE table", [&] { checkPleTable(directory.path()); });
+    guarded("planner on a split GGUF", [&] { checkSplit(directory.path()); });
     std::printf("%s (%d failures)\n", failures ? "GGUF planner tests FAILED" : "GGUF planner tests passed", failures);
     return failures ? 1 : 0;
   }
