@@ -3011,7 +3011,12 @@ int main(int argc, char **argv) {
     // state is also rounded where the first commit stores it, which the rows
     // after it carry through the model, and a mixture of experts amplifies
     // (convolution cosine 0.998 on the 35B): its bound is looser, and the FP32
-    // run holds the partition itself to the tight one.
+    // run holds the partition itself to the tight one. A sparse MoE target's
+    // partitions take the looser bound too where their expert tiles summed the
+    // rows in other orders (an expert's tile of few rows runs the column tile,
+    // moe_column_tile), which leaves the KV the two wrote unlike: 0.998 again
+    // on the 35B's UD-Q2_K_XL (12-core M6) and 0.9987 on its UD-Q4_K_M
+    // (20-core M5 Pro) with an FP32 state.
     const std::vector<uint32_t> prompt16{
         248045, 8678, 198,   24342, 286,  4879, 369,   716,
         310,    830,  11553, 13,    5044, 1683, 15060, 1472};
@@ -3033,6 +3038,15 @@ int main(int argc, char **argv) {
 
     const model::QwenLaneMetadata &baselineMetadata = states.metadata(2);
     const model::QwenLaneMetadata &partitionedMetadata = states.metadata(3);
+    bool partitionKvAlike = true;
+    {
+      const auto left = pages.spans(baselinePages[0]), right = pages.spans(partitionedPages[0]);
+      for (size_t tensor = 0; tensor < left.size() && partitionKvAlike; ++tensor)
+        partitionKvAlike = left[tensor].size() == right[tensor].size() &&
+                           std::memcmp(left[tensor].data(), right[tensor].data(), left[tensor].size()) == 0;
+    }
+    const bool sparseMoe = std::visit(
+        [](const auto &weights) { return weights.layout.ffnKind == model::QwenFfnKind::SparseMoe; }, model.target);
     require(baselineMetadata.lengths == partitionedMetadata.lengths &&
                 baselineMetadata.lengths.targetTokens == prompt16.size(),
             "partitioned prefill logical state diverged");
@@ -3056,8 +3070,8 @@ int main(int argc, char **argv) {
                .rightNorm
         << " recurrent_cos=" << recurrent.cosine
         << " recurrent_norms=" << recurrent.leftNorm << '/'
-        << recurrent.rightNorm << '\n';
-    const double bound = bfloatState ? 0.99 : 0.999;
+        << recurrent.rightNorm << " kv_alike=" << partitionKvAlike << '\n';
+    const double bound = bfloatState || (sparseMoe && !partitionKvAlike) ? 0.99 : 0.999;
     require(convolution.cosine > bound && recurrent.cosine > bound,
             "partitioned prefill numerical state diverged");
 
@@ -3978,7 +3992,11 @@ int main(int argc, char **argv) {
     // rows computed alike, which a dense target's always do: a MoE target's
     // expert tiles follow the routes the command makes to them (an expert's
     // tile of few rows sums in the column tile's order), which the other
-    // prompts move.
+    // prompts move, so where they leave its KV unlike its logits hold to that
+    // rounding alone: the same best option, each logit within
+    // kSparseMoeScoreTolerance of its own, relative to the larger of 1 and the
+    // logit (0.131 on the 35B's UD-Q2_K_XL on a 12-core M6, 0.086 on its
+    // UD-Q4_K_M on a 20-core M5 Pro).
     {
       constexpr uint32_t kScoredRow = 0, kGreedy = 1, kOpen = 2, kSampled = 3;
       // The score lane's KV pages (pageRange(52, 2)) as a command left them.
@@ -4053,15 +4071,22 @@ int main(int argc, char **argv) {
           executor.end(request.id);
         return std::pair{results, scoredKv()};
       };
-      const auto sameScores = [](const ModelStepResult &left,
-                                 const ModelStepResult &right,
-                                 const char *message) {
+      // The largest difference of two score lanes' option logits, relative to
+      // the larger of 1 and the logit.
+      const auto scoreDifference = [](const ModelStepResult &left,
+                                      const ModelStepResult &right) {
         require(left.scoreLogits.size() == 3 && right.scoreLogits.size() == 3,
                 "the score lane of a shared head returned no logits");
+        float difference = 0.0F;
         for (uint32_t option = 0; option < 3; ++option)
-          require(std::fabs(left.scoreLogits[option] - right.scoreLogits[option]) <=
-                      1e-3F * std::max(1.0F, std::fabs(right.scoreLogits[option])),
-                  message);
+          difference = std::max(difference, std::fabs(left.scoreLogits[option] - right.scoreLogits[option]) /
+                                                std::max(1.0F, std::fabs(right.scoreLogits[option])));
+        return difference;
+      };
+      const auto sameScores = [&](const ModelStepResult &left,
+                                  const ModelStepResult &right,
+                                  const char *message) {
+        require(scoreDifference(left, right) <= 1e-3F, message);
       };
       const auto [inOrder, inOrderKv] =
           prefillInOrder({kScoredRow, kGreedy, kOpen, kSampled}, false);
@@ -4079,13 +4104,19 @@ int main(int argc, char **argv) {
       const auto [others, othersKv] =
           prefillInOrder({kScoredRow, kGreedy, kOpen, kSampled}, true);
       const bool alike = othersKv == inOrderKv;
-      const bool sparseMoe = std::visit(
-          [](const auto &weights) { return weights.layout.ffnKind == model::QwenFfnKind::SparseMoe; }, model.target);
       require(alike || sparseMoe, "a dense target's score lane computed its rows otherwise beside other prompts");
+      const float difference = scoreDifference(others[kScoredRow], inOrder[kScoredRow]);
+      const auto best = [](const ModelStepResult &result) {
+        return std::max_element(result.scoreLogits.begin(), result.scoreLogits.end()) - result.scoreLogits.begin();
+      };
+      constexpr float kSparseMoeScoreTolerance = 0.25F;
       if (alike)
         sameScores(others[kScoredRow], inOrder[kScoredRow],
                    "a score lane's logits changed with the other lanes' prompts");
-      std::cout << "shared_head other_prompts_kv_alike=" << alike << '\n';
+      else
+        require(best(others[kScoredRow]) == best(inOrder[kScoredRow]) && difference <= kSparseMoeScoreTolerance,
+                "a sparse MoE score lane's logits left the expert tiles' rounding beside the other lanes' prompts");
+      std::cout << "shared_head other_prompts_kv_alike=" << alike << " score_difference=" << difference << '\n';
     }
 
     constexpr std::array<uint64_t, 4> productionB4Ids{71, 72, 73, 74};
