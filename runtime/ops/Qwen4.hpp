@@ -2,7 +2,8 @@
 
 // Qwen3.8-Flash-Next's QSA indexer, which picks the blocks its
 // full-attention layers attend (kernels/shared/qwen4_qsa.metal). Its
-// projections run through ops::Linear.
+// projections run through ops::Linear; model/Qwen4ExpTarget.cpp composes
+// them.
 
 #include "metal/CommandGraph.hpp"
 #include "metal/abi/Qwen4.h"

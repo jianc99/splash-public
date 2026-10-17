@@ -1,4 +1,8 @@
 #include "model/Runtime.hpp"
+#ifdef SPLASH_RUNTIME_INSTRUMENTATION
+#include "model/Qwen4ExpTarget.hpp"
+#include "model/RuntimeInstrumentation.hpp"
+#endif
 #include "AwakeClock.hpp"
 #include "model/QwenState.hpp"
 #include "model/QwenTarget.hpp"
@@ -198,6 +202,7 @@ QwenTargetPrefillBuffers prefillBuffers(const PrefillArena &arena, uint32_t chun
   buffers.attentionOutput = arena.get(PrefillTensor::AttentionOutput, chunk);
   buffers.ropeCos = arena.get(PrefillTensor::RopeCos, chunk);
   buffers.ropeSin = arena.get(PrefillTensor::RopeSin, chunk);
+  buffers.ropeInverseFrequencies = arena.get(PrefillTensor::TargetInverseFrequencies);
   buffers.chunkKeys = arena.get(PrefillTensor::ChunkKeys);
   buffers.chunkValues = arena.get(PrefillTensor::ChunkValues);
   buffers.moe = arena.moeScratch(chunk);
@@ -1793,6 +1798,7 @@ struct Runtime::Impl {
     buffers.attentionOutput = d(DecodeTensor::AttentionOutput);
     buffers.ropeCos = d(DecodeTensor::RopeCos);
     buffers.ropeSin = d(DecodeTensor::RopeSin);
+    buffers.ropeInverseFrequencies = prefillArena->get(PrefillTensor::TargetInverseFrequencies);
     buffers.capturedTargetHidden = d(DecodeTensor::CapturedTargetHidden);
     buffers.finalHidden = d(DecodeTensor::FinalHidden);
     buffers.logits = d(DecodeTensor::Logits);
@@ -3177,5 +3183,18 @@ ModelMemoryPlan plannedRuntimeMemory(const LoadedModel &model,
 std::unique_ptr<RuntimeModel> createRuntime(RuntimeContext context) {
   return std::make_unique<Runtime>(std::move(context));
 }
+
+#ifdef SPLASH_RUNTIME_INSTRUMENTATION
+std::vector<uint32_t> RuntimeInstrumentation::lastPleRows(const Runtime &runtime, uint32_t lane) {
+  const auto *target = dynamic_cast<const Qwen4ExpTarget *>(runtime.impl_->targetModel.get());
+  return target ? target->verifyPleRows(lane) : std::vector<uint32_t>{};
+}
+
+std::span<const float> RuntimeInstrumentation::lastLogits(const Runtime &runtime, uint32_t lane) {
+  const Runtime::Impl &impl = *runtime.impl_;
+  return {contents<float>(impl.decodeArena->get(lane, DecodeTensor::Logits), "logits"),
+          uint64_t{ExecutionLimits::targetVerifyRows} * impl.geometry.target.vocabularySize};
+}
+#endif
 
 } // namespace splash::model

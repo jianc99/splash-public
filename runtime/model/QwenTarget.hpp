@@ -141,9 +141,14 @@ struct QwenTargetGeometry final : QwenTargetDimensions {
     if (found == layers.end()) return std::nullopt;
     return static_cast<uint32_t>(found - layers.begin());
   }
+  // Whether a layer's mixer adds its output to the layer's input rows, which
+  // its FFN then adds to; the mixers of a target whose residual is
+  // hyper-connected streams write their output to a branch of the target's
+  // own scratch instead (qwenTargetScratchBytes).
+  [[nodiscard]] constexpr bool mixersAddToHidden() const noexcept { return !hyperConnections; }
   [[nodiscard]] constexpr ops::GdnShape gdnShape() const noexcept {
     return {gdnKeyHeads, gdnValueHeads, gdnHeadDimension,
-            convolutionDimension, packedGdnWidth};
+            convolutionDimension, packedGdnWidth, gdnSigmoidGate};
   }
   // The layout itself was checked by requireQwenLayout when the target
   // loaded. The draft reads 1 to ExecutionLimits::maximumDraftTargetLayers
@@ -249,6 +254,8 @@ struct QwenTargetPrefillBuffers final {
   metal::MetalBuffer attentionOutput;
   metal::MetalBuffer ropeCos;
   metal::MetalBuffer ropeSin;
+  // The RoPE inverse frequencies the tables were made of (rotaryPairs).
+  metal::MetalBuffer ropeInverseFrequencies;
   metal::MetalBuffer chunkKeys;
   metal::MetalBuffer chunkValues;
   ops::MoeScratch moe;
@@ -283,6 +290,7 @@ struct QwenTargetVerifyBuffers final {
   metal::MetalBuffer attentionOutput;
   metal::MetalBuffer ropeCos;
   metal::MetalBuffer ropeSin;
+  metal::MetalBuffer ropeInverseFrequencies;
   metal::MetalBuffer capturedTargetHidden;
   metal::MetalBuffer finalHidden;
   metal::MetalBuffer logits;
@@ -329,7 +337,7 @@ template <class Layer> [[nodiscard]] const ops::BlockMoeWeights *qwenMoeBlock(co
 
 // The projections a family's layers and head dispatch beyond their mixers'
 // and MoE blocks' (qwenTargetGeometry): Qwen3.8-27B's dense FFN; the
-// Qwen3.6-35B-A3B's none.
+// Qwen3.6-35B-A3B's none (Qwen3.8-Flash-Next's: model/Qwen4Exp.hpp).
 void includeFamilyProjections(QwenTargetGeometry &geometry,
                               const QwenTargetWeights<Qwen3_8Layout, Qwen3_8LayerWeights> &weights);
 void includeFamilyProjections(QwenTargetGeometry &geometry,
@@ -363,7 +371,7 @@ template <class Weights>
 // mixers (one wiring each for prefill and for verify), the draft's captures
 // and the head's projection; each family composes them into its layers and
 // residual: the Qwen3.5 architecture's (Qwen3.8-27B and Qwen3.6-35B-A3B,
-// model/QwenTarget.cpp).
+// model/QwenTarget.cpp) and Qwen3.8-Flash-Next's (model/Qwen4ExpTarget.cpp).
 // A family that needs more of a step than the buffers the runtime binds
 // keeps that scratch itself (qwenTargetScratchBytes) and makes its own
 // inputs of the step's tokens; the runtime calls the same functions for
