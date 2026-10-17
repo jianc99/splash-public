@@ -48,8 +48,9 @@ inline float hyper_combined(float x, bfloat b, float w) { return x + float(b) * 
 // for Flash-Next's shape, kStreams streams of kNormHidden values. Each takes
 // every load of a pass before the pass's arithmetic: at decode's few rows, a
 // threadgroup per row that waits on each load in turn runs latency-bound.
-// The two sum alike, so a row's streams, output and weights are bit for bit
-// the same whichever of them runs it.
+// The two sum alike, the same values in the same order (reassociation off),
+// so a row's streams, output and weights are bit for bit the same whichever
+// of them runs it.
 constant constexpr uint kNormHidden = HYPER_CONNECTION_NORM_HIDDEN;
 constant constexpr uint kNormValues = kNormHidden / kRowThreads; // per thread and stream
 static_assert(kNormHidden % kRowThreads == 0, "a thread's values per stream are whole");
@@ -63,6 +64,7 @@ inline void hyper_norm_loaded_row(device float *streams, device const float *nor
                                   device const float *branch_weights, device bfloat *table,
                                   device float *table_sums, constant HyperConnectionParams &p, uint row, uint tid,
                                   uint lane, uint sg, threadgroup float *scratch) {
+#pragma clang fp reassociate(off)
   if (row >= p.rows) return;
   const uint width = kStreams * kNormHidden;
   device float *x = streams + ulong(row) * width;
@@ -118,6 +120,7 @@ inline void hyper_norm_quarter_row(device float *streams, device const float *no
                                    device float *table_sums, constant HyperConnectionParams &p, uint row,
                                    uint thread_id, uint lane, uint simdgroup, threadgroup float *scratch,
                                    threadgroup float *scales) {
+#pragma clang fp reassociate(off)
   if (row >= p.rows) return;
   const uint q = thread_id / kRowThreads, tid = thread_id % kRowThreads;
   const uint width = kStreams * kNormHidden;

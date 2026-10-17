@@ -17,6 +17,7 @@ constant constexpr uint kStreams = HYPER_CONNECTION_MAXIMUM_STREAMS;
 // The sums of `values` (one per stream) over the threadgroup, in every thread.
 inline void reduce_streams(thread float (&values)[kStreams], uint streams, threadgroup float *scratch,
                            uint lane, uint sg) {
+#pragma clang fp reassociate(off)
   for (uint s = 0; s < streams; ++s) {
     const float sum = simd_sum(values[s]);
     if (lane == 0) scratch[sg * kStreams + s] = sum;
