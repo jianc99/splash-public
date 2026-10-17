@@ -190,6 +190,14 @@ void testPersistentCacheNamespace() {
   // Factors that print alike to six digits still rotate keys differently.
   require(scaled(3.9999999) != scaled(4.0) && scaled(1.0000001) != scaled(1.0000004),
           "factors alike to six digits shared a cache namespace");
+  // A sparse-attention layout's pages hold token-major values and an index of
+  // pooled keys.
+  RuntimeCacheIdentity tokenMajor = identity('a', "build", kv::Format::Int8), indexed = tokenMajor;
+  tokenMajor.kvLayout.valuesTokenMajor = true;
+  indexed.kvLayout.indexDimension = 128;
+  require(persistentCacheNamespace(tokenMajor, model.stateLayout) != name &&
+              persistentCacheNamespace(indexed, model.stateLayout) != name,
+          "token-major values or an index shared a dense layout's cache namespace");
 }
 
 void testWeightBudgetBeforeLoading(const char *metallibPath) {
