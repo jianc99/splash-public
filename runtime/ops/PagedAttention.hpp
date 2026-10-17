@@ -104,11 +104,9 @@ struct AttentionWorkspace final {
 // encoding. Each prefill uses one split dispatch followed by one reduction.
 // Callers cannot replace a dispatch or reduce its scratch bound.
 struct PrefillAttentionPlan final {
-  // The rows of a query tile; the plan's rows fill `tiles` of them, the last
-  // holding the rest. A sparse plan's tile t attends through list t of its
-  // block lists (AttentionBlocks), which addBlockLists makes in tiles of as
-  // many rows.
-  static constexpr uint32_t tileRows = kv::kPrefillAttentionTileRows;
+  // The plan's rows fill `tiles` query tiles of kPrefillAttentionTileRows
+  // rows, the last holding the rest; a sparse plan's tile t attends through
+  // list t of its block lists (AttentionBlocks, addBlockLists).
   const kv::Layout layout;
   const uint32_t queryHeads;
   const uint32_t rows;
@@ -295,12 +293,12 @@ public:
   // One dispatch of the block lists of up to a batch of sequences of query
   // rows, whose block masks are rows of `mask`, `maskWords` words each
   // (metal/abi/PagedAttention.h) that cover each sequence's history: each
-  // sequence's tiles of `tileRows` rows, its tile t's list into list
-  // blocks.list + its list + t. A list holds at most blocks.stride entries,
-  // which the masks' rows must keep to.
+  // sequence's tiles of the attention's rows (a verify lane's, as many as a
+  // prefill tile's), its tile t's list into list blocks.list + its list + t.
+  // A list holds at most blocks.stride entries, which the masks' rows must
+  // keep to.
   static void addBlockLists(metal::CommandGraph &graph, const metal::MetalBuffer &mask, uint32_t maskWords,
-                            std::span<const BlockListRows> sequences, uint32_t tileRows,
-                            const AttentionBlocks &blocks);
+                            std::span<const BlockListRows> sequences, const AttentionBlocks &blocks);
 };
 
 } // namespace splash::ops

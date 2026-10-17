@@ -335,7 +335,7 @@ void run(const std::string &metallib) {
                     indexed.indexOffset(11) == indexed.indexOffset(0) + uint64_t{11} * extent * 2048 &&
                     indexed.indexOffset(0) % kv::kExtentRegionAlignmentBytes == 0,
                 "a QSA index region is misplaced");
-        rejects([&] { (void)indexed.indexOffset(12); }, "KV layer has no QSA index region",
+        rejects([&] { (void)indexed.indexOffset(12); }, "KV layer has no index region",
                 "a layer past the layout had an index region");
         requireSpansTileExtent(indexed, 0);
         const auto fill = [&](uint32_t page, std::byte value) {
@@ -354,7 +354,7 @@ void run(const std::string &metallib) {
         require(holdsAll(3, std::byte{0}), "a cleared page kept its pooled keys");
     }
     rejects([&] { (void)kv::PageStorage(backend, governor.allocationAdmission(), kvLayout, 256, 128).indexOffset(0); },
-            "KV layer has no QSA index region", "a layout without an index had an index region");
+            "KV layer has no index region", "a layout without an index had an index region");
     std::cout << "KV page storage tests passed\n";
 }
 

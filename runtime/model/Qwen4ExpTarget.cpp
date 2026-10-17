@@ -227,7 +227,6 @@ std::vector<ops::AttentionBlocks> Qwen4ExpTarget::addPrefillQsa(PrefillStep &ste
   }
   if (!sparseRows.empty())
     ops::PagedAttention::addBlockLists(step.graph, h.qsaMask, h.maskWords, sparseRows,
-                                       ops::PrefillAttentionPlan::tileRows,
                                        {h.qsaLists, h.qsaListCounts, h.listStride, 0});
   return blocks;
 }
@@ -300,7 +299,7 @@ ops::AttentionBlocks Qwen4ExpTarget::addVerifyQsa(VerifyStep &step, const Qwen4I
   for (uint32_t lane = 0; lane < step.lanes; ++lane)
     laneLists[lane] = {lane * kVerifyRows, kVerifyRows, firstPositions[lane], lane};
   ops::PagedAttention::addBlockLists(step.graph, h.qsaMask, h.maskWords, std::span(laneLists).first(step.lanes),
-                                     kVerifyRows, blocks);
+                                     blocks);
   return blocks;
 }
 

@@ -128,7 +128,7 @@ void PageStorage::clearPages(std::span<const uint32_t> pages) {
 
 uint32_t PageStorage::indexOffset(uint32_t layer) const {
     if (!layout_.indexDimension || layer >= layout_.attentionLayers)
-        throw std::out_of_range("KV layer has no QSA index region");
+        throw std::out_of_range("KV layer has no index region");
     // After every layer's K/V region, a region per layer.
     const uint64_t first = uint64_t{extentPages_} * layout_.attentionLayers * layout_.bytesPerLayerPage();
     return static_cast<uint32_t>(first + uint64_t{extentPages_} * layer * layout_.indexBytesPerLayerPage());

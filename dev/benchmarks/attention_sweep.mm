@@ -334,8 +334,7 @@ metal::CommandGraph caseGraph(const AttentionFixture &fixture, bool prefill, con
     std::vector<BlockListRows> sequences;
     for (uint32_t lane = 0; lane < plan.lanes; ++lane)
       sequences.push_back({lane * plan.rows, plan.rows, plan.histories[lane], lane});
-    PagedAttention::addBlockLists(graph, qsa.bitmaps, qsa.words, sequences,
-                                  prefill ? kv::kPrefillAttentionTileRows : kVerifyRows, qsa.blocks);
+    PagedAttention::addBlockLists(graph, qsa.bitmaps, qsa.words, sequences, qsa.blocks);
   }
   if (prefill)
     fixture.addGraph(graph,

@@ -3,8 +3,8 @@
 
 // Sparse attention (metal/abi/PagedAttention.h): the block lists a tile's rows'
 // block masks make, and the split and reduce entries that attend through
-// them, for the GQA group of twelve over two KV heads (Qwen3.8-Flash-Next's
-// QSA), whose KV layout keeps values token-major.
+// them, for the GQA group of twelve over two KV heads on a KV layout that
+// keeps values token-major (Qwen3.8-Flash-Next's, for one).
 
 // Threadgroup per tile, group.x the tile and group.y the sequence
 // (SplashAttentionBlockListParams): only the blocks of the tile's history are

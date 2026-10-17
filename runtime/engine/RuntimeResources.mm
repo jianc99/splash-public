@@ -5,6 +5,7 @@
 #include "engine/DiskLabels.hpp"
 #include "engine/Engine.hpp"
 #include "metal/abi/ExecutionGeometry.h"
+#include "metal/abi/PagedAttention.h"
 #include "model/ExpertStore.hpp"
 #include "model/WeightStore.hpp"
 #include "ops/AneFfnMeasurement.hpp"
@@ -281,9 +282,11 @@ std::string persistentCacheNamespace(const RuntimeCacheIdentity &identity,
             // Dimension-major values add nothing, so dense layouts keep the
             // caches they wrote.
             << (kv.valuesTokenMajor ? " values-token-major" : "");
-  // A QSA index's pooled keys, bf16 (kv::Layout::indexDimension). A change
-  // to how a block's key is pooled, normalized or rotated changes this line.
-  if (kv.indexDimension) canonical << " qsa-pooled " << kv.indexDimension << " bf16";
+  // A block index's pooled keys (kv::Layout::indexDimension), bf16, one a
+  // block of SPLASH_ATTENTION_BLOCK_TOKENS tokens. A change to how a block's
+  // key is pooled, normalized or rotated changes this line.
+  if (kv.indexDimension)
+    canonical << " index " << kv.indexDimension << " bf16 block " << SPLASH_ATTENTION_BLOCK_TOKENS;
   canonical << '\n'
             << "gdn " << gdn.layers << ' ' << gdn.convolutionHistory << ' '
             << gdn.convolutionChannels << ' ' << gdn.recurrentGroups << ' ' << gdn.recurrentRows

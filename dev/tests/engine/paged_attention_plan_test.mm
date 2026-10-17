@@ -581,8 +581,7 @@ std::vector<uint16_t> run(metal::MetalBackend &backend, Case &data, bool testBou
     std::vector<ops::BlockListRows> sequences;
     for (uint32_t lane = 0; lane < data.lanes; ++lane)
       sequences.push_back({lane * data.rows, data.rows, data.stores[lane].committed_tokens, lane});
-    ops::PagedAttention::addBlockLists(graph, masks, data.maskWords, sequences,
-                                       prefill ? kv::kPrefillAttentionTileRows : kv::kVerifyRows, blocks);
+    ops::PagedAttention::addBlockLists(graph, masks, data.maskWords, sequences, blocks);
   }
   const size_t first = graph.dispatches().size();
   if constexpr (prefill) {
@@ -1044,27 +1043,27 @@ void attentionBlocks(metal::MetalBackend &backend) {
 // tile's history that one of its rows' masks names, with the bits of those
 // rows; mask bits past the tile's history and words past its last block stay
 // unlisted. One dispatch lists the tiles of several sequences, each from its
-// own mask row, history and list, in tiles of eight rows or of three, the
-// last partial; a list keeps to its stride, and the dispatch refuses a mask
-// shorter than its sequences' rows.
+// own mask row, history and list, in tiles of eight rows, the last partial;
+// a list keeps to its stride, and the dispatch refuses a mask shorter than its
+// sequences' rows.
 void blockListsMatchMasks(metal::MetalBackend &backend) {
   constexpr uint32_t rowBits = SPLASH_ATTENTION_BLOCK_ROW_BITS, blockTokens = SPLASH_ATTENTION_BLOCK_TOKENS;
+  constexpr uint32_t tileRows = kv::kVerifyRows;
   // The dispatch's lists start past list `first`.
   constexpr uint32_t first = 2;
   struct Case final {
-    uint32_t tileRows;
     uint32_t stride;
     std::vector<ops::BlockListRows> sequences;
   };
   const auto buffer = [&](uint64_t bytes) { return test::sharedBuffer(backend, bytes); };
-  for (Case c : {Case{8, 4096, {{3, 8, 4095}, {11, 37, 100}, {48, 8, 4096}}},
-                 Case{3, 4096, {{0, 70, 9000}, {70, 5, 0}}}, Case{8, 5, {{0, 8, 4096}}}}) {
+  for (Case c : {Case{4096, {{3, 8, 4095}, {11, 37, 100}, {48, 8, 4096}}}, Case{4096, {{0, 70, 9000}, {70, 5, 0}}},
+                 Case{5, {{0, 8, 4096}}}}) {
     uint32_t maskRows = 0, words = 0, lists = 0;
     for (ops::BlockListRows &sequence : c.sequences) {
       maskRows = std::max(maskRows, sequence.maskRow + sequence.rows);
       words = std::max(words, (sequence.firstPosition + sequence.rows) / blockTokens / 32 + 3);
       sequence.list = lists;
-      lists += (sequence.rows + c.tileRows - 1) / c.tileRows;
+      lists += (sequence.rows + tileRows - 1) / tileRows;
     }
     // Each row names about one block in three of all the words' blocks, its
     // own and the next included.
@@ -1083,13 +1082,13 @@ void blockListsMatchMasks(metal::MetalBackend &backend) {
     std::memset(counts.contents(), 0xff, counts.sizeBytes());
     const ops::AttentionBlocks blocks{listBuffer, counts, c.stride, first};
     metal::CommandGraph graph;
-    ops::PagedAttention::addBlockLists(graph, mask, words, c.sequences, c.tileRows, blocks);
+    ops::PagedAttention::addBlockLists(graph, mask, words, c.sequences, blocks);
     static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
     const auto *listed = static_cast<const uint32_t *>(listBuffer.contents());
     const auto *listCounts = static_cast<const uint32_t *>(counts.contents());
     for (const ops::BlockListRows &sequence : c.sequences)
-      for (uint32_t row0 = 0; row0 < sequence.rows; row0 += c.tileRows) {
-        const uint32_t rows = std::min(c.tileRows, sequence.rows - row0);
+      for (uint32_t row0 = 0; row0 < sequence.rows; row0 += tileRows) {
+        const uint32_t rows = std::min(tileRows, sequence.rows - row0);
         const uint32_t history = (sequence.firstPosition + row0 + rows + blockTokens - 1) / blockTokens;
         std::vector<uint32_t> expected;
         for (uint32_t block = 0; block < history; ++block) {
@@ -1099,7 +1098,7 @@ void blockListsMatchMasks(metal::MetalBackend &backend) {
               entry |= 1U << row;
           if (entry & ((1U << rowBits) - 1U)) expected.push_back(entry);
         }
-        const uint32_t index = first + sequence.list + row0 / c.tileRows;
+        const uint32_t index = first + sequence.list + row0 / tileRows;
         const uint32_t kept = std::min<uint32_t>(expected.size(), c.stride);
         const uint32_t *list = listed + uint64_t{index} * c.stride;
         require(listCounts[index] == kept && std::equal(expected.begin(), expected.begin() + kept, list) &&
@@ -1113,7 +1112,7 @@ void blockListsMatchMasks(metal::MetalBackend &backend) {
             "block lists were written past the dispatch's lists");
     test::requireExtent(backend, mask, uint64_t{maskRows} * words * 4, 4, "attention block mask",
                         [&](metal::CommandGraph &encoded, const metal::MetalBuffer &view) {
-                          ops::PagedAttention::addBlockLists(encoded, view, words, c.sequences, c.tileRows, blocks);
+                          ops::PagedAttention::addBlockLists(encoded, view, words, c.sequences, blocks);
                         });
   }
   const metal::MetalBuffer any = buffer(4096);
@@ -1121,18 +1120,14 @@ void blockListsMatchMasks(metal::MetalBackend &backend) {
   const std::vector<ops::BlockListRows> one{rows}, none, empty{{0, 0, 0, 0}},
       tooMany(SPLASH_MAXIMUM_BATCH_WIDTH + 1, rows);
   metal::CommandGraph invalid;
-  for (const auto &[sequences, words, tileRows, stride] :
-       {std::tuple{&none, 1U, 8U, 8U}, std::tuple{&tooMany, 1U, 8U, 8U}, std::tuple{&empty, 1U, 8U, 8U},
-        std::tuple{&one, 0U, 8U, 8U}, std::tuple{&one, 1U, 0U, 8U}, std::tuple{&one, 1U, rowBits + 1, 8U},
-        std::tuple{&one, 1U, 8U, 0U}})
-    rejects(
-        [&] {
-          ops::PagedAttention::addBlockLists(invalid, any, words, *sequences, tileRows, {any, any, stride, 0});
-        },
-        "invalid attention block lists", "invalid block lists were accepted");
+  for (const auto &[sequences, words, stride] :
+       {std::tuple{&none, 1U, 8U}, std::tuple{&tooMany, 1U, 8U}, std::tuple{&empty, 1U, 8U}, std::tuple{&one, 0U, 8U},
+        std::tuple{&one, 1U, 0U}})
+    rejects([&] { ops::PagedAttention::addBlockLists(invalid, any, words, *sequences, {any, any, stride, 0}); },
+            "invalid attention block lists", "invalid block lists were accepted");
   // Rows at 252 on reach 65 blocks, past one word's 32.
   const std::vector<ops::BlockListRows> wide{{0, 8, 252, 0}};
-  rejects([&] { ops::PagedAttention::addBlockLists(invalid, any, 1, wide, 8, {any, any, 8, 0}); },
+  rejects([&] { ops::PagedAttention::addBlockLists(invalid, any, 1, wide, {any, any, 8, 0}); },
           "attention block masks narrower than their rows' history",
           "block masks narrower than their rows' history were accepted");
   require(invalid.empty(), "invalid block lists encoded a dispatch");

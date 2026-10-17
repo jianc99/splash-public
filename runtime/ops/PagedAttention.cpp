@@ -38,8 +38,8 @@ KernelLayout storageKernelLayout(kv::Layout layout) {
 KernelLayout attentionKernelLayout(uint32_t queryHeads, kv::Layout layout) {
   // Select a compiled GQA variant so kernels need no geometry branches. The
   // value order picks the family: the sparse kernels gather blocks of
-  // token-major values (compiled for Qwen3.8-Flash-Next's 24 query heads
-  // over two KV heads), and the dense page loop reads dimension-major ones.
+  // token-major values (compiled for 24 query heads over two KV heads,
+  // Qwen3.8-Flash-Next's), and the dense page loop reads dimension-major ones.
   const KernelLayout storage = storageKernelLayout(layout);
   if (layout.valuesTokenMajor) {
     if (storage != KernelLayout::Kv2Group8 || queryHeads != 24)
@@ -403,15 +403,14 @@ void PagedAttention::addPrefill(
   if (!error.empty())
     throw std::invalid_argument(std::string(error));
   // The tiles read the queries and write the output in whole tiles of rows.
-  const Staging staging{plan.layout.kvHeads, chunk.chunk_stride,
-                        kv::prefillAttentionTiles(plan.rows) * kv::kPrefillAttentionTileRows};
+  const Staging staging{plan.layout.kvHeads, chunk.chunk_stride, plan.tiles * kv::kPrefillAttentionTileRows};
   const uint64_t rows = staging.rowBytes(plan.queryHeads / plan.layout.kvHeads, plan.layout.headDimension);
   requireBytes(queries, rows, "attention query");
   requireBytes(output, rows, "attention output");
   requireBytes(partials, plan.workspace.partialsBytes, "prefill attention partials");
   requireBytes(statistics, plan.workspace.statisticsBytes, "prefill attention statistics");
   requirePageTable(pageTable, chunk);
-  requireBlocks(blocks, plan.sparse, kv::prefillAttentionTiles(plan.rows));
+  requireBlocks(blocks, plan.sparse, plan.tiles);
   const kv::PrefillAttentionParams params{
       chunk.committed_tokens, chunk.chunk_tokens, chunk.chunk_stride,
       chunk.page_table_entries, layer, plan.splits, blocks.stride, blocks.list};
@@ -477,10 +476,13 @@ void PagedAttention::addVerify(metal::CommandGraph &graph, SplashKvLayer layer,
 }
 
 void PagedAttention::addBlockLists(metal::CommandGraph &graph, const metal::MetalBuffer &mask, uint32_t maskWords,
-                                   std::span<const BlockListRows> sequences, uint32_t tileRows,
-                                   const AttentionBlocks &blocks) {
-  if (sequences.empty() || sequences.size() > SPLASH_MAXIMUM_BATCH_WIDTH || !maskWords || !tileRows ||
-      tileRows > SPLASH_ATTENTION_BLOCK_ROW_BITS || !blocks.stride)
+                                   std::span<const BlockListRows> sequences, const AttentionBlocks &blocks) {
+  // The sparse kernels read a list's rows as a verify lane's or a prefill
+  // tile's, which are as many, each a bit of an entry.
+  constexpr uint32_t tileRows = kv::kPrefillAttentionTileRows;
+  static_assert(tileRows == kv::kVerifyRows && tileRows <= SPLASH_ATTENTION_BLOCK_ROW_BITS,
+                "a block list's rows are a verify lane's and a prefill tile's");
+  if (sequences.empty() || sequences.size() > SPLASH_MAXIMUM_BATCH_WIDTH || !maskWords || !blocks.stride)
     throw std::invalid_argument("invalid attention block lists");
   SplashAttentionBlockListParams params{
       .tile_rows = tileRows, .mask_words = maskWords, .stride = blocks.stride,

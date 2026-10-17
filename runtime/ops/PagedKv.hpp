@@ -125,13 +125,11 @@ struct Layout final {
   uint32_t kvHeads = 0;
   uint32_t headDimension = 0;
   Format format = Format::Int8;
-  // A QSA index (Qwen3.8-Flash-Next's): each page also holds, per layer, the
-  // pooled keys of its blocks of SPLASH_ATTENTION_BLOCK_TOKENS tokens, this
-  // many values each (bf16 [block][dimension]), in an index region after
-  // every layer's K/V region (PageStorage::indexOffset). The keys a block
-  // pools are the step's own, and those of a block its sequence has not
-  // completed are its state's (model::QwenTargetDimensions::
-  // indexerPendingBytes), so no page holds them.
+  // A block index: each page also holds, per layer, the pooled keys of its
+  // blocks of SPLASH_ATTENTION_BLOCK_TOKENS tokens, this many values each
+  // (bf16 [block][dimension]), in an index region after every layer's K/V
+  // region (PageStorage::indexOffset). Only a complete block has a pooled key
+  // in a page: whoever owns the sequence keeps the keys of its open block.
   uint32_t indexDimension = 0;
   // Whether a page holds each head's values token-major like its keys
   // ([token][dimension]) rather than dimension-major ([dimension][token]).
