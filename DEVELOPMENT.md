@@ -1493,7 +1493,7 @@ a quantized file keeps unquantized: UD-Q8_K_XL keeps the 27B's attention
 projections and LM head and some of the 35B-A3B's projections and experts in
 BF16, and other publishers keep alpha and beta, GDN projections, experts or
 the token table in F16. Their planes hold the values as stored, with an FP32
-scale of 1 per 256 values; the staged tiles round each value once to half, the
+scale of 1 per 64 values; the staged tiles round each value once to half, the
 Apple9 register tile reads BF16 exactly and takes no F16, so a projection with
 an F16 weight stages there, as do all of a model's experts when any expert
 weight is F16. Whole-BF16 and F16 models are not a target: before any weight
