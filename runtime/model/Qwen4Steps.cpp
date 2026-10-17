@@ -235,7 +235,8 @@ void Qwen4Steps::readAhead(std::span<const QwenTargetPrefillChunk> chunks) {
     }
   const uint32_t heads = geometry_.pleHeads();
   ahead_.clear();
-  uint64_t budget = kChunkRows;
+  // The next command's rows: a command's chunks of rows at most.
+  uint64_t budget = uint64_t{prefillChunks_} * kChunkRows;
   for (const QwenTargetPrefillSequence *sequence : last) {
     if (!sequence) continue;
     const std::span<const uint32_t> prompt = sequence->request.tokens;

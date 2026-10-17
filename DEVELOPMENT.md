@@ -234,9 +234,9 @@ default.
   same command stages them between the hash and the gather, keeping the GPU
   awake through it ([Streamed experts](#streamed-experts)).
 - A prefill command reads ahead the rows of the prompt tokens that follow its
-  rows while it runs; the next command's stage finds them cached or finishes
-  what is still in flight. A read ahead runs only while no stage or expert
-  load reads.
+  rows, as many as a command holds, while it runs; the next command's first
+  stage finds them cached or finishes what is still in flight. A read ahead
+  runs only while no stage or expert load reads.
 - A row enters the cache only after the file was found unchanged since it was
   read. The table is read from the source its metadata was parsed from, so a
   new file at its path changes nothing; a write to that file, a failed read

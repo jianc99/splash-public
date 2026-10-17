@@ -102,9 +102,10 @@ public:
   // sequence's blocks.
   [[nodiscard]] std::vector<Qwen4Blocks> preparePrefill(uint32_t index, const QwenTargetPrefillChunk &chunk);
   // When the table streams, starts reading the PLE rows of the prompt rows
-  // that follow each lane's rows of a prefill command, at most a chunk's
-  // worth and its lanes' in order: the readers bring them into the table's
-  // cache while the command runs, where the next command's stage finds them.
+  // that follow each lane's rows of a prefill command, at most a command's
+  // chunks' worth and its lanes' in order: the readers bring them into the
+  // table's cache while the command runs, where the next command's first
+  // stage finishes them for all of its chunks.
   void readAhead(std::span<const QwenTargetPrefillChunk> chunks);
 
   // The scratch of a decode step's first `rows` rows (QwenTarget's storage

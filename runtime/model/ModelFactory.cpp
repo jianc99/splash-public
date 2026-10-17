@@ -2,6 +2,7 @@
 #include "model/DraftCheckpoint.hpp"
 #include "model/GgufTarget.hpp"
 #include "model/QwenTargetLoader.hpp"
+#include "model/RuntimeArenas.hpp"
 #include "model/SafetensorsTarget.hpp"
 #include "model/VisionLoader.hpp"
 
@@ -99,12 +100,13 @@ LoadedModel loadModel(metal::MetalBackend &backend,
         case TargetSource::Gguf: {
           // A streamed table's store (--ple-ssd-cache): a stage takes a
           // prefill chunk's table rows, pleHeads() for each of its
-          // prefillTokenBudget tokens, and prefetches, each a chunk's
-          // read-ahead, may have the rows of two chunks queued or in flight.
+          // prefillTokenBudget tokens, and a prefetch, the read-ahead of the
+          // next prefill command (a group's chunks at most), may have them
+          // queued or in flight beside a chunk's more.
           const uint32_t stageRows = ExecutionLimits::prefillTokenBudget * layout.pleHeads();
           const SparseRowStoreOptions table{.cacheBytes = options.pleCacheBytes,
                                             .readers = readers,
-                                            .prefetchRows = 2 * stageRows,
+                                            .prefetchRows = (kPrefillGroupChunks + 1) * stageRows,
                                             .stageRows = stageRows};
           GgufTargetLoader loader(backend, images, findTargetGgufs(directory), layout.ggufArchitecture, layout, table,
                                   experts);
