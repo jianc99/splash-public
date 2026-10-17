@@ -1,6 +1,6 @@
 // Qwen3.8-Flash-Next's kernels (kernels/shared/hyper_connection.metal,
-// ngram_embedding.metal and qwen4_qsa.metal) through ops::HyperConnection,
-// ops::NgramEmbedding and ops::Qwen4, against fp64 CPU references of the
+// ngram_embedding.metal and block_indexer.metal) through ops::HyperConnection,
+// ops::NgramEmbedding and ops::BlockIndexer, against fp64 CPU references of the
 // model's computation:
 // - the hyper-connection mix at Flash-Next's shape: per-stream RMS norm,
 //   injection weights, the low-rank gate and the stream average; the combine
@@ -18,15 +18,15 @@
 //   streams); the GPU PLE hash against the CPU's.
 #include "../../../runtime/metal/CommandGraph.hpp"
 #include "../../../runtime/metal/MetalBackend.hpp"
+#include "../../../runtime/ops/BlockIndexer.hpp"
 #include "../../../runtime/ops/HyperConnection.hpp"
 #include "../../../runtime/ops/NgramEmbedding.hpp"
-#include "../../../runtime/ops/Qwen4.hpp"
 #include "../../../runtime/ops/Sampling.hpp"
 #include "LinearInputReference.hpp"
+#include "metal/abi/BlockIndexer.h"
 #include "metal/abi/KvExtent.h"
 #include "metal/abi/HyperConnection.h"
 #include "metal/abi/NgramEmbedding.h"
-#include "metal/abi/Qwen4.h"
 
 #import <Foundation/Foundation.h>
 
@@ -490,8 +490,8 @@ struct QsaLane final {
   std::array<MetalBuffer, 2> pending; // pending[0] before the next step
 };
 
-constexpr uint32_t kQsaDimension = QWEN4_QSA_DIMENSION, kQsaPage = 32;
-constexpr uint64_t kQsaPendingBytes = uint64_t{QWEN4_QSA_PENDING} * kQsaDimension * 2;
+constexpr uint32_t kQsaDimension = BLOCK_INDEXER_DIMENSION, kQsaPage = 32;
+constexpr uint64_t kQsaPendingBytes = uint64_t{BLOCK_INDEXER_PENDING} * kQsaDimension * 2;
 
 // The bf16 raw keys of a lane's tokens [from, from + rows).
 std::vector<uint16_t> qsaKeys(const QsaLane &lane, uint32_t from, uint32_t rows) {
@@ -502,8 +502,8 @@ std::vector<uint16_t> qsaKeys(const QsaLane &lane, uint32_t from, uint32_t rows)
 
 // The records of the blocks whose last token is one of `rows` from `from`
 // (a step's, as model/Qwen4Steps writes them for text).
-std::vector<Qwen4QsaBlock> qsaRecords(uint32_t from, uint32_t rows) {
-  std::vector<Qwen4QsaBlock> records;
+std::vector<BlockIndexerBlock> qsaRecords(uint32_t from, uint32_t rows) {
+  std::vector<BlockIndexerBlock> records;
   for (uint32_t last = from; last < from + rows; ++last)
     if (last % 4 == 3) records.push_back({last - 3, {last - 3, last - 3, last - 3}});
   return records;
@@ -515,12 +515,12 @@ std::vector<Qwen4QsaBlock> qsaRecords(uint32_t from, uint32_t rows) {
 void qsaPrefillStep(MetalBackend &backend, CommandGraph &graph, QsaLane &lane, uint32_t from, uint32_t rows,
                     const NormWeights &keyNorm, const MetalBuffer &invFreq, uint32_t indexOffset) {
   const MetalBuffer keys = upload(backend, qsaKeys(lane, from, rows));
-  const std::vector<Qwen4QsaBlock> records = qsaRecords(from, rows);
+  const std::vector<BlockIndexerBlock> records = qsaRecords(from, rows);
   const std::array<uint32_t, 1> firsts{from}, counts{static_cast<uint32_t>(records.size())};
-  const ops::QsaRows qsaRows{rows, firsts, {{&lane.tableBuffer, 1}, indexOffset}, 512, 0, 0};
-  ops::Qwen4::addQsaPool(graph, {upload(backend, records), counts, 0, keys, {&lane.pending[0], 1}}, keyNorm, invFreq,
-                         qsaRows);
-  ops::Qwen4::addQsaPending(graph, keys, lane.pending[0], lane.pending[1], from, rows);
+  const ops::IndexerRows qsaRows{rows, firsts, {{&lane.tableBuffer, 1}, indexOffset}, 512, 0, 0};
+  ops::BlockIndexer::addPool(graph, {upload(backend, records), counts, 0, keys, {&lane.pending[0], 1}}, keyNorm,
+                             invFreq, qsaRows);
+  ops::BlockIndexer::addPending(graph, keys, lane.pending[0], lane.pending[1], from, rows);
   std::swap(lane.pending[0], lane.pending[1]);
 }
 
@@ -543,7 +543,7 @@ struct QsaCase final {
 
 void qsaTest(MetalBackend &backend, QsaCase c) {
   std::mt19937 rng(13);
-  constexpr uint32_t D = kQsaDimension, H = QWEN4_QSA_HEADS, page = kQsaPage;
+  constexpr uint32_t D = kQsaDimension, H = BLOCK_INDEXER_HEADS, page = kQsaPage;
   const uint32_t rows = c.rows, top = c.top, lanes = c.lanes, laneRows = lanes * rows;
   std::vector<QsaLane> lane(lanes);
   uint32_t pages = 0, mostTokens = 0;
@@ -610,28 +610,28 @@ void qsaTest(MetalBackend &backend, QsaCase c) {
       }
     }
   MetalBuffer queries = scratch(backend, uint64_t{laneRows} * H * D * 2), keys = scratch(backend, uint64_t{laneRows} * D * 2);
-  const ops::QsaRows qsaRows{rows, firstPositions, {tables, indexOffset}, top, words, stride};
+  const ops::IndexerRows qsaRows{rows, firstPositions, {tables, indexOffset}, top, words, stride};
   // Each lane's records `laneRecords` records apart.
   const uint32_t laneRecords = (rows + 3) / 4 + 1;
-  std::vector<Qwen4QsaBlock> blocks(uint64_t{lanes} * laneRecords);
+  std::vector<BlockIndexerBlock> blocks(uint64_t{lanes} * laneRecords);
   std::vector<uint32_t> counts;
   std::vector<MetalBuffer> pendingBefore;
   for (uint32_t l = 0; l < lanes; ++l) {
-    const std::vector<Qwen4QsaBlock> records = qsaRecords(lane[l].first, rows);
+    const std::vector<BlockIndexerBlock> records = qsaRecords(lane[l].first, rows);
     std::ranges::copy(records, blocks.begin() + uint64_t{l} * laneRecords);
     counts.push_back(static_cast<uint32_t>(records.size()));
     pendingBefore.push_back(lane[l].pending[0]);
   }
   CommandGraph graph;
-  ops::Qwen4::addQsaProject(graph, upload(backend, query), upload(backend, stepKeys), {upload(backend, qnP), true},
-                            upload(backend, cosT), upload(backend, sinT), queries, keys, qsaRows);
-  ops::Qwen4::addQsaPool(graph, {upload(backend, blocks), counts, laneRecords, keys, pendingBefore}, keyNorm,
-                         invFreqBuffer, qsaRows);
+  ops::BlockIndexer::addProject(graph, upload(backend, query), upload(backend, stepKeys), {upload(backend, qnP), true},
+                                upload(backend, cosT), upload(backend, sinT), queries, keys, qsaRows);
+  ops::BlockIndexer::addPool(graph, {upload(backend, blocks), counts, laneRecords, keys, pendingBefore}, keyNorm,
+                             invFreqBuffer, qsaRows);
   const uint32_t scoreRows = lanes > 1 ? laneRows : 8;
   // Poisoned bitmaps: the select writes every word a tile's lists read.
   MetalBuffer scores = scratch(backend, uint64_t{scoreRows} * stride * 4),
               mask = upload(backend, std::vector<uint32_t>(uint64_t{laneRows} * words, ~0u));
-  ops::Qwen4::addQsaSelect(graph, queries, scores, scoreRows, mask, qsaRows);
+  ops::BlockIndexer::addSelect(graph, queries, scores, scoreRows, mask, qsaRows);
   // The commit after lane l retained a few of its rows.
   std::vector<uint32_t> retained;
   std::vector<MetalBuffer> pendingAfter;
@@ -639,8 +639,8 @@ void qsaTest(MetalBackend &backend, QsaCase c) {
     retained.push_back(1 + (3 * l + c.tokens) % rows);
     pendingAfter.push_back(lane[l].pending[1]);
   }
-  ops::Qwen4::addQsaCommit(graph, keys, 1, laneRows, rows, firstPositions, upload(backend, retained), pendingBefore,
-                           pendingAfter);
+  ops::BlockIndexer::addCommit(graph, keys, 1, laneRows, rows, firstPositions, upload(backend, retained), pendingBefore,
+                               pendingAfter);
   run(backend, graph);
 
   // A rotation's angle is the fp32 product the RoPE tables take (the host's
@@ -694,7 +694,7 @@ void qsaTest(MetalBackend &backend, QsaCase c) {
     // The tokens of the block the retained rows leave open, then zeros.
     const uint32_t end = x.first + retained[l], open = end / 4 * 4;
     const auto gotPending = download<uint16_t>(pendingAfter[l], kQsaPendingBytes / 2);
-    for (uint32_t slot = 0; slot < QWEN4_QSA_PENDING; ++slot)
+    for (uint32_t slot = 0; slot < BLOCK_INDEXER_PENDING; ++slot)
       for (uint32_t d = 0; d < D; ++d)
         okCommit &= gotPending[slot * D + d] ==
                     (open + slot < end ? bf16(x.raw[uint64_t{open + slot} * D + d]) : uint16_t{0});
@@ -777,16 +777,16 @@ void qsaRollbackTest(MetalBackend &backend) {
     // with the committed keys, which are other keys from its first row on.
     const auto step = [&](uint32_t from, const std::vector<uint16_t> &keys, uint32_t retained) {
       const std::array<uint32_t, 1> firsts{from};
-      const std::vector<Qwen4QsaBlock> records = qsaRecords(from, rows);
+      const std::vector<BlockIndexerBlock> records = qsaRecords(from, rows);
       const std::array<uint32_t, 1> counts{static_cast<uint32_t>(records.size())};
       const MetalBuffer keyBuffer = upload(backend, keys);
       CommandGraph graph;
-      const ops::QsaRows qsaRows{rows, firsts, {{&lane.tableBuffer, 1}, 0}, 512, 0, 0};
-      ops::Qwen4::addQsaPool(graph, {upload(backend, records), counts, 0, keyBuffer, {&lane.pending[0], 1}}, keyNorm,
-                             invFreqBuffer, qsaRows);
-      ops::Qwen4::addQsaCommit(graph, keyBuffer, 1, rows, rows, firsts,
-                               upload(backend, std::vector<uint32_t>{retained}), {&lane.pending[0], 1},
-                               {&lane.pending[1], 1});
+      const ops::IndexerRows qsaRows{rows, firsts, {{&lane.tableBuffer, 1}, 0}, 512, 0, 0};
+      ops::BlockIndexer::addPool(graph, {upload(backend, records), counts, 0, keyBuffer, {&lane.pending[0], 1}},
+                                 keyNorm, invFreqBuffer, qsaRows);
+      ops::BlockIndexer::addCommit(graph, keyBuffer, 1, rows, rows, firsts,
+                                   upload(backend, std::vector<uint32_t>{retained}), {&lane.pending[0], 1},
+                                   {&lane.pending[1], 1});
       run(backend, graph);
       std::swap(lane.pending[0], lane.pending[1]);
     };
@@ -825,9 +825,10 @@ void qsaSelectRefusesNarrowScratch(MetalBackend &backend) {
   const auto refused = [&](uint32_t maskWords, uint32_t scoreStride) {
     CommandGraph graph;
     try {
-      ops::Qwen4::addQsaSelect(graph, any, any, 8, any, {8, firstPositions, {tables, 0}, 512, maskWords, scoreStride});
+      ops::BlockIndexer::addSelect(graph, any, any, 8, any,
+                                   {8, firstPositions, {tables, 0}, 512, maskWords, scoreStride});
     } catch (const std::invalid_argument &error) {
-      return std::string(error.what()) == "QSA scores or bitmaps narrower than the rows' history" && graph.empty();
+      return std::string(error.what()) == "indexer scores or bitmaps narrower than the rows' history" && graph.empty();
     }
     return false;
   };

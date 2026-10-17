@@ -21,9 +21,9 @@
 #include "QwenHybridLayout.hpp"
 #include "QwenTarget.hpp"
 #include "QwenTargetFiles.hpp"
+#include "metal/abi/BlockIndexer.h"
 #include "metal/abi/HyperConnection.h"
 #include "metal/abi/NgramEmbedding.h"
-#include "metal/abi/Qwen4.h"
 #include "metal/abi/RoPE.h"
 #include "ops/MoE.hpp"
 #include "ops/Normalization.hpp"
@@ -103,9 +103,9 @@ static_assert(Qwen4ExpLayout{}.hyperConnections == HYPER_CONNECTION_MAXIMUM_STRE
 static_assert(Qwen4ExpLayout{}.pleNgram <= NGRAM_EMBEDDING_MAXIMUM_NGRAM &&
                   Qwen4ExpLayout{}.pleHeads() <= NGRAM_EMBEDDING_MAXIMUM_HEADS,
               "the n-gram hash holds Flash-Next's n-grams and heads");
-static_assert(Qwen4ExpLayout{}.indexerHeads == QWEN4_QSA_HEADS &&
-                  Qwen4ExpLayout{}.indexerHeadDimension == QWEN4_QSA_DIMENSION &&
-                  Qwen4ExpLayout{}.indexerBlockTokens == QWEN4_QSA_BLOCK,
+static_assert(Qwen4ExpLayout{}.indexerHeads == BLOCK_INDEXER_HEADS &&
+                  Qwen4ExpLayout{}.indexerHeadDimension == BLOCK_INDEXER_DIMENSION &&
+                  Qwen4ExpLayout{}.indexerBlockTokens == BLOCK_INDEXER_BLOCK,
               "the QSA kernels are compiled for Flash-Next's indexer");
 
 // The longest n-gram the PLE hash mixes (metal/abi/NgramEmbedding.h).

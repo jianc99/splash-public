@@ -75,7 +75,7 @@ void qwen4PleRows(const Qwen4ExpWeights &weights, uint64_t position, std::span<c
                   std::span<const uint32_t> history, uint32_t *out);
 
 // The QSA blocks a prefill sequence's rows complete, which its attention
-// layers pool: `count` Qwen4QsaBlock records (none without a block).
+// layers pool: `count` BlockIndexerBlock records (none without a block).
 struct Qwen4Blocks final {
   metal::MetalBuffer records;
   uint32_t count = 0;

@@ -2119,7 +2119,7 @@ complete blocks of 4 tokens, a query row attends only to the 512 blocks its
 indexer scores highest and to its tokens after its last complete block. The
 indexer (four query heads and one key head of 128) keeps each block's pooled
 key, bf16, in an index region of the KV pages (`PageStorage::indexOffset`),
-which its kernels reach through index tables of their own (`ops::QsaIndex`,
+which its kernels reach through index tables of their own (`ops::BlockIndex`,
 today the lanes' page tables). A step projects its rows' indexer queries and
 keys, pools the blocks they complete from its rows' keys and, for the tokens
 of a block before its first row, the sequence's pending keys, scores every
@@ -2127,7 +2127,7 @@ complete block for each row in one MPP product per tile of 8 rows by 32
 blocks, and selects each row's blocks into a bitmap by a radix select of its
 scores, 11 bits a pass, the first over the row and the later ones over the
 threshold bin's scores in threadgroup memory, the bitmap written a word per
-simdgroup from ballots (`kernels/shared/qwen4_qsa.metal`). The pending keys,
+simdgroup from ballots (`kernels/shared/block_indexer.metal`). The pending keys,
 the raw keys of the up to 3 tokens of the block a sequence has not completed,
 are its state's (after the PLE history in a state cell,
 `QwenTargetDimensions::indexerPendingBytes`): a prefill writes them after its

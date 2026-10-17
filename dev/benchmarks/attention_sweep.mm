@@ -19,7 +19,7 @@
 //
 // fn is Qwen3.8-Flash-Next's GQA-12 attention, whose rows attend past 512
 // complete blocks of four tokens only to the 512 blocks their QSA bitmap
-// names and their own (kernels/shared/qwen4_qsa.metal); its tiles attend the
+// names and their own (kernels/shared/block_indexer.metal); its tiles attend the
 // union of their rows' blocks, which the graph lists from the bitmaps first
 // (ops::PagedAttention::addBlockLists). --qsa makes such bitmaps: blocks
 // scattered alike for every row (shared), independently per row
@@ -42,10 +42,10 @@
 #include "DispatchReplay.hpp"
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
-#include "metal/abi/Qwen4.h"
+#include "metal/abi/BlockIndexer.h"
 #include "metal/abi/RoPE.h"
+#include "ops/BlockIndexer.hpp"
 #include "ops/PagedAttention.hpp"
-#include "ops/Qwen4.hpp"
 
 #include <algorithm>
 #include <charconv>
@@ -215,7 +215,8 @@ template <class T> metal::MetalBuffer sharedBuffer(metal::MetalBackend &backend,
 
 QsaIndexer qsaIndexer(metal::MetalBackend &backend, const AttentionFixturePlan &plan, bool prefill,
                       uint32_t stride) {
-  constexpr uint32_t D = QWEN4_QSA_DIMENSION, H = QWEN4_QSA_HEADS, pageBlocks = kv::kPageTokens / kQsaBlockTokens;
+  constexpr uint32_t D = BLOCK_INDEXER_DIMENSION, H = BLOCK_INDEXER_HEADS;
+  constexpr uint32_t pageBlocks = kv::kPageTokens / kQsaBlockTokens;
   QsaIndexer result;
   const uint32_t lanes = plan.lanes, rows = plan.rows, laneRows = lanes * rows;
   uint64_t pages = 0;
@@ -230,15 +231,16 @@ QsaIndexer qsaIndexer(metal::MetalBackend &backend, const AttentionFixturePlan &
     auto *entries = static_cast<uint64_t *>(table.contents());
     for (uint32_t index = 0; index < plan.pages[lane]; ++index) entries[index] = result.index.gpuAddress() | page++;
     result.tables.push_back(std::move(table));
-    metal::MetalBuffer pending = sharedBuffer<uint16_t>(backend, QWEN4_QSA_PENDING * D, "attention-sweep-pending");
+    metal::MetalBuffer pending = sharedBuffer<uint16_t>(backend, BLOCK_INDEXER_PENDING * D, "attention-sweep-pending");
     std::memset(pending.contents(), 0, pending.sizeBytes());
     result.pending.push_back(std::move(pending));
     result.firstPositions.push_back(plan.histories[lane]);
   }
   // The blocks each lane's rows complete, each rotated to its first token.
   result.laneRecords = rows / kQsaBlockTokens + 1;
-  result.records = sharedBuffer<Qwen4QsaBlock>(backend, uint64_t{lanes} * result.laneRecords, "attention-sweep-blocks");
-  auto *records = static_cast<Qwen4QsaBlock *>(result.records.contents());
+  result.records =
+      sharedBuffer<BlockIndexerBlock>(backend, uint64_t{lanes} * result.laneRecords, "attention-sweep-blocks");
+  auto *records = static_cast<BlockIndexerBlock *>(result.records.contents());
   for (uint32_t lane = 0; lane < lanes; ++lane) {
     uint32_t count = 0;
     for (uint32_t last = plan.histories[lane]; last < plan.histories[lane] + rows; ++last)
@@ -321,14 +323,14 @@ metal::CommandGraph caseGraph(const AttentionFixture &fixture, bool prefill, con
   const AttentionFixturePlan &plan = fixture.plan();
   metal::CommandGraph graph;
   if (const QsaIndexer *indexer = qsa.indexer ? &*qsa.indexer : nullptr) {
-    const ops::QsaRows rows{plan.rows, indexer->firstPositions, {indexer->tables, 0}, kQsaTopBlocks, qsa.words,
-                            qsa.words * 32};
-    Qwen4::addQsaProject(graph, indexer->query, indexer->key, {indexer->norm, true}, indexer->ropeCos,
-                         indexer->ropeSin, indexer->queries, indexer->keys, rows);
-    Qwen4::addQsaPool(graph,
-                      {indexer->records, indexer->counts, indexer->laneRecords, indexer->keys, indexer->pending},
-                      {indexer->norm, true}, indexer->inverseFrequencies, rows);
-    Qwen4::addQsaSelect(graph, indexer->queries, indexer->scores, indexer->scoreRows, qsa.bitmaps, rows);
+    const ops::IndexerRows rows{plan.rows, indexer->firstPositions, {indexer->tables, 0}, kQsaTopBlocks, qsa.words,
+                                qsa.words * 32};
+    BlockIndexer::addProject(graph, indexer->query, indexer->key, {indexer->norm, true}, indexer->ropeCos,
+                             indexer->ropeSin, indexer->queries, indexer->keys, rows);
+    BlockIndexer::addPool(graph,
+                          {indexer->records, indexer->counts, indexer->laneRecords, indexer->keys, indexer->pending},
+                          {indexer->norm, true}, indexer->inverseFrequencies, rows);
+    BlockIndexer::addSelect(graph, indexer->queries, indexer->scores, indexer->scoreRows, qsa.bitmaps, rows);
   }
   if (qsa.words) {
     std::vector<BlockListRows> sequences;

@@ -1,5 +1,5 @@
+#include "metal/abi/BlockIndexer.h"
 #include "metal/abi/KernelABI.h"
-#include "metal/abi/Qwen4.h"
 #include "metal/kernels/common/kv_extent.h"
 #include "metal/kernels/common/lane_bindings.h"
 #include "metal/kernels/common/rms_inverse.h"
@@ -10,38 +10,41 @@
 using namespace metal;
 using namespace mpp::tensor_ops;
 
-// Qwen3.8-Flash-Next's QSA. Past top_blocks complete blocks of QWEN4_QSA_BLOCK tokens, a query row attends
-// to the top_blocks complete blocks its indexer scores highest and to the
-// tokens after its last complete block, which are none when its own token
-// completes its block. A block's score is sum over the indexer's heads of
+// A block indexer (Qwen3.8-Flash-Next's QSA, for one). Past top_blocks
+// complete blocks of BLOCK_INDEXER_BLOCK tokens, a query row attends to the
+// top_blocks complete blocks its indexer scores highest and to the tokens
+// after its last complete block, which are none when its own token completes
+// its block. A block's score is sum over the indexer's heads of
 // relu(q_h . k_b) / sqrt(dimension), accumulated in fp32: q_h the row's
 // normalized, rotated query heads, k_b the block's pooled key, the
 // normalized mean of its tokens' raw keys rotated to its first token's
 // position, both stored bf16 as the model computes them. The kernels write
-// each row's bitmap of the blocks it attends to (ops/Qwen4.cpp), which the
-// sparse attention lists its tiles' blocks from
+// each row's bitmap of the blocks it attends to (ops/BlockIndexer.cpp), which
+// the sparse attention lists its tiles' blocks from
 // (ops::PagedAttention::addBlockLists).
 
-constant constexpr uint kDimension = QWEN4_QSA_DIMENSION;
-constant constexpr uint kHeads = QWEN4_QSA_HEADS;
-constant constexpr uint kBlock = QWEN4_QSA_BLOCK;
-constant constexpr uint kPending = QWEN4_QSA_PENDING;
+constant constexpr uint kDimension = BLOCK_INDEXER_DIMENSION;
+constant constexpr uint kHeads = BLOCK_INDEXER_HEADS;
+constant constexpr uint kBlock = BLOCK_INDEXER_BLOCK;
+constant constexpr uint kPending = BLOCK_INDEXER_PENDING;
 constant constexpr uint kPairs = SPLASH_TARGET_ROPE_PAIRS; // rotated pairs (i, i + kPairs)
 constant constexpr uint kPageTokens = SPLASH_TARGET_KV_BLOCK_TOKENS;
 constant constexpr uint kPageBlocks = kPageTokens / kBlock;
 
-// Lane `lane` of a dispatch (Qwen4QsaParams), none past its lanes.
-inline bool qsa_lane(uint lane, constant Qwen4QsaParams &p) { return lane < min(p.lanes, SPLASH_MAXIMUM_BATCH_WIDTH); }
+// Lane `lane` of a dispatch (BlockIndexerParams), none past its lanes.
+inline bool indexer_lane(uint lane, constant BlockIndexerParams &p) {
+  return lane < min(p.lanes, SPLASH_MAXIMUM_BATCH_WIDTH);
+}
 
 // The pooled keys of a page's blocks, through its index entry.
-inline device bfloat *qsa_index_keys(SplashKvPage entry, constant Qwen4QsaParams &p) {
+inline device bfloat *indexer_index_keys(SplashKvPage entry, constant BlockIndexerParams &p) {
   const uint index = splash_kv_page_index(entry);
   return reinterpret_cast<device bfloat *>(splash_kv_extent(entry, index) + p.index_offset) +
          ulong(index) * kPageBlocks * kDimension;
 }
 
 // The inverse RMS of the threadgroup's kDimension values, one per thread.
-inline float qsa_rms_scale(float value, threadgroup float *scratch, uint lane, uint sg) {
+inline float indexer_rms_scale(float value, threadgroup float *scratch, uint lane, uint sg) {
   const float sum = simd_sum(value * value);
   if (lane == 0) scratch[sg] = sum;
   threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -54,8 +57,8 @@ inline float qsa_rms_scale(float value, threadgroup float *scratch, uint lane, u
 // Rotates the first 2 kPairs dimensions as the attention does (pairs i,
 // i + kPairs by the table's frequency i) and writes the head as bf16.
 template <class Table>
-inline void qsa_rotate_store(float value, threadgroup float *rotated, Table cosine,
-                             Table sine, device bfloat *out, uint tid) {
+inline void indexer_rotate_store(float value, threadgroup float *rotated, Table cosine,
+                                 Table sine, device bfloat *out, uint tid) {
   rotated[tid] = value;
   threadgroup_barrier(mem_flags::mem_threadgroup);
   float result = value;
@@ -68,63 +71,63 @@ inline void qsa_rotate_store(float value, threadgroup float *rotated, Table cosi
 // Threadgroup (row, head, lane) of 128 threads: query heads are normalized,
 // rotated by the row's RoPE table and written as bf16 [rows][heads][dim];
 // the key head (head == heads) is written raw, bf16, to the row's keys.
-kernel void qwen4_qsa_project(device const float *query [[buffer(0)]],
-                              device const float *key [[buffer(1)]],
-                              device const float *query_norm [[buffer(2)]],
-                              device const float *rope_cos [[buffer(3)]],
-                              device const float *rope_sin [[buffer(4)]],
-                              device bfloat *queries [[buffer(5)]],
-                              device bfloat *keys [[buffer(6)]],
-                              constant Qwen4QsaParams &p [[buffer(7)]],
-                              uint3 group [[threadgroup_position_in_grid]],
-                              uint tid [[thread_index_in_threadgroup]],
-                              uint lane [[thread_index_in_simdgroup]],
-                              uint sg [[simdgroup_index_in_threadgroup]]) {
+kernel void block_indexer_project(device const float *query [[buffer(0)]],
+                                  device const float *key [[buffer(1)]],
+                                  device const float *query_norm [[buffer(2)]],
+                                  device const float *rope_cos [[buffer(3)]],
+                                  device const float *rope_sin [[buffer(4)]],
+                                  device bfloat *queries [[buffer(5)]],
+                                  device bfloat *keys [[buffer(6)]],
+                                  constant BlockIndexerParams &p [[buffer(7)]],
+                                  uint3 group [[threadgroup_position_in_grid]],
+                                  uint tid [[thread_index_in_threadgroup]],
+                                  uint lane [[thread_index_in_simdgroup]],
+                                  uint sg [[simdgroup_index_in_threadgroup]]) {
   threadgroup float scratch[kDimension / 32];
   threadgroup float rotated[kDimension];
   const uint head = group.y, batch = group.z;
-  if (group.x >= p.rows || !qsa_lane(batch, p)) return;
+  if (group.x >= p.rows || !indexer_lane(batch, p)) return;
   const ulong row = ulong(batch) * p.rows + group.x;
   if (head == kHeads) {
     keys[row * kDimension + tid] = bfloat(key[row * kDimension + tid]);
     return;
   }
   const float value = query[(row * kHeads + head) * kDimension + tid];
-  const float scale = qsa_rms_scale(value, scratch, lane, sg);
-  qsa_rotate_store(value * scale * query_norm[tid], rotated, rope_cos + row * kPairs, rope_sin + row * kPairs,
-                   queries + (row * kHeads + head) * kDimension, tid);
+  const float scale = indexer_rms_scale(value, scratch, lane, sg);
+  indexer_rotate_store(value * scale * query_norm[tid], rotated, rope_cos + row * kPairs, rope_sin + row * kPairs,
+                       queries + (row * kHeads + head) * kDimension, tid);
 }
 
 // Threadgroup (block, lane) of 128 threads: the mean of the block's four
 // tokens' raw keys, normalized and rotated to its first token's position.
 // A token from the lane's first row on is a row's of the step; one before it
 // is in the lane's pending keys, whose open block this is.
-kernel void qwen4_qsa_pool(device const Qwen4QsaBlock *blocks [[buffer(0)]],
-                           device const bfloat *keys [[buffer(1)]],
-                           device const bfloat *pending0 [[buffer(2)]],
-                           device const bfloat *pending1 [[buffer(3)]],
-                           device const bfloat *pending2 [[buffer(4)]],
-                           device const bfloat *pending3 [[buffer(5)]],
-                           device const float *key_norm [[buffer(6)]],
-                           device const float *inverse_frequencies [[buffer(7)]],
-                           device const SplashKvPage *index_table0 [[buffer(8)]],
-                           device const SplashKvPage *index_table1 [[buffer(9)]],
-                           device const SplashKvPage *index_table2 [[buffer(10)]],
-                           device const SplashKvPage *index_table3 [[buffer(11)]],
-                           constant Qwen4QsaParams &p [[buffer(12)]],
-                           uint2 group [[threadgroup_position_in_grid]],
-                           uint tid [[thread_index_in_threadgroup]],
-                           uint lane [[thread_index_in_simdgroup]],
-                           uint sg [[simdgroup_index_in_threadgroup]]) {
+kernel void block_indexer_pool(device const BlockIndexerBlock *blocks [[buffer(0)]],
+                               device const bfloat *keys [[buffer(1)]],
+                               device const bfloat *pending0 [[buffer(2)]],
+                               device const bfloat *pending1 [[buffer(3)]],
+                               device const bfloat *pending2 [[buffer(4)]],
+                               device const bfloat *pending3 [[buffer(5)]],
+                               device const float *key_norm [[buffer(6)]],
+                               device const float *inverse_frequencies [[buffer(7)]],
+                               device const SplashKvPage *index_table0 [[buffer(8)]],
+                               device const SplashKvPage *index_table1 [[buffer(9)]],
+                               device const SplashKvPage *index_table2 [[buffer(10)]],
+                               device const SplashKvPage *index_table3 [[buffer(11)]],
+                               constant BlockIndexerParams &p [[buffer(12)]],
+                               uint2 group [[threadgroup_position_in_grid]],
+                               uint tid [[thread_index_in_threadgroup]],
+                               uint lane [[thread_index_in_simdgroup]],
+                               uint sg [[simdgroup_index_in_threadgroup]]) {
   threadgroup float scratch[kDimension / 32];
   threadgroup float rotated[kDimension];
   threadgroup float cosine[kPairs], sine[kPairs];
   const uint index = group.x, batch = group.y;
-  if (!qsa_lane(batch, p) || index >= p.counts[batch]) return;
+  if (!indexer_lane(batch, p) || index >= p.counts[batch]) return;
   device const SplashKvPage *index_table =
       SPLASH_LANE_BINDING(batch, index_table0, index_table1, index_table2, index_table3);
   device const bfloat *pending = SPLASH_LANE_BINDING(batch, pending0, pending1, pending2, pending3);
-  const Qwen4QsaBlock block = blocks[ulong(batch) * p.lane_records + index];
+  const BlockIndexerBlock block = blocks[ulong(batch) * p.lane_records + index];
   // The block's table row as rope_build_tables computes one: frequency i
   // on axis i % 3 (interleaved M-RoPE).
   if (tid < kPairs) {
@@ -142,62 +145,63 @@ kernel void qwen4_qsa_pool(device const Qwen4QsaBlock *blocks [[buffer(0)]],
                                    : pending[t * kDimension + tid]);
   }
   const float mean = sum / kBlock;
-  const float scale = qsa_rms_scale(mean, scratch, lane, sg);
-  qsa_rotate_store(mean * scale * key_norm[tid], rotated, cosine, sine,
-                   qsa_index_keys(index_table[block.position / kPageTokens], p) +
-                       (block.position % kPageTokens / kBlock) * kDimension,
-                   tid);
+  const float scale = indexer_rms_scale(mean, scratch, lane, sg);
+  indexer_rotate_store(mean * scale * key_norm[tid], rotated, cosine, sine,
+                       indexer_index_keys(index_table[block.position / kPageTokens], p) +
+                           (block.position % kPageTokens / kBlock) * kDimension,
+                       tid);
 }
 
 // One layer's pending keys of a lane after the first `retained` of its rows
-// from `first` (Qwen4QsaPendingParams): the tokens of the rows' last block
+// from `first` (BlockIndexerPendingParams): the tokens of the rows' last block
 // before their end, from the rows' keys or, before `first`, the pending keys
 // before them, and zero past the end. A thread per dimension.
-inline void qsa_store_pending(device const bfloat *keys, device const bfloat *pending_in,
-                              device bfloat *pending_out, uint first, uint retained, uint tid) {
+inline void indexer_store_pending(device const bfloat *keys, device const bfloat *pending_in,
+                                  device bfloat *pending_out, uint first, uint retained, uint tid) {
   const uint end = first + retained, open = end / kBlock * kBlock;
   for (uint slot = 0; slot < kPending; ++slot) {
     const uint position = open + slot;
     bfloat value = bfloat(0.0f);
     if (position < end)
-      value = position >= first ? keys[ulong(position - first) * kDimension + tid] : pending_in[slot * kDimension + tid];
+      value = position >= first ? keys[ulong(position - first) * kDimension + tid]
+                                : pending_in[slot * kDimension + tid];
     pending_out[slot * kDimension + tid] = value;
   }
 }
 
 // One threadgroup of kDimension threads: the pending keys of one layer of
 // one lane after its first retained[0] rows, a count the host knows.
-kernel void qwen4_qsa_pending(device const bfloat *keys [[buffer(0)]],
-                              device const bfloat *pending_in [[buffer(1)]],
-                              device bfloat *pending_out [[buffer(2)]],
-                              constant Qwen4QsaPendingParams &p [[buffer(3)]],
-                              uint tid [[thread_index_in_threadgroup]]) {
-  qsa_store_pending(keys, pending_in, pending_out, p.first_position[0], min(p.retained[0], p.rows), tid);
+kernel void block_indexer_pending(device const bfloat *keys [[buffer(0)]],
+                                  device const bfloat *pending_in [[buffer(1)]],
+                                  device bfloat *pending_out [[buffer(2)]],
+                                  constant BlockIndexerPendingParams &p [[buffer(3)]],
+                                  uint tid [[thread_index_in_threadgroup]]) {
+  indexer_store_pending(keys, pending_in, pending_out, p.first_position[0], min(p.retained[0], p.rows), tid);
 }
 
 // Threadgroup (layer, lane) of kDimension threads: each layer's pending keys
 // of each lane of a verify after the rows it retained, a count the GPU
 // wrote. A lane's pending keys of every layer follow each other.
-kernel void qwen4_qsa_commit(device const bfloat *keys [[buffer(0)]],
-                             device const uint *retained [[buffer(1)]],
-                             device const bfloat *pending_in0 [[buffer(2)]],
-                             device const bfloat *pending_in1 [[buffer(3)]],
-                             device const bfloat *pending_in2 [[buffer(4)]],
-                             device const bfloat *pending_in3 [[buffer(5)]],
-                             device bfloat *pending_out0 [[buffer(6)]],
-                             device bfloat *pending_out1 [[buffer(7)]],
-                             device bfloat *pending_out2 [[buffer(8)]],
-                             device bfloat *pending_out3 [[buffer(9)]],
-                             constant Qwen4QsaPendingParams &p [[buffer(10)]],
-                             uint2 group [[threadgroup_position_in_grid]],
-                             uint tid [[thread_index_in_threadgroup]]) {
+kernel void block_indexer_commit(device const bfloat *keys [[buffer(0)]],
+                                 device const uint *retained [[buffer(1)]],
+                                 device const bfloat *pending_in0 [[buffer(2)]],
+                                 device const bfloat *pending_in1 [[buffer(3)]],
+                                 device const bfloat *pending_in2 [[buffer(4)]],
+                                 device const bfloat *pending_in3 [[buffer(5)]],
+                                 device bfloat *pending_out0 [[buffer(6)]],
+                                 device bfloat *pending_out1 [[buffer(7)]],
+                                 device bfloat *pending_out2 [[buffer(8)]],
+                                 device bfloat *pending_out3 [[buffer(9)]],
+                                 constant BlockIndexerPendingParams &p [[buffer(10)]],
+                                 uint2 group [[threadgroup_position_in_grid]],
+                                 uint tid [[thread_index_in_threadgroup]]) {
   const uint layer = group.x, lane = group.y;
   if (lane >= min(p.lanes, SPLASH_MAXIMUM_BATCH_WIDTH)) return;
   const ulong pending = ulong(layer) * kPending * kDimension;
-  qsa_store_pending(keys + (ulong(layer) * p.layer_rows + ulong(lane) * p.rows) * kDimension,
-                    SPLASH_LANE_BINDING(lane, pending_in0, pending_in1, pending_in2, pending_in3) + pending,
-                    SPLASH_LANE_BINDING(lane, pending_out0, pending_out1, pending_out2, pending_out3) + pending,
-                    p.first_position[lane], min(retained[lane], p.rows), tid);
+  indexer_store_pending(keys + (ulong(layer) * p.layer_rows + ulong(lane) * p.rows) * kDimension,
+                        SPLASH_LANE_BINDING(lane, pending_in0, pending_in1, pending_in2, pending_in3) + pending,
+                        SPLASH_LANE_BINDING(lane, pending_out0, pending_out1, pending_out2, pending_out3) + pending,
+                        p.first_position[lane], min(retained[lane], p.rows), tid);
 }
 
 // Threadgroup per tile of kScoreRows rows of a lane by kScoreBlocks blocks:
@@ -206,18 +210,18 @@ kernel void qwen4_qsa_commit(device const bfloat *keys [[buffer(0)]],
 // in one MPP product, and each row's score of a block sums its heads' relu
 // over sqrt(dimension). The scratch holds the dispatch's rows, lane after
 // lane.
-constant constexpr uint kScoreRows = QWEN4_QSA_SCORE_ROWS;
-constant constexpr uint kScoreBlocks = QWEN4_QSA_SCORE_BLOCKS;
-constant constexpr uint kScoreThreads = QWEN4_QSA_SCORE_THREADS;
-kernel void qwen4_qsa_score(device const bfloat *queries [[buffer(0)]],
-                            device const SplashKvPage *index_table0 [[buffer(1)]],
-                            device const SplashKvPage *index_table1 [[buffer(2)]],
-                            device const SplashKvPage *index_table2 [[buffer(3)]],
-                            device const SplashKvPage *index_table3 [[buffer(4)]],
-                            device float *scores [[buffer(5)]],
-                            constant Qwen4QsaParams &p [[buffer(6)]],
-                            uint3 group [[threadgroup_position_in_grid]],
-                            uint tid [[thread_index_in_threadgroup]]) {
+constant constexpr uint kScoreRows = BLOCK_INDEXER_SCORE_ROWS;
+constant constexpr uint kScoreBlocks = BLOCK_INDEXER_SCORE_BLOCKS;
+constant constexpr uint kScoreThreads = BLOCK_INDEXER_SCORE_THREADS;
+kernel void block_indexer_score(device const bfloat *queries [[buffer(0)]],
+                                device const SplashKvPage *index_table0 [[buffer(1)]],
+                                device const SplashKvPage *index_table1 [[buffer(2)]],
+                                device const SplashKvPage *index_table2 [[buffer(3)]],
+                                device const SplashKvPage *index_table3 [[buffer(4)]],
+                                device float *scores [[buffer(5)]],
+                                constant BlockIndexerParams &p [[buffer(6)]],
+                                uint3 group [[threadgroup_position_in_grid]],
+                                uint tid [[thread_index_in_threadgroup]]) {
   constexpr ushort M = kScoreRows * kHeads, N = kScoreBlocks, D = kDimension;
   // 16-byte chunks of a head's (or a key's) row.
   constexpr uint Chunks = D * sizeof(bfloat) / sizeof(uint4);
@@ -225,7 +229,7 @@ kernel void qwen4_qsa_score(device const bfloat *queries [[buffer(0)]],
   alignas(16) threadgroup bfloat k[N * D];
   threadgroup float products[M * N];
   const uint row0 = group.y * kScoreRows, block0 = group.x * N, batch = group.z;
-  if (!qsa_lane(batch, p)) return;
+  if (!indexer_lane(batch, p)) return;
   const uint last = min(p.rows, row0 + kScoreRows);
   // Rows attend sparsely past top_blocks complete blocks; complete blocks
   // grow with the row.
@@ -242,7 +246,7 @@ kernel void qwen4_qsa_score(device const bfloat *queries [[buffer(0)]],
     const uint block = block0 + chunk / Chunks;
     uint4 data = 0;
     if (block < complete)
-      data = reinterpret_cast<device const uint4 *>(qsa_index_keys(index_table[block / kPageBlocks], p) +
+      data = reinterpret_cast<device const uint4 *>(indexer_index_keys(index_table[block / kPageBlocks], p) +
                                                     (block % kPageBlocks) * D)[chunk % Chunks];
     reinterpret_cast<threadgroup uint4 *>(k)[chunk] = data;
   }
@@ -285,16 +289,18 @@ kernel void qwen4_qsa_score(device const bfloat *queries [[buffer(0)]],
 // bitmap's words from ballots of 32 consecutive scores: those above the
 // threshold are taken, and of those equal to it the earliest still wanted. A row
 // writes the words the tiles that hold it list from (attention_block_lists:
-// up to their last row's tail, at most two blocks past its own).
+// up to their last row's tail, at most BLOCK_INDEXER_TILE_SLACK blocks past
+// its own).
 constant constexpr uint kSelectBits = 11;
-constant constexpr uint kSelectThreads = QWEN4_QSA_SELECT_THREADS;
+constant constexpr uint kSelectThreads = BLOCK_INDEXER_SELECT_THREADS;
 constant constexpr uint kCandidates = 4096;
 
 // A pass's threshold over its histogram of `bins` bins: the bin of the
 // `wanted`-th highest value and how many of it are wanted, in threshold[0]
 // and [1], and in threshold[2] whether that is all of it.
-inline void qsa_threshold(threadgroup atomic_uint *histogram, uint bins, uint wanted,
-                          threadgroup uint *simd_counts, threadgroup uint *threshold, uint tid, uint lane, uint sg) {
+inline void indexer_threshold(threadgroup atomic_uint *histogram, uint bins, uint wanted,
+                              threadgroup uint *simd_counts, threadgroup uint *threshold, uint tid, uint lane,
+                              uint sg) {
   constexpr uint kRun = (1u << kSelectBits) / kSelectThreads;
   static_assert((1u << kSelectBits) % kSelectThreads == 0, "the threads share the bins out evenly");
   // Thread t sums the t-th run of bins below the top.
@@ -323,13 +329,13 @@ inline void qsa_threshold(threadgroup atomic_uint *histogram, uint bins, uint wa
   threadgroup_barrier(mem_flags::mem_threadgroup);
 }
 
-kernel void qwen4_qsa_select(device const float *scores [[buffer(0)]],
-                             device uint *mask [[buffer(1)]],
-                             constant Qwen4QsaParams &p [[buffer(2)]],
-                             uint2 group [[threadgroup_position_in_grid]],
-                             uint tid [[thread_index_in_threadgroup]],
-                             uint lane [[thread_index_in_simdgroup]],
-                             uint sg [[simdgroup_index_in_threadgroup]]) {
+kernel void block_indexer_select(device const float *scores [[buffer(0)]],
+                                 device uint *mask [[buffer(1)]],
+                                 constant BlockIndexerParams &p [[buffer(2)]],
+                                 uint2 group [[threadgroup_position_in_grid]],
+                                 uint tid [[thread_index_in_threadgroup]],
+                                 uint lane [[thread_index_in_simdgroup]],
+                                 uint sg [[simdgroup_index_in_threadgroup]]) {
   constexpr uint kBins = 1u << kSelectBits;
   threadgroup atomic_uint histogram[kBins];
   threadgroup uint candidates[kCandidates];
@@ -337,10 +343,10 @@ kernel void qwen4_qsa_select(device const float *scores [[buffer(0)]],
   threadgroup uint simd_counts[kSelectThreads / 32];
   threadgroup uint threshold[3];
   const uint batch = group.y;
-  if (group.x >= p.rows || !qsa_lane(batch, p)) return;
+  if (group.x >= p.rows || !indexer_lane(batch, p)) return;
   const uint position = p.first_position[batch] + p.row_offset + group.x;
   const uint complete = (position + 1) / kBlock;
-  const uint words = min(p.mask_words, (complete + 2) / 32 + 1);
+  const uint words = min(p.mask_words, (complete + BLOCK_INDEXER_TILE_SLACK) / 32 + 1);
   device uint *bits = mask + (ulong(batch) * p.rows + p.row_offset + group.x) * p.mask_words;
   if (complete <= p.top_blocks) {
     // Blocks 0..complete, the tail included; later bits stay clear.
@@ -374,7 +380,7 @@ kernel void qwen4_qsa_select(device const float *scores [[buffer(0)]],
       }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    qsa_threshold(histogram, bins, wanted, simd_counts, threshold, tid, lane, sg);
+    indexer_threshold(histogram, bins, wanted, simd_counts, threshold, tid, lane, sg);
     prefix |= threshold[0] << shift;
     prefix_mask |= (bins - 1) << shift;
     wanted = threshold[1];

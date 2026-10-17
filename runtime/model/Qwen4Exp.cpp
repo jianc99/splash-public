@@ -38,7 +38,7 @@ Qwen4IndexerWeights readIndexer(WeightFile &file, const Qwen4ExpLayout &layout) 
   indexer.query = format.projection(file, layout.indexerHeads * layout.indexerHeadDimension, layout.hiddenSize,
                                     "indexer-query");
   indexer.key = format.projection(file, layout.indexerHeadDimension, layout.hiddenSize, "indexer-key");
-  // The indexer scores in fp32 (ops::Qwen4 QSA).
+  // The indexer scores in fp32 (ops::BlockIndexer).
   indexer.query.destination = ops::FloatOutput::Float32;
   indexer.key.destination = ops::FloatOutput::Float32;
   indexer.queryNorm = format.norm(file, layout.indexerHeadDimension, "indexer-query-norm");

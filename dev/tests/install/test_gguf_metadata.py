@@ -671,10 +671,10 @@ class GgufMetadataTests(unittest.TestCase):
     def test_flash_next_arrays_are_screened_by_the_native_layout(self):
         # qwen4exp's QSA block and PLE layer must be Qwen4ExpLayout's
         # (runtime/model/Qwen4Exp.hpp), whose block may name a kernel macro
-        # (runtime/metal/abi/Qwen4.h), which may name another's.
+        # (runtime/metal/abi/BlockIndexer.h), which may name another's.
         runtime = Path(__file__).resolve().parents[3] / "runtime"
         defines = {}
-        for header in ("Qwen4.h", "PagedAttention.h"):
+        for header in ("BlockIndexer.h", "PagedAttention.h"):
             text = (runtime / "metal/abi" / header).read_text()
             defines.update(re.findall(r"^#define (\w+) (\d+)u\b", text, re.M))
             defines.update(re.findall(r"^#define (\w+) ([A-Z]\w*)$", text, re.M))

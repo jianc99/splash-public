@@ -1,8 +1,8 @@
 #include "model/Qwen4Steps.hpp"
 
 #include "Checked.hpp"
+#include "metal/abi/BlockIndexer.h"
 #include "metal/abi/NgramEmbedding.h"
-#include "metal/abi/Qwen4.h"
 #include "model/Qwen4Exp.hpp"
 #include "model/SparseRowStore.hpp"
 #include "ops/NgramEmbedding.hpp"
@@ -24,24 +24,24 @@ constexpr uint32_t kStepRows = kLanes * kVerifyRows;
 // which bounds its score scratch (a row scores every block of the context);
 // a verify scores every lane's rows at once.
 constexpr uint32_t kPrefillScoreRows = 256;
-constexpr uint32_t kIndexWidth = QWEN4_QSA_HEADS * QWEN4_QSA_DIMENSION;
+constexpr uint32_t kIndexWidth = BLOCK_INDEXER_HEADS * BLOCK_INDEXER_DIMENSION;
 
 template <class T> constexpr uint64_t bytesFor(uint64_t elements) noexcept { return elements * sizeof(T); }
 
 // The QSA blocks whose last row is one of `rows` rows from `position`.
 constexpr uint32_t blockCount(uint64_t position, uint32_t rows) noexcept {
-  return static_cast<uint32_t>((position + rows) / QWEN4_QSA_BLOCK - position / QWEN4_QSA_BLOCK);
+  return static_cast<uint32_t>((position + rows) / BLOCK_INDEXER_BLOCK - position / BLOCK_INDEXER_BLOCK);
 }
 // A prefill chunk's blocks, each sequence's after the one before it: a
 // sequence completes at most one block more than its rows hold whole, and a
 // chunk holds at most a sequence per lane. A verify lane's.
-constexpr uint64_t kChunkBlockBytes = (kChunkRows / QWEN4_QSA_BLOCK + kLanes) * sizeof(Qwen4QsaBlock);
+constexpr uint64_t kChunkBlockBytes = (kChunkRows / BLOCK_INDEXER_BLOCK + kLanes) * sizeof(BlockIndexerBlock);
 constexpr uint64_t kLaneBlockBytes =
-    (kVerifyRows + QWEN4_QSA_BLOCK - 1) / QWEN4_QSA_BLOCK * sizeof(Qwen4QsaBlock);
+    (kVerifyRows + BLOCK_INDEXER_BLOCK - 1) / BLOCK_INDEXER_BLOCK * sizeof(BlockIndexerBlock);
 
 // The words of a row's QSA bitmap: a bit per block of the context, the
 // partial block at its end and the current one included.
-uint32_t maskWords(const QwenTargetGeometry &g) { return (g.maximumContextTokens / QWEN4_QSA_BLOCK + 2 + 31) / 32; }
+uint32_t maskWords(const QwenTargetGeometry &g) { return (g.maximumContextTokens / BLOCK_INDEXER_BLOCK + 2 + 31) / 32; }
 // A row's scores: one per block its bitmap covers.
 uint32_t scoreStride(const QwenTargetGeometry &g) { return maskWords(g) * 32; }
 
@@ -71,9 +71,9 @@ struct Tensor final {
 // A step's QSA raw keys: a prefill chunk's of the layer it runs, which its
 // pool reads; a decode step's of every attention layer, which its commit
 // reads after the last.
-uint64_t keyRowBytes(bool decode) { return decode ? 0 : bytesFor<uint16_t>(QWEN4_QSA_DIMENSION); }
+uint64_t keyRowBytes(bool decode) { return decode ? 0 : bytesFor<uint16_t>(BLOCK_INDEXER_DIMENSION); }
 uint64_t keyFixedBytes(const QwenTargetGeometry &g, bool decode) {
-  return decode ? bytesFor<uint16_t>(uint64_t{g.attentionLayerCount()} * kStepRows * QWEN4_QSA_DIMENSION) : 0;
+  return decode ? bytesFor<uint16_t>(uint64_t{g.attentionLayerCount()} * kStepRows * BLOCK_INDEXER_DIMENSION) : 0;
 }
 
 // A prefill chunk's or a decode step's tensors; a streamed PLE table's rows
@@ -94,7 +94,7 @@ std::vector<Tensor> tensors(const QwenTargetGeometry &g, uint64_t pleRowBytes, b
       {&Qwen4Scratch::pleGated, bytesFor<float>(g.streamWidth()), 0, false},
       {&Qwen4Scratch::pleConvolution, bytesFor<uint16_t>(g.streamWidth()), 0, false},
       {&Qwen4Scratch::indexerQuery, bytesFor<float>(kIndexWidth), 0, false},
-      {&Qwen4Scratch::indexerKey, bytesFor<float>(QWEN4_QSA_DIMENSION), 0, false},
+      {&Qwen4Scratch::indexerKey, bytesFor<float>(BLOCK_INDEXER_DIMENSION), 0, false},
       {&Qwen4Scratch::qsaQueries, bytesFor<uint16_t>(kIndexWidth), 0, false},
       {&Qwen4Scratch::qsaKeys, keyRowBytes(decode), keyFixedBytes(g, decode), false},
       {&Qwen4Scratch::qsaScores, 0, bytesFor<float>(uint64_t{scoreRows} * scoreStride(g)), false},
@@ -144,10 +144,10 @@ template <class T> T *contents(const metal::MetalBuffer &buffer) {
 
 // The records of the blocks whose last row is one of `rows` rows from
 // `position`, each its first token's position and RoPE position.
-void writeBlocks(uint64_t position, uint32_t rows, const QwenTargetRequest &request, Qwen4QsaBlock *out) {
+void writeBlocks(uint64_t position, uint32_t rows, const QwenTargetRequest &request, BlockIndexerBlock *out) {
   for (uint64_t last = position; last < position + rows; ++last) {
-    if (last % QWEN4_QSA_BLOCK != QWEN4_QSA_BLOCK - 1) continue;
-    const uint64_t first = last + 1 - QWEN4_QSA_BLOCK;
+    if (last % BLOCK_INDEXER_BLOCK != BLOCK_INDEXER_BLOCK - 1) continue;
+    const uint64_t first = last + 1 - BLOCK_INDEXER_BLOCK;
     const std::array<uint32_t, 3> rope = request.rotary(first);
     *out++ = {static_cast<uint32_t>(first), {rope[0], rope[1], rope[2]}};
   }
@@ -223,7 +223,7 @@ std::vector<Qwen4Blocks> Qwen4Steps::preparePrefill(uint32_t index, const QwenTa
   for (const QwenTargetPrefillSequence &sequence : chunk.sequences) {
     const uint64_t position = sequence.chunk.committed_tokens;
     const uint32_t count = blockCount(position, sequence.rows);
-    const uint64_t bytes = count * sizeof(Qwen4QsaBlock);
+    const uint64_t bytes = count * sizeof(BlockIndexerBlock);
     if (sequence.tokens.size() != sequence.rows || uint64_t{sequence.rowBegin} + sequence.rows > chunk.rows ||
         written + bytes > kChunkBlockBytes)
       throw std::invalid_argument("invalid Qwen3.8-Flash-Next prefill sequence");
@@ -234,7 +234,7 @@ std::vector<Qwen4Blocks> Qwen4Steps::preparePrefill(uint32_t index, const QwenTa
       continue;
     }
     const metal::MetalBuffer view = backend_.view(records, written, bytes);
-    writeBlocks(position, sequence.rows, sequence.request, contents<Qwen4QsaBlock>(view));
+    writeBlocks(position, sequence.rows, sequence.request, contents<BlockIndexerBlock>(view));
     blocks.push_back({view, count});
     written += bytes;
   }
@@ -295,15 +295,15 @@ void Qwen4Steps::prepareVerifyLane(uint32_t lane, uint64_t position, const QwenT
   preparedPositions_[lane] = position;
   if (blockCount(position, kVerifyRows))
     writeBlocks(position, kVerifyRows, request,
-                contents<Qwen4QsaBlock>(backend_.view(decode_, decodeBlocksOffset_ + lane * kLaneBlockBytes,
-                                                      kLaneBlockBytes)));
+                contents<BlockIndexerBlock>(backend_.view(decode_, decodeBlocksOffset_ + lane * kLaneBlockBytes,
+                                                          kLaneBlockBytes)));
 }
 
 Qwen4LaneBlocks Qwen4Steps::verifyBlocks(std::span<const uint32_t> positions) const {
   if (positions.empty() || positions.size() > kLanes) throw std::invalid_argument("invalid Qwen3.8-Flash-Next lanes");
   Qwen4LaneBlocks blocks{.records = backend_.view(decode_, decodeBlocksOffset_, kLanes * kLaneBlockBytes),
                          .counts = {},
-                         .laneRecords = kLaneBlockBytes / sizeof(Qwen4QsaBlock)};
+                         .laneRecords = kLaneBlockBytes / sizeof(BlockIndexerBlock)};
   for (uint32_t lane = 0; lane < positions.size(); ++lane) {
     if (preparedPositions_[lane] != positions[lane])
       throw std::logic_error("a Qwen3.8-Flash-Next verify lane's inputs were prepared for another position");
