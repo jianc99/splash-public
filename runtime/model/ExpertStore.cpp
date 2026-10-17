@@ -272,6 +272,7 @@ struct ExpertStore::Impl {
   void stage(uint32_t block, uint32_t capacity, ExpertStoreStats::Use &use);
   std::span<const uint32_t> predictedExperts(uint32_t rows);
   void readAhead(uint32_t block, std::span<const uint32_t> experts, ExpertStoreStats::Use &use);
+  void startAhead();
   // The host step after a long chunk's load: block `block`'s experts that
   // are not resident read ahead into the whole staging.
   void readBlockAhead(uint32_t block, ops::MoePhase phase);
@@ -545,9 +546,9 @@ std::span<const uint32_t> ExpertStore::Impl::predictedExperts(uint32_t rows) {
   return predictionOrder;
 }
 
-// Reads ahead, on the readers, block `index`'s experts `experts` (most
-// likely first) in that order into the places the round just staged left
-// free, as many as there are.
+// Lays out a read-ahead of block `index`'s experts `experts` (most likely
+// first) in that order into the places the round just staged left free, as
+// many as there are; the step's `then` starts it (startAhead).
 void ExpertStore::Impl::readAhead(uint32_t index, std::span<const uint32_t> experts, ExpertStoreStats::Use &use) {
   ahead.reads.groups.clear();
   ahead.reads.pieces.clear();
@@ -562,6 +563,14 @@ void ExpertStore::Impl::readAhead(uint32_t index, std::span<const uint32_t> expe
   if (ahead.reads.groups.empty()) return;
   ahead.block = index;
   ahead.use = &use;
+}
+
+// Starts the read-ahead the step laid out, on the readers, once the GPU went
+// on: readers that start reading as the step ends hold its release back (35B
+// decode on an M6: 30-60 us a step with four of them). A release forgets it.
+void ExpertStore::Impl::startAhead() {
+  std::lock_guard lock(mutex);
+  if (ahead.block == kNoSlot || ahead.batch) return;
   ahead.batch = readers->start(
       ahead.reads.pieces.size(),
       [this](size_t task) {
@@ -572,13 +581,13 @@ void ExpertStore::Impl::readAhead(uint32_t index, std::span<const uint32_t> expe
 }
 
 // Stops the read-ahead: once its readers ended the pieces they took, `read`
-// tells which of them they read, the experts they read whole count, and
-// their bytes.
+// tells which of them they read (none of one that never started), the
+// experts they read whole count, and their bytes.
 void ExpertStore::Impl::stopAhead() {
+  ahead.read.assign(ahead.reads.pieces.size(), 0);
   if (!ahead.batch) return;
   readers->stop(*ahead.batch);
   const WeightReaders::Batch &batch = *ahead.batch;
-  ahead.read.assign(ahead.reads.pieces.size(), 0);
   std::vector<uint8_t> whole(ahead.reads.groups.size(), 1);
   for (size_t p = 0; p < ahead.read.size(); ++p) {
     const Piece &piece = ahead.reads.pieces[p];
@@ -937,12 +946,14 @@ void ExpertStore::addLoad(metal::CommandGraph &graph, std::span<const ops::MoeLo
     times.work.add(nanoseconds(timing.workSeconds));
     times.resume.add(nanoseconds(timing.resumeSeconds));
   };
+  // Each step's read-ahead starts once the GPU went on (startAhead).
+  const auto startAhead = [impl = impl_] { impl->startAhead(); };
   for (uint32_t round = 0; round < rounds; ++round) {
     graph.host(
         [impl = impl_, block, phase, rows, predicted, tiles, round, rounds] {
           impl->load(block, phase, rows, predicted, tiles, round, rounds);
         },
-        timed, awake);
+        timed, awake, startAhead);
     ops::MoE::addExpertLoad(graph, impl.staging, size.arena, impl.jobs, impl.sources, size.load,
                             static_cast<uint32_t>(std::min<uint64_t>(routable, impl.places.count)),
                             metal::IndirectGrid{impl.grid, 0});
@@ -953,7 +964,7 @@ void ExpertStore::addLoad(metal::CommandGraph &graph, std::span<const ops::MoeLo
   // next block's mixing, as many as the next load would otherwise read
   // with the GPU waiting.
   if (impl.longChunk(phase, rows) && block + 1 < impl.blocks.size() && impl.streams(block + 1))
-    graph.host([impl = impl_, block, phase] { impl->readBlockAhead(block + 1, phase); }, timed, false);
+    graph.host([impl = impl_, block, phase] { impl->readBlockAhead(block + 1, phase); }, timed, false, startAhead);
 }
 
 ExpertStoreStats ExpertStore::stats() const {
