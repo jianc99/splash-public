@@ -445,6 +445,9 @@ void PagedAttention::addVerify(metal::CommandGraph &graph, SplashKvLayer layer,
   for (uint32_t lane = 0; lane < plan.lanes; ++lane)
     requirePageTable(buffers.pageTables[lane], chunks[lane]);
   requireBlocks(blocks, plan.sparse, plan.lanes);
+  // Step 0 stub, which M3 (attention kernels) replaces with the located split.
+  if (blocks.locations)
+    throw std::logic_error("the located verify split is not built yet (HiSparse M3)");
   // verifyParams validated each chunk, and the plan scaled each lane's
   // split count from the same committed history; every lane's partials use
   // the plan-wide slot stride.
@@ -508,6 +511,12 @@ void PagedAttention::addBlockLists(metal::CommandGraph &graph, const metal::Meta
   requireBytes(blocks.counts, lists * sizeof(uint32_t), "attention block list counts");
   graph.add("attention_block_lists", {mask, blocks.lists, blocks.counts}, params,
             {tiles, sequences.size(), 1}, {SPLASH_ATTENTION_BLOCK_LIST_THREADS, 1, 1});
+}
+
+void PagedAttention::addStageLayer(metal::CommandGraph &, SplashKvLayer, metal::MetalBuffer, SplashKvLayer,
+                                   metal::MetalBuffer, uint32_t, uint32_t, kv::Layout) {
+  // Step 0 stub, which M3 (attention kernels) replaces with the stage kernel.
+  throw std::logic_error("the KV stage kernel is not built yet (HiSparse M3)");
 }
 
 } // namespace splash::ops

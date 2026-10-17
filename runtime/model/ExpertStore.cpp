@@ -1,10 +1,10 @@
 #include "model/ExpertStore.hpp"
 
 #include "metal/abi/MoE.h"
-#include "model/ExpertSlots.hpp"
 #include "model/GgufImageLayout.hpp"
 #include "model/GgufPreparation.hpp"
 #include "model/Model.hpp"
+#include "model/SlotRecycler.hpp"
 #include "model/WeightImages.hpp"
 #include "model/WeightLayout.hpp"
 #include "model/WeightSource.hpp"
@@ -198,7 +198,7 @@ struct ExpertStore::Impl {
   };
   // The experts of one layout in one arena (of some of its blocks, when the
   // layout's would exceed the largest buffer): their slots, a streamed
-  // size's recycled in its order (ExpertSlots).
+  // size's recycled in its order (SlotRecycler).
   struct Size final {
     ExpertLayout layout;
     uint32_t blocks = 0;
@@ -212,7 +212,7 @@ struct ExpertStore::Impl {
     MoeExpertLoadParams load{};
     uint32_t loadGroups = 0;
     // Which slot a load's missing expert takes.
-    ExpertSlots recycling{0};
+    SlotRecycler recycling{0};
     std::vector<uint32_t> ownerBlock, ownerExpert; // kNoSlot when free
   };
   struct Block final {
@@ -227,7 +227,7 @@ struct ExpertStore::Impl {
     metal::MetalBuffer descriptors, count;
   };
 
-  Impl(metal::MetalBackend &backend, ops::MoeShape shape, Geometry geometry, std::shared_ptr<WeightReaders> readers)
+  Impl(metal::MetalBackend &backend, ops::MoeShape shape, Geometry geometry, std::shared_ptr<SsdReaders> readers)
       : backend(backend), shape(shape), geometry(std::move(geometry)), readers(std::move(readers)) {}
   // The readers of a read-ahead read into this store's memory: they end the
   // pieces they took before it goes.
@@ -287,7 +287,7 @@ struct ExpertStore::Impl {
   metal::MetalBackend &backend;
   const ops::MoeShape shape;
   const Geometry geometry;
-  const std::shared_ptr<WeightReaders> readers;
+  const std::shared_ptr<SsdReaders> readers;
   // What holds the sources open, and their checks (StreamedBlocks).
   std::shared_ptr<const void> files;
   std::vector<std::function<void()>> checks;
@@ -317,7 +317,7 @@ struct ExpertStore::Impl {
   struct Ahead final {
     uint32_t block = kNoSlot;
     Reads reads;
-    std::shared_ptr<WeightReaders::Batch> batch;
+    std::shared_ptr<SsdReaders::Batch> batch;
     ExpertStoreStats::Use *use = nullptr;
     std::vector<uint8_t> counted;
   } ahead;
@@ -478,7 +478,7 @@ void ExpertStore::Impl::stage(uint32_t index, uint32_t capacity, ExpertStoreStat
   // those of an expert it stages, a few hundred us at most, and keeps the
   // places of the others.
   const std::vector<Piece> &aheadPieces = ahead.reads.pieces;
-  const WeightReaders::Batch *batch = ahead.batch.get();
+  const SsdReaders::Batch *batch = ahead.batch.get();
   const auto reading = [&](size_t piece) { return piece < batch->taken() && !batch->ended(piece); };
   for (size_t piece = 0, end = 0; batch && piece < aheadPieces.size(); piece = end) {
     const uint32_t at = aheadPieces[piece].group;
@@ -626,7 +626,7 @@ void ExpertStore::Impl::startAhead() {
 void ExpertStore::Impl::countAhead(size_t group, size_t from, size_t to) {
   if (ahead.counted[group]) return;
   ahead.counted[group] = 1;
-  const WeightReaders::Batch &batch = *ahead.batch;
+  const SsdReaders::Batch &batch = *ahead.batch;
   bool whole = true;
   for (size_t p = from; p < to; ++p) {
     const Piece &piece = ahead.reads.pieces[p];
@@ -892,7 +892,7 @@ ExpertStore::ExpertStore(metal::MetalBackend &backend, StreamedBlocks streamed, 
     size.arena = backend.allocateBuffer(region, metal::BufferStorage::Shared,
                                         "experts/arena-" + std::to_string(index));
     impl.arenaTotal += region;
-    size.recycling = ExpertSlots(size.slots);
+    size.recycling = SlotRecycler(size.slots);
     size.ownerBlock.assign(size.slots, kNoSlot);
     size.ownerExpert.assign(size.slots, kNoSlot);
   }

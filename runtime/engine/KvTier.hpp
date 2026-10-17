@@ -6,6 +6,10 @@
 #include <memory>
 #include <vector>
 
+namespace splash::model {
+class KvCopy;
+} // namespace splash::model
+
 namespace splash::engine {
 
 // One slot of the disk tier holding a KV page; releasing the last handle
@@ -61,6 +65,13 @@ public:
   [[nodiscard]] virtual std::unique_ptr<KvTransfer>
   restore(std::shared_ptr<KvDiskSlot> slot, uint32_t page,
           std::function<void()> completion) = 0;
+  // Starts the restores queued since the last call together; a tier that
+  // starts each as it comes has none to start.
+  virtual void submitRestores() {}
+  // The slot's copy as reads of spilled K/V reach it (model::KvPageSource),
+  // on any thread, for as long as they hold it.
+  [[nodiscard]] virtual std::shared_ptr<const model::KvCopy>
+  copy(const std::shared_ptr<KvDiskSlot> &slot) const = 0;
   // Engine-thread bookkeeping after IO completes.
   virtual void poll() = 0;
 };

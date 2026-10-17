@@ -10,7 +10,7 @@
 // projections) share an arena of slots, or several, each of some of its
 // blocks, when one would take more than the device's largest buffer. A size
 // of several blocks streams: an arena's slots are recycled across its blocks
-// by adaptive replacement (ExpertSlots), which keeps the experts decode steps
+// by adaptive replacement (SlotRecycler), which keeps the experts decode steps
 // route again and again, and recycles a long prefill chunk's loads first. A
 // size of one block (a layer whose experts take formats no other layer's do, as a
 // dynamic quantization leaves some) holds every one of its experts: they are
@@ -50,7 +50,7 @@
 // experts of the sizes of one block again, and the loads after it every
 // expert they route.
 //
-// Reads run on the model's weight readers (model::WeightReaders), which try a
+// Reads run on the model's SSD readers (model::SsdReaders), which try a
 // failed read once more. A load checks its sources unchanged after it read
 // them. A load that fails (a read of an expert it routes fails twice, or a
 // source was written) frees the slots of the experts it had not repacked and
@@ -69,8 +69,8 @@
 #include "metal/MetalBackend.hpp"
 #include "model/ExpertStoreStats.hpp"
 #include "model/GgufImage.hpp"
+#include "model/SsdReaders.hpp"
 #include "model/WeightMemory.hpp"
-#include "model/WeightReaders.hpp"
 #include "ops/MoE.hpp"
 
 #include <cstdint>
@@ -97,7 +97,7 @@ struct ExpertStoreOptions final {
   // at least a block's experts of each size and all of a size of one block.
   uint64_t memoryBytes = 0;
   // The readers its reads run on, which a model's streamed weights share.
-  std::shared_ptr<WeightReaders> readers;
+  std::shared_ptr<SsdReaders> readers;
   // The most bytes one arena takes: the device's largest buffer
   // (maxBufferLength) when zero or more.
   uint64_t bufferBytes = 0;

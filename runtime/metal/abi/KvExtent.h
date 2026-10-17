@@ -18,6 +18,11 @@
 typedef uint64_t SplashKvPage;
 #define SPLASH_KV_PAGE_INDEX_BITS 14u
 #define SPLASH_KV_PAGE_INDEX_MASK ((1u << SPLASH_KV_PAGE_INDEX_BITS) - 1u)
+// The K/V entry of a page that holds only its blocks' index (kv::PageForm::
+// Index): no K/V to reach. A kernel that reads through it faults, loudly, on
+// the null address; the target's dense-history rule keeps every read that
+// goes through a page table off such pages.
+#define SPLASH_KV_PAGE_ABSENT ((SplashKvPage)0)
 
 // The dimension of every KV head a page holds.
 #define SPLASH_KV_HEAD_DIMENSION 256u

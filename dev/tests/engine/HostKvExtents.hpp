@@ -5,6 +5,7 @@
 #include "ops/PagedKv.hpp"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cstddef>
 #include <cstdint>
@@ -124,6 +125,36 @@ public:
     auto *entries = static_cast<SplashKvPage *>(table);
     for (size_t index = 0; index < pages.size(); ++index)
       entries[index] = entry(pages[index]);
+  }
+  // The same for an index table (kv::PageStorage::writeIndexEntries): the
+  // entries that reach the pages' block index, which sits in their extent
+  // at indexOffset().
+  void writeIndexTable(std::span<const uint32_t> pages, void *table) const { writeTable(pages, table); }
+  // Where a layer's block index sits in every extent, as
+  // kv::PageStorage::indexOffset places it: after every layer's K/V region.
+  [[nodiscard]] uint64_t indexOffset(uint32_t layer) const {
+    if (!layout_.indexDimension || layer >= layout_.attentionLayers)
+      throw std::out_of_range("host KV layer has no index region");
+    return uint64_t{extentPages_} * (uint64_t{layout_.attentionLayers} * layout_.bytesPerLayerPage() +
+                                     uint64_t{layer} * layout_.indexBytesPerLayerPage());
+  }
+  // A page's bytes as kv::PageStorage::layerSpans and indexSpans give them:
+  // one layer's tensors, by SPLASH_KV_KEYS to SPLASH_KV_VALUE_SCALES (empty
+  // scales for BF16), and each layer's block index.
+  [[nodiscard]] std::array<std::span<std::byte>, 4> layerSpans(uint32_t page, uint32_t layer) const {
+    if (layer >= layout_.attentionLayers)
+      throw std::out_of_range("host KV layer is outside the layout");
+    std::array<std::span<std::byte>, 4> result;
+    for (uint32_t tensor = SPLASH_KV_KEYS; tensor <= SPLASH_KV_VALUE_SCALES; ++tensor)
+      result[tensor] = {slab<std::byte>(layer, tensor, page), splash_kv_page_bytes(dataBytes(), scaleBytes(), tensor)};
+    return result;
+  }
+  [[nodiscard]] std::vector<std::span<std::byte>> indexSpans(uint32_t page) const {
+    std::vector<std::span<std::byte>> result;
+    const uint64_t bytes = layout_.indexBytesPerLayerPage();
+    for (uint32_t layer = 0; layout_.indexDimension && layer < layout_.attentionLayers; ++layer)
+      result.emplace_back(extent(page).contents + indexOffset(layer) + page % extentPages_ * bytes, bytes);
+    return result;
   }
   // Where one value of a KV head sits in a page's slab of values, in the
   // layout's value order (kv::Layout::valuesTokenMajor).

@@ -1,9 +1,12 @@
 #pragma once
 
+#include "TestKvTier.hpp"
 #include "engine/Cache.hpp"
 
 #include <cstdint>
 #include <span>
+#include <stdexcept>
+#include <vector>
 
 namespace splash::test {
 
@@ -18,6 +21,33 @@ inline uint64_t publishBlocks(engine::Cache &cache, uint64_t requestId,
   return committedTokens < pageTokens
              ? 0
              : cache.blockAt(requestId, committedTokens / pageTokens * pageTokens);
+}
+
+// One round of what the engine does between commands to spill, with the
+// tier's IO done at once: starts writing the Spill requests' published pages
+// through (Cache::writeThrough), lands every write (TestKvTier::complete) and
+// moves the eligible pages to the index form (Cache::spillWritten). Returns
+// the writes it started; throws when the cache refused the move.
+inline uint32_t spillRound(engine::Cache &cache, TestKvTier &tier) {
+  const uint32_t written = cache.writeThrough();
+  tier.complete();
+  static_cast<void>(cache.pollTransfers());
+  if (!cache.spillWritten().granted())
+    throw std::runtime_error("the cache refused to spill the pages whose copies landed");
+  return written;
+}
+
+// The blocks the request's next command reads from their copies, by page,
+// 0 for a Full page: its page sources, cut as the engine cuts them
+// (Cache::cutPageTable).
+inline std::vector<uint64_t> indexBlocks(engine::Cache &cache, uint64_t requestId) {
+  const engine::PageTableView table = cache.cutPageTable(requestId);
+  std::vector<uint64_t> blocks(table.pages.size());
+  if (table.sources) {
+    for (uint32_t page = 0; page < blocks.size(); ++page)
+      blocks[page] = (*table.sources)[page].block;
+  }
+  return blocks;
 }
 
 } // namespace splash::test

@@ -919,7 +919,7 @@ void stagedGather(MetalBackend &backend) {
     model::SparseRowStore store({"table", kRows, bytesPerRow, 0}, std::make_unique<MemoryRows>(native),
                                 {model::SparseRowStore::cacheBytesFor(kRows / 2, bytesPerRow) +
                                      model::SparseRowStore::workingBytes(bytesPerRow, 1024, 0),
-                                 std::make_shared<model::WeightReaders>(2), 1024});
+                                 std::make_shared<model::SsdReaders>(2), 1024});
     const EmbeddingWeights table(kRows, hidden, NativeRows(upload(backend, native), f));
     for (int step = 0; step < 2; ++step) {
       std::vector<uint32_t> ids(kCount);

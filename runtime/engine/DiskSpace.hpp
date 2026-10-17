@@ -59,6 +59,11 @@ inline constexpr uint64_t kAutomaticCacheDiskBytes = uint64_t{32} << 30;
 // frees them cost it at most a third more than it freed.
 [[nodiscard]] uint64_t diskLimitBytes(uint64_t quotaBytes, uint64_t availableBytes,
                                       uint64_t heldBytes, uint64_t floorBytes) noexcept;
+// The most active KV may take there (model::DiskBudget::activeLimitBytes):
+// all of its room, and at most the quota:
+//   min(quota, max(0, available + held - floor)).
+[[nodiscard]] uint64_t diskActiveLimitBytes(uint64_t quotaBytes, uint64_t availableBytes,
+                                            uint64_t heldBytes, uint64_t floorBytes) noexcept;
 
 // Why the automatic quota leaves the tier off on this volume, where the
 // tier's files would already hold `heldBytes`: it cannot be measured, it is

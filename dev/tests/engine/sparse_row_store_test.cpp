@@ -103,7 +103,7 @@ uint64_t bytesFor(uint64_t rows, uint32_t prefetchRows) {
 // A store's options: its bytes, `readers` readers of its own, the prefetch
 // bound and the stage scratch.
 SparseRowStoreOptions optionsOf(uint64_t bytes, uint32_t readers, uint32_t prefetchRows) {
-  return {bytes, std::make_shared<WeightReaders>(readers), prefetchRows, kStageRows};
+  return {bytes, std::make_shared<SsdReaders>(readers), prefetchRows, kStageRows};
 }
 
 struct Fixture final {

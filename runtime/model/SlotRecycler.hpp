@@ -30,10 +30,10 @@
 
 namespace splash::model {
 
-class ExpertSlots final {
+class SlotRecycler final {
 public:
   // `slots` slots, every one free.
-  explicit ExpertSlots(uint32_t slots);
+  explicit SlotRecycler(uint32_t slots);
 
   // Load `load` routes the expert in `slot`.
   void touch(uint32_t slot, uint64_t load, bool chunk);

@@ -1,4 +1,4 @@
-#include "model/WeightReaders.hpp"
+#include "model/SsdReaders.hpp"
 
 #include <pthread/qos.h>
 
@@ -7,12 +7,12 @@
 
 namespace splash::model {
 
-bool WeightReaders::Batch::claim(size_t &index) noexcept {
+bool SsdReaders::Batch::claim(size_t &index) noexcept {
   index = next_.fetch_add(1, std::memory_order_acq_rel);
   return index < count_;
 }
 
-void WeightReaders::Batch::end(size_t index, std::exception_ptr failure) {
+void SsdReaders::Batch::end(size_t index, std::exception_ptr failure) {
   if (failure) {
     const std::lock_guard lock(mutex_);
     failures_.emplace_back(index, std::move(failure));
@@ -30,7 +30,7 @@ void WeightReaders::Batch::end(size_t index, std::exception_ptr failure) {
   changed_.notify_all();
 }
 
-void WeightReaders::Batch::wait() {
+void SsdReaders::Batch::wait() {
   std::unique_lock lock(mutex_);
   // Every task taken ended, and a batch whose every task ran also its end:
   // a waiter reads what `ended` wrote.
@@ -40,23 +40,23 @@ void WeightReaders::Batch::wait() {
   });
 }
 
-bool WeightReaders::Batch::failed(size_t index) const {
+bool SsdReaders::Batch::failed(size_t index) const {
   const std::lock_guard lock(mutex_);
   return std::ranges::any_of(failures_, [index](const auto &failure) { return failure.first == index; });
 }
 
-WeightReaders::Tally WeightReaders::Batch::tally() const {
+SsdReaders::Tally SsdReaders::Batch::tally() const {
   const std::lock_guard lock(mutex_);
   return {retries_.load(std::memory_order_relaxed), failures_.size()};
 }
 
-std::exception_ptr WeightReaders::Batch::failure() const {
+std::exception_ptr SsdReaders::Batch::failure() const {
   const std::lock_guard lock(mutex_);
   if (failures_.empty()) return nullptr;
   return std::ranges::min(failures_, {}, [](const auto &failure) { return failure.first; }).second;
 }
 
-WeightReaders::WeightReaders(unsigned readers) {
+SsdReaders::SsdReaders(unsigned readers) {
   threads_.reserve(readers);
   try {
     for (unsigned reader = 0; reader < readers; ++reader) threads_.emplace_back([this] { readerLoop(); });
@@ -71,7 +71,7 @@ WeightReaders::WeightReaders(unsigned readers) {
   }
 }
 
-WeightReaders::~WeightReaders() {
+SsdReaders::~SsdReaders() {
   {
     const std::lock_guard lock(mutex_);
     stopping_ = true;
@@ -80,7 +80,7 @@ WeightReaders::~WeightReaders() {
   for (std::thread &thread : threads_) thread.join();
 }
 
-void WeightReaders::run(size_t count, const Task &task, Tally *tally) {
+void SsdReaders::run(size_t count, const Task &task, Tally *tally) {
   if (tally) *tally = {};
   if (!count) return;
   const std::shared_ptr<Batch> batch(new Batch(count, task, readers(), {}));
@@ -89,7 +89,7 @@ void WeightReaders::run(size_t count, const Task &task, Tally *tally) {
   if (const std::exception_ptr failure = batch->failure()) std::rethrow_exception(failure);
 }
 
-std::shared_ptr<WeightReaders::Batch> WeightReaders::start(size_t count, Task task, unsigned readers,
+std::shared_ptr<SsdReaders::Batch> SsdReaders::start(size_t count, Task task, unsigned readers,
                                                            std::function<void(const Batch &)> ended) {
   if (!readers) throw std::invalid_argument("a background read without readers");
   const std::shared_ptr<Batch> batch(new Batch(count, std::move(task), readers, std::move(ended)));
@@ -106,21 +106,21 @@ std::shared_ptr<WeightReaders::Batch> WeightReaders::start(size_t count, Task ta
   return batch;
 }
 
-void WeightReaders::halt(Batch &batch) {
+void SsdReaders::halt(Batch &batch) {
   // A halted batch keeps the tasks taken before.
   const size_t taken = batch.next_.exchange(batch.count_, std::memory_order_acq_rel);
   batch.limit_.store(std::min({taken, batch.count_, batch.limit_.load(std::memory_order_acquire)}),
                      std::memory_order_release);
 }
 
-void WeightReaders::stop(Batch &batch) {
+void SsdReaders::stop(Batch &batch) {
   halt(batch);
   batch.wait();
   const std::lock_guard lock(mutex_);
   std::erase_if(background_, [&](const std::shared_ptr<Batch> &queued) { return queued.get() == &batch; });
 }
 
-void WeightReaders::finish(Batch &batch) {
+void SsdReaders::finish(Batch &batch) {
   std::shared_ptr<Batch> owned;
   {
     const std::lock_guard lock(mutex_);
@@ -136,7 +136,7 @@ void WeightReaders::finish(Batch &batch) {
   else batch.wait();
 }
 
-void WeightReaders::runNow(const std::shared_ptr<Batch> &batch) {
+void SsdReaders::runNow(const std::shared_ptr<Batch> &batch) {
   {
     const std::lock_guard lock(mutex_);
     now_.push_back(batch);
@@ -158,13 +158,13 @@ void WeightReaders::runNow(const std::shared_ptr<Batch> &batch) {
   if (background) wake_.notify_all();
 }
 
-void WeightReaders::wakeReaders(size_t count) {
+void SsdReaders::wakeReaders(size_t count) {
   if (count >= threads_.size()) wake_.notify_all();
   else
     for (size_t reader = 0; reader < count; ++reader) wake_.notify_one();
 }
 
-void WeightReaders::attempt(Batch &batch, size_t index) {
+void SsdReaders::attempt(Batch &batch, size_t index) {
   std::exception_ptr failure;
   try {
     batch.task_(index);
@@ -179,12 +179,12 @@ void WeightReaders::attempt(Batch &batch, size_t index) {
   batch.end(index, std::move(failure));
 }
 
-void WeightReaders::work(const std::shared_ptr<Batch> &batch, bool background) {
+void SsdReaders::work(const std::shared_ptr<Batch> &batch, bool background) {
   for (size_t index; !(background && running_.load(std::memory_order_acquire)) && batch->claim(index);)
     attempt(*batch, index);
 }
 
-void WeightReaders::readerLoop() {
+void SsdReaders::readerLoop() {
   // A step waits on their reads.
   pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
   std::unique_lock lock(mutex_);

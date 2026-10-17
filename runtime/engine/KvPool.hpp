@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -61,6 +62,17 @@ struct KvPageAcquisition {
   }
 };
 
+// Pages moved to the other form (KvPool::movePages): where each went, or,
+// with nothing moved, why the pool could not grow by an extent of the form.
+struct KvPageMoveResult final {
+  KvPageMoves moves;
+  metal::AllocationFailure failure = metal::AllocationFailure::None;
+
+  [[nodiscard]] bool granted() const noexcept {
+    return failure == metal::AllocationFailure::None;
+  }
+};
+
 // Sole owner of KV page references and of which extents are allocated.
 // Requests hold counted references to a page; the cache owns a page once,
 // for the one block on it (prefixOwner). The pool alone allocates and
@@ -79,8 +91,9 @@ public:
   // std::invalid_argument for a runway longer than the pool.
   KvPool(kv::ExtentStorage &storage, uint32_t runwayPages);
 
-  // The pages come with one active reference each, the requester's.
-  [[nodiscard]] KvPageAcquisition acquirePages(uint32_t count);
+  // The pages, of the form, come with one active reference each, the
+  // requester's.
+  [[nodiscard]] KvPageAcquisition acquirePages(uint32_t count, kv::PageForm form = kv::PageForm::Full);
   void retainPage(uint32_t page, bool prefixOwner);
   void releasePage(uint32_t page, bool prefixOwner);
   // Zeroes a page its requester holds alone and has not written yet, so the
@@ -91,11 +104,18 @@ public:
   [[nodiscard]] uint32_t pageCount() const noexcept;
   [[nodiscard]] uint64_t bytesPerPage() const noexcept;
   [[nodiscard]] uint32_t extentPages() const noexcept { return extentPages_; }
-  // Free pages of allocated extents; acquisition hands these out first.
-  [[nodiscard]] uint32_t freePageCount() const noexcept;
+  // Free pages of the form's allocated extents; acquisition hands these out
+  // first.
+  [[nodiscard]] uint32_t freePageCount(kv::PageForm form = kv::PageForm::Full) const noexcept;
+  // What the page holds: its extent's form.
+  [[nodiscard]] kv::PageForm form(uint32_t page) const;
   // A request holds the page, as one of its own or as a page of a cached
   // chain it uses.
   [[nodiscard]] bool pageActive(uint32_t page) const;
+  // Between commands: gives each page, of the other form, a page of form
+  // `to` that takes its index (ExtentStorage::copyPages) and its references,
+  // as compactExtent() moves them, and frees it; all of them or none.
+  [[nodiscard]] KvPageMoveResult movePages(std::span<const uint32_t> pages, kv::PageForm to);
   [[nodiscard]] uint64_t allocatedBytes() const noexcept;
   // Pages of allocated extents no request holds: free, or held only by the
   // cache.
@@ -103,11 +123,13 @@ public:
     return allocatedExtents_ * extentPages_ - activePages_;
   }
 
-  // Releases completely unreferenced extents, at most `limit` of them, and
-  // returns the bytes released. keepRunway keeps one empty extent warm, so
-  // the next request does not wait for an allocation; unlike the runway the
+  // Releases completely unreferenced extents, of the form or of either, at
+  // most `limit` of them, and returns the bytes released. keepRunway keeps
+  // one empty extent of each form warm, so the next request, or the next
+  // spill, does not wait for an allocation; unlike the runway the
   // constructor allocates, it is always a single extent.
-  [[nodiscard]] uint64_t reclaimEmptyExtents(bool keepRunway, uint32_t limit);
+  [[nodiscard]] uint64_t reclaimEmptyExtents(bool keepRunway, uint32_t limit,
+                                             std::optional<kv::PageForm> form = std::nullopt);
   // Empties the allocated extent that holds the fewest pages, by moving each
   // of them to a free page of the other extents that hold pages, fullest
   // first: free pages scattered over the pool become an empty extent, which

@@ -43,9 +43,9 @@ namespace splash::model {
 // A model's readers: an SSD reads small pieces at full speed only with many
 // in flight (an M5 Pro's reads 460 KiB pieces at 8.1 GB/s from four threads
 // and at 12.5 GB/s from sixteen).
-inline constexpr unsigned kWeightReaders = 16;
+inline constexpr unsigned kSsdReaders = 16;
 
-class WeightReaders final {
+class SsdReaders final {
 public:
   using Task = std::function<void(size_t index)>;
   // A batch's tasks tried again after a failure, and those that failed again.
@@ -67,7 +67,7 @@ public:
     [[nodiscard]] Tally tally() const;
 
   private:
-    friend class WeightReaders;
+    friend class SsdReaders;
     Batch(size_t count, Task task, unsigned readers, std::function<void(const Batch &)> ended)
         : count_(count), task_(std::move(task)), readers_(readers), ended_(std::move(ended)),
           ends_(std::make_unique<std::atomic<bool>[]>(count)), limit_(count) {}
@@ -81,7 +81,7 @@ public:
     const size_t count_;
     const Task task_;
     // The most readers on it at once while it runs in the background, and
-    // those on it (under WeightReaders::mutex_).
+    // those on it (under SsdReaders::mutex_).
     const unsigned readers_;
     unsigned working_ = 0;
     // Runs on the thread that ended its last task, when every task ran;
@@ -100,12 +100,12 @@ public:
   };
 
   // Starts `readers` threads.
-  explicit WeightReaders(unsigned readers);
+  explicit SsdReaders(unsigned readers);
   // Ends the readers once the tasks they took ended; every background batch
   // was stopped or finished.
-  ~WeightReaders();
-  WeightReaders(const WeightReaders &) = delete;
-  WeightReaders &operator=(const WeightReaders &) = delete;
+  ~SsdReaders();
+  SsdReaders(const SsdReaders &) = delete;
+  SsdReaders &operator=(const SsdReaders &) = delete;
 
   // Runs task(i) for every i below count now (see above); throws the first
   // failure once every task ended, and counts its retries and failures in
@@ -130,6 +130,10 @@ public:
   void finish(Batch &batch);
 
   [[nodiscard]] unsigned readers() const noexcept { return static_cast<unsigned>(threads_.size()); }
+  // A batch runs now, from its start until its last task ended: a step waits
+  // for reads, which writes to the same drive yield to
+  // (model::SlotFile::Options::deferWrites).
+  [[nodiscard]] bool criticalBusy() const noexcept { return running_.load(std::memory_order_acquire) != 0; }
 
 private:
   void readerLoop();
