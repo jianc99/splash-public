@@ -5,7 +5,7 @@
 // - the hyper-connection mix at Flash-Next's shape: per-stream RMS norm,
 //   injection weights, the low-rank gate and the stream average; the combine
 //   and the streams' start; the norm's two kernels against each other, bit
-//   for bit, and with a pending block output against combine-then-norm;
+//   for bit;
 // - the PLE gate, its dilated convolution over a history, the history after
 //   a sequence's rows and after a verify step's retained rows;
 // - QSA: the indexer's normalized, rotated queries (bf16) and raw keys at
@@ -126,7 +126,7 @@ void hyperTest(MetalBackend &backend) {
               weights = scratch(backend, rows * streams * 4);
   const NormWeights nw{upload(backend, normPlus), true};
   CommandGraph graph;
-  ops::HyperConnection::addNorm(graph, xs, {}, nw, upload(backend, inject), normalized, weights, shape, rows);
+  ops::HyperConnection::addNorm(graph, xs, nw, upload(backend, inject), normalized, weights, shape, rows);
   run(backend, graph);
   const auto gotN = download<uint16_t>(normalized, rows * width);
   const auto gotW = download<float>(weights, rows * streams);
@@ -243,10 +243,10 @@ void hyperTableTest(MetalBackend &backend) {
   MetalBuffer normalizedT = zeroed(rows * width * 2), weightsT = zeroed(rows * streams * 4);
   const ops::LinearScratch normRef = table(width), normGot = table(width);
   CommandGraph norm;
-  ops::HyperConnection::addNorm(norm, xs, {}, nw, inject, normalized, weights, shape, rows);
+  ops::HyperConnection::addNorm(norm, xs, nw, inject, normalized, weights, shape, rows);
   prepare(norm, normalized, normRef, width);
   const ops::PreparedInput prepared =
-      ops::HyperConnection::addNorm(norm, xs, {}, nw, inject, normalizedT, weightsT, shape, rows, normGot,
+      ops::HyperConnection::addNorm(norm, xs, nw, inject, normalizedT, weightsT, shape, rows, normGot,
                                     ops::LinearInput::Table16);
   run(backend, norm);
   check(prepared.layout == ops::LinearInput::Table16 && prepared.source.sameView(normalizedT),
@@ -331,27 +331,26 @@ void hyperNormKernelsTest(MetalBackend &backend, bool exact) {
     const bool quarters = rows <= HYPER_CONNECTION_NORM_QUARTER_ROWS;
     const std::string other = quarters ? "hyper_connection_norm_loaded" : "hyper_connection_norm_quarters";
     const uint32_t otherThreads = quarters ? HYPER_CONNECTION_ROW_THREADS : HYPER_CONNECTION_NORM_QUARTER_THREADS;
-    const HyperConnectionParams params{rows, hidden, streams, rank, 1, 0};
+    const HyperConnectionParams params{rows, hidden, streams, rank, 1};
     MetalBuffer normalized = zeroed(rows * width * 2), weights = zeroed(rows * streams * 4);
     MetalBuffer normalizedOther = zeroed(rows * width * 2), weightsOther = zeroed(rows * streams * 4);
     MetalBuffer normalizedPlain = zeroed(rows * width * 2);
     CommandGraph graph;
-    ops::HyperConnection::addNorm(graph, xs, {}, nw, inject, normalized, weights, shape, rows);
-    graph.add(other, {xs, nw.buffer, inject, normalizedOther, weightsOther, nw.buffer, nw.buffer}, params,
-              {rows, 1, 1}, {otherThreads, 1, 1});
-    ops::HyperConnection::addNorm(graph, xs, {}, nw, MetalBuffer{}, normalizedPlain, MetalBuffer{}, shape, rows);
+    ops::HyperConnection::addNorm(graph, xs, nw, inject, normalized, weights, shape, rows);
+    graph.add(other, {xs, nw.buffer, inject, normalizedOther, weightsOther}, params, {rows, 1, 1},
+              {otherThreads, 1, 1});
+    ops::HyperConnection::addNorm(graph, xs, nw, MetalBuffer{}, normalizedPlain, MetalBuffer{}, shape, rows);
     // A decode step's rows also into the down projection's table.
     const bool tables = rows % 8 == 0;
     MetalBuffer normalizedT = zeroed(rows * width * 2), weightsT = zeroed(rows * streams * 4);
     MetalBuffer normalizedOtherT = zeroed(rows * width * 2), weightsOtherT = zeroed(rows * streams * 4);
     const ops::LinearScratch tableGot = table((rows + 7) / 8 * 8), tableOther = table((rows + 7) / 8 * 8);
     if (tables) {
-      static_cast<void>(ops::HyperConnection::addNorm(graph, xs, {}, nw, inject, normalizedT, weightsT, shape, rows,
+      static_cast<void>(ops::HyperConnection::addNorm(graph, xs, nw, inject, normalizedT, weightsT, shape, rows,
                                                       tableGot, ops::LinearInput::Table16));
       graph.add(other + "_table16",
-                {xs, nw.buffer, inject, normalizedOtherT, weightsOtherT, nw.buffer, nw.buffer, tableOther.input,
-                 tableOther.sums},
-                params, {rows, 1, 1}, {otherThreads, 1, 1});
+                {xs, nw.buffer, inject, normalizedOtherT, weightsOtherT, tableOther.input, tableOther.sums}, params,
+                {rows, 1, 1}, {otherThreads, 1, 1});
     }
     run(backend, graph);
     const uint64_t rowBytes = uint64_t{rows} * width * 2, weightBytes = uint64_t{rows} * streams * 4;
@@ -375,73 +374,6 @@ void hyperNormKernelsTest(MetalBackend &backend, bool exact) {
   check(okKernels, "hyper norm: the quarters and loaded kernels' output and weights " + how);
   check(okPlain, "hyper norm without injection: normalized rows " + how + " the injecting mix's");
   check(okTables, "hyper norm tables: the quarters and loaded kernels' output, weights and tables " + how);
-}
-
-// A norm with a pending block output (a branch and the injection weights of
-// the mix before its block) adds it to the streams first and stores them, as
-// the combine does: the streams, normalized rows and injection weights of
-// combine-then-norm, from either norm kernel, bit for bit (within the
-// instrumented rounding under shader validation, as hyperNormKernelsTest).
-void hyperNormCombineTest(MetalBackend &backend, bool exact) {
-  std::mt19937 rng(17);
-  const uint32_t hidden = kHidden, streams = kStreams, rank = kRank, width = hidden * streams;
-  const ops::HyperShape shape{hidden, streams, rank};
-  std::vector<float> normPlus = randoms(rng, width, 0.3f);
-  for (float &v : normPlus) v += 1.0f;
-  const NormWeights nw{upload(backend, normPlus), true};
-  const MetalBuffer inject = upload(backend, randoms(rng, streams * width, 0.02f));
-  const auto close = [exact](const MetalBuffer &a, const MetalBuffer &b, uint64_t bytes, bool floats) {
-    if (!std::memcmp(a.contents(), b.contents(), bytes)) return true;
-    if (exact) return false;
-    if (floats) {
-      const auto *x = static_cast<const float *>(a.contents()), *y = static_cast<const float *>(b.contents());
-      for (uint64_t i = 0; i < bytes / 4; ++i)
-        if (!(std::fabs(x[i] - y[i]) <= 1e-4f * (1.0f + std::fabs(y[i])))) return false;
-      return true;
-    }
-    const auto *x = static_cast<const uint16_t *>(a.contents()), *y = static_cast<const uint16_t *>(b.contents());
-    for (uint64_t i = 0; i < bytes / 2; ++i)
-      if (std::abs(int(x[i]) - int(y[i])) > 1) return false;
-    return true;
-  };
-  bool ok = true;
-  for (const uint32_t rows : {1u, 16u, 64u, 65u, 256u}) {
-    const std::vector<float> x = randoms(rng, rows * width, 1.5f);
-    const MetalBuffer branch = upload(backend, bf16s(randoms(rng, rows * hidden, 1.0f)));
-    const MetalBuffer branchWeights = upload(backend, randoms(rng, rows * streams, 1.0f));
-    const uint64_t streamBytes = uint64_t{rows} * width * 4, rowBytes = uint64_t{rows} * width * 2,
-                   weightBytes = uint64_t{rows} * streams * 4;
-    struct Run {
-      MetalBuffer streams, normalized, weights;
-    };
-    const auto make = [&] {
-      return Run{upload(backend, x), scratch(backend, rowBytes), scratch(backend, weightBytes)};
-    };
-    Run combined = make(), fused = make(), other = make();
-    CommandGraph graph;
-    ops::HyperConnection::addCombine(graph, combined.streams, branch, branchWeights, shape, rows);
-    ops::HyperConnection::addNorm(graph, combined.streams, {}, nw, inject, combined.normalized, combined.weights,
-                                  shape, rows);
-    ops::HyperConnection::addNorm(graph, fused.streams, {branch, branchWeights}, nw, inject, fused.normalized,
-                                  fused.weights, shape, rows);
-    // The kernel addNorm does not take for these rows.
-    const bool quarters = rows <= HYPER_CONNECTION_NORM_QUARTER_ROWS;
-    graph.add(quarters ? "hyper_connection_norm_loaded" : "hyper_connection_norm_quarters",
-              {other.streams, nw.buffer, inject, other.normalized, other.weights, branch, branchWeights},
-              HyperConnectionParams{rows, hidden, streams, rank, 1, 1}, {rows, 1, 1},
-              {quarters ? HYPER_CONNECTION_ROW_THREADS : HYPER_CONNECTION_NORM_QUARTER_THREADS, 1, 1});
-    run(backend, graph);
-    for (const Run *got : {&fused, &other}) {
-      const bool equal = close(got->streams, combined.streams, streamBytes, true) &&
-                         close(got->normalized, combined.normalized, rowBytes, false) &&
-                         close(got->weights, combined.weights, weightBytes, true);
-      ok &= equal;
-      if (!equal)
-        std::cout << "  " << (got == &fused ? "addNorm's" : "the other") << " kernel differs at " << rows << " rows\n";
-    }
-  }
-  check(ok, std::string("hyper norm with a pending branch: combine-then-norm's streams, output and weights ") +
-                (exact ? "bit for bit" : "close to (instrumented)"));
 }
 
 void pleTest(MetalBackend &backend) {
@@ -857,12 +789,10 @@ int main(int argc, const char *argv[]) {
         // Uninstrumented: the norm's kernels alone, exact.
         if (std::getenv("MTL_SHADER_VALIDATION")) throw std::runtime_error("bitwise runs without shader validation");
         hyperNormKernelsTest(backend, true);
-        hyperNormCombineTest(backend, true);
       } else {
         hyperTest(backend);
         hyperTableTest(backend);
         hyperNormKernelsTest(backend, !std::getenv("MTL_SHADER_VALIDATION"));
-        hyperNormCombineTest(backend, !std::getenv("MTL_SHADER_VALIDATION"));
         pleTest(backend);
         qsaTest(backend, {150, 20, 16, 0, 1});
         // A threshold inside a run of equal scores: fewer other blocks than

@@ -35,52 +35,33 @@ inline void hyper_table16_row(device const bfloat *values, device bfloat *table,
   }
 }
 
-// A stream's value after a block's output `b` joins it with injection weight
-// `w`, as every kernel that adds one computes it.
-inline float hyper_combined(float x, bfloat b, float w) { return x + float(b) * w; }
-
-// The first mix step of a row: with combine, the streams after the previous
-// block's pending output (branch) joins them with its injection weights
-// (branch_weights), which it stores; each stream's RMS norm times the mix's
-// norm weights (the GGUF stores 1 + w) into bf16 rows of streams * hidden;
-// and, when it injects, the injection weights 2 sigmoid(inject(normalized) /
+// The first mix step of a row: each stream's RMS norm times the mix's norm
+// weights (the GGUF stores 1 + w) into bf16 rows of streams * hidden, and,
+// when it injects, the injection weights 2 sigmoid(inject(normalized) /
 // streams) of the block's output into each stream. Its kernels are compiled
 // for Flash-Next's shape, kStreams streams of kNormHidden values. Each takes
 // every load of a pass before the pass's arithmetic: at decode's few rows, a
 // threadgroup per row that waits on each load in turn runs latency-bound.
-// The two sum alike, the same values in the same order (reassociation off),
-// so a row's streams, output and weights are bit for bit the same whichever
-// of them runs it.
+// The two sum alike, so a row's output and weights are bit for bit the same
+// whichever of them runs it.
 constant constexpr uint kNormHidden = HYPER_CONNECTION_NORM_HIDDEN;
 constant constexpr uint kNormValues = kNormHidden / kRowThreads; // per thread and stream
 static_assert(kNormHidden % kRowThreads == 0, "a thread's values per stream are whole");
 
 // Prefill's rows, and a mix that injects nothing: a threadgroup of
-// kRowThreads threads per row; each thread holds its values of every stream,
-// to which it first adds the pending block output and stores them.
+// kRowThreads threads per row; each thread holds its values of every stream.
 template <bool Table>
-inline void hyper_norm_loaded_row(device float *streams, device const float *norm, device const float *inject,
-                                  device bfloat *normalized, device float *weights, device const bfloat *branch,
-                                  device const float *branch_weights, device bfloat *table,
-                                  device float *table_sums, constant HyperConnectionParams &p, uint row, uint tid,
-                                  uint lane, uint sg, threadgroup float *scratch) {
-#pragma clang fp reassociate(off)
+inline void hyper_norm_loaded_row(device const float *streams, device const float *norm,
+                                  device const float *inject, device bfloat *normalized,
+                                  device float *weights, device bfloat *table, device float *table_sums,
+                                  constant HyperConnectionParams &p, uint row, uint tid, uint lane, uint sg,
+                                  threadgroup float *scratch) {
   if (row >= p.rows) return;
   const uint width = kStreams * kNormHidden;
-  device float *x = streams + ulong(row) * width;
+  device const float *x = streams + ulong(row) * width;
   float xs[kStreams][kNormValues];
   for (uint s = 0; s < kStreams; ++s)
     for (uint i = 0; i < kNormValues; ++i) xs[s][i] = x[s * kNormHidden + tid + i * kRowThreads];
-  if (p.combine) {
-    device const bfloat *b = branch + ulong(row) * kNormHidden;
-    for (uint s = 0; s < kStreams; ++s) {
-      const float w = branch_weights[row * kStreams + s];
-      for (uint i = 0; i < kNormValues; ++i) {
-        xs[s][i] = hyper_combined(xs[s][i], b[tid + i * kRowThreads], w);
-        x[s * kNormHidden + tid + i * kRowThreads] = xs[s][i];
-      }
-    }
-  }
   float sums[kStreams] = {0.0f, 0.0f, 0.0f, 0.0f};
   for (uint s = 0; s < kStreams; ++s)
     for (uint i = 0; i < kNormValues; ++i) sums[s] += xs[s][i] * xs[s][i];
@@ -107,30 +88,23 @@ inline void hyper_norm_loaded_row(device float *streams, device const float *nor
 }
 
 // Decode's rows of an injecting mix: a threadgroup of
-// HYPER_CONNECTION_NORM_QUARTER_THREADS threads per row, whose quarter q
-// stands for the loaded row's threadgroup in stream q's sum and in injection
-// weight q's dot: each of its threads sums its values of stream q, then runs
-// injection dot q over every stream's values in order, and writes stream q's
-// normalized values. With a pending block output, each adds it to the values
-// it reads and, once every quarter has read the streams, stores stream q's.
+// HYPER_CONNECTION_NORM_QUARTER_THREADS threads per row, whose quarter q stands for the
+// loaded row's threadgroup in stream q's sum and in injection weight q's dot:
+// each of its threads sums its values of stream q, then runs injection dot q
+// over every stream's values in order, and writes stream q's normalized
+// values.
 template <bool Table>
-inline void hyper_norm_quarter_row(device float *streams, device const float *norm, device const float *inject,
-                                   device bfloat *normalized, device float *weights, device const bfloat *branch,
-                                   device const float *branch_weights, device bfloat *table,
-                                   device float *table_sums, constant HyperConnectionParams &p, uint row,
-                                   uint thread_id, uint lane, uint simdgroup, threadgroup float *scratch,
-                                   threadgroup float *scales) {
-#pragma clang fp reassociate(off)
+inline void hyper_norm_quarter_row(device const float *streams, device const float *norm,
+                                   device const float *inject, device bfloat *normalized,
+                                   device float *weights, device bfloat *table, device float *table_sums,
+                                   constant HyperConnectionParams &p, uint row, uint thread_id, uint lane,
+                                   uint simdgroup, threadgroup float *scratch, threadgroup float *scales) {
   if (row >= p.rows) return;
   const uint q = thread_id / kRowThreads, tid = thread_id % kRowThreads;
   const uint width = kStreams * kNormHidden;
-  device float *x = streams + ulong(row) * width;
-  device const bfloat *b = branch + ulong(row) * kNormHidden;
+  device const float *x = streams + ulong(row) * width;
   float mine[kNormValues];
   for (uint i = 0; i < kNormValues; ++i) mine[i] = x[q * kNormHidden + tid + i * kRowThreads];
-  if (p.combine)
-    for (uint i = 0; i < kNormValues; ++i)
-      mine[i] = hyper_combined(mine[i], b[tid + i * kRowThreads], branch_weights[row * kStreams + q]);
   float sum = 0.0f;
   for (uint i = 0; i < kNormValues; ++i) sum += mine[i] * mine[i];
   // The threadgroup's simdgroup `simdgroup` is quarter q's simdgroup
@@ -162,9 +136,6 @@ inline void hyper_norm_quarter_row(device float *streams, device const float *no
         ns[i] = norm[c];
         ws[i] = w[c];
       }
-      if (p.combine)
-        for (uint i = 0; i < kNormValues; ++i)
-          xv[i] = hyper_combined(xv[i], b[tid + i * kRowThreads], branch_weights[row * kStreams + s]);
       for (uint i = 0; i < kNormValues; ++i) {
         const uint c = s * kNormHidden + tid + i * kRowThreads;
         const float v = xv[i] * scale * ns[i];
@@ -172,10 +143,6 @@ inline void hyper_norm_quarter_row(device float *streams, device const float *no
         dot += ws[i] * v;
       }
     }
-  }
-  if (p.combine) {
-    threadgroup_barrier(mem_flags::mem_device);
-    for (uint i = 0; i < kNormValues; ++i) x[q * kNormHidden + tid + i * kRowThreads] = mine[i];
   }
   if (Table) hyper_table16_row(out, table, table_sums, width, row, lane, simdgroup, kStreams * kSimdgroups);
   if (!p.inject) return;
@@ -190,55 +157,54 @@ inline void hyper_norm_quarter_row(device float *streams, device const float *no
 }
 
 #define HYPER_NORM_ARGUMENTS                                                                                     \
-  device float *streams [[buffer(0)]], device const float *norm [[buffer(1)]],                                  \
+  device const float *streams [[buffer(0)]], device const float *norm [[buffer(1)]],                            \
       device const float *inject [[buffer(2)]], device bfloat *normalized [[buffer(3)]],                        \
-      device float *weights [[buffer(4)]], device const bfloat *branch [[buffer(5)]],                            \
-      device const float *branch_weights [[buffer(6)]]
+      device float *weights [[buffer(4)]]
 
-kernel void hyper_connection_norm_loaded(HYPER_NORM_ARGUMENTS, constant HyperConnectionParams &p [[buffer(7)]],
+kernel void hyper_connection_norm_loaded(HYPER_NORM_ARGUMENTS, constant HyperConnectionParams &p [[buffer(5)]],
                                          uint row [[threadgroup_position_in_grid]],
                                          uint tid [[thread_index_in_threadgroup]],
                                          uint lane [[thread_index_in_simdgroup]],
                                          uint sg [[simdgroup_index_in_threadgroup]]) {
   threadgroup float scratch[kSimdgroups * kStreams];
-  hyper_norm_loaded_row<false>(streams, norm, inject, normalized, weights, branch, branch_weights, nullptr, nullptr,
-                               p, row, tid, lane, sg, scratch);
+  hyper_norm_loaded_row<false>(streams, norm, inject, normalized, weights, nullptr, nullptr, p, row, tid, lane,
+                                     sg, scratch);
 }
 
-kernel void hyper_connection_norm_loaded_table16(HYPER_NORM_ARGUMENTS, device bfloat *table [[buffer(7)]],
-                                                 device float *sums [[buffer(8)]],
-                                                 constant HyperConnectionParams &p [[buffer(9)]],
+kernel void hyper_connection_norm_loaded_table16(HYPER_NORM_ARGUMENTS, device bfloat *table [[buffer(5)]],
+                                                 device float *sums [[buffer(6)]],
+                                                 constant HyperConnectionParams &p [[buffer(7)]],
                                                  uint row [[threadgroup_position_in_grid]],
                                                  uint tid [[thread_index_in_threadgroup]],
                                                  uint lane [[thread_index_in_simdgroup]],
                                                  uint sg [[simdgroup_index_in_threadgroup]]) {
   threadgroup float scratch[kSimdgroups * kStreams];
-  hyper_norm_loaded_row<true>(streams, norm, inject, normalized, weights, branch, branch_weights, table, sums, p,
-                              row, tid, lane, sg, scratch);
+  hyper_norm_loaded_row<true>(streams, norm, inject, normalized, weights, table, sums, p, row, tid, lane, sg,
+                                    scratch);
 }
 
-kernel void hyper_connection_norm_quarters(HYPER_NORM_ARGUMENTS, constant HyperConnectionParams &p [[buffer(7)]],
+kernel void hyper_connection_norm_quarters(HYPER_NORM_ARGUMENTS, constant HyperConnectionParams &p [[buffer(5)]],
                                            uint row [[threadgroup_position_in_grid]],
                                            uint thread_id [[thread_index_in_threadgroup]],
                                            uint lane [[thread_index_in_simdgroup]],
                                            uint simdgroup [[simdgroup_index_in_threadgroup]]) {
   threadgroup float scratch[kStreams * kSimdgroups];
   threadgroup float scales[kStreams];
-  hyper_norm_quarter_row<false>(streams, norm, inject, normalized, weights, branch, branch_weights, nullptr,
-                                nullptr, p, row, thread_id, lane, simdgroup, scratch, scales);
+  hyper_norm_quarter_row<false>(streams, norm, inject, normalized, weights, nullptr, nullptr, p, row,
+                                      thread_id, lane, simdgroup, scratch, scales);
 }
 
-kernel void hyper_connection_norm_quarters_table16(HYPER_NORM_ARGUMENTS, device bfloat *table [[buffer(7)]],
-                                                   device float *sums [[buffer(8)]],
-                                                   constant HyperConnectionParams &p [[buffer(9)]],
+kernel void hyper_connection_norm_quarters_table16(HYPER_NORM_ARGUMENTS, device bfloat *table [[buffer(5)]],
+                                                   device float *sums [[buffer(6)]],
+                                                   constant HyperConnectionParams &p [[buffer(7)]],
                                                    uint row [[threadgroup_position_in_grid]],
                                                    uint thread_id [[thread_index_in_threadgroup]],
                                                    uint lane [[thread_index_in_simdgroup]],
                                                    uint simdgroup [[simdgroup_index_in_threadgroup]]) {
   threadgroup float scratch[kStreams * kSimdgroups];
   threadgroup float scales[kStreams];
-  hyper_norm_quarter_row<true>(streams, norm, inject, normalized, weights, branch, branch_weights, table, sums,
-                               p, row, thread_id, lane, simdgroup, scratch, scales);
+  hyper_norm_quarter_row<true>(streams, norm, inject, normalized, weights, table, sums, p, row, thread_id,
+                                     lane, simdgroup, scratch, scales);
 }
 
 #undef HYPER_NORM_ARGUMENTS
@@ -325,10 +291,9 @@ kernel void hyper_connection_combine(device float *streams [[buffer(0)]],
                                      uint tid [[thread_index_in_threadgroup]]) {
   const uint row = group.x, d = group.y * kRowThreads + tid;
   if (row >= p.rows || d >= p.hidden) return;
-  const bfloat b = branch[ulong(row) * p.hidden + d];
+  const float b = float(branch[ulong(row) * p.hidden + d]);
   device float *x = streams + ulong(row) * p.streams * p.hidden + d;
-  for (uint s = 0; s < p.streams; ++s)
-    x[s * p.hidden] = hyper_combined(x[s * p.hidden], b, weights[row * p.streams + s]);
+  for (uint s = 0; s < p.streams; ++s) x[s * p.hidden] += b * weights[row * p.streams + s];
 }
 
 // The streams' start: every stream a copy of the token's embedding.

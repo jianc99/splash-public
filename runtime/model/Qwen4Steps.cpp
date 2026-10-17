@@ -58,11 +58,9 @@ uint32_t priorCount(const QwenTargetGeometry &g) { return g.pleNgram - 1; }
 
 // A scratch tensor (Qwen4Scratch): its bytes per row of a step and its fixed
 // bytes, and whether a prefill group's chunks each hold their own: the
-// residual streams, the injection weights and the branch, which a chunk's
-// MoE writes after the group's load of the layer's experts and the next
-// layer's first mix of the chunk adds to its streams
-// (QwenTarget::addPrefillLayers), and the inputs the CPU writes before the
-// command runs.
+// residual streams and injection weights, which a layer's combine reads after
+// the group's load of the layer's experts (QwenTarget::addPrefill), and the
+// inputs the CPU writes before the command runs.
 struct Tensor final {
   metal::MetalBuffer Qwen4Scratch::*field;
   uint64_t rowBytes;
@@ -78,9 +76,8 @@ std::vector<Tensor> tensors(const QwenTargetGeometry &g, uint64_t pleRowBytes, u
       {&Qwen4Scratch::normalized, bytesFor<uint16_t>(g.streamWidth()), 0, false},
       {&Qwen4Scratch::low, bytesFor<uint16_t>(g.hyperRank), 0, false},
       {&Qwen4Scratch::gate, bytesFor<uint16_t>(g.streamWidth()), 0, false},
-      {&Qwen4Scratch::mixerWeights, bytesFor<float>(g.hyperConnections), 0, true},
-      {&Qwen4Scratch::ffnWeights, bytesFor<float>(g.hyperConnections), 0, true},
-      {&Qwen4Scratch::branch, bytesFor<uint16_t>(g.hiddenSize), 0, true},
+      {&Qwen4Scratch::weights, bytesFor<float>(g.hyperConnections), 0, true},
+      {&Qwen4Scratch::branch, bytesFor<uint16_t>(g.hiddenSize), 0, false},
       {&Qwen4Scratch::zeros, bytesFor<uint16_t>(g.hiddenSize), 0, false},
       {&Qwen4Scratch::pleIndices, bytesFor<uint32_t>(g.pleHeads()), 0, true},
       {&Qwen4Scratch::pleRows, bytesFor<uint16_t>(g.pleWidth()), 0, false},
