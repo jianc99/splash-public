@@ -281,9 +281,10 @@ place (`target_weights_bytes`). Off by default.
   at 9.3 GB/s instead of 8.1, with less than half the CPU).
 - While the GPU repacks a round or runs a layer, the next round's experts or
   the next layer's likely experts are read ahead: those the next layer's
-  router picks from this layer's input in a decode step, nearly all of them in
-  a long prefill chunk. A read ahead of an expert no load routes may fail
-  without failing anything.
+  router picks from this layer's input in a decode step; after a long prefill
+  chunk's last repack, one more host step reads nearly all of the next
+  layer's into the whole staging. A read ahead of an expert no load routes may
+  fail without failing anything.
 - A host step (`metal::EventStep`) runs CPU work between a command's GPU work
   and holds the work after it until it returns. A decode step's keep the GPU
   awake: one GPU thread spins through each until the CPU ends it, so the work

@@ -141,18 +141,21 @@ ExpertStoreOptions storeOptions(uint64_t arena, const StreamedBlocks &blocks, co
   return {.memoryBytes = arena + ExpertStore::fixedBytes(blocks, shape), .readers = readers()};
 }
 
-// The rounds of a load of `plan`'s rows: the staging places the experts of a
-// block a decode cycle's rows may route, and at least two; a decode step's
-// load that they hold stages them all in one round, any other load half of
-// them a round.
-uint32_t loadRounds(const MoeShape &shape, const MoePlan &plan) {
+// The host steps of a load of `plan`'s rows, a round each: the staging
+// places the experts of a block a decode cycle's rows may route, and at least
+// two; a decode step's load that they hold stages them all in one round, any
+// other load half of them a round. A long chunk's load whose next block
+// streams (`nextStreams`) reads it ahead in one step more.
+uint32_t loadSteps(const MoeShape &shape, const MoePlan &plan, bool nextStreams) {
   using splash::model::ExecutionLimits;
   const uint64_t places = std::max<uint64_t>(
       2, std::min<uint64_t>(shape.experts, uint64_t{ExecutionLimits::maximumBatchWidth} *
                                                ExecutionLimits::targetVerifyRows * shape.expertsPerToken));
   const uint64_t routable = std::min<uint64_t>(shape.experts, uint64_t{plan.rows()} * shape.expertsPerToken);
   const uint64_t perRound = plan.phase() == MoePhase::Decode && routable <= places ? places : places / 2;
-  return static_cast<uint32_t>((routable + perRound - 1) / perRound);
+  const bool longChunk = plan.phase() == MoePhase::Prefill &&
+                         uint64_t{plan.rows()} * shape.expertsPerToken >= 3ULL * shape.experts;
+  return static_cast<uint32_t>((routable + perRound - 1) / perRound) + (longChunk && nextStreams);
 }
 
 // A step's rows of input and residual and its output, fresh.
@@ -234,7 +237,7 @@ int streamedExperts(MetalBackend &backend, const MoeShape &shape, const std::fil
     std::array<uint64_t, 2> rounds{};
     for (const MoePlan &plan : plans)
       for (uint32_t block = 0; block < 2; ++block, ++index) {
-        rounds[static_cast<size_t>(plan.phase())] += loadRounds(shape, plan);
+        rounds[static_cast<size_t>(plan.phase())] += loadSteps(shape, plan, block == 0);
         const bool prefill = plan.phase() == MoePhase::Prefill;
         if (block == 0 || prefill) freshRows(backend, b, shape);
         const std::string label = formats + (prefill ? " prefill rows=" : " decode rows=") +
@@ -408,7 +411,7 @@ int streamedUnionLoads(MetalBackend &backend, const MoeShape &shape, const std::
         }
       }
       const ExpertStoreStats::Use &use = store.stats().uses[0];
-      const uint32_t rounds = loadRounds(shape, prefillPlan(shape, kRows[0] + kRows[1] + kRows[2]));
+      const uint32_t rounds = loadSteps(shape, prefillPlan(shape, kRows[0] + kRows[1] + kRows[2]), block == 0);
       if (use.loads != used.loads + 1 || use.pickup.count != used.pickup.count + rounds) {
         printf("  %s: a union load counted %llu loads in %llu host steps, not %u FAIL\n", fmtName(f),
                (unsigned long long)(use.loads - used.loads),
@@ -472,7 +475,7 @@ int streamedLoneBlockSize(MetalBackend &backend, const MoeShape &shape, const st
       read += after.uses[use].read - before.uses[use].read;
     }
     if (got != want || !slotsHoldTheirExperts(m, streamed[step.block], b, *step.plan) ||
-        hostSteps != (step.block == 2 ? 0 : loadRounds(shape, *step.plan)) ||
+        hostSteps != (step.block == 2 ? 0 : loadSteps(shape, *step.plan, step.block == 0)) ||
         (step.block == 2 && read)) {
       printf("  block %u%s: %llu host steps read %llu experts, or its output or slots differ from the resident "
              "experts' FAIL\n",
@@ -542,7 +545,7 @@ int streamedRounds(MetalBackend &backend, const MoeShape &shape, const std::file
     const ExpertStoreStats::Use &use = store.stats().uses[step.prefill ? 0 : 1];
     const uint64_t hostSteps = use.pickup.count - used.pickup.count, read = use.read - used.read,
                    routed = use.routed - used.routed;
-    const uint32_t rounds = loadRounds(shape, plan);
+    const uint32_t rounds = loadSteps(shape, plan, step.block == 0);
     if (got != want || !slotsHoldTheirExperts(m, streamed[step.block], b, plan) || hostSteps != rounds ||
         read != (step.reads ? routed : 0) || !store.stats().failure.empty()) {
       printf("  block %u %s%s: %llu host steps of %u rounds, %llu of %llu routed experts read, or its output or "
@@ -554,7 +557,7 @@ int streamedRounds(MetalBackend &backend, const MoeShape &shape, const std::file
   }
   printf("streamed experts loading long chunks in %u rounds through a staging of %llu KiB, across a release: "
          "bitwise the resident experts' %s\n",
-         loadRounds(shape, chunk), (unsigned long long)(store.stats().stagingBytes >> 10),
+         loadSteps(shape, chunk, false), (unsigned long long)(store.stats().stagingBytes >> 10),
          failures ? "FAIL" : "ok");
   return failures;
 }

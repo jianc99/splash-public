@@ -32,14 +32,16 @@
 // Once a round has staged its experts, the next experts are read ahead while
 // the GPU runs, into the places the round left free, an expert at a time in
 // pieces of at most kAheadPieceBytes, most likely first: the load's experts
-// of its next round, or after its last round the next block's experts that
-// are likely routed and not resident: nearly all of them after a long prefill
-// chunk (rows * topK >= 3 * experts), or after a decode step those the next
-// layer's router picks from this block's input (the rows change little from
-// layer to layer), by their summed routing weights. The next round stops the
-// read-ahead and takes over the experts it routes where they are, reading
-// what the readers had not (or failed to: a read ahead of an expert no step
-// routes is no failure).
+// of its next round, or after a decode step's round the next block's experts
+// that are likely routed and not resident, those the next layer's router
+// picks from this block's input (the rows change little from layer to
+// layer), by their summed routing weights. A long prefill chunk (rows * topK
+// >= 3 * experts) routes nearly every expert of the next block: one more host
+// step after its last repack reads them ahead into the whole staging, while
+// the GPU runs this block's experts and the next block's mixing. The next
+// round stops the read-ahead and takes over the experts it routes where they
+// are, reading what the readers had not (or failed to: a read ahead of an
+// expert no step routes is no failure).
 //
 // The arena and the staging are memory the engine gives back while idle
 // (model::WeightMemory): released, every slot is free; a restore reads the

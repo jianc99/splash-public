@@ -305,6 +305,9 @@ struct ExpertStore::Impl {
   void stage(uint32_t block, uint32_t capacity, ExpertStoreStats::Use &use);
   std::span<const uint32_t> predictedExperts(uint32_t rows);
   void readAhead(uint32_t block, std::span<const uint32_t> experts, ExpertStoreStats::Use &use);
+  // The host step after a long chunk's load: block `block`'s experts that
+  // are not resident read ahead into the whole staging.
+  void readBlockAhead(uint32_t block, ops::MoePhase phase);
   void stopAhead();
   void evict(Size &size, uint32_t slot);
   uint32_t claim(Size &size);
@@ -759,15 +762,14 @@ void ExpertStore::Impl::load(uint32_t index, ops::MoePhase phase, uint32_t rows,
       readAhead(index, waitingExperts, use);
       return;
     }
-    if (index + 1 == blocks.size() || !streams(index + 1)) return;
-    const auto notResident = [&](std::span<const uint32_t> experts) {
-      std::vector<uint32_t> result;
-      for (const uint32_t expert : experts)
-        if (blocks[index + 1].slot[expert] == kNoSlot) result.push_back(expert);
-      return result;
-    };
-    if (longChunk(phase, rows)) readAhead(index + 1, notResident(everyExpert), use);
-    else if (predicted) readAhead(index + 1, notResident(predictedExperts(rows)), use);
+    // A long chunk's next block is read ahead by the host step after its
+    // last repack (readBlockAhead).
+    if (predicted) {
+      std::vector<uint32_t> experts;
+      for (const uint32_t expert : predictedExperts(rows))
+        if (blocks[index + 1].slot[expert] == kNoSlot) experts.push_back(expert);
+      readAhead(index + 1, experts, use);
+    }
   } catch (const std::exception &error) {
     abandon();
     failure = error.what();
@@ -775,6 +777,17 @@ void ExpertStore::Impl::load(uint32_t index, ops::MoePhase phase, uint32_t rows,
     throw;
   }
   publish();
+}
+
+void ExpertStore::Impl::readBlockAhead(uint32_t index, ops::MoePhase phase) {
+  std::lock_guard lock(mutex);
+  if (!failure.empty()) throw std::runtime_error("expert store failed earlier: " + failure);
+  // The GPU repacked the load's last round: no place is taken.
+  std::ranges::fill(taken, uint8_t{0});
+  std::vector<uint32_t> experts;
+  for (const uint32_t expert : everyExpert)
+    if (blocks[index].slot[expert] == kNoSlot) experts.push_back(expert);
+  readAhead(index, experts, counters.uses[static_cast<size_t>(phase)]);
 }
 
 ExpertStore::ExpertStore(metal::MetalBackend &backend, StreamedBlocks streamed, ops::MoeShape shape,
@@ -943,23 +956,30 @@ void ExpertStore::addLoad(metal::CommandGraph &graph, std::span<const ops::MoeLo
   // millisecond and most end within one, about as long as an idle GPU takes
   // to come back to full speed; a prefill chunk's read for tens of ms.
   const bool awake = phase == ops::MoePhase::Decode;
+  const auto timed = [impl = impl_, phase](const metal::HostStepTiming &timing) {
+    Impl::StepTimes &times = impl->stepTimes[static_cast<size_t>(phase)];
+    const auto nanoseconds = [](double seconds) { return uint64_t(seconds * 1e9); };
+    times.pickup.add(nanoseconds(timing.pickupSeconds));
+    times.work.add(nanoseconds(timing.workSeconds));
+    times.resume.add(nanoseconds(timing.resumeSeconds));
+  };
   for (uint32_t round = 0; round < rounds; ++round) {
     graph.host(
         [impl = impl_, block, phase, rows, predicted, tiles, round, rounds] {
           impl->load(block, phase, rows, predicted, tiles, round, rounds);
         },
-        [impl = impl_, phase](const metal::HostStepTiming &timing) {
-          Impl::StepTimes &times = impl->stepTimes[static_cast<size_t>(phase)];
-          const auto nanoseconds = [](double seconds) { return uint64_t(seconds * 1e9); };
-          times.pickup.add(nanoseconds(timing.pickupSeconds));
-          times.work.add(nanoseconds(timing.workSeconds));
-          times.resume.add(nanoseconds(timing.resumeSeconds));
-        },
-        awake);
+        timed, awake);
     ops::MoE::addExpertLoad(graph, impl.staging, size.arena, impl.jobs, impl.sources, size.load,
                             static_cast<uint32_t>(std::min<uint64_t>(routable, impl.places.count)),
                             metal::IndirectGrid{impl.grid, 0});
   }
+  // A long chunk routes nearly every expert of the next block too: once the
+  // GPU has repacked the last round, the next block's experts are read ahead
+  // into the whole staging, while the GPU runs this block's experts and the
+  // next block's mixing, as many as the next load would otherwise read
+  // with the GPU waiting.
+  if (impl.longChunk(phase, rows) && block + 1 < impl.blocks.size() && impl.streams(block + 1))
+    graph.host([impl = impl_, block, phase] { impl->readBlockAhead(block + 1, phase); }, timed, false);
 }
 
 ExpertStoreStats ExpertStore::stats() const {
