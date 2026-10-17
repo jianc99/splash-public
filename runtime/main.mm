@@ -157,7 +157,8 @@ void printUsage(std::string_view executable) {
       " [--max-image-patches PATCHES] [--persistent-cache on|off] [--cache-dir DIRECTORY]"
       " [--max-cache-disk-writes BYTES]"
       " [--idle-release SECONDS|off] [--idle-sleep prevent|allow] [--ane on|off]"
-      " [--relaunch-context TOKENS] [--ple-ssd-cache BYTES] [--expert-memory BYTES]");
+      " [--relaunch-context TOKENS] [--ple-ssd-cache BYTES] [--expert-memory BYTES]"
+      " [--sparse-kv-memory BYTES]");
   writeStderrLine("       " + command + " model-check mlx-affine none|safetensors CONFIG [DRAFT_CONFIG]");
   writeStderrLine("       " + command + " model-check gguf none|gguf CONFIG GGUF_METADATA [DRAFT_CONFIG]");
   writeStderrLine("       " + command + " device-check");
@@ -212,6 +213,7 @@ bootstrapConfig(const engine::NativeArguments &arguments) {
   config.resources.relaunchContext = arguments.relaunchContext;
   config.resources.pleCacheBytes = arguments.pleCacheBytes;
   config.resources.expertMemoryBytes = arguments.expertMemoryBytes;
+  config.resources.sparseKvMemoryBytes = arguments.sparseKvMemoryBytes;
   config.nativeLoop.engine.maxContext = arguments.maxContext;
   config.nativeLoop.engine.decodeShare = arguments.decodeShare;
   return config;

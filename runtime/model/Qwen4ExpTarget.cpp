@@ -2,6 +2,7 @@
 
 #include "metal/abi/Qwen4.h"
 #include "model/Qwen4Exp.hpp"
+#include "model/SparseKvStore.hpp"
 #include "model/SparseRowStore.hpp"
 #include "ops/Embedding.hpp"
 #include "ops/HyperConnection.hpp"
@@ -308,7 +309,7 @@ ops::AttentionBlocks Qwen4ExpTarget::addVerifyQsa(VerifyStep &step, const Qwen4I
                           step.blocks.laneRecords, keys, std::span(pendingKeys).first(step.lanes)},
                          indexer.keyNorm, b.ropeInverseFrequencies, qsa);
   if (!sparse) return {h.qsaLists, h.qsaListCounts, 0, 0};
-  const ops::AttentionBlocks blocks{h.qsaLists, h.qsaListCounts, h.listStride, 0};
+  ops::AttentionBlocks blocks{h.qsaLists, h.qsaListCounts, h.listStride, 0};
   ops::Qwen4::addQsaSelect(step.graph, queries, h.qsaScores, h.scoreRows,
                            rowsOf<uint32_t>(h.qsaMask, 0, step.rows, h.maskWords), qsa);
   std::array<ops::BlockListRows, ExecutionLimits::maximumBatchWidth> laneLists{};
@@ -316,6 +317,18 @@ ops::AttentionBlocks Qwen4ExpTarget::addVerifyQsa(VerifyStep &step, const Qwen4I
     laneLists[lane] = {lane * kVerifyRows, kVerifyRows, firstPositions[lane], lane};
   ops::PagedAttention::addBlockLists(step.graph, h.qsaMask, h.maskWords, std::span(laneLists).first(step.lanes),
                                      kVerifyRows, blocks);
+  // The store reads the lists' blocks the lanes' pages no longer serve into
+  // its cache and tells the attention where each entry's block is.
+  if (b.sparseKv) {
+    step.graph.host([store = b.sparseKv, layer, stateLanes = b.stateLanes, lanes = step.lanes, lists = h.qsaLists,
+                     counts = h.qsaListCounts, stride = h.listStride, locations = h.qsaLocations] {
+      store->resolve(layer, std::span(stateLanes).first(lanes), static_cast<const uint32_t *>(lists.contents()),
+                     static_cast<const uint32_t *>(counts.contents()), stride,
+                     static_cast<uint32_t *>(locations.contents()));
+    });
+    blocks.locations = h.qsaLocations;
+    blocks.locationPages = b.sparseKv->locationPages();
+  }
   return blocks;
 }
 

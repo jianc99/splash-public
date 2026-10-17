@@ -148,6 +148,9 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
     } else if (option == "--expert-memory") {
       if (!parsePositive(value, result.expertMemoryBytes))
         throw UsageError("--expert-memory requires a positive byte count");
+    } else if (option == "--sparse-kv-memory") {
+      if (!parsePositive(value, result.sparseKvMemoryBytes))
+        throw UsageError("--sparse-kv-memory requires a positive byte count");
     } else if (option == "--ane") {
       if (value != "on" && value != "off")
         throw UsageError("--ane requires on or off");

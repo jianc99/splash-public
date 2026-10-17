@@ -108,6 +108,8 @@ std::vector<Tensor> tensors(const QwenTargetGeometry &g, uint64_t pleRowBytes, b
       {&Qwen4Scratch::qsaLists, bytesFor<uint32_t>(listStride(g) / kTileRows),
        bytesFor<uint32_t>(uint64_t{kLanes} * listStride(g)), false},
       {&Qwen4Scratch::qsaListCounts, bytesFor<uint32_t>(1), bytesFor<uint32_t>(kLanes), false},
+      // A verify lane's list's locations (model::SparseKvStore).
+      {&Qwen4Scratch::qsaLocations, 0, bytesFor<uint32_t>(uint64_t{kLanes} * listStride(g)), false},
   };
   // A streamed table's step stages up to every row id's row, each distinct
   // one once, and each id's slot.

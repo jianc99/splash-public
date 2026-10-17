@@ -6,6 +6,7 @@
 #include "engine/Engine.hpp"
 #include "metal/abi/ExecutionGeometry.h"
 #include "model/ExpertStore.hpp"
+#include "model/SparseKvStore.hpp"
 #include "model/WeightStore.hpp"
 #include "ops/AneFfnMeasurement.hpp"
 
@@ -319,7 +320,8 @@ RuntimeResources::RuntimeResources(
     std::unique_ptr<model::QwenStateStorage> stateStorage,
     std::unique_ptr<KvPageTier> kvTier, std::unique_ptr<DiskSpace> diskSpace,
     std::unique_ptr<KvPool> kvPool, std::unique_ptr<engine::Cache> cache,
-    std::unique_ptr<ops::AneFfn> aneFfn, AneFfnOutcome aneFfnOutcome)
+    std::unique_ptr<ops::AneFfn> aneFfn, AneFfnOutcome aneFfnOutcome,
+    std::unique_ptr<model::SparseKvStore> sparseKv)
     : persistentCache_(std::move(persistentCache)),
       backend_(std::move(backend)), model_(std::move(model)),
       operators_(std::move(operators)),
@@ -328,7 +330,7 @@ RuntimeResources::RuntimeResources(
       memoryGovernor_(std::move(memoryGovernor)), kvPages_(std::move(kvPages)),
       stateStorage_(std::move(stateStorage)), kvTier_(std::move(kvTier)),
       diskSpace_(std::move(diskSpace)), kvPool_(std::move(kvPool)),
-      cache_(std::move(cache)), aneFfn_(std::move(aneFfn)),
+      cache_(std::move(cache)), aneFfn_(std::move(aneFfn)), sparseKv_(std::move(sparseKv)),
       releasableMemory_({model_.images.get(), model_.expertStore()}, idleSplit(aneFfn_.get())),
       aneFfnOutcome_(std::move(aneFfnOutcome)) {}
 
@@ -754,6 +756,28 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     auto cache = std::make_unique<engine::Cache>(*kvPool, kvTier.get(), diskBudget);
     if (diskSpace)
       cache->setDiskMeasure([space = diskSpace.get()] { space->measure(); });
+    // --sparse-kv-memory: the store's cache takes pages of the pool's layout
+    // as the pool does; its files are temporary, beside the SSD cache's.
+    std::unique_ptr<model::SparseKvStore> sparseKv;
+    if (config.sparseKvMemoryBytes) {
+      const uint32_t topBlocks =
+          std::visit([](const auto &layout) { return layout.indexerTopBlocks; }, loaded.descriptor.target);
+      if (!topBlocks || !kvPages->layout().valuesTokenMajor) {
+        logLine("--sparse-kv-memory ignored: ", config.model.name, " attends densely");
+      } else {
+        std::error_code ignored;
+        sparseKv = std::make_unique<model::SparseKvStore>(
+            *backend, memoryGovernor->allocationAdmission(), *kvPages,
+            model::SparseKvStoreOptions{
+                .memoryBytes = config.sparseKvMemoryBytes,
+                .lanes = model::ExecutionLimits::maximumBatchWidth,
+                .maximumContextTokens = memoryPlan.maximumContextTokens(),
+                .selectedBlocks = model::ExecutionLimits::targetVerifyRows * topBlocks,
+                .directory = std::filesystem::temp_directory_path(ignored)});
+        logLine("Sparse KV: a decoding request's committed KV goes to the SSD; each lane's selected blocks are read "
+                "through ", sparseKv->laneCacheBytes() / kMiB, " MiB of cache.");
+      }
+    }
 
     if (stateStorage->actualAllocatedBytes() != 0) {
       throw std::runtime_error("lane state was allocated eagerly");
@@ -775,7 +799,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
         std::move(operators), std::move(memoryPlan), std::move(cacheIdentity),
         std::move(memoryGovernor), std::move(kvPages), std::move(stateStorage),
         std::move(kvTier), std::move(diskSpace), std::move(kvPool), std::move(cache),
-        std::move(aneFfn.split), std::move(aneFfn.outcome)));
+        std::move(aneFfn.split), std::move(aneFfn.outcome), std::move(sparseKv)));
     result->adoptPersistentCache();
     return result;
   } catch (const metal::MetalAllocationError &error) {
@@ -890,6 +914,7 @@ model::RuntimeContext RuntimeResources::modelContext() noexcept {
       *stateStorage_,
       operators_,
       aneFfn_.get(),
+      sparseKv_.get(),
   };
 }
 
@@ -929,7 +954,9 @@ ActualMemoryReport RuntimeResources::actualMemoryReport(
   if (kvPool_->allocatedBytes() != kvPages_->actualAllocatedBytes()) {
     throw std::logic_error("the KV pool and its storage disagree on allocated extents");
   }
-  report.kvAllocatedBytes = kvPool_->allocatedBytes();
+  // The sparse KV store's cache is pages of the pool's layout, which it takes
+  // from the pool's admission.
+  report.kvAllocatedBytes = kvPool_->allocatedBytes() + (sparseKv_ ? sparseKv_->cacheBytes() : 0);
   report.stateStagingBytes = modelMemory.stateStagingBytes;
   report.aneFfnBytes = aneFfn_ ? aneFfn_->allocatedBytes() : 0;
   if (const auto table = streamedTableStats()) report.streamedTableBytes = table->cacheBytes;

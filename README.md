@@ -119,6 +119,7 @@ window. To set your own limits or cache options, add these to `splash serve`:
 | `--persistent-cache` | Keep the SSD cache across restarts. Off by default. |
 | `--ple-ssd-cache 2G` | Qwen3.8-Flash-Next: read its PLE n-gram table (28.8 GB in IQ4_NL) from the SSD through a 2 GiB RAM cache instead of holding it in memory. Off by default. |
 | `--expert-memory 16G` | MoE models: hold routed experts in 16 GiB and read the others from the SSD when a token routes them. Off by default. |
+| `--sparse-kv-memory 512M` | Qwen3.8-Flash-Next: keep a decoding request's committed KV on the SSD and read the blocks its attention selects through a 512 MiB cache per lane. Off by default. |
 
 Use `--max-memory` to leave room for other applications.
 The server listens on localhost without authentication by default. For LAN

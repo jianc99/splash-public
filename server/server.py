@@ -1693,6 +1693,8 @@ def _native_command(args, relaunch_context=None):
         command.extend(("--ple-ssd-cache", str(args.ple_ssd_cache)))
     if args.expert_memory is not None:
         command.extend(("--expert-memory", str(args.expert_memory)))
+    if args.sparse_kv_memory is not None:
+        command.extend(("--sparse-kv-memory", str(args.sparse_kv_memory)))
     return command
 
 
