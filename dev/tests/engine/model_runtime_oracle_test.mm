@@ -2638,6 +2638,9 @@ int main(int argc, char **argv) {
     kv::Format format = kv::Format::Int8;
     ops::GdnStateFormat stateFormat = ops::GdnStateFormat::Float32;
     std::optional<double> givenAneFfnShare;
+    // --yarn-factor FACTOR: the model served with YaRN by FACTOR, as splash
+    // serve's option serves it.
+    std::optional<double> yarnFactor;
     // The evaluation of the split's program that fails, counted from 1 as
     // ane::ProgramInstrumentation counts them; 0 for none.
     uint64_t aneFfnFault = 0;
@@ -2652,7 +2655,7 @@ int main(int argc, char **argv) {
     if (argc < 3)
       fail("usage: model-runtime-oracle METALLIB MODEL_ROOT [--kv-format int8|bf16] [--state-format fp32|bf16] "
            "[--ane-ffn-share SHARE] [--ane-ffn-fault EVALUATION] [--ple-memory BYTES] "
-           "[--expert-memory BYTES] [--images-only | --warmup-eos-only | --prefill-groups-only]");
+           "[--expert-memory BYTES] [--yarn-factor FACTOR] [--images-only | --warmup-eos-only | --prefill-groups-only]");
     for (int i = 3; i < argc; ++i) {
       const std::string_view option(argv[i]);
       if (option == "--images-only") imagesOnly = true;
@@ -2687,6 +2690,11 @@ int main(int argc, char **argv) {
         char *end = nullptr;
         loadOptions.expertMemoryBytes = std::strtoull(value, &end, 10);
         if (end == value || *end || !loadOptions.expertMemoryBytes) fail("--expert-memory takes a byte count");
+      } else if (option == "--yarn-factor" && i + 1 < argc) {
+        const char *value = argv[++i];
+        char *end = nullptr;
+        yarnFactor = std::strtod(value, &end);
+        if (end == value || *end) fail("--yarn-factor takes a number");
       } else fail("unknown model-runtime-oracle option");
     }
     metal::MetalBackend backend(argv[1]);
@@ -2701,7 +2709,8 @@ int main(int argc, char **argv) {
     require(hostAvailableBytes.has_value(),
             "cannot measure available host memory before loading the oracle model");
     const std::filesystem::path modelRoot(argv[2]);
-    const auto descriptor = model::inspectModelRoot(modelRoot);
+    const auto descriptor = yarnFactor ? model::withYarn(model::inspectModelRoot(modelRoot), *yarnFactor)
+                                       : model::inspectModelRoot(modelRoot);
     // Production's weight byte count with a different bound. Production checks
     // it only against the Metal hard budget, then guards host headroom at every
     // Metal operation while loading. This oracle has no such guard, so the
