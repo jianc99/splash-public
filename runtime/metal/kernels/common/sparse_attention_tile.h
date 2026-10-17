@@ -21,6 +21,10 @@ constant uint SplashSparseNoEntry = 0xffffffffu;
 // format's step, so that the split and reduce kernels of either format share
 // one partition.
 constant uint SplashSparsePartitionBlocks = 8;
+// A split takes at least this many entries of its tile's list: it writes
+// partials of every fused row of the tile, which the reduce reads back, and
+// fewer blocks per split would move more partials than KV.
+constant uint SplashSparseSplitBlocks = SPLASH_SPARSE_SPLIT_BLOCKS;
 constant uint SplashSparseBlockTokens = SPLASH_ATTENTION_BLOCK_TOKENS;
 
 template <typename CacheElement> struct SplashSparseStep {
@@ -38,10 +42,14 @@ static_assert(SplashSparsePartitionBlocks % SplashSparseStep<int8_t>::Blocks == 
 static_assert(SplashKvPageTokens % SplashSparseBlockTokens == 0,
               "a page holds whole blocks");
 
-// The entries one split takes of a list of `count`: an equal share in whole
-// partition units. Every split past the written ones takes none.
+// The entries one split takes of a list of `count`, of at most `splits`
+// splits: an equal share in whole partition units, of at least
+// SplashSparseSplitBlocks entries. It depends on the list alone, so a lane's
+// partition is its own whatever lanes run with it. Every split past the
+// written ones takes none.
 inline uint splash_sparse_split_entries(uint count, uint splits) {
-  const uint share = (count + splits - 1) / splits;
+  const uint used = clamp((count + SplashSparseSplitBlocks - 1) / SplashSparseSplitBlocks, 1u, splits);
+  const uint share = (count + used - 1) / used;
   return (share + SplashSparsePartitionBlocks - 1) / SplashSparsePartitionBlocks *
          SplashSparsePartitionBlocks;
 }

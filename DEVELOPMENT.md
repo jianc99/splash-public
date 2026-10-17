@@ -2106,7 +2106,8 @@ The attention then reads only those blocks: the rows of a tile (a verify lane's
 in block order, each entry a block and the rows of the tile that attend it
 (`attention_block_lists`, `ops::PagedAttention::addBlockLists`). The split
 kernels (`kernels/shared/sparse_attention.metal`) share a list out among their
-splits in units of 8 blocks; each step gathers 8 blocks of keys (4 in BF16), and
+splits in units of 8 blocks, at least 48 a split (`SPLASH_SPARSE_SPLIT_BLOCKS`),
+so that a lane's split count follows its own list; each step gathers 8 blocks of keys (4 in BF16), and
 then their values, into threadgroup memory for the MPP QK and PV of the page
 loop, and the softmax masks each row's tokens in blocks the row does not attend
 and past its causal end. Rows with at most 512 complete blocks attend every
