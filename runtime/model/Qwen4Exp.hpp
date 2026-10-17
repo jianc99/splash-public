@@ -21,6 +21,8 @@
 #include "QwenHybridLayout.hpp"
 #include "QwenTarget.hpp"
 #include "QwenTargetFiles.hpp"
+#include "metal/abi/HyperConnection.h"
+#include "metal/abi/NgramEmbedding.h"
 #include "metal/abi/Qwen4.h"
 #include "metal/abi/RoPE.h"
 #include "ops/MoE.hpp"
@@ -80,10 +82,10 @@ struct Qwen4ExpLayout final : QwenHybridLayout {
                           .expertIntermediateSize = 640,
                           .hyperConnections = 4,
                           .hyperRank = 320,
-                          .indexerHeads = QWEN4_QSA_HEADS,
-                          .indexerHeadDimension = QWEN4_QSA_DIMENSION,
+                          .indexerHeads = 4,
+                          .indexerHeadDimension = 128,
                           .indexerTopBlocks = 512,
-                          .indexerBlockTokens = QWEN4_QSA_BLOCK,
+                          .indexerBlockTokens = 4,
                           .pleLayer = 1,
                           .pleNgram = 3,
                           .pleHeadsPerNgram = 8,
@@ -92,8 +94,22 @@ struct Qwen4ExpLayout final : QwenHybridLayout {
   bool operator==(const Qwen4ExpLayout &) const = default;
 };
 
-// The longest n-gram the PLE hash mixes (metal/abi/Qwen4.h).
-inline constexpr uint32_t kPleMaximumNgram = QWEN4_PLE_MAXIMUM_NGRAM;
+// The family's kernels are compiled for its shape: the hyper-connection norm's
+// streams and width, the n-gram hash's n-grams and heads, and the QSA
+// indexer's heads, head width and blocks, which are the sparse attention's.
+static_assert(Qwen4ExpLayout{}.hyperConnections == HYPER_CONNECTION_MAXIMUM_STREAMS &&
+                  Qwen4ExpLayout{}.hiddenSize == HYPER_CONNECTION_NORM_HIDDEN,
+              "the hyper-connection norm kernels are compiled for Flash-Next's streams");
+static_assert(Qwen4ExpLayout{}.pleNgram <= NGRAM_EMBEDDING_MAXIMUM_NGRAM &&
+                  Qwen4ExpLayout{}.pleHeads() <= NGRAM_EMBEDDING_MAXIMUM_HEADS,
+              "the n-gram hash holds Flash-Next's n-grams and heads");
+static_assert(Qwen4ExpLayout{}.indexerHeads == QWEN4_QSA_HEADS &&
+                  Qwen4ExpLayout{}.indexerHeadDimension == QWEN4_QSA_DIMENSION &&
+                  Qwen4ExpLayout{}.indexerBlockTokens == QWEN4_QSA_BLOCK,
+              "the QSA kernels are compiled for Flash-Next's indexer");
+
+// The longest n-gram the PLE hash mixes (metal/abi/NgramEmbedding.h).
+inline constexpr uint32_t kPleMaximumNgram = NGRAM_EMBEDDING_MAXIMUM_NGRAM;
 
 // The hash of the PLE n-gram embedding, from the GGUF's metadata: the multiplier of each n-gram position (0 past
 // pleNgram), each head's table rows and the table's rows.

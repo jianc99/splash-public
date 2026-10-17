@@ -1,5 +1,6 @@
-// Qwen3.8-Flash-Next's own kernels (kernels/shared/qwen4.metal and
-// qwen4_qsa.metal) through ops::Qwen4, against fp64 CPU references of the
+// Qwen3.8-Flash-Next's kernels (kernels/shared/hyper_connection.metal,
+// ngram_embedding.metal and qwen4_qsa.metal) through ops::HyperConnection,
+// ops::NgramEmbedding and ops::Qwen4, against fp64 CPU references of the
 // model's computation:
 // - the hyper-connection mix at Flash-Next's shape: per-stream RMS norm,
 //   injection weights, the low-rank gate and the stream average; the combine
@@ -15,10 +16,14 @@
 //   streams); the GPU PLE hash against the CPU's.
 #include "../../../runtime/metal/CommandGraph.hpp"
 #include "../../../runtime/metal/MetalBackend.hpp"
+#include "../../../runtime/ops/HyperConnection.hpp"
+#include "../../../runtime/ops/NgramEmbedding.hpp"
 #include "../../../runtime/ops/Qwen4.hpp"
 #include "../../../runtime/ops/Sampling.hpp"
 #include "LinearInputReference.hpp"
 #include "metal/abi/KvExtent.h"
+#include "metal/abi/HyperConnection.h"
+#include "metal/abi/NgramEmbedding.h"
 #include "metal/abi/Qwen4.h"
 
 #import <Foundation/Foundation.h>
@@ -104,9 +109,9 @@ void run(MetalBackend &backend, CommandGraph &graph) {
   static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
 }
 
-// Flash-Next's mix: QWEN4_MAXIMUM_STREAMS streams of QWEN4_NORM_HIDDEN
+// Flash-Next's mix: HYPER_CONNECTION_MAXIMUM_STREAMS streams of HYPER_CONNECTION_NORM_HIDDEN
 // values, the hyper-connections' low rank of 320.
-constexpr uint32_t kHidden = QWEN4_NORM_HIDDEN, kStreams = QWEN4_MAXIMUM_STREAMS, kRank = 320;
+constexpr uint32_t kHidden = HYPER_CONNECTION_NORM_HIDDEN, kStreams = HYPER_CONNECTION_MAXIMUM_STREAMS, kRank = 320;
 
 void hyperTest(MetalBackend &backend) {
   std::mt19937 rng(7);
@@ -121,7 +126,7 @@ void hyperTest(MetalBackend &backend) {
               weights = scratch(backend, rows * streams * 4);
   const NormWeights nw{upload(backend, normPlus), true};
   CommandGraph graph;
-  ops::Qwen4::addNorm(graph, xs, nw, upload(backend, inject), normalized, weights, shape, rows);
+  ops::HyperConnection::addNorm(graph, xs, nw, upload(backend, inject), normalized, weights, shape, rows);
   run(backend, graph);
   const auto gotN = download<uint16_t>(normalized, rows * width);
   const auto gotW = download<float>(weights, rows * streams);
@@ -155,8 +160,8 @@ void hyperTest(MetalBackend &backend) {
   const auto gate = randoms(rng, rows * width, 1.0f);
   MetalBuffer gateBuffer = upload(backend, bf16s(gate)), mixed = scratch(backend, rows * hidden * 2);
   CommandGraph graph2;
-  ops::Qwen4::addLow(graph2, lowBuffer, shape, rows);
-  ops::Qwen4::addMix(graph2, normalized, gateBuffer, mixed, shape, rows);
+  ops::HyperConnection::addLow(graph2, lowBuffer, shape, rows);
+  ops::HyperConnection::addMix(graph2, normalized, gateBuffer, mixed, shape, rows);
   run(backend, graph2);
   const auto gotLow = download<uint16_t>(lowBuffer, rows * rank);
   bool okLow = true;
@@ -178,7 +183,7 @@ void hyperTest(MetalBackend &backend) {
   const auto branch = randoms(rng, rows * hidden, 1.0f);
   MetalBuffer branchBuffer = upload(backend, bf16s(branch));
   CommandGraph graph3;
-  ops::Qwen4::addCombine(graph3, xs, branchBuffer, weights, shape, rows);
+  ops::HyperConnection::addCombine(graph3, xs, branchBuffer, weights, shape, rows);
   run(backend, graph3);
   const auto gotX = download<float>(xs, rows * width);
   bool okC = true;
@@ -192,7 +197,7 @@ void hyperTest(MetalBackend &backend) {
   check(okC, "hyper combine: streams + branch x injection weight");
   MetalBuffer streamsOut = scratch(backend, rows * width * 4);
   CommandGraph graph4;
-  ops::Qwen4::addInit(graph4, branchBuffer, streamsOut, shape, rows);
+  ops::HyperConnection::addInit(graph4, branchBuffer, streamsOut, shape, rows);
   run(backend, graph4);
   const auto gotInit = download<float>(streamsOut, rows * width);
   bool okI = true;
@@ -238,10 +243,11 @@ void hyperTableTest(MetalBackend &backend) {
   MetalBuffer normalizedT = zeroed(rows * width * 2), weightsT = zeroed(rows * streams * 4);
   const ops::LinearScratch normRef = table(width), normGot = table(width);
   CommandGraph norm;
-  ops::Qwen4::addNorm(norm, xs, nw, inject, normalized, weights, shape, rows);
+  ops::HyperConnection::addNorm(norm, xs, nw, inject, normalized, weights, shape, rows);
   prepare(norm, normalized, normRef, width);
   const ops::PreparedInput prepared =
-      ops::Qwen4::addNorm(norm, xs, nw, inject, normalizedT, weightsT, shape, rows, normGot, ops::LinearInput::Table16);
+      ops::HyperConnection::addNorm(norm, xs, nw, inject, normalizedT, weightsT, shape, rows, normGot,
+                                    ops::LinearInput::Table16);
   run(backend, norm);
   check(prepared.layout == ops::LinearInput::Table16 && prepared.source.sameView(normalizedT),
         "hyper norm table: names its output and table layout");
@@ -253,9 +259,9 @@ void hyperTableTest(MetalBackend &backend) {
   MetalBuffer lowPlain = upload(backend, low), lowTable = upload(backend, low);
   const ops::LinearScratch lowRef = table(rank), lowGot = table(rank);
   CommandGraph lows;
-  ops::Qwen4::addLow(lows, lowPlain, shape, rows);
+  ops::HyperConnection::addLow(lows, lowPlain, shape, rows);
   prepare(lows, lowPlain, lowRef, rank);
-  ops::Qwen4::addLow(lows, lowTable, shape, rows, lowGot, ops::LinearInput::Table16);
+  ops::HyperConnection::addLow(lows, lowTable, shape, rows, lowGot, ops::LinearInput::Table16);
   run(backend, lows);
   check(sameTables(lowRef, lowGot), "hyper low table: table and sums as the prepare's");
   check(download<uint16_t>(lowTable, rows * rank) == low, "hyper low table: leaves its input as it was");
@@ -264,17 +270,18 @@ void hyperTableTest(MetalBackend &backend) {
   MetalBuffer mixed = zeroed(rows * hidden * 2), mixedT = zeroed(rows * hidden * 2);
   const ops::LinearScratch mixRef = table(hidden), mixGot = table(hidden);
   CommandGraph mix;
-  ops::Qwen4::addMix(mix, normalized, gate, mixed, shape, rows);
+  ops::HyperConnection::addMix(mix, normalized, gate, mixed, shape, rows);
   prepare(mix, mixed, mixRef, hidden);
-  ops::Qwen4::addMix(mix, normalized, gate, mixedT, shape, rows, mixGot, ops::LinearInput::Table16);
+  ops::HyperConnection::addMix(mix, normalized, gate, mixedT, shape, rows, mixGot, ops::LinearInput::Table16);
   run(backend, mix);
   check(same(mixed, mixedT), "hyper mix table: output as the plain mix's");
   check(sameTables(mixRef, mixGot), "hyper mix table: table and sums as the prepare's");
 }
 
-// The norm's kernels (kernels/shared/qwen4.metal): ops::Qwen4::addNorm runs
-// an injecting mix of up to QWEN4_NORM_QUARTER_ROWS rows on the quarters
-// kernel and the rest on the loaded one, which sum alike: at decode's row
+// The norm's kernels (kernels/shared/hyper_connection.metal):
+// ops::HyperConnection::addNorm runs an injecting mix of up to
+// HYPER_CONNECTION_NORM_QUARTER_ROWS rows on the quarters kernel and the rest
+// on the loaded one, which sum alike: at decode's row
 // counts and past them, the two write bit for bit the same normalized rows,
 // injection weights and tables, and a mix that injects nothing the same
 // normalized rows. Shader validation's instrumentation compiles the kernels
@@ -321,26 +328,26 @@ void hyperNormKernelsTest(MetalBackend &backend, bool exact) {
   bool okKernels = true, okPlain = true, okTables = true;
   for (const uint32_t rows : {1u, 3u, 8u, 16u, 24u, 32u, 64u, 65u, 128u, 136u, 256u, 512u}) {
     // addNorm's kernel, and the other one on the same rows.
-    const bool quarters = rows <= QWEN4_NORM_QUARTER_ROWS;
-    const std::string other = quarters ? "qwen4_hyper_norm_loaded" : "qwen4_hyper_norm_quarters";
-    const uint32_t otherThreads = quarters ? QWEN4_ROW_THREADS : QWEN4_NORM_QUARTER_THREADS;
-    const Qwen4HyperParams params{rows, hidden, streams, rank, 1};
+    const bool quarters = rows <= HYPER_CONNECTION_NORM_QUARTER_ROWS;
+    const std::string other = quarters ? "hyper_connection_norm_loaded" : "hyper_connection_norm_quarters";
+    const uint32_t otherThreads = quarters ? HYPER_CONNECTION_ROW_THREADS : HYPER_CONNECTION_NORM_QUARTER_THREADS;
+    const HyperConnectionParams params{rows, hidden, streams, rank, 1};
     MetalBuffer normalized = zeroed(rows * width * 2), weights = zeroed(rows * streams * 4);
     MetalBuffer normalizedOther = zeroed(rows * width * 2), weightsOther = zeroed(rows * streams * 4);
     MetalBuffer normalizedPlain = zeroed(rows * width * 2);
     CommandGraph graph;
-    ops::Qwen4::addNorm(graph, xs, nw, inject, normalized, weights, shape, rows);
+    ops::HyperConnection::addNorm(graph, xs, nw, inject, normalized, weights, shape, rows);
     graph.add(other, {xs, nw.buffer, inject, normalizedOther, weightsOther}, params, {rows, 1, 1},
               {otherThreads, 1, 1});
-    ops::Qwen4::addNorm(graph, xs, nw, MetalBuffer{}, normalizedPlain, MetalBuffer{}, shape, rows);
+    ops::HyperConnection::addNorm(graph, xs, nw, MetalBuffer{}, normalizedPlain, MetalBuffer{}, shape, rows);
     // A decode step's rows also into the down projection's table.
     const bool tables = rows % 8 == 0;
     MetalBuffer normalizedT = zeroed(rows * width * 2), weightsT = zeroed(rows * streams * 4);
     MetalBuffer normalizedOtherT = zeroed(rows * width * 2), weightsOtherT = zeroed(rows * streams * 4);
     const ops::LinearScratch tableGot = table((rows + 7) / 8 * 8), tableOther = table((rows + 7) / 8 * 8);
     if (tables) {
-      static_cast<void>(ops::Qwen4::addNorm(graph, xs, nw, inject, normalizedT, weightsT, shape, rows, tableGot,
-                                            ops::LinearInput::Table16));
+      static_cast<void>(ops::HyperConnection::addNorm(graph, xs, nw, inject, normalizedT, weightsT, shape, rows,
+                                                      tableGot, ops::LinearInput::Table16));
       graph.add(other + "_table16",
                 {xs, nw.buffer, inject, normalizedOtherT, weightsOtherT, tableOther.input, tableOther.sums}, params,
                 {rows, 1, 1}, {otherThreads, 1, 1});
@@ -372,7 +379,7 @@ void hyperNormKernelsTest(MetalBackend &backend, bool exact) {
 void pleTest(MetalBackend &backend) {
   std::mt19937 rng(11);
   const uint32_t rows = 7, hidden = 256, streams = 4, taps = 4, dilation = 3, width = hidden * streams;
-  const ops::PleShape shape{hidden, streams, taps, dilation};
+  const ops::NgramShape shape{hidden, streams, taps, dilation};
   const uint32_t history = shape.history();
   const auto key = randoms(rng, rows * width, 1.0f), value = randoms(rng, rows * hidden, 1.0f),
              x = randoms(rng, rows * width, 1.0f), kn = randoms(rng, width, 0.2f), qn = randoms(rng, width, 0.2f),
@@ -384,9 +391,9 @@ void pleTest(MetalBackend &backend) {
   MetalBuffer streamsBuffer = upload(backend, x), histIn = upload(backend, bf16s(hist)),
               histOut = scratch(backend, history * width * 2);
   CommandGraph graph;
-  ops::Qwen4::addPleGate(graph, upload(backend, bf16s(key)), upload(backend, bf16s(value)), streamsBuffer,
-                         {upload(backend, knP), true}, {upload(backend, qnP), true}, {upload(backend, cnP), true},
-                         gated, conv, shape, rows);
+  ops::NgramEmbedding::addGate(graph, upload(backend, bf16s(key)), upload(backend, bf16s(value)), streamsBuffer,
+                               {upload(backend, knP), true}, {upload(backend, qnP), true}, {upload(backend, cnP), true},
+                               gated, conv, shape, rows);
   run(backend, graph);
   const auto gotG = download<float>(gated, rows * width);
   const auto gotConv = download<uint16_t>(conv, rows * width);
@@ -425,8 +432,8 @@ void pleTest(MetalBackend &backend) {
   check(okConvIn, "PLE gate: normalized convolution input");
 
   CommandGraph graph2;
-  ops::Qwen4::addPleConvolution(graph2, conv, histIn, histOut, upload(backend, tapsW), gated, streamsBuffer, shape,
-                                rows);
+  ops::NgramEmbedding::addConvolution(graph2, conv, histIn, histOut, upload(backend, tapsW), gated, streamsBuffer,
+                                      shape, rows);
   run(backend, graph2);
   const auto gotX = download<float>(streamsBuffer, rows * width);
   const auto gotH = download<uint16_t>(histOut, history * width);
@@ -452,8 +459,9 @@ void pleTest(MetalBackend &backend) {
   for (uint32_t retained = 1; retained <= rows; retained += 3) {
     MetalBuffer committed = scratch(backend, history * width * 2), captured = scratch(backend, history * width * 2);
     CommandGraph graph3;
-    ops::Qwen4::addPleCommit(graph3, conv, histIn, committed, upload(backend, std::vector<uint32_t>{retained}), shape);
-    ops::Qwen4::addPleHistory(graph3, conv, histIn, captured, shape, retained);
+    ops::NgramEmbedding::addCommit(graph3, conv, histIn, committed, upload(backend, std::vector<uint32_t>{retained}),
+                                   shape);
+    ops::NgramEmbedding::addHistory(graph3, conv, histIn, captured, shape, retained);
     run(backend, graph3);
     const auto got = download<uint16_t>(committed, history * width);
     const auto gotHistory = download<uint16_t>(captured, history * width);
@@ -699,7 +707,8 @@ void streamMeanTest(MetalBackend &backend) {
   const std::vector<uint16_t> before((firstRow + rows) * stride, kPoison);
   MetalBuffer captured = upload(backend, before);
   CommandGraph graph;
-  ops::Qwen4::addStreamMean(graph, upload(backend, values), captured, {firstRow, stride, column}, shape, rows);
+  ops::HyperConnection::addStreamMean(graph, upload(backend, values), captured, {firstRow, stride, column}, shape,
+                                      rows);
   run(backend, graph);
   const auto got = download<uint16_t>(captured, before.size());
   bool ok = true;
@@ -722,12 +731,12 @@ void streamMeanTest(MetalBackend &backend) {
 // three lanes of SPLASH_TARGET_VERIFY_ROWS rows each.
 void pleHashTest(MetalBackend &backend) {
   const uint32_t lanes = 3, laneRows = SPLASH_TARGET_VERIFY_ROWS, ngram = 3, perNgram = 8, heads = 16, eos = 248044;
-  Qwen4PleHashParams params{};
+  NgramHashParams params{};
   params.rows = lanes * laneRows;
   params.ngram = ngram;
   params.heads_per_ngram = perNgram;
   params.eos = eos;
-  const uint64_t multipliers[QWEN4_PLE_MAXIMUM_NGRAM] = {0x9E3779B97F4A7C15ull, 0xC2B2AE3D27D4EB4Full,
+  const uint64_t multipliers[NGRAM_EMBEDDING_MAXIMUM_NGRAM] = {0x9E3779B97F4A7C15ull, 0xC2B2AE3D27D4EB4Full,
                                                          0x165667B19E3779F9ull};
   std::copy(std::begin(multipliers), std::end(multipliers), params.multipliers);
   for (uint32_t h = 0; h < heads; ++h) {
@@ -738,21 +747,21 @@ void pleHashTest(MetalBackend &backend) {
                                         248319, 0, 12, 13, eos, eos, 14, 15};
   // The ngram - 1 tokens before each lane's rows, nearest first. Lane 0:
   // two tokens; lane 1: a sequence start; lane 2: EOS just before.
-  const std::vector<uint32_t> before = {40, 41, QWEN4_PLE_NONE, QWEN4_PLE_NONE, eos, 77};
+  const std::vector<uint32_t> before = {40, 41, NGRAM_EMBEDDING_NONE, NGRAM_EMBEDDING_NONE, eos, 77};
   MetalBuffer indices = scratch(backend, lanes * laneRows * heads * 4);
   CommandGraph graph;
-  ops::Qwen4::addPleHash(graph, upload(backend, tokens), upload(backend, before), indices, params, heads);
+  ops::NgramEmbedding::addHash(graph, upload(backend, tokens), upload(backend, before), indices, params, heads);
   run(backend, graph);
   const auto got = download<uint32_t>(indices, lanes * laneRows * heads);
   bool ok = true;
   for (uint32_t lane = 0; lane < lanes; ++lane)
     for (uint32_t r = 0; r < laneRows; ++r) {
-      uint64_t context[QWEN4_PLE_MAXIMUM_NGRAM] = {tokens[lane * laneRows + r]};
+      uint64_t context[NGRAM_EMBEDDING_MAXIMUM_NGRAM] = {tokens[lane * laneRows + r]};
       bool cut = false;
       for (uint32_t back = 1; back < ngram; ++back) {
         const uint32_t previous =
             back <= r ? tokens[lane * laneRows + r - back] : before[lane * (ngram - 1) + back - r - 1];
-        cut = cut || previous == QWEN4_PLE_NONE || previous == eos;
+        cut = cut || previous == NGRAM_EMBEDDING_NONE || previous == eos;
         context[back] = cut ? eos : previous;
       }
       for (uint32_t gram = 2; gram <= ngram; ++gram) {

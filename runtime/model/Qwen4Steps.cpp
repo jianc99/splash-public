@@ -1,10 +1,11 @@
 #include "model/Qwen4Steps.hpp"
 
 #include "Checked.hpp"
+#include "metal/abi/NgramEmbedding.h"
 #include "metal/abi/Qwen4.h"
 #include "model/Qwen4Exp.hpp"
 #include "model/SparseRowStore.hpp"
-#include "ops/Qwen4.hpp"
+#include "ops/NgramEmbedding.hpp"
 
 #include <algorithm>
 #include <cstring>
@@ -155,8 +156,8 @@ Qwen4Steps::Qwen4Steps(const Qwen4ExpWeights &weights, const QwenTargetGeometry 
                        metal::MetalBackend &backend, uint32_t prefillChunks)
     : weights_(weights), geometry_(geometry), backend_(backend), prefillChunks_(prefillChunks),
       pleRowBytes_(pleRowBytes(weights)) {
-  // The hash keeps at most QWEN4_PLE_MAXIMUM_NGRAM tokens of a row's n-grams.
-  if (!prefillChunks_ || geometry_.pleNgram < 2 || geometry_.pleNgram > QWEN4_PLE_MAXIMUM_NGRAM)
+  // The hash keeps at most NGRAM_EMBEDDING_MAXIMUM_NGRAM tokens of a row's n-grams.
+  if (!prefillChunks_ || geometry_.pleNgram < 2 || geometry_.pleNgram > NGRAM_EMBEDDING_MAXIMUM_NGRAM)
     throw std::invalid_argument("invalid Qwen3.8-Flash-Next step geometry");
   const Layout bytes = layout(geometry_, pleRowBytes_, prefillChunks_);
   prefill_ = backend_.allocateBuffer(bytes.prefillBytes, metal::BufferStorage::Shared, "qwen4-prefill-scratch");
@@ -279,7 +280,7 @@ void Qwen4Steps::prepareVerifyLane(uint32_t lane, uint64_t position, const QwenT
   for (uint32_t back = 1; back <= prior; ++back)
     before[back - 1] = position >= back && position - back < request.tokens.size()
                            ? request.tokens[position - back]
-                           : QWEN4_PLE_NONE;
+                           : NGRAM_EMBEDDING_NONE;
   preparedPositions_[lane] = position;
   if (blockCount(position, kVerifyRows))
     writeBlocks(position, kVerifyRows, request,
@@ -309,9 +310,10 @@ void Qwen4Steps::addVerifyInput(metal::CommandGraph &graph, metal::MetalBuffer t
   const Qwen4ExpLayout &layout = weights_.layout;
   const Qwen4PleHash &hash = weights_.pleHash;
   const uint32_t heads = layout.pleHeads();
-  if (heads > QWEN4_PLE_MAXIMUM_HEADS || hash.headVocabularies.size() != heads || hash.headOffsets.size() != heads)
+  if (heads > NGRAM_EMBEDDING_MAXIMUM_HEADS || hash.headVocabularies.size() != heads ||
+      hash.headOffsets.size() != heads)
     throw std::logic_error("PLE hash geometry mismatch");
-  Qwen4PleHashParams params{};
+  NgramHashParams params{};
   params.rows = lanes * kVerifyRows;
   params.ngram = layout.pleNgram;
   params.heads_per_ngram = layout.pleHeadsPerNgram;
@@ -320,7 +322,7 @@ void Qwen4Steps::addVerifyInput(metal::CommandGraph &graph, metal::MetalBuffer t
   std::copy(hash.headVocabularies.begin(), hash.headVocabularies.end(), params.vocabularies);
   std::copy(hash.headOffsets.begin(), hash.headOffsets.end(), params.offsets);
   const Qwen4Scratch scratch = verifyScratch(params.rows);
-  ops::Qwen4::addPleHash(graph, std::move(tokens), priorTokens(), scratch.pleIndices, params, heads);
+  ops::NgramEmbedding::addHash(graph, std::move(tokens), priorTokens(), scratch.pleIndices, params, heads);
   // A verify step stages a few rows per lane, most of them already in the
   // cache, so its host step is short and keeps the GPU awake
   // (metal::EventStep::awake).
@@ -350,7 +352,7 @@ void qwen4PleRows(const Qwen4ExpWeights &weights, uint64_t position, std::span<c
     return std::nullopt;
   };
   for (uint32_t row = 0; row < tokens.size(); ++row) {
-    std::array<uint64_t, QWEN4_PLE_MAXIMUM_NGRAM> context{tokens[row]};
+    std::array<uint64_t, NGRAM_EMBEDDING_MAXIMUM_NGRAM> context{tokens[row]};
     bool cut = false;
     for (uint32_t back = 1; back < layout.pleNgram; ++back) {
       const std::optional<uint32_t> previous = position + row >= back ? token(position + row - back) : std::nullopt;
