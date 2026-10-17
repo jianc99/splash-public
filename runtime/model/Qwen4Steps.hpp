@@ -7,7 +7,7 @@
 // the PLE rows of prompt rows (the n-gram hashes of their tokens), the tokens
 // before a decode lane's rows (from which the GPU hashes the rows' PLE rows,
 // since only it has their proposals), the QSA blocks a step's rows complete,
-// and, when the PLE table streams from its file (--ple-ssd-cache), each
+// and, when the PLE table streams from its file (--ple-memory), each
 // step's PLE rows staged from the table: a prefill's before its command is
 // submitted, a verify's in a host step of its command, between the hash and
 // the gather.

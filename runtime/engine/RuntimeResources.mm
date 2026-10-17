@@ -415,12 +415,12 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   // stage, as loading them does.
   model::ModelLoadOptions loadOptions;
   try {
-    // --ple-ssd-cache: a table the target's GGUF holds streams from its file,
+    // --ple-memory: a table the target's GGUF holds streams from its file,
     // so its image is not loaded, and the store's bytes (at most the
     // option's) are charged in its place.
-    const bool streamsTable = config.pleCacheBytes && model::streamableTableBytes(config.modelRoot, config.model);
-    if (config.pleCacheBytes && !streamsTable)
-      logLine("--ple-ssd-cache ignored: ", config.model.name, " has no PLE table to stream");
+    const bool streamsTable = config.pleMemoryBytes && model::streamableTableBytes(config.modelRoot, config.model);
+    if (config.pleMemoryBytes && !streamsTable)
+      logLine("--ple-memory ignored: ", config.model.name, " has no PLE table to stream");
     // --expert-memory: a MoE target's routed experts stream through a store
     // of that many bytes, which modelWeightBytes counts with the images,
     // unless they would hold every one of them.
@@ -434,7 +434,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
         logLine("--expert-memory ignored: its ", config.expertMemoryBytes / kMiB, " MiB hold every routed expert (",
                 expertBytes / kMiB, " MiB), which load with their layers");
     }
-    loadOptions = {.pleCacheBytes = streamsTable ? config.pleCacheBytes : 0,
+    loadOptions = {.pleMemoryBytes = streamsTable ? config.pleMemoryBytes : 0,
                    .expertMemoryBytes = streamsExperts ? config.expertMemoryBytes : 0};
     const uint64_t hardBudgetBytes = EngineMemoryPolicy::hardBudgetBytes(
         device.recommendedMaxWorkingSetBytes, config.maximumMemoryBytes);
@@ -448,7 +448,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     const auto requiredFor = [&](uint64_t stagingBytes) {
       uint64_t fixedBytes = 0;
       for (const uint64_t bytes : {weightBytes, model::kPipelineReserveBytes,
-                                   model::kRuntimeOverheadReserveBytes, stagingBytes, loadOptions.pleCacheBytes}) {
+                                   model::kRuntimeOverheadReserveBytes, stagingBytes, loadOptions.pleMemoryBytes}) {
         if (!checkedAdd(fixedBytes, bytes, fixedBytes))
           fixedBytes = std::numeric_limits<uint64_t>::max();
       }

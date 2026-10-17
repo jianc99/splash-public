@@ -1,7 +1,7 @@
 // Per-kernel GPU time attribution for the production executor.
 //
 //   decode-profile METALLIB MODEL_ROOT [--prompt-tokens N] [--cycles K] [--kv-format int8|bf16]
-//                  [--state-format fp32|bf16] [--expert-memory BYTES] [--ple-ssd-cache BYTES]
+//                  [--state-format fp32|bf16] [--expert-memory BYTES] [--ple-memory BYTES]
 //                  [--dispatch-list FILE]
 //   decode-profile METALLIB MODEL_ROOT --images HxW[,HxW...] [--cycles K]
 //
@@ -305,7 +305,7 @@ int main(int argc, char **argv) {
       if (argc < 3) {
         std::cerr << "usage: decode-profile METALLIB MODEL_ROOT "
                      "[--prompt-tokens N] [--cycles K] [--kv-format int8|bf16] "
-                     "[--state-format fp32|bf16] [--expert-memory BYTES] [--ple-ssd-cache BYTES] "
+                     "[--state-format fp32|bf16] [--expert-memory BYTES] [--ple-memory BYTES] "
                      "[--dispatch-list FILE]\n"
                      "       decode-profile METALLIB MODEL_ROOT "
                      "--images HxW[,HxW...] [--cycles K]\n";
@@ -344,8 +344,8 @@ int main(int argc, char **argv) {
         } else if (option == "--expert-memory") {
           loadOptions.expertMemoryBytes = parseBytes(argv[index + 1], "--expert-memory");
           textOptions = true;
-        } else if (option == "--ple-ssd-cache") {
-          loadOptions.pleCacheBytes = parseBytes(argv[index + 1], "--ple-ssd-cache");
+        } else if (option == "--ple-memory") {
+          loadOptions.pleMemoryBytes = parseBytes(argv[index + 1], "--ple-memory");
           textOptions = true;
         } else if (option == "--dispatch-list") {
           dispatchList = argv[index + 1];

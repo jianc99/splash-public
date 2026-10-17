@@ -85,7 +85,7 @@ LoadedModel loadModel(metal::MetalBackend &backend,
   const auto vision = planVisionLoader(root, result.descriptor);
   DraftCheckpointLoader draft(backend, images, root / "draft", result.descriptor.draft);
   // The weights that stream from their files read on one set of readers.
-  const auto readers = options.pleCacheBytes || options.expertMemoryBytes
+  const auto readers = options.pleMemoryBytes || options.expertMemoryBytes
                            ? std::make_shared<WeightReaders>(kWeightReaders)
                            : nullptr;
   const ExpertStoreOptions experts{.memoryBytes = options.expertMemoryBytes, .readers = readers};
@@ -98,13 +98,13 @@ LoadedModel loadModel(metal::MetalBackend &backend,
           return readTarget(backend, layout, std::ref(loader));
         }
         case TargetSource::Gguf: {
-          // A streamed table's store (--ple-ssd-cache): a stage takes a
+          // A streamed table's store (--ple-memory): a stage takes a
           // prefill chunk's table rows, pleHeads() for each of its
           // prefillTokenBudget tokens, and a prefetch, the read-ahead of the
           // next prefill command (a group's chunks at most), may have them
           // queued or in flight beside a chunk's more.
           const uint32_t stageRows = ExecutionLimits::prefillTokenBudget * layout.pleHeads();
-          const SparseRowStoreOptions table{.cacheBytes = options.pleCacheBytes,
+          const SparseRowStoreOptions table{.cacheBytes = options.pleMemoryBytes,
                                             .readers = readers,
                                             .prefetchRows = (kPrefillGroupChunks + 1) * stageRows,
                                             .stageRows = stageRows};
@@ -154,7 +154,7 @@ uint64_t streamableTableBytes(const std::filesystem::path &root, const ModelDesc
 uint64_t modelWeightBytes(const std::filesystem::path &root, const ModelDescriptor &descriptor,
                           const ModelLoadOptions &options) {
   const gguf::PlanOptions plan{.streamExperts = options.expertMemoryBytes != 0,
-                               .streamTable = options.pleCacheBytes != 0};
+                               .streamTable = options.pleMemoryBytes != 0};
   uint64_t bytes = std::visit(
       [&](const auto &layout) {
         return descriptor.targetSource == TargetSource::Gguf

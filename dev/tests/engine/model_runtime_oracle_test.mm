@@ -2611,7 +2611,7 @@ int main(int argc, char **argv) {
     // The evaluation of the split's program that fails, counted from 1 as
     // ane::ProgramInstrumentation counts them; 0 for none.
     uint64_t aneFfnFault = 0;
-    // --ple-ssd-cache BYTES: a Qwen3.8-Flash-Next target's PLE table streams
+    // --ple-memory BYTES: a Qwen3.8-Flash-Next target's PLE table streams
     // from its file through a cache of BYTES, as splash serve's option does;
     // its TOKENS line equals the resident table's. --expert-memory BYTES: its
     // routed experts stream from the file into an arena of BYTES, as splash
@@ -2621,7 +2621,7 @@ int main(int argc, char **argv) {
     model::ModelLoadOptions loadOptions;
     if (argc < 3)
       fail("usage: model-runtime-oracle METALLIB MODEL_ROOT [--kv-format int8|bf16] [--state-format fp32|bf16] "
-           "[--ane-ffn-share SHARE] [--ane-ffn-fault EVALUATION] [--ple-ssd-cache BYTES] "
+           "[--ane-ffn-share SHARE] [--ane-ffn-fault EVALUATION] [--ple-memory BYTES] "
            "[--expert-memory BYTES] [--images-only | --warmup-eos-only | --prefill-groups-only]");
     for (int i = 3; i < argc; ++i) {
       const std::string_view option(argv[i]);
@@ -2647,11 +2647,11 @@ int main(int argc, char **argv) {
         char *end = nullptr;
         aneFfnFault = std::strtoull(value, &end, 10);
         if (end == value || *end || !aneFfnFault) fail("--ane-ffn-fault takes an evaluation from 1");
-      } else if (option == "--ple-ssd-cache" && i + 1 < argc) {
+      } else if (option == "--ple-memory" && i + 1 < argc) {
         const char *value = argv[++i];
         char *end = nullptr;
-        loadOptions.pleCacheBytes = std::strtoull(value, &end, 10);
-        if (end == value || *end || !loadOptions.pleCacheBytes) fail("--ple-ssd-cache takes a positive byte count");
+        loadOptions.pleMemoryBytes = std::strtoull(value, &end, 10);
+        if (end == value || *end || !loadOptions.pleMemoryBytes) fail("--ple-memory takes a positive byte count");
       } else if (option == "--expert-memory" && i + 1 < argc) {
         const char *value = argv[++i];
         char *end = nullptr;
@@ -2678,15 +2678,15 @@ int main(int argc, char **argv) {
     // weights must fit in reclaimable memory above the macOS reserve before
     // any is loaded; it can refuse a model production starts.
     const uint64_t weightBytes =
-        model::modelWeightBytes(modelRoot, descriptor, loadOptions) + loadOptions.pleCacheBytes;
+        model::modelWeightBytes(modelRoot, descriptor, loadOptions) + loadOptions.pleMemoryBytes;
     if (*hostAvailableBytes <= hostReserveBytes ||
         weightBytes > *hostAvailableBytes - hostReserveBytes)
       stopForHostMemory("the weights need " + mebibytes(weightBytes),
                         *hostAvailableBytes, hostReserveBytes);
     model::LoadedModel model =
         model::loadModel(backend, modelRoot, descriptor, loadOptions);
-    if (loadOptions.pleCacheBytes)
-      std::cout << "ple_ssd_cache=" << (model.streamedTable() ? "streamed" : "ignored") << '\n';
+    if (loadOptions.pleMemoryBytes)
+      std::cout << "ple_memory=" << (model.streamedTable() ? "streamed" : "ignored") << '\n';
     ops::ExecutionPlans operators(backend.capabilities());
     model::ModelMemoryPlan executorPlan =
         model::plannedRuntimeMemory(model, operators, format, stateFormat);

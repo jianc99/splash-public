@@ -235,7 +235,7 @@ void testNeuralEngineSplitIsBudgeted() {
           "the split is missing from the memory plan status");
 }
 
-// A streamed table's host memory (--ple-ssd-cache) is fixed runtime memory
+// A streamed table's host memory (--ple-memory) is fixed runtime memory
 // of its own category, which the KV cache gives up; the status and the
 // description report it.
 void testStreamedTableIsBudgeted() {

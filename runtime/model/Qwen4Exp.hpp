@@ -153,7 +153,7 @@ struct Qwen4ExpWeights final : QwenTargetWeightsBase {
   // The last mix, which feeds the head (finalNorm is unused).
   Qwen4HyperWeights finalHyper;
   // The PLE table's native rows of pleHeadDimension values; empty when the
-  // table streams from its file (--ple-ssd-cache), where pleStore reads the
+  // table streams from its file (--ple-memory), where pleStore reads the
   // rows of pleFormat a step gathers.
   ops::EmbeddingWeights pleTable;
   std::shared_ptr<SparseRowStore> pleStore;

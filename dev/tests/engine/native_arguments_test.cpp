@@ -160,7 +160,7 @@ void testServerCommandLines(const char *path) {
          read.maxContext = 102400;
          read.maxMemoryBytes = 32 * kGiB;
        }},
-      {"ple_ssd_cache", [](NativeArguments &read) { read.pleCacheBytes = 2 * kGiB; }},
+      {"ple_memory", [](NativeArguments &read) { read.pleMemoryBytes = 2 * kGiB; }},
       {"expert_memory", [](NativeArguments &read) { read.expertMemoryBytes = 16 * kGiB; }},
   };
   // Every field but the model inspected from the directory.
@@ -177,7 +177,7 @@ void testServerCommandLines(const char *path) {
            read.maxImagePatches == meant.maxImagePatches &&
            read.idleReleaseSeconds == meant.idleReleaseSeconds &&
            read.preventIdleSleep == meant.preventIdleSleep &&
-           read.neuralEngine == meant.neuralEngine && read.pleCacheBytes == meant.pleCacheBytes &&
+           read.neuralEngine == meant.neuralEngine && read.pleMemoryBytes == meant.pleMemoryBytes &&
            read.expertMemoryBytes == meant.expertMemoryBytes;
   };
   const auto golden = readGolden(path);
@@ -234,7 +234,7 @@ void testRefusals() {
   refuses({"auto", "auto", "--ane", "gpu"}, "--ane requires on or off");
   // The server passes bytes.
   for (const char *size : {"0", "2G", ""})
-    refuses({"auto", "auto", "--ple-ssd-cache", size}, "--ple-ssd-cache requires a positive byte count");
+    refuses({"auto", "auto", "--ple-memory", size}, "--ple-memory requires a positive byte count");
   for (const char *size : {"0", "16G", ""})
     refuses({"auto", "auto", "--expert-memory", size}, "--expert-memory requires a positive byte count");
   refuses({"auto", "auto", "--persistent-cache", "yes"}, "--persistent-cache requires on or off");

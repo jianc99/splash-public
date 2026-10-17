@@ -161,7 +161,7 @@ def _store_size(value, example):
     return size
 
 
-def parse_ple_ssd_cache(value):
+def parse_ple_memory(value):
     return _store_size(value, "2G")
 
 
@@ -431,10 +431,10 @@ SERVE_OPTIONS = (
         ),
     ),
     ServeOption(
-        "--ple-ssd-cache",
+        "--ple-memory",
         "memory",
         dict(
-            type=parse_ple_ssd_cache,
+            type=parse_ple_memory,
             default=None,
             metavar="SIZE",
             help="stream the PLE n-gram table of a Qwen3.8-Flash-Next GGUF from "

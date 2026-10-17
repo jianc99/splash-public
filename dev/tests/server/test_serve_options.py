@@ -65,8 +65,8 @@ OPTIONS = {
         "--state-format", {"fp32": "fp32", "bf16": "bf16"}, ("fp16", "int8")
     ),
     "--disable-ane": ([(["--disable-ane"], True)], []),
-    "--ple-ssd-cache": values(
-        "--ple-ssd-cache",
+    "--ple-memory": values(
+        "--ple-memory",
         {"off": None, "OFF": None, "1M": 1024**2, "2G": 2 * 1024**3},
         ("0", "auto", "bad", "-2G"),
     ),
