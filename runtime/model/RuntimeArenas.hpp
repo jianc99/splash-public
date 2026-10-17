@@ -52,6 +52,8 @@ struct RuntimeGeometry final {
   // The chunks of a prefill command: a group's for a target whose experts
   // stream, otherwise one.
   uint32_t prefillChunks = 1;
+  // The step scratch the target keeps itself beside the arenas.
+  QwenTargetScratchBytes targetScratch{};
 
   [[nodiscard]] static RuntimeGeometry from(const LoadedModel &model,
                                             kv::Format kvFormat,
@@ -64,6 +66,9 @@ struct RuntimeGeometry final {
     result.target.kvLayout = model.targetKvLayout(kvFormat);
     result.target.stateLayout = model.stateLayout(stateFormat).target;
     if (model.expertStore()) result.prefillChunks = kPrefillGroupChunks;
+    result.targetScratch = std::visit(
+        [&](const auto &weights) { return qwenTargetScratchBytes(weights, result.target, result.prefillChunks); },
+        model.target);
     if (!result.target.valid() || !result.draft.stateLayout().valid() ||
         result.target.hiddenSize != result.draft.hiddenSize ||
         result.target.vocabularySize != result.draft.vocabularySize ||
@@ -150,7 +155,7 @@ constexpr Tensor moeScratchTensor(size_t field) noexcept {
 // layer's load (input, the mixer's output they add to, the MoE's routing),
 // and those the draft's context reads once every layer ran (the captured
 // target rows, their draft positions and RoPE). A tensor a family does not
-// use holds no rows.
+// use holds no rows; a target's own scratch is its own (QwenTarget).
 [[nodiscard]] constexpr bool prefillGroupTensor(PrefillTensor tensor) noexcept {
   switch (tensor) {
   case PrefillTensor::Hidden0:
@@ -183,6 +188,9 @@ constexpr Tensor moeScratchTensor(size_t field) noexcept {
 [[nodiscard]] std::array<uint64_t, prefillTensorCount>
 prefillTensorBytes(const RuntimeGeometry &geometry,
                    const ops::ExecutionPlans &operators);
+[[nodiscard]] uint64_t prefillArenaBytes(const RuntimeGeometry &geometry,
+                                         const ops::ExecutionPlans &operators);
+// The arena's and the target's own prefill scratch (qwenTargetScratchBytes).
 [[nodiscard]] uint64_t plannedPrefillBytes(const RuntimeGeometry &geometry,
                                            const ops::ExecutionPlans &operators);
 
@@ -192,7 +200,7 @@ class PrefillArena final {
 public:
   PrefillArena(metal::MetalBackend &backend, const RuntimeGeometry &geometry,
                 const ops::ExecutionPlans &operators)
-      : bytes_(plannedPrefillBytes(geometry, operators)), chunks_(geometry.prefillChunks) {
+      : bytes_(prefillArenaBytes(geometry, operators)), chunks_(geometry.prefillChunks) {
     const auto sizes = prefillTensorBytes(geometry, operators);
     base_ = backend.allocateBuffer(bytes_, metal::BufferStorage::Shared,
                                    "qwen-shared-prefill");
@@ -366,6 +374,10 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
 // holes; only whole tensor boundaries are aligned.
 [[nodiscard]] uint64_t decodeArenaBaseBytes(const RuntimeGeometry &geometry,
                                             const ops::ExecutionPlans &operators);
+// The arena's base, its gate and linear scratch.
+[[nodiscard]] uint64_t decodeArenaBytes(const RuntimeGeometry &geometry,
+                                        const ops::ExecutionPlans &operators);
+// The arena's and the target's own decode scratch (qwenTargetScratchBytes).
 [[nodiscard]] uint64_t plannedDecodeBytes(const RuntimeGeometry &geometry,
                                           const ops::ExecutionPlans &operators);
 
@@ -421,7 +433,7 @@ public:
     linearScratch_.rotated = allocate(linearSize.rotated, metal::BufferStorage::Private, "linear-rotated");
     if (linearSize.counters)
       std::memset(linearScratch_.counters.contents(), 0, linearSize.counters);
-    bytes_ = plannedDecodeBytes(geometry_, operators);
+    bytes_ = decodeArenaBytes(geometry_, operators);
   }
 
   [[nodiscard]] metal::MetalBuffer get(uint32_t lane, DecodeTensor tensor) const {
