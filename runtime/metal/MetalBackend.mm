@@ -484,9 +484,11 @@ struct BackendAsyncState {
 // raises through an event of their own: the work before step i has completed
 // at 2i + 1 (ready), and step i has run at 2i + 2; past the event of a step
 // that keeps the GPU awake the runner raises the backend's release counter to
-// the step's value, which ends the GPU's spin through it (host_step_wait).
-// Each step runs unless the command buffer before it failed; the first step
-// that throws names the command's failure. The runner notes when it took each
+// the step's value, which ends the GPU's spin through it (host_step_wait),
+// and then runs the step's `then` once its work returned. Each step runs
+// unless the command buffer before it failed; the first step that throws
+// names the command's failure, and a `then` that throws marks the backend
+// unhealthy (EventStep). The runner notes when it took each
 // step up and when its work returned, which the command's completion reports
 // (timed) against the GPU times of the buffers before and after the step.
 struct HostSteps {
@@ -494,6 +496,7 @@ struct HostSteps {
         uint64_t ready = 0;
         std::function<void()> work;
         std::function<void(const HostStepTiming &)> timed;
+        std::function<void()> then;
         __weak id<MTLCommandBuffer> before = nil;
         __weak id<MTLCommandBuffer> after = nil;
         // AwakeClock seconds, zero while the step has not run.
@@ -504,6 +507,7 @@ struct HostSteps {
         std::optional<uint32_t> release;
     };
     __strong id<MTLSharedEvent> event = nil;
+    std::shared_ptr<BackendAsyncState> backend;
     // The spin's release buffer (HostStepSpin), once a step spins.
     __strong id<MTLBuffer> releases = nil;
     // A deque, so that the runner holds on to a step while the submission
@@ -625,11 +629,13 @@ private:
                 HostSteps::Step &step = *queued.step;
                 id<MTLSharedEvent> event = steps.event;
                 id<MTLCommandBuffer> before = step.before;
+                bool worked = false;
                 if (before && reached(event, step.ready, before) &&
                     before.status != MTLCommandBufferStatusError) {
                     const double pickup = awakeSeconds();
                     try {
                         step.work();
+                        worked = true;
                     } catch (const std::exception &error) {
                         steps.fail(std::string("host step failed: ") + error.what());
                     } catch (...) {
@@ -641,6 +647,13 @@ private:
                 }
                 event.signaledValue = step.ready + 1;
                 if (step.release) release(steps.releases, *step.release);
+                if (worked && step.then) {
+                    try {
+                        step.then();
+                    } catch (...) {
+                        steps.backend->markUnhealthy("Metal host step's then threw an exception");
+                    }
+                }
             }
         }
     }
@@ -1078,6 +1091,7 @@ struct MetalBackend::Impl {
                                         Fail &&failEncoding) {
         if (!steps) {
             steps = std::make_shared<HostSteps>();
+            steps->backend = asyncState;
             steps->event = [device newSharedEvent];
             if (!steps->event) failEncoding("unable to create Metal shared event");
             if (!hostStepRunner) hostStepRunner = std::make_unique<HostStepRunner>();
@@ -1097,7 +1111,7 @@ struct MetalBackend::Impl {
         id<MTLCommandBuffer> next = [queue commandBuffer];
         if (!next) failEncoding("unable to create Metal command buffer");
         [next encodeWaitForEvent:event value:ready + 1];
-        steps->steps.push_back({ready, step.work, step.timed, command, next, 0.0, 0.0, released});
+        steps->steps.push_back({ready, step.work, step.timed, step.then, command, next, 0.0, 0.0, released});
         for (auto buffer = leading.end() - (released ? 2 : 1); buffer != leading.end(); ++buffer)
             [*buffer commit];
         hostStepRunner->add(steps, steps->steps.back());
@@ -1365,8 +1379,9 @@ struct MetalBackend::Impl {
     // Commits every dispatch of the command as its own command and waits
     // for it, then hands back an already-completed ticket with the summed
     // timing, so callers observe the usual asynchronous contract.
-    // Host steps run between the dispatches, in order (EventStep::Kind::Host);
-    // a command with other event steps is refused.
+    // Host steps run between the dispatches, in order, each `then` after its
+    // work (EventStep::Kind::Host); a command with other event steps is
+    // refused.
     CommandTicket submitProfiled(std::span<const ComputeDispatch> dispatches,
                                  std::span<const EventStep> events,
                                  CommandCompletion completion) {
@@ -1376,7 +1391,10 @@ struct MetalBackend::Impl {
         CommandTiming total;
         auto step = events.begin();
         const auto runSteps = [&](size_t before) {
-            for (; step != events.end() && step->before == before; ++step) step->work();
+            for (; step != events.end() && step->before == before; ++step) {
+                step->work();
+                if (step->then) step->then();
+            }
         };
         for (size_t index = 0; index < command.dispatches.size(); ++index) {
             runSteps(index);

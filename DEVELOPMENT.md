@@ -280,7 +280,9 @@ place (`target_weights_bytes`). Off by default.
   builds apart from the metallib, into `build/host-step.metallib`, and a Metal
   compiler that refuses it only warns. The backend checks, before the first
   command with such a step, that the spin sees the CPU end it, and otherwise
-  runs the steps without it, with a warning.
+  runs the steps without it, with a warning. CPU work the GPU need not wait
+  for runs after the step let the work after it go (`then`): reads begun as
+  the step ends hold the GPU's start back.
 - A prefill command runs a group of up to four chunks of 2048 rows layer by
   layer, so each layer's experts are read once for all of them; a prompt with
   images runs one chunk per command. A contended prefill command's slice

@@ -1818,6 +1818,58 @@ void throwingHostStepFailsItsCommand(const std::string &metallibPath) {
     std::cout << "PASS a throwing host step fails its command\n";
 }
 
+// A host step's `then` runs after its work, once the work after the step
+// may go: it sees that work's result; it does not run after work that threw,
+// and one that throws marks the backend unhealthy (the command may have
+// completed by then). Dispatch profiling runs it right after its work.
+void hostStepThen(const std::string &metallibPath) {
+    MetalBackend backend(metallibPath);
+    MetalBuffer buffer = sharedBuffer(backend, sizeof(uint32_t));
+    auto *value = static_cast<volatile uint32_t *>(buffer.contents());
+    *value = 0;
+    const uint32_t count = 1, one = 1;
+    const std::vector<ComputeDispatch> dispatches(2, addition(buffer, count, one));
+    uint32_t seen = 0;
+    std::atomic<bool> after{false};
+    const std::vector<EventStep> steps{{1, {}, 0, EventStep::Kind::Host, [&] { seen = *value; }, {}, false, [&] {
+                                            const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+                                            while (*value != 2 && std::chrono::steady_clock::now() < end) {}
+                                            after = *value == 2;
+                                        }}};
+    (void)backend.submitCommandAsync(Command{dispatches, steps}).wait();
+    require(waitFor([&] { return after.load(); }, std::chrono::seconds(5)) && seen == 1,
+            "a host step's then did not run once the work after the step went");
+    *value = 0;
+    std::vector<uint32_t> order;
+    const std::vector<EventStep> profiled{{1, {}, 0, EventStep::Kind::Host, [&] { order.push_back(uint32_t{*value}); }, {}, false,
+                                           [&] { order.push_back(uint32_t{*value} + 10); }}};
+    BackendInstrumentation::setDispatchProfiling(backend, true);
+    (void)backend.submitCommandAsync(Command{dispatches, profiled}).wait();
+    (void)BackendInstrumentation::takeDispatchProfile(backend);
+    BackendInstrumentation::setDispatchProfiling(backend, false);
+    require(order == std::vector<uint32_t>{1, 11}, "dispatch profiling did not run a host step's then after its work");
+    std::atomic<bool> ran{false};
+    const std::vector<EventStep> throwing{{1, {}, 0, EventStep::Kind::Host,
+                                           [] { throw std::runtime_error("test host failure"); }, {}, false,
+                                           [&] { ran = true; }}};
+    MetalBackend failing(metallibPath);
+    MetalBuffer failingBuffer = sharedBuffer(failing, sizeof(uint32_t));
+    const std::vector<ComputeDispatch> failingDispatches(2, addition(failingBuffer, count, one));
+    rejects([&] { (void)failing.submitCommandAsync(Command{failingDispatches, throwing}).wait(); },
+            "test host failure", "a command whose host step threw did not fail");
+    require(!ran, "a host step's then ran after its work threw");
+    MetalBackend thenFails(metallibPath);
+    MetalBuffer thenBuffer = sharedBuffer(thenFails, sizeof(uint32_t));
+    const std::vector<ComputeDispatch> thenDispatches(2, addition(thenBuffer, count, one));
+    const std::vector<EventStep> throwingThen{{1, {}, 0, EventStep::Kind::Host, [] {}, {}, false,
+                                               [] { throw std::runtime_error("test then failure"); }}};
+    (void)thenFails.submitCommandAsync(Command{thenDispatches, throwingThen}).wait();
+    require(waitFor([&] { return !thenFails.healthy(); }, std::chrono::seconds(5)) &&
+                thenFails.unhealthyReason().find("then threw") != std::string::npos,
+            "a host step's then that threw left the backend healthy");
+    std::cout << "PASS a host step's then runs once the work after it went\n";
+}
+
 // A host step whose work before it ends long after the runner began to wait
 // for it (the command held 50 ms on an event, past the runner's spin, so the
 // runner blocks on the step's event) still runs once that work ended, taken
@@ -2184,6 +2236,7 @@ int main(int argc, const char *argv[]) {
             hostStepSpinFallsBack(argv[1]);
             earlyBuffersRunWhileTheRestEncodes(argv[1]);
             throwingHostStepFailsItsCommand(argv[1]);
+            hostStepThen(argv[1]);
             hostStepAfterALongWait(argv[1]);
             blockedHostStepRunnerStops(argv[1]);
             allocationDoesNotRequestResidency(argv[1]);
