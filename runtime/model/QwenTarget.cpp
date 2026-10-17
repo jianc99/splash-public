@@ -334,7 +334,7 @@ struct QwenTarget::PrefillStep {
   // extents.
   Qwen4Scratch qwen4{};
   std::vector<Qwen4Blocks> blocks{};
-  std::span<const ops::QsaIndex> qsaIndex{};
+  std::span<const uint32_t> indexOffsets{};
 };
 
 // Qwen3.8-Flash-Next's sparse attention of an attention layer: its indexer
@@ -358,18 +358,15 @@ struct QwenTarget::VerifyStep {
   // Qwen3.8-Flash-Next: as PrefillStep's, and the blocks the lanes complete.
   Qwen4Scratch qwen4{};
   Qwen4LaneBlocks blocks{};
-  std::span<const ops::QsaIndex> qsaIndex{};
+  std::span<const uint32_t> indexOffsets{};
 };
 
 namespace {
 
 // Where each attention layer's QSA index sits in the KV extents of `kv`.
-std::vector<ops::QsaIndex> qsaIndex(const kv::PageStorage &kv, uint32_t layers) {
-  std::vector<ops::QsaIndex> result;
-  for (uint32_t layer = 0; layer < layers; ++layer) {
-    const kv::PageStorage::IndexPlacement placement = kv.indexPlacement(layer);
-    result.push_back({placement.keysOffset, placement.pooledOffset});
-  }
+std::vector<uint32_t> indexOffsets(const kv::PageStorage &kv, uint32_t layers) {
+  std::vector<uint32_t> result;
+  for (uint32_t layer = 0; layer < layers; ++layer) result.push_back(kv.indexOffset(layer));
   return result;
 }
 
@@ -382,8 +379,8 @@ std::vector<metal::MetalBuffer> QwenTarget::addPrefill(metal::CommandGraph &grap
   // The Neural Engine splits a dense target's commands, which are one chunk.
   if (chunks.empty() || kvLayers.size() != geometry_.kvLayout.attentionLayers || (aneFfn && chunks.size() > 1))
     throw std::invalid_argument("invalid Qwen prefill");
-  std::vector<ops::QsaIndex> indexes;
-  if (qwen4Steps_) indexes = qsaIndex(kv, geometry_.kvLayout.attentionLayers);
+  std::vector<uint32_t> offsets;
+  if (qwen4Steps_) offsets = indexOffsets(kv, geometry_.kvLayout.attentionLayers);
   std::vector<PrefillStep> steps;
   steps.reserve(chunks.size());
   for (uint32_t index = 0; index < chunks.size(); ++index) {
@@ -402,7 +399,7 @@ std::vector<metal::MetalBuffer> QwenTarget::addPrefill(metal::CommandGraph &grap
     if (qwen4Steps_) {
       step.qwen4 = qwen4Steps_->prefillScratch(index);
       step.blocks = qwen4Steps_->preparePrefill(index, chunk);
-      step.qsaIndex = indexes;
+      step.indexOffsets = offsets;
     }
   }
   if (qwen4Steps_) qwen4Steps_->readAhead(chunks);
@@ -487,14 +484,16 @@ metal::MetalBuffer QwenTarget::addPrefillAttention(PrefillStep &step, const Qwen
     firstPositions.push_back(static_cast<uint32_t>(sequence.chunk.committed_tokens));
   const auto qsaRows = [&](size_t index) {
     const QwenTargetPrefillSequence &sequence = step.sequences[index];
-    return ops::QsaRows{sequence.rows, std::span(firstPositions).subspan(index, 1), {&sequence.pageTable, 1},
-                        qsa->topBlocks, h.maskWords, h.scoreStride};
+    return ops::QsaRows{sequence.rows, std::span(firstPositions).subspan(index, 1),
+                        {{&sequence.pageTable, 1}, step.indexOffsets[layer]}, qsa->topBlocks, h.maskWords,
+                        h.scoreStride};
   };
   linear.addPrefill(step.graph, b.normalized, mixer.inputProjection, b.fullPacked, step.rows, b.linearScratch);
-  // Each sequence's indexer projects its rows and pools the blocks they
-  // complete; a sequence whose rows attend sparsely selects their blocks, and
-  // its tiles attend through the block lists of the selections, each
-  // sequence's after the lists of those before it.
+  // Each sequence's indexer projects its rows, pools the blocks they
+  // complete and keeps the keys of the block they leave open, and those of
+  // any state captured inside them; a sequence whose rows attend sparsely
+  // selects their blocks, and its tiles attend through the block lists of the
+  // selections, each sequence's after the lists of those before it.
   std::vector<ops::AttentionBlocks> blocks(step.sequences.size());
   if (qsa) {
     addIndexerProjection(step.graph, linear, b.normalized, qsa->indexer.query, h.indexerQuery, step.rows);
@@ -503,17 +502,23 @@ metal::MetalBuffer QwenTarget::addPrefillAttention(PrefillStep &step, const Qwen
     uint32_t lists = 0;
     for (size_t index = 0; index < step.sequences.size(); ++index) {
       const QwenTargetPrefillSequence &sequence = step.sequences[index];
+      const metal::MetalBuffer keys = u16Rows(h.qsaKeys, sequence, QWEN4_QSA_DIMENSION);
+      const metal::MetalBuffer pending = qwen4Steps_->qsaPending(sequence.auxiliaryIn, layer);
       ops::Qwen4::addQsaProject(step.graph, f32Rows(h.indexerQuery, sequence, indexWidth),
                                 f32Rows(h.indexerKey, sequence, QWEN4_QSA_DIMENSION), qsa->indexer.queryNorm,
                                 f32Rows(b.ropeCos, sequence, geometry_.rotaryPairs),
-                                f32Rows(b.ropeSin, sequence, geometry_.rotaryPairs), step.qsaIndex[layer],
-                                u16Rows(h.qsaQueries, sequence, indexWidth), qsaRows(index));
+                                f32Rows(b.ropeSin, sequence, geometry_.rotaryPairs),
+                                u16Rows(h.qsaQueries, sequence, indexWidth), keys, qsaRows(index));
       ops::Qwen4::addQsaPool(step.graph,
-                             {step.blocks[index].records, {&step.blocks[index].count, 1}, 0, {&sequence.pageTable, 1}},
-                             qsa->indexer.keyNorm, b.ropeInverseFrequencies, step.qsaIndex[layer]);
+                             {step.blocks[index].records, {&step.blocks[index].count, 1}, 0, keys, {&pending, 1}},
+                             qsa->indexer.keyNorm, b.ropeInverseFrequencies, qsaRows(index));
+      ops::Qwen4::addQsaPending(step.graph, keys, pending, qwen4Steps_->qsaPending(sequence.auxiliaryOut, layer),
+                                firstPositions[index], sequence.rows);
+      for (const QwenTargetStateCapture &capture : sequence.stateCaptures)
+        ops::Qwen4::addQsaPending(step.graph, keys, pending, qwen4Steps_->qsaPending(capture.auxiliary, layer),
+                                  firstPositions[index], capture.row);
       if (!ops::Qwen4::qsaSparse(firstPositions[index], sequence.rows, qsa->topBlocks)) continue;
-      ops::Qwen4::addQsaSelect(step.graph, u16Rows(h.qsaQueries, sequence, indexWidth), step.qsaIndex[layer],
-                               h.qsaScores, h.scoreRows,
+      ops::Qwen4::addQsaSelect(step.graph, u16Rows(h.qsaQueries, sequence, indexWidth), h.qsaScores, h.scoreRows,
                                rowsOf<uint32_t>(backend_, h.qsaMask, sequence.rowBegin, sequence.rows, h.maskWords),
                                qsaRows(index));
       blocks[index] = {h.qsaLists, h.qsaListCounts, h.listStride, lists};
@@ -650,11 +655,11 @@ void QwenTarget::addVerify(
                   operators_.verifyAttention(lanes, geometry_.attentionQueryHeads, geometry_.kvLayout,
                                              std::span(histories).first(lanes))};
   if (geometry_.ffnKind == QwenFfnKind::SparseMoe) step.moe = operators_.moeDecode(geometry_.moeShape(), lanes);
-  std::vector<ops::QsaIndex> indexes;
+  std::vector<uint32_t> offsets;
   if (qwen4Steps_) {
-    indexes = qsaIndex(kv, geometry_.kvLayout.attentionLayers);
+    offsets = indexOffsets(kv, geometry_.kvLayout.attentionLayers);
     step.qwen4 = qwen4Steps_->verifyScratch(decodeStorageLanes(lanes) * kVerifyRows);
-    step.qsaIndex = indexes;
+    step.indexOffsets = offsets;
     std::array<uint32_t, ExecutionLimits::maximumBatchWidth> positions{};
     for (uint32_t lane = 0; lane < lanes; ++lane) positions[lane] = chunks[lane].committed_tokens;
     step.blocks = qwen4Steps_->verifyBlocks(std::span(positions).first(lanes));
@@ -818,15 +823,25 @@ void QwenTarget::addStateCommit(metal::CommandGraph &graph, QwenTargetCommitBuff
   if (!lanes || lanes > ExecutionLimits::maximumBatchWidth)
     throw std::invalid_argument("invalid Qwen state commit batch");
   if (!qwen4Steps_) return;
-  // Qwen3.8-Flash-Next: each lane's PLE history after its retained rows, from
-  // the convolution inputs its verify wrote.
+  // Qwen3.8-Flash-Next: each lane's PLE history and QSA pending keys after
+  // its retained rows, from the convolution inputs and keys its verify wrote.
   const ops::PleShape shape = pleShape(geometry_);
-  const metal::MetalBuffer convolution = qwen4Steps_->verifyScratch(lanes * kVerifyRows).pleConvolution;
+  const Qwen4Scratch scratch = qwen4Steps_->verifyScratch(lanes * kVerifyRows);
   const uint64_t laneBytes = uint64_t{kVerifyRows} * shape.width() * sizeof(uint16_t);
   for (uint32_t lane = 0; lane < lanes; ++lane)
-    ops::Qwen4::addPleCommit(graph, backend_.view(convolution, lane * laneBytes, laneBytes),
+    ops::Qwen4::addPleCommit(graph, backend_.view(scratch.pleConvolution, lane * laneBytes, laneBytes),
                              buffers.auxiliaryIn[lane], buffers.auxiliaryOut[lane],
                              backend_.view(buffers.retainedCounts, lane * sizeof(uint32_t), sizeof(uint32_t)), shape);
+  const uint32_t layers = geometry_.kvLayout.attentionLayers;
+  std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth> in, out;
+  for (uint32_t lane = 0; lane < lanes; ++lane) {
+    in[lane] = qwen4Steps_->qsaPending(buffers.auxiliaryIn[lane], 0, layers);
+    out[lane] = qwen4Steps_->qsaPending(buffers.auxiliaryOut[lane], 0, layers);
+  }
+  const auto positions = qwen4Steps_->verifyPositions(lanes);
+  ops::Qwen4::addQsaCommit(graph, scratch.qsaKeys, layers, scratch.keyLayerRows, kVerifyRows,
+                           std::span(positions).first(lanes), buffers.retainedCounts, std::span(in).first(lanes),
+                           std::span(out).first(lanes));
 }
 
 
@@ -978,24 +993,30 @@ void QwenTarget::addQwen4VerifyAttention(VerifyStep &step, const Qwen4ExpLayerWe
     firstPositions[lane] = step.chunks[lane].committed_tokens;
     sparse = sparse || ops::Qwen4::qsaSparse(firstPositions[lane], laneRows, topBlocks);
   }
-  const auto pageTables = std::span(b.pageTables).first(step.lanes);
-  const ops::QsaRows qsa{laneRows, std::span(firstPositions).first(step.lanes), pageTables, topBlocks,
+  const ops::QsaRows qsa{laneRows, std::span(firstPositions).first(step.lanes),
+                         {std::span(b.pageTables).first(step.lanes), step.indexOffsets[attentionLayer]}, topBlocks,
                          h.maskWords, h.scoreStride};
   const metal::MetalBuffer queries = rowsOf<uint16_t>(backend_, h.qsaQueries, 0, step.rows, indexWidth);
+  // The layer's keys, which the commit reads after the last layer, and each
+  // lane's pending keys before the step.
+  const metal::MetalBuffer keys =
+      rowsOf<uint16_t>(backend_, h.qsaKeys, attentionLayer * h.keyLayerRows, step.rows, QWEN4_QSA_DIMENSION);
+  std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth> pending;
+  for (uint32_t lane = 0; lane < step.lanes; ++lane)
+    pending[lane] = qwen4Steps_->qsaPending(b.auxiliary[lane], attentionLayer);
   ops::Qwen4::addQsaProject(step.graph, rowsOf<float>(backend_, h.indexerQuery, 0, step.rows, indexWidth),
                             rowsOf<float>(backend_, h.indexerKey, 0, step.rows, QWEN4_QSA_DIMENSION),
                             indexer.queryNorm, rowsOf<float>(backend_, b.ropeCos, 0, step.rows, geometry_.rotaryPairs),
-                            rowsOf<float>(backend_, b.ropeSin, 0, step.rows, geometry_.rotaryPairs),
-                            step.qsaIndex[attentionLayer], queries, qsa);
+                            rowsOf<float>(backend_, b.ropeSin, 0, step.rows, geometry_.rotaryPairs), queries, keys, qsa);
   ops::Qwen4::addQsaPool(step.graph,
                          {step.blocks.records, std::span(step.blocks.counts).first(step.lanes),
-                          step.blocks.laneRecords, pageTables},
-                         indexer.keyNorm, b.ropeInverseFrequencies, step.qsaIndex[attentionLayer]);
+                          step.blocks.laneRecords, keys, std::span(pending).first(step.lanes)},
+                         indexer.keyNorm, b.ropeInverseFrequencies, qsa);
   // Once a lane's rows attend sparsely, every lane's attends through its
   // list: a lane's rows that keep every block select them all.
   const ops::AttentionBlocks blocks{h.qsaLists, h.qsaListCounts, sparse ? h.listStride : 0, 0};
   if (sparse) {
-    ops::Qwen4::addQsaSelect(step.graph, queries, step.qsaIndex[attentionLayer], h.qsaScores, h.scoreRows,
+    ops::Qwen4::addQsaSelect(step.graph, queries, h.qsaScores, h.scoreRows,
                              rowsOf<uint32_t>(backend_, h.qsaMask, 0, step.rows, h.maskWords), qsa);
     std::array<ops::BlockListRows, ExecutionLimits::maximumBatchWidth> laneLists{};
     for (uint32_t lane = 0; lane < step.lanes; ++lane)

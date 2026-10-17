@@ -29,9 +29,11 @@ class SparseRowStore;
 // and injection weights, a block's branch and the zero rows the MoE adds its
 // output to, the PLE layer's row ids, gathered rows, projections, gated
 // values and convolution inputs, and the QSA indexer's projections, prepared
-// queries, scores of scoreRows rows of scoreStride each, block bitmaps of
-// maskWords words per row, and the block lists of the attention's tiles of rows (listStride
-// entries each, ops::AttentionBlocks) with their counts. A streamed PLE
+// queries, raw keys (a decode step's keys of every attention layer,
+// keyLayerRows rows apart, which its commit reads), scores of scoreRows rows
+// of scoreStride each, block bitmaps of maskWords words per row, and the
+// block lists of the attention's tiles of rows (listStride entries each,
+// ops::AttentionBlocks) with their counts. A streamed PLE
 // table's step also stages each distinct row it gathers once (pleStaging)
 // and each row id's row there (pleSlots).
 struct Qwen4Scratch final {
@@ -52,6 +54,7 @@ struct Qwen4Scratch final {
   metal::MetalBuffer indexerQuery;
   metal::MetalBuffer indexerKey;
   metal::MetalBuffer qsaQueries;
+  metal::MetalBuffer qsaKeys;
   metal::MetalBuffer qsaScores;
   metal::MetalBuffer qsaMask;
   metal::MetalBuffer qsaLists;
@@ -60,6 +63,7 @@ struct Qwen4Scratch final {
   uint32_t scoreStride = 0;
   uint32_t maskWords = 0;
   uint32_t listStride = 0;
+  uint32_t keyLayerRows = 0;
 };
 
 // The PLE rows of `tokens` from `position` on into `out`, each row's heads'
@@ -116,6 +120,12 @@ public:
   // The blocks prepareVerifyLane wrote for each lane of a step, whose rows
   // start at positions[lane].
   [[nodiscard]] Qwen4LaneBlocks verifyBlocks(std::span<const uint32_t> positions) const;
+  // The positions prepareVerifyLane prepared the first `lanes` lanes for.
+  [[nodiscard]] std::array<uint32_t, ExecutionLimits::maximumBatchWidth> verifyPositions(uint32_t lanes) const;
+  // The QSA pending keys of `layers` attention layers from `layer` on in a
+  // state cell's auxiliary state.
+  [[nodiscard]] metal::MetalBuffer qsaPending(const metal::MetalBuffer &auxiliary, uint32_t layer,
+                                              uint32_t layers = 1) const;
   // The GPU's PLE rows of `lanes` lanes' verify rows, from their tokens and
   // the tokens before each lane's, and, when the table streams, the host step
   // that stages them.

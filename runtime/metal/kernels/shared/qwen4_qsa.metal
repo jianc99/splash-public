@@ -25,6 +25,7 @@ using namespace mpp::tensor_ops;
 constant constexpr uint kDimension = QWEN4_QSA_DIMENSION;
 constant constexpr uint kHeads = QWEN4_QSA_HEADS;
 constant constexpr uint kBlock = QWEN4_QSA_BLOCK;
+constant constexpr uint kPending = QWEN4_QSA_PENDING;
 constant constexpr uint kPairs = SPLASH_TARGET_ROPE_PAIRS; // rotated pairs (i, i + kPairs)
 constant constexpr uint kPageTokens = SPLASH_TARGET_KV_BLOCK_TOKENS;
 constant constexpr uint kPageBlocks = kPageTokens / kBlock;
@@ -32,15 +33,10 @@ constant constexpr uint kPageBlocks = kPageTokens / kBlock;
 // Lane `lane` of a dispatch (Qwen4QsaParams), none past its lanes.
 inline bool qsa_lane(uint lane, constant Qwen4QsaParams &p) { return lane < min(p.lanes, SPLASH_MAXIMUM_BATCH_WIDTH); }
 
-// A page's raw keys and pooled keys in its extent's index regions.
-inline device bfloat *qsa_raw_keys(SplashKvPage entry, constant Qwen4QsaParams &p) {
+// The pooled keys of a page's blocks, through its index entry.
+inline device bfloat *qsa_index_keys(SplashKvPage entry, constant Qwen4QsaParams &p) {
   const uint index = splash_kv_page_index(entry);
-  return reinterpret_cast<device bfloat *>(splash_kv_extent(entry, index) + p.keys_offset) +
-         ulong(index) * kPageTokens * kDimension;
-}
-inline device bfloat *qsa_pooled_keys(SplashKvPage entry, constant Qwen4QsaParams &p) {
-  const uint index = splash_kv_page_index(entry);
-  return reinterpret_cast<device bfloat *>(splash_kv_extent(entry, index) + p.pooled_offset) +
+  return reinterpret_cast<device bfloat *>(splash_kv_extent(entry, index) + p.index_offset) +
          ulong(index) * kPageBlocks * kDimension;
 }
 
@@ -71,19 +67,15 @@ inline void qsa_rotate_store(float value, threadgroup float *rotated, Table cosi
 
 // Threadgroup (row, head, lane) of 128 threads: query heads are normalized,
 // rotated by the row's RoPE table and written as bf16 [rows][heads][dim];
-// the key head (head == heads) is stored raw, bf16, at the row's slot of
-// the index store.
+// the key head (head == heads) is written raw, bf16, to the row's keys.
 kernel void qwen4_qsa_project(device const float *query [[buffer(0)]],
                               device const float *key [[buffer(1)]],
                               device const float *query_norm [[buffer(2)]],
                               device const float *rope_cos [[buffer(3)]],
                               device const float *rope_sin [[buffer(4)]],
-                              device const SplashKvPage *page_table0 [[buffer(5)]],
-                              device const SplashKvPage *page_table1 [[buffer(6)]],
-                              device const SplashKvPage *page_table2 [[buffer(7)]],
-                              device const SplashKvPage *page_table3 [[buffer(8)]],
-                              device bfloat *queries [[buffer(9)]],
-                              constant Qwen4QsaParams &p [[buffer(10)]],
+                              device bfloat *queries [[buffer(5)]],
+                              device bfloat *keys [[buffer(6)]],
+                              constant Qwen4QsaParams &p [[buffer(7)]],
                               uint3 group [[threadgroup_position_in_grid]],
                               uint tid [[thread_index_in_threadgroup]],
                               uint lane [[thread_index_in_simdgroup]],
@@ -92,31 +84,34 @@ kernel void qwen4_qsa_project(device const float *query [[buffer(0)]],
   threadgroup float rotated[kDimension];
   const uint head = group.y, batch = group.z;
   if (group.x >= p.rows || !qsa_lane(batch, p)) return;
-  const uint row = batch * p.rows + group.x;
+  const ulong row = ulong(batch) * p.rows + group.x;
   if (head == kHeads) {
-    device const SplashKvPage *page_table =
-        SPLASH_LANE_BINDING(batch, page_table0, page_table1, page_table2, page_table3);
-    const uint position = p.first_position[batch] + group.x;
-    qsa_raw_keys(page_table[position / kPageTokens], p)[(position % kPageTokens) * kDimension + tid] =
-        bfloat(key[ulong(row) * kDimension + tid]);
+    keys[row * kDimension + tid] = bfloat(key[row * kDimension + tid]);
     return;
   }
-  const float value = query[(ulong(row) * kHeads + head) * kDimension + tid];
+  const float value = query[(row * kHeads + head) * kDimension + tid];
   const float scale = qsa_rms_scale(value, scratch, lane, sg);
-  qsa_rotate_store(value * scale * query_norm[tid], rotated, rope_cos + ulong(row) * kPairs,
-                   rope_sin + ulong(row) * kPairs, queries + (ulong(row) * kHeads + head) * kDimension, tid);
+  qsa_rotate_store(value * scale * query_norm[tid], rotated, rope_cos + row * kPairs, rope_sin + row * kPairs,
+                   queries + (row * kHeads + head) * kDimension, tid);
 }
 
 // Threadgroup (block, lane) of 128 threads: the mean of the block's four
 // tokens' raw keys, normalized and rotated to its first token's position.
+// A token from the lane's first row on is a row's of the step; one before it
+// is in the lane's pending keys, whose open block this is.
 kernel void qwen4_qsa_pool(device const Qwen4QsaBlock *blocks [[buffer(0)]],
-                           device const float *key_norm [[buffer(1)]],
-                           device const float *inverse_frequencies [[buffer(2)]],
-                           device const SplashKvPage *page_table0 [[buffer(3)]],
-                           device const SplashKvPage *page_table1 [[buffer(4)]],
-                           device const SplashKvPage *page_table2 [[buffer(5)]],
-                           device const SplashKvPage *page_table3 [[buffer(6)]],
-                           constant Qwen4QsaParams &p [[buffer(7)]],
+                           device const bfloat *keys [[buffer(1)]],
+                           device const bfloat *pending0 [[buffer(2)]],
+                           device const bfloat *pending1 [[buffer(3)]],
+                           device const bfloat *pending2 [[buffer(4)]],
+                           device const bfloat *pending3 [[buffer(5)]],
+                           device const float *key_norm [[buffer(6)]],
+                           device const float *inverse_frequencies [[buffer(7)]],
+                           device const SplashKvPage *index_table0 [[buffer(8)]],
+                           device const SplashKvPage *index_table1 [[buffer(9)]],
+                           device const SplashKvPage *index_table2 [[buffer(10)]],
+                           device const SplashKvPage *index_table3 [[buffer(11)]],
+                           constant Qwen4QsaParams &p [[buffer(12)]],
                            uint2 group [[threadgroup_position_in_grid]],
                            uint tid [[thread_index_in_threadgroup]],
                            uint lane [[thread_index_in_simdgroup]],
@@ -126,8 +121,9 @@ kernel void qwen4_qsa_pool(device const Qwen4QsaBlock *blocks [[buffer(0)]],
   threadgroup float cosine[kPairs], sine[kPairs];
   const uint index = group.x, batch = group.y;
   if (!qsa_lane(batch, p) || index >= p.counts[batch]) return;
-  device const SplashKvPage *page_table =
-      SPLASH_LANE_BINDING(batch, page_table0, page_table1, page_table2, page_table3);
+  device const SplashKvPage *index_table =
+      SPLASH_LANE_BINDING(batch, index_table0, index_table1, index_table2, index_table3);
+  device const bfloat *pending = SPLASH_LANE_BINDING(batch, pending0, pending1, pending2, pending3);
   const Qwen4QsaBlock block = blocks[ulong(batch) * p.lane_records + index];
   // The block's table row as rope_build_tables computes one: frequency i
   // on axis i % 3 (interleaved M-RoPE).
@@ -137,20 +133,76 @@ kernel void qwen4_qsa_pool(device const Qwen4QsaBlock *blocks [[buffer(0)]],
     sine[tid] = sin(angle);
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  const SplashKvPage page = page_table[block.position / kPageTokens];
-  const uint slot = block.position % kPageTokens;
-  device const bfloat *raw_keys = qsa_raw_keys(page, p);
+  const uint first = p.first_position[batch];
+  device const bfloat *lane_keys = keys + ulong(batch) * p.rows * kDimension;
   float sum = 0.0f;
-  for (uint t = 0; t < kBlock; ++t) sum += float(raw_keys[(slot + t) * kDimension + tid]);
+  for (uint t = 0; t < kBlock; ++t) {
+    const uint position = block.position + t;
+    sum += float(position >= first ? lane_keys[ulong(position - first) * kDimension + tid]
+                                   : pending[t * kDimension + tid]);
+  }
   const float mean = sum / kBlock;
   const float scale = qsa_rms_scale(mean, scratch, lane, sg);
   qsa_rotate_store(mean * scale * key_norm[tid], rotated, cosine, sine,
-                   qsa_pooled_keys(page, p) + (slot / kBlock) * kDimension, tid);
+                   qsa_index_keys(index_table[block.position / kPageTokens], p) +
+                       (block.position % kPageTokens / kBlock) * kDimension,
+                   tid);
+}
+
+// One layer's pending keys of a lane after the first `retained` of its rows
+// from `first` (Qwen4QsaPendingParams): the tokens of the rows' last block
+// before their end, from the rows' keys or, before `first`, the pending keys
+// before them, and zero past the end. A thread per dimension.
+inline void qsa_store_pending(device const bfloat *keys, device const bfloat *pending_in,
+                              device bfloat *pending_out, uint first, uint retained, uint tid) {
+  const uint end = first + retained, open = end / kBlock * kBlock;
+  for (uint slot = 0; slot < kPending; ++slot) {
+    const uint position = open + slot;
+    bfloat value = bfloat(0.0f);
+    if (position < end)
+      value = position >= first ? keys[ulong(position - first) * kDimension + tid] : pending_in[slot * kDimension + tid];
+    pending_out[slot * kDimension + tid] = value;
+  }
+}
+
+// One threadgroup of kDimension threads: the pending keys of one layer of
+// one lane after its first retained[0] rows, a count the host knows.
+kernel void qwen4_qsa_pending(device const bfloat *keys [[buffer(0)]],
+                              device const bfloat *pending_in [[buffer(1)]],
+                              device bfloat *pending_out [[buffer(2)]],
+                              constant Qwen4QsaPendingParams &p [[buffer(3)]],
+                              uint tid [[thread_index_in_threadgroup]]) {
+  qsa_store_pending(keys, pending_in, pending_out, p.first_position[0], min(p.retained[0], p.rows), tid);
+}
+
+// Threadgroup (layer, lane) of kDimension threads: each layer's pending keys
+// of each lane of a verify after the rows it retained, a count the GPU
+// wrote. A lane's pending keys of every layer follow each other.
+kernel void qwen4_qsa_commit(device const bfloat *keys [[buffer(0)]],
+                             device const uint *retained [[buffer(1)]],
+                             device const bfloat *pending_in0 [[buffer(2)]],
+                             device const bfloat *pending_in1 [[buffer(3)]],
+                             device const bfloat *pending_in2 [[buffer(4)]],
+                             device const bfloat *pending_in3 [[buffer(5)]],
+                             device bfloat *pending_out0 [[buffer(6)]],
+                             device bfloat *pending_out1 [[buffer(7)]],
+                             device bfloat *pending_out2 [[buffer(8)]],
+                             device bfloat *pending_out3 [[buffer(9)]],
+                             constant Qwen4QsaPendingParams &p [[buffer(10)]],
+                             uint2 group [[threadgroup_position_in_grid]],
+                             uint tid [[thread_index_in_threadgroup]]) {
+  const uint layer = group.x, lane = group.y;
+  if (lane >= min(p.lanes, SPLASH_MAXIMUM_BATCH_WIDTH)) return;
+  const ulong pending = ulong(layer) * kPending * kDimension;
+  qsa_store_pending(keys + (ulong(layer) * p.layer_rows + ulong(lane) * p.rows) * kDimension,
+                    SPLASH_LANE_BINDING(lane, pending_in0, pending_in1, pending_in2, pending_in3) + pending,
+                    SPLASH_LANE_BINDING(lane, pending_out0, pending_out1, pending_out2, pending_out3) + pending,
+                    p.first_position[lane], min(retained[lane], p.rows), tid);
 }
 
 // Threadgroup per tile of kScoreRows rows of a lane by kScoreBlocks blocks:
-// the rows' query heads and the blocks' pooled keys, gathered from their
-// pages into threadgroup memory, make every head's dot product of the tile
+// the rows' query heads and the blocks' pooled keys, gathered from the
+// index into threadgroup memory, make every head's dot product of the tile
 // in one MPP product, and each row's score of a block sums its heads' relu
 // over sqrt(dimension). The scratch holds the dispatch's rows, lane after
 // lane.
@@ -158,10 +210,10 @@ constant constexpr uint kScoreRows = QWEN4_QSA_SCORE_ROWS;
 constant constexpr uint kScoreBlocks = QWEN4_QSA_SCORE_BLOCKS;
 constant constexpr uint kScoreThreads = QWEN4_QSA_SCORE_THREADS;
 kernel void qwen4_qsa_score(device const bfloat *queries [[buffer(0)]],
-                            device const SplashKvPage *page_table0 [[buffer(1)]],
-                            device const SplashKvPage *page_table1 [[buffer(2)]],
-                            device const SplashKvPage *page_table2 [[buffer(3)]],
-                            device const SplashKvPage *page_table3 [[buffer(4)]],
+                            device const SplashKvPage *index_table0 [[buffer(1)]],
+                            device const SplashKvPage *index_table1 [[buffer(2)]],
+                            device const SplashKvPage *index_table2 [[buffer(3)]],
+                            device const SplashKvPage *index_table3 [[buffer(4)]],
                             device float *scores [[buffer(5)]],
                             constant Qwen4QsaParams &p [[buffer(6)]],
                             uint3 group [[threadgroup_position_in_grid]],
@@ -179,8 +231,8 @@ kernel void qwen4_qsa_score(device const bfloat *queries [[buffer(0)]],
   // grow with the row.
   const uint complete = (p.first_position[batch] + p.row_offset + last) / kBlock;
   if (block0 >= complete || complete <= p.top_blocks) return;
-  device const SplashKvPage *page_table =
-      SPLASH_LANE_BINDING(batch, page_table0, page_table1, page_table2, page_table3);
+  device const SplashKvPage *index_table =
+      SPLASH_LANE_BINDING(batch, index_table0, index_table1, index_table2, index_table3);
   device const uint4 *tile_queries = reinterpret_cast<device const uint4 *>(
       queries + (ulong(batch) * p.rows + p.row_offset + row0) * kHeads * D);
   for (uint chunk = tid; chunk < M * Chunks; chunk += kScoreThreads)
@@ -190,7 +242,7 @@ kernel void qwen4_qsa_score(device const bfloat *queries [[buffer(0)]],
     const uint block = block0 + chunk / Chunks;
     uint4 data = 0;
     if (block < complete)
-      data = reinterpret_cast<device const uint4 *>(qsa_pooled_keys(page_table[block / kPageBlocks], p) +
+      data = reinterpret_cast<device const uint4 *>(qsa_index_keys(index_table[block / kPageBlocks], p) +
                                                     (block % kPageBlocks) * D)[chunk % Chunks];
     reinterpret_cast<threadgroup uint4 *>(k)[chunk] = data;
   }

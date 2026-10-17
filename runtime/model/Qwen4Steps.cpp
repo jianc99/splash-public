@@ -67,7 +67,16 @@ struct Tensor final {
   bool carried;
 };
 
-std::vector<Tensor> tensors(const QwenTargetGeometry &g, uint32_t scoreRows) {
+// A step's QSA raw keys: a prefill chunk's of the layer it runs, which its
+// pool reads; a decode step's of every attention layer, which its commit
+// reads after the last.
+uint64_t keyRowBytes(bool decode) { return decode ? 0 : bytesFor<uint16_t>(QWEN4_QSA_DIMENSION); }
+uint64_t keyFixedBytes(const QwenTargetGeometry &g, bool decode) {
+  return decode ? bytesFor<uint16_t>(uint64_t{g.attentionLayerCount()} * kStepRows * QWEN4_QSA_DIMENSION) : 0;
+}
+
+std::vector<Tensor> tensors(const QwenTargetGeometry &g, bool decode) {
+  const uint32_t scoreRows = decode ? kStepRows : kPrefillScoreRows;
   std::vector<Tensor> result{
       {&Qwen4Scratch::streams, bytesFor<float>(g.streamWidth()), 0, true},
       {&Qwen4Scratch::normalized, bytesFor<uint16_t>(g.streamWidth()), 0, false},
@@ -84,6 +93,7 @@ std::vector<Tensor> tensors(const QwenTargetGeometry &g, uint32_t scoreRows) {
       {&Qwen4Scratch::indexerQuery, bytesFor<float>(kIndexWidth), 0, false},
       {&Qwen4Scratch::indexerKey, bytesFor<float>(QWEN4_QSA_DIMENSION), 0, false},
       {&Qwen4Scratch::qsaQueries, bytesFor<uint16_t>(kIndexWidth), 0, false},
+      {&Qwen4Scratch::qsaKeys, keyRowBytes(decode), keyFixedBytes(g, decode), false},
       {&Qwen4Scratch::qsaScores, 0, bytesFor<float>(uint64_t{scoreRows} * scoreStride(g)), false},
       {&Qwen4Scratch::qsaMask, bytesFor<uint32_t>(maskWords(g)), 0, false},
       // A list of listStride entries per tile of rows, and a word per row
@@ -115,10 +125,10 @@ struct Layout final {
 
 Layout layout(const QwenTargetGeometry &g, uint32_t chunks) {
   Layout result;
-  for (const Tensor &tensor : tensors(g, kPrefillScoreRows))
+  for (const Tensor &tensor : tensors(g, false))
     result.prefillBlocks += alignUp(bytesOf(tensor, kChunkRows)) * (tensor.carried ? chunks : 1);
   result.prefillBytes = result.prefillBlocks + alignUp(kChunkBlockBytes) * chunks;
-  for (const Tensor &tensor : tensors(g, kStepRows)) result.decodeBlocks += alignUp(bytesOf(tensor, kStepRows));
+  for (const Tensor &tensor : tensors(g, true)) result.decodeBlocks += alignUp(bytesOf(tensor, kStepRows));
   result.decodePrior = result.decodeBlocks + alignUp(kLanes * kLaneBlockBytes);
   result.decodeBytes = result.decodePrior + alignUp(bytesFor<uint32_t>(kLanes * priorCount(g)));
   return result;
@@ -156,12 +166,12 @@ Qwen4Steps::Qwen4Steps(const Qwen4ExpWeights &weights, const QwenTargetGeometry 
   decodeBlocksOffset_ = bytes.decodeBlocks;
   decodePriorOffset_ = bytes.decodePrior;
   uint64_t cursor = 0;
-  for (const Tensor &tensor : tensors(geometry_, kPrefillScoreRows)) {
+  for (const Tensor &tensor : tensors(geometry_, false)) {
     prefillTensors_.push_back({tensor.field, tensor.rowBytes, tensor.fixedBytes, tensor.carried, cursor});
     cursor += alignUp(bytesOf(tensor, kChunkRows)) * (tensor.carried ? prefillChunks_ : 1);
   }
   cursor = 0;
-  for (const Tensor &tensor : tensors(geometry_, kStepRows)) {
+  for (const Tensor &tensor : tensors(geometry_, true)) {
     decodeTensors_.push_back({tensor.field, tensor.rowBytes, tensor.fixedBytes, tensor.carried, cursor});
     cursor += alignUp(bytesOf(tensor, kStepRows));
   }
@@ -256,7 +266,8 @@ Qwen4Scratch Qwen4Steps::verifyScratch(uint32_t rows) const {
   Qwen4Scratch scratch{.scoreRows = kStepRows,
                        .scoreStride = scoreStride(geometry_),
                        .maskWords = maskWords(geometry_),
-                       .listStride = listStride(geometry_)};
+                       .listStride = listStride(geometry_),
+                       .keyLayerRows = kStepRows};
   for (const Placed &tensor : decodeTensors_)
     scratch.*tensor.field = backend_.view(decode_, tensor.offset, tensor.rowBytes * rows + tensor.fixedBytes);
   return scratch;
@@ -288,6 +299,20 @@ Qwen4LaneBlocks Qwen4Steps::verifyBlocks(std::span<const uint32_t> positions) co
     blocks.counts[lane] = blockCount(positions[lane], kVerifyRows);
   }
   return blocks;
+}
+
+std::array<uint32_t, ExecutionLimits::maximumBatchWidth> Qwen4Steps::verifyPositions(uint32_t lanes) const {
+  if (!lanes || lanes > kLanes) throw std::invalid_argument("invalid Qwen3.8-Flash-Next lanes");
+  std::array<uint32_t, kLanes> positions{};
+  for (uint32_t lane = 0; lane < lanes; ++lane) positions[lane] = static_cast<uint32_t>(preparedPositions_[lane]);
+  return positions;
+}
+
+metal::MetalBuffer Qwen4Steps::qsaPending(const metal::MetalBuffer &auxiliary, uint32_t layer, uint32_t layers) const {
+  const uint64_t layerBytes = geometry_.indexerPendingBytes() / geometry_.attentionLayerCount();
+  if (!layers || layer + layers > geometry_.attentionLayerCount())
+    throw std::out_of_range("Qwen3.8-Flash-Next QSA pending layers");
+  return backend_.view(auxiliary, geometry_.pleHistoryBytes() + layer * layerBytes, layers * layerBytes);
 }
 
 metal::MetalBuffer Qwen4Steps::priorTokens() const {
