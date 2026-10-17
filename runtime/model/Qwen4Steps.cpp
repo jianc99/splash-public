@@ -41,10 +41,12 @@ constexpr uint64_t kLaneBlockBytes =
     (kVerifyRows + BLOCK_INDEXER_BLOCK - 1) / BLOCK_INDEXER_BLOCK * sizeof(BlockIndexerBlock);
 
 // The words of a row's QSA bitmap in a window of `contextTokens`: a bit per
-// block of the context, the partial block at its end and the current one
-// included. A row's scores: one per block its bitmap covers. Both follow the
-// window the target serves.
-constexpr uint32_t maskWords(uint32_t contextTokens) { return (contextTokens / BLOCK_INDEXER_BLOCK + 2 + 31) / 32; }
+// block of the context and the blocks past it that a tile's lists read, as
+// far as the select writes (BLOCK_INDEXER_TILE_SLACK). A row's scores: one
+// per block its bitmap covers. Both follow the window the target serves.
+constexpr uint32_t maskWords(uint32_t contextTokens) {
+  return (contextTokens / BLOCK_INDEXER_BLOCK + BLOCK_INDEXER_TILE_SLACK + 31) / 32;
+}
 uint32_t maskWords(const QwenTargetGeometry &g) { return maskWords(g.contextTokens()); }
 uint32_t scoreStride(const QwenTargetGeometry &g) { return maskWords(g) * 32; }
 // The rows of a prefill chunk a batch of the selection scores: those whose
