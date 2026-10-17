@@ -241,7 +241,10 @@ MOE_GROUP_ROUTES_ENTRY(moe_group_routes_e512, SPLASH_MOE_WIDE_EXPERT_SLOTS)
 
 // Copies each grouped row's input so every expert tile is a dense matrix,
 // over the rows the staged expert passes read (moe_staged_rows): padding rows
-// among them are zero and their outputs are never read.
+// among them are zero and their outputs are never read. Threadgroup (tile,
+// part) copies the part's 256 columns of the tile's rows, eight rows at once,
+// each thread eight columns (16 bytes, rows of whole 256 columns starting
+// 16-byte aligned) of one row.
 kernel void moe_gather_rows(device const bfloat *input [[buffer(0)]],
                             device const uint *grouped_routes [[buffer(1)]],
                             device const MoeTileDescriptor *tiles [[buffer(2)]],
@@ -252,16 +255,15 @@ kernel void moe_gather_rows(device const bfloat *input [[buffer(0)]],
                             uint thread_index [[thread_index_in_threadgroup]]) {
   if (group.x >= *tile_count)
     return;
-  uint column = group.y * 256 + thread_index;
+  const uint column = group.y * 256 + (thread_index % 32) * 8;
   const uint rows = moe_staged_rows(tiles, group.x, params.tile_rows);
-  for (uint local = 0; local < rows; ++local) {
-    uint row = group.x * params.tile_rows + local;
-    uint route = grouped_routes[row];
-    grouped_input[ulong(row) * params.input_size + column] =
-        route == ~0u
-            ? bfloat(0.0f)
-            : input[ulong(route / params.routes_per_row) * params.input_size +
-                    column];
+  for (uint local = thread_index / 32; local < rows; local += 8) {
+    const uint row = group.x * params.tile_rows + local;
+    const uint route = grouped_routes[row];
+    *reinterpret_cast<device uint4 *>(grouped_input + ulong(row) * params.input_size + column) =
+        route == ~0u ? uint4(0)
+                     : *reinterpret_cast<device const uint4 *>(
+                           input + ulong(route / params.routes_per_row) * params.input_size + column);
   }
 }
 
