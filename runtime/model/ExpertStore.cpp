@@ -1,6 +1,7 @@
 #include "model/ExpertStore.hpp"
 
 #include "metal/abi/MoE.h"
+#include "model/ExpertSlots.hpp"
 #include "model/GgufImageLayout.hpp"
 #include "model/GgufPreparation.hpp"
 #include "model/Model.hpp"
@@ -196,8 +197,7 @@ struct ExpertStore::Impl {
   };
   // The experts of one layout in one arena (of some of its blocks, when the
   // layout's would exceed the largest buffer): their slots, a streamed
-  // size's recycled least recently used first, a long prefill chunk's loads
-  // before the others.
+  // size's recycled in its order (ExpertSlots).
   struct Size final {
     ExpertLayout layout;
     uint32_t blocks = 0;
@@ -210,46 +210,9 @@ struct ExpertStore::Impl {
     // The repack of its staged rows into slots.
     MoeExpertLoadParams load{};
     uint32_t loadGroups = 0;
-    // Two recency orders, each from the least recently used slot (head) to
-    // the most: Chunk, the experts a long prefill chunk loaded that no other
-    // step routed since, which claim() recycles first, and the free slots;
-    // Recent, the others. A slot is in one, order[slot].
-    enum Order : uint8_t { Chunk, Recent };
-    std::vector<uint32_t> previous, next;
-    std::vector<uint8_t> order;
-    std::array<uint32_t, 2> head{kNoSlot, kNoSlot}, tail{kNoSlot, kNoSlot};
+    // Which slot a load's missing expert takes.
+    ExpertSlots recycling{0};
     std::vector<uint32_t> ownerBlock, ownerExpert; // kNoSlot when free
-    std::vector<uint64_t> lastLoad;                // the load that last routed it
-
-    void unlink(uint32_t slot) {
-      const uint8_t o = order[slot];
-      (previous[slot] == kNoSlot ? head[o] : next[previous[slot]]) = next[slot];
-      (next[slot] == kNoSlot ? tail[o] : previous[next[slot]]) = previous[slot];
-    }
-    void append(uint32_t slot, Order o) {
-      order[slot] = o;
-      previous[slot] = tail[o];
-      next[slot] = kNoSlot;
-      (tail[o] == kNoSlot ? head[o] : next[tail[o]]) = slot;
-      tail[o] = slot;
-    }
-    void prepend(uint32_t slot, Order o) {
-      order[slot] = o;
-      next[slot] = head[o];
-      previous[slot] = kNoSlot;
-      (head[o] == kNoSlot ? tail[o] : previous[head[o]]) = slot;
-      head[o] = slot;
-    }
-    void touch(uint32_t slot, uint64_t load, Order o) {
-      lastLoad[slot] = load;
-      unlink(slot);
-      append(slot, o);
-    }
-    // Every slot free, in Chunk.
-    void reset() {
-      head = tail = {kNoSlot, kNoSlot};
-      for (uint32_t slot = 0; slot < slots; ++slot) append(slot, Chunk);
-    }
   };
   struct Block final {
     uint32_t size = 0;
@@ -314,7 +277,6 @@ struct ExpertStore::Impl {
   void readBlockAhead(uint32_t block, ops::MoePhase phase);
   void stopAhead();
   void evict(Size &size, uint32_t slot);
-  uint32_t claim(Size &size);
   void abandon();
   void fill();
   void publish();
@@ -400,26 +362,9 @@ void ExpertStore::Impl::evict(Size &size, uint32_t slot) {
   --counters.resident;
 }
 
-uint32_t ExpertStore::Impl::claim(Size &size) {
-  // The slots a load routes are at their order's most recent end: an order
-  // whose head the load routed holds only the load's.
-  const auto takes = [&](uint32_t slot) { return slot != kNoSlot && size.lastLoad[slot] != serial; };
-  const uint32_t slot = takes(size.head[Size::Chunk]) ? size.head[Size::Chunk] : size.head[Size::Recent];
-  if (!takes(slot)) throw std::runtime_error("the expert arena holds fewer slots than one load's experts");
-  evict(size, slot);
-  return slot;
-}
-
-// A long prefill chunk routes more experts than the arena holds (nearly
-// every expert of every block): the experts it loads join Chunk, which the
-// next blocks' loads recycle first, and those it routes keep their order. So
-// the experts decode steps routed stay, and each chunk of a prompt reads
-// what the last left out, where a single order would have each chunk evict
-// the blocks the next one reads first, and the decode steps after the prompt
-// read their experts again (with a 16 GiB arena, Qwen3.8-Flash-Next's Q2_0
-// GGUF reads 38% fewer experts in prefill than with one order, and 6% fewer
-// in decode). A short chunk's experts, which its decode steps route again,
-// are recent as a decode step's.
+// Routes block `index`'s load: the experts its tiles name, each once; those
+// resident keep their slots, and the others claim one each, in expert order
+// (stage reads consecutive experts together).
 void ExpertStore::Impl::route(uint32_t index, std::span<const std::span<const MoeTileDescriptor>> parts,
                               ops::MoePhase phase, uint32_t rows, ExpertStoreStats::Use &use) {
   Block &block = blocks[index];
@@ -435,7 +380,7 @@ void ExpertStore::Impl::route(uint32_t index, std::span<const std::span<const Mo
       routedIn[expert] = serial;
       ++use.routed;
       if (const uint32_t slot = block.slot[expert]; slot != kNoSlot) {
-        size.touch(slot, serial, chunk ? Size::Order(size.order[slot]) : Size::Recent);
+        size.recycling.touch(slot, serial, chunk);
         continue;
       }
       pending.push_back({expert, kNoSlot});
@@ -444,10 +389,10 @@ void ExpertStore::Impl::route(uint32_t index, std::span<const std::span<const Mo
   std::ranges::sort(pending);
   uint32_t *table = static_cast<uint32_t *>(tables.contents()) + uint64_t{index} * shape.experts;
   for (auto &[expert, slot] : pending) {
-    slot = claim(size);
+    slot = size.recycling.claim(serial, chunk);
+    evict(size, slot);
     size.ownerBlock[slot] = index;
     size.ownerExpert[slot] = expert;
-    size.touch(slot, serial, chunk ? Size::Chunk : Size::Recent);
     block.slot[expert] = slot;
     table[expert] = slot;
     waiting[expert] = 1;
@@ -657,10 +602,7 @@ void ExpertStore::Impl::abandon() {
       block.slot[expert] = kNoSlot;
       table[expert] = 0;
       size.ownerBlock[slot] = size.ownerExpert[slot] = kNoSlot;
-      size.lastLoad[slot] = 0;
-      // A free slot is the first to be claimed.
-      size.unlink(slot);
-      size.prepend(slot, Size::Chunk);
+      size.recycling.free(slot);
       --counters.resident;
     }
   pending.clear();
@@ -885,13 +827,9 @@ ExpertStore::ExpertStore(metal::MetalBackend &backend, StreamedBlocks streamed, 
     size.arena = backend.allocateBuffer(region, metal::BufferStorage::Shared,
                                         "experts/arena-" + std::to_string(index));
     impl.arenaTotal += region;
-    size.previous.resize(size.slots);
-    size.next.resize(size.slots);
-    size.order.resize(size.slots);
+    size.recycling = ExpertSlots(size.slots);
     size.ownerBlock.assign(size.slots, kNoSlot);
     size.ownerExpert.assign(size.slots, kNoSlot);
-    size.lastLoad.assign(size.slots, 0);
-    size.reset();
   }
   impl.places = stagingOf(geometry, shape);
   impl.taken.assign(impl.places.count, 0);
@@ -1046,8 +984,7 @@ void ExpertStore::release() {
     impl.backend.releaseMemory(size.arena);
     std::ranges::fill(size.ownerBlock, kNoSlot);
     std::ranges::fill(size.ownerExpert, kNoSlot);
-    std::ranges::fill(size.lastLoad, 0);
-    size.reset();
+    size.recycling.reset();
   }
   impl.backend.releaseMemory(impl.staging);
   impl.counters.resident = 0;
