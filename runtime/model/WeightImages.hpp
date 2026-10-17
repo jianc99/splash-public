@@ -88,11 +88,12 @@ private:
 // per core.
 [[nodiscard]] unsigned loadThreads() noexcept;
 
-// Runs task(index, thread) for every index below count on up to
-// loadThreads() workers, numbered below that so that each task can stage
-// through its worker's buffers. Rethrows the first exception once every
-// worker has stopped.
-void parallelFor(size_t count, const std::function<void(size_t index, unsigned thread)> &task);
+// Runs task(index, thread) for every index below count on up to `workers`
+// workers, numbered below that so that each task can stage through its
+// worker's buffers, in index order as they take them. Rethrows the first
+// exception once every worker has stopped.
+void parallelFor(size_t count, const std::function<void(size_t index, unsigned thread)> &task,
+                 unsigned workers = loadThreads());
 
 // Writes the F32 GDN decay of `count` BF16 or F32 values A_log at values,
 // each float(-exp(double(A_log))), to `to`; throws on a non-finite decay.
