@@ -2085,13 +2085,21 @@ other GGUF tile.
 Qwen3.8-Flash-Next's full-attention layers attend sparsely (QSA): past 512
 complete blocks of 4 tokens, a query row attends only to the 512 blocks its
 indexer scores highest and to its tokens after its last complete block. The
-indexer (four query heads and one key head of 128) keeps its raw keys and each
-block's pooled key, both bf16, in index regions of the KV pages
-(`PageStorage::indexPlacement`). A step projects its rows' indexer queries and
-keys, pools the blocks they complete, scores every complete block for each row
-in one MPP product per tile of 8 rows by 32 blocks, and selects each row's
-blocks into a bitmap by a radix select of its scores, 11 bits a pass
-(`kernels/shared/qwen4_qsa.metal`).
+indexer (four query heads and one key head of 128) keeps each block's pooled
+key, bf16, in an index region of the KV pages (`PageStorage::indexOffset`),
+which its kernels reach through index tables of their own (`ops::QsaIndex`,
+today the lanes' page tables). A step projects its rows' indexer queries and
+keys, pools the blocks they complete from its rows' keys and, for the tokens
+of a block before its first row, the sequence's pending keys, scores every
+complete block for each row in one MPP product per tile of 8 rows by 32
+blocks, and selects each row's blocks into a bitmap by a radix select of its
+scores, 11 bits a pass (`kernels/shared/qwen4_qsa.metal`). The pending keys,
+the raw keys of the up to 3 tokens of the block a sequence has not completed,
+are its state's (after the PLE history in a state cell,
+`QwenTargetDimensions::indexerPendingBytes`): a prefill writes them after its
+rows and at each state it captures, and a verify's commit after the rows the
+lane retained, so a block a rejected row completed is pooled again by the
+next step from the committed tokens. No page holds a raw key.
 
 The attention then reads only those blocks: the rows of a tile (a verify lane's
 8, or 8 of a prefill chunk's) attend through one list, the union of their blocks

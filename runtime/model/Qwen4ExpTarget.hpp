@@ -64,7 +64,7 @@ private:
   struct PrefillStep : QwenTarget::PrefillStep {
     Qwen4Scratch scratch{};
     std::vector<Qwen4Blocks> blocks{};
-    std::span<const ops::QsaIndex> qsaIndex{};
+    std::span<const uint32_t> indexOffsets{};
     ops::HyperBranch pending{};
   };
   // The family's prefill layers. The streams start as the embedding's rows;
@@ -82,7 +82,7 @@ private:
   struct VerifyStep : QwenTarget::VerifyStep {
     Qwen4Scratch scratch{};
     Qwen4LaneBlocks blocks{};
-    std::span<const ops::QsaIndex> qsaIndex{};
+    std::span<const uint32_t> indexOffsets{};
     ops::HyperBranch pending{};
   };
 

@@ -106,6 +106,15 @@ struct QwenTargetDimensions {
   }
   // The tokens a QSA row attends to sparsely past (the indexer's top_k).
   [[nodiscard]] constexpr uint32_t indexerTokens() const noexcept { return indexerTopBlocks * indexerBlockTokens; }
+  // The QSA indexer's pending keys in a state cell, after the PLE history:
+  // per attention layer the raw keys (bf16) of the tokens of the block a
+  // sequence has not completed, all but its last, which no page holds
+  // (kv::Layout::indexDimension).
+  [[nodiscard]] constexpr uint64_t indexerPendingBytes() const noexcept {
+    return indexerBlockTokens ? uint64_t{attentionLayerCount()} * (indexerBlockTokens - 1) * indexerHeadDimension *
+                                    GdnStateLayout::bfloat16Bytes
+                              : 0;
+  }
   bool operator==(const QwenTargetDimensions &) const = default;
 };
 
@@ -115,7 +124,7 @@ struct QwenTargetDimensions {
 // and whether a safetensors checkpoint of it loads (family, modelType,
 // ggufArchitecture, loadsSafetensors).
 struct QwenHybridLayout : QwenTargetDimensions {
-  // The KV pages, which also hold a QSA indexer's keys; a QSA target's
+  // The KV pages, which also hold a QSA indexer's pooled keys; a QSA target's
   // sparse attention gathers blocks of tokens, so its values are token-major.
   [[nodiscard]] constexpr kv::Layout kvLayout() const noexcept {
     return {.attentionLayers = attentionLayerCount(),
@@ -125,7 +134,7 @@ struct QwenHybridLayout : QwenTargetDimensions {
             .valuesTokenMajor = hasIndexer()};
   }
   // The GDN layers' state and, after it in a cell, a PLE convolution's
-  // history.
+  // history and the QSA indexer's pending keys.
   [[nodiscard]] constexpr GdnStateLayout gdnStateLayout() const noexcept {
     return {.layers = layers - attentionLayerCount(),
             .convolutionHistory = kGdnConvolutionTaps - 1,
@@ -133,7 +142,7 @@ struct QwenHybridLayout : QwenTargetDimensions {
             .recurrentGroups = gdnValueHeads,
             .recurrentRows = gdnHeadDimension,
             .recurrentColumns = gdnHeadDimension,
-            .auxiliaryBytes = pleHistoryBytes()};
+            .auxiliaryBytes = pleHistoryBytes() + indexerPendingBytes()};
   }
   bool operator==(const QwenHybridLayout &) const = default;
 };

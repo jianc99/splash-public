@@ -114,12 +114,15 @@ void testFamilies(const std::filesystem::path &fixtures) {
               flashDescriptor.targetSource == model::TargetSource::Gguf &&
               flashDescriptor.draft == test::flashNextDraft(),
           "a GGUF Qwen3.8-Flash-Next made another descriptor");
-  // Its KV pages also hold the QSA indexer's keys and its states the PLE
-  // convolution's history, which another family's do not.
+  // Its KV pages also hold the QSA indexer's pooled keys and its states the
+  // PLE convolution's history and the indexer's pending keys, which another
+  // family's do not.
   const model::Qwen4ExpLayout flash;
   require(flashDescriptor.targetKvLayout.indexDimension == flash.indexerHeadDimension &&
-              flashDescriptor.stateLayout.target.auxiliaryBytes == flash.pleHistoryBytes() &&
-              flash.pleHistoryBytes() && !denseDescriptor.targetKvLayout.indexDimension &&
+              flashDescriptor.stateLayout.target.auxiliaryBytes ==
+                  flash.pleHistoryBytes() + flash.indexerPendingBytes() &&
+              flash.pleHistoryBytes() && flash.indexerPendingBytes() == 12 * 3 * 128 * 2 &&
+              !denseDescriptor.targetKvLayout.indexDimension &&
               !denseDescriptor.stateLayout.target.auxiliaryBytes,
           "a family's cache layouts do not hold what it adds");
   // A draft states its own layers, intermediate size, rotary base and the
