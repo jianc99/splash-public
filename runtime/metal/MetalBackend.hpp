@@ -203,13 +203,17 @@ struct HostStepTiming {
 // public headers leave out, so the backend checks, before the first command
 // with an awake step, that it does; without that library, or if it does not,
 // awake steps run as plain ones, with a warning. The steps of the committed
-// commands run in order on one thread of the backend's; a step is skipped
-// when the command buffer before it failed. If it throws, the command fails
-// with its message (its ticket's wait() throws); the work after it still
-// runs. Once a command completed without a failure, `timed` gets the round
-// trip of each of its host steps (HostStepTiming); one that throws marks the
-// backend unhealthy, as a completion callback that throws does. A command
-// run under dispatch profiling reports no round trip.
+// commands run in order on one thread of the backend's while the submitting
+// thread goes on, so `work` must not call the backend: it touches buffer
+// contents and its own state only. A step is skipped when the command buffer
+// before it failed; the work after it then runs on what the step's buffers
+// held, as all work after a failed buffer runs on what it left, and the
+// command fails. If the work throws, the command fails with its message (its
+// ticket's wait() throws); the work after it still runs. Once a command
+// completed without a failure, `timed` gets the round trip of each of its
+// host steps (HostStepTiming) on Metal's completion thread; one that throws
+// marks the backend unhealthy, as a completion callback that throws does. A
+// command run under dispatch profiling reports no round trip.
 struct EventStep {
   enum class Kind : uint8_t { Signal, Wait, Host };
 

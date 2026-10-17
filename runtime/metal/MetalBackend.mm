@@ -562,7 +562,8 @@ struct HostSteps {
 // (M5 Max, ISTA Q2_0 with 16G of experts: pickup 26 against 70 us), for
 // about half a core while a streamed command runs; waking through
 // MTLSharedEventListener took about 0.3 ms. Once stopping it raises the steps
-// it still holds without running them, so their commands drain.
+// it still holds without running them, so their commands drain; it waits for
+// the work of a step that is running, which nothing can interrupt.
 class HostStepRunner final {
 public:
     HostStepRunner() : thread_([this] { run(); }) {}
