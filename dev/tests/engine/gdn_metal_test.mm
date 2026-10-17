@@ -85,6 +85,11 @@ double bf16Ulp(double value) {
   return std::max(std::fabs(value), 1e-30) * 0.0078125;
 }
 double silu(double value) { return value / (1.0 + std::exp(-value)); }
+// The output gate of a GDN of `shape`: sigmoid(z) (Qwen3.8-Flash-Next) or
+// silu(z).
+double outputGate(const GdnShape &shape, double z) {
+  return shape.sigmoidGate ? 1.0 / (1.0 + std::exp(-z)) : silu(z);
+}
 
 MetalBuffer shared(MetalBackend &backend, uint64_t bytes, const char *label) {
   MetalBuffer buffer = backend.allocateBuffer(bytes, BufferStorage::Shared, label);
@@ -386,7 +391,7 @@ void runCase(MetalBackend &backend, const GdnShape &shape, uint32_t tokens,
       for (uint32_t dim = 0; dim < kHeadDim; ++dim) {
         const double z = fromBf16(packed[uint64_t{token} * packedWidth + convDim +
                                          head * kHeadDim + dim]);
-        const double ref = roundBf16(roundBf16(normalized[dim]) * silu(z));
+        const double ref = roundBf16(roundBf16(normalized[dim]) * outputGate(shape, z));
         const double got = fromBf16(hidden[base + dim]);
         require(std::isfinite(got), label + "gated output is not finite");
         hiddenUlps = std::max(hiddenUlps, std::fabs(got - ref) / bf16Ulp(ref));
@@ -768,7 +773,7 @@ void run(const std::string &metallib) {
   MetalBackend backend(metallib);
   for (const GdnShape &shape :
        {GdnShape{16, 48, 128, 10240, 16640}, GdnShape{16, 32, 128, 8192, 12544},
-        GdnShape{16, 48, 128, 10240, 16512}}) {
+        GdnShape{16, 48, 128, 10240, 16512, true}}) {
     for (bool float32 : {false, true})
       bufferExtents(backend, shape, float32, GdnStateFormat::Float32);
     bufferExtents(backend, shape, false, GdnStateFormat::BFloat16);
