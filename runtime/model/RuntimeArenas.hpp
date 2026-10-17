@@ -336,6 +336,9 @@ enum class DecodeTensor : uint32_t {
   ProposalProbs,
   ProposedTokens,
   PageTable,
+  // Indexed by state lane, like PageTable: the entries of its pages' QSA
+  // index (kv::PageStorage::writeIndexEntries), for a layout with one.
+  IndexTable,
   // Indexed by state lane, like PageTable: a penalized request's penalty
   // words (ops::Sampling::rebuildPenaltyWords).
   PenaltyState,

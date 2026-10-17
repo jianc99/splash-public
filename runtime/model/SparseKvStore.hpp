@@ -24,9 +24,16 @@
 // store writes them when a prefill or verify command is prepared, while no
 // command runs, so the pages it copies are the request's own (the pool moves
 // pages only between commands); a prefilled prompt's pages are in the file
-// when its decode starts. The request's pages stay held: the attention indexes them (QSA's
-// pooled keys share the page), so memory comes back only once the index has
-// storage of its own.
+// when its decode starts.
+//
+// Once a decoding request attends sparsely in every verify, the pages in its
+// file spill (kv::PageStorage::spill): an extent all of whose pages spilled
+// gives its K/V memory back between commands (release), and its QSA index,
+// in buffers of its own, stays. A page's copy lives as long as the page
+// spills, past its request: the cache keeps the request's blocks, and a
+// command that reads a spilled page through a page table (a prefill, a
+// verify of a page not in its lane's file, a lane without a cache) first
+// reads it back from its copy (restore), taking its extent's memory again.
 
 #include "metal/MetalBackend.hpp"
 #include "ops/PageStorage.hpp"
@@ -50,6 +57,9 @@ struct SparseKvStoreOptions final {
   // The most blocks a lane's rows select in a step: its rows times their top
   // blocks. A cache with fewer slots per layer is refused.
   uint32_t selectedBlocks = 0;
+  // A decoding request's pages spill once it committed this many tokens:
+  // every verify of it then attends through its lists.
+  uint64_t spillFromTokens = 0;
   // Where the files go; each is unlinked once open.
   std::filesystem::path directory;
 };
@@ -67,27 +77,46 @@ struct SparseKvStats final {
   uint64_t writtenPages = 0;
   uint64_t writtenBytes = 0;
   double writeSeconds = 0.0;
+  uint64_t spilledPages = 0;
+  uint64_t restoredPages = 0;
+  double restoreSeconds = 0.0;
+  uint64_t releasedBytes = 0;
 };
 
 class SparseKvStore final {
 public:
   // The cache's pages come from `admission`, the pool's: they count as KV.
-  // A lane's are allocated when a request first uses it; a lane the budget
-  // refuses them reads every block from its requests' pages. Throws
+  // A lane's are allocated when its request first reaches spillFromTokens
+  // and go once the lane is vacated; a lane the budget refuses them reads
+  // every block from its requests' pages. Throws
   // std::invalid_argument for a layout without token-major values or a cache
   // smaller than one extent or than options.selectedBlocks slots, and
   // std::system_error when a file cannot be made.
-  SparseKvStore(metal::MetalBackend &backend, metal::AllocationAdmission admission, const kv::PageStorage &pages,
+  SparseKvStore(metal::MetalBackend &backend, metal::AllocationAdmission admission, kv::PageStorage &pages,
                 SparseKvStoreOptions options);
   ~SparseKvStore();
   SparseKvStore(const SparseKvStore &) = delete;
   SparseKvStore &operator=(const SparseKvStore &) = delete;
 
-  // Before a command of `stateLane`'s request `requestId` (a prefill's or a
-  // verify's), whose first `committedTokens` tokens are committed in the
-  // pages `pageTable` names: writes the pages wholly committed since the last
-  // call to the lane's file. Another request on the lane starts it over.
-  void prepare(uint32_t stateLane, uint64_t requestId, uint64_t committedTokens, std::span<const uint32_t> pageTable);
+  // Before a command of `stateLane`'s request `requestId`, whose first
+  // `committedTokens` tokens are committed in the pages `pageTable` names,
+  // and before its page table is written: restores the spilled pages the
+  // command reads through the page table (every one but a verify's in the
+  // lane's file), writes the pages wholly committed since the last call to
+  // the lane's file, and for a verify past spillFromTokens spills the pages
+  // in it. Another request on the lane starts a file of its own. Throws
+  // metal::MetalAllocationError when the budget refuses a restore.
+  void prepare(uint32_t stateLane, uint64_t requestId, uint64_t committedTokens, std::span<const uint32_t> pageTable,
+               bool verify);
+  // Between commands, before the next is prepared: gives back the K/V memory
+  // of the extents whose pages all spilled and no transfer pins
+  // (kv::PageStorage::releaseSpilledKv) and the caches of vacated lanes, and
+  // drops the copies of pages that stopped spilling; nothing while a command
+  // is in flight. Returns the bytes it gave back.
+  uint64_t release();
+  // The lane's request let go of it (it ended or was suspended): the lane's
+  // cache goes at the next release unless a request uses the lane first.
+  void vacate(uint32_t stateLane);
 
   // A layer's host step: the list of batch lane l, `counts[l]` entries from
   // lists + l * stride, belongs to state lane stateLanes[l]; writes each
@@ -108,7 +137,13 @@ public:
 
 private:
   struct Lane;
+  struct File;
   class Readers;
+  // Where a spilled page's copy is: a file and the page's place in it.
+  struct Copy final {
+    std::shared_ptr<File> file;
+    uint32_t page = 0;
+  };
   struct Miss final {
     uint32_t lane;
     uint32_t block;
@@ -119,11 +154,17 @@ private:
   void allocate(uint32_t stateLane);
   void report(const Lane &lane) const noexcept;
   void reset(Lane &lane, uint64_t requestId);
+  void forgetBlocks(Lane &lane);
+  [[nodiscard]] std::shared_ptr<File> openFile() const;
   void write(Lane &lane, std::span<const uint32_t> pageTable, uint32_t from, uint32_t to);
+  void restore(std::span<const uint32_t> pages);
   void read(uint32_t layer, std::span<const Miss> misses);
 
-  const kv::PageStorage &pages_;
+  metal::MetalBackend &backend_;
+  kv::PageStorage &pages_;
   kv::Layout layout_;
+  std::filesystem::path directory_;
+  uint64_t spillFromTokens_ = 0;
   uint32_t lanes_ = 0;
   uint32_t maximumBlocks_ = 0;
   // Each lane's cache pages, slots per layer (8 a page) and the bytes of a
@@ -141,6 +182,8 @@ private:
   std::unique_ptr<Readers> readers_;
   metal::MetalBuffer locationPages_;
   std::vector<std::unique_ptr<Lane>> laneState_;
+  // Each pool page's copy while it spills.
+  std::vector<Copy> copies_;
   std::vector<Miss> misses_;
   SparseKvStats stats_;
 };

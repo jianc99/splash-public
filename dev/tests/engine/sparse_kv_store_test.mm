@@ -48,6 +48,17 @@ void fill(const kv::PageStorage &pages, uint32_t page) {
   }
 }
 
+// Whether every tensor of `page` holds what fill wrote.
+bool filled(const kv::PageStorage &pages, uint32_t page) {
+  uint32_t tensor = 0;
+  for (const std::span<std::byte> span : pages.spans(page)) {
+    for (size_t at = 0; at < span.size(); ++at)
+      if (span[at] != std::byte(static_cast<uint8_t>(page * 131 + tensor * 29 + at * 7 + at / 251))) return false;
+    ++tensor;
+  }
+  return true;
+}
+
 // Whether block `place` of every tensor of `layer` of the cache page
 // `cached` holds block `block` of `layer` of pool page `page`.
 bool sameBlock(const kv::PageStorage &pool, uint32_t page, uint32_t block,
@@ -83,6 +94,7 @@ void checkFormat(metal::MetalBackend &backend, MemoryGovernor &governor, kv::For
                                        .lanes = 2,
                                        .maximumContextTokens = 2 * extentPages * kPageTokens,
                                        .selectedBlocks = selected,
+                                       .spillFromTokens = kPageTokens,
                                        .directory = std::filesystem::temp_directory_path()};
   };
   rejects([&] { model::SparseKvStore(backend, governor.allocationAdmission(), pool, options(slots + 1)); },
@@ -92,8 +104,13 @@ void checkFormat(metal::MetalBackend &backend, MemoryGovernor &governor, kv::For
           "the cache is not one whole extent a lane, or was allocated before a request used a lane");
 
   const uint64_t committed = uint64_t{table.size() - 1} * kPageTokens + 5;
-  store.prepare(1, 7, committed, table);
-  require(store.stats().writtenPages == table.size() - 1, "the committed pages did not go to the file");
+  const uint32_t filePages = static_cast<uint32_t>(table.size() - 1);
+  store.prepare(1, 7, committed, table, true);
+  require(store.stats().writtenPages == filePages, "the committed pages did not go to the file");
+  require(store.stats().spilledPages == filePages &&
+              std::all_of(table.begin(), table.end() - 1, [&](uint32_t page) { return pool.spilled(page); }) &&
+              !pool.spilled(table.back()),
+          "a verify past spillFromTokens did not spill the pages in its file, and only them");
   require(store.cacheBytes() == pool.extentBytes(), "the request's lane did not allocate its cache alone");
   const uint32_t inFile = static_cast<uint32_t>(table.size() - 1) * kPageBlocks;
   const auto resolve = [&](uint32_t layer, std::span<const uint32_t> blocks) {
@@ -144,12 +161,48 @@ void checkFormat(metal::MetalBackend &backend, MemoryGovernor &governor, kv::For
     (void)resolve(1, over);
   }, "smaller than its selection", "a step selecting more blocks than the cache holds was accepted");
 
+  // Between commands the extent all of whose pages spilled gives its K/V
+  // memory back; the other keeps the open page and the one no request holds.
+  const uint64_t allocated = pool.actualAllocatedBytes();
+  store.release();
+  require(store.stats().releasedBytes && pool.actualAllocatedBytes() == allocated - store.stats().releasedBytes &&
+              !pool.kvResident(extentPages) && pool.kvResident(0),
+          "the spilled extent did not give its K/V memory back");
+  // The blocks still come from the cache and the file.
+  require(resolve(1, std::span(blocks).first(4)).size() == 4, "a resolve after the release failed");
+  // A verify on another lane sharing the pages reads them through its page
+  // table: they come back from the first lane's copies, then spill to its own.
+  store.prepare(0, 9, committed, table, true);
+  require(store.stats().restoredPages == filePages && pool.kvResident(extentPages) &&
+              std::all_of(table.begin(), table.end() - 1, [&](uint32_t page) { return filled(pool, page); }),
+          "pages another lane spilled did not come back as they were");
+  require(store.stats().spilledPages == 2 * filePages, "the other lane did not spill the pages in its own file");
+  store.release();
+  // A prefill of the request reads every page: they come back from the
+  // other lane's copies.
+  store.prepare(1, 7, committed, table, false);
+  require(store.stats().restoredPages == 2 * filePages &&
+              std::all_of(table.begin(), table.end() - 1, [&](uint32_t page) { return filled(pool, page); }) &&
+              std::none_of(table.begin(), table.end(), [&](uint32_t page) { return pool.spilled(page); }),
+          "a prefill's spilled pages did not come back as they were");
+
   // Another request on the lane starts over: nothing of the last is in its
   // file, so its blocks come from its pages until it commits them.
-  store.prepare(1, 8, kPageTokens - 1, table);
+  store.prepare(1, 8, kPageTokens - 1, table, true);
   require(resolve(1, std::span(blocks).first(2)) ==
               std::vector<uint32_t>(2, SPLASH_ATTENTION_PAGED),
           "a new request found the last one's blocks");
+
+  // A vacated lane's cache goes at the next release, and its next request
+  // takes one again.
+  const uint64_t cached = store.cacheBytes();
+  store.vacate(0);
+  require(store.release() >= store.laneCacheBytes() && store.cacheBytes() == cached - store.laneCacheBytes(),
+          "a vacated lane kept its cache");
+  store.prepare(0, 10, kPageTokens - 1, table, true);
+  require(store.cacheBytes() == cached - store.laneCacheBytes(), "a request took a cache before it could spill");
+  store.prepare(0, 10, committed, table, true);
+  require(store.cacheBytes() == cached, "a vacated lane's next request did not take a cache again");
   std::cout << "sparse KV store: format=" << kv::formatName(format) << " PASS\n";
 }
 
@@ -167,7 +220,7 @@ void checkRefused(metal::MetalBackend &backend, MemoryGovernor &governor) {
   model::SparseKvStore store(backend, refuse, pool,
                              {.memoryBytes = pool.extentBytes(), .lanes = 1, .maximumContextTokens = 4096,
                               .selectedBlocks = 16, .directory = std::filesystem::temp_directory_path()});
-  store.prepare(0, 1, 4 * kPageTokens, table);
+  store.prepare(0, 1, 4 * kPageTokens, table, true);
   std::vector<uint32_t> lists(16), locations(16, 0);
   for (uint32_t entry = 0; entry < 8; ++entry) lists[entry] = entry << SPLASH_ATTENTION_BLOCK_ROW_BITS;
   const std::array<uint32_t, 1> lane{0}, counts{8};

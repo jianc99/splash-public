@@ -44,7 +44,14 @@ KvPageAcquisition KvPool::acquirePages(uint32_t count) {
   };
   while (selected.size() < count) {
     if (freePages_) {
-      selected.push_back(popFree());
+      // A free page of an extent whose K/V memory went gets it back first.
+      const uint32_t page = popFree();
+      if (const metal::AllocationResult ready = storage_.prepareAcquired(page); !ready) {
+        insertFree(page);
+        returnSelected();
+        return {{}, ready.failure};
+      }
+      selected.push_back(page);
       continue;
     }
     // Page ids cover every extent the hard budget could hold, so the budget
@@ -183,7 +190,7 @@ KvPageMoves KvPool::compactExtent(std::span<const uint32_t> fixed) {
   uint32_t emptied = noIndex;
   for (uint32_t index = 0; index < extents_.size(); ++index) {
     const ExtentRecord &extent = extents_[index];
-    if (!extent.allocated || !extent.usedPages ||
+    if (!extent.allocated || !extent.usedPages || !storage_.movable(index) ||
         extent.usedPages > freeInUse - extent.freePages.count ||
         (emptied != noIndex && extent.usedPages >= extents_[emptied].usedPages))
       continue;
@@ -198,7 +205,7 @@ KvPageMoves KvPool::compactExtent(std::span<const uint32_t> fixed) {
   for (uint32_t index = 0; index < extents_.size(); ++index) {
     const ExtentRecord &extent = extents_[index];
     if (index != emptied && extent.allocated && extent.usedPages &&
-        extent.freePages.count)
+        extent.freePages.count && storage_.movable(index))
       receivers.push_back(index);
   }
   std::stable_sort(receivers.begin(), receivers.end(),

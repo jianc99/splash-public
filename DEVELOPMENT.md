@@ -2185,16 +2185,35 @@ what a step reads is bounded by the selection, not by the context.
   The attention reads each entry's block where its location names
   (`ops::AttentionBlocks::locations`).
 - The cache is pages of the KV pool's layout, which the pool's admission pays
-  for, allocated when a request first uses the lane; a lane the budget refuses
-  them reads every block from its requests' pages. A lane's cache holds at
+  for, allocated when the lane's request first reaches the length at which its
+  pages spill (below) and given back once the request ends or is suspended; a
+  lane the budget refuses them reads every block from its requests' pages. A
+  lane's cache holds at
   least as many blocks a layer as its rows select (verify rows times top
   blocks, 4,096), so the smallest SIZE is two extents.
-- The request's pages stay held: QSA's pooled keys share the KV pages, so the
-  store does not yet give memory back. Prefill is unchanged.
-- When a lane serves another request its file starts over; the log then
-  reports what the last one did (`Sparse KV · ...`): its steps, blocks a
-  layer, the share its pages served and its cache hit, the reads and their
-  time, and the pages it wrote and their time.
+- A KV extent is two buffers, its pages' K/V and their QSA index (pooled
+  keys), with one page numbering: kernels reach the K/V through a lane's page
+  table and the index through its index table (`ops::QsaIndex`), which
+  Runtime writes beside it. Once a decoding request has committed enough
+  tokens that every verify of it attends through its lists (top blocks times
+  4), the pages in its file spill (`kv::PageStorage::spill`), and before the
+  next command an extent all of whose pages spilled gives its K/V buffer back
+  to the budget; its index stays.
+- A spilled page keeps its copy in the file for as long as it spills, past
+  its request: the prefix cache keeps the request's blocks without their K/V.
+  A command that reads a spilled page through its page table (a prefill,
+  which reads every page, or a verify of a page not in its lane's file, such
+  as another request's prefix hit) first reads the page back, taking its
+  extent's K/V buffer again, and page tables written before then are written
+  again. The pool hands out a free page of such an extent only once its
+  buffer is back, does not move pages of an extent with a spilled page, and
+  the SSD cache's tier skips spilled pages. Prefill is unchanged, so its
+  context's K/V is resident while it runs.
+- When a lane serves another request its file starts over, or a new one
+  starts while spilled pages keep copies in it; the log then reports what the
+  last request did (`Sparse KV · ...`): its steps, blocks a layer, the share
+  its pages served and its cache hit, the reads and their time, the pages it
+  wrote and their time, and the pages it spilled.
 
 ### Neural Engine prefill
 

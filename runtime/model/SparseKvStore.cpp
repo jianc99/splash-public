@@ -150,21 +150,34 @@ private:
   std::vector<std::thread> threads_;
 };
 
+// A file of a request's blocks, closed once neither its lane nor a spilled
+// page's copy needs it.
+struct SparseKvStore::File final {
+  int descriptor = -1;
+  ~File() {
+    if (descriptor >= 0) ::close(descriptor);
+  }
+};
+
 // A lane's request, its file, and per layer its cache's directory: each
 // block's slot, each slot's block, and the slots' recency, most recent first,
 // with the resolve that last used each.
 struct SparseKvStore::Lane final {
   uint64_t request = 0;
-  int file = -1;
+  std::shared_ptr<File> file;
   // Whether the lane's cache pages are allocated, or the budget refused
-  // them: its requests then read every block from their pages.
+  // them: its requests then read every block from their pages. A vacated
+  // lane's cache goes at the next release.
   bool cached = false;
   bool refused = false;
+  bool vacated = false;
   // The request's share of the store's work: its resolves and reads, and
   // the time of the reads and writes it took part in.
   SparseKvStats stats;
-  // The request's pages [0, filePages) are in the file.
+  // The request's pages [0, filePages) are in the file, and those before
+  // `spilled` spilled unless another lane's copy serves them.
   uint32_t filePages = 0;
+  uint32_t spilled = 0;
   uint64_t resolves = 0;
   std::vector<uint32_t> slotOf;
   std::vector<uint32_t> blockIn;
@@ -174,9 +187,6 @@ struct SparseKvStore::Lane final {
   std::vector<uint32_t> newest;
   std::vector<uint32_t> oldest;
 
-  ~Lane() {
-    if (file >= 0) ::close(file);
-  }
   // Makes slot `slot` of the layer's slots from `base` the most recent.
   void touch(uint32_t layer, uint32_t base, uint32_t slot) {
     const uint32_t s = base + slot;
@@ -193,8 +203,9 @@ struct SparseKvStore::Lane final {
 };
 
 SparseKvStore::SparseKvStore(metal::MetalBackend &backend, metal::AllocationAdmission admission,
-                             const kv::PageStorage &pages, SparseKvStoreOptions options)
-    : pages_(pages), layout_(pages.layout()), lanes_(options.lanes),
+                             kv::PageStorage &pages, SparseKvStoreOptions options)
+    : backend_(backend), pages_(pages), layout_(pages.layout()), directory_(std::move(options.directory)),
+      spillFromTokens_(options.spillFromTokens), lanes_(options.lanes),
       maximumBlocks_((options.maximumContextTokens + kPageTokens - 1) / kPageTokens * kPageBlocks) {
   if (!layout_.valuesTokenMajor)
     throw std::invalid_argument("a sparse KV store needs token-major values, whose blocks are contiguous");
@@ -219,19 +230,15 @@ SparseKvStore::SparseKvStore(metal::MetalBackend &backend, metal::AllocationAdmi
   cache_ = std::make_unique<kv::PageStorage>(backend, std::move(admission), layout_, lanes_ * lanePages_,
                                              pages_.extentPages());
   cacheTensors_.assign(uint64_t{lanes_} * lanePages_ * layout_.attentionLayers * 4, nullptr);
-  readers_ = std::make_unique<Readers>(kReaders, alignUp(recordBytes_) + kAlignment);
+  // A reader stages a block's record or, restoring, a page's run of a layer.
+  readers_ = std::make_unique<Readers>(kReaders, std::max<uint64_t>(alignUp(recordBytes_) + kAlignment, pageRunBytes_));
+  copies_.resize(pages_.pageCount());
   locationPages_ = backend.allocateBuffer(uint64_t{lanes_} * lanePages_ * sizeof(SplashKvPage),
                                           metal::BufferStorage::Shared, "sparse-kv-location-pages");
 
   const uint32_t layers = layout_.attentionLayers;
   for (uint32_t index = 0; index < lanes_; ++index) {
     auto lane = std::make_unique<Lane>();
-    std::string name = (options.directory / "splash-sparse-kv-XXXXXX").string();
-    lane->file = ::mkstemp(name.data());
-    if (lane->file < 0) throw std::system_error(errno, std::generic_category(), "sparse KV file " + name);
-    ::unlink(name.c_str());
-    if (::fcntl(lane->file, F_NOCACHE, 1) < 0)
-      throw std::system_error(errno, std::generic_category(), "sparse KV file " + name);
     lane->slotOf.assign(uint64_t{layers} * maximumBlocks_, kNone);
     lane->blockIn.assign(uint64_t{layers} * slots_, kNone);
     lane->newer.resize(uint64_t{layers} * slots_);
@@ -249,6 +256,17 @@ SparseKvStore::~SparseKvStore() {
 }
 
 uint64_t SparseKvStore::cacheBytes() const noexcept { return cache_->actualAllocatedBytes(); }
+
+std::shared_ptr<SparseKvStore::File> SparseKvStore::openFile() const {
+  auto file = std::make_shared<File>();
+  std::string name = (directory_ / "splash-sparse-kv-XXXXXX").string();
+  file->descriptor = ::mkstemp(name.data());
+  if (file->descriptor < 0) throw std::system_error(errno, std::generic_category(), "sparse KV file " + name);
+  ::unlink(name.c_str());
+  if (::fcntl(file->descriptor, F_NOCACHE, 1) < 0)
+    throw std::system_error(errno, std::generic_category(), "sparse KV file " + name);
+  return file;
+}
 
 // Allocates a lane's cache pages, the first time a request uses the lane,
 // and points the location pages at them; with the budget refusing one, the
@@ -292,18 +310,28 @@ void SparseKvStore::report(const Lane &lane) const noexcept {
             done.hits * 100 / std::max<uint64_t>(1, cached), "% of the rest cached · ", done.reads, " reads (",
             done.readBytes >> 20, " MiB) in ", static_cast<uint64_t>(done.readSeconds * 1e3), " ms, ",
             static_cast<uint64_t>(done.resolveSeconds * 1e3), " ms resolving in all · ",
-            done.writtenPages, " pages written in ", static_cast<uint64_t>(done.writeSeconds * 1e3), " ms");
+            done.writtenPages, " pages written in ", static_cast<uint64_t>(done.writeSeconds * 1e3), " ms, ",
+            done.spilledPages, " spilled");
   }
 }
 
-// Forgets the lane's blocks and file, after reporting them; every slot is
-// free, the oldest first.
+// Forgets the lane's blocks, after reporting them, and starts its file over,
+// or a new one while copies of spilled pages are in it; every slot is free,
+// the oldest first.
 void SparseKvStore::reset(Lane &lane, uint64_t requestId) {
   report(lane);
   lane.stats = {};
   lane.request = requestId;
-  lane.filePages = 0;
-  if (::ftruncate(lane.file, 0) < 0) throw std::system_error(errno, std::generic_category(), "sparse KV file");
+  lane.filePages = lane.spilled = 0;
+  if (!lane.file || lane.file.use_count() > 1)
+    lane.file = openFile();
+  else if (::ftruncate(lane.file->descriptor, 0) < 0)
+    throw std::system_error(errno, std::generic_category(), "sparse KV file");
+  forgetBlocks(lane);
+}
+
+// Every slot of the lane is free, the oldest first.
+void SparseKvStore::forgetBlocks(Lane &lane) {
   std::ranges::fill(lane.slotOf, kNone);
   std::ranges::fill(lane.blockIn, kNone);
   std::ranges::fill(lane.used, 0);
@@ -319,15 +347,116 @@ void SparseKvStore::reset(Lane &lane, uint64_t requestId) {
 }
 
 void SparseKvStore::prepare(uint32_t stateLane, uint64_t requestId, uint64_t committedTokens,
-                            std::span<const uint32_t> pageTable) {
+                            std::span<const uint32_t> pageTable, bool verify) {
   if (stateLane >= lanes_) throw std::out_of_range("sparse KV lane");
   Lane &lane = *laneState_[stateLane];
   if (lane.request != requestId) reset(lane, requestId);
-  if (!lane.cached && !lane.refused) allocate(stateLane);
-  if (lane.refused) return;
+  lane.vacated = false;
+  // A request takes a cache once it has blocks to spill (startup warmup's
+  // short requests take none).
+  if (!lane.cached && !lane.refused && committedTokens >= spillFromTokens_) allocate(stateLane);
+  // A verify reads the blocks of the pages in the lane's file through the
+  // store, and every other block through the page table.
+  const uint32_t served = verify && lane.cached ? std::min<uint32_t>(lane.filePages, pageTable.size()) : 0;
+  std::vector<uint32_t> spilled;
+  for (uint32_t index = served; index < pageTable.size(); ++index)
+    if (pages_.spilled(pageTable[index])) spilled.push_back(pageTable[index]);
+  if (!spilled.empty()) {
+    restore(spilled);
+    lane.spilled = std::min(lane.spilled, served);
+  }
+  if (!lane.cached) return;
   const uint64_t complete = std::min<uint64_t>(committedTokens / kPageTokens, pageTable.size());
   if (complete > maximumBlocks_ / kPageBlocks) throw std::out_of_range("sparse KV request past its context");
   if (complete > lane.filePages) write(lane, pageTable, lane.filePages, static_cast<uint32_t>(complete));
+  if (!verify || committedTokens < spillFromTokens_) return;
+  const uint32_t filed = std::min<uint32_t>(lane.filePages, pageTable.size());
+  for (uint32_t index = lane.spilled; index < filed; ++index) {
+    const uint32_t page = pageTable[index];
+    // A page another lane spilled keeps that lane's copy.
+    if (pages_.spilled(page)) continue;
+    pages_.spill(page);
+    copies_[page] = {lane.file, index};
+    ++stats_.spilledPages;
+    ++lane.stats.spilledPages;
+  }
+  lane.spilled = filed;
+}
+
+uint64_t SparseKvStore::release() {
+  if (backend_.commandInFlight()) return 0;
+  for (uint32_t page = 0; page < copies_.size(); ++page)
+    if (copies_[page].file && !pages_.spilled(page)) copies_[page] = {};
+  uint64_t released = pages_.releaseSpilledKv();
+  // A vacated lane's cache goes with the blocks it held; the budget may grant
+  // its next request one again.
+  const uint32_t extents = lanePages_ / pages_.extentPages();
+  for (uint32_t index = 0; index < lanes_; ++index) {
+    Lane &lane = *laneState_[index];
+    if (!lane.vacated) continue;
+    lane.vacated = lane.refused = false;
+    if (!lane.cached) continue;
+    for (uint32_t extent = index * extents; extent < (index + 1) * extents; ++extent) cache_->releaseExtent(extent);
+    lane.cached = false;
+    forgetBlocks(lane);
+    released += laneCacheBytes();
+  }
+  stats_.releasedBytes += released;
+  return released;
+}
+
+void SparseKvStore::vacate(uint32_t stateLane) {
+  if (stateLane >= lanes_) throw std::out_of_range("sparse KV lane");
+  laneState_[stateLane]->vacated = true;
+}
+
+// Takes each page's K/V memory back, then reads its runs back from its copy,
+// every layer's at once; a page whose memory the budget refuses or whose
+// read fails leaves every page spilled as it was.
+void SparseKvStore::restore(std::span<const uint32_t> pages) {
+  const auto start = AwakeClock::now();
+  const auto respill = [&](size_t count) {
+    for (size_t index = 0; index < count; ++index) pages_.spill(pages[index]);
+  };
+  for (const uint32_t page : pages)
+    if (!copies_[page].file) throw std::logic_error("a spilled KV page has no copy");
+  std::vector<std::vector<std::span<std::byte>>> spans(pages.size());
+  for (size_t index = 0; index < pages.size(); ++index) {
+    if (const metal::AllocationResult granted = pages_.unspill(pages[index]); !granted) {
+      respill(index);
+      throw metal::MetalAllocationError("no memory to read spilled KV pages back from the SSD", granted.failure);
+    }
+    spans[index] = pages_.spans(pages[index]);
+  }
+  const uint32_t layers = layout_.attentionLayers;
+  const uint32_t tensorsPerLayer = layout_.format == kv::Format::Int8 ? 4 : 2;
+  try {
+    readers_->run(pages.size() * layers, [&](size_t task, std::byte *staging) {
+      const size_t index = task / layers;
+      const uint32_t layer = static_cast<uint32_t>(task % layers);
+      const Copy &copy = copies_[pages[index]];
+      readFully(copy.file->descriptor, staging, pageRunBytes_, recordOffset(layer, copy.page * kPageBlocks));
+      const std::vector<std::span<std::byte>> &tensors = spans[index];
+      for (uint32_t place = 0; place < kPageBlocks; ++place) {
+        const std::byte *record = staging + uint64_t{place} * recordBytes_;
+        for (uint32_t tensor = 0, at = 0; tensor < 4; ++tensor) {
+          if (!headBytes_[tensor]) continue;
+          const std::span<std::byte> target = tensors[layer * tensorsPerLayer + at++];
+          const uint64_t perHead = uint64_t{kPageTokens} * (headBytes_[tensor] / kBlockTokens);
+          for (uint32_t head = 0; head < layout_.kvHeads; ++head) {
+            std::memcpy(target.data() + head * perHead + place * headBytes_[tensor], record, headBytes_[tensor]);
+            record += headBytes_[tensor];
+          }
+        }
+      }
+    });
+  } catch (...) {
+    respill(pages.size());
+    throw;
+  }
+  for (const uint32_t page : pages) copies_[page] = {};
+  stats_.restoredPages += pages.size();
+  stats_.restoreSeconds += secondsSince(start);
 }
 
 // Copies each page's blocks into the file, a layer's run of up to
@@ -364,7 +493,7 @@ void SparseKvStore::write(Lane &lane, std::span<const uint32_t> pageTable, uint3
             }
           }
         }
-        writeFully(lane.file, run, uint64_t{count} * pageRunBytes_, recordOffset(layer, first * kPageBlocks));
+        writeFully(lane.file->descriptor, run, uint64_t{count} * pageRunBytes_, recordOffset(layer, first * kPageBlocks));
       },
       kWriters);
   lane.filePages = to;
@@ -438,7 +567,7 @@ void SparseKvStore::read(uint32_t layer, std::span<const Miss> misses) {
     const uint64_t offset = recordOffset(layer, miss.block);
     const uint64_t begin = offset / kAlignment * kAlignment;
     const uint64_t size = alignUp(offset + recordBytes_) - begin;
-    readFully(laneState_[miss.lane]->file, staging, size, begin);
+    readFully(laneState_[miss.lane]->file->descriptor, staging, size, begin);
     bytes += size;
     const std::byte *record = staging + (offset - begin);
     const uint32_t page = miss.lane * lanePages_ + miss.slot / kPageBlocks;

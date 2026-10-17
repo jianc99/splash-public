@@ -5,6 +5,7 @@
 #include "engine/DiskLabels.hpp"
 #include "engine/Engine.hpp"
 #include "metal/abi/ExecutionGeometry.h"
+#include "metal/abi/PagedAttention.h"
 #include "model/ExpertStore.hpp"
 #include "model/SparseKvStore.hpp"
 #include "model/WeightStore.hpp"
@@ -773,9 +774,10 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
                 .lanes = model::ExecutionLimits::maximumBatchWidth,
                 .maximumContextTokens = memoryPlan.maximumContextTokens(),
                 .selectedBlocks = model::ExecutionLimits::targetVerifyRows * topBlocks,
+                .spillFromTokens = uint64_t{topBlocks} * SPLASH_ATTENTION_BLOCK_TOKENS,
                 .directory = std::filesystem::temp_directory_path(ignored)});
-        logLine("Sparse KV: a decoding request's committed KV goes to the SSD; each lane's selected blocks are read "
-                "through ", sparseKv->laneCacheBytes() / kMiB, " MiB of cache.");
+        logLine("Sparse KV: a decoding request's committed KV goes to the SSD and leaves memory; each lane's "
+                "selected blocks are read through ", sparseKv->laneCacheBytes() / kMiB, " MiB of cache.");
       }
     }
 
@@ -951,12 +953,13 @@ ActualMemoryReport RuntimeResources::actualMemoryReport(
   report.stateAllocatedBytes = modelMemory.stateActualAllocatedBytes;
   report.sharedPrefillBytes = modelMemory.sharedPrefillActualAllocatedBytes;
   report.sharedDecodeBytes = modelMemory.sharedDecodeActualAllocatedBytes;
-  if (kvPool_->allocatedBytes() != kvPages_->actualAllocatedBytes()) {
+  if (kvPool_->allocatedBytes() != kvPages_->allocatedExtentBytes()) {
     throw std::logic_error("the KV pool and its storage disagree on allocated extents");
   }
-  // The sparse KV store's cache is pages of the pool's layout, which it takes
-  // from the pool's admission.
-  report.kvAllocatedBytes = kvPool_->allocatedBytes() + (sparseKv_ ? sparseKv_->cacheBytes() : 0);
+  // The K/V buffers a sparse KV store's spilled pages gave back do not count;
+  // its cache is pages of the pool's layout, which it takes from the pool's
+  // admission.
+  report.kvAllocatedBytes = kvPages_->actualAllocatedBytes() + (sparseKv_ ? sparseKv_->cacheBytes() : 0);
   report.stateStagingBytes = modelMemory.stateStagingBytes;
   report.aneFfnBytes = aneFfn_ ? aneFfn_->allocatedBytes() : 0;
   if (const auto table = streamedTableStats()) report.streamedTableBytes = table->cacheBytes;

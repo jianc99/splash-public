@@ -335,6 +335,8 @@ struct Runtime::Impl {
   struct PageTableBinding final {
     uint64_t requestId = 0;
     uint64_t revision = 0;
+    // kv::PageStorage::kvRevision when it was written.
+    uint64_t kvRevision = 0;
   };
 
   MetalBackend &backend;
@@ -592,6 +594,7 @@ struct Runtime::Impl {
       states.clearDraftRings(entry.stateLane);
     states.releaseLane(entry.stateLane, entry.id);
     pageTableBindings[entry.stateLane] = {};
+    if (sparseKv) sparseKv->vacate(entry.stateLane);
   }
 
   // A request lets go of its images; the encoded ones stay in the cache.
@@ -808,19 +811,30 @@ struct Runtime::Impl {
         decodeArena->get(entry.stateLane, DecodeTensor::PageTable);
     // Rewrite only what changed since the table was written: nothing at the
     // same revision, the entries from the first changed page on at the next
-    // one, and everything after two changes or for another request.
+    // one, and everything after two changes, for another request, or once a
+    // K/V buffer moved.
     const auto size = static_cast<uint32_t>(item.pageTable.size());
     uint32_t first = 0;
-    if (binding.requestId == entry.id) {
+    if (binding.requestId == entry.id && binding.kvRevision == kvPages.kvRevision()) {
       if (binding.revision == item.pageTableRevision)
         first = size;
       else if (binding.revision + 1 == item.pageTableRevision)
         first = std::min(item.pageTableFirstChanged, size);
     }
-    if (first < size)
+    if (first < size) {
       kvPages.writeEntries(item.pageTable, first, destination);
-    binding = {entry.id, item.pageTableRevision};
+      if (kvPages.layout().indexDimension)
+        kvPages.writeIndexEntries(item.pageTable, first, indexTable(entry));
+    }
+    binding = {entry.id, item.pageTableRevision, kvPages.kvRevision()};
     return destination;
+  }
+
+  // The lane's index table, which synchronizedPageTable keeps beside its page
+  // table; empty for a layout without an index.
+  [[nodiscard]] MetalBuffer indexTable(const Request &entry) const {
+    return kvPages.layout().indexDimension ? decodeArena->get(entry.stateLane, DecodeTensor::IndexTable)
+                                           : MetalBuffer{};
   }
 
   void addRopeTables(CommandGraph &graph, MetalBuffer targetPositions,
@@ -1209,6 +1223,7 @@ struct Runtime::Impl {
     uint32_t captureBegin = 0;
     ChunkedPrefillParams chunk;
     MetalBuffer pageTable;
+    MetalBuffer indexTable;
     DispatchDraftCapturePlan captures;
     std::vector<PrefillStateCapture> stateCaptures;
   };
@@ -1345,15 +1360,17 @@ struct Runtime::Impl {
     if (!rows || rows > uint64_t{kPrefillRows} * prefillArena->chunks())
       throw std::invalid_argument("a prefill command's rows exceed its chunks");
     std::vector<PrefillChunk> chunks(1);
+    if (sparseKv) sparseKv->release();
     for (uint32_t lane = 0; lane < items.size(); ++lane) {
       const ModelBatchItem &item = items[lane];
       Request &entry = prefillLane(item);
       entries[lane] = &entry;
-      const MetalBuffer pageTable = synchronizedPageTable(entry, item);
-      // The pages the request committed before this command go to the sparse
-      // KV store's file as it prefills, so that its decode does not wait for
+      // The prefill reads every page of the request, spilled ones read back;
+      // the pages it committed before this command go to the sparse KV
+      // store's file as it prefills, so that its decode does not wait for
       // them.
-      if (sparseKv) sparseKv->prepare(entry.stateLane, entry.id, item.logicalPosition, item.pageTable);
+      if (sparseKv) sparseKv->prepare(entry.stateLane, entry.id, item.logicalPosition, item.pageTable, false);
+      const MetalBuffer pageTable = synchronizedPageTable(entry, item);
       const uint64_t end = item.logicalPosition + item.tokenCount;
       QwenLogicalLengths lengths = states.metadata(entry.stateLane).lengths;
       size_t nextCapture = 0;
@@ -1377,6 +1394,7 @@ struct Runtime::Impl {
         sequence.captureBegin = chunk.capturedRows;
         sequence.chunk = chunkParams(part.logicalPosition, part.tokenCount, sequence.attentionStride, item.pageTable);
         sequence.pageTable = pageTable;
+        sequence.indexTable = indexTable(entry);
         sequence.captures = activeDraftCaptures(entry, part);
         sequence.stateCaptures = stateCaptures(part, sequence.captures, lengths);
         for (PrefillStateCapture &capture : sequence.stateCaptures) capture.atEnd = capture.lengths.targetTokens == end;
@@ -1596,6 +1614,7 @@ struct Runtime::Impl {
         destination.kvOffset = sequence.kvOffset;
         destination.chunk = sequence.chunk;
         destination.pageTable = sequence.pageTable;
+        destination.indexTable = sequence.indexTable;
         destination.convolutionIn = in.convolutionLayers;
         destination.convolutionOut = out.convolutionLayers;
         destination.recurrentIn = in.recurrentLayers;
@@ -1657,6 +1676,9 @@ struct Runtime::Impl {
         !metadata.lengths.hasCompleteDraftWindow(kDraftCacheStride)) {
       throw std::logic_error("decode state length is not exact");
     }
+    // The pages the request committed since its last verify go to the sparse
+    // KV store's file before the command reads them through it.
+    if (sparseKv) sparseKv->prepare(entry.stateLane, entry.id, item.logicalPosition, item.pageTable, true);
     static_cast<void>(synchronizedPageTable(entry, item));
     auto *draftInput = contents<uint32_t>(
         decodeArena->get(lane, DecodeTensor::DraftInputTokens),
@@ -1822,19 +1844,14 @@ struct Runtime::Impl {
       Request &entry = laneEntry(entries, lane);
       buffers.pageTables[lane] =
           decodeArena->get(entry.stateLane, DecodeTensor::PageTable);
+      buffers.indexTables[lane] = indexTable(entry);
       buffers.currentGdnStates[lane] = states.current(entry.stateLane).stateBase;
       buffers.nextGdnStates[lane] = states.next(entry.stateLane).stateBase;
       buffers.auxiliary[lane] = states.current(entry.stateLane).auxiliary;
     }
-    // The pages each lane committed since its last verify go to the store's
-    // file before the command reads them through it.
     if (sparseKv) {
       buffers.sparseKv = sparseKv;
-      for (uint32_t lane = 0; lane < lanes; ++lane) {
-        const Request &entry = *entries[lane];
-        sparseKv->prepare(entry.stateLane, entry.id, items[lane].logicalPosition, items[lane].pageTable);
-        buffers.stateLanes[lane] = entry.stateLane;
-      }
+      for (uint32_t lane = 0; lane < lanes; ++lane) buffers.stateLanes[lane] = entries[lane]->stateLane;
     }
     for (uint32_t lane = 0; lane < lanes; ++lane) {
       const uint32_t stateLane = entries[lane]->stateLane;
@@ -2719,6 +2736,7 @@ Runtime::decodeAsync(const BatchPlan &plan,
   std::array<Impl::Request *, kLaneCount> requests{};
   std::array<uint64_t, kLaneCount> logicalPositions{};
   std::array<uint32_t, kLaneCount> maximumRetained{};
+  if (impl_->sparseKv) impl_->sparseKv->release();
   for (uint32_t lane = 0; lane < width; ++lane) {
     const ModelBatchItem &item = items[lane];
     Impl::Request &entry = impl_->request(item.requestId);
@@ -2848,6 +2866,11 @@ uint64_t Runtime::reclaimIdleState(bool keepLane, IdleMemory scope) noexcept {
   // rebuildable caches go once the pool has nothing more to give.
   if (const uint64_t buffer = impl_->states.releaseOneIdle(keepLane))
     return buffer;
+  // What the sparse KV store holds for no request: vacated lanes' caches and
+  // the K/V of extents whose pages all spilled.
+  if (impl_->sparseKv)
+    if (const uint64_t released = impl_->sparseKv->release())
+      return released;
   return scope == IdleMemory::BuffersThenCaches ? impl_->releaseOneCache() : 0;
 }
 

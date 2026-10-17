@@ -36,17 +36,20 @@ constexpr kv::Layout indexedBf16Layout{12, 2, 256, kv::Format::BFloat16, 128, tr
 // The host reaches a page through spans of its tensors, layer by layer as
 // keys, key scales, values and value scales, BF16 without scales, then each
 // layer's QSA pooled keys. Kernels find a page's keys at the page's slab in
-// the layer's region and its pooled keys at its slab of the layer's index
-// region, so that is where those spans start, and the spans of an extent's
-// pages cover the extent once, without gaps or overlaps.
+// the layer's region and its pooled keys at its slab of the layer's region of
+// the extent's index buffer, so that is where those spans start, and the
+// spans of an extent's pages cover its K/V buffer and its index buffer once,
+// without gaps or overlaps.
 void requireSpansTileExtent(const kv::PageStorage &storage, uint32_t firstPage) {
     const kv::Layout layout = storage.layout();
     const bool scaled = layout.format == kv::Format::Int8;
     const uint32_t tensors = scaled ? 4 : 2, kvSpans = layout.attentionLayers * tensors;
-    std::byte *const extent = storage.spans(firstPage).front().data();
-    std::vector<std::span<std::byte>> all;
-    for (uint32_t index = 0; index < storage.extentPages(); ++index) {
-        const auto spans = storage.spans(firstPage + index);
+    const std::vector<std::span<std::byte>> first = storage.spans(firstPage);
+    std::byte *const extent = first.front().data();
+    std::byte *const index = layout.indexDimension ? first[kvSpans].data() : nullptr;
+    std::vector<std::span<std::byte>> all, indexes;
+    for (uint32_t page = 0; page < storage.extentPages(); ++page) {
+        const auto spans = storage.spans(firstPage + page);
         require(spans.size() == kvSpans + (layout.indexDimension ? layout.attentionLayers : 0),
                 "a page does not have one span per tensor of every layer");
         for (uint32_t span = 0; span < spans.size(); ++span) {
@@ -58,23 +61,28 @@ void requireSpansTileExtent(const kv::PageStorage &storage, uint32_t firstPage) 
         for (uint32_t layer = 0; layer < layout.attentionLayers; ++layer) {
             require(spans[layer * tensors].data() ==
                         extent + storage.layers()[layer].offset +
-                            uint64_t{index} * layout.dataBytesPerLayerPage(),
+                            uint64_t{page} * layout.dataBytesPerLayerPage(),
                     "a layer's spans do not start at the page's keys in its region");
             if (layout.indexDimension)
-                require(spans[kvSpans + layer].data() == extent + storage.indexOffset(layer) +
-                                                             uint64_t{index} * layout.indexBytesPerLayerPage(),
+                require(spans[kvSpans + layer].data() == index + storage.indexOffset(layer) +
+                                                             uint64_t{page} * layout.indexBytesPerLayerPage(),
                         "a layer's index span is not the page's pooled keys in its index region");
         }
-        all.insert(all.end(), spans.begin(), spans.end());
+        all.insert(all.end(), spans.begin(), spans.begin() + kvSpans);
+        indexes.insert(indexes.end(), spans.begin() + kvSpans, spans.end());
     }
-    std::sort(all.begin(), all.end(),
-              [](auto left, auto right) { return left.data() < right.data(); });
-    std::byte *next = extent;
-    for (const auto span : all) {
-        require(span.data() == next, "the spans of an extent's pages leave a gap or overlap");
-        next += span.size();
-    }
-    require(next == extent + storage.extentBytes(), "the spans of an extent's pages do not cover it");
+    const auto tiles = [](std::vector<std::span<std::byte>> &spans, std::byte *base) {
+        std::sort(spans.begin(), spans.end(), [](auto left, auto right) { return left.data() < right.data(); });
+        std::byte *next = base;
+        for (const auto span : spans) {
+            require(span.data() == next, "the spans of an extent's pages leave a gap or overlap");
+            next += span.size();
+        }
+        return static_cast<uint64_t>(next - base);
+    };
+    const uint64_t kvBytes = uint64_t{storage.extentPages()} * layout.attentionLayers * layout.bytesPerLayerPage();
+    require(tiles(all, extent) == kvBytes && (!index || tiles(indexes, index) == storage.extentBytes() - kvBytes),
+            "the spans of an extent's pages do not cover it");
 }
 
 // Writing a table from an index on leaves the entries before it as they
@@ -321,8 +329,9 @@ void run(const std::string &metallib) {
         require(!bf16.isAllocated(extent) && bf16.allocateExtent(1),
                 "BF16 extent could not be allocated again after release");
     }
-    // A QSA index: 2 KiB of pooled keys per layer page after every layer's
-    // K/V, which a copy moves and a clear zeroes with the rest of the page.
+    // A QSA index: 2 KiB of pooled keys per layer page in a buffer of the
+    // extent's own, which a copy moves and a clear zeroes with the rest of
+    // the page.
     for (const auto layout : {indexedLayout, indexedBf16Layout}) {
         const uint32_t extent = layout.minimumExtentPages();
         require(layout.indexBytesPerLayerPage() == 2048 &&
@@ -331,8 +340,7 @@ void run(const std::string &metallib) {
                 "a QSA index's page bytes or alignment changed");
         kv::PageStorage indexed(backend, governor.allocationAdmission(), layout, 2 * extent, extent);
         require(indexed.allocateExtent(0) && indexed.allocateExtent(1) &&
-                    indexed.indexOffset(0) == uint64_t{12} * extent * layout.bytesPerLayerPage() &&
-                    indexed.indexOffset(11) == indexed.indexOffset(0) + uint64_t{11} * extent * 2048 &&
+                    indexed.indexOffset(0) == 0 && indexed.indexOffset(11) == uint64_t{11} * extent * 2048 &&
                     indexed.indexOffset(0) % kv::kExtentRegionAlignmentBytes == 0,
                 "a QSA index region is misplaced");
         rejects([&] { (void)indexed.indexOffset(12); }, "KV layer has no QSA index region",
@@ -352,6 +360,44 @@ void run(const std::string &metallib) {
         require(holdsAll(extent + 1, std::byte{0x3c}), "a copied page left its pooled keys behind");
         indexed.clearPages(std::array<uint32_t, 1>{3});
         require(holdsAll(3, std::byte{0}), "a cleared page kept its pooled keys");
+
+        // An extent all of whose pages spilled and none is pinned gives its
+        // K/V buffer back and keeps its index; page tables written before
+        // then are stale, and a restored page takes the buffer again.
+        const uint64_t kvBytes = uint64_t{12} * extent * layout.bytesPerLayerPage();
+        const uint64_t allocated = indexed.actualAllocatedBytes();
+        const metal::MetalBuffer indexTable = test::sharedBuffer(backend, 2 * sizeof(SplashKvPage));
+        const auto *entries = static_cast<const SplashKvPage *>(table.contents());
+        const auto *indexEntries = static_cast<const SplashKvPage *>(indexTable.contents());
+        constexpr std::array<uint32_t, 2> pages{3, 4};
+        indexed.writeIndexEntries(pages, 0, indexTable);
+        const std::array<SplashKvPage, 2> indexWritten{indexEntries[0], indexEntries[1]};
+        for (uint32_t page = 0; page + 1 < extent; ++page) indexed.spill(page);
+        require(!indexed.movable(0) && indexed.movable(1) && !indexed.releaseSpilledKv() && indexed.kvResident(3),
+                "an extent with a page that did not spill gave its K/V back, or one that spilled can move");
+        indexed.spill(extent - 1);
+        indexed.pin(5);
+        require(!indexed.releaseSpilledKv(), "an extent with a pinned page gave its K/V back");
+        indexed.unpin(5);
+        const uint64_t revision = indexed.kvRevision();
+        require(indexed.releaseSpilledKv() == kvBytes && indexed.actualAllocatedBytes() == allocated - kvBytes &&
+                    indexed.allocatedExtentBytes() == 2 * indexed.extentBytes() && indexed.kvRevision() != revision &&
+                    indexed.isAllocated(3) && !indexed.kvResident(3) && indexed.kvResident(extent),
+                "a spilled extent did not give its K/V buffer, and only it, back");
+        rejects([&] { (void)indexed.spans(3); }, "gave its K/V back to its sparse KV store",
+                "a page without its K/V had spans");
+        indexed.writeEntries(pages, 0, table);
+        indexed.writeIndexEntries(pages, 0, indexTable);
+        require(entries[0] == SplashKvPage{0} && entries[1] == SplashKvPage{0} &&
+                    indexEntries[0] == indexWritten[0] && indexEntries[1] == indexWritten[1],
+                "a page without its K/V kept a K/V entry, or its index entry moved");
+        const uint64_t released = indexed.kvRevision();
+        require(indexed.unspill(3) && indexed.kvResident(3) && !indexed.spilled(3) && indexed.spilled(4) &&
+                    indexed.actualAllocatedBytes() == allocated && indexed.kvRevision() != released &&
+                    indexed.prepareAcquired(4) && !indexed.spilled(4) && indexed.kvRevision() == released + 1,
+                "a restored page did not take its extent's K/V buffer back once");
+        for (uint32_t page = 0; page < extent; ++page) require(static_cast<bool>(indexed.unspill(page)), "unspill");
+        require(indexed.movable(0), "an extent whose pages came back stayed fixed");
     }
     rejects([&] { (void)kv::PageStorage(backend, governor.allocationAdmission(), kvLayout, 256, 128).indexOffset(0); },
             "KV layer has no QSA index region", "a layout without an index had an index region");

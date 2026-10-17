@@ -7,13 +7,17 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace splash::kv {
 
-// Storage for paged KV in extents: ordinary shared Metal buffers of
-// extentPages pages each, which KvPool alone allocates and releases: its
-// runway when it is built, then an extent when it needs one of its pages.
+// Storage for paged KV in extents of extentPages pages each, which KvPool
+// alone allocates and releases: its runway when it is built, then an extent
+// when it needs one of its pages. An extent is an ordinary shared Metal buffer
+// of its K/V and, for a layout with a QSA index, a second one of its pages'
+// index, so that the K/V of pages whose copy a sparse KV store keeps can go
+// while their index stays (spill, releaseSpilledKv).
 // An extent whose pages are all free stays allocated until a reclaim pass
 // between commands releases it (Engine::reclaimMemory); the cleanup after
 // startup warmup keeps one. Inside an extent every attention layer has a
@@ -51,8 +55,10 @@ public:
   [[nodiscard]] uint64_t extentBytes() const noexcept {
     return uint64_t{extentPages_} * layout_.bytesPerModelPage();
   }
-  // The bytes of the extents that hold memory now: a measurement of the
-  // buffers, which KvPool's record of its extents must match.
+  // The bytes of the allocated extents, which KvPool's record of its extents
+  // must match, and of the buffers that hold memory now: less by the K/V
+  // buffers releaseSpilledKv gave back.
+  [[nodiscard]] uint64_t allocatedExtentBytes() const noexcept;
   [[nodiscard]] uint64_t actualAllocatedBytes() const noexcept;
   [[nodiscard]] bool isAllocated(uint32_t page) const;
   // std::out_of_range for an extent past the pool.
@@ -74,9 +80,30 @@ public:
     return layers_;
   }
   // Where a layer's QSA index (Layout::indexDimension), the pooled keys of
-  // every page, sits in every extent, in bytes. std::out_of_range without an
-  // index or for a layer past the layout.
+  // every page, sits in every extent's index buffer, in bytes.
+  // std::out_of_range without an index or for a layer past the layout.
   [[nodiscard]] uint32_t indexOffset(uint32_t layer) const;
+  // A page's K/V has a copy a sparse KV store keeps (model::SparseKvStore):
+  // releaseSpilledKv may give its extent's K/V buffer back once every page of
+  // the extent has spilled and no transfer pins one; its index stays.
+  // Restoring (unspill) takes the buffer back if it went, through the
+  // allocation admission, and the caller writes the page's K/V again.
+  void spill(uint32_t page);
+  [[nodiscard]] bool spilled(uint32_t page) const;
+  [[nodiscard]] bool kvResident(uint32_t page) const;
+  [[nodiscard]] metal::AllocationResult unspill(uint32_t page);
+  // The K/V buffers it gave back, in bytes; none while a command is in
+  // flight.
+  uint64_t releaseSpilledKv();
+  // Moves on whenever a K/V buffer goes or comes back at another address:
+  // GPU page tables written before then name stale entries.
+  [[nodiscard]] uint64_t kvRevision() const noexcept { return kvRevision_; }
+  [[nodiscard]] bool movable(uint32_t extent) const override { return !spilledPages_.at(extent); }
+  // A transfer (engine::KvPageTier) reads or writes the page's bytes while
+  // it is pinned.
+  void pin(uint32_t page);
+  void unpin(uint32_t page);
+  [[nodiscard]] metal::AllocationResult prepareAcquired(uint32_t page) override;
 
   // Writes the entries kernels reach `pages` by, from index `first` on, to a
   // CPU-visible GPU page table, which must hold all of them; entries before
@@ -86,16 +113,28 @@ public:
   // for `first` past the pages.
   void writeEntries(std::span<const uint32_t> pages, uint32_t first,
                     const metal::MetalBuffer &table) const;
+  // The same for an index table (ops::QsaIndex): entries of the extents'
+  // index buffers. A page whose K/V went has a null K/V entry, which nothing
+  // reads: its store serves its blocks.
+  void writeIndexEntries(std::span<const uint32_t> pages, uint32_t first,
+                         const metal::MetalBuffer &table) const;
   // The page's memory as the host reaches it, and the only code that names
   // it: the page's bytes of each tensor in every layer's region, layer by
   // layer as keys, key scales, values and value scales, where
   // splash_kv_offset places them for the kernels, then each layer's QSA
-  // pooled keys (indexOffset). BF16 pages have no scale bytes. Throws std::logic_error for a page whose extent is not allocated.
+  // pooled keys (indexOffset). BF16 pages have no scale bytes. Throws
+  // std::logic_error for a page whose extent is not allocated or whose K/V
+  // buffer went.
   [[nodiscard]] std::vector<std::span<std::byte>> spans(uint32_t page) const;
 
 private:
   [[nodiscard]] size_t extentIndex(uint32_t page) const;
   [[nodiscard]] SplashKvPage entry(uint32_t page) const;
+  [[nodiscard]] uint64_t kvBytes() const noexcept {
+    return uint64_t{extentPages_} * layout_.attentionLayers * layout_.bytesPerLayerPage();
+  }
+  [[nodiscard]] uint64_t indexBytes() const noexcept { return extentBytes() - kvBytes(); }
+  [[nodiscard]] metal::MetalBuffer allocateBuffer(uint64_t bytes, const std::string &name) const;
 
   metal::MetalBackend &backend_;
   metal::AllocationAdmission admitAllocation_;
@@ -103,10 +142,19 @@ private:
   uint32_t pageCount_ = 0;
   uint32_t extentPages_ = 0;
   std::vector<SplashKvLayer> layers_;
-  // Empty while the extent is not allocated.
+  // Each extent's K/V buffer and index buffer, empty while it is not
+  // allocated (the K/V one also once releaseSpilledKv gave it back), and
+  // their GPU addresses, zero then.
   std::vector<metal::MetalBuffer> extents_;
-  // Each extent's GPU address, zero while it is not allocated.
+  std::vector<metal::MetalBuffer> indexes_;
   std::vector<uint64_t> extentAddresses_;
+  std::vector<uint64_t> indexAddresses_;
+  std::vector<bool> allocated_;
+  // Each page's spill, each extent's spilled pages, and each page's pins.
+  std::vector<bool> spilled_;
+  std::vector<uint32_t> spilledPages_;
+  std::vector<uint32_t> pins_;
+  uint64_t kvRevision_ = 0;
 };
 
 } // namespace splash::kv

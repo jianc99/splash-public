@@ -72,6 +72,19 @@ public:
   // holds alone and that no command reaches yet (KvPool::clearPage).
   // std::logic_error, clearing nothing, for a page of an unallocated extent.
   virtual void clearPages(std::span<const uint32_t> pages) = 0;
+  // Readies a free page of an allocated extent the pool hands out: a storage
+  // that can give an extent's K/V memory back takes it again here (granted,
+  // or the refusal's cause with nothing changed).
+  [[nodiscard]] virtual metal::AllocationResult prepareAcquired(uint32_t page) {
+    (void)page;
+    return {};
+  }
+  // Whether the pool may move the extent's pages away or pages into it: not
+  // while a page of it has its K/V kept elsewhere (PageStorage::spill).
+  [[nodiscard]] virtual bool movable(uint32_t extent) const {
+    (void)extent;
+    return true;
+  }
 };
 
 // Shared cache format and execution limits; model dimensions live in Layout.

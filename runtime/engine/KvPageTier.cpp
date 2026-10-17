@@ -8,8 +8,10 @@
 
 namespace splash::engine {
 
-// A demotion or a restore of one page, until the tier retires its IO.
+// A demotion or a restore of one page, until the tier retires its IO, which
+// pins the page (its K/V buffer stays while the IO reads or writes it).
 struct KvPageTier::Transfer final {
+  uint32_t page = 0;
   bool demotion = false;
   std::shared_ptr<model::SlotFile::Operation> io;
   bool ready = false;
@@ -85,11 +87,14 @@ std::shared_ptr<KvDiskSlot> KvPageTier::acquireSlot() {
 
 std::unique_ptr<KvTransfer> KvPageTier::demote(uint32_t page, std::shared_ptr<KvDiskSlot> slot,
                                                std::function<void()> completion) {
-  if (!canDemote())
+  // A page whose K/V a sparse KV store gave back is demoted once it has it
+  // again.
+  if (!canDemote() || !pages_.kvResident(page))
     return {};
   auto disk = diskSlot(slot);
   const std::vector<std::span<std::byte>> bytes = pages_.spans(page);
   auto transfer = std::make_shared<Transfer>();
+  transfer->page = page;
   transfer->demotion = true;
   auto ticket = std::make_unique<Ticket>(transfer);
   transfer->io = file_->write(disk->slot, {bytes.begin(), bytes.end()}, std::move(completion));
@@ -97,6 +102,7 @@ std::unique_ptr<KvTransfer> KvPageTier::demote(uint32_t page, std::shared_ptr<Kv
   // canDemote() does from now on.
   if (!transfer->io)
     return {};
+  pages_.pin(page);
   ++demotions_;
   inFlight_.push_back(std::move(transfer));
   return ticket;
@@ -108,8 +114,10 @@ std::unique_ptr<KvTransfer> KvPageTier::restore(std::shared_ptr<KvDiskSlot> slot
     return {};
   auto disk = diskSlot(slot);
   auto transfer = std::make_shared<Transfer>();
+  transfer->page = page;
   auto ticket = std::make_unique<Ticket>(transfer);
   transfer->io = file_->read(disk->slot, pages_.spans(page), std::move(completion));
+  pages_.pin(page);
   ++restores_;
   inFlight_.push_back(std::move(transfer));
   return ticket;
@@ -126,6 +134,7 @@ void KvPageTier::poll() {
     --(transfer->demotion ? demotions_ : restores_);
     transfer->success = transfer->io->wait();
     transfer->io.reset();
+    pages_.unpin(transfer->page);
     transfer->ready = true;
   }
 }
