@@ -35,9 +35,9 @@
 // the GPU runs, into the places the round left free, an expert at a time in
 // pieces of at most kAheadPieceBytes, most likely first: the load's experts
 // of its next round, or after a decode step's round the next block's experts
-// that are likely routed and not resident, those the next layer's router
-// picks from this block's input (the rows change little from layer to
-// layer), by their summed routing weights. A long prefill chunk (rows * topK
+// that are likely routed and not resident, those the next block's router
+// picks from this block's input (the rows change little from block to
+// block), by their summed routing weights. A long prefill chunk (rows * topK
 // >= 3 * experts) routes nearly every expert of the next block: one more host
 // step after its last repack reads them ahead into the whole staging, while
 // the GPU runs this block's experts and the next block's mixing. The next

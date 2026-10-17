@@ -282,10 +282,10 @@ place (`target_weights_bytes`). Off by default.
   without the buffer cache: an M5 Pro reads 460 KiB pieces from four threads
   at 9.3 GB/s instead of 8.1, with less than half the CPU).
 - While the GPU repacks a round or runs a layer, the next round's experts or
-  the next layer's likely experts are read ahead: those the next layer's
-  router picks from this layer's input in a decode step; after a long prefill
+  the next block's likely experts are read ahead: those the next block's
+  router picks from this block's input in a decode step; after a long prefill
   chunk's last repack, one more host step reads nearly all of the next
-  layer's into the whole staging. A load takes the read-ahead over without
+  block's into the whole staging. A load takes the read-ahead over without
   waiting for its reads of experts it does not route, and a read ahead of an
   expert no load routes may fail without failing anything.
 - Experts of one format share an arena of slots; when it would take more than

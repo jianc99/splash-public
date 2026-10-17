@@ -300,7 +300,7 @@ struct ExpertStore::Impl {
   // their projections' sources (MoE::addExpertLoad's), and its grid
   // (MTLDispatchThreadgroupsIndirectArguments), all Shared.
   metal::MetalBuffer tables, staging, jobs, sources, grid;
-  // A decode step's prediction of the next layer's routes (addLoad): its
+  // A decode step's prediction of the next block's routes (addLoad): its
   // router's fp32 scores of this block's input, then each row's experts and
   // routing weights as the routing selects them (ops::MoE::addRoutes), for
   // up to a cycle's rows; each expert's summed weight over the rows (negative
@@ -977,8 +977,8 @@ void ExpertStore::addLoad(metal::CommandGraph &graph, std::span<const ops::MoeLo
   const uint64_t routable = impl.routable(rows);
   const uint64_t perRound = impl.roundPlaces(phase, routable);
   const uint32_t rounds = static_cast<uint32_t>((routable + perRound - 1) / perRound);
-  // A decode step's layer predicts the next layer's routes, when its experts
-  // stream: that layer's routing of this block's input.
+  // A decode step's load predicts the next block's routes, when its experts
+  // stream: that block's routing of this block's input.
   const bool predicted =
       phase == ops::MoePhase::Decode && block + 1 < impl.blocks.size() && impl.streams(block + 1);
   if (predicted) {
