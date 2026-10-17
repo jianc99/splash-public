@@ -2755,6 +2755,27 @@ order, as the release check does ([Release check](#release-check)), and writes
 `backend-regression.json` there. Neither is a comparison with another engine
 or a test of agent task quality.
 
+A change of arithmetic that moves outputs (`EXPECT_OUTPUT_CHANGE=1`) is
+measured by its next-token distributions instead. The benchmark's `logits`
+scenario dumps the full-vocabulary logits after 16 prefixes of each of the six
+transcript requests' 256-token greedy answers, the score-only requests cold and
+`--logits-width` at once so that they prefill beside each other, and
+`dev/benchmarks/logit_compare.py` compares a dump with one whose prefixes it
+scored (`--logits-from`): top-1 agreement, mean and p99 KL and the next-token
+NLL change, failing past `--min-top1`, `--max-mean-kl` and `--max-p99-kl`. A
+dump is three files, `sequences.txt`, `records.txt` and `logits.f32` (fp32
+rows, as llama.cpp's model-conversion scripts write logits), so that another
+engine's logits after the same prefixes compare the same way:
+
+```sh
+build/engine-tests/backend-benchmark build/splash.metallib "$MODEL_ROOT" --scenario logits --logits /tmp/base
+build/engine-tests/backend-benchmark build/splash.metallib "$MODEL_ROOT" --scenario logits --logits /tmp/b4 --logits-from /tmp/base --logits-width 4
+.venv/bin/python -m dev.benchmarks.logit_compare /tmp/base /tmp/b4
+```
+
+The second line also measures this build's noise floor: the same prefixes
+prefilled four at a time.
+
 A change of the weight images' layout (`EXPECT_IMAGE_CHANGE=1`) makes
 `backend_regression` report the images it changed instead of failing on them.
 `decode-profile --dispatch-list FILE` writes the profiled B1 cycles'
