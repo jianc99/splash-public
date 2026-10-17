@@ -2,6 +2,7 @@
 #include "../../../runtime/metal/MetalBackend.hpp"
 #include "TestBuffers.hpp"
 #include "TestChecks.hpp"
+#include "TestStderr.hpp"
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -47,6 +48,7 @@ using splash::metal::IndirectGrid;
 using splash::metal::MetalBackend;
 using splash::metal::MetalBackendError;
 using splash::metal::SharedEvent;
+using splash::test::capturedStderr;
 using splash::test::rejects;
 using splash::test::sharedBuffer;
 using splash::metal::MetalBuffer;
@@ -1654,6 +1656,82 @@ void hostSteps(const std::string &metallibPath) {
     std::cout << "PASS host steps run in order between a command's work\n";
 }
 
+// The first command of a fresh backend may hold an awake host step: the
+// backend builds and checks the spin before it encodes the command, which
+// runs the step between its work and spins through it on this system.
+void firstCommandWithAnAwakeHostStep(const std::string &metallibPath) {
+    MetalBackend backend(metallibPath);
+    MetalBuffer buffer = sharedBuffer(backend, sizeof(uint32_t));
+    auto *value = static_cast<volatile uint32_t *>(buffer.contents());
+    *value = 0;
+    const uint32_t count = 1, one = 1;
+    const std::vector<ComputeDispatch> dispatches(2, addition(buffer, count, one));
+    uint32_t seen = 0;
+    HostStepTiming timing;
+    const std::vector<EventStep> steps{{1, {}, 0, EventStep::Kind::Host, [&] { seen = *value; },
+                                        [&](const HostStepTiming &step) { timing = step; }, true}};
+    (void)backend.submitCommandAsync(Command{dispatches, steps}).wait();
+    require(seen == 1 && *value == 2 && backend.healthy(),
+            "an awake host step in a fresh backend's first command did not run between its work");
+    require(BackendInstrumentation::awakeHostStepsSpin(backend) && timing.resumeSeconds < 0.01,
+            "the GPU did not spin through an awake host step of a fresh backend's first command: resume " +
+                std::to_string(timing.resumeSeconds) + " s");
+    std::cout << "PASS a fresh backend's first command spins through its awake host step\n";
+}
+
+id noCommandQueue(id, SEL) { return nil; }
+CFTimeInterval startedLate(id, SEL) { return std::numeric_limits<CFTimeInterval>::max(); }
+
+// Awake host steps run as plain ones, with one warning, when the backend
+// cannot check their spin, as when Metal creates no queue for the check. A
+// check whose every spin started after its release, as when the GPU is busy
+// with other work, decides nothing and warns of nothing: a later check spins.
+void hostStepSpinFallsBack(const std::string &metallibPath) {
+    constexpr std::string_view kWarning = "Metal host steps run without keeping the GPU awake";
+    const auto runAwakeSteps = [](MetalBackend &backend) {
+        MetalBuffer buffer = sharedBuffer(backend, sizeof(uint32_t));
+        auto *value = static_cast<volatile uint32_t *>(buffer.contents());
+        const uint32_t count = 1, one = 1;
+        const std::vector<ComputeDispatch> dispatches(2, addition(buffer, count, one));
+        for (int command = 0; command < 2; ++command) {
+            *value = 0;
+            uint32_t seen = 0;
+            const std::vector<EventStep> steps{{1, {}, 0, EventStep::Kind::Host, [&] { seen = *value; }, {}, true}};
+            (void)backend.submitCommandAsync(Command{dispatches, steps}).wait();
+            require(seen == 1 && *value == 2, "an awake host step without its spin did not run between its work");
+        }
+    };
+    const auto fallsBack = [&](MetalBackend &backend, std::string_view cause) {
+        const std::string warnings = capturedStderr([&] { runAwakeSteps(backend); });
+        const size_t warning = warnings.find(kWarning);
+        require(warning != std::string::npos && warnings.find(cause) != std::string::npos &&
+                    warnings.find(kWarning, warning + 1) == std::string::npos,
+                "awake host steps without their spin did not warn once of \"" + std::string(cause) + "\": " +
+                    warnings);
+        require(backend.healthy() && !BackendInstrumentation::awakeHostStepsSpin(backend),
+                "awake host steps without their spin marked the backend unhealthy or spun");
+    };
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    {
+        MetalBackend backend(metallibPath);
+        MethodReplacement noQueue(device, @selector(newCommandQueue), reinterpret_cast<IMP>(noCommandQueue));
+        fallsBack(backend, "unable to create Metal command queue");
+    }
+    MetalBackend backend(metallibPath);
+    std::string warnings;
+    {
+        id<MTLCommandBuffer> command = [[device newCommandQueue] commandBuffer];
+        MethodReplacement late(command, @selector(GPUStartTime), reinterpret_cast<IMP>(startedLate));
+        warnings = capturedStderr([&] {
+            require(!BackendInstrumentation::awakeHostStepsSpin(backend), "a check whose spins all started late spun");
+        });
+    }
+    runAwakeSteps(backend);
+    require(warnings.find(kWarning) == std::string::npos && BackendInstrumentation::awakeHostStepsSpin(backend),
+            "a check whose spins all started late warned, or kept a later check from spinning: " + warnings);
+    std::cout << "PASS awake host steps run as plain ones without a spin that sees its release\n";
+}
+
 // A host step that throws fails its command with its message once the
 // command ends; the work after it still runs, the backend is unhealthy, and
 // the failed command reports no round trip. A `timed` that throws leaves its
@@ -2052,7 +2130,9 @@ int main(int argc, const char *argv[]) {
             eventPairsRunInOrder(argv[1]);
             malformedEventStepsRefused(argv[1]);
             failedBufferStillSignals(argv[1]);
+            firstCommandWithAnAwakeHostStep(argv[1]);
             hostSteps(argv[1]);
+            hostStepSpinFallsBack(argv[1]);
             throwingHostStepFailsItsCommand(argv[1]);
             hostStepAfterALongWait(argv[1]);
             blockedHostStepRunnerStops(argv[1]);

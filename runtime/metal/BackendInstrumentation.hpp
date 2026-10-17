@@ -34,7 +34,7 @@ public:
   [[nodiscard]] static std::vector<DispatchTiming>
   takeDispatchProfile(MetalBackend &backend);
   // Whether awake host steps spin (EventStep::awake): the backend's check
-  // that a GPU spin sees the CPU end it, run now if no command ran it.
+  // that a GPU spin sees the CPU end it, run now unless one decided.
   [[nodiscard]] static bool awakeHostStepsSpin(MetalBackend &backend);
 };
 

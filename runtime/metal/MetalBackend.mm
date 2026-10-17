@@ -153,9 +153,12 @@ constexpr NSUInteger kMaximumCommandBuffers = 512;
 // The most loads host_step_wait spins for: 60-190 ms on the M5 Max (0.23-0.71
 // us a load), longer than nearly every step's work.
 constexpr uint32_t kHostStepWaitLoads = 1u << 18;
-// Where in the backend's host-step release buffer host_step_wait writes the
+// Where in the spin's release buffer (HostStepSpin) host_step_wait writes the
 // release it saw: a cache line past the counter the CPU raises (word 0).
 constexpr NSUInteger kHostStepSeenOffset = 128;
+// How long after a spin check that decided nothing (every spin started after
+// its release, the GPU busy with other work) awake steps check it again.
+constexpr auto kHostStepSpinRecheck = std::chrono::seconds(10);
 
 // The command buffers an event step adds to its command: a signal ends one,
 // and a host step one more for the GPU's spin when it keeps the GPU awake.
@@ -473,7 +476,7 @@ struct HostSteps {
         std::optional<uint32_t> release;
     };
     __strong id<MTLSharedEvent> event = nil;
-    // The backend's release buffer (Impl::hostStepReleases).
+    // The spin's release buffer (HostStepSpin), once a step spins.
     __strong id<MTLBuffer> releases = nil;
     std::vector<Step> steps;
     std::mutex mutex;
@@ -615,6 +618,16 @@ private:
     std::deque<std::shared_ptr<HostSteps>> queue_;
     std::atomic<bool> stopping_{false};
     std::thread thread_; // last: it starts once the members it uses exist
+};
+
+// The GPU's spin through awake host steps: host_step_wait, and the buffer it
+// looks at, whose counter (word 0) the runner raises past each awake step and
+// where the spin writes the last release it saw (kHostStepSeenOffset).
+struct HostStepSpin {
+    __strong id<MTLComputePipelineState> pipeline = nil;
+    __strong id<MTLBuffer> releases = nil;
+    // The release value of the last spin encoded.
+    uint32_t sequence = 0;
 };
 
 struct CommandTicket::State {
@@ -1020,7 +1033,7 @@ struct MetalBackend::Impl {
     // orders nothing: the work after the step starts in a buffer of its own
     // that waits for the event, and only a buffer's start makes what the CPU
     // wrote visible (a wait inside a buffer that the GPU reaches after the
-    // signal leaves stale lines). An awake step spins only where the spin was
+    // signal leaves stale lines). An awake step spins only once the spin was
     // seen to end at its release (checkHostStepSpin).
     template <class Fail>
     id<MTLCommandBuffer> encodeHostStep(id<MTLCommandBuffer> command, std::vector<id<MTLCommandBuffer>> &leading,
@@ -1030,7 +1043,6 @@ struct MetalBackend::Impl {
             steps = std::make_shared<HostSteps>();
             steps->event = [device newSharedEvent];
             if (!steps->event) failBeforeCommit("unable to create Metal shared event");
-            steps->releases = hostStepReleaseBuffer();
             if (!hostStepRunner) hostStepRunner = std::make_unique<HostStepRunner>();
         }
         id<MTLSharedEvent> event = steps->event;
@@ -1038,10 +1050,11 @@ struct MetalBackend::Impl {
         [command encodeSignalEvent:event value:ready];
         leading.push_back(command);
         std::optional<uint32_t> released;
-        if (step.awake && awakeSpins.value_or(false)) {
+        if (step.awake && hostStepSpin) {
             id<MTLCommandBuffer> awake = [queue commandBuffer];
             if (!awake) failBeforeCommit("unable to create Metal command buffer");
-            released = encodeSpin(awake, failBeforeCommit);
+            released = encodeSpin(*hostStepSpin, awake, failBeforeCommit);
+            steps->releases = hostStepSpin->releases;
             leading.push_back(awake);
         }
         id<MTLCommandBuffer> next = [queue commandBuffer];
@@ -1058,31 +1071,53 @@ struct MetalBackend::Impl {
         hostStepRunner->add(std::move(steps));
     }
 
-    // The release buffer of host steps, created with the first.
-    id<MTLBuffer> hostStepReleaseBuffer() {
-        if (!hostStepReleases) {
-            hostStepReleases =
-                newBuffer(kHostStepSeenOffset + sizeof(uint32_t), BufferStorage::Shared, @"host-step releases");
-            std::memset(hostStepReleases.contents, 0, hostStepReleases.length);
-        }
-        return hostStepReleases;
-    }
-
     // Encodes into `buffer` one host_step_wait thread, which spins until the
-    // release counter reaches the next release value, and returns that value.
+    // release counter reaches the spin's next release value, and returns that
+    // value.
     template <class Fail>
-    uint32_t encodeSpin(id<MTLCommandBuffer> buffer, Fail &&fail) {
-        id<MTLBuffer> releases = hostStepReleaseBuffer();
+    static uint32_t encodeSpin(HostStepSpin &spin, id<MTLCommandBuffer> buffer, Fail &&fail) {
         id<MTLComputeCommandEncoder> encoder = [buffer computeCommandEncoder];
         if (!encoder) fail("unable to create Metal compute encoder");
-        const uint32_t release[2] = {++hostStepSequence, kHostStepWaitLoads};
-        [encoder setComputePipelineState:pipeline("host_step_wait")];
-        [encoder setBuffer:releases offset:0 atIndex:0];
+        const uint32_t release[2] = {++spin.sequence, kHostStepWaitLoads};
+        [encoder setComputePipelineState:spin.pipeline];
+        [encoder setBuffer:spin.releases offset:0 atIndex:0];
         [encoder setBytes:release length:sizeof(release) atIndex:1];
-        [encoder setBuffer:releases offset:kHostStepSeenOffset atIndex:2];
+        [encoder setBuffer:spin.releases offset:kHostStepSeenOffset atIndex:2];
         [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
         [encoder endEncoding];
         return release[0];
+    }
+
+    // How a check of the spin ended (checkHostStepSpin): a spin ended at its
+    // release, or ran past it, or every spin started after its release.
+    enum class SpinCheck : uint8_t { Seen, Unseen, Late };
+
+    // Runs spins on a queue of their own, each released while it spins, as
+    // checkHostStepSpin describes.
+    SpinCheck runSpinCheck(HostStepSpin &spin) {
+        const auto fail = [](std::string message) { throw MetalBackendError(std::move(message)); };
+        id<MTLCommandQueue> checkQueue = [device newCommandQueue];
+        if (!checkQueue) fail("unable to create Metal command queue");
+        const auto *seen = reinterpret_cast<const uint32_t *>(
+            static_cast<const uint8_t *>(spin.releases.contents) + kHostStepSeenOffset);
+        // A spin that starts after its release sees it at its first load
+        // and shows nothing, so a late one runs again, released later.
+        for (const auto delay : {std::chrono::milliseconds(2), std::chrono::milliseconds(20),
+                                 std::chrono::milliseconds(100)}) {
+            id<MTLCommandBuffer> buffer = [checkQueue commandBuffer];
+            if (!buffer) fail("unable to create Metal command buffer");
+            const uint32_t value = encodeSpin(spin, buffer, fail);
+            [buffer commit];
+            std::this_thread::sleep_for(delay);
+            const double released = awakeSeconds();
+            release(spin.releases, value);
+            [buffer waitUntilCompleted];
+            if (buffer.status != MTLCommandBufferStatusCompleted)
+                fail("a GPU spin failed: " + errorDescription(buffer.error));
+            if (buffer.GPUStartTime >= released) continue;
+            return *seen == value ? SpinCheck::Seen : SpinCheck::Unseen;
+        }
+        return SpinCheck::Late;
     }
 
     // Whether a GPU thread spinning through an awake host step sees the CPU
@@ -1090,41 +1125,53 @@ struct MetalBackend::Impl {
     // that Metal's public headers leave out (host_step.metal), and should a
     // Metal release stop honoring it, the work after every awake step would
     // wait out the spin's bound, 60 ms or more. So before the first command
-    // with an awake step is encoded, one spin runs on a queue of its own and
-    // is released 2 ms after its commit, while it spins: it must end at that
-    // release, not at its bound. A spin that started only after its release
-    // shows nothing, and runs again, released 20 and then 100 ms after its
-    // commit. If no spin ends at its release, awake steps run as plain ones
-    // (encodeHostStep), which only gives up the spin's head start, and a
-    // warning says so.
-    bool checkHostStepSpin() {
+    // with an awake step is encoded, the backend builds the spin
+    // (HostStepSpin), and one spin runs on a queue of its own and is released
+    // 2 ms after its commit, while it spins: it must end at that release, not
+    // at its bound. A spin that started only after its release shows
+    // nothing, and runs again, released 20 and then 100 ms after its commit.
+    // Once a spin ended at its release, awake steps spin. If one ran past its
+    // release, or the spin cannot be built or run, awake steps run as plain
+    // ones (encodeHostStep), which only gives up the spin's head start, and a
+    // warning says so. If every spin started late, the GPU busy with other
+    // work, the check decides nothing: awake steps run as plain ones for
+    // kHostStepSpinRecheck, and the first command with one after that checks
+    // again.
+    void checkHostStepSpin() {
         @autoreleasepool {
-            const auto fail = [](std::string message) { throw MetalBackendError(std::move(message)); };
-            id<MTLCommandQueue> checkQueue = [device newCommandQueue];
-            if (!checkQueue) fail("unable to create Metal command queue");
-            const auto *seen = reinterpret_cast<const uint32_t *>(
-                static_cast<const uint8_t *>(hostStepReleases.contents) + kHostStepSeenOffset);
-            // A spin that starts after its release sees it at its first load
-            // and shows nothing, so a late one runs again, released later.
-            for (const auto delay : {std::chrono::milliseconds(2), std::chrono::milliseconds(20),
-                                     std::chrono::milliseconds(100)}) {
-                id<MTLCommandBuffer> spin = [checkQueue commandBuffer];
-                if (!spin) fail("unable to create Metal command buffer");
-                const uint32_t value = encodeSpin(spin, fail);
-                [spin commit];
-                std::this_thread::sleep_for(delay);
-                const double released = awakeSeconds();
-                release(hostStepReleases, value);
-                [spin waitUntilCompleted];
-                if (spin.status != MTLCommandBufferStatusCompleted) break;
-                if (spin.GPUStartTime >= released) continue;
-                if (*seen == value) return true;
-                break;
+            try {
+                HostStepSpin spin = newHostStepSpin();
+                switch (runSpinCheck(spin)) {
+                case SpinCheck::Seen:
+                    hostStepSpin = std::move(spin);
+                    nextSpinCheck = AwakeClock::time_point::max();
+                    return;
+                case SpinCheck::Unseen:
+                    logWarning("Metal host steps run without keeping the GPU awake: a GPU spin did not see the "
+                               "CPU's release (host_step_wait), so the work after each step starts later");
+                    nextSpinCheck = AwakeClock::time_point::max();
+                    return;
+                case SpinCheck::Late:
+                    nextSpinCheck = AwakeClock::now() + kHostStepSpinRecheck;
+                    return;
+                }
+            } catch (const std::exception &error) {
+                logWarning("Metal host steps run without keeping the GPU awake (", error.what(),
+                           "), so the work after each step starts later");
+                nextSpinCheck = AwakeClock::time_point::max();
             }
-            logWarning("Metal host steps run without keeping the GPU awake: a GPU spin did not see the "
-                       "CPU's release (host_step_wait), so the work after each step starts later");
-            return false;
         }
+    }
+
+    // The spin of awake host steps, with a release buffer whose counter
+    // starts at zero.
+    HostStepSpin newHostStepSpin() {
+        HostStepSpin spin;
+        spin.pipeline = newPipeline("host_step_wait");
+        spin.releases = newBuffer(kHostStepSeenOffset + sizeof(uint32_t), BufferStorage::Shared,
+                                  @"host-step releases");
+        std::memset(spin.releases.contents, 0, spin.releases.length);
+        return spin;
     }
 
     // Encodes and commits prepared dispatches and the event steps between
@@ -1133,8 +1180,9 @@ struct MetalBackend::Impl {
                          std::span<const EventStep> events,
                          std::vector<std::shared_ptr<MetalAllocation>> retained,
                          CommandCompletion completion) {
-        if (!awakeSpins && std::ranges::any_of(events, [](const EventStep &step) { return step.awake; }))
-            awakeSpins = checkHostStepSpin();
+        if (!hostStepSpin && AwakeClock::now() >= nextSpinCheck &&
+            std::ranges::any_of(events, [](const EventStep &step) { return step.awake; }))
+            checkHostStepSpin();
         auto ticketState = std::make_shared<CommandTicket::State>();
         ticketState->backend = asyncState;
         ticketState->completion = std::move(completion);
@@ -1314,14 +1362,13 @@ struct MetalBackend::Impl {
     }
 #endif
 
-    // The release buffer of host steps (HostSteps): the counter the runner
-    // raises past each awake step, at word 0, and the last release a spin
-    // saw, at kHostStepSeenOffset. And the value the last spin waits for.
-    __strong id<MTLBuffer> hostStepReleases = nil;
-    uint32_t hostStepSequence = 0;
-    // Whether awake host steps spin, unset until the first command with one
-    // (checkHostStepSpin).
-    std::optional<bool> awakeSpins;
+    // The spin of awake host steps, once checked (checkHostStepSpin); until
+    // then they run as plain ones.
+    std::optional<HostStepSpin> hostStepSpin;
+    // When a command with an awake step checks the spin: the first, or one
+    // kHostStepSpinRecheck after a check that decided nothing; never once a
+    // check decided.
+    AwakeClock::time_point nextSpinCheck{};
     // Last, so that it stops first, raising the steps it holds.
     std::unique_ptr<HostStepRunner> hostStepRunner;
 };
@@ -1762,8 +1809,9 @@ BackendInstrumentation::takeDispatchProfile(MetalBackend &backend) {
 
 bool BackendInstrumentation::awakeHostStepsSpin(MetalBackend &backend) {
     MetalBackend::Impl &impl = *backend.impl_;
-    if (!impl.awakeSpins) impl.awakeSpins = impl.checkHostStepSpin();
-    return *impl.awakeSpins;
+    if (!impl.hostStepSpin && impl.nextSpinCheck != AwakeClock::time_point::max())
+        impl.checkHostStepSpin();
+    return impl.hostStepSpin.has_value();
 }
 #endif
 
