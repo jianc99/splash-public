@@ -569,6 +569,15 @@ DFlashDraftLayout readDraftLayout(NSDictionary *draft, const QwenTargetDimension
                   {"selector_rank", SPLASH_DRAFT_SELECTOR_RANK},
                   {"selector_top_k", SPLASH_DRAFT_CANDIDATES},
                   {"mask_token_id", target.maskToken}});
+  // How a target layer's output row becomes the hidden values the draft reads
+  // of it, as the draft was trained (target_hidden_reduction): a
+  // hyper-connected target's streams by their mean (Qwen4ExpTarget's
+  // capture), another's row as it is. A config without it states its
+  // target's.
+  const std::string_view reduction = target.hyperConnected() ? "stream_mean" : "none";
+  if (flash[@"target_hidden_reduction"])
+    requireEqual(requireString(flash, @"target_hidden_reduction", "draft config target_hidden_reduction"),
+                 reduction, "checkpoint", "draft config dflash_config target_hidden_reduction");
   NSArray *ids = requireArray(flash, @"target_layer_ids", "draft config target_layer_ids");
   std::vector<uint32_t> targetLayers;
   for (id value : ids) {

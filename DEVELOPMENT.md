@@ -1570,7 +1570,10 @@ the draft's block, the anchor and its seven proposals. The target writes the
 outputs of the layers the draft reads for each row it reads;
 Qwen3.8-Flash-Next's, whose layers carry four hyper-connection streams, as
 the streams' mean, summed in fp32 and stored as bf16, as the draft was
-trained on it. Native loading validates the
+trained on it. `dflash_config.target_hidden_reduction` states that reduction
+(`stream_mean` for a hyper-connected target, `none` for another); a config
+without it takes its target's, and one that names another is refused.
+Native loading validates the
 configuration against the target again and loads the draft like a target
 ([Weight loading](#weight-loading)):
 `DraftCheckpointLoader` (`DraftCheckpoint.cpp`) plans the draft's `MDGG0001`

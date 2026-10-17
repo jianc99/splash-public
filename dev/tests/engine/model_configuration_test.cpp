@@ -222,6 +222,9 @@ void testOneRulePerValue(const std::filesystem::path &fixtures) {
             "draft config num_attention_heads mismatch: checkpoint 16, runtime 32"},
            {&SourceModel::draft, R"("selector_top_k": 16)", R"("selector_top_k": 8)",
             "draft config dflash_config selector_top_k mismatch"},
+           {&SourceModel::draft, R"("selector_top_k": 16)",
+            R"("selector_top_k": 16, "target_hidden_reduction": "stream_mean")",
+            "draft config dflash_config target_hidden_reduction mismatch: checkpoint stream_mean, runtime none"},
            {&SourceModel::draft, R"("is_causal": false)", R"("is_causal": 0)", "draft config is_causal must be false"},
        })
     refuses(source.with(refused.file, refused.from, refused.to), refused.error,
@@ -564,6 +567,19 @@ void testConfigurationCheck(const std::filesystem::path &fixtures) {
           "Qwen3.8-Flash-Next's GGUF config and metadata were not found to be its family");
   rejects([&] { static_cast<void>(check("gguf", "none", flashConfig, flashMetadata, dense.draft)); },
           "draft config hidden_size mismatch: checkpoint 5120, runtime 2560", "another family's draft was accepted");
+  // Its draft reads the mean of a layer's streams, which a config states or
+  // leaves to the target.
+  const auto flashDraftWith = [&](std::string_view to) {
+    std::string draft = flashDraft;
+    const std::string_view from = R"("target_hidden_reduction": "stream_mean",)";
+    return draft.replace(draft.find(from), from.size(), to);
+  };
+  require(check("gguf", "none", flashConfig, flashMetadata, flashDraftWith("")) == "Qwen3.8-Flash-Next",
+          "a Qwen3.8-Flash-Next draft without target_hidden_reduction was refused");
+  const std::string otherReduction = flashDraftWith(R"("target_hidden_reduction": "none",)");
+  rejects([&] { static_cast<void>(check("gguf", "none", flashConfig, flashMetadata, otherReduction)); },
+          "draft config dflash_config target_hidden_reduction mismatch: checkpoint none, runtime stream_mean",
+          "a draft of another reduction was accepted");
   rejects([&] { static_cast<void>(check("mlx-affine", "none", flashConfig, std::nullopt, std::nullopt)); },
           "Qwen3.8-Flash-Next loads from a GGUF only", "Qwen3.8-Flash-Next was accepted from MLX");
   for (const auto &[from, to, error] : std::initializer_list<std::array<std::string_view, 3>>{

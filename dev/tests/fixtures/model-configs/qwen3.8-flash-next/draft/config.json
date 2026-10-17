@@ -13,6 +13,7 @@
     "mask_token_id": 248077,
     "selector_rank": 256,
     "selector_top_k": 16,
+    "target_hidden_reduction": "stream_mean",
     "target_layer_ids": [
       3,
       17,
