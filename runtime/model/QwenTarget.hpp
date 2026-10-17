@@ -36,6 +36,7 @@ struct Qwen3_8Layout;
 struct Qwen3_8LayerWeights;
 struct Qwen3_6MoeLayout;
 struct Qwen3_6MoeLayerWeights;
+class SparseKvStore;
 
 // Both supported targets bind the same mixer tensors per hybrid layer; only
 // the FFN differs between them.
@@ -311,6 +312,10 @@ struct QwenTargetVerifyBuffers final {
   // Each lane's auxiliary state before the step; the commit writes the one
   // after it (addStateCommit).
   std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth> auxiliary;
+  // With a sparse KV store (--sparse-kv-memory), each layer's block lists
+  // resolve through it in a host step, each lane as its state lane.
+  SparseKvStore *sparseKv = nullptr;
+  std::array<uint32_t, ExecutionLimits::maximumBatchWidth> stateLanes{};
 };
 
 // The auxiliary state after the rows each lane of a verify retained, which

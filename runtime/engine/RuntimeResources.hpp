@@ -140,6 +140,11 @@ struct RuntimeResourcesConfig {
   // warning, for a dense target, and for bytes that hold every routed
   // expert, which then load with their layers.
   uint64_t expertMemoryBytes = 0;
+  // --sparse-kv-memory: a block-sparse target's decode keeps each request's
+  // committed KV in a file on the SSD and reads the blocks it selects through
+  // a cache of this many bytes a lane (model::SparseKvStore); zero reads them
+  // from the request's pages. Ignored, with a warning, for a dense target.
+  uint64_t sparseKvMemoryBytes = 0;
   // The prefill FFN's Neural Engine split (startAneFfn): off with
   // --disable-ane, and a benchmark round runs the split of the first so that
   // rounds repeat one another.
@@ -285,7 +290,8 @@ private:
                    std::unique_ptr<DiskSpace> diskSpace,
                    std::unique_ptr<KvPool> kvPool,
                    std::unique_ptr<engine::Cache> cache,
-                   std::unique_ptr<ops::AneFfn> aneFfn, AneFfnOutcome aneFfnOutcome);
+                   std::unique_ptr<ops::AneFfn> aneFfn, AneFfnOutcome aneFfnOutcome,
+                   std::unique_ptr<model::SparseKvStore> sparseKv);
   // Takes back the restore points the last process left in a persistent
   // tier (Cache::adopt) and opens its files for this one.
   void adoptPersistentCache();
@@ -306,6 +312,7 @@ private:
   std::unique_ptr<KvPool> kvPool_;
   std::unique_ptr<engine::Cache> cache_;
   std::unique_ptr<ops::AneFfn> aneFfn_;
+  std::unique_ptr<model::SparseKvStore> sparseKv_;
   // Over model_'s images, its expert store if it has one, and aneFfn_.
   ReleasableMemory releasableMemory_;
   AneFfnOutcome aneFfnOutcome_;

@@ -33,7 +33,8 @@ class SparseRowStore;
 // keyLayerRows rows apart, which its commit reads), scores of scoreRows rows
 // of scoreStride each, block bitmaps of maskWords words per row, and the
 // block lists of the attention's tiles of rows (listStride entries each,
-// ops::AttentionBlocks) with their counts. A streamed PLE
+// ops::AttentionBlocks) with their counts and, for a verify that reads KV
+// through a sparse KV store, their entries' locations. A streamed PLE
 // table's step also stages each distinct row it gathers once (pleStaging)
 // and each row id's row there (pleSlots).
 struct Qwen4Scratch final {
@@ -59,6 +60,7 @@ struct Qwen4Scratch final {
   metal::MetalBuffer qsaMask;
   metal::MetalBuffer qsaLists;
   metal::MetalBuffer qsaListCounts;
+  metal::MetalBuffer qsaLocations;
   uint32_t scoreRows = 0;
   uint32_t scoreStride = 0;
   uint32_t maskWords = 0;

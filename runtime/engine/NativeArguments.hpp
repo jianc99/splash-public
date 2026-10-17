@@ -62,6 +62,11 @@ struct NativeArguments final {
   // them; 0, without the option, loads them
   // (RuntimeResourcesConfig::expertMemoryBytes).
   uint64_t expertMemoryBytes = 0;
+  // --sparse-kv-memory BYTES: a block-sparse target's decode keeps committed
+  // KV on the SSD and reads the blocks it selects through a cache of BYTES a
+  // lane (model/SparseKvStore.hpp); 0, without the option, reads them from
+  // the request's pages (RuntimeResourcesConfig::sparseKvMemoryBytes).
+  uint64_t sparseKvMemoryBytes = 0;
 };
 
 // Reads `serve-native MODEL_DIRECTORY MAX_CONTEXT|auto MAX_MEMORY_BYTES|auto

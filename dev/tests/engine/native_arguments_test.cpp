@@ -162,6 +162,7 @@ void testServerCommandLines(const char *path) {
        }},
       {"ple_memory", [](NativeArguments &read) { read.pleMemoryBytes = 2 * kGiB; }},
       {"expert_memory", [](NativeArguments &read) { read.expertMemoryBytes = 16 * kGiB; }},
+      {"sparse_kv_memory", [](NativeArguments &read) { read.sparseKvMemoryBytes = kGiB / 2; }},
   };
   // Every field but the model inspected from the directory.
   const auto same = [](const NativeArguments &read, const NativeArguments &meant) {
@@ -178,7 +179,8 @@ void testServerCommandLines(const char *path) {
            read.idleReleaseSeconds == meant.idleReleaseSeconds &&
            read.preventIdleSleep == meant.preventIdleSleep &&
            read.neuralEngine == meant.neuralEngine && read.pleMemoryBytes == meant.pleMemoryBytes &&
-           read.expertMemoryBytes == meant.expertMemoryBytes;
+           read.expertMemoryBytes == meant.expertMemoryBytes &&
+           read.sparseKvMemoryBytes == meant.sparseKvMemoryBytes;
   };
   const auto golden = readGolden(path);
   require(golden.size() == changes.size(),
@@ -237,6 +239,8 @@ void testRefusals() {
     refuses({"auto", "auto", "--ple-memory", size}, "--ple-memory requires a positive byte count");
   for (const char *size : {"0", "16G", ""})
     refuses({"auto", "auto", "--expert-memory", size}, "--expert-memory requires a positive byte count");
+  for (const char *size : {"0", "512M", ""})
+    refuses({"auto", "auto", "--sparse-kv-memory", size}, "--sparse-kv-memory requires a positive byte count");
   refuses({"auto", "auto", "--persistent-cache", "yes"}, "--persistent-cache requires on or off");
   refuses({"auto", "auto", "0", "--persistent-cache", "on"},
           "--persistent-cache requires an SSD cache, which MAX_CACHE_DISK_BYTES 0 turns off");

@@ -296,6 +296,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/model/WeightSource.cpp \
 	runtime/model/WeightReaders.cpp \
 	runtime/model/SparseRowStore.cpp \
+	runtime/model/SparseKvStore.cpp \
 	runtime/model/WeightImages.cpp \
 	runtime/model/GgufPreparation.cpp \
 	runtime/model/ExpertSlots.cpp \

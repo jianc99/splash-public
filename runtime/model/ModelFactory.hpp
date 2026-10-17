@@ -24,6 +24,7 @@ class AneFfn;
 namespace splash::model {
 
 class QwenStateStorage;
+class SparseKvStore;
 class VisionLoader;
 
 using TargetWeights = std::variant<Qwen3_8Weights, Qwen3_6MoeWeights, Qwen4ExpWeights>;
@@ -104,6 +105,9 @@ struct RuntimeContext final {
   const ops::ExecutionPlans &operators;
   // The prefill FFN's Neural Engine split (engine::startAneFfn), if any.
   ops::AneFfn *aneFfn = nullptr;
+  // The store a block-sparse target's decode reads committed KV through
+  // (--sparse-kv-memory), if any.
+  SparseKvStore *sparseKv = nullptr;
 };
 
 // Validates only the interface between independently defined target and draft

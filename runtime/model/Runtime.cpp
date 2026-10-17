@@ -7,6 +7,7 @@
 #include "model/QwenState.hpp"
 #include "model/QwenTarget.hpp"
 #include "model/RuntimeArenas.hpp"
+#include "model/SparseKvStore.hpp"
 
 #include "metal/CommandGraph.hpp"
 #include "metal/abi/GDN.h"
@@ -381,6 +382,7 @@ struct Runtime::Impl {
   std::unique_ptr<QwenTarget> targetModel;
   DFlashDraft draftModel;
   ops::AneFfn *aneFfn;
+  SparseKvStore *sparseKv;
   explicit Impl(RuntimeContext value)
       : backend(value.backend),
         model(value.model),
@@ -397,7 +399,7 @@ struct Runtime::Impl {
                         },
                         value.model.target)),
         draftModel(value.model.draft, value.backend, operators),
-        aneFfn(value.aneFfn) {
+        aneFfn(value.aneFfn), sparseKv(value.sparseKv) {
     if (states.layout() != model.stateLayout(states.layout().target.format) ||
         kvPages.layout() != model.targetKvLayout(kvPages.layout().format)) {
       throw std::invalid_argument(
@@ -1348,6 +1350,10 @@ struct Runtime::Impl {
       Request &entry = prefillLane(item);
       entries[lane] = &entry;
       const MetalBuffer pageTable = synchronizedPageTable(entry, item);
+      // The pages the request committed before this command go to the sparse
+      // KV store's file as it prefills, so that its decode does not wait for
+      // them.
+      if (sparseKv) sparseKv->prepare(entry.stateLane, entry.id, item.logicalPosition, item.pageTable);
       const uint64_t end = item.logicalPosition + item.tokenCount;
       QwenLogicalLengths lengths = states.metadata(entry.stateLane).lengths;
       size_t nextCapture = 0;
@@ -1819,6 +1825,16 @@ struct Runtime::Impl {
       buffers.currentGdnStates[lane] = states.current(entry.stateLane).stateBase;
       buffers.nextGdnStates[lane] = states.next(entry.stateLane).stateBase;
       buffers.auxiliary[lane] = states.current(entry.stateLane).auxiliary;
+    }
+    // The pages each lane committed since its last verify go to the store's
+    // file before the command reads them through it.
+    if (sparseKv) {
+      buffers.sparseKv = sparseKv;
+      for (uint32_t lane = 0; lane < lanes; ++lane) {
+        const Request &entry = *entries[lane];
+        sparseKv->prepare(entry.stateLane, entry.id, items[lane].logicalPosition, items[lane].pageTable);
+        buffers.stateLanes[lane] = entry.stateLane;
+      }
     }
     for (uint32_t lane = 0; lane < lanes; ++lane) {
       const uint32_t stateLane = entries[lane]->stateLane;

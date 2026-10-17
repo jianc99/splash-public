@@ -75,6 +75,11 @@ OPTIONS = {
         {"off": None, "OFF": None, "512M": 512 * 1024**2, "16G": 16 * 1024**3},
         ("0", "auto", "bad", "-2G"),
     ),
+    "--sparse-kv-memory": values(
+        "--sparse-kv-memory",
+        {"off": None, "OFF": None, "512M": 512 * 1024**2, "1G": 1024**3},
+        ("0", "auto", "bad", "-2G"),
+    ),
     "--max-memory": values(
         "--max-memory",
         {

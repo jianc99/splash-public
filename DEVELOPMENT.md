@@ -99,6 +99,7 @@ access.
 | `--state-format` | `fp32` | Recurrent state storage: `fp32` or `bf16`. See [state precision](#state-precision). |
 | `--ple-memory` | Off | Qwen3.8-Flash-Next: read the PLE n-gram table from the SSD through a host row cache of this size, e.g. `2G`, instead of loading it. See [PLE table streaming](#ple-table-streaming). |
 | `--expert-memory` | Off | MoE targets: hold routed experts in this much memory, e.g. `16G`, and read the others from the SSD when a step routes them. See [streamed experts](#streamed-experts). |
+| `--sparse-kv-memory` | Off | Block-sparse targets (Qwen3.8-Flash-Next): keep a decoding request's committed KV on the SSD and read the blocks its attention selects through a cache of this size per lane, e.g. `512M`. See [sparse KV on the SSD](#sparse-kv-on-the-ssd). |
 | `--idle-release` | `10m` | Time without a request before the engine unwires its memory and frees the weights; the next request restores them. `off` keeps both, though `POST /v1/memory/release` still frees the weights. See [weight loading](#weight-loading). |
 | `--max-cache-disk` | `auto` | SSD quota for cached KV pages and states: `auto` follows the volume's free space up to 32 GiB, a size such as `16G` sets the quota, `0` turns the cache off. Kept for the session, or across restarts with `--persistent-cache`. See [SSD cache](#ssd-cache). |
 | `--max-cache-disk-writes` | `0` (no limit) | The most the SSD cache writes a day, e.g. `200G`. See [SSD cache](#ssd-cache). |
@@ -2161,6 +2162,39 @@ times the sparse kernels over synthetic selections (`--qsa` also takes
 `independent`, `overlapping`, whose unions are the ~1,500 blocks real
 selections make, and `pages`), and `--qsa indexer` the indexer itself before
 them; each case reports the mean entries of its lists.
+
+### Sparse KV on the SSD
+
+With `--sparse-kv-memory SIZE`, such as `--sparse-kv-memory 512M`, a decoding
+request's committed KV pages go to a file on the SSD, and its sparse
+attention reads the blocks it selects through a cache of SIZE per lane
+(`model::SparseKvStore`, `runtime/model/SparseKvStore.hpp`). A verify layer's
+rows select about 1,500 distinct blocks of 4 tokens whatever the context, so
+what a step reads is bounded by the selection, not by the context.
+
+- Before each prefill or verify command, the pages a lane committed since its
+  last one are written to its file (a temporary file, unlinked once open,
+  uncached I/O), so a prefilled prompt's pages are there when its decode starts:
+  each layer's 8 block records of a page in one 4 KiB-aligned run, a block's
+  keys, values and scales of every head in one record.
+- After each attention layer's selection and block lists, a host step
+  resolves every entry of each lane's list. A block of a page not in the file
+  yet is read from the request's page; any other from its slot in the cache,
+  where a block the cache does not hold is read first, by 32 readers at once,
+  into the slot of the least recently used block the step does not select.
+  The attention reads each entry's block where its location names
+  (`ops::AttentionBlocks::locations`).
+- The cache is pages of the KV pool's layout, which the pool's admission pays
+  for, allocated when a request first uses the lane; a lane the budget refuses
+  them reads every block from its requests' pages. A lane's cache holds at
+  least as many blocks a layer as its rows select (verify rows times top
+  blocks, 4,096), so the smallest SIZE is two extents.
+- The request's pages stay held: QSA's pooled keys share the KV pages, so the
+  store does not yet give memory back. Prefill is unchanged.
+- When a lane serves another request its file starts over; the log then
+  reports what the last one did (`Sparse KV · ...`): its steps, blocks a
+  layer, the share its pages served and its cache hit, the reads and their
+  time, and the pages it wrote and their time.
 
 ### Neural Engine prefill
 

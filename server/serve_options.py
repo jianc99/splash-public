@@ -148,8 +148,8 @@ def parse_max_cache_disk_writes(value):
 
 def _store_size(value, example):
     """'off' (None), or a byte count with an optional K, M or G suffix: the
-    memory of a store that streams weights from the SSD. The engine refuses a
-    size that holds nothing the store reads."""
+    memory of a store that streams weights or KV from the SSD. The engine
+    refuses a size that holds nothing the store reads."""
     if value.strip().lower() == "off":
         return None
     try:
@@ -167,6 +167,10 @@ def parse_ple_memory(value):
 
 def parse_expert_memory(value):
     return _store_size(value, "16G")
+
+
+def parse_sparse_kv_memory(value):
+    return _store_size(value, "512M")
 
 
 def parse_cache_dir(value):
@@ -452,6 +456,19 @@ SERVE_OPTIONS = (
             help="keep the routed experts of a MoE model in RAM slots of SIZE in "
             "all, e.g. 16G, and read the others from the SSD when a token routes "
             "them, instead of loading every expert (default: off)",
+        ),
+    ),
+    ServeOption(
+        "--sparse-kv-memory",
+        "memory",
+        dict(
+            type=parse_sparse_kv_memory,
+            default=None,
+            metavar="SIZE",
+            help="for a model with block-sparse attention (Qwen3.8-Flash-Next), "
+            "keep a decoding request's committed KV on the SSD and read the "
+            "blocks it attends through a RAM cache of SIZE per lane, e.g. 512M "
+            "(default: off)",
         ),
     ),
     ServeOption(
