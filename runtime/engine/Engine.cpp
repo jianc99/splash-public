@@ -1308,8 +1308,18 @@ Engine::Prepared Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &i
             workEnd, active.stateBoundaries[active.stateBoundaryCursor].tokens);
     }
     const auto kv = allocate(
-        [&] { return cache_.ensureTokens(active.request.id, workEnd); }, true,
-        growthClass(active));
+        [&] {
+          TokenAdmission admission = cache_.ensureTokens(active.request.id, workEnd);
+          // Pages whose KV memory the model gave back come back before the
+          // command reads them, admitted like the request's own.
+          if (admission.granted()) {
+            const std::span<const uint32_t> pages = cache_.pageTable(active.request.id).pages;
+            if (const metal::AllocationResult ready = model_.readyKv(active.request.id, pages, prefill); !ready)
+              admission = {TokenAdmissionFailure::Denied, static_cast<uint32_t>(pages.size()), 0, ready.failure};
+          }
+          return admission;
+        },
+        true, growthClass(active));
     if (!kv.admission.granted()) {
       denied.push_back(Denied{active.request.id, kv.admission, workEnd, kv.denial});
       continue;

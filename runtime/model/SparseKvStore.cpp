@@ -355,16 +355,8 @@ void SparseKvStore::prepare(uint32_t stateLane, uint64_t requestId, uint64_t com
   // A request takes a cache once it has blocks to spill (startup warmup's
   // short requests take none).
   if (!lane.cached && !lane.refused && committedTokens >= spillFromTokens_) allocate(stateLane);
-  // A verify reads the blocks of the pages in the lane's file through the
-  // store, and every other block through the page table.
-  const uint32_t served = verify && lane.cached ? std::min<uint32_t>(lane.filePages, pageTable.size()) : 0;
-  std::vector<uint32_t> spilled;
-  for (uint32_t index = served; index < pageTable.size(); ++index)
-    if (pages_.spilled(pageTable[index])) spilled.push_back(pageTable[index]);
-  if (!spilled.empty()) {
-    restore(spilled);
-    lane.spilled = std::min(lane.spilled, served);
-  }
+  if (const metal::AllocationResult granted = ready(stateLane, requestId, pageTable, verify); !granted)
+    throw metal::MetalAllocationError("no memory to read spilled KV pages back from the SSD", granted.failure);
   if (!lane.cached) return;
   const uint64_t complete = std::min<uint64_t>(committedTokens / kPageTokens, pageTable.size());
   if (complete > maximumBlocks_ / kPageBlocks) throw std::out_of_range("sparse KV request past its context");
@@ -381,6 +373,23 @@ void SparseKvStore::prepare(uint32_t stateLane, uint64_t requestId, uint64_t com
     ++lane.stats.spilledPages;
   }
   lane.spilled = filed;
+}
+
+metal::AllocationResult SparseKvStore::ready(uint32_t stateLane, uint64_t requestId,
+                                             std::span<const uint32_t> pageTable, bool verify) {
+  if (stateLane >= lanes_) throw std::out_of_range("sparse KV lane");
+  Lane &lane = *laneState_[stateLane];
+  // A verify reads the blocks of the pages in its lane's file through the
+  // store, and every other block through the page table.
+  const bool own = lane.request == requestId;
+  const uint32_t served = verify && own && lane.cached ? std::min<uint32_t>(lane.filePages, pageTable.size()) : 0;
+  std::vector<uint32_t> spilled;
+  for (uint32_t index = served; index < pageTable.size(); ++index)
+    if (pages_.spilled(pageTable[index])) spilled.push_back(pageTable[index]);
+  if (spilled.empty()) return {};
+  const metal::AllocationResult granted = restore(spilled);
+  if (granted && own) lane.spilled = std::min(lane.spilled, served);
+  return granted;
 }
 
 uint64_t SparseKvStore::release() {
@@ -411,9 +420,9 @@ void SparseKvStore::vacate(uint32_t stateLane) {
 }
 
 // Takes each page's K/V memory back, then reads its runs back from its copy,
-// every layer's at once; a page whose memory the budget refuses or whose
-// read fails leaves every page spilled as it was.
-void SparseKvStore::restore(std::span<const uint32_t> pages) {
+// every layer's at once; a page whose memory the budget refuses, or whose
+// read fails (which throws), leaves every page spilled as it was.
+metal::AllocationResult SparseKvStore::restore(std::span<const uint32_t> pages) {
   const auto start = AwakeClock::now();
   const auto respill = [&](size_t count) {
     for (size_t index = 0; index < count; ++index) pages_.spill(pages[index]);
@@ -424,7 +433,7 @@ void SparseKvStore::restore(std::span<const uint32_t> pages) {
   for (size_t index = 0; index < pages.size(); ++index) {
     if (const metal::AllocationResult granted = pages_.unspill(pages[index]); !granted) {
       respill(index);
-      throw metal::MetalAllocationError("no memory to read spilled KV pages back from the SSD", granted.failure);
+      return granted;
     }
     spans[index] = pages_.spans(pages[index]);
   }
@@ -457,6 +466,7 @@ void SparseKvStore::restore(std::span<const uint32_t> pages) {
   for (const uint32_t page : pages) copies_[page] = {};
   stats_.restoredPages += pages.size();
   stats_.restoreSeconds += secondsSince(start);
+  return {};
 }
 
 // Copies each page's blocks into the file, a layer's run of up to

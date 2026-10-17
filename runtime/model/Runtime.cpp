@@ -2911,6 +2911,11 @@ Runtime::provideMask(uint64_t requestId, std::span<const uint32_t> words) {
   return std::nullopt;
 }
 
+metal::AllocationResult Runtime::readyKv(uint64_t requestId, std::span<const uint32_t> pageTable, bool prefill) {
+  if (!impl_->sparseKv) return {};
+  return impl_->sparseKv->ready(impl_->request(requestId).stateLane, requestId, pageTable, !prefill);
+}
+
 void Runtime::end(uint64_t requestId) {
   auto found = impl_->requests.find(requestId);
   if (found == impl_->requests.end())

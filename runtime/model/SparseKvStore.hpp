@@ -105,9 +105,15 @@ public:
   // lane's file), writes the pages wholly committed since the last call to
   // the lane's file, and for a verify past spillFromTokens spills the pages
   // in it. Another request on the lane starts a file of its own. Throws
-  // metal::MetalAllocationError when the budget refuses a restore.
+  // metal::MetalAllocationError when the budget refuses a restore, which
+  // ready() before it avoids.
   void prepare(uint32_t stateLane, uint64_t requestId, uint64_t committedTokens, std::span<const uint32_t> pageTable,
                bool verify);
+  // Restores what prepare would for a command of `stateLane`'s request
+  // `requestId` that reads `pageTable`: granted, or the budget's refusal with
+  // every page left spilled (Model::readyKv).
+  [[nodiscard]] metal::AllocationResult ready(uint32_t stateLane, uint64_t requestId,
+                                              std::span<const uint32_t> pageTable, bool verify);
   // Between commands, before the next is prepared: gives back the K/V memory
   // of the extents whose pages all spilled and no transfer pins
   // (kv::PageStorage::releaseSpilledKv) and the caches of vacated lanes, and
@@ -157,7 +163,7 @@ private:
   void forgetBlocks(Lane &lane);
   [[nodiscard]] std::shared_ptr<File> openFile() const;
   void write(Lane &lane, std::span<const uint32_t> pageTable, uint32_t from, uint32_t to);
-  void restore(std::span<const uint32_t> pages);
+  [[nodiscard]] metal::AllocationResult restore(std::span<const uint32_t> pages);
   void read(uint32_t layer, std::span<const Miss> misses);
 
   metal::MetalBackend &backend_;

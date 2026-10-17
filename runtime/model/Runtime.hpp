@@ -59,6 +59,8 @@ public:
   [[nodiscard]] std::optional<std::string>
   provideMask(uint64_t requestId, std::span<const uint32_t> words) override;
   void end(uint64_t requestId) override;
+  [[nodiscard]] metal::AllocationResult readyKv(uint64_t requestId, std::span<const uint32_t> pageTable,
+                                                bool prefill) override;
 
   [[nodiscard]] WarmupStepResult warmupPrefill(uint32_t rows) override;
   [[nodiscard]] WarmupStepResult

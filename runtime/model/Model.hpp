@@ -650,6 +650,18 @@ public:
   [[nodiscard]] virtual std::optional<std::string>
   provideMask(uint64_t requestId, std::span<const uint32_t> words) = 0;
   virtual void end(uint64_t requestId) = 0;
+  // Before a command of the resident request: a model that gives KV memory
+  // back (--sparse-kv-memory) takes it again for the pages of `pageTable`
+  // the command reads through it, every one for a prefill. Granted, or the
+  // budget's refusal with nothing changed; the engine admits it as it admits
+  // the request's pages.
+  [[nodiscard]] virtual metal::AllocationResult readyKv(uint64_t requestId, std::span<const uint32_t> pageTable,
+                                                        bool prefill) {
+    (void)requestId;
+    (void)pageTable;
+    (void)prefill;
+    return {};
+  }
 };
 
 // Adds startup warmup and observability to the model interface.
