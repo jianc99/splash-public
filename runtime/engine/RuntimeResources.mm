@@ -289,7 +289,9 @@ std::string persistentCacheNamespace(const RuntimeCacheIdentity &identity,
   // key is pooled, normalized or rotated changes this line.
   if (kv.indexDimension)
     canonical << " index " << kv.indexDimension << " bf16 block " << SPLASH_ATTENTION_BLOCK_TOKENS;
-  canonical << '\n'
+  // How a slot holds a page; nothing for the spans' order, so the caches
+  // written before slots had another order stay valid.
+  canonical << KvPageTier::slotFormatToken(kv) << '\n'
             << "gdn " << gdn.layers << ' ' << gdn.convolutionHistory << ' '
             << gdn.convolutionChannels << ' ' << gdn.recurrentGroups << ' ' << gdn.recurrentRows
             << ' ' << gdn.recurrentColumns
@@ -514,7 +516,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
       const model::SparseRowStats stats = table->stats();
       logLine("Table ", stats.table, " streams from its file: ", stats.tableBytes / kMiB,
               " MiB stay on the SSD; row cache of ", stats.cacheCapacityRows, " rows in ",
-              table->committedBytes() / kMiB, " MiB, ", model::kWeightReaders, " readers.");
+              table->committedBytes() / kMiB, " MiB, ", model::kSsdReaders, " readers.");
     }
     if (const model::ExpertStore *experts = loaded.expertStore()) {
       const model::ExpertStoreStats stats = experts->stats();

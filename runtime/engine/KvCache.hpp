@@ -56,6 +56,11 @@ public:
     uint32_t physicalPage = noPage;
   };
 
+  // What moves a block's page from or to the tier: a restore, whose bytes
+  // are not valid until it lands (Filling), or a write, whose bytes are
+  // final (Draining). Either keeps the page where it is.
+  enum class Transfer : uint8_t { None, Filling, Draining };
+
   // Root first; noPage marks a disk-only block.
   struct Chain final {
     std::vector<uint64_t> blocks;
@@ -103,6 +108,13 @@ public:
 
   void retainActive(uint64_t blockId);
   void releaseActive(uint64_t blockId) noexcept;
+  // A request's reference to a page (KvPool::retainPage and releasePage,
+  // not as its owner), which marks the block on it held while any request
+  // holds the page: quota never gives a held block's copy up. Only a cache
+  // whose requests may spill (CacheSpillPolicy) holds blocks; on a layout
+  // that cannot, quota strips and evicts copies as it always has.
+  void holdPage(uint32_t page);
+  void unholdPage(uint32_t page);
   void touch(uint64_t blockId) noexcept;
 
   [[nodiscard]] Chain chain(uint64_t blockId) const;
@@ -139,6 +151,7 @@ public:
   // Resident, without resident children or users: its page can go.
   [[nodiscard]] bool residentLeaf(uint64_t blockId) const;
   void setTransferring(uint64_t blockId, bool transferring);
+  void setTransfer(uint64_t blockId, Transfer transfer);
   // Publishes the block's disk copy; a resident block may drop it with null.
   void setSlot(uint64_t blockId, std::shared_ptr<KvDiskSlot> slot);
   // Returns the page of a resident leaf that has a disk copy to the pool.

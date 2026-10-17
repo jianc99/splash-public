@@ -39,6 +39,15 @@ enum class Format : uint32_t { Int8 = 1, BFloat16 = 2 };
   return "invalid";
 }
 
+// What a pool page holds. A Full page holds its K/V and, with a block index
+// (Layout::indexDimension), its blocks' index; an Index page holds only the
+// index, its K/V living in the page's tier copy, which the request's reads
+// of spilled KV serve (model::SpilledKvReads). A page's form is its extent's:
+// a Full extent has a K/V buffer and an index buffer, an Index extent only
+// the index buffer. A layout that cannot spill (Layout::spillable) has only
+// Full pages.
+enum class PageForm : uint8_t { Full, Index };
+
 // A page whose content goes to another page.
 struct PageCopy final {
   uint32_t from = 0;
@@ -165,8 +174,26 @@ struct Layout final {
   [[nodiscard]] constexpr uint64_t indexBytesPerLayerPage() const noexcept {
     return uint64_t{kPageTokens} / SPLASH_ATTENTION_BLOCK_TOKENS * indexDimension * 2;
   }
-  [[nodiscard]] constexpr uint64_t bytesPerModelPage() const noexcept {
-    return uint64_t{attentionLayers} * (bytesPerLayerPage() + indexBytesPerLayerPage());
+  // A page's K/V and its index, in every layer.
+  [[nodiscard]] constexpr uint64_t kvBytesPerModelPage() const noexcept {
+    return uint64_t{attentionLayers} * bytesPerLayerPage();
+  }
+  [[nodiscard]] constexpr uint64_t indexBytesPerModelPage() const noexcept {
+    return uint64_t{attentionLayers} * indexBytesPerLayerPage();
+  }
+  // What a page of the form holds (PageForm).
+  [[nodiscard]] constexpr uint64_t bytesPerModelPage(PageForm form = PageForm::Full) const noexcept {
+    return (form == PageForm::Full ? kvBytesPerModelPage() : 0) + indexBytesPerModelPage();
+  }
+  // Whether a page's K/V can leave memory while its index stays (PageForm::
+  // Index): the layout has a block index, which selects the blocks a row
+  // reads; its values are token-major, so that a block's tokens are
+  // contiguous in every tensor; and a page holds whole location places
+  // (SPLASH_ATTENTION_LOCATION_BLOCK_BITS), so that a block read back sits at
+  // its own place in a page of the hot block cache.
+  [[nodiscard]] constexpr bool spillable() const noexcept {
+    return indexDimension && valuesTokenMajor &&
+           kPageTokens == SPLASH_ATTENTION_BLOCK_TOKENS << SPLASH_ATTENTION_LOCATION_BLOCK_BITS;
   }
 
   // An extent holds a whole number of these pages, so that every tensor

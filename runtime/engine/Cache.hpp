@@ -4,6 +4,8 @@
 #include "engine/KvPool.hpp"
 #include "engine/KvTier.hpp"
 #include "engine/StateCache.hpp"
+#include "engine/Types.hpp"
+#include "model/LatencyHistogram.hpp"
 #include "model/Model.hpp"
 #include "model/SlotFile.hpp"
 
@@ -119,6 +121,38 @@ struct CacheAdoption final {
   uint32_t dropped = 0;
 };
 
+// What spilling holds and did (/status kv_spill). Index pages, those of
+// spilled blocks, and their bytes in memory and on the tier; write-through
+// of Spill requests' pages: pages and bytes written, writes in flight and
+// failed, and a pause after the volume filled; pages that moved to the index
+// form and back, and blocks written again once their copy had gone;
+// restores of a page's index and of a whole page, and how long they took;
+// the quota of active KV, the slots of held blocks and the commitments of
+// Spill requests within it, and commitments revoked; the empty Index extent
+// kept for spilling at the memory limit.
+struct KvSpillSnapshot final {
+  uint32_t indexPages = 0;
+  uint64_t indexBytes = 0;
+  uint32_t spilledPages = 0;
+  uint64_t spilledBytes = 0;
+  uint64_t writeThroughPages = 0;
+  uint64_t writeThroughBytes = 0;
+  uint32_t writeThroughInFlight = 0;
+  uint64_t writeThroughFailures = 0;
+  bool writeThroughPaused = false;
+  uint64_t spillMoves = 0;
+  uint64_t unspills = 0;
+  uint64_t rewrites = 0;
+  uint64_t indexRestores = 0;
+  uint64_t wholeRestores = 0;
+  model::LatencyStats restore;
+  uint64_t activeLimitBytes = 0;
+  uint64_t heldBytes = 0;
+  uint64_t committedBytes = 0;
+  uint64_t revokedCommitments = 0;
+  uint64_t indexRunwayBytes = 0;
+};
+
 struct CacheSnapshot final {
   KvPoolSnapshot pool;
   StateCacheSnapshot stateCache;
@@ -155,8 +189,20 @@ struct TokenAdmission final {
 
 struct PageTableView final {
   std::span<const uint32_t> pages;
+  // Where each page reads its K/V (ModelBatchItem::pageSources); null while
+  // none holds only its index.
+  std::shared_ptr<const model::KvPageSources> sources;
   uint64_t revision = 0;
   uint32_t firstChanged = 0;
+};
+
+// What a spill-capable target's cache keeps Full for each request that
+// spills: the pages its rows read through page tables from the start (its
+// dense history, SparseKvShape), and the last pages it committed before its
+// open page (the tail window, at least its local rows').
+struct CacheSpillPolicy final {
+  uint32_t densePages = 0;
+  uint32_t windowPages = 0;
 };
 
 struct CacheReclaimResult final {
@@ -243,7 +289,12 @@ public:
   // makes the cache persistent: its copies are labelled for the next
   // process, and the quota keeps whole restore points by the recency of
   // their states (dropOldestPoint).
-  Cache(KvPool &pool, KvTier *kvTier, std::shared_ptr<model::DiskBudget> diskBudget);
+  // With a spill policy, on a layout that can spill (kv::Layout::spillable)
+  // and with a tier, requests may spill (KvMode::Spill), and the blocks
+  // requests hold keep their copies (KvCache::holdPage); without one, quota
+  // treats copies as it always has.
+  Cache(KvPool &pool, KvTier *kvTier, std::shared_ptr<model::DiskBudget> diskBudget,
+        std::optional<CacheSpillPolicy> spill = std::nullopt);
   Cache(const Cache &) = delete;
   Cache &operator=(const Cache &) = delete;
 
@@ -306,8 +357,38 @@ public:
   // The state at this block, in either tier, matches nothing any more and
   // leaves once nothing uses it.
   void invalidateState(uint64_t block) noexcept { states_.invalidate(block); }
-  void beginRequest(uint64_t requestId);
+  // A request begins in its mode; endRequest returns what remains of its
+  // commitment, as suspension does by ending it.
+  void beginRequest(uint64_t requestId, KvMode mode = KvMode::Resident);
   void endRequest(uint64_t requestId);
+
+  // Spilling. What the quota of active KV leaves for new commitments,
+  // without giving any copy up: activeLimit - held slots - committed.
+  [[nodiscard]] uint64_t spillRoom() const noexcept;
+  // Commits quota for `pages` pages of a Spill request, which each page it
+  // publishes then draws or returns (DiskBudget::commit); false, committing
+  // nothing, when spillRoom() cannot hold them.
+  [[nodiscard]] bool commitSpill(uint64_t requestId, uint32_t pages);
+  // Turns a Resident request whose growth was denied into a Spill request:
+  // checks the tier, the write budget and the room for `pages` pages,
+  // commits them and starts write-through of its published blocks. It
+  // allocates nothing; false, changing nothing, when spilling cannot relieve
+  // it.
+  [[nodiscard]] bool convertToSpill(uint64_t requestId, uint32_t pages);
+  // Starts writing Spill requests' published pages that have no copy, as
+  // the tier's share for them allows; returns the writes started.
+  uint32_t writeThrough();
+  // Between commands: moves the eligible pages whose copies landed to the
+  // index form, into free Index pages or the Index runway, then refills the
+  // runway, optionally. A refusal leaves the rest Full.
+  [[nodiscard]] TokenAdmission spillWritten();
+  // Pages of the form that transfers in flight will free: demotions, and
+  // for Full the eligible write-throughs that an Index page will take.
+  [[nodiscard]] uint32_t pendingPages(kv::PageForm form) const noexcept;
+  [[nodiscard]] bool holdsIndexPages(uint64_t requestId) const;
+  // The block's copy could not be read (ModelStepResult::unreadableKvBlocks):
+  // it matches nothing any more, and its copy goes with the block.
+  void poisonCopy(uint64_t block);
 
   // Scheduling probe only: does not pin, touch recency, or count a hit.
   [[nodiscard]] CacheProbe
@@ -348,6 +429,11 @@ public:
   // list, and the list differs from the one at revision - 1 from
   // firstChanged on.
   [[nodiscard]] PageTableView pageTable(uint64_t requestId) const;
+  // The page list a command of the request reads, once per lane and
+  // command: every change since the last cut makes one new revision, which
+  // differs from the last from the first page any of them changed, with its
+  // sources cut from there.
+  [[nodiscard]] PageTableView cutPageTable(uint64_t requestId);
 
   // Canonicalizes every newly complete Page32 block. A block whose parent,
   // tokens and identity match a cached one swaps the request to that block's
@@ -453,9 +539,11 @@ public:
   // demotion is in flight cover `pages` (the admission's additionalPages),
   // until, with KeepExtents, an evicted state has returned memory (the retry
   // may then grow the pool), or until nothing more of the class can go; one
-  // step instead of a retry per page.
+  // step instead of a retry per page. The pages are of the form, whose free
+  // and pending pages count, and empty extents of the other form go first.
   [[nodiscard]] CacheReclaimResult reclaimForPages(uint32_t pages, CacheReclaimMode mode,
-                                                   ReclaimClass upTo);
+                                                   ReclaimClass upTo,
+                                                   kv::PageForm form = kv::PageForm::Full);
   // The most pages reclaimForPages(pages, mode, upTo) can leave free: every
   // allocated page no request holds, but with Ordinary not the idle KV that
   // states in use restore through.
@@ -500,6 +588,10 @@ public:
     return states_.evictableStates(upTo == ReclaimClass::InUse);
   }
   [[nodiscard]] CacheSnapshot snapshot() const;
+  [[nodiscard]] KvSpillSnapshot spillSnapshot() const;
+  // Tests: std::logic_error unless the blocks, pages, references and quota
+  // keep every invariant spilling relies on.
+  void checkInvariants() const;
 
 private:
   // Matches the prompt's pages on from blocks.back() (from the root when
@@ -531,11 +623,6 @@ private:
 
   [[nodiscard]] Request &request(uint64_t requestId);
   [[nodiscard]] const Request &request(uint64_t requestId) const;
-  // Pages whose demotion is in flight; each keeps its page until the copy
-  // lands.
-  [[nodiscard]] uint32_t pendingPages() const noexcept {
-    return static_cast<uint32_t>(demotions_.size());
-  }
   // Pending, in every verdict below and in the results above, means the
   // same thing: a transfer in flight holds what this needs, and it comes
   // back when the transfer lands. Only transfersInFlight() may report it:

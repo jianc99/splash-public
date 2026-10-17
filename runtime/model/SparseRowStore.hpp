@@ -2,7 +2,7 @@
 
 // A large table of fixed-size native rows that stays in its source file and
 // is read a row at a time: a bounded host cache of rows, read on the model's
-// weight readers (model::WeightReaders), and the staging of one command's
+// SSD readers (model::SsdReaders), and the staging of one command's
 // rows into memory the GPU reads. Its user
 // names the table (SparseRowTable) and sizes the working memory of its
 // stages and prefetches (SparseRowStoreOptions). The store knows nothing of
@@ -19,7 +19,7 @@
 // expert's read-ahead.
 //
 // A row enters the cache only after the source file was checked unchanged
-// after it was read. A read is tried once more when it fails (WeightReaders).
+// after it was read. A read is tried once more when it fails (SsdReaders).
 // A stage's failed read, a short file, or a source written since it was
 // opened poisons the store: that stage and every later one throw
 // SparseRowError, and no row of the failing batch is cached. A prefetch is a
@@ -27,7 +27,7 @@
 // it again.
 
 #include "model/LatencyHistogram.hpp"
-#include "model/WeightReaders.hpp"
+#include "model/SsdReaders.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -84,7 +84,7 @@ struct SparseRowStoreOptions final {
   uint64_t cacheBytes = 0;
   // The readers its reads run on besides the staging thread, which a model's
   // streamed weights share.
-  std::shared_ptr<WeightReaders> readers;
+  std::shared_ptr<SsdReaders> readers;
   // The most rows prefetches may have queued or in flight, whose bytes are
   // working memory; more are dropped, and with 0 every one.
   uint32_t prefetchRows = 0;

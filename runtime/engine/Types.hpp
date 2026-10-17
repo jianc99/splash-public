@@ -25,6 +25,12 @@ struct StepResult final {
   DecodeStage nextDecodeStage = DecodeStage::Regular;
 };
 
+// Where a request's committed KV lives, chosen at admission and kept across
+// suspension: in memory (Resident), or, on a target that can spill, in the
+// SSD cache tier once its copies have landed, with memory keeping each
+// page's index (Spill).
+enum class KvMode : uint8_t { Resident, Spill };
+
 // Values are the Done event's reason byte.
 enum class EngineFinishReason : uint8_t {
   Stop = 0,
@@ -99,6 +105,10 @@ enum class LaneOutcome : uint8_t {
   InvalidMask,
   // The server left a token-mask request unanswered (Engine.cpp's limit).
   MaskTimeout,
+  // The SSD cache could not read back KV of an earlier part of the request
+  // (ModelStepResult::unreadableKvBlocks); its copies are given up, so a
+  // retry recomputes it.
+  KvUnreadable,
 };
 
 struct LaneOutcomeWire final {
@@ -123,6 +133,8 @@ laneOutcomeWire(LaneOutcome outcome) noexcept {
     return {"invalid_mask_response", false};
   case LaneOutcome::MaskTimeout:
     return {"mask_timeout", true};
+  case LaneOutcome::KvUnreadable:
+    return {"kv_unreadable", true};
   }
 }
 

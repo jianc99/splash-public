@@ -1,4 +1,4 @@
-// The order an expert arena's slots are recycled in (model::ExpertSlots): a
+// The order an expert arena's slots are recycled in (model::SlotRecycler): a
 // load never takes a slot of an expert it routes, and takes none when every
 // slot is its own; free slots are taken first, a freed one before them; a
 // long prefill chunk's scan of more experts than the slots leaves the experts
@@ -7,7 +7,7 @@
 // cycle routes keep hitting (recycling the least recently used slot keeps a
 // fifth of them).
 #include "TestChecks.hpp"
-#include "model/ExpertSlots.hpp"
+#include "model/SlotRecycler.hpp"
 
 #include <cstdint>
 #include <iostream>
@@ -16,7 +16,7 @@
 #include <stdexcept>
 #include <vector>
 
-using splash::model::ExpertSlots;
+using splash::model::SlotRecycler;
 using splash::test::rejects;
 using splash::test::require;
 
@@ -27,7 +27,7 @@ namespace {
 struct Arena final {
   explicit Arena(uint32_t slots) : order(slots), owner(slots, kFree) {}
   static constexpr uint64_t kFree = UINT64_MAX;
-  ExpertSlots order;
+  SlotRecycler order;
   std::map<uint64_t, uint32_t> slotOf;
   std::vector<uint64_t> owner;
   uint64_t load = 0;
@@ -54,7 +54,7 @@ struct Arena final {
 };
 
 void neverTakesTheLoadsOwn() {
-  ExpertSlots slots(8);
+  SlotRecycler slots(8);
   std::set<uint32_t> taken;
   for (uint64_t expert = 0; expert < 8; ++expert) taken.insert(slots.claim(expert, 1, false));
   require(taken.size() == 8, "one load took a slot twice");
@@ -68,7 +68,7 @@ void neverTakesTheLoadsOwn() {
 }
 
 void freeSlotsFirst() {
-  ExpertSlots slots(4);
+  SlotRecycler slots(4);
   for (uint64_t load = 1; load <= 4; ++load) static_cast<void>(slots.claim(load, load, false));
   slots.free(2);
   require(slots.claim(5, 5, false) == 2, "a freed slot was not taken first");
@@ -122,9 +122,9 @@ int main() {
     aScanSparesTheFrequent();
     aRoutedCoreOutlivesMoreLanes();
   } catch (const std::exception &error) {
-    std::cerr << "expert_slots_test: FAIL: " << error.what() << '\n';
+    std::cerr << "slot_recycler_test: FAIL: " << error.what() << '\n';
     return 1;
   }
-  std::cout << "expert_slots_test: PASS\n";
+  std::cout << "slot_recycler_test: PASS\n";
   return 0;
 }

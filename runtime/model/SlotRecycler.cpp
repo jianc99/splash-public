@@ -1,4 +1,4 @@
-#include "model/ExpertSlots.hpp"
+#include "model/SlotRecycler.hpp"
 
 #include <algorithm>
 #include <stdexcept>
@@ -10,29 +10,29 @@ constexpr uint32_t kNone = UINT32_MAX;
 
 } // namespace
 
-void ExpertSlots::Ghosts::add(uint64_t expert) {
+void SlotRecycler::Ghosts::add(uint64_t expert) {
   order.push_back(expert);
   where[expert] = std::prev(order.end());
 }
 
-void ExpertSlots::Ghosts::remove(uint64_t expert) {
+void SlotRecycler::Ghosts::remove(uint64_t expert) {
   if (const auto found = where.find(expert); found != where.end()) {
     order.erase(found->second);
     where.erase(found);
   }
 }
 
-void ExpertSlots::Ghosts::dropOldest() {
+void SlotRecycler::Ghosts::dropOldest() {
   where.erase(order.front());
   order.pop_front();
 }
 
-ExpertSlots::ExpertSlots(uint32_t slots)
+SlotRecycler::SlotRecycler(uint32_t slots)
     : list_(slots), scan_(slots), previous_(slots), next_(slots), expert_(slots), lastLoad_(slots) {
   reset();
 }
 
-void ExpertSlots::unlink(uint32_t slot) {
+void SlotRecycler::unlink(uint32_t slot) {
   Order &order = list_[slot] == Recent ? recent_ : frequent_;
   (previous_[slot] == kNone ? order.head : next_[previous_[slot]]) = next_[slot];
   (next_[slot] == kNone ? order.tail : previous_[next_[slot]]) = previous_[slot];
@@ -40,7 +40,7 @@ void ExpertSlots::unlink(uint32_t slot) {
   list_[slot] = Free;
 }
 
-void ExpertSlots::append(uint32_t slot, List list) {
+void SlotRecycler::append(uint32_t slot, List list) {
   Order &order = list == Recent ? recent_ : frequent_;
   list_[slot] = list;
   previous_[slot] = order.tail;
@@ -50,7 +50,7 @@ void ExpertSlots::append(uint32_t slot, List list) {
   ++order.count;
 }
 
-void ExpertSlots::prepend(uint32_t slot, List list) {
+void SlotRecycler::prepend(uint32_t slot, List list) {
   Order &order = list == Recent ? recent_ : frequent_;
   list_[slot] = list;
   next_[slot] = order.head;
@@ -60,20 +60,20 @@ void ExpertSlots::prepend(uint32_t slot, List list) {
   ++order.count;
 }
 
-uint32_t ExpertSlots::oldest(List list, uint64_t load) const {
+uint32_t SlotRecycler::oldest(List list, uint64_t load) const {
   uint32_t slot = list == Recent ? recent_.head : frequent_.head;
   while (slot != kNone && lastLoad_[slot] == load) slot = next_[slot];
   return slot;
 }
 
-void ExpertSlots::evict(uint32_t slot) {
+void SlotRecycler::evict(uint32_t slot) {
   const List list = List(list_[slot]);
   unlink(slot);
   if (!scan_[slot]) (list == Recent ? recentGhosts_ : frequentGhosts_).add(expert_[slot]);
   scan_[slot] = 0;
 }
 
-uint32_t ExpertSlots::replace(uint64_t expert, uint64_t load) {
+uint32_t SlotRecycler::replace(uint64_t expert, uint64_t load) {
   const bool fromRecent = recent_.count && (recent_.count > target_ ||
                                             (frequentGhosts_.holds(expert) && recent_.count == target_));
   uint32_t slot = oldest(fromRecent ? Recent : Frequent, load);
@@ -83,7 +83,7 @@ uint32_t ExpertSlots::replace(uint64_t expert, uint64_t load) {
   return slot;
 }
 
-void ExpertSlots::touch(uint32_t slot, uint64_t load, bool chunk) {
+void SlotRecycler::touch(uint32_t slot, uint64_t load, bool chunk) {
   lastLoad_[slot] = load;
   // A scan moves nothing; another route makes an expert of T1 frequent.
   if (chunk) return;
@@ -92,7 +92,7 @@ void ExpertSlots::touch(uint32_t slot, uint64_t load, bool chunk) {
   append(slot, Frequent);
 }
 
-uint32_t ExpertSlots::claim(uint64_t expert, uint64_t load, bool chunk) {
+uint32_t SlotRecycler::claim(uint64_t expert, uint64_t load, bool chunk) {
   const uint64_t slots = size();
   const auto take = [&](uint32_t replaced) {
     if (free_.empty()) return replaced == kNone ? replace(expert, load) : replaced;
@@ -147,7 +147,7 @@ uint32_t ExpertSlots::claim(uint64_t expert, uint64_t load, bool chunk) {
   return slot;
 }
 
-void ExpertSlots::free(uint32_t slot) {
+void SlotRecycler::free(uint32_t slot) {
   if (list_[slot] != Free) {
     unlink(slot);
     free_.push_back(slot);
@@ -156,7 +156,7 @@ void ExpertSlots::free(uint32_t slot) {
   lastLoad_[slot] = 0;
 }
 
-void ExpertSlots::reset() {
+void SlotRecycler::reset() {
   recent_ = frequent_ = {};
   recentGhosts_ = {};
   frequentGhosts_ = {};

@@ -51,8 +51,8 @@ TEST_ANE_FFN_CALIBRATION_ASAN := $(ENGINE_SANITIZER_BUILD)/ane-ffn-calibration-a
 TEST_ANE_FFN_CALIBRATION_TSAN := $(ENGINE_SANITIZER_BUILD)/ane-ffn-calibration-tsan
 TEST_SPARSE_ROW_STORE_ASAN := $(ENGINE_SANITIZER_BUILD)/sparse-row-store-asan-ubsan
 TEST_SPARSE_ROW_STORE_TSAN := $(ENGINE_SANITIZER_BUILD)/sparse-row-store-tsan
-TEST_WEIGHT_READERS_ASAN := $(ENGINE_SANITIZER_BUILD)/weight-readers-asan-ubsan
-TEST_WEIGHT_READERS_TSAN := $(ENGINE_SANITIZER_BUILD)/weight-readers-tsan
+TEST_SSD_READERS_ASAN := $(ENGINE_SANITIZER_BUILD)/ssd-readers-asan-ubsan
+TEST_SSD_READERS_TSAN := $(ENGINE_SANITIZER_BUILD)/ssd-readers-tsan
 TEST_MEMORY_TEST := $(ENGINE_TEST_BUILD)/engine-memory-plan
 TEST_VISION_PREPARATION := $(ENGINE_TEST_BUILD)/vision-preparation
 TEST_DRAFT_PREPARATION := $(ENGINE_TEST_BUILD)/draft-preparation
@@ -155,13 +155,13 @@ TEST_PRODUCTION_LIB := $(ENGINE_TEST_BUILD)/production-and-test.metallib
 
 TEST_SLOT_FILE := $(ENGINE_TEST_BUILD)/slot-file
 TEST_SPARSE_ROW_STORE := $(ENGINE_TEST_BUILD)/sparse-row-store
-TEST_WEIGHT_READERS := $(ENGINE_TEST_BUILD)/weight-readers
-TEST_EXPERT_SLOTS := $(ENGINE_TEST_BUILD)/expert-slots
+TEST_SSD_READERS := $(ENGINE_TEST_BUILD)/ssd-readers
+TEST_SLOT_RECYCLER := $(ENGINE_TEST_BUILD)/slot-recycler
 TEST_CACHE_DIRECTORY := $(ENGINE_TEST_BUILD)/cache-directory
 TEST_DISK_SPACE := $(ENGINE_TEST_BUILD)/disk-space
 TEST_PERSISTENT_CACHE := $(ENGINE_TEST_BUILD)/persistent-cache
 
-TEST_CPU_TARGETS := $(TEST_SLOT_FILE) $(TEST_SPARSE_ROW_STORE) $(TEST_WEIGHT_READERS) $(TEST_EXPERT_SLOTS) \
+TEST_CPU_TARGETS := $(TEST_SLOT_FILE) $(TEST_SPARSE_ROW_STORE) $(TEST_SSD_READERS) $(TEST_SLOT_RECYCLER) \
 	$(TEST_CACHE_DIRECTORY) $(TEST_DISK_SPACE) $(TEST_LEGACY_WEIGHT_CACHE) $(TEST_VISION_PREPARATION) $(TEST_SAFETENSORS_CHECKPOINT) $(TEST_WEIGHT_SOURCE) $(TEST_OPERATOR_WORKSPACE) \
 	$(TEST_MODEL_CONFIGURATION) \
 	$(TEST_GGUF_FILE) \
@@ -244,7 +244,7 @@ SANITIZER_CONFIG_TARGETS := $(TEST_SLOT_FILE_ASAN) $(TEST_SLOT_FILE_TSAN) \
 	$(TEST_FD_TRANSPORT_ASAN) $(TEST_FD_TRANSPORT_TSAN) \
 	$(TEST_ANE_FFN_CALIBRATION_ASAN) $(TEST_ANE_FFN_CALIBRATION_TSAN) \
 	$(TEST_SPARSE_ROW_STORE_ASAN) $(TEST_SPARSE_ROW_STORE_TSAN) \
-	$(TEST_WEIGHT_READERS_ASAN) $(TEST_WEIGHT_READERS_TSAN)
+	$(TEST_SSD_READERS_ASAN) $(TEST_SSD_READERS_TSAN)
 
 # Every native test, benchmark and tool depends on the engine's and the tests'
 # headers, and compiles and links its other prerequisites in the order it
@@ -263,7 +263,7 @@ $(ENGINE_TEST_BUILD) $(ENGINE_SANITIZER_BUILD):
 # library or a framework. Those that also run under the sanitizers list their
 # sources with the sanitizer builds.
 $(TEST_WEIGHT_SOURCE): dev/tests/engine/weight_source_test.cpp runtime/model/WeightSource.cpp
-$(TEST_EXPERT_SLOTS): dev/tests/engine/expert_slots_test.cpp runtime/model/ExpertSlots.cpp
+$(TEST_SLOT_RECYCLER): dev/tests/engine/slot_recycler_test.cpp runtime/model/SlotRecycler.cpp
 $(TEST_GGUF_FILE): dev/tests/engine/gguf_file_test.cpp runtime/model/GgufFile.cpp \
 		runtime/model/WeightSource.cpp
 $(TEST_MEMORY_TEST): runtime/metal/DeviceCapabilities.cpp \
@@ -303,7 +303,7 @@ $(TEST_WEIGHT_SOURCE) $(TEST_GGUF_FILE) $(TEST_MEMORY_TEST) $(TEST_KV_PAGE_CACHE
 		$(TEST_DRAFT_CONTEXT_PLAN_TEST) $(TEST_RAGGED_SCHEDULER_TEST) \
 		$(TEST_ELASTIC_KV_TEST) $(TEST_NATIVE_LOOP_TEST) $(TEST_METRICS_TEST) \
 		$(TEST_MEMORY_AUDIT_TEST) $(TEST_MEMORY_GOVERNOR_TEST) $(TEST_STATUS_TEST) \
-		$(TEST_Q8_CPU_TEST) $(TEST_SLOT_FILE) $(TEST_SPARSE_ROW_STORE) $(TEST_WEIGHT_READERS) $(TEST_EXPERT_SLOTS) \
+		$(TEST_Q8_CPU_TEST) $(TEST_SLOT_FILE) $(TEST_SPARSE_ROW_STORE) $(TEST_SSD_READERS) $(TEST_SLOT_RECYCLER) \
 		$(TEST_CACHE_DIRECTORY) $(TEST_DISK_SPACE) \
 		$(TEST_LEGACY_WEIGHT_CACHE) $(TEST_PERSISTENT_CACHE) $(TEST_ENGINE_CACHE_TEST) $(TEST_PROTOCOL_TEST) \
 		$(TEST_ENGINE_TEST) $(TEST_FD_TRANSPORT_TEST) $(TEST_ANE_FFN_CALIBRATION): | $(ENGINE_TEST_BUILD)
@@ -497,8 +497,8 @@ test-engine: test-engine-cpu test-engine-metal
 test-engine-cpu: $(TEST_CPU_TARGETS) $(TEST_ATTENTION_SWEEP)
 	$(TEST_SLOT_FILE)
 	$(TEST_SPARSE_ROW_STORE)
-	$(TEST_WEIGHT_READERS)
-	$(TEST_EXPERT_SLOTS)
+	$(TEST_SSD_READERS)
+	$(TEST_SLOT_RECYCLER)
 	$(TEST_CACHE_DIRECTORY)
 	$(TEST_DISK_SPACE)
 	$(TEST_LEGACY_WEIGHT_CACHE)
@@ -641,10 +641,10 @@ $(TEST_SLOT_FILE) $(TEST_SLOT_FILE_ASAN) $(TEST_SLOT_FILE_TSAN): \
 $(TEST_CACHE_DIRECTORY) $(TEST_CACHE_DIRECTORY_ASAN) $(TEST_CACHE_DIRECTORY_TSAN): \
 		runtime/engine/CacheDirectory.cpp dev/tests/engine/cache_directory_test.cpp
 $(TEST_SPARSE_ROW_STORE) $(TEST_SPARSE_ROW_STORE_ASAN) $(TEST_SPARSE_ROW_STORE_TSAN): \
-		runtime/model/SparseRowStore.cpp runtime/model/WeightReaders.cpp runtime/model/WeightSource.cpp \
+		runtime/model/SparseRowStore.cpp runtime/model/SsdReaders.cpp runtime/model/WeightSource.cpp \
 		dev/tests/engine/sparse_row_store_test.cpp
-$(TEST_WEIGHT_READERS) $(TEST_WEIGHT_READERS_ASAN) $(TEST_WEIGHT_READERS_TSAN): \
-		runtime/model/WeightReaders.cpp dev/tests/engine/weight_readers_test.cpp
+$(TEST_SSD_READERS) $(TEST_SSD_READERS_ASAN) $(TEST_SSD_READERS_TSAN): \
+		runtime/model/SsdReaders.cpp dev/tests/engine/ssd_readers_test.cpp
 $(TEST_PERSISTENT_CACHE) $(TEST_PERSISTENT_CACHE_ASAN) $(TEST_PERSISTENT_CACHE_TSAN): \
 		$(CACHE_SOURCES) runtime/model/SlotFile.cpp dev/tests/engine/persistent_cache_test.cpp
 $(TEST_ENGINE_CACHE_TEST) $(TEST_ENGINE_CACHE_ASAN) $(TEST_ENGINE_CACHE_TSAN): \
@@ -693,5 +693,5 @@ test-sanitizers: $(SANITIZER_CONFIG_TARGETS)
 	$(TSAN_TEST_ENV) $(TEST_ANE_FFN_CALIBRATION_TSAN)
 	$(ASAN_TEST_ENV) $(TEST_SPARSE_ROW_STORE_ASAN)
 	$(TSAN_TEST_ENV) $(TEST_SPARSE_ROW_STORE_TSAN)
-	$(ASAN_TEST_ENV) $(TEST_WEIGHT_READERS_ASAN)
-	$(TSAN_TEST_ENV) $(TEST_WEIGHT_READERS_TSAN)
+	$(ASAN_TEST_ENV) $(TEST_SSD_READERS_ASAN)
+	$(TSAN_TEST_ENV) $(TEST_SSD_READERS_TSAN)

@@ -23,7 +23,10 @@ class AneFfn;
 
 namespace splash::model {
 
+class KvBlockCache;
+class KvHistoryStream;
 class QwenStateStorage;
+class SsdReaders;
 class VisionLoader;
 
 using TargetWeights = std::variant<Qwen3_8Weights, Qwen3_6MoeWeights, Qwen4ExpWeights>;
@@ -34,10 +37,12 @@ using TargetWeights = std::variant<Qwen3_8Weights, Qwen3_6MoeWeights, Qwen4ExpWe
 // (model/SparseRowStore.hpp, --ple-memory). With expertMemoryBytes, a MoE
 // target's routed experts stream from their files through a store of that
 // many bytes (model/ExpertStore.hpp, --expert-memory). Other models load as
-// without them.
+// without them. Streamed weights read on `readers`, the engine's one pool of
+// SSD readers, which KV reads share.
 struct ModelLoadOptions final {
   uint64_t streamedTableBytes = 0;
   uint64_t expertMemoryBytes = 0;
+  std::shared_ptr<SsdReaders> readers;
 };
 
 struct LoadedModel final {
@@ -101,6 +106,11 @@ struct RuntimeContext final {
   const ops::ExecutionPlans &operators;
   // The prefill FFN's Neural Engine split (engine::startAneFfn), if any.
   ops::AneFfn *aneFfn = nullptr;
+  // The readers of a spill-capable target's spilled K/V, if any: the hot
+  // block cache its verifies resolve through, and the stream of its
+  // prefills' history.
+  KvBlockCache *blockCache = nullptr;
+  KvHistoryStream *historyStream = nullptr;
 };
 
 // Validates only the interface between independently defined target and draft

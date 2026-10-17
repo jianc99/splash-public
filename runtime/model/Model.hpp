@@ -15,11 +15,17 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace splash {
+
+namespace model {
+class KvPageSources;
+} // namespace model
 
 enum class WorkKind : uint8_t { Prefill, Decode };
 
@@ -351,6 +357,10 @@ struct ModelBatchItem final {
   // the one at revision - 1 below pageTableFirstChanged.
   uint64_t pageTableRevision = 0;
   uint32_t pageTableFirstChanged = 0;
+  // Where each page of the list reads its K/V from, cut with the list
+  // (engine::Cache::cutPageTable); null while no page holds only its index.
+  // The command keeps it until it completes.
+  std::shared_ptr<const model::KvPageSources> pageSources{};
   std::span<const uint32_t> inputTokens{};
   // A prefill chunk's states to capture, ascending: page-aligned boundaries in
   // (logicalPosition, logicalPosition + tokenCount], each one where the
@@ -387,6 +397,14 @@ struct ModelStepResult final {
   // state or emits output, and the rest of the batch stands. Broken
   // invariants and GPU faults stay exceptions and remain engine-fatal.
   std::string failure{};
+  // Set when the tier copies of blocks this lane read could not be read
+  // (model::KvPageSource::block), on a host step or anywhere else: a failed
+  // read is the lanes' that needed it, never an exception the engine dies
+  // of. The engine ends that one request as retryable
+  // (engine::LaneOutcome::KvUnreadable) before it publishes cache state or
+  // emits output, keeps the state it restored, which the failure says
+  // nothing of, and gives the copies up (engine::Cache::poisonCopy).
+  std::vector<uint64_t> unreadableKvBlocks{};
   // The request's first output token, which the step that completes its
   // prompt selected and left pending: the first decode cycle writes its KV row
   // and emits it first. Reported so that the engine can send it to the client
@@ -418,6 +436,10 @@ public:
   // steps: a streamed target's expert reads, which a prefill command pays
   // about whole whatever its rows.
   [[nodiscard]] virtual double hostMilliseconds() const noexcept { return 0.0; }
+  // Of hostMilliseconds, the time it waited on the reads of its history's
+  // spilled K/V (model::KvHistoryStream), which bound a streamed prefill
+  // command's length whatever its rows.
+  [[nodiscard]] virtual double streamMilliseconds() const noexcept { return 0.0; }
   // Fixed auxiliary work remains in wall latency but must not train the
   // text-prefill throughput estimate.
   [[nodiscard]] virtual bool prefillTimingIsRepresentative() const noexcept {
@@ -427,11 +449,102 @@ public:
 
 namespace model {
 
+// The attention of a block-sparse target, which lets its committed K/V leave
+// memory while each page keeps its blocks' index (kv::PageForm::Index): each
+// verify row of a lane attends at most selectedBlocks blocks of blockTokens
+// tokens. Rows that read the whole of a page table instead (a row with at
+// most denseHistoryTokens of history, its first sinkTokens and its last
+// localTokens) read only Full pages, which the cache keeps for them.
+struct SparseKvShape final {
+  uint32_t blockTokens = 0;
+  uint32_t selectedBlocks = 0;
+  uint32_t verifyRows = 0;
+  uint32_t denseHistoryTokens = 0;
+  uint32_t sinkTokens = 0;
+  uint32_t localTokens = 0;
+
+  bool operator==(const SparseKvShape &) const = default;
+};
+
 // Startup capabilities used for protocol sizing and admission independently
 // of target-specific headers.
 struct ModelCapabilities final {
   uint32_t vocabularySize = 0;
   uint32_t maximumContextTokens = 0;
+  // Set for a block-sparse target.
+  std::optional<SparseKvShape> sparseKv;
+};
+
+// A tier copy of one block's page, as reads of spilled K/V reach it on any
+// thread: engine::KvPageTier's slots, or a test's bytes.
+class KvCopy {
+public:
+  virtual ~KvCopy() = default;
+  // Unique in the process: the copy's one write (model::SlotFile::Slot::id).
+  [[nodiscard]] virtual uint64_t id() const noexcept = 0;
+  // `bytes` at `offset` of the copy, read into `buffer` (SlotFile::readAt
+  // says what it must hold), or nothing when they cannot be read.
+  [[nodiscard]] virtual std::optional<std::span<const std::byte>>
+  readAt(uint64_t offset, uint64_t bytes, std::span<std::byte> buffer) const noexcept = 0;
+};
+
+// Where a request's page reads its K/V: {} for a page that holds it
+// (kv::PageForm::Full), else the block on a page that holds only its index
+// (kv::PageForm::Index) and the tier copy that holds its K/V.
+struct KvPageSource final {
+  uint64_t block = 0;
+  std::shared_ptr<const KvCopy> copy;
+
+  [[nodiscard]] bool indexed() const noexcept { return block != 0; }
+};
+
+// A request's page sources at one page-table revision, immutable, in chunks
+// of kChunkPages pages that snapshots share: a cut copies only the chunks
+// from its first changed page on. Chunk c holds pages [c kChunkPages,
+// (c + 1) kChunkPages), the last chunk the rest, and counts its Index pages.
+class KvPageSources final {
+public:
+  static constexpr uint32_t kChunkPages = 256;
+  struct Chunk final {
+    std::array<KvPageSource, kChunkPages> pages{};
+    uint32_t indexPages = 0;
+  };
+
+  KvPageSources() = default;
+  // std::invalid_argument unless the chunks, none null, hold `pages` pages.
+  KvPageSources(std::vector<std::shared_ptr<const Chunk>> chunks, uint32_t pages)
+      : chunks_(std::move(chunks)), pages_(pages) {
+    if (chunks_.size() != (uint64_t{pages} + kChunkPages - 1) / kChunkPages)
+      throw std::invalid_argument("KV page sources do not hold their pages");
+    for (const std::shared_ptr<const Chunk> &chunk : chunks_) {
+      if (!chunk) throw std::invalid_argument("KV page sources hold a null chunk");
+      indexPages_ += chunk->indexPages;
+    }
+  }
+
+  [[nodiscard]] uint32_t size() const noexcept { return pages_; }
+  [[nodiscard]] uint32_t indexPages() const noexcept { return indexPages_; }
+  // A page past them reads its own K/V: one the command writes.
+  [[nodiscard]] const KvPageSource &operator[](uint32_t page) const noexcept {
+    static const KvPageSource own{};
+    return page < pages_ ? chunks_[page / kChunkPages]->pages[page % kChunkPages] : own;
+  }
+  [[nodiscard]] std::span<const std::shared_ptr<const Chunk>> chunks() const noexcept { return chunks_; }
+
+private:
+  std::vector<std::shared_ptr<const Chunk>> chunks_;
+  uint32_t pages_ = 0;
+  uint32_t indexPages_ = 0;
+};
+
+// Memory the model takes for a request between commands through the
+// engine's ordinary allocation loop (Engine::allocate): granted, or the
+// cause of the refusal, after which the engine reclaims and retries.
+struct ModelMemoryAdmission final {
+  bool ok = false;
+  metal::AllocationFailure allocationFailure = metal::AllocationFailure::None;
+
+  [[nodiscard]] bool granted() const noexcept { return ok; }
 };
 
 // A token mask row holds one bit per vocabulary token in 32-bit words.
@@ -617,6 +730,17 @@ public:
   [[nodiscard]] virtual std::shared_ptr<const CompositeState> snapshot(uint64_t requestId) = 0;
   // The bytes one cached state's buffers take.
   [[nodiscard]] virtual uint64_t snapshotBytes() const noexcept = 0;
+  // Memory for reads of a request's spilled K/V, taken between commands and
+  // held until it ends or is suspended; a model that reads none grants it at
+  // once, taking nothing. The hot block cache's floor for the request's lane,
+  // which decodes over Index pages (model::KvBlockCache::reserveLane); the
+  // staging of a prefill's history of `pages` pages, which holds Index
+  // pages (model::KvHistoryStream::reserve); and, optionally, one more
+  // extent of the hot block cache toward its planned size
+  // (model::KvBlockCache::growTowardTarget).
+  [[nodiscard]] virtual ModelMemoryAdmission reserveSpilledReads(uint64_t) { return {.ok = true}; }
+  [[nodiscard]] virtual ModelMemoryAdmission reserveHistoryStaging(uint64_t, uint32_t) { return {.ok = true}; }
+  [[nodiscard]] virtual ModelMemoryAdmission growSpilledReads() { return {.ok = true}; }
   // Whether the disk tier takes a state written from a lane now, for a
   // state in use or not, as CompositeState::canOffload. Room in the quota is
   // the write's own concern.
