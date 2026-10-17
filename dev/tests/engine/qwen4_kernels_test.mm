@@ -696,8 +696,9 @@ void qsaTest(MetalBackend &backend, QsaCase c) {
   ops::Qwen4::addQsaPool(graph, {upload(backend, blocks), counts, laneRecords, keys, pendingBefore}, keyNorm,
                          invFreqBuffer, qsaRows);
   const uint32_t scoreRows = lanes > 1 ? laneRows : 8;
+  // Poisoned bitmaps: the select writes every word a tile's lists read.
   MetalBuffer scores = scratch(backend, uint64_t{scoreRows} * stride * 4),
-              mask = scratch(backend, uint64_t{laneRows} * words * 4);
+              mask = upload(backend, std::vector<uint32_t>(uint64_t{laneRows} * words, ~0u));
   ops::Qwen4::addQsaSelect(graph, queries, scores, scoreRows, mask, qsaRows);
   // The commit after lane l retained a few of its rows.
   std::vector<uint32_t> retained;
@@ -768,8 +769,10 @@ void qsaTest(MetalBackend &backend, QsaCase c) {
     for (uint32_t r = 0; r < rows; ++r) {
       const uint32_t row = l * rows + r, position = x.first + r, complete = (position + 1) / 4;
       const auto got = [&](uint32_t b) { return bool((gotMask[uint64_t{row} * words + b / 32] >> (b % 32)) & 1); };
-      // The tail block and nothing past it; below the budget, every block.
-      for (uint32_t b = complete; b < words * 32; ++b) okMask &= got(b) == (b == complete);
+      // The tail block and nothing past it up to two blocks past the tail
+      // (a tile's last row's), in whole words; below the budget, every block.
+      const uint32_t written = std::min(words, (complete + 2) / 32 + 1);
+      for (uint32_t b = complete; b < written * 32; ++b) okMask &= got(b) == (b == complete);
       if (complete <= top) {
         for (uint32_t b = 0; b < complete; ++b) okMask &= got(b);
         continue;
@@ -1009,6 +1012,12 @@ int main(int argc, const char *argv[]) {
         // A verify step's lanes, sparse and causal rows among them.
         qsaTest(backend, {2050, 8, 512, 0, 4, 1021});
         qsaTest(backend, {700, 8, 160, 120, 3, 2});
+        // Rows 2045 to 2060 at Flash-Next's budget, the indexer's semantics
+        // across the dense-to-sparse transition: up to 2050 every block, from
+        // 2051 (513 complete blocks) the top 512, the tail in either case; a
+        // verify step whose lanes sit on both sides of it.
+        qsaTest(backend, {2061, 16, 512, 0, 1, 1023});
+        qsaTest(backend, {2047, 8, 512, 0, 4, 509});
         // Past 32 768 blocks, where each select thread owns two bitmap words.
         qsaTest(backend, {140000, 8, 512, 0, 1, 2047});
         qsaRollbackTest(backend);
