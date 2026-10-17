@@ -1760,6 +1760,27 @@ void hostStepSpinFallsBack(const std::string &metallibPath) {
     std::cout << "PASS awake host steps run as plain ones without a spin that sees its release\n";
 }
 
+// The buffers of a command before its last are committed as their encoding
+// ends: a host step after the first dispatch runs while the backend still
+// encodes the many dispatches after it, before submission returns.
+void earlyBuffersRunWhileTheRestEncodes(const std::string &metallibPath) {
+    constexpr uint32_t kDispatchesAfter = 20000;
+    MetalBackend backend(metallibPath);
+    MetalBuffer buffer = sharedBuffer(backend, sizeof(uint32_t));
+    auto *value = static_cast<volatile uint32_t *>(buffer.contents());
+    *value = 0;
+    const uint32_t count = 1, one = 1;
+    const std::vector<ComputeDispatch> dispatches(kDispatchesAfter + 1, addition(buffer, count, one));
+    std::atomic<bool> submitted{false}, ranBeforeSubmitted{false};
+    const std::vector<EventStep> steps{{1, {}, 0, EventStep::Kind::Host, [&] { ranBeforeSubmitted = !submitted; }}};
+    CommandTicket ticket = backend.submitCommandAsync(Command{dispatches, steps});
+    submitted = true;
+    (void)ticket.wait();
+    require(*value == kDispatchesAfter + 1 && ranBeforeSubmitted,
+            "a host step after a command's first buffer did not run before its submission returned");
+    std::cout << "PASS a command's early buffers run while the rest encodes\n";
+}
+
 // A host step that throws fails its command with its message once the
 // command ends; the work after it still runs, the backend is unhealthy, and
 // the failed command reports no round trip. A `timed` that throws leaves its
@@ -2161,6 +2182,7 @@ int main(int argc, const char *argv[]) {
             firstCommandWithAnAwakeHostStep(argv[1]);
             hostSteps(argv[1]);
             hostStepSpinFallsBack(argv[1]);
+            earlyBuffersRunWhileTheRestEncodes(argv[1]);
             throwingHostStepFailsItsCommand(argv[1]);
             hostStepAfterALongWait(argv[1]);
             blockedHostStepRunnerStops(argv[1]);

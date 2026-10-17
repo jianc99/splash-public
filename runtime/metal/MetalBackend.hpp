@@ -405,12 +405,13 @@ public:
   [[nodiscard]] CommandTiming submit(const ComputeDispatch &dispatch);
 
   // Encodes a command into Metal command buffers, one plus one per buffer its
-  // event steps add (EventStep), and commits them without waiting. The completion
-  // callback only notifies host control flow; command results and errors are
-  // consumed from the returned ticket, which reports the error of the first
-  // of its buffers that failed. A second command is rejected until wait()
-  // consumes the first ticket, preserving the one-in-flight runtime
-  // invariant.
+  // event steps add (EventStep), and commits each as its encoding ends,
+  // without waiting: the GPU runs the work before an event step while the
+  // work after it is still encoded. The completion callback only notifies
+  // host control flow; command results and errors are consumed from the
+  // returned ticket, which reports the error of the first of its buffers that
+  // failed. A second command is rejected until wait() consumes the first
+  // ticket, preserving the one-in-flight runtime invariant.
   [[nodiscard]] CommandTicket
   submitCommandAsync(const Command &command, CommandCompletion completion = {});
   // A command of these dispatches without event steps: one command buffer.
