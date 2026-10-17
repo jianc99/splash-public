@@ -65,7 +65,7 @@ std::vector<uint8_t> slice(const std::vector<uint8_t> &bytes, uint64_t offset, u
 // and the embedding's.
 void loadImages(MetalBackend &backend, model::WeightImages &images, const std::filesystem::path &path,
                 const model::QwenTargetDimensions &geometry) {
-  model::GgufTargetLoader loader(backend, images, path, geometry);
+  model::GgufTargetLoader loader(backend, images, {path}, geometry);
   for (uint32_t layer = 0; layer < geometry.layers; ++layer) static_cast<void>(loader.layer(layer));
   static_cast<void>(loader.head());
   static_cast<void>(loader.embedding());
@@ -398,7 +398,7 @@ void checkDenseTarget(MetalBackend &backend, const std::filesystem::path &direct
                                    {"token_embd.weight", kIQ4_XS}}),
             layout);
   model::WeightImages images(backend, "fixture");
-  model::GgufTargetLoader files(backend, images, model::findTargetGguf(target), layout);
+  model::GgufTargetLoader files(backend, images, model::findTargetGgufs(target), layout);
   const model::Qwen3_8Weights weights = model::loadQwen3_8Weights(backend, layout, files);
   check(weights.layers.size() == layout.layers, "GGUF target: every layer");
   check(weights.finalNorm.float32, "GGUF target: F32 final norm");

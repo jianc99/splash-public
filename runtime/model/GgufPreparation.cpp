@@ -389,7 +389,7 @@ RepackChunk repackChunk(const gguf::Repack &repack) {
 // shape, sources of its row width and planes inside the image.
 void requireRepack(const gguf::Repack &repack, uint64_t imageBytes) {
   if (repack.format >= GGUF_FMT_COUNT || !repack.rows || repack.rows % QUANT_TILE_ROWS || !repack.columns ||
-      repack.columns % kGgufBlockColumns)
+      repack.columns % ggufColumnUnit(kQuantFormats[repack.format]))
     throw GgufError("invalid prepared weight repack");
   const QuantFormat &format = kQuantFormats[repack.format];
   const uint64_t rowBytes = ggufRowBytes(format, repack.columns);
