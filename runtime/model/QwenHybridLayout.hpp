@@ -50,13 +50,16 @@ struct QwenTargetDimensions {
   uint32_t experts = 0;
   uint32_t expertsPerToken = 0;
   uint32_t expertIntermediateSize = 0;
-  // What a family may add, zero where it has none (Qwen3.8-Flash-Next,
-  // model/Qwen4Exp.hpp, has all three): hyper-connected streams
-  // (hyperConnected), the residual's streams and the mixes' low rank; a QSA
-  // indexer (hasIndexer), its heads of indexerHeadDimension values, past
+  // Qwen3.8-Flash-Next's additions (model/Qwen4Exp.hpp), which its family
+  // takes together and the Qwen3.5 families leave zero: hyper-connected
+  // streams (hyperConnected), the residual's streams and the mixes' low rank;
+  // a QSA indexer (hasIndexer), its heads of indexerHeadDimension values, past
   // indexerTopBlocks blocks of indexerBlockTokens tokens of which a row
   // attends sparsely; and a PLE n-gram embedding (hasPle), its layer, n-gram
-  // size, heads per n-gram, head width and convolution taps.
+  // size, heads per n-gram, head width and convolution taps. Shared code
+  // reads them only where zero means none: the KV pages' index region, a
+  // state cell's PLE history and the rows a mixer adds to (kvLayout,
+  // gdnStateLayout, QwenTargetGeometry::mixersAddToHidden).
   uint32_t hyperConnections = 0;
   uint32_t hyperRank = 0;
   uint32_t indexerHeads = 0;

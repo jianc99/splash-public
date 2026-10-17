@@ -437,10 +437,9 @@ struct HybridGguf final {
 };
 
 // Qwen3.8-Flash-Next's GGUFs (qwen4exp): hyper-connection mixes in place of
-// the hybrid's norms, a QSA indexer after each full-attention mixer, and,
-// when the target has one, the PLE n-gram embedding: its projections, norms
-// and convolution after its layer's FFN, and its table in an image of its
-// own.
+// the hybrid's norms, a QSA indexer after each full-attention mixer, and the
+// PLE n-gram embedding: its projections, norms and convolution after its
+// layer's FFN, and its table in an image of its own.
 struct Qwen4ExpGguf final {
   static constexpr std::string_view architecture = "qwen4exp";
 
@@ -450,7 +449,6 @@ struct Qwen4ExpGguf final {
     expect("attention.indexer.head_count", g.indexerHeads);
     expect("attention.indexer.key_length", g.indexerHeadDimension);
     expect("attention.indexer.top_k", g.indexerTokens());
-    if (!g.hasPle()) return;
     expect("ple.ngram_size", g.pleNgram);
     expect("ple.heads_per_ngram", g.pleHeadsPerNgram);
     expect("ple.conv_kernel", g.pleConvolutionTaps);
@@ -468,11 +466,9 @@ struct Qwen4ExpGguf final {
     for (uint32_t layer = 0; ratiosMatch && layer < g.layers; ++layer)
       ratiosMatch = (*ratios)[layer] == (g.isFullAttentionLayer(layer) ? g.indexerBlockTokens : 0);
     if (!ratiosMatch) mismatched += "attention.compress_ratios";
-    if (g.hasPle()) {
-      const auto layers = file.numericArray(arch + ".ple.layers");
-      if (!layers || layers->size() != 1 || (*layers)[0] != g.pleLayer)
-        mismatched += (mismatched.empty() ? "" : ", ") + std::string("ple.layers");
-    }
+    const auto layers = file.numericArray(arch + ".ple.layers");
+    if (!layers || layers->size() != 1 || (*layers)[0] != g.pleLayer)
+      mismatched += (mismatched.empty() ? "" : ", ") + std::string("ple.layers");
     if (!mismatched.empty()) throw GgufError("GGUF metadata does not match the target: " + mismatched);
   }
 
@@ -489,7 +485,7 @@ struct Qwen4ExpGguf final {
     }
     hyperImage(b, g, p + "hc_ffn", true);
     ffnImage(b, g, p);
-    if (!g.hasPle() || index != g.pleLayer) return;
+    if (index != g.pleLayer) return;
     const uint64_t streams = g.streamWidth();
     b.quantized(p + "ple_key.weight", streams, g.pleWidth());
     b.quantized(p + "ple_value.weight", g.hiddenSize, g.pleWidth());
@@ -506,7 +502,6 @@ struct Qwen4ExpGguf final {
   // the plan reads was found (planImages names those it misses first).
   static void tables(const GgufFile &file, const QwenTargetDimensions &g, PlanOptions options,
                      std::vector<std::string> &problems, std::vector<Image> &images) {
-    if (!g.hasPle()) return;
     const std::string table = "per_layer_token_embd.weight";
     Builder b(file, g, problems, "ple.bin", g.pleLayer, kTableImageType);
     b.nativeTable(table, g.pleHeadDimension);
