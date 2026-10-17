@@ -67,7 +67,9 @@ struct Tensor final {
   bool carried;
 };
 
-std::vector<Tensor> tensors(const QwenTargetGeometry &g, uint32_t scoreRows) {
+// A streamed PLE table's rows are `pleRowBytes` each (zero for a table in
+// memory).
+std::vector<Tensor> tensors(const QwenTargetGeometry &g, uint64_t pleRowBytes, uint32_t scoreRows) {
   std::vector<Tensor> result{
       {&Qwen4Scratch::streams, bytesFor<float>(g.streamWidth()), 0, true},
       {&Qwen4Scratch::normalized, bytesFor<uint16_t>(g.streamWidth()), 0, false},
@@ -95,9 +97,9 @@ std::vector<Tensor> tensors(const QwenTargetGeometry &g, uint32_t scoreRows) {
   };
   // A streamed table's step stages up to every row id's row, each distinct
   // one once, and each id's slot.
-  if (g.pleStreamRowBytes) {
+  if (pleRowBytes) {
     result.push_back({&Qwen4Scratch::pleSlots, bytesFor<uint32_t>(g.pleHeads()), 0, true});
-    result.push_back({&Qwen4Scratch::pleStaging, uint64_t{g.pleHeads()} * g.pleStreamRowBytes, 0, true});
+    result.push_back({&Qwen4Scratch::pleStaging, uint64_t{g.pleHeads()} * pleRowBytes, 0, true});
   }
   return result;
 }
@@ -113,12 +115,13 @@ struct Layout final {
   uint64_t decodeBytes = 0;
 };
 
-Layout layout(const QwenTargetGeometry &g, uint32_t chunks) {
+Layout layout(const QwenTargetGeometry &g, uint64_t pleRowBytes, uint32_t chunks) {
   Layout result;
-  for (const Tensor &tensor : tensors(g, kPrefillScoreRows))
+  for (const Tensor &tensor : tensors(g, pleRowBytes, kPrefillScoreRows))
     result.prefillBlocks += alignUp(bytesOf(tensor, kChunkRows)) * (tensor.carried ? chunks : 1);
   result.prefillBytes = result.prefillBlocks + alignUp(kChunkBlockBytes) * chunks;
-  for (const Tensor &tensor : tensors(g, kStepRows)) result.decodeBlocks += alignUp(bytesOf(tensor, kStepRows));
+  for (const Tensor &tensor : tensors(g, pleRowBytes, kStepRows))
+    result.decodeBlocks += alignUp(bytesOf(tensor, kStepRows));
   result.decodePrior = result.decodeBlocks + alignUp(kLanes * kLaneBlockBytes);
   result.decodeBytes = result.decodePrior + alignUp(bytesFor<uint32_t>(kLanes * priorCount(g)));
   return result;
@@ -140,28 +143,34 @@ void writeBlocks(uint64_t position, uint32_t rows, const QwenTargetRequest &requ
   }
 }
 
+// The bytes of a row the PLE table streams, which a step stages; none for a
+// table in memory.
+uint64_t pleRowBytes(const Qwen4ExpWeights &weights) {
+  return weights.pleStore ? weights.pleStore->table().rowBytes : 0;
+}
+
 } // namespace
 
 Qwen4Steps::Qwen4Steps(const Qwen4ExpWeights &weights, const QwenTargetGeometry &geometry,
                        metal::MetalBackend &backend, uint32_t prefillChunks)
-    : weights_(weights), geometry_(geometry), backend_(backend), prefillChunks_(prefillChunks) {
+    : weights_(weights), geometry_(geometry), backend_(backend), prefillChunks_(prefillChunks),
+      pleRowBytes_(pleRowBytes(weights)) {
   // The hash keeps at most QWEN4_PLE_MAXIMUM_NGRAM tokens of a row's n-grams.
-  if (!prefillChunks_ || static_cast<bool>(weights_.pleStore) != static_cast<bool>(geometry_.pleStreamRowBytes) ||
-      geometry_.pleNgram < 2 || geometry_.pleNgram > QWEN4_PLE_MAXIMUM_NGRAM)
+  if (!prefillChunks_ || geometry_.pleNgram < 2 || geometry_.pleNgram > QWEN4_PLE_MAXIMUM_NGRAM)
     throw std::invalid_argument("invalid Qwen3.8-Flash-Next step geometry");
-  const Layout bytes = layout(geometry_, prefillChunks_);
+  const Layout bytes = layout(geometry_, pleRowBytes_, prefillChunks_);
   prefill_ = backend_.allocateBuffer(bytes.prefillBytes, metal::BufferStorage::Shared, "qwen4-prefill-scratch");
   decode_ = backend_.allocateBuffer(bytes.decodeBytes, metal::BufferStorage::Shared, "qwen4-decode-scratch");
   prefillBlocksOffset_ = bytes.prefillBlocks;
   decodeBlocksOffset_ = bytes.decodeBlocks;
   decodePriorOffset_ = bytes.decodePrior;
   uint64_t cursor = 0;
-  for (const Tensor &tensor : tensors(geometry_, kPrefillScoreRows)) {
+  for (const Tensor &tensor : tensors(geometry_, pleRowBytes_, kPrefillScoreRows)) {
     prefillTensors_.push_back({tensor.field, tensor.rowBytes, tensor.fixedBytes, tensor.carried, cursor});
     cursor += alignUp(bytesOf(tensor, kChunkRows)) * (tensor.carried ? prefillChunks_ : 1);
   }
   cursor = 0;
-  for (const Tensor &tensor : tensors(geometry_, kStepRows)) {
+  for (const Tensor &tensor : tensors(geometry_, pleRowBytes_, kStepRows)) {
     decodeTensors_.push_back({tensor.field, tensor.rowBytes, tensor.fixedBytes, tensor.carried, cursor});
     cursor += alignUp(bytesOf(tensor, kStepRows));
   }
@@ -170,8 +179,9 @@ Qwen4Steps::Qwen4Steps(const Qwen4ExpWeights &weights, const QwenTargetGeometry 
     std::memset(zeros.contents(), 0, zeros.sizeBytes());
 }
 
-QwenTargetScratchBytes Qwen4Steps::scratchBytes(const QwenTargetGeometry &geometry, uint32_t prefillChunks) {
-  const Layout bytes = layout(geometry, prefillChunks);
+QwenTargetScratchBytes Qwen4Steps::scratchBytes(const Qwen4ExpWeights &weights, const QwenTargetGeometry &geometry,
+                                                uint32_t prefillChunks) {
+  const Layout bytes = layout(geometry, pleRowBytes(weights), prefillChunks);
   return {bytes.prefillBytes, bytes.decodeBytes};
 }
 
@@ -220,7 +230,7 @@ std::vector<Qwen4Blocks> Qwen4Steps::preparePrefill(uint32_t index, const QwenTa
   }
   // A chunk's rows at once, so that its lanes share their rows.
   if (weights_.pleStore)
-    stage(*weights_.pleStore, geometry_.pleStreamRowBytes, scratch, chunk.rows * geometry_.pleHeads(), true);
+    stage(*weights_.pleStore, pleRowBytes_, scratch, chunk.rows * geometry_.pleHeads(), true);
   return blocks;
 }
 
@@ -315,7 +325,7 @@ void Qwen4Steps::addVerifyInput(metal::CommandGraph &graph, metal::MetalBuffer t
   // cache, so its host step is short and keeps the GPU awake
   // (metal::EventStep::awake).
   if (weights_.pleStore)
-    graph.host([store = weights_.pleStore, rowBytes = geometry_.pleStreamRowBytes, scratch,
+    graph.host([store = weights_.pleStore, rowBytes = pleRowBytes_, scratch,
                 count = params.rows * heads] { stage(*store, rowBytes, scratch, count, false); },
                {}, true);
 }

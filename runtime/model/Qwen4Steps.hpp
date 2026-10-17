@@ -1,16 +1,16 @@
 #pragma once
 
 // What Qwen3.8-Flash-Next (model/Qwen4Exp.hpp) needs of a step beyond its
-// weights and the buffers every Qwen target binds, which QwenTarget keeps for
-// it: the scratch of its hyper-connected streams, its PLE layer and its QSA
-// attention, and the inputs it makes of a step's tokens on the CPU. Those are
-// the PLE rows of prompt rows (the n-gram hashes of their tokens), the tokens
-// before a decode lane's rows (from which the GPU hashes the rows' PLE rows,
-// since only it has their proposals), the QSA blocks a step's rows complete,
-// and, when the PLE table streams from its file (--ple-ssd-cache), each
-// step's PLE rows staged from the table: a prefill's before its command is
-// submitted, a verify's in a host step of its command, between the hash and
-// the gather.
+// weights and the buffers every Qwen target binds, which its target keeps
+// (model/Qwen4ExpTarget.hpp): the scratch of its hyper-connected streams, its
+// PLE layer and its QSA attention, and the inputs it makes of a step's tokens
+// on the CPU. Those are the PLE rows of prompt rows (the n-gram hashes of
+// their tokens), the tokens before a decode lane's rows (from which the GPU
+// hashes the rows' PLE rows, since only it has their proposals), the QSA
+// blocks a step's rows complete, and, when the PLE table streams from its
+// file (--ple-ssd-cache), each step's PLE rows staged from the table: a
+// prefill's before its command is submitted, a verify's in a host step of its
+// command, between the hash and the gather.
 
 #include "model/QwenTarget.hpp"
 
@@ -90,7 +90,8 @@ public:
   // Scratch for prefill commands of up to `prefillChunks` chunks.
   Qwen4Steps(const Qwen4ExpWeights &weights, const QwenTargetGeometry &geometry, metal::MetalBackend &backend,
              uint32_t prefillChunks);
-  [[nodiscard]] static QwenTargetScratchBytes scratchBytes(const QwenTargetGeometry &geometry,
+  [[nodiscard]] static QwenTargetScratchBytes scratchBytes(const Qwen4ExpWeights &weights,
+                                                           const QwenTargetGeometry &geometry,
                                                            uint32_t prefillChunks);
   // What the constructor allocated, scratchBytes' of its geometry.
   [[nodiscard]] QwenTargetScratchBytes allocatedBytes() const noexcept;
@@ -107,8 +108,8 @@ public:
   // cache while the command runs, where the next command's stage finds them.
   void readAhead(std::span<const QwenTargetPrefillChunk> chunks);
 
-  // The scratch of a decode step's first `rows` rows (QwenTarget's storage
-  // rows of the step).
+  // The scratch of a decode step's first `rows` rows (the target's storage
+  // rows of the step, QwenTarget::decodeStorageLanes).
   [[nodiscard]] Qwen4Scratch verifyScratch(uint32_t rows) const;
   // Writes batch lane `lane`'s inputs of its verify rows from `position` on:
   // the tokens before them and the QSA blocks they complete.
@@ -146,6 +147,9 @@ private:
   QwenTargetGeometry geometry_;
   metal::MetalBackend &backend_;
   uint32_t prefillChunks_ = 0;
+  // The bytes of a row of a streamed PLE table, which a step stages; zero
+  // for a table in memory.
+  uint64_t pleRowBytes_ = 0;
   // The prefill scratch: its tensors, a carried one's per chunk, then each
   // chunk's QSA blocks from byte prefillBlocksOffset_. The decode scratch:
   // its tensors for a step's most rows, then each lane's QSA blocks from byte

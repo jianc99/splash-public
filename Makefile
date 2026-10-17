@@ -289,6 +289,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/model/Qwen3_8.cpp \
 	runtime/model/Qwen4Exp.cpp \
 	runtime/model/Qwen4Steps.cpp \
+	runtime/model/Qwen4ExpTarget.cpp \
 	runtime/model/QwenVision.cpp \
 	runtime/model/VisionPreparation.cpp \
 	runtime/model/VisionLoader.cpp \

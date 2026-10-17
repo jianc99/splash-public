@@ -128,7 +128,7 @@ struct Qwen4IndexerWeights final {
 
 // The PLE layer's projections of the gathered n-gram rows, its norms (each
 // streamWidth() F32 multipliers) and its dilated convolution's taps
-// ([taps][streamWidth()] F32).
+// ([streamWidth()][taps] F32: a channel's taps are adjacent).
 struct Qwen4PleWeights final {
   ops::Projection key;
   ops::Projection value;
@@ -150,7 +150,7 @@ struct Qwen4ExpLayerWeights final {
 struct Qwen4ExpWeights final : QwenTargetWeightsBase {
   Qwen4ExpLayout layout;
   std::vector<Qwen4ExpLayerWeights> layers;
-  // The last mix, which feeds the head (finalNorm is unused).
+  // The last mix, which feeds the head in place of a final norm.
   Qwen4HyperWeights finalHyper;
   // The PLE table's native rows of pleHeadDimension values; empty when the
   // table streams from its file (--ple-ssd-cache), where pleStore reads the
@@ -163,5 +163,19 @@ struct Qwen4ExpWeights final : QwenTargetWeightsBase {
 
 [[nodiscard]] Qwen4ExpWeights loadQwen4ExpWeights(metal::MetalBackend &backend, Qwen4ExpLayout layout,
                                                   const QwenTargetFiles &files);
+
+// The family's target (model/Qwen4ExpTarget.hpp), whose prefill commands run
+// up to `prefillChunks` chunks; the step scratch it keeps itself; and the
+// projections its hyper-connection mixes, QSA indexers and PLE layer
+// dispatch (qwenTargetGeometry).
+[[nodiscard]] std::unique_ptr<QwenTarget> makeQwenTarget(const Qwen4ExpWeights &weights,
+                                                         const QwenTargetGeometry &geometry,
+                                                         metal::MetalBackend &backend,
+                                                         const ops::ExecutionPlans &operators,
+                                                         uint32_t prefillChunks);
+[[nodiscard]] QwenTargetScratchBytes qwenTargetScratchBytes(const Qwen4ExpWeights &weights,
+                                                            const QwenTargetGeometry &geometry,
+                                                            uint32_t prefillChunks);
+void includeFamilyProjections(QwenTargetGeometry &geometry, const Qwen4ExpWeights &weights);
 
 } // namespace splash::model
