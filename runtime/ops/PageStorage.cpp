@@ -126,15 +126,12 @@ void PageStorage::clearPages(std::span<const uint32_t> pages) {
     }
 }
 
-PageStorage::IndexPlacement PageStorage::indexPlacement(uint32_t layer) const {
+uint32_t PageStorage::indexOffset(uint32_t layer) const {
     if (!layout_.indexDimension || layer >= layout_.attentionLayers)
         throw std::out_of_range("KV layer has no QSA index region");
-    // After every layer's K/V region: per layer the keys of every page,
-    // then their pooled keys.
+    // After every layer's K/V region, a region per layer.
     const uint64_t first = uint64_t{extentPages_} * layout_.attentionLayers * layout_.bytesPerLayerPage();
-    const uint64_t keys = first + uint64_t{extentPages_} * layer * layout_.indexBytesPerLayerPage();
-    const uint64_t pooled = keys + uint64_t{extentPages_} * layout_.indexKeyBytesPerLayerPage();
-    return {static_cast<uint32_t>(keys), static_cast<uint32_t>(pooled)};
+    return static_cast<uint32_t>(first + uint64_t{extentPages_} * layer * layout_.indexBytesPerLayerPage());
 }
 
 SplashKvPage PageStorage::entry(uint32_t page) const {
@@ -175,7 +172,7 @@ std::vector<std::span<std::byte>> PageStorage::spans(uint32_t page) const {
     const auto scale = static_cast<uint32_t>(layout_.scaleBytesPerLayerPage());
     const uint32_t index = page % extentPages_;
     std::vector<std::span<std::byte>> result;
-    result.reserve(size_t{layout_.attentionLayers} * ((scale ? 4 : 2) + (layout_.indexDimension ? 2 : 0)));
+    result.reserve(size_t{layout_.attentionLayers} * ((scale ? 4 : 2) + (layout_.indexDimension ? 1 : 0)));
     for (uint32_t layer = 0; layer < layout_.attentionLayers; ++layer) {
         for (uint32_t tensor = SPLASH_KV_KEYS; tensor <= SPLASH_KV_VALUE_SCALES;
              ++tensor) {
@@ -188,13 +185,9 @@ std::vector<std::span<std::byte>> PageStorage::spans(uint32_t page) const {
         }
     }
     if (layout_.indexDimension) {
-        const uint64_t keys = layout_.indexKeyBytesPerLayerPage();
-        const uint64_t pooled = layout_.indexPooledBytesPerLayerPage();
-        for (uint32_t layer = 0; layer < layout_.attentionLayers; ++layer) {
-            const IndexPlacement placement = indexPlacement(layer);
-            result.emplace_back(extent + placement.keysOffset + index * keys, keys);
-            result.emplace_back(extent + placement.pooledOffset + index * pooled, pooled);
-        }
+        const uint64_t bytes = layout_.indexBytesPerLayerPage();
+        for (uint32_t layer = 0; layer < layout_.attentionLayers; ++layer)
+            result.emplace_back(extent + indexOffset(layer) + index * bytes, bytes);
     }
     return result;
 }
