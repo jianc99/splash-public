@@ -13,9 +13,6 @@
 
 namespace splash::ops {
 
-static_assert(kv::Layout::kIndexBlockTokens == SPLASH_ATTENTION_BLOCK_TOKENS,
-              "the index pools the blocks sparse attention reads");
-
 namespace {
 
 enum class KernelLayout : uint8_t { Kv4Group6, Kv2Group8, Kv2Group12 };

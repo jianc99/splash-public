@@ -1,6 +1,7 @@
 #pragma once
 
 #include "metal/abi/ExecutionGeometry.h"
+#include "metal/abi/PagedAttention.h"
 #include "metal/MetalBackend.hpp"
 
 #include <algorithm>
@@ -124,13 +125,14 @@ struct Layout final {
   uint32_t kvHeads = 0;
   uint32_t headDimension = 0;
   Format format = Format::Int8;
-  // Qwen3.8-Flash-Next's QSA: each page also holds, per layer, its tokens'
-  // indexer keys of this many values (bf16 [token][dimension]) and the
-  // pooled keys of its blocks of kIndexBlockTokens tokens (bf16 [block]
-  // [dimension]), in index regions after every layer's K/V region
-  // (PageStorage::indexPlacement).
+  // A QSA index (Qwen3.8-Flash-Next's): each page also holds, per layer, the
+  // pooled keys of its blocks of SPLASH_ATTENTION_BLOCK_TOKENS tokens, this
+  // many values each (bf16 [block][dimension]), in an index region after
+  // every layer's K/V region (PageStorage::indexOffset). The keys a block
+  // pools are the step's own, and those of a block its sequence has not
+  // completed are its state's (model::QwenTargetDimensions::
+  // indexerPendingBytes), so no page holds them.
   uint32_t indexDimension = 0;
-  static constexpr uint32_t kIndexBlockTokens = 4;
   // Whether a page holds each head's values token-major like its keys
   // ([token][dimension]) rather than dimension-major ([dimension][token]).
   // The page loop of dense attention reads whole pages, and its PV runs
@@ -158,18 +160,12 @@ struct Layout final {
   [[nodiscard]] constexpr uint64_t scaleBytesPerLayerPage() const noexcept {
     return scalesPerTensorLayerPage() * sizeof(float);
   }
-  [[nodiscard]] constexpr uint64_t indexKeyBytesPerLayerPage() const noexcept {
-    return uint64_t{kPageTokens} * indexDimension * 2;
-  }
-  [[nodiscard]] constexpr uint64_t indexPooledBytesPerLayerPage() const noexcept {
-    return uint64_t{kPageTokens} / kIndexBlockTokens * indexDimension * 2;
-  }
   // The K/V bytes of one layer's page; the index bytes are apart.
   [[nodiscard]] constexpr uint64_t bytesPerLayerPage() const noexcept {
     return 2 * (dataBytesPerLayerPage() + scaleBytesPerLayerPage());
   }
   [[nodiscard]] constexpr uint64_t indexBytesPerLayerPage() const noexcept {
-    return indexKeyBytesPerLayerPage() + indexPooledBytesPerLayerPage();
+    return uint64_t{kPageTokens} / SPLASH_ATTENTION_BLOCK_TOKENS * indexDimension * 2;
   }
   [[nodiscard]] constexpr uint64_t bytesPerModelPage() const noexcept {
     return uint64_t{attentionLayers} * (bytesPerLayerPage() + indexBytesPerLayerPage());
@@ -186,8 +182,7 @@ struct Layout final {
                          : detail::lcm(detail::pagesForAlignedRegion(dataBytesPerLayerPage()),
                                        detail::pagesForAlignedRegion(scaleBytesPerLayerPage()));
     if (indexDimension)
-      pages = detail::lcm(pages, detail::lcm(detail::pagesForAlignedRegion(indexKeyBytesPerLayerPage()),
-                                             detail::pagesForAlignedRegion(indexPooledBytesPerLayerPage())));
+      pages = detail::lcm(pages, detail::pagesForAlignedRegion(indexBytesPerLayerPage()));
     return static_cast<uint32_t>(pages);
   }
 

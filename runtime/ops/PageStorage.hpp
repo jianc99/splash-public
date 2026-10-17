@@ -73,14 +73,10 @@ public:
   [[nodiscard]] std::span<const SplashKvLayer> layers() const noexcept {
     return layers_;
   }
-  // Where a layer's QSA index tensors (Layout::indexDimension) sit in every
-  // extent, in bytes: the raw keys of every page, then their pooled keys.
-  // std::out_of_range without an index or for a layer past the layout.
-  struct IndexPlacement final {
-    uint32_t keysOffset = 0;
-    uint32_t pooledOffset = 0;
-  };
-  [[nodiscard]] IndexPlacement indexPlacement(uint32_t layer) const;
+  // Where a layer's QSA index (Layout::indexDimension), the pooled keys of
+  // every page, sits in every extent, in bytes. std::out_of_range without an
+  // index or for a layer past the layout.
+  [[nodiscard]] uint32_t indexOffset(uint32_t layer) const;
 
   // Writes the entries kernels reach `pages` by, from index `first` on, to a
   // CPU-visible GPU page table, which must hold all of them; entries before
@@ -94,8 +90,7 @@ public:
   // it: the page's bytes of each tensor in every layer's region, layer by
   // layer as keys, key scales, values and value scales, where
   // splash_kv_offset places them for the kernels, then each layer's QSA
-  // index keys and pooled keys (indexPlacement). BF16 pages have no scale
-  // bytes. Throws std::logic_error for a page whose extent is not allocated.
+  // pooled keys (indexOffset). BF16 pages have no scale bytes. Throws std::logic_error for a page whose extent is not allocated.
   [[nodiscard]] std::vector<std::span<std::byte>> spans(uint32_t page) const;
 
 private:
