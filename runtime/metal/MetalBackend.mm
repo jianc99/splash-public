@@ -1094,7 +1094,6 @@ struct MetalBackend::Impl {
             steps->backend = asyncState;
             steps->event = [device newSharedEvent];
             if (!steps->event) failEncoding("unable to create Metal shared event");
-            if (!hostStepRunner) hostStepRunner = std::make_unique<HostStepRunner>();
         }
         id<MTLSharedEvent> event = steps->event;
         const uint64_t ready = 2 * steps->steps.size() + 1;
@@ -1230,6 +1229,11 @@ struct MetalBackend::Impl {
         if (!hostStepSpin && AwakeClock::now() >= nextSpinCheck &&
             std::ranges::any_of(events, [](const EventStep &step) { return step.awake; }))
             checkHostStepSpin();
+        // The runner starts with the first command that has a host step,
+        // before the submission: one that cannot start leaves nothing held.
+        if (!hostStepRunner &&
+            std::ranges::any_of(events, [](const EventStep &step) { return step.kind == EventStep::Kind::Host; }))
+            hostStepRunner = std::make_unique<HostStepRunner>();
         auto ticketState = std::make_shared<CommandTicket::State>();
         ticketState->backend = asyncState;
         ticketState->completion = std::move(completion);
