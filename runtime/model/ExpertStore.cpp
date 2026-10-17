@@ -585,31 +585,39 @@ void ExpertStore::Impl::planAhead(uint32_t index, std::span<const uint32_t> expe
 // release back: 35B decode on an M6, 30-60 us a step with four of them),
 // retires the last read-ahead and reads the planned experts ahead, in that
 // order, into the places the round just staged left free, as many as there
-// are. A release forgets the plan.
+// are. A release forgets the plan. It runs after the step let the GPU go on,
+// where a throw would outlive the command, so it does not throw: an error
+// becomes the store's failure, which the next load reports.
 void ExpertStore::Impl::startAhead() {
   std::lock_guard lock(mutex);
   if (plan.block == kNoSlot) return;
-  retireAhead();
-  uint32_t place = 0;
-  for (const uint32_t expert : plan.experts) {
-    while (place < places.count && taken[place]) ++place;
-    if (place == places.count) break;
-    // Expert after expert, so that the experts a round finds read whole are
-    // the likeliest; a piece starts on a page and so ends on one.
-    addGroup(ahead.reads, plan.block, expert, 1, place++, places, kAheadPieceBytes);
+  try {
+    retireAhead();
+    uint32_t place = 0;
+    for (const uint32_t expert : plan.experts) {
+      while (place < places.count && taken[place]) ++place;
+      if (place == places.count) break;
+      // Expert after expert, so that the experts a round finds read whole
+      // are the likeliest; a piece starts on a page and so ends on one.
+      addGroup(ahead.reads, plan.block, expert, 1, place++, places, kAheadPieceBytes);
+    }
+    const uint32_t block = std::exchange(plan.block, kNoSlot);
+    if (ahead.reads.groups.empty()) return;
+    ahead.block = block;
+    ahead.use = plan.use;
+    ahead.counted.assign(ahead.reads.groups.size(), 0);
+    ahead.batch = readers->start(
+        ahead.reads.pieces.size(),
+        [this](size_t task) {
+          const Piece &piece = ahead.reads.pieces[task];
+          readPiece(ahead.reads.groups[piece.group], piece);
+        },
+        kAheadReaders);
+  } catch (const std::exception &error) {
+    plan.block = kNoSlot;
+    if (failure.empty()) failure = std::string("reading experts ahead failed: ") + error.what();
+    publish();
   }
-  const uint32_t block = std::exchange(plan.block, kNoSlot);
-  if (ahead.reads.groups.empty()) return;
-  ahead.block = block;
-  ahead.use = plan.use;
-  ahead.counted.assign(ahead.reads.groups.size(), 0);
-  ahead.batch = readers->start(
-      ahead.reads.pieces.size(),
-      [this](size_t task) {
-        const Piece &piece = ahead.reads.pieces[task];
-        readPiece(ahead.reads.groups[piece.group], piece);
-      },
-      kAheadReaders);
 }
 
 // Counts group `group` of the read-ahead, its pieces [from, to), which
