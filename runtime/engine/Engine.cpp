@@ -977,8 +977,12 @@ Engine::SpillAdmission Engine::admitSpill(Request &active, bool resuming, uint64
                                  " tokens keep their KV on the SSD cache, ";
       if (gate == SpillGate::WriteBudget) {
         ++counters_.spill.refusedWriteBudget;
+        // It refills over hours: a retry may succeed once it covers again
+        // what Spill requests committed, or sooner as they end.
+        const double admitted = cache_.spillWritesAdmittedAt().value_or(now);
         settle(active, {LaneOutcome::KvWriteBudget,
-                        reason + "whose daily write budget (--max-cache-disk-writes) is spent"});
+                        reason + "whose daily write budget (--max-cache-disk-writes) is spent",
+                        static_cast<uint32_t>(std::lround(std::max(0.0, admitted - now) / 1000.0))});
       } else {
         ++counters_.spill.refusedClosed;
         settle(active, {LaneOutcome::CapacityExhausted, reason + "which takes no writes"});
@@ -2371,7 +2375,7 @@ void Engine::finish(Request &active, EngineFinishReason reason,
 void Engine::finishFailure(Request &active, LaneEnd end) {
   scheduler_.fail(active.request.id);
   active.finalized = true;
-  events_.failed(active.request.id, end.outcome, std::move(end.message));
+  events_.failed(active.request.id, end.outcome, std::move(end.message), end.retryAfterSeconds);
   ++counters_.failed;
   release(active);
 }

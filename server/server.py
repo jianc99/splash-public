@@ -391,10 +391,10 @@ class FrontendHandler(BaseHTTPRequestHandler):
             )
         super().end_headers()
 
-    def _send(self, status, data, content_type):
+    def _send(self, status, data, content_type, retry_after=1):
         self.send_response(status)
         if status in RETRY_STATUSES:
-            self.send_header("Retry-After", "1")
+            self.send_header("Retry-After", str(retry_after))
         if status == 401:
             self.send_header("WWW-Authenticate", "Bearer")
         self.send_header("Content-Type", content_type)
@@ -412,7 +412,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
         if self.command != "HEAD":
             self.wfile.write(data)
 
-    def _json(self, status, payload):
+    def _json(self, status, payload, retry_after=1):
         try:
             data = json_codec.encode(payload)
         except json_codec.JSONEncodingError as error:
@@ -422,7 +422,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 log=False,
             )
             return
-        self._send(status, data, "application/json")
+        self._send(status, data, "application/json", retry_after)
 
     def _log_api_error(self, code):
         path = "".join(char if char.isprintable() else "?" for char in self.route)
@@ -437,7 +437,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
         if log:
             self._log_api_error(code)
         try:
-            self._json(status, payload)
+            self._json(status, payload, error.retry_after)
         except (BrokenPipeError, ConnectionResetError, TimeoutError):
             pass
 

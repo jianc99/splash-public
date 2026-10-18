@@ -314,6 +314,9 @@ struct ErrorEvent {
   bool retryable = false;
   std::string code;
   std::string message;
+  // For a retryable request error, the seconds after which a retry may
+  // succeed, as when the SSD cache's write budget refills; 0 for at once.
+  uint32_t retryAfterSeconds = 0;
 
   bool operator==(const ErrorEvent &) const = default;
 };

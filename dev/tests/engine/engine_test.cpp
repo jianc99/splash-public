@@ -67,13 +67,15 @@ public:
     deduplicatedTokens[id] = deduplicated;
     speculativeCounts[id] = speculation;
   }
-  void failed(uint64_t, LaneOutcome outcome, std::string message) override {
+  void failed(uint64_t, LaneOutcome outcome, std::string message,
+              uint32_t retryAfterSeconds) override {
     ++failedCount;
     if (outcome == LaneOutcome::CapacityExhausted)
       ++capacityExhaustedCount;
     const LaneOutcomeWire wire = laneOutcomeWire(outcome);
     failures.emplace_back(wire.code);
     failureDetails.emplace_back(std::move(message), wire.retryable);
+    retryAfters.push_back(retryAfterSeconds);
   }
 
   std::unordered_map<uint64_t, std::vector<uint32_t>> progress;
@@ -88,6 +90,8 @@ public:
   std::unordered_map<uint64_t, SpeculativeCounts> speculativeCounts;
   std::vector<std::string> failures;
   std::vector<std::pair<std::string, bool>> failureDetails;
+  // When each failure said a retry may succeed, in seconds.
+  std::vector<uint32_t> retryAfters;
   uint32_t emitted = 0;
   uint32_t completedCount = 0;
   uint32_t failedCount = 0;
@@ -7968,11 +7972,12 @@ void testUnwritableTierKeepsRequestsResident() {
 // default) beside the other lanes' (SpillGeometry). One that cannot spill
 // may start Resident within `residentTokens` alone, by default the tokens
 // of resident KV's pages. The tier's transfers land as the fixture ticks
-// on, and decode runs to each request's output limit.
+// on, and decode runs to each request's output limit. The tier's write
+// budget, if a test sets one, refills on the fixture's clock.
 struct Spilling {
   explicit Spilling(uint32_t slots, bool always = true, uint64_t residentKvBytes = 100'000,
                     uint32_t residentTokens = 0)
-      : budget(std::make_shared<model::DiskBudget>(uint64_t{slots} * 100)),
+      : budget(std::make_shared<model::DiskBudget>(uint64_t{slots} * 100, [this] { return now; })),
         cache(pool, &tier, budget, CacheSpillPolicy{1, 1}),
         engine(config(always, residentKvBytes,
                       residentTokens ? residentTokens
@@ -8288,6 +8293,35 @@ void testAStartThatCannotSpillStartsResidentWithinTheResidentContext() {
             closed ? "a start that fits the resident context was refused while the tier took no writes"
                    : "a start that fits the resident context was refused for a short quota");
   }
+}
+
+// A start that would spill while the write budget (--max-cache-disk-writes)
+// does not cover what Spill requests committed, and that memory does not
+// hold alone, is refused with kv_write_budget, which says when a retry may
+// succeed: once the budget, refilling over hours, covers them.
+void testWriteBudgetRefusalSaysWhenToRetry() {
+  // Every start spills, and none fits in memory alone.
+  Spilling spill(64, true, 100'000, KvCache::pageTokens);
+  // 1,600 bytes a day, 400 at once: four slots.
+  spill.budget->setWriteBudget(1'600);
+  // The first request commits the eight pages of its projection and writes
+  // none of them.
+  spill.allowSpillWrites(false);
+  spill.engine.submit(Spilling::prompt(1, 1, 2, 191));
+  spill.runUntil([&] { return spill.events.outputs.contains(1); }, "the first request did not decode");
+  require(spill.committedSlots() == 8, "the first request did not commit its projection");
+  // The budget covers the 800 bytes committed once it refilled 400 more,
+  // a quarter of a day's: in 6 hours.
+  spill.engine.submit(Spilling::prompt(2, 2, 1, 31));
+  spill.runUntil([&] { return spill.events.failedCount == 1; }, "the second request was not refused");
+  require(spill.events.failures == std::vector<std::string>{"kv_write_budget"} &&
+              spill.events.failureDetails.front().second &&
+              spill.events.retryAfters == std::vector<uint32_t>{21'600} &&
+              spill.engine.snapshot().spill.refusedWriteBudget == 1,
+          "the write budget's refusal did not say when a retry may succeed");
+  spill.engine.cancel(1);
+  spill.runUntilIdle();
+  require(spill.committedSlots() == 0, "the first request kept its commitment");
 }
 
 // A Spill request suspended for a higher priority returns its commitment
@@ -11088,6 +11122,7 @@ int main() {
     testAStartThatConvertsCountsNoConversion();
     testShortQuotaBoundsWaitsOrRefusesASpillStart();
     testAStartThatCannotSpillStartsResidentWithinTheResidentContext();
+    testWriteBudgetRefusalSaysWhenToRetry();
     testSpillResumeCommitsAgain();
     testDecodeLeavesOutALaneRefusedItsHotFloor();
     testLoneSpillLaneEndsAtTheWall();
