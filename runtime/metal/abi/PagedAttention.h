@@ -69,8 +69,14 @@ static_assert(SPLASH_MAXIMUM_PHYSICAL_KV_TOKENS / SPLASH_ATTENTION_BLOCK_TOKENS 
                   1u << (32 - SPLASH_ATTENTION_BLOCK_ROW_BITS),
               "A list entry's bits above its rows' hold any block");
 
-// A page holds 1 << SPLASH_ATTENTION_LOCATION_BLOCK_BITS blocks, so that the
-// low bits of a block's location name its place in its page.
+// A list's blocks may sit outside the tile's page table (ops::AttentionBlocks
+// locations, the blocks a spilled request's hot block cache holds), which the
+// located verify split reads: a location per entry, in an array of the lists'
+// shape, names a page of the locations' own page table (location >>
+// SPLASH_ATTENTION_LOCATION_BLOCK_BITS) and the block's place in it (the low
+// bits), or is SPLASH_ATTENTION_PAGED for a block whose page the page table
+// holds, at its own place.
+#define SPLASH_ATTENTION_PAGED 0xffffffffu
 #define SPLASH_ATTENTION_LOCATION_BLOCK_BITS 3u
 
 static_assert(SPLASH_TARGET_KV_BLOCK_TOKENS / SPLASH_ATTENTION_BLOCK_TOKENS ==
@@ -137,3 +143,22 @@ struct SplashVerifyAttentionParams {
 
 static_assert(sizeof(SplashVerifyAttentionParams) == 32,
               "Verify attention parameters are 32 bytes on both sides");
+
+// A prefill whose history has pages that hold only their index reads one
+// layer's history staged (kernels/shared/kv_stage.metal, ops::PagedAttention::
+// addStageLayer): `pages` pages of the pool's layer, reached through a page
+// table, copied to the same pages of a staging table, whose storage holds that
+// one layer; a pool entry that is SPLASH_KV_PAGE_ABSENT is left to the reads
+// that fill it. data_bytes and scale_bytes are a page's bytes of one tensor of
+// the layer (zero scale bytes for BF16).
+struct SplashKvStageParams {
+  SplashKvLayer pool;
+  SplashKvLayer staged;
+  uint32_t pages;
+  uint32_t data_bytes;
+  uint32_t scale_bytes;
+  uint32_t reserved;
+};
+
+static_assert(sizeof(SplashKvStageParams) == 32,
+              "KV stage parameters are 32 bytes on both sides");

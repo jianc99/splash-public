@@ -174,11 +174,17 @@ private:
 // each list's count in `counts`; a verify lane's tile reads list `list` +
 // lane, a prefill tile list `list` + tile. Without a stride every tile
 // attends to every block of its history. Only a sparse plan takes lists.
+// With `locations`, an array of the lists' shape, a verify reads each
+// entry's block where its location names (SPLASH_ATTENTION_PAGED, or a page
+// of locationPages and the block's place in it), as the hot block cache of a
+// request whose K/V spilled gives them (model::KvBlockCache).
 struct AttentionBlocks final {
   metal::MetalBuffer lists;
   metal::MetalBuffer counts;
   uint32_t stride = 0;
   uint32_t list = 0;
+  metal::MetalBuffer locations{};
+  metal::MetalBuffer locationPages{};
 };
 
 // Rows whose block masks become block lists (PagedAttention::addBlockLists):
@@ -299,6 +305,16 @@ public:
   // keep to.
   static void addBlockLists(metal::CommandGraph &graph, const metal::MetalBuffer &mask, uint32_t maskWords,
                             std::span<const BlockListRows> sequences, const AttentionBlocks &blocks);
+  // Stages one layer's history for a prefill that reads it apart from the
+  // pool (SplashKvStageParams, kernels/shared/kv_stage.metal): copies the K/V
+  // of pages [firstPage, firstPage + pages) of poolTable, in the pool's layer
+  // poolLayer, to the same pages of stagedTable, in the staging storage's one
+  // layer stagedLayer; a pool entry that is SPLASH_KV_PAGE_ABSENT is left to
+  // the reads that fill its staging page. Both storages have the layout's
+  // heads, dimension and format.
+  static void addStageLayer(metal::CommandGraph &graph, SplashKvLayer poolLayer, metal::MetalBuffer poolTable,
+                            SplashKvLayer stagedLayer, metal::MetalBuffer stagedTable, uint32_t firstPage,
+                            uint32_t pages, kv::Layout layout);
 };
 
 } // namespace splash::ops
