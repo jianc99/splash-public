@@ -2076,8 +2076,8 @@ void testMemoryStatusReporterLogsTransitionsOnly() {
 
 // It logs one line a pass as the funding of the starts the host's pause
 // refused advances: the starts, on what was released since the last one it
-// reported, by kind, and the lanes whose KV moved to the SSD for them;
-// memory released for a start still waiting logs nothing.
+// reported, by kind, or on earlier releases, and the lanes whose KV moved to
+// the SSD for them; memory released for a start still waiting logs nothing.
 void testMemoryStatusReporterLogsFunding() {
   MemoryStatusReporter reporter;
   ResourceWaitSnapshot wait{.memory = 1};
@@ -2100,6 +2100,12 @@ void testMemoryStatusReporterLogsFunding() {
   require(more == "Memory: growth paused; 2 requests started, the latest request 14, on 300 MiB Splash released "
                   "(cache 300)",
           "the funding line of two starts differs: " + more);
+  // A start on what the balance kept of earlier releases.
+  wait.funding.starts = 4;
+  wait.funding.latestStart = 15;
+  const std::string kept = reporter.update(wait, false);
+  require(kept == "Memory: growth paused; request 15 started on memory Splash released earlier",
+          "the funding line of a start on earlier releases differs: " + kept);
 }
 
 } // namespace

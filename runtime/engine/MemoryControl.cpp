@@ -14,7 +14,8 @@ namespace {
 uint64_t mebibytes(uint64_t bytes) noexcept { return (bytes + (1ULL << 19)) >> 20; }
 
 // The funding since the last line that reported it: the starts funded, on
-// what was released since the last start reported, and the lanes whose KV
+// what was released since the last start reported, by kind, or on what an
+// earlier start's line reported when nothing was, and the lanes whose KV
 // moved to the SSD.
 void describeFunding(std::ostream &out, const SpillFundingSnapshot &now, const SpillFundingSnapshot &before) {
   const char *separator = "";
@@ -26,16 +27,20 @@ void describeFunding(std::ostream &out, const SpillFundingSnapshot &now, const S
       out << "request " << now.latestStart << " started";
     else
       out << starts << " requests started, the latest request " << now.latestStart << ',';
-    out << " on " << mebibytes(released.total()) << " MiB Splash released (";
-    const char *kind = "";
-    for (const auto &[name, bytes] : {std::pair{"streamed", released.streamed}, std::pair{"cache", released.cache},
-                                      std::pair{"idle", released.idle}}) {
-      if (!bytes)
-        continue;
-      out << kind << name << ' ' << mebibytes(bytes);
-      kind = ", ";
+    if (released.total()) {
+      out << " on " << mebibytes(released.total()) << " MiB Splash released (";
+      const char *kind = "";
+      for (const auto &[name, bytes] : {std::pair{"streamed", released.streamed}, std::pair{"cache", released.cache},
+                                        std::pair{"idle", released.idle}}) {
+        if (!bytes)
+          continue;
+        out << kind << name << ' ' << mebibytes(bytes);
+        kind = ", ";
+      }
+      out << ')';
+    } else {
+      out << " on memory Splash released earlier";
     }
-    out << ')';
     separator = "; ";
   }
   if (const uint64_t conversions = now.conversions - before.conversions) {
