@@ -317,6 +317,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/model/KvCopyRead.cpp \
 	runtime/model/KvBlockCache.cpp \
 	runtime/model/KvHistoryStream.cpp \
+	runtime/model/SpilledKvReads.cpp \
 	runtime/model/QwenState.cpp \
 	runtime/model/Runtime.cpp \
 	runtime/model/RuntimeArenas.cpp

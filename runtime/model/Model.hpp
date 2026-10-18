@@ -397,6 +397,14 @@ struct ModelStepResult final {
   // state or emits output, and the rest of the batch stands. Broken
   // invariants and GPU faults stay exceptions and remain engine-fatal.
   std::string failure{};
+  // Set when the tier copies of blocks this lane read could not be read
+  // (model::KvPageSource::block), on a host step or anywhere else: a failed
+  // read is the lanes' that needed it, never an exception the engine dies
+  // of. The engine ends that one request as retryable
+  // (engine::LaneOutcome::KvUnreadable) before it publishes cache state or
+  // emits output, keeps the state it restored, which the failure says
+  // nothing of, and gives the copies up (engine::Cache::poisonCopy).
+  std::vector<uint64_t> unreadableKvBlocks{};
   // The request's first output token, which the step that completes its
   // prompt selected and left pending: the first decode cycle writes its KV row
   // and emits it first. Reported so that the engine can send it to the client
@@ -428,6 +436,10 @@ public:
   // steps: a streamed target's expert reads, which a prefill command pays
   // about whole whatever its rows.
   [[nodiscard]] virtual double hostMilliseconds() const noexcept { return 0.0; }
+  // Of hostMilliseconds, the time it waited on the reads of its history's
+  // spilled K/V (model::KvHistoryStream), which bound a streamed prefill
+  // command's length whatever its rows.
+  [[nodiscard]] virtual double streamMilliseconds() const noexcept { return 0.0; }
   // Fixed auxiliary work remains in wall latency but must not train the
   // text-prefill throughput estimate.
   [[nodiscard]] virtual bool prefillTimingIsRepresentative() const noexcept {
@@ -437,11 +449,30 @@ public:
 
 namespace model {
 
+// The attention of a block-sparse target, which lets its committed K/V leave
+// memory while each page keeps its blocks' index (kv::PageForm::Index): each
+// verify row of a lane attends at most selectedBlocks blocks of blockTokens
+// tokens. Rows that read the whole of a page table instead (a row with at
+// most denseHistoryTokens of history, its first sinkTokens and its last
+// localTokens) read only Full pages, which the cache keeps for them.
+struct SparseKvShape final {
+  uint32_t blockTokens = 0;
+  uint32_t selectedBlocks = 0;
+  uint32_t verifyRows = 0;
+  uint32_t denseHistoryTokens = 0;
+  uint32_t sinkTokens = 0;
+  uint32_t localTokens = 0;
+
+  bool operator==(const SparseKvShape &) const = default;
+};
+
 // Startup capabilities used for protocol sizing and admission independently
 // of target-specific headers.
 struct ModelCapabilities final {
   uint32_t vocabularySize = 0;
   uint32_t maximumContextTokens = 0;
+  // Set for a block-sparse target.
+  std::optional<SparseKvShape> sparseKv;
 };
 
 // A tier copy of one block's page, as reads of spilled K/V reach it on any
@@ -699,6 +730,17 @@ public:
   [[nodiscard]] virtual std::shared_ptr<const CompositeState> snapshot(uint64_t requestId) = 0;
   // The bytes one cached state's buffers take.
   [[nodiscard]] virtual uint64_t snapshotBytes() const noexcept = 0;
+  // Memory for reads of a request's spilled K/V, taken between commands and
+  // held until it ends or is suspended; a model that reads none grants it at
+  // once, taking nothing. The hot block cache's floor for the request's lane,
+  // which decodes over Index pages (model::KvBlockCache::reserveLane); the
+  // staging of a prefill's history of `pages` pages, which holds Index
+  // pages (model::KvHistoryStream::reserve); and, optionally, one more
+  // extent of the hot block cache toward its planned size
+  // (model::KvBlockCache::growTowardTarget).
+  [[nodiscard]] virtual ModelMemoryAdmission reserveSpilledReads(uint64_t) { return {.ok = true}; }
+  [[nodiscard]] virtual ModelMemoryAdmission reserveHistoryStaging(uint64_t, uint32_t) { return {.ok = true}; }
+  [[nodiscard]] virtual ModelMemoryAdmission growSpilledReads() { return {.ok = true}; }
   // Whether the disk tier takes a state written from a lane now, for a
   // state in use or not, as CompositeState::canOffload. Room in the quota is
   // the write's own concern.

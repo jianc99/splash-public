@@ -712,8 +712,10 @@ ModelDescriptor makeModelDescriptor(std::string name, TargetLayout target,
   result.visionSource = visionSource;
   std::visit(
       [&](const auto &layout) {
+        // No target declares its sparse KV until the runtime and
+        // target integration does.
         result.capabilities = {layout.vocabularySize,
-                               layout.nativeContextTokens};
+                               layout.nativeContextTokens, std::nullopt};
         result.targetKvLayout = layout.kvLayout();
         result.stateLayout = {layout.gdnStateLayout(), draft.stateLayout()};
       },

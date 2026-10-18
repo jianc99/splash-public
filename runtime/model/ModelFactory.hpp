@@ -23,6 +23,8 @@ class AneFfn;
 
 namespace splash::model {
 
+class KvBlockCache;
+class KvHistoryStream;
 class QwenStateStorage;
 class SsdReaders;
 class VisionLoader;
@@ -104,6 +106,11 @@ struct RuntimeContext final {
   const ops::ExecutionPlans &operators;
   // The prefill FFN's Neural Engine split (engine::startAneFfn), if any.
   ops::AneFfn *aneFfn = nullptr;
+  // The readers of a spill-capable target's spilled K/V, if any: the hot
+  // block cache its verifies resolve through, and the stream of its
+  // prefills' history.
+  KvBlockCache *blockCache = nullptr;
+  KvHistoryStream *historyStream = nullptr;
 };
 
 // Validates only the interface between independently defined target and draft
