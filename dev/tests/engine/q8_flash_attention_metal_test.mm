@@ -534,7 +534,9 @@ Dispatch dispatch(id<MTLDevice> device, id<MTLCommandQueue> queue,
   // The kernel reaches the extents only through the page entries.
   for (id<MTLBuffer> extent : data.extents)
     [encoder useResource:extent usage:MTLResourceUsageRead];
-  [encoder dispatchThreadgroups:MTLSizeMake(shape.kvHeads, splits, width)
+  // The sparse split's grid is one-dimensional (ops::PagedAttention::verifyPlan).
+  [encoder dispatchThreadgroups:shape.sparse() ? MTLSizeMake(shape.kvHeads * splits, 1, width)
+                                               : MTLSizeMake(shape.kvHeads, splits, width)
           threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
   [encoder setComputePipelineState:reduce];
   [encoder setBuffer:partials offset:0 atIndex:0];
