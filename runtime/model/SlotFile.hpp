@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -205,6 +206,11 @@ public:
   [[nodiscard]] uint64_t fileBytes() const noexcept {
     return file_.load(std::memory_order_relaxed);
   }
+  // Cumulative microseconds the files' writes waited for reads a step waits
+  // for (SlotFile::Options::deferWrites).
+  [[nodiscard]] uint64_t writesDeferredMicroseconds() const noexcept {
+    return deferred_.load(std::memory_order_relaxed);
+  }
 
 private:
   friend class SlotFile;
@@ -232,6 +238,7 @@ private:
   std::atomic<uint64_t> read_{0};
   std::atomic<uint64_t> written_{0};
   std::atomic<uint64_t> file_{0};
+  std::atomic<uint64_t> deferred_{0};
   std::atomic<bool> full_{false};
   std::atomic<bool> stopped_{false};
   // The write budget, on the engine thread: its refill per millisecond (zero
@@ -266,10 +273,12 @@ struct SlotRecord final {
 // uncached IO wants; a slot is a whole number of host pages. A slot is
 // readable only after one complete write; a failed or cancelled write leaves
 // it unreadable. Beside the worker, any thread may read part of a written
-// slot straight from the file (readAt). A write that finds the volume full
-// is reported to the budget (DiskBudget::fullReported) and the file goes on;
-// after one that fails for any other reason, which the worker logs, the file
-// accepts no further writes. A freed slot
+// slot straight from the file (readAt). While reads a step waits for run
+// (Options::deferWrites), the worker holds each chunk of a write back, at
+// most kWriteDeferral. A write that finds the volume full is reported to the
+// budget (DiskBudget::fullReported) and the file goes on; after one that
+// fails for any other reason, which the worker logs, the file accepts no
+// further writes. A freed slot
 // returns its quota at once; one that was written returns its blocks to the
 // volume (F_PUNCHHOLE) on the worker, after the operation in flight and
 // before any later one (DiskBudget). So that a
@@ -315,11 +324,13 @@ public:
     // empty or one, the whole payload, whatever its size, is one segment.
     // Several hold every payload of the file: a write stores their sum.
     std::vector<uint64_t> segments;
-    // While it says so, the worker holds a write's next chunk back, a
-    // bounded while each (model::SsdReaders::criticalBusy: reads a step
-    // waits for go first).
+    // While it says so, the worker holds a write's next chunk back, at most
+    // kWriteDeferral each (model::SsdReaders::criticalBusy: reads a step
+    // waits for go first). It runs on the worker.
     std::function<bool()> deferWrites;
   };
+  // The longest a write's chunk waits for reads (Options::deferWrites).
+  static constexpr std::chrono::milliseconds kWriteDeferral{2};
 
   class Slot final {
   public:

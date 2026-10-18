@@ -11,6 +11,7 @@
 #include "model/Qwen4Exp.hpp"
 #include "model/Qwen4Steps.hpp"
 #include "model/RuntimeInstrumentation.hpp"
+#include "model/SsdReaders.hpp"
 #include "model/QwenState.hpp"
 #include "ops/PageStorage.hpp"
 #include "ops/Sampling.hpp"
@@ -2737,6 +2738,8 @@ int main(int argc, char **argv) {
         weightBytes > *hostAvailableBytes - hostReserveBytes)
       stopForHostMemory("the weights need " + mebibytes(weightBytes),
                         *hostAvailableBytes, hostReserveBytes);
+    // Streamed weights read on a pool of SSD readers, as the engine's do.
+    loadOptions.readers = std::make_shared<model::SsdReaders>(model::kSsdReaders);
     model::LoadedModel model =
         model::loadModel(backend, modelRoot, descriptor, loadOptions);
     if (loadOptions.streamedTableBytes)
