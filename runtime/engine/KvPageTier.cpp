@@ -55,6 +55,13 @@ KvPageTier::~KvPageTier() {
     transfer->io->drain();
 }
 
+std::string_view KvPageTier::slotFormatToken(const kv::Layout &) noexcept {
+  // Stub, which the tiered block store replaces in the commit
+  // that switches what the tier writes: the tier writes every page in its
+  // spans' order.
+  return {};
+}
+
 uint64_t KvPageTier::slotBytes() const noexcept { return file_->slotBytes(); }
 
 bool KvPageTier::writable() const noexcept { return file_->writable(); }
@@ -113,6 +120,12 @@ std::unique_ptr<KvTransfer> KvPageTier::restore(std::shared_ptr<KvDiskSlot> slot
   ++restores_;
   inFlight_.push_back(std::move(transfer));
   return ticket;
+}
+
+std::shared_ptr<const model::KvCopy> KvPageTier::copy(const std::shared_ptr<KvDiskSlot> &) const {
+  // Stub, which the tiered block store replaces: no copy is
+  // read beside the file's worker.
+  throw std::logic_error("direct reads of KV tier copies are not built yet");
 }
 
 void KvPageTier::poll() {

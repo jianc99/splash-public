@@ -32,7 +32,10 @@ KvPool::KvPool(kv::ExtentStorage &storage, uint32_t runwayPages)
   }
 }
 
-KvPageAcquisition KvPool::acquirePages(uint32_t count) {
+KvPageAcquisition KvPool::acquirePages(uint32_t count, kv::PageForm form) {
+  // Stub, which page forms replace: every extent is Full.
+  if (form != kv::PageForm::Full)
+    throw std::logic_error("KV pages of the index form are not built yet");
   if (!count)
     return {};
 
@@ -119,7 +122,21 @@ uint64_t KvPool::bytesPerPage() const noexcept {
   return storage_.bytesPerPage();
 }
 
-uint32_t KvPool::freePageCount() const noexcept { return freePages_; }
+uint32_t KvPool::freePageCount(kv::PageForm form) const noexcept {
+  // Stub, which page forms replace: every extent is Full.
+  return form == kv::PageForm::Full ? freePages_ : 0;
+}
+
+kv::PageForm KvPool::form(uint32_t page) const {
+  // Stub, which page forms replace: every extent is Full.
+  static_cast<void>(pages_.at(page));
+  return kv::PageForm::Full;
+}
+
+KvPageMoveResult KvPool::movePages(std::span<const uint32_t>, kv::PageForm) {
+  // Stub, which page forms replace.
+  throw std::logic_error("moving KV pages between forms is not built yet");
+}
 
 bool KvPool::pageActive(uint32_t page) const {
   return pages_.at(page).activeReferences != 0;
@@ -134,7 +151,10 @@ uint64_t KvPool::allocatedBytes() const noexcept {
   return uint64_t{allocatedExtents_} * extentPages_ * bytesPerPage();
 }
 
-uint64_t KvPool::reclaimEmptyExtents(bool keepRunway, uint32_t limit) {
+uint64_t KvPool::reclaimEmptyExtents(bool keepRunway, uint32_t limit, std::optional<kv::PageForm> form) {
+  // Stub, which page forms replace: every extent is Full.
+  if (form == kv::PageForm::Index)
+    return 0;
   uint32_t reclaimed = 0;
   bool kept = false;
   uint32_t extent = reclaimableExtents_.head;

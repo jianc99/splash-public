@@ -29,10 +29,16 @@ bool older(const std::optional<CacheEvictionCandidate> &left,
 
 } // namespace
 
-Cache::Cache(KvPool &pool, KvTier *kvTier, std::shared_ptr<model::DiskBudget> diskBudget)
+Cache::Cache(KvPool &pool, KvTier *kvTier, std::shared_ptr<model::DiskBudget> diskBudget,
+             std::optional<CacheSpillPolicy> spill)
     : pool_(pool), tier_(kvTier), persistent_(kvTier && kvTier->persistent()),
       diskBudget_(std::move(diskBudget)), kv_(pool, recency_),
-      states_(kv_, recency_, [this](bool inUse) { return freeDiskSpace(inUse); }, persistent_) {}
+      states_(kv_, recency_, [this](bool inUse) { return freeDiskSpace(inUse); }, persistent_) {
+  // Stub, which the tiered block store replaces: no request
+  // spills.
+  if (spill)
+    throw std::logic_error("spilling KV is not built yet");
+}
 
 CacheAdoption Cache::adopt(std::vector<PersistedKv> blocks, std::vector<PersistedState> states) {
   if (!persistent_)
@@ -137,9 +143,13 @@ CacheAdoption Cache::adopt(std::vector<PersistedKv> blocks, std::vector<Persiste
   return result;
 }
 
-void Cache::beginRequest(uint64_t requestId) {
+void Cache::beginRequest(uint64_t requestId, KvMode mode) {
   if (!requestId)
     throw std::invalid_argument("invalid request id");
+  // Stub, which the tiered block store replaces: every request
+  // is Resident.
+  if (mode != KvMode::Resident)
+    throw std::logic_error("spilling KV is not built yet");
   auto [_, inserted] = requests_.emplace(requestId, Request{});
   if (!inserted)
     throw std::invalid_argument("duplicate request id");
@@ -279,7 +289,13 @@ void Cache::recordLookup(const CacheLookup &result) {
 
 PageTableView Cache::pageTable(uint64_t requestId) const {
   const Request &active = request(requestId);
-  return {active.pages, active.pageTableRevision, active.firstChangedPage};
+  return {active.pages, nullptr, active.pageTableRevision, active.firstChangedPage};
+}
+
+PageTableView Cache::cutPageTable(uint64_t requestId) {
+  // Stub, which the tiered block store replaces: every change
+  // still makes a revision of its own, and no page holds only its index.
+  return pageTable(requestId);
 }
 
 void Cache::pagesChanged(Request &active, uint32_t first) noexcept {
@@ -407,7 +423,7 @@ TokenAdmission Cache::admitPages(uint32_t count, std::vector<uint32_t> &pages) {
     // Demoted pages free theirs when their copies land: wait once those on
     // their way cover what the free pages do not, and until then reclaim.
     const uint32_t missing = count - std::min(count, pool_.freePageCount());
-    const uint32_t pending = pendingPages();
+    const uint32_t pending = pendingPages(kv::PageForm::Full);
     const bool covered = pending > 0 && pending >= missing;
     return {covered ? TokenAdmissionFailure::Pending : TokenAdmissionFailure::Denied,
             count, pool_.freePageCount(), acquired.failure};
@@ -483,9 +499,13 @@ CacheReclaimResult Cache::evictOne(ReclaimClass upTo, bool keepResumePoint, bool
 }
 
 CacheReclaimResult Cache::reclaimForPages(uint32_t pages, CacheReclaimMode mode,
-                                          ReclaimClass upTo) {
+                                          ReclaimClass upTo, kv::PageForm form) {
+  // Stub, which the tiered block store replaces: every page is
+  // Full.
+  if (form != kv::PageForm::Full)
+    throw std::logic_error("reclaiming KV pages of the index form is not built yet");
   CacheReclaimResult total;
-  while (pool_.freePageCount() + pendingPages() < pages) {
+  while (pool_.freePageCount(form) + pendingPages(form) < pages) {
     const CacheReclaimResult step = reclaimOne(mode, upTo);
     if (!step.madeProgress) {
       total.pending = step.pending;
@@ -690,7 +710,7 @@ void Cache::dropPoisoned() {
 }
 
 bool Cache::extentWithinReach() const {
-  return pendingPages() + pool_.extentPages() <= reusablePages(ReclaimClass::Ordinary);
+  return pendingPages(kv::PageForm::Full) + pool_.extentPages() <= reusablePages(ReclaimClass::Ordinary);
 }
 
 CacheReclaimResult Cache::releaseExtent(bool keepRunway) {
@@ -739,8 +759,41 @@ bool Cache::transfersInFlight() const noexcept {
 }
 
 uint64_t Cache::pendingBytes() const noexcept {
-  return uint64_t{pendingPages()} * pool_.bytesPerPage();
+  return uint64_t{pendingPages(kv::PageForm::Full)} * pool_.bytesPerPage();
 }
+
+uint32_t Cache::pendingPages(kv::PageForm form) const noexcept {
+  // Stub, which the tiered block store replaces: only the pages
+  // whose demotion is in flight return, each once its copy lands.
+  return form == kv::PageForm::Full ? static_cast<uint32_t>(demotions_.size()) : 0;
+}
+
+// Stubs, which the tiered block store replaces: no request
+// spills, so nothing is committed, written through or moved to the index
+// form.
+
+uint64_t Cache::spillRoom() const noexcept { return 0; }
+
+bool Cache::commitSpill(uint64_t, uint32_t) { return false; }
+
+bool Cache::convertToSpill(uint64_t, uint32_t) { return false; }
+
+uint32_t Cache::writeThrough() { return 0; }
+
+TokenAdmission Cache::spillWritten() { return {}; }
+
+bool Cache::holdsIndexPages(uint64_t requestId) const {
+  static_cast<void>(request(requestId));
+  return false;
+}
+
+void Cache::poisonCopy(uint64_t) {
+  throw std::logic_error("reads of spilled KV are not built yet");
+}
+
+KvSpillSnapshot Cache::spillSnapshot() const { return {}; }
+
+void Cache::checkInvariants() const {}
 
 
 // Disk tier: restores and demotions in flight, the quota they draw on, and
@@ -1130,7 +1183,7 @@ bool Cache::holdsOrdinaryState(uint64_t block) const {
 
 CacheSnapshot Cache::snapshot() const {
   KvTierSnapshot tier = kvTier_;
-  tier.pendingPages = pendingPages();
+  tier.pendingPages = pendingPages(kv::PageForm::Full);
   tier.diskBlocks = kv_.diskBlocks();
   if (diskBudget_) {
     tier.capacityBytes = diskBudget_->capacityBytes();

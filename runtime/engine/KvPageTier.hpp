@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <string_view>
 #include <vector>
 
 namespace splash::engine {
@@ -29,6 +30,12 @@ public:
 
   KvPageTier(kv::PageStorage &pages, std::shared_ptr<model::SlotFile> file,
              uint32_t transfers = kTransfers);
+  // How the tier lays a page of the layout out in its slot, as a persistent
+  // cache's namespace names it (persistentCacheNamespace's kv line): empty
+  // for the order of the page's spans, which every cache before block
+  // records was written in. Whatever changes what the tier writes changes
+  // this with it, so that no process adopts a slot of another layout.
+  [[nodiscard]] static std::string_view slotFormatToken(const kv::Layout &layout) noexcept;
   ~KvPageTier() override;
   KvPageTier(const KvPageTier &) = delete;
   KvPageTier &operator=(const KvPageTier &) = delete;
@@ -49,6 +56,8 @@ public:
   [[nodiscard]] std::unique_ptr<KvTransfer>
   restore(std::shared_ptr<KvDiskSlot> slot, uint32_t page,
           std::function<void()> completion) override;
+  [[nodiscard]] std::shared_ptr<const model::KvCopy>
+  copy(const std::shared_ptr<KvDiskSlot> &slot) const override;
   void poll() override;
 
 private:

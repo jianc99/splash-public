@@ -260,6 +260,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/ops/BlockIndexer.cpp \
 	runtime/ops/PagedAttention.cpp \
 	runtime/ops/PageStorage.cpp \
+	runtime/ops/KvSlotFormat.cpp \
 	runtime/ops/RoPE.cpp \
 	runtime/ops/RowCopy.cpp \
 	runtime/ops/Sampling.cpp \
@@ -294,11 +295,11 @@ ENGINE_CPP_SOURCES := \
 	runtime/model/SafetensorsTarget.cpp \
 	runtime/model/DraftCheckpoint.cpp \
 	runtime/model/WeightSource.cpp \
-	runtime/model/WeightReaders.cpp \
+	runtime/model/SsdReaders.cpp \
 	runtime/model/SparseRowStore.cpp \
 	runtime/model/WeightImages.cpp \
 	runtime/model/GgufPreparation.cpp \
-	runtime/model/ExpertSlots.cpp \
+	runtime/model/SlotRecycler.cpp \
 	runtime/model/ExpertStore.cpp \
 	runtime/model/Qwen3_6Moe.cpp \
 	runtime/model/Qwen3_8.cpp \

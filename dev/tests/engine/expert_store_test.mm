@@ -132,8 +132,8 @@ uint64_t arenaBytes(const Model &m, uint64_t slots) {
 }
 
 // The readers every store of the test reads on.
-const std::shared_ptr<splash::model::WeightReaders> &readers() {
-  static const auto shared = std::make_shared<splash::model::WeightReaders>(splash::model::kWeightReaders);
+const std::shared_ptr<splash::model::SsdReaders> &readers() {
+  static const auto shared = std::make_shared<splash::model::SsdReaders>(splash::model::kSsdReaders);
   return shared;
 }
 

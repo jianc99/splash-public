@@ -54,6 +54,13 @@ uint64_t diskLimitBytes(uint64_t quotaBytes, uint64_t availableBytes, uint64_t h
   return std::min(quotaBytes, diskRoomBytes(availableBytes, heldBytes, floorBytes) / 4);
 }
 
+uint64_t diskActiveLimitBytes(uint64_t quotaBytes, uint64_t availableBytes, uint64_t heldBytes,
+                              uint64_t floorBytes) noexcept {
+  // Stub, which the SSD I/O foundation replaces: active KV is
+  // bounded as cached copies are.
+  return diskLimitBytes(quotaBytes, availableBytes, heldBytes, floorBytes);
+}
+
 std::optional<std::string> automaticDiskRefusal(const std::optional<DiskVolume> &volume,
                                                 uint64_t heldBytes, uint64_t minimumBytes) {
   if (!volume)

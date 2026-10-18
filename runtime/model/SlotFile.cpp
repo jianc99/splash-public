@@ -73,7 +73,10 @@ struct SlotFile::Backing {
 };
 
 SlotFile::Slot::Slot(std::shared_ptr<Backing> backing, uint32_t index)
-    : backing_(std::move(backing)), index_(index) {}
+    : backing_(std::move(backing)), index_(index) {
+  static std::atomic<uint64_t> ids{0};
+  id_ = ids.fetch_add(1, std::memory_order_relaxed) + 1;
+}
 SlotFile::Slot::~Slot() {
   if (!backing_) return;
   bool punch = false;
@@ -353,9 +356,9 @@ uint64_t fileBytes(int descriptor, const char *what) {
 }
 } // namespace
 
-SlotFile::SlotFile(uint64_t slotBytes, std::shared_ptr<DiskBudget> budget)
+SlotFile::SlotFile(uint64_t slotBytes, std::shared_ptr<DiskBudget> budget, const Options &options)
     : backing_(std::make_shared<Backing>()) {
-  prepare(slotBytes, std::move(budget));
+  prepare(slotBytes, std::move(budget), options);
   std::string name = (std::filesystem::temp_directory_path() / "splash-cache-XXXXXX").string();
   backing_->descriptor = ::mkstemp(name.data());
   if (backing_->descriptor < 0)
@@ -370,16 +373,20 @@ SlotFile::SlotFile(uint64_t slotBytes, std::shared_ptr<DiskBudget> budget)
 }
 
 SlotFile::SlotFile(uint64_t slotBytes, std::shared_ptr<DiskBudget> budget,
-                   const Persistence &persistence)
+                   const Persistence &persistence, const Options &options)
     : backing_(std::make_shared<Backing>()) {
-  prepare(slotBytes, std::move(budget));
+  prepare(slotBytes, std::move(budget), options);
   open(persistence);
   worker_ = std::thread([this] { run(); });
 }
 
-void SlotFile::prepare(uint64_t slotBytes, std::shared_ptr<DiskBudget> budget) {
+void SlotFile::prepare(uint64_t slotBytes, std::shared_ptr<DiskBudget> budget, const Options &options) {
   if (!budget)
     throw std::invalid_argument("slot file needs a disk budget");
+  // Stub, which the SSD I/O foundation replaces: one segment per
+  // payload, and writes that never wait for reads.
+  if (options.segments.size() > 1)
+    throw std::logic_error("slot files of several segments are not built yet");
   const uint64_t capacityBytes = budget->capacityBytes();
   if (!slotBytes || capacityBytes > uint64_t{std::numeric_limits<off_t>::max()} ||
       capacityBytes / slotBytes > std::numeric_limits<uint32_t>::max())
@@ -465,7 +472,7 @@ SlotFile::~SlotFile() {
   worker_.join();
 }
 
-std::shared_ptr<SlotFile::Slot> SlotFile::acquire() {
+std::shared_ptr<SlotFile::Slot> SlotFile::acquire(DiskBudget::Draw draw) {
   auto slot = std::shared_ptr<Slot>(new Slot({}, 0));
   std::lock_guard lock(backing_->mutex);
   if (backing_->adopting)
@@ -482,7 +489,7 @@ std::shared_ptr<SlotFile::Slot> SlotFile::acquire() {
         list->reserve(std::max<size_t>(1, 2 * list->capacity()));
     }
   }
-  if (!backing_->budget->reserve(backing_->slotBytes)) return {};
+  if (!backing_->budget->reserve(backing_->slotBytes, draw)) return {};
   uint32_t index;
   if (!backing_->free.empty()) {
     index = backing_->free.back();
@@ -853,6 +860,13 @@ std::shared_ptr<SlotFile::Operation> SlotFile::read(
     }
     return true;
   }, std::move(completion));
+}
+
+std::optional<std::span<const std::byte>> SlotFile::readAt(const Slot &, uint64_t, uint64_t,
+                                                           std::span<std::byte>) const noexcept {
+  // Stub, which the SSD I/O foundation replaces: no slot is read
+  // beside the worker.
+  return std::nullopt;
 }
 
 } // namespace splash::model

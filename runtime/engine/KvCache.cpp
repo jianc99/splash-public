@@ -386,6 +386,22 @@ void KvCache::setTransferring(uint64_t blockId, bool transferring) {
   reindex(entry);
 }
 
+void KvCache::setTransfer(uint64_t blockId, Transfer transfer) {
+  // Stub, which the tiered block store replaces with the two
+  // kinds of transfer: both are a transfer.
+  setTransferring(blockId, transfer != Transfer::None);
+}
+
+void KvCache::holdPage(uint32_t) {
+  // Stub, which the tiered block store replaces.
+  throw std::logic_error("held KV cache blocks are not built yet");
+}
+
+void KvCache::unholdPage(uint32_t) {
+  // Stub, which the tiered block store replaces.
+  throw std::logic_error("held KV cache blocks are not built yet");
+}
+
 void KvCache::setSlot(uint64_t blockId, std::shared_ptr<KvDiskSlot> slot) {
   Block &entry = block(blockId);
   if (!slot && entry.page == noPage)

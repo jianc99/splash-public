@@ -137,7 +137,7 @@ struct SparseRowStore::Impl {
   struct Prefetch final {
     std::vector<uint32_t> ids;
     std::vector<uint8_t> rows;
-    std::shared_ptr<WeightReaders::Batch> batch;
+    std::shared_ptr<SsdReaders::Batch> batch;
     bool ended = false; // under prefetchMutex
   };
 
@@ -285,7 +285,7 @@ struct SparseRowStore::Impl {
     readLatency.add(nanosecondsSince(started));
     readBytes.fetch_add(table.rowBytes, std::memory_order_relaxed);
   }
-  void count(const WeightReaders::Tally &tally) {
+  void count(const SsdReaders::Tally &tally) {
     readRetries.fetch_add(tally.retries, std::memory_order_relaxed);
     readErrors.fetch_add(tally.failures, std::memory_order_relaxed);
   }
@@ -294,7 +294,7 @@ struct SparseRowStore::Impl {
   // cache once the source is unchanged since they were read, but a row that
   // could not be read, a hint, is dropped; a written source poisons the
   // store for the next stage.
-  void endPrefetch(Prefetch &prefetch, const WeightReaders::Batch &batch) {
+  void endPrefetch(Prefetch &prefetch, const SsdReaders::Batch &batch) {
     count(batch.tally());
     try {
       reader->checkUnchanged();
@@ -408,7 +408,7 @@ SparseRowStageResult SparseRowStore::stage(std::span<const uint32_t> ids, std::s
     s.destinations.clear();
     for (const uint32_t u : s.missing) s.destinations.push_back(rows.data() + uint64_t{u} * rowBytes);
     // No reader writes into `rows` once the reads returned.
-    WeightReaders::Tally tally;
+    SsdReaders::Tally tally;
     try {
       s.options.readers->run(
           s.missing.size(), [&](size_t index) { s.readRow(s.unique[s.missing[index]], s.destinations[index]); },
@@ -475,7 +475,7 @@ void SparseRowStore::prefetch(std::span<const uint32_t> ids) {
         s.readRow(reading->ids[index], reading->rows.data() + index * s.table.rowBytes);
       },
       std::max(1u, s.options.readers->readers()),
-      [&s, reading](const WeightReaders::Batch &batch) { s.endPrefetch(*reading, batch); });
+      [&s, reading](const SsdReaders::Batch &batch) { s.endPrefetch(*reading, batch); });
 }
 
 void SparseRowStore::drainPrefetch() { impl_->adoptPrefetches(); }

@@ -243,8 +243,8 @@ default.
   each distinct row the step reads once into a small Shared buffer of the
   step's scratch, from the cache or, for the rows it lacks, with uncached
   (`F_NOCACHE`) row reads (90 bytes for IQ4_NL, 170 for Q8_0) by the model's
-  16 weight readers, which streamed experts share (`WeightReaders`,
-  `runtime/model/WeightReaders.hpp`), and the staging thread itself
+  16 SSD readers, which streamed experts share (`SsdReaders`,
+  `runtime/model/SsdReaders.hpp`), and the staging thread itself
   (`SparseRowStore`, `runtime/model/SparseRowStore.hpp`). The gather then
   reads them with the table's own kernel, so a row's values are computed
   exactly as from the table.

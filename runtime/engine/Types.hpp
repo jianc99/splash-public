@@ -25,6 +25,12 @@ struct StepResult final {
   DecodeStage nextDecodeStage = DecodeStage::Regular;
 };
 
+// Where a request's committed KV lives, chosen at admission and kept across
+// suspension: in memory (Resident), or, on a target that can spill, in the
+// SSD cache tier once its copies have landed, with memory keeping each
+// page's index (Spill).
+enum class KvMode : uint8_t { Resident, Spill };
+
 // Values are the Done event's reason byte.
 enum class EngineFinishReason : uint8_t {
   Stop = 0,

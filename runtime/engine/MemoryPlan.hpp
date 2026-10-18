@@ -175,6 +175,43 @@ struct BudgetValidationStatus {
   [[nodiscard]] std::string describe() const;
 };
 
+// What the engine's admission needs of the memory plan to decide which
+// requests spill (Engine::kvModeFor), as data: the bytes of a Full page, of
+// an Index page and of a tier slot; the memory left to resident KV after the
+// floors; and, per Spill request, the pages its cache keeps Full (its dense
+// history, its tail window and up to two prefill groups awaiting copies).
+struct SpillGeometry final {
+  uint64_t fullPageBytes = 0;
+  uint64_t indexPageBytes = 0;
+  uint64_t slotBytes = 0;
+  uint64_t residentKvBytes = 0;
+  uint32_t densePages = 0;
+  uint32_t windowPages = 0;
+  uint32_t groupPages = 0;
+
+  // A Resident request's KV at `tokens` tokens: its pages, Full.
+  [[nodiscard]] uint64_t residentBytes(uint64_t tokens) const noexcept;
+  // A Spill request's at `tokens` tokens: every page's index, and the pages
+  // it keeps Full.
+  [[nodiscard]] uint64_t spillFloorBytes(uint64_t tokens) const noexcept;
+};
+
+// Whether the target can spill (a spillable layout that declares its
+// SparseKvShape, with a writable tier), whether every request spills
+// (--kv-spill always, for validation), the history a row reads through its
+// page table (SparseKvShape::denseHistoryTokens), and the geometry.
+struct EngineSpillConfig final {
+  bool capable = false;
+  bool always = false;
+  uint32_t denseTokens = 0;
+  SpillGeometry geometry;
+};
+
+// Stubs, which the planner replaces: nothing is planned to
+// spill, and no request does (EngineSpillConfig::capable).
+inline uint64_t SpillGeometry::residentBytes(uint64_t) const noexcept { return 0; }
+inline uint64_t SpillGeometry::spillFloorBytes(uint64_t) const noexcept { return 0; }
+
 struct EngineMemoryPlanResult;
 
 class EngineMemoryPlan {

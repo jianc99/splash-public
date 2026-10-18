@@ -145,6 +145,12 @@ SplashKvPage PageStorage::entry(uint32_t page) const {
         address, page - static_cast<uint32_t>(extent) * extentPages_);
 }
 
+PageForm PageStorage::form(uint32_t page) const {
+    // Stub, which page forms replace: every extent is Full.
+    static_cast<void>(extentIndex(page));
+    return PageForm::Full;
+}
+
 void PageStorage::writeEntries(std::span<const uint32_t> pages,
                                uint32_t first,
                                const metal::MetalBuffer &table) const {
@@ -161,34 +167,63 @@ void PageStorage::writeEntries(std::span<const uint32_t> pages,
         entries[index] = entry(pages[index]);
 }
 
-std::vector<std::span<std::byte>> PageStorage::spans(uint32_t page) const {
+void PageStorage::writeIndexEntries(std::span<const uint32_t> pages,
+                                    uint32_t first,
+                                    const metal::MetalBuffer &table) const {
+    // Stub, which page forms replace: the index shares its
+    // page's extent until it has a buffer of its own, so its entries are the
+    // page's.
+    writeEntries(pages, first, table);
+}
+
+std::byte *PageStorage::contents(uint32_t page) const {
     auto *extent =
         static_cast<std::byte *>(extents_[extentIndex(page)].contents());
     if (!extent) {
         throw std::logic_error("KV page " + std::to_string(page) +
                                " is in an extent that is not allocated");
     }
+    return extent;
+}
+
+std::vector<std::span<std::byte>> PageStorage::spans(uint32_t page) const {
+    std::vector<std::span<std::byte>> result;
+    result.reserve(size_t{layout_.attentionLayers} *
+                   ((layout_.scaleBytesPerLayerPage() ? 4 : 2) + (layout_.indexDimension ? 1 : 0)));
+    for (uint32_t layer = 0; layer < layout_.attentionLayers; ++layer) {
+        for (const std::span<std::byte> tensor : layerSpans(page, layer)) {
+            if (!tensor.empty()) result.push_back(tensor);
+        }
+    }
+    const std::vector<std::span<std::byte>> index = indexSpans(page);
+    result.insert(result.end(), index.begin(), index.end());
+    return result;
+}
+
+std::array<std::span<std::byte>, 4> PageStorage::layerSpans(uint32_t page, uint32_t layer) const {
+    std::byte *extent = contents(page);
+    if (layer >= layout_.attentionLayers)
+        throw std::out_of_range("KV layer is outside the layout");
     const auto data = static_cast<uint32_t>(layout_.dataBytesPerLayerPage());
     const auto scale = static_cast<uint32_t>(layout_.scaleBytesPerLayerPage());
     const uint32_t index = page % extentPages_;
+    std::array<std::span<std::byte>, 4> result;
+    for (uint32_t tensor = SPLASH_KV_KEYS; tensor <= SPLASH_KV_VALUE_SCALES; ++tensor) {
+        result[tensor] = {extent + splash_kv_offset(extentPages_, data, scale, layer, tensor, index),
+                          splash_kv_page_bytes(data, scale, tensor)};
+    }
+    return result;
+}
+
+std::vector<std::span<std::byte>> PageStorage::indexSpans(uint32_t page) const {
+    std::byte *extent = contents(page);
     std::vector<std::span<std::byte>> result;
-    result.reserve(size_t{layout_.attentionLayers} * ((scale ? 4 : 2) + (layout_.indexDimension ? 1 : 0)));
-    for (uint32_t layer = 0; layer < layout_.attentionLayers; ++layer) {
-        for (uint32_t tensor = SPLASH_KV_KEYS; tensor <= SPLASH_KV_VALUE_SCALES;
-             ++tensor) {
-            if (const uint32_t bytes = splash_kv_page_bytes(data, scale, tensor)) {
-                result.emplace_back(extent + splash_kv_offset(extentPages_, data,
-                                                              scale, layer,
-                                                              tensor, index),
-                                    bytes);
-            }
-        }
-    }
-    if (layout_.indexDimension) {
-        const uint64_t bytes = layout_.indexBytesPerLayerPage();
-        for (uint32_t layer = 0; layer < layout_.attentionLayers; ++layer)
-            result.emplace_back(extent + indexOffset(layer) + index * bytes, bytes);
-    }
+    if (!layout_.indexDimension) return result;
+    const uint64_t bytes = layout_.indexBytesPerLayerPage();
+    const uint32_t index = page % extentPages_;
+    result.reserve(layout_.attentionLayers);
+    for (uint32_t layer = 0; layer < layout_.attentionLayers; ++layer)
+        result.emplace_back(extent + indexOffset(layer) + index * bytes, bytes);
     return result;
 }
 
