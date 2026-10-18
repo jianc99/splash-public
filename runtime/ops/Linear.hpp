@@ -36,6 +36,20 @@ enum class FloatTile : uint8_t { Simdgroup, NeuralAccelerator };
 void addGgufFloat(metal::CommandGraph &graph, metal::MetalBuffer input, const QuantizedSegment &weights,
                   metal::MetalBuffer output, uint32_t rows, uint32_t outStride, uint32_t outOffset,
                   FloatOutput type, FloatTile tile);
+// One of several float projections of an input, each into its own
+// destination on its own tile, as the QSA indexer projects its query and key.
+struct FloatProjection final {
+  const QuantizedSegment *weights = nullptr;
+  metal::MetalBuffer output;
+  uint32_t outStride = 0;
+  uint32_t outOffset = 0;
+  FloatTile tile = FloatTile::Simdgroup;
+};
+// The projections of `rows` rows of one input, each dispatch running up to
+// GGUF_FLOAT_PROJECTIONS (metal/abi/Gguf.h) consecutive ones of one value
+// type and tile, so that each one's outputs are those of its own dispatch.
+void addGgufFloat(metal::CommandGraph &graph, metal::MetalBuffer input, std::span<const FloatProjection> projections,
+                  uint32_t rows, FloatOutput type);
 
 struct LinearMatrix final {
   uint32_t outputSize = 0;
