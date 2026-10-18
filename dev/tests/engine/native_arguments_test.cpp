@@ -162,8 +162,14 @@ void testServerCommandLines(const char *path) {
          read.maxMemoryBytes = 32 * kGiB;
        }},
       {"ple_memory", [](NativeArguments &read) { read.pleMemory = {StreamedSetting::Mode::Size, 2 * kGiB}; }},
+      {"ple_memory_off", [](NativeArguments &read) { read.pleMemory = {StreamedSetting::Mode::Off, 0}; }},
       {"expert_memory",
        [](NativeArguments &read) { read.expertMemory = {StreamedSetting::Mode::Size, 16 * kGiB}; }},
+      {"expert_memory_off", [](NativeArguments &read) { read.expertMemory = {StreamedSetting::Mode::Off, 0}; }},
+      // Auto is the engine's default, which the server leaves out.
+      {"expert_memory_auto", [](NativeArguments &) {}},
+      {"sparse_kv_memory",
+       [](NativeArguments &read) { read.sparseKvMemory = {StreamedSetting::Mode::Size, 1200 * (kGiB >> 10)}; }},
       {"yarn", [](NativeArguments &read) { read.model.ropeScaling = {4.0, 262144}; }},
       {"yarn_context",
        [](NativeArguments &read) {

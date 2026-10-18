@@ -77,13 +77,24 @@ OPTIONS = {
     "--disable-ane": ([(["--disable-ane"], True)], []),
     "--ple-memory": values(
         "--ple-memory",
-        {"off": None, "OFF": None, "1M": 1024**2, "2G": 2 * 1024**3},
-        ("0", "auto", "bad", "-2G"),
+        {"auto": None, "off": "off", "OFF": "off", "1M": 1024**2, "2G": 2 * 1024**3},
+        ("0", "bad", "-2G"),
     ),
     "--expert-memory": values(
         "--expert-memory",
-        {"off": None, "OFF": None, "512M": 512 * 1024**2, "16G": 16 * 1024**3},
-        ("0", "auto", "bad", "-2G"),
+        {
+            "auto": None,
+            "off": "off",
+            "OFF": "off",
+            "512M": 512 * 1024**2,
+            "16G": 16 * 1024**3,
+        },
+        ("0", "bad", "-2G"),
+    ),
+    "--sparse-kv-memory": values(
+        "--sparse-kv-memory",
+        {"auto": None, "AUTO": None, "1200M": 1200 * 1024**2},
+        ("0", "off", "bad", "-2G"),
     ),
     "--max-memory": values(
         "--max-memory",
