@@ -442,12 +442,14 @@ it costs, as before, and a quota too small for one state leaves the cache off.
 requested context beside it, and gives it up to the
 [Neural Engine split](#neural-engine-prefill) where the plan holds the split
 only without it; otherwise startup says why the cache is off, and the plan is
-as without it. Memory alone decides this, so every start of a model on a Mac
-advertises the same context, whatever room the disk has. The disk decides only
-whether the cache's files open: `auto` opens them only where its limit, a
-quarter of what a local volume has beyond the floor, would hold two states and
-1 GiB of KV, on the volume of every place the cache may keep its files. Where
-no files open, startup says why the cache is off, and the staging stays unused.
+as without it. Memory alone decides this, so every start of a dense model on a
+Mac advertises the same context, whatever room the disk has; a block-sparse
+target's follows the room for its KV
+([memory and context](#memory-and-context)). The disk decides only whether
+the cache's files open: `auto` opens them only where its limit, a quarter of
+what a local volume has beyond the floor, would hold two states and 1 GiB of
+KV, on the volume of every place the cache may keep its files. Where no files
+open, startup says why the cache is off, and the staging stays unused.
 
 A write that finds the volume full while it shows room beyond the floor met a
 limit the engine cannot see, such as a volume quota, or a volume that filled

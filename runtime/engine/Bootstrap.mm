@@ -285,14 +285,17 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
     // (AneFfnOutcome::context).
     config.nativeLoop.engine.maxContext = resources->aneFfnOutcome().context;
   } else if (config.nativeLoop.engine.maxContext > planContext) {
-    // --max-memory sets the budget only below this Mac's own.
+    // --max-memory sets the budget only below this Mac's own; the SSD cache's
+    // room bounds a context whose KV spills (ContextBounds::bound).
     const auto &budget = resources->memoryPlan().breakdown();
     const bool memoryCapped = budget.configuredMemoryLimitBytes &&
                               budget.hardBudgetBytes == budget.configuredMemoryLimitBytes;
     fail(std::move(base), RuntimeBootstrapStage::ModelCreation,
          "--max-context " + std::to_string(config.nativeLoop.engine.maxContext) +
              " exceeds the " + std::to_string(planContext) + " tokens the model and " +
-             (memoryCapped ? "--max-memory" : "this Mac's memory") +
+             (budget.contextBounds.bound() == "disk" ? "the SSD cache's room for its KV"
+              : memoryCapped                         ? "--max-memory"
+                                                     : "this Mac's memory") +
              " allow; omit it or pass at most " + std::to_string(planContext));
   }
   // YaRN changes every answer, which only a context past the native window
