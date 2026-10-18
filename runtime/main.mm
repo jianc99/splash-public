@@ -210,8 +210,10 @@ bootstrapConfig(const engine::NativeArguments &arguments) {
   config.resources.idleReleaseSeconds = arguments.idleReleaseSeconds;
   config.resources.aneFfn.enabled = arguments.neuralEngine;
   config.resources.relaunchContext = arguments.relaunchContext;
-  config.resources.streamedTableBytes = arguments.streamedTableBytes;
-  config.resources.expertMemoryBytes = arguments.expertMemoryBytes;
+  config.resources.pleMemory = arguments.pleMemory;
+  config.resources.expertMemory = arguments.expertMemory;
+  config.resources.sparseKvMemory = arguments.sparseKvMemory;
+  config.resources.kvSpillAlways = arguments.kvSpillAlways;
   config.nativeLoop.engine.maxContext = arguments.maxContext;
   config.nativeLoop.engine.decodeShare = arguments.decodeShare;
   return config;
