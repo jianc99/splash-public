@@ -5,15 +5,18 @@
 // do, their slots holding the reference repack's planes, in as many rounds as
 // the staging needs, and read ahead the next round's experts or the next
 // block's a long chunk routes or a decode step predicts; a decode step's
-// experts outlive long chunks of other blocks; the union of a block's steps
-// loads at once; a size of one block holds every expert, through a release
-// and a restore; long chunks load in rounds through half the staging, also
-// across a release while the next block's experts are read ahead; a read
-// ahead that fails fails no load that does not route its expert, a read of a
-// routed expert that fails fails the load, and a source written since it was
-// opened fails the load's command, which the store reports; memory one
-// byte short of a block's slots is refused; and a size whose slots would take
-// more than the largest buffer keeps its blocks in arenas that fit.
+// experts outlive long chunks of other blocks; decode steps that loop over
+// more blocks' experts than the arena holds keep finding some of them
+// resident, recycling those of the block they just loaded; the union of a
+// block's steps loads at once; a size of one block holds every expert,
+// through a release and a restore; long chunks load in rounds through half
+// the staging, also across a release while the next block's experts are read
+// ahead; a read ahead that fails fails no load that does not route its
+// expert, a read of a routed expert that fails fails the load, and a source
+// written since it was opened fails the load's command, which the store
+// reports; memory one byte short of a block's slots is refused; and a size
+// whose slots would take more than the largest buffer keeps its blocks in
+// arenas that fit.
 #include "MoeFixture.hpp"
 #include "TestAdmission.hpp"
 #include "TestChecks.hpp"
@@ -360,6 +363,58 @@ int streamedChunkOrder(MetalBackend &backend, const MoeShape &shape, const std::
   }
   printf("streamed experts: a decode step's %zu experts outlive two long chunks of other blocks in %llu slots %s\n",
          routed.size(), (unsigned long long)slots, failures ? "FAIL" : "ok");
+  return failures;
+}
+
+// A load recycles the slots of the block the steps come back to last: blocks
+// that share an arena of one block's experts and three slots route the same
+// experts for a decode row, more of them in a cycle of the blocks than the
+// arena holds, and every cycle after the first finds some of them resident
+// (recycling the least recently used slot would find none: each block's
+// experts gone before the cycle came back), each step giving the resident
+// experts' bits.
+int streamedCycleOrder(MetalBackend &backend, const MoeShape &shape, const std::filesystem::path &directory) {
+  const Model m = makeModel(backend, shape, Q4K, true);
+  ExpertFile file(m, directory / "experts.bin");
+  Buffers b;
+  const MoePlan decode = MoE::decodePlan(shape, 1, MoeConfig{});
+  freshRows(backend, b, shape);
+  const std::vector<uint16_t> want = runWeights(backend, m.weights, b, decode);
+  const auto *selected = static_cast<const uint32_t *>(b.moe.scratch.selectedExperts.contents());
+  std::set<uint32_t> routed;
+  for (uint32_t route = 0; route < decode.rows() * shape.routesPerToken(); ++route)
+    if (selected[route] < shape.experts) routed.insert(selected[route]);
+  const uint64_t slots = shape.experts + 3;
+  const uint32_t count = static_cast<uint32_t>(slots / routed.size() + 2);
+  StreamedBlocks blocks = file.blocks;
+  blocks.blocks.assign(count, file.blocks.blocks.front());
+  ExpertStore store(backend, blocks, shape, storeOptions(arenaBytes(m, slots) + kSpareBytes, blocks, shape));
+  std::vector<BlockMoeWeights> streamed(count, m.weights);
+  for (uint32_t block = 0; block < count; ++block) store.bind(block, streamed[block]);
+  int failures = 0;
+  std::vector<uint64_t> reads;
+  for (uint32_t cycle = 0; cycle < 3; ++cycle) {
+    const uint64_t before = store.stats().uses[1].read;
+    for (uint32_t block = 0; block < count; ++block)
+      if (runWeights(backend, streamed[block], b, decode) != want ||
+          !slotsHoldTheirExperts(m, streamed[block], b, decode)) {
+        printf("  streamed cycle order, cycle %u block %u: output or slots differ from the resident experts' FAIL\n",
+               cycle, block);
+        ++failures;
+      }
+    reads.push_back(store.stats().uses[1].read - before);
+  }
+  const uint64_t routes = uint64_t{count} * routed.size();
+  std::string counts;
+  for (const uint64_t read : reads) counts += " " + std::to_string(read);
+  if (reads.front() != routes ||
+      std::any_of(reads.begin() + 1, reads.end(), [&](uint64_t read) { return read >= routes; })) {
+    printf("  streamed cycle order: cycles of %llu routes over %llu slots read%s FAIL\n", (unsigned long long)routes,
+           (unsigned long long)slots, counts.c_str());
+    ++failures;
+  }
+  printf("streamed experts: decode cycles over %u blocks of %zu experts each in %llu slots read%s %s\n", count,
+         routed.size(), (unsigned long long)slots, counts.c_str(), failures ? "FAIL" : "ok");
   return failures;
 }
 
@@ -784,6 +839,7 @@ int main(int argc, const char *argv[]) {
                shape.expertIntermediateSize);
         failures += streamedExperts(backend, shape, directory.path()) +
                     streamedChunkOrder(backend, shape, directory.path()) +
+                    streamedCycleOrder(backend, shape, directory.path()) +
                     streamedUnionLoads(backend, shape, directory.path()) +
                     streamedLoneBlockSize(backend, shape, directory.path()) +
                     streamedRounds(backend, shape, directory.path()) +

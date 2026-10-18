@@ -226,7 +226,9 @@ struct ExpertStore::Impl {
     std::vector<uint32_t> ownerBlock, ownerExpert; // kNoSlot when free
   };
   struct Block final {
-    uint32_t size = 0;
+    // Its size, and its place among the size's blocks, in the order a step
+    // loads them (its position in the size's SlotRecycler).
+    uint32_t size = 0, position = 0;
     gguf::StreamedExperts experts;
     std::vector<uint32_t> slot; // each expert's, kNoSlot when not resident
     // Its router and shared-expert gate (bind), which predict its routes.
@@ -412,7 +414,7 @@ void ExpertStore::Impl::route(uint32_t index, std::span<const std::span<const Mo
   std::ranges::sort(pending);
   uint32_t *table = static_cast<uint32_t *>(tables.contents()) + uint64_t{index} * shape.experts;
   for (auto &[expert, slot] : pending) {
-    slot = size.recycling.claim(uint64_t{index} << 32 | expert, serial, chunk);
+    slot = size.recycling.claim(uint64_t{index} << 32 | expert, serial, chunk, block.position);
     evict(size, slot);
     size.ownerBlock[slot] = index;
     size.ownerExpert[slot] = expert;
@@ -859,8 +861,10 @@ ExpertStore::ExpertStore(metal::MetalBackend &backend, StreamedBlocks streamed, 
         if (geometry.layoutOf[block] == layout) members.push_back(block);
       for (uint32_t part = 0; part < parts[layout]; ++part) {
         const size_t from = members.size() * part / parts[layout], to = members.size() * (part + 1) / parts[layout];
-        for (size_t member = from; member < to; ++member)
+        for (size_t member = from; member < to; ++member) {
           impl.blocks[members[member]].size = static_cast<uint32_t>(impl.sizes.size());
+          impl.blocks[members[member]].position = static_cast<uint32_t>(member - from);
+        }
         impl.sizes.push_back({.layout = geometry.layouts[layout],
                               .blocks = static_cast<uint32_t>(to - from),
                               .streams = geometry.streams(layout)});
@@ -909,7 +913,7 @@ ExpertStore::ExpertStore(metal::MetalBackend &backend, StreamedBlocks streamed, 
     size.arena = backend.allocateBuffer(region, metal::BufferStorage::Shared,
                                         "experts/arena-" + std::to_string(index));
     impl.arenaTotal += region;
-    size.recycling = SlotRecycler(size.slots);
+    size.recycling = SlotRecycler(size.slots, size.blocks);
     size.ownerBlock.assign(size.slots, kNoSlot);
     size.ownerExpert.assign(size.slots, kNoSlot);
   }

@@ -78,27 +78,43 @@ void SlotRecycler::Links::prepend(Order &order, uint32_t at) noexcept {
   ++order.count;
 }
 
-SlotRecycler::SlotRecycler(uint32_t slots) { resize(slots); }
+SlotRecycler::SlotRecycler(uint32_t slots, uint32_t cycle) {
+  if (cycle == 0) throw std::invalid_argument("a slot recycler's cycle has no position");
+  recent_.at.resize(cycle);
+  frequent_.at.resize(cycle);
+  resize(slots);
+}
 
 void SlotRecycler::unlink(uint32_t slot) {
-  links_.unlink(slots(List(list_[slot])), slot);
+  Positions &list = slots(List(list_[slot]));
+  links_.unlink(list.at[position_[slot]], slot);
+  --list.count;
   list_[slot] = Free;
 }
 
 void SlotRecycler::append(uint32_t slot, List list) {
   list_[slot] = list;
-  links_.append(slots(list), slot);
+  Positions &into = slots(list);
+  links_.append(into.at[position_[slot]], slot);
+  ++into.count;
 }
 
 void SlotRecycler::prepend(uint32_t slot, List list) {
   list_[slot] = list;
-  links_.prepend(slots(list), slot);
+  Positions &into = slots(list);
+  links_.prepend(into.at[position_[slot]], slot);
+  ++into.count;
 }
 
-uint32_t SlotRecycler::oldest(List list, uint64_t load) const {
-  uint32_t slot = list == Recent ? recent_.head : frequent_.head;
-  while (slot != kNone && lastLoad_[slot] == load) slot = links_.next[slot];
-  return slot;
+uint32_t SlotRecycler::oldest(List list, uint32_t position, uint64_t load) const {
+  const std::vector<Order> &at = (list == Recent ? recent_ : frequent_).at;
+  const uint32_t cycle = static_cast<uint32_t>(at.size());
+  for (uint32_t back = 0; back < cycle; ++back) {
+    uint32_t slot = at[(position + cycle - back) % cycle].head;
+    while (slot != kNone && lastLoad_[slot] == load) slot = links_.next[slot];
+    if (slot != kNone) return slot;
+  }
+  return kNone;
 }
 
 void SlotRecycler::addGhost(uint64_t key, List list) {
@@ -134,11 +150,11 @@ void SlotRecycler::evict(uint32_t slot, bool ghost) {
   scan_[slot] = 0;
 }
 
-uint32_t SlotRecycler::replace(uint64_t load, bool frequentGhost) {
+uint32_t SlotRecycler::replace(uint32_t position, uint64_t load, bool frequentGhost) {
   const bool fromRecent =
       recent_.count && (recent_.count > target_ || (frequentGhost && recent_.count == target_));
-  uint32_t slot = oldest(fromRecent ? Recent : Frequent, load);
-  if (slot == kNone) slot = oldest(fromRecent ? Frequent : Recent, load);
+  uint32_t slot = oldest(fromRecent ? Recent : Frequent, position, load);
+  if (slot == kNone) slot = oldest(fromRecent ? Frequent : Recent, position, load);
   if (slot == kNone) throw std::runtime_error("a slot recycler holds fewer slots than one load's keys");
   evict(slot, true);
   return slot;
@@ -159,12 +175,13 @@ void SlotRecycler::touch(uint32_t slot, uint64_t load, bool chunk) {
   append(slot, Frequent);
 }
 
-uint32_t SlotRecycler::claim(uint64_t key, uint64_t load, bool chunk) {
+uint32_t SlotRecycler::claim(uint64_t key, uint64_t load, bool chunk, uint32_t position) {
+  if (position >= recent_.at.size()) throw std::invalid_argument("a key's position is past a slot recycler's cycle");
   const uint64_t slots = size();
   const uint32_t ghost = ghostOf_.find(key);
   const List gaveUp = ghost == KeyIndex::kAbsent ? Free : List(ghostList_[ghost]);
   const auto take = [&](bool frequentGhost) {
-    if (free_.empty()) return replace(load, frequentGhost);
+    if (free_.empty()) return replace(position, load, frequentGhost);
     const uint32_t slot = free_.back();
     free_.pop_back();
     return slot;
@@ -189,16 +206,16 @@ uint32_t SlotRecycler::claim(uint64_t key, uint64_t load, bool chunk) {
       if (recent >= slots) {
         if (recent_.count < slots && recentGhosts_.count) {
           dropGhost(recentGhosts_.head);
-          slot = replace(load, false);
+          slot = replace(position, load, false);
         } else {
           // T1 holds every slot: its oldest goes without a ghost.
-          slot = oldest(Recent, load);
+          slot = oldest(Recent, position, load);
           if (slot == kNone) throw std::runtime_error("a slot recycler holds fewer slots than one load's keys");
           evict(slot, false);
         }
       } else {
         if (all >= 2 * slots && frequentGhosts_.count) dropGhost(frequentGhosts_.head);
-        slot = replace(load, false);
+        slot = replace(position, load, false);
       }
     } else {
       slot = take(false);
@@ -207,6 +224,7 @@ uint32_t SlotRecycler::claim(uint64_t key, uint64_t load, bool chunk) {
   key_[slot] = key;
   lastLoad_[slot] = load;
   scan_[slot] = chunk;
+  position_[slot] = position;
   slotOf_.insert(key, slot);
   if (frequent) append(slot, Frequent);
   else if (chunk) prepend(slot, Recent);
@@ -225,7 +243,10 @@ void SlotRecycler::free(uint32_t slot) {
 }
 
 void SlotRecycler::reset() {
-  recent_ = frequent_ = {};
+  for (Positions *list : {&recent_, &frequent_}) {
+    std::ranges::fill(list->at, Order{});
+    list->count = 0;
+  }
   slotOf_.clear();
   forgetGhosts();
   target_ = 0;
@@ -250,6 +271,7 @@ void SlotRecycler::resize(uint32_t slots) {
   links_.previous.resize(slots);
   links_.next.resize(slots);
   key_.resize(slots);
+  position_.resize(slots, 0);
   lastLoad_.resize(slots, 0);
   for (uint32_t slot = slots; slot-- > held;) free_.push_back(slot);
   slotOf_.reserve(slots);

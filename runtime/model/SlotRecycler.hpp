@@ -22,6 +22,16 @@
 // misses enter T1 at its least recently used end and leave no ghost, and its
 // hits move nothing, so a prompt does not flush what decode steps route.
 //
+// The keys sit at positions of a cycle the loads visit in order (`cycle`;
+// an expert arena's blocks, which each decode step and each prefill chunk
+// route one after another), and of the list ARC recycles from, the slot that
+// goes is of the position the loads reach last: the load's own first (a key
+// there it does not use waits a whole cycle), then the one before it, and so
+// on back to the one after it; within a position, the least recently used.
+// Recency over every position would as soon give up a key the loads reach in
+// a few blocks as one they just passed. With one position (a layer's K/V
+// blocks) this is ARC.
+//
 // The keys of the slots and of the ghosts are in flat tables, and the ghosts
 // in lists over arrays as many as the slots: a claim allocates nothing, and
 // only resize() does.
@@ -37,8 +47,8 @@ namespace splash::model {
 
 class SlotRecycler final {
 public:
-  // `slots` slots, every one free.
-  explicit SlotRecycler(uint32_t slots);
+  // `slots` slots, every one free, of keys at `cycle` positions.
+  explicit SlotRecycler(uint32_t slots, uint32_t cycle = 1);
 
   // The slot that holds `key`, if any.
   [[nodiscard]] std::optional<uint32_t> find(uint64_t key) const noexcept;
@@ -47,11 +57,11 @@ public:
   // Whether load `load` touched or claimed `slot`, which it then never
   // recycles.
   [[nodiscard]] bool pinned(uint32_t slot, uint64_t load) const noexcept { return lastLoad_[slot] == load; }
-  // The slot load `load`'s missing key `key` (unique in the store) takes:
-  // free, or the one whose key to evict; then it holds `key` and is the
-  // load's. Throws std::runtime_error when every slot holds a key the load
-  // uses.
-  [[nodiscard]] uint32_t claim(uint64_t key, uint64_t load, bool chunk);
+  // The slot load `load`'s missing key `key` (unique in the store), at the
+  // load's position `position`, takes: free, or the one whose key to evict;
+  // then it holds `key` and is the load's. Throws std::runtime_error when
+  // every slot holds a key the load uses.
+  [[nodiscard]] uint32_t claim(uint64_t key, uint64_t load, bool chunk, uint32_t position = 0);
   // `slot` holds no key (a failed load claimed it): the first claimed.
   void free(uint32_t slot);
   // Every slot free, and no ghost.
@@ -101,18 +111,24 @@ private:
     void append(Order &order, uint32_t at) noexcept;
     void prepend(Order &order, uint32_t at) noexcept;
   };
+  // The slots of T1 or T2: an order at each position, and how many in all.
+  struct Positions final {
+    std::vector<Order> at;
+    uint32_t count = 0;
+  };
 
-  [[nodiscard]] Order &slots(List list) noexcept { return list == Recent ? recent_ : frequent_; }
+  [[nodiscard]] Positions &slots(List list) noexcept { return list == Recent ? recent_ : frequent_; }
   [[nodiscard]] Order &ghosts(List list) noexcept { return list == Recent ? recentGhosts_ : frequentGhosts_; }
   void unlink(uint32_t slot);
   void append(uint32_t slot, List list);
   void prepend(uint32_t slot, List list);
-  // The least recently used slot of `list` the load does not use, or none.
-  [[nodiscard]] uint32_t oldest(List list, uint64_t load) const;
+  // The slot of `list` the load at `position` does not use that the loads
+  // reach last, or none.
+  [[nodiscard]] uint32_t oldest(List list, uint32_t position, uint64_t load) const;
   // Recycles a slot of T1 or T2 (ARC's REPLACE, `frequentGhost` when the
   // key T2 gave up claims it): its key becomes a ghost, unless a scan brought
   // it.
-  [[nodiscard]] uint32_t replace(uint64_t load, bool frequentGhost);
+  [[nodiscard]] uint32_t replace(uint32_t position, uint64_t load, bool frequentGhost);
   // `slot` leaves its list and gives its key up, as a ghost or not.
   void evict(uint32_t slot, bool ghost);
   void addGhost(uint64_t key, List list);
@@ -121,9 +137,9 @@ private:
 
   std::vector<uint8_t> list_, scan_;
   Links links_;
-  std::vector<uint32_t> free_;
+  std::vector<uint32_t> free_, position_;
   std::vector<uint64_t> key_, lastLoad_;
-  Order recent_, frequent_;
+  Positions recent_, frequent_;
   KeyIndex slotOf_;
   // The ghosts: each a key of B1 or B2 (ghostList_) in a list of its own, at
   // most as many as the slots; the unused ones are freeGhosts_.

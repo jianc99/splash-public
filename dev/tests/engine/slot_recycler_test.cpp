@@ -5,8 +5,13 @@
 // scan of more experts than the slots leaves the experts decode steps routed
 // again in place; and when more lanes add experts to each cycle until a cycle
 // routes more than the slots hold, the experts every cycle routes keep
-// hitting (recycling the least recently used slot keeps a fifth of them). A
-// claim allocates nothing. On the decode selections of real requests
+// hitting (recycling the least recently used slot keeps a fifth of them). Of
+// the list adaptive replacement recycles from, the slot that goes is of the
+// position of the cycle the loads reach last, as a reference model of the
+// policy over lists of keys recycles them, load by load, with one position
+// (adaptive replacement alone) and with six; and loads that loop over more
+// keys than the slots keep hitting, where one position hits none. A claim
+// allocates nothing. On the decode selections of real requests
 // (dev/tests/fixtures/kv-selection-traces, the directory the test takes), the
 // hot block cache's resolves miss at most 2% more than recycling the least
 // recently used block would.
@@ -14,6 +19,7 @@
 #include "model/SlotRecycler.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
@@ -23,6 +29,7 @@
 #include <list>
 #include <map>
 #include <new>
+#include <random>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -189,6 +196,245 @@ void aRoutedCoreOutlivesMoreLanes() {
   }
 }
 
+// The policy as SlotRecycler's description reads, over lists of keys: T1 and
+// T2, a least-recently-used order of keys at each position, and B1 and B2,
+// the keys each gave up lately; a claim recycles, of the list adaptive
+// replacement picks, the least recently used key the load does not use of
+// the first position that holds one, from the load's own back around the
+// cycle.
+class Reference final {
+public:
+  Reference(uint32_t slots, uint32_t cycle) : slots_(slots), lists_{Lists(cycle), Lists(cycle)} {}
+
+  [[nodiscard]] bool holds(uint64_t key) const { return held_.contains(key); }
+  [[nodiscard]] uint64_t ghostHits() const { return ghostHits_; }
+
+  void touch(uint64_t key, uint64_t load, bool chunk) {
+    Held &held = held_.at(key);
+    held.load = load;
+    if (chunk) return;
+    lists_[held.list][held.position].remove(key);
+    held.list = kFrequent;
+    held.scan = false;
+    lists_[kFrequent][held.position].push_back(key);
+  }
+
+  void claim(uint64_t key, uint64_t load, bool chunk, uint32_t position) {
+    const bool recentGhost = gaveUp(kRecent, key), frequentGhost = gaveUp(kFrequent, key);
+    if (!chunk && (recentGhost || frequentGhost)) {
+      const size_t mine = ghosts_[frequentGhost].size(), other = ghosts_[!frequentGhost].size();
+      const uint64_t step = std::max<uint64_t>(1, other / mine);
+      target_ = recentGhost ? std::min<uint64_t>(slots_, target_ + step) : target_ > step ? target_ - step : 0;
+      ++ghostHits_;
+      ghosts_[frequentGhost].remove(key);
+      if (held_.size() == slots_) replace(position, load, frequentGhost);
+      hold(key, kFrequent, position, load, false);
+      return;
+    }
+    ghosts_[kRecent].remove(key);
+    ghosts_[kFrequent].remove(key);
+    if (held_.size() == slots_) {
+      const size_t recent = count(kRecent) + ghosts_[kRecent].size();
+      if (recent >= slots_ && (count(kRecent) == slots_ || ghosts_[kRecent].empty())) {
+        evict(victim(kRecent, position, load), false);
+      } else {
+        if (recent >= slots_) ghosts_[kRecent].pop_front();
+        else if (recent + count(kFrequent) + ghosts_[kFrequent].size() >= 2 * slots_ && !ghosts_[kFrequent].empty())
+          ghosts_[kFrequent].pop_front();
+        replace(position, load, false);
+      }
+    }
+    hold(key, kRecent, position, load, chunk);
+  }
+
+  void free(uint64_t key) {
+    const Held &held = held_.at(key);
+    lists_[held.list][held.position].remove(key);
+    held_.erase(key);
+  }
+  void grow(uint32_t slots) { slots_ = slots; }
+  void reset() {
+    held_.clear();
+    for (Lists &list : lists_)
+      for (std::list<uint64_t> &at : list) at.clear();
+    for (std::list<uint64_t> &ghosts : ghosts_) ghosts.clear();
+    target_ = 0;
+  }
+
+private:
+  static constexpr uint64_t kNoKey = UINT64_MAX;
+  static constexpr int kRecent = 0, kFrequent = 1;
+  using Lists = std::vector<std::list<uint64_t>>;
+  struct Held final {
+    int list = kRecent;
+    uint32_t position = 0;
+    uint64_t load = 0;
+    bool scan = false;
+  };
+
+  [[nodiscard]] bool gaveUp(int list, uint64_t key) const {
+    return std::ranges::find(ghosts_[list], key) != ghosts_[list].end();
+  }
+  [[nodiscard]] size_t count(int list) const {
+    size_t keys = 0;
+    for (const std::list<uint64_t> &at : lists_[list]) keys += at.size();
+    return keys;
+  }
+  [[nodiscard]] uint64_t victim(int list, uint32_t position, uint64_t load) const {
+    const uint32_t cycle = static_cast<uint32_t>(lists_[list].size());
+    for (uint32_t back = 0; back < cycle; ++back)
+      for (const uint64_t key : lists_[list][(position + cycle - back) % cycle])
+        if (held_.at(key).load != load) return key;
+    return kNoKey;
+  }
+  void replace(uint32_t position, uint64_t load, bool frequentGhost) {
+    const bool fromRecent =
+        count(kRecent) && (count(kRecent) > target_ || (frequentGhost && count(kRecent) == target_));
+    uint64_t key = victim(fromRecent ? kRecent : kFrequent, position, load);
+    if (key == kNoKey) key = victim(fromRecent ? kFrequent : kRecent, position, load);
+    evict(key, true);
+  }
+  void evict(uint64_t key, bool ghost) {
+    require(key != kNoKey, "the reference found no key to recycle");
+    const Held held = held_.at(key);
+    lists_[held.list][held.position].remove(key);
+    if (ghost && !held.scan) ghosts_[held.list].push_back(key);
+    held_.erase(key);
+  }
+  // A scan's key enters T1 at its least recently used end.
+  void hold(uint64_t key, int list, uint32_t position, uint64_t load, bool scan) {
+    held_[key] = {list, position, load, scan};
+    if (scan) lists_[list][position].push_front(key);
+    else lists_[list][position].push_back(key);
+  }
+
+  uint64_t slots_;
+  std::array<Lists, 2> lists_;
+  std::array<std::list<uint64_t>, 2> ghosts_;
+  std::map<uint64_t, Held> held_;
+  uint64_t target_ = 0, ghostHits_ = 0;
+};
+
+// Loads of six positions' keys, skewed to each position's first: mostly
+// short loads in the cycle's order, a long chunk's scans every fifth cycle,
+// now and then a load at another position, a slot a load claimed freed (its
+// read failed), more slots once and a reset once; after every load the
+// recycler holds the keys the reference holds, and it never took a slot of a
+// key the load uses.
+void followsItsReference(uint32_t cycle) {
+  constexpr uint32_t kPositions = 6, kKeys = 24, kLoads = 6000;
+  SlotRecycler slots(40, cycle);
+  Reference reference(40, cycle);
+  std::mt19937 random(cycle);
+  std::vector<uint64_t> owner(56, Arena::kFree);
+  std::map<uint64_t, uint32_t> slotOf;
+  const std::string where = "cycle " + std::to_string(cycle) + ": ";
+  for (uint64_t load = 1; load <= kLoads; ++load) {
+    if (load == kLoads / 3) {
+      slots.resize(56);
+      reference.grow(56);
+    }
+    if (load == 2 * kLoads / 3) {
+      slots.reset();
+      reference.reset();
+      slotOf.clear();
+      std::ranges::fill(owner, Arena::kFree);
+    }
+    const uint32_t at = load % 11 == 0 ? random() % kPositions : load % kPositions;
+    const bool chunk = load / kPositions % 5 == 0;
+    std::set<uint64_t> keys;
+    for (uint32_t route = 0, routes = chunk ? 16 + random() % 8 : 2 + random() % 9; route < routes; ++route)
+      keys.insert(uint64_t{at} << 32 | std::min(random() % kKeys, random() % kKeys));
+    const uint32_t position = at % cycle;
+    std::vector<uint64_t> missing;
+    for (const uint64_t key : keys)
+      if (const auto found = slotOf.find(key); found != slotOf.end()) {
+        slots.touch(found->second, load, chunk);
+        reference.touch(key, load, chunk);
+      } else {
+        missing.push_back(key);
+      }
+    for (const uint64_t key : missing) {
+      const uint32_t slot = slots.claim(key, load, chunk, position);
+      reference.claim(key, load, chunk, position);
+      require(owner[slot] == Arena::kFree || !keys.contains(owner[slot]), where + "a load took a slot of its own");
+      if (owner[slot] != Arena::kFree) slotOf.erase(owner[slot]);
+      owner[slot] = key;
+      slotOf[key] = slot;
+    }
+    if (load % 37 == 0 && !missing.empty()) {
+      const uint64_t failed = missing.back();
+      slots.free(slotOf.at(failed));
+      reference.free(failed);
+      owner[slotOf.at(failed)] = Arena::kFree;
+      slotOf.erase(failed);
+    }
+    for (uint64_t key = 0; key < kKeys; ++key)
+      for (uint64_t place = 0; place < kPositions; ++place) {
+        const uint64_t held = place << 32 | key;
+        require(slots.find(held).has_value() == reference.holds(held),
+                where + "load " + std::to_string(load) + " left key " + std::to_string(key) + " of position " +
+                    std::to_string(place) + (reference.holds(held) ? " out, which the reference holds"
+                                                                    : " in, which the reference recycled"));
+      }
+    require(slots.ghostHits() == reference.ghostHits(), where + "the ghosts' claims differ from the reference's");
+  }
+  require(slots.ghostHits() > 0, where + "the loads hit no ghost");
+}
+
+void positionsOfTheCycle() {
+  rejects([] { static_cast<void>(SlotRecycler(4, 0)); }, "no position", "a cycle of no position was taken");
+  SlotRecycler slots(4, 3);
+  rejects([&] { static_cast<void>(slots.claim(1, 1, false, 3)); }, "past", "a position past the cycle was taken");
+  // Keys at positions 0, 1 and 2 fill T1, and a load at 2 claims three more:
+  // the keys of its own position it does not use go first, then that of the
+  // position before it (1), not the least recently used (0).
+  static_cast<void>(slots.claim(10, 1, false, 0));
+  static_cast<void>(slots.claim(11, 2, false, 1));
+  static_cast<void>(slots.claim(20, 3, false, 2));
+  static_cast<void>(slots.claim(21, 4, false, 2));
+  static_cast<void>(slots.claim(22, 5, false, 2));
+  require(!slots.find(20) && slots.find(10) && slots.find(11), "a load recycled a key of another position first");
+  static_cast<void>(slots.claim(23, 5, false, 2));
+  require(!slots.find(21) && slots.find(10) && slots.find(11), "a load recycled a key of another position first");
+  static_cast<void>(slots.claim(24, 5, false, 2));
+  require(!slots.find(11) && slots.find(10), "a load passed over the position before its own");
+}
+
+void aLoopOfMoreKeysThanSlotsKeepsHitting() {
+  // Six positions route their ten keys every cycle, sixty keys for forty
+  // slots: recycling by recency alone gives up each position's keys before
+  // the cycle comes back to them; by the cycle, it gives up those it just
+  // passed.
+  constexpr uint32_t kPositions = 6, kKeys = 10, kSlots = 40;
+  std::array<double, 2> rates{};
+  for (const uint32_t cycle : {1u, kPositions}) {
+    SlotRecycler slots(kSlots, cycle);
+    uint64_t hits = 0, routes = 0, load = 0;
+    for (int pass = 0; pass < 30; ++pass)
+      for (uint32_t position = 0; position < kPositions; ++position) {
+        ++load;
+        std::vector<uint64_t> missing;
+        for (uint64_t key = 0; key < kKeys; ++key) {
+          const uint64_t held = uint64_t{position} << 32 | key;
+          if (const auto slot = slots.find(held)) {
+            slots.touch(*slot, load, false);
+            hits += pass >= 5;
+          } else {
+            missing.push_back(held);
+          }
+          routes += pass >= 5;
+        }
+        for (const uint64_t key : missing) static_cast<void>(slots.claim(key, load, false, position % cycle));
+      }
+    rates[cycle > 1] = double(hits) / double(routes);
+  }
+  std::cout << "slot_recycler_test: a loop of 60 keys over 40 slots hits " << rates[0] << " by recency, " << rates[1]
+            << " by the cycle\n";
+  require(rates[0] < 0.1 && rates[1] > 0.4, "recycling by the cycle did not keep the loop hitting: " +
+                                                 std::to_string(rates[0]) + " vs " + std::to_string(rates[1]));
+}
+
 void claimsAllocateNothing() {
   // Loads of 32 keys used again and again and 16 of 56 others in turn: the
   // 64 slots recycle the others, which come back as ghosts; every seventh
@@ -198,19 +444,22 @@ void claimsAllocateNothing() {
     for (uint64_t key = 0; key < 32; ++key) loads[load].push_back(key);
     for (uint64_t other = 0; other < 16; ++other) loads[load].push_back(1000 + (load * 16 + other) % 56);
   }
-  SlotRecycler slots(64);
-  uint64_t before = 0;
-  for (uint64_t load = 1; load <= loads.size(); ++load) {
-    if (load == 100) before = allocations;
-    const std::vector<uint64_t> &keys = loads[load - 1];
-    const bool chunk = load % 7 == 0;
-    for (const uint64_t key : keys)
-      if (const auto slot = slots.find(key)) slots.touch(*slot, load, chunk);
-      else static_cast<void>(slots.claim(key, load, chunk));
-    if (load % 50 == 0) slots.free(*slots.find(keys.front()));
+  // The same with the loads at four positions in turn.
+  for (const uint32_t cycle : {1u, 4u}) {
+    SlotRecycler slots(64, cycle);
+    uint64_t before = 0;
+    for (uint64_t load = 1; load <= loads.size(); ++load) {
+      if (load == 100) before = allocations;
+      const std::vector<uint64_t> &keys = loads[load - 1];
+      const bool chunk = load % 7 == 0;
+      for (const uint64_t key : keys)
+        if (const auto slot = slots.find(key)) slots.touch(*slot, load, chunk);
+        else static_cast<void>(slots.claim(key, load, chunk, static_cast<uint32_t>(load % cycle)));
+      if (load % 50 == 0) slots.free(*slots.find(keys.front()));
+    }
+    require(allocations == before, "a claim allocated: " + std::to_string(allocations - before) + " allocations");
+    require(slots.ghostHits() > 0, "the loads hit no ghost");
   }
-  require(allocations == before, "a claim allocated: " + std::to_string(allocations - before) + " allocations");
-  require(slots.ghostHits() > 0, "the loads hit no ghost");
 }
 
 // The decode selections of a trace (dev/tools/kv_selection_traces.py): per
@@ -337,6 +586,10 @@ int main(int argc, char **argv) {
     resizes();
     aScanSparesTheFrequent();
     aRoutedCoreOutlivesMoreLanes();
+    positionsOfTheCycle();
+    followsItsReference(1);
+    followsItsReference(6);
+    aLoopOfMoreKeysThanSlotsKeepsHitting();
     claimsAllocateNothing();
     adaptiveReplacementKeepsUpWithRecency(argv[1]);
   } catch (const std::exception &error) {

@@ -11,10 +11,12 @@
 // blocks, when one would take more than the device's largest buffer. A size
 // of several blocks streams: an arena's slots are recycled across its blocks
 // by adaptive replacement (SlotRecycler), which keeps the experts decode steps
-// route again and again, and recycles a long prefill chunk's loads first. A
-// size of one block (a layer whose experts take formats no other layer's do, as a
-// dynamic quantization leaves some) holds every one of its experts: they are
-// read when the store is built or restored, and nothing loads them again.
+// route again and again, and recycles a long prefill chunk's loads first;
+// of either, the experts of the block the steps load last go first (the
+// loading block's, then the one before it). A size of one block (a layer
+// whose experts take formats no other layer's do, as a dynamic quantization
+// leaves some) holds every one of its experts: they are read when the store
+// is built or restored, and nothing loads them again.
 //
 // A streamed block's load runs after its steps' grouping (ops::
 // MoeExpertStream), in rounds: each a host step of the command, which claims
