@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <limits>
 #include <stdexcept>
+#include <string>
 #include <unordered_set>
 #include <utility>
 
@@ -113,9 +114,15 @@ KvCache::BlockMatch KvCache::insert(uint64_t parentBlock,
     BlockMatch result{existing->id, existing->physicalPage};
     if (existing->physicalPage == noPage) {
       adoptPage(existing->id, physicalPage);
+      // The copy holds what another command computed: a block that may
+      // spill keeps one content, the writer's, which its copy must hold.
+      if (spill_ && block(existing->id).slot)
+        setSlot(existing->id, nullptr);
       result.physicalPage = physicalPage;
-    } else if (block(existing->id).transferring) {
-      // Its page is still being filled; the writer keeps its own copy.
+    } else if (block(existing->id).transfer == Transfer::Filling) {
+      // Its page is still being filled; the writer keeps its own copy. A
+      // page being written holds its final bytes, and the writer moves
+      // onto it.
       result.physicalPage = physicalPage;
     }
     return result;
@@ -142,7 +149,6 @@ KvCache::BlockMatch KvCache::insert(uint64_t parentBlock,
   entry.indexHash = indexHash(parentBlock ? block(parentBlock).indexHash : 0, tokens, identity);
   std::copy(tokens.begin(), tokens.end(), entry.tokens.begin());
   entry.identity = identity;
-  entry.page = physicalPage;
   entry.depth = parentBlock ? block(parentBlock).depth + 1 : 1;
   entry.ramNode = RecencyOrder::allocate();
   entry.diskNode = RecencyOrder::allocate();
@@ -154,8 +160,8 @@ KvCache::BlockMatch KvCache::insert(uint64_t parentBlock,
     throw std::logic_error("duplicate KV cache block id");
   index_.emplace(position->second.indexHash, position->first);
   const uint64_t id = nextBlockId_++;
-  blockOnPage_[physicalPage] = id;
   Block &placed = block(id);
+  placeOnPage(placed, physicalPage);
   if (parentBlock) {
     Block &parent = block(parentBlock);
     ++parent.children;
@@ -225,7 +231,7 @@ KvCache::Key KvCache::key(uint64_t blockId) const {
 
 uint64_t KvCache::lastUsed(uint64_t blockId) const { return block(blockId).lastUsed; }
 
-bool KvCache::transferring(uint64_t blockId) const { return block(blockId).transferring; }
+KvCache::Transfer KvCache::transfer(uint64_t blockId) const { return block(blockId).transfer; }
 
 std::vector<uint64_t> KvCache::children(uint64_t blockId) const {
   std::vector<uint64_t> result;
@@ -362,7 +368,7 @@ uint32_t KvCache::idlePagesOnChains(std::span<const uint64_t> blocks) const {
         // The request holding this page holds every page above it too.
         if (pool_.pageActive(entry.page))
           break;
-        if (!entry.transferring)
+        if (entry.transfer == Transfer::None)
           ++pages;
       }
       // A disk-only block holds no page; the walk goes on above it.
@@ -375,49 +381,91 @@ uint32_t KvCache::idlePagesOnChains(std::span<const uint64_t> blocks) const {
 bool KvCache::residentLeaf(uint64_t blockId) const {
   const Block &entry = block(blockId);
   return entry.page != noPage && !entry.residentChildren && !entry.activeUsers &&
-         !entry.transferring && !entry.poisoned;
-}
-
-void KvCache::setTransferring(uint64_t blockId, bool transferring) {
-  Block &entry = block(blockId);
-  if (entry.transferring == transferring)
-    throw std::logic_error("KV cache block transfer state did not change");
-  entry.transferring = transferring;
-  reindex(entry);
+         !entry.held && entry.transfer == Transfer::None && !entry.poisoned;
 }
 
 void KvCache::setTransfer(uint64_t blockId, Transfer transfer) {
-  // Stub, which the tiered block store replaces with the two
-  // kinds of transfer: both are a transfer.
-  setTransferring(blockId, transfer != Transfer::None);
+  Block &entry = block(blockId);
+  if ((entry.transfer == Transfer::None) == (transfer == Transfer::None))
+    throw std::logic_error("KV cache block transfer state did not change");
+  entry.transfer = transfer;
+  reindex(entry);
 }
 
-void KvCache::holdPage(uint32_t) {
-  // Stub, which the tiered block store replaces.
-  throw std::logic_error("held KV cache blocks are not built yet");
+void KvCache::holdPage(uint32_t page) {
+  const bool first = !pool_.pageActive(page);
+  pool_.retainPage(page, false);
+  if (const uint64_t id = blockOnPage_[page]; spill_ && first && id)
+    setHeld(block(id), true);
 }
 
-void KvCache::unholdPage(uint32_t) {
-  // Stub, which the tiered block store replaces.
-  throw std::logic_error("held KV cache blocks are not built yet");
+void KvCache::unholdPage(uint32_t page) {
+  pool_.releasePage(page, false);
+  const uint64_t id = blockOnPage_[page];
+  if (!spill_ || !id || pool_.pageActive(page))
+    return;
+  setHeld(block(id), false);
+  erasePoisonedLeaf(id);
+}
+
+bool KvCache::held(uint64_t blockId) const { return block(blockId).held; }
+
+void KvCache::setHeld(Block &entry, bool held) noexcept {
+  if (entry.held == held)
+    return;
+  entry.held = held;
+  if (entry.slot)
+    held ? ++heldCopies_ : --heldCopies_;
+  reindex(entry);
 }
 
 void KvCache::setSlot(uint64_t blockId, std::shared_ptr<KvDiskSlot> slot) {
   Block &entry = block(blockId);
   if (!slot && entry.page == noPage)
     throw std::logic_error("a disk-only KV cache block is erased, not stripped");
+  if (!slot && entry.form == kv::PageForm::Index)
+    throw std::logic_error("a spilled KV cache block's copy holds its only K/V");
   giveDiskCopy(entry, std::move(slot));
   reindex(entry);
 }
 
-void KvCache::giveDiskCopy(Block &entry, std::shared_ptr<KvDiskSlot> slot) noexcept {
-  if (static_cast<bool>(entry.slot) != static_cast<bool>(slot))
+void KvCache::giveDiskCopy(Block &entry, std::shared_ptr<KvDiskSlot> slot) {
+  // Reads of spilled KV hold a copy only while a request holds its block or
+  // a transfer moves it (Cache::cutPageTable): a copy given up with another
+  // holder would keep its quota while the cache counts it free.
+  if (entry.slot && !slot && entry.slot.use_count() != 1)
+    throw std::logic_error("a KV cache block gave up a copy that a reader still holds");
+  if (static_cast<bool>(entry.slot) != static_cast<bool>(slot)) {
     slot ? ++diskBlocks_ : --diskBlocks_;
+    if (entry.held)
+      slot ? ++heldCopies_ : --heldCopies_;
+  }
+  if (slot)
+    rewrites_ += std::exchange(entry.copied, true);
   entry.slot = std::move(slot);
+}
+
+void KvCache::placeOnPage(Block &entry, uint32_t page) {
+  if (entry.page != noPage) {
+    blockOnPage_[entry.page] = 0;
+    if (entry.form == kv::PageForm::Index)
+      --indexBlocks_;
+    setHeld(entry, false);
+  }
+  entry.page = page;
+  entry.form = kv::PageForm::Full;
+  if (page == noPage)
+    return;
+  blockOnPage_[page] = entry.id;
+  entry.form = pool_.form(page);
+  if (entry.form == kv::PageForm::Index)
+    ++indexBlocks_;
+  setHeld(entry, spill_ && pool_.pageActive(page));
 }
 
 void KvCache::followPages(const KvPageMoves &moves) noexcept {
   // Destinations lie in other extents and were free, so no block is on one.
+  // References moved with the pages, and so do the holders' marks.
   for (const kv::PageCopy &move : moves.moved) {
     const uint64_t id = std::exchange(blockOnPage_[move.from], 0);
     if (!id)
@@ -425,16 +473,24 @@ void KvCache::followPages(const KvPageMoves &moves) noexcept {
     const auto found = blocks_.find(id);
     if (found == blocks_.end())
       std::terminate();
-    found->second.page = move.to;
+    Block &entry = found->second;
+    entry.page = move.to;
     blockOnPage_[move.to] = id;
+    const kv::PageForm form = pool_.form(move.to);
+    if (form == entry.form)
+      continue;
+    form == kv::PageForm::Index ? ++indexBlocks_ : --indexBlocks_;
+    entry.form = form;
+    reindex(entry);
   }
 }
 
 bool KvCache::abandonRestore(uint64_t blockId) {
   Block &entry = block(blockId);
-  if (!entry.transferring || entry.residentChildren || entry.activeUsers)
+  if (entry.transfer != Transfer::Filling || entry.residentChildren || entry.activeUsers ||
+      entry.held)
     return false;
-  setTransferring(blockId, false);
+  setTransfer(blockId, Transfer::None);
   dropPage(blockId);
   return true;
 }
@@ -443,11 +499,10 @@ void KvCache::dropPage(uint64_t blockId) {
   Block &entry = block(blockId);
   if (entry.page == noPage || !entry.slot)
     throw std::logic_error("KV cache block has no page to drop or no disk copy");
-  if (entry.residentChildren || entry.activeUsers)
+  if (entry.residentChildren || entry.activeUsers || entry.held)
     throw std::logic_error("KV cache block is still in use");
   const uint32_t page = entry.page;
-  entry.page = noPage;
-  blockOnPage_[page] = 0;
+  placeOnPage(entry, noPage);
   reindex(entry);
   if (entry.parent) {
     Block &parent = block(entry.parent);
@@ -478,8 +533,7 @@ void KvCache::adoptPage(uint64_t blockId, uint32_t page) {
   if (blockOnPage_[page])
     throw std::logic_error("KV cache page already holds a block");
   pool_.retainPage(page, true);
-  entry.page = page;
-  blockOnPage_[page] = blockId;
+  placeOnPage(entry, page);
   reindex(entry);
   if (entry.parent) {
     Block &parent = block(entry.parent);
@@ -491,9 +545,12 @@ void KvCache::adoptPage(uint64_t blockId, uint32_t page) {
 void KvCache::poison(uint64_t blockId) {
   Block &entry = block(blockId);
   entry.poisoned = true;
-  // It matches no lookup from now on.
+  // It matches no lookup from now on. A request that holds it may still
+  // read the copy, and a spilled block's copy holds its only K/V: either
+  // copy leaves with the block.
   ++generation_;
-  giveDiskCopy(entry, nullptr);
+  if (!entry.held && (entry.page == noPage || entry.form == kv::PageForm::Full))
+    giveDiskCopy(entry, nullptr);
   reindex(entry);
   erasePoisonedLeaf(blockId);
 }
@@ -525,7 +582,7 @@ std::vector<uint64_t> KvCache::subtree(uint64_t blockId) const {
       continue;
     }
     const Block &entry = block(id);
-    if (id != blockId && (entry.transferring || entry.activeUsers))
+    if (id != blockId && (entry.transfer != Transfer::None || entry.activeUsers || entry.held))
       return {};
     pending.push_back({id, true});
     for (uint64_t child = entry.firstChild; child; child = block(child).nextSibling)
@@ -536,9 +593,13 @@ std::vector<uint64_t> KvCache::subtree(uint64_t blockId) const {
 
 void KvCache::erase(uint64_t blockId) {
   Block &candidate = block(blockId);
-  if (candidate.children || candidate.activeUsers || candidate.transferring) {
+  if (candidate.children || candidate.activeUsers || candidate.held ||
+      candidate.transfer != Transfer::None) {
     throw std::logic_error("cannot evict a referenced KV cache block");
   }
+  // Its copy goes with it (giveDiskCopy).
+  if (candidate.slot && candidate.slot.use_count() != 1)
+    throw std::logic_error("a KV cache block left while a reader still holds its copy");
   const uint64_t parentId = candidate.parent;
   const uint64_t previous = candidate.previousSibling;
   const uint64_t next = candidate.nextSibling;
@@ -546,6 +607,7 @@ void KvCache::erase(uint64_t blockId) {
   const uint32_t page = candidate.page;
   const uint64_t lastUsed = candidate.lastUsed;
   const bool disk = candidate.slot != nullptr;
+  const bool spilled = page != noPage && candidate.form == kv::PageForm::Index;
   const auto [first, last] = index_.equal_range(hash);
   auto indexed = std::find_if(
       first, last, [&](const auto &value) { return value.second == blockId; });
@@ -561,6 +623,8 @@ void KvCache::erase(uint64_t blockId) {
     blockOnPage_[page] = 0;
   if (disk)
     --diskBlocks_;
+  if (spilled)
+    --indexBlocks_;
   if (parentId) {
     Block &parent = block(parentId);
     if (!parent.children)
@@ -593,31 +657,89 @@ const KvCache::Block &KvCache::block(uint64_t blockId) const {
 }
 
 // Resident leaves wait in one order, disk copies in another: redundant
-// copies of resident blocks, or disk-only blocks without children. The disk
-// copies no state needs wait in a third as well. A block a request uses, one
-// in transfer, or a poisoned one is in no order.
+// copies of blocks whose page holds their K/V, or the only copies, of a
+// spilled or disk-only block without children. The disk copies no state
+// needs wait in a third as well. A block a request uses or holds, one in
+// transfer, or a poisoned one is in no order: quota never takes a copy
+// active KV reads, nor RAM reclaim a page a request holds.
 void KvCache::reindex(Block &entry) noexcept {
   RecencyOrder::unlink(entry.ramNode);
   RecencyOrder::unlink(entry.diskNode);
   RecencyOrder::unlink(entry.unneededNode);
-  if (entry.activeUsers || entry.transferring || entry.poisoned)
+  if (entry.activeUsers || entry.held || entry.transfer != Transfer::None || entry.poisoned)
     return;
-  const bool resident = entry.page != noPage;
-  if (resident && !entry.residentChildren)
+  const bool paged = entry.page != noPage;
+  const bool full = paged && entry.form == kv::PageForm::Full;
+  if (paged && !entry.residentChildren)
     ramLeaves_.link(entry.ramNode, entry.lastUsed, entry.id);
-  if (entry.slot && resident)
+  if (entry.slot && full)
     duplicates_.link(entry.diskNode, entry.lastUsed, entry.id);
   else if (entry.slot && !entry.children)
     diskLeaves_.link(entry.diskNode, entry.lastUsed, entry.id);
-  if (entry.slot && !entry.statesHere && !entry.statesBelow && (resident || !entry.children))
+  if (entry.slot && !entry.statesHere && !entry.statesBelow && (full || !entry.children))
     unneeded_.link(entry.unneededNode, entry.lastUsed, entry.id);
+}
+
+void KvCache::checkInvariants() const {
+  const auto check = [](bool holds, const char *what) {
+    if (!holds)
+      throw std::logic_error(std::string("KV cache invariant broken: ") + what);
+  };
+  uint32_t disk = 0, spilled = 0, heldCopies = 0;
+  std::unordered_map<uint64_t, std::pair<uint32_t, uint32_t>> children;
+  for (const auto &[id, entry] : blocks_) {
+    check(entry.id == id, "a block's id");
+    disk += entry.slot != nullptr;
+    heldCopies += entry.held && entry.slot;
+    if (entry.parent) {
+      const auto parent = blocks_.find(entry.parent);
+      check(parent != blocks_.end(), "a block's parent is in the graph");
+      check(parent->second.depth + 1 == entry.depth, "a block's depth");
+      // Page-holding blocks form a rooted subtree.
+      check(entry.page == noPage || parent->second.page != noPage,
+            "a block with a page has a parent with one");
+      auto &[all, resident] = children[entry.parent];
+      ++all;
+      resident += entry.page != noPage;
+    }
+    if (entry.page == noPage) {
+      check(entry.slot != nullptr || entry.poisoned, "a disk-only block has a copy");
+      check(!entry.held && entry.transfer == Transfer::None,
+            "a disk-only block is neither held nor moving");
+      continue;
+    }
+    check(blockOnPage_[entry.page] == id, "the page names its block");
+    check(entry.form == pool_.form(entry.page), "a block keeps its page's form");
+    check(entry.held == (spill_ && pool_.pageActive(entry.page)),
+          "a block is held exactly while a request holds its page");
+    if (entry.form == kv::PageForm::Index) {
+      ++spilled;
+      // A spilled block's copy holds its only K/V, landed unless a restore
+      // fills its index.
+      check(entry.slot != nullptr && entry.transfer != Transfer::Draining,
+            "a spilled block has its landed copy");
+    }
+    check(entry.transfer != Transfer::Draining || entry.slot, "a page being written has its copy");
+  }
+  for (const auto &[id, entry] : blocks_) {
+    const auto counted = children.find(id);
+    const auto [all, resident] =
+        counted == children.end() ? std::pair<uint32_t, uint32_t>{} : counted->second;
+    check(entry.children == all && entry.residentChildren == resident, "a block counts its children");
+  }
+  for (uint32_t page = 0; page < blockOnPage_.size(); ++page) {
+    const uint64_t id = blockOnPage_[page];
+    check(!id || (blocks_.contains(id) && blocks_.at(id).page == page), "a page names the block on it");
+  }
+  check(disk == diskBlocks_ && spilled == indexBlocks_ && heldCopies == heldCopies_,
+        "the counts of copies, spilled blocks and held copies");
 }
 
 void KvCache::erasePoisonedLeaf(uint64_t blockId) noexcept {
   const auto found = blocks_.find(blockId);
   if (found == blocks_.end() || !found->second.poisoned ||
-      found->second.children || found->second.activeUsers ||
-      found->second.transferring)
+      found->second.children || found->second.activeUsers || found->second.held ||
+      found->second.transfer != Transfer::None)
     return;
   try {
     erase(blockId);

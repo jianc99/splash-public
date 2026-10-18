@@ -110,16 +110,18 @@ TokenAdmission admitTokens(engine::Cache &cache, uint64_t requestId, uint64_t to
 }
 
 // One process's cache over eight pages, with a KV tier and a shelf for
-// state copies, persistent or not.
+// state copies, persistent or not, and requests that may spill with a spill
+// policy (their Index pages beside the eight).
 struct Process final {
-  test::TestKvStorage storage{9, 100, 1};
+  test::TestKvStorage storage{16, 100, 1, 10};
   KvPool pool{storage, 8};
   test::TestKvTier tier;
   std::shared_ptr<Shelf> shelf = std::make_shared<Shelf>();
   engine::Cache cache;
 
-  explicit Process(bool persistent, std::shared_ptr<model::DiskBudget> budget = nullptr)
-      : tier(persistent), cache(pool, &tier, std::move(budget)) {
+  explicit Process(bool persistent, std::shared_ptr<model::DiskBudget> budget = nullptr,
+                   std::optional<CacheSpillPolicy> spill = std::nullopt)
+      : tier(persistent), cache(pool, &tier, std::move(budget), spill) {
     storage.budgetPages = 8;
     tier.capacity = 16;
     tier.transferLimit = 8;
@@ -799,6 +801,34 @@ void testPointsWaitForTheTier() {
           "a point was kept waiting for a KV file that takes no writes");
 }
 
+
+// A Spill request's pages are written through with the labels a persistent
+// tier keeps, and stay copies of its restore point: making the point durable
+// writes only its state, and the next process takes the point back whole.
+void testWriteThroughCopiesAreRestorePoints() {
+  const std::vector<uint32_t> prompt = promptOf(1000, 4);
+  Process earlier(true, std::make_shared<model::DiskBudget>(1600), CacheSpillPolicy{1, 1});
+  // Room for an Index extent beside the eight Full pages.
+  earlier.storage.budgetPages = 9;
+  earlier.cache.beginRequest(1, KvMode::Spill);
+  require(earlier.cache.commitSpill(1, 4) && admitTokens(earlier.cache, 1, prompt.size()).granted(),
+          "the Spill request was not admitted");
+  earlier.cache.publishCommittedBlocks(1, prompt, static_cast<uint32_t>(prompt.size()), {});
+  const uint64_t point = earlier.cache.blockAt(1, static_cast<uint32_t>(prompt.size()));
+  static_cast<void>(test::spillRound(earlier.cache, earlier.tier));
+  require(earlier.tier.demotions == 4 && earlier.kvLabels().size() == 4 &&
+              earlier.cache.spillSnapshot().spilledPages == 2,
+          "the written-through copies were not labelled, or the pages past the window did not spill");
+  earlier.publish(point);
+  earlier.cache.endRequest(1);
+  require(earlier.cache.persist(point) == PersistStatus::Started && earlier.cache.pollTransfers() &&
+              earlier.cache.persist(point) == PersistStatus::Durable && earlier.tier.demotions == 4,
+          "the point did not become durable, or wrote its chain again");
+  Process next(true);
+  const CacheAdoption adoption = next.adopt(earlier.kvLabels(), earlier.stateLabels());
+  require(adoption.blocks == 4 && adoption.states == 1 && adoption.dropped == 0,
+          "the next process did not take the written-through point back whole");
+}
 } // namespace
 
 int main() {
@@ -820,6 +850,7 @@ int main() {
     testPointsWaitTheirTurn();
     testWritesKeepToTheWriteBudget();
     testPointsWaitForTheTier();
+    testWriteThroughCopiesAreRestorePoints();
     std::cout << "Persistent cache tests passed\n";
   } catch (const std::exception &error) {
     std::cerr << error.what() << '\n';
