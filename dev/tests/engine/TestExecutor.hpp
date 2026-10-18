@@ -388,6 +388,7 @@ public:
       // A step that fails commits nothing.
       if (step.failure.empty())
         step.capturedStates = std::move(captured);
+      step.unreadableKvBlocks = takeUnreadable(item.requestId);
       result.push_back(std::move(step));
     }
     return result;
@@ -422,6 +423,7 @@ public:
           step.draftedTokens = speculative->second.first;
           step.acceptedDraftTokens = speculative->second.second;
         }
+        step.unreadableKvBlocks = takeUnreadable(item.requestId);
         result.push_back(std::move(step));
       }
     }
@@ -750,6 +752,9 @@ public:
   std::unordered_set<uint64_t> refusedSpilledReads;
   std::optional<metal::AllocationFailure> refusedGrowth;
   uint32_t growthAttempts = 0;
+  // Blocks of KV the SSD cache holds that each request's next step reports
+  // it could not read (ModelStepResult::unreadableKvBlocks).
+  std::unordered_map<uint64_t, std::vector<uint64_t>> unreadableBlocks;
 
   // Holds every command until the flag it returns is set.
   std::shared_ptr<std::atomic<bool>> holdCommands() {
@@ -758,6 +763,15 @@ public:
   }
 
 private:
+  // The blocks the request's step reports it could not read, once.
+  std::vector<uint64_t> takeUnreadable(uint64_t id) {
+    const auto found = unreadableBlocks.find(id);
+    if (found == unreadableBlocks.end())
+      return {};
+    std::vector<uint64_t> blocks = std::move(found->second);
+    unreadableBlocks.erase(found);
+    return blocks;
+  }
   // The state the step that captured it keeps in the reserved buffers.
   std::shared_ptr<const CompositeState> seal(Reservation &reservation) {
     std::shared_ptr<uint64_t> pool = reservation.seal();

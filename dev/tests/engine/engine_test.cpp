@@ -8291,6 +8291,43 @@ void testStreamingLaneSizesItsCommandsByItsReads() {
   spill.runUntilIdle();
 }
 
+// KV that the SSD cache cannot read back fails only the lane that read it,
+// as a retry recomputes it (503 kv_unreadable), before that lane's command
+// publishes or emits anything, and without taking the state it restored for
+// the failure: the read says nothing of it. The other lanes go on, and the
+// block's copy is given up, so no later lookup matches it or what follows.
+void testUnreadableKvEndsOnlyItsLane() {
+  Spilling spill(64);
+  // A first request leaves the state at 128 tokens that the failing lane
+  // restores.
+  spill.engine.submit(Spilling::prompt(30, 3, 4, 2));
+  spill.runUntil([&] { return spill.events.outputs.contains(30); },
+                 "the first request did not decode");
+  const uint64_t unreadable = spill.cache.blockAt(30, 2 * KvCache::pageTokens);
+  spill.runUntilIdle();
+  const uint64_t invalidations = spill.cache.snapshot().stateCache.invalidations;
+  // The failing lane's first step after its restore reads the block, and
+  // cannot.
+  spill.model.unreadableBlocks[3] = {unreadable};
+  for (uint64_t id = 1; id <= 4; ++id)
+    spill.engine.submit(Spilling::prompt(id, static_cast<uint32_t>(id), id == 3 ? 6 : 4, 4));
+  spill.runUntilIdle();
+  require(spill.events.failures == std::vector<std::string>{"kv_unreadable"} &&
+              spill.events.failureDetails.front().second && spill.events.completedCount == 4 &&
+              !spill.events.outputs.contains(3) &&
+              std::ranges::all_of(std::array<uint64_t, 3>{1, 2, 4},
+                                  [&](uint64_t id) {
+                                    return spill.events.usage.at(id).second == 4;
+                                  }),
+          "unreadable KV failed other lanes, or its own lane emitted its step");
+  require(spill.cache.snapshot().stateCache.invalidations == invalidations,
+          "the state the failing lane restored was taken for the failure");
+  const std::vector<uint32_t> prompt(6 * KvCache::pageTokens + 1, 3);
+  require(spill.cache.lookup(prompt, {}).kvBoundary == KvCache::pageTokens &&
+              spill.committedSlots() == 0,
+          "a lookup still matched the block whose copy could not be read");
+}
+
 // A request's KV is projected to hold its prompt and at most
 // kProjectedOutputTokens (4096) of output, whatever its output limit: a
 // Spill start commits for that much.
@@ -10890,6 +10927,7 @@ int main() {
     testLoneSpillLaneEndsAtTheWall();
     testHotCacheGrowthTakesNoModelCache();
     testStreamingLaneSizesItsCommandsByItsReads();
+    testUnreadableKvEndsOnlyItsLane();
     testProjectionClipsTheOutput();
     testFailedRestoreReturnsTheCommitment();
     testColdPublishesReplayStateAndRebuildsALostOne();

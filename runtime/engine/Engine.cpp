@@ -54,6 +54,8 @@ std::string pageShortfall(const TokenAdmission &admission) {
          ", free_pages=" + std::to_string(admission.availablePages);
 }
 
+constexpr std::string_view kKvUnreadableMessage =
+    "KV of an earlier part of the conversation could not be read from the SSD cache";
 constexpr std::string_view kDiskQuotaTimeoutMessage =
     "the SSD cache's room for active KV did not become available within the resource wait "
     "limit: other long requests hold it";
@@ -2124,6 +2126,8 @@ void Engine::apply(const Pending &command, std::span<const ModelStepResult> resu
   uint32_t outputTokens = 0;
   uint32_t draftedTokens = 0;
   uint32_t acceptedDraftTokens = 0;
+  // Blocks whose tier copies a lane could not read.
+  std::vector<uint64_t> unreadable;
   for (size_t index = 0; index < results.size(); ++index) {
     const ModelStepResult &result = results[index];
     const BatchItem &item = plan.items[index];
@@ -2145,14 +2149,24 @@ void Engine::apply(const Pending &command, std::span<const ModelStepResult> resu
       if (outOfVocabulary != result.outputTokens.end())
         invalid = "model emitted out-of-vocabulary token " + std::to_string(*outOfVocabulary);
     }
-    // A damaged state is one way to such a result: the state the request
-    // restored goes, unless an earlier step computed from it was finite.
-    if (!invalid.empty() && active.unprovenState)
-      cache_.invalidateState(*active.unprovenState);
+    // KV the lane read could not be read back from the SSD cache: it ends,
+    // as a retry recomputes that KV, and its copies are given up below. Its
+    // result says nothing of the state it restored. Otherwise a damaged
+    // state is one way to an invalid result: the state the request restored
+    // goes, unless an earlier step computed from it was finite. An earlier
+    // cancellation or deadline of the same lane still stands.
+    if (!result.unreadableKvBlocks.empty()) {
+      unreadable.insert(unreadable.end(), result.unreadableKvBlocks.begin(),
+                        result.unreadableKvBlocks.end());
+      if (!active.pendingEnd)
+        active.pendingEnd = LaneEnd{LaneOutcome::KvUnreadable, std::string(kKvUnreadableMessage)};
+    } else if (!invalid.empty()) {
+      if (active.unprovenState)
+        cache_.invalidateState(*active.unprovenState);
+      if (!active.pendingEnd)
+        active.pendingEnd = LaneEnd{LaneOutcome::ModelResultInvalid, std::move(invalid)};
+    }
     active.unprovenState.reset();
-    // An earlier cancellation or deadline of the same lane still stands.
-    if (!invalid.empty() && !active.pendingEnd)
-      active.pendingEnd = LaneEnd{LaneOutcome::ModelResultInvalid, std::move(invalid)};
     if (active.pendingEnd) {
       // An in-flight Metal command cannot be revoked safely. Its provisional
       // writes remain invisible, but a cancelled, deadline-expired or
@@ -2263,6 +2277,13 @@ void Engine::apply(const Pending &command, std::span<const ModelStepResult> resu
       active.maskRequestedMilliseconds = now;
     }
   }
+  // No later lookup matches a block whose copy could not be read; a lane
+  // holding it keeps the copy until it ends.
+  std::ranges::sort(unreadable);
+  const auto repeated = std::ranges::unique(unreadable);
+  unreadable.erase(repeated.begin(), repeated.end());
+  for (const uint64_t block : unreadable)
+    cache_.poisonCopy(block);
   // Spill requests' new pages are written as they publish them.
   if (config_.spill.capable)
     static_cast<void>(cache_.writeThrough());
