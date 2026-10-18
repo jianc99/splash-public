@@ -36,7 +36,8 @@ void addIndexerProjection(metal::CommandGraph &graph, const ops::Linear &linear,
                     ops::FloatOutput::Float32, linear.ggufFloatTile(rows, projection.outputSize));
 }
 
-// Where each attention layer's QSA index sits in the KV extents of `kv`.
+// Where each attention layer's QSA index sits in the extents of `kv` that
+// index tables reach (kv::PageStorage::writeIndexEntries).
 std::vector<uint32_t> indexOffsets(const kv::PageStorage &kv, uint32_t layers) {
   std::vector<uint32_t> result;
   for (uint32_t layer = 0; layer < layers; ++layer) result.push_back(kv.indexOffset(layer));
@@ -194,7 +195,7 @@ std::vector<ops::AttentionBlocks> Qwen4ExpTarget::addPrefillQsa(PrefillStep &ste
   const auto qsaRows = [&](size_t index) {
     const QwenTargetPrefillSequence &sequence = step.sequences[index];
     return ops::IndexerRows{sequence.rows, std::span(firstPositions).subspan(index, 1),
-                            {{&sequence.pageTable, 1}, step.indexOffsets[layer]}, topBlocks, h.maskWords,
+                            {{&sequence.indexTable, 1}, step.indexOffsets[layer]}, topBlocks, h.maskWords,
                             h.scoreStride};
   };
   addIndexerProjection(step.graph, linear, b.normalized, indexer.query, h.indexerQuery, step.rows);
@@ -278,7 +279,7 @@ ops::AttentionBlocks Qwen4ExpTarget::addVerifyQsa(VerifyStep &step, const Qwen4I
     sparse = sparse || ops::BlockIndexer::sparse(firstPositions[lane], kVerifyRows, topBlocks);
   }
   const ops::IndexerRows qsa{kVerifyRows, std::span(firstPositions).first(step.lanes),
-                             {std::span(b.pageTables).first(step.lanes), step.indexOffsets[layer]}, topBlocks,
+                             {std::span(b.indexTables).first(step.lanes), step.indexOffsets[layer]}, topBlocks,
                              h.maskWords, h.scoreStride};
   const metal::MetalBuffer queries = rowsOf<uint16_t>(h.qsaQueries, 0, step.rows, queryWidth);
   // The layer's keys, which the commit reads after the last layer, and each
