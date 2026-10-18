@@ -690,7 +690,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
         config.cacheRoot.empty() ? std::vector<CacheDirectory::Idle>{}
                                  : CacheDirectory::idle(config.cacheRoot);
     // The tier's writes hold back while a step waits for reads.
-    const model::SlotFile::Options tierFiles{.deferWrites = [readers] { return readers->criticalBusy(); }};
+    const model::SlotFile::Options tierFiles{.deferWrites = readers->criticalBusyProbe()};
     if (stateStagingBytes) {
       // A write budget, when one is set, refills on the awake clock the
       // engine schedules its wake-ups on (awakeMilliseconds), so a write it

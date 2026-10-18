@@ -140,7 +140,7 @@ void SsdReaders::runNow(const std::shared_ptr<Batch> &batch) {
   {
     const std::lock_guard lock(mutex_);
     now_.push_back(batch);
-    running_.fetch_add(1, std::memory_order_acq_rel);
+    running_->fetch_add(1, std::memory_order_acq_rel);
   }
   // This thread takes a task too.
   wakeReaders(batch->count_ - 1);
@@ -152,7 +152,7 @@ void SsdReaders::runNow(const std::shared_ptr<Batch> &batch) {
     // this batch ran is woken for it.
     const std::lock_guard lock(mutex_);
     std::erase(now_, batch);
-    running_.fetch_sub(1, std::memory_order_acq_rel);
+    running_->fetch_sub(1, std::memory_order_acq_rel);
     background = !background_.empty();
   }
   if (background) wake_.notify_all();
@@ -180,7 +180,7 @@ void SsdReaders::attempt(Batch &batch, size_t index) {
 }
 
 void SsdReaders::work(const std::shared_ptr<Batch> &batch, bool background) {
-  for (size_t index; !(background && running_.load(std::memory_order_acquire)) && batch->claim(index);)
+  for (size_t index; !(background && running_->load(std::memory_order_acquire)) && batch->claim(index);)
     attempt(*batch, index);
 }
 
@@ -198,7 +198,7 @@ void SsdReaders::readerLoop() {
         batch = now_.front();
         return true;
       }
-      if (running_.load(std::memory_order_acquire)) return false;
+      if (running_->load(std::memory_order_acquire)) return false;
       std::erase_if(background_, [](const std::shared_ptr<Batch> &queued) { return queued->exhausted(); });
       const auto open = std::ranges::find_if(
           background_, [](const std::shared_ptr<Batch> &queued) { return queued->working_ < queued->readers_; });

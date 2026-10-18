@@ -325,8 +325,10 @@ public:
     // Several hold every payload of the file: a write stores their sum.
     std::vector<uint64_t> segments;
     // While it says so, the worker holds a write's next chunk back, at most
-    // kWriteDeferral each (model::SsdReaders::criticalBusy: reads a step
-    // waits for go first). It runs on the worker.
+    // kWriteDeferral each (model::SsdReaders::criticalBusyProbe: reads a
+    // step waits for go first). It runs on the worker; the file's slots keep
+    // it, and the last may go on any thread, a reader's too, so it owns
+    // nothing that thread may not destroy.
     std::function<bool()> deferWrites;
   };
   // The longest a write's chunk waits for reads (Options::deferWrites).
