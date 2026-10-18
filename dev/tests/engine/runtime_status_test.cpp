@@ -651,7 +651,21 @@ void testKvSpillStatus() {
   // That one spilled, one other did after it converted, and one was refused
   // for want of quota; another start waits for it. Its prefill streamed once
   // beside a decoder, which waited 40 ms.
-  engine.spill = {.spill = 1, .resident = 3, .converted = 1, .refusedQuota = 1};
+  // Two starts the host's growth pause refused were funded: 264 MiB of a
+  // streamed cache and idle memory for the first, then the cache a lane's KV
+  // left once it moved to the SSD, that conversion; the governor still
+  // holds 50 MiB of it for them.
+  engine.spill = {.spill = 1,
+                  .resident = 3,
+                  .converted = 1,
+                  .refusedQuota = 1,
+                  .funding = {.starts = 2,
+                              .conversions = 1,
+                              .released = {.idle = 8 * kMiB, .cache = 300 * kMiB, .streamed = 256 * kMiB},
+                              .latestStart = 12,
+                              .latestDonor = 7}};
+  MemoryGovernorSnapshot governor;
+  governor.fundedBalanceBytes = 50 * kMiB;
   engine.scheduler.contendedStreamingPrefillBatches = 1;
   engine.scheduler.decodeGap = {.count = 1, .totalMilliseconds = 40, .maximumMilliseconds = 40,
                                 .p50Milliseconds = 40, .p95Milliseconds = 40, .p99Milliseconds = 40};
@@ -701,7 +715,7 @@ void testKvSpillStatus() {
       .read = {.count = 24, .totalMilliseconds = 5'000, .maximumMilliseconds = 250, .p50Milliseconds = 262.144,
                .p95Milliseconds = 262.144, .p99Milliseconds = 262.144}};
   const auto status = [&](const EngineMemoryPlan &memoryPlan, const std::optional<KvSpillStatus> &kvSpill) {
-    return runtimeStatusJson(memoryPlan, engine, {}, {}, {}, {}, {}, {}, {}, true, {}, wait, {}, {}, {}, {},
+    return runtimeStatusJson(memoryPlan, engine, {}, {}, {}, {}, {}, {}, governor, true, {}, wait, {}, {}, {}, {},
                              std::nullopt, std::nullopt, kvSpill);
   };
   const std::string resident = status(plan(), std::nullopt);
@@ -715,7 +729,9 @@ void testKvSpillStatus() {
   const std::string none = "{\"p50\":0,\"p95\":0,\"p99\":0,\"max\":0,\"total\":0,\"samples\":0}";
   const std::string expected =
       "\"kv_spill\":{\"requests\":{\"spill\":1,\"resident\":3,\"converted\":1,\"bounded\":0,\"length_ends\":0,"
-      "\"refused\":{\"quota\":1,\"write_budget\":0,\"closed\":0},\"waiting_quota\":1},\"pages\":{\"index\":31250,"
+      "\"refused\":{\"quota\":1,\"write_budget\":0,\"closed\":0},\"waiting_quota\":1},\"funding\":{\"starts\":2,"
+      "\"conversions\":1,\"released_bytes\":{\"idle\":8388608,\"cache\":314572800,\"streamed\":268435456},"
+      "\"balance_bytes\":52428800},\"pages\":{\"index\":31250,"
       "\"index_bytes\":768000000,\"spilled\":31250,\"spilled_bytes\":13312000000},\"write_through\":{\"pages\":31250,"
       "\"bytes\":13312000000,\"in_flight\":3,\"failures\":0,\"paused\":false},\"spill_moves\":31250,\"unspills\":0,"
       "\"rewrites\":0,\"restores\":{\"index_pages\":12,\"whole_pages\":2,\"ms\":{\"p50\":0.5,\"p95\":1,\"p99\":1,"

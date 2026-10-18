@@ -321,9 +321,13 @@ size with a warning.
   read is dropped, and the stage that needs it reads it again.
 - The cache counts as fixed runtime memory in the plan
   (`streamed_table_bytes`): the governor charges it beside Metal's
-  allocations, and the startup memory audit bounds it by the plan and counts
-  it toward the hard budget beside Metal's footprint. It is not released
-  while idle.
+  allocations, as it holds it now, and the startup memory audit bounds it by
+  the plan and counts it toward the hard budget beside Metal's footprint. It
+  is not released while idle. Its rows live in 64 MiB chunks above a floor of
+  one row: on a target whose KV can go to the SSD, a new request that host
+  pressure holds back may take chunks
+  ([KV on the SSD](#kv-on-the-ssd)), and the cache grows back a chunk a
+  command once growth is allowed again.
 - `/status` reports it under `streamed_table`: the table and its bytes, the
   cache's size, capacity, rows and evictions; per use (`prefill`, `decode`)
   its stages, requested and distinct rows, hits, reads, hit rate and stage
@@ -610,6 +614,20 @@ what memory holds, as a dense target's is.
   budget covers them again as it refills).
 - A block that cannot be read back fails only the requests that read it, as
   `kv_unreadable`, which they may retry; the copy is dropped.
+- Under host pressure, while growth is paused, a new request (or a resume)
+  beside a running one starts on memory Splash releases for it, rather than
+  wait: idle memory first, then 64 MiB chunks of the streamed PLE table's
+  cache down to its floor, and last a running request's KV, which moves to
+  the SSD. That request decodes at the priority of the new one or below, and
+  is the one whose KV frees the most net of the hot cache it then needs, if
+  the requests that could give their KV together cover what the new one
+  lacks; a short request's KV frees nothing. Splash does not grow for it: the
+  governor admits the new request's memory within what was released for it
+  and no growth took since, and lets what the pressure passes return go to
+  the host; once growth is allowed again, the rest goes back to the host and
+  the PLE cache grows back. A request whose KV moved keeps spilling until it
+  ends. Without the SSD cache, and for every other model, the new request
+  waits as before.
 
 A request's outputs are the same whether its KV spills or not, bit for bit,
 for the same schedule and cache hits. `/status` reports the plan's floors
@@ -1412,7 +1430,7 @@ Proxy consumers can use these fields; additional fields may be added:
 | `identity.cache.rope_scaling` | With `--yarn-factor`, the target's RoPE scaling, which every cached key went through: `type` `yarn`, its `factor` and `original_context_tokens`; `null` otherwise |
 | `streamed_table` | While the PLE table streams, the [streamed PLE table](#ple-table-streaming)'s cache, stages, reads and prefetches; `null` otherwise |
 | `streamed_experts` | While routed experts stream, the [streamed experts](#streamed-experts)' store: its slots and resident experts, per use its loads, reads, read-ahead and host-step round trips, and its failure; `null` otherwise |
-| `kv_spill` | While a block-sparse target's KV can go to the SSD, its [KV on the SSD](#kv-on-the-ssd): the requests that started in each mode, converted to `spill`, had their output bounded or ended at that bound, and were refused for the quota, the write budget or a closed tier, and the starts waiting for the quota (`requests`); the pages that hold only their index and those whose KV is on the SSD; the write-through of spilling requests' pages; page moves, rewrites and restores; the quota of KV in service; the hot block cache's memory, hits, reads and host steps (`block_cache`; `read` over `resolves` is the blocks a layer's step missed on average) and the history streams' reads, how long each layer's took (`read_ms`, whose total gives with `bytes` the streams' bandwidth) and staging, the streamed commands that ran beside decoders, and the decoders' gaps across them (`history_stream`); `null` for a target whose KV stays in memory, as the plan's `memory_plan.budget.kv_spill` is |
+| `kv_spill` | While a block-sparse target's KV can go to the SSD, its [KV on the SSD](#kv-on-the-ssd): the requests that started in each mode, converted to `spill`, had their output bounded or ended at that bound, and were refused for the quota, the write budget or a closed tier, and the starts waiting for the quota (`requests`); the new requests that host pressure held back and memory Splash released started, the requests whose KV moved to the SSD for them, what was released for them (`released_bytes`: idle memory, cache, and the streamed PLE table's chunks) and what the governor still holds of it for them (`balance_bytes`) (`funding`); the pages that hold only their index and those whose KV is on the SSD; the write-through of spilling requests' pages; page moves, rewrites and restores; the quota of KV in service; the hot block cache's memory, hits, reads and host steps (`block_cache`; `read` over `resolves` is the blocks a layer's step missed on average) and the history streams' reads, how long each layer's took (`read_ms`, whose total gives with `bytes` the streams' bandwidth) and staging, the streamed commands that ran beside decoders, and the decoders' gaps across them (`history_stream`); `null` for a target whose KV stays in memory, as the plan's `memory_plan.budget.kv_spill` is |
 | `memory_plan.budget.context_bounds` | What bounds `maximum_context_tokens` ([memory and context](#memory-and-context)): the model's `window`, one request's KV in memory (`resident`), the longest context a block-sparse target's floors hold (`spilled`) and its SSD cache's room holds (`disk`), and the `bound` that sets the limit: `model`, `memory` or `disk` |
 | `ane_ffn.state`, `share`, `minimum_rows`, `reason` | The prefill FFN's [Neural Engine split](#neural-engine-prefill): `split` while it serves, at `share` of the FFN's channels over chunks of `minimum_rows` rows or more; `off` when the start left the GPU alone (`share` and `minimum_rows` 0); `stopped` once it stopped while serving, until the engine restarts. `reason` is the start's outcome, or why the split stopped |
 | `ane_ffn.split_commands`, `evaluations`, `ane_ms`, `reruns` | Prefill commands the split ran since engine start, the Neural Engine's evaluations in them and its milliseconds over them (each evaluation's from the GPU's signal to start it to its report); and the chunks the GPU ran again alone after the split's work for them failed |
@@ -2661,7 +2679,10 @@ the refused request itself while a pass defers it, even one that recovery does
 not try, which still waits for memory) and those waiting for a disk restore
 (`restoring`), reports suspended requests, recovery draining and the oldest
 current wait age, which for a request holding admission closed runs from when
-its wait began. Memory transitions also appear in the console. Growth that no
+its wait began. Memory transitions also appear in the console, and so do the
+new requests memory Splash released started under host pressure, as
+`Memory: growth paused; request 12 started on 264 MiB Splash released
+(streamed 256, idle 8); request 7's KV moves to the SSD`. Growth that no
 request in service needs, and so the cache, leaves other applications their
 memory: it keeps a spare reserve of 7% of the Mac's memory (2 to 7 GiB) and a
 1 GiB margin free of the host's spare memory, the free, file-backed and
@@ -2688,8 +2709,9 @@ growing through host pressure and macOS's warning, short of critical pressure,
 within `--max-memory`, first into cached pages no request holds:
 it takes cached KV, and a cached state only where it sits on the KV that goes
 next, since a state's buffers give it no page. A new request waits while another
-is in service unless it can start from what the engine already holds, and with
-none in service it starts. A request whose start was refused memory, under host
+is in service unless it can start from what the engine already holds, or, where
+the target's KV can go to the SSD, from memory Splash releases for it
+([KV on the SSD](#kv-on-the-ssd)), and with none in service it starts. A request whose start was refused memory, under host
 pressure or at `--max-memory`, holds back the requests that arrived after it
 until it starts, fails or is cancelled, so the lanes that finish leave their
 memory to it; a higher priority is not held back. So does a start that waits

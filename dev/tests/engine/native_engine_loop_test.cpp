@@ -2074,6 +2074,34 @@ void testMemoryStatusReporterLogsTransitionsOnly() {
           "requests held behind a refusal were reported as no wait");
 }
 
+// It logs one line a pass as the funding of the starts the host's pause
+// refused advances: the starts, on what was released since the last one it
+// reported, by kind, and the lanes whose KV moved to the SSD for them;
+// memory released for a start still waiting logs nothing.
+void testMemoryStatusReporterLogsFunding() {
+  MemoryStatusReporter reporter;
+  ResourceWaitSnapshot wait{.memory = 1};
+  require(!reporter.update(wait, false).empty(), "pressure transition was silent");
+  wait.funding.released = {.idle = 8 * kMiB, .streamed = 256 * kMiB};
+  require(reporter.update(wait, false).empty(), "memory released for a waiting start logged a line");
+  wait.funding.starts = 1;
+  wait.funding.latestStart = 12;
+  wait.funding.conversions = 1;
+  wait.funding.latestDonor = 7;
+  const std::string funded = reporter.update(wait, false);
+  require(funded == "Memory: growth paused; request 12 started on 264 MiB Splash released (streamed 256, idle 8); "
+                    "request 7's KV moves to the SSD",
+          "the funding line differs: " + funded);
+  require(reporter.update(wait, false).empty(), "the funding line repeated");
+  wait.funding.released.cache = 300 * kMiB;
+  wait.funding.starts = 3;
+  wait.funding.latestStart = 14;
+  const std::string more = reporter.update(wait, false);
+  require(more == "Memory: growth paused; 2 requests started, the latest request 14, on 300 MiB Splash released "
+                  "(cache 300)",
+          "the funding line of two starts differs: " + more);
+}
+
 } // namespace
 
 int main() {
@@ -2119,6 +2147,7 @@ int main() {
     testReleaseRequestGivesTheWeightsBackWhenIdle();
     testHoldingRequestsSpansFirstToLastRequest();
     testMemoryStatusReporterLogsTransitionsOnly();
+    testMemoryStatusReporterLogsFunding();
     std::cout << "native engine loop tests passed\n";
     return EXIT_SUCCESS;
   } catch (const std::exception &error) {

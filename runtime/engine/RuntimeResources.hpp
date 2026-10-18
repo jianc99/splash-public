@@ -363,8 +363,9 @@ private:
                                       std::string_view buildId, std::function<bool()> cancelled);
 
 // Connects an engine to the governor that admits its memory: the engine asks
-// it whether the host pauses growth, and marks the allocations a request in
-// service makes. Every engine that runs against a governor connects through it.
+// it whether the host pauses growth, marks the allocations a request in
+// service makes and, on a target that can spill, funds the starts the pause
+// refuses. Every engine that runs against a governor connects through it.
 void connectToGovernor(EngineConfig &config, MemoryGovernor &governor);
 
 } // namespace splash::engine
