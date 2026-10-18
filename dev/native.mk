@@ -92,7 +92,7 @@ MLX_QUANTIZATION_FIXTURE := dev/tests/fixtures/mlx-quantization/fixture.json
 # An MLX config.json and a DFlash2 draft config built like each family's.
 MODEL_CONFIGS := dev/tests/fixtures/model-configs
 # Real decodes' block selections, which the hot block cache's replacement is
-# checked on (dev/tools/kv_selection_traces.py).
+# checked on (dev/tests/engine/slot_recycler_test.cpp reads them).
 KV_SELECTION_TRACES := dev/tests/fixtures/kv-selection-traces
 TEST_KV_PAGE_CACHE_TEST := $(ENGINE_TEST_BUILD)/kv-page-cache
 TEST_ENGINE_CACHE_TEST := $(ENGINE_TEST_BUILD)/engine-cache
