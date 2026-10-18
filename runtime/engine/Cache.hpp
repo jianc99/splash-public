@@ -805,11 +805,11 @@ private:
   // empties; progress with zero bytes when the extent emptied is the runway
   // kept. No progress when the free pages fill none.
   [[nodiscard]] CacheReclaimResult releaseExtent(bool keepRunway);
-  // Empties one extent that still holds pages (KvPool::compactExtent); the
-  // blocks and requests on its pages follow them. A page a transfer reads or
-  // writes stays where it is until the transfer has landed. False when the
-  // free pages cover no extent.
-  [[nodiscard]] bool compactExtent();
+  // Empties one extent that still holds pages, of the form or of either
+  // (KvPool::compactExtent); the blocks and requests on its pages follow
+  // them. A page a transfer reads or writes stays where it is until the
+  // transfer has landed. False when the free pages cover no extent.
+  [[nodiscard]] bool compactExtent(std::optional<kv::PageForm> form = std::nullopt);
   // The blocks and requests on moved pages follow them, and the requests'
   // page lists change from the first one moved.
   void followMoves(const KvPageMoves &moves);
