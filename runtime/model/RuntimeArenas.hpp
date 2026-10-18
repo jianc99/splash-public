@@ -317,6 +317,7 @@ enum class DecodeTensor : uint32_t {
   OutputTokens,
   RetainedCount,
   AcceptedCount,
+  VerifyRows,
   DraftInputTokens,
   DraftHidden0,
   DraftHidden1,

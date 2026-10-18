@@ -38,17 +38,28 @@ void DraftSelector::add(metal::CommandGraph &graph,
                         const DraftSelectorBuffers &buffers,
                         const DraftCodebooks &codebooks,
                         std::span<const uint32_t> anchors,
-                        std::span<const SamplingPolicy> policies) const {
+                        std::span<const SamplingPolicy> policies,
+                        VerifyRowsPolicy verify,
+                        std::span<const uint32_t> maximumRows) const {
   if (anchors.empty() || anchors.size() != policies.size() ||
+      anchors.size() != maximumRows.size() ||
       anchors.size() > SPLASH_MAXIMUM_BATCH_WIDTH)
     throw std::invalid_argument("invalid draft selector batch");
+  if (!(verify.threshold >= 0.0F && verify.threshold <= 1.0F) || !verify.minimum ||
+      verify.minimum > SPLASH_DRAFT_QUERY_ROWS)
+    throw std::invalid_argument("invalid draft verify rows policy");
   const uint32_t lanes = static_cast<uint32_t>(anchors.size());
   SelectorBatchParams params{};
   params.lanes = lanes;
   params.vocabulary = vocabulary_;
+  params.verify_threshold = verify.threshold;
+  params.verify_minimum = verify.minimum;
   for (uint32_t lane = 0; lane < lanes; ++lane) {
+    if (!maximumRows[lane] || maximumRows[lane] > SPLASH_DRAFT_QUERY_ROWS)
+      throw std::invalid_argument("invalid draft verify rows maximum");
     params.anchor[lane] = anchors[lane];
     params.temperature[lane] = policies[lane].temperature;
+    params.verify_maximum[lane] = maximumRows[lane];
     if (policies[lane].samples())
       params.sampling_mask |= uint32_t{1} << lane;
   }
@@ -67,6 +78,7 @@ void DraftSelector::add(metal::CommandGraph &graph,
   requireBytes(codebooks.predecessor, codebook, "draft predecessor codebook");
   requireBytes(codebooks.successor, codebook, "draft successor codebook");
   requireBytes(buffers.proposedTokens, uint64_t{lanes} * kPositions * sizeof(uint32_t), "proposed token");
+  requireBytes(buffers.verifyRows, uint64_t{lanes} * sizeof(uint32_t), "verify rows");
   if (const uint64_t sampledLanes = std::bit_width(params.sampling_mask)) {
     requireBytes(buffers.uniforms,
                  ((sampledLanes - 1) * SPLASH_SAMPLING_UNIFORMS + SPLASH_UNIFORM_PROPOSALS + kPositions) * sizeof(float),
@@ -86,7 +98,7 @@ void DraftSelector::add(metal::CommandGraph &graph,
   graph.add("draft_select_dflash",
             {buffers.candidates, buffers.unary, buffers.partialValues,
              buffers.uniforms, buffers.proposedTokens,
-             buffers.proposalProbabilities},
+             buffers.proposalProbabilities, buffers.verifyRows},
             params, {lanes, 1, 1}, {1, 1, 1});
 }
 
