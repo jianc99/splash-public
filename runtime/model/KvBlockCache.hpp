@@ -18,10 +18,19 @@
 // replacement per layer (SlotRecycler); a resolve never recycles a slot it
 // touched itself, and holds at least as many slots per layer as the lanes
 // that hold a floor select blocks (laneSlots each, reserveLane), so a resolve
-// always places every block it reads.
+// always places every block it reads. Its memory is whole extents of the
+// pool's pages: the floors of the lanes that hold one, required(n) = (n + 1)
+// laneSlots slots for n of them, then, while any does, one extent at a time
+// toward the planned target; an idle reclaim gives back what is above the
+// floors.
+//
+// A block that cannot be read (twice) leaves zeros in its slot, which is
+// freed, and fails every lane that listed it (takeFailures), not the
+// command.
 //
 // Threads: the host steps of the command in flight own the directory, and
-// the engine thread owns it between commands (resizing, merging statistics).
+// the engine thread owns it between commands (resizing, merging statistics);
+// a step owns what it reads, so that one its command gave up may still run.
 
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
@@ -53,7 +62,9 @@ struct KvBlockCacheOptions final {
 class KvBlockCache final {
 public:
   // `layout` and `extentPages` are the pool's; the cache's pages come from
-  // `admission`, as KV memory.
+  // `admission`, as KV memory. Throws std::invalid_argument for a layout
+  // that cannot spill (kv::Layout::spillable), a format of another layout,
+  // no readers or no lane slots.
   KvBlockCache(metal::MetalBackend &backend, metal::AllocationAdmission admission, const kv::Layout &layout,
                uint32_t extentPages, KvBlockCacheOptions options);
   ~KvBlockCache();
@@ -72,13 +83,15 @@ public:
   [[nodiscard]] uint64_t releaseAboveFloor();
 
   // After `layer`'s block lists: a host step that resolves the entries of
-  // lane l's list, whose pages' sources are lanes[l], writes their locations
-  // to `locations` (an array of the lists' shape) and counts into `stats`.
+  // lane l's list, whose pages' sources are lanes[l] (null for a lane none
+  // of whose pages holds only its index), writes their locations to
+  // `locations` (an array of the lists' shape) and counts into `stats`.
   // Returns the lists with their locations, for the located split.
   [[nodiscard]] ops::AttentionBlocks addResolve(metal::CommandGraph &graph, uint32_t layer,
-                                                std::span<const KvPageSources *const> lanes,
+                                                std::span<const std::shared_ptr<const KvPageSources>> lanes,
                                                 const ops::AttentionBlocks &blocks,
-                                                const metal::MetalBuffer &locations, KvReadStats &stats);
+                                                const metal::MetalBuffer &locations,
+                                                std::shared_ptr<KvReadStats> stats);
   // Once the command completed: the blocks its resolves could not read, each
   // for every lane that listed it. Their slots were freed.
   [[nodiscard]] std::vector<KvReadFailure> takeFailures();
@@ -87,6 +100,10 @@ public:
   // totals of every command's.
   void mergeStats(const KvReadStats &stats);
   [[nodiscard]] KvBlockCacheStats stats() const;
+
+private:
+  struct Impl;
+  std::shared_ptr<Impl> impl_;
 };
 
 } // namespace splash::model

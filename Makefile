@@ -314,6 +314,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/model/DFlashDraft.cpp \
 	runtime/model/ModelFactory.cpp \
 	runtime/model/SlotFile.cpp \
+	runtime/model/KvCopyRead.cpp \
 	runtime/model/KvBlockCache.cpp \
 	runtime/model/KvHistoryStream.cpp \
 	runtime/model/QwenState.cpp \
