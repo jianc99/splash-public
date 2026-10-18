@@ -10,6 +10,7 @@
 #include "engine/Types.hpp"
 #include "metal/BackendInstrumentation.hpp"
 #include "model/KvBlockCache.hpp"
+#include "model/KvCopyRead.hpp"
 #include "model/KvHistoryStream.hpp"
 #include "model/Runtime.hpp"
 #include "model/Qwen4Exp.hpp"
@@ -2835,6 +2836,40 @@ public:
     }
   }
 
+  // A Resident turn that holds the request's spilled pages alone: moves each
+  // back to a Full page and restores it whole from its copy, as the cache
+  // and its tier do (engine::Cache::restoreRequest, KvPageTier's whole
+  // restore), the K/V the move left overwritten first; the request spills no
+  // more.
+  void unspill(SpillRequest &request) {
+    request.spills = false;
+    std::vector<uint32_t> places, moving;
+    for (uint32_t place = 0; place < request.sources.size(); ++place)
+      if (request.sources[place].indexed()) {
+        places.push_back(place);
+        moving.push_back(request.pages[place]);
+      }
+    if (moving.empty()) return;
+    const engine::KvPageMoveResult moved = pool_.movePages(moving, kv::PageForm::Full);
+    require(moved.granted(), "a spill run's pages did not move back to the full form");
+    model::KvReadBuffer buffer;
+    for (size_t index = 0; index < places.size(); ++index) {
+      const uint32_t page = moved.moves.follow(moving[index]);
+      for (uint32_t layer = 0; layer < layout_.attentionLayers; ++layer)
+        for (const std::span<std::byte> tensor : kv_.layerSpans(page, layer))
+          std::ranges::fill(tensor, std::byte{0x7f});
+      const std::optional<std::span<const std::byte>> bytes =
+          model::readKvCopy(*request.copies[places[index]], {0, format_.payloadBytes()}, buffer);
+      require(bytes.has_value(), "a spilled page's copy could not be read whole");
+      format_.scatterPage(*bytes, kv_, page);
+      request.pages[places[index]] = page;
+      request.sources[places[index]] = {};
+      request.copies[places[index]].reset();
+    }
+    unspilledPages_ += places.size();
+  }
+  [[nodiscard]] uint64_t unspilledPages() const noexcept { return unspilledPages_; }
+
   void end(SpillRequest &request) {
     runtime_->end(request.id);
     for (const uint32_t page : request.pages) pool_.releasePage(page, false);
@@ -2944,6 +2979,7 @@ private:
   std::optional<model::Runtime> runtime_;
   std::vector<ModelStepResult> lastResults_;
   uint64_t blocks_ = 0;
+  uint64_t unspilledPages_ = 0;
 };
 
 // What a spill run's requests gave, each command's step per request, in
@@ -2958,8 +2994,11 @@ struct SpillRecord final {
 // spills or stays, for the same schedule: four requests, each
 // prefilled in commands of the runtime's prefill group, the first of which
 // ends past the dense history and a fourth of a chunk, then decoded one
-// alone, four together, two and one again; first with every page Full, then
-// with the first and the third spilling between commands, the others not,
+// alone, four together, two and one again, and the one last once more as a
+// Resident turn that holds the pages it spilled alone, which it moves back
+// to Full pages and restores whole from their copies (an un-spill); first
+// with every page Full, then with the first and the third spilling between
+// commands, the others not,
 // so that their later commands stream their history and every decode but
 // the first mixes lanes that resolve blocks with lanes that read their page
 // table. The first two requests' first command ends kIntoPage tokens into a
@@ -2987,7 +3026,7 @@ void requireSpilledKvMatchesResident(metal::MetalBackend &backend, const model::
                                       const ops::ExecutionPlans &operators, const metal::AllocationAdmission &admission,
                                       kv::Format format, ops::GdnStateFormat stateFormat, const SpillOptions &options) {
   constexpr uint32_t kCycles = 4;
-  constexpr uint32_t kDecodeTokens = (1 + 3 * kCycles) * model::ExecutionLimits::targetVerifyRows;
+  constexpr uint32_t kDecodeTokens = (1 + 4 * kCycles) * model::ExecutionLimits::targetVerifyRows;
   constexpr uint32_t kIntoPage = 13, kLastChunkRows = 10;
   static_assert(kIntoPage + kLastChunkRows < kv::kPageTokens);
   const uint32_t denseTokens = densePagesOf(*model.descriptor.capabilities.sparseKv) * kv::kPageTokens;
@@ -3042,6 +3081,8 @@ void requireSpilledKvMatchesResident(metal::MetalBackend &backend, const model::
     cycles({&requests[0], &requests[2]}, kCycles);
     spill.end(requests[2]);
     cycles({&requests[0]}, kCycles);
+    spill.unspill(requests[0]);
+    cycles({&requests[0]}, kCycles);
     spill.end(requests[0]);
     return record;
   };
@@ -3050,6 +3091,7 @@ void requireSpilledKvMatchesResident(metal::MetalBackend &backend, const model::
   require(!residentReads.reads.resolves && !spill.historyStream().stats().commands,
           "a run whose pages all hold their K/V read spilled K/V");
   const SpillRecord spilled = run(4011, {true, false, true, false});
+  require(spill.unspilledPages(), "the spilled run's last turn un-spilled nothing");
   for (size_t step = 0; step < resident.steps.size(); ++step)
     require(spilled.steps[step] == resident.steps[step], "a run whose K/V spilled gave other tokens or logits than one "
                                                          "whose K/V stayed, at step " + std::to_string(step));
@@ -3069,6 +3111,7 @@ void requireSpilledKvMatchesResident(metal::MetalBackend &backend, const model::
             << " buffers=" << options.buffers << " streamed_commands=" << history.commands
             << " streamed_pages=" << history.pages << " resolves=" << reads.reads.resolves
             << " hits=" << reads.reads.hits << " misses=" << reads.reads.misses
+            << " unspilled_pages=" << spill.unspilledPages()
             << " command_buffers=" << std::ranges::max(spilled.commandBuffers) << '\n';
 
   // With every request ended, an idle reclaim gives back, after the pooled
