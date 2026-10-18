@@ -1635,8 +1635,10 @@ auto Engine::allocate(Attempt &&attempt, bool inService, ReclaimClass upTo,
       admission = tryOnce();
       continue;
     }
-    if (!paused && fallback && fallback(denial))
+    if (fallback && fallback(denial)) {
+      admission = tryOnce();
       continue;
+    }
     break;
   }
   if (!admission.granted()) {
