@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <string_view>
 
 namespace splash::engine {
 
@@ -28,6 +29,33 @@ inline constexpr uint64_t kGiB = 1024ULL * 1024 * 1024;
 [[nodiscard]] std::optional<uint64_t>
 minimumRequiredBytes(uint64_t fixedBytes, uint64_t laneStateBytes,
                      const kv::Layout &layout) noexcept;
+
+// How a part of the weights that can stream from the SSD is held
+// (--expert-memory, --ple-memory): as the planner decides (Auto), loaded
+// whole (Off), or streamed through a store of `bytes` (Size), which loads
+// the part whole instead when it would hold all of it.
+struct StreamedSetting final {
+  enum class Mode : uint8_t { Auto, Off, Size };
+  Mode mode = Mode::Auto;
+  uint64_t bytes = 0;
+
+  bool operator==(const StreamedSetting &) const = default;
+};
+
+// A part of the weights that can stream from the SSD instead of loading: a
+// MoE target's routed experts (model::ExpertStore) or the table its GGUF
+// holds (model::SparseRowStore). allBytes is what it takes loaded whole, zero
+// for a model without it, and floorBytes the smallest store that streams it.
+struct StreamedPart final {
+  uint64_t allBytes = 0;
+  uint64_t floorBytes = 0;
+  StreamedSetting setting;
+};
+
+// The store `setting` gives a part of `allBytes`: its bytes, or zero when the
+// part loads whole (Off, a Size that holds all of it, or a model without
+// it). Auto has no store of its own: the planner sizes it.
+[[nodiscard]] uint64_t streamedBytes(const StreamedSetting &setting, uint64_t allBytes) noexcept;
 
 // Inputs that the memory planner needs from a loaded model. Model tensor and
 // KV geometry stay with their owners; the planner receives only identity,
@@ -51,16 +79,120 @@ struct ModelMemoryFootprint final {
   uint64_t streamedTableBytes = 0;
 };
 
+// What a spill-capable target plans for the K/V of long requests that lives
+// on the SSD cache (DEVELOPMENT.md, KV on the SSD): a target whose layout can
+// spill (kv::Layout::spillable), whose model declares its block-sparse
+// attention (model::SparseKvShape) and whose SSD cache takes writes. A Spill
+// request's cache keeps Full the pages of its dense history (densePages), of
+// its tail window (windowPages) and of up to two prefill groups awaiting
+// their copies (groupPages each), and of every other page the index alone;
+// its tier copies take slots of slotBytes. Beside the requests' pages the
+// readers hold the larger of the hot block cache of the decoding lanes'
+// selected blocks (laneSlots a lane, its floor requiredSlots(1), its target
+// at least that) and a prefill's history staged a layer at a time in
+// stagingBuffers buffers; and the pool keeps one empty Index extent to spill
+// through at the memory limit. The readers' sizes are in whole extents of
+// the largest a pool of the layout takes, which the pool's own fit.
+struct KvSpillPlan final {
+  bool enabled = false;
+  uint32_t densePages = 0;
+  uint32_t windowPages = 0;
+  uint32_t groupPages = 0;
+  uint64_t slotBytes = 0;
+  uint64_t laneSlots = 0;
+  uint64_t hotFloorBytes = 0;
+  uint64_t hotTargetBytes = 0;
+  // The most the hot cache holds: its target, or the floor of every lane
+  // decoding over Index pages (requiredSlots(maximumBatchWidth)).
+  uint64_t hotLimitBytes = 0;
+  uint32_t stagingBuffers = 0;
+  uint64_t stagingBytes = 0;
+  uint64_t indexRunwayBytes = 0;
+  // The context the floors hold one Spill request of, and the floors: its
+  // pages, the readers' and the runway.
+  uint32_t floorTokens = 0;
+  uint64_t floorBytes = 0;
+  // The longest context spilling serves: what memory holds beside the
+  // streamed stores at their floors, and what the SSD cache's room for
+  // active KV holds (DiskSpace) beside every lane's state.
+  uint32_t memoryTokens = 0;
+  uint32_t diskTokens = 0;
+};
+
 struct ModelMemoryProfile final {
   std::string name;
   uint32_t maximumContextTokens = 0;
   kv::Layout targetKvLayout;
   ModelMemoryFootprint footprint;
   ops::GdnStateFormat stateFormat = ops::GdnStateFormat::Float32;
+  // A spill-capable target's (planStreamedMemory); disabled for others.
+  KvSpillPlan spill{};
 
   [[nodiscard]] std::optional<std::string> validationError() const;
   [[nodiscard]] uint64_t fixedRuntimeBytes() const;
 };
+
+// What the planner sizes the streamed stores and a spill-capable target's
+// floors by, before the model loads (RuntimeResources::create), and once it
+// loaded with the arenas its geometry takes.
+struct StreamedMemoryInputs final {
+  uint64_t hardBudgetBytes = 0;
+  // Everything the plan holds besides the streamed parts, the lanes' state
+  // and KV: the weights that load, the arenas, the reserves, the state
+  // staging and the Neural Engine split.
+  uint64_t fixedBytes = 0;
+  uint64_t laneStateBytes = 0;
+  kv::Layout kvLayout;
+  // The model's window (servedContextTokens), and the context --max-context
+  // asks for; zero for auto.
+  uint32_t windowTokens = 0;
+  uint32_t requestedContextTokens = 0;
+  StreamedPart experts;
+  StreamedPart table;
+  // --sparse-kv-memory: the hot block cache's target (Size), at least its
+  // floor; Auto keeps it at its floor.
+  StreamedSetting hotCache;
+  // The block-sparse attention a target declares, none for a dense one.
+  std::optional<model::SparseKvShape> sparseKv;
+  // The SSD cache: whether it takes writes, its slots and the room active
+  // KV may take of its volume (model::DiskBudget::activeLimitBytes).
+  bool tierWritable = false;
+  uint64_t kvSlotBytes = 0;
+  uint64_t stateSlotBytes = 0;
+  uint64_t activeLimitBytes = 0;
+  // The pages of a prefill group's rows (model::kPrefillGroupChunks chunks).
+  uint32_t groupPages = 0;
+};
+
+// The stores the plan streams the parts through, zero for a part that loads
+// whole or a model without it, and a spill-capable target's plan.
+struct StreamedMemoryPlan final {
+  uint64_t expertBytes = 0;
+  uint64_t tableBytes = 0;
+  KvSpillPlan spill{};
+};
+
+struct StreamedMemoryResult final {
+  std::optional<StreamedMemoryPlan> plan;
+  // Why nothing was planned, and when the floors exceed the budget, their
+  // bytes.
+  std::string error;
+  uint64_t requiredBytes = 0;
+};
+
+// Plans the stores of the parts that stream and a spill-capable target's
+// floors from one budget (DEVELOPMENT.md, Memory and context). The floors
+// come first: the fixed bytes, a lane's state, the KV runway, the stores at
+// their floors and the spill floors at the context spilling serves. Then the
+// routed experts load whole where that leaves KV its allowance, and otherwise
+// stream through all that the allowance and the PLE table's share leave; the
+// table loads whole where the rest holds it, and otherwise streams through
+// its share, at most 2 GiB. The allowance is a spill-capable target's first
+// 64K tokens of KV; a dense target's is --max-context, or none, so that its
+// experts load wherever they fit, and the first 64K tokens once they stream.
+// An explicit setting replaces its part; one below the part's floor, and
+// floors beyond the budget, are refused.
+[[nodiscard]] StreamedMemoryResult planStreamedMemory(const StreamedMemoryInputs &inputs);
 
 struct EngineMemoryPolicy {
   // recommendedMaxWorkingSetSize already describes Metal's performance-safe
@@ -116,6 +248,22 @@ enum class BudgetErrorCode {
   KvPoolDoesNotFit,
 };
 
+// The longest context a request may take, and what bounds it: the model's
+// window (model); the context one request's KV holds resident (memory); and
+// for a spill-capable target the longest one spilling serves, which memory
+// or the SSD cache's room bounds (KvSpillPlan::memoryTokens, diskTokens).
+struct ContextBounds final {
+  uint32_t window = 0;
+  uint32_t resident = 0;
+  uint32_t spilled = 0;
+  uint32_t disk = 0;
+
+  // The window, unless resident KV or spilling holds less of it.
+  [[nodiscard]] uint32_t maximum() const noexcept;
+  // What the maximum is: model, memory or disk.
+  [[nodiscard]] std::string_view bound() const noexcept;
+};
+
 struct EngineMemoryBreakdown {
   uint64_t physicalMemoryBytes = 0;
   uint64_t recommendedWorkingSetBytes = 0;
@@ -157,6 +305,14 @@ struct EngineMemoryBreakdown {
   uint32_t kvCapacityPages = 0;
   uint64_t kvCapacityBytes = 0;
   uint64_t kvCapacityTokens = 0;
+  // An Index page's bytes (kv::PageForm::Index): its blocks' index alone.
+  uint64_t kvIndexPageBytes = 0;
+  // A spill-capable target's plan, and what the dynamic budget leaves the
+  // requests' pages beside one lane's state, its readers and its runway
+  // (SpillGeometry::residentKvBytes).
+  KvSpillPlan kvSpill;
+  uint64_t residentKvBytes = 0;
+  ContextBounds contextBounds;
 
   uint64_t minimumDynamicBytes = 0;
   uint64_t minimumRequiredBytes = 0;
@@ -190,10 +346,19 @@ struct SpillGeometry final {
   uint32_t groupPages = 0;
 
   // A Resident request's KV at `tokens` tokens: its pages, Full.
-  [[nodiscard]] uint64_t residentBytes(uint64_t tokens) const noexcept;
+  [[nodiscard]] uint64_t residentBytes(uint64_t tokens) const noexcept { return pages(tokens) * fullPageBytes; }
   // A Spill request's at `tokens` tokens: every page's index, and the pages
   // it keeps Full.
-  [[nodiscard]] uint64_t spillFloorBytes(uint64_t tokens) const noexcept;
+  [[nodiscard]] uint64_t spillFloorBytes(uint64_t tokens) const noexcept {
+    const uint64_t all = pages(tokens);
+    const uint64_t full = std::min<uint64_t>(all, uint64_t{densePages} + windowPages + 2ULL * groupPages);
+    return full * fullPageBytes + (all - full) * indexPageBytes;
+  }
+
+private:
+  [[nodiscard]] static constexpr uint64_t pages(uint64_t tokens) noexcept {
+    return (tokens + kv::kPageTokens - 1) / kv::kPageTokens;
+  }
 };
 
 // Whether the target can spill (a spillable layout that declares its
@@ -207,11 +372,6 @@ struct EngineSpillConfig final {
   SpillGeometry geometry;
 };
 
-// Stubs, which the planner replaces: nothing is planned to
-// spill, and no request does (EngineSpillConfig::capable).
-inline uint64_t SpillGeometry::residentBytes(uint64_t) const noexcept { return 0; }
-inline uint64_t SpillGeometry::spillFloorBytes(uint64_t) const noexcept { return 0; }
-
 struct EngineMemoryPlanResult;
 
 class EngineMemoryPlan {
@@ -220,9 +380,12 @@ public:
     return breakdown_;
   }
   // Stable per-request ceiling advertised by the runtime: never more than the
-  // model supports or one request's KV capacity holds (less the speculative
-  // scratch); requests share the budget dynamically.
+  // model supports, and no more than one request's KV capacity holds (less
+  // the speculative scratch) unless spilling serves more
+  // (ContextBounds::maximum); requests share the budget dynamically.
   [[nodiscard]] uint32_t maximumContextTokens() const noexcept;
+  // What admission decides which requests spill by (EngineSpillConfig).
+  [[nodiscard]] SpillGeometry spillGeometry() const noexcept;
 
   [[nodiscard]] std::string toStatusJson() const;
 

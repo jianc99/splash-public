@@ -475,6 +475,16 @@ struct SparseKvShape final {
   uint32_t sinkTokens = 0;
   uint32_t localTokens = 0;
 
+  // The hot block cache of spilled K/V (KvBlockCache) in slots a layer: one
+  // decoding lane's rows select at most laneSlots(), and while `lanes` lanes
+  // decode over Index pages it holds requiredSlots(lanes), one lane's more
+  // than they select, so that two lanes' selections do not thrash it; for
+  // one lane, the size past which more slots save few reads.
+  [[nodiscard]] constexpr uint64_t laneSlots() const noexcept { return uint64_t{verifyRows} * selectedBlocks; }
+  [[nodiscard]] constexpr uint64_t requiredSlots(uint32_t lanes) const noexcept {
+    return lanes ? (uint64_t{lanes} + 1) * laneSlots() : 0;
+  }
+
   bool operator==(const SparseKvShape &) const = default;
 };
 

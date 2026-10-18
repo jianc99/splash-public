@@ -66,6 +66,8 @@ TEST_ELASTIC_KV_ASAN := $(ENGINE_SANITIZER_BUILD)/elastic-kv-pool-asan-ubsan
 TEST_ELASTIC_KV_TSAN := $(ENGINE_SANITIZER_BUILD)/elastic-kv-pool-tsan
 TEST_SLOT_RECYCLER_ASAN := $(ENGINE_SANITIZER_BUILD)/slot-recycler-asan-ubsan
 TEST_SLOT_RECYCLER_TSAN := $(ENGINE_SANITIZER_BUILD)/slot-recycler-tsan
+# The memory planner's integer arithmetic; it runs on one thread.
+TEST_MEMORY_PLAN_ASAN := $(ENGINE_SANITIZER_BUILD)/engine-memory-plan-asan-ubsan
 TEST_MEMORY_TEST := $(ENGINE_TEST_BUILD)/engine-memory-plan
 TEST_VISION_PREPARATION := $(ENGINE_TEST_BUILD)/vision-preparation
 TEST_DRAFT_PREPARATION := $(ENGINE_TEST_BUILD)/draft-preparation
@@ -276,7 +278,8 @@ SANITIZER_CONFIG_TARGETS := $(TEST_SLOT_FILE_ASAN) $(TEST_SLOT_FILE_TSAN) \
 	$(TEST_SPARSE_ROW_STORE_ASAN) $(TEST_SPARSE_ROW_STORE_TSAN) \
 	$(TEST_SSD_READERS_ASAN) $(TEST_SSD_READERS_TSAN) \
 	$(TEST_ELASTIC_KV_ASAN) $(TEST_ELASTIC_KV_TSAN) \
-	$(TEST_SLOT_RECYCLER_ASAN) $(TEST_SLOT_RECYCLER_TSAN)
+	$(TEST_SLOT_RECYCLER_ASAN) $(TEST_SLOT_RECYCLER_TSAN) \
+	$(TEST_MEMORY_PLAN_ASAN)
 
 # Every native test, benchmark and tool depends on the engine's and the tests'
 # headers, and compiles and links its other prerequisites in the order it
@@ -297,7 +300,7 @@ $(ENGINE_TEST_BUILD) $(ENGINE_SANITIZER_BUILD):
 $(TEST_WEIGHT_SOURCE): dev/tests/engine/weight_source_test.cpp runtime/model/WeightSource.cpp
 $(TEST_GGUF_FILE): dev/tests/engine/gguf_file_test.cpp runtime/model/GgufFile.cpp \
 		runtime/model/WeightSource.cpp
-$(TEST_MEMORY_TEST): runtime/metal/DeviceCapabilities.cpp \
+$(TEST_MEMORY_TEST) $(TEST_MEMORY_PLAN_ASAN): runtime/metal/DeviceCapabilities.cpp \
 		runtime/engine/MemoryPlan.cpp \
 		dev/tests/engine/engine_memory_plan_test.cpp
 $(TEST_KV_PAGE_CACHE_TEST): runtime/engine/KvPool.cpp \
@@ -764,6 +767,7 @@ test-sanitizers: $(SANITIZER_CONFIG_TARGETS)
 	$(TSAN_TEST_ENV) $(TEST_ELASTIC_KV_TSAN)
 	$(ASAN_TEST_ENV) $(TEST_SLOT_RECYCLER_ASAN) $(KV_SELECTION_TRACES)
 	$(TSAN_TEST_ENV) $(TEST_SLOT_RECYCLER_TSAN) $(KV_SELECTION_TRACES)
+	$(ASAN_TEST_ENV) $(TEST_MEMORY_PLAN_ASAN)
 
 # The Metal tests of the components whose host steps share their state with
 # the engine thread and the SSD readers, the hot block cache and the history

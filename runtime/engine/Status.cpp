@@ -173,6 +173,74 @@ void appendStreamedExperts(std::ostringstream &out, const std::optional<model::E
   out << ",\"failure\":" << json::quote(experts->failure) << '}';
 }
 
+// What the resolves of spilled K/V did (model::KvReadStats): the entries of
+// their block lists, those of Full pages, the blocks found cached and those
+// read, as the expert store counts its own (appendStreamedExperts).
+void appendKvReads(std::ostringstream &out, const model::KvReadStats &reads) {
+  out << "\"resolves\":" << reads.resolves << ",\"entries\":" << reads.entries << ",\"paged\":" << reads.paged
+      << ",\"hits\":" << reads.hits << ",\"read\":" << reads.misses << ",\"hit_rate\":"
+      << (reads.hits + reads.misses ? double(reads.hits) / double(reads.hits + reads.misses) : 0.0)
+      << ",\"ghost_hits\":" << reads.ghostHits << ",\"read_bytes\":" << reads.readBytes
+      << ",\"read_failures\":" << reads.readFailures;
+}
+
+// Where a block-sparse target's long requests keep their KV (kv_spill):
+// whether on the SSD cache and why not; the pages that hold only their index
+// (the pool's extents of that form, `index`) and those spilled; the
+// write-through of Spill requests' pages; the moves between page forms,
+// rewrites and restores; the quota of active KV; the Index runway, the free
+// pages of that form; and the readers' memory and reads, null for a target
+// that keeps its KV in memory.
+void appendKvSpill(std::ostringstream &out, const KvSpillStatus &spill, const KvPoolFormSnapshot &index) {
+  const KvSpillSnapshot &cache = spill.cache;
+  const uint64_t pageBytes = index.pagesAllocated ? index.allocatedBytes / index.pagesAllocated : 0;
+  const uint32_t indexPages = index.pagesActive + index.pagesPrefix;
+  out << "{\"enabled\":" << boolean(spill.enabled) << ",\"reason\":" << json::quote(spill.reason)
+      << ",\"pages\":{\"index\":" << indexPages << ",\"index_bytes\":" << indexPages * pageBytes
+      << ",\"spilled\":" << cache.spilledPages << ",\"spilled_bytes\":" << cache.spilledBytes << '}'
+      << ",\"write_through\":{\"pages\":" << cache.writeThroughPages << ",\"bytes\":" << cache.writeThroughBytes
+      << ",\"in_flight\":" << cache.writeThroughInFlight << ",\"failures\":" << cache.writeThroughFailures
+      << ",\"paused\":" << boolean(cache.writeThroughPaused) << '}' << ",\"spill_moves\":" << cache.spillMoves
+      << ",\"unspills\":" << cache.unspills << ",\"rewrites\":" << cache.rewrites
+      << ",\"restores\":{\"index_pages\":" << cache.indexRestores << ",\"whole_pages\":" << cache.wholeRestores
+      << ",\"ms\":";
+  appendLatency(out, cache.restore);
+  out << "},\"quota\":{\"active_limit_bytes\":" << cache.activeLimitBytes << ",\"held_bytes\":" << cache.heldBytes
+      << ",\"committed_bytes\":" << cache.committedBytes << ",\"revoked\":" << cache.revokedCommitments << '}'
+      << ",\"index_runway_bytes\":" << index.pagesFree * pageBytes << ",\"block_cache\":";
+  if (const std::optional<model::KvBlockCacheStats> &hot = spill.blockCache) {
+    out << "{\"bytes\":" << hot->bytes << ",\"target_bytes\":" << hot->targetBytes
+        << ",\"floor_bytes\":" << hot->floorBytes << ",\"slots_per_layer\":" << hot->slotsPerLayer
+        << ",\"lanes\":" << hot->lanes << ',';
+    appendKvReads(out, hot->reads);
+    out << ",\"resolve_ms\":";
+    appendLatency(out, hot->resolve);
+    out << ",\"read_ms\":";
+    appendLatency(out, hot->read);
+    out << ",\"host_steps\":{\"pickup_ms\":";
+    appendLatency(out, hot->pickup);
+    out << ",\"work_ms\":";
+    appendLatency(out, hot->work);
+    out << ",\"resume_ms\":";
+    appendLatency(out, hot->resume);
+    out << "}}";
+  } else {
+    out << "null";
+  }
+  out << ",\"history_stream\":";
+  if (const std::optional<model::KvHistoryStreamStats> &stream = spill.historyStream) {
+    out << "{\"commands\":" << stream->commands << ",\"layers\":" << stream->layers
+        << ",\"pages\":" << stream->pages << ",\"bytes\":" << stream->bytes
+        << ",\"staging_bytes\":" << stream->stagingBytes << ",\"buffers\":" << stream->buffers
+        << ",\"wait_ms\":";
+    appendLatency(out, stream->wait);
+    out << '}';
+  } else {
+    out << "null";
+  }
+  out << '}';
+}
+
 } // namespace
 
 std::string runtimeStatusJson(
@@ -186,7 +254,7 @@ std::string runtimeStatusJson(
     const NativeLoopTiming &loop, const WeightsSnapshot &weights,
     const AneFfnSnapshot &aneFfn, ThermalState thermalState,
     const std::optional<model::SparseRowStats> &streamedTable,
-    const std::optional<model::ExpertStoreStats> &streamedExperts) {
+    const std::optional<model::ExpertStoreStats> &streamedExperts, const KvSpillStatus &kvSpill) {
   const auto &resources = core.resources;
   const auto &scheduler = core.scheduler;
   const auto &pool = resources.pool;
@@ -270,6 +338,8 @@ std::string runtimeStatusJson(
   appendStreamedTable(out, streamedTable);
   out << ",\"streamed_experts\":";
   appendStreamedExperts(out, streamedExperts);
+  out << ",\"kv_spill\":";
+  appendKvSpill(out, kvSpill, pool.index);
   out << ",\"ane_ffn\":";
   appendAneFfn(out, aneFfn, executorTelemetry.aneFfnReruns);
   out << ",\"kv\":{\"block_tokens\":" << kv::kPageTokens
