@@ -45,8 +45,8 @@ struct SlotRange final {
 // indexSpans).
 class SlotFormat final {
 public:
-  // The alignment of a direct read (model::SlotFile::readAt).
-  static constexpr uint64_t kReadAlignmentBytes = kDirectReadBytes;
+  // The alignment of a read beside the tier's worker (model::SlotFile::readAt).
+  static constexpr uint64_t kReadAlignmentBytes = kSlotReadAlignmentBytes;
   // A version-1 page's blocks per layer: a location's places.
   static constexpr uint32_t kBlocksPerPage = 1u << SPLASH_ATTENTION_LOCATION_BLOCK_BITS;
   // A page's tensors of one layer, by SPLASH_KV_KEYS to

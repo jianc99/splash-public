@@ -11,12 +11,11 @@
 // in the background (start), on at most the readers it was given, and only
 // while no batch runs now, so a read ahead never delays a step's reads.
 // A reader takes the oldest background batch with room for it. While a
-// batch runs now,
-// writes to the drive hold back (criticalBusy). The store that started a
-// background batch ends it: finish() runs the rest of it now, and stop()
-// leaves the rest unread and returns once the tasks readers took ended, the
-// batch's first taken() tasks; halt() leaves the rest unread at once, and its
-// taken tasks end on their own (Batch::ended).
+// batch runs now, writes to the drive hold back (criticalBusy). The store
+// that started a background batch ends it: finish() runs the rest of it
+// now, and stop() leaves the rest unread and returns once the tasks readers
+// took ended, the batch's first taken() tasks; halt() leaves the rest unread
+// at once, and its taken tasks end on their own (Batch::ended).
 //
 // A task that throws is tried once more, for a transient I/O error; a second
 // failure is the task's. A batch that runs now throws its first failure once

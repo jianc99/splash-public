@@ -634,7 +634,8 @@ class AlignedBytes final {
 public:
   explicit AlignedBytes(size_t size) : size_(size) {
     void *memory = nullptr;
-    require(::posix_memalign(&memory, splash::kDirectReadBytes, size) == 0, "aligned memory could not be allocated");
+    require(::posix_memalign(&memory, splash::kSlotReadAlignmentBytes, size) == 0,
+            "aligned memory could not be allocated");
     memory_.reset(static_cast<std::byte *>(memory));
   }
   [[nodiscard]] std::span<std::byte> span() const noexcept { return {memory_.get(), size_}; }
@@ -669,7 +670,7 @@ template <class Value> static void put(std::vector<std::byte> &bytes, size_t off
 // that is not aligned or too small, or another file's slot.
 static void testReadAtReadsAlignedUnits() {
   constexpr size_t size = 4 * kHostPageBytes;
-  constexpr uint64_t unit = splash::kDirectReadBytes;
+  constexpr uint64_t unit = splash::kSlotReadAlignmentBytes;
   auto budget = std::make_shared<DiskBudget>(4 * size);
   SlotFile file(size, budget), other(size, budget);
   auto slot = file.acquire(), unwritten = file.acquire(), foreign = other.acquire();
@@ -859,7 +860,7 @@ static void testSegmentedRecords() {
 // slot is trusted; a slot this process wrote is too.
 static void testAdoptedReadsCheckTheirSegments() {
   constexpr size_t size = 2 * kHostPageBytes;
-  constexpr uint64_t unit = splash::kDirectReadBytes;
+  constexpr uint64_t unit = splash::kSlotReadAlignmentBytes;
   const SlotFile::Options options{.segments = {8192, 4160, 4160, 4160, 4160}};
   const std::vector<std::byte> payload = patterned(24832, 9);
   Directory directory;

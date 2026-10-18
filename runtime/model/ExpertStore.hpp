@@ -50,7 +50,7 @@
 // experts of the sizes of one block again, and the loads after it every
 // expert they route.
 //
-// Reads run on the model's SSD readers (model::SsdReaders), which try a
+// Reads run on the engine's SSD readers (model::SsdReaders), which try a
 // failed read once more. A load checks its sources unchanged after it read
 // them. A load that fails (a read of an expert it routes fails twice, or a
 // source was written) frees the slots of the experts it had not repacked and
@@ -96,7 +96,8 @@ struct ExpertStoreOptions final {
   // (ExpertStore::fixedBytes), and in the rest the arenas' slots, which hold
   // at least a block's experts of each size and all of a size of one block.
   uint64_t memoryBytes = 0;
-  // The readers its reads run on, which a model's streamed weights share.
+  // The readers its reads run on: the engine's one pool, which the other
+  // streamed weights and KV reads share.
   std::shared_ptr<SsdReaders> readers;
   // The most bytes one arena takes: the device's largest buffer
   // (maxBufferLength) when zero or more.
