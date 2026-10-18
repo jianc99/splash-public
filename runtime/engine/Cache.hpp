@@ -554,10 +554,10 @@ public:
   [[nodiscard]] CacheReclaimResult reclaimForPages(uint32_t pages, CacheReclaimMode mode,
                                                    ReclaimClass upTo,
                                                    kv::PageForm form = kv::PageForm::Full);
-  // The most pages reclaimForPages(pages, mode, upTo) can leave free: every
-  // allocated page no request holds, but with Ordinary not the idle KV that
-  // states in use restore through.
-  [[nodiscard]] uint32_t reusablePages(ReclaimClass upTo) const;
+  // The most pages of the form reclaimForPages(pages, mode, upTo, form) can
+  // leave free: every allocated page of the form no request holds, but with
+  // Ordinary not the idle KV that states in use restore through.
+  [[nodiscard]] uint32_t reusablePages(ReclaimClass upTo, kv::PageForm form = kv::PageForm::Full) const;
   // One step of room for the buffers of a state, which a command will
   // capture (Model::reserveState) or which is taken from its lane after the
   // command that ended at it (Model::snapshot), taking nothing of a class
