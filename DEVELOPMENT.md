@@ -324,8 +324,9 @@ size with a warning.
   allocations, as it holds it now, and the startup memory audit bounds it by
   the plan and counts it toward the hard budget beside Metal's footprint. It
   is not released while idle. Its rows live in 64 MiB chunks above a floor of
-  one row: on a target whose KV can go to the SSD, a new request that host
-  pressure holds back may take chunks
+  one row, filled in order, and a chunk holds memory only once rows went into
+  it: on a target whose KV can go to the SSD, a new request that host
+  pressure holds back may take the rows the chunks hold
   ([KV on the SSD](#kv-on-the-ssd)), and the cache grows back a chunk a
   command once growth is allowed again.
 - `/status` reports it under `streamed_table`: the table and its bytes, the
@@ -624,9 +625,10 @@ what memory holds, as a dense target's is.
   `kv_unreadable`, which they may retry; the copy is dropped.
 - Under host pressure, while growth is paused, a new request (or a resume)
   beside a running one starts on memory Splash releases for it, rather than
-  wait: idle memory first, then 64 MiB chunks of the streamed PLE table's
-  cache down to its floor, and last a running request's KV, which moves to
-  the SSD. That request decodes at the priority of the new one or below, and
+  wait: idle memory first, then the rows the streamed PLE table's cache
+  holds, a 64 MiB chunk at a time, down to its floor (a cache its rows have
+  not filled gives back only what they hold), and last a running request's
+  KV, which moves to the SSD. That request decodes at the priority of the new one or below, and
   is the one whose KV frees the most net of the hot cache it then needs, if
   the requests that could give their KV together cover what the new one
   lacks; a short request's KV frees nothing. Splash does not grow for it: the
@@ -1438,7 +1440,7 @@ Proxy consumers can use these fields; additional fields may be added:
 | `identity.cache.rope_scaling` | With `--yarn-factor`, the target's RoPE scaling, which every cached key went through: `type` `yarn`, its `factor` and `original_context_tokens`; `null` otherwise |
 | `streamed_table` | While the PLE table streams, the [streamed PLE table](#ple-table-streaming)'s cache, stages, reads and prefetches; `null` otherwise |
 | `streamed_experts` | While routed experts stream, the [streamed experts](#streamed-experts)' store: its slots and resident experts, per use its loads, reads, read-ahead and host-step round trips, and its failure; `null` otherwise |
-| `kv_spill` | While a block-sparse target's KV can go to the SSD, its [KV on the SSD](#kv-on-the-ssd): the requests that started in each mode, converted to `spill`, had their output bounded or ended at that bound, and were refused for the quota, the write budget or a closed tier, and the starts waiting for the quota (`requests`); the new requests that host pressure held back and memory Splash released started, the requests whose KV moved to the SSD for them, what was released for them (`released_bytes`: idle memory, cache, and the streamed PLE table's chunks) and what the governor still holds of it for them (`balance_bytes`) (`funding`); the pages that hold only their index and those whose KV is on the SSD; the write-through of spilling requests' pages; page moves, rewrites and restores; the quota of KV in service; the hot block cache's memory, hits, reads and host steps (`block_cache`; `read` over `resolves` is the blocks a layer's step missed on average) and the history streams' reads, how long each layer's took (`read_ms`, whose total gives with `bytes` the streams' bandwidth) and staging, the streamed commands that ran beside decoders, and the decoders' gaps across them (`history_stream`); `null` for a target whose KV stays in memory, as the plan's `memory_plan.budget.kv_spill` is |
+| `kv_spill` | While a block-sparse target's KV can go to the SSD, its [KV on the SSD](#kv-on-the-ssd): the requests that started in each mode, converted to `spill`, had their output bounded or ended at that bound, and were refused for the quota, the write budget or a closed tier, and the starts waiting for the quota (`requests`); the new requests that host pressure held back and memory Splash released started, the requests whose KV moved to the SSD for them, what was released for them (`released_bytes`: idle memory, cache, and the rows the streamed PLE table's chunks held) and what the governor still holds of it for them (`balance_bytes`) (`funding`); the pages that hold only their index and those whose KV is on the SSD; the write-through of spilling requests' pages; page moves, rewrites and restores; the quota of KV in service; the hot block cache's memory, hits, reads and host steps (`block_cache`; `read` over `resolves` is the blocks a layer's step missed on average) and the history streams' reads, how long each layer's took (`read_ms`, whose total gives with `bytes` the streams' bandwidth) and staging, the streamed commands that ran beside decoders, and the decoders' gaps across them (`history_stream`); absent for a target whose KV stays in memory, whose plan's `memory_plan.budget.kv_spill` is `null` |
 | `memory_plan.budget.context_bounds` | What bounds `maximum_context_tokens` ([memory and context](#memory-and-context)): the model's `window`, one request's KV in memory (`resident`), the longest context a block-sparse target's floors hold (`spilled`) and its SSD cache's room holds (`disk`), and the `bound` that sets the limit: `model`, `memory` or `disk` |
 | `ane_ffn.state`, `share`, `minimum_rows`, `reason` | The prefill FFN's [Neural Engine split](#neural-engine-prefill): `split` while it serves, at `share` of the FFN's channels over chunks of `minimum_rows` rows or more; `off` when the start left the GPU alone (`share` and `minimum_rows` 0); `stopped` once it stopped while serving, until the engine restarts. `reason` is the start's outcome, or why the split stopped |
 | `ane_ffn.split_commands`, `evaluations`, `ane_ms`, `reruns` | Prefill commands the split ran since engine start, the Neural Engine's evaluations in them and its milliseconds over them (each evaluation's from the GPU's signal to start it to its report); and the chunks the GPU ran again alone after the split's work for them failed |
