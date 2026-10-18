@@ -1399,7 +1399,21 @@ kernel void draft_verify_rows(device const float *confidence [[buffer(0)]],
     rows[lane] = params.every_row != 0 ? params.maximum[lane] : 1;
     total += rows[lane];
   }
-  if (params.every_row == 0) {
+  if (params.every_row == 0 && params.reach > 0.0f) {
+    for (uint lane = 0; lane < params.lanes; ++lane) {
+      const uint maximum = params.maximum[lane];
+      uint reached = min(2u, maximum);
+      float reach = 1.0f;
+      for (uint position = 0; position + 2 < maximum; ++position) {
+        reach *= confidence[lane * Positions + position];
+        if (reach < params.reach)
+          break;
+        ++reached;
+      }
+      total += reached - rows[lane];
+      rows[lane] = reached;
+    }
+  } else if (params.every_row == 0) {
     float survivals[Lanes * Positions];
     uint owners[Lanes * Positions];
     uint count = 0;

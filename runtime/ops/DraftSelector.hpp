@@ -47,6 +47,8 @@ struct VerifyRowsModel final {
   std::array<float, SPLASH_DRAFT_PROPOSAL_TOKENS> intercepts{};
   std::array<float, kCosts> costs{};
   bool everyRow = true;
+  // PROBE: the reach rule at this threshold instead (VerifyRowsParams::reach).
+  float reach = 0.0F;
 };
 
 // The draft's selector codebooks, which score the edge from a proposal

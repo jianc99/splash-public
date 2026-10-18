@@ -38,6 +38,10 @@
 #include <utility>
 #include <vector>
 
+#include <cstdio>
+#include <mutex>
+#include <sys/stat.h>
+
 namespace splash::model {
 namespace {
 
@@ -98,6 +102,90 @@ private:
 };
 
 using kv::ChunkedPrefillParams;
+
+// PROBE (measurement only, not for the PR): SPLASH_PROTO_VERIFY_CTL names a
+// file whose first line sets the verify rows of the cycles encoded after it
+// changes: "all", "reach TAU" or "budget" (the default); SPLASH_PROTO_ACCEPT_LOG
+// a JSON-lines log of every lane of every decode cycle. The verify budget
+// learns from its own cycles only.
+class VerifyRowsProbe final {
+public:
+  enum class Mode : uint8_t { All, Reach, Budget };
+  static VerifyRowsProbe &instance() {
+    static VerifyRowsProbe probe;
+    return probe;
+  }
+  std::pair<Mode, float> mode() {
+    std::lock_guard lock(mutex_);
+    refresh();
+    return {mode_, reach_};
+  }
+  bool logging() const noexcept { return log_ != nullptr; }
+  void record(uint64_t id, uint32_t width, uint32_t lane, Mode mode, bool explored, uint32_t verifyRows,
+              uint32_t maximumRetained, uint32_t accepted, uint32_t retained, const CommandTiming &timing,
+              const float *confidence, const VerifyBudget::Acceptance &acceptance) {
+    std::lock_guard lock(mutex_);
+    if (!log_)
+      return;
+    const double now = std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
+    std::fprintf(log_,
+                 "{\"t\":%.4f,\"id\":%llu,\"B\":%u,\"l\":%u,\"mode\":%u,\"e\":%d,\"k\":%u,\"m\":%u,"
+                 "\"a\":%u,\"r\":%u,\"w\":%.3f,\"g\":%.3f,\"c\":[",
+                 now, static_cast<unsigned long long>(id), width, lane, unsigned(mode), explored ? 1 : 0, verifyRows,
+                 maximumRetained, accepted, retained, timing.wallSeconds * 1e3, timing.gpuSeconds * 1e3);
+    for (uint32_t p = 0; p < kDraftProposalTokens; ++p)
+      std::fprintf(log_, p ? ",%.4f" : "%.4f", confidence[p]);
+    std::fputs("]", log_);
+    if (lane == 0) {
+      std::fprintf(log_, ",\"ws\":%.4f,\"wb\":[", acceptance.slope);
+      for (uint32_t p = 0; p < kDraftProposalTokens; ++p)
+        std::fprintf(log_, p ? ",%.3f" : "%.3f", acceptance.intercepts[p]);
+      std::fputs("]", log_);
+    }
+    std::fputs("}\n", log_);
+    if (lane + 1 == width)
+      std::fflush(log_);
+  }
+
+private:
+  VerifyRowsProbe() {
+    if (const char *path = std::getenv("SPLASH_PROTO_VERIFY_CTL")) control_ = path;
+    if (const char *path = std::getenv("SPLASH_PROTO_ACCEPT_LOG")) log_ = std::fopen(path, "a");
+  }
+  void refresh() {
+    if (control_.empty())
+      return;
+    struct stat info{};
+    if (::stat(control_.c_str(), &info) != 0)
+      return;
+    const int64_t stamp = int64_t(info.st_mtimespec.tv_sec) * 1000000000 + info.st_mtimespec.tv_nsec;
+    if (stamp == stamp_)
+      return;
+    stamp_ = stamp;
+    FILE *file = std::fopen(control_.c_str(), "r");
+    if (!file)
+      return;
+    char word[16] = {};
+    double value = 0;
+    const int read = std::fscanf(file, "%15s %lf", word, &value);
+    std::fclose(file);
+    mode_ = Mode::Budget;
+    reach_ = 0.0F;
+    if (read >= 1 && std::string_view(word) == "all") {
+      mode_ = Mode::All;
+    } else if (read >= 2 && std::string_view(word) == "reach" && value > 0 && value <= 1) {
+      mode_ = Mode::Reach;
+      reach_ = float(value);
+    }
+    std::fprintf(stderr, "verify-rows probe: %s %g\n", word, value);
+  }
+  std::mutex mutex_;
+  std::string control_;
+  FILE *log_ = nullptr;
+  int64_t stamp_ = -1;
+  Mode mode_ = Mode::Budget;
+  float reach_ = 0.0F;
+};
 
 // Whether a target's decode cycles choose how many rows of its block each
 // lane verifies by expected tokens per cost (model::VerifyBudget,
@@ -329,6 +417,9 @@ struct Runtime::Impl {
     uint32_t accepted = 0;
     uint32_t currentAnchor = 0;
     uint32_t maximumRetained = 0;
+    // PROBE: the cycle's verify rows mode and whether it explored.
+    VerifyRowsProbe::Mode probeMode = VerifyRowsProbe::Mode::Budget;
+    bool probeExplored = false;
     // The rows of its block the lane verified (budgetsVerifyRows).
     uint32_t verifyRows = 0;
     // The draft proposals the lane's thinking end replaced, which its
@@ -1730,7 +1821,7 @@ struct Runtime::Impl {
   // The draft's proposals for each lane and how many rows of its block it
   // verifies, at most maximumRows[lane] (its retention limit), by the
   // acceptance model and the costs of `constrained` cycles of its lane count.
-  void encodeDraftBatchGraph(CommandGraph &graph,
+  std::pair<VerifyRowsProbe::Mode, bool> encodeDraftBatchGraph(CommandGraph &graph,
                              std::span<Request *const> entries,
                              std::span<const uint64_t> logicalPositions,
                              std::span<const uint32_t> maximumRows,
@@ -1794,14 +1885,20 @@ struct Runtime::Impl {
          d(DecodeTensor::ProposalProbs), d(DecodeTensor::VerifyConfidence)},
         std::span(anchors).first(lanes), std::span(policies).first(lanes));
     ops::VerifyRowsModel verify;
-    if (budgetsVerifyRows(geometry) && !verifyBudget.explores(lanes, constrained)) {
+    const auto [mode, reach] = VerifyRowsProbe::instance().mode();
+    const bool explores = mode == VerifyRowsProbe::Mode::Budget && verifyBudget.explores(lanes, constrained);
+    if (budgetsVerifyRows(geometry) && mode == VerifyRowsProbe::Mode::Budget && !explores) {
       const VerifyBudget::Acceptance &acceptance = verifyBudget.acceptance();
       verify = {acceptance.slope, acceptance.intercepts, verifyBudget.costs(lanes, constrained), false};
+    } else if (budgetsVerifyRows(geometry) && mode == VerifyRowsProbe::Mode::Reach) {
+      verify.everyRow = false;
+      verify.reach = reach;
     }
     ops::DraftSelector::addVerifyRows(graph, d(DecodeTensor::VerifyConfidence), d(DecodeTensor::VerifyRows),
                                       verify, maximumRows);
     sampling.addThinkingDrafts(graph, std::span(policies).first(lanes),
                                d(DecodeTensor::ProposedTokens));
+    return {mode, explores};
   }
 
   void encodeTargetVerifyBatchForward(CommandGraph &graph,
@@ -2051,8 +2148,16 @@ struct Runtime::Impl {
       laneResult.failure =
           invalidSelection({targetTokens, laneResult.retained}, lane);
     }
+    // PROBE: every lane of the cycle to the log.
+    if (VerifyRowsProbe::instance().logging())
+      for (uint32_t lane = 0; lane < items.size(); ++lane)
+        VerifyRowsProbe::instance().record(
+            lanes[lane].request->id, uint32_t(items.size()), lane, lanes[0].probeMode, lanes[0].probeExplored,
+            lanes[lane].verifyRows, lanes[lane].maximumRetained, lanes[lane].accepted, lanes[lane].retained, timing,
+            contents<float>(decodeArena->get(lane, DecodeTensor::VerifyConfidence), "draft proposal confidence"),
+            verifyBudget.acceptance());
     // The cycle teaches the verify budget its lanes' labels and its cost.
-    if (budgetsVerifyRows(geometry) &&
+    if (budgetsVerifyRows(geometry) && lanes[0].probeMode == VerifyRowsProbe::Mode::Budget &&
         std::all_of(lanes.begin(), lanes.begin() + static_cast<std::ptrdiff_t>(items.size()),
                     [](const DecodeLaneResult &laneResult) { return laneResult.failure.empty(); })) {
       std::array<VerifyBudget::Lane, kLaneCount> observed{};
@@ -2826,9 +2931,13 @@ Runtime::decodeAsync(const BatchPlan &plan,
       impl_->decodeArena->batchSlice(DecodeTensor::DraftRopeSin, width));
   impl_->encodeBatchEmbedding(commandGraph, DecodeTensor::DraftInputTokens,
                               DecodeTensor::DraftHidden0, width);
-  impl_->encodeDraftBatchGraph(commandGraph, entries,
+  const auto [probeMode, probeExplored] = impl_->encodeDraftBatchGraph(commandGraph, entries,
                                {logicalPositions.data(), width},
                                {maximumRetained.data(), width}, constrained);
+  for (uint32_t lane = 0; lane < width; ++lane) {
+    lanes[lane].probeMode = probeMode;
+    lanes[lane].probeExplored = probeExplored;
+  }
   if (constrained) {
     return std::make_unique<Impl::ConstrainedDecodeTicket>(
         *impl_, std::move(lanes), items, commandGraph, std::move(completion));

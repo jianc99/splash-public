@@ -106,7 +106,8 @@ void DraftSelector::addVerifyRows(metal::CommandGraph &graph, const metal::Metal
       throw std::invalid_argument("invalid draft verify rows maximum");
     params.maximum[lane] = maximumRows[lane];
   }
-  if (!model.everyRow) {
+  params.reach = model.everyRow ? 0.0F : model.reach;
+  if (!model.everyRow && model.reach <= 0.0F) {
     if (!std::isfinite(model.slope))
       throw std::invalid_argument("invalid draft verify rows model");
     params.slope = model.slope;

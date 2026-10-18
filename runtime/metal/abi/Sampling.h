@@ -196,10 +196,14 @@ struct VerifyRowsParams {
   uint32_t lanes;
   uint32_t every_row;
   uint32_t maximum[SPLASH_MAXIMUM_BATCH_WIDTH];
+  // PROBE (measurement only): above 0, the reach rule instead: the anchor,
+  // the first proposal and each later one the lane reaches with a product of
+  // confidences of at least `reach`.
+  float reach;
 };
 
-static_assert(sizeof(VerifyRowsParams) == 188,
-              "Verify rows parameters are 188 bytes on both sides");
+static_assert(sizeof(VerifyRowsParams) == 192,
+              "Verify rows parameters are 192 bytes on both sides");
 
 struct AcceptBatchParams {
   uint32_t remaining[SPLASH_MAXIMUM_BATCH_WIDTH];
