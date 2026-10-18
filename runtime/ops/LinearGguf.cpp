@@ -34,9 +34,9 @@ std::string prefillKernel(const char *format, char epilogue) {
 // K splits of a decode tile, one rule for both tiles. A tier asks for more
 // partitions while the grid holds fewer than `threadgroups` threadgroups per
 // core and each partition would still keep `inputs` inputs; the split count
-// doubles, up to the maximum, while some tier asks. Decode K is a multiple of 256,
-// so eight partitions always hold whole 32-input groups. The rule ignores the
-// batch width: bounds that depended on it did not pay on either family.
+// doubles, up to the maximum and in whole 32-input groups per partition, while
+// some tier asks. The rule ignores the batch width: bounds that depended on it
+// did not pay on either family.
 struct SplitTier {
   uint32_t threadgroups;
   uint32_t inputs;
@@ -47,15 +47,18 @@ uint32_t decodeSplits(uint32_t n, uint32_t k, uint32_t cores, std::span<const Sp
   const auto asks = [&](const SplitTier &t) {
     return grid * splits < uint64_t{t.threadgroups} * cores && k / (2 * splits) >= t.inputs;
   };
-  while (splits < LinearConfig::kMaximumSplits && std::any_of(tiers.begin(), tiers.end(), asks)) splits *= 2;
+  while (splits < LinearConfig::kMaximumSplits && (k / 32) % (2 * splits) == 0 &&
+         std::any_of(tiers.begin(), tiers.end(), asks))
+    splits *= 2;
   return splits;
 }
 
 // Apple9 register tile (128 threads). A core holds four of its threadgroups
 // at once, so the tile's time steps with every four threadgroups per core.
-// Below one wave a core must fill it, down to one 256-input coefficient unit
-// per partition; below eight waves more threadgroups shrink the last wave's
-// tail while partitions of 1024 inputs amortize the partial sums.
+// Below one wave a core must fill it, down to 256 inputs per partition, whole
+// coefficient units in every format (quant_register_unit); below eight waves
+// more threadgroups shrink the last wave's tail while partitions of 1024
+// inputs amortize the partial sums.
 constexpr SplitTier kRegisterTiers[] = {{4, 256}, {32, 1024}};
 
 // Staged tile (64 threads): one fitted tier, six threadgroups per core with
@@ -116,8 +119,8 @@ bool oneFormat(std::span<const Projection *const> projections) {
 // four, and on Q2_K 24-33% less at two and four lanes but 5-8% more at one.
 // Three lanes pad its 24 rows to 32, where it takes 16-47% more for every
 // format; the other formats keep the register tile, 6-44% faster at one lane.
-// A segment in a format the register tile cannot take (quant_register_format)
-// stages the plan whatever its rows.
+// A segment the register tile cannot take (quant_register_tensor) stages the
+// plan whatever its rows.
 bool apple9Stages(LinearWorkload w, std::span<const Projection *const> projections) {
   const uint32_t lanes = w.rows / SPLASH_TARGET_VERIFY_ROWS;
   bool quantized = false, faster = true;
@@ -125,7 +128,7 @@ bool apple9Stages(LinearWorkload w, std::span<const Projection *const> projectio
     if (!p) continue;
     for (const QuantizedSegment &s : p->blocks().segments) {
       if (s.isFloat()) continue;
-      if (!quant_register_format(s.formatId)) return true;
+      if (!quant_register_tensor(s.formatId, s.inputSize)) return true;
       faster &= apple9StagesFormat(s.formatId) || (s.formatId == GGUF_FMT_Q2K && lanes >= 2);
       quantized = true;
     }
@@ -221,8 +224,9 @@ void LinearPlan::requireConfiguration() const {
   if (c.oneGateUpPass && (c.tile != LinearTile::GgufStaged || !decode || workload_.epilogue != LinearEpilogue::GateUp))
     throw std::invalid_argument("only a staged block gate/up decode runs gate and up in one pass");
   if (c.tile == LinearTile::GgufRegister) {
-    // Split boundaries fall on 256-input coefficient units.
-    if (!decode || !c.validSplits() || k / 256 < c.splits)
+    // Split boundaries fall on coefficient units, of 64 inputs at the fewest
+    // (quant_register_unit); addGgufRegister checks each segment's.
+    if (!decode || !c.validSplits() || k / 64 < c.splits)
       throw std::invalid_argument("the register block decode tile takes a K unit per split");
     return;
   }
@@ -316,9 +320,12 @@ LinearConfig Linear::ggufBaseline(LinearWorkload w, std::span<const Projection *
   return config;
 }
 
-LinearScratchSize Linear::ggufDecodeScratchSize(LinearWorkload w) const {
+LinearScratchSize Linear::ggufDecodeScratchSize(LinearWorkload w, bool registerFormats) const {
   const auto [n, k] = w.matrix;
-  LinearScratchSize size = LinearPlan(w, ggufBaseline(w)).scratchSize();
+  // Every format the register tile takes K inputs in has one register plan,
+  // whose partitions keep whole coefficient units of each (kRegisterTiers);
+  // a projection of segments the tile does not take has none.
+  LinearScratchSize size = LinearPlan(w, ggufBaseline(w, {}, registerFormats)).scratchSize();
   if (family_ == GpuFamilyClass::Apple9) size.include(LinearPlan(w, stagedDecode(n, k, gpuCores_, family_)).scratchSize());
   if (w.epilogue == LinearEpilogue::GateUp && spreadsStagedDecode(family_, gpuCores_))
     size.include(LinearPlan(w, oneGateUpPassDecode(n, k, gpuCores_, family_)).scratchSize());
@@ -502,9 +509,16 @@ void Linear::addGgufRegister(metal::CommandGraph &graph, const LinearBuffers &b,
   const std::vector<QuantizedSegment> &segments = p.blocks().segments;
   for (const Projection *q : {&p, gate})
     if (q)
-      for (const QuantizedSegment &s : q->blocks().segments)
-        if (!quant_register_format(s.formatId))
-          throw std::invalid_argument(std::string("the register tile does not take ") + s.name() + " weights");
+      for (const QuantizedSegment &s : q->blocks().segments) {
+        if (!quant_register_tensor(s.formatId, s.inputSize))
+          throw std::invalid_argument(std::string("the register tile does not take ") + s.name() + " weights of " +
+                                      std::to_string(s.inputSize) + " inputs");
+        // Each K partition takes whole coefficient units of the segment's format.
+        if (s.inputSize / quant_register_unit(s.formatId) < config.splits)
+          throw std::invalid_argument(std::string("the register tile takes a coefficient unit per split: ") +
+                                      std::to_string(config.splits) + " splits of " + s.name() + " weights of " +
+                                      std::to_string(s.inputSize) + " inputs");
+      }
   if (b.prepared.layout != LinearInput::Table16 || !b.prepared.source.sameView(b.input))
     graph.add("decode_linear_gguf_prepare", {b.input, b.scratch.input, b.scratch.sums}, k,
               {k / 32, lanes, 1}, {128, 1, 1});
