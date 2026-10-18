@@ -1,5 +1,6 @@
 #include "TestChecks.hpp"
 #include "TestDrafts.hpp"
+#include "TestModel.hpp"
 #include "model/ModelDescriptor.hpp"
 #include "model/ModelFactory.hpp"
 #include "model/QwenTargetLoader.hpp"
@@ -9,6 +10,7 @@
 
 #include <algorithm>
 #include <array>
+#include <initializer_list>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -236,6 +238,29 @@ void checkIndexTables() {
           "a lane's index table is not its block index's alone");
 }
 
+// A runtime whose K/V spills (one given the readers of spilled K/V,
+// model::RuntimeContext) runs its prefill commands as groups, which read an
+// attention layer's spilled history once each, and its decode arena holds
+// where its verify's listed blocks are: a lane's list, 8 rows of 512 blocks
+// and the block of each row's tail. The K/V of a target without a block
+// index cannot spill.
+void checkSpilledKvGeometry() {
+  const auto flash = loadedModel<model::Qwen4ExpWeights>();
+  const auto resident = model::RuntimeGeometry::from(flash, kv::Format::Int8, ops::GdnStateFormat::Float32);
+  const auto spilled = model::RuntimeGeometry::from(flash, kv::Format::Int8, ops::GdnStateFormat::Float32, true);
+  require(resident.prefillChunks == 1 && !resident.spilledKv &&
+              spilled.prefillChunks == model::kPrefillGroupChunks && spilled.spilledKv == test::sparseKvShape(),
+          "a runtime's prefill groups do not follow whether its K/V spills");
+  require(!decodeBytes(resident, model::DecodeTensor::Locations) &&
+              decodeBytes(spilled, model::DecodeTensor::Locations) == uint64_t{8} * (512 + 1) * sizeof(uint32_t),
+          "a runtime's decode arena does not hold its spilled blocks' locations exactly when its K/V spills");
+  for (const model::LoadedModel &loaded :
+       {loadedModel<model::Qwen3_8Weights>(), loadedModel<model::Qwen3_6MoeWeights>()})
+    rejects([&] {
+      static_cast<void>(model::RuntimeGeometry::from(loaded, kv::Format::Int8, ops::GdnStateFormat::Float32, true));
+    }, "invalid model runtime geometry", "the K/V of a target without a block index was let spill");
+}
+
 // Arenas are sized from the projections the weights hold, so each must have
 // sizes; an empty one would drop its workspace from the bound silently.
 void checkUnsizedProjection() {
@@ -304,6 +329,7 @@ int main() {
     checkGateUpLayers();
     checkYarnGeometry();
     checkIndexTables();
+    checkSpilledKvGeometry();
     const auto dense = loadedModel<model::Qwen3_8Weights>();
     const auto sparse = loadedModel<model::Qwen3_6MoeWeights>();
     checkLaneScratch(dense);
