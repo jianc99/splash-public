@@ -2338,7 +2338,9 @@ the blocks a row selects and its verify rows, and the rows that read whole
 pages instead, those with at most `denseHistoryTokens` of history and its
 first `sinkTokens` and last `localTokens`. The memory plan sizes the hot block
 cache and the floors of [KV on the SSD](#kv-on-the-ssd) from it, and the
-cache keeps whole the pages those rows read. Its family code reaches K/V that
+cache keeps whole the pages those rows read. A target that declares
+`localTokens` keeps its KV in memory: the cache keeps whole only the dense
+history on every path, not each holder's last pages. Its family code reaches K/V that
 left memory through the command's `model::SpilledKvReads`: `verify` after a
 layer's block lists, which locates each listed block of a page that holds
 only its index in the hot block cache for the attention; `prefill` for each

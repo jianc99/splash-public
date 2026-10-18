@@ -404,6 +404,8 @@ std::string spillOffReason(const model::ModelDescriptor &model, const kv::Layout
     return {};
   if (!model.capabilities.sparseKv)
     return "its attention is dense";
+  if (model.capabilities.sparseKv->localTokens)
+    return "its rows read a local window, which the SSD cache does not keep in memory";
   if (!layout.spillable())
     return "its KV layout cannot keep a page's index alone";
   if (!tierWritable)
