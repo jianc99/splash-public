@@ -159,15 +159,18 @@ public:
   // as a spill at the memory wall needs its Index pages to free its Full
   // ones. Granted, or the budget's refusal with nothing allocated.
   [[nodiscard]] metal::AllocationResult fillRunway(kv::PageForm form);
-  // Empties the allocated extent that holds the fewest pages, by moving each
-  // of them to a free page of the other extents of its form that hold pages,
-  // fullest first: free pages scattered over the pool become an empty
-  // extent, which a reclaim releases. References move with their pages, and
-  // the result says where each went, for the caller to re-point whoever
-  // names them. Nothing moves, and the result is empty, unless those free
-  // pages cover the extent. An extent that holds a page of `fixed` is not
-  // emptied.
-  [[nodiscard]] KvPageMoves compactExtent(std::span<const uint32_t> fixed);
+  // Empties the allocated extent, of the form or of either, that holds the
+  // fewest pages, by moving each of them to a free page of the other extents
+  // of its form that hold pages, fullest first: free pages scattered over the
+  // pool become an empty extent, which a reclaim releases. Of either form, a
+  // Full extent goes before an Index one, as reclaimEmptyExtents() releases
+  // them; a caller that needs the memory of one form names it. References
+  // move with their pages, and the result says where each went, for the
+  // caller to re-point whoever names them. Nothing moves, and the result is
+  // empty, unless those free pages cover the extent. An extent that holds a
+  // page of `fixed` is not emptied.
+  [[nodiscard]] KvPageMoves compactExtent(std::span<const uint32_t> fixed,
+                                          std::optional<kv::PageForm> form = std::nullopt);
   [[nodiscard]] KvPoolSnapshot snapshot() const;
 
 private:
@@ -230,6 +233,9 @@ private:
   [[nodiscard]] bool pageFree(uint32_t page) const;
   // The lowest extent that is not allocated; noIndex when all of them are.
   [[nodiscard]] uint32_t unallocatedExtent() const noexcept;
+  // The extent of the form compactExtent() empties; noIndex when the free
+  // pages of the form cover none.
+  [[nodiscard]] uint32_t compactableExtent(kv::PageForm form, std::span<const uint32_t> fixed) const noexcept;
   // Takes `count` free pages of the form off the free lists, allocating
   // extents of the form when they run out; with a refusal, puts them back
   // and returns none.
