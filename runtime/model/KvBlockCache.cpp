@@ -92,7 +92,8 @@ struct KvBlockCache::Impl {
   [[nodiscard]] ModelMemoryAdmission grow(uint32_t held);
   // The directory and the location pages of `held` extents.
   void place(uint32_t held);
-  // Extents and the directory change between commands only (I3).
+  // Extents and the directory change between commands only: no slot moves
+  // while a command's GPU work reads it.
   void requireNoCommand() const {
     if (backend.commandInFlight()) throw std::logic_error("the hot block cache resizes while a command is in flight");
   }
@@ -222,7 +223,7 @@ void KvBlockCache::Impl::resolve(uint32_t layer, const Resolve &resolve, KvReadS
     }
   }
   // Each lane holding a floor selects at most laneSlots blocks, and the
-  // floors leave laneSlots more (I9): a resolve past them is a bug.
+  // floors leave laneSlots more: a resolve past them is a bug.
   if (misses.size() > slots.size() - pinned)
     throw std::logic_error("a resolve misses more blocks than the hot block cache has slots it does not use");
   reads.clear();
