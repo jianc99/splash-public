@@ -5043,6 +5043,58 @@ void testEveryHolderDecidesWhetherAPageSpills() {
   spill.cache.endRequest(1);
 }
 
+// What a Resident request would spill (spillablePages) is what its
+// conversion spills once its copies land: its pages past the dense history
+// and its own window, but none a Resident peer holds and none inside a Spill
+// peer's window. The Full pages they leave free return as an extent at the
+// next reclaim step that releases extents, its runway kept.
+void testSpillablePagesAreWhatAConversionSpills() {
+  Spilling spill({2, 2});
+  const std::vector<uint32_t> prompt = Spilling::prompt(1000, 12);
+  spill.start(1, prompt, 12, KvMode::Resident);
+  // A Spill peer holds the first six pages, its window the last two of them,
+  // and a Resident peer the first three.
+  spill.start(2, prompt, 6);
+  spill.start(3, prompt, 3, KvMode::Resident);
+  static_cast<void>(test::spillRound(spill.cache, spill.tier));
+  require(spill.cache.spillSnapshot().spilledPages == 0 && spill.cache.spillablePages(2) == 0,
+          "a page spilled beside its Resident holders");
+  // Pages 3 and 6 to 9: page 2 is the Resident peer's, pages 4 and 5 lie in
+  // the Spill peer's window, and pages 10 and 11 in the request's own.
+  require(spill.cache.spillablePages(1) == 5, "spillablePages did not count what a conversion would spill");
+  require(spill.cache.convertToSpill(1, 12), "the request did not convert");
+  static_cast<void>(test::spillRound(spill.cache, spill.tier));
+  std::vector<bool> spilled(13, false);
+  for (const uint32_t page : {3, 6, 7, 8, 9})
+    spilled[page] = true;
+  require(spill.spilled(1) == spilled && spill.cache.spillablePages(1) == 0,
+          "the conversion did not spill the pages spillablePages counted");
+  // Ten Full pages are free now. Steps that release extents compact them
+  // into empty extents, all but the runway released, until fewer are
+  // scattered than the emptiest extent holds; requests hold the rest.
+  const uint32_t allocated = spill.storage.allocatedPages();
+  uint64_t released = 0;
+  while (true) {
+    const CacheReclaimResult step =
+        spill.cache.reclaimOne(CacheReclaimMode::ReleaseExtents, ReclaimClass::Ordinary, true, true);
+    if (!step.madeProgress)
+      break;
+    released += step.reclaimedBytes;
+  }
+  require(released >= 400 && released % 400 == 0 &&
+              spill.storage.allocatedPages() == allocated - released / 100 &&
+              spill.pool.freePageCount() < 8,
+          "the Full pages the spill freed did not return as extents");
+  // Named, the Full form gives up the runway it kept; the Index runway stays.
+  const uint32_t indexFree = spill.pool.freePageCount(kv::PageForm::Index);
+  require(spill.cache.releaseEmptyExtents(false, kv::PageForm::Full) % 400 == 0 &&
+              spill.pool.freePageCount() < 4 && spill.pool.freePageCount(kv::PageForm::Index) == indexFree,
+          "the Full runway did not go alone");
+  spill.cache.checkInvariants();
+  for (const uint64_t id : {3, 2, 1})
+    spill.cache.endRequest(id);
+}
+
 // Without quota pressure a block is written once; one whose redundant copy
 // quota gave up is written again when a Spill request holds it, and counted.
 void testBlocksAreWrittenOnce() {
@@ -5242,6 +5294,7 @@ int main() {
     testPagesPastTheCommitmentCommitTheirSlots();
     testConversionSpillsTheHistoryWithCopiesAtOnce();
     testEveryHolderDecidesWhetherAPageSpills();
+    testSpillablePagesAreWhatAConversionSpills();
     testBlocksAreWrittenOnce();
     testUnreadableCopyLeavesWithItsHolders();
     testCutsShareUnchangedChunks();
