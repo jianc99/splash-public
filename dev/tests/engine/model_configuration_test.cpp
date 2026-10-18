@@ -12,6 +12,7 @@
 #include "TestChecks.hpp"
 #include "TestDrafts.hpp"
 #include "TestFiles.hpp"
+#include "TestModel.hpp"
 #include "model/ModelDescriptor.hpp"
 #include "model/RopeScaling.hpp"
 #include "model/WeightStore.hpp"
@@ -129,6 +130,18 @@ void testFamilies(const std::filesystem::path &fixtures) {
               !denseDescriptor.targetKvLayout.indexDimension &&
               !denseDescriptor.stateLayout.target.auxiliaryBytes,
           "a family's cache layouts do not hold what it adds");
+  // Its full-attention layers select blocks, so its K/V may spill: a verify
+  // row attends 512 blocks of 4 tokens, and a row with at most 2,048 tokens
+  // of history attends them through its page table, the shape the engine's
+  // tests take (TestModel.hpp). Another family's rows attend every token. A
+  // descriptor stating another shape than its target's is invalid.
+  require(flashDescriptor.capabilities.sparseKv == test::sparseKvShape() &&
+              !denseDescriptor.capabilities.sparseKv && !moeDescriptor.capabilities.sparseKv,
+          "a family's descriptor does not state the sparse KV its attention reads");
+  model::ModelDescriptor undeclared = flashDescriptor;
+  undeclared.capabilities.sparseKv.reset();
+  require(flashDescriptor.valid() && !undeclared.valid(),
+          "a descriptor stating another sparse KV than its target's was valid");
   // A draft states its own layers, intermediate size, rotary base and the
   // target layers it reads.
   constexpr std::array<uint32_t, 6> ownLayers{5, 19, 33, 47, 61, 63};
