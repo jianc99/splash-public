@@ -25,6 +25,7 @@
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
 #include "model/ModelFactory.hpp"
+#include "model/SsdReaders.hpp"
 #include "model/VisionLoader.hpp"
 #include "model/WeightImages.hpp"
 #include "engine/MemoryGovernor.hpp"
@@ -367,6 +368,8 @@ int main(int argc, char **argv) {
         profileImages(backend, root, grids, cycles);
         return 0;
       }
+      // Streamed weights read on a pool of SSD readers, as the engine's do.
+      loadOptions.readers = std::make_shared<model::SsdReaders>(model::kSsdReaders);
       model::LoadedModel model =
           model::loadModel(backend, root, model::inspectModelRoot(root), loadOptions);
       ops::ExecutionPlans operators(backend.capabilities());

@@ -24,6 +24,7 @@
 #include "model/QwenState.hpp"
 #include "model/Runtime.hpp"
 #include "model/RuntimeInstrumentation.hpp"
+#include "model/SsdReaders.hpp"
 #include "ops/PageStorage.hpp"
 
 #import <Foundation/Foundation.h>
@@ -244,6 +245,8 @@ int main(int argc, char **argv) {
 
       metal::MetalBackend backend(argv[1]);
       const std::filesystem::path root(argv[2]);
+      // Streamed weights read on a pool of SSD readers, as the engine's do.
+      loadOptions.readers = std::make_shared<model::SsdReaders>(model::kSsdReaders);
       model::LoadedModel model = model::loadModel(backend, root, model::inspectModelRoot(root), loadOptions);
       ops::ExecutionPlans operators(backend.capabilities());
       const uint32_t vocabulary =
