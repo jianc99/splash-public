@@ -8,6 +8,7 @@
 #include "model/QwenState.hpp"
 #include "model/QwenTarget.hpp"
 #include "model/RuntimeArenas.hpp"
+#include "model/SparseRowStore.hpp"
 #include "model/SpilledKvReads.hpp"
 
 #include "metal/CommandGraph.hpp"
@@ -406,6 +407,8 @@ struct Runtime::Impl {
   // The readers of spilled K/V, when the target's K/V spills.
   KvBlockCache *blockCache;
   KvHistoryStream *historyStream;
+  // What a streamed table's row cache grows back through (growCaches).
+  metal::AllocationAdmission admission;
   // The request the history's staging was last reserved for
   // (reserveHistoryStaging), whose next prefill command streams into it.
   uint64_t stagingRequest = 0;
@@ -426,7 +429,8 @@ struct Runtime::Impl {
                         },
                         value.model.target)),
         draftModel(value.model.draft, value.backend, operators),
-        aneFfn(value.aneFfn), blockCache(value.blockCache), historyStream(value.historyStream) {
+        aneFfn(value.aneFfn), blockCache(value.blockCache), historyStream(value.historyStream),
+        admission(std::move(value.admission)) {
     if (states.layout() != model.stateLayout(states.layout().target.format) ||
         kvPages.layout() != model.targetKvLayout(kvPages.layout().format) || !blockCache != !historyStream) {
       throw std::invalid_argument(
@@ -3067,16 +3071,28 @@ ModelMemoryAdmission Runtime::reserveHistoryStaging(uint64_t requestId, uint32_t
   return impl_->historyStream->reserve(pages);
 }
 
-ModelMemoryAdmission Runtime::growSpilledReads() {
-  return impl_->blockCache ? impl_->blockCache->growTowardTarget() : ModelMemoryAdmission{.ok = true};
+ModelMemoryAdmission Runtime::growCaches() {
+  if (impl_->blockCache && impl_->blockCache->belowTarget())
+    return impl_->blockCache->growTowardTarget();
+  SparseRowStore *table = impl_->model.streamedTable();
+  if (!table || !impl_->admission)
+    return {.ok = true};
+  const metal::AllocationResult grown = table->growChunk(impl_->admission);
+  return {.ok = static_cast<bool>(grown), .allocationFailure = grown.failure};
 }
 
 uint64_t Runtime::reclaimIdleState(bool keepLane, IdleMemory scope) noexcept {
   // One unit per call, so a denied allocation frees only what it needs;
-  // rebuildable caches go once the pool has nothing more to give.
+  // rebuildable caches go once the pool has nothing more to give, and a
+  // streamed table's rows once those have nothing either.
   if (const uint64_t buffer = impl_->states.releaseOneIdle(keepLane))
     return buffer;
-  return scope == IdleMemory::BuffersThenCaches ? impl_->releaseOneCache() : 0;
+  if (scope == IdleMemory::Buffers)
+    return 0;
+  if (const uint64_t cache = impl_->releaseOneCache())
+    return cache;
+  SparseRowStore *table = impl_->model.streamedTable();
+  return scope == IdleMemory::Streamed && table ? table->releaseChunk() : 0;
 }
 
 std::optional<std::string>

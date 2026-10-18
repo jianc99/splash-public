@@ -550,7 +550,7 @@ public:
   }
   // It grows that cache toward its planned size, which the fake refuses
   // with refusedGrowth.
-  model::ModelMemoryAdmission growSpilledReads() override {
+  model::ModelMemoryAdmission growCaches() override {
     ++growthAttempts;
     if (refusedGrowth)
       return {.allocationFailure = *refusedGrowth};

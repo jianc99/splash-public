@@ -5,7 +5,9 @@
 // read or of a written source, and fails every later stage once poisoned;
 // and reads a prefetch's rows ahead, below stages, within its bound,
 // skipping rows an earlier prefetch still reads and dropping a row it fails
-// to read; and a store that goes while a prefetch reads waits for it.
+// to read; gives its cache back and grows it again a chunk at a time, never
+// below one row, beside prefetches; and a store that goes while a prefetch
+// reads waits for it.
 #include "TestChecks.hpp"
 #include "TestFiles.hpp"
 #include "model/SparseRowStore.hpp"
@@ -22,6 +24,7 @@
 #include <functional>
 #include <iostream>
 #include <mutex>
+#include <numeric>
 #include <random>
 #include <set>
 #include <thread>
@@ -101,21 +104,24 @@ uint64_t bytesFor(uint64_t rows, uint32_t prefetchRows) {
 }
 
 // A store's options: its bytes, `readers` readers of its own, the prefetch
-// bound and the stage scratch.
-SparseRowStoreOptions optionsOf(uint64_t bytes, uint32_t readers, uint32_t prefetchRows) {
-  return {bytes, std::make_shared<SsdReaders>(readers), prefetchRows, kStageRows};
+// bound, the stage scratch and the chunks its cache gives back and grows by.
+SparseRowStoreOptions optionsOf(uint64_t bytes, uint32_t readers, uint32_t prefetchRows,
+                                uint64_t chunkBytes = kSparseRowChunkBytes) {
+  return {bytes, std::make_shared<SsdReaders>(readers), prefetchRows, kStageRows, chunkBytes};
 }
 
 struct Fixture final {
   std::vector<uint8_t> bytes;
   MemoryReader *reader = nullptr;
   std::unique_ptr<SparseRowStore> store;
-  Fixture(uint64_t rows, uint64_t cacheRows, uint32_t readers = 4, uint32_t prefetchRows = 1u << 16) {
+  Fixture(uint64_t rows, uint64_t cacheRows, uint32_t readers = 4, uint32_t prefetchRows = 1u << 16,
+          uint64_t chunkBytes = kSparseRowChunkBytes) {
     bytes = randomBytes(kOffset + rows * rowBytes, uint32_t(rows));
     auto owned = std::make_unique<MemoryReader>(bytes);
     reader = owned.get();
-    store = std::make_unique<SparseRowStore>(tableOf(rows), std::move(owned),
-                                             optionsOf(bytesFor(cacheRows, prefetchRows), readers, prefetchRows));
+    store = std::make_unique<SparseRowStore>(
+        tableOf(rows), std::move(owned),
+        optionsOf(bytesFor(cacheRows, prefetchRows), readers, prefetchRows, chunkBytes));
     require(store->stats().cacheCapacityRows == cacheRows, "a store's cache holds other than its rows");
     require(store->committedBytes() <= bytesFor(cacheRows, prefetchRows), "a store holds more than its bytes");
   }
@@ -408,6 +414,107 @@ void concurrentUse() {
   require(!failures.load() && !f.store->stats().poisoned, "concurrent stages failed");
 }
 
+// The ids from `first` up to `end`.
+std::vector<uint32_t> idsFrom(uint32_t first, uint32_t end) {
+  std::vector<uint32_t> ids(end - first);
+  std::iota(ids.begin(), ids.end(), first);
+  return ids;
+}
+
+// The cache gives its rows back a chunk at a time, the last first: the rows
+// of that chunk's slots leave the cache and the others stay, and a row read
+// again is its source's. It never goes below its one-row floor, and grows
+// back toward its plan a chunk at a time through an admission, a refused
+// one changing nothing.
+void releasesAndGrowsInChunks() {
+  constexpr uint32_t kChunk = 100;
+  // The floor's row, two chunks of 100 rows and one of 50.
+  constexpr uint32_t kRows = 1 + 2 * kChunk + kChunk / 2;
+  Fixture f(5000, kRows, 2, 64, uint64_t{kChunk} * rowBytes);
+  const uint64_t planned = f.store->committedBytes();
+  // A cold stage fills slot i with row i.
+  require(f.stage(idsFrom(0, kRows)).readRows == kRows, "a cold stage hit");
+  require(f.store->releaseChunk() == uint64_t{kChunk / 2} * rowBytes &&
+              f.store->stats().cachedRows == kRows - kChunk / 2 &&
+              f.store->stats().cacheCapacityRows == kRows - kChunk / 2 &&
+              f.store->releasedBytes() == uint64_t{kChunk / 2} * rowBytes &&
+              f.store->committedBytes() == planned - f.store->releasedBytes() &&
+              f.store->stats().cacheBytes == f.store->committedBytes(),
+          "the last chunk did not go with its rows alone");
+  require(f.stage(idsFrom(0, kRows - kChunk / 2)).hitRows == kRows - kChunk / 2,
+          "a release took rows of the chunks it kept");
+  require(f.stage(idsFrom(kRows - kChunk / 2, kRows)).readRows == kChunk / 2,
+          "rows of the released chunk stayed cached");
+  require(f.store->releaseChunk() == uint64_t{kChunk} * rowBytes &&
+              f.store->releaseChunk() == uint64_t{kChunk} * rowBytes && f.store->releaseChunk() == 0 &&
+              f.store->stats().cacheCapacityRows == 1 && f.store->stats().cachedRows <= 1 &&
+              f.store->releasedBytes() == uint64_t{kRows - 1} * rowBytes,
+          "the cache did not keep its one-row floor");
+  require(f.stage({7, 8, 9, 7}).readRows == 3, "a stage at the floor failed");
+  bool refuse = true;
+  uint64_t asked = 0;
+  const splash::metal::AllocationAdmission admit = [&](uint64_t bytes, const std::function<void()> &allocate) {
+    asked = bytes;
+    if (refuse) return splash::metal::AllocationResult(splash::metal::AllocationFailure::HostPressure);
+    allocate();
+    return splash::metal::AllocationResult();
+  };
+  const splash::metal::AllocationResult refused = f.store->growChunk(admit);
+  require(!refused && refused.failure == splash::metal::AllocationFailure::HostPressure &&
+              asked == uint64_t{kChunk} * rowBytes && f.store->stats().cacheCapacityRows == 1 &&
+              f.store->releasedBytes() == uint64_t{kRows - 1} * rowBytes,
+          "a refused growth changed the cache");
+  refuse = false;
+  for (const uint32_t capacity : {1 + kChunk, 1 + 2 * kChunk, kRows})
+    require(static_cast<bool>(f.store->growChunk(admit)) && f.store->stats().cacheCapacityRows == capacity,
+            "the cache did not grow a chunk at a time");
+  asked = 0;
+  require(static_cast<bool>(f.store->growChunk(admit)) && !asked && f.store->releasedBytes() == 0 &&
+              f.store->committedBytes() == planned,
+          "the cache grew past its plan");
+  require(f.stage(idsFrom(1000, 1000 + kRows)).readRows == kRows &&
+              f.stage(idsFrom(1000, 1000 + kRows)).hitRows == kRows,
+          "the regrown cache did not hold its planned rows");
+}
+
+// Prefetches insert rows while the engine's thread gives chunks back and
+// grows them again, and stages read beside them (also under TSan).
+void prefetchesRaceChunkReleases() {
+  Fixture f(200'000, 1 + 20 * 512, 4, 20'000, uint64_t{512} * rowBytes);
+  std::atomic<bool> stop{false};
+  std::thread prefetcher([&] {
+    std::mt19937 random(13);
+    while (!stop) {
+      std::vector<uint32_t> ids(1 + random() % 2048);
+      for (uint32_t &id : ids) id = random() % 200'000;
+      f.store->prefetch(ids);
+      std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
+  });
+  const splash::metal::AllocationAdmission admit = [](uint64_t, const std::function<void()> &allocate) {
+    allocate();
+    return splash::metal::AllocationResult();
+  };
+  std::mt19937 random(17);
+  for (int round = 0; round < 400; ++round) {
+    if (random() % 2)
+      static_cast<void>(f.store->releaseChunk());
+    else
+      require(static_cast<bool>(f.store->growChunk(admit)), "an admitted growth failed");
+    if (round % 8 == 0) {
+      std::vector<uint32_t> ids(1 + random() % 1024);
+      for (uint32_t &id : ids) id = random() % 200'000;
+      f.stage(ids);
+    }
+  }
+  stop = true;
+  prefetcher.join();
+  f.store->drainPrefetch();
+  const SparseRowStats stats = f.store->stats();
+  require(!stats.poisoned && stats.cachedRows <= stats.cacheCapacityRows,
+          "chunk releases beside prefetches broke the cache");
+}
+
 // The production reader checks the identity its source was opened with: a
 // same-size write after the source was opened is a change, and a new file at
 // its path is not.
@@ -506,6 +613,8 @@ int main() {
       tearsDownWithAPrefetchInFlight();
       dropsAFailedPrefetch();
       concurrentUse();
+      releasesAndGrowsInChunks();
+      prefetchesRaceChunkReleases();
       readsAnOpenFile(directory.path());
       keepsTheSourceIdentity(directory.path());
     }

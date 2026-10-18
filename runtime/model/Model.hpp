@@ -709,12 +709,17 @@ struct WarmupStepResult final {
   double hostSeconds = 0.0;
 };
 
-// What a reclaim step may release of the model's idle memory.
+// What a reclaim step may release of the model's idle memory, each scope
+// the one before it and more.
 enum class IdleMemory : uint8_t {
   // Pooled state buffers.
   Buffers,
   // Pooled state buffers, then caches that can be rebuilt.
   BuffersThenCaches,
+  // Those, then a chunk of a streamed table's row cache above its floor,
+  // which every lane's reads miss into: only a start that the host's growth
+  // pause refused takes it, never a pressure pass.
+  Streamed,
 };
 
 class Model {
@@ -764,12 +769,16 @@ public:
   // place of the staging once no prompt holds it; the staging of a
   // prefill's history of `pages` pages, which holds Index pages, the
   // request's while its prompt goes on, also once refused
-  // (model::KvHistoryStream::reserve); and, optionally, one more
-  // extent of the hot block cache toward its planned size
-  // (model::KvBlockCache::growTowardTarget).
+  // (model::KvHistoryStream::reserve).
   [[nodiscard]] virtual ModelMemoryAdmission reserveSpilledReads(uint64_t) { return {.ok = true}; }
   [[nodiscard]] virtual ModelMemoryAdmission reserveHistoryStaging(uint64_t, uint32_t) { return {.ok = true}; }
-  [[nodiscard]] virtual ModelMemoryAdmission growSpilledReads() { return {.ok = true}; }
+  // Optionally, between commands, one unit more of the caches the memory
+  // plan sizes, toward their plan: an extent of the hot block cache while
+  // lanes read through it and it is below its target
+  // (model::KvBlockCache::growTowardTarget), else a chunk of a streamed
+  // table's row cache that a reclaim gave back (IdleMemory::Streamed).
+  // Granted at once when both are at their plan.
+  [[nodiscard]] virtual ModelMemoryAdmission growCaches() { return {.ok = true}; }
   // Whether the disk tier takes a state written from a lane now, for a
   // state in use or not, as CompositeState::canOffload. Room in the quota is
   // the write's own concern.
@@ -807,8 +816,11 @@ public:
   // buffer is idle, the vision arena when no image waits for its encode and
   // nothing holds it, the staging of spilled history once no prompt streams
   // into it, an extent of the hot block cache above its lanes' floors, and
-  // then one embedding entry nothing else holds, oldest first. A denied allocation
-  // retries between calls, so it frees only what it needs.
+  // then one embedding entry nothing else holds, oldest first; with
+  // Streamed, once none of those is idle, the last chunk of a streamed
+  // table's row cache above its floor (model::SparseRowStore::releaseChunk).
+  // A denied allocation retries between calls, so it frees only what it
+  // needs.
   [[nodiscard]] virtual uint64_t reclaimIdleState(bool keepLane,
                                                   IdleMemory scope) noexcept = 0;
   // Why this request's mask is unusable, or nothing when the model took it.

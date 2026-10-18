@@ -146,11 +146,17 @@ struct SparseRowStore::Impl {
   SparseRowStoreOptions options;
 
   // The cache: slots of rows with their ids, a recency list (head most
-  // recent) and an open-addressed index of slot + 1 (0 empty).
+  // recent) and an open-addressed index of slot + 1 (0 empty), sized for
+  // the planned rows. The rows live in chunks, the first of one row (slot
+  // 0), each other of chunkRows rows; the chunks held now hold slots
+  // [0, capacity), and slots [0, used) hold rows. Only the engine's thread
+  // changes the chunks, under cacheMutex.
   mutable std::mutex cacheMutex;
-  uint64_t capacity = 0;
+  uint64_t plannedRows = 0;
+  uint64_t chunkRows = 0;
+  std::atomic<uint64_t> capacity{0};
   uint64_t used = 0;
-  std::unique_ptr<uint8_t[]> rows;
+  std::vector<std::unique_ptr<uint8_t[]>> chunks;
   std::unique_ptr<uint32_t[]> ids, previous, next, buckets;
   uint64_t bucketMask = 0;
   uint32_t bucketShift = 0;
@@ -188,20 +194,31 @@ struct SparseRowStore::Impl {
   Impl(SparseRowTable table, std::unique_ptr<RowReader> reader, SparseRowStoreOptions options)
       : table(std::move(table)), reader(std::move(reader)), options(std::move(options)) {}
 
-  [[nodiscard]] uint8_t *slotRow(uint32_t slot) const noexcept { return rows.get() + uint64_t{slot} * table.rowBytes; }
+  [[nodiscard]] uint8_t *slotRow(uint32_t slot) const noexcept {
+    if (!slot) return chunks.front().get();
+    return chunks[1 + (slot - 1) / chunkRows].get() + (slot - 1) % chunkRows * table.rowBytes;
+  }
   [[nodiscard]] uint64_t bucketOf(uint32_t id) const noexcept { return hashBucket(id, bucketShift); }
+  // The rows of the chunk at `index`.
+  [[nodiscard]] uint64_t chunkRowsAt(size_t index) const noexcept {
+    return index ? std::min(chunkRows, plannedRows - 1 - (index - 1) * chunkRows) : 1;
+  }
+  [[nodiscard]] size_t plannedChunks() const noexcept { return 1 + (plannedRows - 1 + chunkRows - 1) / chunkRows; }
 
   void allocate(uint64_t cacheBytes) {
     const uint64_t working = workingBytes(table.rowBytes, options.prefetchRows, options.stageRows);
-    capacity = cacheBytes > working ? cacheRowsFor(cacheBytes - working, table.rowBytes) : 0;
-    if (!capacity) throw std::invalid_argument("the row cache holds no row of " + table.name);
-    const uint64_t bucketCount = indexBuckets(capacity);
+    plannedRows = cacheBytes > working ? cacheRowsFor(cacheBytes - working, table.rowBytes) : 0;
+    if (!plannedRows) throw std::invalid_argument("the row cache holds no row of " + table.name);
+    chunkRows = std::max<uint64_t>(1, options.chunkBytes / table.rowBytes);
+    const uint64_t bucketCount = indexBuckets(plannedRows);
     bucketMask = bucketCount - 1;
     bucketShift = 64 - uint32_t(std::countr_zero(bucketCount));
-    rows = std::make_unique_for_overwrite<uint8_t[]>(capacity * table.rowBytes);
-    ids = std::make_unique_for_overwrite<uint32_t[]>(capacity);
-    previous = std::make_unique_for_overwrite<uint32_t[]>(capacity);
-    next = std::make_unique_for_overwrite<uint32_t[]>(capacity);
+    for (size_t chunk = 0; chunk < plannedChunks(); ++chunk)
+      chunks.push_back(std::make_unique_for_overwrite<uint8_t[]>(chunkRowsAt(chunk) * table.rowBytes));
+    capacity = plannedRows;
+    ids = std::make_unique_for_overwrite<uint32_t[]>(plannedRows);
+    previous = std::make_unique_for_overwrite<uint32_t[]>(plannedRows);
+    next = std::make_unique_for_overwrite<uint32_t[]>(plannedRows);
     buckets = std::make_unique<uint32_t[]>(bucketCount);
   }
 
@@ -353,8 +370,49 @@ SparseRowStore::~SparseRowStore() {
 const SparseRowTable &SparseRowStore::table() const noexcept { return impl_->table; }
 
 uint64_t SparseRowStore::committedBytes() const noexcept {
-  return cacheBytesFor(impl_->capacity, impl_->table.rowBytes) +
-         workingBytes(impl_->table.rowBytes, impl_->options.prefetchRows, impl_->options.stageRows);
+  const Impl &s = *impl_;
+  return cacheBytesFor(s.plannedRows, s.table.rowBytes) - releasedBytes() +
+         workingBytes(s.table.rowBytes, s.options.prefetchRows, s.options.stageRows);
+}
+
+uint64_t SparseRowStore::releasedBytes() const noexcept {
+  const Impl &s = *impl_;
+  return (s.plannedRows - s.capacity.load(std::memory_order_relaxed)) * s.table.rowBytes;
+}
+
+uint64_t SparseRowStore::releaseChunk() {
+  Impl &s = *impl_;
+  if (s.chunks.size() == 1) return 0;
+  std::unique_ptr<uint8_t[]> released;
+  const uint64_t rows = s.chunkRowsAt(s.chunks.size() - 1);
+  {
+    const std::lock_guard lock(s.cacheMutex);
+    const uint64_t first = s.capacity - rows;
+    for (uint64_t slot = first; slot < s.used; ++slot) {
+      s.unlink(uint32_t(slot));
+      s.erase(s.ids[slot]);
+    }
+    s.used = std::min(s.used, first);
+    s.capacity = first;
+    released = std::move(s.chunks.back());
+    s.chunks.pop_back();
+  }
+  return rows * s.table.rowBytes;
+}
+
+metal::AllocationResult SparseRowStore::growChunk(const metal::AllocationAdmission &admit) {
+  Impl &s = *impl_;
+  if (s.chunks.size() == s.plannedChunks()) return {};
+  const uint64_t bytes = s.chunkRowsAt(s.chunks.size()) * s.table.rowBytes;
+  std::unique_ptr<uint8_t[]> grown;
+  if (const metal::AllocationResult admitted =
+          admit(bytes, [&] { grown = std::make_unique_for_overwrite<uint8_t[]>(bytes); });
+      !admitted)
+    return admitted;
+  const std::lock_guard lock(s.cacheMutex);
+  s.chunks.push_back(std::move(grown));
+  s.capacity += bytes / s.table.rowBytes;
+  return {};
 }
 
 SparseRowStageResult SparseRowStore::stage(std::span<const uint32_t> ids, std::span<uint8_t> rows,

@@ -1619,7 +1619,7 @@ Engine::Prepared Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &i
   // The hot block cache they read through grows toward its planned size,
   // by an extent at most, into memory nothing needs now.
   if (spilledReads)
-    static_cast<void>(allocate([&] { return model_.growSpilledReads(); }, false,
+    static_cast<void>(allocate([&] { return model_.growCaches(); }, false,
                                ReclaimClass::Ordinary, {}, true));
   if (!admitted.empty()) {
     plan.items = std::move(admitted);
