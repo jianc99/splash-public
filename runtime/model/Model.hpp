@@ -765,9 +765,10 @@ public:
   // nothing in scope is idle. A unit is one pooled state buffer (keepLane
   // keeps those one lane starts from); with BuffersThenCaches, once no
   // buffer is idle, the vision arena when no image waits for its encode and
-  // nothing holds it, and then one embedding entry nothing else holds,
-  // oldest first. A denied allocation retries between calls, so it frees
-  // only what it needs.
+  // nothing holds it, the staging of spilled history, the hot block cache
+  // above its lanes' floors, and then one embedding entry nothing else
+  // holds, oldest first. A denied allocation retries between calls, so it
+  // frees only what it needs.
   [[nodiscard]] virtual uint64_t reclaimIdleState(bool keepLane,
                                                   IdleMemory scope) noexcept = 0;
   // Why this request's mask is unusable, or nothing when the model took it.
