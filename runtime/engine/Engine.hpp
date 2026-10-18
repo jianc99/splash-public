@@ -43,7 +43,7 @@ inline constexpr double kResourceRetryBackoffMilliseconds = 100.0;
 inline constexpr uint32_t kProjectedOutputTokens = 4096;
 
 // The engine's constructor refuses a config without its context window, its
-// vocabulary or the governor's two hooks, which the bootstrap sets from the
+// vocabulary or the governor's hooks, which the bootstrap sets from the
 // model, its memory plan and the governor (connectToGovernor).
 struct EngineConfig final {
   uint32_t maxContext = 0;
@@ -77,22 +77,31 @@ struct EngineConfig final {
   // Which requests keep their KV on the SSD cache (KvMode), from the memory
   // plan; none unless the target can spill.
   EngineSpillConfig spill;
+  // On a target that can spill, and only there: fund credits what the
+  // engine released for a start the pause refused and returns the balance,
+  // and funded marks the allocations that follow as such a start's, which
+  // the pause admits within the balance, returning the mark it replaced
+  // (MemoryGovernor::fund, setFunded; Engine::fundStart).
+  std::function<uint64_t(uint64_t)> fund;
+  std::function<bool(bool)> funded;
 };
 
-// While an active one lives, allocations are memory a request in service
-// needs (EngineConfig::serving). It restores the mark it found, so that a
-// start's mark (RuntimeResources::beginServing) outlives an allocation the
-// engine marks before serving begins.
-class Serving final {
+// While an active one lives, the allocations that follow carry a mark of
+// the governor's: memory a request in service needs (EngineConfig::serving),
+// or a start's that the engine funds (EngineConfig::funded). It restores
+// the mark it found, so that a start's serving mark
+// (RuntimeResources::beginServing) outlives an allocation the engine marks
+// before serving begins.
+class GovernorMark final {
 public:
-  Serving(const std::function<bool(bool)> &mark, bool active)
+  GovernorMark(const std::function<bool(bool)> &mark, bool active)
       : mark_(active ? &mark : nullptr), previous_(mark_ && (*mark_)(true)) {}
-  ~Serving() {
+  ~GovernorMark() {
     if (mark_)
       (*mark_)(previous_);
   }
-  Serving(const Serving &) = delete;
-  Serving &operator=(const Serving &) = delete;
+  GovernorMark(const GovernorMark &) = delete;
+  GovernorMark &operator=(const GovernorMark &) = delete;
 
 private:
   const std::function<bool(bool)> *mark_;
@@ -123,6 +132,28 @@ plannedCheckpoints(uint32_t resumeBoundary, uint32_t replayBoundary, uint32_t in
   return checkpoints;
 }
 
+// What funding the starts the host's growth pause refused did
+// (Engine::fundStart), on a target that can spill: the starts funded, the
+// running lanes whose KV moved to the SSD for them, and the bytes released
+// for them, by kind: idle model memory, cached memory (the prefix cache's,
+// and the extents spills emptied), and chunks of streamed caches. The
+// latest funded start and the latest donor are what the memory log line
+// names.
+struct SpillFundingSnapshot final {
+  struct Released final {
+    uint64_t idle = 0;
+    uint64_t cache = 0;
+    uint64_t streamed = 0;
+
+    [[nodiscard]] uint64_t total() const noexcept { return idle + cache + streamed; }
+  };
+  uint64_t starts = 0;
+  uint64_t conversions = 0;
+  Released released;
+  uint64_t latestStart = 0;
+  uint64_t latestDonor = 0;
+};
+
 struct ResourceWaitSnapshot final {
   uint32_t memory = 0;
   uint32_t concurrency = 0;
@@ -141,6 +172,9 @@ struct ResourceWaitSnapshot final {
   uint32_t suspended = 0;
   double oldestWaitMilliseconds = 0.0;
   bool draining = false;
+  // How starts the pause refused were funded, which the memory log line
+  // reports as it advances (MemoryStatusReporter).
+  SpillFundingSnapshot funding;
 };
 
 // One live request's progress, for /status active_requests: its phase and
@@ -161,11 +195,12 @@ struct ActiveRequestSnapshot final {
 
 // The requests of a target that can spill (EngineConfig::spill): those that
 // started in each KV mode; those that converted to Spill when memory
-// refused their growth; those whose output the SSD cache's quota bounded,
-// and those that ended at that bound or once the cache could hold no more
-// of their KV; and those refused because the quota cannot hold their
-// prompt, the daily write budget is spent or the tier takes no writes. Those
-// waiting for the quota now are ResourceWaitSnapshot::diskQuota.
+// refused their growth, or to fund a start (funding); those whose output
+// the SSD cache's quota bounded, and those that ended at that bound or once
+// the cache could hold no more of their KV; and those refused because the
+// quota cannot hold their prompt, the daily write budget is spent or the
+// tier takes no writes. Those waiting for the quota now are
+// ResourceWaitSnapshot::diskQuota.
 struct SpillRequestsSnapshot final {
   uint64_t spill = 0;
   uint64_t resident = 0;
@@ -175,6 +210,7 @@ struct SpillRequestsSnapshot final {
   uint64_t refusedQuota = 0;
   uint64_t refusedWriteBudget = 0;
   uint64_t refusedClosed = 0;
+  SpillFundingSnapshot funding;
 };
 
 struct EngineSnapshot final {
@@ -233,7 +269,7 @@ struct EngineSnapshot final {
 // reclaimMemory() and flushRestorePoints(), is engine-fatal: NativeRuntime
 // reports EngineUnhealthy and the process exits. Code below them therefore
 // does not roll back on an exception; the only cleanup on that path is RAII
-// teardown itself needs (state IO drains, FileRestore, Serving).
+// teardown itself needs (state IO drains, FileRestore, GovernorMark).
 class Engine final {
 public:
   Engine(EngineConfig config, Cache &cache, model::Model &model,
@@ -418,6 +454,12 @@ private:
     // A restore that could not fit alone released its prefix pin:
     // admissions ignore the cache until one succeeds.
     bool skipCache = false;
+    // Memory was released for it (fundStart) since it last started, which
+    // its next start counts (SpillFundingSnapshot).
+    bool funded = false;
+    // A donor's: the floor of the hot block cache its conversion adds, until
+    // its lane takes it or goes (owedFloorBytes_).
+    uint64_t owedFloor = 0;
     // Admission that waits for its state's read, its KV pages' restores,
     // or both, before the lane runs.
     struct Restore {
@@ -681,6 +723,39 @@ private:
   // running.
   [[nodiscard]] std::function<bool(const Denial &)>
   spillFallback(Request &request, const CacheLookup *restoring = nullptr);
+  // That conversion: false, changing nothing, for a lane in Spill mode or
+  // one the SSD cache cannot take (Cache::convertToSpill).
+  [[nodiscard]] bool convertToSpill(Request &request, const CacheLookup *restoring);
+  // One step of funding a start, or resume, that the host's growth pause
+  // refused beside a resident lane, on a target that can spill, its
+  // `shortfall` being what its refused attempt needs: the plan's lane state
+  // for its state, the extents its missing pages take for its KV. The pause
+  // stays and nothing is reserved for later; memory Splash releases for it
+  // funds it, the cheapest first. The step first moves the pages whose
+  // copies landed to the index form under the start's mark, so that their
+  // Full pages free now and the Index runway refills from the balance. Then
+  // it takes the first of these that gives something, and credits the
+  // governor with what left (EngineConfig::fund):
+  // 1. idle memory: the model's idle buffers and rebuildable caches, then
+  //    one step of the cache's reclaim of ordinary class that releases
+  //    extents, keeping the resume point and the runways, which also returns
+  //    the extents spills emptied, and, while landed pages wait for Index
+  //    pages, the Full runway that funds them;
+  // 2. a chunk of a streamed cache above its floor
+  //    (model::IdleMemory::Streamed);
+  // 3. a running lane's KV, which moves to the SSD (convertDonor);
+  // and, last, the Full runway the running lanes would grow into.
+  // Pending, the start waiting for no other lane, when transfers in flight
+  // hold what step 1 would release next, a donor's copies among them, and
+  // nothing when none gives anything: the start then waits as on a target
+  // that cannot spill.
+  [[nodiscard]] CacheReclaimResult fundStart(const Request &start, uint64_t shortfall);
+  // Step 3: converts the decoding Resident lane of a priority not above the
+  // start's whose KV yields the most once spilled, its pages that would
+  // spill (Cache::spillablePages) less their index, net of what it adds to
+  // the hot block cache's floor, when the balance and every such lane's
+  // net yield together cover the shortfall; else none, and false.
+  [[nodiscard]] bool convertDonor(const Request &start, uint64_t shortfall);
   // What a lane does about memory it could not get. Pending memory returns
   // by itself: the lane waits. Otherwise a lane fails only when it is alone
   // with nothing left to reclaim; while other lanes hold memory or the host
@@ -716,13 +791,18 @@ private:
   // neither gives anything, fallback, given the denial so far, may let go of
   // what the request itself pins or turn its KV to Spill, which allocates
   // nothing, so the host's refusal offers it too; the allocation is then
-  // attempted again. An optional allocation, whose refusal only shortens a
-  // command or leaves memory for later, records no failure
+  // attempted again. A start's allocation (`start`) that the host still
+  // refuses, with nothing pending, is then funded on a target that can
+  // spill: each step funds it (fundStart), and it is attempted again after
+  // every step that gave something, inside the funded mark once the balance
+  // covers what it lacks and the floors its donors owe, so that an attempt
+  // that fails part way spends no balance on buffers it then frees. An optional allocation, whose refusal
+  // only shortens a command or leaves memory for later, records no failure
   // (allocationFailed_).
   template <class Attempt>
   [[nodiscard]] auto allocate(Attempt &&attempt, bool inService, ReclaimClass upTo,
                               const std::function<bool(const Denial &)> &fallback = {},
-                              bool optional = false)
+                              bool optional = false, Request *start = nullptr)
       -> Allocation<std::invoke_result_t<Attempt &>>;
   // Takes a resident request's lane: its state and KV pages go back,
   // and it waits, for `reason`, until admission resumes it with room for
@@ -826,6 +906,11 @@ private:
   // The lanes admit() has obtained so far, including those it gave back when
   // the attempt's pages were refused (Request::admission).
   uint64_t admissions_ = 0;
+  // The floors of the hot block cache that donors converted for funded
+  // starts add once they decode over Index pages and have yet to take:
+  // memory released for the starts covers them too, before a start runs
+  // inside the funded mark (allocate).
+  uint64_t owedFloorBytes_ = 0;
   uint64_t resourceEpoch_ = 1;
   // The resource wait limit after the latest suspension; zero once passed
   // or when no request is suspended.

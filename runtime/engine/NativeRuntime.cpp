@@ -146,7 +146,7 @@ bool NativeRuntime::restoreWeights() {
   try {
     // Memory the requests waiting need: the host's margins do not hold it
     // back, critical pressure and the engine's limit refuse it.
-    const Serving serving(config_.engine.serving, !telemetry_.empty());
+    const GovernorMark serving(config_.engine.serving, !telemetry_.empty());
     restored = config_.weights->restore(config_.weightAdmission);
   } catch (const metal::MetalAllocationError &refusal) {
     return weightsRefused(refusal.failure());

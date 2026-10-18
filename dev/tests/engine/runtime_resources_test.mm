@@ -706,7 +706,7 @@ void testStartGrowsThroughHostPressure(const char *metallibPath) {
     EngineConfig engine;
     connectToGovernor(engine, resources->memoryGovernor());
     {
-      const Serving allocation(engine.serving, true);
+      const GovernorMark allocation(engine.serving, true);
     }
     // The warmup's lane state; it throws if refused.
     static_cast<void>(runtime->warmupPrefill(model::ExecutionLimits::prefillTokenBudget));

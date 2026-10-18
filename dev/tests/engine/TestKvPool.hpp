@@ -20,8 +20,9 @@ namespace splash::test {
 // and indexBytesPerPage an Index page; without index bytes, every page is
 // Full. Growth is refused with allocationFailure (EngineBudget, the
 // governor's cause, unless a test names another) past the bytes of
-// budgetPages Full pages, while growthBlocked, or when growthAllowed(extent)
-// says no; a budget-limited pool needs more page ids than its budget, as
+// budgetPages Full pages, while growthBlocked, when growthAllowed(extent)
+// says no, or when admit, a governor's admission, refuses the extent's
+// bytes; a budget-limited pool needs more page ids than its budget, as
 // production's has. A release or a copy throws std::logic_error while
 // commandInFlight() says a command is in flight, as PageStorage's does.
 // Every page holds one value, which a test sets, a copy carries (between
@@ -51,7 +52,8 @@ public:
         if (form == kv::PageForm::Index && !indexBytesPerPage_)
             throw std::invalid_argument("test KV pages without an index are all Full");
         if (growthBlocked || (growthAllowed && !growthAllowed(extent)) ||
-            allocatedBytes() + extentPages_ * bytesPerPage(form) > budgetPages * bytesPerPage_) {
+            allocatedBytes() + extentPages_ * bytesPerPage(form) > budgetPages * bytesPerPage_ ||
+            (admit && !admit(extentPages_ * bytesPerPage(form)))) {
             return allocationFailure;
         }
         forms_[extent] = form;
@@ -116,6 +118,7 @@ public:
     uint32_t budgetPages = std::numeric_limits<uint32_t>::max();
     bool growthBlocked = false;
     std::function<bool(uint32_t extent)> growthAllowed;
+    std::function<bool(uint64_t bytes)> admit;
     metal::AllocationFailure allocationFailure = metal::AllocationFailure::EngineBudget;
     std::function<bool()> commandInFlight;
     // After each release: a budget shared with states returns its bytes.

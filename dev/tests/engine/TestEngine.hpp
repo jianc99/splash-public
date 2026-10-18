@@ -14,7 +14,9 @@ namespace splash::test {
 
 // An engine config completed as the bootstrap completes one, for tests: what
 // the test set, and otherwise the whole logical context, every 32-bit token
-// in the vocabulary and a host that never pauses growth.
+// in the vocabulary, a host that never pauses growth, and funding hooks that
+// throw: only a target that can spill funds starts, and a test of one sets
+// its own (EngineConfig::fund, funded).
 [[nodiscard]] inline engine::EngineConfig engineConfig(engine::EngineConfig config = {}) {
   if (!config.maxContext)
     config.maxContext = kv::kMaximumLogicalTokens;
@@ -24,6 +26,10 @@ namespace splash::test {
     config.growthPaused = [] { return false; };
   if (!config.serving)
     config.serving = [](bool) { return false; };
+  if (!config.fund)
+    config.fund = [](uint64_t) -> uint64_t { throw std::logic_error("a start was funded"); };
+  if (!config.funded)
+    config.funded = [](bool) -> bool { throw std::logic_error("a start was funded"); };
   return config;
 }
 
