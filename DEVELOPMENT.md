@@ -206,7 +206,10 @@ YaRN's defaults and static: every request, short or long, takes the same
 factor, so turn it on only for prompts past 256K; a start whose context the
 native window holds says so. It scales the target's attention RoPE alone; the draft
 keeps its own, which keeps its acceptance at a million tokens. A long uncached
-prompt is slow to prefill, as attention grows with depth: on an M5 Max the
+prompt is slow to prefill, as attention grows with depth. Past the native
+window a prefill command takes fewer rows, so that its attention does no more
+than a full chunk's at the native window's end, which keeps it well within the
+120 s command watchdog on every supported Mac: 512 rows at a million tokens. On an M5 Max the
 35B prefills a million tokens in about 45 minutes and then decodes at about a
 quarter of its short-context speed, and the 27B takes about half an hour for
 512K. The KV of one long request also leaves the cache little room.

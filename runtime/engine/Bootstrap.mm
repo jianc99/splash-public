@@ -302,6 +302,13 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
             rope.originalContextTokens, " holds: it changes every answer for no more context; omit --yarn-factor.");
   config.nativeLoop.engine.vocabularySize =
       config.resources.model.capabilities.vocabularySize;
+  // A prefill command takes no more attention than a full chunk at the end
+  // of the native window, which every supported Mac runs within the command
+  // watchdog: past it, at depths only YaRN serves, commands take fewer rows.
+  constexpr uint32_t chunk = model::ExecutionLimits::prefillTokenBudget;
+  const uint32_t native = std::visit([](const auto &layout) { return layout.nativeContextTokens; },
+                                     config.resources.model.target);
+  config.nativeLoop.engine.maximumPrefillAttentionPairs = Scheduler::attentionPairs(native - chunk, chunk);
   // Images are admitted up to the server's pixel cap; a model without vision
   // admits none.
   config.nativeLoop.engine.maxImagePatches =
