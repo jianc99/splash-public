@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <optional>
 #include <stdexcept>
 
 namespace splash::engine {
@@ -63,8 +64,8 @@ struct NativeArguments final {
   StreamedSetting pleMemory;
   StreamedSetting expertMemory;
   // --sparse-kv-memory BYTES|auto: the target of a block-sparse target's hot
-  // block cache, auto its floor (RuntimeResourcesConfig::sparseKvMemory).
-  StreamedSetting sparseKvMemory;
+  // block cache; none, auto, its floor (RuntimeResourcesConfig::sparseKvMemory).
+  std::optional<uint64_t> sparseKvMemory;
   // --kv-spill always: every request of a target that can spill keeps its
   // KV on the SSD cache, for validation; without it, the requests memory
   // cannot hold (EngineSpillConfig::always).

@@ -168,8 +168,7 @@ void testServerCommandLines(const char *path) {
       {"expert_memory_off", [](NativeArguments &read) { read.expertMemory = {StreamedSetting::Mode::Off, 0}; }},
       // Auto is the engine's default, which the server leaves out.
       {"expert_memory_auto", [](NativeArguments &) {}},
-      {"sparse_kv_memory",
-       [](NativeArguments &read) { read.sparseKvMemory = {StreamedSetting::Mode::Size, 1200 * (kGiB >> 10)}; }},
+      {"sparse_kv_memory", [](NativeArguments &read) { read.sparseKvMemory = 1200 * (kGiB >> 10); }},
       {"yarn", [](NativeArguments &read) { read.model.ropeScaling = {4.0, 262144}; }},
       {"yarn_context",
        [](NativeArguments &read) {
@@ -229,7 +228,7 @@ void testStreamedMemoryAndSpill() {
   const NativeArguments automatic =
       parse(model, {"auto", "auto", "--expert-memory", "auto", "--ple-memory", "auto", "--sparse-kv-memory", "auto"});
   require(automatic.expertMemory == StreamedSetting{} && automatic.pleMemory == StreamedSetting{} &&
-              automatic.sparseKvMemory == StreamedSetting{} && !automatic.kvSpillAlways,
+              !automatic.sparseKvMemory && !automatic.kvSpillAlways,
           "auto did not leave the stores to the planner");
   require(parse(model, {"auto", "auto", "--kv-spill", "always"}).kvSpillAlways, "--kv-spill always was not read");
 }

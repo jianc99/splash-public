@@ -154,9 +154,9 @@ struct StreamedMemoryInputs final {
   uint32_t requestedContextTokens = 0;
   StreamedPart experts;
   StreamedPart table;
-  // --sparse-kv-memory: the hot block cache's target (Size), at least its
-  // floor; Auto keeps it at its floor.
-  StreamedSetting hotCache;
+  // --sparse-kv-memory: the hot block cache's target, at least its floor;
+  // none keeps it at its floor.
+  std::optional<uint64_t> hotCacheBytes;
   // The block-sparse attention a target declares, none for a dense one.
   std::optional<model::SparseKvShape> sparseKv;
   // The SSD cache: whether it takes writes, its slots and the room active
@@ -200,7 +200,8 @@ struct StreamedMemoryResult final {
 // 64K tokens once they stream. The arenas are those of the parts that
 // stream: where the plan with the arenas of fewer parts streams more, it
 // plans again with those. An explicit setting replaces its part; one below
-// the part's floor, and floors beyond the budget, are refused.
+// the part's floor, a hot cache target beyond what the floors leave, and
+// floors beyond the budget are refused.
 [[nodiscard]] StreamedMemoryResult planStreamedMemory(const StreamedMemoryInputs &inputs);
 
 struct EngineMemoryPolicy {

@@ -219,8 +219,9 @@ fit; only once they stream does it keep the first 64K tokens too. The
 automatic SSD cache gives its state staging up where that alone would stream
 a part, unless the target's KV spills to it. `--expert-memory`, `--ple-memory`
 and `--sparse-kv-memory` set their own part instead; a size below the part's
-smallest store and a `--ple-memory` size for a table that cannot stream are
-refused, and startup logs how each part was sized. Only a loaded model sizes
+smallest store, a `--sparse-kv-memory` beyond what the floors leave and a
+`--ple-memory` size for a table that cannot stream are refused, and startup
+logs how each part was sized. Only a loaded model sizes
 the arenas, which rest on its weights' formats and grow where a part
 streams: prefill groups for streamed experts, a step's staged rows for a
 streamed table. One load gives them for whatever streams, so a start loads
