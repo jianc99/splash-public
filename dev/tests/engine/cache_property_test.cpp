@@ -17,6 +17,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace splash;
@@ -231,10 +232,37 @@ private:
             "active KV stayed past its limit");
   }
 
+  // A conversion, which half the time lands every copy into room enough
+  // for them and for Index pages: it then spills exactly the pages
+  // spillablePages counted before it.
   void convert() {
     Request *request = anyRequest();
     if (!request || request->mode == KvMode::Spill) return;
-    if (cache_.convertToSpill(idOf(*request), kMaximumPages)) request->mode = KvMode::Spill;
+    const uint64_t id = idOf(*request);
+    const uint32_t spillable = cache_.spillablePages(id);
+    const uint32_t indexed = indexPages(id);
+    if (!cache_.convertToSpill(id, kMaximumPages)) return;
+    request->mode = KvMode::Spill;
+    if (chance(50)) return;
+    budget_->setLimitBytes(kSlots * 100);
+    budget_->setActiveLimitBytes(kSlots * 100);
+    const uint32_t budgetPages = std::exchange(storage_.budgetPages, 1024);
+    bool landed = true;
+    while (landed) {
+      const uint32_t started = cache_.writeThrough();
+      tier_.complete();
+      landed = cache_.pollTransfers() || started;
+    }
+    require(cache_.spillWritten().granted() && indexPages(id) == indexed + spillable,
+            "a conversion did not spill the pages spillablePages counted");
+    storage_.budgetPages = budgetPages;
+  }
+
+  // The request's pages of the index form.
+  uint32_t indexPages(uint64_t id) const {
+    const std::span<const uint32_t> pages = cache_.pageTable(id).pages;
+    return static_cast<uint32_t>(std::ranges::count_if(
+        pages, [&](uint32_t page) { return pool_.form(page) == kv::PageForm::Index; }));
   }
 
   // A read of a spilled block fails. The engine applies the results of the

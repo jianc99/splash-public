@@ -502,8 +502,8 @@ TokenAdmission Cache::admitPages(uint32_t count, std::vector<uint32_t> &pages,
 // one; then one victim at a time: KV no state restores through, then the
 // shared recency order, states and resident KV leaves alike.
 
-uint64_t Cache::releaseEmptyExtents(bool keepRunway) {
-  return pool_.reclaimEmptyExtents(keepRunway, std::numeric_limits<uint32_t>::max());
+uint64_t Cache::releaseEmptyExtents(bool keepRunway, std::optional<kv::PageForm> form) {
+  return pool_.reclaimEmptyExtents(keepRunway, std::numeric_limits<uint32_t>::max(), form);
 }
 
 CacheReclaimResult Cache::evictAll() {
@@ -1010,15 +1010,15 @@ bool Cache::writeThrough(Request &active, uint32_t &started) {
   return true;
 }
 
-Cache::Eligibility Cache::spillEligibility(uint64_t block) const {
+Cache::Eligibility Cache::spillEligibility(uint64_t block, std::optional<uint64_t> asSpill) const {
   const uint32_t index = kv_.chainLength(block) - 1;
   if (index < spill_->densePages)
     return Eligibility::KeptFull;
   bool held = false;
-  for (const auto &[_, holder] : requests_) {
+  for (const auto &[id, holder] : requests_) {
     if (holder.cachedBlocks.size() <= index || holder.cachedBlocks[index] != block)
       continue;
-    if (holder.mode != KvMode::Spill)
+    if (holder.mode != KvMode::Spill && id != asSpill)
       return Eligibility::KeptFull;
     if (index + spill_->windowPages >= holder.cachedBlocks.size())
       return Eligibility::Later;
@@ -1112,6 +1112,23 @@ TokenAdmission Cache::moveLandedPages(bool allocate, SpilledExtents extents) {
 }
 
 bool Cache::holdsIndexPages(uint64_t requestId) const { return request(requestId).indexPages != 0; }
+
+uint32_t Cache::spillablePages(uint64_t requestId) const {
+  const Request &active = request(requestId);
+  if (!spill_)
+    return 0;
+  // moveLandedPages' scan, every copy landed.
+  const auto blocks = static_cast<uint32_t>(active.cachedBlocks.size());
+  const uint32_t end = blocks > spill_->windowPages ? blocks - spill_->windowPages : 0;
+  uint32_t pages = 0;
+  for (uint32_t index = spill_->densePages; index < end; ++index) {
+    const uint32_t page = active.pages[index];
+    const uint64_t block = active.cachedBlocks[index];
+    pages += pool_.form(page) == kv::PageForm::Full && kv_.page(block) == page &&
+             spillEligibility(block, requestId) == Eligibility::Eligible;
+  }
+  return pages;
+}
 
 void Cache::poisonCopy(uint64_t block) {
   // Lanes that read it in one command report it each.

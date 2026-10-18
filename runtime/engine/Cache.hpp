@@ -441,6 +441,11 @@ public:
   // for Full the eligible write-throughs that an Index page will take.
   [[nodiscard]] uint32_t pendingPages(kv::PageForm form) const noexcept;
   [[nodiscard]] bool holdsIndexPages(uint64_t requestId) const;
+  // The request's Full pages that spillWritten would move to the index form
+  // were it a Spill request whose copies had landed: past its dense history
+  // and tail window, each its block's page, whose every other holder spills
+  // too, outside its own window. A block a Resident peer holds counts none.
+  [[nodiscard]] uint32_t spillablePages(uint64_t requestId) const;
   // The block's copy could not be read (ModelStepResult::unreadableKvBlocks):
   // it matches nothing any more, and its copy goes with the block.
   void poisonCopy(uint64_t block);
@@ -539,9 +544,10 @@ public:
     return states_.checkpointPinned(checkpoint);
   }
 
-  // Releases every empty extent, but one with keepRunway, and returns the
-  // bytes released.
-  [[nodiscard]] uint64_t releaseEmptyExtents(bool keepRunway);
+  // Releases every empty extent, of the form or of either, but one of each
+  // form with keepRunway, and returns the bytes released.
+  [[nodiscard]] uint64_t releaseEmptyExtents(bool keepRunway,
+                                             std::optional<kv::PageForm> form = std::nullopt);
   // Evicts every unpinned entry, in reclaimOne()'s order, and releases every
   // empty extent, the runway too. Only then does it move pages, those that
   // requests and pins still hold, so that nothing is copied and then evicted.
@@ -880,9 +886,11 @@ private:
   // spilling and outside their tail windows (Eligible). Later: one holds it
   // in its window, which moves on as it commits. KeptFull while a holder
   // reads it Full, a Resident one or its dense history, and without
-  // holders.
+  // holders. `asSpill` names a holder taken to spill whatever its mode
+  // (spillablePages).
   enum class Eligibility : uint8_t { Eligible, Later, KeptFull };
-  [[nodiscard]] Eligibility spillEligibility(uint64_t block) const;
+  [[nodiscard]] Eligibility spillEligibility(uint64_t block,
+                                             std::optional<uint64_t> asSpill = std::nullopt) const;
   // Writes of the class in flight.
   [[nodiscard]] uint32_t writes(WriteClass write) const noexcept;
   // Pages written through whose Full pages free once their copies land.
