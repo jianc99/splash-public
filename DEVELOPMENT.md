@@ -493,11 +493,15 @@ request thinks on until the character is complete, a token or a few, and its
   The server checks the text with the model's tokenizer when it starts, and
   stops with an error on one that breaks these rules.
 
-A model whose thinking is cut mid-thought may go on planning in its answer. An
-end text that turns to the answer first helps it answer at once, such as this
-one adapted from the sentence Qwen suggests for its models: a blank line sets
-it apart from the cut thought, and the model writes the one after `</think>`
-itself.
+A model whose thinking is cut mid-thought may go on planning in its answer, and
+may close that with a `</think>` of its own. A chat answer drops every `</think>`
+after the reasoning's end, the budget's or the model's own, and with thinking
+off, as vLLM's Qwen3 parser does: only the tag goes, the newlines around it
+stay, and a tool call's arguments and a structured answer's JSON keep theirs. A
+text completion keeps its text as written. An end text that turns to the answer
+first helps it answer at once, such as this one adapted from the sentence Qwen
+suggests for its models: a blank line sets it apart from the cut thought, and
+the model writes the one after `</think>` itself.
 
 ```sh
 splash serve --model mlx-community/Qwen3.8-27B-4bit --thinking-token-budget 12000 \

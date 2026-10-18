@@ -101,8 +101,10 @@ class ReasoningSplitter:
 _VALUE_ENDS = tuple(
     PARAMETER_CLOSE + tag for tag in (PARAMETER_OPEN, FUNCTION_END, TOOL_CALL_CLOSE)
 )
-# Text outside calls: a call's opening opens one, and a </think>, which a
-# model that called a tool from its reasoning may still write, is dropped.
+# Text outside calls: a call's opening opens one, and a </think> is dropped.
+# A model may write one again after its reasoning has ended, after its own
+# </think>, a call's opening or a budget's forced end, or with thinking off;
+# vLLM's Qwen3 parser drops it as well.
 _TEXT_TAGS = (CALL_OPEN, THINK_END)
 _NOT_JSON = object()
 # A template that writes a value through Jinja's string filter, as Nex's and
@@ -175,12 +177,17 @@ class StreamingToolCallProjector:
     converts by the types its tool declares for it (convert_value), and one
     that may only be a string streams as it is written. Text outside calls
     streams as it arrives, after a call as before one, and a </think> there
-    is dropped.
+    is dropped (_TEXT_TAGS).
+
+    Without a tool policy the output has no calls: a call's opening is text,
+    and the projector only drops the </think>s, so that every answer reads
+    its text the same way. A structured answer's JSON is left as it is.
     """
 
     def __init__(self, policy, request_id, structured=False):
         self.policy = policy
         self.request_id = request_id
+        self.text_tags = _TEXT_TAGS if policy is not None else (THINK_END,)
         self.pending = ""
         self.state = "output" if structured else "content"
         self.call_index = 0
@@ -202,9 +209,10 @@ class StreamingToolCallProjector:
         self.content_fragments = []
         # How many content fragments the stream has published (the rest are
         # whitespace it holds), and whether the text since the start of the
-        # output or the last call has shown a visible character yet.
+        # output or the last call has shown a visible character yet. Without
+        # calls, no whitespace frames them.
         self.streamed_count = 0
-        self.text_visible = False
+        self.text_visible = policy is None
         self.closed_calls = []
 
     def _emit_content(self, value, events):
@@ -374,9 +382,9 @@ class StreamingToolCallProjector:
                 self.pending = ""
                 break
             if self.state == "content":
-                start, tag = self._next_tag(*_TEXT_TAGS)
+                start, tag = self._next_tag(*self.text_tags)
                 if tag is None:
-                    ready, self.pending = hold_partial(self.pending, *_TEXT_TAGS)
+                    ready, self.pending = hold_partial(self.pending, *self.text_tags)
                     self._emit_content(ready, events)
                     break
                 self._emit_content(self.pending[:start], events)
@@ -470,7 +478,8 @@ class StreamingToolCallProjector:
             self.state in ("content", "output", "json")
             and self.pending
             and not (
-                incomplete and any(tag.startswith(self.pending) for tag in _TEXT_TAGS)
+                incomplete
+                and any(tag.startswith(self.pending) for tag in self.text_tags)
             )
         ):
             self.content_fragments.append(self.pending)
