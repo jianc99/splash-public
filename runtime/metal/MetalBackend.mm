@@ -22,6 +22,7 @@
 #include <cstring>
 #include <deque>
 #include <filesystem>
+#include <iomanip>
 #include <limits>
 #include <mutex>
 #include <new>
@@ -560,6 +561,37 @@ struct HostSteps {
         }
         return waited;
     }
+    // A failed command's account of the steps that ran: how many, the longest
+    // work, and the longest pickup (from the end of the GPU work before a
+    // step to its start, which a runner held up by earlier work lengthens),
+    // each with its step, counted from 1; empty when none ran.
+    std::string longest() {
+        std::lock_guard lock(mutex);
+        double work = 0.0, pickup = 0.0;
+        size_t ran = 0, workStep = 0, pickupStep = 0;
+        for (size_t index = 0; index < steps.size(); ++index) {
+            const Step &step = steps[index];
+            if (!step.done) continue;
+            ++ran;
+            if (!workStep || step.done - step.pickup > work) {
+                work = step.done - step.pickup;
+                workStep = index + 1;
+            }
+            id<MTLCommandBuffer> before = step.before;
+            const double ended = before ? before.GPUEndTime : 0.0;
+            if (ended > 0.0 && (!pickupStep || step.pickup - ended > pickup)) {
+                pickup = step.pickup - ended;
+                pickupStep = index + 1;
+            }
+        }
+        if (!ran) return {};
+        std::ostringstream text;
+        text << std::fixed << std::setprecision(3) << " (host steps: " << ran << " of " << steps.size()
+             << " ran; the longest worked " << work << " s, step " << workStep;
+        if (pickupStep) text << "; the longest pickup " << pickup << " s, step " << pickupStep;
+        text << ')';
+        return text.str();
+    }
 };
 
 // Runs the host steps of committed command buffers in order, on a thread of
@@ -744,6 +776,7 @@ struct CommandTicket::State {
             if (failed && failed.error) {
                 message << ": " << errorDescription(failed.error);
             }
+            if (hostSteps) message << hostSteps->longest();
             error = message.str();
         }
         if (hostSteps && error.empty()) {

@@ -1906,7 +1906,8 @@ void failBeforeFirstHostStep(id command, SEL selector, id<MTLSharedEvent> event,
 // A command runs none of its host steps after one that threw or did not run
 // (the buffer before it failed): a later step may build on an earlier one, as
 // an expert load's later rounds build on its first. The command fails with
-// the first failure, and the work after the steps still runs.
+// the first failure, which names the steps that ran and the longest's work,
+// and the work after the steps still runs.
 void failedCommandRunsNoLaterHostStep(const std::string &metallibPath) {
     for (const bool fault : {false, true}) {
         MetalBackend backend(metallibPath);
@@ -1920,6 +1921,7 @@ void failedCommandRunsNoLaterHostStep(const std::string &metallibPath) {
             {1, {}, 0, EventStep::Kind::Host,
              [&] {
                  first = true;
+                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
                  throw std::runtime_error("test host failure");
              }},
             {2, {}, 0, EventStep::Kind::Host, [&] { second = true; }}};
@@ -1944,7 +1946,14 @@ void failedCommandRunsNoLaterHostStep(const std::string &metallibPath) {
         failedCommand.store(nullptr);
         const std::string expected = fault ? "Metal command 1 failed: test fault before a signal"
                                            : "Metal command 1 failed: host step failed: test host failure";
-        require(error.find(expected) != std::string::npos && first != fault && !second && *value == 3,
+        // The step that ran is named with its work; none ran past the fault.
+        const std::string named = " (host steps: 1 of 2 ran; the longest worked ";
+        const size_t at = error.find(named);
+        const bool accounted =
+            fault ? error.find("host steps:") == std::string::npos
+                  : at != std::string::npos && std::stod(error.substr(at + named.size())) >= 0.05 &&
+                        error.find(" s, step 1", at) != std::string::npos;
+        require(error.find(expected) != std::string::npos && accounted && first != fault && !second && *value == 3,
                 std::string(fault ? "a command whose buffer failed before its first host step"
                                   : "a command whose first host step threw") +
                     " ran its second step (" + std::to_string(second) + "), or failed with \"" + error +

@@ -223,16 +223,19 @@ enum class HostStepGpu : uint8_t {
 // The GPU work after a skipped step still runs, on what its buffers held, as
 // all work after a failed buffer runs on what it left, and the command fails
 // with the first failure; a step whose work threw names it (its ticket's
-// wait() throws its message). Once a command
-// completed without a failure, `timed` gets the round trip of each of its
-// host steps (HostStepTiming) on Metal's completion thread; one that throws
-// marks the backend unhealthy, as a completion callback that throws does. A
-// command run under dispatch profiling reports no round trip. Once the work
-// returned, `then` runs on the runner right after the step let the work after
-// it go: short CPU work the GPU need not wait for and that would slow its
-// start, such as reads begun in the background; the runner takes the next
-// step once it returned. The command may have completed by then, so `then`
-// must not throw: one that does marks the backend unhealthy.
+// wait() throws its message). The failure also names, of the steps that ran,
+// the longest work and the longest pickup (from the end of the GPU work
+// before a step to its start), so that a buffer Metal timed out tells which
+// step held its wait. Once a command completed without a failure, `timed`
+// gets the round trip of each of its host steps (HostStepTiming) on Metal's
+// completion thread; one that throws marks the backend unhealthy, as a
+// completion callback that throws does. A command run under dispatch
+// profiling reports no round trip. Once the work returned, `then` runs on the
+// runner right after the step let the work after it go: short CPU work the
+// GPU need not wait for and that would slow its start, such as reads begun in
+// the background; the runner takes the next step once it returned. The
+// command may have completed by then, so `then` must not throw: one that does
+// marks the backend unhealthy.
 struct EventStep {
   enum class Kind : uint8_t { Signal, Wait, Host };
 
