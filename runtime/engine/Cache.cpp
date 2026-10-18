@@ -838,6 +838,8 @@ TokenAdmission Cache::restoreRequest(uint64_t requestId, const CacheLookup &look
   active.pages = std::move(chain.pages);
   active.cachedBlocks = std::move(chain.blocks);
   pagesChanged(active, 0);
+  if (tier_)
+    tier_->submitRestores();
   return {};
 }
 
@@ -882,20 +884,21 @@ Cache::LeafReclaim Cache::demoteKv(uint64_t block) {
   if (!kvTierWritable())
     return LeafReclaim::Impossible;
   // Do not discard a disk copy for a transfer that cannot start yet.
-  if (!tier_->canDemote()) {
+  if (!tier_->canDemote(WriteClass::Reclaim)) {
     ++kvTier_.demotionsRefused;
     return transfersInFlight() ? LeafReclaim::Pending : LeafReclaim::Impossible;
   }
   // Room in the quota or the tier that transfers in flight will free is
   // worth waiting for; room that nothing will free is not, and the leaf goes.
-  std::shared_ptr<KvDiskSlot> slot = acquireDiskSlot(kvNeededByStateInUse(block));
+  std::shared_ptr<KvDiskSlot> slot =
+      acquireDiskSlot(model::DiskBudget::Draw::Cache, kvNeededByStateInUse(block));
   if (!slot)
     return transfersInFlight() ? LeafReclaim::Pending : LeafReclaim::Impossible;
   // Making room may have taken the states the leaf was kept for; it then
   // goes like any leaf nothing needs.
   if (!kvNeededByState(block))
     return LeafReclaim::Impossible;
-  auto transfer = tier_->demote(kv_.page(block), slot, completionNotifier_);
+  auto transfer = tier_->demote(kv_.page(block), slot, WriteClass::Reclaim, completionNotifier_);
   if (!transfer) {
     ++kvTier_.demotionsRefused;
     return transfersInFlight() ? LeafReclaim::Pending : LeafReclaim::Impossible;
@@ -916,12 +919,14 @@ void Cache::labelKv(uint64_t block, const std::shared_ptr<KvDiskSlot> &slot) {
   tier_->label(slot, encodeLabel(label));
 }
 
-std::shared_ptr<KvDiskSlot> Cache::acquireDiskSlot(bool inUse) {
+std::shared_ptr<KvDiskSlot> Cache::acquireDiskSlot(model::DiskBudget::Draw draw, bool inUse) {
   // Making room is no use while the limit cannot hold a slot.
-  if (diskBudget_ && diskBudget_->limitBytes() < tier_->slotBytes())
+  if (diskBudget_ &&
+      (draw == model::DiskBudget::Draw::Commitment ? diskBudget_->activeLimitBytes()
+                                                   : diskBudget_->limitBytes()) < tier_->slotBytes())
     return {};
   for (;;) {
-    if (auto slot = tier_->acquireSlot())
+    if (auto slot = tier_->acquireSlot(draw))
       return slot;
     if (!freeDiskSpace(inUse))
       return {};
@@ -1023,7 +1028,8 @@ bool Cache::pollTierTransfers() {
   tier_->poll();
   // Waiting restores start in block order and stop at the first the tier
   // refuses: started ones stay a prefix of each chain, and a full tier is
-  // asked once per poll, not once per waiting block.
+  // asked once per poll, not once per waiting block. Those started go out
+  // together after the pass.
   bool refused = false;
   for (auto entry = restores_.begin(); entry != restores_.end();) {
     auto &[block, restore] = *entry;
@@ -1061,6 +1067,7 @@ bool Cache::pollTierTransfers() {
     entry = restores_.erase(entry);
     progressed = true;
   }
+  tier_->submitRestores();
   for (auto demotion = demotions_.begin(); demotion != demotions_.end();) {
     if (!demotion->transfer->ready()) {
       ++demotion;
@@ -1133,14 +1140,14 @@ PersistStatus Cache::persist(uint64_t block) {
       continue;
     }
     // Only a resident block lacks a disk copy.
-    if (!restores_.empty() || copies_.size() >= kCopies || !tier_->canDemote())
+    if (!restores_.empty() || !tier_->canDemote(WriteClass::Persist))
       return inFlight ? PersistStatus::Started : PersistStatus::Busy;
-    std::shared_ptr<KvDiskSlot> slot = acquireDiskSlot(false);
+    std::shared_ptr<KvDiskSlot> slot = acquireDiskSlot(model::DiskBudget::Draw::Cache, false);
     // Making room gives up the oldest point, which may be this one: it does
     // not fit then. Otherwise its chain stays whole, as a state needs it.
     if (!slot || !states_.onDisk(block))
       return PersistStatus::Refused;
-    auto transfer = tier_->demote(chain.pages[index], slot, completionNotifier_);
+    auto transfer = tier_->demote(chain.pages[index], slot, WriteClass::Persist, completionNotifier_);
     if (!transfer)
       return inFlight ? PersistStatus::Started : PersistStatus::Busy;
     labelKv(id, slot);

@@ -2,64 +2,78 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <new>
 #include <span>
 #include <stdexcept>
 #include <utility>
 
 namespace splash::engine {
 
-// A demotion or a restore of one page, until the tier retires its IO.
-struct KvPageTier::Transfer final {
-  bool demotion = false;
-  std::shared_ptr<model::SlotFile::Operation> io;
-  bool ready = false;
-  bool success = false;
-};
-
 class KvPageTier::Ticket final : public KvTransfer {
 public:
-  explicit Ticket(std::shared_ptr<Transfer> transfer) : transfer_(std::move(transfer)) {}
-  bool ready() const noexcept override { return transfer_->ready; }
-  bool finish() override { return transfer_->success; }
+  explicit Ticket(std::shared_ptr<Outcome> outcome) : outcome_(std::move(outcome)) {}
+  bool ready() const noexcept override { return outcome_->ready; }
+  bool finish() override { return outcome_->success; }
 
 private:
-  std::shared_ptr<Transfer> transfer_;
+  std::shared_ptr<Outcome> outcome_;
 };
 
 namespace {
+
 std::shared_ptr<KvPageTier::DiskSlot> diskSlot(const std::shared_ptr<KvDiskSlot> &slot) {
   auto disk = std::dynamic_pointer_cast<KvPageTier::DiskSlot>(slot);
   if (!disk) throw std::invalid_argument("KV disk slot belongs to another tier");
   return disk;
 }
+
+// A reader's memory for what it reads, aligned for uncached IO and kept for
+// the reader's next task: at most a slot each.
+std::span<std::byte> readBuffer(uint64_t bytes) {
+  constexpr std::align_val_t alignment{kv::SlotFormat::kReadAlignmentBytes};
+  struct Free {
+    void operator()(std::byte *memory) const noexcept { ::operator delete(memory, alignment); }
+  };
+  thread_local std::unique_ptr<std::byte, Free> memory;
+  thread_local uint64_t capacity = 0;
+  if (capacity < bytes) {
+    memory.reset(static_cast<std::byte *>(::operator new(bytes, alignment)));
+    capacity = bytes;
+  }
+  return {memory.get(), capacity};
+}
+
 } // namespace
 
-KvPageTier::KvPageTier(kv::PageStorage &pages, std::shared_ptr<model::SlotFile> file,
-                       uint32_t transfers)
-    : pages_(pages), file_(std::move(file)), transferLimit_(transfers) {
-  if (!file_ || !transferLimit_)
-    throw std::invalid_argument("KV tier needs a slot file and room for a transfer");
-  demotionLimit_ = std::max<uint32_t>(1, transferLimit_ / 2);
-  restoreLimit_ = std::max<uint32_t>(1, transferLimit_ - transferLimit_ / 4);
+KvPageTier::KvPageTier(kv::PageStorage &pages, kv::SlotFormat format,
+                       std::shared_ptr<model::SlotFile> file,
+                       std::shared_ptr<model::SsdReaders> readers, uint32_t writes)
+    : pages_(pages), format_(std::move(format)), file_(std::move(file)),
+      readers_(std::move(readers)), writeLimit_(writes) {
+  if (!file_ || !readers_ || !writeLimit_)
+    throw std::invalid_argument("KV tier needs a slot file, readers and room for a write");
+  if (format_.layout() != pages_.layout())
+    throw std::invalid_argument("KV tier's slot format is another layout's");
   // Tracking a submitted IO must not allocate: the tier drains every IO it
   // tracks before it goes, and an IO it lost would outlive the page.
-  inFlight_.reserve(transferLimit_);
+  writes_.reserve(writeLimit_);
 }
 
 // A transfer in flight reads or writes its page in place, and the cache that
-// held the page for it is gone before the tier is: the IO worker must be done
-// with every page first. Nothing will read the slots a cancelled write leaves
-// behind, because the tier that maps pages to them is going away too.
+// held the page for it is gone before the tier is: the worker and the
+// readers must be done with every page first. Nothing will read the slots a
+// cancelled write leaves behind, nor the pages an unread restore leaves,
+// because the tier that maps pages to them is going away too.
 KvPageTier::~KvPageTier() {
-  for (const std::shared_ptr<Transfer> &transfer : inFlight_)
-    transfer->io->drain();
+  for (const Write &write : writes_)
+    write.io->drain();
+  for (RestoreBatch &batch : batches_)
+    readers_->stop(*batch.batch);
 }
 
-std::string_view KvPageTier::slotFormatToken(const kv::Layout &) noexcept {
-  // Stub, which the tiered block store replaces in the commit
-  // that switches what the tier writes: the tier writes every page in its
-  // spans' order.
-  return {};
+std::string_view KvPageTier::slotFormatToken(const kv::Layout &layout) noexcept {
+  // kv::SlotFormat's version 1, the block records of a spillable layout.
+  return layout.spillable() ? " slots block-records-v1" : "";
 }
 
 uint64_t KvPageTier::slotBytes() const noexcept { return file_->slotBytes(); }
@@ -73,39 +87,47 @@ void KvPageTier::label(const std::shared_ptr<KvDiskSlot> &slot, std::vector<std:
 }
 
 std::shared_ptr<KvDiskSlot> KvPageTier::adopt(const model::SlotRecord &record) {
-  return std::make_shared<DiskSlot>(file_->adopt(record));
+  return std::make_shared<DiskSlot>(file_->adopt(record), file_);
 }
 
-bool KvPageTier::canDemote() const noexcept {
-  return demotions_ < demotionLimit_ && inFlight_.size() < transferLimit_ && writable();
+uint32_t KvPageTier::share(WriteClass write) const noexcept {
+  switch (write) {
+  case WriteClass::Reclaim: return writeLimit_;
+  case WriteClass::Persist: return std::max(1u, writeLimit_ / 4);
+  case WriteClass::Spill: return std::max(1u, writeLimit_ / 2);
+  }
+  return 0;
 }
 
-bool KvPageTier::canRestore() const noexcept {
-  return restores_ < restoreLimit_ && inFlight_.size() < transferLimit_;
+bool KvPageTier::canDemote(WriteClass write) const noexcept {
+  return writes_.size() < writeLimit_ && classWrites_[static_cast<size_t>(write)] < share(write) &&
+         writable();
 }
 
-std::shared_ptr<KvDiskSlot> KvPageTier::acquireSlot() {
-  auto slot = file_->acquire();
+bool KvPageTier::canRestore() const noexcept { return restores_ < kRestores; }
+
+std::shared_ptr<KvDiskSlot> KvPageTier::acquireSlot(model::DiskBudget::Draw draw) {
+  auto slot = file_->acquire(draw);
   if (!slot) return {};
-  return std::make_shared<DiskSlot>(std::move(slot));
+  return std::make_shared<DiskSlot>(std::move(slot), file_);
 }
 
 std::unique_ptr<KvTransfer> KvPageTier::demote(uint32_t page, std::shared_ptr<KvDiskSlot> slot,
-                                               std::function<void()> completion) {
-  if (!canDemote())
+                                               WriteClass write, std::function<void()> completion) {
+  if (!canDemote(write))
     return {};
+  if (pages_.form(page) != kv::PageForm::Full)
+    throw std::logic_error("only a page that holds its K/V is written to the KV tier");
   auto disk = diskSlot(slot);
-  const std::vector<std::span<std::byte>> bytes = pages_.spans(page);
-  auto transfer = std::make_shared<Transfer>();
-  transfer->demotion = true;
-  auto ticket = std::make_unique<Ticket>(transfer);
-  transfer->io = file_->write(disk->slot, {bytes.begin(), bytes.end()}, std::move(completion));
+  auto outcome = std::make_shared<Outcome>();
+  auto ticket = std::make_unique<Ticket>(outcome);
+  auto io = file_->write(disk->slot, format_.transferSpans(pages_, page), std::move(completion));
   // A file that stopped taking writes since canDemote() refuses this one as
   // canDemote() does from now on.
-  if (!transfer->io)
+  if (!io)
     return {};
-  ++demotions_;
-  inFlight_.push_back(std::move(transfer));
+  ++classWrites_[static_cast<size_t>(write)];
+  writes_.push_back({write, std::move(io), std::move(outcome)});
   return ticket;
 }
 
@@ -113,33 +135,85 @@ std::unique_ptr<KvTransfer> KvPageTier::restore(std::shared_ptr<KvDiskSlot> slot
                                                 std::function<void()> completion) {
   if (!canRestore())
     return {};
-  auto disk = diskSlot(slot);
-  auto transfer = std::make_shared<Transfer>();
-  auto ticket = std::make_unique<Ticket>(transfer);
-  transfer->io = file_->read(disk->slot, pages_.spans(page), std::move(completion));
+  Restore restore{diskSlot(slot), page, pages_.form(page) == kv::PageForm::Index,
+                  std::move(completion), std::make_shared<Outcome>()};
+  auto ticket = std::make_unique<Ticket>(restore.outcome);
+  queued_.push_back(std::move(restore));
   ++restores_;
-  inFlight_.push_back(std::move(transfer));
   return ticket;
 }
 
-std::shared_ptr<const model::KvCopy> KvPageTier::copy(const std::shared_ptr<KvDiskSlot> &) const {
-  // Stub, which the tiered block store replaces: no copy is
-  // read beside the file's worker.
-  throw std::logic_error("direct reads of KV tier copies are not built yet");
+void KvPageTier::submitRestores() {
+  if (queued_.empty())
+    return;
+  // A batch that does not start leaves its restores queued for the next
+  // call; one that starts is tracked without another allocation.
+  batches_.reserve(batches_.size() + 1);
+  auto restores = std::make_shared<std::vector<Restore>>();
+  RestoreBatch batch{restores, nullptr, std::vector<bool>(queued_.size()), queued_.size()};
+  restores->swap(queued_);
+  try {
+    // A failed read throws, and the readers try it once more. The batch
+    // wakes the engine once every restore in it has ended.
+    batch.batch = readers_->start(
+        restores->size(), [this, restores](size_t index) { read((*restores)[index]); },
+        readers_->readers(), [restores](const model::SsdReaders::Batch &) {
+          if (const std::function<void()> &completion = restores->front().completion)
+            completion();
+        });
+  } catch (...) {
+    restores->swap(queued_);
+    throw;
+  }
+  batches_.push_back(std::move(batch));
+}
+
+void KvPageTier::read(const Restore &restore) const {
+  // The page's extent stays while its restore is in flight, and its memory
+  // is found beside the engine thread's changes to other extents.
+  const kv::SlotRange range =
+      restore.index ? format_.indexRange() : kv::SlotRange{0, format_.payloadBytes()};
+  const std::optional<std::span<const std::byte>> bytes =
+      restore.copy->readAt(range.offset, range.bytes, readBuffer(file_->slotBytes()));
+  if (!bytes)
+    throw std::runtime_error("a KV tier slot could not be read");
+  if (restore.index)
+    format_.scatterIndex(*bytes, pages_.indexSpans(restore.page));
+  else
+    format_.scatterPage(*bytes, pages_, restore.page);
+}
+
+std::shared_ptr<const model::KvCopy> KvPageTier::copy(const std::shared_ptr<KvDiskSlot> &slot) const {
+  return diskSlot(slot);
 }
 
 void KvPageTier::poll() {
-  for (size_t index = 0; index < inFlight_.size();) {
-    if (!inFlight_[index]->io->ready()) {
+  for (size_t index = 0; index < writes_.size();) {
+    Write &write = writes_[index];
+    if (!write.io->ready()) {
       ++index;
       continue;
     }
-    const std::shared_ptr<Transfer> transfer = std::move(inFlight_[index]);
-    inFlight_.erase(inFlight_.begin() + static_cast<std::ptrdiff_t>(index));
-    --(transfer->demotion ? demotions_ : restores_);
-    transfer->success = transfer->io->wait();
-    transfer->io.reset();
-    transfer->ready = true;
+    --classWrites_[static_cast<size_t>(write.write)];
+    write.outcome->success = write.io->wait();
+    write.outcome->ready = true;
+    writes_.erase(writes_.begin() + static_cast<std::ptrdiff_t>(index));
+  }
+  // A restore that ended lets its copy go: the cache may give the copy up
+  // once the restore has landed.
+  for (auto batch = batches_.begin(); batch != batches_.end();) {
+    for (size_t index = 0; index < batch->retired.size(); ++index) {
+      if (batch->retired[index] || !batch->batch->ended(index))
+        continue;
+      Restore &restore = (*batch->restores)[index];
+      restore.outcome->success = !batch->batch->failed(index);
+      restore.outcome->ready = true;
+      restore.copy.reset();
+      batch->retired[index] = true;
+      --batch->left;
+      --restores_;
+    }
+    batch = batch->left ? batch + 1 : batches_.erase(batch);
   }
 }
 
