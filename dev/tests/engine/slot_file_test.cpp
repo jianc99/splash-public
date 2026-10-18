@@ -968,7 +968,8 @@ static void testSpillsWithinTheWriteBudget() {
 
 // While reads a step waits for run, each chunk of a write waits for them, at
 // most kWriteDeferral, and the wait is counted; without them no chunk
-// waits. Either way the write lands.
+// waits, nor while a read of the file waits behind the write, until the
+// worker takes it. Either way the write lands.
 static void testWritesDeferToReads() {
   constexpr size_t size = 3 << 20;
   constexpr uint64_t bound = std::chrono::microseconds(SlotFile::kWriteDeferral).count();
@@ -996,6 +997,24 @@ static void testWritesDeferToReads() {
           "a write waited without reads to wait for, or did not ask once a chunk");
   std::vector<std::byte> output(size);
   require(file.read(slot, {output}, {})->wait() && output == payload, "a deferred write did not land");
+
+  reading = true;
+  std::promise<void> reached, release;
+  auto released = release.get_future().share();
+  auto hold = file.read(slot, {output}, [&] {
+    reached.set_value();
+    released.wait();
+  });
+  reached.get_future().wait();
+  const std::vector<std::byte> later = patterned(size, 12);
+  auto write = file.write(slot, {later}, {});
+  auto behind = file.read(slot, {output}, {});
+  release.set_value();
+  require(hold->wait() && write->wait() && behind->wait() && output == later &&
+              budget->writesDeferredMicroseconds() == deferred,
+          "a write held back for other reads while a read of its file waited behind it");
+  require(file.write(slot, {payload}, {})->wait() && budget->writesDeferredMicroseconds() >= deferred + 3 * bound,
+          "a write did not hold back again once the read behind the last one was taken");
 }
 
 // A file's writes watch the readers without keeping them
