@@ -1380,6 +1380,7 @@ its path, `/v1/systemone`'s included: OpenAI's `server_error` with code
 | 503 | `frontend_overloaded` | The server holds `--queue-size` requests, every connection slot holds a request ([request limits](#request-limits-and-timeouts)), or a shared input budget or request preparation is full; retry. |
 | 503 | `resource_timeout` | The request waited for memory, or for the SSD cache's room for its KV, and got none in time; retry, or free memory. |
 | 503 | `mask_timeout` | The server left the request's token mask unanswered for 5 s; retry. |
+| 503 | `kv_unreadable` | KV of an earlier part of the request could not be read back from the SSD cache, which gave the copy up; a retry recomputes it. |
 | 503 | `kv_write_budget` | The request's KV does not fit in memory and would go to the SSD cache, whose `--max-cache-disk-writes` budget is spent until it refills. |
 | 503 | `runtime_busy` | The server could not hand the request's token mask to the engine: its mask queue was full or the engine connection failed; retry. |
 | 504 | `request_timeout` | The request's `timeout`, or `--request-timeout`, ran out. |
