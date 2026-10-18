@@ -41,11 +41,15 @@ kernel void attention_block_lists(device const uint *mask [[buffer(0)]],
   const uint per = (words + kBlockListThreads - 1) / kBlockListThreads;
   const uint w0 = min(tid * per, words), w1 = min(w0 + per, words);
   device const uint *bits = mask + ulong(s.mask_row + first_row) * p.mask_words;
+  // A tile's rows, unrolled over an entry's row bits, so that each row's word
+  // stays in a register; a short last tile's missing rows read as zero.
+  constexpr uint RowBits = SPLASH_ATTENTION_BLOCK_ROW_BITS;
   uint attended = 0;
   for (uint w = w0; w < w1; ++w) {
     uint any = 0;
-    for (uint r = 0; r < rows; ++r)
-      any |= bits[ulong(r) * p.mask_words + w];
+#pragma unroll
+    for (uint r = 0; r < RowBits; ++r)
+      any |= r < rows ? bits[ulong(r) * p.mask_words + w] : 0u;
     attended += popcount(any & splash_history_word_bits(blocks, w));
   }
   const uint inclusive = simd_prefix_inclusive_sum(attended);
@@ -57,10 +61,11 @@ kernel void attention_block_lists(device const uint *mask [[buffer(0)]],
     before += simd_counts[g];
   device uint *list = lists + ulong(s.list + tile) * p.stride;
   for (uint w = w0; w < w1; ++w) {
-    uint row_bits[SPLASH_ATTENTION_BLOCK_ROW_BITS];
+    uint row_bits[RowBits];
     uint any = 0;
-    for (uint r = 0; r < rows; ++r) {
-      row_bits[r] = bits[ulong(r) * p.mask_words + w];
+#pragma unroll
+    for (uint r = 0; r < RowBits; ++r) {
+      row_bits[r] = r < rows ? bits[ulong(r) * p.mask_words + w] : 0u;
       any |= row_bits[r];
     }
     any &= splash_history_word_bits(blocks, w);
@@ -68,7 +73,8 @@ kernel void attention_block_lists(device const uint *mask [[buffer(0)]],
       const uint b = ctz(any);
       any &= any - 1;
       uint entry = (w * 32 + b) << SPLASH_ATTENTION_BLOCK_ROW_BITS;
-      for (uint r = 0; r < rows; ++r)
+#pragma unroll
+      for (uint r = 0; r < RowBits; ++r)
         entry |= (row_bits[r] >> b & 1u) << r;
       if (before < p.stride)
         list[before] = entry;
