@@ -109,14 +109,15 @@ void excludeFromBackups(const std::filesystem::path &root) {
             error.localizedDescription.UTF8String, ").");
 }
 
-// A persistent tier's directory under root and its files, empty when another
-// process holds the directory or it cannot be used: the tier then keeps
-// temporary files, as without one. A root it makes is excluded from
-// backups.
+// A persistent tier's directory under root and its files, written as
+// `options` says, empty when another process holds the directory or it
+// cannot be used: the tier then keeps temporary files, as without one. A
+// root it makes is excluded from backups.
 PersistentCacheFiles openPersistentCache(const std::filesystem::path &root,
                                          const std::string &cacheNamespace,
                                          uint64_t kvSlotBytes, uint64_t stateSlotBytes,
                                          const std::shared_ptr<model::DiskBudget> &budget,
+                                         const model::SlotFile::Options &options,
                                          const std::function<bool()> &cancelled) {
   try {
     if (root.empty())
@@ -139,11 +140,13 @@ PersistentCacheFiles openPersistentCache(const std::filesystem::path &root,
     files.kv = std::make_shared<model::SlotFile>(
         kvSlotBytes, budget,
         model::SlotFile::Persistence{files.directory->kvSlots(), files.directory->kvRecords(),
-                                     tag, sizeof(KvBlockLabel)});
+                                     tag, sizeof(KvBlockLabel)},
+        options);
     files.states = std::make_shared<model::SlotFile>(
         stateSlotBytes, budget,
         model::SlotFile::Persistence{files.directory->stateSlots(),
-                                     files.directory->stateRecords(), tag, sizeof(StateLabel)});
+                                     files.directory->stateRecords(), tag, sizeof(StateLabel)},
+        options);
     return files;
   } catch (const std::exception &error) {
     logLine("Persistent cache disabled (", error.what(), "); this process keeps a temporary cache.");
@@ -220,14 +223,16 @@ struct DiskTier final {
 };
 
 // Opens the tier's files where the disk takes them, with `quotaBytes` (none
-// leaves it off): a persistent tier keeps its files in a cache directory of
-// its own; when another process holds it or it cannot be used, the tier
-// keeps temporary files, as without one. The automatic tier opens files only
-// on a volume where its limit would hold two states and 1 GiB of KV: a
-// persistent tier's root, whose caches nobody holds count as the tier's,
-// else the temporary files'. Every start removes the root's stale caches.
+// leaves it off), written as `options` says: a persistent tier keeps its
+// files in a cache directory of its own; when another process holds it or it
+// cannot be used, the tier keeps temporary files, as without one. The
+// automatic tier opens files only on a volume where its limit would hold two
+// states and 1 GiB of KV: a persistent tier's root, whose caches nobody holds
+// count as the tier's, else the temporary files'. Every start removes the
+// root's stale caches.
 DiskTier openDiskTier(const RuntimeResourcesConfig &config, const std::string &cacheNamespace,
-                      uint64_t quotaBytes, uint64_t kvSlotBytes, uint64_t stateBytes) {
+                      uint64_t quotaBytes, uint64_t kvSlotBytes, uint64_t stateBytes,
+                      const model::SlotFile::Options &options) {
   DiskTier tier;
   // The cache root's caches nobody holds, this start's own included, looked
   // at once: they are room an automatic persistent tier may take, the stale
@@ -259,7 +264,7 @@ DiskTier openDiskTier(const RuntimeResourcesConfig &config, const std::string &c
     }
     if (config.persistentCache && !rootRefusal) {
       tier.persistent = openPersistentCache(config.cacheRoot, cacheNamespace, kvSlotBytes, stateSlotBytes,
-                                            tier.budget, config.cancelled);
+                                            tier.budget, options, config.cancelled);
       tier.states = tier.persistent.states;
     }
     std::optional<std::string> off;
@@ -272,7 +277,7 @@ DiskTier openDiskTier(const RuntimeResourcesConfig &config, const std::string &c
       if (rootRefusal)
         logLine("Persistent cache off: ", *rootRefusal, "; the SSD cache keeps temporary files.");
       try {
-        tier.states = std::make_shared<model::SlotFile>(stateSlotBytes, tier.budget);
+        tier.states = std::make_shared<model::SlotFile>(stateSlotBytes, tier.budget, options);
       } catch (const std::exception &error) {
         off = error.what();
       }
@@ -293,7 +298,7 @@ DiskTier openDiskTier(const RuntimeResourcesConfig &config, const std::string &c
   tier.kv = tier.persistent.kv;
   try {
     if (!tier.kv)
-      tier.kv = std::make_shared<model::SlotFile>(kvSlotBytes, tier.budget);
+      tier.kv = std::make_shared<model::SlotFile>(kvSlotBytes, tier.budget, options);
   } catch (const std::exception &error) {
     // The persistent files are open by now; without the tier nothing would
     // keep or replace their copies.
@@ -864,8 +869,15 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     // spills takes the room the tier's volume leaves it.
     const std::string cacheNamespace =
         persistentCacheNamespace(cacheIdentity, loaded.stateLayout(config.stateFormat));
+    // Its writes yield to the reads a command waits for.
+    model::SlotFile::Options writes;
+    writes.deferWrites = [readers = std::weak_ptr(readers)] {
+      const std::shared_ptr<model::SsdReaders> pool = readers.lock();
+      return pool && pool->criticalBusy();
+    };
     DiskTier disk = openDiskTier(config, cacheNamespace, stateStagingBytes ? cacheDiskBytes : 0,
-                                 model::SlotFile::slotBytesFor(kvLayout.bytesPerModelPage()), stateBytes);
+                                 model::SlotFile::slotBytesFor(kvLayout.bytesPerModelPage()), stateBytes,
+                                 writes);
     kvFileOpen = disk.kv != nullptr;
     if (disk.budget)
       activeLimitBytes = disk.budget->activeLimitBytes();
