@@ -11,6 +11,10 @@
 // producers write alongside their output (LinearBuffers::prepared), prepared once and not timed. The cases run in
 // ABBA order after a warm-up; printed are the medians of `rounds` (20) commands in ms per projection, the device
 // policy's choice marked with *. Widths emulate core counts: the policy's tiers count threadgroups per core.
+// The float formats float-bf16 and float-f32 time the float projection (ops::addGgufFloat: the router's, the QSA
+// indexer's, F32 alpha/beta) instead, one tensor per width of any multiple of 8 columns, on both float tiles at one to
+// four lanes or each prefill chunk of R rows (the accelerator tile from 16 rows), the tile the device takes for every
+// width marked with *.
 #include "../tests/engine/GgufFormatReference.hpp"
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
@@ -61,6 +65,117 @@ struct Case {
   std::vector<double> ms;
 };
 
+// One float projection's tile at `rows` rows, printed as a Case.
+struct FloatCase {
+  std::string line, label;
+  FloatTile tile;
+  uint32_t rows;
+  bool chosen;
+  std::vector<double> ms;
+};
+
+// Warms each case up, times it `rounds` times in ABBA order with `time` (ms per projection of a command of `copies`)
+// and prints the medians under `heading`.
+template <typename C, typename Time>
+void measure(std::vector<C> &cases, uint32_t rounds, uint32_t copies, Time time, const std::string &heading) {
+  for (C &c : cases)
+    for (double spent = 0; spent < kWarmupSeconds * 1e3;) spent += time(c) * copies;
+  for (uint32_t r = 0; r < rounds; ++r)
+    for (size_t i = 0; i < cases.size(); ++i) {
+      C &c = cases[r % 2 ? cases.size() - 1 - i : i];
+      c.ms.push_back(time(c));
+    }
+  std::printf("%s", heading.c_str());
+  for (size_t i = 0; i < cases.size(); ++i) {
+    C &c = cases[i];
+    if (!i || c.line != cases[i - 1].line) std::printf("%s  %s", i ? "\n" : "", c.line.c_str());
+    std::sort(c.ms.begin(), c.ms.end());
+    std::printf(" | %s%s %.4f", c.label.c_str(), c.chosen ? "*" : "", c.ms[c.ms.size() / 2]);
+  }
+  std::printf("\n");
+}
+
+std::string heading(const MetalBackend &backend, const char *formats, const char *widths, uint32_t K,
+                    const std::string &epilogue, uint32_t copies, uint64_t bytes, uint32_t rounds) {
+  const DeviceCapabilities &device = backend.capabilities();
+  char line[512];
+  std::snprintf(line, sizeof line, "%s (GPU family %u, %u cores): %s %sx%u %s, %u weight copies of %.1f MB, median ms "
+                "of %u rounds:\n", device.deviceName.c_str(), device.appleGpuFamily, device.gpuCoreCount, formats,
+                widths, K, epilogue.c_str(), copies, bytes / 1e6, rounds);
+  return line;
+}
+
+// The float projections of one float format (float-bf16, float-f32) of `widths` columns each, the segments of one
+// fp32 destination row, at one to four lanes or each of `prefillRows`.
+void floatProjections(MetalBackend &backend, const char *formatList, const char *widthList,
+                      const std::vector<std::string> &formats, const std::vector<std::string> &widths, uint32_t K,
+                      LinearEpilogue epilogue, uint32_t rounds, const std::vector<uint32_t> &prefillRows) {
+  if (!std::all_of(formats.begin(), formats.end(), [&](const std::string &f) { return f == formats.front(); }) ||
+      (formats.front() != "float-bf16" && formats.front() != "float-f32") || epilogue != LinearEpilogue::None)
+    throw std::invalid_argument("float projections take one float format, float-bf16 or float-f32, and no epilogue");
+  const uint32_t type = formats.front() == "float-bf16" ? QuantizedSegment::kBFloat16 : QuantizedSegment::kFloat32;
+  const uint32_t valueBytes = type == QuantizedSegment::kBFloat16 ? 2 : 4;
+  std::mt19937 rng(9);
+  std::normal_distribution<float> normal(0.0f, 0.05f);
+  std::vector<uint32_t> sizes;
+  uint32_t N = 0;
+  for (const std::string &width : widths) {
+    sizes.push_back(uint32_t(std::stoul(width)));
+    if (!sizes.back() || sizes.back() % 8 || !K || K % 8) throw std::invalid_argument("bad float tensor " + width);
+    N += sizes.back();
+  }
+  const uint64_t bytes = uint64_t{N} * K * valueBytes;
+  std::vector<std::vector<uint8_t>> tensors;
+  for (const uint32_t size : sizes) {
+    std::vector<uint8_t> &values = tensors.emplace_back(uint64_t{size} * K * valueBytes);
+    for (uint64_t i = 0; i < uint64_t{size} * K; ++i) {
+      const float value = normal(rng);
+      const __bf16 half = __bf16(value);
+      std::memcpy(values.data() + i * valueBytes, valueBytes == 2 ? static_cast<const void *>(&half) : &value,
+                  valueBytes);
+    }
+  }
+  const uint32_t copies = uint32_t(std::clamp<uint64_t>((kRingBytes + bytes - 1) / bytes, kMinimumCopies,
+                                                        kMaximumCopies));
+  std::vector<std::vector<QuantizedSegment>> ring(copies);
+  for (std::vector<QuantizedSegment> &segments : ring)
+    for (uint32_t i = 0, offset = 0; i < sizes.size(); offset += sizes[i++]) {
+      segments.push_back(QuantizedSegment::floats(sizes[i], K, upload(backend, tensors[i]), type));
+      segments.back().columnOffset = offset;
+    }
+  const Linear linear(backend.capabilities());
+  std::vector<FloatCase> cases;
+  std::vector<uint32_t> lines = prefillRows;
+  if (lines.empty())
+    for (uint32_t lanes = 1; lanes <= kMaximumLanes; ++lanes) lines.push_back(lanes * kLaneRows);
+  for (const uint32_t rows : lines)
+    for (const FloatTile tile : {FloatTile::Simdgroup, FloatTile::NeuralAccelerator}) {
+      const bool accelerator = tile == FloatTile::NeuralAccelerator;
+      if (accelerator && (rows < 16 || K % 32)) continue;
+      const bool chosen = std::all_of(sizes.begin(), sizes.end(),
+                                      [&](uint32_t n) { return linear.ggufFloatTile(rows, n) == tile; });
+      cases.push_back({(prefillRows.empty() ? "L" + std::to_string(rows / kLaneRows) : "R" + std::to_string(rows)),
+                       accelerator ? "accelerator" : "simdgroup", tile, rows, chosen, {}});
+    }
+  const uint32_t rows = *std::max_element(lines.begin(), lines.end());
+  const MetalBuffer input = backend.allocateBuffer(uint64_t{rows} * K * 2, metal::BufferStorage::Shared, "input");
+  const MetalBuffer output = backend.allocateBuffer(uint64_t{rows} * N * 4, metal::BufferStorage::Shared, "output");
+  {
+    std::uniform_real_distribution<float> unit(-1.f, 1.f);
+    auto *x = static_cast<__bf16 *>(input.contents());
+    for (uint64_t i = 0; i < uint64_t{rows} * K; ++i) x[i] = __bf16(unit(rng));
+  }
+  uint32_t next = 0;
+  const auto time = [&](FloatCase &c) {
+    CommandGraph graph;
+    for (uint32_t i = 0; i < copies; ++i, ++next)
+      for (const QuantizedSegment &s : ring[next % copies])
+        addGgufFloat(graph, input, s, output, c.rows, N, s.columnOffset, FloatOutput::Float32, c.tile);
+    return backend.submitCommandAsync(graph.dispatches()).wait().gpuSeconds * 1e3 / copies;
+  };
+  measure(cases, rounds, copies, time, heading(backend, formatList, widthList, K, "none", copies, bytes, rounds));
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -94,6 +209,10 @@ int main(int argc, char **argv) {
     }
     try {
       MetalBackend backend(argv[1]);
+      if (formats.front().rfind("float-", 0) == 0) {
+        floatProjections(backend, argv[2], argv[3], formats, widths, K, epilogue, rounds, prefillRows);
+        return 0;
+      }
       std::mt19937 rng(9);
       // One image of the projection's segments, uploaded once per copy of the ring.
       struct Image { Fmt format; uint32_t N, offset; Packed planes; };
@@ -213,24 +332,7 @@ int main(int argc, char **argv) {
                                        step > 1 ? &ring[(next + 1) % copies] : nullptr));
         return backend.submitCommandAsync(graph.dispatches()).wait().gpuSeconds * 1e3 / (copies / step);
       };
-      for (Case &c : cases)
-        for (double spent = 0; spent < kWarmupSeconds * 1e3;) spent += time(c) * copies;
-      for (uint32_t r = 0; r < rounds; ++r)
-        for (size_t i = 0; i < cases.size(); ++i) {
-          Case &c = cases[r % 2 ? cases.size() - 1 - i : i];
-          c.ms.push_back(time(c));
-        }
-      const DeviceCapabilities &device = backend.capabilities();
-      std::printf("%s (GPU family %u, %u cores): %s %sx%u %s, %u weight copies of %.1f MB, median ms of %u rounds:\n",
-                  device.deviceName.c_str(), device.appleGpuFamily, device.gpuCoreCount, argv[2], argv[3], K,
-                  epilogueName.c_str(), copies, bytes / 1e6, rounds);
-      for (size_t i = 0; i < cases.size(); ++i) {
-        Case &c = cases[i];
-        if (!i || c.line != cases[i - 1].line) std::printf("%s  %s", i ? "\n" : "", c.line.c_str());
-        std::sort(c.ms.begin(), c.ms.end());
-        std::printf(" | %s%s %.4f", c.label.c_str(), c.chosen ? "*" : "", c.ms[c.ms.size() / 2]);
-      }
-      std::printf("\n");
+      measure(cases, rounds, copies, time, heading(backend, argv[2], argv[3], K, epilogueName, copies, bytes, rounds));
     } catch (const std::exception &e) {
       std::cerr << "gguf-projection-benchmark: " << e.what() << '\n';
       return 1;
