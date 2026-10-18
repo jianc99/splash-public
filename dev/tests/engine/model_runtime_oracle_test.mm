@@ -1230,9 +1230,13 @@ void requireStatesCapturedInsideCommands(model::Runtime &executor, const metal::
 // middle one carries its state through the group's scratch cell) is
 // prefilled in three commands, then on the same pages and lane in one; then
 // two lanes, one of whose rows end in the group's first chunk, each against
-// commands of the group's chunks.
-void requirePrefillGroupMatchesItsChunks(model::Runtime &executor, const kv::PageStorage &pages,
-                                         const model::QwenStateStorage &states, std::span<const uint32_t> chat) {
+// commands of the group's chunks. A group's command leaves room in the
+// queue's 512 command buffers for the host steps of the reads of a spilled
+// history, two per attention layer, each of two buffers when it keeps the
+// GPU awake (model::SpilledKvReads::prefill and layerEnd).
+void requirePrefillGroupMatchesItsChunks(model::Runtime &executor, const metal::MetalBackend &backend,
+                                         const kv::PageStorage &pages, const model::QwenStateStorage &states,
+                                         std::span<const uint32_t> chat) {
   constexpr uint32_t chunk = model::ExecutionLimits::prefillTokenBudget;
   if (executor.prefillGroupRows() <= chunk) {
     std::cout << "prefill_group=SKIP (the target runs no prefill groups)\n";
@@ -1292,6 +1296,10 @@ void requirePrefillGroupMatchesItsChunks(model::Runtime &executor, const kv::Pag
   executor.end(501);
   start(502);
   const ModelStepResult group = prefill(502, 0, rows);
+  const uint64_t groupBuffers = BackendInstrumentation::lastCommandBuffers(backend);
+  std::cout << "prefill_group_command_buffers=" << groupBuffers << '\n';
+  require(groupBuffers + 4 * pages.layout().attentionLayers <= 512,
+          "a prefill group's command leaves no room for the host steps of a spilled history");
   require(group.scoreLogits == last.scoreLogits, "a prefill group's score logits differ from its chunks'");
   require(kvBytes() == chunkedKv, "a prefill group's KV differs from its chunks'");
   require(states.metadata(0).lengths == chunkedLengths && bytesOf(states.current(0).stateBase) == chunkedCell,
@@ -2917,7 +2925,7 @@ int main(int argc, char **argv) {
         279,    1534,   4087,  13,     248046, 198,   248045, 846,   198,
         9419,   248046, 198,   248045, 74455,  198,   248068, 198};
     if (prefillGroupsOnly) {
-      requirePrefillGroupMatchesItsChunks(executor, pages, states, samplingSeedTokens);
+      requirePrefillGroupMatchesItsChunks(executor, backend, pages, states, samplingSeedTokens);
       std::cout << "PASS model-runtime-oracle scope=prefill-groups-only model=" << model.name()
                 << " (a prefill group leaves what its chunks' commands leave)\n";
       return 0;
@@ -3031,7 +3039,7 @@ int main(int argc, char **argv) {
     requireThinkingEndVerifiesItsTokens(executor, model);
     requireStatesCapturedInsideCommands(executor, backend, pages, states, aneFfn.get(), samplingSeedTokens);
     requireCapturesOutliveTheirItems(executor, states, samplingSeedTokens);
-    requirePrefillGroupMatchesItsChunks(executor, pages, states, samplingSeedTokens);
+    requirePrefillGroupMatchesItsChunks(executor, backend, pages, states, samplingSeedTokens);
     requireBatchedLanesMatchReordered(executor, states, samplingSeedTokens);
 
 

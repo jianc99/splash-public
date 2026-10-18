@@ -878,6 +878,7 @@ struct MetalBackend::Impl {
 #ifdef SPLASH_BACKEND_INSTRUMENTATION
     bool dispatchProfiling = false;
     std::vector<DispatchTiming> dispatchProfile;
+    uint64_t lastCommandBuffers = 0;
 #endif
     __strong id<MTLDevice> device = nil;
     __strong id<MTLCommandQueue> queue = nil;
@@ -1818,6 +1819,8 @@ CommandTicket MetalBackend::submitCommandAsync(const Command &command,
     checkOperation();
     checkEvents(command.events, command.dispatches.size());
 #ifdef SPLASH_BACKEND_INSTRUMENTATION
+    impl_->lastCommandBuffers = 1;
+    for (const EventStep &step : command.events) impl_->lastCommandBuffers += addedBuffers(step);
     if (impl_->dispatchProfiling)
         return impl_->submitProfiled(command.dispatches, command.events, std::move(completion));
 #endif
@@ -1879,6 +1882,10 @@ uint64_t BackendInstrumentation::submittedCommands(
 
 size_t BackendInstrumentation::cachedPipelines(const MetalBackend &backend) {
     return backend.impl_->pipelines.size();
+}
+
+uint64_t BackendInstrumentation::lastCommandBuffers(const MetalBackend &backend) {
+    return backend.impl_->lastCommandBuffers;
 }
 
 void BackendInstrumentation::setDispatchProfiling(MetalBackend &backend,
