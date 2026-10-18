@@ -149,6 +149,10 @@ void Scheduler::setStreamsHistory(uint64_t id, bool streams) {
   get(id).streamsHistory = streams;
 }
 
+void Scheduler::setPrefillGroupRows(uint64_t id, uint32_t rows) {
+  get(id).spec.prefillGroupRows = rows;
+}
+
 void Scheduler::cancel(uint64_t id) {
   Request &request = get(id);
   if (!terminal(request.phase))

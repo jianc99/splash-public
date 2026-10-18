@@ -1051,6 +1051,7 @@ std::function<bool(const Engine::Denial &)> Engine::spillFallback(Request &activ
                                                             : chainEnd(active))))
       return false;
     active.kvMode = KvMode::Spill;
+    scheduler_.setPrefillGroupRows(active.request.id, model_.prefillGroupRows(true));
     counters_.spill.converted += started;
     return true;
   };
@@ -1072,6 +1073,11 @@ void Engine::endAtLength(Request &active) {
 void Engine::completeAdmission(Request &active, CacheLookup &lookup,
                                 DraftContextPlan draft) {
   const bool resuming = scheduler_.suspended(active.request.id);
+  // A lane whose history spills runs prefill groups, which read it once for
+  // their chunks; a Resident one only where every lane runs them, so a
+  // request that arrives beside it waits for a chunk.
+  scheduler_.setPrefillGroupRows(active.request.id,
+                                 model_.prefillGroupRows(active.kvMode == KvMode::Spill));
   active.skipCache = false;
   active.admissionProbe.reset();
   const uint32_t resumeBoundary = lookup.resumeBoundary();

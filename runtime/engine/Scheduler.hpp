@@ -35,7 +35,8 @@ struct RequestSpec final {
   uint32_t prefillTokens = 0;
   double deadlineMilliseconds = 0.0;
   // The most rows of one of its prefill commands (Model::prefillGroupRows): a
-  // prefill group's, which runs it alone, or a chunk's.
+  // prefill group's, which runs it alone, or a chunk's; the engine may set it
+  // again once it knows where the request's KV lives (setPrefillGroupRows).
   uint32_t prefillGroupRows = model::ExecutionLimits::prefillTokenBudget;
 };
 
@@ -105,6 +106,7 @@ public:
   // SSD cache (KvHistoryStream), which a command does for one lane alone and
   // whatever its rows; the engine says so before it plans.
   void setStreamsHistory(uint64_t requestId, bool streams);
+  void setPrefillGroupRows(uint64_t requestId, uint32_t rows);
   void cancel(uint64_t requestId);
   // Ends a request outside a command's completion, as at its length.
   void finish(uint64_t requestId);

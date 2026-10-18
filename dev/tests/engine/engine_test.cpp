@@ -8198,6 +8198,26 @@ void testShortQuotaBoundsWaitsOrRefusesASpillStart() {
   }
 }
 
+// On a target whose prefill groups save only a spilling lane's reads, its
+// experts loaded whole, a Spill request's long prompt runs as groups and a
+// Resident one's as chunks, as without the SSD cache: a request that arrives
+// beside a Resident one waits for a chunk, not a group.
+void testOnlySpillingLanesRunPrefillGroups() {
+  for (const bool spills : {false, true}) {
+    Spilling spill(256, spills);
+    spill.model.groupRows = 4 * model::ExecutionLimits::prefillTokenBudget;
+    spill.model.groupsOnlySpilling = true;
+    // Groups run once prefill has a measured cost, as after the start's.
+    spill.engine.observePrefill(model::ExecutionLimits::prefillTokenBudget, 1000.0, 0.0);
+    // 128 pages and a token: three chunks, or one group.
+    spill.engine.submit(Spilling::prompt(1, 1, 128, 1));
+    spill.runUntilIdle();
+    require(spill.events.completedCount == 1 && spill.model.prefillChunks.at(1) == (spills ? 1u : 3u),
+            spills ? "a Spill request's prompt did not run as a prefill group"
+                   : "a Resident request's prompt ran as a prefill group");
+  }
+}
+
 // A Spill request suspended for a higher priority returns its commitment
 // and commits again for what it still projects when it resumes; short of
 // that, the quota bounds its output there too, and the model is given that
@@ -10993,6 +11013,7 @@ int main() {
     testConversionCommitsTheHistoryWithoutCopies();
     testAStartThatConvertsCountsNoConversion();
     testShortQuotaBoundsWaitsOrRefusesASpillStart();
+    testOnlySpillingLanesRunPrefillGroups();
     testSpillResumeCommitsAgain();
     testDecodeLeavesOutALaneRefusedItsHotFloor();
     testLoneSpillLaneEndsAtTheWall();
