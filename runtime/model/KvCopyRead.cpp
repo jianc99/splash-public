@@ -1,7 +1,5 @@
 #include "model/KvCopyRead.hpp"
 
-#include <cstdint>
-#include <cstdlib>
 #include <new>
 #include <utility>
 
@@ -12,38 +10,38 @@ constexpr uint64_t kAlignment = kv::SlotFormat::kReadAlignmentBytes;
 
 constexpr uint64_t alignUp(uint64_t value) noexcept { return (value + kAlignment - 1) / kAlignment * kAlignment; }
 
-// The thread's buffer, grown to the largest read it made.
-struct ReadBuffer final {
-  std::byte *bytes = nullptr;
-  uint64_t size = 0;
-
-  ReadBuffer() = default;
-  ReadBuffer(const ReadBuffer &) = delete;
-  ReadBuffer &operator=(const ReadBuffer &) = delete;
-  ~ReadBuffer() { std::free(bytes); }
-
-  std::span<std::byte> hold(uint64_t wanted) {
-    if (size < wanted) {
-      std::free(std::exchange(bytes, nullptr));
-      size = 0;
-      bytes = static_cast<std::byte *>(std::aligned_alloc(kAlignment, wanted));
-      if (!bytes) throw std::bad_alloc();
-      size = wanted;
-    }
-    return {bytes, size};
-  }
-};
-
 } // namespace
 
-std::optional<std::span<const std::byte>> readKvCopy(const KvCopy &copy, kv::SlotRange range) {
-  thread_local ReadBuffer buffer;
+KvReadBuffer::~KvReadBuffer() {
+  if (bytes_)
+    ::operator delete(bytes_, std::align_val_t{kAlignment});
+}
+
+std::span<std::byte> KvReadBuffer::hold(uint64_t bytes) {
+  if (size_ < bytes) {
+    if (bytes_)
+      ::operator delete(std::exchange(bytes_, nullptr), std::align_val_t{kAlignment});
+    size_ = 0;
+    bytes_ = static_cast<std::byte *>(::operator new(bytes, std::align_val_t{kAlignment}));
+    size_ = bytes;
+  }
+  return {bytes_, size_};
+}
+
+std::optional<std::span<const std::byte>> readKvCopy(const KvCopy &copy, kv::SlotRange range,
+                                                     KvReadBuffer &buffer) {
   // The aligned range around the bytes, and a unit more: an adopted copy
   // reads the whole segments a range touches (SlotFile::readAt), and a range
-  // of segments (the index, a block's record, a layer's) leaves at most the
-  // room after a record, less than a unit, outside (kv::SlotFormat).
+  // of segments (the index, a block's record, a layer's, a whole page's)
+  // leaves at most the room after a record, less than a unit, outside
+  // (kv::SlotFormat).
   return copy.readAt(range.offset, range.bytes,
                      buffer.hold(alignUp(range.offset % kAlignment + range.bytes) + kAlignment));
+}
+
+std::optional<std::span<const std::byte>> readKvCopy(const KvCopy &copy, kv::SlotRange range) {
+  thread_local KvReadBuffer buffer;
+  return readKvCopy(copy, range, buffer);
 }
 
 } // namespace splash::model
