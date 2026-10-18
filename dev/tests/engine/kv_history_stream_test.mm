@@ -232,7 +232,8 @@ void streams(MetalBackend &backend, kv::Format format, uint32_t buffers) {
   const uint64_t index = sequence.copies.size();
   const model::KvHistoryStreamStats stats = stream.stats();
   require(stats.commands == 1 && stats.layers == kLayers && stats.pages == (index - 1) * kLayers &&
-              stats.bytes == stats.pages * kv::SlotFormat(layout).layerRange(0).bytes && stats.wait.count == kLayers,
+              stats.bytes == stats.pages * kv::SlotFormat(layout).layerRange(0).bytes && stats.wait.count == kLayers &&
+              stats.read.count == kLayers && stats.read.totalMilliseconds > 0,
           "the stream's counts are off");
   for (const auto &copy : sequence.copies)
     require(copy->reads() == (copy == *unreadable ? 2 : 1) * kLayers,
@@ -330,8 +331,9 @@ void endsTheReadsOfACommandGivenUp(MetalBackend &backend) {
   require(held, "the first layer's host step did not read with the readers");
   uint64_t reads = 0;
   for (const auto &copy : copies) reads += copy->reads();
-  require(result.failures.empty() && reads == kTaken && stream.stats().pages == kTaken,
-          "a command given up read past the reads its step had taken");
+  require(result.failures.empty() && reads == kTaken && stream.stats().pages == kTaken &&
+              stream.stats().read.count == 0,
+          "a command given up read past the reads its step had taken, or timed them");
   std::cout << "kv_history_stream_test: a command given up PASS\n";
 }
 
