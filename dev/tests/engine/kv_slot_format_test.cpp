@@ -6,6 +6,7 @@
 // a layer's records and the index land where the kernels address those
 // tokens (abi/KvExtent.h). Built under ASan too.
 
+#include "HostKvPages.hpp"
 #include "TestChecks.hpp"
 #include "metal/abi/KvExtent.h"
 #include "ops/KvSlotFormat.hpp"
@@ -38,59 +39,8 @@ constexpr uint32_t kBlockTokens = SPLASH_ATTENTION_BLOCK_TOKENS;
 constexpr kv::Layout kFlashNext{12, 2, 256, kv::Format::Int8, 128, true};
 constexpr kv::Layout kFlashNextBf16{12, 2, 256, kv::Format::BFloat16, 128, true};
 
-// Pages in host memory, reached as PageStorage reaches its pages: each
-// layer's keys, key scales, values and value scales, then each layer's
-// index.
-class HostPages final {
-public:
-  HostPages(kv::Layout layout, uint32_t pages)
-      : layout_(layout), bytes_(pages * layout.bytesPerModelPage(), std::byte{0}) {}
-
-  [[nodiscard]] SlotFormat::LayerSpans layerSpans(uint32_t page, uint32_t layer) const {
-    std::byte *at = bytes_.data() + page * layout_.bytesPerModelPage() + layer * layout_.bytesPerLayerPage();
-    SlotFormat::LayerSpans result;
-    for (uint32_t tensor = SPLASH_KV_KEYS; tensor <= SPLASH_KV_VALUE_SCALES; ++tensor) {
-      const uint64_t bytes = tensor % 2 ? layout_.scaleBytesPerLayerPage() : layout_.dataBytesPerLayerPage();
-      result[tensor] = {at, bytes};
-      at += bytes;
-    }
-    return result;
-  }
-  [[nodiscard]] std::vector<std::span<std::byte>> indexSpans(uint32_t page) const {
-    std::byte *at = bytes_.data() + page * layout_.bytesPerModelPage() + layout_.kvBytesPerModelPage();
-    std::vector<std::span<std::byte>> result;
-    for (uint32_t layer = 0; layer < layout_.attentionLayers && layout_.indexDimension; ++layer)
-      result.emplace_back(at + layer * layout_.indexBytesPerLayerPage(), layout_.indexBytesPerLayerPage());
-    return result;
-  }
-  [[nodiscard]] std::vector<std::span<std::byte>> spans(uint32_t page) const {
-    std::vector<std::span<std::byte>> result;
-    for (uint32_t layer = 0; layer < layout_.attentionLayers; ++layer)
-      for (const std::span<std::byte> tensor : layerSpans(page, layer))
-        if (!tensor.empty()) result.push_back(tensor);
-    const std::vector<std::span<std::byte>> index = indexSpans(page);
-    result.insert(result.end(), index.begin(), index.end());
-    return result;
-  }
-  [[nodiscard]] std::span<const std::byte> page(uint32_t page) const {
-    return std::span(bytes_).subspan(page * layout_.bytesPerModelPage(), layout_.bytesPerModelPage());
-  }
-  // Every byte of the page a value of its own.
-  void fill(uint32_t page, uint32_t seed) {
-    uint32_t state = seed;
-    for (std::byte &value : std::span(bytes_).subspan(page * layout_.bytesPerModelPage(), layout_.bytesPerModelPage())) {
-      state = state * 1664525u + 1013904223u;
-      value = static_cast<std::byte>(state >> 24);
-    }
-  }
-
-private:
-  kv::Layout layout_;
-  mutable std::vector<std::byte> bytes_;
-};
-
 // The bytes a write of the page stores, in slot order.
-std::vector<std::byte> gather(const SlotFormat &format, const HostPages &pages, uint32_t page) {
+std::vector<std::byte> gather(const SlotFormat &format, const test::HostKvPages &pages, uint32_t page) {
   std::vector<std::byte> payload;
   for (const std::span<const std::byte> span : format.transferSpans(pages, page))
     payload.insert(payload.end(), span.begin(), span.end());
@@ -100,7 +50,7 @@ std::vector<std::byte> gather(const SlotFormat &format, const HostPages &pages, 
 // Record (layer, block) as the kernels address its tokens: per tensor, each
 // head's tokens of the block, keys and token-major values by
 // splash_kv_key_element, scales by splash_kv_scale_element.
-std::vector<std::byte> expectedRecord(const kv::Layout &layout, const HostPages &pages, uint32_t page,
+std::vector<std::byte> expectedRecord(const kv::Layout &layout, const test::HostKvPages &pages, uint32_t page,
                                       uint32_t layer, uint32_t block) {
   const SlotFormat::LayerSpans tensors = pages.layerSpans(page, layer);
   const uint64_t element = layout.format == kv::Format::Int8 ? 1 : 2;
@@ -218,7 +168,7 @@ void testUnspillableLayouts() {
     require(format.version() == 0 && format.payloadBytes() == layout.bytesPerModelPage() &&
                 format.segments() == std::vector<uint64_t>{layout.bytesPerModelPage()},
             "a layout that cannot spill is not one segment of its page");
-    HostPages pages(layout, 2);
+    test::HostKvPages pages(layout, 2);
     pages.fill(0, 7);
     const std::vector<std::span<const std::byte>> spans = format.transferSpans(pages, 0);
     const std::vector<std::span<std::byte>> expected = pages.spans(0);
@@ -248,7 +198,7 @@ void testUnspillableLayouts() {
 void testTransfersAndScatters() {
   for (const kv::Layout &layout : spillableLayouts()) {
     const SlotFormat format(layout);
-    HostPages pages(layout, 3);
+    test::HostKvPages pages(layout, 3);
     pages.fill(0, layout.attentionLayers * 31 + layout.kvHeads);
     const std::vector<std::byte> payload = gather(format, pages, 0);
     require(payload.size() == format.payloadBytes(), "a write's spans do not hold the payload");
@@ -281,7 +231,7 @@ void testTransfersAndScatters() {
     // hot block cache's: each lands at its place and nowhere else.
     kv::Layout cacheLayout = layout;
     cacheLayout.indexDimension = 0;
-    HostPages cache(cacheLayout, 1);
+    test::HostKvPages cache(cacheLayout, 1);
     for (uint32_t block = 0; block < kBlocks; ++block) {
       const SlotRange record = format.recordRange(2 % layout.attentionLayers, block);
       format.scatterRecord(std::span(payload).subspan(record.offset, record.bytes), cache.layerSpans(0, 1), block);
@@ -298,7 +248,7 @@ void testTransfersAndScatters() {
     // A layer's run into a one-layer staging page, and the index alone.
     kv::Layout stagingLayout = cacheLayout;
     stagingLayout.attentionLayers = 1;
-    HostPages staging(stagingLayout, 1);
+    test::HostKvPages staging(stagingLayout, 1);
     const SlotRange run = format.layerRange(layout.attentionLayers - 1);
     format.scatterLayer(std::span(payload).subspan(run.offset, run.bytes), staging.layerSpans(0, 0));
     const SlotFormat::LayerSpans last = pages.layerSpans(0, layout.attentionLayers - 1);
@@ -317,7 +267,7 @@ void testTransfersAndScatters() {
 // refused before anything is written.
 void testRejections() {
   const SlotFormat format(kFlashNext);
-  HostPages pages(kFlashNext, 1), other(kv::Layout{12, 4, 256, kv::Format::Int8, 128, true}, 1);
+  test::HostKvPages pages(kFlashNext, 1), other(kv::Layout{12, 4, 256, kv::Format::Int8, 128, true}, 1);
   const std::vector<std::byte> record(format.recordBytes());
   rejects([&] { static_cast<void>(format.recordRange(12, 0)); }, "outside the page",
           "a record past the layers was placed");
