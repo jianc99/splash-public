@@ -11,9 +11,11 @@
 // across a release while the next block's experts are read ahead; a read
 // ahead that fails fails no load that does not route its expert, a read of a
 // routed expert that fails fails the load, and a source written since it was
-// opened fails the load's command, which the store reports; memory one
-// byte short of a block's slots is refused; and a size whose slots would take
-// more than the largest buffer keeps its blocks in arenas that fit.
+// opened fails the load's command, which the store reports; a command buffer
+// that fails before a load's first round fails its command with its own error
+// alone, the load's later rounds not run; memory one byte short of a block's
+// slots is refused; and a size whose slots would take more than the largest
+// buffer keeps its blocks in arenas that fit.
 #include "MoeFixture.hpp"
 #include "TestAdmission.hpp"
 #include "TestChecks.hpp"
@@ -28,9 +30,12 @@
 #include "ops/MoE.hpp"
 
 #import <Foundation/Foundation.h>
+#import <Metal/Metal.h>
+#import <objc/runtime.h>
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -428,6 +433,105 @@ int streamedUnionLoads(MetalBackend &backend, const MoeShape &shape, const std::
   return failures;
 }
 
+// Replaces a method of the class of `object`, every command buffer's, while
+// it lives.
+class MethodReplacement final {
+public:
+  MethodReplacement(id object, SEL selector, IMP replacement)
+      : method_(class_getInstanceMethod(object_getClass(object), selector)) {
+    require(method_ != nullptr, "replacement method is missing");
+    original = method_setImplementation(method_, replacement);
+  }
+  ~MethodReplacement() { method_setImplementation(method_, original); }
+  MethodReplacement(const MethodReplacement &) = delete;
+  MethodReplacement &operator=(const MethodReplacement &) = delete;
+  IMP original = nullptr;
+
+private:
+  Method method_ = nullptr;
+};
+
+// Once armed, the command buffer that raises a command's first host step's
+// event (its value 1) never raises it and fails once it ends, as a buffer the
+// GPU faults in, or whose wait Metal times out, does.
+std::atomic<bool> faultFirstStep{false};
+std::atomic<void *> faulted{nullptr};
+IMP originalSignal = nullptr, originalStatus = nullptr, originalError = nullptr;
+
+void signalUnlessFaulted(id command, SEL selector, id<MTLSharedEvent> event, uint64_t value) {
+  if (value != 1 || !faultFirstStep.exchange(false)) {
+    reinterpret_cast<void (*)(id, SEL, id<MTLSharedEvent>, uint64_t)>(originalSignal)(command, selector, event, value);
+    return;
+  }
+  [command addCompletedHandler:^(id<MTLCommandBuffer> ended) {
+    faulted.store((__bridge void *)ended);
+  }];
+}
+
+MTLCommandBufferStatus faultedStatus(id command, SEL selector) {
+  if ((__bridge void *)command == faulted.load()) return MTLCommandBufferStatusError;
+  return reinterpret_cast<MTLCommandBufferStatus (*)(id, SEL)>(originalStatus)(command, selector);
+}
+
+NSError *faultedError(id command, SEL selector) {
+  if ((__bridge void *)command == faulted.load())
+    return [NSError errorWithDomain:MTLCommandBufferErrorDomain
+                               code:MTLCommandBufferErrorTimeout
+                           userInfo:@{NSLocalizedDescriptionKey : @"test timeout before a load's first round"}];
+  return reinterpret_cast<NSError *(*)(id, SEL)>(originalError)(command, selector);
+}
+
+// A command buffer that fails before a load's first round (a GPU fault, or a
+// wait Metal times out) leaves the round unrun: the load's later rounds do
+// not run either, and the command fails with that buffer's error alone, not
+// with a round of the load following another block's load. Block 0's long
+// chunk loads, then block 1's, in rounds, with the buffer before its first
+// round failing.
+int streamedFaultBeforeRound(const std::string &metallibPath, const MoeShape &shape,
+                             const std::filesystem::path &directory) {
+  MetalBackend backend(metallibPath);
+  const Model m = makeModel(backend, shape, Q4K, true);
+  ExpertFile file(m, directory / "experts.bin");
+  const uint64_t slots = 2 * shape.experts;
+  ExpertStore store(backend, file.blocks, shape, storeOptions(arenaBytes(m, slots), file.blocks, shape));
+  std::array<BlockMoeWeights, 2> streamed{m.weights, m.weights};
+  for (uint32_t block = 0; block < 2; ++block) store.bind(block, streamed[block]);
+  Buffers b;
+  freshRows(backend, b, shape);
+  const MoePlan chunk = prefillPlan(shape, kMaximumRows);
+  static_cast<void>(runWeights(backend, streamed[0], b, chunk));
+  std::string error;
+  {
+    id<MTLCommandBuffer> command = [[MTLCreateSystemDefaultDevice() newCommandQueue] commandBuffer];
+    MethodReplacement signal(command, @selector(encodeSignalEvent:value:),
+                             reinterpret_cast<IMP>(signalUnlessFaulted));
+    originalSignal = signal.original;
+    MethodReplacement status(command, @selector(status), reinterpret_cast<IMP>(faultedStatus));
+    originalStatus = status.original;
+    MethodReplacement failure(command, @selector(error), reinterpret_cast<IMP>(faultedError));
+    originalError = failure.original;
+    faultFirstStep = true;
+    try {
+      static_cast<void>(runWeights(backend, streamed[1], b, chunk));
+    } catch (const MetalBackendError &caught) {
+      error = caught.what();
+    }
+  }
+  faultFirstStep = false;
+  faulted.store(nullptr);
+  const uint32_t rounds = loadSteps(shape, chunk, false);
+  if (rounds < 2 || error.find("test timeout before a load's first round") == std::string::npos ||
+      error.find("host step failed") != std::string::npos) {
+    printf("  a buffer that failed before block 1's load of %u rounds failed its command with \"%s\" FAIL\n", rounds,
+           error.c_str());
+    return 1;
+  }
+  printf("streamed experts: a buffer that fails before a load's first round fails its command alone, the load's %u "
+         "rounds not run ok\n",
+         rounds);
+  return 0;
+}
+
 // A size of one block in a format of its own (a layer a dynamic quantization
 // gave other formats) holds every one of its experts: the store reads them
 // when it is built and again when it is restored, and that block's steps
@@ -788,6 +892,7 @@ int main(int argc, const char *argv[]) {
                     streamedLoneBlockSize(backend, shape, directory.path()) +
                     streamedRounds(backend, shape, directory.path()) +
                     streamedReadFailures(argv[1], shape, directory.path()) +
+                    streamedFaultBeforeRound(argv[1], shape, directory.path()) +
                     streamedRefusal(backend, shape, directory.path()) +
                     streamedSplitArenas(backend, shape, directory.path()) +
                     streamedSourceChanges(argv[1], shape, directory.path());
