@@ -234,11 +234,18 @@ def round_record(version: str, documents: list[dict], scenarios) -> dict:
                 partial[measurement["scenario"]].append(request)
             elif measurement["scenario"] in transcripts:
                 transcripts[measurement["scenario"]].append(request)
-            elif (
-                measurement["scenario"] == "short"
-                and measurement["prompt_tokens"] - 1 in short
-            ):
-                short[measurement["prompt_tokens"] - 1].append(request)
+            elif measurement["scenario"] == "short":
+                tokens = measurement["prompt_tokens"]
+                if tokens - 1 in short:
+                    # Before c3dcf53f a short prompt held a token past its
+                    # chunk, which ran as a command of its own.
+                    raise RegressionError(
+                        f"the {version} build's short prompts hold a token past "
+                        "their chunk, as builds before c3dcf53f send them: its "
+                        "short prefills are not the one-chunk prefills compared"
+                    )
+                if tokens in short:
+                    short[tokens].append(request)
     measured = {
         "decode": decode,
         "partial": partial,
