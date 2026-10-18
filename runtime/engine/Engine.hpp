@@ -589,10 +589,11 @@ private:
   // the engine holds; when that gives nothing, a request in service retries
   // as one (EngineConfig::serving), which only the engine's limit and
   // critical pressure refuse. A refusal from the engine's limit reclaims
-  // cache; when that gives nothing, fallback, given the denial so far, may
-  // let go of what the request itself pins, and the reclaim goes on. An
-  // optional allocation, whose refusal only shortens a command, records no
-  // failure (allocationFailed_).
+  // cache. When neither gives anything, fallback, given the denial so far,
+  // may change what the request holds, as letting go of what it pins, and
+  // the allocation is then attempted again. An optional allocation, whose
+  // refusal only shortens a command, records no failure
+  // (allocationFailed_).
   template <class Attempt>
   [[nodiscard]] auto allocate(Attempt &&attempt, bool inService, ReclaimClass upTo,
                               const std::function<bool(const Denial &)> &fallback = {},
