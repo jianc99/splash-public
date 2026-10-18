@@ -1,6 +1,7 @@
 #pragma once
 
 #include "engine/KvTier.hpp"
+#include "model/KvCopyRead.hpp"
 #include "model/Model.hpp"
 #include "model/SlotFile.hpp"
 #include "model/SsdReaders.hpp"
@@ -14,7 +15,6 @@
 #include <functional>
 #include <iterator>
 #include <memory>
-#include <new>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -30,10 +30,10 @@ namespace splash::engine {
 // its extent (SlotFormat::transferSpans), a bounded number at once: reclaim
 // may use all of them, persistent copies a quarter and write-through half, so
 // that one kind never starves another and reclaim always keeps a quarter.
-// Reads go to the SSD readers beside the worker (SlotFile::readAt): a
+// Reads go to the SSD readers beside the worker (model::readKvCopy): a
 // restore is a task of a background batch that reads what its page's form
-// holds, the index alone or all of it, into memory of that size and
-// scatters it into the page. The restores asked for since the last
+// holds, the index alone or all of it, into memory of its own and scatters
+// it into the page. The restores asked for since the last
 // submitRestores() go out together, the index restores as one batch on
 // every reader and the whole restores as another on at most
 // kWholeRestoreReaders, whose reads are a slot each. Copies of slots are
@@ -138,25 +138,6 @@ private:
     std::vector<bool> retired;
     size_t left = 0;
   };
-  // Memory a restore's read lands in, aligned for uncached IO, of the read's
-  // own size: the range starts the slot and ends a segment, which a read of
-  // an adopted slot widens it to no further (model::SlotFile::readAt).
-  class ReadBuffer final {
-  public:
-    explicit ReadBuffer(kv::SlotRange range)
-        : bytes_((range.bytes + kAlignment - 1) / kAlignment * kAlignment),
-          memory_(static_cast<std::byte *>(::operator new(bytes_, std::align_val_t{kAlignment}))) {}
-    ~ReadBuffer() { ::operator delete(memory_, std::align_val_t{kAlignment}); }
-    ReadBuffer(const ReadBuffer &) = delete;
-    ReadBuffer &operator=(const ReadBuffer &) = delete;
-    [[nodiscard]] std::span<std::byte> span() const noexcept { return {memory_, bytes_}; }
-
-  private:
-    static constexpr uint64_t kAlignment = kv::SlotFormat::kReadAlignmentBytes;
-    uint64_t bytes_;
-    std::byte *memory_;
-  };
-
   [[nodiscard]] static std::shared_ptr<DiskSlot> diskSlot(const std::shared_ptr<KvDiskSlot> &slot);
   // A reader's task: reads one restore's range and scatters it.
   void read(const Restore &restore) const;
@@ -326,9 +307,8 @@ template <class Pages> void BasicKvPageTier<Pages>::read(const Restore &restore)
   // The page's extent stays while its restore is in flight, and its memory
   // is found beside the engine thread's changes to other extents.
   const kv::SlotRange range = restore.index ? format_.indexRange() : kv::SlotRange{0, format_.payloadBytes()};
-  const ReadBuffer buffer(range);
-  const std::optional<std::span<const std::byte>> bytes =
-      restore.copy->readAt(range.offset, range.bytes, buffer.span());
+  model::KvReadBuffer buffer;
+  const std::optional<std::span<const std::byte>> bytes = model::readKvCopy(*restore.copy, range, buffer);
   if (!bytes)
     throw std::runtime_error("a KV tier slot could not be read");
   if (restore.index)
