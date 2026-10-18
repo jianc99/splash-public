@@ -806,10 +806,9 @@ CacheReclaimResult Cache::releaseExtent(bool keepRunway) {
 bool Cache::compactExtent() {
   const auto start = AwakeClock::now();
   std::vector<uint32_t> inTransfer;
-  inTransfer.reserve(demotions_.size() + copies_.size() + writes_.size() + restores_.size());
-  for (const std::vector<Demotion> *writes : {&demotions_, &copies_, &writes_})
-    for (const Demotion &write : *writes)
-      inTransfer.push_back(kv_.page(write.block));
+  inTransfer.reserve(writes_.size() + restores_.size());
+  for (const Write &write : writes_)
+    inTransfer.push_back(kv_.page(write.block));
   for (const auto &[block, _] : restores_)
     inTransfer.push_back(kv_.page(block));
   const KvPageMoves moves = pool_.compactExtent(inTransfer);
@@ -844,8 +843,8 @@ void Cache::followMoves(const KvPageMoves &moves) {
 bool Cache::transfersInFlight() const noexcept {
   // A page written through holds no block a reclaim could take: only one
   // that spills once its copy lands returns something.
-  return !restores_.empty() || !demotions_.empty() || !copies_.empty() || states_.writing() ||
-         spillingWrites();
+  return !restores_.empty() || writes(WriteClass::Reclaim) || writes(WriteClass::Persist) ||
+         states_.writing() || spillingWrites();
 }
 
 uint64_t Cache::pendingBytes() const noexcept {
@@ -855,7 +854,12 @@ uint64_t Cache::pendingBytes() const noexcept {
 uint32_t Cache::pendingPages(kv::PageForm form) const noexcept {
   // Only a Full page waits for its copy: an Index page's block has one
   // already, and its page frees at once.
-  return form == kv::PageForm::Full ? static_cast<uint32_t>(demotions_.size()) + spillingWrites() : 0;
+  return form == kv::PageForm::Full ? writes(WriteClass::Reclaim) + spillingWrites() : 0;
+}
+
+uint32_t Cache::writes(WriteClass write) const noexcept {
+  return static_cast<uint32_t>(
+      std::ranges::count(writes_, write, [](const Write &each) { return each.write; }));
 }
 
 uint32_t Cache::spillingWrites() const noexcept {
@@ -864,8 +868,8 @@ uint32_t Cache::spillingWrites() const noexcept {
   if (!spill_)
     return 0;
   uint32_t spillable = 0;
-  for (const Demotion &write : writes_)
-    spillable += spillEligibility(write.block) == Eligibility::Eligible;
+  for (const Write &write : writes_)
+    spillable += write.write == WriteClass::Spill && spillEligibility(write.block) == Eligibility::Eligible;
   return std::min(spillable, pool_.freePageCount(kv::PageForm::Index));
 }
 
@@ -982,7 +986,7 @@ bool Cache::writeThrough(Request &active, uint32_t &started) {
     labelKv(block, slot);
     kv_.setSlot(block, std::move(slot));
     kv_.setTransfer(block, KvCache::Transfer::Draining);
-    writes_.push_back({block, std::move(transfer)});
+    writes_.push_back({block, WriteClass::Spill, std::move(transfer)});
     active.owedCopies.pop_front();
     ++started;
   }
@@ -1082,7 +1086,7 @@ void Cache::poisonCopy(uint64_t block) {
 KvSpillSnapshot Cache::spillSnapshot() const {
   KvSpillSnapshot result = spilled_;
   result.spilledPages = kv_.indexBlocks();
-  result.writeThroughInFlight = static_cast<uint32_t>(writes_.size());
+  result.writeThroughInFlight = writes(WriteClass::Spill);
   result.writeThroughPaused = writeThroughPaused_;
   result.rewrites = kv_.rewrites();
   result.restore = restoreLatency_.snapshot();
@@ -1134,9 +1138,8 @@ void Cache::checkInvariants() const {
   if (spill_)
     check(committed * tier_->slotBytes() == diskBudget_->committedBytes(),
           "the commitments are the requests'");
-  for (const std::vector<Demotion> *writes : {&demotions_, &copies_, &writes_})
-    for (const Demotion &write : *writes)
-      check(kv_.transfer(write.block) == KvCache::Transfer::Draining, "a page being written is Draining");
+  for (const Write &write : writes_)
+    check(kv_.transfer(write.block) == KvCache::Transfer::Draining, "a page being written is Draining");
   for (const auto &[block, _] : restores_)
     check(kv_.transfer(block) == KvCache::Transfer::Filling, "a page being restored is Filling");
 }
@@ -1302,7 +1305,7 @@ Cache::LeafReclaim Cache::demoteKv(uint64_t block) {
   labelKv(block, slot);
   kv_.setSlot(block, std::move(slot));
   kv_.setTransfer(block, KvCache::Transfer::Draining);
-  demotions_.push_back({block, std::move(transfer)});
+  writes_.push_back({block, WriteClass::Reclaim, std::move(transfer)});
   return LeafReclaim::Started;
 }
 
@@ -1494,62 +1497,41 @@ bool Cache::pollTierTransfers() {
     progressed = true;
   }
   tier_->submitRestores();
-  for (auto demotion = demotions_.begin(); demotion != demotions_.end();) {
-    if (!demotion->transfer->ready()) {
-      ++demotion;
+  for (auto entry = writes_.begin(); entry != writes_.end();) {
+    if (!entry->transfer->ready()) {
+      ++entry;
       continue;
     }
-    const uint64_t block = demotion->block;
-    const bool written = demotion->transfer->finish();
-    demotion = demotions_.erase(demotion);
+    const uint64_t block = entry->block;
+    const WriteClass write = entry->write;
+    const bool written = entry->transfer->finish();
+    entry = writes_.erase(entry);
     kv_.setTransfer(block, KvCache::Transfer::None);
-    if (!written) {
-      ++kvTier_.demotionFailures;
+    progressed = true;
+    // A write that failed leaves its page as it was, without a copy.
+    if (!written)
       kv_.setSlot(block, nullptr);
-    } else {
-      ++kvTier_.demotions;
+    switch (write) {
+    case WriteClass::Reclaim:
+      ++(written ? kvTier_.demotions : kvTier_.demotionFailures);
       // A request that matched the block meanwhile keeps its page, and so
       // does a state published on it in RAM; the copy makes the next reclaim
       // of the leaf free.
-      if (kv_.residentLeaf(block) && !states_.stateResident(block))
+      if (written && kv_.residentLeaf(block) && !states_.stateResident(block))
         kv_.dropPage(block);
-    }
-    progressed = true;
-  }
-  // A page persist() wrote stays: the copy is for the next process.
-  for (auto copy = copies_.begin(); copy != copies_.end();) {
-    if (!copy->transfer->ready()) {
-      ++copy;
-      continue;
-    }
-    const uint64_t block = copy->block;
-    const bool written = copy->transfer->finish();
-    copy = copies_.erase(copy);
-    kv_.setTransfer(block, KvCache::Transfer::None);
-    if (written) {
-      ++kvTier_.copies;
-    } else {
-      ++kvTier_.copyFailures;
-      kv_.setSlot(block, nullptr);
-    }
-    progressed = true;
-  }
-  // A page written through stays Full until spillWritten moves it.
-  for (auto write = writes_.begin(); write != writes_.end();) {
-    if (!write->transfer->ready()) {
-      ++write;
-      continue;
-    }
-    const uint64_t block = write->block;
-    const bool written = write->transfer->finish();
-    write = writes_.erase(write);
-    kv_.setTransfer(block, KvCache::Transfer::None);
-    if (written) {
-      ++spilled_.writeThroughPages;
-      spilled_.writeThroughBytes += tier_->slotBytes();
-    } else {
+      break;
+    case WriteClass::Persist:
+      // The page stays: the copy is for the next process.
+      ++(written ? kvTier_.copies : kvTier_.copyFailures);
+      break;
+    case WriteClass::Spill: {
+      // The page stays Full until spillWritten moves it.
+      if (written) {
+        ++spilled_.writeThroughPages;
+        spilled_.writeThroughBytes += tier_->slotBytes();
+        break;
+      }
       ++spilled_.writeThroughFailures;
-      kv_.setSlot(block, nullptr);
       // A volume that filled holds write-through back until it has room; a
       // file that stopped taking writes stops it for good. The Spill
       // requests that hold the block owe its copy again.
@@ -1559,8 +1541,9 @@ bool Cache::pollTierTransfers() {
         if (holder.mode == KvMode::Spill && index < holder.cachedBlocks.size() &&
             holder.cachedBlocks[index] == block)
           holder.owedCopies.push_back(block);
+      break;
     }
-    progressed = true;
+    }
   }
   return progressed;
 }
@@ -1607,7 +1590,7 @@ PersistStatus Cache::persist(uint64_t block) {
     labelKv(id, slot);
     kv_.setSlot(id, std::move(slot));
     kv_.setTransfer(id, KvCache::Transfer::Draining);
-    copies_.push_back({id, std::move(transfer)});
+    writes_.push_back({id, WriteClass::Persist, std::move(transfer)});
     inFlight = true;
   }
   return inFlight ? PersistStatus::Started : PersistStatus::Durable;
