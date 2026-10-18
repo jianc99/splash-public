@@ -238,30 +238,44 @@ private:
     if (cache_.convertToSpill(idOf(*request), kMaximumPages)) request->mode = KvMode::Spill;
   }
 
-  // A read of a spilled block fails: the lane that read it ends, and the
-  // block's copy is given up.
+  // A read of a spilled block fails. The engine applies the results of the
+  // command that read it while the command, and what it read, lives on: the
+  // lane ends and the block's copy is given up.
   void failRead() {
     Request *request = anyRequest();
     if (!request) return;
     const uint64_t id = idOf(*request);
-    const std::vector<uint64_t> spilled = test::indexBlocks(cache_, id);
+    if (waiting(id)) return;
+    const PageTableView cut = cache_.cutPageTable(id);
+    const std::shared_ptr<const model::KvPageSources> command = cut.sources;
     std::vector<uint64_t> blocks;
-    std::copy_if(spilled.begin(), spilled.end(), std::back_inserter(blocks),
-                 [](uint64_t block) { return block != 0; });
+    for (uint32_t page = 0; command && page < cut.pages.size(); ++page)
+      if ((*command)[page].indexed()) blocks.push_back((*command)[page].block);
     if (blocks.empty()) return;
     sources_.erase(id);
     cache_.endRequest(id);
     requests_.erase(id);
     cache_.poisonCopy(blocks[pick(0, static_cast<uint32_t>(blocks.size()) - 1)]);
+    whileApplying();
   }
 
+  // A request ends as the engine applies its last command, which holds what
+  // it read until then.
   void finish() {
     Request *request = anyRequest();
     if (!request) return;
     const uint64_t id = idOf(*request);
-    sources_.erase(id);
+    const auto command = sources_.extract(id);
     cache_.endRequest(id);
     requests_.erase(id);
+    whileApplying();
+  }
+
+  // What else applying a command may do before the command goes: give up for
+  // quota or memory what nothing holds any more.
+  void whileApplying() {
+    if (chance(50)) keepQuota();
+    if (chance(50)) reclaim();
   }
 
   // A command cuts a request's page table and reads its sources until the
