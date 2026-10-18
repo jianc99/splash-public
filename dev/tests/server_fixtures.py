@@ -488,6 +488,7 @@ class FakeRuntime:
             else {
                 "stop": wire.FinishReason.STOP,
                 "length": wire.FinishReason.LENGTH,
+                "bounded": wire.FinishReason.LENGTH,
             }[plan.reason]
         )
         plan.terminal.set()
@@ -503,6 +504,7 @@ class FakeRuntime:
             2_000,
             3_000,
             tuple(plan.logits) if plan.logits is not None else (),
+            bounded=reason == wire.FinishReason.LENGTH and plan.reason == "bounded",
         )
         call.complete(result=done)
 

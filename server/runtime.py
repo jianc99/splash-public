@@ -337,13 +337,17 @@ class RuntimeCall:
                 and not completion_tokens
             ):
                 raise ProtocolFatal("DoneEvent arrived before StartEvent")
-            if (
-                done.reason is wire.FinishReason.LENGTH
-                and completion_tokens != logical_max
+            # Only a bound of the engine's own ends a request with LENGTH short of
+            # its logical maximum.
+            if done.reason is wire.FinishReason.LENGTH and (
+                completion_tokens >= logical_max
+                if done.bounded
+                else completion_tokens != logical_max
             ):
                 raise ProtocolFatal(
                     f"length-finished DoneEvent has {completion_tokens} tokens; "
-                    f"expected logical maximum {logical_max}"
+                    f"expected {'fewer than ' if done.bounded else ''}logical "
+                    f"maximum {logical_max}"
                 )
             expected_scores = self._score_tokens
             if expected_scores:

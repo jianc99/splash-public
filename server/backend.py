@@ -122,6 +122,9 @@ class NativeResult:
     drafted_tokens: int = 0
     accepted_draft_tokens: int = 0
     draft_cycles: int = 0
+    # The engine ended the response at a bound of its own, short of
+    # max_new_tokens: what the SSD cache or memory holds of its context.
+    bounded: bool = False
 
     @functools.cached_property
     def metrics(self):
@@ -930,6 +933,7 @@ class NativeBackend:
                 drafted_tokens=done.drafted_tokens,
                 accepted_draft_tokens=done.accepted_draft_tokens,
                 draft_cycles=done.draft_cycles,
+                bounded=done.bounded,
             )
             if job.latency is not None:
                 latency = result.metrics["request_latency"]

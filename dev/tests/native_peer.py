@@ -93,9 +93,10 @@ def _event_payload(event: wire.EngineEvent) -> tuple[wire.FrameType, bytes]:
             )
         case wire.DoneEvent():
             return wire.FrameType.DONE, struct.pack(
-                f"<QBIIQQQIIIII{len(event.option_logits)}f",
+                f"<QBBIIQQQIIIII{len(event.option_logits)}f",
                 event.request_id,
                 event.reason,
+                event.bounded,
                 event.prompt_tokens,
                 event.completion_tokens,
                 event.prefill_micros,
