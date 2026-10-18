@@ -38,6 +38,9 @@ struct RequestSpec final {
   // prefill group's, which runs it alone, or a chunk's; the engine may set it
   // again once it knows where the request's KV lives (setPrefillGroupRows).
   uint32_t prefillGroupRows = model::ExecutionLimits::prefillTokenBudget;
+  // The most passes over the model's layers one of its prefill commands may
+  // run in (Model::prefillPasses, BatchPlan::passes).
+  uint32_t prefillPasses = 1;
 };
 
 struct PrefillAdmission final {
@@ -69,9 +72,11 @@ struct SchedulerSnapshot final {
 // One single-owner scheduling policy. Prefill batches the shortest remaining
 // sequences first into an actual-row budget, with a bound on how often later
 // arrivals may overtake a lane; a lane that streams its history from the SSD
-// cache runs alone. Decode takes the ready lanes of one priority, constraint
-// mode and stage without waiting for more, so it runs only the four real
-// M8/M16/M24/M32 shapes.
+// cache runs alone, and so does one whose command runs in passes over the
+// model's layers, which no other prefill interrupts. Decode takes the ready
+// lanes of one priority, constraint mode and stage without waiting for more,
+// so it runs only the four real M8/M16/M24/M32 shapes, between a command's
+// passes too.
 class Scheduler final {
 public:
   // Decode time owed for each unit of time a prefill runs while requests of
@@ -131,7 +136,9 @@ public:
   void commit(const BatchPlan &plan, std::span<const uint64_t> excluded);
   // A prefill command of one lane that streamed its history from the SSD
   // cache waited streamMilliseconds of its hostMilliseconds on the reads
-  // (ModelBatchTicket); none for a command that streamed nothing.
+  // (ModelBatchTicket); none for a command that streamed nothing. A pass
+  // before a command's last consumes no rows (StepResult), and the
+  // command's estimate learns from its passes' time together.
   void complete(const BatchPlan &plan, std::span<const StepResult> results,
                 double wallMilliseconds, bool representativePrefillTiming,
                 double hostMilliseconds = 0.0,
@@ -172,6 +179,18 @@ private:
     // completed then.
     double decodeGapStart = 0.0;
     uint64_t decodeGapStreams = 0;
+    // Between the passes of its prefill command: the command's passes, its
+    // next pass and its rows, and the time its passes took so far, a sample
+    // of its rows unless one was not.
+    struct Passes final {
+      uint32_t passes = 0;
+      uint32_t next = 0;
+      uint32_t rows = 0;
+      double wallMilliseconds = 0.0;
+      double hostMilliseconds = 0.0;
+      bool representative = true;
+    };
+    std::optional<Passes> passes;
   };
 
   struct PrefillRequestView final {
@@ -200,6 +219,11 @@ private:
   // `contendedRows`, those of another contended command, which it takes
   // before its first streamed command.
   [[nodiscard]] uint32_t streamingRows(const Request &leader, uint32_t contendedRows) const;
+  // The passes a command of `rows` rows of the lane runs in: as many as keep
+  // each within the contended slice by the command estimate, up to its
+  // model's; one for a lane that streams its history, or before the first
+  // estimate.
+  [[nodiscard]] uint32_t passesFor(const Request &leader, uint32_t rows) const;
   // A lane's gap between decode commands starts when it begins to decode
   // and after each of its decode commands.
   void startDecodeGap(Request &request) noexcept;

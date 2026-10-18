@@ -142,7 +142,8 @@ void Engine::submit(EngineRequest value) {
        .constrained = stored.request.constraint == ConstraintMode::TokenMask,
        .prefillTokens = stored.promptTokens,
        .deadlineMilliseconds = stored.request.deadlineMilliseconds,
-       .prefillGroupRows = model_.prefillGroupRows(false)});
+       .prefillGroupRows = model_.prefillGroupRows(false),
+       .prefillPasses = model_.prefillPasses()});
   ++counters_.submitted;
 }
 
@@ -1525,6 +1526,24 @@ Engine::Prepared Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &i
     static_cast<void>(allocate([&] { return cache_.spillWritten(extents); }, false,
                                ReclaimClass::Ordinary, {}, true));
   }
+  // A command's later passes run its item again: the lane holds what it
+  // needs, and only its page table may have changed, as moves between
+  // commands rewrite it.
+  if (plan.pass) {
+    Request &active = request(plan.items.front().requestId);
+    if (!active.passCommand)
+      throw std::logic_error("a prefill command's pass has no command");
+    ModelBatchItem item = active.passCommand->item;
+    const PageTableView pageTable = cache_.cutPageTable(active.request.id);
+    item.pageTable = pageTable.pages;
+    item.pageTableRevision = pageTable.revision;
+    item.pageTableFirstChanged = pageTable.firstChanged;
+    item.pageSources = pageTable.sources;
+    items.push_back(std::move(item));
+    captures.assign(1, active.passCommand->captures);
+    active.resourceWait = {};
+    return Prepared::Runnable;
+  }
   std::vector<BatchItem> admitted;
   admitted.reserve(plan.items.size());
   struct Denied final {
@@ -1639,6 +1658,8 @@ Engine::Prepared Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &i
       }
       items.push_back(std::move(item));
     }
+    if (plan.passes > 1)
+      request(plan.items.front().requestId).passCommand = Request::PassCommand{items.front(), captures.front()};
     return Prepared::Runnable;
   }
 
@@ -2140,6 +2161,8 @@ void Engine::apply(const Pending &command, std::span<const ModelStepResult> resu
   if (results.size() != plan.items.size()) {
     throw std::logic_error("model result count changed");
   }
+  // A pass before the command's last commits nothing and proves nothing.
+  const bool beforeLastPass = plan.kind == WorkKind::Prefill && plan.pass + 1 < plan.passes;
   std::vector<StepResult> schedulerResults;
   schedulerResults.reserve(results.size());
   uint32_t inputTokens = 0;
@@ -2186,7 +2209,8 @@ void Engine::apply(const Pending &command, std::span<const ModelStepResult> resu
       if (!active.pendingEnd)
         active.pendingEnd = LaneEnd{LaneOutcome::ModelResultInvalid, std::move(invalid)};
     }
-    active.unprovenState.reset();
+    if (!beforeLastPass)
+      active.unprovenState.reset();
     if (active.pendingEnd) {
       // An in-flight Metal command cannot be revoked safely. Its provisional
       // writes remain invisible, but a cancelled, deadline-expired or
@@ -2200,6 +2224,10 @@ void Engine::apply(const Pending &command, std::span<const ModelStepResult> resu
     }
     if (result.outputTokensWithoutKv > result.outputTokens.size()) {
       throw std::logic_error("model reported more uncommitted tokens than output");
+    }
+    if (beforeLastPass) {
+      schedulerResults.push_back({active.request.id, 0, false, result.nextDecodeStage});
+      continue;
     }
     if (plan.kind == WorkKind::Prefill) {
       const uint32_t promptProcessed =
@@ -2312,6 +2340,8 @@ void Engine::apply(const Pending &command, std::span<const ModelStepResult> resu
                       ticket.prefillTimingIsRepresentative(), ticket.hostMilliseconds(),
                       command.streamed ? std::optional(ticket.streamMilliseconds())
                                        : std::nullopt);
+  if (plan.passes > 1 && plan.pass + 1 == plan.passes)
+    request(plan.items.front().requestId).passCommand.reset();
   events_.batchCompleted(plan.kind, plan.width(), inputTokens, outputTokens,
                          draftedTokens, acceptedDraftTokens, wallMilliseconds,
                          cycleMilliseconds);
@@ -2400,6 +2430,8 @@ void Engine::finishFailure(Request &active, LaneEnd end) {
 
 void Engine::vacateLane(Request &active, bool keepContinuation) {
   const uint64_t id = active.request.id;
+  // A command between its passes is left, with the states it would capture.
+  active.passCommand.reset();
   discardPendingStateBoundaries(active);
   if (keepContinuation)
     model_.suspend(id);

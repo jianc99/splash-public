@@ -505,6 +505,80 @@ void testImagePromptsRunPrefillGroups() {
   }
 }
 
+// Where the model runs a prefill command in passes over its layers, a long
+// prompt's commands run in passes, each its own command with the command's
+// rows: a decoding lane's steps run between them, its own page table goes
+// with each, and only the last commits the rows. A cancel between two
+// passes ends the request at once and leaves the rest of its command unrun.
+void testPrefillPassesInterleaveDecodeAndEndAtACancel() {
+  for (const bool cancel : {false, true}) {
+    test::TestKvStorage storage(512, 4096, 4);
+    KvPool pool(storage, 0);
+    engine::Cache cache(pool, nullptr, nullptr);
+    Executor model;
+    model.groupRows = 4 * model::ExecutionLimits::prefillTokenBudget;
+    model.passes = 6;
+    model.decodeFinishes = false;
+    // Each command in order: its kind, first lane, pass and passes.
+    struct Command final {
+      WorkKind kind;
+      uint64_t requestId;
+      uint32_t pass, passes, rows;
+    };
+    std::vector<Command> commands;
+    model.commandTimes = [&](const BatchPlan &plan, std::span<const ModelBatchItem>) {
+      commands.push_back({plan.kind, plan.items.front().requestId, plan.pass, plan.passes,
+                          plan.items.front().tokenCount});
+      return plan.kind == WorkKind::Decode ? test::CommandTimes{.wallMilliseconds = 100.0}
+                                           : test::CommandTimes{500.0, 300.0};
+    };
+    Events events;
+    engine::Engine engine(test::engineConfig({.decodeShare = 0.5}), cache, model, events);
+    guardReleases(storage, engine);
+    // A streamed target's chunk: 4.9 s, 3.4 s of it on expert reads.
+    engine.observePrefill(model::ExecutionLimits::prefillTokenBudget, 4900.0, 3400.0);
+    EngineRequest decoding = request(1, std::vector<uint32_t>(100, 3));
+    decoding.maxNewTokens = 10'000;
+    engine.submit(std::move(decoding));
+    double now = 1;
+    tickUntil(engine, now, [&] { return events.outputs.contains(1); }, "the short request did not decode");
+    // Five chunks: two groups of three chunks' rows, in six passes each.
+    engine.submit(request(2, std::vector<uint32_t>(8193, 7)));
+    const auto prefill = [](const Command &command) {
+      return command.kind == WorkKind::Prefill && command.requestId == 2;
+    };
+    const auto passes = [&] { return std::ranges::count_if(commands, prefill); };
+    if (cancel) {
+      tickUntil(engine, now, [&] { return passes() == 3 && !engine.commandInFlight(); },
+                "the long prompt did not run three passes");
+      engine.cancel(2);
+      require(engine.snapshot().cancelled == 1, "a cancel between passes did not end the request at once");
+      const size_t ran = commands.size();
+      for (uint32_t step = 0; step < 8; ++step) static_cast<void>(engine.tick(now++));
+      require(passes() == 3 && commands.size() > ran && !model.prefillChunks.contains(2),
+              "a cancelled command's passes ran on, or the decoding lane stopped");
+    } else {
+      tickUntil(engine, now, [&] { return events.outputs.contains(2); }, "the long prompt did not end");
+      require(model.prefillChunks.at(2) == 2 && model.prefillRows == 100 + 8193,
+              "a command in passes committed its rows other than once, with its last pass");
+    }
+    std::vector<Command> prefills;
+    for (size_t index = 0; index < commands.size(); ++index) {
+      const Command &command = commands[index];
+      if (!prefill(command)) continue;
+      prefills.push_back(command);
+      require(command.passes == 6 && command.rows == (prefills.size() <= 6 ? 6144u : 2049u) &&
+                  command.pass == (prefills.size() - 1) % 6,
+              "a long prompt's command did not run its rows in six passes in order");
+      require(!command.pass || (commands[index - 1].kind == WorkKind::Decode && commands[index - 1].requestId == 1),
+              "the decoding lane did not step between two passes");
+    }
+    engine.cancel(1);
+    if (!cancel) engine.cancel(2);
+    runUntilIdle(engine);
+  }
+}
+
 void testSharedPrefillHonorsPriorityAndLateArrival() {
   for (bool foreground : {false, true}) {
     test::TestKvStorage storage(512, 4096, 4);
@@ -10979,6 +11053,7 @@ int main() {
     testSharedPrefillFailedPublicationFallsBack();
     testSharedPrefillDoesNotBlockUnrelatedWork();
     testImagePromptsRunPrefillGroups();
+    testPrefillPassesInterleaveDecodeAndEndAtACancel();
     testSharedPrefillHonorsPriorityAndLateArrival();
     testLateSharedPrefillExtendsTheProducerPlan();
     testLateSiblingBoundaryNeedsAWholeDraftWindow();

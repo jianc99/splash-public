@@ -260,6 +260,118 @@ void testPrefillGroupsRunUncontended() {
   require(first(10'000, 8192, true) == 2048, "a prefill group ran beside a decoding peer");
 }
 
+// A lane of 100,000 rows whose commands may be prefill groups and run in up
+// to `passes` passes over its model's layers.
+RequestSpec passingLane(uint64_t id, uint32_t passes) {
+  RequestSpec spec = request(id, 100'000);
+  spec.prefillGroupRows = 4 * model::ExecutionLimits::prefillTokenBudget;
+  spec.prefillPasses = passes;
+  return spec;
+}
+
+// Completes a pass of a prefill command of one lane, which consumes its rows
+// if it is the last, and else none of them.
+void completePass(engine::Scheduler &scheduler, const BatchPlan &plan, double wallMilliseconds,
+                  double hostMilliseconds = 0.0) {
+  require(plan.kind == WorkKind::Prefill && plan.width() == 1, "expected a lane's pass alone");
+  scheduler.commit(plan, {});
+  const uint32_t consumed = plan.pass + 1 == plan.passes ? plan.items[0].tokenCount : 0;
+  const std::array result{StepResult{plan.items[0].requestId, consumed, false, DecodeStage::Regular}};
+  scheduler.complete(plan, result, wallMilliseconds, true, hostMilliseconds);
+}
+
+// Where its model runs a prefill command in passes over its layers, a lane
+// keeps its group whatever contends, and runs it alone in as many passes as
+// keep each within the contended slice by the command estimate, up to its
+// model's. Its later passes come before any other prefill, and before any
+// admission, with a decoding peer's commands between them; only the last
+// consumes the rows, and the estimate learns from the passes' time
+// together. A lane that streams its history runs its commands whole, and so
+// does one whose model has no passes or before any estimate.
+void testPrefillPassesBoundCommands() {
+  Scheduler scheduler(0.5);
+  // A streamed target's chunk: 4.9 s, 3.4 s of it on expert reads. A group of
+  // four chunks: 3.4 s + 4 x 1.5 s = 9.4 s, 19 passes of the slice.
+  scheduler.observePrefill(2048, 4900.0, 3400.0);
+  scheduler.submit(passingLane(1, 48));
+  scheduler.resourcesReady(1, 0);
+  scheduler.submit(request(2, 1));
+  scheduler.resourcesReady(2, 1);
+  scheduler.submit(request(3, 200'000));
+  scheduler.resourcesReady(3, 0);
+  scheduler.submit(request(4, 100));
+  completeDecode(scheduler);
+  BatchPlan plan = *scheduler.next({});
+  require(plan.kind == WorkKind::Prefill && plan.width() == 1 && plan.items[0].requestId == 1 &&
+              plan.items[0].tokenCount == 8192 && plan.pass == 0 && plan.passes == 19,
+          "a lane whose model runs passes did not run its group alone in passes within the slice");
+  for (uint32_t pass = 0; pass < plan.passes; ++pass) {
+    require(plan.items[0].requestId == 1 && plan.items[0].tokenCount == 8192 && plan.pass == pass &&
+                plan.passes == 19 && scheduler.promptProcessed(1) == 0,
+            "a command's next pass did not go on, or an earlier one consumed its rows");
+    require(!pass || scheduler.prefillAdmissionOrder(std::array{PrefillAdmission{4, 0}}).empty(),
+            "a start was admitted between a command's passes");
+    completePass(scheduler, plan, 500.0, 300.0);
+    // The decoding peer runs what each pass owes it, 250 ms.
+    completeDecode(scheduler, false, 250.0);
+    plan = *scheduler.next({});
+  }
+  require(scheduler.promptProcessed(1) == 8192 && scheduler.phase(1) == engine::Phase::Prefill &&
+              plan.items[0].requestId == 1 && plan.passes == 19 && plan.pass == 0,
+          "the last pass did not consume the command's rows, or the estimate learned from each pass alone");
+  require(scheduler.snapshot().prefillBatches == 1 && scheduler.snapshot().prefillRows == 8192,
+          "a command in passes counted more than once");
+  scheduler.setStreamsHistory(1, true);
+  plan = *scheduler.next({});
+  require(plan.items[0].requestId == 1 && plan.passes == 1, "a lane that streams its history ran passes");
+
+  for (const uint32_t passes : {1u, 48u}) {
+    Scheduler fresh(0.0);
+    if (passes == 1)
+      fresh.observePrefill(2048, 4900.0, 3400.0);
+    fresh.submit(passingLane(1, passes));
+    fresh.resourcesReady(1, 0);
+    require(fresh.next({})->passes == 1, passes == 1 ? "a model without passes ran passes"
+                                                     : "a command ran passes before any estimate");
+  }
+}
+
+// A command between its passes ends with its lane: suspended, the lane
+// replays its rows from its first pass; cancelled, another lane's prefill
+// runs next; and a pass that ends its request, as one cancelled while the
+// pass ran, leaves the rest.
+void testCommandBetweenPassesEndsWithItsLane() {
+  Scheduler scheduler(0.0);
+  scheduler.observePrefill(2048, 4900.0, 3400.0);
+  scheduler.submit(passingLane(1, 48));
+  scheduler.resourcesReady(1, 0);
+  scheduler.submit(request(2, 200'000));
+  scheduler.resourcesReady(2, 0);
+  BatchPlan plan = *scheduler.next({});
+  completePass(scheduler, plan, 500.0);
+  scheduler.suspendForResources(1);
+  scheduler.resumeFromResources(1, 0, 100'000);
+  plan = *scheduler.next({});
+  require(plan.items[0].requestId == 1 && plan.pass == 0 && plan.passes > 1,
+          "a lane suspended between its command's passes did not replay from the first");
+  completePass(scheduler, plan, 500.0);
+  scheduler.cancel(1);
+  plan = *scheduler.next({});
+  require(plan.items[0].requestId == 2 && plan.pass == 0 && plan.passes == 1,
+          "a cancelled command's passes went on");
+
+  Scheduler ending(0.0);
+  ending.observePrefill(2048, 4900.0, 3400.0);
+  ending.submit(passingLane(1, 48));
+  ending.resourcesReady(1, 0);
+  plan = *ending.next({});
+  ending.commit(plan, {});
+  const std::array ended{StepResult{1, 0, true, DecodeStage::Regular}};
+  ending.complete(plan, ended, 500.0, true);
+  require(ending.phase(1) == engine::Phase::Completed && !ending.next({}),
+          "a pass that ended its request left the rest of its command to run");
+}
+
 // Completes a prefill command of one lane that streamed its history, which
 // waited streamMilliseconds of its hostMilliseconds on the reads.
 void completeStreamedPrefill(engine::Scheduler &scheduler, const BatchPlan &plan,
@@ -1309,6 +1421,8 @@ int main() {
     testWarmupTimingSeedsFirstContendedCommand();
     testFixedPrefillCostSizesContendedSlice();
     testPrefillGroupsRunUncontended();
+    testPrefillPassesBoundCommands();
+    testCommandBetweenPassesEndsWithItsLane();
     testDeepPrefillKeepsANativeChunksAttention();
     testStreamingLaneRunsAlone();
     testContendedStreamingLaneHalvesFromItsGroup();

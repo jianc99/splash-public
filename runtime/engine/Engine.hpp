@@ -319,6 +319,7 @@ private:
     bool diskQuota = false;
   };
 
+  struct Capture;
   struct Request final {
     struct StateBoundary final {
       uint32_t tokens = 0;
@@ -415,6 +416,14 @@ private:
     // A restore that could not fit alone released its prefix pin:
     // admissions ignore the cache until one succeeds.
     bool skipCache = false;
+    // Between the passes of its prefill command (BatchPlan::passes): the
+    // command's item, with the states it captures, and its captures, which
+    // every pass runs and the last one commits.
+    struct PassCommand final {
+      ModelBatchItem item;
+      std::vector<Capture> captures;
+    };
+    std::optional<PassCommand> passCommand;
     // Admission that waits for its state's read, its KV pages' restores,
     // or both, before the lane runs.
     struct Restore {

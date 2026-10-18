@@ -475,6 +475,13 @@ public:
       heldCompletion = std::move(completion);
       ticket = std::make_unique<HeldTicket>(prefill(plan, items),
                                             holdPrefillUntil, 1.0);
+    } else if (plan.kind == WorkKind::Prefill && plan.pass + 1 < plan.passes) {
+      // A pass before a command's last commits nothing, as the production
+      // runtime's returns.
+      std::vector<ModelStepResult> results(items.size());
+      for (size_t lane = 0; lane < items.size(); ++lane) results[lane].requestId = items[lane].requestId;
+      const CommandTimes times = commandTimes ? commandTimes(plan, items) : CommandTimes{};
+      ticket = immediateTicket(std::move(results), completion, times);
     } else {
       const CommandTimes times = commandTimes ? commandTimes(plan, items) : CommandTimes{};
       ticket = immediateTicket(plan.kind == WorkKind::Prefill ? prefill(plan, items)
@@ -488,6 +495,7 @@ public:
   uint32_t prefillGroupRows(bool spills) const noexcept override {
     return spills || !groupsOnlySpilling ? groupRows : model::ExecutionLimits::prefillTokenBudget;
   }
+  uint32_t prefillPasses() const noexcept override { return passes; }
   uint64_t snapshotBytes() const noexcept override { return stateBytes; }
   // The production model takes a cached state's buffers from its pool, or
   // with one admission, for a resident lane's page-aligned boundary, and
@@ -751,6 +759,9 @@ public:
   // groupsOnlySpilling only for a lane whose K/V spills.
   uint32_t groupRows = model::ExecutionLimits::prefillTokenBudget;
   bool groupsOnlySpilling = false;
+  // The most passes over its layers a prefill command runs in
+  // (Model::prefillPasses).
+  uint32_t passes = 1;
   // The tokens a decode step emits.
   uint32_t decodeTokens = 1;
   // The masks the model took.

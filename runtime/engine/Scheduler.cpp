@@ -19,8 +19,12 @@ constexpr uint32_t kMaximumOvertakes =
 // kMinimumPrefillRows. A command with a fixed cost (a streamed target's
 // expert reads, which any chunk pays in full) gets twice that cost instead,
 // so its rows take at least as long as its fixed part and its peers wait
-// that long, seconds rather than this slice. A lane that streams its
-// history sizes its commands by its own reads instead (streamingRows).
+// that long, seconds rather than this slice; where its model runs a command
+// in passes over its layers (Model::prefillPasses), it keeps its rows
+// whatever the contention, and each pass aims for this slice, contended or
+// not, so that decode steps run between passes and a cancel waits for one
+// at most (passesFor). A lane that streams its history sizes its commands
+// by its own reads instead (streamingRows).
 constexpr double kContendedPrefillMilliseconds = 500.0;
 // The fewest rows a contended prefill command is cut to, and the fewest whose
 // time measures prefill throughput: below it a command's fixed costs dominate.
@@ -85,6 +89,8 @@ void Scheduler::suspendForResources(uint64_t id) {
   if (request.phase != Phase::Prefill && request.phase != Phase::Decode) {
     throw std::logic_error("only runnable resident work can be suspended");
   }
+  // A command between its passes is left: the lane replays its rows.
+  request.passes.reset();
   request.suspended = true;
   request.phase = Phase::WaitingResources;
   dropStaleDecodeDebt();
@@ -155,6 +161,7 @@ void Scheduler::setPrefillGroupRows(uint64_t id, uint32_t rows) {
 
 void Scheduler::cancel(uint64_t id) {
   Request &request = get(id);
+  request.passes.reset();
   if (!terminal(request.phase))
     request.phase = Phase::Cancelled;
   dropStaleDecodeDebt();
@@ -162,6 +169,7 @@ void Scheduler::cancel(uint64_t id) {
 
 void Scheduler::finish(uint64_t id) {
   Request &request = get(id);
+  request.passes.reset();
   if (!terminal(request.phase))
     request.phase = Phase::Completed;
   dropStaleDecodeDebt();
@@ -169,6 +177,7 @@ void Scheduler::finish(uint64_t id) {
 
 void Scheduler::fail(uint64_t id) {
   Request &request = get(id);
+  request.passes.reset();
   if (terminal(request.phase))
     return;
   request.phase = Phase::Failed;
@@ -201,6 +210,7 @@ bool Scheduler::expireDeadlines(double now) {
     if (!inFlight && !terminal(request.phase) &&
         request.spec.deadlineMilliseconds <= now) {
       request.phase = Phase::Failed;
+      request.passes.reset();
       changed = true;
     }
   }
@@ -242,12 +252,16 @@ std::vector<uint64_t> Scheduler::prefillAdmissionOrder(
   }
   std::vector<PrefillRequestView> ready;
   ready.reserve(requests_.size());
-  for (const auto &[_, request] : requests_)
+  std::vector<uint64_t> result;
+  for (const auto &[_, request] : requests_) {
+    // A command between its passes runs before any new prefill.
+    if (request.phase == Phase::Prefill && request.passes)
+      return result;
     if (request.phase == Phase::Prefill)
       ready.push_back({&request, request.promptProcessed});
+  }
   for (const auto &request : pending)
     ready.push_back(request);
-  std::vector<uint64_t> result;
   if (const auto plan = planPrefill(std::move(ready))) {
     // Admission ranks candidates against every decoder, left out of a plan
     // or not.
@@ -302,6 +316,20 @@ std::optional<BatchPlan> Scheduler::next(std::span<const uint64_t> excluded) con
 }
 
 std::optional<BatchPlan> Scheduler::nextPrefill(std::span<const uint64_t> excluded) const {
+  // A command between its passes goes on before any other prefill, whose
+  // rows would take the model's prefill memory its rows' work is in.
+  for (const auto &[id, request] : requests_) {
+    if (request.phase != Phase::Prefill || !request.passes)
+      continue;
+    if (listed(excluded, id))
+      return std::nullopt;
+    BatchPlan plan;
+    plan.kind = WorkKind::Prefill;
+    plan.items.push_back({id, request.passes->rows, request.promptProcessed});
+    plan.pass = request.passes->next;
+    plan.passes = request.passes->passes;
+    return plan;
+  }
   std::vector<PrefillRequestView> ready;
   for (const auto &[id, request] : requests_) {
     if (request.phase == Phase::Prefill && !listed(excluded, id))
@@ -367,6 +395,12 @@ Scheduler::planPrefill(std::vector<PrefillRequestView> ready) const {
     budget -= rows;
     if (leader.request->streamsHistory)
       break;
+    // A leader whose command runs in passes runs alone.
+    if (&view == &leader) {
+      plan.passes = passesFor(*leader.request, rows);
+      if (plan.passes > 1)
+        break;
+    }
   }
   return plan;
 }
@@ -374,6 +408,11 @@ Scheduler::planPrefill(std::vector<PrefillRequestView> ready) const {
 uint32_t Scheduler::prefillBudget(
     const PrefillRequestView &leader,
     std::span<const PrefillRequestView> ready) const {
+  const uint32_t leaderRemaining =
+      leader.request->spec.prefillTokens - leader.promptProcessed;
+  // Passes bound a command's time, which fewer rows would not shorten.
+  if (leader.request->spec.prefillPasses > 1 && !leader.request->streamsHistory)
+    return uncontendedRows(leaderRemaining, leader.request->spec.prefillGroupRows);
   const uint32_t maximum = model::ExecutionLimits::prefillTokenBudget;
   if (prefillMillisecondsPerToken_ <= 0.0 && prefillFixedMilliseconds_ <= 0.0)
     return maximum;
@@ -382,8 +421,6 @@ uint32_t Scheduler::prefillBudget(
   while (rows > kMinimumPrefillRows &&
          prefillFixedMilliseconds_ + rows * prefillMillisecondsPerToken_ > slice)
     rows /= 2;
-  const uint32_t leaderRemaining =
-      leader.request->spec.prefillTokens - leader.promptProcessed;
   const bool leaderFinishing = leaderRemaining <= rows;
   const bool streams = leader.request->streamsHistory;
   const bool contended = std::any_of(
@@ -411,6 +448,14 @@ uint32_t Scheduler::prefillBudget(
   // command only when no lane finishes; one that runs prefill groups takes
   // a group alone.
   return uncontendedRows(leaderRemaining, leader.request->spec.prefillGroupRows);
+}
+
+uint32_t Scheduler::passesFor(const Request &leader, uint32_t rows) const {
+  if (leader.spec.prefillPasses <= 1 || leader.streamsHistory)
+    return 1;
+  const double estimate = prefillFixedMilliseconds_ + rows * prefillMillisecondsPerToken_;
+  return static_cast<uint32_t>(std::clamp(std::ceil(estimate / kContendedPrefillMilliseconds), 1.0,
+                                          static_cast<double>(leader.spec.prefillPasses)));
 }
 
 uint32_t Scheduler::streamingRows(const Request &leader, uint32_t contendedRows) const {
@@ -474,10 +519,21 @@ void Scheduler::commit(const BatchPlan &plan, std::span<const uint64_t> excluded
       throw std::logic_error("batch no longer matches scheduler state");
     }
   }
+  if (plan.passes > 1) {
+    Request &lane = get(plan.items.front().requestId);
+    if (plan.width() != 1 || plan.kind != WorkKind::Prefill || plan.pass >= plan.passes ||
+        (lane.passes ? plan.pass != lane.passes->next || plan.passes != lane.passes->passes ||
+                           plan.items.front().tokenCount != lane.passes->rows
+                     : plan.pass != 0))
+      throw std::logic_error("batch no longer matches scheduler state");
+    if (!lane.passes)
+      lane.passes = Request::Passes{.passes = plan.passes, .rows = plan.items.front().tokenCount};
+  }
   excluded_.assign(excluded.begin(), excluded.end());
   active_ = plan;
   lastCommittedKind_ = plan.kind;
-  if (plan.kind == WorkKind::Prefill) {
+  // A command counts, and passes others over, once: with its first pass.
+  if (plan.kind == WorkKind::Prefill && !plan.pass) {
     ++counters_.prefillBatches;
     for (const BatchItem &item : plan.items)
       counters_.prefillRows += item.tokenCount;
@@ -497,7 +553,7 @@ void Scheduler::commit(const BatchPlan &plan, std::span<const uint64_t> excluded
       else if (request.order < youngestServed)
         ++request.overtaken;
     }
-  } else {
+  } else if (plan.kind == WorkKind::Decode) {
     const uint64_t dispatchOrder = ++decodeDispatchOrder_;
     for (const BatchItem &item : plan.items)
       get(item.requestId).lastDecodeDispatch = dispatchOrder;
@@ -542,7 +598,18 @@ void Scheduler::complete(const BatchPlan &plan,
       throw std::logic_error("completion request order changed");
     }
     Request &request = get(item.requestId);
-    if (plan.kind == WorkKind::Prefill) {
+    if (plan.kind == WorkKind::Prefill && plan.pass + 1 < plan.passes) {
+      // A pass before the last consumes nothing; a request it ends leaves
+      // the rest.
+      if (result.finished) {
+        request.phase = Phase::Completed;
+        request.passes.reset();
+      } else if (result.consumedPromptTokens || !request.passes) {
+        throw std::logic_error("prefill completion row count changed");
+      } else {
+        ++request.passes->next;
+      }
+    } else if (plan.kind == WorkKind::Prefill) {
       if (result.consumedPromptTokens != item.tokenCount ||
           item.promptOffset != request.promptProcessed) {
         throw std::logic_error("prefill completion row count changed");
@@ -573,13 +640,28 @@ void Scheduler::complete(const BatchPlan &plan,
     }
   }
   // A streaming command trains the command estimate as if it had not waited
-  // on its history's reads, and its lane's own estimate with that wait.
-  if (representativePrefillTiming && plan.kind == WorkKind::Prefill) {
+  // on its history's reads, and its lane's own estimate with that wait. A
+  // command in passes trains it once, with its passes' time together.
+  double commandWall = wallMilliseconds, commandHost = hostMilliseconds;
+  bool representative = representativePrefillTiming;
+  if (plan.kind == WorkKind::Prefill && plan.passes > 1) {
+    Request &lane = get(plan.items.front().requestId);
+    if (lane.passes) {
+      commandWall = lane.passes->wallMilliseconds += wallMilliseconds;
+      commandHost = lane.passes->hostMilliseconds += hostMilliseconds;
+      representative = lane.passes->representative = lane.passes->representative && representativePrefillTiming;
+    }
+    if (plan.pass + 1 < plan.passes)
+      representative = false;
+    else
+      lane.passes.reset();
+  }
+  if (representative && plan.kind == WorkKind::Prefill) {
     uint32_t rows = 0;
     for (const BatchItem &item : plan.items)
       rows += item.tokenCount;
     const double waited = stream.value_or(0.0);
-    observePrefill(rows, wallMilliseconds - waited, hostMilliseconds - waited);
+    observePrefill(rows, commandWall - waited, commandHost - waited);
   }
   if (stream)
     streaming->streamMilliseconds =
