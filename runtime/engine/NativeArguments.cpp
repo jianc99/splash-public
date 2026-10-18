@@ -78,16 +78,16 @@ double parseDecodeShare(std::string_view value) {
   return result;
 }
 
-// BYTES|auto, or with `off` BYTES|auto|off, as the server writes a store's
-// memory (--expert-memory, --ple-memory, --sparse-kv-memory).
-StreamedSetting parseStreamedSetting(std::string_view option, std::string_view value, bool off) {
+// BYTES|auto|off, as the server writes the memory of a store of streamed
+// weights (--expert-memory, --ple-memory).
+StreamedSetting parseStreamedSetting(std::string_view option, std::string_view value) {
   if (value == "auto")
     return {};
-  if (off && value == "off")
+  if (value == "off")
     return {StreamedSetting::Mode::Off, 0};
   StreamedSetting result{StreamedSetting::Mode::Size, 0};
   if (!parsePositive(value, result.bytes))
-    throw UsageError(std::string(option) + " requires a positive byte count" + (off ? ", auto or off" : " or auto"));
+    throw UsageError(std::string(option) + " requires a positive byte count, auto or off");
   return result;
 }
 
@@ -157,11 +157,14 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
         throw UsageError("--idle-sleep requires prevent or allow");
       result.preventIdleSleep = value == "prevent";
     } else if (option == "--ple-memory") {
-      result.pleMemory = parseStreamedSetting(option, value, true);
+      result.pleMemory = parseStreamedSetting(option, value);
     } else if (option == "--expert-memory") {
-      result.expertMemory = parseStreamedSetting(option, value, true);
+      result.expertMemory = parseStreamedSetting(option, value);
     } else if (option == "--sparse-kv-memory") {
-      result.sparseKvMemory = parseStreamedSetting(option, value, false);
+      uint64_t bytes = 0;
+      if (value != "auto" && !parsePositive(value, bytes))
+        throw UsageError("--sparse-kv-memory requires a positive byte count or auto");
+      result.sparseKvMemory = bytes ? std::optional<uint64_t>(bytes) : std::nullopt;
     } else if (option == "--kv-spill") {
       if (value != "always")
         throw UsageError("--kv-spill requires always");

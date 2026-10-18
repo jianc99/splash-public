@@ -168,23 +168,29 @@ StreamedMemoryResult planParts(const StreamedMemoryInputs &in, const Part &exper
   uint64_t floors = *minimum;
   StreamedMemoryPlan plan{.spill = planSpill(in, floors)};
   KvSpillPlan &spill = plan.spill;
-  // An explicit hot cache target takes its part above the floor first.
-  uint64_t hotAbove = 0;
-  if (spill.enabled && in.hotCache.mode == StreamedSetting::Mode::Size) {
-    if (in.hotCache.bytes < spill.hotFloorBytes)
-      return {std::nullopt, "--sparse-kv-memory of " + std::to_string(in.hotCache.bytes / kMiB) +
-                                " MiB is less than the hot block cache's floor, " +
-                                std::to_string(spill.hotFloorBytes / kMiB) + " MiB"};
-    spill.hotTargetBytes = in.hotCache.bytes;
-    spill.hotLimitBytes = std::max(spill.hotLimitBytes, in.hotCache.bytes);
-    hotAbove = in.hotCache.bytes - spill.hotFloorBytes;
-  }
-  if (!checkedAdd(floors, spill.floorBytes, floors) || !checkedAdd(floors, hotAbove, floors)) return overflow();
+  if (!checkedAdd(floors, spill.floorBytes, floors)) return overflow();
   if (floors > in.hardBudgetBytes)
     return {std::nullopt,
             "the floors of the memory plan require " + std::to_string(floors) +
                 " bytes but the Metal memory budget is " + std::to_string(in.hardBudgetBytes) + " bytes",
             floors};
+  // An explicit hot cache target takes its part above the floor first, of
+  // what the floors leave.
+  if (spill.enabled && in.hotCacheBytes) {
+    const uint64_t target = *in.hotCacheBytes;
+    if (target < spill.hotFloorBytes)
+      return {std::nullopt, "--sparse-kv-memory of " + std::to_string(target / kMiB) +
+                                " MiB is less than the hot block cache's floor, " +
+                                std::to_string(spill.hotFloorBytes / kMiB) + " MiB"};
+    if (target - spill.hotFloorBytes > in.hardBudgetBytes - floors)
+      return {std::nullopt, "--sparse-kv-memory of " + std::to_string(target / kMiB) +
+                                " MiB is more than the hot block cache's floor, " +
+                                std::to_string(spill.hotFloorBytes / kMiB) + " MiB, and the " +
+                                std::to_string((in.hardBudgetBytes - floors) / kMiB) + " MiB the floors leave"};
+    spill.hotTargetBytes = target;
+    spill.hotLimitBytes = std::max(spill.hotLimitBytes, target);
+    floors += target - spill.hotFloorBytes;
+  }
 
   // Then the priorities, out of what the floors leave: the experts first,
   // then the table. The KV allowance a part leaves holds the context kept
@@ -354,7 +360,7 @@ std::string_view ContextBounds::bound() const noexcept {
 
 StreamedMemoryResult planStreamedMemory(const StreamedMemoryInputs &in) {
   if (!in.kvLayout.valid() || !in.windowTokens || in.requestedContextTokens > in.windowTokens ||
-      (in.sparseKv && !in.sparseKv->laneSlots()) || in.hotCache.mode == StreamedSetting::Mode::Off)
+      (in.sparseKv && !in.sparseKv->laneSlots()))
     return {std::nullopt, "invalid memory planner inputs"};
   std::string error;
   const std::optional<Part> experts = resolve(in.experts, "--expert-memory", error);

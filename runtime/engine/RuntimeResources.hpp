@@ -149,8 +149,8 @@ struct RuntimeResourcesConfig {
   // loads them.
   StreamedSetting expertMemory;
   // --sparse-kv-memory: the target of a spill-capable target's hot block
-  // cache, at least its floor, which auto keeps.
-  StreamedSetting sparseKvMemory;
+  // cache, at least its floor; none (auto) keeps its floor.
+  std::optional<uint64_t> sparseKvMemory;
   // --kv-spill always: every request of a spill-capable target spills, for
   // validation (EngineSpillConfig::always).
   bool kvSpillAlways = false;
