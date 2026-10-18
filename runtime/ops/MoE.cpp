@@ -176,7 +176,7 @@ MoeGroupParams groupParams(const MoePlan &plan) {
   const bool oneGateUp = oneGateUpPass(plan);
   return {plan.rows(), shape.expertsPerToken, plan.tileRows(), shape.experts,
           shape.expertIntermediateSize / (oneGateUp ? GGUF_STAGED_COLUMNS : GGUF_TILE_COLUMNS),
-          shape.hiddenSize / GGUF_TILE_COLUMNS};
+          shape.hiddenSize / GGUF_TILE_COLUMNS, SPLASH_TARGET_VERIFY_ROWS};
 }
 
 } // namespace
@@ -211,10 +211,18 @@ void MoE::addRouting(metal::CommandGraph &graph, const MoeBuffers &buffers,
   // decode step of one lane launched 65 tiles' threadgroups for a median of
   // 30 live ones; the rest return at once yet cost a 40-core M5 Max 0.8-4.1%
   // of a decode cycle, a 12-core M6 0.1-1.0% and a 40-core M3 Max up to 4.8%.
-  graph.add(routingKernel("moe_group_routes", shape),
-            {scratch.selectedExperts, scratch.tileDescriptors,
-             scratch.tileCount, scratch.groupedRoutes, scratch.routeRows},
-            groupParams(plan), {1, 1, 1}, {shape.routerWidth(), 1, 1});
+  std::vector<metal::MetalBuffer> grouping{scratch.selectedExperts, scratch.tileDescriptors, scratch.tileCount,
+                                           scratch.groupedRoutes, scratch.routeRows};
+  if (buffers.verifyRows) {
+    // A verify step's rows are its lanes' blocks.
+    if (plan.phase() != MoePhase::Decode)
+      throw std::invalid_argument("only a verify step's MoE routes its verify rows");
+    requireBytes(buffers.verifyRows, uint64_t{rows / SPLASH_TARGET_VERIFY_ROWS} * sizeof(uint32_t),
+                 "MoE verify rows");
+    grouping.push_back(buffers.verifyRows);
+  }
+  graph.add(routingKernel(buffers.verifyRows ? "moe_group_routes_verified" : "moe_group_routes", shape),
+            std::move(grouping), groupParams(plan), {1, 1, 1}, {shape.routerWidth(), 1, 1});
 }
 
 void MoE::addRouted(metal::CommandGraph &graph, const MoeBuffers &buffers,

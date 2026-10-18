@@ -247,9 +247,11 @@ struct ExpertStore::Impl {
 
   // Round `round` of the `rounds` of block `block`'s load (addLoad) of `rows`
   // rows in the tiles of `parts`; `predicted` when the step predicted the
-  // next block's routes (predictionRoutes and predictionWeights).
+  // next block's routes (predictionRoutes and predictionWeights), from the
+  // rows `verifyRows` names when the step routes its verify rows alone
+  // (ops::MoeBuffers::verifyRows).
   void load(uint32_t block, ops::MoePhase phase, uint32_t rows, bool predicted, std::span<const PartTiles> parts,
-            uint32_t round, uint32_t rounds);
+            uint32_t round, uint32_t rounds, const metal::MetalBuffer &verifyRows);
   void route(uint32_t block, std::span<const std::span<const MoeTileDescriptor>> parts, ops::MoePhase phase,
              uint32_t rows, ExpertStoreStats::Use &use);
   // Whether a load of `rows` rows of `phase` is a long prefill chunk's,
@@ -281,7 +283,7 @@ struct ExpertStore::Impl {
   }
   void readPiece(const Group &group, const Piece &piece) const;
   void stage(uint32_t block, uint32_t capacity, ExpertStoreStats::Use &use);
-  std::span<const uint32_t> predictedExperts(uint32_t rows);
+  std::span<const uint32_t> predictedExperts(uint32_t rows, const metal::MetalBuffer &verifyRows);
   void planAhead(uint32_t block, std::span<const uint32_t> experts, ExpertStoreStats::Use &use);
   void startAhead();
   // The host step after a long chunk's load: block `block`'s experts that
@@ -559,13 +561,17 @@ void ExpertStore::Impl::stage(uint32_t index, uint32_t capacity, ExpertStoreStat
 }
 
 // The next block's experts a decode step's prediction names for its `rows`
-// rows, by their summed routing weights, the largest first.
-std::span<const uint32_t> ExpertStore::Impl::predictedExperts(uint32_t rows) {
+// rows, or those of them below their lanes' verify rows when the step routes
+// them alone, by their summed routing weights, the largest first.
+std::span<const uint32_t> ExpertStore::Impl::predictedExperts(uint32_t rows, const metal::MetalBuffer &verifyRows) {
   const auto *selected = static_cast<const uint32_t *>(predictionRoutes.contents());
   const auto *weights = static_cast<const float *>(predictionWeights.contents());
+  // The selector wrote them before the step's GPU work ran up to this load.
+  const auto *verified = static_cast<const uint32_t *>(verifyRows.contents());
   const uint32_t routes = shape.routesPerToken();
   predictionOrder.clear();
-  for (uint64_t row = 0; row < rows; ++row)
+  for (uint64_t row = 0; row < rows; ++row) {
+    if (verified && row % SPLASH_TARGET_VERIFY_ROWS >= verified[row / SPLASH_TARGET_VERIFY_ROWS]) continue;
     for (uint32_t route = 0; route < shape.expertsPerToken; ++route) {
       const uint64_t at = row * routes + route;
       const uint32_t expert = selected[at];
@@ -577,6 +583,7 @@ std::span<const uint32_t> ExpertStore::Impl::predictedExperts(uint32_t rows) {
       }
       sum += weights[at];
     }
+  }
   std::ranges::stable_sort(predictionOrder, std::ranges::greater{},
                            [&](uint32_t expert) { return predictionSum[expert]; });
   for (const uint32_t expert : predictionOrder) predictionSum[expert] = -1;
@@ -737,7 +744,8 @@ void ExpertStore::Impl::publish() {
 }
 
 void ExpertStore::Impl::load(uint32_t index, ops::MoePhase phase, uint32_t rows, bool predicted,
-                             std::span<const PartTiles> parts, uint32_t round, uint32_t rounds) {
+                             std::span<const PartTiles> parts, uint32_t round, uint32_t rounds,
+                             const metal::MetalBuffer &verifyRows) {
   std::lock_guard lock(mutex);
   // No job runs until the round's are staged; the last round's ran.
   static_cast<uint32_t *>(grid.contents())[1] = 0;
@@ -786,7 +794,7 @@ void ExpertStore::Impl::load(uint32_t index, ops::MoePhase phase, uint32_t rows,
     // last repack (readBlockAhead).
     if (predicted) {
       std::vector<uint32_t> experts;
-      for (const uint32_t expert : predictedExperts(rows))
+      for (const uint32_t expert : predictedExperts(rows, verifyRows))
         if (blocks[index + 1].slot[expert] == kNoSlot) experts.push_back(expert);
       planAhead(index + 1, experts, use);
     }
@@ -1018,10 +1026,11 @@ void ExpertStore::addLoad(metal::CommandGraph &graph, std::span<const ops::MoeLo
   };
   // Each step's read-ahead starts once the GPU went on (startAhead).
   const auto startAhead = [impl = impl_] { impl->startAhead(); };
+  const metal::MetalBuffer verifyRows = predicted ? parts.front().buffers->verifyRows : metal::MetalBuffer{};
   for (uint32_t round = 0; round < rounds; ++round) {
     graph.host(
-        [impl = impl_, block, phase, rows, predicted, tiles, round, rounds] {
-          impl->load(block, phase, rows, predicted, tiles, round, rounds);
+        [impl = impl_, block, phase, rows, predicted, tiles, round, rounds, verifyRows] {
+          impl->load(block, phase, rows, predicted, tiles, round, rounds, verifyRows);
         },
         timed, gpu, startAhead);
     ops::MoE::addExpertLoad(graph, impl.staging, size.arena, impl.jobs, impl.sources, size.load,

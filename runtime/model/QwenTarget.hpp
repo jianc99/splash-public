@@ -325,6 +325,9 @@ struct QwenTargetVerifyBuffers final {
   // (ops::BlockIndex::tables).
   std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth> indexTables;
   ops::MoeScratch moe;
+  // Each lane's verify rows (ops::DraftSelector::addVerifyRows), which a MoE target's
+  // steps route alone (ops::MoeBuffers::verifyRows).
+  metal::MetalBuffer verifyRows;
   // Each lane's auxiliary state before the step; the commit writes the one
   // after it (addStateCommit).
   std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth> auxiliary;
