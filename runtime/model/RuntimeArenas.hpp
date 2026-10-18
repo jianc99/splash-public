@@ -33,11 +33,12 @@ inline constexpr uint32_t kDraftProposalTokens = ExecutionLimits::draftProposalT
 inline constexpr uint32_t kPrefillRows = ExecutionLimits::prefillTokenBudget;
 // A prefill group (QwenTarget::addPrefill): a command of up to this many
 // chunks of kPrefillRows rows, run layer by layer, so that a target whose
-// experts stream reads each layer's once for all of them. A group holds the
-// tensors its chunks carry from layer to layer once per chunk
-// (prefillGroupTensor), and requests that arrive while it runs wait for the
-// whole command: four chunks read a layer's experts once per 8192 rows and
-// keep both bounded.
+// experts stream reads each layer's once for all of them, and one whose K/V
+// spills reads each attention layer's spilled history once
+// (model::SpilledKvReads). A group holds the tensors its chunks carry from
+// layer to layer once per chunk (prefillGroupTensor), and requests that
+// arrive while it runs wait for the whole command: four chunks read a layer
+// once per 8192 rows and keep both bounded.
 inline constexpr uint32_t kPrefillGroupChunks = 4;
 inline constexpr uint32_t kTileRows = kv::kPageTokens;
 inline constexpr uint32_t kRaggedAttentionRows =
@@ -49,15 +50,22 @@ inline constexpr uint32_t kMaximumPageTableEntries =
 struct RuntimeGeometry final {
   QwenTargetGeometry target;
   DFlashDraftLayout draft;
+  // The attention of a target whose K/V spills (ModelCapabilities::sparseKv),
+  // whose runtime reads it through the hot block cache and the history
+  // stream (RuntimeContext); none for K/V that stays in memory.
+  std::optional<SparseKvShape> spilledKv;
   // The chunks of a prefill command: a group's for a target whose experts
-  // stream, otherwise one.
+  // stream or whose K/V spills, otherwise one.
   uint32_t prefillChunks = 1;
   // The step scratch the target keeps itself beside the arenas.
   QwenTargetScratchBytes targetScratch{};
 
+  // `kvSpills`: the runtime reads spilled K/V, which only a block-sparse
+  // target with a spillable layout does (kv::Layout::spillable).
   [[nodiscard]] static RuntimeGeometry from(const LoadedModel &model,
                                             kv::Format kvFormat,
-                                            ops::GdnStateFormat stateFormat) {
+                                            ops::GdnStateFormat stateFormat,
+                                            bool kvSpills = false) {
     RuntimeGeometry result;
     result.draft = model.draft.layout;
     result.target = std::visit(
@@ -66,8 +74,10 @@ struct RuntimeGeometry final {
     result.target.kvLayout = model.targetKvLayout(kvFormat);
     result.target.stateLayout = model.stateLayout(stateFormat).target;
     result.target.ropeScaling = model.descriptor.ropeScaling;
-    if (model.expertStore()) result.prefillChunks = kPrefillGroupChunks;
+    if (kvSpills) result.spilledKv = model.descriptor.capabilities.sparseKv;
+    if (model.expertStore() || kvSpills) result.prefillChunks = kPrefillGroupChunks;
     if (!result.target.valid() || !result.draft.stateLayout().valid() ||
+        (kvSpills && (!result.spilledKv || !result.target.kvLayout.spillable())) ||
         result.target.contextTokens() != model.descriptor.capabilities.maximumContextTokens ||
         result.target.hiddenSize != result.draft.hiddenSize ||
         result.target.vocabularySize != result.draft.vocabularySize ||
@@ -341,6 +351,10 @@ enum class DecodeTensor : uint32_t {
   // the entries of the pages' index (kv::PageStorage::writeIndexEntries),
   // which a block-sparse attention selects through (ops::BlockIndex).
   IndexTable,
+  // For a target whose K/V spills: where each entry of a verify's block
+  // lists reads its block (ops::AttentionBlocks::locations), a lane's list
+  // in its row of the batch.
+  Locations,
   // Indexed by state lane, like PageTable: a penalized request's penalty
   // words (ops::Sampling::rebuildPenaltyWords).
   PenaltyState,

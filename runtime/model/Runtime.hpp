@@ -54,6 +54,9 @@ public:
   [[nodiscard]] bool canSnapshotToDisk(bool inUse) const noexcept override;
   [[nodiscard]] std::unique_ptr<StateOffload>
   snapshotToDisk(uint64_t requestId, std::function<void()> completion) override;
+  [[nodiscard]] ModelMemoryAdmission reserveSpilledReads(uint64_t requestId) override;
+  [[nodiscard]] ModelMemoryAdmission reserveHistoryStaging(uint64_t requestId, uint32_t pages) override;
+  [[nodiscard]] ModelMemoryAdmission growSpilledReads() override;
   [[nodiscard]] uint64_t reclaimIdleState(bool keepLane,
                                           IdleMemory scope) noexcept override;
   [[nodiscard]] std::optional<std::string>
