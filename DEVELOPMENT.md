@@ -2264,8 +2264,11 @@ one lane 3.3-3.6% faster on a 12-core M6). Split plans take more time on it, as 
 4.5 bits on the M6. Prefill runs the staged kernels on both families: the 128-row prefill tile
 (`LinearTile::GgufPrefill`), and the staged tile for chunks of up to 32 rows. Every projection
 splits its K across threadgroups by one rule (`decodeSplits`: each tile's tiers of threadgroups
-per core and inputs per partition, from measured occupancy, Apple9's staged tile taking the
-register tile's) that does not depend on the batch width. The MoE experts
+per core, inputs per partition and partitions, from measured occupancy, Apple9's staged tile taking
+the register tile's of eight partitions) that does not depend on the batch width. Partitions stop
+at eight, but the register tile splits a grid that eight leave below three threadgroups per core
+into sixteen while partitions keep 512 inputs (Qwen3.8-Flash-Next's hyper-connection down
+projection, 320 columns over 10240 inputs; measured on Apple10). The MoE experts
 (`runtime/ops/MoE.cpp`) run the same numerics per family over the grouped rows: the register
 form in `linear_gguf_sgmatrix.metal`, the staged one in `kernels/shared/moe_gguf.metal`, which
 Apple9 takes for experts mostly in the formats it stages (`MoeShape::expertFormat`) and for

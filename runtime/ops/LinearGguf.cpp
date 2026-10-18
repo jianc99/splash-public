@@ -33,24 +33,23 @@ std::string prefillKernel(const char *format, char epilogue) {
 }
 
 // K splits of a decode tile, one rule for both tiles. A tier asks for more
-// partitions while the grid holds fewer than `threadgroups` threadgroups per
-// core and each partition would still keep `inputs` inputs; the split count
-// doubles, up to the maximum and in whole 32-input groups per partition, while
-// some tier asks. The rule ignores the batch width: bounds that depended on it
-// did not pay on either family.
+// partitions, up to its `splits`, while the grid holds fewer than
+// `threadgroups` threadgroups per core and each partition would still keep
+// `inputs` inputs; the split count doubles, in whole 32-input groups per
+// partition, while some tier asks. The rule ignores the batch width: bounds
+// that depended on it did not pay on either family.
 struct SplitTier {
   uint32_t threadgroups;
   uint32_t inputs;
+  uint32_t splits = 8;
 };
 uint32_t decodeSplits(uint32_t n, uint32_t k, uint32_t cores, std::span<const SplitTier> tiers) {
   const uint64_t grid = n / GGUF_TILE_COLUMNS;
   uint32_t splits = 1;
   const auto asks = [&](const SplitTier &t) {
-    return grid * splits < uint64_t{t.threadgroups} * cores && k / (2 * splits) >= t.inputs;
+    return splits < t.splits && grid * splits < uint64_t{t.threadgroups} * cores && k / (2 * splits) >= t.inputs;
   };
-  while (splits < LinearConfig::kMaximumSplits && (k / 32) % (2 * splits) == 0 &&
-         std::any_of(tiers.begin(), tiers.end(), asks))
-    splits *= 2;
+  while ((k / 32) % (2 * splits) == 0 && std::any_of(tiers.begin(), tiers.end(), asks)) splits *= 2;
   return splits;
 }
 
@@ -59,8 +58,18 @@ uint32_t decodeSplits(uint32_t n, uint32_t k, uint32_t cores, std::span<const Sp
 // Below one wave a core must fill it, down to 256 inputs per partition, whole
 // coefficient units in every format (quant_register_unit); below eight waves
 // more threadgroups shrink the last wave's tail while partitions of 1024
-// inputs amortize the partial sums.
-constexpr SplitTier kRegisterTiers[] = {{4, 256}, {32, 1024}};
+// inputs amortize the partial sums. Both stop at eight partitions. A grid
+// that eight leave below three threadgroups per core takes sixteen while
+// partitions keep 512 inputs, a tier measured on Apple10 alone (Apple9 takes
+// it unmeasured): Qwen3.8-Flash-Next's hyper-connection down projection,
+// Q8_0 320 x 10240 on five column tiles, then takes 11-17% less time at one
+// to four lanes on the 20-core M5 Pro and 6-20% less on the 32-core M5 Max,
+// and 32 partitions more than 16 on both. On the M5 Max, sixteen take 4%
+// less to 10% more 512 columns wide (two threadgroups per core at eight), up
+// to 18% more 832 wide (3.25), 4-15% more on the same 320 x 10240 in BF16,
+// twice Q8_0's bytes (Flash-Next loads such tensors as Q8_0), and 22-38% more
+// on Q4_K 512 x 5120, whose partitions would keep 320 inputs.
+constexpr SplitTier kRegisterTiers[] = {{4, 256}, {32, 1024}, {3, 512, 16}};
 
 // Staged tile (64 threads): one fitted tier, six threadgroups per core with
 // 512 inputs per partition. Six is not a residency (12-17 of these
@@ -73,13 +82,16 @@ constexpr SplitTier kRegisterTiers[] = {{4, 256}, {32, 1024}};
 constexpr SplitTier kStagedTiers[] = {{6, 512}};
 
 // The staged tile's tiers on a family. Apple9 cores take as many of its
-// threadgroups as of the register tile's, and its tiers: on a 40-core M3 Max
-// over the 27B and 35B dense shapes at one to four lanes they come within
-// 0-9% of each shape's fastest split (20% at one lane on 2048 x 512, a
-// 0.012 ms projection), where the fitted tier above is 13-27% slower on
-// 17408 x 5120 and 12288 x 5120 and 50% on 2048 x 512.
+// threadgroups as of the register tile's, and its tiers of eight partitions
+// (the first two): on a 40-core M3 Max over the 27B and 35B dense shapes at
+// one to four lanes they come within 0-9% of each shape's fastest split (20%
+// at one lane on 2048 x 512, a 0.012 ms projection), where the fitted tier
+// above is 13-27% slower on 17408 x 5120 and 12288 x 5120 and 50% on
+// 2048 x 512. Not sixteen: on the hyper-connection down projection Apple10's
+// staged tile takes 1-7% less time at sixteen than at eight at one lane but
+// 15-34% more at two to four, on the M5 Pro and the M5 Max.
 std::span<const SplitTier> stagedTiers(GpuFamilyClass family) noexcept {
-  if (family == GpuFamilyClass::Apple9) return kRegisterTiers;
+  if (family == GpuFamilyClass::Apple9) return std::span(kRegisterTiers).first(2);
   return kStagedTiers;
 }
 
