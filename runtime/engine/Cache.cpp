@@ -922,6 +922,11 @@ bool Cache::commit(Request &active, uint32_t pages) {
   return true;
 }
 
+void Cache::recommit(Request &active) {
+  if (!commit(active, 1))
+    ++spilled_.revokedCommitments;
+}
+
 void Cache::returnCommitment(Request &active, uint32_t pages) noexcept {
   pages = std::min(pages, active.committedPages);
   if (!pages)
@@ -981,8 +986,14 @@ bool Cache::writeThrough(Request &active, uint32_t &started) {
     if (draw == Draw::Commitment)
       --active.committedPages;
     auto transfer = tier_->demote(kv_.page(block), slot, WriteClass::Spill, completionNotifier_);
-    if (!transfer)
+    if (!transfer) {
+      // A file that stopped taking writes took none: the slot goes back,
+      // and the commitment it drew is the request's again.
+      slot.reset();
+      if (draw == Draw::Commitment)
+        recommit(active);
       return false;
+    }
     labelKv(block, slot);
     kv_.setSlot(block, std::move(slot));
     kv_.setTransfer(block, KvCache::Transfer::Draining);
@@ -1540,13 +1551,20 @@ bool Cache::pollTierTransfers() {
       ++spilled_.writeThroughFailures;
       // A volume that filled holds write-through back until it has room; a
       // file that stopped taking writes stops it for good. The Spill
-      // requests that hold the block owe its copy again.
+      // requests that hold the block owe its copy again, first: its slot
+      // went back, and each of them commits one for it once more, which
+      // the copy they write draws or the copy another writes returns, as
+      // when they published it. The pages past it spill once it has
+      // landed.
       writeThroughPaused_ = kvTierWritable();
       const uint32_t index = kv_.chainLength(block) - 1;
-      for (auto &[_, holder] : requests_)
-        if (holder.mode == KvMode::Spill && index < holder.cachedBlocks.size() &&
-            holder.cachedBlocks[index] == block)
-          holder.owedCopies.push_back(block);
+      for (auto &[_, holder] : requests_) {
+        if (holder.mode != KvMode::Spill || index >= holder.cachedBlocks.size() ||
+            holder.cachedBlocks[index] != block)
+          continue;
+        recommit(holder);
+        holder.owedCopies.push_front(block);
+      }
       break;
     }
     }

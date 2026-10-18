@@ -4889,6 +4889,38 @@ void testCommitmentsLockQuotaUntilWritten() {
   spill.cache.endRequest(7);
 }
 
+// A write through that fails gives its slot back, and its request commits
+// the slot once more and owes the copy again, before its later pages: the
+// copy is written again on the commitment, though the cache's own limit
+// holds no copy, and the pages past it spill once it has landed. So when
+// every write of a request fails, and when one of them does.
+void testFailedWritesKeepTheirCommitment() {
+  for (const bool everyWrite : {true, false}) {
+    Spilling spill;
+    // One write through at a time, for one of them to fail.
+    if (!everyWrite)
+      spill.tier.writeLimits = {~0u, 16, 1};
+    spill.start(1, Spilling::prompt(1000, 6), 6);
+    spill.budget->setLimitBytes(0);
+    for (int round = 0; spill.cache.writeThrough(); ++round) {
+      spill.tier.complete(!(everyWrite ? round == 0 : round == 1));
+      static_cast<void>(spill.cache.pollTransfers());
+      if (everyWrite && !round)
+        require(spill.budget->committedBytes() == 600 && spill.budget->usedBytes() == 0,
+                "the failed writes did not give their slots back to the commitment");
+    }
+    static_cast<void>(spill.cache.spillWritten());
+    const KvSpillSnapshot spilled = spill.cache.spillSnapshot();
+    require(spilled.writeThroughPages == 6 && spilled.writeThroughFailures == (everyWrite ? 6u : 1u) &&
+                spill.budget->committedBytes() == 0 && spilled.spilledPages == 4 &&
+                std::ranges::all_of(spill.tier.draws,
+                                    [](auto draw) { return draw == model::DiskBudget::Draw::Commitment; }),
+            "a failed write's copy was not written again on its commitment, or held the pages past it back");
+    spill.cache.checkInvariants();
+    spill.cache.endRequest(1);
+  }
+}
+
 // A page spills once every request that holds it spills and holds it past
 // its dense history and outside its tail window: a Resident holder keeps it
 // Full while it lives, and a holder whose window still covers it until it
@@ -5106,6 +5138,7 @@ int main() {
     testQuotaGivesUpOnlyCopiesNothingReads();
     testUnreadableCopyLeavesBeforeTheCommandThatReadIt();
     testCommitmentsLockQuotaUntilWritten();
+    testFailedWritesKeepTheirCommitment();
     testEveryHolderDecidesWhetherAPageSpills();
     testBlocksAreWrittenOnce();
     testUnreadableCopyLeavesWithItsHolders();
