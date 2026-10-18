@@ -562,6 +562,14 @@ void testCommandWatchdogAndPendingHealthWake() {
   generations.complete(1);
   require(!generations.expired(129.999) && generations.expired(130.0),
           "stale completion cleared a newer command deadline");
+  // A command's progress (its host steps) moves its deadline a timeout on,
+  // and another command's moves nothing.
+  metal::CommandWatchdog progressing(120.0);
+  progressing.start(3, 0.0);
+  progressing.progress(3, 100.0);
+  progressing.progress(2, 200.0);
+  require(!progressing.expired(219.999) && progressing.expired(220.0),
+          "a command's progress did not move its deadline, or another's did");
 
   for (bool gpuCompleted : {false, true}) {
     LoopFixture fixture;
