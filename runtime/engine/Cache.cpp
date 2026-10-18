@@ -603,11 +603,11 @@ CacheReclaimResult Cache::reclaimForPages(uint32_t pages, CacheReclaimMode mode,
   return total;
 }
 
-uint32_t Cache::reusablePages(ReclaimClass upTo) const {
-  const uint32_t unheld = pool_.reusablePages();
+uint32_t Cache::reusablePages(ReclaimClass upTo, kv::PageForm form) const {
+  const uint32_t unheld = pool_.reusablePages(form);
   if (upTo == ReclaimClass::InUse)
     return unheld;
-  return unheld - kv_.idlePagesOnChains(states_.usedStates());
+  return unheld - kv_.idlePagesOnChains(states_.usedStates(), form);
 }
 
 std::optional<Cache::Victim> Cache::reclaimOldest(const VictimScan &scan) {
