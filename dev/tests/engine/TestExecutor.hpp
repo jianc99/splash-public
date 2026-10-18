@@ -558,16 +558,16 @@ public:
   }
   // It grows that cache toward its planned size, which the fake refuses
   // with refusedGrowth, and otherwise a streamed cache's chunk a reclaim gave
-  // back, through chunkAdmission when a test sets it.
+  // back, empty, through chunkAdmission when a test sets it.
   model::ModelMemoryAdmission growCaches() override {
     ++growthAttempts;
     if (refusedGrowth)
       return {.allocationFailure = *refusedGrowth};
-    if (!releasedChunks.empty()) {
-      if (chunkAdmission && !chunkAdmission(releasedChunks.back()))
+    if (releasedChunks) {
+      if (chunkAdmission && !chunkAdmission(streamedChunkBytes))
         return {.allocationFailure = metal::AllocationFailure::HostPressure};
-      streamedChunks.push_back(releasedChunks.back());
-      releasedChunks.pop_back();
+      streamedChunks.push_back(0);
+      --releasedChunks;
     }
     return {.ok = true};
   }
@@ -598,11 +598,14 @@ public:
     }
     if (scope != model::IdleMemory::Streamed || streamedChunks.empty())
       return 0;
-    const uint64_t chunk = streamedChunks.back();
-    streamedChunks.pop_back();
-    releasedChunks.push_back(chunk);
+    uint64_t held = 0;
+    while (!held && !streamedChunks.empty()) {
+      held = streamedChunks.back();
+      streamedChunks.pop_back();
+      ++releasedChunks;
+    }
     idleReleases.push_back(scope);
-    return chunk;
+    return held;
   }
   std::optional<std::string> provideMask(uint64_t id,
                                          std::span<const uint32_t> words) override {
@@ -736,12 +739,17 @@ public:
   // take them once no buffer is idle; cacheReclaims counts those steps.
   std::vector<uint64_t> cacheUnits;
   uint32_t cacheReclaims = 0;
-  // A streamed cache's chunks above its floor, which only a reclaim of
-  // IdleMemory::Streamed gives back, once no cache unit is left, and those
-  // it gave back, which growCaches() takes again; and the scope of every
-  // reclaim step that gave a cache unit or a chunk, in order.
+  // A streamed cache's chunks above its floor, each by the bytes its rows
+  // hold, none for a chunk no row went into, which only a reclaim of
+  // IdleMemory::Streamed gives back once no cache unit is left, as the
+  // production store does (model::SparseRowStore::releaseChunk): the empty
+  // chunks at the end, then the one before them, returning its rows' bytes.
+  // growCaches() takes the chunks given back again, empty, each of
+  // streamedChunkBytes; and the scope of every reclaim step that gave a
+  // cache unit or chunks, in order.
   std::vector<uint64_t> streamedChunks;
-  std::vector<uint64_t> releasedChunks;
+  uint32_t releasedChunks = 0;
+  uint64_t streamedChunkBytes = 0;
   std::function<bool(uint64_t bytes)> chunkAdmission;
   std::vector<model::IdleMemory> idleReleases;
   // The lanes that hold a floor of the hot block cache, and what a lane's
