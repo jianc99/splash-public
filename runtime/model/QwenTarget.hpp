@@ -226,6 +226,8 @@ struct QwenTargetPrefillSequence final {
   uint64_t kvOffset = 0;
   kv::ChunkedPrefillParams chunk;
   metal::MetalBuffer pageTable;
+  // Its pages' block index, for a layout with one (ops::BlockIndex::tables).
+  metal::MetalBuffer indexTable;
   std::span<const metal::MetalBuffer> convolutionIn;
   std::span<const metal::MetalBuffer> convolutionOut;
   std::span<const metal::MetalBuffer> recurrentIn;
@@ -318,6 +320,9 @@ struct QwenTargetVerifyBuffers final {
       nextGdnStates;
   std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth>
       pageTables;
+  // Each lane's pages' block index, for a layout with one
+  // (ops::BlockIndex::tables).
+  std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth> indexTables;
   ops::MoeScratch moe;
   // Each lane's auxiliary state before the step; the commit writes the one
   // after it (addStateCommit).
