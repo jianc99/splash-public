@@ -751,8 +751,9 @@ void testSpillHoldsTheArenasOfASpillingRuntime() {
   require(requirePlan(inputs).spill.enabled, "the spilling runtime's arenas took more than they add");
 }
 
-// The SSD cache's room bounds the context spilling serves, beside every
-// lane's state: none leaves the resident context.
+// The SSD cache's room bounds the context spilling serves at a first start,
+// beside every lane's state: none leaves the resident context. A relaunch
+// keeps its first engine's context.
 void testDiskBoundsTheSpilledContext() {
   StreamedMemoryInputs inputs = kFlashNext.inputs(kStudio);
   inputs.activeLimitBytes = 4 * inputs.stateSlotBytes + 1'000 * inputs.kvSlotBytes;
@@ -765,6 +766,16 @@ void testDiskBoundsTheSpilledContext() {
   inputs = kFlashNext.inputs(kStudio);
   inputs.requestedContextTokens = 100'000;
   require(requirePlan(inputs).spill.floorTokens == 100'000, "the floors were not held at --max-context");
+  // A relaunch keeps its first engine's context, and its floors, whatever
+  // room the volume has left since; more room serves more.
+  inputs = kFlashNext.inputs(kStudio);
+  inputs.relaunchContextTokens = 300'000;
+  inputs.activeLimitBytes = 4 * inputs.stateSlotBytes + 1'000 * inputs.kvSlotBytes;
+  const StreamedMemoryPlan relaunched = requirePlan(inputs);
+  require(relaunched.spill.diskTokens == 300'000 && relaunched.spill.floorTokens == 300'000,
+          "a relaunch served less than its first engine's context for want of SSD room");
+  inputs.activeLimitBytes = 4 * inputs.stateSlotBytes + 20'000 * inputs.kvSlotBytes;
+  require(requirePlan(inputs).spill.diskTokens == 640'000, "a relaunch did not take the SSD's room past its context");
 }
 
 // One staging buffer where the floors leave less than 4 GiB.

@@ -153,10 +153,12 @@ struct StreamedMemoryInputs final {
   std::array<uint64_t, 2> spillArenaBytes{};
   uint64_t laneStateBytes = 0;
   kv::Layout kvLayout;
-  // The model's window (servedContextTokens), and the context --max-context
-  // asks for; zero for auto.
+  // The model's window (servedContextTokens), the context --max-context
+  // asks for, zero for auto, and the one a relaunch keeps
+  // (--relaunch-context), zero for a first start.
   uint32_t windowTokens = 0;
   uint32_t requestedContextTokens = 0;
+  uint32_t relaunchContextTokens = 0;
   StreamedPart experts;
   StreamedPart table;
   // --sparse-kv-memory: the hot block cache's target, at least its floor;
