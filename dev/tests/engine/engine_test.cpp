@@ -8098,6 +8098,42 @@ void testConversionCommitsTheHistoryWithoutCopies() {
   }
 }
 
+// A start that converts to Spill when memory refuses its restore starts as a
+// Spill request, counted as one. Refused all the same, as while its writes
+// have not landed beside a resident lane, it decides its mode afresh at each
+// attempt and counts no conversion, however often it retries.
+void testAStartThatConvertsCountsNoConversion() {
+  Spilling spill(64, false);
+  spill.model.deniedReservations = 1000;
+  spill.model.stateTier = std::make_shared<OffloadControl>();
+  spill.model.stateTier->ready = true;
+  spill.model.restoreControl->ready = true;
+  // The first turn's state goes to the disk: the second restores it.
+  spill.engine.submit(Spilling::prompt(1, 1, 4, 1));
+  spill.runUntilIdle();
+  // A resident lane decodes within its last page.
+  spill.engine.submit(Spilling::prompt(3, 3, 3, 30));
+  spill.runUntil([&] { return spill.events.outputs.contains(3); }, "the resident lane did not decode");
+  // The second turn's restore is refused memory; it converts, and the
+  // writes of its chain do not land for 2 s.
+  spill.storage.growthBlocked = true;
+  spill.engine.submit(Spilling::prompt(2, 1, 6, 1));
+  for (int step = 0; step < 20; ++step) {
+    spill.now += 100;
+    static_cast<void>(spill.engine.tick(spill.now));
+  }
+  require(spill.events.startIds.size() == 2 && spill.tier.writes.size() == 4 &&
+              spill.engine.snapshot().spill.converted == 0,
+          "the start that converted and waited counted its conversions, or did not convert");
+  // Once memory grows again it starts Resident, its next attempt's mode.
+  spill.storage.growthBlocked = false;
+  spill.runUntilIdle();
+  const SpillRequestsSnapshot counts = spill.engine.snapshot().spill;
+  require(spill.events.completedCount == 3 && counts.converted == 0 && counts.spill == 0 &&
+              counts.resident == 3,
+          "a start was not counted once, by the mode it started in");
+}
+
 // Short of its projection, a Spill start that the quota of active KV holds
 // with a page of output is bounded to what the quota holds, which the model
 // is given, and ends there; one that other Spill requests' commitments keep
@@ -10949,6 +10985,7 @@ int main() {
     testUnwritableTierKeepsRequestsResident();
     testSpillCommitmentCoversTheChainWithoutCopies();
     testConversionCommitsTheHistoryWithoutCopies();
+    testAStartThatConvertsCountsNoConversion();
     testShortQuotaBoundsWaitsOrRefusesASpillStart();
     testSpillResumeCommitsAgain();
     testDecodeLeavesOutALaneRefusedItsHotFloor();
