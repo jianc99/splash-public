@@ -284,7 +284,8 @@ void growsAndReleases(MetalBackend &backend) {
     if (refuse) return metal::AllocationResult(metal::AllocationFailure::EngineBudget);
     return test::admitAll(bytes, allocate);
   });
-  require(cache.stats().bytes == 0 && cache.growTowardTarget().granted() && cache.stats().bytes == 0,
+  require(cache.stats().bytes == 0 && !cache.belowTarget() && cache.growTowardTarget().granted() &&
+              cache.stats().bytes == 0,
           "a cache without floors took memory");
   refuse = true;
   const model::ModelMemoryAdmission refused = cache.reserveLane(0);
@@ -301,9 +302,10 @@ void growsAndReleases(MetalBackend &backend) {
   static_cast<void>(resolve(backend, cache, 0, lanes, {blocksOf(0, 200)}, std::make_shared<KvReadStats>()));
   // Toward the target an extent at a time; the blocks stay.
   for (uint32_t extents = 2; extents <= 4; ++extents)
-    require(cache.growTowardTarget().granted() && cache.stats().bytes == extents * extent,
+    require(cache.belowTarget() && cache.growTowardTarget().granted() && cache.stats().bytes == extents * extent,
             "growth toward the target is not an extent at a time");
-  require(cache.growTowardTarget().granted() && cache.stats().bytes == 4 * extent, "the cache grew past its target");
+  require(!cache.belowTarget() && cache.growTowardTarget().granted() && cache.stats().bytes == 4 * extent,
+          "the cache grew past its target");
   auto grown = std::make_shared<KvReadStats>();
   static_cast<void>(resolve(backend, cache, 0, lanes, {blocksOf(0, 256)}, grown));
   require(grown->hits == 200 * kPlaces && grown->misses == 56 * kPlaces, "growing lost the cache's blocks");
@@ -331,7 +333,7 @@ void growsAndReleases(MetalBackend &backend) {
   require(!cache.growTowardTarget().granted() && cache.stats().bytes == extent, "a refused growth changed the cache");
   refuse = false;
   cache.releaseLane(0);
-  require(cache.growTowardTarget().granted() && cache.stats().bytes == extent,
+  require(!cache.belowTarget() && cache.growTowardTarget().granted() && cache.stats().bytes == extent,
           "a cache whose lanes released their floors grew");
   require(cache.releaseAboveFloor() == extent && cache.stats().bytes == 0,
           "an idle reclaim kept a cache no lane needs");

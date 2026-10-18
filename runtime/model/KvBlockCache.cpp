@@ -323,8 +323,13 @@ void KvBlockCache::releaseLane(uint32_t stateLane) noexcept {
 
 ModelMemoryAdmission KvBlockCache::growTowardTarget() {
   Impl &impl = *impl_;
-  if (!impl.floorLanes() || impl.extents >= impl.targetExtents) return {.ok = true};
+  if (!belowTarget()) return {.ok = true};
   return impl.grow(impl.extents + 1);
+}
+
+bool KvBlockCache::belowTarget() const noexcept {
+  const Impl &impl = *impl_;
+  return impl.floorLanes() && impl.extents < impl.targetExtents;
 }
 
 uint64_t KvBlockCache::releaseAboveFloor() {
