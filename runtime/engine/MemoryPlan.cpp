@@ -150,6 +150,83 @@ KvSpillPlan planSpill(const StreamedMemoryInputs &in, uint64_t floors) {
   return spill;
 }
 
+// The plan of the parts as resolved beside arenas of `arenaBytes`
+// (planStreamedMemory).
+StreamedMemoryResult planParts(const StreamedMemoryInputs &in, const Part &experts, const Part &table,
+                               uint64_t arenaBytes) {
+  const kv::Layout &layout = in.kvLayout;
+  const auto overflow = [] { return StreamedMemoryResult{std::nullopt, "the memory plan overflows uint64"}; };
+  // The floors: what loads, the arenas and the stores at their floors, a
+  // lane's state and the KV runway, and a spill-capable target's spill
+  // floors.
+  uint64_t loaded = 0;
+  for (const uint64_t bytes : {in.fixedBytes, arenaBytes, experts.floor, table.floor})
+    if (!checkedAdd(loaded, bytes, loaded)) return overflow();
+  const std::optional<uint64_t> minimum = minimumRequiredBytes(loaded, in.laneStateBytes, layout);
+  if (!minimum) return overflow();
+  const uint64_t runwayBytes = *minimum - loaded - in.laneStateBytes;
+  uint64_t floors = *minimum;
+  StreamedMemoryPlan plan{.spill = planSpill(in, floors)};
+  KvSpillPlan &spill = plan.spill;
+  // An explicit hot cache target takes its part above the floor first.
+  uint64_t hotAbove = 0;
+  if (spill.enabled && in.hotCache.mode == StreamedSetting::Mode::Size) {
+    if (in.hotCache.bytes < spill.hotFloorBytes)
+      return {std::nullopt, "--sparse-kv-memory of " + std::to_string(in.hotCache.bytes / kMiB) +
+                                " MiB is less than the hot block cache's floor, " +
+                                std::to_string(spill.hotFloorBytes / kMiB) + " MiB"};
+    spill.hotTargetBytes = in.hotCache.bytes;
+    spill.hotLimitBytes = std::max(spill.hotLimitBytes, in.hotCache.bytes);
+    hotAbove = in.hotCache.bytes - spill.hotFloorBytes;
+  }
+  if (!checkedAdd(floors, spill.floorBytes, floors) || !checkedAdd(floors, hotAbove, floors)) return overflow();
+  if (floors > in.hardBudgetBytes)
+    return {std::nullopt,
+            "the floors of the memory plan require " + std::to_string(floors) +
+                " bytes but the Metal memory budget is " + std::to_string(in.hardBudgetBytes) + " bytes",
+            floors};
+
+  // Then the priorities, out of what the floors leave: the experts first,
+  // then the table. The KV allowance a part leaves holds the context kept
+  // resident, with its speculative rows, as one request's KV capacity does:
+  // in the fewest pages whose whole extents hold its pages, of which the
+  // floors hold the runway.
+  int64_t rest = static_cast<int64_t>(in.hardBudgetBytes - floors);
+  const auto allowance = [&](bool streaming) -> int64_t {
+    const uint64_t tokens = spill.enabled ? std::min<uint64_t>(in.windowTokens, kResidentAllowanceTokens)
+                            : in.requestedContextTokens ? in.requestedContextTokens
+                            : streaming ? std::min<uint64_t>(in.windowTokens, kResidentAllowanceTokens)
+                                        : 0;
+    if (!tokens) return 0;
+    const uint64_t pages = pagesOf(kvTokens(tokens));
+    uint64_t budget = pages;
+    while (kvCapacityPagesFor(layout, budget) < pages) ++budget;
+    return static_cast<int64_t>(remaining(budget * layout.bytesPerModelPage(), runwayBytes));
+  };
+  const int64_t tableShare =
+      table.automatic ? static_cast<int64_t>(remaining(std::min(table.all, kTableShareBytes), table.floor)) : 0;
+  bool expertsStream = experts.streams;
+  plan.expertBytes = experts.streams ? experts.floor : 0;
+  if (experts.automatic) {
+    const auto above = static_cast<int64_t>(experts.all - experts.floor);
+    if (rest - allowance(false) - tableShare >= above) {
+      rest -= above;
+    } else {
+      expertsStream = true;
+      const int64_t bytes = std::clamp<int64_t>(rest - allowance(true) - tableShare, 0, above);
+      plan.expertBytes = experts.floor + static_cast<uint64_t>(bytes);
+      rest -= bytes;
+    }
+  }
+  plan.tableBytes = table.streams ? table.floor : 0;
+  if (table.automatic) {
+    const int64_t kept = rest - allowance(expertsStream);
+    if (kept < static_cast<int64_t>(table.all - table.floor))
+      plan.tableBytes = table.floor + static_cast<uint64_t>(std::clamp<int64_t>(kept, 0, tableShare));
+  }
+  return {plan, {}};
+}
+
 std::string bytesAndMiB(uint64_t bytes) {
   std::ostringstream out;
   out << bytes << " bytes (" << std::fixed << std::setprecision(2)
@@ -260,6 +337,11 @@ std::optional<uint64_t> minimumRequiredBytes(uint64_t fixedBytes,
   return result;
 }
 
+uint64_t kvCapacityPagesFor(const kv::Layout &layout, uint64_t pages) noexcept {
+  const uint32_t extentPages = layout.extentPagesFor(pages);
+  return extentPages ? pages - pages % extentPages : 0;
+}
+
 uint32_t ContextBounds::maximum() const noexcept {
   return std::min(window, std::max(resident, std::min(spilled, disk)));
 }
@@ -271,78 +353,25 @@ std::string_view ContextBounds::bound() const noexcept {
 }
 
 StreamedMemoryResult planStreamedMemory(const StreamedMemoryInputs &in) {
-  const kv::Layout &layout = in.kvLayout;
-  if (!layout.valid() || !in.windowTokens || in.requestedContextTokens > in.windowTokens ||
+  if (!in.kvLayout.valid() || !in.windowTokens || in.requestedContextTokens > in.windowTokens ||
       (in.sparseKv && !in.sparseKv->laneSlots()) || in.hotCache.mode == StreamedSetting::Mode::Off)
     return {std::nullopt, "invalid memory planner inputs"};
   std::string error;
   const std::optional<Part> experts = resolve(in.experts, "--expert-memory", error);
   const std::optional<Part> table = experts ? resolve(in.table, "--ple-memory", error) : std::nullopt;
   if (!table) return {std::nullopt, error};
-
-  // The floors: what loads, a lane's state, the KV runway, the stores at
-  // their floors and a spill-capable target's spill floors.
-  const uint64_t runwayBytes = kvRunwayPages(layout.minimumExtentPages()) * layout.bytesPerModelPage();
-  uint64_t floors = 0;
-  for (const uint64_t bytes : {in.fixedBytes, in.laneStateBytes, runwayBytes, experts->floor, table->floor})
-    if (!checkedAdd(floors, bytes, floors)) return {std::nullopt, "the memory plan overflows uint64"};
-  StreamedMemoryPlan plan{.spill = planSpill(in, floors)};
-  KvSpillPlan &spill = plan.spill;
-  // An explicit hot cache target takes its part above the floor first.
-  uint64_t hotAbove = 0;
-  if (spill.enabled && in.hotCache.mode == StreamedSetting::Mode::Size) {
-    if (in.hotCache.bytes < spill.hotFloorBytes)
-      return {std::nullopt, "--sparse-kv-memory of " + std::to_string(in.hotCache.bytes / kMiB) +
-                                " MiB is less than the hot block cache's floor, " +
-                                std::to_string(spill.hotFloorBytes / kMiB) + " MiB"};
-    spill.hotTargetBytes = in.hotCache.bytes;
-    spill.hotLimitBytes = std::max(spill.hotLimitBytes, in.hotCache.bytes);
-    hotAbove = in.hotCache.bytes - spill.hotFloorBytes;
+  // The arenas of the parts set to stream, and where that plan streams
+  // more, those of the parts it streams: a part that streams with smaller
+  // arenas streams with larger ones, so a plan streams no more than the
+  // arenas it was made with after three at most.
+  bool expertsStream = experts->streams, tableStreams = table->streams;
+  for (;;) {
+    StreamedMemoryResult result = planParts(in, *experts, *table, in.arenaBytes[expertsStream][tableStreams]);
+    if (!result.plan || ((expertsStream || !result.plan->expertBytes) && (tableStreams || !result.plan->tableBytes)))
+      return result;
+    expertsStream = expertsStream || result.plan->expertBytes;
+    tableStreams = tableStreams || result.plan->tableBytes;
   }
-  if (!checkedAdd(floors, spill.floorBytes, floors) || !checkedAdd(floors, hotAbove, floors))
-    return {std::nullopt, "the memory plan overflows uint64"};
-  if (floors > in.hardBudgetBytes)
-    return {std::nullopt,
-            "the floors of the memory plan require " + std::to_string(floors) +
-                " bytes but the Metal memory budget is " + std::to_string(in.hardBudgetBytes) + " bytes",
-            floors};
-
-  // Then the priorities, out of what the floors leave: the experts first,
-  // then the table. The KV allowance a part leaves holds the context kept
-  // resident, with its speculative rows, in the pool's whole extents of any
-  // size: its pages and an extent of the largest a pool takes but a page,
-  // beside the KV runway the floors hold.
-  int64_t rest = static_cast<int64_t>(in.hardBudgetBytes - floors);
-  const auto allowance = [&](bool streaming) {
-    const uint64_t tokens = spill.enabled ? std::min<uint64_t>(in.windowTokens, kResidentAllowanceTokens)
-                            : in.requestedContextTokens ? in.requestedContextTokens
-                            : streaming ? std::min<uint64_t>(in.windowTokens, kResidentAllowanceTokens)
-                                        : 0;
-    const uint64_t pages = pagesOf(kvTokens(tokens)) + layout.maximumExtentPages() - 1;
-    return static_cast<int64_t>(tokens ? remaining(pages * layout.bytesPerModelPage(), runwayBytes) : 0);
-  };
-  const int64_t tableShare =
-      table->automatic ? static_cast<int64_t>(remaining(std::min(table->all, kTableShareBytes), table->floor)) : 0;
-  bool expertsStream = experts->streams;
-  plan.expertBytes = experts->streams ? experts->floor : 0;
-  if (experts->automatic) {
-    const auto above = static_cast<int64_t>(experts->all - experts->floor);
-    if (rest - allowance(false) - tableShare >= above) {
-      rest -= above;
-    } else {
-      expertsStream = true;
-      const int64_t bytes = std::clamp<int64_t>(rest - allowance(true) - tableShare, 0, above);
-      plan.expertBytes = experts->floor + static_cast<uint64_t>(bytes);
-      rest -= bytes;
-    }
-  }
-  plan.tableBytes = table->streams ? table->floor : 0;
-  if (table->automatic) {
-    const int64_t kept = rest - allowance(expertsStream);
-    if (kept < static_cast<int64_t>(table->all - table->floor))
-      plan.tableBytes = table->floor + static_cast<uint64_t>(std::clamp<int64_t>(kept, 0, tableShare));
-  }
-  return {plan, {}};
 }
 
 std::optional<std::string> ModelMemoryProfile::validationError() const {
@@ -593,10 +622,7 @@ evaluateEngineMemoryPlan(const DeviceCapabilities &device,
       std::min<uint64_t>(availableForOneRequestKv / breakdown.kvPageBytes,
                          std::numeric_limits<uint32_t>::max());
   breakdown.kvExtentPages = model.targetKvLayout.extentPagesFor(budgetPages);
-  if (breakdown.kvExtentPages) {
-    breakdown.kvCapacityPages = static_cast<uint32_t>(
-        budgetPages - budgetPages % breakdown.kvExtentPages);
-  }
+  breakdown.kvCapacityPages = static_cast<uint32_t>(kvCapacityPagesFor(model.targetKvLayout, budgetPages));
 
   if (!checkedMultiply(breakdown.kvPageBytes, breakdown.kvExtentPages,
                        breakdown.kvExtentBytes) ||

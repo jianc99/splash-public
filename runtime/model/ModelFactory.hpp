@@ -108,7 +108,7 @@ struct RuntimeContext final {
   ops::AneFfn *aneFfn = nullptr;
   // The readers of a spill-capable target's spilled K/V, both or neither:
   // the hot block cache its verifies resolve through, and the stream of its
-  // prefills' history (RuntimeGeometry::from's kvSpills).
+  // prefills' history (StreamedParts::kv).
   KvBlockCache *blockCache = nullptr;
   KvHistoryStream *historyStream = nullptr;
 };
@@ -146,13 +146,28 @@ loadModel(metal::MetalBackend &backend,
 void withPrefillArena(
     metal::MetalBackend &backend, const LoadedModel &model, const ops::ExecutionPlans &operators, kv::Format format,
     const std::function<void(const ops::PrefillFfnBuffers &, const std::array<metal::MetalBuffer, 2> &)> &use);
-// The runtime's memory, of one whose K/V spills with `kvSpills`
-// (RuntimeContext's readers): its prefill commands run as groups.
+// What of a model streams from the SSD, which its arenas rest on: a target
+// whose routed experts stream runs its prefill commands as groups
+// (RuntimeGeometry::prefillChunks), the step of one whose table streams
+// stages its rows, of tableRowBytes each (zero: the table loads), and a
+// runtime whose K/V spills (RuntimeContext's readers) runs groups too, which
+// read an attention layer's spilled history once each, and holds where its
+// verifies' listed blocks are. loaded() is what streams of `model` as it
+// loaded, and its K/V when `kv` says it spills.
+struct StreamedParts final {
+  bool experts = false;
+  uint64_t tableRowBytes = 0;
+  bool kv = false;
+
+  [[nodiscard]] static StreamedParts loaded(const LoadedModel &model, bool kv = false) noexcept;
+};
+// The lane state and arenas of `model`'s geometry with `parts` streaming,
+// whatever streams of it as it loaded: one load plans them for every part
+// that may stream (engine::planStreamedMemory).
 [[nodiscard]] ModelMemoryPlan
 plannedRuntimeMemory(const LoadedModel &model,
                      const ops::ExecutionPlans &operators,
-                     kv::Format kvFormat, ops::GdnStateFormat stateFormat,
-                     bool kvSpills = false);
+                     kv::Format kvFormat, ops::GdnStateFormat stateFormat, StreamedParts parts);
 [[nodiscard]] std::unique_ptr<RuntimeModel>
 createRuntime(RuntimeContext context);
 
