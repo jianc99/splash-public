@@ -112,9 +112,11 @@ void excludeFromBackups(const std::filesystem::path &root) {
 // backups.
 PersistentCacheFiles openPersistentCache(const std::filesystem::path &root,
                                          const std::string &cacheNamespace,
-                                         uint64_t kvSlotBytes, uint64_t stateSlotBytes,
+                                         uint64_t kvSlotBytes,
+                                         const model::SlotFile::Options &kvOptions,
+                                         uint64_t stateSlotBytes,
                                          const std::shared_ptr<model::DiskBudget> &budget,
-                                         const model::SlotFile::Options &options,
+                                         const model::SlotFile::Options &stateOptions,
                                          const std::function<bool()> &cancelled) {
   try {
     if (root.empty())
@@ -138,12 +140,12 @@ PersistentCacheFiles openPersistentCache(const std::filesystem::path &root,
         kvSlotBytes, budget,
         model::SlotFile::Persistence{files.directory->kvSlots(), files.directory->kvRecords(),
                                      tag, sizeof(KvBlockLabel)},
-        options);
+        kvOptions);
     files.states = std::make_shared<model::SlotFile>(
         stateSlotBytes, budget,
         model::SlotFile::Persistence{files.directory->stateSlots(),
                                      files.directory->stateRecords(), tag, sizeof(StateLabel)},
-        options);
+        stateOptions);
     return files;
   } catch (const std::exception &error) {
     logLine("Persistent cache disabled (", error.what(), "); this process keeps a temporary cache.");
@@ -691,6 +693,12 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
                                  : CacheDirectory::idle(config.cacheRoot);
     // The tier's writes hold back while a step waits for reads.
     const model::SlotFile::Options tierFiles{.deferWrites = [readers] { return readers->criticalBusy(); }};
+    // How the KV tier lays a page out in its slot: a persistent file
+    // checksums each of its segments.
+    const kv::SlotFormat kvFormat(kvPages->layout());
+    const uint64_t kvSlotBytes = model::SlotFile::slotBytesFor(kvFormat.payloadBytes());
+    model::SlotFile::Options kvFileOptions = tierFiles;
+    kvFileOptions.segments = kvFormat.segments();
     if (stateStagingBytes) {
       // A write budget, when one is set, refills on the awake clock the
       // engine schedules its wake-ups on (awakeMilliseconds), so a write it
@@ -715,9 +723,9 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
         }
       }
       if (config.persistentCache && !rootRefusal) {
-        persistentCache = openPersistentCache(
-            config.cacheRoot, cacheNamespace, model::SlotFile::slotBytesFor(kvPages->bytesPerPage()),
-            stateSlotBytes, diskBudget, tierFiles, config.cancelled);
+        persistentCache = openPersistentCache(config.cacheRoot, cacheNamespace, kvSlotBytes,
+                                              kvFileOptions, stateSlotBytes, diskBudget, tierFiles,
+                                              config.cancelled);
         stateFile = persistentCache.states;
       }
       std::optional<std::string> off;
@@ -754,12 +762,11 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     std::unique_ptr<KvPageTier> kvTier;
     std::unique_ptr<DiskSpace> diskSpace;
     if (diskBudget) {
-      const uint64_t slotBytes = model::SlotFile::slotBytesFor(kvPages->bytesPerPage());
       std::shared_ptr<model::SlotFile> kvFile = persistentCache.kv;
       try {
         if (!kvFile)
-          kvFile = std::make_shared<model::SlotFile>(slotBytes, diskBudget, tierFiles);
-        kvTier = std::make_unique<KvPageTier>(*kvPages, kvFile);
+          kvFile = std::make_shared<model::SlotFile>(kvSlotBytes, diskBudget, kvFileOptions);
+        kvTier = std::make_unique<KvPageTier>(*kvPages, kvFormat, kvFile, readers);
       } catch (const std::exception &error) {
         // The persistent files are open by now; without the tier nothing
         // would keep or replace their copies.
@@ -782,7 +789,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
                          ? "persistent files in " + persistentCache.directory->path().string()
                          : "temporary files in " +
                                std::filesystem::temp_directory_path().string(),
-                     kvFile ? slotBytes : 0, stateBytes);
+                     kvFile ? kvSlotBytes : 0, stateBytes);
     }
     auto cache = std::make_unique<engine::Cache>(*kvPool, kvTier.get(), diskBudget);
     if (diskSpace)
