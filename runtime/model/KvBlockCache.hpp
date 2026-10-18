@@ -79,6 +79,9 @@ public:
   void releaseLane(uint32_t stateLane) noexcept;
   // Between commands, optionally: at most one extent more toward the target.
   [[nodiscard]] ModelMemoryAdmission growTowardTarget();
+  // Whether growTowardTarget() would grow it: lanes hold floors, and it
+  // holds less than its target.
+  [[nodiscard]] bool belowTarget() const noexcept;
   // An idle reclaim: the cache's last extent above its floors, in bytes;
   // zero at its floors. A reclaim that needs more calls again.
   [[nodiscard]] uint64_t releaseAboveFloor();
