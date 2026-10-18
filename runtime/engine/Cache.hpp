@@ -720,9 +720,10 @@ private:
   // The KV tier's part of pollTransfers().
   [[nodiscard]] bool pollTierTransfers();
   // A slot for a new KV copy, replacing older copies while the tier is at its
-  // limit, and none while the limit cannot hold one; inUse when a state in
-  // use needs the copy.
-  [[nodiscard]] std::shared_ptr<KvDiskSlot> acquireDiskSlot(bool inUse);
+  // limit for the draw, and none while that limit cannot hold one; inUse
+  // when a state in use needs the copy.
+  [[nodiscard]] std::shared_ptr<KvDiskSlot> acquireDiskSlot(model::DiskBudget::Draw draw,
+                                                            bool inUse);
   // Gives up one disk copy for a new copy, in use or not: the oldest
   // redundant one, KV or state, else the oldest that is the only copy, never
   // the KV of a state in RAM. A persistent tier gives up restore points
@@ -779,8 +780,6 @@ private:
   // nothing, so they hold no memory a reclaim waits for (pendingPages), only
   // their blocks.
   std::vector<Demotion> copies_;
-  // At most this many at once, of the tier's demotion share.
-  static constexpr uint32_t kCopies = 16;
   // Block IDs increase from parent to child. Restores start in that order so
   // cancellation can discard an unread suffix without stranding its parents.
   std::map<uint64_t, Restore> restores_;
