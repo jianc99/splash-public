@@ -58,6 +58,8 @@ TEST_SSD_READERS_ASAN := $(ENGINE_SANITIZER_BUILD)/ssd-readers-asan-ubsan
 TEST_SSD_READERS_TSAN := $(ENGINE_SANITIZER_BUILD)/ssd-readers-tsan
 TEST_ELASTIC_KV_ASAN := $(ENGINE_SANITIZER_BUILD)/elastic-kv-pool-asan-ubsan
 TEST_ELASTIC_KV_TSAN := $(ENGINE_SANITIZER_BUILD)/elastic-kv-pool-tsan
+TEST_SLOT_RECYCLER_ASAN := $(ENGINE_SANITIZER_BUILD)/slot-recycler-asan-ubsan
+TEST_SLOT_RECYCLER_TSAN := $(ENGINE_SANITIZER_BUILD)/slot-recycler-tsan
 TEST_MEMORY_TEST := $(ENGINE_TEST_BUILD)/engine-memory-plan
 TEST_VISION_PREPARATION := $(ENGINE_TEST_BUILD)/vision-preparation
 TEST_DRAFT_PREPARATION := $(ENGINE_TEST_BUILD)/draft-preparation
@@ -254,7 +256,8 @@ SANITIZER_CONFIG_TARGETS := $(TEST_SLOT_FILE_ASAN) $(TEST_SLOT_FILE_TSAN) \
 	$(TEST_ANE_FFN_CALIBRATION_ASAN) $(TEST_ANE_FFN_CALIBRATION_TSAN) \
 	$(TEST_SPARSE_ROW_STORE_ASAN) $(TEST_SPARSE_ROW_STORE_TSAN) \
 	$(TEST_SSD_READERS_ASAN) $(TEST_SSD_READERS_TSAN) \
-	$(TEST_ELASTIC_KV_ASAN) $(TEST_ELASTIC_KV_TSAN)
+	$(TEST_ELASTIC_KV_ASAN) $(TEST_ELASTIC_KV_TSAN) \
+	$(TEST_SLOT_RECYCLER_ASAN) $(TEST_SLOT_RECYCLER_TSAN)
 
 # Every native test, benchmark and tool depends on the engine's and the tests'
 # headers, and compiles and links its other prerequisites in the order it
@@ -273,7 +276,6 @@ $(ENGINE_TEST_BUILD) $(ENGINE_SANITIZER_BUILD):
 # library or a framework. Those that also run under the sanitizers list their
 # sources with the sanitizer builds.
 $(TEST_WEIGHT_SOURCE): dev/tests/engine/weight_source_test.cpp runtime/model/WeightSource.cpp
-$(TEST_SLOT_RECYCLER): dev/tests/engine/slot_recycler_test.cpp runtime/model/SlotRecycler.cpp
 $(TEST_GGUF_FILE): dev/tests/engine/gguf_file_test.cpp runtime/model/GgufFile.cpp \
 		runtime/model/WeightSource.cpp
 $(TEST_MEMORY_TEST): runtime/metal/DeviceCapabilities.cpp \
@@ -660,6 +662,8 @@ $(TEST_SSD_READERS) $(TEST_SSD_READERS_ASAN) $(TEST_SSD_READERS_TSAN): \
 		runtime/model/SsdReaders.cpp dev/tests/engine/ssd_readers_test.cpp
 $(TEST_ELASTIC_KV_TEST) $(TEST_ELASTIC_KV_ASAN) $(TEST_ELASTIC_KV_TSAN): \
 		runtime/engine/KvPool.cpp dev/tests/engine/elastic_kv_pool_test.cpp
+$(TEST_SLOT_RECYCLER) $(TEST_SLOT_RECYCLER_ASAN) $(TEST_SLOT_RECYCLER_TSAN): \
+		runtime/model/SlotRecycler.cpp dev/tests/engine/slot_recycler_test.cpp
 $(TEST_PERSISTENT_CACHE) $(TEST_PERSISTENT_CACHE_ASAN) $(TEST_PERSISTENT_CACHE_TSAN): \
 		$(CACHE_SOURCES) runtime/model/SlotFile.cpp dev/tests/engine/persistent_cache_test.cpp
 $(TEST_ENGINE_CACHE_TEST) $(TEST_ENGINE_CACHE_ASAN) $(TEST_ENGINE_CACHE_TSAN): \
@@ -715,3 +719,5 @@ test-sanitizers: $(SANITIZER_CONFIG_TARGETS)
 	$(TSAN_TEST_ENV) $(TEST_SSD_READERS_TSAN)
 	$(ASAN_TEST_ENV) $(TEST_ELASTIC_KV_ASAN)
 	$(TSAN_TEST_ENV) $(TEST_ELASTIC_KV_TSAN)
+	$(ASAN_TEST_ENV) $(TEST_SLOT_RECYCLER_ASAN)
+	$(TSAN_TEST_ENV) $(TEST_SLOT_RECYCLER_TSAN)
