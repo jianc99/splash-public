@@ -81,6 +81,11 @@ struct SlotFile::Backing {
     return segmentEnds.empty() ? payloadBytes : segmentEnds[index];
   }
 
+  // Moves a chunk whole between memory and the slot file at `offset`
+  // (moveChunk), counting what moved in the budget's totals.
+  bool load(std::span<std::byte> chunk, off_t offset) const noexcept;
+  bool store(std::span<const std::byte> chunk, off_t offset) const noexcept;
+
   // Marks a slot's blocks held; true when they were not.
   bool back(uint32_t index) {
     if (backed.size() <= index)
@@ -444,6 +449,24 @@ uint64_t fileBytes(int descriptor, const char *what) {
   return static_cast<uint64_t>(status.st_size);
 }
 } // namespace
+
+bool SlotFile::Backing::load(std::span<std::byte> chunk, off_t offset) const noexcept {
+  return moveChunk(chunk, offset, [this](std::byte *data, size_t bytes, off_t at) {
+    const auto count = ::pread(descriptor, data, bytes, at);
+    if (count > 0)
+      budget->read_.fetch_add(count, std::memory_order_relaxed);
+    return count;
+  });
+}
+
+bool SlotFile::Backing::store(std::span<const std::byte> chunk, off_t offset) const noexcept {
+  return moveChunk(chunk, offset, [this](const std::byte *data, size_t bytes, off_t at) {
+    const auto count = ::pwrite(descriptor, data, bytes, at);
+    if (count > 0)
+      budget->written_.fetch_add(count, std::memory_order_relaxed);
+    return count;
+  });
+}
 
 SlotFile::SlotFile(uint64_t slotBytes, std::shared_ptr<DiskBudget> budget, const Options &options)
     : backing_(std::make_shared<Backing>()) {
@@ -852,12 +875,6 @@ std::shared_ptr<SlotFile::Operation> SlotFile::write(
                                                                           const std::atomic<bool> &cancelled) {
     Backing &backing = *slot->backing_;
     const off_t start = slotOffset(slot->index_, backing.slotBytes);
-    const auto store = [&backing](const std::byte *data, size_t bytes, off_t offset) {
-      const auto count = ::pwrite(backing.descriptor, data, bytes, offset);
-      if (count > 0)
-        backing.budget->written_.fetch_add(count, std::memory_order_relaxed);
-      return count;
-    };
     // Reads a step waits for go first: while they run, a chunk waits for
     // them, a bounded while, unless a read of this file waits behind it.
     const auto deferred = [&backing] {
@@ -875,7 +892,9 @@ std::shared_ptr<SlotFile::Operation> SlotFile::write(
     };
     slot->written_.store(false, std::memory_order_relaxed);
     slot->verify_.store(false, std::memory_order_relaxed);
-    SegmentChecksums checksums(backing.segmentEnds);
+    std::optional<SegmentChecksums> checksums;
+    if (backing.persistent)
+      checksums.emplace(backing.segmentEnds);
     Pieces pieces(source);
     for (uint64_t done = 0; done < backing.slotBytes;) {
       if (cancelled.load(std::memory_order_relaxed)) return false;
@@ -885,8 +904,8 @@ std::shared_ptr<SlotFile::Operation> SlotFile::write(
       if (!chunk.empty()) {
         chunk = chunk.first(kChunkBytes);
         pieces.skip(kChunkBytes);
-        if (backing.persistent)
-          checksums.add(chunk);
+        if (checksums)
+          checksums->add(chunk);
       } else {
         const auto gathered = buffer.first(
             pieces.gatherBytes(std::min<uint64_t>(buffer.size(), backing.slotBytes - done)));
@@ -896,13 +915,13 @@ std::shared_ptr<SlotFile::Operation> SlotFile::write(
           std::memcpy(gathered.data() + filled, piece.data(), piece.size());
           filled += piece.size();
         }
-        if (backing.persistent)
-          checksums.add(gathered.first(filled));
+        if (checksums)
+          checksums->add(gathered.first(filled));
         std::memset(gathered.data() + filled, 0, gathered.size() - filled);
         chunk = gathered;
       }
       defer();
-      if (!moveChunk(chunk, start + static_cast<off_t>(done), store)) {
+      if (!backing.store(chunk, start + static_cast<off_t>(done))) {
         // A full volume is the volume's, which the engine measures again
         // (DiskBudget::fullReported), and the file goes on. Any other error
         // stops it.
@@ -915,7 +934,7 @@ std::shared_ptr<SlotFile::Operation> SlotFile::write(
       done += chunk.size();
     }
     slot->payloadBytes_ = payloadBytes;
-    slot->checksums_ = backing.persistent ? checksums.take() : std::vector<uint32_t>{};
+    slot->checksums_ = checksums ? checksums->take() : std::vector<uint32_t>{};
     slot->written_.store(true, std::memory_order_release);
     return true;
   }, std::move(completion));
@@ -936,42 +955,38 @@ std::shared_ptr<SlotFile::Operation> SlotFile::read(
     // each segment against the record.
     const bool verify = slot->verify_.load(std::memory_order_relaxed);
     if (verify && totalBytes(destination) != slot->payloadBytes_) return false;
-    SegmentChecksums checksums(backing.segmentEnds);
+    std::optional<SegmentChecksums> checksums;
+    if (verify)
+      checksums.emplace(backing.segmentEnds);
     const off_t start = slotOffset(slot->index_, backing.slotBytes);
-    const auto load = [&backing](std::byte *data, size_t bytes, off_t offset) {
-      const auto count = ::pread(backing.descriptor, data, bytes, offset);
-      if (count > 0)
-        backing.budget->read_.fetch_add(count, std::memory_order_relaxed);
-      return count;
-    };
     Pieces pieces(destination);
     for (uint64_t done = 0; !pieces.done();) {
       if (cancelled.load(std::memory_order_relaxed)) return false;
       const off_t offset = start + static_cast<off_t>(done);
       if (const auto run = pieces.directRun(); !run.empty()) {
         const auto chunk = run.first(kChunkBytes);
-        if (!moveChunk(chunk, offset, load)) return false;
-        if (verify)
-          checksums.add(chunk);
+        if (!backing.load(chunk, offset)) return false;
+        if (checksums)
+          checksums->add(chunk);
         pieces.skip(kChunkBytes);
         done += kChunkBytes;
         continue;
       }
       const auto chunk = buffer.first(
           pieces.gatherBytes(std::min<uint64_t>(buffer.size(), backing.slotBytes - done)));
-      if (!moveChunk(chunk, offset, load)) return false;
+      if (!backing.load(chunk, offset)) return false;
       size_t used = 0;
       for (auto piece = pieces.next(chunk.size()); !piece.empty();
            piece = pieces.next(chunk.size() - used)) {
         std::memcpy(piece.data(), chunk.data() + used, piece.size());
         used += piece.size();
       }
-      if (verify)
-        checksums.add(chunk.first(used));
+      if (checksums)
+        checksums->add(chunk.first(used));
       done += chunk.size();
     }
-    if (verify) {
-      if (checksums.take() != slot->checksums_) return false;
+    if (checksums) {
+      if (checksums->take() != slot->checksums_) return false;
       slot->verify_.store(false, std::memory_order_relaxed);
     }
     return true;
@@ -1001,14 +1016,8 @@ std::optional<std::span<const std::byte>> SlotFile::readAt(const Slot &slot, uin
   const uint64_t to = (end + kDirectReadBytes - 1) / kDirectReadBytes * kDirectReadBytes;
   if (reinterpret_cast<std::uintptr_t>(buffer.data()) % kDirectReadBytes || buffer.size() < to - from)
     return std::nullopt;
-  const auto load = [&backing](std::byte *data, size_t size, off_t position) {
-    const auto count = ::pread(backing.descriptor, data, size, position);
-    if (count > 0)
-      backing.budget->read_.fetch_add(count, std::memory_order_relaxed);
-    return count;
-  };
   const off_t at = slotOffset(slot.index_, backing.slotBytes) + static_cast<off_t>(from);
-  if (!moveChunk(buffer.first(to - from), at, load))
+  if (!backing.load(buffer.first(to - from), at))
     return std::nullopt;
   for (size_t index = first; verify && index <= last; ++index) {
     const uint64_t start = backing.segmentStart(index);
