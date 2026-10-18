@@ -2895,10 +2895,14 @@ kernel tests under shader validation, and the Linear pipeline resource check
 without it. They include loading small synthetic MLX, GGUF and vision sources
 and the GGUF kernels on synthetic tensors. `make check-native-build` builds
 every native test, benchmark and tool and runs none. Hosted CI runs the CPU
-checks, `check-native-build` and the sanitizers. `make architecture-check`, one
-of the source checks, also fails when a workflow under `.github/workflows`
-names a Hugging Face token (`HF_TOKEN`, `HUGGING_FACE_HUB_TOKEN` or a
-`secrets.HF_*` secret): CI installs public models alone and never receives one.
+checks, `check-native-build` and the sanitizers. `make test-sanitizers-metal`
+runs the Metal tests of the components whose host steps share their state with
+the engine thread and the SSD readers (the hot block cache of spilled KV and
+the history stream) under ThreadSanitizer, built with it in `build/metal-tsan`.
+`make architecture-check`, one of the source checks, also fails when a workflow
+under `.github/workflows` names a Hugging Face token (`HF_TOKEN`,
+`HUGGING_FACE_HUB_TOKEN` or a `secrets.HF_*` secret): CI installs public models
+alone and never receives one.
 
 The native tests are in `dev/tests/engine`; each Python test is in the
 directory of what it tests: `dev/tests/server`, `dev/tests/install` (launcher,
