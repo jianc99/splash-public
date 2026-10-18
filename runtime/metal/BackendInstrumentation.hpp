@@ -25,6 +25,9 @@ public:
   // Commands that passed the submission gate since construction.
   [[nodiscard]] static uint64_t submittedCommands(const MetalBackend &backend);
   [[nodiscard]] static size_t cachedPipelines(const MetalBackend &backend);
+  // The Metal command buffers the last command submitted takes: one, and one
+  // more per buffer its event steps add, which the queue holds 512 of.
+  [[nodiscard]] static uint64_t lastCommandBuffers(const MetalBackend &backend);
   // While profiling, submitCommandAsync() commits every dispatch as its own
   // command and waits for it, recording its GPU time, then invokes
   // completion inline and returns an already-completed ticket with the

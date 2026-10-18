@@ -176,11 +176,12 @@ NSUInteger addedBuffers(const EventStep &step) noexcept {
     return 0;
 }
 
-// Refuses the event steps of a command of `dispatches` dispatches that its
-// submission cannot encode.
-void checkEvents(std::span<const EventStep> events, size_t dispatches) {
+// The command buffers a command of `dispatches` dispatches and these event
+// steps takes: one, and those its steps add. Refuses the steps when its
+// submission cannot encode them.
+NSUInteger checkEvents(std::span<const EventStep> events, size_t dispatches) {
     size_t before = 0;
-    NSUInteger added = 0;
+    NSUInteger buffers = 1;
     for (const EventStep &step : events) {
         if (step.kind == EventStep::Kind::Host ? !step.work : !step.event || !step.value)
             throw MetalBackendError(step.kind == EventStep::Kind::Host
@@ -194,11 +195,12 @@ void checkEvents(std::span<const EventStep> events, size_t dispatches) {
             throw MetalBackendError(
                 "event step follows more dispatches than its command has");
         before = step.before;
-        added += addedBuffers(step);
+        buffers += addedBuffers(step);
     }
-    if (added >= kMaximumCommandBuffers)
+    if (buffers > kMaximumCommandBuffers)
         throw MetalBackendError("Metal command's event steps take more command "
                                 "buffers than its queue holds");
+    return buffers;
 }
 
 // Raises the release counter of host steps (word 0 of `releases`) to
@@ -882,6 +884,7 @@ struct MetalBackend::Impl {
 #ifdef SPLASH_BACKEND_INSTRUMENTATION
     bool dispatchProfiling = false;
     std::vector<DispatchTiming> dispatchProfile;
+    uint64_t lastCommandBuffers = 0;
 #endif
     __strong id<MTLDevice> device = nil;
     __strong id<MTLCommandQueue> queue = nil;
@@ -1826,8 +1829,9 @@ CommandTicket MetalBackend::submitCommandAsync(
 CommandTicket MetalBackend::submitCommandAsync(const Command &command,
                                                CommandCompletion completion) {
     checkOperation();
-    checkEvents(command.events, command.dispatches.size());
+    [[maybe_unused]] const NSUInteger buffers = checkEvents(command.events, command.dispatches.size());
 #ifdef SPLASH_BACKEND_INSTRUMENTATION
+    impl_->lastCommandBuffers = buffers;
     if (impl_->dispatchProfiling)
         return impl_->submitProfiled(command.dispatches, command.events, std::move(completion));
 #endif
@@ -1889,6 +1893,10 @@ uint64_t BackendInstrumentation::submittedCommands(
 
 size_t BackendInstrumentation::cachedPipelines(const MetalBackend &backend) {
     return backend.impl_->pipelines.size();
+}
+
+uint64_t BackendInstrumentation::lastCommandBuffers(const MetalBackend &backend) {
+    return backend.impl_->lastCommandBuffers;
 }
 
 void BackendInstrumentation::setDispatchProfiling(MetalBackend &backend,

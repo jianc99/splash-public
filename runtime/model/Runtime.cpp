@@ -3381,6 +3381,16 @@ std::span<const float> RuntimeInstrumentation::lastLogits(const Runtime &runtime
   return {contents<float>(impl.decodeArena->get(lane, DecodeTensor::Logits), "logits"),
           uint64_t{ExecutionLimits::targetVerifyRows} * impl.geometry.target.vocabularySize};
 }
+
+RuntimeInstrumentation::LaneTables RuntimeInstrumentation::laneTables(const Runtime &runtime, uint64_t requestId) {
+  const Runtime::Impl &impl = *runtime.impl_;
+  const Runtime::Impl::LaneTables tables = impl.laneTables(impl.requests.at(requestId).stateLane);
+  const auto entries = [](const MetalBuffer &table) {
+    return table ? std::span<const SplashKvPage>(contents<SplashKvPage>(table, "lane table"), kMaximumPageTableEntries)
+                 : std::span<const SplashKvPage>();
+  };
+  return {entries(tables.pages), entries(tables.index)};
+}
 #endif
 
 } // namespace splash::model

@@ -613,7 +613,9 @@ test-engine-metal: $(TEST_METAL_TARGETS)
 # model.json records. Nothing is printed when the installation serves no
 # vision (vision_format none: --language-only, or a GGUF without an mmproj).
 # ORACLE_ARGS: options every run of the runtime oracle takes besides its own,
-# as the oracle takes them (model_runtime_oracle_test.mm).
+# as the oracle takes them (model_runtime_oracle_test.mm). A block-sparse
+# target's spill check runs in each: by default, with two staging buffers,
+# and at 32K tokens with the cache's default window.
 ORACLE_ARGS ?=
 VISION_FIXTURE_FAMILY := import json, pathlib, sys; \
 	model = json.loads((pathlib.Path(sys.argv[1]) / "model.json").read_text()); \
@@ -626,8 +628,9 @@ test-real: preflight $(TARGET) $(TEST_MODEL_RUNTIME_ORACLE) \
 				dev/tests/fixtures/vision-parity/$$family; \
 		else echo "vision parity: skipped, the installation serves text only"; fi
 	$(TEST_MODEL_RUNTIME_ORACLE) $(LIB) "$(MODEL_ROOT)" --ane-ffn-share 0 $(ORACLE_ARGS)
-	$(TEST_MODEL_RUNTIME_ORACLE) $(LIB) "$(MODEL_ROOT)" --ane-ffn-share 0 --state-format bf16 $(ORACLE_ARGS)
-	$(TEST_MODEL_RUNTIME_ORACLE) $(LIB) "$(MODEL_ROOT)" $(ORACLE_ARGS)
+	$(TEST_MODEL_RUNTIME_ORACLE) $(LIB) "$(MODEL_ROOT)" --ane-ffn-share 0 --state-format bf16 \
+		--spill-buffers 2 $(ORACLE_ARGS)
+	$(TEST_MODEL_RUNTIME_ORACLE) $(LIB) "$(MODEL_ROOT)" --spill-tokens 32768 --spill-window 64 $(ORACLE_ARGS)
 
 .PHONY: benchmark-backend \
 	benchmark-decode-profile benchmark-attention-sweep \
