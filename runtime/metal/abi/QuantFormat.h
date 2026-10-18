@@ -256,6 +256,11 @@ inline constexpr uint32_t quant_register_unit(uint32_t format) {
   return kQuantFormats[format].meta_groups == 1 ? 64 : format == GGUF_FMT_Q2K ? 128 : 256;
 }
 
+// Whether a format stores at least four bits per weight.
+inline constexpr bool quant_four_bits(uint32_t format) {
+  return 2 * kQuantFormats[format].block_bytes >= kQuantFormats[format].block_elements;
+}
+
 // Index of (row, block) in a [rows / T][blocks][T] plane (blocks = G) or meta
 // plane (blocks = meta units per row).
 inline constexpr uint64_t quant_tile_index(uint32_t row, uint32_t block, uint32_t blocks) {
