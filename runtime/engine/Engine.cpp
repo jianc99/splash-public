@@ -100,7 +100,7 @@ Engine::Engine(EngineConfig config, Cache &cache, model::Model &model,
     throw std::invalid_argument("decode share must be nonnegative and finite");
   if (config_.spill.capable &&
       (!config_.spill.geometry.fullPageBytes || !config_.spill.geometry.slotBytes ||
-       !config_.spill.geometry.extentPages))
+       !config_.spill.geometry.extentPages || !config_.spill.geometry.hotExtentSlots))
     throw std::invalid_argument("a target that can spill needs its page, extent and slot sizes");
   if (config_.spill.capable && (!config_.fund || !config_.funded))
     throw std::invalid_argument("a target that can spill needs the governor's funding");
@@ -201,6 +201,19 @@ void Engine::setCompletionNotifier(std::function<void()> notifier) {
   cache_.setCompletionNotifier(completionNotifier_);
 }
 
+bool Engine::landTransfers() {
+  if (!cache_.pollTransfers())
+    return false;
+  // Demoted pages and written states are back; waiting lanes retry now.
+  // The tier's share for Spill requests' writes has room again: their
+  // write-through goes on, so that what their next copies free is on its
+  // way, which a start funded by a donor's pages waits for (fundStart).
+  signalResourceProgress();
+  if (config_.spill.capable)
+    static_cast<void>(cache_.writeThrough());
+  return true;
+}
+
 bool Engine::flushRestorePoints() {
   static_cast<void>(cache_.pollTransfers());
   return writeBehind_.flush();
@@ -212,14 +225,7 @@ bool Engine::tick(double now) {
   bool progressed = scheduler_.expireDeadlines(now);
   if (now >= drainEndMilliseconds_)
     drainEndMilliseconds_ = 0.0;
-  if (cache_.pollTransfers()) {
-    // Demoted pages and written states are back; waiting lanes retry now.
-    // The tier's share for Spill requests' writes has room again.
-    signalResourceProgress();
-    progressed = true;
-    if (config_.spill.capable)
-      static_cast<void>(cache_.writeThrough());
-  }
+  progressed = landTransfers() || progressed;
   progressed = pollRestores(now) || progressed;
   progressed = writeBehind_.run(now) || progressed;
   // The earliest submitted and the earliest admitted of the lanes with work
@@ -837,6 +843,8 @@ bool Engine::admit(Request &active, double now) {
         return true;
       },
       false, &active);
+  // Whether memory released for it paid for what it holds (fundStart).
+  bool funded = state.funded;
   if (!state.admission.granted()) {
     // Without a free lane the request waits for one; only memory it could
     // not get may fail it.
@@ -878,9 +886,11 @@ bool Engine::admit(Request &active, double now) {
   // Resident lane may convert to Spill.
   const auto convert = spillFallback(active, &lookup);
   Allocation<TokenAdmission> kv;
-  if (lookup.state)
+  if (lookup.state) {
     kv = allocate([&] { return cache_.restoreRequest(requestId, lookup); }, inService, upTo,
                   convert, false, &active);
+    funded = funded || kv.funded;
+  }
   const bool restoring =
       lookup.state && (!lookup.state->state()->residentBytes() ||
                        cache_.kvRestoreStatus(requestId) == KvRestoreStatus::Pending);
@@ -893,6 +903,7 @@ bool Engine::admit(Request &active, double now) {
     const uint64_t written = resuming ? uint64_t{resumeBoundary} : workEnd;
     kv = allocate([&] { return cache_.ensureTokens(requestId, workEnd, written); }, inService,
                   upTo, convert, false, &active);
+    funded = funded || kv.funded;
   }
   if (!kv.admission.granted()) {
     // The host continuation survives this failed admission. No recurrent
@@ -918,8 +929,8 @@ bool Engine::admit(Request &active, double now) {
     return false;
   }
   active.resourceWait = {};
-  // A start that memory released for it funded starts now.
-  if (std::exchange(active.funded, false)) {
+  active.fundedByDonor = false;
+  if (funded) {
     ++counters_.spill.funding.starts;
     counters_.spill.funding.latestStart = requestId;
   }
@@ -1629,6 +1640,21 @@ Engine::Prepared Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &i
       const auto pages = static_cast<uint32_t>(
           (uint64_t{scheduled.promptOffset} + scheduled.tokenCount + KvCache::pageTokens - 1) /
           KvCache::pageTokens);
+      // A donor's floor is paid by what its conversion releases
+      // (Request::owedFloor): while the host pauses growth the donor waits
+      // for the copies in flight whose pages pay it until the balance covers
+      // it, rather than grow past what was released, and then takes it from
+      // the balance, which growth draws first; with no copy in flight it
+      // grows as in service.
+      if (!prefill && active.owedFloor && config_.growthPaused() && config_.fund(0) < active.owedFloor &&
+          cache_.transfersInFlight()) {
+        denied.push_back(Denied{id,
+                                workEnd,
+                                {.allocationFailure = metal::AllocationFailure::HostPressure, .pending = true},
+                                std::nullopt,
+                                "hot KV cache"});
+        continue;
+      }
       const auto memory = allocate(
           [&] {
             return prefill ? model_.reserveHistoryStaging(id, pages)
@@ -1956,8 +1982,12 @@ auto Engine::allocate(Attempt &&attempt, bool inService, ReclaimClass upTo,
   // Set once a request in service has nothing held left to reuse: from then
   // on only the engine's limit and critical pressure refuse it.
   bool serving = false;
-  // Set once a start the host refuses has nothing else left (fundStart), and
-  // the mark each attempt from then on carries once the balance covers it.
+  // A start that funding may let through the host's pause: its idle model
+  // memory goes in fundStart's first step, which credits it, not before.
+  const bool fundable = start && !inService && !optional && config_.spill.capable;
+  // Set once the host refuses such a start that has nothing else left
+  // (fundStart), and the mark each attempt from then on carries once the
+  // balance covers it.
   bool funding = false;
   bool funded = false;
   const auto tryOnce = [&] {
@@ -1973,9 +2003,16 @@ auto Engine::allocate(Attempt &&attempt, bool inService, ReclaimClass upTo,
         admission.allocationFailure == metal::AllocationFailure::HostPressure;
     if (funding) {
       const uint64_t shortfall = fundingShortfall(admission, config_.spill.geometry);
+      const auto covered = [&] { return config_.fund(0) >= shortfall + owedFloorBytes_; };
+      // What was released for earlier starts may cover it already.
+      if (!funded && covered()) {
+        funded = true;
+        admission = tryOnce();
+        continue;
+      }
       const CacheReclaimResult step = fundStart(*start, shortfall);
       if (step.madeProgress) {
-        funded = config_.fund(0) >= shortfall + owedFloorBytes_;
+        funded = covered();
         admission = tryOnce();
         continue;
       }
@@ -1985,9 +2022,9 @@ auto Engine::allocate(Attempt &&attempt, bool inService, ReclaimClass upTo,
     }
     CacheReclaimResult reclaimed;
     if constexpr (std::is_same_v<Admission, StateAdmission>)
-      reclaimed = paused ? reuseCachedStateWhilePaused(upTo) : reclaimForState(upTo);
+      reclaimed = paused ? reuseCachedStateWhilePaused(upTo, !fundable) : reclaimForState(upTo);
     else if constexpr (std::is_same_v<Admission, TokenAdmission>)
-      reclaimed = paused ? reuseCachedPagesWhilePaused(admission, upTo)
+      reclaimed = paused ? reuseCachedPagesWhilePaused(admission, upTo, !fundable)
                          : reclaimForKv(admission, upTo);
     else
       // The model's memory for reads of spilled KV (a hot block cache floor,
@@ -2013,12 +2050,13 @@ auto Engine::allocate(Attempt &&attempt, bool inService, ReclaimClass upTo,
     }
     // A start beside a resident lane, which nothing else lets through the
     // host's pause.
-    if (start && paused && !inService && !optional && !reclaimed.pending && config_.spill.capable) {
-      funding = start->funded = true;
+    if (fundable && paused && !reclaimed.pending) {
+      funding = true;
       continue;
     }
     break;
   }
+  result.funded = funded && admission.granted();
   if (!admission.granted()) {
     denial.allocationFailure = admission.allocationFailure;
     denial.pending = denial.pending || transferPending(admission);
@@ -2029,7 +2067,7 @@ auto Engine::allocate(Attempt &&attempt, bool inService, ReclaimClass upTo,
   return result;
 }
 
-CacheReclaimResult Engine::fundStart(const Request &start, uint64_t shortfall) {
+CacheReclaimResult Engine::fundStart(Request &start, uint64_t shortfall) {
   // What a step released leaves the engine: the governor admits the start
   // within it.
   const auto credit = [&](uint64_t SpillFundingSnapshot::Released::*kind, uint64_t bytes) {
@@ -2053,7 +2091,8 @@ CacheReclaimResult Engine::fundStart(const Request &start, uint64_t shortfall) {
   // The Full runway stays for the running lanes' growth: it goes when pages
   // whose copies landed wait for Index pages, whose extents it funds (the
   // Full pages they free return as extents, the next runway among them),
-  // and last, once nothing else gives.
+  // and, once nothing else gives, for a start a donor converted for, whose
+  // freed pages may have become it.
   const auto releaseRunway = [&] { return cache_.releaseEmptyExtents(false, kv::PageForm::Full); };
   if (!spilled.granted() && spilled.form == kv::PageForm::Index)
     if (const uint64_t runway = releaseRunway())
@@ -2062,11 +2101,16 @@ CacheReclaimResult Engine::fundStart(const Request &start, uint64_t shortfall) {
     return {.pending = true};
   if (const uint64_t streamed = model_.reclaimIdleState(true, model::IdleMemory::Streamed))
     return credit(&SpillFundingSnapshot::Released::streamed, streamed);
-  // The donor's copies keep the cache's reclaim pending until they land.
-  if (convertDonor(start, shortfall))
-    return {.pending = cache_.transfersInFlight()};
-  if (const uint64_t runway = releaseRunway())
-    return credit(&SpillFundingSnapshot::Released::cache, runway);
+  // The next step moves and credits the donor's pages whose copies are
+  // there already, as a chain restored from the SSD cache has them, and its
+  // copies in flight keep the cache's reclaim pending until they land.
+  if (convertDonor(start, shortfall)) {
+    start.fundedByDonor = true;
+    return {.madeProgress = true};
+  }
+  if (start.fundedByDonor)
+    if (const uint64_t runway = releaseRunway())
+      return credit(&SpillFundingSnapshot::Released::cache, runway);
   return {};
 }
 
@@ -2174,9 +2218,10 @@ bool Engine::reclaimIdleState(bool keepLane, model::IdleMemory scope) noexcept {
 // lane draws from, and nothing is allocated. A state goes only when those in
 // RAM cover what the pool lacks, which they never do for the draft rings no
 // cached state holds; otherwise the cache survives, and the request grows if
-// it is in service and waits if it is not.
-CacheReclaimResult Engine::reuseCachedStateWhilePaused(ReclaimClass upTo) {
-  if (reclaimIdleState(true))
+// it is in service and waits if it is not. Idle model memory goes first,
+// unless funding takes it for a start (releaseIdle).
+CacheReclaimResult Engine::reuseCachedStateWhilePaused(ReclaimClass upTo, bool releaseIdle) {
+  if (releaseIdle && reclaimIdleState(true))
     return {true, 0};
   const uint32_t lacked = model_.statesToActivate();
   if (!lacked || cache_.evictableStates(upTo) < lacked)
@@ -2200,10 +2245,11 @@ CacheReclaimResult Engine::reuseCachedStateWhilePaused(ReclaimClass upTo) {
 // reclaim that must wait for the transfer in flight makes the request wait
 // with it, as it does without the pause. Idle model state goes first, but
 // not the pooled buffers the next lane starts from: they would not let this
-// request grow, and the paced pass keeps them for the next one.
+// request grow, and the paced pass keeps them for the next one; nor for a
+// start funding may fund, whose funding takes it (releaseIdle).
 CacheReclaimResult Engine::reuseCachedPagesWhilePaused(const TokenAdmission &admission,
-                                                       ReclaimClass upTo) {
-  if (reclaimIdleState(true))
+                                                       ReclaimClass upTo, bool releaseIdle) {
+  if (releaseIdle && reclaimIdleState(true))
     return {true, 0};
   if (cache_.reusablePages(upTo, admission.form) < admission.additionalPages)
     return {};
@@ -2243,8 +2289,7 @@ void Engine::suspendForGrowth(Request &active, uint64_t workEnd,
 MemoryReclaimResult Engine::reclaimMemory(const MemoryReclaimDirective &directive) {
   if (pending_)
     throw std::logic_error("memory reclaim requested while a command is in flight");
-  if (cache_.pollTransfers())
-    signalResourceProgress();
+  static_cast<void>(landTransfers());
 
   const bool keep = !directive.critical;
   uint64_t released = 0;
