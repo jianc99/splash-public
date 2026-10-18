@@ -1343,10 +1343,11 @@ Engine::Prepared Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &i
       item.requestId = active.request.id;
       item.logicalPosition = prefill ? scheduled.promptOffset : active.exactTokens.size();
       item.tokenCount = scheduled.tokenCount;
-      const PageTableView pageTable = cache_.pageTable(active.request.id);
+      const PageTableView pageTable = cache_.cutPageTable(active.request.id);
       item.pageTable = pageTable.pages;
       item.pageTableRevision = pageTable.revision;
       item.pageTableFirstChanged = pageTable.firstChanged;
+      item.pageSources = pageTable.sources;
       if (prefill) {
         item.inputTokens =
             std::span<const uint32_t>(active.exactTokens)
