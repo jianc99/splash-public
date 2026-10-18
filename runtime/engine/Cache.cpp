@@ -901,9 +901,12 @@ bool Cache::convertToSpill(uint64_t requestId, uint32_t pages) {
   oweCopies(active, active.cachedBlocks);
   // The blocks it shares with Spill requests may spill now, and its own
   // writes start at once: what lands frees pages its retry waits for
-  // (pendingPages).
+  // (pendingPages). Its blocks whose copies landed before, as a chain it
+  // restored has them, spill at once into free Index pages, whose Full
+  // pages the retry takes.
   rescanSpills();
   static_cast<void>(writeThrough());
+  static_cast<void>(moveLandedPages(false));
   return true;
 }
 
@@ -1030,7 +1033,9 @@ void Cache::rescanSpills() noexcept {
     active.spillScan = 0;
 }
 
-TokenAdmission Cache::spillWritten() {
+TokenAdmission Cache::spillWritten() { return moveLandedPages(true); }
+
+TokenAdmission Cache::moveLandedPages(bool allocate) {
   if (!spill_)
     return {};
   std::vector<uint32_t> pages;
@@ -1065,8 +1070,11 @@ TokenAdmission Cache::spillWritten() {
   std::sort(pages.begin(), pages.end());
   pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
   // Free Index pages first, the runway's among them: a spill never waits
-  // for an allocation. The rest asks for extents of the index form.
+  // for an allocation. The rest, if it may allocate, asks for extents of
+  // the index form.
   const auto now = std::min<size_t>(pages.size(), pool_.freePageCount(kv::PageForm::Index));
+  if (!allocate)
+    pages.resize(now);
   for (const std::span<const uint32_t> part :
        {std::span<const uint32_t>(pages).first(now), std::span<const uint32_t>(pages).subspan(now)}) {
     if (part.empty())
@@ -1078,6 +1086,8 @@ TokenAdmission Cache::spillWritten() {
     followMoves(moved.moves);
     spilled_.spillMoves += part.size();
   }
+  if (!allocate)
+    return {};
   // Then the runway, an extent's free Index pages, is refilled: the next
   // spill frees Full pages without an allocation, at the memory wall too,
   // where a converted request's pages spill through it (pendingPages).

@@ -4982,6 +4982,44 @@ void testPagesPastTheCommitmentCommitTheirSlots() {
   spill.cache.endRequest(1);
 }
 
+// A Resident request whose history has copies already, as a chain it
+// restored from an earlier Spill request's has them, converts like one
+// without: its pages whose copies landed spill at once, through free Index
+// pages and without an allocation, and the admission run again grows into
+// their Full pages instead of being refused.
+void testConversionSpillsTheHistoryWithCopiesAtOnce() {
+  Spilling spill;
+  const std::vector<uint32_t> prompt = Spilling::prompt(1000, 6);
+  spill.start(1, prompt, 6);
+  static_cast<void>(test::spillRound(spill.cache, spill.tier));
+  spill.publishState(spill.block(1, 5));
+  spill.cache.endRequest(1);
+  // The only holder of the spilled chain moves it back to Full pages and
+  // restores them whole, their copies kept.
+  CacheLookup lookup = spill.cache.lookup(prompt, {});
+  spill.cache.beginRequest(2);
+  require(admitRestore(spill.cache, 2, lookup).granted() && spill.cache.spillSnapshot().unspills == 4,
+          "the Resident request did not restore the spilled chain whole");
+  spill.tier.complete();
+  static_cast<void>(spill.cache.pollTransfers());
+  spill.storage.growthBlocked = true;
+  const uint32_t held = static_cast<uint32_t>(spill.cache.pageTable(2).pages.size());
+  const uint64_t tokens = uint64_t{held + spill.pool.freePageCount() + 1} * KvCache::pageTokens;
+  require(spill.cache.ensureTokens(2, tokens).failure == TokenAdmissionFailure::Denied,
+          "the fixture's growth was not denied");
+  const uint32_t writes = static_cast<uint32_t>(spill.tier.writes.size());
+  const uint32_t allocations = spill.storage.allocationAttempts;
+  require(spill.cache.convertToSpill(2, 0) && spill.tier.writes.size() == writes &&
+              spill.spilled(2) == std::vector<bool>{false, true, true, true, true, false} &&
+              spill.storage.allocationAttempts == allocations,
+          "the conversion did not spill the pages whose copies had landed at once, or wrote or allocated");
+  require(spill.cache.ensureTokens(2, tokens).granted(),
+          "the converted request did not grow into the pages its spill freed");
+  spill.cache.checkInvariants();
+  lookup = {};
+  spill.cache.endRequest(2);
+}
+
 // A page spills once every request that holds it spills and holds it past
 // its dense history and outside its tail window: a Resident holder keeps it
 // Full while it lives, and a holder whose window still covers it until it
@@ -5202,6 +5240,7 @@ int main() {
     testCommitmentsLockQuotaUntilWritten();
     testFailedWritesKeepTheirCommitment();
     testPagesPastTheCommitmentCommitTheirSlots();
+    testConversionSpillsTheHistoryWithCopiesAtOnce();
     testEveryHolderDecidesWhetherAPageSpills();
     testBlocksAreWrittenOnce();
     testUnreadableCopyLeavesWithItsHolders();

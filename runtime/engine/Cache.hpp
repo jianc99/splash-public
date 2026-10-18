@@ -381,9 +381,9 @@ public:
   [[nodiscard]] bool commitSpill(uint64_t requestId, uint32_t pages);
   // Turns a Resident request whose growth was denied into a Spill request:
   // checks the tier, the write budget and the room for `pages` pages,
-  // commits them and starts write-through of its published blocks. It
-  // allocates nothing; false, changing nothing, when spilling cannot relieve
-  // it.
+  // commits them, starts write-through of its published blocks and moves
+  // those whose copies landed already into free Index pages. It allocates
+  // nothing; false, changing nothing, when spilling cannot relieve it.
   [[nodiscard]] bool convertToSpill(uint64_t requestId, uint32_t pages);
   // The blocks on the chain that ends at this block (none for 0) whose K/V
   // has a copy, landed or being written: pages of a Spill request that
@@ -853,6 +853,9 @@ private:
   // Rescans every Spill request's blocks from its dense history: a holder
   // that kept some of them Full ended or began to spill.
   void rescanSpills() noexcept;
+  // spillWritten(), or without `allocate` only its moves into free Index
+  // pages, which allocate nothing: those past them stay Full.
+  [[nodiscard]] TokenAdmission moveLandedPages(bool allocate);
   // The copy of the K/V on an Index page.
   [[nodiscard]] model::KvPageSource sourceOf(uint32_t page) const;
 
