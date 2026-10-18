@@ -4,7 +4,6 @@
 #include <algorithm>
 #include <chrono>
 #include <limits>
-#include <numeric>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -226,8 +225,8 @@ KvPageMoves KvPool::compactExtent(std::span<const uint32_t> fixed) {
                      return extents_[left].usedPages > extents_[right].usedPages;
                    });
   const uint32_t first = firstPage(emptied);
-  std::vector<kv::PageCopy> copies;
-  copies.reserve(extents_[emptied].usedPages);
+  KvPageMoves moves;
+  moves.moved.reserve(extents_[emptied].usedPages);
   auto receiver = receivers.begin();
   uint32_t to = extents_[*receiver].freePages.head;
   for (uint32_t page = first; page < first + extentPages_; ++page) {
@@ -236,23 +235,20 @@ KvPageMoves KvPool::compactExtent(std::span<const uint32_t> fixed) {
     // The receivers' free pages cover the extent, so one always follows.
     while (to == noIndex)
       to = extents_[*++receiver].freePages.head;
-    copies.push_back({page, to});
+    moves.moved.push_back({page, to});
     to = pages_[to].nextFree;
   }
 
-  storage_.copyPages(copies);
-  KvPageMoves moves{first, std::vector<uint32_t>(extentPages_)};
-  std::iota(moves.destinations.begin(), moves.destinations.end(), first);
-  for (const kv::PageCopy &copy : copies) {
+  storage_.copyPages(moves.moved);
+  for (const kv::PageCopy &copy : moves.moved) {
     markUsed(copy.to);
     pages_[copy.to].activeReferences =
         std::exchange(pages_[copy.from].activeReferences, 0);
     pages_[copy.to].prefixOwned = std::exchange(pages_[copy.from].prefixOwned, false);
     markFree(copy.from);
-    moves.destinations[copy.from - moves.firstPage] = copy.to;
   }
   ++extentCompactions_;
-  pagesMoved_ += copies.size();
+  pagesMoved_ += moves.moved.size();
   return moves;
 }
 

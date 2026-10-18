@@ -10,6 +10,7 @@
 namespace {
 
 using splash::engine::KvPool;
+using splash::kv::PageCopy;
 using splash::metal::AllocationFailure;
 using splash::test::TestKvStorage;
 
@@ -309,8 +310,7 @@ void testCompactionEmptiesTheExtentWithTheFewestPages() {
     KvPool pool = held(storage, {0, 1, 2, 7, 10, 11});
     pool.retainPage(3, true);
     const auto moves = pool.compactExtent({});
-    require(!moves.empty() && moves.firstPage == 0 &&
-                moves.destinations.size() == 4 && moves.follow(3) == 7 &&
+    require(moves.moved == std::vector<PageCopy>{{3, 7}} && moves.follow(3) == 7 &&
                 moves.follow(0) == 0 && moves.follow(8) == 8,
             "compaction did not move the emptiest extent's page to the fullest one");
     require(storage.copies.size() == 1 && storage.copies[0].from == 3 &&
@@ -340,7 +340,7 @@ void testCompactionFillsTheFullestExtentsFirst() {
     // Extents 0 and 1 keep three pages each, extents 2 and 3 two each.
     KvPool pool = held(storage, {3, 7, 10, 11, 14, 15});
     const auto moves = pool.compactExtent({});
-    require(moves.firstPage == 8 && moves.follow(8) == 3 && moves.follow(9) == 7 &&
+    require(moves.moved == std::vector<PageCopy>{{8, 3}, {9, 7}} &&
                 storage.content[3] == 108 && storage.content[7] == 109,
             "compaction did not fill the fullest extents first");
     // Extents 0 and 1 are full now; extent 3's two pages have nowhere to go.
@@ -376,8 +376,8 @@ void testCompactionLeavesFixedPagesInPlace() {
             "compaction emptied an extent that holds a fixed page");
     const std::vector<uint32_t> fixed{9};
     const auto moves = pool.compactExtent(fixed);
-    require(moves.firstPage == 12 && moves.follow(12) == 3 && moves.follow(13) == 7 &&
-                moves.follow(9) == 9 && pool.pageActive(9),
+    require(moves.moved == std::vector<PageCopy>{{12, 3}, {13, 7}} && moves.follow(9) == 9 &&
+                pool.pageActive(9),
             "compaction did not pass over the extent with a fixed page");
 }
 

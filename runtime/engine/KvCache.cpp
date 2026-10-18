@@ -418,19 +418,15 @@ void KvCache::giveDiskCopy(Block &entry, std::shared_ptr<KvDiskSlot> slot) noexc
 
 void KvCache::followPages(const KvPageMoves &moves) noexcept {
   // Destinations lie in other extents and were free, so no block is on one.
-  for (uint32_t offset = 0; offset < moves.destinations.size(); ++offset) {
-    const uint32_t from = moves.firstPage + offset;
-    const uint32_t to = moves.destinations[offset];
-    if (to == from)
-      continue;
-    const uint64_t id = std::exchange(blockOnPage_[from], 0);
+  for (const kv::PageCopy &move : moves.moved) {
+    const uint64_t id = std::exchange(blockOnPage_[move.from], 0);
     if (!id)
       continue;
     const auto found = blocks_.find(id);
     if (found == blocks_.end())
       std::terminate();
-    found->second.page = to;
-    blockOnPage_[to] = id;
+    found->second.page = move.to;
+    blockOnPage_[move.to] = id;
   }
 }
 
