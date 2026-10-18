@@ -19,8 +19,8 @@
 // which the row attends sparsely. The layer's index holds the pooled key of
 // every complete block (bf16 [dimension]): a lane's index table holds an
 // entry per logical page (SplashKvPage), the page's blocks' keys
-// `index_offset` bytes into the entry's extent, after those of the pages
-// before it in the extent (ops::BlockIndex). A block pools the raw keys of
+// `index_offset` bytes into the index plane the entry names, after those
+// of the pages before it (ops::BlockIndex). A block pools the raw keys of
 // its tokens: a step's rows' (bf16 [row][dimension], which the project
 // writes) and, before a lane's first row, the lane's pending keys, those of
 // its open block (bf16 [slot][dimension] of BLOCK_INDEXER_PENDING slots, the
@@ -65,7 +65,7 @@ struct BlockIndexerParams {
   uint32_t top_blocks;
   uint32_t mask_words;   // 32-bit words of a row's block bitmap
   uint32_t score_stride; // scores per row of the score scratch
-  uint32_t index_offset; // the layer's index in every index entry's extent, in bytes
+  uint32_t index_offset; // the layer's index in every index entry's plane, in bytes
   float rope_scale;
 };
 
