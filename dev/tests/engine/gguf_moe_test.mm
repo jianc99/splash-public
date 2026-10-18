@@ -4,9 +4,10 @@
 // - Float projection, both tiles (fp32 simdgroup MMA, and the neural
 //   accelerator on three exact bf16 parts per weight): every row count a
 //   decode or prefill dispatch takes (with ragged tile tails), the router and
-//   alpha/beta widths, bf16 and fp32 destinations at a column offset of a
-//   wider row; neighbours stay untouched. BF16 weights (a router a GGUF
-//   stores so) give the outputs of the F32 tensor of their values bit for bit.
+//   alpha/beta widths at K of whole and partial 64-input steps, bf16 and fp32
+//   destinations at a column offset of a wider row; neighbours stay
+//   untouched. BF16 weights (a router a GGUF stores so) give the outputs of
+//   the F32 tensor of their values bit for bit.
 // - Float segments of a fused GGUF projection (Linear), the 35B's and the
 //   27B's F32 alpha/beta widths, on either float tile: the quantized
 //   segments' outputs unchanged, the padding past the segments unwritten.
@@ -133,10 +134,12 @@ bool inside(float got, double exact, double bound) {
 
 // ---------------------------------------------------------------- float projection
 // The input holds exactly the dispatch's rows, so a tile reading past them
-// would fail shader validation.
+// would fail shader validation. The simdgroup tile reads K in steps of 64
+// inputs, zeros past a row's end: K = 96 and 2080 end in part of a step, and
+// K = 96 leaves six of its eight K parts without one.
 int floatProjection(MetalBackend &backend) {
   int failures = 0;
-  for (const uint32_t K : {512u, 2048u})
+  for (const uint32_t K : {96u, 512u, 2048u, 2080u})
     for (const uint32_t N : {16u, 64u, 256u}) {
       const Tensor w = floating(backend, N, K, 0.05f);
       for (const FloatTile tile : {FloatTile::Simdgroup, FloatTile::NeuralAccelerator}) {

@@ -642,9 +642,10 @@ void Linear::addGgufFloatSegments(metal::CommandGraph &graph, const LinearBuffer
 // FP32 pipe, where three bf16 matmuls cost three fp32 ones) and a grid of its
 // 64-row by 32-column tiles of at least three threadgroups per two cores. A
 // tile runs K / 32 dependent steps, while the fp32 kernel spreads fewer rows
-// over 8-column tiles with 16 K partitions each and finishes first below that
-// grid: at the 35B's K = 2048 the two take the same time at 1.4-1.6 tiles per
-// core for both of its float projections on the 16- and 20-core M5 Pro.
+// over 8-column tiles with 8 K partitions each and finishes first below that
+// grid: on the 20-core M5 Pro the two take the same time at about 1.5 tiles
+// per core for Flash-Next's BF16 router (K = 2560), and at about 2.2 for the
+// 35B's F32 router (K = 2048), whose weights take three matmuls a step.
 FloatTile Linear::ggufFloatTile(uint32_t rows, uint32_t outputSize) const noexcept {
   const uint64_t tiles = uint64_t{(rows + 63) / 64} * ((outputSize + 31) / 32);
   return family_ == GpuFamilyClass::Apple10 && rows >= 16 && 2 * tiles >= uint64_t{3} * gpuCores_
@@ -652,7 +653,7 @@ FloatTile Linear::ggufFloatTile(uint32_t rows, uint32_t outputSize) const noexce
              : FloatTile::Simdgroup;
 }
 
-// Simdgroup: 8 columns of 32 rows per threadgroup of 16 simdgroups. Neural
+// Simdgroup: 8 columns of 32 rows per threadgroup of 8 simdgroups. Neural
 // accelerator: 32 columns of 64 rows per threadgroup of 4 simdgroups, at least
 // 16 rows and K a multiple of 32 (kernels/shared/gguf_float.metal).
 void addGgufFloat(metal::CommandGraph &graph, metal::MetalBuffer input, const QuantizedSegment &weights,
@@ -671,7 +672,7 @@ void addGgufFloat(metal::CommandGraph &graph, metal::MetalBuffer input, const Qu
   const metal::DispatchSize grid = accelerator ? metal::DispatchSize{(n + 31) / 32, (rows + 63) / 64, 1}
                                                : metal::DispatchSize{n / 8, (rows + 31) / 32, 1};
   graph.add(kernel, {std::move(input), weights.plane0, std::move(output)},
-            GgufFloatParams{rows, k, n, outStride, outOffset}, grid, {accelerator ? 128u : 512u, 1, 1});
+            GgufFloatParams{rows, k, n, outStride, outOffset}, grid, {accelerator ? 128u : 256u, 1, 1});
 }
 
 void requireSegmentPlanes(const QuantizedSegment &segment, std::string_view what, uint32_t planeInputs) {
