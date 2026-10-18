@@ -3,6 +3,7 @@
 #include "TestChecks.hpp"
 #include "model/Crc32c.hpp"
 #include "model/SlotFile.hpp"
+#include "model/SsdReaders.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -48,6 +49,7 @@ using splash::kHostPageBytes;
 using splash::model::DiskBudget;
 using splash::model::SlotFile;
 using splash::model::SlotRecord;
+using splash::model::SsdReaders;
 
 // A slot is its payload rounded up to whole host pages, as uncached IO wants.
 static_assert(SlotFile::slotBytesFor(1) == kHostPageBytes &&
@@ -996,6 +998,38 @@ static void testWritesDeferToReads() {
   require(file.read(slot, {output}, {})->wait() && output == payload, "a deferred write did not land");
 }
 
+// A file's writes watch the readers without keeping them
+// (SsdReaders::criticalBusyProbe), so the slots a reader's task holds never
+// make it the readers' last owner: a task that holds a file's last slot ends,
+// and lets the slot go, after the file and the readers' owner let go of them,
+// and the readers stop. Built under TSan too.
+static void testSlotsKeepNoReaders() {
+  constexpr size_t size = kHostPageBytes;
+  auto readers = std::make_shared<SsdReaders>(1);
+  const std::weak_ptr<SsdReaders> watched = readers;
+  auto file = std::make_unique<SlotFile>(size, std::make_shared<DiskBudget>(size),
+                                         SlotFile::Options{.deferWrites = readers->criticalBusyProbe()});
+  require(watched.use_count() == 1, "a slot file kept the readers its writes watch");
+  std::promise<void> began, release;
+  auto batch = readers->start(
+      1,
+      [slot = file->acquire(), &began, released = release.get_future().share()](size_t) {
+        began.set_value();
+        released.wait();
+      },
+      1);
+  began.get_future().wait();
+  readers->halt(*batch);
+  batch.reset();
+  file.reset();
+  std::thread owner([&] {
+    while (!watched.expired()) std::this_thread::yield();
+    release.set_value();
+  });
+  readers.reset();
+  owner.join();
+}
+
 int main() {
   try {
     testFailedWriteStopsWriting();
@@ -1019,6 +1053,7 @@ int main() {
     testCommitmentsDrawWithinTheActiveLimit();
     testSpillsWithinTheWriteBudget();
     testWritesDeferToReads();
+    testSlotsKeepNoReaders();
     constexpr size_t size = 4 * kHostPageBytes;
     auto budget = std::make_shared<DiskBudget>(size * 2 + 1);
     SlotFile file(size, budget);

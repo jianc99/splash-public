@@ -27,7 +27,9 @@
 // Threads: any thread runs, starts, stops and finishes batches; a batch's
 // tasks run on the readers and on the threads that run it now, each once.
 // A store stops or finishes its background batches before the memory they
-// read into goes, and the readers before they go.
+// read into goes, and the readers before they go. A batch, and what its
+// tasks hold, may go on a reader that holds the readers' lock, so a task
+// owns nothing that owns the readers.
 
 #include <atomic>
 #include <condition_variable>
@@ -136,9 +138,15 @@ public:
 
   [[nodiscard]] unsigned readers() const noexcept { return static_cast<unsigned>(threads_.size()); }
   // A batch runs now, from its start until its last task ended: a step waits
-  // for reads, which writes to the same drive yield to
-  // (model::SlotFile::Options::deferWrites).
-  [[nodiscard]] bool criticalBusy() const noexcept { return running_.load(std::memory_order_acquire) != 0; }
+  // for reads, which writes to the same drive yield to.
+  [[nodiscard]] bool criticalBusy() const noexcept { return running_->load(std::memory_order_acquire) != 0; }
+  // criticalBusy() for what may outlive the readers, a slot file's writes
+  // (model::SlotFile::Options::deferWrites): it shares their count of
+  // batches running now and nothing else, so it keeps no reader alive, and
+  // once they are gone it is false.
+  [[nodiscard]] std::function<bool()> criticalBusyProbe() const {
+    return [running = running_] { return running->load(std::memory_order_acquire) != 0; };
+  }
 
 private:
   void readerLoop();
@@ -155,8 +163,9 @@ private:
   std::mutex mutex_;
   std::condition_variable wake_;
   std::deque<std::shared_ptr<Batch>> now_, background_;
-  // Batches running now, from their start until their last task ended.
-  std::atomic<unsigned> running_{0};
+  // Batches running now, from their start until their last task ended,
+  // shared with criticalBusyProbe().
+  const std::shared_ptr<std::atomic<unsigned>> running_ = std::make_shared<std::atomic<unsigned>>(0);
   bool stopping_ = false;
   std::vector<std::thread> threads_;
 };
