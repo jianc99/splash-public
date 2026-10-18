@@ -161,7 +161,7 @@ private:
   bool handleMaskIssue(protocol::ProtocolIssue issue);
   bool handleIssue(protocol::ProtocolIssue issue);
   void requestError(uint64_t requestId, std::string code, std::string message,
-                    bool retryable = false);
+                    bool retryable = false, uint32_t retryAfterSeconds = 0);
   void engineError(std::string code, std::string message);
   void executionFailed(std::exception_ptr error);
   bool send(const protocol::EngineEvent &event);
@@ -184,7 +184,7 @@ private:
                  std::span<const float> optionLogits,
                  const SpeculativeCounts &speculation) override;
   void failed(uint64_t requestId, LaneOutcome outcome,
-              std::string message) override;
+              std::string message, uint32_t retryAfterSeconds) override;
 
   static uint64_t durationMicros(double startMilliseconds,
                                  double endMilliseconds);

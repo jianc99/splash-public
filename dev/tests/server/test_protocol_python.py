@@ -150,6 +150,14 @@ def engine_events():
             b"deadline_exceeded",
             b"request deadline expired",
         ),
+        "error_retry_after": p.ErrorEvent(
+            p.FailureClass.REQUEST_ERROR,
+            91,
+            True,
+            b"kv_write_budget",
+            b"the SSD cache's write budget is spent",
+            21_600,
+        ),
         "error_engine": p.ErrorEvent(
             p.FailureClass.ENGINE_UNHEALTHY,
             0,
@@ -951,7 +959,7 @@ class ProtocolPythonTests(unittest.TestCase):
         error = native_peer.serialize_event(
             p.ErrorEvent(p.FailureClass.REQUEST_ERROR, 7, False, b"bad", b"message")
         )
-        bad_error = mutate_u32(error, p.FRAME_HEADER_BYTES + 10, 0xFFFFFFFF)
+        bad_error = mutate_u32(error, p.FRAME_HEADER_BYTES + 14, 0xFFFFFFFF)
         self.assert_protocol_error(
             p.FailureClass.PROTOCOL_FATAL,
             p.IssueCode.INVALID_PAYLOAD_LENGTH,
@@ -960,6 +968,11 @@ class ProtocolPythonTests(unittest.TestCase):
         self.assert_fatal_event(
             p.IssueCode.INVALID_ERROR_CLASSIFICATION,
             p.ErrorEvent(p.FailureClass.ENGINE_UNHEALTHY, 7, False, b"bad", b""),
+        )
+        # Only a retryable error says when to retry.
+        self.assert_fatal_event(
+            p.IssueCode.INVALID_ERROR_CLASSIFICATION,
+            p.ErrorEvent(p.FailureClass.REQUEST_ERROR, 7, False, b"bad", b"", 60),
         )
 
     def test_status_json_is_opaque_length_delimited_and_bounded(self):

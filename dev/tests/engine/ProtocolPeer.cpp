@@ -220,6 +220,7 @@ EngineEvent decodeEvent(FrameType type, Reader &in) {
     ErrorEvent event;
     event.failureClass = static_cast<FailureClass>(in.u8());
     event.retryable = in.u8() != 0;
+    event.retryAfterSeconds = in.u32();
     event.requestId = in.u64();
     const uint32_t codeBytes = in.u32();
     const uint32_t messageBytes = in.u32();

@@ -180,8 +180,10 @@ public:
                          uint32_t deduplicatedTokens,
                          std::span<const float> optionLogits,
                          const SpeculativeCounts &speculation) = 0;
+  // retryAfterSeconds: for a retryable outcome, when a retry may succeed;
+  // 0 for at once.
   virtual void failed(uint64_t requestId, LaneOutcome outcome,
-                      std::string message) = 0;
+                      std::string message, uint32_t retryAfterSeconds) = 0;
 };
 
 } // namespace splash::engine

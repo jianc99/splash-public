@@ -250,6 +250,9 @@ const std::vector<std::pair<std::string, EngineEvent>> &engineEvents() {
       {"error_request",
        ErrorEvent{FailureClass::RequestError, 91, true, "deadline_exceeded",
                   "request deadline expired"}},
+      {"error_retry_after",
+       ErrorEvent{FailureClass::RequestError, 91, true, "kv_write_budget",
+                  "the SSD cache's write budget is spent", 21'600}},
       {"error_engine", ErrorEvent{FailureClass::EngineUnhealthy, 0, false,
                                   "gpu_fault", "Metal command buffer failed"}},
       {"error_protocol",
@@ -1023,6 +1026,10 @@ void testFailureTaxonomy() {
                    IssueCode::IntegerOverflow);
   expectEventIssue(test,
                    ErrorEvent{FailureClass::RequestError, 0, false, "bad", ""},
+                   IssueCode::InvalidErrorClassification);
+  // Only a retryable error says when to retry.
+  expectEventIssue(test,
+                   ErrorEvent{FailureClass::RequestError, 5, false, "bad", "", 60},
                    IssueCode::InvalidErrorClassification);
 }
 

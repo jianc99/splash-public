@@ -291,9 +291,12 @@ public:
   [[nodiscard]] bool flushRestorePoints();
 
 private:
+  // A lane's end other than its output's, and for a retryable outcome the
+  // seconds after which a retry may succeed, 0 for at once.
   struct LaneEnd final {
     LaneOutcome outcome;
     std::string message;
+    uint32_t retryAfterSeconds = 0;
   };
 
   struct ResourceWait final {
