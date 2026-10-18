@@ -334,14 +334,18 @@ public:
     return slab<float>(lane, tensor, token) +
            splash_kv_scale_element(head, token % kv::kPageTokens);
   }
+  // The pool's extents, and the page of a lane's token in them.
+  [[nodiscard]] const HostKvExtents &pool() const noexcept { return pages_; }
+  [[nodiscard]] uint32_t page(uint32_t lane, uint32_t token) const {
+    return pageIds_[lane][token / kv::kPageTokens];
+  }
 
 private:
   template <typename T> T *data(Tensor tensor) const {
     return static_cast<T *>(buffer(tensor).contents());
   }
   template <typename T> T *slab(uint32_t lane, uint32_t tensor, uint32_t token) const {
-    return pages_.slab<T>(plan_.geometry.layer, tensor,
-                          pageIds_[lane][token / kv::kPageTokens]);
+    return pages_.slab<T>(plan_.geometry.layer, tensor, page(lane, token));
   }
 
   AttentionFixturePlan plan_;
