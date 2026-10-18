@@ -1,0 +1,38 @@
+#pragma once
+
+// What a model's weights take, sized from its files before it loads, which
+// the memory planner sizes the stores of the parts that stream from the SSD
+// by (engine::planStreamedMemory): the images that load whatever streams,
+// and each part that may stream, whole and at its smallest store.
+
+#include "model/ModelDescriptor.hpp"
+
+#include <cstdint>
+#include <filesystem>
+
+namespace splash::model {
+
+struct StreamableWeights final {
+  // The images the model loads while every part below streams: the
+  // target's without its routed experts or table, the draft's and the
+  // vision tower's.
+  uint64_t loadedBytes = 0;
+  // A MoE target's routed experts: the bytes they load with their layers,
+  // and the smallest store that streams them (ExpertStore::minimumBytes);
+  // zero for a dense FFN.
+  uint64_t expertBytes = 0;
+  uint64_t expertFloorBytes = 0;
+  // The table a GGUF target holds (Qwen3.8-Flash-Next's PLE n-gram table):
+  // the bytes it loads, and the smallest row cache that streams it, which
+  // holds one row beside its working memory (SparseRowStore); zero without
+  // one.
+  uint64_t tableBytes = 0;
+  uint64_t tableFloorBytes = 0;
+};
+
+// The model's weights in `root`, planned from its files' metadata as its
+// loaders plan them, without loading them.
+[[nodiscard]] StreamableWeights streamableWeights(const std::filesystem::path &root,
+                                                  const ModelDescriptor &descriptor);
+
+} // namespace splash::model

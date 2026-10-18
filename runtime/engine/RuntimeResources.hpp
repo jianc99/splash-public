@@ -9,6 +9,8 @@
 #include "engine/MemoryGovernor.hpp"
 #include "engine/KvPageTier.hpp"
 #include "ops/PageStorage.hpp"
+#include "model/KvBlockCache.hpp"
+#include "model/KvHistoryStream.hpp"
 #include "model/ModelFactory.hpp"
 #include "model/QwenState.hpp"
 #include "model/SparseRowStore.hpp"
@@ -135,17 +137,23 @@ struct RuntimeResourcesConfig {
   // Reclaimable host memory, sampled at every Metal operation during startup
   // and by the governor afterwards.
   MemoryGovernor::HostMemoryProvider hostMemory = queryHostMemory;
-  // --ple-memory: a target's PLE n-gram table, which its GGUF holds,
-  // streams from the file through a row cache of this many bytes instead of
-  // loading into memory (model::streamableTableBytes); zero loads it.
-  // Ignored, with a warning, for a target without one.
-  uint64_t streamedTableBytes = 0;
+  // --ple-memory: a target's PLE n-gram table, which its GGUF holds, streams
+  // from the file through a row cache of a size, or loads (off); auto leaves
+  // it to the memory plan (planStreamedMemory). Ignored, with a warning, for
+  // a target without one, and a size that holds the whole table loads it.
+  StreamedSetting pleMemory;
   // --expert-memory: a MoE target's routed experts stream from their files
-  // through a store of this many bytes (its slots, staging and tables)
-  // instead of loading with their layers; zero loads them. Ignored, with a
-  // warning, for a dense target, and for bytes that hold every routed
-  // expert, which then load with their layers.
-  uint64_t expertMemoryBytes = 0;
+  // through a store of a size (its slots, staging and tables), or load with
+  // their layers (off); auto leaves them to the memory plan. Ignored, with a
+  // warning, for a dense target, and a size that holds every routed expert
+  // loads them.
+  StreamedSetting expertMemory;
+  // --sparse-kv-memory: the target of a spill-capable target's hot block
+  // cache, at least its floor, which auto keeps.
+  StreamedSetting sparseKvMemory;
+  // --kv-spill always: every request of a spill-capable target spills, for
+  // validation (EngineSpillConfig::always).
+  bool kvSpillAlways = false;
   // The prefill FFN's Neural Engine split (startAneFfn): off with
   // --disable-ane, and a benchmark round runs the split of the first so that
   // rounds repeat one another.
@@ -210,18 +218,20 @@ private:
 };
 
 // Owns every process-wide native resource exactly once. Members go in
-// reverse declaration order: what the engine gives back while idle -> Neural
-// Engine split -> Cache -> KV pool -> the disk tier's space -> KV disk tier
-// -> state storage -> KV page storage -> governor -> loaded model -> SSD
-// readers -> Metal backend -> a persistent tier's directory, whose lock goes
-// last. The readers outlive what reads on them. The tier's files, whose
-// writes hold back for the readers' urgent reads, only watch them
-// (SsdReaders::criticalBusyProbe), so they and their slots may outlive them.
-// The KV disk tier must go before the KV page storage: its IO worker reads
-// and writes pages in place in the extents, and its destructor waits for
-// every transfer in flight. A persistent tier's files are sealed first,
-// however the process ends, so that the copies the cache lets go of stay for
-// the next process.
+// reverse declaration order: what the engine gives back while idle -> the
+// readers of spilled KV (history stream, hot block cache) -> Neural Engine
+// split -> Cache -> KV pool -> the disk tier's space -> KV disk tier -> state
+// storage -> KV page storage -> governor -> loaded model -> SSD readers ->
+// Metal backend -> a persistent tier's directory, whose lock goes last.
+// The readers of spilled KV drain their reads before the cache and the tier
+// whose copies they read go, and those drain theirs before the SSD readers
+// stop. The tier's files, whose writes hold back for the readers' urgent
+// reads, only watch them (SsdReaders::criticalBusyProbe), so they and their
+// slots may outlive them. The KV disk tier must go before the KV page
+// storage: its IO worker reads and writes pages in place in the extents, and
+// its destructor waits for every transfer in flight. A persistent tier's
+// files are sealed first, however the process ends, so that the copies the
+// cache lets go of stay for the next process.
 class RuntimeResources final {
 public:
   // `requestedContextTokens` is the context the engine is asked to hold
@@ -272,6 +282,10 @@ public:
   [[nodiscard]] std::optional<model::SparseRowStats> streamedTableStats() const;
   // The streamed routed experts' store (--expert-memory), if the model has one.
   [[nodiscard]] std::optional<model::ExpertStoreStats> streamedExpertStats() const;
+  // Which requests keep their KV on the SSD cache (EngineConfig::spill).
+  [[nodiscard]] EngineSpillConfig spillConfig() const noexcept;
+  // Spilling as it stands, for /status; engine thread.
+  [[nodiscard]] KvSpillStatus kvSpillStatus() const;
 
   [[nodiscard]] model::RuntimeContext modelContext() noexcept;
   // What the engine gives back while idle (NativeLoopConfig::weights): the
@@ -295,7 +309,10 @@ private:
                    std::unique_ptr<DiskSpace> diskSpace,
                    std::unique_ptr<KvPool> kvPool,
                    std::unique_ptr<engine::Cache> cache,
-                   std::unique_ptr<ops::AneFfn> aneFfn, AneFfnOutcome aneFfnOutcome);
+                   std::unique_ptr<ops::AneFfn> aneFfn, AneFfnOutcome aneFfnOutcome,
+                   std::unique_ptr<model::KvBlockCache> blockCache,
+                   std::unique_ptr<model::KvHistoryStream> historyStream, bool spillAlways,
+                   std::string spillOffReason);
   // Takes back the restore points the last process left in a persistent
   // tier (Cache::adopt) and opens its files for this one.
   void adoptPersistentCache();
@@ -303,7 +320,8 @@ private:
 
   PersistentCacheFiles persistentCache_;
   std::unique_ptr<metal::MetalBackend> backend_;
-  // The engine's one pool of SSD readers.
+  // The engine's one pool of SSD readers: the model's streamed weights, the
+  // KV tier and the readers of spilled KV read on it.
   std::shared_ptr<model::SsdReaders> readers_;
   model::LoadedModel model_;
   ops::ExecutionPlans operators_;
@@ -318,9 +336,16 @@ private:
   std::unique_ptr<KvPool> kvPool_;
   std::unique_ptr<engine::Cache> cache_;
   std::unique_ptr<ops::AneFfn> aneFfn_;
+  // A spill-capable target's readers of its spilled KV; none for another.
+  std::unique_ptr<model::KvBlockCache> blockCache_;
+  std::unique_ptr<model::KvHistoryStream> historyStream_;
   // Over model_'s images, its expert store if it has one, and aneFfn_.
   ReleasableMemory releasableMemory_;
   AneFfnOutcome aneFfnOutcome_;
+  // --kv-spill always, and why a block-sparse target keeps its KV in
+  // memory, empty when it spills.
+  bool spillAlways_ = false;
+  std::string spillOffReason_;
   // Ends a probation once it has lasted, unless the process stops first.
   std::thread probation_;
   std::mutex probationMutex_;

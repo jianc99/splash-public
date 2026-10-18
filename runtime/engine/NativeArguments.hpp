@@ -55,15 +55,20 @@ struct NativeArguments final {
   // Neural Engine when that is faster (splash serve --disable-ane turns it
   // off).
   bool neuralEngine = true;
-  // --ple-memory BYTES: stream a Qwen3.8-Flash-Next GGUF's PLE table from
-  // its file through a host row cache of BYTES in all instead of loading it;
-  // 0, without the option, loads it (RuntimeResourcesConfig::streamedTableBytes).
-  uint64_t streamedTableBytes = 0;
-  // --expert-memory BYTES: stream a MoE target's routed experts from their
-  // files through a store of BYTES (model/ExpertStore.hpp) instead of loading
-  // them; 0, without the option, loads them
-  // (RuntimeResourcesConfig::expertMemoryBytes).
-  uint64_t expertMemoryBytes = 0;
+  // --ple-memory BYTES|auto|off and --expert-memory BYTES|auto|off: a
+  // Qwen3.8-Flash-Next GGUF's PLE table and a MoE target's routed experts,
+  // through a store of BYTES that streams the rest from the SSD, as the
+  // memory planner decides (auto, without the option) or loaded whole (off)
+  // (RuntimeResourcesConfig::pleMemory, expertMemory).
+  StreamedSetting pleMemory;
+  StreamedSetting expertMemory;
+  // --sparse-kv-memory BYTES|auto: the target of a block-sparse target's hot
+  // block cache, auto its floor (RuntimeResourcesConfig::sparseKvMemory).
+  StreamedSetting sparseKvMemory;
+  // --kv-spill always: every request of a target that can spill keeps its
+  // KV on the SSD cache, for validation; without it, the requests memory
+  // cannot hold (EngineSpillConfig::always).
+  bool kvSpillAlways = false;
 };
 
 // Reads `serve-native MODEL_DIRECTORY MAX_CONTEXT|auto MAX_MEMORY_BYTES|auto
