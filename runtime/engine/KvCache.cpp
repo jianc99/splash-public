@@ -358,7 +358,7 @@ void KvCache::noteState(uint64_t blockId) { block(blockId).hadState = true; }
 
 bool KvCache::hadState(uint64_t blockId) const { return block(blockId).hadState; }
 
-uint32_t KvCache::idlePagesOnChains(std::span<const uint64_t> blocks) const {
+uint32_t KvCache::idlePagesOnChains(std::span<const uint64_t> blocks, kv::PageForm form) const {
   std::unordered_set<uint64_t> visited;
   uint32_t pages = 0;
   for (uint64_t blockId : blocks) {
@@ -368,7 +368,7 @@ uint32_t KvCache::idlePagesOnChains(std::span<const uint64_t> blocks) const {
         // The request holding this page holds every page above it too.
         if (pool_.pageActive(entry.page))
           break;
-        if (entry.transfer == Transfer::None)
+        if (entry.transfer == Transfer::None && entry.form == form)
           ++pages;
       }
       // A disk-only block holds no page; the walk goes on above it.

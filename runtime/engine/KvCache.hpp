@@ -158,11 +158,11 @@ public:
   // block; lookups that find the block without one report a lost state.
   void noteState(uint64_t blockId);
   [[nodiscard]] bool hadState(uint64_t blockId) const;
-  // The resident pages, on the chains of these blocks (each block and every
-  // block above it), that no request holds and no transfer moves; each
-  // counts once. A request holds every page of its chain, so a chain's
-  // count stops at the first page one holds.
-  [[nodiscard]] uint32_t idlePagesOnChains(std::span<const uint64_t> blocks) const;
+  // The resident pages of the form, on the chains of these blocks (each
+  // block and every block above it), that no request holds and no transfer
+  // moves; each counts once. A request holds every page of its chain, so a
+  // chain's count stops at the first page one holds.
+  [[nodiscard]] uint32_t idlePagesOnChains(std::span<const uint64_t> blocks, kv::PageForm form) const;
   // Resident, without resident children, users or holders: its page can go.
   [[nodiscard]] bool residentLeaf(uint64_t blockId) const;
   // Starts a transfer of the block's page, or ends it with None; one at a

@@ -4488,6 +4488,30 @@ void testFullShortfallReleasesEmptyIndexExtents() {
           "a Full shortfall did not release the empty Index extent past the runway first");
 }
 
+// The idle pages a state in use restores through are out of an Ordinary
+// reclaim's reach, each counted against the reusable pages of its own form:
+// a spilled chain's Index pages never against the Full pages, of which the
+// pool keeps fewer once the extents its spills emptied went.
+void testReusablePagesCountTheirForm() {
+  Spilling spill;
+  const std::vector<uint32_t> prompt = Spilling::prompt(1000, 12);
+  spill.start(1, prompt, 12);
+  while (test::spillRound(spill.cache, spill.tier)) {
+  }
+  static_cast<void>(spill.cache.evictAll());
+  const uint64_t tip = spill.block(1, 11);
+  spill.cache.publishCompositeState(tip, std::make_shared<TestState>(100), false);
+  StateUse use = spill.cache.useState(tip);
+  spill.cache.endRequest(1);
+  const uint32_t full = spill.pool.reusablePages(kv::PageForm::Full);
+  const uint32_t index = spill.pool.reusablePages(kv::PageForm::Index);
+  require(spill.cache.spillSnapshot().spilledPages == 10 && full < 10 &&
+              spill.cache.reusablePages(ReclaimClass::Ordinary) == full - 2 &&
+              spill.cache.reusablePages(ReclaimClass::Ordinary, kv::PageForm::Index) == index - 10 &&
+              spill.cache.reusablePages(ReclaimClass::InUse, kv::PageForm::Index) == index,
+          "the pages a state in use restores through were counted against another form");
+}
+
 // A page written through counts as one a Full shortfall waits for while its
 // block will spill once the copy lands, as many as Index pages are free to
 // take their index: not one in a holder's window or held by a Resident
@@ -5022,6 +5046,7 @@ int main() {
     testSpillAtTheMemoryWall();
     testFullReclaimReachesAnIdleSpilledChain();
     testFullShortfallReleasesEmptyIndexExtents();
+    testReusablePagesCountTheirForm();
     testPendingPagesCountWritesThatSpill();
     testWritesThatFreeNothingHoldNothingBack();
     testConversionWaitsForItsPagesToSpill();
