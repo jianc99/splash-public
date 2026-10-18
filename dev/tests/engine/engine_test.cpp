@@ -8976,37 +8976,141 @@ void testShortLanesStartOnStreamedCaches() {
   funding.runUntil([&] { return idle(funding.engine); }, "the requests did not end");
 }
 
-// A streamed cache that holds rows in its first chunks alone gives back
-// the empty chunks after them for nothing: a start is funded only by the
-// rows the chunks held. Short of its state, with no lane that could give
-// its KV, the start waits as on a target that cannot spill, the empty
-// extent kept for the running lane's pages, and once the pause ends it
-// starts, counted as no funded start.
-void testEmptyChunksFundNothing() {
-  Funding funding;
-  Executor &executor = funding.model;
-  executor.streamedChunks = {300, 300, 0, 0, 0};
-  executor.streamedChunkBytes = 300;
-  funding.engine.submit(Funding::prompt(1, 1, 16, 400));
-  funding.runUntil([&] { return funding.events.outputs.contains(1); }, "the first lane did not decode");
-  funding.host.paused = true;
-  const uint64_t paused = funding.charge();
-  funding.engine.submit(Funding::prompt(2, 2, 16, 400));
-  funding.runBounded(paused, [&] { return executor.streamedChunks.empty(); }, "the chunks were not given back");
-  for (int step = 0; step < 6; ++step)
-    funding.tick();
-  require(funding.charge() <= paused && funding.events.startIds.size() == 1 &&
-              funding.engine.resourceWaitSnapshot(funding.now).memory == 1 &&
-              funding.funding().released.streamed == 600 && funding.funding().released.cache == 0 &&
-              funding.host.balance == 600 && funding.storage.releasedExtents == 0,
-          "empty chunks funded a start, or the start took the running lane's empty extent");
-  funding.host.paused = false;
-  funding.host.evaluate();
-  funding.runUntil([&] { return funding.events.startIds.size() == 2; }, "the start did not run after the pause");
-  require(funding.funding().starts == 0, "a start that ran after the pause counted as funded");
-  funding.engine.cancel(1);
-  funding.engine.cancel(2);
-  funding.runUntil([&] { return idle(funding.engine); }, "the requests did not end");
+// A warm streamed cache gives its rows back only for a start they fund.
+// Rows that, with what a running lane's KV would yield, fall short of a
+// lane's state stay, the cache's reads still hitting them, and the start
+// waits as on a target that cannot spill: nothing credited, no lane
+// converted, the empty extent kept for the running lane's pages; once the
+// pause ends it starts, counted as no funded start. Rows that cover it,
+// alone or with a lane's KV, fund it as before, the empty chunks above
+// them crediting nothing.
+void testStreamedRowsGoOnlyForAStartTheyFund() {
+  for (const bool covered : {false, true}) {
+    Funding funding;
+    Executor &executor = funding.model;
+    const std::vector<uint64_t> chunks =
+        covered ? std::vector<uint64_t>{600, 600, 0, 0, 0} : std::vector<uint64_t>{300, 300, 0, 0, 0};
+    executor.streamedChunks = chunks;
+    executor.streamedChunkBytes = 600;
+    funding.engine.submit(Funding::prompt(1, 1, 16, 400));
+    funding.runUntil([&] { return funding.events.outputs.contains(1); }, "the first lane did not decode");
+    funding.host.paused = true;
+    const uint64_t paused = funding.charge();
+    funding.engine.submit(Funding::prompt(2, 2, 16, 400));
+    if (covered) {
+      funding.runBounded(paused, [&] { return funding.events.startIds.size() == 2; },
+                         "rows that cover the start did not fund it");
+      require(funding.funding().starts == 1 && funding.funding().released.streamed == 1200 &&
+                  executor.streamedChunks.empty() && funding.storage.releasedExtents == 0,
+              "the start was not funded by the rows the chunks held alone");
+    } else {
+      for (int step = 0; step < 10; ++step)
+        funding.tick();
+      require(funding.charge() <= paused && funding.events.startIds.size() == 1 &&
+                  funding.engine.resourceWaitSnapshot(funding.now).memory == 1 && funding.funding().starts == 0 &&
+                  funding.funding().released.streamed == 0 && funding.funding().released.cache == 0 &&
+                  funding.host.balance == 0 && executor.streamedChunks == chunks &&
+                  std::ranges::count(executor.idleReleases, model::IdleMemory::Streamed) == 0 &&
+                  funding.storage.releasedExtents == 0,
+              "rows short of the start went, or the start took the running lane's empty extent");
+      funding.host.paused = false;
+      funding.host.evaluate();
+      funding.runUntil([&] { return funding.events.startIds.size() == 2; }, "the start did not run after the pause");
+      require(funding.funding().starts == 0 && executor.streamedChunks == chunks,
+              "a start that ran after the pause counted as funded, or the cache lost its rows");
+    }
+    funding.host.paused = false;
+    funding.engine.cancel(1);
+    funding.engine.cancel(2);
+    funding.runUntil([&] { return idle(funding.engine); }, "the requests did not end");
+  }
+  for (const bool covered : {false, true}) {
+    // One Full extent; sixteen pages of prompt, whose fourteen that spill
+    // yield 1,260 bytes less the first lane's floor, 400: 860, which covers
+    // the start's state with 300 bytes of rows, not with 100.
+    Funding funding(100'000, 8);
+    Executor &executor = funding.model;
+    const std::vector<uint64_t> chunks{covered ? 300u : 100u};
+    executor.streamedChunks = chunks;
+    executor.streamedChunkBytes = chunks.front();
+    funding.engine.submit(Funding::prompt(1, 1, 16 * KvCache::pageTokens + 1, 400));
+    funding.runUntil([&] { return funding.events.outputs.contains(1); }, "the lane did not decode");
+    funding.host.paused = true;
+    const uint64_t paused = funding.charge();
+    funding.engine.submit(Funding::prompt(2, 2, 16, 400));
+    if (covered) {
+      funding.runBounded(paused, [&] { return funding.events.startIds.size() == 2; },
+                         "rows and a lane's KV that cover the start did not fund it");
+      require(funding.funding().starts == 1 && funding.funding().conversions == 1 &&
+                  funding.funding().latestDonor == 1 && funding.funding().released.streamed == 300 &&
+                  executor.streamedChunks.empty() && funding.modeOf(1) == KvMode::Spill,
+              "the start was not funded by the rows and then the lane's KV");
+    } else {
+      for (int step = 0; step < 6; ++step)
+        funding.tick();
+      require(funding.events.startIds.size() == 1 && funding.engine.resourceWaitSnapshot(funding.now).memory == 1 &&
+                  funding.funding().conversions == 0 && funding.funding().released.streamed == 0 &&
+                  executor.streamedChunks == chunks && funding.modeOf(1) == KvMode::Resident,
+              "rows and a lane's KV short of the start went");
+    }
+    funding.host.paused = false;
+    funding.engine.cancel(1);
+    funding.engine.cancel(2);
+    funding.runUntil([&] { return idle(funding.engine); }, "the requests did not end");
+  }
+}
+
+// Rows and a lane's KV go for a start only as the funding step then funds
+// it: the balance, the rows and the donors' net yields must reach its
+// shortfall and the floors owed together. A donor's floor of the hot block
+// cache, 400, stays owed, the model refusing it, and growth took the
+// balance below it: rows that cover a lane's state, 1,300 of its 1,000,
+// but not the floor too give back nothing and convert nothing, and the
+// start waits; with what earlier releases left of the balance, 300, they
+// fund it.
+void testRowsGoForAStartOnlyWithTheFloorsOwed() {
+  for (const bool closes : {false, true}) {
+    Funding funding;
+    Executor &executor = funding.model;
+    // A short lane decodes beside the donor that waits for its floor.
+    funding.engine.submit(Funding::prompt(1, 1, 16, 400));
+    funding.engine.submit(Funding::prompt(2, 2, 24 * KvCache::pageTokens + 1, 400));
+    funding.runUntil([&] { return funding.events.outputs.contains(1) && funding.events.outputs.contains(2); },
+                     "the lanes did not decode");
+    executor.floorAdmission = [] { return false; };
+    funding.host.paused = true;
+    funding.engine.submit(Funding::prompt(3, 3, 16, 400));
+    funding.runUntil([&] { return funding.events.outputs.contains(3); }, "the first start did not run");
+    require(funding.funding().starts == 1 && funding.funding().conversions == 1 &&
+                funding.funding().latestDonor == 2 && !executor.floors.contains(2) &&
+                funding.engine.snapshot().prioritySuspensions == 0,
+            "the first start was not funded by the long lane's KV, or its floor was paid");
+    funding.host.balance = closes ? 300 : 0;
+    executor.streamedChunks = {1300};
+    executor.streamedChunkBytes = 1300;
+    const SpillFundingSnapshot before = funding.funding();
+    funding.engine.submit(Funding::prompt(4, 4, 16, 400));
+    if (closes) {
+      funding.runUntil([&] { return funding.events.startIds.size() == 4; },
+                       "rows that with the balance cover the start and the floor did not fund it");
+      require(funding.funding().starts == 2 && funding.funding().released.streamed == 1300 &&
+                  executor.streamedChunks.empty() && funding.funding().conversions == 1,
+              "the start was not funded by the rows and the balance");
+    } else {
+      for (int step = 0; step < 10; ++step)
+        funding.tick();
+      require(funding.events.startIds.size() == 3 && funding.engine.resourceWaitSnapshot(funding.now).memory == 1 &&
+                  funding.funding().starts == 1 && funding.funding().conversions == 1 &&
+                  funding.funding().released.streamed == 0 &&
+                  funding.funding().released.cache == before.released.cache && funding.host.balance == 0 &&
+                  executor.streamedChunks == std::vector<uint64_t>{1300},
+              "rows short of the start and the floor owed went, or a lane converted");
+    }
+    funding.host.paused = false;
+    for (uint64_t id = 1; id <= 4; ++id)
+      funding.engine.cancel(id);
+    funding.runUntil([&] { return idle(funding.engine); }, "the requests did not end");
+  }
 }
 
 // What funding released for one start and no growth took since funds the
@@ -11834,7 +11938,8 @@ int main() {
     testFailedRestoreReturnsTheCommitment();
     testATargetThatCannotSpillFundsNothing();
     testShortLanesStartOnStreamedCaches();
-    testEmptyChunksFundNothing();
+    testStreamedRowsGoOnlyForAStartTheyFund();
+    testRowsGoForAStartOnlyWithTheFloorsOwed();
     testTheBalanceFundsTheNextStart();
     testALongLaneMovesItsKvForAStart(1024);
     testALongLaneMovesItsKvForAStart(2);

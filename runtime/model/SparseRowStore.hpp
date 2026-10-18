@@ -189,6 +189,9 @@ public:
   // stages and prefetches, which only find fewer rows cached.
   uint64_t releaseChunk();
   [[nodiscard]] metal::AllocationResult growChunk(const metal::AllocationAdmission &admit);
+  // The bytes of the rows the chunks above the floor hold: what
+  // releaseChunk() calls return down to the floor.
+  [[nodiscard]] uint64_t heldBytes() const;
 
   // Stages the rows of `ids` (any order, repeats allowed): row u of `rows`
   // (u * rowBytes) holds the u-th distinct id's row, and slots[i] = u for

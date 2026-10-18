@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -607,6 +608,9 @@ public:
     idleReleases.push_back(scope);
     return held;
   }
+  uint64_t streamedHeldBytes() const noexcept override {
+    return std::accumulate(streamedChunks.begin(), streamedChunks.end(), uint64_t{0});
+  }
   std::optional<std::string> provideMask(uint64_t id,
                                          std::span<const uint32_t> words) override {
     Request &entry = requests.at(id);
@@ -743,10 +747,10 @@ public:
   // hold, none for a chunk no row went into, which only a reclaim of
   // IdleMemory::Streamed gives back once no cache unit is left, as the
   // production store does (model::SparseRowStore::releaseChunk): the empty
-  // chunks at the end, then the one before them, returning its rows' bytes.
-  // growCaches() takes the chunks given back again, empty, each of
-  // streamedChunkBytes; and the scope of every reclaim step that gave a
-  // cache unit or chunks, in order.
+  // chunks at the end, then the one before them, returning its rows' bytes;
+  // streamedHeldBytes() is their sum. growCaches() takes the chunks given
+  // back again, empty, each of streamedChunkBytes; and the scope of every
+  // reclaim step that gave a cache unit or chunks, in order.
   std::vector<uint64_t> streamedChunks;
   uint32_t releasedChunks = 0;
   uint64_t streamedChunkBytes = 0;

@@ -419,6 +419,13 @@ metal::AllocationResult SparseRowStore::growChunk(const metal::AllocationAdmissi
   return {};
 }
 
+uint64_t SparseRowStore::heldBytes() const {
+  const Impl &s = *impl_;
+  // Slot 0 is the floor's.
+  const std::lock_guard lock(s.cacheMutex);
+  return (s.used - std::min<uint64_t>(s.used, 1)) * s.table.rowBytes;
+}
+
 SparseRowStageResult SparseRowStore::stage(std::span<const uint32_t> ids, std::span<uint8_t> rows,
                                            std::span<uint32_t> slots, SparseRowUse use, bool adoptPrefetch) {
   Impl &s = *impl_;

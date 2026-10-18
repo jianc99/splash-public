@@ -60,6 +60,7 @@ public:
   [[nodiscard]] ModelMemoryAdmission growCaches() override;
   [[nodiscard]] uint64_t reclaimIdleState(bool keepLane,
                                           IdleMemory scope) noexcept override;
+  [[nodiscard]] uint64_t streamedHeldBytes() const noexcept override;
   [[nodiscard]] std::optional<std::string>
   provideMask(uint64_t requestId, std::span<const uint32_t> words) override;
   void end(uint64_t requestId) override;

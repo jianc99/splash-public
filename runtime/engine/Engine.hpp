@@ -766,20 +766,32 @@ private:
   //    (model::IdleMemory::Streamed);
   // 3. a running lane's KV, which moves to the SSD (convertDonor), the
   //    next step moving and crediting what landed of it;
-  // and, last, for a start a donor converted for, the Full runway the
-  // running lanes would grow into, which the donor's freed pages may have
-  // become.
+  // steps 2 and 3 only when they fund the start (donorCover); and, last,
+  // for a start a donor converted for, the Full runway the running lanes
+  // would grow into, which the donor's freed pages may have become.
   // Pending, the start waiting for no other lane, when transfers in flight
   // hold what step 1 would release next, a donor's copies among them, and
   // nothing when none gives anything: the start then waits as on a target
   // that cannot spill.
   [[nodiscard]] CacheReclaimResult fundStart(Request &start, uint64_t shortfall);
-  // Step 3: converts the decoding Resident lane of a priority not above the
-  // start's whose KV yields the most once spilled, its pages that would
-  // spill (Cache::spillablePages) less their index, net of what it adds to
-  // the hot block cache's floor, when the balance and every such lane's
-  // net yield together cover the shortfall; else none, and false.
-  [[nodiscard]] bool convertDonor(const Request &start, uint64_t shortfall);
+  // The lanes whose KV may move to the SSD for a start: decoding Resident
+  // lanes of a priority not above its own whose pages that would spill
+  // (Cache::spillablePages), less their index, yield more than the floor
+  // each adds to the hot block cache, the largest net yield first; the
+  // lanes that hold a floor of that cache, or will; and whether they and
+  // the streamed caches fund the start: whether the balance, the rows the
+  // streamed caches hold above their floors (Model::streamedHeldBytes) and
+  // the donors' net yields together reach its shortfall and the floors
+  // owed, as the balance must for allocate() to fund an attempt.
+  struct DonorCover final {
+    std::vector<uint64_t> donors;
+    uint64_t floors = 0;
+    bool funds = false;
+  };
+  [[nodiscard]] DonorCover donorCover(const Request &start, uint64_t shortfall) const;
+  // Step 3, for a start the donors fund: converts the first of them the SSD
+  // cache takes; else none, and false.
+  [[nodiscard]] bool convertDonor(const DonorCover &cover);
   // What a lane does about memory it could not get. Pending memory returns
   // by itself: the lane waits. Otherwise a lane fails only when it is alone
   // with nothing left to reclaim; while other lanes hold memory or the host

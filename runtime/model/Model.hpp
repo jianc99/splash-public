@@ -824,6 +824,11 @@ public:
   // between calls, so it frees only what it needs.
   [[nodiscard]] virtual uint64_t reclaimIdleState(bool keepLane,
                                                   IdleMemory scope) noexcept = 0;
+  // The bytes the rows of streamed tables' row caches hold above their
+  // floors: what reclaimIdleState gives back of them, a chunk at a time,
+  // down to the floors (model::SparseRowStore::heldBytes); zero for a model
+  // that streams none.
+  [[nodiscard]] virtual uint64_t streamedHeldBytes() const noexcept { return 0; }
   // Why this request's mask is unusable, or nothing when the model took it.
   [[nodiscard]] virtual std::optional<std::string>
   provideMask(uint64_t requestId, std::span<const uint32_t> words) = 0;

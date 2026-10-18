@@ -2099,14 +2099,20 @@ CacheReclaimResult Engine::fundStart(Request &start, uint64_t shortfall) {
       return credit(&SpillFundingSnapshot::Released::cache, runway);
   if (cached.pending)
     return {.pending = true};
-  if (const uint64_t streamed = model_.reclaimIdleState(true, model::IdleMemory::Streamed))
-    return credit(&SpillFundingSnapshot::Released::streamed, streamed);
-  // The next step moves and credits the donor's pages whose copies are
-  // there already, as a chain restored from the SSD cache has them, and its
-  // copies in flight keep the cache's reclaim pending until they land.
-  if (convertDonor(start, shortfall)) {
-    start.fundedByDonor = true;
-    return {.madeProgress = true};
+  // A streamed cache's rows, which every lane's reads miss into once they
+  // are gone, and a running lane's KV go only for a start they fund
+  // (donorCover); otherwise both stay, and the start waits.
+  const DonorCover donors = donorCover(start, shortfall);
+  if (donors.funds) {
+    if (const uint64_t streamed = model_.reclaimIdleState(true, model::IdleMemory::Streamed))
+      return credit(&SpillFundingSnapshot::Released::streamed, streamed);
+    // The next step moves and credits the donor's pages whose copies are
+    // there already, as a chain restored from the SSD cache has them, and
+    // its copies in flight keep the cache's reclaim pending until they land.
+    if (convertDonor(donors)) {
+      start.fundedByDonor = true;
+      return {.madeProgress = true};
+    }
   }
   if (start.fundedByDonor)
     if (const uint64_t runway = releaseRunway())
@@ -2117,50 +2123,54 @@ CacheReclaimResult Engine::fundStart(Request &start, uint64_t shortfall) {
 // Long-context lanes spill first: their pages yield the most, and a lane
 // whose pages yield no more than it adds to the hot block cache's floor, as
 // a short one's, has nothing to give.
-bool Engine::convertDonor(const Request &start, uint64_t shortfall) {
+Engine::DonorCover Engine::donorCover(const Request &start, uint64_t shortfall) const {
   const SpillGeometry &geometry = config_.spill.geometry;
   struct Donor final {
-    Request *request;
+    uint64_t id;
     uint64_t yield;
   };
   std::vector<Donor> donors;
-  // The lanes that hold a floor of the hot block cache, or will.
-  uint64_t floors = 0;
-  for (auto &[id, peer] : requests_) {
+  DonorCover result;
+  for (const auto &[id, peer] : requests_) {
     if (!peer.lane)
       continue;
-    floors += peer.kvMode == KvMode::Spill || cache_.holdsIndexPages(id);
+    result.floors += peer.kvMode == KvMode::Spill || cache_.holdsIndexPages(id);
     if (peer.kvMode == KvMode::Resident && scheduler_.phase(id) == Phase::Decode &&
         peer.request.priority >= start.request.priority)
-      donors.push_back({&peer, uint64_t{cache_.spillablePages(id)} *
-                                   (geometry.fullPageBytes - geometry.indexPageBytes)});
+      donors.push_back({id, uint64_t{cache_.spillablePages(id)} *
+                                (geometry.fullPageBytes - geometry.indexPageBytes)});
   }
   std::ranges::sort(donors, [](const Donor &left, const Donor &right) {
-    return left.yield != right.yield ? left.yield > right.yield
-                                     : left.request->request.id < right.request->request.id;
+    return left.yield != right.yield ? left.yield > right.yield : left.id < right.id;
   });
   // Each lane that converts adds to the hot block cache's floor, the first
   // two lanes' slots and each later one a lane's, and its yield net of that
-  // counts toward the cover, beside what the balance leaves of the floors
-  // owed already; one that yields no more than its floor, and every smaller
-  // one after it, gives nothing.
-  const uint64_t balance = config_.fund(0);
-  uint64_t cover = balance - std::min(balance, owedFloorBytes_);
-  size_t candidates = 0;
-  for (; candidates < donors.size(); ++candidates) {
-    const uint64_t lanes = floors + candidates;
+  // counts toward the cover, beside the balance and the rows the streamed
+  // caches hold above their floors; one that yields no more than its floor,
+  // and every smaller one after it, gives nothing. They fund the start when
+  // the cover reaches what allocate() funds an attempt on, the shortfall
+  // and the floors owed already: a balance short of those floors leaves the
+  // start short by the difference.
+  uint64_t cover = config_.fund(0) + model_.streamedHeldBytes();
+  for (const Donor &donor : donors) {
+    const uint64_t lanes = result.floors + result.donors.size();
     const uint64_t floor = geometry.hotFloorBytes(lanes + 1) - geometry.hotFloorBytes(lanes);
-    if (donors[candidates].yield <= floor)
+    if (donor.yield <= floor)
       break;
-    cover += donors[candidates].yield - floor;
+    cover += donor.yield - floor;
+    result.donors.push_back(donor.id);
   }
-  if (cover < shortfall)
-    return false;
-  for (size_t index = 0; index < candidates; ++index) {
-    Request &donor = *donors[index].request;
+  result.funds = cover >= shortfall + owedFloorBytes_;
+  return result;
+}
+
+bool Engine::convertDonor(const DonorCover &cover) {
+  const SpillGeometry &geometry = config_.spill.geometry;
+  for (const uint64_t id : cover.donors) {
+    Request &donor = requests_.at(id);
     if (!convertToSpill(donor, nullptr))
       continue;
-    donor.owedFloor = geometry.hotFloorBytes(floors + 1) - geometry.hotFloorBytes(floors);
+    donor.owedFloor = geometry.hotFloorBytes(cover.floors + 1) - geometry.hotFloorBytes(cover.floors);
     owedFloorBytes_ += donor.owedFloor;
     ++counters_.spill.funding.conversions;
     counters_.spill.funding.latestDonor = donor.request.id;

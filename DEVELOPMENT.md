@@ -629,15 +629,16 @@ what memory holds, as a dense target's is.
   holds, a 64 MiB chunk at a time, down to its floor (a cache its rows have
   not filled gives back only what they hold), and last a running request's
   KV, which moves to the SSD. That request decodes at the priority of the new one or below, and
-  is the one whose KV frees the most net of the hot cache it then needs, if
-  the requests that could give their KV together cover what the new one
-  lacks; a short request's KV frees nothing. Splash does not grow for it: the
-  governor admits the new request's memory within what was released for it
-  and no growth took since, and lets what the pressure passes return go to
-  the host; once growth is allowed again, the rest goes back to the host and
-  the PLE cache grows back. A request whose KV moved keeps spilling until it
-  ends. Without the SSD cache, and for every other model, the new request
-  waits as before.
+  is the one whose KV frees the most net of the hot cache it then needs; a
+  short request's KV frees nothing. The PLE rows and the KV go only if, with
+  what was released for the new request already, they cover what it lacks:
+  otherwise it waits, and the PLE cache keeps its rows. Splash does not grow
+  for it: the governor admits the new request's memory within what was
+  released for it and no growth took since, and lets what the pressure
+  passes return go to the host; once growth is allowed again, the rest goes
+  back to the host and the PLE cache grows back. A request whose KV moved
+  keeps spilling until it ends. Without the SSD cache, and for every other
+  model, the new request waits as before.
 
 A request's outputs are the same whether its KV spills or not, bit for bit,
 for the same schedule and cache hits. `/status` reports the plan's floors

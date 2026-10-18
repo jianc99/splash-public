@@ -3095,6 +3095,11 @@ uint64_t Runtime::reclaimIdleState(bool keepLane, IdleMemory scope) noexcept {
   return scope == IdleMemory::Streamed && table ? table->releaseChunk() : 0;
 }
 
+uint64_t Runtime::streamedHeldBytes() const noexcept {
+  const SparseRowStore *table = impl_->model.streamedTable();
+  return table ? table->heldBytes() : 0;
+}
+
 std::optional<std::string>
 Runtime::provideMask(uint64_t requestId, std::span<const uint32_t> words) {
   Impl::Request &entry = impl_->request(requestId);
