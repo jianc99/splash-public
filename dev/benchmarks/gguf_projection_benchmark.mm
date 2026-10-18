@@ -12,9 +12,9 @@
 // ABBA order after a warm-up; printed are the medians of `rounds` (20) commands in ms per projection, the device
 // policy's choice marked with *. Widths emulate core counts: the policy's tiers count threadgroups per core.
 // The float formats float-bf16 and float-f32 time the float projection (ops::addGgufFloat: the router's, the QSA
-// indexer's, F32 alpha/beta) instead, one tensor per width of any multiple of 8 columns, on both float tiles at one to
-// four lanes or each prefill chunk of R rows (the accelerator tile from 16 rows), the tile the device takes for every
-// width marked with *.
+// indexer's, F32 alpha/beta) instead, one tensor per width of any multiple of 8 columns, two in one dispatch as the
+// indexer's query and key run, on both float tiles at one to four lanes or each prefill chunk of R rows (the
+// accelerator tile from 16 rows), the tile the device takes for every width marked with *.
 #include "../tests/engine/GgufFormatReference.hpp"
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
@@ -168,9 +168,12 @@ void floatProjections(MetalBackend &backend, const char *formatList, const char 
   uint32_t next = 0;
   const auto time = [&](FloatCase &c) {
     CommandGraph graph;
-    for (uint32_t i = 0; i < copies; ++i, ++next)
+    for (uint32_t i = 0; i < copies; ++i, ++next) {
+      std::vector<FloatProjection> projections;
       for (const QuantizedSegment &s : ring[next % copies])
-        addGgufFloat(graph, input, s, output, c.rows, N, s.columnOffset, FloatOutput::Float32, c.tile);
+        projections.push_back({&s, output, N, s.columnOffset, c.tile});
+      addGgufFloat(graph, input, projections, c.rows, FloatOutput::Float32);
+    }
     return backend.submitCommandAsync(graph.dispatches()).wait().gpuSeconds * 1e3 / copies;
   };
   measure(cases, rounds, copies, time, heading(backend, formatList, widthList, K, "none", copies, bytes, rounds));

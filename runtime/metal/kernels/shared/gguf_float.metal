@@ -1,18 +1,39 @@
 // fp32 projections of the GGUF float tensors llama.cpp keeps unquantized: the
-// MoE router (ffn_gate_inp, F32, or BF16 as some GGUFs store it) and, when a
-// GGUF stores them as F32, the GDN alpha/beta gates (ops/Linear.hpp float
-// segments). out[r][n] = sum_k x[r][k] W[n][k] on simdgroup float 8x8 MMA with
-// exact operands (bf16 activations widen to fp32, the weights as stored, BF16
-// ones widened), so a result differs from the fp64 product only by fp32
-// accumulation, and a BF16 tensor's equals that of the F32 tensor of its
-// values bit for bit. llama.cpp's mul_mm stages F32 weights as half above
-// eight rows; no phase here rounds them.
+// MoE router (ffn_gate_inp, F32, or BF16 as some GGUFs store it), the QSA
+// indexer's query and key, which share their input and, on one tile, a
+// dispatch, and, when a GGUF stores them as F32, the GDN alpha/beta gates
+// (ops/Linear.hpp float segments). out[r][n] = sum_k x[r][k] W[n][k] on
+// simdgroup float 8x8 MMA with exact operands (bf16 activations widen to
+// fp32, the weights as stored, BF16 ones widened), so a result differs from
+// the fp64 product only by fp32 accumulation, and a BF16 tensor's equals that
+// of the F32 tensor of its values bit for bit. llama.cpp's mul_mm stages F32
+// weights as half above eight rows; no phase here rounds them.
 #pragma clang fp reassociate(off)
 #include "metal/abi/Gguf.h"
 #include "metal/kernels/common/sgmatrix.h"
 
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 using namespace mpp::tensor_ops;
+
+// One projection of a dispatch (GgufFloatParams) and the column tile of a threadgroup within it: a dispatch's column
+// tiles are its projections' in projection order.
+template <typename W, typename T> struct FloatProjection {
+  device const W *weights;
+  device T *output;
+  uint output_size, out_stride, out_offset, tile;
+};
+static_assert(GGUF_FLOAT_PROJECTIONS == 2, "a dispatch binds two projections");
+// The projection of dispatch column tile `tile`, of `columns` columns.
+template <typename W, typename T>
+inline FloatProjection<W, T> float_projection(constant GgufFloatParams &p, uint tile, uint columns,
+                                              device const W *weights0, device T *output0, device const W *weights1,
+                                              device T *output1) {
+  const uint tiles = (p.output_size[0] + columns - 1) / columns;
+  return tile < tiles
+             ? FloatProjection<W, T>{weights0, output0, p.output_size[0], p.out_stride[0], p.out_offset[0], tile}
+             : FloatProjection<W, T>{weights1, output1, p.output_size[1], p.out_stride[1], p.out_offset[1],
+                                     tile - tiles};
+}
 
 namespace gguf_float {
 
@@ -43,8 +64,8 @@ template <> struct Eight<float> {
   float operator[](uint i) const { return i < 4 ? low[i] : high[i - 4]; }
 };
 
-// One threadgroup: output columns [8 tg.x, 8 tg.x + 8) of rows [32 tg.y, 32 tg.y + 32). K runs in steps of kStep
-// inputs, simdgroup s taking part s of the steps for every fragment; simdgroup f then adds fragment f's parts in
+// One threadgroup: output columns [8 tile, 8 tile + 8) of the projection's rows [32 y, 32 y + 32). K runs in steps of
+// kStep inputs, simdgroup s taking part s of the steps for every fragment; simdgroup f then adds fragment f's parts in
 // order, so a result depends neither on the grid nor on the row count. MMA j of the step from input k multiplies
 // inputs k + 8 i + j over its index i, so each lane's operands are whole runs of 8 inputs: lane (fm, fn) loads
 // W[column fn, fn + 1][k + 8 fm, + 8) as B and x[row fm][k + 8 fn, + 16) as A, a column's runs 128 contiguous bytes
@@ -53,13 +74,13 @@ template <> struct Eight<float> {
 // time: at the router's K = 2048 the mean error stays 5.5e-9 of sum |x w| (7.4e-9 with one chain per part). Rows of
 // K (a multiple of 8) start 16-byte aligned in page-aligned buffers.
 template <typename W, typename T>
-inline void project(device const bfloat *input, device const W *weights, device T *output,
-                    constant GgufFloatParams &p, uint2 tg, uint sg, uint lane, threadgroup float2 *parts) {
+inline void project(device const bfloat *input, FloatProjection<W, T> projection, constant GgufFloatParams &p, uint y,
+                    uint sg, uint lane, threadgroup float2 *parts) {
   const sgmatrix::Lane l = sgmatrix::lane_map(lane);
-  const uint K = p.input_size, runs = K / 8, column = tg.x * 8 + l.fn, row0 = tg.y * kRows;
+  const uint K = p.input_size, runs = K / 8, column = projection.tile * 8 + l.fn, row0 = y * kRows;
   const uint live = min(kRows, p.rows - row0);
   const uint steps = (K + kStep - 1) / kStep, first = sg * steps / kSplits, last = (sg + 1) * steps / kSplits;
-  device const W *w = weights + ulong(column) * K;
+  device const W *w = projection.weights + ulong(column) * K;
   const auto load = [&](uint step, thread Eight<W> (&b)[2]) {
     const uint run = step * 8 + l.fm;
     b[0] = Eight<W>::load(w + run * 8, run < runs);
@@ -93,7 +114,7 @@ inline void project(device const bfloat *input, device const W *weights, device 
   if (f >= kFragments || row >= live) return;
   float2 total = float2(0);
   for (uint s = 0; s < kSplits; ++s) total += parts[(s * kFragments + f) * 32 + lane];
-  device T *out = output + ulong(row0 + row) * p.out_stride + p.out_offset + column;
+  device T *out = projection.output + ulong(row0 + row) * projection.out_stride + projection.out_offset + column;
   out[0] = T(total.x);
   out[1] = T(total.y);
 }
@@ -102,14 +123,17 @@ inline void project(device const bfloat *input, device const W *weights, device 
 
 static_assert(gguf_float::kSplits >= gguf_float::kFragments, "simdgroup f reduces fragment f");
 
-// Grid (output_size / 8, ceil(rows / 32)), 32 kSplits threads; named by the weights' and the output's types.
+// Grid (the projections' output_size / 8 summed, ceil(rows / 32)), 32 kSplits threads; named by the weights' and the
+// output's types.
 #define GGUF_FLOAT_KERNEL(Name, W, T)                                                                          \
-  kernel void Name(device const bfloat *input [[buffer(0)]], device const W *weights [[buffer(1)]],           \
-                   device T *output [[buffer(2)]], constant GgufFloatParams &p [[buffer(3)]],                 \
+  kernel void Name(device const bfloat *input [[buffer(0)]], device const W *weights0 [[buffer(1)]],          \
+                   device T *output0 [[buffer(2)]], device const W *weights1 [[buffer(3)]],                   \
+                   device T *output1 [[buffer(4)]], constant GgufFloatParams &p [[buffer(5)]],                \
                    uint2 tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],     \
                    uint lane [[thread_index_in_simdgroup]]) {                                                 \
     threadgroup float2 parts[gguf_float::kSplits * gguf_float::kFragments * 32];                              \
-    gguf_float::project<W, T>(input, weights, output, p, tg, sg, lane, parts);                                \
+    gguf_float::project<W, T>(input, float_projection(p, tg.x, 8, weights0, output0, weights1, output1), p,   \
+                              tg.y, sg, lane, parts);                                                         \
   }
 GGUF_FLOAT_KERNEL(gguf_float_f32_bf16, float, bfloat)
 GGUF_FLOAT_KERNEL(gguf_float_f32_f32, float, float)
@@ -155,18 +179,18 @@ inline ushort3 split(float w) {
 // simdgroup whose rows cross p.rows computes the 16 rows ending at p.rows instead and stores its own, so no row past
 // the input is read (p.rows >= 16).
 template <typename W, typename T>
-inline void project(device bfloat *input, device const W *weights, device T *output,
-                    constant GgufFloatParams &p, uint2 tg, ushort sg, ushort lane, threadgroup bfloat *stage) {
+inline void project(device bfloat *input, FloatProjection<W, T> projection, constant GgufFloatParams &p, uint y,
+                    ushort sg, ushort lane, threadgroup bfloat *stage) {
   constexpr ushort Parts = kParts<W>;
   constexpr uint Buffer = kBuffer<W>;
   typedef vec<W, 4> W4;
   const uint K = p.input_size, steps = K / kStep;
-  const uint row0 = tg.y * kRows + sg * kRowsPerSimdgroup, first_row = min(row0, p.rows - kRowsPerSimdgroup);
-  const uint col0 = tg.x * kColumns;
+  const uint row0 = y * kRows + sg * kRowsPerSimdgroup, first_row = min(row0, p.rows - kRowsPerSimdgroup);
+  const uint col0 = projection.tile * kColumns;
   const ushort t = sg * 32 + lane, column = t / (kStep / kPerThread), first = t % (kStep / kPerThread) * kPerThread;
-  const bool live_column = col0 + column < p.output_size;
+  const bool live_column = col0 + column < projection.output_size;
   device const W4 *w =
-      reinterpret_cast<device const W4 *>(weights + ulong(live_column ? col0 + column : 0) * K + first);
+      reinterpret_cast<device const W4 *>(projection.weights + ulong(live_column ? col0 + column : 0) * K + first);
   auto a = tensor(input + ulong(first_row) * K, dextents<int, 2>{int(K), kRowsPerSimdgroup}, array<int, 2>{1, int(K)});
   constexpr auto descriptor = matmul2d_descriptor(kRowsPerSimdgroup, kColumns, kStep, false, true, false,
                                                   matmul2d_descriptor::mode::multiply_accumulate);
@@ -232,8 +256,8 @@ inline void project(device bfloat *input, device const W *weights, device T *out
     if (!high.is_valid_element(i)) continue;
     const auto index = high.get_multidimensional_index(i);
     const uint row = first_row + index[1], column_out = col0 + index[0];
-    if (row >= row0 && column_out < p.output_size)
-      output[ulong(row) * p.out_stride + p.out_offset + column_out] = T(high[i] + low[i]);
+    if (row >= row0 && column_out < projection.output_size)
+      projection.output[ulong(row) * projection.out_stride + projection.out_offset + column_out] = T(high[i] + low[i]);
   }
 }
 
@@ -242,15 +266,19 @@ inline void project(device bfloat *input, device const W *weights, device T *out
 static_assert(gguf_float_na::kStep % gguf_float_na::kPerThread == 0 && gguf_float_na::kPerThread % 4 == 0,
               "a thread stages whole float4s of one column");
 
-// Grid (ceil(output_size / 32), ceil(rows / 64)), 128 threads; rows >= 16, input_size a multiple of 32; named by the
-// weights' and the output's types.
+// Grid (the projections' ceil(output_size / 32) summed, ceil(rows / 64)), 128 threads; rows >= 16, input_size a
+// multiple of 32; named by the weights' and the output's types.
 #define GGUF_FLOAT_NA_KERNEL(Name, W, T)                                                                       \
-  kernel void Name(device bfloat *input [[buffer(0)]], device const W *weights [[buffer(1)]],                 \
-                   device T *output [[buffer(2)]], constant GgufFloatParams &p [[buffer(3)]],                 \
+  kernel void Name(device bfloat *input [[buffer(0)]], device const W *weights0 [[buffer(1)]],                \
+                   device T *output0 [[buffer(2)]], device const W *weights1 [[buffer(3)]],                   \
+                   device T *output1 [[buffer(4)]], constant GgufFloatParams &p [[buffer(5)]],                \
                    uint2 tg [[threadgroup_position_in_grid]], ushort sg [[simdgroup_index_in_threadgroup]],   \
                    ushort lane [[thread_index_in_simdgroup]]) {                                               \
     threadgroup bfloat stage[2 * gguf_float_na::kBuffer<W>];                                                   \
-    gguf_float_na::project<W, T>(input, weights, output, p, tg, sg, lane, stage);                             \
+    gguf_float_na::project<W, T>(input,                                                                       \
+                                 float_projection(p, tg.x, gguf_float_na::kColumns, weights0, output0,        \
+                                                  weights1, output1),                                         \
+                                 p, tg.y, sg, lane, stage);                                                   \
   }
 GGUF_FLOAT_NA_KERNEL(gguf_float_na_f32_bf16, float, bfloat)
 GGUF_FLOAT_NA_KERNEL(gguf_float_na_f32_f32, float, float)

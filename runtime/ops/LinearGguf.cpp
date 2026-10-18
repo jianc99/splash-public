@@ -653,26 +653,60 @@ FloatTile Linear::ggufFloatTile(uint32_t rows, uint32_t outputSize) const noexce
              : FloatTile::Simdgroup;
 }
 
-// Simdgroup: 8 columns of 32 rows per threadgroup of 8 simdgroups. Neural
-// accelerator: 32 columns of 64 rows per threadgroup of 4 simdgroups, at least
-// 16 rows and K a multiple of 32 (kernels/shared/gguf_float.metal).
 void addGgufFloat(metal::CommandGraph &graph, metal::MetalBuffer input, const QuantizedSegment &weights,
                   metal::MetalBuffer output, uint32_t rows, uint32_t outStride, uint32_t outOffset,
                   FloatOutput type, FloatTile tile) {
-  const uint32_t n = weights.outputSize, k = weights.inputSize;
-  const bool accelerator = tile == FloatTile::NeuralAccelerator;
-  if (!weights.isFloat() || !rows || !n || n % 8 || !k || k % 8 || outOffset + uint64_t{n} > outStride ||
-      (accelerator && (rows < 16 || k % 32)))
-    throw std::invalid_argument("invalid float projection");
-  requireBytes(weights.plane0, uint64_t{n} * k * weights.floatBytes(), "float projection weight");
+  const FloatProjection projection{&weights, std::move(output), outStride, outOffset, tile};
+  addGgufFloat(graph, std::move(input), {&projection, 1}, rows, type);
+}
+
+// Simdgroup: 8 columns of 32 rows per threadgroup of 8 simdgroups. Neural
+// accelerator: 32 columns of 64 rows per threadgroup of 4 simdgroups, at least
+// 16 rows and K a multiple of 32 (kernels/shared/gguf_float.metal). Every
+// projection is checked before any dispatch is added; a dispatch's slots past
+// its last projection bind that one's buffers again and take no columns.
+void addGgufFloat(metal::CommandGraph &graph, metal::MetalBuffer input, std::span<const FloatProjection> projections,
+                  uint32_t rows, FloatOutput type) {
+  const uint32_t k = projections.empty() ? 0 : projections.front().weights->inputSize;
+  if (!rows || !k || k % 8) throw std::invalid_argument("invalid float projection");
+  for (const FloatProjection &p : projections) {
+    const QuantizedSegment &w = *p.weights;
+    const uint32_t n = w.outputSize;
+    if (!w.isFloat() || w.inputSize != k || !n || n % 8 || p.outOffset + uint64_t{n} > p.outStride ||
+        (p.tile == FloatTile::NeuralAccelerator && (rows < 16 || k % 32)))
+      throw std::invalid_argument("invalid float projection");
+    requireBytes(w.plane0, uint64_t{n} * k * w.floatBytes(), "float projection weight");
+    requireBytes(p.output, rowBytes(rows, p.outStride, uint64_t{p.outOffset} + n, elementBytes(type)),
+                 "float projection output");
+  }
   requireBytes(input, uint64_t{rows} * k * 2, "float projection input");
-  requireBytes(output, rowBytes(rows, outStride, uint64_t{outOffset} + n, elementBytes(type)), "float projection output");
-  const std::string kernel = std::string(accelerator ? "gguf_float_na_" : "gguf_float_") + weights.name() + "_" +
-                             (type == FloatOutput::Float32 ? "f32" : "bf16");
-  const metal::DispatchSize grid = accelerator ? metal::DispatchSize{(n + 31) / 32, (rows + 63) / 64, 1}
-                                               : metal::DispatchSize{n / 8, (rows + 31) / 32, 1};
-  graph.add(kernel, {std::move(input), weights.plane0, std::move(output)},
-            GgufFloatParams{rows, k, n, outStride, outOffset}, grid, {accelerator ? 128u : 256u, 1, 1});
+  for (size_t first = 0; first < projections.size();) {
+    const FloatProjection &lead = projections[first];
+    size_t count = 1;
+    while (first + count < projections.size() && count < GGUF_FLOAT_PROJECTIONS &&
+           projections[first + count].weights->formatId == lead.weights->formatId &&
+           projections[first + count].tile == lead.tile)
+      ++count;
+    const bool accelerator = lead.tile == FloatTile::NeuralAccelerator;
+    const uint32_t columns = accelerator ? 32 : 8, tileRows = accelerator ? 64 : 32;
+    GgufFloatParams params{rows, k, {}, {}, {}};
+    std::vector<metal::MetalBuffer> bindings{input};
+    uint32_t tiles = 0;
+    for (uint32_t slot = 0; slot < GGUF_FLOAT_PROJECTIONS; ++slot) {
+      const FloatProjection &p = projections[first + std::min<size_t>(slot, count - 1)];
+      bindings.insert(bindings.end(), {p.weights->plane0, p.output});
+      if (slot >= count) continue;
+      params.output_size[slot] = p.weights->outputSize;
+      params.out_stride[slot] = p.outStride;
+      params.out_offset[slot] = p.outOffset;
+      tiles += (p.weights->outputSize + columns - 1) / columns;
+    }
+    graph.add(std::string(accelerator ? "gguf_float_na_" : "gguf_float_") + lead.weights->name() + "_" +
+                  (type == FloatOutput::Float32 ? "f32" : "bf16"),
+              std::move(bindings), params, {tiles, (rows + tileRows - 1) / tileRows, 1},
+              {accelerator ? 128u : 256u, 1, 1});
+    first += count;
+  }
 }
 
 void requireSegmentPlanes(const QuantizedSegment &segment, std::string_view what, uint32_t planeInputs) {

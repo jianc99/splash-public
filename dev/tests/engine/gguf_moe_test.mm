@@ -7,7 +7,9 @@
 //   alpha/beta widths at K of whole and partial 64-input steps, bf16 and fp32
 //   destinations at a column offset of a wider row; neighbours stay
 //   untouched. BF16 weights (a router a GGUF stores so) give the outputs of
-//   the F32 tensor of their values bit for bit.
+//   the F32 tensor of their values bit for bit. Two projections of one input
+//   (the QSA indexer's query and key) share a dispatch when they share a tile
+//   and each gives the outputs of its own dispatch bit for bit.
 // - Float segments of a fused GGUF projection (Linear), the 35B's and the
 //   27B's F32 alpha/beta widths, on either float tile: the quantized
 //   segments' outputs unchanged, the padding past the segments unwritten.
@@ -69,6 +71,7 @@ using splash::metal::ComputeDispatch;
 using splash::metal::MetalBackend;
 using splash::metal::MetalBuffer;
 using splash::ops::FloatOutput;
+using splash::ops::FloatProjection;
 using splash::ops::FloatTile;
 using splash::ops::BlockExpertProjection;
 using splash::ops::BlockMoeWeights;
@@ -253,6 +256,66 @@ int bfloat16Weights(MetalBackend &backend) {
         failures += tileFailures;
       }
     }
+  return failures;
+}
+
+// Two float projections of one input, each into a destination of its own
+// stride and offset and on a tile of its own, as the QSA indexer projects its
+// query and key: at decode and prefill row counts and bf16 and fp32
+// destinations, one dispatch when they share a value type and a tile and two
+// otherwise, each projection's outputs and the bytes around them those of its
+// own dispatch bit for bit.
+int floatPairs(MetalBackend &backend) {
+  constexpr uint32_t K = 512, kQueryStride = 96, kKeyStride = 40;
+  constexpr std::array<FloatTile, 2> kTiles{FloatTile::Simdgroup, FloatTile::NeuralAccelerator};
+  const auto name = [](FloatTile tile) { return tile == FloatTile::NeuralAccelerator ? "accelerator" : "simdgroup"; };
+  const Tensor query = floating(backend, 64, K, 0.05f), key = floating(backend, 24, K, 0.05f);
+  const std::vector<__bf16> bits(key.values.begin(), key.values.end());
+  const QuantizedSegment bfloatKey = QuantizedSegment::floats(
+      24, K, upload(backend, bits.data(), bits.size() * 2, "gguf-bf16"), QuantizedSegment::kBFloat16);
+  int failures = 0;
+  for (const uint32_t rows : {1u, 16u, 33u, 263u}) {
+    const MetalBuffer input = bfloatBuffer(backend, activations(uint64_t{rows} * K), "pair-input");
+    for (const FloatTile queryTile : kTiles)
+      for (const FloatTile keyTile : kTiles) {
+        if (rows < 16 && (queryTile != FloatTile::Simdgroup || keyTile != FloatTile::Simdgroup)) continue;
+        for (const FloatOutput type : {FloatOutput::BFloat16, FloatOutput::Float32})
+          for (const QuantizedSegment *second : {&key.segment, &bfloatKey}) {
+            // One row more than the dispatch writes, whose sentinel must survive.
+            const auto destination = [&](uint32_t stride) {
+              MetalBuffer output = backend.allocateBuffer(
+                  uint64_t{rows + 1} * stride * (type == FloatOutput::Float32 ? 4 : 2), BufferStorage::Shared,
+                  "pair-output");
+              std::memset(output.contents(), 0x7F, output.sizeBytes());
+              return output;
+            };
+            const std::array<MetalBuffer, 4> outputs{destination(kQueryStride), destination(kKeyStride),
+                                                     destination(kQueryStride), destination(kKeyStride)};
+            const std::array<FloatProjection, 2> pair{
+                FloatProjection{&query.segment, outputs[0], kQueryStride, 32, queryTile},
+                FloatProjection{second, outputs[1], kKeyStride, 8, keyTile}};
+            CommandGraph together, apart;
+            splash::ops::addGgufFloat(together, input, pair, rows, type);
+            splash::ops::addGgufFloat(apart, input, query.segment, outputs[2], rows, kQueryStride, 32, type,
+                                      queryTile);
+            splash::ops::addGgufFloat(apart, input, *second, outputs[3], rows, kKeyStride, 8, type, keyTile);
+            const size_t dispatches = together.dispatches().size();
+            for (const CommandGraph *graph : {&together, &apart})
+              static_cast<void>(backend.submitCommandAsync(graph->dispatches()).wait());
+            if (dispatches != (second == &key.segment && queryTile == keyTile ? 1u : 2u) ||
+                std::memcmp(outputs[0].contents(), outputs[2].contents(), outputs[0].sizeBytes()) ||
+                std::memcmp(outputs[1].contents(), outputs[3].contents(), outputs[1].sizeBytes())) {
+              printf("  float pair rows=%u %s, query %s, %s key %s: %zu dispatches, outputs %s FAIL\n", rows,
+                     type == FloatOutput::Float32 ? "f32" : "bf16", name(queryTile),
+                     second == &key.segment ? "F32" : "BF16", name(keyTile), dispatches,
+                     "differ from each projection's own dispatch");
+              ++failures;
+            }
+          }
+      }
+  }
+  printf("float pairs: one dispatch of one value type and tile, two otherwise, each projection's outputs as alone %s\n",
+         failures ? "FAIL" : "ok");
   return failures;
 }
 
@@ -1157,9 +1220,9 @@ int main(int argc, const char *argv[]) {
     try {
       MetalBackend backend(argv[1]);
       bufferExtents(backend);
-      const int failures = floatProjection(backend) + bfloat16Weights(backend) + floatSegments(backend, 64) +
-                           floatSegments(backend, 96) + floatOnlyChain(backend) + moe(backend) +
-                           routingLoads(backend) + permutedSlots(backend) + verifiedRows(backend);
+      const int failures = floatProjection(backend) + bfloat16Weights(backend) + floatPairs(backend) +
+                           floatSegments(backend, 64) + floatSegments(backend, 96) + floatOnlyChain(backend) +
+                           moe(backend) + routingLoads(backend) + permutedSlots(backend) + verifiedRows(backend);
       if (failures) {
         std::cerr << "gguf_moe_test: " << failures << " failures\n";
         return 1;

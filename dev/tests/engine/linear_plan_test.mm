@@ -941,8 +941,9 @@ void rotatedRegisterInput(metal::MetalBackend &backend) {
 // Each buffer only a block projection's dispatches reach, at its extent and
 // one element short: a rotated projection's int8 sign of every input and its
 // rotated rows of the plan's storage; a float projection's fp32 weights, its
-// input rows and its output rows of 512 columns up to its last column, 192;
-// and the planes of a quantized segment.
+// input rows and its output rows of 512 columns up to its last column, 192,
+// and those of a second one in its dispatch; and the planes of a quantized
+// segment.
 void blockExtents(metal::MetalBackend &backend) {
   const Linear linear = gpu(10, 16);
   constexpr uint32_t n = 256, k = 2048;
@@ -991,6 +992,23 @@ void blockExtents(metal::MetalBackend &backend) {
                 "float projection output", [&](metal::CommandGraph &graph, const metal::MetalBuffer &view) {
                   project(graph, input, weights, view);
                 });
+  // The second projection of a dispatch of two, as the QSA indexer's key beside its query: its weights and its own
+  // rows of floatColumns columns.
+  const QuantizedSegment second =
+      QuantizedSegment::floats(floatColumns, k, allocate(backend, uint64_t{floatColumns} * k * 4));
+  const metal::MetalBuffer secondRows = allocate(backend, uint64_t{floatRows} * floatColumns * 4);
+  const auto pair = [&](metal::CommandGraph &graph, const QuantizedSegment &segment,
+                        const metal::MetalBuffer &rowsOut) {
+    const std::array<FloatProjection, 2> projections{FloatProjection{&weights, output, outStride, outOffset},
+                                                     FloatProjection{&segment, rowsOut, floatColumns, 0}};
+    addGgufFloat(graph, input, projections, floatRows, FloatOutput::Float32);
+  };
+  requireExtent(backend, second.plane0, uint64_t{floatColumns} * k * 4, 4, "float projection weight",
+                [&](metal::CommandGraph &graph, const metal::MetalBuffer &view) {
+                  pair(graph, QuantizedSegment::floats(floatColumns, k, view), secondRows);
+                });
+  requireExtent(backend, secondRows, uint64_t{floatRows} * floatColumns * 4, 4, "float projection output",
+                [&](metal::CommandGraph &graph, const metal::MetalBuffer &view) { pair(graph, second, view); });
 
   // A fused projection of a 320-row Q5_K segment and a 192-row Q4_K one.
   // Each plane is tiles of QUANT_TILE_ROWS rows by groups of 32 inputs, or
