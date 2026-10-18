@@ -868,6 +868,20 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   }
   reportStreamedStores(loaded, streamable, config.expertMemory, config.pleMemory);
 
+  // The engine's plan with the staging the tier keeps; one that cannot hold
+  // the model stops the start with its breakdown, before the tier's files
+  // open.
+  const auto requirePlan = [&] {
+    EngineMemoryPlanResult planResult = planMemory(0);
+    if (!planResult.plan) {
+      throw RuntimeResourcesError(RuntimeResourceStage::MemoryPlanning,
+                                  planResult.status.message,
+                                  planResult.status.describe());
+    }
+    return std::move(*planResult.plan);
+  };
+  EngineMemoryPlan memoryPlan = requirePlan();
+
   RuntimeCacheIdentity cacheIdentity;
   try {
     cacheIdentity = makeRuntimeCacheIdentity(
@@ -875,15 +889,17 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
         loaded.targetManifestFingerprint(), config.buildId,
         loaded.targetKvLayout(config.kvFormat), loaded.descriptor.ropeScaling);
   } catch (const std::exception &error) {
-    throw RuntimeResourcesError(RuntimeResourceStage::ModelLoading, error.what());
+    throw RuntimeResourcesError(RuntimeResourceStage::ModelLoading,
+                                error.what(),
+                                memoryPlan.breakdown().describe());
   }
 
-  std::optional<EngineMemoryPlan> memoryPlan;
   try {
     // The tier's files open now, where the disk takes them (openDiskTier):
     // the plan set the staging aside without asking it, and where they do
-    // not open the staging stays unused. The plan of a target whose KV
-    // spills takes the room the tier's volume leaves it.
+    // not open the staging stays unused. A plan that spills takes the room
+    // the tier's volume leaves active KV, and spills only where its KV file
+    // opened: its floors can only shrink.
     const std::string cacheNamespace =
         persistentCacheNamespace(cacheIdentity, loaded.stateLayout(config.stateFormat));
     // The KV file's slots hold a page as the tier lays it out, checksummed by
@@ -894,16 +910,12 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     const model::SlotFile::Options stateFileOptions{.deferWrites = readers->criticalBusyProbe()};
     DiskTier disk = openDiskTier(config, cacheNamespace, stateStagingBytes ? cacheDiskBytes : 0, kvSlotBytes,
                                  kvFileOptions, stateBytes, stateFileOptions);
-    kvFileOpen = disk.kv != nullptr;
-    if (disk.budget)
-      activeLimitBytes = disk.budget->activeLimitBytes();
-    EngineMemoryPlanResult planResult = planMemory(0);
-    if (!planResult.plan) {
-      throw RuntimeResourcesError(RuntimeResourceStage::MemoryPlanning,
-                                  planResult.status.message,
-                                  planResult.status.describe());
+    if (memoryPlan.breakdown().kvSpill.enabled) {
+      kvFileOpen = disk.kv != nullptr;
+      if (disk.budget)
+        activeLimitBytes = disk.budget->activeLimitBytes();
+      memoryPlan = requirePlan();
     }
-    memoryPlan = std::move(*planResult.plan);
 
     // The governor holds the complete Metal footprint to the hard budget. The
     // plan budgets pipelines and driver allocations inside the pipeline and
@@ -912,10 +924,10 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     // split only moves bytes from KV to fixed runtime memory, so the governor
     // is the same with it or without.
     auto memoryGovernor = std::make_unique<MemoryGovernor>(
-        *backend, memoryPlan->breakdown().hardBudgetBytes, hostReserveBytes,
+        *backend, memoryPlan.breakdown().hardBudgetBytes, hostReserveBytes,
         EngineMemoryPolicy::hostSpareReserveBytes(device.physicalMemoryBytes), config.hostMemory,
-        memoryPlan->breakdown().pipelineReserveBytes + memoryPlan->breakdown().runtimeOverheadReserveBytes,
-        memoryPlan->breakdown().streamedTableBytes);
+        memoryPlan.breakdown().pipelineReserveBytes + memoryPlan.breakdown().runtimeOverheadReserveBytes,
+        memoryPlan.breakdown().streamedTableBytes);
     if (config.memoryPressure)
       memoryGovernor->setPressure(config.memoryPressure());
     // What the start allocates, the KV runway, the arenas and the warmup, is
@@ -940,7 +952,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
         config.aneFfn, splitContext, planMemory, config.cancelled);
     if (aneFfn.plan)
       memoryPlan = std::move(*aneFfn.plan);
-    const EngineMemoryBreakdown &budget = memoryPlan->breakdown();
+    const EngineMemoryBreakdown &budget = memoryPlan.breakdown();
     const KvSpillPlan &spill = budget.kvSpill;
     std::string spillOff = spillOffReason(config.model, kvLayout, spill, stateStagingBytes && kvFileOpen);
     reportSpill(config.model, budget, spillOff, activeLimitBytes);
@@ -1008,7 +1020,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
 
     auto result = std::unique_ptr<RuntimeResources>(new RuntimeResources(
         std::move(disk.persistent), std::move(backend), std::move(readers), std::move(loaded),
-        std::move(operators), std::move(*memoryPlan), std::move(cacheIdentity),
+        std::move(operators), std::move(memoryPlan), std::move(cacheIdentity),
         std::move(memoryGovernor), std::move(kvPages), std::move(stateStorage),
         std::move(kvTier), std::move(disk.space), std::move(kvPool), std::move(cache),
         std::move(aneFfn.split), std::move(aneFfn.outcome), std::move(blockCache),
@@ -1020,12 +1032,12 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   } catch (const metal::MetalAllocationError &error) {
     throw RuntimeResourcesError(RuntimeResourceStage::StorageAllocation,
                                 error.what(),
-                                memoryPlan ? memoryPlan->breakdown().describe() : std::string(),
+                                memoryPlan.breakdown().describe(),
                                 resourceAllocationFailure(error.failure()));
   } catch (const std::exception &error) {
     throw RuntimeResourcesError(RuntimeResourceStage::StorageAllocation,
                                 error.what(),
-                                memoryPlan ? memoryPlan->breakdown().describe() : std::string());
+                                memoryPlan.breakdown().describe());
   }
 }
 
