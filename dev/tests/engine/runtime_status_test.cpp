@@ -219,10 +219,50 @@ void testCleanRuntimeStatus(const char *goldenPath) {
   const ResourceWaitSnapshot wait{.memory = 2, .concurrency = 1, .heldBehindRefusal = 4,
                                   .restoring = 1, .suspended = 1,
                                   .oldestWaitMilliseconds = 1250.0, .draining = true};
+  // A Flash-Next request decoding over 31K pages of its 1M tokens that hold
+  // only their index, its history's copies written.
+  KvSpillStatus spill{.enabled = true};
+  spill.cache = {.spilledPages = 31'122,
+                 .spilledBytes = 13'257'000'000,
+                 .writeThroughPages = 31'250,
+                 .writeThroughBytes = 13'312'000'000,
+                 .writeThroughInFlight = 3,
+                 .spillMoves = 31'122,
+                 .indexRestores = 12,
+                 .wholeRestores = 2,
+                 .restore = {.count = 2, .totalMilliseconds = 1.5, .maximumMilliseconds = 1, .p50Milliseconds = 0.5,
+                             .p95Milliseconds = 1, .p99Milliseconds = 1},
+                 .activeLimitBytes = 32 * kGiB,
+                 .heldBytes = 13'257'000'000,
+                 .committedBytes = 55'000'000};
+  // Its pool's Index pages, of 24 KiB: those 31K, and a free extent of them,
+  // the runway.
+  engine.resources.pool.index = {.pagesAllocated = 31'506,
+                                 .pagesFree = 256,
+                                 .pagesActive = 31'250,
+                                 .allocatedBytes = 31'506 * 24'576ULL};
+  spill.blockCache = model::KvBlockCacheStats{.bytes = 408'944'640,
+                                              .targetBytes = 408'944'640,
+                                              .floorBytes = 408'944'640,
+                                              .slotsPerLayer = 8'192,
+                                              .lanes = 1,
+                                              .reads = {.resolves = 24,
+                                                        .entries = 98'304,
+                                                        .paged = 1'024,
+                                                        .hits = 60'000,
+                                                        .misses = 37'280,
+                                                        .ghostHits = 512,
+                                                        .readBytes = 310'000'000}};
+  spill.historyStream = model::KvHistoryStreamStats{.commands = 2,
+                                                    .layers = 24,
+                                                    .pages = 750'000,
+                                                    .bytes = 24'960'000'000,
+                                                    .stagingBytes = 1'056'440'320,
+                                                    .buffers = 2};
   const std::string json = runtimeStatusJson(
       memoryPlan, engine, metal, warmup, audit(memoryPlan), metrics, executorTelemetry,
       identity, governor, true, {}, wait, NativeLoopTiming{1843.25}, {600.0, false, false, 2, 1}, aneFfn,
-      ThermalState::Fair);
+      ThermalState::Fair, std::nullopt, std::nullopt, spill);
   std::ifstream golden(goldenPath);
   const std::string expected{std::istreambuf_iterator<char>(golden), {}};
   require(golden && json + '\n' == expected,
