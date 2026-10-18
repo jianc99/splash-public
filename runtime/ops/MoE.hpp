@@ -262,6 +262,11 @@ struct MoeBuffers final {
   metal::MetalBuffer residual;
   metal::MetalBuffer output;
   MoeScratch scratch;
+  // A verify step's lanes' verify rows, a uint32 per lane (the draft
+  // selector's, ops::DraftSelector::addVerifyRows): its routing routes each lane's verify
+  // rows alone (moe_group_routes_verified*), and a streamed load predicts the
+  // next block's experts from them. Empty, every row routes.
+  metal::MetalBuffer verifyRows;
 };
 
 // Routes and executes grouped experts from immutable weight views.

@@ -96,6 +96,13 @@ MetalBuffer allocate(MetalBackend &backend, uint64_t bytes) {
   return buffer;
 }
 
+// Each of `lanes` lanes' verify rows: its whole block.
+MetalBuffer wholeBlocks(MetalBackend &backend, uint64_t lanes) {
+  MetalBuffer buffer = allocate(backend, lanes * sizeof(uint32_t));
+  std::fill_n(static_cast<uint32_t *>(buffer.contents()), lanes, kRows);
+  return buffer;
+}
+
 struct Batch final {
   SamplingBuffers buffers;
   uint32_t vocabulary = 0;
@@ -673,7 +680,8 @@ void speculativeExactness(MetalBackend &backend, uint32_t samplingMask) {
       batch.buffers.uniforms,
       batch.buffers.outputTokens,
       allocate(backend, lanes * sizeof(uint32_t)),
-      allocate(backend, lanes * sizeof(uint32_t))};
+      allocate(backend, lanes * sizeof(uint32_t)),
+      wholeBlocks(backend, lanes)};
   auto *proposed = static_cast<uint32_t *>(acceptance.proposedTokens.contents());
   auto *candidates = static_cast<uint32_t *>(acceptance.candidates.contents());
   auto *proposal =
@@ -995,7 +1003,8 @@ void bufferExtents(MetalBackend &backend) {
                                      batch.buffers.uniforms,
                                      batch.buffers.outputTokens,
                                      allocate(backend, lanes * 4),
-                                     allocate(backend, lanes * 4)};
+                                     allocate(backend, lanes * 4),
+                                     wholeBlocks(backend, lanes)};
   const uint64_t candidates = 2 * kPositions * kDraftCandidates * 4;
   for (const uint32_t lastRetained : {5U, kRows}) {
     const std::array<uint32_t, lanes> retained{kRows, kRows, lastRetained};
@@ -1011,7 +1020,8 @@ void bufferExtents(MetalBackend &backend) {
              {&AcceptanceBuffers::outputTokens, (2 * kRows + std::max(kPositions, lastRetained)) * 4, 4,
               "target token"},
              {&AcceptanceBuffers::retainedCounts, lanes * 4, 4, "retained count"},
-             {&AcceptanceBuffers::acceptedCounts, lanes * 4, 4, "accepted count"}})
+             {&AcceptanceBuffers::acceptedCounts, lanes * 4, 4, "accepted count"},
+             {&AcceptanceBuffers::verifyRows, lanes * 4, 4, "verify rows"}})
       splash::test::requireExtent(backend, acceptance.*member, bytes, element, what,
                                   [&](CommandGraph &graph, const MetalBuffer &buffer) {
                                     AcceptanceBuffers changed = acceptance;
@@ -1509,7 +1519,8 @@ void excludedStopTokens(MetalBackend &backend, uint32_t vocabulary) {
       batch.buffers.uniforms,
       batch.buffers.outputTokens,
       allocate(backend, kLanes * sizeof(uint32_t)),
-      allocate(backend, kLanes * sizeof(uint32_t))};
+      allocate(backend, kLanes * sizeof(uint32_t)),
+      wholeBlocks(backend, kLanes)};
   for (uint32_t lane = 0; lane < kLanes; ++lane) {
     static_cast<uint32_t *>(
         acceptance.proposedTokens.contents())[lane * kPositions] = stops[0];
@@ -1677,7 +1688,8 @@ void thinkingCutoffs(MetalBackend &backend, uint32_t vocabulary) {
       batch.buffers.uniforms,
       batch.buffers.outputTokens,
       allocate(backend, kLanes * sizeof(uint32_t)),
-      allocate(backend, kLanes * sizeof(uint32_t))};
+      allocate(backend, kLanes * sizeof(uint32_t)),
+      wholeBlocks(backend, kLanes)};
   auto *proposed = static_cast<uint32_t *>(acceptance.proposedTokens.contents());
   // A draft token with all of the draft's mass, at verify input row
   // position + 1.
@@ -2157,7 +2169,8 @@ void speculativeWholeVocabulary(MetalBackend &backend) {
       batch.buffers.uniforms,
       batch.buffers.outputTokens,
       allocate(backend, lanes * sizeof(uint32_t)),
-      allocate(backend, lanes * sizeof(uint32_t))};
+      allocate(backend, lanes * sizeof(uint32_t)),
+      wholeBlocks(backend, lanes)};
   auto *proposed = static_cast<uint32_t *>(acceptance.proposedTokens.contents());
   auto *candidates =
       static_cast<uint32_t *>(batch.buffers.draftCandidates.contents());
@@ -2260,7 +2273,8 @@ void overProposedResidual(MetalBackend &backend) {
       batch.buffers.uniforms,
       batch.buffers.outputTokens,
       allocate(backend, sizeof(uint32_t)),
-      allocate(backend, sizeof(uint32_t))};
+      allocate(backend, sizeof(uint32_t)),
+      wholeBlocks(backend, 1)};
   // Token 5 leads with weight 1 and token 6 weighs less than an ulp of it;
   // token 1000 weighs 0.5 and forty tokens from 1200 a hundredth each. The
   // others weigh nothing.
@@ -2417,7 +2431,8 @@ void nonFiniteRowsSelectTheSentinel(MetalBackend &backend) {
       batch.buffers.uniforms,
       batch.buffers.outputTokens,
       allocate(backend, sizeof(uint32_t)),
-      allocate(backend, sizeof(uint32_t))};
+      allocate(backend, sizeof(uint32_t)),
+      wholeBlocks(backend, 1)};
   Random random(0x6e616e);
   for (uint32_t position = 0; position < kPositions; ++position) {
     const uint32_t draft = 3 + random.next() % (vocabulary - 3);
