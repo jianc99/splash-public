@@ -32,7 +32,7 @@ public:
   [[nodiscard]] std::vector<metal::MetalBuffer> addPrefill(metal::CommandGraph &graph,
                                                            std::span<const QwenTargetPrefillChunk> chunks,
                                                            const kv::PageStorage &kv, SpilledKvReads &spilled,
-                                                           ops::AneFfn *aneFfn) override;
+                                                           QwenPrefillLayers layers, ops::AneFfn *aneFfn) override;
   void prepareVerifyLane(uint32_t lane, uint64_t position, const QwenTargetRequest &request) override;
   void addVerify(metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers, const kv::PageStorage &kv,
                  SpilledKvReads &spilled, std::span<const kv::ChunkedPrefillParams> chunks,
@@ -69,6 +69,7 @@ private:
   // every MoE adds its rows to zeros into the branch the next mix adds to the
   // streams; the final mix goes into buffers.hidden[1].
   void addPrefillBegin(PrefillStep &step) const;
+  [[nodiscard]] bool attends(uint32_t index) const;
   void addPrefillLayer(PrefillStep &step, uint32_t index) const;
   [[nodiscard]] const ops::BlockMoeWeights *moe(uint32_t index) const;
   void addPrefillExperts(PrefillStep &step, uint32_t index) const;

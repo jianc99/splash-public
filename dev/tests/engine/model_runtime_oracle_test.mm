@@ -1456,6 +1456,108 @@ void requirePrefillGroupMatchesItsChunks(model::Runtime &executor, const kv::Pag
   std::cout << "prefill_group_matches_its_chunks=PASS" << (vision ? " images=PASS" : " images=SKIP") << '\n';
 }
 
+// A prefill command run in passes over the target's layers
+// (BatchPlan::passes), each its own command, leaves what it leaves run
+// whole: its score logits, KV, GDN cell, PLE history, lengths, draft rings
+// and window, and the states it captures, at three passes and at one a
+// layer; a pass before the last returns its request's id alone. A target
+// whose commands run whole (its experts load whole) skips it.
+void requirePrefillPassesMatchWhole(model::Runtime &executor, const kv::PageStorage &pages,
+                                    const model::QwenStateStorage &states, std::span<const uint32_t> chat) {
+  const uint32_t passes = executor.prefillPasses();
+  if (passes <= 1) {
+    std::cout << "prefill_passes=SKIP (the target runs its prefill commands whole)\n";
+    return;
+  }
+  constexpr uint32_t chunk = model::ExecutionLimits::prefillTokenBudget;
+  constexpr uint32_t rows = 2 * chunk + 512;
+  const std::vector<uint32_t> pageTable = pageRange(0, rows / kv::kPageTokens);
+  require(pages.pageCount() >= pageTable.size(), "the KV pool cannot hold the prefill passes fixture");
+  std::vector<uint32_t> prompt(rows + kv::kPageTokens);
+  for (uint32_t index = 0; index < prompt.size(); ++index) prompt[index] = chat[index % chat.size()];
+  const std::span<const uint32_t> tokens(prompt);
+  constexpr std::array<uint32_t, 3> capturedAt{1024, chunk + 1024, rows};
+  const uint32_t width = states.layout().draft.contextWidth;
+  struct Run final {
+    std::vector<float> scores;
+    std::vector<std::vector<uint8_t>> kv;
+    model::QwenLogicalLengths lengths;
+    std::vector<uint8_t> cell;
+    std::vector<std::vector<uint16_t>> rings;
+    std::vector<uint8_t> window;
+    std::vector<StateBytes> captured;
+  };
+  const auto run = [&](uint64_t id, uint32_t split) {
+    EngineRequest request = makeRequest(id, {prompt.begin(), prompt.begin() + rows}, 0);
+    for (uint32_t option = 0; option < model::ExecutionLimits::maximumScoreOptions; ++option)
+      request.scoreTokens.push_back(1000 + 37 * option);
+    beginCold(executor, request, 0);
+    executor.setDraftContextPlan(id, planDraftContext(0, rows, capturedAt));
+    ModelStepResult last;
+    {
+      ModelBatchItem item = withRevision({id, 0, rows, pageTable});
+      item.inputTokens = tokens.first(rows);
+      for (const uint32_t boundary : capturedAt) {
+        std::shared_ptr<StateReservation> reservation = executor.reserveState(id, boundary);
+        require(reservation != nullptr, "the buffers of a state to capture were refused");
+        item.stateCaptures.push_back({boundary, std::move(reservation)});
+      }
+      for (uint32_t pass = 0; pass < split; ++pass) {
+        const BatchPlan plan{.kind = WorkKind::Prefill,
+                             .items = {{id, rows}},
+                             .decodeStage = DecodeStage::Regular,
+                             .pass = pass,
+                             .passes = split};
+        std::vector<ModelStepResult> results = executor.submit(plan, std::span(&item, 1), {})->wait();
+        require(results.size() == 1 && results[0].requestId == id && results[0].failure.empty(),
+                "a prefill command's pass failed");
+        if (pass + 1 < split)
+          require(!results[0].consumedPromptTokens && results[0].capturedStates.empty() &&
+                      results[0].scoreLogits.empty() && !results[0].finished,
+                  "a pass before a command's last committed something");
+        else
+          last = std::move(results[0]);
+      }
+    }
+    require(last.consumedPromptTokens == rows && last.capturedStates.size() == capturedAt.size(),
+            "a command's last pass did not commit its rows and states");
+    Run result{last.scoreLogits, {}, states.metadata(0).lengths, bytesOf(states.current(0).stateBase),
+               committedState(executor, states, 0).rings, bytesOf(states.window(0)), {}};
+    for (const uint32_t page : pageTable)
+      for (const auto &tensor : pages.spans(page)) {
+        const auto *data = reinterpret_cast<const uint8_t *>(tensor.data());
+        result.kv.emplace_back(data, data + tensor.size());
+      }
+    executor.end(id);
+    for (size_t index = 0; index < capturedAt.size(); ++index) {
+      StateBytes state = restoredBytes(executor, states, 540, 1, tokens, capturedAt[index], last.capturedStates[index]);
+      state.window = windowRows(state.window, width, capturedAt[index]);
+      result.captured.push_back(std::move(state));
+    }
+    return result;
+  };
+  const Run whole = run(531, 1);
+  require(!whole.scores.empty(), "a prefill command run whole scored nothing");
+  for (const uint32_t split : {3u, passes}) {
+    const Run passed = run(531 + split, split);
+    const std::string which = "a prefill command in " + std::to_string(split) + " passes";
+    require(passed.scores == whole.scores, which + ": its score logits differ from the command run whole");
+    require(passed.kv == whole.kv, which + ": its KV differs from the command run whole");
+    require(passed.lengths == whole.lengths && passed.cell == whole.cell,
+            which + ": its GDN cell, PLE history or lengths differ from the command run whole");
+    require(passed.rings == whole.rings && passed.window == whole.window,
+            which + ": its draft rings or window differ from the command run whole");
+    for (size_t index = 0; index < capturedAt.size(); ++index)
+      require(passed.captured[index].cell == whole.captured[index].cell &&
+                  passed.captured[index].window == whole.captured[index].window,
+              which + ": the state it captured at " + std::to_string(capturedAt[index]) +
+                  " differs from the command run whole");
+  }
+  while (executor.reclaimIdleState(false, IdleMemory::Buffers)) {
+  }
+  std::cout << "prefill_passes_match_whole=PASS passes=3," << passes << '\n';
+}
+
 // A command's ticket holds the buffers of the states it captures once the
 // items it was submitted with are gone, as the engine's are once it has
 // submitted them: they go back to the pool only with the states the command
@@ -3306,7 +3408,8 @@ int main(int argc, char **argv) {
     // routed experts stream from the file into an arena of SIZE, as splash
     // serve's --expert-memory does. --prefill-groups-only: a prefill group
     // against its chunks' commands (requirePrefillGroupMatchesItsChunks),
-    // then stop. A block-sparse target's K/V that spilled reads what its
+    // and a command in passes against it whole
+    // (requirePrefillPassesMatchWhole), then stop. A block-sparse target's K/V that spilled reads what its
     // pages held (requireSpilledKvMatchesResident), first, on a runtime of
     // its own: --spill-tokens N prompts (by default two commands, the
     // second of two chunks), --spill-window PAGES (1), --spill-buffers 1|2
@@ -3608,8 +3711,10 @@ int main(int argc, char **argv) {
     if (prefillGroupsOnly) {
       requirePrefillGroupMatchesItsChunks(executor, pages, states, samplingSeedTokens,
                                           model.descriptor.hasVision());
+      requirePrefillPassesMatchWhole(executor, pages, states, samplingSeedTokens);
       std::cout << "PASS model-runtime-oracle scope=prefill-groups-only model=" << model.name()
-                << " (a prefill group leaves what its chunks' commands leave)\n";
+                << " (a prefill group leaves what its chunks' commands leave, and in passes what it leaves "
+                   "whole)\n";
       return 0;
     }
     // A natural token pattern: a run of zero tokens can make the target select
@@ -3723,6 +3828,7 @@ int main(int argc, char **argv) {
     requireCapturesOutliveTheirItems(executor, states, samplingSeedTokens);
     requirePrefillGroupMatchesItsChunks(executor, pages, states, samplingSeedTokens,
                                         model.descriptor.hasVision());
+    requirePrefillPassesMatchWhole(executor, pages, states, samplingSeedTokens);
     requireBatchedLanesMatchReordered(executor, states, samplingSeedTokens);
 
 

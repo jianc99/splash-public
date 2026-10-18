@@ -308,6 +308,15 @@ struct BatchPlan final {
   bool constrained = false;
   std::vector<BatchItem> items;
   DecodeStage decodeStage = DecodeStage::Regular;
+  // A prefill of one lane may run in passes, each over the next of `passes`
+  // even shares of the target's layers (Model::prefillPasses): this command
+  // is pass `pass`. The first pass begins the rows, the last ends them and
+  // commits; the rows' work between lives in the model's prefill memory,
+  // which no other prefill touches meanwhile, while other lanes' decode
+  // commands run between passes. A request that ends between passes leaves
+  // the rest unrun and nothing of the rows committed.
+  uint32_t pass = 0;
+  uint32_t passes = 1;
 
   [[nodiscard]] bool empty() const noexcept { return items.empty(); }
   [[nodiscard]] uint32_t width() const noexcept {
@@ -371,6 +380,8 @@ struct ModelBatchItem final {
 
 struct ModelStepResult final {
   uint64_t requestId = 0;
+  // A prefill's rows, which only its last pass consumes (BatchPlan::passes):
+  // an earlier pass's result is the request's id and nothing else.
   uint32_t consumedPromptTokens = 0;
   std::vector<uint32_t> outputTokens;
   // True after a stop token or the final score-only prefill chunk.
@@ -771,6 +782,12 @@ public:
     static_cast<void>(spills);
     return ExecutionLimits::prefillTokenBudget;
   }
+  // The most passes over its layers one lane's prefill command may run in
+  // (BatchPlan::passes): its layers where a command pays a cost per layer
+  // whatever its rows, which keeps a command long however few they are, as
+  // a streamed target's expert reads; 1 where a command runs whole. A
+  // command that encodes images or streams its history runs whole.
+  [[nodiscard]] virtual uint32_t prefillPasses() const noexcept { return 1; }
   // Releases one unit of idle model memory and returns its bytes; zero when
   // nothing in scope is idle. A unit is one pooled state buffer (keepLane
   // keeps those one lane starts from); with BuffersThenCaches, once no

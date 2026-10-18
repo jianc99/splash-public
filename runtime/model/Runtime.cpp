@@ -925,6 +925,19 @@ struct Runtime::Impl {
         laneTables(request(streamed->requestId).stateLane).pages, kvPages.layers());
   }
 
+  // The layers a prefill command's pass runs (BatchPlan::passes): the
+  // pass's even share of them, all of them for a command that runs whole.
+  // Only a command of one lane whose history stays in memory runs in passes,
+  // as many as the runtime allows (Runtime::prefillPasses).
+  [[nodiscard]] QwenPrefillLayers passLayers(const BatchPlan &plan, std::span<const ModelBatchItem> items,
+                                             uint32_t passes) const {
+    const uint32_t all = geometry.target.layers;
+    if (!plan.passes || plan.pass >= plan.passes || plan.passes > passes ||
+        (plan.passes > 1 && (items.size() != 1 || readsSpilledKv(items.front()))))
+      throw std::invalid_argument("a prefill command's passes are not ones the runtime runs");
+    return {plan.pass * all / plan.passes, (plan.pass + 1) * all / plan.passes};
+  }
+
   // The blocks each lane of a command could not read
   // (ModelStepResult::unreadableKvBlocks), each once.
   static std::array<std::vector<uint64_t>, kLaneCount> unreadableBlocks(const SpilledKvReads &reads) {
@@ -1628,12 +1641,14 @@ struct Runtime::Impl {
     return InitialSelection{&entry, lane, !scoring};
   }
 
-  // A prefill command (preparePrefill): a restored lane's draft rings
-  // (DFlash2) first; each chunk's RoPE tables, embedding and image rows in
-  // its own tensors; the target's layers over the chunks
+  // A prefill command (preparePrefill), or the pass of it that runs
+  // `layers` (BatchPlan::passes): with the first layer, a restored lane's
+  // draft rings (DFlash2) first and each chunk's RoPE tables, embedding and
+  // image rows in its own tensors; the target's layers over the chunks
   // (QwenTarget::addPrefill), which read spilled history through `reads`;
-  // the draft's context of each chunk's captured rows; and the first token
-  // of each lane whose rows end its prompt. A
+  // with the last layer, the draft's context of each chunk's captured rows,
+  // the first token of each lane whose rows end its prompt, and each lane's
+  // last row of the final hidden, which a pass before has none of. A
   // lane's GDN and auxiliary state pass from its current cell through its
   // parts to its next cell, which its last part writes; a part that ends at
   // a state it captures writes that state's cell, another the next cell or
@@ -1641,7 +1656,9 @@ struct Runtime::Impl {
   // no part writes the cell it reads, and none the lane's current cell; with
   // one scratch cell, at most one lane's rows run past a chunk.
   PrefillOutputs encodePrefillGraph(CommandGraph &graph, std::span<const ModelBatchItem> items,
-                                    std::array<Request *, kLaneCount> &entries, SpilledKvReads &reads) {
+                                    std::array<Request *, kLaneCount> &entries, SpilledKvReads &reads,
+                                    QwenPrefillLayers layers) {
+    const bool begins = !layers.first, ends = layers.end == geometry.target.layers;
     const std::vector<PrefillChunk> chunks = preparePrefill(items, entries);
     const uint32_t lanes = static_cast<uint32_t>(items.size());
     // Each lane's parts, (chunk, sequence) in order.
@@ -1678,7 +1695,7 @@ struct Runtime::Impl {
     // and the draft RoPE tables before the command's rows do. Once the window
     // is full, the rows' window store and ring writes reuse the slots of the
     // oldest restored positions, so the rebuild comes before them too.
-    for (uint32_t lane = 0; lane < lanes; ++lane)
+    for (uint32_t lane = 0; begins && lane < lanes; ++lane)
       if (const auto &rebuild = entries[lane]->draftRebuild)
         addDraftRebuild(graph, entries[lane]->stateLane, *rebuild);
 
@@ -1696,14 +1713,16 @@ struct Runtime::Impl {
       QwenTargetPrefillChunk &model = modelChunks.emplace_back();
       model.buffers = prefillBuffers(*prefillArena, c);
       model.rows = chunk.rows;
-      addRopeTables(graph, p(PrefillTensor::TargetPositions), chunk.rows, p(PrefillTensor::DraftPositions),
-                    chunk.capturedRows, model.buffers.ropeCos, model.buffers.ropeSin, p(PrefillTensor::DraftRopeCos),
-                    p(PrefillTensor::DraftRopeSin));
-      targetModel->addEmbedding(graph, p(PrefillTensor::InputTokens), model.buffers.hidden[0], chunk.rows);
+      if (begins) {
+        addRopeTables(graph, p(PrefillTensor::TargetPositions), chunk.rows, p(PrefillTensor::DraftPositions),
+                      chunk.capturedRows, model.buffers.ropeCos, model.buffers.ropeSin,
+                      p(PrefillTensor::DraftRopeCos), p(PrefillTensor::DraftRopeSin));
+        targetModel->addEmbedding(graph, p(PrefillTensor::InputTokens), model.buffers.hidden[0], chunk.rows);
+      }
       for (uint32_t s = 0; s < chunk.sequences.size(); ++s) {
         const PrefillSequence &sequence = chunk.sequences[s];
         const ModelBatchItem &part = sequence.part;
-        addImageRows(graph, *sequence.entry, part, model.buffers.hidden[0], sequence.rowBegin);
+        if (begins) addImageRows(graph, *sequence.entry, part, model.buffers.hidden[0], sequence.rowBegin);
         const GdnParityBuffers &in = *from[sequence.lane], &out = *written[c][s];
         from[sequence.lane] = &out;
         QwenTargetPrefillSequence &destination = sequences[c].emplace_back();
@@ -1737,8 +1756,9 @@ struct Runtime::Impl {
       }
       model.sequences = sequences[c];
     }
-    const std::vector<MetalBuffer> finalHidden = targetModel->addPrefill(graph, modelChunks, kvPages, reads, aneFfn);
-    for (uint32_t c = 0; c < chunks.size(); ++c) addDraftContext(graph, chunks, c);
+    const std::vector<MetalBuffer> finalHidden =
+        targetModel->addPrefill(graph, modelChunks, kvPages, reads, layers, aneFfn);
+    for (uint32_t c = 0; ends && c < chunks.size(); ++c) addDraftContext(graph, chunks, c);
 
     PrefillOutputs outputs;
     std::array<InitialSelection, kLaneCount> selections{};
@@ -1746,19 +1766,21 @@ struct Runtime::Impl {
     for (uint32_t lane = 0; lane < lanes; ++lane) {
       // The lane's last part ends its rows, as a command of the part's rows
       // would.
-      const auto [c, s] = parts[lane].back();
-      const PrefillSequence &last = chunks[c].sequences[s];
-      const MetalBuffer lastRow =
-          prefillU16(finalHidden[c], last.rowBegin + last.part.tokenCount - 1, 1, geometry.target.hiddenSize);
-      if (const auto selection = finishPrompt(graph, *entries[lane], items[lane], lastRow, lane))
-        selections[selectionCount++] = *selection;
+      if (ends) {
+        const auto [c, s] = parts[lane].back();
+        const PrefillSequence &last = chunks[c].sequences[s];
+        const MetalBuffer lastRow =
+            prefillU16(finalHidden[c], last.rowBegin + last.part.tokenCount - 1, 1, geometry.target.hiddenSize);
+        if (const auto selection = finishPrompt(graph, *entries[lane], items[lane], lastRow, lane))
+          selections[selectionCount++] = *selection;
+        outputs.lastRows[lane] = lastRow;
+      }
       for (const auto [partChunk, partSequence] : parts[lane]) {
         const PrefillSequence &part = chunks[partChunk].sequences[partSequence];
         outputs.captures[lane].insert(outputs.captures[lane].end(), part.captures.begin(), part.captures.end());
         outputs.stateCaptures[lane].insert(outputs.stateCaptures[lane].end(), part.stateCaptures.begin(),
                                            part.stateCaptures.end());
       }
-      outputs.lastRows[lane] = lastRow;
     }
     if (selectionCount) encodeInitialSelections(graph, std::span(selections).first(selectionCount), lanes);
     return outputs;
@@ -2626,6 +2648,8 @@ Runtime::prefillAsync(const BatchPlan &plan,
   if (plan.decodeStage != DecodeStage::Regular) {
     throw std::invalid_argument("Qwen prefill cannot resume a mask plan");
   }
+  const QwenPrefillLayers layers = impl_->passLayers(plan, items, prefillPasses());
+  const bool begins = !layers.first, ends = layers.end == impl_->geometry.target.layers;
 
   std::array<Impl::Request *, kLaneCount> entries{};
   // Each request's draws before the chunk, which a rerun of it restores.
@@ -2637,7 +2661,7 @@ Runtime::prefillAsync(const BatchPlan &plan,
     impl_->aneFfn->begin();
   }
   const std::shared_ptr<SpilledKvReads> reads = impl_->prefillReads(items);
-  const auto outputs = impl_->encodePrefillGraph(graph, items, entries, *reads);
+  const auto outputs = impl_->encodePrefillGraph(graph, items, entries, *reads, layers);
   const bool encodesImages = std::any_of(
       entries.begin(), entries.begin() + items.size(), [](const auto *entry) {
         return std::any_of(entry->images.begin(), entry->images.end(),
@@ -2647,9 +2671,9 @@ Runtime::prefillAsync(const BatchPlan &plan,
       });
   // A state captured inside the command starts from the lane's context
   // window as the command finds it, whose older rows the command's own rows
-  // overwrite. It is copied once, before the command runs: a rerun (below)
-  // would find the window the failed run wrote.
-  for (uint32_t lane = 0; lane < items.size(); ++lane)
+  // overwrite. It is copied once, before the command's first pass runs: a
+  // rerun (below) would find the window the failed run wrote.
+  for (uint32_t lane = 0; begins && lane < items.size(); ++lane)
     for (const Impl::PrefillStateCapture &capture : outputs.stateCaptures[lane])
       if (!capture.atEnd)
         impl_->states.copyWindow(entries[lane]->stateLane, *capture.reservation);
@@ -2660,7 +2684,7 @@ Runtime::prefillAsync(const BatchPlan &plan,
       impl_->aneFfn ? impl_->aneFfn->commit(graph, std::move(completion))
                     : impl_->backend.submitCommandAsync(graph.command(), std::move(completion));
   Impl *impl = impl_.get();
-  auto finish = [impl, entries, outputs, draws, reads,
+  auto finish = [impl, entries, outputs, draws, reads, ends,
                  items = std::move(copiedItems)](CommandTiming &timing) mutable {
     // A chunk whose Neural Engine work failed holds no usable outputs, and
     // the split has stopped: the GPU runs the chunk again alone, which
@@ -2686,7 +2710,7 @@ Runtime::prefillAsync(const BatchPlan &plan,
         entries[lane]->rngCounter = draws[lane];
       reads->end();
       CommandGraph again;
-      static_cast<void>(impl->encodePrefillGraph(again, items, entries, *reads));
+      static_cast<void>(impl->encodePrefillGraph(again, items, entries, *reads, {0, impl->geometry.target.layers}));
       const CommandTiming rerun = impl->backend.submitCommandAsync(again.command()).wait();
       timing.gpuSeconds += rerun.gpuSeconds;
       timing.wallSeconds += rerun.wallSeconds;
@@ -2694,6 +2718,14 @@ Runtime::prefillAsync(const BatchPlan &plan,
       ++impl->counters.aneFfnReruns;
     }
     reads->end();
+    // A pass before the last commits nothing: the rows go on in the next.
+    if (!ends) {
+      impl->counters.totalPrefillWallSeconds += timing.wallSeconds;
+      impl->counters.totalPrefillGpuSeconds += timing.gpuSeconds;
+      std::vector<ModelStepResult> results(items.size());
+      for (uint32_t lane = 0; lane < items.size(); ++lane) results[lane].requestId = entries[lane]->id;
+      return results;
+    }
     std::array<std::vector<uint64_t>, kLaneCount> unreadable = Impl::unreadableBlocks(*reads);
     // A row that is not finite, of the chunk or of the state it computed
     // from, reaches the lane's last row through the recurrent state, and
@@ -2999,6 +3031,13 @@ Runtime::snapshotToDisk(uint64_t requestId, std::function<void()> completion) {
 uint32_t Runtime::prefillGroupRows(bool spills) const noexcept {
   const bool groups = impl_->model.expertStore() || (spills && impl_->geometry.spilledKv);
   return (groups ? impl_->geometry.prefillChunks : 1) * kPrefillRows;
+}
+
+// A command over streamed experts reads each layer's that its rows route,
+// almost all of them however few its rows: such a command may run a pass
+// per layer. The Neural Engine's split runs a command whole.
+uint32_t Runtime::prefillPasses() const noexcept {
+  return impl_->model.expertStore() && !impl_->aneFfn ? impl_->geometry.target.layers : 1;
 }
 
 uint32_t Runtime::statesToActivate() const noexcept {

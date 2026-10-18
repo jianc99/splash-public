@@ -106,6 +106,9 @@ public:
   // when the table streams, stages the chunk's PLE rows. Returns each
   // sequence's blocks.
   [[nodiscard]] std::vector<Qwen4Blocks> preparePrefill(uint32_t index, const QwenTargetPrefillChunk &chunk);
+  // Each sequence's blocks preparePrefill wrote, which the chunk's later
+  // passes over the layers read on (QwenPrefillLayers).
+  [[nodiscard]] std::vector<Qwen4Blocks> prefillBlocks(uint32_t index, const QwenTargetPrefillChunk &chunk) const;
   // When the table streams, starts reading the PLE rows of the prompt rows
   // that follow each lane's rows of a prefill command, at most a command's
   // chunks' worth and its lanes' in order: the readers bring them into the
