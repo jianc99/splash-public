@@ -19,14 +19,16 @@ constexpr uint32_t kMaximumOvertakes =
 // kMinimumPrefillRows. A command with a fixed cost (a streamed target's
 // expert reads, which any chunk pays in full) gets twice that cost instead,
 // so its rows take at least as long as its fixed part and its peers wait
-// that long, seconds rather than this slice.
+// that long, seconds rather than this slice. A lane that streams its
+// history sizes its commands by its own reads instead (streamingRows).
 constexpr double kContendedPrefillMilliseconds = 500.0;
 // The fewest rows a contended prefill command is cut to, and the fewest whose
 // time measures prefill throughput: below it a command's fixed costs dominate.
 constexpr uint32_t kMinimumPrefillRows = 64;
-// The weight of a command's measured per-token time in the running estimate:
-// one unusually slow or fast command moves it a quarter of the way, and a
-// lasting change carries it within a few commands.
+// The weight of a command's measured time in a running estimate (per row,
+// fixed, or a lane's wait on its history's reads): one unusually slow or
+// fast command moves it a quarter of the way, and a lasting change carries
+// it within a few commands.
 constexpr double kPrefillTimeWeight = 0.25;
 
 // A command excludes at most the lanes of a full batch: a linear search.
@@ -74,6 +76,8 @@ void Scheduler::resourcesReady(uint64_t id, uint32_t processed) {
   request.decodeStage = DecodeStage::Regular;
   request.phase =
       processed == request.spec.prefillTokens ? Phase::Decode : Phase::Prefill;
+  if (request.phase == Phase::Decode)
+    startDecodeGap(request);
 }
 
 void Scheduler::suspendForResources(uint64_t id) {
@@ -138,6 +142,11 @@ void Scheduler::maskReady(uint64_t id) {
     throw std::logic_error("request is not waiting for a mask");
   }
   request.phase = Phase::Decode;
+  startDecodeGap(request);
+}
+
+void Scheduler::setStreamsHistory(uint64_t id, bool streams) {
+  get(id).streamsHistory = streams;
 }
 
 void Scheduler::cancel(uint64_t id) {
@@ -313,16 +322,22 @@ Scheduler::planPrefill(std::vector<PrefillRequestView> ready) const {
                 return remainingA < remainingB;
               return a.request->order < b.request->order;
             });
-  const RequestPriority selectedPriority = ready.front().request->spec.priority;
+  const PrefillRequestView &leader = ready.front();
+  const RequestPriority selectedPriority = leader.request->spec.priority;
 
   BatchPlan plan;
   plan.kind = WorkKind::Prefill;
-  uint32_t budget = prefillBudget(ready.front(), ready);
+  uint32_t budget = prefillBudget(leader, ready);
   uint64_t pairs = 0;
   for (const PrefillRequestView &view : ready) {
     if (!budget || view.request->spec.priority != selectedPriority ||
         plan.width() == model::ExecutionLimits::maximumBatchWidth)
       break;
+    // A lane that streams its history runs alone: nothing joins a command
+    // it leads, and it joins none it does not lead; overtaken often enough,
+    // it leads one.
+    if (view.request->streamsHistory && &view != &leader)
+      continue;
     uint32_t rows =
         std::min(view.request->spec.prefillTokens - view.promptProcessed, budget);
     // The command's attention stays within maximumAttentionPairs_: a lane's
@@ -339,6 +354,8 @@ Scheduler::planPrefill(std::vector<PrefillRequestView> ready) const {
     plan.items.push_back(
         {view.request->spec.id, rows, view.promptProcessed});
     budget -= rows;
+    if (leader.request->streamsHistory)
+      break;
   }
   return plan;
 }
@@ -357,6 +374,7 @@ uint32_t Scheduler::prefillBudget(
   const uint32_t leaderRemaining =
       leader.request->spec.prefillTokens - leader.promptProcessed;
   const bool leaderFinishing = leaderRemaining <= rows;
+  const bool streams = leader.request->streamsHistory;
   const bool contended = std::any_of(
       requests_.begin(), requests_.end(), [&](const auto &entry) {
         const Request &peer = entry.second;
@@ -366,21 +384,32 @@ uint32_t Scheduler::prefillBudget(
                            const PrefillRequestView &peer) {
         return peer.request->spec.id != leader.request->spec.id &&
                peer.request->spec.priority <= leader.request->spec.priority &&
-               (leaderFinishing || peer.request->spec.prefillTokens -
-                                       peer.promptProcessed <= rows);
+               (streams || leaderFinishing ||
+                peer.request->spec.prefillTokens - peer.promptProcessed <= rows);
       });
   // Bound commands for peers that decode or wait for a CPU mask, including
   // decoders left out of this command (their streams resume once their
-  // memory lands), and for peers that can finish prefill within this slice.
-  // The first sample and minimum matrix shape remain limits.
+  // memory lands), and for peers that can finish prefill within this slice,
+  // or, beside a lane that streams its history and so runs alone, any ready
+  // peer. The first sample and minimum matrix shape remain limits.
   if (contended)
-    return rows;
+    return streams ? streamingRows(*leader.request, rows) : rows;
   // A leader that finishes within the full budget ends the command at its
   // last row: prefill cost is linear above the slice, so shortest-first
   // sequential commands minimise first-token latency. Long prefills share a
   // command only when no lane finishes; one that runs prefill groups takes
   // a group alone.
   return uncontendedRows(leaderRemaining, leader.request->spec.prefillGroupRows);
+}
+
+uint32_t Scheduler::streamingRows(const Request &leader, uint32_t contendedRows) const {
+  if (!leader.streamMilliseconds)
+    return contendedRows;
+  uint32_t rows = std::max(leader.spec.prefillGroupRows, contendedRows);
+  while (rows / 2 >= contendedRows &&
+         rows / 2 * prefillMillisecondsPerToken_ >= *leader.streamMilliseconds)
+    rows /= 2;
+  return rows;
 }
 
 std::optional<BatchPlan> Scheduler::nextDecode(std::span<const uint64_t> excluded) const {
@@ -470,11 +499,30 @@ void Scheduler::complete(const BatchPlan &plan,
                          std::span<const StepResult> results,
                          double wallMilliseconds,
                          bool representativePrefillTiming,
-                         double hostMilliseconds) {
+                         double hostMilliseconds,
+                         std::optional<double> streamMilliseconds) {
   if (!active_ || active_->kind != plan.kind ||
       active_->items.size() != plan.items.size() ||
       results.size() != plan.items.size()) {
     throw std::logic_error("completion does not match active batch");
+  }
+  if (streamMilliseconds && (plan.kind != WorkKind::Prefill || plan.items.size() != 1))
+    throw std::logic_error("only a prefill command of one lane streams its history");
+  const bool timed = std::isfinite(wallMilliseconds) && wallMilliseconds > 0.0;
+  // The lane of a prefill command that streamed its history, alone in it. A
+  // lane that streams may run commands that read nothing yet, before its
+  // first pages spill: those say nothing of its reads.
+  Request *const streaming =
+      streamMilliseconds ? &get(plan.items.front().requestId) : nullptr;
+  // Its wait on the reads, which its waits on host steps include; none
+  // without a measurement.
+  const std::optional<double> stream =
+      streaming && std::isfinite(*streamMilliseconds) && std::isfinite(hostMilliseconds)
+          ? std::optional(std::clamp(*streamMilliseconds, 0.0, std::max(hostMilliseconds, 0.0)))
+          : std::nullopt;
+  if (timed) {
+    commandMilliseconds_ += wallMilliseconds;
+    streamingCommands_ += streaming != nullptr;
   }
   for (size_t index = 0; index < results.size(); ++index) {
     const BatchItem &item = plan.items[index];
@@ -500,29 +548,45 @@ void Scheduler::complete(const BatchPlan &plan,
         request.phase = Phase::WaitingMask;
       } else {
         request.phase = Phase::Decode;
+        startDecodeGap(request);
       }
     } else {
+      // The gap since its last decode command, recorded when a streaming
+      // prefill command ran within it.
+      if (request.decodeGapStreams != streamingCommands_)
+        decodeGaps_.add(
+            static_cast<uint64_t>((commandMilliseconds_ - request.decodeGapStart) * 1e6));
+      startDecodeGap(request);
       request.decodeStage = result.nextDecodeStage;
       request.phase = result.finished ? Phase::Completed : Phase::Decode;
     }
   }
+  // A streaming command trains the command estimate as if it had not waited
+  // on its history's reads, and its lane's own estimate with that wait.
   if (representativePrefillTiming && plan.kind == WorkKind::Prefill) {
     uint32_t rows = 0;
     for (const BatchItem &item : plan.items)
       rows += item.tokenCount;
-    observePrefill(rows, wallMilliseconds, hostMilliseconds);
+    const double waited = stream.value_or(0.0);
+    observePrefill(rows, wallMilliseconds - waited, hostMilliseconds - waited);
   }
+  if (stream)
+    streaming->streamMilliseconds =
+        streaming->streamMilliseconds
+            ? (1.0 - kPrefillTimeWeight) * *streaming->streamMilliseconds +
+                  kPrefillTimeWeight * *stream
+            : *stream;
   // While requests of the same or a higher priority decode, lanes this
   // prefill finished included, it owes decode a share of its time; decode
   // commands work the debt off with their own. A lane waiting for its mask
   // is owed nothing: it could not have decoded meanwhile, and the slice
   // already bounds the prefill it waits behind. Nor is a decoder this
   // command was planned without: it could not run either.
-  if (std::isfinite(wallMilliseconds) && wallMilliseconds > 0.0) {
+  if (timed) {
     if (plan.kind == WorkKind::Decode) {
       decodeDebtMilliseconds_ =
           std::max(0.0, decodeDebtMilliseconds_ - wallMilliseconds);
-    } else if (decodeShare_ > 0.0) {
+    } else if (streaming || decodeShare_ > 0.0) {
       const RequestPriority priority =
           get(plan.items.front().requestId).spec.priority;
       const bool contended = std::any_of(
@@ -531,13 +595,19 @@ void Scheduler::complete(const BatchPlan &plan,
             return peer.phase == Phase::Decode && peer.spec.priority <= priority &&
                    !listed(excluded_, id);
           });
-      if (contended)
+      counters_.contendedStreamingPrefillBatches += contended && streaming;
+      if (contended && decodeShare_ > 0.0)
         decodeDebtMilliseconds_ += decodeShare_ * wallMilliseconds;
     }
   }
   dropStaleDecodeDebt();
   excluded_.clear();
   active_.reset();
+}
+
+void Scheduler::startDecodeGap(Request &request) noexcept {
+  request.decodeGapStart = commandMilliseconds_;
+  request.decodeGapStreams = streamingCommands_;
 }
 
 void Scheduler::dropStaleDecodeDebt() noexcept {
@@ -583,6 +653,7 @@ uint32_t Scheduler::promptProcessed(uint64_t id) const {
 
 SchedulerSnapshot Scheduler::snapshot() const noexcept {
   SchedulerSnapshot result = counters_;
+  result.decodeGap = decodeGaps_.snapshot();
   for (const auto &[_, request] : requests_) {
     switch (request.phase) {
     case Phase::Queued:

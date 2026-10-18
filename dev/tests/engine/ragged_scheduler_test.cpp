@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 
 using namespace splash;
@@ -257,6 +258,169 @@ void testPrefillGroupsRunUncontended() {
   require(first(2048, 8192, false) == 2048, "a prompt of one chunk did not run as a chunk");
   require(first(10'000, 2048, false) == 2048, "a lane without prefill groups took more than a chunk");
   require(first(10'000, 8192, true) == 2048, "a prefill group ran beside a decoding peer");
+}
+
+// Completes a prefill command of one lane that streamed its history, which
+// waited streamMilliseconds of its hostMilliseconds on the reads.
+void completeStreamedPrefill(engine::Scheduler &scheduler, const BatchPlan &plan,
+                             double wallMilliseconds, double hostMilliseconds,
+                             double streamMilliseconds) {
+  require(plan.kind == WorkKind::Prefill && plan.width() == 1, "expected a streaming lane alone");
+  scheduler.commit(plan, {});
+  const std::array result{
+      StepResult{plan.items[0].requestId, plan.items[0].tokenCount, false, DecodeStage::Regular}};
+  scheduler.complete(plan, result, wallMilliseconds, true, hostMilliseconds, streamMilliseconds);
+}
+
+// A lane that streams its history runs alone: leading, it takes no peers
+// into its command; behind a leader, it is passed over while the others
+// share the command, until later arrivals have overtaken it often enough
+// that it leads one.
+void testStreamingLaneRunsAlone() {
+  Scheduler scheduler(0.0);
+  scheduler.submit(request(1, 100));
+  scheduler.submit(request(2, 300));
+  scheduler.submit(request(3, 500));
+  for (uint64_t id = 1; id <= 3; ++id)
+    scheduler.resourcesReady(id, 0);
+  scheduler.setStreamsHistory(1, true);
+  BatchPlan plan = *scheduler.next({});
+  require(plan.width() == 1 && plan.items[0].requestId == 1 && plan.items[0].tokenCount == 100,
+          "a streaming leader shared its command");
+  scheduler.setStreamsHistory(1, false);
+  scheduler.setStreamsHistory(2, true);
+  plan = *scheduler.next({});
+  require(plan.width() == 2 && plan.items[0].requestId == 1 && plan.items[1].requestId == 3,
+          "a streaming lane joined a command it did not lead");
+
+  Scheduler overtaken(0.0);
+  overtaken.submit(request(1, 4000));
+  overtaken.resourcesReady(1, 0);
+  overtaken.setStreamsHistory(1, true);
+  uint64_t id = 2;
+  for (; id <= model::ExecutionLimits::maximumBatchWidth; ++id) {
+    overtaken.submit(request(id, 100));
+    overtaken.resourcesReady(id, 0);
+    plan = *overtaken.next({});
+    require(plan.width() == 1 && plan.items[0].requestId == id,
+            "a passed-over streaming lane led or joined a command");
+    completePrefill(overtaken, plan);
+    overtaken.cancel(id);
+  }
+  overtaken.submit(request(id, 100));
+  overtaken.resourcesReady(id, 0);
+  plan = *overtaken.next({});
+  require(plan.width() == 1 && plan.items[0].requestId == 1,
+          "an overtaken streaming lane did not lead a command of its own");
+}
+
+// Contended, a lane that streams its history takes the fewest rows, halving
+// from its prefill group's, whose time still covers its estimated wait on
+// the reads: fewer would not end the command sooner. It never takes fewer
+// than another contended command, which it takes before it has streamed.
+// Uncontended, it takes its group.
+void testContendedStreamingLaneHalvesFromItsGroup() {
+  // At 0.5 ms a row, a contended command takes 512 rows.
+  const auto first = [](std::optional<double> streamMilliseconds, bool contended) {
+    Scheduler scheduler(0.0);
+    scheduler.observePrefill(2048, 1024.0);
+    RequestSpec spec = request(1, 100'000);
+    spec.prefillGroupRows = 4 * model::ExecutionLimits::prefillTokenBudget;
+    scheduler.submit(spec);
+    scheduler.resourcesReady(1, 0);
+    scheduler.setStreamsHistory(1, true);
+    if (streamMilliseconds) {
+      const BatchPlan streamed = *scheduler.next({});
+      completeStreamedPrefill(scheduler, streamed,
+                              streamed.items[0].tokenCount * 0.5 + *streamMilliseconds,
+                              *streamMilliseconds, *streamMilliseconds);
+    }
+    if (contended) {
+      scheduler.submit(request(2, 1));
+      scheduler.resourcesReady(2, 1);
+      completeDecode(scheduler);
+    }
+    const BatchPlan plan = *scheduler.next({});
+    require(plan.kind == WorkKind::Prefill && plan.width() == 1 && plan.items[0].requestId == 1,
+            "expected the streaming lane alone");
+    return plan.items[0].tokenCount;
+  };
+  require(first(std::nullopt, true) == 512,
+          "a streaming lane's first contended command took more than another's");
+  require(first(2800.0, true) == 8192, "a contended stream that dominates its group was cut");
+  require(first(1000.0, true) == 2048,
+          "a contended streaming lane did not take the fewest rows covering its stream");
+  require(first(0.0, true) == 512, "a stream nothing waited on cut a command below another's");
+  require(first(2800.0, false) == 8192, "an uncontended streaming lane did not take its group");
+}
+
+// A lane that streams its history may run commands that read none of it,
+// before its first pages spill: they leave its estimate of the wait alone,
+// which its first command that read the history sets.
+void testStreamEstimateIgnoresCommandsThatReadNothing() {
+  Scheduler scheduler(0.0);
+  scheduler.observePrefill(2048, 1024.0);
+  RequestSpec spec = request(1, 100'000);
+  spec.prefillGroupRows = 4 * model::ExecutionLimits::prefillTokenBudget;
+  scheduler.submit(spec);
+  scheduler.resourcesReady(1, 0);
+  scheduler.setStreamsHistory(1, true);
+  const BatchPlan unread = *scheduler.next({});
+  completePrefill(scheduler, unread, unread.items[0].tokenCount * 0.5);
+  const BatchPlan streamed = *scheduler.next({});
+  completeStreamedPrefill(scheduler, streamed, streamed.items[0].tokenCount * 0.5 + 2800.0,
+                          2800.0, 2800.0);
+  scheduler.submit(request(2, 1));
+  scheduler.resourcesReady(2, 1);
+  completeDecode(scheduler);
+  const BatchPlan plan = *scheduler.next({});
+  require(plan.kind == WorkKind::Prefill && plan.items[0].requestId == 1 &&
+              plan.items[0].tokenCount == 8192,
+          "a command that read no history lowered its lane's estimate of the reads");
+}
+
+// A streaming command's wait on its history is its lane's own cost: the
+// command estimate other commands' slices come from leaves it out, and the
+// rows it ran train the per-row estimate as any command's do.
+void testStreamWaitStaysOutOfTheCommandEstimate() {
+  Scheduler scheduler(0.0);
+  scheduler.observePrefill(2048, 1024.0);
+  scheduler.submit(request(1, 4096));
+  scheduler.resourcesReady(1, 0);
+  scheduler.setStreamsHistory(1, true);
+  // 3 s of reads beside 2048 rows at 0.5 ms each.
+  completeStreamedPrefill(scheduler, *scheduler.next({}), 4024.0, 3000.0, 3000.0);
+  scheduler.setStreamsHistory(1, false);
+  scheduler.submit(request(2, 1));
+  scheduler.resourcesReady(2, 1);
+  completeDecode(scheduler);
+  const BatchPlan plan = *scheduler.next({});
+  require(plan.kind == WorkKind::Prefill && plan.items[0].tokenCount == 512,
+          "a streamed command's wait on its reads widened other commands' slices");
+}
+
+// Each gap a decoding lane sees between its commands across a streaming
+// prefill command is recorded, and the command counts as contended; gaps
+// across other commands are not recorded.
+void testDecodeGapAcrossStreamingPrefill() {
+  Scheduler scheduler(0.0);
+  scheduler.submit(request(1, 1));
+  scheduler.resourcesReady(1, 1);
+  scheduler.submit(request(2, 4096));
+  scheduler.resourcesReady(2, 0);
+  completeDecode(scheduler, false, 40.0);
+  completePrefill(scheduler, *scheduler.next({}), 1000.0);
+  completeDecode(scheduler, false, 40.0);
+  require(scheduler.snapshot().decodeGap.count == 0 &&
+              scheduler.snapshot().contendedStreamingPrefillBatches == 0,
+          "a gap across an ordinary prefill was recorded");
+  scheduler.setStreamsHistory(2, true);
+  completeStreamedPrefill(scheduler, *scheduler.next({}), 3000.0, 2500.0, 2500.0);
+  completeDecode(scheduler, false, 40.0);
+  const SchedulerSnapshot counts = scheduler.snapshot();
+  require(counts.decodeGap.count == 1 && counts.decodeGap.maximumMilliseconds == 3040.0 &&
+              counts.contendedStreamingPrefillBatches == 1,
+          "the gap across a streaming prefill was not recorded");
 }
 
 void testShortestRemainingFirstUsesActualRows() {
@@ -819,8 +983,7 @@ void testMeasuredBudgetFinishesShortPrefillPromptly() {
 // command of its own rows instead of a full one shared with a long prompt;
 // one that does not finish in it still takes a full command.
 void testShortArrivalBesideLongPrefillEndsAtItsLastRow() {
-  const auto beside = [](std::initializer_list<uint32_t> arrivals) {
-    Scheduler scheduler(0.0);
+  const auto beside = [](Scheduler &scheduler, std::initializer_list<uint32_t> arrivals) {
     scheduler.observePrefill(2048, 5632.0);
     scheduler.submit(request(1, 20'000));
     scheduler.resourcesReady(1, 0);
@@ -830,10 +993,10 @@ void testShortArrivalBesideLongPrefillEndsAtItsLastRow() {
       scheduler.submit(request(id, prompt));
       scheduler.resourcesReady(id++, 0);
     }
-    return scheduler;
+    return *scheduler.next({});
   };
-  Scheduler chat = beside({300});
-  const BatchPlan plan = *chat.next({});
+  Scheduler chat(0.0);
+  const BatchPlan plan = beside(chat, {300});
   require(plan.width() == 1 && plan.items[0].requestId == 2 && plan.items[0].tokenCount == 300,
           "a short arrival shared a full command with a long prefill");
   completePrefill(chat, plan, 825.0);
@@ -843,12 +1006,14 @@ void testShortArrivalBesideLongPrefillEndsAtItsLastRow() {
               slice.items[0].tokenCount == 128,
           "the long prefill did not return to slices beside the decoding arrival");
 
-  const BatchPlan full = *beside({3000}).next({});
+  Scheduler longer(0.0);
+  const BatchPlan full = beside(longer, {3000});
   require(full.width() == 1 && full.items[0].requestId == 2 &&
               full.items[0].tokenCount == 2048,
           "an arrival that does not finish in one command lost the full budget");
 
-  const BatchPlan first = *beside({300, 300}).next({});
+  Scheduler two(0.0);
+  const BatchPlan first = beside(two, {300, 300});
   require(first.width() == 1 && first.items[0].requestId == 2 &&
               first.items[0].tokenCount == 300,
           "two short arrivals shared a command instead of finishing in turn");
@@ -1145,6 +1310,11 @@ int main() {
     testFixedPrefillCostSizesContendedSlice();
     testPrefillGroupsRunUncontended();
     testDeepPrefillKeepsANativeChunksAttention();
+    testStreamingLaneRunsAlone();
+    testContendedStreamingLaneHalvesFromItsGroup();
+    testStreamEstimateIgnoresCommandsThatReadNothing();
+    testStreamWaitStaysOutOfTheCommandEstimate();
+    testDecodeGapAcrossStreamingPrefill();
     testShortestRemainingFirstUsesActualRows();
     testShortenedPrefillResumesFromItsRows();
     testEqualPromptsFinishInArrivalOrder();

@@ -2609,7 +2609,12 @@ part, the time its GPU work waited on host steps (a streamed target's expert
 reads), and a part per row; the slice grows to twice the fixed part, so a
 command's rows take at least as long as its reads. Unopposed, a target whose
 experts stream runs its remaining chunks in as few prefill groups of up to four
-as hold them, evenly split. Without contention, a prompt that can
+as hold them, evenly split. A lane whose history holds KV only the SSD cache has
+reads all of that history in each command, whatever its rows: it runs alone,
+and contended it takes the fewest rows, halving from its group's, whose time
+still covers its own running estimate of that wait, and never fewer than another
+contended command; the wait stays out of the command estimate. Without
+contention, a prompt that can
 finish within one 2048-token chunk ends its chunk at its last row instead of
 sharing it with a longer prompt. While requests of the same or a higher priority
 decode (a lane waiting for its token mask is owed nothing), each slice owes them

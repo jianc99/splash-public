@@ -1,6 +1,7 @@
 #pragma once
 
 #include "engine/Types.hpp"
+#include "model/LatencyHistogram.hpp"
 #include "model/Model.hpp"
 
 #include <array>
@@ -56,13 +57,20 @@ struct SchedulerSnapshot final {
   uint64_t decodeBatches = 0;
   std::array<uint64_t, model::ExecutionLimits::maximumBatchWidth>
       decodeBatchesByWidth{};
+  // Prefill commands of a lane that streams its history from the SSD cache
+  // that ran while lanes of its priority or a higher one decoded, and the
+  // gaps decoding lanes saw between their commands across such a command:
+  // the command time from one of a lane's decode commands to its next.
+  uint64_t contendedStreamingPrefillBatches = 0;
+  model::LatencyStats decodeGap;
 };
 
 // One single-owner scheduling policy. Prefill batches the shortest remaining
 // sequences first into an actual-row budget, with a bound on how often later
-// arrivals may overtake a lane; decode takes the ready lanes of one priority,
-// constraint mode and stage without waiting for more, so it runs only the
-// four real M8/M16/M24/M32 shapes.
+// arrivals may overtake a lane; a lane that streams its history from the SSD
+// cache runs alone. Decode takes the ready lanes of one priority, constraint
+// mode and stage without waiting for more, so it runs only the four real
+// M8/M16/M24/M32 shapes.
 class Scheduler final {
 public:
   // Decode time owed for each unit of time a prefill runs while requests of
@@ -93,6 +101,10 @@ public:
   void resumeFromResources(uint64_t requestId, uint32_t alreadyProcessed,
                            uint32_t replayTokens);
   void maskReady(uint64_t requestId);
+  // Whether the resident lane's prefill commands read its history from the
+  // SSD cache (KvHistoryStream), which a command does for one lane alone and
+  // whatever its rows; the engine says so before it plans.
+  void setStreamsHistory(uint64_t requestId, bool streams);
   void cancel(uint64_t requestId);
   void fail(uint64_t requestId);
   void remove(uint64_t requestId);
@@ -113,9 +125,13 @@ public:
   // The excluded lanes are those the plan was made without: blocked, not
   // passed over, so they lose nothing to it.
   void commit(const BatchPlan &plan, std::span<const uint64_t> excluded);
+  // A prefill command of one lane that streamed its history from the SSD
+  // cache waited streamMilliseconds of its hostMilliseconds on the reads
+  // (ModelBatchTicket); none for a command that streamed nothing.
   void complete(const BatchPlan &plan, std::span<const StepResult> results,
                 double wallMilliseconds, bool representativePrefillTiming,
-                double hostMilliseconds = 0.0);
+                double hostMilliseconds = 0.0,
+                std::optional<double> streamMilliseconds = std::nullopt);
 
   [[nodiscard]] Phase phase(uint64_t requestId) const;
   // Suspended by suspendForResources and not resumed since; a terminal
@@ -141,6 +157,17 @@ private:
     // Consecutive prefill commands that served a later arrival while this
     // lane received no rows. Reset whenever the lane is served.
     uint32_t overtaken = 0;
+    // Its prefill commands stream its history (setStreamsHistory), and the
+    // running estimate of how long one waits on the reads; none before the
+    // first that read any. The command estimate leaves that wait out: it is
+    // this lane's own cost, which grows with its history.
+    bool streamsHistory = false;
+    std::optional<double> streamMilliseconds;
+    // While it decodes, where its gap since its last decode command began
+    // (startDecodeGap): the command time and streaming prefill commands
+    // completed then.
+    double decodeGapStart = 0.0;
+    uint64_t decodeGapStreams = 0;
   };
 
   struct PrefillRequestView final {
@@ -162,6 +189,16 @@ private:
   [[nodiscard]] uint32_t
   prefillBudget(const PrefillRequestView &leader,
                 std::span<const PrefillRequestView> ready) const;
+  // The rows of a contended command of a lane that streams its history,
+  // which reads all of it whatever its rows: the fewest, halving from its
+  // prefill group's, whose time covers its estimated wait on the reads, so
+  // that fewer would not end the command sooner, and no fewer than
+  // `contendedRows`, those of another contended command, which it takes
+  // before its first streamed command.
+  [[nodiscard]] uint32_t streamingRows(const Request &leader, uint32_t contendedRows) const;
+  // A lane's gap between decode commands starts when it begins to decode
+  // and after each of its decode commands.
+  void startDecodeGap(Request &request) noexcept;
   // Debt is owed only to requests that decode or wait for a mask: once the
   // last one leaves, a later decoder starts without it.
   void dropStaleDecodeDebt() noexcept;
@@ -183,6 +220,12 @@ private:
   double decodeDebtMilliseconds_ = 0.0;
   std::optional<WorkKind> lastCommittedKind_;
   SchedulerSnapshot counters_;
+  // The time of the commands completed so far, and the streaming prefill
+  // commands among them, which lanes' decode gaps are measured on; the gaps
+  // across a streaming command.
+  double commandMilliseconds_ = 0.0;
+  uint64_t streamingCommands_ = 0;
+  model::LatencyHistogram decodeGaps_;
 };
 
 } // namespace splash::engine
