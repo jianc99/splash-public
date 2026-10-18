@@ -168,11 +168,14 @@ public:
   virtual void tokens(uint64_t requestId, std::span<const uint32_t> tokens) = 0;
   virtual void maskRequested(uint64_t requestId,
                              std::span<const uint32_t> simulationTokens) = 0;
+  // bounded: a Length end short of the request's maxNewTokens, at a bound
+  // of the engine's own (the SSD cache's quota, or the memory a lone lane
+  // could not grow past), which ends the response as its context would.
   // deduplicatedTokens: tokens whose KV the request read from cached blocks
   // another request computed, past the cached prefix it started from: blocks
   // it computed and then found cached, and blocks a resume after a
   // suspension restored past those it had published.
-  virtual void completed(uint64_t requestId, EngineFinishReason reason,
+  virtual void completed(uint64_t requestId, EngineFinishReason reason, bool bounded,
                          uint32_t promptTokens, uint32_t completionTokens,
                          uint32_t deduplicatedTokens,
                          std::span<const float> optionLogits,

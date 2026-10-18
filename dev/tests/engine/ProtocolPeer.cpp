@@ -203,6 +203,7 @@ EngineEvent decodeEvent(FrameType type, Reader &in) {
     DoneEvent event;
     event.requestId = in.u64();
     event.reason = static_cast<engine::EngineFinishReason>(in.u8());
+    event.bounded = in.u8() != 0;
     event.promptTokens = in.u32();
     event.completionTokens = in.u32();
     event.prefillMicros = in.u64();

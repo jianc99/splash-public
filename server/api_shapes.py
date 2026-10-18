@@ -1206,8 +1206,9 @@ def anthropic_stop(result, called, output_clamped_to_context):
         return "tool_use"
     if result.reason == "length":
         # Anthropic's reason when the context window, not max_tokens, ends
-        # the response.
-        if output_clamped_to_context:
+        # the response: max_tokens was lowered to what the context leaves, or
+        # the engine ended it at what it holds of the context.
+        if output_clamped_to_context or result.bounded:
             return "model_context_window_exceeded"
         return "max_tokens"
     if result.stop_sequence is not None:

@@ -15,7 +15,7 @@ from dataclasses import dataclass, fields
 from enum import IntEnum, IntFlag
 from typing import TypeAlias
 
-PROTOCOL_VERSION = 10
+PROTOCOL_VERSION = 11
 # A frame is its header, the magic, the protocol version, the frame type and
 # the payload length, then the payload.
 FRAME_HEADER_BYTES = 16
@@ -57,7 +57,7 @@ _START = struct.Struct("<QII")
 _PROMPT_PROGRESS = struct.Struct("<QIQ")
 _TOKENS = struct.Struct("<QII")
 _MASK_REQUEST = struct.Struct("<QQII")
-_DONE = struct.Struct("<QBIIQQQIIIII")
+_DONE = struct.Struct("<QBBIIQQQIIIII")
 _ERROR = struct.Struct("<BBQII")
 _STATUS_JSON = struct.Struct("<Q")
 
@@ -71,7 +71,7 @@ assert _REQUEST.size == 114
 assert _IMAGE_SPAN.size == 32
 assert _READY.size == 9
 assert _START.size == 16
-assert _DONE.size == 61
+assert _DONE.size == 62
 assert _ERROR.size == 18
 assert _STATUS_JSON.size == 8
 
@@ -387,6 +387,10 @@ class DoneEvent:
     drafted_tokens: int = 0
     accepted_draft_tokens: int = 0
     draft_cycles: int = 0
+    # A LENGTH end short of the request's logical maximum, at a bound of the
+    # engine's own: the SSD cache's quota, or memory a lone lane could not
+    # grow past. It ends the response as its context would.
+    bounded: bool = False
 
 
 @dataclass(slots=True, frozen=True)
@@ -1078,6 +1082,7 @@ def _decode_event(frame: Frame) -> EngineEvent:
         (
             request_id,
             reason,
+            bounded,
             *counts,
             deduplicated,
             drafted,
@@ -1100,8 +1105,22 @@ def _decode_event(frame: Frame) -> EngineEvent:
             _fatal(
                 IssueCode.INVALID_REQUEST_ID, "done event request id must be non-zero"
             )
+        if bounded > 1 or (bounded and reason is not FinishReason.LENGTH):
+            _fatal(
+                IssueCode.INVALID_ENUM_VALUE,
+                "only a length-finished done event is bounded",
+                request_id,
+            )
         event = DoneEvent(
-            request_id, reason, *counts, logits, deduplicated, drafted, accepted, cycles
+            request_id,
+            reason,
+            *counts,
+            logits,
+            deduplicated,
+            drafted,
+            accepted,
+            cycles,
+            bool(bounded),
         )
         # Each cycle verified at least one drafted token and accepted at most all.
         if accepted > drafted or cycles > drafted or (drafted and not cycles):

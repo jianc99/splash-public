@@ -96,7 +96,7 @@ public:
     throw std::logic_error("unconstrained benchmark requested a token mask");
   }
 
-  void completed(uint64_t requestId, EngineFinishReason, uint32_t,
+  void completed(uint64_t requestId, EngineFinishReason, bool, uint32_t,
                  uint32_t, uint32_t, std::span<const float> optionLogits,
                  const SpeculativeCounts &) override {
     Observation &value = observations_[requestId];
