@@ -8684,7 +8684,9 @@ struct Funding {
                                  .groupPages = 4,
                                  .laneStateBytes = kLaneState,
                                  .extentPages = 8,
-                                 .laneHotBytes = kLaneHot}};
+                                 .laneSlots = 8,
+                                 .hotExtentSlots = 8,
+                                 .hotExtentBytes = kLaneHot}};
     return result;
   }
   // A request whose prompt is `tokens` tokens of `token`, which may generate
