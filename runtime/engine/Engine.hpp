@@ -681,7 +681,10 @@ private:
   // follows the state before it in the command. A checkpoint whose
   // predecessor a reader pins takes only the pool or the admission too:
   // refused, its command ends at it, and apply publishes it from the lane
-  // only if the pin has gone by then. Null buffers when refused.
+  // only if the pin has gone by then. The prompt's replay point that only
+  // the host refuses once room is made takes its buffers as memory the
+  // request in service needs (EngineConfig::serving). Null buffers when
+  // refused.
   [[nodiscard]] Reservation reserveCapture(Request &request, StateClass kind, uint32_t tokens,
                                            bool followsCheckpoint);
   // Makes room for one state's buffers, a step of what its class may take

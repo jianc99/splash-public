@@ -287,11 +287,12 @@ public:
   snapshot(uint32_t lane);
   // The steps of a snapshot, for a state a prefill command captures
   // (Model::reserveState): reserve() takes a cache slot, or returns nullptr
-  // on capacity pressure with nothing allocated; copyState() copies the
-  // lane's committed state into it and copyWindow() the lane's context
-  // window alone; seal() moves the slot's buffers into the cached state of
-  // `lengths`, which leaves the reservation empty.
-  [[nodiscard]] std::shared_ptr<QwenStateReservation> reserve();
+  // on capacity pressure with nothing allocated and the admission's cause
+  // in `refusal`; copyState() copies the lane's committed state into it and
+  // copyWindow() the lane's context window alone; seal() moves the slot's
+  // buffers into the cached state of `lengths`, which leaves the
+  // reservation empty.
+  [[nodiscard]] std::shared_ptr<QwenStateReservation> reserve(metal::AllocationFailure &refusal);
   void copyState(uint32_t lane, QwenStateReservation &reservation) const;
   void copyWindow(uint32_t lane, QwenStateReservation &reservation) const;
   [[nodiscard]] std::shared_ptr<const QwenCompositeState>

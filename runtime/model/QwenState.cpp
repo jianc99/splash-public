@@ -424,16 +424,19 @@ QwenStateStorage::snapshot(uint32_t index, QwenLogicalLengths lengths) {
   // Before anything is allocated; copyState() and seal() check again.
   requireCommitted(lane(index));
   validateLengths(lengths, true);
-  const std::shared_ptr<QwenStateReservation> reservation = reserve();
+  metal::AllocationFailure refusal;
+  const std::shared_ptr<QwenStateReservation> reservation = reserve(refusal);
   if (!reservation)
     return nullptr;
   copyState(index, *reservation);
   return seal(*reservation, lengths);
 }
 
-std::shared_ptr<QwenStateReservation> QwenStateStorage::reserve() {
+std::shared_ptr<QwenStateReservation>
+QwenStateStorage::reserve(metal::AllocationFailure &refusal) {
   Buffers buffers;
-  if (!acquire(1, false, "qwen-state-cache", buffers))
+  refusal = acquire(1, false, "qwen-state-cache", buffers).failure;
+  if (refusal != metal::AllocationFailure::None)
     return nullptr;
   return std::shared_ptr<QwenStateReservation>(new QwenStateReservation(
       pool_, {std::move(buffers.gdn[0]), std::move(buffers.window)}));

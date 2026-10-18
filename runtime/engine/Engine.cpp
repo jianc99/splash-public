@@ -1761,8 +1761,9 @@ uint32_t Engine::reserveCaptures(Request &active, const BatchItem &item, Reclaim
       // before it beside buffers of its own, and takes that checkpoint's
       // when refused the pool and the admission, as it takes its lane's
       // after a command.
+      metal::AllocationFailure refusal;
       if (std::shared_ptr<StateReservation> buffers =
-              model_.reserveState(active.request.id, tokens)) {
+              model_.reserveState(active.request.id, tokens, refusal)) {
         states.push_back({tokens, std::move(buffers)});
         captures.push_back({tokens});
       } else {
@@ -1815,7 +1816,8 @@ uint32_t Engine::reserveCaptures(Request &active, const BatchItem &item, Reclaim
 Engine::Reservation Engine::reserveCapture(Request &active, StateClass kind, uint32_t tokens,
                                            bool followsCheckpoint) {
   const uint64_t id = active.request.id;
-  Reservation result{model_.reserveState(id, tokens)};
+  metal::AllocationFailure refusal = metal::AllocationFailure::None;
+  Reservation result{model_.reserveState(id, tokens, refusal)};
   if (result.buffers)
     return result;
   // The lane's checkpoint is its recovery point until a state that retires
@@ -1839,9 +1841,18 @@ Engine::Reservation Engine::reserveCapture(Request &active, StateClass kind, uin
   // replay point, which is in use itself. A pin keeps the lane's
   // checkpoint, if any, out of it.
   result.recycled = makeStateRoom(kind, [&] {
-    result.buffers = model_.reserveState(id, tokens);
+    result.buffers = model_.reserveState(id, tokens, refusal);
     return result.buffers != nullptr;
   });
+  // The prompt's replay point is work of the request in service, the point
+  // its follow-up resumes from: once nothing its class may take is left,
+  // the host refuses it no more than that request's KV (allocate()). A
+  // junction or a checkpoint stays optional.
+  if (!result.buffers && kind == StateClass::InUse &&
+      refusal == metal::AllocationFailure::HostPressure) {
+    const GovernorMark mark(config_.serving, true);
+    result.buffers = model_.reserveState(id, tokens, refusal);
+  }
   return result;
 }
 

@@ -492,11 +492,12 @@ public:
   uint64_t snapshotBytes() const noexcept override { return stateBytes; }
   // The production model takes a cached state's buffers from its pool, or
   // with one admission, for a resident lane's page-aligned boundary, and
-  // returns nullptr when the governor refuses them. The fake refuses the
-  // next `deniedReservations` calls, every call for the boundary at
-  // `denyReservationAt`, and every call while `reservationRoom` reports no
-  // memory.
-  std::shared_ptr<StateReservation> reserveState(uint64_t id, uint32_t tokens) override {
+  // returns nullptr with the cause when the governor refuses them. The fake
+  // refuses the next `deniedReservations` calls, every call for the
+  // boundary at `denyReservationAt`, and every call while `reservationRoom`
+  // reports no memory, for `reservationFailure`.
+  std::shared_ptr<StateReservation> reserveState(uint64_t id, uint32_t tokens,
+                                                 metal::AllocationFailure &refusal) override {
     if (!requests.at(id).resident || !tokens || tokens % engine::KvCache::pageTokens)
       throw std::logic_error("a state was reserved off a resident lane's page boundary");
     ++reservationAttempts;
@@ -504,12 +505,14 @@ public:
       reservationObserver();
     if (deniedReservations) {
       --deniedReservations;
+      refusal = reservationFailure;
       return nullptr;
     }
-    if (denyReservationAt == tokens)
+    if (denyReservationAt == tokens || (reservationRoom && !reservationRoom())) {
+      refusal = reservationFailure;
       return nullptr;
-    if (reservationRoom && !reservationRoom())
-      return nullptr;
+    }
+    refusal = metal::AllocationFailure::None;
     ++reservations;
     return std::make_shared<Reservation>(evictedStateBytes);
   }
@@ -517,7 +520,9 @@ public:
   // buffers it takes as reserveState() does; so does the fake, refusing as
   // reserveState() refuses.
   std::shared_ptr<const CompositeState> snapshot(uint64_t id) override {
-    const std::shared_ptr<StateReservation> buffers = reserveState(id, requests.at(id).position);
+    metal::AllocationFailure refusal;
+    const std::shared_ptr<StateReservation> buffers =
+        reserveState(id, requests.at(id).position, refusal);
     if (!buffers)
       return nullptr;
     ++snapshots;
@@ -709,6 +714,7 @@ public:
   std::function<void()> beginObserver;
   std::function<void()> reservationObserver;
   std::function<bool()> reservationRoom;
+  metal::AllocationFailure reservationFailure = metal::AllocationFailure::EngineBudget;
   std::function<bool()> beginGrowthBlocked;
   std::vector<std::vector<uint32_t>> resumedPrompts;
   std::vector<uint32_t> prefillWidths;

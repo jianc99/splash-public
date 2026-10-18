@@ -11507,6 +11507,67 @@ void testPacedPassKeepsInServiceReplayPoint() {
           "the third turn did not resume from the replay point the second published");
 }
 
+// The prompt's replay point is work of the request in service: once only
+// the host refuses its buffers and nothing its class may take is left, it
+// takes them as that request's KV would, beside the warning margin.
+// Otherwise a host whose headroom stays between the margin and the margin
+// plus one state, with no cached state to recycle, refuses every replay
+// point, and every follow-up replays its whole prompt.
+void testReplayPointAdmittedInMarginBand() {
+  test::metalStatistics() = {};
+  metal::MetalBackend backend("unused");
+  constexpr uint64_t stateBytes = 160ULL << 20;
+  constexpr uint64_t reserve = 2ULL << 30;
+  // The host's spare memory falls by the state buffers it gives.
+  uint64_t given = 0;
+  MemoryGovernor governor(backend, 40ULL << 30, reserve, reserve, [&] {
+    const uint64_t spare = reserve + kHostWarningMarginBytes + stateBytes / 2 - given;
+    return std::optional<HostMemory>{{spare, spare}};
+  }, 0);
+  test::TestKvStorage storage(64, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool, nullptr, nullptr);
+  Executor executor;
+  executor.stateBytes = stateBytes;
+  // A state's buffers come from the model's pool, which the states the
+  // cache lets go of refill, or else from one admission.
+  executor.reservationRoom = [&] {
+    if (*executor.evictedStateBytes) {
+      *executor.evictedStateBytes -= State().bytes();
+      return true;
+    }
+    const metal::AllocationResult admitted =
+        governor.allocationAdmission()(stateBytes, [&] { given += stateBytes; });
+    executor.reservationFailure = admitted.failure;
+    return static_cast<bool>(admitted);
+  };
+  Events events;
+  EngineConfig config;
+  config.growthPaused = [&] { return !governor.snapshot().hostGrowthAllowed; };
+  config.serving = [&](bool serving) { return governor.setServing(serving); };
+  engine::Engine engine(test::engineConfig(std::move(config)), resources, executor, events);
+  guardReleases(storage, engine);
+  double now = 1;
+  std::vector<uint32_t> prompt(65);
+  std::iota(prompt.begin(), prompt.end(), 1);
+  engine.submit(request(1, prompt));
+  tickUntil(engine, now, [&] { return idle(engine); }, "the first turn did not finish");
+  require(engine.snapshot().replayStatePublications == 1 &&
+              engine.snapshot().replayStatePublicationFailures == 0 && given == stateBytes &&
+              governor.snapshot().hostHeadroomBytes < kHostWarningMarginBytes,
+          "the host's margin refused the replay point of the request in service");
+
+  // The next turn resumes there, and its own point recycles the first's.
+  prompt.insert(prompt.end(), events.outputs[1].begin(), events.outputs[1].end());
+  prompt.resize(140, 7);
+  engine.submit(request(2, prompt));
+  tickUntil(engine, now, [&] { return idle(engine); }, "the second turn did not finish");
+  require(events.starts.back() == 64 && engine.snapshot().replayStatePublications == 2 &&
+              engine.snapshot().recycledStatePublications == 1 && given == stateBytes &&
+              events.completedCount == 2 && events.failedCount == 0,
+          "the second turn did not resume from the first turn's replay point");
+}
+
 // Every end of a decoding request releases its replay point: cancellation
 // and failure at once, before the request leaves the engine, the deadline
 // and capacity exhaustion when the engine ends it.
@@ -11678,6 +11739,7 @@ int main() {
     testHeldBackStartTakesNothingInUse();
     testLaneThatWouldYieldTakesNothingInUse();
     testPacedPassKeepsInServiceReplayPoint();
+    testReplayPointAdmittedInMarginBand();
     testEveryEndReleasesTheReplayPoint();
     testWaitingEndsReleaseTheReplayPoint();
     testConcurrentColdPrefixesComputeOnce();

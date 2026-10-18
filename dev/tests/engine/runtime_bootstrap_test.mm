@@ -141,7 +141,9 @@ public:
                                  completion);
   }
   uint64_t snapshotBytes() const noexcept override { return 64; }
-  std::shared_ptr<StateReservation> reserveState(uint64_t, uint32_t) override {
+  std::shared_ptr<StateReservation> reserveState(uint64_t, uint32_t,
+                                                 metal::AllocationFailure &refusal) override {
+    refusal = metal::AllocationFailure::EngineBudget;
     return {};
   }
   std::shared_ptr<const CompositeState> snapshot(uint64_t) override { return {}; }
