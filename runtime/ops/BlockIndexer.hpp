@@ -16,9 +16,10 @@ namespace splash::ops {
 
 // Where a layer's block index sits for a dispatch's lanes: lane l's pooled
 // keys through index table tables[l], an entry per logical page
-// (SplashKvPage), `offset` bytes into each entry's extent (metal/abi/
-// BlockIndexer.h). The index sits in the KV pages' extents
-// (kv::PageStorage::indexOffset), so a lane's index table is its page table.
+// (SplashKvPage), `offset` bytes into the index plane each entry names
+// (metal/abi/BlockIndexer.h). Every KV page keeps its index in its extent's
+// index plane, whatever its form, so an index table has entries of its own
+// (kv::PageStorage::writeIndexEntries and indexOffset).
 struct BlockIndex final {
   std::span<const metal::MetalBuffer> tables;
   uint32_t offset = 0;
