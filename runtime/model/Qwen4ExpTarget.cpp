@@ -74,16 +74,20 @@ std::vector<uint32_t> Qwen4ExpTarget::verifyTableRows(uint32_t lane) const { ret
 std::vector<metal::MetalBuffer> Qwen4ExpTarget::addPrefill(metal::CommandGraph &graph,
                                                            std::span<const QwenTargetPrefillChunk> chunks,
                                                            const kv::PageStorage &kv, SpilledKvReads &spilled,
-                                                           ops::AneFfn *aneFfn) {
-  std::vector<PrefillStep> steps = prefillSteps<PrefillStep>(graph, chunks, kv, spilled, aneFfn);
+                                                           QwenPrefillLayers layers, ops::AneFfn *aneFfn) {
+  std::vector<PrefillStep> steps = prefillSteps<PrefillStep>(graph, chunks, kv, spilled, layers, aneFfn);
   const std::vector<uint32_t> offsets = indexOffsets(kv, geometry_.kvLayout.attentionLayers);
+  // The inputs of the chunks' rows are written once, for their first layer.
+  const bool begins = !layers.first;
   for (uint32_t index = 0; index < steps.size(); ++index) {
-    steps[index].scratch = steps_.prefillScratch(index);
-    steps[index].blocks = steps_.preparePrefill(index, chunks[index]);
-    steps[index].indexOffsets = offsets;
+    PrefillStep &step = steps[index];
+    step.scratch = steps_.prefillScratch(index);
+    step.blocks = begins ? steps_.preparePrefill(index, chunks[index]) : steps_.prefillBlocks(index, chunks[index]);
+    step.indexOffsets = offsets;
+    step.ffn = {step.buffers.normalized, step.scratch.zeros, step.scratch.branch, step.buffers.moe};
   }
-  steps_.readAhead(chunks);
-  return addPrefillLayers(std::span(steps), *this);
+  if (begins) steps_.readAhead(chunks);
+  return addPrefillLayers(std::span(steps), *this, layers);
 }
 
 void Qwen4ExpTarget::addPrefillMix(PrefillStep &step, const Qwen4HyperWeights &hyper,
@@ -101,9 +105,12 @@ void Qwen4ExpTarget::addPrefillMix(PrefillStep &step, const Qwen4HyperWeights &h
 }
 
 void Qwen4ExpTarget::addPrefillBegin(PrefillStep &step) const {
-  const QwenTargetPrefillBuffers &b = step.buffers;
-  step.ffn = {b.normalized, step.scratch.zeros, step.scratch.branch, b.moe};
-  ops::HyperConnection::addInit(step.graph, b.hidden[0], step.scratch.streams, hyperShape(geometry_), step.rows);
+  ops::HyperConnection::addInit(step.graph, step.buffers.hidden[0], step.scratch.streams, hyperShape(geometry_),
+                                step.rows);
+}
+
+bool Qwen4ExpTarget::attends(uint32_t index) const {
+  return std::holds_alternative<QwenAttentionWeights>(weights_.layers[index].mixer);
 }
 
 void Qwen4ExpTarget::addPrefillLayer(PrefillStep &step, uint32_t index) const {

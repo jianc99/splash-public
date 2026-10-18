@@ -225,30 +225,35 @@ Qwen4Scratch Qwen4Steps::prefillScratch(uint32_t index) const {
   return scratch;
 }
 
-std::vector<Qwen4Blocks> Qwen4Steps::preparePrefill(uint32_t index, const QwenTargetPrefillChunk &chunk) {
-  const Qwen4Scratch scratch = prefillScratch(index);
+std::vector<Qwen4Blocks> Qwen4Steps::prefillBlocks(uint32_t index, const QwenTargetPrefillChunk &chunk) const {
+  if (index >= prefillChunks_) throw std::out_of_range("Qwen3.8-Flash-Next prefill chunk");
   const metal::MetalBuffer records =
       backend_.view(prefill_, prefillBlocksOffset_ + index * alignUp(kChunkBlockBytes), kChunkBlockBytes);
-  auto *indices = contents<uint32_t>(scratch.pleIndices);
   std::vector<Qwen4Blocks> blocks;
   uint64_t written = 0;
   for (const QwenTargetPrefillSequence &sequence : chunk.sequences) {
-    const uint64_t position = sequence.chunk.committed_tokens;
-    const uint32_t count = blockCount(position, sequence.rows);
+    const uint32_t count = blockCount(sequence.chunk.committed_tokens, sequence.rows);
     const uint64_t bytes = count * sizeof(BlockIndexerBlock);
     if (sequence.tokens.size() != sequence.rows || uint64_t{sequence.rowBegin} + sequence.rows > chunk.rows ||
         written + bytes > kChunkBlockBytes)
       throw std::invalid_argument("invalid Qwen3.8-Flash-Next prefill sequence");
+    blocks.push_back(count ? Qwen4Blocks{backend_.view(records, written, bytes), count} : Qwen4Blocks{});
+    written += bytes;
+  }
+  return blocks;
+}
+
+std::vector<Qwen4Blocks> Qwen4Steps::preparePrefill(uint32_t index, const QwenTargetPrefillChunk &chunk) {
+  const Qwen4Scratch scratch = prefillScratch(index);
+  auto *indices = contents<uint32_t>(scratch.pleIndices);
+  std::vector<Qwen4Blocks> blocks = prefillBlocks(index, chunk);
+  for (size_t at = 0; at < chunk.sequences.size(); ++at) {
+    const QwenTargetPrefillSequence &sequence = chunk.sequences[at];
+    const uint64_t position = sequence.chunk.committed_tokens;
     qwen4PleRows(weights_, position, sequence.tokens, sequence.request.tokens,
                  indices + uint64_t{sequence.rowBegin} * geometry_.pleHeads());
-    if (!count) {
-      blocks.push_back({});
-      continue;
-    }
-    const metal::MetalBuffer view = backend_.view(records, written, bytes);
-    writeBlocks(position, sequence.rows, sequence.request, contents<BlockIndexerBlock>(view));
-    blocks.push_back({view, count});
-    written += bytes;
+    if (blocks[at].count)
+      writeBlocks(position, sequence.rows, sequence.request, contents<BlockIndexerBlock>(blocks[at].records));
   }
   // A chunk's rows at once, so that its lanes share their rows.
   if (weights_.streamedTable)

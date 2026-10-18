@@ -288,6 +288,14 @@ struct QwenTargetPrefillChunk final {
   uint32_t rows = 0;
 };
 
+// The layers [first, end) of a prefill command one of its passes runs
+// (BatchPlan::passes): the pass with the first layer begins the chunks'
+// rows, the one with the last ends them.
+struct QwenPrefillLayers final {
+  uint32_t first = 0;
+  uint32_t end = 0;
+};
+
 struct QwenTargetVerifyBuffers final {
   ops::LinearScratch linearScratch{};
   std::array<metal::MetalBuffer, 2> hidden;
@@ -419,16 +427,21 @@ public:
   // K/V through `spilled` (the command's SpilledKvReads, the null one for
   // none). The dense FFN of a command of one chunk the split takes
   // (AneFfn::splits) runs split with the Neural Engine on `aneFfn`, when
-  // given. Returns each chunk's buffer of its last layer's output rows.
+  // given. Of the command, this runs `layers`, all of them or a pass's:
+  // what the layers before left in the chunks' buffers and the target's
+  // prefill scratch the layers after read on, from another command, with no
+  // other prefill between. With the last layer, returns each chunk's buffer
+  // of its last layer's output rows, and else nothing.
   //
-  // It first writes the inputs the target makes of the chunks' tokens on
-  // the CPU and stages a streamed table's rows of them, and starts reading
-  // ahead the rows of the prompt rows after them: the command is submitted
-  // once it returns, while no other command reading the target's prefill
-  // scratch is in flight.
+  // With the first layer, it first writes the inputs the target makes of
+  // the chunks' tokens on the CPU and stages a streamed table's rows of
+  // them, and starts reading ahead the rows of the prompt rows after them:
+  // the command is submitted once it returns, while no other command
+  // reading the target's prefill scratch is in flight.
   [[nodiscard]] virtual std::vector<metal::MetalBuffer> addPrefill(metal::CommandGraph &graph,
                                                                    std::span<const QwenTargetPrefillChunk> chunks,
                                                                    const kv::PageStorage &kv, SpilledKvReads &spilled,
+                                                                   QwenPrefillLayers layers,
                                                                    ops::AneFfn *aneFfn = nullptr) = 0;
   // Writes the inputs the target makes on the CPU of batch lane `lane`'s
   // verify rows, those from `position` on of `request`, before the cycle's
@@ -521,29 +534,35 @@ protected:
   [[nodiscard]] std::vector<Step> prefillSteps(metal::CommandGraph &graph,
                                                std::span<const QwenTargetPrefillChunk> chunks,
                                                const kv::PageStorage &kv, SpilledKvReads &spilled,
-                                               ops::AneFfn *aneFfn) const {
-    requirePrefill(chunks, kv, aneFfn);
+                                               QwenPrefillLayers layers, ops::AneFfn *aneFfn) const {
+    requirePrefill(chunks, kv, layers, aneFfn);
     std::vector<Step> steps;
     steps.reserve(chunks.size());
     for (const QwenTargetPrefillChunk &chunk : chunks)
       steps.push_back(Step{prefillStep(graph, chunk, kv, spilled, aneFfn)});
     return steps;
   }
-  // A prefill's layers over its steps (addPrefill), through a family's
-  // `layers`: each step's begin (addPrefillBegin); per layer, each step
-  // through its FFN's routing (addPrefillLayer), the hand-off of an
-  // attention layer's spilled history once every step attended it
-  // (SpilledKvReads::layerEnd), one load of the streamed experts any step's
-  // rows route (of the layer's MoE block, moe), and each step's routed work
-  // (addPrefillExperts); then each step's end, which returns its last
-  // layer's output rows (addPrefillEnd).
+  // A prefill's layers `range` over its steps (addPrefill), through a
+  // family's `layers`: with the first layer, each step's begin
+  // (addPrefillBegin), and else each step's next GDN and attention layer
+  // past those before the range (attends); per layer, each step through its
+  // FFN's routing (addPrefillLayer), the hand-off of an attention layer's
+  // spilled history once every step attended it (SpilledKvReads::layerEnd),
+  // one load of the streamed experts any step's rows route (of the layer's
+  // MoE block, moe), and each step's routed work (addPrefillExperts); then,
+  // with the last layer, each step's end, which returns its last layer's
+  // output rows (addPrefillEnd).
   template <class Step, class Layers>
-  [[nodiscard]] std::vector<metal::MetalBuffer> addPrefillLayers(std::span<Step> steps, const Layers &layers) const {
-    for (Step &step : steps) layers.addPrefillBegin(step);
+  [[nodiscard]] std::vector<metal::MetalBuffer> addPrefillLayers(std::span<Step> steps, const Layers &layers,
+                                                                 QwenPrefillLayers range) const {
+    if (!range.first)
+      for (Step &step : steps) layers.addPrefillBegin(step);
+    for (uint32_t index = 0; index < range.first; ++index)
+      for (Step &step : steps) ++(layers.attends(index) ? step.attentionLayer : step.gdnLayer);
     std::vector<ops::MoeLoadPart> parts;
     if (geometry_.ffnKind == QwenFfnKind::SparseMoe)
       for (const Step &step : steps) parts.push_back({&step.ffn, &*step.moe});
-    for (uint32_t index = 0; index < geometry_.layers; ++index) {
+    for (uint32_t index = range.first; index < range.end; ++index) {
       const uint32_t attentionLayer = steps.front().attentionLayer;
       for (Step &step : steps) layers.addPrefillLayer(step, index);
       if (steps.front().attentionLayer != attentionLayer)
@@ -553,6 +572,7 @@ protected:
       for (Step &step : steps) layers.addPrefillExperts(step, index);
     }
     std::vector<metal::MetalBuffer> outputs;
+    if (range.end != geometry_.layers) return outputs;
     outputs.reserve(steps.size());
     for (Step &step : steps) {
       requireLayerPartition(step.gdnLayer, step.attentionLayer);
@@ -620,7 +640,7 @@ protected:
 
 private:
   void requirePrefill(std::span<const QwenTargetPrefillChunk> chunks, const kv::PageStorage &kv,
-                      const ops::AneFfn *aneFfn) const;
+                      QwenPrefillLayers layers, const ops::AneFfn *aneFfn) const;
   [[nodiscard]] PrefillStep prefillStep(metal::CommandGraph &graph, const QwenTargetPrefillChunk &chunk,
                                         const kv::PageStorage &kv, SpilledKvReads &spilled,
                                         ops::AneFfn *aneFfn) const;

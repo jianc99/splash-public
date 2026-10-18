@@ -147,9 +147,12 @@ void QwenTarget::requireLayerPartition(uint32_t gdnLayers, uint32_t attentionLay
 }
 
 void QwenTarget::requirePrefill(std::span<const QwenTargetPrefillChunk> chunks, const kv::PageStorage &kv,
-                                const ops::AneFfn *aneFfn) const {
-  // The Neural Engine splits a dense target's commands, which are one chunk.
-  if (chunks.empty() || kv.layers().size() != geometry_.kvLayout.attentionLayers || (aneFfn && chunks.size() > 1))
+                                QwenPrefillLayers layers, const ops::AneFfn *aneFfn) const {
+  // The Neural Engine splits a dense target's commands, which are one chunk
+  // and run whole.
+  const bool whole = !layers.first && layers.end == geometry_.layers;
+  if (chunks.empty() || kv.layers().size() != geometry_.kvLayout.attentionLayers ||
+      (aneFfn && (chunks.size() > 1 || !whole)) || layers.first >= layers.end || layers.end > geometry_.layers)
     throw std::invalid_argument("invalid Qwen prefill");
 }
 
@@ -401,9 +404,9 @@ public:
 
   std::vector<metal::MetalBuffer> addPrefill(metal::CommandGraph &graph, std::span<const QwenTargetPrefillChunk> chunks,
                                              const kv::PageStorage &kv, SpilledKvReads &spilled,
-                                             ops::AneFfn *aneFfn) override {
-    std::vector<PrefillStep> steps = prefillSteps(graph, chunks, kv, spilled, aneFfn);
-    return addPrefillLayers(std::span(steps), *this);
+                                             QwenPrefillLayers layers, ops::AneFfn *aneFfn) override {
+    std::vector<PrefillStep> steps = prefillSteps(graph, chunks, kv, spilled, layers, aneFfn);
+    return addPrefillLayers(std::span(steps), *this, layers);
   }
 
   void addVerify(metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers, const kv::PageStorage &kv,
@@ -447,6 +450,9 @@ private:
   friend class QwenTarget;
 
   void addPrefillBegin(PrefillStep &) const {}
+  [[nodiscard]] bool attends(uint32_t index) const {
+    return std::holds_alternative<QwenAttentionWeights>(weights_.layers[index].mixer);
+  }
   void addPrefillLayer(PrefillStep &step, uint32_t index) const {
     const Layer &layer = weights_.layers[index];
     const QwenTargetPrefillBuffers &b = step.buffers;
