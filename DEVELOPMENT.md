@@ -344,8 +344,9 @@ expert, as a SIZE that holds them all does.
   resident: after the layer's routing, a host step of the command claims
   slots for them, recycled by adaptive replacement (ARC: the experts decode
   steps route again stay while the others pass through, and a prompt's
-  experts go first; of either, those of the layer the steps load last, from
-  the loading layer back), and reads them from their
+  experts go first; of either, those that missed the most of their layer's
+  loads, then those of the layer the steps load last, from the loading
+  layer back), and reads them from their
   files into a staging of a decode cycle's experts on the engine's SSD
   readers, and a repack kernel writes them into their slots before the expert
   passes run. A decode step's load is one such round; a prefill command's

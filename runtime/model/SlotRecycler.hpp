@@ -24,12 +24,16 @@
 //
 // The keys sit at positions of a cycle the loads visit in order (`cycle`;
 // an expert arena's blocks, which each decode step and each prefill chunk
-// route one after another), and of the list ARC recycles from, the slot that
-// goes is of the position the loads reach last: the load's own first (a key
-// there it does not use waits a whole cycle), then the one before it, and so
-// on back to the one after it; within a position, the least recently used.
-// Recency over every position would as soon give up a key the loads reach in
-// a few blocks as one they just passed. With one position (a layer's K/V
+// route one after another; a load's keys are at one position). Of the list
+// ARC recycles from, the slot that goes is the one whose key has missed the
+// most loads of its position since its last use, and of those, the one at
+// the position the loads reach last: the load's own (a key there it does not
+// use waits a whole cycle), then the one before it, and so on back to the
+// one after it. Recency alone would give up, of the keys last used in the
+// same pass of the cycle, the one the loads reach next; the position alone
+// would give up a key used a pass ago before one passed by for many (when
+// the slots hold several passes' keys). A scan's use is none: its keys count
+// as missing every load of their position. With one position (a layer's K/V
 // blocks) this is ARC.
 //
 // The keys of the slots and of the ghosts are in flat tables, and the ghosts
@@ -122,8 +126,11 @@ private:
   void unlink(uint32_t slot);
   void append(uint32_t slot, List list);
   void prepend(uint32_t slot, List list);
-  // The slot of `list` the load at `position` does not use that the loads
-  // reach last, or none.
+  // Load `load`, at `position`, counts as a load of it once.
+  void visit(uint64_t load, uint32_t position) noexcept;
+  // The slot of `list` the load at `position` does not use whose key missed
+  // the most loads of its position, of those the one the loads reach last,
+  // or none.
   [[nodiscard]] uint32_t oldest(List list, uint32_t position, uint64_t load) const;
   // Recycles a slot of T1 or T2 (ARC's REPLACE, `frequentGhost` when the
   // key T2 gave up claims it): its key becomes a ghost, unless a scan brought
@@ -139,6 +146,10 @@ private:
   Links links_;
   std::vector<uint32_t> free_, position_;
   std::vector<uint64_t> key_, lastLoad_;
+  // Each slot's count of its position's loads at its key's last use (0 for a
+  // scan's), each position's loads, and the last load counted.
+  std::vector<uint64_t> lastVisit_, visits_;
+  uint64_t load_ = 0;
   Positions recent_, frequent_;
   KeyIndex slotOf_;
   // The ghosts: each a key of B1 or B2 (ghostList_) in a list of its own, at

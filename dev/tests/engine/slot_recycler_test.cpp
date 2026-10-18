@@ -6,8 +6,9 @@
 // again in place; and when more lanes add experts to each cycle until a cycle
 // routes more than the slots hold, the experts every cycle routes keep
 // hitting (recycling the least recently used slot keeps a fifth of them). Of
-// the list adaptive replacement recycles from, the slot that goes is of the
-// position of the cycle the loads reach last, as a reference model of the
+// the list adaptive replacement recycles from, the slot that goes is the one
+// whose key missed the most loads of its position of the cycle, of those the
+// one at the position the loads reach last, as a reference model of the
 // policy over lists of keys recycles them, load by load, with one position
 // (adaptive replacement alone) and with six; and loads that loop over more
 // keys than the slots keep hitting, where one position hits none. A claim
@@ -197,22 +198,25 @@ void aRoutedCoreOutlivesMoreLanes() {
 }
 
 // The policy as SlotRecycler's description reads, over lists of keys: T1 and
-// T2, a least-recently-used order of keys at each position, and B1 and B2,
-// the keys each gave up lately; a claim recycles, of the list adaptive
-// replacement picks, the least recently used key the load does not use of
-// the first position that holds one, from the load's own back around the
-// cycle.
+// T2, a least-recently-used order of keys at each position (a scan's first),
+// and B1 and B2, the keys each gave up lately; each key counts the loads of
+// its position it missed since its last use (a scan's, all of them). A claim
+// recycles, of the list adaptive replacement picks, the key the load does
+// not use that missed the most, of those the first from the load's own
+// position back around the cycle, and the least recently used of a position.
 class Reference final {
 public:
-  Reference(uint32_t slots, uint32_t cycle) : slots_(slots), lists_{Lists(cycle), Lists(cycle)} {}
+  Reference(uint32_t slots, uint32_t cycle) : slots_(slots), lists_{Lists(cycle), Lists(cycle)}, loads_(cycle) {}
 
   [[nodiscard]] bool holds(uint64_t key) const { return held_.contains(key); }
   [[nodiscard]] uint64_t ghostHits() const { return ghostHits_; }
 
   void touch(uint64_t key, uint64_t load, bool chunk) {
     Held &held = held_.at(key);
+    count(load, held.position);
     held.load = load;
     if (chunk) return;
+    held.visit = loads_[held.position];
     lists_[held.list][held.position].remove(key);
     held.list = kFrequent;
     held.scan = false;
@@ -220,6 +224,7 @@ public:
   }
 
   void claim(uint64_t key, uint64_t load, bool chunk, uint32_t position) {
+    count(load, position);
     const bool recentGhost = gaveUp(kRecent, key), frequentGhost = gaveUp(kFrequent, key);
     if (!chunk && (recentGhost || frequentGhost)) {
       const size_t mine = ghosts_[frequentGhost].size(), other = ghosts_[!frequentGhost].size();
@@ -259,6 +264,8 @@ public:
       for (std::list<uint64_t> &at : list) at.clear();
     for (std::list<uint64_t> &ghosts : ghosts_) ghosts.clear();
     target_ = 0;
+    std::ranges::fill(loads_, 0);
+    last_ = 0;
   }
 
 private:
@@ -269,8 +276,17 @@ private:
     int list = kRecent;
     uint32_t position = 0;
     uint64_t load = 0;
+    // Its position's loads at its last use, 0 for a scan's.
+    uint64_t visit = 0;
     bool scan = false;
   };
+
+  // A load (each at one position) counts once.
+  void count(uint64_t load, uint32_t position) {
+    if (load == last_) return;
+    last_ = load;
+    ++loads_[position];
+  }
 
   [[nodiscard]] bool gaveUp(int list, uint64_t key) const {
     return std::ranges::find(ghosts_[list], key) != ghosts_[list].end();
@@ -282,10 +298,19 @@ private:
   }
   [[nodiscard]] uint64_t victim(int list, uint32_t position, uint64_t load) const {
     const uint32_t cycle = static_cast<uint32_t>(lists_[list].size());
-    for (uint32_t back = 0; back < cycle; ++back)
-      for (const uint64_t key : lists_[list][(position + cycle - back) % cycle])
-        if (held_.at(key).load != load) return key;
-    return kNoKey;
+    uint64_t victim = kNoKey, missed = 0;
+    for (uint32_t back = 0; back < cycle; ++back) {
+      const uint32_t place = (position + cycle - back) % cycle;
+      for (const uint64_t key : lists_[list][place]) {
+        const Held &held = held_.at(key);
+        if (held.load == load) continue;
+        if (const uint64_t loads = loads_[place] - held.visit; victim == kNoKey || loads > missed) {
+          victim = key;
+          missed = loads;
+        }
+      }
+    }
+    return victim;
   }
   void replace(uint32_t position, uint64_t load, bool frequentGhost) {
     const bool fromRecent =
@@ -303,7 +328,7 @@ private:
   }
   // A scan's key enters T1 at its least recently used end.
   void hold(uint64_t key, int list, uint32_t position, uint64_t load, bool scan) {
-    held_[key] = {list, position, load, scan};
+    held_[key] = {list, position, load, scan ? 0 : loads_[position], scan};
     if (scan) lists_[list][position].push_front(key);
     else lists_[list][position].push_back(key);
   }
@@ -313,6 +338,9 @@ private:
   std::array<std::list<uint64_t>, 2> ghosts_;
   std::map<uint64_t, Held> held_;
   uint64_t target_ = 0, ghostHits_ = 0;
+  // Each position's loads, and the last load counted.
+  std::vector<uint64_t> loads_;
+  uint64_t last_ = 0;
 };
 
 // Loads of six positions' keys, skewed to each position's first: mostly
@@ -387,8 +415,9 @@ void positionsOfTheCycle() {
   SlotRecycler slots(4, 3);
   rejects([&] { static_cast<void>(slots.claim(1, 1, false, 3)); }, "past", "a position past the cycle was taken");
   // Keys at positions 0, 1 and 2 fill T1, and a load at 2 claims three more:
-  // the keys of its own position it does not use go first, then that of the
-  // position before it (1), not the least recently used (0).
+  // the keys of its own position it does not use go first (each missed a
+  // load of it), then of the others, which missed none, that of the position
+  // before it (1), not the least recently used (0).
   static_cast<void>(slots.claim(10, 1, false, 0));
   static_cast<void>(slots.claim(11, 2, false, 1));
   static_cast<void>(slots.claim(20, 3, false, 2));
@@ -399,6 +428,18 @@ void positionsOfTheCycle() {
   require(!slots.find(21) && slots.find(10) && slots.find(11), "a load recycled a key of another position first");
   static_cast<void>(slots.claim(24, 5, false, 2));
   require(!slots.find(11) && slots.find(10), "a load passed over the position before its own");
+  // A key that missed a load of its position goes before one that missed
+  // none, though the loads reach it sooner: X at 2 missed the load at 2 that
+  // claimed W, Q at 0 missed nothing, and a long chunk at 1 uses Z and claims
+  // V.
+  SlotRecycler cycle(4, 3);
+  const uint32_t x = cycle.claim(30, 1, false, 2);
+  static_cast<void>(cycle.claim(31, 2, false, 0));
+  const uint32_t z = cycle.claim(32, 3, false, 1);
+  static_cast<void>(cycle.claim(33, 4, false, 2));
+  cycle.touch(z, 5, true);
+  require(cycle.claim(34, 5, true, 1) == x && cycle.find(31), "a load gave up a key that missed no load of its "
+                                                                  "position before one that missed one");
 }
 
 void aLoopOfMoreKeysThanSlotsKeepsHitting() {

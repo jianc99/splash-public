@@ -82,6 +82,7 @@ SlotRecycler::SlotRecycler(uint32_t slots, uint32_t cycle) {
   if (cycle == 0) throw std::invalid_argument("a slot recycler's cycle has no position");
   recent_.at.resize(cycle);
   frequent_.at.resize(cycle);
+  visits_.resize(cycle);
   resize(slots);
 }
 
@@ -106,15 +107,31 @@ void SlotRecycler::prepend(uint32_t slot, List list) {
   ++into.count;
 }
 
+void SlotRecycler::visit(uint64_t load, uint32_t position) noexcept {
+  if (load == load_) return;
+  load_ = load;
+  ++visits_[position];
+}
+
 uint32_t SlotRecycler::oldest(List list, uint32_t position, uint64_t load) const {
+  // Each position's order is by its keys' last use, so its first slot the
+  // load does not use missed the most of its loads; the positions go from
+  // the one the loads reach last, which a tie keeps.
   const std::vector<Order> &at = (list == Recent ? recent_ : frequent_).at;
   const uint32_t cycle = static_cast<uint32_t>(at.size());
+  uint32_t oldest = kNone;
+  uint64_t missed = 0;
   for (uint32_t back = 0; back < cycle; ++back) {
-    uint32_t slot = at[(position + cycle - back) % cycle].head;
+    const uint32_t place = (position + cycle - back) % cycle;
+    uint32_t slot = at[place].head;
     while (slot != kNone && lastLoad_[slot] == load) slot = links_.next[slot];
-    if (slot != kNone) return slot;
+    if (slot == kNone) continue;
+    if (const uint64_t loads = visits_[place] - lastVisit_[slot]; oldest == kNone || loads > missed) {
+      oldest = slot;
+      missed = loads;
+    }
   }
-  return kNone;
+  return oldest;
 }
 
 void SlotRecycler::addGhost(uint64_t key, List list) {
@@ -167,9 +184,11 @@ std::optional<uint32_t> SlotRecycler::find(uint64_t key) const noexcept {
 }
 
 void SlotRecycler::touch(uint32_t slot, uint64_t load, bool chunk) {
+  visit(load, position_[slot]);
   lastLoad_[slot] = load;
   // A scan moves nothing; another use makes a key of T1 frequent.
   if (chunk) return;
+  lastVisit_[slot] = visits_[position_[slot]];
   unlink(slot);
   scan_[slot] = 0;
   append(slot, Frequent);
@@ -177,6 +196,7 @@ void SlotRecycler::touch(uint32_t slot, uint64_t load, bool chunk) {
 
 uint32_t SlotRecycler::claim(uint64_t key, uint64_t load, bool chunk, uint32_t position) {
   if (position >= recent_.at.size()) throw std::invalid_argument("a key's position is past a slot recycler's cycle");
+  visit(load, position);
   const uint64_t slots = size();
   const uint32_t ghost = ghostOf_.find(key);
   const List gaveUp = ghost == KeyIndex::kAbsent ? Free : List(ghostList_[ghost]);
@@ -225,6 +245,7 @@ uint32_t SlotRecycler::claim(uint64_t key, uint64_t load, bool chunk, uint32_t p
   lastLoad_[slot] = load;
   scan_[slot] = chunk;
   position_[slot] = position;
+  lastVisit_[slot] = chunk ? 0 : visits_[position];
   slotOf_.insert(key, slot);
   if (frequent) append(slot, Frequent);
   else if (chunk) prepend(slot, Recent);
@@ -255,6 +276,9 @@ void SlotRecycler::reset() {
   std::ranges::fill(list_, uint8_t{Free});
   std::ranges::fill(scan_, uint8_t{0});
   std::ranges::fill(lastLoad_, 0);
+  std::ranges::fill(lastVisit_, 0);
+  std::ranges::fill(visits_, 0);
+  load_ = 0;
 }
 
 void SlotRecycler::resize(uint32_t slots) {
@@ -273,6 +297,7 @@ void SlotRecycler::resize(uint32_t slots) {
   key_.resize(slots);
   position_.resize(slots, 0);
   lastLoad_.resize(slots, 0);
+  lastVisit_.resize(slots, 0);
   for (uint32_t slot = slots; slot-- > held;) free_.push_back(slot);
   slotOf_.reserve(slots);
   // As many ghosts as slots: fewer slots forget every ghost, more add free

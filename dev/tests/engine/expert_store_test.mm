@@ -366,13 +366,13 @@ int streamedChunkOrder(MetalBackend &backend, const MoeShape &shape, const std::
   return failures;
 }
 
-// A load recycles the slots of the block the steps come back to last: blocks
-// that share an arena of one block's experts and three slots route the same
-// experts for a decode row, more of them in a cycle of the blocks than the
-// arena holds, and every cycle after the first finds some of them resident
-// (recycling the least recently used slot would find none: each block's
-// experts gone before the cycle came back), each step giving the resident
-// experts' bits.
+// A load recycles the slots of the block the steps come back to last, of
+// experts that missed as many of their block's loads: blocks that share an
+// arena of one block's experts and three slots route the same experts for a
+// decode row, more of them in a cycle of the blocks than the arena holds,
+// and every cycle after the first finds some of them resident (recycling the
+// least recently used slot would find none: each block's experts gone before
+// the cycle came back), each step giving the resident experts' bits.
 int streamedCycleOrder(MetalBackend &backend, const MoeShape &shape, const std::filesystem::path &directory) {
   const Model m = makeModel(backend, shape, Q4K, true);
   ExpertFile file(m, directory / "experts.bin");

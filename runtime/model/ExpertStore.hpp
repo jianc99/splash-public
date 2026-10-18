@@ -12,7 +12,8 @@
 // of several blocks streams: an arena's slots are recycled across its blocks
 // by adaptive replacement (SlotRecycler), which keeps the experts decode steps
 // route again and again, and recycles a long prefill chunk's loads first;
-// of either, the experts of the block the steps load last go first (the
+// of either, the experts that missed the most loads of their block go
+// first, and of those the ones of the block the steps load last (the
 // loading block's, then the one before it). A size of one block (a layer
 // whose experts take formats no other layer's do, as a dynamic quantization
 // leaves some) holds every one of its experts: they are read when the store
