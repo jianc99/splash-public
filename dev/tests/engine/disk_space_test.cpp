@@ -116,6 +116,10 @@ void testActiveKvTakesTheRoom() {
               diskActiveLimitBytes(kQuota, 500 * kGiB, 0, floor) == kQuota &&
               !diskActiveLimitBytes(kQuota, 9 * kGiB, 0, floor),
           "the active limit is not the room beyond the floor, at most the quota");
+  require(volumeActiveLimitBytes(kQuota, localVolume(16 * kGiB, 460 * kGiB), 0) == 6 * kGiB &&
+              volumeActiveLimitBytes(kQuota, DiskVolume{"/Volumes/Share", kGiB, 1000 * kGiB, false}, 0) == kQuota &&
+              volumeActiveLimitBytes(kQuota, std::nullopt, 0) == kQuota,
+          "a volume's active limit is not its room, or the quota off a volume the tier follows");
   auto budget = std::make_shared<model::DiskBudget>(kQuota);
   auto file = std::make_shared<model::SlotFile>(kHostPageBytes, budget);
   DiskSpace space(budget, {file});
