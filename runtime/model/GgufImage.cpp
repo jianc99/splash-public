@@ -622,13 +622,14 @@ ImageBuilder::ImageBuilder(std::string name, uint32_t layer, uint32_t type, bool
   image_.type = type;
   const auto header = weightFileHeader(image_.magic, layer, type);
   image_.fills.push_back({0, {header.begin(), header.end()}});
-  cursor_ = header.size();
+  cursor_ = residentCursor_ = header.size();
 }
 
 uint64_t ImageBuilder::section(uint64_t bytes) {
   if (!bytes) throw GgufError("empty image section in " + image_.name);
   const uint64_t start = alignWeightOffset(cursor_);
   cursor_ = start + bytes;
+  residentCursor_ = alignWeightOffset(residentCursor_) + bytes;
   return start;
 }
 
@@ -673,7 +674,14 @@ Repack ImageBuilder::planes(uint32_t format, uint64_t rows, uint64_t columns, co
 void ImageBuilder::repack(Repack repack) { image_.repacks.push_back(std::move(repack)); }
 
 Repack ImageBuilder::expertPlanes(uint32_t format, uint64_t rows, uint64_t columns, const std::string &name) {
-  return streamExperts_ ? tiledRepack(format, rows, columns, name) : planes(format, rows, columns, name);
+  if (!streamExperts_) return planes(format, rows, columns, name);
+  // The sections planes() would lay out, the descriptor's and the planes',
+  // count in the image's resident bytes.
+  const GgufPlaneBytes bytes = ggufPlaneBytes(kQuantFormats[format], rows, columns);
+  const uint64_t descriptorBytes = GgufTensorDescriptor{}.encode().size();
+  for (const uint64_t section : {descriptorBytes, bytes.plane0, bytes.plane1, bytes.meta})
+    if (section) residentCursor_ = alignWeightOffset(residentCursor_) + section;
+  return tiledRepack(format, rows, columns, name);
 }
 
 void ImageBuilder::expertRepack(Repack repack) {
@@ -687,6 +695,7 @@ void ImageBuilder::expertRepack(Repack repack) {
 
 Image ImageBuilder::finish() {
   image_.bytes = alignWeightOffset(cursor_);
+  image_.residentBytes = alignWeightOffset(residentCursor_);
   return std::move(image_);
 }
 

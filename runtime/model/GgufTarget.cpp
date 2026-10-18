@@ -82,7 +82,8 @@ WeightFile GgufTargetLoader::open(size_t index) {
                                                                          const metal::MetalBuffer &buffer) {
                          writeGgufImage(backend, buffer, planned->images[index]);
                          planned->source.checkUnchanged();
-                       }});
+                       },
+                       plan.residentBytes});
 }
 
 WeightFile GgufTargetLoader::layer(uint32_t index) {

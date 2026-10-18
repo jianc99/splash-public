@@ -156,6 +156,11 @@ struct Image {
   std::vector<Repack> repacks;
   // A MoE layer's routed experts, when they stream: then not in the image.
   std::optional<StreamedExperts> experts;
+  // Its bytes with its routed experts in it, which its record declares
+  // whether they stream or not, as a streamed table's image stands in with
+  // its bytes: the weights' manifest, and so the persistent cache's
+  // namespace, does not depend on --expert-memory.
+  uint64_t residentBytes = 0;
   // A table's rows, when they stream (PlanOptions::streamTable): then the
   // image does not load, and stands in the weights' records as when it does,
   // as the rows read are its rows.
@@ -222,7 +227,9 @@ public:
 
 private:
   Image image_;
-  uint64_t cursor_ = 0;
+  // The end of the last section, and where it would end with the routed
+  // experts' sections in the image (Image::residentBytes).
+  uint64_t cursor_ = 0, residentCursor_ = 0;
   bool streamExperts_ = false;
   // The routed experts' projections expertRepack() took.
   uint32_t expertProjections_ = 0;

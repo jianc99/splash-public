@@ -25,7 +25,8 @@ WeightFile SafetensorsTargetLoader::open(size_t index) {
                                                                          const metal::MetalBuffer &buffer) {
                          writeGgufImage(backend, buffer, planned->images[index]);
                          planned->checkpoint.checkUnchanged();
-                       }});
+                       },
+                       plan.residentBytes});
 }
 
 WeightFile SafetensorsTargetLoader::layer(uint32_t index) {

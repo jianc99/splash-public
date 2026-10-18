@@ -9,6 +9,7 @@
 #include "model/GgufPreparation.hpp"
 #include "model/GgufTarget.hpp"
 #include "model/Qwen4Exp.hpp"
+#include "model/WeightStore.hpp"
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -56,11 +57,14 @@ bool sameRepack(const model::gguf::Repack &left, const model::gguf::Repack &righ
 }
 
 // With streamed experts each layer's routed experts are the repacks the
-// resident plan writes, out of the image, which keeps every other section.
+// resident plan writes, out of the image, which keeps every other section and
+// declares the resident image's bytes.
 bool streamsExperts(const Plan &resident, const Plan &streamed) {
   if (resident.error || streamed.error || resident.images.size() != streamed.images.size()) return false;
   for (size_t index = 0; index < resident.images.size(); ++index) {
     const model::gguf::Image &whole = resident.images[index], &image = streamed.images[index];
+    // Either declares the resident image's bytes (the weights' manifest).
+    if (whole.residentBytes != whole.bytes || image.residentBytes != whole.bytes) return false;
     std::vector<const model::gguf::Repack *> routed, rest;
     for (const model::gguf::Repack &repack : whole.repacks)
       (repack.sources.front().name.find("_exps.") != std::string::npos ? routed : rest).push_back(&repack);
@@ -346,8 +350,19 @@ void checkMoe(const std::filesystem::path &directory) {
               std::to_string(tensor.dims[0]));
   }
   check(layer.repacks.size() == quantized, "planner repacks only the layer's quantized tensors");
-  check(streamsExperts(moe, plan(path, g, {.streamExperts = true})),
-        "planner leaves streamed experts out of the layers' images, as the repacks it would write");
+  const Plan streamed = plan(path, g, {.streamExperts = true});
+  check(streamsExperts(moe, streamed),
+        "planner leaves streamed experts out of the layers' images, as the repacks it would write, and declares the "
+        "images' bytes with them");
+  // So the weights' manifest, the persistent cache's namespace, is the same with and without --expert-memory: the
+  // target's loader records each image with its resident bytes (GgufTargetLoader::open).
+  const auto manifest = [](const Plan &planned) {
+    std::vector<model::WeightFileRecord> records;
+    for (const model::gguf::Image &image : planned.images)
+      records.push_back({"target/" + image.name, image.magic, image.layer, image.type, image.residentBytes, "sources"});
+    return model::weightManifestFingerprint(records);
+  };
+  check(manifest(moe) == manifest(streamed), "planner gives the weights the same manifest whether the experts stream or not");
 
   // llama.cpp's fused ffn_gate_up_exps: the gate tensor takes each expert's first width rows of it, the up tensor
   // the next width; one of a type the loader does not read is refused by name.
