@@ -94,8 +94,9 @@ public:
   // Scratch for prefill commands of up to `prefillChunks` chunks.
   Qwen4Steps(const Qwen4ExpWeights &weights, const QwenTargetGeometry &geometry, metal::MetalBackend &backend,
              uint32_t prefillChunks);
-  [[nodiscard]] static QwenTargetScratchBytes scratchBytes(const Qwen4ExpWeights &weights,
-                                                           const QwenTargetGeometry &geometry,
+  // The scratch of a target whose streamed table's rows are `tableRowBytes`
+  // each (zero: the table loads).
+  [[nodiscard]] static QwenTargetScratchBytes scratchBytes(const QwenTargetGeometry &geometry, uint64_t tableRowBytes,
                                                            uint32_t prefillChunks);
   // What the constructor allocated, scratchBytes' of its geometry.
   [[nodiscard]] QwenTargetScratchBytes allocatedBytes() const noexcept;

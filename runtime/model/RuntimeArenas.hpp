@@ -60,12 +60,17 @@ struct RuntimeGeometry final {
   // The step scratch the target keeps itself beside the arenas.
   QwenTargetScratchBytes targetScratch{};
 
-  // `kvSpills`: the runtime reads spilled K/V, which only a block-sparse
-  // target with a spillable layout does (kv::Layout::spillable).
+  // The geometry of `model` as it loaded, or with `parts` streaming
+  // whatever streams of it as it loaded (plannedRuntimeMemory). Only a
+  // block-sparse target with a spillable layout (kv::Layout::spillable)
+  // reads spilled K/V.
   [[nodiscard]] static RuntimeGeometry from(const LoadedModel &model,
                                             kv::Format kvFormat,
-                                            ops::GdnStateFormat stateFormat,
-                                            bool kvSpills = false) {
+                                            ops::GdnStateFormat stateFormat) {
+    return from(model, kvFormat, stateFormat, StreamedParts::loaded(model));
+  }
+  [[nodiscard]] static RuntimeGeometry from(const LoadedModel &model, kv::Format kvFormat,
+                                            ops::GdnStateFormat stateFormat, StreamedParts parts) {
     RuntimeGeometry result;
     result.draft = model.draft.layout;
     result.target = std::visit(
@@ -74,10 +79,10 @@ struct RuntimeGeometry final {
     result.target.kvLayout = model.targetKvLayout(kvFormat);
     result.target.stateLayout = model.stateLayout(stateFormat).target;
     result.target.ropeScaling = model.descriptor.ropeScaling;
-    if (kvSpills) result.spilledKv = model.descriptor.capabilities.sparseKv;
-    if (model.expertStore() || kvSpills) result.prefillChunks = kPrefillGroupChunks;
+    if (parts.kv) result.spilledKv = model.descriptor.capabilities.sparseKv;
+    if (parts.experts || parts.kv) result.prefillChunks = kPrefillGroupChunks;
     if (!result.target.valid() || !result.draft.stateLayout().valid() ||
-        (kvSpills && (!result.spilledKv || !result.target.kvLayout.spillable())) ||
+        (parts.kv && (!result.spilledKv || !result.target.kvLayout.spillable())) ||
         result.target.contextTokens() != model.descriptor.capabilities.maximumContextTokens ||
         result.target.hiddenSize != result.draft.hiddenSize ||
         result.target.vocabularySize != result.draft.vocabularySize ||
@@ -86,7 +91,9 @@ struct RuntimeGeometry final {
     }
     // Sized from the geometry, once it is valid.
     result.targetScratch = std::visit(
-        [&](const auto &weights) { return qwenTargetScratchBytes(weights, result.target, result.prefillChunks); },
+        [&](const auto &weights) {
+          return qwenTargetScratchBytes(weights, result.target, result.prefillChunks, parts.tableRowBytes);
+        },
         model.target);
     return result;
   }

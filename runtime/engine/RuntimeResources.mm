@@ -349,6 +349,16 @@ void reportIgnoredSetting(std::string_view option, const StreamedSetting &settin
             allBytes / kMiB, " MiB), which ", loads);
 }
 
+// What `plan` streams that `other` loads whole, the routed experts before
+// the PLE table, and that it does; empty for neither.
+std::string_view streamedOnlyIn(const StreamedMemoryPlan &plan, const StreamedMemoryPlan &other) {
+  if (plan.expertBytes && !other.expertBytes)
+    return "routed experts, which load whole without it";
+  if (plan.tableBytes && !other.tableBytes)
+    return "PLE table, which loads whole without it";
+  return {};
+}
+
 // What streams of the loaded model, and how an automatic part's store was
 // sized.
 void reportStreamedStores(const model::LoadedModel &loaded, const model::StreamableWeights &streamable,
@@ -620,12 +630,13 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   // plan of a target whose KV cannot spill never depends on the disk, so
   // that every start of the model serves the same context: an explicit quota
   // that holds a state sets the staging aside, and the automatic one where
-  // the plan holds the model and the requested context beside it and the
-  // Neural Engine split does not need its memory (below). The disk decides
-  // only whether the tier's files open, once the weights have loaded: where
-  // they do not, the tier is off and the staging stays unused. The volume
-  // sizes the tier once its files are open (DiskSpace), and with it the
-  // context a target whose KV spills serves (ContextBounds::disk).
+  // the plan holds the model, its parts as they load without it and the
+  // requested context beside it and the Neural Engine split does not need
+  // its memory (below). The disk decides only whether the tier's files open,
+  // once the weights have loaded: where they do not, the tier is off and the
+  // staging stays unused. The volume sizes the tier once its files are open
+  // (DiskSpace), and with it the context a target whose KV spills serves
+  // (ContextBounds::disk).
   model::CompositeStateLayout stateLayout = config.model.stateLayout;
   stateLayout.target.format = config.stateFormat;
   const uint64_t stateBytes = stateLayout.cachedBytes();
@@ -640,7 +651,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   else if (cacheDiskBytes)
     logLine("SSD cache off: its quota holds no state of ", mebibytes(stateBytes),
             " MiB; no state staging is set aside.");
-  // The automatic tier turns off before anything is planned with it.
+  // The automatic tier turns off before the engine's plan is made with it.
   const auto diskOff = [&](std::string_view reason) {
     logLine("SSD cache off: ", reason, "; no state staging is set aside.");
     stateStagingBytes = 0;
@@ -654,9 +665,11 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   // stream from the SSD, a MoE target's routed experts and a GGUF's PLE
   // table: a part set to a size or off loads as set, and the plan sizes an
   // automatic one. It rests on the weights' sizes, which their files give
-  // before they load; on the arenas, which only the loaded model gives, as
-  // they rest on its weights' formats; and on the SSD cache's room for active
-  // KV, its quota until its files open, and whether its KV file opened.
+  // before they load; on the arenas, which only a loaded model gives, as they
+  // rest on its weights' formats, but which one load gives for whatever
+  // streams of it (model::StreamedParts); and on the SSD cache's room for
+  // active KV, its quota until its files open, and whether its KV file
+  // opened.
   kv::Layout kvLayout = config.model.targetKvLayout;
   kvLayout.format = config.kvFormat;
   // How the KV tier lays a page out in its slot, and so the slots' size.
@@ -665,11 +678,9 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   const uint64_t hardBudgetBytes = EngineMemoryPolicy::hardBudgetBytes(
       device.recommendedMaxWorkingSetBytes, config.maximumMemoryBytes);
   model::StreamableWeights streamable;
-  // The arenas of the model as it last loaded; none before it loads.
-  model::ModelMemoryPlan modelMemoryPlan;
-  const auto arenaBytes = [&] {
-    return modelMemoryPlan.sharedPrefillPlannedAllocatedBytes + modelMemoryPlan.sharedDecodePlannedAllocatedBytes;
-  };
+  // The arenas of the loaded model by what streams of it; none before it
+  // loads.
+  std::array<std::array<uint64_t, 2>, 2> arenaBytes{};
   uint64_t activeLimitBytes = cacheDiskBytes;
   bool kvFileOpen = true;
   // The plan with the parts set as `experts` and `table`, `stagingBytes` set
@@ -680,7 +691,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     return planStreamedMemory(
         {.hardBudgetBytes = hardBudgetBytes,
          .fixedBytes = streamable.loadedBytes + model::kPipelineReserveBytes + model::kRuntimeOverheadReserveBytes +
-                       arenaBytes() + stagingBytes + aneFfnBytes,
+                       stagingBytes + aneFfnBytes,
+         .arenaBytes = arenaBytes,
          .laneStateBytes = stateLayout.laneBytes(),
          .kvLayout = kvLayout,
          .windowTokens = config.model.capabilities.maximumContextTokens,
@@ -698,6 +710,32 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   // The plan of the parts as configured, which sizes their stores.
   const auto sizingPlan = [&](uint64_t stagingBytes) {
     return streamedPlan(config.expertMemory, config.pleMemory, stagingBytes, 0);
+  };
+  // The sizing plan with the staging the tier keeps. The automatic tier gives
+  // it up where the plan cannot hold the model beside it, and, once the
+  // model `loaded` gave the arenas, unless the plan spills, which the tier
+  // makes possible, where the staging would stream a part that loads whole
+  // without it: a tier that only caches costs the weights nothing, as it
+  // costs the context nothing (below).
+  const auto storesPlan = [&](bool loaded) {
+    StreamedMemoryResult planned = sizingPlan(stateStagingBytes);
+    if (!stateStagingBytes || !automaticDisk || (planned.plan && planned.plan->spill.enabled))
+      return planned;
+    StreamedMemoryResult without = sizingPlan(0);
+    if (!without.plan)
+      return planned;
+    std::string reason;
+    if (!planned.plan && planned.requiredBytes)
+      reason = "the memory budget has no room for its " + std::to_string(mebibytes(stateBytes)) +
+               " MiB of state staging beside the model";
+    else if (planned.plan && loaded)
+      if (const std::string_view part = streamedOnlyIn(*planned.plan, *without.plan); !part.empty())
+        reason = "its " + std::to_string(mebibytes(stateBytes)) + " MiB of state staging would stream the " +
+                 std::string(part);
+    if (reason.empty())
+      return planned;
+    diskOff(reason);
+    return without;
   };
   // The stores the plan gives the parts, except that automatic experts the
   // plan streams load at their floor while `floors`: until the loaded model
@@ -728,14 +766,9 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     // Refuse a model that cannot fit before loading its weights: beside them
     // the plan needs at least the runtime reserves, one lane's state, the
     // KV runway, the streamed stores at their floors, the floors of KV on the
-    // SSD cache and any SSD cache state staging; the plans after the load add
-    // the arenas.
-    StreamedMemoryResult planned = sizingPlan(stateStagingBytes);
-    if (stateStagingBytes && automaticDisk && !planned.plan && sizingPlan(0).plan) {
-      diskOff("the memory budget has no room for its " + std::to_string(mebibytes(stateBytes)) +
-              " MiB of state staging beside the model");
-      planned = sizingPlan(0);
-    }
+    // SSD cache and any SSD cache state staging; the plan after the load
+    // adds the arenas.
+    const StreamedMemoryResult planned = storesPlan(false);
     if (!planned.plan)
       throw planRefusal(planned, hardBudgetBytes);
     loadOptions = storesOf(*planned.plan, true);
@@ -757,8 +790,9 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   // engine lends it to model execution without inspecting its plans.
   ops::ExecutionPlans operators(device);
   model::LoadedModel loaded;
+  model::ModelMemoryPlan modelMemoryPlan;
   // Loads the model as loadOptions says, `again` once it loaded, and plans
-  // its arenas.
+  // its arenas: as it loaded, and for whatever streams of it.
   const auto load = [&](bool again) {
     try {
       const auto started = AwakeClock::now();
@@ -778,8 +812,16 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
                                   error.what());
     }
     try {
-      modelMemoryPlan = model::plannedRuntimeMemory(loaded, operators, config.kvFormat,
-                                                    config.stateFormat);
+      modelMemoryPlan = model::plannedRuntimeMemory(loaded, operators, config.kvFormat, config.stateFormat,
+                                                    model::StreamedParts::loaded(loaded));
+      for (const bool experts : {false, true})
+        for (const bool table : {false, true}) {
+          const model::ModelMemoryPlan streamed = model::plannedRuntimeMemory(
+              loaded, operators, config.kvFormat, config.stateFormat,
+              {.experts = experts && streamable.expertBytes, .tableRowBytes = table ? streamable.tableRowBytes : 0});
+          arenaBytes[experts][table] =
+              streamed.sharedPrefillPlannedAllocatedBytes + streamed.sharedDecodePlannedAllocatedBytes;
+        }
     } catch (const std::exception &error) {
       throw RuntimeResourcesError(
           RuntimeResourceStage::MemoryPlanning,
@@ -816,13 +858,31 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   };
   // The plan with the staging the tier keeps.
   const auto planMemory = [&](uint64_t aneFfnBytes) { return planWith(stateStagingBytes, aneFfnBytes); };
+
+  // The plan with the loaded model's arenas sizes the stores, and the start
+  // loads again where it gives a part another store: it loads once where the
+  // plan without the arenas already loads each part so, as for a model with
+  // no part to stream, and twice otherwise, as where the routed experts
+  // stream. Until the tier measures its volume, the plan takes the cache's
+  // quota for the room it has.
+  const StreamedMemoryResult planned = storesPlan(true);
+  if (!planned.plan)
+    throw planRefusal(planned, hardBudgetBytes);
+  const model::ModelLoadOptions next = storesOf(*planned.plan, false);
+  if (next.expertMemoryBytes != loadOptions.expertMemoryBytes ||
+      next.streamedTableBytes != loadOptions.streamedTableBytes) {
+    loadOptions = next;
+    load(true);
+  }
+  reportStreamedStores(loaded, streamable, config.expertMemory, config.pleMemory);
+
   // The automatic tier keeps its staging only where the plan holds the model
-  // and the requested context beside it, the parts as they first loaded. The
-  // split wins over it: where the plan refuses the split beside the staging
-  // but not without it, the tier turns off before the split is decided. A
-  // relaunch decides it as its first engine, an automatic start, did, so that
-  // it keeps the staging that engine kept; only its split leaves that
-  // engine's context (below).
+  // and the requested context beside it, the parts as they load. The split
+  // wins over it: where the plan refuses the split beside the staging but not
+  // without it, the tier turns off before the split is decided. A relaunch
+  // decides it as its first engine, an automatic start, did, so that it keeps
+  // the staging that engine kept; only its split leaves that engine's context
+  // (below).
   if (stateStagingBytes && automaticDisk) {
     // The model's side of the split (startAneFfn).
     const AneFfnModel splitModel =
@@ -844,39 +904,6 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
                   : std::string("the memory plan cannot hold the Neural Engine FFN split and any "
                                 "context beside its state staging"));
   }
-
-  // The plan with the loaded model's arenas sizes the automatic parts, and
-  // the start loads again where it gives one another store. The arenas rest
-  // on whether the routed experts stream, as a target whose experts stream
-  // runs its prefill commands as groups (RuntimeGeometry::prefillChunks), and
-  // not on the stores' sizes: where the plan changes whether they stream, the
-  // start loads them at their floor once more and plans with those arenas.
-  // Streaming only grows the arenas, so that plan keeps the experts as they
-  // loaded: a start loads once where the parts load as the plan without the
-  // arenas has them, twice where the experts stream through more than their
-  // floor, and three times only where they fit beside everything but the
-  // arenas, which a start that loaded every expert refused. Until the tier
-  // measures its volume, the plan takes the cache's quota for the room it
-  // has.
-  for (uint32_t pass = 0; pass < 2; ++pass) {
-    const StreamedMemoryResult planned = sizingPlan(stateStagingBytes);
-    if (!planned.plan)
-      throw planRefusal(planned, hardBudgetBytes);
-    const bool regroups = (planned.plan->expertBytes != 0) != (loadOptions.expertMemoryBytes != 0);
-    const model::ModelLoadOptions next = storesOf(*planned.plan, regroups);
-    if (next.expertMemoryBytes == loadOptions.expertMemoryBytes &&
-        next.streamedTableBytes == loadOptions.streamedTableBytes)
-      break;
-    const uint64_t sizedWith = arenaBytes();
-    loadOptions = next;
-    load(true);
-    if (regroups)
-      continue;
-    if (arenaBytes() != sizedWith)
-      throw std::logic_error("the arenas changed with the sizes of the streamed stores");
-    break;
-  }
-  reportStreamedStores(loaded, streamable, config.expertMemory, config.pleMemory);
 
   // The engine's plan with the staging the tier keeps; one that cannot hold
   // the model stops the start with its breakdown, before the tier's files

@@ -209,18 +209,26 @@ otherwise stream through a store of all that the allowance and the PLE
 table's share leave ([streamed experts](#streamed-experts)); the PLE table
 loads where the rest holds it, and otherwise streams through a row cache of
 its share, 2 GiB at most ([PLE table streaming](#ple-table-streaming)); KV and
-the states take what remains. The allowance is a block-sparse target's first
-64K tokens of KV, kept in memory. A dense target keeps the plan it has without
-streaming: its allowance is `--max-context`, so that experts stream to hold
-it, or else none, so its experts load wherever they fit; only once they stream
-does it keep the first 64K tokens too. `--expert-memory`, `--ple-memory` and
-`--sparse-kv-memory` set their own part instead, a size below the part's
-smallest store is refused, and startup logs how each part was sized. Only the
-loaded model sizes its arenas, which rest on its weights' formats, so a start
-whose plan streams the routed experts loads them at their smallest store
-first and then again with the store the plan gives them (`Weights loaded
-again`); where they fit beside everything but the arenas, which streamed
-experts enlarge with prefill groups, it loads them whole first.
+the states take what remains. The allowance is the KV of a context, in the
+fewest pages whose extents hold it as one request's KV capacity rounds them:
+a block-sparse target's first 64K tokens, kept in memory. A dense target keeps
+the plan it has without streaming: its allowance is `--max-context`, so that
+its experts load whole wherever that context fits beside them and stream to
+hold it where it does not, or else none, so its experts load wherever they
+fit; only once they stream does it keep the first 64K tokens too. The
+automatic SSD cache gives its state staging up where that alone would stream
+a part, unless the target's KV spills to it. `--expert-memory`, `--ple-memory`
+and `--sparse-kv-memory` set their own part instead; a size below the part's
+smallest store and a `--ple-memory` size for a table that cannot stream are
+refused, and startup logs how each part was sized. Only a loaded model sizes
+the arenas, which rest on its weights' formats and grow where a part
+streams: prefill groups for streamed experts, a step's staged rows for a
+streamed table. One load gives them for whatever streams, so a start loads
+its weights once where the plan without the arenas already loads each part
+as the plan with them does, as for a model with no part to stream, and
+otherwise loads them again with the stores that plan gives (`Weights loaded
+again`): routed experts the first plan streams load at their smallest store
+until then.
 
 A block-sparse target serves the window where its floors hold a request of
 that length and the SSD cache has room for its KV, and otherwise the longest
