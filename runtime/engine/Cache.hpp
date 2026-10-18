@@ -94,6 +94,9 @@ struct KvTierSnapshot final {
   // What writes not in use may take now; zero once overdrawn, and zero
   // without a write budget, when nothing is held back.
   uint64_t writeBudgetBytes = 0;
+  // How long the files' writes held back for reads a step waited for
+  // (model::DiskBudget::writesDeferredMicroseconds).
+  uint64_t writesDeferredMicroseconds = 0;
   uint64_t readBytes = 0;
   uint64_t writtenBytes = 0;
   uint64_t demotions = 0;
