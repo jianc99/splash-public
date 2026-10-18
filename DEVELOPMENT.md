@@ -310,7 +310,9 @@ when the engine exits.
 ### Persistent cache
 
 `--persistent-cache` keeps the SSD cache across restarts of the same model, so a
-restart, an upgrade or a crash keeps conversations' prefixes. It follows
+restart, an upgrade or a crash keeps conversations' prefixes; an upgrade that
+changes the model's weight images, which the namespace digests, starts its
+cache cold once. It follows
 `--max-cache-disk`, which sizes it as it does the SSD cache; it needs the SSD
 cache, so a start with `--persistent-cache` and `--max-cache-disk 0` is
 refused.
