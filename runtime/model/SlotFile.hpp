@@ -226,12 +226,13 @@ inline uint64_t DiskBudget::committedBytes() const noexcept { return 0; }
 inline bool DiskBudget::admitsSpill(uint64_t) const noexcept { return false; }
 
 // One slot a persistent file keeps from an earlier process, as its record
-// says: where it is, the size and CRC-32C of the payload its last complete
-// write stored, and the label its writer gave it.
+// says: where it is, the size of the payload its last complete write stored
+// and the CRC-32C of each of its segments (SlotFile::Options::segments), and
+// the label its writer gave it.
 struct SlotRecord final {
   uint32_t index = 0;
   uint64_t payloadBytes = 0;
-  uint32_t checksum = 0;
+  std::vector<uint32_t> checksums;
   std::vector<std::byte> label;
 };
 
@@ -245,10 +246,11 @@ struct SlotRecord final {
 // the file sees only transfers aligned to the host page (kHostPageBytes), as
 // uncached IO wants; a slot is a whole number of host pages. A slot is
 // readable only after one complete write; a failed or cancelled write leaves
-// it unreadable. A write that finds the volume full is reported to the
-// budget (DiskBudget::fullReported) and the file goes on; after one that
-// fails for any other reason, which the worker logs, the file accepts no
-// further writes. A freed slot
+// it unreadable. Beside the worker, any thread may read part of a written
+// slot straight from the file (readAt). A write that finds the volume full
+// is reported to the budget (DiskBudget::fullReported) and the file goes on;
+// after one that fails for any other reason, which the worker logs, the file
+// accepts no further writes. A freed slot
 // returns its quota at once; one that was written returns its blocks to the
 // volume (F_PUNCHHOLE) on the worker, after the operation in flight and
 // before any later one (DiskBudget). So that a
@@ -258,14 +260,15 @@ struct SlotRecord final {
 // A temporary file is unlinked at once and gone with the process. A
 // persistent file stays, with a record file beside it: one fixed-size record
 // per slot, written by the worker after the slot's write has landed, from
-// the label its writer gives the slot and the CRC-32C of the payload the
-// worker computed while writing it. A freed slot's record is cleared before
-// its blocks return. The next process reads the records, adopts the slots it
-// keeps, and frees the others; the first read of an adopted slot fails
-// unless its payload matches its record, so a slot that changed after its
-// record was written, or whose blocks never reached the drive, is a cache
-// miss and nothing worse. Slots this process wrote are trusted as a
-// temporary file's are.
+// the label its writer gives the slot and the CRC-32C of each segment of the
+// payload, which the worker computed while writing it. A freed slot's record
+// is cleared before its blocks return. The next process reads the records,
+// adopts the slots it keeps, and frees the others. A read of an adopted
+// slot fails unless each segment it covers matches its record, and the
+// worker's first read covers the whole payload, after which the slot is
+// trusted; so a slot that changed after its record was written, or whose
+// blocks never reached the drive, is a cache miss and nothing worse. Slots
+// this process wrote are trusted as a temporary file's are.
 class SlotFile final {
   struct Backing;
 
@@ -290,7 +293,8 @@ public:
     // The byte lengths of a payload's consecutive segments from its start
     // (kv::SlotFormat::segments). A persistent file keeps a CRC-32C of each,
     // which a read of an adopted slot checks for every segment it covers;
-    // empty or one, the whole payload is one segment.
+    // empty or one, the whole payload, whatever its size, is one segment.
+    // Several hold every payload of the file: a write stores their sum.
     std::vector<uint64_t> segments;
     // While it says so, the worker holds a write's next chunk back, a
     // bounded while each (model::SsdReaders::criticalBusy: reads a step
@@ -313,14 +317,18 @@ public:
     std::shared_ptr<Backing> backing_;
     uint32_t index_;
     uint64_t id_;
-    // Owned by the worker: operations on one file run in submission order.
-    bool written_ = false;
-    // In a persistent file, the size and CRC-32C of the payload the last
-    // complete write stored; an adopted slot checks its first read against
-    // them (verify_). Owned by the worker too.
+    // Set by the worker, which runs a file's operations in submission
+    // order, once a write landed; read beside it too (readAt), which then
+    // finds the fields below the write's.
+    std::atomic<bool> written_{false};
+    // The size of the payload the last complete write stored and, in a
+    // persistent file, the CRC-32C of each of its segments. Reads of an
+    // adopted slot check the segments they cover against them while verify_
+    // holds, which the worker's first read clears once the whole payload
+    // matched.
     uint64_t payloadBytes_ = 0;
-    uint32_t checksum_ = 0;
-    bool verify_ = false;
+    std::vector<uint32_t> checksums_;
+    std::atomic<bool> verify_{false};
     // Set when a write is submitted: freeing the slot then returns the
     // blocks that write may have taken.
     bool returnsBlocks_ = false;
@@ -383,8 +391,8 @@ public:
   [[nodiscard]] const std::vector<SlotRecord> &records() const noexcept { return records_; }
   // Takes back the slot a record names, before finishAdoption(). It counts
   // against the budget even past its capacity, so that the caller can give
-  // up what the quota no longer holds; its first read fails unless the
-  // payload matches the record.
+  // up what the quota no longer holds; its reads fail unless what they
+  // cover matches the record.
   [[nodiscard]] std::shared_ptr<Slot> adopt(const SlotRecord &record);
   // Ends adoption: every slot not adopted is freed, its record cleared and
   // its blocks returned. A record that cannot be cleared stays, reported,
@@ -400,25 +408,29 @@ public:
   // The process is ending: a slot dropped from now on keeps its blocks and
   // its record for the next one.
   void seal() noexcept;
-  // The spans total at most one slot and stay valid until the operation is
-  // ready. A write stores them in order from the start of the slot and zeros
-  // the rest, and takes the whole slot from the write budget as it is
-  // submitted; a read fills them from the start of the slot. A write is null
-  // once the file accepts no further writes, as acquire() is null at the
-  // limit; the write budget never makes it null.
+  // The spans total at most one slot, a write's exactly the segments in a
+  // file of several, and stay valid until the operation is ready. A write
+  // stores them in order from the start of the slot and zeros the rest, and
+  // takes the whole slot from the write budget as it is submitted; a read
+  // fills them from the start of the slot, the whole payload while an
+  // adopted slot is not yet trusted. A write is null once the file accepts
+  // no further writes, as acquire() is null at the limit; the write budget
+  // never makes it null.
   [[nodiscard]] std::shared_ptr<Operation> write(
       std::shared_ptr<Slot> slot, std::vector<std::span<const std::byte>> source,
       std::function<void()> completion);
   [[nodiscard]] std::shared_ptr<Operation> read(
       std::shared_ptr<Slot> slot, std::vector<std::span<std::byte>> destination,
       std::function<void()> completion);
-  // Reads `bytes` at `offset` of a slot on the calling thread, beside the
-  // worker, with one uncached pread into `buffer`: 4 KiB-aligned memory that
-  // holds the 4 KiB-aligned range around the bytes, widened to the whole
-  // segments it touches in an adopted slot, whose checksums it checks.
-  // Returns the bytes within `buffer`, or nothing for a slot whose write has
-  // not landed, a short or failed read or a segment that does not match.
-  // The caller holds the slot while it reads.
+  // Reads `bytes` at `offset` of a slot's payload on the calling thread,
+  // beside the worker, with one uncached pread into `buffer`: 4 KiB-aligned
+  // memory that holds the 4 KiB-aligned range around the bytes, widened to
+  // the whole segments it touches in an adopted slot, whose checksums it
+  // checks; a buffer of slotBytes() always holds it. Returns the bytes within
+  // `buffer`, or nothing for a slot whose write has not landed, bytes past
+  // its payload, a buffer that cannot hold the range, a short or failed read
+  // or a segment that does not match. The caller holds the slot while it
+  // reads, and no write of it runs meanwhile.
   [[nodiscard]] std::optional<std::span<const std::byte>>
   readAt(const Slot &slot, uint64_t offset, uint64_t bytes, std::span<std::byte> buffer) const noexcept;
 
