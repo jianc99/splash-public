@@ -1039,15 +1039,19 @@ std::function<bool(const Engine::Denial &)> Engine::spillFallback(Request &activ
                                                                   const CacheLookup *restoring) {
   if (!config_.spill.capable)
     return {};
+  // A start that converts starts as a Spill request, which completeAdmission
+  // counts, and one refused all the same decides its mode afresh at its next
+  // attempt; a lane that ran Resident before converts once.
+  const bool started = !restoring || scheduler_.suspended(active.request.id);
   // Memory on its way back comes without it.
-  return [this, &active, restoring](const Denial &denial) {
+  return [this, &active, restoring, started](const Denial &denial) {
     if (denial.pending || active.kvMode != KvMode::Resident ||
         !cache_.convertToSpill(active.request.id,
                                spillPages(active, restoring ? chainEnd(*restoring)
                                                             : chainEnd(active))))
       return false;
     active.kvMode = KvMode::Spill;
-    ++counters_.spill.converted;
+    counters_.spill.converted += started;
     return true;
   };
 }
