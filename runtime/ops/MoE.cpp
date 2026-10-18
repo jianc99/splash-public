@@ -177,18 +177,12 @@ MoeGroupParams groupParams(const MoePlan &plan) {
   const bool oneGateUp = oneGateUpPass(plan);
   MoeGroupParams params{plan.rows(), shape.expertsPerToken, plan.tileRows(), shape.experts,
                         shape.expertIntermediateSize / (oneGateUp ? GGUF_STAGED_COLUMNS : GGUF_TILE_COLUMNS),
-                        shape.hiddenSize / GGUF_TILE_COLUMNS, 0, {}};
+                        shape.hiddenSize / GGUF_TILE_COLUMNS, 0};
   // PROTOTYPE (verify length): a decode step's lanes route their verified
   // rows alone (VerifyRowsProbe.hpp).
-  if (plan.phase() == MoePhase::Decode) {
-    const VerifyRows &rows = cycleVerifyRows();
-    bool all = true;
-    for (uint32_t lane = 0; lane < rows.size(); ++lane) {
-      params.verify_rows[lane] = rows[lane];
-      all = all && rows[lane] >= SPLASH_TARGET_VERIFY_ROWS;
-    }
-    params.verify_stride = all ? 0 : SPLASH_TARGET_VERIFY_ROWS;
-  }
+  const CycleVerify &cycle = cycleVerify();
+  if (plan.phase() == MoePhase::Decode && cycle.rows && cycle.rule.limits())
+    params.verify_stride = SPLASH_TARGET_VERIFY_ROWS;
   return params;
 }
 
@@ -224,10 +218,14 @@ void MoE::addRouting(metal::CommandGraph &graph, const MoeBuffers &buffers,
   // decode step of one lane launched 65 tiles' threadgroups for a median of
   // 30 live ones; the rest return at once yet cost a 40-core M5 Max 0.8-4.1%
   // of a decode cycle, a 12-core M6 0.1-1.0% and a 40-core M3 Max up to 4.8%.
+  // PROTOTYPE (verify length): the cycle's verify rows; a grouping that
+  // routes every row binds the tile count in their place and reads nothing.
+  const MoeGroupParams group = groupParams(plan);
   graph.add(routingKernel("moe_group_routes", shape),
             {scratch.selectedExperts, scratch.tileDescriptors,
-             scratch.tileCount, scratch.groupedRoutes, scratch.routeRows},
-            groupParams(plan), {1, 1, 1}, {shape.routerWidth(), 1, 1});
+             scratch.tileCount, scratch.groupedRoutes, scratch.routeRows,
+             group.verify_stride ? cycleVerify().rows : scratch.tileCount},
+            group, {1, 1, 1}, {shape.routerWidth(), 1, 1});
 }
 
 void MoE::addRouted(metal::CommandGraph &graph, const MoeBuffers &buffers,

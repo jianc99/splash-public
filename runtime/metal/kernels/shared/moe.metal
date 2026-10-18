@@ -132,19 +132,21 @@ MOE_ROUTE_SELECT_ENTRY(moe_route_select_f32_e512, SPLASH_MOE_WIDE_EXPERT_SLOTS)
 // Slots threads, one per expert slot.
 // PROTOTYPE (verify length): whether the grouping leaves routed route
 // `route` unrouted (MoeGroupParams::verify_stride).
-inline bool moe_unverified_route(constant MoeGroupParams &params, uint route) {
+inline bool moe_unverified_route(constant MoeGroupParams &params,
+                                 device const uint *verify_rows, uint route) {
   if (!params.verify_stride)
     return false;
   const uint row = route / (params.top_k + 1);
   const uint lane = row / params.verify_stride;
-  return lane < 4 && row % params.verify_stride >= params.verify_rows[lane];
+  return lane < SPLASH_MAXIMUM_BATCH_WIDTH &&
+         row % params.verify_stride >= verify_rows[lane];
 }
 
 template <uint Slots>
 inline void moe_group_routes_phase(
     device const uint *selected, device MoeTileDescriptor *tiles, device MoeTileCount *tile_count,
-    device uint *grouped_routes, device uint *route_rows, constant MoeGroupParams &params,
-    uint thread_index, uint simd_lane, uint simd_group, threadgroup atomic_uint *counts,
+    device uint *grouped_routes, device uint *route_rows, device const uint *verify_rows,
+    constant MoeGroupParams &params, uint thread_index, uint simd_lane, uint simd_group, threadgroup atomic_uint *counts,
     threadgroup atomic_uint *cursors, threadgroup uint *tile_offsets, threadgroup uint *simd_totals,
     threadgroup uint &routed_tiles) {
   const uint routes_per_row = params.top_k + 1;
@@ -154,7 +156,7 @@ inline void moe_group_routes_phase(
   threadgroup_barrier(mem_flags::mem_threadgroup);
   for (uint route = thread_index; route < routes; route += Slots) {
     if (route % routes_per_row != params.top_k &&
-        !moe_unverified_route(params, route)) {
+        !moe_unverified_route(params, verify_rows, route)) {
       atomic_fetch_add_explicit(&counts[selected[route]], 1u,
                                 memory_order_relaxed);
     }
@@ -189,7 +191,7 @@ inline void moe_group_routes_phase(
   for (uint route = thread_index; route < routes; route += Slots) {
     if (route % routes_per_row == params.top_k)
       continue;
-    if (moe_unverified_route(params, route)) {
+    if (moe_unverified_route(params, verify_rows, route)) {
       route_rows[route] = ~0u;
       continue;
     }
@@ -236,7 +238,8 @@ inline void moe_group_routes_phase(
       device MoeTileCount *tile_count [[buffer(2)]],                           \
       device uint *grouped_routes [[buffer(3)]],                               \
       device uint *route_rows [[buffer(4)]],                                   \
-      constant MoeGroupParams &params [[buffer(5)]],                           \
+      device const uint *verify_rows [[buffer(5)]],                            \
+      constant MoeGroupParams &params [[buffer(6)]],                           \
       uint thread_index [[thread_index_in_threadgroup]],                       \
       uint simd_lane [[thread_index_in_simdgroup]],                            \
       uint simd_group [[simdgroup_index_in_threadgroup]]) {                    \
@@ -246,7 +249,8 @@ inline void moe_group_routes_phase(
     threadgroup uint simd_totals[Slots / 32];                                  \
     threadgroup uint routed_tiles;                                             \
     moe_group_routes_phase<Slots>(selected, tiles, tile_count, grouped_routes, \
-                                  route_rows, params, thread_index, simd_lane, \
+                                  route_rows, verify_rows, params,             \
+                                  thread_index, simd_lane,                     \
                                   simd_group, counts, cursors, tile_offsets,   \
                                   simd_totals, routed_tiles);                  \
   }

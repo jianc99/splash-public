@@ -28,6 +28,8 @@ struct DraftSelectorBuffers final {
   metal::MetalBuffer uniforms;
   metal::MetalBuffer proposedTokens;
   metal::MetalBuffer proposalProbabilities;
+  // PROTOTYPE (verify length): each lane's verify rows, one uint32 per lane.
+  metal::MetalBuffer verifyRows;
 };
 
 // The draft's selector codebooks, which score the edge from a proposal

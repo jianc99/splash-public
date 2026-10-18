@@ -317,6 +317,8 @@ enum class DecodeTensor : uint32_t {
   OutputTokens,
   RetainedCount,
   AcceptedCount,
+  // PROTOTYPE (verify length): the lane's verify rows (DraftSelector).
+  VerifyRows,
   DraftInputTokens,
   DraftHidden0,
   DraftHidden1,

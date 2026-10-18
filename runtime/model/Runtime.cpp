@@ -121,18 +121,26 @@ public:
     return probe;
   }
 
-  // The rows request `id` verifies this cycle.
-  uint32_t rows(uint64_t id) {
+  // The cycle's rule for lane `lane`, request `id`: its rows cap, and the
+  // selector's threshold.
+  void fill(ops::VerifyRule &rule, uint32_t lane, uint64_t id) {
     std::lock_guard lock(mutex_);
     refresh();
-    if (mode_ == Mode::Fixed) return fixed_;
-    if (mode_ == Mode::Ema) {
+    rule.cap[lane] = kDecodeRows;
+    if (mode_ == Mode::Fixed) {
+      rule.cap[lane] = fixed_;
+    } else if (mode_ == Mode::Ema) {
       const auto found = ema_.find(id);
       const double recent = found == ema_.end() ? 8.0 : found->second;
       const double wanted = std::ceil(recent + margin_);
-      return static_cast<uint32_t>(std::clamp(wanted, double(minimum_), double(kDecodeRows)));
+      rule.cap[lane] = static_cast<uint32_t>(std::clamp(wanted, double(minimum_), double(kDecodeRows)));
+    } else if (mode_ == Mode::Confidence) {
+      rule.threshold = float(threshold_);
+      rule.cumulative = cumulative_;
+      rule.extra = extra_;
+      rule.minimum = minimum_;
+      rule.cap[lane] = fixed_;
     }
-    return kDecodeRows;
   }
 
   bool logging() const noexcept { return log_ != nullptr; }
@@ -164,7 +172,7 @@ public:
   }
 
 private:
-  enum class Mode : uint8_t { All, Fixed, Ema };
+  enum class Mode : uint8_t { All, Fixed, Ema, Confidence };
 
   VerifyLengthProbe() {
     if (const char *path = std::getenv("SPLASH_PROTO_VERIFY_CTL")) control_ = path;
@@ -186,9 +194,21 @@ private:
     FILE *file = std::fopen(control_.c_str(), "r");
     if (!file) return;
     char word[16] = {};
-    double a = 0, b = 0;
-    const int read = std::fscanf(file, "%15s %lf %lf", word, &a, &b);
+    double a = 0, b = 0, c = 0, e = 0, f = 0;
+    const int read = std::fscanf(file, "%15s %lf %lf %lf %lf %lf", word, &a, &b, &c, &e, &f);
     std::fclose(file);
+    // "conf TAU CUMULATIVE EXTRA MIN CAP": the selector's rule
+    // (SelectorBatchParams::verify_threshold).
+    if (read >= 6 && std::string_view(word) == "conf" && a > 0 && e >= 1 && f >= e && f <= kDecodeRows) {
+      mode_ = Mode::Confidence;
+      threshold_ = a;
+      cumulative_ = b != 0;
+      extra_ = static_cast<uint32_t>(c);
+      minimum_ = static_cast<uint32_t>(e);
+      fixed_ = static_cast<uint32_t>(f);
+      std::fprintf(stderr, "verify-length probe: conf %g %g %g %g %g\n", a, b, c, e, f);
+      return;
+    }
     if (read >= 2 && std::string_view(word) == "k" && a >= 1 && a <= kDecodeRows) {
       mode_ = Mode::Fixed;
       fixed_ = static_cast<uint32_t>(a);
@@ -208,12 +228,15 @@ private:
   uint32_t fixed_ = kDecodeRows;
   double margin_ = 0;
   uint32_t minimum_ = 2;
+  double threshold_ = 0;
+  uint32_t cumulative_ = 0;
+  uint32_t extra_ = 0;
   std::unordered_map<uint64_t, double> ema_;
 };
 
 // Every lane verifies all its rows outside a decode cycle's encoding.
 struct VerifyRowsScope final {
-  ~VerifyRowsScope() { ops::cycleVerifyRows().fill(kDecodeRows); }
+  ~VerifyRowsScope() { ops::cycleVerify() = {}; }
 };
 
 bool isStopToken(const RuntimeGeometry &geometry, uint32_t token) noexcept {
@@ -437,8 +460,10 @@ struct Runtime::Impl {
     uint32_t accepted = 0;
     uint32_t currentAnchor = 0;
     uint32_t maximumRetained = 0;
-    // PROTOTYPE (verify length): the rows the lane verifies.
+    // PROTOTYPE (verify length): the rows the lane verified (the selector
+    // wrote them), and the cycle's rule.
     uint32_t verifyRows = kDecodeRows;
+    ops::VerifyRule verifyRule;
     // The draft proposals the lane's thinking end replaced, which its
     // speculation counts leave out.
     uint32_t endDrafts = 0;
@@ -1891,7 +1916,7 @@ struct Runtime::Impl {
          d(DecodeTensor::TopPartialValues), d(DecodeTensor::Candidates),
          d(DecodeTensor::Unary), d(DecodeTensor::SelectorHidden),
          d(DecodeTensor::SamplingUniforms), d(DecodeTensor::ProposedTokens),
-         d(DecodeTensor::ProposalProbs)},
+         d(DecodeTensor::ProposalProbs), d(DecodeTensor::VerifyRows)},
         std::span(anchors).first(lanes), std::span(policies).first(lanes));
     sampling.addThinkingDrafts(graph, std::span(policies).first(lanes),
                                d(DecodeTensor::ProposedTokens));
@@ -2046,7 +2071,8 @@ struct Runtime::Impl {
          decodeArena->batchSlice(DecodeTensor::SamplingUniforms, width),
          decodeArena->batchSlice(DecodeTensor::OutputTokens, width),
          decodeArena->batchSlice(DecodeTensor::RetainedCount, width),
-         decodeArena->batchSlice(DecodeTensor::AcceptedCount, width)},
+         decodeArena->batchSlice(DecodeTensor::AcceptedCount, width),
+         decodeArena->batchSlice(DecodeTensor::VerifyRows, width)},
         maximumRetained, std::span(policies).first(width),
         geometry.target.stopTokens[0], geometry.target.stopTokens[1]);
   }
@@ -2162,6 +2188,7 @@ struct Runtime::Impl {
                                                 "GPU retained token count");
       laneResult.accepted = *contents<uint32_t>(d(DecodeTensor::AcceptedCount),
                                                 "GPU accepted draft count");
+      laneResult.verifyRows = *contents<uint32_t>(d(DecodeTensor::VerifyRows), "GPU verify rows");
       if (!laneResult.retained || laneResult.retained > kDecodeRows)
         throw std::runtime_error("target policy produced invalid retention");
       if (laneResult.accepted > kDraftProposalTokens)
@@ -2290,7 +2317,8 @@ struct Runtime::Impl {
         CommandGraph target;
         const uint32_t width = static_cast<uint32_t>(lanes_.size());
         const VerifyRowsScope verifyRowsScope;
-        for (uint32_t lane = 0; lane < width; ++lane) ops::cycleVerifyRows()[lane] = lanes_[lane].verifyRows;
+        ops::cycleVerify() = {lanes_[0].verifyRule,
+                              impl_.decodeArena->batchSlice(DecodeTensor::VerifyRows, width)};
         impl_.encodeBatchVerifyInput(target, width);
         impl_.encodeBatchEmbedding(target, DecodeTensor::InputTokens,
                                    DecodeTensor::Hidden0, width);
@@ -2882,6 +2910,7 @@ Runtime::decodeAsync(const BatchPlan &plan,
   std::array<Impl::Request *, kLaneCount> requests{};
   std::array<uint64_t, kLaneCount> logicalPositions{};
   std::array<uint32_t, kLaneCount> maximumRetained{};
+  ops::VerifyRule verifyRule;
   for (uint32_t lane = 0; lane < width; ++lane) {
     const ModelBatchItem &item = items[lane];
     Impl::Request &entry = impl_->request(item.requestId);
@@ -2916,8 +2945,8 @@ Runtime::decodeAsync(const BatchPlan &plan,
     Impl::DecodeLaneResult &laneResult = lanes[lane];
     laneResult.request = &entry;
     laneResult.currentAnchor = *entry.pendingToken;
-    laneResult.verifyRows = VerifyLengthProbe::instance().rows(entry.id);
-    laneResult.maximumRetained = std::min({remaining, kDecodeRows, laneResult.verifyRows});
+    VerifyLengthProbe::instance().fill(verifyRule, lane, entry.id);
+    laneResult.maximumRetained = std::min({remaining, kDecodeRows, verifyRule.cap[lane]});
     if (const auto cutoff = Impl::samplingPolicy(entry).thinkingCutoff)
       laneResult.endDrafts = cutoff->replacedProposals();
 
@@ -2929,7 +2958,8 @@ Runtime::decodeAsync(const BatchPlan &plan,
 
   const std::span<Impl::Request *const> entries(requests.data(), width);
   const VerifyRowsScope verifyRowsScope;
-  for (uint32_t lane = 0; lane < width; ++lane) ops::cycleVerifyRows()[lane] = lanes[lane].verifyRows;
+  for (uint32_t lane = 0; lane < width; ++lane) lanes[lane].verifyRule = verifyRule;
+  ops::cycleVerify() = {verifyRule, impl_->decodeArena->batchSlice(DecodeTensor::VerifyRows, width)};
   const uint32_t ropeRows = width * kDecodeRows;
   CommandGraph commandGraph;
   impl_->addRopeTables(

@@ -161,16 +161,27 @@ static_assert(sizeof(ThinkingCutoffParams) == 220,
 // The batched selector and acceptance kernels' grids cover exactly the
 // dispatch's lanes: per-lane arrays hold those lanes, and entries past them
 // are zero and unread.
+// PROTOTYPE (verify length): draft_select_dflash also writes each lane's
+// verify rows: verify_cap[lane] when verify_threshold is 0; else the anchor
+// and the leading proposals whose selector probability (the softmax of the
+// position's 16 candidate scores at temperature 1; with verify_cumulative,
+// the running product of those) is at least verify_threshold, plus
+// verify_extra, within [verify_minimum, verify_cap[lane]].
 struct SelectorBatchParams {
   uint32_t anchor[SPLASH_MAXIMUM_BATCH_WIDTH];
   float temperature[SPLASH_MAXIMUM_BATCH_WIDTH];
   uint32_t lanes;
   uint32_t sampling_mask;
   uint32_t vocabulary;
+  float verify_threshold;
+  uint32_t verify_cumulative;
+  uint32_t verify_extra;
+  uint32_t verify_minimum;
+  uint32_t verify_cap[SPLASH_MAXIMUM_BATCH_WIDTH];
 };
 
-static_assert(sizeof(SelectorBatchParams) == 44,
-              "Draft selector parameters are 44 bytes on both sides");
+static_assert(sizeof(SelectorBatchParams) == 76,
+              "Draft selector parameters are 76 bytes on both sides");
 
 struct AcceptBatchParams {
   uint32_t remaining[SPLASH_MAXIMUM_BATCH_WIDTH];

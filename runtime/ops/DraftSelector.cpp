@@ -2,6 +2,7 @@
 
 #include "metal/abi/Sampling.h"
 #include "ops/BufferExtent.hpp"
+#include "ops/VerifyRowsProbe.hpp"
 
 #include <bit>
 #include <stdexcept>
@@ -52,6 +53,14 @@ void DraftSelector::add(metal::CommandGraph &graph,
     if (policies[lane].samples())
       params.sampling_mask |= uint32_t{1} << lane;
   }
+  // PROTOTYPE (verify length): the cycle's rule (VerifyRowsProbe.hpp).
+  const VerifyRule &rule = cycleVerify().rule;
+  params.verify_threshold = rule.threshold;
+  params.verify_cumulative = rule.cumulative;
+  params.verify_extra = rule.extra;
+  params.verify_minimum = rule.minimum;
+  for (uint32_t lane = 0; lane < SPLASH_MAXIMUM_BATCH_WIDTH; ++lane) params.verify_cap[lane] = rule.cap[lane];
+  requireBytes(buffers.verifyRows, uint64_t{lanes} * sizeof(uint32_t), "verify rows");
   // A lane's proposal positions take rows 1-7 of its eight query rows of the
   // logits and the selector hidden rows; a sampling lane draws its proposals
   // with its proposal uniforms and writes their candidates' probabilities.
@@ -86,7 +95,7 @@ void DraftSelector::add(metal::CommandGraph &graph,
   graph.add("draft_select_dflash",
             {buffers.candidates, buffers.unary, buffers.partialValues,
              buffers.uniforms, buffers.proposedTokens,
-             buffers.proposalProbabilities},
+             buffers.proposalProbabilities, buffers.verifyRows},
             params, {lanes, 1, 1}, {1, 1, 1});
 }
 

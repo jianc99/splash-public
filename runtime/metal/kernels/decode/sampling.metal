@@ -1311,7 +1311,8 @@ kernel void draft_select_dflash(
     device const float *partial_values [[buffer(2)]],
     device const float *uniforms [[buffer(3)]],
     device uint *tokens [[buffer(4)]], device float *q_probs [[buffer(5)]],
-    constant SelectorBatchParams &params [[buffer(6)]],
+    device uint *verify_rows [[buffer(6)]],
+    constant SelectorBatchParams &params [[buffer(7)]],
     uint batch [[thread_position_in_grid]]) {
   constexpr ulong Positions = SPLASH_DRAFT_PROPOSAL_TOKENS;
   constexpr ulong Shards = SPLASH_DRAFT_SAMPLING_SHARDS;
@@ -1327,6 +1328,11 @@ kernel void draft_select_dflash(
 
   const bool sampling = (params.sampling_mask & (1u << batch)) != 0;
   uint predecessor_index = 0;
+  // PROTOTYPE (verify length): the anchor and the leading confident
+  // proposals (SelectorBatchParams::verify_threshold).
+  uint confident_rows = 1;
+  bool confident = true;
+  float running = 1.0f;
   for (uint position = 0; position < Positions; ++position) {
     device const float *edges =
         tables + (position * Candidates + predecessor_index) * Candidates;
@@ -1362,9 +1368,28 @@ kernel void draft_select_dflash(
           selected = i;
       }
     }
+    if (confident && params.verify_threshold > 0.0f) {
+      float best = scores[0];
+      for (uint i = 1; i < Candidates; ++i)
+        best = max(best, scores[i]);
+      float sum = 0.0f;
+      for (uint i = 0; i < Candidates; ++i)
+        sum += exp(scores[i] - best);
+      const float probability = exp(scores[selected] - best) / sum;
+      running *= probability;
+      if ((params.verify_cumulative ? running : probability) >= params.verify_threshold)
+        ++confident_rows;
+      else
+        confident = false;
+    }
     predecessor_index = selected;
     tokens[position] = candidates[position * Candidates + selected];
   }
+  const uint cap = params.verify_cap[batch];
+  verify_rows[batch] =
+      params.verify_threshold > 0.0f
+          ? clamp(confident_rows + params.verify_extra, params.verify_minimum, cap)
+          : cap;
 }
 
 inline float sparse_lookup(device const uint *ids,
@@ -1604,9 +1629,11 @@ kernel void decode_accept_dflash(
     device uint *target_tokens [[buffer(5)]],
     device uint *retained [[buffer(6)]],
     device uint *accepted_count [[buffer(7)]],
-    constant AcceptBatchParams &params [[buffer(8)]],
+    device const uint *verify_rows [[buffer(8)]],
+    constant AcceptBatchParams &params [[buffer(9)]],
     uint batch [[threadgroup_position_in_grid]]) {
-  uint remaining = params.remaining[batch];
+  // PROTOTYPE (verify length): a lane retains at most its verified rows.
+  uint remaining = min(params.remaining[batch], verify_rows[batch]);
   AcceptParams lane_params{remaining, params.stop_token_0,
                            params.stop_token_1};
   device const uint *lane_draft =

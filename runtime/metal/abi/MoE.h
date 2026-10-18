@@ -61,8 +61,9 @@ inline bool moe_column_tile(Tiles tiles, uint32_t t) {
 // writes (MoeTileCount).
 // PROTOTYPE (verify length): with verify_stride set (a decode step's
 // SPLASH_TARGET_VERIFY_ROWS), row r of lane r / verify_stride routes no
-// expert when r % verify_stride >= verify_rows[lane] (its routed routes keep
-// route row ~0u, which the combine skips); 0 routes every row.
+// expert when r % verify_stride >= the lane's verify rows (the grouping's
+// verify_rows buffer, which the draft selector wrote); its routed routes keep
+// route row ~0u, which the combine skips. 0 routes every row.
 struct MoeGroupParams {
   uint32_t rows;
   uint32_t top_k;
@@ -71,11 +72,10 @@ struct MoeGroupParams {
   uint32_t gate_up_columns;
   uint32_t down_columns;
   uint32_t verify_stride;
-  uint32_t verify_rows[4];
 };
 
-static_assert(sizeof(MoeGroupParams) == 44,
-              "MoE grouping parameters are 44 bytes on both sides");
+static_assert(sizeof(MoeGroupParams) == 28,
+              "MoE grouping parameters are 28 bytes on both sides");
 
 // What the grouping writes besides the tiles: their count, which every pass
 // over them reads first, and the grids (column tiles, tiles, 1) of the
