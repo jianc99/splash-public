@@ -1,4 +1,5 @@
 #include "model/ExpertStore.hpp"
+#include "metal/StallDiag.hpp"
 
 #include "metal/abi/MoE.h"
 #include "model/GgufImageLayout.hpp"
@@ -10,6 +11,7 @@
 #include "model/WeightSource.hpp"
 
 #include <algorithm>
+#include <cstdio>
 #include <array>
 #include <atomic>
 #include <cstring>
@@ -456,6 +458,17 @@ const ExpertStore::Impl::Group &ExpertStore::Impl::addGroup(Reads &reads, uint32
 }
 
 void ExpertStore::Impl::readPiece(const Group &group, const Piece &piece) const {
+  const double started = diag::nowSeconds();
+  struct Slow {
+    const Group &group;
+    const Piece &piece;
+    double started;
+    ~Slow() {
+      if (const double took = diag::nowSeconds() - started; took > 0.5)
+        diag::log("expert read %.3f s: block %u expert %u z %u bytes [%llu, %llu)", took, group.block, group.expert,
+                  piece.z, static_cast<unsigned long long>(piece.from), static_cast<unsigned long long>(piece.to));
+    }
+  } slow{group, piece, started};
   const Run &run = group.runs[piece.z];
   const std::span<uint8_t> to{static_cast<uint8_t *>(staging.contents()) + run.at + piece.from, piece.to - piece.from};
   if (run.file) return run.file->readFile(run.offset + piece.from, to);
@@ -492,6 +505,8 @@ void ExpertStore::Impl::stage(uint32_t index, uint32_t capacity, ExpertStoreStat
   const std::vector<Piece> &aheadPieces = ahead.reads.pieces;
   const SsdReaders::Batch *batch = ahead.batch.get();
   const auto reading = [&](size_t piece) { return piece < batch->taken() && !batch->ended(piece); };
+  const double yieldStart = diag::nowSeconds();
+  size_t yieldedPieces = 0;
   for (size_t piece = 0, end = 0; batch && piece < aheadPieces.size(); piece = end) {
     const uint32_t at = aheadPieces[piece].group;
     const Group &group = ahead.reads.groups[at];
@@ -499,6 +514,7 @@ void ExpertStore::Impl::stage(uint32_t index, uint32_t capacity, ExpertStoreStat
     const bool routed = ahead.block == index && waiting[group.expert];
     bool ended = true;
     for (size_t rest = piece; rest < end; ++rest) {
+      yieldedPieces += routed && reading(rest);
       while (routed && reading(rest)) std::this_thread::yield();
       ended = ended && !reading(rest);
     }
@@ -543,12 +559,20 @@ void ExpertStore::Impl::stage(uint32_t index, uint32_t capacity, ExpertStoreStat
     }
     at += count;
   }
+  if (const double took = diag::nowSeconds() - yieldStart; took > 0.5)
+    diag::log("expert stage waited %.3f s for %zu read-ahead pieces of block %u (%zu ahead pieces); readers %s", took,
+              yieldedPieces, index, aheadPieces.size(), readers->debugQueue().c_str());
   std::atomic<uint64_t> bytes = 0;
+  const std::string queueBefore = readers->debugQueue();
+  const double runStart = diag::nowSeconds();
   readers->run(now.pieces.size(), [&](size_t task) {
     const Piece &piece = now.pieces[task];
     readPiece(now.groups[piece.group], piece);
     bytes += piece.to - piece.from;
   });
+  if (const double took = diag::nowSeconds() - runStart; took > 0.5)
+    diag::log("expert stage read %zu pieces, %llu bytes of block %u in %.3f s; readers before: %s", now.pieces.size(),
+              static_cast<unsigned long long>(bytes.load()), index, took, queueBefore.c_str());
   use.readBytes += bytes;
   // What the load read is the sources' as they were opened.
   if (!staged.empty())
@@ -606,10 +630,19 @@ void ExpertStore::Impl::planAhead(uint32_t index, std::span<const uint32_t> expe
 // where a throw would outlive the command, so it does not throw: an error
 // becomes the store's failure, which the next load reports.
 void ExpertStore::Impl::startAhead() {
+  diag::stepKind = "expert startAhead (then)";
+  const double lockStart = diag::nowSeconds();
   std::lock_guard lock(mutex);
+  if (const double took = diag::nowSeconds() - lockStart; took > 0.5)
+    diag::log("expert startAhead waited %.3f s for the store", took);
   if (plan.block == kNoSlot) return;
   try {
+    const std::string queueBefore = readers->debugQueue();
+    const double retireStart = diag::nowSeconds();
     retireAhead();
+    if (const double took = diag::nowSeconds() - retireStart; took > 0.5)
+      diag::log("expert startAhead retired the last read-ahead in %.3f s; readers before: %s", took,
+                queueBefore.c_str());
     uint32_t place = 0;
     for (const uint32_t expert : plan.experts) {
       while (place < places.count && taken[place]) ++place;
@@ -746,7 +779,14 @@ void ExpertStore::Impl::publish() {
 void ExpertStore::Impl::load(uint32_t index, ops::MoePhase phase, uint32_t rows, bool predicted,
                              std::span<const PartTiles> parts, uint32_t round, uint32_t rounds,
                              const metal::MetalBuffer &verifyRows) {
+  static thread_local char kind[96];
+  std::snprintf(kind, sizeof(kind), "expert load block %u round %u of %u, %s %u rows", index, round, rounds,
+                phase == ops::MoePhase::Decode ? "decode" : "prefill", rows);
+  diag::stepKind = kind;
+  const double lockStart = diag::nowSeconds();
   std::lock_guard lock(mutex);
+  if (const double took = diag::nowSeconds() - lockStart; took > 0.5)
+    diag::log("expert load waited %.3f s for the store", took);
   // No job runs until the round's are staged; the last round's ran.
   static_cast<uint32_t *>(grid.contents())[1] = 0;
   staged.clear();
@@ -808,6 +848,7 @@ void ExpertStore::Impl::load(uint32_t index, ops::MoePhase phase, uint32_t rows,
 }
 
 void ExpertStore::Impl::readBlockAhead(uint32_t index, ops::MoePhase phase) {
+  diag::stepKind = "expert readBlockAhead";
   std::lock_guard lock(mutex);
   if (!failure.empty()) throw std::runtime_error("expert store failed earlier: " + failure);
   // The GPU repacked the load's last round: no place is taken.

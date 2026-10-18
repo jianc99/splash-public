@@ -1,4 +1,5 @@
 #include "model/SparseRowStore.hpp"
+#include "metal/StallDiag.hpp"
 #include "model/WeightSource.hpp"
 #include "AwakeClock.hpp"
 
@@ -300,6 +301,10 @@ struct SparseRowStore::Impl {
     const auto started = Clock::now();
     reader->read(table.offset + uint64_t{id} * table.rowBytes, {destination, table.rowBytes});
     readLatency.add(nanosecondsSince(started));
+    if (const double took = std::chrono::duration<double>(Clock::now() - started).count(); took > 0.5)
+      diag::log("ple read %.3f s: row %u, offset %llu, %u bytes", took, id,
+                static_cast<unsigned long long>(table.offset + uint64_t{id} * table.rowBytes),
+                static_cast<unsigned>(table.rowBytes));
     readBytes.fetch_add(table.rowBytes, std::memory_order_relaxed);
   }
   void count(const SsdReaders::Tally &tally) {
@@ -430,7 +435,14 @@ SparseRowStageResult SparseRowStore::stage(std::span<const uint32_t> ids, std::s
   if (ids.size() > std::numeric_limits<uint32_t>::max())
     throw std::invalid_argument("too many rows staged at once");
   if (s.poisoned.load(std::memory_order_acquire)) s.throwPoisoned();
-  if (adoptPrefetch) s.adoptPrefetches();
+  diag::stepKind = "ple stage";
+  if (adoptPrefetch) {
+    const std::string queueBefore = s.options.readers->debugQueue();
+    const double adoptStart = diag::nowSeconds();
+    s.adoptPrefetches();
+    if (const double took = diag::nowSeconds() - adoptStart; took > 0.5)
+      diag::log("ple stage adopted prefetches in %.3f s; readers before: %s", took, queueBefore.c_str());
+  }
   if (s.poisoned.load(std::memory_order_acquire)) s.throwPoisoned();
   try {
     s.reader->checkUnchanged();
@@ -472,9 +484,14 @@ SparseRowStageResult SparseRowStore::stage(std::span<const uint32_t> ids, std::s
     // No reader writes into `rows` once the reads returned.
     SsdReaders::Tally tally;
     try {
+      const std::string queueBefore = s.options.readers->debugQueue();
+      const double runStart = diag::nowSeconds();
       s.options.readers->run(
           s.missing.size(), [&](size_t index) { s.readRow(s.unique[s.missing[index]], s.destinations[index]); },
           &tally);
+      if (const double took = diag::nowSeconds() - runStart; took > 0.5)
+        diag::log("ple stage read %zu rows in %.3f s; readers before: %s", s.missing.size(), took,
+                  queueBefore.c_str());
       s.count(tally);
       s.reader->checkUnchanged();
     } catch (const std::exception &error) {

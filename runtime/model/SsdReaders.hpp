@@ -41,6 +41,7 @@
 #include <mutex>
 #include <thread>
 #include <utility>
+#include <string>
 #include <vector>
 
 namespace splash::model {
@@ -138,6 +139,8 @@ public:
   // its own (Batch::failed).
   void finish(Batch &batch);
 
+  // Diagnostics: the batches queued now and in the background and their tasks left.
+  [[nodiscard]] std::string debugQueue();
   [[nodiscard]] unsigned readers() const noexcept { return static_cast<unsigned>(threads_.size()); }
   // A batch runs now, from its start until its last task ended: a step waits
   // for reads, which writes to the same drive yield to.

@@ -1,4 +1,5 @@
 #import "MetalBackend.hpp"
+#include "metal/StallDiag.hpp"
 #include "AwakeClock.hpp"
 #include "CommandWatchdog.hpp"
 #include "Residency.hpp"
@@ -647,10 +648,17 @@ private:
                 id<MTLCommandBuffer> before = step.before;
                 bool worked = false;
                 std::optional<double> returned;
-                if (before && reached(event, step.ready, before) &&
-                    before.status != MTLCommandBufferStatusError) {
+                const double waitStart = diag::nowSeconds();
+                const bool ready = before && reached(event, step.ready, before) &&
+                                   before.status != MTLCommandBufferStatusError;
+                if (const double waited = diag::nowSeconds() - waitStart; waited > 2.0)
+                    diag::log("runner waited %.3f s for the GPU before step %llu of command %llu (ready %d)", waited,
+                              static_cast<unsigned long long>(step.ready), static_cast<unsigned long long>(steps.sequence),
+                              ready);
+                if (ready) {
                     const double pickup = awakeSeconds();
                     steps.backend->progressSubmission(steps.sequence, pickup);
+                    diag::stepKind = "unlabeled";
                     try {
                         step.work();
                         worked = true;
@@ -661,6 +669,10 @@ private:
                     }
                     returned = awakeSeconds();
                     steps.ran(step, pickup, *returned);
+                    if (*returned - pickup > 0.5)
+                        diag::log("host step work %.3f s, %s, step %llu of command %llu", *returned - pickup,
+                                  diag::stepKind, static_cast<unsigned long long>(step.ready),
+                                  static_cast<unsigned long long>(steps.sequence));
                 } else if (stopping_) {
                     steps.fail("host step not run: the backend stopped");
                 }
@@ -670,7 +682,12 @@ private:
                 if (returned) steps.backend->progressSubmission(steps.sequence, *returned);
                 if (worked && step.then) {
                     try {
+                        const double thenStart = diag::nowSeconds();
                         step.then();
+                        if (const double took = diag::nowSeconds() - thenStart; took > 0.5)
+                            diag::log("host step then %.3f s, %s, step %llu of command %llu", took, diag::stepKind,
+                                      static_cast<unsigned long long>(step.ready),
+                                      static_cast<unsigned long long>(steps.sequence));
                     } catch (...) {
                         steps.backend->markUnhealthy("Metal host step's then threw an exception");
                     }
@@ -730,6 +747,37 @@ struct CommandTicket::State {
         timing.wallSeconds =
             std::chrono::duration<double>(wallEnd - wallStart).count();
 
+        {
+            // Diagnostics: a failed command's, or one with a buffer over 2 s, whole timeline.
+            std::vector<id<MTLCommandBuffer>> all(leadingCommands.begin(), leadingCommands.end());
+            all.push_back(command);
+            double longest = 0.0;
+            bool failedBuffer = false;
+            for (id<MTLCommandBuffer> buffer : all) {
+                longest = std::max(longest, buffer.GPUEndTime - buffer.GPUStartTime);
+                failedBuffer = failedBuffer || buffer.status == MTLCommandBufferStatusError;
+            }
+            const std::string hostFailure = hostSteps ? hostSteps->firstFailure() : std::string();
+            if (failedBuffer || !hostFailure.empty() || longest > 2.0) {
+                diag::log("command %llu ended: failed buffer %d, host failure '%s', %zu buffers, longest %.3f s, "
+                          "now %.6f", static_cast<unsigned long long>(sequence), failedBuffer, hostFailure.c_str(),
+                          all.size(), longest, awakeSeconds());
+                for (size_t index = 0; index < all.size(); ++index) {
+                    id<MTLCommandBuffer> buffer = all[index];
+                    diag::log("  buffer %zu status %d gpu %.6f .. %.6f (%.3f s) %s", index,
+                              static_cast<int>(buffer.status), buffer.GPUStartTime, buffer.GPUEndTime,
+                              buffer.GPUEndTime - buffer.GPUStartTime,
+                              buffer.error ? buffer.error.localizedDescription.UTF8String : "");
+                }
+                if (hostSteps) {
+                    std::lock_guard lock(hostSteps->mutex);
+                    for (const HostSteps::Step &step : hostSteps->steps)
+                        diag::log("  step %llu pickup %.6f done %.6f work %.3f s",
+                                  static_cast<unsigned long long>(step.ready), step.pickup, step.done,
+                                  step.done - step.pickup);
+                }
+            }
+        }
         std::string error;
         // The first buffer that failed names the error: the buffers after a
         // failed one still run, as its signal is delivered (EventStep). A

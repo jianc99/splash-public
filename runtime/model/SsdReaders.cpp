@@ -161,6 +161,18 @@ void SsdReaders::runNow(const std::shared_ptr<Batch> &batch) {
   if (background) wake_.notify_all();
 }
 
+std::string SsdReaders::debugQueue() {
+  const std::lock_guard lock(mutex_);
+  size_t nowLeft = 0, backgroundLeft = 0;
+  for (const auto &batch : now_)
+    nowLeft += batch->limit_ > batch->next_ ? batch->limit_ - batch->next_ : 0;
+  for (const auto &batch : background_)
+    backgroundLeft += batch->limit_ > batch->next_ ? batch->limit_ - batch->next_ : 0;
+  return "now " + std::to_string(now_.size()) + " batches/" + std::to_string(nowLeft) + " tasks left, background " +
+         std::to_string(background_.size()) + "/" + std::to_string(backgroundLeft) + ", running " +
+         std::to_string(running_->load());
+}
+
 void SsdReaders::wakeReaders(size_t count) {
   if (count >= threads_.size()) wake_.notify_all();
   else
