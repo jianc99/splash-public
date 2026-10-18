@@ -3259,6 +3259,39 @@ void testDroppedLeaseLooksUpAgain() {
           "a start that dropped its lease recomputed the state the reclaim wrote");
 }
 
+// The host's refusal never makes a start drop its own lease: alone, with
+// nothing to reuse, it waits for the pressure to lift, since the fallback
+// that lets the lease go answers only a refusal nothing will lift, and then
+// resumes from its cached state.
+void testHostRefusedStartKeepsItsLease() {
+  test::TestKvStorage storage(16, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache cache(pool, nullptr, nullptr);
+  Executor executor(1);
+  Events events;
+  bool paused = false;
+  engine::Engine engine(test::engineConfig({.growthPaused = [&] { return paused; }}), cache,
+                        executor, events);
+  guardReleases(storage, engine);
+  const std::vector<uint32_t> prompt(65, 1);
+  double now = 1;
+  engine.submit(request(1, prompt));
+  tickUntil(engine, now, [&] { return idle(engine); }, "the first request did not finish");
+  paused = true;
+  executor.beginAllocationFailure = metal::AllocationFailure::HostPressure;
+  executor.beginGrowthBlocked = [&] { return paused; };
+  engine.submit(request(2, prompt));
+  for (int step = 0; step < 5; ++step)
+    static_cast<void>(engine.tick(now++));
+  require(cache.probe(prompt, {}).cachedTokens() == 64 && events.startIds.size() == 1 &&
+              events.failedCount == 0,
+          "a start the host refused gave up its cached state");
+  paused = false;
+  tickUntil(engine, now, [&] { return idle(engine); }, "the refused start did not run");
+  require(events.starts.back() == 64 && executor.prefillRows == 65 + 1,
+          "the refused start did not resume from its cached state");
+}
+
 void testSingletonCapacityFailureTerminatesCleanly() {
   test::TestKvStorage storage(2, 4096, 1);
   storage.budgetPages = 1;
@@ -10468,6 +10501,7 @@ int main() {
     testRefusedStartKeepsItsLeaseBesideAResidentLane();
     testRefusedStartKeepsItsLeaseWhileMemoryIsPending();
     testDroppedLeaseLooksUpAgain();
+    testHostRefusedStartKeepsItsLease();
     testSingletonCapacityFailureTerminatesCleanly();
     testQueuedLongPrefillsLeaveRoomForShortWork();
     testAdmissionUsesCachedRemainingWork();
