@@ -142,6 +142,13 @@ void testFamilies(const std::filesystem::path &fixtures) {
   undeclared.capabilities.sparseKv.reset();
   require(flashDescriptor.valid() && !undeclared.valid(),
           "a descriptor stating another sparse KV than its target's was valid");
+  // The attention kernels read blocks of 4 tokens: a target whose indexer
+  // pools other blocks is invalid, whatever it states.
+  model::ModelDescriptor otherBlocks = flashDescriptor;
+  std::get<model::Qwen4ExpLayout>(otherBlocks.target).indexerBlockTokens = 8;
+  otherBlocks.capabilities.sparseKv->blockTokens = 8;
+  otherBlocks.capabilities.sparseKv->denseHistoryTokens = 4'096;
+  require(!otherBlocks.valid(), "a target whose blocks are not the attention kernels' was valid");
   // A draft states its own layers, intermediate size, rotary base and the
   // target layers it reads.
   constexpr std::array<uint32_t, 6> ownLayers{5, 19, 33, 47, 61, 63};
