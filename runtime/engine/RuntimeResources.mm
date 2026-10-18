@@ -641,8 +641,9 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   // its memory (below). The disk decides only whether the tier's files open,
   // once the weights have loaded: where they do not, the tier is off and the
   // staging stays unused. The volume sizes the tier once its files are open
-  // (DiskSpace), and with it the context a target whose KV spills serves
-  // (ContextBounds::disk).
+  // (DiskSpace); a target whose KV spills plans its stores and context
+  // (ContextBounds::disk) with the room it leaves active KV, before the
+  // weights load and again once the files open.
   model::CompositeStateLayout stateLayout = config.model.stateLayout;
   stateLayout.target.format = config.stateFormat;
   const uint64_t stateBytes = stateLayout.cachedBytes();
@@ -674,8 +675,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   // before they load; on the arenas, which only a loaded model gives, as they
   // rest on its weights' formats, but which one load gives for whatever
   // streams of it (model::StreamedParts); and on the SSD cache's room for
-  // active KV, its quota until its files open, and whether its KV file
-  // opened.
+  // active KV and whether its KV file opened.
   kv::Layout kvLayout = config.model.targetKvLayout;
   kvLayout.format = config.kvFormat;
   // How the KV tier lays a page out in its slot, and so the slots' size.
@@ -690,7 +690,23 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   const bool kvMaySpill = config.model.capabilities.sparseKv && kvLayout.spillable();
   std::array<std::array<uint64_t, 2>, 2> arenaBytes{};
   std::array<uint64_t, 2> spillArenaBytes{};
+  // The room for active KV, which only a target whose KV may spill plans
+  // with: until the tier's files open, what the volume they will take
+  // leaves now, a persistent tier's root, whose caches nobody holds count as
+  // the tier's, else the temporary files'; the room the open measures then
+  // bounds it, so that the floors the stores were sized beside only shrink.
   uint64_t activeLimitBytes = cacheDiskBytes;
+  if (kvMaySpill) {
+    std::error_code ignored;
+    const bool root = config.persistentCache && !config.cacheRoot.empty();
+    uint64_t heldBytes = 0;
+    if (root)
+      for (const CacheDirectory::Idle &cache : CacheDirectory::idle(config.cacheRoot))
+        heldBytes += cache.bytes;
+    activeLimitBytes = volumeActiveLimitBytes(
+        cacheDiskBytes,
+        config.diskVolume(root ? config.cacheRoot : std::filesystem::temp_directory_path(ignored)), heldBytes);
+  }
   bool kvFileOpen = true;
   // The plan with the parts set as `experts` and `table`, `stagingBytes` set
   // aside for the disk tier's state staging and `aneFfnBytes` for the
@@ -897,9 +913,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   // plan without the arenas already loads each part so, as for a model with
   // no part to stream, and twice otherwise, as where the routed experts
   // stream. Floors that the arenas take beyond the budget stop the start
-  // with the engine plan's breakdown (requirePlan, below). Until the tier
-  // measures its volume, the plan takes the cache's quota for the room it
-  // has.
+  // with the engine plan's breakdown (requirePlan, below).
   const StreamedMemoryResult planned = storesPlan(true);
   if (!planned.plan && !planned.requiredBytes)
     throw planRefusal(planned, hardBudgetBytes, streamable, config.model);
@@ -987,7 +1001,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     if (memoryPlan.breakdown().kvSpill.enabled) {
       kvFileOpen = disk.kv != nullptr;
       if (disk.budget)
-        activeLimitBytes = disk.budget->activeLimitBytes();
+        activeLimitBytes = std::min(activeLimitBytes, disk.budget->activeLimitBytes());
       memoryPlan = requirePlan();
     }
 
