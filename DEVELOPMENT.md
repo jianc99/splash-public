@@ -307,7 +307,9 @@ place (`target_weights_bytes`). Off by default.
   chunk's last repack, one more host step reads nearly all of the next
   block's into the whole staging. A load takes the read-ahead over without
   waiting for its reads of experts it does not route, and a read ahead of an
-  expert no load routes may fail without failing anything.
+  expert no load routes may fail without failing anything. A decode step
+  loads and predicts only the experts its lanes' verify rows route
+  ([Drafts](#drafts)); the selector writes those rows before the step's load.
 - Experts of one format share an arena of slots; when it would take more than
   the device's largest buffer (`maxBufferLength`), their layers are split
   between arenas that each fit, each recycling its own slots.
@@ -938,10 +940,17 @@ boundaries also come from
 the cached boundary a request resumes from, from a boundary another request
 waits to resume from, and from one whose state, or the KV past it, memory could
 not hold. With `--state-format bf16` the state is also rounded at each state a
-chunk captures (a replay point, junction or checkpoint). So a greedy or seeded
-request repeats its
+chunk captures (a replay point, junction or checkpoint). On a MoE target the
+rows a decode cycle verifies vary too ([Drafts](#drafts)): the verify budget
+chooses them from cycle wall times and from an acceptance model that the
+requests served so far have taught, so they follow the machine's timing and
+the server's history, and a row's MoE result depends on which rows share its
+expert tiles. So on a dense target a greedy or seeded request repeats its
 output when it runs alone with the same cached prefixes; alongside other
-requests, or with other prefixes cached, it can differ. A request that restores
+requests, or with other prefixes cached, it can differ. On a MoE target the
+same greedy (temperature 0) or seeded request can give different text from run
+to run even alone on an idle server, as vLLM's outputs follow its dynamic
+batches. A request that restores
 nothing can still read cached KV: once a command completes, each block it
 filled whose prefix, tokens and identity (images and cache salt) match a
 cached block is swapped for that block's page, which another command
@@ -1008,11 +1017,11 @@ contain multiple speculative tokens). Thus rates use tokens processed in the
 measured interval, not the full counts. An unavailable rate is zero, including
 responses completed in one emission. A request that drafted adds
 llama-server's `draft_n` and `draft_n_accepted`: the tokens its draft proposed
-and those verification accepted, but for accepted proposals past the output
-limit or from one of the model's stop tokens on; those a `stop` string then
-cuts still count. The end tokens a [thinking token
-budget](#thinking-token-budget) puts in place of the draft's proposals are
-neither. They count that request alone, so
+that its cycles verified ([Drafts](#drafts)) and those verification accepted,
+but for accepted proposals past the output limit or from one of the model's
+stop tokens on; those a `stop` string then cuts still count. The end tokens a
+[thinking token budget](#thinking-token-budget) puts in place of the draft's
+proposals are neither. They count that request alone, so
 they hold under concurrency. `metrics.speculation` carries them with the
 request's speculative `cycles`, the decode cycles in which its draft proposed
 tokens, and the Done line shows what the draft yields per cycle,
@@ -1625,8 +1634,51 @@ target's, and its attention (32 query and 8 KV heads of 128), selector (rank
 256, 16 candidates), block of 8 rows and 2048-token window are those the
 kernels are built for (`readDraftLayout` in `ModelDescriptor.mm`); the
 kernels take any hidden width of whole 16-channel convolution groups. Every
-family loads and runs its draft alike: a decode cycle verifies every row of
-the draft's block, the anchor and its seven proposals. The target writes the
+family loads and runs its draft alike: a decode cycle drafts the whole block,
+the anchor and its seven proposals, and the target verifies the block's first
+rows, as many as the cycle chose for the lane (its verify rows,
+`ops::DraftSelector::addVerifyRows`), never more than the lane may still
+retain. A dense target verifies every row: its projections read their weights
+once for all of a cycle's rows, so a row costs it little. Each row a MoE
+target verifies routes its own experts, which a rejected row reads for nothing
+(a Qwen3.8-Flash-Next cycle of one lane routes about 43 experts a layer with
+all eight rows and 17 with two), so a MoE target's cycles choose their rows as
+vLLM's adaptive verification does (`model::VerifyBudget`). The selector writes
+each lane's confidence at each position, the largest of its candidates'
+probabilities (the softmax at temperature 1 of their scores), which the lane's
+draw there does not change, so a sampled lane's acceptance stays exact. An
+online model, logit(p) = slope * logit(confidence) + intercept[position],
+gives the probability that the target accepts a proposal once it accepted
+those before it; the engine refits it every 64 cycles on the last 4096
+proposals the target accepted or rejected (each lane's up to its first
+rejection), by damped Newton steps under a prior fit to Qwen3.8-Flash-Next's
+and Qwen3.6-35B-A3B's cycles, which also stands before any label. A lane's
+survival at a position, the product of p up to it, is what verifying one more
+row adds to its expected tokens; one GPU step after the selector
+(`draft_verify_rows`) gives every lane its anchor and the rows of the largest
+survivals over the batch, as many as maximize the expected tokens over the
+cycle's cost at that many rows in all. The engine prices those rows from the
+wall times of the lane count's latest cycles, which for streamed experts
+include the store's reads of its misses: a least-squares line in the rows over
+about the last 30 cycles, its slope shrunk toward the shape the measured
+targets share, since what a row costs follows the requests served (a
+Qwen3.6-35B-A3B cycle with 4 GB of experts adds about 3 ms a row on prose and
+8 ms on reasoning); constrained cycles are fit apart, and every 32nd cycle of
+a lane count verifies every row, which keeps the rows of the fit spread. A
+fixed shorter block would do worse: in agentic use about one cycle in six
+accepts all seven proposals and one in five accepts none. Rows past a lane's
+verify rows still run the target's layers, whose kernels take eight rows a
+lane, but their MoE steps route no expert (`moe_group_routes_verified`) and
+acceptance retains none of them. The costs follow wall time and the acceptance
+model every request's labels, so the rows a cycle verifies depend on the
+machine's timing and on what the server served before, and a MoE row's result
+depends on which rows share its expert tiles ([Kernels](#kernels)): on a MoE
+target the same greedy (temperature 0) request can give different text from
+run to run, even alone on an idle server ([Sampling](#sampling)), as vLLM's
+outputs follow its dynamic batches. Dense targets verify every row and are
+unaffected. The speculation counts ([Output limits and
+streaming](#output-limits-and-streaming)) count the proposals a cycle
+verified. The target writes the
 outputs of the layers the draft reads for each row it reads;
 Qwen3.8-Flash-Next's, whose layers carry four hyper-connection streams, as
 the streams' mean, summed in fp32 and stored as bf16, as the draft was
@@ -1791,10 +1843,12 @@ the production metallib on the release GPU and toolchain shows
 numerical-closeness gate; it does not establish bitwise equality of
 production code. Before release,
 compare full-model greedy outputs at the same prompts, cached prefixes and
-batch schedule against the base. Repeat seeded sampled requests within each
-build, and explicitly check base-versus-candidate seeded output when preserving
-a drafting policy. These are measured gates, not a guarantee across arbitrary
-compiler versions or GPUs.
+batch schedule against the base; a MoE target's greedy outputs vary from run
+to run with its verify rows ([Drafts](#drafts)), so for one this comparison
+shows differences that are not regressions. Repeat seeded sampled requests
+within each build, and explicitly check base-versus-candidate seeded output
+when preserving a drafting policy. These are measured gates, not a guarantee
+across arbitrary compiler versions or GPUs.
 
 The values the native runtime holds constant (the Metal command timeout, the
 KV tier's transfers, the input queue's bound, the latency window, the
@@ -2072,7 +2126,9 @@ An expert's only tile of at most `MOE_GGUF_COLUMN_ROWS` live rows runs on the co
 (`kernels/common/gguf_column_tile.h`) rather than the staged one, and the two sum a row's
 products in different orders: a route's output depends on how many rows the step routes to its
 expert, so decode results of GGUF MoE targets on the staged tile, the 35B's included, are not
-invariant to the batch (`kernels/common/moe_expert_slab.h`).
+invariant to the batch (`kernels/common/moe_expert_slab.h`). Which rows a decode step routes also
+follows the verify budget ([Drafts](#drafts)), which learns from timing and earlier requests, so a
+MoE target's decode results can differ between runs of one request.
 The float router and alpha/beta projections run in `kernels/shared/gguf_float.metal`, and the
 token rows are gathered by one template in `kernels/shared/embedding.metal`. These plans are
 fixed rules of GPU family, core count, shape and format.
@@ -3006,8 +3062,9 @@ the other. Per model, `release-check`:
   first to report a [Neural Engine share](#neural-engine-prefill) running that
   share when its build takes one: output tokens and acceptance must be
   identical (`EXPECT_OUTPUT_CHANGE=1` allows changed outputs with acceptance
-  within 0.02), and so must the bytes of the weight images both load
-  (`dev/benchmarks/weights.py`); decode and prefill GPU time, with the cold
+  within 0.02; a MoE target's outputs vary from run to run, [Drafts](#drafts),
+  so its comparison takes it), and so must the bytes of the weight images both
+  load (`dev/benchmarks/weights.py`); decode and prefill GPU time, with the cold
   prefills of short prompts (480 to 2016 tokens, one chunk each) when both
   builds' benchmarks run them, may regress by at most the larger of 2% and
   twice the run's own ABBA spread, a spread above 5% fails as inconclusive,
