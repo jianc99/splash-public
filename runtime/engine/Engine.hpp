@@ -531,6 +531,9 @@ private:
   // Spill mode, reaches past its dense history and tail window, where its
   // pages spill as their copies land.
   [[nodiscard]] bool streamsHistory(const Request &request) const;
+  // Whether a resident Spill request's prompt goes on: its next commands
+  // take Full pages that spill as their copies land.
+  [[nodiscard]] bool spillingPrompt() const;
   // Ends a request at its length outside a command: in Spill mode, once
   // the SSD cache can hold no more of its KV.
   void endAtLength(Request &request);

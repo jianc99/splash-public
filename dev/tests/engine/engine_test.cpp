@@ -7970,7 +7970,7 @@ struct Spilling {
   explicit Spilling(uint32_t slots, bool always = true)
       : budget(std::make_shared<model::DiskBudget>(uint64_t{slots} * 100)),
         cache(pool, &tier, budget, CacheSpillPolicy{1, 1}),
-        engine(config(always), cache, model, events) {
+        engine(config(always, &paused), cache, model, events) {
     tier.budget = budget;
     tier.transferLimit = 1024;
     require(static_cast<bool>(pool.fillRunway(kv::PageForm::Index)),
@@ -7979,8 +7979,9 @@ struct Spilling {
     model.decodeFinishes = false;
   }
 
-  static EngineConfig config(bool always) {
+  static EngineConfig config(bool always, const bool *paused) {
     EngineConfig result = test::engineConfig();
+    result.growthPaused = [paused] { return *paused; };
     result.spill = {.capable = true,
                     .always = always,
                     .denseTokens = KvCache::pageTokens,
@@ -8025,6 +8026,8 @@ struct Spilling {
   engine::Cache cache;
   Executor model;
   Events events;
+  // Whether the host holds growth back (EngineConfig::growthPaused).
+  bool paused = false;
   engine::Engine engine;
   double now = 1;
 };
@@ -8215,6 +8218,38 @@ void testOnlySpillingLanesRunPrefillGroups() {
     require(spill.events.completedCount == 1 && spill.model.prefillChunks.at(1) == (spills ? 1u : 3u),
             spills ? "a Spill request's prompt did not run as a prefill group"
                    : "a Resident request's prompt ran as a prefill group");
+  }
+}
+
+// The Full extents a spill empties leave memory, but one, the runway, while
+// a spilling prompt still grows into it or the host holds growth back.
+void testSpilledFullExtentsLeaveOnceNoPromptGrows() {
+  for (const bool paused : {false, true}) {
+    Spilling spill(1024);
+    const auto emptyFullExtents = [&] {
+      const KvPoolSnapshot pool = spill.pool.snapshot();
+      return (pool.reclaimableBytes - pool.index.reclaimableBytes) /
+             (uint64_t{spill.pool.extentPages()} * spill.pool.bytesPerPage());
+    };
+    // 70 pages and a token: two prefill commands, the second after the
+    // first's pages spilled, then 64 tokens of output.
+    spill.paused = paused;
+    spill.engine.submit(Spilling::prompt(1, 1, 70, 64));
+    uint64_t prompting = 0;
+    spill.runUntil(
+        [&] {
+          if (spill.events.outputs.contains(1)) return true;
+          prompting = std::max(prompting, emptyFullExtents());
+          return false;
+        },
+        "the request did not decode");
+    spill.runUntil([&] { return spill.cache.spillSnapshot().spilledPages == 68; },
+                   "the prompt's pages did not spill");
+    require(spill.model.prefillChunks.at(1) == 2 && prompting <= 1 && emptyFullExtents() == (paused ? 1u : 0u),
+            paused ? "the Full extents spills emptied did not keep the runway while the host held growth back"
+                   : "the Full extents spills emptied stayed, or the runway went while the prompt grew");
+    spill.paused = false;
+    spill.runUntilIdle();
   }
 }
 
@@ -11014,6 +11049,7 @@ int main() {
     testAStartThatConvertsCountsNoConversion();
     testShortQuotaBoundsWaitsOrRefusesASpillStart();
     testOnlySpillingLanesRunPrefillGroups();
+    testSpilledFullExtentsLeaveOnceNoPromptGrows();
     testSpillResumeCommitsAgain();
     testDecodeLeavesOutALaneRefusedItsHotFloor();
     testLoneSpillLaneEndsAtTheWall();

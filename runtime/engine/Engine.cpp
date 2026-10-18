@@ -1065,6 +1065,13 @@ bool Engine::streamsHistory(const Request &active) const {
               uint64_t{geometry.densePages + geometry.windowPages} * KvCache::pageTokens);
 }
 
+bool Engine::spillingPrompt() const {
+  return std::any_of(requests_.begin(), requests_.end(), [&](const auto &entry) {
+    const auto &[id, active] = entry;
+    return active.lane && active.kvMode == KvMode::Spill && scheduler_.phase(id) == Phase::Prefill;
+  });
+}
+
 void Engine::endAtLength(Request &active) {
   ++counters_.spill.lengthEnds;
   finish(active, EngineFinishReason::Length, {});
@@ -1508,10 +1515,16 @@ Engine::Prepared Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &i
   const bool prefill = plan.kind == WorkKind::Prefill;
   const bool spill = config_.spill.capable;
   // Pages whose copies have landed leave memory before any lane grows; the
-  // Index runway they draw on refills if memory allows.
-  if (spill)
-    static_cast<void>(allocate([&] { return cache_.spillWritten(); }, false,
+  // Index runway they draw on refills if memory allows. The Full extents
+  // they empty leave memory too, but one, the runway, while a spilling
+  // prompt still grows into it or the host holds growth back, when it could
+  // not be allocated again.
+  if (spill) {
+    const SpilledExtents extents =
+        spillingPrompt() || config_.growthPaused() ? SpilledExtents::KeepRunway : SpilledExtents::Released;
+    static_cast<void>(allocate([&] { return cache_.spillWritten(extents); }, false,
                                ReclaimClass::Ordinary, {}, true));
+  }
   std::vector<BatchItem> admitted;
   admitted.reserve(plan.items.size());
   struct Denied final {
