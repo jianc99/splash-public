@@ -32,6 +32,14 @@ namespace splash::model {
 // punches them, after the transfer that worker is in, so the files' blocks
 // can briefly exceed the limit by the slots freed but not yet punched.
 //
+// Active KV, the slots of blocks requests hold and the quota Spill requests
+// committed for the pages they will write, is bounded by the active limit
+// instead, which leaves it the volume's whole room rather than a quarter of
+// it (engine::DiskSpace): a commitment locks quota without taking a slot or
+// giving a copy up, and a committed page's slot draws on it
+// (Draw::Commitment). Every draw checks what the files hold against its
+// limit, so none passes a full volume.
+//
 // A write budget that spares the drive is the user's to set
 // (setWriteBudget, --max-cache-disk-writes); without one, the default, every
 // write passes and nothing is held back. With one, every write a file of the
@@ -56,7 +64,7 @@ public:
   // Without a clock the budget refills by the awake clock
   // (awakeMilliseconds), the native loop's.
   explicit DiskBudget(uint64_t capacityBytes, Clock clock = {})
-      : capacity_(capacityBytes), limit_(capacityBytes),
+      : capacity_(capacityBytes), limit_(capacityBytes), activeLimit_(capacityBytes),
         clock_(clock ? std::move(clock) : Clock(awakeMilliseconds)) {}
   // The quota.
   [[nodiscard]] uint64_t capacityBytes() const noexcept { return capacity_; }
@@ -81,32 +89,48 @@ public:
 
   // Active KV, the slots of blocks requests hold and what Spill requests
   // committed, may use more of the volume than cached copies may: its limit
-  // (engine::DiskSpace sets it), at most the quota.
-  [[nodiscard]] uint64_t activeLimitBytes() const noexcept;
-  void setActiveLimitBytes(uint64_t bytes) noexcept;
+  // (engine::DiskSpace sets it), at most the quota, which it is until set.
+  [[nodiscard]] uint64_t activeLimitBytes() const noexcept {
+    return activeLimit_.load(std::memory_order_relaxed);
+  }
+  void setActiveLimitBytes(uint64_t bytes) noexcept {
+    activeLimit_.store(std::min(bytes, capacity_), std::memory_order_relaxed);
+  }
   // Quota a Spill request's pages will take, locked without taking a slot
   // or giving any copy up: granted iff heldBytes (the slots of blocks
   // requests hold, the cache's count) plus what is committed plus `bytes`
   // stays within the active limit. Engine thread.
-  [[nodiscard]] bool commit(uint64_t bytes, uint64_t heldBytes) noexcept;
-  void uncommit(uint64_t bytes) noexcept;
-  [[nodiscard]] uint64_t committedBytes() const noexcept;
+  [[nodiscard]] bool commit(uint64_t bytes, uint64_t heldBytes) noexcept {
+    const uint64_t limit = activeLimitBytes(), committed = committedBytes();
+    if (heldBytes > limit || committed > limit - heldBytes || bytes > limit - heldBytes - committed)
+      return false;
+    committed_.store(committed + bytes, std::memory_order_relaxed);
+    return true;
+  }
+  // Returns what a request committed and will not write. Engine thread.
+  void uncommit(uint64_t bytes) noexcept { committed_.fetch_sub(bytes, std::memory_order_relaxed); }
+  [[nodiscard]] uint64_t committedBytes() const noexcept {
+    return committed_.load(std::memory_order_relaxed);
+  }
   // What a slot's reservation draws on: a cached copy's room within the
   // limit, or a committed page's, whose bytes move from what is committed
   // to what is used within the active limit. Either checks what the files
-  // hold, so no draw passes a full quota.
+  // hold, so no draw passes a full quota; a draw of more than is committed
+  // is refused. A commitment's draw is the engine thread's.
   enum class Draw : uint8_t { Cache, Commitment };
   [[nodiscard]] bool reserve(uint64_t bytes, Draw draw = Draw::Cache) noexcept {
-    // Stub, which the SSD I/O foundation replaces: a commitment
-    // draws as a cached copy does.
-    static_cast<void>(draw);
-    const uint64_t limit = limitBytes();
+    const bool committed = draw == Draw::Commitment;
+    if (committed && bytes > committedBytes())
+      return false;
+    const uint64_t limit = committed ? activeLimitBytes() : limitBytes();
     uint64_t used = used_.load(std::memory_order_relaxed);
     do {
       // Adopted slots, or a limit that fell, may leave more in use than it.
       if (used > limit || bytes > limit - used)
         return false;
     } while (!used_.compare_exchange_weak(used, used + bytes, std::memory_order_relaxed));
+    if (committed)
+      uncommit(bytes);
     return true;
   }
   void release(uint64_t bytes) noexcept { used_.fetch_sub(bytes, std::memory_order_relaxed); }
@@ -129,7 +153,9 @@ public:
   // requests already committed `outstandingBytes` of writes: without a
   // write budget, or while its balance covers them. Their writes are in use
   // and pass whatever the balance. Engine thread.
-  [[nodiscard]] bool admitsSpill(uint64_t outstandingBytes) const noexcept;
+  [[nodiscard]] bool admitsSpill(uint64_t outstandingBytes) const noexcept {
+    return lifted_ || !refillPerMillisecond_ || balanceAt(clock_()) >= static_cast<double>(outstandingBytes);
+  }
   // When a state's write not in use may start again, on the budget's clock;
   // empty while one may start now.
   [[nodiscard]] std::optional<double> admitsAgainAt() const noexcept {
@@ -199,8 +225,10 @@ private:
 
   uint64_t capacity_;
   std::atomic<uint64_t> limit_;
+  std::atomic<uint64_t> activeLimit_;
   std::atomic<uint64_t> volumeAvailable_{0};
   std::atomic<uint64_t> used_{0};
+  std::atomic<uint64_t> committed_{0};
   std::atomic<uint64_t> read_{0};
   std::atomic<uint64_t> written_{0};
   std::atomic<uint64_t> file_{0};
@@ -215,15 +243,6 @@ private:
   double balanceTime_ = 0.0;
   bool lifted_ = false;
 };
-
-// Stubs, which the SSD I/O foundation replaces: no commitment is
-// granted and no spill admitted, so active KV is bounded as cached copies are.
-inline uint64_t DiskBudget::activeLimitBytes() const noexcept { return limitBytes(); }
-inline void DiskBudget::setActiveLimitBytes(uint64_t) noexcept {}
-inline bool DiskBudget::commit(uint64_t, uint64_t) noexcept { return false; }
-inline void DiskBudget::uncommit(uint64_t) noexcept {}
-inline uint64_t DiskBudget::committedBytes() const noexcept { return 0; }
-inline bool DiskBudget::admitsSpill(uint64_t) const noexcept { return false; }
 
 // One slot a persistent file keeps from an earlier process, as its record
 // says: where it is, the size of the payload its last complete write stored

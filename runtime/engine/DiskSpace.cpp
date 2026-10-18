@@ -56,9 +56,7 @@ uint64_t diskLimitBytes(uint64_t quotaBytes, uint64_t availableBytes, uint64_t h
 
 uint64_t diskActiveLimitBytes(uint64_t quotaBytes, uint64_t availableBytes, uint64_t heldBytes,
                               uint64_t floorBytes) noexcept {
-  // Stub, which the SSD I/O foundation replaces: active KV is
-  // bounded as cached copies are.
-  return diskLimitBytes(quotaBytes, availableBytes, heldBytes, floorBytes);
+  return std::min(quotaBytes, diskRoomBytes(availableBytes, heldBytes, floorBytes));
 }
 
 std::optional<std::string> automaticDiskRefusal(const std::optional<DiskVolume> &volume,
@@ -125,9 +123,11 @@ void DiskSpace::measure(std::optional<DiskVolume> volume) {
       logLine("SSD cache: a second write found ", seen, "; the cache keeps within the ",
               gibibytes(heldCapBytes_), " it holds while this server runs.");
   }
-  const uint64_t rootLimit = followed() ? diskLimitBytes(budget_->capacityBytes(),
-                                                         volume_->availableBytes, heldBytes_, floor)
-                                        : budget_->capacityBytes();
+  const uint64_t quota = budget_->capacityBytes();
+  const uint64_t rootLimit =
+      followed() ? diskLimitBytes(quota, volume_->availableBytes, heldBytes_, floor) : quota;
+  const uint64_t activeLimit =
+      followed() ? diskActiveLimitBytes(quota, volume_->availableBytes, heldBytes_, floor) : quota;
   // The root holds more than its limit: another model's cache nobody holds
   // goes, the oldest first, before a copy of this one's. One someone took
   // meanwhile is that process's to count.
@@ -140,8 +140,10 @@ void DiskSpace::measure(std::optional<DiskVolume> volume) {
               "), the oldest cache nobody holds, to keep the cache root within ",
               gibibytes(rootLimit), ".");
   }
-  // The tier may use the whole root: the others go as it grows.
+  // The tier may use the whole root: the others go as it grows, before
+  // active KV takes the room beyond the root's limit.
   budget_->setLimitBytes(std::min(rootLimit, heldCapBytes_));
+  budget_->setActiveLimitBytes(std::min(activeLimit, heldCapBytes_));
 }
 
 } // namespace splash::engine

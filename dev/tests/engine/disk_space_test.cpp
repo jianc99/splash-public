@@ -1,6 +1,6 @@
-// The disk tier's limit on its volume (engine::DiskSpace): the rule, how it
-// behaves as space comes and goes, the automatic tier's start, a measure of
-// real files, and the other caches in a persistent cache's root.
+// The disk tier's limits on its volume (engine::DiskSpace): the rules, how
+// they behave as space comes and goes, the automatic tier's start, a measure
+// of real files, and the other caches in a persistent cache's root.
 
 #include "Checked.hpp"
 #include "TestChecks.hpp"
@@ -12,6 +12,7 @@
 #include <sys/time.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
@@ -102,6 +103,38 @@ void testSnapshotCostsAtMostAThird() {
   }
   require(firstFreed && held && start - held <= firstFreed + firstFreed / 3 + 1,
           "a snapshot that keeps freed blocks drained the tier");
+}
+
+// Active KV may take all of the room beyond the floor, at most the quota,
+// while cached copies keep a quarter of it: on a Mac mini's 460 GiB volume
+// with 16 GiB free, 6 GiB against 1.5; with 24 GiB free, 14 GiB. Off a local
+// volume both are the quota; a hidden limit caps both at what the tier holds.
+void testActiveKvTakesTheRoom() {
+  const uint64_t floor = 10 * kGiB;
+  require(diskActiveLimitBytes(kQuota, 30 * kGiB, 0, floor) == 20 * kGiB &&
+              diskActiveLimitBytes(kQuota, 22 * kGiB, 8 * kGiB, floor) == 20 * kGiB &&
+              diskActiveLimitBytes(kQuota, 500 * kGiB, 0, floor) == kQuota &&
+              !diskActiveLimitBytes(kQuota, 9 * kGiB, 0, floor),
+          "the active limit is not the room beyond the floor, at most the quota");
+  auto budget = std::make_shared<model::DiskBudget>(kQuota);
+  auto file = std::make_shared<model::SlotFile>(kHostPageBytes, budget);
+  DiskSpace space(budget, {file});
+  for (const auto [available, active, cached] :
+       {std::array{16 * kGiB, 6 * kGiB, 3 * kGiB / 2}, std::array{24 * kGiB, 14 * kGiB, 7 * kGiB / 2}}) {
+    space.measure(localVolume(available, 460 * kGiB));
+    require(space.heldBytes() == 0 && budget->activeLimitBytes() == active && budget->limitBytes() == cached,
+            "a Mac mini's free space did not give active KV its room and cached copies a quarter of it");
+  }
+  space.measure(DiskVolume{"/Volumes/Share", kGiB, 1000 * kGiB, false});
+  require(budget->activeLimitBytes() == kQuota && budget->limitBytes() == kQuota,
+          "a volume the tier does not follow did not leave both limits at the quota");
+  const std::shared_ptr<model::SlotFile::Slot> held = file->acquire();
+  for (int write = 0; write < 2; ++write) {
+    budget->reportFull();
+    space.measure(localVolume(100 * kGiB));
+  }
+  require(budget->activeLimitBytes() == kHostPageBytes && budget->limitBytes() == kHostPageBytes,
+          "a hidden limit did not cap active KV at what the tier holds");
 }
 
 // The automatic tier turns on only on a local volume whose limit holds the
@@ -285,6 +318,7 @@ void testOtherCachesGoAsTheTierGrows() {
 int main() {
   try {
     testTheRule();
+    testActiveKvTakesTheRoom();
     testTiersOnOneVolumeConverge();
     testSnapshotCostsAtMostAThird();
     testAutomaticStart();

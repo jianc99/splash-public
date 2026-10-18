@@ -80,19 +80,19 @@ automaticDiskRefusal(const std::optional<DiskVolume> &volume, uint64_t heldBytes
 // control pass and when a write found the volume full, reads the volume
 // through the first file's descriptor, which names the right volume however
 // the file was made, adds the blocks the tier's files hold, and sets the
-// budget's limit (diskLimitBytes); off a local volume the quota is the
-// limit. In a persistent cache's root one limit bounds every namespace
-// together, and the tier may use all of it: the others nobody holds count
-// among what the tier holds, and while the root holds more than its limit,
-// as the tier grows or the volume shrinks, they go, oldest first, before
-// the tier gives up a copy of its own. A write that found the volume full
-// while the volume shows room above the floor, or on a volume whose free
-// space the tier does not follow, met a limit the measure cannot see, such as
-// a volume quota or a disk image whose host is full, or a volume that filled
-// and freed again before the measure. A second such write says it was a
-// limit: the tier then keeps within what it holds, its live slots, for the
-// rest of the process. It goes on serving and replacing its copies within
-// that, and a later such write lowers it again.
+// budget's limit (diskLimitBytes) and active limit (diskActiveLimitBytes);
+// off a local volume the quota is both. In a persistent cache's root one
+// limit bounds every namespace together, and the tier may use all of it: the
+// others nobody holds count among what the tier holds, and while the root
+// holds more than its limit, as the tier grows or the volume shrinks, they
+// go, oldest first, before the tier gives up a copy of its own. A write that
+// found the volume full while the volume shows room above the floor, or on a
+// volume whose free space the tier does not follow, met a limit the measure
+// cannot see, such as a volume quota or a disk image whose host is full, or a
+// volume that filled and freed again before the measure. A second such write
+// says it was a limit: the tier then keeps within what it holds, its live
+// slots, both limits, for the rest of the process. It goes on serving and
+// replacing its copies within that, and a later such write lowers it again.
 class DiskSpace final {
 public:
   // The files live on one volume; `others` are the root's namespaces nobody
