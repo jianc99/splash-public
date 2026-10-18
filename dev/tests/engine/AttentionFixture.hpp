@@ -7,6 +7,7 @@
 #include "metal/abi/KvExtent.h"
 #include "ops/PagedAttention.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -21,7 +22,9 @@
 
 // The paged-attention fixture attention-sweep times: deterministic Page32
 // history of every lane in the extents of a pool, one chunk of rows per lane
-// with its queries, and the production store and attention graph over them.
+// with its queries, and the production store and attention graph over them;
+// and the move of a block from a page to a block cache that a verify reads
+// through its locations.
 namespace splash::test {
 
 // The target attention layer a fixture holds: its query and KV heads, its
@@ -349,5 +352,37 @@ private:
   std::array<std::vector<uint32_t>, AttentionFixturePlan::kMaximumLanes> pageIds_;
   std::array<metal::MetalBuffer, AttentionFixturePlan::kMaximumLanes> tables_{};
 };
+
+// Moves one block of SPLASH_ATTENTION_BLOCK_TOKENS tokens of layer `layer`,
+// every KV head's keys, values and, for INT8, their scales, from place
+// fromPlace of page fromPage of `from` to place toPlace of page toPage of
+// `to`: extents of `layout`, whose values are token-major, so that a head's
+// block is one run of each tensor. As a page whose blocks a spilled request
+// reads from its block cache no longer holds them, the source is left with
+// the complement of every byte it held: a kernel that still reads the block
+// there reads other bits.
+inline void moveBlock(kv::Layout layout, uint32_t layer, const HostKvExtents &from, uint32_t fromPage,
+                      uint32_t fromPlace, const HostKvExtents &to, uint32_t toPage, uint32_t toPlace) {
+  if (!layout.valuesTokenMajor)
+    throw std::invalid_argument("a block of values in dimension order is not one run");
+  constexpr uint32_t tokens = SPLASH_ATTENTION_BLOCK_TOKENS;
+  const uint64_t elementBytes = layout.format == kv::Format::Int8 ? 1 : 2;
+  const auto move = [&](uint32_t tensor, uint64_t source, uint64_t target, uint64_t bytes) {
+    std::byte *moved = from.slab<std::byte>(layer, tensor, fromPage) + source;
+    std::copy_n(moved, bytes, to.slab<std::byte>(layer, tensor, toPage) + target);
+    std::for_each_n(moved, bytes, [](std::byte &byte) { byte = ~byte; });
+  };
+  for (uint32_t head = 0; head < layout.kvHeads; ++head) {
+    // Token-major values sit where keys do (HostKvExtents::valueElement).
+    for (const uint32_t tensor : {SPLASH_KV_KEYS, SPLASH_KV_VALUES})
+      move(tensor, splash_kv_key_element(head, fromPlace * tokens, 0) * elementBytes,
+           splash_kv_key_element(head, toPlace * tokens, 0) * elementBytes,
+           uint64_t{tokens} * layout.headDimension * elementBytes);
+    if (layout.format == kv::Format::Int8)
+      for (const uint32_t tensor : {SPLASH_KV_KEY_SCALES, SPLASH_KV_VALUE_SCALES})
+        move(tensor, splash_kv_scale_element(head, fromPlace * tokens) * sizeof(float),
+             splash_kv_scale_element(head, toPlace * tokens) * sizeof(float), tokens * sizeof(float));
+  }
+}
 
 } // namespace splash::test
