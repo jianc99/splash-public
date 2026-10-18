@@ -69,18 +69,20 @@ private:
 
 // A KV disk tier without a disk: slots count against a quota, a bounded
 // number of transfers is in flight, writes of each class within their own
-// bound, and transfers finish when the test says so. With a budget, a slot
-// is reserved from it as its draw says (model::DiskBudget::reserve) instead
-// of against the quota. Each slot is its own copy (TestKvCopy, copyOf),
-// which reads of spilled KV hold as they hold a real slot: a copy outlives
-// the cache's reference only as long as a reader keeps it, and its quota
-// with it.
+// bound, and transfers finish when the test says so, a restore only once
+// submitted (submitRestores), as the tier's readers take it then. With a
+// budget, a slot is reserved from it as its draw says
+// (model::DiskBudget::reserve) instead of against the quota. Each slot is
+// its own copy (TestKvCopy, copyOf), which reads of spilled KV hold as they
+// hold a real slot: a copy outlives the cache's reference only as long as a
+// reader keeps it, and its quota with it.
 class TestKvTier final : public engine::KvTier {
 public:
   struct Transfer final {
     bool ready = false;
     bool success = true;
     bool finished = false;
+    bool submitted = true;
   };
 
   TestKvTier() = default;
@@ -116,9 +118,14 @@ public:
     if (!canRestore()) return {};
     ++restores;
     restoredPages.push_back(page);
-    return start(std::nullopt);
+    std::unique_ptr<engine::KvTransfer> transfer = start(std::nullopt);
+    transfers.back()->submitted = false;
+    return transfer;
   }
-  void submitRestores() override { ++restoreSubmissions; }
+  void submitRestores() override {
+    for (const auto &transfer : transfers)
+      transfer->submitted = true;
+  }
   std::shared_ptr<const model::KvCopy> copy(const std::shared_ptr<engine::KvDiskSlot> &slot) const override {
     return std::static_pointer_cast<const Slot>(slot);
   }
@@ -129,10 +136,10 @@ public:
     return static_cast<Slot &>(*slot);
   }
 
-  // Finishes every transfer still in flight.
+  // Finishes every transfer still in flight, of the restores those submitted.
   void complete(bool success = true) {
     for (auto &transfer : transfers) {
-      if (transfer->finished || transfer->ready) continue;
+      if (transfer->finished || transfer->ready || !transfer->submitted) continue;
       transfer->ready = true;
       transfer->success = success;
     }
@@ -169,7 +176,6 @@ public:
   // Restores started, every restore() call, and the pages of those started.
   uint32_t restores = 0;
   uint32_t restoreCalls = 0;
-  uint32_t restoreSubmissions = 0;
   std::vector<uint32_t> restoredPages;
   bool writableFile = true;
   bool persistentTier = false;
