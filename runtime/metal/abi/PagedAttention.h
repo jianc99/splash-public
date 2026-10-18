@@ -75,7 +75,8 @@ static_assert(SPLASH_MAXIMUM_PHYSICAL_KV_TOKENS / SPLASH_ATTENTION_BLOCK_TOKENS 
 // shape, names a page of the locations' own page table (location >>
 // SPLASH_ATTENTION_LOCATION_BLOCK_BITS) and the block's place in it (the low
 // bits), or is SPLASH_ATTENTION_PAGED for a block whose page the page table
-// holds, at its own place.
+// holds, at its own place. The locations' pages hold the layer where the
+// tile's `kv` places it, as the pool's do.
 #define SPLASH_ATTENTION_PAGED 0xffffffffu
 #define SPLASH_ATTENTION_LOCATION_BLOCK_BITS 3u
 

@@ -152,6 +152,8 @@ struct VerifyAttentionPlan final {
 
 private:
   friend class PagedAttention;
+  // A sparse plan's split for lists with locations (AttentionBlocks).
+  const std::string_view locatedSplitPipeline_;
   const std::string_view storePipeline_;
   const metal::DispatchSize storeGroups_;
   const metal::DispatchSize storeThreads_;
@@ -160,13 +162,15 @@ private:
                       uint32_t splits, AttentionWorkspace workspace,
                       std::string_view splitPipeline, std::string_view reducePipeline,
                       metal::DispatchSize splitGroups, metal::DispatchSize reduceGroups,
-                      bool sparse, std::string_view storePipeline, metal::DispatchSize storeGroups,
-                      metal::DispatchSize storeThreads, kv::Layout layout, uint32_t queryHeads)
+                      bool sparse, std::string_view locatedSplitPipeline, std::string_view storePipeline,
+                      metal::DispatchSize storeGroups, metal::DispatchSize storeThreads, kv::Layout layout,
+                      uint32_t queryHeads)
       : layout(layout), queryHeads(queryHeads), lanes(lanes), laneSplits(laneSplits),
         splits(splits), workspace(workspace),
         splitPipeline(splitPipeline), reducePipeline(reducePipeline),
         splitGroups(splitGroups), reduceGroups(reduceGroups), sparse(sparse),
-        storePipeline_(storePipeline), storeGroups_(storeGroups), storeThreads_(storeThreads) {}
+        locatedSplitPipeline_(locatedSplitPipeline), storePipeline_(storePipeline),
+        storeGroups_(storeGroups), storeThreads_(storeThreads) {}
 };
 
 // The block lists a sparse plan's tiles attend through (metal/abi/
@@ -282,7 +286,8 @@ public:
   // must not alias. Encode the store before attention; both stay in one
   // compute encoder. The plan owns both dispatch grids and their exact scratch.
   // prefillWorkspace() bounds every legal history for the command's largest
-  // sequence.
+  // sequence. Prefill reads its history through the page table alone: its
+  // blocks take no locations.
   static void addPrefill(metal::CommandGraph &graph, SplashKvLayer layer,
                          metal::MetalBuffer queries, metal::MetalBuffer output,
                          metal::MetalBuffer partials,
@@ -291,7 +296,9 @@ public:
                          const kv::ChunkedPrefillParams &chunk,
                          const PrefillAttentionPlan &plan, AttentionBlocks blocks = {});
   // Stores each lane's chunk (verifyParams, one per plan lane) and attends
-  // its verify rows with the plan's split counts.
+  // its verify rows with the plan's split counts; with block locations, a
+  // sparse plan's located split reads each listed block where its location
+  // names.
   static void addVerify(metal::CommandGraph &graph, SplashKvLayer layer,
                         PagedVerifyBuffers buffers,
                         std::span<const kv::ChunkedPrefillParams> chunks,
