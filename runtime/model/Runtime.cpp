@@ -648,8 +648,9 @@ struct Runtime::Impl {
   // readers of spilled K/V while no command reads through them: the staging
   // of spilled history once no prompt holds it (stagingHeld), which the next
   // streamed prefill takes again
-  // (KvHistoryStream::releaseIdle), and the hot block cache above its lanes'
-  // floors, which refills as they read (KvBlockCache::releaseAboveFloor).
+  // (KvHistoryStream::releaseIdle), and an extent of the hot block cache
+  // above its lanes' floors, which grows back between commands
+  // (KvBlockCache::releaseAboveFloor).
   // Then the least recently used embedding entry nothing else holds, one at
   // a time, since only an encode rebuilds it. An entry something else holds
   // is skipped, since dropping it frees nothing.

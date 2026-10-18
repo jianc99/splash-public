@@ -768,8 +768,8 @@ public:
   // keeps those one lane starts from); with BuffersThenCaches, once no
   // buffer is idle, the vision arena when no image waits for its encode and
   // nothing holds it, the staging of spilled history once no prompt streams
-  // into it, the hot block cache above its lanes' floors, and then one
-  // embedding entry nothing else holds, oldest first. A denied allocation
+  // into it, an extent of the hot block cache above its lanes' floors, and
+  // then one embedding entry nothing else holds, oldest first. A denied allocation
   // retries between calls, so it frees only what it needs.
   [[nodiscard]] virtual uint64_t reclaimIdleState(bool keepLane,
                                                   IdleMemory scope) noexcept = 0;

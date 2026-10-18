@@ -2973,7 +2973,8 @@ struct SpillRecord final {
 // add at most two command buffers an attention layer to a command, whatever
 // its history (of the queue's 512, which the backend checks for every
 // command); and an idle reclaim gives their memory back one unit at a time,
-// the staging, then the hot block cache above its lanes' floors. Then a
+// the staging, then each extent of the hot block cache above its lanes'
+// floors. Then a
 // command's reads streamed again, as a Neural Engine rerun streams them,
 // keep what they could not read; a copy that cannot be read fails the
 // prefill command that streams it, which commits nothing and gives the same
@@ -3071,14 +3072,21 @@ void requireSpilledKvMatchesResident(metal::MetalBackend &backend, const model::
             << " command_buffers=" << std::ranges::max(spilled.commandBuffers) << '\n';
 
   // With every request ended, an idle reclaim gives back, after the pooled
-  // buffers, the staging and then the hot block cache above its floors.
+  // buffers, the staging and then the hot block cache above its floors, an
+  // extent at a time.
   while (runtime.reclaimIdleState(true, IdleMemory::Buffers)) {
   }
   require(history.stagingBytes && reads.bytes > reads.floorBytes &&
-              runtime.reclaimIdleState(true, IdleMemory::BuffersThenCaches) == history.stagingBytes &&
-              runtime.reclaimIdleState(true, IdleMemory::BuffersThenCaches) == reads.bytes - reads.floorBytes &&
-              !runtime.reclaimIdleState(true, IdleMemory::BuffersThenCaches),
-          "an idle reclaim did not give back the staging, then the hot block cache above its floors");
+              runtime.reclaimIdleState(true, IdleMemory::BuffersThenCaches) == history.stagingBytes,
+          "an idle reclaim did not give back the staging first");
+  const uint64_t extent = runtime.reclaimIdleState(true, IdleMemory::BuffersThenCaches);
+  uint64_t released = extent;
+  while (const uint64_t bytes = runtime.reclaimIdleState(true, IdleMemory::BuffersThenCaches)) {
+    require(bytes == extent, "an idle reclaim gave back more than an extent of the hot block cache");
+    released += bytes;
+  }
+  require(released == reads.bytes - reads.floorBytes,
+          "an idle reclaim did not give back the hot block cache above its floors");
 
   // A copy that cannot be read fails the command that reads it, for its lane
   // alone and as no failure of the model, and nothing of the lane is
