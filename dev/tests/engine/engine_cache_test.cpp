@@ -4509,6 +4509,27 @@ void testFullShortfallReleasesEmptyIndexExtents() {
           "a Full shortfall did not release the empty Index extents past the runway first");
 }
 
+// An Index shortfall empties only a Full extent: the Full pages spills
+// freed fund the next Index extent, while moving Index pages would release no
+// memory the shortfall could grow by. Here an Index extent could empty and no
+// Full one can, so nothing moves.
+void testIndexShortfallCompactsOnlyFullExtents() {
+  Spilling spill;
+  KvPageAcquisition index = spill.pool.acquirePages(5, kv::PageForm::Index);
+  require(index.granted() && spill.pool.freePageCount(kv::PageForm::Index) == 3,
+          "the Index pages did not take a second extent");
+  for (uint32_t page : std::span(index.pages).first(3))
+    spill.pool.releasePage(page, false);
+  spill.storage.growthBlocked = true;
+  const CacheReclaimResult reclaimed = spill.cache.reclaimForPages(
+      8, CacheReclaimMode::KeepExtents, ReclaimClass::InUse, kv::PageForm::Index);
+  require(!reclaimed.madeProgress && spill.storage.copies.empty() &&
+              spill.pool.snapshot().extentCompactions == 0,
+          "an Index shortfall compacted an Index extent");
+  for (uint32_t page : std::span(index.pages).last(2))
+    spill.pool.releasePage(page, false);
+}
+
 // The idle pages a state in use restores through are out of an Ordinary
 // reclaim's reach, each counted against the reusable pages of its own form:
 // a spilled chain's Index pages never against the Full pages, of which the
@@ -5128,6 +5149,7 @@ int main() {
     testSpillAtTheMemoryWall();
     testFullReclaimReachesAnIdleSpilledChain();
     testFullShortfallReleasesEmptyIndexExtents();
+    testIndexShortfallCompactsOnlyFullExtents();
     testReusablePagesCountTheirForm();
     testPendingPagesCountWritesThatSpill();
     testWritesThatFreeNothingHoldNothingBack();

@@ -576,7 +576,7 @@ CacheReclaimResult Cache::reclaimForPages(uint32_t pages, CacheReclaimMode mode,
     const kv::PageForm other = form == kv::PageForm::Full ? kv::PageForm::Index : kv::PageForm::Full;
     const uint32_t all = std::numeric_limits<uint32_t>::max();
     uint64_t released = pool_.reclaimEmptyExtents(true, all, other);
-    if (!released && form == kv::PageForm::Index && compactExtent())
+    if (!released && form == kv::PageForm::Index && compactExtent(other))
       released = pool_.reclaimEmptyExtents(true, all, other);
     total.reclaimedBytes += released;
     total.madeProgress = total.madeProgress || released;
@@ -803,7 +803,7 @@ CacheReclaimResult Cache::releaseExtent(bool keepRunway) {
   return {};
 }
 
-bool Cache::compactExtent() {
+bool Cache::compactExtent(std::optional<kv::PageForm> form) {
   const auto start = AwakeClock::now();
   std::vector<uint32_t> inTransfer;
   inTransfer.reserve(writes_.size() + restores_.size());
@@ -811,7 +811,7 @@ bool Cache::compactExtent() {
     inTransfer.push_back(kv_.page(write.block));
   for (const auto &[block, _] : restores_)
     inTransfer.push_back(kv_.page(block));
-  const KvPageMoves moves = pool_.compactExtent(inTransfer);
+  const KvPageMoves moves = pool_.compactExtent(inTransfer, form);
   if (moves.empty())
     return false;
   followMoves(moves);
