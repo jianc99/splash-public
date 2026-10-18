@@ -2,6 +2,7 @@
 
 #include "ops/PagedKv.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <limits>
 #include <optional>
@@ -35,20 +36,17 @@ struct KvPoolSnapshot {
   uint64_t pagesMoved = 0;
 };
 
-// Where the pages of an emptied extent went. Whoever names one of its pages
-// follows it.
+// Where moved pages went: an emptied extent's, or pages moved to the other
+// form. Whoever names one of them follows it.
 struct KvPageMoves final {
-  uint32_t firstPage = 0;
-  // By offset in the extent: the page that took the page's content, or the
-  // page itself where it was free.
-  std::vector<uint32_t> destinations;
+  // Each moved page and the page that took its content, by moved page.
+  std::vector<kv::PageCopy> moved;
 
-  [[nodiscard]] bool empty() const noexcept { return destinations.empty(); }
+  [[nodiscard]] bool empty() const noexcept { return moved.empty(); }
   // The page that holds what `page` held.
   [[nodiscard]] uint32_t follow(uint32_t page) const noexcept {
-    return page >= firstPage && page - firstPage < destinations.size()
-               ? destinations[page - firstPage]
-               : page;
+    const auto found = std::ranges::lower_bound(moved, page, {}, &kv::PageCopy::from);
+    return found != moved.end() && found->from == page ? found->to : page;
   }
 };
 
