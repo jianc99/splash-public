@@ -151,6 +151,8 @@ KvSpillPlan planSpill(const StreamedMemoryInputs &in, uint64_t floors) {
   spill.groupPages = in.groupPages;
   spill.slotBytes = in.kvSlotBytes;
   spill.laneSlots = shape.laneSlots();
+  spill.laneHotBytes = extentsBytes(shape.laneSlots() >> SPLASH_ATTENTION_LOCATION_BLOCK_BITS, extentPages,
+                                    layout.kvBytesPerModelPage());
   spill.hotFloorBytes = spill.hotTargetBytes = spillFloors.hotFloorBytes;
   spill.hotLimitBytes = extentsBytes(
       shape.requiredSlots(model::ExecutionLimits::maximumBatchWidth) >> SPLASH_ATTENTION_LOCATION_BLOCK_BITS,
@@ -560,7 +562,10 @@ SpillGeometry EngineMemoryPlan::spillGeometry() const noexcept {
           .residentTokens = breakdown_.contextBounds.resident,
           .densePages = spill.densePages,
           .windowPages = spill.windowPages,
-          .groupPages = spill.groupPages};
+          .groupPages = spill.groupPages,
+          .laneStateBytes = breakdown_.laneStateBytes,
+          .extentPages = breakdown_.kvExtentPages,
+          .laneHotBytes = spill.laneHotBytes};
 }
 
 std::string EngineMemoryPlan::toStatusJson() const {

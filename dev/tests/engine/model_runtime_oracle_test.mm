@@ -3597,7 +3597,10 @@ int main(int argc, char **argv) {
         budget.pipelineReserveBytes - budget.runtimeOverheadReserveBytes;
     MemoryGovernor governor(backend, elasticGrowthCeiling, hostReserveBytes,
                             EngineMemoryPolicy::hostSpareReserveBytes(device.physicalMemoryBytes),
-                            queryHostMemory, 0, budget.streamedTableBytes);
+                            queryHostMemory, 0,
+                            [planned = budget.streamedTableBytes, table = model.streamedTable()] {
+                              return planned - std::min(planned, table ? table->releasedBytes() : 0);
+                            });
     std::cout << "ane_ffn_share=" << (aneFfn ? aneFfn->share() : 0.0)
               << " ane_ffn_minimum_rows=" << (aneFfn ? aneFfn->minimumRows() : 0) << '\n';
     const metal::AllocationAdmission governed =

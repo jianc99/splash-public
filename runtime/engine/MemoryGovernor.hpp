@@ -108,6 +108,9 @@ struct MemoryGovernorSnapshot {
   // Allocation need not ask: admission names the host as the cause of every
   // refusal the host shares.
   bool hostGrowthAllowed = true;
+  // What the engine released for starts the host refused and no growth has
+  // taken since (MemoryGovernor::fund).
+  uint64_t fundedBalanceBytes = 0;
 };
 
 // Critical pressure evicts every unpinned entry and takes what a request
@@ -173,6 +176,7 @@ private:
 class MemoryGovernor final {
 public:
   using HostMemoryProvider = std::function<std::optional<HostMemory>()>;
+  using HostHeldProvider = std::function<uint64_t()>;
 
   // Metal memory outside the backend's buffers (pipelines, driver
   // allocations) is charged only beyond untrackedReserveBytes, the part of
@@ -180,11 +184,12 @@ public:
   // must exceed hostReserveBytes, which macOS keeps; growth that no request
   // in service needs keeps hostSpareReserveBytes of its spare memory, and
   // the warning margin above them, for other applications.
-  // hostHeldBytes, host memory held outside Metal (the streamed table's
-  // row cache), is charged in full.
+  // hostHeld, host memory held outside Metal now (the streamed table's row
+  // cache), is charged in full; none without it.
   MemoryGovernor(metal::MetalBackend &backend, uint64_t limitBytes,
                  uint64_t hostReserveBytes, uint64_t hostSpareReserveBytes,
-                 HostMemoryProvider hostMemory, uint64_t untrackedReserveBytes, uint64_t hostHeldBytes = 0);
+                 HostMemoryProvider hostMemory, uint64_t untrackedReserveBytes,
+                 HostHeldProvider hostHeld = {});
 
   // The only way to reserve memory. Low-level storage/model components
   // receive only this transactional callback, so allocation stays governed
@@ -195,17 +200,32 @@ public:
   // does. The host refuses under critical pressure and, unless a request in
   // service needs the bytes (setServing), while macOS warns, inside the
   // warning margin or while it holds for the recovery margin for a waiting
-  // request (setRequestWaiting).
+  // request (setRequestWaiting); there a funded reservation (setFunded) is
+  // admitted within the balance.
   [[nodiscard]] metal::AllocationAdmission allocationAdmission() noexcept;
   // Marks the reservations that follow as memory a request in service needs,
   // until it is cleared, and returns the mark it replaced, which a scope
-  // that sets it restores (Serving). Neither the host's margins nor macOS's
+  // that sets it restores (GovernorMark). Neither the host's margins nor macOS's
   // warning refuse those: holding them back would strand the request and
   // the memory it already has, while the cache it could give up instead is
   // what the paced reclaim returns. The limit and critical pressure refuse
   // them like any other. A start marks what it allocates so until serving
   // begins (RuntimeResources::beginServing).
   bool setServing(bool serving) noexcept;
+  // Funding a start the host holds back. fund() credits what the engine
+  // released for it, never what the paced reclaim returns, and returns the
+  // balance; setFunded() marks the reservations that follow as such a
+  // start's, as setServing() does, and returns the mark it replaced. While
+  // the host holds growth back, a funded reservation that fits the balance
+  // is admitted, and every reservation admitted draws the balance down,
+  // in-service growth included, so that a funded start uses only bytes
+  // released for it that no growth has taken since: Splash's footprint
+  // stays within what the host's rules allow without funding. Critical
+  // pressure and the limit refuse a funded reservation like any other, and
+  // with no balance one is refused as without the mark. The balance lapses
+  // at the first evaluation that finds growth allowed.
+  uint64_t fund(uint64_t bytes) noexcept;
+  bool setFunded(bool funded) noexcept;
   // Whether a request cannot proceed for want of memory, as each control pass
   // finds: only then does growth wait for the recovery margin once the host
   // has run short.
@@ -289,9 +309,11 @@ private:
   uint64_t hostSpareReserveBytes_ = 0;
   HostMemoryProvider hostMemory_;
   uint64_t untrackedReserveBytes_ = 0;
-  uint64_t hostHeldBytes_ = 0;
+  HostHeldProvider hostHeld_;
   uint64_t reservedBytes_ = 0;
   bool serving_ = false;
+  bool funded_ = false;
+  uint64_t fundedBalance_ = 0;
   bool requestWaiting_ = false;
   uint64_t deniedReservations_ = 0;
   MemoryPressure systemPressure_ = MemoryPressure::Normal;

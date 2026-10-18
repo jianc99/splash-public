@@ -100,6 +100,9 @@ struct KvSpillPlan final {
   uint32_t groupPages = 0;
   uint64_t slotBytes = 0;
   uint64_t laneSlots = 0;
+  // The hot block cache's bytes for laneSlots slots a layer, in whole
+  // extents: what each decoding lane past the first adds to its floor.
+  uint64_t laneHotBytes = 0;
   uint64_t hotFloorBytes = 0;
   uint64_t hotTargetBytes = 0;
   // The most the hot cache holds: its target, or the floor of every lane
@@ -364,6 +367,12 @@ struct SpillGeometry final {
   uint32_t densePages = 0;
   uint32_t windowPages = 0;
   uint32_t groupPages = 0;
+  // What funding a start the host holds back weighs (Engine::fundStart): a
+  // lane's state, the pages of the pool's extents, and laneSlots in bytes
+  // of the hot block cache (KvSpillPlan::laneHotBytes).
+  uint64_t laneStateBytes = 0;
+  uint32_t extentPages = 0;
+  uint64_t laneHotBytes = 0;
 
   // A Resident request's KV at `tokens` tokens: its pages, Full.
   [[nodiscard]] uint64_t residentBytes(uint64_t tokens) const noexcept { return pages(tokens) * fullPageBytes; }
@@ -374,6 +383,9 @@ struct SpillGeometry final {
     const uint64_t full = std::min<uint64_t>(all, uint64_t{densePages} + windowPages + 2ULL * groupPages);
     return full * fullPageBytes + (all - full) * indexPageBytes;
   }
+  // The hot block cache's floor for `lanes` lanes decoding over Index
+  // pages: one lane's slots more than theirs, none for no lane.
+  [[nodiscard]] uint64_t hotFloorBytes(uint64_t lanes) const noexcept { return lanes ? (lanes + 1) * laneHotBytes : 0; }
 
 private:
   [[nodiscard]] static constexpr uint64_t pages(uint64_t tokens) noexcept {
