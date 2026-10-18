@@ -61,6 +61,11 @@ SparseRowStoreOptions streamedTableRows(const Qwen3_8Layout &) { return {}; }
 
 SparseRowStoreOptions streamedTableRows(const Qwen3_6MoeLayout &) { return {}; }
 
+StreamedParts StreamedParts::loaded(const LoadedModel &model, bool kv) noexcept {
+  const SparseRowStore *table = model.streamedTable();
+  return {.experts = model.expertStore() != nullptr, .tableRowBytes = table ? table->table().rowBytes : 0, .kv = kv};
+}
+
 LoadedModel loadModel(metal::MetalBackend &backend,
                               const std::filesystem::path &root,
                               const ModelDescriptor &descriptor,

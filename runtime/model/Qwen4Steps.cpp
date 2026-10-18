@@ -201,9 +201,9 @@ Qwen4Steps::Qwen4Steps(const Qwen4ExpWeights &weights, const QwenTargetGeometry 
     std::memset(zeros.contents(), 0, zeros.sizeBytes());
 }
 
-QwenTargetScratchBytes Qwen4Steps::scratchBytes(const Qwen4ExpWeights &weights, const QwenTargetGeometry &geometry,
+QwenTargetScratchBytes Qwen4Steps::scratchBytes(const QwenTargetGeometry &geometry, uint64_t tableRowBytes,
                                                 uint32_t prefillChunks) {
-  const Layout bytes = layout(geometry, pleRowBytes(weights), prefillChunks);
+  const Layout bytes = layout(geometry, tableRowBytes, prefillChunks);
   return {bytes.prefillBytes, bytes.decodeBytes};
 }
 

@@ -2822,7 +2822,8 @@ public:
                                        "oracle-spill-pages"),
                 backend.allocateBuffer(lanePages * sizeof(SplashKvPage), metal::BufferStorage::Shared,
                                        "oracle-spill-index")} {
-    const model::ModelMemoryPlan plan = model::plannedRuntimeMemory(model, operators, format, stateFormat, true);
+    const model::ModelMemoryPlan plan = model::plannedRuntimeMemory(model, operators, format, stateFormat,
+                                                                    model::StreamedParts::loaded(model, true));
     const uint64_t arenaBytes = plan.sharedPrefillPlannedAllocatedBytes + plan.sharedDecodePlannedAllocatedBytes;
     require(static_cast<bool>(admission(arenaBytes, [&] {
               runtime_.emplace(model::RuntimeContext{backend, model, kv_, states_, operators, nullptr, &cache_,
@@ -3521,7 +3522,7 @@ int main(int argc, char **argv) {
       std::cout << "ple_memory=" << (model.streamedTable() ? "streamed" : "ignored") << '\n';
     ops::ExecutionPlans operators(backend.capabilities());
     model::ModelMemoryPlan executorPlan =
-        model::plannedRuntimeMemory(model, operators, format, stateFormat);
+        model::plannedRuntimeMemory(model, operators, format, stateFormat, model::StreamedParts::loaded(model));
     // The memory plan with `aneFfnBytes` set aside for the prefill FFN's
     // Neural Engine split.
     const auto planMemory = [&](uint64_t aneFfnBytes) {

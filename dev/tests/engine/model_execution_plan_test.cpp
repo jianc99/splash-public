@@ -247,7 +247,8 @@ void checkIndexTables() {
 void checkSpilledKvGeometry() {
   const auto flash = loadedModel<model::Qwen4ExpWeights>();
   const auto resident = model::RuntimeGeometry::from(flash, kv::Format::Int8, ops::GdnStateFormat::Float32);
-  const auto spilled = model::RuntimeGeometry::from(flash, kv::Format::Int8, ops::GdnStateFormat::Float32, true);
+  const auto spilled = model::RuntimeGeometry::from(flash, kv::Format::Int8, ops::GdnStateFormat::Float32,
+                                                    model::StreamedParts::loaded(flash, true));
   require(resident.prefillChunks == 1 && !resident.spilledKv &&
               spilled.prefillChunks == model::kPrefillGroupChunks && spilled.spilledKv == test::sparseKvShape(),
           "a runtime's prefill groups do not follow whether its K/V spills");
@@ -257,7 +258,8 @@ void checkSpilledKvGeometry() {
   for (const model::LoadedModel &loaded :
        {loadedModel<model::Qwen3_8Weights>(), loadedModel<model::Qwen3_6MoeWeights>()})
     rejects([&] {
-      static_cast<void>(model::RuntimeGeometry::from(loaded, kv::Format::Int8, ops::GdnStateFormat::Float32, true));
+      static_cast<void>(model::RuntimeGeometry::from(loaded, kv::Format::Int8, ops::GdnStateFormat::Float32,
+                                                     model::StreamedParts::loaded(loaded, true)));
     }, "invalid model runtime geometry", "the K/V of a target without a block index was let spill");
 }
 

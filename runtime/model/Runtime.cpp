@@ -413,7 +413,8 @@ struct Runtime::Impl {
       : backend(value.backend),
         model(value.model),
         geometry(RuntimeGeometry::from(value.model, value.kvPages.layout().format,
-                                       value.stateStorage.layout().target.format, value.blockCache != nullptr)),
+                                       value.stateStorage.layout().target.format,
+                                       StreamedParts::loaded(value.model, value.blockCache != nullptr))),
         operators(value.operators),
         kvPages(value.kvPages),
         states(value.stateStorage),
@@ -3415,10 +3416,9 @@ void withPrefillArena(
 ModelMemoryPlan plannedRuntimeMemory(const LoadedModel &model,
                                      const ops::ExecutionPlans &operators,
                                      kv::Format kvFormat,
-                                     ops::GdnStateFormat stateFormat,
-                                     bool kvSpills) {
+                                     ops::GdnStateFormat stateFormat, StreamedParts parts) {
   requireCompatibleModel(model);
-  const RuntimeGeometry geometry = RuntimeGeometry::from(model, kvFormat, stateFormat, kvSpills);
+  const RuntimeGeometry geometry = RuntimeGeometry::from(model, kvFormat, stateFormat, parts);
   return {model.stateLayout(stateFormat).laneBytes(),
           plannedPrefillBytes(geometry, operators),
           plannedDecodeBytes(geometry, operators)};

@@ -46,6 +46,7 @@ StreamableWeights targetWeights(const Layout &layout, const Plan &plan, gguf::Pl
     if (image.streamedRows) {
       result.tableBytes = loadedBytes(plan({.streamExperts = streams.streamExperts})) - result.loadedBytes;
       const SparseRowStoreOptions rows = streamedTableRows(layout);
+      result.tableRowBytes = image.streamedRows->rowBytes;
       result.tableFloorBytes = SparseRowStore::workingBytes(image.streamedRows->rowBytes, rows.prefetchRows,
                                                             rows.stageRows) +
                                SparseRowStore::cacheBytesFor(1, image.streamedRows->rowBytes);

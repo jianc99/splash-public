@@ -443,9 +443,9 @@ std::unique_ptr<QwenTarget> makeQwenTarget(const Qwen4ExpWeights &weights, const
   return std::make_unique<Qwen4ExpTarget>(weights, geometry, backend, operators, prefillChunks);
 }
 
-QwenTargetScratchBytes qwenTargetScratchBytes(const Qwen4ExpWeights &weights, const QwenTargetGeometry &geometry,
-                                              uint32_t prefillChunks) {
-  return Qwen4Steps::scratchBytes(weights, geometry, prefillChunks);
+QwenTargetScratchBytes qwenTargetScratchBytes(const Qwen4ExpWeights &, const QwenTargetGeometry &geometry,
+                                              uint32_t prefillChunks, uint64_t tableRowBytes) {
+  return Qwen4Steps::scratchBytes(geometry, tableRowBytes, prefillChunks);
 }
 
 // A stage takes a prefill chunk's table rows, pleHeads() for each of its
