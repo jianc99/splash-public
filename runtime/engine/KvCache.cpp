@@ -430,11 +430,6 @@ void KvCache::setSlot(uint64_t blockId, std::shared_ptr<KvDiskSlot> slot) {
 }
 
 void KvCache::giveDiskCopy(Block &entry, std::shared_ptr<KvDiskSlot> slot) {
-  // Reads of spilled KV hold a copy only while a request holds its block or
-  // a transfer moves it (Cache::cutPageTable): a copy given up with another
-  // holder would keep its quota while the cache counts it free.
-  if (entry.slot && !slot && entry.slot.use_count() != 1)
-    throw std::logic_error("a KV cache block gave up a copy that a reader still holds");
   if (static_cast<bool>(entry.slot) != static_cast<bool>(slot)) {
     slot ? ++diskBlocks_ : --diskBlocks_;
     if (entry.held)
@@ -597,9 +592,6 @@ void KvCache::erase(uint64_t blockId) {
       candidate.transfer != Transfer::None) {
     throw std::logic_error("cannot evict a referenced KV cache block");
   }
-  // Its copy goes with it (giveDiskCopy).
-  if (candidate.slot && candidate.slot.use_count() != 1)
-    throw std::logic_error("a KV cache block left while a reader still holds its copy");
   const uint64_t parentId = candidate.parent;
   const uint64_t previous = candidate.previousSibling;
   const uint64_t next = candidate.nextSibling;
@@ -691,6 +683,12 @@ void KvCache::checkInvariants() const {
     check(entry.id == id, "a block's id");
     disk += entry.slot != nullptr;
     heldCopies += entry.held && entry.slot;
+    // Reads of spilled K/V hold a copy only while a request holds its block
+    // or a transfer moves it (Cache::cutPageTable), so a copy quota gives up
+    // returns its slot at once. A command's cut names blocks its lanes held,
+    // and outlives them only while the engine applies its results.
+    check(!entry.slot || entry.held || entry.transfer != Transfer::None || entry.slot.use_count() == 1,
+          "a copy no request holds and no transfer moves has no reader");
     if (entry.parent) {
       const auto parent = blocks_.find(entry.parent);
       check(parent != blocks_.end(), "a block's parent is in the graph");

@@ -170,8 +170,7 @@ public:
   void setTransfer(uint64_t blockId, Transfer transfer);
   // Publishes the block's disk copy. A block whose page holds its K/V may
   // drop it with null; one whose page holds only its index cannot, and a
-  // disk-only block is erased instead. A copy a reader still holds
-  // (KvTier::copy) is never dropped.
+  // disk-only block is erased instead.
   void setSlot(uint64_t blockId, std::shared_ptr<KvDiskSlot> slot);
   // Returns the page of a resident leaf that has a disk copy to the pool.
   void dropPage(uint64_t blockId);
@@ -211,8 +210,9 @@ public:
   // resident.
   [[nodiscard]] std::vector<uint64_t> subtree(uint64_t blockId) const;
   // Only a block without children, users, holders or transfer can be
-  // removed, and not while a reader holds its copy. The caller handles any
-  // composite state attached to it first.
+  // removed. Its copy goes with it, and the copy's slot once a reader that
+  // still holds it (KvTier::copy) lets go. The caller handles any composite
+  // state attached to it first.
   void erase(uint64_t blockId);
 
   // Blocks with a disk copy, resident or not; the pool counts the resident
@@ -224,7 +224,8 @@ public:
   // was on the disk once already.
   [[nodiscard]] uint64_t rewrites() const noexcept { return rewrites_; }
   // Tests: std::logic_error unless every block's links, counts, form and
-  // held mark agree with the graph and the pool.
+  // held mark agree with the graph and the pool, and, between commands, no
+  // copy of a block that nothing holds or moves has a reader.
   void checkInvariants() const;
 
 private:

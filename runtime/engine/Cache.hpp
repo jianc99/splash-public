@@ -599,8 +599,8 @@ public:
   }
   [[nodiscard]] CacheSnapshot snapshot() const;
   [[nodiscard]] KvSpillSnapshot spillSnapshot() const;
-  // Tests: std::logic_error unless the blocks, pages, references and quota
-  // keep every invariant spilling relies on.
+  // Tests, between commands: std::logic_error unless the blocks, pages,
+  // references and quota keep every invariant spilling relies on.
   void checkInvariants() const;
 
 private:
