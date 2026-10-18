@@ -1105,7 +1105,7 @@ uint64_t ExpertStore::minimumBytes(const StreamedBlocks &blocks, ops::MoeShape s
 
 metal::MetalBuffer residentExpertSlots(metal::MetalBackend &backend, uint32_t experts) {
   metal::MetalBuffer table =
-      backend.allocateBuffer(uint64_t{experts} * sizeof(uint32_t), metal::BufferStorage::Shared,
+      backend.allocateBuffer(residentExpertSlotsBytes(experts), metal::BufferStorage::Shared,
                              "experts/resident-slots");
   auto *slot = static_cast<uint32_t *>(table.contents());
   for (uint32_t expert = 0; expert < experts; ++expert) slot[expert] = expert;
