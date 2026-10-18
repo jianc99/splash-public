@@ -244,13 +244,11 @@ void KvBlockCache::Impl::resolve(uint32_t layer, const Resolve &resolve, KvReadS
   stats.ghostHits += slots.ghostHits() - ghostHits;
   if (!reads.empty()) {
     // The reads run now, ahead of the background, as a batch that keeps its
-    // failures (SsdReaders::finish) instead of throwing the first
-    // (SsdReaders::run): a block the readers read twice in vain fails the
-    // lanes that list it, not the command.
+    // failures (SsdReaders::runBatch): a block the readers read twice in vain
+    // fails the lanes that list it, not the command.
     const AwakeClock::time_point reading = AwakeClock::now();
-    const std::shared_ptr<SsdReaders::Batch> batch = readers->start(
-        reads.size(), [this, layer](size_t index) { readBlock(layer, reads[index]); }, readers->readers());
-    readers->finish(*batch);
+    const std::shared_ptr<SsdReaders::Batch> batch =
+        readers->runBatch(reads.size(), [this, layer](size_t index) { readBlock(layer, reads[index]); });
     readTimes.add(nanosecondsSince(reading));
     const uint64_t failed = batch->tally().failures;
     stats.readBytes += (reads.size() - failed) * recordBytes;
