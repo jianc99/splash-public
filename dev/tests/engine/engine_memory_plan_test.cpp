@@ -7,6 +7,7 @@
 #include <iostream>
 #include <limits>
 #include <stdexcept>
+#include <tuple>
 
 using namespace splash;
 using namespace splash::engine;
@@ -500,7 +501,8 @@ void testFlashNextOnTheThreeMacs() {
                 spill.floorTokens == std::min<uint32_t>(1'010'000, disk),
             std::string("Flash-Next's context bounds on the ") + mac.name + " are wrong");
     const uint64_t stagedPages = (pagesOf(spill.floorTokens + 7) + 255) / 256 * 256;
-    require(spill.stagingBuffers == 2 && spill.stagingBytes == 2 * stagedPages * test::sparseKvLayout().bytesPerLayerPage(),
+    require(spill.stagingBuffers == 2 &&
+                spill.stagingBytes == 2 * stagedPages * test::sparseKvLayout().bytesPerLayerPage(),
             std::string("Flash-Next on the ") + mac.name + " does not stage in two buffers");
   }
   require(requirePlan(kFlashNext.inputs(kM6, true)).expertBytes <
@@ -509,21 +511,20 @@ void testFlashNextOnTheThreeMacs() {
 }
 
 // Main's plan for the 35B on the three Macs: every routed expert loads with
-// its layer, and the plan is the one main makes.
+// its layer, and the KV holds main's context, pinned: the M6 229,369 tokens
+// beside the whole Q2_K_XL, the others the 256K window of UD-Q4_K_M.
 void testDense35BKeepsMainsPlan() {
-  for (const auto &[mac, target] : {std::pair{kM6, k35BQ2}, std::pair{kStudio, k35BQ4}, std::pair{kM5Pro, k35BQ4}}) {
+  const std::tuple<Mac, Target, uint32_t, uint64_t> pinned[] = {
+      {kM6, k35BQ2, 229'369, 229'376}, {kStudio, k35BQ4, 262'144, 352'256}, {kM5Pro, k35BQ4, 262'144, 2'801'664}};
+  for (const auto &[mac, target, context, capacityTokens] : pinned) {
     const StreamedMemoryPlan plan = requirePlan(target.inputs(mac, false));
     require(!plan.expertBytes && !plan.tableBytes && !plan.spill.enabled,
             std::string("the 35B streams its experts on the ") + mac.name + " where main loads them");
     const EngineMemoryPlan mains = test::requireMemoryPlan(deviceOf(mac), target.profile());
-    require(mains.maximumContextTokens() == mains.breakdown().contextBounds.resident &&
+    require(mains.maximumContextTokens() == context && mains.breakdown().kvCapacityTokens == capacityTokens &&
                 mains.breakdown().contextBounds.bound() != std::string_view("disk"),
-            "a dense plan's context is not its resident KV's");
+            std::string("the 35B's plan on the ") + mac.name + " is not main's");
   }
-  // The M6 holds the 35B's whole Q2_K_XL with 2.6 GB for KV, the 256K window.
-  const StreamedMemoryInputs m6 = k35BQ2.inputs(kM6, false);
-  require(hardBudget(kM6) - m6.fixedBytes - k35BQ2.experts.allBytes > 2 * kGiB,
-          "the 35B's fixture no longer leaves the M6 its KV");
 }
 
 // A dense target's explicit context is its KV allowance: where the experts
@@ -620,7 +621,8 @@ void testSpillNeedsATierAndRoom() {
   // A budget whose floors hold the model but not the hot cache's floor.
   inputs = kFlashNext.inputs(kM6, true);
   inputs.experts.setting = inputs.table.setting = {StreamedSetting::Mode::Off, 0};
-  inputs.hardBudgetBytes = inputs.fixedBytes + inputs.laneStateBytes + 256 * test::sparseKvLayout().bytesPerModelPage() +
+  inputs.hardBudgetBytes = inputs.fixedBytes + inputs.laneStateBytes +
+                           256 * test::sparseKvLayout().bytesPerModelPage() +
                            kFlashNext.experts.allBytes + kFlashNext.table.allBytes + 200 * kMiB;
   require(!requirePlan(inputs).spill.enabled, "spilling was planned without room for its floors");
 }
