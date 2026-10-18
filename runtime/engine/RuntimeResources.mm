@@ -710,7 +710,17 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   };
   model::ModelLoadOptions loadOptions;
   try {
-    streamable = model::streamableWeights(config.modelRoot, config.model);
+    // A table set off is among the images that load: its streaming is never
+    // planned.
+    streamable = model::streamableWeights(
+        config.modelRoot, config.model,
+        {.streamExperts = true, .streamTable = config.pleMemory.mode != StreamedSetting::Mode::Off});
+    if (!streamable.tableRefusal.empty()) {
+      if (config.pleMemory.mode == StreamedSetting::Mode::Size)
+        throw RuntimeResourcesError(RuntimeResourceStage::Configuration,
+                                    "--ple-memory cannot stream the PLE table: " + streamable.tableRefusal);
+      logLine("The PLE table loads with the weights: ", streamable.tableRefusal, " (--ple-memory auto).");
+    }
     reportIgnoredSetting("--ple-memory", config.pleMemory, streamable.tableBytes, config.model.name, "PLE table",
                          "loads with the weights");
     reportIgnoredSetting("--expert-memory", config.expertMemory, streamable.expertBytes, config.model.name,
