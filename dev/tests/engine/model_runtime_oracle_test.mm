@@ -17,7 +17,6 @@
 #include "model/Qwen4Exp.hpp"
 #include "model/Qwen4Steps.hpp"
 #include "model/RuntimeInstrumentation.hpp"
-#include "model/SsdReaders.hpp"
 #include "model/QwenState.hpp"
 #include "model/SpilledKvReads.hpp"
 #include "model/SsdReaders.hpp"
@@ -2602,7 +2601,7 @@ void requireBatchedLanesMatchReordered(model::Runtime &executor, const model::Qw
 }
 
 // The K/V of a block-sparse target whose committed pages hold only their
-// index (kv::PageForm::Index), their K/V in tier copies (HiSparse), reaches
+// index (kv::PageForm::Index), their K/V in SSD cache tier copies, reaches
 // the attention through the command's reads of spilled K/V
 // (model::SpilledKvReads): a prefill's history streamed into staging
 // (model::KvHistoryStream), a decode's selected blocks through the hot block
@@ -2993,7 +2992,7 @@ struct SpillRecord final {
 };
 
 // A block-sparse target's outputs are bitwise the same whether its K/V
-// spills or stays (HiSparse I1), for the same schedule: four requests, each
+// spills or stays, for the same schedule: four requests, each
 // prefilled in commands of the runtime's prefill group, the first of which
 // ends past the dense history and a fourth of a chunk, then decoded one
 // alone, four together, two and one again, and the one last once more as a
