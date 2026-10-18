@@ -912,6 +912,9 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     }
   }
   reportStreamedStores(loaded, streamable, config.expertMemory, config.pleMemory);
+  // The model's side of the split (startAneFfn).
+  const AneFfnModel splitModel =
+      aneFfnModel(*backend, loaded, operators, config.kvFormat, config.buildId, config.cancelled);
 
   // The automatic tier keeps its staging only where the plan holds the model
   // and the requested context beside it, the parts as they load. The split
@@ -921,9 +924,6 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   // the staging that engine kept; only its split leaves that engine's context
   // (below).
   if (stateStagingBytes && automaticDisk) {
-    // The model's side of the split (startAneFfn).
-    const AneFfnModel splitModel =
-        aneFfnModel(*backend, loaded, operators, config.kvFormat, config.buildId, config.cancelled);
     const auto withoutStaging = [&](uint64_t aneFfnBytes) { return planWith(0, aneFfnBytes); };
     const EngineMemoryPlanResult planResult = planMemory(0);
     if (!planResult.plan ||
@@ -1021,9 +1021,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
         requestedContextTokens ? RequestedContext{.tokens = requestedContextTokens}
                                : RequestedContext{.tokens = config.relaunchContext,
                                                   .relaunch = config.relaunchContext != 0};
-    AneFfnStart aneFfn = startAneFfn(
-        aneFfnModel(*backend, loaded, operators, config.kvFormat, config.buildId, config.cancelled),
-        config.aneFfn, splitContext, planMemory, config.cancelled);
+    AneFfnStart aneFfn = startAneFfn(splitModel, config.aneFfn, splitContext, planMemory, config.cancelled);
     if (aneFfn.plan)
       memoryPlan = std::move(*aneFfn.plan);
     const EngineMemoryBreakdown &budget = memoryPlan.breakdown();
