@@ -101,10 +101,11 @@ void MemoryGovernor::Reservation::release() noexcept {
 
 MemoryGovernor::MemoryGovernor(metal::MetalBackend &backend, uint64_t limitBytes,
                                uint64_t hostReserveBytes, uint64_t hostSpareReserveBytes,
-                               HostMemoryProvider hostMemory, uint64_t untrackedReserveBytes, uint64_t hostHeldBytes)
+                               HostMemoryProvider hostMemory, uint64_t untrackedReserveBytes,
+                               HostHeldProvider hostHeld)
     : backend_(backend), limitBytes_(limitBytes), hostReserveBytes_(hostReserveBytes),
       hostSpareReserveBytes_(hostSpareReserveBytes), hostMemory_(std::move(hostMemory)),
-      untrackedReserveBytes_(untrackedReserveBytes), hostHeldBytes_(hostHeldBytes) {
+      untrackedReserveBytes_(untrackedReserveBytes), hostHeld_(std::move(hostHeld)) {
   if (!limitBytes_) {
     throw std::invalid_argument("memory governor limit must be positive");
   }
@@ -139,7 +140,8 @@ MemoryGovernor::chargedBytes(bool refreshDevice) const noexcept {
       ? memory.allocatedBytes + untrackedReserveBytes_
       : limit;
   const uint64_t device = std::max(accounted, memory.deviceCurrentAllocatedBytes);
-  return hostHeldBytes_ <= limit - device ? device + hostHeldBytes_ : limit;
+  const uint64_t held = hostHeld_ ? hostHeld_() : 0;
+  return held <= limit - device ? device + held : limit;
 }
 
 std::optional<HostMemory> MemoryGovernor::sampleHost() const noexcept {
@@ -176,7 +178,8 @@ MemoryGovernor::tryReserve(uint64_t bytes, metal::AllocationFailure &failure) {
   // Growth leaves the warning margin free above the host's spare reserve,
   // stops while macOS warns and, while a request waits for memory, waits for
   // the recovery margin once the host has run short, unless a request in
-  // service needs it (setServing).
+  // service needs it (setServing), or the engine released it for a start
+  // (setFunded).
   const uint64_t hostRoom = hostHeadroomBytes(host, 0);
   const bool hostRoomFits =
       requested <= hostRoom && hostRoom - requested >= kHostWarningMarginBytes;
@@ -186,10 +189,10 @@ MemoryGovernor::tryReserve(uint64_t bytes, metal::AllocationFailure &failure) {
   // toward the recovery margin for it.
   if (engineFits && !serving_ && !hostRoomFits)
     host_.constrained = true;
-  const bool hostRefuses =
-      pressure == MemoryPressure::Critical ||
-      (!serving_ && (systemPressure_ == MemoryPressure::Warning || !hostRoomFits ||
-                     growthHeld(host_)));
+  const bool hostHolds =
+      systemPressure_ == MemoryPressure::Warning || !hostRoomFits || growthHeld(host_);
+  const bool hostRefuses = pressure == MemoryPressure::Critical ||
+                           (!serving_ && hostHolds && !(funded_ && bytes <= fundedBalance_));
   if (hostRefuses || !engineFits) {
     // The host's refusal lifts with its pressure, the limit's only once
     // memory is freed: a refusal they share is the host's.
@@ -201,6 +204,8 @@ MemoryGovernor::tryReserve(uint64_t bytes, metal::AllocationFailure &failure) {
     return std::nullopt;
   }
   reservedBytes_ = requested;
+  // Growth takes the balance first, whatever it is for.
+  fundedBalance_ -= std::min(fundedBalance_, bytes);
   return Reservation(this, bytes);
 }
 
@@ -225,6 +230,17 @@ bool MemoryGovernor::setServing(bool serving) noexcept {
   return std::exchange(serving_, serving);
 }
 
+uint64_t MemoryGovernor::fund(uint64_t bytes) noexcept {
+  fundedBalance_ = bytes <= std::numeric_limits<uint64_t>::max() - fundedBalance_
+                       ? fundedBalance_ + bytes
+                       : std::numeric_limits<uint64_t>::max();
+  return fundedBalance_;
+}
+
+bool MemoryGovernor::setFunded(bool funded) noexcept {
+  return std::exchange(funded_, funded);
+}
+
 void MemoryGovernor::setRequestWaiting(bool waiting) noexcept {
   requestWaiting_ = waiting;
 }
@@ -247,7 +263,12 @@ MemoryGovernorSnapshot MemoryGovernor::snapshot() const noexcept {
 MemoryGovernorSnapshot MemoryGovernor::evaluate() noexcept {
   const std::optional<HostMemory> host = sampleHost();
   host_ = hostState(host);
-  return snapshot(host, host_);
+  MemoryGovernorSnapshot result = snapshot(host, host_);
+  // Once the host allows growth again, what was released for starts it held
+  // back goes back to it.
+  if (result.hostGrowthAllowed)
+    fundedBalance_ = result.fundedBalanceBytes = 0;
+  return result;
 }
 
 MemoryGovernorSnapshot
@@ -278,6 +299,7 @@ MemoryGovernor::snapshot(const std::optional<HostMemory> &hostMemory,
       hostHeadroom,
       systemPressure_,
       hostGrowthAllowed,
+      fundedBalance_,
   };
 }
 

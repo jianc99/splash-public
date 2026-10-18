@@ -20,11 +20,20 @@ namespace {
 using splash::test::rejects;
 using splash::test::require;
 
+// Whether admit() reserves inside the funded mark: every case that funds
+// nothing runs both ways, the mark at a balance of 0 changing nothing.
+bool fundedMark = false;
+
 // Admits bytes through the governor's one admission path, running allocate
 // while they are reserved.
 metal::AllocationResult admit(MemoryGovernor &governor, uint64_t bytes,
                               const std::function<void()> &allocate = [] {}) {
-  return governor.allocationAdmission()(bytes, allocate);
+  if (!fundedMark)
+    return governor.allocationAdmission()(bytes, allocate);
+  const bool previous = governor.setFunded(true);
+  const metal::AllocationResult result = governor.allocationAdmission()(bytes, allocate);
+  governor.setFunded(previous);
+  return result;
 }
 
 // A host whose spare memory is all its available memory: no anonymous
@@ -263,18 +272,23 @@ void testReservationsAndAdmissionClasses() {
 }
 
 // Host memory the engine holds outside Metal (a streamed table's row cache)
-// is charged in full beside the backend's buffers.
+// is charged in full beside the backend's buffers, as it holds it now: a
+// chunk the cache gives back leaves the charge.
 void testHostHeldBytesAreCharged() {
   test::metalStatistics() = {};
   metal::MetalBackend backend("unused");
   const uint64_t hostReserve = 64 * 1024;
-  const uint64_t limit = 64 * 1024, held = 16 * 1024;
+  const uint64_t limit = 64 * 1024;
+  uint64_t held = 16 * 1024;
   MemoryGovernor governor(backend, limit, hostReserve, hostReserve, [] {
     return hostMemory(hostReserve + 3 * kGiB);
-  }, 0, held);
+  }, 0, [&held] { return held; });
   require(static_cast<bool>(admit(governor, limit - held)) && !admit(governor, limit - held + 1),
           "memory governor did not charge the host memory the engine holds");
   require(governor.snapshot().chargedBytes == held, "the host memory the engine holds is not in its charge");
+  held = 4 * 1024;
+  require(governor.snapshot().chargedBytes == held && admit(governor, limit - held),
+          "the charge did not follow what the engine gave back");
 }
 
 // Critical pressure stops all growth. Host headroom below the warning margin
@@ -790,27 +804,142 @@ void testSystemWarningGivesCacheBack() {
           "growth or the passes did not follow macOS back to normal pressure");
 }
 
+// A Mac whose host holds growth back, inside the warning margin: 14 GiB
+// allocated of a 15 GiB limit.
+struct HeldBack final {
+  metal::AllocationResult grow(uint64_t bytes) {
+    return admit(governor, bytes, [bytes] { allocate(bytes); });
+  }
+  // A reservation inside the funded mark.
+  metal::AllocationResult funded(uint64_t bytes) {
+    const bool previous = governor.setFunded(true);
+    const metal::AllocationResult result = grow(bytes);
+    governor.setFunded(previous);
+    return result;
+  }
+
+  static constexpr uint64_t kHostReserve = 2 * kGiB;
+  // The backend's charge, set before the governor measures it.
+  struct Charge final {
+    Charge() {
+      test::metalStatistics() = {};
+      test::metalStatistics().allocatedBytes = 14 * kGiB;
+      test::metalStatistics().deviceCurrentAllocatedBytes = 14 * kGiB;
+    }
+  } charge;
+  std::optional<uint64_t> available = kHostReserve + kGiB / 2;
+  metal::MetalBackend backend{"unused"};
+  MemoryGovernor governor{backend, 15 * kGiB, kHostReserve, kHostReserve,
+                          [this] { return hostMemory(available); }, 0};
+};
+
+// While the host holds growth back, what the engine released for a start
+// it refused funds the start: a reservation inside the funded mark is
+// admitted when it fits the balance, which it draws down, and refused
+// beyond it; outside the mark the balance admits nothing.
+void testFundedReservationsFitTheBalance() {
+  HeldBack host;
+  require(!host.grow(100 * kMiB) && !host.funded(100 * kMiB) && !host.governor.snapshot().hostGrowthAllowed,
+          "the host did not hold growth back, or the mark admitted growth without a balance");
+  require(host.governor.fund(256 * kMiB) == 256 * kMiB && host.governor.fund(8 * kMiB) == 264 * kMiB &&
+              host.governor.snapshot().fundedBalanceBytes == 264 * kMiB,
+          "the balance is not what the engine released");
+  const metal::AllocationResult outside = host.grow(100 * kMiB);
+  require(!outside && outside.failure == metal::AllocationFailure::HostPressure &&
+              host.governor.snapshot().fundedBalanceBytes == 264 * kMiB,
+          "a balance admitted growth outside the funded mark");
+  const metal::AllocationResult beyond = host.funded(265 * kMiB);
+  require(!beyond && beyond.failure == metal::AllocationFailure::HostPressure &&
+              host.governor.snapshot().fundedBalanceBytes == 264 * kMiB,
+          "a funded reservation beyond the balance was admitted");
+  require(host.funded(200 * kMiB) && host.governor.snapshot().fundedBalanceBytes == 64 * kMiB &&
+              host.funded(64 * kMiB) && host.governor.snapshot().fundedBalanceBytes == 0 && !host.funded(1),
+          "funded reservations did not draw the balance down to what they took");
+}
+
+// Critical pressure and the engine's limit refuse a funded reservation as
+// any other, and leave the balance as it was.
+void testCriticalAndTheLimitRefuseFunding() {
+  HeldBack host;
+  host.governor.fund(2 * kGiB);
+  host.governor.setPressure(MemoryPressure::Critical);
+  const metal::AllocationResult critical = host.funded(100 * kMiB);
+  require(!critical && critical.failure == metal::AllocationFailure::HostPressure &&
+              host.governor.snapshot().fundedBalanceBytes == 2 * kGiB,
+          "critical pressure admitted a funded reservation, or took its balance");
+  host.governor.setPressure(MemoryPressure::Normal);
+  const metal::AllocationResult limit = host.funded(kGiB + kMiB);
+  require(!limit && limit.failure == metal::AllocationFailure::EngineBudget &&
+              host.governor.snapshot().fundedBalanceBytes == 2 * kGiB,
+          "a funded reservation past the engine's limit was admitted, or took its balance");
+}
+
+// Growth that a request in service makes through the host's pause, a hot
+// floor or a runway refill, takes the balance first: a funded start uses
+// only bytes released for it that no growth has taken since.
+void testServingGrowthDrawsTheBalanceDown() {
+  HeldBack host;
+  host.governor.fund(300 * kMiB);
+  host.governor.setServing(true);
+  require(host.grow(200 * kMiB) && host.governor.snapshot().fundedBalanceBytes == 100 * kMiB,
+          "growth in service did not draw the balance down");
+  host.governor.setServing(false);
+  require(!host.funded(101 * kMiB) && host.funded(100 * kMiB) &&
+              host.governor.snapshot().fundedBalanceBytes == 0,
+          "a funded start took bytes growth had taken");
+}
+
+// The balance spans the control passes that find the host still holding
+// growth back, as spilled pages land over several of them, and lapses at
+// the first one that finds growth allowed, the paused passes' reclaim
+// credited never.
+void testTheBalanceLapsesOnceGrowthIsAllowed() {
+  HeldBack host;
+  host.governor.fund(150 * kMiB);
+  const MemoryGovernorSnapshot paused = host.governor.evaluate();
+  require(!paused.hostGrowthAllowed && paused.fundedBalanceBytes == 150 * kMiB &&
+              host.governor.snapshot().fundedBalanceBytes == 150 * kMiB,
+          "a pass that found growth paused took the balance");
+  host.available = HeldBack::kHostReserve + 3 * kGiB;
+  require(host.governor.snapshot().hostGrowthAllowed && host.governor.snapshot().fundedBalanceBytes == 150 * kMiB,
+          "a read of the governor took the balance");
+  const MemoryGovernorSnapshot allowed = host.governor.evaluate();
+  require(allowed.hostGrowthAllowed && allowed.fundedBalanceBytes == 0 &&
+              host.governor.snapshot().fundedBalanceBytes == 0,
+          "the balance outlived the pause");
+  host.available = HeldBack::kHostReserve + kGiB / 2;
+  require(!host.funded(100 * kMiB), "a lapsed balance funded a start in the next pause");
+}
+
 } // namespace
 
 int main() {
   try {
     testHostAvailabilityCountsReclaimablePages();
     testAdvertisedContextIsGrantable();
-    testReservationsAndAdmissionClasses();
-    testHostHeldBytesAreCharged();
-    testHostHeadroomHysteresis();
-    testReclaimablePagesReopenGrowth();
-    testSnapshotLeavesTheHysteresis();
-    testPressurePolicyDirectives();
-    testHostRefusalStartsReclaim();
-    testHostRefusalComesBeforeTheEngineLimit();
-    testPolicyContinuesHeldBackTarget();
-    testExhaustedReclaimWaivesTheHold();
-    testOnlyAWaitingRequestHoldsGrowth();
-    testOnlyATargetedPassWaitsToSettle();
-    testRequestInServiceGrowsThroughHostPressure();
-    testOptionalGrowthKeepsTheSpareReserve();
-    testSystemWarningGivesCacheBack();
+    for (const bool funded : {false, true}) {
+      fundedMark = funded;
+      testReservationsAndAdmissionClasses();
+      testHostHeldBytesAreCharged();
+      testHostHeadroomHysteresis();
+      testReclaimablePagesReopenGrowth();
+      testSnapshotLeavesTheHysteresis();
+      testPressurePolicyDirectives();
+      testHostRefusalStartsReclaim();
+      testHostRefusalComesBeforeTheEngineLimit();
+      testPolicyContinuesHeldBackTarget();
+      testExhaustedReclaimWaivesTheHold();
+      testOnlyAWaitingRequestHoldsGrowth();
+      testOnlyATargetedPassWaitsToSettle();
+      testRequestInServiceGrowsThroughHostPressure();
+      testOptionalGrowthKeepsTheSpareReserve();
+      testSystemWarningGivesCacheBack();
+    }
+    fundedMark = false;
+    testFundedReservationsFitTheBalance();
+    testCriticalAndTheLimitRefuseFunding();
+    testServingGrowthDrawsTheBalanceDown();
+    testTheBalanceLapsesOnceGrowthIsAllowed();
     std::cout << "memory governor tests passed\n";
     return EXIT_SUCCESS;
   } catch (const std::exception &error) {

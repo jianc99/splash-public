@@ -1011,11 +1011,18 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     // only beyond them, and elastic state and KV never grow into them. The
     // split only moves bytes from KV to fixed runtime memory, so the governor
     // is the same with it or without.
+    // The streamed table's row cache is charged at its planned bytes, less
+    // the chunks it gave back to fund starts (SparseRowStore::releaseChunk).
+    MemoryGovernor::HostHeldProvider hostHeld;
+    if (const uint64_t planned = memoryPlan.breakdown().streamedTableBytes)
+      hostHeld = [planned, table = loaded.streamedTable()] {
+        return planned - std::min(planned, table ? table->releasedBytes() : 0);
+      };
     auto memoryGovernor = std::make_unique<MemoryGovernor>(
         *backend, memoryPlan.breakdown().hardBudgetBytes, hostReserveBytes,
         EngineMemoryPolicy::hostSpareReserveBytes(device.physicalMemoryBytes), config.hostMemory,
         memoryPlan.breakdown().pipelineReserveBytes + memoryPlan.breakdown().runtimeOverheadReserveBytes,
-        memoryPlan.breakdown().streamedTableBytes);
+        std::move(hostHeld));
     if (config.memoryPressure)
       memoryGovernor->setPressure(config.memoryPressure());
     // What the start allocates, the KV runway, the arenas and the warmup, is
