@@ -12,6 +12,7 @@
 #include "model/ModelFactory.hpp"
 #include "model/QwenState.hpp"
 #include "model/SparseRowStore.hpp"
+#include "model/SsdReaders.hpp"
 #include "engine/MemoryAudit.hpp"
 #include "engine/ReleasableMemory.hpp"
 #include "engine/Status.hpp"
@@ -211,8 +212,11 @@ private:
 // Owns every process-wide native resource exactly once. Members go in
 // reverse declaration order: what the engine gives back while idle -> Neural
 // Engine split -> Cache -> KV pool -> the disk tier's space -> KV disk tier
-// -> state storage -> KV page storage -> governor -> loaded model -> Metal
-// backend -> a persistent tier's directory, whose lock goes last.
+// -> state storage -> KV page storage -> governor -> loaded model -> SSD
+// readers -> Metal backend -> a persistent tier's directory, whose lock goes
+// last. The readers outlive what reads on them; the tier's files, which hold
+// their writes back for the readers' urgent reads, keep them as long as they
+// last.
 // The KV disk tier must go before the KV page storage: its IO worker reads
 // and writes pages in place in the extents, and its destructor waits for
 // every transfer in flight. A persistent tier's files are sealed first,
@@ -280,6 +284,7 @@ private:
 
   RuntimeResources(PersistentCacheFiles persistentCache,
                    std::unique_ptr<metal::MetalBackend> backend,
+                   std::shared_ptr<model::SsdReaders> readers,
                    model::LoadedModel model, ops::ExecutionPlans operators,
                    EngineMemoryPlan memoryPlan,
                    RuntimeCacheIdentity cacheIdentity,
@@ -298,6 +303,8 @@ private:
 
   PersistentCacheFiles persistentCache_;
   std::unique_ptr<metal::MetalBackend> backend_;
+  // The engine's one pool of SSD readers.
+  std::shared_ptr<model::SsdReaders> readers_;
   model::LoadedModel model_;
   ops::ExecutionPlans operators_;
   EngineMemoryPlan memoryPlan_;

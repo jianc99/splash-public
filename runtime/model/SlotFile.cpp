@@ -35,6 +35,7 @@ struct SlotFile::Backing {
   // Where each segment of a payload ends (Options::segments); empty when the
   // whole payload, whatever its size, is one.
   std::vector<uint64_t> segmentEnds;
+  std::function<bool()> deferWrites;
   // A persistent file's record file, the label each record holds, the size
   // of a record and a cleared one.
   bool persistent = false;
@@ -423,6 +424,9 @@ private:
   uint32_t crc_ = 0;
 };
 
+// How often a write's chunk looks again whether the reads it waits for ended.
+constexpr auto kDeferralPoll = std::chrono::microseconds(100);
+
 int openPersistent(const std::filesystem::path &path, const char *what) {
   const int descriptor = ::open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
   if (descriptor < 0)
@@ -481,8 +485,7 @@ void SlotFile::prepare(uint64_t slotBytes, std::shared_ptr<DiskBudget> budget, c
       backing_->segmentEnds.push_back(end);
     }
   }
-  // Stub, which the SSD I/O foundation replaces: writes that never
-  // wait for reads.
+  backing_->deferWrites = options.deferWrites;
   backing_->slotBytes = slotBytes;
   backing_->budget = std::move(budget);
   // A write past the file-size limit (ulimit -f, a launchd FileSize) raises
@@ -848,6 +851,18 @@ std::shared_ptr<SlotFile::Operation> SlotFile::write(
         backing.budget->written_.fetch_add(count, std::memory_order_relaxed);
       return count;
     };
+    // Reads a step waits for go first: while they run, a chunk waits for
+    // them, a bounded while.
+    const auto defer = [&] {
+      if (!backing.deferWrites || !backing.deferWrites()) return;
+      const auto began = AwakeClock::now();
+      do {
+        std::this_thread::sleep_for(kDeferralPoll);
+      } while (!cancelled.load(std::memory_order_relaxed) && backing.deferWrites() &&
+               AwakeClock::now() - began < kWriteDeferral);
+      const auto waited = std::chrono::duration_cast<std::chrono::microseconds>(AwakeClock::now() - began);
+      backing.budget->deferred_.fetch_add(static_cast<uint64_t>(waited.count()), std::memory_order_relaxed);
+    };
     slot->written_.store(false, std::memory_order_relaxed);
     slot->verify_.store(false, std::memory_order_relaxed);
     SegmentChecksums checksums(backing.segmentEnds);
@@ -876,6 +891,7 @@ std::shared_ptr<SlotFile::Operation> SlotFile::write(
         std::memset(gathered.data() + filled, 0, gathered.size() - filled);
         chunk = gathered;
       }
+      defer();
       if (!moveChunk(chunk, start + static_cast<off_t>(done), store)) {
         // A full volume is the volume's, which the engine measures again
         // (DiskBudget::fullReported), and the file goes on. Any other error

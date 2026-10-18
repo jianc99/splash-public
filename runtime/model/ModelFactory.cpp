@@ -89,13 +89,8 @@ LoadedModel loadModel(metal::MetalBackend &backend,
   // the vision tower's and the draft's here, the target's by its loader.
   const auto vision = planVisionLoader(root, result.descriptor);
   DraftCheckpointLoader draft(backend, images, root / "draft", result.descriptor.draft);
-  // The weights that stream from their files read on one set of readers,
-  // the engine's. Stub, which the SSD I/O foundation replaces with
-  // the one pool RuntimeResources owns: a load given none makes its own.
-  std::shared_ptr<SsdReaders> readers;
-  if (options.streamedTableBytes || options.expertMemoryBytes)
-    readers = options.readers ? options.readers : std::make_shared<SsdReaders>(kSsdReaders);
-  const ExpertStoreOptions experts{.memoryBytes = options.expertMemoryBytes, .readers = readers};
+  // The weights that stream from their files read on the engine's readers.
+  const ExpertStoreOptions experts{.memoryBytes = options.expertMemoryBytes, .readers = options.readers};
   result.target = std::visit(
       [&](const auto &layout) -> TargetWeights {
         const std::filesystem::path directory = root / "target";
@@ -109,7 +104,7 @@ LoadedModel loadModel(metal::MetalBackend &backend,
           // a step stages and prefetches from the family.
           SparseRowStoreOptions table = tableRows(layout);
           table.cacheBytes = options.streamedTableBytes;
-          table.readers = readers;
+          table.readers = options.readers;
           GgufTargetLoader loader(backend, images, findTargetGgufs(directory), layout.ggufArchitecture, layout, table,
                                   experts);
           return readTarget(backend, layout, std::ref(loader));

@@ -1,18 +1,22 @@
 #pragma once
 
-// The reader threads of the weights that stay in their source files and are
-// read as steps need them (model::ExpertStore, model::SparseRowStore), which
-// a model's stores share: batches of tasks, each reading into memory of its
-// own.
+// The engine's one pool of SSD readers, which RuntimeResources owns: the
+// stores of the weights that stay in their source files and are read as
+// steps need them (model::ExpertStore, model::SparseRowStore) read on them,
+// and so does whatever else reads the SSD for a step. Batches of tasks, each
+// reading into memory of its own.
 //
 // A batch either runs now (run, finish), on the calling thread and every
 // reader, ahead of every background batch, because a step waits for it; or
 // in the background (start), on at most the readers it was given, and only
-// while no batch runs now, so a read ahead never delays a step's reads. The
-// store that started a background batch ends it: finish() runs the rest of it
-// now, and stop() leaves the rest unread and returns once the tasks readers
-// took ended, the batch's first taken() tasks; halt() leaves the rest unread
-// at once, and its taken tasks end on their own (Batch::ended).
+// while no batch runs now, so a read ahead never delays a step's reads.
+// A reader takes the oldest background batch with room for it. While a
+// batch runs now,
+// writes to the drive hold back (criticalBusy). The store that started a
+// background batch ends it: finish() runs the rest of it now, and stop()
+// leaves the rest unread and returns once the tasks readers took ended, the
+// batch's first taken() tasks; halt() leaves the rest unread at once, and its
+// taken tasks end on their own (Batch::ended).
 //
 // A task that throws is tried once more, for a transient I/O error; a second
 // failure is the task's. A batch that runs now throws its first failure once
@@ -40,10 +44,11 @@
 
 namespace splash::model {
 
-// A model's readers: an SSD reads small pieces at full speed only with many
-// in flight (an M5 Pro's reads 460 KiB pieces at 8.1 GB/s from four threads
-// and at 12.5 GB/s from sixteen).
-inline constexpr unsigned kSsdReaders = 16;
+// The engine's readers: an SSD reads small pieces at full speed only with
+// many in flight (an M5 Pro reads 460 KiB pieces at 8.1 GB/s from four
+// threads and at 12.5 GB/s from sixteen, and random 4 KiB pieces 168K times
+// a second from sixteen and 230K from thirty-two, as the other Macs do).
+inline constexpr unsigned kSsdReaders = 32;
 
 class SsdReaders final {
 public:

@@ -242,8 +242,8 @@ default.
 - A step's rows are staged before its PLE layer gathers them: the CPU copies
   each distinct row the step reads once into a small Shared buffer of the
   step's scratch, from the cache or, for the rows it lacks, with uncached
-  (`F_NOCACHE`) row reads (90 bytes for IQ4_NL, 170 for Q8_0) by the model's
-  16 SSD readers, which streamed experts share (`SsdReaders`,
+  (`F_NOCACHE`) row reads (90 bytes for IQ4_NL, 170 for Q8_0) by the engine's
+  32 SSD readers, which streamed experts share (`SsdReaders`,
   `runtime/model/SsdReaders.hpp`), and the staging thread itself
   (`SparseRowStore`, `runtime/model/SparseRowStore.hpp`). The gather then
   reads them with the table's own kernel, so a row's values are computed
@@ -290,7 +290,7 @@ place (`target_weights_bytes`). Off by default.
   slots for them, recycled by adaptive replacement (ARC: the experts decode
   steps route again stay while the others pass through, and a prompt's
   experts go first), and reads them from their
-  files into a staging of a decode cycle's experts on the model's weight
+  files into a staging of a decode cycle's experts on the engine's SSD
   readers, and a repack kernel writes them into their slots before the expert
   passes run. A decode step's load is one such round; a prefill command's
   loads take as many rounds as its rows may route experts, each staging half
@@ -2730,7 +2730,9 @@ after the write succeeds. Unneeded tails are dropped without writing, before any
 state, together with any disk copies below them. A restored page is read
 straight into its extent. Either way the transfer runs on the file's IO worker
 beside whatever command the model runs: a cached page is never written by a
-command, and no command uses a page before its read has landed. At most 128 KV
+command, and no command uses a page before its read has landed. While a step
+waits for SSD reads (streamed experts or PLE rows), each 1 MiB of a write
+waits for them, at most 2 ms (`SlotFile::Options::deferWrites`). At most 128 KV
 pages are in transfer at a time, demotions at most half of them and restores at
 most three quarters, since one worker serves both in order and a burst of either
 kind must leave the other its share. When the tier takes no more, leaves that

@@ -1,13 +1,14 @@
-// The readers of streamed weights (model::SsdReaders) run every task of a
-// batch once: a batch that runs now on the caller and every reader, a
-// background batch on at most its readers; a failed task is tried once more,
-// and a second failure is the batch's (a batch that runs now throws it once
-// every task ended); stop() leaves the tasks no reader took unrun and
-// returns once those taken ended, and the batch's end once every task ran,
-// halt() returns at once and each taken task tells when it ended, finish()
-// runs the rest now and returns once the batch's end has; a batch that runs
-// now never waits behind a background batch's queue; and several threads run, start, stop and finish batches at
-// once. Built under TSan too.
+// The engine's SSD readers (model::SsdReaders) run every task of a batch
+// once: a batch that runs now on the caller and every reader, a background
+// batch on at most its readers, the oldest first; a failed task is tried
+// once more, and a second failure is the batch's (a batch that runs now
+// throws it once every task ended); stop() leaves the tasks no reader took
+// unrun and returns once those taken ended, and the batch's end once every
+// task ran, halt() returns at once and each taken task tells when it ended,
+// finish() runs the rest now and returns once the batch's end has; a batch
+// that runs now never waits behind a background batch's queue, and the pool
+// is busy for writes exactly while one runs; and several threads run, start,
+// stop and finish batches at once. Built under TSan too.
 #include "TestChecks.hpp"
 #include "model/SsdReaders.hpp"
 
@@ -244,6 +245,64 @@ void runNowPassesTheBackground() {
           "a background batch ran a task other than once");
 }
 
+// A reader takes the background batches in the order they came: one
+// reader runs the tasks of three batches started behind a busy one batch by
+// batch.
+void backgroundRunsTheOldestFirst() {
+  SsdReaders pool(1);
+  Gate gate;
+  std::atomic<bool> began = false;
+  const auto busy = pool.start(
+      1,
+      [&](size_t) {
+        began = true;
+        gate.wait();
+      },
+      1);
+  while (!began.load()) std::this_thread::yield();
+  std::mutex orderMutex;
+  std::vector<size_t> order;
+  std::atomic<size_t> ran = 0;
+  std::vector<std::shared_ptr<SsdReaders::Batch>> batches;
+  for (size_t batch = 0; batch < 3; ++batch)
+    batches.push_back(pool.start(
+        4,
+        [&, batch](size_t index) {
+          const std::lock_guard lock(orderMutex);
+          order.push_back(batch * 4 + index);
+          ++ran;
+        },
+        1));
+  gate.open();
+  while (ran.load() < 12) std::this_thread::yield();
+  for (const auto &batch : batches) pool.stop(*batch);
+  pool.stop(*busy);
+  require(std::ranges::is_sorted(order), "a reader took a later background batch first");
+}
+
+// Writes yield to the pool exactly while a batch runs now (criticalBusy):
+// not while it is idle or only reads in the background.
+void criticalBusyWhileABatchRunsNow() {
+  SsdReaders pool(2);
+  require(!pool.criticalBusy(), "an idle pool held writes back");
+  Gate gate;
+  std::atomic<bool> began = false;
+  const auto ahead = pool.start(
+      1,
+      [&](size_t) {
+        began = true;
+        gate.wait();
+      },
+      1);
+  while (!began.load()) std::this_thread::yield();
+  require(!pool.criticalBusy(), "a background batch held writes back");
+  std::atomic<int> seen = 0;
+  pool.run(8, [&](size_t) { seen += pool.criticalBusy(); });
+  require(seen.load() == 8 && !pool.criticalBusy(), "a batch run now did not hold writes back exactly while it ran");
+  gate.open();
+  pool.stop(*ahead);
+}
+
 void threadsShareTheReaders() {
   SsdReaders pool(6);
   std::vector<std::thread> threads;
@@ -277,6 +336,8 @@ int main() {
     stopLeavesTheRestUnread();
     haltLeavesTheTakenRunning();
     runNowPassesTheBackground();
+    backgroundRunsTheOldestFirst();
+    criticalBusyWhileABatchRunsNow();
     threadsShareTheReaders();
   } catch (const std::exception &error) {
     std::cerr << "ssd_readers_test: FAIL: " << error.what() << '\n';

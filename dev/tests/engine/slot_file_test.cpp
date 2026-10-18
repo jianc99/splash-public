@@ -1,3 +1,4 @@
+#include "AwakeClock.hpp"
 #include "Checked.hpp"
 #include "TestChecks.hpp"
 #include "model/Crc32c.hpp"
@@ -963,6 +964,38 @@ static void testSpillsWithinTheWriteBudget() {
   require(budget->admitsSpill(uint64_t{1} << 50), "a lifted write budget refused a spill");
 }
 
+// While reads a step waits for run, each chunk of a write waits for them, at
+// most kWriteDeferral, and the wait is counted; without them no chunk
+// waits. Either way the write lands.
+static void testWritesDeferToReads() {
+  constexpr size_t size = 3 << 20;
+  constexpr uint64_t bound = std::chrono::microseconds(SlotFile::kWriteDeferral).count();
+  std::atomic<bool> reading = true;
+  std::atomic<int> asked = 0;
+  auto budget = std::make_shared<DiskBudget>(2 * size);
+  SlotFile file(size, budget, {.deferWrites = [&] {
+                                 ++asked;
+                                 return reading.load();
+                               }});
+  auto slot = file.acquire();
+  const std::vector<std::byte> payload = patterned(size, 11);
+  const auto started = splash::AwakeClock::now();
+  require(file.write(slot, {payload}, {})->wait(), "a deferred write failed");
+  const double waited = splash::millisecondsSince(started);
+  const uint64_t deferred = budget->writesDeferredMicroseconds();
+  // Three chunks, each held back its bound and at most a loaded machine's
+  // oversleep more.
+  require(deferred >= 3 * bound && waited * 1000 >= 3 * bound && deferred < 3 * (bound + 20'000),
+          "a write's chunks did not wait their bound for reads, or waited longer");
+  reading = false;
+  asked = 0;
+  require(file.write(slot, {payload}, {})->wait() && budget->writesDeferredMicroseconds() == deferred &&
+              asked.load() == 3,
+          "a write waited without reads to wait for, or did not ask once a chunk");
+  std::vector<std::byte> output(size);
+  require(file.read(slot, {output}, {})->wait() && output == payload, "a deferred write did not land");
+}
+
 int main() {
   try {
     testFailedWriteStopsWriting();
@@ -985,6 +1018,7 @@ int main() {
     testAdoptedReadsCheckTheirSegments();
     testCommitmentsDrawWithinTheActiveLimit();
     testSpillsWithinTheWriteBudget();
+    testWritesDeferToReads();
     constexpr size_t size = 4 * kHostPageBytes;
     auto budget = std::make_shared<DiskBudget>(size * 2 + 1);
     SlotFile file(size, budget);
