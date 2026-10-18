@@ -89,6 +89,9 @@ WEIGHT_GOLDENS := dev/tests/fixtures/weight-goldens/goldens.json
 MLX_QUANTIZATION_FIXTURE := dev/tests/fixtures/mlx-quantization/fixture.json
 # An MLX config.json and a DFlash2 draft config built like each family's.
 MODEL_CONFIGS := dev/tests/fixtures/model-configs
+# Real decodes' block selections, which the hot block cache's replacement is
+# checked on (dev/tools/kv_selection_traces.py).
+KV_SELECTION_TRACES := dev/tests/fixtures/kv-selection-traces
 TEST_KV_PAGE_CACHE_TEST := $(ENGINE_TEST_BUILD)/kv-page-cache
 TEST_ENGINE_CACHE_TEST := $(ENGINE_TEST_BUILD)/engine-cache
 TEST_DRAFT_CONTEXT_PLAN_TEST := $(ENGINE_TEST_BUILD)/draft-context-plan
@@ -507,7 +510,7 @@ test-engine-cpu: $(TEST_CPU_TARGETS) $(TEST_ATTENTION_SWEEP)
 	$(TEST_KV_SLOT_FORMAT)
 	$(TEST_SPARSE_ROW_STORE)
 	$(TEST_SSD_READERS)
-	$(TEST_SLOT_RECYCLER)
+	$(TEST_SLOT_RECYCLER) $(KV_SELECTION_TRACES)
 	$(TEST_CACHE_DIRECTORY)
 	$(TEST_DISK_SPACE)
 	$(TEST_LEGACY_WEIGHT_CACHE)
@@ -719,5 +722,5 @@ test-sanitizers: $(SANITIZER_CONFIG_TARGETS)
 	$(TSAN_TEST_ENV) $(TEST_SSD_READERS_TSAN)
 	$(ASAN_TEST_ENV) $(TEST_ELASTIC_KV_ASAN)
 	$(TSAN_TEST_ENV) $(TEST_ELASTIC_KV_TSAN)
-	$(ASAN_TEST_ENV) $(TEST_SLOT_RECYCLER_ASAN)
-	$(TSAN_TEST_ENV) $(TEST_SLOT_RECYCLER_TSAN)
+	$(ASAN_TEST_ENV) $(TEST_SLOT_RECYCLER_ASAN) $(KV_SELECTION_TRACES)
+	$(TSAN_TEST_ENV) $(TEST_SLOT_RECYCLER_TSAN) $(KV_SELECTION_TRACES)
