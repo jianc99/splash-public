@@ -941,16 +941,21 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     if (aneFfn.plan)
       memoryPlan = std::move(*aneFfn.plan);
     const EngineMemoryBreakdown &budget = memoryPlan->breakdown();
-    std::string spillOff = spillOffReason(config.model, kvLayout, budget.kvSpill, stateStagingBytes && kvFileOpen);
+    const KvSpillPlan &spill = budget.kvSpill;
+    std::string spillOff = spillOffReason(config.model, kvLayout, spill, stateStagingBytes && kvFileOpen);
     reportSpill(config.model, budget, spillOff, activeLimitBytes);
-    if (config.kvSpillAlways && !budget.kvSpill.enabled)
-      logLine("--kv-spill always ignored: ", config.model.name, " keeps its KV in memory, ", spillOff, ".");
+    if (!spill.enabled) {
+      if (config.kvSpillAlways)
+        logLine("--kv-spill always ignored: ", config.model.name, " keeps its KV in memory, ", spillOff, ".");
+      if (config.sparseKvMemory.mode == StreamedSetting::Mode::Size)
+        logLine("--sparse-kv-memory ignored: ", config.model.name, " keeps its KV in memory, ", spillOff, ".");
+    }
 
     // Page ids for every extent the hard budget could hold, of Index pages
-    // where the layout's pages may hold only their index: the governor,
-    // never the id range, limits the pool.
+    // where spilled pages hold only their index: the governor, never the id
+    // range, limits the pool.
     const uint64_t idExtentBytes =
-        kvLayout.spillable() ? uint64_t{budget.kvExtentPages} * budget.kvIndexPageBytes : budget.kvExtentBytes;
+        spill.enabled ? uint64_t{budget.kvExtentPages} * budget.kvIndexPageBytes : budget.kvExtentBytes;
     const uint64_t poolExtents = std::min<uint64_t>(
         (budget.hardBudgetBytes + idExtentBytes - 1) / idExtentBytes,
         std::numeric_limits<uint32_t>::max() / budget.kvExtentPages);
@@ -964,7 +969,6 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     std::unique_ptr<KvPageTier> kvTier;
     if (disk.kv)
       kvTier = std::make_unique<KvPageTier>(*kvPages, kvFormat, disk.kv, readers);
-    const KvSpillPlan &spill = budget.kvSpill;
     std::optional<CacheSpillPolicy> spillPolicy;
     if (spill.enabled)
       spillPolicy = CacheSpillPolicy{.densePages = spill.densePages, .windowPages = spill.windowPages};
