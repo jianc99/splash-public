@@ -614,6 +614,43 @@ void testCompactionStaysWithinAForm() {
             "compaction moved a page to an extent of the other form");
 }
 
+// A compaction for one form empties an extent of that form, however few
+// pages an extent of the other holds; one for either empties a Full extent
+// before an Index one.
+void testCompactionEmptiesAnExtentOfTheFormAskedFor() {
+    // Full extents 0 and 1 keep two pages each; Index extent 2 keeps page 8,
+    // Index extent 3 pages 12 to 14.
+    const auto spread = [](TestKvStorage &storage) {
+        KvPool pool(storage, 0);
+        require(pool.acquirePages(8).granted() && pool.acquirePages(8, PageForm::Index).granted(),
+                "compaction setup failed");
+        release(pool, {2, 3, 6, 7, 9, 10, 11, 15});
+        return pool;
+    };
+    const std::vector<PageCopy> full{{0, 7}, {1, 6}}, index{{8, 15}};
+
+    TestKvStorage forFullStorage(16, 100, 4, 10);
+    KvPool forFull = spread(forFullStorage);
+    require(forFull.compactExtent({}, PageForm::Full).moved == full &&
+                forFull.snapshot().reclaimableBytes == extentBytes,
+            "a compaction for Full pages did not empty a Full extent");
+    require(forFull.compactExtent({}, PageForm::Full).empty() && forFull.pageActive(8) &&
+                forFull.snapshot().index.reclaimableBytes == 0,
+            "a compaction for Full pages emptied an Index extent");
+
+    TestKvStorage forIndexStorage(16, 100, 4, 10);
+    KvPool forIndex = spread(forIndexStorage);
+    require(forIndex.compactExtent({}, PageForm::Index).moved == index &&
+                forIndex.snapshot().reclaimableBytes == indexExtentBytes,
+            "a compaction for Index pages did not empty only an Index extent");
+
+    TestKvStorage eitherStorage(16, 100, 4, 10);
+    KvPool either = spread(eitherStorage);
+    require(either.compactExtent({}).moved == full && either.compactExtent({}).moved == index &&
+                either.snapshot().reclaimableBytes == extentBytes + indexExtentBytes,
+            "a compaction for either form did not empty a Full extent before an Index one");
+}
+
 }  // namespace
 
 int main() {
@@ -641,6 +678,7 @@ int main() {
         testEachFormKeepsARunway();
         testSpillAtTheWallGoesThroughTheIndexRunway();
         testCompactionStaysWithinAForm();
+        testCompactionEmptiesAnExtentOfTheFormAskedFor();
         std::cout << "elastic KV pool tests passed\n";
         return EXIT_SUCCESS;
     } catch (const std::exception &error) {
