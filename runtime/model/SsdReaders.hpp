@@ -6,7 +6,7 @@
 // and so does whatever else reads the SSD for a step. Batches of tasks, each
 // reading into memory of its own.
 //
-// A batch either runs now (run, finish), on the calling thread and every
+// A batch either runs now (run, runBatch, finish), on the calling thread and every
 // reader, ahead of every background batch, because a step waits for it; or
 // in the background (start), on at most the readers it was given, and only
 // while no batch runs now, so a read ahead never delays a step's reads.
@@ -18,10 +18,10 @@
 // at once, and its taken tasks end on their own (Batch::ended).
 //
 // A task that throws is tried once more, for a transient I/O error; a second
-// failure is the task's. A batch that runs now throws its first failure once
-// every task ended; a background batch keeps its failures for its store
-// (failed), which decides whether the read was needed: a read ahead of what
-// no step routed is no failure.
+// failure is the task's. A batch run() runs throws its first failure once
+// every task ended; one runBatch() runs, and a background batch, keep their
+// failures for their store (failed), which decides what a failure fails: a
+// read ahead of what no step routed is no failure.
 //
 // Threads: any thread runs, starts, stops and finishes batches; a batch's
 // tasks run on the readers and on the threads that run it now, each once.
@@ -117,6 +117,9 @@ public:
   // failure once every task ended, and counts its retries and failures in
   // `tally`, if any.
   void run(size_t count, const Task &task, Tally *tally = nullptr);
+  // Runs task(i) for every i below count now, as run() does, and returns the
+  // batch once every task ended, its failures its own (Batch::failed).
+  [[nodiscard]] std::shared_ptr<Batch> runBatch(size_t count, Task task);
   // Starts task(i) for every i below count in the background, in order, on
   // at most `readers` readers at once; `ended`, if any, runs with the batch
   // on the thread that ends its last task once every task ran (never when

@@ -108,6 +108,14 @@ void retriesAFailedTaskOnce() {
     require(runs.counts[index].load() == (index == 3 || index == 7 || index == 11 ? 2 : 1),
             "a task ran another number of times than once, or twice after a failure");
   require(tally.retries == 3 && tally.failures == 2, "a batch counted other retries or failures");
+  // runBatch() keeps the failures for its caller instead.
+  for (std::atomic<int> &count : runs.counts) count = 0;
+  const std::shared_ptr<SsdReaders::Batch> batch = pool.runBatch(runs.counts.size(), task);
+  for (size_t index = 0; index < runs.counts.size(); ++index)
+    require(batch->ended(index) && batch->failed(index) == (index == 3 || index == 11),
+            "a batch run now did not keep exactly the failures of its tasks");
+  require(batch->tally().retries == 3 && batch->tally().failures == 2,
+          "a batch run now that keeps its failures counted other retries or failures");
 }
 
 void backgroundRunsOnItsReaders() {
@@ -304,7 +312,8 @@ void criticalBusyWhileABatchRunsNow() {
     require(!pool.criticalBusy() && !probe(), "a background batch held writes back");
     std::atomic<int> seen = 0;
     pool.run(8, [&](size_t) { seen += pool.criticalBusy() && probe(); });
-    require(seen.load() == 8 && !pool.criticalBusy() && !probe(),
+    static_cast<void>(pool.runBatch(8, [&](size_t) { seen += pool.criticalBusy() && probe(); }));
+    require(seen.load() == 16 && !pool.criticalBusy() && !probe(),
             "a batch run now did not hold writes back exactly while it ran");
     gate.open();
     pool.stop(*ahead);
