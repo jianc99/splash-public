@@ -811,6 +811,11 @@ void testEnginePlanServesTheSpilledContext() {
                                                 std::max(streamed.spill.stagingBytes, streamed.spill.hotTargetBytes) &&
                 geometry.residentTokens == bounds.resident,
             "admission's geometry is not the plan's");
+    require(geometry.laneStateBytes == plan.breakdown().laneStateBytes &&
+                geometry.extentPages == plan.breakdown().kvExtentPages &&
+                geometry.hotFloorBytes(0) == 0 && geometry.hotFloorBytes(1) == streamed.spill.hotFloorBytes &&
+                geometry.hotFloorBytes(model::ExecutionLimits::maximumBatchWidth) == streamed.spill.hotLimitBytes,
+            "funding's geometry is not the plan's, or its hot floors not the cache's");
   }
   const SpillGeometry geometry{.fullPageBytes = 423'936, .indexPageBytes = 24'576, .densePages = 64,
                                .windowPages = 64, .groupPages = 256};
@@ -818,6 +823,13 @@ void testEnginePlanServesTheSpilledContext() {
               geometry.spillFloorBytes(32 * 100) == 100 * 423'936 &&
               geometry.spillFloorBytes(32 * 1'000) == 640 * 423'936 + 360 * 24'576,
           "a request's KV is not its pages, Full or Index");
+  // A lane's slots short of an extent: the floor rounds every lane's slots
+  // together, as the hot block cache takes them, so a lane whose slots the
+  // extents held already adds none.
+  const SpillGeometry hot{.laneSlots = 3, .hotExtentSlots = 4, .hotExtentBytes = 100};
+  require(hot.hotFloorBytes(1) == 200 && hot.hotFloorBytes(2) == 300 && hot.hotFloorBytes(3) == 300 &&
+              hot.hotFloorBytes(4) == 400,
+          "the hot floors are not the lanes' slots together in whole extents");
 }
 
 // A disk bound below the resident context leaves the resident context, and
