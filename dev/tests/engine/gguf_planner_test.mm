@@ -645,8 +645,11 @@ void checkHyperConnections(const std::filesystem::path &directory) {
 // feeds, and its table's rows as stored in an image of their own after the
 // embedding's. With the table streamed, that image loads none of its bytes
 // but stays planned, for the weights' records, its rows where the file holds
-// them, and every other image is the same. A GGUF that declares another PLE
-// layer is refused.
+// them, and every other image is the same. A table that does not stream,
+// llama.cpp's NVFP4, which the writer rebuilds, is refused by name where it
+// would, and loads in its image, which the weights' sizes fall back on
+// (model::streamableWeights). A GGUF that declares another PLE layer is
+// refused.
 void checkPleTable(const std::filesystem::path &directory) {
   const model::QwenTargetDimensions g = qwen4ExpGeometry();
   TensorTypes types = qwen4ExpTypes();
@@ -683,6 +686,18 @@ void checkPleTable(const std::filesystem::path &directory) {
             model::gguf::streamedTableBytes(streamedTable) == kPleTableRows * rows->rowBytes &&
             model::gguf::loadedBytes(streamedTable) == 0 && streamedTable.bytes == table.bytes,
         "planner streams the PLE table's rows instead of loading its image, which its record keeps");
+  // NVFP4 rows are whole blocks of 256 values.
+  model::QwenTargetDimensions wide = g;
+  wide.pleHeadDimension = 256;
+  TensorTypes rebuilt = types;
+  rebuilt["per_layer_token_embd.weight"] = model::ggml::kNVFP4;
+  writeGguf(path, targetTensors(wide, rebuilt), wide);
+  const Plan whole = plan(path, wide), refused = plan(path, wide, {.streamTable = true});
+  check(!whole.error && whole.images.back().name == "ple.bin" && !whole.images.back().streamedRows &&
+            model::gguf::loadedBytes(whole.images.back()) && refused.error &&
+            refused.error->find("does not stream: per_layer_token_embd.weight") != std::string::npos,
+        "planner loads an NVFP4 PLE table and refuses by name to stream it" +
+            (whole.error ? ": " + *whole.error : std::string()));
   model::QwenTargetDimensions other = g;
   other.pleLayer = 1;
   splash::test::writeFile(path, test_gguf::file(metadata(other), tensors));

@@ -38,12 +38,4 @@ WeightFile SafetensorsTargetLoader::head() { return open(planned_->images.size()
 
 WeightFile SafetensorsTargetLoader::embedding() { return open(planned_->images.size() - 1); }
 
-uint64_t safetensorsTargetImageBytes(const std::filesystem::path &directory, const QwenTargetDimensions &geometry,
-                                     gguf::PlanOptions options) {
-  const SafetensorsCheckpoint checkpoint(directory);
-  uint64_t bytes = 0;
-  for (const gguf::Image &image : safetensors::planImages(checkpoint, geometry, options)) bytes += image.bytes;
-  return bytes;
-}
-
 } // namespace splash::model

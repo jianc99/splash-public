@@ -272,7 +272,10 @@ memory requirements also include the cache and Metal staging buffers. The
 rows each command gathers are read through a host cache with a SIZE-byte
 cache and working-memory reservation, auto's share of the budget, at most
 2 GiB; the engine refuses a SIZE that holds no row, and a SIZE that holds the
-whole table loads it with the weights instead, as `--ple-memory off` does.
+whole table loads it with the weights instead, as `--ple-memory off` does. A
+table whose rows the GGUF does not store as the gathers read them (NVFP4,
+which the loader rebuilds, or any table of a rotated GGUF) loads with the
+weights, and the engine refuses a SIZE for it.
 This reservation is not a strict bound on host allocations: prefetch scratch,
 excess vector capacity, job metadata, allocator overhead and reader stacks are
 additional, and oversized stages grow their scratch. Other models ignore a
@@ -2048,7 +2051,7 @@ SHA-256 of the record of every source file's digest, the assembly's
 reports (`loaded_model_layout_sha256`, `target_model_sha256`) cover it, so
 models of one layout from different sources never share a fingerprint.
 
-Runtime admission counts the images exactly once (`modelWeightBytes`, which
+Runtime admission counts the images exactly once (`streamableWeights`, which
 the runtime oracle uses too). Before loading, startup refuses
 a model whose images, with the pipeline and runtime reserves, one lane's state,
 the KV runway and any disk tier state staging, exceed the hard budget, so a
