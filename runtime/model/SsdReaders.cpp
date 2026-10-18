@@ -81,12 +81,15 @@ SsdReaders::~SsdReaders() {
 }
 
 void SsdReaders::run(size_t count, const Task &task, Tally *tally) {
-  if (tally) *tally = {};
-  if (!count) return;
-  const std::shared_ptr<Batch> batch(new Batch(count, task, readers(), {}));
-  runNow(batch);
+  const std::shared_ptr<Batch> batch = runBatch(count, task);
   if (tally) *tally = batch->tally();
   if (const std::exception_ptr failure = batch->failure()) std::rethrow_exception(failure);
+}
+
+std::shared_ptr<SsdReaders::Batch> SsdReaders::runBatch(size_t count, Task task) {
+  const std::shared_ptr<Batch> batch(new Batch(count, std::move(task), readers(), {}));
+  if (count) runNow(batch);
+  return batch;
 }
 
 std::shared_ptr<SsdReaders::Batch> SsdReaders::start(size_t count, Task task, unsigned readers,
