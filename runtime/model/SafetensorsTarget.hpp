@@ -59,9 +59,5 @@ private:
 [[nodiscard]] uint64_t safetensorsTargetImageBytes(const std::filesystem::path &directory,
                                                    const QwenTargetDimensions &geometry,
                                                    gguf::PlanOptions options = {});
-// The bytes of the planes of its routed experts when they stream; 0 for a
-// dense target.
-[[nodiscard]] uint64_t safetensorsRoutedExpertBytes(const std::filesystem::path &directory,
-                                                    const QwenTargetDimensions &geometry);
 
 } // namespace splash::model
