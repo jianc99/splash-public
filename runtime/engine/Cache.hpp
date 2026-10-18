@@ -347,6 +347,12 @@ public:
   [[nodiscard]] std::optional<double> diskWritesAdmittedAt() const noexcept {
     return diskBudget_ ? diskBudget_->admitsAgainAt() : std::nullopt;
   }
+  // When the write budget covers what Spill requests committed again, so
+  // that a request may start to spill (spillGate), on its clock; empty
+  // while it does now or without a budget.
+  [[nodiscard]] std::optional<double> spillWritesAdmittedAt() const noexcept {
+    return diskBudget_ ? diskBudget_->admitsSpillAt(diskBudget_->committedBytes()) : std::nullopt;
+  }
   // At a clean stop: the write budget holds nothing back any more.
   void liftDiskWriteBudget() noexcept {
     if (diskBudget_)
