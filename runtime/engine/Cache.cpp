@@ -1099,10 +1099,15 @@ TokenAdmission Cache::moveLandedPages(bool allocate, SpilledExtents extents) {
   }
   // The memory the moves freed leaves with the Full extents they emptied,
   // once the runway stands: at the wall, which refuses it, they stay, and
-  // the requests grow into their pages.
-  if (!pages.empty() && extents != SpilledExtents::Kept)
+  // the requests grow into their pages. Released, the Full pages left first
+  // gather in the fewest extents.
+  if (!pages.empty() && extents != SpilledExtents::Kept) {
+    if (extents == SpilledExtents::Released)
+      while (compactExtent(kv::PageForm::Full)) {
+      }
     static_cast<void>(pool_.reclaimEmptyExtents(extents == SpilledExtents::KeepRunway,
                                                 std::numeric_limits<uint32_t>::max(), kv::PageForm::Full));
+  }
   return {};
 }
 

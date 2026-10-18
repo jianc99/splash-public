@@ -4412,9 +4412,10 @@ void testSpillMovesLandedPagesToTheIndexForm() {
 }
 
 // The memory a spill frees leaves with the Full extents its moves empty, as
-// its caller says: kept for a reclaim, released but the runway, or all
-// released; a spill that moves nothing releases nothing, an empty extent of
-// a request that ended included.
+// its caller says: kept for a reclaim, released but the runway, or, the Full
+// pages left gathered in the fewest extents first, all released; a spill
+// that moves nothing releases nothing, an empty extent of a request that
+// ended included.
 void testSpilledFullExtentsLeaveMemory() {
   for (const SpilledExtents extents :
        {SpilledExtents::Kept, SpilledExtents::KeepRunway, SpilledExtents::Released}) {
@@ -4424,16 +4425,22 @@ void testSpilledFullExtentsLeaveMemory() {
       return static_cast<uint32_t>((pool.reclaimableBytes - pool.index.reclaimableBytes) /
                                    (spill.pool.extentPages() * spill.pool.bytesPerPage()));
     };
+    const auto fullExtents = [&] {
+      const KvPoolSnapshot pool = spill.pool.snapshot();
+      return (pool.pagesAllocated - pool.index.pagesAllocated) / spill.pool.extentPages();
+    };
     // Fourteen pages and the open one fill four Full extents, the runway's
     // first. Pages 1-12 spill: the dense history stays in the first and the
-    // tail window in the last, the two between empty.
+    // tail window in the last, the two between empty; released, the dense
+    // history's page moves beside the window's.
     const std::vector<uint32_t> prompt = Spilling::prompt(1000, 14);
     spill.start(1, prompt, 14);
     static_cast<void>(spill.cache.writeThrough());
     spill.tier.complete();
     require(spill.cache.pollTransfers() && !emptyFullExtents(), "the writes did not land, or an extent was empty");
+    const bool kept = extents == SpilledExtents::Kept, runway = extents == SpilledExtents::KeepRunway;
     require(spill.cache.spillWritten(extents).granted() && test::indexBlocks(spill.cache, 1)[12] &&
-                emptyFullExtents() == (extents == SpilledExtents::Kept ? 2u : extents == SpilledExtents::KeepRunway),
+                emptyFullExtents() == (kept ? 2u : runway) && fullExtents() == (kept ? 4u : runway ? 3u : 1u),
             "the Full extents the moves emptied did not go as the caller said");
     // A Resident request's pages, which an idle reclaim drops once it ended,
     // empty extents that a spill moving nothing leaves.
