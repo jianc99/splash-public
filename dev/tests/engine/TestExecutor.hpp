@@ -232,6 +232,7 @@ public:
     if (beginObserver) beginObserver();
     beganFlags[request.id] = request.flags;
     beganSampling[request.id] = request.sampling;
+    outputLimits[request.id] = request.maxNewTokens;
     if (beginGrowthBlocked && beginGrowthBlocked())
       return {{}, StateFailure::MemoryPressure, beginAllocationFailure};
     if (deniedBegins) {
@@ -272,6 +273,7 @@ public:
   StateAdmission resume(const ModelRequest &request) override {
     ++resumeAttempts;
     lastRestoredTokens = request.restoredTokens;
+    outputLimits[request.id] = request.maxNewTokens;
     if (resumeDenied)
       return {{}, StateFailure::MemoryPressure, metal::AllocationFailure::HostPressure};
     const uint64_t id = request.id;
@@ -472,9 +474,10 @@ public:
       ticket = std::make_unique<HeldTicket>(prefill(plan, items),
                                             holdPrefillUntil, 1.0);
     } else {
+      const CommandTimes times = commandTimes ? commandTimes(plan, items) : CommandTimes{};
       ticket = immediateTicket(plan.kind == WorkKind::Prefill ? prefill(plan, items)
                                                               : decode(plan, items),
-                               completion);
+                               completion, times);
     }
     if (submitObserver)
       submitObserver();
@@ -524,6 +527,21 @@ public:
   }
   uint32_t statesToActivate() const noexcept override {
     return statesLacked ? statesLacked() : 0;
+  }
+  // The production model reserves a decoding lane's floor of the hot block
+  // cache, which the fake refuses for the requests in refusedSpilledReads.
+  model::ModelMemoryAdmission reserveSpilledReads(uint64_t id) override {
+    if (refusedSpilledReads.contains(id))
+      return {.allocationFailure = metal::AllocationFailure::EngineBudget};
+    return {.ok = true};
+  }
+  // It grows that cache toward its planned size, which the fake refuses
+  // with refusedGrowth.
+  model::ModelMemoryAdmission growSpilledReads() override {
+    ++growthAttempts;
+    if (refusedGrowth)
+      return {.allocationFailure = *refusedGrowth};
+    return {.ok = true};
   }
   uint64_t reclaimIdleState(bool keepLane, model::IdleMemory scope) noexcept override {
     keptLane = keepLane;
@@ -709,19 +727,29 @@ public:
   std::function<void()> healthCheck;
   // Runs once each command is submitted, a held one's completion stored.
   std::function<void()> submitObserver;
+  // The times each command that completes at once reports, from its plan
+  // and items; none without it.
+  std::function<CommandTimes(const BatchPlan &, std::span<const ModelBatchItem>)> commandTimes;
   // Score requests whose final prompt step reports a non-finite logit.
   std::unordered_set<uint64_t> invalidScores;
   // Requests whose prefill steps report a row that is not finite.
   std::unordered_set<uint64_t> nonFinitePrefills;
-  // The flags and sampling each request began with.
+  // The flags and sampling each request began with, and the output limit
+  // (ModelRequest::maxNewTokens) its latest begin() or resume() was given.
   std::unordered_map<uint64_t, uint32_t> beganFlags;
   std::unordered_map<uint64_t, SamplingParameters> beganSampling;
+  std::unordered_map<uint64_t, uint32_t> outputLimits;
   // The prefill steps each request took.
   std::unordered_map<uint64_t, uint32_t> prefillChunks;
   // The tokens a decode step emits.
   uint32_t decodeTokens = 1;
   // The masks the model took.
   uint32_t providedMasks = 0;
+  // Requests whose floor of the hot block cache is refused
+  // (reserveSpilledReads).
+  std::unordered_set<uint64_t> refusedSpilledReads;
+  std::optional<metal::AllocationFailure> refusedGrowth;
+  uint32_t growthAttempts = 0;
 
   // Holds every command until the flag it returns is set.
   std::shared_ptr<std::atomic<bool>> holdCommands() {
