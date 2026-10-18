@@ -220,7 +220,13 @@ VerifyAttentionPlan PagedAttention::verifyPlan(
                          "verify_attention_q8_sparse_kv2_g12"),
           pipeline(kernel, "verify_attention_reduce",
                    "verify_attention_reduce_kv2_g8", "verify_attention_sparse_reduce_kv2_g12"),
-          {layout.kvHeads, splits, lanes},
+          // A sparse lane's list fills only the first of the plan's splits.
+          // Its split grid is one-dimensional, x the KV head and then the
+          // split: an M5 Max spread the same order as a two-dimensional grid
+          // (x the KV head, y the split) worse, running it up to 1.7x slower
+          // on most grids of more than 32 splits.
+          layout.valuesTokenMajor ? metal::DispatchSize{layout.kvHeads * splits, 1, lanes}
+                                  : metal::DispatchSize{layout.kvHeads, splits, lanes},
           {layout.kvHeads,
            kv::kVerifyRows * (queryHeads / layout.kvHeads), lanes},
           layout.valuesTokenMajor,

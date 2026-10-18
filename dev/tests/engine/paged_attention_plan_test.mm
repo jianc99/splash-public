@@ -159,10 +159,14 @@ void checkPlans(uint32_t queryHeads, kv::Layout layout) {
     }
     const uint64_t fused =
         uint64_t{lanes} * 8 * kv::kVerifyMaximumSplits * queryHeads;
+    // The sparse split's grid is one-dimensional, KV head and then split;
+    // the page loop's is two-dimensional.
+    const bool sparse = layout.valuesTokenMajor;
     require(plan.splits == maximum &&
                 plan.workspace.partialsBytes == fused * 256 * 4 &&
                 plan.workspace.statisticsBytes == fused * 2 * 4 &&
-                plan.splitGroups.y == plan.splits &&
+                plan.splitGroups.x == (sparse ? layout.kvHeads * plan.splits : layout.kvHeads) &&
+                plan.splitGroups.y == (sparse ? 1 : plan.splits) &&
                 plan.splitGroups.z == lanes &&
                 plan.reduceGroups.y == 8 * queryHeads / layout.kvHeads &&
                 plan.reduceGroups.z == lanes,
@@ -655,7 +659,8 @@ std::vector<uint16_t> run(metal::MetalBackend &backend, Case &data, bool testBou
     const std::string splitPipeline =
         blocks.locations ? locatedSplitName(data.layout) : std::string(plan.splitPipeline);
     require(split.pipelineName == splitPipeline && reduce.pipelineName == plan.reducePipeline &&
-                split.threadgroups.y == plan.splits && split.threadgroups.z == plan.splitGroups.z &&
+                split.threadgroups.x == plan.splitGroups.x && split.threadgroups.y == plan.splitGroups.y &&
+                split.threadgroups.z == plan.splitGroups.z &&
                 reduce.threadgroups.y == plan.reduceGroups.y &&
                 reduce.threadgroups.z == plan.reduceGroups.z,
             "production verify encoding departed from its plan");
