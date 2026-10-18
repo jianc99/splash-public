@@ -383,8 +383,9 @@ private:
 
 // Whether the target can spill (a spillable layout that declares its
 // SparseKvShape, with a writable tier), whether every request spills
-// (--kv-spill always, for validation), the history a row reads through its
-// page table (SparseKvShape::denseHistoryTokens), and the geometry.
+// (--kv-spill always, for validation), the history a row may read whole
+// through its page table, the pages the cache keeps Full for it
+// (SparseKvShape::denseTokens, KvSpillPlan::densePages), and the geometry.
 struct EngineSpillConfig final {
   bool capable = false;
   bool always = false;
