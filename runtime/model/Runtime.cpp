@@ -2481,6 +2481,9 @@ StateAdmission Runtime::resume(const ModelRequest &request) {
   if (request.prompt.size() < entry.promptTokens) {
     throw std::invalid_argument("recomputed history cannot shorten the prompt");
   }
+  if (request.maxNewTokens < entry.generatedTokens) {
+    throw std::invalid_argument("a resumed request's output limit is below its output");
+  }
   Impl::VisionRollback rollback{*impl_, impl_->vision};
   std::vector<Impl::ImageState> images;
   StateAdmission admission = admitIdleLane(impl_->states, [&](uint32_t lane) {
@@ -2491,6 +2494,7 @@ StateAdmission Runtime::resume(const ModelRequest &request) {
     entry.resident = true;
     entry.promptTokens = static_cast<uint32_t>(request.prompt.size());
     entry.tokens.assign(request.prompt.begin(), request.prompt.end());
+    entry.maxNewTokens = request.maxNewTokens;
     entry.images = std::move(images);
     entry.restoredTokens = request.restoredTokens;
     impl_->bindPenalties(entry, request.prompt);

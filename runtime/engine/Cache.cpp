@@ -893,8 +893,8 @@ bool Cache::commitSpill(uint64_t requestId, uint32_t pages) {
 
 bool Cache::convertToSpill(uint64_t requestId, uint32_t pages) {
   Request &active = request(requestId);
-  if (!spill_ || active.mode == KvMode::Spill || !kvTierWritable() ||
-      !diskBudget_->admitsSpill(diskBudget_->committedBytes()) || !commit(active, pages))
+  if (!spill_ || active.mode == KvMode::Spill || spillGate() != SpillGate::Open ||
+      !commit(active, pages))
     return false;
   active.mode = KvMode::Spill;
   active.spillOrder = ++spillSequence_;

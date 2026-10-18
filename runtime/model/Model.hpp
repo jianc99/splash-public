@@ -700,7 +700,9 @@ public:
   [[nodiscard]] virtual StateAdmission begin(const ModelRequest &request) = 0;
   // Safe-point preemption returns the request's state buffers, retaining
   // only its host-side sampling/constraint continuation. Resume replays the
-  // supplied committed history through the ordinary prefill path.
+  // supplied committed history through the ordinary prefill path, and takes
+  // the output limit it is given (maxNewTokens), which the engine sets anew
+  // at each start of a request (the SSD cache's quota may bound it).
   virtual void suspend(uint64_t requestId) = 0;
   [[nodiscard]] virtual StateAdmission resume(const ModelRequest &request) = 0;
   // Restores a cached state into the request's lane at `boundary`. A RAM

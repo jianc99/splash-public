@@ -987,6 +987,10 @@ class NativeBackend:
                     f"larger --max-memory or a smaller --max-context ({message})",
                     code,
                 )
+            # The SSD cache cannot hold even the prompt's KV of a request that
+            # does not fit in memory; the message names its quota.
+            if code == "kv_disk_quota":
+                return APIError(400, message, code)
             request_codes = {
                 "invalid_constraint",
                 "invalid_count",

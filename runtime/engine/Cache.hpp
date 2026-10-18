@@ -215,6 +215,11 @@ struct CacheSpillPolicy final {
   uint32_t windowPages = 0;
 };
 
+// Whether a request may start to spill now, or what holds it back: the KV
+// tier takes no writes (it is off, or a file stopped taking them), or the
+// write budget does not cover the writes Spill requests have committed.
+enum class SpillGate : uint8_t { Open, TierClosed, WriteBudget };
+
 struct CacheReclaimResult final {
   bool madeProgress = false;
   // Bytes of the KV extents the step released.
@@ -385,8 +390,23 @@ public:
   void beginRequest(uint64_t requestId, KvMode mode = KvMode::Resident);
   void endRequest(uint64_t requestId);
 
-  // Spilling. What the quota of active KV leaves for new commitments,
-  // without giving any copy up: activeLimit - held slots - committed.
+  // Spilling. Whether a new Spill request may start, or a Resident one
+  // convert: a writable tier, and a write budget that covers what Spill
+  // requests committed (DiskBudget::admitsSpill).
+  [[nodiscard]] SpillGate spillGate() const noexcept {
+    if (!kvTierWritable())
+      return SpillGate::TierClosed;
+    if (diskBudget_ && !diskBudget_->admitsSpill(diskBudget_->committedBytes()))
+      return SpillGate::WriteBudget;
+    return SpillGate::Open;
+  }
+  // The quota of active KV, the slots of blocks requests hold and what Spill
+  // requests committed (DiskBudget::activeLimitBytes); none without
+  // spilling. What it leaves for new commitments, without giving any copy
+  // up: activeLimit - held slots - committed.
+  [[nodiscard]] uint64_t spillLimit() const noexcept {
+    return spill_ ? diskBudget_->activeLimitBytes() : 0;
+  }
   [[nodiscard]] uint64_t spillRoom() const noexcept;
   // Commits quota for `pages` pages of a Spill request, which each page it
   // publishes then draws or returns (DiskBudget::commit); false, committing
