@@ -406,7 +406,6 @@ void testCompactionMovesNothingWhenTheStorageRefuses() {
             "the pool did not compact after the storage refused");
 }
 
-
 // Pages of a form come only from extents of their form, the fullest first.
 void testEachFormFillsItsOwnExtents() {
     TestKvStorage storage(24, 100, 4, 10);

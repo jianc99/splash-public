@@ -139,13 +139,19 @@ public:
   }
   // The same for an index table (kv::PageStorage::writeIndexEntries): the
   // entries that reach the pages' block index, in their extent's index
-  // plane.
+  // plane. std::logic_error without an index, and for a Full extent whose
+  // plane leaves no room for the page index, which only extents of whole
+  // alignment units (aligned()) rule out.
   void writeIndexTable(std::span<const uint32_t> pages, void *table) const {
+    if (!layout_.indexDimension)
+      throw std::logic_error("host KV pages of a layout without an index have no index entries");
     auto *entries = static_cast<SplashKvPage *>(table);
     for (size_t index = 0; index < pages.size(); ++index) {
       const Extent &placed = extent(pages[index]);
-      entries[index] = splash_kv_page_entry(placed.gpuAddress + indexPlaneOffset(placed.form),
-                                            pages[index] % extentPages_);
+      const uint64_t plane = placed.gpuAddress + indexPlaneOffset(placed.form);
+      if (plane & SPLASH_KV_PAGE_INDEX_MASK)
+        throw std::logic_error("host KV index plane leaves no room for the page index");
+      entries[index] = splash_kv_page_entry(plane, pages[index] % extentPages_);
     }
   }
   // Where a layer's block index sits in every extent's index plane, as
