@@ -1,4 +1,5 @@
 #import "MetalBackend.hpp"
+#include "metal/HandoffDiag.hpp"
 #include "AwakeClock.hpp"
 #include "CommandWatchdog.hpp"
 #include "Residency.hpp"
@@ -690,6 +691,30 @@ private:
                 }
                 if (!worked) steps.halted = true;
                 event.signaledValue = step.ready + 1;
+                // Diagnostics: with HANDOFF_REREAD set, the value the CPU set,
+                // re-read at once and about 50 and 200 us later (which delays
+                // the runner's next pickup).
+                static const bool reread = std::getenv("HANDOFF_REREAD") != nullptr;
+                if (reread) {
+                    const uint64_t expected = step.ready + 1;
+                    const auto set = std::chrono::steady_clock::now();
+                    uint64_t seen[3] = {event.signaledValue, 0, 0};
+                    while (std::chrono::steady_clock::now() - set < std::chrono::microseconds(50)) {
+                    }
+                    seen[1] = event.signaledValue;
+                    while (std::chrono::steady_clock::now() - set < std::chrono::microseconds(200)) {
+                    }
+                    seen[2] = event.signaledValue;
+                    ++handoff::checks;
+                    if (seen[0] < expected || seen[1] < expected || seen[2] < expected) {
+                        ++handoff::regressions;
+                        handoff::log("event went back down: set %llu, read %llu / %llu / %llu at 0 / 50 / 200 us",
+                                     static_cast<unsigned long long>(expected),
+                                     static_cast<unsigned long long>(seen[0]),
+                                     static_cast<unsigned long long>(seen[1]),
+                                     static_cast<unsigned long long>(seen[2]));
+                    }
+                }
                 if (step.release) release(steps.releases, *step.release);
                 if (worked && step.then) {
                     try {
@@ -753,6 +778,22 @@ struct CommandTicket::State {
         timing.wallSeconds =
             std::chrono::duration<double>(wallEnd - wallStart).count();
 
+        if (hostSteps && (command.status != MTLCommandBufferStatusCompleted ||
+                          std::ranges::any_of(leadingCommands, [](id<MTLCommandBuffer> buffer) {
+                              return buffer.status == MTLCommandBufferStatusError;
+                          }))) {
+            // Diagnostics: a failed command's event and steps.
+            std::lock_guard lock(hostSteps->mutex);
+            handoff::log("command %llu failed: event at %llu, %zu steps", static_cast<unsigned long long>(sequence),
+                         static_cast<unsigned long long>(hostSteps->event.signaledValue), hostSteps->steps.size());
+            for (const HostSteps::Step &step : hostSteps->steps) {
+                id<MTLCommandBuffer> before = step.before, after = step.after;
+                handoff::log("  step ready %llu pickup %.6f done %.6f before %d (gpu end %.6f) after %d (gpu start %.6f)",
+                             static_cast<unsigned long long>(step.ready), step.pickup, step.done,
+                             before ? static_cast<int>(before.status) : -1, before ? before.GPUEndTime : 0.0,
+                             after ? static_cast<int>(after.status) : -1, after ? after.GPUStartTime : 0.0);
+            }
+        }
         std::string error;
         // The first buffer that failed names the error: the buffers after a
         // failed one still run, as its signal is delivered (EventStep). A
