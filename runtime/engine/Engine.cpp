@@ -936,8 +936,7 @@ KvMode Engine::kvModeFor(const Request &active) const {
 }
 
 bool Engine::fitsResidentAlone(const Request &active) const {
-  const SpillGeometry &geometry = config_.spill.geometry;
-  return geometry.residentBytes(projectedTokens(active)) <= geometry.residentKvBytes;
+  return projectedTokens(active) <= config_.spill.geometry.residentTokens;
 }
 
 uint64_t Engine::chainEnd(const CacheLookup &lookup) noexcept {
@@ -975,10 +974,8 @@ Engine::SpillAdmission Engine::admitSpill(Request &active, bool resuming, uint64
     if (const SpillGate gate = cache_.spillGate(); gate != SpillGate::Open) {
       if (residentInstead())
         return SpillAdmission::Resident;
-      const std::string reason =
-          "requests past " +
-          std::to_string(geometry.residentKvBytes / geometry.fullPageBytes * KvCache::pageTokens) +
-          " tokens keep their KV on the SSD cache, ";
+      const std::string reason = "requests past " + std::to_string(geometry.residentTokens) +
+                                 " tokens keep their KV on the SSD cache, ";
       if (gate == SpillGate::WriteBudget) {
         ++counters_.spill.refusedWriteBudget;
         settle(active, {LaneOutcome::KvWriteBudget,
