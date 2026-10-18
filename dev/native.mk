@@ -735,3 +735,21 @@ test-sanitizers: $(SANITIZER_CONFIG_TARGETS)
 	$(TSAN_TEST_ENV) $(TEST_ELASTIC_KV_TSAN)
 	$(ASAN_TEST_ENV) $(TEST_SLOT_RECYCLER_ASAN) $(KV_SELECTION_TRACES)
 	$(TSAN_TEST_ENV) $(TEST_SLOT_RECYCLER_TSAN) $(KV_SELECTION_TRACES)
+
+# The Metal tests of the components whose host steps share their state with
+# the engine thread and the SSD readers, the hot block cache and the history
+# stream, under ThreadSanitizer on a Mac with a GPU: the engine library and
+# the tests built with it, and their metallibs, in a build of their own (the
+# builds above link no framework), and what it cannot see inside Metal
+# suppressed (metal_tsan_suppressions.txt).
+METAL_TSAN_BUILD := $(BUILD)/metal-tsan
+METAL_TSAN_CXXFLAGS := $(ENGINE_SANITIZER_CXXFLAGS) -fsanitize=thread
+METAL_TSAN_TEST_ENV := $(TSAN_TEST_ENV):suppressions=dev/tests/engine/metal_tsan_suppressions.txt
+.PHONY: test-sanitizers-metal
+test-sanitizers-metal:
+	$(MAKE) --no-print-directory -f "$(SPLASH_MAKEFILE)" BUILD=$(METAL_TSAN_BUILD) \
+		ENGINE_CXXFLAGS='$(METAL_TSAN_CXXFLAGS)' ENGINE_TEST_CXXFLAGS='$(METAL_TSAN_CXXFLAGS)' \
+		$(METAL_TSAN_BUILD)/splash.metallib $(METAL_TSAN_BUILD)/host-step.metallib \
+		$(METAL_TSAN_BUILD)/engine-tests/kv-block-cache $(METAL_TSAN_BUILD)/engine-tests/kv-history-stream
+	$(METAL_TSAN_TEST_ENV) $(METAL_TSAN_BUILD)/engine-tests/kv-block-cache $(METAL_TSAN_BUILD)/splash.metallib
+	$(METAL_TSAN_TEST_ENV) $(METAL_TSAN_BUILD)/engine-tests/kv-history-stream $(METAL_TSAN_BUILD)/splash.metallib
