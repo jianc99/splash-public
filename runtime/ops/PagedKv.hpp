@@ -43,9 +43,9 @@ enum class Format : uint32_t { Int8 = 1, BFloat16 = 2 };
 // (Layout::indexDimension), its blocks' index; an Index page holds only the
 // index, its K/V living in the page's tier copy, which the request's reads
 // of spilled KV serve (model::SpilledKvReads). A page's form is its extent's:
-// a Full extent has a K/V buffer and an index buffer, an Index extent only
-// the index buffer. A layout that cannot spill (Layout::spillable) has only
-// Full pages.
+// a Full extent holds every layer's K/V region and then the index plane, an
+// Index extent only the index plane. A layout that cannot spill
+// (Layout::spillable) has only Full pages.
 enum class PageForm : uint8_t { Full, Index };
 
 // A page whose content goes to another page.
