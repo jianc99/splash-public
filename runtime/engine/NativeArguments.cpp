@@ -78,6 +78,19 @@ double parseDecodeShare(std::string_view value) {
   return result;
 }
 
+// BYTES|auto, or with `off` BYTES|auto|off, as the server writes a store's
+// memory (--expert-memory, --ple-memory, --sparse-kv-memory).
+StreamedSetting parseStreamedSetting(std::string_view option, std::string_view value, bool off) {
+  if (value == "auto")
+    return {};
+  if (off && value == "off")
+    return {StreamedSetting::Mode::Off, 0};
+  StreamedSetting result{StreamedSetting::Mode::Size, 0};
+  if (!parsePositive(value, result.bytes))
+    throw UsageError(std::string(option) + " requires a positive byte count" + (off ? ", auto or off" : " or auto"));
+  return result;
+}
+
 std::filesystem::path requireModelRoot(std::string_view argument) {
   std::error_code error;
   const std::filesystem::path root =
@@ -144,11 +157,15 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
         throw UsageError("--idle-sleep requires prevent or allow");
       result.preventIdleSleep = value == "prevent";
     } else if (option == "--ple-memory") {
-      if (!parsePositive(value, result.streamedTableBytes))
-        throw UsageError("--ple-memory requires a positive byte count");
+      result.pleMemory = parseStreamedSetting(option, value, true);
     } else if (option == "--expert-memory") {
-      if (!parsePositive(value, result.expertMemoryBytes))
-        throw UsageError("--expert-memory requires a positive byte count");
+      result.expertMemory = parseStreamedSetting(option, value, true);
+    } else if (option == "--sparse-kv-memory") {
+      result.sparseKvMemory = parseStreamedSetting(option, value, false);
+    } else if (option == "--kv-spill") {
+      if (value != "always")
+        throw UsageError("--kv-spill requires always");
+      result.kvSpillAlways = true;
     } else if (option == "--ane") {
       if (value != "on" && value != "off")
         throw UsageError("--ane requires on or off");

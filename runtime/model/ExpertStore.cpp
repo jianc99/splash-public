@@ -1094,6 +1094,15 @@ uint64_t ExpertStore::fixedBytes(const StreamedBlocks &blocks, ops::MoeShape sha
   return fixedBytesOf(geometryOf(blocks, shape), static_cast<uint32_t>(blocks.blocks.size()), shape);
 }
 
+uint64_t ExpertStore::minimumBytes(const StreamedBlocks &blocks, ops::MoeShape shape) {
+  const Geometry geometry = geometryOf(blocks, shape);
+  uint64_t bytes = fixedBytesOf(geometry, static_cast<uint32_t>(blocks.blocks.size()), shape);
+  for (uint32_t layout = 0; layout < geometry.layouts.size(); ++layout)
+    bytes += arenaBytes(geometry.layouts[layout],
+                        uint64_t{shape.experts} * (geometry.streams(layout) ? 1 : geometry.blocks[layout]));
+  return bytes;
+}
+
 metal::MetalBuffer residentExpertSlots(metal::MetalBackend &backend, uint32_t experts) {
   metal::MetalBuffer table =
       backend.allocateBuffer(uint64_t{experts} * sizeof(uint32_t), metal::BufferStorage::Shared,
