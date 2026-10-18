@@ -3894,7 +3894,8 @@ void testPendingDemotionLeavesOtherKvOpen() {
     tier.complete();
     require(cache.pollTransfers(), "the demotion did not land");
   }
-  require(cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress && !tier.canDemote(),
+  require(cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress &&
+              !tier.canDemote(WriteClass::Reclaim),
           "the second demotion did not fill the tier");
   const uint64_t state = cacheChain(cache, 4, 1).second[0];
   cache.publishCompositeState(state, std::make_shared<TestState>(100), false);

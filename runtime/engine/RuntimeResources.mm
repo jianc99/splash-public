@@ -690,10 +690,13 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
         config.cacheRoot.empty() ? std::vector<CacheDirectory::Idle>{}
                                  : CacheDirectory::idle(config.cacheRoot);
     // The tier's files: the KV file's slots hold a page as the tier lays it
-    // out, the state file's a state, and the writes of both hold back while a
-    // step waits for reads.
-    const uint64_t kvSlotBytes = model::SlotFile::slotBytesFor(kvPages->bytesPerPage());
-    const model::SlotFile::Options kvFileOptions{.deferWrites = readers->criticalBusyProbe()};
+    // out (kv::SlotFormat), checksummed by segment when persistent, the state
+    // file's a state, and the writes of both hold back while a step waits for
+    // reads.
+    const kv::SlotFormat kvFormat(kvPages->layout());
+    const uint64_t kvSlotBytes = model::SlotFile::slotBytesFor(kvFormat.payloadBytes());
+    const model::SlotFile::Options kvFileOptions{.segments = kvFormat.segments(),
+                                                 .deferWrites = readers->criticalBusyProbe()};
     const model::SlotFile::Options stateFileOptions{.deferWrites = readers->criticalBusyProbe()};
     if (stateStagingBytes) {
       // A write budget, when one is set, refills on the awake clock the
@@ -762,7 +765,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
       try {
         if (!kvFile)
           kvFile = std::make_shared<model::SlotFile>(kvSlotBytes, diskBudget, kvFileOptions);
-        kvTier = std::make_unique<KvPageTier>(*kvPages, kvFile);
+        kvTier = std::make_unique<KvPageTier>(*kvPages, kvFormat, kvFile, readers);
       } catch (const std::exception &error) {
         // The persistent files are open by now; without the tier nothing
         // would keep or replace their copies.
