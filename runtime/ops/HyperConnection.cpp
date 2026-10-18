@@ -33,31 +33,22 @@ void HyperConnection::addInit(metal::CommandGraph &graph, metal::MetalBuffer emb
             {rows, groups(shape.hidden), 1}, {kThreads, 1, 1});
 }
 
-PreparedInput HyperConnection::addNorm(metal::CommandGraph &graph, metal::MetalBuffer streams,
-                                       const NormWeights &norm, metal::MetalBuffer inject,
-                                       metal::MetalBuffer normalized, metal::MetalBuffer weights, HyperShape shape,
-                                       uint32_t rows, LinearScratch scratch, LinearInput layout) {
+void HyperConnection::addNorm(metal::CommandGraph &graph, metal::MetalBuffer streams, const NormWeights &norm,
+                              metal::MetalBuffer inject, metal::MetalBuffer normalized, metal::MetalBuffer weights,
+                              HyperShape shape, uint32_t rows) {
   requireShape(shape);
   if (shape.streams != HYPER_CONNECTION_MAXIMUM_STREAMS || shape.hidden != HYPER_CONNECTION_NORM_HIDDEN)
     throw std::invalid_argument("no hyper-connection norm kernel for the shape");
   const bool injects = static_cast<bool>(inject);
   // A mix without injection binds its norm in the unused slots.
-  std::vector<metal::MetalBuffer> bindings{std::move(streams), norm.buffer, injects ? inject : norm.buffer, normalized,
-                                           injects ? weights : norm.buffer};
+  std::vector<metal::MetalBuffer> bindings{std::move(streams), norm.buffer, injects ? inject : norm.buffer,
+                                           std::move(normalized), injects ? weights : norm.buffer};
   // An injecting mix of decode's few rows runs a threadgroup of a quarter per
   // stream each, the rest one of kThreads (kernels/shared/hyper_connection.metal).
   const bool quarters = injects && rows <= HYPER_CONNECTION_NORM_QUARTER_ROWS;
-  const std::string name = quarters ? "hyper_connection_norm_quarters" : "hyper_connection_norm_loaded";
-  const uint32_t threads = quarters ? HYPER_CONNECTION_NORM_QUARTER_THREADS : kThreads;
-  if (layout == LinearInput::Plain) {
-    graph.add(name, std::move(bindings), hyperParams(shape, rows, injects), {rows, 1, 1}, {threads, 1, 1});
-    return {};
-  }
-  requireTableScratch(scratch, layout, shape.width(), rows);
-  bindings.insert(bindings.end(), {scratch.input, scratch.sums});
-  graph.add(name + tableSuffix(layout), std::move(bindings), hyperParams(shape, rows, injects), {rows, 1, 1},
-            {threads, 1, 1});
-  return {std::move(normalized), layout};
+  graph.add(quarters ? "hyper_connection_norm_quarters" : "hyper_connection_norm_loaded", std::move(bindings),
+            hyperParams(shape, rows, injects), {rows, 1, 1},
+            {quarters ? HYPER_CONNECTION_NORM_QUARTER_THREADS : kThreads, 1, 1});
 }
 
 PreparedInput HyperConnection::addLow(metal::CommandGraph &graph, metal::MetalBuffer low, HyperShape shape,
