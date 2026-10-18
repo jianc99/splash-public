@@ -119,11 +119,11 @@ struct MemoryGovernorSnapshot {
 // follow-up request resumes from; only a shrink nothing waits for can afford
 // to, or one under macOS's warning, which holds a waiting request back too.
 // upTo is the highest class the pass takes. A shrink nothing waits for takes
-// nothing in use: the states the requests in service restore from and
-// publish for their follow-ups, and the KV they restore through. What it
-// would free there goes back to those requests' growth, which the host's
-// margin does not hold back, and the replay point it would take is the next
-// resume point.
+// nothing in use, under macOS's warning too: the states the requests in
+// service restore from and publish for their follow-ups, and the KV they
+// restore through. What it would free there goes back to those requests'
+// growth, which neither the host's margin nor the warning holds back, and
+// the replay point it would take is the next resume point.
 struct MemoryReclaimDirective {
   bool critical = false;
   uint64_t targetBytes = 0;
@@ -156,8 +156,8 @@ public:
   // The pass to run now; none under normal pressure. requestWaiting reports
   // whether a request cannot proceed for want of memory. Without one the
   // pass is speculative: it keeps the resume point, as every pass under
-  // macOS's warning does, and, unless macOS warns, only restores the warning
-  // margin and takes nothing in use.
+  // macOS's warning does, takes nothing in use and, unless macOS warns, only
+  // restores the warning margin.
   [[nodiscard]] std::optional<MemoryReclaimDirective>
   update(const MemoryGovernorSnapshot &snapshot, double nowMilliseconds,
          bool requestWaiting) noexcept;

@@ -2186,9 +2186,9 @@ in use (below), such as the replay point a request in service has just
 published: what it would free there would only go back to that request's
 growth. So it does, however much spare memory there is, while macOS reports
 warning memory pressure, its signal for caches to give memory back: each pass
-then returns up to 1 GiB, what is in use last, until the level is normal again
-and keeps the state a follow-up resumes from, even while a request waits, whose
-growth the warning refuses as well (`/status`:
+then returns up to 1 GiB until the level is normal again, still taking nothing
+in use unless a request waits, and keeps the state a follow-up resumes from,
+even while a request waits, whose growth the warning refuses as well (`/status`:
 `memory_governor.system_pressure`, and `growth_allowed` is false meanwhile). A
 pass counts only memory that leaves the engine; a cached state it evicts first
 refills the lane's state buffers it keeps. A start needs only what macOS can
@@ -2233,11 +2233,11 @@ Cache victims come in three classes: checkpoints, then ordinary states and KV
 (first the KV no state restores through, which saves no prefill), then what is
 in use. No work displaces anything of a class above its own. Memory for running
 requests takes what is in use after everything else, and so does a paced pass
-that a request waits for or that macOS's warning asks for. Three kinds of work
-take nothing in use: a paced pass that nothing waits for, and the two that
-follow. A start that a resident lane holds back waits for that lane. And when no
-lane's growth fits, the lane that yields first, such as one just started beside
-a decoding lane, pays for the memory with its own suspension; while other lanes
+that a request waits for. Three kinds of work take nothing in use: a paced pass
+that nothing waits for, under macOS's warning too, and the two that follow. A
+start that a resident lane holds back waits for that lane. And when no lane's
+growth fits, the lane that yields first, such as one just started beside a
+decoding lane, pays for the memory with its own suspension; while other lanes
 fit, it waits for them, resident. A prefill command captures the state of
 each boundary it reaches, in buffers reserved before it runs. A junction or a
 checkpoint retires its lane's checkpoint once published, and a checkpoint the
