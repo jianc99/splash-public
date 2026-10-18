@@ -53,8 +53,10 @@ TEST_SPARSE_ROW_STORE_ASAN := $(ENGINE_SANITIZER_BUILD)/sparse-row-store-asan-ub
 TEST_SPARSE_ROW_STORE_TSAN := $(ENGINE_SANITIZER_BUILD)/sparse-row-store-tsan
 TEST_SSD_READERS_ASAN := $(ENGINE_SANITIZER_BUILD)/ssd-readers-asan-ubsan
 TEST_SSD_READERS_TSAN := $(ENGINE_SANITIZER_BUILD)/ssd-readers-tsan
-# The memory planner's integer arithmetic; it runs on one thread.
+# The memory plan, its audit and /status: arithmetic and JSON on one thread.
 TEST_MEMORY_PLAN_ASAN := $(ENGINE_SANITIZER_BUILD)/engine-memory-plan-asan-ubsan
+TEST_MEMORY_AUDIT_ASAN := $(ENGINE_SANITIZER_BUILD)/memory-audit-asan-ubsan
+TEST_STATUS_ASAN := $(ENGINE_SANITIZER_BUILD)/runtime-status-asan-ubsan
 TEST_MEMORY_TEST := $(ENGINE_TEST_BUILD)/engine-memory-plan
 TEST_VISION_PREPARATION := $(ENGINE_TEST_BUILD)/vision-preparation
 TEST_DRAFT_PREPARATION := $(ENGINE_TEST_BUILD)/draft-preparation
@@ -247,7 +249,7 @@ SANITIZER_CONFIG_TARGETS := $(TEST_SLOT_FILE_ASAN) $(TEST_SLOT_FILE_TSAN) \
 	$(TEST_ANE_FFN_CALIBRATION_ASAN) $(TEST_ANE_FFN_CALIBRATION_TSAN) \
 	$(TEST_SPARSE_ROW_STORE_ASAN) $(TEST_SPARSE_ROW_STORE_TSAN) \
 	$(TEST_SSD_READERS_ASAN) $(TEST_SSD_READERS_TSAN) \
-	$(TEST_MEMORY_PLAN_ASAN)
+	$(TEST_MEMORY_PLAN_ASAN) $(TEST_MEMORY_AUDIT_ASAN) $(TEST_STATUS_ASAN)
 
 # Every native test, benchmark and tool depends on the engine's and the tests'
 # headers, and compiles and links its other prerequisites in the order it
@@ -269,9 +271,6 @@ $(TEST_WEIGHT_SOURCE): dev/tests/engine/weight_source_test.cpp runtime/model/Wei
 $(TEST_SLOT_RECYCLER): dev/tests/engine/slot_recycler_test.cpp runtime/model/SlotRecycler.cpp
 $(TEST_GGUF_FILE): dev/tests/engine/gguf_file_test.cpp runtime/model/GgufFile.cpp \
 		runtime/model/WeightSource.cpp
-$(TEST_MEMORY_TEST) $(TEST_MEMORY_PLAN_ASAN): runtime/metal/DeviceCapabilities.cpp \
-		runtime/engine/MemoryPlan.cpp \
-		dev/tests/engine/engine_memory_plan_test.cpp
 $(TEST_KV_PAGE_CACHE_TEST): runtime/engine/KvPool.cpp \
 		runtime/engine/KvCache.cpp \
 		dev/tests/engine/kv_page_cache_test.cpp
@@ -287,16 +286,9 @@ $(TEST_NATIVE_LOOP_TEST): $(NATIVE_RUNTIME_SOURCES) \
 		dev/tests/engine/ProtocolPeer.cpp \
 		dev/tests/engine/native_engine_loop_test.cpp
 $(TEST_METRICS_TEST): dev/tests/engine/runtime_metrics_test.cpp
-$(TEST_MEMORY_AUDIT_TEST): runtime/metal/DeviceCapabilities.cpp \
-		runtime/engine/MemoryPlan.cpp runtime/engine/MemoryAudit.cpp \
-		dev/tests/engine/memory_audit_test.cpp
 $(TEST_MEMORY_GOVERNOR_TEST): runtime/metal/DeviceCapabilities.cpp \
 		runtime/engine/MemoryPlan.cpp runtime/engine/MemoryGovernor.cpp \
 		dev/tests/engine/memory_governor_test.cpp
-$(TEST_STATUS_TEST): runtime/metal/DeviceCapabilities.cpp \
-		runtime/engine/MemoryPlan.cpp runtime/engine/MemoryAudit.cpp \
-		runtime/engine/Status.cpp \
-		dev/tests/engine/runtime_status_test.cpp
 $(TEST_Q8_CPU_TEST): dev/tests/engine/q8_paged_kv_test.cc
 $(TEST_DISK_SPACE): runtime/engine/DiskSpace.cpp runtime/engine/CacheDirectory.cpp \
 		runtime/model/SlotFile.cpp dev/tests/engine/disk_space_test.cpp
@@ -666,6 +658,16 @@ $(TEST_FD_TRANSPORT_TEST) $(TEST_FD_TRANSPORT_ASAN) $(TEST_FD_TRANSPORT_TSAN): \
 		dev/tests/engine/native_fd_transport_test.cpp
 $(TEST_ANE_FFN_CALIBRATION) $(TEST_ANE_FFN_CALIBRATION_ASAN) $(TEST_ANE_FFN_CALIBRATION_TSAN): \
 		runtime/ops/AneFfnCalibration.cpp dev/tests/engine/ane_ffn_calibration_test.cpp
+$(TEST_MEMORY_TEST) $(TEST_MEMORY_PLAN_ASAN): runtime/metal/DeviceCapabilities.cpp \
+		runtime/engine/MemoryPlan.cpp \
+		dev/tests/engine/engine_memory_plan_test.cpp
+$(TEST_MEMORY_AUDIT_TEST) $(TEST_MEMORY_AUDIT_ASAN): runtime/metal/DeviceCapabilities.cpp \
+		runtime/engine/MemoryPlan.cpp runtime/engine/MemoryAudit.cpp \
+		dev/tests/engine/memory_audit_test.cpp
+$(TEST_STATUS_TEST) $(TEST_STATUS_ASAN): runtime/metal/DeviceCapabilities.cpp \
+		runtime/engine/MemoryPlan.cpp runtime/engine/MemoryAudit.cpp \
+		runtime/engine/Status.cpp \
+		dev/tests/engine/runtime_status_test.cpp
 
 $(filter %-asan-ubsan,$(SANITIZER_CONFIG_TARGETS)): SANITIZERS := address,undefined
 $(filter %-tsan,$(SANITIZER_CONFIG_TARGETS)): SANITIZERS := thread
@@ -699,3 +701,5 @@ test-sanitizers: $(SANITIZER_CONFIG_TARGETS)
 	$(ASAN_TEST_ENV) $(TEST_SSD_READERS_ASAN)
 	$(TSAN_TEST_ENV) $(TEST_SSD_READERS_TSAN)
 	$(ASAN_TEST_ENV) $(TEST_MEMORY_PLAN_ASAN)
+	$(ASAN_TEST_ENV) $(TEST_MEMORY_AUDIT_ASAN)
+	$(ASAN_TEST_ENV) $(TEST_STATUS_ASAN) dev/tests/engine/status_golden.json
