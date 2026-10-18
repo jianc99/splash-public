@@ -282,13 +282,10 @@ struct AneFfnSnapshot {
   double aneMilliseconds = 0.0;
 };
 
-// A block-sparse target's KV on the SSD cache as /status reports it
-// (kv_spill): whether long requests keep it there and why not, what the
-// cache holds and did (Cache::spillSnapshot), and its readers' memory and
-// reads, none for a target that keeps its KV in memory.
+// A spill-capable target's KV on the SSD cache as /status reports it
+// (kv_spill): what the cache holds and did (Cache::spillSnapshot), and its
+// readers' memory and reads.
 struct KvSpillStatus final {
-  bool enabled = false;
-  std::string reason;
   KvSpillSnapshot cache;
   std::optional<model::KvBlockCacheStats> blockCache;
   std::optional<model::KvHistoryStreamStats> historyStream;
@@ -307,6 +304,6 @@ struct KvSpillStatus final {
     const AneFfnSnapshot &aneFfn, ThermalState thermalState,
     const std::optional<model::SparseRowStats> &streamedTable = std::nullopt,
     const std::optional<model::ExpertStoreStats> &streamedExperts = std::nullopt,
-    const KvSpillStatus &kvSpill = {});
+    const std::optional<KvSpillStatus> &kvSpill = std::nullopt);
 
 } // namespace splash::engine
