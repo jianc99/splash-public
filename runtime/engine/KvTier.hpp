@@ -78,9 +78,9 @@ public:
   [[nodiscard]] virtual std::unique_ptr<KvTransfer>
   restore(std::shared_ptr<KvDiskSlot> slot, uint32_t page,
           std::function<void()> completion) = 0;
-  // Starts the restores queued since the last call together, which then
-  // land together and run the first one's completion once for all of them;
-  // a tier that starts each as it comes has none to start.
+  // Starts the restores queued since the last call, in batches that each
+  // run their first restore's completion once all of theirs have landed; a
+  // tier that starts each as it comes has none to start.
   virtual void submitRestores() {}
   // The slot's copy as reads of spilled K/V reach it (model::KvPageSource),
   // on any thread, for as long as they hold it.

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <iterator>
 #include <new>
 #include <span>
 #include <stdexcept>
@@ -27,21 +28,24 @@ std::shared_ptr<KvPageTier::DiskSlot> diskSlot(const std::shared_ptr<KvDiskSlot>
   return disk;
 }
 
-// A reader's memory for what it reads, aligned for uncached IO and kept for
-// the reader's next task: at most a slot each.
-std::span<std::byte> readBuffer(uint64_t bytes) {
-  constexpr std::align_val_t alignment{kv::SlotFormat::kReadAlignmentBytes};
-  struct Free {
-    void operator()(std::byte *memory) const noexcept { ::operator delete(memory, alignment); }
-  };
-  thread_local std::unique_ptr<std::byte, Free> memory;
-  thread_local uint64_t capacity = 0;
-  if (capacity < bytes) {
-    memory.reset(static_cast<std::byte *>(::operator new(bytes, alignment)));
-    capacity = bytes;
-  }
-  return {memory.get(), capacity};
-}
+// Memory a restore's read lands in, aligned for uncached IO, of the read's
+// own size: the range starts the slot and ends a segment, which a read of an
+// adopted slot widens it to no further (model::SlotFile::readAt).
+class ReadBuffer final {
+public:
+  explicit ReadBuffer(kv::SlotRange range)
+      : bytes_((range.bytes + kAlignment - 1) / kAlignment * kAlignment),
+        memory_(static_cast<std::byte *>(::operator new(bytes_, std::align_val_t{kAlignment}))) {}
+  ~ReadBuffer() { ::operator delete(memory_, std::align_val_t{kAlignment}); }
+  ReadBuffer(const ReadBuffer &) = delete;
+  ReadBuffer &operator=(const ReadBuffer &) = delete;
+  [[nodiscard]] std::span<std::byte> span() const noexcept { return {memory_, bytes_}; }
+
+private:
+  static constexpr uint64_t kAlignment = kv::SlotFormat::kReadAlignmentBytes;
+  uint64_t bytes_;
+  std::byte *memory_;
+};
 
 } // namespace
 
@@ -144,28 +148,38 @@ std::unique_ptr<KvTransfer> KvPageTier::restore(std::shared_ptr<KvDiskSlot> slot
 }
 
 void KvPageTier::submitRestores() {
-  if (queued_.empty())
-    return;
-  // A batch that does not start leaves its restores queued for the next
-  // call; one that starts is tracked without another allocation.
-  batches_.reserve(batches_.size() + 1);
-  auto restores = std::make_shared<std::vector<Restore>>();
-  RestoreBatch batch{restores, nullptr, std::vector<bool>(queued_.size()), queued_.size()};
-  restores->swap(queued_);
-  try {
-    // A failed read throws, and the readers try it once more. The batch
-    // wakes the engine once every restore in it has ended.
-    batch.batch = readers_->start(
-        restores->size(), [this, restores](size_t index) { read((*restores)[index]); },
-        readers_->readers(), [restores](const model::SsdReaders::Batch &) {
-          if (const std::function<void()> &completion = restores->front().completion)
-            completion();
-        });
-  } catch (...) {
-    restores->swap(queued_);
-    throw;
+  // Index restores read a few KiB each, on every reader; a whole restore
+  // reads a slot, so fewer of them run at once and their memory stays
+  // within kWholeRestoreReaders slots.
+  for (const bool index : {true, false}) {
+    const auto first = std::stable_partition(queued_.begin(), queued_.end(),
+                                             [&](const Restore &restore) { return restore.index != index; });
+    const auto count = static_cast<size_t>(queued_.end() - first);
+    if (!count)
+      continue;
+    // A batch that does not start leaves its restores queued for the next
+    // call; one that starts is tracked without another allocation.
+    batches_.reserve(batches_.size() + 1);
+    RestoreBatch batch{std::make_shared<std::vector<Restore>>(), nullptr, std::vector<bool>(count), count};
+    batch.restores->reserve(count);
+    std::move(first, queued_.end(), std::back_inserter(*batch.restores));
+    try {
+      // A failed read throws, and the readers try it once more. The batch
+      // wakes the engine once every restore in it has ended.
+      batch.batch = readers_->start(
+          count, [this, restores = batch.restores](size_t task) { read((*restores)[task]); },
+          index ? readers_->readers() : std::min(kWholeRestoreReaders, readers_->readers()),
+          [restores = batch.restores](const model::SsdReaders::Batch &) {
+            if (const std::function<void()> &completion = restores->front().completion)
+              completion();
+          });
+    } catch (...) {
+      std::move(batch.restores->begin(), batch.restores->end(), first);
+      throw;
+    }
+    queued_.erase(first, queued_.end());
+    batches_.push_back(std::move(batch));
   }
-  batches_.push_back(std::move(batch));
 }
 
 void KvPageTier::read(const Restore &restore) const {
@@ -173,8 +187,9 @@ void KvPageTier::read(const Restore &restore) const {
   // is found beside the engine thread's changes to other extents.
   const kv::SlotRange range =
       restore.index ? format_.indexRange() : kv::SlotRange{0, format_.payloadBytes()};
+  const ReadBuffer buffer(range);
   const std::optional<std::span<const std::byte>> bytes =
-      restore.copy->readAt(range.offset, range.bytes, readBuffer(file_->slotBytes()));
+      restore.copy->readAt(range.offset, range.bytes, buffer.span());
   if (!bytes)
     throw std::runtime_error("a KV tier slot could not be read");
   if (restore.index)
@@ -213,7 +228,15 @@ void KvPageTier::poll() {
       --batch->left;
       --restores_;
     }
-    batch = batch->left ? batch + 1 : batches_.erase(batch);
+    if (batch->left) {
+      ++batch;
+      continue;
+    }
+    // The reader that ended the last restore runs the batch's end once that
+    // restore shows ended: the batch goes when its end has returned, so no
+    // completion runs past the tier.
+    readers_->stop(*batch->batch);
+    batch = batches_.erase(batch);
   }
 }
 
