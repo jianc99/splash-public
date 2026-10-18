@@ -454,11 +454,14 @@ private:
     // A restore that could not fit alone released its prefix pin:
     // admissions ignore the cache until one succeeds.
     bool skipCache = false;
-    // Memory was released for it (fundStart) since it last started, which
-    // its next start counts (SpillFundingSnapshot).
-    bool funded = false;
+    // A start's: a running lane's KV moved to the SSD for its funding, so
+    // the Full runway, which that lane's freed pages may have become, funds
+    // it too (fundStart), until it starts.
+    bool fundedByDonor = false;
     // A donor's: the floor of the hot block cache its conversion adds, until
-    // its lane takes it or goes (owedFloorBytes_).
+    // its lane takes it or goes (owedFloorBytes_). Memory released for the
+    // start pays it: while the host pauses growth the lane waits for the
+    // copies that pay it until the balance covers it (prepare).
     uint64_t owedFloor = 0;
     // Admission that waits for its state's read, its KV pages' restores,
     // or both, before the lane runs.
@@ -696,9 +699,13 @@ private:
                                                 ReclaimClass upTo);
   [[nodiscard]] bool reclaimIdleState(
       bool keepLane, model::IdleMemory scope = model::IdleMemory::BuffersThenCaches) noexcept;
-  [[nodiscard]] CacheReclaimResult reuseCachedStateWhilePaused(ReclaimClass upTo);
+  // Lands the tier's finished transfers, as each tick and memory reclaim
+  // does, and goes on with Spill requests' write-through; true when any
+  // landed.
+  bool landTransfers();
+  [[nodiscard]] CacheReclaimResult reuseCachedStateWhilePaused(ReclaimClass upTo, bool releaseIdle);
   [[nodiscard]] CacheReclaimResult reuseCachedPagesWhilePaused(
-      const TokenAdmission &admission, ReclaimClass upTo);
+      const TokenAdmission &admission, ReclaimClass upTo, bool releaseIdle);
   // Memory a lane could not get, and what the engine knows about its return.
   struct Denial {
     metal::AllocationFailure allocationFailure = metal::AllocationFailure::None;
@@ -709,10 +716,12 @@ private:
     bool diskQuota = false;
   };
   // An allocation's last attempt, and what the engine knows about the memory
-  // it could not get.
+  // it could not get; funded when that attempt was granted inside the funded
+  // mark, on memory released for a start (fundStart).
   template <class Admission> struct Allocation final {
     Admission admission;
     Denial denial;
+    bool funded = false;
   };
   // The fallback of a Resident lane's KV allocation on a target that can
   // spill, none otherwise: it converts the lane to Spill (Cache::
@@ -743,13 +752,16 @@ private:
   //    pages, the Full runway that funds them;
   // 2. a chunk of a streamed cache above its floor
   //    (model::IdleMemory::Streamed);
-  // 3. a running lane's KV, which moves to the SSD (convertDonor);
-  // and, last, the Full runway the running lanes would grow into.
+  // 3. a running lane's KV, which moves to the SSD (convertDonor), the
+  //    next step moving and crediting what landed of it;
+  // and, last, for a start a donor converted for, the Full runway the
+  // running lanes would grow into, which the donor's freed pages may have
+  // become.
   // Pending, the start waiting for no other lane, when transfers in flight
   // hold what step 1 would release next, a donor's copies among them, and
   // nothing when none gives anything: the start then waits as on a target
   // that cannot spill.
-  [[nodiscard]] CacheReclaimResult fundStart(const Request &start, uint64_t shortfall);
+  [[nodiscard]] CacheReclaimResult fundStart(Request &start, uint64_t shortfall);
   // Step 3: converts the decoding Resident lane of a priority not above the
   // start's whose KV yields the most once spilled, its pages that would
   // spill (Cache::spillablePages) less their index, net of what it adds to
@@ -793,12 +805,13 @@ private:
   // nothing, so the host's refusal offers it too; the allocation is then
   // attempted again. A start's allocation (`start`) that the host still
   // refuses, with nothing pending, is then funded on a target that can
-  // spill: each step funds it (fundStart), and it is attempted again after
-  // every step that gave something, inside the funded mark once the balance
-  // covers what it lacks and the floors its donors owe, so that an attempt
-  // that fails part way spends no balance on buffers it then frees. An optional allocation, whose refusal
-  // only shortens a command or leaves memory for later, records no failure
-  // (allocationFailed_).
+  // spill, its idle model memory kept for that until then: it is attempted
+  // inside the funded mark once the balance covers what it lacks and the
+  // floors its donors owe, so that an attempt that fails part way spends no
+  // balance on buffers it then frees, and otherwise each step funds it
+  // (fundStart), after every one that gave something attempted again. An
+  // optional allocation, whose refusal only shortens a command or leaves
+  // memory for later, records no failure (allocationFailed_).
   template <class Attempt>
   [[nodiscard]] auto allocate(Attempt &&attempt, bool inService, ReclaimClass upTo,
                               const std::function<bool(const Denial &)> &fallback = {},

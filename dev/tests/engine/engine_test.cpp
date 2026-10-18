@@ -7930,13 +7930,13 @@ void testIncompleteConfigIsRefused() {
           "a target that can spill needs its page, extent and slot sizes");
   refused(
       [](EngineConfig &config) {
-        config.spill = {.capable = true, .geometry = {.fullPageBytes = 100, .slotBytes = 100, .extentPages = 4}};
+        config.spill = {.capable = true, .geometry = {.fullPageBytes = 100, .slotBytes = 100, .extentPages = 4, .hotExtentSlots = 32}};
         config.fund = {};
       },
       "a target that can spill needs the governor's funding");
   refused(
       [](EngineConfig &config) {
-        config.spill = {.capable = true, .geometry = {.fullPageBytes = 100, .slotBytes = 100, .extentPages = 4}};
+        config.spill = {.capable = true, .geometry = {.fullPageBytes = 100, .slotBytes = 100, .extentPages = 4, .hotExtentSlots = 32}};
         config.funded = {};
       },
       "a target that can spill needs the governor's funding");
@@ -7965,7 +7965,8 @@ void testUnwritableTierKeepsRequestsResident() {
                                .densePages = 64,
                                .windowPages = 64,
                                .groupPages = 256,
-                               .extentPages = 256}};
+                               .extentPages = 256,
+                               .hotExtentSlots = 2048}};
   engine::Engine engine(config, cache, model, events);
   guardReleases(storage, engine);
   engine.submit(request(1, std::vector<uint32_t>(100, 3)));
@@ -8022,7 +8023,8 @@ struct Spilling {
                                  .densePages = 1,
                                  .windowPages = 1,
                                  .groupPages = 4,
-                                 .extentPages = 4}};
+                                 .extentPages = 4,
+                                 .hotExtentSlots = 32}};
     return result;
   }
   // A request whose prompt is `pages` whole pages of `token` and one token
@@ -8643,21 +8645,25 @@ struct HostGovernor final {
 // A target that can spill whose memory a HostGovernor admits: a lane's state
 // of 1,000 bytes as each start activates it, the KV pool's extents of eight
 // Full pages of 100 bytes (800) or eight Index pages of 10 (80), a decoding
-// lane's floor of the hot block cache, 200 bytes a lane and one lane's more
-// for the first, and the chunks of a streamed cache. Two Full extents and
-// the Index runway are allocated first; a tier of 100-byte slots takes
-// every write, which lands as the fixture ticks on; the dense history and
-// the tail window are a page each, and requests stay Resident within
-// resident KV of `residentKvBytes`. Decode runs until a test ends it.
+// lane's floor of the hot block cache, an extent of `laneHot` bytes (200 by
+// default) a lane and one lane's more for the first, and the chunks of a
+// streamed cache. Two Full
+// extents and the Index runway are allocated first; a tier of 100-byte
+// slots takes `transferLimit` writes at a time, which land as the fixture
+// ticks on; the dense history and the tail window are a page each, and
+// requests stay Resident within resident KV of `residentKvBytes`. Decode
+// runs until a test ends it.
 struct Funding {
   static constexpr uint64_t kLaneState = 1000, kLaneHot = 200;
 
-  explicit Funding(uint64_t residentKvBytes = 100'000, uint32_t runwayPages = 16)
-      : pool(storage, runwayPages),
+  explicit Funding(uint64_t residentKvBytes = 100'000, uint32_t runwayPages = 16, uint32_t transferLimit = 1024,
+                   uint64_t laneHot = kLaneHot)
+      : laneHot(laneHot), pool(storage, runwayPages),
         budget(std::make_shared<model::DiskBudget>(uint64_t{1024} * 100, [this] { return now; })),
-        cache(pool, &tier, budget, CacheSpillPolicy{1, 1}), engine(config(host, residentKvBytes), cache, model, events) {
+        cache(pool, &tier, budget, CacheSpillPolicy{1, 1}),
+        engine(config(host, residentKvBytes, laneHot), cache, model, events) {
     tier.budget = budget;
-    tier.transferLimit = 1024;
+    tier.transferLimit = transferLimit;
     require(static_cast<bool>(pool.fillRunway(kv::PageForm::Index)), "the Index runway was not allocated");
     guardReleases(storage, engine);
     model.decodeFinishes = false;
@@ -8666,10 +8672,10 @@ struct Funding {
     model.beginAllocationFailure = metal::AllocationFailure::HostPressure;
     model.beginGrowthBlocked = [this] { return !host.reserve(kLaneState); };
     model.chunkAdmission = [this](uint64_t bytes) { return host.reserve(bytes); };
-    model.floorAdmission = [this] { return host.reserve(model.floors.empty() ? 2 * kLaneHot : kLaneHot); };
+    model.floorAdmission = [this] { return host.reserve(model.floors.empty() ? 2 * this->laneHot : this->laneHot); };
   }
 
-  static EngineConfig config(HostGovernor &host, uint64_t residentKvBytes) {
+  static EngineConfig config(HostGovernor &host, uint64_t residentKvBytes, uint64_t laneHot) {
     EngineConfig result = test::engineConfig();
     host.connect(result);
     result.spill = {.capable = true,
@@ -8686,7 +8692,7 @@ struct Funding {
                                  .extentPages = 8,
                                  .laneSlots = 8,
                                  .hotExtentSlots = 8,
-                                 .hotExtentBytes = kLaneHot}};
+                                 .hotExtentBytes = laneHot}};
     return result;
   }
   // A request whose prompt is `tokens` tokens of `token`, which may generate
@@ -8704,14 +8710,18 @@ struct Funding {
     const auto lanes = static_cast<uint64_t>(
         std::ranges::count_if(model.requests, [](const auto &entry) { return entry.second.resident; }));
     const uint64_t floors = model.floors.size();
-    return storage.allocatedBytes() + kLaneState * lanes + (floors ? (floors + 1) * kLaneHot : 0) +
+    return storage.allocatedBytes() + kLaneState * lanes + (floors ? (floors + 1) * laneHot : 0) +
            std::accumulate(model.cacheUnits.begin(), model.cacheUnits.end(), uint64_t{0}) +
            std::accumulate(model.streamedChunks.begin(), model.streamedChunks.end(), uint64_t{0});
   }
-  // A tick, after which the tier's transfers land.
+  // A tick, after which the tier's transfers land, and, with
+  // pacedReclaimBytes, the paced reclaim of macOS's warning runs between
+  // commands, toward that many bytes.
   void tick() {
     static_cast<void>(engine.tick(now++));
     tier.complete();
+    if (pacedReclaimBytes && !engine.commandInFlight())
+      static_cast<void>(engine.reclaimMemory({.targetBytes = pacedReclaimBytes, .keepResumePoint = true}));
   }
   void runUntil(const std::function<bool()> &done, const char *message) {
     for (uint32_t step = 0; step < 2000 && !done(); ++step)
@@ -8735,6 +8745,7 @@ struct Funding {
   }
   [[nodiscard]] SpillFundingSnapshot funding() const { return engine.snapshot().spill.funding; }
 
+  const uint64_t laneHot;
   HostGovernor host;
   test::TestKvStorage storage{512, 100, 8, 10};
   KvPool pool;
@@ -8745,6 +8756,7 @@ struct Funding {
   Events events;
   engine::Engine engine;
   double now = 1;
+  uint64_t pacedReclaimBytes = 0;
 };
 
 // (a) A target that cannot spill funds nothing: a start the host's pause
@@ -8790,8 +8802,8 @@ void testATargetThatCannotSpillFundsNothing() {
 
 // (b) Short lanes under the host's pause, scenario 5's essays: the starts
 // beside a decoding lane start in the pass that first tries them, each on
-// memory Splash releases for it, the cheapest first: once reuse took the
-// model's idle cache, as it always has, and with no cache to give, a
+// memory Splash releases for it, the cheapest first: the model's idle cache,
+// which reuse leaves to the funding, then, with no cache to give, a
 // streamed cache's chunks, one at a time, while the empty extent stays for
 // the lanes' pages. Nothing converts, the four lanes decode together, and
 // Splash's charge never rises past its value when the pause began. (f) Once
@@ -8802,6 +8814,7 @@ void testShortLanesStartOnStreamedCaches() {
   Executor &executor = funding.model;
   executor.cacheUnits = {50};
   executor.streamedChunks = std::vector<uint64_t>(12, 300);
+  executor.streamedChunkBytes = 300;
   funding.engine.submit(Funding::prompt(1, 1, 16, 400));
   funding.runUntil([&] { return funding.events.outputs.contains(1); }, "the first lane did not decode");
   funding.host.paused = true;
@@ -8816,15 +8829,14 @@ void testShortLanesStartOnStreamedCaches() {
       },
       "the starts were not funded");
   const SpillFundingSnapshot funded = funding.funding();
-  // The reuse before the funding took the model's idle cache; then each
-  // start took chunks until the balance held its state: four, three and
-  // three.
+  // The first start's funding took the model's idle cache, then each start
+  // took chunks until the balance held its state: four, three and three.
   std::vector<model::IdleMemory> order(11, model::IdleMemory::Streamed);
   order.front() = model::IdleMemory::BuffersThenCaches;
-  require(funded.starts == 3 && funded.conversions == 0 && funded.latestStart == 4 && funded.released.idle == 0 &&
+  require(funded.starts == 3 && funded.conversions == 0 && funded.latestStart == 4 && funded.released.idle == 50 &&
               funded.released.cache == 0 && funded.released.streamed == 10 * 300 && executor.idleReleases == order &&
               executor.streamedChunks.size() == 2 && funding.storage.releasedExtents == 0,
-          "the starts were not funded from streamed chunks alone, the empty extent kept");
+          "the starts were not funded from the idle cache and streamed chunks alone, the empty extent kept");
   funding.runBounded(
       paused,
       [&] {
@@ -8853,22 +8865,86 @@ void testShortLanesStartOnStreamedCaches() {
   funding.runUntil([&] { return idle(funding.engine); }, "the requests did not end");
 }
 
+// A streamed cache that holds rows in its first chunks alone gives back
+// the empty chunks after them for nothing: a start is funded only by the
+// rows the chunks held. Short of its state, with no lane that could give
+// its KV, the start waits as on a target that cannot spill, the empty
+// extent kept for the running lane's pages, and once the pause ends it
+// starts, counted as no funded start.
+void testEmptyChunksFundNothing() {
+  Funding funding;
+  Executor &executor = funding.model;
+  executor.streamedChunks = {300, 300, 0, 0, 0};
+  executor.streamedChunkBytes = 300;
+  funding.engine.submit(Funding::prompt(1, 1, 16, 400));
+  funding.runUntil([&] { return funding.events.outputs.contains(1); }, "the first lane did not decode");
+  funding.host.paused = true;
+  const uint64_t paused = funding.charge();
+  funding.engine.submit(Funding::prompt(2, 2, 16, 400));
+  funding.runBounded(paused, [&] { return executor.streamedChunks.empty(); }, "the chunks were not given back");
+  for (int step = 0; step < 6; ++step)
+    funding.tick();
+  require(funding.charge() <= paused && funding.events.startIds.size() == 1 &&
+              funding.engine.resourceWaitSnapshot(funding.now).memory == 1 &&
+              funding.funding().released.streamed == 600 && funding.funding().released.cache == 0 &&
+              funding.host.balance == 600 && funding.storage.releasedExtents == 0,
+          "empty chunks funded a start, or the start took the running lane's empty extent");
+  funding.host.paused = false;
+  funding.host.evaluate();
+  funding.runUntil([&] { return funding.events.startIds.size() == 2; }, "the start did not run after the pause");
+  require(funding.funding().starts == 0, "a start that ran after the pause counted as funded");
+  funding.engine.cancel(1);
+  funding.engine.cancel(2);
+  funding.runUntil([&] { return idle(funding.engine); }, "the requests did not end");
+}
+
+// What funding released for one start and no growth took since funds the
+// next start of the pause, with nothing more released for it.
+void testTheBalanceFundsTheNextStart() {
+  Funding funding;
+  Executor &executor = funding.model;
+  executor.streamedChunks = {2100};
+  executor.streamedChunkBytes = 2100;
+  funding.engine.submit(Funding::prompt(1, 1, 16, 400));
+  funding.runUntil([&] { return funding.events.outputs.contains(1); }, "the first lane did not decode");
+  funding.host.paused = true;
+  const uint64_t paused = funding.charge();
+  funding.engine.submit(Funding::prompt(2, 2, 16, 400));
+  funding.engine.submit(Funding::prompt(3, 3, 16, 400));
+  funding.runBounded(paused, [&] { return funding.events.startIds.size() == 3; },
+                     "the next start did not run on the balance");
+  require(funding.funding().starts == 2 && funding.funding().released.streamed == 2100 &&
+              funding.funding().released.cache == 0 && funding.storage.releasedExtents == 0 &&
+              funding.engine.snapshot().prioritySuspensions == 0,
+          "the next start took more than the balance held");
+  funding.host.paused = false;
+  for (uint64_t id = 1; id <= 3; ++id)
+    funding.engine.cancel(id);
+  funding.runUntil([&] { return idle(funding.engine); }, "the requests did not end");
+}
+
 // (c) With the streamed caches at their floors, a decoding lane of a long
 // context, the one lane whose KV yields more than its hot floor, moves its
 // KV to the SSD for a start: the start waits for the copies, no lane
 // suspended for it, and starts once they landed, on the Full pages they
 // freed, the donor's floor covered too: Splash's charge never rises past
-// its value when the pause began. (f) The donor stays Spill once the pause
+// its value when the pause began, also while the copies land a few at a
+// tick, the donor, of a longer context and a floor larger than an extent,
+// then waiting for its floor until what they freed covers it, and a paced
+// reclaim runs between the ticks. (f) The donor stays Spill once the pause
 // is over, and the conversation's next turn, Resident, takes its pages back
 // whole.
-void testALongLaneMovesItsKvForAStart() {
-  Funding funding;
+void testALongLaneMovesItsKvForAStart(uint32_t transferLimit) {
+  const bool slow = transferLimit < 1024;
+  Funding funding(100'000, 16, transferLimit, slow ? 500 : Funding::kLaneHot);
+  if (slow)
+    funding.pacedReclaimBytes = 2'000;
   // A short lane of a lower priority than the start's, which a suspension
   // would take were the start not waiting for the copies, then the long
   // lane.
   funding.engine.submit(Funding::prompt(3, 3, 16, 400, RequestPriority::Background));
   funding.runUntil([&] { return funding.events.outputs.contains(3); }, "the short lane did not decode");
-  funding.engine.submit(Funding::prompt(1, 1, 24 * KvCache::pageTokens + 1, 400));
+  funding.engine.submit(Funding::prompt(1, 1, (slow ? 40 : 24) * KvCache::pageTokens + 1, 400));
   funding.runUntil([&] { return funding.events.outputs.contains(1); }, "the long lane did not decode");
   funding.host.paused = true;
   const uint64_t paused = funding.charge();
@@ -8884,8 +8960,10 @@ void testALongLaneMovesItsKvForAStart() {
           "the start did not run on the donor's spilled pages");
   funding.runBounded(paused, [&] { return funding.events.outputs[2].size() >= 4 && funding.model.floors.contains(1); },
                      "the start and the donor did not decode");
+  require(funding.engine.snapshot().prioritySuspensions == 0, "a lane was suspended while the donor's floor waited");
   // (f) After the pause the donor stays Spill until it ends; the next turn
-  // of its conversation, Resident, holds its blocks alone and un-spills them.
+  // of its conversation, Resident, holds its blocks alone and un-spills them
+  // (the paced reclaim, had it run on, would have taken the cached chain).
   funding.host.paused = false;
   funding.host.evaluate();
   for (int step = 0; step < 10; ++step)
@@ -8894,6 +8972,8 @@ void testALongLaneMovesItsKvForAStart() {
   for (const uint64_t id : {1, 2, 3})
     funding.engine.cancel(id);
   funding.runUntil([&] { return idle(funding.engine); }, "the requests did not end");
+  if (funding.pacedReclaimBytes)
+    return;
   const uint64_t unspills = funding.cache.spillSnapshot().unspills;
   const uint64_t resident = funding.engine.snapshot().spill.resident;
   funding.engine.submit(Funding::prompt(4, 1, 24 * KvCache::pageTokens + 40, 8));
@@ -8901,6 +8981,48 @@ void testALongLaneMovesItsKvForAStart() {
   require(funding.events.starts.back() > 0 && funding.cache.spillSnapshot().unspills > unspills &&
               funding.engine.snapshot().spill.resident == resident + 1,
           "the next Resident turn did not take the donor's pages back");
+}
+
+// A donor whose blocks have their copies already, as a turn that took a
+// spilled chain back holds them, frees its pages at its conversion: the
+// start is funded in the same step, from what they freed, and no lane of a
+// lower priority is suspended for it.
+void testARestoredChainFundsAStartAtOnce() {
+  Funding funding;
+  // A conversation's first turn moves its KV to the SSD for a start.
+  funding.engine.submit(Funding::prompt(1, 1, 24 * KvCache::pageTokens + 1, 400));
+  funding.runUntil([&] { return funding.events.outputs.contains(1); }, "the long lane did not decode");
+  funding.host.paused = true;
+  funding.engine.submit(Funding::prompt(2, 2, 16, 400));
+  funding.runUntil([&] { return funding.events.startIds.size() == 2; }, "the first start did not run");
+  funding.host.paused = false;
+  funding.host.evaluate();
+  funding.engine.cancel(1);
+  funding.engine.cancel(2);
+  funding.runUntil([&] { return idle(funding.engine); }, "the requests did not end");
+  // Its next turn, Resident, takes its pages back whole beside a short lane
+  // of a lower priority, and then a start comes under the pause: each of the
+  // turn's blocks has its copy.
+  const uint64_t unspills = funding.cache.spillSnapshot().unspills;
+  funding.engine.submit(Funding::prompt(5, 5, 16, 400, RequestPriority::Background));
+  funding.runUntil([&] { return funding.events.outputs.contains(5); }, "the short lane did not decode");
+  funding.engine.submit(Funding::prompt(4, 1, 24 * KvCache::pageTokens + 8, 400));
+  funding.runUntil([&] { return funding.events.outputs.contains(4); }, "the next turn did not decode");
+  require(funding.cache.spillSnapshot().unspills > unspills && funding.modeOf(4) == KvMode::Resident,
+          "the next turn did not take its pages back");
+  funding.host.paused = true;
+  const uint64_t paused = funding.charge();
+  const uint32_t demotions = funding.tier.demotions;
+  funding.engine.submit(Funding::prompt(6, 6, 16, 400));
+  funding.runBounded(paused, [&] { return funding.events.startIds.size() == 5; }, "the start did not run");
+  require(funding.funding().conversions == 2 && funding.funding().latestDonor == 4 &&
+              funding.funding().starts == 2 && funding.tier.demotions == demotions &&
+              funding.engine.snapshot().prioritySuspensions == 0 && funding.modeOf(5) == KvMode::Resident,
+          "the start did not run on the pages the restored chain freed, or took the short lane's");
+  funding.host.paused = false;
+  for (const uint64_t id : {4, 5, 6})
+    funding.engine.cancel(id);
+  funding.runUntil([&] { return idle(funding.engine); }, "the requests did not end");
 }
 
 // (d) No donor among a lane that prefills, one that spills, one too short
@@ -11599,7 +11721,11 @@ int main() {
     testFailedRestoreReturnsTheCommitment();
     testATargetThatCannotSpillFundsNothing();
     testShortLanesStartOnStreamedCaches();
-    testALongLaneMovesItsKvForAStart();
+    testEmptyChunksFundNothing();
+    testTheBalanceFundsTheNextStart();
+    testALongLaneMovesItsKvForAStart(1024);
+    testALongLaneMovesItsKvForAStart(2);
+    testARestoredChainFundsAStartAtOnce();
     testDonorsAreDecodingResidentLanesThatCover();
     testPacedReclaimLeavesTheFunding();
     testColdPublishesReplayStateAndRebuildsALostOne();
