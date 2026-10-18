@@ -261,7 +261,9 @@ uint64_t StateCache::resumePoint() const noexcept {
   // Speculative protection keeps the newest ordinary publication, such as
   // the point of a request that just finished, and a checkpoint only without
   // one: checkpoints can survive cancellation but remain disposable. A state
-  // in use needs no such protection; its class already puts it last.
+  // in use needs no such protection: a pass that nothing waits for takes
+  // nothing in use (MemoryReclaimDirective::upTo), and other work takes it
+  // after everything else.
   std::optional<CacheEvictionCandidate> newest = ordinary_.newest();
   if (!newest)
     newest = checkpoints_.newest();

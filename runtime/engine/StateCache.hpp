@@ -241,8 +241,8 @@ public:
   // resume point, the newest of them.
   [[nodiscard]] std::optional<CacheEvictionCandidate>
   ordinaryCandidate(bool keepResumePoint) const noexcept;
-  // Oldest RAM copy of a state in use. The resume point is never in use:
-  // the class of a state in use protects it.
+  // Oldest RAM copy of a state in use, which only work of class InUse takes
+  // (ReclaimClass). The resume point is never in use.
   [[nodiscard]] std::optional<CacheEvictionCandidate> inUseCandidate() const noexcept;
   // Frees the RAM copy of a candidate above (an unpinned RAM copy; anything
   // else throws std::logic_error): for nothing when a disk copy exists, by

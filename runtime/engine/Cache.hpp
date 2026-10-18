@@ -4,6 +4,7 @@
 #include "engine/KvCache.hpp"
 #include "engine/KvPool.hpp"
 #include "engine/KvTier.hpp"
+#include "engine/ReclaimClass.hpp"
 #include "engine/StateCache.hpp"
 #include "engine/Types.hpp"
 #include "model/LatencyHistogram.hpp"
@@ -244,15 +245,6 @@ struct CacheReclaimResult final {
 // only what gives pages goes, KV leaves, and a state only where it sits on
 // the leaf that goes next; its buffers would give no page otherwise.
 enum class CacheReclaimMode { KeepExtents, ReleaseExtents, ReusePages };
-
-// The highest class a reclaim step may take (the class rule). Ordinary:
-// checkpoints, ordinary states and KV, for growth that can wait or yield
-// instead: a start a resident lane holds back, and the lane that would
-// yield first (Engine::laneToYield) while another lane is resident. InUse:
-// after all of those, the states unfinished requests use and the KV they
-// restore through, for other running work (any other resident lane, or a
-// start no resident lane precedes) and for pressure passes.
-enum class ReclaimClass : uint8_t { Ordinary, InUse };
 
 // Whether the caller can wait for KV memory a step leaves to come back.
 // CanWait (growth and pressure passes): a KV leaf a state needs is written

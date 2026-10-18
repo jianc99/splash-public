@@ -4,6 +4,7 @@
 #include "TestExecutor.hpp"
 #include "TestKvPool.hpp"
 #include "TestKvTier.hpp"
+#include "TestMetalMemory.hpp"
 #include "benchmarks/PrefillWork.hpp"
 #include "engine/Engine.hpp"
 
@@ -11453,6 +11454,59 @@ void testLaneThatWouldYieldTakesNothingInUse() {
           "the lanes did not both complete");
 }
 
+// A paced pass that nothing waits for takes nothing in use, whatever its
+// target: the replay point a running request has published stays, the point
+// its follow-up resumes from once it ends, beside the resume point the pass
+// keeps. What the pass would free there goes back to that request's growth,
+// which the host's margin does not hold back.
+void testPacedPassKeepsInServiceReplayPoint() {
+  test::TestKvStorage storage(64, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool, nullptr, nullptr);
+  Executor executor;
+  Events events;
+  engine::Engine engine(test::engineConfig(), resources, executor, events);
+  guardReleases(storage, engine);
+  double now = 1;
+  // Each turn is the one before, its reply and a new message.
+  std::vector<uint32_t> prompt(65);
+  std::iota(prompt.begin(), prompt.end(), 1);
+  const auto follow = [&](uint64_t id, size_t tokens) {
+    prompt.insert(prompt.end(), events.outputs[id].begin(), events.outputs[id].end());
+    prompt.resize(tokens, static_cast<uint32_t>(id) + 1000);
+  };
+  engine.submit(request(1, prompt));
+  tickUntil(engine, now, [&] { return idle(engine); }, "the first turn did not finish");
+  follow(1, 140);
+  executor.decodeFinishes = false;
+  auto running = request(2, prompt);
+  running.maxNewTokens = 1000;
+  engine.submit(std::move(running));
+  tickUntil(engine, now, [&] { return events.outputs[2].size() >= 2; },
+            "the second turn did not decode");
+  require(events.starts.back() == 64 && resources.snapshot().stateCache.entries == 2 &&
+              resources.snapshot().stateCache.inUse == 1,
+          "the second turn did not restore the first turn's point and publish its own");
+
+  // The host is short of the whole warning margin, and nothing waits.
+  MemoryGovernorSnapshot host;
+  host.pressure = MemoryPressure::Warning;
+  host.hostMeasurementValid = true;
+  MemoryPressurePolicy policy;
+  static_cast<void>(engine.reclaimMemory(policy.update(host, now, false).value()));
+  require(resources.snapshot().stateCache.entries == 2 &&
+              resources.snapshot().stateCache.inUseEvictions == 0,
+          "a paced pass nothing waited for took what a running request uses");
+
+  executor.decodeFinishes = true;
+  tickUntil(engine, now, [&] { return idle(engine); }, "the second turn did not finish");
+  follow(2, 220);
+  engine.submit(request(3, prompt));
+  tickUntil(engine, now, [&] { return idle(engine); }, "the third turn did not finish");
+  require(events.starts.back() == 128 && events.completedCount == 3 && events.failedCount == 0,
+          "the third turn did not resume from the replay point the second published");
+}
+
 // Every end of a decoding request releases its replay point: cancellation
 // and failure at once, before the request leaves the engine, the deadline
 // and capacity exhaustion when the engine ends it.
@@ -11623,6 +11677,7 @@ int main() {
     testWarningShrinkKeepsTheFinishedPoint();
     testHeldBackStartTakesNothingInUse();
     testLaneThatWouldYieldTakesNothingInUse();
+    testPacedPassKeepsInServiceReplayPoint();
     testEveryEndReleasesTheReplayPoint();
     testWaitingEndsReleaseTheReplayPoint();
     testConcurrentColdPrefixesComputeOnce();
