@@ -359,7 +359,8 @@ struct ModelBatchItem final {
   uint32_t pageTableFirstChanged = 0;
   // Where each page of the list reads its K/V from, cut with the list
   // (engine::Cache::cutPageTable); null while no page holds only its index.
-  // The command keeps it until it completes.
+  // The command keeps it until it completes, and lets it go before its
+  // ticket's wait() returns.
   std::shared_ptr<const model::KvPageSources> pageSources{};
   std::span<const uint32_t> inputTokens{};
   // A prefill chunk's states to capture, ascending: page-aligned boundaries in
@@ -735,7 +736,8 @@ public:
   // once, taking nothing. The hot block cache's floor for the request's lane,
   // which decodes over Index pages (model::KvBlockCache::reserveLane); the
   // staging of a prefill's history of `pages` pages, which holds Index
-  // pages (model::KvHistoryStream::reserve); and, optionally, one more
+  // pages, the request's while its prompt goes on, also once refused
+  // (model::KvHistoryStream::reserve); and, optionally, one more
   // extent of the hot block cache toward its planned size
   // (model::KvBlockCache::growTowardTarget).
   [[nodiscard]] virtual ModelMemoryAdmission reserveSpilledReads(uint64_t) { return {.ok = true}; }
@@ -765,9 +767,10 @@ public:
   // nothing in scope is idle. A unit is one pooled state buffer (keepLane
   // keeps those one lane starts from); with BuffersThenCaches, once no
   // buffer is idle, the vision arena when no image waits for its encode and
-  // nothing holds it, and then one embedding entry nothing else holds,
-  // oldest first. A denied allocation retries between calls, so it frees
-  // only what it needs.
+  // nothing holds it, the staging of spilled history once no prompt streams
+  // into it, the hot block cache above its lanes' floors, and then one
+  // embedding entry nothing else holds, oldest first. A denied allocation
+  // retries between calls, so it frees only what it needs.
   [[nodiscard]] virtual uint64_t reclaimIdleState(bool keepLane,
                                                   IdleMemory scope) noexcept = 0;
   // Why this request's mask is unusable, or nothing when the model took it.

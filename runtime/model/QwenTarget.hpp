@@ -3,6 +3,7 @@
 #include "Model.hpp"
 #include "QwenHybridLayout.hpp"
 #include "RopeScaling.hpp"
+#include "SpilledKvReads.hpp"
 #include "StateLayout.hpp"
 #include "WeightStore.hpp"
 #include "ops/GDN.hpp"
@@ -414,7 +415,9 @@ public:
   // layer: a layer of each chunk in turn, then the next layer, so that a
   // layer whose experts stream loads the union of the chunks' experts once.
   // A chunk's sequences read the states and KV that the chunks before it
-  // wrote, in `kv`. The dense FFN of a command of one chunk the split takes
+  // wrote, in `kv`, and a sequence whose history holds Index pages reads its
+  // K/V through `spilled` (the command's SpilledKvReads, the null one for
+  // none). The dense FFN of a command of one chunk the split takes
   // (AneFfn::splits) runs split with the Neural Engine on `aneFfn`, when
   // given. Returns each chunk's buffer of its last layer's output rows.
   //
@@ -425,16 +428,17 @@ public:
   // scratch is in flight.
   [[nodiscard]] virtual std::vector<metal::MetalBuffer> addPrefill(metal::CommandGraph &graph,
                                                                    std::span<const QwenTargetPrefillChunk> chunks,
-                                                                   const kv::PageStorage &kv,
+                                                                   const kv::PageStorage &kv, SpilledKvReads &spilled,
                                                                    ops::AneFfn *aneFfn = nullptr) = 0;
   // Writes the inputs the target makes on the CPU of batch lane `lane`'s
   // verify rows, those from `position` on of `request`, before the cycle's
   // commands are encoded.
   virtual void prepareVerifyLane(uint32_t lane, uint64_t position, const QwenTargetRequest &request);
-  // A verify's layers and head over `lanes` lanes.
+  // A verify's layers and head over `lanes` lanes, whose blocks on Index
+  // pages it reads through `spilled` (the command's SpilledKvReads).
   virtual void addVerify(
       metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers,
-      const kv::PageStorage &kv,
+      const kv::PageStorage &kv, SpilledKvReads &spilled,
       std::span<const kv::ChunkedPrefillParams> chunks,
       uint32_t lanes) const = 0;
   // The head over `lanes` lanes of targetVerifyRows rows of the last layer's
@@ -468,8 +472,9 @@ protected:
              const ops::ExecutionPlans &operators);
 
   // The state a prefill command's layers share for one of its chunks: its
-  // rows, their buffers and plans, the buffers the layer's MoE routes and
-  // runs through, and the next GDN and attention layer of the step. A family
+  // rows, their buffers and plans, the K/V they attend and the command's
+  // reads of spilled K/V, the buffers the layer's MoE routes and runs
+  // through, and the next GDN and attention layer of the step. A family
   // whose steps need more extends it.
   struct PrefillStep {
     metal::CommandGraph &graph;
@@ -477,6 +482,7 @@ protected:
     std::span<const QwenTargetPrefillSequence> sequences;
     uint32_t rows;
     std::span<const SplashKvLayer> kvLayers;
+    SpilledKvReads &spilled;
     // Each sequence's attention plan, which every attention layer runs.
     std::vector<ops::PrefillAttentionPlan> attention{};
     std::optional<ops::MoePlan> moe{};
@@ -492,6 +498,7 @@ protected:
     metal::CommandGraph &graph;
     const QwenTargetVerifyBuffers &buffers;
     std::span<const SplashKvLayer> kvLayers;
+    SpilledKvReads &spilled;
     std::span<const kv::ChunkedPrefillParams> chunks;
     uint32_t lanes;
     uint32_t rows;
@@ -513,19 +520,23 @@ protected:
   template <class Step = PrefillStep>
   [[nodiscard]] std::vector<Step> prefillSteps(metal::CommandGraph &graph,
                                                std::span<const QwenTargetPrefillChunk> chunks,
-                                               const kv::PageStorage &kv, ops::AneFfn *aneFfn) const {
+                                               const kv::PageStorage &kv, SpilledKvReads &spilled,
+                                               ops::AneFfn *aneFfn) const {
     requirePrefill(chunks, kv, aneFfn);
     std::vector<Step> steps;
     steps.reserve(chunks.size());
-    for (const QwenTargetPrefillChunk &chunk : chunks) steps.push_back(Step{prefillStep(graph, chunk, kv, aneFfn)});
+    for (const QwenTargetPrefillChunk &chunk : chunks)
+      steps.push_back(Step{prefillStep(graph, chunk, kv, spilled, aneFfn)});
     return steps;
   }
   // A prefill's layers over its steps (addPrefill), through a family's
   // `layers`: each step's begin (addPrefillBegin); per layer, each step
-  // through its FFN's routing (addPrefillLayer), one load of the streamed
-  // experts any step's rows route (of the layer's MoE block, moe), and each
-  // step's routed work (addPrefillExperts); then each step's end, which
-  // returns its last layer's output rows (addPrefillEnd).
+  // through its FFN's routing (addPrefillLayer), the hand-off of an
+  // attention layer's spilled history once every step attended it
+  // (SpilledKvReads::layerEnd), one load of the streamed experts any step's
+  // rows route (of the layer's MoE block, moe), and each step's routed work
+  // (addPrefillExperts); then each step's end, which returns its last
+  // layer's output rows (addPrefillEnd).
   template <class Step, class Layers>
   [[nodiscard]] std::vector<metal::MetalBuffer> addPrefillLayers(std::span<Step> steps, const Layers &layers) const {
     for (Step &step : steps) layers.addPrefillBegin(step);
@@ -533,7 +544,10 @@ protected:
     if (geometry_.ffnKind == QwenFfnKind::SparseMoe)
       for (const Step &step : steps) parts.push_back({&step.ffn, &*step.moe});
     for (uint32_t index = 0; index < geometry_.layers; ++index) {
+      const uint32_t attentionLayer = steps.front().attentionLayer;
       for (Step &step : steps) layers.addPrefillLayer(step, index);
+      if (steps.front().attentionLayer != attentionLayer)
+        steps.front().spilled.layerEnd(steps.front().graph, attentionLayer);
       if (const ops::BlockMoeWeights *ffn = layers.moe(index); ffn && ffn->stream)
         ffn->stream->addLoad(steps.front().graph, parts, ffn->streamBlock);
       for (Step &step : steps) layers.addPrefillExperts(step, index);
@@ -548,8 +562,8 @@ protected:
   }
   // The checked step of a verify of `lanes` lanes, with its plans.
   [[nodiscard]] VerifyStep verifyStep(metal::CommandGraph &graph, const QwenTargetVerifyBuffers &buffers,
-                                      const kv::PageStorage &kv, std::span<const kv::ChunkedPrefillParams> chunks,
-                                      uint32_t lanes) const;
+                                      const kv::PageStorage &kv, SpilledKvReads &spilled,
+                                      std::span<const kv::ChunkedPrefillParams> chunks, uint32_t lanes) const;
   // Throws unless a family's `layers` match the geometry's layers and its
   // attention layers.
   template <class Layer> void requireLayers(std::span<const Layer> layers) const {
@@ -563,7 +577,8 @@ protected:
   // The mixers, of a step's normalized rows (buffers.normalized) into their
   // output projection's `output`: a GDN, and a full attention whose rows
   // attend, when given, only the blocks of their lists (`blocks`, a prefill's
-  // per sequence, a verify's for the step).
+  // per sequence, a verify's for the step), through the step's reads of
+  // spilled K/V.
   void addPrefillMixer(PrefillStep &step, const QwenGdnWeights &mixer, BlockOutput output) const;
   void addPrefillMixer(PrefillStep &step, const QwenAttentionWeights &mixer, BlockOutput output,
                        std::span<const ops::AttentionBlocks> blocks = {}) const;
@@ -607,7 +622,8 @@ private:
   void requirePrefill(std::span<const QwenTargetPrefillChunk> chunks, const kv::PageStorage &kv,
                       const ops::AneFfn *aneFfn) const;
   [[nodiscard]] PrefillStep prefillStep(metal::CommandGraph &graph, const QwenTargetPrefillChunk &chunk,
-                                        const kv::PageStorage &kv, ops::AneFfn *aneFfn) const;
+                                        const kv::PageStorage &kv, SpilledKvReads &spilled,
+                                        ops::AneFfn *aneFfn) const;
 };
 
 // The target of a Qwen3.5-architecture family's weights (Qwen3.8-27B,
