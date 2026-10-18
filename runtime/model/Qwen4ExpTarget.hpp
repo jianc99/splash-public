@@ -31,10 +31,12 @@ public:
   [[nodiscard]] QwenTargetScratchBytes allocatedScratchBytes() const noexcept override;
   [[nodiscard]] std::vector<metal::MetalBuffer> addPrefill(metal::CommandGraph &graph,
                                                            std::span<const QwenTargetPrefillChunk> chunks,
-                                                           const kv::PageStorage &kv, ops::AneFfn *aneFfn) override;
+                                                           const kv::PageStorage &kv, SpilledKvReads &spilled,
+                                                           ops::AneFfn *aneFfn) override;
   void prepareVerifyLane(uint32_t lane, uint64_t position, const QwenTargetRequest &request) override;
   void addVerify(metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers, const kv::PageStorage &kv,
-                 std::span<const kv::ChunkedPrefillParams> chunks, uint32_t lanes) const override;
+                 SpilledKvReads &spilled, std::span<const kv::ChunkedPrefillParams> chunks,
+                 uint32_t lanes) const override;
   // The hidden rows are the final mix, which the head reads as they are.
   void addHeadBatch(metal::CommandGraph &graph, metal::MetalBuffer hidden, metal::MetalBuffer finalHidden,
                     metal::MetalBuffer logits, uint32_t lanes, ops::LinearScratch scratch) const override;

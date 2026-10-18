@@ -154,11 +154,12 @@ void QwenTarget::requirePrefill(std::span<const QwenTargetPrefillChunk> chunks, 
 }
 
 QwenTarget::PrefillStep QwenTarget::prefillStep(metal::CommandGraph &graph, const QwenTargetPrefillChunk &chunk,
-                                                const kv::PageStorage &kv, ops::AneFfn *aneFfn) const {
+                                                const kv::PageStorage &kv, SpilledKvReads &spilled,
+                                                ops::AneFfn *aneFfn) const {
   if (chunk.sequences.empty() || chunk.sequences.size() > ExecutionLimits::maximumBatchWidth || !chunk.rows ||
       chunk.rows > ExecutionLimits::prefillTokenBudget)
     throw std::invalid_argument("invalid Qwen prefill chunk");
-  PrefillStep step{graph, chunk.buffers, chunk.sequences, chunk.rows, kv.layers()};
+  PrefillStep step{graph, chunk.buffers, chunk.sequences, chunk.rows, kv.layers(), spilled};
   for (const QwenTargetPrefillSequence &sequence : chunk.sequences) {
     requirePrefillStates(geometry_, sequence);
     step.attention.push_back(
@@ -170,7 +171,7 @@ QwenTarget::PrefillStep QwenTarget::prefillStep(metal::CommandGraph &graph, cons
 }
 
 QwenTarget::VerifyStep QwenTarget::verifyStep(metal::CommandGraph &graph, const QwenTargetVerifyBuffers &buffers,
-                                              const kv::PageStorage &kv,
+                                              const kv::PageStorage &kv, SpilledKvReads &spilled,
                                               std::span<const kv::ChunkedPrefillParams> chunks,
                                               uint32_t lanes) const {
   const std::span<const SplashKvLayer> kvLayers = kv.layers();
@@ -186,7 +187,7 @@ QwenTarget::VerifyStep QwenTarget::verifyStep(metal::CommandGraph &graph, const 
       throw std::invalid_argument("Qwen verify lane without its auxiliary state");
     histories[lane] = chunks[lane].committed_tokens;
   }
-  VerifyStep step{graph, buffers, kvLayers, chunks, lanes, lanes * kVerifyRows,
+  VerifyStep step{graph, buffers, kvLayers, spilled, chunks, lanes, lanes * kVerifyRows,
                   operators_.verifyAttention(lanes, geometry_.attentionQueryHeads, geometry_.kvLayout,
                                              std::span(histories).first(lanes))};
   if (geometry_.ffnKind == QwenFfnKind::SparseMoe) step.moe = operators_.moeDecode(geometry_.moeShape(), lanes);
@@ -238,7 +239,10 @@ void QwenTarget::addPrefillMixer(PrefillStep &step, const QwenGdnWeights &mixer,
                    std::move(output.rows), std::move(output.residual));
 }
 
-// A sequence with blocks attends through the lists of its tiles of rows.
+// A sequence with blocks attends through the lists of its tiles of rows,
+// and one whose history holds Index pages attends staging, which the step's
+// reads of spilled K/V fill with the layer's history and the chunk's pages
+// once stored.
 void QwenTarget::addPrefillMixer(PrefillStep &step, const QwenAttentionWeights &mixer, BlockOutput output,
                                  std::span<const ops::AttentionBlocks> blocks) const {
   const QwenTargetPrefillBuffers &b = step.buffers;
@@ -271,8 +275,13 @@ void QwenTarget::addPrefillMixer(PrefillStep &step, const QwenAttentionWeights &
         geometry_.kvLayout);
     ops::PagedAttention::addPrefillStore(step.graph, step.kvLayers[layer], keys, values, sequence.pageTable,
                                          sequence.chunk, geometry_.kvLayout);
-    ops::PagedAttention::addPrefill(step.graph, step.kvLayers[layer], queries, attentionRows, b.attentionPartials,
-                                    b.attentionStatistics, sequence.pageTable, sequence.chunk, step.attention[index],
+    const uint32_t firstPage = sequence.chunk.committed_tokens / kv::kPageTokens;
+    const PrefillKv attended =
+        step.spilled.prefill(step.graph, layer, sequence.lane, firstPage,
+                             kv::chunkedPrefillRequiredPages(sequence.chunk) - firstPage,
+                             {sequence.pageTable, step.kvLayers[layer]});
+    ops::PagedAttention::addPrefill(step.graph, attended.kv, queries, attentionRows, b.attentionPartials,
+                                    b.attentionStatistics, attended.table, sequence.chunk, step.attention[index],
                                     blocks.empty() ? ops::AttentionBlocks{} : blocks[index]);
     ops::PagedAttention::addPrefillGate(
         step.graph, u16Rows(b.fullPacked, sequence, geometry_.packedFullWidth), attentionRows,
@@ -320,7 +329,10 @@ void QwenTarget::addVerifyMixer(VerifyStep &step, const QwenGdnWeights &mixer, o
              mixer.outputProjection, outputPlan);
 }
 
-// With `blocks`, each lane's rows attend through its list (ops::AttentionBlocks).
+// With `blocks`, each lane's rows attend through its list (ops::AttentionBlocks),
+// whose blocks on Index pages the step's reads of spilled K/V locate. Rows
+// that read their page table instead read only Full pages (SparseKvShape),
+// so a step whose lanes hold Index pages attends through lists.
 void QwenTarget::addVerifyMixer(VerifyStep &step, const QwenAttentionWeights &mixer, ops::PreparedInput normalized,
                                 BlockOutput output, const ops::AttentionBlocks &blocks) const {
   const QwenTargetVerifyBuffers &b = step.buffers;
@@ -331,10 +343,15 @@ void QwenTarget::addVerifyMixer(VerifyStep &step, const QwenAttentionWeights &mi
   ops::PagedAttention::addVerifyProjection(step.graph, b.fullPacked, mixer.queryNorm, mixer.keyNorm, b.ropeCos,
                                            b.ropeSin, b.fullQueries, b.chunkKeys[layer], b.chunkValues[layer],
                                            geometry_.attentionQueryHeads, geometry_.kvLayout, step.lanes);
+  ops::AttentionBlocks attended = blocks;
+  if (step.spilled.active()) {
+    if (!blocks.stride) throw std::logic_error("a verify over spilled K/V attends without block lists");
+    attended = step.spilled.verify(step.graph, layer, blocks);
+  }
   ops::PagedAttention::addVerify(step.graph, step.kvLayers[layer],
                                  {b.chunkKeys[layer], b.chunkValues[layer], b.fullQueries, b.attentionPartials,
                                   b.attentionStatistics, b.fullAttention, b.pageTables},
-                                 step.chunks, step.attention, blocks);
+                                 step.chunks, step.attention, attended);
   const ops::LinearPlan outputPlan = linear.decodePlan(
       mixer.outputProjection, step.lanes, output.residual ? ops::LinearEpilogue::Residual : ops::LinearEpilogue::None);
   const ops::PreparedInput hidden = ops::PagedAttention::addVerifyGate(
@@ -383,14 +400,16 @@ public:
   }
 
   std::vector<metal::MetalBuffer> addPrefill(metal::CommandGraph &graph, std::span<const QwenTargetPrefillChunk> chunks,
-                                             const kv::PageStorage &kv, ops::AneFfn *aneFfn) override {
-    std::vector<PrefillStep> steps = prefillSteps(graph, chunks, kv, aneFfn);
+                                             const kv::PageStorage &kv, SpilledKvReads &spilled,
+                                             ops::AneFfn *aneFfn) override {
+    std::vector<PrefillStep> steps = prefillSteps(graph, chunks, kv, spilled, aneFfn);
     return addPrefillLayers(std::span(steps), *this);
   }
 
   void addVerify(metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers, const kv::PageStorage &kv,
-                 std::span<const kv::ChunkedPrefillParams> chunks, uint32_t lanes) const override {
-    VerifyStep step = verifyStep(graph, buffers, kv, chunks, lanes);
+                 SpilledKvReads &spilled, std::span<const kv::ChunkedPrefillParams> chunks,
+                 uint32_t lanes) const override {
+    VerifyStep step = verifyStep(graph, buffers, kv, spilled, chunks, lanes);
     for (uint32_t index = 0; index < geometry_.layers; ++index) {
       const Layer &layer = weights_.layers[index];
       const metal::MetalBuffer input = buffers.hidden[index & 1];

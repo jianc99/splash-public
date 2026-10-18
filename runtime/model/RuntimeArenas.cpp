@@ -288,6 +288,10 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
   put(DecodeTensor::PageTable, bytesFor<SplashKvPage>(kMaximumPageTableEntries));
   if (geometry.target.kvLayout.indexDimension)
     put(DecodeTensor::IndexTable, bytesFor<SplashKvPage>(kMaximumPageTableEntries));
+  // A verify lane's list holds each row's selected blocks and the block of
+  // the row's own tail.
+  if (const auto &shape = geometry.spilledKv)
+    put(DecodeTensor::Locations, bytesFor<uint32_t>(uint64_t{shape->verifyRows} * (shape->selectedBlocks + 1)));
   put(DecodeTensor::PenaltyState,
       bytesFor<uint32_t>(geometry.target.vocabularySize));
   put(DecodeTensor::GdnPacked, gdnPackedStride(geometry));

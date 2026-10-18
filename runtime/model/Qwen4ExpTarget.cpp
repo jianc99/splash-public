@@ -73,8 +73,9 @@ std::vector<uint32_t> Qwen4ExpTarget::verifyTableRows(uint32_t lane) const { ret
 
 std::vector<metal::MetalBuffer> Qwen4ExpTarget::addPrefill(metal::CommandGraph &graph,
                                                            std::span<const QwenTargetPrefillChunk> chunks,
-                                                           const kv::PageStorage &kv, ops::AneFfn *aneFfn) {
-  std::vector<PrefillStep> steps = prefillSteps<PrefillStep>(graph, chunks, kv, aneFfn);
+                                                           const kv::PageStorage &kv, SpilledKvReads &spilled,
+                                                           ops::AneFfn *aneFfn) {
+  std::vector<PrefillStep> steps = prefillSteps<PrefillStep>(graph, chunks, kv, spilled, aneFfn);
   const std::vector<uint32_t> offsets = indexOffsets(kv, geometry_.kvLayout.attentionLayers);
   for (uint32_t index = 0; index < steps.size(); ++index) {
     steps[index].scratch = steps_.prefillScratch(index);
@@ -312,9 +313,9 @@ ops::AttentionBlocks Qwen4ExpTarget::addVerifyQsa(VerifyStep &step, const Qwen4I
 // their mix and adds its branch back to them, and the head reads the final
 // mix.
 void Qwen4ExpTarget::addVerify(metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers,
-                               const kv::PageStorage &kv, std::span<const kv::ChunkedPrefillParams> chunks,
-                               uint32_t lanes) const {
-  VerifyStep step{verifyStep(graph, buffers, kv, chunks, lanes)};
+                               const kv::PageStorage &kv, SpilledKvReads &spilled,
+                               std::span<const kv::ChunkedPrefillParams> chunks, uint32_t lanes) const {
+  VerifyStep step{verifyStep(graph, buffers, kv, spilled, chunks, lanes)};
   const std::vector<uint32_t> offsets = indexOffsets(kv, geometry_.kvLayout.attentionLayers);
   step.scratch = steps_.verifyScratch(decodeStorageLanes(lanes) * kVerifyRows);
   step.indexOffsets = offsets;
