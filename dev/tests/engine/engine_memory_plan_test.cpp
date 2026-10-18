@@ -797,7 +797,8 @@ void testEnginePlanServesTheSpilledContext() {
                 geometry.groupPages == 256 &&
                 geometry.residentKvBytes == plan.breakdown().dynamicBudgetBytes -
                                                 plan.breakdown().laneStateBytes - streamed.spill.indexRunwayBytes -
-                                                std::max(streamed.spill.stagingBytes, streamed.spill.hotTargetBytes),
+                                                std::max(streamed.spill.stagingBytes, streamed.spill.hotTargetBytes) &&
+                geometry.residentTokens == bounds.resident,
             "admission's geometry is not the plan's");
   }
   const SpillGeometry geometry{.fullPageBytes = 423'936, .indexPageBytes = 24'576, .densePages = 64,

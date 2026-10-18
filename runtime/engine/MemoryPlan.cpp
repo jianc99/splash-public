@@ -551,6 +551,7 @@ SpillGeometry EngineMemoryPlan::spillGeometry() const noexcept {
           .indexPageBytes = breakdown_.kvIndexPageBytes,
           .slotBytes = spill.slotBytes,
           .residentKvBytes = breakdown_.residentKvBytes,
+          .residentTokens = breakdown_.contextBounds.resident,
           .densePages = spill.densePages,
           .windowPages = spill.windowPages,
           .groupPages = spill.groupPages};
