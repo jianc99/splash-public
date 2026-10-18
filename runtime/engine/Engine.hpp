@@ -3,6 +3,7 @@
 #include "ops/Vision.hpp"
 #include "engine/Cache.hpp"
 #include "engine/MemoryGovernor.hpp"
+#include "engine/MemoryPlan.hpp"
 #include "engine/Scheduler.hpp"
 #include "engine/Types.hpp"
 #include "engine/WriteBehind.hpp"
@@ -68,6 +69,9 @@ struct EngineConfig final {
   // which the pause does not hold back, or clears the mark, and returns the
   // mark it replaced (MemoryGovernor::setServing).
   std::function<bool(bool)> serving;
+  // Which requests keep their KV on the SSD cache (KvMode), from the memory
+  // plan; none unless the target can spill.
+  EngineSpillConfig spill;
 };
 
 // While an active one lives, allocations are memory a request in service
