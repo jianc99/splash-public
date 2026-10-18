@@ -214,9 +214,9 @@ private:
 // Engine split -> Cache -> KV pool -> the disk tier's space -> KV disk tier
 // -> state storage -> KV page storage -> governor -> loaded model -> SSD
 // readers -> Metal backend -> a persistent tier's directory, whose lock goes
-// last. The readers outlive what reads on them; the tier's files, which hold
-// their writes back for the readers' urgent reads, keep them as long as they
-// last.
+// last. The readers outlive what reads on them. The tier's files, whose
+// writes hold back for the readers' urgent reads, only watch them
+// (SsdReaders::criticalBusyProbe), so they and their slots may outlive them.
 // The KV disk tier must go before the KV page storage: its IO worker reads
 // and writes pages in place in the extents, and its destructor waits for
 // every transfer in flight. A persistent tier's files are sealed first,

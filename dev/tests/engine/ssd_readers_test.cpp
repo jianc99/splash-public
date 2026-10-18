@@ -7,8 +7,9 @@
 // task ran, halt() returns at once and each taken task tells when it ended,
 // finish() runs the rest now and returns once the batch's end has; a batch
 // that runs now never waits behind a background batch's queue, and the pool
-// is busy for writes exactly while one runs; and several threads run, start,
-// stop and finish batches at once. Built under TSan too.
+// is busy for writes exactly while one runs, as a probe that outlives it
+// says; and several threads run, start, stop and finish batches at once.
+// Built under TSan too.
 #include "TestChecks.hpp"
 #include "model/SsdReaders.hpp"
 
@@ -16,6 +17,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <functional>
 #include <iostream>
 #include <mutex>
 #include <stdexcept>
@@ -280,27 +282,34 @@ void backgroundRunsTheOldestFirst() {
   require(std::ranges::is_sorted(order), "a reader took a later background batch first");
 }
 
-// Writes yield to the pool exactly while a batch runs now (criticalBusy):
-// not while it is idle or only reads in the background.
+// Writes yield to the pool exactly while a batch runs now (criticalBusy, as
+// its probe says): not while it is idle or only reads in the background. The
+// probe outlives the pool and then says nothing runs.
 void criticalBusyWhileABatchRunsNow() {
-  SsdReaders pool(2);
-  require(!pool.criticalBusy(), "an idle pool held writes back");
-  Gate gate;
-  std::atomic<bool> began = false;
-  const auto ahead = pool.start(
-      1,
-      [&](size_t) {
-        began = true;
-        gate.wait();
-      },
-      1);
-  while (!began.load()) std::this_thread::yield();
-  require(!pool.criticalBusy(), "a background batch held writes back");
-  std::atomic<int> seen = 0;
-  pool.run(8, [&](size_t) { seen += pool.criticalBusy(); });
-  require(seen.load() == 8 && !pool.criticalBusy(), "a batch run now did not hold writes back exactly while it ran");
-  gate.open();
-  pool.stop(*ahead);
+  std::function<bool()> probe;
+  {
+    SsdReaders pool(2);
+    probe = pool.criticalBusyProbe();
+    require(!pool.criticalBusy() && !probe(), "an idle pool held writes back");
+    Gate gate;
+    std::atomic<bool> began = false;
+    const auto ahead = pool.start(
+        1,
+        [&](size_t) {
+          began = true;
+          gate.wait();
+        },
+        1);
+    while (!began.load()) std::this_thread::yield();
+    require(!pool.criticalBusy() && !probe(), "a background batch held writes back");
+    std::atomic<int> seen = 0;
+    pool.run(8, [&](size_t) { seen += pool.criticalBusy() && probe(); });
+    require(seen.load() == 8 && !pool.criticalBusy() && !probe(),
+            "a batch run now did not hold writes back exactly while it ran");
+    gate.open();
+    pool.stop(*ahead);
+  }
+  require(!probe(), "a pool that is gone held writes back");
 }
 
 void threadsShareTheReaders() {

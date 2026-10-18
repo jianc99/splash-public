@@ -644,7 +644,7 @@ benchmark-backend: preflight $(TARGET) $(TEST_BACKEND_BENCHMARK) $(LIB)
 # sanitizer, or twice for a test that starts no thread, which runs under ASan
 # alone.
 $(TEST_SLOT_FILE) $(TEST_SLOT_FILE_ASAN) $(TEST_SLOT_FILE_TSAN): \
-		runtime/model/SlotFile.cpp dev/tests/engine/slot_file_test.cpp
+		runtime/model/SlotFile.cpp runtime/model/SsdReaders.cpp dev/tests/engine/slot_file_test.cpp
 $(TEST_KV_SLOT_FORMAT) $(TEST_KV_SLOT_FORMAT_ASAN): \
 		runtime/ops/KvSlotFormat.cpp dev/tests/engine/kv_slot_format_test.cpp
 $(TEST_DISK_SPACE) $(TEST_DISK_SPACE_ASAN) $(TEST_DISK_SPACE_TSAN): \
