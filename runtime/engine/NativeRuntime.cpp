@@ -536,7 +536,7 @@ void NativeRuntime::maskRequested(uint64_t requestId,
       std::vector<uint32_t>(simulationTokens.begin(), simulationTokens.end())});
 }
 
-void NativeRuntime::completed(uint64_t requestId, EngineFinishReason reason,
+void NativeRuntime::completed(uint64_t requestId, EngineFinishReason reason, bool bounded,
                               uint32_t promptTokens, uint32_t completionTokens,
                               uint32_t deduplicatedTokens,
                               std::span<const float> optionLogits,
@@ -553,7 +553,7 @@ void NativeRuntime::completed(uint64_t requestId, EngineFinishReason reason,
       telemetry.firstTokenMilliseconds ? durationMicros(first, now) : 0,
       durationMicros(telemetry.arrivedMilliseconds, now),
       std::vector<float>(optionLogits.begin(), optionLogits.end()),
-      deduplicatedTokens, speculation});
+      deduplicatedTokens, speculation, bounded});
   ended(requestId, now);
 }
 

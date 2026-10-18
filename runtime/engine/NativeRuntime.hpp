@@ -178,7 +178,7 @@ private:
   void tokens(uint64_t requestId, std::span<const uint32_t> values) override;
   void maskRequested(uint64_t requestId,
                      std::span<const uint32_t> simulationTokens) override;
-  void completed(uint64_t requestId, EngineFinishReason reason,
+  void completed(uint64_t requestId, EngineFinishReason reason, bool bounded,
                  uint32_t promptTokens, uint32_t completionTokens,
                  uint32_t deduplicatedTokens,
                  std::span<const float> optionLogits,

@@ -2356,7 +2356,11 @@ void Engine::finish(Request &active, EngineFinishReason reason,
     scheduler_.finish(active.request.id);
   active.finalized = true;
   const uint32_t completionTokens = generatedTokens(active);
-  events_.completed(active.request.id, reason, active.promptTokens,
+  // Only a bound of the engine's own ends a request with Length short of
+  // its output: the quota's (outputLimit) or a lone lane's at the wall.
+  const bool bounded =
+      reason == EngineFinishReason::Length && completionTokens < active.request.maxNewTokens;
+  events_.completed(active.request.id, reason, bounded, active.promptTokens,
                     completionTokens, active.deduplicatedKvTokens, optionLogits,
                     active.speculation);
   if (reason == EngineFinishReason::Cancelled) {

@@ -57,10 +57,12 @@ public:
     maskRequests.emplace_back(
         requestId, std::vector<uint32_t>(simulation.begin(), simulation.end()));
   }
-  void completed(uint64_t id, EngineFinishReason, uint32_t prompt,
+  void completed(uint64_t id, EngineFinishReason, bool bounded, uint32_t prompt,
                  uint32_t completion, uint32_t deduplicated,
                  std::span<const float>, const SpeculativeCounts &speculation) override {
     ++completedCount;
+    if (bounded)
+      boundedIds.push_back(id);
     usage[id] = {prompt, completion};
     deduplicatedTokens[id] = deduplicated;
     speculativeCounts[id] = speculation;
@@ -80,6 +82,8 @@ public:
   std::vector<uint64_t> startIds;
   std::unordered_map<uint64_t, std::vector<uint32_t>> outputs;
   std::unordered_map<uint64_t, std::pair<uint32_t, uint32_t>> usage;
+  // The requests that ended at a bound of the engine's own.
+  std::vector<uint64_t> boundedIds;
   std::unordered_map<uint64_t, uint32_t> deduplicatedTokens;
   std::unordered_map<uint64_t, SpeculativeCounts> speculativeCounts;
   std::vector<std::string> failures;
@@ -8150,8 +8154,8 @@ void testShortQuotaBoundsWaitsOrRefusesASpillStart() {
     const SpillRequestsSnapshot counts = spill.engine.snapshot().spill;
     require(spill.events.completedCount == 1 && spill.events.usage.at(1).second == 63 &&
                 spill.model.outputLimits.at(1) == 63 && counts.bounded == 1 &&
-                counts.lengthEnds == 1 && spill.tier.writes.size() == 5 &&
-                spill.committedSlots() == 0,
+                counts.lengthEnds == 1 && spill.events.boundedIds == std::vector<uint64_t>{1} &&
+                spill.tier.writes.size() == 5 && spill.committedSlots() == 0,
             "a start the quota holds with a page of output was not bounded to it");
   }
   {
@@ -8177,8 +8181,9 @@ void testShortQuotaBoundsWaitsOrRefusesASpillStart() {
     spill.runUntilIdle();
     require(spill.events.startIds == std::vector<uint64_t>{1, 2, 3} &&
                 spill.events.completedCount == 3 && spill.events.usage.at(2).second == 200 &&
-                spill.events.usage.at(3).second == 31 && spill.committedSlots() == 0,
-            "the waiting start did not run once the quota it waited for came back");
+                spill.events.usage.at(3).second == 31 && spill.events.boundedIds.empty() &&
+                spill.committedSlots() == 0,
+            "the waiting start did not run once the quota it waited for came back, or ended bounded");
   }
   {
     Spilling spill(3);
@@ -8279,8 +8284,9 @@ void testLoneSpillLaneEndsAtTheWall() {
           spill.events.usage.contains(1) ? spill.events.usage.at(1).second : 0;
       require(spill.events.failedCount == 0 && output > 0 &&
                   4 * KvCache::pageTokens + 1 + output <= 8 * KvCache::pageTokens &&
-                  spill.engine.snapshot().spill.lengthEnds == 1,
-              "a lone Spill lane at the wall did not end with Length");
+                  spill.engine.snapshot().spill.lengthEnds == 1 &&
+                  spill.events.boundedIds == std::vector<uint64_t>{1},
+              "a lone Spill lane at the wall did not end with Length at its bound");
     } else {
       require(spill.events.failures == std::vector<std::string>{"capacity_exhausted"} &&
                   spill.events.failureDetails.front().first.find("SSD cache") !=
