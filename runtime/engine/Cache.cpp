@@ -966,7 +966,6 @@ uint32_t Cache::writeThrough() {
 }
 
 bool Cache::writeThrough(Request &active, uint32_t &started) {
-  using Draw = model::DiskBudget::Draw;
   while (!active.owedCopies.empty()) {
     const uint64_t block = active.owedCopies.front();
     // Another request's write, or a restore, gave it a copy meanwhile.
@@ -977,21 +976,25 @@ bool Cache::writeThrough(Request &active, uint32_t &started) {
     }
     if (!tier_->canDemote(WriteClass::Spill))
       return false;
-    // Past its commitment, a page takes a cached copy's room: never the
-    // only copy of a state in use.
-    const Draw draw = active.committedPages ? Draw::Commitment : Draw::Cache;
-    std::shared_ptr<KvDiskSlot> slot = acquireDiskSlot(draw, false);
+    // Past its commitment, as when its output outgrows the projection, a
+    // page commits its slot itself: the copy of a block a request holds is
+    // active KV, within the active limit beside what other requests
+    // committed. Short of that room its page stays Full, and theirs are
+    // still written.
+    if (!active.committedPages && !commit(active, 1))
+      return true;
+    // A slot gives up cached copies, never the only copy of a state in use;
+    // without one the volume holds no more active KV, for any request.
+    std::shared_ptr<KvDiskSlot> slot = acquireDiskSlot(model::DiskBudget::Draw::Commitment, false);
     if (!slot)
       return false;
-    if (draw == Draw::Commitment)
-      --active.committedPages;
+    --active.committedPages;
     auto transfer = tier_->demote(kv_.page(block), slot, WriteClass::Spill, completionNotifier_);
     if (!transfer) {
       // A file that stopped taking writes took none: the slot goes back,
       // and the commitment it drew is the request's again.
       slot.reset();
-      if (draw == Draw::Commitment)
-        recommit(active);
+      recommit(active);
       return false;
     }
     labelKv(block, slot);

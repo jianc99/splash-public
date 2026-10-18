@@ -4942,6 +4942,46 @@ void testFailedWritesKeepTheirCommitment() {
   }
 }
 
+// A Spill request's pages past what it committed, as when its output
+// outgrows its projection, are written on slots it commits as it writes
+// them, within the active limit beside other requests' commitments, whatever
+// room the cached copies' own limit leaves. Short of that room its pages stay
+// Full while a newer request's committed pages are still written; once the
+// active limit has room again, they are written and spill too.
+void testPagesPastTheCommitmentCommitTheirSlots() {
+  Spilling spill;
+  spill.budget->setLimitBytes(0);
+  // The first request committed two of the four pages it published, the
+  // second all four of its own.
+  const std::vector<uint32_t> first = Spilling::prompt(1000, 4);
+  spill.cache.beginRequest(1, KvMode::Spill);
+  require(spill.cache.commitSpill(1, 2), "the first request's commitment was refused");
+  spill.grow(1, first, 4);
+  spill.start(2, Spilling::prompt(5000, 4), 4);
+  // Active KV may hold the six committed slots and no more.
+  spill.budget->setActiveLimitBytes(600);
+  require(spill.cache.writeThrough() == 6 && spill.tier.writes.size() == 6 &&
+              spill.budget->committedBytes() == 0 && spill.budget->usedBytes() == 600,
+          "the first request's pages past its commitment held the second's committed pages back");
+  spill.tier.complete();
+  static_cast<void>(spill.cache.pollTransfers());
+  static_cast<void>(spill.cache.spillWritten());
+  require(spill.spilled(1) == std::vector<bool>{false, true, false, false, false} &&
+              spill.spilled(2) == std::vector<bool>{false, true, true, false, false},
+          "a page without a copy spilled, or one with a copy did not");
+  spill.budget->setActiveLimitBytes(6400);
+  require(test::spillRound(spill.cache, spill.tier) == 2 &&
+              spill.spilled(1) == std::vector<bool>{false, true, true, false, false} &&
+              spill.budget->committedBytes() == 0 &&
+              std::ranges::all_of(spill.tier.draws,
+                                  [](auto draw) { return draw == model::DiskBudget::Draw::Commitment; }),
+          "the pages past the commitment were not written on slots committed for them once the active "
+          "limit had room");
+  spill.cache.checkInvariants();
+  spill.cache.endRequest(2);
+  spill.cache.endRequest(1);
+}
+
 // A page spills once every request that holds it spills and holds it past
 // its dense history and outside its tail window: a Resident holder keeps it
 // Full while it lives, and a holder whose window still covers it until it
@@ -5161,6 +5201,7 @@ int main() {
     testUnreadableCopyLeavesBeforeTheCommandThatReadIt();
     testCommitmentsLockQuotaUntilWritten();
     testFailedWritesKeepTheirCommitment();
+    testPagesPastTheCommitmentCommitTheirSlots();
     testEveryHolderDecidesWhetherAPageSpills();
     testBlocksAreWrittenOnce();
     testUnreadableCopyLeavesWithItsHolders();
