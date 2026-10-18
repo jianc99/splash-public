@@ -105,7 +105,8 @@ struct KvHistoryStream::Impl {
   // their `then` read it under; it reads it without.
   std::mutex mutex;
   Run run;
-  LatencyHistogram waits;
+  // Updated from any thread.
+  LatencyHistogram readTimes, waits;
 };
 
 KvHistoryStream::Impl::Impl(metal::MetalBackend &backend, metal::AllocationAdmission admission,
@@ -137,9 +138,16 @@ void KvHistoryStream::Impl::readPage(uint32_t layer, const Page &page) const {
 
 void KvHistoryStream::Impl::startLocked(uint32_t layer) {
   LayerReads &reads = run.layers[layer];
+  // A layer's reads take from their start to their last page's end, which a
+  // reader reaches; reads stopped early take no time.
+  std::function<void(const SsdReaders::Batch &)> ended;
+  if (!run.pages->empty())
+    ended = [this, started = AwakeClock::now()](const SsdReaders::Batch &) {
+      readTimes.add(static_cast<uint64_t>(millisecondsSince(started) * 1e6));
+    };
   reads.batch = readers->start(
       run.pages->size(), [this, layer, pages = run.pages](size_t index) { readPage(layer, (*pages)[index]); },
-      readers->readers());
+      readers->readers(), std::move(ended));
 }
 
 void KvHistoryStream::Impl::start(uint64_t serial, uint32_t layer) noexcept {
@@ -328,6 +336,7 @@ KvHistoryStreamStats KvHistoryStream::stats() const {
   const Impl &impl = *impl_;
   KvHistoryStreamStats result = impl.counts;
   result.stagingBytes = impl.extents * impl.buffers * impl.staging.front()->extentBytes();
+  result.read = impl.readTimes.snapshot();
   result.wait = impl.waits.snapshot();
   return result;
 }
