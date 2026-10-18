@@ -214,8 +214,17 @@ void claimsAllocateNothing() {
   require(slots.ghostHits() > 0, "the loads hit no ghost");
 }
 
-// The decode selections of a trace (dev/tools/kv_selection_traces.py): per
-// request, its steps; per step and layer, its first position and blocks.
+// The decode selections of real requests: the blocks each attention layer
+// of Qwen3.8-Flash-Next's decode selected, step by step, as a build that
+// recorded every layer's block lists wrote them (not part of Splash), for a
+// novel at 126K and 252K tokens and SGLang's sources at 126K, two questions
+// each; the committed traces keep layers 0 and 6 of each request's first 100
+// steps. A trace (NAME.kvst) is the magic "KVS1", then unsigned LEB128
+// varints: the requests and the layers; per request its steps; per step and
+// layer the step's first position, its blocks' count and the blocks in
+// ascending order, the first as it is and each other as its distance from
+// the one before. Per request, its steps; per step and layer, its first
+// position and blocks.
 struct TraceStep final {
   uint32_t first = 0;
   std::vector<std::vector<uint32_t>> layers;
