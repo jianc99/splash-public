@@ -117,10 +117,10 @@ struct RuntimeContext final {
 // architectures. Each architecture validates its own tensor and state layout.
 void requireCompatibleModel(const LoadedModel &model);
 
-// The bytes of the images loadModel writes, without a table or routed experts
-// that stream, and of the store streamed experts load into.
-[[nodiscard]] uint64_t modelWeightBytes(const std::filesystem::path &root, const ModelDescriptor &descriptor,
-                                        const ModelLoadOptions &options = {});
+// The rows of a family's streamed table that a step stages and prefetches,
+// beside Qwen4Exp.hpp's: the Qwen3.5 families have no table to stream.
+[[nodiscard]] SparseRowStoreOptions streamedTableRows(const Qwen3_8Layout &layout);
+[[nodiscard]] SparseRowStoreOptions streamedTableRows(const Qwen3_6MoeLayout &layout);
 
 // The vision role's source, planned; null for a model without vision.
 [[nodiscard]] std::unique_ptr<VisionLoader> planVisionLoader(const std::filesystem::path &root,

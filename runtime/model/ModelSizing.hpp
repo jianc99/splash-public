@@ -5,10 +5,12 @@
 // by (engine::planStreamedMemory): the images that load whatever streams,
 // and each part that may stream, whole and at its smallest store.
 
+#include "model/GgufImage.hpp"
 #include "model/ModelDescriptor.hpp"
 
 #include <cstdint>
 #include <filesystem>
+#include <string>
 
 namespace splash::model {
 
@@ -29,11 +31,16 @@ struct StreamableWeights final {
   // (SparseRowStore); zero without one.
   uint64_t tableBytes = 0;
   uint64_t tableFloorBytes = 0;
+  // Why the table cannot stream (gguf::tableRows), which then loads with
+  // the weights: among loadedBytes, with no part of its own.
+  std::string tableRefusal;
 };
 
 // The model's weights in `root`, planned from its files' metadata as its
-// loaders plan them, without loading them.
+// loaders plan them, without loading them, with the parts `streams` lets
+// stream as parts of their own: one it does not is among the images that
+// load.
 [[nodiscard]] StreamableWeights streamableWeights(const std::filesystem::path &root,
-                                                  const ModelDescriptor &descriptor);
+                                                  const ModelDescriptor &descriptor, gguf::PlanOptions streams);
 
 } // namespace splash::model
