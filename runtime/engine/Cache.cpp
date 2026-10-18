@@ -295,11 +295,11 @@ void Cache::recordLookup(const CacheLookup &result) {
     ++lookup_.lostStateMisses;
 }
 
-PageTableView Cache::pageTable(uint64_t requestId) const {
+PageTableState Cache::pageTable(uint64_t requestId) const {
   const Request &active = request(requestId);
   if (active.dirtyFrom)
-    return {active.pages, active.sources, active.revision + 1, *active.dirtyFrom};
-  return {active.pages, active.sources, active.revision, active.firstChanged};
+    return {active.pages, active.revision + 1, *active.dirtyFrom};
+  return {active.pages, active.revision, active.firstChanged};
 }
 
 PageTableView Cache::cutPageTable(uint64_t requestId) {
@@ -310,7 +310,7 @@ PageTableView Cache::cutPageTable(uint64_t requestId) {
     active.dirtyFrom.reset();
     active.sources = cutSources(active);
   }
-  return pageTable(requestId);
+  return {active.pages, active.sources, active.revision, active.firstChanged};
 }
 
 std::shared_ptr<const model::KvPageSources> Cache::cutSources(const Request &active) const {

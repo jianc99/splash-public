@@ -4975,7 +4975,7 @@ struct ScatteredPages {
     engine.submit(running);
     for (; now < 16 && events.outputs[4].empty(); ++now)
       static_cast<void>(engine.tick(now));
-    const PageTableView table = cache.pageTable(4);
+    const PageTableState table = cache.pageTable(4);
     const CacheSnapshot cached = cache.snapshot();
     require(!events.outputs[4].empty() &&
                 std::vector<uint32_t>(table.pages.begin(), table.pages.end()) ==
@@ -5029,7 +5029,7 @@ void testStateStartGathersFreePagesBeforeEvicting() {
               started.pool.pagesPrefix >= cached.pool.pagesPrefix &&
               started.stateCache.entries >= cached.stateCache.entries,
           "the lane's start evicted instead of gathering the free pages");
-  const PageTableView moved = cache.pageTable(4);
+  const PageTableState moved = cache.pageTable(4);
   require(moved.pages[2] == 2 && moved.pages[0] == 6 && moved.pages[4] == 1 &&
               moved.revision > revision,
           "the running request did not follow its moved page");
@@ -6244,7 +6244,7 @@ void testResumedLaneClearsThePagesPastItsRestoredChain() {
   tickUntil(engine, now, [&] { return executor.requests.at(1).resident; },
             "the Background lane did not resume");
   const auto replayEnd = static_cast<uint32_t>(executor.resumedPrompts.at(0).size());
-  const PageTableView table = resources.pageTable(1);
+  const PageTableState table = resources.pageTable(1);
   const std::vector<uint32_t> pages(table.pages.begin(), table.pages.end());
   const uint32_t restored = executor.lastRestoredTokens / KvCache::pageTokens;
   require(replayEnd % KvCache::pageTokens && replayEnd / KvCache::pageTokens < pages.size() &&
