@@ -275,13 +275,13 @@ struct SlotRecord final {
 // it unreadable. Beside the worker, any thread may read part of a written
 // slot straight from the file (readAt). While reads a step waits for run
 // (Options::deferWrites), the worker holds each chunk of a write back, at
-// most kWriteDeferral. A write that finds the volume full is reported to the
-// budget (DiskBudget::fullReported) and the file goes on; after one that
-// fails for any other reason, which the worker logs, the file accepts no
-// further writes. A freed slot
-// returns its quota at once; one that was written returns its blocks to the
-// volume (F_PUNCHHOLE) on the worker, after the operation in flight and
-// before any later one (DiskBudget). So that a
+// most kWriteDeferral, unless a read of the file waits behind the write. A
+// write that finds the volume full is reported to the budget
+// (DiskBudget::fullReported) and the file goes on; after one that fails for
+// any other reason, which the worker logs, the file accepts no further
+// writes. A freed slot returns its quota at once; one that was written
+// returns its blocks to the volume (F_PUNCHHOLE) on the worker, after the
+// operation in flight and before any later one (DiskBudget). So that a
 // file-size limit fails a write rather than killing the process, a file
 // ignores SIGXFSZ from its construction on.
 //
@@ -326,9 +326,10 @@ public:
     std::vector<uint64_t> segments;
     // While it says so, the worker holds a write's next chunk back, at most
     // kWriteDeferral each (model::SsdReaders::criticalBusyProbe: reads a
-    // step waits for go first). It runs on the worker; the file's slots keep
-    // it, and the last may go on any thread, a reader's too, so it owns
-    // nothing that thread may not destroy.
+    // step waits for go first), unless a read of the file waits behind the
+    // write and so would wait as long. It runs on the worker; the file's
+    // slots keep it, and the last may go on any thread, a reader's too, so
+    // it owns nothing that thread may not destroy.
     std::function<bool()> deferWrites;
   };
   // The longest a write's chunk waits for reads (Options::deferWrites).
@@ -474,12 +475,14 @@ private:
     std::shared_ptr<Operation> operation;
     Run run;
     std::function<void()> completion;
+    // A read: the writes ahead of it hold back for no other reads.
+    bool read = false;
   };
   struct Free {
     void operator()(std::byte *memory) const noexcept;
   };
-  [[nodiscard]] std::shared_ptr<Operation> submit(Run run,
-                                                  std::function<void()> completion);
+  [[nodiscard]] std::shared_ptr<Operation> submit(Run run, std::function<void()> completion,
+                                                  bool read = false);
   // The checks and the setup both constructors share before the file opens;
   // each starts the worker last.
   void prepare(uint64_t slotBytes, std::shared_ptr<DiskBudget> budget, const Options &options);

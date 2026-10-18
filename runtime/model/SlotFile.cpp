@@ -51,6 +51,9 @@ struct SlotFile::Backing {
   // Freed slots whose blocks go back before the next operation runs.
   std::vector<uint32_t> punches;
   std::deque<Work> work;
+  // The reads in it, which every write ahead of them delays: while any
+  // waits, a write holds back for no other reads (Options::deferWrites).
+  std::atomic<uint32_t> queuedReads{0};
   bool stopping = false;
   // A persistent file between opening and finishAdoption(): the worker
   // waits, and the slots are adoption's alone.
@@ -743,8 +746,8 @@ void SlotFile::seal() noexcept {
   backing_->sealed = true;
 }
 
-std::shared_ptr<SlotFile::Operation> SlotFile::submit(Run run,
-                                                     std::function<void()> completion) {
+std::shared_ptr<SlotFile::Operation> SlotFile::submit(Run run, std::function<void()> completion,
+                                                     bool read) {
   auto operation = std::make_shared<Operation>();
   {
     std::lock_guard lock(backing_->mutex);
@@ -752,7 +755,9 @@ std::shared_ptr<SlotFile::Operation> SlotFile::submit(Run run,
       throw std::logic_error("slot file is shutting down");
     if (backing_->adopting)
       throw std::logic_error("a persistent slot file takes operations only after adoption");
-    backing_->work.push_back({operation, std::move(run), std::move(completion)});
+    backing_->work.push_back({operation, std::move(run), std::move(completion), read});
+    if (read)
+      backing_->queuedReads.fetch_add(1, std::memory_order_relaxed);
   }
   backing_->wake.notify_one();
   return operation;
@@ -780,6 +785,8 @@ void SlotFile::run() {
       if (backing.work.empty()) return;
       work = std::move(backing.work.front());
       backing.work.pop_front();
+      if (work.read)
+        backing.queuedReads.fetch_sub(1, std::memory_order_relaxed);
     }
     bool success = false;
     try { success = work.run({buffer_.get(), kChunkBytes}, work.operation->cancelled_); }
@@ -852,13 +859,16 @@ std::shared_ptr<SlotFile::Operation> SlotFile::write(
       return count;
     };
     // Reads a step waits for go first: while they run, a chunk waits for
-    // them, a bounded while.
+    // them, a bounded while, unless a read of this file waits behind it.
+    const auto deferred = [&backing] {
+      return !backing.queuedReads.load(std::memory_order_relaxed) && backing.deferWrites();
+    };
     const auto defer = [&] {
-      if (!backing.deferWrites || !backing.deferWrites()) return;
+      if (!backing.deferWrites || !deferred()) return;
       const auto began = AwakeClock::now();
       do {
         std::this_thread::sleep_for(kDeferralPoll);
-      } while (!cancelled.load(std::memory_order_relaxed) && backing.deferWrites() &&
+      } while (!cancelled.load(std::memory_order_relaxed) && deferred() &&
                AwakeClock::now() - began < kWriteDeferral);
       const auto waited = std::chrono::duration_cast<std::chrono::microseconds>(AwakeClock::now() - began);
       backing.budget->deferred_.fetch_add(static_cast<uint64_t>(waited.count()), std::memory_order_relaxed);
@@ -965,7 +975,7 @@ std::shared_ptr<SlotFile::Operation> SlotFile::read(
       slot->verify_.store(false, std::memory_order_relaxed);
     }
     return true;
-  }, std::move(completion));
+  }, std::move(completion), true);
 }
 
 // A slot read beside the worker, which writes it no more: it reads what the

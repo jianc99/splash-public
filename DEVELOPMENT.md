@@ -2732,10 +2732,11 @@ straight into its extent. Either way the transfer runs on the file's IO worker
 beside whatever command the model runs: a cached page is never written by a
 command, and no command uses a page before its read has landed. While a step
 waits for SSD reads (streamed experts or PLE rows), each 1 MiB of a write
-waits for them, at most 2 ms (`SlotFile::Options::deferWrites`). At most 128 KV
-pages are in transfer at a time, demotions at most half of them and restores at
-most three quarters, since one worker serves both in order and a burst of either
-kind must leave the other its share. When the tier takes no more, leaves that
+waits for them, at most 2 ms, unless a restore queued behind the write would
+wait as long (`SlotFile::Options::deferWrites`). At most 128 KV pages are in
+transfer at a time, demotions at most half of them and restores at most three
+quarters, since one worker serves both in order and a burst of either kind
+must leave the other its share. When the tier takes no more, leaves that
 need a write stay until a transfer lands, while leaves whose page frees without
 one still go.
 
