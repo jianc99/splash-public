@@ -377,9 +377,12 @@ expert, as a SIZE that holds them all does.
   full clocks rather than after the GPU's wake-up.
 - A prefill command runs a group of up to four chunks of 2048 rows layer by
   layer, so each layer's experts are read once for all of them, a prompt's
-  with images too. A contended prefill command's slice counts the time its
-  GPU work waited on the reads as a fixed cost
-  ([Admission and eviction](#admission-and-eviction)).
+  with images too. Since every command reads nearly all of each layer's
+  experts however few its rows, one that would take longer than the 500 ms
+  slice runs in passes over the layers, each its own command of about the
+  slice: other requests' decode steps run between passes, and a cancel
+  waits for one pass at most. A pass reads its own layers' experts, so
+  passes add no reads ([Admission and eviction](#admission-and-eviction)).
 - A load checks its files unchanged after it read them. A read is tried once
   more when it fails. A load that fails (a routed expert cannot be read, or
   a file was written) fails its command, and every later load fails too.
@@ -571,10 +574,13 @@ what memory holds, as a dense target's is.
   the copy has landed, the page keeps only its index, 24 KiB of the int8
   page's 414 KiB. Its first 2,048 tokens, which rows with less history read
   whole, its last 64 pages and up to two prefill groups' pages still being
-  written stay whole.
+  written stay whole. The memory the pages free leaves with the extents they
+  empty, all of them once every spilling request decodes, but one while a
+  spilling prompt still grows into it or the host holds growth back.
 - A decode step reads, after each attention layer selects its blocks, the
   selected blocks not in memory into one hot block cache that all requests
-  share, one 8 KiB read a block on the 32 SSD readers, and attends them there.
+  share, a page's in one read from its first missed block to its last on the
+  32 SSD readers, and attends them there.
   The cache holds at least, for n decoding requests, n + 1 times the blocks a
   request's 8 rows select, 8,192 blocks a layer (390 MiB) for one;
   `--sparse-kv-memory` raises its target.
@@ -582,7 +588,9 @@ what memory holds, as a dense target's is.
   staging, a layer's pages read whole (36 KiB each) while the previous layer
   runs, in two buffers where the plan leaves 4 GiB beside its floors. A
   prefill whose history is on the SSD runs alone, and with others waiting it
-  takes the fewest rows whose work covers its reads.
+  takes the fewest rows whose work covers its reads. The staging holds
+  nothing between prompts: a decoding request's floor of the hot block cache
+  takes its place, and the next prompt that streams allocates it again.
 - The next turn finds its pages' index in memory, or reads it back, and
   continues without prefilling the conversation again; with
   `--persistent-cache`, after a restart too.
@@ -2797,7 +2805,12 @@ experts stream runs its remaining chunks in as few prefill groups of up to four
 as hold them, evenly split, and so does a request whose KV spills to the SSD
 cache, which reads its history once a group; one whose KV stays in memory on a
 target whose experts load whole runs chunks, so a request that arrives beside it
-waits for a chunk. A lane whose history holds KV only the SSD cache has
+waits for a chunk. On a target whose experts stream a request keeps its groups
+whatever contends, and a command whose estimate exceeds the slice runs alone in
+passes over the model's layers, as many as keep each within the slice: its
+later passes come before any other prefill or admission, decode commands run
+between them as the decode share owes them, only the last commits its rows,
+and a request that ends between passes leaves the rest unrun. A lane whose history holds KV only the SSD cache has
 reads all of that history in each command, whatever its rows: it runs alone,
 and contended it takes the fewest rows, halving from its group's, whose time
 still covers its own running estimate of that wait, and never fewer than another
