@@ -1,5 +1,6 @@
 #pragma once
 
+#include "metal/abi/KvExtent.h"
 #include "model/Runtime.hpp"
 
 #include <cstdint>
@@ -22,6 +23,14 @@ public:
   // verify rows, or in row 0 the final position of the prefill chunk that
   // ended a prompt.
   [[nodiscard]] static std::span<const float> lastLogits(const Runtime &runtime, uint32_t lane);
+  // The GPU tables of resident request `requestId`'s lane as its last
+  // command left them, every entry the lane holds: its page table and, for
+  // a layout with a block index, its index table (none without).
+  struct LaneTables final {
+    std::span<const SplashKvPage> pages;
+    std::span<const SplashKvPage> index;
+  };
+  [[nodiscard]] static LaneTables laneTables(const Runtime &runtime, uint64_t requestId);
 };
 
 } // namespace splash::model
