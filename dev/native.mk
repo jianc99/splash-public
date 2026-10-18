@@ -52,6 +52,8 @@ TEST_PROTOCOL_ASAN := $(ENGINE_SANITIZER_BUILD)/protocol-asan-ubsan
 TEST_PROTOCOL_TSAN := $(ENGINE_SANITIZER_BUILD)/protocol-tsan
 TEST_ENGINE_ASAN := $(ENGINE_SANITIZER_BUILD)/engine-asan-ubsan
 TEST_ENGINE_TSAN := $(ENGINE_SANITIZER_BUILD)/engine-tsan
+TEST_RAGGED_SCHEDULER_ASAN := $(ENGINE_SANITIZER_BUILD)/ragged-scheduler-asan-ubsan
+TEST_RAGGED_SCHEDULER_TSAN := $(ENGINE_SANITIZER_BUILD)/ragged-scheduler-tsan
 TEST_FD_TRANSPORT_ASAN := $(ENGINE_SANITIZER_BUILD)/native-fd-asan-ubsan
 TEST_FD_TRANSPORT_TSAN := $(ENGINE_SANITIZER_BUILD)/native-fd-tsan
 TEST_ANE_FFN_CALIBRATION_ASAN := $(ENGINE_SANITIZER_BUILD)/ane-ffn-calibration-asan-ubsan
@@ -268,6 +270,7 @@ SANITIZER_CONFIG_TARGETS := $(TEST_SLOT_FILE_ASAN) $(TEST_SLOT_FILE_TSAN) \
 	$(TEST_CACHE_PROPERTY_ASAN) $(TEST_CACHE_PROPERTY_TSAN) \
 	$(TEST_PROTOCOL_ASAN) $(TEST_PROTOCOL_TSAN) \
 	$(TEST_ENGINE_ASAN) $(TEST_ENGINE_TSAN) \
+	$(TEST_RAGGED_SCHEDULER_ASAN) $(TEST_RAGGED_SCHEDULER_TSAN) \
 	$(TEST_FD_TRANSPORT_ASAN) $(TEST_FD_TRANSPORT_TSAN) \
 	$(TEST_ANE_FFN_CALIBRATION_ASAN) $(TEST_ANE_FFN_CALIBRATION_TSAN) \
 	$(TEST_SPARSE_ROW_STORE_ASAN) $(TEST_SPARSE_ROW_STORE_TSAN) \
@@ -303,8 +306,6 @@ $(TEST_KV_PAGE_CACHE_TEST): runtime/engine/KvPool.cpp \
 $(TEST_DRAFT_CONTEXT_PLAN_TEST): runtime/model/DraftContextPlan.cpp \
 		dev/benchmarks/PrefillWork.hpp \
 		dev/tests/engine/draft_context_plan_test.cpp
-$(TEST_RAGGED_SCHEDULER_TEST): runtime/engine/Scheduler.cpp \
-		dev/tests/engine/ragged_scheduler_test.cpp
 $(TEST_NATIVE_LOOP_TEST): $(NATIVE_RUNTIME_SOURCES) \
 		runtime/engine/MemoryGovernor.cpp runtime/engine/MemoryControl.cpp \
 		dev/tests/engine/ProtocolPeer.cpp \
@@ -709,6 +710,8 @@ $(TEST_ENGINE_TEST) $(TEST_ENGINE_ASAN) $(TEST_ENGINE_TSAN): \
 		$(BACKEND_CONTROL_SOURCES) \
 		dev/benchmarks/PrefillWork.hpp \
 		dev/tests/engine/engine_test.cpp
+$(TEST_RAGGED_SCHEDULER_TEST) $(TEST_RAGGED_SCHEDULER_ASAN) $(TEST_RAGGED_SCHEDULER_TSAN): \
+		runtime/engine/Scheduler.cpp dev/tests/engine/ragged_scheduler_test.cpp
 $(TEST_FD_TRANSPORT_TEST) $(TEST_FD_TRANSPORT_ASAN) $(TEST_FD_TRANSPORT_TSAN): \
 		$(NATIVE_RUNTIME_SOURCES) \
 		runtime/engine/FdTransport.cpp \
@@ -747,6 +750,8 @@ test-sanitizers: $(SANITIZER_CONFIG_TARGETS)
 	$(TSAN_TEST_ENV) $(TEST_PROTOCOL_TSAN) dev/tests/engine/protocol_golden.txt
 	$(ASAN_TEST_ENV) $(TEST_ENGINE_ASAN)
 	$(TSAN_TEST_ENV) $(TEST_ENGINE_TSAN)
+	$(ASAN_TEST_ENV) $(TEST_RAGGED_SCHEDULER_ASAN)
+	$(TSAN_TEST_ENV) $(TEST_RAGGED_SCHEDULER_TSAN)
 	$(ASAN_TEST_ENV) $(TEST_FD_TRANSPORT_ASAN)
 	$(TSAN_TEST_ENV) $(TEST_FD_TRANSPORT_TSAN)
 	$(ASAN_TEST_ENV) $(TEST_ANE_FFN_CALIBRATION_ASAN)
