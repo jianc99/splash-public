@@ -270,6 +270,32 @@ class RequestFailureTests(HarnessTestCase):
         status, _, _ = harness.request("POST", "/v1/chat/completions", chat_body())
         self.assertEqual(status, 200)
 
+    def test_disk_quota_failure_is_a_bad_request_naming_the_ssd_cache(self):
+        native = (
+            "this request's KV needs needed_bytes=1703936 of the SSD cache, which may "
+            "hold active_limit_bytes=425984 of active KV now (--max-cache-disk and the "
+            "volume's free space)"
+        )
+        runtime = FakeRuntime(
+            Plan(
+                exception=api.engine_runtime.RequestFailed(
+                    1, b"kv_disk_quota", native.encode(), retryable=False
+                )
+            ),
+            Plan([[4]]),
+        )
+        harness = self.harness(runtime)
+        status, _, payload = harness.request(
+            "POST", "/v1/chat/completions", chat_body()
+        )
+        error = json.loads(payload)["error"]
+        # Retrying fails the same way, and memory is not what it lacks.
+        self.assertEqual(status, 400)
+        self.assertEqual(error["code"], "kv_disk_quota")
+        self.assertEqual(error["message"], native)
+        status, _, _ = harness.request("POST", "/v1/chat/completions", chat_body())
+        self.assertEqual(status, 200)
+
     def test_unexpected_runtime_error_does_not_kill_backend(self):
         runtime = FakeRuntime(
             Plan(exception=RuntimeError("boom")),
