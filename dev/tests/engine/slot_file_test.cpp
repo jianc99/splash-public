@@ -961,6 +961,11 @@ static void testSpillsWithinTheWriteBudget() {
   const std::vector<std::byte> payload(size, std::byte{2});
   require(file.write(slot, {payload}, {})->wait(), "slot write failed");
   require(budget->admitsSpill(0) && !budget->admitsSpill(1), "a spent write budget covered a committed write");
+  // It covers half a slot once it refilled an eighth of a day's, a slot
+  // and a half once its refill passes what it holds at once.
+  require(!budget->admitsSpillAt(0) && std::abs(*budget->admitsSpillAt(size / 2) - 86'400'000.0 / 8) < 1.0 &&
+              std::abs(*budget->admitsSpillAt(3 * size / 2) - 3 * 86'400'000.0 / 8) < 1.0,
+          "the write budget did not say when it covers committed writes again");
   now = 86'400'000.0 / 8;
   require(budget->admitsSpill(size / 2) && !budget->admitsSpill(size), "the write budget did not refill");
   budget->lift();
