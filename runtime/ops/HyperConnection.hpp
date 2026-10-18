@@ -30,13 +30,11 @@ struct HyperConnection final {
                       HyperShape shape, uint32_t rows);
   // The normalized streams (bf16) and, with inject, the injection weights
   // (fp32 [rows][streams]), of the shape its kernels are compiled for
-  // (HYPER_CONNECTION_NORM_HIDDEN). With a table `layout` (decode rows), also
-  // the table in `scratch` that the projection reading the output takes,
-  // which then prepares none (ops::Linear PreparedInput).
-  static PreparedInput addNorm(metal::CommandGraph &graph, metal::MetalBuffer streams, const NormWeights &norm,
-                               metal::MetalBuffer inject, metal::MetalBuffer normalized, metal::MetalBuffer weights,
-                               HyperShape shape, uint32_t rows, LinearScratch scratch = {},
-                               LinearInput layout = LinearInput::Plain);
+  // (HYPER_CONNECTION_NORM_HIDDEN). A register-tile projection reading the
+  // output prepares its own table.
+  static void addNorm(metal::CommandGraph &graph, metal::MetalBuffer streams, const NormWeights &norm,
+                      metal::MetalBuffer inject, metal::MetalBuffer normalized, metal::MetalBuffer weights,
+                      HyperShape shape, uint32_t rows);
   // silu(low / streams) in place or, with a table layout, into the table
   // alone, leaving `low` as it was.
   static PreparedInput addLow(metal::CommandGraph &graph, metal::MetalBuffer low, HyperShape shape, uint32_t rows,

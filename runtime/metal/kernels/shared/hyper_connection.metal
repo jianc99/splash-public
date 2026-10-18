@@ -23,18 +23,6 @@ inline void hyper_table16_write(device bfloat *table, device float *sums, uint w
                           span, row % gguf_sg::kRows, lane, a, b);
 }
 
-// A row's bf16 values into its table, read back from `values` after the
-// threadgroup wrote them: a simdgroup per 64-value span, each of the
-// threadgroup's `simdgroups` taking every simdgroups-th.
-inline void hyper_table16_row(device const bfloat *values, device bfloat *table, device float *sums, uint width,
-                              uint row, uint lane, uint sg, uint simdgroups = kSimdgroups) {
-  threadgroup_barrier(mem_flags::mem_device);
-  for (uint g = sg; g < width / 64; g += simdgroups) {
-    const uint k = g * 64 + 2 * lane;
-    hyper_table16_write(table, sums, width, g, row, lane, values[k], values[k + 1]);
-  }
-}
-
 // The first mix step of a row: each stream's RMS norm times the mix's norm
 // weights (the GGUF stores 1 + w) into bf16 rows of streams * hidden, and,
 // when it injects, the injection weights 2 sigmoid(inject(normalized) /
@@ -43,19 +31,22 @@ inline void hyper_table16_row(device const bfloat *values, device bfloat *table,
 // every load of a pass before the pass's arithmetic: at decode's few rows, a
 // threadgroup per row that waits on each load in turn runs latency-bound.
 // The two sum alike, so a row's output and weights are bit for bit the same
-// whichever of them runs it.
+// whichever of them runs it. They write no table: a register-tile down
+// projection prepares its own (decode_linear_gguf_prepare, a simdgroup per
+// span and row over the whole GPU). A threadgroup per row writing its row's
+// table stores two bytes at a time into a lane's eight-row tiles from one
+// core, which cost a 20-core M5 Pro 1.5 to 5.2 us per mix more than the
+// plain norm and that preparation, at one to four lanes.
 constant constexpr uint kNormHidden = HYPER_CONNECTION_NORM_HIDDEN;
 constant constexpr uint kNormValues = kNormHidden / kRowThreads; // per thread and stream
 static_assert(kNormHidden % kRowThreads == 0, "a thread's values per stream are whole");
 
 // Prefill's rows, and a mix that injects nothing: a threadgroup of
 // kRowThreads threads per row; each thread holds its values of every stream.
-template <bool Table>
 inline void hyper_norm_loaded_row(device const float *streams, device const float *norm,
                                   device const float *inject, device bfloat *normalized,
-                                  device float *weights, device bfloat *table, device float *table_sums,
-                                  constant HyperConnectionParams &p, uint row, uint tid, uint lane, uint sg,
-                                  threadgroup float *scratch) {
+                                  device float *weights, constant HyperConnectionParams &p, uint row, uint tid,
+                                  uint lane, uint sg, threadgroup float *scratch) {
   if (row >= p.rows) return;
   const uint width = kStreams * kNormHidden;
   device const float *x = streams + ulong(row) * width;
@@ -81,7 +72,6 @@ inline void hyper_norm_loaded_row(device const float *streams, device const floa
         for (uint j = 0; j < kStreams; ++j) dots[j] += inject[ulong(j) * width + c] * v;
     }
   }
-  if (Table) hyper_table16_row(out, table, table_sums, width, row, lane, sg);
   if (!p.inject) return;
   reduce_streams(dots, kStreams, scratch, lane, sg);
   if (tid < kStreams) weights[row * kStreams + tid] = 2.0f * splash_sigmoid(dots[tid] / kStreams);
@@ -93,12 +83,11 @@ inline void hyper_norm_loaded_row(device const float *streams, device const floa
 // each of its threads sums its values of stream q, then runs injection dot q
 // over every stream's values in order, and writes stream q's normalized
 // values.
-template <bool Table>
 inline void hyper_norm_quarter_row(device const float *streams, device const float *norm,
                                    device const float *inject, device bfloat *normalized,
-                                   device float *weights, device bfloat *table, device float *table_sums,
-                                   constant HyperConnectionParams &p, uint row, uint thread_id, uint lane,
-                                   uint simdgroup, threadgroup float *scratch, threadgroup float *scales) {
+                                   device float *weights, constant HyperConnectionParams &p, uint row,
+                                   uint thread_id, uint lane, uint simdgroup, threadgroup float *scratch,
+                                   threadgroup float *scales) {
   if (row >= p.rows) return;
   const uint q = thread_id / kRowThreads, tid = thread_id % kRowThreads;
   const uint width = kStreams * kNormHidden;
@@ -144,7 +133,6 @@ inline void hyper_norm_quarter_row(device const float *streams, device const flo
       }
     }
   }
-  if (Table) hyper_table16_row(out, table, table_sums, width, row, lane, simdgroup, kStreams * kSimdgroups);
   if (!p.inject) return;
   dot = simd_sum(dot);
   threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -167,20 +155,7 @@ kernel void hyper_connection_norm_loaded(HYPER_NORM_ARGUMENTS, constant HyperCon
                                          uint lane [[thread_index_in_simdgroup]],
                                          uint sg [[simdgroup_index_in_threadgroup]]) {
   threadgroup float scratch[kSimdgroups * kStreams];
-  hyper_norm_loaded_row<false>(streams, norm, inject, normalized, weights, nullptr, nullptr, p, row, tid, lane,
-                                     sg, scratch);
-}
-
-kernel void hyper_connection_norm_loaded_table16(HYPER_NORM_ARGUMENTS, device bfloat *table [[buffer(5)]],
-                                                 device float *sums [[buffer(6)]],
-                                                 constant HyperConnectionParams &p [[buffer(7)]],
-                                                 uint row [[threadgroup_position_in_grid]],
-                                                 uint tid [[thread_index_in_threadgroup]],
-                                                 uint lane [[thread_index_in_simdgroup]],
-                                                 uint sg [[simdgroup_index_in_threadgroup]]) {
-  threadgroup float scratch[kSimdgroups * kStreams];
-  hyper_norm_loaded_row<true>(streams, norm, inject, normalized, weights, table, sums, p, row, tid, lane, sg,
-                                    scratch);
+  hyper_norm_loaded_row(streams, norm, inject, normalized, weights, p, row, tid, lane, sg, scratch);
 }
 
 kernel void hyper_connection_norm_quarters(HYPER_NORM_ARGUMENTS, constant HyperConnectionParams &p [[buffer(5)]],
@@ -190,21 +165,8 @@ kernel void hyper_connection_norm_quarters(HYPER_NORM_ARGUMENTS, constant HyperC
                                            uint simdgroup [[simdgroup_index_in_threadgroup]]) {
   threadgroup float scratch[kStreams * kSimdgroups];
   threadgroup float scales[kStreams];
-  hyper_norm_quarter_row<false>(streams, norm, inject, normalized, weights, nullptr, nullptr, p, row,
-                                      thread_id, lane, simdgroup, scratch, scales);
-}
-
-kernel void hyper_connection_norm_quarters_table16(HYPER_NORM_ARGUMENTS, device bfloat *table [[buffer(5)]],
-                                                   device float *sums [[buffer(6)]],
-                                                   constant HyperConnectionParams &p [[buffer(7)]],
-                                                   uint row [[threadgroup_position_in_grid]],
-                                                   uint thread_id [[thread_index_in_threadgroup]],
-                                                   uint lane [[thread_index_in_simdgroup]],
-                                                   uint simdgroup [[simdgroup_index_in_threadgroup]]) {
-  threadgroup float scratch[kStreams * kSimdgroups];
-  threadgroup float scales[kStreams];
-  hyper_norm_quarter_row<true>(streams, norm, inject, normalized, weights, table, sums, p, row, thread_id,
-                                     lane, simdgroup, scratch, scales);
+  hyper_norm_quarter_row(streams, norm, inject, normalized, weights, p, row, thread_id, lane, simdgroup, scratch,
+                         scales);
 }
 
 #undef HYPER_NORM_ARGUMENTS
