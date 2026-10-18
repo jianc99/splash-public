@@ -4,6 +4,7 @@
 #include "WeightStore.hpp"
 #include "metal/abi/DraftAttention.h"
 #include "metal/abi/ExecutionGeometry.h"
+#include "metal/abi/PagedAttention.h"
 
 #import <Foundation/Foundation.h>
 
@@ -753,6 +754,7 @@ bool ModelDescriptor::valid() const noexcept {
                (!ropeScaling.yarn() ||
                 ropeScaling.originalContextTokens == layout.nativeContextTokens) &&
                capabilities.sparseKv == sparseKvShape(layout) &&
+               (!capabilities.sparseKv || capabilities.sparseKv->blockTokens == SPLASH_ATTENTION_BLOCK_TOKENS) &&
                layout.hiddenSize == draft.hiddenSize &&
                draft.targetLayerCount && draft.targetLayerCount <= ExecutionLimits::maximumDraftTargetLayers &&
                draft.targetLayers[draft.targetLayerCount - 1] < layout.layers &&

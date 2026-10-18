@@ -2754,7 +2754,7 @@ struct SpillOptions final {
 // The pages a request of a block-sparse target keeps whole before those it
 // may spill: its dense history (engine::CacheSpillPolicy::densePages).
 uint32_t densePagesOf(const model::SparseKvShape &shape) {
-  return (std::max(shape.denseHistoryTokens, shape.sinkTokens) + kv::kPageTokens - 1) / kv::kPageTokens;
+  return (shape.denseTokens() + kv::kPageTokens - 1) / kv::kPageTokens;
 }
 
 // FNV-1a of the values' bytes: logits compared bit for bit.
@@ -2815,7 +2815,7 @@ public:
         states_(backend, admission, model.stateLayout(stateFormat), nullptr),
         readers_(std::make_shared<model::SsdReaders>(model::kSsdReaders)),
         cache_(backend, admission, layout_, extentPages_,
-               {.laneSlots = shape_.verifyRows * shape_.selectedBlocks, .targetBytes = 0, .readers = readers_,
+               {.laneSlots = static_cast<uint32_t>(shape_.laneSlots()), .targetBytes = 0, .readers = readers_,
                 .format = format_}),
         stream_(backend, admission, layout_, extentPages_, readers_, format_, options.buffers),
         tables_{backend.allocateBuffer(lanePages * sizeof(SplashKvPage), metal::BufferStorage::Shared,

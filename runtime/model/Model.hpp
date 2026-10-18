@@ -484,6 +484,9 @@ struct SparseKvShape final {
   [[nodiscard]] constexpr uint64_t requiredSlots(uint32_t lanes) const noexcept {
     return lanes ? (uint64_t{lanes} + 1) * laneSlots() : 0;
   }
+  // The history from its start that a row may read whole through its page
+  // table: its dense history, or its sink tokens if more.
+  [[nodiscard]] constexpr uint32_t denseTokens() const noexcept { return std::max(denseHistoryTokens, sinkTokens); }
 
   bool operator==(const SparseKvShape &) const = default;
 };
