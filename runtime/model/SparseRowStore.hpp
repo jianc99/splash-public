@@ -1,7 +1,7 @@
 #pragma once
 
 // A large table of fixed-size native rows that stays in its source file and
-// is read a row at a time: a bounded host cache of rows, read on the model's
+// is read a row at a time: a bounded host cache of rows, read on the engine's
 // SSD readers (model::SsdReaders), and the staging of one command's
 // rows into memory the GPU reads. Its user
 // names the table (SparseRowTable) and sizes the working memory of its
@@ -82,8 +82,8 @@ struct SparseRowStoreOptions final {
   // and, in the rest, rows with their ids, recency links and index. This is
   // not a bound on all host allocations (see workingBytes).
   uint64_t cacheBytes = 0;
-  // The readers its reads run on besides the staging thread, which a model's
-  // streamed weights share.
+  // The readers its reads run on besides the staging thread: the engine's one
+  // pool, which the other streamed weights and KV reads share.
   std::shared_ptr<SsdReaders> readers;
   // The most rows prefetches may have queued or in flight, whose bytes are
   // working memory; more are dropped, and with 0 every one.

@@ -1012,9 +1012,10 @@ std::optional<std::span<const std::byte>> SlotFile::readAt(const Slot &slot, uin
   const size_t last = verify ? backing.segmentAt(offset + bytes - 1) : 0;
   const uint64_t begin = verify ? backing.segmentStart(first) : offset;
   const uint64_t end = verify ? backing.segmentEnd(last, payloadBytes) : offset + bytes;
-  const uint64_t from = begin / kDirectReadBytes * kDirectReadBytes;
-  const uint64_t to = (end + kDirectReadBytes - 1) / kDirectReadBytes * kDirectReadBytes;
-  if (reinterpret_cast<std::uintptr_t>(buffer.data()) % kDirectReadBytes || buffer.size() < to - from)
+  constexpr uint64_t unit = kSlotReadAlignmentBytes;
+  const uint64_t from = begin / unit * unit;
+  const uint64_t to = (end + unit - 1) / unit * unit;
+  if (reinterpret_cast<std::uintptr_t>(buffer.data()) % unit || buffer.size() < to - from)
     return std::nullopt;
   const off_t at = slotOffset(slot.index_, backing.slotBytes) + static_cast<off_t>(from);
   if (!backing.load(buffer.first(to - from), at))
