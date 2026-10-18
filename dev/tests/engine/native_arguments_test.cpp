@@ -168,8 +168,14 @@ void testServerCommandLines(const char *path) {
          read.model.ropeScaling = {2.5, 262144};
        }},
       {"ple_memory", [](NativeArguments &read) { read.pleMemory = {StreamedSetting::Mode::Size, 2 * kGiB}; }},
+      {"ple_memory_off", [](NativeArguments &read) { read.pleMemory = {StreamedSetting::Mode::Off, 0}; }},
       {"expert_memory",
        [](NativeArguments &read) { read.expertMemory = {StreamedSetting::Mode::Size, 16 * kGiB}; }},
+      {"expert_memory_off", [](NativeArguments &read) { read.expertMemory = {StreamedSetting::Mode::Off, 0}; }},
+      // Auto is the engine's default, which the server leaves out.
+      {"expert_memory_auto", [](NativeArguments &) {}},
+      {"sparse_kv_memory",
+       [](NativeArguments &read) { read.sparseKvMemory = {StreamedSetting::Mode::Size, 1200 * (kGiB >> 10)}; }},
   };
   // Every field but the model inspected from the directory, whose RoPE
   // scaling --yarn-factor sets.

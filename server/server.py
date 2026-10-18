@@ -1691,10 +1691,13 @@ def _native_command(args, relaunch_context=None):
         command.extend(("--yarn-factor", str(args.yarn_factor)))
     if relaunch_context is not None and args.max_context is None:
         command.extend(("--relaunch-context", str(relaunch_context)))
-    if args.ple_memory is not None:
-        command.extend(("--ple-memory", str(args.ple_memory)))
-    if args.expert_memory is not None:
-        command.extend(("--expert-memory", str(args.expert_memory)))
+    for flag, value in (
+        ("--ple-memory", args.ple_memory),
+        ("--expert-memory", args.expert_memory),
+        ("--sparse-kv-memory", args.sparse_kv_memory),
+    ):
+        if value is not None:
+            command.extend((flag, str(value)))
     return command
 
 
