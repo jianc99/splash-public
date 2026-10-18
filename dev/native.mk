@@ -617,9 +617,10 @@ benchmark-attention-sweep: $(TEST_ATTENTION_SWEEP) $(LIB)
 
 # One GGUF projection on both decode tiles at every lane count and K split
 # (the split tiers of runtime/ops/LinearGguf.cpp), or with prefill=R[,R...]
-# on the 128-row prefill tile at each chunk of R rows; GGUF_PROJECTION_ARGS
-# passes <fmt[+fmt+fmt]> <N[+N+N]> <K> [none|residual|gateup] [rounds]
-# [prefill=R[,R...]].
+# on the 128-row prefill tile at each chunk of R rows; the float formats
+# float-bf16 and float-f32 time the float projection on both float tiles.
+# GGUF_PROJECTION_ARGS passes <fmt[+fmt+fmt]> <N[+N+N]> <K>
+# [none|residual|gateup] [rounds] [prefill=R[,R...]].
 GGUF_PROJECTION_ARGS ?= q4k 5120 8192
 benchmark-gguf-projection: $(TEST_GGUF_PROJECTION_BENCHMARK) $(LIB)
 	$(TEST_GGUF_PROJECTION_BENCHMARK) $(LIB) $(GGUF_PROJECTION_ARGS)
