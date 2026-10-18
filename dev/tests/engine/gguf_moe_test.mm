@@ -28,7 +28,7 @@
 //   them, every route's grouped row naming it back, the padding a tile's
 //   matmul reads marked empty and the rows past it unwritten. Concentrated and
 //   skewed router loads on the staged 32-row tiles of one format, at ragged
-//   row counts.
+//   row counts. A verify step that routes its lanes' verify rows alone.
 // Streamed experts (model::ExpertStore) run in expert_store_test.mm.
 #include "../../../runtime/metal/CommandGraph.hpp"
 #include "../../../runtime/metal/MetalBackend.hpp"
@@ -1030,6 +1030,121 @@ int permutedSlots(MetalBackend &backend) {
   return failures;
 }
 
+// A verify step's grouping routes each lane's verify rows alone
+// (MoeBuffers::verifyRows). With every row verified, its output and tile kinds
+// are bitwise the all-rows grouping's. Over four lanes that verify 8, 5, 2 and
+// 1 rows, a routed route of a row past its lane's rows stays out of every tile
+// with the route row ~0u, every other route round-trips and the tiles hold
+// exactly those routes; a verified row's output is bitwise the all-rows run's
+// where its routes ran the same tile kinds (a row's output depends on its own
+// routes only), and a row past them stays finite (its residual and shared
+// expert). On the staged and the register tile. How many staged rows keep
+// their tile kinds depends on the inputs, which the cases before this one draw
+// from the shared generator, down to none of the 16; so only the register
+// tile, whose kinds cannot change, must compare a row, and the run with every
+// row verified covers the staged tile.
+int verifiedRows(MetalBackend &backend) {
+  const MoeShape shape{kHidden, kExperts, kTopK, kIntermediate};
+  constexpr std::array<uint32_t, 4> kVerify{8, 5, 2, 1};
+  int failures = 0;
+  for (const MoeGgufTile tile : {MoeGgufTile::Staged, MoeGgufTile::Register}) {
+    const Model m = makeModel(backend, shape, tileFormats(tile).front(), false, tile);
+    const MoePlan plan = MoE::decodePlan(shape, 4, MoeConfig{.expertTile = MoeExpertTile::M8, .ggufTile = tile});
+    const uint32_t rows = plan.rows(), tileRows = plan.tileRows();
+    Buffers b;
+    b.input = activations(uint64_t{kMaximumRows} * kHidden);
+    b.residual = activations(uint64_t{kMaximumRows} * kHidden);
+    b.moe.input = bfloatBuffer(backend, b.input, "moe-input");
+    b.moe.residual = bfloatBuffer(backend, b.residual, "moe-residual");
+    b.moe.output = zeros(backend, uint64_t{kMaximumRows} * kHidden * 2, "moe-output");
+    MetalBuffer verify = backend.allocateBuffer(kVerify.size() * sizeof(uint32_t), BufferStorage::Shared,
+                                                "verify-rows");
+    std::copy(kVerify.begin(), kVerify.end(), static_cast<uint32_t *>(verify.contents()));
+    MetalBuffer verifyAll = backend.allocateBuffer(kVerify.size() * sizeof(uint32_t), BufferStorage::Shared,
+                                                   "verify-all-rows");
+    std::fill_n(static_cast<uint32_t *>(verifyAll.contents()), kVerify.size(), SPLASH_TARGET_VERIFY_ROWS);
+    const auto unverified = [&](uint32_t route) {
+      const uint32_t row = route / kRoutes;
+      return route % kRoutes < kTopK && row % SPLASH_TARGET_VERIFY_ROWS >= kVerify[row / SPLASH_TARGET_VERIFY_ROWS];
+    };
+    // A run's output rows and, per route, its tile kind: column or not on the
+    // staged passes, UINT32_MAX where the run left it out.
+    const auto run = [&](const MetalBuffer &verifyRows) {
+      allocate(backend, b, plan);
+      std::memset(b.moe.output.contents(), 0, b.moe.output.sizeBytes());
+      b.moe.verifyRows = verifyRows;
+      CommandGraph graph;
+      MoE::add(graph, b.moe, m.weights, plan);
+      static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+      const auto *output = static_cast<const uint16_t *>(b.moe.output.contents());
+      const auto *routeRows = static_cast<const uint32_t *>(b.moe.scratch.routeRows.contents());
+      const auto *tiles = static_cast<const MoeTileDescriptor *>(b.moe.scratch.tileDescriptors.contents());
+      std::vector<uint32_t> kinds(uint64_t{rows} * kRoutes);
+      for (uint32_t route = 0; route < kinds.size(); ++route)
+        kinds[route] = routeRows[route] == UINT32_MAX ? UINT32_MAX
+                       : tile == MoeGgufTile::Staged ? uint32_t(moe_column_tile(tiles, routeRows[route] / tileRows))
+                                                     : 0;
+      return std::pair{std::vector<uint16_t>(output, output + uint64_t{rows} * kHidden), kinds};
+    };
+    const auto [allOutput, allKinds] = run({});
+    const auto [fullOutput, fullKinds] = run(verifyAll);
+    const auto [output, kinds] = run(verify);
+    int tileFailures = 0;
+    const auto fail = [&](const std::string &what) {
+      printf("  %s FAIL\n", what.c_str());
+      ++tileFailures;
+    };
+    const bool fullBitwise = fullOutput == allOutput && fullKinds == allKinds;
+    if (!fullBitwise) fail("every row verified is not bitwise the all-rows run");
+
+    const MoeScratch &scratch = b.moe.scratch;
+    const auto *selected = static_cast<const uint32_t *>(scratch.selectedExperts.contents());
+    const auto *routeRows = static_cast<const uint32_t *>(scratch.routeRows.contents());
+    const auto *groupedRoutes = static_cast<const uint32_t *>(scratch.groupedRoutes.contents());
+    const auto *tiles = static_cast<const MoeTileDescriptor *>(scratch.tileDescriptors.contents());
+    const uint32_t tileCount = *static_cast<const uint32_t *>(scratch.tileCount.contents());
+    std::array<uint32_t, kExperts + 1> routes{};
+    for (uint32_t route = 0; route < rows * kRoutes; ++route) {
+      if (unverified(route)) {
+        if (routeRows[route] != UINT32_MAX) fail("a route past its lane's verify rows was grouped");
+        continue;
+      }
+      ++routes[selected[route]];
+      const uint32_t grouped = routeRows[route];
+      if (grouped >= tileCount * tileRows || groupedRoutes[grouped] != route ||
+          tiles[grouped / tileRows].expert != selected[route])
+        fail("a verified route's grouped row does not round-trip");
+    }
+    uint32_t occupied = 0;
+    for (const uint32_t count : routes) occupied += (count + tileRows - 1) / tileRows;
+    if (tileCount != occupied) fail("the tiles hold other routes than the verified ones");
+
+    uint32_t compared = 0, acrossKinds = 0;
+    for (uint32_t row = 0; row < rows; ++row) {
+      const auto at = [&](const std::vector<uint16_t> &values) { return values.begin() + uint64_t{row} * kHidden; };
+      if (row % SPLASH_TARGET_VERIFY_ROWS >= kVerify[row / SPLASH_TARGET_VERIFY_ROWS]) {
+        if (!std::all_of(at(output), at(output) + kHidden, [](uint16_t v) { return (v & 0x7F80) != 0x7F80; }))
+          fail("a row past its lane's verify rows is not finite");
+        continue;
+      }
+      if (!std::equal(kinds.begin() + uint64_t{row} * kRoutes, kinds.begin() + uint64_t{row + 1} * kRoutes,
+                      allKinds.begin() + uint64_t{row} * kRoutes)) {
+        ++acrossKinds;
+        continue;
+      }
+      ++compared;
+      if (!std::equal(at(output), at(output) + kHidden, at(allOutput)))
+        fail("verified row " + std::to_string(row) + " differs from the all-rows run");
+    }
+    if (!compared && tile == MoeGgufTile::Register) fail("no verified row ran its all-rows tile kinds");
+    printf("%-20s %s every row verified: %s; verify rows 8/5/2/1: %u rows bitwise, %u across tile kinds: %s\n",
+           formatNames(m).c_str(), tile == MoeGgufTile::Register ? "register" : "staged  ",
+           fullBitwise ? "bitwise" : "differs", compared, acrossKinds, tileFailures ? "FAIL" : "ok");
+    failures += tileFailures;
+  }
+  return failures;
+}
+
 int main(int argc, const char *argv[]) {
   @autoreleasepool {
     if (argc != 2) {
@@ -1041,7 +1156,7 @@ int main(int argc, const char *argv[]) {
       bufferExtents(backend);
       const int failures = floatProjection(backend) + bfloat16Weights(backend) + floatSegments(backend, 64) +
                            floatSegments(backend, 96) + floatOnlyChain(backend) + moe(backend) +
-                           routingLoads(backend) + permutedSlots(backend);
+                           routingLoads(backend) + permutedSlots(backend) + verifiedRows(backend);
       if (failures) {
         std::cerr << "gguf_moe_test: " << failures << " failures\n";
         return 1;

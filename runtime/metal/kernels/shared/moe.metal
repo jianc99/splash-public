@@ -122,6 +122,17 @@ MOE_ROUTE_SELECT_ENTRY(moe_route_select_f32, SPLASH_MOE_EXPERT_SLOTS)
 MOE_ROUTE_SELECT_ENTRY(moe_route_select_f32_e512, SPLASH_MOE_WIDE_EXPERT_SLOTS)
 #undef MOE_ROUTE_SELECT_ENTRY
 
+// Whether a verified grouping leaves routed route `route` out: its row is
+// past its lane's verify rows (MoeGroupParams).
+template <bool Verified>
+inline bool moe_unverified_route(device const uint *verify_rows,
+                                 constant MoeGroupParams &params, uint route) {
+  if (!Verified)
+    return false;
+  const uint row = route / (params.top_k + 1);
+  return row % params.lane_rows >= verify_rows[row / params.lane_rows];
+}
+
 // Sorts one command's routes by expert. Tile t covers grouped rows
 // [t * tile_rows, (t + 1) * tile_rows) of a single expert; the rows past
 // that expert's last route that its last tile's matmul reads
@@ -129,21 +140,23 @@ MOE_ROUTE_SELECT_ENTRY(moe_route_select_f32_e512, SPLASH_MOE_WIDE_EXPERT_SLOTS)
 // and thread e owns expert e's count, offsets and tile descriptors. The
 // shared expert's tiles follow the routed tiles and hold every row in order.
 // It writes the tile count with the expert passes' grids (MoeTileCount).
-// Slots threads, one per expert slot.
-template <uint Slots>
+// Slots threads, one per expert slot. A Verified grouping routes each lane's
+// verify rows alone (MoeGroupParams).
+template <uint Slots, bool Verified>
 inline void moe_group_routes_phase(
     device const uint *selected, device MoeTileDescriptor *tiles, device MoeTileCount *tile_count,
-    device uint *grouped_routes, device uint *route_rows, constant MoeGroupParams &params,
-    uint thread_index, uint simd_lane, uint simd_group, threadgroup atomic_uint *counts,
-    threadgroup atomic_uint *cursors, threadgroup uint *tile_offsets, threadgroup uint *simd_totals,
-    threadgroup uint &routed_tiles) {
+    device uint *grouped_routes, device uint *route_rows, device const uint *verify_rows,
+    constant MoeGroupParams &params, uint thread_index, uint simd_lane, uint simd_group,
+    threadgroup atomic_uint *counts, threadgroup atomic_uint *cursors, threadgroup uint *tile_offsets,
+    threadgroup uint *simd_totals, threadgroup uint &routed_tiles) {
   const uint routes_per_row = params.top_k + 1;
   const uint routes = params.rows * routes_per_row;
   atomic_store_explicit(&counts[thread_index], 0u, memory_order_relaxed);
   atomic_store_explicit(&cursors[thread_index], 0u, memory_order_relaxed);
   threadgroup_barrier(mem_flags::mem_threadgroup);
   for (uint route = thread_index; route < routes; route += Slots) {
-    if (route % routes_per_row != params.top_k) {
+    if (route % routes_per_row != params.top_k &&
+        !moe_unverified_route<Verified>(verify_rows, params, route)) {
       atomic_fetch_add_explicit(&counts[selected[route]], 1u,
                                 memory_order_relaxed);
     }
@@ -178,6 +191,10 @@ inline void moe_group_routes_phase(
   for (uint route = thread_index; route < routes; route += Slots) {
     if (route % routes_per_row == params.top_k)
       continue;
+    if (moe_unverified_route<Verified>(verify_rows, params, route)) {
+      route_rows[route] = ~0u;
+      continue;
+    }
     uint expert = selected[route];
     uint slot =
         atomic_fetch_add_explicit(&cursors[expert], 1u, memory_order_relaxed);
@@ -214,6 +231,16 @@ inline void moe_group_routes_phase(
   }
 }
 
+#define MOE_GROUP_ROUTES_BODY(Slots, Verified, verify_rows)                    \
+    threadgroup atomic_uint counts[Slots];                                     \
+    threadgroup atomic_uint cursors[Slots];                                    \
+    threadgroup uint tile_offsets[Slots];                                      \
+    threadgroup uint simd_totals[Slots / 32];                                  \
+    threadgroup uint routed_tiles;                                             \
+    moe_group_routes_phase<Slots, Verified>(                                   \
+        selected, tiles, tile_count, grouped_routes, route_rows, verify_rows,  \
+        params, thread_index, simd_lane, simd_group, counts, cursors,          \
+        tile_offsets, simd_totals, routed_tiles);
 #define MOE_GROUP_ROUTES_ENTRY(Name, Slots)                                    \
   kernel void Name(                                                            \
       device const uint *selected [[buffer(0)]],                               \
@@ -225,19 +252,31 @@ inline void moe_group_routes_phase(
       uint thread_index [[thread_index_in_threadgroup]],                       \
       uint simd_lane [[thread_index_in_simdgroup]],                            \
       uint simd_group [[simdgroup_index_in_threadgroup]]) {                    \
-    threadgroup atomic_uint counts[Slots];                                     \
-    threadgroup atomic_uint cursors[Slots];                                    \
-    threadgroup uint tile_offsets[Slots];                                      \
-    threadgroup uint simd_totals[Slots / 32];                                  \
-    threadgroup uint routed_tiles;                                             \
-    moe_group_routes_phase<Slots>(selected, tiles, tile_count, grouped_routes, \
-                                  route_rows, params, thread_index, simd_lane, \
-                                  simd_group, counts, cursors, tile_offsets,   \
-                                  simd_totals, routed_tiles);                  \
+    MOE_GROUP_ROUTES_BODY(Slots, false, nullptr)                               \
+  }
+// A verify step's grouping, which routes each lane's verify rows alone
+// (MoeGroupParams), the uint per lane the draft selector wrote.
+#define MOE_GROUP_ROUTES_VERIFIED_ENTRY(Name, Slots)                           \
+  kernel void Name(                                                            \
+      device const uint *selected [[buffer(0)]],                               \
+      device MoeTileDescriptor *tiles [[buffer(1)]],                           \
+      device MoeTileCount *tile_count [[buffer(2)]],                           \
+      device uint *grouped_routes [[buffer(3)]],                               \
+      device uint *route_rows [[buffer(4)]],                                   \
+      device const uint *verify_rows [[buffer(5)]],                            \
+      constant MoeGroupParams &params [[buffer(6)]],                           \
+      uint thread_index [[thread_index_in_threadgroup]],                       \
+      uint simd_lane [[thread_index_in_simdgroup]],                            \
+      uint simd_group [[simdgroup_index_in_threadgroup]]) {                    \
+    MOE_GROUP_ROUTES_BODY(Slots, true, verify_rows)                            \
   }
 MOE_GROUP_ROUTES_ENTRY(moe_group_routes, SPLASH_MOE_EXPERT_SLOTS)
 MOE_GROUP_ROUTES_ENTRY(moe_group_routes_e512, SPLASH_MOE_WIDE_EXPERT_SLOTS)
+MOE_GROUP_ROUTES_VERIFIED_ENTRY(moe_group_routes_verified, SPLASH_MOE_EXPERT_SLOTS)
+MOE_GROUP_ROUTES_VERIFIED_ENTRY(moe_group_routes_verified_e512, SPLASH_MOE_WIDE_EXPERT_SLOTS)
+#undef MOE_GROUP_ROUTES_VERIFIED_ENTRY
 #undef MOE_GROUP_ROUTES_ENTRY
+#undef MOE_GROUP_ROUTES_BODY
 
 // Copies each grouped row's input so every expert tile is a dense matrix,
 // over the rows the staged expert passes read (moe_staged_rows): padding rows
@@ -346,9 +385,12 @@ kernel void moe_combine(
   float value = float(residual[ulong(row) * params.hidden_size + dimension]);
   ulong route = ulong(row) * params.routes_per_row;
   for (uint slot = 0; slot < params.routes_per_row; ++slot) {
+    // A route a verified grouping left out (MoeGroupParams) adds nothing.
+    const uint grouped = route_rows[route + slot];
+    if (grouped == ~0u)
+      continue;
     value += routing_weights[route + slot] *
-             float(expert_output[ulong(route_rows[route + slot]) *
-                                     params.hidden_size +
+             float(expert_output[ulong(grouped) * params.hidden_size +
                                  dimension]);
   }
   output[ulong(row) * params.hidden_size + dimension] = bfloat(value);
