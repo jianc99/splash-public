@@ -628,8 +628,9 @@ private:
     uint32_t indexPages = 0;
     // A Spill request: the slots its commitment holds, when it began to
     // spill (revocation goes newest first), the blocks it holds whose copy
-    // it still owes, in publication order, and how far its blocks are known
-    // spilled or kept Full by another holder (spillWritten).
+    // it still owes, in publication order after those whose write failed,
+    // and how far its blocks are known spilled or kept Full by another
+    // holder (spillWritten).
     uint32_t committedPages = 0;
     uint64_t spillOrder = 0;
     std::deque<uint64_t> owedCopies;
@@ -814,6 +815,10 @@ private:
   // A Spill request's commitment: locks quota for `pages` slots; false,
   // committing nothing, when active KV's limit cannot hold them.
   [[nodiscard]] bool commit(Request &active, uint32_t pages);
+  // A slot drawn for the request came back unwritten: it commits the slot
+  // again, or, while active KV's limit cannot hold it, counts the
+  // commitment revoked.
+  void recommit(Request &active);
   // Returns `pages` slots of the request's commitment.
   void returnCommitment(Request &active, uint32_t pages) noexcept;
   // The request owes a copy of each of these blocks that has none.
