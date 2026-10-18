@@ -8132,6 +8132,35 @@ void testConversionCommitsTheHistoryWithoutCopies() {
   }
 }
 
+// A Resident lane whose history has copies already, as the chain it restored
+// from an earlier Spill request's has them, converts at the memory wall as a
+// lane without them does: its pages whose copies landed spill at once, and
+// it decodes its whole output rather than ending at the wall.
+void testConversionSpillsAHistoryWithCopies() {
+  // Resident KV holds 20 pages.
+  Spilling spill(400, false, 2'000);
+  // Ten pages and 4,096 tokens of output do not fit: the first turn spills,
+  // its pages written through, and is cancelled while it decodes.
+  spill.engine.submit(Spilling::prompt(1, 1, 10, 4'096));
+  spill.runUntil([&] { return spill.events.outputs.contains(1); }, "the first turn did not decode");
+  for (int step = 0; step < 50; ++step) {
+    static_cast<void>(spill.engine.tick(spill.now++));
+    spill.tier.complete();
+  }
+  spill.engine.cancel(1);
+  spill.runUntilIdle();
+  // With 120 tokens of output the second turn fits and starts Resident: it
+  // restores the first's chain whole, with its copies, and meets the wall of
+  // the 13 pages memory holds while it decodes.
+  spill.storage.budgetPages = 13;
+  spill.engine.submit(Spilling::prompt(2, 1, 10, 120));
+  spill.runUntilIdle();
+  const SpillRequestsSnapshot counts = spill.engine.snapshot().spill;
+  require(counts.converted == 1 && counts.lengthEnds == 0 && spill.events.usage.contains(2) &&
+              spill.events.usage.at(2).second == 120 && spill.committedSlots() == 0,
+          "the lane whose history had copies did not spill them when it converted");
+}
+
 // Short of its projection, a Spill start that the quota of active KV holds
 // with a page of output is bounded to what the quota holds, which the model
 // is given, and ends there; one that other Spill requests' commitments keep
@@ -10984,6 +11013,7 @@ int main() {
     testAdmissionSpillsWhatMemoryCannotHold();
     testSpillCommitmentCoversTheChainWithoutCopies();
     testConversionCommitsTheHistoryWithoutCopies();
+    testConversionSpillsAHistoryWithCopies();
     testShortQuotaBoundsWaitsOrRefusesASpillStart();
     testSpillResumeCommitsAgain();
     testDecodeLeavesOutALaneRefusedItsHotFloor();
