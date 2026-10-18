@@ -284,8 +284,9 @@ public:
   [[nodiscard]] std::optional<model::ExpertStoreStats> streamedExpertStats() const;
   // Which requests keep their KV on the SSD cache (EngineConfig::spill).
   [[nodiscard]] EngineSpillConfig spillConfig() const noexcept;
-  // Spilling as it stands, for /status; engine thread.
-  [[nodiscard]] KvSpillStatus kvSpillStatus() const;
+  // Spilling as it stands, for /status, none for a target that keeps its KV
+  // in memory; engine thread.
+  [[nodiscard]] std::optional<KvSpillStatus> kvSpillStatus() const;
 
   [[nodiscard]] model::RuntimeContext modelContext() noexcept;
   // What the engine gives back while idle (NativeLoopConfig::weights): the
@@ -311,8 +312,7 @@ private:
                    std::unique_ptr<engine::Cache> cache,
                    std::unique_ptr<ops::AneFfn> aneFfn, AneFfnOutcome aneFfnOutcome,
                    std::unique_ptr<model::KvBlockCache> blockCache,
-                   std::unique_ptr<model::KvHistoryStream> historyStream, bool spillAlways,
-                   std::string spillOffReason);
+                   std::unique_ptr<model::KvHistoryStream> historyStream, bool spillAlways);
   // Takes back the restore points the last process left in a persistent
   // tier (Cache::adopt) and opens its files for this one.
   void adoptPersistentCache();
@@ -342,10 +342,8 @@ private:
   // Over model_'s images, its expert store if it has one, and aneFfn_.
   ReleasableMemory releasableMemory_;
   AneFfnOutcome aneFfnOutcome_;
-  // --kv-spill always, and why a block-sparse target keeps its KV in
-  // memory, empty when it spills.
+  // --kv-spill always.
   bool spillAlways_ = false;
-  std::string spillOffReason_;
   // Ends a probation once it has lasted, unless the process stops first.
   std::thread probation_;
   std::mutex probationMutex_;

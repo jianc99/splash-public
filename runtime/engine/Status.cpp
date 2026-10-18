@@ -184,19 +184,23 @@ void appendKvReads(std::ostringstream &out, const model::KvReadStats &reads) {
       << ",\"read_failures\":" << reads.readFailures;
 }
 
-// Where a block-sparse target's long requests keep their KV (kv_spill):
-// whether on the SSD cache and why not; the pages that hold only their index
-// (the pool's extents of that form, `index`) and those spilled; the
-// write-through of Spill requests' pages; the moves between page forms,
-// rewrites and restores; the quota of active KV; the Index runway, the free
-// pages of that form; and the readers' memory and reads, null for a target
-// that keeps its KV in memory.
-void appendKvSpill(std::ostringstream &out, const KvSpillStatus &spill, const KvPoolFormSnapshot &index) {
+// A spill-capable target's KV on the SSD cache (kv_spill): the pages that
+// hold only their index (the pool's extents of that form, `index`) and those
+// spilled; the write-through of Spill requests' pages; the moves between page
+// forms, rewrites and restores; the quota of active KV; the Index runway, the
+// free pages of that form; and the readers' memory and reads. Null for a
+// target that keeps its KV in memory.
+void appendKvSpill(std::ostringstream &out, const std::optional<KvSpillStatus> &status,
+                   const KvPoolFormSnapshot &index) {
+  if (!status) {
+    out << "null";
+    return;
+  }
+  const KvSpillStatus &spill = *status;
   const KvSpillSnapshot &cache = spill.cache;
   const uint64_t pageBytes = index.pagesAllocated ? index.allocatedBytes / index.pagesAllocated : 0;
   const uint32_t indexPages = index.pagesActive + index.pagesPrefix;
-  out << "{\"enabled\":" << boolean(spill.enabled) << ",\"reason\":" << json::quote(spill.reason)
-      << ",\"pages\":{\"index\":" << indexPages << ",\"index_bytes\":" << indexPages * pageBytes
+  out << "{\"pages\":{\"index\":" << indexPages << ",\"index_bytes\":" << indexPages * pageBytes
       << ",\"spilled\":" << cache.spilledPages << ",\"spilled_bytes\":" << cache.spilledBytes << '}'
       << ",\"write_through\":{\"pages\":" << cache.writeThroughPages << ",\"bytes\":" << cache.writeThroughBytes
       << ",\"in_flight\":" << cache.writeThroughInFlight << ",\"failures\":" << cache.writeThroughFailures
@@ -254,7 +258,7 @@ std::string runtimeStatusJson(
     const NativeLoopTiming &loop, const WeightsSnapshot &weights,
     const AneFfnSnapshot &aneFfn, ThermalState thermalState,
     const std::optional<model::SparseRowStats> &streamedTable,
-    const std::optional<model::ExpertStoreStats> &streamedExperts, const KvSpillStatus &kvSpill) {
+    const std::optional<model::ExpertStoreStats> &streamedExperts, const std::optional<KvSpillStatus> &kvSpill) {
   const auto &resources = core.resources;
   const auto &scheduler = core.scheduler;
   const auto &pool = resources.pool;

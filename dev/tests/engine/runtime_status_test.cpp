@@ -221,7 +221,7 @@ void testCleanRuntimeStatus(const char *goldenPath) {
                                   .oldestWaitMilliseconds = 1250.0, .draining = true};
   // A Flash-Next request decoding over 31K pages of its 1M tokens that hold
   // only their index, its history's copies written.
-  KvSpillStatus spill{.enabled = true};
+  KvSpillStatus spill;
   spill.cache = {.spilledPages = 31'122,
                  .spilledBytes = 13'257'000'000,
                  .writeThroughPages = 31'250,
