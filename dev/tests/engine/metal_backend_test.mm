@@ -1888,6 +1888,71 @@ void throwingHostStepFailsItsCommand(const std::string &metallibPath) {
     std::cout << "PASS a throwing host step fails its command\n";
 }
 
+std::atomic<bool> failFirstHostStep{false};
+
+// Once armed, the command buffer that raises a command's first host step's
+// event (its value 1) fails instead, as failBeforeSignal's does.
+void failBeforeFirstHostStep(id command, SEL selector, id<MTLSharedEvent> event, uint64_t value) {
+    if (value != 1 || !failFirstHostStep.exchange(false)) {
+        reinterpret_cast<void (*)(id, SEL, id<MTLSharedEvent>, uint64_t)>(
+            originalSignalEncoding)(command, selector, event, value);
+        return;
+    }
+    [command addCompletedHandler:^(id<MTLCommandBuffer> ended) {
+        failedCommand.store((__bridge void *)ended);
+    }];
+}
+
+// A command runs none of its host steps after one that threw or did not run
+// (the buffer before it failed): a later step may build on an earlier one, as
+// an expert load's later rounds build on its first. The command fails with
+// the first failure, and the work after the steps still runs.
+void failedCommandRunsNoLaterHostStep(const std::string &metallibPath) {
+    for (const bool fault : {false, true}) {
+        MetalBackend backend(metallibPath);
+        MetalBuffer buffer = sharedBuffer(backend, sizeof(uint32_t));
+        auto *value = static_cast<volatile uint32_t *>(buffer.contents());
+        *value = 0;
+        const uint32_t count = 1, one = 1;
+        const std::vector<ComputeDispatch> dispatches(3, addition(buffer, count, one));
+        bool first = false, second = false;
+        const std::vector<EventStep> steps{
+            {1, {}, 0, EventStep::Kind::Host,
+             [&] {
+                 first = true;
+                 throw std::runtime_error("test host failure");
+             }},
+            {2, {}, 0, EventStep::Kind::Host, [&] { second = true; }}};
+        id<MTLCommandBuffer> command = [[MTLCreateSystemDefaultDevice() newCommandQueue] commandBuffer];
+        std::string error;
+        {
+            MethodReplacement signal(command, @selector(encodeSignalEvent:value:),
+                                     reinterpret_cast<IMP>(failBeforeFirstHostStep));
+            originalSignalEncoding = signal.original;
+            MethodReplacement status(command, @selector(status), reinterpret_cast<IMP>(terminalCommandStatus));
+            originalCommandStatus = status.original;
+            MethodReplacement failure(command, @selector(error), reinterpret_cast<IMP>(failedCommandError));
+            originalCommandError = failure.original;
+            failFirstHostStep = fault;
+            try {
+                (void)backend.submitCommandAsync(Command{dispatches, steps}).wait();
+            } catch (const MetalBackendError &caught) {
+                error = caught.what();
+            }
+        }
+        failFirstHostStep = false;
+        failedCommand.store(nullptr);
+        const std::string expected = fault ? "Metal command 1 failed: test fault before a signal"
+                                           : "Metal command 1 failed: host step failed: test host failure";
+        require(error.find(expected) != std::string::npos && first != fault && !second && *value == 3,
+                std::string(fault ? "a command whose buffer failed before its first host step"
+                                  : "a command whose first host step threw") +
+                    " ran its second step (" + std::to_string(second) + "), or failed with \"" + error +
+                    "\", or its work stopped at " + std::to_string(*value));
+    }
+    std::cout << "PASS a failed command runs no later host step\n";
+}
+
 // A host step's `then` runs after its work, once the work after the step
 // may go: it sees that work's result; it does not run after work that threw,
 // and one that throws marks the backend unhealthy (the command may have
@@ -2353,6 +2418,7 @@ int main(int argc, const char *argv[]) {
             earlyBuffersRunWhileTheRestEncodes(argv[1]);
             encodingFailureAfterACommit(argv[1]);
             throwingHostStepFailsItsCommand(argv[1]);
+            failedCommandRunsNoLaterHostStep(argv[1]);
             hostStepThen(argv[1]);
             hostStepAfterALongWait(argv[1]);
             watchdogFollowsHostSteps(argv[1]);
