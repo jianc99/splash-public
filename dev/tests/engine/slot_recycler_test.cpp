@@ -6,19 +6,27 @@
 // again in place; and when more lanes add experts to each cycle until a cycle
 // routes more than the slots hold, the experts every cycle routes keep
 // hitting (recycling the least recently used slot keeps a fifth of them). A
-// claim allocates nothing.
+// claim allocates nothing. On the decode selections of real requests
+// (dev/tests/fixtures/kv-selection-traces, the directory the test takes), the
+// hot block cache's resolves miss at most 2% more than recycling the least
+// recently used block would.
 #include "TestChecks.hpp"
 #include "model/SlotRecycler.hpp"
 
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <iterator>
+#include <list>
 #include <map>
 #include <new>
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 // Every allocation of the test's thread, which a claim must not add to.
@@ -205,10 +213,124 @@ void claimsAllocateNothing() {
   require(slots.ghostHits() > 0, "the loads hit no ghost");
 }
 
+// The decode selections of a trace (dev/tools/kv_selection_traces.py): per
+// request, its steps; per step and layer, its first position and blocks.
+struct TraceStep final {
+  uint32_t first = 0;
+  std::vector<std::vector<uint32_t>> layers;
+};
+using Trace = std::vector<std::vector<TraceStep>>;
+
+Trace readTrace(const std::filesystem::path &path) {
+  std::ifstream file(path, std::ios::binary);
+  const std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+  size_t at = 4;
+  const auto varint = [&] {
+    uint64_t value = 0;
+    for (uint32_t shift = 0;; shift += 7) {
+      require(at < bytes.size(), "a selection trace ends early: " + path.string());
+      value |= uint64_t{bytes[at] & 0x7fu} << shift;
+      if (!(bytes[at++] & 0x80)) return static_cast<uint32_t>(value);
+    }
+  };
+  require(bytes.size() >= 4 && std::string(bytes.begin(), bytes.begin() + 4) == "KVS1",
+          "not a selection trace: " + path.string());
+  Trace trace(varint());
+  const uint32_t layers = varint();
+  for (std::vector<TraceStep> &request : trace) {
+    request.resize(varint());
+    for (TraceStep &step : request) {
+      step.layers.resize(layers);
+      for (std::vector<uint32_t> &blocks : step.layers) {
+        step.first = varint();
+        blocks.resize(varint());
+        uint32_t block = 0;
+        for (uint32_t &entry : blocks) entry = block += varint();
+      }
+    }
+  }
+  require(at == bytes.size(), "a selection trace has bytes past its steps: " + path.string());
+  return trace;
+}
+
+// The misses of one layer of a request's decode as the hot block cache's
+// resolves place its blocks in `slots` slots (model::KvBlockCache): those
+// of the open page and after it are the page table's; a step touches the
+// blocks it holds, then claims slots for the others, never one it touched;
+// the first step, of an empty cache, does not count. `recency` recycles the
+// least recently used slot instead.
+uint64_t misses(const std::vector<TraceStep> &request, uint32_t layer, uint32_t slots, bool recency) {
+  constexpr uint32_t kPageBlocks = 8, kPageTokens = 32;
+  SlotRecycler order(slots);
+  std::list<uint32_t> used;
+  std::unordered_map<uint32_t, std::pair<std::list<uint32_t>::iterator, uint64_t>> lru;
+  uint64_t total = 0;
+  for (uint64_t load = 1; load <= request.size(); ++load) {
+    const TraceStep &step = request[load - 1];
+    const uint32_t paged = step.first / kPageTokens * kPageBlocks;
+    std::vector<uint32_t> missing;
+    for (const uint32_t block : step.layers[layer]) {
+      if (block >= paged) continue;
+      if (!recency) {
+        if (const auto slot = order.find(block)) order.touch(*slot, load, false);
+        else missing.push_back(block);
+      } else if (const auto held = lru.find(block); held != lru.end()) {
+        used.splice(used.end(), used, held->second.first);
+        held->second.second = load;
+      } else {
+        missing.push_back(block);
+      }
+    }
+    if (load > 1) total += missing.size();
+    for (const uint32_t block : missing) {
+      if (!recency) {
+        static_cast<void>(order.claim(block, load, false));
+        continue;
+      }
+      if (used.size() == slots) {
+        auto oldest = used.begin();
+        while (lru.at(*oldest).second == load) ++oldest;
+        lru.erase(*oldest);
+        used.erase(oldest);
+      }
+      lru[block] = {used.insert(used.end(), block), load};
+    }
+  }
+  return total;
+}
+
+void adaptiveReplacementKeepsUpWithRecency(const std::filesystem::path &traces) {
+  // One lane's floor, two lanes' selections a layer: the knee of the hot
+  // block cache's hit rate, as measured on such traces.
+  constexpr uint32_t kSlots = 8192;
+  std::vector<std::filesystem::path> paths;
+  for (const auto &entry : std::filesystem::directory_iterator(traces))
+    if (entry.path().extension() == ".kvst") paths.push_back(entry.path());
+  std::ranges::sort(paths);
+  require(!paths.empty(), "no selection trace in " + traces.string());
+  uint64_t adaptive = 0, recency = 0;
+  for (const std::filesystem::path &path : paths) {
+    const Trace trace = readTrace(path);
+    uint64_t traceAdaptive = 0, traceRecency = 0;
+    for (const std::vector<TraceStep> &request : trace)
+      for (uint32_t layer = 0; layer < request.front().layers.size(); ++layer) {
+        traceAdaptive += misses(request, layer, kSlots, false);
+        traceRecency += misses(request, layer, kSlots, true);
+      }
+    std::cout << "slot_recycler_test: " << path.filename().string() << ": " << traceAdaptive << " misses, "
+              << traceRecency << " least recently used\n";
+    adaptive += traceAdaptive;
+    recency += traceRecency;
+  }
+  require(adaptive * 100 <= recency * 102, "adaptive replacement missed " + std::to_string(adaptive) +
+                                               " blocks, recency " + std::to_string(recency));
+}
+
 } // namespace
 
-int main() {
+int main(int argc, char **argv) {
   try {
+    if (argc != 2) throw std::invalid_argument("usage: slot_recycler_test SELECTION_TRACES");
     neverTakesTheLoadsOwn();
     freeSlotsFirst();
     findsWhatItHolds();
@@ -216,6 +338,7 @@ int main() {
     aScanSparesTheFrequent();
     aRoutedCoreOutlivesMoreLanes();
     claimsAllocateNothing();
+    adaptiveReplacementKeepsUpWithRecency(argv[1]);
   } catch (const std::exception &error) {
     std::cerr << "slot_recycler_test: FAIL: " << error.what() << '\n';
     return 1;
