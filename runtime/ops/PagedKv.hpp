@@ -57,24 +57,29 @@ struct PageCopy final {
 };
 
 // The memory of the engine's page pool: extents of extentPages() pages,
-// pageCount() a whole number of them. Only KvPool allocates and releases
-// them. Implementations provide Metal storage or deterministic test storage.
+// pageCount() a whole number of them, each of one form (PageForm) from its
+// allocation to its release. Only KvPool allocates and releases them.
+// Implementations provide Metal storage or deterministic test storage.
 class ExtentStorage {
 public:
   virtual ~ExtentStorage() = default;
   [[nodiscard]] virtual uint32_t pageCount() const noexcept = 0;
-  [[nodiscard]] virtual uint64_t bytesPerPage() const noexcept = 0;
+  // What a page of the form takes in its extent.
+  [[nodiscard]] virtual uint64_t bytesPerPage(PageForm form) const noexcept = 0;
   [[nodiscard]] virtual uint32_t extentPages() const noexcept = 0;
-  // Allocates extent `extent`, which is not allocated: granted, or the
-  // refusal's cause with nothing allocated. std::logic_error for an
-  // allocated extent.
-  [[nodiscard]] virtual metal::AllocationResult allocateExtent(uint32_t extent) = 0;
+  // Allocates extent `extent`, which is not allocated, for pages of the
+  // form: granted, or the refusal's cause with nothing allocated.
+  // std::logic_error for an allocated extent, std::invalid_argument for
+  // Index pages of storage whose pages cannot spill.
+  [[nodiscard]] virtual metal::AllocationResult allocateExtent(uint32_t extent, PageForm form) = 0;
   // Releases allocated extent `extent` at once. std::logic_error, changing
   // nothing, for an unallocated extent or while a command is in flight (a
   // command reaches extents through its page tables without retaining them).
   virtual void releaseExtent(uint32_t extent) = 0;
   // Copies each page's content onto its destination, both in allocated
-  // extents: how the pool moves the pages of an extent it empties.
+  // extents: what both pages hold, all of it between pages of one form and
+  // the index between a Full page and an Index page. How the pool moves the
+  // pages of an extent it empties, and pages to the other form.
   // std::logic_error, copying nothing, for a page of an unallocated extent
   // or while a command is in flight (it reaches both pages through its
   // tables and may still write the source).
@@ -138,9 +143,9 @@ struct Layout final {
   Format format = Format::Int8;
   // A block index: each page also holds, per layer, the pooled keys of its
   // blocks of SPLASH_ATTENTION_BLOCK_TOKENS tokens, this many values each
-  // (bf16 [block][dimension]), in an index region after every layer's K/V
-  // region (PageStorage::indexOffset). Only a complete block has a pooled key
-  // in a page: whoever owns the sequence keeps the keys of its open block.
+  // (bf16 [block][dimension]), in an index region of its extent's index plane
+  // (PageStorage::indexOffset). Only a complete block has a pooled key in a
+  // page: whoever owns the sequence keeps the keys of its open block.
   uint32_t indexDimension = 0;
   // Whether a page holds each head's values token-major like its keys
   // ([token][dimension]) rather than dimension-major ([dimension][token]).

@@ -13,7 +13,7 @@ namespace splash::engine {
 KvPool::KvPool(kv::ExtentStorage &storage, uint32_t runwayPages)
     : storage_(storage), extentPages_(storage.extentPages()),
       pages_(storage.pageCount()) {
-  if (pages_.empty() || !storage_.bytesPerPage() || !extentPages_ ||
+  if (pages_.empty() || !storage_.bytesPerPage(kv::PageForm::Full) || !extentPages_ ||
       pages_.size() % extentPages_) {
     throw std::invalid_argument("invalid KV extent storage");
   }
@@ -118,7 +118,7 @@ uint32_t KvPool::pageCount() const noexcept {
 }
 
 uint64_t KvPool::bytesPerPage() const noexcept {
-  return storage_.bytesPerPage();
+  return storage_.bytesPerPage(kv::PageForm::Full);
 }
 
 uint32_t KvPool::freePageCount(kv::PageForm form) const noexcept {
@@ -172,7 +172,7 @@ uint64_t KvPool::reclaimEmptyExtents(bool keepRunway, uint32_t limit, std::optio
 
 metal::AllocationResult KvPool::allocateExtent(uint32_t extent) {
   const auto start = AwakeClock::now();
-  const metal::AllocationResult allocated = storage_.allocateExtent(extent);
+  const metal::AllocationResult allocated = storage_.allocateExtent(extent, kv::PageForm::Full);
   if (allocated) {
     ++extentAllocations_;
     extentAllocateMaxMilliseconds_ =
