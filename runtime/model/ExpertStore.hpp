@@ -132,9 +132,10 @@ public:
   // The bytes a store of these blocks allocates besides its arenas: its
   // staging, slot tables, jobs and the decode prediction's buffers.
   [[nodiscard]] static uint64_t fixedBytes(const StreamedBlocks &blocks, ops::MoeShape shape);
-  // The smallest store of these blocks (ExpertStoreOptions::memoryBytes):
-  // its fixed bytes, a block's experts of each streamed size and every
-  // expert of a size of one block.
+  // The smallest store of these blocks (ExpertStoreOptions::memoryBytes),
+  // which the constructor refuses a byte less than: its fixed bytes, a
+  // block's experts of each streamed size and every expert of a size of one
+  // block.
   [[nodiscard]] static uint64_t minimumBytes(const StreamedBlocks &blocks, ops::MoeShape shape);
 
 private:
