@@ -1688,6 +1688,7 @@ CacheSnapshot Cache::snapshot() const {
                                                      : DiskWritesGate::No;
     tier.writeBudgetBytes =
         static_cast<uint64_t>(std::max<int64_t>(0, diskBudget_->writeBudgetBytes()));
+    tier.writesDeferredMicroseconds = diskBudget_->writesDeferredMicroseconds();
     tier.readBytes = diskBudget_->readBytes();
     tier.writtenBytes = diskBudget_->writtenBytes();
   }

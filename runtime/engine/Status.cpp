@@ -184,23 +184,33 @@ void appendKvReads(std::ostringstream &out, const model::KvReadStats &reads) {
       << ",\"read_failures\":" << reads.readFailures;
 }
 
-// A spill-capable target's KV on the SSD cache (kv_spill): the pages that
-// hold only their index (the pool's extents of that form, `index`) and those
-// spilled; the write-through of Spill requests' pages; the moves between page
-// forms, rewrites and restores; the quota of active KV; the Index runway, the
-// free pages of that form; and the readers' memory and reads. Null for a
-// target that keeps its KV in memory.
+// A spill-capable target's KV on the SSD cache (kv_spill): the engine's
+// requests by KV mode, conversions, bounds, ends and refusals, and the starts
+// waiting for the quota; the pages that hold only their index (the pool's
+// extents of that form) and those spilled; the write-through of Spill
+// requests' pages; the moves between page forms, rewrites and restores; the
+// quota of active KV; the Index runway, the free pages of that form; and the
+// readers' memory and reads, with the commands that streamed a history beside
+// decoders and the decoders' gaps across them. Null for a target that keeps
+// its KV in memory.
 void appendKvSpill(std::ostringstream &out, const std::optional<KvSpillStatus> &status,
-                   const KvPoolFormSnapshot &index) {
+                   const engine::EngineSnapshot &core, const ResourceWaitSnapshot &resourceWait) {
   if (!status) {
     out << "null";
     return;
   }
   const KvSpillStatus &spill = *status;
   const KvSpillSnapshot &cache = spill.cache;
+  const engine::SpillRequestsSnapshot &requests = core.spill;
+  const KvPoolFormSnapshot &index = core.resources.pool.index;
   const uint64_t pageBytes = index.pagesAllocated ? index.allocatedBytes / index.pagesAllocated : 0;
   const uint32_t indexPages = index.pagesActive + index.pagesPrefix;
-  out << "{\"pages\":{\"index\":" << indexPages << ",\"index_bytes\":" << indexPages * pageBytes
+  out << "{\"requests\":{\"spill\":" << requests.spill << ",\"resident\":" << requests.resident
+      << ",\"converted\":" << requests.converted << ",\"bounded\":" << requests.bounded
+      << ",\"length_ends\":" << requests.lengthEnds << ",\"refused\":{\"quota\":" << requests.refusedQuota
+      << ",\"write_budget\":" << requests.refusedWriteBudget << ",\"closed\":" << requests.refusedClosed
+      << "},\"waiting_quota\":" << resourceWait.diskQuota << '}'
+      << ",\"pages\":{\"index\":" << indexPages << ",\"index_bytes\":" << indexPages * pageBytes
       << ",\"spilled\":" << cache.spilledPages << ",\"spilled_bytes\":" << cache.spilledBytes << '}'
       << ",\"write_through\":{\"pages\":" << cache.writeThroughPages << ",\"bytes\":" << cache.writeThroughBytes
       << ",\"in_flight\":" << cache.writeThroughInFlight << ",\"failures\":" << cache.writeThroughFailures
@@ -233,11 +243,14 @@ void appendKvSpill(std::ostringstream &out, const std::optional<KvSpillStatus> &
   }
   out << ",\"history_stream\":";
   if (const std::optional<model::KvHistoryStreamStats> &stream = spill.historyStream) {
-    out << "{\"commands\":" << stream->commands << ",\"layers\":" << stream->layers
-        << ",\"pages\":" << stream->pages << ",\"bytes\":" << stream->bytes
+    out << "{\"commands\":" << stream->commands
+        << ",\"contended_commands\":" << core.scheduler.contendedStreamingPrefillBatches
+        << ",\"layers\":" << stream->layers << ",\"pages\":" << stream->pages << ",\"bytes\":" << stream->bytes
         << ",\"staging_bytes\":" << stream->stagingBytes << ",\"buffers\":" << stream->buffers
         << ",\"wait_ms\":";
     appendLatency(out, stream->wait);
+    out << ",\"decode_gap_ms\":";
+    appendLatency(out, core.scheduler.decodeGap);
     out << '}';
   } else {
     out << "null";
@@ -343,7 +356,7 @@ std::string runtimeStatusJson(
   out << ",\"streamed_experts\":";
   appendStreamedExperts(out, streamedExperts);
   out << ",\"kv_spill\":";
-  appendKvSpill(out, kvSpill, pool.index);
+  appendKvSpill(out, kvSpill, core, resourceWait);
   out << ",\"ane_ffn\":";
   appendAneFfn(out, aneFfn, executorTelemetry.aneFfnReruns);
   out << ",\"kv\":{\"block_tokens\":" << kv::kPageTokens
@@ -390,6 +403,7 @@ std::string runtimeStatusJson(
       << ",\"volume_available_bytes\":" << resources.kvTier.volumeAvailableBytes
       << ",\"writes_gated\":" << json::quote(writesGatedName(resources.kvTier.writesGated))
       << ",\"write_budget_bytes\":" << resources.kvTier.writeBudgetBytes
+      << ",\"writes_deferred_ms\":" << resources.kvTier.writesDeferredMicroseconds / 1000.0
       << ",\"read_bytes\":" << resources.kvTier.readBytes
       << ",\"written_bytes\":" << resources.kvTier.writtenBytes
       << ",\"kv_blocks\":" << resources.kvTier.diskBlocks
@@ -505,8 +519,11 @@ std::string runtimeStatusJson(
         << "\",\"prompt_tokens\":" << request.promptTokens
         << ",\"prompt_processed\":" << request.promptProcessed
         << ",\"generated_tokens\":" << request.generatedTokens
-        << ",\"max_new_tokens\":" << request.maxNewTokens
-        << ",\"age_ms\":" << request.ageMilliseconds << '}';
+        << ",\"max_new_tokens\":" << request.maxNewTokens;
+    // Where a target's KV may spill, where each request's is kept.
+    if (kvSpill)
+      out << ",\"kv_mode\":" << (request.kvMode == engine::KvMode::Spill ? "\"spill\"" : "\"resident\"");
+    out << ",\"age_ms\":" << request.ageMilliseconds << '}';
   }
   out << "]"
       << ",\"requests\":{\"submitted\":" << core.submitted

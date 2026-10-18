@@ -107,6 +107,7 @@ void testCleanRuntimeStatus(const char *goldenPath) {
                             .promptProcessed = 512,
                             .generatedTokens = 40,
                             .maxNewTokens = 128,
+                            .kvMode = engine::KvMode::Spill,
                             .ageMilliseconds = 2250.25}};
   engine.resources.pool = {128, 72, 24, 32, 128 * 4096ULL,
                            32 * 4096ULL, 5, 3, 2.5, 0.75, 2, 9};
@@ -132,6 +133,7 @@ void testCleanRuntimeStatus(const char *goldenPath) {
   engine.resources.kvTier.usedBytes = 4096;
   engine.resources.kvTier.volumeAvailableBytes = 46170898432;
   engine.resources.kvTier.writesGated = engine::DiskWritesGate::Budget;
+  engine.resources.kvTier.writesDeferredMicroseconds = 2'500;
   engine.resources.persistent = true;
   engine.resources.kvTier.copies = 64;
   engine.resources.adoption = {2, 96, 4096, 1};
@@ -216,9 +218,9 @@ void testCleanRuntimeStatus(const char *goldenPath) {
                               12,
                               768,
                               10752.5};
-  const ResourceWaitSnapshot wait{.memory = 2, .concurrency = 1, .heldBehindRefusal = 4,
-                                  .restoring = 1, .suspended = 1,
-                                  .oldestWaitMilliseconds = 1250.0, .draining = true};
+  ResourceWaitSnapshot wait{.memory = 2, .concurrency = 1, .heldBehindRefusal = 4,
+                            .restoring = 1, .suspended = 1,
+                            .oldestWaitMilliseconds = 1250.0, .draining = true};
   // A Flash-Next request decoding over 31K pages of its 1M tokens that hold
   // only their index, its history's copies written.
   KvSpillStatus spill;
@@ -235,6 +237,14 @@ void testCleanRuntimeStatus(const char *goldenPath) {
                  .activeLimitBytes = 32 * kGiB,
                  .heldBytes = 13'257'000'000,
                  .committedBytes = 55'000'000};
+  // The engine's requests: that one spilled, one other did after it
+  // converted, and one was refused for want of quota; another start waits
+  // for it. Its prefill streamed once beside a decoder, which waited 40 ms.
+  engine.spill = {.spill = 1, .resident = 3, .converted = 1, .refusedQuota = 1};
+  wait.diskQuota = 1;
+  engine.scheduler.contendedStreamingPrefillBatches = 1;
+  engine.scheduler.decodeGap = {.count = 1, .totalMilliseconds = 40, .maximumMilliseconds = 40,
+                                .p50Milliseconds = 40, .p95Milliseconds = 40, .p99Milliseconds = 40};
   // Its pool's Index pages, of 24 KiB: those 31K, and a free extent of them,
   // the runway.
   engine.resources.pool.index = {.pagesAllocated = 31'506,
