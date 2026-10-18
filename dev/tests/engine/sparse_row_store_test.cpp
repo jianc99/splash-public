@@ -5,7 +5,7 @@
 // read or of a written source, and fails every later stage once poisoned;
 // and reads a prefetch's rows ahead, below stages, within its bound,
 // skipping rows an earlier prefetch still reads and dropping a row it fails
-// to read.
+// to read; and a store that goes while a prefetch reads waits for it.
 #include "TestChecks.hpp"
 #include "TestFiles.hpp"
 #include "model/SparseRowStore.hpp"
@@ -328,6 +328,26 @@ void skipsRowsInFlight() {
           "a prefetch read again a row another was reading");
 }
 
+// A store destroyed while its readers read a prefetch waits for the rows they
+// took and their end: nothing touches the store after it went (ASan, TSan).
+void tearsDownWithAPrefetchInFlight() {
+  Gate gate;
+  {
+    Fixture f(1000, 500, 2, 100);
+    f.reader->hook = [&](uint64_t) { gate.wait(); };
+    std::vector<uint32_t> ids(40);
+    for (uint32_t i = 0; i < ids.size(); ++i) ids[i] = i;
+    f.store->prefetch(ids);
+    while (gate.waiting.load() < 2) std::this_thread::yield();
+    std::thread opener([&] {
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      gate.release();
+    });
+    f.store.reset();
+    opener.join();
+  }
+}
+
 // A row a prefetch fails to read (twice) is dropped, a hint: the store stays
 // usable, and the stage that needs the row reads it.
 void dropsAFailedPrefetch() {
@@ -483,6 +503,7 @@ int main() {
       adoptsPrefetchedRows();
       boundsQueuedPrefetch();
       skipsRowsInFlight();
+      tearsDownWithAPrefetchInFlight();
       dropsAFailedPrefetch();
       concurrentUse();
       readsAnOpenFile(directory.path());

@@ -3,10 +3,10 @@
 // background batch on at most its readers; a failed task is tried once more,
 // and a second failure is the batch's (a batch that runs now throws it once
 // every task ended); stop() leaves the tasks no reader took unrun and
-// returns once those taken ended, halt() returns at once and each taken
-// task tells when it ended, finish() runs the rest now and returns once the
-// batch's end has; a batch that runs now never waits behind a background
-// batch's queue; and several threads run, start, stop and finish batches at
+// returns once those taken ended, and the batch's end once every task ran,
+// halt() returns at once and each taken task tells when it ended, finish()
+// runs the rest now and returns once the batch's end has; a batch that runs
+// now never waits behind a background batch's queue; and several threads run, start, stop and finish batches at
 // once. Built under TSan too.
 #include "TestChecks.hpp"
 #include "model/WeightReaders.hpp"
@@ -26,7 +26,6 @@ using splash::test::require;
 
 namespace {
 
-using Clock = std::chrono::steady_clock;
 
 // Runs of each task of a batch.
 struct Runs final {
@@ -124,31 +123,35 @@ void backgroundRunsOnItsReaders() {
         --working;
       },
       2, [&](const WeightReaders::Batch &) { ++ended; });
+  // In the background it runs on two readers at most, until it ends.
+  while (!ended.load()) std::this_thread::yield();
+  require(most.load() >= 1 && most.load() <= 2, "a background batch ran on other than its two readers");
   pool.finish(*batch);
   require(runs.eachOnce(0, runs.counts.size()) && batch->taken() == runs.counts.size(),
           "a finished background batch did not run every task once");
   require(ended.load() == 1, "a finished background batch did not report its end once");
-  // finish() runs the rest on every reader: only before it do two at most.
-  require(most.load() >= 1, "no task of a background batch ran");
   bool emptyEnded = false;
   const auto empty = pool.start(0, [](size_t) {}, 1, [&](const WeightReaders::Batch &) { emptyEnded = true; });
   require(emptyEnded && empty->taken() == 0, "an empty background batch did not end at once");
 }
 
-// finish() of a batch whose tasks all ran returns once its end returned, so
-// the caller reads what the end wrote.
+// finish() or stop() of a batch whose tasks all ran returns once its end
+// returned, so the caller reads what the end wrote.
 void finishWaitsForTheEnd() {
-  WeightReaders pool(2);
-  std::atomic<bool> ran = false, endReturned = false;
-  const auto batch = pool.start(
-      1, [&](size_t) { ran = true; }, 1,
-      [&](const WeightReaders::Batch &) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        endReturned = true;
-      });
-  while (!ran.load()) std::this_thread::yield();
-  pool.finish(*batch);
-  require(endReturned.load(), "finish() returned before the batch's end did");
+  for (const bool finish : {true, false}) {
+    WeightReaders pool(2);
+    std::atomic<bool> ran = false, endReturned = false;
+    const auto batch = pool.start(
+        1, [&](size_t) { ran = true; }, 1,
+        [&](const WeightReaders::Batch &) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(50));
+          endReturned = true;
+        });
+    while (!ran.load()) std::this_thread::yield();
+    if (finish) pool.finish(*batch);
+    else pool.stop(*batch);
+    require(endReturned.load(), std::string(finish ? "finish()" : "stop()") + " returned before the batch's end did");
+  }
 }
 
 void stopLeavesTheRestUnread() {
@@ -214,23 +217,28 @@ void haltLeavesTheTakenRunning() {
 void runNowPassesTheBackground() {
   WeightReaders pool(4);
   Runs background(400), now(32);
+  std::atomic<int> backgroundStarted = 0;
   const auto batch = pool.start(
       background.counts.size(),
       [&](size_t index) {
+        ++backgroundStarted;
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
         ++background.counts[index];
       },
       4);
   std::this_thread::sleep_for(std::chrono::milliseconds(5));
-  const auto started = Clock::now();
+  const int before = backgroundStarted.load();
   pool.run(now.counts.size(), [&](size_t index) {
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
     ++now.counts[index];
   });
-  const auto waited = Clock::now() - started;
+  const int during = backgroundStarted.load() - before;
   require(now.eachOnce(0, now.counts.size()), "a batch run beside a background batch did not run every task once");
-  // Without passing, it would wait for a second of background tasks.
-  require(waited < std::chrono::milliseconds(300), "a batch run now waited behind a background batch");
+  // A reader starts at most the background task it was about to take as the
+  // batch began and one as it ended; waiting behind the background, the batch
+  // would see hundreds start.
+  require(during <= 8, "a batch run now waited behind a background batch (" + std::to_string(during) +
+                           " background tasks started while it ran)");
   pool.stop(*batch);
   require(background.eachOnce(0, batch->taken()) && background.noneFrom(batch->taken()),
           "a background batch ran a task other than once");
