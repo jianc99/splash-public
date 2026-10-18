@@ -1,18 +1,25 @@
 #include "LinearNumerics.hpp"
 #include "TestChecks.hpp"
+#include "TestKvTier.hpp"
 #include "ane/ProgramInstrumentation.hpp"
+#include "engine/KvPool.hpp"
 #include "engine/RuntimeResources.hpp"
 #include "engine/MemoryGovernor.hpp"
 #include "engine/MemoryPlan.hpp"
 #include "engine/NativeArguments.hpp"
 #include "engine/Types.hpp"
 #include "metal/BackendInstrumentation.hpp"
+#include "model/KvBlockCache.hpp"
+#include "model/KvHistoryStream.hpp"
 #include "model/Runtime.hpp"
 #include "model/Qwen4Exp.hpp"
 #include "model/Qwen4Steps.hpp"
 #include "model/RuntimeInstrumentation.hpp"
 #include "model/SsdReaders.hpp"
 #include "model/QwenState.hpp"
+#include "model/SpilledKvReads.hpp"
+#include "model/SsdReaders.hpp"
+#include "ops/KvSlotFormat.hpp"
 #include "ops/PageStorage.hpp"
 #include "ops/Sampling.hpp"
 #include "ops/Vision.hpp"
@@ -21,6 +28,7 @@
 #include <array>
 #include <charconv>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -30,6 +38,8 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <random>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -2589,6 +2599,558 @@ void requireBatchedLanesMatchReordered(model::Runtime &executor, const model::Qw
   std::cout << "batched_lanes_reordered=PASS widths=2,3,4\n";
 }
 
+// The K/V of a block-sparse target whose committed pages hold only their
+// index (kv::PageForm::Index), their K/V in SSD cache tier copies, reaches
+// the attention through the command's reads of spilled K/V
+// (model::SpilledKvReads): a prefill's history streamed into staging
+// (model::KvHistoryStream), a decode's selected blocks through the hot block
+// cache (model::KvBlockCache). A spill run's options: each prompt's tokens
+// (by default those requireSpilledKvMatchesResident describes), the newest
+// full pages a request keeps whole (the cache's window,
+// engine::CacheSpillPolicy; by default 1, its minimum) and the history's
+// staging buffers.
+struct SpillOptions final {
+  std::optional<uint32_t> tokens;
+  uint32_t windowPages = 1;
+  uint32_t buffers = 1;
+};
+
+// The pages a request of a block-sparse target keeps whole before those it
+// may spill: its dense history (engine::CacheSpillPolicy::densePages).
+uint32_t densePagesOf(const model::SparseKvShape &shape) {
+  return (std::max(shape.denseHistoryTokens, shape.sinkTokens) + kv::kPageTokens - 1) / kv::kPageTokens;
+}
+
+// FNV-1a of the values' bytes: logits compared bit for bit.
+uint64_t digestOf(std::span<const float> values) {
+  uint64_t hash = 14695981039346656037ULL;
+  for (const std::byte byte : std::as_bytes(values))
+    hash = (hash ^ std::to_integer<uint64_t>(byte)) * 1099511628211ULL;
+  return hash;
+}
+
+// A request of a spill run: its prompt and lane, its pages, where each
+// reads its K/V and the copy of each it spilled (whose reads a check may
+// fail), and the tokens it committed.
+struct SpillRequest final {
+  uint64_t id = 0;
+  uint32_t stateLane = 0;
+  bool spills = false;
+  std::vector<uint32_t> prompt;
+  std::vector<uint32_t> pages;
+  std::vector<model::KvPageSource> sources;
+  std::vector<std::shared_ptr<test::TestKvCopy>> copies;
+  uint32_t committed = 0;
+
+  [[nodiscard]] bool holdsIndexPages() const {
+    return std::ranges::any_of(sources, [](const model::KvPageSource &source) { return source.indexed(); });
+  }
+};
+
+// What a command gave one lane, as a spill run compares it: its tokens and
+// the digest of the logits it computed (none for a prefill command inside
+// the prompt).
+struct SpillStep final {
+  std::vector<uint32_t> outputTokens;
+  std::optional<uint32_t> firstToken;
+  std::optional<uint64_t> logits;
+
+  bool operator==(const SpillStep &) const = default;
+};
+
+// A runtime whose reads of spilled K/V are built, over a pool of its own:
+// requests' pages from the pool (engine::KvPool), each new one zeroed, as
+// engine::Cache::ensureTokens gives them, and a spilling request's committed
+// pages past the dense history and the window moved to the index form once
+// a command committed them, as engine::Cache::spillWritten moves them: each
+// page's bytes copied to a tier copy in memory first (kv::SlotFormat::
+// transferSpans), its K/V overwritten once it moved, so that only its copy
+// holds them.
+class SpillRuntime final {
+public:
+  SpillRuntime(metal::MetalBackend &backend, const model::LoadedModel &model, const ops::ExecutionPlans &operators,
+               const metal::AllocationAdmission &admission, kv::Format format, ops::GdnStateFormat stateFormat,
+               const SpillOptions &options, uint32_t lanePages)
+      : backend_(backend), layout_(model.targetKvLayout(format)), shape_(*model.descriptor.capabilities.sparseKv),
+        vocabulary_(model.descriptor.capabilities.vocabularySize), format_(layout_),
+        windowPages_(options.windowPages), densePages_(densePagesOf(shape_)),
+        extentPages_(layout_.minimumExtentPages()),
+        kv_(backend, admission, layout_, poolPages(lanePages, extentPages_), extentPages_), pool_(kv_, extentPages_),
+        states_(backend, admission, model.stateLayout(stateFormat), nullptr),
+        readers_(std::make_shared<model::SsdReaders>(model::kSsdReaders)),
+        cache_(backend, admission, layout_, extentPages_,
+               {.laneSlots = shape_.verifyRows * shape_.selectedBlocks, .targetBytes = 0, .readers = readers_,
+                .format = format_}),
+        stream_(backend, admission, layout_, extentPages_, readers_, format_, options.buffers),
+        tables_{backend.allocateBuffer(lanePages * sizeof(SplashKvPage), metal::BufferStorage::Shared,
+                                       "oracle-spill-pages"),
+                backend.allocateBuffer(lanePages * sizeof(SplashKvPage), metal::BufferStorage::Shared,
+                                       "oracle-spill-index")} {
+    const model::ModelMemoryPlan plan = model::plannedRuntimeMemory(model, operators, format, stateFormat, true);
+    const uint64_t arenaBytes = plan.sharedPrefillPlannedAllocatedBytes + plan.sharedDecodePlannedAllocatedBytes;
+    require(static_cast<bool>(admission(arenaBytes, [&] {
+              runtime_.emplace(model::RuntimeContext{backend, model, kv_, states_, operators, nullptr, &cache_,
+                                                     &stream_});
+            })),
+            "the spill runtime's arenas exceed the oracle Metal budget");
+  }
+
+  [[nodiscard]] model::Runtime &runtime() { return *runtime_; }
+  [[nodiscard]] const model::QwenStateStorage &states() const { return states_; }
+  [[nodiscard]] const model::KvBlockCache &blockCache() const { return cache_; }
+  [[nodiscard]] const model::KvHistoryStream &historyStream() const { return stream_; }
+  [[nodiscard]] uint32_t densePages() const noexcept { return densePages_; }
+
+  void begin(SpillRequest &request) {
+    EngineRequest engineRequest = makeRequest(request.id, request.prompt, 4096);
+    engineRequest.flags = RequestIgnoreEndOfSequence;
+    beginCold(*runtime_, engineRequest, request.stateLane);
+  }
+
+  // The request's prompt from what it committed to token `end`, one command.
+  SpillStep prefill(SpillRequest &request, uint32_t end) {
+    const uint32_t position = request.committed;
+    ensure(request, end);
+    if (request.holdsIndexPages())
+      require(runtime_->reserveHistoryStaging(request.id, pagesFor(end)).granted(),
+              "the staging of a spilled history was refused");
+    const std::span<const uint32_t> input = std::span(request.prompt).subspan(position, end - position);
+    const BatchPlan plan{.kind = WorkKind::Prefill,
+                         .items = {{request.id, end - position}},
+                         .decodeStage = DecodeStage::Regular};
+    const std::array items{item(request, position, end - position, input)};
+    std::vector<ModelStepResult> results = runtime_->submit(plan, items, {})->wait();
+    require(results.size() == 1 && results[0].consumedPromptTokens == end - position,
+            "a spill run's prefill result mismatch");
+    lastResults_ = results;
+    if (!results[0].unreadableKvBlocks.empty()) return {};
+    require(results[0].failure.empty(), "a spill run's prefill failed: " + results[0].failure);
+    request.committed = end;
+    requireTablesWritten(request);
+    spill(request);
+    return {results[0].outputTokens, results[0].firstToken,
+            end == request.prompt.size()
+                ? std::optional(digestOf(model::RuntimeInstrumentation::lastLogits(*runtime_, 0).first(vocabulary_)))
+                : std::nullopt};
+  }
+
+  // A decode cycle of the requests together, in lanes in their order.
+  std::vector<SpillStep> decode(std::span<SpillRequest *const> requests) {
+    BatchPlan plan{.kind = WorkKind::Decode, .decodeStage = DecodeStage::Regular};
+    std::vector<ModelBatchItem> items;
+    for (SpillRequest *request : requests) {
+      ensure(*request, request->committed + model::ExecutionLimits::targetVerifyRows);
+      if (request->holdsIndexPages())
+        require(runtime_->reserveSpilledReads(request->id).granted(), "a lane's floor of the hot block cache was refused");
+      plan.items.push_back({request->id, 0});
+      items.push_back(item(*request, request->committed, 0, {}));
+    }
+    std::vector<ModelStepResult> results = runtime_->submit(plan, items, {})->wait();
+    require(results.size() == requests.size(), "a spill run's decode lost a lane");
+    lastResults_ = results;
+    std::vector<SpillStep> steps;
+    for (size_t lane = 0; lane < requests.size(); ++lane) {
+      const ModelStepResult &result = results[lane];
+      SpillRequest &request = *requests[lane];
+      if (!result.unreadableKvBlocks.empty()) {
+        steps.emplace_back();
+        continue;
+      }
+      require(result.failure.empty() && !result.outputTokens.empty(), "a spill run's decode failed a lane");
+      request.committed += static_cast<uint32_t>(result.outputTokens.size() - result.outputTokensWithoutKv);
+      requireTablesWritten(request);
+      steps.push_back({result.outputTokens, std::nullopt,
+                       digestOf(model::RuntimeInstrumentation::lastLogits(*runtime_, static_cast<uint32_t>(lane)))});
+    }
+    for (SpillRequest *request : requests) spill(*request);
+    return steps;
+  }
+
+  // The results of the last command, which a check that fails reads may read.
+  [[nodiscard]] const std::vector<ModelStepResult> &lastResults() const noexcept { return lastResults_; }
+
+  // The Neural Engine's rerun of a prefill command (Runtime::prefillAsync)
+  // ends the command's reads of spilled K/V and encodes the command again
+  // through them: the request's history up to token `end` streamed twice by
+  // one model::SpilledKvReads, each attention layer staged with the
+  // command's pages and handed off, the copy of its last spilled page
+  // unreadable in the first run alone. The reads stream it again once they
+  // ended, and keep what the first run could not read and the time both
+  // waited.
+  void requireReadsRunAgain(SpillRequest &request, uint32_t end) {
+    ensure(request, end);
+    require(runtime_->reserveHistoryStaging(request.id, pagesFor(end)).granted(),
+            "the staging of a spilled history was refused");
+    size_t unreadable = request.pages.size() - 1;
+    while (!request.copies[unreadable]) --unreadable;
+    const uint32_t firstPage = request.committed / kv::kPageTokens, endPage = pagesFor(end);
+    kv_.writeEntries(request.pages, 0, tables_[0]);
+    model::SpilledKvReads reads(stream_, 0, pageSources(request), endPage, tables_[0], kv_.layers());
+    const uint64_t commands = stream_.stats().commands;
+    double waited = 0.0;
+    request.copies[unreadable]->failAll = true;
+    for (uint32_t run = 0; run < 2; ++run) {
+      metal::CommandGraph graph;
+      for (uint32_t layer = 0; layer < layout_.attentionLayers; ++layer) {
+        static_cast<void>(
+            reads.prefill(graph, layer, 0, firstPage, endPage - firstPage, {tables_[0], kv_.layers()[layer]}));
+        reads.layerEnd(graph, layer);
+      }
+      static_cast<void>(backend_.submitCommandAsync(graph.command()).wait());
+      reads.end();
+      request.copies[unreadable]->failAll = false;
+      require(reads.failures().size() == 1 && reads.failures().front().lane == 0 &&
+                  reads.failures().front().block == request.sources[unreadable].block &&
+                  reads.streamMilliseconds() >= waited,
+              "a prefill's reads streamed again did not keep what they could not read and the time they waited");
+      waited = reads.streamMilliseconds();
+    }
+    require(stream_.stats().commands == commands + 2, "a prefill's reads did not stream its history again");
+  }
+
+  // Moves the request's pages [first, last) that still hold their K/V to the
+  // index form.
+  void spillPages(SpillRequest &request, uint32_t first, uint32_t last) {
+    std::vector<uint32_t> places, moving;
+    std::vector<std::shared_ptr<test::TestKvCopy>> copies;
+    for (uint32_t place = first; place < last; ++place) {
+      if (request.sources[place].indexed()) continue;
+      std::vector<std::byte> bytes;
+      for (const auto &span : format_.transferSpans(kv_, request.pages[place]))
+        bytes.insert(bytes.end(), span.begin(), span.end());
+      places.push_back(place);
+      moving.push_back(request.pages[place]);
+      copies.push_back(std::make_shared<test::TestKvCopy>(std::move(bytes)));
+    }
+    if (moving.empty()) return;
+    const engine::KvPageMoveResult moved = pool_.movePages(moving, kv::PageForm::Index);
+    require(moved.granted(), "a spill run's pages did not move to the index form");
+    for (size_t index = 0; index < places.size(); ++index) {
+      for (uint32_t layer = 0; layer < layout_.attentionLayers; ++layer)
+        for (const std::span<std::byte> tensor : kv_.layerSpans(moving[index], layer))
+          std::ranges::fill(tensor, std::byte{0x7f});
+      request.pages[places[index]] = moved.moves.follow(moving[index]);
+      request.sources[places[index]] = {++blocks_, copies[index]};
+      request.copies[places[index]] = copies[index];
+    }
+  }
+
+  void end(SpillRequest &request) {
+    runtime_->end(request.id);
+    for (const uint32_t page : request.pages) pool_.releasePage(page, false);
+    request.pages.clear();
+    request.sources.clear();
+    request.copies.clear();
+  }
+
+private:
+  // Pool pages for four lanes of `lanePages` Full pages and two of Index
+  // pages, the runway and an extent of each form's slack.
+  static uint32_t poolPages(uint32_t lanePages, uint32_t extentPages) {
+    const auto extents = [&](uint32_t pages) { return (pages + extentPages - 1) / extentPages + 1; };
+    return (extents(4 * lanePages) + extents(2 * lanePages) + 1) * extentPages;
+  }
+
+  [[nodiscard]] static uint32_t pagesFor(uint64_t tokens) {
+    return static_cast<uint32_t>((tokens + kv::kPageTokens - 1) / kv::kPageTokens);
+  }
+
+  void ensure(SpillRequest &request, uint64_t tokens) {
+    const uint32_t needed = pagesFor(tokens);
+    if (needed <= request.pages.size()) return;
+    const engine::KvPageAcquisition acquired =
+        pool_.acquirePages(needed - static_cast<uint32_t>(request.pages.size()));
+    require(acquired.granted(), "a spill run's pages were refused");
+    for (const uint32_t page : acquired.pages) {
+      pool_.clearPage(page);
+      request.pages.push_back(page);
+      request.sources.emplace_back();
+      request.copies.emplace_back();
+    }
+  }
+
+  // The request's item.
+  ModelBatchItem item(const SpillRequest &request, uint64_t position, uint32_t tokens,
+                      std::span<const uint32_t> input) const {
+    ModelBatchItem result = withRevision({request.id, position, tokens, request.pages});
+    result.inputTokens = input;
+    result.pageSources = pageSources(request);
+    return result;
+  }
+
+  // Where the request's pages read their K/V, cut as the cache cuts them
+  // (KvPageSources' chunks); none while no page holds only its index.
+  static std::shared_ptr<const model::KvPageSources> pageSources(const SpillRequest &request) {
+    if (!request.holdsIndexPages()) return nullptr;
+    constexpr uint32_t chunkPages = model::KvPageSources::kChunkPages;
+    std::vector<std::shared_ptr<const model::KvPageSources::Chunk>> chunks;
+    for (size_t first = 0; first < request.sources.size(); first += chunkPages) {
+      auto chunk = std::make_shared<model::KvPageSources::Chunk>();
+      for (size_t page = first; page < std::min<size_t>(first + chunkPages, request.sources.size()); ++page) {
+        chunk->pages[page - first] = request.sources[page];
+        chunk->indexPages += request.sources[page].indexed();
+      }
+      chunks.push_back(std::move(chunk));
+    }
+    return std::make_shared<const model::KvPageSources>(std::move(chunks),
+                                                        static_cast<uint32_t>(request.sources.size()));
+  }
+
+  // A spilling request's committed pages past the dense history and the
+  // window.
+  void spill(SpillRequest &request) {
+    const uint32_t full = request.committed / kv::kPageTokens;
+    if (request.spills && full > densePages_ + windowPages_)
+      spillPages(request, densePages_, full - windowPages_);
+  }
+
+  // The lane's GPU tables after its command: what its pages' entries are
+  // written as, every page's (kv::PageStorage::writeEntries,
+  // writeIndexEntries), from the runtime's rewrites since its last full one;
+  // a page's index entry names the same page as its K/V entry, unless the
+  // page holds only its index, whose K/V entry is absent.
+  void requireTablesWritten(const SpillRequest &request) {
+    const model::RuntimeInstrumentation::LaneTables lane =
+        model::RuntimeInstrumentation::laneTables(*runtime_, request.id);
+    const size_t count = request.pages.size();
+    kv_.writeEntries(request.pages, 0, tables_[0]);
+    kv_.writeIndexEntries(request.pages, 0, tables_[1]);
+    const std::span<const SplashKvPage> pages(static_cast<const SplashKvPage *>(tables_[0].contents()), count);
+    const std::span<const SplashKvPage> index(static_cast<const SplashKvPage *>(tables_[1].contents()), count);
+    require(std::ranges::equal(lane.pages.first(count), pages) && std::ranges::equal(lane.index.first(count), index),
+            "a lane's page or index table is not what its pages' entries are");
+    for (size_t page = 0; page < count; ++page)
+      require(request.sources[page].indexed()
+                  ? pages[page] == SPLASH_KV_PAGE_ABSENT
+                  : (pages[page] & SPLASH_KV_PAGE_INDEX_MASK) == (index[page] & SPLASH_KV_PAGE_INDEX_MASK),
+              "a lane's index entry names another page than its page entry");
+  }
+
+  metal::MetalBackend &backend_;
+  const kv::Layout layout_;
+  const model::SparseKvShape shape_;
+  const uint32_t vocabulary_;
+  const kv::SlotFormat format_;
+  const uint32_t windowPages_;
+  const uint32_t densePages_;
+  const uint32_t extentPages_;
+  kv::PageStorage kv_;
+  engine::KvPool pool_;
+  model::QwenStateStorage states_;
+  std::shared_ptr<model::SsdReaders> readers_;
+  model::KvBlockCache cache_;
+  model::KvHistoryStream stream_;
+  const std::array<metal::MetalBuffer, 2> tables_;
+  std::optional<model::Runtime> runtime_;
+  std::vector<ModelStepResult> lastResults_;
+  uint64_t blocks_ = 0;
+};
+
+// What a spill run's requests gave, each command's step per request, in
+// the order the run issued them, and the command buffers each command took
+// (BackendInstrumentation::lastCommandBuffers).
+struct SpillRecord final {
+  std::vector<std::vector<SpillStep>> steps;
+  std::vector<uint64_t> commandBuffers;
+};
+
+// A block-sparse target's outputs are bitwise the same whether its K/V
+// spills or stays, for the same schedule: four requests, each
+// prefilled in commands of the runtime's prefill group, the first of which
+// ends past the dense history and a fourth of a chunk, then decoded one
+// alone, four together, two and one again; first with every page Full, then
+// with the first and the third spilling between commands, the others not,
+// so that their later commands stream their history and every decode but
+// the first mixes lanes that resolve blocks with lanes that read their page
+// table. The first two requests' first command ends kIntoPage tokens into a
+// page and the last two's on a page boundary, so that a streamed command
+// starts inside a page that holds history as well as on a boundary; by
+// default each prompt ends kLastChunkRows tokens past the first chunk of
+// its second command, which streams in two chunks, the first request's
+// second ending in the page its first ends in, whose staging the second
+// still attends after the first. The tables the lanes read are what their
+// pages' entries are; the reads read history and blocks, hit and miss, and
+// add at most two command buffers an attention layer to a command, whatever
+// its history (of the queue's 512, which the backend checks for every
+// command); and an idle reclaim gives their memory back one unit at a time,
+// the staging, then the hot block cache above its lanes' floors. Then a
+// command's reads streamed again, as a Neural Engine rerun streams them,
+// keep what they could not read; a copy that cannot be read fails the
+// prefill command that streams it, which commits nothing and gives the same
+// step on a retry, while the staging stays the prompt's until it ends; a
+// decode lane that resolves blocks of copies that cannot be read fails
+// alone, its state kept, its retry giving the same step; and a verify over
+// Index pages without block lists, of rows that read their page table, is
+// refused.
+void requireSpilledKvMatchesResident(metal::MetalBackend &backend, const model::LoadedModel &model,
+                                      const ops::ExecutionPlans &operators, const metal::AllocationAdmission &admission,
+                                      kv::Format format, ops::GdnStateFormat stateFormat, const SpillOptions &options) {
+  constexpr uint32_t kCycles = 4;
+  constexpr uint32_t kDecodeTokens = (1 + 3 * kCycles) * model::ExecutionLimits::targetVerifyRows;
+  constexpr uint32_t kIntoPage = 13, kLastChunkRows = 10;
+  static_assert(kIntoPage + kLastChunkRows < kv::kPageTokens);
+  const uint32_t denseTokens = densePagesOf(*model.descriptor.capabilities.sparseKv) * kv::kPageTokens;
+  const uint32_t firstEnd = denseTokens + model::ExecutionLimits::prefillTokenBudget / 2;
+  const uint32_t tokens =
+      options.tokens.value_or(firstEnd + kIntoPage + model::ExecutionLimits::prefillTokenBudget + kLastChunkRows);
+  const uint32_t lanePages = (tokens + kDecodeTokens) / kv::kPageTokens + 2;
+  SpillRuntime spill(backend, model, operators, admission, format, stateFormat, options, lanePages);
+  model::Runtime &runtime = spill.runtime();
+  // Each prompt's commands: the first, then the runtime's groups, at least
+  // one of them past pages that spilled.
+  std::array<std::vector<uint32_t>, 4> ends;
+  for (uint32_t index = 0; index < ends.size(); ++index) {
+    std::vector<uint32_t> &commands = ends[index];
+    commands = {std::min(tokens, firstEnd + (index < 2 ? kIntoPage : 0))};
+    while (commands.back() < tokens) commands.push_back(std::min(tokens, commands.back() + runtime.prefillGroupRows()));
+    require(commands.size() > 1 &&
+                commands[commands.size() - 2] / kv::kPageTokens > spill.densePages() + options.windowPages,
+            "--spill-tokens leaves no prefill command whose history spilled");
+  }
+  std::array<std::vector<uint32_t>, 4> prompts;
+  for (uint32_t index = 0; index < prompts.size(); ++index) {
+    std::mt19937 random(1000 + index);
+    std::uniform_int_distribution<uint32_t> distribution(1000, 150000);
+    prompts[index].resize(tokens);
+    for (uint32_t &token : prompts[index]) token = distribution(random);
+  }
+  const auto run = [&](uint64_t firstId, std::array<bool, 4> spills) {
+    std::array<SpillRequest, 4> requests;
+    SpillRecord record;
+    const auto took = [&] { record.commandBuffers.push_back(BackendInstrumentation::lastCommandBuffers(backend)); };
+    for (uint32_t index = 0; index < requests.size(); ++index) {
+      requests[index] = {.id = firstId + index, .stateLane = index, .spills = spills[index], .prompt = prompts[index]};
+      spill.begin(requests[index]);
+      std::vector<SpillStep> steps;
+      for (const uint32_t end : ends[index]) {
+        steps.push_back(spill.prefill(requests[index], end));
+        took();
+      }
+      record.steps.push_back(std::move(steps));
+    }
+    const auto cycles = [&](std::vector<SpillRequest *> lanes, uint32_t count) {
+      for (uint32_t cycle = 0; cycle < count; ++cycle) {
+        record.steps.push_back(spill.decode(lanes));
+        took();
+      }
+    };
+    cycles({&requests[0]}, 1);
+    cycles({&requests[0], &requests[1], &requests[2], &requests[3]}, kCycles);
+    spill.end(requests[1]);
+    spill.end(requests[3]);
+    cycles({&requests[0], &requests[2]}, kCycles);
+    spill.end(requests[2]);
+    cycles({&requests[0]}, kCycles);
+    spill.end(requests[0]);
+    return record;
+  };
+  const SpillRecord resident = run(4001, {false, false, false, false});
+  const model::KvBlockCacheStats residentReads = spill.blockCache().stats();
+  require(!residentReads.reads.resolves && !spill.historyStream().stats().commands,
+          "a run whose pages all hold their K/V read spilled K/V");
+  const SpillRecord spilled = run(4011, {true, false, true, false});
+  for (size_t step = 0; step < resident.steps.size(); ++step)
+    require(spilled.steps[step] == resident.steps[step], "a run whose K/V spilled gave other tokens or logits than one "
+                                                         "whose K/V stayed, at step " + std::to_string(step));
+  const model::KvBlockCacheStats reads = spill.blockCache().stats();
+  const model::KvHistoryStreamStats history = spill.historyStream().stats();
+  require(reads.reads.resolves && reads.reads.hits && reads.reads.misses && reads.reads.paged < reads.reads.entries &&
+              history.commands && history.pages,
+          "a run whose K/V spilled did not read it back");
+  // A decode's reads add a resolve an attention layer, a prefill's a
+  // stream's start and hand-off: steps of a command buffer, two when the
+  // GPU stays awake.
+  const uint64_t readBuffers = 2ull * model.targetKvLayout(format).attentionLayers;
+  for (size_t command = 0; command < resident.commandBuffers.size(); ++command)
+    require(spilled.commandBuffers[command] <= resident.commandBuffers[command] + readBuffers,
+            "a command's reads of spilled K/V took more than two command buffers an attention layer");
+  std::cout << "spilled_kv_matches_resident=PASS tokens=" << tokens << " window_pages=" << options.windowPages
+            << " buffers=" << options.buffers << " streamed_commands=" << history.commands
+            << " streamed_pages=" << history.pages << " resolves=" << reads.reads.resolves
+            << " hits=" << reads.reads.hits << " misses=" << reads.reads.misses
+            << " command_buffers=" << std::ranges::max(spilled.commandBuffers) << '\n';
+
+  // With every request ended, an idle reclaim gives back, after the pooled
+  // buffers, the staging and then the hot block cache above its floors.
+  while (runtime.reclaimIdleState(true, IdleMemory::Buffers)) {
+  }
+  require(history.stagingBytes && reads.bytes > reads.floorBytes &&
+              runtime.reclaimIdleState(true, IdleMemory::BuffersThenCaches) == history.stagingBytes &&
+              runtime.reclaimIdleState(true, IdleMemory::BuffersThenCaches) == reads.bytes - reads.floorBytes &&
+              !runtime.reclaimIdleState(true, IdleMemory::BuffersThenCaches),
+          "an idle reclaim did not give back the staging, then the hot block cache above its floors");
+
+  // A copy that cannot be read fails the command that reads it, for its lane
+  // alone and as no failure of the model, and nothing of the lane is
+  // committed: a retry gives the step it gives without the failure.
+  SpillRequest streamed{.id = 4021, .stateLane = 0, .spills = true, .prompt = prompts[0]};
+  SpillRequest healthy{.id = 4022, .stateLane = 1, .spills = false, .prompt = prompts[1]};
+  spill.begin(streamed);
+  spill.begin(healthy);
+  require(spill.prefill(streamed, ends[0][0]) == resident.steps[0][0], "a spilled prompt's first command changed");
+  for (size_t command = 1; command < ends[0].size(); ++command) {
+    if (streamed.holdsIndexPages()) {
+      spill.requireReadsRunAgain(streamed, ends[0][command]);
+      // The history's last spilled page.
+      size_t unreadable = streamed.pages.size() - 1;
+      while (!streamed.copies[unreadable]) --unreadable;
+      streamed.copies[unreadable]->failAll = true;
+      static_cast<void>(spill.prefill(streamed, ends[0][command]));
+      const ModelStepResult &failed = spill.lastResults().front();
+      require(failed.failure.empty() && failed.outputTokens.empty() && !failed.firstToken &&
+                  failed.unreadableKvBlocks == std::vector<uint64_t>{streamed.sources[unreadable].block} &&
+                  streamed.committed == ends[0][command - 1],
+              "a prefill command whose history could not be read did not fail its lane alone, committing nothing");
+      streamed.copies[unreadable]->failAll = false;
+      // The staging is the prompt's while it goes on: an idle reclaim, as
+      // one that funds the staging's growth, leaves it.
+      const uint64_t staging = spill.historyStream().stats().stagingBytes;
+      while (runtime.reclaimIdleState(true, IdleMemory::BuffersThenCaches)) {
+      }
+      require(staging && spill.historyStream().stats().stagingBytes == staging,
+              "an idle reclaim took the staging of a prompt that streams");
+    }
+    require(spill.prefill(streamed, ends[0][command]) == resident.steps[0][command],
+            "a prefill command retried after its history could not be read gave another step");
+  }
+  // Once the prompt ended, its staging is the first idle cache to go.
+  const uint64_t staging = spill.historyStream().stats().stagingBytes;
+  while (runtime.reclaimIdleState(true, IdleMemory::Buffers)) {
+  }
+  require(staging && runtime.reclaimIdleState(true, IdleMemory::BuffersThenCaches) == staging,
+          "an idle reclaim kept the staging of a prompt that ended");
+  for (const uint32_t end : ends[1]) static_cast<void>(spill.prefill(healthy, end));
+  for (const auto &copy : streamed.copies)
+    if (copy) copy->failAll = true;
+  const uint64_t committedTokens = spill.states().metadata(streamed.stateLane).lengths.targetTokens;
+  const std::vector<SpillStep> mixed = spill.decode(std::array{&streamed, &healthy});
+  const std::vector<ModelStepResult> &decoded = spill.lastResults();
+  require(!decoded[0].unreadableKvBlocks.empty() && decoded[0].failure.empty() && decoded[0].outputTokens.empty() &&
+              spill.states().metadata(streamed.stateLane).lengths.targetTokens == committedTokens &&
+              decoded[1].unreadableKvBlocks.empty() && decoded[1].failure.empty() && !mixed[1].outputTokens.empty(),
+          "a decode lane whose blocks could not be read did not fail alone, keeping its state");
+  for (const auto &copy : streamed.copies)
+    if (copy) copy->failAll = false;
+  require(spill.decode(std::array{&streamed}) == resident.steps[prompts.size()],
+          "a decode lane retried after its blocks could not be read gave another step");
+  spill.end(streamed);
+  spill.end(healthy);
+  require(backend.healthy(), "reads of spilled K/V that failed made the backend unhealthy");
+
+  // Rows that read their page table read only Full pages
+  // (SparseKvShape::denseHistoryTokens), so a verify over Index pages
+  // without block lists is a broken invariant.
+  SpillRequest dense{.id = 4031, .stateLane = 0, .spills = false,
+                     .prompt = std::vector(prompts[0].begin(), prompts[0].begin() + denseTokens / 2)};
+  spill.begin(dense);
+  static_cast<void>(spill.prefill(dense, static_cast<uint32_t>(dense.prompt.size())));
+  spill.spillPages(dense, 1, 2);
+  rejects([&] { static_cast<void>(spill.decode(std::array{&dense})); }, "attends without block lists",
+          "a verify over Index pages attended without block lists");
+  spill.end(dense);
+  std::cout << "spilled_kv_failures=PASS\n";
+}
+
 void warmupEos(model::RuntimeContext context, model::LoadedModel &model) {
   uint32_t prefillStop = 0;
   uint32_t decodeStop = 0;
@@ -2654,7 +3216,8 @@ void warmupEos(model::RuntimeContext context, model::LoadedModel &model) {
 
 int main(int argc, char **argv) {
   try {
-    bool imagesOnly = false, warmupEosOnly = false, prefillGroupsOnly = false;
+    bool imagesOnly = false, warmupEosOnly = false, prefillGroupsOnly = false, spillOnly = false;
+    SpillOptions spill;
     kv::Format format = kv::Format::Int8;
     ops::GdnStateFormat stateFormat = ops::GdnStateFormat::Float32;
     std::optional<double> givenAneFfnShare;
@@ -2670,17 +3233,35 @@ int main(int argc, char **argv) {
     // routed experts stream from the file into an arena of SIZE, as splash
     // serve's --expert-memory does. --prefill-groups-only: a prefill group
     // against its chunks' commands (requirePrefillGroupMatchesItsChunks),
-    // then stop.
+    // then stop. A block-sparse target's K/V that spilled reads what its
+    // pages held (requireSpilledKvMatchesResident), first, on a runtime of
+    // its own: --spill-tokens N prompts (by default two commands, the
+    // second of two chunks), --spill-window PAGES (1), --spill-buffers 1|2
+    // (1); --spill-only stops after it.
     model::ModelLoadOptions loadOptions;
     if (argc < 3)
       fail("usage: model-runtime-oracle METALLIB MODEL_ROOT [--kv-format int8|bf16] [--state-format fp32|bf16] "
            "[--ane-ffn-share SHARE] [--ane-ffn-fault EVALUATION] [--ple-memory SIZE] "
-           "[--expert-memory SIZE] [--yarn-factor FACTOR] [--images-only | --warmup-eos-only | --prefill-groups-only]");
+           "[--expert-memory SIZE] [--yarn-factor FACTOR] [--spill-tokens N] [--spill-window PAGES] "
+           "[--spill-buffers 1|2] [--images-only | --warmup-eos-only | --prefill-groups-only | --spill-only]");
     for (int i = 3; i < argc; ++i) {
       const std::string_view option(argv[i]);
       if (option == "--images-only") imagesOnly = true;
       else if (option == "--warmup-eos-only") warmupEosOnly = true;
       else if (option == "--prefill-groups-only") prefillGroupsOnly = true;
+      else if (option == "--spill-only") spillOnly = true;
+      else if ((option == "--spill-tokens" || option == "--spill-window" || option == "--spill-buffers") &&
+               i + 1 < argc) {
+        const char *value = argv[++i];
+        char *end = nullptr;
+        const unsigned long parsed = std::strtoul(value, &end, 10);
+        if (end == value || *end || !parsed || parsed > kv::kMaximumLogicalTokens ||
+            (option == "--spill-buffers" && parsed > 2))
+          fail("invalid " + std::string(option));
+        if (option == "--spill-tokens") spill.tokens = static_cast<uint32_t>(parsed);
+        else if (option == "--spill-window") spill.windowPages = static_cast<uint32_t>(parsed);
+        else spill.buffers = static_cast<uint32_t>(parsed);
+      }
       else if (option == "--kv-format" && i + 1 < argc) {
         const std::string_view value(argv[++i]);
         if (value != "int8" && value != "bf16") fail("invalid KV format");
@@ -2857,6 +3438,14 @@ int main(int argc, char **argv) {
               backend.memoryStats().allocatedBytes - before;
           return {};
         };
+    if (model.descriptor.capabilities.sparseKv && (spillOnly || !(imagesOnly || warmupEosOnly || prefillGroupsOnly)))
+      requireSpilledKvMatchesResident(backend, model, operators, governed, format, stateFormat, spill);
+    if (spillOnly) {
+      require(model.descriptor.capabilities.sparseKv.has_value(), "--spill-only needs a block-sparse target");
+      std::cout << "PASS model-runtime-oracle scope=spill-only model=" << model.name()
+                << " (K/V that spilled reads what its pages held)\n";
+      return 0;
+    }
     kv::PageStorage pages(backend, governed, kvLayout, pageCount, extentPages);
     // The oracle's requests address pages directly, without a pool, so every
     // extent is allocated up front.
