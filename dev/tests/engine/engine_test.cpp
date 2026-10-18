@@ -11282,10 +11282,10 @@ void testReplayPointRecyclesAnOlderPointInUse() {
           "the newer replay point did not recycle the older point in use");
 }
 
-// The pressure warning's speculative shrink keeps the point it kept before
-// states could be in use: a request that just finished outranks an older
-// running request's replay point, which goes, after the older ordinary
-// state, like any cache the shrink may take.
+// A shrink under the pressure warning that a request waits for keeps the
+// point it kept before states could be in use: a request that just finished
+// outranks an older running request's replay point, which goes, after the
+// older ordinary state, like any cache the shrink may take.
 void testWarningShrinkKeepsTheFinishedPoint() {
   test::TestKvStorage storage(64, 4096, 4);
   KvPool pool(storage, 0);
@@ -11312,8 +11312,9 @@ void testWarningShrinkKeepsTheFinishedPoint() {
               resources.snapshot().stateCache.inUse == 1,
           "the fixture did not cache three replay points, one in use");
 
-  static_cast<void>(engine.reclaimMemory(
-      {.targetBytes = std::numeric_limits<uint64_t>::max(), .keepResumePoint = true}));
+  static_cast<void>(engine.reclaimMemory({.targetBytes = std::numeric_limits<uint64_t>::max(),
+                                          .keepResumePoint = true,
+                                          .upTo = ReclaimClass::InUse}));
   const auto cachedTokens = [&](uint32_t token) {
     std::vector<uint32_t> next(65, token);
     next.resize(80, 9);
@@ -11455,56 +11456,65 @@ void testLaneThatWouldYieldTakesNothingInUse() {
 }
 
 // A paced pass that nothing waits for takes nothing in use, whatever its
-// target: the replay point a running request has published stays, the point
-// its follow-up resumes from once it ends, beside the resume point the pass
-// keeps. What the pass would free there goes back to that request's growth,
-// which the host's margin does not hold back.
+// target, under macOS's warning too: the replay point a running request has
+// published stays, the point its follow-up resumes from once it ends, beside
+// the resume point the pass keeps. What the pass would free there goes back
+// to that request's growth, which neither the host's margin nor the warning
+// holds back.
 void testPacedPassKeepsInServiceReplayPoint() {
-  test::TestKvStorage storage(64, 4096, 4);
-  KvPool pool(storage, 0);
-  engine::Cache resources(pool, nullptr, nullptr);
-  Executor executor;
-  Events events;
-  engine::Engine engine(test::engineConfig(), resources, executor, events);
-  guardReleases(storage, engine);
-  double now = 1;
-  // Each turn is the one before, its reply and a new message.
-  std::vector<uint32_t> prompt(65);
-  std::iota(prompt.begin(), prompt.end(), 1);
-  const auto follow = [&](uint64_t id, size_t tokens) {
-    prompt.insert(prompt.end(), events.outputs[id].begin(), events.outputs[id].end());
-    prompt.resize(tokens, static_cast<uint32_t>(id) + 1000);
-  };
-  engine.submit(request(1, prompt));
-  tickUntil(engine, now, [&] { return idle(engine); }, "the first turn did not finish");
-  follow(1, 140);
-  executor.decodeFinishes = false;
-  auto running = request(2, prompt);
-  running.maxNewTokens = 1000;
-  engine.submit(std::move(running));
-  tickUntil(engine, now, [&] { return events.outputs[2].size() >= 2; },
-            "the second turn did not decode");
-  require(events.starts.back() == 64 && resources.snapshot().stateCache.entries == 2 &&
-              resources.snapshot().stateCache.inUse == 1,
-          "the second turn did not restore the first turn's point and publish its own");
+  // The host is short of the whole warning margin, or has room to spare
+  // while macOS warns.
+  enum class Host { Short, Warned };
+  for (const Host condition : {Host::Short, Host::Warned}) {
+    test::TestKvStorage storage(64, 4096, 4);
+    KvPool pool(storage, 0);
+    engine::Cache resources(pool, nullptr, nullptr);
+    Executor executor;
+    Events events;
+    engine::Engine engine(test::engineConfig(), resources, executor, events);
+    guardReleases(storage, engine);
+    double now = 1;
+    // Each turn is the one before, its reply and a new message.
+    std::vector<uint32_t> prompt(65);
+    std::iota(prompt.begin(), prompt.end(), 1);
+    const auto follow = [&](uint64_t id, size_t tokens) {
+      prompt.insert(prompt.end(), events.outputs[id].begin(), events.outputs[id].end());
+      prompt.resize(tokens, static_cast<uint32_t>(id) + 1000);
+    };
+    engine.submit(request(1, prompt));
+    tickUntil(engine, now, [&] { return idle(engine); }, "the first turn did not finish");
+    follow(1, 140);
+    executor.decodeFinishes = false;
+    auto running = request(2, prompt);
+    running.maxNewTokens = 1000;
+    engine.submit(std::move(running));
+    tickUntil(engine, now, [&] { return events.outputs[2].size() >= 2; },
+              "the second turn did not decode");
+    require(events.starts.back() == 64 && resources.snapshot().stateCache.entries == 2 &&
+                resources.snapshot().stateCache.inUse == 1,
+            "the second turn did not restore the first turn's point and publish its own");
 
-  // The host is short of the whole warning margin, and nothing waits.
-  MemoryGovernorSnapshot host;
-  host.pressure = MemoryPressure::Warning;
-  host.hostMeasurementValid = true;
-  MemoryPressurePolicy policy;
-  static_cast<void>(engine.reclaimMemory(policy.update(host, now, false).value()));
-  require(resources.snapshot().stateCache.entries == 2 &&
-              resources.snapshot().stateCache.inUseEvictions == 0,
-          "a paced pass nothing waited for took what a running request uses");
+    MemoryGovernorSnapshot host;
+    host.pressure = MemoryPressure::Warning;
+    host.hostMeasurementValid = true;
+    if (condition == Host::Warned) {
+      host.systemPressure = MemoryPressure::Warning;
+      host.hostHeadroomBytes = 16ULL << 30;
+    }
+    MemoryPressurePolicy policy;
+    static_cast<void>(engine.reclaimMemory(policy.update(host, now, false).value()));
+    require(resources.snapshot().stateCache.entries == 2 &&
+                resources.snapshot().stateCache.inUseEvictions == 0,
+            "a paced pass nothing waited for took what a running request uses");
 
-  executor.decodeFinishes = true;
-  tickUntil(engine, now, [&] { return idle(engine); }, "the second turn did not finish");
-  follow(2, 220);
-  engine.submit(request(3, prompt));
-  tickUntil(engine, now, [&] { return idle(engine); }, "the third turn did not finish");
-  require(events.starts.back() == 128 && events.completedCount == 3 && events.failedCount == 0,
-          "the third turn did not resume from the replay point the second published");
+    executor.decodeFinishes = true;
+    tickUntil(engine, now, [&] { return idle(engine); }, "the second turn did not finish");
+    follow(2, 220);
+    engine.submit(request(3, prompt));
+    tickUntil(engine, now, [&] { return idle(engine); }, "the third turn did not finish");
+    require(events.starts.back() == 128 && events.completedCount == 3 && events.failedCount == 0,
+            "the third turn did not resume from the replay point the second published");
+  }
 }
 
 // The prompt's replay point is work of the request in service: once only

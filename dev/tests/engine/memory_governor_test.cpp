@@ -762,10 +762,10 @@ void testOptionalGrowthKeepsTheSpareReserve() {
 // macOS's warning asks caches to give memory back. While it lasts, growth
 // that no request in service needs stops whatever the host's headroom, and
 // the snapshot says so, while what a request in service needs still grows.
-// Every paced pass returns the warning margin's worth of cache, what is in
-// use last, and keeps the resume point, even for a waiting request, which
-// the warning holds back too; once the level is normal again, growth
-// resumes and no pass runs.
+// Every paced pass returns the warning margin's worth of cache and keeps the
+// resume point, even for a waiting request, which the warning holds back
+// too; only a pass a request waits for takes what is in use. Once the level
+// is normal again, growth resumes and no pass runs.
 void testSystemWarningGivesCacheBack() {
   test::metalStatistics() = {};
   test::metalStatistics().allocatedBytes = 12 * kGiB;
@@ -791,15 +791,17 @@ void testSystemWarningGivesCacheBack() {
   MemoryPressurePolicy policy;
   const auto first = policy.update(warned, 0.0, false);
   require(first && !first->critical && first->targetBytes == kHostWarningMarginBytes &&
-              first->keepResumePoint && first->upTo == ReclaimClass::InUse,
+              first->keepResumePoint && first->upTo == ReclaimClass::Ordinary,
           "a pass under macOS's warning did not return the warning margin's worth of cache, "
-          "keeping the resume point");
+          "keeping the resume point and what is in use");
   require(policy.update(warned, 500.0, false).value().targetBytes == 0 &&
               policy.update(warned, 1000.0, false).value().targetBytes == kHostWarningMarginBytes,
           "the passes under macOS's warning did not keep the pace");
   const auto waited = policy.update(warned, 2000.0, true);
-  require(waited && waited->targetBytes == kHostWarningMarginBytes && waited->keepResumePoint,
-          "a pass under macOS's warning dropped the resume point for a request it holds back");
+  require(waited && waited->targetBytes == kHostWarningMarginBytes && waited->keepResumePoint &&
+              waited->upTo == ReclaimClass::InUse,
+          "a pass under macOS's warning dropped the resume point for a request it holds back, "
+          "or kept what is in use from it");
 
   governor.setPressure(MemoryPressure::Normal);
   const MemoryGovernorSnapshot normal = governor.evaluate();
