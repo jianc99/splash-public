@@ -5,7 +5,6 @@
 
 #include <cstdint>
 #include <span>
-#include <stdexcept>
 #include <vector>
 
 namespace splash::test {
@@ -26,14 +25,13 @@ inline uint64_t publishBlocks(engine::Cache &cache, uint64_t requestId,
 // One round of what the engine does between commands to spill, with the
 // tier's IO done at once: starts writing the Spill requests' published pages
 // through (Cache::writeThrough), lands every write (TestKvTier::complete) and
-// moves the eligible pages to the index form (Cache::spillWritten). Returns
-// the writes it started; throws when the cache refused the move.
+// moves the eligible pages to the index form (Cache::spillWritten), as far
+// as the pool admits. Returns the writes it started.
 inline uint32_t spillRound(engine::Cache &cache, TestKvTier &tier) {
   const uint32_t written = cache.writeThrough();
   tier.complete();
   static_cast<void>(cache.pollTransfers());
-  if (!cache.spillWritten().granted())
-    throw std::runtime_error("the cache refused to spill the pages whose copies landed");
+  static_cast<void>(cache.spillWritten());
   return written;
 }
 

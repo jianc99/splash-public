@@ -4289,17 +4289,18 @@ void testPublicationReleasesTheExtentItEmpties() {
 
 // Spilling. A cache whose requests may spill: its pool's extents hold four
 // pages, 100 bytes a Full page and 10 an Index page, one extent of each form
-// allocated from the start (the Index one the runway spilling draws on), and
-// its tier's slots of 100 bytes draw on a quota of `slots` of them. The dense
-// history and the tail window are a page each unless a test says otherwise.
+// allocated from the start (the Index one the runway spilling draws on, as
+// the cache's first spill pass allocates it), and its tier's slots of 100
+// bytes draw on a quota of `slots` of them. The dense history and the tail
+// window are a page each unless a test says otherwise.
 struct Spilling {
   explicit Spilling(CacheSpillPolicy policy = {1, 1}, uint32_t slots = 64)
       : budget(std::make_shared<model::DiskBudget>(uint64_t{slots} * 100)),
         cache(pool, &tier, budget, policy) {
     tier.budget = budget;
     tier.transferLimit = 1024;
-    require(static_cast<bool>(pool.fillRunway(kv::PageForm::Index)),
-            "the Index runway was not allocated");
+    require(cache.spillWritten().granted() && pool.freePageCount(kv::PageForm::Index) == 4,
+            "the cache did not allocate the Index runway");
   }
 
   // `pages` whole pages of tokens from `first` on, and one token past them.
@@ -4361,9 +4362,10 @@ struct Spilling {
 // A Spill request's published pages are written through, and once their
 // copies have landed those past the dense history and the tail window move
 // to the index form, where their K/V lives in the copy alone: their Full
-// pages free, the Index runway takes their index, and the request's next
-// cut names each of them with its copy. The quota holds the slots of the
-// blocks it holds; its commitment moved into them as the writes drew on it.
+// pages free, the Index runway takes their index and is refilled, and the
+// request's next cut names each of them with its copy. The quota holds the
+// slots of the blocks it holds; its commitment moved into them as the
+// writes drew on it.
 void testSpillMovesLandedPagesToTheIndexForm() {
   Spilling spill;
   const std::vector<uint32_t> prompt = Spilling::prompt(1000, 6);
@@ -4387,9 +4389,10 @@ void testSpillMovesLandedPagesToTheIndexForm() {
   require(spill.cache.spillWritten().granted() &&
               spill.spilled(1) == std::vector<bool>{false, true, true, true, true, false, false} &&
               spill.pool.freePageCount() == free + 4 &&
-              spill.pool.freePageCount(kv::PageForm::Index) == 0 &&
-              spill.storage.allocationAttempts == allocations,
-          "the landed pages past the dense history and the window did not spill into the runway");
+              spill.pool.freePageCount(kv::PageForm::Index) == 4 &&
+              spill.storage.allocationAttempts == allocations + 1,
+          "the landed pages past the dense history and the window did not spill into the runway, or it "
+          "was not refilled");
   const KvSpillSnapshot spilled = spill.cache.spillSnapshot();
   require(spilled.spilledPages == 4 && spilled.spilledBytes == 400 && spilled.spillMoves == 4 &&
               spilled.writeThroughPages == 6 && spilled.heldBytes == 600 && spilled.committedBytes == 0 &&
@@ -4411,15 +4414,18 @@ void testSpillMovesLandedPagesToTheIndexForm() {
 // At the memory wall spilling draws on the Index runway alone: a page that
 // lands spills without an allocation and its Full page serves the request's
 // growth, until the runway is spent; the next spill asks for an extent of
-// the index form, which the wall refuses, and leaves its page Full. So under
-// the engine's limit and under host pressure alike.
+// the index form, which the wall refuses, and leaves its page Full. Once
+// growth is admitted again that page spills and the runway is refilled, so
+// that the next time the wall stands the request spills through it again.
+// So under the engine's limit and under host pressure alike.
 void testSpillAtTheMemoryWall() {
   for (const auto failure :
        {metal::AllocationFailure::EngineBudget, metal::AllocationFailure::HostPressure}) {
     Spilling spill;
     spill.storage.growthBlocked = true;
     spill.storage.allocationFailure = failure;
-    const std::vector<uint32_t> prompt = Spilling::prompt(1000, 8);
+    const std::vector<uint32_t> prompt = Spilling::prompt(1000, 12);
+    const uint32_t allocated = spill.storage.allocatedPages();
     // The Full runway holds three pages and the open one. Each page that
     // spills frees the one the next grows into.
     spill.start(1, prompt, 3);
@@ -4429,7 +4435,7 @@ void testSpillAtTheMemoryWall() {
       require(test::spillRound(spill.cache, spill.tier) == 1, "a page was not written through");
     }
     require(spill.spilled(1) == std::vector<bool>{false, true, true, true, true, false, false} &&
-                spill.storage.allocationAttempts == 2,
+                spill.storage.allocatedPages() == allocated,
             "spilling at the wall allocated, or did not free the pages the request grew into");
     spill.grow(1, prompt, 7);
     static_cast<void>(spill.cache.writeThrough());
@@ -4440,6 +4446,20 @@ void testSpillAtTheMemoryWall() {
                 refused.additionalPages == 1 && refused.allocationFailure == failure &&
                 !spill.spilled(1)[5],
             "a spill past the runway did not ask for an Index extent, or moved its page anyway");
+    spill.storage.growthBlocked = false;
+    require(spill.cache.spillWritten().granted() && spill.spilled(1)[5] &&
+                spill.pool.freePageCount(kv::PageForm::Index) >= 4,
+            "once growth was admitted the page did not spill, or the runway was not refilled");
+    spill.storage.growthBlocked = true;
+    const uint32_t refilled = spill.storage.allocatedPages();
+    for (uint32_t pages = 8; pages <= 11; ++pages) {
+      spill.grow(1, prompt, pages);
+      static_cast<void>(test::spillRound(spill.cache, spill.tier));
+    }
+    std::vector<bool> spilled(12, true);
+    spilled[0] = spilled[10] = spilled[11] = false;
+    require(spill.spilled(1) == spilled && spill.storage.allocatedPages() == refilled,
+            "at the wall once more the request did not spill through the refilled runway");
     spill.cache.checkInvariants();
     spill.cache.endRequest(1);
   }
@@ -4447,7 +4467,8 @@ void testSpillAtTheMemoryWall() {
 
 // A Full shortfall reaches the Full pages of an idle spilled chain: leaves of
 // either form go oldest first, so its Index leaves go before the dense
-// history above them, and the empty Index extent stays as the runway.
+// history above them; the Index extent they empty goes, and the runway
+// stays.
 void testFullReclaimReachesAnIdleSpilledChain() {
   Spilling spill;
   const std::vector<uint32_t> prompt = Spilling::prompt(1000, 6);
@@ -4463,7 +4484,7 @@ void testFullReclaimReachesAnIdleSpilledChain() {
           "the Full shortfall did not reach the idle chain's dense history");
   const CacheSnapshot after = spill.cache.snapshot();
   require(after.kvTier.diskBlocks == 6 && spill.cache.spillSnapshot().spilledPages == 0 &&
-              spill.pool.freePageCount(kv::PageForm::Index) == 4 && spill.storage.releasedExtents == 0,
+              spill.pool.freePageCount(kv::PageForm::Index) == 4 && spill.storage.releasedExtents == 1,
           "the idle chain did not leave RAM for its copies, or its runway went");
   spill.cache.checkInvariants();
   spill.cache.endRequest(2);
@@ -4483,9 +4504,9 @@ void testFullShortfallReleasesEmptyIndexExtents() {
             "an idle spilled leaf did not go");
   const CacheReclaimResult released =
       spill.cache.reclaimForPages(1, CacheReclaimMode::KeepExtents, ReclaimClass::InUse);
-  require(released.madeProgress && released.reclaimedBytes == 40 && spill.storage.releasedExtents == 1 &&
+  require(released.madeProgress && released.reclaimedBytes == 80 && spill.storage.releasedExtents == 2 &&
               spill.pool.freePageCount(kv::PageForm::Index) == 4,
-          "a Full shortfall did not release the empty Index extent past the runway first");
+          "a Full shortfall did not release the empty Index extents past the runway first");
 }
 
 // The idle pages a state in use restores through are out of an Ordinary
@@ -4573,8 +4594,8 @@ void testWritesThatFreeNothingHoldNothingBack() {
 // A Resident request whose growth is denied converts to Spill: it commits
 // quota, its published pages start to be written, and the admission run
 // again waits for them, without allocating anything, until they land and
-// spill. The tier, the write budget or the quota can refuse it, changing
-// nothing.
+// spill through the runway, whose refill the wall refuses. The tier, the
+// write budget or the quota can refuse it, changing nothing.
 void testConversionWaitsForItsPagesToSpill() {
   Spilling spill;
   const std::vector<uint32_t> prompt = Spilling::prompt(1000, 9);
@@ -4597,11 +4618,40 @@ void testConversionWaitsForItsPagesToSpill() {
           "the converted request did not wait for its pages to spill");
   spill.tier.complete();
   static_cast<void>(spill.cache.pollTransfers());
-  require(spill.cache.spillWritten().granted() && spill.cache.ensureTokens(1, tokens).granted(),
+  const TokenAdmission runway = spill.cache.spillWritten();
+  require(runway.failure == TokenAdmissionFailure::Denied && runway.form == kv::PageForm::Index &&
+              spill.cache.spillSnapshot().spilledPages == 4 && spill.cache.ensureTokens(1, tokens).granted(),
           "the converted request did not grow into the pages its spill freed");
   spill.cache.checkInvariants();
   spill.cache.endRequest(1);
   require(spill.budget->committedBytes() == 0, "the converted request kept its commitment");
+}
+
+// Spills while memory is available use the runway up, and the cache refills
+// it: a Resident request that converts at the memory wall afterwards waits
+// for its writes, whose pages the runway takes, instead of being refused.
+void testConversionAtTheWallFindsTheRunway() {
+  Spilling spill;
+  spill.start(1, Spilling::prompt(1000, 6), 6);
+  static_cast<void>(test::spillRound(spill.cache, spill.tier));
+  require(spill.cache.spillSnapshot().spilledPages == 4 && spill.pool.freePageCount(kv::PageForm::Index) == 4,
+          "the runway the first spill took was not refilled");
+  spill.start(2, Spilling::prompt(5000, 5), 4, KvMode::Resident);
+  spill.storage.growthBlocked = true;
+  const uint64_t tokens = 5 * KvCache::pageTokens + 1;
+  require(spill.cache.ensureTokens(2, tokens).failure == TokenAdmissionFailure::Denied,
+          "the fixture's growth was not denied");
+  require(spill.cache.convertToSpill(2, 5) && spill.cache.pendingPages(kv::PageForm::Full) == 2 &&
+              spill.cache.ensureTokens(2, tokens).failure == TokenAdmissionFailure::Pending,
+          "the request that converted at the wall did not wait for its pages to spill");
+  spill.tier.complete();
+  static_cast<void>(spill.cache.pollTransfers());
+  static_cast<void>(spill.cache.spillWritten());
+  require(spill.cache.spillSnapshot().spilledPages == 6 && spill.cache.ensureTokens(2, tokens).granted(),
+          "the converted request's pages did not spill through the runway");
+  spill.cache.checkInvariants();
+  spill.cache.endRequest(2);
+  spill.cache.endRequest(1);
 }
 
 // A Resident request moves a spilled block back to a Full page and restores
@@ -5050,6 +5100,7 @@ int main() {
     testPendingPagesCountWritesThatSpill();
     testWritesThatFreeNothingHoldNothingBack();
     testConversionWaitsForItsPagesToSpill();
+    testConversionAtTheWallFindsTheRunway();
     testUnspillOnlyAsTheOnlyHolder();
     testWritersMoveOntoPagesBeingWritten();
     testQuotaGivesUpOnlyCopiesNothingReads();

@@ -78,7 +78,6 @@ public:
     tier_.transferLimit = 64;
     tier_.writeLimits = {8, 4, 8};
     storage_.budgetPages = 96;
-    require(static_cast<bool>(pool_.fillRunway(kv::PageForm::Index)), "the Index runway was not allocated");
     for (uint32_t base = 0; base < bases_.size(); ++base) {
       bases_[base].resize(kMaximumPages * KvCache::pageTokens + 1);
       for (uint32_t row = 0; row < bases_[base].size(); ++row)
