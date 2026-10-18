@@ -801,7 +801,6 @@ void testPointsWaitForTheTier() {
           "a point was kept waiting for a KV file that takes no writes");
 }
 
-
 // A Spill request's pages are written through with the labels a persistent
 // tier keeps, and stay copies of its restore point: making the point durable
 // writes only its state, and the next process takes the point back whole.
@@ -829,6 +828,7 @@ void testWriteThroughCopiesAreRestorePoints() {
   require(adoption.blocks == 4 && adoption.states == 1 && adoption.dropped == 0,
           "the next process did not take the written-through point back whole");
 }
+
 } // namespace
 
 int main() {
