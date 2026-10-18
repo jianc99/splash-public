@@ -571,7 +571,7 @@ void testNewPagesTheWorkDoesNotFillComeCleared() {
   require(cache.ensureTokens(1, 64).granted() && storage.cleared.empty(),
           "a target at a page boundary cleared a page");
   require(cache.ensureTokens(1, 70).granted(), "the tail page was not admitted");
-  const PageTableView table = cache.pageTable(1);
+  const PageTableState table = cache.pageTable(1);
   require(table.pages.size() == 3 &&
               storage.cleared == std::vector<uint32_t>{table.pages[2]} &&
               storage.content[table.pages[2]] == 0 &&
@@ -582,7 +582,7 @@ void testNewPagesTheWorkDoesNotFillComeCleared() {
   // A resumed lane takes back pages past where its replay ends.
   cache.beginRequest(2);
   require(cache.ensureTokens(2, 160, 70).granted(), "the resumed pages were not admitted");
-  const PageTableView resumed = cache.pageTable(2);
+  const PageTableState resumed = cache.pageTable(2);
   require(resumed.pages.size() == 5 &&
               storage.cleared == std::vector<uint32_t>{table.pages[2], resumed.pages[2],
                                                        resumed.pages[3], resumed.pages[4]} &&
@@ -2990,7 +2990,7 @@ struct ExtentFixture {
       cache.beginRequest(request);
       require(admitTokens(cache, request, 96).granted(),
               "extent fixture KV pages were not acquired");
-      const PageTableView table = cache.pageTable(request);
+      const PageTableState table = cache.pageTable(request);
       for (uint32_t block = 0; block < 3; ++block) {
         require(table.pages[block] == 3 * prompt + block,
                 "extent fixture pages are not laid out in order");
@@ -3050,7 +3050,7 @@ void testCompactionReturnsFreePagesBeforeEvicting() {
               cache.snapshot().pool.pagesAllocated == 8 &&
               cache.snapshot().pool.extentCompactions == 1,
           "scattered free pages were not returned before an eviction");
-  const PageTableView table = cache.pageTable(4);
+  const PageTableState table = cache.pageTable(4);
   require(table.revision == revision + 1 && table.firstChanged == 0 &&
               table.pages[0] == 9 && table.pages[1] == 4 && table.pages[2] == 5 &&
               fixture.storage.content[9] == ExtentFixture::content(1, 0),
@@ -3144,7 +3144,7 @@ void testCompactionFollowsOnlyTheMovedBlocks() {
   cache.beginRequest(4);
   require(lookup.state && admitRestore(cache, 4, lookup).granted(),
           "the third prompt was not restored");
-  const PageTableView table = cache.pageTable(4);
+  const PageTableState table = cache.pageTable(4);
   require(table.pages[0] == 6 && table.pages[1] == 7 && table.pages[2] == 4,
           "the third prompt's leaf is not where it moved last");
   for (uint32_t block = 0; block < 3; ++block) {
@@ -3201,7 +3201,7 @@ void testEvictAllGathersWhatRequestsHold() {
               fixture.storage.copies[0].to / 4 == 1,
           "an evict-all pass moved a page it then evicted, or left extents");
   const CacheSnapshot stats = cache.snapshot();
-  const PageTableView table = cache.pageTable(4);
+  const PageTableState table = cache.pageTable(4);
   require(stats.pool.pagesAllocated == 4 && stats.pool.pagesFree == 1 &&
               stats.pool.pagesPrefix == 3 && stats.stateCache.entries == 0 &&
               table.pages[0] / 4 == 1 && table.pages[1] == 4 && table.pages[2] == 5 &&
@@ -3284,7 +3284,7 @@ void testCompactionLeavesAPageBeingRestored() {
   lookup = cache.lookup(kept, {});
   cache.beginRequest(5);
   require(lookup.state && admitRestore(cache, 5, lookup).granted(), "kept prompt was lost");
-  const PageTableView table = cache.pageTable(5);
+  const PageTableState table = cache.pageTable(5);
   require(table.pages[0] == 0 && table.pages[1] == 1 && table.pages[2] == 2 &&
               storage.content[0] == 40 && storage.content[1] == 41 && storage.content[2] == 42,
           "the kept prompt's blocks did not follow their pages");
@@ -3348,7 +3348,7 @@ void testCompactionLeavesAPageBeingDemoted() {
   auto lookup = cache.lookup(chained, {});
   cache.beginRequest(3);
   require(lookup.state && admitRestore(cache, 3, lookup).granted(), "chain was lost");
-  const PageTableView table = cache.pageTable(3);
+  const PageTableState table = cache.pageTable(3);
   require(table.pages[0] == 5 && table.pages[1] == 6 && table.pages[2] == 7 &&
               table.pages[3] == 4 && storage.content[5] == 20 && storage.content[6] == 21 &&
               storage.content[7] == 22,

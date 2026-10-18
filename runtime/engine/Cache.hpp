@@ -187,11 +187,21 @@ struct TokenAdmission final {
   }
 };
 
+// The page list a command of a request reads (Cache::cutPageTable).
 struct PageTableView final {
   std::span<const uint32_t> pages;
   // Where each page reads its K/V (ModelBatchItem::pageSources); null while
   // none holds only its index.
   std::shared_ptr<const model::KvPageSources> sources;
+  uint64_t revision = 0;
+  uint32_t firstChanged = 0;
+};
+
+// A request's page list as it is now, with the revision and first change its
+// next cut gives it (Cache::pageTable): what the engine and tests inspect,
+// never what a command reads.
+struct PageTableState final {
+  std::span<const uint32_t> pages;
   uint64_t revision = 0;
   uint32_t firstChanged = 0;
 };
@@ -440,8 +450,8 @@ public:
   ensureTokens(uint64_t requestId, uint64_t tokenCount,
                uint64_t writtenTokens = std::numeric_limits<uint64_t>::max());
   // The request's page list as it is now, at the revision and first change
-  // its next cut gives it, and with its last cut's sources.
-  [[nodiscard]] PageTableView pageTable(uint64_t requestId) const;
+  // its next cut gives it.
+  [[nodiscard]] PageTableState pageTable(uint64_t requestId) const;
   // The page list a command of the request reads, once per lane and
   // command: every change since the last cut makes one new revision, which
   // differs from the last from the first page any of them changed, with its
