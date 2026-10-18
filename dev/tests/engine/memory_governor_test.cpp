@@ -422,15 +422,18 @@ void testPressurePolicyDirectives() {
           "a waiting request's shrink stopped short of the recovery margin");
   // The newest publication is what a follow-up resumes from; rebuilding it
   // costs a whole prefill, so a shrink nothing is waiting for leaves it and
-  // takes the rest. A waiting request outranks it, and Critical takes all.
+  // takes the rest short of what is in use, which includes the replay point
+  // a running request publishes for its follow-up. A waiting request
+  // outranks both, and Critical takes all.
   policySnapshot.hostHeadroomBytes = kGiB / 4;
   const auto speculative = policy.update(policySnapshot, 6101.0, false);
   require(speculative && speculative->targetBytes == 3 * kGiB / 4 &&
-              speculative->keepResumePoint,
-          "a speculative shrink discarded the resume point");
+              speculative->keepResumePoint && speculative->upTo == ReclaimClass::Ordinary,
+          "a speculative shrink discarded the resume point or took what is in use");
   const auto demanded = policy.update(policySnapshot, 7101.0, true);
-  require(demanded && demanded->targetBytes == kGiB && !demanded->keepResumePoint,
-          "a waiting request could not reach the resume point");
+  require(demanded && demanded->targetBytes == kGiB && !demanded->keepResumePoint &&
+              demanded->upTo == ReclaimClass::InUse,
+          "a waiting request could not reach the resume point or what is in use");
   policySnapshot.pressure = MemoryPressure::Critical;
   const auto criticalDirective = policy.update(policySnapshot, 7102.0, false);
   require(criticalDirective && criticalDirective->critical &&
@@ -730,9 +733,10 @@ void testOptionalGrowthKeepsTheSpareReserve() {
 // macOS's warning asks caches to give memory back. While it lasts, growth
 // that no request in service needs stops whatever the host's headroom, and
 // the snapshot says so, while what a request in service needs still grows.
-// Every paced pass returns the warning margin's worth of cache and keeps the
-// resume point, even for a waiting request, which the warning holds back
-// too; once the level is normal again, growth resumes and no pass runs.
+// Every paced pass returns the warning margin's worth of cache, what is in
+// use last, and keeps the resume point, even for a waiting request, which
+// the warning holds back too; once the level is normal again, growth
+// resumes and no pass runs.
 void testSystemWarningGivesCacheBack() {
   test::metalStatistics() = {};
   test::metalStatistics().allocatedBytes = 12 * kGiB;
@@ -758,7 +762,7 @@ void testSystemWarningGivesCacheBack() {
   MemoryPressurePolicy policy;
   const auto first = policy.update(warned, 0.0, false);
   require(first && !first->critical && first->targetBytes == kHostWarningMarginBytes &&
-              first->keepResumePoint,
+              first->keepResumePoint && first->upTo == ReclaimClass::InUse,
           "a pass under macOS's warning did not return the warning margin's worth of cache, "
           "keeping the resume point");
   require(policy.update(warned, 500.0, false).value().targetBytes == 0 &&

@@ -336,10 +336,14 @@ std::optional<MemoryReclaimDirective> MemoryPressurePolicy::update(
   // discard cache nothing needs, on every pass while the host's idle headroom
   // stays below it. Such a pass also keeps the resume point, whose loss costs
   // the next request a replay of its whole prompt; a waiting request outranks
-  // it. macOS's warning asks caches to give memory back, whatever the
-  // headroom: while it lasts, every pass returns as much as a pass may, and
-  // keeps the resume point even for a waiting request, whose growth the
-  // warning refuses as well, so that what the pass frees would not reach it.
+  // it. Nor does such a pass take what is in use: the states of the requests
+  // in service and the KV they restore through. The replay point it would
+  // take is the next resume point, and what it would free goes back to those
+  // requests' growth, which the margin does not hold back. macOS's warning
+  // asks caches to give memory back, whatever the headroom: while it lasts,
+  // every pass returns as much as a pass may, what is in use last, and keeps
+  // the resume point even for a waiting request, whose growth the warning
+  // refuses as well, so that what the pass frees would not reach it.
   const bool warning = snapshot.systemPressure == MemoryPressure::Warning;
   const uint64_t margin = requestWaiting ? kHostRecoveryMarginBytes : kHostWarningMarginBytes;
   const uint64_t deficit =
@@ -353,7 +357,8 @@ std::optional<MemoryReclaimDirective> MemoryPressurePolicy::update(
     nextReclaimMilliseconds_ = nowMilliseconds + 1000.0;
   return MemoryReclaimDirective{
       .targetBytes = std::min(desired, kHostWarningMarginBytes),
-      .keepResumePoint = !requestWaiting || warning};
+      .keepResumePoint = !requestWaiting || warning,
+      .upTo = requestWaiting || warning ? ReclaimClass::InUse : ReclaimClass::Ordinary};
 }
 
 void MemoryPressurePolicy::reclaimed(const MemoryReclaimDirective &directive,

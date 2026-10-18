@@ -1802,7 +1802,7 @@ MemoryReclaimResult Engine::reclaimMemory(const MemoryReclaimDirective &directiv
     released += cache_.releaseEmptyExtents(keep);
     while (targetUnmet()) {
       const CacheReclaimResult step =
-          cache_.reclaimOne(CacheReclaimMode::ReleaseExtents, ReclaimClass::InUse,
+          cache_.reclaimOne(CacheReclaimMode::ReleaseExtents, directive.upTo,
                             directive.keepResumePoint, keep);
       if (!step.madeProgress)
         break;

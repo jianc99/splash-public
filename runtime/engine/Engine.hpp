@@ -230,12 +230,13 @@ public:
   // critical directive has no target and takes them all. Under critical
   // pressure it then evicts every unpinned cache entry (Cache::evictAll()).
   // Otherwise it releases empty KV extents and reclaims the cache one
-  // Cache::reclaimOne step at a time, in the order that step's contract
-  // (Cache.hpp) gives, returning the buffers an evicted state handed back to
-  // the model's pool after each step. While the target is still unmet, it
-  // then takes the image rows only evicted states held. A pass counts only
-  // memory that leaves the engine: released KV extents, the caches and idle
-  // buffers the model returns; evicting a state frees nothing by itself.
+  // Cache::reclaimOne step at a time, up to the directive's class, in the
+  // order that step's contract (Cache.hpp) gives, returning the buffers an
+  // evicted state handed back to the model's pool after each step. While
+  // the target is still unmet, it then takes the image rows only evicted
+  // states held. A pass counts only memory that leaves the engine: released
+  // KV extents, the caches and idle buffers the model returns; evicting a
+  // state frees nothing by itself.
   // Pages whose copies are being written count toward the target. A pass
   // short of critical keeps one lane's pooled buffers and one empty extent.
   // Requests waiting for memory retry after any step that freed some, kept
