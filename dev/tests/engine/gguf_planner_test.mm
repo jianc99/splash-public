@@ -5,6 +5,7 @@
 //   gguf-planner
 #include "GgufFixtures.hpp"
 #include "metal/abi/Gguf.h"
+#include "model/WeightStore.hpp"
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -25,14 +26,54 @@ struct Plan {
   std::optional<std::string> error;
 };
 
-Plan plan(const std::filesystem::path &path, const model::QwenTargetDimensions &geometry) {
+Plan plan(const std::filesystem::path &path, const model::QwenTargetDimensions &geometry,
+          model::gguf::PlanOptions options = {}) {
   try {
     model::WeightSource source(path);
     const model::GgufFile gguf(source);
-    return {model::gguf::planImages(gguf, geometry), std::nullopt};
+    return {model::gguf::planImages(gguf, geometry, options), std::nullopt};
   } catch (const model::GgufError &error) {
     return {{}, error.what()};
   }
+}
+
+// The same repack: format, shape and sources' rows.
+bool sameRepack(const model::gguf::Repack &left, const model::gguf::Repack &right) {
+  if (left.format != right.format || left.rows != right.rows || left.columns != right.columns ||
+      left.sources.size() != right.sources.size())
+    return false;
+  for (size_t index = 0; index < left.sources.size(); ++index) {
+    const model::gguf::TensorRows &a = left.sources[index], &b = right.sources[index];
+    if (a.name != b.name || a.offset != b.offset || a.first != b.first || a.rows != b.rows || a.rowBytes != b.rowBytes)
+      return false;
+  }
+  return true;
+}
+
+// With streamed experts each layer's routed experts are the repacks the
+// resident plan writes, out of the image, which keeps every other section and
+// declares the resident image's bytes.
+bool streamsExperts(const Plan &resident, const Plan &streamed) {
+  if (resident.error || streamed.error || resident.images.size() != streamed.images.size()) return false;
+  for (size_t index = 0; index < resident.images.size(); ++index) {
+    const model::gguf::Image &whole = resident.images[index], &image = streamed.images[index];
+    // Either declares the resident image's bytes (the weights' manifest).
+    if (whole.residentBytes != whole.bytes || image.residentBytes != whole.bytes) return false;
+    std::vector<const model::gguf::Repack *> routed, rest;
+    for (const model::gguf::Repack &repack : whole.repacks)
+      (repack.sources.front().name.find("_exps.") != std::string::npos ? routed : rest).push_back(&repack);
+    if (routed.empty()) {
+      if (image.experts || image.bytes != whole.bytes) return false;
+      continue;
+    }
+    if (!image.experts || routed.size() != 3 || image.repacks.size() != rest.size() || image.bytes >= whole.bytes)
+      return false;
+    for (size_t projection = 0; projection < 3; ++projection)
+      if (!sameRepack(*routed[projection], image.experts->projections[projection])) return false;
+    for (size_t other = 0; other < rest.size(); ++other)
+      if (!sameRepack(*rest[other], image.repacks[other])) return false;
+  }
+  return true;
 }
 
 // Whether a refusal names every part.
@@ -304,6 +345,19 @@ void checkMoe(const std::filesystem::path &directory) {
               std::to_string(tensor.dims[0]));
   }
   check(layer.repacks.size() == quantized, "planner repacks only the layer's quantized tensors");
+  const Plan streamed = plan(path, g, {.streamExperts = true});
+  check(streamsExperts(moe, streamed),
+        "planner leaves streamed experts out of the layers' images, as the repacks it would write, and declares the "
+        "images' bytes with them");
+  // So the weights' manifest, the persistent cache's namespace, is the same with and without --expert-memory: the
+  // target's loader records each image with its resident bytes (GgufTargetLoader::open).
+  const auto manifest = [](const Plan &planned) {
+    std::vector<model::WeightFileRecord> records;
+    for (const model::gguf::Image &image : planned.images)
+      records.push_back({"target/" + image.name, image.magic, image.layer, image.type, image.residentBytes, "sources"});
+    return model::weightManifestFingerprint(records);
+  };
+  check(manifest(moe) == manifest(streamed), "planner gives the weights the same manifest whether the experts stream or not");
 
   // llama.cpp's fused ffn_gate_up_exps: the gate tensor takes each expert's first width rows of it, the up tensor
   // the next width; one of a type the loader does not read is refused by name.
@@ -326,6 +380,8 @@ void checkMoe(const std::filesystem::path &directory) {
   }
   check(split, "planner splits llama.cpp's fused gate/up experts into each expert's gate and up rows" +
                    (fusedPlan.error ? ": " + *fusedPlan.error : ""));
+  check(streamsExperts(fusedPlan, plan(path, g, {.streamExperts = true})),
+        "planner streams llama.cpp's fused gate/up experts as each expert's gate and up rows");
   tensorNamed(fused, "blk.0.ffn_gate_up_exps.weight").type = kQ8_1;
   tensorNamed(fused, "blk.0.ffn_gate_up_exps.weight").data.resize(2 * g.experts * width * g.hiddenSize / 32 * 36);
   writeGguf(path, fused, g);

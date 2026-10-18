@@ -53,14 +53,14 @@ void checkWeightHeader(const uint8_t *header, uint64_t bytes, std::string_view e
 WeightFile::WeightFile(metal::MetalBackend &backend, metal::MetalBuffer image,
                        std::string relativePath, std::string_view expectedMagic,
                        uint32_t expectedLayer, uint32_t expectedType,
-                       std::string contentIdentity)
+                       uint64_t declaredBytes, std::string contentIdentity)
     : impl_(std::make_unique<Impl>()) {
     const auto *header = static_cast<const uint8_t *>(image.contents());
     if (!header) throw WeightStoreError("weight image is not host visible: " + relativePath);
     checkWeightHeader(header, image.sizeBytes(), expectedMagic, expectedLayer, expectedType, relativePath);
     impl_->backend = &backend;
     impl_->record = {std::move(relativePath), std::string(expectedMagic), expectedLayer, expectedType,
-                     image.sizeBytes(), std::move(contentIdentity)};
+                     declaredBytes, std::move(contentIdentity)};
     impl_->base = std::move(image);
 }
 
