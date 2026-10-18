@@ -151,7 +151,7 @@ void runWindow(model::Runtime &executor, std::span<const uint32_t> tokens, Windo
 
   WindowLogits logits(window.rows + 1, vocabulary);
   const auto started = std::chrono::steady_clock::now();
-  const uint32_t chunk = executor.prefillGroupRows();
+  const uint32_t chunk = executor.prefillGroupRows(false);
   for (uint32_t offset = 0; offset < start;) {
     const uint32_t count = std::min(chunk, start - offset);
     BatchPlan plan{.kind = WorkKind::Prefill, .items = {{id, count, offset}}, .decodeStage = DecodeStage::Regular};
