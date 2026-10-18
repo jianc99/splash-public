@@ -2256,9 +2256,13 @@ pin has gone. Refused, the replay point, which is in use, takes cached KV and
 states in the same order, then the oldest state in use; of the KV it takes only
 leaves whose page frees at once, and only while an extent can be emptied, which
 is released at once; it drops a state whose write must wait for the write in
-flight. A junction makes room the same way short of what is in use, and an
-optional checkpoint takes only checkpoints; neither drops a state whose write
-must wait. A state whose lane holds no such checkpoint makes that room before
+flight. Refused then by the host alone, it takes its buffers as memory the
+request in service needs, as that request's KV does: a headroom between the
+1 GiB margin and the margin plus one state would otherwise refuse every replay
+point once no cached state is left to recycle. A junction makes room the same
+way short of what is in use, and an optional checkpoint takes only
+checkpoints; neither drops a state whose write must wait, and the host's margin
+refuses both. A state whose lane holds no such checkpoint makes that room before
 its command, and still refused ends its command at its boundary. With the SSD
 cache, a state its command could not capture and memory still refuses is
 written from the lane unless another write is in flight. A disk copy in use may

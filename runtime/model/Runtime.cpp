@@ -2662,11 +2662,12 @@ uint32_t Runtime::residentLane(uint64_t requestId) {
   return entry.stateLane;
 }
 
-std::shared_ptr<StateReservation> Runtime::reserveState(uint64_t requestId, uint32_t tokens) {
+std::shared_ptr<StateReservation> Runtime::reserveState(uint64_t requestId, uint32_t tokens,
+                                                        metal::AllocationFailure &refusal) {
   static_cast<void>(residentLane(requestId));
   if (!tokens || tokens % kv::kPageTokens)
     throw std::invalid_argument("a state boundary is page-aligned");
-  return impl_->states.reserve();
+  return impl_->states.reserve(refusal);
 }
 
 std::shared_ptr<const CompositeState> Runtime::snapshot(uint64_t requestId) {

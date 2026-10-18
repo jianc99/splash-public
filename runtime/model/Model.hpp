@@ -596,10 +596,10 @@ public:
   // Takes the buffers of one cached state for the request's state boundary
   // at `tokens`, which the prefill command reaching it fills
   // (ModelBatchItem::stateCaptures): from the pool, or one admission for
-  // what the pool lacks. Null when the governor refuses; the caller may
-  // release a cached state and retry.
+  // what the pool lacks. Null when the governor refuses, which sets
+  // `refusal` to the cause; the caller may release a cached state and retry.
   [[nodiscard]] virtual std::shared_ptr<StateReservation>
-  reserveState(uint64_t requestId, uint32_t tokens) = 0;
+  reserveState(uint64_t requestId, uint32_t tokens, metal::AllocationFailure &refusal) = 0;
   // Copies the request's committed state at its current page-aligned
   // boundary into the buffers of a cached state, taken as reserveState()
   // takes them: the state of a boundary its prefill command ended at without

@@ -44,7 +44,7 @@ public:
   [[nodiscard]] std::vector<ModelStepResult>
   decode(const BatchPlan &plan, std::span<const ModelBatchItem> items);
   [[nodiscard]] std::shared_ptr<StateReservation>
-  reserveState(uint64_t requestId, uint32_t tokens) override;
+  reserveState(uint64_t requestId, uint32_t tokens, metal::AllocationFailure &refusal) override;
   [[nodiscard]] std::shared_ptr<const CompositeState>
   snapshot(uint64_t requestId) override;
   [[nodiscard]] uint64_t snapshotBytes() const noexcept override;
