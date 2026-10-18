@@ -193,14 +193,9 @@ void appendKvReads(std::ostringstream &out, const model::KvReadStats &reads) {
 // rewrites and restores; the quota of active KV; the Index runway, the free
 // pages of that form; and the readers' memory and reads, with the commands
 // that streamed a history beside decoders and the decoders' gaps across them.
-// Null for a target that keeps its KV in memory.
-void appendKvSpill(std::ostringstream &out, const std::optional<KvSpillStatus> &status, uint64_t indexPageBytes,
+// A target that keeps its KV in memory has none: its /status is main's.
+void appendKvSpill(std::ostringstream &out, const KvSpillStatus &spill, uint64_t indexPageBytes,
                    const engine::EngineSnapshot &core, const ResourceWaitSnapshot &resourceWait) {
-  if (!status) {
-    out << "null";
-    return;
-  }
-  const KvSpillStatus &spill = *status;
   const KvSpillSnapshot &cache = spill.cache;
   const engine::SpillRequestsSnapshot &requests = core.spill;
   const KvPoolFormSnapshot &index = core.resources.pool.index;
@@ -357,8 +352,10 @@ std::string runtimeStatusJson(
   appendStreamedTable(out, streamedTable);
   out << ",\"streamed_experts\":";
   appendStreamedExperts(out, streamedExperts);
-  out << ",\"kv_spill\":";
-  appendKvSpill(out, kvSpill, plan.breakdown().kvIndexPageBytes, core, resourceWait);
+  if (kvSpill) {
+    out << ",\"kv_spill\":";
+    appendKvSpill(out, *kvSpill, plan.breakdown().kvIndexPageBytes, core, resourceWait);
+  }
   out << ",\"ane_ffn\":";
   appendAneFfn(out, aneFfn, executorTelemetry.aneFfnReruns);
   out << ",\"kv\":{\"block_tokens\":" << kv::kPageTokens

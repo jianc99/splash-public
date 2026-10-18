@@ -635,7 +635,7 @@ void testStreamedExpertsStatus() {
 
 // A target whose KV can spill reports what spilling does under kv_spill,
 // and each active request's kv_mode; one whose KV stays in memory reports
-// kv_spill null and no kv_mode, as before. The pages that hold only their
+// neither, as before (its plan's kv_spill is null). The pages that hold only their
 // index are the pool's pages of that form in use, each a spilled block's,
 // which a request holds as the cache does: counted once. An added section:
 // the schema version stays.
@@ -705,7 +705,9 @@ void testKvSpillStatus() {
                              std::nullopt, std::nullopt, kvSpill);
   };
   const std::string resident = status(plan(), std::nullopt);
-  require(resident.find(",\"kv_spill\":null,") != std::string::npos &&
+  const size_t planned = resident.find("\"kv_spill\":null");
+  require(planned < resident.find("\"memory_actual\"") &&
+              resident.find("\"kv_spill\"", planned + 1) == std::string::npos &&
               resident.find("\"kv_mode\"") == std::string::npos,
           "a target whose KV stays in memory reported spilling");
   const std::string json = status(plan(test::sparseKvLayout()), spill);
