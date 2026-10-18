@@ -349,13 +349,16 @@ struct BudgetValidationStatus {
 // What the engine's admission needs of the memory plan to decide which
 // requests spill (Engine::kvModeFor), as data: the bytes of a Full page, of
 // an Index page and of a tier slot; the memory left to resident KV after the
-// floors; and, per Spill request, the pages its cache keeps Full (its dense
-// history, its tail window and up to two prefill groups awaiting copies).
+// floors; the tokens one request's KV may take in memory alone, as without
+// the SSD cache (ContextBounds::resident), for a request that cannot spill;
+// and, per Spill request, the pages its cache keeps Full (its dense history,
+// its tail window and up to two prefill groups awaiting copies).
 struct SpillGeometry final {
   uint64_t fullPageBytes = 0;
   uint64_t indexPageBytes = 0;
   uint64_t slotBytes = 0;
   uint64_t residentKvBytes = 0;
+  uint32_t residentTokens = 0;
   uint32_t densePages = 0;
   uint32_t windowPages = 0;
   uint32_t groupPages = 0;
