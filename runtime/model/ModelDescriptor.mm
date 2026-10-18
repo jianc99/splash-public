@@ -13,6 +13,7 @@
 #include <fnmatch.h>
 #include <initializer_list>
 #include <iterator>
+#include <optional>
 #include <regex>
 #include <span>
 #include <stdexcept>
@@ -696,6 +697,20 @@ GgufMetadata readGgufMetadata(const std::filesystem::path &path) {
   return metadata;
 }
 
+// The attention of a target whose full-attention layers select blocks (a
+// block indexer): a verify row attends its top blocks, and a row whose
+// history holds no more than those attends it all, through its page table.
+// None for a target whose rows attend every token.
+std::optional<SparseKvShape> sparseKvShape(const QwenTargetDimensions &layout) {
+  if (!layout.hasIndexer()) return std::nullopt;
+  return SparseKvShape{.blockTokens = layout.indexerBlockTokens,
+                       .selectedBlocks = layout.indexerTopBlocks,
+                       .verifyRows = ExecutionLimits::targetVerifyRows,
+                       .denseHistoryTokens = layout.indexerTokens(),
+                       .sinkTokens = 0,
+                       .localTokens = 0};
+}
+
 } // namespace
 
 ModelDescriptor makeModelDescriptor(std::string name, TargetLayout target,
@@ -712,10 +727,8 @@ ModelDescriptor makeModelDescriptor(std::string name, TargetLayout target,
   result.visionSource = visionSource;
   std::visit(
       [&](const auto &layout) {
-        // No target declares its sparse KV until the runtime and
-        // target integration does.
         result.capabilities = {layout.vocabularySize,
-                               layout.nativeContextTokens, std::nullopt};
+                               layout.nativeContextTokens, sparseKvShape(layout)};
         result.targetKvLayout = layout.kvLayout();
         result.stateLayout = {layout.gdnStateLayout(), draft.stateLayout()};
       },
@@ -739,6 +752,7 @@ bool ModelDescriptor::valid() const noexcept {
                    capabilities.maximumContextTokens &&
                (!ropeScaling.yarn() ||
                 ropeScaling.originalContextTokens == layout.nativeContextTokens) &&
+               capabilities.sparseKv == sparseKvShape(layout) &&
                layout.hiddenSize == draft.hiddenSize &&
                draft.targetLayerCount && draft.targetLayerCount <= ExecutionLimits::maximumDraftTargetLayers &&
                draft.targetLayers[draft.targetLayerCount - 1] < layout.layers &&
