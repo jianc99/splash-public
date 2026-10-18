@@ -66,9 +66,11 @@ TEST_ELASTIC_KV_ASAN := $(ENGINE_SANITIZER_BUILD)/elastic-kv-pool-asan-ubsan
 TEST_ELASTIC_KV_TSAN := $(ENGINE_SANITIZER_BUILD)/elastic-kv-pool-tsan
 TEST_SLOT_RECYCLER_ASAN := $(ENGINE_SANITIZER_BUILD)/slot-recycler-asan-ubsan
 TEST_SLOT_RECYCLER_TSAN := $(ENGINE_SANITIZER_BUILD)/slot-recycler-tsan
-# The memory plan, its audit and /status: arithmetic and JSON on one thread.
+# The memory plan, its audit, its governor and /status: arithmetic and JSON on
+# one thread.
 TEST_MEMORY_PLAN_ASAN := $(ENGINE_SANITIZER_BUILD)/engine-memory-plan-asan-ubsan
 TEST_MEMORY_AUDIT_ASAN := $(ENGINE_SANITIZER_BUILD)/memory-audit-asan-ubsan
+TEST_MEMORY_GOVERNOR_ASAN := $(ENGINE_SANITIZER_BUILD)/memory-governor-asan-ubsan
 TEST_STATUS_ASAN := $(ENGINE_SANITIZER_BUILD)/runtime-status-asan-ubsan
 TEST_MEMORY_TEST := $(ENGINE_TEST_BUILD)/engine-memory-plan
 TEST_VISION_PREPARATION := $(ENGINE_TEST_BUILD)/vision-preparation
@@ -281,7 +283,7 @@ SANITIZER_CONFIG_TARGETS := $(TEST_SLOT_FILE_ASAN) $(TEST_SLOT_FILE_TSAN) \
 	$(TEST_SSD_READERS_ASAN) $(TEST_SSD_READERS_TSAN) \
 	$(TEST_ELASTIC_KV_ASAN) $(TEST_ELASTIC_KV_TSAN) \
 	$(TEST_SLOT_RECYCLER_ASAN) $(TEST_SLOT_RECYCLER_TSAN) \
-	$(TEST_MEMORY_PLAN_ASAN) $(TEST_MEMORY_AUDIT_ASAN) $(TEST_STATUS_ASAN)
+	$(TEST_MEMORY_PLAN_ASAN) $(TEST_MEMORY_AUDIT_ASAN) $(TEST_MEMORY_GOVERNOR_ASAN) $(TEST_STATUS_ASAN)
 
 # Every native test, benchmark and tool depends on the engine's and the tests'
 # headers, and compiles and links its other prerequisites in the order it
@@ -313,7 +315,7 @@ $(TEST_NATIVE_LOOP_TEST): $(NATIVE_RUNTIME_SOURCES) \
 		dev/tests/engine/ProtocolPeer.cpp \
 		dev/tests/engine/native_engine_loop_test.cpp
 $(TEST_METRICS_TEST): dev/tests/engine/runtime_metrics_test.cpp
-$(TEST_MEMORY_GOVERNOR_TEST): runtime/metal/DeviceCapabilities.cpp \
+$(TEST_MEMORY_GOVERNOR_TEST) $(TEST_MEMORY_GOVERNOR_ASAN): runtime/metal/DeviceCapabilities.cpp \
 		runtime/engine/MemoryPlan.cpp runtime/engine/MemoryGovernor.cpp \
 		dev/tests/engine/memory_governor_test.cpp
 $(TEST_Q8_CPU_TEST): dev/tests/engine/q8_paged_kv_test.cc
@@ -771,6 +773,7 @@ test-sanitizers: $(SANITIZER_CONFIG_TARGETS)
 	$(TSAN_TEST_ENV) $(TEST_SLOT_RECYCLER_TSAN) $(KV_SELECTION_TRACES)
 	$(ASAN_TEST_ENV) $(TEST_MEMORY_PLAN_ASAN)
 	$(ASAN_TEST_ENV) $(TEST_MEMORY_AUDIT_ASAN)
+	$(ASAN_TEST_ENV) $(TEST_MEMORY_GOVERNOR_ASAN)
 	$(ASAN_TEST_ENV) $(TEST_STATUS_ASAN) dev/tests/engine/status_golden.json
 
 # The Metal tests of the components whose host steps share their state with
