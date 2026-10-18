@@ -833,8 +833,10 @@ private:
   void returnCommitment(Request &active, uint32_t pages) noexcept;
   // The request owes a copy of each of these blocks that has none.
   void oweCopies(Request &active, std::span<const uint64_t> blocks);
-  // Starts writing the copies the request owes, as the tier's share and the
-  // quota allow; false once either stops further writes.
+  // Starts writing the copies the request owes, each on its commitment or,
+  // past it, on a slot it commits then. False once the tier's share, the
+  // volume or the file stops every request's writes; true when only the
+  // active limit's room for this request's next commitment ran out.
   [[nodiscard]] bool writeThrough(Request &active, uint32_t &started);
   // Whether a Full block whose copy has landed may move to the index form:
   // it lies past the dense history, and requests hold it, all of them
