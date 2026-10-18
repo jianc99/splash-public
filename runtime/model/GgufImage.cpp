@@ -583,16 +583,6 @@ std::vector<StreamedExperts> streamedExperts(std::span<const Image> layers) {
   return result;
 }
 
-uint64_t streamedExpertBytes(const Image &image) {
-  uint64_t bytes = 0;
-  if (image.experts)
-    for (const Repack &repack : image.experts->projections) {
-      const GgufPlaneBytes planes = ggufPlaneBytes(kQuantFormats[repack.format], repack.rows, repack.columns);
-      bytes += planes.plane0 + planes.plane1 + planes.meta;
-    }
-  return bytes;
-}
-
 uint64_t streamedTableBytes(const Image &image) {
   return image.streamedRows ? image.streamedRows->rows * image.streamedRows->rowBytes : 0;
 }

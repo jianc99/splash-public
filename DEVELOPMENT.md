@@ -216,9 +216,11 @@ it, or else none, so its experts load wherever they fit; only once they stream
 does it keep the first 64K tokens too. `--expert-memory`, `--ple-memory` and
 `--sparse-kv-memory` set their own part instead, a size below the part's
 smallest store is refused, and startup logs how each part was sized. Only the
-loaded model sizes its arenas, which rest on its weights' formats: a start
-whose parts the plan sizes loads them at their smallest store first, and then
-again with the stores the plan gives them (`Weights loaded again`).
+loaded model sizes its arenas, which rest on its weights' formats, so a start
+whose plan streams the routed experts loads them at their smallest store
+first and then again with the store the plan gives them (`Weights loaded
+again`); where they fit beside everything but the arenas, which streamed
+experts enlarge with prefill groups, it loads them whole first.
 
 A block-sparse target serves the window where its floors hold a request of
 that length and the SSD cache has room for its KV, and otherwise the longest

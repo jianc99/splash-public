@@ -17,15 +17,16 @@ struct StreamableWeights final {
   // target's without its routed experts or table, the draft's and the
   // vision tower's.
   uint64_t loadedBytes = 0;
-  // A MoE target's routed experts: the bytes they load with their layers,
-  // and the smallest store that streams them (ExpertStore::minimumBytes);
-  // zero for a dense FFN.
+  // A MoE target's routed experts: what the model takes more where they
+  // load with their layers, their planes in the images and their slot table
+  // (residentExpertSlots), and the smallest store that streams them
+  // (ExpertStore::minimumBytes); zero for a dense FFN.
   uint64_t expertBytes = 0;
   uint64_t expertFloorBytes = 0;
   // The table a GGUF target holds (Qwen3.8-Flash-Next's PLE n-gram table):
-  // the bytes it loads, and the smallest row cache that streams it, which
-  // holds one row beside its working memory (SparseRowStore); zero without
-  // one.
+  // what its image takes where it loads, and the smallest row cache that
+  // streams it, which holds one row beside its working memory
+  // (SparseRowStore); zero without one.
   uint64_t tableBytes = 0;
   uint64_t tableFloorBytes = 0;
 };

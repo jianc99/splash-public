@@ -52,11 +52,6 @@ struct StreamedPart final {
   StreamedSetting setting;
 };
 
-// The store `setting` gives a part of `allBytes`: its bytes, or zero when the
-// part loads whole (Off, a Size that holds all of it, or a model without
-// it). Auto has no store of its own: the planner sizes it.
-[[nodiscard]] uint64_t streamedBytes(const StreamedSetting &setting, uint64_t allBytes) noexcept;
-
 // Inputs that the memory planner needs from a loaded model. Model tensor and
 // KV geometry stay with their owners; the planner receives only identity,
 // capacity, and measured allocation sizes.

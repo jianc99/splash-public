@@ -127,27 +127,6 @@ LoadedModel loadModel(metal::MetalBackend &backend,
   return result;
 }
 
-uint64_t routedExpertBytes(const std::filesystem::path &root, const ModelDescriptor &descriptor) {
-  return std::visit(
-      [&](const auto &layout) -> uint64_t {
-        if (layout.ffnKind != QwenFfnKind::SparseMoe) return 0;
-        if (descriptor.targetSource != TargetSource::Gguf) return safetensorsRoutedExpertBytes(root / "target", layout);
-        return ggufTargetBytes(root, layout.ggufArchitecture, layout, {.streamExperts = true},
-                               gguf::streamedExpertBytes);
-      },
-      descriptor.target);
-}
-
-uint64_t streamableTableBytes(const std::filesystem::path &root, const ModelDescriptor &descriptor) {
-  if (descriptor.targetSource != TargetSource::Gguf) return 0;
-  return std::visit(
-      [&](const auto &layout) {
-        return ggufTargetBytes(root, layout.ggufArchitecture, layout, {.streamTable = true},
-                               gguf::streamedTableBytes);
-      },
-      descriptor.target);
-}
-
 uint64_t modelWeightBytes(const std::filesystem::path &root, const ModelDescriptor &descriptor,
                           const ModelLoadOptions &options) {
   const gguf::PlanOptions plan{.streamExperts = options.expertMemoryBytes != 0,
