@@ -48,10 +48,12 @@ template <class Error = std::overflow_error>
 // The Apple Silicon VM page: arenas, state cells and slot files align to it.
 inline constexpr uint64_t kHostPageBytes = 16 * 1024;
 
-// The unit of the SSD cache's reads beside its worker (model::SlotFile::
-// readAt): uncached reads of whole aligned units of it run at the drive's
-// rate of small reads.
-inline constexpr uint64_t kDirectReadBytes = 4 * 1024;
+// The alignment of the SSD cache's reads beside its worker
+// (model::SlotFile::readAt, kv::SlotFormat), APFS's block: uncached reads
+// of whole aligned blocks run at the drive's rate of small reads. They pass
+// through the buffer cache, which only reads that start and end on host
+// pages skip (model::ExpertStore), but do not stay in it.
+inline constexpr uint64_t kSlotReadAlignmentBytes = 4 * 1024;
 
 // bytes rounded up to a whole number of host pages.
 [[nodiscard]] constexpr uint64_t alignUp(uint64_t bytes) noexcept {
