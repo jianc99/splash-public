@@ -193,4 +193,18 @@ private:
   std::set<const Slot *> live_;
 };
 
+// A request's page sources (model::KvPageSources), page by page.
+inline std::shared_ptr<const model::KvPageSources> sourcesOf(const std::vector<model::KvPageSource> &pages) {
+  std::vector<std::shared_ptr<const model::KvPageSources::Chunk>> chunks;
+  for (size_t first = 0; first < pages.size(); first += model::KvPageSources::kChunkPages) {
+    auto chunk = std::make_shared<model::KvPageSources::Chunk>();
+    for (size_t page = first; page < std::min(pages.size(), first + model::KvPageSources::kChunkPages); ++page) {
+      chunk->pages[page - first] = pages[page];
+      chunk->indexPages += pages[page].indexed();
+    }
+    chunks.push_back(std::move(chunk));
+  }
+  return std::make_shared<const model::KvPageSources>(std::move(chunks), static_cast<uint32_t>(pages.size()));
+}
+
 } // namespace splash::test

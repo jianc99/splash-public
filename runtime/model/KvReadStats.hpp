@@ -24,9 +24,10 @@ struct KvReadFailure final {
 // What one command's resolves did (KvBlockCache::addResolve): counted on its
 // host steps, owned by the command, and merged on the engine thread when it
 // completes (KvBlockCache::mergeStats). Entries are the lists' entries, paged
-// those of Full pages; a hit found its block cached, a miss read it (once
-// for every lane that listed it); a ghost hit missed a block the cache
-// recently gave up.
+// those of Full pages; a hit found its block cached, or read for another
+// lane by the same resolve; a miss read it, once for every lane that listed
+// it; a ghost hit missed a block the cache recently gave up. The bytes read
+// are the blocks' records, and a failure a block read twice in vain.
 struct KvReadStats final {
   uint64_t resolves = 0;
   uint64_t entries = 0;
@@ -36,6 +37,18 @@ struct KvReadStats final {
   uint64_t ghostHits = 0;
   uint64_t readBytes = 0;
   uint64_t readFailures = 0;
+
+  KvReadStats &operator+=(const KvReadStats &other) noexcept {
+    resolves += other.resolves;
+    entries += other.entries;
+    paged += other.paged;
+    hits += other.hits;
+    misses += other.misses;
+    ghostHits += other.ghostHits;
+    readBytes += other.readBytes;
+    readFailures += other.readFailures;
+    return *this;
+  }
 };
 
 // The hot block cache as /status reports it: its memory, target and floor,
