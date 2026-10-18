@@ -26,10 +26,12 @@ namespace splash::engine {
 // that one kind never starves another and reclaim always keeps a quarter.
 // Reads go to the SSD readers beside the worker (SlotFile::readAt): a
 // restore is a task of a background batch that reads what its page's form
-// holds, the index alone or all of it, into a buffer of its reader and
-// scatters it into the page; the restores asked for since the last
-// submitRestores() go out as one batch. Copies of slots are read the same way
-// by whoever holds them (copy()).
+// holds, the index alone or all of it, into memory of that size and
+// scatters it into the page. The restores asked for since the last
+// submitRestores() go out together, the index restores as one batch on
+// every reader and the whole restores as another on at most
+// kWholeRestoreReaders, whose reads are a slot each. Copies of slots are
+// read the same way by whoever holds them (copy()).
 class KvPageTier final : public KvTier {
 public:
   // A slot of the tier, which is also the copy reads of spilled K/V reach
@@ -46,9 +48,12 @@ public:
     std::shared_ptr<model::SlotFile::Slot> slot;
     std::shared_ptr<const model::SlotFile> file;
   };
-  // Writes in flight at once, by default, and restores at most.
+  // Writes in flight at once, by default, and restores at most; the readers
+  // whole restores take at once (an M5 Pro reads 460 KiB pieces at 8.1 GB/s
+  // from four threads, model::SsdReaders).
   static constexpr uint32_t kWrites = 64;
   static constexpr uint32_t kRestores = 4096;
+  static constexpr unsigned kWholeRestoreReaders = 8;
 
   KvPageTier(kv::PageStorage &pages, kv::SlotFormat format,
              std::shared_ptr<model::SlotFile> file, std::shared_ptr<model::SsdReaders> readers,
