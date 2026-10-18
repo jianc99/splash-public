@@ -169,6 +169,16 @@ uint64_t fixedBytesOf(const Geometry &g, uint32_t blocks, ops::MoeShape shape) {
          uint64_t{shape.experts} * (sizeof(uint32_t) + 3 * sizeof(uint64_t)) + 4 * sizeof(uint32_t) + prediction;
 }
 
+// The smallest store (ExpertStore::minimumBytes): its fixed bytes and an
+// arena of each layout of a block's experts, which for a layout of one block
+// are all of its experts.
+uint64_t minimumBytesOf(const Geometry &g, uint32_t blocks, ops::MoeShape shape) {
+  uint64_t bytes = fixedBytesOf(g, blocks, shape);
+  for (const ExpertLayout &layout : g.layouts)
+    bytes += arenaBytes(layout, shape.experts);
+  return bytes;
+}
+
 } // namespace
 
 struct ExpertStore::Impl {
@@ -811,7 +821,13 @@ ExpertStore::ExpertStore(metal::MetalBackend &backend, StreamedBlocks streamed, 
   for (uint32_t block = 0; block < streamed.blocks.size(); ++block)
     impl.blocks.push_back(
         {.experts = std::move(streamed.blocks[block]), .slot = std::vector<uint32_t>(shape.experts, kNoSlot)});
-  const uint64_t fixed = fixedBytesOf(geometry, static_cast<uint32_t>(impl.blocks.size()), shape);
+  const uint32_t blocks = static_cast<uint32_t>(impl.blocks.size());
+  if (const uint64_t minimum = minimumBytesOf(geometry, blocks, shape); options.memoryBytes < minimum)
+    throw std::invalid_argument("expert memory of " + std::to_string(options.memoryBytes >> 20) +
+                                " MiB holds fewer slots than the smallest store (" + std::to_string(minimum >> 20) +
+                                " MiB): a block's experts of each size and every expert of a size of one block, "
+                                "beside the staging and tables");
+  const uint64_t fixed = fixedBytesOf(geometry, blocks, shape);
   const uint64_t arenaBudget = options.memoryBytes > fixed ? options.memoryBytes - fixed : 0;
   const uint64_t largest = options.bufferBytes && options.bufferBytes < backend.capabilities().maxBufferLengthBytes
                                ? options.bufferBytes
@@ -851,6 +867,7 @@ ExpertStore::ExpertStore(metal::MetalBackend &backend, StreamedBlocks streamed, 
         sizeLayout.push_back(layout);
       }
     }
+    // Arenas a layout splits into hold a block's experts each.
     if (bytesAt(0.0) > arenaBudget)
       throw std::invalid_argument("expert memory of " + std::to_string(options.memoryBytes >> 20) +
                                   " MiB holds fewer slots (" + std::to_string(bytesAt(0.0) >> 20) +
@@ -1095,12 +1112,7 @@ uint64_t ExpertStore::fixedBytes(const StreamedBlocks &blocks, ops::MoeShape sha
 }
 
 uint64_t ExpertStore::minimumBytes(const StreamedBlocks &blocks, ops::MoeShape shape) {
-  const Geometry geometry = geometryOf(blocks, shape);
-  uint64_t bytes = fixedBytesOf(geometry, static_cast<uint32_t>(blocks.blocks.size()), shape);
-  for (uint32_t layout = 0; layout < geometry.layouts.size(); ++layout)
-    bytes += arenaBytes(geometry.layouts[layout],
-                        uint64_t{shape.experts} * (geometry.streams(layout) ? 1 : geometry.blocks[layout]));
-  return bytes;
+  return minimumBytesOf(geometryOf(blocks, shape), static_cast<uint32_t>(blocks.blocks.size()), shape);
 }
 
 metal::MetalBuffer residentExpertSlots(metal::MetalBackend &backend, uint32_t experts) {
