@@ -61,8 +61,8 @@ public:
 
   // Between commands: staging for a sequence of `pages` pages, its history
   // and the command's own, or a refusal with nothing changed. Staging stays
-  // as an idle buffer after the prompt, for the next turn, until
-  // releaseIdle() gives it back (an idle reclaim), returning its bytes.
+  // as an idle buffer after the prompt until releaseIdle() gives it back,
+  // returning its bytes.
   [[nodiscard]] ModelMemoryAdmission reserve(uint32_t pages);
   uint64_t releaseIdle();
 
