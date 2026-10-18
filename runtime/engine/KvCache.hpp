@@ -43,9 +43,11 @@ blockImageIdentity(uint64_t blockBegin, uint32_t blockTokens,
 // Content-addressed target-KV blocks across two tiers. Matching walks the
 // chained full-page hashes from the root. A block holds a pool page, a disk
 // slot, or both; resident blocks form a subtree at the root, so a matched
-// chain is a resident prefix followed by disk-only blocks. Composite
-// recurrent states are a separate sparse layer. This class owns exactly one
-// prefix reference for every resident block.
+// chain is a resident prefix followed by disk-only blocks. A resident block's
+// page holds its K/V (kv::PageForm::Full) or, once the block spilled, only
+// its index, its K/V living in its copy alone (kv::PageForm::Index).
+// Composite recurrent states are a separate sparse layer. This class owns
+// exactly one prefix reference for every resident block.
 class KvCache final {
 public:
   static constexpr uint32_t pageTokens = kv::kPageTokens;
@@ -67,8 +69,12 @@ public:
     std::vector<uint32_t> pages;
   };
 
-  KvCache(KvPool &pool, CacheRecency &recency)
-      : pool_(pool), recency_(recency), blockOnPage_(pool.pageCount()) {}
+  // With spill, requests may spill the blocks (Cache's spill policy): a
+  // block on a page a request holds is held (holdPage), and a disk-only
+  // block that adopts a writer's page gives its copy up, so that every block
+  // has one content, whichever form its page has.
+  KvCache(KvPool &pool, CacheRecency &recency, bool spill = false)
+      : pool_(pool), recency_(recency), spill_(spill), blockOnPage_(pool.pageCount()) {}
   KvCache(const KvCache &) = delete;
   KvCache &operator=(const KvCache &) = delete;
   ~KvCache() noexcept;
@@ -79,8 +85,9 @@ public:
   [[nodiscard]] std::optional<BlockMatch> find(uint64_t parentBlock,
                                                std::span<const uint32_t> tokens,
                                                BlockIdentity identity) const;
-  // Existing content is returned as is; a disk-only block adopts the
-  // writer's page, and a block in transfer keeps its own.
+  // Existing content is returned as is: the writer moves onto its page,
+  // either form, unless a restore is filling it, and then keeps its own. A
+  // disk-only block adopts the writer's page instead.
   [[nodiscard]] BlockMatch insert(uint64_t parentBlock,
                                   std::span<const uint32_t> tokens,
                                   uint32_t physicalPage,
@@ -102,7 +109,7 @@ public:
   };
   [[nodiscard]] Key key(uint64_t blockId) const;
   [[nodiscard]] uint64_t lastUsed(uint64_t blockId) const;
-  [[nodiscard]] bool transferring(uint64_t blockId) const;
+  [[nodiscard]] Transfer transfer(uint64_t blockId) const;
   // The blocks right below this one.
   [[nodiscard]] std::vector<uint64_t> children(uint64_t blockId) const;
 
@@ -110,11 +117,17 @@ public:
   void releaseActive(uint64_t blockId) noexcept;
   // A request's reference to a page (KvPool::retainPage and releasePage,
   // not as its owner), which marks the block on it held while any request
-  // holds the page: quota never gives a held block's copy up. Only a cache
-  // whose requests may spill (CacheSpillPolicy) holds blocks; on a layout
-  // that cannot, quota strips and evicts copies as it always has.
+  // holds the page: neither quota nor RAM reclaim takes a held block or its
+  // copy. Only a cache whose requests may spill (CacheSpillPolicy) holds
+  // blocks; on a layout that cannot, quota strips and evicts copies as it
+  // always has. A poisoned block leaves once nothing holds it or keeps it
+  // otherwise.
   void holdPage(uint32_t page);
   void unholdPage(uint32_t page);
+  [[nodiscard]] bool held(uint64_t blockId) const;
+  // Held blocks with a disk copy: the copies of active KV
+  // (model::DiskBudget::commit).
+  [[nodiscard]] uint32_t heldCopies() const noexcept { return heldCopies_; }
   void touch(uint64_t blockId) noexcept;
 
   [[nodiscard]] Chain chain(uint64_t blockId) const;
@@ -125,8 +138,10 @@ public:
   [[nodiscard]] uint64_t generation() const noexcept { return generation_; }
 
   // Tiers. A block in transfer is moving between them and is neither
-  // evicted nor replaced until the transfer is cleared.
+  // evicted nor dropped until the transfer is cleared.
   [[nodiscard]] uint32_t page(uint64_t blockId) const;
+  // The block on a page; 0 for none.
+  [[nodiscard]] uint64_t blockOn(uint32_t page) const { return blockOnPage_.at(page); }
   [[nodiscard]] std::shared_ptr<KvDiskSlot> slot(uint64_t blockId) const;
   [[nodiscard]] bool hasDiskChildren(uint64_t blockId) const;
   // StateCache counts each of its entries in and out, and each entry while
@@ -148,24 +163,32 @@ public:
   // counts once. A request holds every page of its chain, so a chain's
   // count stops at the first page one holds.
   [[nodiscard]] uint32_t idlePagesOnChains(std::span<const uint64_t> blocks) const;
-  // Resident, without resident children or users: its page can go.
+  // Resident, without resident children, users or holders: its page can go.
   [[nodiscard]] bool residentLeaf(uint64_t blockId) const;
-  void setTransferring(uint64_t blockId, bool transferring);
+  // Starts a transfer of the block's page, or ends it with None; one at a
+  // time.
   void setTransfer(uint64_t blockId, Transfer transfer);
-  // Publishes the block's disk copy; a resident block may drop it with null.
+  // Publishes the block's disk copy. A block whose page holds its K/V may
+  // drop it with null; one whose page holds only its index cannot, and a
+  // disk-only block is erased instead. A copy a reader still holds
+  // (KvTier::copy) is never dropped.
   void setSlot(uint64_t blockId, std::shared_ptr<KvDiskSlot> slot);
   // Returns the page of a resident leaf that has a disk copy to the pool.
   void dropPage(uint64_t blockId);
   // Gives a disk-only block a page whose content follows, by restore or from
   // the request that recomputed it. The parent must be resident.
   void adoptPage(uint64_t blockId, uint32_t page);
-  // The pool moved pages: the block on each of them, if any, names the page
-  // it moved to. It visits only the moved pages.
+  // The pool moved pages, within their form (KvPool::compactExtent) or to
+  // the other one (KvPool::movePages): the block on each of them, if any,
+  // names the page it moved to and takes its form. It visits only the moved
+  // pages.
   void followPages(const KvPageMoves &moves) noexcept;
   // Abandons an unsubmitted restore at an unused leaf, keeping its disk copy.
   [[nodiscard]] bool abandonRestore(uint64_t blockId);
-  // A restore that failed: the block matches nothing any more and leaves
-  // once its subtree and users are gone.
+  // A restore or a read of its copy that failed: the block matches nothing
+  // any more and leaves once its subtree, users and holders are gone. Its
+  // copy goes at once, unless a request holds the block or its page holds
+  // only its index: then it leaves with the block.
   void poison(uint64_t blockId);
 
   // Oldest resident leaf (no resident children) that no request uses. Pass
@@ -187,13 +210,22 @@ public:
   // resident leaf they are disk-only; below a poisoned block some may be
   // resident.
   [[nodiscard]] std::vector<uint64_t> subtree(uint64_t blockId) const;
-  // Only a block without children, users or transfer can be removed. The
-  // caller handles any composite state attached to it first.
+  // Only a block without children, users, holders or transfer can be
+  // removed, and not while a reader holds its copy. The caller handles any
+  // composite state attached to it first.
   void erase(uint64_t blockId);
 
   // Blocks with a disk copy, resident or not; the pool counts the resident
   // blocks (KvPoolSnapshot::pagesPrefix).
   [[nodiscard]] uint32_t diskBlocks() const noexcept { return diskBlocks_; }
+  // Blocks whose page holds only their index: spilled blocks.
+  [[nodiscard]] uint32_t indexBlocks() const noexcept { return indexBlocks_; }
+  // Copies given to a block that had one before: writes of content that
+  // was on the disk once already.
+  [[nodiscard]] uint64_t rewrites() const noexcept { return rewrites_; }
+  // Tests: std::logic_error unless every block's links, counts, form and
+  // held mark agree with the graph and the pool.
+  void checkInvariants() const;
 
 private:
   struct Block {
@@ -217,7 +249,12 @@ private:
     uint32_t activeUsers = 0;
     uint32_t depth = 0;
     uint64_t lastUsed = 0;
-    bool transferring = false;
+    Transfer transfer = Transfer::None;
+    // Its page's form, kept here so that reindex reads no pool state.
+    kv::PageForm form = kv::PageForm::Full;
+    bool held = false;
+    // It had a disk copy once (rewrites).
+    bool copied = false;
     bool poisoned = false;
     bool hadState = false;
     RecencyOrder::Node ramNode;
@@ -229,7 +266,11 @@ private:
   [[nodiscard]] const Block &block(uint64_t blockId) const;
   // Places the block in the orders its state calls for.
   void reindex(Block &entry) noexcept;
-  void giveDiskCopy(Block &entry, std::shared_ptr<KvDiskSlot> slot) noexcept;
+  void giveDiskCopy(Block &entry, std::shared_ptr<KvDiskSlot> slot);
+  // The block takes the page, whose form it keeps and whose holders, if
+  // any, hold it; or leaves its page with noPage.
+  void placeOnPage(Block &entry, uint32_t page);
+  void setHeld(Block &entry, bool held) noexcept;
   void inherit(Block &parent, uint64_t lastUsed) noexcept;
   // Applies count to every block above this one.
   template <typename Count>
@@ -239,10 +280,11 @@ private:
 
   KvPool &pool_;
   CacheRecency &recency_;
+  const bool spill_;
   std::unordered_map<uint64_t, Block> blocks_;
   // The resident block on each page, 0 for none. A resident block owns its
   // page: a writer whose block already exists moves onto that block's page,
-  // or keeps its own while the block is in transfer.
+  // or keeps its own while a restore fills it.
   std::vector<uint64_t> blockOnPage_;
   std::unordered_multimap<uint64_t, uint64_t> index_;
   uint64_t nextBlockId_ = 1;
@@ -257,6 +299,9 @@ private:
   RecencyOrder diskLeaves_;
   RecencyOrder unneeded_;
   uint32_t diskBlocks_ = 0;
+  uint32_t indexBlocks_ = 0;
+  uint32_t heldCopies_ = 0;
+  uint64_t rewrites_ = 0;
 };
 
 } // namespace splash::engine
