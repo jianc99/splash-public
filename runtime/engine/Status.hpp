@@ -7,6 +7,7 @@
 #include "engine/MemoryAudit.hpp"
 #include "engine/ThermalState.hpp"
 #include "model/ExpertStoreStats.hpp"
+#include "model/KvReadStats.hpp"
 #include "model/SparseRowStore.hpp"
 
 #include <algorithm>
@@ -281,6 +282,18 @@ struct AneFfnSnapshot {
   double aneMilliseconds = 0.0;
 };
 
+// A block-sparse target's KV on the SSD cache as /status reports it
+// (kv_spill): whether long requests keep it there and why not, what the
+// cache holds and did (Cache::spillSnapshot), and its readers' memory and
+// reads, none for a target that keeps its KV in memory.
+struct KvSpillStatus final {
+  bool enabled = false;
+  std::string reason;
+  KvSpillSnapshot cache;
+  std::optional<model::KvBlockCacheStats> blockCache;
+  std::optional<model::KvHistoryStreamStats> historyStream;
+};
+
 // Single source for /status and native protocol status events.
 [[nodiscard]] std::string runtimeStatusJson(
     const EngineMemoryPlan &plan, const EngineSnapshot &core,
@@ -293,6 +306,7 @@ struct AneFfnSnapshot {
     const NativeLoopTiming &loop, const WeightsSnapshot &weights,
     const AneFfnSnapshot &aneFfn, ThermalState thermalState,
     const std::optional<model::SparseRowStats> &streamedTable = std::nullopt,
-    const std::optional<model::ExpertStoreStats> &streamedExperts = std::nullopt);
+    const std::optional<model::ExpertStoreStats> &streamedExperts = std::nullopt,
+    const KvSpillStatus &kvSpill = {});
 
 } // namespace splash::engine
