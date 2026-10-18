@@ -1460,10 +1460,12 @@ void requirePrefillGroupMatchesItsChunks(model::Runtime &executor, const kv::Pag
 // (BatchPlan::passes), each its own command, leaves what it leaves run
 // whole: its score logits, KV, GDN cell, PLE history, lengths, draft rings
 // and window, and the states it captures, at three passes and at one a
-// layer; a pass before the last returns its request's id alone. A target
+// layer, and with an image its first pass encodes when the target serves
+// vision; a pass before the last returns its request's id alone. A target
 // whose commands run whole (its experts load whole) skips it.
 void requirePrefillPassesMatchWhole(model::Runtime &executor, const kv::PageStorage &pages,
-                                    const model::QwenStateStorage &states, std::span<const uint32_t> chat) {
+                                    const model::QwenStateStorage &states, std::span<const uint32_t> chat,
+                                    bool vision) {
   const uint32_t passes = executor.prefillPasses();
   if (passes <= 1) {
     std::cout << "prefill_passes=SKIP (the target runs its prefill commands whole)\n";
@@ -1487,10 +1489,18 @@ void requirePrefillPassesMatchWhole(model::Runtime &executor, const kv::PageStor
     std::vector<uint8_t> window;
     std::vector<StateBytes> captured;
   };
-  const auto run = [&](uint64_t id, uint32_t split) {
+  const auto run = [&](uint64_t id, uint32_t split, bool image) {
     EngineRequest request = makeRequest(id, {prompt.begin(), prompt.begin() + rows}, 0);
     for (uint32_t option = 0; option < model::ExecutionLimits::maximumScoreOptions; ++option)
       request.scoreTokens.push_back(1000 + 37 * option);
+    // The same pixels in every request, under a digest of its own, so that
+    // each request encodes the image itself.
+    if (image) {
+      request.images = {{chunk - 16, 64, 16, 16, id, 0}};
+      request.imagePixels.resize(request.images.front().pixelBytes());
+      for (size_t index = 0; index < request.imagePixels.size(); ++index)
+        request.imagePixels[index] = static_cast<uint8_t>(index * 13 + 7);
+    }
     beginCold(executor, request, 0);
     executor.setDraftContextPlan(id, planDraftContext(0, rows, capturedAt));
     ModelStepResult last;
@@ -1536,26 +1546,30 @@ void requirePrefillPassesMatchWhole(model::Runtime &executor, const kv::PageStor
     }
     return result;
   };
-  const Run whole = run(531, 1);
-  require(!whole.scores.empty(), "a prefill command run whole scored nothing");
-  for (const uint32_t split : {3u, passes}) {
-    const Run passed = run(531 + split, split);
-    const std::string which = "a prefill command in " + std::to_string(split) + " passes";
-    require(passed.scores == whole.scores, which + ": its score logits differ from the command run whole");
-    require(passed.kv == whole.kv, which + ": its KV differs from the command run whole");
-    require(passed.lengths == whole.lengths && passed.cell == whole.cell,
-            which + ": its GDN cell, PLE history or lengths differ from the command run whole");
-    require(passed.rings == whole.rings && passed.window == whole.window,
-            which + ": its draft rings or window differ from the command run whole");
-    for (size_t index = 0; index < capturedAt.size(); ++index)
-      require(passed.captured[index].cell == whole.captured[index].cell &&
-                  passed.captured[index].window == whole.captured[index].window,
-              which + ": the state it captured at " + std::to_string(capturedAt[index]) +
-                  " differs from the command run whole");
+  for (const bool image : vision ? std::vector{false, true} : std::vector{false}) {
+    const Run whole = run(image ? 631 : 531, 1, image);
+    require(!whole.scores.empty(), "a prefill command run whole scored nothing");
+    for (const uint32_t split : {3u, passes}) {
+      const Run passed = run((image ? 631 : 531) + split, split, image);
+      const std::string which =
+          "a prefill command" + std::string(image ? " with an image" : "") + " in " + std::to_string(split) + " passes";
+      require(passed.scores == whole.scores, which + ": its score logits differ from the command run whole");
+      require(passed.kv == whole.kv, which + ": its KV differs from the command run whole");
+      require(passed.lengths == whole.lengths && passed.cell == whole.cell,
+              which + ": its GDN cell, PLE history or lengths differ from the command run whole");
+      require(passed.rings == whole.rings && passed.window == whole.window,
+              which + ": its draft rings or window differ from the command run whole");
+      for (size_t index = 0; index < capturedAt.size(); ++index)
+        require(passed.captured[index].cell == whole.captured[index].cell &&
+                    passed.captured[index].window == whole.captured[index].window,
+                which + ": the state it captured at " + std::to_string(capturedAt[index]) +
+                    " differs from the command run whole");
+    }
   }
   while (executor.reclaimIdleState(false, IdleMemory::Buffers)) {
   }
-  std::cout << "prefill_passes_match_whole=PASS passes=3," << passes << '\n';
+  std::cout << "prefill_passes_match_whole=PASS passes=3," << passes << (vision ? " images=PASS" : " images=SKIP")
+            << '\n';
 }
 
 // A command's ticket holds the buffers of the states it captures once the
@@ -3711,7 +3725,7 @@ int main(int argc, char **argv) {
     if (prefillGroupsOnly) {
       requirePrefillGroupMatchesItsChunks(executor, pages, states, samplingSeedTokens,
                                           model.descriptor.hasVision());
-      requirePrefillPassesMatchWhole(executor, pages, states, samplingSeedTokens);
+      requirePrefillPassesMatchWhole(executor, pages, states, samplingSeedTokens, model.descriptor.hasVision());
       std::cout << "PASS model-runtime-oracle scope=prefill-groups-only model=" << model.name()
                 << " (a prefill group leaves what its chunks' commands leave, and in passes what it leaves "
                    "whole)\n";
@@ -3828,7 +3842,7 @@ int main(int argc, char **argv) {
     requireCapturesOutliveTheirItems(executor, states, samplingSeedTokens);
     requirePrefillGroupMatchesItsChunks(executor, pages, states, samplingSeedTokens,
                                         model.descriptor.hasVision());
-    requirePrefillPassesMatchWhole(executor, pages, states, samplingSeedTokens);
+    requirePrefillPassesMatchWhole(executor, pages, states, samplingSeedTokens, model.descriptor.hasVision());
     requireBatchedLanesMatchReordered(executor, states, samplingSeedTokens);
 
 
