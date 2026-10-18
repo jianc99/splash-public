@@ -146,6 +146,11 @@ struct StreamedMemoryInputs final {
   // prefill commands as groups, and one whose table streams stages its rows,
   // so streaming only grows them. None before the model loads.
   std::array<std::array<uint64_t, 2>, 2> arenaBytes{};
+  // The arenas of the geometry of a runtime whose K/V spills, by whether the
+  // table streams (model::StreamedParts::kv): it runs prefill groups whether
+  // the experts stream or not, and holds where its verifies' listed blocks
+  // are, so they are at least arenaBytes'. A plan that spills takes them.
+  std::array<uint64_t, 2> spillArenaBytes{};
   uint64_t laneStateBytes = 0;
   kv::Layout kvLayout;
   // The model's window (servedContextTokens), and the context --max-context

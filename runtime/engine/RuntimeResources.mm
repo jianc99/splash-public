@@ -682,9 +682,12 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   const uint64_t hardBudgetBytes = EngineMemoryPolicy::hardBudgetBytes(
       device.recommendedMaxWorkingSetBytes, config.maximumMemoryBytes);
   model::StreamableWeights streamable;
-  // The arenas of the loaded model by what streams of it; none before it
-  // loads.
+  // The arenas of the loaded model by what streams of it, and those of a
+  // runtime whose K/V spills, which only a block-sparse target with a
+  // spillable layout may have; none before it loads.
+  const bool kvMaySpill = config.model.capabilities.sparseKv && kvLayout.spillable();
   std::array<std::array<uint64_t, 2>, 2> arenaBytes{};
+  std::array<uint64_t, 2> spillArenaBytes{};
   uint64_t activeLimitBytes = cacheDiskBytes;
   bool kvFileOpen = true;
   // The plan with the parts set as `experts` and `table`, `stagingBytes` set
@@ -697,6 +700,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
          .fixedBytes = streamable.loadedBytes + model::kPipelineReserveBytes + model::kRuntimeOverheadReserveBytes +
                        stagingBytes + aneFfnBytes,
          .arenaBytes = arenaBytes,
+         .spillArenaBytes = spillArenaBytes,
          .laneStateBytes = stateLayout.laneBytes(),
          .kvLayout = kvLayout,
          .windowTokens = config.model.capabilities.maximumContextTokens,
@@ -794,7 +798,9 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   // engine lends it to model execution without inspecting its plans.
   ops::ExecutionPlans operators(device);
   model::LoadedModel loaded;
-  model::ModelMemoryPlan modelMemoryPlan;
+  // The runtime's lane state and arenas as the model loaded, with its K/V in
+  // memory and where it spills.
+  model::ModelMemoryPlan modelMemoryPlan, spillModelMemoryPlan;
   // Loads the model as loadOptions says, `again` once it loaded, and plans
   // its arenas: as it loaded, and for whatever streams of it.
   const auto load = [&](bool again) {
@@ -818,14 +824,22 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     try {
       modelMemoryPlan = model::plannedRuntimeMemory(loaded, operators, config.kvFormat, config.stateFormat,
                                                     model::StreamedParts::loaded(loaded));
-      for (const bool experts : {false, true})
-        for (const bool table : {false, true}) {
-          const model::ModelMemoryPlan streamed = model::plannedRuntimeMemory(
-              loaded, operators, config.kvFormat, config.stateFormat,
-              {.experts = experts && streamable.expertBytes, .tableRowBytes = table ? streamable.tableRowBytes : 0});
+      if (kvMaySpill)
+        spillModelMemoryPlan = model::plannedRuntimeMemory(loaded, operators, config.kvFormat, config.stateFormat,
+                                                           model::StreamedParts::loaded(loaded, true));
+      const auto arenas = [&](model::StreamedParts parts) {
+        const model::ModelMemoryPlan streamed =
+            model::plannedRuntimeMemory(loaded, operators, config.kvFormat, config.stateFormat, parts);
+        return streamed.sharedPrefillPlannedAllocatedBytes + streamed.sharedDecodePlannedAllocatedBytes;
+      };
+      for (const bool table : {false, true}) {
+        const uint64_t tableRowBytes = table ? streamable.tableRowBytes : 0;
+        for (const bool experts : {false, true})
           arenaBytes[experts][table] =
-              streamed.sharedPrefillPlannedAllocatedBytes + streamed.sharedDecodePlannedAllocatedBytes;
-        }
+              arenas({.experts = experts && streamable.expertBytes, .tableRowBytes = tableRowBytes});
+        if (kvMaySpill)
+          spillArenaBytes[table] = arenas({.tableRowBytes = tableRowBytes, .kv = true});
+      }
     } catch (const std::exception &error) {
       throw RuntimeResourcesError(
           RuntimeResourceStage::MemoryPlanning,
@@ -837,8 +851,9 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   // The engine's memory plan, with `stagingBytes` set aside for the disk
   // tier's state staging and `aneFfnBytes` for the prefill FFN's Neural Engine
   // split, each part as it loaded, whole or through its store, and the spill
-  // plan beside them. Floors that the spill plan refuses refuse it with the
-  // engine plan's breakdown.
+  // plan beside them, with the arenas of a runtime whose K/V spills where it
+  // spills. Floors that the spill plan refuses refuse it with the engine
+  // plan's breakdown.
   const auto planWith = [&](uint64_t stagingBytes, uint64_t aneFfnBytes) -> EngineMemoryPlanResult {
     const auto asLoaded = [](uint64_t storeBytes) {
       return storeBytes ? StreamedSetting{StreamedSetting::Mode::Size, storeBytes}
@@ -850,7 +865,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
         loaded.targetActualAllocatedBytes(),
         loaded.draft.actualAllocatedBytes,
         loaded.vision.actualAllocatedBytes,
-        modelMemoryPlan,
+        streamed.plan && streamed.plan->spill.enabled ? spillModelMemoryPlan : modelMemoryPlan,
         stagingBytes,
         aneFfnBytes,
         loaded.streamedTable() ? loaded.streamedTable()->committedBytes() : 0,
