@@ -666,15 +666,23 @@ void testOverridesAndRefusals() {
 
   inputs = kFlashNext.inputs(kStudio);
   const StreamedMemoryPlan automatic = requirePlan(inputs);
-  inputs.hotCache = {StreamedSetting::Mode::Size, 1'200 * kMiB};
+  inputs.hotCacheBytes = 1'200 * kMiB;
   const StreamedMemoryPlan raised = requirePlan(inputs);
   require(raised.spill.hotTargetBytes == 1'200 * kMiB && raised.spill.hotFloorBytes == automatic.spill.hotFloorBytes &&
               automatic.expertBytes - raised.expertBytes == 1'200 * kMiB - automatic.spill.hotFloorBytes,
           "--sparse-kv-memory did not take its target from the experts");
-  inputs.hotCache = {StreamedSetting::Mode::Size, 300 * kMiB};
-  require(!planStreamedMemory(inputs).plan, "a hot cache below its floor was planned");
-  inputs.hotCache = {StreamedSetting::Mode::Size, 64 * kGiB};
-  require(!planStreamedMemory(inputs).plan, "a hot cache beyond the budget was planned");
+  // Below its floor, or beyond what the floors leave, it is refused by name
+  // as a setting, never as floors the budget cannot hold.
+  for (const auto &[bytes, refusal] : {std::pair<uint64_t, std::string>{300 * kMiB, "is less than"},
+                                       std::pair<uint64_t, std::string>{16 * kGiB, "MiB the floors leave"}}) {
+    inputs.hotCacheBytes = bytes;
+    const StreamedMemoryResult refused = planStreamedMemory(inputs);
+    require(!refused.plan && !refused.requiredBytes &&
+                refused.error.find("--sparse-kv-memory of " + std::to_string(bytes / kMiB) + " MiB") !=
+                    std::string::npos &&
+                refused.error.find(refusal) != std::string::npos,
+            "a hot cache target the plan cannot hold was not refused by name");
+  }
 
   // Floors beyond the budget: Flash-Next with --max-memory 8G.
   inputs = kFlashNext.inputs(kM6);

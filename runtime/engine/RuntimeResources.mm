@@ -322,18 +322,24 @@ DiskTier openDiskTier(const RuntimeResourcesConfig &config, const std::string &c
   return tier;
 }
 
-// A plan the budget cannot hold, refused with what its floors take, or a
-// setting the planner refuses.
-RuntimeResourcesError planRefusal(const StreamedMemoryResult &result, uint64_t hardBudgetBytes) {
+// A setting the planner refuses, or a plan the budget cannot hold, refused
+// with what its floors take of those the model has: the stores of parts
+// that stream, and the floors of a block-sparse target's KV on the SSD
+// cache.
+RuntimeResourcesError planRefusal(const StreamedMemoryResult &result, uint64_t hardBudgetBytes,
+                                  const model::StreamableWeights &streamable, const model::ModelDescriptor &model) {
   if (!result.requiredBytes)
     return RuntimeResourcesError(RuntimeResourceStage::Configuration, result.error);
-  return RuntimeResourcesError(
-      RuntimeResourceStage::MemoryPlanning,
-      "model weights with the runtime reserves, one lane's state, the KV runway, the streamed stores at "
-      "their floors, the floors of KV on the SSD cache and any SSD cache state staging require " +
-          std::to_string(result.requiredBytes) + " bytes but the Metal memory budget is " +
-          std::to_string(hardBudgetBytes) + " bytes",
-      {}, RuntimeResourceFailure::EngineCapacity);
+  std::string floors = "model weights with the runtime reserves, one lane's state, the KV runway";
+  if (streamable.expertBytes || streamable.tableBytes)
+    floors += ", the streamed stores at their floors";
+  if (model.capabilities.sparseKv)
+    floors += ", the floors of KV on the SSD cache";
+  return RuntimeResourcesError(RuntimeResourceStage::MemoryPlanning,
+                               floors + " and any SSD cache state staging require " +
+                                   std::to_string(result.requiredBytes) + " bytes but the Metal memory budget is " +
+                                   std::to_string(hardBudgetBytes) + " bytes",
+                               {}, RuntimeResourceFailure::EngineCapacity);
 }
 
 // An explicit size of `option` that changes nothing: the model has no `what`
@@ -578,13 +584,12 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
       !config.model.valid() || !config.hostMemory || !config.diskVolume ||
       config.buildId.empty() || !config.maximumImagePatches ||
       config.maximumImagePatches % 4 ||
-      config.maximumImagePatches > ops::kMaximumImagePatches ||
-      config.sparseKvMemory.mode == StreamedSetting::Mode::Off) {
+      config.maximumImagePatches > ops::kMaximumImagePatches) {
     throw RuntimeResourcesError(
         RuntimeResourceStage::Configuration,
         "metallib path, model root, a valid model layout, KV and state format, "
-        "host memory and volume probes, build id, a merge-aligned image patch "
-        "limit no larger than the protocol's and a hot KV cache that is on are required");
+        "host memory and volume probes, build id and a merge-aligned image "
+        "patch limit no larger than the protocol's are required");
   }
   std::unique_ptr<metal::MetalBackend> backend;
   try {
@@ -699,7 +704,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
          .requestedContextTokens = requestedContextTokens,
          .experts = {streamable.expertBytes, streamable.expertFloorBytes, experts},
          .table = {streamable.tableBytes, streamable.tableFloorBytes, table},
-         .hotCache = config.sparseKvMemory,
+         .hotCacheBytes = config.sparseKvMemory,
          .sparseKv = config.model.capabilities.sparseKv,
          .tierWritable = stagingBytes && kvFileOpen,
          .kvSlotBytes = kvSlotBytes,
@@ -770,7 +775,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     // adds the arenas.
     const StreamedMemoryResult planned = storesPlan(false);
     if (!planned.plan)
-      throw planRefusal(planned, hardBudgetBytes);
+      throw planRefusal(planned, hardBudgetBytes, streamable, config.model);
     loadOptions = storesOf(*planned.plan, true);
     // Fail before loading the model when the machine has no headroom at
     // all; the guard installed above keeps checking as residency grows.
@@ -832,7 +837,9 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
 
   // The engine's memory plan, with `stagingBytes` set aside for the disk
   // tier's state staging and `aneFfnBytes` for the prefill FFN's Neural Engine
-  // split, and each part as it loaded: whole, or through its store.
+  // split, each part as it loaded, whole or through its store, and the spill
+  // plan beside them. Floors that the spill plan refuses refuse it with the
+  // engine plan's breakdown.
   const auto planWith = [&](uint64_t stagingBytes, uint64_t aneFfnBytes) -> EngineMemoryPlanResult {
     const auto asLoaded = [](uint64_t storeBytes) {
       return storeBytes ? StreamedSetting{StreamedSetting::Mode::Size, storeBytes}
@@ -840,8 +847,6 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     };
     const StreamedMemoryResult streamed = streamedPlan(
         asLoaded(loadOptions.expertMemoryBytes), asLoaded(loadOptions.streamedTableBytes), stagingBytes, aneFfnBytes);
-    if (!streamed.plan)
-      return {std::nullopt, {false, BudgetErrorCode::KvPoolDoesNotFit, streamed.error, {}}};
     ModelMemoryFootprint footprint{
         loaded.targetActualAllocatedBytes(),
         loaded.draft.actualAllocatedBytes,
@@ -852,9 +857,20 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
         loaded.streamedTable() ? loaded.streamedTable()->committedBytes() : 0,
     };
     ModelMemoryProfile modelProfile{
-        loaded.name(), loaded.maximumContextTokens(),
-        loaded.targetKvLayout(config.kvFormat), footprint, config.stateFormat, streamed.plan->spill};
-    return evaluateEngineMemoryPlan(device, modelProfile, config.maximumMemoryBytes);
+        loaded.name(), loaded.maximumContextTokens(), loaded.targetKvLayout(config.kvFormat), footprint,
+        config.stateFormat, streamed.plan ? streamed.plan->spill : KvSpillPlan{}};
+    EngineMemoryPlanResult result = evaluateEngineMemoryPlan(device, modelProfile, config.maximumMemoryBytes);
+    if (streamed.plan || !result.plan)
+      return result;
+    BudgetValidationStatus &status = result.status;
+    status.valid = false;
+    status.code = BudgetErrorCode::KvPoolDoesNotFit;
+    status.message = streamed.error;
+    if (streamed.requiredBytes) {
+      status.breakdown.minimumRequiredBytes = streamed.requiredBytes;
+      status.breakdown.deficitBytes = streamed.requiredBytes - status.breakdown.hardBudgetBytes;
+    }
+    return {std::nullopt, std::move(status)};
   };
   // The plan with the staging the tier keeps.
   const auto planMemory = [&](uint64_t aneFfnBytes) { return planWith(stateStagingBytes, aneFfnBytes); };
@@ -863,16 +879,20 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   // loads again where it gives a part another store: it loads once where the
   // plan without the arenas already loads each part so, as for a model with
   // no part to stream, and twice otherwise, as where the routed experts
-  // stream. Until the tier measures its volume, the plan takes the cache's
-  // quota for the room it has.
+  // stream. Floors that the arenas take beyond the budget stop the start
+  // with the engine plan's breakdown (requirePlan, below). Until the tier
+  // measures its volume, the plan takes the cache's quota for the room it
+  // has.
   const StreamedMemoryResult planned = storesPlan(true);
-  if (!planned.plan)
-    throw planRefusal(planned, hardBudgetBytes);
-  const model::ModelLoadOptions next = storesOf(*planned.plan, false);
-  if (next.expertMemoryBytes != loadOptions.expertMemoryBytes ||
-      next.streamedTableBytes != loadOptions.streamedTableBytes) {
-    loadOptions = next;
-    load(true);
+  if (!planned.plan && !planned.requiredBytes)
+    throw planRefusal(planned, hardBudgetBytes, streamable, config.model);
+  if (planned.plan) {
+    const model::ModelLoadOptions next = storesOf(*planned.plan, false);
+    if (next.expertMemoryBytes != loadOptions.expertMemoryBytes ||
+        next.streamedTableBytes != loadOptions.streamedTableBytes) {
+      loadOptions = next;
+      load(true);
+    }
   }
   reportStreamedStores(loaded, streamable, config.expertMemory, config.pleMemory);
 
@@ -996,7 +1016,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     if (!spill.enabled) {
       if (config.kvSpillAlways)
         logLine("--kv-spill always ignored: ", config.model.name, " keeps its KV in memory, ", spillOff, ".");
-      if (config.sparseKvMemory.mode == StreamedSetting::Mode::Size)
+      if (config.sparseKvMemory)
         logLine("--sparse-kv-memory ignored: ", config.model.name, " keeps its KV in memory, ", spillOff, ".");
     }
 

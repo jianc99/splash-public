@@ -223,8 +223,9 @@ void testStreamableWeightsAreWhatLoads(const RuntimeResourcesConfig &config) {
 // through a store of all that the first 64K tokens of KV leave, in two
 // loads: the first plans the arenas of either, and the second loads that
 // store. The automatic SSD cache gives its state staging up where it alone
-// would stream them. Off loads them whatever the budget, and a size below the
-// smallest store is refused by name before anything loads.
+// would stream them. Off loads them whatever the budget, a budget without
+// room for their arenas stops the start with its breakdown, and a size below
+// the smallest store is refused by name before anything loads.
 void testAutomaticExpertMemory(RuntimeResourcesConfig config) {
   const model::StreamableWeights weights =
       model::streamableWeights(config.modelRoot, config.model, {.streamExperts = true});
@@ -268,6 +269,19 @@ void testAutomaticExpertMemory(RuntimeResourcesConfig config) {
   config.expertMemory = {StreamedSetting::Mode::Off, 0};
   config.maximumMemoryBytes = 0;
   require(!startStreamed(config).experts, "--expert-memory off streamed the experts");
+  // A budget that holds the weights but not their arenas: the start loads
+  // them, and stops with the engine plan's breakdown.
+  config.maximumMemoryBytes = whole.minimumRequired - whole.arenaBytes / 2;
+  try {
+    static_cast<void>(RuntimeResources::create(config, 0));
+    throw std::runtime_error("a plan without room for its arenas started");
+  } catch (const RuntimeResourcesError &error) {
+    require(error.stage() == RuntimeResourceStage::MemoryPlanning &&
+                error.budgetDescription().find("deficit: " + std::to_string(whole.arenaBytes / 2) + " bytes") !=
+                    std::string::npos,
+            "a start without room for its arenas was refused without its breakdown");
+  }
+  config.maximumMemoryBytes = 0;
   config.expertMemory = {StreamedSetting::Mode::Size, weights.expertFloorBytes};
   const StreamedStart floor = startStreamed(config);
   require(floor.experts && floor.experts->slots == kMoeExperts && floor.loads == 1,
