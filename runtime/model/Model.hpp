@@ -763,9 +763,14 @@ public:
   // buffers, and the maximum when no number of states does (a buffer no
   // cached state holds, such as Qwen's draft rings).
   [[nodiscard]] virtual uint32_t statesToActivate() const noexcept { return 0; }
-  // The most rows of one lane's prefill command: a prefill group's when the
-  // model runs them (one lane's chunks, layer by layer), else a chunk's.
-  [[nodiscard]] virtual uint32_t prefillGroupRows() const noexcept { return ExecutionLimits::prefillTokenBudget; }
+  // The most rows of one lane's prefill command: a prefill group's where
+  // the model runs them (one lane's chunks, layer by layer) to read
+  // something once for all of them, its streamed experts for every lane or a
+  // spilled history for a lane whose K/V spills (`spills`), else a chunk's.
+  [[nodiscard]] virtual uint32_t prefillGroupRows(bool spills) const noexcept {
+    static_cast<void>(spills);
+    return ExecutionLimits::prefillTokenBudget;
+  }
   // Releases one unit of idle model memory and returns its bytes; zero when
   // nothing in scope is idle. A unit is one pooled state buffer (keepLane
   // keeps those one lane starts from); with BuffersThenCaches, once no

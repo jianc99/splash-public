@@ -2996,7 +2996,10 @@ Runtime::snapshotToDisk(uint64_t requestId, std::function<void()> completion) {
   return impl_->states.snapshotToDisk(residentLane(requestId), std::move(completion));
 }
 
-uint32_t Runtime::prefillGroupRows() const noexcept { return impl_->geometry.prefillChunks * kPrefillRows; }
+uint32_t Runtime::prefillGroupRows(bool spills) const noexcept {
+  const bool groups = impl_->model.expertStore() || (spills && impl_->geometry.spilledKv);
+  return (groups ? impl_->geometry.prefillChunks : 1) * kPrefillRows;
+}
 
 uint32_t Runtime::statesToActivate() const noexcept {
   return impl_->states.statesToActivate();

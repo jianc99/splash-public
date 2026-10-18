@@ -142,7 +142,7 @@ void Engine::submit(EngineRequest value) {
        .constrained = stored.request.constraint == ConstraintMode::TokenMask,
        .prefillTokens = stored.promptTokens,
        .deadlineMilliseconds = stored.request.deadlineMilliseconds,
-       .prefillGroupRows = model_.prefillGroupRows()});
+       .prefillGroupRows = model_.prefillGroupRows(false)});
   ++counters_.submitted;
 }
 

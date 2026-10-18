@@ -1267,7 +1267,7 @@ void requirePrefillGroupMatchesItsChunks(model::Runtime &executor, const kv::Pag
                                          const model::QwenStateStorage &states, std::span<const uint32_t> chat,
                                          bool vision) {
   constexpr uint32_t chunk = model::ExecutionLimits::prefillTokenBudget;
-  if (executor.prefillGroupRows() <= chunk) {
+  if (executor.prefillGroupRows(true) <= chunk) {
     std::cout << "prefill_group=SKIP (the target runs no prefill groups)\n";
     return;
   }
@@ -3061,7 +3061,8 @@ void requireSpilledKvMatchesResident(metal::MetalBackend &backend, const model::
   for (uint32_t index = 0; index < ends.size(); ++index) {
     std::vector<uint32_t> &commands = ends[index];
     commands = {std::min(tokens, firstEnd + (index < 2 ? kIntoPage : 0))};
-    while (commands.back() < tokens) commands.push_back(std::min(tokens, commands.back() + runtime.prefillGroupRows()));
+    while (commands.back() < tokens)
+      commands.push_back(std::min(tokens, commands.back() + runtime.prefillGroupRows(true)));
     require(commands.size() > 1 &&
                 commands[commands.size() - 2] / kv::kPageTokens > spill.densePages() + options.windowPages,
             "--spill-tokens leaves no prefill command whose history spilled");
