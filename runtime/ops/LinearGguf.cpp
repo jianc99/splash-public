@@ -21,7 +21,8 @@ constexpr size_t kFusedSegments = std::extent_v<decltype(GgufDecodeFusedParams::
 
 // The staged decode tile that holds `rows` rows: MPP computes 16-row
 // fragments, so the tile holds 8, 16 or 32 rows and a three-lane step runs
-// the 32-row tile over four lanes of storage.
+// the 32-row tile over four lanes of storage (a one-lane step may run the
+// 16-row tile over two, LinearConfig::sixteenRows).
 constexpr uint32_t stagedTileRows(uint32_t rows) noexcept { return rows <= 8 ? 8 : rows <= 16 ? 16 : 32; }
 
 std::string decodeKernel(const char *format, uint32_t rows, char epilogue) {
@@ -266,6 +267,8 @@ void LinearPlan::requireConfiguration() const {
     throw std::invalid_argument("only the staged block tile spreads its walks");
   if (c.oneGateUpPass && (c.tile != LinearTile::GgufStaged || !decode || workload_.epilogue != LinearEpilogue::GateUp))
     throw std::invalid_argument("only a staged block gate/up decode runs gate and up in one pass");
+  if (c.sixteenRows && (c.tile != LinearTile::GgufStaged || !decode || workload_.rows != SPLASH_TARGET_VERIFY_ROWS))
+    throw std::invalid_argument("only a staged one-lane block decode runs the 16-row tile");
   if (c.tile == LinearTile::GgufRegister) {
     // Split boundaries fall on coefficient units, of 64 inputs at the fewest
     // (quant_register_unit); addGgufRegister checks each segment's.
@@ -289,7 +292,7 @@ uint32_t LinearPlan::storageRows() const noexcept {
   if (config_.tile == LinearTile::GgufRegister) return workload_.rows;
   if (config_.tile == LinearTile::GgufPrefill)
     return (workload_.rows + GGUF_PREFILL_ROWS - 1) / GGUF_PREFILL_ROWS * GGUF_PREFILL_ROWS;
-  return stagedTileRows(workload_.rows);
+  return config_.sixteenRows ? 16 : stagedTileRows(workload_.rows);
 }
 
 LinearScratchSize LinearPlan::scratchSize() const noexcept {
@@ -316,7 +319,7 @@ LinearScratchSize LinearPlan::scratchSize() const noexcept {
 }
 
 LinearConfig Linear::ggufBaseline(LinearWorkload w, std::span<const Projection *const> projections,
-                                  bool registerFormats, bool fourBits) const {
+                                  ProjectionShape shape) const {
   const auto [n, k] = w.matrix;
   // Prefill: 128-row tiles. A chunk of up to 32 rows runs the staged tile
   // of its rows (8, 16 or 32, two simdgroups) with the decode split rule:
@@ -337,11 +340,11 @@ LinearConfig Linear::ggufBaseline(LinearWorkload w, std::span<const Projection *
   // runs it on narrow grids (apple10Registers).
   const bool spreads = spreadsStagedDecode(family_, gpuCores_),
              onePass = spreads && w.epilogue == LinearEpilogue::GateUp && oneFormat(projections);
-  if (registerFormats && everyQuantizedSegment(projections, registerTileTakes) &&
+  if (shape.registerFormats && everyQuantizedSegment(projections, registerTileTakes) &&
       (family_ == GpuFamilyClass::Apple9
            ? !apple9Stages(w, projections)
            : apple10Registers(w.rows, onePass ? 2 * n : n, gpuCores_,
-                              fourBits && everyQuantizedSegment(projections, fourBitsPerWeight))))
+                              shape.fourBits && everyQuantizedSegment(projections, fourBitsPerWeight))))
     return registerDecode(n, k, gpuCores_);
   // Decode tiles walking K in lockstep all fetch the same slice of the input
   // at each step, just written by the operator before and in no cache yet,
@@ -363,10 +366,38 @@ LinearConfig Linear::ggufBaseline(LinearWorkload w, std::span<const Projection *
   // Pro); 8-bit, whose pair streams near DRAM's rate either way, takes 0.1-0.6%
   // more. A 12-core M6 holds 45 chains of the pair per core, saturated, where
   // one pass took 2-11% more.
-  if (onePass) return oneGateUpPassDecode(n, k, gpuCores_, family_);
-  LinearConfig config = stagedDecode(n, k, gpuCores_, family_);
+  //
+  // One lane of a projection whose quantized segments store fewer than four
+  // and a half bits per weight together runs unsplit on Apple10's 16-row
+  // tile, the second lane of its storage padding: the lane's rows are the
+  // bits of the 8-row tile's (gguf-projection checks it), in less time. On
+  // the 27B UD-IQ3_XXS's shapes, DRAM-cold and unsplit, a 12-core M6 takes
+  // 2-10% less (its fused inputs 8-10%, an IQ3_S down projection 1% more)
+  // and a 32-core M5 Max 5-7% less (a one-pass gate/up pair 10%), and the
+  // 27B decodes one lane 3.3-3.6% faster on the M6; Flash-Next's fused
+  // inputs take 7-9% less on a 20-core M5 Pro, its one-lane cycle about 1%.
+  // At 4.5 bits the M6 takes up to 1.6% more (Q4_K, the vocabulary head's),
+  // and split plans up to 18% more. A gate/up pair runs it where both its
+  // tensors' own plans do (sixteenRowLane).
+  LinearConfig config =
+      onePass ? oneGateUpPassDecode(n, k, gpuCores_, family_) : stagedDecode(n, k, gpuCores_, family_);
   config.spread = spreads;
+  config.sixteenRows = sixteenRowLane(w, config.splits, projections, shape);
   return config;
+}
+
+bool Linear::sixteenRowLane(LinearWorkload w, uint32_t splits, std::span<const Projection *const> projections,
+                            ProjectionShape shape) const {
+  // A gate/up pair, whose K split is at most its tensors', where both their
+  // own plans run it: the decode storage of their shapes then holds its rows
+  // (decodeStorageRows).
+  if (w.epilogue == LinearEpilogue::GateUp)
+    return !projections.empty() && std::all_of(projections.begin(), projections.end(), [&](const Projection *p) {
+             return p && ggufBaseline({w.matrix, w.rows}, std::span(&p, 1)).sixteenRows;
+           });
+  if (!projections.empty()) shape = projections.front()->shape();
+  return family_ == GpuFamilyClass::Apple10 && w.rows == SPLASH_TARGET_VERIFY_ROWS && splits == 1 &&
+         shape.underFourAndHalfBits;
 }
 
 LinearScratchSize Linear::ggufDecodeScratchSize(LinearWorkload w, bool registerFormats) const {
@@ -374,7 +405,7 @@ LinearScratchSize Linear::ggufDecodeScratchSize(LinearWorkload w, bool registerF
   // Every format the register tile takes K inputs in has one register plan,
   // whose partitions keep whole coefficient units of each (kRegisterTiers);
   // a projection of segments the tile does not take has none.
-  LinearScratchSize size = LinearPlan(w, ggufBaseline(w, {}, registerFormats)).scratchSize();
+  LinearScratchSize size = LinearPlan(w, ggufBaseline(w, {}, {.registerFormats = registerFormats})).scratchSize();
   // A projection of segments the register tile does not take, or of fewer
   // bits, stages where the device registers.
   if (family_ == GpuFamilyClass::Apple9 || apple10Registers(w.rows, n, gpuCores_, true))

@@ -4,13 +4,15 @@
 // decode tiles:
 // - decode: the Apple9 register tile and the staged tile at one to four lanes (three on the staged 32-row tile over
 //   NaN padding rows), every K split, each epilogue, dense inputs and sparse ones past half's range; a lane's rows
-//   equal a one-lane projection of them bitwise; the plain epilogue into fp32 (the logits) holds the values its
-//   bf16 output rounds, bit for bit, each within fp64 before rounding;
-// - fused: three segments of different formats in one projection equal the projections of each segment alone;
+//   equal a one-lane projection of them bitwise, as does one lane on the staged 16-row tile over a NaN padding lane
+//   (LinearConfig::sixteenRows); the plain epilogue into fp32 (the logits) holds the values its bf16 output rounds,
+//   bit for bit, each within fp64 before rounding;
+// - fused: three segments of different formats in one projection equal the projections of each segment alone, and
+//   one lane of them on the 16-row tile the 8-row tile's;
 // - both on the staged tile's spread walk too (LinearConfig::spread), over partitions from 72 steps down to 9, an odd
 //   count, whose tiles' walks wrap past the partition's end;
 // - gate/up: each format's gate with the next format the tile takes as up, and in one pass
-//   (LinearConfig::oneGateUpPass) bitwise the two passes at the same K split;
+//   (LinearConfig::oneGateUpPass) bitwise the two passes at the same K split, one lane on the 16-row tile too;
 // - prefill: 128-row tiles with each epilogue, whose simdgroups past the chunk write nothing, and chunks of up to 32
 //   rows on the decode tiles equal to them bitwise; fused segments at their column offsets;
 // - split visibility: two projections that share the split scratch, at every pair of K splits either tile's policy
@@ -447,7 +449,7 @@ LinearWorkload decode(LinearMatrix matrix, uint32_t lanes, LinearEpilogue epilog
 // ---------------------------------------------------------------- decode
 // One tile and walk on single tensors [512, K] in each of `formats` (gate in the format three further on of those):
 // at every lane count, K split the tile takes and epilogue, on dense and sparse inputs, every output within fp64 and
-// each lane's rows equal to a one-lane projection of them.
+// each lane's rows equal to a one-lane projection of them, on the staged tile's 16-row tile too.
 void decodeTile(MetalBackend &backend, const Linear &linear, LinearTile tile, bool spread, uint32_t K,
                 const std::vector<Fmt> &formats) {
   constexpr uint32_t N = 512, columns = N + kPadding;
@@ -481,6 +483,22 @@ void decodeTile(MetalBackend &backend, const Linear &linear, LinearTile tile, bo
                                      storageRows(aux, columns, kLaneRows, kLaneRows), kPoisonNaN, N,
                                      what + " lane " + std::to_string(lane) + " alone"));
           }
+          // The first lane on the 16-row tile, over a padding lane of NaN rows: the 8-row tile's bits, and the fp32
+          // plain outputs rounding to them.
+          if (staged) {
+            const LinearWorkload one = decode({columns, K}, 1, epilogue);
+            LinearConfig sixteen = config(tile, one, splits, spread);
+            sixteen.sixteenRows = true;
+            const std::string label = what + " lane 0 on the 16-row tile";
+            const std::vector<uint16_t> rows = storageRows(x, K, kLaneRows, 2 * kLaneRows);
+            const Outcome out = run(backend, linear, Linear::plan(one, sixteen, FloatOutput::BFloat16), up, gated, rows,
+                                    storageRows(residual, columns, kLaneRows, 2 * kLaneRows), kPoisonFinite, N, label);
+            if (!sameRows(out.output, 0, lanesAlone[0].output, 0, kLaneRows, columns))
+              fail(label + ": differs from the 8-row tile");
+            if (epilogue == LinearEpilogue::None)
+              floatOutput(backend, linear, Linear::plan(one, sixteen, FloatOutput::Float32), up, rows, out, dots, N,
+                          staged, label);
+          }
           for (uint32_t lanes = 1; lanes <= kMaximumLanes; ++lanes) {
             const LinearWorkload wl = decode({columns, K}, lanes, epilogue);
             const LinearPlan plan = Linear::plan(wl, config(tile, wl, splits, spread), FloatOutput::BFloat16);
@@ -502,13 +520,13 @@ void decodeTile(MetalBackend &backend, const Linear &linear, LinearTile tile, bo
   }
   section(walkName(tile, spread) + " decode: " + std::to_string(formats.size()) + " formats, K " + std::to_string(K) +
           ", 1-4 lanes, S 1-" + std::to_string(mostSplits) +
-          ", plain/residual/gate-up, dense and sparse inputs within fp64, lanes equal to one-lane projections, fp32 "
-          "plain outputs rounding to bf16's");
+          ", plain/residual/gate-up, dense and sparse inputs within fp64, lanes equal to one-lane projections" +
+          (staged ? " (one lane on the 16-row tile too)" : "") + ", fp32 plain outputs rounding to bf16's");
 }
 
 // One fused projection of three segments of different formats ([512 | 256 | 256, K]) on one tile and walk, each format
 // it takes with the formats three and five further on of those: at every lane count and K split, within fp64 and
-// equal to the projections of each segment alone.
+// equal to the projections of each segment alone; one lane on the staged 16-row tile equal to the 8-row tile.
 void fusedDecode(MetalBackend &backend, const Linear &linear, LinearTile tile, bool spread) {
   const uint32_t K = decodeInputs(spread);
   const std::vector<Fmt> formats = tileFormats(tile);
@@ -531,6 +549,16 @@ void fusedDecode(MetalBackend &backend, const Linear &linear, LinearTile tile, b
         const Outcome out = run(backend, linear, plan, fused, nullptr, storageRows(x, K, rows, storage), {},
                                 kPoisonNaN, covered, label);
         checkValues(out, dots, {}, {}, wl, rows, covered, tile == LinearTile::GgufStaged, label);
+        // One lane on the 16-row tile, over a padding lane of NaN rows: the 8-row tile's bits.
+        if (lanes == 1 && tile == LinearTile::GgufStaged) {
+          LinearConfig sixteen = config(tile, wl, splits, spread);
+          sixteen.sixteenRows = true;
+          const Outcome wide = run(backend, linear, Linear::plan(wl, sixteen, FloatOutput::BFloat16), fused, nullptr,
+                                   storageRows(x, K, rows, 2 * kLaneRows), {}, kPoisonFinite, covered,
+                                   label + " on the 16-row tile");
+          if (!sameRows(wide.output, 0, out.output, 0, rows, columns))
+            fail(label + ": the 16-row tile differs from the 8-row tile");
+        }
         uint32_t offset = 0;
         for (const Tensor *part : parts) {
           const Projection alone = projection({part}, part->N);
@@ -550,7 +578,8 @@ void fusedDecode(MetalBackend &backend, const Linear &linear, LinearTile tile, b
   }
   section(walkName(tile, spread) + " fused: three segments in " + std::to_string(formats.size()) +
           " format triples, K " + std::to_string(K) +
-          ", 1-4 lanes, S 1-8 within fp64 and equal to each segment's projection");
+          ", 1-4 lanes, S 1-8 within fp64 and equal to each segment's projection" +
+          (tile == LinearTile::GgufStaged ? ", one lane on the 16-row tile equal to the 8-row tile" : ""));
 }
 
 // Gate/up on one tile for the gate of each format it takes with the up of the next one ([256, 1024]), so that every
@@ -584,8 +613,8 @@ void gateUpPairs(MetalBackend &backend, const Linear &linear, LinearTile tile) {
 }
 
 // Gate/up in one pass (LinearConfig::oneGateUpPass) on the staged tile, gate and up in each format ([768, K]), and in
-// Q4_K and MLX 4-bit at the 27B's [17408, 5120]: at every lane count, K split and walk, bitwise the output of the gate
-// and up passes, whatever the partials held before.
+// Q4_K and MLX 4-bit at the 27B's [17408, 5120]: at every lane count, K split and walk, and for one lane on the 16-row
+// tile too, bitwise the output of the gate and up passes, whatever the partials held before.
 void oneGateUpPass(MetalBackend &backend, const Linear &linear, bool spread) {
   const auto pairs = [&](Fmt f, uint32_t N, uint32_t K, uint32_t columns, std::span<const uint32_t> lanes) {
     const Tensor g = tensor(backend, f, N, K), u = tensor(backend, f, N, K);
@@ -604,6 +633,14 @@ void oneGateUpPass(MetalBackend &backend, const Linear &linear, bool spread) {
         const Outcome two = run(backend, linear, twoPasses, up, &gate, rows, {}, kPoisonNaN, N, label + " two passes");
         const Outcome one = run(backend, linear, onePass, up, &gate, rows, {}, kPoisonFinite, N, label);
         if (!sameRows(one.output, 0, two.output, 0, wl.rows, columns)) fail(label + ": differs from the two passes");
+        // One lane on the 16-row tile, over a padding lane of NaN rows.
+        if (l > 1) continue;
+        c.sixteenRows = true;
+        const LinearPlan sixteen = Linear::plan(wl, c, FloatOutput::BFloat16);
+        const Outcome wide = run(backend, linear, sixteen, up, &gate, storageRows(x, K, wl.rows, sixteen.storageRows()),
+                                 {}, kPoisonFinite, N, label + " on the 16-row tile");
+        if (!sameRows(wide.output, 0, two.output, 0, wl.rows, columns))
+          fail(label + ": the 16-row tile differs from the two passes");
       }
   };
   const uint32_t K = decodeInputs(spread);
@@ -612,7 +649,7 @@ void oneGateUpPass(MetalBackend &backend, const Linear &linear, bool spread) {
   for (const Fmt f : {Q4K, Fmt(GGUF_FMT_AF4G64)}) pairs(f, 17408, 5120, 17408, kEndLanes);
   section(walkName(LinearTile::GgufStaged, spread) + " one-pass gate/up: " + std::to_string(FMT_COUNT) +
           " formats at 768x" + std::to_string(K) + ", 1-4 lanes, and Q4_K and MLX 4-bit at 17408x5120, 1 and 4 lanes, "
-          "S 1-8, bitwise the two passes");
+          "S 1-8, one lane on the 16-row tile too, bitwise the two passes");
 }
 
 // ---------------------------------------------------------------- prefill
