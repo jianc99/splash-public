@@ -1991,9 +1991,9 @@ CacheReclaimResult Engine::reuseCachedStateWhilePaused(ReclaimClass upTo) {
 // Host pressure pauses growth, and the pressure controller owns the shrink.
 // Extents that stay allocated are outside that accounting: a request short
 // of pages takes idle cached pages before it grows or waits. Cache is only
-// evicted when the pages the request's class may take can actually cover
-// the shortfall: never those a request holds, nor, for a start a resident
-// lane holds back, the idle KV that states in use restore through
+// evicted when the pages of the shortfall's form the request's class may
+// take can actually cover it: never those a request holds, nor, for a start
+// a resident lane holds back, the idle KV that states in use restore through
 // (Cache::reusablePages). Otherwise it survives for later hits, and the
 // request grows if it is in service and waits if it is not. Only KV goes: a
 // state's buffers give no page while the host refuses growth, unless the
@@ -2006,7 +2006,7 @@ CacheReclaimResult Engine::reuseCachedPagesWhilePaused(const TokenAdmission &adm
                                                        ReclaimClass upTo) {
   if (reclaimIdleState(true))
     return {true, 0};
-  if (cache_.reusablePages(upTo) < admission.additionalPages)
+  if (cache_.reusablePages(upTo, admission.form) < admission.additionalPages)
     return {};
   const CacheReclaimResult reused = cache_.reclaimForPages(
       admission.additionalPages, CacheReclaimMode::ReusePages, upTo, admission.form);
