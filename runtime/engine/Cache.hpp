@@ -240,7 +240,8 @@ enum class CacheReclaimMode { KeepExtents, ReleaseExtents, ReusePages };
 // What becomes of the Full extents a spill's moves leave empty
 // (Cache::spillWritten): they stay allocated for a reclaim to take; they
 // leave memory but one, the runway the next Full pages come from without
-// an allocation; or they all leave.
+// an allocation; or the Full pages left gather in the fewest extents
+// (Cache::compactExtent) and every empty one leaves.
 enum class SpilledExtents : uint8_t { Kept, KeepRunway, Released };
 
 // The highest class a reclaim step may take (the class rule). Ordinary:
