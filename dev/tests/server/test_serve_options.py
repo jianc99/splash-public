@@ -77,8 +77,15 @@ OPTIONS = {
     "--disable-ane": ([(["--disable-ane"], True)], []),
     "--ple-memory": values(
         "--ple-memory",
-        {"auto": None, "off": "off", "OFF": "off", "1M": 1024**2, "2G": 2 * 1024**3},
-        ("0", "bad", "-2G"),
+        {
+            "auto": None,
+            "off": "off",
+            "OFF": "off",
+            "1M": 1024**2,
+            "2G": 2 * 1024**3,
+            "0.75G": 768 * 1024**2,
+        },
+        ("0", "bad", "-2G", ".5G"),
     ),
     "--expert-memory": values(
         "--expert-memory",
@@ -104,8 +111,10 @@ OPTIONS = {
             "1GiB": 1024**3,
             "512mb": 512 * 1024**2,
             "1073741824": 1024**3,
+            "10.4G": 11166914969,
+            "2.5g": 5 * 512 * 1024**2,
         },
-        ("0", "-1G", "bad", "G", str(2**64)),
+        ("0", "-1G", "bad", "G", str(2**64), "1.5", "2.G", "1e3G", "0.0000000001K"),
     ),
     "--idle-release": values(
         "--idle-release",
