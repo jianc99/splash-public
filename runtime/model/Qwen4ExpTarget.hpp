@@ -57,7 +57,7 @@ private:
 
   // A prefill chunk's step: the shared one, the chunk's scratch, the QSA
   // blocks each sequence's rows complete and where each attention layer's
-  // QSA index sits in the KV extents.
+  // QSA index sits in the extents the index tables reach.
   struct PrefillStep : QwenTarget::PrefillStep {
     Qwen4Scratch scratch{};
     std::vector<Qwen4Blocks> blocks{};

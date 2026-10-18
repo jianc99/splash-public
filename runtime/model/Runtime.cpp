@@ -327,12 +327,20 @@ struct Runtime::Impl {
     std::string failure;
   };
 
-  // What a lane's GPU table was last written from. Its entries stay valid
-  // while the revision does: KvPool never releases the extent of a page a
-  // request holds (PageStorage::releaseExtent).
+  // What a lane's GPU tables were last written from. Their entries stay
+  // valid while the revision does: KvPool never releases the extent of a
+  // page a request holds (PageStorage::releaseExtent).
   struct PageTableBinding final {
     uint64_t requestId = 0;
     uint64_t revision = 0;
+  };
+
+  // A lane's GPU tables: its page table and, for a layout with a block
+  // index, its index table (ops::BlockIndex::tables), whose entries reach
+  // every page's index whatever its form.
+  struct LaneTables final {
+    MetalBuffer pages;
+    MetalBuffer index;
   };
 
   MetalBackend &backend;
@@ -790,8 +798,13 @@ struct Runtime::Impl {
     }
   }
 
-  [[nodiscard]] MetalBuffer synchronizedPageTable(Request &entry,
-                                                  const ModelBatchItem &item) {
+  [[nodiscard]] LaneTables laneTables(uint32_t stateLane) const {
+    return {decodeArena->get(stateLane, DecodeTensor::PageTable),
+            decodeArena->get(stateLane, DecodeTensor::IndexTable)};
+  }
+
+  [[nodiscard]] LaneTables synchronizedTables(Request &entry,
+                                              const ModelBatchItem &item) {
     if (entry.stateLane >= pageTableBindings.size())
       throw std::out_of_range("request state lane is outside page tables");
     if (item.pageTable.empty() ||
@@ -801,11 +814,10 @@ struct Runtime::Impl {
     if (!item.pageTableRevision)
       throw std::invalid_argument("request page table has no revision");
     PageTableBinding &binding = pageTableBindings[entry.stateLane];
-    MetalBuffer destination =
-        decodeArena->get(entry.stateLane, DecodeTensor::PageTable);
-    // Rewrite only what changed since the table was written: nothing at the
-    // same revision, the entries from the first changed page on at the next
-    // one, and everything after two changes or for another request.
+    const LaneTables tables = laneTables(entry.stateLane);
+    // Rewrite only what changed since the tables were written: nothing at
+    // the same revision, the entries from the first changed page on at the
+    // next one, and everything after two changes or for another request.
     const auto size = static_cast<uint32_t>(item.pageTable.size());
     uint32_t first = 0;
     if (binding.requestId == entry.id) {
@@ -814,11 +826,15 @@ struct Runtime::Impl {
       else if (binding.revision + 1 == item.pageTableRevision)
         first = std::min(item.pageTableFirstChanged, size);
     }
-    if (first < size)
-      kvPages.writeEntries(item.pageTable, first, destination);
+    if (first < size) {
+      kvPages.writeEntries(item.pageTable, first, tables.pages);
+      if (tables.index)
+        kvPages.writeIndexEntries(item.pageTable, first, tables.index);
+    }
     binding = {entry.id, item.pageTableRevision};
-    return destination;
+    return tables;
   }
+
 
   void addRopeTables(CommandGraph &graph, MetalBuffer targetPositions,
                      uint32_t targetRows, MetalBuffer draftPositions,
@@ -1197,8 +1213,8 @@ struct Runtime::Impl {
   // A lane's rows in a chunk of a prefill command (PrefillChunk): `part`, the
   // rows of the lane's item the chunk runs, with the states they capture;
   // where they sit among the chunk's rows and in its attention scratch; the
-  // lane's page table; the draft context rows they capture (from
-  // captureBegin on among the chunk's) and their states.
+  // lane's tables; the draft context rows they capture (from captureBegin on
+  // among the chunk's) and their states.
   struct PrefillSequence final {
     Request *entry = nullptr;
     ModelBatchItem part;
@@ -1209,7 +1225,7 @@ struct Runtime::Impl {
     uint64_t kvOffset = 0;
     uint32_t captureBegin = 0;
     ChunkedPrefillParams chunk;
-    MetalBuffer pageTable;
+    LaneTables tables;
     DispatchDraftCapturePlan captures;
     std::vector<PrefillStateCapture> stateCaptures;
   };
@@ -1355,7 +1371,7 @@ struct Runtime::Impl {
       const ModelBatchItem &item = items[lane];
       Request &entry = prefillLane(item);
       entries[lane] = &entry;
-      const MetalBuffer pageTable = synchronizedPageTable(entry, item);
+      const LaneTables tables = synchronizedTables(entry, item);
       const uint64_t end = item.logicalPosition + item.tokenCount;
       QwenLogicalLengths lengths = states.metadata(entry.stateLane).lengths;
       size_t nextCapture = 0;
@@ -1378,7 +1394,7 @@ struct Runtime::Impl {
         sequence.attentionStride = (part.tokenCount + kTileRows - 1) / kTileRows * kTileRows;
         sequence.captureBegin = chunk.capturedRows;
         sequence.chunk = chunkParams(part.logicalPosition, part.tokenCount, sequence.attentionStride, item.pageTable);
-        sequence.pageTable = pageTable;
+        sequence.tables = tables;
         sequence.captures = activeDraftCaptures(entry, part);
         sequence.stateCaptures = stateCaptures(part, sequence.captures, lengths);
         for (PrefillStateCapture &capture : sequence.stateCaptures) capture.atEnd = capture.lengths.targetTokens == end;
@@ -1597,7 +1613,8 @@ struct Runtime::Impl {
         destination.queryOffset = sequence.queryOffset;
         destination.kvOffset = sequence.kvOffset;
         destination.chunk = sequence.chunk;
-        destination.pageTable = sequence.pageTable;
+        destination.pageTable = sequence.tables.pages;
+        destination.indexTable = sequence.tables.index;
         destination.convolutionIn = in.convolutionLayers;
         destination.convolutionOut = out.convolutionLayers;
         destination.recurrentIn = in.recurrentLayers;
@@ -1664,7 +1681,7 @@ struct Runtime::Impl {
     // engine's.
     if (entry.tokens.size() != item.logicalPosition)
       throw std::logic_error("decode token history is not exact");
-    static_cast<void>(synchronizedPageTable(entry, item));
+    static_cast<void>(synchronizedTables(entry, item));
     auto *draftInput = contents<uint32_t>(
         decodeArena->get(lane, DecodeTensor::DraftInputTokens),
         "draft input tokens");
@@ -1827,8 +1844,9 @@ struct Runtime::Impl {
           static_cast<uint32_t>(items[lane].pageTable.size()));
     for (uint32_t lane = 0; lane < kLaneCount; ++lane) {
       Request &entry = laneEntry(entries, lane);
-      buffers.pageTables[lane] =
-          decodeArena->get(entry.stateLane, DecodeTensor::PageTable);
+      const LaneTables tables = laneTables(entry.stateLane);
+      buffers.pageTables[lane] = tables.pages;
+      buffers.indexTables[lane] = tables.index;
       buffers.currentGdnStates[lane] = states.current(entry.stateLane).stateBase;
       buffers.nextGdnStates[lane] = states.next(entry.stateLane).stateBase;
       buffers.auxiliary[lane] = states.current(entry.stateLane).auxiliary;
@@ -2525,7 +2543,7 @@ Runtime::prefillAsync(const BatchPlan &plan,
     // run filled with its own rows, but each belongs to a position the rerun
     // captures again, and that capture overwrites the ring slot after the
     // rebuild; clearForColdStart clears the current state again, which
-    // neither command writes; synchronizedPageTable writes nothing at the
+    // neither command writes; synchronizedTables writes nothing at the
     // same revision; image rows the first command encoded are still
     // `encoding` and are copied, not encoded again; and the requests' draws
     // restored, a sampled first token draws the same uniform. The first

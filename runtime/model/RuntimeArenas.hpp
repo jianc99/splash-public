@@ -337,6 +337,10 @@ enum class DecodeTensor : uint32_t {
   ProposalProbs,
   ProposedTokens,
   PageTable,
+  // Indexed by state lane, like PageTable, for a layout with a block index:
+  // the entries of the pages' index (kv::PageStorage::writeIndexEntries),
+  // which a block-sparse attention selects through (ops::BlockIndex).
+  IndexTable,
   // Indexed by state lane, like PageTable: a penalized request's penalty
   // words (ops::Sampling::rebuildPenaltyWords).
   PenaltyState,

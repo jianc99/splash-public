@@ -23,15 +23,29 @@ using splash::test::rejects;
 using splash::test::require;
 
 template <class Weights>
+model::DFlashDraftLayout draftOf() {
+  if constexpr (std::is_same_v<Weights, model::Qwen3_6MoeWeights>)
+    return test::qwen3_6MoeDraft();
+  else if constexpr (std::is_same_v<Weights, model::Qwen4ExpWeights>)
+    return test::flashNextDraft();
+  else
+    return test::qwen3_8Draft();
+}
+
+template <class Weights>
 model::LoadedModel loadedModel() {
   model::LoadedModel result;
   Weights target;
-  const model::DFlashDraftLayout draft =
-      std::is_same_v<Weights, model::Qwen3_6MoeWeights> ? test::qwen3_6MoeDraft() : test::qwen3_8Draft();
+  const model::DFlashDraftLayout draft = draftOf<Weights>();
   const auto projection = [](uint32_t n, uint32_t k) {
     return ops::Projection(n, k, ops::BlockWeights{{ops::QuantizedSegment::planes(GGUF_FMT_Q4K, n, k, {}, {}, {})}});
   };
   const auto &layout = target.layout;
+  // Qwen3.8-Flash-Next's hyper-connection mixes, QSA indexers and PLE layer.
+  const auto hyper = [&] {
+    return model::Qwen4HyperWeights{.norm = {}, .down = projection(layout.hyperRank, layout.streamWidth()),
+                                    .up = projection(layout.streamWidth(), layout.hyperRank), .inject = {}};
+  };
   target.logitsProjection = projection(layout.vocabularySize, layout.hiddenSize);
   target.layers.resize(layout.layers);
   for (uint32_t i = 0; i < layout.layers; ++i) {
@@ -52,7 +66,22 @@ model::LoadedModel loadedModel() {
       layer.upProjection = layer.gateProjection;
       layer.downProjection = projection(layout.hiddenSize, layout.intermediateSize);
     }
+    if constexpr (std::is_same_v<Weights, model::Qwen4ExpWeights>) {
+      layer.mixerHyper = hyper();
+      layer.ffnHyper = hyper();
+      if (layout.isFullAttentionLayer(i))
+        layer.indexer = model::Qwen4IndexerWeights{
+            .query = projection(layout.indexerHeads * layout.indexerHeadDimension, layout.hiddenSize),
+            .key = projection(layout.indexerHeadDimension, layout.hiddenSize), .queryNorm = {}, .keyNorm = {}};
+      if (i == layout.pleLayer)
+        layer.ple = model::Qwen4PleWeights{.key = projection(layout.hiddenSize, layout.pleWidth()),
+                                           .value = projection(layout.hiddenSize, layout.pleWidth()),
+                                           .keyNorm = {}, .queryNorm = {}, .convolutionNorm = {},
+                                           .convolution = {}};
+    }
   }
+  if constexpr (std::is_same_v<Weights, model::Qwen4ExpWeights>)
+    target.finalHyper = hyper();
   ops::VisionLayout vision;
   vision.outputHiddenSize = target.layout.hiddenSize;
   result.descriptor = model::makeModelDescriptor(
@@ -184,6 +213,29 @@ void checkYarnGeometry() {
   }, "invalid model runtime geometry", "a geometry serving another window than the model's was accepted");
 }
 
+// A decode tensor's bytes per lane in a runtime of `geometry`, on an M5's
+// plans.
+uint64_t decodeBytes(const model::RuntimeGeometry &geometry, model::DecodeTensor tensor) {
+  DeviceCapabilities device;
+  device.appleGpuFamily = 10;
+  device.gpuCoreCount = 20;
+  return model::decodeTensorBytes(geometry, ops::ExecutionPlans(device))[static_cast<uint32_t>(tensor)];
+}
+
+// A block-sparse target selects its blocks through index tables of their
+// own, a lane's beside its page table (kv::PageStorage::writeIndexEntries);
+// a target without a block index has none, and its arenas are as they were.
+void checkIndexTables() {
+  const auto geometry = [](const model::LoadedModel &loaded) {
+    return model::RuntimeGeometry::from(loaded, kv::Format::Int8, ops::GdnStateFormat::Float32);
+  };
+  require(decodeBytes(geometry(loadedModel<model::Qwen4ExpWeights>()), model::DecodeTensor::IndexTable) ==
+                  model::kMaximumPageTableEntries * sizeof(SplashKvPage) &&
+              !decodeBytes(geometry(loadedModel<model::Qwen3_8Weights>()), model::DecodeTensor::IndexTable) &&
+              !decodeBytes(geometry(loadedModel<model::Qwen3_6MoeWeights>()), model::DecodeTensor::IndexTable),
+          "a lane's index table is not its block index's alone");
+}
+
 // Arenas are sized from the projections the weights hold, so each must have
 // sizes; an empty one would drop its workspace from the bound silently.
 void checkUnsizedProjection() {
@@ -251,6 +303,7 @@ int main() {
     checkGdnWidths();
     checkGateUpLayers();
     checkYarnGeometry();
+    checkIndexTables();
     const auto dense = loadedModel<model::Qwen3_8Weights>();
     const auto sparse = loadedModel<model::Qwen3_6MoeWeights>();
     checkLaneScratch(dense);
