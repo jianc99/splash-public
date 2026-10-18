@@ -86,21 +86,47 @@ inline uint splash_sparse_list_count(device const uint *counts, uint stride, uin
   return stride ? min(counts[index], stride) : splash_sparse_history_blocks(first_position, active_rows);
 }
 
-// A tile's list, null without a stride, and its entries' count.
+// A tile's list, null without a stride, the locations of its entries where
+// the split binds them (an array of the lists' shape: a list's locations sit
+// where the list does), and its entries' count.
 struct SplashSparseList {
   device const uint *entries;
+  device const uint *locations;
   uint count;
 };
 
 inline SplashSparseList splash_sparse_list(device const uint *lists, device const uint *counts,
                                            uint stride, uint index, uint first_position,
-                                           uint active_rows) {
-  return {stride ? lists + ulong(index) * stride : nullptr,
+                                           uint active_rows, device const uint *locations = nullptr) {
+  const ulong offset = ulong(index) * stride;
+  return {stride ? lists + offset : nullptr, locations ? locations + offset : nullptr,
           splash_sparse_list_count(counts, stride, index, first_position, active_rows)};
 }
 
 // Verify: group.x is the KV head, group.y the split and group.z the lane,
-// whose eight rows attend through the lane's list (block_list).
+// whose eight rows attend through the lane's list (block_list). The located
+// split reads each entry's block where the list's locations name.
+#define SPARSE_VERIFY_SPLIT_BODY(Heads, Group, CacheElement, Located,          \
+                                 Locations, LocationPages, Places)             \
+    constexpr uint Rows = SPLASH_TARGET_VERIFY_ROWS;                           \
+    threadgroup SplashSparseScratch<CacheElement, Rows * Group> scratch;       \
+    constant SplashVerifyAttentionParams &lane = params[group.z];              \
+    const SplashAttentionTile tile =                                           \
+        splash_verify_attention_tile<Heads, Group>(lane, group.x, group.z);    \
+    if (!tile.active || group.y >= tile.splits)                                \
+      return;                                                                  \
+    const SplashSparseList list = splash_sparse_list(                          \
+        lists, counts, lane.block_stride, lane.block_list,                     \
+        tile.first_position, tile.active_rows, Locations);                     \
+    splash_sparse_attention_tile<Heads, Group, Rows, CacheElement, Located>(   \
+        queries + tile.offset,                                                 \
+        SPLASH_LANE_BINDING(group.z, page_table0, page_table1, page_table2,    \
+                            page_table3),                                      \
+        lane.kv, group.x, tile.first_position, tile.active_rows, list.entries, \
+        list.count, list.locations, LocationPages, Places, tile.splits,        \
+        group.y, partials, statistics, tile.first_slot + group.y, scratch,     \
+        thread_index);
+
 #define SPARSE_VERIFY_SPLIT(Name, Heads, Group, CacheElement)                  \
   kernel void Name(                                                            \
       device bfloat *queries [[buffer(0)]],                                    \
@@ -115,27 +141,39 @@ inline SplashSparseList splash_sparse_list(device const uint *lists, device cons
       constant SplashVerifyAttentionParams *params [[buffer(9)]],              \
       uint3 group [[threadgroup_position_in_grid]],                            \
       uint thread_index [[thread_index_in_threadgroup]]) {                     \
-    constexpr uint Rows = SPLASH_TARGET_VERIFY_ROWS;                           \
-    threadgroup SplashSparseScratch<CacheElement, Rows * Group> scratch;       \
-    constant SplashVerifyAttentionParams &lane = params[group.z];              \
-    const SplashAttentionTile tile =                                           \
-        splash_verify_attention_tile<Heads, Group>(lane, group.x, group.z);    \
-    if (!tile.active || group.y >= tile.splits)                                \
-      return;                                                                  \
-    const SplashSparseList list =                                              \
-        splash_sparse_list(lists, counts, lane.block_stride, lane.block_list,  \
-                           tile.first_position, tile.active_rows);             \
-    splash_sparse_attention_tile<Heads, Group, Rows, CacheElement>(            \
-        queries + tile.offset,                                                 \
-        SPLASH_LANE_BINDING(group.z, page_table0, page_table1, page_table2,    \
-                            page_table3),                                      \
-        lane.kv, group.x, tile.first_position, tile.active_rows, list.entries, \
-        list.count, tile.splits, group.y, partials, statistics,                \
-        tile.first_slot + group.y, scratch, thread_index);                     \
+    SPARSE_VERIFY_SPLIT_BODY(Heads, Group, CacheElement, false, nullptr,       \
+                             nullptr, nullptr)                                 \
+  }
+
+// The located split binds the lists' locations and their pages after the
+// lists. The places of a step's blocks take threadgroup memory of their own.
+#define SPARSE_VERIFY_LOCATED_SPLIT(Name, Heads, Group, CacheElement)          \
+  kernel void Name(                                                            \
+      device bfloat *queries [[buffer(0)]],                                    \
+      device float *partials [[buffer(1)]],                                    \
+      device float *statistics [[buffer(2)]],                                  \
+      device const SplashKvPage *page_table0 [[buffer(3)]],                    \
+      device const SplashKvPage *page_table1 [[buffer(4)]],                    \
+      device const SplashKvPage *page_table2 [[buffer(5)]],                    \
+      device const SplashKvPage *page_table3 [[buffer(6)]],                    \
+      device const uint *lists [[buffer(7)]],                                  \
+      device const uint *counts [[buffer(8)]],                                 \
+      device const uint *locations [[buffer(9)]],                              \
+      device const SplashKvPage *location_pages [[buffer(10)]],                \
+      constant SplashVerifyAttentionParams *params [[buffer(11)]],             \
+      uint3 group [[threadgroup_position_in_grid]],                            \
+      uint thread_index [[thread_index_in_threadgroup]]) {                     \
+    threadgroup uint places[SplashSparseStep<CacheElement>::Blocks];           \
+    SPARSE_VERIFY_SPLIT_BODY(Heads, Group, CacheElement, true, locations,      \
+                             location_pages, places)                           \
   }
 SPARSE_VERIFY_SPLIT(verify_attention_q8_sparse_kv2_g12, 2, 12, int8_t)
 SPARSE_VERIFY_SPLIT(verify_attention_bf16_sparse_kv2_g12, 2, 12, bfloat)
+SPARSE_VERIFY_LOCATED_SPLIT(verify_attention_q8_sparse_located_kv2_g12, 2, 12, int8_t)
+SPARSE_VERIFY_LOCATED_SPLIT(verify_attention_bf16_sparse_located_kv2_g12, 2, 12, bfloat)
+#undef SPARSE_VERIFY_LOCATED_SPLIT
 #undef SPARSE_VERIFY_SPLIT
+#undef SPARSE_VERIFY_SPLIT_BODY
 
 // Combines the splits that took entries of the lane's list.
 #define SPARSE_VERIFY_REDUCE(Name, Heads, Group)                               \
@@ -193,8 +231,8 @@ SPARSE_VERIFY_REDUCE(verify_attention_sparse_reduce_kv2_g12, 2, 12)
     splash_sparse_attention_tile<Heads, Group, Rows, CacheElement>(            \
         queries + tile.offset, page_table, params.kv, group.x,                 \
         tile.first_position, tile.active_rows, list.entries, list.count,       \
-        tile.splits, group.z, partials, statistics, tile.first_slot + group.z, \
-        scratch, thread_index);                                                \
+        nullptr, nullptr, nullptr, tile.splits, group.z, partials,             \
+        statistics, tile.first_slot + group.z, scratch, thread_index);         \
   }
 SPARSE_PREFILL_SPLIT(prefill_attention_q8_sparse_kv2_g12, 2, 12, int8_t)
 SPARSE_PREFILL_SPLIT(prefill_attention_bf16_sparse_kv2_g12, 2, 12, bfloat)
