@@ -489,9 +489,10 @@ struct BackendAsyncState {
 // that keeps the GPU awake the runner raises the backend's release counter to
 // the step's value, which ends the GPU's spin through it (host_step_wait),
 // and then runs the step's `then` once its work returned. Each step runs
-// unless the command buffer before it failed; the first step that throws
-// names the command's failure, and a `then` that throws marks the backend
-// unhealthy (EventStep). The runner notes when it took each
+// unless the command buffer before it failed or an earlier step of its
+// command did not run or threw (halted); the first step that throws names the
+// command's failure, and a `then` that throws marks the backend unhealthy
+// (EventStep). The runner notes when it took each
 // step up and when its work returned, which the command's completion reports
 // (timed) against the GPU times of the buffers before and after the step.
 struct HostSteps {
@@ -521,6 +522,9 @@ struct HostSteps {
     // Whether report() handed the round trips on: a command whose late
     // callback the watchdog recovered finishes twice.
     bool reported = false;
+    // Whether a step did not run or threw, after which the runner runs none
+    // of the command's steps (the runner's alone).
+    bool halted = false;
 
     void fail(std::string message) {
         std::lock_guard lock(mutex);
@@ -634,8 +638,11 @@ private:
                 id<MTLSharedEvent> event = steps.event;
                 id<MTLCommandBuffer> before = step.before;
                 bool worked = false;
-                if (before && reached(event, step.ready, before) &&
-                    before.status != MTLCommandBufferStatusError) {
+                // A halted command's step still waits for the work before
+                // it, which the event's value then follows.
+                const bool ready = before && reached(event, step.ready, before) &&
+                                   before.status != MTLCommandBufferStatusError;
+                if (ready && !steps.halted) {
                     const double pickup = awakeSeconds();
                     try {
                         step.work();
@@ -649,6 +656,7 @@ private:
                 } else if (stopping_) {
                     steps.fail("host step not run: the backend stopped");
                 }
+                if (!worked) steps.halted = true;
                 event.signaledValue = step.ready + 1;
                 if (step.release) release(steps.releases, *step.release);
                 if (worked && step.then) {

@@ -216,11 +216,14 @@ enum class HostStepGpu : uint8_t {
 // contents and its own state only. It may also run after submitCommandAsync
 // or wait() threw (its encoding failed after its first buffers were committed,
 // or the watchdog or a shutdown gave the command up), so it owns what it
-// touches. A step is skipped when the command buffer before it failed; the
-// work after it then runs on what the step's buffers held, as all work after
-// a failed buffer runs on what it left, and the command fails. If the work
-// throws, the command fails with its message (its ticket's wait() throws);
-// the work after it still runs. Once a command
+// touches. A step is skipped when the command buffer before it failed, and
+// so is every later step of its command, as are those after a step whose
+// work threw: a later step may build on what an earlier one did (an expert
+// load's later rounds on its first), and a command that failed is given up.
+// The GPU work after a skipped step still runs, on what its buffers held, as
+// all work after a failed buffer runs on what it left, and the command fails
+// with the first failure; a step whose work threw names it (its ticket's
+// wait() throws its message). Once a command
 // completed without a failure, `timed` gets the round trip of each of its
 // host steps (HostStepTiming) on Metal's completion thread; one that throws
 // marks the backend unhealthy, as a completion callback that throws does. A
