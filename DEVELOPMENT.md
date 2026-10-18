@@ -240,8 +240,11 @@ one request's KV in memory (`resident`), the longest context the floors hold
 (`spilled`) and the room the SSD cache has for active KV beside every lane's
 state (`disk`), and in `bound` which one sets the limit (`model`, `memory` or
 `disk`). Its context therefore follows the free space of the cache's volume
-at the start; a dense target's never does, nor does a block-sparse one's with
-`--max-cache-disk 0`.
+at a first start; a dense target's never does, nor does a block-sparse one's
+with `--max-cache-disk 0`. A relaunch keeps its first engine's context
+whatever room the volume has left since: each request's commitment checks
+the room as it starts. The plans that size the streamed stores take the
+room the volume leaves when the start begins, before the weights load.
 
 `--yarn-factor FACTOR` stretches the native window by FACTOR, above 1 and at
 most 4, with YaRN RoPE scaling, as Qwen describes for these models: `2` gives a
@@ -556,7 +559,9 @@ what memory holds, as a dense target's is.
   `min(max_tokens, 4096)` tokens of output, fits the memory the plan leaves
   resident KV beside the other requests' keeps its KV in memory; any other
   spills. A request in memory whose KV cannot grow spills from then on
-  rather than yield its lane or fail: it waits while its pages' copies land.
+  rather than yield its lane or fail: its pages whose copies landed before,
+  as a prefix restored from the SSD cache has them, spill at once, and it
+  waits while the others' copies land.
 - A spilling request writes each committed page once to the SSD cache. Once
   the copy has landed, the page keeps only its index, 24 KiB of the int8
   page's 414 KiB. Its first 2,048 tokens, which rows with less history read
@@ -583,12 +588,21 @@ what memory holds, as a dense target's is.
   A spilling request commits slots for its KV when admitted; one the cache
   cannot hold even alone is refused, one that other requests' commitments
   keep out waits, and one whose prompt fits but not its output ends at the
-  bound it was admitted with.
+  bound it was admitted with, which Messages reports as
+  `model_context_window_exceeded`. A request that cannot spill, the cache
+  short of room, its file closed or its write budget spent, keeps its KV in
+  memory where it fits the context memory holds of one request
+  (`context_bounds.resident`). Past what it committed, as when its output
+  outgrows the 4,096 tokens admission counted, a request commits each
+  page's slot as it writes it, while the room lasts; its pages stay in
+  memory beyond it, and the other requests' committed pages are still
+  written.
 - The KV a spilling request writes is in use and always written, so one long
   request may overdraw `--max-cache-disk-writes` once. Until the budget
   covers what spilling requests were promised, a new request that would
   spill keeps its KV in memory where it fits and is refused otherwise
-  (`kv_write_budget`, which it may retry).
+  (`kv_write_budget`, 503 with a `Retry-After` of the seconds until the
+  budget covers them again as it refills).
 - A block that cannot be read back fails only the requests that read it, as
   `kv_unreadable`, which they may retry; the copy is dropped.
 
@@ -1089,7 +1103,9 @@ turn. Omitted from Chat or Responses, the output may use all the context the
 prompt leaves: the context limit, and `--request-timeout` when set, are the only
 server bounds on a request that names no limit. A response the context limit
 ends finishes as one its limit ends; Messages gives it the `stop_reason`
-`model_context_window_exceeded`, as in Anthropic's API, not `max_tokens`. An
+`model_context_window_exceeded`, as in Anthropic's API, not `max_tokens`, and so
+does one the engine ends before its limit at what the SSD cache or memory holds
+of a long request's KV ([KV on the SSD](#kv-on-the-ssd)). An
 invalid value returns 400 naming the field the request sent. Messages refuses
 a final assistant message (prefill) with 400; `count_tokens` still counts it.
 
@@ -1390,7 +1406,7 @@ Proxy consumers can use these fields; additional fields may be added:
 | `weights.idle_release_seconds`, `released`, `restoring`, `restores`, `restore_failures` | `--idle-release` in seconds (`null` for `off`), whether the weights' memory is released now, whether a request's restore of it is under way (it stays `released` until the last image is back), the times it was restored for a request since engine start, and the restores that gave up for want of memory |
 | `streamed_table` | While the PLE table streams, the [streamed PLE table](#ple-table-streaming)'s cache, stages, reads and prefetches; `null` otherwise |
 | `streamed_experts` | While routed experts stream, the [streamed experts](#streamed-experts)' store: its slots and resident experts, per use its loads, reads, read-ahead and host-step round trips, and its failure; `null` otherwise |
-| `kv_spill` | While a block-sparse target's KV can go to the SSD, its [KV on the SSD](#kv-on-the-ssd): the requests that started in each mode, converted to `spill`, had their output bounded or ended at that bound, and were refused for the quota, the write budget or a closed tier, and the starts waiting for the quota (`requests`); the pages that hold only their index and those whose KV is on the SSD; the write-through of spilling requests' pages; page moves, rewrites and restores; the quota of KV in service; the hot block cache's memory, hits, reads and host steps (`block_cache`) and the history streams' reads and staging, the streamed commands that ran beside decoders, and the decoders' gaps across them (`history_stream`); `null` for a target whose KV stays in memory, as the plan's `memory_plan.budget.kv_spill` is |
+| `kv_spill` | While a block-sparse target's KV can go to the SSD, its [KV on the SSD](#kv-on-the-ssd): the requests that started in each mode, converted to `spill`, had their output bounded or ended at that bound, and were refused for the quota, the write budget or a closed tier, and the starts waiting for the quota (`requests`); the pages that hold only their index and those whose KV is on the SSD; the write-through of spilling requests' pages; page moves, rewrites and restores; the quota of KV in service; the hot block cache's memory, hits, reads and host steps (`block_cache`; `read` over `resolves` is the blocks a layer's step missed on average) and the history streams' reads, how long each layer's took (`read_ms`, whose total gives with `bytes` the streams' bandwidth) and staging, the streamed commands that ran beside decoders, and the decoders' gaps across them (`history_stream`); `null` for a target whose KV stays in memory, as the plan's `memory_plan.budget.kv_spill` is |
 | `memory_plan.budget.context_bounds` | What bounds `maximum_context_tokens` ([memory and context](#memory-and-context)): the model's `window`, one request's KV in memory (`resident`), the longest context a block-sparse target's floors hold (`spilled`) and its SSD cache's room holds (`disk`), and the `bound` that sets the limit: `model`, `memory` or `disk` |
 | `ane_ffn.state`, `share`, `minimum_rows`, `reason` | The prefill FFN's [Neural Engine split](#neural-engine-prefill): `split` while it serves, at `share` of the FFN's channels over chunks of `minimum_rows` rows or more; `off` when the start left the GPU alone (`share` and `minimum_rows` 0); `stopped` once it stopped while serving, until the engine restarts. `reason` is the start's outcome, or why the split stopped |
 | `ane_ffn.split_commands`, `evaluations`, `ane_ms`, `reruns` | Prefill commands the split ran since engine start, the Neural Engine's evaluations in them and its milliseconds over them (each evaluation's from the GPU's signal to start it to its report); and the chunks the GPU ran again alone after the split's work for them failed |
@@ -1467,7 +1483,8 @@ otherwise.
 `{"type": "error", "error": {"type", "message"}}`, with Anthropic's type for the
 status, such as `overloaded_error` for 503. `/v1/systemone` answers invalid
 requests with 422 `detail` arrays and every 503 with 529. Every 503, and every
-529, carries `Retry-After: 1`. A connection the server refuses before reading
+529, carries `Retry-After: 1`, unless the engine says when a retry may succeed,
+as `kv_write_budget` does. A connection the server refuses before reading
 any of its request, as when every connection slot is taken
 ([request limits](#request-limits-and-timeouts)), gets one fixed 503 whatever
 its path, `/v1/systemone`'s included: OpenAI's `server_error` with code
@@ -1496,7 +1513,7 @@ its path, `/v1/systemone`'s included: OpenAI's `server_error` with code
 | 503 | `resource_timeout` | The request waited for memory, or for the SSD cache's room for its KV, and got none in time; retry, or free memory. |
 | 503 | `mask_timeout` | The server left the request's token mask unanswered for 5 s; retry. |
 | 503 | `kv_unreadable` | KV of an earlier part of the request could not be read back from the SSD cache, which gave the copy up; a retry recomputes it. |
-| 503 | `kv_write_budget` | The request's KV does not fit in memory and would go to the SSD cache, whose `--max-cache-disk-writes` budget is spent until it refills. |
+| 503 | `kv_write_budget` | The request's KV does not fit in memory and would go to the SSD cache, whose `--max-cache-disk-writes` budget is spent until it refills; `Retry-After` says when it covers what spilling requests were promised again. |
 | 503 | `runtime_busy` | The server could not hand the request's token mask to the engine: its mask queue was full or the engine connection failed; retry. |
 | 504 | `request_timeout` | The request's `timeout`, or `--request-timeout`, ran out. |
 | 505 | `http_version_not_supported` | The request is not HTTP/1.0 or HTTP/1.1. |
@@ -2825,8 +2842,10 @@ does the automatic quota where the plan has no room for the staging beside the
 model and the requested context, so a start the staging would fail goes on
 without the tier, and where the plan refuses the Neural Engine split beside the
 staging but not without it (`aneFfnRefused`): the split wins. The disk plays no
-part in the plan, so it changes no start's context; the server's relaunch of
-the engine decides the staging as its first engine did and keeps that engine's
+part in a dense target's plan, so it changes no start's context; a block-sparse
+target's first start takes its room for active KV into its context
+([memory and context](#memory-and-context)). The server's relaunch of the
+engine decides the staging as its first engine did and keeps that engine's
 context ([Neural Engine prefill](#neural-engine-prefill)). The tier's files
 open after the plan, where the disk takes them; where none open, the tier turns
 off and the staging the plan set aside stays unused. The automatic quota opens
@@ -2960,17 +2979,25 @@ second such write the tier keeps within what it holds, with one log line, while
 serving continues. On a volume that cannot punch holes the files keep the
 blocks of freed slots, which the runtime reports once; the limit counts them.
 
-Transfers use `pread`/`pwrite` with `F_NOCACHE`, every one an aligned range:
-whole 1 MiB chunks of 16 KiB-aligned memory that start at an aligned offset of
-the slot (a state's staging buffer and lane buffers) move directly, everything
-else through the file's own 1 MiB buffer. A write that fails for another reason
+Transfers use `pread`/`pwrite` with `F_NOCACHE`, every one an aligned range.
+Those of the files' IO workers, every write and a state's reads, move whole
+1 MiB chunks of 16 KiB-aligned memory that start at an aligned offset of the
+slot (a state's staging buffer and lane buffers) directly, everything else
+through the file's own 1 MiB buffer; a KV read on the SSD readers is one read
+of whole 4 KiB pages around the bytes it needs, into the readers' own memory
+(`SlotFile::readAt`). A write that fails for another reason
 than a full volume disables further writes to that file, with one log line.
 Failed KV writes retain RAM pages; failed state writes invalidate the disk
 copy. A failed read invalidates its cached data, allowing lookup to fall back
 to the surviving prefix.
 
-With `--persistent-cache`, each slot's record carries a CRC-32C of its payload;
-a copy that fails it on first read is a miss.
+With `--persistent-cache`, each slot's record carries a CRC-32C of its payload,
+or, in a KV file whose pages hold block records ([KV on the SSD](#kv-on-the-ssd)),
+one of each segment: the page's index, then each block's record. A state that
+fails it on its first read is a miss. Every read of a KV copy a restart took
+back checks the segments it covers: a whole or index restore that fails is a
+miss, and a block or history read that fails is `kv_unreadable` for the
+requests that read it.
 
 `/status` reports the shared quota, its limit, the write budget and KV
 transfers under `disk`. Its cumulative `read_bytes` and `written_bytes` count
