@@ -33,4 +33,8 @@ relaunch_limits | --max-context 100K --max-memory 32G | 102400 34359738368
 yarn | --yarn-factor 4 | auto auto --yarn-factor 4.0
 yarn_context | --yarn-factor 2.5 --max-context 640K | 655360 auto --yarn-factor 2.5
 ple_memory | --ple-memory 2G | auto auto --ple-memory 2147483648
+ple_memory_off | --ple-memory off | auto auto --ple-memory off
 expert_memory | --expert-memory 16G | auto auto --expert-memory 17179869184
+expert_memory_off | --expert-memory off | auto auto --expert-memory off
+expert_memory_auto | --expert-memory auto --ple-memory auto | auto auto
+sparse_kv_memory | --sparse-kv-memory 1200M | auto auto --sparse-kv-memory 1258291200
