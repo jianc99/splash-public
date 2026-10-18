@@ -27,7 +27,8 @@ struct KvReadFailure final {
 // those of Full pages; a hit found its block cached, or read for another
 // lane by the same resolve; a miss read it, once for every lane that listed
 // it; a ghost hit missed a block the cache recently gave up. The bytes read
-// are the blocks' records, and a failure a block read twice in vain.
+// are what the reads brought, a page's records from its first missed block
+// to its last, and a failure a block read twice in vain.
 struct KvReadStats final {
   uint64_t resolves = 0;
   uint64_t entries = 0;

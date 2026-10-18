@@ -8,7 +8,8 @@
 // any other from its slot of the cache, which a missed block is read into
 // first, once for every lane that lists it, with direct reads of its tier
 // copy (KvCopy::readAt) on the SSD readers, ahead of everything else they
-// read. The entries' locations tell the attention where
+// read: one read of a page's records from its first missed block to its
+// last. The entries' locations tell the attention where
 // (ops::AttentionBlocks::locations).
 //
 // The cache is pages of the pool's layout without an index

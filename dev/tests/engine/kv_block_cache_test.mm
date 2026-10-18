@@ -3,7 +3,8 @@
 // the page table (SPLASH_ATTENTION_PAGED), as it does every block of a lane
 // none of whose pages holds only its index, and places every other in a slot
 // of its layer's: a block it holds stays where it is, and a block it misses is
-// read once, whatever lanes list it; it keys a block by its tier copy and
+// read once, whatever lanes list it, a page's misses in one read from its
+// first missed block to its last; it keys a block by its tier copy and
 // refuses an Index page without one. It refuses a resolve that misses more
 // blocks than it has slots it does not use, before it claims one. It grows to
 // the floors of the lanes that hold one, then toward its target an extent at
@@ -169,10 +170,10 @@ void resolvesEntries(MetalBackend &backend) {
       require(slots.insert(located[1][entry]).second, "a lane's own block shares another's slot");
   }
   require(stats->resolves == 1 && stats->entries == 480 && stats->paged == 32 && stats->misses == 368 &&
-              stats->hits == 80 && stats->readBytes == 368 * kv::SlotFormat(layout).recordBytes() &&
+              stats->hits == 80 && stats->readBytes == 46 * kv::SlotFormat(layout).layerRange(0).bytes &&
               !stats->readFailures,
           "a resolve's counts are off");
-  for (const auto &copy : copies) require(copy->reads() == kPlaces, "a block was read more than once");
+  for (const auto &copy : copies) require(copy->reads() == 1, "a page's missed blocks were not one read");
   // The next step finds every block where it was.
   auto again = std::make_shared<KvReadStats>();
   require(resolve(backend, cache, 0, lanes, blocks, again) == located && !again->misses && again->hits == 448,
@@ -239,6 +240,40 @@ void refusesWhatItCannotPlace(const char *metallib) {
   rejects([&] { static_cast<void>(resolve(backend, cache, 0, lanes, {past}, std::make_shared<KvReadStats>())); },
           "misses more blocks", "a resolve placed more blocks than its cache's slots");
   std::cout << "kv_block_cache_test: refusals PASS\n";
+}
+
+// A page's blocks a resolve misses in a layer are one read, from the first
+// to the last, the records between included; its hits and the blocks of
+// other layers stay out of it.
+void readsAPagesMissesAtOnce(MetalBackend &backend) {
+  const kv::Layout layout = layoutOf(kv::Format::Int8);
+  const kv::SlotFormat format(layout);
+  KvBlockCache cache = makeCache(backend, layout, 1);
+  require(cache.reserveLane(0).granted(), "the floor was refused");
+  std::vector<std::shared_ptr<TestKvCopy>> copies;
+  std::vector<KvPageSource> pages(4);
+  for (uint32_t page = 0; page < pages.size(); ++page) {
+    copies.push_back(copyOf(layout));
+    pages[page] = {1 + page, copies.back()};
+  }
+  const Lanes lanes{sourcesOf(pages)};
+  // Page 0's blocks 1 and 4, page 1's block 7, every block of page 2.
+  std::vector<uint32_t> blocks{1, 4, kPlaces + 7};
+  for (uint32_t place = 0; place < kPlaces; ++place) blocks.push_back(2 * kPlaces + place);
+  const auto span = [&](uint32_t first, uint32_t last) {
+    return format.recordRange(1, last).offset + format.recordBytes() - format.recordRange(1, first).offset;
+  };
+  auto stats = std::make_shared<KvReadStats>();
+  static_cast<void>(resolve(backend, cache, 1, lanes, {blocks}, stats));
+  require(stats->misses == 11 && stats->readBytes == span(1, 4) + span(7, 7) + span(0, 7) &&
+              copies[0]->reads() == 1 && copies[1]->reads() == 1 && copies[2]->reads() == 1 && !copies[3]->reads(),
+          "a page's missed blocks were not one read across them");
+  // Page 0's blocks 2 and 6 are its misses now, around a block it holds.
+  auto next = std::make_shared<KvReadStats>();
+  static_cast<void>(resolve(backend, cache, 1, lanes, {{2, 4, 6}}, next));
+  require(next->hits == 1 && next->misses == 2 && next->readBytes == span(2, 6) && copies[0]->reads() == 2,
+          "a page's misses around a block the cache holds were not one read");
+  std::cout << "kv_block_cache_test: a page's misses in one read PASS\n";
 }
 
 void growsAndReleases(MetalBackend &backend) {
@@ -401,8 +436,10 @@ template <typename T> void attendsThroughLocations(MetalBackend &backend, kv::Fo
   fixture.fill();
   const ops::VerifyAttentionPlan verify = ops::PagedAttention::verifyPlan(
       lanes, kQueryHeads, plan.layout(), std::span(histories).first(lanes));
-  // Each row selects every other block of its history besides its own, as
-  // QSA's lists do (masks of each lane's rows, a bit a block).
+  // Each row of lane 0 selects every other block of its history besides its
+  // own, as QSA's lists do (masks of each lane's rows, a bit a block); lane
+  // 1's rows select blocks 1, 2 and 5 of each page, so that a page's read
+  // starts past its first record and passes over records it does not place.
   const uint32_t visible = std::max(histories[0], histories[1]) + kRows, words = visible / kTokens / 32 + 1;
   const MetalBuffer masks = test::sharedBuffer(backend, uint64_t{lanes} * kRows * words * sizeof(uint32_t));
   std::memset(masks.contents(), 0, masks.sizeBytes());
@@ -411,8 +448,11 @@ template <typename T> void attendsThroughLocations(MetalBackend &backend, kv::Fo
     for (uint32_t row = 0; row < kRows; ++row) {
       uint32_t *bits = static_cast<uint32_t *>(masks.contents()) + (uint64_t{lane} * kRows + row) * words;
       const uint32_t own = (histories[lane] + row) / kTokens;
-      for (uint32_t block = 0; block <= own; ++block)
-        if (block == own || (block + row) % 2 == 0) bits[block / 32] |= 1u << (block % 32);
+      for (uint32_t block = 0; block <= own; ++block) {
+        const uint32_t place = block % kPlaces;
+        if (block == own || (lane ? place == 1 || place == 2 || place == 5 : (block + row) % 2 == 0))
+          bits[block / 32] |= 1u << (block % 32);
+      }
     }
     sequences.push_back({lane * kRows, kRows, histories[lane], lane});
   }
@@ -483,6 +523,7 @@ int main(int argc, const char *argv[]) {
     try {
       MetalBackend backend(argv[1]);
       resolvesEntries(backend);
+      readsAPagesMissesAtOnce(backend);
       growsAndReleases(backend);
       failsTheLanesOfUnreadBlocks(backend);
       attendsThroughLocations<int8_t>(backend, kv::Format::Int8);

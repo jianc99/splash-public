@@ -68,6 +68,13 @@ struct KvBlockCache::Impl {
     uint32_t slot = 0;
     uint32_t lanes = 0;
   };
+  // One read of a page's blocks a resolve misses in its layer, the reads
+  // [first, end) of its blocks, in place order: from the first block's
+  // record to the last's, the records between too.
+  struct Span final {
+    uint32_t first = 0;
+    uint32_t end = 0;
+  };
   // What a resolve's host step reads and writes: the lists from `list` on,
   // their counts and locations (Shared), and each lane's sources, which it
   // holds.
@@ -98,8 +105,10 @@ struct KvBlockCache::Impl {
     if (backend.commandInFlight()) throw std::logic_error("the hot block cache resizes while a command is in flight");
   }
   void resolve(uint32_t layer, const Resolve &resolve, KvReadStats &stats);
-  // A reader task: throws when the block cannot be read.
-  void readBlock(uint32_t layer, const Read &read) const;
+  // The bytes a span's read brings.
+  [[nodiscard]] kv::SlotRange spanRange(uint32_t layer, const Span &span) const;
+  // A reader task: throws when the span cannot be read.
+  void readSpan(uint32_t layer, const Span &span) const;
 
   metal::MetalBackend &backend;
   const kv::SlotFormat format;
@@ -130,6 +139,7 @@ struct KvBlockCache::Impl {
   uint64_t resolves = 0;
   std::vector<Miss> misses;
   std::vector<Read> reads;
+  std::vector<Span> spans;
   std::vector<uint32_t> readOf;
   std::vector<KvReadFailure> failures;
 
@@ -171,19 +181,33 @@ void KvBlockCache::Impl::place(uint32_t held) {
   extents = held;
 }
 
-void KvBlockCache::Impl::readBlock(uint32_t layer, const Read &read) const {
-  const std::optional<std::span<const std::byte>> record =
-      readKvCopy(*read.source->copy, format.recordRange(layer, read.place));
-  // A block that cannot be read leaves zeros, which its lanes' attention
+kv::SlotRange KvBlockCache::Impl::spanRange(uint32_t layer, const Span &span) const {
+  const kv::SlotRange first = format.recordRange(layer, reads[span.first].place);
+  const kv::SlotRange last = format.recordRange(layer, reads[span.end - 1].place);
+  return {first.offset, last.offset + last.bytes - first.offset};
+}
+
+void KvBlockCache::Impl::readSpan(uint32_t layer, const Span &span) const {
+  const kv::SlotRange range = spanRange(layer, span);
+  const std::optional<std::span<const std::byte>> bytes = readKvCopy(*reads[span.first].source->copy, range);
+  // Blocks that cannot be read leave zeros, which their lanes' attention
   // reads before they fail.
-  format.scatterRecord(record ? *record : std::span<const std::byte>(zeros),
-                       pages.layerSpans(read.slot >> kPlaceBits, layer), read.slot & kPlaceMask);
-  if (!record) throw std::runtime_error("a spilled K/V block could not be read");
+  for (uint32_t index = span.first; index < span.end; ++index) {
+    const Read &read = reads[index];
+    const std::span<const std::byte> record =
+        bytes ? bytes->subspan(format.recordRange(layer, read.place).offset - range.offset, recordBytes)
+              : std::span<const std::byte>(zeros);
+    format.scatterRecord(record, pages.layerSpans(read.slot >> kPlaceBits, layer), read.slot & kPlaceMask);
+  }
+  if (!bytes) throw std::runtime_error("a spilled K/V block could not be read");
 }
 
 // Looks every Index entry up first, so that a block the resolve holds stays
 // whatever it misses; then claims a slot for each block it misses, once for
-// every lane that lists it, and reads them all.
+// every lane that lists it, and reads them all, a page's in one read: reads
+// of up to 16 KiB cost about the same, and the records of a layer's blocks
+// lie in place order, so one read across a page's misses, the records
+// between them too, costs less than a read for each.
 void KvBlockCache::Impl::resolve(uint32_t layer, const Resolve &resolve, KvReadStats &stats) {
   const AwakeClock::time_point start = AwakeClock::now();
   const std::lock_guard lock(mutex);
@@ -244,22 +268,34 @@ void KvBlockCache::Impl::resolve(uint32_t layer, const Resolve &resolve, KvReadS
   stats.misses += reads.size();
   stats.ghostHits += slots.ghostHits() - ghostHits;
   if (!reads.empty()) {
+    // A page's blocks, in place order, are one span.
+    std::ranges::sort(reads, {}, [](const Read &read) { return std::pair(read.source->copy->id(), read.place); });
+    spans.clear();
+    for (uint32_t index = 0; index < reads.size(); ++index)
+      if (!index || reads[index].source->copy->id() != reads[index - 1].source->copy->id())
+        spans.push_back({index, index + 1});
+      else
+        spans.back().end = index + 1;
     // The reads run now, ahead of the background, as a batch that keeps its
-    // failures (SsdReaders::runBatch): a block the readers read twice in vain
-    // fails the lanes that list it, not the command.
+    // failures (SsdReaders::runBatch): blocks the readers read twice in vain
+    // fail the lanes that list them, not the command.
     const AwakeClock::time_point reading = AwakeClock::now();
     const std::shared_ptr<SsdReaders::Batch> batch =
-        readers->runBatch(reads.size(), [this, layer](size_t index) { readBlock(layer, reads[index]); });
+        readers->runBatch(spans.size(), [this, layer](size_t index) { readSpan(layer, spans[index]); });
     readTimes.add(nanosecondsSince(reading));
-    const uint64_t failed = batch->tally().failures;
-    stats.readBytes += (reads.size() - failed) * recordBytes;
-    stats.readFailures += failed;
-    for (size_t index = 0; failed && index < reads.size(); ++index) {
-      if (!batch->failed(index)) continue;
-      const Read &read = reads[index];
-      slots.free(read.slot);
-      for (uint32_t lane = 0; lane < kLanes; ++lane)
-        if (read.lanes >> lane & 1) failures.push_back({lane, read.source->block});
+    for (size_t index = 0; index < spans.size(); ++index) {
+      const Span &span = spans[index];
+      if (!batch->failed(index)) {
+        stats.readBytes += spanRange(layer, span).bytes;
+        continue;
+      }
+      stats.readFailures += span.end - span.first;
+      for (uint32_t at = span.first; at < span.end; ++at) {
+        const Read &read = reads[at];
+        slots.free(read.slot);
+        for (uint32_t lane = 0; lane < kLanes; ++lane)
+          if (read.lanes >> lane & 1) failures.push_back({lane, read.source->block});
+      }
     }
   }
   resolveTimes.add(nanosecondsSince(start));
