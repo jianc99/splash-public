@@ -2260,9 +2260,11 @@ Qwen3.8-Flash-Next's full-attention layers attend sparsely (QSA): past 512
 complete blocks of 4 tokens, a query row attends only to the 512 blocks its
 indexer scores highest and to its tokens after its last complete block. The
 indexer (four query heads and one key head of 128) keeps each block's pooled
-key, bf16, in an index region of the KV pages (`PageStorage::indexOffset`),
-which its kernels reach through index tables of their own (`ops::BlockIndex`,
-today the lanes' page tables). A step projects its rows' indexer queries and
+key, bf16, in its page's index, in the index plane of the page's extent apart
+from its K/V (`PageStorage::indexOffset`), which its kernels reach through each
+lane's index table (`ops::BlockIndex`, `DecodeTensor::IndexTable`), written as
+its page table is: a page whose K/V went to the SSD keeps its index
+([KV on the SSD](#kv-on-the-ssd)). A step projects its rows' indexer queries and
 keys, pools the blocks they complete from its rows' keys and, for the tokens
 of a block before its first row, the sequence's pending keys, scores every
 complete block for each row in one MPP product per tile of 8 rows by 32
@@ -2300,15 +2302,29 @@ softmax masks each row's tokens in blocks the row does not attend and past its
 causal end. A tile without a list attends every block of its history.
 Token-major values make a block's values one contiguous run as its keys are;
 the dense page loop keeps them dimension-major, on which its PV runs faster. A
-layout may also keep an index of its keys in regions of the KV pages after
-every layer's K/V region (`kv::Layout::indexDimension`,
-`PageStorage::indexOffset`): per layer each block's bf16 pooled key, part of
-the page wherever the host copies or clears it (`PageStorage::spans`).
+layout may also keep an index of its keys (`kv::Layout::indexDimension`), per
+layer each block's bf16 pooled key, in the index plane of its pages' extents
+(`PageStorage::indexOffset`, `indexSpans`), part of the page wherever the host
+copies or clears it (`PageStorage::spans`).
 `make benchmark-attention-sweep ATTENTION_SWEEP_ARGS='--shapes fn --qsa shared'`
 times the sparse kernels over synthetic selections (`--qsa` also takes
 `independent`, `overlapping`, whose unions are the ~1,500 blocks real
 selections make, and `pages`), and `--qsa indexer` the indexer itself before
 them; each case reports the mean entries of its lists.
+
+Where some of a verify's listed blocks are on the SSD, a host step after the
+layer's selection resolves each lane's list through the hot block cache
+(`KvBlockCache::addResolve`) into a location per entry: the block's place in
+the cache, or `SPLASH_ATTENTION_PAGED` for a block its page holds. The located
+split (`AttentionBlocks::locations` and `locationPages`) reads each block where
+its location says, and a command none of whose lanes reads spilled KV encodes
+the splits as before. A prefill whose history is on the SSD attends through a
+staging of one layer's pages, ordinary entries of a one-layer
+`kv::PageStorage`: the history stream reads the spilled pages into it, and the
+stage kernel (`PagedAttention::addStageLayer`, `kernels/shared/kv_stage.metal`)
+copies those still in the pool, so the prefill kernels run unchanged.
+`attention-sweep --located` moves the listed blocks into a block cache and
+times the located split against the default one.
 
 A block-sparse target declares its attention to the engine
 (`model::SparseKvShape`, `ModelCapabilities::sparseKv`): its blocks' tokens,
@@ -2570,7 +2586,12 @@ pressure and swap.
 KV pages live in extents: ordinary shared Metal buffers of one size per pool,
 between half and one and a half times 128 MiB, in which every tensor region of
 each attention layer starts 64 KiB-aligned, sized to leave the fewest of the
-budget's pages unused (`Layout::extentPagesFor`). The pool allocates an extent
+budget's pages unused (`Layout::extentPagesFor`). Each extent has a form
+(`kv::PageForm`): a Full extent holds its pages' K/V and then, for a layout
+with a block index, their index plane; an Index extent only the plane, for
+pages whose K/V is on the SSD, and only a pool that spills allocates one. A
+page moves to the other form, its references with it, when its K/V leaves
+memory or comes back (`KvPool::movePages`). The pool allocates an extent
 when it needs one of its pages. When it is built it allocates the runway, the
 extents of the first 64 pages, which startup warmup runs on; nothing but the
 pool allocates or releases an extent. An extent whose last page is free stays
@@ -2581,13 +2602,18 @@ address in its request's page table, so no command binds KV; the command
 queue's residency set makes extents resident for every command buffer. The host reaches the same memory
 (`PageStorage::spans`), which is how the disk tier moves pages. A reclaim
 returns free pages before it evicts anything: an empty extent as it is, and the
-free pages scattered over the others as soon as they cover the extent that holds
-the fewest pages, whose pages the pool copies to them (`KvPool::compactExtent`).
+free pages scattered over the others of its form as soon as they cover the
+extent of that form that holds the fewest pages, whose pages the pool copies to
+them (`KvPool::compactExtent`): a Full extent before an Index one, unless the
+reclaim needs the memory of one form, as a shortfall of Index pages needs Full
+memory.
 The blocks and requests on those pages follow them, a page a disk transfer reads
 or writes stays where it is, and a pass that evicts everything copies only what
 is left afterwards. Every extent a pass empties is released, except that a
 warning pass, like startup cleanup, keeps one empty extent as the runway the next
-request starts from.
+request starts from, and a pool that spills keeps an extent's worth of free
+Index pages, which spilling draws on first, so that a page spills at the memory
+wall.
 `/status` reports under `kv` the pages of allocated extents (`pages_allocated`),
 those requests and the cache hold (`pages_active`, `pages_cache`) and those
 nothing holds (`pages_free`), the bytes allocated and the bytes of empty extents
@@ -2813,9 +2839,13 @@ tier takes anything back, and again at every control pass and whenever a write
 finds the volume full. `DiskSpace` reads the volume with `fstatfs` on the first
 file's descriptor, which names the right volume however the file was made, and
 sets the budget's limit to min(quota, max(0, available + held - floor) / 4),
-held being the blocks the tier's files take (`st_blocks`). The tier's own writes
-and punches move bytes between available and held, so they leave the limit
-where it is, while space anything else takes or frees moves it by a quarter.
+held being the blocks the tier's files take (`st_blocks`). The KV of requests
+in service, the slots of the blocks they hold and the commitments of spilling
+requests, may use min(quota, max(0, available + held - floor)) instead
+(`DiskBudget::activeLimitBytes`, [KV on the SSD](#kv-on-the-ssd)). The tier's
+own writes and punches move bytes between available and held, so they leave
+the limit where it is, while space anything else takes or frees moves it by a
+quarter.
 Several tiers on one volume each settle at (available - floor) / (tiers + 3) of
 what was available before them, and blocks a local snapshot keeps when the tier
 frees them cost it at most a third more than it freed. A limit below what the
@@ -2865,18 +2895,24 @@ Writes happen when RAM reclamation selects a victim. States copy through one
 staging buffer, freeing their RAM immediately. KV leaves needed by a state
 on them or below them are written straight from their extents and released
 after the write succeeds. Unneeded tails are dropped without writing, before any
-state, together with any disk copies below them. A restored page is read
-straight into its extent. Either way the transfer runs on the file's IO worker
-beside whatever command the model runs: a cached page is never written by a
-command, and no command uses a page before its read has landed. While a step
-waits for SSD reads (streamed experts or PLE rows), each 1 MiB of a write
-waits for them, at most 2 ms, unless a restore queued behind the write would
-wait as long (`SlotFile::Options::deferWrites`). At most 128 KV pages are in
-transfer at a time, demotions at most half of them and restores at most three
-quarters, since one worker serves both in order and a burst of either kind
-must leave the other its share. When the tier takes no more, leaves that
-need a write stay until a transfer lands, while leaves whose page frees without
-one still go.
+state, together with any disk copies below them. Writes run on their file's IO
+worker. A KV page is restored by the engine's SSD readers (`SsdReaders`), which
+read what the page's form holds, its index alone or the whole page, with one
+aligned read into memory of their own, and scatter it into the page; the
+restores asked for between two submissions (`KvTier::submitRestores`) go out
+together, index restores on every reader and whole ones on at most
+`KvPageTier::kWholeRestoreReaders`. A state is restored on its file's worker.
+Either way the transfer runs beside whatever command the model runs: a cached
+page is never written by a command, and no command uses a page before its read
+has landed. While a step waits for SSD
+reads (streamed experts, PLE rows or spilled KV), each 1 MiB of a write waits
+for them, at most 2 ms, unless a read queued behind the write on its file's
+worker would wait as long (`SlotFile::Options::deferWrites`). At most 64 KV
+writes are in flight (`KvPageTier::kWrites`): a persistent point's copies a
+quarter of them and spilling requests' write-through half, so that neither
+starves the demotions a reclaim needs, which may take the rest. When the tier
+takes no more, leaves that need a write stay until a transfer lands, while
+leaves whose page frees without one still go.
 
 A state with no available RAM cache slot can be written directly from its lane.
 When every state in RAM is in use and no cached KV is left to take, a replay

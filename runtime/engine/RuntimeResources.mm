@@ -226,10 +226,10 @@ struct DiskTier final {
 // leaves it off), each with its slots' size and options: a persistent tier
 // keeps its files in a cache directory of its own; when another process
 // holds it or it cannot be used, the tier keeps temporary files, as without
-// one. The automatic tier opens files only
-// on a volume where its limit would hold two states and 1 GiB of KV: a
-// persistent tier's root, whose caches nobody holds count as the tier's,
-// else the temporary files'. Every start removes the root's stale caches.
+// one. The automatic tier opens files only on a volume where its limit would
+// hold two states and 1 GiB of KV: a persistent tier's root, whose caches
+// nobody holds count as the tier's, else the temporary files'. Every start
+// removes the root's stale caches.
 DiskTier openDiskTier(const RuntimeResourcesConfig &config, const std::string &cacheNamespace,
                       uint64_t quotaBytes, uint64_t kvSlotBytes, const model::SlotFile::Options &kvOptions,
                       uint64_t stateBytes, const model::SlotFile::Options &stateOptions) {
