@@ -635,8 +635,13 @@ private:
   };
   // Records a change of the request's page list from index first on.
   static void pagesChanged(Request &active, uint32_t first) noexcept;
-  struct Demotion final {
+  // A page being written to the tier, and what for (WriteClass): a reclaim
+  // demotion, whose page frees once the copy lands; a copy persist() keeps
+  // of a page that stays; or a Spill request's page written through, which
+  // stays Full until spillWritten moves it.
+  struct Write final {
     uint64_t block = 0;
+    WriteClass write = WriteClass::Reclaim;
     std::unique_ptr<KvTransfer> transfer;
   };
   struct Restore final {
@@ -820,6 +825,8 @@ private:
   // holders.
   enum class Eligibility : uint8_t { Eligible, Later, KeptFull };
   [[nodiscard]] Eligibility spillEligibility(uint64_t block) const;
+  // Writes of the class in flight.
+  [[nodiscard]] uint32_t writes(WriteClass write) const noexcept;
   // Pages written through whose Full pages free once their copies land.
   [[nodiscard]] uint32_t spillingWrites() const noexcept;
   // Rescans every Spill request's blocks from its dense history: a holder
@@ -839,14 +846,10 @@ private:
   KvCache kv_;
   StateCache states_;
   std::unordered_map<uint64_t, Request> requests_;
-  std::vector<Demotion> demotions_;
-  // Pages persist() writes while they stay in RAM: transfers that free
-  // nothing, so they hold no memory a reclaim waits for (pendingPages), only
-  // their blocks.
-  std::vector<Demotion> copies_;
-  // Spill requests' pages written through, whose Full pages free once their
-  // copies landed and they move to the index form (spillWritten).
-  std::vector<Demotion> writes_;
+  // Writes in flight, in the order they started. Only reclaim demotions,
+  // and writes through whose pages will spill, free memory a reclaim waits
+  // for (pendingPages); copies persist() keeps hold only their blocks.
+  std::vector<Write> writes_;
   // Write-through waits after a write found the volume full, until the
   // active limit holds another slot.
   bool writeThroughPaused_ = false;
