@@ -907,9 +907,9 @@ class FrontendHandler(BaseHTTPRequestHandler):
         stop sequence the call it ends inside; text before a stop sequence is
         the text the client asked for. An answer without calls is validated
         against the response format only when the model ended it. `content`
-        is read only without tools: with tools, the projector holds it."""
+        is read only without a projector, which otherwise holds it."""
         ended = result.reason != "length" and result.stop_sequence is None
-        if job.tool_policy is None:
+        if projector is None:
             if ended:
                 validate_response_content(content, job.response_validator)
             return content, [], []
@@ -934,14 +934,16 @@ class FrontendHandler(BaseHTTPRequestHandler):
         start, each piece of output, the idle waits and prompt progress:
         streams send them, and complete Messages and Responses gather the
         output into blocks."""
-        policy = job.tool_policy
         splitter = ReasoningSplitter(job.thinking, job.may_call_tools)
-        # Output with tools is parsed as it arrives whether it streams or not.
+        # A chat answer is parsed as it arrives whether it streams or not:
+        # its calls where tools may be called, and in any answer, a </think>
+        # the model writes after its reasoning ended is dropped. A text
+        # completion, without a chat template, is its text as written.
         projector = (
             StreamingToolCallProjector(
-                policy, job.public_id, job.response_validator is not None
+                job.tool_policy, job.public_id, job.response_validator is not None
             )
-            if policy is not None
+            if job.tool_policy is not None or job.reasoning is not None
             else None
         )
         reasoning, content, result = [], [], None
