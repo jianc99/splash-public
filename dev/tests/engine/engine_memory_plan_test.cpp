@@ -553,7 +553,8 @@ void testDenseExplicitContextStreamsExperts() {
 // An explicit setting replaces its part: a size streams through that store,
 // one that holds the whole part loads it, off loads it, and a size below the
 // part's floor is refused; --sparse-kv-memory raises the hot cache's target
-// and is refused below its floor.
+// and is refused below its floor. An automatic part whose smallest store
+// takes all it would loads whole.
 void testOverridesAndRefusals() {
   StreamedMemoryInputs inputs = kFlashNext.inputs(kStudio, true);
   inputs.experts.setting = {StreamedSetting::Mode::Size, 12 * kGiB};
@@ -574,11 +575,12 @@ void testOverridesAndRefusals() {
     dense.experts.setting = setting;
     require(!requirePlan(dense).expertBytes, "off, or a store that holds every expert, did not load them whole");
   }
-  require(streamedBytes({StreamedSetting::Mode::Size, 4 * kGiB}, 10 * kGiB) == 4 * kGiB &&
-              !streamedBytes({StreamedSetting::Mode::Size, 10 * kGiB}, 10 * kGiB) &&
-              !streamedBytes({StreamedSetting::Mode::Off, 0}, 10 * kGiB) &&
-              !streamedBytes({StreamedSetting::Mode::Size, 4 * kGiB}, 0),
-          "an explicit size's store is not the part's");
+  StreamedMemoryInputs tight = k35BQ2.inputs(kM6, true);
+  tight.hardBudgetBytes = 12 * kGiB;
+  tight.experts.floorBytes = tight.experts.allBytes;
+  const StreamedMemoryResult whole = planStreamedMemory(tight);
+  require(!whole.plan && whole.requiredBytes > 12 * kGiB,
+          "experts whose smallest store takes all they would streamed instead of loading whole");
 
   inputs = kFlashNext.inputs(kStudio, true);
   const StreamedMemoryPlan automatic = requirePlan(inputs);

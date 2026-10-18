@@ -44,7 +44,8 @@ uint64_t extentsBytes(uint64_t pages, uint64_t extentPages, uint64_t pageBytes) 
 
 // A streamed part as its setting leaves it to the planner: the bytes the
 // floors charge it, and all of it; an Auto part streams through more than
-// its floor or loads whole as the budget allows, any other only as set.
+// its floor or loads whole as the budget allows, any other only as set. An
+// Auto part whose smallest store takes all it would loads whole.
 struct Part final {
   uint64_t floor = 0;
   uint64_t all = 0;
@@ -56,7 +57,8 @@ std::optional<Part> resolve(const StreamedPart &part, std::string_view option, s
   if (!part.allBytes) return Part{};
   switch (part.setting.mode) {
   case StreamedSetting::Mode::Auto:
-    return Part{part.floorBytes, part.allBytes, true, false};
+    if (part.floorBytes < part.allBytes) return Part{part.floorBytes, part.allBytes, true, false};
+    [[fallthrough]];
   case StreamedSetting::Mode::Off:
     return Part{part.allBytes, part.allBytes, false, false};
   case StreamedSetting::Mode::Size:
@@ -258,10 +260,6 @@ std::optional<uint64_t> minimumRequiredBytes(uint64_t fixedBytes,
   return result;
 }
 
-uint64_t streamedBytes(const StreamedSetting &setting, uint64_t allBytes) noexcept {
-  return setting.mode == StreamedSetting::Mode::Size && setting.bytes < allBytes ? setting.bytes : 0;
-}
-
 uint32_t ContextBounds::maximum() const noexcept {
   return std::min(window, std::max(resident, std::min(spilled, disk)));
 }
@@ -275,8 +273,7 @@ std::string_view ContextBounds::bound() const noexcept {
 StreamedMemoryResult planStreamedMemory(const StreamedMemoryInputs &in) {
   const kv::Layout &layout = in.kvLayout;
   if (!layout.valid() || !in.windowTokens || in.requestedContextTokens > in.windowTokens ||
-      (in.sparseKv && !in.sparseKv->laneSlots()) || in.experts.floorBytes > in.experts.allBytes ||
-      in.table.floorBytes > in.table.allBytes || in.hotCache.mode == StreamedSetting::Mode::Off)
+      (in.sparseKv && !in.sparseKv->laneSlots()) || in.hotCache.mode == StreamedSetting::Mode::Off)
     return {std::nullopt, "invalid memory planner inputs"};
   std::string error;
   const std::optional<Part> experts = resolve(in.experts, "--expert-memory", error);

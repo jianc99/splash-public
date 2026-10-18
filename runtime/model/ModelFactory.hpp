@@ -32,7 +32,7 @@ class VisionLoader;
 using TargetWeights = std::variant<Qwen3_8Weights, Qwen3_6MoeWeights, Qwen4ExpWeights>;
 
 // How a model loads beside its descriptor: with streamedTableBytes, the rows
-// of a table the target's GGUF holds (streamableTableBytes) stream from its
+// of a table the target's GGUF holds (model/ModelSizing.hpp) stream from its
 // file through a row cache of that many bytes instead of loading into memory
 // (model/SparseRowStore.hpp, --ple-memory). With expertMemoryBytes, a MoE
 // target's routed experts stream from their files through a store of that
@@ -121,14 +121,6 @@ void requireCompatibleModel(const LoadedModel &model);
 // that stream, and of the store streamed experts load into.
 [[nodiscard]] uint64_t modelWeightBytes(const std::filesystem::path &root, const ModelDescriptor &descriptor,
                                         const ModelLoadOptions &options = {});
-// The bytes of the planes of a MoE target's routed experts, which an expert
-// store holding them all takes; 0 for a dense target.
-[[nodiscard]] uint64_t routedExpertBytes(const std::filesystem::path &root, const ModelDescriptor &descriptor);
-// The bytes of the rows of the table a target's GGUF holds, which stream from
-// it instead of loading with streamedTableBytes (gguf::PlanOptions::streamTable);
-// 0 for a target without one. Throws for a table that cannot stream
-// (gguf::tableRows).
-[[nodiscard]] uint64_t streamableTableBytes(const std::filesystem::path &root, const ModelDescriptor &descriptor);
 
 // The vision role's source, planned; null for a model without vision.
 [[nodiscard]] std::unique_ptr<VisionLoader> planVisionLoader(const std::filesystem::path &root,

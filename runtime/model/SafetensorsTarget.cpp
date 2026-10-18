@@ -38,14 +38,6 @@ WeightFile SafetensorsTargetLoader::head() { return open(planned_->images.size()
 
 WeightFile SafetensorsTargetLoader::embedding() { return open(planned_->images.size() - 1); }
 
-uint64_t safetensorsRoutedExpertBytes(const std::filesystem::path &directory, const QwenTargetDimensions &geometry) {
-  const SafetensorsCheckpoint checkpoint(directory);
-  uint64_t bytes = 0;
-  for (const gguf::Image &image : safetensors::planImages(checkpoint, geometry, {.streamExperts = true}))
-    bytes += gguf::streamedExpertBytes(image);
-  return bytes;
-}
-
 uint64_t safetensorsTargetImageBytes(const std::filesystem::path &directory, const QwenTargetDimensions &geometry,
                                      gguf::PlanOptions options) {
   const SafetensorsCheckpoint checkpoint(directory);

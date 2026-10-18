@@ -650,14 +650,13 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   // tier, which read on it.
   auto readers = std::make_shared<model::SsdReaders>(model::kSsdReaders);
 
-  // The memory plan of the parts of the weights that may stream from the SSD
-  // (planStreamedMemory) rests on the arenas only the loaded model sizes: a
-  // start plans before loading, with no arenas, whether each part streams
-  // and loads an automatic one at its floor, then sizes it with the arenas
-  // and loads again where it takes more. What the plan rests on as it
-  // stands: the parts' settings (as configured until they loaded), the
-  // arenas, and the SSD cache's room for active KV and whether its KV file
-  // opened, its quota and open until the tier has opened its files.
+  // One plan (planStreamedMemory) sizes the parts of the weights that may
+  // stream from the SSD, a MoE target's routed experts and a GGUF's PLE
+  // table: a part set to a size or off loads as set, and the plan sizes an
+  // automatic one. It rests on the weights' sizes, which their files give
+  // before they load; on the arenas, which only the loaded model gives, as
+  // they rest on its weights' formats; and on the SSD cache's room for active
+  // KV, its quota until its files open, and whether its KV file opened.
   kv::Layout kvLayout = config.model.targetKvLayout;
   kvLayout.format = config.kvFormat;
   // How the KV tier lays a page out in its slot, and so the slots' size.
@@ -666,21 +665,28 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   const uint64_t hardBudgetBytes = EngineMemoryPolicy::hardBudgetBytes(
       device.recommendedMaxWorkingSetBytes, config.maximumMemoryBytes);
   model::StreamableWeights streamable;
-  StreamedSetting expertSetting = config.expertMemory, tableSetting = config.pleMemory;
-  uint64_t arenaBytes = 0;
+  // The arenas of the model as it last loaded; none before it loads.
+  model::ModelMemoryPlan modelMemoryPlan;
+  const auto arenaBytes = [&] {
+    return modelMemoryPlan.sharedPrefillPlannedAllocatedBytes + modelMemoryPlan.sharedDecodePlannedAllocatedBytes;
+  };
   uint64_t activeLimitBytes = cacheDiskBytes;
   bool kvFileOpen = true;
-  const auto streamedPlan = [&](uint64_t stagingBytes, uint64_t aneFfnBytes) {
+  // The plan with the parts set as `experts` and `table`, `stagingBytes` set
+  // aside for the disk tier's state staging and `aneFfnBytes` for the
+  // prefill FFN's Neural Engine split.
+  const auto streamedPlan = [&](const StreamedSetting &experts, const StreamedSetting &table,
+                                uint64_t stagingBytes, uint64_t aneFfnBytes) {
     return planStreamedMemory(
         {.hardBudgetBytes = hardBudgetBytes,
          .fixedBytes = streamable.loadedBytes + model::kPipelineReserveBytes + model::kRuntimeOverheadReserveBytes +
-                       arenaBytes + stagingBytes + aneFfnBytes,
+                       arenaBytes() + stagingBytes + aneFfnBytes,
          .laneStateBytes = stateLayout.laneBytes(),
          .kvLayout = kvLayout,
          .windowTokens = config.model.capabilities.maximumContextTokens,
          .requestedContextTokens = requestedContextTokens,
-         .experts = {streamable.expertBytes, streamable.expertFloorBytes, expertSetting},
-         .table = {streamable.tableBytes, streamable.tableFloorBytes, tableSetting},
+         .experts = {streamable.expertBytes, streamable.expertFloorBytes, experts},
+         .table = {streamable.tableBytes, streamable.tableFloorBytes, table},
          .hotCache = config.sparseKvMemory,
          .sparseKv = config.model.capabilities.sparseKv,
          .tierWritable = stagingBytes && kvFileOpen,
@@ -689,17 +695,20 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
          .activeLimitBytes = activeLimitBytes,
          .groupPages = model::kPrefillGroupChunks * model::ExecutionLimits::prefillTokenBudget / kv::kPageTokens});
   };
-  // The stores of the plan's parts that load: an automatic part's at its
-  // floor until the arenas size it.
-  model::ModelLoadOptions loadOptions{.readers = readers};
+  // The plan of the parts as configured, which sizes their stores.
+  const auto sizingPlan = [&](uint64_t stagingBytes) {
+    return streamedPlan(config.expertMemory, config.pleMemory, stagingBytes, 0);
+  };
+  // The stores the plan gives the parts, except that automatic experts the
+  // plan streams load at their floor while `floors`: until the loaded model
+  // gives the arenas, which take from all that the experts stream through.
   const auto storesOf = [&](const StreamedMemoryPlan &plan, bool floors) {
-    const auto store = [&](const StreamedSetting &setting, uint64_t planned, uint64_t floorBytes) {
-      return setting.mode == StreamedSetting::Mode::Auto && floors && planned ? floorBytes : planned;
-    };
-    return model::ModelLoadOptions{.streamedTableBytes = store(tableSetting, plan.tableBytes, streamable.tableFloorBytes),
-                                   .expertMemoryBytes = store(expertSetting, plan.expertBytes, streamable.expertFloorBytes),
+    const bool experts = floors && plan.expertBytes && config.expertMemory.mode == StreamedSetting::Mode::Auto;
+    return model::ModelLoadOptions{.streamedTableBytes = plan.tableBytes,
+                                   .expertMemoryBytes = experts ? streamable.expertFloorBytes : plan.expertBytes,
                                    .readers = readers};
   };
+  model::ModelLoadOptions loadOptions;
   try {
     streamable = model::streamableWeights(config.modelRoot, config.model);
     reportIgnoredSetting("--ple-memory", config.pleMemory, streamable.tableBytes, config.model.name, "PLE table",
@@ -708,13 +717,14 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
                          "routed experts", "load with their layers");
     // Refuse a model that cannot fit before loading its weights: beside them
     // the plan needs at least the runtime reserves, one lane's state, the
-    // KV runway, the streamed stores at their floors and any SSD cache state
-    // staging; the full plan below adds the arenas.
-    StreamedMemoryResult planned = streamedPlan(stateStagingBytes, 0);
-    if (stateStagingBytes && automaticDisk && !planned.plan && streamedPlan(0, 0).plan) {
+    // KV runway, the streamed stores at their floors, the floors of KV on the
+    // SSD cache and any SSD cache state staging; the plans after the load add
+    // the arenas.
+    StreamedMemoryResult planned = sizingPlan(stateStagingBytes);
+    if (stateStagingBytes && automaticDisk && !planned.plan && sizingPlan(0).plan) {
       diskOff("the memory budget has no room for its " + std::to_string(mebibytes(stateBytes)) +
               " MiB of state staging beside the model");
-      planned = streamedPlan(0, 0);
+      planned = sizingPlan(0);
     }
     if (!planned.plan)
       throw planRefusal(planned, hardBudgetBytes);
@@ -737,17 +747,18 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   // engine lends it to model execution without inspecting its plans.
   ops::ExecutionPlans operators(device);
   model::LoadedModel loaded;
-  model::ModelMemoryPlan modelMemoryPlan;
-  // Loads the model as loadOptions says, then plans its arenas.
+  // Loads the model as loadOptions says, `again` once it loaded, and plans
+  // its arenas.
   const auto load = [&](bool again) {
     try {
       const auto started = AwakeClock::now();
+      // The images of the last load go before the next allocates its own.
       loaded = {};
       loaded = model::loadModel(*backend, config.modelRoot, config.model, loadOptions);
       requireLoadedModel(loaded);
       const std::chrono::duration<double> loading = AwakeClock::now() - started;
-      logLine("Weights loaded ", again ? "again, with the streamed stores the arenas leave room for, " : "", "in ",
-              std::fixed, std::setprecision(2), loading.count(), " s.");
+      logLine("Weights loaded ", again ? "again " : "", "in ", std::fixed, std::setprecision(2), loading.count(),
+              " s.");
     } catch (const metal::MetalAllocationError &error) {
       throw RuntimeResourcesError(RuntimeResourceStage::ModelLoading,
                                   error.what(), {},
@@ -764,26 +775,19 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
           RuntimeResourceStage::MemoryPlanning,
           std::string("model allocated-size plan is invalid: ") + error.what());
     }
-    arenaBytes = modelMemoryPlan.sharedPrefillPlannedAllocatedBytes +
-                 modelMemoryPlan.sharedDecodePlannedAllocatedBytes;
   };
   load(false);
-  // From now on each part is set as it loaded: whole, or through its store.
-  const auto asLoaded = [&] {
-    expertSetting = loadOptions.expertMemoryBytes ? StreamedSetting{StreamedSetting::Mode::Size,
-                                                                    loadOptions.expertMemoryBytes}
-                                                  : StreamedSetting{StreamedSetting::Mode::Off, 0};
-    tableSetting = loadOptions.streamedTableBytes ? StreamedSetting{StreamedSetting::Mode::Size,
-                                                                    loadOptions.streamedTableBytes}
-                                                  : StreamedSetting{StreamedSetting::Mode::Off, 0};
-  };
-  asLoaded();
 
   // The engine's memory plan, with `stagingBytes` set aside for the disk
   // tier's state staging and `aneFfnBytes` for the prefill FFN's Neural Engine
-  // split, and the parts as they loaded.
+  // split, and each part as it loaded: whole, or through its store.
   const auto planWith = [&](uint64_t stagingBytes, uint64_t aneFfnBytes) -> EngineMemoryPlanResult {
-    const StreamedMemoryResult streamed = streamedPlan(stagingBytes, aneFfnBytes);
+    const auto asLoaded = [](uint64_t storeBytes) {
+      return storeBytes ? StreamedSetting{StreamedSetting::Mode::Size, storeBytes}
+                        : StreamedSetting{StreamedSetting::Mode::Off, 0};
+    };
+    const StreamedMemoryResult streamed = streamedPlan(
+        asLoaded(loadOptions.expertMemoryBytes), asLoaded(loadOptions.streamedTableBytes), stagingBytes, aneFfnBytes);
     if (!streamed.plan)
       return {std::nullopt, {false, BudgetErrorCode::KvPoolDoesNotFit, streamed.error, {}}};
     ModelMemoryFootprint footprint{
@@ -802,18 +806,19 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   };
   // The plan with the staging the tier keeps.
   const auto planMemory = [&](uint64_t aneFfnBytes) { return planWith(stateStagingBytes, aneFfnBytes); };
-  EngineMemoryPlanResult planResult = planMemory(0);
   // The automatic tier keeps its staging only where the plan holds the model
-  // and the requested context beside it. The split wins over it: where the
-  // plan refuses the split beside the staging but not without it, the tier
-  // turns off before the split is decided. A relaunch decides it as its first
-  // engine, an automatic start, did, so that it keeps the staging that engine
-  // kept; only its split leaves that engine's context (below).
+  // and the requested context beside it, the parts as they first loaded. The
+  // split wins over it: where the plan refuses the split beside the staging
+  // but not without it, the tier turns off before the split is decided. A
+  // relaunch decides it as its first engine, an automatic start, did, so that
+  // it keeps the staging that engine kept; only its split leaves that
+  // engine's context (below).
   if (stateStagingBytes && automaticDisk) {
     // The model's side of the split (startAneFfn).
     const AneFfnModel splitModel =
         aneFfnModel(*backend, loaded, operators, config.kvFormat, config.buildId, config.cancelled);
     const auto withoutStaging = [&](uint64_t aneFfnBytes) { return planWith(0, aneFfnBytes); };
+    const EngineMemoryPlanResult planResult = planMemory(0);
     if (!planResult.plan ||
         planResult.plan->maximumContextTokens() < std::max<uint32_t>(1, requestedContextTokens))
       diskOff(requestedContextTokens
@@ -830,28 +835,37 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
                                 "context beside its state staging"));
   }
 
-  // The automatic parts sized with the arenas: the start loads again where
-  // the plan gives a part another store. Whether a part streams decides the
-  // arenas: where the plan streams a part that loaded whole, or the reverse,
-  // the start loads it at its floor first and plans again. Until the tier
-  // measures its volume, the plan takes its quota for the room it has.
-  expertSetting = config.expertMemory;
-  tableSetting = config.pleMemory;
-  for (bool sized = false; !sized;) {
-    const StreamedMemoryResult planned = streamedPlan(stateStagingBytes, 0);
+  // The plan with the loaded model's arenas sizes the automatic parts, and
+  // the start loads again where it gives one another store. The arenas rest
+  // on whether the routed experts stream, as a target whose experts stream
+  // runs its prefill commands as groups (RuntimeGeometry::prefillChunks), and
+  // not on the stores' sizes: where the plan changes whether they stream, the
+  // start loads them at their floor once more and plans with those arenas.
+  // Streaming only grows the arenas, so that plan keeps the experts as they
+  // loaded: a start loads once where the parts load as the plan without the
+  // arenas has them, twice where the experts stream through more than their
+  // floor, and three times only where they fit beside everything but the
+  // arenas, which a start that loaded every expert refused. Until the tier
+  // measures its volume, the plan takes the cache's quota for the room it
+  // has.
+  for (uint32_t pass = 0; pass < 2; ++pass) {
+    const StreamedMemoryResult planned = sizingPlan(stateStagingBytes);
     if (!planned.plan)
       throw planRefusal(planned, hardBudgetBytes);
-    const bool switched = (planned.plan->expertBytes != 0) != (loadOptions.expertMemoryBytes != 0) ||
-                          (planned.plan->tableBytes != 0) != (loadOptions.streamedTableBytes != 0);
-    const model::ModelLoadOptions next = storesOf(*planned.plan, switched);
-    sized = !switched;
+    const bool regroups = (planned.plan->expertBytes != 0) != (loadOptions.expertMemoryBytes != 0);
+    const model::ModelLoadOptions next = storesOf(*planned.plan, regroups);
     if (next.expertMemoryBytes == loadOptions.expertMemoryBytes &&
         next.streamedTableBytes == loadOptions.streamedTableBytes)
       break;
+    const uint64_t sizedWith = arenaBytes();
     loadOptions = next;
     load(true);
+    if (regroups)
+      continue;
+    if (arenaBytes() != sizedWith)
+      throw std::logic_error("the arenas changed with the sizes of the streamed stores");
+    break;
   }
-  asLoaded();
   reportStreamedStores(loaded, streamable, config.expertMemory, config.pleMemory);
 
   RuntimeCacheIdentity cacheIdentity;
@@ -883,7 +897,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     kvFileOpen = disk.kv != nullptr;
     if (disk.budget)
       activeLimitBytes = disk.budget->activeLimitBytes();
-    planResult = planMemory(0);
+    EngineMemoryPlanResult planResult = planMemory(0);
     if (!planResult.plan) {
       throw RuntimeResourcesError(RuntimeResourceStage::MemoryPlanning,
                                   planResult.status.message,

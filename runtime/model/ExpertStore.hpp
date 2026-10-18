@@ -143,7 +143,10 @@ private:
 };
 
 // The slot table of a block whose routed experts are all resident: expert e
-// in slot e.
+// in slot e. A model's blocks share one, of residentExpertSlotsBytes.
 [[nodiscard]] metal::MetalBuffer residentExpertSlots(metal::MetalBackend &backend, uint32_t experts);
+[[nodiscard]] constexpr uint64_t residentExpertSlotsBytes(uint32_t experts) noexcept {
+  return uint64_t{experts} * sizeof(uint32_t);
+}
 
 } // namespace splash::model

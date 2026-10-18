@@ -180,9 +180,6 @@ struct PlanOptions {
 // The routed experts each layer's image streams (Image::experts), in layer
 // order; throws unless every layer's do.
 [[nodiscard]] std::vector<StreamedExperts> streamedExperts(std::span<const Image> layers);
-// The bytes of the planes of the routed experts an image streams
-// (Image::experts), 0 for none.
-[[nodiscard]] uint64_t streamedExpertBytes(const Image &image);
 // The bytes of the table rows an image streams (Image::streamedRows), 0 for
 // none.
 [[nodiscard]] uint64_t streamedTableBytes(const Image &image);
