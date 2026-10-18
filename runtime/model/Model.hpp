@@ -716,9 +716,9 @@ enum class IdleMemory : uint8_t {
   Buffers,
   // Pooled state buffers, then caches that can be rebuilt.
   BuffersThenCaches,
-  // Those, then a chunk of a streamed table's row cache above its floor,
-  // which every lane's reads miss into: only a start that the host's growth
-  // pause refused takes it, never a pressure pass.
+  // Those, then the rows of a streamed table's row cache above its floor,
+  // a chunk at a time, which every lane's reads miss into: only a start
+  // that the host's growth pause refused takes them, never a pressure pass.
   Streamed,
 };
 
@@ -817,10 +817,11 @@ public:
   // nothing holds it, the staging of spilled history once no prompt streams
   // into it, an extent of the hot block cache above its lanes' floors, and
   // then one embedding entry nothing else holds, oldest first; with
-  // Streamed, once none of those is idle, the last chunk of a streamed
-  // table's row cache above its floor (model::SparseRowStore::releaseChunk).
-  // A denied allocation retries between calls, so it frees only what it
-  // needs.
+  // Streamed, once none of those is idle, the chunk of a streamed table's
+  // row cache that holds its last rows, above its floor, with the empty
+  // chunks above it, which give back nothing: the bytes of those rows
+  // (model::SparseRowStore::releaseChunk). A denied allocation retries
+  // between calls, so it frees only what it needs.
   [[nodiscard]] virtual uint64_t reclaimIdleState(bool keepLane,
                                                   IdleMemory scope) noexcept = 0;
   // Why this request's mask is unusable, or nothing when the model took it.

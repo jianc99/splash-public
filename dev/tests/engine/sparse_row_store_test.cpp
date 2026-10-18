@@ -6,8 +6,8 @@
 // and reads a prefetch's rows ahead, below stages, within its bound,
 // skipping rows an earlier prefetch still reads and dropping a row it fails
 // to read; gives its cache back and grows it again a chunk at a time, never
-// below one row, beside prefetches; and a store that goes while a prefetch
-// reads waits for it.
+// below one row, beside prefetches, counting as given back the rows its
+// chunks held; and a store that goes while a prefetch reads waits for it.
 #include "TestChecks.hpp"
 #include "TestFiles.hpp"
 #include "model/SparseRowStore.hpp"
@@ -477,6 +477,38 @@ void releasesAndGrowsInChunks() {
           "the regrown cache did not hold its planned rows");
 }
 
+// A cache its rows have not filled holds memory only in the chunks rows
+// went into, the first ones: a release gives back the empty chunks above
+// them for nothing and then the chunk of its last rows, returning what those
+// rows held, the rows below staying cached; with no row above its floor it
+// gives back the empty chunks and returns nothing.
+void releasesTheRowsItHolds() {
+  constexpr uint32_t kChunk = 100;
+  // The floor's row and three chunks, of which a stage fills the first and
+  // half of the second.
+  Fixture f(5000, 1 + 3 * kChunk, 2, 64, uint64_t{kChunk} * rowBytes);
+  constexpr uint32_t kHeld = 1 + kChunk + kChunk / 2;
+  require(f.stage(idsFrom(0, kHeld)).readRows == kHeld, "a cold stage hit");
+  require(f.store->releaseChunk() == uint64_t{kChunk / 2} * rowBytes &&
+              f.store->releasedBytes() == uint64_t{2 * kChunk} * rowBytes &&
+              f.store->stats().cacheCapacityRows == 1 + kChunk && f.store->stats().cachedRows == 1 + kChunk,
+          "a release did not give back the empty chunk and the rows of the next alone");
+  require(f.stage(idsFrom(0, 1 + kChunk)).hitRows == 1 + kChunk, "a release took rows of the chunks it kept");
+  require(f.store->releaseChunk() == uint64_t{kChunk} * rowBytes && f.store->releaseChunk() == 0 &&
+              f.store->stats().cacheCapacityRows == 1,
+          "the full chunk did not give back its rows, or the floor went");
+  const splash::metal::AllocationAdmission admit = [](uint64_t, const std::function<void()> &allocate) {
+    allocate();
+    return splash::metal::AllocationResult();
+  };
+  require(static_cast<bool>(f.store->growChunk(admit)) && static_cast<bool>(f.store->growChunk(admit)) &&
+              f.store->stats().cacheCapacityRows == 1 + 2 * kChunk,
+          "the cache did not grow back");
+  require(f.store->releaseChunk() == 0 && f.store->stats().cacheCapacityRows == 1 &&
+              f.store->releasedBytes() == uint64_t{3 * kChunk} * rowBytes,
+          "chunks no row went into gave back other than nothing");
+}
+
 // Prefetches insert rows while the engine's thread gives chunks back and
 // grows them again, and stages read beside them (also under TSan).
 void prefetchesRaceChunkReleases() {
@@ -614,6 +646,7 @@ int main() {
       dropsAFailedPrefetch();
       concurrentUse();
       releasesAndGrowsInChunks();
+      releasesTheRowsItHolds();
       prefetchesRaceChunkReleases();
       readsAnOpenFile(directory.path());
       keepsTheSourceIdentity(directory.path());

@@ -382,22 +382,26 @@ uint64_t SparseRowStore::releasedBytes() const noexcept {
 
 uint64_t SparseRowStore::releaseChunk() {
   Impl &s = *impl_;
-  if (s.chunks.size() == 1) return 0;
-  std::unique_ptr<uint8_t[]> released;
-  const uint64_t rows = s.chunkRowsAt(s.chunks.size() - 1);
+  // A chunk's memory is the host's only once a row was copied into it, and
+  // rows fill the slots in order: the chunks past slot `used` hold none.
+  std::vector<std::unique_ptr<uint8_t[]>> released;
+  uint64_t held = 0;
   {
     const std::lock_guard lock(s.cacheMutex);
-    const uint64_t first = s.capacity - rows;
-    for (uint64_t slot = first; slot < s.used; ++slot) {
-      s.unlink(uint32_t(slot));
-      s.erase(s.ids[slot]);
+    while (!held && s.chunks.size() > 1) {
+      const uint64_t first = s.capacity - s.chunkRowsAt(s.chunks.size() - 1);
+      for (uint64_t slot = first; slot < s.used; ++slot) {
+        s.unlink(uint32_t(slot));
+        s.erase(s.ids[slot]);
+      }
+      held = s.used > first ? s.used - first : 0;
+      s.used = std::min(s.used, first);
+      s.capacity = first;
+      released.push_back(std::move(s.chunks.back()));
+      s.chunks.pop_back();
     }
-    s.used = std::min(s.used, first);
-    s.capacity = first;
-    released = std::move(s.chunks.back());
-    s.chunks.pop_back();
   }
-  return rows * s.table.rowBytes;
+  return held * s.table.rowBytes;
 }
 
 metal::AllocationResult SparseRowStore::growChunk(const metal::AllocationAdmission &admit) {
