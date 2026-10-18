@@ -358,6 +358,7 @@ private:
     bool diskQuota = false;
   };
 
+  struct Capture;
   struct Request final {
     struct StateBoundary final {
       uint32_t tokens = 0;
@@ -460,6 +461,14 @@ private:
     // A donor's: the floor of the hot block cache its conversion adds, until
     // its lane takes it or goes (owedFloorBytes_).
     uint64_t owedFloor = 0;
+    // Between the passes of its prefill command (BatchPlan::passes): the
+    // command's item, with the states it captures, and its captures, which
+    // every pass runs and the last one commits.
+    struct PassCommand final {
+      ModelBatchItem item;
+      std::vector<Capture> captures;
+    };
+    std::optional<PassCommand> passCommand;
     // Admission that waits for its state's read, its KV pages' restores,
     // or both, before the lane runs.
     struct Restore {
