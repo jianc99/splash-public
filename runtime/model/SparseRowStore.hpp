@@ -26,6 +26,7 @@
 // hint: a row it fails to read is dropped, and the stage that needs it reads
 // it again.
 
+#include "metal/MetalBackend.hpp"
 #include "model/LatencyHistogram.hpp"
 #include "model/SsdReaders.hpp"
 
@@ -57,6 +58,9 @@ struct SparseRowTable final {
 
 // The widest row a store takes.
 inline constexpr uint32_t kSparseRowMaximumBytes = 64 << 10;
+// The unit a store's cache gives back and grows in by default
+// (SparseRowStoreOptions::chunkBytes).
+inline constexpr uint64_t kSparseRowChunkBytes = 64ULL << 20;
 
 // How a store reads its source. Production stores read a WeightSource
 // (openRowReader); tests inject failures and delays.
@@ -91,6 +95,9 @@ struct SparseRowStoreOptions final {
   // The ids of a stage whose scratch the working memory holds; a larger
   // stage grows its scratch past that.
   uint32_t stageRows = 0;
+  // The rows the cache gives back and grows by at a time (releaseChunk,
+  // growChunk): as many as this many bytes hold, at least one.
+  uint64_t chunkBytes = kSparseRowChunkBytes;
 };
 
 // What a stage or prefetch was for, which its statistics are kept by.
@@ -107,7 +114,7 @@ struct SparseRowStageResult final {
 struct SparseRowStats final {
   std::string table;
   uint64_t tableBytes = 0;
-  uint64_t cacheBytes = 0;    // cache and working-memory reservation
+  uint64_t cacheBytes = 0;    // cache and working-memory reservation, as its chunks hold now
   uint64_t cacheCapacityRows = 0;
   uint64_t cachedRows = 0;
   // Per SparseRowUse: stages, row ids they took, distinct rows, cache hits
@@ -161,7 +168,22 @@ public:
   [[nodiscard]] const SparseRowTable &table() const noexcept;
   // Cache bytes plus the fixed working-memory reservation, at most
   // options.cacheBytes; not the store's measured allocation high-water mark.
+  // It follows the chunks the cache holds now: the planned bytes less
+  // releasedBytes().
   [[nodiscard]] uint64_t committedBytes() const noexcept;
+  // The bytes of the chunks the cache has given back below its plan.
+  [[nodiscard]] uint64_t releasedBytes() const noexcept;
+
+  // The cache holds its rows in chunks: one row, its floor, and then rows of
+  // options.chunkBytes each, the last one shorter. The index, the ids and
+  // the recency links stay sized for the plan. releaseChunk() gives back the
+  // last chunk above the floor, its rows leaving the cache, and returns its
+  // bytes, zero at the floor; growChunk() allocates the next chunk toward
+  // the plan through `admit`, which refused it changes nothing, and does
+  // nothing at the plan. Both take the engine's thread, between commands or
+  // beside stages and prefetches, which only find fewer rows cached.
+  uint64_t releaseChunk();
+  [[nodiscard]] metal::AllocationResult growChunk(const metal::AllocationAdmission &admit);
 
   // Stages the rows of `ids` (any order, repeats allowed): row u of `rows`
   // (u * rowBytes) holds the u-th distinct id's row, and slots[i] = u for

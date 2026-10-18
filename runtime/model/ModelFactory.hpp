@@ -111,6 +111,9 @@ struct RuntimeContext final {
   // prefills' history (StreamedParts::kv).
   KvBlockCache *blockCache = nullptr;
   KvHistoryStream *historyStream = nullptr;
+  // The governor's admission, through which a streamed table's row cache
+  // grows back toward its plan (Model::growCaches); none: it does not.
+  metal::AllocationAdmission admission = {};
 };
 
 // Validates only the interface between independently defined target and draft
