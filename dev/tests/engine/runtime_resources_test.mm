@@ -960,7 +960,7 @@ void testEngineFollowsTheGovernor(const char *metallibPath) {
       [&available] { return std::optional<HostMemory>(HostMemory{*available, *available}); }, 0);
   EngineConfig config;
   connectToGovernor(config, governor);
-  require(config.growthPaused && config.serving && !config.growthPaused(),
+  require(config.growthPaused && config.serving && config.fund && config.funded && !config.growthPaused(),
           "the engine was not connected to the governor");
   const auto admits = [admit = governor.allocationAdmission()] {
     return static_cast<bool>(admit(1024, [] {}));
@@ -973,6 +973,11 @@ void testEngineFollowsTheGovernor(const char *metallibPath) {
   require(admits(), "the serving mark did not reach the governor");
   config.serving(false);
   require(!admits(), "the serving mark was not cleared");
+  // A start funded through it: the mark admits what the balance holds.
+  config.funded(true);
+  require(!admits() && config.fund(1024) == 1024 && admits() && !admits(),
+          "the funding of a start did not reach the governor");
+  config.funded(false);
 }
 
 } // namespace

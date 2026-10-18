@@ -1236,6 +1236,7 @@ model::RuntimeContext RuntimeResources::modelContext() noexcept {
       aneFfn_.get(),
       blockCache_.get(),
       historyStream_.get(),
+      memoryGovernor_->allocationAdmission(),
   };
 }
 
@@ -1369,6 +1370,8 @@ void connectToGovernor(EngineConfig &config, MemoryGovernor &governor) {
     return !governor.snapshot().hostGrowthAllowed;
   };
   config.serving = [&governor](bool serving) { return governor.setServing(serving); };
+  config.fund = [&governor](uint64_t bytes) { return governor.fund(bytes); };
+  config.funded = [&governor](bool funded) { return governor.setFunded(funded); };
 }
 
 } // namespace splash::engine

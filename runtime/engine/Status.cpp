@@ -186,7 +186,10 @@ void appendKvReads(std::ostringstream &out, const model::KvReadStats &reads) {
 
 // A spill-capable target's KV on the SSD cache (kv_spill): the engine's
 // requests by KV mode, conversions, bounds, ends and refusals, and the starts
-// waiting for the quota; the pages that hold only their index, the pool's
+// waiting for the quota; the starts the host's growth pause refused that
+// memory Splash released funded, the lanes whose KV moved to the SSD for
+// them, what was released by kind, and the balance the governor holds for
+// them (funding); the pages that hold only their index, the pool's
 // pages of that form in use (each a spilled block's, which requests may hold
 // as the cache does), of `indexPageBytes` each, and those spilled; the
 // write-through of Spill requests' pages; the moves between page forms,
@@ -195,7 +198,8 @@ void appendKvReads(std::ostringstream &out, const model::KvReadStats &reads) {
 // that streamed a history beside decoders and the decoders' gaps across them.
 // A target that keeps its KV in memory has none: its /status is main's.
 void appendKvSpill(std::ostringstream &out, const KvSpillStatus &spill, uint64_t indexPageBytes,
-                   const engine::EngineSnapshot &core, const ResourceWaitSnapshot &resourceWait) {
+                   const engine::EngineSnapshot &core, const ResourceWaitSnapshot &resourceWait,
+                   const MemoryGovernorSnapshot &memoryGovernor) {
   const KvSpillSnapshot &cache = spill.cache;
   const engine::SpillRequestsSnapshot &requests = core.spill;
   const KvPoolFormSnapshot &index = core.resources.pool.index;
@@ -204,7 +208,12 @@ void appendKvSpill(std::ostringstream &out, const KvSpillStatus &spill, uint64_t
       << ",\"converted\":" << requests.converted << ",\"bounded\":" << requests.bounded
       << ",\"length_ends\":" << requests.lengthEnds << ",\"refused\":{\"quota\":" << requests.refusedQuota
       << ",\"write_budget\":" << requests.refusedWriteBudget << ",\"closed\":" << requests.refusedClosed
-      << "},\"waiting_quota\":" << resourceWait.diskQuota << '}'
+      << "},\"waiting_quota\":" << resourceWait.diskQuota << '}';
+  const engine::SpillFundingSnapshot &funding = requests.funding;
+  out << ",\"funding\":{\"starts\":" << funding.starts << ",\"conversions\":" << funding.conversions
+      << ",\"released_bytes\":{\"idle\":" << funding.released.idle << ",\"cache\":" << funding.released.cache
+      << ",\"streamed\":" << funding.released.streamed
+      << "},\"balance_bytes\":" << memoryGovernor.fundedBalanceBytes << '}'
       << ",\"pages\":{\"index\":" << indexPages << ",\"index_bytes\":" << indexPages * indexPageBytes
       << ",\"spilled\":" << cache.spilledPages << ",\"spilled_bytes\":" << cache.spilledBytes << '}'
       << ",\"write_through\":{\"pages\":" << cache.writeThroughPages << ",\"bytes\":" << cache.writeThroughBytes
@@ -354,7 +363,7 @@ std::string runtimeStatusJson(
   appendStreamedExperts(out, streamedExperts);
   if (kvSpill) {
     out << ",\"kv_spill\":";
-    appendKvSpill(out, *kvSpill, plan.breakdown().kvIndexPageBytes, core, resourceWait);
+    appendKvSpill(out, *kvSpill, plan.breakdown().kvIndexPageBytes, core, resourceWait, memoryGovernor);
   }
   out << ",\"ane_ffn\":";
   appendAneFfn(out, aneFfn, executorTelemetry.aneFfnReruns);

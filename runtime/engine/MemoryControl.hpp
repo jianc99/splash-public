@@ -8,13 +8,18 @@
 
 namespace splash::engine {
 
-// Emits only transitions; retry counts and queue depth do not produce logs.
+// The one owner of the memory log lines. Emits only transitions, retry
+// counts and queue depth producing none, and the starts the host's pause
+// refused that memory Splash released funded, with the lanes whose KV moved
+// to the SSD for them, as their counts advance: one line a pass.
 class MemoryStatusReporter final {
 public:
   [[nodiscard]] std::string update(const ResourceWaitSnapshot &wait,
                                     bool hostGrowthAllowed);
 private:
   unsigned state_ = 0;
+  // The funding the last line reported, and what had been released then.
+  SpillFundingSnapshot funding_;
 };
 
 // The engine's memory control between commands: it releases the weights of
