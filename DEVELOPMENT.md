@@ -546,8 +546,8 @@ what memory holds, as a dense target's is.
 - Admission decides it per request. A request whose KV, its prompt and
   `min(max_tokens, 4096)` tokens of output, fits the memory the plan leaves
   resident KV beside the other requests' keeps its KV in memory; any other
-  spills. A request in memory whose KV cannot grow spills from then on,
-  instead of waiting or yielding.
+  spills. A request in memory whose KV cannot grow spills from then on
+  rather than yield its lane or fail: it waits while its pages' copies land.
 - A spilling request writes each committed page once to the SSD cache. Once
   the copy has landed, the page keeps only its index, 24 KiB of the int8
   page's 414 KiB. Its first 2,048 tokens, which rows with less history read
@@ -576,8 +576,10 @@ what memory holds, as a dense target's is.
   keep out waits, and one whose prompt fits but not its output ends at the
   bound it was admitted with.
 - The KV a spilling request writes is in use and always written, so one long
-  request may overdraw `--max-cache-disk-writes` once: new spills wait until
-  the budget covers what was promised.
+  request may overdraw `--max-cache-disk-writes` once. Until the budget
+  covers what spilling requests were promised, a new request that would
+  spill keeps its KV in memory where it fits and is refused otherwise
+  (`kv_write_budget`, which it may retry).
 - A block that cannot be read back fails only the requests that read it, as
   `kv_unreadable`, which they may retry; the copy is dropped.
 
@@ -2308,12 +2310,13 @@ pages instead, those with at most `denseHistoryTokens` of history and its
 first `sinkTokens` and last `localTokens`. The memory plan sizes the hot block
 cache and the floors of [KV on the SSD](#kv-on-the-ssd) from it, and the
 cache keeps whole the pages those rows read. Its family code reaches K/V that
-left memory through two calls of the command's `model::SpilledKvReads`:
-`verify` after a layer's block lists, which locates each listed block of a
-page that holds only its index in the hot block cache for the attention, and
-`prefill` for each chunk, which returns the table and layer of the history
-staged for it. A command none of whose requests holds such a page encodes as
-without them.
+left memory through the command's `model::SpilledKvReads`: `verify` after a
+layer's block lists, which locates each listed block of a page that holds
+only its index in the hot block cache for the attention; `prefill` for each
+chunk, which returns the table and layer of the history staged for it; and
+`layerEnd` after a prefill layer, which hands the history's reads on to the
+next. A command none of whose requests holds such a page encodes as without
+them.
 
 ### Neural Engine prefill
 
