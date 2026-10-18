@@ -474,6 +474,33 @@ void testSharedPrefillDoesNotBlockUnrelatedWork() {
   }
 }
 
+// A prompt with images runs prefill groups as a text prompt does: an image
+// anywhere in a conversation leaves its long prompts' commands groups.
+void testImagePromptsRunPrefillGroups() {
+  for (bool images : {false, true}) {
+    test::TestKvStorage storage(512, 4096, 4);
+    KvPool pool(storage, 0);
+    engine::Cache cache(pool, nullptr, nullptr);
+    Executor model;
+    model.groupRows = 4 * model::ExecutionLimits::prefillTokenBudget;
+    Events events;
+    engine::Engine engine(test::engineConfig(), cache, model, events);
+    guardReleases(storage, engine);
+    // Groups run once prefill has a measured cost, as after the start's.
+    engine.observePrefill(model::ExecutionLimits::prefillTokenBudget, 1000.0, 0.0);
+    auto value = request(1, std::vector<uint32_t>(8193, 7));
+    if (images) {
+      value.images = {{4000, 16, 8, 8, 1, 1}};
+      value.imagePixels.assign(value.images.front().pixelBytes(), 1);
+    }
+    engine.submit(std::move(value));
+    runUntilIdle(engine);
+    require(events.completedCount == 1 && model.prefillChunks.at(1) == 2,
+            images ? "a prompt with an image did not run prefill groups"
+                   : "a text prompt did not run prefill groups");
+  }
+}
+
 void testSharedPrefillHonorsPriorityAndLateArrival() {
   for (bool foreground : {false, true}) {
     test::TestKvStorage storage(512, 4096, 4);
@@ -10854,6 +10881,7 @@ int main() {
     testSharedPrefillWaiterCancellationAndDeadline();
     testSharedPrefillFailedPublicationFallsBack();
     testSharedPrefillDoesNotBlockUnrelatedWork();
+    testImagePromptsRunPrefillGroups();
     testSharedPrefillHonorsPriorityAndLateArrival();
     testLateSharedPrefillExtendsTheProducerPlan();
     testLateSiblingBoundaryNeedsAWholeDraftWindow();
