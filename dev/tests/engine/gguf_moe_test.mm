@@ -408,7 +408,8 @@ std::vector<ComputeDispatch> fullGridsTwoPasses(const CommandGraph &graph, const
       continue;
     }
     // Input, tiles, tile count, gate's and up's routed and shared planes,
-    // output; a pass binds one projection's planes, its output and the gate.
+    // output, slot table; a pass binds one projection's planes, its output,
+    // the gate and the slot table.
     for (const bool up : {false, true}) {
       ComputeDispatch pass = dispatch;
       pass.pipelineName = dispatch.pipelineName.substr(0, merged) + (up ? "_g" : "_a");
@@ -417,13 +418,14 @@ std::vector<ComputeDispatch> fullGridsTwoPasses(const CommandGraph &graph, const
         pass.buffers.push_back({3 + plane, dispatch.buffers[(up ? 9 : 3) + plane].buffer});
       pass.buffers.push_back({9, up ? dispatch.buffers[15].buffer : scratch.expertOutput});
       pass.buffers.push_back({10, scratch.expertOutput});
+      pass.buffers.push_back({11, dispatch.buffers[16].buffer});
       // The pass's own parameters: the passes' sizes and this pass's formats.
       MoeGgufGateUpParams both;
       std::memcpy(&both, dispatch.bytes[0].data, sizeof(both));
       const MoeGgufExpertParams &params = passes.emplace_back(MoeGgufExpertParams{
           both.input_size, both.output_size, both.experts, up ? both.up_routed_format : both.gate_routed_format,
           up ? both.up_shared_format : both.gate_shared_format});
-      pass.bytes[0] = {11, &params, sizeof(params)};
+      pass.bytes[0] = {12, &params, sizeof(params)};
       pass.threadgroups.x = dispatch.threadgroups.x * GGUF_STAGED_COLUMNS / GGUF_TILE_COLUMNS;
       dispatches.push_back(std::move(pass));
     }
@@ -973,6 +975,60 @@ int routingLoads(MetalBackend &backend) {
 
 } // namespace
 
+// The kernels read each routed expert from the slot its table names: the
+// experts in slots permuted by sigma, with each expert's router row moved to
+// match (expert e routes as e' did where sigma(e) = e'), give the identity
+// table's output bit for bit, in decode and in prefill, on the staged tile
+// and on the register tile (Apple9's, which binds the table on its own).
+int permutedSlots(MetalBackend &backend) {
+  const MoeShape shape{kHidden, kExperts, kTopK, kIntermediate};
+  const auto sigma = [](uint32_t expert) { return (expert * 7 + 3) % kExperts; };
+  int failures = 0;
+  for (const MoeGgufTile tile : {MoeGgufTile::Staged, MoeGgufTile::Register}) {
+    const Model m = makeModel(backend, shape, tileFormats(tile).front(), false, tile);
+    Model permuted = m;
+    MetalBuffer table = backend.allocateBuffer(uint64_t{kExperts} * sizeof(uint32_t), BufferStorage::Shared,
+                                               "permuted-slots");
+    std::vector<float> router(m.router.values.size());
+    for (uint32_t expert = 0; expert < kExperts; ++expert) {
+      static_cast<uint32_t *>(table.contents())[expert] = sigma(expert);
+      std::copy_n(m.router.row(sigma(expert)), kHidden, router.begin() + uint64_t{expert} * kHidden);
+    }
+    permuted.weights.slotTable = table;
+    permuted.weights.router = floatSegment(backend, router, kExperts, kHidden);
+    Buffers b;
+    b.input = activations(uint64_t{kMaximumRows} * kHidden);
+    b.residual = activations(uint64_t{kMaximumRows} * kHidden);
+    b.moe.input = bfloatBuffer(backend, b.input, "moe-input");
+    b.moe.residual = bfloatBuffer(backend, b.residual, "moe-residual");
+    b.moe.output = zeros(backend, uint64_t{kMaximumRows} * kHidden * 2, "moe-output");
+    const auto run = [&](const Model &model, const MoePlan &plan) {
+      allocate(backend, b, plan);
+      std::memset(b.moe.output.contents(), 0, b.moe.output.sizeBytes());
+      CommandGraph graph;
+      MoE::add(graph, b.moe, model.weights, plan);
+      static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+      const auto *output = static_cast<const uint16_t *>(b.moe.output.contents());
+      return std::vector<uint16_t>(output, output + uint64_t{plan.rows()} * kHidden);
+    };
+    // The register tile prefills on the 8-row tiles of its decode
+    // (ExecutionPlans::moePrefill), the staged one here on 32-row tiles.
+    const MoeExpertTile prefillTile = tile == MoeGgufTile::Register ? MoeExpertTile::M8 : MoeExpertTile::M32;
+    int tileFailures = 0;
+    for (const MoePlan &plan :
+         {MoE::decodePlan(shape, 4, MoeConfig{.expertTile = MoeExpertTile::M8, .ggufTile = tile}),
+          MoE::prefillPlan(shape, kMaximumRows, MoeConfig{.expertTile = prefillTile, .ggufTile = tile})})
+      if (run(m, plan) != run(permuted, plan)) {
+        printf("  permuted slots, %u rows: the output differs from the identity table's FAIL\n", plan.rows());
+        ++tileFailures;
+      }
+    printf("%-20s %s permuted slot table, decode B4 and prefill %u: %s\n", formatNames(m).c_str(),
+           tile == MoeGgufTile::Register ? "register" : "staged  ", kMaximumRows, tileFailures ? "FAIL" : "ok");
+    failures += tileFailures;
+  }
+  return failures;
+}
+
 int main(int argc, const char *argv[]) {
   @autoreleasepool {
     if (argc != 2) {
@@ -984,7 +1040,7 @@ int main(int argc, const char *argv[]) {
       bufferExtents(backend);
       const int failures = floatProjection(backend) + bfloat16Weights(backend) + floatSegments(backend, 64) +
                            floatSegments(backend, 96) + floatOnlyChain(backend) + moe(backend) +
-                           routingLoads(backend);
+                           routingLoads(backend) + permutedSlots(backend);
       if (failures) {
         std::cerr << "gguf_moe_test: " << failures << " failures\n";
         return 1;
