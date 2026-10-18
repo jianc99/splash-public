@@ -55,25 +55,11 @@ TargetWeights readTarget(metal::MetalBackend &backend, const Qwen4ExpLayout &lay
   return loadQwen4ExpWeights(backend, layout, files);
 }
 
-// The rows of a family's streamed table that a step stages and prefetches
-// (SparseRowStoreOptions); the Qwen3.5 families have no table to stream.
-SparseRowStoreOptions tableRows(const Qwen3_8Layout &) { return {}; }
-SparseRowStoreOptions tableRows(const Qwen3_6MoeLayout &) { return {}; }
-SparseRowStoreOptions tableRows(const Qwen4ExpLayout &layout) { return streamedTableRows(layout); }
-
-// The sum of `bytes` over the images of the GGUF target in root's target/,
-// planned for a layout of `architecture` and `geometry`.
-uint64_t ggufTargetBytes(const std::filesystem::path &root, std::string_view architecture,
-                         const QwenTargetDimensions &geometry, gguf::PlanOptions options,
-                         uint64_t (*bytes)(const gguf::Image &)) {
-  const OpenGguf target(findTargetGgufs(root / "target"));
-  uint64_t total = 0;
-  for (const gguf::Image &image : gguf::planImages(target.file(), architecture, geometry, options))
-    total += bytes(image);
-  return total;
-}
-
 } // namespace
+
+SparseRowStoreOptions streamedTableRows(const Qwen3_8Layout &) { return {}; }
+
+SparseRowStoreOptions streamedTableRows(const Qwen3_6MoeLayout &) { return {}; }
 
 LoadedModel loadModel(metal::MetalBackend &backend,
                               const std::filesystem::path &root,
@@ -102,7 +88,7 @@ LoadedModel loadModel(metal::MetalBackend &backend,
         case TargetSource::Gguf: {
           // A streamed table's store: its memory and readers here, the rows
           // a step stages and prefetches from the family.
-          SparseRowStoreOptions table = tableRows(layout);
+          SparseRowStoreOptions table = streamedTableRows(layout);
           table.cacheBytes = options.streamedTableBytes;
           table.readers = options.readers;
           GgufTargetLoader loader(backend, images, findTargetGgufs(directory), layout.ggufArchitecture, layout, table,
@@ -125,27 +111,6 @@ LoadedModel loadModel(metal::MetalBackend &backend,
   result.manifestFingerprintSha256 = weightManifestFingerprint(records);
   requireCompatibleModel(result);
   return result;
-}
-
-uint64_t modelWeightBytes(const std::filesystem::path &root, const ModelDescriptor &descriptor,
-                          const ModelLoadOptions &options) {
-  const gguf::PlanOptions plan{.streamExperts = options.expertMemoryBytes != 0,
-                               .streamTable = options.streamedTableBytes != 0};
-  uint64_t bytes = std::visit(
-      [&](const auto &layout) {
-        return descriptor.targetSource == TargetSource::Gguf
-                   ? ggufTargetBytes(root, layout.ggufArchitecture, layout, plan, gguf::loadedBytes)
-                   : safetensorsTargetImageBytes(root / "target", layout, plan);
-      },
-      descriptor.target);
-  // A store allocates at most its memory (ExpertStoreOptions::memoryBytes).
-  if (plan.streamExperts &&
-      std::visit([](const auto &layout) { return layout.ffnKind == QwenFfnKind::SparseMoe; }, descriptor.target))
-    bytes += options.expertMemoryBytes;
-  bytes += draftImageBytes(root / "draft", descriptor.draft);
-  if (descriptor.hasVision())
-    bytes += visionImageBytes(descriptor.vision);
-  return bytes;
 }
 
 } // namespace splash::model

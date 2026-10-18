@@ -168,11 +168,11 @@ StreamedStart startStreamed(const RuntimeResourcesConfig &config) {
 // refuses a byte less.
 void testStreamableWeightsAreWhatLoads(const RuntimeResourcesConfig &config) {
   const std::filesystem::path &root = config.modelRoot;
-  const model::StreamableWeights weights = model::streamableWeights(root, config.model);
-  require(weights.expertBytes && !weights.tableBytes && !weights.tableFloorBytes &&
-              weights.loadedBytes + weights.expertFloorBytes ==
-                  model::modelWeightBytes(root, config.model, {.expertMemoryBytes = weights.expertFloorBytes}),
-          "the streamable weights are not what the loader plans");
+  const model::StreamableWeights weights =
+      model::streamableWeights(root, config.model, {.streamExperts = true, .streamTable = true});
+  require(weights.expertBytes > weights.expertFloorBytes && weights.expertFloorBytes && !weights.tableBytes &&
+              !weights.tableFloorBytes && weights.tableRefusal.empty(),
+          "the streamable weights of a MoE without a table are not its experts'");
   const auto allocated = [](const model::LoadedModel &loaded) {
     return loaded.targetActualAllocatedBytes() + loaded.draft.actualAllocatedBytes +
            loaded.vision.actualAllocatedBytes;
@@ -200,7 +200,8 @@ void testStreamableWeightsAreWhatLoads(const RuntimeResourcesConfig &config) {
 // loads them whatever the budget, and a size below the smallest store is
 // refused by name before anything loads.
 void testAutomaticExpertMemory(RuntimeResourcesConfig config) {
-  const model::StreamableWeights weights = model::streamableWeights(config.modelRoot, config.model);
+  const model::StreamableWeights weights =
+      model::streamableWeights(config.modelRoot, config.model, {.streamExperts = true});
   const StreamedStart whole = startStreamed(config);
   require(!whole.experts && whole.loads == 1 &&
               whole.log.find("Routed experts load with their layers") != std::string::npos,
@@ -273,7 +274,7 @@ void requireReachesModelLoader(RuntimeResourcesConfig config,
 // Beside its weights a model needs at least the runtime reserves, one lane's
 // state and the KV runway.
 uint64_t minimumBytes(const RuntimeResourcesConfig &config) {
-  return minimumRequiredBytes(model::modelWeightBytes(config.modelRoot, config.model) +
+  return minimumRequiredBytes(model::streamableWeights(config.modelRoot, config.model, {}).loadedBytes +
                                   model::kPipelineReserveBytes + model::kRuntimeOverheadReserveBytes,
                               config.model.stateLayout.laneBytes(),
                               config.model.targetKvLayout)
@@ -363,9 +364,9 @@ void testWeightBudgetBeforeLoading(const char *metallibPath) {
   config.memoryPressure = [] { return MemoryPressure::Warning; };
 
   // The low ceiling is one byte short of the minimum, so admission must
-  // charge modelWeightBytes and all a model needs beside its weights. The
-  // other ceilings must reach the real loader, whose expected weight files
-  // are deliberately absent.
+  // charge the weights and all a model needs beside them. The other ceilings
+  // must reach the real loader, whose expected weight files are deliberately
+  // absent.
   const uint64_t minimum = minimumBytes(config);
   for (uint64_t ceiling : {minimum - 1, minimum, uint64_t{0}}) {
     config.maximumMemoryBytes = ceiling;
@@ -499,7 +500,7 @@ void testModelBeyondBudgetIsRefusedBeforeLoading(const char *metallibPath) {
                                             test::qwen3_8Vision(), model::TargetSource::Safetensors,
                                             model::VisionSource::Safetensors);
   writeCheckpoints(root.path(), config.model);
-  config.maximumMemoryBytes = model::modelWeightBytes(root.path(), config.model) + kGiB / 2;
+  config.maximumMemoryBytes = model::streamableWeights(root.path(), config.model, {}).loadedBytes + kGiB / 2;
   try {
     auto resources = RuntimeResources::create(config, 0);
     throw std::runtime_error("a model that cannot fit unexpectedly loaded");
@@ -526,7 +527,8 @@ void testStartupAdmissionIgnoresModelSize(const char *metallibPath) {
   config.model = model::makeModelDescriptor("budget-test", target, draft, test::qwen3_8Vision(),
                                             model::TargetSource::Safetensors, model::VisionSource::Safetensors);
   writeCheckpoints(root.path(), config.model);
-  require(model::modelWeightBytes(root.path(), config.model) > 3 * kGiB, "the model must exceed the sample");
+  require(model::streamableWeights(root.path(), config.model, {}).loadedBytes > 3 * kGiB,
+          "the model must exceed the sample");
   config.hostMemory = [] { return std::optional<HostMemory>(HostMemory{3 * kGiB, 3 * kGiB}); };
   requireReachesModelLoader(config, root.path(),
                             "a model larger than reclaimable host memory "
