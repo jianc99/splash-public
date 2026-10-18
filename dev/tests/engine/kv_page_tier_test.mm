@@ -7,6 +7,7 @@
 
 #include "engine/MemoryGovernor.hpp"
 #include "engine/RuntimeResources.hpp"
+#include "model/KvCopyRead.hpp"
 
 #include <sys/resource.h>
 #include <unistd.h>
@@ -78,22 +79,6 @@ std::vector<std::byte> payload(const kv::SlotFormat &format, const kv::PageStora
     bytes.insert(bytes.end(), span.begin(), span.end());
   return bytes;
 }
-
-// Memory a direct read lands in (model::SlotFile::readAt).
-class ReadBuffer final {
-public:
-  explicit ReadBuffer(size_t bytes)
-      : memory_(static_cast<std::byte *>(::operator new(bytes, kAlignment))), bytes_(bytes) {}
-  ~ReadBuffer() { ::operator delete(memory_, kAlignment); }
-  ReadBuffer(const ReadBuffer &) = delete;
-  ReadBuffer &operator=(const ReadBuffer &) = delete;
-  [[nodiscard]] std::span<std::byte> span() const noexcept { return {memory_, bytes_}; }
-
-private:
-  static constexpr std::align_val_t kAlignment{kv::SlotFormat::kReadAlignmentBytes};
-  std::byte *memory_;
-  size_t bytes_;
-};
 
 std::shared_ptr<SlotFile::Slot> fileSlot(const std::shared_ptr<engine::KvDiskSlot> &slot) {
   return static_cast<KvPageTier::DiskSlot &>(*slot).slot;
@@ -219,11 +204,10 @@ void blockRecords(metal::MetalBackend &backend, engine::MemoryGovernor &governor
   runUntilReady(tier, *written);
   require(written->finish(), "the page's write failed");
   const std::shared_ptr<const model::KvCopy> copy = tier.copy(slot);
-  const ReadBuffer buffer(2 * kv::SlotFormat::kReadAlignmentBytes);
   for (uint32_t layer : {0u, layout.attentionLayers - 1}) {
     for (uint32_t block = 0; block < kv::SlotFormat::kBlocksPerPage; ++block) {
       const kv::SlotRange range = format.recordRange(layer, block);
-      const auto bytes = copy->readAt(range.offset, range.bytes, buffer.span());
+      const auto bytes = model::readKvCopy(*copy, range);
       require(bytes && std::equal(bytes->begin(), bytes->end(), slotted.begin() + range.offset),
               "a block's record did not come back in one aligned read");
     }
@@ -631,11 +615,10 @@ void persistentRoundTrip(metal::MetalBackend &backend, engine::MemoryGovernor &g
           "an adopted slot did not restore its page byte for byte");
   require(!restoreChanged->finish(), "a slot that changed after its record was restored");
   if (format.version()) {
-    const ReadBuffer buffer(2 * kv::SlotFormat::kReadAlignmentBytes);
     const kv::SlotRange whole = format.recordRange(0, 0);
     const kv::SlotRange broken = format.recordRange(lastLayer, lastBlock);
-    require(tier.copy(changed)->readAt(whole.offset, whole.bytes, buffer.span()).has_value() &&
-                !tier.copy(changed)->readAt(broken.offset, broken.bytes, buffer.span()).has_value(),
+    require(model::readKvCopy(*tier.copy(changed), whole).has_value() &&
+                !model::readKvCopy(*tier.copy(changed), broken).has_value(),
             "a record of an adopted slot was read against another's checksum");
   }
   std::error_code ignored;

@@ -678,7 +678,7 @@ $(TEST_KV_SLOT_FORMAT) $(TEST_KV_SLOT_FORMAT_ASAN): \
 		runtime/ops/KvSlotFormat.cpp dev/tests/engine/kv_slot_format_test.cpp
 $(TEST_KV_PAGE_TIER_HOST) $(TEST_KV_PAGE_TIER_HOST_ASAN) $(TEST_KV_PAGE_TIER_HOST_TSAN): \
 		runtime/ops/KvSlotFormat.cpp runtime/model/SlotFile.cpp runtime/model/SsdReaders.cpp \
-		dev/tests/engine/kv_page_tier_host_test.cpp
+		runtime/model/KvCopyRead.cpp dev/tests/engine/kv_page_tier_host_test.cpp
 $(TEST_DISK_SPACE) $(TEST_DISK_SPACE_ASAN) $(TEST_DISK_SPACE_TSAN): \
 		runtime/engine/DiskSpace.cpp runtime/engine/CacheDirectory.cpp \
 		runtime/model/SlotFile.cpp dev/tests/engine/disk_space_test.cpp
