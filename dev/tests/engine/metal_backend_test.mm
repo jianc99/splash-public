@@ -1974,6 +1974,52 @@ void hostStepAfterALongWait(const std::string &metallibPath) {
     std::cout << "PASS a host step after a long wait runs (pickup " << timing.pickupSeconds * 1e6 << " us)\n";
 }
 
+// The watchdog bounds each stretch of a command between its progress, its
+// host steps as the work before each ends and as each returns, not the whole
+// command: checked as often as the engine's health checks may, a command of
+// eight host steps of 50 ms each outlasts the 100 ms timeout and completes
+// with the backend healthy, and one host step of 300 ms is given up on.
+void watchdogFollowsHostSteps(const std::string &metallibPath) {
+    // The reason the backend gave up a command of `steps` host steps of
+    // `each`, empty while it stays healthy.
+    const auto givenUp = [&](uint32_t steps, std::chrono::milliseconds each) {
+        MetalBackend backend(metallibPath, kResidencyKeepAliveSeconds, kShortCommandTimeoutSeconds);
+        MetalBuffer buffer = sharedBuffer(backend, sizeof(uint32_t));
+        auto *value = static_cast<volatile uint32_t *>(buffer.contents());
+        *value = 0;
+        const uint32_t count = 1, one = 1;
+        const std::vector<ComputeDispatch> dispatches(steps + 1, addition(buffer, count, one));
+        std::vector<EventStep> events;
+        for (uint32_t step = 1; step <= steps; ++step)
+            events.push_back({step, {}, 0, EventStep::Kind::Host, [each] { std::this_thread::sleep_for(each); }});
+        std::atomic<bool> done{false};
+        std::thread checks([&] {
+            while (!done) {
+                try {
+                    backend.checkHealth();
+                } catch (const MetalBackendError &) {
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+        });
+        try {
+            (void)backend.submitCommandAsync(Command{dispatches, events}).wait();
+        } catch (const MetalBackendError &) {
+        }
+        done = true;
+        checks.join();
+        require(!backend.healthy() || *value == steps + 1, "a command completed without its work");
+        return backend.healthy() ? std::string() : backend.unhealthyReason();
+    };
+    const std::string progressing = givenUp(8, std::chrono::milliseconds(50));
+    require(progressing.empty(),
+            "a command whose host steps each ended within the timeout was given up: " + progressing);
+    const std::string stalled = givenUp(1, std::chrono::milliseconds(300));
+    require(stalled.find("completion timed out") != std::string::npos,
+            "a host step longer than the timeout was not given up: " + stalled);
+    std::cout << "PASS the watchdog follows a command's host steps\n";
+}
+
 // A backend destroyed while its runner is blocked on a step (the command
 // held on an event past the runner's spin) stops the runner within its stop
 // check: the runner raises the step without running it, so the command
@@ -2309,6 +2355,7 @@ int main(int argc, const char *argv[]) {
             throwingHostStepFailsItsCommand(argv[1]);
             hostStepThen(argv[1]);
             hostStepAfterALongWait(argv[1]);
+            watchdogFollowsHostSteps(argv[1]);
             blockedHostStepRunnerStops(argv[1]);
             allocationDoesNotRequestResidency(argv[1]);
             residencyRacesTheHeartbeat(argv[1]);

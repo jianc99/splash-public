@@ -425,6 +425,13 @@ struct BackendAsyncState {
         commandWatchdog.complete(sequence);
     }
 
+    // A host step of the command was taken up or returned at nowSeconds
+    // (CommandWatchdog).
+    void progressSubmission(uint64_t sequence, double nowSeconds) noexcept {
+        std::lock_guard lock(gateMutex);
+        commandWatchdog.progress(sequence, nowSeconds);
+    }
+
     // Runs the command watchdog. A terminal command whose callback is late
     // is completed here; one still running past its timeout marks the
     // backend unhealthy, and the answer is then true: the backend gave up on
@@ -493,7 +500,8 @@ struct BackendAsyncState {
 // names the command's failure, and a `then` that throws marks the backend
 // unhealthy (EventStep). The runner notes when it took each
 // step up and when its work returned, which the command's completion reports
-// (timed) against the GPU times of the buffers before and after the step.
+// (timed) against the GPU times of the buffers before and after the step,
+// and each is the command's progress for the watchdog (CommandWatchdog).
 struct HostSteps {
     struct Step {
         uint64_t ready = 0;
@@ -511,6 +519,8 @@ struct HostSteps {
     };
     __strong id<MTLSharedEvent> event = nil;
     std::shared_ptr<BackendAsyncState> backend;
+    // The command's submission (BackendAsyncState::beginSubmission).
+    uint64_t sequence = 0;
     // The spin's release buffer (HostStepSpin), once a step spins.
     __strong id<MTLBuffer> releases = nil;
     // A deque, so that the runner holds on to a step while the submission
@@ -634,9 +644,11 @@ private:
                 id<MTLSharedEvent> event = steps.event;
                 id<MTLCommandBuffer> before = step.before;
                 bool worked = false;
+                std::optional<double> returned;
                 if (before && reached(event, step.ready, before) &&
                     before.status != MTLCommandBufferStatusError) {
                     const double pickup = awakeSeconds();
+                    steps.backend->progressSubmission(steps.sequence, pickup);
                     try {
                         step.work();
                         worked = true;
@@ -645,12 +657,15 @@ private:
                     } catch (...) {
                         steps.fail("host step failed");
                     }
-                    steps.ran(step, pickup, awakeSeconds());
+                    returned = awakeSeconds();
+                    steps.ran(step, pickup, *returned);
                 } else if (stopping_) {
                     steps.fail("host step not run: the backend stopped");
                 }
                 event.signaledValue = step.ready + 1;
                 if (step.release) release(steps.releases, *step.release);
+                // The step's return moves the deadline once the GPU went on.
+                if (returned) steps.backend->progressSubmission(steps.sequence, *returned);
                 if (worked && step.then) {
                     try {
                         step.then();
@@ -1094,11 +1109,12 @@ struct MetalBackend::Impl {
     // seen to end at its release (checkHostStepSpin).
     template <class Fail>
     id<MTLCommandBuffer> encodeHostStep(id<MTLCommandBuffer> command, std::vector<id<MTLCommandBuffer>> &leading,
-                                        std::shared_ptr<HostSteps> &steps, const EventStep &step,
+                                        std::shared_ptr<HostSteps> &steps, uint64_t sequence, const EventStep &step,
                                         Fail &&failEncoding) {
         if (!steps) {
             steps = std::make_shared<HostSteps>();
             steps->backend = asyncState;
+            steps->sequence = sequence;
             steps->event = [device newSharedEvent];
             if (!steps->event) failEncoding("unable to create Metal shared event");
         }
@@ -1287,7 +1303,8 @@ struct MetalBackend::Impl {
                             encoder = nil;
                         }
                         if (step->kind == EventStep::Kind::Host) {
-                            command = encodeHostStep(command, leading, ticketState->hostSteps, *step, failEncoding);
+                            command = encodeHostStep(command, leading, ticketState->hostSteps,
+                                                     ticketState->sequence, *step, failEncoding);
                             continue;
                         }
                         id<MTLSharedEvent> event =

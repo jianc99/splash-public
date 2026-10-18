@@ -338,8 +338,10 @@ private:
 // enough to refuse an unsupported Mac before a model is downloaded.
 [[nodiscard]] DeviceCapabilities probeDeviceCapabilities();
 
-// How long a command may run before the backend gives up on it by default,
-// in time the Mac is awake (AwakeClock).
+// How long a command may go without progress before the backend gives up on
+// it by default, in time the Mac is awake (AwakeClock): from its commit, and
+// then from each of its host steps as the GPU work before it ends and as it
+// returns (CommandWatchdog).
 inline constexpr double kCommandTimeoutSeconds = 120.0;
 // How long every buffer stays wired after the last command by default (see
 // allocateBuffer), also the default of the engine's idle release
@@ -355,7 +357,8 @@ class MetalBackend final {
 public:
   // Buffers stay wired for residencyKeepAliveSeconds after the last command;
   // an infinite keep-alive holds them while the backend lives. The watchdog
-  // gives up on a command that runs longer than commandTimeoutSeconds.
+  // gives up on a command that goes longer than commandTimeoutSeconds without
+  // progress (kCommandTimeoutSeconds).
   explicit MetalBackend(std::string metallibPath,
                         double residencyKeepAliveSeconds = kResidencyKeepAliveSeconds,
                         double commandTimeoutSeconds = kCommandTimeoutSeconds);
