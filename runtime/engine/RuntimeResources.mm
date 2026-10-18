@@ -1233,10 +1233,10 @@ model::RuntimeContext RuntimeResources::modelContext() noexcept {
 }
 
 EngineSpillConfig RuntimeResources::spillConfig() const noexcept {
-  const std::optional<model::SparseKvShape> &shape = model_.descriptor.capabilities.sparseKv;
-  return {.capable = memoryPlan_.breakdown().kvSpill.enabled,
+  const KvSpillPlan &spill = memoryPlan_.breakdown().kvSpill;
+  return {.capable = spill.enabled,
           .always = spillAlways_,
-          .denseTokens = shape ? shape->denseHistoryTokens : 0,
+          .denseTokens = spill.densePages * kv::kPageTokens,
           .geometry = memoryPlan_.spillGeometry()};
 }
 
