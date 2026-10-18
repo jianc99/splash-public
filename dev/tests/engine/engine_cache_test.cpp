@@ -15,6 +15,7 @@
 #include <iostream>
 #include <memory>
 #include <numeric>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <utility>
@@ -4394,12 +4395,13 @@ void testSpillMovesLandedPagesToTheIndexForm() {
               spilled.writeThroughPages == 6 && spilled.heldBytes == 600 && spilled.committedBytes == 0 &&
               spill.cache.holdsIndexPages(1),
           "spilling did not count what it holds and did");
-  const PageTableView table = spill.cache.cutPageTable(1);
-  require(table.sources && table.sources->indexPages() == 4 &&
-              (*table.sources)[1].block == spill.block(1, 1) && (*table.sources)[1].copy &&
-              !(*table.sources)[5].indexed() && !(*table.sources)[0].indexed(),
+  std::shared_ptr<const model::KvPageSources> sources = spill.cache.cutPageTable(1).sources;
+  require(sources && sources->indexPages() == 4 && (*sources)[1].block == spill.block(1, 1) &&
+              (*sources)[1].copy && !(*sources)[5].indexed() && !(*sources)[0].indexed(),
           "the cut did not name the spilled blocks and their copies");
   spill.cache.checkInvariants();
+  // The command that read them completed.
+  sources.reset();
   spill.cache.endRequest(1);
   require(spill.cache.spillSnapshot().heldBytes == 0 && spill.cache.spillSnapshot().spilledPages == 4,
           "the finished request's spilled chain did not stay cached");
@@ -4681,29 +4683,60 @@ void testWritersMoveOntoPagesBeingWritten() {
 }
 
 // Quota never gives up the copy of a block a request holds: the copies a
-// running request reads stay at a limit of nothing. A cut outlives its
-// command only by mistake: a copy it names, whose block nothing holds any
-// more, cannot go while it does.
+// running request reads stay at a limit of nothing. The command that read
+// them outlives the request while the engine applies its results, as the
+// request ends: quota and RAM reclaim give the blocks up all the same, and
+// the slots of those its cut names return once the cut goes.
 void testQuotaGivesUpOnlyCopiesNothingReads() {
   Spilling spill({1, 1}, 64);
   const std::vector<uint32_t> prompt = Spilling::prompt(1000, 5);
   spill.start(1, prompt, 5);
   static_cast<void>(test::spillRound(spill.cache, spill.tier));
-  const PageTableView table = spill.cache.cutPageTable(1);
+  std::optional<PageTableView> command = spill.cache.cutPageTable(1);
   spill.budget->setLimitBytes(0);
   spill.cache.keepDiskLimit();
   require(spill.tier.slots == 5 && spill.cache.spillSnapshot().heldBytes == 500,
           "quota gave up the copies a running request reads");
   spill.cache.checkInvariants();
   spill.cache.endRequest(1);
-  // The window's page goes without a copy, then the deepest spilled leaf
-  // keeps its copy alone.
-  spill.cache.keepDiskLimit();
-  for (int step = 0; step < 2; ++step)
-    require(spill.cache.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::Ordinary).madeProgress,
-            "a leaf did not leave RAM");
-  rejects([&] { spill.cache.keepDiskLimit(); }, "a reader still holds its copy",
-          "quota gave up a copy a cut still names");
+  do {
+    spill.cache.keepDiskLimit();
+  } while (spill.cache.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::Ordinary).madeProgress);
+  require(spill.cache.snapshot().kvTier.diskBlocks == 0 && spill.cache.snapshot().pool.pagesPrefix == 0 &&
+              spill.tier.slots == 3,
+          "quota and reclaim did not give the ended request's blocks up, or the cut lost its copies");
+  command.reset();
+  require(spill.tier.slots == 0 && spill.budget->usedBytes() == 0,
+          "the slots of the copies the cut named did not return once it went");
+  spill.cache.checkInvariants();
+}
+
+// A lane that read an unreadable copy ends, and the copy is poisoned, while
+// the engine applies the results of the command that read it, whose cut
+// still names it: before the lane ends or after, the block at the start of
+// the spilled pages or at their end. The block and those below it leave at
+// once; their copies' slots return with the cut.
+void testUnreadableCopyLeavesBeforeTheCommandThatReadIt() {
+  for (const bool poisonFirst : {false, true}) {
+    for (const uint32_t page : {1u, 4u}) {
+      Spilling spill;
+      spill.start(1, Spilling::prompt(1000, 6), 6);
+      static_cast<void>(test::spillRound(spill.cache, spill.tier));
+      std::optional<PageTableView> command = spill.cache.cutPageTable(1);
+      const uint64_t unreadable = spill.block(1, page);
+      if (poisonFirst)
+        spill.cache.poisonCopy(unreadable);
+      spill.cache.endRequest(1);
+      if (!poisonFirst)
+        spill.cache.poisonCopy(unreadable);
+      // The spilled pages past it keep their slots until the cut goes.
+      require(spill.cache.snapshot().kvTier.diskBlocks == page && spill.tier.slots == 5,
+              "the unreadable block and those below it did not leave, or the cut lost its copies");
+      command.reset();
+      require(spill.tier.slots == page, "the cut's slots did not return once it went");
+      spill.cache.checkInvariants();
+    }
+  }
 }
 
 // A commitment locks quota without giving any copy up; each page a Spill
@@ -4995,6 +5028,7 @@ int main() {
     testUnspillOnlyAsTheOnlyHolder();
     testWritersMoveOntoPagesBeingWritten();
     testQuotaGivesUpOnlyCopiesNothingReads();
+    testUnreadableCopyLeavesBeforeTheCommandThatReadIt();
     testCommitmentsLockQuotaUntilWritten();
     testEveryHolderDecidesWhetherAPageSpills();
     testBlocksAreWrittenOnce();

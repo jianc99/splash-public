@@ -712,10 +712,13 @@ void testWritersAndTheContentOfABlock() {
 }
 
 // A poisoned block that requests hold keeps its copy, which they may still
-// read; it leaves with the block once the last of them lets go. A copy a
-// reader still holds cannot go with its block, and a block written once
-// more after its copy went counts as written again.
-void testCopiesLeaveOnlyWithNoReader() {
+// read; it leaves with the block once the last of them lets go. A block
+// written once more after its copy went counts as written again. A reader
+// holds a copy while a request holds its block; one that outlives the
+// holders, as a command's cut does while the engine applies its results,
+// keeps the slot of a block that left until it lets go, and the invariants
+// find it while the block stays.
+void testCopiesLeaveWithTheirBlocks() {
   test::TestKvStorage storage(8, 100, 1, 10);
   KvPool pool(storage, 8);
   CacheRecency recency;
@@ -736,9 +739,18 @@ void testCopiesLeaveOnlyWithNoReader() {
   cache.setSlot(root.id, nullptr);
   cache.setSlot(root.id, std::make_shared<FakeSlot>());
   require(cache.rewrites() == 1, "a block written again after its copy went was not counted");
-  const std::shared_ptr<engine::KvDiskSlot> reader = cache.slot(root.id);
-  rejects([&] { cache.setSlot(root.id, nullptr); }, "a reader still holds",
-          "a copy a reader holds was given up");
+  std::shared_ptr<engine::KvDiskSlot> reader = cache.slot(root.id);
+  const std::weak_ptr<engine::KvDiskSlot> slot = reader;
+  cache.checkInvariants();
+  cache.unholdPage(acquired.pages[0]);
+  rejects([&] { cache.checkInvariants(); }, "has no reader",
+          "a copy whose block nothing holds kept a reader unnoticed");
+  cache.erase(root.id);
+  require(!cache.contains(root.id) && cache.diskBlocks() == 0 && !slot.expired(),
+          "a block whose copy a reader holds did not leave, or took the copy from the reader");
+  reader.reset();
+  require(slot.expired(), "the copy outlived its last reader");
+  cache.checkInvariants();
 }
 } // namespace
 
@@ -757,7 +769,7 @@ int main() {
     testRequestsHoldTheirBlocks();
     testSpilledBlocksTakeTheirPagesForm();
     testWritersAndTheContentOfABlock();
-    testCopiesLeaveOnlyWithNoReader();
+    testCopiesLeaveWithTheirBlocks();
     std::cout << "KV page cache tests passed\n";
     return 0;
   } catch (const std::exception &error) {
