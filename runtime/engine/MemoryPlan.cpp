@@ -263,10 +263,12 @@ std::string_view budgetErrorCodeName(BudgetErrorCode code) {
   return "unknown";
 }
 
-// A spill-capable target's plan (KvSpillPlan), as /status reports it.
+// A spill-capable target's plan (KvSpillPlan), as /status reports it; null
+// for a target that keeps its KV in memory.
 std::string spillStatusJson(const KvSpillPlan &spill) {
+  if (!spill.enabled) return "null";
   std::ostringstream out;
-  out << "{\"enabled\":" << (spill.enabled ? "true" : "false") << ",\"dense_pages\":" << spill.densePages
+  out << "{\"dense_pages\":" << spill.densePages
       << ",\"window_pages\":" << spill.windowPages << ",\"group_pages\":" << spill.groupPages
       << ",\"slot_bytes\":" << spill.slotBytes << ",\"lane_slots\":" << spill.laneSlots
       << ",\"hot_floor_bytes\":" << spill.hotFloorBytes << ",\"hot_target_bytes\":" << spill.hotTargetBytes

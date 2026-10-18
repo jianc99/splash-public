@@ -537,7 +537,8 @@ void testDense35BKeepsMainsPlan() {
             std::string("the 35B streams its experts on the ") + mac.name + " where main loads them");
     const EngineMemoryPlan mains = test::requireMemoryPlan(deviceOf(mac), target.profile());
     require(mains.maximumContextTokens() == context && mains.breakdown().kvCapacityTokens == capacityTokens &&
-                mains.breakdown().contextBounds.bound() != std::string_view("disk"),
+                mains.breakdown().contextBounds.bound() != std::string_view("disk") &&
+                mains.toStatusJson().find("\"kv_spill\":null") != std::string::npos,
             std::string("the 35B's plan on the ") + mac.name + " is not main's");
   }
 }
@@ -754,7 +755,7 @@ void testEnginePlanServesTheSpilledContext() {
                 plan.maximumContextTokens() == std::min(bounds.spilled, bounds.disk),
             std::string("Flash-Next's context on the ") + mac.name + " is not what spilling serves");
     require(plan.toStatusJson().find("\"context_bounds\":{\"window\":1010000") != std::string::npos &&
-                plan.toStatusJson().find("\"kv_spill\":{\"enabled\":true") != std::string::npos,
+                plan.toStatusJson().find("\"kv_spill\":{\"dense_pages\":64") != std::string::npos,
             "the memory status does not report the spill plan");
     const SpillGeometry geometry = plan.spillGeometry();
     require(geometry.fullPageBytes == 423'936 && geometry.indexPageBytes == 24'576 &&

@@ -561,7 +561,7 @@ RuntimeResources::RuntimeResources(
     std::unique_ptr<KvPool> kvPool, std::unique_ptr<engine::Cache> cache,
     std::unique_ptr<ops::AneFfn> aneFfn, AneFfnOutcome aneFfnOutcome,
     std::unique_ptr<model::KvBlockCache> blockCache,
-    std::unique_ptr<model::KvHistoryStream> historyStream, bool spillAlways, std::string spillOffReason)
+    std::unique_ptr<model::KvHistoryStream> historyStream, bool spillAlways)
     : persistentCache_(std::move(persistentCache)),
       backend_(std::move(backend)), readers_(std::move(readers)), model_(std::move(model)),
       operators_(std::move(operators)),
@@ -573,8 +573,7 @@ RuntimeResources::RuntimeResources(
       cache_(std::move(cache)), aneFfn_(std::move(aneFfn)),
       blockCache_(std::move(blockCache)), historyStream_(std::move(historyStream)),
       releasableMemory_({model_.images.get(), model_.expertStore()}, idleSplit(aneFfn_.get())),
-      aneFfnOutcome_(std::move(aneFfnOutcome)), spillAlways_(spillAlways),
-      spillOffReason_(std::move(spillOffReason)) {}
+      aneFfnOutcome_(std::move(aneFfnOutcome)), spillAlways_(spillAlways) {}
 
 std::unique_ptr<RuntimeResources>
 RuntimeResources::create(const RuntimeResourcesConfig &config,
@@ -1011,7 +1010,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
       memoryPlan = std::move(*aneFfn.plan);
     const EngineMemoryBreakdown &budget = memoryPlan.breakdown();
     const KvSpillPlan &spill = budget.kvSpill;
-    std::string spillOff = spillOffReason(config.model, kvLayout, spill, stateStagingBytes && kvFileOpen);
+    const std::string spillOff = spillOffReason(config.model, kvLayout, spill, stateStagingBytes && kvFileOpen);
     reportSpill(config.model, budget, spillOff, activeLimitBytes);
     if (!spill.enabled) {
       if (config.kvSpillAlways)
@@ -1081,7 +1080,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
         std::move(memoryGovernor), std::move(kvPages), std::move(stateStorage),
         std::move(kvTier), std::move(disk.space), std::move(kvPool), std::move(cache),
         std::move(aneFfn.split), std::move(aneFfn.outcome), std::move(blockCache),
-        std::move(historyStream), config.kvSpillAlways, std::move(spillOff)));
+        std::move(historyStream), config.kvSpillAlways));
     result->adoptPersistentCache();
     return result;
   } catch (const RuntimeResourcesError &) {
@@ -1211,10 +1210,10 @@ EngineSpillConfig RuntimeResources::spillConfig() const noexcept {
           .geometry = memoryPlan_.spillGeometry()};
 }
 
-KvSpillStatus RuntimeResources::kvSpillStatus() const {
-  KvSpillStatus result{.enabled = memoryPlan_.breakdown().kvSpill.enabled,
-                       .reason = spillOffReason_,
-                       .cache = cache_->spillSnapshot()};
+std::optional<KvSpillStatus> RuntimeResources::kvSpillStatus() const {
+  if (!memoryPlan_.breakdown().kvSpill.enabled)
+    return std::nullopt;
+  KvSpillStatus result{.cache = cache_->spillSnapshot()};
   if (blockCache_)
     result.blockCache = blockCache_->stats();
   if (historyStream_)
