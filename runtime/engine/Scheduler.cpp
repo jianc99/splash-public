@@ -156,6 +156,13 @@ void Scheduler::cancel(uint64_t id) {
   dropStaleDecodeDebt();
 }
 
+void Scheduler::finish(uint64_t id) {
+  Request &request = get(id);
+  if (!terminal(request.phase))
+    request.phase = Phase::Completed;
+  dropStaleDecodeDebt();
+}
+
 void Scheduler::fail(uint64_t id) {
   Request &request = get(id);
   if (terminal(request.phase))

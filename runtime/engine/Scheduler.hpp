@@ -106,6 +106,8 @@ public:
   // whatever its rows; the engine says so before it plans.
   void setStreamsHistory(uint64_t requestId, bool streams);
   void cancel(uint64_t requestId);
+  // Ends a request outside a command's completion, as at its length.
+  void finish(uint64_t requestId);
   void fail(uint64_t requestId);
   void remove(uint64_t requestId);
 

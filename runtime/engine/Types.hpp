@@ -109,6 +109,14 @@ enum class LaneOutcome : uint8_t {
   // (ModelStepResult::unreadableKvBlocks); its copies are given up, so a
   // retry recomputes it.
   KvUnreadable,
+  // Its KV does not fit in memory and would go to the SSD cache, whose
+  // daily write budget (--max-cache-disk-writes) is spent until it refills.
+  KvWriteBudget,
+  // Its KV does not fit in memory, and the SSD cache's quota of active KV
+  // (--max-cache-disk, and the volume's free space) cannot hold even its
+  // prompt's, without any other request's: retrying the same request fails
+  // the same way.
+  KvDiskQuota,
 };
 
 struct LaneOutcomeWire final {
@@ -135,6 +143,10 @@ laneOutcomeWire(LaneOutcome outcome) noexcept {
     return {"mask_timeout", true};
   case LaneOutcome::KvUnreadable:
     return {"kv_unreadable", true};
+  case LaneOutcome::KvWriteBudget:
+    return {"kv_write_budget", true};
+  case LaneOutcome::KvDiskQuota:
+    return {"kv_disk_quota", false};
   }
 }
 
