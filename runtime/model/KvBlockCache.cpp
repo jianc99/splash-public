@@ -294,13 +294,13 @@ ModelMemoryAdmission KvBlockCache::growTowardTarget() {
 
 uint64_t KvBlockCache::releaseAboveFloor() {
   Impl &impl = *impl_;
-  const uint32_t held = impl.extents, kept = impl.floorExtents(impl.floorLanes());
-  if (held <= kept) return 0;
+  const uint32_t held = impl.extents;
+  if (held <= impl.floorExtents(impl.floorLanes())) return 0;
   impl.requireNoCommand();
-  // The slots of the extents that go leave the directory first.
-  impl.place(kept);
-  for (uint32_t extent = kept; extent < held; ++extent) impl.pages.releaseExtent(extent);
-  return uint64_t{held - kept} * impl.pages.extentBytes();
+  // The slots of the extent that goes leave the directory first.
+  impl.place(held - 1);
+  impl.pages.releaseExtent(held - 1);
+  return impl.pages.extentBytes();
 }
 
 ops::AttentionBlocks KvBlockCache::addResolve(metal::CommandGraph &graph, uint32_t layer,

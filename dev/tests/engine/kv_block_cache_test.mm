@@ -272,13 +272,16 @@ void growsAndReleases(MetalBackend &backend) {
   auto grown = std::make_shared<KvReadStats>();
   static_cast<void>(resolve(backend, cache, 0, lanes, {blocksOf(0, 256)}, grown));
   require(grown->hits == 200 * kPlaces && grown->misses == 56 * kPlaces, "growing lost the cache's blocks");
-  // A second lane's floor fits; giving back what is above the floors keeps
-  // two lanes' (3,072 slots, two extents), then one lane's.
+  // A second lane's floor fits; giving back what is above the floors, an
+  // extent a call, keeps two lanes' (3,072 slots, two extents), then one
+  // lane's.
   require(cache.reserveLane(1).granted() && cache.stats().bytes == 4 * extent &&
               cache.stats().floorBytes == 2 * extent,
           "a second lane's floor is not two lanes' extents");
-  require(cache.releaseAboveFloor() == 2 * extent && cache.stats().slotsPerLayer == 2 * kExtentSlots,
-          "an idle reclaim did not give back what is above the floors");
+  // An idle reclaim gives back one extent above the floors a call.
+  require(cache.releaseAboveFloor() == extent && cache.stats().slotsPerLayer == 3 * kExtentSlots &&
+              cache.releaseAboveFloor() == extent && cache.stats().slotsPerLayer == 2 * kExtentSlots,
+          "an idle reclaim did not give back an extent above the floors at a time");
   cache.releaseLane(1);
   require(cache.releaseAboveFloor() == extent && cache.stats().bytes == extent && cache.stats().lanes == 1,
           "an idle reclaim kept a released lane's floor");
