@@ -313,6 +313,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/model/QwenTargetLoader.cpp \
 	runtime/model/DFlashDraft.cpp \
 	runtime/model/ModelFactory.cpp \
+	runtime/model/ModelSizing.cpp \
 	runtime/model/SlotFile.cpp \
 	runtime/model/KvCopyRead.cpp \
 	runtime/model/KvBlockCache.cpp \
