@@ -161,16 +161,28 @@ static_assert(sizeof(ThinkingCutoffParams) == 220,
 // The batched selector and acceptance kernels' grids cover exactly the
 // dispatch's lanes: per-lane arrays hold those lanes, and entries past them
 // are zero and unread.
+//
+// The selector also writes each lane's verify rows, the rows of its block the
+// target verifies: the anchor and each proposal the lane reaches with a
+// probability of at least verify_threshold, the product of the selector
+// probabilities of the proposals before it (the softmax at temperature 1 of a
+// position's candidate scores, at the candidate the lane chose), at least
+// verify_minimum rows and at most verify_maximum[lane]; with a
+// verify_threshold of 0, verify_maximum[lane] rows. The verify's MoE steps
+// route those rows alone and acceptance retains at most that many tokens.
 struct SelectorBatchParams {
   uint32_t anchor[SPLASH_MAXIMUM_BATCH_WIDTH];
   float temperature[SPLASH_MAXIMUM_BATCH_WIDTH];
   uint32_t lanes;
   uint32_t sampling_mask;
   uint32_t vocabulary;
+  float verify_threshold;
+  uint32_t verify_minimum;
+  uint32_t verify_maximum[SPLASH_MAXIMUM_BATCH_WIDTH];
 };
 
-static_assert(sizeof(SelectorBatchParams) == 44,
-              "Draft selector parameters are 44 bytes on both sides");
+static_assert(sizeof(SelectorBatchParams) == 68,
+              "Draft selector parameters are 68 bytes on both sides");
 
 struct AcceptBatchParams {
   uint32_t remaining[SPLASH_MAXIMUM_BATCH_WIDTH];

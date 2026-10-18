@@ -307,7 +307,9 @@ place (`target_weights_bytes`). Off by default.
   chunk's last repack, one more host step reads nearly all of the next
   block's into the whole staging. A load takes the read-ahead over without
   waiting for its reads of experts it does not route, and a read ahead of an
-  expert no load routes may fail without failing anything.
+  expert no load routes may fail without failing anything. A decode step
+  loads and predicts only the experts its lanes' verify rows route
+  ([Drafts](#drafts)); the selector writes those rows before the step's load.
 - Experts of one format share an arena of slots; when it would take more than
   the device's largest buffer (`maxBufferLength`), their layers are split
   between arenas that each fit, each recycling its own slots.
@@ -1008,11 +1010,11 @@ contain multiple speculative tokens). Thus rates use tokens processed in the
 measured interval, not the full counts. An unavailable rate is zero, including
 responses completed in one emission. A request that drafted adds
 llama-server's `draft_n` and `draft_n_accepted`: the tokens its draft proposed
-and those verification accepted, but for accepted proposals past the output
-limit or from one of the model's stop tokens on; those a `stop` string then
-cuts still count. The end tokens a [thinking token
-budget](#thinking-token-budget) puts in place of the draft's proposals are
-neither. They count that request alone, so
+that its cycles verified ([Drafts](#drafts)) and those verification accepted,
+but for accepted proposals past the output limit or from one of the model's
+stop tokens on; those a `stop` string then cuts still count. The end tokens a
+[thinking token budget](#thinking-token-budget) puts in place of the draft's
+proposals are neither. They count that request alone, so
 they hold under concurrency. `metrics.speculation` carries them with the
 request's speculative `cycles`, the decode cycles in which its draft proposed
 tokens, and the Done line shows what the draft yields per cycle,
@@ -1625,8 +1627,32 @@ target's, and its attention (32 query and 8 KV heads of 128), selector (rank
 256, 16 candidates), block of 8 rows and 2048-token window are those the
 kernels are built for (`readDraftLayout` in `ModelDescriptor.mm`); the
 kernels take any hidden width of whole 16-channel convolution groups. Every
-family loads and runs its draft alike: a decode cycle verifies every row of
-the draft's block, the anchor and its seven proposals. The target writes the
+family loads and runs its draft alike: a decode cycle drafts the whole block,
+the anchor and its seven proposals, and the target verifies the block's first
+rows, as many as the draft's selector chose for the lane (its verify rows,
+`ops::VerifyRowsPolicy`), never more than the lane may still retain. A dense
+target verifies every row: its projections read their weights once for all of
+a cycle's rows, so a row costs it little. Each row a MoE target verifies routes
+its own experts, which a rejected row reads for nothing (a Qwen3.8-Flash-Next
+cycle of one lane routes about 43 experts a layer with all eight rows and 30
+with its verify rows). A MoE target verifies the anchor and each proposal the
+lane reaches with a probability of at least 0.6, the product of the selector
+probabilities of the proposals before it, each the softmax at temperature 1 of
+its position's 16 candidate scores; the first proposal is always verified.
+Whether a proposal is verified depends only on the proposals before it, so a
+sampled lane's acceptance stays exact. The selector probability predicts
+acceptance closely: a proposal the target reaches is accepted about half the
+time at 0.5-0.7 and 96% of the time above 0.95. A fixed shorter block would do
+worse, since in agentic use about one cycle in six accepts all seven proposals
+and one in five accepts none. The best threshold follows a row's cost, about
+0.5 where experts are resident and 0.8 where they stream at four lanes; 0.6
+serves every MoE target within 2% of the best simulated throughput, but for
+the streamed Qwen3.6-35B-A3B at four lanes (5%). Rows past a lane's verify
+rows still run the target's layers, whose kernels take eight rows a lane, but
+their MoE steps route no expert (`moe_group_routes_verified`) and acceptance
+retains none of them. The speculation counts ([Output limits and
+streaming](#output-limits-and-streaming)) count the proposals a cycle
+verified. The target writes the
 outputs of the layers the draft reads for each row it reads;
 Qwen3.8-Flash-Next's, whose layers carry four hyper-connection streams, as
 the streams' mean, summed in fp32 and stored as bf16, as the draft was

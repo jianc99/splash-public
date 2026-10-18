@@ -136,6 +136,9 @@ struct AcceptanceBuffers final {
   metal::MetalBuffer outputTokens;
   metal::MetalBuffer retainedCounts;
   metal::MetalBuffer acceptedCounts;
+  // Each lane's verify rows (ops::DraftSelector), which bound what it
+  // retains.
+  metal::MetalBuffer verifyRows;
 };
 
 // Target token policy (penalties, min-p/top-k/top-p, constrained selection,

@@ -145,10 +145,12 @@ DFlashDraft::DFlashDraft(const DFlashDraftWeights &weights,
 void DFlashDraft::addSelection(
     metal::CommandGraph &graph, const ops::DraftSelectorBuffers &buffers,
     std::span<const uint32_t> anchors,
-    std::span<const ops::SamplingPolicy> policies) const {
+    std::span<const ops::SamplingPolicy> policies,
+    ops::VerifyRowsPolicy verify,
+    std::span<const uint32_t> maximumRows) const {
   selector_.add(graph, buffers,
                 {weights_.predecessorCodebook, weights_.successorCodebook},
-                anchors, policies);
+                anchors, policies, verify, maximumRows);
 }
 
 void DFlashDraft::addContextPrefill(

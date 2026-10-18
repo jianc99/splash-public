@@ -100,7 +100,7 @@ void Qwen4ExpTarget::addPrefillMix(PrefillStep &step, const Qwen4HyperWeights &h
 
 void Qwen4ExpTarget::addPrefillBegin(PrefillStep &step) const {
   const QwenTargetPrefillBuffers &b = step.buffers;
-  step.ffn = {b.normalized, step.scratch.zeros, step.scratch.branch, b.moe};
+  step.ffn = {b.normalized, step.scratch.zeros, step.scratch.branch, b.moe, {}};
   ops::HyperConnection::addInit(step.graph, b.hidden[0], step.scratch.streams, hyperShape(geometry_), step.rows);
 }
 
@@ -355,7 +355,7 @@ void Qwen4ExpTarget::addVerify(metal::CommandGraph &graph, QwenTargetVerifyBuffe
         layer.mixer);
     ops::HyperConnection::addCombine(step.graph, h.streams, h.branch, h.weights, hs, rows);
     addVerifyMix(step, layer.ffnHyper, b.normalized);
-    ops::MoE::add(step.graph, {b.normalized, h.zeros, h.branch, b.moe}, layer.ffn, *step.moe);
+    ops::MoE::add(step.graph, {b.normalized, h.zeros, h.branch, b.moe, b.verifyRows}, layer.ffn, *step.moe);
     ops::HyperConnection::addCombine(step.graph, h.streams, h.branch, h.weights, hs, rows);
     if (const auto slot = geometry_.captureSlot(index))
       addStreamCapture(step.graph, geometry_, *slot, h.streams, b.capturedTargetHidden, 0, rows);

@@ -256,6 +256,7 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
   put(DecodeTensor::OutputTokens, bytesFor<uint32_t>(r));
   put(DecodeTensor::RetainedCount, sizeof(uint32_t));
   put(DecodeTensor::AcceptedCount, sizeof(uint32_t));
+  put(DecodeTensor::VerifyRows, sizeof(uint32_t));
   put(DecodeTensor::DraftInputTokens, bytesFor<uint32_t>(r));
   for (uint32_t index = 0; index < 2; ++index) {
     put(static_cast<DecodeTensor>(

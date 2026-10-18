@@ -28,6 +28,20 @@ struct DraftSelectorBuffers final {
   metal::MetalBuffer uniforms;
   metal::MetalBuffer proposedTokens;
   metal::MetalBuffer proposalProbabilities;
+  // Each lane's verify rows, a uint32 per lane (VerifyRowsPolicy).
+  metal::MetalBuffer verifyRows;
+};
+
+// How many rows of its block each lane's verify verifies, which the selector
+// writes (SelectorBatchParams in metal/abi/Sampling.h): the anchor and each
+// proposal the lane reaches with a probability of at least `threshold` (the
+// product of the selector probabilities of the proposals before it), and at
+// least `minimum` rows; every row with a threshold of 0. A lane's rows never
+// exceed its maximum (DraftSelector::add).
+struct VerifyRowsPolicy final {
+  float threshold = 0.0F;
+  uint32_t minimum = 2;
+  bool operator==(const VerifyRowsPolicy &) const = default;
 };
 
 // The draft's selector codebooks, which score the edge from a proposal
@@ -42,7 +56,8 @@ struct DraftCodebooks final {
 // SPLASH_DRAFT_CANDIDATES most likely draft tokens of every proposal
 // position, scores each candidate with its edge from the previous position's
 // choice, and walks the SPLASH_DRAFT_PROPOSAL_TOKENS positions greedily or,
-// for a sampling lane, drawing at its temperature.
+// for a sampling lane, drawing at its temperature; it writes each lane's
+// verify rows by `verify`, at most maximumRows[lane] of them.
 class DraftSelector final {
 public:
   explicit DraftSelector(uint32_t vocabulary);
@@ -52,7 +67,8 @@ public:
 
   void add(metal::CommandGraph &graph, const DraftSelectorBuffers &buffers,
            const DraftCodebooks &codebooks, std::span<const uint32_t> anchors,
-           std::span<const SamplingPolicy> policies) const;
+           std::span<const SamplingPolicy> policies, VerifyRowsPolicy verify,
+           std::span<const uint32_t> maximumRows) const;
 
 private:
   uint32_t vocabulary_ = 0;
