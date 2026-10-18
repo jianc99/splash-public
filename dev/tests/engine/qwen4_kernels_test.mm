@@ -216,9 +216,9 @@ void hyperTest(MetalBackend &backend) {
   check(okI, "hyper init: every stream the embedding");
 }
 
-// The table variants (norm, low and mix into a register-tile projection's
-// Table16 table): bit for bit the plain kernel's output followed by the
-// projection's own decode_linear_gguf_prepare, over two lanes of eight rows.
+// The table variants (low and mix into a register-tile projection's Table16
+// table): bit for bit the plain kernel's output followed by the projection's
+// own decode_linear_gguf_prepare, over two lanes of eight rows.
 void hyperTableTest(MetalBackend &backend) {
   std::mt19937 rng(11);
   const uint32_t lanes = 2, rows = 8 * lanes, hidden = kHidden, streams = kStreams, rank = kRank,
@@ -248,20 +248,9 @@ void hyperTableTest(MetalBackend &backend) {
   const NormWeights nw{upload(backend, normPlus), true};
   const MetalBuffer xs = upload(backend, x), inject = upload(backend, randoms(rng, streams * width, 0.02f));
   MetalBuffer normalized = zeroed(rows * width * 2), weights = zeroed(rows * streams * 4);
-  MetalBuffer normalizedT = zeroed(rows * width * 2), weightsT = zeroed(rows * streams * 4);
-  const ops::LinearScratch normRef = table(width), normGot = table(width);
   CommandGraph norm;
   ops::HyperConnection::addNorm(norm, xs, nw, inject, normalized, weights, shape, rows);
-  prepare(norm, normalized, normRef, width);
-  const ops::PreparedInput prepared =
-      ops::HyperConnection::addNorm(norm, xs, nw, inject, normalizedT, weightsT, shape, rows, normGot,
-                                    ops::LinearInput::Table16);
   run(backend, norm);
-  check(prepared.layout == ops::LinearInput::Table16 && prepared.source.sameView(normalizedT),
-        "hyper norm table: names its output and table layout");
-  check(same(normalized, normalizedT) && same(weights, weightsT),
-        "hyper norm table: output and weights as the plain norm's");
-  check(sameTables(normRef, normGot), "hyper norm table: table and sums as the prepare's");
 
   const std::vector<uint16_t> low = bf16s(randoms(rng, rows * rank, 2.0f));
   MetalBuffer lowPlain = upload(backend, low), lowTable = upload(backend, low);
@@ -289,13 +278,13 @@ void hyperTableTest(MetalBackend &backend) {
 // The norm's kernels (kernels/shared/hyper_connection.metal):
 // ops::HyperConnection::addNorm runs an injecting mix of up to
 // HYPER_CONNECTION_NORM_QUARTER_ROWS rows on the quarters kernel and the rest
-// on the loaded one, which sum alike: at decode's row
-// counts and past them, the two write bit for bit the same normalized rows,
-// injection weights and tables, and a mix that injects nothing the same
-// normalized rows. Shader validation's instrumentation compiles the kernels
-// apart, which can move a bf16 value by its last bit; under it (`exact`
-// false) they agree within that, and test-engine-metal runs the exact
-// comparison uninstrumented (`qwen4-kernels METALLIB bitwise`).
+// on the loaded one, which sum alike: at decode's row counts and past them,
+// the two write bit for bit the same normalized rows and injection weights,
+// and a mix that injects nothing the same normalized rows. Shader
+// validation's instrumentation compiles the kernels apart, which can move a
+// bf16 value by its last bit; under it (`exact` false) they agree within
+// that, and test-engine-metal runs the exact comparison uninstrumented
+// (`qwen4-kernels METALLIB bitwise`).
 void hyperNormKernelsTest(MetalBackend &backend, bool exact) {
   std::mt19937 rng(13);
   const uint32_t hidden = kHidden, streams = kStreams, rank = kRank, width = hidden * streams;
@@ -329,11 +318,7 @@ void hyperNormKernelsTest(MetalBackend &backend, bool exact) {
     std::memset(buffer.contents(), 0, bytes);
     return buffer;
   };
-  const auto table = [&](uint32_t rows) {
-    return ops::LinearScratch{zeroed(ops::tableBytes(width, rows)),
-                              zeroed(ops::tableSumsBytes(ops::LinearInput::Table16, width, rows)), {}, {}};
-  };
-  bool okKernels = true, okPlain = true, okTables = true;
+  bool okKernels = true, okPlain = true;
   for (const uint32_t rows : {1u, 3u, 8u, 16u, 24u, 32u, 64u, 65u, 128u, 136u, 256u, 512u}) {
     // addNorm's kernel, and the other one on the same rows.
     const bool quarters = rows <= HYPER_CONNECTION_NORM_QUARTER_ROWS;
@@ -348,18 +333,6 @@ void hyperNormKernelsTest(MetalBackend &backend, bool exact) {
     graph.add(other, {xs, nw.buffer, inject, normalizedOther, weightsOther}, params, {rows, 1, 1},
               {otherThreads, 1, 1});
     ops::HyperConnection::addNorm(graph, xs, nw, MetalBuffer{}, normalizedPlain, MetalBuffer{}, shape, rows);
-    // A decode step's rows also into the down projection's table.
-    const bool tables = rows % 8 == 0;
-    MetalBuffer normalizedT = zeroed(rows * width * 2), weightsT = zeroed(rows * streams * 4);
-    MetalBuffer normalizedOtherT = zeroed(rows * width * 2), weightsOtherT = zeroed(rows * streams * 4);
-    const ops::LinearScratch tableGot = table((rows + 7) / 8 * 8), tableOther = table((rows + 7) / 8 * 8);
-    if (tables) {
-      static_cast<void>(ops::HyperConnection::addNorm(graph, xs, nw, inject, normalizedT, weightsT, shape, rows,
-                                                      tableGot, ops::LinearInput::Table16));
-      graph.add(other + "_table16",
-                {xs, nw.buffer, inject, normalizedOtherT, weightsOtherT, tableOther.input, tableOther.sums}, params,
-                {rows, 1, 1}, {otherThreads, 1, 1});
-    }
     run(backend, graph);
     const uint64_t rowBytes = uint64_t{rows} * width * 2, weightBytes = uint64_t{rows} * streams * 4;
     const bool kernels = same(normalized, normalizedOther, rowBytes) && same(weights, weightsOther, weightBytes, true);
@@ -368,20 +341,10 @@ void hyperNormKernelsTest(MetalBackend &backend, bool exact) {
     const bool plain = same(normalizedPlain, normalized, rowBytes);
     okPlain &= plain;
     if (!plain) std::cout << "  a mix without injection differs at " << rows << " rows\n";
-    if (tables) {
-      const bool equal = same(normalizedT, normalized, rowBytes) && same(weightsT, weights, weightBytes, true) &&
-                         same(normalizedOtherT, normalized, rowBytes) &&
-                         same(tableGot.input, tableOther.input, tableGot.input.sizeBytes()) &&
-                         // The sums of the table's values, which inexact can move further.
-                         (!exact || same(tableGot.sums, tableOther.sums, tableGot.sums.sizeBytes()));
-      okTables &= equal;
-      if (!equal) std::cout << "  the table kernels differ at " << rows << " rows\n";
-    }
   }
   const std::string how = exact ? "bit for bit" : "close to (instrumented)";
   check(okKernels, "hyper norm: the quarters and loaded kernels' output and weights " + how);
   check(okPlain, "hyper norm without injection: normalized rows " + how + " the injecting mix's");
-  check(okTables, "hyper norm tables: the quarters and loaded kernels' output, weights and tables " + how);
 }
 
 void pleTest(MetalBackend &backend) {
