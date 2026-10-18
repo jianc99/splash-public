@@ -524,10 +524,18 @@ void PagedAttention::addBlockLists(metal::CommandGraph &graph, const metal::Meta
             {tiles, sequences.size(), 1}, {SPLASH_ATTENTION_BLOCK_LIST_THREADS, 1, 1});
 }
 
-void PagedAttention::addStageLayer(metal::CommandGraph &, SplashKvLayer, metal::MetalBuffer, SplashKvLayer,
-                                   metal::MetalBuffer, uint32_t, uint32_t, kv::Layout) {
-  // Stub, which the attention kernels replace with the stage kernel.
-  throw std::logic_error("the KV stage kernel is not built yet");
+void PagedAttention::addStageLayer(metal::CommandGraph &graph, SplashKvLayer poolLayer, metal::MetalBuffer poolTable,
+                                   SplashKvLayer stagedLayer, metal::MetalBuffer stagedTable, uint32_t firstPage,
+                                   uint32_t pages, kv::Layout layout) {
+  if (!layout.valid() || !pages) throw std::invalid_argument("invalid KV stage geometry");
+  // Both tables hold the staged pages' entries.
+  const uint64_t tableBytes = (uint64_t{firstPage} + pages) * sizeof(SplashKvPage);
+  requireBytes(poolTable, tableBytes, "KV stage pool table");
+  requireBytes(stagedTable, tableBytes, "KV stage staged table");
+  const SplashKvStageParams params{poolLayer, stagedLayer, firstPage,
+                                   static_cast<uint32_t>(layout.dataBytesPerLayerPage()),
+                                   static_cast<uint32_t>(layout.scaleBytesPerLayerPage())};
+  graph.add("paged_kv_stage_layer", {std::move(poolTable), std::move(stagedTable)}, params, {pages, 1, 1});
 }
 
 } // namespace splash::ops
