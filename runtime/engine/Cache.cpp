@@ -1047,14 +1047,11 @@ TokenAdmission Cache::spillWritten() {
         active.spillScan = index + 1;
     }
   }
-  if (pages.empty())
-    return {};
   // Requests on one prefix find its pages each.
   std::sort(pages.begin(), pages.end());
   pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
   // Free Index pages first, the runway's among them: a spill never waits
-  // for an allocation. The rest asks for an extent of the index form, which
-  // the caller makes room for or does without.
+  // for an allocation. The rest asks for extents of the index form.
   const auto now = std::min<size_t>(pages.size(), pool_.freePageCount(kv::PageForm::Index));
   for (const std::span<const uint32_t> part :
        {std::span<const uint32_t>(pages).first(now), std::span<const uint32_t>(pages).subspan(now)}) {
@@ -1066,6 +1063,15 @@ TokenAdmission Cache::spillWritten() {
               pool_.freePageCount(kv::PageForm::Index), moved.failure, kv::PageForm::Index};
     followMoves(moved.moves);
     spilled_.spillMoves += part.size();
+  }
+  // Then the runway, an extent's free Index pages, is refilled: the next
+  // spill frees Full pages without an allocation, at the memory wall too,
+  // where a converted request's pages spill through it (pendingPages).
+  const uint32_t free = pool_.freePageCount(kv::PageForm::Index);
+  if (free < pool_.extentPages()) {
+    if (const metal::AllocationResult runway = pool_.fillRunway(kv::PageForm::Index); !runway)
+      return {TokenAdmissionFailure::Denied, pool_.extentPages() - free, free, runway.failure,
+              kv::PageForm::Index};
   }
   return {};
 }

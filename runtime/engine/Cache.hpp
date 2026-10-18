@@ -383,8 +383,12 @@ public:
   // the tier's share for them allows; returns the writes started.
   uint32_t writeThrough();
   // Between commands: moves the eligible pages whose copies landed to the
-  // index form, into free Index pages or the Index runway, then refills the
-  // runway, optionally. A refusal leaves the rest Full.
+  // index form, into free Index pages, the runway's among them, and the
+  // rest into extents of the index form it allocates; then refills the
+  // runway, an extent's worth of free Index pages, which the next spill
+  // takes without an allocation. Denied, of the index form, when an
+  // allocation was refused: the pages it leaves Full, or the runway's;
+  // the caller makes room for them or does without.
   [[nodiscard]] TokenAdmission spillWritten();
   // Pages of the form that transfers in flight will free: demotions, and
   // for Full the eligible write-throughs that an Index page will take.
