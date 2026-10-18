@@ -52,6 +52,8 @@ enum class PageForm : uint8_t { Full, Index };
 struct PageCopy final {
   uint32_t from = 0;
   uint32_t to = 0;
+
+  bool operator==(const PageCopy &) const = default;
 };
 
 // The memory of the engine's page pool: extents of extentPages() pages,
