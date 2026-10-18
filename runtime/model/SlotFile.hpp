@@ -157,6 +157,17 @@ public:
   [[nodiscard]] bool admitsSpill(uint64_t outstandingBytes) const noexcept {
     return lifted_ || !refillPerMillisecond_ || balanceAt(clock_()) >= static_cast<double>(outstandingBytes);
   }
+  // When admitsSpill(outstandingBytes) holds again as the balance refills,
+  // on the budget's clock; empty while it holds now. The writes of Spill
+  // requests lower their commitments as they charge the balance, so the
+  // balance's shortfall closes only by its refill, and sooner as they end
+  // and return what they did not write.
+  [[nodiscard]] std::optional<double> admitsSpillAt(uint64_t outstandingBytes) const noexcept {
+    if (admitsSpill(outstandingBytes))
+      return std::nullopt;
+    const double now = clock_();
+    return now + (static_cast<double>(outstandingBytes) - balanceAt(now)) / refillPerMillisecond_;
+  }
   // When a state's write not in use may start again, on the budget's clock;
   // empty while one may start now.
   [[nodiscard]] std::optional<double> admitsAgainAt() const noexcept {
