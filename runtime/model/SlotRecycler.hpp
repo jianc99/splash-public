@@ -57,7 +57,8 @@ public:
   // Every slot free, and no ghost.
   void reset();
   // `slots` slots: those added are free, and those past it are gone with
-  // their keys and every ghost.
+  // their keys. The ghosts stay, as many as the slots at most: fewer keep the
+  // newest, those of T1 within what T1 leaves of the slots.
   void resize(uint32_t slots);
 
   [[nodiscard]] uint32_t size() const noexcept { return static_cast<uint32_t>(list_.size()); }
@@ -100,6 +101,8 @@ private:
     void unlink(Order &order, uint32_t at) noexcept;
     void append(Order &order, uint32_t at) noexcept;
     void prepend(Order &order, uint32_t at) noexcept;
+    // `by` takes `at`'s place in the list.
+    void replace(Order &order, uint32_t at, uint32_t by) noexcept;
   };
 
   [[nodiscard]] Order &slots(List list) noexcept { return list == Recent ? recent_ : frequent_; }
@@ -118,6 +121,10 @@ private:
   void addGhost(uint64_t key, List list);
   void dropGhost(uint32_t ghost);
   void forgetGhosts();
+  // Before the arrays shrink to `slots`: drops the oldest ghosts past ARC's
+  // bounds there (|T1| + |B1| and |B1| + |B2| at most the slots), and moves
+  // those past `slots` to free places below it.
+  void keepGhosts(uint32_t slots);
 
   std::vector<uint8_t> list_, scan_;
   Links links_;

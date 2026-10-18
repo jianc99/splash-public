@@ -140,7 +140,8 @@ void resizes() {
   slots.resize(12);
   static_cast<void>(slots.claim(4, 5, false));
   require(slots.ghostHits() == 1, "growing forgot a ghost");
-  // Fewer slots: the keys of the slots past them go, with every ghost.
+  // Fewer slots: the keys of the slots past them go, and the ghosts within
+  // the slots stay: 5, which T1 gave up before.
   std::vector<uint64_t> kept, dropped;
   for (uint64_t key = 0; key < 10; ++key)
     if (const auto slot = slots.find(key)) (*slot < 5 ? kept : dropped).push_back(key);
@@ -149,7 +150,7 @@ void resizes() {
   for (const uint64_t key : kept) require(slots.find(key).has_value(), "shrinking lost a key it kept");
   for (const uint64_t key : dropped) require(!slots.find(key), "shrinking kept a key past its slots");
   static_cast<void>(slots.claim(5, 6, false));
-  require(slots.ghostHits() == 1, "shrinking kept a ghost");
+  require(slots.ghostHits() == 2, "shrinking forgot a ghost within the slots");
   for (uint64_t load = 7; load < 40; ++load)
     require(slots.claim(100 + load, load, false) < 5, "a shrunk recycler took a slot past its size");
 }

@@ -78,6 +78,13 @@ void SlotRecycler::Links::prepend(Order &order, uint32_t at) noexcept {
   ++order.count;
 }
 
+void SlotRecycler::Links::replace(Order &order, uint32_t at, uint32_t by) noexcept {
+  previous[by] = previous[at];
+  next[by] = next[at];
+  (previous[at] == kNone ? order.head : next[previous[at]]) = by;
+  (next[at] == kNone ? order.tail : previous[next[at]]) = by;
+}
+
 SlotRecycler::SlotRecycler(uint32_t slots) { resize(slots); }
 
 void SlotRecycler::unlink(uint32_t slot) {
@@ -117,6 +124,29 @@ void SlotRecycler::dropGhost(uint32_t ghost) {
   ghostLinks_.unlink(ghosts(List(ghostList_[ghost])), ghost);
   ghostOf_.erase(ghostKey_[ghost]);
   freeGhosts_.push_back(ghost);
+}
+
+void SlotRecycler::keepGhosts(uint32_t slots) {
+  while (recentGhosts_.count && recent_.count + recentGhosts_.count > slots) dropGhost(recentGhosts_.head);
+  while (recentGhosts_.count + frequentGhosts_.count > slots)
+    dropGhost(frequentGhosts_.count ? frequentGhosts_.head : recentGhosts_.head);
+  // As many places below `slots` are free as ghosts lie past it.
+  std::erase_if(freeGhosts_, [slots](uint32_t ghost) { return ghost >= slots; });
+  for (Order *order : {&recentGhosts_, &frequentGhosts_}) {
+    for (uint32_t ghost = order->head; ghost != kNone;) {
+      const uint32_t next = ghostLinks_.next[ghost];
+      if (ghost >= slots) {
+        const uint32_t place = freeGhosts_.back();
+        freeGhosts_.pop_back();
+        ghostKey_[place] = ghostKey_[ghost];
+        ghostList_[place] = ghostList_[ghost];
+        ghostLinks_.replace(*order, ghost, place);
+        ghostOf_.erase(ghostKey_[ghost]);
+        ghostOf_.insert(ghostKey_[place], place);
+      }
+      ghost = next;
+    }
+  }
 }
 
 void SlotRecycler::forgetGhosts() {
@@ -244,6 +274,7 @@ void SlotRecycler::resize(uint32_t slots) {
       if (list_[slot] != Free) evict(slot, false);
     std::erase_if(free_, [slots](uint32_t slot) { return slot >= slots; });
     target_ = std::min<uint64_t>(target_, slots);
+    keepGhosts(slots);
   }
   list_.resize(slots, Free);
   scan_.resize(slots, 0);
@@ -253,14 +284,12 @@ void SlotRecycler::resize(uint32_t slots) {
   lastLoad_.resize(slots, 0);
   for (uint32_t slot = slots; slot-- > held;) free_.push_back(slot);
   slotOf_.reserve(slots);
-  // As many ghosts as slots: fewer slots forget every ghost, more add free
-  // ones.
+  // As many ghosts as slots: more add free ones.
   ghostKey_.resize(slots);
   ghostList_.resize(slots);
   ghostLinks_.previous.resize(slots);
   ghostLinks_.next.resize(slots);
-  if (fewer) forgetGhosts();
-  else
+  if (!fewer)
     for (uint32_t ghost = slots; ghost-- > held;) freeGhosts_.push_back(ghost);
   ghostOf_.reserve(slots);
 }
