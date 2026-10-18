@@ -176,6 +176,21 @@ void testPersistentCacheNamespace() {
               persistentCacheNamespace(identity('a', "build", kv::Format::Int8), states) != name &&
               persistentCacheNamespace(identity('a', "build", kv::Format::Int8), bfloatStates) != name,
           "other models, layouts or state formats shared a cache namespace");
+  // A dense layout's namespace is the one main (be3b083c) names, with FP32
+  // and BF16 states: a change of its lines would leave every 27B's and 35B's
+  // persistent cache cold.
+  require(name == "6365d687c8be103a3bbcc6d2a83b1543" &&
+              persistentCacheNamespace(identity('a', "build", kv::Format::Int8), bfloatStates) ==
+                  "172879058b5e2bcc713e129a2b62393a",
+          "a dense layout's cache namespace is not the one main names");
+  // A sparse-attention layout's pages hold token-major values and an index of
+  // pooled keys.
+  RuntimeCacheIdentity tokenMajor = identity('a', "build", kv::Format::Int8), indexed = tokenMajor;
+  tokenMajor.kvLayout.valuesTokenMajor = true;
+  indexed.kvLayout.indexDimension = 128;
+  require(persistentCacheNamespace(tokenMajor, model.stateLayout) != name &&
+              persistentCacheNamespace(indexed, model.stateLayout) != name,
+          "token-major values or an index shared a dense layout's cache namespace");
 }
 
 void testWeightBudgetBeforeLoading(const char *metallibPath) {
