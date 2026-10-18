@@ -2827,7 +2827,7 @@ public:
     const uint64_t arenaBytes = plan.sharedPrefillPlannedAllocatedBytes + plan.sharedDecodePlannedAllocatedBytes;
     require(static_cast<bool>(admission(arenaBytes, [&] {
               runtime_.emplace(model::RuntimeContext{backend, model, kv_, states_, operators, nullptr, &cache_,
-                                                     &stream_});
+                                                     &stream_, admission});
             })),
             "the spill runtime's arenas exceed the oracle Metal budget");
   }
@@ -3133,8 +3133,9 @@ struct SpillRecord final {
 // alone, four together, two and one again, and the one last once more as a
 // Resident turn that holds the pages it spilled alone, which it moves back
 // to Full pages and restores whole from their copies (an un-spill); first
-// with every page Full, then with the first and the third spilling between
-// commands, the others not,
+// with every page Full, then with the first and the fourth spilling between
+// commands, the others not, and the third converting, as a funded start's
+// donor does, once the second and the fourth have ended,
 // so that their later commands stream their history and every decode but
 // the first mixes lanes that resolve blocks with lanes that read their page
 // table. The first two requests' first command ends kIntoPage tokens into a
@@ -3192,7 +3193,21 @@ void requireSpilledKvMatchesResident(metal::MetalBackend &backend, const model::
     prompts[index].resize(tokens);
     for (uint32_t &token : prompts[index]) token = distribution(random);
   }
-  const auto run = [&](uint64_t firstId, std::array<bool, 4> spills) {
+  // A start that the host's pause refused, funded between two decode
+  // cycles (engine::Engine::fundStart): a chunk of the streamed table goes,
+  // its rows read again from the file by the next stages, and the third
+  // lane, Resident and decoding, converts: its pages spill from its next
+  // command on, and its floor of the hot block cache takes the place of the
+  // fourth lane's, which has ended. The chunk grows back after the run
+  // (Model::growCaches).
+  model::SparseRowStore *const table = model.streamedTable();
+  uint64_t releasedChunks = 0;
+  const auto fund = [&](SpillRequest &donor) {
+    if (table)
+      releasedChunks += table->releaseChunk() != 0;
+    donor.spills = true;
+  };
+  const auto run = [&](uint64_t firstId, std::array<bool, 4> spills, bool funded) {
     std::array<SpillRequest, 4> requests;
     SpillRecord record;
     const auto took = [&] { record.commandBuffers.push_back(BackendInstrumentation::lastCommandBuffers(backend)); };
@@ -3219,19 +3234,23 @@ void requireSpilledKvMatchesResident(metal::MetalBackend &backend, const model::
     cycles({&requests[0], &requests[1], &requests[2], &requests[3]}, kCycles);
     spill.end(requests[1]);
     spill.end(requests[3]);
+    if (funded)
+      fund(requests[2]);
     cycles({&requests[0], &requests[2]}, kCycles);
     spill.end(requests[2]);
     cycles({&requests[0]}, kCycles);
     spill.unspill(requests[0]);
     cycles({&requests[0]}, kCycles);
     spill.end(requests[0]);
+    while (table && table->releasedBytes())
+      require(runtime.growCaches().granted(), "the streamed table did not grow back");
     return record;
   };
-  const SpillRecord resident = run(4001, {false, false, false, false});
+  const SpillRecord resident = run(4001, {false, false, false, false}, false);
   const model::KvBlockCacheStats residentReads = spill.blockCache().stats();
   require(!residentReads.reads.resolves && !spill.historyStream().stats().commands,
           "a run whose pages all hold their K/V read spilled K/V");
-  const SpillRecord spilled = run(4011, {true, false, true, false});
+  const SpillRecord spilled = run(4011, {true, false, false, true}, true);
   require(spill.unspilledPages(), "the spilled run's last turn un-spilled nothing");
   for (size_t step = 0; step < resident.steps.size(); ++step)
     require(spilled.steps[step] == resident.steps[step], "a run whose K/V spilled gave other tokens or logits than one "
@@ -3253,11 +3272,14 @@ void requireSpilledKvMatchesResident(metal::MetalBackend &backend, const model::
             << " streamed_pages=" << history.pages << " resolves=" << reads.reads.resolves
             << " hits=" << reads.reads.hits << " misses=" << reads.reads.misses
             << " unspilled_pages=" << spill.unspilledPages()
-            << " command_buffers=" << std::ranges::max(spilled.commandBuffers) << '\n';
+            << " command_buffers=" << std::ranges::max(spilled.commandBuffers)
+            << " funded_conversion=1 streamed_chunks_released=" << releasedChunks << '\n';
 
   // With every request ended, an idle reclaim gives back, after the pooled
   // buffers, the hot block cache above its floors, an extent at a time (the
-  // decoding lanes' floors took the staging's place).
+  // decoding lanes' floors took the staging's place), and never the
+  // streamed table's rows, which only a start's funding takes, a chunk at a
+  // time, and the caches' growth takes back.
   while (runtime.reclaimIdleState(true, IdleMemory::Buffers)) {
   }
   require(!history.stagingBytes && reads.bytes > reads.floorBytes,
@@ -3270,6 +3292,12 @@ void requireSpilledKvMatchesResident(metal::MetalBackend &backend, const model::
   }
   require(released == reads.bytes - reads.floorBytes,
           "an idle reclaim did not give back the hot block cache above its floors");
+  if (table) {
+    require(!table->releasedBytes(), "an idle reclaim of buffers and caches gave back the streamed table's rows");
+    const uint64_t chunk = runtime.reclaimIdleState(true, IdleMemory::Streamed);
+    require(chunk && table->releasedBytes() == chunk && runtime.growCaches().granted() && !table->releasedBytes(),
+            "the streamed table did not give back a chunk to a funding reclaim and grow it back");
+  }
 
   // A copy that cannot be read fails the command that reads it, for its lane
   // alone and as no failure of the model, and nothing of the lane is

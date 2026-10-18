@@ -264,6 +264,7 @@ public:
     if (!entry.resident)
       throw std::logic_error("request is already suspended");
     pageTables.erase(id);
+    floors.erase(id);
     entry.resident = false;
     entry.position = 0;
     ++suspensions;
@@ -542,18 +543,32 @@ public:
     return statesLacked ? statesLacked() : 0;
   }
   // The production model reserves a decoding lane's floor of the hot block
-  // cache, which the fake refuses for the requests in refusedSpilledReads.
+  // cache, which the fake refuses for the requests in refusedSpilledReads;
+  // a lane takes its floor once, through floorAdmission when a test sets it,
+  // until it ends or is suspended.
   model::ModelMemoryAdmission reserveSpilledReads(uint64_t id) override {
     if (refusedSpilledReads.contains(id))
       return {.allocationFailure = metal::AllocationFailure::EngineBudget};
+    if (!floors.contains(id)) {
+      if (floorAdmission && !floorAdmission())
+        return {.allocationFailure = metal::AllocationFailure::HostPressure};
+      floors.insert(id);
+    }
     return {.ok = true};
   }
   // It grows that cache toward its planned size, which the fake refuses
-  // with refusedGrowth.
+  // with refusedGrowth, and otherwise a streamed cache's chunk a reclaim gave
+  // back, through chunkAdmission when a test sets it.
   model::ModelMemoryAdmission growCaches() override {
     ++growthAttempts;
     if (refusedGrowth)
       return {.allocationFailure = *refusedGrowth};
+    if (!releasedChunks.empty()) {
+      if (chunkAdmission && !chunkAdmission(releasedChunks.back()))
+        return {.allocationFailure = metal::AllocationFailure::HostPressure};
+      streamedChunks.push_back(releasedChunks.back());
+      releasedChunks.pop_back();
+    }
     return {.ok = true};
   }
   uint64_t reclaimIdleState(bool keepLane, model::IdleMemory scope) noexcept override {
@@ -575,11 +590,19 @@ public:
     if (released || scope == model::IdleMemory::Buffers)
       return released;
     ++cacheReclaims;
-    if (cacheUnits.empty())
+    if (!cacheUnits.empty()) {
+      const uint64_t unit = cacheUnits.back();
+      cacheUnits.pop_back();
+      idleReleases.push_back(scope);
+      return unit;
+    }
+    if (scope != model::IdleMemory::Streamed || streamedChunks.empty())
       return 0;
-    const uint64_t unit = cacheUnits.back();
-    cacheUnits.pop_back();
-    return unit;
+    const uint64_t chunk = streamedChunks.back();
+    streamedChunks.pop_back();
+    releasedChunks.push_back(chunk);
+    idleReleases.push_back(scope);
+    return chunk;
   }
   std::optional<std::string> provideMask(uint64_t id,
                                          std::span<const uint32_t> words) override {
@@ -600,6 +623,7 @@ public:
   void end(uint64_t id) override {
     requests.erase(id);
     pageTables.erase(id);
+    floors.erase(id);
   }
 
   // What a page holds once prefill has written a block's first row to it.
@@ -712,6 +736,18 @@ public:
   // take them once no buffer is idle; cacheReclaims counts those steps.
   std::vector<uint64_t> cacheUnits;
   uint32_t cacheReclaims = 0;
+  // A streamed cache's chunks above its floor, which only a reclaim of
+  // IdleMemory::Streamed gives back, once no cache unit is left, and those
+  // it gave back, which growCaches() takes again; and the scope of every
+  // reclaim step that gave a cache unit or a chunk, in order.
+  std::vector<uint64_t> streamedChunks;
+  std::vector<uint64_t> releasedChunks;
+  std::function<bool(uint64_t bytes)> chunkAdmission;
+  std::vector<model::IdleMemory> idleReleases;
+  // The lanes that hold a floor of the hot block cache, and what a lane's
+  // first floor asks of a test's governor.
+  std::unordered_set<uint64_t> floors;
+  std::function<bool()> floorAdmission;
   // Rows each state captured from then on holds (RowsHoldingState); the
   // executor must outlive the cache that keeps those states.
   uint64_t stateHeldRows = 0;

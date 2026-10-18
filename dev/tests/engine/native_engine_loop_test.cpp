@@ -1478,13 +1478,13 @@ void testServingMarkRestoresTheMarkItFound() {
   };
   static_cast<void>(governor.setServing(true));
   {
-    const Serving allocation(mark, true);
+    const GovernorMark allocation(mark, true);
     require(admits(), "an allocation the engine marked was refused");
   }
   require(admits(), "an allocation the engine marked ended the start's mark");
   static_cast<void>(governor.setServing(false));
   {
-    const Serving allocation(mark, true);
+    const GovernorMark allocation(mark, true);
     require(admits(), "an allocation the engine marked was refused once serving began");
   }
   require(!admits(), "an allocation the engine marked left its mark behind");
