@@ -122,7 +122,8 @@ access.
 Sizes (`--max-memory`, `--max-cache-disk`, `--max-cache-disk-writes`,
 `--max-request-size`, `--ple-memory`, `--expert-memory`, `--sparse-kv-memory`) are a whole number of bytes, or one with a `K`, `M` or
 `G` suffix in binary units: `28G` is 28 GiB, and `28GB`, `28GiB` and `28g` say
-the same. Token counts (`--max-context`) are a whole number, or one with a `K`
+the same. With a suffix the number may have a fraction, rounded down to whole
+bytes: `2.5G` is 2,560 MiB. Token counts (`--max-context`) are a whole number, or one with a `K`
 suffix of 1024 tokens: `100K` is 102,400 tokens. `--max-memory`, `--max-context`, `--max-cache-disk`,
 `--ple-memory`, `--expert-memory` and `--sparse-kv-memory` also take `auto`, their default,
 `--ple-memory off` and `--expert-memory off` load the whole table and every expert, `--max-cache-disk 0` turns the SSD cache off,

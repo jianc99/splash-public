@@ -12,6 +12,7 @@ import os
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path
 
 from . import images, origins
@@ -35,6 +36,8 @@ _SIZE_UNITS = {
     for power, unit in enumerate(("K", "M", "G"), 1)
     for suffix in ("", "B", "IB")
 }
+# A size's number: whole, or with a fraction before a unit (2.5G).
+_SIZE_NUMBER = re.compile(r"\d+(\.\d+)?")
 # A model ID, as --model takes it: OWNER/REPO, a Hugging Face repository ID
 # by the Hub's rule, then optionally :VARIANT, which names the GGUF to serve,
 # such as UD-Q4_K_M.
@@ -128,7 +131,9 @@ def context_window(yarn_factor=None):
 
 
 def parse_max_memory(value):
-    """'auto' (None), or a byte count with an optional K, M or G suffix."""
+    """'auto' (None), or a byte count with an optional K, M or G suffix; a
+    count with a suffix may have a fraction (2.5G), rounded down to whole
+    bytes."""
     normalized = value.strip().upper()
     if normalized == "AUTO":
         return None
@@ -137,13 +142,13 @@ def parse_max_memory(value):
         if normalized.endswith(suffix):
             normalized, multiplier = normalized[: -len(suffix)], _SIZE_UNITS[suffix]
             break
-    try:
-        size = int(normalized) * multiplier
-    except ValueError:
-        size = 0
+    number = _SIZE_NUMBER.fullmatch(normalized)
+    size = 0
+    if number and (multiplier > 1 or not number.group(1)):
+        size = int(Decimal(normalized) * multiplier)
     if not 1 <= size <= 2**63 - 1:
         raise argparse.ArgumentTypeError(
-            "must be 'auto' or a positive byte count such as 32G"
+            "must be 'auto' or a positive byte count such as 32G or 2.5G"
         )
     return size
 
