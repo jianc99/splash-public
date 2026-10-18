@@ -2079,9 +2079,11 @@ An expert's only tile of at most `MOE_GGUF_COLUMN_ROWS` live rows runs on the co
 products in different orders: a route's output depends on how many rows the step routes to its
 expert, so decode results of GGUF MoE targets on the staged tile, the 35B's included, are not
 invariant to the batch (`kernels/common/moe_expert_slab.h`).
-The float router and alpha/beta projections run in `kernels/shared/gguf_float.metal`, and the
-token rows are gathered by one template in `kernels/shared/embedding.metal`. These plans are
-fixed rules of GPU family, core count, shape and format.
+The float router, QSA indexer and alpha/beta projections run in `kernels/shared/gguf_float.metal`,
+which runs two projections of one input in one dispatch where they take the same tile (the
+indexer's query and key, each on the tile of its own width), and the token rows are gathered by
+one template in `kernels/shared/embedding.metal`. These plans are fixed rules of GPU family, core
+count, shape and format.
 
 A rotated projection rotates its input once into `LinearScratch::rotated`
 (`gguf_rotate`, in fp32 and rounded once to bf16) before its quantized segments,
@@ -2141,8 +2143,10 @@ projection (up to three fused formats and widths, then `K` and an optional epilo
 decode tiles at one to four lanes (one lane also on the staged 16-row tile, `staged16`) and
 every K split, and marks the device policy's pick, or, with a trailing `prefill=R[,R...]`
 after the epilogue and the round count, one format's 128-row prefill tile at each chunk of `R`
-rows (more than 32); `make benchmark-gguf-moe` times one MoE layer at the 35B shape on the
-device's plans and the other GGUF tile.
+rows (more than 32); the formats `float-bf16` and `float-f32` time the float projection
+(`ops::addGgufFloat`, widths of any multiple of 8) on both float tiles instead, marking
+`Linear::ggufFloatTile`'s pick; `make benchmark-gguf-moe` times one MoE layer at the 35B shape
+on the device's plans and the other GGUF tile.
 
 ### Sparse attention
 

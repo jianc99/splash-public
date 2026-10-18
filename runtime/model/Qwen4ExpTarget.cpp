@@ -25,15 +25,22 @@ ops::NgramShape ngramShape(const QwenTargetGeometry &g) {
   return {g.hiddenSize, g.hyperConnections, g.pleConvolutionTaps, g.pleNgram};
 }
 
-// The QSA indexer's fp32 projections of `rows` rows: one float segment each
-// (Qwen4Exp.cpp readIndexer), at any row count.
-void addIndexerProjection(metal::CommandGraph &graph, const ops::Linear &linear, metal::MetalBuffer input,
-                          const ops::Projection &projection, metal::MetalBuffer output, uint32_t rows) {
-  const auto &segments = projection.blocks().segments;
-  if (segments.size() != 1 || !segments.front().isFloat())
-    throw std::invalid_argument("the QSA indexer projections are single float segments");
-  ops::addGgufFloat(graph, std::move(input), segments.front(), std::move(output), rows, projection.outputSize, 0,
-                    ops::FloatOutput::Float32, linear.ggufFloatTile(rows, projection.outputSize));
+// The QSA indexer's fp32 query and key projections of `rows` rows, one float
+// segment each (Qwen4Exp.cpp readIndexer), each on the float tile of its own
+// width: in one dispatch when the two take the same tile.
+void addIndexerProjections(metal::CommandGraph &graph, const ops::Linear &linear, metal::MetalBuffer input,
+                           const Qwen4IndexerWeights &indexer, metal::MetalBuffer query, metal::MetalBuffer key,
+                           uint32_t rows) {
+  const auto projection = [&](const ops::Projection &weights, metal::MetalBuffer output) {
+    const auto &segments = weights.blocks().segments;
+    if (segments.size() != 1 || !segments.front().isFloat())
+      throw std::invalid_argument("the QSA indexer projections are single float segments");
+    return ops::FloatProjection{&segments.front(), std::move(output), weights.outputSize, 0,
+                                linear.ggufFloatTile(rows, weights.outputSize)};
+  };
+  const std::array<ops::FloatProjection, 2> projections{projection(indexer.query, std::move(query)),
+                                                        projection(indexer.key, std::move(key))};
+  ops::addGgufFloat(graph, std::move(input), projections, rows, ops::FloatOutput::Float32);
 }
 
 // Where each attention layer's QSA index sits in the KV extents of `kv`.
@@ -197,8 +204,7 @@ std::vector<ops::AttentionBlocks> Qwen4ExpTarget::addPrefillQsa(PrefillStep &ste
                             {{&sequence.pageTable, 1}, step.indexOffsets[layer]}, topBlocks, h.maskWords,
                             h.scoreStride};
   };
-  addIndexerProjection(step.graph, linear, b.normalized, indexer.query, h.indexerQuery, step.rows);
-  addIndexerProjection(step.graph, linear, b.normalized, indexer.key, h.indexerKey, step.rows);
+  addIndexerProjections(step.graph, linear, b.normalized, indexer, h.indexerQuery, h.indexerKey, step.rows);
   std::vector<ops::AttentionBlocks> blocks(step.sequences.size());
   std::vector<ops::BlockListRows> sparseRows;
   uint32_t lists = 0;
@@ -269,8 +275,7 @@ ops::AttentionBlocks Qwen4ExpTarget::addVerifyQsa(VerifyStep &step, const Qwen4I
   const ops::Linear &linear = operators_.linear();
   const uint32_t layer = step.attentionLayer, topBlocks = weights_.layout.indexerTopBlocks;
   const uint32_t keyWidth = geometry_.indexerHeadDimension, queryWidth = geometry_.indexerHeads * keyWidth;
-  addIndexerProjection(step.graph, linear, b.normalized, indexer.query, h.indexerQuery, step.rows);
-  addIndexerProjection(step.graph, linear, b.normalized, indexer.key, h.indexerKey, step.rows);
+  addIndexerProjections(step.graph, linear, b.normalized, indexer, h.indexerQuery, h.indexerKey, step.rows);
   std::array<uint32_t, ExecutionLimits::maximumBatchWidth> firstPositions{};
   bool sparse = false;
   for (uint32_t lane = 0; lane < step.lanes; ++lane) {
