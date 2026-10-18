@@ -18,41 +18,76 @@ namespace gguf_float {
 
 constant constexpr uint kFragments = 4;          // 8-row fragments per threadgroup: 32 rows
 constant constexpr uint kRows = 8 * kFragments;
-// K parts, one per simdgroup. A decode dispatch has few threadgroups (8 or 32 at the 35B's alpha/beta and router
-// widths), so each simdgroup's chain of K / (8 kSplits) dependent loads and MMAs sets its time.
-constant constexpr uint kSplits = 16;
+constant constexpr uint kStep = 64;              // inputs per step: eight runs of 8
+// K parts, one per simdgroup. A decode dispatch has few threadgroups (64 at Flash-Next's router width, 32 at the
+// 35B's); on the M5 Max at 8 to 32 rows, 8 parts are the fastest at those widths, where 16 took up to 29% longer, and
+// 16 parts gained at most 19% at the narrow alpha/beta widths.
+constant constexpr uint kSplits = 8;
 
-// One threadgroup: output columns [8 tg.x, 8 tg.x + 8) of rows [32 tg.y, 32 tg.y + 32). Simdgroup s accumulates
-// K part s of every fragment; simdgroup f then adds fragment f's parts in order, so a result depends neither on
-// the grid nor on the row count. Lane (fm, fn) holds x[row fm][k + fn, k + fn + 1] as A,
-// W[column fn, fn + 1][k + fm] as B and the destination [row fm][column fn, fn + 1] (sgmatrix::lane_map).
+// Eight consecutive values of a row as stored, 16 bytes of bf16 or 32 of fp32, each widened exactly to fp32 where
+// read; zeros past the row's last run.
+template <typename V> struct Eight;
+template <> struct Eight<bfloat> {
+  uint4 pairs;
+  static Eight load(device const bfloat *values, bool inside) {
+    return {inside ? *reinterpret_cast<device const uint4 *>(values) : uint4(0)};
+  }
+  float operator[](uint i) const { return float(as_type<bfloat2>(pairs[i / 2])[i % 2]); }
+};
+template <> struct Eight<float> {
+  float4 low, high;
+  static Eight load(device const float *values, bool inside) {
+    device const float4 *quads = reinterpret_cast<device const float4 *>(values);
+    return inside ? Eight{quads[0], quads[1]} : Eight{float4(0), float4(0)};
+  }
+  float operator[](uint i) const { return i < 4 ? low[i] : high[i - 4]; }
+};
+
+// One threadgroup: output columns [8 tg.x, 8 tg.x + 8) of rows [32 tg.y, 32 tg.y + 32). K runs in steps of kStep
+// inputs, simdgroup s taking part s of the steps for every fragment; simdgroup f then adds fragment f's parts in
+// order, so a result depends neither on the grid nor on the row count. MMA j of the step from input k multiplies
+// inputs k + 8 i + j over its index i, so each lane's operands are whole runs of 8 inputs: lane (fm, fn) loads
+// W[column fn, fn + 1][k + 8 fm, + 8) as B and x[row fm][k + 8 fn, + 16) as A, a column's runs 128 contiguous bytes
+// of bf16 over its eight lanes, and holds the destination [row fm][column fn, fn + 1] (sgmatrix::lane_map). The
+// weights load a step ahead. Even and odd MMAs accumulate apart, which halves each chain of fp32 sums at no cost in
+// time: at the router's K = 2048 the mean error stays 5.5e-9 of sum |x w| (7.4e-9 with one chain per part). Rows of
+// K (a multiple of 8) start 16-byte aligned in page-aligned buffers.
 template <typename W, typename T>
 inline void project(device const bfloat *input, device const W *weights, device T *output,
                     constant GgufFloatParams &p, uint2 tg, uint sg, uint lane, threadgroup float2 *parts) {
   const sgmatrix::Lane l = sgmatrix::lane_map(lane);
-  const uint K = p.input_size, column = tg.x * 8 + l.fn, row0 = tg.y * kRows;
+  const uint K = p.input_size, runs = K / 8, column = tg.x * 8 + l.fn, row0 = tg.y * kRows;
   const uint live = min(kRows, p.rows - row0);
-  const uint steps = K / 8, first = sg * steps / kSplits, last = (sg + 1) * steps / kSplits;
-  device const W *w = weights + ulong(column) * K + l.fm;
-  float2 acc[kFragments];
+  const uint steps = (K + kStep - 1) / kStep, first = sg * steps / kSplits, last = (sg + 1) * steps / kSplits;
+  device const W *w = weights + ulong(column) * K;
+  const auto load = [&](uint step, thread Eight<W> (&b)[2]) {
+    const uint run = step * 8 + l.fm;
+    b[0] = Eight<W>::load(w + run * 8, run < runs);
+    b[1] = Eight<W>::load(w + K + run * 8, run < runs);
+  };
+  float2 acc[kFragments][2];
 #pragma unroll
-  for (uint f = 0; f < kFragments; ++f) acc[f] = float2(0);
-#pragma unroll(4)
+  for (uint f = 0; f < kFragments; ++f) acc[f][0] = acc[f][1] = float2(0);
+  Eight<W> next[2];
+  load(first, next);
   for (uint step = first; step < last; ++step) {
-    const uint k = step * 8;
-    const float2 b = float2(float(w[k]), float(w[K + k]));
+    const Eight<W> b0 = next[0], b1 = next[1];
+    if (step + 1 < last) load(step + 1, next);
+    const uint run = step * 8 + l.fn;
 #pragma unroll
     for (uint f = 0; f < kFragments; ++f) {
       if (f * 8 >= live) break;
       const uint row = f * 8 + l.fm;
-      const float2 a = row < live
-          ? float2(*reinterpret_cast<device const bfloat2 *>(input + ulong(row0 + row) * K + k + l.fn))
-          : float2(0);
-      sgmatrix::mma_acc<float>(acc[f], a, b);
+      device const bfloat *x = input + ulong(row0 + row) * K + run * 8;
+      const Eight<bfloat> a0 = Eight<bfloat>::load(x, row < live && run < runs);
+      const Eight<bfloat> a1 = Eight<bfloat>::load(x + 8, row < live && run + 1 < runs);
+#pragma unroll
+      for (uint j = 0; j < 8; ++j)
+        sgmatrix::mma_acc<float>(acc[f][j % 2], float2(a0[j], a1[j]), float2(b0[j], b1[j]));
     }
   }
 #pragma unroll
-  for (uint f = 0; f < kFragments; ++f) parts[(sg * kFragments + f) * 32 + lane] = acc[f];
+  for (uint f = 0; f < kFragments; ++f) parts[(sg * kFragments + f) * 32 + lane] = acc[f][0] + acc[f][1];
   threadgroup_barrier(mem_flags::mem_threadgroup);
   const uint f = sg, row = f * 8 + l.fm;
   if (f >= kFragments || row >= live) return;
