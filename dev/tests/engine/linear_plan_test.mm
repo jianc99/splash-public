@@ -148,7 +148,9 @@ constexpr std::array kStagedSplitAnchors{
     SplitAnchor{"narrow 1024 x 3072 tensor", 16, 1024, 3072, 32, kNone, 1, 4}};
 
 // One wave (four threadgroups per core) down to one 256-input unit per
-// partition, eight waves while partitions keep 1024 inputs, at most eight.
+// partition, eight waves while partitions keep 1024 inputs, at most eight;
+// sixteen where eight leave fewer than three threadgroups per core and
+// partitions keep 512 inputs, which 512 x 5120's sixteen would not.
 constexpr std::array kRegisterSplitAnchors{
     SplitAnchor{"27B down", 40, 5120, 17408, 8, kResidual, 1, 8},
     SplitAnchor{"27B out_proj, four lanes", 40, 5120, 6144, 32, kResidual, 1, 4},
@@ -165,7 +167,11 @@ constexpr std::array kRegisterSplitAnchors{
     SplitAnchor{"35B output projection", 40, 2048, 4096, 8, kResidual, 1, 8},
     SplitAnchor{"35B vocabulary head", 40, 248320, 2048, 8, kNone, 1, 1},
     SplitAnchor{"narrow 1024 x 5120 tensor", 40, 1024, 5120, 8, kNone, 1, 8},
-    SplitAnchor{"narrow 1024 x 1024 tensor", 40, 1024, 1024, 8, kNone, 1, 4}};
+    SplitAnchor{"narrow 512 x 5120 tensor", 40, 512, 5120, 8, kNone, 1, 8},
+    SplitAnchor{"narrow 1024 x 1024 tensor", 40, 1024, 1024, 8, kNone, 1, 4},
+    SplitAnchor{"Flash-Next hyper-connection down", 12, 320, 10240, 8, kNone, 1, 8},
+    SplitAnchor{"Flash-Next hyper-connection down", 14, 320, 10240, 8, kNone, 1, 16},
+    SplitAnchor{"Flash-Next hyper-connection down, four lanes", 40, 320, 10240, 32, kNone, 1, 16}};
 
 // fp32 K-split partials over the plan's rows and columns and one completion
 // counter per 64-column tile (LinearPlan::scratchSize).
@@ -408,6 +414,18 @@ void ggufPlans() {
     require(pair(20, 1024, 5120).oneGateUpPass && pair(32, 1024, 5120).tile == LinearTile::GgufRegister &&
                 pair(20, 512, 2560).tile == LinearTile::GgufRegister,
             "Apple10 registers a one-pass gate/up pair on both tensors' columns");
+    // Flash-Next's hyper-connection down projection splits K sixteen ways on the register tile at every lane count
+    // on 20 and 32 cores; its prefill chunks keep the staged tile's eight.
+    const Projection hyperDown = blockProjection(320, 10240, 1, GGUF_FMT_Q80);
+    for (const uint32_t cores : {20U, 32U}) {
+      for (uint32_t rows = 8; rows <= 32; rows += 8)
+        require(gpu(10, cores).plan({{320, 10240}, rows, LinearPhase::Decode, kNone}, hyperDown).configuration() ==
+                    LinearConfig{.tile = LinearTile::GgufRegister, .splits = 16},
+                "Apple10 splits the hyper-connection down projection sixteen ways");
+      require(gpu(10, cores).plan({{320, 10240}, 32, LinearPhase::Prefill, kNone}, hyperDown).configuration() ==
+                  LinearConfig{.tile = LinearTile::GgufStaged, .splits = 8},
+              "Apple10 stages a hyper-connection down chunk in eight K partitions");
+    }
     const Linear m5 = gpu(10, 32);
     for (const uint32_t format : {GGUF_FMT_Q4K, GGUF_FMT_IQ2XXS, GGUF_FMT_Q20})
       for (const auto [n, k] : {std::pair{1024U, 5120U}, {512U, 2560U}, {2560U, 6144U}, {320U, 10240U}}) {
@@ -553,9 +571,10 @@ void ggufPlans() {
       }
   }
   // Apple9's staged tile, in decode and in prefill chunks, splits K by the
-  // register tile's tiers: on 40 cores 17408 x 5120 in four, 5120 x 17408 in
+  // register tile's tiers of eight partitions: on 40 cores 17408 x 5120 in
+  // four, 5120 x 17408 and 320 x 10240 (sixteen on the register tile) in
   // eight.
-  for (const auto [n, k, splits] : {std::tuple{17408U, 5120U, 4U}, {5120U, 17408U, 8U}}) {
+  for (const auto [n, k, splits] : {std::tuple{17408U, 5120U, 4U}, {5120U, 17408U, 8U}, {320U, 10240U, 8U}}) {
     const LinearPlan decode = m3.plan({{n, k}, 8, LinearPhase::Decode, LinearEpilogue::None},
                                       blockProjection(n, k, 1, GGUF_FMT_IQ2XXS));
     const LinearPlan chunk = m3.plan({{n, k}, 8, LinearPhase::Prefill, LinearEpilogue::None}, blockProjection(n, k, 1));
@@ -563,11 +582,12 @@ void ggufPlans() {
                 chunk.configuration().splits == splits,
             "Apple9 staged split tiers");
   }
-  for (const LinearConfig config : {LinearConfig{.tile = LinearTile::GgufRegister, .splits = 3},
-                                    LinearConfig{.tile = LinearTile::GgufRegister, .splits = 16}})
+  for (const LinearConfig config :
+       {LinearConfig{.tile = LinearTile::GgufRegister, .splits = 3},
+        LinearConfig{.tile = LinearTile::GgufRegister, .splits = 2 * LinearConfig::kMaximumSplits}})
     rejects([&] { (void)Linear::plan(down, config, FloatOutput::BFloat16); },
             "the register block decode tile takes a K unit per split",
-            "the register tile took a K split that is not a power of two up to eight");
+            "the register tile took a K split that is not a power of two up to the maximum");
   // Split boundaries fall on coefficient units, of 64 inputs at the fewest, and prefill has no register tile.
   const LinearWorkload chunk{{5120, 17408}, 128, LinearPhase::Prefill, LinearEpilogue::None};
   rejects(
@@ -673,9 +693,9 @@ void scratchBoundsRotated() {
 //   where the grid of column tiles and lanes holds fewer than 1.5 per core,
 //   Q4_K's) or the staged tile's, the same at every width, over its tile's
 //   rows;
-// - a split count is a power of two up to eight whose partitions keep the kernel's
-//   floor (register: one 256-input unit, staged: 512 inputs in whole 32-input
-//   groups);
+// - a split count is a power of two up to the maximum whose partitions keep
+//   the kernel's floor (register: one 256-input unit, staged: 512 inputs in
+//   whole 32-input groups);
 // - the staged tile spreads its walks from 16 planned cores, the register tile
 //   never;
 // - it depends on the grid per core only: doubling the width and the core count
@@ -716,7 +736,8 @@ void ggufCoreLaws() {
                             other.storageRows() == (staged && rows == 24 ? 32U : rows),
                         "GGUF decode plan depends on the batch width");
                 const uint32_t s = c.splits;
-                require(s >= 1 && s <= 8 && (s & (s - 1)) == 0 && c.spread == (staged && planned >= 16),
+                require(s >= 1 && s <= LinearConfig::kMaximumSplits && (s & (s - 1)) == 0 &&
+                            c.spread == (staged && planned >= 16),
                         "GGUF decode plan split count or walk");
                 require(s == 1 || (staged ? k / s >= 512 && (k / 32) % s == 0 : k / 256 / s >= 1),
                         "GGUF decode partition below the kernel floor");

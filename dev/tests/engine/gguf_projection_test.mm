@@ -7,8 +7,9 @@
 //   equal a one-lane projection of them bitwise, as does one lane on the staged 16-row tile over a NaN padding lane
 //   (LinearConfig::sixteenRows); the plain epilogue into fp32 (the logits) holds the values its bf16 output rounds,
 //   bit for bit, each within fp64 before rounding;
-// - fused: three segments of different formats in one projection equal the projections of each segment alone, and
-//   one lane of them on the 16-row tile the 8-row tile's;
+// - fused: three segments of different formats in one projection equal the projections of each segment alone, on the
+//   register tile at K 4096, so that formats of 256-input units split sixteen ways too, and one lane of them on the
+//   16-row tile the 8-row tile's;
 // - both on the staged tile's spread walk too (LinearConfig::spread), over partitions from 72 steps down to 9, an odd
 //   count, whose tiles' walks wrap past the partition's end;
 // - gate/up: each format's gate with the next format the tile takes as up, and in one pass
@@ -16,7 +17,8 @@
 // - prefill: 128-row tiles with each epilogue, whose simdgroups past the chunk write nothing, and chunks of up to 32
 //   rows on the decode tiles equal to them bitwise; fused segments at their column offsets;
 // - split visibility: two projections that share the split scratch, at every pair of K splits either tile's policy
-//   picks for 8-80 cores, independent of poisoned partials;
+//   picks for 8-80 cores (the register tile's for Flash-Next's hyper-connection pair too), independent of poisoned
+//   partials;
 // - narrow inputs: Q8_0, MXFP4 and Q4_0 at K 320 and 640, whole 64-input spans but no multiple of 256 (the
 //   hyper-connection projections of Qwen3.8-Flash-Next take 320 inputs in Q8_0), decoded on both tiles and walks at
 //   every K split each tile takes there, and prefilled; and Q8_0 decoded at K 192, three of the register tile's
@@ -66,7 +68,7 @@ namespace {
 
 constexpr uint32_t kLaneRows = 8, kMaximumLanes = 4, kMaximumRows = kLaneRows * kMaximumLanes;
 // Every K split a plan takes: the powers of two up to the largest.
-constexpr uint32_t kSplits[] = {1, 2, 4, 8};
+constexpr uint32_t kSplits[] = {1, 2, 4, 8, 16};
 static_assert(kSplits[std::size(kSplits) - 1] == LinearConfig::kMaximumSplits);
 // Padding columns past a matrix's segments, which no kernel writes: four 64-column tiles.
 constexpr uint32_t kPadding = 256;
@@ -525,11 +527,14 @@ void decodeTile(MetalBackend &backend, const Linear &linear, LinearTile tile, bo
 }
 
 // One fused projection of three segments of different formats ([512 | 256 | 256, K]) on one tile and walk, each format
-// it takes with the formats three and five further on of those: at every lane count and K split, within fp64 and
-// equal to the projections of each segment alone; one lane on the staged 16-row tile equal to the 8-row tile.
+// it takes with the formats three and five further on of those: at every lane count and K split the tile takes in
+// all three, within fp64 and equal to the projections of each segment alone; one lane on the staged 16-row tile equal
+// to the 8-row tile. The register tile's K holds a 256-input unit per partition at the most splits, so that every
+// triple takes every split.
 void fusedDecode(MetalBackend &backend, const Linear &linear, LinearTile tile, bool spread) {
-  const uint32_t K = decodeInputs(spread);
+  const uint32_t K = tile == LinearTile::GgufRegister ? 256 * LinearConfig::kMaximumSplits : decodeInputs(spread);
   const std::vector<Fmt> formats = tileFormats(tile);
+  uint32_t mostSplits = 1;
   for (size_t i = 0; i < formats.size(); ++i) {
     const Tensor a = tensor(backend, formats[i], 512, K),
                  b = tensor(backend, formats[(i + 3) % formats.size()], 256, K),
@@ -540,7 +545,11 @@ void fusedDecode(MetalBackend &backend, const Linear &linear, LinearTile tile, b
     const std::vector<float> x = activations(Inputs::Dense, kMaximumRows, K);
     const std::vector<Dot> dots = products(parts, columns, x, kMaximumRows);
     const std::string formats = std::string(fmtName(a.format)) + "|" + fmtName(b.format) + "|" + fmtName(c.format);
-    for (const uint32_t splits : kSplits)
+    for (const uint32_t splits : kSplits) {
+      if (!std::all_of(parts.begin(), parts.end(),
+                       [&](const Tensor *part) { return takesSplits(tile, part->format, K, splits); }))
+        continue;
+      mostSplits = std::max(mostSplits, splits);
       for (uint32_t lanes = 1; lanes <= kMaximumLanes; ++lanes) {
         const LinearWorkload wl = decode({columns, K}, lanes, LinearEpilogue::None);
         const LinearPlan plan = Linear::plan(wl, config(tile, wl, splits, spread), FloatOutput::BFloat16);
@@ -575,10 +584,11 @@ void fusedDecode(MetalBackend &backend, const Linear &linear, LinearTile tile, b
           offset += part->N;
         }
       }
+    }
   }
   section(walkName(tile, spread) + " fused: three segments in " + std::to_string(formats.size()) +
-          " format triples, K " + std::to_string(K) +
-          ", 1-4 lanes, S 1-8 within fp64 and equal to each segment's projection" +
+          " format triples, K " + std::to_string(K) + ", 1-4 lanes, S 1-" + std::to_string(mostSplits) +
+          " within fp64 and equal to each segment's projection" +
           (tile == LinearTile::GgufStaged ? ", one lane on the 16-row tile equal to the 8-row tile" : ""));
 }
 
@@ -613,14 +623,17 @@ void gateUpPairs(MetalBackend &backend, const Linear &linear, LinearTile tile) {
 }
 
 // Gate/up in one pass (LinearConfig::oneGateUpPass) on the staged tile, gate and up in each format ([768, K]), and in
-// Q4_K and MLX 4-bit at the 27B's [17408, 5120]: at every lane count, K split and walk, and for one lane on the 16-row
-// tile too, bitwise the output of the gate and up passes, whatever the partials held before.
+// Q4_K and MLX 4-bit at the 27B's [17408, 5120]: at every lane count, K split the tile takes and walk, and for one
+// lane on the 16-row tile too, bitwise the output of the gate and up passes, whatever the partials held before.
 void oneGateUpPass(MetalBackend &backend, const Linear &linear, bool spread) {
+  uint32_t mostSplits = 1;
   const auto pairs = [&](Fmt f, uint32_t N, uint32_t K, uint32_t columns, std::span<const uint32_t> lanes) {
     const Tensor g = tensor(backend, f, N, K), u = tensor(backend, f, N, K);
     const Projection gate = projection({&g}, columns), up = projection({&u}, columns);
     const std::vector<float> x = activations(Inputs::Dense, kMaximumRows, K);
-    for (const uint32_t splits : kSplits)
+    for (const uint32_t splits : kSplits) {
+      if (!takesSplits(LinearTile::GgufStaged, f, K, splits)) continue;
+      mostSplits = std::max(mostSplits, splits);
       for (const uint32_t l : lanes) {
         const LinearWorkload wl = decode({columns, K}, l, LinearEpilogue::GateUp);
         LinearConfig c = config(LinearTile::GgufStaged, wl, splits, spread);
@@ -642,6 +655,7 @@ void oneGateUpPass(MetalBackend &backend, const Linear &linear, bool spread) {
         if (!sameRows(wide.output, 0, two.output, 0, wl.rows, columns))
           fail(label + ": the 16-row tile differs from the two passes");
       }
+    }
   };
   const uint32_t K = decodeInputs(spread);
   constexpr uint32_t kAllLanes[] = {1, 2, 3, 4}, kEndLanes[] = {1, kMaximumLanes};
@@ -649,7 +663,7 @@ void oneGateUpPass(MetalBackend &backend, const Linear &linear, bool spread) {
   for (const Fmt f : {Q4K, Fmt(GGUF_FMT_AF4G64)}) pairs(f, 17408, 5120, 17408, kEndLanes);
   section(walkName(LinearTile::GgufStaged, spread) + " one-pass gate/up: " + std::to_string(FMT_COUNT) +
           " formats at 768x" + std::to_string(K) + ", 1-4 lanes, and Q4_K and MLX 4-bit at 17408x5120, 1 and 4 lanes, "
-          "S 1-8, one lane on the 16-row tile too, bitwise the two passes");
+          "S 1-" + std::to_string(mostSplits) + ", one lane on the 16-row tile too, bitwise the two passes");
 }
 
 // ---------------------------------------------------------------- prefill
@@ -1064,13 +1078,18 @@ int main(int argc, char **argv) {
       const SplitOperand down = splitOperand(backend, Q6K, {5120, 17408}, LinearEpilogue::Residual);
       const SplitOperand gdn = splitOperand(backend, IQ4XS, {12288, 5120}, LinearEpilogue::None);
       const SplitOperand gateUp = splitOperand(backend, Q4K, {17408, 5120}, LinearEpilogue::GateUp);
+      // Flash-Next's hyper-connection down then up projections, Q8_0: K 10240 (sixteen partitions from 14 cores on the
+      // register tile) and 320.
+      const SplitOperand hyperDown = splitOperand(backend, Q80, {320, 10240}, LinearEpilogue::None);
+      const SplitOperand hyperUp = splitOperand(backend, Q80, {10240, 320}, LinearEpilogue::None);
       for (const LinearTile tile : {LinearTile::GgufRegister, LinearTile::GgufStaged})
         for (const uint32_t lanes : {1u, kMaximumLanes}) {
           splitVisibility(backend, linear, tile, {&out, &down}, lanes);
           splitVisibility(backend, linear, tile, {&gdn, &gateUp}, lanes);
+          if (tile == LinearTile::GgufRegister) splitVisibility(backend, linear, tile, {&hyperDown, &hyperUp}, lanes);
         }
-      section("split visibility: both tiles, 1 and 4 lanes, every split pair the policy picks for 8-80 cores, "
-              "independent of poisoned partials and within fp64");
+      section("split visibility: both tiles, 1 and 4 lanes, every split pair the policy picks for 8-80 cores, and the "
+              "register tile's at Flash-Next's hyper-connection pair, independent of poisoned partials and within fp64");
       // Narrow inputs, in formats of 32-input blocks: K 320 and 640, and on the decode tiles 192.
       const std::vector<Fmt> narrow{Q80, MXFP4, Q40};
       for (const uint32_t K : {320u, 640u}) {

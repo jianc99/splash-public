@@ -99,7 +99,7 @@ struct LinearConfig final {
   // Cross-threadgroup K partitions for GgufStaged and GgufRegister, a power
   // of two up to kMaximumSplits; GgufPrefill uses one.
   uint32_t splits = 1;
-  static constexpr uint32_t kMaximumSplits = 8;
+  static constexpr uint32_t kMaximumSplits = 16;
   // GgufStaged: each column tile starts its walk over its K partition at its
   // own step (kernels/common/gguf_staged_tile.h) instead of every tile at the
   // partition's first; no other tile spreads.
