@@ -36,6 +36,8 @@ NATIVE_RUNTIME_SOURCES := $(BACKEND_CONTROL_SOURCES) \
 TEST_SLOT_FILE_ASAN := $(ENGINE_SANITIZER_BUILD)/slot-file-asan-ubsan
 TEST_SLOT_FILE_TSAN := $(ENGINE_SANITIZER_BUILD)/slot-file-tsan
 TEST_KV_SLOT_FORMAT_ASAN := $(ENGINE_SANITIZER_BUILD)/kv-slot-format-asan-ubsan
+TEST_DISK_SPACE_ASAN := $(ENGINE_SANITIZER_BUILD)/disk-space-asan-ubsan
+TEST_DISK_SPACE_TSAN := $(ENGINE_SANITIZER_BUILD)/disk-space-tsan
 TEST_CACHE_DIRECTORY_ASAN := $(ENGINE_SANITIZER_BUILD)/cache-directory-asan-ubsan
 TEST_CACHE_DIRECTORY_TSAN := $(ENGINE_SANITIZER_BUILD)/cache-directory-tsan
 TEST_PERSISTENT_CACHE_ASAN := $(ENGINE_SANITIZER_BUILD)/persistent-cache-asan-ubsan
@@ -240,6 +242,7 @@ PRODUCTION_FLAG_TOOLS := $(TEST_BACKEND_BENCHMARK) $(WEIGHT_DIGESTS)
 PRODUCTION_CONFIG_TARGETS += $(PRODUCTION_FLAG_TOOLS)
 SANITIZER_CONFIG_TARGETS := $(TEST_SLOT_FILE_ASAN) $(TEST_SLOT_FILE_TSAN) \
 	$(TEST_KV_SLOT_FORMAT_ASAN) \
+	$(TEST_DISK_SPACE_ASAN) $(TEST_DISK_SPACE_TSAN) \
 	$(TEST_CACHE_DIRECTORY_ASAN) $(TEST_CACHE_DIRECTORY_TSAN) \
 	$(TEST_PERSISTENT_CACHE_ASAN) $(TEST_PERSISTENT_CACHE_TSAN) \
 	$(TEST_ENGINE_CACHE_ASAN) $(TEST_ENGINE_CACHE_TSAN) \
@@ -299,8 +302,6 @@ $(TEST_STATUS_TEST): runtime/metal/DeviceCapabilities.cpp \
 		runtime/engine/Status.cpp \
 		dev/tests/engine/runtime_status_test.cpp
 $(TEST_Q8_CPU_TEST): dev/tests/engine/q8_paged_kv_test.cc
-$(TEST_DISK_SPACE): runtime/engine/DiskSpace.cpp runtime/engine/CacheDirectory.cpp \
-		runtime/model/SlotFile.cpp dev/tests/engine/disk_space_test.cpp
 $(TEST_LEGACY_WEIGHT_CACHE): dev/tests/engine/legacy_weight_cache_test.cpp
 
 $(TEST_WEIGHT_SOURCE) $(TEST_GGUF_FILE) $(TEST_MEMORY_TEST) $(TEST_KV_PAGE_CACHE_TEST) \
@@ -646,6 +647,9 @@ $(TEST_SLOT_FILE) $(TEST_SLOT_FILE_ASAN) $(TEST_SLOT_FILE_TSAN): \
 		runtime/model/SlotFile.cpp dev/tests/engine/slot_file_test.cpp
 $(TEST_KV_SLOT_FORMAT) $(TEST_KV_SLOT_FORMAT_ASAN): \
 		runtime/ops/KvSlotFormat.cpp dev/tests/engine/kv_slot_format_test.cpp
+$(TEST_DISK_SPACE) $(TEST_DISK_SPACE_ASAN) $(TEST_DISK_SPACE_TSAN): \
+		runtime/engine/DiskSpace.cpp runtime/engine/CacheDirectory.cpp \
+		runtime/model/SlotFile.cpp dev/tests/engine/disk_space_test.cpp
 $(TEST_CACHE_DIRECTORY) $(TEST_CACHE_DIRECTORY_ASAN) $(TEST_CACHE_DIRECTORY_TSAN): \
 		runtime/engine/CacheDirectory.cpp dev/tests/engine/cache_directory_test.cpp
 $(TEST_SPARSE_ROW_STORE) $(TEST_SPARSE_ROW_STORE_ASAN) $(TEST_SPARSE_ROW_STORE_TSAN): \
@@ -686,6 +690,8 @@ test-sanitizers: $(SANITIZER_CONFIG_TARGETS)
 	$(ASAN_TEST_ENV) $(TEST_SLOT_FILE_ASAN)
 	$(TSAN_TEST_ENV) $(TEST_SLOT_FILE_TSAN)
 	$(ASAN_TEST_ENV) $(TEST_KV_SLOT_FORMAT_ASAN)
+	$(ASAN_TEST_ENV) $(TEST_DISK_SPACE_ASAN)
+	$(TSAN_TEST_ENV) $(TEST_DISK_SPACE_TSAN)
 	$(ASAN_TEST_ENV) $(TEST_CACHE_DIRECTORY_ASAN)
 	$(TSAN_TEST_ENV) $(TEST_CACHE_DIRECTORY_TSAN)
 	$(ASAN_TEST_ENV) $(TEST_PERSISTENT_CACHE_ASAN)

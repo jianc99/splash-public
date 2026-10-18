@@ -902,6 +902,67 @@ static void testAdoptedReadsCheckTheirSegments() {
           "a slot this process wrote was checked against a record");
 }
 
+// Active KV's quota: a commitment locks room within the active limit beside
+// the slots requests hold, without taking a slot; a committed page's slot
+// draws on it within the active limit while a cached copy's takes the
+// limit, each against what the files hold, and no draw takes more than is
+// committed.
+static void testCommitmentsDrawWithinTheActiveLimit() {
+  constexpr size_t size = kHostPageBytes;
+  auto budget = std::make_shared<DiskBudget>(10 * size);
+  require(budget->activeLimitBytes() == 10 * size, "the active limit was not the quota before a measure");
+  budget->setActiveLimitBytes(20 * size);
+  require(budget->activeLimitBytes() == 10 * size, "the active limit passed the quota");
+  budget->setActiveLimitBytes(8 * size);
+  budget->setLimitBytes(2 * size);
+  SlotFile file(size, budget);
+  require(budget->commit(4 * size, 3 * size) && !budget->commit(2 * size, 3 * size) &&
+              budget->commit(size, 3 * size) && budget->committedBytes() == 5 * size,
+          "a commitment passed the active limit beside what is held and committed");
+  budget->uncommit(size);
+  std::vector<std::shared_ptr<SlotFile::Slot>> slots{file.acquire(), file.acquire()};
+  require(slots[0] && slots[1] && !file.acquire(), "cached copies passed the limit");
+  for (int page = 0; page < 4; ++page) {
+    slots.push_back(file.acquire(DiskBudget::Draw::Commitment));
+    require(slots.back() && budget->committedBytes() == (3 - page) * size,
+            "a committed page did not draw its slot from the commitment within the active limit");
+  }
+  require(!file.acquire(DiskBudget::Draw::Commitment) && budget->usedBytes() == 6 * size,
+          "a draw took more than was committed");
+  require(budget->commit(3 * size, 0), "a commitment beside nothing held was refused");
+  for (int page = 0; page < 2; ++page) {
+    slots.push_back(file.acquire(DiskBudget::Draw::Commitment));
+    require(slots.back() != nullptr, "a committed page did not draw its slot within the active limit");
+  }
+  require(!file.acquire(DiskBudget::Draw::Commitment) && budget->committedBytes() == size,
+          "a committed draw passed what the files hold under the active limit");
+  slots.pop_back();
+  require(file.acquire(DiskBudget::Draw::Commitment) && !budget->committedBytes(),
+          "a freed slot's room did not take the committed draw");
+}
+
+// A request may start to spill while the write budget covers what Spill
+// requests committed: always without one, and once it is lifted.
+static void testSpillsWithinTheWriteBudget() {
+  constexpr size_t size = kHostPageBytes;
+  double now = 0.0;
+  auto budget = std::make_shared<DiskBudget>(8 * size, [&now] { return now; });
+  require(budget->admitsSpill(uint64_t{1} << 50), "a budget without a write budget refused a spill");
+  // Four slots a day, one at once.
+  budget->setWriteBudget(4 * size);
+  require(budget->admitsSpill(size) && !budget->admitsSpill(size + 1),
+          "a write budget did not cover exactly its balance of committed writes");
+  SlotFile file(size, budget);
+  auto slot = file.acquire();
+  const std::vector<std::byte> payload(size, std::byte{2});
+  require(file.write(slot, {payload}, {})->wait(), "slot write failed");
+  require(budget->admitsSpill(0) && !budget->admitsSpill(1), "a spent write budget covered a committed write");
+  now = 86'400'000.0 / 8;
+  require(budget->admitsSpill(size / 2) && !budget->admitsSpill(size), "the write budget did not refill");
+  budget->lift();
+  require(budget->admitsSpill(uint64_t{1} << 50), "a lifted write budget refused a spill");
+}
+
 int main() {
   try {
     testFailedWriteStopsWriting();
@@ -922,6 +983,8 @@ int main() {
     testOneSegmentKeepsVersionOneRecords();
     testSegmentedRecords();
     testAdoptedReadsCheckTheirSegments();
+    testCommitmentsDrawWithinTheActiveLimit();
+    testSpillsWithinTheWriteBudget();
     constexpr size_t size = 4 * kHostPageBytes;
     auto budget = std::make_shared<DiskBudget>(size * 2 + 1);
     SlotFile file(size, budget);
