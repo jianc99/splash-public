@@ -111,7 +111,7 @@ KvSpillPlan planSpill(const StreamedMemoryInputs &in, uint64_t floors) {
       .layout = layout,
       .geometry = {.fullPageBytes = layout.bytesPerModelPage(),
                    .indexPageBytes = layout.indexBytesPerModelPage(),
-                   .densePages = static_cast<uint32_t>(pagesOf(std::max(shape.denseHistoryTokens, shape.sinkTokens))),
+                   .densePages = static_cast<uint32_t>(pagesOf(shape.denseTokens())),
                    .windowPages = kSpillWindowPages,
                    .groupPages = in.groupPages},
       .extentPages = extentPages,
