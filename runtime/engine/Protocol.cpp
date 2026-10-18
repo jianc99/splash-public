@@ -34,7 +34,7 @@ constexpr uint64_t kPromptProgressFixedBytes = 20;
 constexpr uint64_t kTokensFixedBytes = 16;
 constexpr uint64_t kMaskRequestFixedBytes = 24;
 constexpr uint64_t kDoneFixedBytes = 62;
-constexpr uint64_t kErrorFixedBytes = 18;
+constexpr uint64_t kErrorFixedBytes = 22;
 constexpr uint64_t kStatusJsonFixedBytes = 8;
 
 struct PayloadBounds {
@@ -555,6 +555,10 @@ std::optional<ProtocolIssue> validateError(const ErrorEvent &event,
     return invalidEvent(IssueCode::LimitExceeded, event.requestId,
                         "error code or message exceeds its safe limit");
   }
+  if (event.retryAfterSeconds && !event.retryable) {
+    return invalidEvent(IssueCode::InvalidErrorClassification, event.requestId,
+                        "only a retryable error says when to retry");
+  }
   return std::nullopt;
 }
 
@@ -666,6 +670,7 @@ EncodedEvent encodeError(const ErrorEvent &event,
                   kErrorFixedBytes + event.code.size() + event.message.size());
   writer.u8(static_cast<uint8_t>(event.failureClass));
   writer.u8(event.retryable ? 1 : 0);
+  writer.u32(event.retryAfterSeconds);
   writer.u64(event.requestId);
   writer.u32(static_cast<uint32_t>(event.code.size()));
   writer.u32(static_cast<uint32_t>(event.message.size()));

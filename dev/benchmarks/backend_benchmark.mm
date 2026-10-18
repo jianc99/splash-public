@@ -104,8 +104,8 @@ public:
     value.optionLogits.assign(optionLogits.begin(), optionLogits.end());
   }
 
-  void failed(uint64_t requestId, LaneOutcome outcome,
-              std::string message) override {
+  void failed(uint64_t requestId, LaneOutcome outcome, std::string message,
+              uint32_t) override {
     observations_[requestId].failure =
         std::string(laneOutcomeWire(outcome).code) + ":" + message;
   }

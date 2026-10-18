@@ -1005,7 +1005,9 @@ class NativeBackend:
                 "limit_exceeded",
             }
             status = 503 if error.retryable else 400 if code in request_codes else 500
-            return APIError(status, message, code)
+            # The engine says when a retry may succeed where that is not at
+            # once, as when the SSD cache's write budget refills.
+            return APIError(status, message, code, error.retry_after_seconds or 1)
         if isinstance(error, engine_runtime.MaskComputationFailed):
             if error.retryable:
                 return APIError(503, str(error), "runtime_busy")

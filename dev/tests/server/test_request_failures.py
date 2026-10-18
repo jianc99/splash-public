@@ -296,6 +296,41 @@ class RequestFailureTests(HarnessTestCase):
         status, _, _ = harness.request("POST", "/v1/chat/completions", chat_body())
         self.assertEqual(status, 200)
 
+    def test_write_budget_refusal_says_when_to_retry(self):
+        # The SSD cache's daily write budget covers what spilling requests
+        # were promised again in 6 hours, not in a second.
+        runtime = FakeRuntime(
+            Plan(
+                exception=api.engine_runtime.RequestFailed(
+                    1,
+                    b"kv_write_budget",
+                    b"the SSD cache's daily write budget is spent",
+                    retryable=True,
+                    retry_after_seconds=21_600,
+                )
+            ),
+            Plan([[4]]),
+        )
+        harness = self.harness(runtime)
+        connection = http.client.HTTPConnection(
+            *harness.server.server_address, timeout=3
+        )
+        self.addCleanup(connection.close)
+        connection.request(
+            "POST",
+            "/v1/chat/completions",
+            json.dumps(chat_body()),
+            {"Content-Type": "application/json"},
+        )
+        response = connection.getresponse()
+        self.assertEqual(response.status, 503)
+        self.assertEqual(response.getheader("Retry-After"), "21600")
+        self.assertEqual(
+            json.loads(response.read())["error"]["code"], "kv_write_budget"
+        )
+        status, _, _ = harness.request("POST", "/v1/chat/completions", chat_body())
+        self.assertEqual(status, 200)
+
     def test_unexpected_runtime_error_does_not_kill_backend(self):
         runtime = FakeRuntime(
             Plan(exception=RuntimeError("boom")),

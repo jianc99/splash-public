@@ -58,7 +58,7 @@ _PROMPT_PROGRESS = struct.Struct("<QIQ")
 _TOKENS = struct.Struct("<QII")
 _MASK_REQUEST = struct.Struct("<QQII")
 _DONE = struct.Struct("<QBBIIQQQIIIII")
-_ERROR = struct.Struct("<BBQII")
+_ERROR = struct.Struct("<BBIQII")
 _STATUS_JSON = struct.Struct("<Q")
 
 assert (
@@ -72,7 +72,7 @@ assert _IMAGE_SPAN.size == 32
 assert _READY.size == 9
 assert _START.size == 16
 assert _DONE.size == 62
-assert _ERROR.size == 18
+assert _ERROR.size == 22
 assert _STATUS_JSON.size == 8
 
 REQUEST_FIXED_BYTES = _REQUEST.size
@@ -400,6 +400,9 @@ class ErrorEvent:
     retryable: bool
     code: bytes
     message: bytes
+    # For a retryable request error, the seconds after which a retry may
+    # succeed, as when the SSD cache's write budget refills; 0 for at once.
+    retry_after_seconds: int = 0
 
 
 # The JSON is opaque to the transport: the document carries its own
@@ -1145,8 +1148,8 @@ def _decode_event(frame: Frame) -> EngineEvent:
             )
         return event
     if frame_type is FrameType.ERROR:
-        failure, retryable, request_id, code_bytes, message_bytes = _ERROR.unpack_from(
-            payload
+        failure, retryable, retry_after, request_id, code_bytes, message_bytes = (
+            _ERROR.unpack_from(payload)
         )
         if retryable > 1 or code_bytes + message_bytes != len(payload) - _ERROR.size:
             _fatal(
@@ -1177,6 +1180,12 @@ def _decode_event(frame: Frame) -> EngineEvent:
                 "error code or message exceeds its safe limit",
                 request_id,
             )
+        if retry_after and not retryable:
+            _fatal(
+                IssueCode.INVALID_ERROR_CLASSIFICATION,
+                "only a retryable error says when to retry",
+                request_id,
+            )
         message_start = _ERROR.size + code_bytes
         return ErrorEvent(
             classification,
@@ -1184,6 +1193,7 @@ def _decode_event(frame: Frame) -> EngineEvent:
             bool(retryable),
             payload[_ERROR.size : message_start],
             payload[message_start:],
+            retry_after,
         )
     if frame_type is FrameType.STATUS_JSON:
         (correlation_id,) = _STATUS_JSON.unpack_from(payload)

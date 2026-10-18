@@ -407,9 +407,11 @@ bool NativeRuntime::handleIssue(protocol::ProtocolIssue issue) {
 }
 
 void NativeRuntime::requestError(uint64_t requestId, std::string code,
-                                 std::string message, bool retryable) {
+                                 std::string message, bool retryable,
+                                 uint32_t retryAfterSeconds) {
   send(protocol::ErrorEvent{protocol::FailureClass::RequestError, requestId,
-                            retryable, std::move(code), std::move(message)});
+                            retryable, std::move(code), std::move(message),
+                            retryAfterSeconds});
 }
 
 void NativeRuntime::engineError(std::string code, std::string message) {
@@ -558,12 +560,12 @@ void NativeRuntime::completed(uint64_t requestId, EngineFinishReason reason, boo
 }
 
 void NativeRuntime::failed(uint64_t requestId, LaneOutcome outcome,
-                           std::string message) {
+                           std::string message, uint32_t retryAfterSeconds) {
   const LaneOutcomeWire wire = laneOutcomeWire(outcome);
   if (outcome == LaneOutcome::CapacityExhausted)
     config_.metrics->capacityFailed();
   requestError(requestId, std::string(wire.code), std::move(message),
-               wire.retryable);
+               wire.retryable, retryAfterSeconds);
   ended(requestId, config_.monotonicMilliseconds());
 }
 
