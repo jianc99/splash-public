@@ -16,6 +16,7 @@
 #include "ops/RoPE.hpp"
 #include "ops/RowCopy.hpp"
 #include "ops/Sampling.hpp"
+#include "ops/VerifyRowsProbe.hpp"
 #include "ops/Vision.hpp"
 
 #include <algorithm>
@@ -24,8 +25,12 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <mutex>
+#include <sys/stat.h>
 #include <list>
 #include <numeric>
 #include <optional>
@@ -97,6 +102,119 @@ private:
 };
 
 using kv::ChunkedPrefillParams;
+
+// PROTOTYPE (night/dflash-verify-len, measurement only). With
+// SPLASH_PROTO_VERIFY_CTL naming a file, each decode cycle verifies the rows
+// the file's one line gives every lane: "k N" (N of the eight rows) or
+// "ema MARGIN MIN" (the lane's recent tokens per cycle, an EMA, plus MARGIN,
+// clamped to [MIN, 8]). The cycle retains at most that many tokens and its
+// MoE steps route the lane's verified rows alone. Without the file every lane
+// verifies all eight rows. With SPLASH_PROTO_ACCEPT_LOG naming a file, every
+// lane of every cycle appends a JSON line: its accepted proposals before any
+// cap, what it retained, its rows, the cycle's times and the selector's
+// probability of each of its seven proposals (softmax of the 16 candidates'
+// scores at temperature 1).
+class VerifyLengthProbe final {
+public:
+  static VerifyLengthProbe &instance() {
+    static VerifyLengthProbe probe;
+    return probe;
+  }
+
+  // The rows request `id` verifies this cycle.
+  uint32_t rows(uint64_t id) {
+    std::lock_guard lock(mutex_);
+    refresh();
+    if (mode_ == Mode::Fixed) return fixed_;
+    if (mode_ == Mode::Ema) {
+      const auto found = ema_.find(id);
+      const double recent = found == ema_.end() ? 8.0 : found->second;
+      const double wanted = std::ceil(recent + margin_);
+      return static_cast<uint32_t>(std::clamp(wanted, double(minimum_), double(kDecodeRows)));
+    }
+    return kDecodeRows;
+  }
+
+  bool logging() const noexcept { return log_ != nullptr; }
+
+  void record(uint64_t id, uint32_t width, uint32_t lane, uint32_t verifyRows, uint32_t maximumRetained,
+              uint32_t accepted, uint32_t retained, bool sampled, const CommandTiming &timing,
+              const std::array<float, kDraftProposalTokens> &confidence) {
+    std::lock_guard lock(mutex_);
+    // Tokens per cycle the lane would have had with all eight rows (its
+    // budget and stops aside).
+    // A lane that verified fewer rows knows its acceptance up to them alone:
+    // one that accepted them all counts one more, so its rows can grow.
+    double tokens = double(std::min(accepted + 1, verifyRows));
+    if (verifyRows < kDecodeRows && accepted + 1 >= verifyRows) tokens = verifyRows + 1;
+    auto [at, inserted] = ema_.try_emplace(id, tokens);
+    if (!inserted) at->second = 0.7 * at->second + 0.3 * tokens;
+    if (ema_.size() > 4096) ema_.clear();
+    if (!log_) return;
+    const double now = std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
+    std::fprintf(log_,
+                 "{\"t\":%.4f,\"id\":%llu,\"B\":%u,\"l\":%u,\"k\":%u,\"m\":%u,\"a\":%u,\"r\":%u,\"s\":%d,"
+                 "\"w\":%.3f,\"g\":%.3f,\"c\":[",
+                 now, static_cast<unsigned long long>(id), width, lane, verifyRows, maximumRetained, accepted,
+                 retained, sampled ? 1 : 0, timing.wallSeconds * 1e3, timing.gpuSeconds * 1e3);
+    for (uint32_t p = 0; p < kDraftProposalTokens; ++p)
+      std::fprintf(log_, p ? ",%.4f" : "%.4f", confidence[p]);
+    std::fputs("]}\n", log_);
+    if (lane + 1 == width) std::fflush(log_);
+  }
+
+private:
+  enum class Mode : uint8_t { All, Fixed, Ema };
+
+  VerifyLengthProbe() {
+    if (const char *path = std::getenv("SPLASH_PROTO_VERIFY_CTL")) control_ = path;
+    if (const char *path = std::getenv("SPLASH_PROTO_ACCEPT_LOG")) log_ = std::fopen(path, "a");
+  }
+
+  // Rereads the control file when it changed.
+  void refresh() {
+    if (control_.empty()) return;
+    struct stat info{};
+    if (::stat(control_.c_str(), &info) != 0) {
+      mode_ = Mode::All;
+      return;
+    }
+    const int64_t stamp = int64_t(info.st_mtimespec.tv_sec) * 1000000000 + info.st_mtimespec.tv_nsec;
+    if (stamp == stamp_) return;
+    stamp_ = stamp;
+    mode_ = Mode::All;
+    FILE *file = std::fopen(control_.c_str(), "r");
+    if (!file) return;
+    char word[16] = {};
+    double a = 0, b = 0;
+    const int read = std::fscanf(file, "%15s %lf %lf", word, &a, &b);
+    std::fclose(file);
+    if (read >= 2 && std::string_view(word) == "k" && a >= 1 && a <= kDecodeRows) {
+      mode_ = Mode::Fixed;
+      fixed_ = static_cast<uint32_t>(a);
+    } else if (read >= 3 && std::string_view(word) == "ema" && b >= 1 && b <= kDecodeRows) {
+      mode_ = Mode::Ema;
+      margin_ = a;
+      minimum_ = static_cast<uint32_t>(b);
+    }
+    std::fprintf(stderr, "verify-length probe: %s %g %g\n", word, a, b);
+  }
+
+  std::mutex mutex_;
+  std::string control_;
+  FILE *log_ = nullptr;
+  int64_t stamp_ = -1;
+  Mode mode_ = Mode::All;
+  uint32_t fixed_ = kDecodeRows;
+  double margin_ = 0;
+  uint32_t minimum_ = 2;
+  std::unordered_map<uint64_t, double> ema_;
+};
+
+// Every lane verifies all its rows outside a decode cycle's encoding.
+struct VerifyRowsScope final {
+  ~VerifyRowsScope() { ops::cycleVerifyRows().fill(kDecodeRows); }
+};
 
 bool isStopToken(const RuntimeGeometry &geometry, uint32_t token) noexcept {
   return token == geometry.target.stopTokens[0] ||
@@ -319,6 +437,8 @@ struct Runtime::Impl {
     uint32_t accepted = 0;
     uint32_t currentAnchor = 0;
     uint32_t maximumRetained = 0;
+    // PROTOTYPE (verify length): the rows the lane verifies.
+    uint32_t verifyRows = kDecodeRows;
     // The draft proposals the lane's thinking end replaced, which its
     // speculation counts leave out.
     uint32_t endDrafts = 0;
@@ -1993,6 +2113,43 @@ struct Runtime::Impl {
     return true;
   }
 
+  // PROTOTYPE (verify length): the selector's probability of each proposal
+  // lane `lane` of a `width`-lane cycle drew, from what draft_select_edges
+  // and draft_select_dflash left: the softmax at temperature 1 of the 16
+  // candidates' scores (unary score plus the edge from the chosen
+  // predecessor), at the candidate the proposal is (else the best one).
+  std::array<float, kDraftProposalTokens> proposalConfidence(uint32_t width, uint32_t lane) const {
+    constexpr uint32_t P = kDraftProposalTokens, C = SPLASH_DRAFT_CANDIDATES, S = SPLASH_DRAFT_SAMPLING_SHARDS;
+    const auto *ids = contents<uint32_t>(decodeArena->batchSlice(DecodeTensor::Candidates, width), "candidates") +
+                      uint64_t{lane} * P * C;
+    const auto *unary = contents<float>(decodeArena->batchSlice(DecodeTensor::Unary, width), "unary") +
+                        uint64_t{lane} * P * C;
+    const auto *tables =
+        contents<float>(decodeArena->batchSlice(DecodeTensor::TopPartialValues, width), "edge tables") +
+        uint64_t{width} * P * S * C + uint64_t{lane} * P * C * C;
+    const auto *proposed =
+        contents<uint32_t>(decodeArena->batchSlice(DecodeTensor::ProposedTokens, width), "proposals") +
+        uint64_t{lane} * P;
+    std::array<float, kDraftProposalTokens> result{};
+    uint32_t predecessor = 0;
+    for (uint32_t position = 0; position < P; ++position) {
+      const float *edges = tables + (uint64_t{position} * C + predecessor) * C;
+      float scores[C];
+      uint32_t best = 0, chosen = C;
+      for (uint32_t i = 0; i < C; ++i) {
+        scores[i] = unary[position * C + i] + edges[i];
+        if (scores[i] > scores[best]) best = i;
+        if (chosen == C && ids[position * C + i] == proposed[position]) chosen = i;
+      }
+      if (chosen == C) chosen = best;
+      double sum = 0;
+      for (uint32_t i = 0; i < C; ++i) sum += std::exp(double(scores[i]) - double(scores[best]));
+      result[position] = float(std::exp(double(scores[chosen]) - double(scores[best])) / sum);
+      predecessor = chosen;
+    }
+    return result;
+  }
+
   std::vector<ModelStepResult> finalizeDecode(
       std::span<DecodeLaneResult> lanes, std::span<const ModelBatchItem> items,
       CommandTiming timing) {
@@ -2017,6 +2174,13 @@ struct Runtime::Impl {
           d(DecodeTensor::OutputTokens), "target output tokens");
       laneResult.failure =
           invalidSelection({targetTokens, laneResult.retained}, lane);
+      VerifyLengthProbe &probe = VerifyLengthProbe::instance();
+      std::array<float, kDraftProposalTokens> confidence{};
+      if (probe.logging())
+        confidence = proposalConfidence(static_cast<uint32_t>(items.size()), lane);
+      probe.record(laneResult.request->id, static_cast<uint32_t>(items.size()), lane, laneResult.verifyRows,
+                   laneResult.maximumRetained, laneResult.accepted, laneResult.retained,
+                   samplingEnabled(*laneResult.request), timing, confidence);
     }
 
     std::vector<ModelStepResult> results;
@@ -2125,6 +2289,8 @@ struct Runtime::Impl {
 
         CommandGraph target;
         const uint32_t width = static_cast<uint32_t>(lanes_.size());
+        const VerifyRowsScope verifyRowsScope;
+        for (uint32_t lane = 0; lane < width; ++lane) ops::cycleVerifyRows()[lane] = lanes_[lane].verifyRows;
         impl_.encodeBatchVerifyInput(target, width);
         impl_.encodeBatchEmbedding(target, DecodeTensor::InputTokens,
                                    DecodeTensor::Hidden0, width);
@@ -2750,7 +2916,8 @@ Runtime::decodeAsync(const BatchPlan &plan,
     Impl::DecodeLaneResult &laneResult = lanes[lane];
     laneResult.request = &entry;
     laneResult.currentAnchor = *entry.pendingToken;
-    laneResult.maximumRetained = std::min(remaining, kDecodeRows);
+    laneResult.verifyRows = VerifyLengthProbe::instance().rows(entry.id);
+    laneResult.maximumRetained = std::min({remaining, kDecodeRows, laneResult.verifyRows});
     if (const auto cutoff = Impl::samplingPolicy(entry).thinkingCutoff)
       laneResult.endDrafts = cutoff->replacedProposals();
 
@@ -2761,6 +2928,8 @@ Runtime::decodeAsync(const BatchPlan &plan,
   }
 
   const std::span<Impl::Request *const> entries(requests.data(), width);
+  const VerifyRowsScope verifyRowsScope;
+  for (uint32_t lane = 0; lane < width; ++lane) ops::cycleVerifyRows()[lane] = lanes[lane].verifyRows;
   const uint32_t ropeRows = width * kDecodeRows;
   CommandGraph commandGraph;
   impl_->addRopeTables(

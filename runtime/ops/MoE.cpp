@@ -4,6 +4,7 @@
 #include "metal/abi/Gguf.h"
 #include "metal/abi/MoE.h"
 #include "ops/BufferExtent.hpp"
+#include "ops/VerifyRowsProbe.hpp"
 
 #include <stdexcept>
 #include <string>
@@ -174,9 +175,21 @@ namespace {
 MoeGroupParams groupParams(const MoePlan &plan) {
   const MoeShape shape = plan.shape();
   const bool oneGateUp = oneGateUpPass(plan);
-  return {plan.rows(), shape.expertsPerToken, plan.tileRows(), shape.experts,
-          shape.expertIntermediateSize / (oneGateUp ? GGUF_STAGED_COLUMNS : GGUF_TILE_COLUMNS),
-          shape.hiddenSize / GGUF_TILE_COLUMNS};
+  MoeGroupParams params{plan.rows(), shape.expertsPerToken, plan.tileRows(), shape.experts,
+                        shape.expertIntermediateSize / (oneGateUp ? GGUF_STAGED_COLUMNS : GGUF_TILE_COLUMNS),
+                        shape.hiddenSize / GGUF_TILE_COLUMNS, 0, {}};
+  // PROTOTYPE (verify length): a decode step's lanes route their verified
+  // rows alone (VerifyRowsProbe.hpp).
+  if (plan.phase() == MoePhase::Decode) {
+    const VerifyRows &rows = cycleVerifyRows();
+    bool all = true;
+    for (uint32_t lane = 0; lane < rows.size(); ++lane) {
+      params.verify_rows[lane] = rows[lane];
+      all = all && rows[lane] >= SPLASH_TARGET_VERIFY_ROWS;
+    }
+    params.verify_stride = all ? 0 : SPLASH_TARGET_VERIFY_ROWS;
+  }
+  return params;
 }
 
 } // namespace

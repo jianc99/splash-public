@@ -130,6 +130,16 @@ MOE_ROUTE_SELECT_ENTRY(moe_route_select_f32_e512, SPLASH_MOE_WIDE_EXPERT_SLOTS)
 // shared expert's tiles follow the routed tiles and hold every row in order.
 // It writes the tile count with the expert passes' grids (MoeTileCount).
 // Slots threads, one per expert slot.
+// PROTOTYPE (verify length): whether the grouping leaves routed route
+// `route` unrouted (MoeGroupParams::verify_stride).
+inline bool moe_unverified_route(constant MoeGroupParams &params, uint route) {
+  if (!params.verify_stride)
+    return false;
+  const uint row = route / (params.top_k + 1);
+  const uint lane = row / params.verify_stride;
+  return lane < 4 && row % params.verify_stride >= params.verify_rows[lane];
+}
+
 template <uint Slots>
 inline void moe_group_routes_phase(
     device const uint *selected, device MoeTileDescriptor *tiles, device MoeTileCount *tile_count,
@@ -143,7 +153,8 @@ inline void moe_group_routes_phase(
   atomic_store_explicit(&cursors[thread_index], 0u, memory_order_relaxed);
   threadgroup_barrier(mem_flags::mem_threadgroup);
   for (uint route = thread_index; route < routes; route += Slots) {
-    if (route % routes_per_row != params.top_k) {
+    if (route % routes_per_row != params.top_k &&
+        !moe_unverified_route(params, route)) {
       atomic_fetch_add_explicit(&counts[selected[route]], 1u,
                                 memory_order_relaxed);
     }
@@ -178,6 +189,10 @@ inline void moe_group_routes_phase(
   for (uint route = thread_index; route < routes; route += Slots) {
     if (route % routes_per_row == params.top_k)
       continue;
+    if (moe_unverified_route(params, route)) {
+      route_rows[route] = ~0u;
+      continue;
+    }
     uint expert = selected[route];
     uint slot =
         atomic_fetch_add_explicit(&cursors[expert], 1u, memory_order_relaxed);
@@ -346,9 +361,12 @@ kernel void moe_combine(
   float value = float(residual[ulong(row) * params.hidden_size + dimension]);
   ulong route = ulong(row) * params.routes_per_row;
   for (uint slot = 0; slot < params.routes_per_row; ++slot) {
+    // PROTOTYPE (verify length): an unrouted route (~0u) adds nothing.
+    const uint grouped = route_rows[route + slot];
+    if (grouped == ~0u)
+      continue;
     value += routing_weights[route + slot] *
-             float(expert_output[ulong(route_rows[route + slot]) *
-                                     params.hidden_size +
+             float(expert_output[ulong(grouped) * params.hidden_size +
                                  dimension]);
   }
   output[ulong(row) * params.hidden_size + dimension] = bfloat(value);
