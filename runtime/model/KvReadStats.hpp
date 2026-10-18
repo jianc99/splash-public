@@ -76,7 +76,9 @@ struct KvStreamResult final {
 
 // The history streams as /status reports them: commands that streamed, the
 // layers, pages and bytes they read, the staging they hold and its buffers,
-// and how long commands waited on their reads.
+// how long a layer's reads took from their start to their last page, which
+// with the bytes gives the streams' bandwidth, and how long commands waited
+// on them.
 struct KvHistoryStreamStats final {
   uint64_t commands = 0;
   uint64_t layers = 0;
@@ -84,7 +86,7 @@ struct KvHistoryStreamStats final {
   uint64_t bytes = 0;
   uint64_t stagingBytes = 0;
   uint32_t buffers = 0;
-  LatencyStats wait;
+  LatencyStats read, wait;
 };
 
 } // namespace splash::model
