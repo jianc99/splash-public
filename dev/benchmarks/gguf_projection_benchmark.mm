@@ -1,6 +1,6 @@
 // GPU time of one GGUF projection through ops::Linear on both decode tiles (the Apple9 register tile and the staged
-// tile, on the device policy's walk) at one to four lanes and every K split, the measurements behind the tile rule and
-// split tiers of runtime/ops/LinearGguf.cpp:
+// tile, on the device policy's walk, one lane on its 8- and 16-row tiles) at one to four lanes and every K split, the
+// measurements behind the tile rule and split tiers of runtime/ops/LinearGguf.cpp:
 //   gguf-projection-benchmark <metallib> <fmt[+fmt+fmt]> <N[+N+N]> <K> [none|residual|gateup] [rounds]
 //                             [prefill=R[,R...]]
 // The projection has one segment per format and width (up to three, fused, no epilogue), each a multiple of 64
@@ -153,11 +153,17 @@ int main(int argc, char **argv) {
                 }))
               continue;
             if (!registerTile && (K / 32) % splits) continue;
-            const LinearConfig config{.tile = tile, .splits = splits, .spread = !registerTile && wide.spread,
-                                      .oneGateUpPass = !registerTile && wide.oneGateUpPass};
-            cases.push_back({"L" + std::to_string(lanes),
-                             std::string(registerTile ? "register" : "staged") + " S" + std::to_string(splits),
-                             Linear::plan(w, config, FloatOutput::BFloat16), config == policy, {}});
+            // One lane stages on the 8-row tile and on the 16-row tile (staged16).
+            for (const bool sixteenRows : {false, true}) {
+              if (sixteenRows && (registerTile || lanes > 1)) continue;
+              const LinearConfig config{.tile = tile, .splits = splits, .spread = !registerTile && wide.spread,
+                                        .oneGateUpPass = !registerTile && wide.oneGateUpPass,
+                                        .sixteenRows = sixteenRows};
+              cases.push_back({"L" + std::to_string(lanes),
+                               std::string(registerTile ? "register" : sixteenRows ? "staged16" : "staged") + " S" +
+                                   std::to_string(splits),
+                               Linear::plan(w, config, FloatOutput::BFloat16), config == policy, {}});
+            }
           }
       }
       // Buffers of the widest plan; the scratch of the plan that needs the most.

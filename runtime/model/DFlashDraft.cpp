@@ -225,6 +225,24 @@ void DFlashDraft::addContextKv(metal::CommandGraph &graph,
   }
 }
 
+uint32_t DFlashDraft::decodeStorageLanes(uint32_t lanes) const {
+  const ops::Linear &linear = operators_.linear();
+  const uint32_t rows = lanes * ExecutionLimits::draftQueryRows;
+  uint32_t storageRows = rows;
+  const auto include = [&](const ops::Projection &p) {
+    storageRows = std::max(storageRows, linear.decodeStorageRows(rows, p.shape()));
+  };
+  for (const DFlashDraftLayerWeights &layer : weights_.layers)
+    for (const ops::Projection *p : {&layer.attentionDynamic, &layer.qkvProjection, &layer.outputProjection,
+                                     &layer.mlpDynamic, &layer.gateProjection, &layer.upProjection,
+                                     &layer.downProjection})
+      include(*p);
+  include(weights_.contextProjection);
+  include(weights_.selectorProjection);
+  for (const ops::Projection &p : contextKvProjections_) include(p);
+  return storageRows / ExecutionLimits::draftQueryRows;
+}
+
 void DFlashDraft::addDecode(
     metal::CommandGraph &graph, DFlashDecodeBuffers buffers,
     const ops::Projection &vocabularyProjection,

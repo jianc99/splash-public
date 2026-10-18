@@ -410,8 +410,9 @@ public:
   // Lanes of storage the tensors of a decode step of `lanes` lanes bind: a
   // linear tile may hold more rows than the step (LinearPlan::storageRows;
   // a three-lane GGUF step on the staged tile runs its 32-row tile over four
-  // lanes). Every op still processes the step's lanes; padding rows read
-  // stale activations and write results no active row reads.
+  // lanes, a one-lane step may run its 16-row tile over two). Every op still
+  // processes the step's lanes; padding rows read stale activations and write
+  // results no active row reads.
   [[nodiscard]] uint32_t decodeStorageLanes(uint32_t lanes) const;
 
   // A prefill command of one or more chunks (a prefill group), run layer by

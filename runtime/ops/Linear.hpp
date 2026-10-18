@@ -94,6 +94,10 @@ struct LinearConfig final {
   // each stage both tensors' 32 columns (gguf_decode_<format>_m<rows>_gate_up,
   // gate and up in one format), instead of a gate pass and an up pass.
   bool oneGateUpPass = false;
+  // GgufStaged one-lane decode: the 16-row tile over two lanes of storage
+  // (LinearPlan::storageRows), whose padding lane's rows it computes and
+  // discards, instead of the 8-row tile.
+  bool sixteenRows = false;
   [[nodiscard]] constexpr bool validSplits() const noexcept {
     return splits && splits <= kMaximumSplits && !(splits & (splits - 1));
   }
@@ -278,10 +282,15 @@ public:
 private:
   // The device's configuration of the workload; the tile may follow the
   // formats of the projections it runs (LinearGguf.cpp), or without them
-  // whether those formats are all the register tile's and of four bits.
+  // those of a projection of `shape`.
   [[nodiscard]] LinearConfig ggufBaseline(LinearWorkload workload,
                                           std::span<const Projection *const> projections = {},
-                                          bool registerFormats = true, bool fourBits = true) const;
+                                          ProjectionShape shape = {}) const;
+  // Whether one decode lane runs its staged plan of `splits` K partitions on
+  // the 16-row tile (LinearConfig::sixteenRows), by the projections' formats
+  // or without them `shape`'s.
+  [[nodiscard]] bool sixteenRowLane(LinearWorkload workload, uint32_t splits,
+                                    std::span<const Projection *const> projections, ProjectionShape shape) const;
   // The partials and counters a dispatch of `splits` K partitions binds: the
   // scratch's, or for one partition, which reads neither, the output.
   [[nodiscard]] static std::array<metal::MetalBuffer, 2> splitScratch(const LinearBuffers &buffers,

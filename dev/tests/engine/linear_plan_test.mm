@@ -422,6 +422,136 @@ void ggufPlans() {
         }
       }
   }
+  // Apple10 decodes one lane of a projection whose quantized segments store
+  // fewer than four and a half bits per weight together, float segments
+  // aside, on the 16-row tile where its staged plan runs unsplit, and a
+  // gate/up pair where both its tensors' own plans do. The plan's other
+  // fields are the two-lane plan's, so the lane's sums stay those of every
+  // width, and the decode storage of its shapes holds its rows. Apple9 never
+  // does.
+  {
+    // A projection of `k` inputs in segments of (format, columns), F32 for
+    // QuantizedSegment::kFloat32.
+    using Parts = std::vector<std::pair<uint32_t, uint32_t>>;
+    const auto segments = [](uint32_t k, const Parts &parts) {
+      BlockWeights weights;
+      uint32_t n = 0;
+      for (const auto &[format, columns] : parts) {
+        weights.segments.push_back(format == QuantizedSegment::kFloat32
+                                       ? QuantizedSegment::floats(columns, k, {})
+                                       : QuantizedSegment::planes(format, columns, k, {}, {}, {}));
+        weights.segments.back().columnOffset = n;
+        n += columns;
+      }
+      return Projection(n, k, std::move(weights));
+    };
+    constexpr uint32_t kF32 = QuantizedSegment::kFloat32;
+    struct Weighed {
+      const char *projection;
+      Parts parts;
+      bool under;
+    };
+    for (const Weighed &w : {Weighed{"IQ4_XS", {{GGUF_FMT_IQ4XS, 1024}}, true},
+                             Weighed{"MXFP4", {{GGUF_FMT_MXFP4, 1024}}, true},
+                             Weighed{"MLX 4-bit in groups of 128", {{GGUF_FMT_AF4G128, 1024}}, true},
+                             Weighed{"Q4_K", {{GGUF_FMT_Q4K, 1024}}, false},
+                             Weighed{"Q4_0", {{GGUF_FMT_Q40, 1024}}, false},
+                             Weighed{"IQ4_NL", {{GGUF_FMT_IQ4NL, 1024}}, false},
+                             Weighed{"MLX 4-bit in groups of 64", {{GGUF_FMT_AF4G64, 1024}}, false},
+                             Weighed{"the 27B UD-IQ3_XXS attention input, Q2_K q beside Q4_K k and v",
+                                     {{GGUF_FMT_Q2K, 12288}, {GGUF_FMT_Q4K, 1024}, {GGUF_FMT_Q4K, 1024}}, true},
+                             Weighed{"IQ2_XXS beside as much Q8_0",
+                                     {{GGUF_FMT_IQ2XXS, 512}, {GGUF_FMT_Q80, 512}}, false},
+                             Weighed{"IQ3_XXS beside F32", {{GGUF_FMT_IQ3XXS, 1024}, {kF32, 96}}, true},
+                             Weighed{"F32 alone", {{kF32, 1024}}, false}})
+      require(segments(5120, w.parts).shape().underFourAndHalfBits == w.under,
+              std::string("the bits per weight of ") + w.projection);
+    // The 27B's 17408 x 5120 IQ3_XXS runs it on a 12-core M6 and a 32-core M5
+    // Max, its 5120 x 17408 IQ3_S on the M6 but not the M5 Max, which splits
+    // its K in four, and Q4_K on neither.
+    struct Pick {
+      const char *projection;
+      uint32_t family, cores, n, k, format;
+      bool sixteenRows;
+    };
+    constexpr Pick kPicks[] = {
+        {"IQ3_XXS 17408 x 5120, 12 cores", 11, 12, 17408, 5120, GGUF_FMT_IQ3XXS, true},
+        {"IQ3_XXS 17408 x 5120, 32 cores", 10, 32, 17408, 5120, GGUF_FMT_IQ3XXS, true},
+        {"IQ3_S 5120 x 17408, 12 cores", 11, 12, 5120, 17408, GGUF_FMT_IQ3S, true},
+        {"IQ3_S 5120 x 17408, 32 cores", 10, 32, 5120, 17408, GGUF_FMT_IQ3S, false},
+        {"Q4_K 17408 x 5120, 12 cores", 11, 12, 17408, 5120, GGUF_FMT_Q4K, false},
+        {"Q4_K 17408 x 5120, 32 cores", 10, 32, 17408, 5120, GGUF_FMT_Q4K, false},
+    };
+    for (const Pick &p : kPicks)
+      require(gpu(p.family, p.cores)
+                      .plan({{p.n, p.k}, 8, LinearPhase::Decode, kNone}, blockProjection(p.n, p.k, 1, p.format))
+                      .configuration()
+                      .sixteenRows == p.sixteenRows,
+              std::string("one lane on the 16-row tile: ") + p.projection);
+    // The 27B's gate/up pair runs one lane on the 16-row tile in two passes on
+    // 12 cores and in one on 32, but beside a Q4_K gate; a pair of 8192
+    // columns, unsplit in one pass on 32 cores where each tensor splits, does
+    // not.
+    for (const uint32_t cores : {12U, 32U}) {
+      const Linear device = gpu(11, cores);
+      const auto pair = [&](uint32_t n, uint32_t gateFormat) {
+        const Projection gate = blockProjection(n, 5120, 1, gateFormat);
+        return device.plan({{n, 5120}, 8, LinearPhase::Decode, kGateUp}, blockProjection(n, 5120, 1, GGUF_FMT_IQ3XXS),
+                           &gate).configuration();
+      };
+      const LinearConfig iq = pair(17408, GGUF_FMT_IQ3XXS), wide = pair(8192, GGUF_FMT_IQ3XXS);
+      require(iq.sixteenRows && iq.oneGateUpPass == (cores == 32) && !pair(17408, GGUF_FMT_Q4K).sixteenRows &&
+                  (cores == 12 || (wide.oneGateUpPass && wide.splits == 1 && !wide.sixteenRows)),
+              "the 16-row tile of a gate/up pair at " + std::to_string(cores) + " cores");
+    }
+    // The projection of `formats`, with a float segment of 64 columns last.
+    const auto withFloat = [](uint32_t n, uint32_t k, std::span<const uint32_t> formats) {
+      BlockWeights weights = blockProjection(n - 64, k, formats).blocks();
+      weights.segments.push_back(QuantizedSegment::floats(64, k, {}));
+      weights.segments.back().columnOffset = n - 64;
+      return Projection(n, k, std::move(weights));
+    };
+    using Formats = std::vector<uint32_t>;
+    const std::array<Formats, 6> kFormats{Formats{GGUF_FMT_IQ3XXS}, Formats{GGUF_FMT_IQ4XS}, Formats{GGUF_FMT_Q4K},
+                                          Formats{GGUF_FMT_AF4G64}, Formats{GGUF_FMT_IQ3XXS, GGUF_FMT_Q4K},
+                                          Formats{GGUF_FMT_IQ2XXS, GGUF_FMT_Q80}};
+    for (const uint32_t family : {9U, 10U, 11U})
+      for (uint32_t cores = 0; cores <= 128; ++cores) {
+        const Linear device = gpu(family, cores);
+        for (const auto [n, k] : {std::pair{17408U, 5120U}, {5120U, 17408U}, {16384U, 5120U}, {248320U, 5120U},
+                                  {1024U, 5120U}})
+          for (const Formats &formats : kFormats) {
+            const Projection plain = blockProjection(n, k, formats), mixed = withFloat(n, k, formats),
+                             q4kGate = blockProjection(n, k, 1);
+            const auto alone = [&](const Projection &p) {
+              return device.plan({{n, k}, 8, LinearPhase::Decode, kNone}, p).configuration().sixteenRows;
+            };
+            for (const auto &[p, gate, epilogue] :
+                 {std::tuple<const Projection *, const Projection *, LinearEpilogue>{&plain, nullptr, kNone},
+                  {&plain, nullptr, kResidual}, {&mixed, nullptr, kNone}, {&plain, &plain, kGateUp},
+                  {&plain, &q4kGate, kGateUp}}) {
+              if (gate && formats.size() > 1) continue;
+              const LinearPlan one = device.plan({{n, k}, 8, LinearPhase::Decode, epilogue}, *p, gate),
+                               two = device.plan({{n, k}, 16, LinearPhase::Decode, epilogue}, *p, gate);
+              LinearConfig config = one.configuration();
+              const bool sixteen = gate ? alone(*p) && alone(*gate)
+                                        : family >= 10 && config.tile == LinearTile::GgufStaged &&
+                                              config.splits == 1 && p->shape().underFourAndHalfBits;
+              uint32_t storage = device.decodeStorageRows(8, p->shape());
+              if (gate) storage = std::max(storage, device.decodeStorageRows(8, gate->shape()));
+              require(config.sixteenRows == sixteen && one.storageRows() == (sixteen ? 16U : 8U) &&
+                          (gate ? one.storageRows() <= storage : one.storageRows() == storage),
+                      "one lane on the 16-row tile: family " + std::to_string(family) + ", " +
+                          std::to_string(cores) + " cores, " + std::to_string(n) + " x " + std::to_string(k));
+              config.sixteenRows = false;
+              require(!sixteen || config == two.configuration(), "one lane on the 16-row tile took another plan");
+            }
+          }
+        const Projection floats = segments(5120, {{kF32, 17408}});
+        require(!device.plan({{17408, 5120}, 8, LinearPhase::Decode, kNone}, floats).configuration().sixteenRows,
+                "a projection of float segments alone took the 16-row tile");
+      }
+  }
   // Apple9's staged tile, in decode and in prefill chunks, splits K by the
   // register tile's tiers: on 40 cores 17408 x 5120 in four, 5120 x 17408 in
   // eight.
@@ -508,6 +638,16 @@ void ggufPlans() {
         (void)Linear::plan(down, {.tile = LinearTile::GgufStaged, .oneGateUpPass = true}, FloatOutput::BFloat16);
       },
       "only a staged block gate/up decode runs gate and up in one pass", "a residual plan ran gate/up in one pass");
+  // The 16-row tile holds one lane's decode rows on the staged tile only.
+  for (const auto &[w, config] :
+       {std::pair{down, LinearConfig{.tile = LinearTile::GgufRegister, .sixteenRows = true}},
+        {LinearWorkload{down.matrix, 16, LinearPhase::Decode, LinearEpilogue::Residual},
+         LinearConfig{.tile = LinearTile::GgufStaged, .sixteenRows = true}},
+        {LinearWorkload{down.matrix, 8, LinearPhase::Prefill, LinearEpilogue::Residual},
+         LinearConfig{.tile = LinearTile::GgufStaged, .sixteenRows = true}}})
+    rejects([&] { (void)Linear::plan(w, config, FloatOutput::BFloat16); },
+            "only a staged one-lane block decode runs the 16-row tile",
+            "the 16-row tile took other rows than one decode lane's or another tile");
   rejects([&] { (void)Linear::plan(chunk, {.tile = LinearTile::GgufPrefill, .spread = true}, FloatOutput::BFloat16); },
           "only the staged block tile spreads its walks", "the prefill tile spread its walks");
 }

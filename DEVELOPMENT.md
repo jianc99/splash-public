@@ -2255,7 +2255,13 @@ dispatch (`LinearConfig::oneGateUpPass`), each simdgroup staging both tensors' c
 chain's serial steps serve both. Its output is bitwise the two passes' at the same K split; it
 splits K as one projection of the pair's columns, and where that split differs from theirs, its
 sums are reassociated. A step of three request lanes runs the 32-row tile over four lanes of
-storage. Prefill runs the staged kernels on both families: the 128-row prefill tile
+storage. On Apple10 one lane runs the 16-row tile over two lanes of storage
+(`LinearConfig::sixteenRows`), its padding lane computed and discarded, where its staged plan is
+unsplit and the projection's quantized segments store fewer than four and a half bits per weight
+together (`ProjectionShape::underFourAndHalfBits`), a gate/up pair where both its tensors' own
+plans do: the lane's rows are bitwise the 8-row tile's, in less time (the 27B UD-IQ3_XXS decodes
+one lane 3.3-3.6% faster on a 12-core M6). Split plans take more time on it, as does Q4_K's
+4.5 bits on the M6. Prefill runs the staged kernels on both families: the 128-row prefill tile
 (`LinearTile::GgufPrefill`), and the staged tile for chunks of up to 32 rows. Every projection
 splits its K across threadgroups by one rule (`decodeSplits`: each tile's tiers of threadgroups
 per core and inputs per partition, from measured occupancy, Apple9's staged tile taking the
@@ -2323,8 +2329,9 @@ PQ2_0 token gather bitwise against the fp32 butterflies and within one bf16 step
 decode tiles run on every GPU, each in every format it takes (the register tile all but F16), at
 one to four lanes, every K split and epilogue, fused segments, every format's gate with the next
 format's up and the prefill tiles, each output inside the fp64 bound of
-`GgufFormatReference.hpp`, and the one-pass gate/up bitwise against the two passes at the same K
-split; and `gguf-moe`: the float projections on both float tiles and the MoE layer on every GGUF
+`GgufFormatReference.hpp`, the one-pass gate/up bitwise against the two passes at the same K
+split, and one lane on the staged 16-row tile bitwise against the 8-row tile; and
+`gguf-moe`: the float projections on both float tiles and the MoE layer on every GGUF
 plan, the staged 8- and 32-row tiles and the Apple9 register tile whatever GPU runs it, each in
 every format it takes as each routed and shared expert tensor, against fp64, and bitwise against
 the full grids and two gate/up passes. The goldens and how to regenerate them are
@@ -2334,11 +2341,11 @@ in `dev/tests/fixtures/weight-goldens/`; with `SPLASH_GGML_ORACLE=<libggml-base.
 Two benchmark tools repeat the measurements behind the GGUF split tiers and MoE plans, with the
 weights DRAM-cold. `make benchmark-gguf-projection GGUF_PROJECTION_ARGS='q4k 5120 8192'` times one
 projection (up to three fused formats and widths, then `K` and an optional epilogue) on both
-decode tiles at one to four lanes and every K split, and marks the device policy's pick, or, with
-a trailing `prefill=R[,R...]` after the epilogue and the round count, one format's 128-row
-prefill tile at each chunk of `R` rows (more than 32);
-`make benchmark-gguf-moe` times one MoE layer at the 35B shape on the device's plans and the
-other GGUF tile.
+decode tiles at one to four lanes (one lane also on the staged 16-row tile, `staged16`) and
+every K split, and marks the device policy's pick, or, with a trailing `prefill=R[,R...]`
+after the epilogue and the round count, one format's 128-row prefill tile at each chunk of `R`
+rows (more than 32); `make benchmark-gguf-moe` times one MoE layer at the 35B shape on the
+device's plans and the other GGUF tile.
 
 ### Sparse attention
 
