@@ -254,6 +254,9 @@ public:
                          std::span<const DFlashDraftRingLayer> ring,
                          uint32_t rows, uint32_t startPosition) const;
 
+  // Lanes of storage the draft's own projections bind in a decode step or
+  // context commit of `lanes` lanes (ops::Linear::decodeStorageRows).
+  [[nodiscard]] uint32_t decodeStorageLanes(uint32_t lanes) const;
   void addDecode(metal::CommandGraph &graph, DFlashDecodeBuffers buffers,
                  const ops::Projection &vocabularyProjection,
                  std::span<const uint32_t> cacheLengths) const;

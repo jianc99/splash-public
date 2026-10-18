@@ -1713,6 +1713,13 @@ struct Runtime::Impl {
     }
   }
 
+  // Lanes of storage a draft step of `lanes` lanes binds: its own
+  // projections' and the target's, whose vocabulary head it shares.
+  uint32_t draftStorageLanes(uint32_t lanes) const {
+    return std::max(targetModel->decodeStorageLanes(lanes),
+                    draftModel.decodeStorageLanes(lanes));
+  }
+
   void encodeDraftBatchGraph(CommandGraph &graph,
                              std::span<Request *const> entries,
                              std::span<const uint64_t> logicalPositions) {
@@ -1721,8 +1728,7 @@ struct Runtime::Impl {
       throw std::invalid_argument("invalid draft decode batch");
     }
     const uint32_t lanes = static_cast<uint32_t>(entries.size());
-    // The draft shares the target's vocabulary head and its storage rows.
-    const uint32_t storage = targetModel->decodeStorageLanes(lanes);
+    const uint32_t storage = draftStorageLanes(lanes);
     auto d = [&](DecodeTensor tensor) {
       return decodeArena->batchSlice(tensor, storage);
     };
@@ -1877,9 +1883,7 @@ struct Runtime::Impl {
       throw std::invalid_argument("invalid draft state commit batch");
     }
     const uint32_t lanes = static_cast<uint32_t>(entries.size());
-    // The draft's projections take the target's storage rows, as in its
-    // decode (encodeDraftBatchGraph).
-    const uint32_t storage = targetModel->decodeStorageLanes(lanes);
+    const uint32_t storage = draftStorageLanes(lanes);
     auto d = [&](DecodeTensor tensor) {
       return decodeArena->batchSlice(tensor, storage);
     };
