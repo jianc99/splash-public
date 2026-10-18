@@ -3010,9 +3010,10 @@ struct SpillRecord final {
 // pages' entries are; the reads read history and blocks, hit and miss, and
 // add at most two command buffers an attention layer to a command, whatever
 // its history (of the queue's 512, which the backend checks for every
-// command); and an idle reclaim gives their memory back one unit at a time,
-// the staging, then each extent of the hot block cache above its lanes'
-// floors. Then a
+// command); the first decoding lane's floor of the hot block cache takes
+// the place of the staging the last prompt left; and an idle reclaim gives
+// their memory back one unit at a time, each extent of the hot block cache
+// above its lanes' floors. Then a
 // command's reads streamed again, as a Neural Engine rerun streams them,
 // keep what they could not read; a copy that cannot be read fails the
 // prefill command that streams it, which commits nothing and gives the same
@@ -3073,7 +3074,10 @@ void requireSpilledKvMatchesResident(metal::MetalBackend &backend, const model::
         took();
       }
     };
+    const uint64_t staging = spill.historyStream().stats().stagingBytes;
     cycles({&requests[0]}, 1);
+    require(!requests[0].holdsIndexPages() || (staging && !spill.historyStream().stats().stagingBytes),
+            "a decoding lane's floor of the hot block cache did not take the place of the idle staging");
     cycles({&requests[0], &requests[1], &requests[2], &requests[3]}, kCycles);
     spill.end(requests[1]);
     spill.end(requests[3]);
@@ -3114,13 +3118,12 @@ void requireSpilledKvMatchesResident(metal::MetalBackend &backend, const model::
             << " command_buffers=" << std::ranges::max(spilled.commandBuffers) << '\n';
 
   // With every request ended, an idle reclaim gives back, after the pooled
-  // buffers, the staging and then the hot block cache above its floors, an
-  // extent at a time.
+  // buffers, the hot block cache above its floors, an extent at a time (the
+  // decoding lanes' floors took the staging's place).
   while (runtime.reclaimIdleState(true, IdleMemory::Buffers)) {
   }
-  require(history.stagingBytes && reads.bytes > reads.floorBytes &&
-              runtime.reclaimIdleState(true, IdleMemory::BuffersThenCaches) == history.stagingBytes,
-          "an idle reclaim did not give back the staging first");
+  require(!history.stagingBytes && reads.bytes > reads.floorBytes,
+          "the staging stayed beside the decoding lanes' floors of the hot block cache");
   const uint64_t extent = runtime.reclaimIdleState(true, IdleMemory::BuffersThenCaches);
   uint64_t released = extent;
   while (const uint64_t bytes = runtime.reclaimIdleState(true, IdleMemory::BuffersThenCaches)) {

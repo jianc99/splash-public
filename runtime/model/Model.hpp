@@ -734,9 +734,10 @@ public:
   // Memory for reads of a request's spilled K/V, taken between commands and
   // held until it ends or is suspended; a model that reads none grants it at
   // once, taking nothing. The hot block cache's floor for the request's lane,
-  // which decodes over Index pages (model::KvBlockCache::reserveLane); the
-  // staging of a prefill's history of `pages` pages, which holds Index
-  // pages, the request's while its prompt goes on, also once refused
+  // which decodes over Index pages (model::KvBlockCache::reserveLane), in
+  // place of the staging once no prompt holds it; the staging of a
+  // prefill's history of `pages` pages, which holds Index pages, the
+  // request's while its prompt goes on, also once refused
   // (model::KvHistoryStream::reserve); and, optionally, one more
   // extent of the hot block cache toward its planned size
   // (model::KvBlockCache::growTowardTarget).

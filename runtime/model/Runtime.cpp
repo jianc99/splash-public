@@ -635,7 +635,9 @@ struct Runtime::Impl {
   // Whether the history's staging is still a prompt's: that of the request
   // it was last reserved for, while the request is resident and its prompt
   // goes on. Releasing it would only make its next command allocate it
-  // again, and could never fund its own growth.
+  // again, and could never fund its own growth. Once it is not, a decoding
+  // lane's floor replaces it (reserveSpilledReads), or an idle reclaim
+  // gives it back.
   [[nodiscard]] bool stagingHeld() const noexcept {
     const auto holder = requests.find(stagingRequest);
     return holder != requests.end() && holder->second.resident && !holder->second.promptComplete;
@@ -2996,9 +2998,17 @@ uint32_t Runtime::statesToActivate() const noexcept {
   return impl_->states.statesToActivate();
 }
 
+// A prompt reads its spilled history through the staging, a decode through
+// the hot block cache: the floor a decoding lane takes replaces the staging
+// once no prompt holds it, so a lane never holds both (the memory plan
+// counts the larger of the two). The staging holds nothing between
+// commands, and a next prompt allocates it again as it streams; the hot
+// block cache keeps its blocks.
 ModelMemoryAdmission Runtime::reserveSpilledReads(uint64_t requestId) {
   const uint32_t lane = residentLane(requestId);
-  return impl_->blockCache ? impl_->blockCache->reserveLane(lane) : ModelMemoryAdmission{.ok = true};
+  if (!impl_->blockCache) return {.ok = true};
+  if (impl_->historyStream && !impl_->stagingHeld()) static_cast<void>(impl_->historyStream->releaseIdle());
+  return impl_->blockCache->reserveLane(lane);
 }
 
 // The staging is the request's from now on, also when its growth is
