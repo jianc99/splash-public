@@ -2794,7 +2794,10 @@ part, the time its GPU work waited on host steps (a streamed target's expert
 reads), and a part per row; the slice grows to twice the fixed part, so a
 command's rows take at least as long as its reads. Unopposed, a target whose
 experts stream runs its remaining chunks in as few prefill groups of up to four
-as hold them, evenly split. A lane whose history holds KV only the SSD cache has
+as hold them, evenly split, and so does a request whose KV spills to the SSD
+cache, which reads its history once a group; one whose KV stays in memory on a
+target whose experts load whole runs chunks, so a request that arrives beside it
+waits for a chunk. A lane whose history holds KV only the SSD cache has
 reads all of that history in each command, whatever its rows: it runs alone,
 and contended it takes the fewest rows, halving from its group's, whose time
 still covers its own running estimate of that wait, and never fewer than another
