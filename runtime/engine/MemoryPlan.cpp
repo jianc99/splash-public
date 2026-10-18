@@ -150,10 +150,10 @@ KvSpillPlan planSpill(const StreamedMemoryInputs &in, uint64_t floors) {
   return spill;
 }
 
-// The plan of the parts as resolved beside arenas of `arenaBytes`
-// (planStreamedMemory).
+// The plan of the parts as resolved beside arenas of `arenaBytes`, or of
+// `spillArenaBytes` where the plan spills (planStreamedMemory).
 StreamedMemoryResult planParts(const StreamedMemoryInputs &in, const Part &experts, const Part &table,
-                               uint64_t arenaBytes) {
+                               uint64_t arenaBytes, uint64_t spillArenaBytes) {
   const kv::Layout &layout = in.kvLayout;
   const auto overflow = [] { return StreamedMemoryResult{std::nullopt, "the memory plan overflows uint64"}; };
   // The floors: what loads, the arenas and the stores at their floors, a
@@ -166,8 +166,13 @@ StreamedMemoryResult planParts(const StreamedMemoryInputs &in, const Part &exper
   if (!minimum) return overflow();
   const uint64_t runwayBytes = *minimum - loaded - in.laneStateBytes;
   uint64_t floors = *minimum;
-  StreamedMemoryPlan plan{.spill = planSpill(in, floors)};
+  // A plan that spills holds the arenas of a runtime whose K/V spills
+  // instead, at least as large, beside which its spill floors must fit.
+  uint64_t spillFloors = 0;
+  if (!checkedAdd(floors, remaining(spillArenaBytes, arenaBytes), spillFloors)) return overflow();
+  StreamedMemoryPlan plan{.spill = planSpill(in, spillFloors)};
   KvSpillPlan &spill = plan.spill;
+  if (spill.enabled) floors = spillFloors;
   if (!checkedAdd(floors, spill.floorBytes, floors)) return overflow();
   if (floors > in.hardBudgetBytes)
     return {std::nullopt,
@@ -374,7 +379,8 @@ StreamedMemoryResult planStreamedMemory(const StreamedMemoryInputs &in) {
   // arenas it was made with after three at most.
   bool expertsStream = experts->streams, tableStreams = table->streams;
   for (;;) {
-    StreamedMemoryResult result = planParts(in, *experts, *table, in.arenaBytes[expertsStream][tableStreams]);
+    StreamedMemoryResult result = planParts(in, *experts, *table, in.arenaBytes[expertsStream][tableStreams],
+                                            in.spillArenaBytes[tableStreams]);
     if (!result.plan || ((expertsStream || !result.plan->expertBytes) && (tableStreams || !result.plan->tableBytes)))
       return result;
     expertsStream = expertsStream || result.plan->expertBytes;
