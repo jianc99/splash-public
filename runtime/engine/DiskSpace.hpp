@@ -64,6 +64,10 @@ inline constexpr uint64_t kAutomaticCacheDiskBytes = uint64_t{32} << 30;
 //   min(quota, max(0, available + held - floor)).
 [[nodiscard]] uint64_t diskActiveLimitBytes(uint64_t quotaBytes, uint64_t availableBytes,
                                             uint64_t heldBytes, uint64_t floorBytes) noexcept;
+// That limit on `volume`, where the tier's files hold `heldBytes`; the quota
+// on a volume the tier does not follow, one not local or not measured.
+[[nodiscard]] uint64_t volumeActiveLimitBytes(uint64_t quotaBytes, const std::optional<DiskVolume> &volume,
+                                              uint64_t heldBytes) noexcept;
 
 // Why the automatic quota leaves the tier off on this volume, where the
 // tier's files would already hold `heldBytes`: it cannot be measured, it is

@@ -59,6 +59,13 @@ uint64_t diskActiveLimitBytes(uint64_t quotaBytes, uint64_t availableBytes, uint
   return std::min(quotaBytes, diskRoomBytes(availableBytes, heldBytes, floorBytes));
 }
 
+uint64_t volumeActiveLimitBytes(uint64_t quotaBytes, const std::optional<DiskVolume> &volume,
+                                uint64_t heldBytes) noexcept {
+  if (!volume || !volume->local)
+    return quotaBytes;
+  return diskActiveLimitBytes(quotaBytes, volume->availableBytes, heldBytes, diskFloorBytes(volume->sizeBytes));
+}
+
 std::optional<std::string> automaticDiskRefusal(const std::optional<DiskVolume> &volume,
                                                 uint64_t heldBytes, uint64_t minimumBytes) {
   if (!volume)
@@ -126,8 +133,7 @@ void DiskSpace::measure(std::optional<DiskVolume> volume) {
   const uint64_t quota = budget_->capacityBytes();
   const uint64_t rootLimit =
       followed() ? diskLimitBytes(quota, volume_->availableBytes, heldBytes_, floor) : quota;
-  const uint64_t activeLimit =
-      followed() ? diskActiveLimitBytes(quota, volume_->availableBytes, heldBytes_, floor) : quota;
+  const uint64_t activeLimit = volumeActiveLimitBytes(quota, volume_, heldBytes_);
   // The root holds more than its limit: another model's cache nobody holds
   // goes, the oldest first, before a copy of this one's. One someone took
   // meanwhile is that process's to count.
