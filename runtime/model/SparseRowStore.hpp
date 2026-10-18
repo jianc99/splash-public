@@ -176,12 +176,17 @@ public:
 
   // The cache holds its rows in chunks: one row, its floor, and then rows of
   // options.chunkBytes each, the last one shorter. The index, the ids and
-  // the recency links stay sized for the plan. releaseChunk() gives back the
-  // last chunk above the floor, its rows leaving the cache, and returns its
-  // bytes, zero at the floor; growChunk() allocates the next chunk toward
-  // the plan through `admit`, which refused it changes nothing, and does
-  // nothing at the plan. Both take the engine's thread, between commands or
-  // beside stages and prefetches, which only find fewer rows cached.
+  // the recency links stay sized for the plan. A chunk holds memory of the
+  // host's only once rows were copied into it, and rows fill the chunks in
+  // order. releaseChunk() gives back, from the last chunk above the floor
+  // down, the chunks that hold no row and then the one that holds the
+  // cache's last rows, which leave the cache, and returns the bytes those
+  // rows held, what the host gets back; zero when no chunk above the floor
+  // holds a row, the cache then at its floor. releasedBytes() counts every
+  // chunk given back. growChunk() allocates the next chunk toward the plan
+  // through `admit`, which refused it changes nothing, and does nothing at
+  // the plan. Both take the engine's thread, between commands or beside
+  // stages and prefetches, which only find fewer rows cached.
   uint64_t releaseChunk();
   [[nodiscard]] metal::AllocationResult growChunk(const metal::AllocationAdmission &admit);
 
