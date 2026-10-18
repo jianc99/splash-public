@@ -695,9 +695,10 @@ void testOverridesAndRefusals() {
           "floors beyond the budget were planned");
 }
 
-// A target spills only with a spillable layout, its shape and an SSD cache
-// that takes writes, and only where its floors hold an empty Spill request;
-// otherwise it plans as a dense target.
+// A target spills only with a spillable layout, its shape without a local
+// window its rows read whole, and an SSD cache that takes writes, and only
+// where its floors hold an empty Spill request; otherwise it plans as a dense
+// target.
 void testSpillNeedsATierAndRoom() {
   StreamedMemoryInputs inputs = kFlashNext.inputs(kStudio);
   inputs.tierWritable = false;
@@ -705,6 +706,9 @@ void testSpillNeedsATierAndRoom() {
   inputs = kFlashNext.inputs(kStudio);
   inputs.sparseKv.reset();
   require(!requirePlan(inputs).spill.enabled, "a target spilled without declaring its sparse attention");
+  inputs = kFlashNext.inputs(kStudio);
+  inputs.sparseKv->localTokens = 128;
+  require(!requirePlan(inputs).spill.enabled, "a target whose rows read a local window spilled");
   inputs = k35BQ2.inputs(kStudio);
   inputs.sparseKv = test::sparseKvShape();
   require(!requirePlan(inputs).spill.enabled, "a layout that cannot spill spilled");
