@@ -1258,11 +1258,14 @@ void requireStatesCapturedInsideCommands(model::Runtime &executor, const metal::
 // the same states captured inside a chunk, at a chunk's end and at the
 // group's end. One prompt of three chunks (2048, 2048 and 512 rows; the
 // middle one carries its state through the group's scratch cell) is
-// prefilled in three commands, then on the same pages and lane in one; then
-// two lanes, one of whose rows end in the group's first chunk, each against
-// commands of the group's chunks.
+// prefilled in three commands, then on the same pages and lane in one, as
+// text and, on a target that serves vision, with an image across the first
+// chunk's end, which the group encodes in its first chunk and injects in
+// both; then two lanes, one of whose rows end in the group's first chunk,
+// each against commands of the group's chunks.
 void requirePrefillGroupMatchesItsChunks(model::Runtime &executor, const kv::PageStorage &pages,
-                                         const model::QwenStateStorage &states, std::span<const uint32_t> chat) {
+                                         const model::QwenStateStorage &states, std::span<const uint32_t> chat,
+                                         bool vision) {
   constexpr uint32_t chunk = model::ExecutionLimits::prefillTokenBudget;
   if (executor.prefillGroupRows() <= chunk) {
     std::cout << "prefill_group=SKIP (the target runs no prefill groups)\n";
@@ -1280,6 +1283,15 @@ void requirePrefillGroupMatchesItsChunks(model::Runtime &executor, const kv::Pag
     EngineRequest request = makeRequest(id, {prompt.begin(), prompt.begin() + rows}, 0);
     for (uint32_t option = 0; option < model::ExecutionLimits::maximumScoreOptions; ++option)
       request.scoreTokens.push_back(1000 + 37 * option);
+    return request;
+  };
+  // The same pixels in every request, under a digest of its own, so that
+  // each request encodes the image itself.
+  const auto withImage = [&](EngineRequest request) {
+    request.images = {{chunk - 16, 64, 16, 16, request.id, 0}};
+    request.imagePixels.resize(request.images.front().pixelBytes());
+    for (size_t index = 0; index < request.imagePixels.size(); ++index)
+      request.imagePixels[index] = static_cast<uint8_t>(index * 13 + 7);
     return request;
   };
   constexpr std::array<uint32_t, 4> capturedAt{1024, chunk, chunk + 1024, rows};
@@ -1303,48 +1315,55 @@ void requirePrefillGroupMatchesItsChunks(model::Runtime &executor, const kv::Pag
     return bytes;
   };
   // Every captured state holds a whole draft window (planDraftContext).
-  const auto start = [&](uint64_t id) {
-    beginCold(executor, scoring(id), 0);
+  const auto start = [&](uint64_t id, bool image) {
+    beginCold(executor, image ? withImage(scoring(id)) : scoring(id), 0);
     executor.setDraftContextPlan(id, planDraftContext(0, rows, capturedAt));
   };
-  start(501);
-  std::vector<std::shared_ptr<const CompositeState>> chunked;
-  ModelStepResult last;
-  for (uint32_t begin = 0; begin < rows; begin += chunk) {
-    last = prefill(501, begin, std::min(rows, begin + chunk));
-    chunked.insert(chunked.end(), last.capturedStates.begin(), last.capturedStates.end());
-  }
-  const std::vector<std::vector<uint8_t>> chunkedKv = kvBytes();
-  const model::QwenLogicalLengths chunkedLengths = states.metadata(0).lengths;
-  const std::vector<uint8_t> chunkedCell = bytesOf(states.current(0).stateBase);
-  const std::vector<std::vector<uint16_t>> chunkedRings = committedState(executor, states, 0).rings;
-  const std::vector<uint8_t> chunkedWindow = bytesOf(states.window(0));
-  executor.end(501);
-  start(502);
-  const ModelStepResult group = prefill(502, 0, rows);
-  require(group.scoreLogits == last.scoreLogits, "a prefill group's score logits differ from its chunks'");
-  require(kvBytes() == chunkedKv, "a prefill group's KV differs from its chunks'");
-  require(states.metadata(0).lengths == chunkedLengths && bytesOf(states.current(0).stateBase) == chunkedCell,
-          "a prefill group's GDN cell, PLE history or lengths differ from its chunks'");
-  require(committedState(executor, states, 0).rings == chunkedRings && bytesOf(states.window(0)) == chunkedWindow,
-          "a prefill group's draft rings or window differ from its chunks'");
-  executor.end(502);
-  require(chunked.size() == capturedAt.size() && group.capturedStates.size() == capturedAt.size(),
-          "a prefill group or its chunks did not capture every state");
-  // A state's window holds the rows of the positions below its boundary; a
-  // state captured before a whole window's rows keeps in its other slots
-  // what its lane held, which differs between the requests.
   const uint32_t width = states.layout().draft.contextWidth;
-  for (size_t index = 0; index < capturedAt.size(); ++index) {
-    const StateBytes left = restoredBytes(executor, states, 510, 2, tokens, capturedAt[index], chunked[index]);
-    const StateBytes right =
-        restoredBytes(executor, states, 510, 2, tokens, capturedAt[index], group.capturedStates[index]);
-    const std::string at = std::to_string(capturedAt[index]);
-    require(left.cell == right.cell, "the GDN cell of the state a prefill group captured at " + at +
-                                         " differs from its chunks'");
-    require(windowRows(left.window, width, capturedAt[index]) == windowRows(right.window, width, capturedAt[index]),
-            "the window of the state a prefill group captured at " + at + " differs from its chunks'");
-  }
+  const auto oneLane = [&](bool image) {
+    const uint64_t chunks = image ? 503 : 501, grouped = chunks + 1;
+    const std::string which = image ? "a prefill group with an image" : "a prefill group";
+    start(chunks, image);
+    std::vector<std::shared_ptr<const CompositeState>> chunked;
+    ModelStepResult last;
+    for (uint32_t begin = 0; begin < rows; begin += chunk) {
+      last = prefill(chunks, begin, std::min(rows, begin + chunk));
+      chunked.insert(chunked.end(), last.capturedStates.begin(), last.capturedStates.end());
+    }
+    const std::vector<std::vector<uint8_t>> chunkedKv = kvBytes();
+    const model::QwenLogicalLengths chunkedLengths = states.metadata(0).lengths;
+    const std::vector<uint8_t> chunkedCell = bytesOf(states.current(0).stateBase);
+    const std::vector<std::vector<uint16_t>> chunkedRings = committedState(executor, states, 0).rings;
+    const std::vector<uint8_t> chunkedWindow = bytesOf(states.window(0));
+    executor.end(chunks);
+    start(grouped, image);
+    const ModelStepResult group = prefill(grouped, 0, rows);
+    require(group.scoreLogits == last.scoreLogits, which + ": its score logits differ from its chunks'");
+    require(kvBytes() == chunkedKv, which + ": its KV differs from its chunks'");
+    require(states.metadata(0).lengths == chunkedLengths && bytesOf(states.current(0).stateBase) == chunkedCell,
+            which + ": its GDN cell, PLE history or lengths differ from its chunks'");
+    require(committedState(executor, states, 0).rings == chunkedRings && bytesOf(states.window(0)) == chunkedWindow,
+            which + ": its draft rings or window differ from its chunks'");
+    executor.end(grouped);
+    require(chunked.size() == capturedAt.size() && group.capturedStates.size() == capturedAt.size(),
+            which + " or its chunks did not capture every state");
+    // A state's window holds the rows of the positions below its boundary; a
+    // state captured before a whole window's rows keeps in its other slots
+    // what its lane held, which differs between the requests.
+    for (size_t index = 0; index < capturedAt.size(); ++index) {
+      const StateBytes left = restoredBytes(executor, states, 510, 2, tokens, capturedAt[index], chunked[index]);
+      const StateBytes right =
+          restoredBytes(executor, states, 510, 2, tokens, capturedAt[index], group.capturedStates[index]);
+      const std::string at = std::to_string(capturedAt[index]);
+      require(left.cell == right.cell, "the GDN cell of the state " + which + " captured at " + at +
+                                           " differs from its chunks'");
+      require(windowRows(left.window, width, capturedAt[index]) == windowRows(right.window, width, capturedAt[index]),
+              "the window of the state " + which + " captured at " + at + " differs from its chunks'");
+    }
+  };
+  oneLane(false);
+  if (vision)
+    oneLane(true);
 
   // Two lanes in one group, the first lane's rows all in its first chunk:
   // each lane leaves what it leaves in commands of the group's chunks, the
@@ -1434,7 +1453,7 @@ void requirePrefillGroupMatchesItsChunks(model::Runtime &executor, const kv::Pag
   executor.end(522);
   while (executor.reclaimIdleState(false, IdleMemory::Buffers)) {
   }
-  std::cout << "prefill_group_matches_its_chunks=PASS\n";
+  std::cout << "prefill_group_matches_its_chunks=PASS" << (vision ? " images=PASS" : " images=SKIP") << '\n';
 }
 
 // A command's ticket holds the buffers of the states it captures once the
@@ -3586,7 +3605,8 @@ int main(int argc, char **argv) {
         279,    1534,   4087,  13,     248046, 198,   248045, 846,   198,
         9419,   248046, 198,   248045, 74455,  198,   248068, 198};
     if (prefillGroupsOnly) {
-      requirePrefillGroupMatchesItsChunks(executor, pages, states, samplingSeedTokens);
+      requirePrefillGroupMatchesItsChunks(executor, pages, states, samplingSeedTokens,
+                                          model.descriptor.hasVision());
       std::cout << "PASS model-runtime-oracle scope=prefill-groups-only model=" << model.name()
                 << " (a prefill group leaves what its chunks' commands leave)\n";
       return 0;
@@ -3700,7 +3720,8 @@ int main(int argc, char **argv) {
     requireThinkingEndVerifiesItsTokens(executor, model);
     requireStatesCapturedInsideCommands(executor, backend, pages, states, aneFfn.get(), samplingSeedTokens);
     requireCapturesOutliveTheirItems(executor, states, samplingSeedTokens);
-    requirePrefillGroupMatchesItsChunks(executor, pages, states, samplingSeedTokens);
+    requirePrefillGroupMatchesItsChunks(executor, pages, states, samplingSeedTokens,
+                                        model.descriptor.hasVision());
     requireBatchedLanesMatchReordered(executor, states, samplingSeedTokens);
 
 

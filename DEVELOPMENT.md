@@ -315,9 +315,9 @@ place (`target_weights_bytes`). Off by default.
   ([Host steps](#host-steps)), so the work after a load starts at once and at
   full clocks rather than after the GPU's wake-up.
 - A prefill command runs a group of up to four chunks of 2048 rows layer by
-  layer, so each layer's experts are read once for all of them; a prompt with
-  images runs one chunk per command. A contended prefill command's slice
-  counts the time its GPU work waited on the reads as a fixed cost
+  layer, so each layer's experts are read once for all of them, a prompt's
+  with images too. A contended prefill command's slice counts the time its
+  GPU work waited on the reads as a fixed cost
   ([Admission and eviction](#admission-and-eviction)).
 - A load checks its files unchanged after it read them. A read is tried once
   more when it fails. A load that fails (a routed expert cannot be read, or

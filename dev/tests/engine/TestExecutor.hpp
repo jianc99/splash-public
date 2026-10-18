@@ -485,6 +485,7 @@ public:
       submitObserver();
     return ticket;
   }
+  uint32_t prefillGroupRows() const noexcept override { return groupRows; }
   uint64_t snapshotBytes() const noexcept override { return stateBytes; }
   // The production model takes a cached state's buffers from its pool, or
   // with one admission, for a resident lane's page-aligned boundary, and
@@ -743,6 +744,9 @@ public:
   std::unordered_map<uint64_t, uint32_t> outputLimits;
   // The prefill steps each request took.
   std::unordered_map<uint64_t, uint32_t> prefillChunks;
+  // The most rows of a prefill command (Model::prefillGroupRows): a chunk's,
+  // or a prefill group's.
+  uint32_t groupRows = model::ExecutionLimits::prefillTokenBudget;
   // The tokens a decode step emits.
   uint32_t decodeTokens = 1;
   // The masks the model took.
