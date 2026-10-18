@@ -2723,7 +2723,7 @@ int main(int argc, char **argv) {
       std::cout << "ple_memory=" << (model.streamedTable() ? "streamed" : "ignored") << '\n';
     ops::ExecutionPlans operators(backend.capabilities());
     model::ModelMemoryPlan executorPlan =
-        model::plannedRuntimeMemory(model, operators, format, stateFormat);
+        model::plannedRuntimeMemory(model, operators, format, stateFormat, model::StreamedParts::loaded(model));
     // The memory plan with `aneFfnBytes` set aside for the prefill FFN's
     // Neural Engine split.
     const auto planMemory = [&](uint64_t aneFfnBytes) {

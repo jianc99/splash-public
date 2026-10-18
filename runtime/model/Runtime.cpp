@@ -3188,9 +3188,9 @@ void withPrefillArena(
 ModelMemoryPlan plannedRuntimeMemory(const LoadedModel &model,
                                      const ops::ExecutionPlans &operators,
                                      kv::Format kvFormat,
-                                     ops::GdnStateFormat stateFormat) {
+                                     ops::GdnStateFormat stateFormat, StreamedParts parts) {
   requireCompatibleModel(model);
-  const RuntimeGeometry geometry = RuntimeGeometry::from(model, kvFormat, stateFormat);
+  const RuntimeGeometry geometry = RuntimeGeometry::from(model, kvFormat, stateFormat, parts);
   return {model.stateLayout(stateFormat).laneBytes(),
           plannedPrefillBytes(geometry, operators),
           plannedDecodeBytes(geometry, operators)};

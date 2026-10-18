@@ -26,11 +26,13 @@ struct StreamableWeights final {
   uint64_t expertBytes = 0;
   uint64_t expertFloorBytes = 0;
   // The table a GGUF target holds (Qwen3.8-Flash-Next's PLE n-gram table):
-  // what its image takes where it loads, and the smallest row cache that
+  // what its image takes where it loads, the smallest row cache that
   // streams it, which holds one row beside its working memory
-  // (SparseRowStore); zero without one.
+  // (SparseRowStore), and the bytes of a row, which a step stages
+  // (StreamedParts::tableRowBytes); zero without one.
   uint64_t tableBytes = 0;
   uint64_t tableFloorBytes = 0;
+  uint64_t tableRowBytes = 0;
   // Why the table cannot stream (gguf::tableRows), which then loads with
   // the weights: among loadedBytes, with no part of its own.
   std::string tableRefusal;

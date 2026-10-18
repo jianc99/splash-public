@@ -6,6 +6,7 @@
 #include "ops/PagedKv.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -29,6 +30,10 @@ inline constexpr uint64_t kGiB = 1024ULL * 1024 * 1024;
 [[nodiscard]] std::optional<uint64_t>
 minimumRequiredBytes(uint64_t fixedBytes, uint64_t laneStateBytes,
                      const kv::Layout &layout) noexcept;
+
+// One request's KV capacity, in pages, of a budget of `pages` pages: the
+// whole extents of the size a pool of them takes (kv::Layout::extentPagesFor).
+[[nodiscard]] uint64_t kvCapacityPagesFor(const kv::Layout &layout, uint64_t pages) noexcept;
 
 // How a part of the weights that can stream from the SSD is held
 // (--expert-memory, --ple-memory): as the planner decides (Auto), loaded
@@ -132,10 +137,15 @@ struct ModelMemoryProfile final {
 // loaded with the arenas its geometry takes.
 struct StreamedMemoryInputs final {
   uint64_t hardBudgetBytes = 0;
-  // Everything the plan holds besides the streamed parts, the lanes' state
-  // and KV: the weights that load, the arenas, the reserves, the state
+  // Everything the plan holds besides the streamed parts, the arenas, the
+  // lanes' state and KV: the weights that load, the reserves, the state
   // staging and the Neural Engine split.
   uint64_t fixedBytes = 0;
+  // The arenas of the model's geometry (model::plannedRuntimeMemory) by what
+  // streams, [experts][table]: a target whose routed experts stream runs its
+  // prefill commands as groups, and one whose table streams stages its rows,
+  // so streaming only grows them. None before the model loads.
+  std::array<std::array<uint64_t, 2>, 2> arenaBytes{};
   uint64_t laneStateBytes = 0;
   kv::Layout kvLayout;
   // The model's window (servedContextTokens), and the context --max-context
@@ -177,16 +187,20 @@ struct StreamedMemoryResult final {
 
 // Plans the stores of the parts that stream and a spill-capable target's
 // floors from one budget (DEVELOPMENT.md, Memory and context). The floors
-// come first: the fixed bytes, a lane's state, the KV runway, the stores at
-// their floors and the spill floors at the context spilling serves. Then the
-// routed experts load whole where that leaves KV its allowance, and otherwise
-// stream through all that the allowance and the PLE table's share leave; the
-// table loads whole where the rest holds it, and otherwise streams through
-// its share, at most 2 GiB. The allowance is a spill-capable target's first
-// 64K tokens of KV; a dense target's is --max-context, or none, so that its
-// experts load wherever they fit, and the first 64K tokens once they stream.
-// An explicit setting replaces its part; one below the part's floor, and
-// floors beyond the budget, are refused.
+// come first: the fixed bytes and the arenas, a lane's state and the KV
+// runway (minimumRequiredBytes), the stores at their floors and the spill
+// floors at the context spilling serves. Then the routed experts load whole
+// where that leaves KV its allowance, and otherwise stream through all that
+// the allowance and the PLE table's share leave; the table loads whole where
+// the rest holds it, and otherwise streams through its share, at most 2 GiB.
+// The allowance is the KV of a context in the fewest pages whose whole
+// extents hold it, as one request's capacity rounds them (kvCapacityPagesFor):
+// a spill-capable target's first 64K tokens; a dense target's --max-context,
+// or none, so that its experts load wherever main loads them, and the first
+// 64K tokens once they stream. The arenas are those of the parts that
+// stream: where the plan with the arenas of fewer parts streams more, it
+// plans again with those. An explicit setting replaces its part; one below
+// the part's floor, and floors beyond the budget, are refused.
 [[nodiscard]] StreamedMemoryResult planStreamedMemory(const StreamedMemoryInputs &inputs);
 
 struct EngineMemoryPolicy {

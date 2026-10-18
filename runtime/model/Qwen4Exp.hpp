@@ -181,9 +181,10 @@ struct Qwen4ExpWeights final : QwenTargetWeightsBase {
                                                   const QwenTargetFiles &files);
 
 // The family's target (model/Qwen4ExpTarget.hpp), whose prefill commands run
-// up to `prefillChunks` chunks; the step scratch it keeps itself; and the
-// projections its hyper-connection mixes, QSA indexers and PLE layer
-// dispatch (qwenTargetGeometry).
+// up to `prefillChunks` chunks; the step scratch it keeps itself, with the
+// rows of a streamed PLE table of `tableRowBytes` each (zero: the table
+// loads); and the projections its hyper-connection mixes, QSA indexers and
+// PLE layer dispatch (qwenTargetGeometry).
 [[nodiscard]] std::unique_ptr<QwenTarget> makeQwenTarget(const Qwen4ExpWeights &weights,
                                                          const QwenTargetGeometry &geometry,
                                                          metal::MetalBackend &backend,
@@ -191,7 +192,7 @@ struct Qwen4ExpWeights final : QwenTargetWeightsBase {
                                                          uint32_t prefillChunks);
 [[nodiscard]] QwenTargetScratchBytes qwenTargetScratchBytes(const Qwen4ExpWeights &weights,
                                                             const QwenTargetGeometry &geometry,
-                                                            uint32_t prefillChunks);
+                                                            uint32_t prefillChunks, uint64_t tableRowBytes);
 void includeFamilyProjections(QwenTargetGeometry &geometry, const Qwen4ExpWeights &weights);
 // The rows of its PLE table, when it streams, that a step stages and the
 // read-ahead may have queued (SparseRowStoreOptions::stageRows and

@@ -146,10 +146,24 @@ loadModel(metal::MetalBackend &backend,
 void withPrefillArena(
     metal::MetalBackend &backend, const LoadedModel &model, const ops::ExecutionPlans &operators, kv::Format format,
     const std::function<void(const ops::PrefillFfnBuffers &, const std::array<metal::MetalBuffer, 2> &)> &use);
+// What of a model streams from the SSD, which its arenas rest on: a target
+// whose routed experts stream runs its prefill commands as groups
+// (RuntimeGeometry::prefillChunks), and the step of one whose table streams
+// stages its rows, of tableRowBytes each (zero: the table loads). loaded()
+// is what streams of `model` as it loaded.
+struct StreamedParts final {
+  bool experts = false;
+  uint64_t tableRowBytes = 0;
+
+  [[nodiscard]] static StreamedParts loaded(const LoadedModel &model) noexcept;
+};
+// The lane state and arenas of `model`'s geometry with `parts` streaming,
+// whatever streams of it as it loaded: one load plans them for every part
+// that may stream (engine::planStreamedMemory).
 [[nodiscard]] ModelMemoryPlan
 plannedRuntimeMemory(const LoadedModel &model,
                      const ops::ExecutionPlans &operators,
-                     kv::Format kvFormat, ops::GdnStateFormat stateFormat);
+                     kv::Format kvFormat, ops::GdnStateFormat stateFormat, StreamedParts parts);
 [[nodiscard]] std::unique_ptr<RuntimeModel>
 createRuntime(RuntimeContext context);
 

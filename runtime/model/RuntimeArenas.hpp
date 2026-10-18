@@ -55,9 +55,15 @@ struct RuntimeGeometry final {
   // The step scratch the target keeps itself beside the arenas.
   QwenTargetScratchBytes targetScratch{};
 
+  // The geometry of `model` as it loaded, or with `parts` streaming
+  // whatever streams of it as it loaded (plannedRuntimeMemory).
   [[nodiscard]] static RuntimeGeometry from(const LoadedModel &model,
                                             kv::Format kvFormat,
                                             ops::GdnStateFormat stateFormat) {
+    return from(model, kvFormat, stateFormat, StreamedParts::loaded(model));
+  }
+  [[nodiscard]] static RuntimeGeometry from(const LoadedModel &model, kv::Format kvFormat,
+                                            ops::GdnStateFormat stateFormat, StreamedParts parts) {
     RuntimeGeometry result;
     result.draft = model.draft.layout;
     result.target = std::visit(
@@ -66,7 +72,7 @@ struct RuntimeGeometry final {
     result.target.kvLayout = model.targetKvLayout(kvFormat);
     result.target.stateLayout = model.stateLayout(stateFormat).target;
     result.target.ropeScaling = model.descriptor.ropeScaling;
-    if (model.expertStore()) result.prefillChunks = kPrefillGroupChunks;
+    if (parts.experts) result.prefillChunks = kPrefillGroupChunks;
     if (!result.target.valid() || !result.draft.stateLayout().valid() ||
         result.target.contextTokens() != model.descriptor.capabilities.maximumContextTokens ||
         result.target.hiddenSize != result.draft.hiddenSize ||
@@ -76,7 +82,9 @@ struct RuntimeGeometry final {
     }
     // Sized from the geometry, once it is valid.
     result.targetScratch = std::visit(
-        [&](const auto &weights) { return qwenTargetScratchBytes(weights, result.target, result.prefillChunks); },
+        [&](const auto &weights) {
+          return qwenTargetScratchBytes(weights, result.target, result.prefillChunks, parts.tableRowBytes);
+        },
         model.target);
     return result;
   }
