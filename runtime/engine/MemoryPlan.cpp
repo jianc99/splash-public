@@ -135,8 +135,14 @@ KvSpillPlan planSpill(const StreamedMemoryInputs &in, uint64_t floors) {
   const uint64_t states = uint64_t{model::ExecutionLimits::maximumBatchWidth} * in.stateSlotBytes;
   spill.enabled = true;
   spill.memoryTokens = low;
+  // The room only bounds a first start's context: it follows the volume's
+  // free space, and a relaunch keeps its first engine's context, which each
+  // request's commitment checks against the room as it starts.
   spill.diskTokens = static_cast<uint32_t>(std::min<uint64_t>(
-      in.windowTokens, in.kvSlotBytes ? remaining(in.activeLimitBytes, states) / in.kvSlotBytes * kv::kPageTokens : 0));
+      in.windowTokens,
+      std::max<uint64_t>(in.relaunchContextTokens,
+                         in.kvSlotBytes ? remaining(in.activeLimitBytes, states) / in.kvSlotBytes * kv::kPageTokens
+                                        : 0)));
   spill.floorTokens = std::min({in.requestedContextTokens ? in.requestedContextTokens : in.windowTokens,
                                 spill.memoryTokens, spill.diskTokens});
   spill.stagingBuffers = room >= spillFloors.bytes(spill.floorTokens, 1) + kDoubleStagingBytes ? 2 : 1;
