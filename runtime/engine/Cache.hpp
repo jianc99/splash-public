@@ -237,6 +237,12 @@ struct CacheReclaimResult final {
 // the leaf that goes next; its buffers would give no page otherwise.
 enum class CacheReclaimMode { KeepExtents, ReleaseExtents, ReusePages };
 
+// What becomes of the Full extents a spill's moves leave empty
+// (Cache::spillWritten): they stay allocated for a reclaim to take; they
+// leave memory but one, the runway the next Full pages come from without
+// an allocation; or they all leave.
+enum class SpilledExtents : uint8_t { Kept, KeepRunway, Released };
+
 // The highest class a reclaim step may take (the class rule). Ordinary:
 // checkpoints, ordinary states and KV, for growth that can wait or yield
 // instead: a start a resident lane holds back, and the lane that would
@@ -402,10 +408,11 @@ public:
   // index form, into free Index pages, the runway's among them, and the
   // rest into extents of the index form it allocates; then refills the
   // runway, an extent's worth of free Index pages, which the next spill
-  // takes without an allocation. Denied, of the index form, when an
-  // allocation was refused: the pages it leaves Full, or the runway's;
+  // takes without an allocation; and once it stands, the Full extents the
+  // moves left empty go as `extents` says. Denied, of the index form, when
+  // an allocation was refused: the pages it leaves Full, or the runway's;
   // the caller makes room for them or does without.
-  [[nodiscard]] TokenAdmission spillWritten();
+  [[nodiscard]] TokenAdmission spillWritten(SpilledExtents extents = SpilledExtents::Kept);
   // Pages of the form that transfers in flight will free: demotions, and
   // for Full the eligible write-throughs that an Index page will take.
   [[nodiscard]] uint32_t pendingPages(kv::PageForm form) const noexcept;
@@ -859,9 +866,10 @@ private:
   // Rescans every Spill request's blocks from its dense history: a holder
   // that kept some of them Full ended or began to spill.
   void rescanSpills() noexcept;
-  // spillWritten(), or without `allocate` only its moves into free Index
-  // pages, which allocate nothing: those past them stay Full.
-  [[nodiscard]] TokenAdmission moveLandedPages(bool allocate);
+  // spillWritten(extents), or without `allocate` only its moves into free
+  // Index pages, which allocate nothing: those past them stay Full, and so
+  // do the Full extents they empty.
+  [[nodiscard]] TokenAdmission moveLandedPages(bool allocate, SpilledExtents extents = SpilledExtents::Kept);
   // The copy of the K/V on an Index page.
   [[nodiscard]] model::KvPageSource sourceOf(uint32_t page) const;
 

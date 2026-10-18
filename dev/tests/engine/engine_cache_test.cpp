@@ -4411,6 +4411,45 @@ void testSpillMovesLandedPagesToTheIndexForm() {
   spill.cache.checkInvariants();
 }
 
+// The memory a spill frees leaves with the Full extents its moves empty, as
+// its caller says: kept for a reclaim, released but the runway, or all
+// released; a spill that moves nothing releases nothing, an empty extent of
+// a request that ended included.
+void testSpilledFullExtentsLeaveMemory() {
+  for (const SpilledExtents extents :
+       {SpilledExtents::Kept, SpilledExtents::KeepRunway, SpilledExtents::Released}) {
+    Spilling spill;
+    const auto emptyFullExtents = [&] {
+      const KvPoolSnapshot pool = spill.pool.snapshot();
+      return static_cast<uint32_t>((pool.reclaimableBytes - pool.index.reclaimableBytes) /
+                                   (spill.pool.extentPages() * spill.pool.bytesPerPage()));
+    };
+    // Fourteen pages and the open one fill four Full extents, the runway's
+    // first. Pages 1-12 spill: the dense history stays in the first and the
+    // tail window in the last, the two between empty.
+    const std::vector<uint32_t> prompt = Spilling::prompt(1000, 14);
+    spill.start(1, prompt, 14);
+    static_cast<void>(spill.cache.writeThrough());
+    spill.tier.complete();
+    require(spill.cache.pollTransfers() && !emptyFullExtents(), "the writes did not land, or an extent was empty");
+    require(spill.cache.spillWritten(extents).granted() && test::indexBlocks(spill.cache, 1)[12] &&
+                emptyFullExtents() == (extents == SpilledExtents::Kept ? 2u : extents == SpilledExtents::KeepRunway),
+            "the Full extents the moves emptied did not go as the caller said");
+    // A Resident request's pages, which an idle reclaim drops once it ended,
+    // empty extents that a spill moving nothing leaves.
+    spill.start(2, Spilling::prompt(5000, 20), 20, KvMode::Resident);
+    spill.cache.endRequest(2);
+    while (spill.cache.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::Ordinary).madeProgress) {
+    }
+    const uint32_t before = emptyFullExtents();
+    require(before > (extents == SpilledExtents::Kept ? 2u : 1u) && spill.cache.spillWritten(extents).granted() &&
+                emptyFullExtents() == before,
+            "a spill that moved nothing released an extent");
+    spill.cache.checkInvariants();
+    spill.cache.endRequest(1);
+  }
+}
+
 // At the memory wall spilling draws on the Index runway alone: a page that
 // lands spills without an allocation and its Full page serves the request's
 // growth, until the runway is spent; the next spill asks for an extent of
@@ -5224,6 +5263,7 @@ int main() {
     testReplacementKeepsTheExtentItEmpties();
     testReleaseTimeCoversOneExtent();
     testSpillMovesLandedPagesToTheIndexForm();
+    testSpilledFullExtentsLeaveMemory();
     testSpillAtTheMemoryWall();
     testFullReclaimReachesAnIdleSpilledChain();
     testFullShortfallReleasesEmptyIndexExtents();

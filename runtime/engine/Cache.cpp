@@ -1033,9 +1033,9 @@ void Cache::rescanSpills() noexcept {
     active.spillScan = 0;
 }
 
-TokenAdmission Cache::spillWritten() { return moveLandedPages(true); }
+TokenAdmission Cache::spillWritten(SpilledExtents extents) { return moveLandedPages(true, extents); }
 
-TokenAdmission Cache::moveLandedPages(bool allocate) {
+TokenAdmission Cache::moveLandedPages(bool allocate, SpilledExtents extents) {
   if (!spill_)
     return {};
   std::vector<uint32_t> pages;
@@ -1097,6 +1097,12 @@ TokenAdmission Cache::moveLandedPages(bool allocate) {
       return {TokenAdmissionFailure::Denied, pool_.extentPages() - free, free, runway.failure,
               kv::PageForm::Index};
   }
+  // The memory the moves freed leaves with the Full extents they emptied,
+  // once the runway stands: at the wall, which refuses it, they stay, and
+  // the requests grow into their pages.
+  if (!pages.empty() && extents != SpilledExtents::Kept)
+    static_cast<void>(pool_.reclaimEmptyExtents(extents == SpilledExtents::KeepRunway,
+                                                std::numeric_limits<uint32_t>::max(), kv::PageForm::Full));
   return {};
 }
 
