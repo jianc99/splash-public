@@ -527,6 +527,8 @@ struct HostSteps {
     // Whether a step did not run or threw, after which the runner runs none
     // of the command's steps (the runner's alone).
     bool halted = false;
+    // Diagnostics: the value the runner last raised the event to.
+    uint64_t raised = 0;
 
     void fail(std::string message) {
         std::lock_guard lock(mutex);
@@ -641,14 +643,21 @@ private:
     // Whether `event` reached `value`, which `before` signals, before the
     // runner was stopped. A buffer that fails may end without its signal, so
     // the wait also ends at its failure.
-    bool reached(id<MTLSharedEvent> event, uint64_t value, id<MTLCommandBuffer> before) const {
+    bool reached(id<MTLSharedEvent> event, uint64_t value, id<MTLCommandBuffer> before, uint64_t &lowest) const {
         const auto ended = [&] { return stopping_ || before.status == MTLCommandBufferStatusError; };
         const auto spinEnd = AwakeClock::now() + kHostStepSpin;
-        while (event.signaledValue < value) {
+        const auto seen = [&] {
+            const uint64_t now = event.signaledValue;
+            lowest = std::min(lowest, now);
+            return now;
+        };
+        while (seen() < value) {
             if (ended()) return false;
             if (AwakeClock::now() < spinEnd) continue;
-            while (![event waitUntilSignaledValue:value timeoutMS:kStopCheckMilliseconds])
+            while (![event waitUntilSignaledValue:value timeoutMS:kStopCheckMilliseconds]) {
+                static_cast<void>(seen());
                 if (ended()) return false;
+            }
             return true;
         }
         return true;
@@ -673,8 +682,25 @@ private:
                 bool worked = false;
                 // A halted command's step still waits for the work before
                 // it, which the event's value then follows.
-                const bool ready = before && reached(event, step.ready, before) &&
+                uint64_t lowest = UINT64_MAX;
+                const auto waitStart = std::chrono::steady_clock::now();
+                const bool ready = before && reached(event, step.ready, before, lowest) &&
                                    before.status != MTLCommandBufferStatusError;
+                const double waited =
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - waitStart).count();
+                if (lowest < steps.raised) {
+                    ++handoff::regressions;
+                    handoff::log("event went back down to %llu while the runner waited for %llu, after it raised %llu",
+                                 static_cast<unsigned long long>(lowest), static_cast<unsigned long long>(step.ready),
+                                 static_cast<unsigned long long>(steps.raised));
+                }
+                if (waited > 2.0)
+                    handoff::log("runner waited %.3f s for %llu: lowest value seen %llu, it had raised %llu, now %llu, "
+                                 "buffer before status %d",
+                                 waited, static_cast<unsigned long long>(step.ready),
+                                 static_cast<unsigned long long>(lowest), static_cast<unsigned long long>(steps.raised),
+                                 static_cast<unsigned long long>(event.signaledValue),
+                                 before ? static_cast<int>(before.status) : -1);
                 if (ready && !steps.halted) {
                     const double pickup = awakeSeconds();
                     try {
@@ -691,6 +717,7 @@ private:
                 }
                 if (!worked) steps.halted = true;
                 event.signaledValue = step.ready + 1;
+                steps.raised = step.ready + 1;
                 // Diagnostics: with HANDOFF_REREAD set, the value the CPU set,
                 // re-read at once and about 50 and 200 us later (which delays
                 // the runner's next pickup).

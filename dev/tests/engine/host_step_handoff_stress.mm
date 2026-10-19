@@ -16,7 +16,9 @@
 
 #import <Foundation/Foundation.h>
 
+#include <algorithm>
 #include <chrono>
+#include <mutex>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -30,6 +32,7 @@ using splash::metal::Command;
 using splash::metal::ComputeDispatch;
 using splash::metal::EventStep;
 using splash::metal::HostStepGpu;
+using splash::metal::HostStepTiming;
 using splash::metal::MetalBackend;
 using splash::metal::MetalBackendError;
 using splash::metal::MetalBuffer;
@@ -58,6 +61,11 @@ int main(int argc, const char *argv[]) {
     if (mode == "zero") dispatch.indirectThreadgroups = {noGrid, 0};
     const std::vector<ComputeDispatch> dispatches(steps + 1, dispatch);
     const bool sleeps = mode == "sleep", times = mode == "timeout";
+    // Each step's round trip (HostStepTiming): resume is the step-to-work latency.
+    std::mutex timedMutex;
+    std::vector<double> resumes, pickups;
+    resumes.reserve(size_t{commands} * steps);
+    pickups.reserve(size_t{commands} * steps);
     std::vector<EventStep> events;
     for (uint32_t step = 0; step < steps; ++step)
       events.push_back({step + 1, {}, 0, EventStep::Kind::Host,
@@ -65,7 +73,12 @@ int main(int argc, const char *argv[]) {
                           if (sleeps) std::this_thread::sleep_for(std::chrono::milliseconds(1));
                           if (times) std::this_thread::sleep_for(std::chrono::seconds(6));
                         },
-                        {}, mode == "awake" ? HostStepGpu::Awake : HostStepGpu::Idle});
+                        [&](const HostStepTiming &timing) {
+                          std::lock_guard lock(timedMutex);
+                          resumes.push_back(timing.resumeSeconds);
+                          pickups.push_back(timing.pickupSeconds);
+                        },
+                        mode == "awake" ? HostStepGpu::Awake : HostStepGpu::Idle});
     const Command command{dispatches, events};
     const auto start = std::chrono::steady_clock::now();
     uint32_t done = 0, failures = 0;
@@ -96,6 +109,20 @@ int main(int argc, const char *argv[]) {
                 static_cast<unsigned long long>(uint64_t{done} * (steps + 1)),
                 static_cast<unsigned long long>(splash::handoff::checks.load()),
                 static_cast<unsigned long long>(splash::handoff::regressions.load()));
+    const auto quantiles = [](std::vector<double> &values, const char *what) {
+      if (values.empty()) return;
+      std::sort(values.begin(), values.end());
+      double sum = 0;
+      for (const double value : values) sum += value;
+      const auto at = [&](double q) { return values[std::min(values.size() - 1, size_t(q * double(values.size())))] * 1e6; };
+      std::printf("  %s us: p50 %.1f p90 %.1f p99 %.1f mean %.1f (%zu steps)\n", what, at(0.5), at(0.9), at(0.99),
+                  sum / double(values.size()) * 1e6, values.size());
+    };
+    {
+      std::lock_guard lock(timedMutex);
+      quantiles(resumes, "resume (step to work)");
+      quantiles(pickups, "pickup (work to step)");
+    }
     return failures ? 1 : 0;
   }
 }
