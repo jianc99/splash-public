@@ -45,7 +45,7 @@ constexpr uint64_t kLaneBlockBytes =
 // far as the select writes (BLOCK_INDEXER_TILE_SLACK). A row's scores: one
 // per block its bitmap covers. Both follow the window the target serves.
 constexpr uint32_t maskWords(uint32_t contextTokens) {
-  return (contextTokens / BLOCK_INDEXER_BLOCK + BLOCK_INDEXER_TILE_SLACK + 31) / 32;
+  return qwen4IndexerMaskWords(contextTokens);
 }
 uint32_t maskWords(const QwenTargetGeometry &g) { return maskWords(g.contextTokens()); }
 uint32_t scoreStride(const QwenTargetGeometry &g) { return maskWords(g) * 32; }

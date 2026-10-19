@@ -13,6 +13,7 @@
 // command, between the hash and the gather.
 
 #include "model/QwenTarget.hpp"
+#include "model/Qwen4ScratchSizing.hpp"
 
 #include <array>
 #include <cstdint>

@@ -769,7 +769,7 @@ void qsaTest(MetalBackend &backend, QsaCase c) {
 
 // A target's QSA scratch (model::Qwen4Steps) takes rows to the end of the
 // window it serves: a prefill chunk's and a verify step's last rows at the
-// native window, or at the 1,010,000 tokens YaRN by 4 serves, whose prefill
+// native or fractional YaRN windows, including speculative tails. Prefill
 // scores keep the native window's scratch; the native window's scratch
 // refuses rows at the end of YaRN's.
 void qsaScratchCoversWindow(MetalBackend &backend) {
@@ -780,6 +780,10 @@ void qsaScratchCoversWindow(MetalBackend &backend) {
   model::QwenTargetGeometry scaled = native;
   scaled.ropeScaling = {4.0, 262144};
   const model::QwenTargetGeometry &yarn = scaled;
+  model::QwenTargetGeometry fractional = native;
+  fractional.ropeScaling = {1.9999771118164062, 262144};
+  model::QwenTargetGeometry fractionalTail = native;
+  fractionalTail.ropeScaling = {double(524409) / 262144, 262144};
   const MetalBuffer table = scratch(backend, 8);
   const auto selects = [&](const model::Qwen4Scratch &s, uint32_t rows, std::vector<uint32_t> firsts) {
     const std::vector<MetalBuffer> tables(firsts.size(), table);
@@ -792,14 +796,17 @@ void qsaScratchCoversWindow(MetalBackend &backend) {
     }
     return !graph.empty();
   };
+  const model::QwenTargetGeometry &fractionalWindow = fractional, &fractionalTailWindow = fractionalTail;
   uint64_t nativeScores = 0;
-  for (const auto &[geometry, window] : {std::pair{&native, 262'144U}, std::pair{&yarn, 1'010'000U}}) {
+  for (const auto &[geometry, window] : {std::pair{&native, 262'144U}, std::pair{&yarn, 1'010'000U},
+                                       std::pair{&fractionalWindow, 524'282U}, std::pair{&fractionalTailWindow, 524'409U}}) {
     const model::Qwen4Steps steps(weights, *geometry, backend, 1);
     const model::Qwen4Scratch prefill = steps.prefillScratch(0), verify = steps.verifyScratch(kLanes * kVerify);
     const uint64_t scores = uint64_t{prefill.scoreRows} * prefill.scoreStride;
     if (!nativeScores) nativeScores = scores;
     check(geometry->contextTokens() == window && selects(prefill, kChunk, {window - kChunk}) &&
-              selects(verify, kVerify, std::vector<uint32_t>(kLanes, window - kVerify)) && scores <= nativeScores,
+              selects(verify, kVerify, std::vector<uint32_t>(kLanes, window - kVerify)) &&
+              selects(verify, kVerify, std::vector<uint32_t>(kLanes, window - 2)) && scores <= nativeScores,
           "QSA scratch of a " + std::to_string(window) + "-token window: its last rows, within the native scores");
   }
   const model::Qwen4Steps steps(weights, native, backend, 1);
