@@ -354,8 +354,6 @@ def model_config(metadata, vision=None):
     if architecture.text_config is not None:
         text.update(architecture.text_config(metadata, arch))
     if architecture.flat:
-        if vision is not None:
-            raise ModelError(f"GGUF {arch} targets take no vision projector")
         return text
     config = {
         "model_type": architecture.model_type.removesuffix("_text"),
