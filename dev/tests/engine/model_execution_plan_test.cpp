@@ -361,6 +361,11 @@ void checkGdnWidths() {
           "packed GDN rows without the gates reached arena sizing");
   // Every family's layout, the 122B's among them, passes the layout check.
   model::forEachFamily([](const auto &family) { model::requireQwenLayout(family); });
+  // A layout without GDN layers sets none of the GDN dimensions.
+  auto strayGdn = model::FlintLayout{};
+  strayGdn.gdnKeyHeads = 16;
+  rejects([&] { model::requireQwenLayout(strayGdn); }, "Qwen target layout is inconsistent",
+          "a layout without GDN layers was accepted with a GDN dimension");
   // The dense layout is checked like the sparse one: its convolution width
   // against its GDN heads.
   const model::Qwen3_8Layout dense;
