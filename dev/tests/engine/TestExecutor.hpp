@@ -273,6 +273,8 @@ public:
     entry.resident = false;
     entry.position = 0;
     ++suspensions;
+    if (laneReleased)
+      laneReleased();
     if (kvGrowthBlocked && unblockGrowthOnSuspend)
       *kvGrowthBlocked = false;
   }
@@ -678,6 +680,9 @@ public:
     return std::nullopt;
   }
   void end(uint64_t id) override {
+    if (const auto found = requests.find(id);
+        laneReleased && found != requests.end() && found->second.resident)
+      laneReleased();
     requests.erase(id);
     pageTables.erase(id);
     spilledReadFloors.erase(id);
@@ -804,6 +809,8 @@ public:
   // executor must outlive the cache that keeps those states.
   uint64_t stateHeldRows = 0;
   bool keptLane = false;
+  // Called when a resident request gives its lane back.
+  std::function<void()> laneReleased;
   bool *kvGrowthBlocked = nullptr;
   bool unblockGrowthOnSuspend = true;
   bool decodeFinishes = true;

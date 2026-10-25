@@ -1696,6 +1696,73 @@ void testKvGrowthReclaimsIdleStateBeforeCache() {
   }
 }
 
+// A KV growth denial that the cache covers keeps the lane's pooled buffers:
+// their draft ring is the one buffer no cached state holds, so a request that
+// arrives while the host is short of memory still starts beside the growing
+// one. Here each lane takes a pooled ring (pooledLaneBytes) or allocates one,
+// which the host refuses while it is short and the start is not in service.
+void testKvGrowthKeepsTheRingAWaitingLaneStartsFrom() {
+  constexpr uint64_t kRing = 4096;
+  test::TestKvStorage storage(64, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool, nullptr, nullptr);
+  Executor executor(2);
+  executor.decodeFinishes = false;
+  Events events;
+  bool serving = false;
+  bool hostShort = false;
+  EngineConfig config = test::engineConfig();
+  config.growthPaused = [&] { return hostShort; };
+  config.serving = [&](bool mark) { return std::exchange(serving, mark); };
+  engine::Engine engine(config, resources, executor, events);
+  guardReleases(storage, engine);
+  executor.pooledLaneBytes = kRing;
+  executor.statesLacked = [&]() -> uint32_t {
+    return executor.pooledLaneBytes ? 0 : std::numeric_limits<uint32_t>::max();
+  };
+  executor.beginAllocationFailure = metal::AllocationFailure::HostPressure;
+  executor.beginGrowthBlocked = [&] {
+    if (executor.pooledLaneBytes >= kRing) {
+      executor.pooledLaneBytes -= kRing;
+      return false;
+    }
+    return hostShort && !serving;
+  };
+  executor.laneReleased = [&] { executor.pooledLaneBytes += kRing; };
+  const auto resident = [&](uint64_t id) {
+    const auto found = executor.requests.find(id);
+    return found != executor.requests.end() && found->second.resident;
+  };
+  const auto done = [&](uint64_t id) { return events.usage.contains(id); };
+  const auto submit = [&](uint64_t id, uint32_t tokens) {
+    EngineRequest next = request(id, std::vector<uint32_t>(65, static_cast<uint32_t>(id)));
+    next.maxNewTokens = tokens;
+    next.deadlineMilliseconds = 1e9;
+    engine.submit(next);
+  };
+
+  double now = 1;
+  submit(40, 8);
+  submit(41, 400);
+  tickUntil(engine, now, [&] { return done(40); }, "the first request did not finish");
+  require(resident(41) && executor.pooledLaneBytes == kRing,
+          "the finished lane's ring did not return to the pool");
+
+  hostShort = true;
+  storage.growthBlocked = true;
+  executor.kvGrowthBlocked = &storage.growthBlocked;
+  executor.unblockGrowthOnSuspend = false;
+  executor.reclaimableIdleStateBytes = 1U << 20;
+  tickUntil(engine, now, [&] { return !storage.growthBlocked; }, "KV growth was never denied");
+  require(executor.pooledLaneBytes == kRing, "KV growth reclaimed the ring a lane starts from");
+
+  submit(42, 8);
+  tickUntil(engine, now, [&] { return resident(42) || done(42); }, "the waiting request never started");
+  require(resident(41), "the waiting request started only once the growing one ended");
+  tickUntil(engine, now, [&] { return done(41) && done(42); }, "a request did not finish");
+  require(events.failures.empty(), "a request failed");
+}
+
 // Two lanes prefill their prompts, replay states included, in one command.
 // The KV growth denial the first lane meets is answered by reclaiming idle
 // model state, never by dropping any lane's boundary: both replay states
@@ -5018,7 +5085,7 @@ void testBudgetDenialRetriesAfterRelease() {
 
 // A lane's admission keeps the pooled buffers a lane starts from: its
 // activation takes them, so releasing them would only make the retry allocate
-// them again. KV growth has no use for them and releases them.
+// them again. KV growth releases them once the cache has nothing to give.
 void testStateAdmissionKeepsThePooledLaneBuffers() {
   for (bool state : {true, false}) {
     test::TestKvStorage storage(8, 4096, 4);
@@ -12133,6 +12200,7 @@ int main() {
     testCancellationInFlightAtBoundaryPublishesNoState();
     testLaneStateGrowthReclaimsCachedStateAndRetries();
     testKvGrowthReclaimsIdleStateBeforeCache();
+    testKvGrowthKeepsTheRingAWaitingLaneStartsFrom();
     testKvGrowthDenialKeepsEveryLaneReplayState();
     testBoundaryStatesAreCapturedInsideCommands();
     testRefusedBuffersEndTheCommandAtTheirBoundary();

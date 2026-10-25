@@ -2075,15 +2075,21 @@ CacheReclaimResult Engine::reclaimForState(ReclaimClass upTo, bool forLater) {
 }
 
 // The reclaim step for KV pages the engine's limit refused. Allocated extents
-// stay for the pages to reuse; idle state memory goes first, then the cache
-// gives up what covers the shortfall, of the pages' form, in one step.
+// stay for the pages to reuse; idle state memory beyond the lane's pooled
+// buffers goes first, then the cache gives up what covers the shortfall, of
+// the pages' form, in one step, and the lane's buffers go last. Their draft
+// ring is the one buffer no cached state holds: while it stays, a request
+// that waits can start beside this one from cached states' cells and windows.
 CacheReclaimResult Engine::reclaimForKv(const TokenAdmission &admission, ReclaimClass upTo) {
-  if (reclaimIdleState(false, model::IdleMemory::BuffersThenCaches))
+  if (reclaimIdleState(true, model::IdleMemory::BuffersThenCaches))
     return {true, 0};
   const CacheReclaimResult reclaimed = cache_.reclaimForPages(
       admission.additionalPages, CacheReclaimMode::KeepExtents, upTo, admission.form);
   if (reclaimed.madeProgress)
     signalResourceProgress();
+  if (!reclaimed.madeProgress && !reclaimed.pending &&
+      reclaimIdleState(false, model::IdleMemory::Buffers))
+    return {true, 0};
   return reclaimed;
 }
 
