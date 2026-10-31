@@ -1,8 +1,10 @@
 #include "TestBuffers.hpp"
 #include "ops/PageStorage.hpp"
+#include "engine/KvPool.hpp"
 #include "engine/MemoryGovernor.hpp"
 #include "tests/engine/HostKvExtents.hpp"
 #include "tests/engine/TestChecks.hpp"
+#include "tests/engine/TestMethodReplacement.hpp"
 #include "tests/engine/TestPageEntries.hpp"
 
 #include <algorithm>
@@ -135,6 +137,89 @@ void entriesFollowAReallocatedExtent(metal::MetalBackend &backend, kv::PageStora
         if (written[word] != (seed ^ word))
             throw std::runtime_error("a kernel did not reach a reallocated extent through its entry");
     }
+}
+
+// A table takes entries only of pages of active extents, as each extent is
+// from its allocation: an inactive one is not resident for commands, which
+// would reach it outside the memory resident for them.
+void entriesOnlyOfActiveExtents(metal::MetalBackend &backend, MemoryGovernor &governor) {
+    const uint32_t extent = indexedLayout.minimumExtentPages();
+    kv::PageStorage storage(backend, governor.allocationAdmission(), indexedLayout, extent, extent);
+    require(static_cast<bool>(storage.allocateExtent(0)), "an indexed extent was not allocated");
+    const metal::MetalBuffer table = test::sharedBuffer(backend, sizeof(SplashKvPage));
+    const std::array<uint32_t, 1> page{1};
+    storage.writeEntries(page, 0, table);
+    storage.writeIndexEntries(page, 0, table);
+    storage.setExtentActive(0, false);
+    rejects([&] { storage.writeEntries(page, 0, table); },
+            "KV page 1 is in an extent that is not resident for commands",
+            "a table took an entry of a page of an inactive extent");
+    rejects([&] { storage.writeIndexEntries(page, 0, table); },
+            "KV page 1 is in an extent that is not resident for commands",
+            "an index table took an entry of a page of an inactive extent");
+    storage.setExtentActive(0, true);
+    storage.writeEntries(page, 0, table);
+    storage.writeIndexEntries(page, 0, table);
+}
+
+// A page only the cache holds is in an extent the command queue's residency
+// set lets go once no request holds a page of it, and a table refuses it. A
+// request that takes it again makes its extent resident for the next
+// command, which reads through the table what a kernel wrote there; so does
+// a compaction that moves a request's page into an extent only the cache
+// held, while the extent it leaves goes.
+void cachedPagesReachedAgainAreResident(const std::string &metallib) {
+    const test::QueueSets queue;
+    metal::MetalBackend backend(metallib);
+    MemoryGovernor governor(
+        backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1, queryHostMemory, 0);
+    kv::PageStorage storage(backend, governor.allocationAdmission(), kvLayout, 256, 128);
+    // Extent 0 holds pages 0 to 127, extent 1 pages 128 to 255.
+    KvPool pool(storage, 256);
+    const metal::MetalBuffer table = test::sharedBuffer(backend, sizeof(SplashKvPage));
+    const metal::MetalBuffer mismatches = test::sharedBuffer(backend, sizeof(uint32_t));
+    const metal::MetalBuffer word = test::sharedBuffer(backend, sizeof(uint32_t));
+    // A page an extent starts with has the extent's address as its entry,
+    // which the test kernels read as one.
+    const uint32_t words = 1024, seed = 0xcac4e;
+    const metal::ComputeDispatch write{"addressed_write_u32", {{0, table}},
+                                       {{1, &words, sizeof(words)}, {2, &seed, sizeof(seed)}},
+                                       {words / 256, 1, 1}, {256, 1, 1}};
+    const metal::ComputeDispatch check{"addressed_check_u32", {{0, table}, {3, mismatches}},
+                                       {{1, &words, sizeof(words)}, {2, &seed, sizeof(seed)}},
+                                       {words / 256, 1, 1}, {256, 1, 1}};
+    const auto mismatched = [&](uint32_t page) {
+        storage.writeEntries(std::array{page}, 0, table);
+        *static_cast<uint32_t *>(mismatches.contents()) = 0;
+        (void)backend.submit(check);
+        return *static_cast<const uint32_t *>(mismatches.contents());
+    };
+
+    const KvPageAcquisition acquired = pool.acquirePages(1);
+    require(acquired.granted() && acquired.pages == std::vector<uint32_t>{0}, "the first page was not page 0");
+    storage.writeEntries(acquired.pages, 0, table);
+    (void)backend.submit(write);
+    require(queue.holds(@"kv-extent-0") && !queue.holds(@"kv-extent-128"),
+            "the command queue's set does not hold exactly the extent of the page a request holds");
+    pool.retainPage(0, true);
+    pool.releasePage(0, false);
+    (void)backend.submit({"residency_kick", {{0, word}}, {}, {1, 1, 1}, {1, 1, 1}});
+    require(!queue.holds(@"kv-extent-0"), "an extent only the cache holds stayed in the command queue's set");
+    rejects([&] { storage.writeEntries(std::array<uint32_t, 1>{0}, 0, table); },
+            "KV page 0 is in an extent that is not resident for commands",
+            "a table took an entry of a page only the cache holds");
+    pool.retainPage(0, false);
+    require(mismatched(0) == 0 && queue.holds(@"kv-extent-0"),
+            "a cached page a request took again was not resident for the command that read it");
+
+    // Extent 1 holds page 129 for the cache alone, and as many pages as
+    // extent 0: page 0 moves to its first page.
+    pool.retainPage(129, true);
+    const KvPageMoves moves = pool.compactExtent({});
+    require(moves.follow(0) == 128 && queue.holds(@"kv-extent-0") && !queue.holds(@"kv-extent-128"),
+            "the compaction did not move page 0 into the extent only the cache held");
+    require(mismatched(128) == 0 && queue.holds(@"kv-extent-128") && !queue.holds(@"kv-extent-0"),
+            "a page a compaction moved into an extent only the cache held was not resident for the next command");
 }
 
 void requireSameSpans(std::span<const std::span<std::byte>> left, std::span<const std::span<std::byte>> right,
@@ -626,6 +711,8 @@ void run(const std::string &metallib) {
     indexPagesHoldOnlyTheirIndex(backend, governor);
     windowedLayersComeLast(backend, governor);
     slimPagesHoldTheirFirstRegions(backend, governor);
+    entriesOnlyOfActiveExtents(backend, governor);
+    cachedPagesReachedAgainAreResident(metallib);
     std::cout << "KV page storage tests passed\n";
 }
 

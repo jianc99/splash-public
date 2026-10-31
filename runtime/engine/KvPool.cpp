@@ -18,7 +18,7 @@ constexpr std::array kForms{kv::PageForm::Full, kv::PageForm::Slim, kv::PageForm
 } // namespace
 
 KvPool::KvPool(kv::ExtentStorage &storage, uint32_t runwayPages)
-    : storage_(storage), extentPages_(storage.extentPages()),
+    : storage_(storage), extentPages_(storage.extentPages()), runwayPages_(runwayPages),
       pages_(storage.pageCount()) {
   if (pages_.empty() || !storage_.bytesPerPage(kv::PageForm::Full) || !extentPages_ ||
       pages_.size() % extentPages_) {
@@ -38,12 +38,29 @@ KvPool::KvPool(kv::ExtentStorage &storage, uint32_t runwayPages)
   }
 }
 
+KvPool::RunwayHold::RunwayHold(KvPool &pool) : pool_(pool) {
+  for (uint32_t page = 0; page < pool_.runwayPages_; ++page) {
+    try {
+      pool_.retainPage(page, false);
+    } catch (...) {
+      while (page)
+        pool_.releasePage(--page, false);
+      throw;
+    }
+  }
+}
+
+KvPool::RunwayHold::~RunwayHold() {
+  for (uint32_t page = 0; page < pool_.runwayPages_; ++page)
+    pool_.releasePage(page, false);
+}
+
 KvPageAcquisition KvPool::acquirePages(uint32_t count, kv::PageForm form) {
   KvPageAcquisition acquired = takeFreePages(count, form);
   for (uint32_t page : acquired.pages) {
     markUsed(page);
     pages_[page].activeReferences = 1;
-    ++formRecord(form).activePages;
+    markActive(page);
   }
   return acquired;
 }
@@ -98,7 +115,7 @@ void KvPool::retainPage(uint32_t page, bool prefixOwner) {
     record.prefixOwned = true;
     ++formOf(page).prefixPages;
   } else if (!record.activeReferences++) {
-    ++formOf(page).activePages;
+    markActive(page);
   }
 }
 
@@ -110,7 +127,7 @@ void KvPool::releasePage(uint32_t page, bool prefixOwner) {
     record.prefixOwned = false;
     --formOf(page).prefixPages;
   } else if (!--record.activeReferences) {
-    --formOf(page).activePages;
+    markInactive(page);
   }
   if (pageFree(page))
     markFree(page);
@@ -231,6 +248,8 @@ metal::AllocationResult KvPool::allocateExtent(uint32_t extent, kv::PageForm for
         std::max(extentAllocateMaxMilliseconds_, millisecondsSince(start));
     extents_[extent].form = form;
     setExtentAllocated(extent, true);
+    // A new extent holds no page a request holds.
+    storage_.setExtentActive(extent, false);
   }
   return allocated;
 }
@@ -357,8 +376,8 @@ void KvPool::moveReferences(const kv::PageCopy &copy) noexcept {
   FormRecord &toForm = formOf(copy.to);
   markUsed(copy.to);
   if (from.activeReferences) {
-    --fromForm.activePages;
-    ++toForm.activePages;
+    markActive(copy.to);
+    markInactive(copy.from);
   }
   if (from.prefixOwned) {
     --fromForm.prefixPages;
@@ -465,6 +484,21 @@ void KvPool::markFree(uint32_t page) noexcept {
   insertFree(page);
   if (!extent.usedPages)
     setExtentReclaimable(extentIndex, true);
+}
+
+void KvPool::markActive(uint32_t page) noexcept {
+  ++formOf(page).activePages;
+  if (!extents_[extentOf(page)].activePages++)
+    storage_.setExtentActive(extentOf(page), true);
+}
+
+void KvPool::markInactive(uint32_t page) noexcept {
+  ExtentRecord &extent = extents_[extentOf(page)];
+  if (!extent.activePages)
+    std::terminate();
+  --formOf(page).activePages;
+  if (!--extent.activePages)
+    storage_.setExtentActive(extentOf(page), false);
 }
 
 // An extent changes state only while none of its pages is held: its pages

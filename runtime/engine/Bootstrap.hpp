@@ -119,10 +119,13 @@ public:
         NativeRuntime::ByteSink output,
         NativeRuntime::StatusProvider statusProvider);
 
-    // Completes warmup and validation before announcing readiness.
+    // Completes warmup and validation before announcing readiness. Warmup
+    // runs on kvPool's runway (model::ExecutionLimits::warmupKvPages) and
+    // holds its pages while it runs (KvPool::RunwayHold).
     [[nodiscard]] static RuntimeBootstrapReport requireWarmupAndAnnounce(
         const EngineMemoryPlan &memoryPlan,
         model::RuntimeModel &modelRuntime,
+        KvPool &kvPool,
         ActualMemoryReporter memoryReporter,
         NativeRuntime &nativeLoop);
 

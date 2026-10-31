@@ -198,7 +198,8 @@ private:
 class Harness final {
 public:
   explicit Harness(int throwingStep = -1, bool failReadyWrite = false)
-      : backing_(16, 4096, 4), pool_(backing_, 16),
+      : backing_(model::ExecutionLimits::warmupKvPages, 4096, 4),
+        pool_(backing_, model::ExecutionLimits::warmupKvPages),
         resources_(pool_, nullptr, nullptr),
         executor_(throwingStep),
         loop_(
@@ -214,6 +215,7 @@ public:
   }
 
   Executor &executor() noexcept { return executor_; }
+  KvPool &pool() noexcept { return pool_; }
   engine::NativeRuntime &loop() noexcept { return loop_; }
   const std::vector<uint8_t> &output() const noexcept { return output_; }
 
@@ -242,7 +244,7 @@ void testAllNativeWarmupsPrecedeReady() {
   require(harness.output().empty(),
           "runtime became visible before warmup");
   auto report = engine::RuntimeBootstrap::requireWarmupAndAnnounce(
-      plan, harness.executor(), [&] { return validActual(plan); },
+      plan, harness.executor(), harness.pool(), [&] { return validActual(plan); },
       harness.loop());
   const auto events = protocol::peer::decodeEvents(harness.output());
   require(report.stage == RuntimeBootstrapStage::Ready && report.memoryAudit.valid &&
@@ -258,7 +260,7 @@ void testAllNativeWarmupsPrecedeReady() {
 
 RuntimeBootstrapReport warmup(Harness &harness, const EngineMemoryPlan &plan) {
   return RuntimeBootstrap::requireWarmupAndAnnounce(
-      plan, harness.executor(), [&] { return validActual(plan); },
+      plan, harness.executor(), harness.pool(), [&] { return validActual(plan); },
       harness.loop());
 }
 
@@ -271,6 +273,24 @@ void requireReadyWithoutReducingConcurrency(
   const auto *ready = std::get_if<protocol::ReadyEvent>(&events.front());
   require(ready && ready->maxConcurrentRequests == 4,
           "startup budget permanently reduced the advertised concurrency");
+}
+
+// Warmup runs on the KV runway and holds its pages as a request holds its
+// own, so that commands reach their extents (KvPool::RunwayHold); none is
+// held once the engine is Ready.
+void testWarmupHoldsTheRunway() {
+  const EngineMemoryPlan plan = memoryPlan();
+  Harness harness;
+  int warmups = 0;
+  harness.executor().warmupHook = [&](int, model::WarmupStepResult &) {
+    ++warmups;
+    for (uint32_t page = 0; page < model::ExecutionLimits::warmupKvPages; ++page)
+      require(harness.pool().pageActive(page), "a warmup ran on a runway page no request held");
+  };
+  const auto report = warmup(harness, plan);
+  require(report.stage == RuntimeBootstrapStage::Ready && warmups == 6 &&
+              harness.pool().snapshot().pagesActive == 0,
+          "warmup held the runway past Ready");
 }
 
 void testBudgetLimitedWarmupKeepsRuntimeConcurrency() {
@@ -399,7 +419,7 @@ void testFinalHostPressurePreventsReady() {
   Harness harness;
   try {
     static_cast<void>(RuntimeBootstrap::requireWarmupAndAnnounce(
-        plan, harness.executor(),
+        plan, harness.executor(), harness.pool(),
         []() -> ActualMemoryReport {
           throw metal::MetalAllocationError("pressure after warmup",
                                              metal::AllocationFailure::HostPressure);
@@ -476,21 +496,21 @@ void testExceptionsMemoryAndReadyWriteAreFailClosed() {
     Harness harness(3);
     try {
       static_cast<void>(engine::RuntimeBootstrap::requireWarmupAndAnnounce(
-          plan, harness.executor(), [] { return ActualMemoryReport{}; },
+          plan, harness.executor(), harness.pool(), [] { return ActualMemoryReport{}; },
           harness.loop()));
       throw std::runtime_error("warmup exception announced ready");
     } catch (const engine::RuntimeBootstrapError &error) {
       require(error.report().stage ==
                       engine::RuntimeBootstrapStage::DecodeWarmup &&
-                  harness.output().empty(),
-              "warmup exception was not contained");
+                  harness.output().empty() && harness.pool().snapshot().pagesActive == 0,
+              "warmup exception was not contained or kept the runway held");
     }
   }
   {
     Harness harness;
     try {
       static_cast<void>(engine::RuntimeBootstrap::requireWarmupAndAnnounce(
-          plan, harness.executor(), [] { return ActualMemoryReport{}; },
+          plan, harness.executor(), harness.pool(), [] { return ActualMemoryReport{}; },
           harness.loop()));
       throw std::runtime_error("invalid memory report announced ready");
     } catch (const engine::RuntimeBootstrapError &error) {
@@ -504,7 +524,7 @@ void testExceptionsMemoryAndReadyWriteAreFailClosed() {
     Harness harness(-1, true);
     try {
       static_cast<void>(engine::RuntimeBootstrap::requireWarmupAndAnnounce(
-          plan, harness.executor(), [&] { return validActual(plan); },
+          plan, harness.executor(), harness.pool(), [&] { return validActual(plan); },
           harness.loop()));
       throw std::runtime_error("failed Ready write left runtime ready");
     } catch (const engine::RuntimeBootstrapError &error) {
@@ -581,6 +601,7 @@ int main() {
   try {
     testRuntimeCacheIdentityReportsTheLoadedModel();
     testAllNativeWarmupsPrecedeReady();
+    testWarmupHoldsTheRunway();
     testBudgetLimitedWarmupKeepsRuntimeConcurrency();
     testOptionalAllocationFailuresAreMemoryLimited();
     testResourceFailureClassificationSurvivesBootstrap();

@@ -378,7 +378,8 @@ struct Runtime::Impl {
 
   // What a lane's GPU tables were last written from. Their entries stay
   // valid while the revision does: KvPool never releases the extent of a
-  // page a request holds (PageStorage::releaseExtent).
+  // page a request holds (PageStorage::releaseExtent), and keeps it resident
+  // for commands (PageStorage::setExtentActive).
   struct PageTableBinding final {
     uint64_t requestId = 0;
     uint64_t revision = 0;
@@ -3267,7 +3268,8 @@ void requireLanesSucceeded(std::span<const ModelStepResult> results) {
 }
 
 // Warmup runs on the startup runway the engine's KV pool allocated
-// (ExecutionLimits::warmupKvPages); it never allocates KV.
+// (ExecutionLimits::warmupKvPages), whose pages its caller holds while it
+// runs (engine::KvPool::RunwayHold); it never allocates KV.
 void requireRunwayPages(const kv::PageStorage &storage,
                         std::span<const uint32_t> pages) {
   for (uint32_t page : pages) {

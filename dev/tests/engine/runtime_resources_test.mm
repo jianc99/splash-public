@@ -867,8 +867,11 @@ void testStartGrowsThroughHostPressure(const char *metallibPath) {
       const Serving allocation(engine.serving, true);
     }
     // The warmup's lane state; it throws if refused.
-    static_cast<void>(runtime->warmupPrefill(model::ExecutionLimits::prefillTokenBudget));
-    static_cast<void>(runtime->warmupDecodeBatch(1));
+    {
+      const KvPool::RunwayHold runway(resources->kvPool());
+      static_cast<void>(runtime->warmupPrefill(model::ExecutionLimits::prefillTokenBudget));
+      static_cast<void>(runtime->warmupDecodeBatch(1));
+    }
     resources->beginServing();
     const metal::AllocationResult grown = admit(kMiB, [] {});
     require(!grown && grown.failure == metal::AllocationFailure::HostPressure,
@@ -958,6 +961,7 @@ void testYarnRuntime(const char *metallibPath) {
   require(static_cast<bool>(admit(budget.sharedPrefillBytes + budget.sharedDecodeBytes,
                                   [&] { runtime = model::createRuntime(context); })),
           "the YaRN runtime's arenas were refused");
+  const KvPool::RunwayHold runway(resources->kvPool());
   static_cast<void>(runtime->warmupPrefill(model::ExecutionLimits::prefillTokenBudget));
   static_cast<void>(runtime->warmupDecodeBatch(1));
 }

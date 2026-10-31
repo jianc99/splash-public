@@ -29,10 +29,15 @@ namespace splash::kv {
 // SplashKvLayer serves a Full page and a Slim one alike. Kernels reach a
 // page through its entries in a request's GPU tables, so extents are
 // allocated metal::BufferReach::Addressed: the command queue's residency set
-// keeps them resident for every command buffer. The host reaches the same
-// bytes through the page's spans(). Active requests may overwrite slots at
-// or beyond their logical commit index. Cached KV blocks reference only
-// fully committed pages, which are immutable while shared.
+// keeps an extent resident for every command buffer while it is active
+// (setExtentActive), which it is from its allocation, and a table takes
+// entries only of pages of active extents. KvPool keeps an extent active
+// only while a request holds one of its pages, so KV only the cache holds
+// costs commands nothing; the extents of the hot block cache and of history
+// staging, which no pool holds, stay active. The host reaches the same bytes
+// through the page's spans(). Active requests may overwrite slots at or
+// beyond their logical commit index. Cached KV blocks reference only fully
+// committed pages, which are immutable while shared.
 class PageStorage final : public ExtentStorage {
 public:
   // pageCount must be a whole number of extents of extentPages pages, a
@@ -75,6 +80,11 @@ public:
   // a request or the cache holds; GPU page tables rely on it (Runtime's
   // PageTableBinding).
   void releaseExtent(uint32_t extent) override;
+  // Marks the extent's buffer queue resident or not
+  // (metal::MetalBackend::setQueueResident): the command queue's residency
+  // set holds an active extent's buffer from the next command on, and lets an
+  // inactive one's go as that command begins.
+  void setExtentActive(uint32_t extent, bool active) noexcept override;
   // Copies what both pages hold: the K/V regions of the one that holds
   // fewer (Layout::regions) and the index, which is all of spans() between
   // pages of one form and indexSpans() between an Index page and another.
@@ -103,9 +113,11 @@ public:
   // before `first` are left as they are. An Index page's entry is
   // SPLASH_KV_PAGE_ABSENT; a Slim page's reaches the regions it holds, all
   // that a row its window has passed reads of it. Throws std::logic_error
-  // for a table that is not CPU-visible or too small and for a page whose
+  // for a table that is not CPU-visible or too small, for a page whose
   // extent is not allocated (a GPU table holds only pages of allocated
-  // extents), std::invalid_argument for `first` past the pages.
+  // extents) and for a page of an inactive extent (setExtentActive), which
+  // commands would reach outside the memory resident for them;
+  // std::invalid_argument for `first` past the pages.
   void writeEntries(std::span<const uint32_t> pages, uint32_t first,
                     const metal::MetalBuffer &table) const;
   // The same for an index table (ops::BlockIndex::tables), whose entries

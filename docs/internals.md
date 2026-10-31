@@ -1018,28 +1018,41 @@ Every buffer the backend allocates belongs to one residency set
 state buffers and scratch alike stay wired between requests until the idle
 release (`--idle-release`, 10 minutes by default) passes without a command, and
 the next command wires them again. The command queue holds only a set of the KV
-extents, which kernels reach by address: Metal makes them resident for every
-command buffer, as it does each buffer a dispatch binds. A queue that held every
-buffer would have each command buffer wait for all of them before it starts,
-which with memory nearly full takes 100-170 ms for 1-2% of them; a streamed
-decode command, whose host steps start about a hundred a cycle, would wait at
-nearly every cycle. `--idle-release off` keeps every buffer wired, and the
-weight images allocated unless an [explicit release](#explicit-weights-release)
-gives them back, while the engine runs; KV extents return only through the
-reclaims below, memory pressure among them. Memory returns to macOS when the
-engine releases it, never because macOS compressed or dropped an idle buffer.
-macOS page cache, driver allocations and other applications still affect memory
-pressure and swap.
+extents commands reach: a pool's extents that hold a page a request holds
+(`MetalBackend::setQueueResident`, `KvPool`), and, where KV spills, the hot
+block cache's and history staging's while they are allocated, which no pool
+holds. Metal makes them resident for every command buffer, as it does each
+buffer a dispatch binds. A queue that held every buffer would have each command
+buffer wait for all of them before it starts, which with memory nearly full
+takes 100-170 ms for 1-2% of them; a streamed decode command, whose host steps
+start about a hundred a cycle, would wait at nearly every cycle. One that held
+every KV extent made cached KV cost every command buffer too: 8 GB of extents
+only the cache held made a streamed Qwen3.8-Flash-Next decode cycle 3.5-5.5%
+slower where 8 GB of bound buffers cost nothing, and a KV pool of 8.4 GiB near
+the engine's limit made it 45% slower (M5 Max with 36 GB). A set that grew with
+every cached extent is likely what made a 128 GB Mac's decode fall from 97 to
+6-12 tokens/s with 43.6 GB of cached KV, as reported; that fall was not
+reproduced. The set takes an extent that came into use or went out of it only as
+the next command begins, while none runs (`Residency::commitQueue`), and a
+released one leaves it at once (`Residency::unqueue`); extents only the cache
+holds stay in the backend's set, wired. `--idle-release off` keeps every buffer
+wired, and the weight images allocated unless an
+[explicit release](#explicit-weights-release) gives them back, while the engine
+runs; KV extents return only through the reclaims below, memory pressure among
+them. Memory returns to macOS when the engine releases it, never because macOS
+compressed or dropped an idle buffer. macOS page cache, driver allocations and
+other applications still affect memory pressure and swap.
 
 A buffer a dispatch binds is resident for it; one kernels reach by address is
-made resident in one of two ways. KV extents (`BufferReach::Addressed`) join
-the command queue's set, since nearly every command reads KV. A dispatch may
-instead list buffers in an address table (`metal::AddressTable`,
-`CommandGraph::addresses`): the backend writes their GPU addresses as it
-encodes the command, after the dispatch's parameters (`setBytes`, so at most
-512), and makes them resident from that dispatch to the end of its encoder
-(`useResources`, for reading, or reading and writing, declared once per table
-and usage in each encoder), never for the queue.
+made resident in one of two ways. KV extents (`BufferReach::Addressed`) join the
+command queue's set, since nearly every command reads KV: a pool's while a
+request holds one of their pages, the hot block cache's and staging's while they
+are allocated. A dispatch may instead list buffers in an address table
+(`metal::AddressTable`, `CommandGraph::addresses`): the backend writes their GPU
+addresses as it encodes the command, after the dispatch's parameters
+(`setBytes`, so at most 512), and makes them resident from that dispatch to the
+end of its encoder (`useResources`, for reading, or reading and writing,
+declared once per table and usage in each encoder), never for the queue.
 The addresses are those of the buffers' memory when the command is encoded, so
 a buffer released and restored since (which comes back at another address) is
 reached where it is, and a table that reaches released memory is refused like
@@ -1071,26 +1084,27 @@ or comes back, or when it gives up its windowed layers' K/V
 (`KvPool::movePages`), and the copy takes what both forms hold. The pool
 allocates an extent when it needs one of its pages. When it is built it
 allocates the runway, the extents of the first 64 pages, which startup warmup
-runs on; nothing but the pool allocates or releases an extent. An extent whose
-last page is free stays allocated until a reclaim releases it, at once and only
-between commands: memory pressure, an admission the budget denies, the
-publication of a replay point in use or a junction, or startup cleanup. Kernels
-reach a page through the GPU address in its request's page table, so no command
-binds KV; the command queue's residency set makes extents resident for every
-command buffer. The host reaches the same memory (`PageStorage::spans`), which
-is how the disk tier moves pages. A reclaim returns free pages before it evicts
-anything: an empty extent as it is, and the free pages scattered over the others
-of its form as soon as they cover the extent of that form that holds the fewest
-pages, whose pages the pool copies to them (`KvPool::compactExtent`): a Full
-extent before a Slim one and a Slim one before an Index one, unless the reclaim
-needs the memory of one form, as a shortfall of Index pages needs Full memory.
-The blocks and requests on those pages follow them, a page a disk transfer reads
-or writes stays where it is, and a pass that evicts everything copies only what
-is left afterwards. Every extent a pass empties is released, except that a
-warning pass, like startup cleanup, keeps one empty extent as the runway the next
-request starts from, and a pool that spills keeps an extent's worth of free
-Index pages, which spilling draws on first, so that a page spills at the memory
-wall.
+holds and runs on; nothing but the pool allocates or releases an extent. An
+extent whose last page is free stays allocated until a reclaim releases it, at
+once and only between commands: memory pressure, an admission the budget denies,
+the publication of a replay point in use or a junction, or startup cleanup.
+Kernels reach a page through the GPU address in its request's page table, so no
+command binds KV; the command queue's residency set holds the pool's extents of
+pages requests hold, and a table takes entries only of pages of those extents
+(`PageStorage::writeEntries`). The host reaches the same memory
+(`PageStorage::spans`), which is how the disk tier moves pages. A reclaim
+returns free pages before it evicts anything: an empty extent as it is, and the
+free pages scattered over the others of its form as soon as they cover the
+extent of that form that holds the fewest pages, whose pages the pool copies to
+them (`KvPool::compactExtent`): a Full extent before a Slim one and a Slim one
+before an Index one, unless the reclaim needs the memory of one form, as a
+shortfall of Index pages needs Full memory. The blocks and requests on those
+pages follow them, a page a disk transfer reads or writes stays where it is, and
+a pass that evicts everything copies only what is left afterwards. Every extent
+a pass empties is released, except that a warning pass, like startup cleanup,
+keeps one empty extent as the runway the next request starts from, and a pool
+that spills keeps an extent's worth of free Index pages, which spilling draws on
+first, so that a page spills at the memory wall.
 `/status` reports under `kv` the pages of allocated extents (`pages_allocated`),
 those requests and the cache hold (`pages_active`, `pages_cache`) and those
 nothing holds (`pages_free`), the bytes allocated and the bytes of empty extents

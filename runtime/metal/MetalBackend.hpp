@@ -60,7 +60,9 @@ enum class BufferStorage {
 // through its GPU address held in another buffer, as they reach KV extents.
 // A Bound buffer may also be reached through a dispatch's address table
 // (AddressTable), which the backend writes per dispatch and declares once
-// per encoder.
+// per encoder. The command queue's residency set holds an Addressed buffer
+// while its owner says commands reach it (MetalBackend::setQueueResident),
+// making it resident for every command buffer though no command names it.
 enum class BufferReach {
   Bound,
   Addressed,
@@ -92,8 +94,15 @@ public:
   // GPU address of the view's first byte, for kernels that reach a buffer
   // through an address another buffer holds; zero for released memory. Only
   // a buffer allocated BufferReach::Addressed has one: no command names the
-  // buffers kernels reach that way, so only that keeps them resident.
+  // buffers kernels reach that way, so only the command queue's residency set
+  // keeps them resident, while their owners say commands reach them
+  // (MetalBackend::setQueueResident).
   [[nodiscard]] uint64_t gpuAddress() const;
+  // Whether the command queue's residency set holds the buffer's memory for
+  // the commands from the next one on (MetalBackend::setQueueResident): an
+  // Addressed buffer's from its allocation until its owner says otherwise, a
+  // Bound buffer's never. A view's is its allocation's.
+  [[nodiscard]] bool queueResident() const noexcept;
   // Allocation identity and exact view range, including Private storage.
   // This compares metadata only; it never maps or reads device contents.
   [[nodiscard]] bool sameView(const MetalBuffer &other) const noexcept;
@@ -171,7 +180,8 @@ struct IndirectGrid {
 // `index` (setBytes, so at most 512 of them), and makes their memory resident
 // for the encoder's dispatches from this one on (useResources, for reading,
 // or reading and writing when `writes`, declared once per table and usage per
-// encoder), never for the queue as BufferReach::Addressed buffers are.
+// encoder), never for the queue as the BufferReach::Addressed buffers
+// commands reach are (MetalBackend::setQueueResident).
 // Addresses are the buffers' when the command is encoded, so a buffer
 // released and restored since the graph was built is reached where it is
 // now; released memory is refused like a binding of it. Dispatches that
@@ -389,9 +399,9 @@ inline constexpr double kResidencyKeepAliveSeconds = 600.0;
 static_assert(kCommandTimeoutSeconds > 0.0 && kResidencyKeepAliveSeconds > 0.0);
 
 // Permits exactly one submitted-but-not-applied command on its command queue.
-// One thread submits, allocates and looks up pipelines; checkHealth(),
-// healthy(), unhealthyReason(), memoryStats() and commandInFlight() may be
-// called from any thread.
+// One thread submits, allocates, sets queue residency (setQueueResident) and
+// looks up pipelines; checkHealth(), healthy(), unhealthyReason(),
+// memoryStats() and commandInFlight() may be called from any thread.
 class MetalBackend final {
 public:
   // Buffers stay wired for residencyKeepAliveSeconds after the last command;
@@ -430,8 +440,9 @@ public:
   // back to macOS when the engine releases it, not when macOS chooses. A
   // Shared buffer that kernels reach only through its GPU address
   // (BufferReach::Addressed), as they reach KV extents, also belongs to the
-  // set the command queue holds, which makes it resident for every command
-  // buffer though no command names it (Residency).
+  // set the command queue holds while its owner says commands reach it, from
+  // its allocation on (setQueueResident): that set makes it resident for
+  // every command buffer though no command names it (Residency).
   [[nodiscard]] MetalBuffer
   allocateBuffer(uint64_t bytes, BufferStorage storage,
                  std::string_view label,
@@ -451,13 +462,24 @@ public:
   [[nodiscard]] SharedEvent newSharedEvent();
 
   // Frees the memory of a buffer from allocateBuffer while no command is in
-  // flight: it leaves the residency set and the accounting. Its views stay
+  // flight: it leaves the residency sets and the accounting at once, and
+  // keeps whether it is queue resident (setQueueResident). Its views stay
   // valid handles of no memory: a command that binds one fails, and their
   // contents are null and GPU addresses 0, until restoreMemory allocates the
   // buffer's memory again, at another GPU address, its contents undefined
   // until written.
   void releaseMemory(const MetalBuffer &buffer);
   void restoreMemory(const MetalBuffer &buffer);
+  // Whether commands reach an Addressed buffer through its GPU address, as
+  // its owner knows: the command queue's residency set holds the buffer's
+  // memory only while they do, since every command buffer makes all of that
+  // set resident first. A buffer is queue resident from its allocation. The
+  // set changes as the next command begins, never under one in flight: that
+  // command and every later one find resident a buffer marked resident, and
+  // none after it may reach one marked otherwise. Released memory keeps its
+  // mark and follows it once restored. MetalBackendError for a view, another
+  // backend's buffer or a Bound one.
+  void setQueueResident(const MetalBuffer &buffer, bool resident);
 
   // Encodes exactly one compute dispatch, commits it, waits for completion,
   // and reports both GPU and end-to-end wall time.

@@ -302,27 +302,38 @@ struct MetalAllocation {
     BufferStorage storage = BufferStorage::Shared;
     __strong NSString *label = nil;
     BufferReach reach = BufferReach::Bound;
+    // Whether the command queue's set holds an Addressed buffer, as its owner
+    // last said (MetalBackend::setQueueResident), from the next command on.
+    bool queueResident = true;
     // The owner of wrapped memory (MetalBackend::wrapSharedMemory), which is
     // never released: our views keep it as well as Metal's deallocator.
     std::shared_ptr<void> owner;
-    // The residency set the buffer belongs to, held weakly as allocations
-    // may outlive the backend. The set retains the buffer, and with it its
+    // The residency sets the buffer belongs to, held weakly as allocations
+    // may outlive the backend. The sets retain the buffer, and with it its
     // memory, so the last view takes it out.
     std::weak_ptr<Residency> residency;
 
-    // Takes the buffer, which joins the residency set and the accounting.
+    // Takes the buffer, which joins the residency set and the accounting,
+    // and, an Addressed one marked queue resident, the command queue's set
+    // as the next command begins.
     void attach(id<MTLBuffer> allocated) {
         buffer = allocated;
         bytes = allocated.allocatedSize;
-        if (auto kept = residency.lock()) kept->add(buffer, reach);
+        if (auto kept = residency.lock()) {
+            kept->add(buffer);
+            if (reach == BufferReach::Addressed && queueResident) kept->stage(buffer, true);
+        }
         raisePeak(accounting->peakAllocatedBytes,
                   accounting->allocatedBytes.fetch_add(
                       bytes, std::memory_order_relaxed) + bytes);
     }
-    // Lets the buffer go: it leaves the residency set and the accounting.
+    // Lets the buffer go: it leaves the residency sets and the accounting.
     void detach() noexcept {
         if (!buffer) return;
-        if (auto kept = residency.lock()) kept->remove(buffer, reach);
+        if (auto kept = residency.lock()) {
+            if (reach == BufferReach::Addressed) kept->unqueue(buffer);
+            kept->remove(buffer);
+        }
         accounting->allocatedBytes.fetch_sub(bytes, std::memory_order_relaxed);
         buffer = nil;
         bytes = 0;
@@ -1373,6 +1384,13 @@ struct MetalBackend::Impl {
         // command holds every member of its queue's residency set). The
         // command retains everything the GPU still needs.
         @autoreleasepool {
+            // Staged changes of the queue's residency set are made only here,
+            // before the command's first Metal buffer and while none of the
+            // queue's runs (beginSubmission): a removal takes residency from no
+            // running command, and every Metal buffer of this one, each host
+            // step's continuation among them, finds resident each buffer marked
+            // queue resident before it (setQueueResident).
+            residency->commitQueue();
             // The buffers before `command`, each ended by an event signal or
             // a host step.
             std::vector<id<MTLCommandBuffer>> leading;
@@ -1695,6 +1713,10 @@ uint64_t MetalBuffer::gpuAddress() const {
     return impl_->allocation->buffer.gpuAddress + impl_->offsetBytes;
 }
 
+bool MetalBuffer::queueResident() const noexcept {
+    return impl_ && impl_->allocation->reach == BufferReach::Addressed && impl_->allocation->queueResident;
+}
+
 CommandTicket::CommandTicket() = default;
 
 CommandTicket::CommandTicket(std::shared_ptr<State> state)
@@ -1912,6 +1934,15 @@ void MetalBackend::restoreMemory(const MetalBuffer &buffer) {
     allocation.attach(impl_->newBuffer(allocation.length, allocation.storage,
                                        allocation.label));
     impl_->sampleDeviceMemory();
+}
+
+void MetalBackend::setQueueResident(const MetalBuffer &buffer, bool resident) {
+    MetalAllocation &allocation = impl_->baseAllocation(buffer);
+    if (allocation.reach != BufferReach::Addressed)
+        throw MetalBackendError("only a Metal buffer allocated BufferReach::Addressed is queue resident");
+    if (allocation.queueResident == resident) return;
+    allocation.queueResident = resident;
+    if (allocation.buffer) impl_->residency->stage(allocation.buffer, resident);
 }
 
 MetalBuffer MetalBackend::view(const MetalBuffer &base,

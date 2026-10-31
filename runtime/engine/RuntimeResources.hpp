@@ -281,6 +281,8 @@ public:
   [[nodiscard]] engine::Cache &cache() noexcept {
     return *cache_;
   }
+  // Startup warmup holds its runway (KvPool::RunwayHold).
+  [[nodiscard]] KvPool &kvPool() noexcept { return *kvPool_; }
   [[nodiscard]] const RuntimeCacheIdentity &cacheIdentity() const noexcept {
     return cacheIdentity_;
   }

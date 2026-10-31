@@ -1009,8 +1009,10 @@ int main(int argc, char **argv) {
     // These warmups run after serving began, and widths 2-4 each add a lane.
     // Like a start's warmup, what they allocate is memory a request in
     // service needs (MemoryGovernor::setServing): unmarked, the host's
-    // margins refuse a lane the plan holds, and the run fails.
+    // margins refuse a lane the plan holds, and the run fails. Like a start's
+    // warmup too, they hold the KV runway they run on.
     const bool wasServing = resources->memoryGovernor().setServing(true);
+    std::optional<engine::KvPool::RunwayHold> runway(std::in_place, resources->kvPool());
     if (progress)
       progress->begin("warmup", "prefill_2048", 0,
                       model::ExecutionLimits::prefillTokenBudget);
@@ -1035,6 +1037,7 @@ int main(int argc, char **argv) {
       decodeWarmupGpu[width - 1] =
           executor->telemetry().lastDecodeGpuSeconds * 1000.0;
     }
+    runway.reset();
     resources->memoryGovernor().setServing(wasServing);
 
     Events events;

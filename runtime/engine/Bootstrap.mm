@@ -157,7 +157,7 @@ void RuntimeBootstrap::sampleThermalState() {
 }
 
 RuntimeBootstrapReport RuntimeBootstrap::requireWarmupAndAnnounce(
-    const EngineMemoryPlan &memoryPlan, model::RuntimeModel &modelRuntime,
+    const EngineMemoryPlan &memoryPlan, model::RuntimeModel &modelRuntime, KvPool &kvPool,
     ActualMemoryReporter memoryReporter, NativeRuntime &nativeLoop) {
   RuntimeBootstrapReport report = reportForPlan(memoryPlan);
   auto run = [&](RuntimeBootstrapStage stage, WarmupStepStatus &status,
@@ -194,37 +194,40 @@ RuntimeBootstrapReport RuntimeBootstrap::requireWarmupAndAnnounce(
     return result;
   };
 
-  model::WarmupStepResult maximumPrefill =
-      run(RuntimeBootstrapStage::MaximumPrefill, report.warmup.maximumPrefill,
-          [&] {
-            return modelRuntime.warmupPrefill(model::ExecutionLimits::prefillTokenBudget);
-          });
-  nativeLoop.observePrefill(model::ExecutionLimits::prefillTokenBudget,
-                           maximumPrefill.wallSeconds * 1000.0, maximumPrefill.hostSeconds * 1000.0);
-  report.warmup.maximumPrefillDetail = maximumPrefill.detail;
-  const auto &budget = memoryPlan.breakdown();
-  // Startup exercises only widths that fit this budget. This is not a
-  // serving concurrency limit: the engine still admits lanes dynamically.
-  const uint32_t affordableWidth = static_cast<uint32_t>(std::min<uint64_t>(
-      model::ExecutionLimits::maximumBatchWidth,
-      (budget.dynamicBudgetBytes -
-       kvRunwayPages(budget.kvExtentPages) * budget.kvPageBytes) /
-          budget.laneStateBytes));
-  for (uint32_t width = 1;
-       width <= model::ExecutionLimits::maximumBatchWidth; ++width) {
-    if (width > affordableWidth ||
-        (width > 1 && report.warmup.decodeBatches[width - 2] ==
-                          WarmupStepStatus::MemoryLimited)) {
-      report.warmup.decodeBatches[width - 1] = WarmupStepStatus::MemoryLimited;
-      continue;
+  {
+    const KvPool::RunwayHold runway(kvPool);
+    model::WarmupStepResult maximumPrefill =
+        run(RuntimeBootstrapStage::MaximumPrefill, report.warmup.maximumPrefill,
+            [&] {
+              return modelRuntime.warmupPrefill(model::ExecutionLimits::prefillTokenBudget);
+            });
+    nativeLoop.observePrefill(model::ExecutionLimits::prefillTokenBudget,
+                             maximumPrefill.wallSeconds * 1000.0, maximumPrefill.hostSeconds * 1000.0);
+    report.warmup.maximumPrefillDetail = maximumPrefill.detail;
+    const auto &budget = memoryPlan.breakdown();
+    // Startup exercises only widths that fit this budget. This is not a
+    // serving concurrency limit: the engine still admits lanes dynamically.
+    const uint32_t affordableWidth = static_cast<uint32_t>(std::min<uint64_t>(
+        model::ExecutionLimits::maximumBatchWidth,
+        (budget.dynamicBudgetBytes -
+         kvRunwayPages(budget.kvExtentPages) * budget.kvPageBytes) /
+            budget.laneStateBytes));
+    for (uint32_t width = 1;
+         width <= model::ExecutionLimits::maximumBatchWidth; ++width) {
+      if (width > affordableWidth ||
+          (width > 1 && report.warmup.decodeBatches[width - 2] ==
+                            WarmupStepStatus::MemoryLimited)) {
+        report.warmup.decodeBatches[width - 1] = WarmupStepStatus::MemoryLimited;
+        continue;
+      }
+      run(RuntimeBootstrapStage::DecodeWarmup,
+          report.warmup.decodeBatches[width - 1],
+          [&] { return modelRuntime.warmupDecodeBatch(width); }, width > 1);
     }
-    run(RuntimeBootstrapStage::DecodeWarmup,
-        report.warmup.decodeBatches[width - 1],
-        [&] { return modelRuntime.warmupDecodeBatch(width); }, width > 1);
+    run(RuntimeBootstrapStage::CompositeStateRestore,
+        report.warmup.compositeStateRestore,
+        [&] { return modelRuntime.warmupCompositeStateRestore(); }, true);
   }
-  run(RuntimeBootstrapStage::CompositeStateRestore,
-      report.warmup.compositeStateRestore,
-      [&] { return modelRuntime.warmupCompositeStateRestore(); }, true);
 
   ActualMemoryReport actual;
   try {
@@ -390,7 +393,7 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
   RuntimeResources *resourcesPointer = resources.get();
   model::RuntimeModel *modelPointer = modelRuntime.get();
   RuntimeBootstrapReport report = requireWarmupAndAnnounce(
-      resources->memoryPlan(), *modelRuntime,
+      resources->memoryPlan(), *modelRuntime, resources->kvPool(),
       [resourcesPointer, modelPointer] {
         // Audit every attempted warmup before reclaiming idle buffers.
         // Wider batches and cache memory grow on demand after Ready.

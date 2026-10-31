@@ -3,11 +3,11 @@
 #include "TestBuffers.hpp"
 #include "TestChecks.hpp"
 #include "TestFiles.hpp"
+#include "TestMethodReplacement.hpp"
 #include "TestStderr.hpp"
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
-#import <objc/runtime.h>
 
 #include <unistd.h>
 
@@ -53,6 +53,8 @@ using splash::metal::IndirectGrid;
 using splash::metal::MetalBackend;
 using splash::metal::MetalBackendError;
 using splash::metal::SharedEvent;
+using splash::test::MethodReplacement;
+using splash::test::QueueSets;
 using splash::test::TemporaryDirectory;
 using splash::test::capturedStderr;
 using splash::test::rejects;
@@ -93,19 +95,6 @@ struct TemporaryMetallib final {
     }
     ~TemporaryMetallib() { ::unlink(path.c_str()); }
     std::string path;
-};
-
-class MethodReplacement final {
-public:
-    MethodReplacement(id object, SEL selector, IMP replacement) {
-        method_ = class_getInstanceMethod(object_getClass(object), selector);
-        require(method_ != nullptr, "replacement method is missing");
-        original = method_setImplementation(method_, replacement);
-    }
-    ~MethodReplacement() { method_setImplementation(method_, original); }
-    IMP original = nullptr;
-private:
-    Method method_ = nullptr;
 };
 
 thread_local bool inCompletionHandler = false;
@@ -754,8 +743,8 @@ id countComputeEncoder(id command, SEL selector) {
 }
 
 // Counts what residency sets ask of Metal while it lives, passing every call
-// on: requests and ends of residency, and removals of a member. All sets
-// share the class of the one it creates. Arm it before the backend it
+// on: requests and ends of residency, removals of a member and commits. All
+// sets share the class of the one it creates. Arm it before the backend it
 // observes, so that no call races the swap.
 class ResidencyCalls final {
 public:
@@ -763,17 +752,20 @@ public:
         originalRequest = request_.original;
         originalEnd = end_.original;
         originalRemoval = removal_.original;
-        requests = ends = removals = 0;
+        originalCommit = commit_.original;
+        requests = ends = removals = commits = 0;
     }
 
     static inline std::atomic<unsigned> requests{0};
     static inline std::atomic<unsigned> ends{0};
     static inline std::atomic<unsigned> removals{0};
+    static inline std::atomic<unsigned> commits{0};
 
 private:
     static inline IMP originalRequest = nullptr;
     static inline IMP originalEnd = nullptr;
     static inline IMP originalRemoval = nullptr;
+    static inline IMP originalCommit = nullptr;
 
     static void countRequest(id set, SEL selector) {
         ++requests;
@@ -787,6 +779,10 @@ private:
         ++removals;
         reinterpret_cast<void (*)(id, SEL, id)>(originalRemoval)(set, selector, allocation);
     }
+    static void countSetCommit(id set, SEL selector) {
+        ++commits;
+        reinterpret_cast<void (*)(id, SEL)>(originalCommit)(set, selector);
+    }
 
     id<MTLResidencySet> set_ = [MTLCreateSystemDefaultDevice()
         newResidencySetWithDescriptor:[MTLResidencySetDescriptor new] error:nil];
@@ -795,6 +791,7 @@ private:
     MethodReplacement end_{set_, @selector(endResidency), reinterpret_cast<IMP>(countEnd)};
     MethodReplacement removal_{set_, @selector(removeAllocation:),
                                reinterpret_cast<IMP>(countRemoval)};
+    MethodReplacement commit_{set_, @selector(commit), reinterpret_cast<IMP>(countSetCommit)};
 };
 
 // Polls until `done` holds or `limit` passes, and returns whether it held.
@@ -1025,45 +1022,94 @@ void residencyRacesTheHeartbeat(const std::string &metallibPath) {
               << " lapses=" << lapses << '\n';
 }
 
-// Records the residency sets added to command queues.
-class QueueSets final {
-public:
-    QueueSets() {
-        original = replacement_.original;
-        added.clear();
-    }
-
-    static inline std::vector<id<MTLResidencySet>> added;
-
-private:
-    static inline IMP original = nullptr;
-
-    static void recordAdd(id queue, SEL selector, id<MTLResidencySet> set) {
-        added.push_back(set);
-        reinterpret_cast<void (*)(id, SEL, id)>(original)(queue, selector, set);
-    }
-
-    id<MTLCommandQueue> queue_ = [MTLCreateSystemDefaultDevice() newCommandQueue];
-    MethodReplacement replacement_{queue_, @selector(addResidencySet:),
-                                   reinterpret_cast<IMP>(recordAdd)};
-};
-
 // The command queue holds one residency set, of the buffers kernels reach
-// only through their addresses, and none other: a command buffer waits for
-// its queue's set to be resident before it starts (Residency). Only a Shared
-// buffer is reached by its address, and only such a buffer has one, zero
-// while its memory is released.
-void queueHoldsAddressedBuffers(const std::string &metallibPath) {
+// only through their addresses while their owners say commands reach them
+// (MetalBackend::setQueueResident), and none other: a command buffer waits
+// for its queue's set to be resident before it starts (Residency). A buffer
+// joins the set or leaves it as the next command begins, never under a
+// command in flight; one marked and unmarked again between two commands, or
+// allocated and released between them, leaves the set as it was without a
+// commit of it; and released memory leaves the set at once, keeps its mark,
+// takes one set while it is released, and follows it once restored. Only a
+// Shared buffer is reached by its address, and only such a buffer has one,
+// zero while its memory is released.
+void queueHoldsBuffersCommandsReach(const std::string &metallibPath) {
     QueueSets sets;
+    ResidencyCalls calls;
     MetalBackend backend(metallibPath);
     require(sets.added.size() == 1, "the command queue does not hold exactly one residency set");
+    id<MTLResidencySet> queued = sets.added.front();
+    MetalBuffer word = sharedBuffer(backend, sizeof(uint32_t));
+    const ComputeDispatch kick{"residency_kick", {{0, word}}, {}, {1, 1, 1}, {1, 1, 1}};
+    const auto command = [&] { (void)backend.submitCommandAsync({&kick, 1}).wait(); };
     const uint64_t page = static_cast<uint64_t>(getpagesize());
     MetalBuffer bound = backend.allocateBuffer(page, BufferStorage::Shared, "bound");
     MetalBuffer addressed = backend.allocateBuffer(page, BufferStorage::Shared, "addressed",
                                                    BufferReach::Addressed);
-    NSArray<id<MTLAllocation>> *held = sets.added.front().allAllocations;
-    require(held.count == 1 && [((id<MTLBuffer>)held.firstObject).label isEqualToString:@"addressed"],
+    require(addressed.queueResident() && !bound.queueResident() && queued.allocationCount == 0,
+            "an addressed buffer was not queue resident, or joined the set before a command");
+    command();
+    require(queued.allocationCount == 1 && sets.holds(@"addressed"),
             "the command queue's set does not hold exactly the addressed buffer");
+
+    backend.setQueueResident(addressed, false);
+    require(!addressed.queueResident() && sets.holds(@"addressed"),
+            "a buffer left the command queue's set before the next command");
+    command();
+    require(queued.allocationCount == 0, "a buffer no command reaches stayed in the command queue's set");
+
+    unsigned commits = calls.commits;
+    backend.setQueueResident(addressed, true);
+    backend.setQueueResident(addressed, false);
+    command();
+    require(calls.commits == commits && queued.allocationCount == 0,
+            "a buffer marked and unmarked between two commands changed the command queue's set");
+    // The backend's set takes the buffer and lets it go, a commit each.
+    const unsigned removals = calls.removals;
+    commits = calls.commits;
+    (void)backend.allocateBuffer(page, BufferStorage::Shared, "transient", BufferReach::Addressed);
+    command();
+    require(calls.removals == removals + 1 && calls.commits == commits + 2 && queued.allocationCount == 0,
+            "a buffer released before a command reached the command queue's set");
+
+    {
+        auto ticket = backend.submitCommandAsync({&kick, 1});
+        backend.setQueueResident(addressed, true);
+        require(queued.allocationCount == 0, "a buffer joined the command queue's set under a command in flight");
+        (void)ticket.wait();
+    }
+    require(queued.allocationCount == 0, "a buffer joined the command queue's set without a command");
+    command();
+    require(sets.holds(@"addressed"), "a buffer marked under a command did not join the set at the next one");
+
+    backend.releaseMemory(addressed);
+    require(queued.allocationCount == 0 && addressed.queueResident() && !addressed.gpuAddress(),
+            "released memory stayed in the command queue's set, lost its mark or kept its GPU address");
+    backend.restoreMemory(addressed);
+    require(queued.allocationCount == 0, "restored memory joined the command queue's set before a command");
+    command();
+    require(sets.holds(@"addressed") && addressed.gpuAddress(),
+            "restored memory marked queue resident did not join the command queue's set");
+    backend.setQueueResident(addressed, false);
+    backend.releaseMemory(addressed);
+    backend.restoreMemory(addressed);
+    command();
+    require(queued.allocationCount == 0, "restored memory not marked queue resident joined the command queue's set");
+    backend.releaseMemory(addressed);
+    backend.setQueueResident(addressed, true);
+    require(addressed.queueResident() && queued.allocationCount == 0,
+            "released memory did not take its mark, or joined the command queue's set");
+    command();
+    backend.restoreMemory(addressed);
+    command();
+    require(sets.holds(@"addressed"), "memory marked queue resident while released did not join the set once restored");
+
+    require(backend.view(addressed, 0, 64).queueResident(), "a view is not queue resident as its allocation");
+    rejects([&] { backend.setQueueResident(bound, false); },
+            "only a Metal buffer allocated BufferReach::Addressed is queue resident",
+            "a bound buffer was marked queue resident");
+    rejects([&] { backend.setQueueResident(backend.view(addressed, 0, 64), false); },
+            "a view's memory is its base buffer's", "a view was marked queue resident");
     rejects([&] {
                 (void)backend.allocateBuffer(page, BufferStorage::Private, "private", BufferReach::Addressed);
             },
@@ -1071,19 +1117,16 @@ void queueHoldsAddressedBuffers(const std::string &metallibPath) {
             "a Private buffer was reached by its address");
     rejects([&] { (void)bound.gpuAddress(); }, "allocated BufferReach::Addressed has a GPU address",
             "a buffer kernels reach bound had a GPU address");
-    require(addressed.gpuAddress(), "an addressed buffer has no GPU address");
-    backend.releaseMemory(addressed);
-    require(!addressed.gpuAddress(), "released memory kept its GPU address");
-    std::cout << "PASS the command queue holds the addressed buffers\n";
+    std::cout << "PASS the command queue holds the buffers commands reach\n";
 }
 
 // Kernels reach shared buffers only through GPU addresses in a table, as
 // they reach KV extents (BufferReach::Addressed). The command queue's
-// residency set makes the buffers resident for every command, also once the
-// backend's set has lapsed; one dispatch reads what the previous one wrote
-// through them; the CPU reads what kernels wrote and kernels read what the CPU
-// wrote between commands; and buffers released and allocated again between
-// commands work at once.
+// residency set makes the buffers resident for every command from the first
+// after their allocation, also once the backend's set has lapsed; one
+// dispatch reads what the previous one wrote through them; the CPU reads what
+// kernels wrote and kernels read what the CPU wrote between commands; and
+// buffers released and allocated again between commands work at once.
 void buffersReachedThroughTables(const std::string &metallibPath) {
     constexpr double kKeepAliveSeconds = 0.2;
     constexpr uint32_t kBuffers = 6, kWords = 16384, kRounds = 60;
@@ -1172,7 +1215,8 @@ void buffersReachedThroughTables(const std::string &metallibPath) {
         }
     }
     buffers.clear();
-    // Each released buffer leaves both the backend's set and the queue's.
+    // Each released buffer leaves both the backend's set and the queue's,
+    // which a command after its allocation made it join.
     require(backend.memoryStats().allocatedBytes == before &&
                 calls.removals == 2 * (kBuffers + regrown),
             "released buffers stayed counted or in the residency sets");
@@ -2578,7 +2622,7 @@ int main(int argc, const char *argv[]) {
             residencyRacesTheHeartbeat(argv[1]);
             residencyEndsWithoutBlits(argv[1]);
             residencyReturnsRemovedBuffers(argv[1]);
-            queueHoldsAddressedBuffers(argv[1]);
+            queueHoldsBuffersCommandsReach(argv[1]);
             buffersReachedThroughTables(argv[1]);
             addressTables(argv[1]);
             run(argv[1]);

@@ -71,8 +71,10 @@ public:
   }
 
   // Shared buffers of the backend, zero-filled and addressed
-  // (metal::BufferReach), as the pool's extents: resident for every command
-  // buffer. `extents` Full extents, or an extent of each form of `forms`.
+  // (metal::BufferReach) as the pool's extents, and queue resident from their
+  // allocation: resident for every command buffer, as the extents of pages
+  // requests hold. `extents` Full extents, or an extent of each form of
+  // `forms`.
   HostKvExtents(metal::MetalBackend &backend, kv::Layout layout,
                 uint32_t extentPages, uint32_t extents)
       : HostKvExtents(backend, layout, extentPages, std::vector(extents, kv::PageForm::Full)) {}

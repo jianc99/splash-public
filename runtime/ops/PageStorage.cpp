@@ -115,6 +115,10 @@ void PageStorage::releaseExtent(uint32_t extent) {
     record = {};
 }
 
+void PageStorage::setExtentActive(uint32_t extent, bool active) noexcept {
+    backend_.setQueueResident(extents_.at(extent).buffer, active);
+}
+
 void PageStorage::copyPages(std::span<const PageCopy> copies) {
     if (backend_.commandInFlight()) {
         throw std::logic_error(
@@ -173,7 +177,12 @@ void PageStorage::writeTable(std::span<const uint32_t> pages, uint32_t first,
     }
     for (size_t index = first; index < pages.size(); ++index) {
         const uint32_t page = pages[index];
-        entries[index] = entry(allocatedExtent(page), page % extentPages_);
+        const Extent &extent = allocatedExtent(page);
+        if (!extent.buffer.queueResident()) {
+            throw std::logic_error("KV page " + std::to_string(page) +
+                                   " is in an extent that is not resident for commands");
+        }
+        entries[index] = entry(extent, page % extentPages_);
     }
 }
 

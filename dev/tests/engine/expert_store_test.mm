@@ -32,6 +32,7 @@
 #include "TestAdmission.hpp"
 #include "TestChecks.hpp"
 #include "TestFiles.hpp"
+#include "TestMethodReplacement.hpp"
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
 #include "model/ExpertStore.hpp"
@@ -43,7 +44,6 @@
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
-#import <objc/runtime.h>
 
 #include <algorithm>
 #include <array>
@@ -83,6 +83,7 @@ using splash::ops::MoePhase;
 using splash::ops::MoePlan;
 using splash::ops::MoeShape;
 using splash::ops::QuantizedSegment;
+using splash::test::MethodReplacement;
 using splash::test::require;
 using namespace gguf_reference;
 using namespace moe_fixture;
@@ -469,24 +470,6 @@ int streamedUnionLoads(MetalBackend &backend, const MoeShape &shape, const std::
   }
   return failures;
 }
-
-// Replaces a method of the class of `object`, every command buffer's, while
-// it lives.
-class MethodReplacement final {
-public:
-  MethodReplacement(id object, SEL selector, IMP replacement)
-      : method_(class_getInstanceMethod(object_getClass(object), selector)) {
-    require(method_ != nullptr, "replacement method is missing");
-    original = method_setImplementation(method_, replacement);
-  }
-  ~MethodReplacement() { method_setImplementation(method_, original); }
-  MethodReplacement(const MethodReplacement &) = delete;
-  MethodReplacement &operator=(const MethodReplacement &) = delete;
-  IMP original = nullptr;
-
-private:
-  Method method_ = nullptr;
-};
 
 // Once armed, the command buffer that raises a command's first host step's
 // event (its value 1) never raises it and fails once it ends, as a buffer the

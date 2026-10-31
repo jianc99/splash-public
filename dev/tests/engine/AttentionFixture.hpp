@@ -188,8 +188,9 @@ private:
 
 // A fixture's extents start its one allocation and its tensors are views of
 // the rest; kernels reach the extents only through the lanes' page tables, so
-// the allocation is addressed (metal::BufferReach), resident for every
-// command buffer. Lanes past the plan's lanes bind lane 0's page table, as the
+// the allocation is addressed (metal::BufferReach) and queue resident from
+// its allocation: resident for every command buffer, as the extents of pages
+// requests hold. Lanes past the plan's lanes bind lane 0's page table, as the
 // runtime's padded lanes do.
 class AttentionFixture final {
 public:

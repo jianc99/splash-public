@@ -27,7 +27,11 @@ namespace splash::test {
 // says a command is in flight, as PageStorage's does. Every page holds one
 // value, which a test sets, a copy carries (between forms too, as what both
 // pages hold) and a clear zeroes, so a test can follow the content of pages
-// the pool moves.
+// the pool moves. An extent is active from its allocation, as PageStorage's,
+// until the pool says otherwise (setExtentActive), which counts each change
+// and, as a misuse, a mark of an unallocated extent or one the extent already
+// has. Releasing an active extent throws std::logic_error, changing nothing:
+// the pool releases only extents none of whose pages a request holds.
 class TestKvStorage final : public kv::ExtentStorage {
 public:
     TestKvStorage(uint32_t pages, uint64_t bytesPerPage, uint32_t extentPages,
@@ -39,6 +43,7 @@ public:
             throw std::invalid_argument("invalid test KV extent storage");
         }
         forms_.resize(pages / extentPages);
+        active_.resize(pages / extentPages);
     }
 
     uint32_t pageCount() const noexcept override { return pageCount_; }
@@ -64,11 +69,14 @@ public:
             return allocationFailure;
         }
         forms_[extent] = form;
+        active_[extent] = true;
         return {};
     }
     void releaseExtent(uint32_t extent) override {
         if (!forms_.at(extent))
             throw std::logic_error("test KV extent is not allocated");
+        if (active_[extent])
+            throw std::logic_error("the pool released a KV extent a request holds a page of");
         if (commandInFlight && commandInFlight()) {
             throw std::logic_error(
                 "cannot release a KV extent while a command is in flight");
@@ -93,6 +101,14 @@ public:
             content.at(copy.to) = content.at(copy.from);
             copies.push_back(copy);
         }
+    }
+    void setExtentActive(uint32_t extent, bool active) noexcept override {
+        if (extent >= forms_.size() || !forms_[extent] || active_[extent] == active) {
+            ++activityMisuses;
+            return;
+        }
+        active_[extent] = active;
+        ++activityChanges;
     }
     void clearPages(std::span<const uint32_t> pages) override {
         for (uint32_t page : pages) {
@@ -125,6 +141,24 @@ public:
             if (form) bytes += extentPages_ * bytesPerPage(*form);
         return bytes;
     }
+    // Whether the allocated extent is active, as the pool last said.
+    [[nodiscard]] bool active(uint32_t extent) const {
+        if (!forms_.at(extent))
+            throw std::logic_error("test KV extent is not allocated");
+        return active_[extent];
+    }
+    // Whether exactly the allocated extents that hold a page a request holds
+    // are active, and the pool told only changes.
+    [[nodiscard]] bool activityFollows(const engine::KvPool &pool) const {
+        for (uint32_t extent = 0; extent < forms_.size(); ++extent) {
+            if (!forms_[extent]) continue;
+            bool held = false;
+            for (uint32_t page = extent * extentPages_; page < (extent + 1) * extentPages_; ++page)
+                held = held || pool.pageActive(page);
+            if (active_[extent] != held) return false;
+        }
+        return activityMisuses == 0;
+    }
 
     uint32_t budgetPages = std::numeric_limits<uint32_t>::max();
     bool growthBlocked = false;
@@ -137,6 +171,9 @@ public:
     std::chrono::milliseconds releaseTime{0};
     uint32_t allocationAttempts = 0;
     uint32_t releasedExtents = 0;
+    // The changes setExtentActive made, and the calls it took as misuses.
+    uint32_t activityChanges = 0;
+    uint32_t activityMisuses = 0;
     // What the releases took as measured here, in milliseconds: the longest,
     // and all of them together.
     double longestRelease = 0.0;
@@ -153,6 +190,8 @@ private:
     uint32_t extentPages_ = 0;
     // The form of each allocated extent.
     std::vector<std::optional<kv::PageForm>> forms_;
+    // Whether each allocated extent is active.
+    std::vector<bool> active_;
 };
 
 }  // namespace splash::test

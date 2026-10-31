@@ -101,13 +101,35 @@ struct KvPageMoveResult final {
 // up, empty extents are touched last, and cold extents drain to empty, the
 // only state in which an extent can be released. Held pages are scattered
 // over the extents all the same; compactExtent() empties one more extent
-// whenever the free pages of the others of its form cover it.
+// whenever the free pages of the others of its form cover it. Commands reach
+// a page only through the tables of the requests that hold it, so the pool
+// tells the storage which extents hold a page a request holds
+// (ExtentStorage::setExtentActive): only those are resident for commands,
+// and pages only the cache holds cost them nothing. Every command buffer pays
+// for each extent resident for it: 8 GB of extents only the cache held made a
+// streamed Qwen3.8-Flash-Next decode cycle 3.5-5.5% slower (M5 Max with
+// 36 GB), where 8 GB of buffers outside the command queue's residency set
+// cost nothing.
 class KvPool final {
 public:
   // Allocates the runway, the Full extents that hold pages [0, runwayPages),
   // or throws metal::MetalAllocationError with the budget's cause;
   // std::invalid_argument for a runway longer than the pool.
   KvPool(kv::ExtentStorage &storage, uint32_t runwayPages);
+
+  // Holds the runway's pages, as a request holds its own, while it lives:
+  // startup warmup runs on them, and commands reach only the extents of
+  // pages requests hold. Rethrows, holding none, when the pool refuses one.
+  class RunwayHold final {
+  public:
+    explicit RunwayHold(KvPool &pool);
+    ~RunwayHold();
+    RunwayHold(const RunwayHold &) = delete;
+    RunwayHold &operator=(const RunwayHold &) = delete;
+
+  private:
+    KvPool &pool_;
+  };
 
   // The pages, of the form, come with one active reference each, the
   // requester's.
@@ -197,6 +219,9 @@ private:
 
   struct ExtentRecord {
     uint32_t usedPages = 0;
+    // The extent's pages a request holds: commands reach the extent while it
+    // holds any (ExtentStorage::setExtentActive).
+    uint32_t activePages = 0;
     uint32_t previousReclaimable = noIndex;
     uint32_t nextReclaimable = noIndex;
     // The extent's pages nothing holds; only an allocated extent lists any.
@@ -256,6 +281,11 @@ private:
   [[nodiscard]] uint32_t fillingExtent(kv::PageForm form) noexcept;
   void markUsed(uint32_t page) noexcept;
   void markFree(uint32_t page) noexcept;
+  // A page gains its first request's reference or loses its last: counted in
+  // its form and its extent, whose storage hears when the extent's count
+  // leaves zero or reaches it (ExtentStorage::setExtentActive).
+  void markActive(uint32_t page) noexcept;
+  void markInactive(uint32_t page) noexcept;
   void setExtentAllocated(uint32_t extent, bool allocated) noexcept;
   void setExtentReclaimable(uint32_t extent, bool reclaimable) noexcept;
 
@@ -266,6 +296,8 @@ private:
 
   kv::ExtentStorage &storage_;
   uint32_t extentPages_ = 0;
+  // The runway's pages, from page 0 (RunwayHold).
+  uint32_t runwayPages_ = 0;
   uint64_t extentAllocations_ = 0;
   uint64_t extentReleases_ = 0;
   double extentAllocateMaxMilliseconds_ = 0.0;

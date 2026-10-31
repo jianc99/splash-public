@@ -76,6 +76,7 @@ void testRunwayIsAllocatedThroughThePool() {
     require(status.extentAllocations - status.extentReleases == 1 &&
                 status.pagesAllocated == 4 && storage.allocatedPages() == 4,
             "the pool's extent counts differ from the extents allocated");
+    require(storage.activityFollows(pool), "the runway was active though no request held a page of it");
 
     TestKvStorage blocked(16, 100, 4);
     blocked.growthBlocked = true;
@@ -88,6 +89,31 @@ void testRunwayIsAllocatedThroughThePool() {
     require(refused, "a refused runway did not fail with the budget's cause");
     rejects([&] { KvPool longPool(blocked, 17); }, "the KV runway exceeds the page pool",
             "a runway longer than the pool was accepted");
+}
+
+// A runway hold holds the runway's pages as a request holds its own, which
+// makes their extents active, and lets them go when it ends. One the pool
+// refuses a page of, as a runway extent a reclaim released, holds none.
+void testRunwayHoldHoldsTheRunway() {
+    TestKvStorage storage(16, 100, 4);
+    KvPool pool(storage, 6);
+    {
+        const KvPool::RunwayHold runway(pool);
+        require(pool.snapshot().pagesActive == 6 && pool.pageActive(5) && !pool.pageActive(6) &&
+                    storage.active(0) && storage.active(1) && storage.activityFollows(pool),
+                "a runway hold did not hold exactly the runway's pages");
+    }
+    require(pool.snapshot().pagesActive == 0 && storage.activityFollows(pool),
+            "a runway hold kept pages once it ended");
+
+    // A page of extent 0 held keeps it while a reclaim releases extent 1.
+    pool.retainPage(0, false);
+    require(reclaimEvery(pool, false) == extentBytes && !storage.allocated(1), "reclaim setup failed");
+    pool.releasePage(0, false);
+    rejects([&] { const KvPool::RunwayHold runway(pool); }, "cannot retain a KV page of an unallocated extent",
+            "a runway hold took a page of a released extent");
+    require(pool.snapshot().pagesActive == 0 && storage.activityFollows(pool),
+            "a refused runway hold kept the pages it held before the refusal");
 }
 
 // Page ids cover every extent the budget could hold, so running out of them
@@ -122,6 +148,8 @@ void testFailedGrowthKeepsItsExtentsForTheRetry() {
                 status.pagesPrefix == 0 && status.extentAllocations == 2,
             "a failed acquisition was not denied, held pages or did not "
             "keep its extents");
+    require(!storage.active(0) && !storage.active(1) && storage.activityFollows(pool),
+            "the extents a failed acquisition kept were active");
     storage.growthAllowed = nullptr;
     pages = pool.acquirePages(9);
     require(pages.granted() && pool.snapshot().extentAllocations == 3 &&
@@ -296,6 +324,49 @@ void testOnlyAPageItsRequesterHoldsAloneIsCleared() {
     release(pool, acquired.pages);
 }
 
+// Commands reach a page only through the tables of the requests that hold
+// it, so the storage hears which extents hold a page a request holds: a new
+// extent is inactive, turns active with its first such page and inactive
+// with its last, whether a request acquired the page, retained a free one
+// (as warmup holds the runway) or one the cache holds, and the pool tells
+// only changes. Pages only the cache holds keep no extent active, and a
+// reclaim releases only inactive extents.
+void testOnlyExtentsOfPagesRequestsHoldAreActive() {
+    TestKvStorage storage(16, 100, 4);
+    KvPool pool(storage, 4);
+    require(!storage.active(0) && storage.activityChanges == 1,
+            "the runway was active though no request held a page of it");
+    auto first = pool.acquirePages(2);
+    require(first.granted() && first.pages == std::vector<uint32_t>{0, 1} && storage.active(0) &&
+                storage.activityChanges == 2,
+            "the extent of pages a request acquired did not turn active once");
+    pool.retainPage(0, false);
+    pool.retainPage(0, true);
+    require(storage.activityChanges == 2, "another reference to a held page changed its extent");
+    release(pool, {0, 0, 1});
+    require(!storage.active(0) && storage.activityChanges == 3 && storage.activityFollows(pool),
+            "an extent whose pages only the cache holds stayed active");
+    pool.retainPage(0, false);
+    require(storage.active(0) && storage.activityChanges == 4,
+            "a request that took a cached page did not make its extent active");
+    // Pages 1 to 3 of the runway, then page 4 of an extent the growth adds.
+    auto grown = pool.acquirePages(4);
+    require(grown.granted() && grown.pages.back() == 4 && storage.active(1) && storage.activityChanges == 6 &&
+                storage.activityFollows(pool),
+            "an extent the pool grew by did not start inactive and turn active with its page");
+    release(pool, grown.pages);
+    release(pool, {0});
+    require(!storage.active(0) && !storage.active(1) && storage.activityChanges == 8,
+            "extents stayed active once no request held a page of them");
+    pool.retainPage(5, false);
+    require(storage.active(1) && storage.activityFollows(pool),
+            "a free page a request retained did not make its extent active");
+    release(pool, {5});
+    pool.releasePage(0, true);
+    require(reclaimEvery(pool, false) == 2 * extentBytes && storage.activityFollows(pool),
+            "the inactive extents were not released");
+}
+
 // The pool with every page allocated and held by a request, less the pages
 // in `released`. Every page starts with content of its own.
 KvPool held(TestKvStorage &storage, const std::vector<uint32_t> &released) {
@@ -399,11 +470,51 @@ void testCompactionMovesNothingWhenTheStorageRefuses() {
     const auto status = pool.snapshot();
     require(pool.pageActive(3) && !pool.pageActive(7) &&
                 status.pagesActive == 6 && status.pagesFree == 6 &&
-                status.reclaimableBytes == 0 && status.extentCompactions == 0,
+                status.reclaimableBytes == 0 && status.extentCompactions == 0 &&
+                storage.activityFollows(pool),
             "a refused copy left pages moved");
     storage.commandInFlight = nullptr;
     require(pool.compactExtent({}).follow(3) == 7,
             "the pool did not compact after the storage refused");
+}
+
+// Activity follows the references that move with their pages: the extent
+// a request's page goes to turns active, even one only the cache held, and
+// the one it leaves inactive, which a reclaim then releases; a page only
+// the cache holds makes no extent active wherever it goes.
+void testActivityFollowsMovedReferences() {
+    {
+        TestKvStorage storage(12, 100, 4);
+        // Extent 0 keeps request page 2 and cached page 3, extent 1 cached
+        // pages 4 to 6, extent 2 request pages 8 and 9.
+        KvPool pool = held(storage, {0, 1, 7, 10, 11});
+        for (uint32_t page = 3; page <= 6; ++page) {
+            pool.retainPage(page, true);
+            pool.releasePage(page, false);
+        }
+        require(storage.active(0) && !storage.active(1) && storage.active(2) && storage.activityFollows(pool),
+                "compaction setup failed");
+        const auto moves = pool.compactExtent({});
+        require(moves.moved == std::vector<PageCopy>{{2, 7}, {3, 11}} && !storage.active(0) &&
+                    storage.active(1) && storage.active(2) && storage.activityFollows(pool),
+                "a compaction did not move its extents' activity with the request's page");
+        require(reclaimEvery(pool, false) == extentBytes && !storage.allocated(0),
+                "the extent a compaction emptied was not released");
+    }
+    TestKvStorage storage(16, 100, 4, 10);
+    KvPool pool(storage, 4);
+    require(pool.acquirePages(2).granted(), "move setup failed");
+    // Page 1 belongs to the cache alone.
+    pool.retainPage(1, true);
+    pool.releasePage(1, false);
+    const auto spilled = pool.movePages(std::vector<uint32_t>{0, 1}, PageForm::Index);
+    require(spilled.granted() && pool.form(spilled.moves.follow(0)) == PageForm::Index && !storage.active(0) &&
+                storage.active(1) && storage.activityFollows(pool),
+            "a move to the other form did not move its extents' activity with the request's page");
+    const auto restored = pool.movePages(std::vector<uint32_t>{spilled.moves.follow(1)}, PageForm::Full);
+    require(restored.granted() && restored.moves.follow(spilled.moves.follow(1)) / 4 == 0 && !storage.active(0) &&
+                storage.activityFollows(pool),
+            "a page only the cache holds made the extent it moved to active");
 }
 
 // Pages of a form come only from extents of their form, the fullest first.
@@ -520,7 +631,7 @@ void testRefusedMovesMoveNothing() {
     rejects([&] { static_cast<void>(pool.movePages(std::span(five).first(4), PageForm::Index)); },
             "cannot copy KV pages while a command is in flight", "a move went on without its copy");
     storage.commandInFlight = nullptr;
-    require(unchanged(), "a refused move changed the pool");
+    require(unchanged() && storage.activityFollows(pool), "a refused move changed the pool");
     require(pool.movePages(five, PageForm::Index).granted() && !pool.pageActive(0) &&
                 pool.snapshot().index.pagesActive == 5,
             "the pool did not move the pages a refusal had kept");
@@ -699,6 +810,7 @@ int main() {
     try {
         testGrowthFillsAllocatedExtents();
         testRunwayIsAllocatedThroughThePool();
+        testRunwayHoldHoldsTheRunway();
         testIdExhaustionIsALogicError();
         testFailedGrowthKeepsItsExtentsForTheRetry();
         testPressureReusesFreePagesAndDeniesGrowth();
@@ -713,6 +825,8 @@ int main() {
         testCompactionNeedsFreePagesInExtentsInUse();
         testCompactionLeavesFixedPagesInPlace();
         testCompactionMovesNothingWhenTheStorageRefuses();
+        testOnlyExtentsOfPagesRequestsHoldAreActive();
+        testActivityFollowsMovedReferences();
         testEachFormFillsItsOwnExtents();
         testAnExtentTakesTheFormOfEachAllocation();
         testPagesMoveToTheOtherFormAndBack();

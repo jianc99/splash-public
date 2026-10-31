@@ -66,6 +66,9 @@ struct PageCopy final {
 // The memory of the engine's page pool: extents of extentPages() pages,
 // pageCount() a whole number of them, each of one form (PageForm) from its
 // allocation to its release. Only KvPool allocates and releases them.
+// Commands reach a page only through the tables of the requests that hold
+// it, so the pool says which extents hold a page a request holds
+// (setExtentActive), and only those need be resident for commands.
 // Implementations provide Metal storage or deterministic test storage.
 class ExtentStorage {
 public:
@@ -82,7 +85,15 @@ public:
   // Releases allocated extent `extent` at once. std::logic_error, changing
   // nothing, for an unallocated extent or while a command is in flight (a
   // command reaches extents through its page tables without retaining them).
+  // The pool releases only an inactive extent (setExtentActive).
   virtual void releaseExtent(uint32_t extent) = 0;
+  // Whether a request holds a page of allocated extent `extent`: commands
+  // reach only the extents of such pages, so the storage keeps only active
+  // extents resident for commands (PageStorage). A new extent is active, as
+  // those of a storage no pool owns stay; the pool marks each extent it
+  // allocates inactive at once, and then tells only changes, after its own
+  // records changed, so a failure terminates.
+  virtual void setExtentActive(uint32_t extent, bool active) noexcept = 0;
   // Copies each page's content onto its destination, both in allocated
   // extents: what both pages hold, all of it between pages of one form and
   // the index between a Full page and an Index page. How the pool moves the

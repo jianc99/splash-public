@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <mutex>
 #include <string_view>
+#include <unordered_map>
 
 namespace splash::metal {
 
@@ -21,16 +22,22 @@ namespace splash::metal {
 // kernel, whose pipeline the backend builds with its library, on a queue of
 // its own, as the runtime keeps exactly one command in flight on the command
 // queue. Destruction ends residency without GPU work: a backend being torn
-// down must not start any. The sets are used only on the heartbeat's serial
-// queue.
+// down must not start any. The backend's set is used only on the heartbeat's
+// serial queue.
 //
 // The command queue holds a set of its own, of the buffers kernels reach only
-// through their GPU addresses (BufferReach::Addressed): Metal makes it
-// resident for every command buffer, as it does each buffer a dispatch binds.
-// Holding every buffer there would make each command buffer wait for all of
-// them first: with memory nearly full, 1-2% of command buffers waited
-// 100-170 ms before they started (M5 Max with 36 GB), so a command of many
-// buffers waited at nearly every command.
+// through their GPU addresses (BufferReach::Addressed) while their owners say
+// commands reach them (MetalBackend::setQueueResident): Metal makes it
+// resident for every command buffer, as it does each buffer a dispatch binds,
+// so each command buffer pays for all of it. Holding every buffer there would
+// make each command buffer wait for all of them first: with memory nearly
+// full, 1-2% of command buffers waited 100-170 ms before they started (M5 Max
+// with 36 GB), so a command of many buffers waited at nearly every command.
+// Changes to that set are staged (stage()) and made as a command begins
+// (commitQueue()), while none of the queue's commands runs; a buffer that
+// goes leaves it at once (unqueue()). The heartbeat never touches that set,
+// so it is used under a mutex of its own on the threads that change it, and a
+// command begins without waiting behind a residency request.
 class Residency final {
 public:
   // A one-thread kernel that writes one word of its buffer 0
@@ -74,30 +81,67 @@ public:
   Residency(const Residency &) = delete;
   Residency &operator=(const Residency &) = delete;
 
-  // Adds the buffer to the set, and an addressed one to the queue's too, and
-  // restarts the keep-alive: a held set wires it at the commit, and a lapsed
-  // one is requested again off the caller's thread (use()).
-  void add(id<MTLBuffer> buffer, BufferReach reach) {
+  // Adds the buffer to the set and restarts the keep-alive: a held set wires
+  // it at the commit, and a lapsed one is requested again off the caller's
+  // thread (use()).
+  void add(id<MTLBuffer> buffer) {
     dispatch_sync(queue_, ^{
       [set_ addAllocation:buffer];
       [set_ commit];
-      if (reach == BufferReach::Addressed) {
-        [addressed_ addAllocation:buffer];
-        [addressed_ commit];
-      }
     });
     use();
   }
 
-  void remove(id<MTLBuffer> buffer, BufferReach reach) {
+  void remove(id<MTLBuffer> buffer) {
     dispatch_sync(queue_, ^{
       [set_ removeAllocation:buffer];
       [set_ commit];
-      if (reach == BufferReach::Addressed) {
+    });
+  }
+
+  // Stages whether the queue's set holds an Addressed buffer, as its owner
+  // says commands reach it or not (MetalBackend::setQueueResident): the next
+  // command's commitQueue() makes it so.
+  void stage(id<MTLBuffer> buffer, bool resident) {
+    std::lock_guard lock(queueMutex_);
+    staged_[(__bridge const void *)buffer] = {buffer, resident};
+  }
+
+  // Makes the staged changes of the queue's set as a command begins, with one
+  // commit when any changes it: none of the queue's commands runs then, so a
+  // removal takes residency from none, and the command finds resident every
+  // buffer staged in before it. A buffer staged in and out again since the
+  // last command leaves the set as it was. The staged changes are a map of
+  // their own, not the set's uncommitted ones: unqueue() commits the set at
+  // once, which must not make a removal staged for the next command.
+  void commitQueue() noexcept {
+    std::lock_guard lock(queueMutex_);
+    bool changed = false;
+    for (const auto &[key, change] : staged_) {
+      if (static_cast<bool>([addressed_ containsAllocation:change.buffer]) == change.resident)
+        continue;
+      if (change.resident)
+        [addressed_ addAllocation:change.buffer];
+      else
+        [addressed_ removeAllocation:change.buffer];
+      changed = true;
+    }
+    if (changed) [addressed_ commit];
+    staged_.clear();
+  }
+
+  // Takes an Addressed buffer that goes out of the queue's set at once, with
+  // whatever is staged for it: the sets retain the buffer, whose memory goes
+  // with its last view, which no command still reaches.
+  void unqueue(id<MTLBuffer> buffer) noexcept {
+    std::lock_guard lock(queueMutex_);
+    staged_.erase((__bridge const void *)buffer);
+    @autoreleasepool {
+      if ([addressed_ containsAllocation:buffer]) {
         [addressed_ removeAllocation:buffer];
         [addressed_ commit];
       }
-    });
+    }
   }
 
   // Marks a command. A lapsed set is requested again at once, off the
@@ -118,6 +162,12 @@ public:
 
 private:
   static constexpr uint64_t kBeat = 500 * NSEC_PER_MSEC;
+
+  // A staged change of the queue's set: the buffer joins it or leaves it.
+  struct QueueChange final {
+    __strong id<MTLBuffer> buffer = nil;
+    bool resident = false;
+  };
 
   void beat() {
     bool lapsed;
@@ -149,7 +199,7 @@ private:
   __strong id<MTLCommandQueue> commands_ = nil;
   __strong id<MTLComputePipelineState> kick_ = nil;
   __strong id<MTLResidencySet> set_ = nil;
-  // The command queue's: the addressed buffers.
+  // The command queue's: the Addressed buffers commands reach.
   __strong id<MTLResidencySet> addressed_ = nil;
   __strong id<MTLCommandQueue> kickQueue_ = nil;
   __strong id<MTLBuffer> kickTarget_ = nil;
@@ -159,6 +209,11 @@ private:
   std::mutex mutex_;
   AwakeClock::time_point lastUse_;
   bool held_ = false;
+  // Guards addressed_ and staged_.
+  std::mutex queueMutex_;
+  // The staged changes of the queue's set, by buffer; each retains its buffer
+  // until it is made or the buffer goes.
+  std::unordered_map<const void *, QueueChange> staged_;
 };
 
 } // namespace splash::metal

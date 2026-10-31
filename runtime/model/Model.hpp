@@ -605,7 +605,8 @@ struct ExecutionLimits final {
   // both: the lanes before the last still lie within the first chunk.
   static constexpr uint32_t prefillTokenBudget = 2048;
   // KV pages startup warmup runs on, from page 0: the runway the engine's KV
-  // pool allocates when it is built.
+  // pool allocates when it is built, whose pages warmup holds while it runs
+  // (engine::KvPool::RunwayHold).
   static constexpr uint32_t warmupKvPages =
       (prefillTokenBudget + kv::kPageTokens - 1) / kv::kPageTokens;
   static constexpr uint32_t draftQueryRows = 8;
