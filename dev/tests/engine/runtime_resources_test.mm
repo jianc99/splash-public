@@ -585,10 +585,19 @@ void testWeightBudgetBeforeLoading(const char *metallibPath) {
       }
     }
   }
-  config.maximumMemoryBytes = 0;
-  requireReachesModelLoader(config, root.path(),
-                            "a sufficient weight budget did not reach the "
-                            "model loader");
+  // Without a ceiling, or with one above this Mac's budget, which only a
+  // notice names, the start reaches the loader.
+  for (const uint64_t ceiling : {uint64_t{0}, 1024 * kGiB}) {
+    config.maximumMemoryBytes = ceiling;
+    const std::string log = test::capturedStderr([&] {
+      requireReachesModelLoader(config, root.path(),
+                                "a sufficient weight budget did not reach the "
+                                "model loader");
+    });
+    require((log.find("--max-memory ignored: its 1024.0 GiB exceed this Mac's Metal budget of ") !=
+             std::string::npos) == (ceiling != 0),
+            "a ceiling above the budget was ignored without a notice, or no ceiling was named");
+  }
 }
 
 // A state's write to the disk tier stages through a state-sized buffer the

@@ -2777,10 +2777,13 @@ Engine::LaneEnd Engine::capacityExhausted(std::string_view what,
                         metal::allocationFailureName(failure);
   if (!detail.empty())
     message += " (" + std::string(detail) + ")";
-  // A lone lane judge failed: only other limits fit it.
+  // A lone lane judge failed: only other limits fit it. --max-memory only
+  // lowers this Mac's budget (EngineMemoryPolicy::hardBudgetBytes), so a
+  // larger one helps only where one lowered it.
   message += "; the request does not fit in the memory this server may use, even after "
              "every cached prefix was evicted and any store of streamed experts shrank to its "
-             "floor: restart the server with a larger --max-memory or a smaller --max-context";
+             "floor: restart the server with a smaller --max-context, or with a larger "
+             "--max-memory where one lowered it";
   return {LaneOutcome::CapacityExhausted, std::move(message)};
 }
 

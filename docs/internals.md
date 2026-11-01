@@ -1405,8 +1405,8 @@ suspended. Such a lane holds memory the request waits for until it finishes.
 Other lanes do not extend the wait. Readiness does not guarantee that a
 request-sized allocation fits. A request that cannot fit even alone, after every
 cached prefix was evicted and the expert store shrank to its floor, fails with
-400 `capacity_exhausted`, naming
-`--max-memory` and `--max-context`; retrying it fails the same way.
+400 `capacity_exhausted`, naming a smaller `--max-context`, or a larger
+`--max-memory` where one lowered the budget; retrying it fails the same way.
 
 A cached state holds the target's GDN cell and the draft's context window, not
 the draft's rings: the context row of each of the 2048 positions the rings
