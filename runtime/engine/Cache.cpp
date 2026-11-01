@@ -1086,7 +1086,7 @@ bool Cache::commitSpill(uint64_t requestId, uint32_t pages) {
   Request &active = request(requestId);
   if (active.mode != KvMode::Spill)
     throw std::logic_error("only a Spill request commits quota");
-  return kvTierWritable() && commit(active, pages);
+  return commit(active, pages);
 }
 
 bool Cache::convertToSpill(uint64_t requestId, uint32_t pages, bool spillNow) {

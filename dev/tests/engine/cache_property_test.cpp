@@ -230,7 +230,8 @@ private:
   }
 
   // A new request on a prefix of a base prompt, restored from what the
-  // cache holds of it, a Spill request committing quota for its pages.
+  // cache holds of it, a Spill request committing quota for its pages
+  // whether the tier takes writes or not, as a resume does.
   void start() {
     if (requests_.size() >= 6) return;
     const uint64_t id = ++nextId_;

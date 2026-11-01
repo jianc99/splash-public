@@ -9177,6 +9177,38 @@ void testSpillResumeCommitsAgain() {
   }
 }
 
+// A Spill request suspended with spilled pages before the SSD cache stopped
+// taking writes resumes once it takes none: the tier's closure refuses new
+// Spill starts alone, and the resume's commitment, which no write draws
+// there, goes back as it ends.
+void testSpillResumeOnAClosedTier() {
+  Spilling spill(20);
+  // Its prompt's second and third pages spill.
+  EngineRequest background = Spilling::prompt(1, 1, 4, 100);
+  background.priority = RequestPriority::Background;
+  spill.engine.submit(std::move(background));
+  spill.runUntil([&] { return spill.events.outputs[1].size() >= 10; },
+                 "the request did not decode");
+  // A Normal start is refused memory while it is resident, which
+  // suspends it.
+  spill.model.beginGrowthBlocked = [&] {
+    return spill.model.lastBeginId == 2 && spill.model.requests.at(1).resident;
+  };
+  spill.model.resumeDenied = true;
+  spill.engine.submit(Spilling::prompt(2, 2, 1, 1));
+  spill.runUntil([&] { return spill.events.completedCount == 1; },
+                 "the Normal request did not run");
+  require(spill.model.suspensions == 1 && spill.cache.spillSnapshot().spilledPages != 0,
+          "the request was not suspended with spilled pages");
+  spill.tier.writableFile = false;
+  spill.model.resumeDenied = false;
+  spill.runUntilIdle();
+  require(spill.events.failedCount == 0 && spill.events.completedCount == 2 &&
+              spill.model.resumptions == 1 && spill.events.usage.at(1).second == 100 &&
+              spill.committedSlots() == 0,
+          "a Spill request suspended before the tier closed did not resume");
+}
+
 // A Spill request resumed after a suspension holds the anchor its model
 // selected under its whole output, which the model decodes only with output
 // left past it: it emits a last budgeted anchor as it selects it. The quota
@@ -13375,6 +13407,7 @@ int main() {
     testSpilledFullExtentsLeaveOnceNoPromptGrows();
     testSpillMovesThroughTheHostPause();
     testSpillResumeCommitsAgain();
+    testSpillResumeOnAClosedTier();
     testSpillResumeBoundLeavesOutputPastItsAnchor();
     testSpillResumeInItsPromptHoldsNoAnchor();
     testSpillResumeTakesItsReplaysPagesAsItRuns();

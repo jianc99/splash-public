@@ -454,7 +454,9 @@ public:
   [[nodiscard]] uint64_t spillRoom() const noexcept;
   // Commits quota for `pages` pages of a Spill request, which each page it
   // publishes then draws or returns (DiskBudget::commit); false, committing
-  // nothing, when spillRoom() cannot hold them.
+  // nothing, when spillRoom() cannot hold them. A tier that takes no writes
+  // is the spill gate's to refuse: a resume commits there too, and since no
+  // write draws its commitment, all of it goes back as the request ends.
   [[nodiscard]] bool commitSpill(uint64_t requestId, uint32_t pages);
   // Turns a Resident request whose growth was denied into a Spill request:
   // checks the tier, the write budget and the room for `pages` pages,
