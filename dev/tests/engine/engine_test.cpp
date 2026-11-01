@@ -10833,7 +10833,7 @@ void publishDiskState(engine::Cache &cache, const std::vector<uint32_t> &prompt)
 }
 
 void testAsyncRestoreLifecycle() {
-  for (int outcome = 0; outcome < 4; ++outcome) {
+  for (int outcome = 0; outcome < 5; ++outcome) {
     test::TestKvStorage storage(128, 4096, 4);
     KvPool pool(storage, 0);
     engine::Cache cache(pool, nullptr, nullptr);
@@ -10854,10 +10854,20 @@ void testAsyncRestoreLifecycle() {
     for (int tick = 2; tick < 8; ++tick) static_cast<void>(engine.tick(tick));
     require(events.outputs.contains(2), "restore blocked independent model work");
     if (outcome == 1) engine.cancel(1);
-    if (outcome == 2) static_cast<void>(engine.tick(10001));
+    if (outcome == 2) {
+      // Expired, it keeps its waiting phase until the read drains.
+      static_cast<void>(engine.tick(10001));
+      const auto &active = engine.snapshot().activeRequests;
+      require(active.size() == 1 && active.front().id == 1 &&
+                  active.front().phase != engine::Phase::Failed && events.failures.empty(),
+              "an expired restore failed before its read drained");
+    }
     if (outcome == 3) executor.restoreControl->success = false;
     require(executor.requests.contains(1), "cancellation reused IO destination before drain");
     executor.restoreControl->ready = true;
+    // The read lands at the tick the deadline passes: the request ends
+    // without starting on it.
+    if (outcome == 4) static_cast<void>(engine.tick(10001));
     runUntilIdle(engine);
     require(cache.snapshot().stateCache.pinned == 0 && cache.snapshot().activeRequests == 0 &&
                 executor.requests.empty(), "restore leaked active resources");
@@ -10869,10 +10879,11 @@ void testAsyncRestoreLifecycle() {
     else
       require(executor.restored == 0 && !events.outputs.contains(1),
               "cancelled or expired restore emitted output");
-    if (outcome == 2)
+    if (outcome == 2 || outcome == 4)
       require(events.failures == std::vector<std::string>{"deadline_exceeded"} &&
-                  events.failureDetails.front().first == "request deadline exceeded",
-              "an expired restore lost its outcome or message");
+                  events.failureDetails.front().first == "request deadline exceeded" &&
+                  std::ranges::find(events.startIds, 1) == events.startIds.end(),
+              "an expired restore lost its outcome or message, or started");
   }
 }
 

@@ -199,26 +199,6 @@ void Scheduler::remove(uint64_t id) {
   requests_.erase(found);
 }
 
-bool Scheduler::expireDeadlines(double now) {
-  bool changed = false;
-  for (auto &[_, request] : requests_) {
-    const bool inFlight =
-        active_ && std::any_of(active_->items.begin(), active_->items.end(),
-                               [&](const BatchItem &item) {
-                                 return item.requestId == request.spec.id;
-                               });
-    if (!inFlight && !terminal(request.phase) &&
-        request.spec.deadlineMilliseconds <= now) {
-      request.phase = Phase::Failed;
-      request.passes.reset();
-      changed = true;
-    }
-  }
-  if (changed)
-    dropStaleDecodeDebt();
-  return changed;
-}
-
 std::vector<uint64_t> Scheduler::admissionOrder() const {
   std::vector<const Request *> ready;
   ready.reserve(requests_.size());
