@@ -9782,6 +9782,47 @@ void testOwedCopiesHoldBackTheNextConversion() {
   require(spill.events.failedCount == 0, "a request failed");
 }
 
+// A start refused at the engine's limit converts the Resident lane holding
+// the most KV and waits for what its pages give back as their copies land.
+// They land while a command runs and leave memory before the start tries
+// again, which then fits: no other lane converts, and the store keeps its
+// chunk.
+void testARefusedStartTakesWhatItsConversionFreed() {
+  Spilling spill(1024, true, 100'000, 0, Spilling::Extent{16});
+  // The tier writes every copy the conversion owes at once.
+  spill.tier.writeLimits[static_cast<size_t>(WriteClass::Spill)] = 64;
+  spill.model.expertChunks = {1000};
+  // Two neighbours start Resident, as requests do while the SSD cache takes
+  // no writes: 16 and 40 pages.
+  spill.tier.writableFile = false;
+  spill.engine.submit(Spilling::prompt(4, 4, 16, 10000));
+  spill.engine.submit(Spilling::prompt(5, 5, 40, 10000));
+  spill.runUntil([&] { return spill.events.outputs.contains(4) && spill.events.outputs.contains(5); },
+                 "the neighbours did not decode");
+  spill.tier.writableFile = true;
+  // The start's state fits once an extent has left memory since it was
+  // first refused, or a chunk of the store went.
+  std::optional<uint64_t> limit;
+  spill.model.beginGrowthBlocked = [&] {
+    if (spill.model.lastBeginId != 3)
+      return false;
+    if (!limit)
+      limit = spill.storage.allocatedBytes() - 16 * 100;
+    return spill.storage.allocatedBytes() > *limit && spill.model.releasedExpertChunks.empty();
+  };
+  spill.engine.submit(Spilling::prompt(3, 3, 1, 8));
+  spill.runUntil([&] { return spill.events.outputs.contains(3); }, "the start did not decode");
+  std::unordered_map<uint64_t, KvMode> modes;
+  for (const ActiveRequestSnapshot &active : spill.engine.snapshot().activeRequests)
+    modes[active.id] = active.kvMode;
+  require(modes.at(5) == KvMode::Spill && modes.at(4) == KvMode::Resident &&
+              spill.engine.snapshot().spill.converted == 1 && spill.model.releasedExpertChunks.empty(),
+          "a refused start climbed on before the pages its conversion freed left memory");
+  spill.model.decodeFinishes = true;
+  spill.runUntilIdle();
+  require(spill.events.failedCount == 0, "a request failed");
+}
+
 // A lane whose admission is not complete, its state's restore from the SSD
 // cache in flight, holds the chain it restores, which only its admission's
 // own conversion counts: a pass the host is short for converts no such lane,
@@ -13268,6 +13309,86 @@ void testShortPassConvertsAResidentLaneBeforeTheExpertStore() {
           "the lane failed or kept its commitment");
 }
 
+// A pass the host is short for that converted a Resident lane ends Pending
+// while the lane's copies are written. The pass that continues it once they
+// landed, before the next command, spills every page of the lane past its
+// dense and window pages and counts what it gives back: it converts no
+// other lane, and the store keeps its chunk. So it does while the host holds
+// growth back, the lane in service, and beside idle buffers past a lane's,
+// all the host is short of, which it counts too. Where the engine's limit
+// refuses the Index extent the pages past the runway's free Index pages
+// need, an untargeted pass leaves them Full and takes nothing for them,
+// neither the model's caches nor the buffers a lane starts from; the next
+// tick spills them.
+void testAContinuedShortPassTakesWhatItsConversionFreed() {
+  enum class Growth { Free, Paused, AtTheLimit };
+  for (const Growth growth : {Growth::Free, Growth::Paused, Growth::AtTheLimit}) {
+    Spilling spill(1024, true, 100'000, 0, Spilling::Extent{16});
+    // The tier writes every copy the conversion owes at once.
+    spill.tier.writeLimits[static_cast<size_t>(WriteClass::Spill)] = 64;
+    spill.model.expertChunks = {1000};
+    // Two lanes start Resident, as requests do while the SSD cache takes no
+    // writes: 16 and 40 pages.
+    spill.tier.writableFile = false;
+    spill.engine.submit(Spilling::prompt(4, 4, 16, 10000));
+    spill.engine.submit(Spilling::prompt(5, 5, 40, 10000));
+    spill.runUntil([&] { return spill.events.outputs.contains(4) && spill.events.outputs.contains(5); },
+                   "the lanes did not decode");
+    spill.tier.writableFile = true;
+    const auto pass = [&](uint64_t target) {
+      return spill.engine.reclaimMemory(
+          {.targetBytes = target, .upTo = ReclaimClass::Ordinary, .hostShort = true});
+    };
+    require(pass(10'000).outcome == ReclaimOutcome::Pending &&
+                spill.engine.snapshot().spill.converted == 1,
+            "the short pass did not convert a lane and wait for its copies");
+    spill.tier.complete();
+    // The converted lane's pages past its dense and window pages.
+    constexpr uint32_t spillable = 40 - 2;
+    const auto spilled = [&] { return spill.cache.spillSnapshot().spilledPages; };
+    if (growth == Growth::AtTheLimit) {
+      spill.storage.growthBlocked = true;
+      spill.model.cacheUnits = {100};
+      spill.model.laneFootprintBytes = spill.model.pooledLaneBytes = 1000;
+      static_cast<void>(spill.engine.reclaimMemory({.upTo = ReclaimClass::Ordinary}));
+      require(spilled() == 16 && spill.model.cacheUnits.size() == 1 && spill.model.pooledLaneBytes == 1000,
+              "an untargeted pass took the model's caches or a lane's buffers for the Index pages of "
+              "the pages it spilled");
+      spill.storage.growthBlocked = false;
+      static_cast<void>(spill.engine.tick(spill.now++));
+      require(spilled() == spillable, "the next tick did not spill the pages a refused extent left Full");
+    } else {
+      // As the governor does, the host refuses growth unless a request in
+      // service needs it; the pool holds 5,000 bytes of idle buffers, all
+      // the host is short of. Without the pause, the host is short of an
+      // extent.
+      if (growth == Growth::Paused) {
+        spill.storage.growthAllowed = [&](uint32_t) {
+          const bool host = spill.paused && !spill.serving;
+          spill.storage.allocationFailure =
+              host ? metal::AllocationFailure::HostPressure : metal::AllocationFailure::EngineBudget;
+          return !host;
+        };
+        spill.paused = true;
+        spill.model.reclaimableIdleStateBytes = 5'000;
+      }
+      const uint64_t target = growth == Growth::Paused ? 5'000 : 16 * 100;
+      const MemoryReclaimResult continued = pass(target);
+      require(continued.outcome == ReclaimOutcome::Met && continued.releasedBytes >= target &&
+                  spilled() == spillable && spill.engine.snapshot().spill.converted == 1 &&
+                  spill.model.releasedExpertChunks.empty(),
+              "the pass that continued a short pass did not spill the pages its conversion freed, or "
+              "climbed on before counting what they and the idle buffers gave back");
+      spill.paused = false;
+      spill.storage.growthAllowed = {};
+    }
+    spill.model.decodeFinishes = true;
+    spill.runUntilIdle();
+    require(spill.events.failedCount == 0 && spill.committedSlots() == 0,
+            "a lane failed or kept its commitment");
+  }
+}
+
 // The KV a prefill command takes past its first state boundary only
 // lengthens the command: refused at the engine's limit with nothing
 // ordinary left, it takes neither the expert store nor what is in use, and
@@ -13407,6 +13528,7 @@ int main() {
     testReplayPointCopiesCacheBeforeTheExpertStore();
     testShortPassWaitsForCopiesBeforeTheExpertStore();
     testShortPassConvertsAResidentLaneBeforeTheExpertStore();
+    testAContinuedShortPassTakesWhatItsConversionFreed();
     testCaptureKvPastABoundaryTakesNothingInUse();
     testReplayPointTakesTheExpertStoreBeforeWhatIsInUse();
     testReplayPointAdmittedInMarginBand();
@@ -13522,6 +13644,7 @@ int main() {
     testAFloorConvertsAResidentNeighbourBeforeTheExpertStore();
     testAFloorConvertsTheLargestLaneThatGivesMemoryBack();
     testOwedCopiesHoldBackTheNextConversion();
+    testARefusedStartTakesWhatItsConversionFreed();
     testALaneBeingAdmittedDoesNotConvert();
     testALoneSpillLaneWaitsForItsOwnCopies();
     testALaneRefusedBeforeItsFirstCommandWritesItsChain();

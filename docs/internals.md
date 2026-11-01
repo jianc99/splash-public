@@ -1243,17 +1243,20 @@ land: the requester's own lane first, and the allocation is tried again at
 once; else, unless the copies Spill lanes owe already bring an extent's
 pages back, the lane holding the most KV whose Full pages past those a Spill
 lane keeps outweigh the hot block cache its reads add, and the request waits
-for that memory. An attempt that finds it fell short climbs on, to the next
-lane and then the store, so each conversion delays the store by one attempt
-at most. Then a chunk of the expert store above its floor; then, for work
-that may, anything in use. Only lanes whose admission is complete convert
-this way. A lane that cannot convert, the tier closed or its quota short,
+for that memory. Pages whose copies landed leave memory wherever memory is
+judged between commands, before admission and at each command's start
+(`Engine::spillLanded`) and as a paced pass begins, so the next attempt finds
+what they gave back; one that finds it fell short climbs on, to the next lane
+and then the store, so each conversion delays the store by one attempt at
+most. Then a chunk of the expert store above its floor; then, for work that
+may, anything in use. Only lanes whose admission is complete convert this way.
+A lane that cannot convert, the tier closed or its quota short,
 is passed over, as on a target whose KV stays in memory, and so is a lane
 between the passes of its prefill command, which reads its whole history
 from memory. A lane converted once the command being built has reserved its
 lanes' reads of spilled KV keeps its pages Full in that command, and the
-next command's start spills those whose copies landed; a command in passes
-whose lane converted so, its history now one that streams, runs whole. The
+next point between commands spills those whose copies landed; a command in
+passes whose lane converted so, its history now one that streams, runs whole. The
 prompt's replay point climbs the same rungs short of what is in use before
 it recycles another request's state in use, after the cache nothing in use
 holds whose KV needs its copy on the SSD cache first: it starts that copy,
@@ -1261,7 +1264,8 @@ and while memory is on its way the command ends at the boundary without the
 state's buffers, and the point is kept from the lane after the command, as
 a refused one is. A paced pass the host is really short for climbs them
 too, short of what is in use, once its cache waits for no transfer, and
-ends Pending while a conversion's memory is on its way.
+ends Pending while a conversion's memory is on its way; the pass that
+continues it counts what the landed pages gave back before it climbs on.
 Growth that only shortens a command
 (the KV a prefill captures past its first state boundary) or leaves memory for
 later takes neither the store nor anything in use, a junction or checkpoint

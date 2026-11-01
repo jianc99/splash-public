@@ -485,6 +485,8 @@ public:
   // Pages of the form that transfers in flight will free: demotions, and
   // for Full the eligible write-throughs that an Index page will take.
   [[nodiscard]] uint32_t pendingPages(kv::PageForm form) const noexcept;
+  // The bytes the KV pool's extents take, of every form.
+  [[nodiscard]] uint64_t allocatedBytes() const noexcept { return pool_.allocatedBytes(); }
   // Between commands, with a window: moves to the Slim form every Full page
   // no row will read whole again: every request that holds it has
   // published windowPages blocks past it (its next command's rows, at or
