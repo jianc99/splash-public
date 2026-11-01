@@ -284,10 +284,18 @@ bool Engine::tick(double now) {
 
   progressed = admitQueued(now) || progressed;
   sweepTerminal();
+  // A prefill lane that reads its history from the SSD cache runs alone in
+  // its commands (streamsHistory). One whose history spills, or that holds
+  // another request's spilled blocks, runs prefill groups, which read that
+  // history once for their chunks; a Resident one only where every lane
+  // runs them, so a request that arrives beside it waits for a chunk.
   if (config_.spill.capable) {
     for (const auto &[id, active] : requests_)
-      if (active.lane && scheduler_.phase(id) == Phase::Prefill)
+      if (active.lane && scheduler_.phase(id) == Phase::Prefill) {
         scheduler_.setStreamsHistory(id, streamsHistory(active));
+        scheduler_.setPrefillGroupRows(
+            id, model_.prefillGroupRows(active.kvMode == KvMode::Spill || cache_.holdsIndexPages(id)));
+      }
   }
   // Lanes that wait for memory on its way back cannot run before it lands;
   // the command runs the other lanes meanwhile. A plan whose lanes all wait
@@ -1053,7 +1061,6 @@ bool Engine::convertToSpill(Request &active, const CacheLookup *restoring) {
   if (!cache_.convertToSpill(active.request.id, spillPages(active, end), !commandShaped_))
     return false;
   active.kvMode = KvMode::Spill;
-  scheduler_.setPrefillGroupRows(active.request.id, model_.prefillGroupRows(true));
   // A start that converts starts as a Spill request, which completeAdmission
   // counts, and one refused all the same decides its mode afresh at its next
   // attempt; a lane that ran Resident before converts once.
@@ -1119,11 +1126,6 @@ void Engine::endAtLength(Request &active) {
 void Engine::completeAdmission(Request &active, CacheLookup &lookup,
                                 DraftContextPlan draft) {
   const bool resuming = scheduler_.suspended(active.request.id);
-  // A lane whose history spills runs prefill groups, which read it once for
-  // their chunks; a Resident one only where every lane runs them, so a
-  // request that arrives beside it waits for a chunk.
-  scheduler_.setPrefillGroupRows(active.request.id,
-                                 model_.prefillGroupRows(active.kvMode == KvMode::Spill));
   active.skipCache = false;
   active.admissionProbe.reset();
   const uint32_t resumeBoundary = lookup.resumeBoundary();

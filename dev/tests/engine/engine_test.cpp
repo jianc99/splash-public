@@ -8859,6 +8859,106 @@ void testOnlySpillingLanesRunPrefillGroups() {
   }
 }
 
+// A Resident request that continues a Spill request's prefix holds its
+// spilled blocks spilled too (Cache::restoreRequest), so its prompt reads
+// its history from the SSD cache as a Spill one does, and runs as prefill
+// groups, which read it once for their chunks.
+void testAResidentLaneHoldingSpilledBlocksRunsPrefillGroups() {
+  // Resident KV holds 120 pages.
+  Spilling spill(256, false, 120 * 100);
+  spill.model.groupRows = 4 * model::ExecutionLimits::prefillTokenBudget;
+  spill.model.groupsOnlySpilling = true;
+  spill.engine.observePrefill(model::ExecutionLimits::prefillTokenBudget, 1000.0, 0.0);
+  // Eight pages and 4,096 tokens of output project 136 pages: it spills,
+  // and decodes below the next request's priority.
+  EngineRequest spilling = Spilling::prompt(1, 1, 8, 4'096);
+  spilling.priority = RequestPriority::Background;
+  spill.engine.submit(std::move(spilling));
+  spill.runUntil([&] { return spill.events.outputs[1].size() >= 10; },
+                 "the Spill request did not decode");
+  // Its eight pages, then 64 pages and a token, two chunks or a group: 73
+  // pages in all with its output, which memory holds.
+  std::vector<uint32_t> prompt(8 * KvCache::pageTokens, 1);
+  prompt.resize(prompt.size() + 64 * KvCache::pageTokens + 1, 2);
+  EngineRequest continuing = request(2, std::move(prompt));
+  continuing.maxNewTokens = 1;
+  spill.engine.submit(std::move(continuing));
+  spill.runUntil([&] { return spill.events.usage.contains(2); },
+                 "the Resident request did not run");
+  const SpillRequestsSnapshot counts = spill.engine.snapshot().spill;
+  require(counts.spill == 1 && counts.resident == 1 &&
+              spill.events.starts.back() == 8 * KvCache::pageTokens &&
+              spill.model.prefillChunks.at(2) == 1,
+          "a Resident request holding spilled blocks ran its prompt a chunk a command");
+  spill.engine.cancel(1);
+  spill.runUntilIdle();
+}
+
+// So does a Resident lane that converts to Spill between its prefill
+// commands, as a pass the host is short for converts it: the chunks its
+// prompt has left run as groups from its next command.
+void testALaneThatConvertsMidPromptRunsPrefillGroups() {
+  Spilling spill(1024, false);
+  spill.model.groupRows = 4 * model::ExecutionLimits::prefillTokenBudget;
+  spill.model.groupsOnlySpilling = true;
+  spill.engine.observePrefill(model::ExecutionLimits::prefillTokenBudget, 1000.0, 0.0);
+  // 128 pages and a token: three chunks, the first of them Resident.
+  spill.engine.submit(Spilling::prompt(1, 1, 128, 1));
+  spill.runUntil([&] { return spill.model.prefillChunks[1] == 1 && !spill.engine.commandInFlight(); },
+                 "the prompt's first chunk did not run");
+  require(spill.engine.reclaimMemory({.targetBytes = 1'000'000, .upTo = ReclaimClass::Ordinary,
+                                      .hostShort = true})
+                  .outcome == ReclaimOutcome::Pending &&
+              spill.engine.snapshot().spill.converted == 1,
+          "the short pass did not convert the prompt's lane");
+  spill.runUntilIdle();
+  // The two chunks left run as one group.
+  require(spill.events.completedCount == 1 && spill.model.prefillChunks.at(1) == 2,
+          "a lane that converted mid-prompt ran the rest of it a chunk a command");
+}
+
+// And so does a Resident lane that comes to hold another request's spilled
+// blocks as it prefills: one that shares a Spill request's prefix but no
+// state on it starts from nothing, and the blocks its first chunk computes
+// take that request's Index pages (KvCache::insert), so the chunks it has
+// left read its history from the SSD cache, and run as groups.
+void testALaneThatTakesSpilledBlocksAsItPrefillsRunsPrefillGroups() {
+  Spilling spill(1024, false);
+  spill.model.groupRows = 4 * model::ExecutionLimits::prefillTokenBudget;
+  spill.model.groupsOnlySpilling = true;
+  spill.engine.observePrefill(model::ExecutionLimits::prefillTokenBudget, 1000.0, 0.0);
+  // Eight pages, four more of its own and a token, its state at their end.
+  // It starts Resident and decodes below the next request's priority, and a
+  // short pass converts it: its pages but its dense and window pages spill.
+  std::vector<uint32_t> prompt(8 * KvCache::pageTokens, 1);
+  prompt.resize(prompt.size() + 4 * KvCache::pageTokens + 1, 9);
+  EngineRequest spilling = request(1, prompt);
+  spilling.maxNewTokens = 4'096;
+  spilling.priority = RequestPriority::Background;
+  spill.engine.submit(std::move(spilling));
+  spill.runUntil([&] { return spill.events.outputs[1].size() >= 2 && !spill.engine.commandInFlight(); },
+                 "the first request did not decode");
+  static_cast<void>(spill.engine.reclaimMemory(
+      {.targetBytes = 1'000'000, .upTo = ReclaimClass::Ordinary, .hostShort = true}));
+  spill.runUntil([&] { return spill.cache.spillSnapshot().spilledPages == 10; },
+                 "the converted request's pages did not spill");
+  // Its eight pages, then 120 pages and a token: three chunks, the first of
+  // which takes the seven spilled pages among them.
+  prompt.resize(8 * KvCache::pageTokens);
+  prompt.resize(prompt.size() + 120 * KvCache::pageTokens + 1, 2);
+  EngineRequest continuing = request(2, std::move(prompt));
+  continuing.maxNewTokens = 1;
+  spill.engine.submit(std::move(continuing));
+  spill.runUntil([&] { return spill.events.usage.contains(2); }, "the Resident request did not run");
+  const SpillRequestsSnapshot counts = spill.engine.snapshot().spill;
+  // The two chunks left run as one group.
+  require(counts.resident == 2 && counts.converted == 1 && spill.events.starts.back() == 0 &&
+              spill.model.prefillChunks.at(2) == 2,
+          "a Resident lane that took spilled blocks as it prefilled ran the rest a chunk a command");
+  spill.engine.cancel(1);
+  spill.runUntilIdle();
+}
+
 // A lane between the passes of its prefill command reads its whole history
 // from memory: a pass the host is short for, which converts the Resident
 // lane holding the most KV to Spill, leaves it as it is, and its command
@@ -13401,6 +13501,9 @@ int main() {
     testAStartThatCannotSpillStartsResidentWithinTheResidentContext();
     testWriteBudgetRefusalSaysWhenToRetry();
     testOnlySpillingLanesRunPrefillGroups();
+    testAResidentLaneHoldingSpilledBlocksRunsPrefillGroups();
+    testALaneThatConvertsMidPromptRunsPrefillGroups();
+    testALaneThatTakesSpilledBlocksAsItPrefillsRunsPrefillGroups();
     testALaneThatConvertsAtItsPrefillRunsItAloneAndWhole();
     testALaneBetweenItsPassesDoesNotConvert();
     testALaneThatConvertsInItsFirstPassRunsItWhole();

@@ -830,7 +830,8 @@ public:
   // The most rows of one lane's prefill command: a prefill group's where
   // the model runs them (one lane's chunks, layer by layer) to read
   // something once for all of them, its streamed experts for every lane or a
-  // spilled history for a lane whose K/V spills (`spills`), else a chunk's.
+  // spilled history for a lane whose K/V spills or that holds spilled blocks
+  // (`spills`), else a chunk's.
   [[nodiscard]] virtual uint32_t prefillGroupRows(bool spills) const noexcept {
     static_cast<void>(spills);
     return ExecutionLimits::prefillTokenBudget;

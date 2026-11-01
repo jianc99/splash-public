@@ -1377,9 +1377,9 @@ reads), and a part per row; the slice grows to twice the fixed part, so a
 command's rows take at least as long as its reads. Unopposed, a target whose
 experts stream runs its remaining chunks in as few prefill groups of up to four
 as hold them, evenly split, and so does a request whose KV spills to the SSD
-cache, which reads its history once a group; one whose KV stays in memory on a
-target whose experts load whole runs chunks, so a request that arrives beside it
-waits for a chunk. On a target whose experts stream a request keeps its groups
+cache, or that holds another request's spilled blocks, which reads its history
+once a group; one whose KV stays in memory on a target whose experts load whole
+runs chunks, so a request that arrives beside it waits for a chunk. On a target whose experts stream a request keeps its groups
 whatever contends, and a command whose estimate exceeds the slice runs alone in
 passes over the model's layers, as many as keep each within the slice: its
 later passes come before any other prefill or admission, decode commands run
