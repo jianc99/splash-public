@@ -310,12 +310,14 @@ KvBlockCache::~KvBlockCache() = default;
 ModelMemoryAdmission KvBlockCache::reserveLane(uint32_t stateLane) {
   Impl &impl = *impl_;
   if (stateLane >= kLanes) throw std::out_of_range("the hot block cache has no such lane");
-  if (impl.floors[stateLane]) return {.ok = true};
+  if (holdsLane(stateLane)) return {.ok = true};
   if (const uint32_t held = impl.floorExtents(impl.floorLanes() + 1); held > impl.extents)
     if (const ModelMemoryAdmission admission = impl.grow(held); !admission.granted()) return admission;
   impl.floors[stateLane] = true;
   return {.ok = true};
 }
+
+bool KvBlockCache::holdsLane(uint32_t stateLane) const { return impl_->floors.at(stateLane); }
 
 void KvBlockCache::releaseLane(uint32_t stateLane) noexcept {
   if (stateLane < kLanes) impl_->floors[stateLane] = false;

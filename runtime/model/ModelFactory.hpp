@@ -37,7 +37,8 @@ using TargetWeights = std::variant<Qwen3_8Weights, Qwen3_6MoeWeights, Qwen4ExpWe
 // (model/SparseRowStore.hpp, --ple-memory). With expertMemoryBytes, a MoE
 // target's routed experts stream from their files through a store of that
 // many bytes at its cap, which gives memory back down to its floor of
-// expertFloorBytes, zero for the store's own (model/ExpertStore.hpp,
+// expertFloorBytes, zero for the store's own, and starts with
+// expertStartBytes, zero for its cap (model/ExpertStore.hpp,
 // ExpertStoreOptions, --expert-memory). Other models load as without them.
 // Streamed weights read on `readers`, the engine's one pool of SSD readers,
 // which KV reads share.
@@ -45,6 +46,7 @@ struct ModelLoadOptions final {
   uint64_t streamedTableBytes = 0;
   uint64_t expertMemoryBytes = 0;
   uint64_t expertFloorBytes = 0;
+  uint64_t expertStartBytes = 0;
   std::shared_ptr<SsdReaders> readers;
 };
 

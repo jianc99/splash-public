@@ -762,12 +762,10 @@ times the located split against the default one.
 A block-sparse target declares its attention to the engine
 (`model::SparseKvShape`, `ModelCapabilities::sparseKv`): its blocks' tokens,
 the blocks a row selects and its verify rows, and the rows that read whole
-pages instead, those with at most `denseHistoryTokens` of history and its
-first `sinkTokens` and last `localTokens`. The memory plan sizes the hot block
-cache and the floors of [KV on the SSD](server.md#kv-on-the-ssd) from it, and the
-cache keeps whole the pages those rows read. A target that declares
-`localTokens` keeps its KV in memory: the cache keeps whole only the dense
-history on every path, not each holder's last pages. Its family code reaches K/V that
+pages instead, those with at most `denseHistoryTokens` of history. The memory
+plan sizes the hot block cache and the floors of
+[KV on the SSD](server.md#kv-on-the-ssd) from it, and the cache keeps whole
+the pages those rows read. Its family code reaches K/V that
 left memory through the command's `model::SpilledKvReads`: `verify` after a
 layer's block lists, which locates each listed block of a page that holds
 only its index in the hot block cache for the attention; `prefill` for each
@@ -1154,36 +1152,52 @@ while its target is unmet, once nothing outside what is in use is left to free
 and before anything in use; the experts a chunk held move to the chunks below it
 or are evicted, and later steps read them from the SSD again. Memory on its way
 back holds the store back: while cache nothing in use holds waits for a
-transfer, a KV demotion or a state write, the pass ends pending, and the pass
-that continues it once the transfer landed takes that cache first. macOS's
-warning alone never takes the store. Once memory allows again the control
-pass takes one chunk back per pass, its slots empty: when macOS reports no
-memory pressure, no request waits for memory, the host lets growth go on, the
-weights are neither released nor being restored, and the cool-down has passed
-since a chunk last went: 30 s, doubled up to 4 minutes each time a chunk taken
-back goes again within it, which shows the requests still needed its memory,
-and back to 30 s once a chunk taken back stays for a whole cool-down
-(`MemoryControl`). The chunk takes from the host only its headroom beyond the
-2 GiB recovery margin, and from the engine only room `--max-memory` leaves
-free. While the engine holds any request, resident, queued or draining, it
-takes only that. With none the chunk is an exchange for cache nothing in use
-holds, which ranks below the store, for what the chunk lacks of either: the
-engine first returns that cache to the system, one reclaim step at a time,
-each releasing the extent it empties, until the bytes that left the engine
-cover what the chunk lacks, and keeps the resume point of the newest
-conversation. The governor's growth admission then counts those bytes as the
-host's already (`MemoryGovernor::setGrowthCredit`): its own sample of the host
-may not show them yet, and the pass checked the rest against the sample it
-took before the exchange. Cache that cannot pay for the chunk in that pass
-stays. The exchange starts no copy to the SSD cache, whose memory would come
-back only after the pass: a state or page that needs one stays, and so do the
-pages above that page and the newer states of that state's class (checkpoint
-or ordinary). Unless the idle state buffers beyond a lane's and the extents
-that what leaves at once would empty cover what the chunk lacks
-(`Engine::exchangeableBytes`, `Cache::exchangeable`), the exchange takes
-nothing and the chunk waits; it waits too while a transfer is in flight. With
-the SSD cache on, a cached conversation buys a chunk only once its state and
-pages have copies there, as `--persistent-cache` writes them. A start
+transfer, a KV demotion, a state write or the copy ahead of a leaf that then
+leaves through it, the pass ends pending, and the pass that continues it once
+the transfer landed takes that cache first. A copy ahead of a page a Spill
+request holds past its dense history and window frees that page as it spills,
+as a page written through does; a copy ahead of anything else, such as a page
+a Resident request holds, frees nothing as it lands and holds nothing back. macOS's warning alone never takes the store. The store's cap is a
+reservation: the memory a chunk gave back is a deficit the engine repays once
+the cache that took it can pay. Each control pass, before its reclaim, takes
+one chunk back, its slots empty, while no request waits for memory, the host
+keeps the 1 GiB warning margin short of critical pressure, the weights are
+neither released nor being restored, and the cool-down has passed since a
+chunk last went:
+30 s, doubled up to 4 minutes each time a chunk taken back goes again within
+it, which shows the requests still needed its memory, and back to 30 s once a
+chunk taken back stays for a whole cool-down (`MemoryControl`). The chunk
+takes from the host only its headroom beyond the 2 GiB recovery margin, none
+of it under macOS's warning, and from the engine only room `--max-memory`
+leaves free. For what it lacks of either the chunk is an exchange for cache
+nothing in use holds, which ranks below the store, beside running requests as
+with none: the engine first returns that cache to the system, one reclaim
+step at a time, each releasing the extent it empties, until the bytes that
+left the engine cover what the chunk lacks. It keeps the resume point of the
+newest conversation and every chain a request that holds no lane would
+restore: the KV of the chain its probe of the cache found, brought up to date
+first, and the state the chain ends at (`RestoredChains`). A request
+admission has not probed, such as one that arrived since its last pass, one
+below the priority that runs or one behind the first waiting for a lane, the
+exchange probes itself. What is in use, the replay points of unfinished
+requests and the KV they restore through, stays, and so does every chain a request holds pages of. The
+governor's growth admission then counts those bytes as the host's already
+(`MemoryGovernor::setGrowthCredit`): its own sample of the host may not show
+them yet, and the pass checked the rest against the sample it took before the
+exchange. An exchange that returns the whole chunk leaves the host's
+footprint where it was, which macOS's warning does not hold back: a pass
+under the warning alone first exchanges cache for the chunk and then gives
+back what the warning asks of the rest. Cache that cannot pay for the chunk
+in that pass stays. The exchange starts no copy to the SSD cache, whose
+memory would come back only after the pass: a state or page that needs one
+stays, and so do the pages above that page, and the exchange goes on to the
+next state or page that leaves at once. Unless the idle state buffers beyond
+a lane's and the extents that what leaves at once would empty cover what the
+chunk lacks (`Engine::exchangeableBytes`, `Cache::exchangeable`), the
+exchange takes nothing and the chunk waits; it waits too while a transfer is
+in flight. With the SSD cache on, a cached conversation buys a chunk only
+once its state and pages have copies there, as its restore point gets them
+ahead of need ([disk tier](#disk-tier)). A start
 needs only what macOS can
 hand out at all beyond a reserve of a tenth of a small Mac's memory and 2 GiB of
 a larger one, counting what compressing the anonymous pages would free at the
@@ -1192,7 +1206,24 @@ what it allocates, the KV runway, arenas and warmup included, is memory a
 request in service needs until serving begins (`/status`:
 `memory_governor.host_available_bytes` and `host_reserve_bytes`; the spare
 memory and its reserve are `host_spare_bytes` and `host_spare_reserve_bytes`,
-and `host_headroom_bytes` is the room above them). A request in service keeps
+and `host_headroom_bytes` is the room above them). Since a start's checks
+hold back none of what the plan sizes, the automatic streamed stores start
+within the governor's own rule (`hostBudgetBytes`), taken once the first load
+holds its weights: no more than the engine's Metal memory and the host's
+spare memory beyond the spare reserve and the warning margin, the margin a
+pass keeps while no request waits, leave beside what an engine without
+requests holds once warm, its pipelines included, less the process's runtime
+overhead, which the spare memory counts already
+([memory and context](server.md#memory-and-context)). The
+passes then find nothing of them to take back before the first request. The
+expert store's cap stays the limit's: the chunks the host leaves no room for
+start released, as a restore leaves those it is refused, and the store
+starts on a chunk boundary: under the default floor its start, its floor the
+whole chunks below it that keep 85% of it, one at least, but none below a
+layer's experts, and with a floor given the last one at or below its start.
+The engine repays the rest as it repays a chunk given back (above). What the
+host holds back stays in the plan, so the context does not move. A
+request in service keeps
 growing through host pressure and macOS's warning, short of critical pressure,
 within `--max-memory`, first into cached pages no request holds:
 it takes cached KV, and a cached state only where it sits on the KV that goes
@@ -1297,7 +1328,16 @@ grow too and are refused in turn. Where KV spills, a refusal they do not share,
 of the model's memory for reading KV from the SSD cache (a decoding lane's share
 of the hot block cache, a prompt's staging), which no transfer in flight
 returns, suspends the lane that yields first if that lane yields before it and
-is resident outside its command. A prefill command captures the state of
+is resident outside its command. Memory a transfer in flight returns to a
+refused lane of the priority that runs, KV pages or the model's memory alike,
+alone or beside lanes that run, waits for that lane: until it has it, or for
+the resource wait's limit from when it first awaited it, a lane that
+yields before it leaves a command where it would take KV pages past its
+capacity or memory for its reads of spilled KV it does not hold, ends one at a
+state boundary past which it would, and runs within what it holds; the hot
+block cache does not grow, and a command between its passes goes on. The
+buffers of the states a command captures, and new starts, are not held. A
+prefill command captures the state of
 each boundary it reaches, in buffers reserved before it runs. A junction or a
 checkpoint retires its lane's checkpoint once published, and a checkpoint the
 same command would capture before it is not captured at all; the prompt's
@@ -1582,7 +1622,7 @@ use passes), is read only by the state's admission probes
 (`CompositeState::canOffload`, `Model::canSnapshotToDisk`), never by a
 reservation, an acquire or a write, so a write the engine admitted is never
 refused for it. KV is demoted only for a chain a state on the SSD needs, and
-copied only for a persistent point whose state was written, so those writes
+copied ahead only for a restore point whose state was written, so those writes
 pass the budget: a state the budget let through keeps its chain, and what a
 chain costs comes out of later states' share. The budget therefore paces the
 writes rather than bounding them: writes of states in use and of KV pass it,
@@ -1591,17 +1631,65 @@ While the budget is spent an evicted state is dropped, and `Cache::persist`
 reports the tier busy before it writes anything of a point; once the budget
 admits the point's state, the state is written first and the pages of its
 chain after it. It refuses a point for a file that stopped taking writes, or
-one larger than the tier's limit, its quota or what the volume leaves it. The
-budget refills on the awake clock the native loop schedules its wake-ups on,
-and write-behind wakes when the budget has room again.
+one larger than the room it may take (below). The budget refills on the awake
+clock the native loop schedules its wake-ups on, and write-behind wakes when
+the budget has room again.
 
-Writes happen when RAM reclamation selects a victim. States copy through one
-staging buffer, freeing their RAM immediately. KV leaves needed by a state
-on them or below them are written straight from their extents and released
-after the write succeeds; only then is the block above such a leaf a leaf. A
-chain whose newest blocks have no copy, as a finished request's prompt past the
-chain it restored, so leaves RAM one write at a time, and an allocation refused
-meanwhile waits for each write. Unneeded
+Restore points get their copies ahead of need (`WriteBehind`,
+`Cache::persist`), so that a reclaim later frees a cached conversation at once
+rather than waiting for its writes: an ordinary state published or reused at
+least 2048 tokens deep, 10 s after its publication, unless an ordinary state on
+its only branch below supersedes it by then, its conversation having gone on.
+Its state is written from its own buffers, which stay in RAM, out of every
+eviction order until the write lands, and then the pages of its chain that have
+no copy, root first, at most a quarter of the KV writes in flight
+(`WriteClass::Persist`). Points are copied one at a time, in publication order,
+those that wait passed over.
+Nothing else is copied ahead, as each costs more to write than to lose: the KV
+past a point, which no state restores through and a reclaim drops first, a
+shorter point, which recomputes in less time than its state takes to write, and
+a checkpoint, which a reclaim takes first. A step of a point starts nothing
+while the tier serves what is needed now, a restore that waits, a reclaim's
+demotion or a Spill request's write through, and goes on when they land, which
+wakes the engine, nor while a request the engine retries next, a lane of
+the priority that runs or one admission tries next, waits for memory on its
+way back, up to the resource wait's limit from when it first awaited it, so
+that the request, not a copy started as that memory lands, takes the state
+write next. A demotion or write through started meanwhile waits on the KV
+file's worker behind at most the copies in flight, a quarter of the tier's
+writes, and a state a reclaim writes waits for the point's, the one state write
+in flight, as for any other. A temporary tier's copies serve reclaims alone, so
+they wait for need: a point is copied only within 5 minutes
+(`WriteBehind::kNeedMilliseconds`) of a reclaim last taking cache out of RAM to
+the tier (`Cache::reclaimedToDisk`), a KV leaf or a state, written for it or
+freed through the copy it had, which shows that memory ran short. What leaves
+through a copy counts as much as what is written, so that the copies go on
+while memory stays short and reclaims find what they take copied, writing
+nothing. Without memory pressure nothing is written ahead. A point that waits
+for need keeps its turn while it stays its conversation's newest: a publication
+meanwhile drops the queued points their conversations went on from or that are
+gone (`Cache::newestPoint`), so that need, once it comes, finds no backlog of
+superseded points. There a point also waits while it is in use, as its request
+holds its chain and may go on from it, and its copies take only the room the
+quota has free beside the other copies and the commitments of Spill requests,
+giving up no copy: the redundant copies a full quota gives up first hold what
+reclaims take before such a point, and the only copies what RAM no longer
+holds, while the point may never leave RAM. A point that room cannot hold is
+refused, and once the quota is full a reclaim writes what it takes, as for any
+victim without a copy, giving up redundant copies, those made ahead among them,
+first. A persistent tier copies every point, whether memory has run short or
+not and in use too, so that a start after a crash takes it back, gives up the
+oldest point for it (below), and refuses one larger than its limit. A clean
+stop writes a persistent tier's waiting points, the newest first; a temporary
+tier's copies go with the process.
+
+Otherwise writes happen when RAM reclamation selects a victim without a copy.
+States copy through one staging buffer, freeing their RAM immediately. KV
+leaves needed by a state on them or below them are written straight from their
+extents and released after the write succeeds; only then is the block above
+such a leaf a leaf. A chain whose newest blocks have no copy yet, as a finished
+request's prompt past the chain it restored, so leaves RAM one write at a time,
+and an allocation refused meanwhile waits for each write. Unneeded
 tails are dropped without writing, before any state, together with any disk
 copies below them. Writes run on their file's IO worker. A KV page's slot
 holds what the page holds as it is written: a Slim page's is the first part of a
@@ -1619,7 +1707,7 @@ has landed. While a step waits for SSD
 reads (streamed experts, PLE rows or spilled KV), each 1 MiB of a write waits
 for them, at most 2 ms, unless a read queued behind the write on its file's
 worker would wait as long (`SlotFile::Options::deferWrites`). At most 64 KV
-writes are in flight (`KvPageTier::kWrites`): a persistent point's copies a
+writes are in flight (`KvPageTier::kWrites`): restore points' copies ahead a
 quarter of them and spilling requests' write-through half, so that neither
 starves the demotions a reclaim needs, which may take the rest. When the tier
 takes no more, leaves that need a write stay until a transfer lands, while

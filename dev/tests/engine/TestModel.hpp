@@ -37,8 +37,7 @@ modelMemoryProfile(uint64_t targetWeightsBytes,
   return {12, 2, 256, kv::Format::Int8, 128, true};
 }
 [[nodiscard]] constexpr model::SparseKvShape sparseKvShape() noexcept {
-  return {.blockTokens = 4, .selectedBlocks = 512, .verifyRows = 8, .denseHistoryTokens = 2048,
-          .sinkTokens = 0, .localTokens = 0};
+  return {.blockTokens = 4, .selectedBlocks = 512, .verifyRows = 8, .denseHistoryTokens = 2048};
 }
 static_assert(sparseKvLayout().spillable());
 

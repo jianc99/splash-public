@@ -67,10 +67,14 @@ bool MemoryControl::run(MemoryPressure pressure) {
   const std::optional<MemoryReclaimDirective> directive =
       policy_.update(memory, now, requestWaiting);
   noteExpertReleases(now);
-  if (!directive) {
+  // A pass the host is short for may take the store's chunks, and takes none
+  // back. Any other takes one back before its reclaim: under macOS's warning
+  // alone the cache the pass gives back buys it first, the store ranking
+  // above that cache.
+  if (!directive || !directive->hostShort)
     growExperts(memory, requestWaiting, now);
+  if (!directive)
     return false;
-  }
   const MemoryReclaimResult reclaim = loop_.reclaimMemory(*directive);
   noteExpertReleases(now);
   policy_.reclaimed(*directive, reclaim);
@@ -98,7 +102,9 @@ void MemoryControl::growExperts(const MemoryGovernorSnapshot &memory, bool reque
     expertGrowthMilliseconds_.reset();
     expertCooldownMilliseconds_ = kExpertGrowthCooldownMilliseconds;
   }
-  if (requestWaiting || !memory.hostGrowthAllowed ||
+  // A host short of its warning margin takes no chunk back, in the passes
+  // that answer it and between them.
+  if (requestWaiting || memory.hostHeadroomBytes < kHostWarningMarginBytes ||
       (expertReleaseMilliseconds_ && now - *expertReleaseMilliseconds_ < expertCooldownMilliseconds_))
     return;
   const uint64_t bytes = loop_.expertGrowthBytes();
@@ -106,13 +112,17 @@ void MemoryControl::growExperts(const MemoryGovernorSnapshot &memory, bool reque
     return;
   // What the chunk lacks of the host's headroom beyond the recovery margin,
   // in the pass's sample, or of the room the engine's limit has free,
-  // whichever lacks more: what the engine returns adds to both. An engine
-  // without requests returns it first, or nothing when what leaves at once
-  // falls short; one with a request returns nothing, and the chunk waits. A
-  // chunk refused after all leaves what the engine returned with the
-  // system.
+  // whichever lacks more: what the engine returns adds to both. The engine
+  // returns it first, or nothing when what leaves at once falls short, and
+  // the chunk waits. Under macOS's warning, which holds back growth that
+  // adds to the host's footprint (hostGrowthAllowed), the chunk takes none
+  // of the host's headroom: the engine returns all of it first, and the
+  // footprint stays where it was. A chunk refused after all leaves what the
+  // engine returned with the system.
   const uint64_t spare =
-      memory.hostHeadroomBytes - std::min(memory.hostHeadroomBytes, kHostRecoveryMarginBytes);
+      memory.hostGrowthAllowed
+          ? memory.hostHeadroomBytes - std::min(memory.hostHeadroomBytes, kHostRecoveryMarginBytes)
+          : 0;
   const uint64_t lacking = bytes - std::min({bytes, spare, memory.headroomBytes});
   const uint64_t returned = lacking ? loop_.reclaimForExperts(lacking) : 0;
   bool grown = false;

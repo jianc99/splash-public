@@ -1184,6 +1184,114 @@ splash::model::ExpertSlotPlanes slotPlanes(const Model &m) {
   return planes;
 }
 
+// A store that starts below its cap (ExpertStoreOptions::startBytes) starts
+// with the slots its start holds: three halves of a block's experts, beside a
+// cap of both blocks' but an eighth, and elastic chunks of three quarters of
+// the slots a floor of 85% of them leaves below the start, so that a store
+// with that floor would start with it and one chunk alone. Its floor lies a
+// chunk below the start instead, and the store's live chunks, slots, live
+// bytes and floor are the start's, the chunks past it reserved without
+// memory: the Metal memory it allocates holds none of them.
+// Decode steps and prefill chunks give the resident experts' bits; regrows
+// take the rest back with their slots free, up to the cap, and after a
+// release a restore that admits everything brings the cap back. A start below
+// its smallest store or above its cap is refused. At 16 experts the slots
+// below the start fill fewer regions than two chunks take.
+int streamedStart(MetalBackend &backend, const MoeShape &shape, const std::filesystem::path &directory) {
+  if (shape.experts < 256) return 0;
+  const Model m = makeModel(backend, shape, Q5K, true);
+  ExpertFile file(m, directory / "start.bin");
+  const uint64_t cap = 2 * shape.experts - shape.experts / 8, start = shape.experts + shape.experts / 2,
+                 fixed = ExpertStore::fixedBytes(file.blocks, shape);
+  const auto floor = static_cast<uint32_t>(splash::model::kExpertFloorShare * double(start));
+  ExpertStoreOptions options = storeOptions(arenaBytes(m, cap) + kSpareBytes, file.blocks, shape);
+  options.startBytes = fixed + arenaBytes(m, start) + kSpareBytes;
+  options.elasticChunkBytes = arenaBytes(m, (start - floor) * 3 / 4);
+  const uint64_t largest = backend.capabilities().maxBufferLengthBytes;
+  const auto layoutOf = [&](uint32_t floorSlots, uint64_t startSlots) {
+    return splash::model::streamedExpertChunkLayout(slotPlanes(m), static_cast<uint32_t>(cap), floorSlots,
+                                                    shape.experts, largest, options.elasticChunkBytes,
+                                                    static_cast<uint32_t>(startSlots));
+  };
+  int failures = 0;
+  const auto fail = [&](const std::string &what) {
+    printf("  a store's start %s FAIL\n", what.c_str());
+    ++failures;
+  };
+  const splash::model::ExpertChunkLayout atFloor = layoutOf(floor, cap), layout = layoutOf(0, start);
+  // The chunks of a layout that end at or below the start.
+  const auto reaching = [&](const splash::model::ExpertChunkLayout &chunks) {
+    uint32_t count = 0;
+    while (count < chunks.chunks && chunks.first(count + 1) <= start) ++count;
+    return count;
+  };
+  const uint32_t live = reaching(layout);
+  const uint64_t reached = layout.first(live);
+  if (reaching(atFloor) != 2 || live != 2 || reached <= atFloor.first(2) || layout.chunkSlots != atFloor.chunkSlots)
+    fail("fixture: a floor of 85% reaches the start in " + std::to_string(reaching(atFloor)) +
+         " chunks and the start's layout in " + std::to_string(live) + ", not both in the floor and one chunk");
+  const uint64_t allocated = backend.memoryStats().allocatedBytes;
+  ExpertStore store(backend, file.blocks, shape, options);
+  const uint64_t held = backend.memoryStats().allocatedBytes - allocated;
+  std::array<BlockMoeWeights, 2> streamed{m.weights, m.weights};
+  for (uint32_t block = 0; block < 2; ++block) store.bind(block, streamed[block]);
+  const splash::ops::ExpertChunks &chunks = streamed[0].chunks;
+  ExpertStoreStats stats = store.stats();
+  if (chunks.chunks() != layout.chunks || chunks.floorSlots() != layout.floorSlots ||
+      chunks.chunkSlots() != layout.chunkSlots || stats.capChunks != layout.chunks || stats.chunks != live ||
+      stats.slots != reached || stats.capBytes != fixed + arenaBytes(m, cap) ||
+      stats.floorBytes != fixed + arenaBytes(m, layout.floorSlots) ||
+      stats.liveBytes != fixed + arenaBytes(m, reached) || held < stats.liveBytes ||
+      held - stats.liveBytes >= stats.capBytes - stats.liveBytes)
+    fail("as it starts: " + std::to_string(stats.chunks) + " of " + std::to_string(stats.capChunks) +
+         " chunks of " + std::to_string(stats.slots) + " slots, " + std::to_string(stats.liveBytes) +
+         " bytes live of " + std::to_string(held) + " allocated, a floor of " + std::to_string(stats.floorBytes) +
+         " bytes, not the start's " + std::to_string(live) + " chunks of " + std::to_string(reached) + " slots");
+  std::vector<MoePlan> plans{MoE::decodePlan(shape, 2, MoeConfig{}), prefillPlan(shape, 64),
+                             prefillPlan(shape, kMaximumRows)};
+  Buffers b;
+  const auto run = [&](const std::string &when) {
+    for (const MoePlan &plan : plans)
+      for (uint32_t block = 0; block < 2; ++block) {
+        freshRows(backend, b, shape);
+        const std::vector<uint16_t> want = runWeights(backend, m.weights, b, plan);
+        if (runWeights(backend, streamed[block], b, plan) != want ||
+            !slotsHoldTheirExperts(m, streamed[block], b, plan))
+          fail(when + ", block " + std::to_string(block) + ", " + std::to_string(plan.rows()) +
+               " rows: output or slots differ from the resident experts'");
+      }
+  };
+  run("as it starts");
+  while (store.growthBytes())
+    if (!store.growTowardCap(splash::test::admitAll)) fail("a regrow from the start was refused");
+  stats = store.stats();
+  if (stats.chunks != layout.chunks || stats.slots != cap || stats.liveBytes != stats.capBytes ||
+      stats.regrows != layout.chunks - live)
+    fail("after regrows: " + std::to_string(stats.chunks) + " chunks of " + std::to_string(stats.slots) +
+         " slots after " + std::to_string(stats.regrows) + " regrows, not the cap");
+  run("after regrows to the cap");
+  store.release();
+  if (store.stats().liveBytes) fail("a released store counts bytes live");
+  require(store.restore(splash::test::admitAll, splash::test::admitAll), "the started store did not restore");
+  if (store.stats().chunks != layout.chunks || store.stats().liveBytes != stats.capBytes)
+    fail("a restore that admits everything did not bring the cap back");
+  for (const uint64_t bytes : {ExpertStore::minimumBytes(file.blocks, shape) - 1, options.memoryBytes + 1}) {
+    ExpertStoreOptions outside = options;
+    outside.startBytes = bytes;
+    try {
+      ExpertStore refused(backend, file.blocks, shape, outside);
+      fail("a start of " + std::to_string(bytes) + " bytes was taken");
+    } catch (const std::invalid_argument &error) {
+      if (std::string(error.what()).find("lies outside its floor") == std::string::npos)
+        fail("a start of " + std::to_string(bytes) + " bytes was refused for another reason: " + error.what());
+    }
+  }
+  printf("a store starting with %llu of %llu slots in %u of %u chunks: the start's slots live, the rest reserved "
+         "and taken back, bitwise the resident experts' %s\n",
+         (unsigned long long)reached, (unsigned long long)cap, live, layout.chunks, failures ? "FAIL" : "ok");
+  return failures;
+}
+
 // Two streamed sizes beside a size of one block give their chunks back and
 // take them again by their shares above their floors: two blocks of Q8_0 and
 // two of Q5_K, each size in memory for both blocks' experts but three, and
@@ -1242,7 +1350,8 @@ int streamedElasticSizes(MetalBackend &backend, const MoeShape &shape, const std
   for (size_t size = 0; size < 2; ++size) {
     layouts[size] = splash::model::streamedExpertChunkLayout(slotPlanes(*sizes[size]), static_cast<uint32_t>(cap),
                                                              static_cast<uint32_t>(floor), shape.experts,
-                                                             options.bufferBytes, options.elasticChunkBytes);
+                                                             options.bufferBytes, options.elasticChunkBytes,
+                                                             static_cast<uint32_t>(cap));
     const splash::ops::ExpertChunks &chunks = streamed[firstBlock[size]].chunks;
     const ExpertChunkLayout &layout = layouts[size];
     if (streamed[firstBlock[size]].slots != cap || chunks.chunks() != layout.chunks ||
@@ -1551,6 +1660,7 @@ int main(int argc, const char *argv[]) {
                     streamedChunks(backend, shape, directory.path()) +
                     streamedElastic(backend, shape, directory.path()) +
                     streamedElasticSizes(backend, shape, directory.path()) +
+                    streamedStart(backend, shape, directory.path()) +
                     streamedSkippedLoadAfterShrink(argv[1], shape, directory.path()) +
                     streamedChunkLimit(backend, shape, directory.path()) +
                     streamedSourceChanges(argv[1], shape, directory.path());

@@ -250,9 +250,11 @@ void testCleanRuntimeStatus(const char *goldenPath) {
                     "\"left_behind\":1},\"write_behind\":{\"waiting\":1,\"durable\":5,"
                     "\"unneeded\":3,\"refused\":0}}") != std::string::npos,
           "status lost the persistent tier");
-  require(json.find("\"state_staging_bytes\":0,\"fixed_runtime_bytes\"") !=
+  // The room the host held back of the streamed stores follows the staging
+  // among the fixed parts.
+  require(json.find("\"state_staging_bytes\":0,\"host_held_back_bytes\":0,\"fixed_runtime_bytes\"") !=
               std::string::npos,
-          "the memory plan status omitted the disk tier's state staging");
+          "the memory plan status omitted the disk tier's state staging or the room the host held back");
   const std::string kvIdentity =
       "{\"target_model_sha256\":\"" + std::string(64, 'b') +
       "\",\"format\":\"int8\",\"quantization\":\"symmetric_int8\","

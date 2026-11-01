@@ -26,7 +26,23 @@ uint64_t compressionSavings(const HostMemoryPages &pages) noexcept {
          static_cast<uint64_t>(static_cast<unsigned __int128>(pages.anonymous) * pages.compressor / pages.compressed);
 }
 
+// The host's spare memory above its spare reserve, beside `reservedBytes`
+// being allocated: the room growth no request in service needs takes from.
+uint64_t spareHeadroom(const HostMemory &host, uint64_t spareReserveBytes, uint64_t reservedBytes) noexcept {
+  if (host.spare <= spareReserveBytes)
+    return 0;
+  const uint64_t spareAfterReserve = host.spare - spareReserveBytes;
+  return reservedBytes < spareAfterReserve ? spareAfterReserve - reservedBytes : 0;
+}
+
 } // namespace
+
+uint64_t hostBudgetBytes(const HostMemory &host, uint64_t spareReserveBytes, uint64_t engineBytes) noexcept {
+  const uint64_t headroom = spareHeadroom(host, spareReserveBytes, 0);
+  const uint64_t room = headroom > kHostWarningMarginBytes ? headroom - kHostWarningMarginBytes : 0;
+  return room <= std::numeric_limits<uint64_t>::max() - engineBytes ? engineBytes + room
+                                                                     : std::numeric_limits<uint64_t>::max();
+}
 
 HostMemory estimateHostMemory(const HostMemoryPages &statistics, uint64_t pageSize,
                               bool compression) noexcept {
@@ -161,10 +177,7 @@ std::optional<HostMemory> MemoryGovernor::sampleHost() const noexcept {
 
 uint64_t MemoryGovernor::hostHeadroomBytes(const std::optional<HostMemory> &host,
                                            uint64_t reservedBytes) const noexcept {
-  if (!host || host->spare <= hostSpareReserveBytes_)
-    return 0;
-  const uint64_t spareAfterReserve = host->spare - hostSpareReserveBytes_;
-  return reservedBytes < spareAfterReserve ? spareAfterReserve - reservedBytes : 0;
+  return host ? spareHeadroom(*host, hostSpareReserveBytes_, reservedBytes) : 0;
 }
 
 std::optional<MemoryGovernor::Reservation>
@@ -188,14 +201,16 @@ MemoryGovernor::tryReserve(uint64_t bytes, bool optional, metal::AllocationFailu
   // service needs it (setServing). Optional growth leaves the recovery
   // margin free, whatever the mark, but takes from the host only the bytes
   // beyond those the engine returned to the system for it (setGrowthCredit):
-  // with none beyond them, no margin holds it back on a measured host.
+  // with none beyond them it leaves the host's footprint where it was, and
+  // neither a margin nor macOS's warning holds it back on a measured host.
   const bool serving = serving_ && !optional;
   const uint64_t hostRoom = hostHeadroomBytes(host, 0);
   const uint64_t margin = optional ? kHostRecoveryMarginBytes : kHostWarningMarginBytes;
   const uint64_t credited = optional ? std::min(bytes, growthCreditBytes_) : 0;
   const uint64_t hostRequested = requested - credited;
+  const bool covered = host && credited == bytes;
   const bool hostRoomFits =
-      host && (credited == bytes || (hostRequested <= hostRoom && hostRoom - hostRequested >= margin));
+      covered || (host && hostRequested <= hostRoom && hostRoom - hostRequested >= margin);
   // A request that only the host headroom refuses waits for host memory
   // while the idle headroom may still clear the margin. Hold host pressure:
   // once a control pass finds the request waiting, the paced reclaim frees
@@ -205,7 +220,7 @@ MemoryGovernor::tryReserve(uint64_t bytes, bool optional, metal::AllocationFailu
     host_.constrained = true;
   const bool hostRefuses =
       pressure == MemoryPressure::Critical ||
-      (!serving && (systemPressure_ == MemoryPressure::Warning || !hostRoomFits ||
+      (!serving && ((systemPressure_ == MemoryPressure::Warning && !covered) || !hostRoomFits ||
                     growthHeld(host_)));
   if (hostRefuses || !engineFits) {
     // The host's refusal lifts with its pressure, the limit's only once

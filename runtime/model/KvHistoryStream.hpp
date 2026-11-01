@@ -64,6 +64,9 @@ public:
   // as an idle buffer after the prompt until releaseIdle() gives it back,
   // returning its bytes.
   [[nodiscard]] ModelMemoryAdmission reserve(uint32_t pages);
+  // Whether reserve(pages) would allocate nothing: the staging, which the
+  // prompts that stream share, holds those pages already.
+  [[nodiscard]] bool holds(uint32_t pages) const noexcept;
   uint64_t releaseIdle();
 
   // Encode of a command whose one streamed sequence's history holds Index

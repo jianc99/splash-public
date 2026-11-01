@@ -12,12 +12,13 @@
 namespace splash::model {
 
 struct ExpertStoreStats final {
-  // The store at its cap and at its floor, as ExpertStoreOptions counts
-  // them (its staging and tables too), its chunks at the cap and those live.
-  // The live chunks, their bytes and their slots are zero while the store is
-  // released.
+  // The store at its cap, at its floor and as it is, as ExpertStoreOptions
+  // counts them (its staging and tables too), its chunks at the cap and
+  // those live. The store as it is, the live chunks, their bytes and their
+  // slots are zero while the store is released.
   uint64_t capBytes = 0;
   uint64_t floorBytes = 0;
+  uint64_t liveBytes = 0;
   uint64_t capChunks = 0;
   uint64_t chunks = 0;
   uint64_t arenaBytes = 0; // the live chunks of every size

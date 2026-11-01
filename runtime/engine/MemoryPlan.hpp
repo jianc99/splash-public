@@ -102,6 +102,13 @@ struct ModelMemoryFootprint final {
   // as long as it runs, so the plan and the governor charge it like the
   // weights it stands in for. Zero without one.
   uint64_t streamedTableBytes = 0;
+  // What the host held back of the streamed stores the engine's limit gives
+  // them: the table's row cache below its share
+  // (StreamedMemoryPlan::hostHeldBackBytes) and the expert store's chunks
+  // that start released (StreamedMemoryPlan::expertStartBytes). No memory,
+  // but fixed in the plan, so that the context and the KV it holds rest on
+  // the engine's limit alone, as on a host with the room.
+  uint64_t hostHeldBackBytes = 0;
 };
 
 // What a spill-capable target plans for the K/V of long requests that lives
@@ -139,6 +146,13 @@ struct KvSpillPlan final {
   // pages, the readers' and the runway.
   uint32_t floorTokens = 0;
   uint64_t floorBytes = 0;
+  // What the plan sets aside for one Spill request's readers: the larger of
+  // the hot cache's target and the history staging. Not the most they hold:
+  // each further lane decoding over Index pages adds laneReadBytes to the
+  // hot cache once their floors pass its target, up to hotLimitBytes, and a
+  // prompt's staging may be held beside other lanes' floors, which KV's
+  // memory pays for as they take it.
+  [[nodiscard]] uint64_t readerBytes() const noexcept { return std::max(hotTargetBytes, stagingBytes); }
   // The longest context spilling serves: what memory holds beside the
   // streamed stores at their smallest, and what the SSD cache's room for
   // active KV holds (DiskSpace) beside every lane's state.
@@ -172,6 +186,12 @@ struct StreamedMemoryInputs final {
   // lanes' state and KV: the weights that load, the reserves, the state
   // staging and the Neural Engine split.
   uint64_t fixedBytes = 0;
+  // Of fixedBytes, the reserve the host's budget holds already when it is
+  // sampled: the process's runtime overhead
+  // (model::kRuntimeOverheadReserveBytes), which the spare memory counts.
+  // The pipeline reserve's pipelines and encoder scratch are built at
+  // warmup, after the sample, so the host room charges them.
+  uint64_t reserveBytes = 0;
   // The arenas of the model's geometry (model::plannedRuntimeMemory) by what
   // streams, [experts][table]: a target whose routed experts stream runs its
   // prefill commands as groups, and one whose table streams stages its rows,
@@ -192,6 +212,14 @@ struct StreamedMemoryInputs final {
   uint32_t relaunchContextTokens = 0;
   StreamedPart experts;
   StreamedPart table;
+  // The row cache an automatic table takes at most
+  // (model::StreamableWeights::tableShareBytes).
+  uint64_t tableShareBytes = 0;
+  // What the host leaves the engine as the governor counts it when the
+  // stores are sized (hostBudgetBytes): an automatic part's store starts
+  // with at most what it leaves beside what an engine without requests
+  // holds once warm, reserveBytes aside.
+  uint64_t hostBudgetBytes = 0;
   // --sparse-kv-memory: the hot block cache's target, at least its floor;
   // none keeps it at its floor.
   std::optional<uint64_t> hotCacheBytes;
@@ -211,11 +239,18 @@ struct StreamedMemoryInputs final {
 // whole or a model without it, and a spill-capable target's plan. The
 // routed experts' store takes expertBytes, its cap, and gives back what
 // memory needs down to its floor, expertFloorBytes: --expert-memory's size,
-// or zero for the store's own (model::ExpertStoreOptions::floorBytes).
+// or zero for the store's own (model::ExpertStoreOptions::floorBytes). An
+// automatic store starts with expertStartBytes, what the host's budget
+// leaves it, zero for its cap, and takes the rest back once memory allows
+// (model::ExpertStoreOptions::startBytes). hostHeldBackBytes is what the
+// host's budget held back of an automatic table's share, whose row cache
+// does not grow.
 struct StreamedMemoryPlan final {
   uint64_t expertBytes = 0;
   uint64_t expertFloorBytes = 0;
+  uint64_t expertStartBytes = 0;
   uint64_t tableBytes = 0;
+  uint64_t hostHeldBackBytes = 0;
   KvSpillPlan spill{};
 };
 
@@ -235,18 +270,26 @@ struct StreamedMemoryResult final {
 // at the context spilling serves. Then the routed experts load whole where
 // that leaves KV its allowance, and otherwise stream through all that the
 // allowance and the PLE table's share leave; the table loads whole where the
-// rest holds it, and otherwise streams through its share, 512 MiB at most.
-// The allowance is the KV of a context in the fewest pages whose whole
+// rest holds it, and otherwise streams through its share, tableShareBytes at
+// most. The allowance is the KV of a context in the fewest pages whose whole
 // extents hold it, as one request's capacity rounds them (kvCapacityPagesFor):
 // a spill-capable target's first 64K tokens; a dense target's --max-context,
 // or none, so that its experts load wherever main loads them, and the first
-// 64K tokens once they stream. The arenas are those of the parts that
-// stream: where the plan with the arenas of fewer parts streams more, it
-// plans again with those. An explicit size of the PLE table replaces its
-// part; one of the routed experts is charged among the floors, and they load
-// whole or stream as automatic experts do, a store that streams them taking
-// all that the rest leaves them, so at least that size, with that size as
-// its floor.
+// 64K tokens once they stream. Last, the host's budget: an engine without
+// requests holds what loads, the floors but a Spill request's and the
+// stores, the reserve the budget holds already aside, and the automatic
+// stores, the table's share first, take above their charge only what the
+// budget leaves of what the engine's limit gives them: the table's row cache
+// that much, what the budget holds back of it the plan's all the same
+// (hostHeldBackBytes), and the experts' store starts with it, its cap the
+// limit's (expertStartBytes), so that what loads whole, the floors and the
+// context follow the engine's limit alone. The arenas are those of the
+// parts that stream: where the plan with the arenas of fewer parts streams
+// more, it plans again with those. An explicit size of the PLE table
+// replaces its part; one of the routed experts is charged among the floors,
+// and they load whole or stream as automatic experts do, a store that
+// streams them taking all that the rest leaves them, so at least that size,
+// with that size as its floor, and starting as an automatic store does.
 // A size below the part's smallest store, a hot cache target beyond what
 // the floors leave, and floors beyond the budget are refused.
 [[nodiscard]] StreamedMemoryResult planStreamedMemory(const StreamedMemoryInputs &inputs);
@@ -342,6 +385,7 @@ struct EngineMemoryBreakdown {
   uint64_t aneFfnBytes = 0;
   uint64_t stateStagingBytes = 0;
   uint64_t streamedTableBytes = 0;
+  uint64_t hostHeldBackBytes = 0;
   uint64_t fixedRuntimeBytes = 0;
 
   // All lanes' state, cached composite states, and KV extents grow from this
@@ -436,7 +480,8 @@ private:
 // SparseKvShape, with a writable tier), whether every request spills
 // (--kv-spill always, for validation), the history a row may read whole
 // through its page table, the pages the cache keeps Full for it
-// (SparseKvShape::denseTokens, KvSpillPlan::densePages), and the geometry.
+// (SparseKvShape::denseHistoryTokens, KvSpillPlan::densePages), and the
+// geometry.
 struct EngineSpillConfig final {
   bool capable = false;
   bool always = false;

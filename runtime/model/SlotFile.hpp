@@ -47,12 +47,12 @@ namespace splash::model {
 // tier submits draws on it: a token bucket of this process, counted at
 // submission in whole slots, which each start begins full. The budget then
 // decides which states are written: while it is spent, an evicted state is
-// dropped instead and a persistent restore point waits, unless the state is
-// in use (the state a conversation resumes from), which passes. KV is written
-// only for a state the budget let through, its chain's pages kept reachable
-// or copied after it: those writes pass, counted all the same, so such a
-// state never loses its chain for want of budget, and what a chain costs
-// comes out of later states' share. Writes are submitted on the engine
+// dropped instead and a restore point waits for its copies, unless the state
+// is in use (the state a conversation resumes from), which passes. KV is
+// written only for a state the budget let through, its chain's pages kept
+// reachable or copied after it: those writes pass, counted all the same, so
+// such a state never loses its chain for want of budget, and what a chain
+// costs comes out of later states' share. Writes are submitted on the engine
 // thread, which alone reads the budget (admits), so a write the engine
 // admitted is never refused for it.
 class DiskBudget final {

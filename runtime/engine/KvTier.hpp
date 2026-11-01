@@ -35,9 +35,9 @@ public:
 
 // What a write to the tier is for, each with its share of the writes in
 // flight (KvPageTier), so that one kind never starves another: a page whose
-// RAM a reclaim frees once its copy lands, a copy a persistent tier keeps of
-// a page that stays (Cache::persist), and a Spill request's page written
-// through (Cache::writeThrough).
+// RAM a reclaim frees once its copy lands, a copy of a page that stays,
+// which a restore point's chain gets ahead of need (Cache::persist), and a
+// Spill request's page written through (Cache::writeThrough).
 enum class WriteClass : uint8_t { Reclaim, Persist, Spill };
 
 // The disk tier for KV pages as the engine drives it. Until a transfer is

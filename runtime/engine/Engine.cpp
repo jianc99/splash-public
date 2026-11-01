@@ -199,7 +199,7 @@ bool Engine::tick(double now) {
       static_cast<void>(cache_.writeThrough());
   }
   progressed = pollRestores(now) || progressed;
-  progressed = writeBehind_.run(now) || progressed;
+  progressed = writeBehind_.run(now, memoryAwaited(now)) || progressed;
   // The earliest submitted and the earliest admitted of the lanes with work
   // in flight.
   uint64_t earliestWorking = std::numeric_limits<uint64_t>::max();
@@ -297,6 +297,13 @@ bool Engine::tick(double now) {
     if (active.lane && active.resourceWait.pending && !resourceRetryReady(active, now))
       excluded.push_back(id);
   }
+  // Lanes prepare held back for a lane that waits for memory wait on once
+  // this tick's attempts are over (rewaitHeld), however the tick ends.
+  struct HeldWaits final {
+    Engine &engine;
+    double now;
+    ~HeldWaits() { engine.rewaitHeld(now); }
+  } const heldWaits{*this, now};
   while (auto plan = scheduler_.next(excluded)) {
     std::vector<ModelBatchItem> items;
     std::vector<std::vector<Capture>> captures;
@@ -366,6 +373,33 @@ bool Engine::admissionTries(const Request &active, std::optional<RequestPriority
          (scheduler_.suspended(active.request.id) && !draining);
 }
 
+bool Engine::belowRunnable(const Request &active) const {
+  const std::optional<RequestPriority> runnable = scheduler_.highestRunnablePriority();
+  return runnable && active.request.priority > *runnable;
+}
+
+std::optional<double> Engine::memoryAwaitedUntil(const Request &waiter) const {
+  const ResourceWait &wait = waiter.resourceWait;
+  if (!wait.pending || !wait.startedMilliseconds)
+    return std::nullopt;
+  const bool retried = waiter.lane ? !belowRunnable(waiter)
+                                   : admissionTries(waiter, suspendedTier(), drainingForRecovery()) &&
+                                         !holdsBack(waiter.heldBehind);
+  if (!retried)
+    return std::nullopt;
+  return *wait.startedMilliseconds + config_.resourceWaitTimeoutMilliseconds;
+}
+
+bool Engine::awaitsMemory(const Request &waiter, double now) const {
+  const std::optional<double> until = memoryAwaitedUntil(waiter);
+  return until && now < *until;
+}
+
+bool Engine::memoryAwaited(double now) const {
+  return std::ranges::any_of(requests_,
+                             [&](const auto &entry) { return awaitsMemory(entry.second, now); });
+}
+
 bool Engine::holdsBack(std::optional<uint64_t> refused) const {
   if (!refused)
     return false;
@@ -408,8 +442,13 @@ std::optional<double> Engine::nextWakeupMilliseconds() const {
     if (!result || wakeup < *result)
       result = wakeup;
   }
-  if (const std::optional<double> persist = writeBehind_.nextWakeup();
-      persist && (!result || *persist < *result))
+  // Copies ahead wait for the end of a wait for memory, which a step of the
+  // engine shows, or for the end of what that wait holds back.
+  std::optional<double> persist = writeBehind_.nextWakeup();
+  for (const auto &[_, active] : requests_)
+    if (const std::optional<double> until = memoryAwaitedUntil(active); persist && until)
+      persist = std::max(*persist, *until);
+  if (persist && (!result || *persist < *result))
     result = persist;
   return result;
 }
@@ -502,13 +541,9 @@ bool Engine::admitQueued(double now) {
     request(id).heldBehind = refused;
   };
   // A request below the highest priority that prefills or decodes cannot
-  // run before that priority is done. It waits for scheduling, unprobed, and
-  // takes no lane, neither a free one nor a lower resident's: the lanes of
-  // that priority free theirs as they finish.
-  const std::optional<RequestPriority> runnable = scheduler_.highestRunnablePriority();
-  const auto belowRunnable = [&](const Request &active) {
-    return runnable && active.request.priority > *runnable;
-  };
+  // run before that priority is done (belowRunnable). It waits for
+  // scheduling, unprobed, and takes no lane, neither a free one nor a lower
+  // resident's: the lanes of that priority free theirs as they finish.
   // The tokens a request's start would reuse, from its probe brought up to
   // date: none for a request that ignores the cache, which is ranked by its
   // whole prompt.
@@ -1242,17 +1277,42 @@ void Engine::deferResourceRetry(Request &active, double now,
   // those admitted before the first refusal of memory.
   if (!wait.admittedBefore && reason != StateFailure::ConcurrencyLimit)
     wait.admittedBefore = admissions_;
-  const bool progressed = wait.pending && wait.epoch != resourceEpoch_;
+  noteRefusal(active, now, denial);
   wait.reason = reason;
+  if (reason == StateFailure::ConcurrencyLimit)
+    wait.deadlineMilliseconds = 0.0;
+  else if (wait.deadlineMilliseconds <= 0.0)
+    wait.deadlineMilliseconds = now + config_.resourceWaitTimeoutMilliseconds;
+  wait.retryMilliseconds = now + kResourceRetryBackoffMilliseconds;
+}
+
+void Engine::noteRefusal(Request &active, double now, const Denial &denial) noexcept {
+  auto &wait = active.resourceWait;
+  if (wait.pending && wait.epoch != resourceEpoch_ && wait.deadlineMilliseconds > 0.0)
+    wait.deadlineMilliseconds = now + config_.resourceWaitTimeoutMilliseconds;
+  if (denial.pending && !wait.startedMilliseconds)
+    wait.startedMilliseconds = now;
   wait.allocationFailure = denial.allocationFailure;
   wait.pending = denial.pending;
   wait.diskQuota = denial.diskQuota;
-  if (reason == StateFailure::ConcurrencyLimit)
-    wait.deadlineMilliseconds = 0.0;
-  else if (progressed || wait.deadlineMilliseconds <= 0.0)
-    wait.deadlineMilliseconds = now + config_.resourceWaitTimeoutMilliseconds;
   wait.epoch = resourceEpoch_;
-  wait.retryMilliseconds = now + kResourceRetryBackoffMilliseconds;
+}
+
+void Engine::rewaitHeld(double now) noexcept {
+  for (const uint64_t id : heldWaits_) {
+    const auto found = requests_.find(id);
+    if (found == requests_.end() || !found->second.lane)
+      continue;
+    Request &held = found->second;
+    const ResourceWait &wait = held.resourceWait;
+    if (wait.retryMilliseconds > 0.0)
+      deferResourceRetry(held, now,
+                         {.allocationFailure = wait.allocationFailure,
+                          .pending = wait.pending,
+                          .diskQuota = wait.diskQuota},
+                         wait.reason);
+  }
+  heldWaits_.clear();
 }
 
 void Engine::deferWait(Request &active) noexcept {
@@ -1652,12 +1712,42 @@ Engine::Prepared Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &i
     }
     return workEnd;
   };
+  // A lane that yields before one waiting for memory on its way back leaves
+  // that memory to it until it has it, or for as long as that wait's limit
+  // allows (awaitsMemory): as the memory lands, it would take it a page or
+  // an extent at a time before the waiting lane retries, and a lane that
+  // waits for many pages' worth at once, as for a floor of the hot block
+  // cache, would wait for as long as the other one grows. Such a lane leaves
+  // the command where it would take KV pages past its capacity, or memory
+  // for its reads of spilled KV it does not hold, and ends its command at a
+  // state boundary past which it would take KV pages (reserveCaptures);
+  // within what it holds, it runs. The buffers of the states its command
+  // captures are not held. A command between its passes takes nothing and
+  // goes on (above).
+  const auto held = [&](const Request &active) {
+    return std::ranges::any_of(requests_, [&](const auto &entry) {
+      return &entry.second != &active && entry.second.lane &&
+             awaitsMemory(entry.second, now) && yieldsBefore(active, entry.second);
+    });
+  };
+  // A lane held back with a wait of its own waits on as one refused does
+  // (rewaitHeld).
+  bool heldBack = false;
+  const auto hold = [&](const Request &active) {
+    heldBack = true;
+    if (active.resourceWait.retryMilliseconds > 0.0)
+      heldWaits_.push_back(active.request.id);
+  };
   for (const BatchItem &scheduled : plan.items) {
     Request &active = request(scheduled.requestId);
     if (!active.lane)
       throw std::logic_error("scheduled request is not resident");
     const uint64_t id = active.request.id;
     const uint64_t workEnd = workEndOf(active, scheduled);
+    if (workEnd > kvCapacity(id) && held(active)) {
+      hold(active);
+      continue;
+    }
     const auto kv = allocate([&] { return cache_.ensureTokens(id, workEnd); }, true,
                              growthClass(active), spillFallback(active));
     if (kv.admission.granted())
@@ -1694,6 +1784,10 @@ Engine::Prepared Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &i
         const auto pages = static_cast<uint32_t>(
             (uint64_t{scheduled.promptOffset} + scheduled.tokenCount + KvCache::pageTokens - 1) /
             KvCache::pageTokens);
+        if (!model_.holdsSpilledReads(id, prefill ? pages : 0) && held(active)) {
+          hold(active);
+          continue;
+        }
         const auto memory = allocate(
             [&] {
               return prefill ? model_.reserveHistoryStaging(id, pages)
@@ -1715,9 +1809,14 @@ Engine::Prepared Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &i
     }
     admitted = std::move(kept);
   }
-  // A lane that runs is waiting for nothing.
+  // A lane that runs is waiting for nothing; one refused waits for what
+  // refused it, beside the lanes that run or alone: memory on its way back,
+  // which the lanes that yield before it leave to it (held), or memory
+  // nothing returns, for which it holds no one.
   for (const BatchItem &scheduled : admitted)
     request(scheduled.requestId).resourceWait = {};
+  for (const Denied &entry : denied)
+    noteRefusal(request(entry.requestId), now, entry.denial);
   // A lane refused the model's memory for its reads of spilled KV, which no
   // transfer in flight returns, takes it from the lane that yields first, as
   // when no lane fits, if that lane holds its memory outside this command
@@ -1739,8 +1838,9 @@ Engine::Prepared Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &i
     }
   }
   // The hot block cache they read through grows toward its planned size,
-  // by an extent at most, into memory nothing needs now.
-  if (spilledReads)
+  // by an extent at most, into memory nothing needs now: none while a lane
+  // waits for memory on its way back.
+  if (spilledReads && !memoryAwaited(now))
     static_cast<void>(allocate([&] { return model_.growSpilledReads(); }, false,
                                ReclaimClass::Ordinary, {}, true));
   if (!admitted.empty()) {
@@ -1753,7 +1853,8 @@ Engine::Prepared Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &i
     for (size_t index = 0; prefill && index < plan.items.size(); ++index) {
       BatchItem &item = plan.items[index];
       Request &active = request(item.requestId);
-      const uint32_t rows = reserveCaptures(active, item, states[index], captures[index]);
+      const uint32_t rows =
+          reserveCaptures(active, item, states[index], captures[index], held(active));
       if (rows != item.tokenCount) {
         item.tokenCount = rows;
         ++counters_.captureCuts;
@@ -1796,9 +1897,13 @@ Engine::Prepared Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &i
 
   // Partial admissions execute at their actual width. If no lane fits, the
   // lane to yield is chosen among all runnable residents: an unstarted peer
-  // can release its lane before completed prefill is discarded.
-  if (denied.empty())
+  // can release its lane before completed prefill is discarded. Lanes held
+  // back for a lane that waits for memory only leave the plan for this tick.
+  if (denied.empty()) {
+    if (heldBack)
+      return Prepared::Waiting;
     throw std::logic_error("empty resource admission result");
+  }
   // No lane runs: the copies Spill requests owe and have not started, as a
   // chain a lane restored has before its first command or those the memory
   // governor's pass left when it collected the ones that landed, start now.
@@ -1859,7 +1964,7 @@ Engine::Prepared Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &i
 
 uint32_t Engine::reserveCaptures(Request &active, const BatchItem &item,
                                  std::vector<StateCapture> &states,
-                                 std::vector<Capture> &captures) {
+                                 std::vector<Capture> &captures, bool held) {
   const uint32_t start = item.promptOffset;
   // A request waiting for a prefix starts once the command that reaches its
   // state has ended.
@@ -1923,6 +2028,12 @@ uint32_t Engine::reserveCaptures(Request &active, const BatchItem &item,
     const uint32_t next = index + 1 < boundaries.size() && boundaries[index + 1].tokens < end
                               ? boundaries[index + 1].tokens
                               : end;
+    // A held lane (prepare) takes no KV pages past its capacity.
+    if (held && next > kvCapacity(active.request.id)) {
+      if (passed)
+        static_cast<void>(reserve(index));
+      return tokens - start;
+    }
     const auto kv = allocate(
         [&] { return cache_.ensureTokens(active.request.id, next); }, true, ReclaimClass::Ordinary,
         {}, true);
@@ -2307,24 +2418,39 @@ bool Engine::growExperts(uint64_t headroomBytes) {
     throw std::logic_error("expert growth requested while a command is in flight");
   const uint64_t bytes = model_.expertGrowthBytes();
   // It takes only room the engine's limit has free, and asks for none it
-  // lacks, which would count as a denied reservation for nothing. An engine
-  // without requests makes that room by the exchange alone
-  // (reclaimForExperts), which buys the chunk or takes nothing.
+  // lacks, which would count as a denied reservation for nothing. The
+  // exchange alone makes that room (reclaimForExperts), which buys the
+  // chunk or takes nothing.
   return bytes && headroomBytes >= bytes && model_.growExperts().granted();
 }
 
 uint64_t Engine::reclaimForExperts(uint64_t bytes) {
   if (pending_)
     throw std::logic_error("cache reclaim for the expert store requested while a command is in flight");
+  // A request that holds no lane, yet to start or suspended, restores the
+  // chain its probe finds once it starts: admission's, brought up to date,
+  // or one made here where admission has made none. One that skips the cache
+  // restores none.
+  RestoredChains restored;
+  for (auto &[_, active] : requests_) {
+    if (active.lane || active.finalized || active.skipCache)
+      continue;
+    if (active.admissionProbe) {
+      cache_.refresh(*active.admissionProbe, active.exactTokens, promptIdentity(active.request));
+      restored.add(active.admissionProbe->restoredChain());
+    } else {
+      restored.add(cache_.probe(active.exactTokens, promptIdentity(active.request)).restoredChain());
+    }
+  }
   // Cache that cannot buy the chunk would go for nothing: as a lane takes a
   // cached state only when those in RAM cover what it lacks
   // (reuseCachedStateWhilePaused), nothing goes unless what leaves at once
   // covers the bytes, and then the bytes leave in this call.
-  if (!idle() || exchangeableBytes() < bytes)
+  if (exchangeableBytes(restored) < bytes)
     return 0;
   uint64_t returned = 0;
   while (returned < bytes) {
-    const CacheReclaimResult step = reclaimStepForExperts();
+    const CacheReclaimResult step = reclaimStepForExperts(restored);
     if (!step.madeProgress)
       break;
     returned += step.reclaimedBytes;
@@ -2332,17 +2458,17 @@ uint64_t Engine::reclaimForExperts(uint64_t bytes) {
   return returned;
 }
 
-uint64_t Engine::exchangeableBytes() const {
-  const CacheExchange cache = cache_.exchangeable();
+uint64_t Engine::exchangeableBytes(const RestoredChains &restored) const {
+  const CacheExchange cache = cache_.exchangeable(restored);
   return model_.idleBufferBytes(cache.states) + cache.extentBytes;
 }
 
-CacheReclaimResult Engine::reclaimStepForExperts() {
+CacheReclaimResult Engine::reclaimStepForExperts(const RestoredChains &restored) {
   if (const uint64_t buffer = model_.reclaimIdleState(true, model::IdleMemory::Buffers)) {
     signalResourceProgress();
     return {.madeProgress = true, .reclaimedBytes = buffer};
   }
-  return cache_.reclaimForExchange();
+  return cache_.reclaimForExchange(restored);
 }
 
 bool Engine::reclaimIdleState(bool keepLane, model::IdleMemory scope) noexcept {

@@ -18,6 +18,7 @@
 #include <cstring>
 #include <exception>
 #include <iomanip>
+#include <limits>
 #include <mutex>
 #include <span>
 #include <stdexcept>
@@ -417,6 +418,8 @@ struct ExpertStore::Impl {
   std::vector<uint64_t> routedIn;
   std::string failure;
   ExpertStoreStats counters;
+  // The staging and tables (fixedBytes), which counters' bytes count.
+  uint64_t fixedBytes = 0;
   mutable std::mutex statsMutex;
   ExpertStoreStats published;
   bool released = false;
@@ -927,7 +930,7 @@ void ExpertStore::Impl::forgetRepack() {
 }
 
 void ExpertStore::Impl::countLive() {
-  counters.chunks = counters.arenaBytes = counters.slots = 0;
+  counters.chunks = counters.arenaBytes = counters.slots = counters.liveBytes = 0;
   if (released) return;
   for (const Size &size : sizes) {
     const uint32_t live = size.chunks.liveChunks();
@@ -935,6 +938,7 @@ void ExpertStore::Impl::countLive() {
     for (uint32_t chunk = 0; chunk < live; ++chunk) counters.arenaBytes += size.buffers[chunk].sizeBytes();
     counters.slots += size.chunkLayout.first(live);
   }
+  counters.liveBytes = fixedBytes + counters.arenaBytes;
 }
 
 // Leaves a copy of the counters and the failure for stats().
@@ -1041,6 +1045,11 @@ ExpertStore::ExpertStore(metal::MetalBackend &backend, StreamedBlocks streamed, 
     throw std::invalid_argument("an expert floor of " + std::to_string(options.floorBytes >> 20) +
                                 " MiB lies outside the smallest store and the store's " +
                                 std::to_string(options.memoryBytes >> 20) + " MiB");
+  if (options.startBytes &&
+      (options.startBytes < std::max(minimum, options.floorBytes) || options.startBytes > options.memoryBytes))
+    throw std::invalid_argument("an expert store starting with " + std::to_string(options.startBytes >> 20) +
+                                " MiB lies outside its floor and its " + std::to_string(options.memoryBytes >> 20) +
+                                " MiB");
   const uint64_t fixed = fixedBytesOf(geometry, blocks, shape);
   const uint64_t largest = options.bufferBytes && options.bufferBytes < backend.capabilities().maxBufferLengthBytes
                                ? options.bufferBytes
@@ -1052,9 +1061,9 @@ ExpertStore::ExpertStore(metal::MetalBackend &backend, StreamedBlocks streamed, 
   // Every streamed size holds the same share of its experts, but at least a
   // block's (a prefill chunk may route them all) and at most all of them; a
   // size of one block all of its: the largest share the chunks hold at the
-  // cap, and as its floor the largest share the floor's bytes hold (or
-  // kExpertFloorShare of its slots). The minimum above holds a block's
-  // experts of each size.
+  // cap, and as its floor the largest share the floor's bytes hold (or the
+  // layout's own, of the slots the start's bytes hold). The minimum above
+  // holds a block's experts of each size.
   const auto slotsAt = [&](uint32_t size, double share) {
     const uint64_t all = uint64_t{impl.sizes[size].blocks} * shape.experts;
     if (!impl.sizes[size].streams) return all;
@@ -1079,11 +1088,12 @@ ExpertStore::ExpertStore(metal::MetalBackend &backend, StreamedBlocks streamed, 
   };
   const double capShare = shareOf(options.memoryBytes);
   const double floorShare = options.floorBytes ? shareOf(options.floorBytes) : 0.0;
+  const double startShare = options.startBytes ? shareOf(options.startBytes) : capShare;
   for (uint32_t index = 0; index < impl.sizes.size(); ++index) {
     Impl::Size &size = impl.sizes[index];
     size.slots = static_cast<uint32_t>(slotsAt(index, capShare));
-    const uint32_t floorSlots = static_cast<uint32_t>(options.floorBytes ? slotsAt(index, floorShare)
-                                                                         : kExpertFloorShare * double(size.slots));
+    const uint32_t startSlots = static_cast<uint32_t>(slotsAt(index, startShare));
+    const uint32_t floorSlots = options.floorBytes ? static_cast<uint32_t>(slotsAt(index, floorShare)) : 0;
     for (size_t z = 0; z < 3; ++z) {
       const ProjectionLayout &projection = size.layout[z];
       size.load.projections[z] = {projection.format,
@@ -1097,10 +1107,12 @@ ExpertStore::ExpertStore(metal::MetalBackend &backend, StreamedBlocks streamed, 
     }
     size.loadGroups = ops::MoE::expertLoadGroups(size.load);
     // Each chunk's regions over its own slots, in the expert kernels' order
-    // (ops::ExpertChunks): plane1's is meta's for a format without one.
+    // (ops::ExpertChunks): plane1's is meta's for a format without one. The
+    // floor's chunks take their memory now, the elastic chunks as the start
+    // takes them (below).
     const ExpertSlotPlanes slotPlanes{size.layout[0].planes, size.layout[1].planes, size.layout[2].planes};
     size.chunkLayout = size.streams ? streamedExpertChunkLayout(slotPlanes, size.slots, floorSlots, shape.experts,
-                                                                largest, options.elasticChunkBytes)
+                                                                largest, options.elasticChunkBytes, startSlots)
                                     : wholeExpertChunkLayout(slotPlanes, size.slots, largest);
     const ExpertChunkLayout &chunks = size.chunkLayout;
     std::vector<metal::MetalBuffer> planes;
@@ -1113,9 +1125,10 @@ ExpertStore::ExpertStore(metal::MetalBackend &backend, StreamedBlocks streamed, 
           regions[z][plane] = bytes;
           bytes += alignWeightOffset(held * size.layout[z].planes[plane]);
         }
-      const metal::MetalBuffer &buffer = size.buffers.emplace_back(backend.allocateBuffer(
-          bytes, metal::BufferStorage::Shared,
-          "experts/arena-" + std::to_string(index) + "-" + std::to_string(chunk)));
+      const std::string label = "experts/arena-" + std::to_string(index) + "-" + std::to_string(chunk);
+      const metal::MetalBuffer &buffer = size.buffers.emplace_back(
+          chunk < chunks.floorChunks ? backend.allocateBuffer(bytes, metal::BufferStorage::Shared, label)
+                                     : backend.reserveBuffer(bytes, metal::BufferStorage::Shared, label));
       for (size_t z = 0; z < 3; ++z) {
         const std::array<uint64_t, 3> &regionBytes = size.layout[z].planes;
         const metal::MetalBuffer meta = backend.view(buffer, regions[z][2], held * regionBytes[2]);
@@ -1128,7 +1141,8 @@ ExpertStore::ExpertStore(metal::MetalBackend &backend, StreamedBlocks streamed, 
     }
     size.chunks = ops::ExpertChunks::of(std::move(planes), chunks.floorSlots, chunks.chunkSlots, size.slots,
                                         size.routed[0], size.routed[1], size.routed[2]);
-    size.recycling = SlotRecycler(size.slots);
+    size.chunks.keep(chunks.floorChunks);
+    size.recycling = SlotRecycler(chunks.first(chunks.floorChunks));
     size.ownerBlock.assign(size.slots, kNoSlot);
     size.ownerExpert.assign(size.slots, kNoSlot);
   }
@@ -1156,6 +1170,7 @@ ExpertStore::ExpertStore(metal::MetalBackend &backend, StreamedBlocks streamed, 
   std::memset(impl.grid.contents(), 0, 4 * sizeof(uint32_t));
   impl.routedIn.assign(shape.experts, 0);
   impl.waiting.assign(shape.experts, 0);
+  impl.fixedBytes = fixed;
   impl.counters.capBytes += fixed;
   impl.counters.floorBytes += fixed;
   impl.counters.stagingBytes = impl.staging.sizeBytes();
@@ -1163,6 +1178,21 @@ ExpertStore::ExpertStore(metal::MetalBackend &backend, StreamedBlocks streamed, 
     impl.counters.capChunks += size.chunkLayout.chunks;
     impl.counters.experts += uint64_t{size.blocks} * shape.experts;
   }
+  // The elastic chunks the start's bytes hold come in growTowardCap's order;
+  // the first they do not hold stays released with those after it.
+  uint64_t live = impl.counters.floorBytes;
+  const uint64_t start = options.startBytes ? options.startBytes : std::numeric_limits<uint64_t>::max();
+  const metal::AllocationAdmission starts = [&](uint64_t bytes,
+                                                const std::function<void()> &allocate) -> metal::AllocationResult {
+    if (bytes > start - std::min(start, live)) return metal::AllocationFailure::EngineBudget;
+    allocate();
+    live += bytes;
+    return {};
+  };
+  for (uint32_t index = impl.growingSize(); index != kNoSlot; index = impl.growingSize())
+    if (!impl.grow(index, starts)) break;
+  // Every slot free, the lowest claimed first.
+  for (Impl::Size &size : impl.sizes) size.recycling.reset();
   impl.countLive();
   impl.fill();
   impl.publish();

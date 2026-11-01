@@ -78,6 +78,9 @@ public:
   // releaseLane() gives it back when the request ends or is suspended.
   [[nodiscard]] ModelMemoryAdmission reserveLane(uint32_t stateLane);
   void releaseLane(uint32_t stateLane) noexcept;
+  // Whether the lane holds its floor: reserveLane() granted it, and
+  // releaseLane() has not given it back.
+  [[nodiscard]] bool holdsLane(uint32_t stateLane) const;
   // Between commands, optionally: at most one extent more toward the target.
   [[nodiscard]] ModelMemoryAdmission growTowardTarget();
   // An idle reclaim: the cache's last extent above its floors, in bytes;

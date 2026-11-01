@@ -343,7 +343,7 @@ struct MetalAllocation {
 };
 
 // Every Impl has an allocation, whose buffer is nil only while its memory is
-// released: only allocateBuffer, wrapSharedMemory and view create one.
+// released: only reserveBuffer, wrapSharedMemory and view create one.
 struct MetalBuffer::Impl {
     std::shared_ptr<MetalAllocation> allocation;
     uint64_t offsetBytes = 0;
@@ -1854,6 +1854,15 @@ MetalBuffer MetalBackend::allocateBuffer(uint64_t bytes,
                                          BufferStorage storage,
                                          std::string_view label,
                                          BufferReach reach) {
+    MetalBuffer buffer = reserveBuffer(bytes, storage, label, reach);
+    restoreMemory(buffer);
+    return buffer;
+}
+
+MetalBuffer MetalBackend::reserveBuffer(uint64_t bytes,
+                                        BufferStorage storage,
+                                        std::string_view label,
+                                        BufferReach reach) {
     checkOperation();
     if (!bytes) throw MetalBackendError("Metal buffer size must be positive");
     if (bytes > impl_->capabilities.maxBufferLengthBytes) {
@@ -1868,8 +1877,6 @@ MetalBuffer MetalBackend::allocateBuffer(uint64_t bytes,
     allocation->reach = reach;
     if (!label.empty()) allocation->label = checkedNSString(label, "buffer label");
     allocation->residency = impl_->residency;
-    allocation->attach(impl_->newBuffer(bytes, storage, allocation->label));
-    impl_->sampleDeviceMemory();
     auto result = std::make_shared<MetalBuffer::Impl>();
     result->lengthBytes = bytes;
     result->allocation = std::move(allocation);

@@ -18,18 +18,10 @@ namespace {
 // stores take the rest of the budget, and a dense target too once its
 // experts stream: requests up to it never spill while they decode alone.
 constexpr uint64_t kResidentAllowanceTokens = 65'536;
-// The streamed PLE table's row cache before the experts take the rest. It
-// hits only rows read before, and a request reads few distinct rows: a
-// 128K-token prompt about 1.1M, a quarter of what 512 MiB holds. A larger
-// cache hits no more often and leaves streamed experts less.
-constexpr uint64_t kTableShareBytes = 512 * kMiB;
 // A Spill request's tail window: the pages before its open page that it
 // keeps Full. A decode selects about a tenth of its blocks in its last 64
 // pages.
 constexpr uint32_t kSpillWindowPages = 64;
-// A prefill's history stages in two buffers, so the next layer's reads
-// overlap this layer's attention, where the floors leave this much.
-constexpr uint64_t kDoubleStagingBytes = 4 * kGiB;
 
 uint64_t pagesOf(uint64_t tokens) noexcept { return (tokens + kv::kPageTokens - 1) / kv::kPageTokens; }
 
@@ -106,23 +98,18 @@ struct SpillFloors final {
 
 // A spill-capable target's spill plan beside floors of `floors` bytes; a
 // disabled one for a target that cannot spill, or whose floors cannot hold
-// even an empty Spill request, which then serves what stays resident. A
-// target whose rows read their last tokens through their page tables
-// (SparseKvShape::localTokens) cannot spill: the cache keeps a page Full for
-// rows that read it whole only within the dense history, and a restore or a
-// writer's move onto a spilled block may leave such a page in a holder's
-// window holding only its index.
+// even an empty Spill request, which then serves what stays resident.
 KvSpillPlan planSpill(const StreamedMemoryInputs &in, uint64_t floors) {
   KvSpillPlan spill;
   const kv::Layout &layout = in.kvLayout;
-  if (!in.sparseKv || in.sparseKv->localTokens || !layout.spillable() || !in.tierWritable) return spill;
+  if (!in.sparseKv || !layout.spillable() || !in.tierWritable) return spill;
   const model::SparseKvShape &shape = *in.sparseKv;
   const uint32_t extentPages = layout.maximumExtentPages();
   const SpillFloors spillFloors{
       .layout = layout,
       .geometry = {.fullPageBytes = layout.bytesPerModelPage(),
                    .indexPageBytes = layout.indexBytesPerModelPage(),
-                   .densePages = static_cast<uint32_t>(pagesOf(shape.denseTokens())),
+                   .densePages = static_cast<uint32_t>(pagesOf(shape.denseHistoryTokens)),
                    .windowPages = kSpillWindowPages,
                    .groupPages = in.groupPages},
       .extentPages = extentPages,
@@ -156,7 +143,8 @@ KvSpillPlan planSpill(const StreamedMemoryInputs &in, uint64_t floors) {
                                         : 0)));
   spill.floorTokens = std::min({in.requestedContextTokens ? in.requestedContextTokens : in.windowTokens,
                                 spill.memoryTokens, spill.diskTokens});
-  spill.stagingBuffers = room >= spillFloors.bytes(spill.floorTokens, 1) + kDoubleStagingBytes ? 2 : 1;
+  // One buffer until the stores are placed (planParts).
+  spill.stagingBuffers = 1;
   spill.densePages = spillFloors.geometry.densePages;
   spill.windowPages = spillFloors.geometry.windowPages;
   spill.groupPages = in.groupPages;
@@ -198,28 +186,35 @@ StreamedMemoryResult planParts(const StreamedMemoryInputs &in, const Part &exper
   StreamedMemoryPlan plan{.spill = planSpill(in, spillFloors)};
   KvSpillPlan &spill = plan.spill;
   if (spill.enabled) floors = spillFloors;
+  // What an engine without requests holds of the floors: all of them but a
+  // Spill request's.
+  const uint64_t idleBytes = floors;
   if (!checkedAdd(floors, spill.floorBytes, floors)) return overflow();
   if (floors > in.hardBudgetBytes)
     return {std::nullopt,
             "the floors of the memory plan require " + std::to_string(floors) +
                 " bytes but the Metal memory budget is " + std::to_string(in.hardBudgetBytes) + " bytes",
             floors};
-  // An explicit hot cache target takes its part above the floor first, of
-  // what the floors leave.
+  // An explicit hot cache target takes what it adds to the readers first,
+  // of what the floors leave: the floors hold the larger of the hot cache's
+  // floor and the history staging, and the readers the larger of its target
+  // and the staging.
   if (spill.enabled && in.hotCacheBytes) {
     const uint64_t target = *in.hotCacheBytes;
     if (target < spill.hotFloorBytes)
       return {std::nullopt, "--sparse-kv-memory of " + std::to_string(target / kMiB) +
                                 " MiB is less than the hot block cache's floor, " +
                                 std::to_string(spill.hotFloorBytes / kMiB) + " MiB"};
-    if (target - spill.hotFloorBytes > in.hardBudgetBytes - floors)
+    const uint64_t readers = spill.readerBytes(), added = remaining(target, readers);
+    if (added > in.hardBudgetBytes - floors)
       return {std::nullopt, "--sparse-kv-memory of " + std::to_string(target / kMiB) +
-                                " MiB is more than the hot block cache's floor, " +
-                                std::to_string(spill.hotFloorBytes / kMiB) + " MiB, and the " +
+                                " MiB is more than the readers' floor, the larger of the hot block cache's floor "
+                                "and the history staging, " +
+                                std::to_string(readers / kMiB) + " MiB, and the " +
                                 std::to_string((in.hardBudgetBytes - floors) / kMiB) + " MiB the floors leave"};
     spill.hotTargetBytes = target;
     spill.hotLimitBytes = std::max(spill.hotLimitBytes, target);
-    floors += target - spill.hotFloorBytes;
+    floors += added;
   }
 
   // Then the priorities, out of what the floors leave: the experts first,
@@ -244,7 +239,7 @@ StreamedMemoryResult planParts(const StreamedMemoryInputs &in, const Part &exper
         remaining(kvPagesBytes(layout, budget, floorPages, layout.extentPagesFor(budget)), runwayBytes));
   };
   const int64_t tableShare =
-      table.automatic ? static_cast<int64_t>(remaining(std::min(table.all, kTableShareBytes), table.charged)) : 0;
+      table.automatic ? static_cast<int64_t>(remaining(std::min(table.all, in.tableShareBytes), table.charged)) : 0;
   bool expertsStream = experts.streams;
   plan.expertBytes = experts.streams ? experts.charged : 0;
   if (experts.automatic) {
@@ -267,6 +262,52 @@ StreamedMemoryResult planParts(const StreamedMemoryInputs &in, const Part &exper
     const int64_t kept = rest - allowance(expertsStream);
     if (kept < static_cast<int64_t>(table.all - table.charged))
       plan.tableBytes = table.charged + static_cast<uint64_t>(std::clamp<int64_t>(kept, 0, tableShare));
+  }
+  // A second buffer of staged history lets the next layer's reads overlap
+  // this layer's attention. It is planned where the readers' memory holds it
+  // already (readerBytes), or where what the stores and the KV allowance
+  // leave holds it: that is nothing where a store binds, which keeps the
+  // room, and otherwise KV kept resident beyond the allowance.
+  if (spill.enabled) {
+    const uint64_t one = spill.stagingBytes;
+    const uint64_t added = std::max(spill.hotTargetBytes, 2 * one) - spill.readerBytes();
+    const uint64_t tableAbove =
+        table.automatic ? (plan.tableBytes ? plan.tableBytes : table.all) - table.charged : 0;
+    const int64_t left = rest - allowance(expertsStream) - static_cast<int64_t>(tableAbove);
+    if (!added || left >= static_cast<int64_t>(added)) {
+      spill.stagingBuffers = 2;
+      spill.stagingBytes = 2 * one;
+      spill.floorBytes += std::max(2 * one, spill.hotFloorBytes) - std::max(one, spill.hotFloorBytes);
+    }
+  }
+
+  // Last, the host's budget beyond what an engine without requests holds of
+  // the floors once warm, the reserve the budget holds already aside: an
+  // automatic part that loads whole takes what it adds to its floors'
+  // charge, then the table's store and the experts' take, each above its
+  // charge, at most what is left. The table's row cache, which does not
+  // grow, takes that much, and what the budget holds back of it stays
+  // planned (hostHeldBackBytes); the experts' store, one --expert-memory
+  // sets the floor of too, starts with it and takes the rest of its cap back
+  // once memory allows. So the floors, what loads whole and the context
+  // never rest on the host.
+  uint64_t hostRoom = remaining(in.hostBudgetBytes, remaining(idleBytes, in.reserveBytes));
+  if (experts.automatic && !expertsStream) hostRoom = remaining(hostRoom, experts.all - experts.charged);
+  if (table.automatic && !plan.tableBytes) hostRoom = remaining(hostRoom, table.all - table.charged);
+  // What the host leaves the store above its smallest.
+  const auto hostKeeps = [&](const Part &part, uint64_t storeBytes) {
+    const uint64_t kept = std::min(storeBytes - part.charged, hostRoom);
+    hostRoom -= kept;
+    return part.charged + kept;
+  };
+  if (table.automatic && plan.tableBytes) {
+    const uint64_t kept = hostKeeps(table, plan.tableBytes);
+    plan.hostHeldBackBytes = plan.tableBytes - kept;
+    plan.tableBytes = kept;
+  }
+  if (experts.automatic && expertsStream) {
+    const uint64_t start = hostKeeps(experts, plan.expertBytes);
+    plan.expertStartBytes = start < plan.expertBytes ? start : 0;
   }
   return {plan, {}};
 }
@@ -480,7 +521,8 @@ uint64_t ModelMemoryProfile::fixedRuntimeBytes() const {
            footprint.runtime.sharedPrefillPlannedAllocatedBytes,
            footprint.runtime.sharedDecodePlannedAllocatedBytes,
            model::kPipelineReserveBytes, model::kRuntimeOverheadReserveBytes,
-           footprint.streamedTableBytes, footprint.aneFfnBytes, footprint.stateStagingBytes}) {
+           footprint.streamedTableBytes, footprint.aneFfnBytes, footprint.stateStagingBytes,
+           footprint.hostHeldBackBytes}) {
     if (!checkedAdd(result, value, result)) {
       throw std::overflow_error("fixed runtime cost overflow");
     }
@@ -508,6 +550,7 @@ std::string EngineMemoryBreakdown::toStatusJson() const {
       << ',' << "\"streamed_table_bytes\":" << streamedTableBytes << ','
       << "\"ane_ffn_bytes\":" << aneFfnBytes << ','
       << "\"state_staging_bytes\":" << stateStagingBytes << ','
+      << "\"host_held_back_bytes\":" << hostHeldBackBytes << ','
       << "\"fixed_runtime_bytes\":" << fixedRuntimeBytes << ','
       << "\"dynamic_budget_bytes\":" << dynamicBudgetBytes << ','
       << "\"kv_page_tokens\":" << kvPageTokens << ','
@@ -558,6 +601,7 @@ std::string EngineMemoryBreakdown::describe() const {
       << "streamed table cache: " << bytesAndMiB(streamedTableBytes) << '\n'
       << "Neural Engine split: " << bytesAndMiB(aneFfnBytes) << '\n'
       << "SSD cache state staging: " << bytesAndMiB(stateStagingBytes) << '\n'
+      << "streamed stores held back for the host: " << bytesAndMiB(hostHeldBackBytes) << '\n'
       << "fixed runtime: " << bytesAndMiB(fixedRuntimeBytes) << '\n'
       << "elastic state/KV budget: " << bytesAndMiB(dynamicBudgetBytes) << '\n'
       << "KV page: " << kvPageTokens << " tokens, "
@@ -648,6 +692,7 @@ evaluateEngineMemoryPlan(const DeviceCapabilities &device,
   breakdown.stateStagingBytes = model.footprint.stateStagingBytes;
   breakdown.aneFfnBytes = model.footprint.aneFfnBytes;
   breakdown.streamedTableBytes = model.footprint.streamedTableBytes;
+  breakdown.hostHeldBackBytes = model.footprint.hostHeldBackBytes;
   breakdown.kvPageTokens = kv::kPageTokens;
 
   if (auto error = device.validationError()) {
@@ -736,9 +781,8 @@ evaluateEngineMemoryPlan(const DeviceCapabilities &device,
       .spilled = spill.memoryTokens,
       .disk = spill.diskTokens};
   if (spill.enabled)
-    breakdown.residentKvBytes =
-        remaining(breakdown.dynamicBudgetBytes, breakdown.laneStateBytes + spill.indexRunwayBytes +
-                                                    std::max(spill.stagingBytes, spill.hotTargetBytes));
+    breakdown.residentKvBytes = remaining(breakdown.dynamicBudgetBytes,
+                                          breakdown.laneStateBytes + spill.indexRunwayBytes + spill.readerBytes());
   if (!breakdown.kvExtentPages ||
       breakdown.dynamicBudgetBytes < breakdown.minimumDynamicBytes) {
     if (breakdown.minimumRequiredBytes > breakdown.hardBudgetBytes) {

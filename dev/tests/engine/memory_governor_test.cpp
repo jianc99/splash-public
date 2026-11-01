@@ -844,9 +844,12 @@ void testOnlyAShortHostTakesTheExpertStore() {
 // growth are the host's already (MemoryGovernor::setGrowthCredit): growth
 // the engine can do without counts only the bytes beyond them against the
 // host's headroom, which must keep the recovery margin beside them, and
-// with none beyond them no margin holds it back. The engine's limit counts
-// every byte, and macOS's warning and a host it cannot measure still refuse
-// it. Memory a request needs takes no credit.
+// with none beyond them it leaves the host's footprint where it was, which
+// neither a margin nor macOS's warning holds back. The engine's limit
+// counts every byte, macOS's warning still refuses growth with bytes beyond
+// the credit, however much headroom the host has, and critical pressure and
+// a host the governor cannot measure refuse it all. Memory a request needs
+// takes no credit.
 void testGrowthCreditCountsOnlyTheRest() {
   test::metalStatistics() = {};
   metal::MetalBackend backend("unused");
@@ -875,13 +878,54 @@ void testGrowthCreditCountsOnlyTheRest() {
   require(!grows(), "the credit lifted the engine's limit");
   test::metalStatistics().allocatedBytes = 0;
   governor.setPressure(MemoryPressure::Warning);
-  require(!grows(), "the credit lifted macOS's warning");
+  require(grows(), "macOS's warning refused growth the credit covers");
+  static_cast<void>(governor.setGrowthCredit(chunk / 2));
+  available = hostReserve + (16 * kGiB);
+  require(!grows(), "macOS's warning admitted growth beyond the credit");
+  static_cast<void>(governor.setGrowthCredit(chunk));
+  available = between;
+  governor.setPressure(MemoryPressure::Critical);
+  require(!grows(), "the credit lifted critical pressure");
   governor.setPressure(MemoryPressure::Normal);
   available = std::nullopt;
   require(!grows(), "the credit admitted growth on a host that could not be measured");
   available = between;
   require(grows() && governor.setGrowthCredit(0) == chunk && !grows(),
           "the credit outlived its clearing");
+}
+
+// The host's budget (hostBudgetBytes) is what the engine may hold without a
+// pass the governor runs while no request waits taking any of it back: an
+// engine of 4 GiB on a host of 12 GiB spare, 2 GiB of it the spare reserve,
+// may hold 13 GiB. Grown to that, the host keeps the warning margin and no
+// pass runs; a page more and a pass the host is short for runs.
+void testHostBudgetIsWhatThePassesKeep() {
+  test::metalStatistics() = {};
+  test::metalStatistics().allocatedBytes = 4 * kGiB;
+  test::metalStatistics().deviceCurrentAllocatedBytes = 4 * kGiB;
+  metal::MetalBackend backend("unused");
+  const uint64_t hostReserve = 2 * kGiB, spareReserve = 2 * kGiB, page = 16 * 1024;
+  require(hostBudgetBytes({12 * kGiB, 12 * kGiB}, spareReserve, 4 * kGiB) == 13 * kGiB &&
+              hostBudgetBytes({3 * kGiB, 3 * kGiB}, spareReserve, 4 * kGiB) == 4 * kGiB &&
+              hostBudgetBytes({kGiB, kGiB}, spareReserve, 4 * kGiB) == 4 * kGiB &&
+              hostBudgetBytes({12 * kGiB, 12 * kGiB}, spareReserve, std::numeric_limits<uint64_t>::max()) ==
+                  std::numeric_limits<uint64_t>::max(),
+          "the host's budget is not what the engine holds and the spare memory past the reserve and margin");
+  std::optional<uint64_t> spare = 12 * kGiB;
+  MemoryGovernor governor(backend, 40 * kGiB, hostReserve, spareReserve, [&spare] { return hostMemory(spare); },
+                          0);
+  allocate(9 * kGiB);
+  *spare -= 9 * kGiB;
+  MemoryPressurePolicy policy;
+  const MemoryGovernorSnapshot kept = governor.evaluate();
+  require(kept.chargedBytes == 13 * kGiB && kept.pressure == MemoryPressure::Normal && kept.hostGrowthAllowed &&
+              !policy.update(kept, 0.0, false),
+          "an engine at the host's budget did not keep the warning margin");
+  *spare -= page;
+  const MemoryGovernorSnapshot past = governor.evaluate();
+  const auto pass = policy.update(past, 1000.0, false);
+  require(pass && pass->hostShort && pass->targetBytes == page,
+          "an engine past the host's budget did not have a pass take it back");
 }
 
 } // namespace
@@ -907,6 +951,7 @@ int main() {
     testSystemWarningGivesCacheBack();
     testOnlyAShortHostTakesTheExpertStore();
     testGrowthCreditCountsOnlyTheRest();
+    testHostBudgetIsWhatThePassesKeep();
     std::cout << "memory governor tests passed\n";
     return EXIT_SUCCESS;
   } catch (const std::exception &error) {
