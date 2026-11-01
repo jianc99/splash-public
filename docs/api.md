@@ -429,8 +429,9 @@ next `<arg_key>` or `</tool_call>` follows. A value may hold the tags in any
 other order, as a file an agent writes may. Tags written otherwise are text.
 Besides:
 
-- names lose the space around them, and a call that names no function is
-  dropped, as is a `</think>` in text;
+- names lose the space around them; an opening that names no function, or a
+  name too long to be one, opens no call and reads as the text the model
+  wrote, and a call after it still reads; a `</think>` in text is dropped;
 - a repeated parameter keeps its first value, which has streamed;
 - text after a call stays content, with or without its `</tool_call>`;
 - a call the token limit or a stop sequence cuts keeps the unfinished

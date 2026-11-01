@@ -216,7 +216,7 @@ class StreamingToolCallProjector:
         self.pending = ""
         self.state = "output" if structured else "content"
         self.call_index = 0
-        # The open call, None while the text names none or names no function.
+        # The open call, None while the text names none.
         self.call_id = None
         self.function_name = None
         # The types by which its declared parameters and any others convert.
@@ -261,8 +261,6 @@ class StreamingToolCallProjector:
         return "".join(self.content_fragments[: self.streamed_count])
 
     def _emit_argument(self, fragment, events):
-        if self.call_id is None:
-            return
         self.argument_fragments.append(fragment)
         for chunk in argument_deltas(fragment):
             events.append(
@@ -314,9 +312,8 @@ class StreamingToolCallProjector:
     def _begin_parameter(self, name, events):
         name = name.strip(NAME_SPACE)
         # A repeated parameter keeps its first value, which may have streamed;
-        # a parameter without a name, or of a call that names no function,
-        # keeps none.
-        kept = name and name not in self.parameter_names and self.call_id is not None
+        # a parameter without a name keeps none.
+        kept = name and name not in self.parameter_names
         self.parameter_names.add(name)
         self.parameter_name = name if kept else None
         self.value_types = self.parameter_types.get(name, self.other_types)
@@ -364,18 +361,17 @@ class StreamingToolCallProjector:
 
     def _finish_call(self, events):
         self._emit_argument("}", events)
-        if self.call_id is not None:
-            self.closed_calls.append(
-                {
-                    "id": self.call_id,
-                    "type": "function",
-                    "function": {
-                        "name": self.function_name,
-                        "arguments": "".join(self.argument_fragments),
-                    },
-                }
-            )
-            self.call_index += 1
+        self.closed_calls.append(
+            {
+                "id": self.call_id,
+                "type": "function",
+                "function": {
+                    "name": self.function_name,
+                    "arguments": "".join(self.argument_fragments),
+                },
+            }
+        )
+        self.call_index += 1
         self.call_id = None
         self.function_name = None
         self.argument_fragments = []
