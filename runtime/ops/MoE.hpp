@@ -29,7 +29,9 @@ enum class MoeRouter : uint8_t { Softmax, SigmoidNormalized };
 // a router with a shared expert of sharedSlices slices behind the block's
 // scalar gate or none (MoeShape), and their kernels' name suffixes: the
 // selection's, which reads all three, and slicesSuffix of the grouping and
-// the expert passes, which read the slices alone.
+// the expert passes, which read the slices alone. The selection and grouping
+// of the softmax routing are compiled for both router widths
+// (MoeShape::routerWidth), Flint's for SPLASH_MOE_EXPERT_SLOTS experts alone.
 struct CompiledMoeRouting final {
   MoeRouter router;
   uint32_t sharedSlices;
@@ -69,8 +71,9 @@ struct MoeShape final {
   uint32_t routerFormat = QuantizedSegment::kFloat32;
 
   [[nodiscard]] constexpr bool valid() const noexcept {
-    // Experts the routing kernels' slots hold, of an intermediate width
-    // that fills 64-column tiles, routed as a kernel compiles.
+    // Experts up to the wide slots, of an intermediate width that fills
+    // 64-column tiles, and a compiled router, shared slices and gate
+    // (kCompiledMoeRoutings states the widths each is compiled for).
     return hiddenSize && hiddenSize % 256 == 0 && experts && experts <= SPLASH_MOE_WIDE_EXPERT_SLOTS &&
            expertsPerToken && expertsPerToken <= experts &&
            expertIntermediateSize && expertIntermediateSize % 64 == 0 && compiledRouting();

@@ -90,8 +90,8 @@ const CompiledMoeRouting &compiledRouting(MoeShape shape) {
 }
 
 // A routing kernel's instance for the shape's router width (past
-// SPLASH_MOE_EXPERT_SLOTS experts, its wide one) and its compiled routing's
-// `suffix`.
+// SPLASH_MOE_EXPERT_SLOTS experts, the softmax routing's wide one) and its
+// compiled routing's `suffix`.
 std::string routingKernel(std::string name, MoeShape shape, std::string_view CompiledMoeRouting::*suffix) {
   static_assert(SPLASH_MOE_WIDE_EXPERT_SLOTS == 512, "the wide routing kernels are the _e512 instances");
   if (shape.routerWidth() == SPLASH_MOE_WIDE_EXPERT_SLOTS) name += "_e512";
