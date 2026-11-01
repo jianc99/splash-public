@@ -66,7 +66,7 @@ struct Shape {
 
 private:
   splash::ops::PrefillAttentionPlan prefillPlan() const {
-    return splash::ops::PagedAttention::prefillPlan(kRows, queryHeads(), layout());
+    return splash::ops::PagedAttention::prefillPlan(kRows, 0, queryHeads(), layout());
   }
   splash::ops::VerifyAttentionPlan verifyPlan() const {
     const std::array<uint32_t, 1> history{0};

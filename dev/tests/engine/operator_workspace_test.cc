@@ -24,19 +24,22 @@ void attention() {
     uint32_t maximumSlots = 0;
     for (uint32_t rows = 1; rows <= 2048; ++rows) {
       // Split counts decrease as the M8 tile count grows, so a shorter
-      // request can need more scratch than the exact requested row count.
+      // request can need more scratch than the exact requested row count;
+      // the longest history takes the most, its 256 tile splits shared out.
       const uint32_t tiles = (rows + 7) / 8;
-      const uint32_t splits = std::clamp(32U / tiles, 1U, 32U);
+      const uint32_t splits = std::clamp(256U / tiles, 1U, 32U);
       maximumSlots = std::max(maximumSlots, tiles * splits);
       const auto workspace = ops::PagedAttention::prefillWorkspace(rows, queryHeads, layout);
       require(workspace.partialsBytes == uint64_t{maximumSlots} * 8 * queryHeads * 256 * 4,
               "prefill partial workspace differs from the maximum over actual row counts");
       require(workspace.statisticsBytes == uint64_t{maximumSlots} * 8 * queryHeads * 2 * 4,
               "prefill statistics workspace differs from the maximum over actual row counts");
-      const auto plan = ops::PagedAttention::prefillPlan(rows, queryHeads, layout);
-      require(workspace.partialsBytes >= plan.workspace.partialsBytes &&
-                  workspace.statisticsBytes >= plan.workspace.statisticsBytes,
-              "prefill workspace omitted the plan of its own rows");
+      for (const uint32_t history : {0U, 65536U, 1'000'000U}) {
+        const auto plan = ops::PagedAttention::prefillPlan(rows, history, queryHeads, layout);
+        require(workspace.partialsBytes >= plan.workspace.partialsBytes &&
+                    workspace.statisticsBytes >= plan.workspace.statisticsBytes,
+                "prefill workspace omitted the plan of its own rows");
+      }
     }
     const auto maximum = ops::PagedAttention::prefillWorkspace(2048, queryHeads, layout);
     require(maximum.partialsBytes == (queryHeads == 24 ? 48U : 32U) * uint64_t{1024 * 1024},

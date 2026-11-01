@@ -166,6 +166,13 @@ void QwenTarget::requirePrefill(std::span<const QwenTargetPrefillChunk> chunks, 
     throw std::invalid_argument("invalid Qwen prefill");
 }
 
+ops::PrefillAttentionPlan prefillAttentionPlan(const ops::ExecutionPlans &plans, const QwenTargetGeometry &geometry,
+                                               const QwenTargetPrefillSequence &sequence,
+                                               ops::AttentionVariant variant) {
+  return plans.prefillAttention(sequence.rows, sequence.chunk.committed_tokens, geometry.attentionQueryHeads,
+                                geometry.kvLayout, variant);
+}
+
 QwenTarget::PrefillStep QwenTarget::prefillStep(metal::CommandGraph &graph, const QwenTargetPrefillChunk &chunk,
                                                 const kv::PageStorage &kv, SpilledKvReads &spilled,
                                                 ops::AneFfn *aneFfn) const {
@@ -176,11 +183,9 @@ QwenTarget::PrefillStep QwenTarget::prefillStep(metal::CommandGraph &graph, cons
   const uint32_t window = geometry_.kvLayout.windowTokens;
   for (const QwenTargetPrefillSequence &sequence : chunk.sequences) {
     requirePrefillStates(geometry_, sequence);
-    step.attention.push_back(
-        operators_.prefillAttention(sequence.rows, geometry_.attentionQueryHeads, geometry_.kvLayout));
+    step.attention.push_back(prefillAttentionPlan(operators_, geometry_, sequence));
     if (window)
-      step.windowedAttention.push_back(operators_.prefillAttention(
-          sequence.rows, geometry_.attentionQueryHeads, geometry_.kvLayout, {.windowTokens = window}));
+      step.windowedAttention.push_back(prefillAttentionPlan(operators_, geometry_, sequence, {.windowTokens = window}));
   }
   if (geometry_.ffnKind == QwenFfnKind::SparseMoe) step.moe = operators_.moePrefill(geometry_.moeShape(), chunk.rows);
   if (aneFfn && aneFfn->splits(chunk.rows)) step.aneFfn = aneFfn;

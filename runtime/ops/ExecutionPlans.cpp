@@ -28,8 +28,9 @@ ExecutionPlans::ExecutionPlans(const DeviceCapabilities &device)
       gpuCores_(plannedGpuCores(device)) {}
 
 PrefillAttentionPlan ExecutionPlans::prefillAttention(
-    uint32_t rows, uint32_t queryHeads, kv::Layout layout, AttentionVariant variant) const {
-  return PagedAttention::prefillPlan(rows, queryHeads, layout, variant);
+    uint32_t rows, uint32_t historyTokens, uint32_t queryHeads, kv::Layout layout,
+    AttentionVariant variant) const {
+  return PagedAttention::prefillPlan(rows, historyTokens, queryHeads, layout, variant);
 }
 
 VerifyAttentionPlan ExecutionPlans::verifyAttention(

@@ -87,8 +87,9 @@ void baselinePlans() {
     for (const auto &[queryHeads, kvLayout] : attentionShapes) {
       const auto memory = plans.prefillAttentionWorkspace(2048, queryHeads, kvLayout);
       for (uint32_t rows = 1; rows <= 2048; ++rows)
-        covers(memory, plans.prefillAttention(rows, queryHeads, kvLayout).workspace, 1,
-               attentionFields);
+        for (const uint32_t history : {0U, 32768U, 1'000'000U})
+          covers(memory, plans.prefillAttention(rows, history, queryHeads, kvLayout).workspace, 1,
+                 attentionFields);
       const auto stride = plans.verifyAttentionWorkspacePerLane(queryHeads, kvLayout);
       for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
         const std::array<uint32_t, 4> histories{0, 31, 2048, 8192};
@@ -286,7 +287,7 @@ void invalidLookupsAndContextEdges() {
           "invalid verify attention history vector", "a verify plan without a history per lane was accepted");
   rejects([&] { (void)plans.verifyAttention(1, 24, {}, std::span(histories).first(1)); },
           "no KV store kernel for layout", "a verify plan of an empty KV layout was accepted");
-  rejects([&] { (void)plans.prefillAttention(1, 24, {}); }, "no KV store kernel for layout",
+  rejects([&] { (void)plans.prefillAttention(1, 0, 24, {}); }, "no KV store kernel for layout",
           "a prefill plan of an empty KV layout was accepted");
   for (const uint32_t rows : {0U, UINT32_MAX})
     rejects([&] { (void)plans.prefillAttentionWorkspace(rows, 24, kvLayout); },

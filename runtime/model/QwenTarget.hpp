@@ -298,6 +298,14 @@ struct QwenTargetPrefillBuffers final {
   }
 };
 
+// The attention plan of a prefill sequence's rows after the history its
+// chunk committed (sequence.chunk.committed_tokens): of a geometry's whole
+// layers by default, of its sliding layers with their window.
+[[nodiscard]] ops::PrefillAttentionPlan prefillAttentionPlan(const ops::ExecutionPlans &plans,
+                                                            const QwenTargetGeometry &geometry,
+                                                            const QwenTargetPrefillSequence &sequence,
+                                                            ops::AttentionVariant variant = {});
+
 // A chunk of a prefill command: `rows` rows of its lanes' sequences, packed
 // in sequence order, in its own buffers.
 struct QwenTargetPrefillChunk final {

@@ -230,24 +230,43 @@ std::array<metal::MetalBuffer, 2> blockBindings(const AttentionBlocks &blocks, c
 // dimension.
 metal::DispatchSize reduceThreads(kv::Layout layout) { return {layout.headDimension, 1, 1}; }
 
-// Each query tile's history splits: the maximum shared out over the chunk's
-// tiles, at least one, and with a window of windowTokens keys before each
-// row no more than the pages it reads (a split each).
-uint32_t prefillSplits(uint32_t tiles, uint32_t windowTokens) {
+// Each query tile's history splits: one per kPrefillPagesPerSplit pages a
+// tile's rows read, those of the visibleTokens the chunk's rows see or, with
+// a window of windowTokens keys before each row, no more than its window's;
+// but no fewer than the maximum shared out over the chunk's tiles (all a
+// short history or a window takes), and no more than the maximum nor, over
+// all the tiles, than the longest chunk's tiles, whose partials the prefill
+// workspace holds; with a window no more than the pages it reads (a split
+// each). A chunk of a few hundred rows over a long history otherwise leaves
+// much of the GPU idle: on an M5 Max the attention of a 256-row chunk after
+// 32K-128K tokens ran 23-26% faster at these splits (Qwen3.6-35B-A3B's and
+// Qwen3.8-27B's), of a 512-row chunk 23% and 10%, within 7% of the fastest
+// split count.
+constexpr uint32_t kPrefillPagesPerSplit = 32;
+uint32_t prefillSplits(uint32_t tiles, uint64_t visibleTokens, uint32_t windowTokens) {
   constexpr uint32_t maximum = SPLASH_PREFILL_ATTENTION_MAXIMUM_SPLITS;
-  const uint32_t splits = std::clamp(maximum / tiles, 1U, maximum);
+  constexpr uint32_t ceiling = kv::prefillAttentionTiles(kv::kChunkedPrefillMaximumRows);
+  const uint64_t seen = (visibleTokens + kv::kPageTokens - 1) / kv::kPageTokens;
+  const uint64_t pages = windowTokens ? std::min<uint64_t>(seen, kv::windowAttentionPages(windowTokens)) : seen;
+  const uint32_t shared = std::clamp(maximum / tiles, 1U, maximum);
+  const uint32_t splits = static_cast<uint32_t>(
+      std::clamp<uint64_t>(pages / kPrefillPagesPerSplit, shared, std::clamp(ceiling / tiles, shared, maximum)));
   return windowTokens ? std::min(splits, kv::windowAttentionPages(windowTokens)) : splits;
 }
 
 } // namespace
 
 PrefillAttentionPlan PagedAttention::prefillPlan(
-    uint32_t rows, uint32_t queryHeads, kv::Layout layout, AttentionVariant variant) {
+    uint32_t rows, uint32_t historyTokens, uint32_t queryHeads, kv::Layout layout, AttentionVariant variant) {
   const CompiledAttention &kernel = compiledAttention(queryHeads, layout, variant);
   if (!rows || rows > kv::kChunkedPrefillMaximumRows)
     throw std::invalid_argument("invalid attention workspace rows");
   const uint32_t tiles = kv::prefillAttentionTiles(rows);
-  const uint32_t splits = prefillSplits(tiles, variant.windowTokens);
+  // A sparse tile reads its list's blocks, a few thousand tokens whatever
+  // its history, and keeps the shared splits: by its history it ran up to
+  // 47% slower (Qwen3.8-Flash-Next's 64-row chunk after 64K tokens).
+  const uint32_t splits =
+      prefillSplits(tiles, layout.valuesTokenMajor ? 0 : uint64_t{historyTokens} + rows, variant.windowTokens);
   const uint32_t fusedRows =
       kv::kPrefillAttentionTileRows * (queryHeads / layout.kvHeads);
   return {rows, splits,
@@ -305,13 +324,13 @@ AttentionWorkspace PagedAttention::prefillWorkspace(
   (void)compiledAttention(queryHeads, layout);
   if (!maximumRows || maximumRows > kv::kChunkedPrefillMaximumRows)
     throw std::invalid_argument("invalid attention workspace rows");
-  // Allocation-time bound for every shorter sequence and every variant, a
-  // window taking no more splits than the whole history. Encoding resolves
-  // its own exact plan in constant time; no bound scan occurs on the hot
-  // path.
+  // Allocation-time bound for every shorter sequence, every history (the
+  // longest takes the most splits) and every variant, a window taking no
+  // more splits than the whole history. Encoding resolves its own exact plan
+  // in constant time; no bound scan occurs on the hot path.
   uint64_t slots = 0;
   for (uint32_t tiles = 1; tiles <= kv::prefillAttentionTiles(maximumRows); ++tiles)
-    slots = std::max(slots, uint64_t{tiles} * prefillSplits(tiles, 0));
+    slots = std::max(slots, uint64_t{tiles} * prefillSplits(tiles, kv::kMaximumPhysicalTokens, 0));
   return attentionWorkspace(slots * kv::kPrefillAttentionTileRows * queryHeads,
                              layout.headDimension);
 }

@@ -58,6 +58,17 @@ uint32_t tileParts(uint32_t queryHeads, kv::Layout layout) {
   return layout.valuesTokenMajor ? 1 : SPLASH_ATTENTION_TILE_PARTS(queryHeads / layout.kvHeads);
 }
 
+// A prefill tile's history splits (PagedAttention.cpp prefillSplits): one
+// per 32 pages the chunk's rows see, no fewer than 32 shared out over its
+// tiles, and no more than 32 nor 256 (the longest chunk's tiles) over them;
+// a sparse tile's, which reads its list, the 32 shared out alone.
+uint32_t prefillSplits(uint32_t rows, uint32_t history, bool sparse) {
+  const uint32_t tiles = (rows + 7) / 8;
+  const uint64_t pages = sparse ? 0 : (uint64_t{history} + rows + 31) / 32;
+  const uint32_t shared = std::clamp(32U / tiles, 1U, 32U);
+  return static_cast<uint32_t>(std::clamp<uint64_t>(pages / 32, shared, std::clamp(256U / tiles, shared, 32U)));
+}
+
 // A layout's split or reduce pipeline of a phase ("prefill" or "verify").
 std::string pipelineName(std::string_view phase, bool split, uint32_t queryHeads, kv::Layout layout) {
   const bool sparse = layout.valuesTokenMajor;
@@ -84,8 +95,9 @@ void checkPrefillSlotOrientation(uint32_t queryHeads, kv::Layout layout) {
   // Enumerate nonsquare grids and partial final tiles. Each logical partial
   // belongs to exactly one query tile, KV head part and balanced history
   // split.
-  for (const uint32_t rows : {17U, 257U, 2048U}) {
-    const auto plan = ops::PagedAttention::prefillPlan(rows, queryHeads, layout);
+  for (const auto [rows, history] : {std::pair{17U, 0U}, std::pair{257U, 0U}, std::pair{257U, 65536U},
+                                     std::pair{2048U, 131072U}}) {
+    const auto plan = ops::PagedAttention::prefillPlan(rows, history, queryHeads, layout);
     const uint32_t tiles = (rows + 7) / 8;
     require(plan.splitGroups.x == headParts &&
                 plan.splitGroups.y == tiles && plan.splitGroups.z == plan.splits,
@@ -122,28 +134,40 @@ void checkPlans(uint32_t queryHeads, kv::Layout layout) {
   const std::string prefillSplit = pipelineName("prefill", true, queryHeads, layout);
   const std::string prefillReduce = pipelineName("prefill", false, queryHeads, layout);
   checkPrefillSlotOrientation(queryHeads, layout);
-  for (uint32_t rows = 1; rows <= 2048; ++rows) {
-    const auto plan = ops::PagedAttention::prefillPlan(rows, queryHeads, layout);
-    const uint32_t tiles = (rows + 7) / 8;
-    const uint32_t splits = std::clamp(32U / tiles, 1U, 32U);
-    require(plan.rows == rows && plan.splits == splits, "prefill plan lost actual rows");
-    require(plan.splitPipeline == prefillSplit && plan.reducePipeline == prefillReduce,
-            "prefill plan runs the wrong pipelines");
-    require(plan.splitGroups.x == layout.kvHeads * tileParts(queryHeads, layout) &&
-                plan.splitGroups.y == tiles && plan.splitGroups.z == splits &&
-                plan.reduceGroups.x == layout.kvHeads &&
-                plan.reduceGroups.y == 8 * queryHeads / layout.kvHeads &&
-                plan.reduceGroups.z == tiles,
-            "prefill split/reduce geometry disagrees");
-    const uint64_t fused = uint64_t{tiles} * splits * 8 * queryHeads;
-    require(plan.workspace.partialsBytes == fused * 256 * 4 &&
-                plan.workspace.statisticsBytes == fused * 2 * 4,
-            "prefill split dispatch and exact scratch disagree");
-    const auto bound = ops::PagedAttention::prefillWorkspace(rows, queryHeads, layout);
-    require(bound.partialsBytes >= plan.workspace.partialsBytes &&
-                bound.statisticsBytes >= plan.workspace.statisticsBytes,
-            "prefill arena omitted a valid shorter plan");
-  }
+  // A short history's chunk shares out 32 splits over its tiles; over a
+  // longer one a tile takes a split per 32 pages, up to the longest chunk's
+  // tiles in all.
+  for (const auto [rows, history, splits] :
+       {std::array{1U, 0U, 32U}, std::array{64U, 0U, 4U}, std::array{256U, 1500U, 1U}, std::array{64U, 4096U, 4U},
+        std::array{256U, 4096U, 4U}, std::array{64U, 8192U, 8U}, std::array{256U, 16384U, 8U},
+        std::array{64U, 65536U, 32U}, std::array{256U, 131072U, 8U}, std::array{512U, 65536U, 4U},
+        std::array{300U, 65536U, 6U}, std::array{2048U, 131072U, 1U}})
+    require(ops::PagedAttention::prefillPlan(rows, history, queryHeads, layout).splits ==
+                (layout.valuesTokenMajor ? std::clamp(32U / ((rows + 7) / 8), 1U, 32U) : splits),
+            "prefill split count does not follow its rows and history");
+  for (uint32_t rows = 1; rows <= 2048; ++rows)
+    for (const uint32_t history : {0U, 4000U, 8192U, 32768U, 131072U, 1'000'000U}) {
+      const auto plan = ops::PagedAttention::prefillPlan(rows, history, queryHeads, layout);
+      const uint32_t tiles = (rows + 7) / 8;
+      const uint32_t splits = prefillSplits(rows, history, layout.valuesTokenMajor);
+      require(plan.rows == rows && plan.splits == splits, "prefill plan lost actual rows");
+      require(plan.splitPipeline == prefillSplit && plan.reducePipeline == prefillReduce,
+              "prefill plan runs the wrong pipelines");
+      require(plan.splitGroups.x == layout.kvHeads * tileParts(queryHeads, layout) &&
+                  plan.splitGroups.y == tiles && plan.splitGroups.z == splits &&
+                  plan.reduceGroups.x == layout.kvHeads &&
+                  plan.reduceGroups.y == 8 * queryHeads / layout.kvHeads &&
+                  plan.reduceGroups.z == tiles,
+              "prefill split/reduce geometry disagrees");
+      const uint64_t fused = uint64_t{tiles} * splits * 8 * queryHeads;
+      require(plan.workspace.partialsBytes == fused * 256 * 4 &&
+                  plan.workspace.statisticsBytes == fused * 2 * 4,
+              "prefill split dispatch and exact scratch disagree");
+      const auto bound = ops::PagedAttention::prefillWorkspace(rows, queryHeads, layout);
+      require(bound.partialsBytes >= plan.workspace.partialsBytes &&
+                  bound.statisticsBytes >= plan.workspace.statisticsBytes,
+              "prefill arena omitted a valid shorter plan");
+    }
   const std::string verifySplit = pipelineName("verify", true, queryHeads, layout);
   const std::string verifyReduce = pipelineName("verify", false, queryHeads, layout);
   for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
@@ -180,7 +204,7 @@ void checkPlans(uint32_t queryHeads, kv::Layout layout) {
             "verify partition changed");
   }
   for (const uint32_t rows : {0U, 2049U})
-    rejects([&] { (void)ops::PagedAttention::prefillPlan(rows, queryHeads, layout); },
+    rejects([&] { (void)ops::PagedAttention::prefillPlan(rows, 0, queryHeads, layout); },
             "invalid attention workspace rows", "a prefill plan of no rows or past the budget was accepted");
   for (const uint32_t lanes : {0U, 5U})
     rejects([&] { (void)ops::PagedAttention::verifyPlan(lanes, queryHeads, layout, zeroHistory); },
@@ -566,7 +590,7 @@ std::vector<uint16_t> run(metal::MetalBackend &backend, Case &data, bool testBou
   constexpr bool prefill = phase == Phase::Prefill;
   const auto plan = [&] {
     if constexpr (prefill)
-      return ops::PagedAttention::prefillPlan(data.rows, data.queryHeads, data.layout);
+      return ops::PagedAttention::prefillPlan(data.rows, data.stores[0].committed_tokens, data.queryHeads, data.layout);
     else {
       std::vector<uint32_t> histories;
       for (uint32_t lane = 0; lane < data.lanes; ++lane)
@@ -1071,7 +1095,7 @@ void bufferExtents(metal::MetalBackend &backend, uint32_t queryHeads, kv::Layout
                        [&](metal::CommandGraph &graph, const Buffers &b) {
                          ops::PagedAttention::addPrefillStore(graph, {}, b[0], b[1], b[2], chunk, layout);
                        });
-  const auto prefill = ops::PagedAttention::prefillPlan(tokens, queryHeads, layout);
+  const auto prefill = ops::PagedAttention::prefillPlan(tokens, committed, queryHeads, layout);
   const uint64_t tileRows = kv::prefillAttentionTiles(tokens) * kv::kPrefillAttentionTileRows;
   test::requireExtents(backend,
                        Extents{{0, staged(kvHeads, stride, tileRows, queryWidth), 2, "attention query"},
@@ -1176,7 +1200,7 @@ void attentionBlocks(metal::MetalBackend &backend) {
   kv::Layout tokenMajor = dense;
   tokenMajor.valuesTokenMajor = true;
   const std::array<uint32_t, lanes> histories{100, 2000, 0};
-  rejects([&] { (void)ops::PagedAttention::prefillPlan(tokens, 24, dense); },
+  rejects([&] { (void)ops::PagedAttention::prefillPlan(tokens, 100, 24, dense); },
           "no paged-attention kernel for layout", "the sparse kernels took dimension-major values");
   rejects([&] { (void)ops::PagedAttention::verifyPlan(lanes, 16, tokenMajor, histories); },
           "no sparse attention kernel for layout", "the page loop took token-major values");
@@ -1195,7 +1219,7 @@ void attentionBlocks(metal::MetalBackend &backend) {
   for (const uint32_t queryHeads : {16U, 24U}) {
     const bool sparse = queryHeads == 24;
     const kv::Layout layout = sparse ? tokenMajor : dense;
-    const auto prefill = ops::PagedAttention::prefillPlan(tokens, queryHeads, layout);
+    const auto prefill = ops::PagedAttention::prefillPlan(tokens, 100, queryHeads, layout);
     const auto verify = ops::PagedAttention::verifyPlan(lanes, queryHeads, layout, histories);
     require(prefill.sparse == sparse && verify.sparse == sparse,
             "a plan's kernels do not take block lists as its group size states");
