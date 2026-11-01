@@ -32,7 +32,6 @@ struct RequestSpec final {
   // Tokens to prefill: the prompt, and after resumeFromResources the
   // replayed history.
   uint32_t prefillTokens = 0;
-  double deadlineMilliseconds = 0.0;
   // The most rows of one of its prefill commands (Model::prefillGroupRows): a
   // prefill group's, or a chunk's; the engine may set it again once it knows
   // where the request's KV lives (setPrefillGroupRows).
@@ -117,7 +116,6 @@ public:
   void fail(uint64_t requestId);
   void remove(uint64_t requestId);
 
-  [[nodiscard]] bool expireDeadlines(double nowMilliseconds);
   [[nodiscard]] std::vector<uint64_t> admissionOrder() const;
   // Preview the dispatch row budget before allocating new lanes.
   [[nodiscard]] std::vector<uint64_t>

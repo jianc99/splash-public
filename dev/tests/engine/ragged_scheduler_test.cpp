@@ -20,7 +20,7 @@ using splash::test::require;
 engine::RequestSpec
 request(uint64_t id, uint32_t prompt,
         RequestPriority priority = RequestPriority::Normal) {
-  return {id, priority, prompt, 10'000.0};
+  return {id, priority, prompt};
 }
 
 void completePrefill(engine::Scheduler &scheduler,
@@ -1476,19 +1476,6 @@ void testInitialSelectionsBatch() {
           "first-token selections of one priority did not share a plan");
 }
 
-void testWaitingMaskExpiresAtRequestDeadline() {
-  engine::Scheduler scheduler(0.0);
-  scheduler.submit(request(1, 1));
-  scheduler.resourcesReady(1, 0);
-  awaitFirstMask(scheduler, 1);
-  require(scheduler.expireDeadlines(10'000.0) &&
-              scheduler.phase(1) == engine::Phase::Failed,
-          "waiting mask survived its request deadline");
-
-  rejects([&] { scheduler.maskReady(1); }, "request is not waiting for a mask",
-          "late mask revived an expired request");
-}
-
 void testWaitingMaskBoundsPeerPrefill() {
   for (const RequestPriority priority : {RequestPriority::Foreground,
                                          RequestPriority::Normal,
@@ -1636,7 +1623,6 @@ int main() {
     testDecodeLanesRotate();
     testMaskStagesNeverMix();
     testInitialSelectionsBatch();
-    testWaitingMaskExpiresAtRequestDeadline();
     testWaitingMaskBoundsPeerPrefill();
     testResourceSuspensionReplaysFromCache();
     testReplayKeepsHeldInitialMask();

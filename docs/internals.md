@@ -1120,10 +1120,11 @@ the loop shows in `loop.max_tick_ms`.
 ## Admission and eviction
 
 `/status.admission` distinguishes memory and concurrency waits, counts the
-requests held back behind one refused memory (`held_behind_refusal`; during
-recovery only the suspended ones and those of a strictly higher priority, and
-the refused request itself while a pass defers it, even one that recovery does
-not try, which still waits for memory) and those waiting for a disk restore
+requests held back behind one refused memory or the SSD cache's room for its
+KV (`held_behind_refusal`; during recovery only the suspended ones and those of
+a strictly higher priority, and the refused request itself while a pass defers
+it, even one that recovery does not try, which still waits for what it was
+refused) and those waiting for a disk restore
 (`restoring`), reports suspended requests, recovery draining and the oldest
 current wait age, which for a request holding admission closed runs from when
 its wait began. Memory transitions also appear in the console. Growth that no

@@ -140,7 +140,6 @@ void Engine::submit(EngineRequest value) {
       {.id = id,
        .priority = stored.request.priority,
        .prefillTokens = stored.promptTokens,
-       .deadlineMilliseconds = stored.request.deadlineMilliseconds,
        .prefillGroupRows = model_.prefillGroupRows(false),
        .prefillPasses = model_.prefillPasses()});
   ++counters_.submitted;
@@ -187,7 +186,16 @@ bool Engine::flushRestorePoints() {
 bool Engine::tick(double now) {
   model_.checkHealth();
   nextHealthCheckMilliseconds_ = now + kHealthCheckIntervalMilliseconds;
-  bool progressed = scheduler_.expireDeadlines(now);
+  // A request's deadline ends it in whatever phase it is: at once, or once
+  // its command in flight or the read of the state it restores has drained
+  // (settle), before a read that landed can admit it (pollRestores).
+  bool progressed = false;
+  for (auto &[_, active] : requests_) {
+    if (!active.finalized && !active.pendingEnd && active.request.deadlineMilliseconds <= now) {
+      settle(active, deadlineEnd());
+      progressed = true;
+    }
+  }
   if (now >= drainEndMilliseconds_)
     drainEndMilliseconds_ = 0.0;
   if (cache_.pollTransfers()) {
@@ -198,7 +206,7 @@ bool Engine::tick(double now) {
     if (config_.spill.capable)
       static_cast<void>(cache_.writeThrough());
   }
-  progressed = pollRestores(now) || progressed;
+  progressed = pollRestores() || progressed;
   progressed = writeBehind_.run(now, memoryAwaited(now)) || progressed;
   // The earliest submitted and the earliest admitted of the lanes with work
   // in flight.
@@ -247,30 +255,19 @@ bool Engine::tick(double now) {
       progressed = true;
     }
   }
-  // Finalize expired requests now, even while a command is in flight, so a
-  // late mask or cancel for them is a no-op rather than a scheduler error.
+  // The requests the checks above ended leave the engine and the scheduler
+  // now, even while a command is in flight.
   if (progressed)
     sweepTerminal();
   if (pending_) {
-    auto advance = [&] {
-      pending_->ticket->advance();
-      for (ModelMaskRequest &asked : pending_->ticket->takeMaskRequests()) {
-        events_.maskRequested(asked.requestId, asked.simulationTokens);
-        request(asked.requestId).maskRequestedMilliseconds = now;
-        progressed = true;
-      }
-    };
-    advance();
-    for (const BatchItem &item : pending_->plan.items) {
-      Request &active = request(item.requestId);
-      if (!active.pendingEnd && active.request.deadlineMilliseconds <= now) {
-        settle(active, deadlineEnd());
-        progressed = true;
-      }
-    }
     // A mask response, cancellation, or deadline can make the commit tail
     // runnable without another Metal completion wake.
-    advance();
+    pending_->ticket->advance();
+    for (ModelMaskRequest &asked : pending_->ticket->takeMaskRequests()) {
+      events_.maskRequested(asked.requestId, asked.simulationTokens);
+      request(asked.requestId).maskRequestedMilliseconds = now;
+      progressed = true;
+    }
     if (!pending_->ticket->ready())
       return progressed;
     Pending command = std::move(*pending_);
@@ -1216,15 +1213,10 @@ void Engine::completeAdmission(Request &active, CacheLookup &lookup,
   }
 }
 
-bool Engine::pollRestores(double now) {
+bool Engine::pollRestores() {
   bool progressed = false;
   for (auto &[id, active] : requests_) {
     if (!active.restore) continue;
-    // Scheduler::expireDeadlines has already failed this lane's phase; a
-    // restore landing now would otherwise admit the lane on it
-    // (completeAdmission) before sweepTerminal ends it.
-    if (!active.pendingEnd && active.request.deadlineMilliseconds <= now)
-      settle(active, deadlineEnd());
     StateRestore *ticket = active.restore->ticket.get();
     // The state's read must drain before its lane is reused; KV restores
     // belong to their blocks and outlive a request that gives up.
@@ -2974,10 +2966,6 @@ void Engine::sweepTerminal() {
   for (auto iterator = requests_.begin(); iterator != requests_.end();) {
     const uint64_t id = iterator->first;
     Request &active = iterator->second;
-    // Scheduler::expireDeadlines is the only source of a Failed phase on an
-    // unfinalized request.
-    if (scheduler_.phase(id) == Phase::Failed && !active.finalized)
-      settle(active, deadlineEnd());
     if (!active.finalized) {
       ++iterator;
       continue;

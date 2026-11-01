@@ -639,7 +639,7 @@ private:
   // producer's prefix (awaitedSharedBoundary), else `end`.
   [[nodiscard]] uint32_t awaitedBoundary(const Request &producer, uint32_t end) const;
   void completeAdmission(Request &request, CacheLookup &lookup, DraftContextPlan draft);
-  [[nodiscard]] bool pollRestores(double nowMilliseconds);
+  [[nodiscard]] bool pollRestores();
   [[nodiscard]] DraftContextPlan
   configureDraftStatePlan(Request &request, uint32_t stateBoundary,
                           uint32_t junctionBoundary);
