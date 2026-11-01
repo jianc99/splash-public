@@ -984,13 +984,13 @@ struct Runtime::Impl {
 
   // The layers a prefill command's pass runs (BatchPlan::passes): the
   // pass's even share of them, all of them for a command that runs whole.
-  // Only a command of one lane whose history stays in memory runs in passes,
-  // as many as the runtime allows (Runtime::prefillPasses).
+  // Only a command whose lanes' history stays in memory runs in passes, as
+  // many as the runtime allows (Runtime::prefillPasses).
   [[nodiscard]] QwenPrefillLayers passLayers(const BatchPlan &plan, std::span<const ModelBatchItem> items,
                                              uint32_t passes) const {
     const uint32_t all = geometry.target.layers;
     if (!plan.passes || plan.pass >= plan.passes || plan.passes > passes ||
-        (plan.passes > 1 && (items.size() != 1 || readsSpilledKv(items.front()))))
+        (plan.passes > 1 && std::ranges::any_of(items, readsSpilledKv)))
       throw std::invalid_argument("a prefill command's passes are not ones the runtime runs");
     return {plan.pass * all / plan.passes, (plan.pass + 1) * all / plan.passes};
   }

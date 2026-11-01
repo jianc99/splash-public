@@ -1674,8 +1674,11 @@ void requirePrefillGroupMatchesItsChunks(model::Runtime &executor, const kv::Pag
 // whole: its score logits, KV, GDN cell, PLE history, lengths, draft rings
 // and window, and the states it captures, at three passes and at one a
 // layer, and with an image its first pass encodes when the target serves
-// vision; a pass before the last returns its request's id alone. A target
-// whose commands run whole (its experts load whole) skips it.
+// vision; so does each lane of a command of two, the first lane's rows in
+// its first chunk and the second's past it, each capturing a state inside
+// its rows and one at their end. A pass before the last returns its
+// requests' ids alone. A target whose commands run whole (its experts load
+// whole) skips it.
 void requirePrefillPassesMatchWhole(model::Runtime &executor, const kv::PageStorage &pages,
                                     const model::QwenStateStorage &states, std::span<const uint32_t> chat,
                                     bool vision) {
@@ -1780,10 +1783,114 @@ void requirePrefillPassesMatchWhole(model::Runtime &executor, const kv::PageStor
                     " differs from the command run whole");
     }
   }
+
+  constexpr uint32_t firstRows = chunk / 2, secondRows = chunk + chunk / 2;
+  const std::array<std::vector<uint32_t>, 2> lanePages{pageRange(0, firstRows / kv::kPageTokens),
+                                                       pageRange(firstRows / kv::kPageTokens,
+                                                                 secondRows / kv::kPageTokens)};
+  const std::array<std::array<uint32_t, 2>, 2> laneCaptures{{{chunk / 4, firstRows}, {chunk / 2, secondRows}}};
+  struct LaneRun final {
+    std::vector<float> scores;
+    std::vector<std::vector<uint8_t>> kv;
+    model::QwenLogicalLengths lengths;
+    std::vector<uint8_t> cell;
+    std::vector<std::vector<uint16_t>> rings;
+    std::vector<uint8_t> windowRows;
+    std::vector<StateBytes> captured;
+  };
+  // The two lanes' command in `split` passes: what each lane leaves.
+  const auto runLanes = [&](uint64_t first, uint32_t split) {
+    const std::array<uint64_t, 2> ids{first, first + 1};
+    BatchPlan plan{.kind = WorkKind::Prefill, .decodeStage = DecodeStage::Regular, .passes = split};
+    std::vector<ModelBatchItem> items;
+    for (uint32_t lane = 0; lane < 2; ++lane) {
+      const uint32_t laneRows = lane ? secondRows : firstRows;
+      EngineRequest request = makeRequest(ids[lane], {prompt.begin(), prompt.begin() + laneRows}, 0);
+      for (uint32_t option = 0; option < model::ExecutionLimits::maximumScoreOptions; ++option)
+        request.scoreTokens.push_back(1000 + 37 * option);
+      beginCold(executor, request, lane);
+      executor.setDraftContextPlan(ids[lane], planDraftContext(0, laneRows, laneCaptures[lane]));
+      plan.items.push_back({ids[lane], laneRows});
+      ModelBatchItem item = withRevision({ids[lane], 0, laneRows, lanePages[lane]});
+      item.inputTokens = tokens.first(laneRows);
+      for (const uint32_t boundary : laneCaptures[lane]) {
+        metal::AllocationFailure refusal;
+        std::shared_ptr<StateReservation> reservation = executor.reserveState(ids[lane], boundary, refusal);
+        require(reservation != nullptr, "the buffers of a state to capture were refused");
+        item.stateCaptures.push_back({boundary, std::move(reservation)});
+      }
+      items.push_back(std::move(item));
+    }
+    std::vector<ModelStepResult> last;
+    for (uint32_t pass = 0; pass < split; ++pass) {
+      plan.pass = pass;
+      std::vector<ModelStepResult> results = executor.submit(plan, items, {})->wait();
+      require(results.size() == 2 && results[0].requestId == ids[0] && results[1].requestId == ids[1] &&
+                  results[0].failure.empty() && results[1].failure.empty(),
+              "a two-lane prefill command's pass failed");
+      if (pass + 1 < split)
+        require(std::ranges::all_of(results,
+                                    [](const ModelStepResult &result) {
+                                      return !result.consumedPromptTokens && result.capturedStates.empty() &&
+                                             result.scoreLogits.empty() && !result.finished;
+                                    }),
+                "a pass before a two-lane command's last committed something");
+      else
+        last = std::move(results);
+    }
+    items.clear();
+    std::array<LaneRun, 2> runs;
+    for (uint32_t lane = 0; lane < 2; ++lane) {
+      require(last[lane].consumedPromptTokens == plan.items[lane].tokenCount &&
+                  last[lane].capturedStates.size() == laneCaptures[lane].size(),
+              "a two-lane command's last pass did not commit a lane's rows and states");
+      LaneRun &run = runs[lane];
+      run.scores = last[lane].scoreLogits;
+      for (const uint32_t page : lanePages[lane])
+        for (const auto &tensor : pages.spans(page)) {
+          const auto *data = reinterpret_cast<const uint8_t *>(tensor.data());
+          run.kv.emplace_back(data, data + tensor.size());
+        }
+      run.lengths = states.metadata(lane).lengths;
+      run.cell = bytesOf(states.current(lane).stateBase);
+      run.rings = committedState(executor, states, lane).rings;
+      run.windowRows = windowRows(bytesOf(states.window(lane)), width, run.lengths.targetTokens);
+    }
+    for (const uint64_t id : ids)
+      executor.end(id);
+    for (uint32_t lane = 0; lane < 2; ++lane)
+      for (size_t index = 0; index < laneCaptures[lane].size(); ++index) {
+        const uint32_t boundary = laneCaptures[lane][index];
+        StateBytes state = restoredBytes(executor, states, 560, 0, tokens, boundary, last[lane].capturedStates[index]);
+        state.window = windowRows(state.window, width, boundary);
+        runs[lane].captured.push_back(std::move(state));
+      }
+    return runs;
+  };
+  const std::array<LaneRun, 2> whole = runLanes(551, 1);
+  for (const uint32_t split : {3u, passes}) {
+    const std::array<LaneRun, 2> passed = runLanes(551 + 2 * split, split);
+    for (uint32_t lane = 0; lane < 2; ++lane) {
+      const std::string which = "lane " + std::to_string(lane) + " of a two-lane prefill command in " +
+                                std::to_string(split) + " passes";
+      require(!passed[lane].scores.empty() && passed[lane].scores == whole[lane].scores,
+              which + ": its score logits differ from the command run whole");
+      require(passed[lane].kv == whole[lane].kv, which + ": its KV differs from the command run whole");
+      require(passed[lane].lengths == whole[lane].lengths && passed[lane].cell == whole[lane].cell,
+              which + ": its GDN cell, PLE history or lengths differ from the command run whole");
+      require(passed[lane].rings == whole[lane].rings && passed[lane].windowRows == whole[lane].windowRows,
+              which + ": its draft rings or window rows differ from the command run whole");
+      for (size_t index = 0; index < laneCaptures[lane].size(); ++index)
+        require(passed[lane].captured[index].cell == whole[lane].captured[index].cell &&
+                    passed[lane].captured[index].window == whole[lane].captured[index].window,
+                which + ": the state it captured at " + std::to_string(laneCaptures[lane][index]) +
+                    " differs from the command run whole");
+    }
+  }
   while (executor.reclaimIdleState(false, IdleMemory::Buffers)) {
   }
   std::cout << "prefill_passes_match_whole=PASS passes=3," << passes << (vision ? " images=PASS" : " images=SKIP")
-            << '\n';
+            << " lanes=2\n";
 }
 
 // A command's ticket holds the buffers of the states it captures once the

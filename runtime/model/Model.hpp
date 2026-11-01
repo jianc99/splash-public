@@ -834,11 +834,11 @@ public:
     static_cast<void>(spills);
     return ExecutionLimits::prefillTokenBudget;
   }
-  // The most passes over its layers one lane's prefill command may run in
+  // The most passes over its layers a prefill command may run in
   // (BatchPlan::passes): its layers where a command pays a cost per layer
   // whatever its rows, which keeps a command long however few they are, as
   // a streamed target's expert reads; 1 where a command runs whole. A
-  // command that streams its history runs whole.
+  // command that streams a lane's history runs whole.
   [[nodiscard]] virtual uint32_t prefillPasses() const noexcept { return 1; }
   // Releases one unit of idle model memory and returns its bytes; zero when
   // nothing in scope is idle. A unit is one pooled state buffer (keepLane
