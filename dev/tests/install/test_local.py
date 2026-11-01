@@ -287,11 +287,11 @@ class LocalModelTest(unittest.TestCase):
         )
         self.assertEqual(
             sorted(p.name for p in (prepared / "vision").iterdir()),
-            ["config.json", "model-00001-of-00002.safetensors"],
+            ["model-00001-of-00002.safetensors"],
         )
         self.assertEqual(
             sorted(p.name for p in (prepared / "target").iterdir()),
-            ["config.json", *sorted(set(shards.values()))],
+            sorted(set(shards.values())),
         )
         self.assertEqual(
             sorted(p.name for p in (prepared / "tokenizer").iterdir()),

@@ -11,10 +11,6 @@ The paths an assembly links, and what reads each:
   config.json            the target configuration: the MLX config.json, or
                          the one derived from the GGUF (ModelDescriptor.mm
                          inspectSourceModel)
-  target/config.json, vision/config.json
-                         the MLX config.json again, as each checkpoint
-                         directory's own config, read by engines up to 1.2,
-                         which a release check runs on this installation
   target/<shard>         the MLX safetensors shards except those holding only
                          vision_tower.* (SafetensorsCheckpoint.mm)
   target/<name>.gguf     the GGUF target, or the parts of a split one

@@ -731,9 +731,11 @@ class UpstreamTest(unittest.TestCase):
             self.assertEqual(
                 (chosen.link / "tokenizer" / name).readlink(), snapshot / name
             )
-        # The paths the native loaders and the tokenizer read (assembly.py).
-        for name in ("config.json", "target/config.json", "tokenizer/config.json"):
+        # The paths the native loaders and the tokenizer read (assembly.py),
+        # and no other copy of the configuration.
+        for name in ("config.json", "tokenizer/config.json"):
             self.assertEqual((chosen.link / name).readlink(), snapshot / "config.json")
+        self.assertFalse((chosen.link / "target/config.json").exists())
         self.assertEqual(
             (chosen.link / "draft/model.safetensors").read_bytes(), b"draft"
         )
@@ -766,11 +768,11 @@ class UpstreamTest(unittest.TestCase):
         self.assertFalse((chosen.link / "processor").exists())
         self.assertEqual(
             sorted(p.name for p in (chosen.link / "vision").iterdir()),
-            ["config.json", "model-00001-of-00002.safetensors"],
+            ["model-00001-of-00002.safetensors"],
         )
         self.assertEqual(
             sorted(p.name for p in (chosen.link / "target").iterdir()),
-            ["config.json", *sorted(set(shards.values()))],
+            sorted(set(shards.values())),
         )
         # A checkpoint without the tower cannot serve images, nor can a
         # text-only conversion that keeps the processor but drops the tower's
@@ -874,11 +876,7 @@ class UpstreamTest(unittest.TestCase):
         self.prepare(chosen)
         self.assertEqual(
             sorted(p.name for p in (chosen.link / "target").iterdir()),
-            [
-                "config.json",
-                "model-00001-of-00002.safetensors",
-                "model-00002-of-00002.safetensors",
-            ],
+            ["model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"],
         )
         self.assertNotIn(f"{MODEL}/optiq/optiq_vision.safetensors", fake.downloads)
 
@@ -955,7 +953,7 @@ class UpstreamTest(unittest.TestCase):
         self.prepare(chosen)
         self.assertEqual(
             sorted(p.name for p in (chosen.link / "vision").iterdir()),
-            ["config.json", "model.safetensors"],
+            ["model.safetensors"],
         )
         fake.publish(
             "someone/text", "c" * 40, checkpoint(["language_model.lm_head.weight"])
