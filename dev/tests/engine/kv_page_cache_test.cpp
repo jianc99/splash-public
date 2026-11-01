@@ -763,12 +763,14 @@ void testStateTailsPinBoundedWindows() {
   };
   cache.countState(chain[9], true, false);
   cache.countState(chain[7], true, false);
-  require(cache.pinnedBlocks() == 5 && cache.windowPinned(chain[5]) && !cache.windowPinned(chain[4]) &&
+  require(cache.pinnedBlocks() == 5 &&
               candidates() == std::vector<uint64_t>(chain.begin(), chain.begin() + 5),
           "two states two blocks apart did not pin five blocks, or the rest were no trim candidates");
   cache.countState(chain[9], false, false);
-  require(cache.pinnedBlocks() == 3 && !cache.windowPinned(chain[8]) && cache.windowPinned(chain[7]) &&
-              candidates().size() == 7 && cache.tailFull(chain[7]),
+  require(cache.pinnedBlocks() == 3 &&
+              candidates() == std::vector<uint64_t>{chain[0], chain[1], chain[2], chain[3],
+                                                    chain[4], chain[8], chain[9]} &&
+              cache.tailFull(chain[7]),
           "a state's removal did not unpin what its tail alone held");
   cache.checkInvariants();
 

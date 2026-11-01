@@ -417,8 +417,6 @@ void KvCache::noteState(uint64_t blockId) { block(blockId).hadState = true; }
 
 bool KvCache::hadState(uint64_t blockId) const { return block(blockId).hadState; }
 
-bool KvCache::windowPinned(uint64_t blockId) const { return block(blockId).windowPins != 0; }
-
 bool KvCache::tailFull(uint64_t blockId) const {
   for (uint32_t index = 0; blockId && index < windowPages_; ++index) {
     const Block &entry = block(blockId);

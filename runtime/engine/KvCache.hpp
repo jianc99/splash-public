@@ -83,7 +83,7 @@ public:
   // copies no state needs in an order of their own (unneededCopy). With a
   // window of windowPages pages (kv::Layout::windowPages), a state pins the
   // windowPages blocks that end at its block, its tail, which a restore
-  // reads whole (windowPinned), and the Full blocks no tail holds wait in an
+  // reads whole (countState), and the Full blocks no tail holds wait in an
   // order of their own (trimCandidate).
   KvCache(KvPool &pool, CacheRecency &recency, bool spill = false, bool persistent = false,
           uint32_t windowPages = 0)
@@ -200,9 +200,6 @@ public:
   // block; lookups that find the block without one report a lost state.
   void noteState(uint64_t blockId);
   [[nodiscard]] bool hadState(uint64_t blockId) const;
-  // With a window: the tail of a state, its own or one below it, holds the
-  // block (countState), whose page stays Full.
-  [[nodiscard]] bool windowPinned(uint64_t blockId) const;
   // Whether the windowPages blocks that end at this one, its tail, hold
   // every layer's K/V, in RAM (a Full page) or, without a page, in their
   // copy (copyForm): what a state at the block needs to restore.
@@ -287,7 +284,7 @@ public:
   // Blocks that left their page for that of a writer that computed them
   // again (insert).
   [[nodiscard]] uint64_t upgrades() const noexcept { return upgrades_; }
-  // Blocks a state's tail holds (windowPinned).
+  // Blocks a state's tail holds (countState).
   [[nodiscard]] uint32_t pinnedBlocks() const noexcept { return pinnedBlocks_; }
   // Tests: std::logic_error unless every block's links, counts, form and
   // held mark agree with the graph and the pool, every order holds exactly
