@@ -34,24 +34,26 @@ private:
 // an engine left without a request (NativeRuntime::releaseIdleWeights),
 // records the system's pressure, logs a change in what requests wait for,
 // and runs the reclaim pass the pressure policy asks for, telling the
-// governor what it found. A pass the policy asks nothing of takes back one
-// chunk of the expert store toward its cap (NativeRuntime::growExperts)
-// while memory allows it: no request waits for memory, the host lets growth
-// go on (MemoryGovernorSnapshot::hostGrowthAllowed), and the cool-down has
-// passed since the pass first found a chunk given back
-// (kExpertGrowthCooldownMilliseconds, longer after a chunk taken back went
-// again). The chunk takes from the host only what its headroom
-// holds beyond the recovery margin, so that the chunk does not bring the
-// host back to the margin where reclaim would take it again, and from the
-// engine only the room its limit has free. With no request in the engine
-// the pass exchanges cache for what the chunk lacks of either, the store
-// ranking above the cache nothing in use holds, but only cache that pays
-// for it at once: the engine returns that much to the system, or nothing
-// when what leaves without a copy to the SSD cache falls short
-// (NativeRuntime::reclaimForExperts), and the governor's admission then
-// counts what it returned as the host's already
-// (MemoryGovernor::setGrowthCredit). Beside any request the chunk takes
-// only free room.
+// governor what it found. The expert store's cap is a reservation the
+// engine repays: before its reclaim, each pass that may not take the store
+// (MemoryReclaimDirective::hostShort) takes back one chunk of it toward its
+// cap (NativeRuntime::growExperts) while no request waits for memory, the
+// host keeps its warning margin, and the cool-down has passed since the
+// pass first found a chunk given back (kExpertGrowthCooldownMilliseconds,
+// longer after a chunk taken back went again). The chunk takes from the
+// host only what its headroom holds beyond the recovery margin, so that the
+// chunk does not bring the host back to the margin where reclaim would take
+// it again, and none of it under macOS's warning; from the engine it takes
+// only the room its limit has free. The pass exchanges cache for what the
+// chunk lacks of either, the store ranking above the cache nothing in use
+// holds, beside running requests too, but only cache that pays for it at
+// once and that no request would restore: the engine returns that much to
+// the system, or nothing when what leaves without a copy to the SSD cache
+// falls short (NativeRuntime::reclaimForExperts), and the governor's
+// admission then counts what it returned as the host's already
+// (MemoryGovernor::setGrowthCredit). An exchange that returns the whole
+// chunk leaves the host's footprint where it was, which macOS's warning
+// does not hold back.
 class MemoryControl final {
 public:
   MemoryControl(MemoryGovernor &governor, metal::MetalBackend &backend,

@@ -188,14 +188,16 @@ MemoryGovernor::tryReserve(uint64_t bytes, bool optional, metal::AllocationFailu
   // service needs it (setServing). Optional growth leaves the recovery
   // margin free, whatever the mark, but takes from the host only the bytes
   // beyond those the engine returned to the system for it (setGrowthCredit):
-  // with none beyond them, no margin holds it back on a measured host.
+  // with none beyond them it leaves the host's footprint where it was, and
+  // neither a margin nor macOS's warning holds it back on a measured host.
   const bool serving = serving_ && !optional;
   const uint64_t hostRoom = hostHeadroomBytes(host, 0);
   const uint64_t margin = optional ? kHostRecoveryMarginBytes : kHostWarningMarginBytes;
   const uint64_t credited = optional ? std::min(bytes, growthCreditBytes_) : 0;
   const uint64_t hostRequested = requested - credited;
+  const bool covered = host && credited == bytes;
   const bool hostRoomFits =
-      host && (credited == bytes || (hostRequested <= hostRoom && hostRoom - hostRequested >= margin));
+      covered || (host && hostRequested <= hostRoom && hostRoom - hostRequested >= margin);
   // A request that only the host headroom refuses waits for host memory
   // while the idle headroom may still clear the margin. Hold host pressure:
   // once a control pass finds the request waiting, the paced reclaim frees
@@ -205,7 +207,7 @@ MemoryGovernor::tryReserve(uint64_t bytes, bool optional, metal::AllocationFailu
     host_.constrained = true;
   const bool hostRefuses =
       pressure == MemoryPressure::Critical ||
-      (!serving && (systemPressure_ == MemoryPressure::Warning || !hostRoomFits ||
+      (!serving && ((systemPressure_ == MemoryPressure::Warning && !covered) || !hostRoomFits ||
                     growthHeld(host_)));
   if (hostRefuses || !engineFits) {
     // The host's refusal lifts with its pressure, the limit's only once

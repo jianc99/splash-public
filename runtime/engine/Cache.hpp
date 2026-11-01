@@ -20,6 +20,7 @@
 #include <optional>
 #include <span>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace splash::engine {
@@ -55,6 +56,11 @@ class Cache;
 class CacheProbe final {
 public:
   [[nodiscard]] uint32_t cachedTokens() const noexcept { return cachedTokens_; }
+  // The chain a start from it restores: its blocks up to the one whose
+  // state it resumes from, none without a state.
+  [[nodiscard]] std::span<const uint64_t> restoredChain() const noexcept {
+    return std::span<const uint64_t>(blocks_).first(cachedTokens_ / KvCache::pageTokens);
+  }
 
 private:
   friend class Cache;
@@ -308,6 +314,28 @@ enum class StateClass : uint8_t { Checkpoint, Ordinary, InUse };
 struct CacheExchange final {
   uint64_t extentBytes = 0;
   uint32_t states = 0;
+};
+
+// The chains requests that hold no lane would restore once they start,
+// which the exchange for the expert store keeps as it keeps what is in use
+// (Cache::exchangeable, reclaimForExchange): of each, the KV of every block
+// and the state at its last, which the request resumes from
+// (CacheProbe::restoredChain).
+class RestoredChains final {
+public:
+  void add(std::span<const uint64_t> chain) {
+    if (chain.empty())
+      return;
+    blocks_.insert(chain.begin(), chain.end());
+    states_.push_back(chain.back());
+  }
+  [[nodiscard]] bool holds(uint64_t block) const { return blocks_.contains(block); }
+  // The blocks of the states the chains resume from.
+  [[nodiscard]] std::span<const uint64_t> states() const noexcept { return states_; }
+
+private:
+  std::unordered_set<uint64_t> blocks_;
+  std::vector<uint64_t> states_;
 };
 
 // What one step of room for a state's buffers gave: a recycled state's
@@ -710,28 +738,30 @@ public:
   // true, true) takes, in its order, but only what leaves at once, starting
   // no copy to the SSD cache. A state goes through a disk copy it has, or is
   // dropped when the tier takes no write of it; one that needs a write
-  // stays, and so do the newer ones of its class
+  // stays, and the step passes over it to the next of its class
   // (StateCache::Unwritten::Stay). A KV leaf goes through its disk copy, or
   // is erased when no state needs it or the tier takes no write; one that
   // needs a demotion stays, and the chain above it
-  // (ReclaimTiming::Immediate).
-  [[nodiscard]] CacheReclaimResult reclaimForExchange();
-  // What reclaimForExchange(), repeated until it makes no progress, takes
-  // between commands: the RAM copies of states it frees
+  // (ReclaimTiming::Immediate). The restored chains stay whole, as what is
+  // in use does: the states they resume from, which the step passes over as
+  // well, and every page of their KV.
+  [[nodiscard]] CacheReclaimResult reclaimForExchange(const RestoredChains &restored);
+  // What reclaimForExchange(restored), repeated until it makes no progress,
+  // takes between commands: the RAM copies of states it frees
   // (StateCache::freedWithoutWrites), and the bytes of the extents it
   // releases, of each form every allocated extent but the runway and those
   // the pages that stay fill, which compaction gathers (compactExtent). The
   // pages that stay are those requests hold and every resident page on the
-  // chains it leaves: those of the states in use, of the RAM copies of
-  // states it leaves, and, while the tier takes writes, of each block a
-  // state needs that has no copy on the SSD yet. Exact unless the tier takes
-  // KV writes but no write of the states it drops: the KV that only those
-  // states needed then counts as staying, and goes. Nothing while a
-  // transfer or the state write is in flight: until it lands, a transfer
-  // holds its pages in their extents, and a persist write holds the RAM copy
-  // it reads out of every order, the resume point's among them. The
-  // exchange waits for it.
-  [[nodiscard]] CacheExchange exchangeable() const;
+  // chains it leaves: the requests' own, the restored chains, those of the
+  // states in use, of the RAM copies of states it leaves, and, while the
+  // tier takes writes, of each block a state needs that has no copy on the
+  // SSD yet. Exact unless the tier takes KV writes but no write of the
+  // states it drops: the KV that only those states needed then counts as
+  // staying, and goes. Nothing while a transfer or the state write is in
+  // flight: until it lands, a transfer holds its pages in their extents, and
+  // a persist write holds the RAM copy it reads out of every order, the
+  // resume point's among them. The exchange waits for it.
+  [[nodiscard]] CacheExchange exchangeable(const RestoredChains &restored) const;
   // One step of room for the buffers of a state, which a command will
   // capture (Model::reserveState) or which is taken from its lane after the
   // command that ended at it (Model::snapshot), taking nothing of a class
@@ -895,9 +925,10 @@ private:
   // One eviction step: what it takes, as reclaimOne's arguments say, the
   // allocation that was refused, if it is taken for one rather than for a
   // pass, what becomes of a state without a disk copy
-  // (StateCache::Unwritten), and how long the caller can wait for KV memory
-  // (ReclaimTiming). An exchange (reclaimForExchange) starts no write and
-  // waits for none.
+  // (StateCache::Unwritten), how long the caller can wait for KV memory
+  // (ReclaimTiming), and the chains it keeps beside what is in use. An
+  // exchange (reclaimForExchange) starts no write, waits for none and keeps
+  // the restored chains.
   struct EvictionStep final {
     CacheReclaimMode mode;
     ReclaimClass upTo;
@@ -905,7 +936,13 @@ private:
     std::optional<Shortfall> refused;
     StateCache::Unwritten unwritten = StateCache::Unwritten::Wait;
     ReclaimTiming timing = ReclaimTiming::CanWait;
+    const RestoredChains *restored = nullptr;
   };
+  // The states a step or a scan passes over beside the resume point it
+  // keeps: those its restored chains resume from.
+  [[nodiscard]] static std::span<const uint64_t> keptStates(const RestoredChains *restored) noexcept {
+    return restored ? restored->states() : std::span<const uint64_t>{};
+  }
   // The step of reclaimOne and reclaimForExchange: with ReleaseExtents an
   // extent of free pages first, else one eviction followed by the extent it
   // emptied; otherwise the eviction alone.
@@ -925,24 +962,29 @@ private:
   // One reclaimOldest scan: the class it takes (what is in use, or the
   // ordinary class), whether it keeps the resume point, what becomes of a
   // state whose write cannot start now, how long the caller can wait for KV
-  // memory, and whether only what gives pages goes.
+  // memory, whether only what gives pages goes, and the chains it keeps.
   struct VictimScan final {
     bool inUse;
     bool keepResumePoint;
     StateCache::Unwritten unwritten;
     ReclaimTiming timing;
     bool pagesOnly;
+    const RestoredChains *restored = nullptr;
   };
   // Gives up one victim of the scan's class. The ordinary class first gives
   // the oldest KV leaf no state restores through (oldestDeadKvLeaf). Then
   // the oldest of the class's states and resident KV leaves goes: a state as
   // `unwritten` says (StateCache::reclaim), a KV leaf as the timing allows
-  // (reclaimKvLeaf). One that stays leaves the other kind to give, and once
-  // a demotion has to wait for the tier, no other is started: leaves that
-  // need one stay. A page scan (pagesOnly) takes the class's leaves alone,
+  // (reclaimKvLeaf). One that stays leaves the other kind to give: a state
+  // that waits for the write in flight holds back the newer ones of its
+  // class, and one that stays without a write (Stay) is passed over to the
+  // next; once a demotion has to wait for the tier, no other is started:
+  // leaves that need one stay. A page scan (pagesOnly) takes the class's leaves alone,
   // in their own order, and a state only where it sits in RAM on the leaf
   // that goes next: that state goes, the leaf on a later step; a resume
-  // point it keeps stays with its leaf. Nothing once all stay.
+  // point it keeps stays with its leaf. A restored chain's state and leaves
+  // stay, and the scan goes on to the next of their kind; no leaf no state
+  // restores through lies on one. Nothing once all stay.
   [[nodiscard]] std::optional<Victim> reclaimOldest(const VictimScan &scan);
   // Oldest resident KV leaf after `after` no state restores through: nothing
   // sits on it or below it, so it saves no prefill, and it frees its page

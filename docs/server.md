@@ -450,23 +450,29 @@ off` loads every expert, as a SIZE that holds them all does.
   it, the experts the slots' recycling would recycle first evicted to make
   room, and later steps read the evicted ones from the SSD again. Critical
   pressure takes the store down to its floor at once, spilling no request
-  first, in one copy per format rather than one per chunk. Once memory
-  allows again, between commands, the store takes one chunk back per pass,
-  its slots empty, as long as macOS reports no memory pressure, no request
-  waits for memory, 30 s have passed since a chunk last went and the
-  weights are not released. A chunk taken back that goes again within that
-  wait doubles it, up to 4 minutes, since the requests still needed its
-  memory; one that stays for the whole wait restores it. While the
-  engine holds a request, resident or queued, the chunk takes only memory
-  `--max-memory` leaves free, and only while the host has the chunk and
-  2 GiB to spare. With none, the chunk is an exchange, the store ranking
-  above the prefix cache: the engine first evicts cached prefixes, but not
-  the one the newest conversation resumes from, and returns their memory to
-  macOS until it covers what the host lacks of the chunk and 2 GiB, or what
-  `--max-memory` lacks of the chunk. It evicts only prefixes that leave
-  memory at once, never one that would first need a copy on the SSD cache;
-  when those cannot cover the lack, every prefix stays cached and the chunk
-  waits. Each chunk given back or
+  first, in one copy per format rather than one per chunk. The store's cap
+  is a reservation the engine repays: once memory allows again, between
+  commands, the store takes one chunk back per pass, its slots empty, as
+  long as no request waits for memory, the host has 1 GiB to spare and
+  macOS reports no critical pressure, 30 s have passed since a chunk last
+  went and the weights are not released. A chunk taken back that goes
+  again within that wait doubles it, up to 4 minutes, since the requests
+  still needed its memory; one that stays for the whole wait restores it.
+  The chunk takes memory `--max-memory` leaves free, and of the host's only
+  what it has to spare beyond the chunk and 2 GiB, none while macOS reports
+  memory pressure. For the rest the chunk is an exchange, the store ranking
+  above the prefix cache, beside requests in service too: the engine first
+  evicts cached prefixes and returns their memory to macOS until it covers
+  what the host lacks of the chunk and 2 GiB, or what `--max-memory` lacks
+  of the chunk. It keeps the prefix the newest conversation resumes from,
+  those requests waiting to start would resume from, looked up for it where
+  the engine has not yet, and whatever requests in service use. It evicts only
+  prefixes that leave memory at once, never one that would first need a
+  copy on the SSD cache; when those cannot cover the lack, every prefix
+  stays cached and the chunk waits. Under macOS's warning the exchange
+  returns all of the chunk's memory before the chunk takes it, so the
+  Mac's footprint does not grow, and the warning does not hold it back.
+  Each chunk given back or
   taken back logs a line, and so does each format critical pressure takes to
   its floor (`Expert store gave back`, `Expert store took back`).
   Elasticity serves concurrency, the prefix cache and the rest of the Mac;

@@ -1140,34 +1140,46 @@ or are evicted, and later steps read them from the SSD again. Memory on its way
 back holds the store back: while cache nothing in use holds waits for a
 transfer, a KV demotion or a state write, the pass ends pending, and the pass
 that continues it once the transfer landed takes that cache first. macOS's
-warning alone never takes the store. Once memory allows again the control
-pass takes one chunk back per pass, its slots empty: when macOS reports no
-memory pressure, no request waits for memory, the host lets growth go on, the
-weights are neither released nor being restored, and the cool-down has passed
-since a chunk last went: 30 s, doubled up to 4 minutes each time a chunk taken
-back goes again within it, which shows the requests still needed its memory,
-and back to 30 s once a chunk taken back stays for a whole cool-down
-(`MemoryControl`). The chunk takes from the host only its headroom beyond the
-2 GiB recovery margin, and from the engine only room `--max-memory` leaves
-free. While the engine holds any request, resident, queued or draining, it
-takes only that. With none the chunk is an exchange for cache nothing in use
-holds, which ranks below the store, for what the chunk lacks of either: the
-engine first returns that cache to the system, one reclaim step at a time,
-each releasing the extent it empties, until the bytes that left the engine
-cover what the chunk lacks, and keeps the resume point of the newest
-conversation. The governor's growth admission then counts those bytes as the
-host's already (`MemoryGovernor::setGrowthCredit`): its own sample of the host
-may not show them yet, and the pass checked the rest against the sample it
-took before the exchange. Cache that cannot pay for the chunk in that pass
-stays. The exchange starts no copy to the SSD cache, whose memory would come
-back only after the pass: a state or page that needs one stays, and so do the
-pages above that page and the newer states of that state's class (checkpoint
-or ordinary). Unless the idle state buffers beyond a lane's and the extents
-that what leaves at once would empty cover what the chunk lacks
-(`Engine::exchangeableBytes`, `Cache::exchangeable`), the exchange takes
-nothing and the chunk waits; it waits too while a transfer is in flight. With
-the SSD cache on, a cached conversation buys a chunk only once its state and
-pages have copies there, as `--persistent-cache` writes them. A start
+warning alone never takes the store. The store's cap is a reservation: the
+memory a chunk gave back is a deficit the engine repays once the cache that
+took it can pay. Each control pass, before its reclaim, takes one chunk back,
+its slots empty, while no request waits for memory, the host keeps the
+1 GiB warning margin short of critical pressure, the weights are neither released
+nor being restored, and the cool-down has passed since a chunk last went:
+30 s, doubled up to 4 minutes each time a chunk taken back goes again within
+it, which shows the requests still needed its memory, and back to 30 s once a
+chunk taken back stays for a whole cool-down (`MemoryControl`). The chunk
+takes from the host only its headroom beyond the 2 GiB recovery margin, none
+of it under macOS's warning, and from the engine only room `--max-memory`
+leaves free. For what it lacks of either the chunk is an exchange for cache
+nothing in use holds, which ranks below the store, beside running requests as
+with none: the engine first returns that cache to the system, one reclaim
+step at a time, each releasing the extent it empties, until the bytes that
+left the engine cover what the chunk lacks. It keeps the resume point of the
+newest conversation and every chain a request that holds no lane would
+restore: the KV of the chain its probe of the cache found, brought up to date
+first, and the state the chain ends at (`RestoredChains`). A request
+admission has not probed, such as one that arrived since its last pass, one
+below the priority that runs or one behind the first waiting for a lane, the
+exchange probes itself. What is in use, the replay points of unfinished
+requests and the KV they restore through, stays, and so does every chain a request holds pages of. The
+governor's growth admission then counts those bytes as the host's already
+(`MemoryGovernor::setGrowthCredit`): its own sample of the host may not show
+them yet, and the pass checked the rest against the sample it took before the
+exchange. An exchange that returns the whole chunk leaves the host's
+footprint where it was, which macOS's warning does not hold back: a pass
+under the warning alone first exchanges cache for the chunk and then gives
+back what the warning asks of the rest. Cache that cannot pay for the chunk
+in that pass stays. The exchange starts no copy to the SSD cache, whose
+memory would come back only after the pass: a state or page that needs one
+stays, and so do the pages above that page, and the exchange goes on to the
+next state or page that leaves at once. Unless the idle state buffers beyond
+a lane's and the extents that what leaves at once would empty cover what the
+chunk lacks (`Engine::exchangeableBytes`, `Cache::exchangeable`), the
+exchange takes nothing and the chunk waits; it waits too while a transfer is
+in flight. With the SSD cache on, a cached conversation buys a chunk only
+once its state and pages have copies there, as `--persistent-cache` writes
+them. A start
 needs only what macOS can
 hand out at all beyond a reserve of a tenth of a small Mac's memory and 2 GiB of
 a larger one, counting what compressing the anonymous pages would free at the

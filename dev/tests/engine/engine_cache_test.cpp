@@ -1455,6 +1455,37 @@ void testRestoredStateKeepsItsDiskCopy() {
           "the disk copy did not remain after the RAM copy left");
 }
 
+// The exchange for the expert store starts no write: an older checkpoint
+// that needs one stays, and the exchange takes a newer one past it, which a
+// restore brought back to RAM beside its copy. The newest ordinary state, the
+// resume point, stays too.
+void testExchangePassesOverACheckpointThatNeedsAWrite() {
+  CacheFixture fixture;
+  auto control = std::make_shared<TransferControl>();
+  control->ready = true;
+  fixture.cache.publishCompositeState(fixture.blocks[2], std::make_shared<TieredState>(control), true);
+  require(fixture.cache.reclaimOneState(StateClass::Checkpoint, false).made && fixture.cache.pollTransfers(),
+          "the fixture's checkpoint was not written");
+  fixture.cache.publishCompositeState(fixture.blocks[1], std::make_shared<TieredState>(control), true);
+  {
+    auto lookup = fixture.lookup(97);
+    PromotionTicket ticket;
+    fixture.cache.promoteState(lookup, ticket);
+    require(ticket.copies == 1, "the fixture's checkpoint was not restored to RAM");
+  }
+  fixture.publish(3);
+  const RestoredChains none;
+  const uint64_t offloads = fixture.cache.snapshot().stateCache.offloads;
+  require(fixture.cache.exchangeable(none).states == 1,
+          "the exchange did not count the checkpoint past the one that needs a write");
+  while (fixture.cache.reclaimForExchange(none).madeProgress) {
+  }
+  require(!fixture.cache.stateResident(fixture.blocks[2]) && fixture.cache.stateResident(fixture.blocks[1]) &&
+              fixture.cache.stateResident(fixture.blocks[3]) &&
+              fixture.cache.snapshot().stateCache.offloads == offloads,
+          "the exchange did not take the copied checkpoint alone, or wrote one");
+}
+
 void testDiskCheckpointRamAccounting() {
   for (bool republish : {false, true}) {
     CacheFixture fixture;
@@ -5828,6 +5859,7 @@ int main() {
     testRepublicationKeepsTheDiskCopy();
     testLostStatesAreCounted();
     testRestoredStateKeepsItsDiskCopy();
+    testExchangePassesOverACheckpointThatNeedsAWrite();
     testDiskReplacementSpansStatesAndKv();
     testDiskPublicationLifecycle();
     testDiskPublicationFailure();

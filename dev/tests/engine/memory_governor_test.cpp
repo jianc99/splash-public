@@ -844,9 +844,12 @@ void testOnlyAShortHostTakesTheExpertStore() {
 // growth are the host's already (MemoryGovernor::setGrowthCredit): growth
 // the engine can do without counts only the bytes beyond them against the
 // host's headroom, which must keep the recovery margin beside them, and
-// with none beyond them no margin holds it back. The engine's limit counts
-// every byte, and macOS's warning and a host it cannot measure still refuse
-// it. Memory a request needs takes no credit.
+// with none beyond them it leaves the host's footprint where it was, which
+// neither a margin nor macOS's warning holds back. The engine's limit
+// counts every byte, macOS's warning still refuses growth with bytes beyond
+// the credit, however much headroom the host has, and critical pressure and
+// a host the governor cannot measure refuse it all. Memory a request needs
+// takes no credit.
 void testGrowthCreditCountsOnlyTheRest() {
   test::metalStatistics() = {};
   metal::MetalBackend backend("unused");
@@ -875,7 +878,14 @@ void testGrowthCreditCountsOnlyTheRest() {
   require(!grows(), "the credit lifted the engine's limit");
   test::metalStatistics().allocatedBytes = 0;
   governor.setPressure(MemoryPressure::Warning);
-  require(!grows(), "the credit lifted macOS's warning");
+  require(grows(), "macOS's warning refused growth the credit covers");
+  static_cast<void>(governor.setGrowthCredit(chunk / 2));
+  available = hostReserve + (16 * kGiB);
+  require(!grows(), "macOS's warning admitted growth beyond the credit");
+  static_cast<void>(governor.setGrowthCredit(chunk));
+  available = between;
+  governor.setPressure(MemoryPressure::Critical);
+  require(!grows(), "the credit lifted critical pressure");
   governor.setPressure(MemoryPressure::Normal);
   available = std::nullopt;
   require(!grows(), "the credit admitted growth on a host that could not be measured");

@@ -570,12 +570,13 @@ CacheReclaimResult Cache::reclaimOne(CacheReclaimMode mode, ReclaimClass upTo,
   return reclaimStep({.mode = mode, .upTo = upTo, .keepResumePoint = keepResumePoint}, keepRunway);
 }
 
-CacheReclaimResult Cache::reclaimForExchange() {
+CacheReclaimResult Cache::reclaimForExchange(const RestoredChains &restored) {
   return reclaimStep({.mode = CacheReclaimMode::ReleaseExtents,
                       .upTo = ReclaimClass::Ordinary,
                       .keepResumePoint = true,
                       .unwritten = StateCache::Unwritten::Stay,
-                      .timing = ReclaimTiming::Immediate},
+                      .timing = ReclaimTiming::Immediate,
+                      .restored = &restored},
                      true);
 }
 
@@ -600,11 +601,18 @@ CacheReclaimResult Cache::evictOne(const EvictionStep &step) {
     return step.refused ? returnsInFlight(*step.refused) : transfersInFlight();
   };
   // Disposable checkpoints go first, except in a page scan, to which their
-  // buffers give no page; one whose write must wait for the one in flight
-  // stays and holds back nothing else.
-  if (const auto oldest = states_.checkpointCandidate(step.keepResumePoint); oldest && !pagesOnly) {
-    if (states_.reclaim(oldest->id, step.unwritten).evicted)
+  // buffers give no page; one that stays without a write is passed over to
+  // the next, and one whose write must wait for the one in flight stays and
+  // holds back nothing else.
+  for (auto checkpoint = pagesOnly ? std::nullopt
+                                   : states_.checkpointCandidate(step.keepResumePoint, keptStates(step.restored));
+       checkpoint;
+       checkpoint = states_.checkpointCandidate(step.keepResumePoint, keptStates(step.restored), checkpoint)) {
+    const StateEviction eviction = states_.reclaim(checkpoint->id, step.unwritten);
+    if (eviction.evicted)
       return {.madeProgress = true, .evictedState = true};
+    if (eviction.pending)
+      break;
   }
 
   // Then oldest first across ordinary states and KV, or the leaves alone
@@ -620,7 +628,8 @@ CacheReclaimResult Cache::evictOne(const EvictionStep &step) {
                                            .keepResumePoint = step.keepResumePoint,
                                            .unwritten = step.unwritten,
                                            .timing = step.timing,
-                                           .pagesOnly = pagesOnly}))
+                                           .pagesOnly = pagesOnly,
+                                           .restored = step.restored}))
       return {.madeProgress = true, .evictedState = !victim->kv};
   }
   // Nothing to reclaim now. Transfers land only in pollTransfers(), so what
@@ -735,20 +744,29 @@ uint32_t Cache::reusablePages(ReclaimClass upTo, kv::PageForm form) const {
   return unheld - kv_.idlePagesOnChains(states_.usedStates(), form);
 }
 
-CacheExchange Cache::exchangeable() const {
+CacheExchange Cache::exchangeable(const RestoredChains &restored) const {
   if (!writes_.empty() || !restores_.empty() || states_.writing())
     return {};
-  // The chains reclaimForExchange leaves: those of the states in use, which
-  // only InUse takes, those of the RAM copies of states it leaves, whose
-  // leaves keep them, and, while the tier takes writes, those of the blocks
-  // that need a demotion, which an exchange starts none of.
+  // The chains reclaimForExchange leaves: the restored chains, those of the
+  // states in use, which only InUse takes, those of the RAM copies of states
+  // it leaves, whose leaves keep them, and, while the tier takes writes,
+  // those of the blocks that need a demotion, which an exchange starts none
+  // of. A request's chain stays whole: the pages it holds, and the page of
+  // each of its blocks it keeps another page beside (privatePages, or its
+  // own while a restore filled the block's), which another request may hold
+  // or none.
   std::vector<uint64_t> kept = states_.usedStates();
-  CacheExchange exchange{.states = states_.freedWithoutWrites(kept)};
+  kept.insert(kept.end(), restored.states().begin(), restored.states().end());
+  CacheExchange exchange{.states = states_.freedWithoutWrites(kept, restored.states())};
   if (kvTierWritable()) {
     for (const uint64_t block : kv_.uncopiedBlocks())
       if (kvNeededByState(block))
         kept.push_back(block);
   }
+  for (const auto &[_, active] : requests_)
+    for (size_t index = 0; index < active.cachedBlocks.size(); ++index)
+      if (kv_.page(active.cachedBlocks[index]) != active.pages[index])
+        kept.push_back(active.cachedBlocks[index]);
   const uint32_t extent = pool_.extentPages();
   for (const kv::PageForm form : {kv::PageForm::Full, kv::PageForm::Slim, kv::PageForm::Index}) {
     const uint32_t allocated = pool_.allocatedExtents(form);
@@ -770,16 +788,30 @@ std::optional<Cache::Victim> Cache::reclaimOldest(const VictimScan &scan) {
       if (reclaimKvLeaf(leaf->id, scan.timing) == LeafReclaim::Started)
         return Victim{true};
   }
+  // The class's oldest state, or the next after one that stayed.
+  const auto stateAfter = [&](std::optional<CacheEvictionCandidate> after) {
+    return scan.inUse ? states_.inUseCandidate(after)
+                      : states_.ordinaryCandidate(scan.keepResumePoint, keptStates(scan.restored), after);
+  };
   std::optional<CacheEvictionCandidate> state;
   if (!scan.pagesOnly)
-    state = scan.inUse ? states_.inUseCandidate() : states_.ordinaryCandidate(scan.keepResumePoint);
+    state = stateAfter(std::nullopt);
   std::optional<CacheEvictionCandidate> kv = oldestKvLeaf(0, scan.inUse, scan.pagesOnly);
   ReclaimTiming timing = scan.timing;
   while (state || kv) {
     if (state && (!kv || state->lastUsed <= kv->lastUsed)) {
-      if (states_.reclaim(state->id, scan.unwritten).evicted)
+      const StateEviction eviction = states_.reclaim(state->id, scan.unwritten);
+      if (eviction.evicted)
         return Victim{false};
-      state.reset();
+      // One that waits for the write in flight holds back the newer states
+      // of its class, which follow it once that write has landed; one that
+      // stays without a write is passed over to the next.
+      state = eviction.pending ? std::nullopt : stateAfter(state);
+      continue;
+    }
+    // A restored chain's leaf stays, as the state it resumes from does.
+    if (scan.restored && scan.restored->holds(kv->id)) {
+      kv = oldestKvLeaf(kv->id, scan.inUse, scan.pagesOnly);
       continue;
     }
     // A page scan's leaf gives up its state in RAM first. The resume point

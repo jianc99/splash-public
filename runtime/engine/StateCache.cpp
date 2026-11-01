@@ -258,16 +258,17 @@ bool StateCache::contains(uint64_t kvBlock) const noexcept {
   return found != entries_.end() && !found->second.invalid;
 }
 
-uint32_t StateCache::freedWithoutWrites(std::vector<uint64_t> &staying) const {
+uint32_t StateCache::freedWithoutWrites(std::vector<uint64_t> &staying,
+                                        std::span<const uint64_t> kept) const {
   const uint64_t resume = resumePoint();
   uint32_t freed = 0;
   for (const RecencyOrder *order : {&checkpoints_, &ordinary_}) {
-    bool stays = false;
     for (auto state = order->oldest(); state; state = order->next(*state)) {
+      // The reclaim passes over a kept state to the next of its class.
+      if (std::ranges::find(kept, state->id) != kept.end())
+        continue;
       const Entry &entry = entries_.at(state->id);
-      stays = stays || state->id == resume ||
-              (!entry.disk && entry.ram->canOffload(inUse(state->id)));
-      if (stays)
+      if (state->id == resume || (!entry.disk && entry.ram->canOffload(inUse(state->id))))
         staying.push_back(state->id);
       else
         ++freed;
@@ -348,25 +349,32 @@ void StateCache::relabel() const {
 }
 
 std::optional<CacheEvictionCandidate>
-StateCache::oldestOf(const RecencyOrder &order, bool keepResumePoint) const noexcept {
-  const std::optional<CacheEvictionCandidate> oldest = order.oldest();
-  if (oldest && keepResumePoint && oldest->id == resumePoint())
-    return std::nullopt;
-  return oldest;
+StateCache::oldestOf(const RecencyOrder &order, bool keepResumePoint, std::span<const uint64_t> kept,
+                     std::optional<CacheEvictionCandidate> after) const noexcept {
+  // The resume point is its order's newest: none follows it.
+  const uint64_t resume = keepResumePoint ? resumePoint() : 0;
+  for (auto state = after ? order.next(*after) : order.oldest(); state && state->id != resume;
+       state = order.next(*state))
+    if (std::ranges::find(kept, state->id) == kept.end())
+      return state;
+  return std::nullopt;
 }
 
 std::optional<CacheEvictionCandidate>
-StateCache::checkpointCandidate(bool keepResumePoint) const noexcept {
-  return oldestOf(checkpoints_, keepResumePoint);
+StateCache::checkpointCandidate(bool keepResumePoint, std::span<const uint64_t> kept,
+                                std::optional<CacheEvictionCandidate> after) const noexcept {
+  return oldestOf(checkpoints_, keepResumePoint, kept, after);
 }
 
 std::optional<CacheEvictionCandidate>
-StateCache::ordinaryCandidate(bool keepResumePoint) const noexcept {
-  return oldestOf(ordinary_, keepResumePoint);
+StateCache::ordinaryCandidate(bool keepResumePoint, std::span<const uint64_t> kept,
+                              std::optional<CacheEvictionCandidate> after) const noexcept {
+  return oldestOf(ordinary_, keepResumePoint, kept, after);
 }
 
-std::optional<CacheEvictionCandidate> StateCache::inUseCandidate() const noexcept {
-  return inUse_.oldest();
+std::optional<CacheEvictionCandidate>
+StateCache::inUseCandidate(std::optional<CacheEvictionCandidate> after) const noexcept {
+  return oldestOf(inUse_, false, {}, after);
 }
 
 std::optional<CacheEvictionCandidate>

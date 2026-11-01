@@ -302,27 +302,31 @@ public:
   // std::logic_error while a command is in flight. It takes only what
   // headroomBytes, the room the engine's limit has free, covers, and asks
   // for none it lacks, which would count as a denied reservation for
-  // nothing. It never takes cache, what is in use or the store itself: an
-  // engine without requests makes the room first (reclaimForExperts), which
-  // the control pass asks for. True when the chunk came back.
+  // nothing. It never takes cache, what is in use or the store itself: the
+  // exchange makes the room first (reclaimForExperts), which the control
+  // pass asks for. True when the chunk came back.
   [[nodiscard]] bool growExperts(uint64_t headroomBytes);
   // The cache's side of the exchange the control pass makes for the expert
   // store's next chunk while the host's headroom or the engine's limit lacks
-  // `bytes` of it (MemoryControl). Cache that cannot cover the bytes would go
-  // for nothing, so it takes nothing unless what leaves at once covers them
+  // `bytes` of it (MemoryControl): the memory the store gave back is the
+  // cache's to repay, beside running requests too, from what none of them
+  // needs. It takes nothing in use, which only InUse takes (ReclaimClass),
+  // and nothing of the chains the requests that hold no lane would restore
+  // once they start, each from its probe brought up to date
+  // (RestoredChains), or from one it makes where admission has made none.
+  // Cache that cannot cover the bytes would go for nothing, so it takes
+  // nothing unless what leaves at once covers them
   // (exchangeableBytes); it starts no copy to the SSD cache, whose memory
   // would come back only after the call, so cache that needs one stays.
-  // Then, with no request in the engine, it returns memory to the system a
-  // step at a time until the bytes returned cover `bytes`: the model's idle
-  // buffers beyond those one lane starts from, then the cache nothing in use
-  // holds, one Cache::reclaimForExchange step at a time, each releasing the
-  // extent it empties. It keeps the resume point, which the next turn of the
-  // newest conversation resumes from, and the runway extent. Beside any
-  // request, resident, queued or draining, whose memory outranks the
-  // store's and whose prefix the cache may hold, it takes nothing. Returns
-  // the bytes that left the engine, zero or at least `bytes`: buffers the
-  // model released and extents released, never pages freed in an extent
-  // that stays. Runs only between commands: throws std::logic_error while a
+  // Then it returns memory to the system a step at a time until the bytes
+  // returned cover `bytes`: the model's idle buffers beyond those one lane
+  // starts from, then the cache nothing in use holds, one
+  // Cache::reclaimForExchange step at a time, each releasing the extent it
+  // empties. It keeps the resume point, which the next turn of the newest
+  // conversation resumes from, and the runway extent. Returns the bytes
+  // that left the engine, zero or at least `bytes`: buffers the model
+  // released and extents released, never pages freed in an extent that
+  // stays. Runs only between commands: throws std::logic_error while a
   // command is in flight.
   [[nodiscard]] uint64_t reclaimForExperts(uint64_t bytes);
   // The bytes growExperts takes next (Model::expertGrowthBytes).
@@ -748,17 +752,18 @@ private:
   [[nodiscard]] uint64_t releaseExpertsToFloor();
   // One step of the exchange (reclaimForExperts): an idle buffer beyond
   // those one lane starts from, else one Cache::reclaimForExchange step of
-  // the cache nothing in use holds, which keeps the resume point and the
-  // runway extent, releases the extent it empties and starts no copy. Its
-  // progress, and the bytes it returned to the system (reclaimedBytes).
-  [[nodiscard]] CacheReclaimResult reclaimStepForExperts();
-  // What reclaimForExperts returns with no request in the engine, its steps
-  // repeated until none makes progress: the model's idle buffers beyond a
-  // lane's, with those of the cached states the cache frees
-  // (Model::idleBufferBytes of Cache::exchangeable's states), and the
-  // extents the cache releases (Cache::exchangeable). Nothing while a copy
-  // to or from the SSD cache is in flight.
-  [[nodiscard]] uint64_t exchangeableBytes() const;
+  // the cache nothing in use holds, which keeps the restored chains, the
+  // resume point and the runway extent, releases the extent it empties and
+  // starts no copy. Its progress, and the bytes it returned to the system
+  // (reclaimedBytes).
+  [[nodiscard]] CacheReclaimResult reclaimStepForExperts(const RestoredChains &restored);
+  // What reclaimForExperts returns, its steps repeated until none makes
+  // progress: the model's idle buffers beyond a lane's, with those of the
+  // cached states the cache frees (Model::idleBufferBytes of
+  // Cache::exchangeable's states), and the extents the cache releases
+  // (Cache::exchangeable). Nothing while a copy to or from the SSD cache is
+  // in flight.
+  [[nodiscard]] uint64_t exchangeableBytes(const RestoredChains &restored) const;
   [[nodiscard]] bool reclaimIdleState(bool keepLane, model::IdleMemory scope) noexcept;
   [[nodiscard]] CacheReclaimResult reuseCachedStateWhilePaused(ReclaimClass upTo);
   [[nodiscard]] CacheReclaimResult reuseCachedPagesWhilePaused(

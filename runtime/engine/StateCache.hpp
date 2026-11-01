@@ -231,29 +231,38 @@ public:
                                  (withInUse ? inUse_.size() : 0));
   }
   // The RAM copies a reclaim that starts no write frees, each at once: the
-  // oldest checkpoint, then the oldest ordinary state, freed with Stay until
-  // none is left, keeping the resume point (Cache::reclaimForExchange).
-  // Appends to `staying` the blocks of the RAM copies it leaves but those in
-  // use: in either class the first that needs a write and every newer one,
-  // which never becomes the class's oldest, the resume point, and the copies
-  // in no order, pinned or read by the write in flight.
-  [[nodiscard]] uint32_t freedWithoutWrites(std::vector<uint64_t> &staying) const;
+  // checkpoints, then the ordinary states, oldest first, freed with Stay
+  // until none is left, keeping the resume point and the states at `kept`
+  // (Cache::reclaimForExchange). Appends to `staying` the blocks of the RAM
+  // copies it leaves but those in use and those at `kept`: those that need a
+  // write, which the reclaim passes over to the next of their class, the
+  // resume point, and the copies in no order, pinned or read by the write in
+  // flight.
+  [[nodiscard]] uint32_t freedWithoutWrites(std::vector<uint64_t> &staying,
+                                            std::span<const uint64_t> kept) const;
   // The resume point a reclaim may keep (keepResumePoint): the newest
   // unpinned ordinary state in RAM, else the newest such checkpoint; 0
   // without either.
   [[nodiscard]] uint64_t resumePoint() const noexcept;
-  // Oldest unpinned checkpoint in RAM, the first class a reclaim frees.
-  // keepResumePoint withholds the resume point when it is a checkpoint: the
-  // newest one, while no ordinary state is in RAM.
+  // Oldest unpinned checkpoint in RAM, the first class a reclaim frees, or
+  // the next after `after`, a candidate that stayed. keepResumePoint
+  // withholds the resume point when it is a checkpoint: the newest one,
+  // while no ordinary state is in RAM. The states at `kept` are withheld
+  // too, and the next oldest is the candidate.
   [[nodiscard]] std::optional<CacheEvictionCandidate>
-  checkpointCandidate(bool keepResumePoint) const noexcept;
-  // Oldest unpinned ordinary state in RAM. keepResumePoint withholds the
-  // resume point, the newest of them.
+  checkpointCandidate(bool keepResumePoint, std::span<const uint64_t> kept = {},
+                      std::optional<CacheEvictionCandidate> after = std::nullopt) const noexcept;
+  // Oldest unpinned ordinary state in RAM, or the next after `after`.
+  // keepResumePoint withholds the resume point, the newest of them, and
+  // `kept` as for checkpoints.
   [[nodiscard]] std::optional<CacheEvictionCandidate>
-  ordinaryCandidate(bool keepResumePoint) const noexcept;
+  ordinaryCandidate(bool keepResumePoint, std::span<const uint64_t> kept = {},
+                    std::optional<CacheEvictionCandidate> after = std::nullopt) const noexcept;
   // Oldest RAM copy of a state in use, which only work of class InUse takes
-  // (ReclaimClass). The resume point is never in use.
-  [[nodiscard]] std::optional<CacheEvictionCandidate> inUseCandidate() const noexcept;
+  // (ReclaimClass), or the next after `after`. The resume point is never in
+  // use.
+  [[nodiscard]] std::optional<CacheEvictionCandidate>
+  inUseCandidate(std::optional<CacheEvictionCandidate> after = std::nullopt) const noexcept;
   // Frees the RAM copy of a candidate above (an unpinned RAM copy; anything
   // else throws std::logic_error): for nothing when a disk copy exists, by
   // writing one when the tier takes it (makeRoom frees quota on its behalf)
@@ -314,9 +323,11 @@ private:
     std::unique_ptr<StateOffload> transfer;
   };
 
-  // The order's oldest entry, unless keepResumePoint withholds it.
+  // The order's oldest entry, or the next after `after`, that
+  // keepResumePoint and `kept` do not withhold.
   [[nodiscard]] std::optional<CacheEvictionCandidate>
-  oldestOf(const RecencyOrder &order, bool keepResumePoint) const noexcept;
+  oldestOf(const RecencyOrder &order, bool keepResumePoint, std::span<const uint64_t> kept,
+           std::optional<CacheEvictionCandidate> after) const noexcept;
   [[nodiscard]] static const std::shared_ptr<const CompositeState> &
   copy(const Entry &entry) noexcept {
     return entry.ram ? entry.ram : entry.disk;

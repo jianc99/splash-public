@@ -2091,12 +2091,13 @@ void settleCommand(engine::NativeRuntime &loop) {
 
 // A control pass the policy asks nothing of takes back one chunk of the
 // expert store toward its cap while memory is ample: the host has the
-// recovery margin to spare beyond the chunk, or the idle engine returns the
-// rest to the system first, no request waits for memory, the weights are
-// neither released nor being restored, and the cool-down after reclaim last
-// gave a chunk back has passed, twice as long after a chunk it took back
-// went again. Beside a resident lane it takes only room the engine's limit
-// has free, and asks for none it lacks.
+// recovery margin to spare beyond the chunk, or the engine returns the rest
+// to the system first, no request waits for memory, the weights are neither
+// released nor being restored, and the cool-down after reclaim last gave a
+// chunk back has passed, twice as long after a chunk it took back went
+// again. Beside a resident lane, with no cache that covers what the engine's
+// limit lacks, it takes only room the limit has free, and asks for none it
+// lacks.
 void testControlPassGrowsTheExpertStoreWhenMemoryIsAmple() {
   engine::NativeLoopConfig config;
   config.engine.maxContext = 1024;
@@ -2112,7 +2113,7 @@ void testControlPassGrowsTheExpertStoreWhenMemoryIsAmple() {
   constexpr uint64_t hostReserve = 2ULL << 30;
   constexpr uint64_t limit = 40ULL << 30;
   // Half the chunk short of the recovery margin, which the empty extents
-  // the idle engine returns do not cover.
+  // the engine returns do not cover.
   std::optional<uint64_t> available = hostReserve + kHostRecoveryMarginBytes + chunk / 2;
   MemoryGovernor governor(backend, limit, hostReserve, hostReserve,
                           [&available] { return hostMemory(available); }, 0);
@@ -2138,7 +2139,8 @@ void testControlPassGrowsTheExpertStoreWhenMemoryIsAmple() {
   fixture.monotonic += 2 * engine::kResourceRetryBackoffMilliseconds;
   runUntilIdle(loop);
 
-  // Beside a resident lane only room the engine's limit has free.
+  // Beside a resident lane, with no cache that covers half a chunk, only
+  // room the engine's limit has free.
   auto running = request(2, 900);
   for (uint32_t &token : running.promptTokens)
     token += 200;
@@ -2282,18 +2284,21 @@ void testIdleControlPassExchangesCacheForTheExpertStore() {
           "the newest conversation did not resume from the state the exchange kept");
 }
 
-// The exchange waits where the store's growth does: beside a resident
-// request, which takes only the host's headroom beyond the margin, while a
-// request waits for memory, within the cool-down after a chunk went, and
-// under macOS's pressure, whose passes give cache back but take no chunk
-// back. None returns cache for the store or asks for a chunk.
+// The exchange waits where the store's growth does: while a request waits
+// for memory, within the cool-down after a chunk went, and under critical
+// pressure, whose passes give cache back but take no chunk back. None
+// returns cache for the store or asks for a chunk. It waits neither beside
+// a running lane nor under macOS's warning alone: the store's cap is a
+// reservation the cache repays from what no request needs
+// (testControlPassExchangesCacheBesideARunningLane), and an exchange that
+// returns the whole chunk first leaves the host's footprint where it was
+// (testWarningPassExchangesOnlyWhatItReturns).
 void testExpertExchangeWaitsWhereGrowthDoes() {
   engine::NativeLoopConfig config;
   config.engine.maxContext = 1024;
   LoopFixture fixture(config, kExchangePool);
   engine::NativeRuntime &loop = fixture.loop;
   Executor &executor = fixture.executor;
-  const engine::Cache &resources = fixture.cache;
   const KvPool &pool = fixture.pool;
   loop.announceReady();
   test::metalStatistics() = {};
@@ -2322,21 +2327,6 @@ void testExpertExchangeWaitsWhereGrowthDoes() {
            (pressure != MemoryPressure::Normal || pool.snapshot().extentReleases == releases);
   };
 
-  // Beside a resident lane.
-  auto running = request(20, 900);
-  for (uint32_t &token : running.promptTokens)
-    token += 2000;
-  executor.decodeFinishes = false;
-  require(loop.receive(protocol::peer::serialize(running)), "the long request failed");
-  for (uint32_t step = 0; step < 8; ++step)
-    static_cast<void>(loop.tick());
-  settleCommand(loop);
-  require(executor.requests.contains(20) && executor.requests.at(20).resident,
-          "the long request did not decode");
-  require(waits(), "the exchange took cache beside a resident lane");
-  executor.decodeFinishes = true;
-  runUntilIdle(loop);
-
   // While a request waits for memory: the host has the recovery margin it
   // waits for, beside half a chunk.
   available = hostReserve + kHostRecoveryMarginBytes + chunk / 2;
@@ -2364,11 +2354,120 @@ void testExpertExchangeWaitsWhereGrowthDoes() {
   require(!control.run(MemoryPressure::Normal) && executor.expertChunks.size() == 1,
           "the exchange did not take a chunk back after the cool-down");
 
-  // Under macOS's warning and critical pressure.
+  // Under critical pressure.
   available = between;
-  require(waits(MemoryPressure::Warning) && resources.snapshot().stateCache.entries != 0,
-          "the store took a chunk back under macOS's warning");
   require(waits(MemoryPressure::Critical), "the store took a chunk back under critical pressure");
+}
+
+// Beside a running lane a control pass exchanges cache for a chunk of the
+// expert store as an idle one does: the pass returns the cache nothing in
+// use holds to the system, keeps the replay point the lane uses and the
+// resume point, and takes the chunk; the lane decodes on to its end, and the
+// newest conversation's next turn resumes where it was.
+void testControlPassExchangesCacheBesideARunningLane() {
+  engine::NativeLoopConfig config;
+  config.engine.maxContext = 1024;
+  LoopFixture fixture(config, kExchangePool);
+  engine::NativeRuntime &loop = fixture.loop;
+  Executor &executor = fixture.executor;
+  const engine::Cache &resources = fixture.cache;
+  loop.announceReady();
+  test::metalStatistics() = {};
+  metal::MetalBackend backend("unused");
+  constexpr uint64_t hostReserve = 2ULL << 30;
+  constexpr uint64_t chunk = kExchangeChunkBytes;
+  // The host lacks the whole chunk beyond the recovery margin.
+  const std::optional<uint64_t> available =
+      hostReserve + kHostWarningMarginBytes + kHostWarningMarginBytes / 2;
+  MemoryGovernor governor(backend, 40ULL << 30, hostReserve, hostReserve,
+                          [&available] { return hostMemory(available); }, 0);
+  MemoryControl control(governor, backend, loop);
+  executor.expertAdmission = governor.growthAdmission();
+  executor.expertChunks = {chunk};
+  executor.releasedExpertChunks = {chunk};
+  for (uint64_t id = 1; id <= 6; ++id)
+    finishConversation(fixture, id);
+  auto running = request(20, 900);
+  for (uint32_t &token : running.promptTokens)
+    token += 2000;
+  executor.decodeFinishes = false;
+  require(loop.receive(protocol::peer::serialize(running)), "the long request failed");
+  for (uint32_t step = 0; step < 8; ++step)
+    static_cast<void>(loop.tick());
+  settleCommand(loop);
+  require(executor.requests.contains(20) && executor.requests.at(20).resident,
+          "the long request did not decode");
+  const auto before = resources.snapshot();
+  require(!control.run(MemoryPressure::Normal) && executor.expertChunks.size() == 2,
+          "a pass beside a running lane did not exchange cache for a chunk of the store");
+  const auto after = resources.snapshot();
+  require(after.pool.extentReleases > before.pool.extentReleases &&
+              after.stateCache.entries < before.stateCache.entries &&
+              after.stateCache.inUse == 1 && after.stateCache.inUseEvictions == 0,
+          "the exchange beside a running lane did not return unused cache alone");
+  executor.decodeFinishes = true;
+  runUntilIdle(loop);
+  require(loop.snapshot().failed == 0, "the running request failed beside the exchange");
+  const uint64_t hits = loop.snapshot().cacheHits;
+  finishConversation(fixture, 6);
+  require(loop.snapshot().cacheHits == hits + 1,
+          "the newest conversation did not resume from the state the exchange kept");
+}
+
+// macOS's warning holds back growth that adds to the host's footprint, not
+// an exchange that returns the whole chunk first. Under the warning a pass
+// takes none of the host's headroom for a chunk of the expert store,
+// however much there is: a chunk no cache covers stays out, though a pass
+// at normal pressure takes it from that headroom. A chunk the cache covers
+// comes back, the cache leaving the engine before the chunk is taken, which
+// the governor admits only for those bytes; the pass then gives back the
+// cache the warning asks for, the resume point kept.
+void testWarningPassExchangesOnlyWhatItReturns() {
+  engine::NativeLoopConfig config;
+  config.engine.maxContext = 1024;
+  LoopFixture fixture(config, kExchangePool);
+  engine::NativeRuntime &loop = fixture.loop;
+  Executor &executor = fixture.executor;
+  const engine::Cache &resources = fixture.cache;
+  const KvPool &pool = fixture.pool;
+  loop.announceReady();
+  test::metalStatistics() = {};
+  metal::MetalBackend backend("unused");
+  constexpr uint64_t hostReserve = 2ULL << 30;
+  constexpr uint64_t chunk = kExchangeChunkBytes;
+  // More than the whole pool and every cached state's buffers.
+  constexpr uint64_t large = 1ULL << 30;
+  // The host has the large chunk and more to spare.
+  const std::optional<uint64_t> available = hostReserve + (16ULL << 30);
+  MemoryGovernor governor(backend, 40ULL << 30, hostReserve, hostReserve,
+                          [&available] { return hostMemory(available); }, 0);
+  MemoryControl control(governor, backend, loop);
+  executor.expertAdmission = governor.growthAdmission();
+  executor.expertChunks = {chunk};
+  executor.releasedExpertChunks = {chunk, large};
+  for (uint64_t id = 1; id <= 6; ++id)
+    finishConversation(fixture, id);
+  const uint32_t attempts = executor.expertGrowthAttempts;
+  require(!control.run(MemoryPressure::Warning) && executor.expertChunks.size() == 1 &&
+              executor.expertGrowthAttempts == attempts,
+          "a pass under macOS's warning took the host's headroom for a chunk of the store");
+  require(!control.run(MemoryPressure::Normal) && executor.expertChunks.size() == 2,
+          "a pass at normal pressure did not take the chunk from the host's headroom");
+
+  for (uint64_t id = 7; id <= 12; ++id)
+    finishConversation(fixture, id);
+  const auto before = resources.snapshot();
+  const uint64_t buffers = executor.reclaimedIdleStateBytes;
+  require(!control.run(MemoryPressure::Warning) && executor.expertChunks.size() == 3,
+          "a pass under macOS's warning did not exchange cache for a chunk the cache covers");
+  const auto after = resources.snapshot();
+  require(before.pool.allocatedBytes - after.pool.allocatedBytes + executor.reclaimedIdleStateBytes -
+                  buffers >= chunk &&
+              after.stateCache.entries == 1 && pool.snapshot().reclaimableBytes == kExchangeExtentBytes,
+          "the warning pass did not return the chunk's cache and then the cache the warning asks for, "
+          "keeping the resume point and the runway extent");
+  require(!governor.growthAdmission()(chunk, [] {}),
+          "the governor admitted under macOS's warning a chunk the engine returned nothing for");
 }
 
 // An idle pass whose cache cannot cover what the host lacks of a chunk of the
@@ -2412,10 +2511,9 @@ void testExpertExchangeKeepsCacheThatCannotCoverTheChunk() {
           "an exchange that bought no chunk evicted cache");
 }
 
-// The chunk takes from the engine only the room its limit has free. With no
-// request in the engine the pass exchanges cache for what the limit lacks of
-// it, as for what the host lacks, and the extents the exchange releases make
-// the room. Where both lack some of the chunk, what the exchange returns adds
+// The chunk takes from the engine only the room its limit has free. The
+// pass exchanges cache for what the limit lacks of it, as for what the host
+// lacks, and the extents the exchange releases make the room. Where both lack some of the chunk, what the exchange returns adds
 // to both, so it returns the larger lack alone. Without cache that covers
 // the lack the pass neither takes cache nor asks for the chunk.
 void testExpertExchangeCoversTheEngineLimit() {
@@ -2695,6 +2793,8 @@ int main() {
     testControlPassGrowsTheExpertStoreWhenMemoryIsAmple();
     testIdleControlPassExchangesCacheForTheExpertStore();
     testExpertExchangeWaitsWhereGrowthDoes();
+    testControlPassExchangesCacheBesideARunningLane();
+    testWarningPassExchangesOnlyWhatItReturns();
     testExpertExchangeKeepsCacheThatCannotCoverTheChunk();
     testExpertExchangeCoversTheEngineLimit();
     testRefusedExchangeLeavesItsBytesToTheNextPass();

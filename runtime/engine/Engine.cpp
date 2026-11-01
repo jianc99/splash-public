@@ -2307,24 +2307,39 @@ bool Engine::growExperts(uint64_t headroomBytes) {
     throw std::logic_error("expert growth requested while a command is in flight");
   const uint64_t bytes = model_.expertGrowthBytes();
   // It takes only room the engine's limit has free, and asks for none it
-  // lacks, which would count as a denied reservation for nothing. An engine
-  // without requests makes that room by the exchange alone
-  // (reclaimForExperts), which buys the chunk or takes nothing.
+  // lacks, which would count as a denied reservation for nothing. The
+  // exchange alone makes that room (reclaimForExperts), which buys the
+  // chunk or takes nothing.
   return bytes && headroomBytes >= bytes && model_.growExperts().granted();
 }
 
 uint64_t Engine::reclaimForExperts(uint64_t bytes) {
   if (pending_)
     throw std::logic_error("cache reclaim for the expert store requested while a command is in flight");
+  // A request that holds no lane, yet to start or suspended, restores the
+  // chain its probe finds once it starts: admission's, brought up to date,
+  // or one made here where admission has made none. One that skips the cache
+  // restores none.
+  RestoredChains restored;
+  for (auto &[_, active] : requests_) {
+    if (active.lane || active.finalized || active.skipCache)
+      continue;
+    if (active.admissionProbe) {
+      cache_.refresh(*active.admissionProbe, active.exactTokens, promptIdentity(active.request));
+      restored.add(active.admissionProbe->restoredChain());
+    } else {
+      restored.add(cache_.probe(active.exactTokens, promptIdentity(active.request)).restoredChain());
+    }
+  }
   // Cache that cannot buy the chunk would go for nothing: as a lane takes a
   // cached state only when those in RAM cover what it lacks
   // (reuseCachedStateWhilePaused), nothing goes unless what leaves at once
   // covers the bytes, and then the bytes leave in this call.
-  if (!idle() || exchangeableBytes() < bytes)
+  if (exchangeableBytes(restored) < bytes)
     return 0;
   uint64_t returned = 0;
   while (returned < bytes) {
-    const CacheReclaimResult step = reclaimStepForExperts();
+    const CacheReclaimResult step = reclaimStepForExperts(restored);
     if (!step.madeProgress)
       break;
     returned += step.reclaimedBytes;
@@ -2332,17 +2347,17 @@ uint64_t Engine::reclaimForExperts(uint64_t bytes) {
   return returned;
 }
 
-uint64_t Engine::exchangeableBytes() const {
-  const CacheExchange cache = cache_.exchangeable();
+uint64_t Engine::exchangeableBytes(const RestoredChains &restored) const {
+  const CacheExchange cache = cache_.exchangeable(restored);
   return model_.idleBufferBytes(cache.states) + cache.extentBytes;
 }
 
-CacheReclaimResult Engine::reclaimStepForExperts() {
+CacheReclaimResult Engine::reclaimStepForExperts(const RestoredChains &restored) {
   if (const uint64_t buffer = model_.reclaimIdleState(true, model::IdleMemory::Buffers)) {
     signalResourceProgress();
     return {.madeProgress = true, .reclaimedBytes = buffer};
   }
-  return cache_.reclaimForExchange();
+  return cache_.reclaimForExchange(restored);
 }
 
 bool Engine::reclaimIdleState(bool keepLane, model::IdleMemory scope) noexcept {

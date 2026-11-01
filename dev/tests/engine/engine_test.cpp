@@ -12642,10 +12642,10 @@ void testImpossibleSpeculativeCountsFailOnlyTheirOwnLane() {
 
 // A conversation that finished and one that decodes: an ordinary replay
 // point and one in use, beside the store's chunks above its floor; the KV
-// in extents of `extentPages` pages.
+// in extents of `extentPages` pages, of `pages` pages in all.
 struct StoreFixture {
-  explicit StoreFixture(uint32_t lanes = 2, uint32_t extentPages = 4)
-      : storage(16, 4096, extentPages), executor(lanes) {
+  explicit StoreFixture(uint32_t lanes = 2, uint32_t extentPages = 4, uint32_t pages = 16)
+      : storage(pages, 4096, extentPages), executor(lanes) {
     guardReleases(storage, engine);
     engine.submit(request(1, std::vector<uint32_t>(65, 1)));
     tickUntil(engine, now, [&] { return idle(engine); }, "the first conversation did not finish");
@@ -12858,15 +12858,17 @@ void testExpertGrowthTakesOnlyFreeRoom() {
 }
 
 // The cache's side of the control pass's exchange for a chunk of the expert
-// store takes nothing beside a request, resident or queued before its first
-// tick. With none it takes cache only when all it may take covers the bytes
-// asked for, and then returns memory to the system until what it returned
-// covers them: idle buffers beyond one lane's, then the cache nothing in use
-// holds, releasing the extents it empties, but never the resume point, which
-// the newest conversation's next turn resumes from, nor the runway extent.
-// It reports only what left the engine: the extents released and the
-// buffers the model released. What it may take is exactly what it returns:
-// a byte more takes nothing.
+// store takes only cache nothing in use holds and no request would restore:
+// beside a resident lane with only the resume point cached beside its replay
+// point, nothing. It takes cache only when all it may take covers the bytes
+// asked for, and then
+// returns memory to the system until what it returned covers them: idle
+// buffers beyond one lane's, then the cache nothing in use holds, releasing
+// the extents it empties, but never the resume point, which the newest
+// conversation's next turn resumes from, nor the runway extent. It reports
+// only what left the engine: the extents released and the buffers the model
+// released. What it may take is exactly what it returns: a byte more takes
+// nothing.
 void testExpertExchangeReturnsCacheToTheSystem() {
   StoreFixture fixture(2, 2);
   Executor &executor = fixture.executor;
@@ -12881,13 +12883,10 @@ void testExpertExchangeReturnsCacheToTheSystem() {
     return allocated - pool.snapshot().allocatedBytes + executor.reclaimedIdleStateBytes - buffers;
   };
   require(engine.reclaimForExperts(1) == 0 && left() == 0 && entries() == 2,
-          "the exchange took memory beside a resident lane");
+          "the exchange took the resume point, or the replay point a resident lane uses");
   fixture.finish();
   const std::vector<uint32_t> newest(65, 3);
   engine.submit(request(3, newest));
-  allocated = pool.snapshot().allocatedBytes;
-  require(engine.reclaimForExperts(1) == 0 && left() == 0 && entries() == 2,
-          "the exchange took memory beside a queued request");
   tickUntil(engine, fixture.now, [&] { return idle(engine); }, "the queued request did not finish");
   require(entries() == 3, "the fixture did not keep three replay points");
 
@@ -12919,6 +12918,187 @@ void testExpertExchangeReturnsCacheToTheSystem() {
   tickUntil(engine, fixture.now, [&] { return idle(engine); }, "the follow-up did not finish");
   require(engine.snapshot().cacheHits == hits + 1,
           "the newest conversation did not resume from the state the exchange kept");
+}
+
+// Beside a running lane the exchange takes the cache nothing in use holds,
+// as with no request in the engine: the store's cap is a reservation the
+// cache repays from what no request needs. Of three cached conversations
+// the two older leave, while the replay point the lane uses and the resume
+// point, the newest conversation's, stay; the lane decodes on to its end,
+// and the newest conversation's next turn resumes where it was.
+void testExpertExchangeTakesOnlyUnusedCacheBesideARunningLane() {
+  StoreFixture fixture(2, 2, 32);
+  Executor &executor = fixture.executor;
+  engine::Engine &engine = fixture.engine;
+  const KvPool &pool = fixture.pool;
+  const auto states = [&] { return fixture.resources.snapshot().stateCache; };
+  // Two more conversations finish beside the decoding lane.
+  for (const uint32_t id : {3u, 4u}) {
+    engine.submit(request(id, std::vector<uint32_t>(65, id)));
+    tickUntil(engine, fixture.now, [&] { return fixture.events.usage.contains(id); },
+              "a conversation beside the decoding lane did not finish");
+  }
+  require(states().entries == 4 && states().inUse == 1,
+          "the fixture did not cache three conversations beside the lane's replay point");
+  const uint64_t allocated = pool.snapshot().allocatedBytes;
+  const uint64_t buffers = executor.reclaimedIdleStateBytes;
+  uint64_t returned = 0;
+  while (const uint64_t step = engine.reclaimForExperts(1))
+    returned += step;
+  require(returned != 0 &&
+              returned == allocated - pool.snapshot().allocatedBytes + executor.reclaimedIdleStateBytes - buffers,
+          "the exchange took no cache beside a running lane, or counted memory that stayed");
+  require(states().entries == 2 && states().inUse == 1 && states().inUseEvictions == 0,
+          "the exchange beside a running lane took more than the two older conversations");
+  fixture.finish();
+  const uint64_t hits = engine.snapshot().cacheHits;
+  engine.submit(request(5, std::vector<uint32_t>(65, 4)));
+  tickUntil(engine, fixture.now, [&] { return idle(engine); }, "the follow-up did not finish");
+  require(engine.snapshot().cacheHits == hits + 1,
+          "the newest conversation did not resume from the state the exchange kept");
+}
+
+// A request that has not started holds the chain its probe found: the
+// exchange takes neither the state it resumes from nor that state's KV. Two
+// next turns wait for a lane, each attempt to start one making the state it
+// found the newest; the newer is the resume point, the older stays for its
+// probe alone, and the exchange takes the conversation no request needs.
+// Once lanes are free both turns start from the states the exchange kept.
+void testExpertExchangeKeepsWhatQueuedRequestsRestore() {
+  StoreFixture fixture(2, 2, 32);
+  engine::Engine &engine = fixture.engine;
+  const auto states = [&] { return fixture.resources.snapshot().stateCache; };
+  // Two more conversations finish beside the decoding lane; another long
+  // decode then takes the second lane.
+  for (const uint32_t id : {3u, 4u}) {
+    engine.submit(request(id, std::vector<uint32_t>(65, id)));
+    tickUntil(engine, fixture.now, [&] { return fixture.events.usage.contains(id); },
+              "a conversation beside the decoding lane did not finish");
+  }
+  auto second = request(5, std::vector<uint32_t>(65, 5));
+  second.maxNewTokens = 1000;
+  engine.submit(std::move(second));
+  tickUntil(engine, fixture.now, [&] { return fixture.events.outputs[5].size() >= 2; },
+            "the second long decode did not start");
+  // The first and the third conversation's next turns wait for a lane.
+  engine.submit(request(6, std::vector<uint32_t>(129, 1)));
+  engine.submit(request(7, std::vector<uint32_t>(129, 3)));
+  for (uint32_t step = 0; step < 4; ++step)
+    static_cast<void>(engine.tick(fixture.now++));
+  const auto started = [&](uint64_t id) {
+    const auto start = std::ranges::find(fixture.events.startIds, id);
+    return start == fixture.events.startIds.end()
+               ? std::optional<uint32_t>()
+               : fixture.events.starts[start - fixture.events.startIds.begin()];
+  };
+  require(!started(6) && !started(7) && states().entries == 5 && states().inUse == 2,
+          "the next turns did not wait for a lane beside three cached conversations");
+  uint64_t returned = 0;
+  while (const uint64_t step = engine.reclaimForExperts(1))
+    returned += step;
+  require(returned != 0 && states().entries == 4 && states().inUseEvictions == 0,
+          "the exchange did not take the one conversation no request needs, or took one a next "
+          "turn resumes from");
+  fixture.finish();
+  require(started(6) == 64 && started(7) == 64,
+          "the next turns did not start from the states the exchange kept for them");
+}
+
+// A request admission leaves unprobed keeps the chain it restores too: the
+// first conversation's next turn, queued behind a Foreground decode below
+// the priority that runs, the exchange probes itself, and it takes the one
+// conversation no request needs while it keeps the one that turn continues.
+// Once the lanes are free the turn starts from the state the exchange kept.
+void testExpertExchangeKeepsWhatAnUnprobedRequestRestores() {
+  StoreFixture fixture(2, 2, 32);
+  engine::Engine &engine = fixture.engine;
+  const auto states = [&] { return fixture.resources.snapshot().stateCache; };
+  for (const uint32_t id : {3u, 4u}) {
+    engine.submit(request(id, std::vector<uint32_t>(65, id)));
+    tickUntil(engine, fixture.now, [&] { return fixture.events.usage.contains(id); },
+              "a conversation beside the decoding lane did not finish");
+  }
+  auto foreground = request(5, std::vector<uint32_t>(65, 5));
+  foreground.priority = RequestPriority::Foreground;
+  foreground.maxNewTokens = 1000;
+  engine.submit(std::move(foreground));
+  tickUntil(engine, fixture.now, [&] { return fixture.events.outputs[5].size() >= 2; },
+            "the Foreground decode did not start");
+  engine.submit(request(6, std::vector<uint32_t>(129, 1)));
+  for (uint32_t step = 0; step < 4; ++step)
+    static_cast<void>(engine.tick(fixture.now++));
+  const auto started = [&](uint64_t id) {
+    const auto start = std::ranges::find(fixture.events.startIds, id);
+    return start == fixture.events.startIds.end()
+               ? std::optional<uint32_t>()
+               : fixture.events.starts[start - fixture.events.startIds.begin()];
+  };
+  require(!started(6) && states().entries == 5 && states().inUse == 2,
+          "the next turn did not wait behind the Foreground decode beside three cached conversations");
+  uint64_t returned = 0;
+  while (const uint64_t step = engine.reclaimForExperts(1))
+    returned += step;
+  require(returned != 0 && states().entries == 4 && states().inUseEvictions == 0,
+          "the exchange took nothing beside a request admission left unprobed, or took the "
+          "conversation it continues");
+  fixture.finish();
+  require(started(6) == 64, "the next turn did not start from the state the exchange kept for it");
+}
+
+// A request that skips the cache restores no chain once it starts: while it
+// waits, its prefix restore having failed alone and a long decode holding
+// the lane, the exchange takes the cache beside it that no other request
+// restores.
+void testExpertExchangeBesideARequestThatSkipsTheCache() {
+  test::TestKvStorage storage(128, 4096, 4);
+  KvPool pool(storage, 0);
+  test::TestKvTier tier;
+  engine::Cache cache(pool, &tier, nullptr);
+  Executor executor(1);
+  executor.decodeFinishes = false;
+  Events events;
+  engine::Engine engine(test::engineConfig({.maxContext = 102400}), cache, executor, events);
+  guardReleases(storage, engine);
+  // The request's prefix, its state and KV on the SSD alone.
+  const std::vector<uint32_t> prompt(65, 17);
+  cache.beginRequest(999);
+  require(cache.ensureTokens(999, 64).granted(), "fixture KV failed");
+  demoteState(cache, test::publishBlocks(cache, 999, prompt, 64));
+  cache.endRequest(999);
+  for (uint32_t written = 1; written <= 2; ++written) {
+    require(cache.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::InUse).madeProgress,
+            "KV block was not written");
+    tier.complete();
+    require(cache.pollTransfers(), "written block did not land");
+  }
+  require(cache.reclaimOne(CacheReclaimMode::ReleaseExtents, ReclaimClass::InUse).madeProgress &&
+              storage.allocatedPages() == 0,
+          "the prefix did not move to disk whole");
+  storage.growthBlocked = true;
+  engine.submit(request(1, prompt));
+  static_cast<void>(engine.tick(1));
+  require(events.starts.empty() && engine.resourceWaitSnapshot(1).memory == 1,
+          "the restore that cannot fit alone did not wait");
+  // A cached chain no request restores, of two extents beside the runway,
+  // and a long decode that takes the lane the request waits for.
+  storage.growthBlocked = false;
+  cache.beginRequest(998);
+  require(cache.ensureTokens(998, 256).granted(), "fixture KV failed");
+  static_cast<void>(test::publishBlocks(cache, 998, std::vector<uint32_t>(257, 18), 256));
+  cache.endRequest(998);
+  auto decoding = request(2, std::vector<uint32_t>(9, 2));
+  decoding.priority = RequestPriority::Foreground;
+  decoding.maxNewTokens = 1000;
+  engine.submit(std::move(decoding));
+  double now = 200;
+  tickUntil(engine, now, [&] { return !engine.commandInFlight() && events.outputs[2].size() >= 2; },
+            "the decode did not take the lane");
+  require(events.startIds == std::vector<uint64_t>{2}, "the request that skips the cache started");
+  require(engine.reclaimForExperts(1) != 0,
+          "the exchange took nothing beside a request that skips the cache");
+  executor.decodeFinishes = true;
+  tickUntil(engine, now, [&] { return idle(engine); }, "engine did not reach idle");
+  require(events.failedCount == 0 && events.completedCount == 2, "a request failed");
 }
 
 // With a tier that takes writes, the exchange starts no copy to the SSD
@@ -12991,8 +13171,9 @@ void testExpertExchangeTakesOnlyWhatLeavesAtOnce() {
 
 // The exchange passes over what needs a copy to the SSD cache before it
 // leaves, starting none, and takes newer cache that leaves at once: an older
-// state that needs a write stays, and the newer states of its class with it;
-// an older page whose state is on the SSD stays until a copy of it is.
+// state that needs a write stays with its page, and a newer one whose state
+// and page have copies leaves; an older page whose state is on the SSD
+// stays until a copy of it is.
 void testExpertExchangePassesOverWhatNeedsACopy() {
   constexpr uint64_t pageBytes = 4096;
   test::TestKvStorage storage(8, pageBytes, 1);
@@ -13039,21 +13220,22 @@ void testExpertExchangePassesOverWhatNeedsACopy() {
   // Three in RAM: the oldest state needs a write, the next has copies of its
   // state and page, and the newest is the resume point.
   const uint64_t unwritten = publish(3).first;
-  const uint64_t blocked = publish(4).first;
-  require(cache.persist(blocked) == PersistStatus::Started, "the fixture's copies did not start");
+  const uint64_t newer = publish(4).first;
+  require(cache.persist(newer) == PersistStatus::Started, "the fixture's copies did not start");
   land();
   publish(5);
   // A lookup makes the first conversation's page the newest.
   require(cache.lookup(copiedPrompt, {}).kvBoundary == tokens, "the fixture's lookup missed");
   const size_t copies = tier.writes.size() + cache.snapshot().stateCache.offloads;
   const auto ramStates = [&] { return cache.snapshot().stateCache.bytes / test::State().bytes(); };
-  // The buffers of the two states that left RAM, and the first page.
-  const uint64_t leaving = 2 * test::State().bytes() + pageBytes;
+  // The buffers of the two states that left RAM and of the newer copied one,
+  // the first page and the newer one's.
+  const uint64_t leaving = 3 * test::State().bytes() + 2 * pageBytes;
   require(engine.reclaimForExperts(leaving + 1) == 0 && ramStates() == 3 &&
               pool.snapshot().extentReleases == 0,
           "the exchange took cache that could not cover the bytes asked for at once");
-  require(engine.reclaimForExperts(leaving) == leaving && pool.snapshot().extentReleases == 1 &&
-              ramStates() == 3 && cache.stateResident(unwritten) && cache.stateResident(blocked) &&
+  require(engine.reclaimForExperts(leaving) == leaving && pool.snapshot().extentReleases == 2 &&
+              ramStates() == 2 && cache.stateResident(unwritten) && !cache.stateResident(newer) &&
               cache.copiedBlocks(uncopied) == 0 &&
               tier.writes.size() + cache.snapshot().stateCache.offloads == copies,
           "the exchange did not take the cache that leaves at once alone, or started a copy");
@@ -13264,6 +13446,10 @@ int main() {
     testEngineLimitTakesTheExpertStoreBeforeWhatIsInUse();
     testExpertGrowthTakesOnlyFreeRoom();
     testExpertExchangeReturnsCacheToTheSystem();
+    testExpertExchangeTakesOnlyUnusedCacheBesideARunningLane();
+    testExpertExchangeKeepsWhatQueuedRequestsRestore();
+    testExpertExchangeKeepsWhatAnUnprobedRequestRestores();
+    testExpertExchangeBesideARequestThatSkipsTheCache();
     testExpertExchangeTakesOnlyWhatLeavesAtOnce();
     testExpertExchangePassesOverWhatNeedsACopy();
     testReplayPointCopiesCacheBeforeTheExpertStore();

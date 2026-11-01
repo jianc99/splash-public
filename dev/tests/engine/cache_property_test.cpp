@@ -69,8 +69,9 @@ private:
 
 // One randomized run of the tiered block store. Requests of both modes on
 // prompts that share prefixes publish, spill, restore, convert, read
-// unreadable copies and end; RAM reclaim and the disk quota take what they
-// may, a persistent tier keeps restore points, the pool's growth and the
+// unreadable copies and end; RAM reclaim, the exchange for the expert store
+// beside the requests, and the disk quota take what they may, a persistent
+// tier keeps restore points, the pool's growth and the
 // tier's writes of every class fail now and then, and the tier's transfers
 // land at random. The cache checks every invariant spilling relies on after
 // each step (Cache::checkInvariants), and active KV never stays past its
@@ -99,7 +100,7 @@ public:
   }
 
   void step() {
-    switch (pick(0, 13)) {
+    switch (pick(0, 14)) {
     case 0: start(); break;
     case 1: case 2: grow(); break;
     case 3: static_cast<void>(cache_.writeThrough()); break;
@@ -115,6 +116,7 @@ public:
     case 11: command(); break;
     case 12: persist(); break;
     case 13: failWrites(); break;
+    case 14: checkExchange(false); break;
     }
     cache_.checkInvariants();
   }
@@ -158,20 +160,45 @@ public:
   // reclaimForExchange releases at once, repeated until it makes no
   // progress, with no copy to the SSD cache started: no fewer extents and
   // RAM copies of states. With `exact`, once nothing is in flight, exactly
-  // those, unless the KV tier takes writes and the state file none.
+  // those, unless the KV tier takes writes and the state file none. The
+  // chains that probes of base prompts would restore, as requests that have
+  // not started hold them, stay: each still matches whole, and the state it
+  // resumes from keeps its RAM copy.
   void checkExchange(bool exact) {
-    const CacheExchange predicted = cache_.exchangeable();
+    struct Waiting final {
+      Request request;
+      CacheProbe probe;
+      std::vector<uint64_t> chain;
+      bool stateResident = false;
+    };
+    std::vector<Waiting> waiting;
+    RestoredChains restored;
+    for (uint32_t count = pick(0, 2); count; --count) {
+      const Request request{pick(0, static_cast<uint32_t>(bases_.size()) - 1), pick(1, kMaximumPages - 2)};
+      CacheProbe probe = cache_.probe(prompt(request), {});
+      const std::span<const uint64_t> chain = probe.restoredChain();
+      restored.add(chain);
+      waiting.push_back({request, probe, {chain.begin(), chain.end()},
+                         !chain.empty() && cache_.stateResident(chain.back())});
+    }
+    const CacheExchange predicted = cache_.exchangeable(restored);
     const uint64_t allocated = pool_.allocatedBytes();
     const uint64_t resident = cache_.snapshot().stateCache.bytes;
     const size_t writes = tier_.writes.size();
     const uint64_t offloads = cache_.snapshot().stateCache.offloads;
-    for (uint32_t steps = 0; cache_.reclaimForExchange().madeProgress; ++steps)
+    for (uint32_t steps = 0; cache_.reclaimForExchange(restored).madeProgress; ++steps)
       require(steps < 100'000, "the exchange's reclaim did not end");
     cache_.checkInvariants();
     require(tier_.writes.size() == writes && cache_.snapshot().stateCache.offloads == offloads,
             "the exchange's reclaim started a copy to the SSD cache");
-    const CacheExchange left = cache_.exchangeable();
+    const CacheExchange left = cache_.exchangeable(restored);
     require(!left.extentBytes && !left.states, "the exchange's reclaim left cache it counts on");
+    for (Waiting &each : waiting) {
+      cache_.refresh(each.probe, prompt(each.request), {});
+      require(std::ranges::equal(each.probe.restoredChain(), each.chain) &&
+                  (!each.stateResident || cache_.stateResident(each.chain.back())),
+              "the exchange took a chain a request that has not started would restore");
+    }
     const uint64_t released = allocated - pool_.allocatedBytes();
     const uint64_t freed = (resident - cache_.snapshot().stateCache.bytes) / 100;
     const std::string counts = "counted " + std::to_string(predicted.extentBytes) + " bytes and " +

@@ -228,7 +228,8 @@ public:
   // (kHostRecoveryMarginBytes) beyond the bytes, so that what comes back
   // never brings the host near the warning margin. Only the bytes beyond
   // the growth credit (setGrowthCredit) count against the host's headroom,
-  // and with none beyond it no margin holds the growth back; the limit
+  // and with none beyond it neither a margin nor macOS's warning holds the
+  // growth back, which leaves the host's footprint where it was; the limit
   // counts them all. Its refusal does not mark the host constrained: it
   // asks no reclaim.
   [[nodiscard]] metal::AllocationAdmission growthAdmission() noexcept;
@@ -243,12 +244,12 @@ public:
   bool setServing(bool serving) noexcept;
   // Sets the bytes the engine has just returned to the system for the growth
   // that follows, until it is set again, and returns the credit it replaced,
-  // which a scope that sets it restores. The control pass sets it while an
-  // engine without requests exchanges its cache for a chunk of the expert
-  // store (MemoryControl): those bytes are the host's already, so
-  // growthAdmission counts only the chunk's bytes beyond them against the
-  // host's headroom, whose sample may not show them yet. The control pass
-  // checks the rest against the sample it took before the exchange.
+  // which a scope that sets it restores. The control pass sets it while the
+  // engine exchanges its cache for a chunk of the expert store
+  // (MemoryControl): those bytes are the host's already, so growthAdmission
+  // counts only the chunk's bytes beyond them against the host's headroom,
+  // whose sample may not show them yet. The control pass checks the rest
+  // against the sample it took before the exchange.
   uint64_t setGrowthCredit(uint64_t bytes) noexcept;
   // Whether a request cannot proceed for want of memory, as each control pass
   // finds: only then does growth wait for the recovery margin once the host
