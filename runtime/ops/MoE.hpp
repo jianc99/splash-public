@@ -335,8 +335,9 @@ enum class MoeExpertTile : uint8_t { M8 = 8, M32 = 32 };
 // Register in both phases but for experts mostly in a format they stage. In
 // decode, as Apple9's dense GGUF projections do (LinearGguf.cpp): its matrix
 // operations share the FP32 pipe, where the register tile beats staging. In
-// prefill it keeps the decode numerics at a cost: the staged 32-row tiles run
-// long chunks faster.
+// prefill as last measured, on the 35B's real routes on the 40-core M3 Max
+// (ms per layer): against the staged 32-row tiles, faster at 512 rows (3.52
+// vs 3.72) and slower at 2048 (12.6-13.1 vs 11.0-11.7).
 enum class MoeGgufTile : uint8_t { Staged, Register };
 
 // Apple9 stages experts mostly in a format apple9StagesFormat names: one
