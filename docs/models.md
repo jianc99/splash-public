@@ -36,9 +36,10 @@ another size of an architecture is one more value there, built by the
 constructor from a `QwenHybridLayout` its layout type gains with its second
 family (as `Qwen3_6MoeLayout`'s builds `kQwen3_5_122BLayout`), its draft in
 `families.FAMILIES`, and, for a GDN or attention shape no family had, its kernel
-instances and a row of the compiled shapes in `ops/GDN.cpp` or
-`ops/PagedAttention.cpp`. The kernel tests take every family's shapes from that
-list (`dev/tests/engine/TestFamilies.hpp`). A Qwen config holds its text model
+instances (of bf16 norms only where a family of it loads safetensors) and a row
+of the compiled shapes in `ops/GDN.cpp` or `ops/PagedAttention.cpp`. The kernel
+tests take every family's shapes from that list
+(`dev/tests/engine/TestFamilies.hpp`). A Qwen config holds its text model
 under `text_config`; Flint's is flat, its keys at the top level, which the check
 reads only for a model type whose configs are flat (a layout type's
 `flatConfig`). Flint loads from a GGUF only, and its configuration is held to

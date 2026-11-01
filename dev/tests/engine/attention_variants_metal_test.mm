@@ -4,6 +4,7 @@
 #include "NormReference.hpp"
 #include "TestBuffers.hpp"
 #include "TestChecks.hpp"
+#include "TestFamilies.hpp"
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
 #include "metal/abi/KvExtent.h"
@@ -42,6 +43,8 @@ using test::require;
 using test::ulpBf16;
 
 constexpr uint32_t kQueryHeads = 32, kKvHeads = 4, kGroup = kQueryHeads / kKvHeads, kHeadDimension = 128;
+// The geometry among the families' (TestFamilies.hpp): Flint's.
+constexpr test::AttentionGeometry kGeometry{kQueryHeads, kKvHeads, kHeadDimension, false};
 constexpr uint32_t kWindow = 512, kRotaryPairs = kHeadDimension / 2;
 constexpr uint32_t kPageTokens = kv::kPageTokens;
 // The attention layer under test is the second of a pool's two, so its region
@@ -615,8 +618,9 @@ void checkPlans(metal::MetalBackend &backend) {
 // 32 query heads, then 4 K and 4 V heads, of 128. Rotated, each pair
 // (i, i + 64) of the normalized head rotates by its row's table entry, NeoX's
 // half split of the whole head; unrotated (NoPE) the head is its norm, and no
-// table is bound. Against fp64 with norm weights in bf16 or F32, as
-// paged_attention_plan_test's check of the gated geometries.
+// table is bound. Against fp64 with norm weights of each type the geometry's
+// families store (test::familyNorms), as paged_attention_plan_test's check of
+// the gated geometries.
 void checkProjection(metal::MetalBackend &backend, bool rotated, bool float32, bool verify) {
   const ops::AttentionVariant variant{.rotated = rotated, .windowTokens = 0};
   const kv::Layout layout = layoutOf(kv::Format::Int8);
@@ -805,7 +809,7 @@ int main(int argc, char **argv) {
     checkPlans(backend);
     checkRopeTables(backend);
     for (const bool rotated : {true, false})
-      for (const bool float32 : {false, true})
+      for (const bool float32 : test::familyNorms(kGeometry))
         for (const bool verify : {false, true}) checkProjection(backend, rotated, float32, verify);
     checkGather(backend);
     for (const kv::Format format : {kv::Format::Int8, kv::Format::BFloat16}) {
