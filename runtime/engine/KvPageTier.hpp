@@ -28,8 +28,8 @@ namespace splash::engine {
 // in its slot as kv::SlotFormat says, so the tier holds no memory of its own
 // beyond what reads land in. The file's IO worker writes a page straight from
 // its extent (SlotFormat::transferSpans), a bounded number at once: reclaim
-// may use all of them, persistent copies a quarter and write-through half, so
-// that one kind never starves another and reclaim always keeps a quarter. A
+// may use all of them, copies ahead of need a quarter and write-through half,
+// so that one kind never starves another and reclaim always keeps a quarter. A
 // page's slot holds what the page holds as it is written: a Full page whole,
 // a Slim page its first regions and its index (kv::SlotFormat::payloadBytes).
 // Reads go to the SSD readers beside the worker (model::readKvCopy): a

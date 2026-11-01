@@ -199,7 +199,7 @@ bool Engine::tick(double now) {
       static_cast<void>(cache_.writeThrough());
   }
   progressed = pollRestores(now) || progressed;
-  progressed = writeBehind_.run(now) || progressed;
+  progressed = writeBehind_.run(now, memoryAwaited()) || progressed;
   // The earliest submitted and the earliest admitted of the lanes with work
   // in flight.
   uint64_t earliestWorking = std::numeric_limits<uint64_t>::max();
@@ -366,6 +366,22 @@ bool Engine::admissionTries(const Request &active, std::optional<RequestPriority
          (scheduler_.suspended(active.request.id) && !draining);
 }
 
+bool Engine::belowRunnable(const Request &active) const {
+  const std::optional<RequestPriority> runnable = scheduler_.highestRunnablePriority();
+  return runnable && active.request.priority > *runnable;
+}
+
+bool Engine::memoryAwaited() const {
+  const std::optional<RequestPriority> tier = suspendedTier();
+  const bool draining = drainingForRecovery();
+  return std::ranges::any_of(requests_, [&](const auto &entry) {
+    const Request &active = entry.second;
+    return !active.finalized && active.resourceWait.pending &&
+           (active.lane ? !belowRunnable(active)
+                        : admissionTries(active, tier, draining) && !holdsBack(active.heldBehind));
+  });
+}
+
 bool Engine::holdsBack(std::optional<uint64_t> refused) const {
   if (!refused)
     return false;
@@ -408,8 +424,10 @@ std::optional<double> Engine::nextWakeupMilliseconds() const {
     if (!result || wakeup < *result)
       result = wakeup;
   }
-  if (const std::optional<double> persist = writeBehind_.nextWakeup();
-      persist && (!result || *persist < *result))
+  // Copies ahead wait for the end of a wait for memory, which a step of the
+  // engine shows.
+  const std::optional<double> persist = memoryAwaited() ? std::nullopt : writeBehind_.nextWakeup();
+  if (persist && (!result || *persist < *result))
     result = persist;
   return result;
 }
@@ -502,13 +520,9 @@ bool Engine::admitQueued(double now) {
     request(id).heldBehind = refused;
   };
   // A request below the highest priority that prefills or decodes cannot
-  // run before that priority is done. It waits for scheduling, unprobed, and
-  // takes no lane, neither a free one nor a lower resident's: the lanes of
-  // that priority free theirs as they finish.
-  const std::optional<RequestPriority> runnable = scheduler_.highestRunnablePriority();
-  const auto belowRunnable = [&](const Request &active) {
-    return runnable && active.request.priority > *runnable;
-  };
+  // run before that priority is done (belowRunnable). It waits for
+  // scheduling, unprobed, and takes no lane, neither a free one nor a lower
+  // resident's: the lanes of that priority free theirs as they finish.
   // The tokens a request's start would reuse, from its probe brought up to
   // date: none for a request that ignores the cache, which is ranked by its
   // whole prompt.
@@ -1242,17 +1256,23 @@ void Engine::deferResourceRetry(Request &active, double now,
   // those admitted before the first refusal of memory.
   if (!wait.admittedBefore && reason != StateFailure::ConcurrencyLimit)
     wait.admittedBefore = admissions_;
-  const bool progressed = wait.pending && wait.epoch != resourceEpoch_;
+  noteRefusal(active, now, denial);
   wait.reason = reason;
+  if (reason == StateFailure::ConcurrencyLimit)
+    wait.deadlineMilliseconds = 0.0;
+  else if (wait.deadlineMilliseconds <= 0.0)
+    wait.deadlineMilliseconds = now + config_.resourceWaitTimeoutMilliseconds;
+  wait.retryMilliseconds = now + kResourceRetryBackoffMilliseconds;
+}
+
+void Engine::noteRefusal(Request &active, double now, const Denial &denial) noexcept {
+  auto &wait = active.resourceWait;
+  if (wait.pending && wait.epoch != resourceEpoch_ && wait.deadlineMilliseconds > 0.0)
+    wait.deadlineMilliseconds = now + config_.resourceWaitTimeoutMilliseconds;
   wait.allocationFailure = denial.allocationFailure;
   wait.pending = denial.pending;
   wait.diskQuota = denial.diskQuota;
-  if (reason == StateFailure::ConcurrencyLimit)
-    wait.deadlineMilliseconds = 0.0;
-  else if (progressed || wait.deadlineMilliseconds <= 0.0)
-    wait.deadlineMilliseconds = now + config_.resourceWaitTimeoutMilliseconds;
   wait.epoch = resourceEpoch_;
-  wait.retryMilliseconds = now + kResourceRetryBackoffMilliseconds;
 }
 
 void Engine::deferWait(Request &active) noexcept {
@@ -1715,9 +1735,12 @@ Engine::Prepared Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &i
     }
     admitted = std::move(kept);
   }
-  // A lane that runs is waiting for nothing.
+  // A lane that runs is waiting for nothing; one refused waits for what
+  // refused it, beside the lanes that run or alone.
   for (const BatchItem &scheduled : admitted)
     request(scheduled.requestId).resourceWait = {};
+  for (const Denied &entry : denied)
+    noteRefusal(request(entry.requestId), now, entry.denial);
   // A lane refused the model's memory for its reads of spilled KV, which no
   // transfer in flight returns, takes it from the lane that yields first, as
   // when no lane fits, if that lane holds its memory outside this command

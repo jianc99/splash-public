@@ -228,8 +228,8 @@ public:
   [[nodiscard]] virtual std::unique_ptr<StateOffload>
   offload(std::function<void()>) const { return {}; }
   // Starts writing this state to the disk tier from its own buffers, for a
-  // persistent tier's copy of a state that stays in RAM: the buffers must
-  // stay as they are until the ticket is ready. Null as for offload().
+  // copy ahead of need of a state that stays in RAM: the buffers must stay
+  // as they are until the ticket is ready. Null as for offload().
   [[nodiscard]] virtual std::unique_ptr<StateOffload>
   persist(std::function<void()>) const { return {}; }
   // On a disk copy in a persistent tier, keeps the label with its slot once

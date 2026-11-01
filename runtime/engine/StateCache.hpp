@@ -105,7 +105,7 @@ struct StateEviction final {
   bool pending = false;
 };
 
-// What one step of making a restore point durable for the next process did
+// What one step of giving a restore point its copies ahead of need did
 // (Cache::persist, StateCache::persist).
 enum class PersistStatus : uint8_t {
   // Every copy it needs is complete on disk.
@@ -214,13 +214,15 @@ public:
   [[nodiscard]] bool stateResident(uint64_t kvBlock) const noexcept;
   // A disk copy exists, written or being written.
   [[nodiscard]] bool onDisk(uint64_t kvBlock) const noexcept;
-  // In a persistent tier, writes a disk copy of a RAM copy from the RAM
-  // copy's own buffers, which stay: the next process takes the disk copy
-  // back. Until the write lands the RAM copy is no eviction candidate, and
-  // the write is the one in flight. Durable once a disk copy has landed;
-  // busy while the write budget holds the state back, and refused once its
-  // file takes no write of a copy in use either.
-  [[nodiscard]] PersistStatus persist(uint64_t kvBlock);
+  // Writes a disk copy of a RAM copy from the RAM copy's own buffers, which
+  // stay, ahead of need (Cache::persist): a reclaim then frees the RAM copy
+  // without a write, and a persistent tier's next process takes the disk
+  // copy back. Until the write lands the RAM copy is no eviction candidate, and
+  // the write is the one in flight. Only with makeRoom does the write give
+  // up disk copies for its quota. Durable once a disk copy has landed; busy
+  // while the write budget holds the state back, and refused once its file
+  // takes no write of a copy in use either, or the quota has no room for it.
+  [[nodiscard]] PersistStatus persist(uint64_t kvBlock, bool makeRoom);
   // In a persistent tier, labels every disk copy again, with its state's
   // block, class and current recency.
   void relabel() const;
@@ -297,6 +299,8 @@ public:
   void promotionSkipped() noexcept { ++promotionsSkipped_; }
   // The one state write is in flight; its RAM or quota returns when it lands.
   [[nodiscard]] bool writing() const noexcept { return pending_.has_value(); }
+  // The RAM copies reclaim() freed for a disk copy, written then or before.
+  [[nodiscard]] uint64_t reclaimedToDisk() const noexcept { return reclaimedToDisk_; }
   [[nodiscard]] bool pollOffload();
   [[nodiscard]] StateCacheSnapshot snapshot() const noexcept;
 
@@ -340,13 +344,14 @@ private:
   // keeps its lifetime; an ordinary publication upgrades a checkpoint in
   // either tier so rolling retirement cannot erase it.
   [[nodiscard]] Entry &publicationEntry(uint64_t kvBlock, bool checkpoint);
-  // Starts the write of the block's state, giving up quota through makeRoom
-  // while the tier refuses one; null while the one write in flight holds the
-  // staging buffer. makeRoom leaves states in RAM alone: reclaim holds the
-  // entry it writes. The disk copy counts for the KV from the first attempt
-  // (KvCache::countDiskState), and no longer once none starts.
-  [[nodiscard]] std::unique_ptr<StateOffload> startWrite(uint64_t kvBlock,
-                                                         const StateWriter &write);
+  // Starts the write of the block's state, giving up quota through
+  // makeRoom_ while the tier refuses one, unless told not to make room; null
+  // while the one write in flight holds the staging buffer. makeRoom_ leaves
+  // states in RAM alone: reclaim holds the entry it writes. The disk copy
+  // counts for the KV from the first attempt (KvCache::countDiskState), and
+  // no longer once none starts.
+  [[nodiscard]] std::unique_ptr<StateOffload> startWrite(uint64_t kvBlock, const StateWriter &write,
+                                                         bool makeRoom = true);
   // The disk copy this write carries, counted since startWrite, becomes the
   // entry's; the write is the one in flight, reading `source` in place when
   // given.
@@ -405,6 +410,7 @@ private:
   uint64_t checkpointEvictions_ = 0;
   uint64_t offloads_ = 0;
   uint64_t offloadFailures_ = 0;
+  uint64_t reclaimedToDisk_ = 0;
   uint64_t invalidations_ = 0;
   // Destroyed before entries_: the ticket's disk copy may still be an entry.
   std::optional<PendingOffload> pending_;

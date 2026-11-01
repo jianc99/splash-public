@@ -543,6 +543,29 @@ memory cannot keep its progress checkpoints and replays its prompt after each
 suspension. It does not raise a dense target's context limit; a block-sparse
 target keeps the KV of its long requests there ([KV on the SSD](#kv-on-the-ssd)).
 
+While memory runs short, the cache also copies each conversation's newest
+restore point at least 2048 tokens deep there ahead of need, the state its next
+turn resumes from and the KV of the prompt up to it, while its memory copy
+stays. It does so while a reclaim has taken cached KV or a state out of memory
+to the SSD within the last 5 minutes: 10 s after the point was published, once
+its request has ended, unless the conversation has gone on from it by then, so
+a step of a tool loop that goes on within that time costs no write. A point
+that falls due while memory is not short waits, and is copied once memory runs
+short if it is still its conversation's newest. When memory runs short again,
+that conversation leaves memory at once instead of waiting for its writes.
+Without memory pressure the cache writes nothing ahead, so a Mac whose memory
+never runs short spends no SSD writes on it. Nothing else is copied ahead: not
+the KV a reply adds past the point, which no state resumes from, a shorter
+prompt, which is quicker to compute again, or a progress checkpoint. These
+copies take only the room the cache has free beside its other copies and the
+room spilling requests hold for their KV: they give up no copy, a point that
+room cannot hold is not copied, and a full cache gives up the copies of what
+memory still holds first. They wait while the cache reads a prompt back, writes
+what memory needs now or writes a spilling request's KV, and while a request
+waits for that memory, and take at most a quarter of its writes in flight. The
+[persistent cache](#persistent-cache) copies every point, whether memory has
+run short or not and while its request runs too, and makes room for it.
+
 `--max-cache-disk` sizes it. The default, `auto`, holds at most a quarter of
 what its volume has beyond the space it keeps free (10 GiB, or 5% of a volume
 smaller than 200 GiB), its own files counted, and at most 32 GiB. A size such
@@ -590,15 +613,15 @@ write that finds the volume full does the same.
 most the cache writes a day on average, such as `200G`, at most a quarter of a
 day's at once. It is off by default, when every write the cache needs goes
 ahead. Once set, the budget decides which states are written: while it is
-spent, a state a later request could reuse is dropped instead of written, and
-so is a suspended request's progress checkpoint. It paces writes rather than
-capping them: the state a conversation resumes from is written all the same,
-KV pages are written only for a state, to keep the chain of one on the SSD
-reachable or to complete a persistent restore point, and pass it too, and each
-server process has a budget of its own that every start begins with a quarter
-of a day's of. All of these count against the budget, so later states pay for
-them. A quota smaller than the working set can cause repeated reads and
-writes.
+spent, a state a later request could reuse is dropped instead of written, so
+is a suspended request's progress checkpoint, and restore points wait for their
+copies. It paces writes rather than capping them: the state a conversation
+resumes from is written all the same, KV pages are written only for a state, to
+keep the chain of one on the SSD reachable or to complete a restore point's
+copies, and pass it too, and each server process has a budget of its own that
+every start begins with a quarter of a day's of. All of these count against the
+budget, so later states pay for them. A quota smaller than the working set can
+cause repeated reads and writes.
 
 Startup prints one line: where the files are, the limit and why, the write
 budget when one is set, and that `--max-cache-disk 0` turns the cache off.
@@ -608,7 +631,10 @@ holds writes back (`writes_gated`: `no`, `budget`, or `closed` once a file
 stopped taking writes), `write_budget_bytes`, the bytes the next state's
 write not in use may take now, and `writes_deferred_ms`, how long writes held
 back for SSD reads a step waited for. Without a write budget `writes_gated` is
-never `budget` and `write_budget_bytes` is 0.
+never `budget` and `write_budget_bytes` is 0. It counts the KV pages copied
+ahead (`kv_copies`), and under `write_behind` the restore points waiting for
+their copies (`waiting`), copied (`durable`), gone on from first (`unneeded`)
+and not copied for want of room or a file that takes writes (`refused`).
 
 Restarts recompute everything unless `--persistent-cache` is on (see
 [persistent cache](#persistent-cache)); otherwise the cache keeps evicted KV
@@ -651,17 +677,16 @@ root when the persistent cache is turned off goes too; one under another
 named as a namespace, 32 hex digits, counts as a cache: nothing else under the
 root is touched.
 
-Each conversation's newest restore point at least 2048 tokens deep is written
-10 s after publication, unless the conversation has gone past it; its RAM copy
-stays. With a write budget set, a point waits while the budget is spent,
-nothing of it written; once the budget admits its state, the state is written
-and then the pages of its chain. A point larger than what the cache may hold
-now, its quota or what the volume leaves it, is not written. A full quota
-keeps restore points whole: it drops copies no point needs first, then the
-oldest point. A request that computes blocks of a point's chain again
-leaves their copies to the point: they count as its copies, not as the
-request's KV. One whose KV spills writes its own over them before its pages
-spill.
+The restore points the SSD cache copies ahead ([SSD cache](#ssd-cache)) are
+what the next start takes back. The persistent cache copies every point,
+whether memory has run short or not, and while its request still runs too, so
+that a start after a crash takes it back, and makes room for it as for any
+copy: a full quota keeps restore points whole, dropping copies no point needs
+first, then the oldest point. A point larger than what the cache may hold now,
+its quota or what the volume leaves it, is not written. A request that computes
+blocks of a point's chain again leaves their copies to the point: they count as
+its copies, not as the request's KV. One whose KV spills writes its own over
+them before its pages spill.
 
 A start takes back every recorded point whose chain is whole. A clean stop
 writes the waiting points (newest first, up to 6 s, whatever the write budget)
@@ -670,7 +695,7 @@ disk, each state with the class it had last: a checkpoint a request went on to
 reuse as an ordinary state comes back as one. Every start serves its first
 minute on probation: after two starts in a row fail within it, or one whose
 engine reports its own failure, the next start begins empty. `/status` reports
-all this under `disk` (`persistent`, `kv_copies`, `taken_back`, `write_behind`).
+all this under `disk` (`persistent`, `taken_back`).
 
 ### KV on the SSD
 

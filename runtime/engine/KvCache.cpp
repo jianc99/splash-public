@@ -467,7 +467,7 @@ std::vector<uint64_t> KvCache::uncopiedBlocks() const {
 bool KvCache::residentLeaf(uint64_t blockId) const {
   const Block &entry = block(blockId);
   return entry.page != noPage && !entry.residentChildren && !entry.activeUsers &&
-         !entry.held && entry.transfer == Transfer::None && !entry.poisoned;
+         !entry.held && !entry.poisoned;
 }
 
 void KvCache::setTransfer(uint64_t blockId, Transfer transfer) {

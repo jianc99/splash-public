@@ -316,7 +316,7 @@ bool StateCache::onDisk(uint64_t kvBlock) const noexcept {
   return found != entries_.end() && found->second.disk != nullptr;
 }
 
-PersistStatus StateCache::persist(uint64_t kvBlock) {
+PersistStatus StateCache::persist(uint64_t kvBlock, bool makeRoom) {
   const auto found = entries_.find(kvBlock);
   if (found == entries_.end() || found->second.invalid)
     return PersistStatus::Unneeded;
@@ -333,7 +333,7 @@ PersistStatus StateCache::persist(uint64_t kvBlock) {
   std::unique_ptr<StateOffload> transfer =
       startWrite(kvBlock, [&source](std::function<void()> done) {
         return source->persist(std::move(done));
-      });
+      }, makeRoom);
   if (!transfer)
     return PersistStatus::Refused;
   beginWrite(kvBlock, entry, std::move(transfer), std::move(source));
@@ -413,6 +413,7 @@ StateEviction StateCache::reclaim(uint64_t kvBlock, Unwritten unwritten) {
   // A write reads its own copy, so the RAM copy is free at once.
   discardRam(entry);
   reindex(kvBlock, entry);
+  ++reclaimedToDisk_;
   return {true};
 }
 
@@ -644,7 +645,8 @@ StateCache::Entry &StateCache::publicationEntry(uint64_t kvBlock, bool checkpoin
   return entry;
 }
 
-std::unique_ptr<StateOffload> StateCache::startWrite(uint64_t kvBlock, const StateWriter &write) {
+std::unique_ptr<StateOffload> StateCache::startWrite(uint64_t kvBlock, const StateWriter &write,
+                                                     bool makeRoom) {
   if (pending_)
     return {};
   // A publication at a used block is in use before its entry exists.
@@ -653,7 +655,7 @@ std::unique_ptr<StateOffload> StateCache::startWrite(uint64_t kvBlock, const Sta
   // none of the KV copies it restores through.
   kv_.countDiskState(kvBlock, true);
   std::unique_ptr<StateOffload> transfer = write(completion_);
-  while (!transfer && makeRoom_(used))
+  while (!transfer && makeRoom && makeRoom_(used))
     transfer = write(completion_);
   if (!transfer)
     kv_.countDiskState(kvBlock, false);

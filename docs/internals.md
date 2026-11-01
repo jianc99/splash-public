@@ -1138,14 +1138,18 @@ while its target is unmet, once nothing outside what is in use is left to free
 and before anything in use; the experts a chunk held move to the chunks below it
 or are evicted, and later steps read them from the SSD again. Memory on its way
 back holds the store back: while cache nothing in use holds waits for a
-transfer, a KV demotion or a state write, the pass ends pending, and the pass
-that continues it once the transfer landed takes that cache first. macOS's
-warning alone never takes the store. The store's cap is a reservation: the
-memory a chunk gave back is a deficit the engine repays once the cache that
-took it can pay. Each control pass, before its reclaim, takes one chunk back,
-its slots empty, while no request waits for memory, the host keeps the
-1 GiB warning margin short of critical pressure, the weights are neither released
-nor being restored, and the cool-down has passed since a chunk last went:
+transfer, a KV demotion, a state write or the copy ahead of a leaf that then
+leaves through it, the pass ends pending, and the pass that continues it once
+the transfer landed takes that cache first. A copy ahead of a page a Spill
+request holds past its dense history and window frees that page as it spills,
+as a page written through does; a copy ahead of anything else, such as a page
+a Resident request holds, frees nothing as it lands and holds nothing back. macOS's warning alone never takes the store. The store's cap is a
+reservation: the memory a chunk gave back is a deficit the engine repays once
+the cache that took it can pay. Each control pass, before its reclaim, takes
+one chunk back, its slots empty, while no request waits for memory, the host
+keeps the 1 GiB warning margin short of critical pressure, the weights are
+neither released nor being restored, and the cool-down has passed since a
+chunk last went:
 30 s, doubled up to 4 minutes each time a chunk taken back goes again within
 it, which shows the requests still needed its memory, and back to 30 s once a
 chunk taken back stays for a whole cool-down (`MemoryControl`). The chunk
@@ -1178,8 +1182,8 @@ a lane's and the extents that what leaves at once would empty cover what the
 chunk lacks (`Engine::exchangeableBytes`, `Cache::exchangeable`), the
 exchange takes nothing and the chunk waits; it waits too while a transfer is
 in flight. With the SSD cache on, a cached conversation buys a chunk only
-once its state and pages have copies there, as `--persistent-cache` writes
-them. A start
+once its state and pages have copies there, as its restore point gets them
+ahead of need ([disk tier](#disk-tier)). A start
 needs only what macOS can
 hand out at all beyond a reserve of a tenth of a small Mac's memory and 2 GiB of
 a larger one, counting what compressing the anonymous pages would free at the
@@ -1578,7 +1582,7 @@ use passes), is read only by the state's admission probes
 (`CompositeState::canOffload`, `Model::canSnapshotToDisk`), never by a
 reservation, an acquire or a write, so a write the engine admitted is never
 refused for it. KV is demoted only for a chain a state on the SSD needs, and
-copied only for a persistent point whose state was written, so those writes
+copied ahead only for a restore point whose state was written, so those writes
 pass the budget: a state the budget let through keeps its chain, and what a
 chain costs comes out of later states' share. The budget therefore paces the
 writes rather than bounding them: writes of states in use and of KV pass it,
@@ -1587,17 +1591,65 @@ While the budget is spent an evicted state is dropped, and `Cache::persist`
 reports the tier busy before it writes anything of a point; once the budget
 admits the point's state, the state is written first and the pages of its
 chain after it. It refuses a point for a file that stopped taking writes, or
-one larger than the tier's limit, its quota or what the volume leaves it. The
-budget refills on the awake clock the native loop schedules its wake-ups on,
-and write-behind wakes when the budget has room again.
+one larger than the room it may take (below). The budget refills on the awake
+clock the native loop schedules its wake-ups on, and write-behind wakes when
+the budget has room again.
 
-Writes happen when RAM reclamation selects a victim. States copy through one
-staging buffer, freeing their RAM immediately. KV leaves needed by a state
-on them or below them are written straight from their extents and released
-after the write succeeds; only then is the block above such a leaf a leaf. A
-chain whose newest blocks have no copy, as a finished request's prompt past the
-chain it restored, so leaves RAM one write at a time, and an allocation refused
-meanwhile waits for each write. Unneeded
+Restore points get their copies ahead of need (`WriteBehind`,
+`Cache::persist`), so that a reclaim later frees a cached conversation at once
+rather than waiting for its writes: an ordinary state published or reused at
+least 2048 tokens deep, 10 s after its publication, unless an ordinary state on
+its only branch below supersedes it by then, its conversation having gone on.
+Its state is written from its own buffers, which stay in RAM, out of every
+eviction order until the write lands, and then the pages of its chain that have
+no copy, root first, at most a quarter of the KV writes in flight
+(`WriteClass::Persist`). Points are copied one at a time, in publication order,
+those that wait passed over.
+Nothing else is copied ahead, as each costs more to write than to lose: the KV
+past a point, which no state restores through and a reclaim drops first, a
+shorter point, which recomputes in less time than its state takes to write, and
+a checkpoint, which a reclaim takes first. A step of a point starts nothing
+while the tier serves what is needed now, a restore that waits, a reclaim's
+demotion or a Spill request's write through, and goes on when they land, which
+wakes the engine, nor while a request the engine retries next, a lane of
+the priority that runs or one admission tries next, waits for memory on its
+way back, so
+that the request, not a copy started as that memory lands, takes the state
+write next. A demotion or write through started meanwhile waits on the KV
+file's worker behind at most the copies in flight, a quarter of the tier's
+writes, and a state a reclaim writes waits for the point's, the one state write
+in flight, as for any other. A temporary tier's copies serve reclaims alone, so
+they wait for need: a point is copied only within 5 minutes
+(`WriteBehind::kNeedMilliseconds`) of a reclaim last taking cache out of RAM to
+the tier (`Cache::reclaimedToDisk`), a KV leaf or a state, written for it or
+freed through the copy it had, which shows that memory ran short. What leaves
+through a copy counts as much as what is written, so that the copies go on
+while memory stays short and reclaims find what they take copied, writing
+nothing. Without memory pressure nothing is written ahead. A point that waits
+for need keeps its turn while it stays its conversation's newest: a publication
+meanwhile drops the queued points their conversations went on from or that are
+gone (`Cache::newestPoint`), so that need, once it comes, finds no backlog of
+superseded points. There a point also waits while it is in use, as its request
+holds its chain and may go on from it, and its copies take only the room the
+quota has free beside the other copies and the commitments of Spill requests,
+giving up no copy: the redundant copies a full quota gives up first hold what
+reclaims take before such a point, and the only copies what RAM no longer
+holds, while the point may never leave RAM. A point that room cannot hold is
+refused, and once the quota is full a reclaim writes what it takes, as for any
+victim without a copy, giving up redundant copies, those made ahead among them,
+first. A persistent tier copies every point, whether memory has run short or
+not and in use too, so that a start after a crash takes it back, gives up the
+oldest point for it (below), and refuses one larger than its limit. A clean
+stop writes a persistent tier's waiting points, the newest first; a temporary
+tier's copies go with the process.
+
+Otherwise writes happen when RAM reclamation selects a victim without a copy.
+States copy through one staging buffer, freeing their RAM immediately. KV
+leaves needed by a state on them or below them are written straight from their
+extents and released after the write succeeds; only then is the block above
+such a leaf a leaf. A chain whose newest blocks have no copy yet, as a finished
+request's prompt past the chain it restored, so leaves RAM one write at a time,
+and an allocation refused meanwhile waits for each write. Unneeded
 tails are dropped without writing, before any state, together with any disk
 copies below them. Writes run on their file's IO worker. A KV page's slot
 holds what the page holds as it is written: a Slim page's is the first part of a
@@ -1615,7 +1667,7 @@ has landed. While a step waits for SSD
 reads (streamed experts, PLE rows or spilled KV), each 1 MiB of a write waits
 for them, at most 2 ms, unless a read queued behind the write on its file's
 worker would wait as long (`SlotFile::Options::deferWrites`). At most 64 KV
-writes are in flight (`KvPageTier::kWrites`): a persistent point's copies a
+writes are in flight (`KvPageTier::kWrites`): restore points' copies ahead a
 quarter of them and spilling requests' write-through half, so that neither
 starves the demotions a reclaim needs, which may take the rest. When the tier
 takes no more, leaves that need a write stay until a transfer lands, while

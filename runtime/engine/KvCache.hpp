@@ -221,7 +221,8 @@ public:
   // The resident blocks whose page a reclaim cannot free through a disk
   // copy: those without one, and those whose page a transfer moves.
   [[nodiscard]] std::vector<uint64_t> uncopiedBlocks() const;
-  // Resident, without resident children, users or holders: its page can go.
+  // Resident, without resident children, users or holders: its page can go
+  // once no transfer moves it.
   [[nodiscard]] bool residentLeaf(uint64_t blockId) const;
   // Starts a transfer of the block's page, or ends it with None; one at a
   // time.

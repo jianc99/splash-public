@@ -217,7 +217,7 @@ struct EngineSnapshot final {
   uint64_t resourceResumptions = 0;
   // All prefill rows after preemption, including an unfinished prompt suffix.
   uint64_t resourceReplayTokens = 0;
-  // A persistent tier's newest restore points (WriteBehind).
+  // The copies of the newest restore points ahead of need (WriteBehind).
   WriteBehindSnapshot writeBehind;
   SpillRequestsSnapshot spill;
 };
@@ -334,8 +334,8 @@ public:
   // The reclaim steps that gave chunks of the expert store back, which the
   // control pass's growth waits after.
   [[nodiscard]] uint64_t expertReleases() const noexcept { return expertReleases_; }
-  // At a clean stop, once tick() has stopped: makes every restore point
-  // still waiting for its delay durable, the newest first, as the writes it
+  // At a clean stop, once tick() has stopped: makes every restore point a
+  // persistent tier has waiting durable, the newest first, as the writes it
   // starts land (WriteBehind::flush). True once none is left. The requests
   // and the command in flight stay as they are, for teardown.
   [[nodiscard]] bool flushRestorePoints();
@@ -365,7 +365,8 @@ private:
     double earlierLaneWorkMilliseconds = 0.0;
     double retryMilliseconds = 0.0;
     uint64_t epoch = 0;
-    // Memory is on its way back; the limit fires only without progress.
+    // Its latest refusal waits for memory on its way back; the limit fires
+    // only without progress.
     bool pending = false;
     // It waits for the SSD cache's quota of active KV, which other requests'
     // active KV holds, rather than for memory.
@@ -896,6 +897,11 @@ private:
   void deferResourceRetry(Request &request, double nowMilliseconds,
                           const Denial &denial,
                           StateFailure reason = StateFailure::MemoryPressure) noexcept;
+  // The latest refusal of the request's memory, as a wait or beside lanes
+  // that run: what refused it, and whether memory is on its way back.
+  // Memory that came back since a refusal that waited for it is progress,
+  // which restarts the limit of a wait that has one.
+  void noteRefusal(Request &request, double nowMilliseconds, const Denial &denial) noexcept;
   // Waiting for scheduling or for a prefix does not consume the memory
   // wait limit, so the wait's record is reset. A request that holds
   // admission closed (Request::refusedResources) keeps when its wait began and
@@ -967,6 +973,16 @@ private:
   // behind (Request::heldBehind) still waits refused: it is neither
   // finalized nor started since.
   [[nodiscard]] bool holdsBack(std::optional<uint64_t> refused) const;
+  // Whether the request is below the highest priority that prefills or
+  // decodes: the scheduler plans none of its work, and admission starts it
+  // in no lane.
+  [[nodiscard]] bool belowRunnable(const Request &request) const;
+  // A request the engine retries next, a lane of a priority the scheduler
+  // plans (belowRunnable) or one without a lane that admission tries and
+  // holds behind no refusal, has its latest refusal wait for memory on its
+  // way back (ResourceWait::pending): copies ahead start nothing until it is
+  // retried (WriteBehind::run).
+  [[nodiscard]] bool memoryAwaited() const;
   std::function<void()> completionNotifier_;
   std::optional<Pending> pending_;
   // When the latest command retired, until a tick finds nothing to do.
