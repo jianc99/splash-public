@@ -777,12 +777,18 @@ what memory holds, as a dense target's is.
   32 SSD readers, and attends them there.
   The cache holds at least, for n decoding requests, n + 1 times the blocks a
   request's 8 rows select, 8,192 blocks a layer (390 MiB) for one;
-  `--sparse-kv-memory` raises its target.
+  `--sparse-kv-memory` raises its target. It shares the readers' memory
+  with the history staging below, which the plan sets aside the larger of,
+  so a target within the staging takes nothing from the expert store.
 - A prefill streams each attention layer's history from the SSD cache into
   staging, a layer's pages read whole (36 KiB each) while the previous layer
-  runs, in two buffers where the plan leaves 4 GiB beside its floors. A
-  prefill whose history is on the SSD runs alone, and with others waiting it
-  takes the fewest rows whose work covers its reads. The staging holds
+  runs. A second buffer, which lets the next layer's reads overlap this
+  layer's attention, is planned where the readers' memory holds it already,
+  or where what the streamed stores and the first 64K tokens of KV leave
+  holds it: where a store binds that is nothing, and the store keeps the
+  room; otherwise the buffer takes it from the KV kept resident beyond them.
+  A prefill whose history is on the SSD runs alone, and with others waiting
+  it takes the fewest rows whose work covers its reads. The staging holds
   nothing between prompts: a decoding request's floor of the hot block cache
   takes its place, and the next prompt that streams allocates it again.
 - The next turn finds its pages' index in memory, or reads it back, and

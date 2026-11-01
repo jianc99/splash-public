@@ -146,6 +146,13 @@ struct KvSpillPlan final {
   // pages, the readers' and the runway.
   uint32_t floorTokens = 0;
   uint64_t floorBytes = 0;
+  // What the plan sets aside for one Spill request's readers: the larger of
+  // the hot cache's target and the history staging. Not the most they hold:
+  // each further lane decoding over Index pages adds laneReadBytes to the
+  // hot cache once their floors pass its target, up to hotLimitBytes, and a
+  // prompt's staging may be held beside other lanes' floors, which KV's
+  // memory pays for as they take it.
+  [[nodiscard]] uint64_t readerBytes() const noexcept { return std::max(hotTargetBytes, stagingBytes); }
   // The longest context spilling serves: what memory holds beside the
   // streamed stores at their smallest, and what the SSD cache's room for
   // active KV holds (DiskSpace) beside every lane's state.

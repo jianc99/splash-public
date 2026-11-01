@@ -22,9 +22,6 @@ constexpr uint64_t kResidentAllowanceTokens = 65'536;
 // keeps Full. A decode selects about a tenth of its blocks in its last 64
 // pages.
 constexpr uint32_t kSpillWindowPages = 64;
-// A prefill's history stages in two buffers, so the next layer's reads
-// overlap this layer's attention, where the floors leave this much.
-constexpr uint64_t kDoubleStagingBytes = 4 * kGiB;
 
 uint64_t pagesOf(uint64_t tokens) noexcept { return (tokens + kv::kPageTokens - 1) / kv::kPageTokens; }
 
@@ -151,7 +148,8 @@ KvSpillPlan planSpill(const StreamedMemoryInputs &in, uint64_t floors) {
                                         : 0)));
   spill.floorTokens = std::min({in.requestedContextTokens ? in.requestedContextTokens : in.windowTokens,
                                 spill.memoryTokens, spill.diskTokens});
-  spill.stagingBuffers = room >= spillFloors.bytes(spill.floorTokens, 1) + kDoubleStagingBytes ? 2 : 1;
+  // One buffer until the stores are placed (planParts).
+  spill.stagingBuffers = 1;
   spill.densePages = spillFloors.geometry.densePages;
   spill.windowPages = spillFloors.geometry.windowPages;
   spill.groupPages = in.groupPages;
@@ -202,22 +200,26 @@ StreamedMemoryResult planParts(const StreamedMemoryInputs &in, const Part &exper
             "the floors of the memory plan require " + std::to_string(floors) +
                 " bytes but the Metal memory budget is " + std::to_string(in.hardBudgetBytes) + " bytes",
             floors};
-  // An explicit hot cache target takes its part above the floor first, of
-  // what the floors leave.
+  // An explicit hot cache target takes what it adds to the readers first,
+  // of what the floors leave: the floors hold the larger of the hot cache's
+  // floor and the history staging, and the readers the larger of its target
+  // and the staging.
   if (spill.enabled && in.hotCacheBytes) {
     const uint64_t target = *in.hotCacheBytes;
     if (target < spill.hotFloorBytes)
       return {std::nullopt, "--sparse-kv-memory of " + std::to_string(target / kMiB) +
                                 " MiB is less than the hot block cache's floor, " +
                                 std::to_string(spill.hotFloorBytes / kMiB) + " MiB"};
-    if (target - spill.hotFloorBytes > in.hardBudgetBytes - floors)
+    const uint64_t readers = spill.readerBytes(), added = remaining(target, readers);
+    if (added > in.hardBudgetBytes - floors)
       return {std::nullopt, "--sparse-kv-memory of " + std::to_string(target / kMiB) +
-                                " MiB is more than the hot block cache's floor, " +
-                                std::to_string(spill.hotFloorBytes / kMiB) + " MiB, and the " +
+                                " MiB is more than the readers' floor, the larger of the hot block cache's floor "
+                                "and the history staging, " +
+                                std::to_string(readers / kMiB) + " MiB, and the " +
                                 std::to_string((in.hardBudgetBytes - floors) / kMiB) + " MiB the floors leave"};
     spill.hotTargetBytes = target;
     spill.hotLimitBytes = std::max(spill.hotLimitBytes, target);
-    floors += target - spill.hotFloorBytes;
+    floors += added;
   }
 
   // Then the priorities, out of what the floors leave: the experts first,
@@ -265,6 +267,23 @@ StreamedMemoryResult planParts(const StreamedMemoryInputs &in, const Part &exper
     const int64_t kept = rest - allowance(expertsStream);
     if (kept < static_cast<int64_t>(table.all - table.charged))
       plan.tableBytes = table.charged + static_cast<uint64_t>(std::clamp<int64_t>(kept, 0, tableShare));
+  }
+  // A second buffer of staged history lets the next layer's reads overlap
+  // this layer's attention. It is planned where the readers' memory holds it
+  // already (readerBytes), or where what the stores and the KV allowance
+  // leave holds it: that is nothing where a store binds, which keeps the
+  // room, and otherwise KV kept resident beyond the allowance.
+  if (spill.enabled) {
+    const uint64_t one = spill.stagingBytes;
+    const uint64_t added = std::max(spill.hotTargetBytes, 2 * one) - spill.readerBytes();
+    const uint64_t tableAbove =
+        table.automatic ? (plan.tableBytes ? plan.tableBytes : table.all) - table.charged : 0;
+    const int64_t left = rest - allowance(expertsStream) - static_cast<int64_t>(tableAbove);
+    if (!added || left >= static_cast<int64_t>(added)) {
+      spill.stagingBuffers = 2;
+      spill.stagingBytes = 2 * one;
+      spill.floorBytes += std::max(2 * one, spill.hotFloorBytes) - std::max(one, spill.hotFloorBytes);
+    }
   }
 
   // Last, the host's budget beyond what an engine without requests holds of
@@ -767,9 +786,8 @@ evaluateEngineMemoryPlan(const DeviceCapabilities &device,
       .spilled = spill.memoryTokens,
       .disk = spill.diskTokens};
   if (spill.enabled)
-    breakdown.residentKvBytes =
-        remaining(breakdown.dynamicBudgetBytes, breakdown.laneStateBytes + spill.indexRunwayBytes +
-                                                    std::max(spill.stagingBytes, spill.hotTargetBytes));
+    breakdown.residentKvBytes = remaining(breakdown.dynamicBudgetBytes,
+                                          breakdown.laneStateBytes + spill.indexRunwayBytes + spill.readerBytes());
   if (!breakdown.kvExtentPages ||
       breakdown.dynamicBudgetBytes < breakdown.minimumDynamicBytes) {
     if (breakdown.minimumRequiredBytes > breakdown.hardBudgetBytes) {
