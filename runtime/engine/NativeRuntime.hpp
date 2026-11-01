@@ -118,9 +118,6 @@ public:
   // again, or the engine's next timed event (Engine::nextWakeupMilliseconds),
   // without a limit when it has none.
   [[nodiscard]] std::optional<double> millisecondsUntilNextWakeup() const;
-  [[nodiscard]] engine::EngineSnapshot snapshot() const {
-    return core_.snapshot();
-  }
   // The snapshot /status reports: each live request's age counted from its
   // arrival, on the runtime's clock.
   [[nodiscard]] engine::EngineSnapshot statusSnapshot() const;

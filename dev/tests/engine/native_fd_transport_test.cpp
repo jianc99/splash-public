@@ -632,9 +632,9 @@ void testFlushEndsOrStopsAtItsDeadline() {
   protocol::RequestFrame frame = requestFrame(1, 30'000'000);
   frame.promptTokens.assign(2060, 7);
   require(harness.loop.receive(protocol::peer::serialize(frame)), "the request was refused");
-  for (uint32_t step = 0; step < 16 && !harness.loop.snapshot().writeBehind.waiting; ++step)
+  for (uint32_t step = 0; step < 16 && !harness.loop.statusSnapshot().writeBehind.waiting; ++step)
     static_cast<void>(harness.loop.tick());
-  require(harness.loop.snapshot().writeBehind.waiting == 1,
+  require(harness.loop.statusSnapshot().writeBehind.waiting == 1,
           "the replay point did not wait to be written");
   const auto started = std::chrono::steady_clock::now();
   require(!harness.transport.runFlush(harness.loop, 50ms) &&

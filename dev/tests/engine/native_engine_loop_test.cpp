@@ -43,7 +43,7 @@ std::optional<HostMemory> hostMemory(std::optional<uint64_t> bytes) {
 
 // Every submitted request has ended and no command is in flight.
 bool idle(const engine::NativeRuntime &loop) {
-  const EngineSnapshot counts = loop.snapshot();
+  const EngineSnapshot counts = loop.statusSnapshot();
   return counts.submitted == counts.completed + counts.cancelled + counts.failed &&
          !loop.commandInFlight();
 }
@@ -641,7 +641,7 @@ void testDuplicateLiveRequestClosesWithoutAmbiguousError() {
             "live duplicate fixture did not start");
     require(!loop.receive(
                 protocol::peer::serialize(request(1, malformed ? 2 : 1))) &&
-                loop.connectionMustClose() && loop.snapshot().submitted == 1,
+                loop.connectionMustClose() && loop.statusSnapshot().submitted == 1,
             "duplicate live request was accepted");
     uint32_t errors = 0;
     for (const auto &message : fixture.events()) {
@@ -899,7 +899,7 @@ void testOutOfVocabularyTokensStayRequestScoped() {
     done += std::holds_alternative<protocol::DoneEvent>(message);
   }
   require(errors == invalid.size() && done == 1 && loop.engineHealthy() &&
-              loop.snapshot().submitted == 1,
+              loop.statusSnapshot().submitted == 1,
           "invalid tokens reached admission or prevented subsequent completion");
 }
 
@@ -962,7 +962,7 @@ void testImageRequestBeyondVisionStaysRequestScoped() {
       done += std::holds_alternative<protocol::DoneEvent>(message);
     }
     require(errors == 1 && done == 1 && loop.engineHealthy() &&
-                loop.snapshot().submitted == 1,
+                loop.statusSnapshot().submitted == 1,
             "image request reached admission or stopped the engine");
   }
 }
@@ -1091,7 +1091,7 @@ void testPrefillTimeCountsFromTheStart() {
   fixture.monotonic = -2.0;
   require(loop.receive(protocol::peer::serialize(request(1))), "request wire failed");
   fixture.monotonic = 0.0;
-  require(loop.tick() && loop.snapshot().submitted == 1 && loop.commandInFlight(),
+  require(loop.tick() && loop.statusSnapshot().submitted == 1 && loop.commandInFlight(),
           "the request did not start");
   fixture.monotonic = 3.0;
   runUntilIdle(loop);
@@ -1536,7 +1536,7 @@ void testControlPassHoldsGrowthForAWaitingRequest() {
   fixture.monotonic += 2 * engine::kResourceRetryBackoffMilliseconds;
   runUntilIdle(loop);
   static_cast<void>(control.run(MemoryPressure::Normal));
-  require(loop.snapshot().completed == 2 && governor.snapshot().hostGrowthAllowed,
+  require(loop.statusSnapshot().completed == 2 && governor.snapshot().hostGrowthAllowed,
           "the hold outlived the waiting request");
 }
 
@@ -1623,10 +1623,13 @@ void testIdleWeightsAreReleasedAndRestored(bool releasable) {
 
   require(loop.receive(protocol::peer::serialize(request(2))), "a second request failed");
   // It runs past the idle release, without a control pass between commands.
-  fixture.clockStep = idleRelease;
-  runUntilIdle(loop);
-  fixture.clockStep = 0;
-  require(!idlePass(0), "weights were released as soon as a long request ended");
+  // The clock moves before each tick alone: the snapshot idle() checks reads
+  // it too, for the requests' ages.
+  for (uint32_t step = 0; step < 32 && !idle(loop); ++step) {
+    fixture.monotonic += idleRelease;
+    static_cast<void>(loop.tick());
+  }
+  require(idle(loop) && !idlePass(0), "weights were released as soon as a long request ended");
   require(idlePass(idleRelease), "weights were kept past the idle release after a request");
 
   require(loop.receive(protocol::peer::serialize(request(3))) && loop.tick() &&
@@ -1757,7 +1760,7 @@ void testIdleReleaseRestoresTheSplitLast() {
   const auto imagesBack = [&](uint64_t id) {
     require(loop.receive(protocol::peer::serialize(request(id))), "a request was refused");
     for (uint32_t image = 0; image < Weights::kImages; ++image)
-      require(loop.tick() && loop.snapshot().completed == id - 1,
+      require(loop.tick() && loop.statusSnapshot().completed == id - 1,
               "a request ran before every image was written back");
     return loop.weightsSnapshot().restores == id - 1;
   };
@@ -1774,7 +1777,8 @@ void testIdleReleaseRestoresTheSplitLast() {
   require(loop.tick() && loaded && loads == 1 && loop.weightsSnapshot().restores == 1,
           "the tick after the last image did not load the split's program");
   runUntilIdle(loop);
-  require(loop.snapshot().completed == 1, "the request did not run once the program was back");
+  require(loop.statusSnapshot().completed == 1,
+          "the request did not run once the program was back");
 
   failLoad = true;
   require(idlePass() && !loaded, "the idle release kept the split's program");
@@ -1782,19 +1786,19 @@ void testIdleReleaseRestoresTheSplitLast() {
               loop.weightsSnapshot().restores == 2 && loop.engineHealthy(),
           "a program that did not load again failed the restore");
   runUntilIdle(loop);
-  require(loop.snapshot().completed == 2, "the request did not run after the split stopped");
+  require(loop.statusSnapshot().completed == 2, "the request did not run after the split stopped");
 
   require(idlePass() && released, "the stopped split kept what its program may hold");
   require(imagesBack(3) && loop.tick() && loads == 2 && loop.weightsSnapshot().restores == 3,
           "a stopped split's program was loaded again");
   runUntilIdle(loop);
-  require(loop.snapshot().completed == 3 && loop.engineHealthy(),
+  require(loop.statusSnapshot().completed == 3 && loop.engineHealthy(),
           "a request after the split stopped did not run");
   require(idlePass(), "the idle release kept the images once the split stopped");
   require(!imagesBack(4) && loads == 2 && loop.weightsSnapshot().restores == 4,
           "the images did not come back alone once the stopped split had given its program back");
   runUntilIdle(loop);
-  require(loop.snapshot().completed == 4, "a later request did not run");
+  require(loop.statusSnapshot().completed == 4, "a later request did not run");
 }
 
 // A restore takes the weights' memory under the governor's admission as
@@ -1872,7 +1876,7 @@ void testRefusedRestoreWaitsForMemory() {
   hostAvailable = kHostMemory;
   pass(MemoryPressure::Normal);
   runUntilIdle(loop);
-  require(loop.snapshot().completed == 1 && weights.restores == Weights::kImages &&
+  require(loop.statusSnapshot().completed == 1 && weights.restores == Weights::kImages &&
               programLoads == 1 && loop.weightsSnapshot().restores == 1,
           "the restore did not go on once memory came back");
 
@@ -1920,7 +1924,7 @@ void testRefusedRestoreWaitsForMemory() {
           "the next request did not wait for memory afresh");
   pass(MemoryPressure::Normal);
   runUntilIdle(loop);
-  require(loop.snapshot().completed == 2 && weights.restores == 2 * Weights::kImages + 2 &&
+  require(loop.statusSnapshot().completed == 2 && weights.restores == 2 * Weights::kImages + 2 &&
               programLoads == 2 && loop.weightsSnapshot().restores == 2,
           "the next request did not restore the weights from the first image");
 
@@ -2276,9 +2280,9 @@ void testIdleControlPassExchangesCacheForTheExpertStore() {
   const uint64_t releases = pool.snapshot().extentReleases;
   require(pass() == 3 && pool.snapshot().extentReleases == releases,
           "a store at its cap took cache");
-  const uint64_t hits = loop.snapshot().cacheHits;
+  const uint64_t hits = loop.statusSnapshot().cacheHits;
   finishConversation(fixture, 6);
-  require(loop.snapshot().cacheHits == hits + 1,
+  require(loop.statusSnapshot().cacheHits == hits + 1,
           "the newest conversation did not resume from the state the exchange kept");
 }
 
@@ -2464,9 +2468,9 @@ void testExpertExchangeCoversTheEngineLimit() {
   const auto [grown, released] = pass(kExchangeExtentBytes);
   require(grown && released != 0,
           "an idle pass did not exchange cache for the room the engine's limit lacked");
-  const uint64_t hits = loop.snapshot().cacheHits;
+  const uint64_t hits = loop.statusSnapshot().cacheHits;
   finishConversation(fixture, 6);
-  require(loop.snapshot().cacheHits == hits + 1,
+  require(loop.statusSnapshot().cacheHits == hits + 1,
           "the newest conversation did not resume from the state the exchange kept");
 
   // The host lacks one extent of the chunk beyond the recovery margin, the
@@ -2603,7 +2607,7 @@ void testShrunkRestoreGrowsBackAfterTheRequest() {
           "the store was not released");
   require(loop.receive(protocol::peer::serialize(request(1))), "the request failed");
   runUntilIdle(loop);
-  require(loop.snapshot().completed == 1 && loop.resourceWaitSnapshot().memory == 0 &&
+  require(loop.statusSnapshot().completed == 1 && loop.resourceWaitSnapshot().memory == 0 &&
               store.floors == 1 && fixture.executor.expertChunks.size() == 1,
           "a refused chunk above the floor held the restore back");
   for (size_t chunks = 2; chunks <= 3; ++chunks) {
@@ -2644,7 +2648,7 @@ void testRestoreTakesChunksOnlyFromAHostWithRoomToSpare() {
     require(!releaseAnswer(fixture, 1).restoring && store.released(), "the store was not released");
     require(fixture.loop.receive(protocol::peer::serialize(request(1))), "the request failed");
     runUntilIdle(fixture.loop);
-    require(fixture.loop.snapshot().completed == 1 && store.floors == 1 &&
+    require(fixture.loop.statusSnapshot().completed == 1 && store.floors == 1 &&
                 fixture.executor.expertChunks.size() == (ample ? 3U : 0U),
             ample ? "an ample host did not restore the store at its cap"
                   : "a host short of a chunk and the recovery margin took one back in a restore");
