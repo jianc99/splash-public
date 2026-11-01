@@ -9,7 +9,9 @@
 #include "engine/Engine.hpp"
 #include "engine/MemoryPlan.hpp"
 #include "model/ModelSizing.hpp"
+#include "model/Qwen4Exp.hpp"
 #include "model/RuntimeArenas.hpp"
+#include "model/SparseRowStore.hpp"
 #include "model/SsdReaders.hpp"
 
 #import <Foundation/Foundation.h>
@@ -156,8 +158,10 @@ RuntimeResourcesConfig moeConfig(const char *metallibPath, const std::filesystem
 // (gguf_fixtures::targetTensors) with its attention, GDN, indexer and PLE
 // heads but a hidden state of 256 values, a vocabulary of 256 tokens, eight
 // layers, every second one full attention, and four routed experts a layer,
-// and a draft of one layer that reads four of them; no vision tower.
-RuntimeResourcesConfig flashNextConfig(const char *metallibPath, const std::filesystem::path &root) {
+// a PLE table of `pleRows` rows, and a draft of one layer that reads four of
+// them; no vision tower.
+RuntimeResourcesConfig flashNextConfig(const char *metallibPath, const std::filesystem::path &root,
+                                       uint64_t pleRows = gguf_fixtures::kPleTableRows) {
   model::Qwen4ExpLayout target;
   target.layers = 8;
   target.hiddenSize = 256;
@@ -180,7 +184,7 @@ RuntimeResourcesConfig flashNextConfig(const char *metallibPath, const std::file
   // The PLE hash, its heads an equal share of the table's rows each.
   std::vector<test::gguf::Key> keys = gguf_fixtures::metadata(target);
   const std::string ple = std::string(model::Qwen4ExpLayout::ggufArchitecture) + ".ple.";
-  const uint32_t heads = target.pleHeads(), headRows = gguf_fixtures::kPleTableRows / heads;
+  const uint32_t heads = target.pleHeads(), headRows = static_cast<uint32_t>(pleRows / heads);
   std::vector<int32_t> offsets, rows(heads, int32_t(headRows));
   for (uint32_t head = 0; head < heads; ++head)
     offsets.push_back(int32_t(head * headRows));
@@ -190,7 +194,7 @@ RuntimeResourcesConfig flashNextConfig(const char *metallibPath, const std::file
   keys.push_back(test::gguf::uint32Key(ple + "eos_token_id", target.pleEosToken));
   std::filesystem::create_directories(root / "target");
   test::writeFile(root / "target" / "model.gguf",
-                  test::gguf::file(keys, gguf_fixtures::targetTensors(target, types)));
+                  test::gguf::file(keys, gguf_fixtures::targetTensors(target, types, pleRows)));
   constexpr std::array<uint32_t, 4> draftReads{1, 3, 5, 7};
   const model::DFlashDraftLayout draft =
       model::draftLayout(target.hiddenSize, target.vocabularySize, 1, 512, 1'000'000.0F, draftReads);
@@ -207,12 +211,14 @@ RuntimeResourcesConfig flashNextConfig(const char *metallibPath, const std::file
   return config;
 }
 
-// What a start sized: its context, the least memory its plan needs and its
-// arenas, its routed experts' store, whether its SSD cache started, its
-// backend's memory, its log and how many times it loaded the weights.
+// What a start sized: its context, the least memory its plan needs, its
+// arenas, the budget of states and KV, its streamed table's row cache and
+// what the host held back of the streamed stores, its routed experts' store,
+// whether its SSD cache started, its backend's memory, its log and how many
+// times it loaded the weights.
 struct StreamedStart final {
   uint32_t context = 0;
-  uint64_t minimumRequired = 0, arenaBytes = 0;
+  uint64_t minimumRequired = 0, arenaBytes = 0, dynamicBudget = 0, table = 0, heldBack = 0;
   std::optional<model::ExpertStoreStats> experts;
   bool tier = false;
   metal::MetalMemoryStats memory;
@@ -228,6 +234,9 @@ StreamedStart startStreamed(const RuntimeResourcesConfig &config) {
     started.context = resources->memoryPlan().maximumContextTokens();
     started.minimumRequired = budget.minimumRequiredBytes;
     started.arenaBytes = budget.sharedPrefillBytes + budget.sharedDecodeBytes;
+    started.dynamicBudget = budget.dynamicBudgetBytes;
+    started.table = budget.streamedTableBytes;
+    started.heldBack = budget.hostHeldBackBytes;
     started.experts = resources->streamedExpertStats();
     started.tier = resources->cache().snapshot().kvTier.capacityBytes != 0;
     started.memory = resources->backend().refreshMemoryStats();
@@ -316,7 +325,45 @@ void testAutomaticExpertMemory(RuntimeResourcesConfig config) {
   const StreamedStart reloaded = startStreamed(config);
   streams(reloaded,
           "experts that fit beside everything but the arenas did not stream through the store the plan sizes");
+  // The same start on a host whose spare memory holds nothing past the
+  // governor's reserve and margin: the store's cap is the limit's and it
+  // starts below it, the chunks past its start released and held back in
+  // the plan, so that the context and the budget of states and KV are the
+  // roomy host's.
+  const uint64_t spareReserve =
+      EngineMemoryPolicy::hostSpareReserveBytes(metal::probeDeviceCapabilities().physicalMemoryBytes);
+  RuntimeResourcesConfig bounded = config;
+  bounded.hostMemory = [spareReserve] {
+    return std::optional<HostMemory>(HostMemory{64 * kGiB, spareReserve + kHostWarningMarginBytes});
+  };
+  const StreamedStart held = startStreamed(bounded);
+  require(reloaded.experts->chunks == reloaded.experts->capChunks && !reloaded.heldBack && held.experts &&
+              held.experts->capBytes == reloaded.experts->capBytes &&
+              held.experts->chunks < held.experts->capChunks &&
+              held.experts->liveBytes < held.experts->capBytes &&
+              held.heldBack == held.experts->capBytes - held.experts->liveBytes &&
+              held.context == reloaded.context && held.dynamicBudget == reloaded.dynamicBudget &&
+              held.log.find("it starts with " + std::to_string(held.experts->chunks) + " of them") !=
+                  std::string::npos &&
+              held.log.find("keep 85% of it, one at least, but none below a layer's experts") != std::string::npos,
+          "a store the host held back did not start with its smallest store below the limit's cap, held back "
+          "in the plan beside the roomy host's context");
+  // The host's room is the Metal memory the first load holds, every expert
+  // among it, beside what an engine without requests holds once warm, the
+  // process's runtime overhead aside: the store starts above its smallest by
+  // that, to within the memory Metal holds outside the backend's buffers, and
+  // by each byte of spare memory more.
   const uint64_t firstLoad = weights.loadedBytes + weights.expertBytes;
+  const uint64_t idle = held.minimumRequired - (held.experts->capBytes - weights.expertMinimumBytes);
+  const uint64_t room = firstLoad + model::kRuntimeOverheadReserveBytes - idle;
+  const uint64_t started = held.experts->liveBytes - weights.expertMinimumBytes;
+  RuntimeResourcesConfig roomier = bounded;
+  roomier.hostMemory = [spareReserve] {
+    return std::optional<HostMemory>(HostMemory{64 * kGiB, spareReserve + kHostWarningMarginBytes + 256 * kMiB});
+  };
+  const uint64_t more = startStreamed(roomier).experts->liveBytes - held.experts->liveBytes;
+  require(started >= room && started - room < 64 * kMiB && more <= 256 * kMiB && more + 8 * kMiB > 256 * kMiB,
+          "the store did not start with the room the host's sample leaves beside the engine without requests");
   require(reloaded.memory.peakAllocatedBytes < firstLoad && reloaded.memory.devicePeakAllocatedBytes < firstLoad,
           "the backend's peaks counted the load the start discarded");
   // Short of that too: at the floor, then through the store.
@@ -1176,6 +1223,58 @@ void testRelaunchKeepsTheSpilledContext(const char *metallibPath) {
           "a relaunch served less than its first engine's context for want of SSD room");
 }
 
+// --ple-memory auto takes at most the rows of every id a 128K-token prompt
+// stages beside the row cache's working memory: on the Flash-Next fixture,
+// 128K tokens of its PLE heads' ids.
+void testTableShareHoldsAPromptsIds(const char *metallibPath) {
+  const test::TemporaryDirectory root("splash-table-share");
+  const RuntimeResourcesConfig config = flashNextConfig(metallibPath, root.path());
+  const model::StreamableWeights weights =
+      model::streamableWeights(config.modelRoot, config.model, {.streamExperts = true, .streamTable = true});
+  const auto &layout = std::get<model::Qwen4ExpLayout>(config.model.target);
+  const model::SparseRowStoreOptions rows = model::streamedTableRows(layout);
+  require(weights.tableRowBytes &&
+              weights.tableShareBytes ==
+                  model::SparseRowStore::workingBytes(weights.tableRowBytes, rows.prefetchRows, rows.stageRows) +
+                      model::SparseRowStore::cacheBytesFor(uint64_t{128 * 1024} * layout.pleHeads(),
+                                                           weights.tableRowBytes) &&
+              weights.tableShareBytes > weights.tableMinimumBytes,
+          "--ple-memory auto's share is not the rows of every id a 128K-token prompt stages");
+}
+
+// A PLE table the host holds back stays in the plan, as the expert store's
+// chunks do: Flash-Next's fixture of a table three times its row cache's
+// working memory, under a limit that streams it above its smallest, starts
+// on a host with no spare room with its smallest row cache, the rest held
+// back, so that the context and the budget of states and KV are the roomy
+// host's, to within the whole rows the row cache commits of what the limit
+// gives it.
+void testTheHeldBackTableStaysInThePlan(const char *metallibPath) {
+  const test::TemporaryDirectory root("splash-held-table");
+  RuntimeResourcesConfig config = flashNextConfig(metallibPath, root.path(), 491'520);
+  config.expertMemory = {StreamedSetting::Mode::Off, 0};
+  const model::StreamableWeights weights =
+      model::streamableWeights(config.modelRoot, config.model, {.streamTable = true});
+  const StreamedStart whole = startStreamed(config);
+  require(weights.tableMinimumBytes < weights.tableBytes && !whole.table,
+          "the fixture's table does not stream above its smallest, or loads whole on a roomy limit");
+  config.maximumMemoryBytes = whole.minimumRequired - (weights.tableBytes - weights.tableMinimumBytes) / 2;
+  const StreamedStart roomy = startStreamed(config);
+  RuntimeResourcesConfig bounded = config;
+  const uint64_t spareReserve =
+      EngineMemoryPolicy::hostSpareReserveBytes(metal::probeDeviceCapabilities().physicalMemoryBytes);
+  bounded.hostMemory = [spareReserve] {
+    return std::optional<HostMemory>(HostMemory{64 * kGiB, spareReserve + kHostWarningMarginBytes});
+  };
+  const StreamedStart held = startStreamed(bounded);
+  const uint64_t heldBack = roomy.table - held.table;
+  require(roomy.table > weights.tableMinimumBytes && !roomy.heldBack && held.table == weights.tableMinimumBytes &&
+              held.heldBack >= heldBack && held.heldBack - heldBack < 4096 && held.context == roomy.context &&
+              roomy.dynamicBudget >= held.dynamicBudget && roomy.dynamicBudget - held.dynamicBudget < 4096,
+          "a table the host held back did not start at its smallest, held back in the plan beside the roomy "
+          "host's context");
+}
+
 // The engine asks the governor whether the host pauses growth, and its
 // serving mark lets a request in service grow through that pause.
 void testEngineFollowsTheGovernor(const char *metallibPath) {
@@ -1229,6 +1328,8 @@ int main(int argc, char **argv) {
       testAutomaticTierYieldsToTheContext(argv[1]);
       testAutomaticContextIgnoresTheVolume(argv[1]);
       testRelaunchKeepsTheSpilledContext(argv[1]);
+      testTableShareHoldsAPromptsIds(argv[1]);
+      testTheHeldBackTableStaysInThePlan(argv[1]);
       testEngineFollowsTheGovernor(argv[1]);
       {
         const test::TemporaryDirectory root("splash-moe");

@@ -108,8 +108,8 @@ uint32_t floorOf(uint32_t slots) { return static_cast<uint32_t>(kExpertFloorShar
 
 ExpertChunkLayout streamed(const ExpertSlotPlanes &planes, uint32_t slots, uint32_t minimum, uint64_t largest,
                            const std::string &what, uint64_t elasticBytes = kExpertElasticChunkBytes) {
-  return checked(streamedExpertChunkLayout(planes, slots, floorOf(slots), minimum, largest, elasticBytes), planes,
-                 slots, largest, what);
+  return checked(streamedExpertChunkLayout(planes, slots, floorOf(slots), minimum, largest, elasticBytes, slots),
+                 planes, slots, largest, what);
 }
 
 // A large size's floor is the floor share of its slots rounded down to whole
@@ -197,20 +197,21 @@ void floorsAskedFor() {
     const uint64_t group = alignedSlotsOf(planes);
     const std::string what = std::string(name) + ", a floor of half the slots";
     const ExpertChunkLayout half = checked(
-        streamedExpertChunkLayout(planes, slots, slots / 2, 512, UINT64_MAX, chunkBytes(planes, alignUp(256, group))),
+        streamedExpertChunkLayout(planes, slots, slots / 2, 512, UINT64_MAX, chunkBytes(planes, alignUp(256, group)),
+                                  slots),
         planes, slots, UINT64_MAX, what);
     require(half.floorSlots == alignDown(slots / 2, group) && half.floorChunks == 1 &&
                 half.chunkSlots == alignUp(256, group) &&
                 half.chunks == 1 + (slots - half.floorSlots + half.chunkSlots - 1) / half.chunkSlots,
             what + ": the floor or the elastic chunks above it are not what was asked for");
     const ExpertChunkLayout all = checked(
-        streamedExpertChunkLayout(planes, slots, slots, 512, UINT64_MAX, kExpertElasticChunkBytes), planes, slots,
-        UINT64_MAX, std::string(name) + ", a floor of every slot");
+        streamedExpertChunkLayout(planes, slots, slots, 512, UINT64_MAX, kExpertElasticChunkBytes, slots), planes,
+        slots, UINT64_MAX, std::string(name) + ", a floor of every slot");
     require(all.chunks == 1 && all.floorChunks == 1,
             std::string(name) + ": a floor of every slot takes elastic chunks");
     const ExpertChunkLayout raised = checked(
-        streamedExpertChunkLayout(planes, slots, 100, 512, UINT64_MAX, kExpertElasticChunkBytes), planes, slots,
-        UINT64_MAX, std::string(name) + ", a floor below a block's experts");
+        streamedExpertChunkLayout(planes, slots, 100, 512, UINT64_MAX, kExpertElasticChunkBytes, slots), planes,
+        slots, UINT64_MAX, std::string(name) + ", a floor below a block's experts");
     require(raised.floorSlots == alignUp(512, group) && raised.floorChunks == 1,
             std::string(name) + ": a floor below a block's experts is not raised to them");
   }
@@ -229,9 +230,109 @@ void largerElasticChunks() {
           "330 GiB: the elastic chunks are not the fewest slots that take 47 chunks");
 }
 
+// A store of the default floor that starts below its cap starts with every
+// slot the start holds, rounded down to whole regions, on a chunk boundary,
+// its elastic chunks the cap's: the floor lies the most whole chunks below
+// the start that keep it at least kExpertFloorShare of it, and one below it
+// where a chunk is more than the rest of the start. Flash-Next's experts on a
+// 24 GB M6, 5721 slots of 1.3 MiB at the cap: a start of 7000 MiB holds 4969
+// beside the store's fixed bytes, where a floor of 85% of them would start
+// the store with its floor, 984 MiB short; the floor lies a chunk below it, in
+// as many chunks as at the cap. At a cap of 1500 slots, whose one elastic
+// chunk is 15% of it, the floor of a start it can give back a chunk of rises
+// with the start, holds at least two thirds of it and takes at most the
+// chunks of a block's experts and the cap's chunks above them. No start takes
+// the floor below a block's experts, not even one below them; a floor beyond
+// a buffer lies on a chunk boundary too, the floor chunk within the buffer. A
+// floor given is the cap's, whatever the start.
+void startsOnAChunkBoundary() {
+  constexpr ExpertSlotPlanes kFlashNext{{{442368, 0, 16384}, {442368, 0, 16384}, {442368, 0, 16384}}};
+  const auto layout = [](const ExpertSlotPlanes &planes, uint32_t slots, uint32_t floor, uint32_t start,
+                         uint64_t largest, const std::string &what) {
+    return checked(streamedExpertChunkLayout(planes, slots, floor, 512, largest, kExpertElasticChunkBytes, start),
+                   planes, slots, largest, what);
+  };
+  // The layout of a start below the cap: the cap's elastic chunks, the floor
+  // `below` of them below the start.
+  const auto startsAt = [&](const ExpertSlotPlanes &planes, uint32_t slots, uint32_t floor, uint32_t start,
+                            uint64_t below, uint64_t largest, const std::string &what) {
+    const ExpertChunkLayout atCap = layout(planes, slots, 0, slots, largest, what + ", at the cap");
+    const ExpertChunkLayout started = layout(planes, slots, floor, start, largest, what);
+    const uint64_t at = alignDown(start, alignedSlotsOf(planes)), kept = at - below * atCap.chunkSlots;
+    require(started.chunkSlots == atCap.chunkSlots && started.first(started.floorChunks) == kept &&
+                started.first(started.floorChunks + static_cast<uint32_t>(below)) == at,
+            what + ": the store does not start on a chunk boundary, its floor the whole chunks below it");
+    return started;
+  };
+  const auto chunk = [](const ExpertSlotPlanes &planes, uint32_t slots) {
+    return uint64_t{streamedExpertChunkLayout(planes, slots, 0, 512, UINT64_MAX, kExpertElasticChunkBytes, slots)
+                        .chunkSlots};
+  };
+  const uint64_t m6 = chunk(kFlashNext, 5721);
+  require(chunkBytes(kFlashNext, m6) <= kExpertElasticChunkBytes && chunkBytes(kFlashNext, m6 + 1) > kExpertElasticChunkBytes &&
+              4969 - floorOf(4969) < m6,
+          "M6: the cap's chunks are not of about 1 GiB, or 15% of the start holds a whole one");
+  const ExpertChunkLayout m6Start = startsAt(kFlashNext, 5721, 0, 4969, 1, UINT64_MAX, "M6, starting with 4969 slots");
+  require(m6Start.floorChunks == 1 && m6Start.chunks == layout(kFlashNext, 5721, 0, 5721, UINT64_MAX, "M6").chunks,
+          "M6: the floor chunk does not hold the floor, or the store takes other chunks than at its cap");
+  for (const auto &[planes, name] : kLayouts)
+    for (const double share : {0.95, 0.75, 0.5, 0.25, 0.125}) {
+      const uint32_t slots = 30011, start = static_cast<uint32_t>(share * slots);
+      const uint64_t group = alignedSlotsOf(planes), at = alignDown(start, group);
+      const uint64_t below = std::max<uint64_t>(1, (at - alignDown(floorOf(start), group)) / chunk(planes, slots));
+      const ExpertChunkLayout started = startsAt(planes, slots, 0, start, below, UINT64_MAX,
+                                                 std::string(name) + ", a start of " + std::to_string(start));
+      require(started.floorSlots >= floorOf(start) || below == 1,
+              std::string(name) + ": a floor below 85% of the start lies more than a chunk below it");
+    }
+  // A cap of 1500 slots.
+  const uint64_t small = chunk(kFlashNext, 1500);
+  require(small == 1500 - floorOf(1500), "1500 slots: the cap's elastic chunk is not the slots above its floor");
+  uint64_t risen = 0;
+  for (uint32_t start = 512 + static_cast<uint32_t>(small); start <= 1500; ++start) {
+    const std::string what = "1500 slots, starting with " + std::to_string(start);
+    const ExpertChunkLayout started = start < 1500 ? startsAt(kFlashNext, 1500, 0, start, 1, UINT64_MAX, what)
+                                                   : layout(kFlashNext, 1500, 0, start, UINT64_MAX, what);
+    const uint64_t kept = started.first(started.floorChunks);
+    require(kept >= risen && 3 * kept >= 2 * start && started.chunks <= 1 + (1500 - 512 + small - 1) / small,
+            what + ": the floor fell, holds less than two thirds of the start, or takes more chunks");
+    risen = kept;
+  }
+  // A floor given.
+  const uint64_t whole = chunk(kWhole, 30011);
+  const ExpertChunkLayout given = layout(kWhole, 30011, 20000, 30011, UINT64_MAX, "a floor given, at the cap");
+  for (const uint64_t start : {20000 + whole / 2, 20000 + 5 * whole / 2}) {
+    const std::string what = "a floor given, a start of " + std::to_string(start);
+    const ExpertChunkLayout started = layout(kWhole, 30011, 20000, static_cast<uint32_t>(start), UINT64_MAX, what);
+    require(started.floorSlots == 20000 && started.chunkSlots == given.chunkSlots &&
+                started.chunks == given.chunks && started.floorChunks == given.floorChunks,
+            what + ": the layout is not the cap's");
+  }
+  // A start less than a chunk above a block's experts, and one below them.
+  startsAt(kWhole, 8193, 0, 512 + static_cast<uint32_t>(whole) / 2, 0, UINT64_MAX, "a start beside the least floor");
+  const ExpertChunkLayout least = layout(kFlashNext, 1500, 0, 100, UINT64_MAX, "a start below the least floor");
+  require(least.floorSlots == 512 && least.floorChunks == 1, "a start below a block's experts took a floor of fewer");
+  // A floor beyond a buffer of 4000 slots.
+  const ExpertChunkLayout buffered =
+      startsAt(kWhole, 30011, 0, 20000, (20000 - alignDown(floorOf(20000), 1)) / whole,
+               chunkBytes(kWhole, 4000), "a floor beyond the largest buffer");
+  require(buffered.floorSlots <= 4000 && buffered.floorChunks > 1,
+          "a floor beyond the largest buffer did not take elastic chunks below the start");
+  // Far below a large cap the elastic chunks grow to fit the table, as at
+  // the cap.
+  const uint32_t far = 9000;
+  const ExpertChunkLayout atCap = layout(kWhole, 200000, 0, 200000, UINT64_MAX, "a large cap");
+  const ExpertChunkLayout started = layout(kWhole, 200000, 0, far, UINT64_MAX, "a start far below a large cap");
+  require(started.chunks <= MOE_EXPERT_MAX_CHUNKS && started.chunkSlots >= atCap.chunkSlots &&
+              started.first(started.floorChunks + 1) == far,
+          "a start far below a large cap took more chunks than the table holds, or did not end a chunk");
+}
+
 // The smallest largest buffer that holds the size in at most 48 chunks is
 // taken, a byte less refused, and one of a sixtieth of the size refused. The
-// 20000-slot sizes take exactly 48 chunks under it; the 515-slot ones fewer.
+// 20000-slot sizes take exactly 48 chunks under it, so a start below their
+// cap, whose floor may lie a chunk lower, is refused under it; the 515-slot
+// ones fewer.
 void tooManyChunks() {
   for (const auto &[planes, name] : kLayouts)
     for (const uint32_t slots : {515u, 20000u}) {
@@ -249,12 +350,17 @@ void tooManyChunks() {
                                    " of the device's largest buffers";
       const auto under = [&](uint64_t buffer) {
         static_cast<void>(
-            streamedExpertChunkLayout(planes, slots, floorOf(slots), 1, buffer, kExpertElasticChunkBytes));
+            streamedExpertChunkLayout(planes, slots, floorOf(slots), 1, buffer, kExpertElasticChunkBytes, slots));
       };
       rejects([&] { under(largest - 1); }, expected,
               what + ": a largest buffer a byte short of the smallest of at most 48 chunks was taken");
       rejects([&] { under(chunkBytes(planes, slots) / 60); }, expected,
               what + ": a largest buffer of a sixtieth of the size was taken");
+      if (slots == 20000)
+        rejects([&] {
+          static_cast<void>(
+              streamedExpertChunkLayout(planes, slots, 0, 1, largest, kExpertElasticChunkBytes, slots - 1));
+        }, expected, what + ": a start below the cap was taken under the smallest largest buffer of the cap");
     }
 }
 
@@ -283,6 +389,7 @@ int main() {
     floorCap();
     floorsAskedFor();
     largerElasticChunks();
+    startsOnAChunkBoundary();
     tooManyChunks();
     oneBlockSizes();
   } catch (const std::exception &error) {

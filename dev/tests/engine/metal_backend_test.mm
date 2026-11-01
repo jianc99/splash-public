@@ -1421,6 +1421,43 @@ void releasedMemory(const std::string &metallibPath) {
     std::cout << "PASS released memory\n";
 }
 
+// A reserved buffer starts as a released one is left: no accounting and no
+// contents, its views handles no command may bind, and nothing to release;
+// a restore gives it memory, which commands use as an allocated buffer's,
+// and a release takes it back out of the residency set and the accounting.
+void reservedMemory(const std::string &metallibPath) {
+    ResidencyCalls calls;
+    MetalBackend backend(metallibPath);
+    const uint64_t page = static_cast<uint64_t>(getpagesize());
+    const uint64_t before = backend.memoryStats().allocatedBytes;
+    MetalBuffer buffer = backend.reserveBuffer(page, BufferStorage::Shared, "reserved page");
+    const MetalBuffer view = backend.view(buffer, 0, sizeof(uint32_t));
+    require(!buffer.contents() && !view.contents() && buffer.sizeBytes() == page && !buffer.allocatedBytes() &&
+                backend.memoryStats().allocatedBytes == before,
+            "a reserved buffer holds memory, contents or accounting");
+    const uint32_t count = 1, increment = 7;
+    const ComputeDispatch dispatch{"test_add_u32", {{0, view}},
+        {{1, &count, sizeof(count)}, {2, &increment, sizeof(increment)}},
+        {1, 1, 1}, {1, 1, 1}};
+    rejects([&] { (void)backend.submit(dispatch); }, "binds released memory",
+            "a command bound a reserved buffer");
+    rejects([&] { backend.releaseMemory(buffer); }, "already released", "a reserved buffer's memory was released");
+    backend.restoreMemory(buffer);
+    require(view.contents() && buffer.allocatedBytes() >= page &&
+                backend.memoryStats().allocatedBytes == before + buffer.allocatedBytes(),
+            "a restored reserved buffer lacks its contents or its accounting");
+    *static_cast<uint32_t *>(view.contents()) = 0;
+    (void)backend.submit(dispatch);
+    require(*static_cast<uint32_t *>(view.contents()) == increment,
+            "a command on a restored reserved buffer produced the wrong result");
+    const unsigned removals = calls.removals;
+    backend.releaseMemory(buffer);
+    require(!view.contents() && backend.memoryStats().allocatedBytes == before && calls.removals == removals + 1,
+            "a restored reserved buffer's release kept its accounting or its residency");
+    buffer = {};
+    std::cout << "PASS reserved memory\n";
+}
+
 // Memory another agent shares, such as the Neural Engine's surfaces, wrapped
 // without a copy: kernels and the CPU see the same bytes, the accounting
 // counts them, and only their owner frees them.
@@ -2557,6 +2594,7 @@ int main(int argc, const char *argv[]) {
             buffersStayResident(argv[1]);
             infiniteKeepAliveHoldsResidency(argv[1]);
             releasedMemory(argv[1]);
+            reservedMemory(argv[1]);
             wrappedMemory(argv[1]);
             sharedEventNotifies(argv[1]);
             eventSteps(argv[1]);

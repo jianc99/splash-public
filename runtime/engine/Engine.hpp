@@ -553,8 +553,9 @@ private:
   // Where the KV of a request that starts now lives: on a target that can
   // spill, Spill when its projection does not fit in the memory resident KV
   // may use beside every other lane's (a Resident lane's projection, a Spill
-  // lane's floor), and for every request under --kv-spill always; Resident
-  // otherwise. Correctness never depends on it.
+  // lane's floor), which the plan sizes beside the expert store at its cap,
+  // and for every request under --kv-spill always; Resident otherwise.
+  // Correctness never depends on it.
   [[nodiscard]] KvMode kvModeFor(const Request &request) const;
   // The request's projection fits in memory alone, as it would without the
   // SSD cache (SpillGeometry::residentTokens).

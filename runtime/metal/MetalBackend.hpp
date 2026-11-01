@@ -436,6 +436,13 @@ public:
   allocateBuffer(uint64_t bytes, BufferStorage storage,
                  std::string_view label,
                  BufferReach reach = BufferReach::Bound);
+  // A buffer as allocateBuffer makes it, its memory released from the start
+  // (releaseMemory): its views are handles of no memory until restoreMemory
+  // allocates it.
+  [[nodiscard]] MetalBuffer
+  reserveBuffer(uint64_t bytes, BufferStorage storage,
+                std::string_view label,
+                BufferReach reach = BufferReach::Bound);
   // A Shared buffer over whole pages of memory another agent also reads or
   // writes, such as an IOSurface of the Neural Engine, without a copy. Metal
   // keeps `owner` until it lets the buffer go; the memory is the owner's, so

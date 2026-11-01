@@ -1192,7 +1192,24 @@ what it allocates, the KV runway, arenas and warmup included, is memory a
 request in service needs until serving begins (`/status`:
 `memory_governor.host_available_bytes` and `host_reserve_bytes`; the spare
 memory and its reserve are `host_spare_bytes` and `host_spare_reserve_bytes`,
-and `host_headroom_bytes` is the room above them). A request in service keeps
+and `host_headroom_bytes` is the room above them). Since a start's checks
+hold back none of what the plan sizes, the automatic streamed stores start
+within the governor's own rule (`hostBudgetBytes`), taken once the first load
+holds its weights: no more than the engine's Metal memory and the host's
+spare memory beyond the spare reserve and the warning margin, the margin a
+pass keeps while no request waits, leave beside what an engine without
+requests holds once warm, its pipelines included, less the process's runtime
+overhead, which the spare memory counts already
+([memory and context](server.md#memory-and-context)). The
+passes then find nothing of them to take back before the first request. The
+expert store's cap stays the limit's: the chunks the host leaves no room for
+start released, as a restore leaves those it is refused, and the store
+starts on a chunk boundary: under the default floor its start, its floor the
+whole chunks below it that keep 85% of it, one at least, but none below a
+layer's experts, and with a floor given the last one at or below its start.
+The engine repays the rest as it repays a chunk given back (above). What the
+host holds back stays in the plan, so the context does not move. A
+request in service keeps
 growing through host pressure and macOS's warning, short of critical pressure,
 within `--max-memory`, first into cached pages no request holds:
 it takes cached KV, and a cached state only where it sits on the KV that goes

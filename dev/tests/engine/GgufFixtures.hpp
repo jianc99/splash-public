@@ -242,13 +242,14 @@ inline constexpr uint64_t kPleTableRows = 96;
 // with hyper-connected streams, mixes in place of the norms around each mixer
 // and the output norm; with a QSA indexer, its tensors in each
 // full-attention layer; with a PLE embedding, its tensors in the layer it
-// feeds and its table of kPleTableRows rows; and in a flint GGUF, each
+// feeds and its table of `pleRows` rows; and in a flint GGUF, each
 // layer's sinks after its attention and its norm before the FFN named
 // ffn_norm. The queries hold their gate where the attention has one
 // (attentionGate), a MoE geometry's leading layers are dense (isMoeLayer),
 // and its shared expert is sharedExpertSlices routed experts wide, with a
 // scalar gate where its blocks have one (sharedExpertGate).
-inline std::vector<Tensor> targetTensors(const model::QwenTargetDimensions &g, const TensorTypes &types) {
+inline std::vector<Tensor> targetTensors(const model::QwenTargetDimensions &g, const TensorTypes &types,
+                                         uint64_t pleRows = kPleTableRows) {
   std::vector<Tensor> tensors;
   const auto add = [&](std::string name, std::vector<uint64_t> dims) {
     const uint32_t type = typeOf(types, name);
@@ -331,7 +332,7 @@ inline std::vector<Tensor> targetTensors(const model::QwenTargetDimensions &g, c
   mix("output_hc", false, "output_norm.weight");
   add("output.weight", {hidden, g.vocabularySize});
   add("token_embd.weight", {hidden, g.vocabularySize});
-  if (g.hasPle()) add("per_layer_token_embd.weight", {g.pleHeadDimension, kPleTableRows});
+  if (g.hasPle()) add("per_layer_token_embd.weight", {g.pleHeadDimension, pleRows});
   return tensors;
 }
 

@@ -11,10 +11,14 @@
 // (ops::ExpertChunks, model/ExpertChunkLayout.hpp): the floor chunk holds the
 // size's floor (ExpertStoreOptions::floorBytes, 0.85 of its slots by
 // default), and elastic chunks of about 1 GiB each the rest, up to the cap
-// (ExpertStoreOptions::memoryBytes). While memory is short the store gives
-// its last live elastic chunk back (releaseAboveFloor), the experts it holds
-// moved to free slots below it and the coldest evicted to make room, and once
-// memory is ample takes it back with its slots free (growTowardCap): the live
+// (ExpertStoreOptions::memoryBytes); those past what the store starts with
+// (ExpertStoreOptions::startBytes) start released, the default floor then the
+// whole chunks below the start that keep 0.85 of it, one at least, but none
+// below a block's experts, and a floor given as it is. While memory is short
+// the store gives its last live elastic chunk back (releaseAboveFloor), the
+// experts it holds moved to free slots below it and the coldest evicted to
+// make room, and once memory is ample takes it back with its slots free
+// (growTowardCap): the live
 // chunks are always the first ones, which the kernels' address tables name
 // alone. The kernels reach the chunks through their GPU addresses, which the
 // backend writes per dispatch and declares resident once per encoder
@@ -128,8 +132,16 @@ struct ExpertStoreOptions final {
   // The floor in the same bytes (--expert-memory SIZE), what the store keeps
   // however short memory is, from minimumBytes to memoryBytes: each streamed
   // size's floor is the share of its slots those bytes hold, as memoryBytes'
-  // slots are. Zero for kExpertFloorShare of each streamed size's slots.
+  // slots are, whatever the store starts with. Zero for kExpertFloorShare of
+  // each streamed size's slots, or, below the cap, about that of those it
+  // starts with, on a chunk boundary below the start
+  // (streamedExpertChunkLayout).
   uint64_t floorBytes = 0;
+  // What the store starts with in the same bytes, from its floor to
+  // memoryBytes, as the host's memory leaves it: its elastic chunks past
+  // these bytes start released, as a restore leaves those it is refused, and
+  // growTowardCap takes them later. Zero to start at the cap.
+  uint64_t startBytes = 0;
   // The readers its reads run on: the engine's one pool, which the other
   // streamed weights and KV reads share.
   std::shared_ptr<SsdReaders> readers;
@@ -155,8 +167,9 @@ public:
   // when a streamed size's slots would take more than MOE_EXPERT_MAX_CHUNKS
   // chunks of the largest buffer (options.bufferBytes or the device's
   // maxBufferLength), when a size of one block's experts take more than it,
-  // or when options.floorBytes is neither zero nor from the smallest store
-  // (minimumBytes) to options.memoryBytes.
+  // when options.floorBytes is neither zero nor from the smallest store
+  // (minimumBytes) to options.memoryBytes, or when options.startBytes is
+  // neither zero nor from the floor to options.memoryBytes.
   ExpertStore(metal::MetalBackend &backend, StreamedBlocks blocks, ops::MoeShape shape, ExpertStoreOptions options);
   ~ExpertStore() override;
   ExpertStore(const ExpertStore &) = delete;

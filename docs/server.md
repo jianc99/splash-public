@@ -90,7 +90,7 @@ paths for `--model-dir`, `--draft-model` and `--mmproj`.
 | `--kv-format` | `int8` | Target KV storage: `int8` or `bf16`. See [KV cache precision](#kv-cache-precision). |
 | `--state-format` | `fp32` | Recurrent state storage: `fp32` or `bf16`. See [state precision](#state-precision). |
 | `--ple-memory` | Auto | Qwen3.8-Flash-Next: read the PLE n-gram table from the SSD through a host row cache of this size, e.g. `2G`; `off` loads the whole table. Auto loads it where memory holds it, else streams it through its share of the budget. See [PLE table streaming](#ple-table-streaming). |
-| `--expert-memory` | Auto | MoE targets: the least memory routed experts keep, e.g. `16G`; they load whole where memory holds them all, as auto does, and otherwise take all the memory the plan leaves them, at least this, give memory back down to it while requests need it, and read the other experts from the SSD when a step routes them; `off` loads every expert. Auto loads them all where memory holds them, else gives them what the context leaves, given back down to 85% of their slots. See [streamed experts](#streamed-experts). |
+| `--expert-memory` | Auto | MoE targets: the least memory routed experts keep, e.g. `16G`; they load whole where memory holds them all, as auto does, and otherwise take all the memory the plan leaves them, at least this, give memory back down to it while requests need it, and read the other experts from the SSD when a step routes them; `off` loads every expert. Auto loads them all where memory holds them, else gives them what the context leaves, given back down to within a chunk of 85% of the slots they start with. See [streamed experts](#streamed-experts). |
 | `--sparse-kv-memory` | Auto | Qwen3.8-Flash-Next: memory for the KV blocks read back from the SSD for requests whose KV is there, e.g. `1200M`; never below its floor, which auto keeps. See [KV on the SSD](#kv-on-the-ssd). |
 | `--idle-release` | `10m` | Time without a request before the engine unwires its memory and frees the weights; the next request restores them. `off` keeps both, though `POST /v1/memory/release` still frees the weights. See [weight loading](internals.md#weight-loading). |
 | `--max-cache-disk` | `auto` | SSD quota for cached KV pages and states: `auto` follows the volume, a quarter of its free space beyond a floor of 10 GiB (5% of a volume under 200 GiB), at most 32 GiB; a size such as `16G` is held as given while the volume keeps that floor; `0` turns the cache off. Kept for the session, or across restarts with `--persistent-cache`. See [SSD cache](#ssd-cache). |
@@ -181,12 +181,15 @@ that includes loopback when launching agents locally.
 
 Splash sizes memory and context when it starts. Its Metal budget is the GPU's
 recommended working set less a small margin; `--max-memory` can only lower it,
-such as `--max-memory 28G`. The automatic plan takes the whole budget, so on a
-Mac that also runs other applications, `--max-memory` leaves them room: the
-automatic expert store and PLE row cache are planned smaller with it. The budget
-caps Metal allocations, not combined process RSS. The context limit is the
-model's native window, 256K tokens for every supported family, when the budget
-holds it beside the weights and, unless `--disable-ane`, the
+such as `--max-memory 28G`. The automatic plan takes the whole budget, its
+streamed stores starting with no more than the host's memory leaves the engine
+when it starts (below); on a Mac that also runs other applications,
+`--max-memory` leaves them room whatever they hold later: the automatic expert
+store and PLE row cache are planned smaller with it. The budget caps Metal
+allocations, not combined process RSS. The context limit is the model's native
+window, 256K tokens for
+every supported family, when the budget holds it beside the weights and,
+unless `--disable-ane`, the
 [Neural Engine split](internals.md#neural-engine-prefill) this Mac's calibration of a dense
 model takes, and otherwise as much as the budget holds beside them.
 `--max-context` sets it, such as `--max-context 100K` (K is 1024 tokens, M a
@@ -207,20 +210,40 @@ routed experts load with their layers where that leaves KV its allowance, and
 otherwise stream through a store of all that the allowance and the PLE
 table's share leave ([streamed experts](#streamed-experts)); the PLE table
 loads where the rest holds it, and otherwise streams through a row cache of
-its share, 512 MiB at most ([PLE table streaming](#ple-table-streaming)); KV and
-the states take what remains. The allowance is the KV of a context, in the
-fewest pages whose extents hold it as one request's KV capacity rounds them:
-a block-sparse target's first 64K tokens, kept in memory. A dense target keeps
+its share, at most the rows of every id a 128K-token prompt stages
+([PLE table streaming](#ple-table-streaming)); KV and the states take what
+remains. The allowance is the KV of a context, in the fewest pages whose
+extents hold it as one request's KV capacity rounds them: a block-sparse
+target's first 64K tokens, kept in memory. A dense target keeps
 the plan it has without streaming: its allowance is `--max-context`, so that
 its experts load whole wherever that context fits beside them and stream to
 hold it where it does not, or else none, so its experts load wherever they
-fit; only once they stream does it keep the first 64K tokens too. The
-automatic SSD cache gives its state staging up where that alone would stream
-a part, unless the target's KV spills to it. `--ple-memory` and
+fit; only once they stream does it keep the first 64K tokens too. Last, the
+automatic stores start with no more than the host leaves the engine as the
+memory governor counts it, sampled once the first load holds its weights: the
+Metal memory the engine holds and the host's spare memory beyond the spare
+reserve and the 1 GiB warning margin
+([admission and eviction](internals.md#admission-and-eviction)), less what an
+engine without requests holds of the floors once warm (all but a Spill
+request's, and the runtime overhead reserve, which the spare memory counts
+already); the table's share first, then the experts' store, each down to its
+smallest at most, so that nothing they start with is built for the governor
+to take back. The expert
+store's cap stays all that the budget gives it: the chunks past what the host
+leaves start released, and the store takes them back once memory allows, as
+after giving them back ([streamed experts](#streamed-experts)); the PLE row
+cache, which does not grow, stays at what the host leaves it. What the host
+holds back stays in the plan (`memory_plan.budget.host_held_back_bytes`, and
+a startup line), so that what loads whole, the floors, the context and the KV
+admission keeps in memory follow the budget alone, and a relaunch serves its
+first engine's context whatever the host holds then. The automatic SSD cache
+gives its state staging up where that alone would stream a part, unless the
+target's KV spills to it. `--ple-memory` and
 `--sparse-kv-memory` set their own part instead. `--expert-memory` sets the
 expert store's floor, which the floors charge: the experts then load whole
 where memory holds every one, as automatic ones do, and otherwise stream
-through a store of all that the rest leaves them, so at least that floor;
+through a store of all that the rest leaves them, so at least that floor, and
+start with what the host leaves them above it;
 the plan holds the context and KV beside the store at that cap, and what
 the store gives back while memory is short only adds room
 ([streamed experts](#streamed-experts)). A size below the part's smallest
@@ -293,10 +316,13 @@ as `--ple-memory 2G`, the table stays in its GGUF on the SSD: no `ple.bin`
 image is written, and the weights shrink by the stored table size. Startup
 memory requirements also include the cache and Metal staging buffers. The
 rows each command gathers are read through a host cache with a SIZE-byte
-cache and working-memory reservation, auto's share of the budget, at most
-512 MiB: the cache hits only rows read before, and a request reads few
-distinct rows (a 128K-token prompt about 1.1M, a quarter of what 512 MiB
-holds), so a larger one hits no more often and leaves streamed experts less.
+cache and working-memory reservation, auto's share of the budget: at most
+the rows of every id a 128K-token prompt stages, 2M rows, 237 MiB with
+IQ4_NL's 90-byte rows. The cache hits only rows read before, and a request
+reads few distinct rows (a 128K-token prompt about 1.1M): caches from
+256 MiB, which no run filled, to 2 GiB hit as often, while each GiB more of
+the expert store makes a 24 GB Mac decode 11-23% faster, so the experts take
+the rest.
 The engine refuses a SIZE that holds no row, and a SIZE that holds the
 whole table loads it with the weights instead, as `--ple-memory off` does. A
 table whose rows the GGUF does not store as the gathers read them (NVFP4,
@@ -343,8 +369,8 @@ size with a warning.
   (`SparseRowStore::commit`), so that the cache holds all of its host memory
   from the start: the host memory the engine measures from then on, which
   the start's checks and the expert store's growth go by, counts the whole
-  cache rather than the rows read so far. Auto's cache takes 512 MiB at most;
-  a `--ple-memory` size takes all of it. Stages and prefetches allocate their
+  cache rather than the rows read so far. Auto's cache takes its share at
+  most; a `--ple-memory` size takes all of it. Stages and prefetches allocate their
   working memory as they run.
 - `/status` reports it under `streamed_table`: the table and its bytes, the
   cache's size, capacity, rows and evictions; per use (`prefill`, `decode`)
@@ -362,13 +388,22 @@ context (`--expert-memory auto`, the default,
 such as `--expert-memory 16G`, its routed experts stay in their files on the
 SSD, and a store holds as many of them as fit (`ExpertStore`,
 `runtime/model/ExpertStore.hpp`): the weights shrink by the routed experts'
-bytes, and the store counts in their place (`target_weights_bytes`). The store
-starts at its cap, all that the plan leaves the experts, and gives memory back
-down to its floor while requests or the Mac need it. Under auto the floor is 85%
-of its slots. With `--expert-memory SIZE` it is SIZE bytes, counted as the whole
-store's, its slots, staging and tables, which the plan's floors charge, rounded
-to whole slots and chunks, which startup logs beside SIZE where they differ; the
-cap is then all that the rest leaves the store, as under auto, so at least SIZE,
+bytes, and the store counts in their place at its cap
+(`target_weights_bytes` and `host_held_back_bytes`). Its cap is all that the
+plan leaves the experts; it starts with as much of that as the host's spare
+memory holds as the engine starts ([memory and context](#memory-and-context)),
+the chunks past it released, which it takes back as after giving them back,
+and gives memory back down to its floor while requests or the Mac need it.
+Under auto the floor is 85% of its slots; a store that starts below its cap
+starts on a chunk boundary, in chunks of its cap's size, its floor the whole
+chunks below its start that keep 85% of that, one at least, but none below a
+layer's experts. With
+`--expert-memory SIZE` it is SIZE bytes, counted as the whole store's, its
+slots, staging and tables, which the plan's floors charge, rounded to whole
+slots and chunks, which startup logs beside SIZE where they differ, whatever
+the store starts with: below its cap it starts with the whole chunks the
+host's spare memory holds. The
+cap is all that the rest leaves the store, as under auto, so at least SIZE,
 and a SIZE the plan leaves nothing more than itself has nothing to give back,
 which startup says. Where memory holds every expert beside the KV kept resident,
 a SIZE loads them whole as auto does, and startup says it is ignored; forcing
@@ -405,22 +440,27 @@ off` loads every expert, as a SIZE that holds them all does.
   ([Drafts](models.md#drafts)); the selector writes those rows before the step's load.
 - Experts of one format share their slots, held in chunks, each a buffer of
   its own of at most the device's largest buffer (`maxBufferLength`). One
-  chunk holds each format's floor, 0.85 of its slots by default or the share of
-  them `--expert-memory SIZE` holds; the rest lie in chunks of about 1 GiB (more
-  where they would take more than 47, since the expert kernels' address table
-  holds at most 48 chunks), the last of fewer slots; a floor larger than the
-  device's largest buffer takes the elastic chunks it needs too. The kernels
+  chunk holds each format's floor, by default 0.85 of its slots (for a store
+  that starts below its cap, its start less the whole chunks of its cap's
+  that keep 0.85 of it, one at least, but none below a layer's experts), or
+  the share of them `--expert-memory SIZE` holds;
+  the rest lie in chunks of about 1 GiB
+  (more where they would take more than 47, since the expert kernels' address
+  table holds at most 48 chunks), the last of fewer slots; a floor larger than
+  the device's largest buffer takes the elastic chunks it needs too. The kernels
   reach the chunks through their GPU addresses, which the backend writes for
   each expert dispatch as it encodes the command, and makes them resident for
   that dispatch's encoder rather than for every command on the queue
   ([Residency](internals.md#residency-and-kv-extents)). Chunks are few
   because each one a decode encoder makes resident costs GPU time: 36 chunks
   of about 512 MiB cost a streamed decode cycle 2.3% of its GPU time on the
-  M5 Max, about 0.065% a chunk. A format has about one elastic chunk per
-  6.7 GiB of its slots (0.15 of them, in chunks of about 1 GiB), so the
-  Studio's 17.2 GiB Flash-Next store, a floor and 3 elastic chunks, costs about
-  0.25%. A size of one block (layers in formats of their own) is one chunk of
-  every expert.
+  M5 Max, about 0.065% a chunk. A format that starts at its cap has about one
+  elastic chunk per 6.7 GiB of its slots (0.15 of them, in chunks of about
+  1 GiB), one where they are less, so the Studio's 17.2 GiB Flash-Next store,
+  a floor and 3 elastic chunks, costs about 0.25%; one that starts below its
+  cap has as many of the cap's chunks as the slots above its lower floor take,
+  at most 7 in a store under 6.7 GiB. A size of one block (layers in formats
+  of their own) is one chunk of every expert.
 - A decode step's loads keep the GPU awake through their host steps
   ([Host steps](internals.md#host-steps)), so the work after a load starts at once and at
   full clocks rather than after the GPU's wake-up.
@@ -452,7 +492,8 @@ off` loads every expert, as a SIZE that holds them all does.
   pressure takes the store down to its floor at once, spilling no request
   first, in one copy per format rather than one per chunk. The store's cap
   is a reservation the engine repays: once memory allows again, between
-  commands, the store takes one chunk back per pass, its slots empty, as
+  commands, the store takes one chunk back per pass, one it gave back or
+  started without, its slots empty, as
   long as no request waits for memory, the host has 1 GiB to spare and
   macOS reports no critical pressure, 30 s have passed since a chunk last
   went and the weights are not released. A chunk taken back that goes
@@ -476,8 +517,8 @@ off` loads every expert, as a SIZE that holds them all does.
   taken back logs a line, and so does each format critical pressure takes to
   its floor (`Expert store gave back`, `Expert store took back`).
   Elasticity serves concurrency, the prefix cache and the rest of the Mac;
-  the advertised context is planned with the store at its cap and does not
-  change.
+  the advertised context is planned with the store at the cap the engine's
+  limit gives it and does not change.
 - The store's live chunks and staging are released while idle with the
   weights and restored with them: its floor and staging first, as the
   request waiting needs them, then each elastic chunk only while macOS
@@ -708,9 +749,10 @@ what memory holds, as a dense target's is.
 
 - Admission decides it per request. A request whose KV, its prompt and
   `min(max_tokens, 4096)` tokens of output, fits the memory the plan leaves
-  resident KV beside the other requests' keeps its KV in memory; any other
-  spills. A request in memory whose KV cannot grow spills from then on
-  rather than yield its lane or fail: its pages whose copies landed before,
+  resident KV beside the other requests', which leaves the
+  [expert store](#streamed-experts) its cap, keeps its KV in memory; any other
+  spills. A request in memory whose KV cannot grow spills
+  from then on rather than yield its lane or fail: its pages whose copies landed before,
   as a prefix restored from the SSD cache has them, spill at once, and it
   waits while the others' copies land. When any other memory is short, a
   state, a spilling request's reads, or the host's, the request in memory

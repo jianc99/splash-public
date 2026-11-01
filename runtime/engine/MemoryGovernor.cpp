@@ -26,7 +26,23 @@ uint64_t compressionSavings(const HostMemoryPages &pages) noexcept {
          static_cast<uint64_t>(static_cast<unsigned __int128>(pages.anonymous) * pages.compressor / pages.compressed);
 }
 
+// The host's spare memory above its spare reserve, beside `reservedBytes`
+// being allocated: the room growth no request in service needs takes from.
+uint64_t spareHeadroom(const HostMemory &host, uint64_t spareReserveBytes, uint64_t reservedBytes) noexcept {
+  if (host.spare <= spareReserveBytes)
+    return 0;
+  const uint64_t spareAfterReserve = host.spare - spareReserveBytes;
+  return reservedBytes < spareAfterReserve ? spareAfterReserve - reservedBytes : 0;
+}
+
 } // namespace
+
+uint64_t hostBudgetBytes(const HostMemory &host, uint64_t spareReserveBytes, uint64_t engineBytes) noexcept {
+  const uint64_t headroom = spareHeadroom(host, spareReserveBytes, 0);
+  const uint64_t room = headroom > kHostWarningMarginBytes ? headroom - kHostWarningMarginBytes : 0;
+  return room <= std::numeric_limits<uint64_t>::max() - engineBytes ? engineBytes + room
+                                                                     : std::numeric_limits<uint64_t>::max();
+}
 
 HostMemory estimateHostMemory(const HostMemoryPages &statistics, uint64_t pageSize,
                               bool compression) noexcept {
@@ -161,10 +177,7 @@ std::optional<HostMemory> MemoryGovernor::sampleHost() const noexcept {
 
 uint64_t MemoryGovernor::hostHeadroomBytes(const std::optional<HostMemory> &host,
                                            uint64_t reservedBytes) const noexcept {
-  if (!host || host->spare <= hostSpareReserveBytes_)
-    return 0;
-  const uint64_t spareAfterReserve = host->spare - hostSpareReserveBytes_;
-  return reservedBytes < spareAfterReserve ? spareAfterReserve - reservedBytes : 0;
+  return host ? spareHeadroom(*host, hostSpareReserveBytes_, reservedBytes) : 0;
 }
 
 std::optional<MemoryGovernor::Reservation>

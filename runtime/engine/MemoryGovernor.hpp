@@ -85,6 +85,16 @@ memoryPressureName(MemoryPressure pressure) noexcept {
 inline constexpr uint64_t kHostWarningMarginBytes = 1ULL << 30;
 inline constexpr uint64_t kHostRecoveryMarginBytes = 2ULL << 30;
 
+// The memory an engine that holds `engineBytes` may hold in all on a host
+// whose memory is `host`: what it holds and the host's spare memory beyond
+// the spare reserve and the warning margin, which growth no request in
+// service needs leaves free and the paced reclaim restores while no request
+// waits (MemoryPressurePolicy). An engine without requests that holds no
+// more leaves that reclaim nothing to take; the plan sizes the streamed
+// stores within it (planStreamedMemory).
+[[nodiscard]] uint64_t hostBudgetBytes(const HostMemory &host, uint64_t spareReserveBytes,
+                                       uint64_t engineBytes) noexcept;
+
 struct MemoryGovernorSnapshot {
   uint64_t limitBytes = 0;
   // Charged against the limit: the backend's allocated buffers plus the
