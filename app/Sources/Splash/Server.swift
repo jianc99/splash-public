@@ -249,13 +249,10 @@ final class Server {
     nonisolated static func memoryProblem(_ message: String, settings: ServeSettings) -> String? {
         if let match = message.firstMatch(of: /require (\d+) bytes but the Metal memory budget is (\d+) bytes/),
            let need = Int64(match.1), let budget = Int64(match.2) {
-            let size = { (bytes: Int64) in
-                "\((Double(bytes) / Double(1 << 30)).formatted(.number.precision(.fractionLength(0...1)))) GB"
-            }
             if let limit = settings.memoryLimit, Int64(limit) << 30 == budget {
-                return "It needs \(size(need)) of memory but the memory limit is \(size(budget)). Raise the memory limit in Launch Options."
+                return "It needs \(Format.memory(need)) of memory but the memory limit is \(Format.memory(budget)). Raise the memory limit in Launch Options."
             }
-            return "It needs \(size(need)) of memory but this Mac can give it \(size(budget)). Choose a smaller model."
+            return "It needs \(Format.memory(need)) of memory but this Mac can give it \(Format.memory(budget)). Choose a smaller model."
         }
         if let match = message.firstMatch(of: /exceeds the (\d+) tokens the model and (.+) allow/), let most = Int(match.1) {
             let tokens = most >= 1024 ? "\(most / 1024)K" : "\(most)"

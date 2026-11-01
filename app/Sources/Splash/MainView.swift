@@ -184,6 +184,14 @@ enum Format {
 
     static func gigabytes(_ count: Int) -> Int64 { Int64(count) * 1_000_000_000 }
 
+    /// Memory in binary units, as Apple sells a Mac's and the memory limit counts it: 512 MB,
+    /// 16 GB for 16 GiB, 17.2 GB.
+    static func memory(_ bytes: Int64) -> String {
+        let gigabytes = Double(bytes) / Double(1 << 30)
+        guard gigabytes >= 1 else { return bytes.formatted(.byteCount(style: .memory)) }
+        return "\(gigabytes.formatted(.number.precision(.fractionLength(0...1)))) GB"
+    }
+
     /// A count in a few figures: 950, 12K, 3.4M.
     static func count(_ value: Int) -> String {
         value.formatted(.number.notation(.compactName))
@@ -202,7 +210,7 @@ enum Format {
             : ((milliseconds / 1000).formatted(.number.precision(.fractionLength(1))), "s")
     }
 
-    /// A figure and its unit, as `size` says it: 4.3 and GB.
+    /// A figure and its unit, as `size` and `memory` say it: 4.3 and GB.
     static func parts(_ text: String) -> (String, String?) {
         guard let space = text.lastIndex(of: " ") else { return (text, nil) }
         return (String(text[..<space]), String(text[text.index(after: space)...]))
