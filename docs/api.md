@@ -731,8 +731,14 @@ otherwise.
 status, such as `overloaded_error` for 503. `/v1/systemone` answers invalid
 requests with 422 `detail` arrays and every 503 with 529. Every 503, and every
 529, carries `Retry-After: 1`, unless the engine says when a retry may succeed,
-as `kv_write_budget` does. A connection the server refuses before reading
-any of its request, as when every connection slot is taken
+as `kv_write_budget` does. While the engine restarts (`engine_recovering`,
+`runtime_unavailable`) it is the seconds until the restarted engine should be
+ready, as long after its spawn as the engine before took to start; before the
+spawn, while the restart waits for its backoff or for the engine before to
+exit, as long after the later of now and the time the restart is due. It is
+at least 1, and at most 59, the longest the JavaScript OpenAI and Anthropic
+SDKs follow. A connection the server refuses before reading any of its
+request, as when every connection slot is taken
 ([request limits](#request-limits-and-timeouts)), gets one fixed 503 whatever
 its path, `/v1/systemone`'s included: OpenAI's `server_error` with code
 `frontend_overloaded`. The codes a client may act on:

@@ -1290,6 +1290,66 @@ class RuntimeTests(unittest.TestCase):
             + [("splash", "serve-native", str(READY.max_context_tokens))] * 2,
         )
 
+    def test_a_relaunch_should_be_ready_a_start_after_its_spawn(self):
+        # An engine's start runs from its spawn to Ready. A relaunch spawns
+        # once the engine before has exited and should take as long as the
+        # latest start.
+        factory = FakeFactory(initial_output=b"")
+        runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
+        self.addCleanup(runtime.close)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            started = time.monotonic()
+            ready = executor.submit(runtime.wait_ready, 1.0)
+            self.assertIsNone(runtime.last_start_seconds)
+            time.sleep(0.3)
+            factory.processes[0].send(READY)
+            self.assertTrue(ready.result(1.0))
+            elapsed = time.monotonic() - started
+        first_start = runtime.last_start_seconds
+        self.assertGreaterEqual(first_start, 0.3)
+        self.assertLessEqual(first_start, elapsed)
+        self.assertIsNone(runtime.expected_ready_at)
+
+        def wait_until(predicate):
+            deadline = time.monotonic() + 2
+            while not predicate():
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(0.005)
+
+        # The engine fails and ignores SIGTERM: it exits once killed, past
+        # the shutdown grace.
+        old = factory.processes[0]
+        with (
+            mock.patch.object(old, "terminate"),
+            mock.patch.object(runtime, "_shutdown_grace_seconds", 0.3),
+            mock.patch.object(runtime._crash_trace, "dump"),
+            ThreadPoolExecutor(max_workers=1) as executor,
+        ):
+            failed = time.monotonic()
+            old.close_stdout()
+            wait_until(lambda: not runtime.ready)
+            relaunch = executor.submit(runtime.wait_ready, 2.0)
+            time.sleep(0.1)
+            self.assertIsNone(runtime.expected_ready_at)
+            self.assertEqual(len(factory.processes), 1)
+            wait_until(lambda: len(factory.processes) == 2)
+            expected = runtime.expected_ready_at
+            self.assertGreaterEqual(expected - first_start, failed + 0.3)
+            self.assertLessEqual(expected - first_start, time.monotonic())
+            factory.processes[1].send(READY)
+            self.assertTrue(relaunch.result(2.0))
+            self.assertIsNone(runtime.expected_ready_at)
+            # That start was faster, and the next relaunch expects it.
+            self.assertLess(runtime.last_start_seconds, first_start)
+            factory.processes[1].kill()
+            relaunch = executor.submit(runtime.wait_ready, 2.0)
+            wait_until(lambda: len(factory.processes) == 3)
+            self.assertLess(
+                runtime.expected_ready_at, time.monotonic() + first_start / 2
+            )
+            factory.processes[2].send(READY)
+            self.assertTrue(relaunch.result(2.0))
+
     def test_unanswered_status_with_fail_unanswered_fails_only_its_generation(self):
         factory = FakeFactory()
         runtime = engine_runtime.MultiplexedRuntime(

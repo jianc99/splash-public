@@ -34,7 +34,8 @@ restarts count) Splash stops restarting it, and requests get 500 `engine_failed`
 until the server is restarted; its message names the crash trace when
 `SPLASH_CRASH_TRACE=1` recorded one
 ([crash traces](internals.md#failures-and-crash-traces)). Meanwhile generation requests get
-503 `engine_recovering`, whose message names the last failure. An engine whose
+503 `engine_recovering`, whose message names the last failure and whose
+`Retry-After` the time until the restart should be ready ([errors](api.md#errors)). An engine whose
 loop leaves a status request unanswered for 30 seconds, while requests are
 pending or during a background status refresh, is failed and restarted by the
 same rules. A restarted engine serves what the first one announced: the same

@@ -53,6 +53,8 @@ class RecoveringRuntime(FakeRuntime):
     def wait_ready(self, timeout=None):
         self.startup_calls += 1
         outcome = self.outcomes.get(timeout=3)
+        # The startup has ended; no engine is being started.
+        self.expected_ready_at = None
         if outcome is not None:
             raise outcome
         self.ready = True
@@ -157,6 +159,42 @@ class ServerRecoveryTests(HarnessTestCase):
         self.assertEqual(status, 500)
         self.assertEqual(json.loads(payload)["error"]["code"], "engine_failed")
         self.assertEqual(runtime.startup_calls, 2)
+
+    def test_recovery_refusals_ask_for_the_time_a_relaunch_takes(self):
+        # Until the relaunched engine should be Ready, as long after its spawn
+        # as the engine before took to start, and before the spawn as long
+        # after the later of now and the relaunch's due time, rounded up: at
+        # least 1 s once that time has passed, at most 59 s, the longest every
+        # SDK follows.
+        runtime = RecoveringRuntime()
+        backend = self.backend(runtime)
+        clock = [100.0]
+        with (
+            mock.patch.object(
+                backend_api, "time", SimpleNamespace(monotonic=lambda: clock[0])
+            ),
+            mock.patch.object(backend_api, "print_status"),
+        ):
+            runtime.last_start_seconds = 20.5
+            runtime.fail(backend)
+            self.assertEqual(backend.refusal().retry_after, 21)
+            # The engine before ignores SIGTERM and is still being stopped
+            # past a start's time: the whole start is still to come.
+            clock[0] += 25.0
+            self.assertEqual(backend.refusal().retry_after, 21)
+            # Ten seconds after the spawn, the rest of the start is left.
+            runtime.expected_ready_at = clock[0] + 20.5
+            clock[0] += 10.0
+            self.assertEqual(backend.refusal().retry_after, 11)
+            # A spawned engine slower than the one before.
+            clock[0] += 20.0
+            self.assertEqual(backend.refusal().retry_after, 1)
+            self.relaunched(runtime, backend)
+            # The second relaunch in a row is due RESTART_BACKOFF_SECONDS on.
+            runtime.fail(backend)
+            for start, retry_after in ((20.5, 26), (0.2, 6), (100.0, 59)):
+                runtime.last_start_seconds = start
+                self.assertEqual(backend.refusal().retry_after, retry_after)
 
     def test_full_window_of_service_resets_the_crash_count(self):
         runtime = RecoveringRuntime()
@@ -428,6 +466,8 @@ class ServerRecoveryTests(HarnessTestCase):
         self,
     ):
         runtime = RecoveringRuntime()
+        # A relaunch is due now and takes as long as the engine before's start.
+        runtime.last_start_seconds = 20.0
         harness = self.harness(runtime, queue_size=1)
         runtime.fail(harness.backend)
         with mock.patch.object(harness.app, "prepare") as prepare:
@@ -449,7 +489,7 @@ class ServerRecoveryTests(HarnessTestCase):
                         connection.endheaders()
                         response = connection.getresponse()
                         self.assertEqual(response.status, status)
-                        self.assertEqual(response.getheader("Retry-After"), "1")
+                        self.assertEqual(response.getheader("Retry-After"), "20")
                         self.assertEqual(
                             json.loads(response.read())["error"]["type"],
                             "overloaded_error"
@@ -726,7 +766,21 @@ class ServerRecoveryTests(HarnessTestCase):
                 )
                 backend = self.backend(runtime)
                 job = make_job()
-                with mock.patch.object(backend_api, "print_status") as console:
+                with (
+                    mock.patch.object(backend_api, "print_status") as console,
+                    # A start as long as a large model's, its relaunch not
+                    # spawned yet.
+                    mock.patch.object(
+                        engine_runtime.MultiplexedRuntime,
+                        "last_start_seconds",
+                        mock.PropertyMock(return_value=30.0),
+                    ),
+                    mock.patch.object(
+                        engine_runtime.MultiplexedRuntime,
+                        "expected_ready_at",
+                        mock.PropertyMock(return_value=None),
+                    ),
+                ):
                     backend.submit(job)
                     factory.processes[0].stdin.wait_for(wire.RequestFrame)
                     fail(factory.processes[0])
@@ -734,12 +788,13 @@ class ServerRecoveryTests(HarnessTestCase):
                     self.wait_until(lambda: console.called)
                 self.assertEqual(kind, "error")
                 self.assertEqual(
-                    (error.status, error.code, error.message),
+                    (error.status, error.code, error.message, error.retry_after),
                     (
                         503,
                         "runtime_unavailable",
                         "the inference engine stopped unexpectedly and is "
                         "restarting; retry the request",
+                        30,
                     ),
                 )
                 # The engine's own reason stays on the console.
