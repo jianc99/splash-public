@@ -198,13 +198,14 @@ struct RequestFrame {
 //   Tokens         u64 requestId, u32 sequenceOffset, u32 count, u32 tokens
 //   MaskRequest    u64 requestId, u64 maskRequestId, u32 wordsPerMask,
 //                  u32 count, u32 simulation tokens
-//   Done           u64 requestId, u8 reason, u32 promptTokens,
+//   Done           u64 requestId, u8 reason, u8 bounded, u32 promptTokens,
 //                  u32 completionTokens, u64 prefillMicros, u64 decodeMicros,
 //                  u64 wallMicros, u32 deduplicatedTokens, u32 draftedTokens,
 //                  u32 acceptedDraftTokens, u32 speculative cycles, u32 count,
 //                  f32 option logits
-//   Error          u8 failureClass, u8 retryable, u64 requestId, u32 code
-//                  bytes, u32 message bytes, the code, the message
+//   Error          u8 failureClass, u8 retryable, u32 retryAfterSeconds,
+//                  u64 requestId, u32 code bytes, u32 message bytes, the code,
+//                  the message
 //   StatusJson     u64 correlationId, the JSON
 struct CancelFrame {
   uint64_t requestId = 0;
