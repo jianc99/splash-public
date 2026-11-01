@@ -3138,9 +3138,9 @@ uint32_t Runtime::prefillGroupRows(bool spills) const noexcept {
 
 // A command over streamed experts reads each layer's that its rows route,
 // almost all of them however few its rows: such a command may run a pass
-// per layer. The Neural Engine's split runs a command whole.
+// per layer.
 uint32_t Runtime::prefillPasses() const noexcept {
-  return impl_->model.expertStore() && !impl_->aneFfn ? impl_->geometry.target.layers : 1;
+  return impl_->model.expertStore() ? impl_->geometry.target.layers : 1;
 }
 
 uint32_t Runtime::statesToActivate() const noexcept {
