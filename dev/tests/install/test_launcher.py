@@ -3,6 +3,7 @@ import fcntl
 import io
 import json
 import os
+import re
 import select
 import signal
 import socket
@@ -568,6 +569,32 @@ class LauncherTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 launcher.parse_args(["serve", "--help"])
         self.assertIn("SPLASH_PORT or 8123", " ".join(output.getvalue().split()))
+
+    def test_the_apps_launch_options_are_the_serve_options(self):
+        # The desktop app offers every option of splash serve but those of one
+        # model and those it sets itself, from one table (LaunchOption.all,
+        # docs/package.md): a flag it keeps that serve no longer takes would
+        # fail every start, and a new option would never show.
+        with (
+            mock.patch("sys.stdout", io.StringIO()) as output,
+            self.assertRaises(SystemExit),
+        ):
+            launcher.parse_args(["serve", "--help"])
+        flags = set(re.findall(r"(?m)^  (--[a-z-]+)", output.getvalue())) - {
+            "--help",
+            "--model",
+            "--model-dir",
+            "--offline",
+            "--revision",
+            "--draft-model",
+            "--mmproj",
+        }
+        self.assertIn("--max-memory", flags)
+        table = Path(launcher.__file__).resolve().parents[1] / (
+            "app/Sources/Splash/Preferences.swift"
+        )
+        options = set(re.findall(r'flag: "(--[a-z-]+)"', table.read_text()))
+        self.assertEqual(options, flags)
 
     def test_distinct_ports_have_independent_locks_and_same_port_is_rejected(self):
         with tempfile.TemporaryDirectory() as temporary, socket.socket() as listener:
