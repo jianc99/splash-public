@@ -367,6 +367,45 @@ void testOnlyExtentsOfPagesRequestsHoldAreActive() {
             "the inactive extents were not released");
 }
 
+// The snapshot counts the extents active, those resident for commands, and
+// their bytes: an extent of pages a request holds counts once, with the
+// bytes of its form, and one whose pages only the cache holds not at all,
+// however much of the pool the cache fills.
+void testSnapshotCountsTheExtentsOfPagesRequestsHold() {
+    TestKvStorage storage(16, 100, 4, 10);
+    KvPool pool(storage, 0);
+    // Extents 0 and 1 hold pages only the cache holds.
+    const auto cached = pool.acquirePages(8);
+    require(cached.granted(), "snapshot setup failed");
+    for (uint32_t page : cached.pages) {
+        pool.retainPage(page, true);
+        pool.releasePage(page, false);
+    }
+    auto status = pool.snapshot();
+    require(status.extentsActive == 0 && status.activeBytes == 0 && status.allocatedBytes == 2 * extentBytes &&
+                !storage.active(0) && !storage.active(1),
+            "extents whose pages only the cache holds were counted active");
+    // A request's two Full pages on extent 2 and its Index page on extent 3.
+    const auto full = pool.acquirePages(2);
+    const auto index = pool.acquirePages(1, PageForm::Index);
+    status = pool.snapshot();
+    require(full.granted() && index.granted() && status.extentsActive == 2 &&
+                status.activeBytes == extentBytes + indexExtentBytes && status.index.extentsActive == 1 &&
+                status.index.activeBytes == indexExtentBytes && storage.activityFollows(pool),
+            "the snapshot did not count once each extent of pages a request holds, with its form's bytes");
+    // A request that takes a cached page counts its extent.
+    pool.retainPage(cached.pages[5], false);
+    require(pool.snapshot().extentsActive == 3 && pool.snapshot().activeBytes == 2 * extentBytes + indexExtentBytes,
+            "the extent of a cached page a request took was not counted active");
+    release(pool, full.pages);
+    release(pool, index.pages);
+    pool.releasePage(cached.pages[5], false);
+    status = pool.snapshot();
+    require(status.extentsActive == 0 && status.activeBytes == 0 &&
+                status.allocatedBytes == 3 * extentBytes + indexExtentBytes && storage.activityFollows(pool),
+            "extents stayed counted active once no request held a page of them");
+}
+
 // The pool with every page allocated and held by a request, less the pages
 // in `released`. Every page starts with content of its own.
 KvPool held(TestKvStorage &storage, const std::vector<uint32_t> &released) {
@@ -826,6 +865,7 @@ int main() {
         testCompactionLeavesFixedPagesInPlace();
         testCompactionMovesNothingWhenTheStorageRefuses();
         testOnlyExtentsOfPagesRequestsHoldAreActive();
+        testSnapshotCountsTheExtentsOfPagesRequestsHold();
         testActivityFollowsMovedReferences();
         testEachFormFillsItsOwnExtents();
         testAnExtentTakesTheFormOfEachAllocation();

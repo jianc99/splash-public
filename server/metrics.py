@@ -66,6 +66,8 @@ PROMETHEUS_SERIES = {
     ),
     "splash_kv_pages_allocated": ("kv", "pages_allocated"),
     "splash_kv_pages_active": ("kv", "pages_active"),
+    "splash_kv_extents_active": ("kv", "extents_active"),
+    "splash_kv_active_bytes": ("kv", "active_bytes"),
     "splash_kv_pages_cache": ("kv", "pages_cache"),
     "splash_kv_free_allocated_pages": ("kv", "pages_free"),
     "splash_kv_allocated_bytes": ("kv", "allocated_bytes"),

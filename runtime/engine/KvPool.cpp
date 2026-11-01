@@ -340,6 +340,8 @@ KvPoolSnapshot KvPool::snapshot() const {
     result.pagesFree += each.pagesFree;
     result.allocatedBytes += each.allocatedBytes;
     result.reclaimableBytes += each.reclaimableBytes;
+    result.extentsActive += each.extentsActive;
+    result.activeBytes += each.activeBytes;
   }
   result.extentAllocations = extentAllocations_;
   result.extentReleases = extentReleases_;
@@ -358,7 +360,9 @@ KvPoolFormSnapshot KvPool::formSnapshot(kv::PageForm form) const noexcept {
           record.activePages,
           record.prefixPages,
           record.allocatedExtents * extentBytes,
-          record.reclaimableExtents.count * extentBytes};
+          record.reclaimableExtents.count * extentBytes,
+          record.activeExtents,
+          record.activeExtents * extentBytes};
 }
 
 uint32_t KvPool::unallocatedExtent() const noexcept {
@@ -487,18 +491,24 @@ void KvPool::markFree(uint32_t page) noexcept {
 }
 
 void KvPool::markActive(uint32_t page) noexcept {
-  ++formOf(page).activePages;
-  if (!extents_[extentOf(page)].activePages++)
+  FormRecord &form = formOf(page);
+  ++form.activePages;
+  if (!extents_[extentOf(page)].activePages++) {
+    ++form.activeExtents;
     storage_.setExtentActive(extentOf(page), true);
+  }
 }
 
 void KvPool::markInactive(uint32_t page) noexcept {
   ExtentRecord &extent = extents_[extentOf(page)];
   if (!extent.activePages)
     std::terminate();
-  --formOf(page).activePages;
-  if (!--extent.activePages)
+  FormRecord &form = formOf(page);
+  --form.activePages;
+  if (!--extent.activePages) {
+    --form.activeExtents;
     storage_.setExtentActive(extentOf(page), false);
+  }
 }
 
 // An extent changes state only while none of its pages is held: its pages

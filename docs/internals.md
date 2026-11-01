@@ -1107,7 +1107,9 @@ that spills keeps an extent's worth of free Index pages, which spilling draws on
 first, so that a page spills at the memory wall.
 `/status` reports under `kv` the pages of allocated extents (`pages_allocated`),
 those requests and the cache hold (`pages_active`, `pages_cache`) and those
-nothing holds (`pages_free`), the bytes allocated and the bytes of empty extents
+nothing holds (`pages_free`), the extents of the pages requests hold and their
+bytes (`extents_active`, `active_bytes`), the pool's extents in the command
+queue's residency set, the bytes allocated and the bytes of empty extents
 (`allocated_bytes`, `reclaimable_bytes`), the extents allocated and released
 (`extent_allocations`, `extent_releases`) and those emptied by moving pages
 (`extent_compactions`, `pages_moved`), and the longest allocation, release and

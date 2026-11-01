@@ -108,6 +108,8 @@ class StatusRouteTests(HarnessTestCase):
             kv={
                 "pages_allocated": 8,
                 "pages_active": 4,
+                "extents_active": 1,
+                "active_bytes": 4096,
                 "pages_cache": 4,
                 "pages_free": 2,
                 "allocated_bytes": 8192,
@@ -187,6 +189,8 @@ class StatusRouteTests(HarnessTestCase):
         self.assertIn("splash_scheduler_prefill_rows_total 2048", metrics)
         self.assertIn("splash_scheduler_decode_b3_total 3", metrics)
         self.assertIn("splash_kv_pages_allocated 8", metrics)
+        self.assertIn("splash_kv_extents_active 1", metrics)
+        self.assertIn("splash_kv_active_bytes 4096", metrics)
         self.assertIn("splash_kv_free_allocated_pages 2", metrics)
         self.assertFalse([line for line in metrics if "splash_kv_pages_free" in line])
         self.assertIn("splash_kv_allocated_bytes 8192", metrics)

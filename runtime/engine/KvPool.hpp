@@ -21,6 +21,8 @@ struct KvPoolFormSnapshot {
   uint32_t pagesPrefix = 0;
   uint64_t allocatedBytes = 0;
   uint64_t reclaimableBytes = 0;
+  uint32_t extentsActive = 0;
+  uint64_t activeBytes = 0;
 };
 
 struct KvPoolSnapshot {
@@ -34,6 +36,11 @@ struct KvPoolSnapshot {
   // The bytes of extents none of whose pages is held, which a reclaim
   // releases at once.
   uint64_t reclaimableBytes = 0;
+  // The extents that hold a page a request holds, and their bytes: the
+  // pool's extents resident for commands (ExtentStorage::setExtentActive),
+  // which extents only the cache holds are not among.
+  uint32_t extentsActive = 0;
+  uint64_t activeBytes = 0;
   // Extents allocated and released through the pool, and the longest
   // allocation and release of one: what memory costs per extent. The counts
   // and the longest allocation include the runway the pool allocates when it
@@ -237,6 +244,8 @@ private:
     uint32_t freePages = 0;
     uint32_t activePages = 0;
     uint32_t prefixPages = 0;
+    // The extents that hold a page a request holds.
+    uint32_t activeExtents = 0;
     // The extent currently being filled. Stays valid while only this extent
     // changes, so a burst of allocations rescans the extents once per extent
     // it moves into.
@@ -282,8 +291,9 @@ private:
   void markUsed(uint32_t page) noexcept;
   void markFree(uint32_t page) noexcept;
   // A page gains its first request's reference or loses its last: counted in
-  // its form and its extent, whose storage hears when the extent's count
-  // leaves zero or reaches it (ExtentStorage::setExtentActive).
+  // its form and its extent; when the extent's count leaves zero or reaches
+  // it, the form counts the extent and its storage hears
+  // (ExtentStorage::setExtentActive).
   void markActive(uint32_t page) noexcept;
   void markInactive(uint32_t page) noexcept;
   void setExtentAllocated(uint32_t extent, bool allocated) noexcept;

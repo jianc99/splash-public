@@ -110,8 +110,9 @@ void testCleanRuntimeStatus(const char *goldenPath) {
                             .generatedTokens = 40,
                             .maxNewTokens = 128,
                             .ageMilliseconds = 2250.25}};
+  // Four extents of 32 pages: the 24 pages requests hold are in two of them.
   engine.resources.pool = {128, 72, 24, 32, 128 * 4096ULL,
-                           32 * 4096ULL, 5, 3, 2.5, 0.75, 2, 9};
+                           32 * 4096ULL, 2, 64 * 4096ULL, 5, 3, 2.5, 0.75, 2, 9};
   engine.resources.extentCompactMaxMilliseconds = 1.25;
   engine.resources.stateCache = {2, 0, 128, 1, 1, 2, 0};
   engine.resources.stateCache.checkpointEntries = 1;
@@ -333,9 +334,10 @@ void testCleanRuntimeStatus(const char *goldenPath) {
           "status lost the rows decode cycles verify");
   require(json.find("\"kv\":{\"block_tokens\":32,"
                     "\"pages_allocated\":128,\"pages_active\":24,"
+                    "\"extents_active\":2,\"active_bytes\":262144,"
                     "\"pages_cache\":32,\"pages_free\":72,") !=
               std::string::npos,
-          "status lost the KV pool's page counts");
+          "status lost the KV pool's page counts or the extents of requests' pages");
   require(json.find("\"extent_allocations\":5,\"extent_releases\":3,"
                     "\"extent_allocate_max_ms\":2.5,\"extent_release_max_ms\":0.75,"
                     "\"extent_compactions\":2,\"pages_moved\":9,"
