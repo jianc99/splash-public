@@ -586,8 +586,8 @@ def language_only_refusal(code: int, document: dict, modality: str) -> bool:
 
 def run_text_only(port: int, model: str, nonce: str) -> None:
     """A server without vision refuses images and PDFs, in every API shape,
-    with the language-only message before rendering anything, and serves the
-    next text request."""
+    with its message before rendering anything, and serves the next text
+    request."""
     question = f"What color is this image? Answer with one word. Request {nonce}."
     pdf = base64.b64encode(
         (ROOT / "dev/tests/fixtures/documents/plain.pdf").read_bytes()
@@ -697,7 +697,7 @@ def run_text_only(port: int, model: str, nonce: str) -> None:
         code, rejected = request(port, "POST", path, body)
         require(
             language_only_refusal(code, rejected, modality),
-            f"text-only {name} was not refused as language-only: {code} {rejected!r}",
+            f"text-only {name} was not refused for want of vision: {code} {rejected!r}",
         )
     code, chat = request(
         port,

@@ -520,7 +520,9 @@ opening passwords and citations are unsupported. PDFs render one at a time: a
 request waits for its turn and renders without holding any of the server's
 preparation capacity, so other requests prepare meanwhile.
 
-A model served with `--language-only` refuses both with 400 ([vision](models.md#vision)).
+A model serving without vision refuses both with 400: one served with
+`--language-only`, one of a family without a vision tower such as Flint, or a
+GGUF served without a projector ([vision](models.md#vision)).
 
 ## Responses state
 
@@ -663,7 +665,7 @@ Proxy consumers can use these fields; additional fields may be added:
 | `loop.max_tick_ms` | Longest control pass and engine step of the native loop. A reader thread keeps reading requests meanwhile, so a request frame whose write stalls 5 s after it started fails the engine only when the process stopped reading; while requests are pending the server asks for status every 10 s and fails an engine whose loop does not answer within 30 s. |
 | `maximum_context_tokens` | Declared context limit; available memory may limit admission |
 | `thermal_state` | The Mac's thermal state as macOS reports it: `nominal`, `fair`, `serious` or `critical`. As the Mac heats, its CPU and GPU clocks drop and prefill and decode slow down, on some Macs already at `fair`; readiness ignores it. The engine samples it twice a second and logs each change (`Thermal state: fair → serious`) |
-| `vision`, `input_modalities` | Whether image and PDF input is accepted; `false` and `["text"]` after `--language-only` |
+| `vision`, `input_modalities` | Whether image and PDF input is accepted; `false` and `["text"]` for a model serving without vision |
 | `reasoning_switch` | Whether a request's reasoning effort or `enable_thinking` turns the model's reasoning on and off ([default reasoning effort](server.md#default-reasoning-effort)): `true` for the Qwen families, `false` for Flint, whose model decides each turn |
 | `chat_template.later_system` | `native`, `patched` or `unsupported`: how system messages after the first render (per name for named templates) |
 | `transport.recovering`, `transport.stopped`, `transport.error` | The engine is restarting, or Splash stopped restarting it after repeated failures; `error` names its failure, the last failed restart, or why restarts stopped |
