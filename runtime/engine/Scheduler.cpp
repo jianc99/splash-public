@@ -230,29 +230,44 @@ std::vector<uint64_t> Scheduler::prefillAdmissionOrder(
       throw std::logic_error("invalid pending prefill admission");
     pending.push_back({&value, candidate.cachedTokens});
   }
-  std::vector<PrefillRequestView> ready;
-  ready.reserve(requests_.size());
+  std::vector<PrefillRequestView> lanes;
+  lanes.reserve(requests_.size());
   std::vector<uint64_t> result;
   for (const auto &[_, request] : requests_) {
     // A command between its passes runs before any new prefill.
     if (request.phase == Phase::Prefill && request.passes)
       return result;
     if (request.phase == Phase::Prefill)
-      ready.push_back({&request, request.promptProcessed});
+      lanes.push_back({&request, request.promptProcessed});
   }
-  for (const auto &request : pending)
-    ready.push_back(request);
-  if (const auto plan = planPrefill(std::move(ready))) {
-    // Admission ranks candidates against every decoder, left out of a plan
-    // or not.
-    const auto decode = nextDecode({});
-    if (decode && get(decode->items.front().requestId).spec.priority <
-                      get(plan->items.front().requestId).spec.priority)
+  // Admission starts only lanes the next command serves: it plans again
+  // without the candidates a plan leaves out until it keeps all it plans, as
+  // without them the plan can take another leader (planPrefill measures its
+  // near-equal band from the shortest lane).
+  std::optional<BatchPlan> plan;
+  size_t planned = 0;
+  do {
+    planned = pending.size();
+    std::vector<PrefillRequestView> ready = lanes;
+    ready.insert(ready.end(), pending.begin(), pending.end());
+    plan = planPrefill(std::move(ready));
+    if (!plan)
       return result;
-    for (const auto &item : plan->items)
-      if (get(item.requestId).phase != Phase::Prefill)
-        result.push_back(item.requestId);
-  }
+    std::erase_if(pending, [&](const PrefillRequestView &view) {
+      return std::none_of(plan->items.begin(), plan->items.end(), [&](const BatchItem &item) {
+        return item.requestId == view.request->spec.id;
+      });
+    });
+  } while (pending.size() != planned);
+  // Admission ranks candidates against every decoder, left out of a plan or
+  // not.
+  const auto decode = nextDecode({});
+  if (decode && get(decode->items.front().requestId).spec.priority <
+                    get(plan->items.front().requestId).spec.priority)
+    return result;
+  for (const auto &item : plan->items)
+    if (get(item.requestId).phase != Phase::Prefill)
+      result.push_back(item.requestId);
   return result;
 }
 
@@ -327,20 +342,50 @@ Scheduler::planPrefill(std::vector<PrefillRequestView> ready) const {
   const auto overdue = [](const PrefillRequestView &view) {
     return view.request->overtaken >= kMaximumOvertakes;
   };
+  const auto remaining = [](const PrefillRequestView &view) {
+    return uint64_t{view.request->spec.prefillTokens - view.promptProcessed};
+  };
   std::sort(ready.begin(), ready.end(),
             [&](const PrefillRequestView &a, const PrefillRequestView &b) {
               if (a.request->spec.priority != b.request->spec.priority)
                 return a.request->spec.priority < b.request->spec.priority;
               if (overdue(a) != overdue(b))
                 return overdue(a);
-              const uint32_t remainingA =
-                  a.request->spec.prefillTokens - a.promptProcessed;
-              const uint32_t remainingB =
-                  b.request->spec.prefillTokens - b.promptProcessed;
-              if (remainingA != remainingB)
-                return remainingA < remainingB;
+              if (remaining(a) != remaining(b))
+                return remaining(a) < remaining(b);
               return a.request->order < b.request->order;
             });
+  // Unless the front lane is overdue, the oldest lane of its priority leads
+  // whose remaining prompt exceeds the shortest by at most floor((m-1)/k)
+  // commands of c rows, with c the row budget of the shortest's commands, m
+  // their number and k = kMaximumOvertakes: as many as an earlier lane would
+  // lead, overdue, before the shortest's last, were the shortest to lead. An
+  // earlier lane it makes overdue comes in as a second long lane, which can
+  // push a Resident lane to Spill. Between two lanes with serial prefill, the
+  // earlier one leading does not raise the summed first-token latency where
+  // those overdue commands would take c rows each. It raises it where one
+  // comes before a last command of the shortest that fits a contended slice,
+  // and so takes the slice, and where a lane older than the leader and
+  // outside the band, overtaken by it as by the shortest, leads overdue
+  // commands ahead of both. While the first lane to finish decodes, the
+  // other's rows run at 1/(1 + decodeShare_) of their speed, and the earlier
+  // lane leading leaves up to the tolerance more of them: the later first
+  // token can come up to decodeShare_ times their time later. The rest stay
+  // shortest first. A tolerance is not transitive, so it cannot go in the
+  // comparator.
+  if (!overdue(ready.front())) {
+    const RequestPriority priority = ready.front().request->spec.priority;
+    const uint64_t shortest = remaining(ready.front());
+    const uint64_t rows = prefillBudget(ready.front(), ready);
+    const uint64_t tolerance = (shortest - 1) / (rows * kMaximumOvertakes) * rows;
+    auto oldest = ready.begin();
+    for (auto view = ready.begin();
+         view != ready.end() && view->request->spec.priority == priority; ++view)
+      if (remaining(*view) <= shortest + tolerance &&
+          view->request->order < oldest->request->order)
+        oldest = view;
+    std::rotate(ready.begin(), oldest, oldest + 1);
+  }
   const PrefillRequestView &leader = ready.front();
   const RequestPriority selectedPriority = leader.request->spec.priority;
 

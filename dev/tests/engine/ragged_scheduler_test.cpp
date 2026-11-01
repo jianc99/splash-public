@@ -867,6 +867,182 @@ void testServedLaneResetsOvertaking() {
           "a lane that received rows was treated as overtaken");
 }
 
+// The lane that leads the next prefill command once lane 1 of `earlier`
+// tokens and lane 2 of `later`, submitted after it, are ready from their
+// cached positions.
+uint64_t prefillLeader(engine::Scheduler &scheduler, uint32_t earlier, uint32_t later,
+                       uint32_t earlierCached = 0, uint32_t laterCached = 0,
+                       RequestPriority earlierPriority = RequestPriority::Normal) {
+  scheduler.submit(request(1, earlier, earlierPriority));
+  scheduler.submit(request(2, later));
+  scheduler.resourcesReady(1, earlierCached);
+  scheduler.resourcesReady(2, laterCached);
+  return scheduler.next({})->items.front().requestId;
+}
+
+uint64_t prefillLeader(uint32_t earlier, uint32_t later, uint32_t earlierCached = 0,
+                       uint32_t laterCached = 0,
+                       RequestPriority earlierPriority = RequestPriority::Normal) {
+  engine::Scheduler scheduler(0.0);
+  return prefillLeader(scheduler, earlier, later, earlierCached, laterCached, earlierPriority);
+}
+
+// The oldest lane leads whose remaining prompt exceeds the shortest by at most
+// a command of the shortest's for each k = 3 it needs past its first.
+// Unmeasured, a command is 2048 rows: 30,000 take 15 commands and allow
+// 4 x 2048; 6,145 take 4 and allow 2048; 6,144 take 3 and allow none, as at
+// 4,000 and 3,000.
+void testOldestNearEqualPromptLeads() {
+  require(prefillLeader(71'254, 71'220) == 1 && prefillLeader(38'192, 30'000) == 1 &&
+              prefillLeader(8193, 6145) == 1,
+          "a later prompt led an earlier one within the rows it would lead overdue");
+  require(prefillLeader(38'193, 30'000) == 2 && prefillLeader(8192, 6144) == 2 &&
+              prefillLeader(4000, 3000) == 2,
+          "an earlier prompt led a later one past the rows it would lead overdue");
+  // Remaining rows, after a cached prefix: 20,000 against 19,000 lead, and
+  // 22,000 against 16,000 do not.
+  require(prefillLeader(40'000, 19'000, 20'000, 0) == 1 &&
+              prefillLeader(22'000, 40'000, 0, 24'000) == 2,
+          "near-equal prompts were not measured by their remaining rows");
+  // Beside a decoder, at 512-row slices: 2,000 rows take four commands and
+  // allow 512; 500 take one.
+  const auto contendedLeader = [](uint32_t earlier, uint32_t later) {
+    engine::Scheduler scheduler(0.0);
+    scheduler.observePrefill(2048, 1024.0);
+    scheduler.submit(request(3, 1));
+    scheduler.resourcesReady(3, 1);
+    completeDecode(scheduler);
+    return prefillLeader(scheduler, earlier, later);
+  };
+  require(contendedLeader(2512, 2000) == 1 && contendedLeader(2513, 2000) == 2 &&
+              contendedLeader(600, 500) == 2,
+          "near-equal prompts were not measured in their contended commands");
+  // Prompts that finish within k commands keep shortest first.
+  engine::Scheduler scheduler(0.0);
+  for (uint64_t id = 1; id <= 3; ++id) {
+    scheduler.submit(request(id, id == 1 ? 1300 : 1000));
+    scheduler.resourcesReady(id, 0);
+  }
+  const BatchPlan plan = *scheduler.next({});
+  require(plan.items.size() == 3 && plan.items[0].requestId == 2 &&
+              plan.items[1].requestId == 3 && plan.items[2].requestId == 1 &&
+              plan.items[2].tokenCount == 48,
+          "short prompts did not run shortest first");
+}
+
+// The band counts the shortest lane's own commands: in 8192-row prefill
+// groups, 20,000 rows take three and allow none, where chunks would allow
+// 6,144; and with the shortest streaming its history beside a ready peer,
+// 2,000 rows take four 512-row slices and allow 512, where chunks would
+// allow none.
+void testNearEqualBandCountsTheShortestLanesCommands() {
+  engine::Scheduler grouped(0.0);
+  // A streamed target's chunk: 4.9 s, 3.4 s of it on expert reads.
+  grouped.observePrefill(2048, 4900.0, 3400.0);
+  for (uint64_t id = 1; id <= 2; ++id) {
+    RequestSpec spec = request(id, id == 1 ? 21'000 : 20'000);
+    spec.prefillGroupRows = 4 * model::ExecutionLimits::prefillTokenBudget;
+    grouped.submit(spec);
+    grouped.resourcesReady(id, 0);
+  }
+  require(grouped.next({})->items.front().requestId == 2,
+          "the band counted chunks where the shortest lane runs prefill groups");
+  engine::Scheduler streaming(0.0);
+  // At 0.5 ms a row, a contended command takes 512 rows.
+  streaming.observePrefill(2048, 1024.0);
+  streaming.submit(request(1, 2512));
+  streaming.submit(request(2, 2000));
+  streaming.resourcesReady(1, 0);
+  streaming.resourcesReady(2, 0);
+  streaming.setStreamsHistory(2, true);
+  require(streaming.next({})->items.front().requestId == 1,
+          "the band counted chunks where the shortest lane streams its history");
+}
+
+// Lane 1 of 9,000 rows leads lane 3 of 7,000, within a command of it, and
+// where attention halves its rows the rest join it shortest first.
+void testNearEqualLeaderKeepsTheRestShortestFirst() {
+  engine::Scheduler scheduler(0.0, 700'000);
+  for (uint64_t id = 1; id <= 3; ++id) {
+    scheduler.submit(request(id, 10'000 - 1000 * id));
+    scheduler.resourcesReady(id, 0);
+  }
+  const BatchPlan plan = *scheduler.next({});
+  require(plan.items.size() == 3 && plan.items[0].requestId == 1 &&
+              plan.items[0].tokenCount == 1024 && plan.items[1].requestId == 3 &&
+              plan.items[1].tokenCount == 512 && plan.items[2].requestId == 2 &&
+              plan.items[2].tokenCount == 256,
+          "the lanes after a near-equal leader did not stay shortest first");
+}
+
+// An overdue lane leads an older lane that is not overdue, which the band
+// measured from the overdue lane would otherwise put first: lane 1 joins three
+// short arrivals' commands that leave lane 2 out.
+void testOverdueLaneLeadsAnOlderLane() {
+  engine::Scheduler scheduler(0.0);
+  scheduler.submit(request(1, 8000));
+  scheduler.submit(request(2, 9000));
+  scheduler.resourcesReady(1, 0);
+  scheduler.resourcesReady(2, 0);
+  for (uint64_t id = 3; id <= 5; ++id) {
+    scheduler.submit(request(id, 100));
+    scheduler.resourcesReady(id, 0);
+    const BatchPlan plan = *scheduler.next({});
+    require(plan.items.size() == 2 && plan.items[0].requestId == id &&
+                plan.items[1].requestId == 1,
+            "a short arrival and the shorter long lane did not share the command");
+    scheduler.commit(plan, {});
+    const std::vector<StepResult> results{
+        {id, 100, true, DecodeStage::Regular},
+        {1, plan.items[1].tokenCount, false, DecodeStage::Regular}};
+    scheduler.complete(plan, results, 0.0, true);
+  }
+  const BatchPlan overdue = *scheduler.next({});
+  require(overdue.items.size() == 1 && overdue.items[0].requestId == 2,
+          "an overdue lane did not lead an older lane");
+}
+
+// Only lanes of the front lane's priority count: an older lane of a lower
+// priority does not lead, and one overdue after lane 2's three commands does
+// not keep lane 2 from leading lane 3.
+void testNearEqualOrderStaysWithinAPriority() {
+  require(prefillLeader(5000, 5000, 0, 0, RequestPriority::Background) == 2,
+          "an older lane of a lower priority led a near-equal one");
+  engine::Scheduler scheduler(0.0);
+  scheduler.submit(request(1, 5000, RequestPriority::Background));
+  scheduler.resourcesReady(1, 0);
+  scheduler.submit(request(2, 27'144));
+  scheduler.resourcesReady(2, 0);
+  for (int command = 0; command < 3; ++command)
+    completePrefill(scheduler, *scheduler.next({}));
+  scheduler.submit(request(3, 20'000));
+  scheduler.resourcesReady(3, 0);
+  require(scheduler.next({})->items.front().requestId == 2,
+          "an overdue lane of a lower priority stopped the near-equal rule");
+}
+
+// Admission starts the lanes of the next plan, so the older of two queued
+// near-equal prompts starts first, and none that the next command would leave
+// out: without the shortest candidate, lane 3, which the plan leaves out,
+// lane 1 leads lane 2.
+void testAdmissionStartsTheLanesOfTheNextCommand() {
+  engine::Scheduler scheduler(0.0);
+  scheduler.submit(request(1, 71'254));
+  scheduler.submit(request(2, 71'220));
+  const std::array candidates{PrefillAdmission{1, 0}, PrefillAdmission{2, 0}};
+  require(scheduler.prefillAdmissionOrder(candidates) == std::vector<uint64_t>{1},
+          "admission started a later near-equal prompt first");
+  engine::Scheduler running(0.0);
+  running.submit(request(1, 41'000));
+  running.resourcesReady(1, 0);
+  running.submit(request(2, 38'000));
+  running.submit(request(3, 30'000));
+  const std::array queued{PrefillAdmission{2, 0}, PrefillAdmission{3, 0}};
+  require(running.prefillAdmissionOrder(queued).empty() &&
+              running.next({})->items.front().requestId == 1,
+          "admission started a lane the next command leaves out");
+}
+
 void testRealDecodeWidths() {
   for (uint32_t width = 1; width <= 4; ++width) {
     engine::Scheduler scheduler(0.0);
@@ -1596,6 +1772,12 @@ int main() {
     testEqualLanesRunInArrivalOrderWithoutOvertaking();
     testLaneOvertakenThreeTimesLeadsTheNextCommand();
     testServedLaneResetsOvertaking();
+    testOldestNearEqualPromptLeads();
+    testNearEqualBandCountsTheShortestLanesCommands();
+    testNearEqualLeaderKeepsTheRestShortestFirst();
+    testOverdueLaneLeadsAnOlderLane();
+    testNearEqualOrderStaysWithinAPriority();
+    testAdmissionStartsTheLanesOfTheNextCommand();
     testRealDecodeWidths();
     testUnconstrainedLanesShareDecode();
     testRejectedCommitCountsNothing();
