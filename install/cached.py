@@ -5,8 +5,7 @@ models beside the ones it downloaded:
 
     python install/cached.py [--models DIR]
 
-prints, one JSON line each, {"model": ID} for each model it installed. A
-repository it cannot serve installs nothing: a model of no family Splash
+A repository it cannot serve installs nothing: a model of no family Splash
 serves, one missing files, or no model at all, such as a draft.
 """
 
@@ -15,7 +14,6 @@ from __future__ import annotations
 import argparse
 import contextlib
 import io
-import json
 import os
 import sys
 from pathlib import Path
@@ -91,7 +89,7 @@ def candidates(name, files, suggested_models):
 
 def install_cached(models_root):
     """Install each model the Hub cache holds whole that is not installed in
-    models_root, without the Hub; yield the IDs installed."""
+    models_root, without the Hub."""
     from . import hub, upstream
 
     suggested_models = suggested()
@@ -108,8 +106,7 @@ def install_cached(models_root):
                 with contextlib.redirect_stdout(io.StringIO()):
                     upstream.prepare(selection)
             except (models.ModelError, OSError):
-                continue
-            yield model
+                pass  # the installer refuses it
 
 
 def main(argv=None):
@@ -118,8 +115,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     # Only what the cache holds: the Hub is never asked.
     os.environ["HF_HUB_OFFLINE"] = "1"
-    for model in install_cached(args.models):
-        print(json.dumps({"model": model}), flush=True)
+    install_cached(args.models)
     return 0
 
 
