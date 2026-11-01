@@ -102,7 +102,7 @@ paths for `--model-dir`, `--draft-model` and `--mmproj`.
 | `--announce-served-name` | Off | Report the first `--served-model-name` in responses; needs `--served-model-name`. |
 | `--default-reasoning-effort` | `SPLASH_DEFAULT_REASONING_EFFORT` or the template's | Effort of Chat and Responses requests that set none. See [default reasoning effort](#default-reasoning-effort). |
 | `--thinking-token-budget` | `SPLASH_THINKING_TOKEN_BUDGET` or none | Thinking tokens of a request that sets no budget. See [thinking token budget](#thinking-token-budget). |
-| `--thinking-end-text` | `SPLASH_THINKING_END_TEXT` or `</think>` | Text that ends thinking where a budget runs out, `</think>` its last token. See [thinking token budget](#thinking-token-budget). |
+| `--thinking-end-text` | `SPLASH_THINKING_END_TEXT` or the template's close | Text that ends thinking where a budget runs out, `</think>` its last token; unset, the close the chat template writes after a reasoning. See [thinking token budget](#thinking-token-budget). |
 | `--max-request-size` | `128M` | Largest HTTP request body. See [request limits](api.md#request-limits-and-timeouts). |
 | `--max-image-pixels` | `4194304` | Maximum resized pixels per image. An image's vision scratch grows with its patches (pixels / 256), to about 600 MiB at the default. |
 | `--request-timeout` | None | Time a request may take from its arrival; a request's own `timeout` can only shorten it. |
@@ -985,9 +985,15 @@ request thinks on until the character is complete, a token or a few, and its
   server's budget; unset, thinking has no cap.
 - `--thinking-end-text TEXT` (or `SPLASH_THINKING_END_TEXT`) is the server's
   thinking end: text without the template's special tokens, then `</think>` as
-  its own token, at most 64 tokens in all. Unset, the end is `</think>` alone.
-  The server checks the text with the model's tokenizer when it starts, and
-  stops with an error on one that breaks these rules.
+  its own token, at most 64 tokens in all. The server checks the text with the
+  model's tokenizer when it starts, and stops with an error on one that breaks
+  these rules. Unset, the end is the close the chat template writes after a
+  reasoning, which the server probes at startup: a line break then `</think>`
+  for Qwen's templates, `</think>` alone for Flint's. A reply whose thinking
+  the budget ended then renders back in the next request as it was generated,
+  so that the prompt cache reuses the whole reply; with `</think>` alone, the
+  Qwen templates' line break made the next request read the reply again. A
+  reasoning cut just after a line break still renders back with one less.
 
 A model whose thinking is cut mid-thought may go on planning in its answer, and
 may close that with a `</think>` of its own. A chat answer drops every `</think>`
@@ -1006,7 +1012,11 @@ splash serve --model mlx-community/Qwen3.8-27B-4bit --thinking-token-budget 1200
 
 A budget applies only where generation starts in a thinking block, and one the
 output limit reaches first changes nothing; the output limit can also cut the
-end short. A model that opens its thinking itself, as Flint does, never starts
+end short. Where the context leaves a request less room than its output limit,
+its budget gives up the difference, down to none, so that the answer keeps the
+room the request left it: a budget of 24,576 under a limit of 32,768 with
+20,000 tokens of context left ends thinking at 11,808. A model that opens its
+thinking itself, as Flint does, never starts
 in one, and a budget caps nothing for it. Where the output may call a tool, a
 call's opening ends thinking too, so the end never lands inside a call. The
 engine takes any `<tool_call>` token for that opening, while the reply's
