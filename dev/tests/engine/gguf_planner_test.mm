@@ -836,8 +836,8 @@ model::QwenTargetDimensions flintGeometry() {
 // two slices of the routed width and has no gate; its streamed experts are
 // the MoE layers' alone. Its metadata names each mismatch, its layer
 // patterns' among them, scaled routing weights and a RoPE over part of a
-// head, and its tensors a missing sink and a router bias the blocks would
-// not add.
+// head, and its tensors a missing sink, sinks of BF16 (llama.cpp writes them
+// F32) and a router bias the blocks would not add.
 void checkFlint(const std::filesystem::path &directory) {
   const model::QwenTargetDimensions g = flintGeometry();
   std::vector<Tensor> tensors = targetTensors(
@@ -924,6 +924,12 @@ void checkFlint(const std::filesystem::path &directory) {
   std::erase_if(sinkless, [](const Tensor &tensor) { return tensor.name == "blk.3.attn_sinks.weight"; });
   check(names(planned(metadata(g), sinkless), {"blk.3.attn_sinks.weight (missing)"}),
         "planner names a missing sink");
+  std::vector<Tensor> bfloat16Sinks = tensors;
+  Tensor &sinks = tensorNamed(bfloat16Sinks, "blk.3.attn_sinks.weight");
+  sinks.type = model::ggml::kBF16;
+  sinks.data.resize(sizeof(uint16_t) * g.attentionQueryHeads);
+  check(names(planned(metadata(g), bfloat16Sinks), {"blk.3.attn_sinks.weight (BF16)"}),
+        "planner refuses sinks of BF16");
   std::vector<Tensor> biased = tensors;
   biased.push_back({"blk.2.ffn_exp_probs_b.bias", {g.experts}, model::ggml::kF32, test_gguf::Bytes(4 * g.experts)});
   check(names(planned(metadata(g), biased), {"blk.2.ffn_exp_probs_b.bias (a router bias)"}),
