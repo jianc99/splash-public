@@ -299,19 +299,21 @@ struct BatchItem final {
   uint64_t requestId = 0;
   uint32_t tokenCount = 0;
   uint32_t promptOffset = 0;
+
+  bool operator==(const BatchItem &) const = default;
 };
 
 struct BatchPlan final {
   WorkKind kind = WorkKind::Decode;
   std::vector<BatchItem> items;
   DecodeStage decodeStage = DecodeStage::Regular;
-  // A prefill of one lane may run in passes, each over the next of `passes`
-  // even shares of the target's layers (Model::prefillPasses): this command
-  // is pass `pass`. The first pass begins the rows, the last ends them and
-  // commits; the rows' work between lives in the model's prefill memory,
-  // which no other prefill touches meanwhile, while other lanes' decode
-  // commands run between passes. A request that ends between passes leaves
-  // the rest unrun and nothing of the rows committed.
+  // A prefill command may run in passes, each over the next of `passes` even
+  // shares of the target's layers (Model::prefillPasses), every one of the
+  // same items: this command is pass `pass`. The first pass begins the rows,
+  // the last ends them and commits; the rows' work between lives in the
+  // model's prefill memory, which no other prefill touches meanwhile, while
+  // other lanes' decode commands run between passes. A command abandoned
+  // between its passes commits nothing of its rows (Scheduler::abandonPasses).
   uint32_t pass = 0;
   uint32_t passes = 1;
 

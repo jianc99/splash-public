@@ -312,10 +312,32 @@ bool Engine::tick(double now) {
     ~HeldWaits() { engine.rewaitHeld(now); }
   } const heldWaits{*this, now};
   while (auto plan = scheduler_.next(excluded)) {
+    // A command between its passes yields, whole, to a command that
+    // supersedes it (Scheduler::abandonsPasses), and its lanes that ended
+    // meanwhile end. One planned again with its lanes is abandoned before it
+    // takes shape, its lanes then taking part in it as any lane does; one of
+    // a higher priority, once it runs, so that the command goes on while
+    // that one waits for memory.
+    const bool supersedes = scheduler_.abandonsPasses(*plan);
+    if (supersedes && std::ranges::any_of(plan->items, [&](const BatchItem &item) {
+          return betweenPasses(item.requestId);
+        })) {
+      abandonPasses();
+      continue;
+    }
     std::vector<ModelBatchItem> items;
     std::vector<std::vector<Capture>> captures;
-    switch (prepare(*plan, items, captures, now)) {
+    const Prepared prepared = [&] {
+      const Superseding superseding(superseding_, supersedes);
+      return prepare(*plan, items, captures, now);
+    }();
+    switch (prepared) {
     case Prepared::Runnable: {
+      // Unless prepare gave the command up already: an allocation for it
+      // took what the command holds (escalate), or a lane yielded beside one
+      // of it that ended (yieldsEndedLanes).
+      if (supersedes && passCommand_)
+        abandonPasses();
       std::unique_ptr<ModelBatchTicket> ticket =
           model_.submit(*plan, items, completionNotifier_);
       if (!ticket) {
@@ -325,6 +347,10 @@ bool Engine::tick(double now) {
       // from the SSD cache: alone in its command (streamsHistory).
       const bool streamed = plan->kind == WorkKind::Prefill && items.front().pageSources;
       scheduler_.commit(*plan, excluded);
+      // A command in passes keeps its items and their captures for its
+      // later passes (prepare).
+      if (plan->passes > 1 && !plan->pass)
+        passCommand_ = PassCommand{items, captures};
       // The command reads the cached pages its lanes' blocks were swapped
       // for, and those a resume restored. Selecting a constrained request's
       // first token reads none, but the cycle after it does; only a first
@@ -790,6 +816,10 @@ uint32_t Engine::awaitedBoundary(const Request &producer, uint32_t end) const {
 
 bool Engine::admit(Request &active, double now) {
   const bool resuming = scheduler_.suspended(active.request.id);
+  // A start whose prompt would supersede the command between its passes
+  // takes what that command holds first, as its prompt's command does once it
+  // runs (escalate).
+  const Superseding superseding(superseding_, scheduler_.yieldsTo(active.request.priority, 1));
   ModelRequest modelRequest = active.request.modelView();
   modelRequest.prompt = active.exactTokens;
   CacheLookup lookup =
@@ -973,7 +1003,7 @@ KvMode Engine::kvModeFor(const Request &active) const {
     return KvMode::Resident;
   uint64_t bytes = spill.geometry.residentBytes(tokens);
   for (const auto &[id, peer] : requests_) {
-    if (!peer.lane || id == active.request.id)
+    if (!peer.lane || peer.pendingEnd || id == active.request.id)
       continue;
     const uint64_t projection = projectedTokens(peer);
     bytes += peer.kvMode == KvMode::Spill ? spill.geometry.spillFloorBytes(projection)
@@ -1089,7 +1119,7 @@ void Engine::waitForDiskQuota(Request &active, double now) {
 }
 
 bool Engine::convertToSpill(Request &active, const CacheLookup *restoring) {
-  if (!config_.spill.capable || active.kvMode != KvMode::Resident || active.passCommand)
+  if (!config_.spill.capable || active.kvMode != KvMode::Resident || betweenPasses(active.request.id))
     return false;
   const uint64_t end = restoring ? chainEnd(*restoring) : chainEnd(active);
   if (!cache_.convertToSpill(active.request.id, spillPages(active, end), !commandShaped_))
@@ -1656,22 +1686,21 @@ Engine::Prepared Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &i
     const Serving mark(config_.serving, laneInService(std::nullopt));
     static_cast<void>(cache_.trimWindows());
   }
-  // A command's later passes run its item again: the lane holds what it
-  // needs, and only its page table may have changed, as moves between
-  // commands rewrite it.
+  // A command's later passes run its items again: their lanes hold what
+  // they need, and only their page tables may have changed, as moves
+  // between commands rewrite them.
   if (plan.pass) {
-    Request &active = request(plan.items.front().requestId);
-    if (!active.passCommand)
+    if (!passCommand_)
       throw std::logic_error("a prefill command's pass has no command");
-    ModelBatchItem item = active.passCommand->item;
-    const PageTableView pageTable = cache_.cutPageTable(active.request.id);
-    item.pageTable = pageTable.pages;
-    item.pageTableRevision = pageTable.revision;
-    item.pageTableFirstChanged = pageTable.firstChanged;
-    item.pageSources = pageTable.sources;
-    items.push_back(std::move(item));
-    captures.assign(1, active.passCommand->captures);
-    active.resourceWait = {};
+    items = passCommand_->items;
+    for (ModelBatchItem &item : items) {
+      const PageTableView pageTable = cache_.cutPageTable(item.requestId);
+      item.pageTable = pageTable.pages;
+      item.pageTableRevision = pageTable.revision;
+      item.pageTableFirstChanged = pageTable.firstChanged;
+      item.pageSources = pageTable.sources;
+    }
+    captures = passCommand_->captures;
     return Prepared::Runnable;
   }
   std::vector<BatchItem> admitted;
@@ -1690,15 +1719,16 @@ Engine::Prepared Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &i
   // A decoding lane reads KV only the SSD cache holds, through the hot block
   // cache.
   bool spilledReads = false;
-  Request *const yielding = laneToYield();
   // A scheduled lane is resident: it grows as a request in service. The
   // lane that yields first if growth fails takes nothing in use, since its
   // own suspension, not another conversation's replay point, pays for it.
   // While other lanes fit, it waits for them instead, resident and denied
-  // each step, as a start a resident lane holds back waits.
+  // each step, as a start a resident lane holds back waits. Which lane that
+  // is is asked where it matters: an allocation may give up the command
+  // between its passes, whose lanes that ended then end (escalate).
   const auto growthClass = [&](const Request &active) {
-    return &active == yielding && anotherResident(active.request.id) ? ReclaimClass::Ordinary
-                                                                     : ReclaimClass::InUse;
+    return &active == laneToYield() && anotherResident(active.request.id) ? ReclaimClass::Ordinary
+                                                                          : ReclaimClass::InUse;
   };
   // A prefill command's KV reaches its first state boundary first; what
   // lies past it follows once that state has its buffers
@@ -1818,6 +1848,13 @@ Engine::Prepared Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &i
     request(scheduled.requestId).resourceWait = {};
   for (const Denied &entry : denied)
     noteRefusal(request(entry.requestId), now, entry.denial);
+  // Beside a lane of its command that ended, a lane gives that command up in
+  // place of its suspension; the next tick plans again either way.
+  const auto yieldLane = [&](Request &lane, uint64_t workEnd, metal::AllocationFailure failure) {
+    if (!yieldsEndedLanes(lane))
+      suspendForGrowth(lane, workEnd, failure, now);
+    return Prepared::Yielded;
+  };
   // A lane refused the model's memory for its reads of spilled KV, which no
   // transfer in flight returns, takes it from the lane that yields first, as
   // when no lane fits, if that lane holds its memory outside this command
@@ -1825,18 +1862,16 @@ Engine::Prepared Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &i
   // refusal: run without the lane while they fit, they would leave it
   // refused for as long as they run. A lane refused its KV waits while they
   // fit, since they grow too and are refused in turn.
-  if (yielding && std::ranges::none_of(plan.items, [&](const BatchItem &item) {
+  if (Request *const yielding = laneToYield();
+      yielding && std::ranges::none_of(plan.items, [&](const BatchItem &item) {
         return item.requestId == yielding->request.id;
       })) {
     const auto refused = std::ranges::find_if(denied, [&](const Denied &entry) {
       return !entry.kv && !entry.denial.pending &&
              yieldsBefore(*yielding, request(entry.requestId));
     });
-    if (refused != denied.end()) {
-      suspendForGrowth(*yielding, kvCapacity(yielding->request.id),
-                       refused->denial.allocationFailure, now);
-      return Prepared::Yielded;
-    }
+    if (refused != denied.end())
+      return yieldLane(*yielding, kvCapacity(yielding->request.id), refused->denial.allocationFailure);
   }
   // The hot block cache they read through grows toward its planned size,
   // by an extent at most, into memory nothing needs now: none while a lane
@@ -1848,9 +1883,13 @@ Engine::Prepared Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &i
     plan.items = std::move(admitted);
     std::vector<std::vector<StateCapture>> states(plan.items.size());
     captures.assign(plan.items.size(), {});
-    // A command in passes runs one lane, whose history stays in memory.
-    Request &leader = request(plan.items.front().requestId);
-    const bool leaderResident = leader.kvMode == KvMode::Resident;
+    // A command in passes reads its lanes' history from memory.
+    const auto spilling = [&] {
+      return std::ranges::count_if(plan.items, [&](const BatchItem &item) {
+        return request(item.requestId).kvMode == KvMode::Spill;
+      });
+    };
+    const auto spilled = spilling();
     for (size_t index = 0; prefill && index < plan.items.size(); ++index) {
       BatchItem &item = plan.items[index];
       Request &active = request(item.requestId);
@@ -1865,7 +1904,7 @@ Engine::Prepared Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &i
     // Full in it, but the point before its next pass would spill those whose
     // copies landed (spillLanded): it runs the command whole, as the spill
     // section has a lane that streams run it.
-    if (plan.passes > 1 && leaderResident && leader.kvMode == KvMode::Spill)
+    if (plan.passes > 1 && spilling() != spilled)
       plan.passes = 1;
     // The items come last: making room for a state's buffers may move KV
     // pages out of an extent, which rewrites the page lists of the lanes
@@ -1891,8 +1930,6 @@ Engine::Prepared Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &i
       }
       items.push_back(std::move(item));
     }
-    if (plan.passes > 1)
-      request(plan.items.front().requestId).passCommand = Request::PassCommand{items.front(), captures.front()};
     return Prepared::Runnable;
   }
 
@@ -1927,6 +1964,7 @@ Engine::Prepared Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &i
       [&](const Denied &left, const Denied &right) {
         return yieldsBefore(request(left.requestId), request(right.requestId));
       });
+  Request *const yielding = laneToYield();
   if (!yielding)
     throw std::logic_error("no resident lane can yield");
   Request &active = *yielding;
@@ -1944,8 +1982,7 @@ Engine::Prepared Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &i
     // keep failing, end it there.
     return wait();
   case Verdict::Yield:
-    suspendForGrowth(active, resumeTarget, victim.denial.allocationFailure, now);
-    return Prepared::Yielded;
+    return yieldLane(active, resumeTarget, victim.denial.allocationFailure);
   case Verdict::Fail:
     break;
   }
@@ -2195,6 +2232,13 @@ bool Engine::preemptBelow(RequestPriority priority, double now) {
   Request *const victim = laneToYield();
   if (!victim || victim->request.priority <= priority)
     return false;
+  if (yieldsEndedLanes(*victim))
+    return true;
+  // Suspended, a lane of the command between its passes would give that
+  // command up all the same: for a start whose prompt would not supersede
+  // it, the start waits for its end instead.
+  if (betweenPasses(victim->request.id) && !scheduler_.yieldsTo(priority, 1))
+    return false;
   suspendLane(*victim, kvCapacity(victim->request.id), metal::AllocationFailure::None,
               StateFailure::ConcurrencyLimit, now);
   // What the lane held is free: an earlier failure may fit now.
@@ -2302,6 +2346,10 @@ auto Engine::allocate(Attempt &&attempt, bool inService, ReclaimClass upTo,
 // its KV, the model's memory for reading spilled KV, the prompt's replay
 // point) and for a pass the host is short for (reclaimMemory). They rank what
 // a byte is worth where it is:
+// - For work that supersedes the command between its passes (superseding_:
+//   a plan that supersedes it, or a start whose prompt would), that command,
+//   abandoned as it would be once that work runs: it gives back the buffers
+//   of the states it would capture and the lanes of it that ended.
 // - On a target whose KV can live on the SSD cache, a Resident lane converts
 //   to Spill (convertToSpill): beyond its dense and window pages a page then
 //   keeps only its index in memory, and the rest comes back as the copies
@@ -2323,6 +2371,10 @@ auto Engine::allocate(Attempt &&attempt, bool inService, ReclaimClass upTo,
 //   for it may take.
 CacheReclaimResult Engine::escalate(const std::function<bool()> &convertRequester,
                                     const std::function<CacheReclaimResult()> &takeInUse) {
+  if (superseding_ && passCommand_) {
+    abandonPasses();
+    return {.madeProgress = true};
+  }
   if (convertRequester && convertRequester())
     return {.madeProgress = true};
   if (cache_.owedCopiesReturn(0, kv::PageForm::Full) || convertLargestResidentLane())
@@ -2374,10 +2426,10 @@ CacheReclaimResult Engine::reclaimForState(ReclaimClass upTo, bool forLater) {
 // buffers goes first, then the cache nothing in use holds gives up what
 // covers the shortfall, of the pages' form, in one step, starting the copies
 // what it takes needs; then the rungs above it (escalate), the requester's
-// own conversion to Spill first (`convertRequester`), what is in use only up
-// to InUse. Memory on its way back holds the rungs back, and so does an
-// optional allocation (a capture's KV past its first boundary, whose refusal
-// only ends the command early). The lane's buffers go last. Their draft ring
+// own conversion to Spill ahead of another lane's (`convertRequester`), what
+// is in use only up to InUse. Memory on its way back holds the rungs back,
+// and so does an optional allocation (a capture's KV past its first
+// boundary, whose refusal only ends the command early). The lane's buffers go last. Their draft ring
 // is the one buffer no cached state holds: while it stays, a request that
 // waits can start beside this one from cached states' cells and windows.
 CacheReclaimResult Engine::reclaimForKv(const TokenAdmission &admission, ReclaimClass upTo,
@@ -2687,7 +2739,8 @@ void Engine::apply(const Pending &command, std::span<const ModelStepResult> resu
   if (results.size() != plan.items.size()) {
     throw std::logic_error("model result count changed");
   }
-  // A pass before the command's last commits nothing and proves nothing.
+  // A pass before the command's last commits nothing, proves nothing and
+  // ends no lane.
   const bool beforeLastPass = plan.kind == WorkKind::Prefill && plan.pass + 1 < plan.passes;
   std::vector<StepResult> schedulerResults;
   schedulerResults.reserve(results.size());
@@ -2735,8 +2788,12 @@ void Engine::apply(const Pending &command, std::span<const ModelStepResult> resu
       if (!active.pendingEnd)
         active.pendingEnd = LaneEnd{LaneOutcome::ModelResultInvalid, std::move(invalid)};
     }
-    if (!beforeLastPass)
-      active.unprovenState.reset();
+    // A lane that ended meanwhile stays in the command to its last pass.
+    if (beforeLastPass) {
+      schedulerResults.push_back({active.request.id, 0, false, result.nextDecodeStage});
+      continue;
+    }
+    active.unprovenState.reset();
     if (active.pendingEnd) {
       // An in-flight Metal command cannot be revoked safely. Its provisional
       // writes remain invisible, but a cancelled, deadline-expired or
@@ -2750,10 +2807,6 @@ void Engine::apply(const Pending &command, std::span<const ModelStepResult> resu
     }
     if (result.outputTokensWithoutKv > result.outputTokens.size()) {
       throw std::logic_error("model reported more uncommitted tokens than output");
-    }
-    if (beforeLastPass) {
-      schedulerResults.push_back({active.request.id, 0, false, result.nextDecodeStage});
-      continue;
     }
     if (plan.kind == WorkKind::Prefill) {
       const uint32_t promptProcessed =
@@ -2867,13 +2920,18 @@ void Engine::apply(const Pending &command, std::span<const ModelStepResult> resu
                       command.streamed ? std::optional(ticket.streamMilliseconds())
                                        : std::nullopt,
                       ticket.imageEncodeMilliseconds());
-  if (plan.passes > 1 && plan.pass + 1 == plan.passes)
-    request(plan.items.front().requestId).passCommand.reset();
+  // The command's last pass ends it, and the lanes that ended between its
+  // passes with it (below); a pass before goes on unless none of its lanes
+  // is left.
+  if (plan.passes > 1 && !beforeLastPass)
+    passCommand_.reset();
+  else if (beforeLastPass && passesEnded())
+    abandonPasses();
   events_.batchCompleted(plan.kind, plan.width(), inputTokens, outputTokens,
                          draftedTokens, acceptedDraftTokens, wallMilliseconds,
                          cycleMilliseconds);
 
-  for (size_t index = 0; index < results.size(); ++index) {
+  for (size_t index = 0; !beforeLastPass && index < results.size(); ++index) {
     const ModelStepResult &result = results[index];
     Request &active = request(result.requestId);
     if (active.pendingEnd) {
@@ -2892,16 +2950,52 @@ bool Engine::inFlight(uint64_t id) const {
                      [id](const BatchItem &item) { return item.requestId == id; });
 }
 
+bool Engine::betweenPasses(uint64_t id) const {
+  return passCommand_ && std::ranges::any_of(passCommand_->items, [id](const ModelBatchItem &item) {
+           return item.requestId == id;
+         });
+}
+
+bool Engine::passesEnded() const {
+  return std::ranges::all_of(passCommand_->items, [&](const ModelBatchItem &item) {
+    return requests_.at(item.requestId).pendingEnd.has_value();
+  });
+}
+
+bool Engine::yieldsEndedLanes(const Request &lane) {
+  if (!betweenPasses(lane.request.id) ||
+      std::ranges::none_of(passCommand_->items, [&](const ModelBatchItem &item) {
+        return requests_.at(item.requestId).pendingEnd.has_value();
+      }))
+    return false;
+  abandonPasses();
+  return true;
+}
+
+void Engine::abandonPasses() {
+  scheduler_.abandonPasses();
+  const std::vector<ModelBatchItem> items = std::move(passCommand_->items);
+  passCommand_.reset();
+  for (const ModelBatchItem &item : items)
+    if (Request &lane = request(item.requestId); lane.pendingEnd)
+      settle(lane, *std::exchange(lane.pendingEnd, std::nullopt));
+}
+
 void Engine::settle(Request &active, LaneEnd end) {
   if (active.finalized)
     return;
-  if (active.restore || inFlight(active.request.id)) {
+  const uint64_t id = active.request.id;
+  if (active.restore || inFlight(id) || betweenPasses(id)) {
     if (!active.pendingEnd)
       active.pendingEnd = std::move(end);
-    if (!active.restore)
-      pending_->ticket->abandonMask(active.request.id);
-    else if (active.restore->ticket)
-      active.restore->ticket->cancel();
+    if (active.restore) {
+      if (active.restore->ticket)
+        active.restore->ticket->cancel();
+    } else if (inFlight(id)) {
+      pending_->ticket->abandonMask(id);
+    } else if (passesEnded()) {
+      abandonPasses();
+    }
     return;
   }
   if (end.outcome == LaneOutcome::Cancelled)
@@ -2964,8 +3058,8 @@ void Engine::finishFailure(Request &active, LaneEnd end) {
 
 void Engine::vacateLane(Request &active, bool keepContinuation) {
   const uint64_t id = active.request.id;
-  // A command between its passes is left, with the states it would capture.
-  active.passCommand.reset();
+  if (betweenPasses(id))
+    abandonPasses();
   discardPendingStateBoundaries(active);
   if (keepContinuation)
     model_.suspend(id);

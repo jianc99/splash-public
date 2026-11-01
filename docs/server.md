@@ -467,11 +467,15 @@ off` loads every expert, as a SIZE that holds them all does.
 - A prefill command runs a group of up to four chunks of 2048 rows layer by
   layer, so each layer's experts are read once for all of them, a prompt's
   with images too. Since every command reads nearly all of each layer's
-  experts however few its rows, one that would take longer than the 500 ms
-  slice runs in passes over the layers, each its own command of about the
-  slice: other requests' decode steps run between passes, and a cancel
-  waits for one pass at most. A pass reads its own layers' experts, so
-  passes add no reads ([Admission and eviction](internals.md#admission-and-eviction)).
+  experts however few its rows, short prompts ready together share one
+  command, and one that would take longer than the 500 ms slice runs in
+  passes over the layers, each its own command of about the slice: other
+  requests' decode steps run between passes, requests that arrive meanwhile
+  start, and those that arrive early in its passes join the command, which
+  starts again with them. A cancel of a command's only request waits for one
+  pass at most, one of several for the command's last. A pass reads its own
+  layers' experts, so passes add no reads; a command that starts again reads
+  its passes' layers again ([Admission and eviction](internals.md#admission-and-eviction)).
 - A load checks its files unchanged after it read them. A read is tried once
   more when it fails. A load that fails (a routed expert cannot be read, or
   a file was written) fails its command, and every later load fails too.

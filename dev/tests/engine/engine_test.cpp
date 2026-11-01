@@ -610,6 +610,617 @@ void testPrefillPassesInterleaveDecodeAndEndAtACancel() {
   }
 }
 
+// An engine on a target whose prefill commands may run in six passes over
+// its layers, a streamed target's chunk measured (4.9 s, 3.4 s of it on
+// expert reads), which each command takes again, over its passes, and the
+// commands it ran; a decode cycle takes 100 ms.
+struct PassingEngine {
+  struct Command final {
+    WorkKind kind;
+    std::vector<uint64_t> lanes;
+    uint32_t pass, passes;
+    // The states each lane's item captures.
+    std::vector<size_t> captures;
+  };
+  PassingEngine() {
+    model.groupRows = 4 * model::ExecutionLimits::prefillTokenBudget;
+    model.passes = 6;
+    model.decodeFinishes = false;
+    model.commandTimes = [this](const BatchPlan &plan, std::span<const ModelBatchItem> items) {
+      Command command{plan.kind, {}, plan.pass, plan.passes, {}};
+      uint32_t rows = 0;
+      for (const ModelBatchItem &item : items) {
+        command.lanes.push_back(item.requestId);
+        command.captures.push_back(item.stateCaptures.size());
+        rows += item.tokenCount;
+      }
+      commands.push_back(std::move(command));
+      return plan.kind == WorkKind::Decode
+                 ? test::CommandTimes{.wallMilliseconds = 100.0}
+                 : test::CommandTimes{(3400.0 + rows * 1500.0 / 2048) / plan.passes, 3400.0 / plan.passes};
+    };
+    guardReleases(storage, engine);
+    engine.observePrefill(model::ExecutionLimits::prefillTokenBudget, 4900.0, 3400.0);
+  }
+  // A request of `tokens` prompt tokens of its id, of `priority`.
+  void submit(uint64_t id, uint32_t tokens, RequestPriority priority = RequestPriority::Normal) {
+    EngineRequest value = request(id, std::vector<uint32_t>(tokens, static_cast<uint32_t>(id)));
+    value.priority = priority;
+    engine.submit(std::move(value));
+  }
+  // The prefill commands run so far, a pass each.
+  [[nodiscard]] size_t prefills() const {
+    return std::ranges::count_if(commands, [](const Command &command) { return command.kind == WorkKind::Prefill; });
+  }
+  void tickUntil(const std::function<bool()> &done, const char *message) {
+    ::tickUntil(engine, now, done, message);
+  }
+
+  test::TestKvStorage storage{512, 4096, 4};
+  KvPool pool{storage, 0};
+  engine::Cache cache{pool, nullptr, nullptr};
+  Executor model;
+  Events events;
+  engine::Engine engine{test::engineConfig({.decodeShare = 0.5}), cache, model, events};
+  std::vector<Command> commands;
+  double now = 1;
+};
+
+// Where the model runs a prefill command in passes over its layers, short
+// prompts that arrive together share one command: every pass runs all their
+// items, with the state each captures, and the last commits each lane's rows
+// and publishes its replay point. A lane cancelled between its command's
+// passes stays in the command to its last pass, which publishes nothing of
+// it, and ends then; once every lane of it is cancelled, the command ends at
+// once, and so it does after the pass that runs as they are.
+void testShortPromptsShareACommandInPasses() {
+  for (const auto [cancelled, inFlight] : {std::pair{0u, false}, {1u, false}, {3u, false}, {3u, true}}) {
+    PassingEngine passing;
+    for (uint64_t id = 1; id <= 3; ++id)
+      passing.submit(id, 300);
+    if (cancelled) {
+      passing.tickUntil([&] { return passing.prefills() == 2 && passing.engine.commandInFlight() == inFlight; },
+                        "the short prompts did not run two passes");
+      for (uint64_t id = 1; id <= cancelled; ++id)
+        passing.engine.cancel(id);
+      require(passing.engine.snapshot().cancelled == (cancelled == 3 && !inFlight ? 3u : 0u),
+              cancelled == 3 && !inFlight ? "a command whose lanes were all cancelled went on"
+                                          : "a lane cancelled during its command's passes left the command");
+    }
+    passing.tickUntil([&] { return idle(passing.engine); }, "the short prompts did not end");
+    require(passing.prefills() == (cancelled == 3 ? 2u : 6u) &&
+                std::ranges::all_of(passing.commands,
+                                    [](const PassingEngine::Command &command) {
+                                      return command.kind != WorkKind::Prefill ||
+                                             (command.lanes == std::vector<uint64_t>{1, 2, 3} &&
+                                              command.passes == 6 &&
+                                              command.captures == std::vector<size_t>{1, 1, 1});
+                                    }),
+            "short prompts did not share one command in passes, each pass with every lane's capture");
+    const EngineSnapshot counts = passing.engine.snapshot();
+    require(counts.cancelled == cancelled && passing.events.completedCount == 3 &&
+                counts.replayStatePublications == 3 - cancelled,
+            "a lane cancelled between its command's passes committed, or a lane that ran did not");
+  }
+}
+
+// Requests that arrive while a short prompt's command runs its first pass,
+// as concurrent agent turns arrive a few milliseconds after the first, start
+// at the next command's boundary, and the command is planned again with
+// them: one command of all four runs its passes, each prompt's rows
+// committed once, rather than the first prompt's command and then theirs.
+void testArrivalsDuringPassesShareTheCommand() {
+  PassingEngine passing;
+  passing.submit(1, 300);
+  passing.tickUntil([&] { return passing.prefills() == 1 && !passing.engine.commandInFlight(); },
+                    "the first prompt did not run a pass");
+  for (uint64_t id = 2; id <= 4; ++id)
+    passing.submit(id, 300);
+  static_cast<void>(passing.engine.tick(passing.now++));
+  require(passing.events.startIds == std::vector<uint64_t>({1, 2, 3, 4}),
+          "the requests that arrived during a command's pass did not start before its next");
+  passing.tickUntil([&] { return idle(passing.engine); }, "the prompts did not end");
+  std::vector<PassingEngine::Command> prefills;
+  for (const PassingEngine::Command &command : passing.commands)
+    if (command.kind == WorkKind::Prefill)
+      prefills.push_back(command);
+  bool regrouped = prefills.size() == 7 && prefills.front().lanes == std::vector<uint64_t>{1};
+  for (uint32_t pass = 0; regrouped && pass < 6; ++pass)
+    regrouped = prefills[pass + 1].lanes == std::vector<uint64_t>{1, 2, 3, 4} && prefills[pass + 1].pass == pass;
+  require(regrouped,
+          "the first prompt's command was not planned again with the requests that arrived in its first pass");
+  require(std::ranges::all_of(passing.model.prefillChunks, [](const auto &entry) { return entry.second == 1; }) &&
+              passing.engine.snapshot().replayStatePublications == 4 && passing.events.completedCount == 4,
+          "a prompt of the command planned again did not commit its rows once");
+}
+
+// A command between its passes does not hold back a higher priority: a
+// Foreground request that arrives between them starts at once, and its
+// prompt runs before the command's next pass, which yields to it,
+// abandoned. Its lanes then run their rows again from a first pass.
+void testAHigherPriorityIsNotHeldBehindPasses() {
+  PassingEngine passing;
+  for (uint64_t id = 1; id <= 2; ++id)
+    passing.submit(id, 300, RequestPriority::Background);
+  passing.tickUntil([&] { return passing.prefills() == 1 && !passing.engine.commandInFlight(); },
+                    "the Background prompts did not run a pass");
+  passing.submit(3, 100, RequestPriority::Foreground);
+  const size_t arrived = passing.commands.size();
+  passing.tickUntil([&] { return passing.events.usage.contains(3); }, "the Foreground request did not end");
+  require(passing.events.startIds.back() == 3 && passing.commands.at(arrived).lanes == std::vector<uint64_t>{3},
+          "a higher priority's start waited for a command between its passes");
+  passing.tickUntil([&] { return idle(passing.engine); }, "the Background requests did not end");
+  const auto rerun = std::ranges::find_if(passing.commands.begin() + static_cast<std::ptrdiff_t>(arrived),
+                                          passing.commands.end(), [](const PassingEngine::Command &command) {
+                                            return command.lanes == std::vector<uint64_t>{1, 2};
+                                          });
+  require(rerun != passing.commands.end() && rerun->pass == 0 && passing.events.completedCount == 3 &&
+              passing.events.failedCount == 0,
+          "an abandoned command's lanes did not run their rows again from a first pass");
+}
+
+// A lane suspended between its command's passes takes the command's
+// remaining passes with it: four Background prompts share every lane in a
+// command in passes, and a Foreground arrival suspends one of them, which
+// abandons the command before anything plans its next pass; the other
+// three run their rows again from a first pass, and the suspended one once
+// it resumes. A lane cancelled between the passes, which stays in the
+// command to its last, gives the arrival its lane instead: the command is
+// given up for it, which ends that lane, and no lane is suspended.
+void testALaneSuspendedBetweenPassesAbandonsItsCommand() {
+  for (const bool cancelled : {false, true}) {
+    PassingEngine passing;
+    for (uint64_t id = 1; id <= 4; ++id)
+      passing.submit(id, 300, RequestPriority::Background);
+    const auto lanes = [](const PassingEngine::Command &command, std::vector<uint64_t> ids) {
+      return command.kind == WorkKind::Prefill && command.lanes == ids;
+    };
+    passing.tickUntil(
+        [&] {
+          return std::ranges::count_if(passing.commands, [&](const PassingEngine::Command &command) {
+                   return lanes(command, {1, 2, 3, 4});
+                 }) == 1 &&
+                 !passing.engine.commandInFlight();
+        },
+        "the Background prompts did not run a pass of their command");
+    if (cancelled) {
+      passing.engine.cancel(4);
+      require(passing.engine.snapshot().cancelled == 0, "a lane cancelled between its command's passes left it");
+    }
+    passing.submit(5, 100, RequestPriority::Foreground);
+    passing.tickUntil([&] { return idle(passing.engine); }, "the requests did not end");
+    std::vector<PassingEngine::Command> prefills;
+    for (const PassingEngine::Command &command : passing.commands)
+      if (command.kind == WorkKind::Prefill)
+        prefills.push_back(command);
+    // The lanes that run again, and those once the suspended one resumes.
+    const std::vector<uint64_t> again{1, 2, 3};
+    const std::vector<uint64_t> resumed = cancelled ? std::vector<uint64_t>{1, 2, 3} : std::vector<uint64_t>{1, 2, 3, 4};
+    require(passing.engine.snapshot().prioritySuspensions == !cancelled &&
+                passing.engine.snapshot().cancelled == cancelled && prefills.size() > 2 &&
+                prefills[1].lanes == again && prefills[1].pass == 0 &&
+                std::ranges::count_if(prefills, [&](const PassingEngine::Command &command) {
+                  return lanes(command, resumed) && command.pass;
+                }) == 5 &&
+                passing.events.completedCount == 5 && passing.events.failedCount == 0,
+            "a command whose lane was suspended between its passes ran on, or its lanes did not run again");
+  }
+}
+
+// A prompt of a higher priority that the engine's limit refuses its KV
+// takes what the Background command between its passes holds before any
+// lane of it yields: the command, which a lane's suspension would abandon
+// anyway, is given up, and the buffers of the states it would capture are
+// what the prompt's KV fits in. No lane is suspended, and the Background
+// prompts run their rows again from a first pass.
+void testAHigherPriorityTakesWhatACommandBetweenPassesHolds() {
+  PassingEngine passing;
+  passing.model.kvGrowthBlocked = &passing.storage.growthBlocked;
+  for (uint64_t id = 1; id <= 2; ++id)
+    passing.submit(id, 300, RequestPriority::Background);
+  passing.tickUntil([&] { return passing.prefills() == 1 && !passing.engine.commandInFlight(); },
+                    "the Background prompts did not run a pass");
+  passing.storage.growthBlocked = true;
+  passing.submit(3, 100, RequestPriority::Foreground);
+  const size_t arrived = passing.commands.size();
+  passing.tickUntil([&] { return idle(passing.engine); }, "the requests did not end");
+  const auto rerun = std::ranges::find_if(passing.commands.begin() + static_cast<std::ptrdiff_t>(arrived),
+                                          passing.commands.end(), [](const PassingEngine::Command &command) {
+                                            return command.lanes == std::vector<uint64_t>{1, 2};
+                                          });
+  require(passing.engine.snapshot().resourceSuspensions == 0 && passing.model.reclaimedIdleStateBytes != 0 &&
+              passing.commands.at(arrived).lanes == std::vector<uint64_t>{3} && rerun != passing.commands.end() &&
+              rerun->pass == 0 && passing.events.completedCount == 3 && passing.events.failedCount == 0,
+          "a higher priority's refused KV suspended a lane of a command between its passes");
+}
+
+// Each later pass of a command in passes runs every lane's page table cut
+// anew: a memory-control pass between passes that empties an extent moves
+// the second lane's page out of it, and the next pass finds the page where
+// it went.
+void testLaterPassesFollowEveryLanesMovedPages() {
+  test::TestKvStorage storage(16, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache cache(pool, nullptr, nullptr);
+  Executor model;
+  model.kv = &storage;
+  model.groupRows = 4 * model::ExecutionLimits::prefillTokenBudget;
+  std::vector<std::pair<std::vector<uint64_t>, uint32_t>> prefills;
+  model.commandTimes = [&](const BatchPlan &plan, std::span<const ModelBatchItem> items) {
+    std::vector<uint64_t> lanes;
+    uint32_t rows = 0;
+    for (const ModelBatchItem &item : items) {
+      lanes.push_back(item.requestId);
+      rows += item.tokenCount;
+    }
+    if (plan.kind == WorkKind::Prefill)
+      prefills.emplace_back(std::move(lanes), plan.pass);
+    return test::CommandTimes{(3400.0 + rows * 1500.0 / 2048) / plan.passes, 3400.0 / plan.passes};
+  };
+  Events events;
+  engine::Engine engine(test::engineConfig(), cache, model, events);
+  guardReleases(storage, engine);
+  engine.observePrefill(model::ExecutionLimits::prefillTokenBudget, 4900.0, 3400.0);
+  double now = 1;
+  engine.submit(request(1, std::vector<uint32_t>(65, 1)));
+  tickUntil(engine, now, [&] { return idle(engine); }, "the first prompt did not end");
+  model.passes = 6;
+  for (const auto &[id, tokens] : {std::pair{uint64_t{2}, 129u}, {uint64_t{3}, 50u}}) {
+    EngineRequest prompt = request(id, std::vector<uint32_t>(tokens, static_cast<uint32_t>(id)));
+    prompt.maxNewTokens = 2;
+    engine.submit(std::move(prompt));
+  }
+  tickUntil(engine, now, [&] { return prefills.size() == 2 && !engine.commandInFlight(); },
+            "the two prompts did not run a pass of their command");
+  require(prefills.back() == std::pair{std::vector<uint64_t>{3, 2}, 0u}, "the two prompts did not share a command");
+  const uint64_t revision = cache.pageTable(2).revision;
+  static_cast<void>(engine.reclaimMemory({.critical = true}));
+  const CacheSnapshot reclaimed = cache.snapshot();
+  require(reclaimed.pool.extentCompactions == 1 && reclaimed.pool.extentReleases == 1 &&
+              cache.pageTable(2).revision > revision,
+          "the memory-control pass did not move the second lane's page");
+  tickUntil(engine, now, [&] { return idle(engine); }, "the two prompts did not end");
+  require(events.completedCount == 3 && events.failedCount == 0,
+          "a later pass did not follow a lane's moved page");
+}
+
+// A start of a higher priority that the engine's limit refuses its state
+// early in a Background command's passes, where its prompt would supersede
+// the command (Scheduler::yieldsTo), takes what the command holds before any
+// lane of it is suspended: given up, the command gives back the buffers of
+// the states it would capture.
+void testAHigherPriorityStartTakesWhatACommandBetweenPassesHolds() {
+  PassingEngine passing;
+  for (uint64_t id = 1; id <= 2; ++id)
+    passing.submit(id, 300, RequestPriority::Background);
+  passing.tickUntil([&] { return passing.prefills() == 1 && !passing.engine.commandInFlight(); },
+                    "the Background prompts did not run a pass");
+  passing.model.beginGrowthBlocked = [&] {
+    return passing.model.lastBeginId == 3 && *passing.model.evictedStateBytes == 0;
+  };
+  passing.submit(3, 100, RequestPriority::Foreground);
+  passing.tickUntil([&] { return idle(passing.engine); }, "the requests did not end");
+  const EngineSnapshot counts = passing.engine.snapshot();
+  require(counts.prioritySuspensions == 0 && counts.resourceSuspensions == 0 &&
+              passing.events.completedCount == 3 && passing.events.failedCount == 0,
+          "a higher priority's refused start suspended a lane of a command between its passes");
+}
+
+// A lane of several that ends at its deadline during its command's passes
+// ends once: while the command's next pass is in flight, the engine has
+// nothing more to do for it.
+void testALaneThatExpiredBetweenPassesEndsOnce() {
+  PassingEngine passing;
+  passing.submit(1, 300);
+  EngineRequest expiring = request(2, std::vector<uint32_t>(300, 2));
+  expiring.deadlineMilliseconds = 5000;
+  passing.engine.submit(std::move(expiring));
+  passing.tickUntil([&] { return passing.prefills() == 1 && !passing.engine.commandInFlight(); },
+                    "the prompts did not run a pass of their command");
+  const auto hold = std::make_shared<std::atomic<bool>>(false);
+  passing.model.holdPrefillUntil = hold;
+  passing.tickUntil([&] { return passing.engine.commandInFlight(); }, "the command's next pass did not start");
+  passing.now = 5000;
+  require(passing.engine.tick(passing.now++) && !passing.engine.tick(passing.now++),
+          "a lane that ended during its command's passes kept the engine busy");
+  *hold = true;
+  passing.model.holdPrefillUntil.reset();
+  passing.tickUntil([&] { return idle(passing.engine); }, "the requests did not end");
+  require(passing.events.failedCount == 1 && passing.events.completedCount == 1,
+          "the expired lane did not fail once, or the other did not complete");
+}
+
+// The ladder's first rung may give the command between its passes up as a
+// lane's allocation climbs it, which ends the lanes of it that ended: the lane
+// that yields is the one still resident after it. A Foreground prompt
+// supersedes two Background prompts' command, one of them cancelled between
+// its passes, and the engine's limit refuses the prompt's KV: the command is
+// given up, which ends the cancelled lane, and the live one is suspended
+// for the prompt, nothing ending twice.
+void testTheLaneThatYieldsIsChosenAfterTheLadder() {
+  PassingEngine passing;
+  for (uint64_t id = 1; id <= 2; ++id)
+    passing.submit(id, 300, RequestPriority::Background);
+  passing.tickUntil([&] { return passing.prefills() == 1 && !passing.engine.commandInFlight(); },
+                    "the Background prompts did not run a pass");
+  passing.engine.cancel(2);
+  passing.storage.growthBlocked = true;
+  passing.submit(3, 3000, RequestPriority::Foreground);
+  passing.tickUntil([&] { return passing.engine.snapshot().resourceSuspensions == 1; },
+                    "the Foreground prompt's refused KV did not suspend the live Background lane");
+  require(passing.engine.snapshot().cancelled == 1, "the cancelled lane did not end with its command");
+  passing.storage.growthBlocked = false;
+  passing.tickUntil([&] { return idle(passing.engine); }, "the requests did not end");
+  const EngineSnapshot counts = passing.engine.snapshot();
+  require(counts.cancelled == 1 && counts.completed == 2 && counts.failed == 0,
+          "a lane the ladder ended was chosen to yield");
+}
+
+// A lane that ended between its command's passes, cancelled or at its
+// deadline, is never suspended as the lane that yields first: where a
+// decoding lane's KV the engine's limit refuses there would suspend it, the
+// command is given up in its place, which ends that lane and gives back its
+// memory and the command's captures, with no lane suspended, and the
+// command's live lane runs its rows again from a first pass. So it is where
+// the lane that would yield is the live one, the later submission, beside the
+// one that ended.
+void testALaneThatEndedBetweenPassesIsNotSuspended() {
+  for (const uint64_t ending : {uint64_t{3}, uint64_t{2}}) {
+    for (const bool cancelled : {true, false}) {
+      PassingEngine passing;
+      passing.model.decodeTokens = 8;
+      EngineRequest decoding = request(1, std::vector<uint32_t>(100, 1));
+      decoding.maxNewTokens = 400;
+      passing.engine.submit(std::move(decoding));
+      passing.tickUntil([&] { return passing.events.outputs.contains(1); }, "the decoding lane did not decode");
+      for (const uint64_t id : {uint64_t{2}, uint64_t{3}}) {
+        EngineRequest prompt = request(id, std::vector<uint32_t>(300, static_cast<uint32_t>(id)));
+        if (id == ending)
+          prompt.deadlineMilliseconds = 5000;
+        passing.engine.submit(std::move(prompt));
+      }
+      const size_t submitted = passing.commands.size();
+      const size_t prefills = passing.prefills();
+      // A decoding step runs between the passes.
+      passing.tickUntil(
+          [&] { return passing.prefills() == prefills + 1 && passing.commands.back().kind == WorkKind::Decode; },
+          "the prompts did not run a pass of their command");
+      const auto pass = std::ranges::find_if(passing.commands.begin() + static_cast<std::ptrdiff_t>(submitted),
+                                             passing.commands.end(), [](const PassingEngine::Command &command) {
+                                               return command.kind == WorkKind::Prefill;
+                                             });
+      require(pass->lanes == std::vector<uint64_t>{2, 3} && pass->passes > 1,
+              "the prompts did not share a command in passes");
+      if (cancelled) {
+        passing.engine.cancel(ending);
+      } else {
+        passing.now = 5000;
+        static_cast<void>(passing.engine.tick(passing.now++));
+      }
+      const EngineSnapshot before = passing.engine.snapshot();
+      require(before.cancelled + before.failed == 0, "a lane that ended between its command's passes left it");
+      passing.storage.growthBlocked = true;
+      const size_t ended = passing.commands.size();
+      passing.tickUntil(
+          [&] {
+            const EngineSnapshot counts = passing.engine.snapshot();
+            return counts.cancelled + counts.failed == 1 || counts.resourceSuspensions;
+          },
+          "the lane that ended did not end");
+      passing.storage.growthBlocked = false;
+      passing.tickUntil([&] { return idle(passing.engine); }, "the requests did not end");
+      // The command never runs its last pass: it is given up, and the live
+      // lane's rows run again from a first pass.
+      const auto lanes = [&](std::vector<uint64_t> ids) {
+        return std::ranges::find_if(passing.commands.begin() + static_cast<std::ptrdiff_t>(ended),
+                                    passing.commands.end(), [&](const PassingEngine::Command &command) {
+                                      return command.kind == WorkKind::Prefill && command.lanes == ids &&
+                                             (ids.size() == 1 || command.pass + 1 == command.passes);
+                                    });
+      };
+      const auto rerun = lanes({ending == 3 ? uint64_t{2} : uint64_t{3}});
+      const EngineSnapshot counts = passing.engine.snapshot();
+      require(counts.resourceSuspensions == 0 && counts.prioritySuspensions == 0 &&
+                  counts.cancelled == cancelled && counts.failed == !cancelled && counts.completed == 2 &&
+                  lanes({2, 3}) == passing.commands.end() && rerun != passing.commands.end() && rerun->pass == 0,
+              "a lane that ended between its command's passes was suspended, or the command not given up");
+    }
+  }
+}
+
+// A start of a higher priority whose prompt would not supersede the command
+// between its passes (Scheduler::yieldsTo) takes nothing the command holds
+// and suspends no lane of it: refused memory after four of a two-lane
+// Background command's six passes, a Foreground start climbs the rest of the
+// ladder, giving back an expert chunk, and waits for the command's end,
+// which gives the captures back. Refused at every attempt after the first
+// pass of a Background prompt's command, Foreground starts give the command
+// up three times and let it run to its end at the fourth.
+void testAStartThatWouldNotSupersedeACommandWaitsForItsEnd() {
+  // Whether the latest prefill command ran a pass short of its last.
+  const auto betweenPasses = [](const PassingEngine &passing) {
+    const auto last = std::ranges::find_if(passing.commands.rbegin(), passing.commands.rend(),
+                                           [](const PassingEngine::Command &command) {
+                                             return command.kind == WorkKind::Prefill;
+                                           });
+    return last != passing.commands.rend() && last->pass + 1 < last->passes;
+  };
+  const auto prefillsOf = [](const PassingEngine &passing, std::vector<uint64_t> lanes, uint32_t pass) {
+    return std::ranges::count_if(passing.commands, [&](const PassingEngine::Command &command) {
+      return command.kind == WorkKind::Prefill && command.lanes == lanes && command.pass == pass;
+    });
+  };
+  {
+    PassingEngine passing;
+    passing.model.expertChunks = {1000};
+    for (uint64_t id = 1; id <= 2; ++id)
+      passing.submit(id, 300, RequestPriority::Background);
+    passing.tickUntil([&] { return passing.prefills() == 4 && !passing.engine.commandInFlight(); },
+                      "the Background prompts did not run four passes");
+    require(passing.commands.back().passes == 6, "the Background prompts did not run in six passes");
+    // Its memory comes back once the command gives its captures back.
+    while (passing.cache.reclaimOneState(StateClass::Ordinary, false)) {
+    }
+    *passing.model.evictedStateBytes = 0;
+    passing.model.beginGrowthBlocked = [&] {
+      return passing.model.lastBeginId == 3 && *passing.model.evictedStateBytes == 0 && betweenPasses(passing);
+    };
+    passing.submit(3, 100, RequestPriority::Foreground);
+    passing.tickUntil([&] { return idle(passing.engine); }, "the requests did not end");
+    const auto first = std::ranges::find_if(passing.commands, [](const PassingEngine::Command &command) {
+      return command.kind == WorkKind::Prefill && command.lanes == std::vector<uint64_t>{3};
+    });
+    const EngineSnapshot counts = passing.engine.snapshot();
+    require(prefillsOf(passing, {1, 2}, 0) == 1 && prefillsOf(passing, {1, 2}, 5) == 1 &&
+                first != passing.commands.end() && first->pass == 0 &&
+                std::ranges::count(passing.model.reclaimSteps, Executor::ReclaimStep::ExpertRelease) == 1 &&
+                counts.prioritySuspensions == 0 && counts.resourceSuspensions == 0 && counts.completed == 3,
+            "a start whose prompt would not supersede a command took what it holds, or suspended a lane of it");
+  }
+  {
+    PassingEngine passing;
+    passing.submit(1, 300, RequestPriority::Background);
+    passing.model.beginGrowthBlocked = [&] {
+      return passing.model.lastBeginId != 1 && *passing.model.evictedStateBytes == 0 && betweenPasses(passing);
+    };
+    for (uint64_t foreground = 2; !passing.events.usage.contains(1); ++foreground) {
+      require(foreground < 10, "Foreground starts kept giving a Background command up");
+      const auto attempts = prefillsOf(passing, {1}, 0);
+      passing.tickUntil(
+          [&] {
+            return (prefillsOf(passing, {1}, 0) > attempts || passing.events.usage.contains(1)) &&
+                   !passing.engine.commandInFlight();
+          },
+          "the Background prompt did not run a first pass");
+      if (passing.events.usage.contains(1))
+        break;
+      // As above; the earlier starts' states are gone.
+      while (passing.cache.reclaimOneState(StateClass::Ordinary, false)) {
+      }
+      *passing.model.evictedStateBytes = 0;
+      passing.submit(foreground, 100, RequestPriority::Foreground);
+      passing.tickUntil([&] { return passing.events.usage.contains(foreground); },
+                        "the Foreground request did not end");
+    }
+    passing.tickUntil([&] { return idle(passing.engine); }, "the requests did not end");
+    require(prefillsOf(passing, {1}, 0) == 4 && passing.engine.snapshot().prioritySuspensions == 0 &&
+                passing.events.failedCount == 0,
+            "refused Foreground starts gave a Background command up past the bound");
+  }
+}
+
+// A lane that prepare refuses memory the other lanes of its command fit in
+// waits for the command's end, as a lane any command leaves out does: a
+// short prompt's command in passes, planned again with a short arrival
+// whose KV the engine's limit then refuses, runs its passes to its last
+// without it, rather than its first again at every boundary, and the
+// arrival runs once memory allows.
+void testARefusedLaneWaitsForItsCommandsEnd() {
+  PassingEngine passing;
+  passing.submit(1, 300);
+  passing.tickUntil([&] { return passing.prefills() == 1 && !passing.engine.commandInFlight(); },
+                    "the first prompt did not run a pass");
+  passing.storage.growthBlocked = true;
+  passing.submit(2, 300);
+  passing.tickUntil([&] { return passing.events.usage.contains(1); }, "the first prompt's command did not end");
+  passing.storage.growthBlocked = false;
+  passing.tickUntil([&] { return idle(passing.engine); }, "the refused prompt did not run");
+  std::vector<uint32_t> passes;
+  for (const PassingEngine::Command &command : passing.commands)
+    if (command.kind == WorkKind::Prefill && command.lanes == std::vector<uint64_t>{1})
+      passes.push_back(command.pass);
+  require(passes == std::vector<uint32_t>{0, 0, 1, 2, 3, 4, 5},
+          "a command planned again with a lane prepare refused did not run its passes to its last without it");
+  require(passing.events.completedCount == 2 && passing.events.failedCount == 0,
+          "the refused prompt did not run once memory allowed");
+}
+
+// A lane of a command in passes ends at its deadline as it does at a
+// cancel: between the passes, while a decoding lane's step runs there, a
+// lone lane's command ends at once, its next pass unrun; during a pass, the
+// command ends after it; and a lane of two that expires between passes is
+// not planned again when an arrival regroups the command.
+void testADeadlineEndsALaneOfACommandInPasses() {
+  enum class When { BetweenPasses, InAPass, BeforeARegroup };
+  for (const When when : {When::BetweenPasses, When::InAPass, When::BeforeARegroup}) {
+    PassingEngine passing;
+    if (when == When::BetweenPasses) {
+      EngineRequest decoding = request(1, std::vector<uint32_t>(100, 1));
+      decoding.maxNewTokens = 10'000;
+      decoding.deadlineMilliseconds = 1e9;
+      passing.engine.submit(std::move(decoding));
+      passing.tickUntil([&] { return passing.events.outputs.contains(1); }, "the decoding lane did not decode");
+    } else if (when == When::BeforeARegroup) {
+      passing.submit(1, 300);
+    }
+    EngineRequest expiring = request(2, std::vector<uint32_t>(when == When::BeforeARegroup ? 300 : 8193, 2));
+    expiring.deadlineMilliseconds = 5000;
+    passing.engine.submit(std::move(expiring));
+    const auto expiringPasses = [&] {
+      return std::ranges::count_if(passing.commands, [](const PassingEngine::Command &command) {
+        return command.kind == WorkKind::Prefill && std::ranges::count(command.lanes, 2u);
+      });
+    };
+    passing.tickUntil(
+        [&] {
+          return expiringPasses() == 1 + (when == When::InAPass) &&
+                 passing.engine.commandInFlight() == (when != When::BeforeARegroup) &&
+                 (when != When::BetweenPasses || passing.commands.back().kind == WorkKind::Decode);
+        },
+        "the expiring prompt did not run its passes");
+    if (when == When::BeforeARegroup)
+      passing.submit(3, 300);
+    passing.now = 5000;
+    static_cast<void>(passing.engine.tick(passing.now++));
+    const std::optional<double> wakeup = passing.engine.nextWakeupMilliseconds();
+    require(passing.events.failedCount == 1 && (!wakeup || *wakeup >= passing.now),
+            "a lane whose deadline passed during its command's passes did not end there");
+    if (when == When::BetweenPasses)
+      passing.engine.cancel(1);
+    passing.tickUntil([&] { return idle(passing.engine); }, "the requests did not end");
+    require(expiringPasses() == 1 + (when == When::InAPass) && passing.events.failedCount == 1,
+            "a lane whose deadline passed during its command's passes was run again");
+  }
+}
+
+// During recovery admission waits for no command's passes either: a
+// Background lane a Normal start's refusal suspended resumes between them,
+// and its replay, of a lower priority, runs once the Normal prompt's command
+// has run its last.
+void testRecoveryAdmitsBetweenPasses() {
+  PassingEngine passing;
+  passing.model.beginGrowthBlocked = [&] {
+    return passing.model.lastBeginId == 2 && passing.model.requests.at(1).resident;
+  };
+  EngineRequest background = request(1, std::vector<uint32_t>(65, 1));
+  background.priority = RequestPriority::Background;
+  background.maxNewTokens = 1000;
+  passing.engine.submit(std::move(background));
+  passing.tickUntil([&] { return passing.events.outputs.contains(1); }, "the Background lane did not decode");
+  passing.submit(2, 300);
+  const auto normal = [](const PassingEngine::Command &command) {
+    return command.kind == WorkKind::Prefill && command.lanes == std::vector<uint64_t>{2};
+  };
+  passing.tickUntil([&] { return std::ranges::count_if(passing.commands, normal) == 2 && !passing.engine.commandInFlight(); },
+                    "the Normal prompt did not run two passes");
+  require(passing.engine.snapshot().prioritySuspensions == 1 && passing.engine.snapshot().resourceResumptions == 1,
+          "a suspended request did not resume between a command's passes");
+  // The first command of the Normal prompt, and the Background lane's replay
+  // after it, if it ran.
+  const auto replay = [&] {
+    const auto first = std::ranges::find_if(passing.commands, normal);
+    return std::pair{first, std::find_if(first, passing.commands.end(), [](const PassingEngine::Command &command) {
+                       return command.kind == WorkKind::Prefill && command.lanes == std::vector<uint64_t>{1};
+                     })};
+  };
+  passing.tickUntil([&] { return replay().second != passing.commands.end(); }, "the suspended request did not replay");
+  const auto [first, replayed] = replay();
+  require(std::count_if(first, replayed, normal) == 6, "a lower priority's replay ran between a command's passes");
+  passing.engine.cancel(1);
+  passing.tickUntil([&] { return idle(passing.engine); }, "engine did not reach idle");
+  require(passing.events.failedCount == 0, "a request failed");
+}
+
 void testSharedPrefillHonorsPriorityAndLateArrival() {
   for (bool foreground : {false, true}) {
     test::TestKvStorage storage(512, 4096, 4);
@@ -9005,6 +9616,206 @@ void testALaneBetweenItsPassesDoesNotConvert() {
           "the lane's command did not run its passes");
 }
 
+// As testALaneBetweenItsPassesDoesNotConvert, with the lane that holds the
+// most KV second in a command of two: no lane of a command between its
+// passes converts, not only the one it leads with.
+void testNoLaneOfACommandBetweenItsPassesConverts() {
+  Spilling spill(64, false);
+  // Each prefill command's lanes, pass and passes.
+  std::vector<std::tuple<std::vector<uint64_t>, uint32_t, uint32_t>> prefills;
+  spill.model.commandTimes = [&](const BatchPlan &plan, std::span<const ModelBatchItem>) {
+    if (plan.kind == WorkKind::Prefill) {
+      std::vector<uint64_t> lanes;
+      for (const BatchItem &item : plan.items)
+        lanes.push_back(item.requestId);
+      prefills.emplace_back(std::move(lanes), plan.pass, plan.passes);
+    }
+    return test::CommandTimes{};
+  };
+  spill.storage.budgetPages = 9;
+  spill.engine.submit(Spilling::prompt(1, 1, 7, 40));
+  spill.runUntilIdle();
+  while (spill.cache.reclaimOneState(StateClass::Ordinary, false)) {
+  }
+  std::vector<uint32_t> history(7 * KvCache::pageTokens + 1, 1);
+  history.insert(history.end(), spill.events.outputs.at(1).begin(), spill.events.outputs.at(1).end());
+  spill.storage.budgetPages = std::numeric_limits<uint32_t>::max();
+  spill.engine.submit(request(2, history));
+  spill.runUntilIdle();
+  require(spill.engine.snapshot().spill.converted == 1, "the first turn did not spill its chain");
+  // The third turn restores the chain; a short fourth joins it ahead, since
+  // less of its prompt is left, and the two run in passes.
+  spill.model.passes = 4;
+  spill.engine.observePrefill(model::ExecutionLimits::prefillTokenBudget, 4900.0, 3400.0);
+  history.insert(history.end(), 192, 5);
+  spill.engine.submit(request(3, history));
+  static_cast<void>(spill.engine.tick(spill.now++));
+  spill.engine.submit(request(4, std::vector<uint32_t>(100, 9)));
+  const std::vector<uint64_t> shared{4, 3};
+  spill.runUntil(
+      [&] {
+        return !prefills.empty() && std::get<0>(prefills.back()) == shared &&
+               std::get<1>(prefills.back()) + 1 < std::get<2>(prefills.back()) &&
+               !spill.engine.commandInFlight();
+      },
+      "the two lanes did not share a command in passes");
+  static_cast<void>(spill.engine.reclaimMemory(
+      {.targetBytes = 100'000, .upTo = ReclaimClass::Ordinary, .hostShort = true}));
+  require(spill.engine.snapshot().spill.converted == 1, "a lane between its command's passes converted to Spill");
+  spill.runUntilIdle();
+  require(spill.events.failedCount == 0 && spill.events.completedCount == 4,
+          "the command of two lanes did not run its passes");
+  require(std::get<0>(prefills.back()) == shared &&
+              std::get<1>(prefills.back()) + 1 == std::get<2>(prefills.back()),
+          "the command of two lanes did not run to its last pass");
+}
+
+// The rule holds where a lane refused the model's memory for its reads of
+// spilled KV takes it from the lane that yields first. Refused a decoding Spill
+// lane's floor of the hot block cache, a cancelled lane of the command between
+// its passes gives that command up rather than be suspended. A Foreground prompt
+// that supersedes a command, refused the staging of the history it streams,
+// gives the command up on the ladder, which ends its cancelled lane, and the
+// lane that then yields is the live one, chosen after the ladder.
+void testASpilledReadsRefusalFollowsTheRuleForLanesThatEnded() {
+  struct Lanes final {
+    std::vector<uint64_t> ids;
+    uint32_t pass, passes;
+  };
+  const auto setUp = [](Spilling &spill, std::vector<Lanes> &prefills) {
+    spill.model.passes = 6;
+    spill.model.groupRows = 4 * model::ExecutionLimits::prefillTokenBudget;
+    spill.model.commandTimes = [&prefills](const BatchPlan &plan, std::span<const ModelBatchItem> items) {
+      if (plan.kind == WorkKind::Decode)
+        return test::CommandTimes{.wallMilliseconds = 100.0};
+      Lanes command{{}, plan.pass, plan.passes};
+      uint32_t rows = 0;
+      for (const ModelBatchItem &item : items) {
+        command.ids.push_back(item.requestId);
+        rows += item.tokenCount;
+      }
+      prefills.push_back(std::move(command));
+      return test::CommandTimes{(3400.0 + rows * 1500.0 / 2048) / plan.passes, 3400.0 / plan.passes};
+    };
+    spill.engine.observePrefill(model::ExecutionLimits::prefillTokenBudget, 4900.0, 3400.0);
+  };
+  const auto sharing = [](const Spilling &spill, const std::vector<Lanes> &prefills) {
+    return !prefills.empty() && prefills.back().ids.size() == 2 && prefills.back().pass + 1 < prefills.back().passes &&
+           !spill.engine.commandInFlight();
+  };
+  {
+    Spilling spill(1024, false, 200 * 100);
+    std::vector<Lanes> prefills;
+    setUp(spill, prefills);
+    spill.engine.submit(Spilling::prompt(1, 1, 80, 4096));
+    spill.runUntil([&] { return spill.events.outputs.contains(1) && spill.cache.holdsIndexPages(1); },
+                   "the Spill lane did not decode with Index pages");
+    spill.engine.submit(Spilling::prompt(2, 2, 9, 1));
+    spill.engine.submit(Spilling::prompt(3, 3, 9, 1));
+    spill.runUntil([&] { return sharing(spill, prefills); }, "the two prompts did not share a command in passes");
+    spill.engine.cancel(3);
+    require(spill.engine.snapshot().cancelled == 0, "the cancelled lane left its command");
+    spill.model.refusedSpilledReads = {1};
+    spill.runUntil([&] { return spill.engine.snapshot().cancelled == 1; }, "the cancelled lane did not end");
+    spill.model.refusedSpilledReads.clear();
+    require(spill.engine.snapshot().resourceSuspensions == 0, "a lane yielded beside one that gave its command up");
+    spill.engine.cancel(1);
+    spill.runUntilIdle();
+    require(spill.events.completedCount == 3 && spill.events.failedCount == 0, "the requests did not end");
+  }
+  {
+    Spilling spill(1024, true, 100'000, 0, Spilling::Extent{64});
+    std::vector<Lanes> prefills;
+    setUp(spill, prefills);
+    const std::vector<uint32_t> earlier(40 * KvCache::pageTokens + 1, 7);
+    spill.engine.submit(request(1, earlier));
+    spill.runUntilIdle();
+    for (uint64_t id = 2; id <= 3; ++id) {
+      EngineRequest background = request(id, std::vector<uint32_t>(300, static_cast<uint32_t>(id)));
+      background.priority = RequestPriority::Background;
+      spill.engine.submit(std::move(background));
+    }
+    spill.runUntil([&] { return sharing(spill, prefills); }, "the Background prompts did not share a command in passes");
+    spill.engine.cancel(3);
+    spill.model.refusedStaging = {4};
+    std::vector<uint32_t> prompt = earlier;
+    prompt.insert(prompt.end(), 300, 9);
+    EngineRequest foreground = request(4, prompt);
+    foreground.priority = RequestPriority::Foreground;
+    spill.engine.submit(std::move(foreground));
+    spill.runUntil([&] { return spill.engine.snapshot().resourceSuspensions == 1; },
+                   "the refused prompt did not take its memory from the live lane");
+    require(spill.engine.snapshot().cancelled == 1, "the cancelled lane did not end with its command");
+    spill.model.refusedStaging.clear();
+    spill.runUntilIdle();
+    const EngineSnapshot counts = spill.engine.snapshot();
+    require(counts.cancelled == 1 && spill.events.failedCount == 0 && spill.events.completedCount == 4,
+            "the requests did not end once each");
+  }
+}
+
+// On a target that can spill, a prompt of a higher priority that the
+// engine's limit refuses its KV takes what the Background command between its
+// passes holds before it converts itself to Spill: giving the command up,
+// which that prompt's command does once it runs, is the first rung above the
+// cache nothing in use holds, and the buffers of the states the command
+// would capture are what its KV fits in.
+void testASupersedingPromptTakesACommandsMemoryBeforeSpilling() {
+  Spilling spill(64, false);
+  std::vector<std::pair<uint64_t, uint32_t>> prefills;
+  spill.model.commandTimes = [&](const BatchPlan &plan, std::span<const ModelBatchItem>) {
+    if (plan.kind == WorkKind::Prefill)
+      prefills.emplace_back(plan.items.front().requestId, plan.pass);
+    return test::CommandTimes{};
+  };
+  spill.model.passes = 6;
+  spill.model.kvGrowthBlocked = &spill.storage.growthBlocked;
+  spill.engine.observePrefill(model::ExecutionLimits::prefillTokenBudget, 4900.0, 3400.0);
+  for (uint64_t id = 1; id <= 2; ++id) {
+    EngineRequest background = Spilling::prompt(id, static_cast<uint32_t>(id), 4, 1);
+    background.priority = RequestPriority::Background;
+    spill.engine.submit(std::move(background));
+  }
+  spill.runUntil([&] { return !prefills.empty() && !spill.engine.commandInFlight(); },
+                 "the Background prompts did not run a pass");
+  spill.storage.growthBlocked = true;
+  EngineRequest foreground = Spilling::prompt(3, 3, 4, 1);
+  foreground.priority = RequestPriority::Foreground;
+  spill.engine.submit(std::move(foreground));
+  spill.runUntilIdle();
+  const EngineSnapshot counts = spill.engine.snapshot();
+  require(counts.spill.converted == 0 && counts.resourceSuspensions == 0 && spill.events.completedCount == 3 &&
+              spill.events.failedCount == 0,
+          "a superseding prompt converted itself to Spill before the command between its passes gave its memory back");
+}
+
+// A lane that ended between its command's passes, whose KV leaves with that
+// command, is no part of a start's projection: a turn that would fit beside
+// the lanes that go on starts Resident, not Spill for life.
+void testAnEndedLaneLeavesAStartResident() {
+  Spilling spill(64, false, 3000);
+  std::vector<std::pair<uint64_t, uint32_t>> prefills;
+  spill.model.commandTimes = [&](const BatchPlan &plan, std::span<const ModelBatchItem>) {
+    if (plan.kind == WorkKind::Prefill)
+      prefills.emplace_back(plan.items.front().requestId, plan.pass);
+    return test::CommandTimes{};
+  };
+  spill.model.passes = 6;
+  spill.engine.observePrefill(model::ExecutionLimits::prefillTokenBudget, 4900.0, 3400.0);
+  spill.engine.submit(Spilling::prompt(1, 1, 20, 1));
+  spill.engine.submit(Spilling::prompt(2, 2, 2, 1));
+  spill.runUntil([&] { return !prefills.empty() && !spill.engine.commandInFlight(); },
+                 "the prompts did not run a pass of their command");
+  require(spill.engine.snapshot().spill.spill == 0 && prefills.back() == std::pair{2UL, 0U},
+          "the prompts did not share a command");
+  spill.engine.cancel(1);
+  spill.engine.submit(Spilling::prompt(3, 3, 6, 1));
+  spill.runUntilIdle();
+  require(spill.engine.snapshot().spill.spill == 0 && spill.events.failedCount == 0 &&
+              spill.events.completedCount == 3,
+          "a start counted a lane that had ended between its command's passes");
+}
+
 // A lane in passes whose replay point the first pass's preparation is
 // refused, with nothing but the lane itself to give memory back, converts
 // to Spill there: its pages stay Full in that command, but those whose
@@ -9059,6 +9870,46 @@ void testALaneThatConvertsInItsFirstPassRunsItWhole() {
                                      return std::get<0>(each) == 3 && std::get<2>(each) > 1;
                                    }),
           "the command the lane converted in did not run whole");
+}
+
+// A command in passes runs whole once a refusal while it takes shape
+// converts any of its lanes to Spill, not only its leader: here the rest of
+// a long prompt, which shares a command with a short one, and whose replay
+// point the engine's limit refuses until the lane has converted. Its pages
+// stay Full in that command, but those whose copies land would spill at the
+// next pass's start.
+void testACommandAnyLaneConvertsInRunsWhole() {
+  Spilling spill(256, false);
+  // Each prefill command's lanes and passes.
+  using Command = std::pair<std::vector<uint64_t>, uint32_t>;
+  std::vector<Command> prefills;
+  spill.model.commandTimes = [&](const BatchPlan &plan, std::span<const ModelBatchItem>) {
+    if (plan.kind == WorkKind::Prefill) {
+      std::vector<uint64_t> lanes;
+      for (const BatchItem &item : plan.items)
+        lanes.push_back(item.requestId);
+      prefills.emplace_back(std::move(lanes), plan.passes);
+    }
+    return test::CommandTimes{};
+  };
+  spill.model.passes = 4;
+  spill.engine.observePrefill(model::ExecutionLimits::prefillTokenBudget, 4900.0, 3400.0);
+  spill.model.reservationObserver = [&] {
+    spill.model.denyReservationAt = spill.engine.snapshot().spill.converted ? 0 : 79 * KvCache::pageTokens;
+  };
+  // The long prompt's first chunk runs in passes; the short one, which
+  // arrives before its last, too late to join it, leads the next command.
+  spill.engine.submit(Spilling::prompt(2, 2, 79, 1));
+  spill.runUntil([&] { return prefills.size() == 3 && !spill.engine.commandInFlight(); },
+                 "the long prompt did not run three passes");
+  spill.engine.submit(Spilling::prompt(1, 1, 1, 1));
+  spill.runUntilIdle();
+  require(spill.events.failedCount == 0 && spill.events.completedCount == 2 &&
+              spill.engine.snapshot().spill.converted == 1 && prefills.front() == Command{{2}, 4} &&
+              std::ranges::find(prefills, Command{{1, 2}, 1}) != prefills.end() &&
+              std::ranges::none_of(prefills,
+                                   [](const Command &each) { return each.first.size() > 1 && each.second > 1; }),
+          "the command a lane converted in did not run whole");
 }
 
 // A Resident lane that restored a spilled chain, whose copies landed, and
@@ -9933,6 +10784,101 @@ void testAHeldLaneEndsItsCommandAtItsCapacity() {
   spill.runUntilIdle();
   require(spill.events.failedCount == 0 && spill.events.completedCount == 4,
           "the requests did not complete");
+}
+
+// A command that a lane's arrival would regroup, while a lane it yields before
+// waits for memory on its way back, loses only the passes the regroup costs: a
+// Resident prompt's command in passes, planned again with a short arrival,
+// keeps the KV it holds and runs without the arrival, which takes no page while
+// the Spill lane waits for its floor, and is not planned again at every
+// boundary. The arrival runs once the lane has its floor. So it does where the
+// command's lane is cancelled meanwhile, which ends it at once and leaves the
+// memory to the waiting lane.
+void testAJoinerHeldBackLeavesACommandItsPasses() {
+  for (const bool cancelled : {false, true}) {
+    Spilling spill(1024, true, 100'000, 0, Spilling::Extent{16});
+    spill.model.deniedReservations = std::numeric_limits<uint32_t>::max();
+    spill.model.stateTier = std::make_shared<OffloadControl>();
+    spill.model.stateTier->ready = true;
+    spill.model.restoreControl->ready = true;
+    std::vector<std::tuple<uint64_t, uint32_t, uint32_t>> prefills;
+    spill.model.commandTimes = [&](const BatchPlan &plan, std::span<const ModelBatchItem> items) {
+      if (plan.kind == WorkKind::Prefill)
+        for (const ModelBatchItem &item : items)
+          prefills.emplace_back(item.requestId, plan.pass, plan.passes);
+      return plan.kind == WorkKind::Decode
+                 ? test::CommandTimes{.wallMilliseconds = 100.0}
+                 : test::CommandTimes{4900.0 / plan.passes, 3400.0 / plan.passes};
+    };
+    spill.engine.observePrefill(model::ExecutionLimits::prefillTokenBudget, 4900.0, 3400.0);
+    const auto prompt = [](uint64_t id, uint32_t token, uint32_t tokens) {
+      EngineRequest result = request(id, std::vector<uint32_t>(tokens, token));
+      result.maxNewTokens = 400;
+      result.deadlineMilliseconds = 1e9;
+      return result;
+    };
+    spill.tier.writableFile = false;
+    spill.engine.submit(prompt(1, 1, 48 * KvCache::pageTokens + 1));
+    spill.runUntilIdle();
+    spill.tier.writableFile = true;
+    spill.model.deniedReservations = 0;
+    bool room = false;
+    spill.model.spilledReadsRoom = [&](uint64_t id) { return id != 2 || room; };
+    spill.engine.submit(prompt(2, 2, 4 * KvCache::pageTokens + 1));
+    for (uint32_t step = 0; step < 100 && !spill.events.outputs.contains(2); ++step)
+      static_cast<void>(spill.engine.tick(spill.now += 50));
+    require(spill.events.outputs.contains(2) && !spill.cache.holdsIndexPages(2),
+            "the Spill lane did not decode before its pages spilled");
+    // A short prompt starts Resident and runs its command's first pass.
+    spill.model.passes = 4;
+    spill.tier.writableFile = false;
+    spill.engine.submit(prompt(3, 3, 60));
+    const auto passesOf = [&](uint64_t id, uint32_t pass) {
+      return std::ranges::count_if(prefills, [&](const auto &each) {
+        return std::get<0>(each) == id && std::get<1>(each) == pass;
+      });
+    };
+    for (uint32_t step = 0; step < 100 && !passesOf(3, 0); ++step)
+      static_cast<void>(spill.engine.tick(spill.now += 50));
+    require(std::get<2>(prefills.back()) == 4, "the prompt's command did not run in passes");
+    spill.tier.writableFile = true;
+    // The Spill lane's pages spill; from its next decode command it waits for
+    // its floor while a cached leaf's write, which does not land, is in flight.
+    spill.tier.complete();
+    const size_t outputs = spill.events.outputs.at(2).size();
+    spill.engine.submit(prompt(4, 4, 300));
+    const auto step = [&] {
+      static_cast<void>(spill.engine.tick(spill.now += 50));
+      for (const auto &transfer : spill.tier.transfers)
+        if (transfer->submitted && transfer->write != WriteClass::Reclaim)
+          transfer->ready = true;
+    };
+    for (uint32_t tick = 0; tick < 200 && passesOf(3, 0) < 2; ++tick)
+      step();
+    require(passesOf(3, 0) == 2, "the arrival did not regroup the command");
+    if (cancelled) {
+      step();
+      spill.engine.cancel(3);
+      require(spill.engine.snapshot().cancelled == 1, "a command's only lane cancelled between its passes stayed");
+      for (uint32_t tick = 0; tick < 8; ++tick)
+        step();
+    } else {
+      for (uint32_t tick = 0; tick < 200 && !passesOf(3, 3); ++tick)
+        step();
+      require(passesOf(3, 0) == 2 && passesOf(3, 3) == 1,
+              "a command planned again with an arrival held back did not run its passes to its last without it");
+    }
+    require(spill.cache.holdsIndexPages(2) && spill.events.outputs.at(2).size() == outputs,
+            "the Spill lane did not wait for its floor");
+    require(!passesOf(4, 0), "an arrival took pages while a lane it yields before waited for its floor");
+    room = true;
+    spill.model.decodeFinishes = true;
+    spill.runUntilIdle();
+    const EngineSnapshot counts = spill.engine.snapshot();
+    require(passesOf(4, 0) != 0 && counts.resourceSuspensions == 0 && counts.failed == 0 &&
+                counts.cancelled == cancelled && spill.events.completedCount == 4,
+            "the arrival did not run once the lane had its floor, or a lane yielded");
+  }
 }
 
 // A lane whose memory on its way back never lands holds the lanes that yield
@@ -12725,6 +13671,72 @@ void testRefusedRestoreClosesAdmission() {
   }
 }
 
+// A command between its passes yields to a prompt of a higher priority as
+// that prompt's command runs, not before: a Foreground prompt whose KV comes
+// back only as the copies of the pages it reclaims land waits for them while
+// the Background command it arrived beside runs its passes on, rather than
+// that command's first pass again whenever the prompt tries anew.
+void testAHigherPriorityThatWaitsLeavesACommandItsPasses() {
+  test::TestKvStorage storage(64, 4096, 4);
+  KvPool pool(storage, 0);
+  test::TestKvTier tier;
+  tier.capacity = 64;
+  tier.transferLimit = 8;
+  engine::Cache cache(pool, &tier, nullptr);
+  Executor model;
+  model.groupRows = 4 * model::ExecutionLimits::prefillTokenBudget;
+  model.passes = 6;
+  // The passes of the Background prompts' commands.
+  std::vector<uint32_t> passes;
+  model.commandTimes = [&](const BatchPlan &plan, std::span<const ModelBatchItem> items) {
+    if (plan.kind == WorkKind::Prefill && plan.items.front().requestId != 3)
+      passes.push_back(plan.pass);
+    uint32_t rows = 0;
+    for (const ModelBatchItem &item : items)
+      rows += item.tokenCount;
+    return test::CommandTimes{(3400.0 + rows * 1500.0 / 2048) / plan.passes, 3400.0 / plan.passes};
+  };
+  Events events;
+  engine::Engine engine(test::engineConfig(), cache, model, events);
+  guardReleases(storage, engine);
+  engine.observePrefill(model::ExecutionLimits::prefillTokenBudget, 4900.0, 3400.0);
+  for (uint64_t id = 1; id <= 2; ++id) {
+    EngineRequest background = request(id, std::vector<uint32_t>(300, static_cast<uint32_t>(id)));
+    background.priority = RequestPriority::Background;
+    engine.submit(std::move(background));
+  }
+  double now = 1;
+  tickUntil(engine, now, [&] { return passes.size() == 1 && !engine.commandInFlight(); },
+            "the Background prompts did not run a pass");
+  // Cached blocks under states on disk take the pages the engine's limit
+  // leaves; they come back only once their copies are written.
+  storage.budgetPages = 32;
+  for (uint64_t id = 900;; ++id) {
+    cache.beginRequest(id);
+    if (!cache.ensureTokens(id, 32).granted()) {
+      cache.endRequest(id);
+      break;
+    }
+    demoteState(cache, test::publishBlocks(cache, id, std::vector<uint32_t>(32, static_cast<uint32_t>(id)), 32));
+    cache.endRequest(id);
+  }
+  EngineRequest foreground = request(3, std::vector<uint32_t>(100, 3));
+  foreground.priority = RequestPriority::Foreground;
+  engine.submit(std::move(foreground));
+  for (uint32_t step = 0; step < 50 && !(events.usage.contains(1) && events.usage.contains(2)); ++step, now += 101)
+    static_cast<void>(engine.tick(now));
+  require(events.usage.contains(1) && events.usage.contains(2) && !events.usage.contains(3) && tier.demotions != 0,
+          "the Background prompts' command did not end while a Foreground prompt waited for copies");
+  require(passes == std::vector<uint32_t>{0, 1, 2, 3, 4, 5},
+          "a higher priority that waited for memory abandoned a command between its passes");
+  for (uint32_t step = 0; step < 100 && !idle(engine); ++step, ++now) {
+    tier.complete();
+    static_cast<void>(engine.tick(now));
+  }
+  require(idle(engine) && events.completedCount == 3 && events.failedCount == 0,
+          "the Foreground prompt did not run once its memory landed");
+}
+
 // A lane whose pages keep landing is never failed for waiting: the resource
 // limit measures time without progress. With one transfer at a time every
 // round moves one page, so the restore takes many rounds and several times
@@ -14972,6 +15984,20 @@ int main() {
     testImagePromptsRunPrefillGroups();
     testTicketAdvancesOnTheEngineWakes();
     testPrefillPassesInterleaveDecodeAndEndAtACancel();
+    testShortPromptsShareACommandInPasses();
+    testArrivalsDuringPassesShareTheCommand();
+    testAHigherPriorityIsNotHeldBehindPasses();
+    testALaneSuspendedBetweenPassesAbandonsItsCommand();
+    testARefusedLaneWaitsForItsCommandsEnd();
+    testAHigherPriorityTakesWhatACommandBetweenPassesHolds();
+    testAHigherPriorityStartTakesWhatACommandBetweenPassesHolds();
+    testALaneThatExpiredBetweenPassesEndsOnce();
+    testTheLaneThatYieldsIsChosenAfterTheLadder();
+    testALaneThatEndedBetweenPassesIsNotSuspended();
+    testAStartThatWouldNotSupersedeACommandWaitsForItsEnd();
+    testLaterPassesFollowEveryLanesMovedPages();
+    testADeadlineEndsALaneOfACommandInPasses();
+    testRecoveryAdmitsBetweenPasses();
     testSharedPrefillHonorsPriorityAndLateArrival();
     testLateSharedPrefillExtendsTheProducerPlan();
     testLateSiblingBoundaryNeedsAWholeDraftWindow();
@@ -14995,6 +16021,7 @@ int main() {
     testCancelledDiskPrefixStopsQueuedReads();
     testPagesReturnFromDemotionWithoutSuspending();
     testRefusedRestoreClosesAdmission();
+    testAHigherPriorityThatWaitsLeavesACommandItsPasses();
     testFailedDiskRestoreKeepsShallowerState();
     testRepeatedDiskHitPromotesToMemory();
     testGrowthWaitsForTheStateWriteInFlight();
@@ -15060,7 +16087,12 @@ int main() {
     testALaneThatTakesSpilledBlocksAsItPrefillsRunsPrefillGroups();
     testALaneThatConvertsAtItsPrefillRunsItAloneAndWhole();
     testALaneBetweenItsPassesDoesNotConvert();
+    testNoLaneOfACommandBetweenItsPassesConverts();
+    testASpilledReadsRefusalFollowsTheRuleForLanesThatEnded();
+    testASupersedingPromptTakesACommandsMemoryBeforeSpilling();
+    testAnEndedLaneLeavesAStartResident();
     testALaneThatConvertsInItsFirstPassRunsItWhole();
+    testACommandAnyLaneConvertsInRunsWhole();
     testSpilledFullExtentsLeaveOnceNoPromptGrows();
     testSpillMovesThroughTheHostPause();
     testSpillResumeCommitsAgain();
@@ -15079,6 +16111,7 @@ int main() {
     testAWaitingStartHoldsNoLane();
     testABatchRefusalOfNothingOnItsWayBackHoldsNoOne();
     testAHeldLaneEndsItsCommandAtItsCapacity();
+    testAJoinerHeldBackLeavesACommandItsPasses();
     testAFloorConvertsAResidentNeighbourBeforeTheExpertStore();
     testAFloorConvertsTheLargestLaneThatGivesMemoryBack();
     testOwedCopiesHoldBackTheNextConversion();

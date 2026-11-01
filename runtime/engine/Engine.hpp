@@ -471,7 +471,8 @@ private:
     // corresponding event was emitted and model/resource ownership ended.
     bool finalized = false;
     // The outcome that ends this lane once the command or restore it is in
-    // drains; the first one stands.
+    // drains, or the command between its passes that holds it has run its
+    // last or is given up (abandonPasses); the first one stands.
     std::optional<LaneEnd> pendingEnd;
     // When the engine asked the server for this lane's token mask, until the
     // model takes one.
@@ -482,14 +483,6 @@ private:
     // A restore that could not fit alone released its prefix pin:
     // admissions ignore the cache until one succeeds.
     bool skipCache = false;
-    // Between the passes of its prefill command (BatchPlan::passes): the
-    // command's item, with the states it captures, and its captures, which
-    // every pass runs and the last one commits.
-    struct PassCommand final {
-      ModelBatchItem item;
-      std::vector<Capture> captures;
-    };
-    std::optional<PassCommand> passCommand;
     // Admission that waits for its state's read, its KV pages' restores,
     // or both, before the lane runs.
     struct Restore {
@@ -535,6 +528,13 @@ private:
     // cache (KvHistoryStream), whose wait on the reads the ticket reports.
     bool streamed = false;
   };
+  // A prefill command between its passes (BatchPlan::passes): its items,
+  // with the states they capture, and their captures, which every pass runs
+  // and the last one commits.
+  struct PassCommand final {
+    std::vector<ModelBatchItem> items;
+    std::vector<std::vector<Capture>> captures;
+  };
   enum class Prepared : uint8_t {
     // Some lanes were admitted and the plan runs with them.
     Runnable,
@@ -555,10 +555,10 @@ private:
   [[nodiscard]] static uint64_t projectedTokens(const Request &request) noexcept;
   // Where the KV of a request that starts now lives: on a target that can
   // spill, Spill when its projection does not fit in the memory resident KV
-  // may use beside every other lane's (a Resident lane's projection, a Spill
-  // lane's floor), which the plan sizes beside the expert store at its cap,
-  // and for every request under --kv-spill always; Resident otherwise.
-  // Correctness never depends on it.
+  // may use beside every other lane's that has not ended (a Resident lane's
+  // projection, a Spill lane's floor), which the plan sizes beside the expert
+  // store at its cap, and for every request under --kv-spill always; Resident
+  // otherwise. Correctness never depends on it.
   [[nodiscard]] KvMode kvModeFor(const Request &request) const;
   // The request's projection fits in memory alone, as it would without the
   // SSD cache (SpillGeometry::residentTokens).
@@ -744,12 +744,13 @@ private:
   // another request's state in use go (Cache::reclaimInUseState).
   template <class Take> [[nodiscard]] bool makeStateRoom(StateClass kind, Take &&take);
   // The rungs above the cache nothing in use holds that every refusal of the
-  // engine's limit climbs, one step a call (Engine.cpp has the ladder): a
-  // Resident lane converting to Spill on a target whose KV can live on the
-  // SSD cache, the requester's own first (`convertRequester`), whose memory
-  // is on its way back (pending), as Spill lanes' owed copies' is; a chunk
-  // of the expert store above its floor; what is in use (`takeInUse`).
-  // Between commands only.
+  // engine's limit climbs, one step a call (Engine.cpp has the ladder): for
+  // work that supersedes the command between its passes (superseding_),
+  // that command, given up (abandonPasses); a Resident lane converting to
+  // Spill on a target whose KV can live on the SSD cache, the requester's
+  // own first (`convertRequester`), whose memory is on its way back
+  // (pending), as Spill lanes' owed copies' is; a chunk of the expert store
+  // above its floor; what is in use (`takeInUse`). Between commands only.
   [[nodiscard]] CacheReclaimResult escalate(const std::function<bool()> &convertRequester,
                                             const std::function<CacheReclaimResult()> &takeInUse);
   // The reclaim steps for a lane's state (and the model's memory for reading
@@ -824,9 +825,9 @@ private:
   // without a copy, the chain it holds or, at admission, the one it restores
   // (`restoring`) counted; false when it cannot (no SSD cache, the tier
   // closed, its quota short, or a lane already Spill) or must not: a lane
-  // between the passes of a command, which reads all its history from
-  // memory. Its pages whose copies landed spill at once, but in a command
-  // whose lanes' forms are reserved already (commandShaped_).
+  // of the command between its passes, which reads all its lanes' history
+  // from memory. Its pages whose copies landed spill at once, but in a
+  // command whose lanes' forms are reserved already (commandShaped_).
   [[nodiscard]] bool convertToSpill(Request &request, const CacheLookup *restoring = nullptr);
   // Whether converting the lane to Spill gives memory back: whether the Full
   // pages it holds past those a Spill request keeps Full (its dense, window
@@ -860,7 +861,12 @@ private:
   // The resident lane in prefill or decode that yields first when every
   // lane's growth fails (yieldsBefore; on a tie, the later submission), or
   // nullptr without one. prepare() gates that lane's growth and suspends
-  // that lane; preemptBelow() suspends it for a higher priority.
+  // that lane; preemptBelow() suspends it for a higher priority. A lane of
+  // the command between its passes beside one of it that ended gives that
+  // command up in its place, at every point a lane yields
+  // (yieldsEndedLanes). Work that supersedes the command takes what it holds
+  // before that (escalate), and a start whose prompt would not supersede it
+  // suspends no lane of it (preemptBelow).
   [[nodiscard]] Request *laneToYield();
   // Runs one allocation of a lane's state, of KV pages or of the model's
   // memory for reads of spilled KV, reclaiming cache up to class upTo
@@ -870,8 +876,9 @@ private:
   // when that gives nothing, a request in service retries as one
   // (EngineConfig::serving), which only the engine's limit and critical
   // pressure refuse. A refusal from the engine's limit reclaims cache and,
-  // unless the allocation is optional, climbs escalate()'s rungs: a KV
-  // allocation's own conversion to Spill (through fallback), another
+  // unless the allocation is optional, climbs escalate()'s rungs: for work
+  // that supersedes the command between its passes, that command, given up;
+  // a KV allocation's own conversion to Spill (through fallback), another
   // Resident lane's, a chunk of the expert store above its floor, then what
   // is in use (reclaimForState, reclaimForKv). When none gives anything,
   // fallback, given the denial so far, may let go of what the request itself
@@ -901,9 +908,13 @@ private:
   [[nodiscard]] uint64_t kvCapacity(uint64_t requestId) const;
   // For a request of this priority that cannot start: suspends the lane that
   // yields first (laneToYield) if its priority is strictly lower, without a
-  // drain. The lane waits as for a free one, and resumes once admission
-  // reaches it again, a Resident one with its current KV capacity. True when
-  // one was suspended.
+  // drain, or abandons the command between its passes that holds it if a
+  // lane of that command ended, which that frees (yieldsEndedLanes). A lane
+  // of that command otherwise yields only to a start whose prompt would
+  // supersede it (Scheduler::yieldsTo): its suspension gives the command up
+  // too, and any other start waits for the command's end. The lane waits as
+  // for a free one, and resumes once admission reaches it again, a Resident
+  // one with its current KV capacity. True when one was suspended or freed.
   // Memory on its way back makes no lane yield, as in prepare(): a request
   // refused while it is pending waits for it instead.
   [[nodiscard]] bool preemptBelow(RequestPriority priority, double nowMilliseconds);
@@ -944,11 +955,40 @@ private:
              double cycleMilliseconds, double nowMilliseconds);
   // Whether the command in flight holds the request's lane.
   [[nodiscard]] bool inFlight(uint64_t requestId) const;
+  // Whether the command between its passes holds the request's lane.
+  [[nodiscard]] bool betweenPasses(uint64_t requestId) const;
+  // Whether every lane of the command between its passes has ended
+  // (Request::pendingEnd): none is left for its passes to run for.
+  [[nodiscard]] bool passesEnded() const;
+  // Where `lane`, the lane that would yield, is one of the command between
+  // its passes beside a lane of it that ended, gives that command up in its
+  // place (abandonPasses), which ends the lanes that ended and gives back
+  // their lanes and memory and the command's captures, and returns true,
+  // for the caller to try again at its next attempt; a lane that ended is
+  // never suspended. Every point a lane yields asks it first.
+  [[nodiscard]] bool yieldsEndedLanes(const Request &lane);
+  // Abandons the command between its passes (Scheduler::abandonPasses),
+  // while none of its passes is in flight, though a command of other lanes
+  // may be: the states it would capture go back to the model's pool, its
+  // lanes that ended meanwhile end now, and the others run its rows again
+  // in a later command, nothing of them committed. A command
+  // yields so, whole, to a command that supersedes it
+  // (Scheduler::abandonsPasses): before one planned again with its lanes
+  // takes shape, and as one of a higher priority runs, or sooner, where an
+  // allocation for that work, or for a start whose prompt would supersede
+  // it, finds nothing in the cache nothing in use holds (escalate). So it
+  // does to the suspension of any of its lanes, in place of that suspension
+  // where a lane of it ended (yieldsEndedLanes), and once every lane of it
+  // has ended.
+  void abandonPasses();
   // Ends a request early. While its command or restore runs, the first end
   // waits there (the command's mask wait is abandoned, the restore's read
   // cancelled) and apply()/pollRestores() settle it once that work drains;
-  // otherwise the request ends now: Cancelled completes it, any other
-  // outcome fails it.
+  // so it does while the command between its passes holds it, until that
+  // command's last pass or until it is given up (abandonPasses), at once
+  // where every lane of it has ended. Otherwise the request ends now: Cancelled completes it, any other
+  // outcome fails it. A lane of either command ends at its deadline so
+  // (tick).
   void settle(Request &request, LaneEnd end);
   [[nodiscard]] static LaneEnd deadlineEnd();
   [[nodiscard]] static LaneEnd capacityExhausted(std::string_view what,
@@ -957,8 +997,9 @@ private:
   void finish(Request &request, EngineFinishReason reason,
               std::span<const float> optionLogits);
   void finishFailure(Request &request, LaneEnd end);
-  // Gives back what a lane holds: its planned state boundaries,
-  // its state (keepContinuation keeps the model's host continuation of a
+  // Gives back what a lane holds: the command between its passes that
+  // holds it, abandoned (abandonPasses), its planned state boundaries, its
+  // state (keepContinuation keeps the model's host continuation of a
   // suspended request) and its KV leases. The caller signals progress
   // when the memory becomes available to waiting requests: a lane that
   // held it across passes and ends (release) or fails its restore, or one
@@ -985,6 +1026,22 @@ private:
   bool commandShaped_ = false;
   // The lanes with a wait of their own that this tick's prepare held back.
   std::vector<uint64_t> heldWaits_;
+  // Set while the allocations are for work that supersedes the command
+  // between its passes: a plan that abandonsPasses as prepare() shapes it,
+  // or the start of a request whose prompt would supersede it
+  // (Scheduler::yieldsTo), which takes what the command holds first
+  // (escalate).
+  bool superseding_ = false;
+  struct Superseding final {
+    Superseding(bool &flag, bool value) : flag_(flag), previous_(std::exchange(flag, value)) {}
+    ~Superseding() { flag_ = previous_; }
+    Superseding(const Superseding &) = delete;
+    Superseding &operator=(const Superseding &) = delete;
+
+  private:
+    bool &flag_;
+    bool previous_;
+  };
   // Pressure preempted work, a lane is still resident, and memory is still
   // short (growth is paused or allocationFailed_), up to the drain's end.
   [[nodiscard]] bool drainingForRecovery() const;
@@ -1023,6 +1080,7 @@ private:
   [[nodiscard]] bool memoryAwaited(double nowMilliseconds) const;
   std::function<void()> completionNotifier_;
   std::optional<Pending> pending_;
+  std::optional<PassCommand> passCommand_;
   // When the latest command retired, until a tick finds nothing to do.
   std::optional<double> busySinceMilliseconds_;
   // The lanes admit() has obtained so far, including those it gave back when
