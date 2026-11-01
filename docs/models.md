@@ -276,9 +276,7 @@ Every model decodes with a DFlash2 draft. Each family names the repository
 of the DFlash2 checkpoint trained for it (`families.FAMILIES`), which holds
 it as the release publishes it: `config.json` and BF16 `model.safetensors`
 (or the shards its index names), and `mask_embedding.safetensors` when the
-release ships its mask token's embedding; a family whose draft is not released
-yet names none, and its installation names one with `--draft-model`.
-Installation downloads only those files and follows the repository's default
+release ships its mask token's embedding. Installation downloads only those files and follows the repository's default
 branch as it follows the target's ([Revisions](server.md#revisions)); `--draft-model`
 accepts another repository, followed the same way, or a local directory that
 holds them. A checkpoint is installed only when the engine accepts its

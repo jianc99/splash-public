@@ -62,7 +62,7 @@ class UpstreamTest(unittest.TestCase):
         return output.getvalue(), warnings.getvalue()
 
     def test_every_family_names_its_own_draft_repository(self):
-        repos = [family.draft_repo for family in families.FAMILIES if family.draft_repo]
+        repos = [family.draft_repo for family in families.FAMILIES]
         for repo in repos:
             with self.subTest(repo=repo):
                 self.assertEqual(models.validate_repo_id(repo), repo)

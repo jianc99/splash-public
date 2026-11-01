@@ -1,5 +1,4 @@
 import contextlib
-import dataclasses
 import io
 import math
 import re
@@ -36,7 +35,7 @@ from dev.tests.installer_fixtures import (
     vision_fixture,
     write_gguf,
 )
-from install import assembly, families, gguf, hub, models, upstream
+from install import assembly, gguf, hub, models, upstream
 
 GGUF_REPO = "unsloth/Qwen3.6-35B-A3B-GGUF"
 
@@ -1048,21 +1047,6 @@ class GgufMetadataTests(unittest.TestCase):
             models.read_json(chosen.link / "draft" / "config.json"),
             family_config(FLASH_NEXT, "draft/config.json"),
         )
-
-    def test_a_family_without_a_released_draft_is_refused_before_any_download(self):
-        repo = "someone/Flash-Next-GGUF"
-        fake = self.flash_next_repository(repo)
-        unreleased = dataclasses.replace(FLASH_NEXT, draft_repo=None)
-        with (
-            mock.patch.object(families, "FAMILIES", (unreleased,)),
-            self.assertRaisesRegex(
-                models.ModelError,
-                "no DFlash2 draft is released for Qwen3.8-Flash-Next; "
-                "name one with --draft-model",
-            ),
-        ):
-            self.prepare(selection(self.root, repo + ":Q2_0"))
-        self.assertNotIn(f"{repo}/model-Q2_0.gguf", fake.downloads)
 
     def test_a_layer_count_no_family_has_is_rejected_before_screening(self):
         # Screening lists every tensor of every layer a header claims; only

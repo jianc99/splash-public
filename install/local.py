@@ -246,11 +246,6 @@ def _draft(family, draft):
     (hub.Repository.resolve)."""
     if draft:
         return hub.Repository.local_directory(draft)
-    if family.draft_repo is None:
-        raise ModelError(
-            f"no DFlash2 draft is released for {family.name}; pass the "
-            "directory of one as draft"
-        )
     try:
         return hub.Repository.resolve(
             family.draft_repo,

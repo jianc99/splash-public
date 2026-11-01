@@ -707,14 +707,8 @@ def _resolve_draft(family, selection, installed, target):
     for the target, made only when the Hub answered for the target. Else the
     installed draft stands in, unlisted, or without one a commit the Hub
     cache holds for this selection; the installed draft also stands in, with
-    the reason, when the draft cannot be resolved. A family no draft is
-    released for takes --draft-model's."""
+    the reason, when the draft cannot be resolved."""
     name = selection.draft_model or family.draft_repo
-    if name is None:
-        raise models.ModelError(
-            f"no DFlash2 draft is released for {family.name}; "
-            "name one with --draft-model"
-        )
     recorded = installed and installed["sources"]["draft"]
     asked = _answered(target)
     if recorded and not asked:
