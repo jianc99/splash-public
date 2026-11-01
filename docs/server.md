@@ -867,7 +867,8 @@ empty.
 `/apply-template` uses the same default. Anthropic `thinking` keeps its protocol
 semantics (off when omitted) unless the request's `chat_template_kwargs` set
 `enable_thinking`; judgment endpoints always disable thinking. The
-built-in chat page sends no effort unless the user picks one.
+built-in chat page offers Auto, the efforts `/v1/models` reports and Off, and
+no menu for a model that decides; it sends no effort unless the user picks one.
 
 The console's Started line shows how each chat request reasons: the effort it
 sent, or `absent` and the default it took, its `enable_thinking` when it set
