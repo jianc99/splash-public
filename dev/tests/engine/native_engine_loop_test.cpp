@@ -2411,10 +2411,10 @@ void testControlPassExchangesCacheBesideARunningLane() {
           "the exchange beside a running lane did not return unused cache alone");
   executor.decodeFinishes = true;
   runUntilIdle(loop);
-  require(loop.snapshot().failed == 0, "the running request failed beside the exchange");
-  const uint64_t hits = loop.snapshot().cacheHits;
+  require(loop.statusSnapshot().failed == 0, "the running request failed beside the exchange");
+  const uint64_t hits = loop.statusSnapshot().cacheHits;
   finishConversation(fixture, 6);
-  require(loop.snapshot().cacheHits == hits + 1,
+  require(loop.statusSnapshot().cacheHits == hits + 1,
           "the newest conversation did not resume from the state the exchange kept");
 }
 

@@ -1244,7 +1244,7 @@ void testCopiesAheadOfSpilledPagesArePending() {
   process.tier.budget = budget;
   // Room for an Index extent beside the eight Full pages.
   process.storage.budgetPages = 9;
-  require(process.cache.spillWritten().granted(), "the cache did not allocate the Index runway");
+  require(process.cache.spillWritten(SpilledExtents::KeepRunway).granted(), "the cache did not allocate the Index runway");
   std::vector<uint32_t> prompt = promptOf(1000, 4);
   const std::vector<uint64_t> chain = process.cachePrompt(1, prompt);
   process.publish(chain[3]);
@@ -1268,7 +1268,7 @@ void testCopiesAheadOfSpilledPagesArePending() {
           "the copies ahead of the Spill request's pages did not count as the copies it waits for");
   process.tier.complete();
   require(process.cache.pollTransfers(), "the copies did not land");
-  static_cast<void>(process.cache.spillWritten());
+  static_cast<void>(process.cache.spillWritten(SpilledExtents::KeepRunway));
   require(process.cache.ensureTokens(2, grown).granted(), "the landed copies did not free a page as it spilled");
   for (const uint32_t page : held.pages)
     process.pool.releasePage(page, false);
