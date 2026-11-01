@@ -681,11 +681,26 @@ struct Runtime::Impl {
   // it was last reserved for, while the request is resident and its prompt
   // goes on. Releasing it would only make its next command allocate it
   // again, and could never fund its own growth. Once it is not, a decoding
-  // lane's floor replaces it (reserveSpilledReads), or an idle reclaim
-  // gives it back.
+  // lane's floor replaces it (reserveSpilledReads), it goes once its request
+  // left (releaseLeftStaging), or an idle reclaim gives it back.
   [[nodiscard]] bool stagingHeld() const noexcept {
     const auto holder = requests.find(stagingRequest);
     return holder != requests.end() && holder->second.resident && !holder->second.promptComplete;
+  }
+
+  // Gives the history's staging back once the request it was last reserved
+  // for left, ended or suspended (cancelled, scored, stopped at its first
+  // token, timed out), at the first point no command runs, which releasing
+  // its extents needs: as the request leaves, or else before the next
+  // command (Runtime::submit, which the engine calls with none in flight).
+  // While the request holds its lane, the staging waits for its decoding
+  // floor or an idle reclaim instead.
+  void releaseLeftStaging() {
+    if (!historyStream || backend.commandInFlight())
+      return;
+    const auto holder = requests.find(stagingRequest);
+    if (holder == requests.end() || !holder->second.resident)
+      static_cast<void>(historyStream->releaseIdle());
   }
 
   // Frees one cache that can be rebuilt and returns its bytes. The vision
@@ -2593,6 +2608,7 @@ void Runtime::suspend(uint64_t requestId) {
   entry.replayingGeneration |= entry.promptComplete;
   entry.promptComplete = false;
   entry.resident = false;
+  impl_->releaseLeftStaging();
 }
 
 StateAdmission Runtime::resume(const ModelRequest &request) {
@@ -2731,6 +2747,8 @@ Runtime::prefill(const BatchPlan &plan, std::span<const ModelBatchItem> items) {
 std::unique_ptr<ModelBatchTicket>
 Runtime::submit(const BatchPlan &plan, std::span<const ModelBatchItem> items,
                 std::function<void()> completion) {
+  // The staging of a request that left while another command ran.
+  impl_->releaseLeftStaging();
   switch (plan.kind) {
   case WorkKind::Prefill:
     return prefillAsync(plan, items, std::move(completion));
@@ -3155,7 +3173,7 @@ uint64_t Runtime::idleBufferBytes(uint32_t evictedStates) const noexcept {
 // the hot block cache: the floor a decoding lane takes replaces the staging
 // once no prompt holds it, so a lane never holds both (the memory plan
 // counts the larger of the two). The staging holds nothing between
-// commands, and a next prompt allocates it again as it streams; the hot
+// prompts, and a next prompt allocates it again as it streams; the hot
 // block cache keeps its blocks.
 ModelMemoryAdmission Runtime::reserveSpilledReads(uint64_t requestId) {
   const uint32_t lane = residentLane(requestId);
@@ -3255,6 +3273,7 @@ void Runtime::end(uint64_t requestId) {
   if (found->second.resident)
     impl_->releaseLane(found->second);
   impl_->requests.erase(found);
+  impl_->releaseLeftStaging();
 }
 
 namespace {
