@@ -323,6 +323,10 @@ struct OutputTests {
         #expect(Format.size(10_980_000_000) == "11 GB")
         #expect(Format.size(21_250_000_000) == "21 GB")
         #expect(Format.size(Format.gigabytes(24)) == "24 GB")
+        // Memory counts as the memory limit does: a 16 GB limit is 16 GiB.
+        #expect(Format.memory(16 << 30) == "16 GB")
+        #expect(Format.memory(18_467_000_000) == "17.2 GB")
+        #expect(Format.memory(512 << 20) == "512 MB")
     }
 }
 

@@ -266,7 +266,9 @@ class Frontend:
         self.chat_templates = chat_templates
         # The served family's: how its output reasons and calls tools.
         self.chat_format = chat_format
-        self.prompt_tokenizer = PromptTokenizer(tokenizer, chat_format.message_boundary)
+        self.prompt_tokenizer = PromptTokenizer(
+            tokenizer, chat_format.message_boundary, max_context
+        )
         self.backend = backend
         # The model id the engine loaded. /status reports it, so an alias
         # can never hide what served a request (#81).

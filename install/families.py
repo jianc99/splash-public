@@ -20,10 +20,8 @@ class ModelFamily:
     name: str
     # The repository of the DFlash2 draft released for the family, as its
     # release publishes it (config.json and BF16 safetensors). Installations
-    # follow its default branch as they follow the target's. None while no
-    # draft is released for the family: an installation names one with
-    # --draft-model.
-    draft_repo: str | None
+    # follow its default branch as they follow the target's.
+    draft_repo: str
     # How the family's model reasons and calls tools, and the tokens it
     # shares with the engine (server/chat_format.py).
     chat_format: ChatFormat

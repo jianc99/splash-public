@@ -1,5 +1,4 @@
 import contextlib
-import dataclasses
 import fcntl
 import io
 import json
@@ -11,7 +10,6 @@ from unittest import mock
 from dev.tests.installer_fixtures import (
     DENSE,
     DRAFT_COMMIT,
-    FLASH_NEXT,
     GGML,
     MOE,
     PROCESSOR,
@@ -27,7 +25,7 @@ from dev.tests.installer_fixtures import (
     vision_fixture,
     write_gguf,
 )
-from install import assembly, families, hub, local, models, upstream
+from install import assembly, hub, local, models, upstream
 
 GGUF_REPO = "unsloth/Qwen3.6-35B-A3B-GGUF"
 
@@ -238,21 +236,6 @@ class LocalModelTest(unittest.TestCase):
         ):
             self.prepare(target)
 
-    def test_a_family_without_a_released_draft_needs_a_draft(self):
-        target = self.gguf(self.root / "model-Q2_0.gguf", FLASH_NEXT)
-        unreleased = dataclasses.replace(FLASH_NEXT, draft_repo=None)
-        with mock.patch.object(families, "FAMILIES", (unreleased,)):
-            with self.assertRaisesRegex(
-                models.ModelError,
-                "no DFlash2 draft is released for Qwen3.8-Flash-Next; pass the "
-                "directory of one as draft",
-            ):
-                self.prepare(target)
-            record = assembly.verify(
-                self.prepare(target, draft_dir(self.root / "draft", FLASH_NEXT))
-            )
-        self.assertEqual(record["family"], FLASH_NEXT.name)
-
     def test_an_mlx_target_serves_images_with_its_own_tower(self):
         shards = {
             "vision_tower.blocks.0.attn.qkv.weight": "model-00001-of-00002.safetensors",
@@ -304,11 +287,11 @@ class LocalModelTest(unittest.TestCase):
         )
         self.assertEqual(
             sorted(p.name for p in (prepared / "vision").iterdir()),
-            ["config.json", "model-00001-of-00002.safetensors"],
+            ["model-00001-of-00002.safetensors"],
         )
         self.assertEqual(
             sorted(p.name for p in (prepared / "target").iterdir()),
-            ["config.json", *sorted(set(shards.values()))],
+            sorted(set(shards.values())),
         )
         self.assertEqual(
             sorted(p.name for p in (prepared / "tokenizer").iterdir()),

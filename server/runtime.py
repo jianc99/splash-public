@@ -424,6 +424,9 @@ class _StartupAttempt:
     error: EngineRuntimeError | None = None
     # The engine before, while the attempt waits for it to exit.
     stopping: ProcessLike | None = None
+    # When it spawned its engine (time.monotonic()), once the engine before
+    # had exited.
+    spawned: float | None = None
 
 
 class MultiplexedRuntime:
@@ -484,6 +487,9 @@ class MultiplexedRuntime:
         # When the current generation's ReadyEvent arrived.
         self._ready_at: float | None = None
         self._first_ready: wire.ReadyEvent | None = None
+        # The seconds the latest engine took from its spawn to Ready, which a
+        # relaunch is expected to take again from its own.
+        self._last_start_seconds: float | None = None
         # Set when a relaunch cannot help; no further engine is started.
         self._fatal_error: EngineRuntimeError | None = None
         self._terminal_error: EngineRuntimeError | None = None
@@ -556,6 +562,25 @@ class MultiplexedRuntime:
                 and self._ready_message is not None
                 and self._terminal_error is None
             )
+
+    @property
+    def last_start_seconds(self) -> float | None:
+        """The seconds the latest engine took from its spawn to Ready; None
+        until an engine was Ready."""
+        with self._state_lock:
+            return self._last_start_seconds
+
+    @property
+    def expected_ready_at(self) -> float | None:
+        """When the engine a relaunch spawned should be Ready
+        (time.monotonic()), as long after its spawn as the engine before took
+        to start; None once its startup has ended, and while it waits for the
+        engine before to exit."""
+        with self._state_lock:
+            attempt = self._startup_attempt
+            if attempt.event.is_set() or attempt.spawned is None:
+                return None
+            return attempt.spawned + self._last_start_seconds
 
     @property
     def fatal_error(self) -> EngineRuntimeError | None:
@@ -887,6 +912,7 @@ class MultiplexedRuntime:
                 or time.monotonic() >= attempt.deadline
             ):
                 return
+            attempt.spawned = time.monotonic()
 
         process = None
         try:
@@ -1200,6 +1226,7 @@ class MultiplexedRuntime:
                     raise self._fatal_error.restate()
                 self._ready_message = message
                 self._ready_at = time.monotonic()
+                self._last_start_seconds = self._ready_at - attempt.spawned
                 attempt.event.set()
             return
 

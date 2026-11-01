@@ -108,7 +108,7 @@ struct MenuBarPanel: View {
     /// How the model does since it started: answering speed, requests and memory; the tokens it
     /// generated, read and took from its cache.
     private func totals(_ activity: Server.Activity) -> some View {
-        let memory = activity.memory.map { Format.parts(Format.size($0)) }
+        let memory = activity.memory.map { Format.parts(Format.memory($0)) }
         return VStack(spacing: 10) {
             HStack(spacing: 0) {
                 Figure(value: activity.generation.map(Format.whole), unit: "tok/s", caption: "Answering", compact: true)

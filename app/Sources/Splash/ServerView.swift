@@ -311,7 +311,7 @@ private struct ActivityFigures: View {
 
     var body: some View {
         let latency = activity.firstToken.map(Format.latency)
-        let memory = activity.memory.map { Format.parts(Format.size($0)) }
+        let memory = activity.memory.map { Format.parts(Format.memory($0)) }
         HStack(spacing: 0) {
             Figure(value: activity.generation.map(Format.whole), unit: "tok/s", caption: "Answering",
                    help: "Average since the model started")

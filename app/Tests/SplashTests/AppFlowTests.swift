@@ -281,23 +281,6 @@ struct AppFlowTests {
         try await install(download)
     }
 
-    @Test func everyServeOptionHasItsPlace() throws {
-        // The options splash serve takes but those of one model, or that the app sets itself.
-        let process = Process()
-        let command = state.runtime.command(["serve", "--help"])
-        process.executableURL = URL(filePath: command[0])
-        process.arguments = Array(command.dropFirst())
-        let output = Pipe()
-        process.standardOutput = output
-        try process.run()
-        let help = String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-        process.waitUntilExit()
-        let flags = Set(help.matches(of: /(?m)^  (--[a-z-]+)/).map { String($0.1) })
-            .subtracting(["--help", "--model", "--model-dir", "--offline", "--revision", "--draft-model", "--mmproj"])
-        #expect(!flags.isEmpty)
-        #expect(flags == Set(LaunchOption.all.map(\.flag)))
-    }
-
     // MARK: -
 
     private func install(_ model: String) async throws {

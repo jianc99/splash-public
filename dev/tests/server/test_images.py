@@ -577,8 +577,7 @@ class ImageRequestTest(HarnessTestCase):
                     self.assertEqual(
                         json.loads(payload)["error"]["message"],
                         f"{modality[kind]} input is not supported: "
-                        "this model is serving without vision "
-                        "(started with --language-only)",
+                        "this model is serving without vision",
                     )
             decode.assert_not_called()
             render.assert_not_called()

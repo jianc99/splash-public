@@ -429,8 +429,9 @@ next `<arg_key>` or `</tool_call>` follows. A value may hold the tags in any
 other order, as a file an agent writes may. Tags written otherwise are text.
 Besides:
 
-- names lose the space around them, and a call that names no function is
-  dropped, as is a `</think>` in text;
+- names lose the space around them; an opening that names no function, or a
+  name too long to be one, opens no call and reads as the text the model
+  wrote, and a call after it still reads; a `</think>` in text is dropped;
 - a repeated parameter keeps its first value, which has streamed;
 - text after a call stays content, with or without its `</tool_call>`;
 - a call the token limit or a stop sequence cuts keeps the unfinished
@@ -520,7 +521,9 @@ opening passwords and citations are unsupported. PDFs render one at a time: a
 request waits for its turn and renders without holding any of the server's
 preparation capacity, so other requests prepare meanwhile.
 
-A model served with `--language-only` refuses both with 400 ([vision](models.md#vision)).
+A model serving without vision refuses both with 400: one served with
+`--language-only`, one of a family without a vision tower such as Flint, or a
+GGUF served without a projector ([vision](models.md#vision)).
 
 ## Responses state
 
@@ -664,7 +667,7 @@ Proxy consumers can use these fields; additional fields may be added:
 | `loop.max_tick_ms` | Longest control pass and engine step of the native loop. A reader thread keeps reading requests meanwhile, so a request frame whose write stalls 5 s after it started fails the engine only when the process stopped reading; while requests are pending the server asks for status every 10 s and fails an engine whose loop does not answer within 30 s. |
 | `maximum_context_tokens` | Declared context limit; available memory may limit admission |
 | `thermal_state` | The Mac's thermal state as macOS reports it: `nominal`, `fair`, `serious` or `critical`. As the Mac heats, its CPU and GPU clocks drop and prefill and decode slow down, on some Macs already at `fair`; readiness ignores it. The engine samples it twice a second and logs each change (`Thermal state: fair → serious`) |
-| `vision`, `input_modalities` | Whether image and PDF input is accepted; `false` and `["text"]` after `--language-only` |
+| `vision`, `input_modalities` | Whether image and PDF input is accepted; `false` and `["text"]` for a model serving without vision |
 | `reasoning_switch` | Whether a request's reasoning effort or `enable_thinking` turns the model's reasoning on and off ([default reasoning effort](server.md#default-reasoning-effort)): `true` for the Qwen families, `false` for Flint, whose model decides each turn |
 | `chat_template.later_system` | `native`, `patched` or `unsupported`: how system messages after the first render (per name for named templates) |
 | `transport.recovering`, `transport.stopped`, `transport.error` | The engine is restarting, or Splash stopped restarting it after repeated failures; `error` names its failure, the last failed restart, or why restarts stopped |
@@ -716,7 +719,8 @@ Exact-prefix caching reuses model work while the server runs, and across
 restarts with `--persistent-cache` ([persistent cache](server.md#persistent-cache)).
 Text requests also reuse tokenized history at literal message-end boundaries
 when the tokenizer supports independent encoding there. This process-local cache
-retains at most four prefixes and 8 MiB of text/token storage; it falls back to
+retains at most four prefixes, in storage sized for four prompts of the served
+context however Python stores their text (24 bytes a token); it falls back to
 full encoding for other tokenizer pipelines. `/status.tokenizer_cache` reports
 its usage. It does not alter prompt text, token IDs or the GPU KV cache.
 
@@ -732,8 +736,14 @@ otherwise.
 status, such as `overloaded_error` for 503. `/v1/systemone` answers invalid
 requests with 422 `detail` arrays and every 503 with 529. Every 503, and every
 529, carries `Retry-After: 1`, unless the engine says when a retry may succeed,
-as `kv_write_budget` does. A connection the server refuses before reading
-any of its request, as when every connection slot is taken
+as `kv_write_budget` does. While the engine restarts (`engine_recovering`,
+`runtime_unavailable`) it is the seconds until the restarted engine should be
+ready, as long after its spawn as the engine before took to start; before the
+spawn, while the restart waits for its backoff or for the engine before to
+exit, as long after the later of now and the time the restart is due. It is
+at least 1, and at most 59, the longest the JavaScript OpenAI and Anthropic
+SDKs follow. A connection the server refuses before reading any of its
+request, as when every connection slot is taken
 ([request limits](#request-limits-and-timeouts)), gets one fixed 503 whatever
 its path, `/v1/systemone`'s included: OpenAI's `server_error` with code
 `frontend_overloaded`. The codes a client may act on:

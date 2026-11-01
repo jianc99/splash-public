@@ -409,6 +409,8 @@ class FakeRuntime:
         self.fatal_error = None
         self.pending_limit = 32
         self.restart_count = 0
+        self.last_start_seconds = 0.0
+        self.expected_ready_at = None
         self.last_crash_trace = None
         self.status_event = native_peer.status_event()
         self.release_event = native_peer.status_event(weights=RELEASED_WEIGHTS)

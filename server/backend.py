@@ -2,6 +2,7 @@
 
 import copy
 import functools
+import math
 import queue
 import threading
 import time
@@ -28,6 +29,10 @@ CRASH_LOOP_LIMIT = 3
 # The n-th consecutive relaunch waits RESTART_BACKOFF_SECONDS * 2**(n-2); the
 # first waits 0.
 RESTART_BACKOFF_SECONDS = 5.0
+# The longest Retry-After a refusal while the engine restarts asks for, the
+# longest every OpenAI and Anthropic SDK follows: the JavaScript ones follow
+# less than a minute, the Python ones up to a minute.
+RECOVERY_RETRY_AFTER_LIMIT_SECONDS = 59
 
 
 # Control requests use a short live probe and explicitly label stale snapshots.
@@ -521,6 +526,22 @@ class NativeBackend:
                 self.restart_due = None
             self.refresh_due = True
 
+    def _recovery_retry_after_locked(self):
+        """The Retry-After of a refusal while the engine restarts: the seconds
+        until the relaunched engine should be Ready, as long after its spawn
+        as the engine before took to start. Before the spawn, while the
+        relaunch waits for its backoff or for the engine before to exit, it
+        is as long after the later of now and the time the relaunch is due;
+        a relaunch not owed yet, before the failure listener has run, is due
+        now. At least 1 once that time has passed, and at most
+        RECOVERY_RETRY_AFTER_LIMIT_SECONDS."""
+        now = time.monotonic()
+        ready = self.runtime.expected_ready_at
+        if ready is None:
+            due = now if self.restart_due is None else max(self.restart_due, now)
+            ready = due + self.runtime.last_start_seconds
+        return min(max(math.ceil(ready - now), 1), RECOVERY_RETRY_AFTER_LIMIT_SECONDS)
+
     def refusal(self):
         """The error a request not yet admitted gets now; None while the
         engine serves."""
@@ -533,11 +554,13 @@ class NativeBackend:
             if self.runtime.ready:
                 return None
             failure = self.engine_error
+            retry_after = self._recovery_retry_after_locked()
         return APIError(
             503,
             "engine is recovering; retry shortly"
             + (f" (last failure: {failure})" if failure else ""),
             "engine_recovering",
+            retry_after,
         )
 
     def is_ready(self):
@@ -964,16 +987,16 @@ class NativeBackend:
             # protocol. The listener has already decided whether that engine
             # restarts; the console names the failure.
             with self.lock:
-                fatal_error = self.fatal_error
-            if fatal_error is not None:
-                error = APIError(500, fatal_error, "engine_failed")
-            else:
-                error = APIError(
-                    503,
-                    "the inference engine stopped unexpectedly and is restarting; "
-                    "retry the request",
-                    "runtime_unavailable",
-                )
+                if self.fatal_error is not None:
+                    error = APIError(500, self.fatal_error, "engine_failed")
+                else:
+                    error = APIError(
+                        503,
+                        "the inference engine stopped unexpectedly and is "
+                        "restarting; retry the request",
+                        "runtime_unavailable",
+                        self._recovery_retry_after_locked(),
+                    )
         except Exception as unexpected:
             error = self._api_error(unexpected)
         finally:

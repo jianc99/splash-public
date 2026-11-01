@@ -329,10 +329,7 @@ def mlx_target(repo, language_only):
         )
     config = repo.file("config.json")
     family = check_model("mlx-affine", "none", config)
-    files = {
-        path: "config.json"
-        for path in ("config.json", "target/config.json", "tokenizer/config.json")
-    }
+    files = {path: "config.json" for path in ("config.json", "tokenizer/config.json")}
     files |= {"tokenizer/" + n: n for n in TOKENIZER_FILES if n in repo.files}
     # The target's shards: those holding a tensor other than the tower's. A
     # tower in a shard of its own is not the target's (an OptiQ checkpoint
@@ -354,7 +351,6 @@ def mlx_target(repo, language_only):
             check_model("mlx-affine", vision_format, config)
         except models.ModelError as error:
             raise models.VisionError(str(error)) from None
-        files["vision/config.json"] = "config.json"
         files |= {"vision/" + n: n for n in shards}
     return Target("mlx-affine", vision_format, config, None, family, files)
 
@@ -707,14 +703,8 @@ def _resolve_draft(family, selection, installed, target):
     for the target, made only when the Hub answered for the target. Else the
     installed draft stands in, unlisted, or without one a commit the Hub
     cache holds for this selection; the installed draft also stands in, with
-    the reason, when the draft cannot be resolved. A family no draft is
-    released for takes --draft-model's."""
+    the reason, when the draft cannot be resolved."""
     name = selection.draft_model or family.draft_repo
-    if name is None:
-        raise models.ModelError(
-            f"no DFlash2 draft is released for {family.name}; "
-            "name one with --draft-model"
-        )
     recorded = installed and installed["sources"]["draft"]
     asked = _answered(target)
     if recorded and not asked:

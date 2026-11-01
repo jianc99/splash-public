@@ -34,7 +34,8 @@ restarts count) Splash stops restarting it, and requests get 500 `engine_failed`
 until the server is restarted; its message names the crash trace when
 `SPLASH_CRASH_TRACE=1` recorded one
 ([crash traces](internals.md#failures-and-crash-traces)). Meanwhile generation requests get
-503 `engine_recovering`, whose message names the last failure. An engine whose
+503 `engine_recovering`, whose message names the last failure and whose
+`Retry-After` the time until the restart should be ready ([errors](api.md#errors)). An engine whose
 loop leaves a status request unanswered for 30 seconds, while requests are
 pending or during a background status refresh, is failed and restarted by the
 same rules. A restarted engine serves what the first one announced: the same
@@ -76,7 +77,7 @@ paths for `--model-dir`, `--draft-model` and `--mmproj`.
 | `--model-dir` | None | Prepare a local GGUF file or GGUF/MLX model directory without the Hub. See [local model files](models.md#local-model-files). |
 | `--mmproj` | None | A local GGUF target's vision projector; requires `--model-dir`. |
 | `--revision` | Default branch | Select an upstream target branch, tag, or commit. See [revisions](#revisions). |
-| `--draft-model` | The family's released DFlash2 draft | A compatible repository or local directory in its place; required for a family without a released draft. See [drafts](models.md#drafts). |
+| `--draft-model` | The family's released DFlash2 draft | A compatible repository or local directory in its place. See [drafts](models.md#drafts). |
 | `--language-only` | Off | Skip vision loading; image and PDF input is rejected. See [vision](models.md#vision). |
 | `--offline` | Off | Start the installed model without asking the Hub, as `HF_HUB_OFFLINE=1` does. See [revisions](#revisions). |
 | `--port` | `SPLASH_PORT` or `8000` | HTTP port. |
@@ -944,7 +945,8 @@ empty.
 `/apply-template` uses the same default. Anthropic `thinking` keeps its protocol
 semantics (off when omitted) unless the request's `chat_template_kwargs` set
 `enable_thinking`; judgment endpoints always disable thinking. The
-built-in chat page sends no effort unless the user picks one.
+built-in chat page offers Auto, the efforts `/v1/models` reports and Off, and
+no menu for a model that decides; it sends no effort unless the user picks one.
 
 The console's Started line shows how each chat request reasons: the effort it
 sent, or `absent` and the default it took, its `enable_thinking` when it set
