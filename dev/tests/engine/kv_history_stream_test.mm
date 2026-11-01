@@ -196,7 +196,10 @@ void streams(MetalBackend &backend, kv::Format format, uint32_t buffers) {
   const kv::Layout layout = layoutOf(format);
   Sequence sequence(backend, layout);
   KvHistoryStream stream = makeStream(backend, layout, buffers);
-  require(stream.reserve(kPages).granted() &&
+  // holds() tells reserve() it would take nothing, by whole extents.
+  require(!stream.holds(1), "staging nothing reserved held a page");
+  require(stream.reserve(kPages).granted() && stream.holds(kPages) && stream.holds(kExtentPages) &&
+              !stream.holds(kExtentPages + 1) &&
               stream.stats().stagingBytes == uint64_t{buffers} * kExtentPages * layout.bytesPerLayerPage() &&
               stream.stats().buffers == buffers,
           "staging does not hold a sequence's pages in each buffer");
@@ -244,7 +247,8 @@ void streams(MetalBackend &backend, kv::Format format, uint32_t buffers) {
   require(next.failures.empty() && layerBytes(readback, kUnreadable, 2) == sequence.expected[kUnreadable][2] &&
               stream.stats().commands == 2,
           "a second command did not stream the history again");
-  require(stream.releaseIdle() == stats.stagingBytes && stream.stats().stagingBytes == 0,
+  require(stream.releaseIdle() == stats.stagingBytes && stream.stats().stagingBytes == 0 &&
+              !stream.holds(1),
           "an idle reclaim did not give staging back");
   std::cout << "kv_history_stream_test: " << kv::formatName(format) << ", " << buffers << " buffer"
             << (buffers == 1 ? "" : "s") << ", " << index << " pages read a layer PASS\n";

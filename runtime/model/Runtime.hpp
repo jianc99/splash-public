@@ -54,6 +54,7 @@ public:
   [[nodiscard]] ModelMemoryAdmission reserveSpilledReads(uint64_t requestId) override;
   [[nodiscard]] ModelMemoryAdmission reserveHistoryStaging(uint64_t requestId, uint32_t pages) override;
   [[nodiscard]] ModelMemoryAdmission growSpilledReads() override;
+  [[nodiscard]] bool holdsSpilledReads(uint64_t requestId, uint32_t historyPages) const override;
   [[nodiscard]] uint64_t reclaimIdleState(bool keepLane,
                                           IdleMemory scope) noexcept override;
   [[nodiscard]] uint64_t releaseExpertChunk() override;
@@ -78,7 +79,7 @@ public:
 private:
   // The state lane of a resident request; the storage checks that its
   // committed state can be cached.
-  [[nodiscard]] uint32_t residentLane(uint64_t requestId);
+  [[nodiscard]] uint32_t residentLane(uint64_t requestId) const;
   void finishRestore(uint64_t requestId, uint32_t boundary, bool restoreDraft);
   void prepareWarmupDecode(uint64_t requestId, uint32_t anchor);
   [[nodiscard]] StateAdmission beginAt(const ModelRequest &request,

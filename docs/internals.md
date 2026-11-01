@@ -1312,7 +1312,15 @@ grow too and are refused in turn. Where KV spills, a refusal they do not share,
 of the model's memory for reading KV from the SSD cache (a decoding lane's share
 of the hot block cache, a prompt's staging), which no transfer in flight
 returns, suspends the lane that yields first if that lane yields before it and
-is resident outside its command. A prefill command captures the state of
+is resident outside its command. Memory a transfer in flight returns to a
+refused lane, KV pages or the model's memory alike, waits for that lane: until
+it has it, or for the resource wait's limit from its first refusal, a lane that
+yields before it leaves a command where it would take KV pages past its
+capacity or memory for its reads of spilled KV it does not hold, ends one at a
+state boundary past which it would, and runs within what it holds; the hot
+block cache does not grow, and a command between its passes goes on. The
+buffers of the states a command captures, and new starts, are not held. A
+prefill command captures the state of
 each boundary it reaches, in buffers reserved before it runs. A junction or a
 checkpoint retires its lane's checkpoint once published, and a checkpoint the
 same command would capture before it is not captured at all; the prompt's

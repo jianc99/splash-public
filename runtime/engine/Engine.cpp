@@ -297,6 +297,13 @@ bool Engine::tick(double now) {
     if (active.lane && active.resourceWait.pending && !resourceRetryReady(active, now))
       excluded.push_back(id);
   }
+  // Lanes prepare held back for a lane that waits for memory wait on once
+  // this tick's attempts are over (rewaitHeld), however the tick ends.
+  struct HeldWaits final {
+    Engine &engine;
+    double now;
+    ~HeldWaits() { engine.rewaitHeld(now); }
+  } const heldWaits{*this, now};
   while (auto plan = scheduler_.next(excluded)) {
     std::vector<ModelBatchItem> items;
     std::vector<std::vector<Capture>> captures;
@@ -1275,6 +1282,23 @@ void Engine::noteRefusal(Request &active, double now, const Denial &denial) noex
   wait.epoch = resourceEpoch_;
 }
 
+void Engine::rewaitHeld(double now) noexcept {
+  for (const uint64_t id : heldWaits_) {
+    const auto found = requests_.find(id);
+    if (found == requests_.end() || !found->second.lane)
+      continue;
+    Request &held = found->second;
+    const ResourceWait &wait = held.resourceWait;
+    if (wait.retryMilliseconds > 0.0)
+      deferResourceRetry(held, now,
+                         {.allocationFailure = wait.allocationFailure,
+                          .pending = wait.pending,
+                          .diskQuota = wait.diskQuota},
+                         wait.reason);
+  }
+  heldWaits_.clear();
+}
+
 void Engine::deferWait(Request &active) noexcept {
   ResourceWait kept;
   if (active.refusedResources) {
@@ -1672,12 +1696,42 @@ Engine::Prepared Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &i
     }
     return workEnd;
   };
+  // A lane that yields before one waiting for memory on its way back leaves
+  // that memory to it until it has it, or for as long as that wait's limit
+  // allows (awaitsMemory): as the memory lands, it would take it a page or
+  // an extent at a time before the waiting lane retries, and a lane that
+  // waits for many pages' worth at once, as for a floor of the hot block
+  // cache, would wait for as long as the other one grows. Such a lane leaves
+  // the command where it would take KV pages past its capacity, or memory
+  // for its reads of spilled KV it does not hold, and ends its command at a
+  // state boundary past which it would take KV pages (reserveCaptures);
+  // within what it holds, it runs. The buffers of the states its command
+  // captures are not held. A command between its passes takes nothing and
+  // goes on (above).
+  const auto held = [&](const Request &active) {
+    return std::ranges::any_of(requests_, [&](const auto &entry) {
+      return &entry.second != &active && awaitsMemory(entry.second, now) &&
+             yieldsBefore(active, entry.second);
+    });
+  };
+  // A lane held back with a wait of its own waits on as one refused does
+  // (rewaitHeld).
+  bool heldBack = false;
+  const auto hold = [&](const Request &active) {
+    heldBack = true;
+    if (active.resourceWait.retryMilliseconds > 0.0)
+      heldWaits_.push_back(active.request.id);
+  };
   for (const BatchItem &scheduled : plan.items) {
     Request &active = request(scheduled.requestId);
     if (!active.lane)
       throw std::logic_error("scheduled request is not resident");
     const uint64_t id = active.request.id;
     const uint64_t workEnd = workEndOf(active, scheduled);
+    if (workEnd > kvCapacity(id) && held(active)) {
+      hold(active);
+      continue;
+    }
     const auto kv = allocate([&] { return cache_.ensureTokens(id, workEnd); }, true,
                              growthClass(active), spillFallback(active));
     if (kv.admission.granted())
@@ -1714,6 +1768,10 @@ Engine::Prepared Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &i
         const auto pages = static_cast<uint32_t>(
             (uint64_t{scheduled.promptOffset} + scheduled.tokenCount + KvCache::pageTokens - 1) /
             KvCache::pageTokens);
+        if (!model_.holdsSpilledReads(id, prefill ? pages : 0) && held(active)) {
+          hold(active);
+          continue;
+        }
         const auto memory = allocate(
             [&] {
               return prefill ? model_.reserveHistoryStaging(id, pages)
@@ -1761,9 +1819,30 @@ Engine::Prepared Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &i
       return Prepared::Yielded;
     }
   }
+  // A lane refused memory on its way back waits for it, whether or not the
+  // command runs the lanes beside it: it retries once that memory lands, and
+  // the lanes that yield before it leave it to it (held). Refused memory
+  // nothing returns beside lanes that run, it waits for them, as a lane
+  // refused its KV does: it holds no one and starts no limit, and keeps when
+  // its wait began, which bounds a later hold.
+  if (!admitted.empty())
+    for (const Denied &entry : denied) {
+      Request &refused = request(entry.requestId);
+      if (entry.denial.pending) {
+        deferResourceRetry(refused, now, entry.denial);
+        continue;
+      }
+      ResourceWait kept;
+      kept.startedMilliseconds = refused.resourceWait.startedMilliseconds;
+      kept.admittedBefore = refused.resourceWait.admittedBefore;
+      refused.resourceWait = kept;
+    }
   // The hot block cache they read through grows toward its planned size,
-  // by an extent at most, into memory nothing needs now.
-  if (spilledReads)
+  // by an extent at most, into memory nothing needs now: none while a lane
+  // waits for memory on its way back.
+  if (spilledReads && std::ranges::none_of(requests_, [&](const auto &entry) {
+        return awaitsMemory(entry.second, now);
+      }))
     static_cast<void>(allocate([&] { return model_.growSpilledReads(); }, false,
                                ReclaimClass::Ordinary, {}, true));
   if (!admitted.empty()) {
@@ -1776,7 +1855,8 @@ Engine::Prepared Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &i
     for (size_t index = 0; prefill && index < plan.items.size(); ++index) {
       BatchItem &item = plan.items[index];
       Request &active = request(item.requestId);
-      const uint32_t rows = reserveCaptures(active, item, states[index], captures[index]);
+      const uint32_t rows =
+          reserveCaptures(active, item, states[index], captures[index], held(active));
       if (rows != item.tokenCount) {
         item.tokenCount = rows;
         ++counters_.captureCuts;
@@ -1819,9 +1899,13 @@ Engine::Prepared Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &i
 
   // Partial admissions execute at their actual width. If no lane fits, the
   // lane to yield is chosen among all runnable residents: an unstarted peer
-  // can release its lane before completed prefill is discarded.
-  if (denied.empty())
+  // can release its lane before completed prefill is discarded. Lanes held
+  // back for a lane that waits for memory only leave the plan for this tick.
+  if (denied.empty()) {
+    if (heldBack)
+      return Prepared::Waiting;
     throw std::logic_error("empty resource admission result");
+  }
   // No lane runs: the copies Spill requests owe and have not started, as a
   // chain a lane restored has before its first command or those the memory
   // governor's pass left when it collected the ones that landed, start now.
@@ -1882,7 +1966,7 @@ Engine::Prepared Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &i
 
 uint32_t Engine::reserveCaptures(Request &active, const BatchItem &item,
                                  std::vector<StateCapture> &states,
-                                 std::vector<Capture> &captures) {
+                                 std::vector<Capture> &captures, bool held) {
   const uint32_t start = item.promptOffset;
   // A request waiting for a prefix starts once the command that reaches its
   // state has ended.
@@ -1946,6 +2030,12 @@ uint32_t Engine::reserveCaptures(Request &active, const BatchItem &item,
     const uint32_t next = index + 1 < boundaries.size() && boundaries[index + 1].tokens < end
                               ? boundaries[index + 1].tokens
                               : end;
+    // A held lane (prepare) takes no KV pages past its capacity.
+    if (held && next > kvCapacity(active.request.id)) {
+      if (passed)
+        static_cast<void>(reserve(index));
+      return tokens - start;
+    }
     const auto kv = allocate(
         [&] { return cache_.ensureTokens(active.request.id, next); }, true, ReclaimClass::Ordinary,
         {}, true);
@@ -2113,6 +2203,12 @@ bool Engine::preemptBelow(RequestPriority priority, double now) {
   ++counters_.prioritySuspensions;
   signalResourceProgress();
   return true;
+}
+
+bool Engine::awaitsMemory(const Request &waiter, double now) const {
+  const ResourceWait &wait = waiter.resourceWait;
+  return waiter.lane && wait.pending && wait.startedMilliseconds &&
+         now < *wait.startedMilliseconds + config_.resourceWaitTimeoutMilliseconds;
 }
 
 bool Engine::anotherResident(uint64_t requestId) const {

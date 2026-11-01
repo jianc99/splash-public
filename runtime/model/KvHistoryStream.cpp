@@ -197,11 +197,17 @@ KvHistoryStream::~KvHistoryStream() {
   impl_->drainLocked();
 }
 
+bool KvHistoryStream::holds(uint32_t pages) const noexcept {
+  const Impl &impl = *impl_;
+  const uint32_t extentPages = impl.staging.front()->extentPages();
+  return (pages + extentPages - 1) / extentPages <= impl.extents;
+}
+
 ModelMemoryAdmission KvHistoryStream::reserve(uint32_t pages) {
   Impl &impl = *impl_;
+  if (holds(pages)) return {.ok = true};
   const uint32_t extentPages = impl.staging.front()->extentPages();
   const uint32_t wanted = (pages + extentPages - 1) / extentPages;
-  if (wanted <= impl.extents) return {.ok = true};
   if (uint64_t{wanted} * extentPages > impl.staging.front()->pageCount())
     throw std::invalid_argument("history staging past the longest sequence");
   if (impl.run.active) throw std::logic_error("history staging grows while a command streams");

@@ -691,10 +691,12 @@ private:
   // buffers of its own class; refused the KV up to that state, the command
   // ends at the checkpoint and captures it. The prompt's replay point
   // refused buffers of its own takes those of a checkpoint the command
-  // captures before it.
+  // captures before it. A lane held for one waiting for memory on its way
+  // back (`held`, prepare) ends at a boundary past which it would take KV
+  // pages past its capacity.
   [[nodiscard]] uint32_t reserveCaptures(Request &request, const BatchItem &item,
                                          std::vector<StateCapture> &states,
-                                         std::vector<Capture> &captures);
+                                         std::vector<Capture> &captures, bool held);
   // Takes the buffers of the state of class `kind` the lane's command
   // captures at `tokens`: from the model's pool or one admission, then from
   // cache its class may take, but only while the lane holds no checkpoint a
@@ -827,6 +829,12 @@ private:
   enum class Verdict : uint8_t { Wait, Yield, Fail };
   [[nodiscard]] Verdict judge(const Denial &denial, uint64_t requestId) const;
   [[nodiscard]] bool anotherResident(uint64_t requestId) const;
+  // Whether a resident lane waits for memory on its way back
+  // (ResourceWait::pending) that the lanes yielding before it leave to it
+  // (prepare): from its first refusal up to the resource wait's limit, so a
+  // wait whose memory never lands holds them no longer. A start that waits
+  // holds no lane; an ended request keeps no wait (release).
+  [[nodiscard]] bool awaitsMemory(const Request &waiter, double now) const;
   // The prompt rows a lane in prefill has processed, or the tokens a
   // decoding lane holds.
   [[nodiscard]] uint64_t completedTokens(const Request &request) const;
@@ -908,6 +916,12 @@ private:
   // admission closed (Request::refusedResources) keeps when its wait began and
   // which lanes were admitted before it was refused.
   void deferWait(Request &request) noexcept;
+  // A lane prepare held back with a wait of its own (heldWaits_) waits on as
+  // one refused does, as of the end of the tick, whose attempts may have
+  // made progress: it retries once memory lands after them or after the
+  // backoff, not at every tick, and a landing since its last attempt counts
+  // as progress toward its limit.
+  void rewaitHeld(double nowMilliseconds) noexcept;
   // The wait limit tick() enforces, or zero while it enforces none: a
   // pending wait that has seen progress waits for its next attempt. The
   // limit restarts whenever a lane submitted before the request, or one
@@ -957,6 +971,8 @@ private:
   // on keeps its pages Full in that command, which the next one's start
   // spills (Cache::spillWritten). False between commands.
   bool commandShaped_ = false;
+  // The lanes with a wait of their own that this tick's prepare held back.
+  std::vector<uint64_t> heldWaits_;
   // Pressure preempted work, a lane is still resident, and memory is still
   // short (growth is paused or allocationFailed_), up to the drain's end.
   [[nodiscard]] bool drainingForRecovery() const;

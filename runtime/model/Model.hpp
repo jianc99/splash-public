@@ -792,6 +792,11 @@ public:
   [[nodiscard]] virtual ModelMemoryAdmission reserveSpilledReads(uint64_t) { return {.ok = true}; }
   [[nodiscard]] virtual ModelMemoryAdmission reserveHistoryStaging(uint64_t, uint32_t) { return {.ok = true}; }
   [[nodiscard]] virtual ModelMemoryAdmission growSpilledReads() { return {.ok = true}; }
+  // Whether the resident request holds what reserveSpilledReads reserves
+  // (`historyPages` 0: its lane's floor of the hot block cache), or whether
+  // the staging, which the prompts that stream share, holds `historyPages`
+  // pages already, so reserveHistoryStaging takes nothing.
+  [[nodiscard]] virtual bool holdsSpilledReads(uint64_t, uint32_t) const { return true; }
   // Whether the disk tier takes a state written from a lane now, for a
   // state in use or not, as CompositeState::canOffload. Room in the quota is
   // the write's own concern.

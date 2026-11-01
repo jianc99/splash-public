@@ -653,6 +653,14 @@ public:
     stagings.push_back(id);
     return {.ok = true};
   }
+  // A lane holds its floor once granted it, and a prefill the pages of
+  // history staged for it.
+  bool holdsSpilledReads(uint64_t id, uint32_t pages) const override {
+    if (!pages)
+      return spilledReadFloors.contains(id);
+    const auto staged = historyStaging.find(id);
+    return staged != historyStaging.end() && staged->second >= pages;
+  }
   // It grows that cache toward its planned size, which the fake refuses
   // with refusedGrowth.
   model::ModelMemoryAdmission growSpilledReads() override {

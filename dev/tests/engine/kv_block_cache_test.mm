@@ -289,10 +289,10 @@ void growsAndReleases(MetalBackend &backend) {
   refuse = true;
   const model::ModelMemoryAdmission refused = cache.reserveLane(0);
   require(!refused.granted() && refused.allocationFailure == metal::AllocationFailure::EngineBudget &&
-              cache.stats().bytes == 0 && cache.stats().lanes == 0,
+              cache.stats().bytes == 0 && cache.stats().lanes == 0 && !cache.holdsLane(0),
           "a refused floor changed the cache");
   refuse = false;
-  require(cache.reserveLane(0).granted() && cache.stats().bytes == extent &&
+  require(cache.reserveLane(0).granted() && cache.holdsLane(0) && cache.stats().bytes == extent &&
               cache.stats().floorBytes == extent && cache.stats().targetBytes == 4 * extent,
           "one lane's floor is not one extent");
   std::vector<KvPageSource> pages(256);
@@ -310,7 +310,9 @@ void growsAndReleases(MetalBackend &backend) {
   // A second lane's floor fits; giving back what is above the floors, an
   // extent a call, keeps two lanes' (3,072 slots, two extents), then one
   // lane's.
-  require(cache.reserveLane(1).granted() && cache.stats().bytes == 4 * extent &&
+  // holdsLane() is the lane's own floor, not room the cache has for one.
+  require(!cache.holdsLane(1), "a lane held a floor it was not granted");
+  require(cache.reserveLane(1).granted() && cache.holdsLane(1) && cache.stats().bytes == 4 * extent &&
               cache.stats().floorBytes == 2 * extent,
           "a second lane's floor is not two lanes' extents");
   // An idle reclaim gives back one extent above the floors a call.
@@ -318,6 +320,7 @@ void growsAndReleases(MetalBackend &backend) {
               cache.releaseAboveFloor() == extent && cache.stats().slotsPerLayer == 2 * kExtentSlots,
           "an idle reclaim did not give back an extent above the floors at a time");
   cache.releaseLane(1);
+  require(!cache.holdsLane(1) && cache.holdsLane(0), "a released floor was still held");
   require(cache.releaseAboveFloor() == extent && cache.stats().bytes == extent && cache.stats().lanes == 1,
           "an idle reclaim kept a released lane's floor");
   auto shrunk = std::make_shared<KvReadStats>();

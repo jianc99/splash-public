@@ -3092,7 +3092,7 @@ Runtime::decodeAsync(const BatchPlan &plan,
                                                std::move(finish));
 }
 
-uint32_t Runtime::residentLane(uint64_t requestId) {
+uint32_t Runtime::residentLane(uint64_t requestId) const {
   Impl::Request &entry = impl_->request(requestId);
   if (!entry.resident)
     throw std::logic_error("request is not resident");
@@ -3170,6 +3170,13 @@ ModelMemoryAdmission Runtime::reserveHistoryStaging(uint64_t requestId, uint32_t
   if (!impl_->historyStream) return {.ok = true};
   impl_->stagingRequest = requestId;
   return impl_->historyStream->reserve(pages);
+}
+
+bool Runtime::holdsSpilledReads(uint64_t requestId, uint32_t historyPages) const {
+  const uint32_t lane = residentLane(requestId);
+  if (historyPages)
+    return !impl_->historyStream || impl_->historyStream->holds(historyPages);
+  return !impl_->blockCache || impl_->blockCache->holdsLane(lane);
 }
 
 ModelMemoryAdmission Runtime::growSpilledReads() {
