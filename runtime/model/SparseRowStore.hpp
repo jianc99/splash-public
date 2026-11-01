@@ -110,8 +110,6 @@ struct SparseRowStats final {
   uint64_t cacheBytes = 0;    // cache and working-memory reservation
   uint64_t cacheCapacityRows = 0;
   uint64_t cachedRows = 0;
-  // Whether the cache's arrays hold all of their host memory (commit()).
-  bool committed = false;
   // Per SparseRowUse: stages, row ids they took, distinct rows, cache hits
   // and rows read.
   struct Use final {

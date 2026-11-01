@@ -37,6 +37,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <functional>
 #include <iostream>
 #include <iterator>
 #include <limits>
@@ -3394,8 +3395,9 @@ public:
                 : std::nullopt};
   }
 
-  // A decode cycle of the requests together, in lanes in their order.
-  std::vector<SpillStep> decode(std::span<SpillRequest *const> requests) {
+  // A decode cycle of the requests together, in lanes in their order;
+  // `during`, if any, runs while its command is in flight.
+  std::vector<SpillStep> decode(std::span<SpillRequest *const> requests, const std::function<void()> &during = {}) {
     BatchPlan plan{.kind = WorkKind::Decode, .decodeStage = DecodeStage::Regular};
     std::vector<ModelBatchItem> items;
     for (SpillRequest *request : requests) {
@@ -3405,7 +3407,9 @@ public:
       plan.items.push_back({request->id, 0});
       items.push_back(item(*request, request->committed, 0, {}));
     }
-    std::vector<ModelStepResult> results = runtime_->submit(plan, items, {})->wait();
+    const std::unique_ptr<ModelBatchTicket> ticket = runtime_->submit(plan, items, {});
+    if (during) during();
+    std::vector<ModelStepResult> results = ticket->wait();
     require(results.size() == requests.size(), "a spill run's decode lost a lane");
     lastResults_ = results;
     std::vector<SpillStep> steps;
@@ -3679,9 +3683,12 @@ struct SpillRecord final {
 // prefill command that streams it, which commits nothing and gives the same
 // step on a retry, while the staging stays the prompt's until it ends; a
 // decode lane that resolves blocks of copies that cannot be read fails
-// alone, its state kept, its retry giving the same step; and a verify over
-// Index pages without block lists, of rows that read their page table, is
-// refused.
+// alone, its state kept, its retry giving the same step; a request that
+// ends with its streamed prompt, or is suspended once its next command
+// reserved the staging, gives the staging back, and one that leaves while
+// another lane's command runs gives it back before the next command; and a
+// verify over Index pages without block lists, of rows that read their page
+// table, is refused.
 void requireSpilledKvMatchesResident(metal::MetalBackend &backend, const model::LoadedModel &model,
                                       const ops::ExecutionPlans &operators, const metal::AllocationAdmission &admission,
                                       kv::Format format, ops::GdnStateFormat stateFormat, const SpillOptions &options) {
@@ -3850,6 +3857,48 @@ void requireSpilledKvMatchesResident(metal::MetalBackend &backend, const model::
   spill.end(streamed);
   spill.end(healthy);
   require(backend.healthy(), "reads of spilled K/V that failed made the backend unhealthy");
+
+  // The staging goes with the request it was reserved for when no decode
+  // takes its place: one that ends as its streamed prompt does (scored, or
+  // stopped at its first token), and one suspended once its next command
+  // reserved it.
+  for (const bool suspends : {false, true}) {
+    SpillRequest leaving{.id = 4023u + suspends, .stateLane = 0, .spills = true, .prompt = prompts[0]};
+    spill.begin(leaving);
+    for (size_t command = 0; command < ends[0].size() - suspends; ++command)
+      static_cast<void>(spill.prefill(leaving, ends[0][command]));
+    if (suspends)
+      require(runtime.reserveHistoryStaging(leaving.id, (tokens + kv::kPageTokens - 1) / kv::kPageTokens).granted(),
+              "the staging of a spilled history was refused");
+    require(leaving.holdsIndexPages() && spill.historyStream().stats().stagingBytes,
+            "a prompt that streams its history held no staging");
+    if (suspends) runtime.suspend(leaving.id);
+    else spill.end(leaving);
+    require(!spill.historyStream().stats().stagingBytes,
+            suspends ? "a suspended prompt kept its staging" : "a request that ended with its prompt kept its staging");
+    if (suspends) spill.end(leaving);
+  }
+  // A request that leaves while another lane's command runs keeps the
+  // staging, as no extent goes while a command is in flight, and the next
+  // command gives it back before it runs.
+  SpillRequest leaving{.id = 4025, .stateLane = 0, .spills = true, .prompt = prompts[0]};
+  SpillRequest beside{.id = 4026, .stateLane = 1, .spills = false,
+                      .prompt = std::vector(prompts[1].begin(), prompts[1].begin() + denseTokens / 2)};
+  spill.begin(leaving);
+  spill.begin(beside);
+  static_cast<void>(spill.prefill(beside, static_cast<uint32_t>(beside.prompt.size())));
+  for (size_t command = 0; command + 1 < ends[0].size(); ++command)
+    static_cast<void>(spill.prefill(leaving, ends[0][command]));
+  require(runtime.reserveHistoryStaging(leaving.id, (tokens + kv::kPageTokens - 1) / kv::kPageTokens).granted(),
+          "the staging of a spilled history was refused");
+  const uint64_t leftStaging = spill.historyStream().stats().stagingBytes;
+  static_cast<void>(spill.decode(std::array{&beside}, [&] { spill.end(leaving); }));
+  require(leftStaging && spill.historyStream().stats().stagingBytes == leftStaging,
+          "the staging of a request that left while a command ran went before the command ended");
+  static_cast<void>(spill.decode(std::array{&beside}));
+  require(!spill.historyStream().stats().stagingBytes,
+          "the next command kept the staging of a request that left while a command ran");
+  spill.end(beside);
 
   // Rows that read their page table read only Full pages
   // (SparseKvShape::denseHistoryTokens), so a verify over Index pages
