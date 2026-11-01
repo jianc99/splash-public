@@ -1105,7 +1105,7 @@ bool Cache::convertToSpill(uint64_t requestId, uint32_t pages, bool spillNow) {
   rescanSpills();
   static_cast<void>(writeThrough());
   if (spillNow)
-    static_cast<void>(moveLandedPages(false));
+    static_cast<void>(moveLandedPages(std::nullopt));
   return true;
 }
 
@@ -1235,9 +1235,9 @@ void Cache::rescanSpills() noexcept {
     active.spillScan = 0;
 }
 
-TokenAdmission Cache::spillWritten(SpilledExtents extents) { return moveLandedPages(true, extents); }
+TokenAdmission Cache::spillWritten(SpilledExtents extents) { return moveLandedPages(extents); }
 
-TokenAdmission Cache::moveLandedPages(bool allocate, SpilledExtents extents) {
+TokenAdmission Cache::moveLandedPages(std::optional<SpilledExtents> extents) {
   if (!spill_)
     return {};
   std::vector<uint32_t> pages;
@@ -1277,7 +1277,7 @@ TokenAdmission Cache::moveLandedPages(bool allocate, SpilledExtents extents) {
   // for an allocation. The rest, if it may allocate, asks for extents of
   // the index form.
   const auto now = std::min<size_t>(pages.size(), pool_.freePageCount(kv::PageForm::Index));
-  if (!allocate)
+  if (!extents)
     pages.resize(now);
   for (const std::span<const uint32_t> part :
        {std::span<const uint32_t>(pages).first(now), std::span<const uint32_t>(pages).subspan(now)}) {
@@ -1290,7 +1290,7 @@ TokenAdmission Cache::moveLandedPages(bool allocate, SpilledExtents extents) {
     followMoves(moved.moves);
     spilled_.spillMoves += part.size();
   }
-  if (!allocate)
+  if (!extents)
     return {};
   // Then the runway, an extent's free Index pages, is refilled: the next
   // spill frees Full pages without an allocation, at the memory wall too,
@@ -1305,11 +1305,11 @@ TokenAdmission Cache::moveLandedPages(bool allocate, SpilledExtents extents) {
   // once the runway stands: at the wall, which refuses it, they stay, and
   // the requests grow into their pages. Released, the Full pages left first
   // gather in the fewest extents.
-  if (!pages.empty() && extents != SpilledExtents::Kept) {
-    if (extents == SpilledExtents::Released)
+  if (!pages.empty()) {
+    if (*extents == SpilledExtents::Released)
       while (compactExtent(kv::PageForm::Full)) {
       }
-    static_cast<void>(pool_.reclaimEmptyExtents(extents == SpilledExtents::KeepRunway,
+    static_cast<void>(pool_.reclaimEmptyExtents(*extents == SpilledExtents::KeepRunway,
                                                 std::numeric_limits<uint32_t>::max(), kv::PageForm::Full));
   }
   return {};
