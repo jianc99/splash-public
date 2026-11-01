@@ -45,8 +45,6 @@ struct Qwen3_8Layout final : QwenHybridLayout {
                           .ffnKind = QwenFfnKind::Dense,
                           .intermediateSize = 17408},
                          "Qwen3.8-27B"} {}
-  // A family of the architecture.
-  constexpr explicit Qwen3_8Layout(const QwenHybridLayout &family) : QwenHybridLayout(family) {}
   bool operator==(const Qwen3_8Layout &) const = default;
 };
 

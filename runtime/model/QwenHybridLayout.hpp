@@ -94,11 +94,11 @@ struct QwenTargetDimensions {
   // streams (hyperConnected), the residual's streams and the mixes' low rank;
   // a QSA indexer (hasIndexer), its heads of indexerHeadDimension values, past
   // indexerTopBlocks blocks of indexerBlockTokens tokens of which a row
-  // attends sparsely; and a PLE n-gram embedding (hasPle), its layer, n-gram
-  // size, heads per n-gram, head width and convolution taps. Shared code
-  // reads them only where zero means none: the KV pages' index region, a
-  // state cell's PLE history and QSA pending keys, and the rows a mixer adds
-  // to (kvLayout, gdnStateLayout, QwenTargetGeometry::mixersAddToHidden).
+  // attends sparsely; and a PLE n-gram embedding, its layer, n-gram size,
+  // heads per n-gram, head width and convolution taps. Shared code reads them
+  // only where zero means none: the KV pages' index region, a state cell's
+  // PLE history and QSA pending keys, and the rows a mixer adds to (kvLayout,
+  // gdnStateLayout, QwenTargetGeometry::mixersAddToHidden).
   uint32_t hyperConnections = 0;
   uint32_t hyperRank = 0;
   uint32_t indexerHeads = 0;
@@ -138,9 +138,6 @@ struct QwenTargetDimensions {
             .sharedSlices = sharedExpertSlices,
             .sharedGate = sharedExpertGate};
   }
-  [[nodiscard]] constexpr uint32_t actualGdnWidth() const noexcept {
-    return convolutionDimension + attentionWidth + 2 * gdnValueHeads;
-  }
   // The window the target serves with `scaling`: the native one, or YaRN's,
   // the native one times its factor, rounded to the nearest token so that a
   // factor taken as a context over the native window (servedFor) serves that
@@ -155,9 +152,6 @@ struct QwenTargetDimensions {
   [[nodiscard]] constexpr bool hyperConnected() const noexcept { return hyperConnections != 0; }
   // Whether each full-attention layer has a QSA indexer.
   [[nodiscard]] constexpr bool hasIndexer() const noexcept { return indexerHeads != 0; }
-  // Whether a PLE n-gram embedding feeds layer pleLayer from a table of its
-  // own.
-  [[nodiscard]] constexpr bool hasPle() const noexcept { return pleNgram != 0; }
   [[nodiscard]] constexpr uint32_t streamWidth() const noexcept { return hyperConnections * hiddenSize; }
   [[nodiscard]] constexpr uint32_t pleHeads() const noexcept {
     return pleNgram ? (pleNgram - 1) * pleHeadsPerNgram : 0;

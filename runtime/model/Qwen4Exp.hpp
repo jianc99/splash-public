@@ -92,8 +92,6 @@ struct Qwen4ExpLayout final : QwenHybridLayout {
                           .pleHeadDimension = 160,
                           .pleConvolutionTaps = 4},
                          "Qwen3.8-Flash-Next"} {}
-  // A family of the architecture.
-  constexpr explicit Qwen4ExpLayout(const QwenHybridLayout &family) : QwenHybridLayout(family) {}
   bool operator==(const Qwen4ExpLayout &) const = default;
 };
 

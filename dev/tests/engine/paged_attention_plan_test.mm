@@ -994,7 +994,9 @@ void bufferExtents(metal::MetalBackend &backend, uint32_t queryHeads, kv::Layout
   const auto pageTable = [](const kv::ChunkedPrefillParams &chunk) {
     return uint64_t{(chunk.committed_tokens + chunk.chunk_tokens + 31) / 32} * sizeof(SplashKvPage);
   };
-  const ops::NormWeights queryNorm{allocate(backend, dimension * 2)}, keyNorm{allocate(backend, dimension * 2)};
+  // F32 norms, a GGUF's, which every geometry's projection kernels take.
+  const ops::NormWeights queryNorm{allocate(backend, dimension * 4), true},
+      keyNorm{allocate(backend, dimension * 4), true};
   using Extents = std::initializer_list<test::BufferExtent>;
   // The q/k norms of both projections, whose other buffers hold every row.
   const uint64_t rows = std::max<uint64_t>(tokens, verifyRows);
@@ -1002,10 +1004,10 @@ void bufferExtents(metal::MetalBackend &backend, uint32_t queryHeads, kv::Layout
                            staging = allocate(backend, staged(verifyHeads, stride, stride, queryWidth));
   for (const bool verify : {false, true})
     for (const bool key : {false, true}) {
-      test::requireExtent(backend, (key ? keyNorm : queryNorm).buffer, dimension * 2, 2, "norm weight",
+      test::requireExtent(backend, (key ? keyNorm : queryNorm).buffer, dimension * 4, 4, "norm weight",
                           [&](metal::CommandGraph &graph, const metal::MetalBuffer &view) {
-                            const ops::NormWeights query{key ? queryNorm.buffer : view},
-                                keys{key ? view : keyNorm.buffer};
+                            const ops::NormWeights query{key ? queryNorm.buffer : view, true},
+                                keys{key ? view : keyNorm.buffer, true};
                             if (verify)
                               ops::PagedAttention::addVerifyProjection(graph, packed, query, keys, rope, rope, staging,
                                                                        staging, staging, queryHeads, layout, lanes);
@@ -1527,9 +1529,10 @@ int main(int argc, char **argv) {
     attentionBlocks(backend);
     stageEncoding(backend);
     blockListsMatchMasks(backend);
-    // The prepare kernels do not depend on the KV format.
+    // The prepare kernels do not depend on the KV format; their norms are of
+    // each type the geometry's families store.
     for (const Geometry geometry : kGeometries)
-      for (bool float32 : {false, true})
+      for (bool float32 : splash::test::familyNorms(geometry))
         for (bool verify : {false, true})
           checkProjection(backend, geometry.queryHeads, geometry.layout(kv::Format::Int8), float32, verify);
     if (argc == 3 && std::string_view(argv[2]) == "--long") {

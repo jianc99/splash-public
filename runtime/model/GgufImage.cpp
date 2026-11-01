@@ -248,6 +248,11 @@ public:
       image_.copy(tensorRows(*tensor, heads, tensor->bytes / heads, grouped(0, 1)), conversion);
   }
 
+  // An F32 vector the kernels read as stored (Flint's attention sinks).
+  void floatValues(const std::string &name, uint64_t elements) {
+    if (const GgufTensor *tensor = floatVector(name, elements)) image_.copy(tensorRows(*tensor, 1, tensor->bytes));
+  }
+
   // Native token rows, gathered by the embedding kernel.
   void embeddingRows(const std::string &name) {
     const GgufTensor *tensor = find(name, embeddingType);
@@ -614,7 +619,7 @@ struct FlintGguf final {
     const std::string p = prefix(index);
     b.floatNorm(p + "attn_norm.weight", g.hiddenSize);
     mixerImage(b, g, p, true);
-    b.floatNorm(p + "attn_sinks.weight", g.attentionQueryHeads);
+    b.floatValues(p + "attn_sinks.weight", g.attentionQueryHeads);
     b.floatNorm(p + "ffn_norm.weight", g.hiddenSize);
     ffnImage(b, g, p, index);
     // llama.cpp writes a router's expert bias (Flint's optional expert_bias)

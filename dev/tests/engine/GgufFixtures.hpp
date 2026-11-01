@@ -320,7 +320,7 @@ inline std::vector<Tensor> targetTensors(const model::QwenTargetDimensions &g, c
       add(p + "ffn_up.weight", {hidden, g.intermediateSize});
       add(p + "ffn_down.weight", {g.intermediateSize, hidden});
     }
-    if (g.hasPle() && layer == g.pleLayer) {
+    if (g.pleNgram && layer == g.pleLayer) {
       add(p + "ple_key.weight", {g.pleWidth(), streams});
       add(p + "ple_value.weight", {g.pleWidth(), hidden});
       add(p + "ple_norm_key.weight", {streams});
@@ -332,7 +332,7 @@ inline std::vector<Tensor> targetTensors(const model::QwenTargetDimensions &g, c
   mix("output_hc", false, "output_norm.weight");
   add("output.weight", {hidden, g.vocabularySize});
   add("token_embd.weight", {hidden, g.vocabularySize});
-  if (g.hasPle()) add("per_layer_token_embd.weight", {g.pleHeadDimension, pleRows});
+  if (g.pleNgram) add("per_layer_token_embd.weight", {g.pleHeadDimension, pleRows});
   return tensors;
 }
 
@@ -525,7 +525,7 @@ inline std::vector<test_gguf::Key> metadata(const model::QwenTargetDimensions &g
       ratios.push_back(g.isFullAttentionLayer(layer) ? int32_t(g.indexerBlockTokens) : 0);
     keys.push_back(test_gguf::int32ArrayKey(arch + ".attention.compress_ratios", ratios));
   }
-  if (g.hasPle()) {
+  if (g.pleNgram) {
     key("ple.ngram_size", g.pleNgram);
     key("ple.heads_per_ngram", g.pleHeadsPerNgram);
     key("ple.conv_kernel", g.pleConvolutionTaps);

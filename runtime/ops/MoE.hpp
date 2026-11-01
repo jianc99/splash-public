@@ -29,7 +29,9 @@ enum class MoeRouter : uint8_t { Softmax, SigmoidNormalized };
 // a router with a shared expert of sharedSlices slices behind the block's
 // scalar gate or none (MoeShape), and their kernels' name suffixes: the
 // selection's, which reads all three, and slicesSuffix of the grouping and
-// the expert passes, which read the slices alone.
+// the expert passes, which read the slices alone. The selection and grouping
+// of the softmax routing are compiled for both router widths
+// (MoeShape::routerWidth), Flint's for SPLASH_MOE_EXPERT_SLOTS experts alone.
 struct CompiledMoeRouting final {
   MoeRouter router;
   uint32_t sharedSlices;
@@ -69,8 +71,9 @@ struct MoeShape final {
   uint32_t routerFormat = QuantizedSegment::kFloat32;
 
   [[nodiscard]] constexpr bool valid() const noexcept {
-    // Experts the routing kernels' slots hold, of an intermediate width
-    // that fills 64-column tiles, routed as a kernel compiles.
+    // Experts up to the wide slots, of an intermediate width that fills
+    // 64-column tiles, and a compiled router, shared slices and gate
+    // (kCompiledMoeRoutings states the widths each is compiled for).
     return hiddenSize && hiddenSize % 256 == 0 && experts && experts <= SPLASH_MOE_WIDE_EXPERT_SLOTS &&
            expertsPerToken && expertsPerToken <= experts &&
            expertIntermediateSize && expertIntermediateSize % 64 == 0 && compiledRouting();
@@ -335,8 +338,9 @@ enum class MoeExpertTile : uint8_t { M8 = 8, M32 = 32 };
 // Register in both phases but for experts mostly in a format they stage. In
 // decode, as Apple9's dense GGUF projections do (LinearGguf.cpp): its matrix
 // operations share the FP32 pipe, where the register tile beats staging. In
-// prefill it keeps the decode numerics at a cost: the staged 32-row tiles run
-// long chunks faster.
+// prefill as last measured, on the 35B's real routes on the 40-core M3 Max
+// (ms per layer): against the staged 32-row tiles, faster at 512 rows (3.52
+// vs 3.72) and slower at 2048 (12.6-13.1 vs 11.0-11.7).
 enum class MoeGgufTile : uint8_t { Staged, Register };
 
 // Apple9 stages experts mostly in a format apple9StagesFormat names: one

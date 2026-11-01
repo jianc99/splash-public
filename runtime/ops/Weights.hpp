@@ -163,7 +163,6 @@ public:
   // inputSize. Only the prefill residual tiles of quantized weights take such
   // a view, on kernel instances of their own (Linear::add).
   [[nodiscard]] uint32_t planeInputs() const noexcept { return planeInputs_; }
-  [[nodiscard]] uint32_t planeInputSize() const noexcept { return planeInputs_ ? planeInputs_ : inputSize; }
 
   uint32_t outputSize = 0;
   uint32_t inputSize = 0;

@@ -113,9 +113,10 @@ inline void moe_route_select(device const float *scores, device bfloat *input,
 
 // The router's fp32 scores (kernels/shared/gguf_float.metal) in rows of
 // Slots expert slots and, with a gated shared expert, the F32 shared-expert
-// scalar gate, on SPLASH_MOE_EXPERT_SLOTS slots or (_e512)
-// SPLASH_MOE_WIDE_EXPERT_SLOTS, each routing a compiled routing
-// (ops::kCompiledMoeRoutings) under its select suffix.
+// scalar gate, each routing a compiled routing (ops::kCompiledMoeRoutings)
+// under its select suffix: the softmax one on SPLASH_MOE_EXPERT_SLOTS slots
+// or (_e512) SPLASH_MOE_WIDE_EXPERT_SLOTS, Qwen3.8-Flash-Next's 512 experts,
+// and Flint's on SPLASH_MOE_EXPERT_SLOTS, its 256.
 #define MOE_ROUTE_SELECT_BODY(Slots, Router, Shared, SharedGate, input, shared_gate) \
     threadgroup float row_scores[Slots];                                       \
     threadgroup float ordered[Slots];                                          \
@@ -154,8 +155,6 @@ inline void moe_route_select(device const float *scores, device bfloat *input,
 MOE_ROUTE_SELECT_ENTRY(moe_route_select_f32, SPLASH_MOE_EXPERT_SLOTS, MoeRouter::Softmax, 1)
 MOE_ROUTE_SELECT_ENTRY(moe_route_select_f32_e512, SPLASH_MOE_WIDE_EXPERT_SLOTS, MoeRouter::Softmax, 1)
 MOE_ROUTE_SELECT_UNGATED_ENTRY(moe_route_select_f32_sigmoid_s2, SPLASH_MOE_EXPERT_SLOTS,
-                               MoeRouter::SigmoidNormalized, 2)
-MOE_ROUTE_SELECT_UNGATED_ENTRY(moe_route_select_f32_e512_sigmoid_s2, SPLASH_MOE_WIDE_EXPERT_SLOTS,
                                MoeRouter::SigmoidNormalized, 2)
 #undef MOE_ROUTE_SELECT_UNGATED_ENTRY
 #undef MOE_ROUTE_SELECT_ENTRY
@@ -316,15 +315,13 @@ inline void moe_group_routes_phase(
     MOE_GROUP_ROUTES_BODY(Slots, Shared, true, verify_rows)                    \
   }
 // Each for the shared slices of a compiled routing, under its slices suffix
-// (ops::kCompiledMoeRoutings).
+// (ops::kCompiledMoeRoutings), on the expert slots of its selection.
 MOE_GROUP_ROUTES_ENTRY(moe_group_routes, SPLASH_MOE_EXPERT_SLOTS, 1)
 MOE_GROUP_ROUTES_ENTRY(moe_group_routes_e512, SPLASH_MOE_WIDE_EXPERT_SLOTS, 1)
 MOE_GROUP_ROUTES_VERIFIED_ENTRY(moe_group_routes_verified, SPLASH_MOE_EXPERT_SLOTS, 1)
 MOE_GROUP_ROUTES_VERIFIED_ENTRY(moe_group_routes_verified_e512, SPLASH_MOE_WIDE_EXPERT_SLOTS, 1)
 MOE_GROUP_ROUTES_ENTRY(moe_group_routes_s2, SPLASH_MOE_EXPERT_SLOTS, 2)
-MOE_GROUP_ROUTES_ENTRY(moe_group_routes_e512_s2, SPLASH_MOE_WIDE_EXPERT_SLOTS, 2)
 MOE_GROUP_ROUTES_VERIFIED_ENTRY(moe_group_routes_verified_s2, SPLASH_MOE_EXPERT_SLOTS, 2)
-MOE_GROUP_ROUTES_VERIFIED_ENTRY(moe_group_routes_verified_e512_s2, SPLASH_MOE_WIDE_EXPERT_SLOTS, 2)
 #undef MOE_GROUP_ROUTES_VERIFIED_ENTRY
 #undef MOE_GROUP_ROUTES_ENTRY
 #undef MOE_GROUP_ROUTES_BODY
