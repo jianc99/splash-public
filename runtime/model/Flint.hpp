@@ -83,8 +83,6 @@ struct FlintLayout final : QwenHybridLayout {
                           .sharedExpertGate = false,
                           .leadingDenseLayers = 2},
                          "Flint"} {}
-  // A family of the architecture.
-  constexpr explicit FlintLayout(const QwenHybridLayout &family) : QwenHybridLayout(family) {}
   bool operator==(const FlintLayout &) const = default;
 };
 

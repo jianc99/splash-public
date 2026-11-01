@@ -32,7 +32,9 @@ Ornith-1.5-35B-A3B or Ornith-1.5-122B, is its family. A layout type
 (`Qwen3_8.hpp`, `Qwen3_6Moe.hpp`, `Qwen4Exp.hpp`, `Flint.hpp` in
 `runtime/model/`) is an architecture, whose code its families share, and each
 family is a value of it in one list, `model::kFamilies` (`ModelDescriptor.hpp`):
-another size of an architecture is one more value there, its draft in
+another size of an architecture is one more value there, built by the
+constructor from a `QwenHybridLayout` its layout type gains with its second
+family (as `Qwen3_6MoeLayout`'s builds `kQwen3_5_122BLayout`), its draft in
 `families.FAMILIES`, and, for a GDN or attention shape no family had, its kernel
 instances and a row of the compiled shapes in `ops/GDN.cpp` or
 `ops/PagedAttention.cpp`. The kernel tests take every family's shapes from that
