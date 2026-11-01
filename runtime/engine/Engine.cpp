@@ -199,7 +199,7 @@ bool Engine::tick(double now) {
       static_cast<void>(cache_.writeThrough());
   }
   progressed = pollRestores(now) || progressed;
-  progressed = writeBehind_.run(now, memoryAwaited()) || progressed;
+  progressed = writeBehind_.run(now, memoryAwaited(now)) || progressed;
   // The earliest submitted and the earliest admitted of the lanes with work
   // in flight.
   uint64_t earliestWorking = std::numeric_limits<uint64_t>::max();
@@ -378,15 +378,26 @@ bool Engine::belowRunnable(const Request &active) const {
   return runnable && active.request.priority > *runnable;
 }
 
-bool Engine::memoryAwaited() const {
-  const std::optional<RequestPriority> tier = suspendedTier();
-  const bool draining = drainingForRecovery();
-  return std::ranges::any_of(requests_, [&](const auto &entry) {
-    const Request &active = entry.second;
-    return !active.finalized && active.resourceWait.pending &&
-           (active.lane ? !belowRunnable(active)
-                        : admissionTries(active, tier, draining) && !holdsBack(active.heldBehind));
-  });
+std::optional<double> Engine::memoryAwaitedUntil(const Request &waiter) const {
+  const ResourceWait &wait = waiter.resourceWait;
+  if (!wait.pending || !wait.startedMilliseconds)
+    return std::nullopt;
+  const bool retried = waiter.lane ? !belowRunnable(waiter)
+                                   : admissionTries(waiter, suspendedTier(), drainingForRecovery()) &&
+                                         !holdsBack(waiter.heldBehind);
+  if (!retried)
+    return std::nullopt;
+  return *wait.startedMilliseconds + config_.resourceWaitTimeoutMilliseconds;
+}
+
+bool Engine::awaitsMemory(const Request &waiter, double now) const {
+  const std::optional<double> until = memoryAwaitedUntil(waiter);
+  return until && now < *until;
+}
+
+bool Engine::memoryAwaited(double now) const {
+  return std::ranges::any_of(requests_,
+                             [&](const auto &entry) { return awaitsMemory(entry.second, now); });
 }
 
 bool Engine::holdsBack(std::optional<uint64_t> refused) const {
@@ -432,8 +443,11 @@ std::optional<double> Engine::nextWakeupMilliseconds() const {
       result = wakeup;
   }
   // Copies ahead wait for the end of a wait for memory, which a step of the
-  // engine shows.
-  const std::optional<double> persist = memoryAwaited() ? std::nullopt : writeBehind_.nextWakeup();
+  // engine shows, or for the end of what that wait holds back.
+  std::optional<double> persist = writeBehind_.nextWakeup();
+  for (const auto &[_, active] : requests_)
+    if (const std::optional<double> until = memoryAwaitedUntil(active); persist && until)
+      persist = std::max(*persist, *until);
   if (persist && (!result || *persist < *result))
     result = persist;
   return result;
@@ -1276,6 +1290,8 @@ void Engine::noteRefusal(Request &active, double now, const Denial &denial) noex
   auto &wait = active.resourceWait;
   if (wait.pending && wait.epoch != resourceEpoch_ && wait.deadlineMilliseconds > 0.0)
     wait.deadlineMilliseconds = now + config_.resourceWaitTimeoutMilliseconds;
+  if (denial.pending && !wait.startedMilliseconds)
+    wait.startedMilliseconds = now;
   wait.allocationFailure = denial.allocationFailure;
   wait.pending = denial.pending;
   wait.diskQuota = denial.diskQuota;
@@ -1710,8 +1726,8 @@ Engine::Prepared Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &i
   // goes on (above).
   const auto held = [&](const Request &active) {
     return std::ranges::any_of(requests_, [&](const auto &entry) {
-      return &entry.second != &active && awaitsMemory(entry.second, now) &&
-             yieldsBefore(active, entry.second);
+      return &entry.second != &active && entry.second.lane &&
+             awaitsMemory(entry.second, now) && yieldsBefore(active, entry.second);
     });
   };
   // A lane held back with a wait of its own waits on as one refused does
@@ -1794,7 +1810,9 @@ Engine::Prepared Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &i
     admitted = std::move(kept);
   }
   // A lane that runs is waiting for nothing; one refused waits for what
-  // refused it, beside the lanes that run or alone.
+  // refused it, beside the lanes that run or alone: memory on its way back,
+  // which the lanes that yield before it leave to it (held), or memory
+  // nothing returns, for which it holds no one.
   for (const BatchItem &scheduled : admitted)
     request(scheduled.requestId).resourceWait = {};
   for (const Denied &entry : denied)
@@ -1819,30 +1837,10 @@ Engine::Prepared Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &i
       return Prepared::Yielded;
     }
   }
-  // A lane refused memory on its way back waits for it, whether or not the
-  // command runs the lanes beside it: it retries once that memory lands, and
-  // the lanes that yield before it leave it to it (held). Refused memory
-  // nothing returns beside lanes that run, it waits for them, as a lane
-  // refused its KV does: it holds no one and starts no limit, and keeps when
-  // its wait began, which bounds a later hold.
-  if (!admitted.empty())
-    for (const Denied &entry : denied) {
-      Request &refused = request(entry.requestId);
-      if (entry.denial.pending) {
-        deferResourceRetry(refused, now, entry.denial);
-        continue;
-      }
-      ResourceWait kept;
-      kept.startedMilliseconds = refused.resourceWait.startedMilliseconds;
-      kept.admittedBefore = refused.resourceWait.admittedBefore;
-      refused.resourceWait = kept;
-    }
   // The hot block cache they read through grows toward its planned size,
   // by an extent at most, into memory nothing needs now: none while a lane
   // waits for memory on its way back.
-  if (spilledReads && std::ranges::none_of(requests_, [&](const auto &entry) {
-        return awaitsMemory(entry.second, now);
-      }))
+  if (spilledReads && !memoryAwaited(now))
     static_cast<void>(allocate([&] { return model_.growSpilledReads(); }, false,
                                ReclaimClass::Ordinary, {}, true));
   if (!admitted.empty()) {
@@ -2203,12 +2201,6 @@ bool Engine::preemptBelow(RequestPriority priority, double now) {
   ++counters_.prioritySuspensions;
   signalResourceProgress();
   return true;
-}
-
-bool Engine::awaitsMemory(const Request &waiter, double now) const {
-  const ResourceWait &wait = waiter.resourceWait;
-  return waiter.lane && wait.pending && wait.startedMilliseconds &&
-         now < *wait.startedMilliseconds + config_.resourceWaitTimeoutMilliseconds;
 }
 
 bool Engine::anotherResident(uint64_t requestId) const {

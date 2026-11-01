@@ -829,12 +829,6 @@ private:
   enum class Verdict : uint8_t { Wait, Yield, Fail };
   [[nodiscard]] Verdict judge(const Denial &denial, uint64_t requestId) const;
   [[nodiscard]] bool anotherResident(uint64_t requestId) const;
-  // Whether a resident lane waits for memory on its way back
-  // (ResourceWait::pending) that the lanes yielding before it leave to it
-  // (prepare): from its first refusal up to the resource wait's limit, so a
-  // wait whose memory never lands holds them no longer. A start that waits
-  // holds no lane; an ended request keeps no wait (release).
-  [[nodiscard]] bool awaitsMemory(const Request &waiter, double now) const;
   // The prompt rows a lane in prefill has processed, or the tokens a
   // decoding lane holds.
   [[nodiscard]] uint64_t completedTokens(const Request &request) const;
@@ -907,9 +901,10 @@ private:
                           const Denial &denial,
                           StateFailure reason = StateFailure::MemoryPressure) noexcept;
   // The latest refusal of the request's memory, as a wait or beside lanes
-  // that run: what refused it, and whether memory is on its way back.
-  // Memory that came back since a refusal that waited for it is progress,
-  // which restarts the limit of a wait that has one.
+  // that run: what refused it, whether memory is on its way back, and when
+  // memory on its way back was first awaited, which bounds that wait's hold
+  // (memoryAwaitedUntil). Memory that came back since a refusal that waited
+  // for it is progress, which restarts the limit of a wait that has one.
   void noteRefusal(Request &request, double nowMilliseconds, const Denial &denial) noexcept;
   // Waiting for scheduling or for a prefix does not consume the memory
   // wait limit, so the wait's record is reset. A request that holds
@@ -994,12 +989,21 @@ private:
   // decodes: the scheduler plans none of its work, and admission starts it
   // in no lane.
   [[nodiscard]] bool belowRunnable(const Request &request) const;
-  // A request the engine retries next, a lane of a priority the scheduler
-  // plans (belowRunnable) or one without a lane that admission tries and
-  // holds behind no refusal, has its latest refusal wait for memory on its
-  // way back (ResourceWait::pending): copies ahead start nothing until it is
-  // retried (WriteBehind::run).
-  [[nodiscard]] bool memoryAwaited() const;
+  // When a request's wait for memory on its way back stops holding back what
+  // waits for it, if it waits: a request the engine retries next, a lane of a
+  // priority the scheduler plans (belowRunnable) or one without a lane that
+  // admission tries and holds behind no refusal, whose latest refusal waits
+  // for memory on its way back (ResourceWait::pending), up to the resource
+  // wait's limit from when it was first awaited, so a wait whose memory
+  // never lands holds back nothing longer.
+  [[nodiscard]] std::optional<double> memoryAwaitedUntil(const Request &waiter) const;
+  // Whether the request waits so now (memoryAwaitedUntil). What it waits
+  // for lands for it: the lanes that yield before a lane that waits take none
+  // of it (prepare), the hot block cache does not grow, and copies ahead
+  // start nothing (WriteBehind::run), while any request waits
+  // (memoryAwaited).
+  [[nodiscard]] bool awaitsMemory(const Request &waiter, double nowMilliseconds) const;
+  [[nodiscard]] bool memoryAwaited(double nowMilliseconds) const;
   std::function<void()> completionNotifier_;
   std::optional<Pending> pending_;
   // When the latest command retired, until a tick finds nothing to do.

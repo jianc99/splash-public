@@ -1313,8 +1313,9 @@ of the model's memory for reading KV from the SSD cache (a decoding lane's share
 of the hot block cache, a prompt's staging), which no transfer in flight
 returns, suspends the lane that yields first if that lane yields before it and
 is resident outside its command. Memory a transfer in flight returns to a
-refused lane, KV pages or the model's memory alike, waits for that lane: until
-it has it, or for the resource wait's limit from its first refusal, a lane that
+refused lane of the priority that runs, KV pages or the model's memory alike,
+alone or beside lanes that run, waits for that lane: until it has it, or for
+the resource wait's limit from when it first awaited it, a lane that
 yields before it leaves a command where it would take KV pages past its
 capacity or memory for its reads of spilled KV it does not hold, ends one at a
 state boundary past which it would, and runs within what it holds; the hot
@@ -1636,7 +1637,7 @@ while the tier serves what is needed now, a restore that waits, a reclaim's
 demotion or a Spill request's write through, and goes on when they land, which
 wakes the engine, nor while a request the engine retries next, a lane of
 the priority that runs or one admission tries next, waits for memory on its
-way back, so
+way back, up to the resource wait's limit from when it first awaited it, so
 that the request, not a copy started as that memory lands, takes the state
 write next. A demotion or write through started meanwhile waits on the KV
 file's worker behind at most the copies in flight, a quarter of the tier's

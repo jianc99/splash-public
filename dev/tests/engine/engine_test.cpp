@@ -11238,6 +11238,81 @@ void testCopiesAheadWaitForALaneRefusedBesideOthers() {
   require(events.failedCount == 0, "a lane failed");
 }
 
+// Copies ahead wait for a request's memory on its way back no longer than
+// the resource wait's limit from when it was first awaited
+// (Engine::memoryAwaitedUntil): beside a lane refused a page while a cached
+// leaf's demotion is in flight, a point that fell due waits for the
+// demotion, which takes the tier first, and once it lands past that limit
+// the point's copy starts at once, before the lane, which then has its
+// page, has decoded again.
+void testCopiesAheadWaitNoLongerThanTheWaitsLimit() {
+  test::TestKvStorage storage(1024, 4096, 4);
+  KvPool pool(storage, 0);
+  test::TestKvTier tier(true);
+  tier.transferLimit = 64;
+  tier.capacity = 256;
+  engine::Cache cache(pool, &tier, nullptr);
+  Executor executor;
+  executor.keptTier = std::make_shared<OffloadControl>();
+  executor.keptTier->ready = true;
+  Events events;
+  engine::Engine engine(test::engineConfig({.maxContext = 102400}), cache, executor, events);
+  guardReleases(storage, engine);
+  // The leaf the refusal demotes, under a state on the SSD.
+  cacheBlocksUnderDiskStates(cache, 1);
+  engine.submit(request(9, std::vector<uint32_t>(2060, 9)));
+  double now = 1;
+  tickUntil(engine, now, [&] { return idle(engine); }, "the conversation did not finish");
+  const std::optional<double> due = engine.nextWakeupMilliseconds();
+  require(due && engine.snapshot().writeBehind.waiting == 1 && !tier.demotions,
+          "the finished conversation's point did not wait for its delay");
+  // Lane 1's decode needs a fourth page two tokens in, lane 2's 24 tokens in.
+  executor.decodeFinishes = false;
+  const auto promptTokens = [](uint64_t id) { return id == 1 ? 87U : 65U; };
+  for (const uint32_t id : {1U, 2U}) {
+    auto decoding = request(id, std::vector<uint32_t>(promptTokens(id), id));
+    decoding.maxNewTokens = 1000;
+    decoding.deadlineMilliseconds = 1e9;
+    engine.submit(std::move(decoding));
+  }
+  tickUntil(engine, now, [&] { return events.outputs.contains(1) && events.outputs.contains(2); },
+            "the lanes did not decode");
+  const auto needsPage = [&](uint64_t id) {
+    return promptTokens(id) + events.outputs[id].size() + model::ExecutionLimits::targetVerifyRows >
+           uint64_t{cache.pageTable(id).pages.size()} * KvCache::pageTokens;
+  };
+  tickUntil(engine, now, [&] { return !engine.commandInFlight() && needsPage(1) && !needsPage(2); },
+            "lane 1 did not come to need a page that lane 2 does not");
+  require(now < *due, "the point fell due before the lanes decoded");
+  storage.growthBlocked = true;
+  const KvPageAcquisition held = pool.acquirePages(pool.freePageCount());
+  const double refusedAt = now;
+  static_cast<void>(engine.tick(now++));
+  const uint32_t demotions = tier.demotions;
+  const size_t decoded = events.outputs[1].size();
+  require(held.granted() && engine.commandInFlight() && demotions == 1 && !executor.suspensions,
+          "lane 1 was not refused its page beside lane 2 while the leaf's demotion is in flight");
+  static_cast<void>(engine.tick(*due));
+  const std::optional<double> wakeup = engine.nextWakeupMilliseconds();
+  require(tier.demotions == demotions && engine.snapshot().writeBehind.waiting == 1 &&
+              (!wakeup || *wakeup > *due),
+          "the point was copied, or woke the engine, while a lane beside others waited for memory");
+  static_cast<void>(engine.tick(refusedAt + kResourceWaitTimeoutMilliseconds - 1));
+  require(tier.demotions == demotions, "the point was copied while the demotion was in flight");
+  // The demotion lands past the limit.
+  tier.complete();
+  static_cast<void>(engine.tick(refusedAt + kResourceWaitTimeoutMilliseconds + 1));
+  require(tier.demotions > demotions && events.outputs[1].size() == decoded,
+          "the point waited past the limit of a wait for memory on its way back");
+  for (const uint32_t page : held.pages)
+    pool.releasePage(page, false);
+  storage.growthBlocked = false;
+  executor.decodeFinishes = true;
+  now = refusedAt + kResourceWaitTimeoutMilliseconds + 2;
+  tickUntil(engine, now, [&] { return idle(engine); }, "the lanes did not finish");
+  require(events.failedCount == 0, "a lane failed");
+}
+
 // A lane of a priority the scheduler does not plan holds no copy back: a
 // Normal lane refused alone while a cached leaf's demotion is in flight
 // keeps that wait while a Foreground request, started as the demotion
@@ -11303,6 +11378,8 @@ void testCopiesAheadDoNotWaitForALaneBelowThePriorityThatRuns() {
   require(events.failedCount == 0, "a lane failed");
 }
 
+void publishDiskState(engine::Cache &cache, const std::vector<uint32_t> &prompt);
+
 // A lane's wait limit measures time without progress also while it waits
 // beside lanes that run: refused alone while a demotion is in flight, then
 // refused again beside a later lane once that demotion landed and the page
@@ -11321,8 +11398,12 @@ void testARefusalAfterProgressRestartsTheWaitLimit() {
   engine::Engine engine(test::engineConfig({.maxContext = 102400, .resourceWaitTimeoutMilliseconds = kLimit}),
                         cache, executor, events);
   guardReleases(storage, engine);
-  // The leaf a refusal demotes, under a state on the SSD.
+  // The leaf a refusal demotes, under a state on the SSD, and a later
+  // prefix whose state is on the SSD too.
   cacheBlocksUnderDiskStates(cache, 1);
+  const std::vector<uint32_t> prefix(65, 2);
+  publishDiskState(cache, prefix);
+  executor.restoreControl->ready = true;
   auto first = request(1, std::vector<uint32_t>(87, 1));
   first.maxNewTokens = 1000;
   first.deadlineMilliseconds = 1e9;
@@ -11340,9 +11421,11 @@ void testARefusalAfterProgressRestartsTheWaitLimit() {
   const double refused = now;
   static_cast<void>(engine.tick(now));
   require(tier.demotions == 1 && !engine.commandInFlight(), "the lane was not refused alone beside a demotion");
-  // A later request starts in memory growth gives it, the rest of which is
-  // held, and runs beside the lane.
-  auto later = request(2, std::vector<uint32_t>(1, 2));
+  // A later request restores that prefix into a page growth gives it, the
+  // rest of which is held, and runs beside the lane within that page: it
+  // yields before the lane, so it takes no page past it while the lane
+  // waits for the demotion (prepare).
+  auto later = request(2, prefix);
   later.maxNewTokens = 1000;
   later.deadlineMilliseconds = 1e9;
   engine.submit(std::move(later));
@@ -14649,6 +14732,7 @@ int main() {
     testReplayPointsAreWrittenBehind();
     testFinishedConversationsLeaveAtOnce();
     testCopiesAheadWaitForALaneRefusedBesideOthers();
+    testCopiesAheadWaitNoLongerThanTheWaitsLimit();
     testCopiesAheadDoNotWaitForALaneBelowThePriorityThatRuns();
     testARefusalAfterProgressRestartsTheWaitLimit();
     testCopiesAheadDoNotWaitForARequestHeldBehindARefusal();
