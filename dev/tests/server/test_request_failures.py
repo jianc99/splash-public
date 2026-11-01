@@ -237,8 +237,8 @@ class RequestFailureTests(HarnessTestCase):
             "could not allocate KV target: engine memory budget exceeded "
             "(additional_pages=12, free_pages=0); the request does not fit in the "
             "memory this server may use, even after every cached prefix was "
-            "evicted: restart the server with a larger --max-memory or a smaller "
-            "--max-context"
+            "evicted: restart the server with a smaller --max-context, or with a "
+            "larger --max-memory where one lowered it"
         )
         records = []
         capacity = [

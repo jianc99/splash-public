@@ -4400,7 +4400,8 @@ struct Spilling {
         cache(pool, &tier, budget, policy) {
     tier.budget = budget;
     tier.transferLimit = 1024;
-    require(cache.spillWritten().granted() && pool.freePageCount(kv::PageForm::Index) == 4,
+    require(cache.spillWritten(SpilledExtents::KeepRunway).granted() &&
+                pool.freePageCount(kv::PageForm::Index) == 4,
             "the cache did not allocate the Index runway");
   }
 
@@ -4480,14 +4481,14 @@ void testSpillMovesLandedPagesToTheIndexForm() {
                                   [](auto draw) { return draw == model::DiskBudget::Draw::Commitment; }) &&
               spill.budget->committedBytes() == 0 && spill.budget->usedBytes() == 600,
           "the published pages were not written through on the request's commitment");
-  require(spill.cache.spillWritten().granted() &&
+  require(spill.cache.spillWritten(SpilledExtents::KeepRunway).granted() &&
               spill.spilled(1) == std::vector<bool>(7, false),
           "a page spilled before its copy landed");
   spill.tier.complete();
   require(spill.cache.pollTransfers(), "the writes did not land");
   const uint32_t free = spill.pool.freePageCount();
   const uint32_t allocations = spill.storage.allocationAttempts;
-  require(spill.cache.spillWritten().granted() &&
+  require(spill.cache.spillWritten(SpilledExtents::KeepRunway).granted() &&
               spill.spilled(1) == std::vector<bool>{false, true, true, true, true, false, false} &&
               spill.pool.freePageCount() == free + 4 &&
               spill.pool.freePageCount(kv::PageForm::Index) == 4 &&
@@ -4513,13 +4514,11 @@ void testSpillMovesLandedPagesToTheIndexForm() {
 }
 
 // The memory a spill frees leaves with the Full extents its moves empty, as
-// its caller says: kept for a reclaim, released but the runway, or, the Full
-// pages left gathered in the fewest extents first, all released; a spill
-// that moves nothing releases nothing, an empty extent of a request that
-// ended included.
+// its caller says: released but the runway, or, the Full pages left gathered
+// in the fewest extents first, all released; a spill that moves nothing
+// releases nothing, an empty extent of a request that ended included.
 void testSpilledFullExtentsLeaveMemory() {
-  for (const SpilledExtents extents :
-       {SpilledExtents::Kept, SpilledExtents::KeepRunway, SpilledExtents::Released}) {
+  for (const SpilledExtents extents : {SpilledExtents::KeepRunway, SpilledExtents::Released}) {
     Spilling spill;
     const auto emptyFullExtents = [&] {
       const KvPoolSnapshot pool = spill.pool.snapshot();
@@ -4539,9 +4538,9 @@ void testSpilledFullExtentsLeaveMemory() {
     static_cast<void>(spill.cache.writeThrough());
     spill.tier.complete();
     require(spill.cache.pollTransfers() && !emptyFullExtents(), "the writes did not land, or an extent was empty");
-    const bool kept = extents == SpilledExtents::Kept, runway = extents == SpilledExtents::KeepRunway;
+    const bool runway = extents == SpilledExtents::KeepRunway;
     require(spill.cache.spillWritten(extents).granted() && test::indexBlocks(spill.cache, 1)[12] &&
-                emptyFullExtents() == (kept ? 2u : runway) && fullExtents() == (kept ? 4u : runway ? 3u : 1u),
+                emptyFullExtents() == runway && fullExtents() == (runway ? 3u : 1u),
             "the Full extents the moves emptied did not go as the caller said");
     // A Resident request's pages, which an idle reclaim drops once it ended,
     // empty extents that a spill moving nothing leaves.
@@ -4550,7 +4549,7 @@ void testSpilledFullExtentsLeaveMemory() {
     while (spill.cache.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::Ordinary).madeProgress) {
     }
     const uint32_t before = emptyFullExtents();
-    require(before > (extents == SpilledExtents::Kept ? 2u : 1u) && spill.cache.spillWritten(extents).granted() &&
+    require(before > 1 && spill.cache.spillWritten(extents).granted() &&
                 emptyFullExtents() == before,
             "a spill that moved nothing released an extent");
     spill.cache.checkInvariants();
@@ -4588,13 +4587,13 @@ void testSpillAtTheMemoryWall() {
     static_cast<void>(spill.cache.writeThrough());
     spill.tier.complete();
     static_cast<void>(spill.cache.pollTransfers());
-    const TokenAdmission refused = spill.cache.spillWritten();
+    const TokenAdmission refused = spill.cache.spillWritten(SpilledExtents::KeepRunway);
     require(refused.failure == TokenAdmissionFailure::Denied && refused.form == kv::PageForm::Index &&
                 refused.additionalPages == 1 && refused.allocationFailure == failure &&
                 !spill.spilled(1)[5],
             "a spill past the runway did not ask for an Index extent, or moved its page anyway");
     spill.storage.growthBlocked = false;
-    require(spill.cache.spillWritten().granted() && spill.spilled(1)[5] &&
+    require(spill.cache.spillWritten(SpilledExtents::KeepRunway).granted() && spill.spilled(1)[5] &&
                 spill.pool.freePageCount(kv::PageForm::Index) >= 4,
             "once growth was admitted the page did not spill, or the runway was not refilled");
     spill.storage.growthBlocked = true;
@@ -4860,7 +4859,7 @@ void testConversionWaitsForItsPagesToSpill() {
           "the converted request did not wait for its pages to spill");
   spill.tier.complete();
   static_cast<void>(spill.cache.pollTransfers());
-  const TokenAdmission runway = spill.cache.spillWritten();
+  const TokenAdmission runway = spill.cache.spillWritten(SpilledExtents::KeepRunway);
   require(runway.failure == TokenAdmissionFailure::Denied && runway.form == kv::PageForm::Index &&
               spill.cache.spillSnapshot().spilledPages == 4 && spill.cache.ensureTokens(1, tokens).granted(),
           "the converted request did not grow into the pages its spill freed");
@@ -4888,7 +4887,7 @@ void testConversionAtTheWallFindsTheRunway() {
           "the request that converted at the wall did not wait for its pages to spill");
   spill.tier.complete();
   static_cast<void>(spill.cache.pollTransfers());
-  static_cast<void>(spill.cache.spillWritten());
+  static_cast<void>(spill.cache.spillWritten(SpilledExtents::KeepRunway));
   require(spill.cache.spillSnapshot().spilledPages == 6 && spill.cache.ensureTokens(2, tokens).granted(),
           "the converted request's pages did not spill through the runway");
   spill.cache.checkInvariants();
@@ -5263,7 +5262,7 @@ void testFailedWritesKeepTheirCommitment() {
         require(spill.budget->committedBytes() == 600 && spill.budget->usedBytes() == 0,
                 "the failed writes did not give their slots back to the commitment");
     }
-    static_cast<void>(spill.cache.spillWritten());
+    static_cast<void>(spill.cache.spillWritten(SpilledExtents::KeepRunway));
     const KvSpillSnapshot spilled = spill.cache.spillSnapshot();
     require(spilled.writeThroughPages == 6 && spilled.writeThroughFailures == (everyWrite ? 6u : 1u) &&
                 spill.budget->committedBytes() == 0 && spilled.spilledPages == 4 &&
@@ -5298,7 +5297,7 @@ void testPagesPastTheCommitmentCommitTheirSlots() {
           "the first request's pages past its commitment held the second's committed pages back");
   spill.tier.complete();
   static_cast<void>(spill.cache.pollTransfers());
-  static_cast<void>(spill.cache.spillWritten());
+  static_cast<void>(spill.cache.spillWritten(SpilledExtents::KeepRunway));
   require(spill.spilled(1) == std::vector<bool>{false, true, false, false, false} &&
               spill.spilled(2) == std::vector<bool>{false, true, true, false, false},
           "a page without a copy spilled, or one with a copy did not");
@@ -5448,12 +5447,12 @@ void testRecomputedBlocksSpillToCopiesOfTheirPages() {
           "for copies of its pages");
   spill.cache.endRequest(2);
   spill.start(3, prompt, 6);
-  require(spill.cache.writeThrough() == 6 && spill.cache.spillWritten().granted() &&
+  require(spill.cache.writeThrough() == 6 && spill.cache.spillWritten(SpilledExtents::KeepRunway).granted() &&
               spill.spilled(3) == std::vector<bool>(7, false),
           "a Spill request did not write copies of its pages, or a page spilled to another's copy");
   spill.tier.complete();
   static_cast<void>(spill.cache.pollTransfers());
-  require(spill.cache.spillWritten().granted() &&
+  require(spill.cache.spillWritten(SpilledExtents::KeepRunway).granted() &&
               spill.spilled(3) == std::vector<bool>{false, true, true, true, true, false, false} &&
               spill.cache.copiedBlocks(chainEnd) == 6 && spill.cache.spillSnapshot().rewrites == 6 &&
               spill.cache.snapshot().kvTier.diskBlocks == 6,

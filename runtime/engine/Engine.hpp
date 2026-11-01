@@ -264,9 +264,13 @@ public:
   [[nodiscard]] ResourceWaitSnapshot resourceWaitSnapshot(double nowMilliseconds) const;
 
   // Runs only between commands: throws std::logic_error while a command is
-  // in flight. Returns the model's idle state buffers first, then the caches
-  // the model can rebuild while the directive's byte target is unmet; a
-  // critical directive has no target and takes them all. Under critical
+  // in flight. A pass first collects the transfers that landed, so one that
+  // continues a reclaim they held back takes what they freed. It returns the
+  // model's idle state buffers first, then spills the pages whose copies
+  // landed, refilling the Index runway if memory allows, and counts what the
+  // KV pool gives back for them; then the caches the model can rebuild
+  // while the directive's byte target is unmet; a critical directive has no
+  // target and takes them all. Under critical
   // pressure it then evicts every unpinned cache entry nothing in use holds
   // (Cache::evictAll), gives back every chunk of the expert store above its
   // floor at once (Model::releaseExpertsToFloor), and evicts the rest.
@@ -289,10 +293,9 @@ public:
   // short of critical keeps one lane's pooled buffers and one empty extent.
   // Requests waiting for memory retry after any step that freed some, kept
   // or released.
-  // Live command buffers are never eviction candidates. A pass first collects
-  // the transfers that landed, so one that continues a reclaim they held back
-  // takes what they freed. The result says whether the directive's target is
-  // met, waits for transfers in flight or a conversion's memory, or finds
+  // Live command buffers are never eviction candidates. The result says
+  // whether the directive's target is met, waits for transfers in flight or
+  // a conversion's memory, or finds
   // nothing left that the directive lets it take: with hostShort, no lane
   // converts and the store is at its floor too.
   [[nodiscard]] MemoryReclaimResult reclaimMemory(const MemoryReclaimDirective &directive);
@@ -609,6 +612,20 @@ private:
   // Whether a resident Spill request's prompt goes on: its next commands
   // take Full pages that spill as their copies land.
   [[nodiscard]] bool spillingPrompt() const;
+  // Whether a lane, of the given KV mode if one is named, is in service.
+  [[nodiscard]] bool laneInService(std::optional<KvMode> mode) const;
+  // What becomes of the Full extents the spill of pages whose copies landed
+  // empties (Cache::spillWritten): they leave memory but the runway while a
+  // spilling prompt still grows into it or the host holds growth back, when
+  // it could not be allocated again; otherwise all of them.
+  [[nodiscard]] SpilledExtents landedExtents() const;
+  // Between commands, on a target whose KV can live on the SSD cache: the
+  // pages whose copies have landed leave memory (Cache::spillWritten) before
+  // admission and at a command's start, so that a request that waits for a
+  // conversion's memory finds it rather than climbing on. The Index pages
+  // they take are an optional KV allocation (allocate()). A paced pass
+  // spills them too, within its own rules (reclaimMemory).
+  void spillLanded();
   // Ends a request at its length outside a command: in Spill mode, once
   // the SSD cache can hold no more of its KV.
   void endAtLength(Request &request);
@@ -963,8 +980,8 @@ private:
   std::unordered_map<uint64_t, Request> requests_;
   // Set while prepare() reserves the memory its lanes' KV forms need (the
   // reads of spilled KV) and after: a lane that converts to Spill from then
-  // on keeps its pages Full in that command, which the next one's start
-  // spills (Cache::spillWritten). False between commands.
+  // on keeps its pages Full in that command, which the next point between
+  // commands spills (spillLanded). False between commands.
   bool commandShaped_ = false;
   // The lanes with a wait of their own that this tick's prepare held back.
   std::vector<uint64_t> heldWaits_;

@@ -279,12 +279,22 @@ bool Engine::tick(double now) {
     return true;
   }
 
+  // Pages whose copies landed leave memory before admission judges it.
+  spillLanded();
   progressed = admitQueued(now) || progressed;
   sweepTerminal();
+  // A prefill lane that reads its history from the SSD cache runs alone in
+  // its commands (streamsHistory). One whose history spills, or that holds
+  // another request's spilled blocks, runs prefill groups, which read that
+  // history once for their chunks; a Resident one only where every lane
+  // runs them, so a request that arrives beside it waits for a chunk.
   if (config_.spill.capable) {
     for (const auto &[id, active] : requests_)
-      if (active.lane && scheduler_.phase(id) == Phase::Prefill)
+      if (active.lane && scheduler_.phase(id) == Phase::Prefill) {
         scheduler_.setStreamsHistory(id, streamsHistory(active));
+        scheduler_.setPrefillGroupRows(
+            id, model_.prefillGroupRows(active.kvMode == KvMode::Spill || cache_.holdsIndexPages(id)));
+      }
   }
   // Lanes that wait for memory on its way back cannot run before it lands;
   // the command runs the other lanes meanwhile. A plan whose lanes all wait
@@ -1085,7 +1095,6 @@ bool Engine::convertToSpill(Request &active, const CacheLookup *restoring) {
   if (!cache_.convertToSpill(active.request.id, spillPages(active, end), !commandShaped_))
     return false;
   active.kvMode = KvMode::Spill;
-  scheduler_.setPrefillGroupRows(active.request.id, model_.prefillGroupRows(true));
   // A start that converts starts as a Spill request, which completeAdmission
   // counts, and one refused all the same decides its mode afresh at its next
   // attempt; a lane that ran Resident before converts once.
@@ -1143,6 +1152,29 @@ bool Engine::spillingPrompt() const {
   });
 }
 
+bool Engine::laneInService(std::optional<KvMode> mode) const {
+  return std::any_of(requests_.begin(), requests_.end(), [&](const auto &entry) {
+    return entry.second.lane && (!mode || entry.second.kvMode == *mode);
+  });
+}
+
+SpilledExtents Engine::landedExtents() const {
+  return spillingPrompt() || config_.growthPaused() ? SpilledExtents::KeepRunway
+                                                    : SpilledExtents::Released;
+}
+
+void Engine::spillLanded() {
+  if (!config_.spill.capable)
+    return;
+  // The Index runway the pages draw on refills if memory allows. The Index
+  // pages, the runway's included, are memory the resident Spill lanes need,
+  // as their Full pages are, and a fraction of what the moves free: the
+  // host's pause holds them back only while no such lane is in service.
+  const SpilledExtents extents = landedExtents();
+  static_cast<void>(allocate([&] { return cache_.spillWritten(extents); },
+                             laneInService(KvMode::Spill), ReclaimClass::Ordinary, {}, true));
+}
+
 void Engine::endAtLength(Request &active) {
   ++counters_.spill.lengthEnds;
   finish(active, EngineFinishReason::Length, {});
@@ -1151,11 +1183,6 @@ void Engine::endAtLength(Request &active) {
 void Engine::completeAdmission(Request &active, CacheLookup &lookup,
                                 DraftContextPlan draft) {
   const bool resuming = scheduler_.suspended(active.request.id);
-  // A lane whose history spills runs prefill groups, which read it once for
-  // their chunks; a Resident one only where every lane runs them, so a
-  // request that arrives beside it waits for a chunk.
-  scheduler_.setPrefillGroupRows(active.request.id,
-                                 model_.prefillGroupRows(active.kvMode == KvMode::Spill));
   active.skipCache = false;
   active.admissionProbe.reset();
   const uint32_t resumeBoundary = lookup.resumeBoundary();
@@ -1616,26 +1643,8 @@ Engine::Prepared Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &i
     bool &shaped;
     ~Shaping() { shaped = false; }
   } const shaping{commandShaped_};
-  // Whether a lane, of the given KV mode if one is named, is in service.
-  const auto inService = [&](std::optional<KvMode> mode) {
-    return std::any_of(requests_.begin(), requests_.end(), [&](const auto &entry) {
-      return entry.second.lane && (!mode || entry.second.kvMode == *mode);
-    });
-  };
-  // Pages whose copies have landed leave memory before any lane grows; the
-  // Index runway they draw on refills if memory allows. The Full extents
-  // they empty leave memory too, but one, the runway, while a spilling
-  // prompt still grows into it or the host holds growth back, when it could
-  // not be allocated again. The Index pages, the runway's included, are
-  // memory the resident Spill lanes need, as their Full pages are, and a
-  // fraction of what the moves free: the host's pause holds them back only
-  // while no such lane is in service.
-  if (spill) {
-    const SpilledExtents extents =
-        spillingPrompt() || config_.growthPaused() ? SpilledExtents::KeepRunway : SpilledExtents::Released;
-    static_cast<void>(allocate([&] { return cache_.spillWritten(extents); }, inService(KvMode::Spill),
-                               ReclaimClass::Ordinary, {}, true));
-  }
+  // Pages whose copies have landed leave memory before any lane grows.
+  spillLanded();
   // So do a windowed layout's windowed layers' K/V of the pages every
   // window has passed, the processed rows' (Cache::trimWindows): into the
   // Slim runway and what memory allows, the rest Full for a later pass. A
@@ -1644,7 +1653,7 @@ Engine::Prepared Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &i
   // host's pause holds them back only while none is, and a long prompt's
   // pages trim as it prefills rather than filling the budget Full.
   {
-    const Serving mark(config_.serving, inService(std::nullopt));
+    const Serving mark(config_.serving, laneInService(std::nullopt));
     static_cast<void>(cache_.trimWindows());
   }
   // A command's later passes run its item again: the lane holds what it
@@ -1853,9 +1862,9 @@ Engine::Prepared Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &i
       }
     }
     // A lane a refusal converted while the command took shape keeps its pages
-    // Full in it, but the next pass's start would spill those whose copies
-    // landed: it runs the command whole, as the spill section has a lane
-    // that streams run it.
+    // Full in it, but the point before its next pass would spill those whose
+    // copies landed (spillLanded): it runs the command whole, as the spill
+    // section has a lane that streams run it.
     if (plan.passes > 1 && leaderResident && leader.kvMode == KvMode::Spill)
       plan.passes = 1;
     // The items come last: making room for a state's buffers may move KV
@@ -2302,10 +2311,12 @@ auto Engine::allocate(Attempt &&attempt, bool inService, ReclaimClass upTo,
 //   (Cache::owedCopiesReturn), that memory is on its way (pending), and
 //   nothing more converts or goes for it. Otherwise the lane holding the
 //   most KV converts (convertLargestResidentLane), its memory on its way
-//   too: an attempt that finds it fell short climbs on, to the next lane
-//   and then the store, so each lane that converts delays the store by one
-//   attempt at most. A target whose KV stays in memory skips this rung, and
-//   so does one whose lanes would give back less than spilling costs them.
+//   too: its pages leave memory as their copies land, at the next point
+//   between commands (spillLanded), and an attempt that finds it fell
+//   short climbs on, to the next lane and then the store, so each lane that
+//   converts delays the store by one attempt at most. A target whose KV
+//   stays in memory skips this rung, and so does one whose lanes would give
+//   back less than spilling costs them.
 // - Then one chunk of the expert store above its floor, which every decode
 //   step of a streamed MoE target reads.
 // - Then what is in use (`takeInUse`), which only work that would not yield
@@ -2576,6 +2587,20 @@ MemoryReclaimResult Engine::reclaimMemory(const MemoryReclaimDirective &directiv
       released += idle;
   };
   releaseIdle();
+  // The pages whose copies landed leave memory next, as before admission
+  // (spillLanded), and what the KV pool gives back for them counts toward
+  // the target. The pass spills them by its own rules: their Index pages
+  // are memory a Spill lane in service needs, as there, but no other step
+  // makes room for them, which would take what the pass keeps and count
+  // none of it. Pages a refused extent leaves Full spill at the next tick.
+  if (config_.spill.capable) {
+    const uint64_t allocated = cache_.allocatedBytes();
+    {
+      const Serving mark(config_.serving, laneInService(KvMode::Spill));
+      static_cast<void>(cache_.spillWritten(landedExtents()));
+    }
+    released += allocated - std::min(allocated, cache_.allocatedBytes());
+  }
   // Caches the model can rebuild go only toward a byte target or under
   // critical pressure: an untargeted pass keeps the embedding rows and the
   // vision encoder.
@@ -2627,8 +2652,9 @@ MemoryReclaimResult Engine::reclaimMemory(const MemoryReclaimDirective &directiv
     // it first. A host that is really short then climbs escalate()'s rungs
     // short of what is in use, a Resident lane's conversion to Spill before
     // the expert store; what a conversion frees comes back as its copies
-    // land, or at the next command's start, which the pass waits for as
-    // well: the pass that continues it takes the extents its pages empty.
+    // land, which the pass waits for as well: the pass that continues it
+    // spills the pages whose copies landed before it climbs and counts what
+    // they give back.
     pending = reclaimUpTo(ReclaimClass::Ordinary);
     if (!pending && directive.hostShort)
       while (targetUnmet()) {
@@ -2895,10 +2921,13 @@ Engine::LaneEnd Engine::capacityExhausted(std::string_view what,
                         metal::allocationFailureName(failure);
   if (!detail.empty())
     message += " (" + std::string(detail) + ")";
-  // A lone lane judge failed: only other limits fit it.
+  // A lone lane judge failed: only other limits fit it. --max-memory only
+  // lowers this Mac's budget (EngineMemoryPolicy::hardBudgetBytes), so a
+  // larger one helps only where one lowered it.
   message += "; the request does not fit in the memory this server may use, even after "
              "every cached prefix was evicted and any store of streamed experts shrank to its "
-             "floor: restart the server with a larger --max-memory or a smaller --max-context";
+             "floor: restart the server with a smaller --max-context, or with a larger "
+             "--max-memory where one lowered it";
   return {LaneOutcome::CapacityExhausted, std::move(message)};
 }
 

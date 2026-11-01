@@ -288,11 +288,11 @@ struct CacheReclaimResult final {
 enum class CacheReclaimMode { KeepExtents, ReleaseExtents, ReusePages };
 
 // What becomes of the Full extents a spill's moves leave empty
-// (Cache::spillWritten): they stay allocated for a reclaim to take; they
-// leave memory but one, the runway the next Full pages come from without
-// an allocation; or the Full pages left gather in the fewest extents
-// (Cache::compactExtent) and every empty one leaves.
-enum class SpilledExtents : uint8_t { Kept, KeepRunway, Released };
+// (Cache::spillWritten): they leave memory but one, the runway the next
+// Full pages come from without an allocation; or the Full pages left
+// gather in the fewest extents (Cache::compactExtent) and every empty one
+// leaves.
+enum class SpilledExtents : uint8_t { KeepRunway, Released };
 
 // Whether the caller can wait for KV memory a step leaves to come back.
 // CanWait (growth and pressure passes): a KV leaf a state needs is written
@@ -499,7 +499,9 @@ public:
   [[nodiscard]] uint64_t spillRoom() const noexcept;
   // Commits quota for `pages` pages of a Spill request, which each page it
   // publishes then draws or returns (DiskBudget::commit); false, committing
-  // nothing, when spillRoom() cannot hold them.
+  // nothing, when spillRoom() cannot hold them. A tier that takes no writes
+  // is the spill gate's to refuse: a resume commits there too, and since no
+  // write draws its commitment, all of it goes back as the request ends.
   [[nodiscard]] bool commitSpill(uint64_t requestId, uint32_t pages);
   // Turns a Resident request whose growth was denied into a Spill request:
   // checks the tier, the write budget and the room for `pages` pages,
@@ -524,12 +526,14 @@ public:
   // moves left empty go as `extents` says. Denied, of the index form, when
   // an allocation was refused: the pages it leaves Full, or the runway's;
   // the caller makes room for them or does without.
-  [[nodiscard]] TokenAdmission spillWritten(SpilledExtents extents = SpilledExtents::Kept);
+  [[nodiscard]] TokenAdmission spillWritten(SpilledExtents extents);
   // Pages of the form that transfers in flight will free: demotions, and
   // for Full the pages Spill requests hold that spill once their copies in
   // flight land, written through or copied ahead, as far as free Index
   // pages take them (spillingWrites).
   [[nodiscard]] uint32_t pendingPages(kv::PageForm form) const noexcept;
+  // The bytes the KV pool's extents take, of every form.
+  [[nodiscard]] uint64_t allocatedBytes() const noexcept { return pool_.allocatedBytes(); }
   // Between commands, with a window: moves to the Slim form every Full page
   // no row will read whole again: every request that holds it has
   // published windowPages blocks past it (its next command's rows, at or
@@ -1176,10 +1180,10 @@ private:
   // Rescans every Spill request's blocks from its dense history: a holder
   // that kept some of them Full ended or began to spill.
   void rescanSpills() noexcept;
-  // spillWritten(extents), or without `allocate` only its moves into free
+  // spillWritten(*extents), or without `extents` only its moves into free
   // Index pages, which allocate nothing: those past them stay Full, and so
   // do the Full extents they empty.
-  [[nodiscard]] TokenAdmission moveLandedPages(bool allocate, SpilledExtents extents = SpilledExtents::Kept);
+  [[nodiscard]] TokenAdmission moveLandedPages(std::optional<SpilledExtents> extents);
   // The copy of the K/V on an Index page.
   [[nodiscard]] model::KvPageSource sourceOf(uint32_t page) const;
   // Every request that holds the page, at chain index `index`, has

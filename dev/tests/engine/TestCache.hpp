@@ -26,12 +26,13 @@ inline uint64_t publishBlocks(engine::Cache &cache, uint64_t requestId,
 // tier's IO done at once: starts writing the Spill requests' published pages
 // through (Cache::writeThrough), lands every write (TestKvTier::complete) and
 // moves the eligible pages to the index form (Cache::spillWritten), as far
-// as the pool admits. Returns the writes it started.
+// as the pool admits, releasing the Full extents they empty but the runway.
+// Returns the writes it started.
 inline uint32_t spillRound(engine::Cache &cache, TestKvTier &tier) {
   const uint32_t written = cache.writeThrough();
   tier.complete();
   static_cast<void>(cache.pollTransfers());
-  static_cast<void>(cache.spillWritten());
+  static_cast<void>(cache.spillWritten(engine::SpilledExtents::KeepRunway));
   return written;
 }
 

@@ -749,6 +749,9 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   const uint64_t kvSlotBytes = model::SlotFile::slotBytesFor(kvFormat.payloadBytes());
   const uint64_t hardBudgetBytes = EngineMemoryPolicy::hardBudgetBytes(
       device.recommendedMaxWorkingSetBytes, config.maximumMemoryBytes);
+  if (config.maximumMemoryBytes > hardBudgetBytes)
+    logLine("--max-memory ignored: its ", gibibytes(config.maximumMemoryBytes), " exceed this Mac's Metal budget of ",
+            gibibytes(hardBudgetBytes), ", which it can only lower.");
   model::StreamableWeights streamable;
   // The arenas of the loaded model by what streams of it, and those of a
   // runtime whose K/V spills, which only a block-sparse target with a

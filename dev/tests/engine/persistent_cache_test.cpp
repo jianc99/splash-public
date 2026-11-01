@@ -1603,7 +1603,7 @@ void testAPrefixWithoutOwnCopiesHoldsBackNoSpill() {
   const auto shelf = std::make_shared<Shelf>();
   shelf->capacity = 100;
   engine::Cache cache(pool, &tier, budget, CacheSpillPolicy{1, 1});
-  require(cache.spillWritten().granted(), "the Index runway was not allocated");
+  require(cache.spillWritten(SpilledExtents::KeepRunway).granted(), "the Index runway was not allocated");
   const auto publish = [&](uint64_t block) {
     cache.publishCompositeState(block, std::make_shared<ShelvedState>(shelf, false), false);
   };
@@ -1651,7 +1651,7 @@ void testAPrefixWithoutOwnCopiesHoldsBackNoSpill() {
   require(cache.commitSpill(3, 13), "the next turn's commitment was refused");
   const CacheLookup found = cache.lookup(next, {});
   require(found.state && cache.restoreRequest(3, found).granted(), "the next turn did not restore the chain");
-  require(cache.spillWritten().granted(), "the spill was refused");
+  require(cache.spillWritten(SpilledExtents::KeepRunway).granted(), "the spill was refused");
   require(std::ranges::count_if(test::indexBlocks(cache, 3), [](uint64_t block) { return block != 0; }) == 7,
           "the prefix waiting for its own copies held back the pages that had theirs");
   cache.checkInvariants();

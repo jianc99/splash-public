@@ -106,7 +106,10 @@ public:
     case 3: static_cast<void>(cache_.writeThrough()); break;
     case 4: land(); break;
     case 5:
-      static_cast<void>(windowed_ ? cache_.trimWindows(chance(80)) : cache_.spillWritten().additionalPages);
+      static_cast<void>(windowed_ ? cache_.trimWindows(chance(80))
+                                  : cache_.spillWritten(chance(50) ? SpilledExtents::KeepRunway
+                                                                   : SpilledExtents::Released)
+                                        .additionalPages);
       break;
     case 6: reclaim(); break;
     case 7: keepQuota(); break;
@@ -254,7 +257,8 @@ private:
   }
 
   // A new request on a prefix of a base prompt, restored from what the
-  // cache holds of it, a Spill request committing quota for its pages.
+  // cache holds of it, a Spill request committing quota for its pages
+  // whether the tier takes writes or not, as a resume does.
   void start() {
     if (requests_.size() >= 6) return;
     const uint64_t id = ++nextId_;

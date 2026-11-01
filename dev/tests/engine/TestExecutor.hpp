@@ -969,7 +969,7 @@ public:
   std::unordered_map<uint64_t, uint32_t> prefillChunks;
   // The most rows of a prefill command (Model::prefillGroupRows): a chunk's,
   // or a prefill group's, for every lane, as where experts stream, or with
-  // groupsOnlySpilling only for a lane whose K/V spills.
+  // groupsOnlySpilling only for a lane whose history spills.
   uint32_t groupRows = model::ExecutionLimits::prefillTokenBudget;
   bool groupsOnlySpilling = false;
   // The most passes over its layers a prefill command runs in
