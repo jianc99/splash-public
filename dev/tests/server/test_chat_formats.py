@@ -32,6 +32,7 @@ from server import protocol as wire
 from server import server as api
 from server.chat_format import FLINT, GLM_ARGS, QWEN, QWEN_XML, ToolCallSyntax
 from server.chat_templates import NATIVE, ChatTemplates
+from server.serve_options import MAX_CONTEXT_TOKENS
 from server.tokenization import PromptTokenizer
 
 TEMPLATE = (
@@ -690,7 +691,7 @@ class FlintPromptTests(unittest.TestCase):
             ]
         )
         backend.post_processor = processors.ByteLevel(trim_offsets=False)
-        cache = PromptTokenizer(tokenizer, FLINT.message_boundary)
+        cache = PromptTokenizer(tokenizer, FLINT.message_boundary, MAX_CONTEXT_TOKENS)
         self.assertTrue(cache.enabled)
         first = "<|user|>" + "Paris 12345 " * 400 + "<|assistant|>"
         later = first + "Sunny.<|user|>And Rome?<|assistant|>"
