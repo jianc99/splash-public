@@ -27,8 +27,22 @@ struct SplashApp: App {
                 .keyboardShortcut("n")
                 .disabled(!state.available)
             }
-            // The toolbar holds the switch between the Server and the Chat; it is not to be hidden.
+            // The toolbar holds the switch to the Chat and the Server's button; it is not to be
+            // hidden. The sidebar is.
             CommandGroup(replacing: .toolbar) {
+                Button(state.showsSidebar ? "Hide Sidebar" : "Show Sidebar") { state.toggleSidebar() }
+                    .keyboardShortcut("b")
+                    .disabled(!state.available || state.section == .server)
+                Button(state.showsDrawer ? "Hide Terminal and Logs" : "Show Terminal and Logs") { state.toggleDrawer() }
+                    .keyboardShortcut("j")
+                    .disabled(!state.available)
+                Button("New Terminal") {
+                    state.newTerminal()
+                    state.showDrawer(.terminal)
+                }
+                .keyboardShortcut("t", modifiers: [.command, .shift])
+                .disabled(!state.available)
+                Divider()
                 Button("Server") { state.section = .server }
                     .keyboardShortcut("1")
                     .disabled(!state.available)
@@ -112,6 +126,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         false
+    }
+
+    /// The chats' files written before the app ends, a reply stopped as it quit among them.
+    func applicationWillTerminate(_ notification: Notification) {
+        state.chats.flush()
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {

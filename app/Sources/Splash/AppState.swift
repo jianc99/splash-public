@@ -6,8 +6,9 @@ import Observation
 /// conversations.
 @MainActor @Observable
 final class AppState {
-    /// The window's two parts: the Server, where models download, start and change, and the Chat
-    /// with the model that runs. The window opens on the Server.
+    /// The window's two parts: the Server, where models download, start and change, which the
+    /// button at the toolbar's end opens, and the Chat with the model that runs. The window opens
+    /// on the Server.
     enum Section: Hashable { case server, chat }
 
     /// Why the app cannot run models here.
@@ -31,6 +32,16 @@ final class AppState {
     /// The open conversation's page, kept while the window shows something else, so that the Chat
     /// shows again at once.
     let transcript: Transcript
+    /// Whether the Chat shows its sidebar, as the toolbar's button and ⌘B have it, from one launch
+    /// to the next.
+    var showsSidebar = UserDefaults.standard.object(forKey: Preference.sidebar) as? Bool ?? true {
+        didSet { UserDefaults.standard.set(showsSidebar, forKey: Preference.sidebar) }
+    }
+    /// The terminals and logs under the window's content, whether they show, as ⌘J has it, and
+    /// the height the user dragged them to.
+    let drawer = Drawer()
+    var showsDrawer = false
+    var drawerHeight: CGFloat = 280
     private(set) var installed: [InstalledModel] = []
     private(set) var blocker: Blocker?
     /// Whether the checks of `launch` are done; nothing starts before.
@@ -154,8 +165,7 @@ final class AppState {
     /// then, in the background, installs the models the Hugging Face cache holds.
     func launch() async {
         defer { launched = true }
-        let runtime = runtime
-        if let reason = await Task.detached(operation: { runtime.unsupportedReason() }).value {
+        if let reason = await runtime.unsupportedReason() {
             blocker = Blocker(title: "This Mac Can’t Run Splash", symbol: "exclamationmark.triangle", message: reason)
             return
         }
@@ -223,11 +233,13 @@ final class AppState {
         installer.install(model)
     }
 
-    /// Stops the download, the model and the installer of cached models for the app to quit, and
-    /// starts nothing after. The last gets SIGINT, as Ctrl+C sends, and SIGTERM 5 s later.
+    /// Stops the download, the model, the drawer's terminals and the installer of cached models for
+    /// the app to quit, and starts nothing after. The installer gets SIGINT, as Ctrl+C sends, and
+    /// SIGTERM 5 s later.
     func quit() {
         quitting = true
         chats.stop()
+        drawer.endAll()
         installer.cancel()
         server.stop()
         if let cachedInstaller {

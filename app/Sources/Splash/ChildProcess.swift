@@ -7,6 +7,8 @@ import Foundation
 /// if the app quits or crashes.
 final class ChildProcess: @unchecked Sendable {
     let pid: pid_t
+    /// When it started (`processStart`), which tells it apart from a later process given its ID.
+    let started: Int?
     private let exitSource: DispatchSourceProcess
 
     /// Starts `command` with `environment`, standard input from /dev/null and standard output and
@@ -52,6 +54,7 @@ final class ChildProcess: @unchecked Sendable {
         let status = posix_spawn(&pid, command[0], &actions, &attributes, argv, envp)
         guard status == 0 else { throw POSIXError(.init(rawValue: status) ?? .EIO) }
         self.pid = pid
+        started = processStart(pid)
 
         exitSource = DispatchSource.makeProcessSource(identifier: pid, eventMask: .exit, queue: .main)
         exitSource.setEventHandler { [exitSource] in
@@ -70,6 +73,63 @@ final class ChildProcess: @unchecked Sendable {
     /// Sends `signal` to the program's process group.
     func signal(_ signal: Int32) {
         killpg(pid, signal)
+    }
+}
+
+/// A program run to its end for what it says on its error output, as the engine's device check
+/// is: its exit status and that output, read as it writes it, so that it never waits on a pipe
+/// nobody reads; nil where it does not start. One still running after `timeout` is ended, and so
+/// is one whose caller no longer waits for it. The read and the wait for its end hold no thread of
+/// Swift's own pool: waitUntilExit there once never returned for a process that had exited.
+enum Program {
+    static func run(_ command: [String], timeout: Duration) async -> (status: Int32, error: String)? {
+        let process = Process(), errors = Pipe()
+        process.executableURL = URL(filePath: command[0])
+        process.arguments = Array(command.dropFirst())
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = errors
+        let ended = AsyncStream<Void> { continuation in process.terminationHandler = { _ in continuation.finish() } }
+        guard (try? process.run()) != nil else { return nil }
+        let deadline = Task {
+            try? await Task.sleep(for: timeout)
+            if process.isRunning { process.terminate() }
+        }
+        defer { deadline.cancel() }
+        return await withTaskCancellationHandler {
+            let error = String(decoding: await reading(errors.fileHandleForReading), as: UTF8.self)
+            await end(ended)
+            return (process.terminationStatus, error)
+        } onCancel: {
+            if process.isRunning { process.terminate() }
+        }
+    }
+
+    /// Waits for `ended`, the stream a process's termination handler finishes, to finish: in a task
+    /// of its own, which the caller's cancellation does not reach. A cancelled task's `for await`
+    /// returns at once, before the process has exited, and terminationStatus, read then, raises
+    /// "task still running".
+    private static func end(_ ended: AsyncStream<Void>) async {
+        await Task { for await _ in ended {} }.value
+    }
+
+    /// Reads what a program writes to `handle` as it writes it, until the program ends: on a thread
+    /// of its own, blocking there, rather than on FileHandle's async bytes, which read every handle
+    /// on one actor.
+    private static func reading(_ handle: FileHandle) async -> Data {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                var data = Data()
+                var chunk = [UInt8](repeating: 0, count: 65536)
+                while true {
+                    let count = read(handle.fileDescriptor, &chunk, chunk.count)
+                    if count < 0 && errno == EINTR { continue }
+                    guard count > 0 else { break }
+                    data.append(contentsOf: chunk[..<count])
+                }
+                continuation.resume(returning: data)
+            }
+        }
     }
 }
 
@@ -111,6 +171,41 @@ final class LogTail {
             if !text.isEmpty { line(text) }
         }
     }
+}
+
+/// A program this app started, as the defaults keep it for the next launch should this one end
+/// without stopping it: its process ID and when it started. Together they name it whichever copy
+/// of the app started it, and never a later process given the same ID.
+struct ChildRecord {
+    let key: String
+
+    /// Keeps `child` as the program this record names.
+    func keep(_ child: ChildProcess) {
+        guard let started = child.started else { return forget() }
+        UserDefaults.standard.set([Int(child.pid), started], forKey: key)
+    }
+
+    func forget() {
+        UserDefaults.standard.removeObject(forKey: key)
+    }
+
+    /// Stops the program kept, if it still runs, and forgets it once it has ended; one still
+    /// running stays kept, for the launch after.
+    func stopLeftover() async {
+        guard let kept = UserDefaults.standard.array(forKey: key) as? [Int], kept.count == 2,
+              let pid = pid_t(exactly: kept[0])
+        else { return forget() }
+        if processStart(pid) == kept[1] { await stopProcessGroup(pid) }
+        if processStart(pid) != kept[1] { forget() }
+    }
+}
+
+/// When process `pid` started, in microseconds since 1970, or nil where no such process runs.
+func processStart(_ pid: pid_t) -> Int? {
+    var info = proc_bsdinfo()
+    let size = Int32(MemoryLayout<proc_bsdinfo>.size)
+    guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, size) == size else { return nil }
+    return Int(info.pbi_start_tvsec) * 1_000_000 + Int(info.pbi_start_tvusec)
 }
 
 /// Stops the process group `pid` leads, as `ChildProcess.signal` would, when this app no longer

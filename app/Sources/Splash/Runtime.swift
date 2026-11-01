@@ -58,12 +58,20 @@ struct Runtime: Sendable {
         return process
     }
 
-    /// The environment of the programs the app runs: the app's own (an app does not get the shell's),
-    /// kept from the user's site-packages in the programs Python starts, and without an API key the
-    /// server would require of the app. Run with -B, the launcher keeps them from writing bytecode.
+    /// The environment of the programs the app runs: `userEnvironment`, kept from the user's
+    /// site-packages in the programs Python starts. Run with -B, the launcher keeps them from
+    /// writing bytecode.
     var environment: [String: String] {
-        var environment = ProcessInfo.processInfo.environment
+        var environment = userEnvironment
         environment["PYTHONNOUSERSITE"] = "1"
+        return environment
+    }
+
+    /// The app's own environment (an app does not get the shell's), without an API key the server
+    /// would require of the app: the drawer's terminals', whose commands are the user's, finding
+    /// the user's site-packages as in their terminal.
+    var userEnvironment: [String: String] {
+        var environment = ProcessInfo.processInfo.environment
         environment.removeValue(forKey: "SPLASH_API_KEY")
         environment.removeValue(forKey: "SPLASH_RUNTIME")
         return environment
@@ -99,31 +107,13 @@ struct Runtime: Sendable {
         return (try? JSONDecoder().decode(Owner.self, from: data))?.pid
     }
 
-    /// Whether `pid` runs this runtime's Python.
-    func runsPython(_ pid: pid_t) -> Bool {
-        var path = [UInt8](repeating: 0, count: Int(MAXPATHLEN))
-        let length = proc_pidpath(pid, &path, UInt32(path.count))
-        guard length > 0 else { return false }
-        return URL(filePath: String(decoding: path.prefix(Int(length)), as: UTF8.self)).resolvingSymlinksInPath()
-            == python.resolvingSymlinksInPath()
-    }
-
     /// Why this Mac cannot run Splash, or nil when it can: the engine's own check, which the
-    /// launcher repeats before every start.
-    func unsupportedReason() -> String? {
-        let process = Process()
-        process.executableURL = engine
-        process.arguments = ["device-check"]
-        let errors = Pipe()
-        process.standardError = errors
-        process.standardOutput = FileHandle.nullDevice
-        guard (try? process.run()) != nil else { return nil }
-        let message = errors.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-        guard process.terminationStatus != 0 else { return nil }
-        return String(decoding: message, as: UTF8.self)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .replacing(#/^error: /#, with: "")
+    /// launcher repeats before every start; nil too where the check does not answer in 30 s.
+    func unsupportedReason() async -> String? {
+        guard let ran = await Program.run([engine.path, "device-check"], timeout: .seconds(30)), ran.status != 0
+        else { return nil }
+        let reason = ran.error.trimmingCharacters(in: .whitespacesAndNewlines).replacing(#/^error: /#, with: "")
+        return reason.isEmpty ? nil : reason
     }
 }
 

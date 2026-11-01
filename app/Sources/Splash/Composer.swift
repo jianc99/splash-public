@@ -140,22 +140,15 @@ private struct ContextRing: View {
     let usage: ContextUsage
 
     var body: some View {
-        ZStack {
-            Circle().stroke(.quaternary, lineWidth: 2)
-            Circle()
-                .trim(from: 0, to: usage.fraction)
-                .stroke(tint, style: StrokeStyle(lineWidth: 2, lineCap: .round))
-                .rotationEffect(.degrees(-90))
-        }
-        .frame(width: 14, height: 14)
-        // Room around the ring for the pointer to find its help.
-        .padding(5)
-        .contentShape(.rect)
-        .animation(Motion.settle, value: usage)
-        .help(usage.explanation)
-        .accessibilityElement()
-        .accessibilityLabel("Context")
-        .accessibilityValue(usage.explanation)
+        Ring(fraction: usage.fraction, tint: tint, size: 14)
+            // Room around the ring for the pointer to find its help.
+            .padding(5)
+            .contentShape(.rect)
+            .animation(Motion.settle, value: usage)
+            .help(usage.explanation)
+            .accessibilityElement()
+            .accessibilityLabel("Context")
+            .accessibilityValue(usage.explanation)
     }
 
     private var tint: AnyShapeStyle {
@@ -164,6 +157,26 @@ private struct ContextRing: View {
         case .tight: AnyShapeStyle(.orange)
         case .full: AnyShapeStyle(.red)
         }
+    }
+}
+
+/// How full something is, as a ring that `fraction`, from 0 to 1, fills in `tint` from the top
+/// clockwise, over a faint track, `size` points across: the context in the Chat's composer
+/// (`ContextRing`), and a download in the Server's button (`ServerButton`).
+struct Ring<Tint: ShapeStyle>: View {
+    let fraction: Double
+    let tint: Tint
+    let size: CGFloat
+
+    var body: some View {
+        ZStack {
+            Circle().stroke(.quaternary, lineWidth: 2)
+            Circle()
+                .trim(from: 0, to: fraction)
+                .stroke(tint, style: StrokeStyle(lineWidth: 2, lineCap: .round))
+                .rotationEffect(.degrees(-90))
+        }
+        .frame(width: size, height: size)
     }
 }
 
@@ -176,8 +189,9 @@ private struct InkCircle: ButtonStyle {
         configuration.label
             .foregroundStyle(.background)
             .frame(width: 28, height: 28)
-            .background(.primary, in: .circle)
-            .opacity(isEnabled ? (configuration.isPressed ? 0.7 : 1) : 0.4)
+            // The mark's color while it sends or stops, the app's one accent; gray while it can't.
+            .background(isEnabled ? AnyShapeStyle(Color.splash) : AnyShapeStyle(.tertiary), in: .circle)
+            .opacity(configuration.isPressed ? 0.7 : 1)
     }
 }
 
@@ -261,6 +275,9 @@ private struct EffortMenu: View {
     }
 }
 
+/// The images attached to a draft, each with a button that takes it off. Each has a hairline, so
+/// that a white one keeps its edge on the composer, and its button a solid disc, which stands out
+/// over any image in either appearance.
 private struct Attachments: View {
     let draft: Draft
 
@@ -275,9 +292,12 @@ private struct Attachments: View {
                                 .scaledToFill()
                                 .frame(width: 56, height: 56)
                                 .clipShape(.rect(cornerRadius: 10))
+                                .overlay { RoundedRectangle(cornerRadius: 10).strokeBorder(.separator) }
                         }
                         Button { draft.remove(at: index) } label: {
-                            Image(systemName: "xmark.circle.fill").symbolRenderingMode(.hierarchical)
+                            Image(systemName: "xmark.circle.fill")
+                                .symbolRenderingMode(.palette)
+                                .foregroundStyle(.white, .black.opacity(0.6))
                         }
                         .buttonStyle(.borderless)
                         .offset(x: 6, y: -6)
