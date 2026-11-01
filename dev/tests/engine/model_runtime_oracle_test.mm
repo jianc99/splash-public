@@ -3275,7 +3275,7 @@ struct SpillOptions final {
 // The pages a request of a block-sparse target keeps whole before those it
 // may spill: its dense history (engine::CacheSpillPolicy::densePages).
 uint32_t densePagesOf(const model::SparseKvShape &shape) {
-  return (shape.denseTokens() + kv::kPageTokens - 1) / kv::kPageTokens;
+  return (shape.denseHistoryTokens + kv::kPageTokens - 1) / kv::kPageTokens;
 }
 
 // FNV-1a of the values' bytes: logits compared bit for bit.

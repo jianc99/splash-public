@@ -98,23 +98,18 @@ struct SpillFloors final {
 
 // A spill-capable target's spill plan beside floors of `floors` bytes; a
 // disabled one for a target that cannot spill, or whose floors cannot hold
-// even an empty Spill request, which then serves what stays resident. A
-// target whose rows read their last tokens through their page tables
-// (SparseKvShape::localTokens) cannot spill: the cache keeps a page Full for
-// rows that read it whole only within the dense history, and a restore or a
-// writer's move onto a spilled block may leave such a page in a holder's
-// window holding only its index.
+// even an empty Spill request, which then serves what stays resident.
 KvSpillPlan planSpill(const StreamedMemoryInputs &in, uint64_t floors) {
   KvSpillPlan spill;
   const kv::Layout &layout = in.kvLayout;
-  if (!in.sparseKv || in.sparseKv->localTokens || !layout.spillable() || !in.tierWritable) return spill;
+  if (!in.sparseKv || !layout.spillable() || !in.tierWritable) return spill;
   const model::SparseKvShape &shape = *in.sparseKv;
   const uint32_t extentPages = layout.maximumExtentPages();
   const SpillFloors spillFloors{
       .layout = layout,
       .geometry = {.fullPageBytes = layout.bytesPerModelPage(),
                    .indexPageBytes = layout.indexBytesPerModelPage(),
-                   .densePages = static_cast<uint32_t>(pagesOf(shape.denseTokens())),
+                   .densePages = static_cast<uint32_t>(pagesOf(shape.denseHistoryTokens)),
                    .windowPages = kSpillWindowPages,
                    .groupPages = in.groupPages},
       .extentPages = extentPages,

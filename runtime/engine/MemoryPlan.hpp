@@ -480,7 +480,8 @@ private:
 // SparseKvShape, with a writable tier), whether every request spills
 // (--kv-spill always, for validation), the history a row may read whole
 // through its page table, the pages the cache keeps Full for it
-// (SparseKvShape::denseTokens, KvSpillPlan::densePages), and the geometry.
+// (SparseKvShape::denseHistoryTokens, KvSpillPlan::densePages), and the
+// geometry.
 struct EngineSpillConfig final {
   bool capable = false;
   bool always = false;

@@ -851,9 +851,7 @@ std::optional<SparseKvShape> sparseKvShape(const QwenTargetDimensions &layout) {
   return SparseKvShape{.blockTokens = layout.indexerBlockTokens,
                        .selectedBlocks = layout.indexerTopBlocks,
                        .verifyRows = ExecutionLimits::targetVerifyRows,
-                       .denseHistoryTokens = layout.indexerTokens(),
-                       .sinkTokens = 0,
-                       .localTokens = 0};
+                       .denseHistoryTokens = layout.indexerTokens()};
 }
 
 } // namespace

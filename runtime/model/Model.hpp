@@ -474,16 +474,13 @@ namespace model {
 // The attention of a block-sparse target, which lets its committed K/V leave
 // memory while each page keeps its blocks' index (kv::PageForm::Index): each
 // verify row of a lane attends at most selectedBlocks blocks of blockTokens
-// tokens. Rows that read the whole of a page table instead (a row with at
-// most denseHistoryTokens of history, its first sinkTokens and its last
-// localTokens) read only Full pages, which the cache keeps for them.
+// tokens. A row with at most denseHistoryTokens of history reads the whole
+// of its page table instead, only Full pages, which the cache keeps for it.
 struct SparseKvShape final {
   uint32_t blockTokens = 0;
   uint32_t selectedBlocks = 0;
   uint32_t verifyRows = 0;
   uint32_t denseHistoryTokens = 0;
-  uint32_t sinkTokens = 0;
-  uint32_t localTokens = 0;
 
   // The hot block cache of spilled K/V (KvBlockCache) in slots a layer: one
   // decoding lane's rows select at most laneSlots(), and while `lanes` lanes
@@ -494,10 +491,6 @@ struct SparseKvShape final {
   [[nodiscard]] constexpr uint64_t requiredSlots(uint32_t lanes) const noexcept {
     return lanes ? (uint64_t{lanes} + 1) * laneSlots() : 0;
   }
-  // The history from its start that a row may read whole through its page
-  // table: its dense history, or its sink tokens if more.
-  [[nodiscard]] constexpr uint32_t denseTokens() const noexcept { return std::max(denseHistoryTokens, sinkTokens); }
-
   bool operator==(const SparseKvShape &) const = default;
 };
 
