@@ -112,11 +112,11 @@ struct KvPageMoveResult final {
 // a page only through the tables of the requests that hold it, so the pool
 // tells the storage which extents hold a page a request holds
 // (ExtentStorage::setExtentActive): only those are resident for commands,
-// and pages only the cache holds cost them nothing. Every command buffer pays
-// for each extent resident for it: 8 GB of extents only the cache held made a
-// streamed Qwen3.8-Flash-Next decode cycle 3.5-5.5% slower (M5 Max with
-// 36 GB), where 8 GB of buffers outside the command queue's residency set
-// cost nothing.
+// with every page in them, so an extent only the cache holds costs them
+// nothing. Every command buffer pays for each extent resident for it: 8 GB of
+// extents only the cache held made a streamed Qwen3.8-Flash-Next decode cycle
+// 3.5-5.5% slower (M5 Max with 36 GB), where 8 GB of buffers outside the
+// command queue's residency set cost nothing.
 class KvPool final {
 public:
   // Allocates the runway, the Full extents that hold pages [0, runwayPages),

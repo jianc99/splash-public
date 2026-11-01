@@ -1947,7 +1947,6 @@ void MetalBackend::setQueueResident(const MetalBuffer &buffer, bool resident) {
     MetalAllocation &allocation = impl_->baseAllocation(buffer);
     if (allocation.reach != BufferReach::Addressed)
         throw MetalBackendError("only a Metal buffer allocated BufferReach::Addressed is queue resident");
-    if (allocation.queueResident == resident) return;
     allocation.queueResident = resident;
     if (allocation.buffer) impl_->residency->stage(allocation.buffer, resident);
 }

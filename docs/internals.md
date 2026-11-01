@@ -1089,8 +1089,8 @@ once and only between commands: memory pressure, an admission the budget denies,
 the publication of a replay point in use or a junction, or startup cleanup.
 Kernels reach a page through the GPU address in its request's page table, so no
 command binds KV; the command queue's residency set holds the pool's extents of
-pages requests hold, and a table takes entries only of pages of those extents
-(`PageStorage::writeEntries`). The host reaches the same memory
+pages requests hold, and a table takes entries only of pages of extents resident
+for commands (`PageStorage::writeEntries`). The host reaches the same memory
 (`PageStorage::spans`), which is how the disk tier moves pages. A reclaim
 returns free pages before it evicts anything: an empty extent as it is, and the
 free pages scattered over the others of its form as soon as they cover the
@@ -1107,8 +1107,8 @@ first, so that a page spills at the memory wall.
 `/status` reports under `kv` the pages of allocated extents (`pages_allocated`),
 those requests and the cache hold (`pages_active`, `pages_cache`) and those
 nothing holds (`pages_free`), the extents of the pages requests hold and their
-bytes (`extents_active`, `active_bytes`), the pool's extents in the command
-queue's residency set, the bytes allocated and the bytes of empty extents
+bytes (`extents_active`, `active_bytes`), the pool's extents resident for
+commands, the bytes allocated and the bytes of empty extents
 (`allocated_bytes`, `reclaimable_bytes`), the extents allocated and released
 (`extent_allocations`, `extent_releases`) and those emptied by moving pages
 (`extent_compactions`, `pages_moved`), and the longest allocation, release and

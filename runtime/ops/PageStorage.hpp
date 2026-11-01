@@ -32,12 +32,12 @@ namespace splash::kv {
 // keeps an extent resident for every command buffer while it is active
 // (setExtentActive), which it is from its allocation, and a table takes
 // entries only of pages of active extents. KvPool keeps an extent active
-// only while a request holds one of its pages, so KV only the cache holds
-// costs commands nothing; the extents of the hot block cache and of history
-// staging, which no pool holds, stay active. The host reaches the same bytes
-// through the page's spans(). Active requests may overwrite slots at or
-// beyond their logical commit index. Cached KV blocks reference only fully
-// committed pages, which are immutable while shared.
+// only while a request holds one of its pages, so an extent only the cache
+// holds costs commands nothing; the extents of the hot block cache and of
+// history staging, which no pool holds, stay active. The host reaches the
+// same bytes through the page's spans(). Active requests may overwrite slots
+// at or beyond their logical commit index. Cached KV blocks reference only
+// fully committed pages, which are immutable while shared.
 class PageStorage final : public ExtentStorage {
 public:
   // pageCount must be a whole number of extents of extentPages pages, a
