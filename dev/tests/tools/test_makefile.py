@@ -238,22 +238,20 @@ class MakefileTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             directory = Path(directory)
             # backend_regression requires the installation, and builds in
-            # BASELINE and in this checkout, its candidate, whose
-            # weight-digests name the options they take in their usage.
+            # BASELINE and in this checkout, its candidate, each with the
+            # benchmark, the library and weight-digests.
             model_root = directory / "model"
             model_root.mkdir()
             (model_root / "model.json").touch()
             baseline, candidate = directory / "baseline", directory / "candidate"
             for checkout in (baseline, candidate):
                 (checkout / "build/engine-tests").mkdir(parents=True)
-                (checkout / backend_regression.BENCHMARK).touch()
-                (checkout / backend_regression.METALLIB).touch()
-                tool = checkout / "build" / weights.WEIGHT_DIGESTS
-                tool.write_text(
-                    "#!/bin/sh\necho 'usage: weight-digests METALLIB MODEL_DIRECTORY "
-                    "[--expert-memory SIZE] [--ple-memory SIZE]' >&2\nexit 2\n"
-                )
-                tool.chmod(0o755)
+                for path in (
+                    backend_regression.BENCHMARK,
+                    backend_regression.METALLIB,
+                    Path("build") / weights.WEIGHT_DIGESTS,
+                ):
+                    (checkout / path).touch()
             variables = (
                 "MODEL=owner/repo",
                 "REVISION=main",

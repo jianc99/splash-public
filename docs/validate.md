@@ -111,9 +111,8 @@ source tree and commits.
 A release is checked once per source identity, and then on each Apple GPU
 family (an Apple9 M3 and an Apple10 M5) against a retained baseline build,
 `BASELINE`: a checkout whose `build/` holds `splash`, `splash.metallib`,
-`engine-tests/backend-benchmark` and, for a build that loads the weights into
-memory (1.2.0 and later), `engine-tests/weight-digests`. `release-check` fails
-without it. The baseline must load the model: it is the previous release's
+`engine-tests/backend-benchmark` and `engine-tests/weight-digests`.
+`release-check` fails without it. The baseline must load the model: it is the previous release's
 build when that loads the model. From a clean checkout:
 
 ```sh
@@ -152,20 +151,19 @@ the other. Per model, `release-check`:
 - compares this build with `BASELINE`, which must have another build
   identity, in ABBA order (`test-performance-real`), every round after the
   first to report a [Neural Engine share](internals.md#neural-engine-prefill) running that
-  share when its build takes one: output tokens and acceptance must be
+  share: output tokens and acceptance must be
   identical (`EXPECT_OUTPUT_CHANGE=1` allows changed outputs with acceptance
   within 0.02; the benchmark verifies every row (`--verify-rows all`), so a
   MoE target's outputs repeat and its times measure the backend, not the
   verify budget of [Drafts](models.md#drafts)), and so must the bytes of the weight images
   both load (`dev/benchmarks/weights.py`); decode and prefill GPU time, with the cold
-  prefills of short prompts (480 to 2016 tokens, one chunk each) when both
-  builds' benchmarks run them, may regress by at most the larger of 2% and
+  prefills of short prompts (480 to 2016 tokens, one chunk each), may regress
+  by at most the larger of 2% and
   twice the run's own ABBA spread, a spread above 5% fails as inconclusive,
   and this build's
   memory plan must hold, without the Neural Engine split, at least the
   context the baseline's holds without it. `ANE_FFN_SHARE=SHARE` runs
-  every round at that share instead, in each build whose benchmark takes one
-  (0: the GPU alone); a baseline whose benchmark takes none must report none.
+  every round at that share instead (0: the GPU alone).
 
 Where the Mac's memory cannot hold a model's weight images, or its largest
 Metal buffer cannot hold one of them, as for Qwen3.8-Flash-Next,
@@ -175,7 +173,7 @@ whose images are recorded and compared ([streamed experts](server.md#streamed-ex
 `--expert-memory SIZE` and `--ple-memory SIZE` that `ORACLE_ARGS` gives the
 runtime oracle, each SIZE a whole number of bytes or of `K`, `M` or `G`, such
 as `7G`, in `verify-models` and in both builds of the comparison with
-`BASELINE`, whose `weight-digests` must take them. The layers' images then
+`BASELINE`. The layers' images then
 leave out their routed experts, and a PLE table that streams has no image
 (`ple.bin`): the engine reads those bytes from the source files, which
 `verify --full` hashes, and the digests do not cover them. Any size a store

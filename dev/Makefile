@@ -176,13 +176,12 @@ test-release-real: preflight $(TARGET) agent-preflight verify-build-identity
 		--http-smoke
 
 # BASELINE is a checkout whose build/ holds another build's splash.metallib,
-# engine-tests/backend-benchmark and, for a build that loads the weights into
-# memory, engine-tests/weight-digests: this build is compared with it on this
-# machine in ABBA order, and so are their weight images
-# (dev/benchmarks/backend_regression.py). Without it, the release scenarios
-# characterize this build alone. ANE_FFN_SHARE, in [0, 1), is the prefill
-# FFN's Neural Engine share every benchmark that takes --ane-ffn-share runs
-# instead of calibrating one (0: the GPU alone).
+# engine-tests/backend-benchmark and engine-tests/weight-digests: this build
+# is compared with it on this machine in ABBA order, and so are their weight
+# images (dev/benchmarks/backend_regression.py). Without it, the release
+# scenarios characterize this build alone. ANE_FFN_SHARE, in [0, 1), is the
+# prefill FFN's Neural Engine share every benchmark runs instead of
+# calibrating one (0: the GPU alone).
 BASELINE ?=
 ANE_FFN_SHARE ?=
 ANE_FFN_SHARE_ARGS = $(if $(ANE_FFN_SHARE),--ane-ffn-share "$(ANE_FFN_SHARE)",)
