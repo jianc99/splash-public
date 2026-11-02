@@ -1,3 +1,4 @@
+#include "EngineHarness.hpp"
 #include "EngineTestSupport.hpp"
 #include "MemoryPasses.hpp"
 #include "TestCache.hpp"
@@ -2003,6 +2004,66 @@ void testAPendingRefusalHoldsItsClaimForTheWaitLimit() {
   require(!config.governor->ledger().claimWaiting(), "the claim held its room past the wait limit");
 }
 
+// Borrowed 3(e): a burst of completions keeps write-behind bounded and delays
+// no decode command. Three requests that resume one cached prompt end
+// within seconds of each other beside a lane that decodes, each leaving a
+// replay point a persistent tier copies behind it: the three points wait at
+// once, the copies start as earlier ones land, never more at once than the
+// tier takes, every point becomes durable, and the decoding lane's commands
+// run back to back throughout.
+void testCompletionBurstKeepsWriteBehindBounded() {
+  test::EngineHarness harness(
+      {.pages = 256,
+       .tier = test::TierOptions{.capacity = 256, .transferLimit = 4, .bytesPerMillisecond = 1.0, .persistent = true},
+       .memory = test::FakeMemory::Config{},
+       .timing = &test::kM6FlashNextQ2});
+  harness.model.keptTier = std::make_shared<OffloadControl>();
+  harness.model.keptTier->ready = true;
+  harness.model.decodeFinishes = false;
+  EngineRequest decoding = harness.request(1, std::vector<uint32_t>(65, 1));
+  decoding.maxNewTokens = 100'000;
+  decoding.deadlineMilliseconds = 1e9;
+  harness.engine.submit(std::move(decoding));
+  // A prompt deep enough to be copied behind (WriteBehind::kMinimumTokens),
+  // cached with its replay point at 2048.
+  std::vector<uint32_t> shared(2060);
+  std::iota(shared.begin(), shared.end(), 10'000);
+  EngineRequest first = harness.request(2, shared);
+  first.deadlineMilliseconds = 1e9;
+  harness.engine.submit(std::move(first));
+  harness.runUntil([&] { return harness.events.usage.contains(2); }, "the first prompt did not finish");
+  for (uint32_t id = 3; id <= 5; ++id) {
+    std::vector<uint32_t> prompt(shared.begin(), shared.begin() + 2048);
+    for (uint32_t token = 0; token < 60; ++token)
+      prompt.push_back(id * 1000 + token);
+    EngineRequest ending = harness.request(id, prompt);
+    ending.maxNewTokens = 4;
+    ending.deadlineMilliseconds = 1e9;
+    harness.engine.submit(std::move(ending));
+  }
+  uint32_t mostInFlight = 0;
+  uint64_t mostWaiting = 0;
+  harness.runUntil(
+      [&] {
+        mostInFlight = std::max(mostInFlight, harness.tier->inFlight());
+        mostWaiting = std::max<uint64_t>(mostWaiting, harness.engine.snapshot().writeBehind.waiting);
+        return harness.events.completedCount == 4 && harness.engine.snapshot().writeBehind.durable == 4;
+      },
+      "the burst's points were not all copied behind it");
+  require(mostWaiting >= 3 && mostInFlight <= 4 && mostInFlight > 0,
+          "the three points did not wait at once, or more copies ran at once than the tier takes: most waiting " +
+              std::to_string(mostWaiting) + ", most in flight " + std::to_string(mostInFlight));
+  const std::vector<test::EngineHarness::Command> &commands = harness.commands();
+  for (size_t index = 1; index < commands.size(); ++index)
+    require(commands[index].startMilliseconds ==
+                commands[index - 1].startMilliseconds + commands[index - 1].wallMilliseconds,
+            "a command waited after the one before it ended");
+  require(!harness.events.usage.contains(1) && harness.events.failedCount == 0,
+          "the decoding lane did not decode throughout");
+  harness.engine.cancel(1);
+  harness.runUntilIdle();
+}
+
 } // namespace
 
 std::span<const test::TestCase> diskTests() {
@@ -2045,6 +2106,7 @@ std::span<const test::TestCase> diskTests() {
       {"testDiskCheckpointStaysUntilItsSuccessorIsPublished", testDiskCheckpointStaysUntilItsSuccessorIsPublished},
       {"testNoCheckpointWithinAChunkOfTheReplayBoundary", testNoCheckpointWithinAChunkOfTheReplayBoundary},
       {"testSkippedCheckpointKeepsPreviousRecoveryPoint", testSkippedCheckpointKeepsPreviousRecoveryPoint},
+      {"testCompletionBurstKeepsWriteBehindBounded", testCompletionBurstKeepsWriteBehindBounded},
   };
   return kTests;
 }

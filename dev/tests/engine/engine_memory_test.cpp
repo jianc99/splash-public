@@ -1,5 +1,7 @@
 #include "CostSeeds.hpp"
+#include "EngineHarness.hpp"
 #include "EngineTestSupport.hpp"
+#include "FakeElasticPool.hpp"
 #include "GovernedHost.hpp"
 #include "MemoryPasses.hpp"
 #include "TestCache.hpp"
@@ -5982,6 +5984,111 @@ void testReplayPointCopiesCacheBeforeTheExpertStore() {
   executor.reservationRoom = {};
 }
 
+// Borrowed 3(f): priority preemption fires when memory, not width, is what a
+// higher-priority start lacks. Beside a Background lane that holds most of
+// the engine's limit, with lanes to spare, a Foreground start the limit
+// refuses takes that lane's memory and runs first.
+void testMemoryNotWidthTriggersPriorityPreemption() {
+  // The engine's limit: seven extents of four pages, the states besides.
+  test::EngineHarness harness({.memory = test::FakeMemory::Config{}, .limits = {.limitBytes = 28 * 4096}});
+  harness.model.decodeFinishes = false;
+  EngineRequest background = harness.request(1, std::vector<uint32_t>(65, 1));
+  background.priority = RequestPriority::Background;
+  background.maxNewTokens = 600;
+  background.deadlineMilliseconds = 1e9;
+  harness.engine.submit(std::move(background));
+  harness.runUntil([&] { return harness.events.outputs[1].size() >= 450; }, "the background lane did not decode");
+  // 515 tokens in five extents; the Foreground prompt's 16 pages need four
+  // more than the three its last extent has free, and two fit.
+  require(harness.model.maximumLanes > 1 && harness.storage.allocatedPages() == 20,
+          "the fixture's lane does not hold five extents with lanes to spare");
+  EngineRequest foreground = harness.request(2, std::vector<uint32_t>(500, 2));
+  foreground.maxNewTokens = 8;
+  foreground.deadlineMilliseconds = 1e9;
+  harness.engine.submit(std::move(foreground));
+  harness.runUntil([&] { return harness.events.usage.contains(2); }, "the foreground request did not finish");
+  require(harness.events.failedCount == 0 && !harness.events.usage.contains(1) &&
+              harness.engine.snapshot().resourceSuspensions == 1,
+          "a foreground start the limit refused beside free lanes did not take the background lane's memory: "
+          "suspensions " + std::to_string(harness.engine.snapshot().resourceSuspensions) + ", failed " +
+              std::to_string(harness.events.failedCount) + ", background done " +
+              std::to_string(harness.events.usage.contains(1)) + ", outputs " +
+              std::to_string(harness.events.outputs[1].size()) + ", pages " +
+              std::to_string(harness.storage.allocatedPages()));
+  harness.runUntilIdle();
+  require(harness.events.completedCount == 2 && harness.events.failedCount == 0 &&
+              harness.events.outputs[1].size() == 600,
+          "the background request did not finish after it gave way");
+}
+
+// Borrowed 3(c): a claim short of X frees at most X and one unit of the
+// expert store more: a lane whose growth the engine's limit refuses by half
+// a unit, with no cache to take, takes back one unit of the store, and the
+// store keeps the rest.
+void testSmallShortfallFreesAtMostOneStoreUnitMore() {
+  constexpr uint64_t kUnit = 16 * 4096;
+  // The store holds four units above its floor of one; beside it the limit
+  // leaves the KV four extents and a page, and the lane needs more than
+  // that and less than a unit more.
+  test::EngineHarness harness(
+      {.pages = 128, .memory = test::FakeMemory::Config{}, .limits = {.limitBytes = 5 * kUnit + 16 * 4096 + 4096}});
+  test::FakeElasticPool experts("experts", *harness.memory, kUnit, 1, 5, 8, 5, 2.5, 80.0);
+  harness.model.experts = &experts;
+  static_cast<void>(harness.governor->ledger().addPool(experts));
+  harness.model.decodeFinishes = false;
+  EngineRequest request = harness.request(1, std::vector<uint32_t>(65, 1));
+  request.maxNewTokens = 700;
+  request.deadlineMilliseconds = 1e9;
+  harness.engine.submit(std::move(request));
+  harness.runUntilIdle();
+  require(harness.events.completedCount == 1 && harness.events.failedCount == 0 &&
+              harness.storage.allocatedPages() > 17 && harness.storage.allocatedPages() <= 32,
+          "the lane did not grow past its room by less than a unit: pages " +
+              std::to_string(harness.storage.allocatedPages()) + ", store units " + std::to_string(experts.units()) +
+              ", failed " + std::to_string(harness.events.failedCount) +
+              (harness.events.failures.empty() ? "" : " (" + harness.events.failureDetails.front().first + ")"));
+  require(experts.shrinks == 1 && experts.units() == 4,
+          "a shortfall of half a store unit took more than one unit of the store");
+}
+
+// Borrowed 3(b): a conversation's KV chain and the state that resumes it
+// leave together. After twelve other conversations pass through a cache the
+// engine's limit holds only part of, the first one's chain is kept to no
+// deeper than a state it resumes from, and its next turn starts there.
+void testKvChainAndItsCheckpointLeaveTogether() {
+  test::EngineHarness harness({.memory = test::FakeMemory::Config{}, .limits = {.limitBytes = 40 * 4096 + 4096}});
+  const auto turn = [&](uint64_t id, const std::vector<uint32_t> &prompt) {
+    EngineRequest next = harness.request(id, prompt);
+    next.maxNewTokens = 1;
+    harness.engine.submit(std::move(next));
+    harness.runUntil([&] { return harness.events.usage.contains(id); }, "a turn did not finish");
+  };
+  std::vector<uint32_t> first(129);
+  std::iota(first.begin(), first.end(), 1);
+  turn(1, first);
+  for (uint32_t id = 2; id <= 13; ++id) {
+    std::vector<uint32_t> other(129);
+    std::iota(other.begin(), other.end(), id * 1000);
+    turn(id, other);
+  }
+  uint32_t kv = 0, resume = 0;
+  {
+    const CacheLookup lookup = harness.cache.lookup(first, {});
+    kv = lookup.kvBoundary;
+    resume = lookup.resumeBoundary();
+  }
+  require(harness.engine.snapshot().resources.stateCache.evictions > 0 || harness.storage.releasedExtents > 0,
+          "twelve conversations did not press the cache");
+  require(kv == resume, "the cache kept " + std::to_string(kv) + " tokens of KV past the state at " +
+                            std::to_string(resume) + " that resumes them");
+  std::vector<uint32_t> next = first;
+  next.insert(next.end(), harness.events.outputs[1].begin(), harness.events.outputs[1].end());
+  next.resize(200, 7);
+  turn(14, next);
+  require(harness.events.starts.back() == resume && harness.events.failedCount == 0,
+          "the next turn did not start where its chain and its state both reach");
+}
+
 } // namespace
 
 std::span<const test::TestCase> memoryTests() {
@@ -6121,6 +6228,9 @@ std::span<const test::TestCase> memoryTests() {
       {"testWindowTrimServesThroughTheHostPause", testWindowTrimServesThroughTheHostPause},
       {"testAllocationCausesRemainDistinct", testAllocationCausesRemainDistinct},
       {"testAdmissionRespectsPriorityBeforeHashOrder", testAdmissionRespectsPriorityBeforeHashOrder},
+      {"testMemoryNotWidthTriggersPriorityPreemption", testMemoryNotWidthTriggersPriorityPreemption},
+      {"testSmallShortfallFreesAtMostOneStoreUnitMore", testSmallShortfallFreesAtMostOneStoreUnitMore},
+      {"testKvChainAndItsCheckpointLeaveTogether", testKvChainAndItsCheckpointLeaveTogether},
   };
   return kTests;
 }

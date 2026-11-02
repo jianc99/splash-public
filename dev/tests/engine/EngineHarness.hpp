@@ -39,6 +39,7 @@ namespace splash::test {
 struct TierOptions final {
   uint32_t capacity = 4, transferLimit = 2;
   std::optional<double> bytesPerMillisecond;  // with it, a transfer lands bytes / rate after it starts
+  bool persistent = false;                    // a persistent tier copies points ahead whatever memory holds
 };
 struct HarnessOptions final {
   uint32_t pages = 64;
@@ -225,7 +226,7 @@ private:
   static std::optional<TestKvTier> kvTier(const HarnessOptions &options) {
     if (!options.tier)
       return std::nullopt;
-    return std::optional<TestKvTier>(std::in_place);
+    return std::optional<TestKvTier>(std::in_place, options.tier->persistent);
   }
   static engine::EngineConfig config(const HarnessOptions &options, std::optional<engine::MemoryGovernor> &governor) {
     engine::EngineConfig result = options.engine;
