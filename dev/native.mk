@@ -81,6 +81,7 @@ TEST_SLOT_RECYCLER_TSAN := $(ENGINE_SANITIZER_BUILD)/slot-recycler-tsan
 TEST_MEMORY_PLAN_ASAN := $(ENGINE_SANITIZER_BUILD)/engine-memory-plan-asan-ubsan
 TEST_MEMORY_AUDIT_ASAN := $(ENGINE_SANITIZER_BUILD)/memory-audit-asan-ubsan
 TEST_STATUS_ASAN := $(ENGINE_SANITIZER_BUILD)/runtime-status-asan-ubsan
+TEST_MEMORY_LEDGER_ASAN := $(ENGINE_SANITIZER_BUILD)/memory-ledger-asan-ubsan
 TEST_MEMORY_TEST := $(ENGINE_TEST_BUILD)/engine-memory-plan
 TEST_VISION_PREPARATION := $(ENGINE_TEST_BUILD)/vision-preparation
 TEST_DRAFT_PREPARATION := $(ENGINE_TEST_BUILD)/draft-preparation
@@ -117,6 +118,9 @@ MODEL_CONFIGS := dev/tests/fixtures/model-configs
 # Real decodes' block selections, which the hot block cache's replacement is
 # checked on (dev/tests/engine/slot_recycler_test.cpp reads them).
 KV_SELECTION_TRACES := dev/tests/fixtures/kv-selection-traces
+# Recorded runs' decode misses and prefill reads, which the memory
+# ledger's rates are replayed over (dev/tests/engine/memory_value_test.cpp).
+RECORDED_LOADS := dev/tests/fixtures/recorded-loads
 TEST_KV_PAGE_CACHE_TEST := $(ENGINE_TEST_BUILD)/kv-page-cache
 TEST_ENGINE_CACHE_TEST := $(ENGINE_TEST_BUILD)/engine-cache
 TEST_CACHE_PROPERTY := $(ENGINE_TEST_BUILD)/cache-property
@@ -140,6 +144,7 @@ TEST_METRICS_TEST := $(ENGINE_TEST_BUILD)/runtime-metrics
 TEST_MODEL_LOADING_TEST := $(ENGINE_TEST_BUILD)/model-loading
 TEST_MEMORY_AUDIT_TEST := $(ENGINE_TEST_BUILD)/memory-audit
 TEST_MEMORY_GOVERNOR_TEST := $(ENGINE_TEST_BUILD)/memory-governor
+TEST_MEMORY_LEDGER := $(ENGINE_TEST_BUILD)/memory-ledger
 TEST_QWEN_STATE_TEST := $(ENGINE_TEST_BUILD)/qwen-state-storage
 TEST_STATUS_TEST := $(ENGINE_TEST_BUILD)/runtime-status
 TEST_Q8_CPU_TEST := $(ENGINE_TEST_BUILD)/q8-paged-kv
@@ -245,6 +250,7 @@ TEST_CPU_TARGETS := $(TEST_SLOT_FILE) $(TEST_SPARSE_ROW_STORE) $(TEST_SSD_READER
 	$(TEST_METRICS_TEST) \
 	$(TEST_MEMORY_AUDIT_TEST) \
 	$(TEST_MEMORY_GOVERNOR_TEST) \
+	$(TEST_MEMORY_LEDGER) \
 	$(TEST_STATUS_TEST) \
 	$(TEST_Q8_CPU_TEST)
 
@@ -318,7 +324,8 @@ SANITIZER_CONFIG_TARGETS := $(TEST_SLOT_FILE_ASAN) $(TEST_SLOT_FILE_TSAN) \
 	$(TEST_SSD_READERS_ASAN) $(TEST_SSD_READERS_TSAN) \
 	$(TEST_ELASTIC_KV_ASAN) $(TEST_ELASTIC_KV_TSAN) \
 	$(TEST_SLOT_RECYCLER_ASAN) $(TEST_SLOT_RECYCLER_TSAN) \
-	$(TEST_MEMORY_PLAN_ASAN) $(TEST_MEMORY_AUDIT_ASAN) $(TEST_STATUS_ASAN)
+	$(TEST_MEMORY_PLAN_ASAN) $(TEST_MEMORY_AUDIT_ASAN) $(TEST_STATUS_ASAN) \
+	$(TEST_MEMORY_LEDGER_ASAN)
 
 # Every native test, benchmark and tool depends on the engine's and the tests'
 # headers, and compiles and links its other prerequisites in the order it
@@ -360,6 +367,9 @@ $(TEST_MEMORY_GOVERNOR_TEST): runtime/metal/DeviceCapabilities.cpp \
 		runtime/engine/MemoryPlan.cpp runtime/engine/MemoryGovernor.cpp \
 		runtime/engine/MemoryLedger.cpp \
 		dev/tests/engine/memory_governor_test.cpp
+$(TEST_MEMORY_LEDGER) $(TEST_MEMORY_LEDGER_ASAN): runtime/metal/DeviceCapabilities.cpp \
+		runtime/engine/MemoryPlan.cpp runtime/engine/MemoryGovernor.cpp runtime/engine/MemoryLedger.cpp \
+		dev/tests/engine/memory_ledger_test.cpp dev/tests/engine/memory_value_test.cpp
 $(TEST_Q8_CPU_TEST): dev/tests/engine/q8_paged_kv_test.cc
 $(TEST_LEGACY_WEIGHT_CACHE): dev/tests/engine/legacy_weight_cache_test.cpp
 
@@ -367,7 +377,7 @@ $(TEST_WEIGHT_SOURCE) $(TEST_GGUF_FILE) $(TEST_MEMORY_TEST) $(TEST_KV_PAGE_CACHE
 		$(TEST_DRAFT_CONTEXT_PLAN_TEST) $(TEST_RAGGED_SCHEDULER_TEST) $(TEST_COST_MODEL) $(TEST_MODEL_BOUNDARY_TEST) \
 		$(TEST_WEIGHT_RESIDENCY) \
 		$(TEST_ELASTIC_KV_TEST) $(TEST_NATIVE_LOOP_TEST) $(TEST_METRICS_TEST) \
-		$(TEST_MEMORY_AUDIT_TEST) $(TEST_MEMORY_GOVERNOR_TEST) $(TEST_STATUS_TEST) \
+		$(TEST_MEMORY_AUDIT_TEST) $(TEST_MEMORY_GOVERNOR_TEST) $(TEST_MEMORY_LEDGER) $(TEST_STATUS_TEST) \
 		$(TEST_Q8_CPU_TEST) $(TEST_SLOT_FILE) $(TEST_SPARSE_ROW_STORE) $(TEST_SSD_READERS) $(TEST_SLOT_RECYCLER) \
 		$(TEST_EXPERT_CHUNK_LAYOUT) $(TEST_VERIFY_BUDGET) \
 		$(TEST_CACHE_DIRECTORY) $(TEST_DISK_SPACE) $(TEST_KV_SLOT_FORMAT) $(TEST_KV_PAGE_TIER_HOST) \
@@ -637,6 +647,7 @@ test-engine-cpu: $(TEST_CPU_TARGETS) $(TEST_ATTENTION_SWEEP) $(TEST_BACKEND_BENC
 	$(TEST_METRICS_TEST)
 	$(TEST_MEMORY_AUDIT_TEST)
 	$(TEST_MEMORY_GOVERNOR_TEST)
+	$(TEST_MEMORY_LEDGER) $(RECORDED_LOADS)
 	$(TEST_STATUS_TEST) dev/tests/engine/status_golden.json
 	$(TEST_Q8_CPU_TEST)
 
@@ -879,6 +890,7 @@ test-sanitizers: $(SANITIZER_CONFIG_TARGETS)
 	$(ASAN_TEST_ENV) $(TEST_MEMORY_PLAN_ASAN)
 	$(ASAN_TEST_ENV) $(TEST_MEMORY_AUDIT_ASAN)
 	$(ASAN_TEST_ENV) $(TEST_STATUS_ASAN) dev/tests/engine/status_golden.json
+	$(ASAN_TEST_ENV) $(TEST_MEMORY_LEDGER_ASAN) $(RECORDED_LOADS)
 
 # The Metal tests of the components whose host steps share their state with
 # the engine thread and the SSD readers, the hot block cache and the history
