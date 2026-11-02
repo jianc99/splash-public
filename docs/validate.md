@@ -351,8 +351,14 @@ schema, and the client times what a user sees.
 | `warm` | per cached depth of `--sizes`, a fresh cold prefix, then 2 discarded and 8 measured ~300-token suffixes after it: the server's prompt time of each (`--trial` picks the texts, the same for every tree); `/status` as `serve1` |
 
 Every request timestamps each content chunk of its stream; its gaps are the
-intervals between consecutive chunks after the first, and a request still
-streaming when a run is cut contributes its open gap.
+intervals between consecutive chunks after the first. Each request may take
+`--request-seconds` from its send (`plan` gives twice the longest request of
+the machine's recorded runs, `longest_request_s` in the spec; `run.py`'s
+default is twice the longest on any machine): one the server keeps streaming
+past it, though its keepalives hold the connection open, ends the scenario as
+the server's failure; in `churn` its client stops, and the end record lists
+every request still open, with its open gap or, before its first token, as
+unanswered.
 
 ```sh
 .venv/bin/python -m dev.benchmarks.serving.run --tree TREE --machine m6 \
@@ -411,7 +417,8 @@ only if the experts were at their cap with pressure normal at Ready. G8 is
 judged on every candidate run of every scenario: a run whose server
 restarted, failed a request, had a Metal failure, or exited, was not ready in
 time or, once ready, did not let its scenario end (a request or `/status` it
-did not answer in time, no idle within 10 minutes) fails G8. A run that
+did not answer in time, a request still streaming past `--request-seconds`,
+no idle within 10 minutes) fails G8. A run that
 `run.py` refused to measure (a port that already answers, a build that is not
 the tree's, an installation that failed) or that its surroundings or the
 cell's void list voided is listed, to be repeated, and fails G8 only on those

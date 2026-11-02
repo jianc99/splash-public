@@ -42,11 +42,24 @@ HEADERS = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/js
 LONG_GAP_SECONDS = 1.0
 # Log2 buckets of gap milliseconds: [0, 2), [2, 4), ..., [2^20, inf).
 GAP_BUCKETS = 21
+# How long a request may take from its send before it is one the server did
+# not answer in time: twice the longest request of the recorded reference
+# runs (p150b2, the M5 Pro at --max-memory 18G, 1068.4 s; owner 13:29: a job
+# past twice its expected time is overdue). plan passes each machine's own
+# (matrix-1.6.0.json, longest_request_s).
+DEADLINE_FACTOR = 2
+REQUEST_SECONDS = DEADLINE_FACTOR * 1068.4
 
 
 class RequestFailed(RuntimeError):
     """A request the server answered with an error, or without a token,
     that ends a scenario (the server's own failure, amend/V.md §5 G8)."""
+
+
+class Deadline(TimeoutError):
+    """A request the server did not end within its time, though it kept the
+    stream alive (server.py writes a keepalive every 2 s while a request
+    runs, so no socket timeout fires): the server's own failure."""
 
 
 def dig(document, path: str):
@@ -106,10 +119,17 @@ class Stream:
     error event of a stream it had begun, which keeps status 200 (the server
     sends it, then [DONE], when the request fails after its first event).
     With a barrier the request is sent once every sender has connected, and
-    its clock starts after the connection; without one, before it."""
+    its clock starts after the connection; without one, before it. A request
+    still streaming `timeout` seconds after its send raises Deadline; the
+    socket's own timeout, as long, ends one the server went silent on."""
 
     def __init__(
-        self, port: int, body: str, timeout: float = 3600, barrier=None, chunks=None
+        self,
+        port: int,
+        body: str,
+        timeout: float = REQUEST_SECONDS,
+        barrier=None,
+        chunks=None,
     ):
         self.chunks: list[float] = [] if chunks is None else chunks
         self.text: list[str] = []
@@ -132,6 +152,10 @@ class Stream:
                 self.error_body = response.read().decode(errors="replace")[:200]
                 return
             for line in response:
+                if time.time() - self.sent > timeout:
+                    raise Deadline(
+                        f"a request still streaming {timeout:g} s after its send"
+                    )
                 if not line.startswith(b"data: {"):
                     continue
                 event = json.loads(line[6:])
@@ -285,23 +309,33 @@ def run_churn(
     base: int = CHURN_DEFAULT_BASE,
     step: int = CHURN_DEFAULT_STEP,
     poll_seconds: float = 2.0,
-    drain_minutes: float | None = None,
+    timeout: float = REQUEST_SECONDS,
 ) -> None:
     """A churn run. Workers send requests until `minutes` have passed and
-    finish the one they have in flight; the run ends 4 s after the last, or
-    `drain_minutes` after the load window, when the end record lists each
-    request still streaming with its open gap."""
+    finish the one they have in flight; the run ends 4 s after the last. A
+    request the server keeps streaming `timeout` seconds after its send ends
+    its worker; the end record lists it, as every request still open, with
+    its open gap or, before its first token, as unanswered, and the run
+    raises Deadline."""
     model = served_model(port)
     recorder = Recorder(directory, label)
     end = recorder.start + minutes * 60
-    # The content chunk times of each request in flight, by tag.
+    # The content chunk times of each request in flight, by tag, and the
+    # requests past their time.
     open_streams: dict[str, list[float]] = {}
+    expired: list[str] = []
 
     def chat(messages, tag):
         chunks: list[float] = []
         with recorder.lock:
             open_streams[tag] = chunks
-        stream = Stream(port, churn_body(model, messages), chunks=chunks)
+        try:
+            stream = Stream(port, churn_body(model, messages), timeout, chunks=chunks)
+        except Deadline as error:
+            recorder.emit("deadline", tag=tag, chunks=len(chunks), error=str(error))
+            with recorder.lock:
+                expired.append(tag)
+            raise
         if not stream.ok:
             # Code 200 for an error event in a stream the server had begun.
             recorder.emit(
@@ -335,11 +369,14 @@ def run_churn(
         round_number, previous = 0, None
         while time.time() < end:
             round_number += 1
-            if previous and round_number % 4 == 0:
-                chat(previous, f"w{index}-resend{round_number}")
-                continue
-            messages = churn_messages(index, round_number, base, step)
-            answer = chat(messages, f"w{index}-r{round_number}")
+            try:
+                if previous and round_number % 4 == 0:
+                    chat(previous, f"w{index}-resend{round_number}")
+                    continue
+                messages = churn_messages(index, round_number, base, step)
+                answer = chat(messages, f"w{index}-r{round_number}")
+            except Deadline:
+                return
             if answer is not None:
                 previous = churn_resend(messages, answer)
 
@@ -356,9 +393,8 @@ def run_churn(
     ]
     for thread in workers:
         thread.start()
-    cut = None if drain_minutes is None else end + drain_minutes * 60
     for thread in workers:
-        thread.join(None if cut is None else max(0.0, cut - time.time()))
+        thread.join()
     time.sleep(4)
     now = time.time()
     with recorder.lock:
@@ -367,10 +403,15 @@ def run_churn(
             for tag, chunks in open_streams.items()
             if chunks
         }
-    recorder.emit("end", open_gaps=open_gaps)
+        unanswered = sorted(tag for tag, chunks in open_streams.items() if not chunks)
+    recorder.emit("end", open_gaps=open_gaps, unanswered=unanswered)
     done.set()
     poller.join(timeout=poll_seconds + 35)
     recorder.close()
+    if expired:
+        raise Deadline(
+            f"requests still streaming {timeout:g} s after their send: {', '.join(sorted(expired))}"
+        )
 
 
 # ----------------------------------------------------------------- ttft
@@ -581,11 +622,12 @@ def run_ttft(
     settle: float = 3.0,
     poll_seconds: float = 0.5,
     text: str | None = None,
+    timeout: float = REQUEST_SECONDS,
 ) -> dict:
     """One concurrency level of the TTFT scenario against a fresh server:
     records LABEL.events.jsonl (start, warm-ups, requests, rounds, summary) and
     LABEL.status.jsonl (/status every `poll_seconds`), and returns the
-    summary."""
+    summary. Each request may take `timeout` seconds (Stream)."""
     if rounds > TTFT_ROUND_SLOTS:
         raise ValueError(f"at most {TTFT_ROUND_SLOTS} rounds")
     text = ttft_corpus() if text is None else text
@@ -606,7 +648,7 @@ def run_ttft(
         conversations, digest = [], hashlib.sha256()
         for c in range(n):
             warm, slot = ttft_conversation(text, n, c)
-            stream = Stream(port, ttft_body(model, warm, 1))
+            stream = Stream(port, ttft_body(model, warm, 1), timeout)
             if not stream.ok:
                 raise RequestFailed(f"warm-up {c}: {stream.status} {stream.error_body}")
             recorder.emit(
@@ -629,9 +671,13 @@ def run_ttft(
                     streams[i] = Stream(
                         port,
                         ttft_body(model, requests[i], TTFT_MAX_TOKENS),
+                        timeout,
                         barrier=barrier,
                     )
                 except Exception as error:  # the round fails and says why
+                    # A sender that failed before the barrier releases the
+                    # others waiting there.
+                    barrier.abort()
                     streams[i] = error
 
             threads = [threading.Thread(target=send, args=(i,)) for i in range(n)]
@@ -725,11 +771,12 @@ def run_serve1(
     samples: int = 3,
     settle: float = 2.0,
     sizes=SERVE1_SIZES,
+    timeout: float = REQUEST_SECONDS,
 ) -> None:
     """Each size's cold prompt `samples` times, one request at a time on an
     idle server: time to first token and decode milliseconds per token. The
     /status each request waited idle for, and the one after the last, are
-    the run's samples."""
+    the run's samples. Each request may take `timeout` seconds (Stream)."""
     model = served_model(port)
     recorder = Recorder(directory, label)
     try:
@@ -747,7 +794,7 @@ def run_serve1(
                         "chat_template_kwargs": {"enable_thinking": False},
                     }
                 )
-                stream = Stream(port, body)
+                stream = Stream(port, body, timeout)
                 if not stream.ok or not stream.chunks:
                     raise RequestFailed(
                         f"serve1 {size}: {stream.status} {stream.error_body}"
@@ -809,18 +856,25 @@ def warm_suffix(prefix: list[dict], depth: int, trial: int, index: int) -> list[
 
 
 def run_warm(
-    port: int, directory: str, label: str, depths, trial: int, settle: float = 2.0
+    port: int,
+    directory: str,
+    label: str,
+    depths,
+    trial: int,
+    settle: float = 2.0,
+    timeout: float = REQUEST_SECONDS,
 ) -> None:
     """The warm-suffix trial `trial` at each cached depth: the same texts for
     every tree, so trees compare trial by trial. The /status each request
-    waited idle for, and the one after the last, are the run's samples."""
+    waited idle for, and the one after the last, are the run's samples.
+    Each request may take `timeout` seconds (Stream)."""
     model = served_model(port)
     recorder = Recorder(directory, label)
     try:
         for depth in depths:
             prefix = warm_prefix(depth, trial)
             recorder.sample(wait_idle(port, settle))
-            cached = Stream(port, ttft_body(model, prefix, 1))
+            cached = Stream(port, ttft_body(model, prefix, 1), timeout)
             if not cached.ok:
                 raise RequestFailed(
                     f"warm {depth}: {cached.status} {cached.error_body}"
@@ -828,7 +882,9 @@ def run_warm(
             for index in range(WARM_DISCARDED + WARM_SUFFIXES):
                 recorder.sample(wait_idle(port, settle))
                 stream = Stream(
-                    port, ttft_body(model, warm_suffix(prefix, depth, trial, index), 1)
+                    port,
+                    ttft_body(model, warm_suffix(prefix, depth, trial, index), 1),
+                    timeout,
                 )
                 if not stream.ok:
                     raise RequestFailed(

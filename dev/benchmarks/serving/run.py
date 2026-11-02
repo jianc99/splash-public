@@ -473,9 +473,10 @@ def parse_args(argv=None):
         "--minutes", type=float, default=15.0, help="churn: the load window"
     )
     parser.add_argument(
-        "--drain-minutes",
+        "--request-seconds",
         type=float,
-        help="churn: how long to wait for requests after it",
+        default=clients.REQUEST_SECONDS,
+        help="how long a request may take from its send (plan: twice the machine's longest recorded)",
     )
     parser.add_argument(
         "--n", default="1,2,4", help="ttft: concurrency levels, a fresh server each"
@@ -639,12 +640,17 @@ def main(argv=None) -> int:
                         step=args.environment.get(
                             "CHURN_STEP", clients.CHURN_DEFAULT_STEP
                         ),
-                        drain_minutes=args.drain_minutes,
+                        timeout=args.request_seconds,
                     )
                     middle.cancel()
                 elif args.scenario == "ttft":
                     summary = clients.run_ttft(
-                        args.port, str(out), part, level, rounds=args.rounds
+                        args.port,
+                        str(out),
+                        part,
+                        level,
+                        rounds=args.rounds,
+                        timeout=args.request_seconds,
                     )
                     note(f"{part} summary {json.dumps(summary)}")
                     if 0 < index < len(levels) - 1 and index == len(levels) // 2:
@@ -656,10 +662,16 @@ def main(argv=None) -> int:
                         part,
                         samples=args.samples,
                         sizes=args.size_list,
+                        timeout=args.request_seconds,
                     )
                 else:
                     clients.run_warm(
-                        args.port, str(out), part, args.size_list, args.trial
+                        args.port,
+                        str(out),
+                        part,
+                        args.size_list,
+                        args.trial,
+                        timeout=args.request_seconds,
                     )
                 # A server gone by the scenario's end failed the run, also
                 # where its clients carried on (a churn client stops at the
@@ -678,7 +690,8 @@ def main(argv=None) -> int:
             except Exception as error:
                 # Past Ready, whatever else ends the scenario is the server's
                 # failure: it exited, or, alive on 127.0.0.1, it did not answer
-                # a request or /status in time or did not go idle.
+                # a request or /status in time (a request it kept streaming
+                # past --request-seconds among them) or did not go idle.
                 code = server.process.poll()
                 raise RunError(
                     f"{type(error).__name__}: {error}"

@@ -1,4 +1,5 @@
 import hashlib
+import http.client
 import http.server
 import json
 import math
@@ -149,7 +150,7 @@ class ClientRequestTests(unittest.TestCase):
         statuses = iter({"n": i} for i in range(10))
 
         class FakeStream:
-            def __init__(self, port, body):
+            def __init__(self, port, body, timeout):
                 self.sent, self.chunks, self.error_body = 0.0, [0.5, 0.6, 0.7], ""
                 self.status = 500 if "Log s2048" in body else 200
                 self.ok = self.status == 200
@@ -191,10 +192,36 @@ def content_event(text):
     return {"choices": [{"index": 0, "delta": {"content": text}}]}
 
 
+KEEPALIVE = object()
+
+
+def keepalives_forever():
+    while True:
+        yield KEEPALIVE
+
+
+def finished(target, seconds=30):
+    """target()'s outcome, ("returned", value) or ("raised", error), or
+    ("running", None) if it has not ended within `seconds`."""
+    outcome = ["running", None]
+
+    def call():
+        try:
+            outcome[:] = ["returned", target()]
+        except Exception as error:
+            outcome[:] = ["raised", error]
+
+    thread = threading.Thread(target=call, daemon=True)
+    thread.start()
+    thread.join(seconds)
+    return tuple(outcome)
+
+
 class StreamingServer:
     """A server on 127.0.0.1 streaming each chat completion, status 200, as
-    server.py does: the role chunk, then the events answer(body) returns,
-    then [DONE]; /status idle."""
+    server.py does: the role chunk, then the events answer(body) returns
+    (KEEPALIVE: server.py's keepalive, 0.05 s after the last write), then
+    [DONE]; /status idle."""
 
     def __init__(self, answer):
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -216,9 +243,17 @@ class StreamingServer:
                 self.send_header("Content-Type", "text/event-stream")
                 self.end_headers()
                 role = {"choices": [{"index": 0, "delta": {"role": "assistant"}}]}
-                for event in [role, *answer(body)]:
-                    self.wfile.write(f"data: {json.dumps(event)}\n\n".encode())
-                self.wfile.write(b"data: [DONE]\n\n")
+                try:
+                    self.wfile.write(f"data: {json.dumps(role)}\n\n".encode())
+                    for event in answer(body):
+                        if event is KEEPALIVE:
+                            time.sleep(0.05)
+                            self.wfile.write(b": splash-keepalive\n\n")
+                        else:
+                            self.wfile.write(f"data: {json.dumps(event)}\n\n".encode())
+                    self.wfile.write(b"data: [DONE]\n\n")
+                except (BrokenPipeError, ConnectionResetError):
+                    pass  # the client ended the request
 
         self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.port = self.server.server_address[1]
@@ -330,6 +365,115 @@ class ErrorEventTests(unittest.TestCase):
                 clients.RequestFailed, "warm 300 suffix 0: 200 .*internal_server_error"
             ):
                 clients.run_warm(fake.port, self.directory, "w", [300], 0, settle=0)
+
+
+class DeadlineTests(unittest.TestCase):
+    """server.py keeps every stream alive with a keepalive every 2 s and sets
+    no deadline of its own, so a request a scheduler or ledger bug starves
+    ends at its time as the server's failure instead of holding the run, and
+    its machine's GPU lock, forever."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.directory = temporary.name
+
+    def events(self, label):
+        path = Path(self.directory) / f"{label}.events.jsonl"
+        return [json.loads(line) for line in path.read_text().splitlines()]
+
+    def test_keepalives_do_not_hold_a_request_open(self):
+        with StreamingServer(lambda body: keepalives_forever()) as fake:
+            outcome = finished(lambda: clients.Stream(fake.port, "{}", timeout=0.5), 10)
+        self.assertEqual(
+            outcome[0], "raised", "keepalives held a request open past its time"
+        )
+        self.assertIsInstance(outcome[1], clients.Deadline)
+
+    def test_churn_fails_a_request_the_server_keeps_open(self):
+        # m6-fn-churn cand: w1's first request stays queued while w0 and w2
+        # keep working, and the server keeps its stream alive.
+        usage = {
+            "choices": [],
+            "usage": {"prompt_tokens": 9000, "completion_tokens": 2},
+        }
+
+        def answer(body):
+            if "Log 1-" in body:
+                yield from keepalives_forever()
+            time.sleep(0.2)
+            yield from (content_event("1"), content_event("2"), usage)
+
+        with (
+            StreamingServer(answer) as fake,
+            mock.patch.object(clients, "CHURN_STAGGER_SECONDS", 0),
+        ):
+            outcome = finished(
+                lambda: clients.run_churn(
+                    fake.port,
+                    self.directory,
+                    "c",
+                    0.01,
+                    [0, 1, 2],
+                    poll_seconds=0.05,
+                    timeout=1,
+                )
+            )
+        self.assertEqual(outcome[0], "raised", outcome)
+        self.assertIsInstance(outcome[1], clients.Deadline)
+        self.assertIn("w1-r1", str(outcome[1]))
+        events = self.events("c")
+        (expired,) = [e for e in events if e["kind"] == "deadline"]
+        self.assertEqual((expired["tag"], expired["chunks"]), ("w1-r1", 0))
+        (end,) = [e for e in events if e["kind"] == "end"]
+        self.assertEqual(end["unanswered"], ["w1-r1"])
+        done = {e["tag"].split("-")[0] for e in events if e["kind"] == "done"}
+        self.assertEqual(done, {"w0", "w2"})
+
+    def test_a_sender_that_fails_before_the_barrier_releases_the_others(self):
+        # m6-fn-ttft cand at N=2: one sender of a round cannot connect; the
+        # one that did does not wait at the barrier for it forever.
+        usage = {
+            "choices": [],
+            "usage": {"prompt_tokens": 2000, "completion_tokens": 1},
+        }
+        connect, lock, refused = (
+            http.client.HTTPConnection.connect,
+            threading.Lock(),
+            [],
+        )
+
+        def refuse_one_sender(connection):
+            with lock:
+                refuse = (
+                    threading.current_thread().name.endswith("(send)") and not refused
+                )
+                if refuse:
+                    refused.append(threading.current_thread().name)
+            if refuse:
+                raise ConnectionRefusedError(61, "Connection refused")
+            return connect(connection)
+
+        with (
+            StreamingServer(lambda body: [content_event("OK"), usage]) as fake,
+            mock.patch.object(http.client.HTTPConnection, "connect", refuse_one_sender),
+        ):
+            outcome = finished(
+                lambda: clients.run_ttft(
+                    fake.port,
+                    self.directory,
+                    "t-n2",
+                    2,
+                    rounds=1,
+                    settle=0,
+                    poll_seconds=0.05,
+                    text=synthetic_corpus(),
+                )
+            )
+        self.assertEqual(outcome[0], "returned", outcome)
+        self.assertEqual((len(refused), outcome[1]["rounds"]), (1, 0))
+        (failed,) = [e for e in self.events("t-n2") if e["kind"] == "round_failed"]
+        self.assertEqual(len(failed["failures"]), 2)
 
 
 class LegacyNumberTests(unittest.TestCase):
@@ -1710,6 +1854,21 @@ class RunTests(unittest.TestCase):
 
         self.assertEqual(
             recorded("wedged", wedged), (1, "server", "TimeoutError: timed out")
+        )
+
+        # A request it kept streaming past --request-seconds.
+        def expired(*args, **kwargs):
+            raise clients.Deadline(
+                "requests still streaming 2137 s after their send: w1-r1"
+            )
+
+        self.assertEqual(
+            recorded("expired", expired),
+            (
+                1,
+                "server",
+                "Deadline: requests still streaming 2137 s after their send: w1-r1",
+            ),
         )
 
         def owing(*args, **kwargs):

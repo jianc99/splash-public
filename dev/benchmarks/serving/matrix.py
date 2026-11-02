@@ -1915,6 +1915,8 @@ def job_script(spec: dict, cell: dict, tree: str, order: str, repeat: int, args)
         args.out,
         # One word: argparse takes a value beginning with "--" only after "=".
         f"--server-args={server_args}",
+        "--request-seconds",
+        f"{clients.DEADLINE_FACTOR * machine['longest_request_s']:g}",
     ]
     if commit:
         command += ["--commit", commit]
