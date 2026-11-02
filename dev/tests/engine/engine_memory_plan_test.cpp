@@ -1,5 +1,6 @@
 #include "TestChecks.hpp"
 #include "engine/MemoryPlan.hpp"
+#include "engine/StreamedMemoryPlan.hpp"
 #include "TestModel.hpp"
 
 #include <array>

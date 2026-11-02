@@ -830,7 +830,7 @@ $(TEST_NATIVE_LOOP_TEST) $(TEST_NATIVE_LOOP_ASAN) $(TEST_NATIVE_LOOP_TSAN): \
 $(TEST_ANE_FFN_CALIBRATION) $(TEST_ANE_FFN_CALIBRATION_ASAN) $(TEST_ANE_FFN_CALIBRATION_TSAN): \
 		runtime/ops/AneFfnCalibration.cpp dev/tests/engine/ane_ffn_calibration_test.cpp
 $(TEST_MEMORY_TEST) $(TEST_MEMORY_PLAN_ASAN): runtime/metal/DeviceCapabilities.cpp \
-		runtime/engine/MemoryPlan.cpp \
+		runtime/engine/MemoryPlan.cpp runtime/engine/StreamedMemoryPlan.cpp \
 		dev/tests/engine/engine_memory_plan_test.cpp
 $(TEST_MEMORY_AUDIT_TEST) $(TEST_MEMORY_AUDIT_ASAN): runtime/metal/DeviceCapabilities.cpp \
 		runtime/engine/MemoryPlan.cpp runtime/engine/MemoryAudit.cpp \

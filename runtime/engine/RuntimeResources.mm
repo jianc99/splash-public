@@ -1,4 +1,5 @@
 #include "engine/RuntimeResources.hpp"
+#include "engine/StreamedMemoryPlan.hpp"
 #include "AwakeClock.hpp"
 #include "Checked.hpp"
 #include "StderrLine.hpp"
