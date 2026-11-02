@@ -82,12 +82,13 @@ private:
 // RAM and on disk, which it is published only with (Cache::stateTailFull).
 class Run final {
 public:
-  // With peeks, the walk's units for a device need are weighed and taken
-  // too (checkPeek).
+  // With peeks, the walk's units for a device or a page need are weighed
+  // and taken too (checkPeek), and in half the runs the tier says how many
+  // demotions it admits (test::RoomTier), which the walk then counts on.
   Run(uint32_t seed, bool windowed, bool peeks = false)
-      : random_(seed), windowed_(windowed), peeks_(peeks), tier_(chance(50)),
+      : random_(seed), windowed_(windowed), peeks_(peeks), tier_(chance(50)), saysRoom_(peeks && chance(50)),
         budget_(std::make_shared<model::DiskBudget>(kSlots * 100)),
-        cache_(pool_, &tier_, budget_,
+        cache_(pool_, saysRoom_ ? static_cast<engine::KvTier *>(&room_) : &tier_, budget_,
                windowed ? std::nullopt : std::optional(CacheSpillPolicy{pick(0, 2), pick(1, 2)}),
                windowed ? std::optional(CacheWindowPolicy{pick(1, 3)}) : std::nullopt) {
     tier_.budget = budget_;
@@ -127,7 +128,7 @@ public:
     cache_.checkInvariants();
   }
 
-  uint64_t exactUnits = 0, unsureUnits = 0;
+  uint64_t exactUnits = 0, unsureUnits = 0, landingUnits = 0;
 
   // Every request ends, every transfer lands, and nothing leaks: the pool's
   // pages and the tier's slots belong to the cache's blocks alone.
@@ -220,48 +221,75 @@ public:
   }
 
   // What the walk weighs its victims to free never exceeds what taking them
-  // frees (testPeekNeverOverstates): for a device need of a drawn class,
-  // reach and timing, the bytes of the first units the walk gives, taken in
-  // order, are at most the bytes the pool releases; an Immediate claim, as
-  // free() does, passes over those that land later. Each unit releases
-  // exactly what it was weighed at while none so far lands later and the
-  // takes so far started no transfer and wrote no state: what the tier
-  // refuses, and the copies a write gives up for room, the walk cannot know
-  // (exactUnits, the others unsureUnits).
+  // frees (testPeekNeverOverstates): for a device or a page need of a drawn
+  // class, reach and timing, a page need met in place or while the host
+  // refuses growth, the bytes of the first units the walk gives, taken in
+  // order, are at most those the pool releases and those take() says the
+  // copies it started complete as they land (laterBytes), and their pages
+  // at most the pages of the need's form that free, now or as demotions
+  // land; an Immediate claim, as free() does, passes over those that land
+  // later. Each unit of a device need releases exactly what it was weighed
+  // at while none so far lands later and the takes so far started no
+  // transfer and wrote no state: what the tier refuses, and the copies a
+  // write gives up for room, the walk cannot know (exactUnits, the others
+  // unsureUnits).
   void checkPeek() {
     const ClaimSpec claim{.cls = std::array{ClaimClass::InService, ClaimClass::Start, ClaimClass::Optional,
                                             ClaimClass::Growth, ClaimClass::Host}[pick(0, 4)],
                           .reach = chance(50) ? ReclaimClass::InUse : ReclaimClass::Ordinary,
                           .timing = chance(50) ? NeedTiming::Immediate : NeedTiming::CanWait};
+    const kv::PageForm form = !chance(50) ? kv::PageForm::Full : windowed_ ? kv::PageForm::Slim : kv::PageForm::Index;
+    const uint32_t stateBuffers = chance(30) ? 1u : 0u;
+    const bool device = chance(50);
     const VictimQuery query{.claim = &claim,
-                            .need = {.bytes = pick(1, 8) * 400ull, .stateBuffers = chance(30) ? 1u : 0u},
+                            .need = device ? Need{.bytes = pick(1, 8) * 400ull, .stateBuffers = stateBuffers}
+                                           : Need{.hostRefused = chance(50), .pages = pick(1, 8), .form = form,
+                                                  .stateBuffers = stateBuffers},
                             .critical = chance(10)};
     std::vector<engine::Victim> victims;
     uint64_t predicted = 0;
+    uint32_t predictedPages = 0;
     for (std::optional<engine::Victim> victim = cache_.peek(query, nullptr); victim && victims.size() < 4;
          victim = cache_.peek(query, &*victim)) {
       if (victim->later && claim.timing == NeedTiming::Immediate)
         continue;
       predicted += victim->bytes;
+      predictedPages += victim->form == form ? victim->pages : 0;
       victims.push_back(*victim);
     }
-    const uint64_t allocated = pool_.allocatedBytes();
+    const auto pagesOf = [&] {
+      return pool_.freePageCount(form) + cache_.returning().landingPages[static_cast<size_t>(form)];
+    };
     const size_t writes = tier_.writes.size();
     const uint64_t offloads = cache_.snapshot().stateCache.offloads;
     bool sure = true;
+    uint64_t freed = 0;
+    uint32_t freedPages = 0;
     for (const engine::Victim &victim : victims) {
       sure = sure && !victim.later;
+      // A windowed cache's trims may take Slim extents for the Full pages
+      // they free.
       const uint64_t before = pool_.allocatedBytes();
-      static_cast<void>(cache_.take(query, victim));
-      const uint64_t freed = before - pool_.allocatedBytes();
+      const uint32_t pagesBefore = pagesOf();
+      const FreeResult taken = cache_.take(query, victim);
+      const uint64_t released = before - std::min(before, pool_.allocatedBytes());
+      require(taken.nowBytes <= released, "a take released " + std::to_string(released) + " bytes, reported " +
+                                              std::to_string(taken.nowBytes));
+      freed += released + taken.laterBytes;
+      const uint32_t pagesAfter = pagesOf();
+      freedPages += pagesAfter - std::min(pagesAfter, pagesBefore);
       sure = sure && tier_.writes.size() == writes && cache_.snapshot().stateCache.offloads == offloads;
+      if (!device)
+        continue;
+      landingUnits += taken.laterBytes != 0;
       ++(sure ? exactUnits : unsureUnits);
-      require(!sure || freed == victim.bytes,
-              "a unit released " + std::to_string(freed) + " bytes, weighed at " + std::to_string(victim.bytes));
+      require(!sure || released == victim.bytes,
+              "a unit released " + std::to_string(released) + " bytes, weighed at " + std::to_string(victim.bytes));
     }
-    require(allocated - pool_.allocatedBytes() >= predicted,
-            "the walk weighed its victims to free more than taking them freed: weighed " +
-                std::to_string(predicted) + ", freed " + std::to_string(allocated - pool_.allocatedBytes()));
+    require(freed >= predicted && freedPages >= predictedPages,
+            "the walk weighed its victims to free more than taking them freed: weighed " + std::to_string(predicted) +
+                " bytes and " + std::to_string(predictedPages) + " pages, freed " + std::to_string(freed) +
+                " bytes and " + std::to_string(freedPages) + " pages");
   }
 
 private:
@@ -457,6 +485,8 @@ private:
   test::TestKvStorage storage_{1024, 100, 4, 10, 30};
   KvPool pool_{storage_, 4};
   test::TestKvTier tier_;
+  test::RoomTier room_{tier_};
+  bool saysRoom_;
   std::shared_ptr<model::DiskBudget> budget_;
   engine::Cache cache_;
   std::shared_ptr<Shelf> shelf_ = std::make_shared<Shelf>();
@@ -499,7 +529,7 @@ void testRandomRuns(uint32_t plainSeeds, uint32_t windowedSeeds) {
 // The same runs with the walk's units for a device need weighed and taken
 // beside the other steps: no unit frees less than the walk weighed.
 void testPeekNeverOverstates(uint32_t plainSeeds, uint32_t windowedSeeds) {
-  uint64_t exact = 0, unsure = 0;
+  uint64_t exact = 0, unsure = 0, landing = 0;
   for (const bool windowed : {false, true})
     for (uint32_t seed = 1; seed <= (windowed ? windowedSeeds : plainSeeds); ++seed) {
       Run run(seed, windowed, true);
@@ -514,9 +544,11 @@ void testPeekNeverOverstates(uint32_t plainSeeds, uint32_t windowedSeeds) {
       }
       exact += run.exactUnits;
       unsure += run.unsureUnits;
+      landing += run.landingUnits;
     }
   std::cout << "cache peek runs ok: " << plainSeeds << " plain seeds, " << windowedSeeds << " windowed; " << exact
-            << " units released what they were weighed at, " << unsure << " after a copy or a write, never more than taken\n";
+            << " units released what they were weighed at, " << unsure << " after a copy or a write, " << landing
+            << " freeing extents as their copies land, never more than taken\n";
 }
 
 } // namespace
