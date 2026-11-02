@@ -1431,6 +1431,40 @@ void testACaptureCutReplansWithARowCap() {
           "the next command did not go on from the boundary");
 }
 
+// A capture cut's row cap holds for the tick that cut the command only: the
+// next tick's admission plans the lane's command uncut, as that tick's
+// planning does, and starts no prompt the command cannot hold. (The first
+// group of the prompt, 6144 rows, ends at its checkpoint at 4096, which the
+// model refuses; its next is a whole command of 8192 rows. The long prompt
+// queued meanwhile would join 4096 rows with its 24 sparing rows at the M6's
+// price, but not 8192.)
+void testARowCapEndsWithItsTick() {
+  test::TestKvStorage storage(2048, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache cache(pool, nullptr, nullptr);
+  Executor model;
+  test::commandShape(4 * model::ExecutionLimits::prefillTokenBudget)(model);
+  RanRows commands;
+  recordPrefills(model, commands);
+  model.denyReservationAt = engine::kPrefillCheckpointTokens;
+  Events events;
+  engine::Engine engine(test::engineConfig({.maxContext = 102400}), cache, model, events);
+  guardReleases(storage, engine);
+  test::seedAsStartup(engine, model, test::kM6FlashNextQ2);
+  engine.submit(request(1, std::vector<uint32_t>(18'096, 7)));
+  double now = 1;
+  static_cast<void>(engine.tick(now++));
+  require(commands == RanRows{{{1, engine::kPrefillCheckpointTokens}}} && engine.snapshot().captureCuts == 1,
+          "the prompt's first group did not end at the boundary whose capture was refused");
+  engine.submit(request(2, std::vector<uint32_t>(24'600, 8)));
+  tickUntil(engine, now, [&] { return commands.size() == 2; }, "the prompt's next command did not run");
+  require(commands[1] == std::vector<std::pair<uint64_t, uint32_t>>{{1, 8192}} &&
+              events.startIds == std::vector<uint64_t>{1},
+          "admission started a prompt the next command did not serve, planned beside the cut command's rows");
+  tickUntil(engine, now, [&] { return idle(engine); }, "the prompts did not end");
+  require(events.completedCount == 2 && events.failedCount == 0, "the prompts did not complete");
+}
+
 // A lane refused its KV leaves the plan: prepare sends the plan back
 // without it, the others keeping what they were granted, and the plan made
 // again runs them; the refused lane runs once memory frees. (The short
@@ -1543,6 +1577,7 @@ std::span<const test::TestCase> commandsTests() {
       {"testALaneJoinsWithTheRowsThatSpareItACommand", testALaneJoinsWithTheRowsThatSpareItACommand},
       {"testTheEstimatesReportWhatPricesTheUnits", testTheEstimatesReportWhatPricesTheUnits},
       {"testACaptureCutReplansWithARowCap", testACaptureCutReplansWithARowCap},
+      {"testARowCapEndsWithItsTick", testARowCapEndsWithItsTick},
       {"testAPartialAdmissionReplansWithoutTheDeniedLane", testAPartialAdmissionReplansWithoutTheDeniedLane},
       {"testReplansPerTickAreBounded", testReplansPerTickAreBounded},
   };

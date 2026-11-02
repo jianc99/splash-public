@@ -274,21 +274,23 @@ bool Engine::tick(double now) {
   // back, so each attempt plans without at least one more lane, or with a
   // lane's rows cut at a state boundary, or after a lane's one conversion.
   std::vector<uint64_t> excluded, refused;
-  for (auto &[id, active] : requests_) {
-    active.rowCap.reset();
+  for (const auto &[id, active] : requests_)
     if (active.lane && active.resourceWait.pending && !resourceRetryReady(active, now))
       excluded.push_back(id);
-  }
   // Lanes prepare held back for a lane that waits for memory wait on once
   // this tick's attempts are over (rewaitHeld), however the tick ends.
-  // So do the states plans sent back kept for their lanes go back.
+  // So do the states plans sent back kept for their lanes go back, and the
+  // lanes' row caps clear: the next tick's admission plans each lane's
+  // command uncut, as its planning does.
   struct HeldWaits final {
     Engine &engine;
     double now;
     ~HeldWaits() {
       engine.rewaitHeld(now);
-      for (auto &[_, active] : engine.requests_)
+      for (auto &[_, active] : engine.requests_) {
         active.keptCaptures.reset();
+        active.rowCap.reset();
+      }
     }
   } const heldWaits{*this, now};
   for (;;) {
