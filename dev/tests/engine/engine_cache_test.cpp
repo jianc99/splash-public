@@ -6002,8 +6002,12 @@ void testVictimCostsFollowCopiesAndReuse() {
           "a state without a copy did not cost its prefill");
 }
 
-// The units of certain reuse keep their place in the walk, marked: the
-// resume point, and a wanted chain's state and the KV it restores through.
+// The units of certain reuse keep their place in the walk, marked for a
+// claim that may take them: the resume point, and a wanted chain's state
+// and the KV it restores through. Growth, and a host short of critical
+// pressure, take none of them: their walk keeps them, a device need's
+// memory reclaims too, so that a request waiting to start restores its
+// chain whole.
 void testResumePointAndWantedChainsAreCertainReuse() {
   test::TestKvStorage storage{16, 100, 1};
   KvPool pool{storage, 16};
@@ -6019,11 +6023,11 @@ void testResumePointAndWantedChainsAreCertainReuse() {
     return prompt;
   };
   const std::vector<uint32_t> wanted = cachePrompt(1, 1000);
-  cachePrompt(2, 5000);
-  cachePrompt(3, 9000);
+  const std::vector<uint32_t> other = cachePrompt(2, 5000);
+  const std::vector<uint32_t> newest = cachePrompt(3, 9000);
   CacheProbe probe = cache.probe(wanted, {});
   cache.setWantedChains({probe.restoredChain()});
-  const ClaimSpec claim{.cls = ClaimClass::Host};
+  const ClaimSpec claim{.cls = ClaimClass::InService};
   const VictimQuery query{.claim = &claim, .need = {.pages = 1}};
   std::vector<engine::Victim> units;
   for (std::optional<engine::Victim> victim = cache.peek(query, nullptr); victim; victim = cache.peek(query, &*victim))
@@ -6036,6 +6040,29 @@ void testResumePointAndWantedChainsAreCertainReuse() {
   require(units.size() == 3 && certain == 2 && !units[1].certainReuse && units[0].certainReuse &&
               units[2].certainReuse,
           "the resume point and the wanted chain's state were not marked in their place");
+  // Growth and a host pass short of critical pressure leave them; a device
+  // need's units release every extent but theirs.
+  for (const ClaimClass cls : {ClaimClass::Host, ClaimClass::Growth}) {
+    const ClaimSpec keeps{.cls = cls};
+    const VictimQuery pages{.claim = &keeps, .need = {.pages = 1}};
+    const std::optional<engine::Victim> first = cache.peek(pages, nullptr);
+    require(first && !first->certainReuse && !cache.peek(pages, &*first),
+            "a claim that may take nothing of certain reuse was offered some");
+  }
+  const ClaimSpec growth{.cls = ClaimClass::Growth};
+  const VictimQuery device{.claim = &growth, .need = {.bytes = pool.allocatedBytes()}};
+  std::vector<engine::Victim> reclaims;
+  for (std::optional<engine::Victim> victim = cache.peek(device, nullptr); victim; victim = cache.peek(device, &*victim))
+    reclaims.push_back(*victim);
+  for (const engine::Victim &victim : reclaims)
+    require(!victim.certainReuse && cache.take(device, victim).outcome == FreeOutcome::Met,
+            "growth took a memory reclaim of certain reuse");
+  cache.refresh(probe, wanted, {});
+  require(!reclaims.empty() && probe.cachedTokens() == 2 * KvCache::pageTokens &&
+              cache.stateResident(probe.restoredChain().back()) &&
+              cache.probe(newest, {}).cachedTokens() == 2 * KvCache::pageTokens &&
+              !cache.probe(other, {}).cachedTokens(),
+          "growth's memory reclaims took the wanted chain or the resume point");
   cache.setWantedChains({});
   uint32_t left = 0;
   for (std::optional<engine::Victim> victim = cache.peek(query, nullptr); victim; victim = cache.peek(query, &*victim))
@@ -6095,6 +6122,133 @@ void testBurstReclaimTakesWholeExtentsOncePerNeed() {
             "a memory reclaim did not take the leaves that empty one extent and release it");
   }
   cache.checkInvariants();
+}
+
+// A device need's units go on past the states its reclaims give up on the
+// way to an extent: the oldest conversation's checkpoint goes first,
+// written as it leaves RAM, then its state, which the tier takes no write
+// of and which drops, leaving its KV dead, and the leaves of the
+// conversations after it, whose extents the next units release. Each unit
+// is weighed at what taking it releases.
+void testDeviceNeedReachesTheLeavesPastTheStates() {
+  test::TestKvStorage storage{48, 100, 4};
+  KvPool pool{storage, 4};
+  engine::Cache cache(pool, nullptr, nullptr);
+  auto control = std::make_shared<TransferControl>();
+  control->ready = true;
+  const auto cachePrompt = [&](uint64_t id, uint32_t pages) {
+    std::vector<uint32_t> prompt(pages * KvCache::pageTokens + 1);
+    std::iota(prompt.begin(), prompt.end(), 1000 * id);
+    cache.beginRequest(id);
+    require(admitTokens(cache, id, prompt.size()).granted(), "a conversation's pages were denied");
+    cache.publishCommittedBlocks(id, prompt, pages * KvCache::pageTokens, {});
+    const std::array blocks{cache.blockAt(id, pages / 2 * KvCache::pageTokens),
+                            cache.blockAt(id, pages * KvCache::pageTokens)};
+    cache.endRequest(id);
+    return blocks;
+  };
+  const std::array<uint64_t, 2> oldest = cachePrompt(1, 8);
+  cache.publishCompositeState(oldest[0], std::make_shared<TieredState>(control), true);
+  cache.publishCompositeState(oldest[1], std::make_shared<TestState>(100), false);
+  for (uint64_t id = 2; id <= 5; ++id)
+    static_cast<void>(cachePrompt(id, 4));
+  static_cast<void>(cache.releaseEmptyExtents(false));
+  const ClaimSpec claim{.cls = ClaimClass::InService};
+  const VictimQuery query{.claim = &claim, .need = {.bytes = pool.allocatedBytes()}};
+  std::vector<engine::Victim> units;
+  for (std::optional<engine::Victim> victim = cache.peek(query, nullptr); victim; victim = cache.peek(query, &*victim))
+    units.push_back(*victim);
+  const uint64_t extent = 4 * 100;
+  require(units.size() == 6 && units[0].stateBuffers == 1 && units[0].later && units[0].bytes == extent,
+          "the first unit did not go past the oldest conversation's checkpoint to an extent");
+  for (const engine::Victim &unit : units) {
+    const uint64_t allocated = pool.allocatedBytes();
+    require(unit.bytes == extent && cache.take(query, unit).outcome == FreeOutcome::Met &&
+                allocated - pool.allocatedBytes() == unit.bytes,
+            "a unit did not release the extent it was weighed at");
+  }
+  require(!pool.allocatedBytes() && cache.snapshot().stateCache.offloads == 1,
+          "the units left extents, or the checkpoint unwritten");
+  cache.checkInvariants();
+}
+
+// A device need's walk weighs a cache of thousands of pages, states on
+// every conversation, in the time of one walk over it, not once per unit
+// and eviction.
+void testDeviceNeedWeighsALargeCacheAtOnce() {
+  constexpr uint32_t kConversations = 120, kPages = 32;
+  test::TestKvStorage storage{(kConversations + 8) * kPages, 100, 64};
+  KvPool pool{storage, 64};
+  engine::Cache cache(pool, nullptr, nullptr);
+  for (uint64_t id = 1; id <= kConversations; ++id) {
+    std::vector<uint32_t> prompt(kPages * KvCache::pageTokens + 1);
+    std::iota(prompt.begin(), prompt.end(), 100'000 * id);
+    cache.beginRequest(id);
+    require(admitTokens(cache, id, prompt.size()).granted(), "a conversation's pages were denied");
+    cache.publishCommittedBlocks(id, prompt, kPages * KvCache::pageTokens, {});
+    cache.publishCompositeState(cache.blockAt(id, kPages / 2 * KvCache::pageTokens), std::make_shared<TestState>(100),
+                                true);
+    cache.publishCompositeState(cache.blockAt(id, kPages * KvCache::pageTokens), std::make_shared<TestState>(100),
+                                false);
+    cache.endRequest(id);
+  }
+  const ClaimSpec claim{.cls = ClaimClass::InService};
+  const VictimQuery query{.claim = &claim, .need = {.bytes = pool.allocatedBytes()}};
+  const auto start = std::chrono::steady_clock::now();
+  uint64_t weighed = 0;
+  uint32_t units = 0;
+  for (std::optional<engine::Victim> victim = cache.peek(query, nullptr); victim; victim = cache.peek(query, &*victim)) {
+    weighed += victim->bytes;
+    ++units;
+  }
+  const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+  const uint64_t allocated = pool.allocatedBytes();
+  require(weighed == allocated && units >= kConversations * kPages / 64,
+          "the walk did not weigh every extent of the cache: " + std::to_string(weighed) + " of " +
+              std::to_string(allocated) + " bytes");
+  require(seconds < 5.0, "weighing the cache's memory reclaims took " + std::to_string(seconds) + " s");
+}
+
+// A state that needs a write frees its memory as a unit that lands later: a
+// claim that cannot wait, of any class, passes over it and starts no write,
+// and one that can wait, growth too, takes it with its write.
+void testImmediateClaimsPassOverStatesThatNeedAWrite() {
+  CacheFixture fixture;
+  auto control = std::make_shared<TransferControl>();
+  control->ready = true;
+  control->capacity = 4;
+  fixture.cache.publishCompositeState(fixture.blocks[0], std::make_shared<TieredState>(control), false);
+  fixture.cache.publishCompositeState(fixture.blocks[1], std::make_shared<TieredState>(control), false);
+  // The resume point, and a state the tier takes no write of, which goes at
+  // once.
+  fixture.publish(2);
+  fixture.publish(3);
+  const auto unitsOf = [&](ClaimClass cls, NeedTiming timing) {
+    const ClaimSpec claim{.cls = cls, .timing = timing};
+    const VictimQuery query{.claim = &claim, .need = {.stateBuffers = 1}};
+    std::vector<engine::Victim> units;
+    for (std::optional<engine::Victim> victim = fixture.cache.peek(query, nullptr); victim;
+         victim = fixture.cache.peek(query, &*victim))
+      units.push_back(*victim);
+    return units;
+  };
+  const auto blockOf = [](const engine::Victim &victim) { return victim.key & ((uint64_t{1} << 56) - 1); };
+  for (const ClaimClass cls : {ClaimClass::InService, ClaimClass::Growth}) {
+    const std::vector<engine::Victim> atOnce = unitsOf(cls, NeedTiming::Immediate);
+    require(!atOnce.empty() && std::ranges::none_of(atOnce, [&](const engine::Victim &victim) {
+              return blockOf(victim) == fixture.blocks[0] || blockOf(victim) == fixture.blocks[1] || victim.later;
+            }),
+            "a claim that cannot wait was offered a state that needs a write");
+  }
+  const std::vector<engine::Victim> waits = unitsOf(ClaimClass::Growth, NeedTiming::CanWait);
+  require(waits.size() >= 2 && blockOf(waits[0]) == fixture.blocks[0] && waits[0].later &&
+              blockOf(waits[1]) == fixture.blocks[1] && waits[1].later,
+          "growth that can wait passed over the states that need a write, or took them as going at once");
+  const ClaimSpec growth{.cls = ClaimClass::Growth};
+  const VictimQuery query{.claim = &growth, .need = {.stateBuffers = 1}};
+  require(fixture.cache.take(query, waits[0]).outcome == FreeOutcome::Met && control->slots == 1 &&
+              !fixture.cache.stateResident(fixture.blocks[0]),
+          "growth did not write the state it took");
 }
 
 int main() {
@@ -6263,6 +6417,9 @@ int main() {
     testResumePointAndWantedChainsAreCertainReuse();
     testInUseUnitsComeOnlyWithReachInUse();
     testBurstReclaimTakesWholeExtentsOncePerNeed();
+    testDeviceNeedReachesTheLeavesPastTheStates();
+    testDeviceNeedWeighsALargeCacheAtOnce();
+    testImmediateClaimsPassOverStatesThatNeedAWrite();
     std::cout << "engine cache tests passed\n";
     return 0;
   } catch (const std::exception &error) {
