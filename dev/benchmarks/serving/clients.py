@@ -102,9 +102,11 @@ def gap_summary(chunks: list[float], run_start: float) -> dict:
 class Stream:
     """One streamed chat completion: its HTTP status, content chunk times
     (appended to `chunks` as they arrive), text, usage and the server's own
-    metrics. With a barrier the request is sent once every sender has
-    connected, and its clock starts after the connection; without one, before
-    it."""
+    metrics, and why the server failed it: the body of an HTTP error, or the
+    error event of a stream it had begun, which keeps status 200 (the server
+    sends it, then [DONE], when the request fails after its first event).
+    With a barrier the request is sent once every sender has connected, and
+    its clock starts after the connection; without one, before it."""
 
     def __init__(
         self, port: int, body: str, timeout: float = 3600, barrier=None, chunks=None
@@ -133,6 +135,8 @@ class Stream:
                 if not line.startswith(b"data: {"):
                     continue
                 event = json.loads(line[6:])
+                if "error" in event:
+                    self.error_body = json.dumps(event["error"])[:200]
                 self.usage = event.get("usage") or self.usage
                 self.metrics = event.get("metrics") or self.metrics
                 for choice in event.get("choices", []):
@@ -143,6 +147,11 @@ class Stream:
         finally:
             connection.close()
             self.ended = time.time()
+
+    @property
+    def ok(self) -> bool:
+        """Whether the server served the request: status 200 and no error."""
+        return self.status == 200 and not self.error_body
 
     @property
     def first(self) -> float | None:
@@ -293,7 +302,8 @@ def run_churn(
         with recorder.lock:
             open_streams[tag] = chunks
         stream = Stream(port, churn_body(model, messages), chunks=chunks)
-        if stream.status != 200:
+        if not stream.ok:
+            # Code 200 for an error event in a stream the server had begun.
             recorder.emit(
                 "http_error", tag=tag, code=stream.status, body=stream.error_body
             )
@@ -597,7 +607,7 @@ def run_ttft(
         for c in range(n):
             warm, slot = ttft_conversation(text, n, c)
             stream = Stream(port, ttft_body(model, warm, 1))
-            if stream.status != 200:
+            if not stream.ok:
                 raise RequestFailed(f"warm-up {c}: {stream.status} {stream.error_body}")
             recorder.emit(
                 "warmup", n=n, conv=c, **ttft_request_record(stream, recorder)
@@ -635,7 +645,7 @@ def run_ttft(
                 if isinstance(s, Exception)
                 else f"{s.status} {s.error_body}"
                 for s in streams
-                if isinstance(s, Exception) or s.status != 200
+                if isinstance(s, Exception) or not s.ok
             ]
             if failures:
                 recorder.emit("round_failed", n=n, round=r, failures=failures)
@@ -738,7 +748,7 @@ def run_serve1(
                     }
                 )
                 stream = Stream(port, body)
-                if stream.status != 200 or not stream.chunks:
+                if not stream.ok or not stream.chunks:
                     raise RequestFailed(
                         f"serve1 {size}: {stream.status} {stream.error_body}"
                     )
@@ -811,7 +821,7 @@ def run_warm(
             prefix = warm_prefix(depth, trial)
             recorder.sample(wait_idle(port, settle))
             cached = Stream(port, ttft_body(model, prefix, 1))
-            if cached.status != 200:
+            if not cached.ok:
                 raise RequestFailed(
                     f"warm {depth}: {cached.status} {cached.error_body}"
                 )
@@ -820,7 +830,7 @@ def run_warm(
                 stream = Stream(
                     port, ttft_body(model, warm_suffix(prefix, depth, trial, index), 1)
                 )
-                if stream.status != 200:
+                if not stream.ok:
                     raise RequestFailed(
                         f"warm {depth} suffix {index}: {stream.status} {stream.error_body}"
                     )

@@ -374,8 +374,9 @@ SHA-256, build id, model, spawn-to-ready seconds and whether the binary had
 started on that Mac before, host memory and pressure, process snapshots at
 the start, middle and end of the scenario while the server serves, the pids
 the run started, and for a run that did not complete why and whose failure
-that was: the server's, which exited, was not ready in time or failed a
-request, or `run.py`'s refusal to measure) and on the M5 Pro
+that was: the server's, which exited, was not ready in time, failed a
+request or, once ready, did not let the scenario end, or `run.py`'s refusal
+to measure) and on the M5 Pro
 `LABEL.idle.jsonl`, its idle time and sleep assertions every 10 s. It refuses any output directory that resolves,
 through whatever symlinks, into `~/.cache/huggingface` or an `install/models`
 directory.
@@ -400,7 +401,8 @@ runs per tree and order, recorded reference runs, gates).
 
 A run of any scenario counts only if it ended with `DONE`, its server never
 restarted and failed no request (an HTTP error but `context_length_exceeded`,
-or a request of a failed TTFT round), it saw no `serious` or `critical`
+an error event in a stream it had begun, a request of a failed TTFT round, or
+one `/status` counts in `requests.failed`), it saw no `serious` or `critical`
 thermal sample, it served the cell's model, no process it did not start was
 among the top five by CPU at 24 % or more (`foreign_cpu_percent` in the spec,
 whose note gives its source), and, on the M5 Pro, its owner neither touched
@@ -408,12 +410,15 @@ it (HIDIdleTime under 10 s) nor had a process the run did not start hold a
 display or system sleep assertion. A TTFT run's concurrency counts only where
 every round it was to run completed its N requests. An ample-memory run counts
 only if the experts were at their cap with pressure normal at Ready. G8 is
-judged on every candidate run of every scenario but those left out for
-anything other than the server's own failures: a run whose server restarted,
-failed a request, or exited or was not ready in time fails G8; one that
+judged on every candidate run of every scenario: a run whose server
+restarted, failed a request, had a Metal failure, or exited, was not ready in
+time or, once ready, did not let its scenario end (a request or `/status` it
+did not answer in time, no idle within 10 minutes) fails G8. A run that
 `run.py` refused to measure (a port that already answers, a build that is not
 the tree's, an installation that failed) or that its surroundings or the
-cell's void list voided is only listed, to be repeated. Copy a tree to another Mac by content
+cell's void list voided is listed, to be repeated, and fails G8 only on those
+failures: its loop's long tick, which its surroundings can cause, is not
+judged. Copy a tree to another Mac by content
 (`rsync --checksum`): `git archive` leaves `dev/tests` and `dev/benchmarks` out
 (`.gitattributes`), and a copy that keeps the files' old times leaves make
 running stale binaries. For a gate, delete the test binary before building it

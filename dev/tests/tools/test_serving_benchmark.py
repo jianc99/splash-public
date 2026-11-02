@@ -1,4 +1,5 @@
 import hashlib
+import http.server
 import json
 import math
 import os
@@ -6,6 +7,7 @@ import re
 import shlex
 import socket
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -150,6 +152,7 @@ class ClientRequestTests(unittest.TestCase):
             def __init__(self, port, body):
                 self.sent, self.chunks, self.error_body = 0.0, [0.5, 0.6, 0.7], ""
                 self.status = 500 if "Log s2048" in body else 200
+                self.ok = self.status == 200
                 self.usage = {"completion_tokens": 3, "prompt_tokens": 300}
 
         def sampled(directory, label):
@@ -172,6 +175,161 @@ class ClientRequestTests(unittest.TestCase):
             with self.assertRaisesRegex(clients.RequestFailed, "serve1 2048: 500"):
                 clients.run_serve1(1, directory, "bad", samples=1, sizes=(300, 2048))
             self.assertEqual(sampled(directory, "bad"), [3, 4])
+
+
+# A request that fails after its stream began: server.py's _sse_error.
+FAILED_EVENT = {
+    "error": {
+        "message": "internal server error",
+        "type": "server_error",
+        "code": "internal_server_error",
+    }
+}
+
+
+def content_event(text):
+    return {"choices": [{"index": 0, "delta": {"content": text}}]}
+
+
+class StreamingServer:
+    """A server on 127.0.0.1 streaming each chat completion, status 200, as
+    server.py does: the role chunk, then the events answer(body) returns,
+    then [DONE]; /status idle."""
+
+    def __init__(self, answer):
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                models = {"data": [{"id": "m"}]}
+                document = models if self.path == "/v1/models" else {}
+                data = json.dumps(document).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def do_POST(self):
+                body = self.rfile.read(int(self.headers["Content-Length"])).decode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                role = {"choices": [{"index": 0, "delta": {"role": "assistant"}}]}
+                for event in [role, *answer(body)]:
+                    self.wfile.write(f"data: {json.dumps(event)}\n\n".encode())
+                self.wfile.write(b"data: [DONE]\n\n")
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.port = self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+class ErrorEventTests(unittest.TestCase):
+    """A request the server fails after the role chunk went out answers 200
+    and ends with an error event: every scenario records it as failed."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.directory = temporary.name
+
+    def events(self, label):
+        path = Path(self.directory) / f"{label}.events.jsonl"
+        return [json.loads(line) for line in path.read_text().splitlines()]
+
+    def test_the_stream_records_the_error_event(self):
+        with StreamingServer(lambda body: [content_event("1"), FAILED_EVENT]) as fake:
+            stream = clients.Stream(fake.port, "{}")
+        self.assertEqual((stream.status, stream.ok), (200, False))
+        self.assertEqual(json.loads(stream.error_body), FAILED_EVENT["error"])
+
+    def test_churn_records_an_http_error(self):
+        # m6-fn-churn cand: the engine fails each request during its
+        # prefill, after the role chunk.
+        def failing(body):
+            time.sleep(0.1)
+            return [FAILED_EVENT]
+
+        with (
+            StreamingServer(failing) as fake,
+            mock.patch.object(clients, "CHURN_STAGGER_SECONDS", 0),
+        ):
+            clients.run_churn(
+                fake.port, self.directory, "c", 0.01, [0, 1, 2], poll_seconds=0.05
+            )
+        kinds = [e["kind"] for e in self.events("c")]
+        self.assertNotIn("done", kinds)
+        errors = [e for e in self.events("c") if e["kind"] == "http_error"]
+        self.assertGreaterEqual(len(errors), 3)
+        self.assertTrue(
+            all(
+                e["code"] == 200 and "internal_server_error" in e["body"]
+                for e in errors
+            )
+        )
+        self.assertEqual(len(matrix.Run(Path(self.directory), "c").errors), len(errors))
+
+    def test_ttft_fails_the_round(self):
+        # m6-fn-ttft cand at N=2: the engine refuses one lane's memory claim
+        # in round 0 after the role chunk went out.
+        usage = {
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 2000,
+                "completion_tokens": 1,
+                "prompt_tokens_details": {"cached_tokens": 1900},
+            },
+        }
+
+        def answer(body):
+            if "Round 0." in body and "Conversation 2.1." in body:
+                return [FAILED_EVENT]
+            return [content_event("OK"), usage]
+
+        with StreamingServer(answer) as fake:
+            summary = clients.run_ttft(
+                fake.port,
+                self.directory,
+                "t-n2",
+                2,
+                rounds=1,
+                settle=0,
+                poll_seconds=0.05,
+                text=synthetic_corpus(),
+            )
+        self.assertEqual(summary["rounds"], 0)
+        (failed,) = [e for e in self.events("t-n2") if e["kind"] == "round_failed"]
+        self.assertEqual(len(failed["failures"]), 1)
+        self.assertTrue(failed["failures"][0].startswith("200 "))
+        self.assertIn("internal_server_error", failed["failures"][0])
+
+    def test_serve1_and_warm_end_on_it(self):
+        # p-serve1 cand: the 300-token request fails after its first token;
+        # s-warm cand: a suffix request fails after its role chunk.
+        with StreamingServer(lambda body: [content_event("1"), FAILED_EVENT]) as fake:
+            with self.assertRaisesRegex(
+                clients.RequestFailed, "serve1 300: 200 .*internal_server_error"
+            ):
+                clients.run_serve1(
+                    fake.port, self.directory, "s", samples=1, settle=0, sizes=(300,)
+                )
+
+        def answer(body):
+            return [FAILED_EVENT] if "Note 0:" in body else [content_event("OK")]
+
+        with StreamingServer(answer) as fake:
+            with self.assertRaisesRegex(
+                clients.RequestFailed, "warm 300 suffix 0: 200 .*internal_server_error"
+            ):
+                clients.run_warm(fake.port, self.directory, "w", [300], 0, settle=0)
 
 
 class LegacyNumberTests(unittest.TestCase):
@@ -432,7 +590,10 @@ class GateTests(unittest.TestCase):
         # the port, and run.py refuses the run. An M5 run is voided because
         # the laptop's owner was on a call, and its loop shows a 5.2 s tick.
         # Both are listed, to be repeated, and fail nothing. A run whose
-        # server exited during the scenario fails G8.
+        # server exited during the scenario fails G8. p-fn-churn-18g on the
+        # M5: the owner touched the laptop at minute 3, and at minute 10 the
+        # engine crashed and was relaunched. The run is listed, to be
+        # repeated, and its crash still fails G8.
         cell = {"name": "c", "machine": "m6", "model": "fn-q2", "scenario": "churn"}
         done = [
             {"tag": f"w{w}-r1", "start": 0, "t": 100, "ttft": 5, "decode_tps": 30}
@@ -452,29 +613,89 @@ class GateTests(unittest.TestCase):
             self.directory / "called.idle.jsonl", [{"hid_idle_s": 3.0, "holders": []}]
         )
         churn_run(
+            self.directory,
+            "crashed",
+            done,
+            [
+                status(0),
+                status(600, transport__restarts=1),
+                status(960, transport__restarts=1),
+            ],
+        )
+        self.run_meta("crashed")
+        write_jsonl(
+            self.directory / "crashed.idle.jsonl", [{"hid_idle_s": 4.0, "holders": []}]
+        )
+        churn_run(
             self.directory, "exited", done, [status(0), status(300)], complete=False
         )
         exit_error = "the server exited -9 during the scenario"
         self.run_meta("exited", complete=False, failure="server", error=exit_error)
         runs = [
             matrix.Run(self.directory, label, "c", "cand", "A")
-            for label in ("refused", "called", "exited")
+            for label in ("refused", "called", "crashed", "exited")
         ]
         for run_ in runs:
             matrix.validate(run_, self.spec, cell)
         verdicts = matrix.churn_cell(cell, self.spec, runs, {}, PRICES)
         self.assertEqual(
             [(v["rule"], v["verdict"]) for v in verdicts],
-            [("G4 G8 G9 exited", stats.FAIL)],
+            [("G8 crashed", stats.FAIL), ("G4 G8 G9 exited", stats.FAIL)],
         )
-        self.assertIn(f"G8: {exit_error}", verdicts[0]["numbers"]["failures"])
+        self.assertEqual(
+            verdicts[0]["numbers"],
+            ["G8: the engine restarted (transport.restarts 0 -> 1)"],
+        )
+        self.assertIn(f"G8: {exit_error}", verdicts[1]["numbers"]["failures"])
         self.assertEqual(
             [(r.label, r.invalid, bool(r.voided)) for r in runs],
             [
                 ("refused", [f"the run did not end with DONE: {refusal}"], True),
                 ("called", ["the laptop was in use (HIDIdleTime 3.0 s)"], True),
+                (
+                    "crashed",
+                    [
+                        "the laptop was in use (HIDIdleTime 4.0 s)",
+                        "the engine restarted (0 -> 1)",
+                    ],
+                    True,
+                ),
                 ("exited", [f"the run did not end with DONE: {exit_error}"], False),
             ],
+        )
+        # The same in a ttft, serve1 or warm cell.
+        self.assertEqual(
+            [
+                (v["rule"], v["verdict"])
+                for v in matrix.g8_verdict(cell, self.spec, runs[2])
+            ],
+            [("G8 crashed", stats.FAIL)],
+        )
+        self.assertEqual(matrix.g8_verdict(cell, self.spec, runs[1]), [])
+
+    def test_a_request_status_counts_failed_makes_the_run_invalid(self):
+        # m6-fn-churn cand: a request the engine failed counts in /status
+        # requests.failed, though its client recorded it as done.
+        cell = {"name": "c", "machine": "m6", "model": "fn-q2", "scenario": "churn"}
+        done = [
+            {"tag": f"w{w}-r1", "start": 0, "t": 100, "ttft": 5, "decode_tps": 30}
+            for w in range(3)
+        ]
+        churn_run(
+            self.directory,
+            "failed",
+            done,
+            [
+                status(0),
+                status(500, requests__failed=1),
+                status(960, requests__failed=1),
+            ],
+        )
+        self.run_meta("failed")
+        run_ = matrix.Run(self.directory, "failed", "c", "cand", "A")
+        matrix.validate(run_, self.spec, cell)
+        self.assertEqual(
+            (run_.invalid, run_.voided), (["requests the server failed: 1"], [])
         )
 
     def test_g8_judges_every_scenarios_candidate_runs(self):
@@ -1392,8 +1613,9 @@ class RunTests(unittest.TestCase):
         self.assertTrue({4242, 4243} <= set(meta["pids"]))
 
     def test_the_servers_own_failures_are_recorded_as_such(self):
-        # A request the server failed, or a server gone by the end of the
-        # scenario, ends the run as the server's failure, which fails G8;
+        # A request the server failed, a server gone by the end of the
+        # scenario, or anything else that ends a scenario once the server is
+        # ready, ends the run as the server's failure, which fails G8;
         # run.py's refusals are recorded by their own kinds.
         exited = {}
 
@@ -1475,9 +1697,28 @@ class RunTests(unittest.TestCase):
         code, failure, error = recorded("refused", connection_refused)
         self.assertEqual((code, failure), (1, "server"))
         self.assertTrue(error.startswith("the server exited -9 during the scenario: "))
+        # p-serve1 cand: alive on 127.0.0.1, the server refuses a request,
+        # leaves its 14K request's stream to time out, or never goes idle.
         exited.clear()
-        with self.assertRaises(ConnectionRefusedError):
-            recorded("alive", connection_refused)
+        self.assertEqual(
+            recorded("alive", connection_refused),
+            (1, "server", "ConnectionRefusedError: [Errno 61] Connection refused"),
+        )
+
+        def wedged(*args, **kwargs):
+            raise TimeoutError("timed out")
+
+        self.assertEqual(
+            recorded("wedged", wedged), (1, "server", "TimeoutError: timed out")
+        )
+
+        def owing(*args, **kwargs):
+            raise RuntimeError("server did not go idle")
+
+        self.assertEqual(
+            recorded("owing", owing),
+            (1, "server", "RuntimeError: server did not go idle"),
+        )
 
     def test_gpu_utilization_reads_ioreg(self):
         line = (

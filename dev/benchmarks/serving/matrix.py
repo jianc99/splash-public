@@ -182,8 +182,9 @@ class Run:
             for e in read_jsonl(path)
         ]
         self.done = {e["tag"]: e for e in events if e.get("kind") == "done"}
-        # Churn's HTTP errors but context_length_exceeded, and each request
-        # of a failed TTFT round.
+        # Churn's HTTP errors but context_length_exceeded (error events of
+        # streams the server had begun among them), and each request of a
+        # failed TTFT round.
         self.errors = [
             failure
             for e in events
@@ -249,6 +250,20 @@ class Run:
             found.append(self.client_gaps()[1])
         return max(found, default=None)
 
+    def failed_in_status(self) -> int:
+        """The largest requests.failed of the run's /status samples (a ttft
+        run's servers each start afresh)."""
+        return max(
+            (value(s["status"], "requests.failed", 0) for s in self.samples), default=0
+        )
+
+    def failed_requests(self) -> int:
+        """How many requests the server failed: its /status count or its
+        clients', whichever is larger. Each sees failures the other may not:
+        /status those of the engine, the clients also those the frontend
+        raised."""
+        return max(self.failed_in_status(), len(self.errors))
+
     def restarts(self) -> tuple | None:
         """transport.restarts at the first sample and its largest, when the
         engine restarted during the run."""
@@ -312,12 +327,13 @@ def assertion_pid(holder: str) -> int | None:
 def validate(run: Run, spec: dict, cell: dict) -> None:
     """Records why a run cannot be used (amend/V.md §5 validity), each reason
     in run.invalid. The server's own failures, an engine restart, a request
-    it failed, or its exit, a start not ready in time or a failed request
-    that ended the run (run.py's `failure`), fail a candidate's G8; every
-    other reason, run.py refusing to measure (a port that answers, a build
-    that is not the tree's, an installation that failed), the run's
-    surroundings or the cell's void list, is also in run.voided: such a run
-    is to be repeated, and judged on nothing."""
+    it failed, or its exit, a start not ready in time, a scenario it did not
+    let end or a failed request that ended the run (run.py's `failure`),
+    fail a candidate's G8; every other reason, run.py refusing to measure (a
+    port that answers, a build that is not the tree's, an installation that
+    failed), the run's surroundings or the cell's void list, is also in
+    run.voided: such a run is to be repeated, and judged on nothing but the
+    server's own failures it also shows, which still fail G8."""
 
     def void(reason: str) -> None:
         run.invalid.append(reason)
@@ -380,8 +396,8 @@ def validate(run: Run, spec: dict, cell: dict) -> None:
             )
         if held:
             void(f"another process held a sleep assertion: {held[0]}")
-    if run.errors:
-        run.invalid.append(f"requests the server failed: {len(run.errors)}")
+    if run.failed_requests():
+        run.invalid.append(f"requests the server failed: {run.failed_requests()}")
     restarted = run.restarts()
     if restarted:
         run.invalid.append(f"the engine restarted ({restarted[0]} -> {restarted[1]})")
@@ -699,16 +715,15 @@ def g8_failures(run: Run, gates: dict) -> list[str]:
     its clients' records and run.py's: an engine restart, a request it
     failed, a Metal failure, a tick of its loop past the GPU wait limit, or
     an exit, a start not ready in time or a failed request that ended the
-    run."""
+    run. A voided run's long tick is not judged: its surroundings (another
+    GPU load, heat) can make one, and they cause none of the others."""
     failures = []
     restarted = run.restarts()
     if restarted:
         failures.append(
             f"G8: the engine restarted (transport.restarts {restarted[0]} -> {restarted[1]})"
         )
-    failed = max(
-        (value(s["status"], "requests.failed", 0) for s in run.samples), default=0
-    )
+    failed = run.failed_in_status()
     if failed or run.errors:
         failures.append(
             f"G8: {failed} failed requests in /status, {len(run.errors)} at the client"
@@ -720,7 +735,7 @@ def g8_failures(run: Run, gates: dict) -> list[str]:
     ):
         failures.append("G8: a Metal failure")
     ticks = [value(s["status"], "loop.max_tick_ms", 0) for s in run.samples]
-    if ticks and max(ticks) >= gates["max_tick_ms"]:
+    if not run.voided and ticks and max(ticks) >= gates["max_tick_ms"]:
         failures.append(f"G8: loop.max_tick_ms {max(ticks):.0f}")
     if run.meta.get("failure") in SERVER_FAILURES:
         failures.append(f"G8: {run.meta.get('error')}")
@@ -899,11 +914,15 @@ def churn_cell(
     # G4, G8 and G9 are judged on every candidate run (amend/V.md §5) but
     # the voided: one the server's own failures made unusable fails G8; one
     # run.py refused to measure or its surroundings voided (heat, other
-    # processes, the laptop's owner) is only listed under the runs not used,
-    # to be repeated.
+    # processes, the laptop's owner) is listed under the runs not used, to be
+    # repeated, and judged on G8 alone, which fails on the server's own
+    # failures it also shows.
     g4_holds = True
     for run in runs:
-        if run.tree not in cell.get("health", ["cand"]) or run.voided:
+        if run.tree not in cell.get("health", ["cand"]):
+            continue
+        if run.voided:
+            verdicts.extend(g8_verdict(cell, spec, run))
             continue
         facts = health(run, machine, gates)
         g4_holds &= not any(f.startswith("G4") for f in facts["failures"])
@@ -1308,11 +1327,15 @@ def unused_entry(cell: dict, label: str, tree: str, reasons: list[str]) -> dict:
 
 
 def g8_verdict(cell: dict, spec: dict, run: Run) -> list[dict]:
-    """G8 of a validated ttft, serve1 or warm run of a candidate tree, unless
-    voided (a churn run's is part of its health in churn_cell)."""
-    if run.tree not in cell.get("health", ["cand"]) or run.voided:
+    """G8 of a validated run of a candidate tree: of a ttft, serve1 or warm
+    run, and of a voided churn run (a used one's is part of its health in
+    churn_cell). A voided run passes nothing: it shows only a FAIL, on the
+    server's own failures."""
+    if run.tree not in cell.get("health", ["cand"]):
         return []
     failures = g8_failures(run, spec["gates"])
+    if run.voided and not failures:
+        return []
     return [
         {
             "cell": cell["name"],

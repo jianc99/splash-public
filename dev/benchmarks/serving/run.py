@@ -81,7 +81,9 @@ class RunError(RuntimeError):
 
 
 # The server's own failures, which fail a candidate's G8 (amend/V.md §5): it
-# exited or was not ready in time, or it failed a request.
+# exited, was not ready in time or, once ready, ended its scenario otherwise
+# (a request or /status it did not answer in time, a wait for idle it
+# outlasted), or it failed a request.
 SERVER_FAILURES = ("server", "request")
 
 
@@ -669,15 +671,19 @@ def main(argv=None) -> int:
                     )
                 if index == len(levels) - 1:
                     snapshots.append(ps_snapshot(ours))
+            except RunError:
+                raise
             except clients.RequestFailed as error:
                 raise RunError(str(error), "request") from error
-            except OSError as error:
-                # A request or /status the server no longer answered: its own
-                # failure once it has exited, else not.
-                if server.process.poll() is None:
-                    raise
+            except Exception as error:
+                # Past Ready, whatever else ends the scenario is the server's
+                # failure: it exited, or, alive on 127.0.0.1, it did not answer
+                # a request or /status in time or did not go idle.
+                code = server.process.poll()
                 raise RunError(
-                    f"the server exited {server.process.returncode} during the scenario: {error}",
+                    f"{type(error).__name__}: {error}"
+                    if code is None
+                    else f"the server exited {code} during the scenario: {error}",
                     "server",
                 ) from error
             finally:
