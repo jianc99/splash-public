@@ -36,14 +36,22 @@ inline constexpr double kHostSettleMilliseconds = 1000.0;
 // lifetime lies past every retake recorded and 60 s stays within it.
 inline constexpr double kValueHorizonSeconds = 60.0;
 // The time constant of the measured rates: pools' ghost hits, scan reads and
-// takes, the cache's reuse, the KV tier's throughput. The smallest of 10, 30,
-// 60 and 120 s at which the recorded M6 runs' decode misses and prefill reads,
-// replayed through PoolRate at the control pass's 500 ms, change by less, at
-// P95 over passes of steady load, than half the relative hysteresis a
-// 1023 MiB store chunk's cycle cost gives it at the run's value (1.9-2.2 %):
-// at 30 s 2 of the 38 runs of the trees 1.6.0 builds on fail (mMNa, mSl:
-// 1.05x), at 60 s none; only 1.5.0's six and fn15b of the old store fail
-// there (memory_value_test replays two of them).
+// takes, the cache's reuse, the KV tier's throughput. amend/M.md's rule asks
+// the smallest of 10, 30, 60 and 120 s at which every recorded run's decode
+// misses and prefill reads, replayed through PoolRate at the control pass's
+// 500 ms, change by less, at P95 over passes of steady load, than half the
+// relative hysteresis a 1023 MiB store chunk's cycle (refill and compaction)
+// gives it at the run's value. None meets it over every run: of the M6's 45,
+// at 60 s 1.5.0's m150a (1.68x), m150b (1.06x), m150a2 (1.02x) and fn15b
+// (1.11x) fail, at 120 s m150b (1.04x) and fn15b (1.17x); of the Studio's 63
+// Flash-Next runs (valued at its 18G store's 0.0071 misses a token a slot:
+// its 6681-slot runs against its 5672-slot ones), at 60 s s150Fa (1.23x)
+// and the three 2-minute q runs (1.6-2.3x), at 120 s the q runs; its five
+// 35B runs have no pinned-store pair to value them. 60 s is the smallest at
+// which every 15-minute run of the trees 1.6.0 builds on passes (at 30 s
+// mMNa and mSl fail, 1.05x): the exclusion is open (merge report). The cycle
+// counts a refill the ledger does not price until pools report keyBytes
+// (MemoryLedger.cpp). memory_value_test replays mMNa and pFa.
 inline constexpr double kRateTimeConstantSeconds = 60.0;
 
 struct AccountId final {

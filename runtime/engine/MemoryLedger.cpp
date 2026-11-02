@@ -71,7 +71,9 @@ struct Lacking final {
 // The B1 inputs (amend/M.md) model::ElasticPool does not report yet: the
 // bytes that would hold every key it serves, those one miss reads, and those
 // its prefill loads read on misses. Unreported, they price no scan and no
-// refill.
+// refill: a pool's value counts no prefill read (B8) and growth's cycle no
+// refill (B4) until PoolState::wholeBytes and PoolValue::keyBytes and
+// scanReadBytes exist and are read here.
 struct PoolInputs final {
   uint64_t missingBytes = 0;
   uint64_t keyBytes = 0;
