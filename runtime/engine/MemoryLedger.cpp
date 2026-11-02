@@ -68,18 +68,9 @@ struct Lacking final {
   }
 };
 
-// The B1 inputs (amend/M.md) model::ElasticPool does not report yet: the
-// bytes that would hold every key it serves, those one miss reads, and those
-// its prefill loads read on misses. Unreported, they price no scan and no
-// refill: a pool's value counts no prefill read (B8) and growth's cycle no
-// refill (B4) until PoolState::wholeBytes and PoolValue::keyBytes and
-// scanReadBytes exist and are read here.
-struct PoolInputs final {
-  uint64_t missingBytes = 0;
-  uint64_t keyBytes = 0;
-  uint64_t scanReadBytes = 0;
-};
-PoolInputs inputs(const model::PoolState &, const model::PoolValue &) noexcept { return {}; }
+// The bytes of the keys a pool does not hold, over which its scan reads
+// spread (value::poolUnit); none when it reports no whole size.
+uint64_t missingBytes(const model::PoolState &state) noexcept { return less(state.wholeBytes, state.currentBytes); }
 
 } // namespace
 
@@ -157,9 +148,7 @@ void MemoryLedger::observePools(double nowSeconds, bool commandsRan) {
   for (Account &account : accounts_) {
     if (!account.pool)
       continue;
-    const model::PoolValue counters = account.pool->value();
-    const PoolInputs more = inputs(account.pool->state(), counters);
-    account.rate.observe(counters, more.scanReadBytes, account.taken, nowSeconds, commandsRan);
+    account.rate.observe(account.pool->value(), account.taken, nowSeconds, commandsRan);
   }
 }
 
@@ -315,7 +304,6 @@ MemoryLedger::DryRun MemoryLedger::dryRun(const ClaimSpec &spec, const VictimQue
     // A pool's reading, and the bytes above its floor the run has taken.
     model::PoolState state;
     model::PoolValue counters;
-    PoolInputs more;
     uint64_t taken = 0;
     bool pendingOffered = false;
   };
@@ -328,7 +316,7 @@ MemoryLedger::DryRun MemoryLedger::dryRun(const ClaimSpec &spec, const VictimQue
       head.pendingOffered = true;
       head.pending = true;
       const UnitCost cost = value::poolUnit(account.rate, head.counters, account.pendingGrowth,
-                                            head.more.missingBytes, spec.holdSeconds, rates_);
+                                            missingBytes(head.state), spec.holdSeconds, rates_);
       return Victim{.bytes = account.pendingGrowth, .cost = {.ratePerSecond = cost.ratePerSecond}};
     }
     const uint64_t above = less(head.state.currentBytes, head.state.floorBytes);
@@ -337,7 +325,7 @@ MemoryLedger::DryRun MemoryLedger::dryRun(const ClaimSpec &spec, const VictimQue
     const uint64_t bytes = std::min(head.state.releaseUnitBytes, above - head.taken);
     return Victim{.key = head.taken / head.state.releaseUnitBytes,
                   .bytes = bytes,
-                  .cost = value::poolUnit(account.rate, head.counters, bytes, head.more.missingBytes,
+                  .cost = value::poolUnit(account.rate, head.counters, bytes, missingBytes(head.state),
                                           spec.holdSeconds, rates_)};
   };
   for (size_t index = 0; index < sources_.size(); ++index)
@@ -349,7 +337,6 @@ MemoryLedger::DryRun MemoryLedger::dryRun(const ClaimSpec &spec, const VictimQue
     Head head{.pool = AccountId{static_cast<uint8_t>(index)},
               .state = account.pool->state(),
               .counters = account.pool->value()};
-    head.more = inputs(head.state, head.counters);
     head.victim = poolUnit(head);
     heads.push_back(std::move(head));
   }
@@ -624,10 +611,9 @@ bool MemoryLedger::grow(uint64_t freeBytes, const GrowthHost &host) {
     const Account &account = accounts_[index];
     const model::PoolState state = account.pool->state();
     const model::PoolValue counters = account.pool->value();
-    const PoolInputs more = inputs(state, counters);
     return Candidate{index, state.growUnitBytes,
-                     value::growthBenefit(account.rate, counters, state.growUnitBytes, more.missingBytes, rates_),
-                     value::cycleSeconds(counters, more.keyBytes, state.growUnitBytes)};
+                     value::growthBenefit(account.rate, counters, state.growUnitBytes, missingBytes(state), rates_),
+                     value::cycleSeconds(counters, state.growUnitBytes)};
   };
   for (size_t index = 1; index < accounts_.size(); ++index) {
     Account &account = accounts_[index];
@@ -720,7 +706,7 @@ void MemoryLedger::fill(MemoryGovernorSnapshot &snapshot, uint64_t chargedBytes)
       row.unitBytes = state.releaseUnitBytes ? state.releaseUnitBytes : state.growUnitBytes;
       if (row.unitBytes)
         row.valuePerGiB = value::poolUnit(account.rate, counters, row.unitBytes,
-                                          inputs(state, counters).missingBytes, kValueHorizonSeconds, rates_)
+                                          missingBytes(state), kValueHorizonSeconds, rates_)
                               .at(kValueHorizonSeconds) *
                           kGiB / double(row.unitBytes);
     } else {

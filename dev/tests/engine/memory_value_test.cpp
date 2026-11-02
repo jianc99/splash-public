@@ -49,12 +49,11 @@ value::PoolRate observed(double ghostsPerSecond, double hitsPerSecond, double sc
                          double seconds = 30.0) {
   value::PoolRate rate;
   model::PoolValue counters{.ghostBytes = ghostBytes};
-  uint64_t scan = 0;
   for (double t = 0.0; t <= seconds; t += 0.5) {
-    rate.observe(counters, scan, 0, t, true);
+    rate.observe(counters, 0, t, true);
     counters.ghostHits += static_cast<uint64_t>(std::llround(ghostsPerSecond * 0.5));
     counters.hits += static_cast<uint64_t>(std::llround(hitsPerSecond * 0.5));
-    scan += static_cast<uint64_t>(std::llround(scanBytesPerSecond * 0.5));
+    counters.scanReadBytes += static_cast<uint64_t>(std::llround(scanBytesPerSecond * 0.5));
   }
   return rate;
 }
@@ -68,10 +67,10 @@ void testRatesStartFromTheirFirstMeasurement() {
   require(rate.ghostHitsPerSecond() == 0.0 && rate.hitsPerSecond() == 0.0 && rate.scanReadBytesPerSecond() == 0.0 &&
               rate.takesPerSecond() == 0.0 && rate.ghostBytes() == 0.0,
           "a rate is not zero before its first interval");
-  rate.observe({.hits = 10, .ghostHits = 20, .ghostBytes = 4096}, 100, 1, 0.0, true);
-  rate.observe({.hits = 60, .ghostHits = 70, .ghostBytes = 4096}, 600, 3, 0.5, false);
+  rate.observe({.hits = 10, .ghostHits = 20, .ghostBytes = 4096, .scanReadBytes = 100}, 1, 0.0, true);
+  rate.observe({.hits = 60, .ghostHits = 70, .ghostBytes = 4096, .scanReadBytes = 600}, 3, 0.5, false);
   require(rate.ghostHitsPerSecond() == 0.0, "an interval without commands set a rate");
-  rate.observe({.hits = 110, .ghostHits = 170, .ghostBytes = 8192}, 1100, 4, 1.0, true);
+  rate.observe({.hits = 110, .ghostHits = 170, .ghostBytes = 8192, .scanReadBytes = 1100}, 4, 1.0, true);
   require(rate.hitsPerSecond() == 100.0 && rate.ghostHitsPerSecond() == 200.0 &&
               rate.scanReadBytesPerSecond() == 1000.0 && rate.takesPerSecond() == 2.0 && rate.ghostBytes() == 8192.0,
           "the first interval with commands did not set the rates");
@@ -91,14 +90,16 @@ void testRatesStartFromTheirFirstMeasurement() {
 // 0.21 s. Without a release measured, no release is priced.
 void testCycleCostIncludesCompaction() {
   const uint64_t unit = 1023 * kMiB;
-  const model::PoolValue store{.missMilliseconds = 0.1846, .releasedBytes = 2 * unit, .releaseMilliseconds = 125.4};
+  model::PoolValue store{
+      .missMilliseconds = 0.1846, .releasedBytes = 2 * unit, .releaseMilliseconds = 125.4, .keyBytes = kSlotBytes};
   const double refill = double(unit) / kSlotBytes * 0.1846 / 1000.0;
-  require(std::abs(value::cycleSeconds(store, kSlotBytes, unit) - (refill + 0.0627)) < 1e-9 &&
-              std::abs(value::cycleSeconds(store, kSlotBytes, unit) - 0.206) < 0.005,
+  require(std::abs(value::cycleSeconds(store, unit) - (refill + 0.0627)) < 1e-9 &&
+              std::abs(value::cycleSeconds(store, unit) - 0.206) < 0.005,
           "the cycle is not the refill and the compaction");
-  require(std::abs(value::cycleSeconds(store, 0, unit) - 0.0627) < 1e-9,
+  store.keyBytes = 0;
+  require(std::abs(value::cycleSeconds(store, unit) - 0.0627) < 1e-9,
           "with no key reported the cycle is not the compaction alone");
-  require(value::cycleSeconds({.missMilliseconds = 0.1846}, 0, unit) == 0.0, "an unmeasured release was priced");
+  require(value::cycleSeconds({.missMilliseconds = 0.1846}, unit) == 0.0, "an unmeasured release was priced");
 }
 
 // Units no lane uses cost nothing: the hot block cache while no lane decodes
@@ -196,7 +197,7 @@ void testGrowthPaysOnlyWhatARetakeCosts() {
   require(value::growsIntoFreeRoom(untaken, 0.0, 1.0), "an untaken pool did not grow unconditionally");
   value::PoolRate retaken;
   for (uint64_t step = 0; step <= 400; ++step)
-    retaken.observe({}, 0, step / 40, step * 0.5, true);
+    retaken.observe({}, step / 40, step * 0.5, true);
   const double share = 1.0 - std::exp(-retaken.takesPerSecond() * kValueHorizonSeconds);
   require(std::abs(retaken.takesPerSecond() - 0.05) < 0.02 && share > 0.9,
           "a unit taken every 20 s is not taken at about 0.05 a second");
@@ -260,7 +261,7 @@ void testRecordedLoadsDoNotFlipFlop() {
     value::PoolRate rate;
     std::vector<double> missChanges, scanChanges;
     bool steadyMisses = false, steadyScans = false;
-    rate.observe({.ghostHits = run.samples.front().misses}, run.samples.front().prefillBytes, 0,
+    rate.observe({.ghostHits = run.samples.front().misses, .scanReadBytes = run.samples.front().prefillBytes}, 0,
                  run.samples.front().seconds, false);
     for (size_t index = 1; index < run.samples.size(); ++index) {
       const RecordedRun::Sample &a = run.samples[index - 1], &b = run.samples[index];
@@ -273,9 +274,10 @@ void testRecordedLoadsDoNotFlipFlop() {
       for (int pass = 1; pass <= passes; ++pass) {
         const double share = double(pass) / passes;
         const double misses = rate.ghostHitsPerSecond(), scans = rate.scanReadBytesPerSecond();
-        rate.observe({.ghostHits = a.misses + static_cast<uint64_t>(double(b.misses - a.misses) * share)},
-                     a.prefillBytes + static_cast<uint64_t>(double(b.prefillBytes - a.prefillBytes) * share), 0,
-                     a.seconds + span * share, commands);
+        rate.observe({.ghostHits = a.misses + static_cast<uint64_t>(double(b.misses - a.misses) * share),
+                      .scanReadBytes =
+                          a.prefillBytes + static_cast<uint64_t>(double(b.prefillBytes - a.prefillBytes) * share)},
+                     0, a.seconds + span * share, commands);
         if (commands && missing && steadyMisses && misses > 0.0)
           missChanges.push_back(std::abs(rate.ghostHitsPerSecond() - misses) / misses);
         if (commands && scanning && steadyScans && scans > 0.0)

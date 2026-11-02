@@ -19,11 +19,10 @@ namespace splash::engine::value {
 // resets: an idle release and restore clear its ghosts but not these.
 class PoolRate final {
 public:
-  // `scanReadBytes` and `taken` are monotonic like the pool's counters: the
-  // bytes its prefill loads read on misses, and the units claims took.
-  void observe(const model::PoolValue &value, uint64_t scanReadBytes, uint64_t taken, double nowSeconds,
-               bool commandsRan) noexcept {
-    const Counters now{value.hits, value.ghostHits, scanReadBytes, taken};
+  // `taken`, the units claims took from it, is monotonic like the pool's
+  // counters.
+  void observe(const model::PoolValue &value, uint64_t taken, double nowSeconds, bool commandsRan) noexcept {
+    const Counters now{value.hits, value.ghostHits, value.scanReadBytes, taken};
     if (last_ && commandsRan && nowSeconds > lastSeconds_) {
       const double seconds = nowSeconds - lastSeconds_;
       const double weight = rates_ ? 1.0 - std::exp(-seconds / kRateTimeConstantSeconds) : 1.0;
@@ -82,12 +81,12 @@ private:
   return cost;
 }
 // What growth that displaces other memory costs beyond what it takes: the
-// unit read back key by key once it comes back (`keyBytes` per miss; 0: the
-// pool reports no key, so no refill is priced), and given back again at the
+// unit read back key by key once it comes back (PoolValue::keyBytes a miss;
+// none priced for a pool that reports no key), and given back again at the
 // pool's measured release time per byte (the store's compactions).
-[[nodiscard]] inline double cycleSeconds(const model::PoolValue &value, uint64_t keyBytes, uint64_t unitBytes) noexcept {
+[[nodiscard]] inline double cycleSeconds(const model::PoolValue &value, uint64_t unitBytes) noexcept {
   const double unit = double(unitBytes);
-  const double refill = keyBytes ? unit / double(keyBytes) * value.missMilliseconds / 1000.0 : 0.0;
+  const double refill = value.keyBytes ? unit / double(value.keyBytes) * value.missMilliseconds / 1000.0 : 0.0;
   const double release =
       value.releasedBytes ? unit * value.releaseMilliseconds / double(value.releasedBytes) / 1000.0 : 0.0;
   return refill + release;

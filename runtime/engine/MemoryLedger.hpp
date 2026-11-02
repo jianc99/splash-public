@@ -49,9 +49,8 @@ inline constexpr double kValueHorizonSeconds = 60.0;
 // and the three 2-minute q runs (1.6-2.3x), at 120 s the q runs; its five
 // 35B runs have no pinned-store pair to value them. 60 s is the smallest at
 // which every 15-minute run of the trees 1.6.0 builds on passes (at 30 s
-// mMNa and mSl fail, 1.05x): the exclusion is open (merge report). The cycle
-// counts a refill the ledger does not price until pools report keyBytes
-// (MemoryLedger.cpp). memory_value_test replays mMNa and pFa.
+// mMNa and mSl fail, 1.05x): the exclusion is open (merge report).
+// memory_value_test replays mMNa and pFa.
 inline constexpr double kRateTimeConstantSeconds = 60.0;
 
 struct AccountId final {

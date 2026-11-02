@@ -95,6 +95,58 @@ private:
   FakeMemory *memory_ = nullptr;
 };
 
+// A pool whose units above its floor are listed, the last given back first,
+// the fewest whose bytes reach what release() asks, as the expert store
+// gives its last live chunk back, whatever its size (ExpertStorePool). It
+// reports what the store reports of its keys: the bytes that would hold all
+// of them, a key's bytes and the bytes its prefill scans read, which the
+// test moves with its hits.
+class ListedPool final : public model::ElasticPool {
+public:
+  ListedPool(uint64_t floorBytes, std::vector<uint64_t> units, uint64_t wholeBytes, uint64_t keyBytes,
+             double missMilliseconds)
+      : floorBytes_(floorBytes), units_(std::move(units)), wholeBytes_(wholeBytes), keyBytes_(keyBytes),
+        missMilliseconds_(missMilliseconds) {}
+
+  [[nodiscard]] model::PoolState state() const override {
+    const uint64_t current = currentBytes();
+    return {.name = "experts",
+            .floorBytes = floorBytes_,
+            .currentBytes = current,
+            .capBytes = current,
+            .releaseUnitBytes = units_.empty() ? 0 : units_.back(),
+            .wholeBytes = wholeBytes_};
+  }
+  [[nodiscard]] model::PoolValue value() const override {
+    return {.hits = hits, .missMilliseconds = missMilliseconds_, .keyBytes = keyBytes_,
+            .scanReadBytes = scanReadBytes};
+  }
+  [[nodiscard]] uint64_t release(uint64_t bytes) override {
+    uint64_t released = 0;
+    while (released < bytes && !units_.empty()) {
+      released += units_.back();
+      units_.pop_back();
+    }
+    return released;
+  }
+  [[nodiscard]] metal::AllocationResult grow(const metal::AllocationAdmission &) override { return {}; }
+
+  [[nodiscard]] uint64_t currentBytes() const noexcept {
+    uint64_t bytes = floorBytes_;
+    for (const uint64_t unit : units_)
+      bytes += unit;
+    return bytes;
+  }
+
+  uint64_t hits = 0, scanReadBytes = 0;
+
+private:
+  uint64_t floorBytes_;
+  std::vector<uint64_t> units_;
+  uint64_t wholeBytes_, keyBytes_;
+  double missMilliseconds_;
+};
+
 Victim unit(uint64_t key, uint64_t bytes, double onceSeconds, bool later = false) {
   return {.key = key, .bytes = bytes, .later = later, .cost = {.onceSeconds = onceSeconds}};
 }
@@ -1547,6 +1599,46 @@ void testHiSparseOffTakesCacheThenStoreAndNeverConverts() {
           "without Spill the claim did not take the cache first and then one store unit");
 }
 
+// The ledger values the store by the scans it reports (amend/M.md B8, A18):
+// on the M6 (memory_value_test's testExpertValueCountsPrefillReads), with
+// no decoder and no ghost, the store's scans read 3.2 GB a prefill-second
+// over the 18,854 Flash-Next slots of 1,382,400 B it does not hold, at the
+// profile's weight price; a claim of a long prompt's hold lacking an 8K
+// copied chain takes the chain, read back at 5 GB/s at reuse 0.25, before
+// the 1023 MiB chunk. A store whose scans read nothing costs about one miss
+// and gives the chunk.
+void testTheLedgerValuesTheStoreByItsScans() {
+  constexpr uint64_t kSlotBytes = 1382400, kExtentBytes = 108527616;
+  const MemoryRates rates{.weightReadSecondsPerByte = 0.2 / 5.0e9, .tierReadBytesPerSecond = 5.0e9, .reuse = 0.25};
+  for (const double scanBytesPerSecond : {3.2e9, 0.0}) {
+    ListedPool store(5722 * kSlotBytes - 1023 * kMiB, {1023 * kMiB}, 24576 * kSlotBytes, kSlotBytes, 0.1846);
+    TestSource cache("cache");
+    Victim chain = unit(1, kExtentBytes, 0.0);
+    chain.cost = value::cached(8192, kExtentBytes, true, false, rates);
+    cache.units = {chain};
+    MemoryLedger ledger;
+    ledger.setRates(rates);
+    ledger.addSource(cache);
+    ledger.addPool(store);
+    // Prefill hits at the store's 0.288 share of the uses.
+    const double hitsPerSecond = 3.2e9 / kSlotBytes * 0.288 / 0.712;
+    for (double t = 0.0; t <= 30.0; t += 0.5) {
+      ledger.observePools(t, true);
+      store.hits += static_cast<uint64_t>(std::llround(hitsPerSecond * 0.5));
+      store.scanReadBytes += static_cast<uint64_t>(std::llround(scanBytesPerSecond * 0.5));
+    }
+    const ClaimId claim = ledger.open(request(1, RequestPriority::Normal, ClaimClass::InService, 200.0));
+    require(ledger.free(claim, {.bytes = kExtentBytes}, 0, false, false).outcome == FreeOutcome::Met,
+            "the claim was not met");
+    if (scanBytesPerSecond > 0.0)
+      require(cache.taken == std::vector<uint64_t>{1} && store.currentBytes() == 5722 * kSlotBytes,
+              "the store's scans did not keep its chunk before a copied chain");
+    else
+      require(cache.taken.empty() && store.currentBytes() == 5722 * kSlotBytes - 1023 * kMiB,
+              "a store that scans nothing kept its chunk before a copied chain");
+  }
+}
+
 } // namespace
 
 std::span<const test::TestCase> ledgerTests() {
@@ -1609,6 +1701,7 @@ std::span<const test::TestCase> ledgerTests() {
       {"testHiSparseOnM6ConvertsBeforeTheStore", testHiSparseOnM6ConvertsBeforeTheStore},
       {"testHiSparseOnStudio36GWeighsSpillDecode", testHiSparseOnStudio36GWeighsSpillDecode},
       {"testHiSparseOffTakesCacheThenStoreAndNeverConverts", testHiSparseOffTakesCacheThenStoreAndNeverConverts},
+      {"testTheLedgerValuesTheStoreByItsScans", testTheLedgerValuesTheStoreByItsScans},
   };
   return kTests;
 }
