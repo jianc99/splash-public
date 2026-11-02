@@ -939,14 +939,12 @@ void testKeptCheckpointGoesFirstUnderPressure() {
 // recovery point and stays. Both finish and leave nothing else behind.
 void testSharedCheckpointSurvivesPeerReplayPoint() {
   for (const bool refused : {false, true}) {
-    test::TestKvStorage storage(2048, 4096, 4);
-    KvPool pool(storage, 0);
-    engine::Cache resources(pool, nullptr, nullptr);
-    Executor executor(2);
+    test::EngineHarness h({.pages = 2048, .shape = [](Executor &shape) { shape.maximumLanes = 2; }});
+    engine::Cache &resources = h.cache;
+    Executor &executor = h.model;
+    Events &events = h.events;
+    engine::Engine &engine = h.engine;
     executor.decodeFinishes = false;
-    Events events;
-    engine::Engine engine(test::engineConfig(), resources, executor, events);
-    guardReleases(storage, engine);
     // Checkpoints at 4096 and 8192, the replay state at 12192.
     std::vector<uint32_t> first(12201);
     std::iota(first.begin(), first.end(), 1);
@@ -968,7 +966,7 @@ void testSharedCheckpointSurvivesPeerReplayPoint() {
     }
     engine.submit(std::move(decoding));
     double now = 200;
-    tickUntil(engine, now,
+    tickUntil(h, now,
               [&] {
                 const auto counters = engine.snapshot();
                 return counters.replayStatePublications +
@@ -983,7 +981,7 @@ void testSharedCheckpointSurvivesPeerReplayPoint() {
             "the second lane's replay point retired the first lane's recovery point");
     held.reset();
     executor.denyReservationAt.reset();
-    tickUntil(engine, now, [&] { return engine.snapshot().checkpointPublications == 2; },
+    tickUntil(h, now, [&] { return engine.snapshot().checkpointPublications == 2; },
               "the first lane did not reach its next checkpoint");
     // Refused, the second lane still resumes from the shared checkpoint;
     // otherwise its replay point does, and the first's own progress replaced
@@ -992,7 +990,7 @@ void testSharedCheckpointSurvivesPeerReplayPoint() {
                 resources.snapshot().stateCache.checkpointEntries == (refused ? 2U : 1U),
             "the first lane's next checkpoint retired the second lane's recovery point");
     executor.decodeFinishes = true;
-    tickUntil(engine, now, [&] { return idle(engine); }, "the lanes did not finish");
+    tickUntil(h, now, [&] { return idle(engine); }, "the lanes did not finish");
     const auto counters = engine.snapshot();
     require(events.completedCount == 2 && events.failedCount == 0 &&
                 counters.resources.activeRequests == 0 &&
@@ -1114,14 +1112,12 @@ void suspendWithoutTheReplayPoint(engine::Engine &engine, engine::Cache &cache,
 // the state past it takes no checkpoint's buffers, and the checkpoint stays
 // cached beside both.
 void testStatePastTheReplayPointKeepsTheCheckpoint() {
-  test::TestKvStorage storage(1024, 4096, 4);
-  KvPool pool(storage, 0);
-  engine::Cache resources(pool, nullptr, nullptr);
-  Executor executor(1);
+  test::EngineHarness h({.pages = 1024, .shape = [](Executor &shape) { shape.maximumLanes = 1; }});
+  engine::Cache &resources = h.cache;
+  Executor &executor = h.model;
+  Events &events = h.events;
+  engine::Engine &engine = h.engine;
   executor.decodeFinishes = false;
-  Events events;
-  engine::Engine engine(test::engineConfig(), resources, executor, events);
-  guardReleases(storage, engine);
   // Checkpoints at 4096 and 8192, the replay point at 12192. A history of 64
   // tokens ends at 12256: the lane resumes from 8192, and its command
   // [10240, 12265) captures both.
@@ -1129,7 +1125,7 @@ void testStatePastTheReplayPointKeepsTheCheckpoint() {
   std::iota(prompt.begin(), prompt.end(), 1);
   double now = 1;
   suspendWithoutTheReplayPoint(engine, resources, executor, events, now, prompt, 64);
-  tickUntil(engine, now,
+  tickUntil(h, now,
             [&] { return executor.prefillChunks.at(1) == 8 && !engine.commandInFlight(); },
             "the resumed lane did not reach its history's end");
   std::vector<uint32_t> branch(prompt.begin(), prompt.begin() + 9000);
@@ -1147,7 +1143,7 @@ void testStatePastTheReplayPointKeepsTheCheckpoint() {
               resources.snapshot().stateCache.checkpointEntries == 2,
           "a state past the replay point retired the checkpoint the replay point keeps");
   executor.decodeFinishes = true;
-  tickUntil(engine, now, [&] { return idle(engine); }, "the lane did not finish");
+  tickUntil(h, now, [&] { return idle(engine); }, "the lane did not finish");
 }
 
 // The prompt's replay point keeps the checkpoint before it beside buffers of

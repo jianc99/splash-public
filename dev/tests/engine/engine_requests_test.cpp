@@ -171,12 +171,8 @@ void testBlocksFoundCachedAfterTheLastCommandAreNotReported() {
 // protocol does: one without end tokens, and one with an end token before the
 // last that would end thinking itself.
 void testUnusableThinkingBudgetIsRefused() {
-  test::TestKvStorage storage(16, 4096, 4);
-  KvPool pool(storage, 0);
-  engine::Cache resources(pool, nullptr, nullptr);
-  Executor executor(1);
-  Events events;
-  engine::Engine engine(test::engineConfig(), resources, executor, events);
+  test::EngineHarness h({.pages = 16, .shape = [](Executor &shape) { shape.maximumLanes = 1; }});
+  engine::Engine &engine = h.engine;
   EngineRequest empty = request(1, std::vector<uint32_t>(8, 7));
   empty.thinkingBudget = ThinkingBudget{4, {}, 9};
   rejects([&] { engine.submit(std::move(empty)); }, "needs end tokens",
@@ -312,17 +308,15 @@ void testSharedPrefillWaiterCancellationAndDeadline() {
 }
 
 void testSharedPrefillFailedPublicationFallsBack() {
-  test::TestKvStorage storage(64, 4096, 4);
-  KvPool pool(storage, 0);
-  engine::Cache cache(pool, nullptr, nullptr);
-  Executor model;
+  test::EngineHarness h({.pages = 64});
+  engine::Cache &cache = h.cache;
+  Executor &model = h.model;
+  Events &events = h.events;
+  engine::Engine &engine = h.engine;
   model.deniedReservations = 100;
-  Events events;
-  engine::Engine engine(test::engineConfig(), cache, model, events);
-  guardReleases(storage, engine);
   for (uint32_t id = 1; id <= 4; ++id)
     engine.submit(request(id, std::vector<uint32_t>(193, 7)));
-  runUntilIdle(engine);
+  h.runUntilIdle();
   require(events.completedCount == 4 && events.failedCount == 0 &&
               model.prefillRows == 4 * 193 && cache.snapshot().activeRequests == 0,
           "a missing prefix state stranded dependent requests");
@@ -1150,14 +1144,11 @@ void testConstraintMaskOverlapsInsideOneSchedulerBatch() {
 // constrained lane's verify mask alone, a mask response for the other lane
 // does not reach the model, and the one mask completes the command for both.
 void testConstrainedLaneSharesDecodeCommand() {
-  test::TestKvStorage storage(8, 4096, 4);
-  KvPool pool(storage, 0);
-  engine::Cache resources(pool, nullptr, nullptr);
-  Executor executor(2);
+  test::EngineHarness h({.pages = 8, .shape = [](Executor &shape) { shape.maximumLanes = 2; }});
+  Executor &executor = h.model;
+  Events &events = h.events;
+  engine::Engine &engine = h.engine;
   executor.decodeFinishes = false;
-  Events events;
-  engine::Engine engine(test::engineConfig(), resources, executor, events);
-  guardReleases(storage, engine);
 
   engine.submit(constrainedRequest(1, 100'000));
   EngineRequest unconstrained = request(2, {2});
@@ -1165,11 +1156,11 @@ void testConstrainedLaneSharesDecodeCommand() {
   unconstrained.deadlineMilliseconds = 100'000;
   engine.submit(std::move(unconstrained));
   double now = 1;
-  tickUntil(engine, now, [&] { return events.maskRequests.size() == 1; },
+  tickUntil(h, now, [&] { return events.maskRequests.size() == 1; },
             "the constrained prompt did not ask for its first mask");
   const std::array<uint32_t, 1> mask{1};
   engine.provideMask(1, mask);
-  tickUntil(engine, now, [&] { return events.maskRequests.size() == 2; },
+  tickUntil(h, now, [&] { return events.maskRequests.size() == 2; },
             "the constrained lane's first cycle did not ask for its verify mask");
   require(engine.commandInFlight() && executor.overlap && executor.overlap->requestId == 1 &&
               events.maskRequests[1].first == 1,
@@ -1180,13 +1171,13 @@ void testConstrainedLaneSharesDecodeCommand() {
   require(executor.providedMasks == provided && events.failedCount == 0,
           "a mask for the lane that asked for none reached the model");
   engine.provideMask(1, mask);
-  require(engine.tick(now++) && !engine.commandInFlight() && events.outputs[1] == std::vector<uint32_t>{42} &&
+  require(tickAt(h, now++) && !engine.commandInFlight() && events.outputs[1] == std::vector<uint32_t>{42} &&
               events.outputs[2].size() > unconstrainedTokens &&
               engine.snapshot().scheduler.decodeBatchesByWidth[1] != 0,
           "the constrained lane's mask did not complete the command for both lanes");
   for (const uint64_t id : {1, 2})
     engine.cancel(id);
-  tickUntil(engine, now, [&] { return idle(engine); }, "engine did not reach idle");
+  tickUntil(h, now, [&] { return idle(engine); }, "engine did not reach idle");
   require(events.failedCount == 0, "a lane failed");
 }
 
@@ -1194,14 +1185,11 @@ void testConstrainedLaneSharesDecodeCommand() {
 // the engine stays busy, so it covers the host work between commands, and
 // from the command's plan after a tick that found nothing to do.
 void testDecodeCycleCoversHostWork() {
-  test::TestKvStorage storage(8, 4096, 4);
-  KvPool pool(storage, 0);
-  engine::Cache resources(pool, nullptr, nullptr);
-  Executor executor(1);
+  test::EngineHarness h({.pages = 8, .shape = [](Executor &shape) { shape.maximumLanes = 1; }});
+  Executor &executor = h.model;
+  Events &events = h.events;
+  engine::Engine &engine = h.engine;
   executor.decodeFinishes = false;
-  Events events;
-  engine::Engine engine(test::engineConfig(), resources, executor, events);
-  guardReleases(storage, engine);
 
   EngineRequest greedy = request(1, {1});
   greedy.maxNewTokens = 2;
@@ -1209,22 +1197,22 @@ void testDecodeCycleCoversHostWork() {
   // Each command is planned 5 ms after the previous one retires and
   // retires 10 ms after its plan.
   for (double now : {10.0, 20.0, 25.0, 35.0, 40.0, 50.0})
-    require(engine.tick(now), "the greedy request stalled");
+    require(tickAt(h, now), "the greedy request stalled");
   using Cycles = std::vector<std::pair<WorkKind, double>>;
   require(events.completedCount == 1 &&
               events.cycles == Cycles{{WorkKind::Prefill, 10.0},
                                       {WorkKind::Decode, 15.0},
                                       {WorkKind::Decode, 15.0}},
           "back-to-back commands were not timed from retirement to retirement");
-  require(!engine.tick(60.0), "a finished request kept the engine busy");
+  require(!tickAt(h, 60.0), "a finished request kept the engine busy");
 
   engine.submit(constrainedRequest(2));
-  require(engine.tick(100.0) && engine.tick(110.0) &&
-              events.maskRequests.size() == 1 && !engine.tick(130.0),
+  require(tickAt(h, 100.0) && tickAt(h, 110.0) &&
+              events.maskRequests.size() == 1 && !tickAt(h, 130.0),
           "a lane waiting for its first mask kept the engine busy");
   const std::array<uint32_t, 1> mask{1};
   engine.provideMask(2, mask);
-  require(engine.tick(140.0) && engine.tick(150.0) &&
+  require(tickAt(h, 140.0) && tickAt(h, 150.0) &&
               events.cycles.back() == std::pair{WorkKind::Decode, 10.0},
           "a decode planned after an idle tick was not timed from its plan");
 }
@@ -1464,27 +1452,25 @@ void testOrdinaryInFlightDeadlineDrainsWithoutPublishingOrOutput() {
 }
 
 void testStalledSuspensionFailsWithCapacity() {
-  test::TestKvStorage storage(8, 4096, 4);
-  KvPool pool(storage, 0);
-  engine::Cache resources(pool, nullptr, nullptr);
-  Executor executor(2);
+  test::EngineHarness h({.pages = 8, .shape = [](Executor &shape) { shape.maximumLanes = 2; }});
+  test::TestKvStorage &storage = h.storage;
+  Executor &executor = h.model;
+  Events &events = h.events;
+  engine::Engine &engine = h.engine;
   executor.kvGrowthBlocked = &storage.growthBlocked;
   executor.unblockGrowthOnSuspend = false;
-  Events events;
-  engine::Engine engine(test::engineConfig(), resources, executor, events);
-  guardReleases(storage, engine);
 
   storage.growthBlocked = true;
   engine.submit(request(60, {60}));
   engine.submit(request(61, {61}));
-  require(engine.tick(1.0) && engine.tick(2.0) && executor.suspensions == 1 &&
+  require(tickAt(h, 1.0) && tickAt(h, 2.0) && executor.suspensions == 1 &&
               events.capacityExhaustedCount == 1,
           "preemption did not identify that the remaining singleton cannot fit");
 
   // Nothing completes between suspension and retry, so suspending again would
   // only rotate the same two lanes forever.
   for (double now = 102.0; now < 140.0 && !idle(engine); ++now)
-    static_cast<void>(engine.tick(now));
+    static_cast<void>(tickAt(h, now));
   require(idle(engine) && events.capacityExhaustedCount == 2 &&
               engine.snapshot().resourceSuspensions == 1 &&
               engine.snapshot().resourceResumptions == 0 && executor.prefillRows == 0,
@@ -1493,19 +1479,17 @@ void testStalledSuspensionFailsWithCapacity() {
 
 void testTerminalAnchorWithoutKvIsNotCached() {
   for (uint32_t withoutKv : {1U, 0U}) {
-    test::TestKvStorage storage(8, 4096, 4);
-    KvPool pool(storage, 0);
-    engine::Cache resources(pool, nullptr, nullptr);
-    Executor executor(1);
+    test::EngineHarness h({.pages = 8, .shape = [](Executor &shape) { shape.maximumLanes = 1; }});
+    engine::Cache &resources = h.cache;
+    Executor &executor = h.model;
+    Events &events = h.events;
+    engine::Engine &engine = h.engine;
     executor.decodeTokensWithoutKv = withoutKv;
-    Events events;
-    engine::Engine engine(test::engineConfig(), resources, executor, events);
-    guardReleases(storage, engine);
 
     // 31 prompt tokens plus the emitted token complete one Page32 block only
     // when that token has a stored KV row.
     engine.submit(request(70, std::vector<uint32_t>(31, 70)));
-    runUntilIdle(engine);
+    h.runUntilIdle();
     require(events.completedCount == 1 && events.emitted == 1,
             "terminal anchor request did not complete");
     require(resources.snapshot().pool.pagesPrefix == (withoutKv ? 0U : 1U),
@@ -1519,31 +1503,28 @@ void testTerminalAnchorWithoutKvIsNotCached() {
 // request is cancelled before that cycle.
 void testFirstTokenIsSentAtPrefill() {
   for (const bool cancel : {false, true}) {
-    test::TestKvStorage storage(8, 4096, 4);
-    KvPool pool(storage, 0);
-    engine::Cache resources(pool, nullptr, nullptr);
-    Executor executor(1);
+    test::EngineHarness h({.pages = 8, .shape = [](Executor &shape) { shape.maximumLanes = 1; }});
+    Executor &executor = h.model;
+    Events &events = h.events;
+    engine::Engine &engine = h.engine;
     executor.firstTokens = true;
     executor.decodeFinishes = false;
     executor.decodeTokens = 4;
     executor.holdDecodeUntil = std::make_shared<std::atomic<bool>>(false);
-    Events events;
-    engine::Engine engine(test::engineConfig(), resources, executor, events);
-    guardReleases(storage, engine);
 
     EngineRequest value = request(91, std::vector<uint32_t>(40, 91));
     value.maxNewTokens = 12;
     engine.submit(std::move(value));
     // The first cycle is held in flight: the client has the first token.
     double now = 1;
-    tickUntil(engine, now, [&] { return !events.outputs[91].empty() && engine.commandInFlight(); },
+    tickUntil(h, now, [&] { return !events.outputs[91].empty() && engine.commandInFlight(); },
               "the first cycle did not start after the prompt");
     require(events.outputs[91] == std::vector<uint32_t>{42},
             "the first token did not reach the client before the first cycle");
     if (cancel)
       engine.cancel(91);
     *executor.holdDecodeUntil = true;
-    tickUntil(engine, now, [&] { return idle(engine); }, "the request did not end");
+    tickUntil(h, now, [&] { return idle(engine); }, "the request did not end");
     const uint32_t expected = cancel ? 1 : 12;
     require(events.completedCount == 1 && events.outputs[91].size() == expected &&
                 events.usage[91] == std::pair<uint32_t, uint32_t>{40, expected},
@@ -1745,19 +1726,16 @@ void testResumePastItsBlocksCountsAnotherRequestsKv() {
 
 void testPrefillCanCompleteTheRequest() {
   for (bool stop : {false, true}) {
-    test::TestKvStorage storage(8, 4096, 4);
-    KvPool pool(storage, 0);
-    engine::Cache resources(pool, nullptr, nullptr);
-    Executor executor(1);
+    test::EngineHarness h({.pages = 8, .shape = [](Executor &shape) { shape.maximumLanes = 1; }});
+    Executor &executor = h.model;
+    Events &events = h.events;
+    engine::Engine &engine = h.engine;
     executor.prefillAnchor = stop;
-    Events events;
-    engine::Engine engine(test::engineConfig(), resources, executor, events);
-    guardReleases(storage, engine);
 
     EngineRequest value = request(90, std::vector<uint32_t>(40, 90));
     value.maxNewTokens = stop ? 8 : 1;
     engine.submit(std::move(value));
-    runUntilIdle(engine);
+    h.runUntilIdle();
     require(events.completedCount == 1 && events.emitted == 1 &&
                 events.failedCount == 0,
             "request finished by prefill did not complete cleanly");
@@ -1929,22 +1907,19 @@ void testIncompleteConfigIsRefused() {
 }
 
 void testSpeculativeCountsStayWithEachConcurrentRequest() {
-  test::TestKvStorage storage(128, 4096, 4);
-  KvPool pool(storage, 0);
-  engine::Cache cache(pool, nullptr, nullptr);
-  Executor executor;
+  test::EngineHarness h({.pages = 128});
+  Executor &executor = h.model;
+  Events &events = h.events;
+  engine::Engine &engine = h.engine;
   executor.decodeFinishes = false;
   executor.speculativeCounts = {{1, {7, 2}}, {2, {7, 6}}};
-  Events events;
-  engine::Engine engine(test::engineConfig(), cache, executor, events);
-  guardReleases(storage, engine);
   auto prose = request(1, std::vector<uint32_t>(65, 11));
   prose.maxNewTokens = 6;
   auto arithmetic = request(2, std::vector<uint32_t>(65, 12));
   arithmetic.maxNewTokens = 21;
   engine.submit(std::move(prose));
   engine.submit(std::move(arithmetic));
-  runUntilIdle(engine);
+  h.runUntilIdle();
   require(events.speculativeCounts.at(1) == SpeculativeCounts{14, 4, 2} &&
               events.speculativeCounts.at(2) == SpeculativeCounts{21, 18, 3} &&
               events.draftedTokens == 14 + 21 &&
@@ -1955,25 +1930,22 @@ void testSpeculativeCountsStayWithEachConcurrentRequest() {
   score.maxNewTokens = 0;
   score.scoreTokens = {1, 2};
   engine.submit(std::move(score));
-  runUntilIdle(engine);
+  h.runUntilIdle();
   require(events.speculativeCounts.at(3) == SpeculativeCounts{},
           "score-only request inherited speculative generation activity");
 }
 
 void testImpossibleSpeculativeCountsFailOnlyTheirOwnLane() {
-  test::TestKvStorage storage(128, 4096, 4);
-  KvPool pool(storage, 0);
-  engine::Cache cache(pool, nullptr, nullptr);
-  Executor executor;
+  test::EngineHarness h({.pages = 128});
+  Executor &executor = h.model;
+  Events &events = h.events;
+  engine::Engine &engine = h.engine;
   executor.speculativeCounts = {{1, {7, 9}}, {2, {7, 1}}};
-  Events events;
-  engine::Engine engine(test::engineConfig(), cache, executor, events);
-  guardReleases(storage, engine);
   engine.submit(request(1, std::vector<uint32_t>(65, 11)));
   auto healthy = request(2, std::vector<uint32_t>(65, 12));
   healthy.maxNewTokens = 2;
   engine.submit(std::move(healthy));
-  runUntilIdle(engine);
+  h.runUntilIdle();
   require(events.failedCount == 1 && events.completedCount == 1 &&
               !events.speculativeCounts.contains(1) &&
               events.speculativeCounts.at(2) == SpeculativeCounts{7, 1, 1},
