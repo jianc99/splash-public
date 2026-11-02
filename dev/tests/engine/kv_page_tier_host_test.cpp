@@ -6,6 +6,7 @@
 // and right after its last batch retired, whose end ran on a reader, with
 // nothing it started running past it. kv_page_tier_test runs the tier over
 // the pool's extents beside the GPU. Built under ASan and TSan too.
+#include "AwakeClock.hpp"
 #include "HostKvPages.hpp"
 #include "TestChecks.hpp"
 #include "engine/KvPageTier.hpp"
@@ -17,6 +18,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <iostream>
 #include <memory>
 #include <span>
@@ -125,37 +127,69 @@ void roundTrips(const std::shared_ptr<model::SsdReaders> &readers, kv::Layout la
   std::cout << "round trips " << kv::formatName(layout.format) << " slot format v" << format.version() << '\n';
 }
 
+// The latest end of a transfer's IO the test's hooks saw: a write's hook
+// runs once its IO has ended, a batch of restores' once its last read has.
+struct IoEnds final {
+  std::atomic<AwakeClock::rep> latest{0};
+  std::atomic<uint32_t> hooks{0};
+
+  [[nodiscard]] std::function<void()> hook() {
+    return [this] {
+      const AwakeClock::rep now = AwakeClock::now().time_since_epoch().count();
+      AwakeClock::rep last = latest.load(std::memory_order_relaxed);
+      while (last < now && !latest.compare_exchange_weak(last, now, std::memory_order_relaxed)) {
+      }
+      hooks.fetch_add(1, std::memory_order_release);
+    };
+  }
+  // Once `count` hooks ran: the seconds from `start` to the latest end.
+  [[nodiscard]] double since(AwakeClock::time_point start, uint32_t count) const {
+    const auto deadline = AwakeClock::now() + std::chrono::seconds(60);
+    while (hooks.load(std::memory_order_acquire) < count) {
+      if (AwakeClock::now() > deadline)
+        throw std::runtime_error("KV transfers did not end");
+      std::this_thread::yield();
+    }
+    const AwakeClock::time_point end(AwakeClock::duration(latest.load(std::memory_order_relaxed)));
+    return std::chrono::duration<double>(end - start).count();
+  }
+};
+
 // What the tier moved, as it retires each transfer that succeeded: the
 // bytes a write sent to its slot and those a restore read back, the index
 // alone for an Index page; and the wall time it had writes, or reads, in
 // flight, once however many ran beside each other: never more than the
-// time from the first start to the last retirement, and none of the time
+// time from the first start to the end of the last IO, so none of the time
 // the engine thread took to retire them after their IO had ended.
 void tierThroughputCounts(const std::shared_ptr<model::SsdReaders> &readers, kv::Layout layout) {
   constexpr uint32_t kPages = 8;
-  // Longer than the transfers' IO by far: the engine runs a command meanwhile.
+  // The engine thread retires the transfers this long after their IO ended,
+  // as when it runs a command meanwhile.
   constexpr auto kPoll = std::chrono::milliseconds(200);
-  const double poll = std::chrono::duration<double>(kPoll).count();
+  // Index restores go in a batch of their own beside the whole ones.
+  const uint32_t batches = layout.spillable() ? 2 : 1;
+  IoEnds writeEnds, readEnds;
   test::HostKvPages pages(layout, 2 * kPages);
   const kv::SlotFormat format(layout);
   std::shared_ptr<DiskBudget> budget;
   Tier tier(pages, format, slotFile(format, kPages + 1, budget), readers);
   std::vector<std::shared_ptr<engine::KvDiskSlot>> slots;
   std::vector<std::unique_ptr<KvTransfer>> writes;
-  const auto wrote = std::chrono::steady_clock::now();
+  const AwakeClock::time_point wrote = AwakeClock::now();
   for (uint32_t page = 0; page < kPages; ++page) {
     pages.fill(page, page + 1);
     slots.push_back(tier.acquireSlot(cached));
-    writes.push_back(tier.demote(page, slots.back(), WriteClass::Reclaim, {}));
+    writes.push_back(tier.demote(page, slots.back(), WriteClass::Reclaim, writeEnds.hook()));
   }
+  const double writing = writeEnds.since(wrote, kPages);
   std::this_thread::sleep_for(kPoll);
   runUntilReady(tier, writes);
-  const double writing = std::chrono::duration<double>(std::chrono::steady_clock::now() - wrote).count();
   const engine::KvTierThroughput written = tier.throughput();
   require(written.writtenBytes == kPages * format.payloadBytes() && written.writeSeconds > 0.0 &&
-              written.writeSeconds <= writing && written.writeSeconds < poll && !written.readBytes,
+              written.writeSeconds <= writing && !written.readBytes,
           "the tier did not count the bytes its writes sent and the time it had writes in flight: " +
-              std::to_string(written.writeSeconds) + " s of " + std::to_string(writing) + " s");
+              std::to_string(written.writeSeconds) + " s of the " + std::to_string(writing) +
+              " s to the end of their IO");
   std::vector<std::unique_ptr<KvTransfer>> restores;
   uint64_t read = 0;
   for (uint32_t page = 0; page < kPages; ++page) {
@@ -163,18 +197,19 @@ void tierThroughputCounts(const std::shared_ptr<model::SsdReaders> &readers, kv:
     if (index)
       pages.setForm(kPages + page, kv::PageForm::Index);
     read += index ? format.indexRange().bytes : format.payloadBytes();
-    restores.push_back(tier.restore(slots[page], kPages + page, {}));
+    restores.push_back(tier.restore(slots[page], kPages + page, readEnds.hook()));
   }
-  const auto restored = std::chrono::steady_clock::now();
+  const AwakeClock::time_point restored = AwakeClock::now();
   tier.submitRestores();
+  const double reading = readEnds.since(restored, batches);
   std::this_thread::sleep_for(kPoll);
   runUntilReady(tier, restores);
-  const double reading = std::chrono::duration<double>(std::chrono::steady_clock::now() - restored).count();
   const engine::KvTierThroughput moved = tier.throughput();
   require(moved.readBytes == read && moved.readSeconds > 0.0 && moved.readSeconds <= reading &&
-              moved.readSeconds < poll && moved.writtenBytes == written.writtenBytes,
+              moved.writtenBytes == written.writtenBytes,
           "the tier did not count the bytes its restores read and the time it had reads in flight: " +
-              std::to_string(moved.readSeconds) + " s of " + std::to_string(reading) + " s");
+              std::to_string(moved.readSeconds) + " s of the " + std::to_string(reading) +
+              " s to the end of their reads");
   std::cout << "throughput " << kv::formatName(layout.format) << '\n';
 }
 
