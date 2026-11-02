@@ -526,6 +526,25 @@ void testBandWaivedWhenTheHostClaimFindsNothing() {
   require(fixture.allocate(probe, 128 * kMiB), "the band held after the host pass found nothing");
 }
 
+// Every host pass gives back the units that cost nothing and are sized only
+// when taken, whatever else it finds (amend/M.md B3; plan/M3a.md S2: the
+// idle state buffers, which the base gave back first on every pass,
+// EngineMemory.cpp:991-995): under macOS's warning, with no cache to take,
+// two finished lanes' pooled buffers go at the first pass.
+void testEveryHostPassGivesBackIdleBuffers() {
+  Fixture fixture(host(4 * kGiB, MemoryPressure::Warning));
+  TestSource engine("engine", &fixture.memory);
+  Victim buffers = unit(1, 0, 0.0);
+  buffers.sized = false;
+  engine.units = {buffers};
+  engine.unsizedBytes = 226 * kMiB;
+  fixture.memory.hold("engine", 226 * kMiB);
+  fixture.ledger().addSource(engine);
+  static_cast<void>(fixture.pass(1.0));
+  require(engine.taken == std::vector<uint64_t>{1} && fixture.memory.total() == 0,
+          "a host pass that found no sized unit kept the idle buffers");
+}
+
 // The pass's deficit is the margin plus what host-refused waiting claims
 // lack, not a recovery margin: with nothing waiting a band pass frees only
 // what restores M.
@@ -1665,6 +1684,7 @@ std::span<const test::TestCase> ledgerTests() {
       {"testTakenPendingGrowthIsCancelled", testTakenPendingGrowthIsCancelled},
       {"testOneHostRule", testOneHostRule},
       {"testBandWaivedWhenTheHostClaimFindsNothing", testBandWaivedWhenTheHostClaimFindsNothing},
+      {"testEveryHostPassGivesBackIdleBuffers", testEveryHostPassGivesBackIdleBuffers},
       {"testDeficitCountsHostRefusedClaimsNotAnIdleMargin", testDeficitCountsHostRefusedClaimsNotAnIdleMargin},
       {"testCheapestPerByteFirstAcrossSources", testCheapestPerByteFirstAcrossSources},
       {"testSourceOrderIsKeptWithinASource", testSourceOrderIsKeptWithinASource},

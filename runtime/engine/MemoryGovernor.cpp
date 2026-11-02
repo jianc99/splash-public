@@ -470,18 +470,21 @@ bool MemoryGovernor::copyDemand() const noexcept { return ledger_.copyDemand(); 
 
 bool MemoryGovernor::claimWaiting() const noexcept { return ledger_.claimWaiting(); }
 
+// The host's claim of what the pass finds, up to `target`, or of what lands:
+// free() gives back the units that cost nothing and are sized only when
+// taken (the idle state buffers) first, whatever it finds besides. A pass
+// that freed nothing now or later is Short: it found nothing to take.
 FreeResult MemoryGovernor::hostPass(uint64_t target, bool critical, bool deficit) {
   const ClaimSpec spec{.cls = ClaimClass::Host,
                        .reach = critical ? ReclaimClass::InUse : ReclaimClass::Ordinary,
                        .holdSeconds = kValueHorizonSeconds};
   const uint64_t found = ledger_.available(spec, target, 0, critical, deficit);
   const uint64_t landing = ledger_.returning().landingBytes;
-  const uint64_t need = std::min(target, std::max(found, landing));
-  if (!need)
-    return {};
   const ClaimId claim = ledger_.open(spec);
-  const FreeResult result = ledger_.free(claim, {.bytes = need}, 0, critical, deficit);
+  FreeResult result = ledger_.free(claim, {.bytes = std::min(target, std::max(found, landing))}, 0, critical, deficit);
   ledger_.close(claim);
+  if (result.outcome == FreeOutcome::Met && !result.nowBytes && !result.laterBytes)
+    result.outcome = FreeOutcome::Short;
   return result;
 }
 
