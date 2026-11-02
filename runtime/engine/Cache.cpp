@@ -777,13 +777,6 @@ std::optional<Cache::WalkUnit> Cache::nextUnit(const WalkScope &scope, WalkCurso
 
 std::optional<Cache::WalkUnit> Cache::nextStepUnit(const Walk &walk, WalkCursor &cursor) const {
   for (std::optional<WalkUnit> unit; (unit = nextUnit(walk.scope, cursor));) {
-    if (cursor.phase == WalkCursor::Phase::InUse && !cursor.inUseAsked) {
-      cursor.inUseAsked = true;
-      if (returns(walk)) {
-        cursor = WalkCursor{.phase = WalkCursor::Phase::Done};
-        return std::nullopt;
-      }
-    }
     if (!kept(*unit, walk.keepResumePoint, walk.restored))
       return unit;
   }
@@ -799,7 +792,6 @@ Cache::WalkCursor Cache::cursorAfter(Unit unit, uint64_t block) const {
                              : unit == Unit::State    ? Phase::Ordinary
                                                       : Phase::InUse,
                     .started = true,
-                    .inUseAsked = unit == Unit::UsedState,
                     .last = unit,
                     .lastCandidate = {block, states_.lastUsed(block)}};
 }
@@ -1050,7 +1042,6 @@ private:
   [[nodiscard]] bool keptLeaf(uint64_t block) const;
   [[nodiscard]] bool writes(uint64_t block) const;
   [[nodiscard]] bool transfers() const;
-  [[nodiscard]] bool returnsLanding() const;
   [[nodiscard]] ReclaimTiming timing() const noexcept;
   [[nodiscard]] bool skipsWrites() const noexcept;
   [[nodiscard]] bool reachesUncopied(uint64_t block, bool state) const;
@@ -1242,8 +1233,6 @@ Cache::ReclaimPlan::Step Cache::ReclaimPlan::evict() {
   if (const Step taken = evictPhase(false); taken.progress || taken.uncopied)
     return taken;
   if (walk.scope.upTo == ReclaimClass::InUse) {
-    if (returnsLanding())
-      return {};
     if (const Step taken = evictPhase(true); taken.progress || taken.uncopied)
       return taken;
   }
@@ -1318,8 +1307,6 @@ Cache::ReclaimPlan::Step Cache::ReclaimPlan::recycle() {
     if (order == RecycledUsed && walk.scope.upTo == ReclaimClass::Ordinary)
       break;
     for (std::optional<CacheEvictionCandidate> state; (state = head(order));) {
-      if (order == RecycledUsed && returnsLanding())
-        return {};
       if (reachesUncopied(state->id, true))
         return {.uncopied = true};
       if (keptState(state->id) || (skipsWrites() && cache.states_.reclaimWrites(state->id))) {
@@ -1618,27 +1605,6 @@ bool Cache::ReclaimPlan::writes(uint64_t block) const {
 // transfersInFlight once the reclaims before started what they did.
 bool Cache::ReclaimPlan::transfers() const {
   return cache.transfersInFlight() || demotions_ > cache.writes(WriteClass::Reclaim) || writing_;
-}
-
-// returnsInFlight(the walk's shortfall) once the reclaims before started
-// what they did. A copy ahead returns memory where its block is a leaf by
-// now.
-bool Cache::ReclaimPlan::returnsLanding() const {
-  if (!cache.restores_.empty() || demotions_ || writing_ || cache.copyAheadReturns())
-    return true;
-  const KvCache &kv = cache.kv_;
-  for (const Write &write : cache.writes_) {
-    const uint32_t page = kv.page(write.block);
-    if (write.write == WriteClass::Persist && page != KvCache::noPage && kv.matchable(write.block) &&
-        !kv.held(write.block) && !cache.pool_.pageActive(page) &&
-        std::ranges::none_of(kv.children(write.block), [&](uint64_t child) {
-          return kv.page(child) != KvCache::noPage && !leftRam_.contains(child);
-        }))
-      return true;
-  }
-  const Shortfall &refused = *walk.refused;
-  const uint32_t freed = refused.form == kv::PageForm::Full ? cache.spillingWrites() : 0;
-  return freed && refused.pages && forms_[static_cast<size_t>(refused.form)].freePages + freed >= refused.pages;
 }
 
 // A claim that can wait's plan writes and demotes what an Immediate one

@@ -773,9 +773,10 @@ public:
   // then KV leaves no state restores through, then ordinary states and
   // resident KV leaves, which share one oldest-first access order. States
   // that unfinished requests use and the KV they restore through follow in
-  // their own such order, once no transfer in flight can return what is
-  // needed first. A chosen state keeps its disk copy when it has one, is
-  // written when the tier admits it and dropped otherwise; its buffers return
+  // their own such order; whether a claim waits for what lands instead is
+  // the ledger's to say (MemoryLedger::free). A chosen state keeps its disk
+  // copy when it has one, is written when the tier admits it and dropped
+  // otherwise; its buffers return
   // to the model's pool, which reclaimIdleState gives back to the host. A
   // chosen KV leaf frees its page at once when a disk copy exists, is
   // dropped when nothing depends on it, and is otherwise written first: its
@@ -845,10 +846,9 @@ public:
   // Recycles one unpinned state, preferring checkpoints, for a lane that
   // takes the state's buffers, as a lane's state does while the host
   // refuses growth, taking nothing of a class above upTo. For running work
-  // (InUse) a state in use goes once no other state is left and no transfer
-  // in flight can return what is needed first (returnsInFlight: no page
-  // covers a state's buffers); a start that a resident lane holds back
-  // (Ordinary) takes nothing in use. A state the tier could take once the
+  // (InUse) a state in use goes once no other state is left; a start that a
+  // resident lane holds back (Ordinary) takes nothing in use. A state the
+  // tier could take once the
   // write in flight has finished stays and is reported pending, as in
   // reclaimOne. evictableStates(upTo) are those it can take.
   [[nodiscard]] CacheReclaimResult reclaimStateForLane(ReclaimClass upTo);
@@ -984,15 +984,12 @@ private:
   // the oldest first, and the unit it gave last, whose order moves past it
   // at the next step, once whatever was done with it is done, as a reclaim
   // step's scan does. A state that waits for the write in flight holds back
-  // the newer states of its phase (statesHeld); whether a transfer in flight
-  // holds back what is in use was asked once the walk reached it
-  // (inUseAsked).
+  // the newer states of its phase (statesHeld).
   struct WalkCursor final {
     enum class Phase : uint8_t { Checkpoints, DeadLeaves, Ordinary, InUse, Done };
     Phase phase = Phase::Checkpoints;
     bool started = false;
     bool statesHeld = false;
-    bool inUseAsked = false;
     std::optional<CacheEvictionCandidate> state;
     std::optional<CacheEvictionCandidate> leaf;
     std::optional<Unit> last;
@@ -1018,10 +1015,11 @@ private:
   // whether a state that needs a write is passed over, as a unit that lands
   // later an Immediate claim does not wait for (skipStateWrites); what it
   // keeps beside what is in use, the resume point and the restored chains;
-  // the shortfall a transfer in flight must be able to cover for what is in
-  // use to wait (returnsInFlight), any transfer without one; whether the
-  // runway stays; and a query's need: a device need's bytes, whose unit is
-  // the memory reclaims up to an extent released, or a page need's pages of
+  // the shortfall a transfer in flight must be able to cover for a step
+  // that finds nothing to report pending (returnsInFlight), any transfer
+  // without one; whether the runway stays; and a query's need: a device
+  // need's bytes, whose unit is the memory reclaims up to an extent
+  // released, or a page need's pages of
   // a form, whose unit is the evictions up to a page freed, the states on
   // the way among its victims unless the need counts state buffers too
   // (statesAreUnits).
@@ -1055,9 +1053,7 @@ private:
   // leaves (not for states alone), the ordinary class's states and leaves by
   // recency, then, up to InUse, what is in use. Nothing changes.
   [[nodiscard]] std::optional<WalkUnit> nextUnit(const WalkScope &scope, WalkCursor &cursor) const;
-  // The next unit a step of the walk tries: past the units it keeps, and
-  // none of what is in use while a transfer in flight can return what is
-  // needed first (returns).
+  // The next unit a step of the walk tries: past the units it keeps.
   [[nodiscard]] std::optional<WalkUnit> nextStepUnit(const Walk &walk, WalkCursor &cursor) const;
   // A cursor whose next unit is the one after this state unit of the walk
   // for states alone; at the walk's end when the unit is gone.
@@ -1132,9 +1128,8 @@ private:
   // emptied; otherwise the eviction alone.
   [[nodiscard]] CacheReclaimResult reclaimStep(const Walk &walk, bool release, bool keepRunway);
   // One eviction: the walk's first unit that goes, as reclaimOne describes.
-  // A page scan has no checkpoints. What is in use waits, and a step that
-  // finds nothing reports pending, while a transfer in flight can return
-  // what is needed first (returns).
+  // A page scan has no checkpoints. A step that finds nothing reports
+  // pending while a transfer in flight can return what is needed (returns).
   [[nodiscard]] CacheReclaimResult evictOne(const Walk &walk);
   // The units of the walk from the cursor on, each taken in turn until one
   // goes, which it returns. One that waits for a transfer in flight leaves
@@ -1144,9 +1139,9 @@ private:
   // stay.
   [[nodiscard]] std::optional<Victim> takeOldest(const Walk &walk, WalkCursor cursor);
   // The first state of the walk, of states alone, goes as the walk says: the
-  // oldest checkpoint, else the oldest ordinary state, then, up to InUse
-  // and once no transfer in flight can return what is needed first, a state
-  // in use. A state that needs a write the walk passes over leaves the next.
+  // oldest checkpoint, else the oldest ordinary state, then, up to InUse, a
+  // state in use. A state that needs a write the walk passes over leaves the
+  // next.
   [[nodiscard]] CacheReclaimResult recycleState(const Walk &walk);
   // One memory reclaim of the walk: free pages first, as
   // the extent they fill; then the walk's victims while their KV can empty

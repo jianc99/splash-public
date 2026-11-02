@@ -118,15 +118,17 @@ private:
   SharedBudget &budget_;
 };
 
-// Admits pages the way the engine does: each denial makes room in one
-// reclaim step, until the pages fit, a transfer in flight holds what they
-// need, or nothing more can be reclaimed.
+// Admits pages the way the engine does: each denial asks the ledger for the
+// pages it lacks beyond the free ones (Engine's inPlace), until the pages
+// fit, what lands holds what they need, or nothing more can be taken.
 TokenAdmission admitLikeEngine(engine::Cache &cache,
                                const std::function<TokenAdmission()> &attempt) {
   TokenAdmission admission = attempt();
   while (admission.failure == TokenAdmissionFailure::Denied) {
-    const FreeResult step = test::freeFromCache(cache, test::kInServiceGrowth,
-                                                {.pages = admission.additionalPages, .form = admission.form});
+    const uint32_t lacking =
+        admission.additionalPages - std::min(admission.additionalPages, admission.availablePages);
+    const FreeResult step =
+        test::freeFromCache(cache, test::kInServiceGrowth, {.pages = lacking, .form = admission.form});
     if (step.outcome != FreeOutcome::Met) {
       if (step.outcome == FreeOutcome::Pending)
         admission.failure = TokenAdmissionFailure::Pending;
@@ -3598,10 +3600,12 @@ void testStatesInUseAreOrdinary() {
           "a checkpoint published at a used block stayed disposable");
 }
 
-// States in use and the KV they need wait for transfers in flight, and a
-// request short of pages waits with them: what those return may be enough.
-// Once they have landed, the state in use goes with its leaf.
-void testInUseWaitsForTransfersInFlight() {
+// A request short of pages that can wait waits only for what lands that
+// covers it (MemoryLedger::free, amend/M.md B5): what is in use is a unit
+// like any other, past the ordinary ones, whatever is in flight. A state
+// write in flight returns no page, so the request takes the leaf a state in
+// use needs, and that state with it, at once.
+void testInUseGoesWhenWhatLandsReturnsNoPage() {
   constexpr auto reuse = CacheReclaimMode::KeepExtents;
   CacheFixture fixture;
   auto control = std::make_shared<TransferControl>();
@@ -3611,27 +3615,24 @@ void testInUseWaitsForTransfersInFlight() {
   // Only the transfer holds this state back: nothing needs to write it.
   StateUse use = fixture.cache.useState(fixture.blocks[1]);
   fixture.publish(1);
-  CacheReclaimResult result;
-  while ((result = fixture.cache.reclaimOne(reuse, ReclaimClass::InUse)).madeProgress) {
+  while (fixture.cache.reclaimOne(reuse, ReclaimClass::Ordinary).madeProgress) {
   }
-  require(result.pending && fixture.cache.stateResident(fixture.blocks[1]),
-          "a state in use went while a transfer was in flight");
+  require(fixture.cache.stateResident(fixture.blocks[1]) && fixture.pool.freePageCount() == 2,
+          "the ordinary class did not stop short of the state in use");
   // Two pages are free; the third has to come from the leaf in use.
   fixture.cache.beginRequest(2);
-  require(admitTokens(fixture.cache, 2, 96).failure == TokenAdmissionFailure::Pending &&
-              fixture.cache.stateResident(fixture.blocks[1]),
-          "a request short of pages took the KV in use while a transfer was in flight");
-  control->ready = true;
-  require(fixture.cache.pollTransfers() && admitTokens(fixture.cache, 2, 96).granted() &&
-              !fixture.cache.stateResident(fixture.blocks[1]) &&
+  require(admitTokens(fixture.cache, 2, 96).granted() && !fixture.cache.stateResident(fixture.blocks[1]) &&
               fixture.cache.snapshot().stateCache.inUseEvictions == 1,
-          "the state in use was not taken once the transfer landed");
+          "a request short of pages waited for a transfer that returns no page");
+  control->ready = true;
+  require(fixture.cache.pollTransfers(), "the state write did not land");
   fixture.cache.endRequest(2);
 }
 
 // A lane that takes a cached state's buffers is running work: a state in use
-// goes after every other state, newer or not, and once no transfer in flight
-// can return what is needed first.
+// goes after every other state, newer or not. The write in flight of the
+// ordinary one returns no buffer, and holds the state in use back no more
+// than it holds a request short of pages (testInUseGoesWhenWhatLandsReturnsNoPage).
 void testLaneTakesStatesInUseLast() {
   CacheFixture fixture;
   auto control = std::make_shared<TransferControl>();
@@ -3644,16 +3645,13 @@ void testLaneTakesStatesInUseLast() {
               !fixture.cache.stateResident(fixture.blocks[1]),
           "a lane took the state in use before a newer ordinary state");
   // The ordinary state's write is in flight.
-  const CacheReclaimResult waiting = fixture.cache.reclaimStateForLane(ReclaimClass::InUse);
-  require(!waiting.madeProgress && waiting.pending &&
-              fixture.cache.stateResident(fixture.blocks[0]),
-          "a lane took a state in use while a transfer was in flight");
-  control->ready = true;
-  require(fixture.cache.pollTransfers() &&
-              fixture.cache.reclaimStateForLane(ReclaimClass::InUse).madeProgress &&
-              fixture.cache.evictableStates(ReclaimClass::InUse) == 0 &&
+  require(fixture.cache.reclaimStateForLane(ReclaimClass::InUse).madeProgress &&
+              !fixture.cache.stateResident(fixture.blocks[0]) &&
               fixture.cache.snapshot().stateCache.inUseEvictions == 1,
-          "a lane could not take the last state in use");
+          "a lane did not take the state in use beside a write that returns no buffer");
+  control->ready = true;
+  require(fixture.cache.pollTransfers() && fixture.cache.evictableStates(ReclaimClass::InUse) == 0,
+          "a lane left a state in use");
 }
 
 // Work that a resident lane holds back reclaims up to the ordinary class:
@@ -6491,7 +6489,7 @@ int main() {
     testEndRequestStampsOnlyTheReplayPoint();
     testKeepResumePointKeepsTheNewestOrdinaryPublication();
     testStatesInUseAreOrdinary();
-    testInUseWaitsForTransfersInFlight();
+    testInUseGoesWhenWhatLandsReturnsNoPage();
     testLaneTakesStatesInUseLast();
     testOrdinaryClassStopsShortOfStatesInUse();
     testRecycleNeverDropsAStateInUseForTheWriteSlot();
