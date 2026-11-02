@@ -567,6 +567,12 @@ std::optional<Scheduler::Planned> Scheduler::planPrefill(std::vector<Lane> ready
   UnitFit fit = passesFor(lanes, bounded);
   // A contended unit no passes bound halves its rows where fewer rows can
   // bound it: a cost per chunk or per pass no rows shorten leaves its rows.
+  // Halving is how fewer rows meet the bound; where even the fewest exceed it
+  // in the most passes (each pass carries its layers' share of the chunk's
+  // compute, which ChunkLayers prices and fixed() leaves out), halving meets
+  // nothing and multiplies the commands: a 2.2 s dense chunk in four passes
+  // would take 32 commands of about its time for its 2048 rows
+  // (testAContendedUnitKeepsRowsNoFewerBound).
   const model::PrefillLane fewest{leader.processed, std::min(lanes.front().rows, kMinimumPrefillRows),
                                   leader.shape.indexPages};
   const bool halves = !fit.within && contend && passesFor({&fewest, 1}, bounded).within;

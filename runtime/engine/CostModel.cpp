@@ -59,8 +59,14 @@ void CostModel::seed(std::span<const model::CommandSample> warmups, model::SsdRe
   // run a chunk over every layer in one pass, so what the line leaves at no
   // rows is a cost per chunk-layer as much as per pass: it seeds ChunkLayers,
   // which passes divide as they divide the layers, and Units, the turnaround
-  // only commands of other passes measure, starts at zero. A model that
-  // reports no layers leaves it nowhere but Units.
+  // only commands of other passes measure, starts at zero. Seeded as Units it
+  // would price every pass what a chunk's command costs at no rows (1633 ms
+  // on the M6 profile, TimingProfile.cpp) and bound units at ten times that,
+  // so no contended unit would run in passes before samples of several
+  // passes; at zero the bound is G, the base's slice, until such samples
+  // price the turnaround (six commands do in
+  // testContendedTurnPassesByTurnaround). A model that reports no layers
+  // leaves it nowhere but Units.
   std::vector<std::pair<double, double>> points;
   double chunkLayers = std::numeric_limits<double>::infinity();
   for (const model::CommandSample &warmup : warmups) {
