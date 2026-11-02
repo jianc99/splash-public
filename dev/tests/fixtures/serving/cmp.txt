@@ -1,0 +1,8 @@
+order A: 14 common tags
+  m150a   done=17 work650=   737 work900=  1023  common ttft= 142.6 lat= 170.4 maxlat=  307
+  m150a2  done=16 work650=   744 work900=  1016  common ttft= 127.1 lat= 185.7 maxlat=  322
+  mMNa    done=16 work650=   697 work900=   962  common ttft= 105.1 lat= 188.6 maxlat=  306
+  mMNa2   done=15 work650=   679 work900=   922  common ttft= 101.0 lat= 189.9 maxlat=  318
+order B: 16 common tags
+  m150b   done=17 work650=   728 work900=   995  common ttft= 137.0 lat= 187.0 maxlat=  325
+  mMNb    done=16 work650=   676 work900=   920  common ttft= 118.9 lat= 206.5 maxlat=  317

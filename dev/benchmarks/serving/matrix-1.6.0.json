@@ -1,0 +1,192 @@
+{
+  "version": 1,
+  "about": "The 1.6.0 benchmark matrix (DESIGN-1.6.0 §8.3 as amended by review/amend/V.md §4-§5, AMENDMENTS X11-X13 and the owner's rulings of 2026-11-01 20:30 and 20:45). Final day: cand only, plus the M6 floor = cap control; references are recorded runs (labels below) or run before the final day (reference_runs). Read by dev/benchmarks/serving/matrix.py.",
+  "orders": {"A": [2, 0, 1], "B": [0, 1, 2]},
+  "trees": {
+    "r150": {"commit": "cabbad2732b027540f5a141511544e0bb62224b7", "role": "release reference for throughput and latency (tag 1.5.0)"},
+    "main": {"commit": "031a25a6125af2d7acf7096580afe56eb33d65bc", "role": "release reference for TTFT"},
+    "pass": {"commit": "0bd50301c6402c8d5f48e4e4a88ebda2ab792c2d", "role": "base of the refactor: G7, G10 and diagnostic references"},
+    "ntie": {"commit": "87382087fdd28532b26f5ef5c56aeae9819a5325", "role": "best measured: ample memory, M5 18G (trades only)"},
+    "intp": {"commit": "1da46c67ecb1c37c7eb509c50b62c3409805f5d2", "role": "best measured at 18G on the Studio and on the M6 (trades only)"},
+    "cand": {"commit": null, "role": "the integration head, given to plan with --commit"}
+  },
+  "models": {
+    "fn-q2": {"model": "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF:Q2_0", "revision": "ed59f92082b1e93c0e96d60a8b11aab089b52f09", "draft": "incoai/Qwen3.8-Flash-Next-DFlash2", "draft_revision": "a22a1744e85c17364dcc54a6a420af7135d4c7f6"},
+    "fn-iq3s": {"model": "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF:IQ3_S", "revision": "ed59f92082b1e93c0e96d60a8b11aab089b52f09", "draft": "incoai/Qwen3.8-Flash-Next-DFlash2", "draft_revision": "a22a1744e85c17364dcc54a6a420af7135d4c7f6", "_note": "the M5 Pro's Flash-Next: Q2_0 is missing from its cache (ATTEMPTS A95)"},
+    "35b-q4": {"model": "unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M", "revision": "a483e9e6cbd595906af30beda3187c2663a1118c", "draft": "incoai/Qwen3.6-35B-A3B-DFlash2", "draft_revision": "51ef7b6923ad6c14cb1bb41c37a9041446496ab6"},
+    "35b-q2": {"model": "unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q2_K_XL", "revision": "a483e9e6cbd595906af30beda3187c2663a1118c", "draft": "incoai/Qwen3.6-35B-A3B-DFlash2", "draft_revision": "51ef7b6923ad6c14cb1bb41c37a9041446496ab6", "_note": "the only 35B the M6 holds"},
+    "27b-q4": {"model": "unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M", "revision": "4ca720788d1e01f1bff70c033e0d0028fd02e502", "draft": "incoai/Qwen3.8-27B-DFlash2", "draft_revision": "015e795645c74b1a0eeef3b570031fb62e769bc5"},
+    "27b-iq3": {"model": "unsloth/Qwen3.8-27B-GGUF:UD-IQ3_XXS", "revision": "4ca720788d1e01f1bff70c033e0d0028fd02e502", "draft": "incoai/Qwen3.8-27B-DFlash2", "draft_revision": "015e795645c74b1a0eeef3b570031fb62e769bc5", "_note": "the 27B installed on the M6"},
+    "flint": {"model": "unsloth/flint-GGUF:UD-Q4_K_XL", "revision": "20468edfc38ab43d6914cc88b08cbecb05d0fc62", "draft": "incoai/Flint-DFlash2", "draft_revision": "39b0a7f7a12a14461b9eac8d90a9fcec24168889"}
+  },
+  "machines": {
+    "studio": {"lock": "/tmp/studio-gpu.lock", "port": 8611, "g4c_floor_s": 6.2, "warmup_256_s": 2.16,
+      "sigma": {"work": {"sigma": 0.0155, "df": 5}, "latency": {"sigma": 0.035, "df": 10}, "ttft": {"sigma": 0.068, "df": 8}, "decode": {"sigma": 0.035, "df": 10}},
+      "_note": "g4c: the smallest stall the owner rejected here (plan 1/R4, 6.2 s; amend/V.md A09). warmup_256_s: 2065 ms + 0.36 ms/row x 256 (DATA.md, amend/V.md A16). sigma: work from 5 recorded same-tree pairs (amend/V.md §0.4); latency, TTFT and decode borrowed from the M6 until this cell's own pairs pool (matrix.py pools them whenever a tree has two runs in an order)."},
+    "m5": {"lock": "/tmp/m520gpu.lock", "port": 8641, "g4c_floor_s": 8.6, "warmup_256_s": 2.16,
+      "sigma": {"work": {"sigma": 0.011, "df": 3}, "latency": {"sigma": 0.035, "df": 10}, "ttft": {"sigma": 0.068, "df": 8}, "decode": {"sigma": 0.035, "df": 10}},
+      "_note": "g4c 8.6 s (R4's M5 max, ATTEMPTS A107). work sigma from 3 pairs (amend/V.md §0.4); the rest borrowed from the M6. The M5 Pro is the owner's laptop: run.py samples its idle time and sleep assertions (A96)."},
+    "m6": {"lock": "/tmp/m6-gpu.lock", "port": 8594, "g4c_floor_s": 7.3, "warmup_256_s": 2.42,
+      "sigma": {"work": {"sigma": 0.026, "df": 10}, "latency": {"sigma": 0.035, "df": 10}, "ttft": {"sigma": 0.068, "df": 8}, "decode": {"sigma": 0.035, "df": 10}},
+      "_note": "g4c 7.3 s (R4's M6 max). warmup_256_s: 2.11 s + 1.204 ms/row x 256. sigma from 10 work and latency pairs and 8 TTFT pairs (amend/V.md §0.4; decode taken as latency's)."},
+    "mini": {"lock": "/tmp/kernel-gpu.lock", "port": 8594, "g4c_floor_s": 6.2, "warmup_256_s": null,
+      "sigma": {"work": {"sigma": 0.026, "df": 10}, "latency": {"sigma": 0.035, "df": 10}, "ttft": {"sigma": 0.068, "df": 8}, "decode": {"sigma": 0.035, "df": 10}},
+      "_note": "someone else's machine: its existing lock (AMENDMENTS X16); g4c the smallest of the three measured floors; sigma borrowed from the M6."}
+  },
+  "gates": {
+    "tolerance": 0.02,
+    "trade_tolerance": 0.05,
+    "value_horizon_seconds": 60,
+    "pass_overhead_share": 0.1,
+    "max_tick_ms": 5000,
+    "resource_wait_ms": 30000,
+    "m5_idle_seconds": 10,
+    "_note": "tolerance: owner-set 2 % for G3, G6, G10 (DESIGN §11 O2). trade_tolerance: owner 2026-11-01 20:30, throughput and decode speed vs r150 only with a clear gain on TTFT, completion latency, freezes or concurrent TTFT, else 0. value_horizon_seconds: M's kValueHorizonSeconds (amend/M.md). pass_overhead_share: kPassOverheadShare (§0 O3). max_tick_ms: supervision::kGpuWaitLimit. resource_wait_ms: kResourceWaitTimeoutMilliseconds (Engine.hpp). m5_idle_seconds: amend/V.md A96."
+  },
+  "cells": [
+    {
+      "name": "m6-fn-churn", "machine": "m6", "model": "fn-q2", "scenario": "churn", "minutes": 15,
+      "prices": {"R": 585, "D": 46, "source": "M6 single-request rates (DATA.md; bin/cmp.py)"},
+      "runs": {"cand": {"A": 2, "B": 2}, "cand-floorcap": {"A": 2, "B": 2}},
+      "tree_server_args": {"cand-floorcap": "--expert-memory {experts_cap}"},
+      "_floorcap": "§0 20:15 / AMENDMENTS X12's m6-fn-churn-floorcap: cand with --expert-memory set to the plan's cap (read from a cand run's streamed_experts.cap_bytes and given to plan with --set experts_cap=SIZE), interleaved with cand in this cell; judged by amend/M.md B17's rule.",
+      "candidates": ["cand"], "health": ["cand", "cand-floorcap"],
+      "floor_rule": {"candidate": "cand-floorcap", "reference": "cand"},
+      "release": {"throughput": "r150", "ttft": "main"},
+      "best_measured": ["intp", "pass"],
+      "ssd": ["r150", "main"],
+      "recorded": {
+        "r150": {"A": ["m150a", "m150a2", "m150a3"], "B": ["m150b", "m150b2", "m150b3"]},
+        "main": {"A": ["mMNa", "mMNa2", "mMNa3"], "B": ["mMNb", "mMNb2", "mMNb3"]},
+        "intp": {"A": ["mIPa", "mIPa2"], "B": ["mIPb", "mIPb2"]},
+        "pass": {"A": ["pFa"], "B": ["pFb"]}
+      }
+    },
+    {
+      "name": "s-fn-churn-18g", "machine": "studio", "model": "fn-q2", "scenario": "churn", "minutes": 15,
+      "server_args": "--max-memory 18G", "env": {"CHURN_BASE": 5800, "CHURN_STEP": 1500},
+      "prices": {"R": 1000, "D": 75, "source": "Studio single-request rates (DATA.md)"},
+      "runs": {"cand": {"A": 2, "B": 2}},
+      "release": {"throughput": "r150", "ttft": "main"}, "memory_cap": true, "kept_decodes_reference": "intp",
+      "best_measured": ["intp"], "ssd": ["r150", "main"],
+      "recorded": {
+        "r150": {"A": ["s150a", "s150a2"], "B": ["s150b"]},
+        "main": {"A": ["sMNa", "sMNa2"], "B": ["sMNb", "sMNb2"]},
+        "intp": {"A": ["sIPa", "sIPa2"], "B": ["sIPb", "sIPb2"]}
+      }
+    },
+    {
+      "name": "p-fn-churn-18g", "machine": "m5", "model": "fn-iq3s", "scenario": "churn", "minutes": 15,
+      "server_args": "--max-memory 18G", "env": {"CHURN_BASE": 5800, "CHURN_STEP": 1500},
+      "prices": {"R": 1000, "D": 75, "source": "Studio prices, as DATA.md's M5 rows"},
+      "runs": {"cand": {"A": 2, "B": 2}},
+      "release": {"throughput": "r150", "ttft": "main"}, "memory_cap": true, "kept_decodes_reference": "ntie",
+      "best_measured": ["ntie"], "ssd": ["r150", "main"], "reference_froze": true,
+      "_reference_froze": "main froze decoders 381-766 s here (max gap 424.8 s, DATA.md): a cand run that holds G4 has the freeze gain of the owner's trade rule",
+      "recorded": {
+        "r150": {"A": ["p150a", "p150a2"], "B": ["p150b", "p150b2"]},
+        "main": {"A": ["pMNa3", "pMNa4"], "B": ["pMNb3", "pMNb4"]},
+        "ntie": {"A": ["pNTa", "pNTa2"], "B": ["pNTb", "pNTb2"]}
+      },
+      "void": {"pNTa2": "overlapped the #649 tests (ATTEMPTS A96)"}
+    },
+    {
+      "name": "p-35b-churn-18g", "machine": "m5", "model": "35b-q4", "scenario": "churn", "minutes": 15,
+      "server_args": "--max-memory 18G", "prices_from": "p-35b-price-pass-1",
+      "runs": {"cand": {"A": 2, "B": 2}},
+      "release": {"throughput": "r150", "ttft": "main"}, "memory_cap": true, "kept_decodes_reference": null,
+      "ssd": ["r150", "main"],
+      "recorded": {"r150": {"A": ["p35R150a"], "B": ["p35R150b"]}, "main": {"A": ["p35MNa"], "B": ["p35MNb"]}},
+      "_note": "the only HiSparse-off pressure cell (owner 06:37); its 18G start streams the experts (amend/V.md §0.5). No tree that kept decodes running has a 35B run, so OQ2's acceptance does not apply."
+    },
+    {
+      "name": "p-35b-price", "machine": "m5", "model": "35b-q4", "scenario": "serve1", "samples": 3,
+      "reference_runs": {"pass": {"-": 1}},
+      "_note": "the 35B's prices at 18G: pass's single-request rates (DESIGN §8.3)", "server_args": "--max-memory 18G"
+    },
+    {
+      "name": "s-fn-churn-ample", "machine": "studio", "model": "fn-q2", "scenario": "churn", "minutes": 15,
+      "env": {"CHURN_BASE": 5800, "CHURN_STEP": 1500}, "ample": true,
+      "prices": {"R": 1000, "D": 75, "source": "Studio single-request rates (DATA.md)"},
+      "runs": {"cand": {"A": 1, "B": 1}},
+      "ample_gate": "ntie", "ssd": ["ntie", "main"], "ssd_counters": ["disk_written_per_work"],
+      "recorded": {
+        "ntie": {"A": ["sNFa"], "B": ["sNFb"]},
+        "main": {"A": ["sMFa"], "B": ["sMFb"]},
+        "r150": {"A": ["s150Fa"], "B": ["s150Fb"]}
+      }
+    },
+    {
+      "name": "m6-fn-ttft", "machine": "m6", "model": "fn-q2", "scenario": "ttft", "n": [1, 2, 4], "rounds": 3,
+      "runs": {"cand": {"-": 1}}, "reference": "pass", "gain_reference": "r150", "gate_n": [2, 4],
+      "cached_min": {"2": 7840},
+      "recorded": {"pass": ["pf1", "pf1b"], "main": ["base2"], "r150": ["t150"]}
+    },
+    {
+      "name": "s-serve1", "machine": "studio", "model": "fn-q2", "scenario": "serve1", "samples": 3,
+      "abba": {"reference": "pass", "sets": 1}
+    },
+    {
+      "name": "m6-serve1", "machine": "m6", "model": "fn-q2", "scenario": "serve1", "samples": 3,
+      "abba": {"reference": "pass", "sets": 1}
+    },
+    {
+      "name": "p-serve1", "machine": "m5", "model": "fn-iq3s", "scenario": "serve1", "samples": 3,
+      "abba": {"reference": "pass", "sets": 1}
+    },
+    {
+      "name": "s-warm", "machine": "studio", "model": "35b-q4", "scenario": "warm", "sizes": [66700, 134000],
+      "server_args": "--max-context 163840", "abba": {"reference": "pass", "sets": 1},
+      "_note": "amend/K.md A83 item 4 = amend/V.md s-warm (AMENDMENTS X13): resident 35B, a fresh cold prefix per trial, 2 warm-ups discarded, 8 suffixes per arm, 2 trials (repeat = trial), cand and pass in ABBA"
+    },
+    {
+      "name": "s-fn-cold", "machine": "studio", "model": "fn-q2", "scenario": "serve1", "sizes": [32768], "samples": 1,
+      "abba": {"reference": "pass", "sets": 2},
+      "_note": "Flash-Next 32K cold solo ABBA x 2 (behaviour change 6 touches lone streamed requests; AMENDMENTS X13)"
+    },
+    {
+      "name": "s-single", "machine": "studio", "scenario": "single", "baseline": "pass", "models": ["27b-q4", "35b-q4", "flint"]
+    },
+    {
+      "name": "m6-single", "machine": "m6", "scenario": "single", "baseline": "pass", "models": ["27b-iq3", "35b-q2"]
+    },
+    {
+      "name": "p-single", "machine": "m5", "scenario": "single", "baseline": "pass", "models": ["27b-q4", "35b-q4"]
+    },
+    {
+      "name": "s-27b-ttft", "machine": "studio", "model": "27b-q4", "scenario": "ttft", "n": [1, 2, 4], "rounds": 3,
+      "runs": {"pass": {"-": 1}, "cand": {"-": 1}}, "point_gate": "pass", "gate_n": [2, 4]
+    },
+    {
+      "name": "m6-27b-churn", "machine": "m6", "model": "27b-iq3", "scenario": "churn", "minutes": 15,
+      "prices_from": "m6-27b-price-pass-1",
+      "runs": {"cand": {"A": 1, "B": 1}}, "point_gate": "pass",
+      "recorded": {"pass": {"A": ["m27Pa"], "B": ["m27Pb"]}}
+    },
+    {
+      "name": "m6-27b-price", "machine": "m6", "model": "27b-iq3", "scenario": "serve1", "samples": 3,
+      "reference_runs": {"pass": {"-": 1}}
+    },
+    {
+      "name": "p-flint-churn-18g", "machine": "m5", "model": "flint", "scenario": "churn", "minutes": 15,
+      "server_args": "--max-memory 18G", "prices_from": "p-flint-price-pass-1",
+      "runs": {"cand": {"A": 1, "B": 1}}, "point_gate": "pass",
+      "recorded": {"pass": {"A": ["pFLPSa"], "B": ["pFLPSb"]}}
+    },
+    {
+      "name": "p-flint-price", "machine": "m5", "model": "flint", "scenario": "serve1", "samples": 3,
+      "server_args": "--max-memory 18G", "reference_runs": {"pass": {"-": 1}}
+    },
+    {
+      "name": "mini-35b-churn", "machine": "mini", "model": "35b-q4", "scenario": "churn", "minutes": 10,
+      "prices_from": "mini-35b-price-pass-1",
+      "runs": {"cand": {"A": 1, "B": 1}}, "point_gate": "pass",
+      "reference_runs": {"pass": {"A": 1, "B": 1}},
+      "_note": "O6: the 35B copied from the Studio; reference changed from r150 to pass (amend/V.md §4.1)"
+    },
+    {
+      "name": "mini-35b-price", "machine": "mini", "model": "35b-q4", "scenario": "serve1", "samples": 3,
+      "reference_runs": {"pass": {"-": 1}}
+    }
+  ]
+}

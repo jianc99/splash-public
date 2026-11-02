@@ -1,0 +1,16 @@
+{"t": 113.8, "kind": "done", "tag": "w2-r1", "prompt": 16259, "cached": 0, "out": 1500, "ttft": 21.97, "decode_tps": 16.3, "start": 0.0}
+{"t": 191.68, "kind": "done", "tag": "w1-r1", "prompt": 16205, "cached": 0, "out": 1500, "ttft": 58.94, "decode_tps": 11.4, "start": 1.2}
+{"t": 228.3, "kind": "done", "tag": "w0-r1", "prompt": 16230, "cached": 0, "out": 1500, "ttft": 100.97, "decode_tps": 11.8, "start": 0.6}
+{"t": 281.31, "kind": "done", "tag": "w2-r2", "prompt": 23516, "cached": 0, "out": 1500, "ttft": 61.16, "decode_tps": 14.1, "start": 113.8}
+{"t": 363.66, "kind": "done", "tag": "w1-r2", "prompt": 23565, "cached": 0, "out": 1500, "ttft": 68.15, "decode_tps": 14.4, "start": 191.7}
+{"t": 429.9, "kind": "done", "tag": "w0-r2", "prompt": 23488, "cached": 0, "out": 1500, "ttft": 95.5, "decode_tps": 14.1, "start": 228.3}
+{"t": 499.57, "kind": "done", "tag": "w2-r3", "prompt": 30779, "cached": 0, "out": 1500, "ttft": 130.87, "decode_tps": 17.2, "start": 281.3}
+{"t": 580.89, "kind": "done", "tag": "w1-r3", "prompt": 30824, "cached": 0, "out": 1500, "ttft": 129.53, "decode_tps": 17.1, "start": 363.7}
+{"t": 622.65, "kind": "done", "tag": "w2-resend4", "prompt": 32298, "cached": 30752, "out": 1500, "ttft": 16.58, "decode_tps": 14.1, "start": 499.6}
+{"t": 674.47, "kind": "done", "tag": "w1-resend4", "prompt": 32343, "cached": 30816, "out": 1500, "ttft": 6.69, "decode_tps": 17.3, "start": 580.9}
+{"t": 747.7, "kind": "done", "tag": "w0-r3", "prompt": 30782, "cached": 0, "out": 1500, "ttft": 238.04, "decode_tps": 18.8, "start": 429.9}
+{"t": 812.38, "kind": "done", "tag": "w2-r5", "prompt": 45370, "cached": 0, "out": 1500, "ttft": 158.76, "decode_tps": 48.4, "start": 622.6}
+{"t": 906.48, "kind": "done", "tag": "w0-resend4", "prompt": 32301, "cached": 30752, "out": 1500, "ttft": 91.11, "decode_tps": 22.1, "start": 747.7}
+{"t": 1002.95, "kind": "done", "tag": "w1-r5", "prompt": 45303, "cached": 0, "out": 1500, "ttft": 251.96, "decode_tps": 19.6, "start": 674.5}
+{"t": 1079.8, "kind": "done", "tag": "w2-r6", "prompt": 52680, "cached": 0, "out": 1500, "ttft": 235.83, "decode_tps": 47.4, "start": 812.4}
+{"t": 1083.81, "kind": "end"}
