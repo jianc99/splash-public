@@ -335,12 +335,18 @@ public:
   // The accounts, claims and victim sources the governor's rule works on.
   [[nodiscard]] MemoryLedger &ledger() noexcept { return ledger_; }
   [[nodiscard]] const MemoryLedger &ledger() const noexcept { return ledger_; }
-  // While one lives, admissions are for `claim`; `growing` names the account
-  // a ledger growth allocates into, whose own pending growth is not held
-  // against it. It restores the scope it replaced.
+  // While one lives, admissions are for `claim`, under the host's rule for
+  // its class and the room claims ranked above it hold (MemoryLedger::
+  // heldBytes); with none open an admission is as allocationAdmission says.
+  // `growing` names the account a ledger growth allocates into, whose own
+  // pending growth is not held against it, and `hostCreditBytes` what that
+  // growth's victims gave back to the host just now: growth within it leaves
+  // the host's footprint where it was, which only critical pressure refuses.
+  // It restores the scope it replaced.
   class Scope final {
   public:
-    Scope(MemoryGovernor &governor, ClaimId claim, std::optional<AccountId> growing = {}) noexcept;
+    Scope(MemoryGovernor &governor, ClaimId claim, std::optional<AccountId> growing = {},
+          uint64_t hostCreditBytes = 0) noexcept;
     ~Scope();
     Scope(const Scope &) = delete;
     Scope &operator=(const Scope &) = delete;
@@ -349,6 +355,7 @@ public:
     MemoryGovernor &governor_;
     ClaimId previousClaim_;
     std::optional<AccountId> previousGrowing_;
+    uint64_t previousCredit_ = 0;
   };
   // The need its scope's refusals recorded, with the caller's in-place part.
   [[nodiscard]] Need need(ClaimId claim, const std::optional<Need> &inPlace = {}) const;
@@ -363,18 +370,21 @@ public:
   // found: the paths that ask take no sample of their own, unlike
   // EngineConfig::growthPaused.
   [[nodiscard]] bool admits(ClaimClass cls) const noexcept;
-  // Whether memory wants a temporary tier's copies ahead of need: the host
-  // is constrained, growth is pending, or the room for growth is short of
-  // one unit.
+  // Whether a temporary tier's copies ahead pay: within the value horizon a
+  // free() reached a cached unit that frees memory only once its copy
+  // lands (MemoryLedger::copyDemand).
   [[nodiscard]] bool copyDemand() const noexcept;
   // Whether a claim waits for memory on its way back, which copies ahead
   // would hold up.
   [[nodiscard]] bool claimWaiting() const noexcept;
-  // The control pass's decision: under critical pressure every pool to its
-  // floor, else the host's deficit freed or the pools grown into free room.
-  // Throws with a command in flight (the caller checks). True when the
-  // host's deficit is unmet while bytes are returning: the transport runs
-  // the pass again at the next command-free point.
+  // The control pass's decision, between commands: under macOS's critical
+  // pressure every pool to its floor and the host claim takes all it may;
+  // otherwise, on a pass the host has settled from the last one that
+  // returned memory, under macOS's warning the host claim frees the margin
+  // (cache only while the host lacks nothing past it), and in the band it
+  // frees the deficit; then the pools grow (MemoryLedger::grow). True when
+  // the host claim waits for memory on its way back: the transport runs the
+  // pass again at the next command-free point.
   [[nodiscard]] bool controlPass(double nowMilliseconds);
   // At startup, before Ready: grows the pools into the free room.
   void growToTargets(double nowMilliseconds);
@@ -417,17 +427,42 @@ private:
   [[nodiscard]] bool growthHeld(const HostState &host) const noexcept {
     return requestWaiting_ && host.held();
   }
-  // The host's rule at its latest sample: which classes it admits, and the
-  // deficit a host pass frees.
+  // The host's one rule at its latest sample (DESIGN section 4.4 R4;
+  // amend/M.md B3, B4): its headroom h is its spare memory above the spare
+  // reserve, beside what is being allocated. The band begins when h falls
+  // below the margin M (kHostMarginBytes) or cannot be measured, and ends
+  // once h clears M by the largest unit a pool grows by, or once a host pass
+  // finds nothing to take. Floor work passes; in-service work passes while h
+  // keeps M beyond it at normal pressure, and, once nothing in place meets
+  // it, as a claim the host exempts; growth within its credit passes, leaving
+  // the host's footprint where it was; anything else needs h to keep M
+  // beyond it outside the band and macOS's warning. macOS's critical
+  // pressure refuses everything.
   class HostRule final {
   public:
     void sample(const std::optional<HostMemory> &host, uint64_t spareReserve, uint64_t inFlight,
                 MemoryPressure system, uint64_t hysteresisBytes, bool reclaimShort) noexcept;
-    [[nodiscard]] bool admits(ClaimClass cls, uint64_t bytes, bool hostExempt) const noexcept;
+    [[nodiscard]] bool admits(ClaimClass cls, uint64_t bytes, bool hostExempt, uint64_t creditBytes) const noexcept;
+    // What the host lacks of M and of what the claims it refused wait for,
+    // beyond what is landing; nothing measured, nothing lacking.
     [[nodiscard]] uint64_t deficitBytes(uint64_t refusedWaitingBytes, uint64_t returningBytes) const noexcept;
-    [[nodiscard]] bool constrained() const noexcept;
-    [[nodiscard]] MemoryPressure level() const noexcept;
+    [[nodiscard]] bool constrained() const noexcept { return constrained_; }
+    [[nodiscard]] MemoryPressure level() const noexcept { return system_; }
+
+  private:
+    bool measured_ = false;
+    uint64_t headroom_ = 0;
+    MemoryPressure system_ = MemoryPressure::Normal;
+    bool constrained_ = true;
   };
+  // The host claim's pass: up to `target` of what it may take, or what is
+  // landing.
+  [[nodiscard]] FreeResult hostPass(uint64_t target, bool critical, bool deficit);
+  // Room under the limit beside what is charged and being allocated.
+  [[nodiscard]] uint64_t roomBytes() const noexcept;
+  // HostRule::sample at a fresh sample of the host.
+  void sampleHostRule(const std::optional<HostMemory> &host) noexcept;
+  [[nodiscard]] GrowthHost growthHost(bool displaces);
   // allocationAdmission's reservation, or growthAdmission's where
   // `optional`.
   [[nodiscard]] metal::AllocationAdmission admission(bool optional) noexcept;
@@ -464,9 +499,19 @@ private:
   // As the latest reservation or control pass evaluated it.
   HostState host_;
   MemoryLedger ledger_;
-  // The innermost Scope's claim and growing account.
+  // The innermost Scope's claim, growing account and host credit.
   ClaimId scope_;
   std::optional<AccountId> growing_;
+  uint64_t scopeCredit_ = 0;
+  HostRule hostRule_;
+  // The largest unit a pool grows by, as the last pass or evaluation found:
+  // how far past the margin the band reaches. Kept, so that an admission a
+  // pool's growth runs inside does not read the pool.
+  uint64_t growthUnitBytes_ = 0;
+  // When the host has settled from the last pass that returned memory, and
+  // whether the last host pass found nothing to take (the band's waiver).
+  double nextHostPassMilliseconds_ = 0.0;
+  bool hostPassShort_ = false;
 };
 
 // Connects an engine to the governor that admits its memory: the engine asks
