@@ -1,6 +1,7 @@
 import array
 import gc
 import io
+import itertools
 import math
 import queue
 import random
@@ -30,7 +31,8 @@ from server import constraints as generation_constraints
 from server import diagnostics, images, runtime
 from server import errors as api_errors
 from server import protocol as wire
-from server.chat_format import QWEN
+from server.chat_format import FLINT, QWEN, THINK_END, THINK_START, TOOL_CALL_OPEN
+from server.output import ReasoningSplitter
 from server.supervision import THRESHOLDS
 
 
@@ -1205,6 +1207,119 @@ class CallbackStreamerTests(unittest.TestCase):
                     streamer.count_reasoning_tokens(QWEN, True, tool_calls), expected
                 )
                 self.assertEqual(streamer.count_reasoning_tokens(QWEN, False, True), 0)
+
+    def test_reasoning_tokens_count_what_the_splitter_reads(self):
+        """The tokens count_reasoning_tokens counts decode to exactly the
+        reasoning ReasoningSplitter reads from the output's text, over random
+        outputs of THINK_START, THINK_END, a call's opening in one or two
+        tokens after TOOL_CALL_OPEN, a stray TOOL_CALL_OPEN no call follows,
+        and text: the server's two copies of where reasoning ends agree."""
+        # Qwen's generation prompt opens the reasoning, and its THINK_START
+        # is a token as any other; Flint's model opens it itself.
+        for chat_format, think_start in (
+            (QWEN, 248_068),
+            (FLINT, FLINT.think_start_id),
+        ):
+            texts = {
+                1: "a",
+                2: " b",
+                3: "\n",
+                4: "<function=",
+                5: "\n<function=",
+                6: "f>\n",
+                think_start: THINK_START,
+                chat_format.think_end_id: THINK_END,
+                chat_format.call_open_id: TOOL_CALL_OPEN,
+            }
+            tokenizer = SimpleNamespace(
+                backend_tokenizer=None,
+                decode=lambda ids, texts=texts: "".join(texts[token] for token in ids),
+            )
+            vocabulary = sorted(texts)
+            randomizer = random.Random(1175)
+            for _ in range(400):
+                token_ids = randomizer.choices(vocabulary, k=randomizer.randint(0, 10))
+                for thinking, tool_calls in itertools.product((False, True), repeat=2):
+                    streamer = backend_api.CallbackStreamer(tokenizer, lambda *_: None)
+                    streamer.token_ids = token_ids
+                    counted = streamer.count_reasoning_tokens(
+                        chat_format, thinking, tool_calls
+                    )
+                    # The model's own THINK_START opens the reasoning and is
+                    # not part of it.
+                    start = int(
+                        not thinking
+                        and chat_format.think_start_id is not None
+                        and token_ids[:1] == [chat_format.think_start_id]
+                    )
+                    splitter = ReasoningSplitter(thinking, tool_calls, chat_format)
+                    parts = [
+                        part
+                        for token in token_ids
+                        for part in splitter.put(texts[token])
+                    ] + splitter.finish()
+                    with self.subTest(
+                        chat_format=chat_format.message_boundary,
+                        token_ids=token_ids,
+                        thinking=thinking,
+                        tool_calls=tool_calls,
+                    ):
+                        self.assertEqual(
+                            tokenizer.decode(token_ids[start : start + counted]),
+                            "".join(
+                                text
+                                for kind, text in parts
+                                if kind == "reasoning_content"
+                            ),
+                        )
+
+    def test_a_stray_call_open_ends_the_engine_count_not_the_reasoning(self):
+        """Where a call may follow, the engine's thinking ends at the first
+        call-open token (ThinkingBudget.also_ends: it sees one token at a
+        time, and a longer end would change its cutoff kernel), the
+        reasoning only at one a call's opening follows. A stray TOOL_CALL_OPEN
+        ends the engine's count but not the reasoning, which can then run
+        past the budget, as docs/server.md says: a change to either side
+        fails here."""
+        transport = backend_api.NativeBackend(
+            DrivenRuntime(), DigitTokenizer(), lambda _record: None
+        )
+        self.addCleanup(transport.close)
+        job = make_job()
+        job.chat_format = QWEN
+        job.thinking_token_budget = 8
+        job.tool_policy = SimpleNamespace(schemas=("weather",))
+        budget = transport._thinking_budget(job)
+        texts = {
+            1: "a",
+            2: " b",
+            QWEN.call_open_id: TOOL_CALL_OPEN,
+            QWEN.think_end_id: THINK_END,
+        }
+        token_ids = [1, QWEN.call_open_id, 2, QWEN.think_end_id, 1]
+        engine = next(
+            index
+            for index, token in enumerate(token_ids)
+            if token in (budget.end[-1], budget.also_ends)
+        )
+        streamer = backend_api.CallbackStreamer(
+            SimpleNamespace(
+                backend_tokenizer=None,
+                decode=lambda ids: "".join(texts[token] for token in ids),
+            ),
+            lambda *_: None,
+        )
+        streamer.token_ids = token_ids
+        splitter = ReasoningSplitter(True, True, QWEN)
+        parts = [part for token in token_ids for part in splitter.put(texts[token])]
+        self.assertEqual(
+            (
+                engine,
+                streamer.count_reasoning_tokens(QWEN, True, True),
+                "".join(text for kind, text in parts if kind == "reasoning_content"),
+            ),
+            (1, 3, "a<tool_call> b"),
+        )
 
     def test_callback_streamer_matches_one_shot_for_random_token_batches(self):
         family = "👨‍👩‍👧‍👦".encode()
