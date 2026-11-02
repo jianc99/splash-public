@@ -526,6 +526,50 @@ void testSourceOrderIsKeptWithinASource() {
           "free() skipped ahead inside a source's order");
 }
 
+// A source's units keyed by their place in its order, as the cache's
+// reclaims are (steps from its state as it stands): taking one moves every
+// unit after it up a place.
+class PlacedSource final : public VictimSource {
+public:
+  [[nodiscard]] std::string_view name() const noexcept override { return "placed"; }
+  [[nodiscard]] std::optional<Victim> peek(const VictimQuery &, const Victim *after) const override {
+    const size_t place = after ? after->key + 1 : 0;
+    if (place >= units.size())
+      return std::nullopt;
+    Victim victim = units[place].second;
+    victim.key = place;
+    return victim;
+  }
+  FreeResult take(const VictimQuery &, const Victim &victim) override {
+    taken.push_back(units.at(victim.key).first);
+    units.erase(units.begin() + static_cast<std::ptrdiff_t>(victim.key));
+    return {.nowBytes = victim.bytes};
+  }
+  std::vector<std::pair<uint64_t, Victim>> units;  // the test's name for each unit, and the unit
+  std::vector<uint64_t> taken;
+};
+
+// free() takes the units its dry run chose from a source whose keys are
+// places: each by its place as the order stands after the takes before it,
+// past the units the run passed over, which stay.
+void testUnitsKeyedByTheirPlaceAreTakenAsChosen() {
+  MemoryLedger ledger;
+  PlacedSource placed;
+  TestSource other("other");
+  Victim inUse = unit(0, kGiB, 0.5);
+  inUse.cls = ReclaimClass::InUse;
+  placed.units = {{1, unit(0, kGiB, 1.0)}, {2, inUse}, {3, unit(0, kGiB, 2.0)}, {4, unit(0, kGiB, 3.0)}};
+  other.units = {unit(5, kGiB, 1.5)};
+  ledger.addSource(placed);
+  ledger.addSource(other);
+  const ClaimId claim = ledger.open(request(1, RequestPriority::Normal));
+  require(ledger.free(claim, {.bytes = 4 * kGiB}, 0, false, false).outcome == FreeOutcome::Met,
+          "the claim was not met");
+  require(placed.taken == std::vector<uint64_t>{1, 3, 4} && other.taken == std::vector<uint64_t>{5} &&
+              placed.units.size() == 1 && placed.units.front().first == 2,
+          "free() did not take the units its dry run chose from a source keyed by place");
+}
+
 // At equal cost per byte: a unit that frees memory now, then the source
 // registered first, the pools after the sources.
 void testTiesGoToTheImmediateUnitThenTheSourceRegisteredFirst() {
@@ -1370,6 +1414,7 @@ std::span<const test::TestCase> ledgerTests() {
       {"testDeficitCountsHostRefusedClaimsNotAnIdleMargin", testDeficitCountsHostRefusedClaimsNotAnIdleMargin},
       {"testCheapestPerByteFirstAcrossSources", testCheapestPerByteFirstAcrossSources},
       {"testSourceOrderIsKeptWithinASource", testSourceOrderIsKeptWithinASource},
+      {"testUnitsKeyedByTheirPlaceAreTakenAsChosen", testUnitsKeyedByTheirPlaceAreTakenAsChosen},
       {"testTiesGoToTheImmediateUnitThenTheSourceRegisteredFirst",
        testTiesGoToTheImmediateUnitThenTheSourceRegisteredFirst},
       {"testClassBoundsEligibility", testClassBoundsEligibility},

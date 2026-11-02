@@ -96,10 +96,12 @@ struct MemoryLedger::Account final {
   value::PoolRate rate;
 };
 
-// One unit a dry run chose: a source's (by index), or a pool's unit or
-// pending growth (by account).
+// One unit a dry run chose: a source's (by index, after the units of the
+// source it passed over since the source's previous choice), or a pool's
+// unit or pending growth (by account).
 struct MemoryLedger::Choice final {
   size_t source = 0;
+  uint32_t passed = 0;
   std::optional<AccountId> pool;
   bool pending = false;
   Victim victim;
@@ -305,6 +307,7 @@ MemoryLedger::DryRun MemoryLedger::dryRun(const ClaimSpec &spec, const VictimQue
   struct Head final {
     std::optional<Victim> victim;
     size_t source = 0;
+    uint32_t passed = 0;  // the source's units passed over since its last choice
     std::optional<AccountId> pool;
     bool pending = false;
     // A pool's reading, and the bytes above its floor the run has taken.
@@ -357,6 +360,10 @@ MemoryLedger::DryRun MemoryLedger::dryRun(const ClaimSpec &spec, const VictimQue
       head.victim = sources_[head.source]->peek(query, &*head.victim);
     }
   };
+  const auto pass = [&](Head &head) {
+    ++head.passed;
+    advance(head);
+  };
 
   DryRun run;
   for (;;) {
@@ -367,7 +374,7 @@ MemoryLedger::DryRun MemoryLedger::dryRun(const ClaimSpec &spec, const VictimQue
       // keep a unit that lands later in an Immediate claim's way, to note
       // that the run reached it.
       while (head.victim && (!mayTake(*head.victim) || lack.share(*head.victim) == 0.0))
-        advance(head);
+        pass(head);
       if (!head.victim)
         continue;
       const double price = head.victim->cost.at(spec.holdSeconds) / lack.share(*head.victim);
@@ -382,7 +389,7 @@ MemoryLedger::DryRun MemoryLedger::dryRun(const ClaimSpec &spec, const VictimQue
     if (victim.later && victim.kind == VictimKind::Memory)
       run.uncopied = true;
     if (victim.later && immediate) {
-      advance(*best);
+      pass(*best);
       continue;
     }
     const double cost = victim.cost.at(spec.holdSeconds);
@@ -394,7 +401,9 @@ MemoryLedger::DryRun MemoryLedger::dryRun(const ClaimSpec &spec, const VictimQue
       run.pages += victim.pages;
     run.buffers += victim.stateBuffers;
     run.later = run.later || victim.later;
-    run.chosen.push_back(Choice{.source = best->source, .pool = best->pool, .pending = best->pending, .victim = victim});
+    run.chosen.push_back(Choice{
+        .source = best->source, .passed = best->passed, .pool = best->pool, .pending = best->pending, .victim = victim});
+    best->passed = 0;
     advance(*best);
     if ((lack.bytes && run.bytes >= lack.bytes) || (lack.pages && run.pages >= lack.pages) ||
         (lack.buffers && run.buffers >= lack.buffers)) {
@@ -405,12 +414,14 @@ MemoryLedger::DryRun MemoryLedger::dryRun(const ClaimSpec &spec, const VictimQue
   return run;
 }
 
-// Takes what a covered dry run chose, in its order: a source's unit as the
-// latest peek over its order returns it again (the units the run skipped
-// skipped again), a pool's unit by its release, pending growth by cancelling
-// it.
+// Takes what a covered dry run chose, in its order: a source's unit by its
+// place in the source's order as it stands, past the units the run passed
+// over (VictimSource), a pool's unit by its release, pending growth by
+// cancelling it.
 FreeResult MemoryLedger::take(const DryRun &run, const VictimQuery &query, ClaimState *claim) {
   FreeResult result{.outcome = run.later ? FreeOutcome::Pending : FreeOutcome::Met};
+  // Each source's last unit the run passed over, which stays in its order.
+  std::vector<std::optional<Victim>> passed(sources_.size());
   for (const Choice &choice : run.chosen) {
     if (choice.pool) {
       Account &account = accounts_[choice.pool->value];
@@ -427,9 +438,12 @@ FreeResult MemoryLedger::take(const DryRun &run, const VictimQuery &query, Claim
       continue;
     }
     VictimSource &source = *sources_[choice.source];
-    std::optional<Victim> unit = source.peek(query, nullptr);
-    while (unit && unit->key != choice.victim.key)
-      unit = source.peek(query, &*unit);
+    std::optional<Victim> &before = passed[choice.source];
+    std::optional<Victim> unit = source.peek(query, before ? &*before : nullptr);
+    for (uint32_t over = 0; unit && over < choice.passed; ++over) {
+      before = unit;
+      unit = source.peek(query, &*before);
+    }
     if (!unit)
       throw std::logic_error(std::string(source.name()) + " no longer offers a unit its dry run chose");
     const FreeResult taken = source.take(query, *unit);

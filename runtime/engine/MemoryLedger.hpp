@@ -172,8 +172,15 @@ struct VictimQuery final {
 // A source of the units free() takes, on the engine thread between commands.
 // peek changes nothing, and may understate what later units free but never
 // overstate it: free() takes nothing unless what it peeked covers the need.
-// take takes exactly the unit the latest peek returned. Units that cost
-// nothing and are sized only when taken come first in a source's order.
+// take takes exactly the unit the latest peek returned. A key may name its
+// unit by no more than its place in the source's order (the cache's
+// reclaims are steps from its state as it stands), but a conversion's is
+// its lane's request id, which free() records: free() takes the units its
+// dry run chose in the source's order, each found again by peeking from the
+// head as it stands then, past as many units as the run passed over before
+// it. So taking a unit leaves the units before it where they were and those
+// after it in their order. Units that cost nothing and are sized only when
+// taken come first in a source's order.
 class VictimSource {
 public:
   virtual ~VictimSource() = default;
