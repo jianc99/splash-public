@@ -1932,19 +1932,16 @@ bool Engine::advanceWeights(double now) {
     const Serving serving(config_.serving, !waiting.empty());
     return weights_->restore(now);
   }();
-  switch (step.kind) {
-  case WeightResidency::Step::Kind::Progress:
-    // A part that came back restarts each waiting request's resource wait
-    // limit (resourceDeadline).
-    for (Request *waiter : waiting)
-      waiter->resourceWait.earlierLaneWorkMilliseconds = now;
+  if (step.kind != WeightResidency::Step::Kind::Refused) {
+    // A part that came back ends each waiting request's wait for memory: its
+    // limit counts from its next refusal, by the restore or, once the weights
+    // are back, by its start.
+    for (Request *waiter : waiting) {
+      waiter->resourceWait = {};
+      scheduler_.deferAdmission(waiter->request.id);
+    }
     signalResourceProgress();
     return true;
-  case WeightResidency::Step::Kind::Restored:
-    signalResourceProgress();
-    return true;
-  case WeightResidency::Step::Kind::Refused:
-    break;
   }
   // Each waiting request waits for memory on its own clock, and fails once
   // this attempt at or past its limit was refused.

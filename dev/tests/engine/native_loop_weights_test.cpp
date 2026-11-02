@@ -714,6 +714,54 @@ void testRestoreTriesAgainAtTheLimit() {
           "the request did not get the weights that came back at its limit");
 }
 
+// A part of the weights that comes back ends the waits for memory of the
+// requests waiting for them: a request refused memory at its start once the
+// weights are back waits the resource wait limit from that refusal, however
+// long the restore kept it waiting for the last part.
+void testARestoredRequestWaitsAfreshAtItsStart() {
+  constexpr double kWaitLimit = 400.0;
+  bool refuseWeights = false, refuseStates = false;
+  engine::NativeLoopConfig config;
+  config.engine.maxContext = 1024;
+  config.engine.resourceWaitTimeoutMilliseconds = kWaitLimit;
+  config.engine.weights = WeightResidencyConfig{.admit = refusing(refuseWeights)};
+  LoopFixture fixture(config, {}, {}, metal::kResidencyKeepAliveSeconds,
+                      test::LoopOptions{.memory = test::FakeMemory::Config{}, .control = false});
+  // A lane's state buffers, refused while refuseStates is set.
+  fixture.executor.laneFootprintBytes = 64ULL << 20;
+  fixture.executor.admission = refusing(refuseStates);
+  engine::NativeRuntime &loop = fixture.loop;
+  loop.announceReady();
+  require(!releaseAnswer(fixture, 1).restoring && fixture.weights.released(),
+          "the weights were not released");
+  require(loop.receive(protocol::peer::serialize(request(1))) && loop.tick() && loop.tick() &&
+              fixture.weights.held() == Weights::kImages - 1,
+          "the restore did not write back the images before the last");
+  refuseWeights = true;
+  require(!loop.tick() && loop.resourceWaitSnapshot().memory == 1,
+          "the request did not wait for the last image");
+  fixture.monotonic += kWaitLimit - 100.0;
+  require(!loop.tick() && !errorOf(fixture, 1), "a refused restore gave up before the resource wait limit");
+  // The last image comes back; the request's start is refused memory.
+  refuseWeights = false;
+  refuseStates = true;
+  require(loop.tick() && !fixture.weights.released(), "the last image did not come back");
+  static_cast<void>(loop.tick());
+  const ResourceWaitSnapshot wait = loop.resourceWaitSnapshot();
+  require(wait.memory == 1 && wait.oldestWaitMilliseconds == 0.0 && !errorOf(fixture, 1),
+          "the request refused memory at its start did not wait from that refusal");
+  fixture.monotonic += kWaitLimit - 1.0;
+  static_cast<void>(loop.tick());
+  require(!errorOf(fixture, 1),
+          "a request the restore kept waiting failed before the resource wait limit from its "
+          "refusal at its start");
+  fixture.monotonic += 1.0;
+  require(loop.tick(), "the request's resource wait limit passed without progress");
+  const std::optional<protocol::ErrorEvent> error = errorOf(fixture, 1);
+  require(error && error->code == "resource_timeout" && error->retryable,
+          "the request refused memory at its start did not fail at its limit");
+}
+
 // The expert store's chunks above its floor are the model's (Executor::
 // expertChunks): a release gives them back with the floor, and a restore
 // takes the floor back alone in one admission (`floors` counts those), as
@@ -835,6 +883,7 @@ std::span<const test::TestCase> weightsTests() {
       {"testTransfersLandWhileTheWeightsAreRestored", testTransfersLandWhileTheWeightsAreRestored},
       {"testRequestsWaitForTheWeightsEachOnItsOwnClock", testRequestsWaitForTheWeightsEachOnItsOwnClock},
       {"testRestoreTriesAgainAtTheLimit", testRestoreTriesAgainAtTheLimit},
+      {"testARestoredRequestWaitsAfreshAtItsStart", testARestoredRequestWaitsAfreshAtItsStart},
       {"testRestoredStoreGrowsBackAfterTheRequest", testRestoredStoreGrowsBackAfterTheRequest},
       {"testRestoreTakesTheFloorWhateverTheHostSpares", testRestoreTakesTheFloorWhateverTheHostSpares},
   };

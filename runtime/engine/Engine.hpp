@@ -267,10 +267,10 @@ public:
   // runs its timed checks, collects transfers and runs write-behind, then
   // takes back one part of the weights while a request waits, under the
   // admission of memory a request in service needs (Serving). A part that
-  // comes back restarts their resource wait limit; a refused one makes them
-  // wait for memory (resourceWaitSnapshot), retried at every tick, which the
-  // loop runs for their retries and limits; each fails once the attempt at
-  // or past its own limit is refused. Once no request waits, the restore goes
+  // comes back ends their waits for memory; a refused one makes them wait
+  // for memory (resourceWaitSnapshot), retried at every tick, which the loop
+  // runs for their retries and limits; each fails once the attempt at or
+  // past its own limit is refused. Once no request waits, the restore goes
   // on while memory admits it without the mark, and a refused part ends it:
   // the weights give back what came back. No request runs until they are
   // back.
