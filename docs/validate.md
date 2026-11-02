@@ -20,15 +20,13 @@ none. Hosted CI runs the CPU checks, `check-native-build`, the sanitizers and
 the control plane's (`engine`, `native-engine-loop`, the cache, protocol and
 transport tests) among them, under AddressSanitizer with UndefinedBehavior
 and under ThreadSanitizer. `make test-sanitizers-metal` runs the Metal tests
-of the components whose host steps share their state with the engine thread
-and the SSD readers (the hot block cache of spilled KV, the history stream
-and the expert store) under ThreadSanitizer, built with it in
-`build/metal-tsan`; only orders that lie inside Metal are suppressed
-(`dev/tests/engine/metal_tsan_suppressions.txt`). `metal-backend` is not among
-them until the backend sets a command's `HostSteps::releases` once, before its
-steps reach the host-step runner: each awake step sets it again (to the same
-buffer) while the runner may read it, a race ThreadSanitizer reports on every
-run. `make architecture-check`, one of the source checks,
+of the backend (`metal-backend`, whose host-step runner shares each
+command's steps with the thread that encodes it) and of the components whose
+host steps share their state with the engine thread and the SSD readers (the
+hot block cache of spilled KV, the history stream and the expert store) under
+ThreadSanitizer, built with it in `build/metal-tsan`; only orders that lie
+inside Metal are suppressed (`dev/tests/engine/metal_tsan_suppressions.txt`).
+`make architecture-check`, one of the source checks,
 also fails when a workflow under `.github/workflows` names a Hugging Face token
 (`HF_TOKEN`, `HUGGING_FACE_HUB_TOKEN` or a `secrets.HF_*` secret): CI installs
 public models alone and never receives one.
