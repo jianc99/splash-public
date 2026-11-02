@@ -1902,7 +1902,9 @@ void hostSteps(const std::string &metallibPath) {
 
 // The first command of a fresh backend may hold an awake host step: the
 // backend builds and checks the spin before it encodes the command, which
-// runs the step between its work and spins through it on this system.
+// runs the step between its work, and spins through it on this system once
+// the check decided. A check the busy GPU kept from deciding ran the step
+// without the spin, as designed: its resume is then not the spin's.
 void firstCommandWithAnAwakeHostStep(const std::string &metallibPath) {
     MetalBackend backend(metallibPath);
     MetalBuffer buffer = sharedBuffer(backend, sizeof(uint32_t));
@@ -1917,9 +1919,15 @@ void firstCommandWithAnAwakeHostStep(const std::string &metallibPath) {
     (void)backend.submitCommandAsync(Command{dispatches, steps}).wait();
     require(seen == 1 && *value == 2 && backend.healthy(),
             "an awake host step in a fresh backend's first command did not run between its work");
-    // A first check that decided nothing ran the step without the spin.
-    const std::optional<bool> spins = spinCheck(backend, "a fresh backend's first awake host step");
-    require(spins.value_or(true) && timing.resumeSeconds < kIdleResumeSeconds,
+    // What the check made of the first command, before anything checks again.
+    const std::optional<bool> spins = BackendInstrumentation::hostStepSpinDecision(backend);
+    require(spins.value_or(true), "a GPU spin through an awake host step did not see the CPU end it");
+    if (!spins) {
+        std::cout << "SKIP a fresh backend's first awake host step: the GPU stayed too busy for the spin check "
+                     "to decide\n";
+        return;
+    }
+    require(timing.resumeSeconds < kIdleResumeSeconds,
             "the GPU did not spin through an awake host step of a fresh backend's first command: resume " +
                 std::to_string(timing.resumeSeconds) + " s");
     std::cout << "PASS a fresh backend's first command spins through its awake host step\n";

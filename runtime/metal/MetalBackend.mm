@@ -2092,6 +2092,11 @@ std::optional<bool> BackendInstrumentation::awakeHostStepsSpin(MetalBackend &bac
     MetalBackend::Impl &impl = *backend.impl_;
     if (!impl.hostStepSpin && impl.nextSpinCheck != AwakeClock::time_point::max())
         impl.checkHostStepSpin();
+    return hostStepSpinDecision(backend);
+}
+
+std::optional<bool> BackendInstrumentation::hostStepSpinDecision(const MetalBackend &backend) {
+    const MetalBackend::Impl &impl = *backend.impl_;
     if (impl.hostStepSpin) return true;
     if (impl.nextSpinCheck == AwakeClock::time_point::max()) return false;
     return std::nullopt;
