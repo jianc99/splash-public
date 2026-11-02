@@ -201,10 +201,19 @@ inline constexpr std::span<const SplitTier> kApple9StagedTiers = std::span(kRegi
 // (in-sample), the law's choices take 1.1%, 1.6% and 0.05% less time than the
 // earlier rules' in total on the M5 Max, the M5 Pro and the M6, 29, 30 and 3
 // cases 3-33% less, and 2, 2 and 1 cases 4-12% more (a 34-us pair of four
-// threadgroups per core over 2048 inputs, two lanes). Status: measured over
-// 2048 and 5120 inputs and pairs in MLX 4-bit; the down projections' 17408
-// inputs, pairs in other formats and low-bit pairs take the law unmeasured
-// (U6). Staged partitions keep 512 inputs, eight at most.
+// threadgroups per core over 2048 inputs, two lanes). Over the 27B's down
+// projection (5120 x 17408: Q4_K, Q5_K, Q6_K, Q8_0, MLX 4-bit) and gate/up
+// pair (17408 x 5120: Q4_K, Q6_K, IQ3_XXS, IQ2_XS) at one to four lanes
+// (medians of 20, two passes; binaries e33524f0, metallib 703016c3) the
+// law's choice is within the A/A spread of the fastest split in 35 of 36
+// cases on the 12-core M6 (spread 10.6%; Q4_K down at one lane takes 11.5%
+// more than at sixteen) and in 18 of 36 on the 32-core M5 Max (spread 2.9%),
+// where it splits downs in four that run 4-16% faster in two (Q8_0, Q6_K,
+// Q5_K) and runs IQ2_XS, IQ3_XXS and Q6_K pairs in two passes that run 6-16%
+// faster in one: at most 65 us a call, about 0.5 ms of a 27B UD-Q4_K_M decode
+// step whose projections take at least 35 ms, under the 5% that would refit
+// the law. Status: measured (U6). Staged partitions keep 512 inputs, eight at
+// most.
 inline constexpr WaveLaw kApple10StagedLaw{{10, 6, 2}, {16, 10, 3}, 512, 8};
 static_assert(kApple10StagedLaw.tile.resident >= kApple10StagedLaw.tile.saturating &&
                   kApple10StagedLaw.gateUpPair.resident >= kApple10StagedLaw.gateUpPair.saturating,
@@ -217,8 +226,15 @@ static_assert(kApple10StagedLaw.tile.resident >= kApple10StagedLaw.tile.saturati
 // lane, 2-11% at two and 2-9% at four, and on Q2_K 24-33% less at two and
 // four lanes but 5-8% more at one. Three lanes pad its 24 rows to 32, where it
 // takes 16-47% more for every format; the other formats keep the register
-// tile, 6-44% faster at one lane. Status: measured on the 40-core M3 Max;
-// unmeasured on a 10-core Apple9 (U3), which takes it.
+// tile, 6-44% faster at one lane. On a 10-core M4 over the 27B's and the
+// 35B's decode shapes in the matrix GGUFs' formats (Q4_K, Q5_K, IQ4_XS,
+// Q6_K, Q8_0, their fused inputs) and in Q3_K and IQ3_S, staged at its split
+// against the register tile's (gguf-projection-benchmark, medians of 20, two
+// passes 1.0-1.7% apart in the sessions without other load; binaries
+// e33524f0, metallib 703016c3): the staged tile takes 4-34% more time at one
+// to three lanes, and at four 3-9% less on the 5120- and 8192-column shapes
+// but 13-42% more on the 35B's shared expert (512 and 2048 columns), so a 10-
+// core Apple9 keeps these entries. Status: measured (M3 Max; M4, U3).
 inline constexpr RegisterBoundary kApple9DecodeRegister{{{
     {0, 0, kAlways, 0},             // GridLookup
     {kAlways, 0, kAlways, 0},       // GridLookupOrQ2K
