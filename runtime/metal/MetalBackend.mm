@@ -545,7 +545,8 @@ struct HostSteps {
     std::shared_ptr<BackendAsyncState> backend;
     // The command's submission (BackendAsyncState::beginSubmission).
     uint64_t sequence = 0;
-    // The spin's release buffer (HostStepSpin), once a step spins.
+    // The spin's release buffer (HostStepSpin) while awake steps spin, set
+    // before the first step reaches the runner, which reads it.
     __strong id<MTLBuffer> releases = nil;
     // A deque, so that the runner holds on to a step while the submission
     // appends the next.
@@ -1223,6 +1224,7 @@ struct MetalBackend::Impl {
             steps->readyEvent = [device newSharedEvent];
             steps->ranEvent = [device newSharedEvent];
             if (!steps->readyEvent || !steps->ranEvent) failEncoding("unable to create Metal shared event");
+            if (hostStepSpin) steps->releases = hostStepSpin->releases;
         }
         const uint64_t ready = steps->steps.size() + 1;
         [command encodeSignalEvent:steps->readyEvent value:ready];
@@ -1232,7 +1234,6 @@ struct MetalBackend::Impl {
             id<MTLCommandBuffer> awake = [queue commandBuffer];
             if (!awake) failEncoding("unable to create Metal command buffer");
             released = encodeSpin(*hostStepSpin, awake, failEncoding);
-            steps->releases = hostStepSpin->releases;
             leading.push_back(awake);
         }
         id<MTLCommandBuffer> next = [queue commandBuffer];
