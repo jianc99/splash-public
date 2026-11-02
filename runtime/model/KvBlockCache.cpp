@@ -369,6 +369,11 @@ uint64_t KvBlockCache::releaseAboveFloor() {
 
 uint64_t KvBlockCache::extentBytes() const noexcept { return impl_->pages.extentBytes(); }
 
+// A slot of every layer takes an extent's bytes over its slots.
+uint64_t KvBlockCache::slotBytes() const noexcept {
+  return impl_->pages.extentBytes() / (uint64_t{impl_->extentSlots} * impl_->format.layout().attentionLayers);
+}
+
 ops::AttentionBlocks KvBlockCache::addResolve(metal::CommandGraph &graph, uint32_t layer,
                                               std::span<const std::shared_ptr<const KvPageSources>> lanes,
                                               const ops::AttentionBlocks &blocks,
@@ -421,11 +426,10 @@ void KvBlockCache::mergeStats(const KvReadStats &stats) {
 KvBlockCacheStats KvBlockCache::stats() const {
   const Impl &impl = *impl_;
   const uint64_t extentBytes = impl.pages.extentBytes();
-  // A slot of every layer takes an extent's bytes over its slots.
   return {.bytes = impl.extents * extentBytes,
           .targetBytes = impl.targetExtents * extentBytes,
           .floorBytes = impl.floorExtents(impl.floorLanes()) * extentBytes,
-          .ghostBytes = impl.ghosts * extentBytes / (uint64_t{impl.extentSlots} * impl.directory.size()),
+          .ghostBytes = impl.ghosts * slotBytes(),
           .slotsPerLayer = impl.extents * impl.extentSlots,
           .lanes = impl.floorLanes(),
           .reads = impl.totals,

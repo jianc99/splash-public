@@ -115,7 +115,8 @@ private:
 // floors (KvBlockCache::releaseAboveFloor) and taken toward the planned
 // target while a lane holds a floor (growTowardTarget), which its floors may
 // take it past. Its value: its resolves' hits and ghost hits, the bytes its
-// ghosts would take, and the read time of a block it missed.
+// ghosts would take, the read time of a block it missed and a slot's bytes,
+// which a missed block is read into.
 class HotBlocksPool final : public ElasticPool {
 public:
   explicit HotBlocksPool(KvBlockCache &cache) noexcept : cache_(cache) {}
@@ -137,7 +138,8 @@ public:
             .ghostBytes = stats.ghostBytes,
             .missMilliseconds = stats.reads.misses ? stats.read.totalMilliseconds / double(stats.reads.misses) : 0.0,
             .releasedBytes = released_.bytes(),
-            .releaseMilliseconds = released_.milliseconds()};
+            .releaseMilliseconds = released_.milliseconds(),
+            .keyBytes = cache_.slotBytes()};
   }
   uint64_t release(uint64_t bytes) override {
     return released_([&] { return releaseUnits(bytes, [this] { return cache_.releaseAboveFloor(); }); });

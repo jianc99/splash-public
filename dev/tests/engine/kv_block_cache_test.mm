@@ -21,6 +21,7 @@
 #include "TestBuffers.hpp"
 #include "TestChecks.hpp"
 #include "TestKvTier.hpp"
+#include "engine/MemoryValue.hpp"
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
 #include "model/KvBlockCache.hpp"
@@ -365,7 +366,8 @@ void growsAndReleases(MetalBackend &backend) {
 // unit, given back above the floors one at a time or all at once, counted
 // with the time it took; it grows toward its target while a lane holds a
 // floor; its value is its resolves' hits and ghost hits, the bytes of the
-// blocks its layers gave up lately, and the read time of a block it missed.
+// blocks its layers gave up lately, the read time of a block it missed and
+// the bytes it reads into, a slot of one layer.
 void growsAsAPool(MetalBackend &backend) {
   const kv::Layout layout = layoutOf(kv::Format::Int8);
   const uint64_t extent = extentBytes(layout);
@@ -437,6 +439,20 @@ void growsAsAPool(MetalBackend &backend) {
               value.ghostBytes == stats.ghostBytes && stats.ghostBytes &&
               stats.ghostBytes <= extent / layout.attentionLayers && value.missMilliseconds > 0,
           "the pool's value is not its resolves' hits, ghost hits, ghost bytes and miss time");
+  // A miss reads a block into a slot of one layer: an extent's bytes over its
+  // slots and the layers, the bytes a ghost spans. So growth into free room
+  // pays for an extent's refill, a miss a slot: while claims take extents
+  // back, two a horizon, an extent whose ghost hits save less than its refill
+  // waits (engine::value::growsIntoFreeRoom).
+  require(value.keyBytes == extent / (uint64_t{kExtentSlots} * layout.attentionLayers) &&
+              stats.ghostBytes % value.keyBytes == 0,
+          "a miss of the pool does not read a slot of one layer");
+  engine::value::PoolRate rate;
+  rate.observe({}, 0, 0.0, true);
+  rate.observe(value, 2, engine::kValueHorizonSeconds, true);
+  const double benefit = engine::value::growthBenefit(rate, value, extent, 0, {});
+  require(benefit > 0.0 && !engine::value::growsIntoFreeRoom(rate, benefit, engine::value::cycleSeconds(value, extent)),
+          "an extent claims kept taking back grew into free room though its refill cost more than it saved");
   // Above the floor an extent at a time, counted.
   require(static_cast<bool>(pool.grow(test::admitAll)) && static_cast<bool>(pool.grow(test::admitAll)) &&
               pool.state().releaseUnitBytes == extent && pool.release(1) == extent &&
