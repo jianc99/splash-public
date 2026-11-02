@@ -252,6 +252,11 @@ def validate(run: Run, spec: dict, cell: dict) -> None:
     if meta:
         if not meta.get("complete"):
             run.invalid.append(f"run.py did not complete: {meta.get('error')}")
+        idle = meta.get("gpu_idle_check")
+        if idle and not idle["ok"]:
+            run.invalid.append(
+                f"the GPU was busy at the start ({idle['max_percent']} %)"
+            )
         model = spec["models"][cell["model"]]["model"]
         if meta.get("model") != model:
             run.invalid.append(f"model {meta.get('model')}, the cell's is {model}")
@@ -1542,11 +1547,21 @@ def planned_runs(cell: dict, references: bool) -> list[tuple[str, str, int]]:
     return interleave(cell.get("runs") or {})
 
 
-def draft_path(model: dict) -> str | None:
+def draft_path(model: dict, machine: dict) -> str | None:
+    """The draft's snapshot in the machine's Hugging Face hub (its HF_HOME's,
+    else ~/.cache/huggingface), read by the installer."""
     if not model.get("draft"):
         return None
     owner, name = model["draft"].split("/")
-    return f"$HOME/.cache/huggingface/hub/models--{owner}--{name}/snapshots/{model['draft_revision']}"
+    home = machine.get("hf_home", "$HOME/.cache/huggingface")
+    return f"{home}/hub/models--{owner}--{name}/snapshots/{model['draft_revision']}"
+
+
+def machine_prefix(machine: dict) -> str:
+    """What a job runs its commands under on the machine: its Hugging Face
+    home and its niceness, where the spec gives them (the mini-M4)."""
+    prefix = f'HF_HOME="{machine["hf_home"]}" ' if machine.get("hf_home") else ""
+    return prefix + (f"nice -n {machine['nice']} " if machine.get("nice") else "")
 
 
 def job_script(spec: dict, cell: dict, tree: str, order: str, repeat: int, args) -> str:
@@ -1566,7 +1581,7 @@ def job_script(spec: dict, cell: dict, tree: str, order: str, repeat: int, args)
         ]
         if model.get("language_only", True):
             variables.append("LANGUAGE_ONLY=1")
-        draft = draft_path(model)
+        draft = draft_path(model, machine)
         if draft:
             variables.append(f'DRAFT_MODEL="{draft}"')
         results = f"build/release/{model['model'].replace('/', '--').replace(':', '--')}/backend-regression.json"
@@ -1574,7 +1589,8 @@ def job_script(spec: dict, cell: dict, tree: str, order: str, repeat: int, args)
             "#!/bin/zsh\n"
             f"# {label}: cell {cell['name']}, {model['model']} against {cell['baseline']} ({spec['path']})\n"
             f"cd {shlex.quote(args.trees[base])} || exit 1\n"
-            f"/usr/bin/lockf -k {machine['lock']} make install test-performance-real {' '.join(variables)}\n"
+            f"/usr/bin/lockf -k {machine['lock']} env {machine_prefix(machine)}make install "
+            f"test-performance-real {' '.join(variables)}\n"
             "status=$?\n"
             f"cp {results} {shlex.quote(args.out)}/{label}.backend-regression.json\n"
             "echo EXIT=$status\n"
@@ -1596,7 +1612,7 @@ def job_script(spec: dict, cell: dict, tree: str, order: str, repeat: int, args)
             f"{label}: set the placeholder in {server_args!r} with --set KEY=VALUE"
         )
     command = [
-        "python3",
+        f"{args.tools}/.venv/bin/python",
         "-m",
         "dev.benchmarks.serving.run",
         "--tree",
@@ -1641,6 +1657,8 @@ def job_script(spec: dict, cell: dict, tree: str, order: str, repeat: int, args)
         command += ["--samples", str(cell["samples"])]
     if cell["scenario"] == "warm":
         command += ["--trial", str(repeat)]
+    if machine.get("gpu_idle_percent") is not None:
+        command += ["--gpu-idle-percent", str(machine["gpu_idle_percent"])]
     if cell["scenario"] == "ttft":
         command += [
             "--n",
@@ -1649,14 +1667,14 @@ def job_script(spec: dict, cell: dict, tree: str, order: str, repeat: int, args)
             str(cell.get("rounds", 3)),
         ]
     quoted = " ".join(shlex.quote(word) for word in command)
-    draft = draft_path(model)
+    draft = draft_path(model, machine)
     if draft:
         quoted += f' --draft-model "{draft}"'
     return (
         "#!/bin/zsh\n"
         f"# {label}: cell {cell['name']}, tree {tree}, order {order}, repeat {repeat} ({spec['path']})\n"
         f"cd {shlex.quote(args.tools)} || exit 1\n"
-        f"/usr/bin/lockf -k {machine['lock']} {quoted}\n"
+        f"/usr/bin/lockf -k {machine['lock']} env {machine_prefix(machine)}{quoted}\n"
         "echo EXIT=$?\n"
     )
 

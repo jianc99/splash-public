@@ -680,6 +680,23 @@ class PlanTests(unittest.TestCase):
                                 words[words.index("dev.benchmarks.serving.run") + 1 :]
                             )
                             self.assertTrue(job.name.endswith(f"-{parsed.label}.sh"))
+                            if machine == "mini":
+                                # Its own HF home, nice 15 and the GPU idle check.
+                                self.assertEqual(
+                                    words[3:7],
+                                    [
+                                        "env",
+                                        "HF_HOME=/home/dev/splash-lead/hf",
+                                        "nice",
+                                        "-n",
+                                    ],
+                                )
+                                self.assertEqual(parsed.gpu_idle_percent, 0)
+                                self.assertTrue(
+                                    parsed.draft_model.startswith(
+                                        "/home/dev/splash-lead/hf/hub/"
+                                    )
+                                )
                         else:
                             self.assertIn("test-performance-real", words, job.name)
                             self.assertIn("BASELINE=/trees/pass", words, job.name)
@@ -731,6 +748,14 @@ class RunTests(unittest.TestCase):
                 run.refuse_protected(root / "elsewhere"),
                 Path(os.path.realpath(root / "elsewhere")),
             )
+
+    def test_gpu_utilization_reads_ioreg(self):
+        line = (
+            '  | "PerformanceStatistics" = {"In use system memory"=1,'
+            '"Device Utilization %"=37,"Renderer Utilization %"=12}'
+        )
+        with mock.patch.object(run, "command_output", return_value=line):
+            self.assertEqual(run.gpu_utilization(), 37)
 
     def test_a_port_that_answers_is_refused(self):
         with socket.socket() as listener:

@@ -56,6 +56,10 @@ STOP_GRACE_SECONDS = 60
 # The M5 Pro is the owner's laptop: its idle time and sleep assertions are
 # sampled this often during a run (amend/V.md A96).
 IDLE_SAMPLE_SECONDS = 10
+# On a machine whose owner does not hold our lock (the mini-M4), a timed
+# run waits until the GPU is as idle as it was recorded with nothing running:
+# five samples 2 s apart, for up to 10 minutes (amend/V.md A96 item 4).
+GPU_IDLE_SAMPLES, GPU_IDLE_PERIOD, GPU_IDLE_WAIT_SECONDS = 5, 2.0, 600
 # The processes of the top of `ps -r` a snapshot keeps.
 PS_LINES = 15
 PRINT_CONSTANTS = "splash-benchmark-print-build-id-constants:\n\t@printf '%s\\n' $(BUILD_ID_CONSTANT_ARGS)\n"
@@ -208,6 +212,35 @@ def ps_snapshot(ours: set[int]) -> dict:
         "rows": rows,
         "therm": command_output(["pmset", "-g", "therm"]).strip(),
     }
+
+
+def gpu_utilization() -> int:
+    """The GPU's Device Utilization % now (IOAccelerator statistics)."""
+    for line in command_output(["ioreg", "-r", "-c", "AGXAccelerator"]).splitlines():
+        if '"Device Utilization %"=' in line:
+            return int(
+                line.split('"Device Utilization %"=')[1].split(",")[0].split("}")[0]
+            )
+    return 0
+
+
+def wait_gpu_idle(idle_percent: int) -> dict:
+    """Waits until five samples over 10 s are at most the machine's recorded
+    idle level, up to GPU_IDLE_WAIT_SECONDS; says whether they were."""
+    started = time.time()
+    while True:
+        highest = 0
+        for _ in range(GPU_IDLE_SAMPLES):
+            highest = max(highest, gpu_utilization())
+            time.sleep(GPU_IDLE_PERIOD)
+        waited = round(time.time() - started, 1)
+        if highest <= idle_percent or waited >= GPU_IDLE_WAIT_SECONDS:
+            return {
+                "ok": highest <= idle_percent,
+                "max_percent": highest,
+                "waited_s": waited,
+            }
+        time.sleep(10)
 
 
 def idle_sample() -> dict:
@@ -433,6 +466,11 @@ def parse_args(argv=None):
         "--trial", type=int, default=1, help="warm: the trial, which picks the texts"
     )
     parser.add_argument(
+        "--gpu-idle-percent",
+        type=int,
+        help="wait until the GPU is this idle before the run (the machine's recorded idle level)",
+    )
+    parser.add_argument(
         "--server-args", default="", help="the server's own options, one shell string"
     )
     parser.add_argument(
@@ -516,6 +554,8 @@ def main(argv=None) -> int:
         meta["model_root"] = root
         meta["host_at_start"] = host_memory()
         meta["first_start"] = first_start(starts, meta["binary_sha256"])
+        if args.gpu_idle_percent is not None:
+            meta["gpu_idle_check"] = wait_gpu_idle(args.gpu_idle_percent)
         note(
             f"root {root} tree {tree} binary {meta['binary_sha256'][:12]} build {meta['build_id']}"
         )
