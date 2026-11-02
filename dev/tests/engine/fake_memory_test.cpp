@@ -372,16 +372,17 @@ void testATickThatChangesNothingSpinsOnlyWhenItWouldRunAgain() {
   require(harness.now() == 1.0, "the harness clock moved");
 }
 
-// The model's memory queries count per candidate and admission state: two
-// in one state count twice, one after an allocation counts in the next.
-void testMemoryQueriesCountPerCandidateAndState() {
+// The model's spilled-read shortfall queries count per candidate and
+// admission state: two in one state count twice, one after an allocation
+// counts in the next.
+void testShortfallQueriesCountPerCandidateAndState() {
   test::EngineHarness harness({.memory = sixteen(), .limits = {.limitBytes = 6 * kGiB}});
   static_cast<void>(harness.model.spilledReadShortfall(5, {}));
   static_cast<void>(harness.model.spilledReadShortfall(5, {}));
-  require(harness.mostAvailableCalls() == 2, "two queries in one state were not counted");
+  require(harness.mostShortfallQueries() == 2, "two queries in one state were not counted");
   harness.memory->hold("kv", 4096);
   static_cast<void>(harness.model.spilledReadShortfall(5, {}));
-  require(harness.availableCalls().size() == 2 && harness.mostAvailableCalls() == 2,
+  require(harness.shortfallQueries().size() == 2 && harness.mostShortfallQueries() == 2,
           "a query after an allocation counted in the same state");
 }
 
@@ -412,7 +413,7 @@ int main(int argc, char **argv) {
       {"endedLanesLeaveOneLanesBuffersPooled", testEndedLanesLeaveOneLanesBuffersPooled},
       {"theHarnessChecksTheBooksEveryTick", testTheHarnessChecksTheBooksEveryTick},
       {"aTickThatChangesNothingSpinsOnlyWhenItWouldRunAgain", testATickThatChangesNothingSpinsOnlyWhenItWouldRunAgain},
-      {"memoryQueriesCountPerCandidateAndState", testMemoryQueriesCountPerCandidateAndState},
+      {"shortfallQueriesCountPerCandidateAndState", testShortfallQueriesCountPerCandidateAndState},
       {"theLoopFixtureRunsOverMemory", testTheLoopFixtureRunsOverMemory},
   };
   const test::TestGroup groups[] = {{"fake-memory", kTests}};

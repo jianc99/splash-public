@@ -167,13 +167,13 @@ public:
   // The commands that took their times (CommandTimes), as Model::submit
   // received them.
   [[nodiscard]] const std::vector<Command> &commands() const noexcept { return commands_; }
-  // The model's memory queries (Model::spilledReadShortfall) of each
-  // candidate in each admission state, and the most one candidate made in
-  // one state.
-  [[nodiscard]] const std::map<std::pair<uint64_t, uint64_t>, uint32_t> &availableCalls() const noexcept {
+  // The model's spilled-read shortfall queries (Model::spilledReadShortfall)
+  // of each candidate in each admission state, and the most one candidate
+  // made in one state. The governor's available() calls are not counted.
+  [[nodiscard]] const std::map<std::pair<uint64_t, uint64_t>, uint32_t> &shortfallQueries() const noexcept {
     return model.shortfallQueries;
   }
-  [[nodiscard]] uint32_t mostAvailableCalls() const noexcept {
+  [[nodiscard]] uint32_t mostShortfallQueries() const noexcept {
     uint32_t most = 0;
     for (const auto &[key, calls] : model.shortfallQueries)
       most = std::max(most, calls);
