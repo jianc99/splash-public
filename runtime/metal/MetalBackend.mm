@@ -980,8 +980,12 @@ struct MetalBackend::Impl {
         asyncState->markUnhealthy(std::move(reason));
     }
 
-    id<MTLBuffer> newBuffer(uint64_t bytes, BufferStorage storage,
-                            NSString *label) {
+    // Returned retained, never autoreleased: a buffer's memory returns with
+    // its last reference though the serving thread's autorelease pool never
+    // drains, also where ARC cannot elide an autoreleased return (a
+    // ThreadSanitizer build's instrumentation keeps it from doing so).
+    NS_RETURNS_RETAINED id<MTLBuffer> newBuffer(uint64_t bytes, BufferStorage storage,
+                                                NSString *label) {
         MTLResourceOptions options = storage == BufferStorage::Shared
             ? MTLResourceStorageModeShared : MTLResourceStorageModePrivate;
         id<MTLBuffer> buffer = [device newBufferWithLength:bytes
