@@ -206,10 +206,11 @@ void testRetryCancelledBeforeNextCheckpointKeepsItsSource() {
 void testRestoredCheckpointAtReplayEndBecomesOrdinary() {
   for (bool disk : {false, true}) {
     for (uint32_t suffix : {1U, 31U}) {
-      test::TestKvStorage storage(1024, 4096, 4);
-      KvPool pool(storage, 0);
-      engine::Cache resources(pool, nullptr, nullptr);
-      Executor executor(1);
+      test::EngineHarness h({.pages = 1024, .shape = [](Executor &shape) { shape.maximumLanes = 1; }});
+      engine::Cache &resources = h.cache;
+      Executor &executor = h.model;
+      Events &events = h.events;
+      engine::Engine &engine = h.engine;
       if (disk) {
         executor.deniedReservations = 1000;
         executor.stateTier = std::make_shared<OffloadControl>();
@@ -217,19 +218,16 @@ void testRestoredCheckpointAtReplayEndBecomesOrdinary() {
         executor.restoreControl->ready = true;
         executor.restoreControl->promotionDenied = true;
       }
-      Events events;
-      engine::Engine engine(test::engineConfig(), resources, executor, events);
-      guardReleases(storage, engine);
       const std::vector<uint32_t> prompt(25001, 33);
       engine.submit(request(520, prompt));
       runUntilCheckpoint(engine, 1);
       engine.cancel(520);
-      runUntilIdle(engine);
+      h.runUntilIdle();
       const uint32_t taken = executor.reservations + executor.diskSnapshots;
       std::vector<uint32_t> shorter(
           prompt.begin(), prompt.begin() + kPrefillCheckpointTokens + suffix);
       engine.submit(request(521, shorter));
-      runUntilIdle(engine);
+      h.runUntilIdle();
       const auto states = resources.snapshot().stateCache;
       require(events.starts.back() == kPrefillCheckpointTokens &&
                   executor.reservations + executor.diskSnapshots == taken &&
@@ -251,22 +249,21 @@ void testRestoredCheckpointAtReplayEndBecomesOrdinary() {
 }
 
 void testRetryRetiresCheckpointAtDeeperJunction() {
-  test::TestKvStorage storage(2048, 4096, 4);
-  KvPool pool(storage, 0);
-  engine::Cache resources(pool, nullptr, nullptr);
-  Executor executor(1);
-  Events events;
-  engine::Engine engine(test::engineConfig({.prefillCheckpointTokens = 8192}), resources, executor,
-                        events);
-  guardReleases(storage, engine);
+  test::EngineHarness h({.pages = 2048,
+                         .engine = {.prefillCheckpointTokens = 8192},
+                         .shape = [](Executor &shape) { shape.maximumLanes = 1; }});
+  engine::Cache &resources = h.cache;
+  Executor &executor = h.model;
+  Events &events = h.events;
+  engine::Engine &engine = h.engine;
   const std::vector<uint32_t> prompt(30001, 34);
   engine.submit(request(530, prompt));
   runUntilCheckpoint(engine, 2);
-  require(engine.tick(50) && engine.tick(51) && !engine.commandInFlight() &&
+  require(tickAt(h, 50) && tickAt(h, 51) && !engine.commandInFlight() &&
               executor.requests.at(530).position == 18432,
           "fixture did not commit past the last recovery point");
   engine.cancel(530);
-  runUntilIdle(engine);
+  h.runUntilIdle();
   // Another conversation leaves the prompt at 18432 and goes on to a state
   // of its own, so the retry's matched KV ends at a branch point.
   std::vector<uint32_t> branch(prompt.begin(), prompt.begin() + 18432);
@@ -278,7 +275,7 @@ void testRetryRetiresCheckpointAtDeeperJunction() {
       std::make_shared<State>(), false);
   resources.endRequest(999);
   engine.submit(request(531, prompt));
-  require(engine.tick(1) && engine.tick(2) &&
+  require(tickAt(h, 1) && tickAt(h, 2) &&
               events.starts.back() == 16384 &&
               engine.snapshot().junctionMaterializations == 1 &&
               resources.snapshot().stateCache.entries == 2 &&
@@ -286,7 +283,7 @@ void testRetryRetiresCheckpointAtDeeperJunction() {
           "retry kept an earlier recovery point after publishing its junction");
   // Past the junction it checkpoints at 24576, the last before its replay
   // boundary, which stays.
-  runUntilIdle(engine);
+  h.runUntilIdle();
   require(resources.snapshot().stateCache.entries == 4 &&
               resources.snapshot().stateCache.checkpointEntries == 1,
           "retry did not retain its junction, its replay state and its last checkpoint");
@@ -537,27 +534,25 @@ void testCheckpointRetiresOnceItsSuccessorIsPublished() {
 }
 
 void testCancelAtCheckpointDoesNotPublishDrainingCommand() {
-  test::TestKvStorage storage(1024, 4096, 4);
-  KvPool pool(storage, 0);
-  engine::Cache resources(pool, nullptr, nullptr);
-  Executor executor(1);
-  Events events;
-  engine::Engine engine(test::engineConfig({.prefillCheckpointTokens = 8192}), resources, executor,
-                        events);
-  guardReleases(storage, engine);
+  test::EngineHarness h({.pages = 1024,
+                         .engine = {.prefillCheckpointTokens = 8192},
+                         .shape = [](Executor &shape) { shape.maximumLanes = 1; }});
+  engine::Cache &resources = h.cache;
+  Executor &executor = h.model;
+  engine::Engine &engine = h.engine;
   engine.submit(request(440, std::vector<uint32_t>(18001, 24)));
   for (uint32_t step = 0; step < 32; ++step) {
-    static_cast<void>(engine.tick(step + 1));
+    static_cast<void>(tickAt(h, step + 1));
     if (!engine.commandInFlight() && executor.requests.at(440).position == 6144)
       break;
   }
   executor.holdPrefillUntil = std::make_shared<std::atomic<bool>>(false);
-  static_cast<void>(engine.tick(40));
+  static_cast<void>(tickAt(h, 40));
   require(engine.commandInFlight() && executor.requests.at(440).position == 8192,
           "fixture did not stop inside the checkpoint command");
   engine.cancel(440);
   *executor.holdPrefillUntil = true;
-  runUntilIdle(engine);
+  h.runUntilIdle();
   // The command captured the checkpoint; its state goes back to the pool.
   require(executor.captures.size() == 1 && *executor.evictedStateBytes == 64 &&
               engine.snapshot().checkpointPublications == 0 &&
@@ -880,23 +875,21 @@ void testShortSharedPrefixFindsAndKeepsNoCheckpoint() {
 // before an older ordinary state, and a later publication that finds no room
 // recycles it rather than an ordinary state, and is published.
 void testKeptCheckpointGoesFirstUnderPressure() {
-  test::TestKvStorage storage(1024, 4096, 4);
-  KvPool pool(storage, 0);
-  engine::Cache resources(pool, nullptr, nullptr);
-  Executor executor(1);
-  Events events;
   GovernedHost host;
-  EngineConfig config = host.connect({});
-  engine::Engine engine(config, resources, executor, events);
-  guardReleases(storage, engine);
+  test::EngineHarness h({.pages = 1024,
+                         .engine = host.connect({}),
+                         .shape = [](Executor &shape) { shape.maximumLanes = 1; }});
+  engine::Cache &resources = h.cache;
+  Executor &executor = h.model;
+  engine::Engine &engine = h.engine;
   const std::vector<uint32_t> hot(65, 27);
   engine.submit(request(1, hot));
-  runUntilIdle(engine);
+  h.runUntilIdle();
   // Each keeps its checkpoint at 8192 beside its replay state at 12192.
   const auto keep = [&](uint64_t id, uint32_t token) {
     const std::vector<uint32_t> prompt(12201, token);
     engine.submit(request(id, prompt));
-    runUntilIdle(engine);
+    h.runUntilIdle();
     require(resources.snapshot().stateCache.checkpointEntries == 1,
             "the prompt did not keep its last checkpoint");
     return prompt;
@@ -917,7 +910,7 @@ void testKeptCheckpointGoesFirstUnderPressure() {
   executor.deniedReservations = 1;
   const std::vector<uint32_t> next(65, 30);
   engine.submit(request(4, next));
-  runUntilIdle(engine);
+  h.runUntilIdle();
   const auto counters = engine.snapshot();
   require(counters.recycledStatePublications == 1 &&
               counters.replayStatePublicationFailures == 0 &&
@@ -1011,15 +1004,13 @@ void testSharedCheckpointSurvivesPeerReplayPoint() {
 // room, both checkpoints stay.
 void testReplayPointWithoutRoomTakesItsOwnCheckpoint() {
   for (const bool full : {true, false}) {
-    test::TestKvStorage storage(4096, 4096, 4);
-    KvPool pool(storage, 0);
-    engine::Cache resources(pool, nullptr, nullptr);
-    Executor executor(2);
-    Events events;
     GovernedHost host;
-    EngineConfig config = host.connect({});
-    engine::Engine engine(config, resources, executor, events);
-    guardReleases(storage, engine);
+    test::EngineHarness h({.pages = 4096,
+                           .engine = host.connect({}),
+                           .shape = [](Executor &shape) { shape.maximumLanes = 2; }});
+    engine::Cache &resources = h.cache;
+    Executor &executor = h.model;
+    engine::Engine &engine = h.engine;
     bool memoryFull = false;
     executor.reservationRoom = [&] {
       if (*executor.evictedStateBytes >= 64) {
@@ -1039,11 +1030,11 @@ void testReplayPointWithoutRoomTakesItsOwnCheckpoint() {
     branch.resize(9100, 7);
     engine.submit(request(2, other));
     double now = 1;
-    tickUntil(engine, now, [&] { return engine.snapshot().checkpointPublications == 1; },
+    tickUntil(h, now, [&] { return engine.snapshot().checkpointPublications == 1; },
               "the other lane did not publish its first checkpoint");
     engine.submit(request(1, prompt));
     // Its commands up to the replay point capture no other state.
-    tickUntil(engine, now, [&] { return resources.probe(branch, {}).cachedTokens() == 8192; },
+    tickUntil(h, now, [&] { return resources.probe(branch, {}).cachedTokens() == 8192; },
               "the lane did not publish its checkpoint at 8192");
     require(resources.probe(other, {}).cachedTokens() == 4096,
             "fixture did not leave each lane its checkpoint");
@@ -1053,7 +1044,7 @@ void testReplayPointWithoutRoomTakesItsOwnCheckpoint() {
     // the pool went back to the host.
     if (full)
       *executor.evictedStateBytes = 0;
-    tickUntil(engine, now,
+    tickUntil(h, now,
               [&] {
                 const auto counters = engine.snapshot();
                 return counters.replayStatePublications +
@@ -1070,7 +1061,7 @@ void testReplayPointWithoutRoomTakesItsOwnCheckpoint() {
             full ? "a replay point refused room kept its checkpoint"
                  : "a replay point with room retired its checkpoint");
     engine.cancel(2);
-    tickUntil(engine, now, [&] { return idle(engine); }, "the lanes did not end");
+    tickUntil(h, now, [&] { return idle(engine); }, "the lanes did not end");
   }
 }
 
@@ -1150,17 +1141,16 @@ void testStatePastTheReplayPointKeepsTheCheckpoint() {
 // its own; refused them, it takes that checkpoint's rather than another
 // conversation's state, also when its own command captures the checkpoint.
 void testReplayPointWithoutRoomTakesTheCheckpointItsCommandCaptures() {
-  test::TestKvStorage storage(1024, 4096, 4);
-  KvPool pool(storage, 0);
-  engine::Cache resources(pool, nullptr, nullptr);
-  Executor executor(1);
+  GovernedHost host;
+  test::EngineHarness h({.pages = 1024,
+                         .engine = host.connect({.prefillCheckpointTokens = 3072}),
+                         .shape = [](Executor &shape) { shape.maximumLanes = 1; }});
+  engine::Cache &resources = h.cache;
+  Executor &executor = h.model;
+  Events &events = h.events;
+  engine::Engine &engine = h.engine;
   executor.decodeFinishes = false;
   executor.decodeTokens = 8;
-  Events events;
-  GovernedHost host;
-  EngineConfig config = host.connect({.prefillCheckpointTokens = 3072});
-  engine::Engine engine(config, resources, executor, events);
-  guardReleases(storage, engine);
   bool memoryFull = false;
   executor.reservationRoom = [&] {
     if (*executor.evictedStateBytes >= 64) {
@@ -1176,7 +1166,7 @@ void testReplayPointWithoutRoomTakesTheCheckpointItsCommandCaptures() {
   std::iota(prompt.begin(), prompt.end(), 1);
   double now = 1;
   suspendWithoutTheReplayPoint(engine, resources, executor, events, now, prompt, 1600);
-  tickUntil(engine, now, [&] { return events.usage.contains(2); },
+  tickUntil(h, now, [&] { return events.usage.contains(2); },
             "the Normal request did not finish");
   // Memory fills: a state's buffers come only from a state the cache lets
   // go, and while the engine may not grow, from no free pages. One state's
@@ -1185,7 +1175,7 @@ void testReplayPointWithoutRoomTakesTheCheckpointItsCommandCaptures() {
   memoryFull = true;
   *executor.evictedStateBytes = 64;
   const uint64_t evictions = resources.snapshot().stateCache.evictions;
-  tickUntil(engine, now,
+  tickUntil(h, now,
             [&] { return executor.prefillChunks.at(1) == 6 && !engine.commandInFlight(); },
             "the resumed lane did not reach its replay point");
   const auto counters = engine.snapshot();
@@ -1199,7 +1189,7 @@ void testReplayPointWithoutRoomTakesTheCheckpointItsCommandCaptures() {
   host.pause(false);
   memoryFull = false;
   executor.decodeFinishes = true;
-  tickUntil(engine, now, [&] { return idle(engine); }, "the lane did not finish");
+  tickUntil(h, now, [&] { return idle(engine); }, "the lane did not finish");
   require(events.completedCount == 2 && events.failedCount == 0, "a request failed");
 }
 

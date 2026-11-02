@@ -379,23 +379,20 @@ void testSharedPrefillHonorsPriorityAndLateArrival() {
 // checkpoint completes the draft state all the same.
 void testLateSharedPrefillExtendsTheProducerPlan() {
   for (bool denyCheckpoint : {false, true}) {
-    test::TestKvStorage storage(512, 4096, 4);
-    KvPool pool(storage, 0);
-    engine::Cache cache(pool, nullptr, nullptr);
-    Executor model;
+    test::EngineHarness h({.pages = 512});
+    Executor &model = h.model;
+    Events &events = h.events;
+    engine::Engine &engine = h.engine;
     if (denyCheckpoint)
       model.denyReservationAt = 4096;
-    Events events;
-    engine::Engine engine(test::engineConfig(), cache, model, events);
-    guardReleases(storage, engine);
     engine.submit(request(1, std::vector<uint32_t>(6601, 7)));
-    static_cast<void>(engine.tick(0));
+    static_cast<void>(tickAt(h, 0));
     for (uint32_t id = 2; id <= 4; ++id) {
       std::vector<uint32_t> branch(6601, 7);
       std::fill(branch.begin() + 6000, branch.end(), id + 10);
       engine.submit(request(id, branch));
     }
-    runUntilIdle(engine);
+    h.runUntilIdle();
     require(events.completedCount == 4 && events.failedCount == 0 &&
                 model.prefillRows == 6601 + 3 * (6601 - 5984) &&
                 model.restored == 3 * 5984,
@@ -490,14 +487,11 @@ void testLateSiblingBoundaryNeedsAWholeDraftWindow() {
 // capture: published, the junction would retire it at once.
 void testLateSiblingJunctionAtOrPastAPlannedCheckpoint() {
   for (const uint32_t shared : {6144u, 6784u}) {
-    test::TestKvStorage storage(2048, 4096, 4);
-    KvPool pool(storage, 0);
-    engine::Cache resources(pool, nullptr, nullptr);
-    Executor executor;
-    Events events;
-    engine::Engine engine(test::engineConfig({.prefillCheckpointTokens = 2048}), resources,
-                          executor, events);
-    guardReleases(storage, engine);
+    test::EngineHarness h({.pages = 2048, .engine = {.prefillCheckpointTokens = 2048}});
+    engine::Cache &resources = h.cache;
+    Executor &executor = h.model;
+    Events &events = h.events;
+    engine::Engine &engine = h.engine;
     std::vector<uint32_t> prompt(12001);
     std::iota(prompt.begin(), prompt.end(), 1);
     const auto branch = [&](uint32_t first) {
@@ -507,22 +501,22 @@ void testLateSiblingJunctionAtOrPastAPlannedCheckpoint() {
       return result;
     };
     engine.submit(request(1, std::vector<uint32_t>(prompt.begin(), prompt.begin() + 1057)));
-    runUntilIdle(engine);
+    h.runUntilIdle();
     engine.submit(request(2, prompt));
     double now = 1;
-    tickUntil(engine, now,
+    tickUntil(h, now,
               [&] {
                 return !engine.commandInFlight() && executor.requests.contains(2) &&
                        executor.requests.at(2).position == 3104;
               },
               "the producer did not run its first command");
     executor.holdPrefillUntil = std::make_shared<std::atomic<bool>>(false);
-    static_cast<void>(engine.tick(now++));
+    static_cast<void>(tickAt(h, now++));
     require(engine.commandInFlight() && executor.requests.at(2).position == 5152,
             "the producer's command did not pass its checkpoint");
     engine.submit(request(3, branch(1'000'000)));
     *executor.holdPrefillUntil = true;
-    tickUntil(engine, now, [&] { return idle(engine); }, "the requests did not finish");
+    tickUntil(h, now, [&] { return idle(engine); }, "the requests did not finish");
     const auto captured = [&](uint32_t tokens) {
       return std::count_if(executor.captures.begin(), executor.captures.end(),
                            [&](const Executor::Capture &capture) {
@@ -577,23 +571,21 @@ void testSharedJunctionAtACheckpointIsReusable() {
 }
 
 void testSharedPrefillCapacityFailureDoesNotDeadlock() {
-  test::TestKvStorage storage(8, 4096, 4);
-  storage.budgetPages = 4;
-  KvPool pool(storage, 0);
-  engine::Cache cache(pool, nullptr, nullptr);
-  Executor model;
-  Events events;
-  engine::Engine engine(test::engineConfig(), cache, model, events);
-  guardReleases(storage, engine);
+  test::EngineHarness h({.pages = 8});
+  h.storage.budgetPages = 4;
+  engine::Cache &cache = h.cache;
+  Executor &model = h.model;
+  Events &events = h.events;
+  engine::Engine &engine = h.engine;
   for (uint32_t id = 1; id <= 4; ++id)
     engine.submit(request(id, std::vector<uint32_t>(193, 7)));
   for (uint32_t step = 0; step < 64 && !idle(engine); ++step)
-    static_cast<void>(engine.tick(step * 1000));
+    static_cast<void>(tickAt(h, step * 1000));
   require(idle(engine) && cache.snapshot().activeRequests == 0 &&
               model.requests.empty() && events.emitted == 0,
           "capacity failure stranded a shared prefix producer or waiter");
   engine.submit(request(5, std::vector<uint32_t>(33, 9)));
-  runUntilIdle(engine);
+  h.runUntilIdle();
   require(events.outputs[5] == std::vector<uint32_t>{42},
           "capacity failure prevented subsequent service");
 }
@@ -973,26 +965,25 @@ void testLazyJunctionNeedsADraftWindowOfGain() {
 // recently used cached state, which is an older unrelated state, not the
 // junction state this same request published one command earlier.
 void testLatestReplayDenialRecyclesOlderStateNotTheJunction() {
-  test::TestKvStorage storage(256, 4096, 4);
-  KvPool pool(storage, 0);
-  engine::Cache resources(pool, nullptr, nullptr);
-  Executor executor(1);
-  Events events;
   GovernedHost host;
-  EngineConfig config = host.connect({});
-  engine::Engine engine(config, resources, executor, events);
-  guardReleases(storage, engine);
+  test::EngineHarness h({.pages = 256,
+                         .engine = host.connect({}),
+                         .shape = [](Executor &shape) { shape.maximumLanes = 1; }});
+  engine::Cache &resources = h.cache;
+  Executor &executor = h.model;
+  Events &events = h.events;
+  engine::Engine &engine = h.engine;
 
   engine.submit(request(70, std::vector<uint32_t>(65, 7000)));
-  runUntilIdle(engine);
+  h.runUntilIdle();
   engine.submit(request(7, branchPrompt(777)));
-  runUntilIdle(engine);
+  h.runUntilIdle();
   const auto older = resources.snapshot();
   require(older.stateCache.entries == 2 && older.stateCache.evictions == 0,
           "older unrelated state was not left in the cache");
 
   engine.submit(request(8, branchPrompt(888)));
-  require(engine.tick(1) && engine.tick(2),
+  require(tickAt(h, 1) && tickAt(h, 2),
           "request did not publish its junction state");
   require(engine.snapshot().junctionMaterializations == 1 &&
               resources.snapshot().stateCache.entries == 3,
@@ -1002,7 +993,7 @@ void testLatestReplayDenialRecyclesOlderStateNotTheJunction() {
   // recycle a state.
   host.pause(true);
   executor.deniedReservations = 1;
-  runUntilIdle(engine);
+  h.runUntilIdle();
   host.pause(false);
 
   const DraftContextPlan &plan = executor.plans.at(8);
@@ -1024,12 +1015,12 @@ void testLatestReplayDenialRecyclesOlderStateNotTheJunction() {
   // publishes its replay state again.
   const uint32_t restored = executor.restored;
   engine.submit(request(9, branchPrompt(999)));
-  runUntilIdle(engine);
+  h.runUntilIdle();
   require(executor.restored == restored + 2048 &&
               events.starts.back() == 2048,
           "latest-state denial discarded the independent junction state");
   engine.submit(request(71, std::vector<uint32_t>(65, 7000)));
-  runUntilIdle(engine);
+  h.runUntilIdle();
   require(events.starts.back() == 0 &&
               engine.snapshot().replayStatePublications == 5 &&
               engine.snapshot().junctionMaterializations == 1,
@@ -1353,23 +1344,19 @@ void testUnansweredInitialMaskFails() {
 }
 
 void testDecodeNearContextCeilingCoversVerifyRows() {
-  test::TestKvStorage storage(8, 4096, 4);
-  KvPool pool(storage, 0);
-  engine::Cache resources(pool, nullptr, nullptr);
-  Executor executor(1);
+  test::EngineHarness h(
+      {.pages = 8, .engine = {.maxContext = 64}, .shape = [](Executor &shape) { shape.maximumLanes = 1; }});
+  Executor &executor = h.model;
+  Events &events = h.events;
+  engine::Engine &engine = h.engine;
   executor.decodeFinishes = false;
-  Events events;
-  EngineConfig config = test::engineConfig();
-  config.maxContext = 64;
-  engine::Engine engine(config, resources, executor, events);
-  guardReleases(storage, engine);
 
   // prompt + max_tokens fill a context that is a whole number of pages; the
   // last decode cycles store verify rows past the logical ceiling.
   EngineRequest value = request(10, std::vector<uint32_t>(57, 10));
   value.maxNewTokens = 7;
   engine.submit(value);
-  runUntilIdle(engine);
+  h.runUntilIdle();
   require(events.completedCount == 1 && events.failedCount == 0 &&
               events.emitted == 7,
           "decode at the context ceiling lost its verify-row page coverage");
@@ -1538,10 +1525,10 @@ void testFirstTokenIsSentAtPrefill() {
 // the cycle that commits the token does not send it again. /status counts the
 // token meanwhile.
 void testFirstTokenSentBeforeASuspensionIsNotSentAgain() {
-  test::TestKvStorage storage(512, 4096, 4);
-  KvPool pool(storage, 0);
-  engine::Cache resources(pool, nullptr, nullptr);
-  Executor executor;
+  test::EngineHarness h({.pages = 512});
+  Executor &executor = h.model;
+  Events &events = h.events;
+  engine::Engine &engine = h.engine;
   executor.firstTokens = true;
   executor.decodeFinishes = false;
   executor.decodeTokens = 4;
@@ -1550,9 +1537,6 @@ void testFirstTokenSentBeforeASuspensionIsNotSentAgain() {
   executor.beginGrowthBlocked = [&] {
     return executor.lastBeginId == 2 && executor.requests.at(1).resident;
   };
-  Events events;
-  engine::Engine engine(test::engineConfig(), resources, executor, events);
-  guardReleases(storage, engine);
 
   const std::vector<uint32_t> prompt(40, 1);
   auto background = request(1, prompt);
@@ -1560,19 +1544,19 @@ void testFirstTokenSentBeforeASuspensionIsNotSentAgain() {
   background.maxNewTokens = 12;
   engine.submit(std::move(background));
   double now = 1;
-  tickUntil(engine, now, [&] { return events.outputs.contains(1); },
+  tickUntil(h, now, [&] { return events.outputs.contains(1); },
             "the first token was not sent at the prefill");
   auto normal = request(2, std::vector<uint32_t>(9, 2));
   normal.maxNewTokens = 4;
   engine.submit(std::move(normal));
-  tickUntil(engine, now, [&] { return !executor.requests.at(1).resident; },
+  tickUntil(h, now, [&] { return !executor.requests.at(1).resident; },
             "the Background lane was not suspended");
   const EngineSnapshot suspended = engine.snapshot();
   require(events.outputs.at(1) == std::vector<uint32_t>{42} &&
               suspended.activeRequests.front().id == 1 &&
               suspended.activeRequests.front().generatedTokens == 1,
           "the suspended lane did not keep the first token it was sent");
-  tickUntil(engine, now, [&] { return idle(engine); }, "the requests did not end");
+  tickUntil(h, now, [&] { return idle(engine); }, "the requests did not end");
   require(executor.resumedPrompts == std::vector<std::vector<uint32_t>>{prompt} &&
               events.completedCount == 2 && events.failedCount == 0 &&
               events.outputs.at(1) == std::vector<uint32_t>(12, 42) &&
@@ -1585,35 +1569,34 @@ void testFirstTokenSentBeforeASuspensionIsNotSentAgain() {
 // of them: they all come cleared, so rows not yet written read zero whoever
 // held them before.
 void testResumedLaneClearsThePagesPastItsRestoredChain() {
-  test::TestKvStorage storage(512, 4096, 4);
-  KvPool pool(storage, 0);
-  engine::Cache resources(pool, nullptr, nullptr);
-  Executor executor;
+  test::EngineHarness h({.pages = 512});
+  test::TestKvStorage &storage = h.storage;
+  engine::Cache &resources = h.cache;
+  Executor &executor = h.model;
+  Events &events = h.events;
+  engine::Engine &engine = h.engine;
   executor.firstTokens = true;
   executor.decodeFinishes = false;
   executor.decodeTokens = 4;
   executor.beginGrowthBlocked = [&] {
     return executor.lastBeginId == 2 && executor.requests.at(1).resident;
   };
-  Events events;
-  engine::Engine engine(test::engineConfig(), resources, executor, events);
-  guardReleases(storage, engine);
 
   auto background = request(1, std::vector<uint32_t>(40, 1));
   background.priority = RequestPriority::Background;
   background.maxNewTokens = 80;
   engine.submit(std::move(background));
   double now = 1;
-  tickUntil(engine, now,
+  tickUntil(h, now,
             [&] { return events.outputs.contains(1) && events.outputs.at(1).size() >= 41; },
             "the lane did not decode");
   auto normal = request(2, std::vector<uint32_t>(9, 2));
   normal.maxNewTokens = 4;
   engine.submit(std::move(normal));
-  tickUntil(engine, now, [&] { return !executor.requests.at(1).resident; },
+  tickUntil(h, now, [&] { return !executor.requests.at(1).resident; },
             "the Background lane was not suspended");
   const size_t cleared = storage.cleared.size();
-  tickUntil(engine, now, [&] { return executor.requests.at(1).resident; },
+  tickUntil(h, now, [&] { return executor.requests.at(1).resident; },
             "the Background lane did not resume");
   const auto replayEnd = static_cast<uint32_t>(executor.resumedPrompts.at(0).size());
   const PageTableState table = resources.pageTable(1);
@@ -1626,7 +1609,7 @@ void testResumedLaneClearsThePagesPastItsRestoredChain() {
     require(std::find(storage.cleared.begin() + cleared, storage.cleared.end(), pages[page]) !=
                 storage.cleared.end(),
             "a page past the resumed lane's restored chain was not cleared");
-  tickUntil(engine, now, [&] { return idle(engine); }, "the requests did not end");
+  tickUntil(h, now, [&] { return idle(engine); }, "the requests did not end");
   require(events.completedCount == 2 && events.failedCount == 0,
           "the resumed lane did not complete");
 }
@@ -1635,19 +1618,16 @@ void testResumedLaneClearsThePagesPastItsRestoredChain() {
 // that block when it resumes and finds it cached: its own, not counted as KV
 // another command computed.
 void testReplayFindsItsOwnBlocks() {
-  test::TestKvStorage storage(512, 4096, 4);
-  KvPool pool(storage, 0);
-  engine::Cache resources(pool, nullptr, nullptr);
-  Executor executor;
+  test::EngineHarness h({.pages = 512});
+  Executor &executor = h.model;
+  Events &events = h.events;
+  engine::Engine &engine = h.engine;
   executor.firstTokens = true;
   executor.decodeFinishes = false;
   executor.decodeTokens = 4;
   executor.beginGrowthBlocked = [&] {
     return executor.lastBeginId == 2 && executor.requests.at(1).resident;
   };
-  Events events;
-  engine::Engine engine(test::engineConfig(), resources, executor, events);
-  guardReleases(storage, engine);
 
   const std::vector<uint32_t> prompt(40, 1);
   auto background = request(1, prompt);
@@ -1656,15 +1636,15 @@ void testReplayFindsItsOwnBlocks() {
   engine.submit(std::move(background));
   double now = 1;
   // Its KV reaches past the second block; its latest state is at the first.
-  tickUntil(engine, now,
+  tickUntil(h, now,
             [&] { return events.outputs.contains(1) && events.outputs.at(1).size() >= 28; },
             "the lane did not decode past its second block");
   auto normal = request(2, std::vector<uint32_t>(9, 2));
   normal.maxNewTokens = 4;
   engine.submit(std::move(normal));
-  tickUntil(engine, now, [&] { return !executor.requests.at(1).resident; },
+  tickUntil(h, now, [&] { return !executor.requests.at(1).resident; },
             "the Background lane was not suspended");
-  tickUntil(engine, now, [&] { return idle(engine); }, "the requests did not end");
+  tickUntil(h, now, [&] { return idle(engine); }, "the requests did not end");
   require(executor.lastRestoredTokens == KvCache::pageTokens &&
               executor.resumedPrompts.size() == 1 &&
               executor.resumedPrompts.front().size() > 2 * KvCache::pageTokens,
@@ -1681,16 +1661,13 @@ void testReplayFindsItsOwnBlocks() {
 // restores there, which the other request computed, and counts it though it
 // started cold.
 void testResumePastItsBlocksCountsAnotherRequestsKv() {
-  test::TestKvStorage storage(1024, 4096, 4);
-  KvPool pool(storage, 0);
-  engine::Cache resources(pool, nullptr, nullptr);
-  Executor executor;
+  test::EngineHarness h({.pages = 1024});
+  Executor &executor = h.model;
+  Events &events = h.events;
+  engine::Engine &engine = h.engine;
   executor.beginGrowthBlocked = [&] {
     return executor.lastBeginId == 2 && executor.requests.at(1).resident;
   };
-  Events events;
-  engine::Engine engine(test::engineConfig(), resources, executor, events);
-  guardReleases(storage, engine);
 
   std::vector<uint32_t> prompt(8000);
   std::iota(prompt.begin(), prompt.end(), 1);
@@ -1698,17 +1675,17 @@ void testResumePastItsBlocksCountsAnotherRequestsKv() {
   background.priority = RequestPriority::Background;
   engine.submit(std::move(background));
   double now = 1;
-  tickUntil(engine, now,
+  tickUntil(h, now,
             [&] { return !engine.commandInFlight() && executor.prefillRows == 2048; },
             "the lane did not prefill its first chunk");
   // A Normal request of the same prompt suspends the lane, which resumes
   // only once that request has computed the prompt and completed.
   executor.resumeDenied = true;
   engine.submit(request(2, prompt));
-  tickUntil(engine, now, [&] { return events.usage.contains(2); },
+  tickUntil(h, now, [&] { return events.usage.contains(2); },
             "the Normal request did not complete");
   executor.resumeDenied = false;
-  tickUntil(engine, now, [&] { return idle(engine); }, "the lane did not complete");
+  tickUntil(h, now, [&] { return idle(engine); }, "the lane did not complete");
   const uint32_t replayPoint = (8000 - 1) / KvCache::pageTokens * KvCache::pageTokens;
   require(executor.suspensions == 1 && executor.resumptions == 1 &&
               executor.lastRestoredTokens == replayPoint &&
@@ -1745,15 +1722,10 @@ void testPrefillCanCompleteTheRequest() {
 }
 
 void testOutOfVocabularyOutputFailsLaneOnly() {
-  test::TestKvStorage storage(64, 4096, 4);
-  KvPool pool(storage, 0);
-  engine::Cache cache(pool, nullptr, nullptr);
-  Executor model;
-  Events events;
-  EngineConfig config = test::engineConfig();
-  config.vocabularySize = 1000;
-  engine::Engine engine(config, cache, model, events);
-  guardReleases(storage, engine);
+  test::EngineHarness h({.pages = 64, .engine = {.vocabularySize = 1000}});
+  Executor &model = h.model;
+  Events &events = h.events;
+  engine::Engine &engine = h.engine;
   // The sampling kernels leave 0xffffffff when a logit row is entirely
   // non-finite; the engine must fail that lane before the sentinel reaches
   // the token history while the peer request completes normally.
@@ -1761,7 +1733,7 @@ void testOutOfVocabularyOutputFailsLaneOnly() {
   model.poisonToken = 0xFFFFFFFFU;
   engine.submit(request(1, {7, 7, 7}));
   engine.submit(request(2, {7, 7, 7}));
-  runUntilIdle(engine);
+  h.runUntilIdle();
   require(events.failedCount == 1,
           "out-of-vocabulary model output did not fail the lane");
   require(events.failures.size() == 1 &&
@@ -1813,25 +1785,21 @@ void testNonFiniteFirstStepAfterARestoreInvalidatesTheState() {
 // A step from the restored state that was finite proves it: a later step
 // that is not finite leaves it, and the next request resumes from it.
 void testNonFiniteLaterStepKeepsTheRestoredState() {
-  test::TestKvStorage storage(32, 4096, 4);
-  KvPool pool(storage, 0);
-  engine::Cache cache(pool, nullptr, nullptr);
-  Executor model;
-  Events events;
-  EngineConfig config = test::engineConfig();
-  config.vocabularySize = 1000;
-  engine::Engine engine(config, cache, model, events);
-  guardReleases(storage, engine);
+  test::EngineHarness h({.pages = 32, .engine = {.vocabularySize = 1000}});
+  engine::Cache &cache = h.cache;
+  Executor &model = h.model;
+  Events &events = h.events;
+  engine::Engine &engine = h.engine;
   std::vector<uint32_t> prompt(129);
   std::iota(prompt.begin(), prompt.end(), 1u);
 
   engine.submit(request(1, std::vector<uint32_t>(prompt.begin(), prompt.begin() + 65)));
-  runUntilIdle(engine);
+  h.runUntilIdle();
   // Its prompt's steps from the state succeed; its first decode fails.
   model.poisonRequest = 2;
   model.poisonToken = 0xFFFFFFFFU;
   engine.submit(request(2, prompt));
-  runUntilIdle(engine);
+  h.runUntilIdle();
   require(events.starts == std::vector<uint32_t>{0, 64} &&
               events.failures == std::vector<std::string>{"model_result_invalid"},
           "the request did not resume from the state and fail in its decode");
