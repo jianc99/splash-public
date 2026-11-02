@@ -417,6 +417,39 @@ StateEviction StateCache::reclaim(uint64_t kvBlock, Unwritten unwritten) {
   return {true};
 }
 
+bool StateCache::reclaimable(uint64_t kvBlock) const noexcept {
+  const auto found = entries_.find(kvBlock);
+  return found != entries_.end() && found->second.ram && !found->second.pins && !found->second.invalid;
+}
+
+bool StateCache::pinned(uint64_t kvBlock) const noexcept {
+  const auto found = entries_.find(kvBlock);
+  return found != entries_.end() && found->second.pins;
+}
+
+uint64_t StateCache::lastUsed(uint64_t kvBlock) const noexcept {
+  const auto found = entries_.find(kvBlock);
+  return found == entries_.end() ? 0 : found->second.lastUsed;
+}
+
+bool StateCache::reclaimWrites(uint64_t kvBlock) const noexcept {
+  const auto found = entries_.find(kvBlock);
+  return found != entries_.end() && found->second.ram && !found->second.disk &&
+         found->second.ram->canOffload(inUse(kvBlock));
+}
+
+StateEviction StateCache::reclaimOutcome(uint64_t kvBlock, Unwritten unwritten) const noexcept {
+  // As reclaim() decides it.
+  if (persisting(kvBlock))
+    return {false, true};
+  const bool writable = reclaimWrites(kvBlock);
+  if (writable && unwritten == Unwritten::Stay)
+    return {};
+  if (writable && pending_ && unwritten != Unwritten::Drop)
+    return {false, true};
+  return {true};
+}
+
 void StateCache::evict(uint64_t kvBlock) noexcept {
   static_cast<void>(erase(kvBlock, false));
 }

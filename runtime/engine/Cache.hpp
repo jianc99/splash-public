@@ -675,15 +675,29 @@ public:
 
   // The cache as a source of the units the memory ledger takes, in the order
   // of its walk: free pages first (an empty extent, then compaction toward
-  // one; other forms' empty extents for a page need), a windowed cache's
-  // trims for Full pages, checkpoints, KV no state restores through,
-  // ordinary states and resident leaves by one recency order, then units of
-  // certain reuse (the newest resume point, the wanted chains), then, for a
-  // claim that reaches InUse alone, states in use and the KV they restore
-  // through. A device need's unit is one extent released and costs the
-  // victims that empty it; an in-place page need's is one leaf, a state
-  // need's one state. Immediate passes over units that free memory only as
-  // a transfer lands. A unit the query cannot use is passed over.
+  // one; for a page need other forms' empty extents, and a windowed cache's
+  // trims for Full pages), checkpoints, KV no state restores through,
+  // ordinary states and resident leaves by one recency order, then, for a
+  // claim that reaches InUse, states in use and the KV they restore through.
+  // The units of certain reuse, the resume point and the wanted chains, stay
+  // in their place in that order, marked: the claim's class decides whether
+  // they may go. A device need's unit is one memory reclaim
+  // (reclaimForMemory): the victims whose pages, with the free ones, let one
+  // extent go, or a state, and costs those victims; a page need's is one
+  // victim, a leaf or a state; a state need's one state, without growth
+  // (hostRefused) a state alone. Immediate passes over units that free
+  // memory only as a transfer lands, and Growth starts no copy to the SSD
+  // cache: a state that needs a write stays. A unit peek() cannot be sure a
+  // transfer for it starts, a demotion the tier may refuse, frees nothing in
+  // what it reports, and a unit that waits for the state write in flight
+  // frees nothing yet: peek() may understate what a unit frees, never
+  // overstate it. A unit's cost is the prefill it takes to compute it again,
+  // or with a copy the time to read it back, as often as the cache's reuse
+  // (MemoryRates::reuse, every time for a unit of certain reuse): nothing
+  // for free pages and KV no state restores through. take() does what the
+  // reclaim steps do with that unit: Met when it went, with the bytes of the
+  // extents it released, Pending when a transfer in flight holds what it
+  // needs, Short when it stays.
   [[nodiscard]] std::string_view name() const noexcept override { return "cache"; }
   [[nodiscard]] std::optional<engine::Victim> peek(const VictimQuery &query,
                                                    const engine::Victim *after) const override;
@@ -703,9 +717,10 @@ public:
   // table, written through or copied ahead, that spill once their copies
   // land, as far as free Index pages take them, and the copies it owes.
   [[nodiscard]] Returning returningFor(uint64_t requestId) const noexcept;
-
   // The chains the requests waiting to start restore (their admission
-  // probes): units on them are of certain reuse.
+  // probes): the KV of every block of each, and the state at its last, which
+  // the request resumes from (CacheProbe::restoredChain), are of certain
+  // reuse until the next call.
   void setWantedChains(std::vector<std::span<const uint64_t>> chains);
 
   // Releases every empty extent, but one with keepRunway, and returns the
@@ -973,6 +988,98 @@ private:
     bool kv = false;
   };
 
+  // The units of the walk peek() and take() go over, and the reclaim steps
+  // with them (Victim::key holds the unit above the block's id): one extent
+  // of free pages released (for a page need, the empty extents of the other
+  // forms); a windowed cache's trims; one memory reclaim for a device need
+  // (reclaimForMemory), whose id counts the reclaims before it; a checkpoint
+  // in RAM; a KV leaf no state restores through; an ordinary state in RAM or
+  // a resident KV leaf, or in a page scan the state in RAM on the leaf that
+  // goes next; and the same of what is in use.
+  enum class Unit : uint8_t {
+    Extent = 1,
+    Trim,
+    Reclaim,
+    Checkpoint,
+    DeadLeaf,
+    State,
+    Leaf,
+    LeafState,
+    UsedState,
+    UsedLeaf,
+    UsedLeafState,
+  };
+  // What a walk goes over: what is in use too with InUse, only the leaves
+  // and the states in RAM on them in a page scan, and only states for a
+  // state's buffers.
+  struct WalkScope final {
+    ReclaimClass upTo = ReclaimClass::Ordinary;
+    bool pagesOnly = false;
+    bool statesOnly = false;
+  };
+  // Where a walk stands: its phase, the candidates of the phase's orders,
+  // the oldest first, and the unit it gave last, whose order moves past it
+  // at the next step, once whatever was done with it is done, as a reclaim
+  // step's scan does. A state that waits for the write in flight holds back
+  // the newer states of its phase (statesHeld).
+  struct WalkCursor final {
+    enum class Phase : uint8_t { Checkpoints, DeadLeaves, Ordinary, InUse, Done };
+    Phase phase = Phase::Checkpoints;
+    bool started = false;
+    bool statesHeld = false;
+    std::optional<CacheEvictionCandidate> state;
+    std::optional<CacheEvictionCandidate> leaf;
+    std::optional<Unit> last;
+    CacheEvictionCandidate lastCandidate{};
+  };
+  struct WalkUnit final {
+    Unit unit = Unit::Checkpoint;
+    CacheEvictionCandidate candidate{};
+  };
+  // What a query asks the walk for (VictimQuery): its scope, how long it can
+  // wait for KV memory, what becomes of a state without a disk copy, whether
+  // the runway stays (memory for later, growth and a pass that is not
+  // critical keep it), and its need: a device need's bytes, a page need's
+  // pages of a form, or with neither a state's buffers or one step.
+  struct Walk final {
+    WalkScope scope;
+    ReclaimTiming timing = ReclaimTiming::CanWait;
+    StateCache::Unwritten unwritten = StateCache::Unwritten::Wait;
+    bool keepRunway = false;
+    bool device = false;
+    uint32_t pages = 0;
+    kv::PageForm form = kv::PageForm::Full;
+    bool hostRefused = false;
+  };
+  [[nodiscard]] Walk walkFor(const VictimQuery &query) const;
+  // The walk's next unit, moving the cursor on: the checkpoints, the dead
+  // leaves (not for states alone), the ordinary class's states and leaves by
+  // recency, then, up to InUse, what is in use. Nothing changes.
+  [[nodiscard]] std::optional<WalkUnit> nextUnit(const WalkScope &scope, WalkCursor &cursor) const;
+  // A cursor whose next unit is the one after this unit of the walk; at the
+  // walk's end when the unit is gone.
+  [[nodiscard]] WalkCursor cursorAfter(const WalkScope &scope, Unit unit, uint64_t block) const;
+  // A step that keeps the resume point, or the restored chains, passes over
+  // the unit.
+  [[nodiscard]] bool kept(const WalkUnit &unit, bool keepResumePoint, const RestoredChains *restored) const;
+  // The unit is of certain reuse: the resume point, a wanted chain's state
+  // or KV.
+  [[nodiscard]] bool certainReuse(const WalkUnit &unit) const;
+  // What peek() reports of a unit the walk would take, none when the walk
+  // passes over it.
+  [[nodiscard]] std::optional<engine::Victim> victimOf(const VictimQuery &query, const Walk &walk,
+                                                       const WalkUnit &unit) const;
+  // peek()'s unit for a device need: the one memory reclaims after `after`.
+  [[nodiscard]] std::optional<engine::Victim> peekReclaim(const VictimQuery &query, const Walk &walk,
+                                                          const engine::Victim *after) const;
+  // A leaf still is a candidate of the walk: resident, used by none, its
+  // page in no transfer.
+  [[nodiscard]] bool leafCandidate(uint64_t block) const;
+  // How a reclaim of the leaf frees its page: at once, as its demotion
+  // lands, or not now (the leaf stays).
+  enum class LeafFree : uint8_t { Now, Later, Not };
+  [[nodiscard]] LeafFree leafFrees(uint64_t block, ReclaimTiming timing) const;
+
   [[nodiscard]] TokenAdmission admitPages(uint32_t count, std::vector<uint32_t> &pages, kv::PageForm form,
                                           uint32_t held);
   // What an allocation that was refused lacks, as the free pages that cover
@@ -1039,7 +1146,12 @@ private:
   // reclaimStateForLane's step for a shortfall: what is in use waits, and
   // finding nothing is pending, while a transfer in flight can still cover
   // it.
-  [[nodiscard]] CacheReclaimResult recycleState(ReclaimClass upTo, const Shortfall &shortfall);
+  [[nodiscard]] CacheReclaimResult recycleState(ReclaimClass upTo, const Shortfall &shortfall,
+                                                StateCache::Unwritten unwritten = StateCache::Unwritten::Wait);
+  // reclaimForMemory's step, with how long the caller can wait for KV memory
+  // and what becomes of a state without a disk copy.
+  [[nodiscard]] CacheReclaimResult reclaimMemory(ReclaimClass upTo, bool keepRunway, ReclaimTiming timing,
+                                                 StateCache::Unwritten unwritten);
   // One reclaimOldest scan: the class it takes (what is in use, or the
   // ordinary class), whether it keeps the resume point, what becomes of a
   // state whose write cannot start now, how long the caller can wait for KV
@@ -1163,6 +1275,12 @@ private:
   // of them: its Spill request holds it, though it frees once its copy lands
   // (pendingPages).
   [[nodiscard]] bool extentWithinReach(ReclaimClass upTo = ReclaimClass::Ordinary) const;
+  // For a shortfall of pages of the form in a cache that spills or trims:
+  // the empty extents of the other forms beyond the runway each keeps, and
+  // for Index pages, when none is, a Full extent compaction empties (the Full
+  // pages spills freed fund the next Index extent). Returns the bytes
+  // released.
+  uint64_t releaseOtherForms(kv::PageForm form);
   // Returns one extent of free pages: an empty one, or the one compactExtent
   // empties; progress with zero bytes when the extent emptied is the runway
   // kept. No progress when the free pages fill none.
@@ -1255,6 +1373,8 @@ private:
   KvCache kv_;
   StateCache states_;
   std::unordered_map<uint64_t, Request> requests_;
+  // The chains requests waiting to start restore (setWantedChains).
+  RestoredChains wanted_;
   // KV leaves reclaims took out of RAM to the disk tier (reclaimedToDisk).
   uint64_t reclaimedToDisk_ = 0;
   // Writes in flight, in the order they started. Only reclaim demotions,

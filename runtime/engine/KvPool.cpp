@@ -263,33 +263,63 @@ void KvPool::releaseExtent(uint32_t extent) {
   setExtentAllocated(extent, false);
 }
 
-uint32_t KvPool::compactableExtent(kv::PageForm form, std::span<const uint32_t> fixed) const noexcept {
+std::vector<KvPool::ExtentCounts> KvPool::extentCounts(std::span<const uint32_t> fixed) const {
+  std::vector<ExtentCounts> counts(extents_.size());
+  for (uint32_t index = 0; index < extents_.size(); ++index) {
+    const ExtentRecord &extent = extents_[index];
+    counts[index] = {extent.form, extent.allocated, false, extent.usedPages, extent.freePages.count};
+  }
+  for (const uint32_t page : fixed)
+    counts[extentOf(page)].fixed = true;
+  return counts;
+}
+
+std::optional<uint32_t> KvPool::compactable(std::span<const ExtentCounts> extents, kv::PageForm form) noexcept {
   // Pages move only into extents of their form that hold pages already: an
   // empty extent is released as it is, never filled to release another.
   uint32_t freeInUse = 0;
-  for (const ExtentRecord &extent : extents_) {
+  for (const ExtentCounts &extent : extents) {
     if (extent.allocated && extent.form == form && extent.usedPages)
-      freeInUse += extent.freePages.count;
+      freeInUse += extent.freePages;
   }
-  uint32_t emptied = noIndex;
-  for (uint32_t index = 0; index < extents_.size(); ++index) {
-    const ExtentRecord &extent = extents_[index];
-    if (!extent.allocated || extent.form != form || !extent.usedPages ||
-        extent.usedPages > freeInUse - extent.freePages.count ||
-        (emptied != noIndex && extent.usedPages >= extents_[emptied].usedPages))
-      continue;
-    if (std::none_of(fixed.begin(), fixed.end(),
-                     [&](uint32_t page) { return extentOf(page) == index; }))
+  std::optional<uint32_t> emptied;
+  for (uint32_t index = 0; index < extents.size(); ++index) {
+    const ExtentCounts &extent = extents[index];
+    if (extent.allocated && extent.form == form && extent.usedPages && !extent.fixed &&
+        extent.usedPages <= freeInUse - extent.freePages &&
+        (!emptied || extent.usedPages < extents[*emptied].usedPages))
       emptied = index;
   }
   return emptied;
 }
 
+void KvPool::compact(std::span<ExtentCounts> extents, uint32_t emptied) noexcept {
+  std::vector<uint32_t> receivers;
+  for (uint32_t index = 0; index < extents.size(); ++index) {
+    const ExtentCounts &extent = extents[index];
+    if (index != emptied && extent.allocated && extent.form == extents[emptied].form && extent.usedPages &&
+        extent.freePages)
+      receivers.push_back(index);
+  }
+  std::stable_sort(receivers.begin(), receivers.end(),
+                   [&](uint32_t left, uint32_t right) { return extents[left].usedPages > extents[right].usedPages; });
+  uint32_t moving = extents[emptied].usedPages;
+  for (const uint32_t receiver : receivers) {
+    const uint32_t moved = std::min(moving, extents[receiver].freePages);
+    extents[receiver].freePages -= moved;
+    extents[receiver].usedPages += moved;
+    moving -= moved;
+  }
+  extents[emptied].freePages += extents[emptied].usedPages;
+  extents[emptied].usedPages = 0;
+}
+
 KvPageMoves KvPool::compactExtent(std::span<const uint32_t> fixed, std::optional<kv::PageForm> form) {
+  const std::vector<ExtentCounts> counts = extentCounts(fixed);
   uint32_t emptied = noIndex;
   for (const kv::PageForm each : kForms) {
     if (emptied == noIndex && (!form || *form == each) && formRecord(each).allocatedExtents)
-      emptied = compactableExtent(each, fixed);
+      emptied = compactable(counts, each).value_or(noIndex);
   }
   if (emptied == noIndex)
     return {};

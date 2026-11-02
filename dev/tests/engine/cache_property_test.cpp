@@ -82,8 +82,10 @@ private:
 // RAM and on disk, which it is published only with (Cache::stateTailFull).
 class Run final {
 public:
-  Run(uint32_t seed, bool windowed)
-      : random_(seed), windowed_(windowed), tier_(chance(50)),
+  // With peeks, the walk's units for a device need are weighed and taken
+  // too (checkPeek).
+  Run(uint32_t seed, bool windowed, bool peeks = false)
+      : random_(seed), windowed_(windowed), peeks_(peeks), tier_(chance(50)),
         budget_(std::make_shared<model::DiskBudget>(kSlots * 100)),
         cache_(pool_, &tier_, budget_,
                windowed ? std::nullopt : std::optional(CacheSpillPolicy{pick(0, 2), pick(1, 2)}),
@@ -100,7 +102,7 @@ public:
   }
 
   void step() {
-    switch (pick(0, 14)) {
+    switch (pick(0, peeks_ ? 15 : 14)) {
     case 0: start(); break;
     case 1: case 2: grow(); break;
     case 3: static_cast<void>(cache_.writeThrough()); break;
@@ -120,6 +122,7 @@ public:
     case 12: persist(); break;
     case 13: failWrites(); break;
     case 14: checkExchange(false); break;
+    case 15: checkPeek(); break;
     }
     cache_.checkInvariants();
   }
@@ -212,6 +215,31 @@ public:
     if (exact && (!tier_.writableFile || shelf_->takesWrites))
       require(released == predicted.extentBytes && freed == predicted.states,
               "the exchange did not count what its reclaim releases: " + counts);
+  }
+
+  // What the walk weighs its victims to free never exceeds what taking them
+  // frees (testPeekNeverOverstates): for a device need of a drawn class,
+  // reach and timing, the bytes of the first units the walk gives, taken in
+  // order, are at most the bytes the pool releases.
+  void checkPeek() {
+    const ClaimSpec claim{.cls = std::array{ClaimClass::InService, ClaimClass::Start, ClaimClass::Optional,
+                                            ClaimClass::Growth, ClaimClass::Host}[pick(0, 4)],
+                          .reach = chance(50) ? ReclaimClass::InUse : ReclaimClass::Ordinary,
+                          .timing = chance(50) ? NeedTiming::Immediate : NeedTiming::CanWait};
+    const VictimQuery query{.claim = &claim, .need = {.bytes = pick(1, 8) * 400ull}, .critical = chance(10)};
+    std::vector<engine::Victim> victims;
+    uint64_t predicted = 0;
+    for (std::optional<engine::Victim> victim = cache_.peek(query, nullptr); victim && victims.size() < 4;
+         victim = cache_.peek(query, &*victim)) {
+      predicted += victim->bytes;
+      victims.push_back(*victim);
+    }
+    const uint64_t allocated = pool_.allocatedBytes();
+    for (const engine::Victim &victim : victims)
+      static_cast<void>(cache_.take(query, victim));
+    require(allocated - pool_.allocatedBytes() >= predicted,
+            "the walk weighed its victims to free more than taking them freed: weighed " +
+                std::to_string(predicted) + ", freed " + std::to_string(allocated - pool_.allocatedBytes()));
   }
 
 private:
@@ -401,6 +429,7 @@ private:
 
   std::mt19937 random_;
   bool windowed_;
+  bool peeks_;
   // Index pages of 10 bytes for a run that spills, Slim ones of 30 for a
   // windowed one.
   test::TestKvStorage storage_{1024, 100, 4, 10, 30};
@@ -445,6 +474,25 @@ void testRandomRuns(uint32_t plainSeeds, uint32_t windowedSeeds) {
             << " windowed and windowed seed 9454\n";
 }
 
+// The same runs with the walk's units for a device need weighed and taken
+// beside the other steps: no unit frees less than the walk weighed.
+void testPeekNeverOverstates(uint32_t plainSeeds, uint32_t windowedSeeds) {
+  for (const bool windowed : {false, true})
+    for (uint32_t seed = 1; seed <= (windowed ? windowedSeeds : plainSeeds); ++seed) {
+      Run run(seed, windowed, true);
+      try {
+        for (int step = 0; step < 600; ++step)
+          run.step();
+        run.endRequests();
+        run.drain();
+      } catch (const std::exception &error) {
+        throw std::runtime_error(std::string(windowed ? "peek windowed " : "peek ") + "seed " + std::to_string(seed) +
+                                 ": " + error.what());
+      }
+    }
+  std::cout << "cache peek runs ok: " << plainSeeds << " plain seeds, " << windowedSeeds << " windowed\n";
+}
+
 } // namespace
 
 // cache-property [plainSeeds windowedSeeds]: 40 and 400 by default.
@@ -454,8 +502,10 @@ int main(int argc, char **argv) {
     return 2;
   }
   try {
-    testRandomRuns(argc == 3 ? static_cast<uint32_t>(std::stoul(argv[1])) : 40u,
-                   argc == 3 ? static_cast<uint32_t>(std::stoul(argv[2])) : 400u);
+    const uint32_t plainSeeds = argc == 3 ? static_cast<uint32_t>(std::stoul(argv[1])) : 40u;
+    const uint32_t windowedSeeds = argc == 3 ? static_cast<uint32_t>(std::stoul(argv[2])) : 400u;
+    testRandomRuns(plainSeeds, windowedSeeds);
+    testPeekNeverOverstates(plainSeeds, windowedSeeds);
     std::cout << "cache property tests passed\n";
     return 0;
   } catch (const std::exception &error) {

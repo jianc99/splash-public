@@ -209,6 +209,29 @@ public:
   // the extent. An extent that holds a page of `fixed` is not emptied.
   [[nodiscard]] KvPageMoves compactExtent(std::span<const uint32_t> fixed,
                                           std::optional<kv::PageForm> form = std::nullopt);
+  // What compaction and release look at in an extent: its form, whether it
+  // is allocated, whether a page of it may not move (compactExtent's
+  // `fixed`), and its used and free pages.
+  struct ExtentCounts final {
+    kv::PageForm form = kv::PageForm::Full;
+    bool allocated = false;
+    bool fixed = false;
+    uint32_t usedPages = 0;
+    uint32_t freePages = 0;
+  };
+  // Every extent's counts, by index, those that hold a page of `fixed`
+  // fixed: what a caller that weighs a reclaim before it makes one counts on.
+  [[nodiscard]] std::vector<ExtentCounts> extentCounts(std::span<const uint32_t> fixed) const;
+  // The extent of the form compactExtent() empties among these: of those
+  // that hold pages and no fixed one, the one that holds the fewest, ties to
+  // the lowest index, once the free pages of the other extents of its form
+  // that hold pages cover it; none otherwise.
+  [[nodiscard]] static std::optional<uint32_t> compactable(std::span<const ExtentCounts> extents,
+                                                           kv::PageForm form) noexcept;
+  // The counts once compactExtent() has emptied that extent: its pages move
+  // to the free pages of the other extents of its form that hold pages,
+  // fullest first.
+  static void compact(std::span<ExtentCounts> extents, uint32_t emptied) noexcept;
   [[nodiscard]] KvPoolSnapshot snapshot() const;
 
 private:
@@ -276,9 +299,6 @@ private:
   [[nodiscard]] bool pageFree(uint32_t page) const;
   // The lowest extent that is not allocated; noIndex when all of them are.
   [[nodiscard]] uint32_t unallocatedExtent() const noexcept;
-  // The extent of the form compactExtent() empties; noIndex when the free
-  // pages of the form cover none.
-  [[nodiscard]] uint32_t compactableExtent(kv::PageForm form, std::span<const uint32_t> fixed) const noexcept;
   // Takes `count` free pages of the form off the free lists, leaving `held`
   // of them there, allocating extents of the form when they run out; with a
   // refusal, puts them back and returns none.

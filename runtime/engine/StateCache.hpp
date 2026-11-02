@@ -273,6 +273,22 @@ public:
   // host. A RAM copy a write in flight reads (persist) stays until it lands:
   // pending.
   [[nodiscard]] StateEviction reclaim(uint64_t kvBlock, Unwritten unwritten);
+  // The state at this block may be given to reclaim(): an unpinned, valid
+  // RAM copy.
+  [[nodiscard]] bool reclaimable(uint64_t kvBlock) const noexcept;
+  // A lease holds the state at this block (acquireDeepest), and with it the
+  // block.
+  [[nodiscard]] bool pinned(uint64_t kvBlock) const noexcept;
+  // When the state at this block was last used; 0 without one.
+  [[nodiscard]] uint64_t lastUsed(uint64_t kvBlock) const noexcept;
+  // A reclaim of the state at this block writes it: it has no disk copy and
+  // the tier takes its write.
+  [[nodiscard]] bool reclaimWrites(uint64_t kvBlock) const noexcept;
+  // What reclaim(kvBlock, unwritten) of a reclaimable state does, doing
+  // nothing: evicted, pending, or neither while it stays. A write the quota
+  // refuses drops the state, which counts as evicted, but with Keep, which
+  // keeps it: this cannot know the quota, and reports it evicted.
+  [[nodiscard]] StateEviction reclaimOutcome(uint64_t kvBlock, Unwritten unwritten) const noexcept;
   // Removes an unpinned state from both tiers.
   void evict(uint64_t kvBlock) noexcept;
   // Disk replacement: the oldest unpinned disk copy that is redundant (a RAM
