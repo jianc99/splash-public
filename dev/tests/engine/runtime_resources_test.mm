@@ -1336,8 +1336,9 @@ void testStreamedRuntimeBoundary(RuntimeResourcesConfig moe) {
 // its history's staging. A lane's decode reads and a prompt's staging lack
 // what a reservation of them then allocates, and nothing once they hold it;
 // before the runtime begins the request, which the engine places first,
-// they lack the same. (The fixture runs no command: no hyper-connection
-// kernel takes its 256-wide hidden state.)
+// they lack the same. The staging stays a prompt's while it goes on,
+// whatever other prompts reserved since. (The fixture runs no command: no
+// hyper-connection kernel takes its 256-wide hidden state.)
 void testSpilledRuntimeBoundary(const char *metallibPath) {
   const test::TemporaryDirectory root("splash-boundary-spill");
   RuntimeResourcesConfig config = flashNextConfig(metallibPath, root.path());
@@ -1387,7 +1388,33 @@ void testSpilledRuntimeBoundary(const char *metallibPath) {
             std::string(need.kind == WorkKind::Decode ? "a lane's decode reads" : "a prompt's staging") +
                 " did not allocate the shortfall it named before and after the request began");
   }
+  // The staging stays the prompt's while it goes on, as its command in
+  // passes reserved it once, before its first pass, whatever other prompts
+  // reserved meanwhile: one that reserved it and was suspended, and one that
+  // reserved it and ended, leave it, and so do an idle reclaim, a release of
+  // the pool and a decode's floor; it goes once none of the requests it was
+  // reserved for holds a lane.
+  const uint64_t held = staging.state().currentBytes;
+  for (const bool suspends : {true, false}) {
+    ModelRequest other = request;
+    other.id = suspends ? 912 : 913;
+    runtime->beginColdRequest(other, 1);
+    require(reads.reserveSpilledReads(other.id, {.kind = WorkKind::Prefill, .pages = 64}).granted(),
+            "a prompt's staging within what the staging holds was refused");
+    if (suspends) runtime->suspend(other.id);
+    else runtime->end(other.id);
+    require(staging.state().currentBytes == held && reads.holdsSpilledReads(request.id, 128),
+            std::string("a prompt's staging went with another prompt that reserved it and ") +
+                (suspends ? "was suspended" : "ended"));
+  }
+  while (runtime->reclaimIdleState(true, model::IdleMemory::BuffersThenCaches)) {
+  }
+  require(!staging.release(UINT64_MAX) && reads.reserveSpilledReads(request.id).granted() &&
+              staging.state().currentBytes == held,
+          "an idle reclaim, a release of the pool or a decode's floor took the staging of a prompt that goes on");
   runtime->end(request.id);
+  require(!staging.state().currentBytes, "the staging stayed once every request it was reserved for left");
+  runtime->end(912);
 }
 
 // The engine asks the governor whether the host pauses growth, and its

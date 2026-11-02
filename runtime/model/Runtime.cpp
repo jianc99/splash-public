@@ -503,9 +503,12 @@ struct Runtime::Impl {
   KvHistoryStream *historyStream;
   // Admits the expert store's growth toward its cap (RuntimeContext).
   metal::AllocationAdmission expertAdmission;
-  // The request the history's staging was last reserved for
-  // (reserveHistoryStaging), whose next prefill command streams into it.
-  uint64_t stagingRequest = 0;
+  // The resident requests the history's staging was reserved for
+  // (reserveHistoryStaging) since it was last given back, whose prefill
+  // commands stream into it. A command in passes reserves it once, before
+  // its first pass, so a reservation for another prompt between its passes
+  // leaves it the command's too.
+  std::vector<uint64_t> stagingRequests;
   // What one prefill command may hold (Runtime::commandLimits).
   const CommandLimits limits;
   // What loading the weights read from the SSD (Runtime::loadReads): the
@@ -536,7 +539,7 @@ struct Runtime::Impl {
     }
     uint64_t release(uint64_t bytes) override {
       if (!bytes || runtime_.stagingHeld()) return 0;
-      return released_([this] { return runtime_.historyStream->releaseIdle(); });
+      return released_([this] { return runtime_.releaseStaging(); });
     }
     metal::AllocationResult grow(const metal::AllocationAdmission &) override { return {}; }
 
@@ -873,30 +876,53 @@ struct Runtime::Impl {
     entry.images.clear();
   }
 
-  // Whether the history's staging is still a prompt's: that of the request
-  // it was last reserved for, while the request is resident and its prompt
-  // goes on. Releasing it would only make its next command allocate it
-  // again, and could never fund its own growth. Once it is not, a decoding
-  // lane's floor replaces it (reserveSpilledReads), it goes once its request
-  // left (releaseLeftStaging), or an idle reclaim gives it back.
-  [[nodiscard]] bool stagingHeld() const noexcept {
-    const auto holder = requests.find(stagingRequest);
-    return holder != requests.end() && holder->second.resident && !holder->second.promptComplete;
+  // Whether the request has begun and holds its lane.
+  [[nodiscard]] bool residentRequest(uint64_t id) const noexcept {
+    const auto found = requests.find(id);
+    return found != requests.end() && found->second.resident;
   }
 
-  // Gives the history's staging back once the request it was last reserved
+  // Whether the history's staging is still a prompt's: that of a request it
+  // was reserved for, while the request is resident and its prompt goes on.
+  // Releasing it would only make the request's next command allocate it
+  // again, could never fund its own growth, and would take the pages a
+  // command between its passes streams. Once it is not, a decoding lane's
+  // floor replaces it (reserveSpilledReads), it goes once its requests left
+  // (releaseLeftStaging), or an idle reclaim gives it back.
+  [[nodiscard]] bool stagingHeld() const noexcept {
+    return std::ranges::any_of(stagingRequests, [this](uint64_t id) {
+      const auto holder = requests.find(id);
+      return holder != requests.end() && holder->second.resident && !holder->second.promptComplete;
+    });
+  }
+
+  // The history's staging for a request's prompt, granted or refused; it
+  // stays the staging of the other resident requests it was reserved for.
+  [[nodiscard]] ModelMemoryAdmission reserveStaging(uint64_t requestId, uint32_t pages) {
+    std::erase_if(stagingRequests, [this](uint64_t id) { return !residentRequest(id); });
+    if (std::ranges::find(stagingRequests, requestId) == stagingRequests.end())
+      stagingRequests.push_back(requestId);
+    return historyStream->reserve(pages);
+  }
+
+  // Gives the history's staging back, which then is no request's.
+  uint64_t releaseStaging() {
+    stagingRequests.clear();
+    return historyStream->releaseIdle();
+  }
+
+  // Gives the history's staging back once every request it was reserved
   // for left, ended or suspended (cancelled, scored, stopped at its first
   // token, timed out), at the first point no command runs, which releasing
-  // its extents needs: as the request leaves, or else before the next
+  // its extents needs: as the last request leaves, or else before the next
   // command (Runtime::submit, which the engine calls with none in flight).
-  // While the request holds its lane, the staging waits for its decoding
+  // While one of them holds its lane, the staging waits for its decoding
   // floor or an idle reclaim instead.
   void releaseLeftStaging() {
     if (!historyStream || backend.commandInFlight())
       return;
-    const auto holder = requests.find(stagingRequest);
-    if (holder == requests.end() || !holder->second.resident)
-      static_cast<void>(historyStream->releaseIdle());
+    if (std::ranges::none_of(stagingRequests, [this](uint64_t id) { return residentRequest(id); }))
+      static_cast<void>(releaseStaging());
   }
 
   // Frees one cache that can be rebuilt and returns its bytes. The vision
@@ -920,7 +946,7 @@ struct Runtime::Impl {
     }
     if (!backend.commandInFlight()) {
       if (historyStream && !stagingHeld())
-        if (const uint64_t bytes = historyStream->releaseIdle())
+        if (const uint64_t bytes = releaseStaging())
           return bytes;
       if (blockCache)
         if (const uint64_t bytes = blockCache->releaseAboveFloor())
@@ -3456,16 +3482,14 @@ uint64_t Runtime::spilledReadShortfall(uint64_t requestId, SpilledReadNeed need)
 // prompts, and a next prompt allocates it again as it streams; the hot
 // block cache keeps its blocks. The staging is the prompt's from its
 // reservation on, also when its growth is refused: the reclaim that funds a
-// retry spares it (Impl::stagingHeld).
+// retry spares it (Impl::stagingHeld). It stays the other prompts' it was
+// reserved for, whose commands between their passes stream into it.
 ModelMemoryAdmission Runtime::reserveSpilledReads(uint64_t requestId, SpilledReadNeed need) {
   const uint32_t lane = residentLane(requestId);
-  if (need.kind == WorkKind::Prefill) {
-    if (!impl_->historyStream) return {.ok = true};
-    impl_->stagingRequest = requestId;
-    return impl_->historyStream->reserve(need.pages);
-  }
+  if (need.kind == WorkKind::Prefill)
+    return impl_->historyStream ? impl_->reserveStaging(requestId, need.pages) : ModelMemoryAdmission{.ok = true};
   if (!impl_->blockCache) return {.ok = true};
-  if (impl_->historyStream && !impl_->stagingHeld()) static_cast<void>(impl_->historyStream->releaseIdle());
+  if (impl_->historyStream && !impl_->stagingHeld()) static_cast<void>(impl_->releaseStaging());
   return impl_->blockCache->reserveLane(lane);
 }
 
