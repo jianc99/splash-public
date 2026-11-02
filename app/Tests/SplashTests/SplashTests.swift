@@ -448,6 +448,42 @@ struct ChildRecordTests {
         #expect(log == "ready\ninterrupted\n")
     }
 
+    /// A leftover that ignores its stop signal is killed, with its process group, once the record's
+    /// delay has passed, and the next launch waits that and at most 10 s more. A server's record
+    /// gives it as long as the server's own stop of its engine takes.
+    @Test func aLeftoverIgnoringItsStopIsKilledAfterItsDelay() async throws {
+        #expect(Server(runtime: Showcase.runtime).record.killAfter == Server.killAfter)
+        let killAfter = Duration.seconds(1)
+        let record = ChildRecord(key: "test.child.\(UUID().uuidString)", stop: SIGTERM, killAfter: killAfter)
+        defer { record.forget() }
+        let log = FileManager.default.temporaryDirectory.appending(path: "child-\(UUID().uuidString).log")
+        defer { try? FileManager.default.removeItem(at: log) }
+        // A shell that ignores SIGTERM, and a program of its group, which ignores it too, whose
+        // process ID it writes.
+        let child = try ChildProcess(command: ["/bin/sh", "-c", "trap '' TERM; sleep 60 & echo $!; wait"],
+                                     environment: [:], log: log) { _ in }
+        defer { child.signal(SIGKILL) }
+        var written: String { (try? String(contentsOf: log, encoding: .utf8)) ?? "" }
+        let deadline = ContinuousClock.now + .seconds(10)
+        while !written.hasSuffix("\n") {
+            try #require(ContinuousClock.now < deadline, "it never ran")
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        let member = try #require(pid_t(written.trimmingCharacters(in: .whitespacesAndNewlines)))
+        record.keep(child)
+        let stopping = ContinuousClock.now
+        await record.stopLeftover()
+        let took = ContinuousClock.now - stopping
+        #expect(processStart(child.pid) == nil)
+        #expect(took >= killAfter && took < killAfter + .seconds(10))
+        // Once its parent is gone, launchd reaps it.
+        let reaped = ContinuousClock.now + .seconds(2)
+        while processStart(member) != nil, ContinuousClock.now < reaped {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        #expect(processStart(member) == nil)
+    }
+
     /// What `script` wrote by the time a record that stops with `signal` has stopped it, once it
     /// has written `ready`.
     private static func leftover(_ script: String, stoppedBy signal: Int32) async throws -> String {
