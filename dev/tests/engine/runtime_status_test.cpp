@@ -157,9 +157,13 @@ void testCleanRuntimeStatus(const char *goldenPath) {
   engine.scheduler.abandonedPassCommands = 1;
   engine.scheduler.boundCuts = 1;
   engine.scheduler.indexPageConflicts = 2;
+  // The weights its commands read, which the model estimates before they
+  // run, came to 0.59 of the expected (amend/S.md A62).
   engine.scheduler.prefillEstimate = {.samples = 6,
                                       .clamped = 1,
-                                      .terms = {{"units", 20.5, 25.0}, {"row_layers", 0.0075, 0.008}},
+                                      .terms = {{"units", 20.5, 25.0},
+                                                {"row_layers", 0.0075, 0.008},
+                                                {"weight_read_bytes", 1.25e-7, 1.3e-7, 0.59}},
                                       .relativeErrorP50 = 0.0625,
                                       .relativeErrorP95 = 0.25};
   engine.scheduler.decodeEstimate = {

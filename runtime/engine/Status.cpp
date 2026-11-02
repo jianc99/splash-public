@@ -298,15 +298,15 @@ void appendMemoryLedger(std::ostringstream &out, const MemoryGovernorSnapshot &g
 }
 
 // A command estimate (scheduler.estimate): the commands or passes that
-// trained it and those it clamped, per quantity its rate and the seed's, and
-// its relative error.
+// trained it and those it clamped, per quantity its rate, the seed's and the
+// realized over the expected its price scales it by, and its relative error.
 void appendEstimate(std::ostringstream &out, const CostEstimateSnapshot &estimate) {
   out << "{\"samples\":" << estimate.samples << ",\"clamped\":" << estimate.clamped << ",\"terms\":[";
   for (size_t index = 0; index < estimate.terms.size(); ++index) {
     const CostTermSnapshot &term = estimate.terms[index];
     out << (index ? "," : "") << "{\"quantity\":" << json::quote(term.quantity)
         << ",\"ms_per_unit\":" << term.millisecondsPerUnit << ",\"seed_ms_per_unit\":" << term.seedMillisecondsPerUnit
-        << '}';
+        << ",\"realized_per_expected\":" << term.realizedPerExpected << '}';
   }
   out << "],\"relative_error\":{\"p50\":" << estimate.relativeErrorP50 << ",\"p95\":" << estimate.relativeErrorP95
       << "}}";
