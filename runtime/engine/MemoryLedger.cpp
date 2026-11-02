@@ -467,12 +467,13 @@ FreeResult MemoryLedger::free(ClaimId claim, const Need &need, uint64_t freeByte
 // would, but for claims ranked above it); else the cheapest units that meet
 // it are taken, all or none; else it waits when every copy in flight or owed
 // would meet it. A pool's growth waits on no landing but its own victims':
-// what it waits for is held as pending growth (R3). A claim lacks what
-// admission asks beyond the room: its need and the room held against it. A
-// need the host refused counts only units that leave memory in place; the
-// host's claim lacks its whole need, and growth the host admits only on its
-// credit (`credited`) at least what free() leaves now: the room under the
-// engine's limit returns nothing to the host.
+// what it waits for is held as pending growth (R3). A claim admission
+// refused bytes lacks what admission asks beyond the room: its need and the
+// room held against it; a need met in place lacks no bytes. A need the host
+// refused counts only units that leave memory in place; the host's claim
+// lacks its whole need, and growth the host admits only on its credit
+// (`credited`) at least what free() leaves now: the room under the engine's
+// limit returns nothing to the host.
 FreeResult MemoryLedger::freeFor(uint32_t id, const Need &need, uint64_t freeBytes, bool critical, bool deficit,
                                  std::optional<AccountId> growing, bool credited) {
   ClaimState &claim = claims_.at(id);
@@ -499,8 +500,9 @@ FreeResult MemoryLedger::freeFor(uint32_t id, const Need &need, uint64_t freeByt
   const uint64_t held = host ? 0 : plus(growth, heldByClaims(spec.rank, id));
   const uint64_t forClaim = less(room, held);
   const uint64_t lackingBytes =
-      need.hostRefused ? 0
-                       : std::max(less(plus(need.bytes, held), room), credited ? less(need.bytes, result.nowBytes) : 0);
+      need.hostRefused || !need.bytes
+          ? 0
+          : std::max(less(plus(need.bytes, held), room), credited ? less(need.bytes, result.nowBytes) : 0);
   const uint32_t lackingPages = need.pages;
   const bool canWait = spec.timing == NeedTiming::CanWait && !need.hostRefused && spec.cls != ClaimClass::Growth;
 

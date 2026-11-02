@@ -1168,6 +1168,35 @@ void testAClaimLacksTheRoomHeldAboveIt() {
           "the claim did not take what it and the room held above it lack");
 }
 
+// A need met in place asks admission for no bytes, so the room claims
+// ranked above it hold is none of what it lacks (R2): below a claim waiting
+// for 1 GiB with no room free, a lane's 8 pages are met by the leaf that
+// leaves them, neither waiting on nothing landing nor, for an Immediate
+// claim, taking cache bytes that leave no page.
+void testANeedMetInPlaceLacksNoHeldBytes() {
+  MemoryLedger ledger;
+  TestSource cache("cache");
+  Victim leaf = unit(1, 0, 0.2);
+  leaf.pages = 8;
+  cache.units = {leaf};
+  ledger.addSource(cache);
+  const ClaimId high = ledger.open(request(1, RequestPriority::Foreground));
+  ledger.refused(high, {.bytes = kGiB});
+  ledger.setWaiting(high, true);
+  const ClaimId low = ledger.open(request(2, RequestPriority::Background));
+  require(ledger.free(low, {.pages = 8}, 0, false, false).outcome == FreeOutcome::Met &&
+              cache.taken == std::vector<uint64_t>{1} && !ledger.claim(low).waiting,
+          "a pages-only need waited on the room held above it instead of taking the leaf");
+  leaf.key = 3;
+  cache.units = {unit(2, kGiB, 0.1), leaf};
+  ClaimSpec spec = request(3, RequestPriority::Background);
+  spec.timing = NeedTiming::Immediate;
+  const ClaimId now = ledger.open(spec);
+  require(ledger.free(now, {.pages = 8}, 0, false, false).outcome == FreeOutcome::Met &&
+              cache.taken == std::vector<uint64_t>{1, 3},
+          "an Immediate pages-only need took cache bytes that leave no page");
+}
+
 // Free room goes back to a pool claims keep taking units from only while a
 // unit is worth its expected retake: with no ghost value and a claim every
 // 20 s, at most one regrowth per three recurrences.
@@ -1563,6 +1592,7 @@ std::span<const test::TestCase> ledgerTests() {
       {"testGrowthPendsOnlyOnItsOwnVictims", testGrowthPendsOnlyOnItsOwnVictims},
       {"testDisplacementTakesNothingItCannotGrowInto", testDisplacementTakesNothingItCannotGrowInto},
       {"testAClaimLacksTheRoomHeldAboveIt", testAClaimLacksTheRoomHeldAboveIt},
+      {"testANeedMetInPlaceLacksNoHeldBytes", testANeedMetInPlaceLacksNoHeldBytes},
       {"testFreeRoomGrowthWaitsWhileClaimsRecur", testFreeRoomGrowthWaitsWhileClaimsRecur},
       {"testShortStartRegrowsWhenTheHostFrees", testShortStartRegrowsWhenTheHostFrees},
       {"testALoneConvertedLaneWaitsForItsOwnCopies", testALoneConvertedLaneWaitsForItsOwnCopies},
