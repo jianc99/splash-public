@@ -995,8 +995,9 @@ void testThePairBoundIsPerLayerAndOnlyRowsMeetIt() {
   }
 }
 
-// S-P2: every contended unit is within max(G, u / 0.1) by its price, and
-// takes about that by the profile's clock once the price has learned.
+// S-P2: every contended unit is within max(G, u / 0.1) by its price, and by
+// the profile's clock within that bound by the price's error once learned:
+// at most bound × (1 + p95 relative error) (amend/S.md A09).
 void testEveryContendedUnitWithinItsBound() {
   for (const test::TimingProfile &tuned :
        atEveryTurnaround({&test::kM6FlashNextQ2, &test::kStudio18GFlashNextQ2, &test::kDense27B})) {
@@ -1017,15 +1018,17 @@ void testEveryContendedUnitWithinItsBound() {
           require(sim.price(plan.items, pass, plan.passes) <= sim.bound() * (1 + 1e-9) ||
                       plan.passes == profile->layers,
                   at(*profile) + ": a contended unit's price exceeds the bound");
+        const double limit =
+            sim.bound() * (1.0 + sim.scheduler.snapshot().prefillEstimate.relativeErrorP95);
         const double wall = sim.run(plan);
         if (++units > 40)
-          longest = std::max(longest, wall / sim.bound());
+          longest = std::max(longest, wall / limit);
       } else {
         sim.run(plan);
       }
     }
-    require(longest <= 1.25, at(*profile) + ": a contended unit took " + std::to_string(longest) +
-                                 " of its bound once learned");
+    require(longest <= 1.0 + 1e-9, at(*profile) + ": a contended unit took " + std::to_string(longest) +
+                                       " of its bound by the price's p95 error once learned");
   }
 }
 
