@@ -155,7 +155,7 @@ public:
 
   // Finishes every transfer still in flight, of the restores those submitted.
   void complete(bool success = true) {
-    for (auto &transfer : transfers) {
+    for (auto &transfer : open()) {
       if (transfer->finished || transfer->ready || !transfer->submitted) continue;
       transfer->ready = true;
       transfer->success = success;
@@ -166,13 +166,13 @@ public:
   // those due by `nowMilliseconds` landed (a restore once submitted).
   [[nodiscard]] std::optional<double> nextLanding() const {
     std::optional<double> next;
-    for (const auto &transfer : transfers)
+    for (const auto &transfer : open())
       if (!transfer->finished && !transfer->ready && transfer->submitted && transfer->dueMilliseconds)
         next = std::min(next.value_or(*transfer->dueMilliseconds), *transfer->dueMilliseconds);
     return next;
   }
   void land(double nowMilliseconds) {
-    for (auto &transfer : transfers)
+    for (auto &transfer : open())
       if (!transfer->finished && !transfer->ready && transfer->submitted && transfer->dueMilliseconds &&
           *transfer->dueMilliseconds <= nowMilliseconds)
         transfer->ready = true;
@@ -272,9 +272,29 @@ private:
     return std::make_unique<Ticket>(*this, std::move(transfer), write);
   }
 
+  // The transfers from the first one not finished on: every one before it
+  // is, so a long run's scans skip them.
+  [[nodiscard]] std::span<const std::shared_ptr<Transfer>> open() const {
+    if (open_ > transfers.size())
+      open_ = 0;
+    while (open_ < transfers.size() && transfers[open_]->finished)
+      ++open_;
+    return std::span(transfers).subspan(open_);
+  }
+
   uint32_t inFlight_ = 0;
   std::array<uint32_t, 3> writesInFlight_{};
   std::set<const Slot *> live_;
+  mutable size_t open_ = 0;
+};
+
+// A fixture's tier: its quota of slots, its transfers in flight, and with a
+// rate, a transfer lands bytes / rate after it starts. A persistent tier
+// copies points ahead whatever memory holds.
+struct TierOptions final {
+  uint32_t capacity = 4, transferLimit = 2;
+  std::optional<double> bytesPerMillisecond;
+  bool persistent = false;
 };
 
 // A request's page sources (model::KvPageSources), page by page.

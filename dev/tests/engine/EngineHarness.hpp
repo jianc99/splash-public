@@ -36,11 +36,6 @@
 
 namespace splash::test {
 
-struct TierOptions final {
-  uint32_t capacity = 4, transferLimit = 2;
-  std::optional<double> bytesPerMillisecond;  // with it, a transfer lands bytes / rate after it starts
-  bool persistent = false;                    // a persistent tier copies points ahead whatever memory holds
-};
 struct HarnessOptions final {
   uint32_t pages = 64;
   uint64_t pageBytes = 4096;
@@ -56,6 +51,9 @@ struct HarnessOptions final {
   GovernorLimits limits{};
   const TimingProfile *timing = nullptr;  // with it, commands take the profile's time on the clock
   bool checks = true;
+  // What one of the model's commands may hold (Executor::groupRows, passes,
+  // maximumLanes), set before the engine takes it as it is built.
+  std::function<void(Executor &)> shape;
 };
 
 class EngineHarness final {
@@ -75,7 +73,7 @@ public:
                 options_.slimPageBytes),
         pool(memory ? storage.through(*memory, governor->allocationAdmission()) : storage, options_.runwayPages),
         tier(kvTier(options_)), cache(pool, tier ? &*tier : nullptr, nullptr), model(),
-        engine(config(options_, governor), cache, model, events) {
+        engine((options_.shape ? options_.shape(model) : void(), config(options_, governor)), cache, model, events) {
     guardReleases(storage, engine);
     // The ledger's accounts of what the engine allocates, as a start books
     // them (RuntimeResources::create): the KV pages and the lane states.

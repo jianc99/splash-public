@@ -10,6 +10,7 @@
 #include "TestEngine.hpp"
 #include "TestExecutor.hpp"
 #include "TestKvPool.hpp"
+#include "TestKvTier.hpp"
 #include "TestStatus.hpp"
 #include "TimingProfile.hpp"
 #include "engine/Cache.hpp"
@@ -75,6 +76,8 @@ struct PoolShape {
   uint32_t pages = 32;
   uint32_t extentPages = 4;
   uint32_t runwayPages = pages;
+  // A Full page's bytes, and an Index page's (none without them).
+  uint64_t pageBytes = 4096, indexPageBytes = 0;
 };
 
 // What a loop fixture adds to the loop. With memory: FakeMemory, the
@@ -84,12 +87,17 @@ struct PoolShape {
 // weights allocate through, and with `control` the production control pass
 // (MemoryControl::run at FakeMemory's pressure) between commands. With
 // timing: the model takes the profile's time and the awake clock moves only
-// as run() moves it.
+// as run() moves it. With a tier, the cache's KV tier and its quota, its
+// transfers landing on the awake clock, and the cache's spill policy. `shape` sets what one
+// of the model's commands may hold before the loop's engine takes it.
 struct LoopOptions final {
   std::optional<FakeMemory::Config> memory;
   GovernorLimits limits{};
   const TimingProfile *timing = nullptr;
   bool control = true;
+  std::optional<TierOptions> tier;
+  std::optional<engine::CacheSpillPolicy> cacheSpill;
+  std::function<void(Executor &)> shape;
 };
 
 // A native loop over the fake model, collecting the bytes it writes. Its
@@ -107,9 +115,13 @@ struct LoopFixture {
                        std::optional<LoopOptions> loopOptions = std::nullopt)
       : options(std::move(loopOptions)), memory(fakeMemory(options)), backend(standIn(memory)),
         governor(memoryGovernor(options, memory, backend)), startup_(startScope(governor)),
-        storage(shape.pages, 4096, shape.extentPages),
+        storage(shape.pages, shape.pageBytes, shape.extentPages, shape.indexPageBytes),
         pool(memory ? storage.through(*memory, governor->allocationAdmission()) : storage, shape.runwayPages),
-        cache(pool, nullptr, nullptr),
+        tier(kvTier(options)),
+        budget(tier ? std::make_shared<model::DiskBudget>(uint64_t{options->tier->capacity} * tier->slotBytes(),
+                                                          [this] { return monotonic; })
+                    : nullptr),
+        cache(pool, tier ? &*tier : nullptr, budget, options ? options->cacheSpill : std::nullopt),
         loop(
             clocked(std::move(config), idleReleaseSeconds), cache, executor,
             [this](std::span<const uint8_t> bytes) {
@@ -131,6 +143,13 @@ struct LoopFixture {
       executor.time(*options->timing);
       executor.clock = [this] { return monotonic; };
     }
+    if (tier) {
+      tier->budget = budget;
+      tier->capacity = options->tier->capacity;
+      tier->transferLimit = options->tier->transferLimit;
+      tier->bytesPerMillisecond = options->tier->bytesPerMillisecond;
+      tier->clock = [this] { return monotonic; };
+    }
     startup_.reset();
   }
 
@@ -140,6 +159,8 @@ struct LoopFixture {
   }
 
   engine::NativeLoopConfig clocked(engine::NativeLoopConfig config, double idleReleaseSeconds) {
+    if (options && options->shape)
+      options->shape(executor);
     if (governor)
       engine::connectToGovernor(config.engine, *governor);
     config.engine = test::engineConfig(std::move(config.engine));
@@ -164,8 +185,9 @@ struct LoopFixture {
   // Ticks, with memory running the control pass between commands and the
   // memory checks (I1) after each tick, again at once after a tick that
   // made progress, else once the awake clock reaches the earliest of the
-  // command in flight's end, the loop's next wakeup and the host's next
-  // event, or 1 ms on; until done() or `steps` ticks, then requires done().
+  // command in flight's end, the loop's next wakeup, the tier's next landing
+  // and the host's next event, or 1 ms on; until done() or `steps` ticks,
+  // then requires done().
   void run(const std::function<bool()> &done, std::string_view what, uint32_t steps = 100'000) {
     for (uint32_t step = 0; step < steps && !done(); ++step) {
       const bool progressed = loop.tick();
@@ -183,12 +205,14 @@ struct LoopFixture {
       double next = std::numeric_limits<double>::infinity();
       for (const std::optional<double> &instant :
            {executor.commandEnd(), wakeup ? std::optional<double>(monotonic + *wakeup) : std::nullopt,
-            memory ? memory->nextEvent() : std::nullopt})
+            tier ? tier->nextLanding() : std::nullopt, memory ? memory->nextEvent() : std::nullopt})
         if (instant)
           next = std::min(next, *instant);
       monotonic = next == std::numeric_limits<double>::infinity() ? monotonic + 1.0 : std::max(monotonic, next);
       if (memory)
         memory->advanceTo(monotonic);
+      if (tier)
+        tier->land(monotonic);
       executor.land(monotonic);
     }
     require(done(), what);
@@ -206,6 +230,9 @@ private:
 public:
   test::TestKvStorage storage;
   engine::KvPool pool;
+  std::optional<TestKvTier> tier;
+  // The tier's quota, its slots' bytes, refilled on the awake clock.
+  std::shared_ptr<model::DiskBudget> budget;
   engine::Cache cache;
   Executor executor;
   std::vector<uint8_t> output;
@@ -225,6 +252,11 @@ private:
     if (!options || !options->memory)
       return std::nullopt;
     return std::optional<FakeMemory>(std::in_place, *options->memory);
+  }
+  static std::optional<TestKvTier> kvTier(const std::optional<LoopOptions> &options) {
+    if (!options || !options->tier)
+      return std::nullopt;
+    return std::optional<TestKvTier>(std::in_place, options->tier->persistent);
   }
   static std::optional<metal::MetalBackend> standIn(const std::optional<FakeMemory> &memory) {
     if (!memory)

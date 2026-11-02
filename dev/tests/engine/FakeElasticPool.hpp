@@ -39,12 +39,13 @@ public:
   FakeElasticPool &operator=(const FakeElasticPool &) = delete;
 
   [[nodiscard]] model::PoolState state() const override {
+    const uint32_t cap = regrows ? capUnits_ : units_;
     return {.name = name_,
             .floorBytes = uint64_t{floorUnits_} * unitBytes_,
             .currentBytes = uint64_t{units_} * unitBytes_,
-            .capBytes = uint64_t{capUnits_} * unitBytes_,
+            .capBytes = uint64_t{cap} * unitBytes_,
             .releaseUnitBytes = units_ > floorUnits_ ? unitBytes_ : 0,
-            .growUnitBytes = units_ < capUnits_ ? unitBytes_ : 0,
+            .growUnitBytes = units_ < cap ? unitBytes_ : 0,
             .rebuildOnly = rebuildOnly};
   }
   // Ghosts span the keys not resident.
@@ -76,7 +77,7 @@ public:
     return released;
   }
   [[nodiscard]] metal::AllocationResult grow(const metal::AllocationAdmission &admit) override {
-    if (units_ == capUnits_)
+    if (units_ == capUnits_ || !regrows)
       return {};
     const metal::AllocationResult result = memory_.allocate(admit, name_, unitBytes_);
     if (result) {
@@ -108,6 +109,8 @@ public:
   // Units taken and given back, and the prefill uses served from memory and
   // read from the SSD (the scans' value, which ghosts do not show).
   uint64_t grows = 0, shrinks = 0;
+  // Cleared, the pool grows no further than it stands: its cap is its units.
+  bool regrows = true;
   uint64_t prefillHits = 0, prefillMisses = 0;
   // The hits at the edge it reports (model::PoolValue::nearGhostHits,
   // tailHits), which the test moves.
