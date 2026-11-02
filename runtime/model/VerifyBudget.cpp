@@ -1,4 +1,5 @@
 #include "model/VerifyBudget.hpp"
+#include "SmallSolve.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -47,32 +48,6 @@ double objective(std::span<const VerifyBudget::Label> labels, const Parameters &
   for (uint32_t i = 0; i < kParameters; ++i)
     value += 0.5 * VerifyBudget::priorPrecision(i) * (theta[i] - prior[i]) * (theta[i] - prior[i]);
   return value;
-}
-
-// x with h x = g, h positive definite: Gaussian elimination.
-Parameters solve(std::array<Parameters, kParameters> h, Parameters g) {
-  for (uint32_t column = 0; column < kParameters; ++column) {
-    uint32_t pivot = column;
-    for (uint32_t row = column + 1; row < kParameters; ++row)
-      if (std::fabs(h[row][column]) > std::fabs(h[pivot][column]))
-        pivot = row;
-    std::swap(h[column], h[pivot]);
-    std::swap(g[column], g[pivot]);
-    for (uint32_t row = column + 1; row < kParameters; ++row) {
-      const double factor = h[row][column] / h[column][column];
-      for (uint32_t k = column; k < kParameters; ++k)
-        h[row][k] -= factor * h[column][k];
-      g[row] -= factor * g[column];
-    }
-  }
-  Parameters x{};
-  for (uint32_t row = kParameters; row-- > 0;) {
-    double sum = g[row];
-    for (uint32_t k = row + 1; k < kParameters; ++k)
-      sum -= h[row][k] * x[k];
-    x[row] = sum / h[row][row];
-  }
-  return x;
 }
 
 } // namespace
@@ -213,7 +188,7 @@ VerifyBudget::Acceptance VerifyBudget::fit(std::span<const Label> labels, const 
       gradient[i] += priorPrecision(i) * (theta[i] - prior[i]);
       hessian[i][i] += priorPrecision(i);
     }
-    const Parameters step = solve(hessian, gradient);
+    const Parameters step = splash::solve<kParameters>(hessian, gradient);
     // Damped: the Newton step, halved until the objective does not grow.
     Parameters next{};
     double value = current, scale = 1.0;
