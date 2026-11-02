@@ -898,9 +898,9 @@ void testALoneRequestIsSizedAsToday() {
   }
 }
 
-// A contended agent turn on the M6's profile at turnaround `turnaround`,
-// after commands of varied passes have taught the fit the turnaround: the
-// sim and the turn's first plan.
+// A contended agent turn on `profile` (the M6's at some turnaround), after
+// commands of varied passes have taught the fit the turnaround: the sim and
+// the turn's first plan.
 std::pair<std::unique_ptr<Sim>, BatchPlan> learnedContendedTurn(const test::TimingProfile &profile) {
   auto sim = std::make_unique<Sim>(profile, limits(8192, 48));
   sim->seed();
