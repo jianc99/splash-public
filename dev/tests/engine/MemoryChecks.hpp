@@ -1,8 +1,8 @@
 #pragma once
 
-// The memory checks the harness and the loop fixture run after every tick
-// when the test's engine allocates through FakeMemory. I1 is here; the
-// ledger's relations (I2) join it when the ledger lands.
+// The memory checks the harness runs after every tick when the test's engine
+// allocates through FakeMemory: I1, the allocators' counts, and I2, the
+// ledger's relations.
 
 #include "FakeMemory.hpp"
 #include "TestEngine.hpp"
@@ -49,8 +49,25 @@ inline void checkMemory(const MemoryHolders &holders) {
   }
   if (holders.weights)
     agree("weights", uint64_t{holders.weights->held()} * Weights::kImageBytes);
-  if (holders.governor && holders.governor->snapshot().chargedBytes < holders.memory.total())
+  if (!holders.governor)
+    return;
+  const engine::MemoryGovernorSnapshot snapshot = holders.governor->snapshot();
+  if (snapshot.chargedBytes < holders.memory.total())
     throw std::logic_error("the governor charges less than fake memory holds");
+  // I2, L1: the accounts sum to what is charged, the fixed account (the
+  // first) what the others leave, never less than nothing.
+  uint64_t accounts = 0;
+  for (size_t index = 1; index < snapshot.accounts.size(); ++index)
+    accounts += snapshot.accounts[index].currentBytes;
+  if (accounts > snapshot.chargedBytes)
+    throw std::logic_error("the ledger's accounts hold " + std::to_string(accounts) + " bytes, " +
+                           std::to_string(snapshot.chargedBytes) + " are charged");
+  // L2: what is charged and what pending growth holds stay under the limit.
+  if (snapshot.chargedBytes > snapshot.limitBytes ||
+      snapshot.reservedBytes > snapshot.limitBytes - snapshot.chargedBytes)
+    throw std::logic_error("charged " + std::to_string(snapshot.chargedBytes) + " and reserved " +
+                           std::to_string(snapshot.reservedBytes) + " bytes pass the limit of " +
+                           std::to_string(snapshot.limitBytes));
 }
 
 } // namespace splash::test

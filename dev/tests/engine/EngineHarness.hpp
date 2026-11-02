@@ -77,6 +77,12 @@ public:
         tier(kvTier(options_)), cache(pool, tier ? &*tier : nullptr, nullptr), model(),
         engine(config(options_, governor), cache, model, events) {
     guardReleases(storage, engine);
+    // The ledger's accounts of what the engine allocates, as a start books
+    // them (RuntimeResources::create): the KV pages and the lane states.
+    if (governor) {
+      governor->ledger().addAccount("kv", engine::AccountRole::Kv, [this] { return storage.allocatedBytes(); });
+      governor->ledger().addAccount("states", engine::AccountRole::States, [this] { return model.heldStateBytes; });
+    }
     const std::function<double()> clock = [this] { return now_; };
     events.clock = clock;
     if (tier) {
@@ -281,13 +287,16 @@ private:
                                    request.generatedTokens, static_cast<uint64_t>(request.kvMode)});
     return result;
   }
-  // I1 with memory; I3 holds inside the storage (guardReleases); I4 the
-  // extents' activity follows the pool's held pages; I5 the cache's
-  // invariants between commands; I6 inside the model (commandViolation); I7
-  // no spin (spins).
+  // I1 and I2 with memory, and no claim waits once no request is left; I3
+  // holds inside the storage (guardReleases); I4 the extents' activity
+  // follows the pool's held pages; I5 the cache's invariants between
+  // commands; I6 inside the model (commandViolation); I7 no spin (spins).
   void check(bool progressed) {
-    if (memory)
+    if (memory) {
       checkMemory({.memory = *memory, .storage = storage, .model = model, .governor = &*governor});
+      if (governor->ledger().claimWaiting() && idle(engine))
+        throw std::logic_error("a claim waits for memory with no request left");
+    }
     if (!storage.activityFollows(pool))
       throw std::logic_error("KV extents' activity does not follow the pages requests hold");
     if (!engine.commandInFlight())
