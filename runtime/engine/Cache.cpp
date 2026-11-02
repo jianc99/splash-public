@@ -624,7 +624,7 @@ Cache::Walk Cache::walkFor(const VictimQuery &query) const {
   walk.restored = certain ? nullptr : &wanted_;
   walk.timing = claim.timing == NeedTiming::Immediate ? ReclaimTiming::Immediate : ReclaimTiming::CanWait;
   // A state that needs a write frees its memory as a unit that lands later,
-  // which an Immediate claim passes over (amend/M.md A38).
+  // which the reclaims of an Immediate claim pass over (amend/M.md A38).
   walk.skipStateWrites = walk.timing == ReclaimTiming::Immediate;
   // Memory for later, growth and a pass keep the empty extent the next
   // request takes, unless the host is critical.
@@ -855,14 +855,14 @@ bool Cache::leafCandidate(uint64_t block) const {
   return kv_.contains(block) && kv_.residentLeaf(block) && kv_.transfer(block) == KvCache::Transfer::None;
 }
 
-Cache::LeafFree Cache::leafFrees(uint64_t block, ReclaimTiming timing) const {
+Cache::LeafFree Cache::leafFrees(uint64_t block) const {
   // As reclaimKvLeaf decides it: through its copy at once; a leaf a state
-  // needs by a demotion while the tier takes writes, which an Immediate
-  // caller passes over; otherwise erased, once its disk subtree can go.
+  // needs by a demotion while the tier takes writes; otherwise erased, once
+  // its disk subtree can go.
   if (kv_.slot(block))
     return LeafFree::Now;
   if (kvNeededByState(block) && kvTierWritable())
-    return timing == ReclaimTiming::Immediate ? LeafFree::Not : LeafFree::Later;
+    return LeafFree::Later;
   if (kv_.hasDiskChildren(block) && (states_.writing() || kv_.subtree(block).empty()))
     return LeafFree::Not;
   return LeafFree::Now;
@@ -950,15 +950,11 @@ std::optional<engine::Victim> Cache::victimOf(const VictimQuery &query, const Wa
   case Unit::LeafState:
   case Unit::UsedState:
   case Unit::UsedLeafState: {
-    if (skipsState(walk, block))
-      return std::nullopt;
     const StateEviction outcome = states_.reclaimOutcome(block, walk.unwritten);
     if (!outcome.evicted && !outcome.pending)
       return std::nullopt;
     // One that waits for the state write in flight frees nothing yet, and
     // one that needs a write lands later (amend/M.md A38).
-    if (outcome.pending && walk.timing == ReclaimTiming::Immediate)
-      return std::nullopt;
     victim.later = outcome.pending || states_.reclaimWrites(block);
     victim.stateBuffers = outcome.evicted ? 1 : 0;
     victim.cost = cachedCost(tokens, states_.bytes(block),
@@ -968,7 +964,7 @@ std::optional<engine::Victim> Cache::victimOf(const VictimQuery &query, const Wa
   case Unit::DeadLeaf:
   case Unit::Leaf:
   case Unit::UsedLeaf: {
-    const LeafFree frees = leafFrees(block, walk.timing);
+    const LeafFree frees = leafFrees(block);
     if (frees == LeafFree::Not)
       return std::nullopt;
     victim.form = pool_.form(kv_.page(block));
@@ -1003,7 +999,10 @@ std::optional<engine::Victim> Cache::victimOf(const VictimQuery &query, const Wa
 // it fills, fullest first. A state's write, or a demotion the quota holds no
 // slot for, may give up redundant copies to make room (freeDiskSpace), the
 // oldest first, as many as the write needs: from then on no copy of what
-// RAM holds too, KV or a state, is counted on.
+// RAM holds too, KV or a state, is counted on. The reclaims of an Immediate
+// claim pass over what only a write or a demotion frees; a unit whose
+// reclaims first reach such cache comes after the unit a claim that can
+// wait gets from there, which lands later.
 struct Cache::DevicePlan final {
   DevicePlan(const Cache &cache, const Walk &walk, const MemoryRates &rates, uint32_t serial);
   // The next unit, none once the reclaims change nothing more.
@@ -1041,9 +1040,19 @@ private:
     uint64_t bytes = 0;
     bool state = false;
     bool kv = false;
+    // Stopped before the first uncopied cache of the unit (reachesUncopied).
+    bool uncopied = false;
+  };
+  // What the reclaims of the unit being weighed released and gave up so far.
+  struct Weighed final {
+    uint32_t demotions = 0;
+    uint64_t bytes = 0;
+    uint32_t states = 0;
+    bool changed = false;
   };
   enum class LeafGoes : uint8_t { Copy, Erase, Demotion, Pending, Stays };
 
+  [[nodiscard]] std::optional<engine::Victim> weigh(Weighed weighed);
   [[nodiscard]] Step step();
   [[nodiscard]] Step evict();
   [[nodiscard]] Step evictPhase(bool inUse);
@@ -1073,6 +1082,9 @@ private:
   [[nodiscard]] bool writes(uint64_t block) const;
   [[nodiscard]] bool transfers() const;
   [[nodiscard]] bool returnsLanding() const;
+  [[nodiscard]] ReclaimTiming timing() const noexcept;
+  [[nodiscard]] bool skipsWrites() const noexcept;
+  [[nodiscard]] bool reachesUncopied(uint64_t block, bool state) const;
   [[nodiscard]] StateEviction stateGoes(uint64_t block) const;
   [[nodiscard]] LeafGoes leafGoes(uint64_t block, ReclaimTiming timing) const;
   [[nodiscard]] LeafGoes leafGoesUncopied(uint64_t block, ReclaimTiming timing) const;
@@ -1109,6 +1121,13 @@ private:
   bool inUse_ = false;
   bool written_ = false;
   bool ended_ = false;
+  // A claim that can wait's plan, weighed from where an Immediate one first
+  // reached uncopied cache in a unit; the unit that goes on past it, and
+  // comes next; and a step that goes on where it stopped there.
+  bool waits_ = false;
+  bool passing_ = false;
+  std::optional<engine::Victim> passed_;
+  bool resumes_ = false;
 };
 
 Cache::DevicePlan::DevicePlan(const Cache &owner, const Walk &plan, const MemoryRates &prices, uint32_t id)
@@ -1135,21 +1154,44 @@ bool Cache::DevicePlan::weighs(const Walk &other, const MemoryRates &otherRates)
 }
 
 std::optional<engine::Victim> Cache::DevicePlan::next() {
-  if (ended_)
-    return std::nullopt;
-  cost_ = {};
-  certain_ = inUse_ = written_ = false;
-  const uint32_t demotions = demotions_;
-  uint64_t bytes = 0;
-  uint32_t states = 0;
-  bool changed = false;
-  // A reclaim that gives up a state alone frees no bytes: the unit goes on
-  // to the extent the next ones release, unless the need counts states.
+  std::optional<engine::Victim> unit = std::exchange(passed_, std::nullopt);
+  if (!unit) {
+    if (ended_)
+      return std::nullopt;
+    cost_ = {};
+    certain_ = inUse_ = written_ = false;
+    unit = weigh({.demotions = demotions_});
+  }
+  if (unit)
+    unit->key = unitKey(static_cast<uint8_t>(Unit::Reclaim), uint64_t{serial} << kPlanShift | produced++);
+  return unit;
+}
+
+// The reclaims of the unit from what it weighed so far. A reclaim that
+// gives up a state alone frees no bytes: the unit goes on to the extent the
+// next ones release, unless the need counts states.
+std::optional<engine::Victim> Cache::DevicePlan::weigh(Weighed weighed) {
   for (;;) {
     const Step taken = step();
-    bytes += taken.bytes;
-    states += taken.state;
-    changed = changed || taken.progress || taken.kv;
+    weighed.bytes += taken.bytes;
+    weighed.states += taken.state;
+    weighed.changed = weighed.changed || taken.progress || taken.kv;
+    if (taken.uncopied) {
+      // The unit a claim that can wait gets from here comes first: it lands
+      // later, so free() passes over it for an Immediate claim, which then
+      // reached cache a copy ahead would have let go at once (amend/M.md
+      // B9). This unit goes on past that cache.
+      DevicePlan waits = *this;
+      waits.waits_ = true;
+      const std::optional<engine::Victim> later = waits.weigh(weighed);
+      passing_ = true;
+      std::optional<engine::Victim> unit = weigh(weighed);
+      passing_ = false;
+      if (!later || !later->later)
+        return unit;
+      passed_ = std::move(unit);
+      return later;
+    }
     if (!taken.progress) {
       ended_ = true;
       break;
@@ -1157,26 +1199,30 @@ std::optional<engine::Victim> Cache::DevicePlan::next() {
     if (taken.bytes || walk.statesAreUnits)
       break;
   }
-  if (!changed)
+  if (!weighed.changed)
     return std::nullopt;
-  return engine::Victim{.key = unitKey(static_cast<uint8_t>(Unit::Reclaim),
-                                       uint64_t{serial} << kPlanShift | produced++),
-                        .bytes = bytes,
-                        .stateBuffers = states,
-                        .later = demotions_ > demotions || written_,
+  return engine::Victim{.bytes = weighed.bytes,
+                        .stateBuffers = weighed.states,
+                        .later = demotions_ > weighed.demotions || written_,
                         .certainReuse = certain_,
                         .cls = inUse_ ? ReclaimClass::InUse : ReclaimClass::Ordinary,
                         .cost = cost_};
 }
 
-// takeReclaim, weighed.
+// takeReclaim, weighed; one that stopped at uncopied cache goes on there.
 Cache::DevicePlan::Step Cache::DevicePlan::step() {
-  for (std::pair<bool, uint64_t> released; (released = releaseExtent()).first;)
-    if (released.second)
-      return {.progress = true, .bytes = released.second};
+  if (!std::exchange(resumes_, false)) {
+    for (std::pair<bool, uint64_t> released; (released = releaseExtent()).first;)
+      if (released.second)
+        return {.progress = true, .bytes = released.second};
+  }
   bool kv = false;
   while (demotions_ + extentPages_ <= reusable_) {
     const Step evicted = evict();
+    if (evicted.uncopied) {
+      resumes_ = true;
+      return {.kv = kv, .uncopied = true};
+    }
     if (!evicted.progress || evicted.state)
       return {.progress = evicted.progress, .state = evicted.state, .kv = kv};
     kv = true;
@@ -1184,6 +1230,7 @@ Cache::DevicePlan::Step Cache::DevicePlan::step() {
       return {.progress = true, .bytes = bytes, .kv = true};
   }
   Step recycled = recycle();
+  resumes_ = recycled.uncopied;
   recycled.kv = kv;
   return recycled;
 }
@@ -1196,6 +1243,8 @@ Cache::DevicePlan::Step Cache::DevicePlan::evict() {
       checkpointsDone_ = true;
       break;
     }
+    if (reachesUncopied(checkpoint->id, true))
+      return {.uncopied = true};
     visit(Checkpoints);
     if (keptState(checkpoint->id))
       continue;
@@ -1208,17 +1257,17 @@ Cache::DevicePlan::Step Cache::DevicePlan::evict() {
   }
   for (std::optional<CacheEvictionCandidate> dead; (dead = head(DeadLeaves));) {
     visit(DeadLeaves);
-    if (const LeafGoes goes = leafGoes(dead->id, walk.timing); goes == LeafGoes::Copy || goes == LeafGoes::Erase) {
+    if (const LeafGoes goes = leafGoes(dead->id, timing()); goes == LeafGoes::Copy || goes == LeafGoes::Erase) {
       takeLeaf(dead->id, goes, false);
       return {.progress = true};
     }
   }
-  if (const Step taken = evictPhase(false); taken.progress)
+  if (const Step taken = evictPhase(false); taken.progress || taken.uncopied)
     return taken;
   if (walk.scope.upTo == ReclaimClass::InUse) {
     if (returnsLanding())
       return {};
-    if (const Step taken = evictPhase(true); taken.progress)
+    if (const Step taken = evictPhase(true); taken.progress || taken.uncopied)
       return taken;
   }
   return {};
@@ -1234,6 +1283,8 @@ Cache::DevicePlan::Step Cache::DevicePlan::evictPhase(bool inUse) {
     if (!state && !leaf)
       return {};
     if (state && (!leaf || state->lastUsed <= leaf->lastUsed)) {
+      if (reachesUncopied(state->id, true))
+        return {.uncopied = true};
       visit(states);
       if (keptState(state->id))
         continue;
@@ -1245,10 +1296,12 @@ Cache::DevicePlan::Step Cache::DevicePlan::evictPhase(bool inUse) {
       held = goes.pending;
       continue;
     }
+    if (reachesUncopied(leaf->id, false))
+      return {.uncopied = true};
     visit(leaves);
     if (keptLeaf(leaf->id))
       continue;
-    switch (const LeafGoes goes = leafGoes(leaf->id, demotionsRefused_ ? ReclaimTiming::Immediate : walk.timing)) {
+    switch (const LeafGoes goes = leafGoes(leaf->id, demotionsRefused_ ? ReclaimTiming::Immediate : timing())) {
     case LeafGoes::Copy:
     case LeafGoes::Erase:
     case LeafGoes::Demotion:
@@ -1271,7 +1324,9 @@ Cache::DevicePlan::Step Cache::DevicePlan::recycle() {
     for (std::optional<CacheEvictionCandidate> state; (state = head(order));) {
       if (order == RecycledUsed && returnsLanding())
         return {};
-      if (keptState(state->id) || (walk.skipStateWrites && cache.states_.reclaimWrites(state->id))) {
+      if (reachesUncopied(state->id, true))
+        return {.uncopied = true};
+      if (keptState(state->id) || (skipsWrites() && cache.states_.reclaimWrites(state->id))) {
         visit(order);
         continue;
       }
@@ -1574,10 +1629,31 @@ bool Cache::DevicePlan::returnsLanding() const {
   return freed && forms_[static_cast<size_t>(kv::PageForm::Full)].freePages + freed >= extentPages_;
 }
 
+// A claim that can wait's plan writes and demotes what an Immediate one
+// passes over.
+ReclaimTiming Cache::DevicePlan::timing() const noexcept {
+  return waits_ ? ReclaimTiming::CanWait : walk.timing;
+}
+
+bool Cache::DevicePlan::skipsWrites() const noexcept {
+  return !waits_ && walk.skipStateWrites;
+}
+
+// The first cache of the unit that an Immediate claim's reclaims pass over
+// as only a write or a demotion frees it: a state that needs a write, a
+// leaf a state needs without a copy while the tier takes writes.
+bool Cache::DevicePlan::reachesUncopied(uint64_t block, bool state) const {
+  if (passing_ || timing() != ReclaimTiming::Immediate)
+    return false;
+  if (state)
+    return !keptState(block) && skipsWrites() && writes(block);
+  return !keptLeaf(block) && !cache.kv_.slot(block) && needed(block) && cache.kvTierWritable();
+}
+
 // StateCache::reclaimOutcome with the write the reclaims before started.
 StateEviction Cache::DevicePlan::stateGoes(uint64_t block) const {
   const bool written = writes(block);
-  if (walk.skipStateWrites && written)
+  if (skipsWrites() && written)
     return {};
   const StateEviction outcome = cache.states_.reclaimOutcome(block, walk.unwritten);
   if (outcome.evicted && writing_ && written && walk.unwritten != StateCache::Unwritten::Drop)
@@ -1746,19 +1822,9 @@ std::optional<engine::Victim> Cache::peek(const VictimQuery &query, const engine
     cursor = cursorAfter(walk.scope, afterUnit, blockOfKey(after->key));
     holdAfter(walk, cursor);
   }
-  for (std::optional<WalkUnit> unit; (unit = nextStepUnit(walk, cursor));) {
+  for (std::optional<WalkUnit> unit; (unit = nextStepUnit(walk, cursor));)
     if (std::optional<engine::Victim> victim = victimOf(query, walk, *unit))
       return victim;
-    // What a step learns from a unit that waits for the write in flight.
-    const bool state = unit->unit == Unit::Checkpoint || unit->unit == Unit::State || unit->unit == Unit::UsedState;
-    if (state && !skipsState(walk, unit->candidate.id) &&
-        states_.reclaimOutcome(unit->candidate.id, walk.unwritten).pending) {
-      if (unit->unit == Unit::Checkpoint)
-        cursor = WalkCursor{.phase = walk.scope.statesOnly ? WalkCursor::Phase::Ordinary : WalkCursor::Phase::DeadLeaves};
-      else
-        cursor.statesHeld = true;
-    }
-  }
   return std::nullopt;
 }
 

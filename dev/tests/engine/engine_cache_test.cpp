@@ -6245,10 +6245,13 @@ void testHeldPagesAreNoRoomToWaitFor() {
   cache.endRequest(2);
 }
 
-// A state that needs a write frees its memory as a unit that lands later: a
-// claim that cannot wait, of any class, passes over it and starts no write,
-// and one that can wait, growth too, takes it with its write.
-void testImmediateClaimsPassOverStatesThatNeedAWrite() {
+// A state that needs a write frees its memory as a unit that lands later,
+// as does a leaf that needs a demotion: every claim's walk offers it in its
+// place, marked later, so that free() passes over it for a claim that
+// cannot wait, of any class, whose run then reached cache a copy ahead would
+// have let go at once (amend/M.md B9), and takes the units after it, which
+// start no write; one that can wait, growth too, takes it with its write.
+void testImmediateWalksOfferWhatLandsLaterInItsPlace() {
   CacheFixture fixture;
   auto control = std::make_shared<TransferControl>();
   control->ready = true;
@@ -6269,13 +6272,24 @@ void testImmediateClaimsPassOverStatesThatNeedAWrite() {
     return units;
   };
   const auto blockOf = [](const engine::Victim &victim) { return victim.key & ((uint64_t{1} << 56) - 1); };
+  const auto same = [](const engine::Victim &left, const engine::Victim &right) {
+    return left.key == right.key && left.later == right.later && left.stateBuffers == right.stateBuffers &&
+           left.pages == right.pages;
+  };
   for (const ClaimClass cls : {ClaimClass::InService, ClaimClass::Growth}) {
     const std::vector<engine::Victim> atOnce = unitsOf(cls, NeedTiming::Immediate);
-    require(!atOnce.empty() && std::ranges::none_of(atOnce, [&](const engine::Victim &victim) {
-              return blockOf(victim) == fixture.blocks[0] || blockOf(victim) == fixture.blocks[1] || victim.later;
-            }),
-            "a claim that cannot wait was offered a state that needs a write");
+    require(atOnce.size() >= 3 && blockOf(atOnce[0]) == fixture.blocks[0] && atOnce[0].later &&
+                blockOf(atOnce[1]) == fixture.blocks[1] && atOnce[1].later && !atOnce[2].later &&
+                std::ranges::equal(atOnce, unitsOf(cls, NeedTiming::CanWait), same),
+            "a claim that cannot wait was not offered the states that need a write in their place, marked later");
   }
+  const ClaimSpec cannotWait{.cls = ClaimClass::Growth, .timing = NeedTiming::Immediate};
+  const VictimQuery immediate{.claim = &cannotWait, .need = {.stateBuffers = 1}};
+  require(fixture.cache.take(immediate, unitsOf(ClaimClass::Growth, NeedTiming::Immediate)[2]).outcome ==
+                  FreeOutcome::Met &&
+              !control->slots && fixture.cache.stateResident(fixture.blocks[0]) &&
+              fixture.cache.stateResident(fixture.blocks[1]),
+          "the unit after the states that need a write started a write");
   const std::vector<engine::Victim> waits = unitsOf(ClaimClass::Growth, NeedTiming::CanWait);
   require(waits.size() >= 2 && blockOf(waits[0]) == fixture.blocks[0] && waits[0].later &&
               blockOf(waits[1]) == fixture.blocks[1] && waits[1].later,
@@ -6285,6 +6299,93 @@ void testImmediateClaimsPassOverStatesThatNeedAWrite() {
   require(fixture.cache.take(query, waits[0]).outcome == FreeOutcome::Met && control->slots == 1 &&
               !fixture.cache.stateResident(fixture.blocks[0]),
           "growth did not write the state it took");
+
+  // The leaf a state on disk restores through, without a copy while the
+  // tier takes writes.
+  test::TestKvTier tier;
+  CacheFixture kv(&tier, false, std::make_shared<model::DiskBudget>(1000));
+  auto written = std::make_shared<TransferControl>();
+  written->ready = true;
+  kv.cache.publishCompositeState(kv.blocks[3], std::make_shared<TieredState>(written), false);
+  require(kv.cache.reclaimOneState(StateClass::Ordinary, false) && !kv.cache.stateResident(kv.blocks[3]),
+          "the state was not written");
+  static_cast<void>(kv.cache.pollTransfers());
+  const auto leavesOf = [&](NeedTiming timing) {
+    const ClaimSpec claim{.cls = ClaimClass::InService, .timing = timing};
+    const VictimQuery pages{.claim = &claim, .need = {.pages = 1}};
+    std::vector<engine::Victim> units;
+    for (std::optional<engine::Victim> victim = kv.cache.peek(pages, nullptr); victim;
+         victim = kv.cache.peek(pages, &*victim))
+      units.push_back(*victim);
+    return units;
+  };
+  const std::vector<engine::Victim> demoted = leavesOf(NeedTiming::Immediate);
+  require(!demoted.empty() && blockOf(demoted[0]) == kv.blocks[3] && demoted[0].later && demoted[0].pages == 1 &&
+              std::ranges::equal(demoted, leavesOf(NeedTiming::CanWait), same),
+          "a claim that cannot wait was not offered the leaf that needs a demotion in its place, marked later");
+}
+
+// The reclaims of an Immediate claim pass over cache only a write frees,
+// here the oldest conversation's checkpoint, and take the leaves of the
+// conversations after it. Its walk offers first, marked later, the unit a
+// claim that can wait gets from there, which writes the checkpoint, so that
+// free() passes over it, its run having reached cache a copy ahead would
+// have let go at once (amend/M.md B9); the units that go at once are those
+// the reclaims take, which write nothing and release what they were
+// weighed at.
+void testImmediateDeviceWalkOffersWhatAWriteFreesFirst() {
+  test::TestKvStorage storage{48, 100, 4};
+  KvPool pool{storage, 4};
+  engine::Cache cache(pool, nullptr, nullptr);
+  auto control = std::make_shared<TransferControl>();
+  control->ready = true;
+  const auto cachePrompt = [&](uint64_t id, uint32_t pages) {
+    std::vector<uint32_t> prompt(pages * KvCache::pageTokens + 1);
+    std::iota(prompt.begin(), prompt.end(), 1000 * id);
+    cache.beginRequest(id);
+    require(admitTokens(cache, id, prompt.size()).granted(), "a conversation's pages were denied");
+    cache.publishCommittedBlocks(id, prompt, pages * KvCache::pageTokens, {});
+    const std::array blocks{cache.blockAt(id, pages / 2 * KvCache::pageTokens),
+                            cache.blockAt(id, pages * KvCache::pageTokens)};
+    cache.endRequest(id);
+    return blocks;
+  };
+  const std::array<uint64_t, 2> oldest = cachePrompt(1, 8);
+  cache.publishCompositeState(oldest[0], std::make_shared<TieredState>(control), true);
+  cache.publishCompositeState(oldest[1], std::make_shared<TestState>(100), false);
+  for (uint64_t id = 2; id <= 5; ++id)
+    static_cast<void>(cachePrompt(id, 4));
+  static_cast<void>(cache.releaseEmptyExtents(false));
+  const MemoryRates rates{.prefillSecondsPerRow = 0.001, .tierReadBytesPerSecond = 1.0e4, .reuse = 0.5};
+  const auto unitsOf = [&](NeedTiming timing) {
+    const ClaimSpec claim{.cls = ClaimClass::Optional, .timing = timing};
+    const VictimQuery query{.claim = &claim, .need = {.bytes = pool.allocatedBytes()}, .rates = &rates};
+    std::vector<engine::Victim> units;
+    for (std::optional<engine::Victim> victim = cache.peek(query, nullptr); victim; victim = cache.peek(query, &*victim))
+      units.push_back(*victim);
+    return units;
+  };
+  const std::vector<engine::Victim> waits = unitsOf(NeedTiming::CanWait);
+  const std::vector<engine::Victim> atOnce = unitsOf(NeedTiming::Immediate);
+  require(!waits.empty() && waits[0].later && waits[0].stateBuffers == 1 && atOnce.size() > 1 && atOnce[0].later &&
+              atOnce[0].bytes == waits[0].bytes && atOnce[0].stateBuffers == waits[0].stateBuffers &&
+              atOnce[0].cost.onceSeconds == waits[0].cost.onceSeconds && !atOnce[1].later,
+          "an Immediate claim's walk passed over the checkpoint that needs a write without offering what writing it "
+          "frees first");
+  const ClaimSpec claim{.cls = ClaimClass::Optional, .timing = NeedTiming::Immediate};
+  const VictimQuery query{.claim = &claim, .need = {.bytes = pool.allocatedBytes()}, .rates = &rates};
+  uint64_t released = 0;
+  for (const engine::Victim &unit : atOnce) {
+    if (unit.later)
+      continue;
+    const uint64_t allocated = pool.allocatedBytes();
+    require(cache.take(query, unit).outcome == FreeOutcome::Met && allocated - pool.allocatedBytes() == unit.bytes,
+            "a unit that goes at once did not release what it was weighed at");
+    released += unit.bytes;
+  }
+  require(released && !control->slots && !cache.snapshot().stateCache.offloads && cache.stateResident(oldest[0]),
+          "the units that go at once wrote the checkpoint");
+  cache.checkInvariants();
 }
 
 int main() {
@@ -6456,7 +6557,8 @@ int main() {
     testDeviceNeedReachesTheLeavesPastTheStates();
     testDeviceNeedWeighsALargeCacheAtOnce();
     testHeldPagesAreNoRoomToWaitFor();
-    testImmediateClaimsPassOverStatesThatNeedAWrite();
+    testImmediateWalksOfferWhatLandsLaterInItsPlace();
+    testImmediateDeviceWalkOffersWhatAWriteFreesFirst();
     std::cout << "engine cache tests passed\n";
     return 0;
   } catch (const std::exception &error) {

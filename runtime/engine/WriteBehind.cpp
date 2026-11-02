@@ -63,7 +63,8 @@ bool WriteBehind::demanded(uint64_t demandBytes) const {
   uint64_t covered = cache_.copyingAheadBytes();
   for (std::optional<Victim> unit = cache_.peek(query, nullptr); unit && covered < demandBytes;
        unit = cache_.peek(query, &*unit))
-    covered += unit->bytes;
+    if (!unit->later)
+      covered += unit->bytes;
   return covered < demandBytes;
 }
 

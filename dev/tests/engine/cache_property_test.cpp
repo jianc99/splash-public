@@ -222,7 +222,8 @@ public:
   // What the walk weighs its victims to free never exceeds what taking them
   // frees (testPeekNeverOverstates): for a device need of a drawn class,
   // reach and timing, the bytes of the first units the walk gives, taken in
-  // order, are at most the bytes the pool releases. Each unit releases
+  // order, are at most the bytes the pool releases; an Immediate claim, as
+  // free() does, passes over those that land later. Each unit releases
   // exactly what it was weighed at while none so far lands later and the
   // takes so far started no transfer and wrote no state: what the tier
   // refuses, and the copies a write gives up for room, the walk cannot know
@@ -239,6 +240,8 @@ public:
     uint64_t predicted = 0;
     for (std::optional<engine::Victim> victim = cache_.peek(query, nullptr); victim && victims.size() < 4;
          victim = cache_.peek(query, &*victim)) {
+      if (victim->later && claim.timing == NeedTiming::Immediate)
+        continue;
       predicted += victim->bytes;
       victims.push_back(*victim);
     }

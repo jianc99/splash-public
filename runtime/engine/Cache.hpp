@@ -700,9 +700,14 @@ public:
   // reclaims before it took (DevicePlan), it costs its victims. A page
   // need's unit is one victim, a leaf or a state; a state need's one state,
   // without growth (hostRefused) a state alone. A state that needs a write
-  // frees its memory as a unit that lands later, and an Immediate claim
-  // passes over it, as over units that free memory only as a transfer lands
-  // (amend/M.md A38). A unit peek() cannot be sure a transfer for it starts,
+  // frees its memory as a unit that lands later (amend/M.md A38), as do a
+  // state that waits for the write in flight and a leaf that needs a
+  // demotion. The walk offers them in their place to every claim, marked
+  // later: free() takes none of them for an Immediate claim, whose run then
+  // reached cache a copy ahead would have let go at once (B9). The reclaims
+  // of an Immediate claim pass over such cache, so a device need's unit
+  // whose reclaims first reach it comes after the unit a claim that can wait
+  // gets from there. A unit peek() cannot be sure a transfer for it starts,
   // a demotion the tier may refuse, frees nothing in what it reports, and a
   // unit that waits for the state write in flight frees nothing yet: peek()
   // may understate what a unit frees, never overstate it. A unit's cost is
@@ -1116,8 +1121,8 @@ private:
   // The unit is of certain reuse: the resume point, a wanted chain's state
   // or KV, or what is in use.
   [[nodiscard]] bool certainReuse(const WalkUnit &unit) const;
-  // What peek() reports of a unit the walk would take, none when the walk
-  // passes over it.
+  // What peek() reports of a unit the walk reaches, none when taking it
+  // frees nothing.
   [[nodiscard]] std::optional<engine::Victim> victimOf(const VictimQuery &query, const Walk &walk,
                                                        const WalkUnit &unit) const;
   // peek()'s unit for a device need: the one after `after` of those the
@@ -1135,8 +1140,9 @@ private:
   // How a reclaim of the leaf frees its page: at once, as its demotion
   // lands, or not now (the leaf stays).
   enum class LeafFree : uint8_t { Now, Later, Not };
-  [[nodiscard]] LeafFree leafFrees(uint64_t block, ReclaimTiming timing) const;
-  // The walk passes over a state that needs a write (skipStateWrites).
+  [[nodiscard]] LeafFree leafFrees(uint64_t block) const;
+  // The walk's reclaims pass over a state that needs a write
+  // (skipStateWrites).
   [[nodiscard]] bool skipsState(const Walk &walk, uint64_t block) const;
   // Frees the RAM copy of a state the walk reached, as the walk says; one it
   // passes over stays, counted as cache reached that a copy would have let

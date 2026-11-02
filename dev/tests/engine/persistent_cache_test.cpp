@@ -1507,6 +1507,34 @@ void testCopiesFollowDemandNotAWindow() {
           "a point was not copied ahead on the memory's demand");
 }
 
+// The cache's victims that go at once, against which the memory's demand
+// for copies is weighed, start no write and wait for none: the walk offers
+// the unit a claim that can wait gets from cache that needs a write, here
+// the oldest conversation's checkpoint before the KV of the others, in its
+// place, and it counts for nothing (amend/M.md B9). A demand that what goes
+// at once holds copies no point; one byte more copies it.
+void testCopyDemandCountsOnlyWhatGoesAtOnce() {
+  constexpr double kDelay = WriteBehind::kDelayMilliseconds;
+  Process process(false);
+  WriteBehind writes(process.cache);
+  process.publish(process.cachePrompt(1, promptOf(9000, 2))[0], true);
+  static_cast<void>(process.cachePrompt(2, promptOf(5000, 2)));
+  const uint64_t point = process.cachePrompt(3, promptOf(1000, 1))[0];
+  process.publish(point);
+  writes.published(point, WriteBehind::kMinimumTokens, 0.0);
+  const ClaimSpec growth{.cls = ClaimClass::Growth, .timing = NeedTiming::Immediate};
+  const VictimQuery query{.claim = &growth, .need = {.bytes = 1}};
+  uint64_t atOnce = 0, later = 0;
+  for (std::optional<Victim> unit = process.cache.peek(query, nullptr); unit;
+       unit = process.cache.peek(query, &*unit))
+    (unit->later ? later : atOnce) += unit->bytes;
+  require(atOnce && later, "the walk did not offer what writing the checkpoint frees before the KV that goes at once");
+  require(!writes.run(kDelay, atOnce, false) && !process.tier.demotions && writes.snapshot().waiting == 1,
+          "a point was copied ahead though what goes at once held the demand");
+  require(!writes.run(kDelay, atOnce + 1, false) && process.tier.demotions == 1,
+          "a demand beyond what goes at once copied no point");
+}
+
 // Until the engine's claims weigh copies ahead, a reclaim that only passes
 // over cache a copy would have let go at once keeps a temporary tier's
 // copies going as one that writes it does: the exchange for the expert
@@ -1763,6 +1791,7 @@ int main() {
     testTemporaryPointsWaitForTheirRequests();
     testTemporaryCopiesFollowReclaimsOfUncopiedCache();
     testCopiesFollowDemandNotAWindow();
+    testCopyDemandCountsOnlyWhatGoesAtOnce();
     testCopiesFollowReclaimsThatPassOverUncopiedCache();
     testWriteThroughCopiesAreRestorePoints();
     testRecomputedChainsStayWhole();
