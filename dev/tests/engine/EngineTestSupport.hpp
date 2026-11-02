@@ -12,10 +12,12 @@
 #include "TestKvTier.hpp"
 #include "engine/Engine.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <functional>
 #include <initializer_list>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -183,17 +185,23 @@ inline engine::EngineRequest constrainedRequest(uint64_t id, double deadline = 1
 // pages (1,000 pages by default). The tier's transfers land as the fixture
 // ticks on, and decode runs to each request's output limit. The tier's
 // write budget, if a test sets one, refills on the fixture's clock. Its
-// engine's governor is the host's (GovernedHost), of `limits`.
+// engine's governor is the host's (GovernedHost), of `limits`. A governed
+// fixture's KV extents allocate through that governor, as production's
+// do, so that its limit, which limit() sets, refuses them as it refuses the
+// allocations a test routes through it (GovernedHost::reserve), recording
+// what each claim lacks; the storage's own budget is then unused.
 struct Spilling {
   // The pages of an extent, of a type of its own for a call to name.
   struct Extent final {
     uint32_t pages;
   };
+  struct Governed final {};
   // `shape` sets what one of the model's prefill commands may hold
   // (Executor::groupRows, passes), which the engine takes as it is built.
   explicit Spilling(uint32_t slots, bool always = true, uint64_t residentKvBytes = 100'000,
                     uint32_t residentTokens = 0, Extent extent = {4}, uint64_t laneReadBytes = 0,
-                    const std::function<void(Executor &)> &shape = {}, const GovernorLimits &limits = {})
+                    const std::function<void(Executor &)> &shape = {}, const GovernorLimits &limits = {},
+                    bool governed = false)
       : storage(256, 100, extent.pages, 10),
         budget(std::make_shared<model::DiskBudget>(uint64_t{slots} * 100, [this] { return now; })),
         cache(pool, &tier, budget, engine::CacheSpillPolicy{1, 1}),
@@ -206,11 +214,24 @@ struct Spilling {
                cache, model, events) {
     tier.budget = budget;
     tier.transferLimit = 1024;
-    require(static_cast<bool>(pool.fillRunway(kv::PageForm::Index)),
-            "the Index runway was not allocated");
+    {
+      // A governed runway is the start's, under its Floor claim.
+      std::optional<ClaimScope> start;
+      if (governed) {
+        host.through(storage);
+        start.emplace(host.governor, engine::ClaimClass::Floor);
+      }
+      require(static_cast<bool>(pool.fillRunway(kv::PageForm::Index)), "the Index runway was not allocated");
+    }
     guardReleases(storage, engine);
     model.decodeFinishes = false;
   }
+
+  // A governed fixture, its governor's limit kGovernedLimitBytes.
+  explicit Spilling(Governed, uint32_t slots, bool always = true, Extent extent = {4}, uint64_t laneReadBytes = 0,
+                    const std::function<void(Executor &)> &shape = {})
+      : Spilling(slots, always, 100'000, 0, extent, laneReadBytes, shape, {.limitBytes = kGovernedLimitBytes}, true) {}
+  static constexpr uint64_t kGovernedLimitBytes = 1ULL << 20;
 
   static engine::EngineConfig config(bool always, uint32_t residentTokens,
                                      GovernedHost &host, uint64_t laneReadBytes) {
@@ -247,6 +268,20 @@ struct Spilling {
   void runUntilIdle() {
     runUntil([&] { return idle(engine); }, "the requests did not end");
   }
+  // A governed fixture's engine may hold `bytes` in all: other memory
+  // (FakeMemory's holder "limit") takes the rest of its governor's limit.
+  void limit(uint64_t bytes) {
+    const uint64_t held = host.memory.held("limit");
+    const uint64_t wanted = kGovernedLimitBytes - std::min(bytes, kGovernedLimitBytes);
+    if (wanted > held)
+      host.memory.hold("limit", wanted - held);
+    else
+      host.memory.release("limit", held - wanted);
+  }
+  // What a governed fixture's engine holds: all FakeMemory counts but that;
+  // and the room its limit leaves.
+  [[nodiscard]] uint64_t held() const { return host.memory.total() - host.memory.held("limit"); }
+  [[nodiscard]] uint64_t room() const { return kGovernedLimitBytes - std::min(kGovernedLimitBytes, host.memory.total()); }
   // The slots the quota of active KV keeps for commitments now.
   [[nodiscard]] uint64_t committedSlots() const { return budget->committedBytes() / 100; }
   void allowSpillWrites(bool allowed) {

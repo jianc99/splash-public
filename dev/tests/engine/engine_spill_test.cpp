@@ -1,5 +1,6 @@
 #include "CostSeeds.hpp"
 #include "EngineTestSupport.hpp"
+#include "FakeElasticPool.hpp"
 #include "MemoryPasses.hpp"
 #include "TestChecks.hpp"
 #include "TestEngine.hpp"
@@ -186,20 +187,22 @@ void testConversionCommitsTheHistoryWithoutCopies() {
 }
 
 // On a target whose KV can live on the SSD cache, a Resident lane the
-// engine's limit refuses to grow converts to Spill before a chunk of the
-// expert store goes: its KV then gives memory back as its copies land, the
-// store every decode step reads keeps its chunks, and the lane decodes its
-// whole output. A lane that cannot convert, its quota short of its history,
-// keeps all its KV in memory, as on a target without the SSD cache, and
-// takes the chunk.
-void testResidentLaneConvertsBeforeTheExpertStore() {
+// engine's limit refuses to grow converts to Spill where its quota holds its
+// history: its KV then gives memory back as its copies land, and the lane
+// decodes its whole output. A lane that cannot convert, its quota short of
+// its history, keeps all its KV in memory, as on a target without the SSD
+// cache, and takes a unit of the expert store instead. Between a conversion
+// and a store unit both on offer the ledger takes the cheaper (amend/M.md
+// B8; memory_ledger_test, memory_value_test): here the store holds a unit
+// above its floor only where the lane cannot convert.
+void testResidentLaneConvertsOrTakesTheExpertStore() {
   for (const uint32_t slots : {8U, 5U}) {
-    Spilling spill(slots, false);
-    // Two Full extents beside the Index runway, and one Index extent more.
-    spill.storage.budgetPages = 9;
-    spill.model.expertChunks = {1000};
-    // A chunk given back is room the engine's limit then gives the KV.
-    spill.model.expertReleaseObserver = [&] { spill.storage.budgetPages += 8; };
+    Spilling spill(Spilling::Governed{}, slots, false);
+    test::FakeElasticPool experts("experts", spill.host.memory, 800, slots == 8 ? 1 : 0, 1, 1, 1, 1.0, 0.0);
+    static_cast<void>(spill.host.governor.ledger().addPool(experts));
+    // Two Full extents beside the Index runway, and one Index extent more,
+    // beside the store's unit.
+    spill.limit(9 * 100 + 800);
     spill.engine.submit(Spilling::prompt(1, 1, 7, 40));
     spill.runUntilIdle();
     const SpillRequestsSnapshot counts = spill.engine.snapshot().spill;
@@ -207,12 +210,10 @@ void testResidentLaneConvertsBeforeTheExpertStore() {
                 spill.events.usage.at(1).second == 40,
             "the lane did not decode its whole output");
     if (slots == 8)
-      require(counts.converted == 1 && spill.model.expertChunks.size() == 1 &&
-                  spill.model.releasedExpertChunks.empty(),
-              "a lane that could convert to Spill took a chunk of the expert store first");
+      require(counts.converted == 1 && experts.shrinks == 0, "a lane that could convert to Spill did not");
     else
-      require(counts.converted == 0 && spill.model.releasedExpertChunks.size() == 1,
-              "a lane that could not convert did not take a chunk of the expert store");
+      require(counts.converted == 0 && experts.shrinks == 1,
+              "a lane that could not convert did not take a unit of the expert store");
     require(spill.committedSlots() == 0, "the lane kept its commitment");
   }
 }
@@ -247,11 +248,13 @@ void testConversionSpillsAHistoryWithCopies() {
           "the lane whose history had copies did not spill them when it converted");
 }
 
-// A start that converts to Spill when memory refuses its restore starts as a
-// Spill request, counted as one. Refused all the same, as while its writes
-// have not landed beside a resident lane, it decides its mode afresh at each
-// attempt and counts no conversion, however often it retries.
-void testAStartThatConvertsCountsNoConversion() {
+// A start refused memory beside a resident lane, as while its restore is
+// refused, does not convert to Spill: where its KV lives is placement's
+// decision at each attempt (amend/M.md B13), and a conversion is a victim
+// the ledger takes of an admitted lane (B7). It waits, counts no conversion
+// however often it retries, and once memory grows starts in the mode its
+// attempt placed, counted once by it.
+void testAStartRefusedMemoryCountsNoConversion() {
   Spilling spill(64, false);
   spill.model.deniedReservations = 1000;
   spill.model.stateTier = std::make_shared<OffloadControl>();
@@ -260,25 +263,21 @@ void testAStartThatConvertsCountsNoConversion() {
   // The first turn's state goes to the disk: the second restores it.
   spill.engine.submit(Spilling::prompt(1, 1, 4, 1));
   spill.runUntilIdle();
-  // States take memory from here on: refused, the resident lane's replay
-  // point would start copies of the first turn's KV, which hold back the
-  // writes of the conversion below.
   spill.model.deniedReservations = 0;
   // A resident lane decodes within its last page.
   spill.engine.submit(Spilling::prompt(3, 3, 3, 30));
   spill.runUntil([&] { return spill.events.outputs.contains(3); }, "the resident lane did not decode");
-  // The second turn's restore is refused memory; it converts, and the
-  // writes of its chain do not land for 2 s.
+  // The second turn's restore is refused memory for 2 s.
   spill.storage.growthBlocked = true;
   spill.engine.submit(Spilling::prompt(2, 1, 6, 1));
   for (int step = 0; step < 20; ++step) {
     spill.now += 100;
     static_cast<void>(spill.engine.tick(spill.now));
   }
-  require(spill.events.startIds.size() == 2 && spill.tier.writes.size() == 4 &&
+  require(spill.events.startIds.size() == 2 && spill.tier.writes.empty() &&
               spill.engine.snapshot().spill.converted == 0,
-          "the start that converted and waited counted its conversions, or did not convert");
-  // Once memory grows again it starts Resident, its next attempt's mode.
+          "a start refused memory converted, or counted a conversion");
+  // Once memory grows again it starts Resident, its attempt's mode.
   spill.storage.growthBlocked = false;
   spill.runUntilIdle();
   const SpillRequestsSnapshot counts = spill.engine.snapshot().spill;
@@ -456,15 +455,10 @@ void testSpilledFullExtentsLeaveOnceNoPromptGrows() {
 // what they take. A prompt that the engine's limit holds with its pages
 // spilled, but not as Full pages, completes with them spilled.
 void testSpillMovesThroughTheHostPause() {
-  Spilling spill(1024);
+  Spilling spill(Spilling::Governed{}, 1024);
   // The governor's host refuses growth unless a request in service needs
   // it, then the engine's limit: 90 Full pages.
-  spill.storage.budgetPages = 90;
-  spill.storage.growthAllowed = [&](uint32_t) {
-    const metal::AllocationResult host = spill.host.reserve(100);
-    spill.storage.allocationFailure = host ? metal::AllocationFailure::EngineBudget : host.failure;
-    return static_cast<bool>(host);
-  };
+  spill.limit(90 * 100);
   spill.host.pause(true);
   // 120 pages and a token: two prefill commands, the second after 62 of the
   // first's 64 pages spilled, 58 of them past the runway's four Index pages.
@@ -669,12 +663,18 @@ void testSpillResumeTakesItsReplaysPagesAsItRuns() {
 }
 
 // A Resident request suspended for a higher priority resumes with the KV it
-// held, all Full, at once. Where memory no longer holds that, it converts to
-// Spill there, and then takes its replay's first page, as a Spill request
-// resumes, rather than ask for all of it as Full pages again.
-void testAResumeThatConvertsTakesItsReplaysPagesAsItRuns() {
-  // Requests spill only where memory refuses them.
-  Spilling spill(1024, false);
+// held, all Full, at once. Memory the expert store grew into while it waited
+// is memory its resume, a claim in service, takes back (amend/M.md B2): it
+// resumes Resident and decodes its whole output. Where its KV lives was
+// placement's decision at its start (B13); a resume converts no lane of its
+// own, a conversion being a victim of an admitted lane (B7).
+void testAResumeTakesBackTheMemoryItsKvHeld() {
+  Spilling spill(Spilling::Governed{}, 1024, false);
+  test::FakeElasticPool experts("experts", spill.host.memory, 1'000, 0, 16, 16, 0, 1.0, 0.0);
+  static_cast<void>(spill.host.governor.ledger().addPool(experts));
+  // The engine's limit holds the projection of a request with 4,096 tokens
+  // of output, 261 Full pages, beside the Index runway.
+  spill.limit(270 * 100);
   spill.model.decodeTokens = 8;
   EngineRequest background = Spilling::prompt(1, 1, 4, 4'096);
   background.priority = RequestPriority::Background;
@@ -683,7 +683,7 @@ void testAResumeThatConvertsTakesItsReplaysPagesAsItRuns() {
   spill.runUntil([&] { return spill.events.outputs[1].size() >= 2'400; },
                  "the request did not decode");
   // A Normal start is refused memory while it is resident, which suspends
-  // it, and its resume is refused until memory has shrunk.
+  // it, and its resume is refused until the store has grown.
   spill.model.beginGrowthBlocked = [&] {
     return spill.model.lastBeginId == 2 && spill.model.requests.at(1).resident;
   };
@@ -691,17 +691,18 @@ void testAResumeThatConvertsTakesItsReplaysPagesAsItRuns() {
   spill.engine.submit(Spilling::prompt(2, 2, 1, 1));
   spill.runUntil([&] { return spill.events.completedCount == 1; },
                  "the Normal request did not run");
-  // Memory shrinks to 72 Full pages, which hold a prefill command's 64 and
-  // not the 80 it held: a critical pass releases what the cache held.
-  spill.storage.budgetPages = 72;
+  // A critical pass releases what the cache held, and the control pass then
+  // grows the store into the room.
   static_cast<void>(test::criticalPass(spill.host.governor));
+  static_cast<void>(spill.host.governor.controlPass(spill.now));
+  require(experts.units() == 16, "the store did not grow into the room the cache left");
   spill.model.resumeDenied = false;
   spill.runUntilIdle();
   const SpillRequestsSnapshot counts = spill.engine.snapshot().spill;
-  require(counts.resident == 2 && counts.converted == 1 && spill.events.failedCount == 0 &&
-              spill.events.completedCount == 2 && spill.events.usage.at(1).second == 4'096,
-          "a Resident request that converted as it resumed asked for its whole replay as Full "
-          "pages");
+  require(counts.resident == 2 && counts.converted == 0 && spill.events.failedCount == 0 &&
+              spill.events.completedCount == 2 && spill.events.usage.at(1).second == 4'096 &&
+              spill.model.resumptions == 1 && experts.shrinks != 0,
+          "a Resident request's resume did not take back the memory the store grew into");
 }
 
 // A decoding lane whose history holds Index pages reads them through the hot
@@ -835,7 +836,7 @@ void testALoneLaneWaitsForTheChainANeighbourLeft() {
     // Extents of 16 pages, which the requests share. Every state goes
     // straight to the SSD. The quota holds the Spill lane's commitment but
     // not the neighbour's, which cannot convert to Spill then.
-    Spilling spill(128, true, 100'000, 0, Spilling::Extent{16});
+    Spilling spill(Spilling::Governed{}, 128, true, Spilling::Extent{16});
     spill.model.deniedReservations = std::numeric_limits<uint32_t>::max();
     spill.model.stateTier = std::make_shared<OffloadControl>();
     spill.model.stateTier->ready = true;
@@ -852,18 +853,18 @@ void testALoneLaneWaitsForTheChainANeighbourLeft() {
     spill.engine.submit(Spilling::prompt(2, 1, 48, 10000));
     spill.runUntil([&] { return spill.events.outputs.contains(2); }, "the neighbour did not decode");
     spill.tier.writableFile = true;
-    // The Spill lane's floor fits once two extents have left memory since it
-    // first asked for it.
-    std::optional<uint64_t> limit;
+    // The Spill lane's floor, three extents' bytes, finds an extent's room
+    // when it first asks for it: it fits once two extents have left memory.
+    bool asked = false;
     spill.model.spilledReadsRoom = [&](uint64_t id) {
-      if (id != 3)
+      if (id != 3 || spill.model.spilledReadFloors.contains(id))
         return true;
-      if (!limit)
-        limit = spill.storage.allocatedBytes() - 2 * 16 * 100;
-      return spill.storage.allocatedBytes() <= *limit;
+      if (!std::exchange(asked, true))
+        spill.limit(spill.held() + 16 * 100);
+      return static_cast<bool>(spill.host.reserve(3 * 16 * 100));
     };
     spill.engine.submit(Spilling::prompt(3, 3, 20, 8));
-    spill.runUntil([&] { return limit.has_value(); }, "the Spill lane did not ask for its floor");
+    spill.runUntil([&] { return asked; }, "the Spill lane did not ask for its floor");
     // The neighbour finishes, or is cancelled.
     if (restored)
       spill.model.decodeFinishes = true;
@@ -1351,18 +1352,21 @@ void testAWaitThatNeverLandsHoldsLanesUpToItsLimit() {
 }
 
 // A Spill lane refused its floor of the hot block cache converts the Resident
-// neighbour that holds the most KV to Spill before a chunk of the expert
-// store goes: the neighbour's pages leave as their copies land, the floor
-// fits, and the store every decode step reads keeps its chunks. A neighbour
-// that restored a chain whose copies landed keeps those pages Full in the
-// command its conversion came in, whose lanes' reads were reserved before,
-// and spills them from the next. A neighbour that cannot convert, its
-// projection beyond the quota, keeps its KV in memory, and the chunk goes.
-void testAFloorConvertsAResidentNeighbourBeforeTheExpertStore() {
+// neighbour that holds the most KV to Spill where the quota holds it: the
+// neighbour's pages leave as their copies land and the floor fits. A
+// neighbour that restored a chain whose copies landed keeps those pages Full
+// in the command its conversion came in, whose lanes' reads were reserved
+// before, and spills them from the next. A neighbour that cannot convert,
+// its projection beyond the quota, keeps its KV in memory, and a unit of the
+// expert store goes instead. Between a conversion and a store unit both on
+// offer the ledger takes the cheaper (amend/M.md B8): here the store holds a
+// unit above its floor only where the neighbour cannot convert.
+void testAFloorConvertsAResidentNeighbourOrTakesTheExpertStore() {
   for (const uint32_t slots : {1024U, 128U})
   for (const bool restored : {false, true}) {
-    Spilling spill(slots, true, 100'000, 0, Spilling::Extent{16});
-    spill.model.expertChunks = {1000};
+    Spilling spill(Spilling::Governed{}, slots, true, Spilling::Extent{16});
+    test::FakeElasticPool experts("experts", spill.host.memory, 16 * 100, slots == 1024 ? 1 : 0, 1, 1, 1, 1.0, 0.0);
+    static_cast<void>(spill.host.governor.ledger().addPool(experts));
     // An earlier turn leaves its chain spilled, its copies written through.
     if (restored) {
       spill.engine.submit(Spilling::prompt(1, 1, 40, 1));
@@ -1376,31 +1380,26 @@ void testAFloorConvertsAResidentNeighbourBeforeTheExpertStore() {
     spill.runUntil([&] { return spill.events.outputs.contains(2); }, "the neighbour did not decode");
     spill.tier.writableFile = true;
     // The Spill lane's first decode command reads; from its second on, which
-    // its neighbour leads, its floor fits once two extents have left memory
-    // since it was first refused, or a chunk of the store went.
+    // its neighbour leads, its floor, an extent's bytes, finds no room when
+    // first refused: it fits once an extent has left memory, or a unit of the
+    // store went.
     uint32_t asked = 0;
-    std::optional<uint64_t> limit;
+    bool limited = false;
     spill.model.spilledReadsRoom = [&](uint64_t id) {
       if (id != 3 || ++asked == 1)
         return true;
-      if (!limit)
-        limit = spill.storage.allocatedBytes() - 2 * 16 * 100;
-      return spill.storage.allocatedBytes() <= *limit || !spill.model.releasedExpertChunks.empty();
+      if (!std::exchange(limited, true))
+        spill.limit(spill.held());
+      return static_cast<bool>(spill.host.reserve(16 * 100));
     };
     spill.engine.submit(Spilling::prompt(3, 3, 20, 64));
-    spill.runUntil(
-        [&] {
-          return limit && (spill.storage.allocatedBytes() <= *limit ||
-                           !spill.model.releasedExpertChunks.empty());
-        },
-        "the Spill lane's floor did not fit");
+    spill.runUntil([&] { return limited && spill.room() >= 16 * 100; }, "the Spill lane's floor did not fit");
     const SpillRequestsSnapshot counts = spill.engine.snapshot().spill;
     if (slots == 1024)
-      require(counts.converted == 1 && spill.model.releasedExpertChunks.empty(),
-              "a floor took a chunk of the expert store before a neighbour that could convert");
+      require(counts.converted == 1 && experts.shrinks == 0, "a floor beside a neighbour that could convert did not convert it");
     else
-      require(counts.converted == 0 && spill.model.releasedExpertChunks.size() == 1,
-              "a floor beside a neighbour that could not convert did not take a chunk of the store");
+      require(counts.converted == 0 && experts.shrinks == 1,
+              "a floor beside a neighbour that could not convert did not take a unit of the store");
     spill.model.decodeFinishes = true;
     spill.runUntilIdle();
     require(spill.events.failedCount == 0 && spill.committedSlots() == 0,
@@ -1410,14 +1409,18 @@ void testAFloorConvertsAResidentNeighbourBeforeTheExpertStore() {
 
 // A Spill lane refused its floor of the hot block cache converts the Resident
 // lane holding the most KV, and, while that lane's copies bring an extent's
-// pages back as they land, no other: the next lane keeps its KV in memory. A
-// lane whose Full pages past those a Spill lane keeps would not outweigh the
-// hot block cache its reads add is passed over, and the store gives a chunk
-// back instead.
+// pages back as they land, no other: the next lane keeps its KV in memory
+// (amend/M.md B5, B7). A lane whose Full pages past those a Spill lane keeps
+// would not outweigh the hot block cache its reads add is not offered, and a
+// unit of the expert store goes instead (B8: a conversion frees its bytes
+// net of the reads it adds). Here the store holds a unit above its floor
+// only where no lane may convert.
 void testAFloorConvertsTheLargestLaneThatGivesMemoryBack() {
   for (const uint64_t laneReadBytes : {0UL, 10'000UL}) {
-    Spilling spill(1024, true, 100'000, 0, Spilling::Extent{16}, laneReadBytes);
-    spill.model.expertChunks = {1000};
+    Spilling spill(Spilling::Governed{}, 1024, true, Spilling::Extent{16});
+    spill.model.spilledReadFloorBytes = laneReadBytes;
+    test::FakeElasticPool experts("experts", spill.host.memory, 16 * 100, laneReadBytes ? 0 : 1, 1, 1, 1, 1.0, 0.0);
+    static_cast<void>(spill.host.governor.ledger().addPool(experts));
     // Two neighbours start Resident, as requests do while the SSD cache takes
     // no writes: 24 and 48 pages.
     spill.tier.writableFile = false;
@@ -1426,15 +1429,16 @@ void testAFloorConvertsTheLargestLaneThatGivesMemoryBack() {
     spill.runUntil([&] { return spill.events.outputs.contains(4) && spill.events.outputs.contains(5); },
                    "the neighbours did not decode");
     spill.tier.writableFile = true;
-    // The Spill lane's floor fits once two extents have left memory since it
-    // first asked for it, or a chunk of the store went.
-    std::optional<uint64_t> limit;
+    // The Spill lane's floor, an extent's bytes, finds no room when it first
+    // asks for it: it fits once an extent has left memory, or a unit of the
+    // store went.
+    bool limited = false;
     spill.model.spilledReadsRoom = [&](uint64_t id) {
       if (id != 3)
         return true;
-      if (!limit)
-        limit = spill.storage.allocatedBytes() - 2 * 16 * 100;
-      return spill.storage.allocatedBytes() <= *limit || !spill.model.releasedExpertChunks.empty();
+      if (!std::exchange(limited, true))
+        spill.limit(spill.held());
+      return static_cast<bool>(spill.host.reserve(16 * 100));
     };
     spill.engine.submit(Spilling::prompt(3, 3, 20, 8));
     spill.runUntil([&] { return spill.events.outputs.contains(3); }, "the Spill lane did not decode");
@@ -1443,12 +1447,11 @@ void testAFloorConvertsTheLargestLaneThatGivesMemoryBack() {
       modes[active.id] = active.kvMode;
     if (!laneReadBytes)
       require(modes.at(5) == KvMode::Spill && modes.at(4) == KvMode::Resident &&
-                  spill.engine.snapshot().spill.converted == 1 && spill.model.releasedExpertChunks.empty(),
-              "the floor did not convert the largest lane alone before the store");
+                  spill.engine.snapshot().spill.converted == 1 && experts.shrinks == 0,
+              "the floor did not convert the largest lane alone");
     else
       require(modes.at(5) == KvMode::Resident && modes.at(4) == KvMode::Resident &&
-                  spill.engine.snapshot().spill.converted == 0 &&
-                  spill.model.releasedExpertChunks.size() == 1,
+                  spill.engine.snapshot().spill.converted == 0 && experts.shrinks == 1,
               "a lane whose reads would cost more than spilling frees converted");
     spill.model.decodeFinishes = true;
     spill.runUntilIdle();
@@ -1461,26 +1464,25 @@ void testAFloorConvertsTheLargestLaneThatGivesMemoryBack() {
 // writes at a time where an extent holds more pages than the tier writes at
 // once, as the production pool's do: while they bring an extent's pages
 // back, a Spill lane refused its floor again waits for them, and no other
-// lane converts.
+// lane converts (amend/M.md B5).
 void testOwedCopiesHoldBackTheNextConversion() {
-  Spilling spill(1024, true, 100'000, 0, Spilling::Extent{32});
+  Spilling spill(Spilling::Governed{}, 1024, true, Spilling::Extent{32});
   spill.tier.writeLimits[static_cast<size_t>(WriteClass::Spill)] = 4;
-  spill.model.expertChunks = {1000};
   spill.tier.writableFile = false;
   spill.engine.submit(Spilling::prompt(4, 4, 24, 10000));
   spill.engine.submit(Spilling::prompt(5, 5, 48, 10000));
   spill.runUntil([&] { return spill.events.outputs.contains(4) && spill.events.outputs.contains(5); },
                  "the neighbours did not decode");
   spill.tier.writableFile = true;
-  // The Spill lane's floor fits once an extent has left memory since it
-  // first asked for it, or a chunk of the store went.
-  std::optional<uint64_t> limit;
+  // The Spill lane's floor, half an extent's bytes, finds no room when it
+  // first asks for it: it fits once an extent has left memory.
+  bool limited = false;
   spill.model.spilledReadsRoom = [&](uint64_t id) {
     if (id != 3)
       return true;
-    if (!limit)
-      limit = spill.storage.allocatedBytes() - 32 * 100;
-    return spill.storage.allocatedBytes() <= *limit || !spill.model.releasedExpertChunks.empty();
+    if (!std::exchange(limited, true))
+      spill.limit(spill.held());
+    return static_cast<bool>(spill.host.reserve(16 * 100));
   };
   spill.engine.submit(Spilling::prompt(3, 3, 20, 8));
   spill.runUntil([&] { return spill.events.outputs.contains(3); }, "the Spill lane did not decode");
@@ -1488,23 +1490,21 @@ void testOwedCopiesHoldBackTheNextConversion() {
   for (const ActiveRequestSnapshot &active : spill.engine.snapshot().activeRequests)
     modes[active.id] = active.kvMode;
   require(modes.at(5) == KvMode::Spill && modes.at(4) == KvMode::Resident &&
-              spill.engine.snapshot().spill.converted == 1 && spill.model.releasedExpertChunks.empty(),
-          "a lane converted, or the store went, while a converted lane's copies brought an extent back");
+              spill.engine.snapshot().spill.converted == 1,
+          "a lane converted while a converted lane's copies brought an extent back");
   spill.model.decodeFinishes = true;
   spill.runUntilIdle();
   require(spill.events.failedCount == 0, "a request failed");
 }
 
-// A start refused at the engine's limit converts the Resident lane holding
-// the most KV and waits for what its pages give back as their copies land.
-// They land while a command runs and leave memory before the start tries
-// again, which then fits: no other lane converts, and the store keeps its
-// chunk.
-void testARefusedStartTakesWhatItsConversionFreed() {
-  Spilling spill(1024, true, 100'000, 0, Spilling::Extent{16});
-  // The tier writes every copy the conversion owes at once.
-  spill.tier.writeLimits[static_cast<size_t>(WriteClass::Spill)] = 64;
-  spill.model.expertChunks = {1000};
+// A start refused at the engine's limit beside resident lanes takes only the
+// cache nothing in use holds (amend/M.md B2): it converts no lane in service
+// and takes no unit of the expert store, which serves them, and waits for
+// their memory. It starts once they have ended.
+void testARefusedStartTakesNothingTheLanesInServiceHold() {
+  Spilling spill(Spilling::Governed{}, 1024, true, Spilling::Extent{16});
+  test::FakeElasticPool experts("experts", spill.host.memory, 16 * 100, 0, 1, 1, 1, 1.0, 0.0);
+  static_cast<void>(spill.host.governor.ledger().addPool(experts));
   // Two neighbours start Resident, as requests do while the SSD cache takes
   // no writes: 16 and 40 pages.
   spill.tier.writableFile = false;
@@ -1513,27 +1513,21 @@ void testARefusedStartTakesWhatItsConversionFreed() {
   spill.runUntil([&] { return spill.events.outputs.contains(4) && spill.events.outputs.contains(5); },
                  "the neighbours did not decode");
   spill.tier.writableFile = true;
-  // The start's state fits once an extent has left memory since it was
-  // first refused, or a chunk of the store went.
-  std::optional<uint64_t> limit;
-  spill.model.beginGrowthBlocked = [&] {
-    if (spill.model.lastBeginId != 3)
-      return false;
-    if (!limit)
-      limit = spill.storage.allocatedBytes() - 16 * 100;
-    return spill.storage.allocatedBytes() > *limit && spill.model.releasedExpertChunks.empty();
-  };
+  // The start's state, an extent's bytes, finds no room.
+  spill.limit(spill.held());
+  spill.host.admitBegins(spill.model, 16 * 100);
   spill.engine.submit(Spilling::prompt(3, 3, 1, 8));
-  spill.runUntil([&] { return spill.events.outputs.contains(3); }, "the start did not decode");
-  std::unordered_map<uint64_t, KvMode> modes;
-  for (const ActiveRequestSnapshot &active : spill.engine.snapshot().activeRequests)
-    modes[active.id] = active.kvMode;
-  require(modes.at(5) == KvMode::Spill && modes.at(4) == KvMode::Resident &&
-              spill.engine.snapshot().spill.converted == 1 && spill.model.releasedExpertChunks.empty(),
-          "a refused start climbed on before the pages its conversion freed left memory");
+  for (uint32_t step = 0; step < 50; ++step) {
+    static_cast<void>(spill.engine.tick(spill.now++));
+    spill.tier.complete();
+  }
+  require(!spill.events.outputs.contains(3) && spill.engine.snapshot().spill.converted == 0 &&
+              experts.shrinks == 0 && spill.events.failedCount == 0,
+          "a start refused beside lanes in service took what they hold, or failed");
   spill.model.decodeFinishes = true;
   spill.runUntilIdle();
-  require(spill.events.failedCount == 0, "a request failed");
+  require(spill.events.failedCount == 0 && spill.events.completedCount == 3 && spill.events.outputs.contains(3),
+          "the start did not run once the lanes had ended");
 }
 
 // A lane whose admission is not complete, its state's restore from the SSD
@@ -1588,7 +1582,7 @@ void testALoneSpillLaneWaitsForItsOwnCopies() {
         Case{1, false, false, "a lone Spill lane failed while its dense history's copy was written"},
         Case{4, false, true, "a lone Spill lane failed at a wall the Index runway could not refill at"}}) {
     // Extents of 16 pages. Every state goes straight to the SSD.
-    Spilling spill(1024, true, 100'000, 0, Spilling::Extent{16});
+    Spilling spill(Spilling::Governed{}, 1024, true, Spilling::Extent{16});
     spill.model.deniedReservations = std::numeric_limits<uint32_t>::max();
     spill.model.stateTier = std::make_shared<OffloadControl>();
     spill.model.stateTier->ready = true;
@@ -1608,27 +1602,26 @@ void testALoneSpillLaneWaitsForItsOwnCopies() {
       }
       require(done(), message);
     };
-    // Its floor fits once two extents have left memory since it first asked
-    // for it.
-    std::optional<uint64_t> limit;
-    spill.model.spilledReadsRoom = [&](uint64_t) {
-      if (!limit)
-        limit = spill.storage.allocatedBytes() - 2 * 16 * 100;
-      return spill.storage.allocatedBytes() <= *limit;
+    // Its floor, two extents' bytes, finds no room when it first asks for
+    // it: it fits once two extents have left memory.
+    bool asked = false;
+    spill.model.spilledReadsRoom = [&](uint64_t id) {
+      if (spill.model.spilledReadFloors.contains(id))
+        return true;
+      if (!std::exchange(asked, true))
+        spill.limit(spill.held());
+      return static_cast<bool>(spill.host.reserve(2 * 16 * 100));
     };
     spill.engine.submit(Spilling::prompt(1, 1, 60, 64));
     run([&] { return spill.events.outputs.contains(1); }, "the lane did not decode");
-    require(!limit && !spill.cache.holdsIndexPages(1), "a page spilled before its copy landed");
+    require(!asked && !spill.cache.holdsIndexPages(1), "a page spilled before its copy landed");
     // At the wall, the memory left beside its Full extents and the Index
     // runway holds less than another Index extent.
     if (each.wall)
-      spill.storage.budgetPages =
-          static_cast<uint32_t>((spill.storage.allocatedBytes() + 16 * 10 / 2) / 100);
+      spill.limit(spill.held() + 16 * 10 / 2);
     land = true;
     run([&] { return idle(spill.engine); }, "the lane did not end");
-    require(limit.has_value() && spill.events.failedCount == 0 &&
-                spill.events.usage.at(1).second == 64,
-            each.message);
+    require(asked && spill.events.failedCount == 0 && spill.events.usage.at(1).second == 64, each.message);
   }
 }
 
@@ -1637,8 +1630,13 @@ void testALoneSpillLaneWaitsForItsOwnCopies() {
 // first command. Alone, refused its prefill history's staging there, it
 // starts writing that chain and waits for those copies rather than fail.
 void testALaneRefusedBeforeItsFirstCommandWritesItsChain() {
-  // Extents of 16 pages. Every state goes straight to the SSD.
-  Spilling spill(1024, true, 100'000, 0, Spilling::Extent{16});
+  // Extents of 16 pages. Every state goes straight to the SSD. The model's
+  // staging of a prompt's history takes memory the governor admits: that of
+  // 60 pages is more than an extent's.
+  Spilling spill(Spilling::Governed{}, 1024, true, Spilling::Extent{16});
+  spill.model.memory = &spill.host.memory;
+  spill.model.admission = spill.host.governor.allocationAdmission();
+  spill.model.stagingPageBytes = 30;
   spill.model.deniedReservations = std::numeric_limits<uint32_t>::max();
   spill.model.stateTier = std::make_shared<OffloadControl>();
   spill.model.stateTier->ready = true;
@@ -1654,15 +1652,13 @@ void testALaneRefusedBeforeItsFirstCommandWritesItsChain() {
   }
   require(spill.cache.spillSnapshot().writeThroughInFlight == 0,
           "the first turn's writes were still in flight");
-  // The next turn's staging fits once an extent has left memory.
-  const uint64_t limit = spill.storage.allocatedBytes() - 16 * 100;
-  spill.model.refusedStaging = {2};
+  // The next turn's staging finds no room: it fits once an extent has left
+  // memory.
+  spill.limit(spill.held());
   spill.engine.submit(Spilling::prompt(2, 1, 60, 64));
   for (uint32_t step = 0; step < 4000 && !idle(spill.engine); ++step) {
     static_cast<void>(spill.engine.tick(spill.now++));
     spill.tier.complete();
-    if (spill.storage.allocatedBytes() <= limit)
-      spill.model.refusedStaging.clear();
   }
   require(idle(spill.engine), "the requests did not end");
   require(spill.events.failedCount == 0 && spill.events.usage.at(2).second == 64,
@@ -1785,24 +1781,27 @@ void testLoneSpillLaneEndsAtTheWall() {
   }
 }
 
-// The hot block cache grows toward its planned size between commands, an
-// allocation that may be refused: refused, it takes no cache the model can
-// rebuild, among which that cache's own slots past its floor are, nor a
-// chunk of the expert store, and nothing while the host refuses growth. The
-// lane decodes all the same.
-void testHotCacheGrowthTakesNoModelCache() {
-  for (const auto failure :
-       {metal::AllocationFailure::EngineBudget, metal::AllocationFailure::HostPressure}) {
-    Spilling spill(64);
-    spill.model.cacheUnits = {100};
-    spill.model.expertChunks = {1000};
-    spill.model.refusedGrowth = failure;
+// The hot block cache grows toward its planned size as its pool's growth
+// in the governor's control pass, which takes free room and displaces other
+// memory only where its unit is worth more than what it displaces (amend/M.md
+// B4; memory_ledger_test): a decoding lane's reads take its floor alone, the
+// engine asks the model for no growth of that cache, and no unit of the
+// expert store goes, at the engine's limit and while the host refuses
+// growth. The lane decodes all the same.
+void testHotCacheGrowthIsNotTheEngines() {
+  for (const bool paused : {false, true}) {
+    Spilling spill(Spilling::Governed{}, 64);
+    test::FakeElasticPool experts("experts", spill.host.memory, 800, 0, 1, 1, 1, 1.0, 0.0);
+    static_cast<void>(spill.host.governor.ledger().addPool(experts));
+    spill.host.pause(paused);
     spill.engine.submit(Spilling::prompt(1, 1, 5, 20));
+    spill.runUntil([&] { return spill.cache.spillSnapshot().spilledPages != 0; }, "the lane's pages did not spill");
+    // From here the limit leaves no room for growth.
+    spill.limit(spill.held());
     spill.runUntilIdle();
-    require(spill.model.growthAttempts > 0 && spill.model.cacheReclaims == 0 &&
-                spill.model.cacheUnits.size() == 1 && spill.model.expertChunks.size() == 1 &&
-                spill.events.completedCount == 1 && spill.events.failedCount == 0,
-            "the hot block cache's growth took a cache the model can rebuild or the expert store");
+    require(spill.model.growthAttempts == 0 && experts.shrinks == 0 && spill.events.completedCount == 1 &&
+                spill.events.failedCount == 0 && spill.events.usage.at(1).second == 20,
+            "the engine grew the hot block cache, or took the expert store for it");
   }
 }
 
@@ -2010,8 +2009,8 @@ std::span<const test::TestCase> spillTests() {
       {"testSpillCommitmentCoversTheChainWithoutCopies", testSpillCommitmentCoversTheChainWithoutCopies},
       {"testConversionCommitsTheHistoryWithoutCopies", testConversionCommitsTheHistoryWithoutCopies},
       {"testConversionSpillsAHistoryWithCopies", testConversionSpillsAHistoryWithCopies},
-      {"testResidentLaneConvertsBeforeTheExpertStore", testResidentLaneConvertsBeforeTheExpertStore},
-      {"testAStartThatConvertsCountsNoConversion", testAStartThatConvertsCountsNoConversion},
+      {"testResidentLaneConvertsOrTakesTheExpertStore", testResidentLaneConvertsOrTakesTheExpertStore},
+      {"testAStartRefusedMemoryCountsNoConversion", testAStartRefusedMemoryCountsNoConversion},
       {"testShortQuotaBoundsWaitsOrRefusesASpillStart", testShortQuotaBoundsWaitsOrRefusesASpillStart},
       {"testAStartThatCannotSpillStartsResidentWithinTheResidentContext",
        testAStartThatCannotSpillStartsResidentWithinTheResidentContext},
@@ -2024,7 +2023,7 @@ std::span<const test::TestCase> spillTests() {
       {"testSpillResumeBoundLeavesOutputPastItsAnchor", testSpillResumeBoundLeavesOutputPastItsAnchor},
       {"testSpillResumeInItsPromptHoldsNoAnchor", testSpillResumeInItsPromptHoldsNoAnchor},
       {"testSpillResumeTakesItsReplaysPagesAsItRuns", testSpillResumeTakesItsReplaysPagesAsItRuns},
-      {"testAResumeThatConvertsTakesItsReplaysPagesAsItRuns", testAResumeThatConvertsTakesItsReplaysPagesAsItRuns},
+      {"testAResumeTakesBackTheMemoryItsKvHeld", testAResumeTakesBackTheMemoryItsKvHeld},
       {"testDecodeLeavesOutALaneRefusedItsHotFloor", testDecodeLeavesOutALaneRefusedItsHotFloor},
       {"testARefusedDecodeTakesThePrefillLanesMemory", testARefusedDecodeTakesThePrefillLanesMemory},
       {"testRefusedModelMemoryTakesWhatGivesMemoryBack", testRefusedModelMemoryTakesWhatGivesMemoryBack},
@@ -2035,18 +2034,18 @@ std::span<const test::TestCase> spillTests() {
       {"testAWaitingStartHoldsNoLane", testAWaitingStartHoldsNoLane},
       {"testAHeldLaneEndsItsCommandAtItsCapacity", testAHeldLaneEndsItsCommandAtItsCapacity},
       {"testAJoinerHeldBackLeavesACommandItsPasses", testAJoinerHeldBackLeavesACommandItsPasses},
-      {"testAFloorConvertsAResidentNeighbourBeforeTheExpertStore",
-       testAFloorConvertsAResidentNeighbourBeforeTheExpertStore},
+      {"testAFloorConvertsAResidentNeighbourOrTakesTheExpertStore",
+       testAFloorConvertsAResidentNeighbourOrTakesTheExpertStore},
       {"testAFloorConvertsTheLargestLaneThatGivesMemoryBack", testAFloorConvertsTheLargestLaneThatGivesMemoryBack},
       {"testOwedCopiesHoldBackTheNextConversion", testOwedCopiesHoldBackTheNextConversion},
-      {"testARefusedStartTakesWhatItsConversionFreed", testARefusedStartTakesWhatItsConversionFreed},
+      {"testARefusedStartTakesNothingTheLanesInServiceHold", testARefusedStartTakesNothingTheLanesInServiceHold},
       {"testALaneBeingAdmittedDoesNotConvert", testALaneBeingAdmittedDoesNotConvert},
       {"testALoneSpillLaneWaitsForItsOwnCopies", testALoneSpillLaneWaitsForItsOwnCopies},
       {"testALaneRefusedBeforeItsFirstCommandWritesItsChain", testALaneRefusedBeforeItsFirstCommandWritesItsChain},
       {"testAPageWaitingForItsCopyHoldsBackNoneAfterIt", testAPageWaitingForItsCopyHoldsBackNoneAfterIt},
       {"testAConversionLeavesNoLaneWithoutItsFloor", testAConversionLeavesNoLaneWithoutItsFloor},
       {"testLoneSpillLaneEndsAtTheWall", testLoneSpillLaneEndsAtTheWall},
-      {"testHotCacheGrowthTakesNoModelCache", testHotCacheGrowthTakesNoModelCache},
+      {"testHotCacheGrowthIsNotTheEngines", testHotCacheGrowthIsNotTheEngines},
       {"testHostRefusedHotFloorTakesNoModelCache", testHostRefusedHotFloorTakesNoModelCache},
       {"testUnreadableKvEndsOnlyItsLane", testUnreadableKvEndsOnlyItsLane},
       {"testProjectionClipsTheOutput", testProjectionClipsTheOutput},
