@@ -15,6 +15,7 @@
 #include <cmath>
 #include <cstdint>
 #include <functional>
+#include <initializer_list>
 #include <limits>
 #include <optional>
 #include <span>
@@ -44,6 +45,28 @@ model::CommandLimits limits(uint32_t commandRows = kChunk, uint32_t passes = 1, 
 
 RequestSpec request(uint64_t id, uint32_t prompt, RequestPriority priority = RequestPriority::Normal) {
   return {id, priority, prompt};
+}
+
+// The turnarounds u the bound and pass tests run at until I-model measures
+// it (TimingProfile.cpp: the profiles' 60 ms is the middle one).
+constexpr std::array<double, 3> kTurnarounds{5.0, 60.0, 150.0};
+
+test::TimingProfile withTurnaround(const test::TimingProfile &profile, double turnaround) {
+  test::TimingProfile result = profile;
+  result.turnaroundMilliseconds = turnaround;
+  return result;
+}
+
+std::vector<test::TimingProfile> atEveryTurnaround(std::initializer_list<const test::TimingProfile *> profiles) {
+  std::vector<test::TimingProfile> result;
+  for (const test::TimingProfile *profile : profiles)
+    for (const double turnaround : kTurnarounds)
+      result.push_back(withTurnaround(*profile, turnaround));
+  return result;
+}
+
+std::string at(const test::TimingProfile &profile) {
+  return std::string(profile.name) + " at u " + std::to_string(int(profile.turnaroundMilliseconds)) + " ms";
 }
 
 // A target, its scheduler and what the engine gives the scheduler: the
@@ -187,15 +210,44 @@ void completeDecode(Sim &sim, bool finished = false) {
   sim.scheduler.complete(plan, results, {.wallMilliseconds = 50.0});
 }
 
+// Commits a prefill unit and completes it in `sample`'s time, its lanes
+// consuming their rows at its last pass.
+void completePrefill(Sim &sim, const BatchPlan &plan, const model::CommandSample &sample = {}) {
+  require(plan.kind == WorkKind::Prefill, "expected a prefill command");
+  sim.scheduler.commit(plan, sim.in());
+  std::vector<StepResult> results;
+  for (const BatchItem &item : plan.items)
+    results.push_back(
+        {item.requestId, plan.pass + 1 == plan.passes ? item.tokenCount : 0, false, DecodeStage::Regular});
+  sim.scheduler.complete(plan, results, sample);
+}
+
+// Lane 1 decodes beside lane 2's long prompt: a decode command, then a
+// prefill unit of 500 ms, which owes decode its share of that.
+void runContendedPrefill(Sim &sim) {
+  sim.decoder(1);
+  sim.lane(2, 0, 20'000);
+  completeDecode(sim);
+  const BatchPlan prefill = sim.plan();
+  require(prefill.kind == WorkKind::Prefill && prefill.items[0].requestId == 2,
+          "the long prompt did not follow the first decode command");
+  completePrefill(sim, prefill, {.wallMilliseconds = 500.0});
+}
+
 // Prefills a constrained request's prompt, whose end waits for the mask of
 // its first token.
 void awaitFirstMask(Sim &sim, uint64_t id) {
-  const BatchPlan prompt = sim.plan();
+  BatchPlan prompt = sim.plan();
   require(prompt.kind == WorkKind::Prefill && prompt.width() == 1 && prompt.items[0].requestId == id,
           "expected the constrained prompt");
+  while (prompt.pass + 1 < prompt.passes) {
+    sim.run(prompt);
+    prompt = sim.plan();
+  }
   sim.scheduler.commit(prompt, sim.in());
   const std::array result{StepResult{id, prompt.items[0].tokenCount, false, DecodeStage::ApplyInitialMask}};
   sim.scheduler.complete(prompt, result, {});
+  sim.passes.reset();
   require(sim.scheduler.phase(id) == Phase::WaitingMask, "a constrained prompt did not wait for its first mask");
 }
 
@@ -405,6 +457,271 @@ void testAdmissionStartsTheLanesOfTheNextCommand() {
           "admission did not start the candidate the next command leads with");
 }
 
+// Admission starts at most a full batch: of eight agent turns that share a
+// command, the first four.
+void testAdmissionStartsAtMostAFullBatch() {
+  Sim sim(test::kM6FlashNextQ2, limits(8192, 48));
+  sim.seed();
+  std::vector<PrefillAdmission> turns;
+  for (uint64_t id = 1; id <= 8; ++id) {
+    sim.scheduler.submit(request(id, 8192 + 300));
+    turns.push_back({id, 8192});
+  }
+  require(sim.scheduler.prefillAdmissionOrder(turns, sim.in()) == std::vector<uint64_t>({1, 2, 3, 4}),
+          "admission of short prompts lost their sharing or exceeded the real width");
+}
+
+// Admission ranks candidates against every decoder: a higher priority's
+// decode holds a lower priority's prompts back until it leaves.
+void testAdmissionWaitsForAHigherPrioritysDecode() {
+  DenseSim sim;
+  std::vector<PrefillAdmission> candidates;
+  for (uint64_t id = 1; id <= 2; ++id) {
+    sim.scheduler.submit(request(id, 65));
+    candidates.push_back({id, 0});
+  }
+  require(!sim.scheduler.prefillAdmissionOrder(candidates, sim.in()).empty(), "admission started nothing");
+  sim.decoder(5, RequestPriority::Foreground);
+  require(sim.scheduler.prefillAdmissionOrder(candidates, sim.in()).empty(),
+          "a lower priority's prefill started ahead of a runnable Foreground decode");
+  sim.scheduler.cancel(5);
+  require(!sim.scheduler.prefillAdmissionOrder(candidates, sim.in()).empty(),
+          "prefill admission did not resume after the Foreground decode left");
+}
+
+void testUnconstrainedLanesShareDecode() {
+  DenseSim sim;
+  for (uint64_t id = 1; id <= 4; ++id)
+    sim.decoder(id);
+  require(sim.plan().width() == 4, "unconstrained requests did not share one decode command");
+}
+
+// Two constrained prompts wait for their first masks; their first tokens'
+// selections share a plan of their stage, and once selected they decode with
+// the other lanes.
+void testMaskedLanesShareDecode() {
+  for (const bool selected : {false, true}) {
+    DenseSim sim;
+    sim.lane(1, 0, 1);
+    sim.lane(2, 0, 1);
+    const BatchPlan prompts = sim.plan();
+    sim.scheduler.commit(prompts, sim.in());
+    const std::array promptResults{StepResult{1, 1, false, DecodeStage::ApplyInitialMask},
+                                   StepResult{2, 1, false, DecodeStage::ApplyInitialMask}};
+    sim.scheduler.complete(prompts, promptResults, {});
+    sim.scheduler.maskReady(1);
+    sim.scheduler.maskReady(2);
+    if (!selected) {
+      const BatchPlan selection = sim.plan();
+      require(selection.kind == WorkKind::Decode && selection.width() == 2 &&
+                  selection.decodeStage == DecodeStage::ApplyInitialMask,
+              "first-token selections of one priority did not share a plan");
+      continue;
+    }
+    completeDecode(sim);
+    sim.decoder(3);
+    sim.decoder(4);
+    const BatchPlan plan = sim.plan();
+    require(plan.kind == WorkKind::Decode && plan.width() == 4 && plan.decodeStage == DecodeStage::Regular,
+            "lanes that waited for their first masks decoded apart from the others");
+  }
+}
+
+// A prefill beside a lane waiting for its mask owes decode nothing: the lane
+// could not have decoded meanwhile.
+void testMaskWaitAccruesNoDecodeDebt() {
+  DenseSim sim(0.5);
+  sim.lane(1, 0, 1);
+  awaitFirstMask(sim, 1);
+  sim.lane(2, 0, 20'000);
+  for (uint32_t command = 0; command < 3; ++command)
+    completePrefill(sim, sim.plan(), {.wallMilliseconds = 500.0});
+  sim.scheduler.maskReady(1);
+  completeDecode(sim);
+  require(sim.plan().kind == WorkKind::Prefill, "prefill beside a lane waiting for its mask banked decode debt");
+}
+
+// Debt is owed only to lanes that decode: once the last leaves, by its
+// decode command's end or a cancel, a later decoder starts without it.
+void testDecodeDebtLeavesWithTheLastDecoder() {
+  for (const bool finished : {true, false}) {
+    DenseSim sim(0.5);
+    runContendedPrefill(sim);
+    completeDecode(sim, finished);
+    if (!finished)
+      sim.scheduler.cancel(1);
+    sim.decoder(3);
+    require(sim.plan().kind == WorkKind::Prefill, "a later decoder inherited debt owed to one that left");
+  }
+}
+
+void testHigherPriorityPrefillPrecedesDecodeDebt() {
+  DenseSim sim(0.5);
+  runContendedPrefill(sim);
+  sim.lane(3, 0, 20'000, RequestPriority::Foreground);
+  const BatchPlan plan = sim.plan();
+  require(plan.kind == WorkKind::Prefill && plan.items[0].requestId == 3,
+          "decode debt overrode a higher-priority prefill");
+}
+
+void testDecodeCommandContainsOnePriorityTier() {
+  DenseSim sim;
+  sim.decoder(1, RequestPriority::Foreground);
+  sim.decoder(2, RequestPriority::Background);
+  const BatchPlan plan = sim.plan();
+  require(plan.kind == WorkKind::Decode && plan.width() == 1 && plan.items[0].requestId == 1,
+          "a decode command mixed priority tiers");
+  completeDecode(sim, true);
+  const BatchPlan background = sim.plan();
+  require(background.kind == WorkKind::Decode && background.width() == 1 && background.items[0].requestId == 2,
+          "background decode did not run after foreground completion");
+}
+
+// A request suspended while it holds its first mask replays its history and
+// selects its first token under that mask, without asking for another.
+void testReplayKeepsHeldInitialMask() {
+  DenseSim sim;
+  sim.lane(2, 0, 1);
+  awaitFirstMask(sim, 2);
+  sim.scheduler.maskReady(2);
+  sim.scheduler.suspendForResources(2);
+  sim.scheduler.resumeFromResources(2, 32, 40);
+  const BatchPlan replay = sim.plan();
+  require(replay.kind == WorkKind::Prefill && replay.items[0].promptOffset == 32 && replay.items[0].tokenCount == 8,
+          "decode resume did not replay its committed token history");
+  completePrefill(sim, replay);
+  require(sim.scheduler.phase(2) == Phase::Decode, "the replay waited for a second first mask");
+  const BatchPlan continuation = sim.plan();
+  require(continuation.kind == WorkKind::Decode && continuation.decodeStage == DecodeStage::ApplyInitialMask,
+          "the replay dropped the held first mask's selection");
+}
+
+// A lane waiting for its mask, of the prefill's priority or a higher one,
+// bounds the prefill beside it as a decoder does; a lower one does not. A
+// mask that arrives during the unit gets the next command; cancelled, the
+// lane leaves the prefill unbounded.
+void testWaitingMaskBoundsPeerPrefill() {
+  for (const RequestPriority priority :
+       {RequestPriority::Foreground, RequestPriority::Normal, RequestPriority::Background}) {
+    DenseSim sim;
+    sim.lane(1, 0, 1, priority);
+    awaitFirstMask(sim, 1);
+    sim.lane(2, 0, 20'000);
+    const BatchPlan prefill = sim.plan();
+    const bool bounded = priority <= RequestPriority::Normal;
+    require(prefill.kind == WorkKind::Prefill && prefill.items[0].requestId == 2 &&
+                (prefill.items[0].tokenCount < kChunk) == bounded,
+            "a mask wait lost prefill latency protection or priority ordering");
+    sim.scheduler.maskReady(1);
+    completePrefill(sim, prefill);
+    if (bounded) {
+      const BatchPlan decode = sim.plan();
+      require(decode.kind == WorkKind::Decode && decode.items[0].requestId == 1,
+              "a ready mask did not resume after a bounded prefill");
+    }
+    sim.scheduler.cancel(1);
+    require(sim.plan().items[0].tokenCount == kChunk, "a cancelled mask request kept the prefill bounded");
+  }
+}
+
+// --- Contention --------------------------------------------------------------------------------------------
+
+// Uncontended work runs whole; beside a decoder of its priority it is
+// bounded, and once the decoder ends it runs whole again.
+void testOnlyContendedUnitsAreBounded() {
+  DenseSim sim;
+  sim.lane(1, 0, 20'000);
+  require(sim.plan().items[0].tokenCount == kChunk, "uncontended work lost its rows");
+  sim.step();
+  sim.decoder(2);
+  completeDecode(sim);
+  const BatchPlan contended = sim.plan();
+  require(contended.kind == WorkKind::Prefill && contended.items[0].tokenCount < kChunk &&
+              sim.price(contended.items) <= sim.bound() * (1 + 1e-9),
+          "a contended unit was not bounded");
+  sim.run(contended);
+  completeDecode(sim, true);
+  require(sim.plan().items[0].tokenCount == kChunk, "prefill did not run whole again once its peer ended");
+}
+
+// A lower priority's decode does not bound a prefill; one of its priority
+// does.
+void testALowerPrioritysDecodeDoesNotBoundAPrefill() {
+  DenseSim sim;
+  sim.lane(1, 0, 20'000, RequestPriority::Foreground);
+  sim.decoder(2, RequestPriority::Background);
+  require(sim.plan().items[0].tokenCount == kChunk, "lower-priority work bounded a Foreground prefill");
+  sim.decoder(3, RequestPriority::Foreground);
+  completeDecode(sim);
+  require(sim.plan().items[0].tokenCount < kChunk, "a Foreground decoder left its priority's prefill unbounded");
+}
+
+// Neither lanes waiting for admission or memory nor lanes that only prefill
+// bound a prefill: nothing of theirs waits for its units.
+void testWaitingOrPrefillingPeersDoNotBoundAPrefill() {
+  DenseSim sim;
+  sim.lane(1, 0, 20'000);
+  sim.scheduler.submit(request(2, 20'000));
+  sim.scheduler.waitForResources(2);
+  sim.scheduler.submit(request(3, 20'000));
+  require(sim.plan().items[0].tokenCount == kChunk, "queued or resource-blocked work bounded a resident prefill");
+  for (uint64_t id = 4; id <= 6; ++id)
+    sim.lane(id, 0, 20'000);
+  const BatchPlan plan = sim.plan();
+  require(plan.width() == 1 && plan.items[0].requestId == 1 && plan.items[0].tokenCount == kChunk &&
+              plan.passes == 1,
+          "lanes that only prefill bounded their leader");
+}
+
+// A unit whose time is missing, not positive or not finite trains nothing;
+// one whose completion added work (an auxiliary encoder's rerun) neither.
+void testUntimedOrAuxiliaryUnitsTrainNothing() {
+  for (const double wall : {0.0, -1.0, std::numeric_limits<double>::quiet_NaN(),
+                            std::numeric_limits<double>::infinity(), 1e9}) {
+    for (const bool representative : {true, false}) {
+      if (std::isfinite(wall) && wall > 0.0 && representative)
+        continue;
+      DenseSim sim;
+      sim.lane(1, 0, 20'000);
+      const std::array probe{BatchItem{1, kChunk, 0}};
+      const double before = sim.price(probe);
+      const BatchPlan plan = sim.plan();
+      completePrefill(sim, plan,
+                      {.work = sim.work.prefillWork(sim.lanes(plan.items), 0, 1),
+                       .wallMilliseconds = wall,
+                       .representative = representative});
+      require(sim.scheduler.snapshot().prefillEstimate.samples == 0 && sim.price(probe) == before,
+              "a unit of " + std::to_string(wall) + " ms" + (representative ? "" : " that added work") +
+                  " trained the price");
+    }
+  }
+}
+
+// One lane of a command may run past a chunk (model::CommandLimits::
+// lanesPastChunk), and a command holds at most the model's command rows,
+// whatever its lanes' depths and lengths.
+void testACommandHoldsOneLanePastAChunk() {
+  for (const uint32_t depth : {0u, 70'000u, 150'000u, 300'000u})
+    for (const uint32_t remaining : {300u, 3000u, 9000u, 20'000u})
+      for (const uint32_t peer : {0u, 100'000u})
+        for (const uint32_t shortest : {1000u, remaining + 1000}) {
+          Sim sim(test::kM6FlashNextQ2, limits(8192, 48));
+          sim.seed();
+          sim.lane(1, depth, remaining);
+          sim.lane(2, peer, shortest);
+          sim.lane(3, peer, remaining + 2000);
+          sim.lane(4, 0, remaining + 3000);
+          const BatchPlan plan = sim.plan();
+          uint32_t past = 0, rows = 0;
+          for (const BatchItem &item : plan.items) {
+            past += rows / kChunk != (rows + item.tokenCount - 1) / kChunk;
+            rows += item.tokenCount;
+          }
+          require(past <= 1 && rows <= 8192, "a command held " + std::to_string(past) +
+                                                 " lanes past a chunk or " + std::to_string(rows) + " rows");
+        }
+}
+
 // --- The price and its seed ---------------------------------------------------------------------------------
 
 // The prefill price is the cost model's for the work the model expects: a
@@ -492,53 +809,82 @@ void testALoneDenseCommandRunsWhole() {
 
 // A lone streamed request is sized as today: a turn in as many passes as
 // keep each within the bound, and a long prompt in groups of the model's
-// command rows; a lone dense prompt runs whole.
+// command rows; a lone dense prompt runs whole. At every turnaround.
 void testALoneRequestIsSizedAsToday() {
-  Sim sim(test::kM6FlashNextQ2, limits(8192, 48));
-  sim.seed();
-  sim.lane(1, 8192, 300);
-  const BatchPlan turn = sim.plan();
-  const double cost = sim.price(turn.items);
-  const auto expected = static_cast<uint32_t>(std::ceil(cost / sim.bound()));
-  require(turn.items[0].tokenCount == 300 && turn.passes + 1 >= expected && turn.passes <= expected + 1,
-          "a lone turn ran in " + std::to_string(turn.passes) + " passes, not about " + std::to_string(expected));
-  sim.scheduler.cancel(1);
-  sim.scheduler.remove(1);
-  sim.lane(2, 0, 20'000);
-  require(sim.plan().items[0].tokenCount == 8192, "a lone long prompt did not take a group");
+  for (const double turnaround : kTurnarounds) {
+    const test::TimingProfile profile = withTurnaround(test::kM6FlashNextQ2, turnaround);
+    Sim sim(profile, limits(8192, 48));
+    sim.seed();
+    sim.lane(1, 8192, 300);
+    const BatchPlan turn = sim.plan();
+    // The fewest passes whose every pass is within the bound: about
+    // ceil(cost / bound), more where the layers do not divide evenly.
+    const auto within = [&](uint32_t passes) {
+      for (uint32_t pass = 0; pass < passes; ++pass)
+        if (sim.price(turn.items, pass, passes) > sim.bound() * (1 + 1e-9))
+          return false;
+      return true;
+    };
+    require(turn.items[0].tokenCount == 300 && turn.passes > 1 && within(turn.passes) && !within(turn.passes - 1),
+            at(profile) + ": a lone turn ran in " + std::to_string(turn.passes) +
+                " passes, not the fewest within the bound");
+    sim.scheduler.cancel(1);
+    sim.scheduler.remove(1);
+    sim.lane(2, 0, 20'000);
+    require(sim.plan().items[0].tokenCount == 8192, at(profile) + ": a lone long prompt did not take a group");
+    const test::TimingProfile dense = withTurnaround(test::kDense27B, turnaround);
+    Sim alone(dense, limits(kChunk, dense.layers));
+    alone.seed();
+    alone.lane(1, 0, 4096);
+    const BatchPlan chunk = alone.plan();
+    require(chunk.items[0].tokenCount == kChunk && chunk.passes == 1,
+            at(dense) + ": a lone dense prompt did not run whole");
+  }
 }
 
-// The passes of a contended turn are those the bound needs: with the
-// turnaround the units measure, max(G, u / 0.1).
+// The passes of a contended turn are those the bound needs, and no more:
+// with the turnaround the units measure, max(G, u / 0.1), which at 150 ms
+// is 1.5 s, so fewer passes than G would need (behaviour change 2).
 void testContendedTurnPassesByTurnaround() {
-  Sim sim(test::kM6FlashNextQ2, limits(8192, 48));
-  sim.seed();
-  sim.decoder(1);
-  // Commands of varied passes teach the fit the turnaround.
-  for (uint32_t turn = 0; turn < 6; ++turn) {
-    sim.lane(10 + turn, 8192, 300 + 1500 * turn);
-    while (sim.scheduler.phase(10 + turn) == Phase::Prefill)
-      sim.step();
-    sim.scheduler.cancel(10 + turn);
-    sim.scheduler.remove(10 + turn);
+  for (const double turnaround : kTurnarounds) {
+    const test::TimingProfile profile = withTurnaround(test::kM6FlashNextQ2, turnaround);
+    Sim sim(profile, limits(8192, 48));
+    sim.seed();
+    sim.decoder(1);
+    // Commands of varied passes teach the fit the turnaround.
+    for (uint32_t turn = 0; turn < 6; ++turn) {
+      sim.lane(10 + turn, 8192, 300 + 1500 * turn);
+      while (sim.scheduler.phase(10 + turn) == Phase::Prefill)
+        sim.step();
+      sim.scheduler.cancel(10 + turn);
+      sim.scheduler.remove(10 + turn);
+    }
+    sim.lane(2, 8192, 300);
+    BatchPlan plan = sim.plan();
+    while (plan.kind != WorkKind::Prefill) {
+      sim.run(plan);
+      plan = sim.plan();
+    }
+    const auto least = static_cast<uint32_t>(std::ceil(sim.price(plan.items) / sim.bound()));
+    require(plan.passes >= least && plan.passes <= least + 1,
+            at(profile) + ": a contended turn ran in " + std::to_string(plan.passes) + " passes, not the " +
+                std::to_string(least) + " its bound needs");
+    for (uint32_t pass = 0; pass < plan.passes; ++pass)
+      require(sim.price(plan.items, pass, plan.passes) <= sim.bound() * (1 + 1e-9),
+              at(profile) + ": a contended turn's pass exceeds the bound");
+    if (turnaround / kPassOverheadShare >= 2.0 * kGap)
+      require(sim.bound() > kGap && plan.passes < static_cast<uint32_t>(std::ceil(sim.price(plan.items) / kGap)),
+              at(profile) + ": the bound did not follow the turnaround the units measured (" +
+                  std::to_string(sim.turnaround()) + " ms)");
   }
-  sim.lane(2, 8192, 300);
-  BatchPlan plan = sim.plan();
-  while (plan.kind != WorkKind::Prefill) {
-    sim.run(plan);
-    plan = sim.plan();
-  }
-  const auto least = static_cast<uint32_t>(std::ceil(sim.price(plan.items) / sim.bound()));
-  require(plan.passes >= least, "a contended turn ran in fewer passes than its bound needs");
-  for (uint32_t pass = 0; pass < plan.passes; ++pass)
-    require(sim.price(plan.items, pass, plan.passes) <= sim.bound() * (1 + 1e-9),
-            "a contended turn's pass exceeds the bound");
 }
 
 // The fewest passes within the bound spend at most a tenth of the command on
 // turnarounds: (P - 1) u <= (price - u) / 9, on every profile.
 void testPassesAddAtMostATenthOfTheCommand() {
-  for (const test::TimingProfile *profile : {&test::kM6FlashNextQ2, &test::kStudio18GFlashNextQ2, &test::kDense27B}) {
+  for (const test::TimingProfile &tuned :
+       atEveryTurnaround({&test::kM6FlashNextQ2, &test::kStudio18GFlashNextQ2, &test::kDense27B})) {
+    const test::TimingProfile *profile = &tuned;
     const uint32_t rows = profile->experts.experts ? 8192 : kChunk;
     Sim sim(*profile, limits(rows, profile->layers));
     sim.seed();
@@ -556,9 +902,15 @@ void testPassesAddAtMostATenthOfTheCommand() {
       sim.run(plan);
       plan = sim.plan();
     }
+    // The fewest passes within u / 0.1: had P - 1 passes fit, P would not
+    // run, so (P - 1) u stays under a ninth of what the command runs past
+    // its turnaround, by the share of the layers the heaviest of P - 1
+    // passes holds over an even one's.
     const double u = sim.turnaround(), whole = sim.price(plan.items);
-    require(plan.passes > 1 && (plan.passes - 1) * u <= (whole - u) / 9.0 + 1e-6,
-            std::string(profile->name) + ": " + std::to_string(plan.passes) + " passes of " + std::to_string(u) +
+    const uint32_t layers = profile->layers, fewer = plan.passes - 1;
+    const double granularity = fewer ? double((layers + fewer - 1) / fewer) * fewer / layers : 1.0;
+    require(plan.passes > 1 && fewer * u <= (whole - u) / 9.0 * granularity + 1e-6,
+            at(*profile) + ": " + std::to_string(plan.passes) + " passes of " + std::to_string(u) +
                 " ms turnaround for a " + std::to_string(whole) + " ms command");
   }
 }
@@ -646,7 +998,9 @@ void testThePairBoundIsPerLayerAndOnlyRowsMeetIt() {
 // S-P2: every contended unit is within max(G, u / 0.1) by its price, and
 // takes about that by the profile's clock once the price has learned.
 void testEveryContendedUnitWithinItsBound() {
-  for (const test::TimingProfile *profile : {&test::kM6FlashNextQ2, &test::kStudio18GFlashNextQ2, &test::kDense27B}) {
+  for (const test::TimingProfile &tuned :
+       atEveryTurnaround({&test::kM6FlashNextQ2, &test::kStudio18GFlashNextQ2, &test::kDense27B})) {
+    const test::TimingProfile *profile = &tuned;
     const bool streamed = profile->experts.experts;
     Sim sim(*profile, limits(streamed ? 8192 : kChunk, profile->layers));
     sim.seed();
@@ -662,7 +1016,7 @@ void testEveryContendedUnitWithinItsBound() {
         for (uint32_t pass = 0; !plan.pass && pass < plan.passes; ++pass)
           require(sim.price(plan.items, pass, plan.passes) <= sim.bound() * (1 + 1e-9) ||
                       plan.passes == profile->layers,
-                  std::string(profile->name) + ": a contended unit's price exceeds the bound");
+                  at(*profile) + ": a contended unit's price exceeds the bound");
         const double wall = sim.run(plan);
         if (++units > 40)
           longest = std::max(longest, wall / sim.bound());
@@ -670,7 +1024,7 @@ void testEveryContendedUnitWithinItsBound() {
         sim.run(plan);
       }
     }
-    require(longest <= 1.25, std::string(profile->name) + ": a contended unit took " + std::to_string(longest) +
+    require(longest <= 1.25, at(*profile) + ": a contended unit took " + std::to_string(longest) +
                                  " of its bound once learned");
   }
 }
@@ -743,6 +1097,120 @@ void testAContendedUnitKeepsRowsNoFewerBound() {
           "a contended unit no fewer rows bound halved to " + std::to_string(plan.items[0].tokenCount) + " rows");
   sim.run(plan);
   require(sim.scheduler.snapshot().boundCuts == 0, "a halving no fewer rows could make was counted");
+}
+
+// S-P3: beside a Spill lane streaming its history, a decoder's gaps between
+// its decode commands stay within a unit's bound, max(G, u / 0.1) by the
+// price's error (p95), and one decode command, once the price has learned,
+// at every turnaround.
+void testDecodeGapsBesideAStreamingLaneStayWithinTheBound() {
+  for (const test::TimingProfile *base : {&test::kM6FlashNextQ2, &test::kStudio18GFlashNextQ2}) {
+    for (const double turnaround : kTurnarounds) {
+      const test::TimingProfile profile = withTurnaround(*base, turnaround);
+      Sim sim(profile, limits(8192, profile.layers));
+      sim.seed();
+      sim.decoder(1);
+      sim.lane(2, 45056, 80'000);
+      sim.shape(2, 45056 / kPageTokens, true);
+      std::optional<double> lastDecode;
+      uint32_t units = 0;
+      double worst = 0.0;
+      while (sim.scheduler.phase(2) == Phase::Prefill && units < 800) {
+        const BatchPlan plan = sim.plan();
+        const double wall = sim.run(plan);
+        if (plan.kind == WorkKind::Prefill) {
+          ++units;
+          continue;
+        }
+        if (lastDecode && units > 40) {
+          const SchedulerSnapshot counts = sim.scheduler.snapshot();
+          const double limit = sim.bound() * (1.0 + counts.prefillEstimate.relativeErrorP95) + wall;
+          worst = std::max(worst, (sim.now - *lastDecode) / limit);
+        }
+        lastDecode = sim.now;
+      }
+      require(units > 40 && worst <= 1.0 + 1e-9,
+              at(profile) + ": a decode gap beside a streaming lane reached " + std::to_string(worst) + " of B");
+    }
+  }
+}
+
+// The TTFT simulation (DESIGN §7.5, A74) on the M6's profile: agent turns
+// of 300 rows at 8K, arriving at `arrivals`; each turn's first token ends
+// its prompt (no admission here), after which it leaves, as what it waited
+// for is what this measures. Returns each turn's TTFT, and in `first` the
+// first plan.
+std::vector<double> runTurns(std::span<const double> arrivals, std::optional<BatchPlan> *first = nullptr) {
+  Sim sim(test::kM6FlashNextQ2, limits(8192, 48));
+  sim.seed();
+  std::vector<double> ttft(arrivals.size(), -1.0);
+  size_t arrived = 0, done = 0;
+  while (done < arrivals.size()) {
+    for (; arrived < arrivals.size() && arrivals[arrived] <= sim.now; ++arrived)
+      sim.lane(arrived + 1, 8192, 300);
+    const std::optional<BatchPlan> plan = sim.next();
+    if (!plan) {
+      sim.now = arrivals[arrived];
+      continue;
+    }
+    if (first && !*first)
+      *first = plan;
+    sim.run(*plan);
+    for (size_t index = 0; index < arrived; ++index)
+      if (ttft[index] < 0.0 && sim.scheduler.phase(index + 1) != Phase::Prefill) {
+        ttft[index] = sim.now - arrivals[index];
+        sim.scheduler.cancel(index + 1);
+        sim.scheduler.remove(index + 1);
+        ++done;
+      }
+  }
+  return ttft;
+}
+
+// N = 1, 2, 4 turns together share one command: the worst TTFT within 1.25
+// times their command run whole. Two 1.03 s apart (the pass tree's split
+// round, 6976 ms, A74): the second's TTFT is at most the rest of the
+// first's command and its own, and the two together no more than that and
+// the first's alone, regrouped or not. (On this profile a turn costs
+// 3.2-3.8 s with its passes, not S.md §11.2's 2.47 s: the rule regroups
+// the second while 2 R + K_J > 2 K', here up to about 1.6 s in.) Apart by
+// 0.5, 1 or 1.5 s, each turn waits at most for the command in flight and a
+// command of all of them.
+void testTurnsTtftAloneTogetherAndApart() {
+  const test::TimingProfile &profile = test::kM6FlashNextQ2;
+  test::TimedWork work(profile);
+  const auto whole = [&](uint32_t turns) {
+    std::vector<model::PrefillLane> lanes(turns, model::PrefillLane{8192, 300, 0});
+    return test::prefillTimes(profile, work.prefillWork(lanes, 0, 1)).wallMilliseconds;
+  };
+  const std::array lone{0.0};
+  const double own = runTurns(lone)[0];
+  for (const uint32_t count : {1u, 2u, 4u}) {
+    const std::vector<double> together(count, 0.0);
+    std::optional<BatchPlan> first;
+    const std::vector<double> ttft = runTurns(together, &first);
+    require(first && first->width() == count, std::to_string(count) + " turns together did not share a command");
+    require(*std::ranges::max_element(ttft) <= 1.25 * whole(count),
+            std::to_string(count) + " turns together: worst TTFT " +
+                std::to_string(*std::ranges::max_element(ttft)) + " ms against their command's " +
+                std::to_string(whole(count)) + " ms");
+  }
+  const std::array split{0.0, 1030.0};
+  const std::vector<double> ttft = runTurns(split);
+  require(ttft[1] <= (own - split[1]) + own + 1e-6 && ttft[0] + ttft[1] <= own + (own - split[1]) + own + 1e-6,
+          "turns 1.03 s apart took " + std::to_string(ttft[0]) + " and " + std::to_string(ttft[1]) +
+              " ms, past the rest of the first's command and their own, " + std::to_string(own) + " ms each");
+  for (const uint32_t count : {2u, 4u})
+    for (const double gap : {500.0, 1000.0, 1500.0}) {
+      std::vector<double> arrivals;
+      for (uint32_t index = 0; index < count; ++index)
+        arrivals.push_back(index * gap);
+      const std::vector<double> apart = runTurns(arrivals);
+      for (size_t index = 0; index < apart.size(); ++index)
+        require(apart[index] <= 1.25 * (own + whole(count)),
+                std::to_string(count) + " turns " + std::to_string(int(gap)) + " ms apart: turn " +
+                    std::to_string(index + 1) + " took " + std::to_string(apart[index]) + " ms");
+    }
 }
 
 // --- Joins --------------------------------------------------------------------------------------------------
@@ -907,6 +1375,35 @@ void testAgingBoundsALongLaneUnderArrivals() {
               std::to_string(cost) + " ms");
 }
 
+// Equal prompts are served oldest first, a whole command at a time, not
+// filled side by side to finish together; the oldest keeps leading to its
+// prompt's end, which leaves the younger nothing lost (not overtaken).
+void testEqualPromptsFinishInArrivalOrder() {
+  DenseSim sim;
+  for (uint64_t id = 1; id <= 3; ++id)
+    sim.lane(id, 0, 5000);
+  for (uint32_t command = 0; command < 3; ++command) {
+    const BatchPlan plan = sim.plan();
+    require(plan.width() == 1 && plan.items[0].requestId == 1 &&
+                plan.items[0].tokenCount == std::min(kChunk, 5000 - command * kChunk),
+            "equal prompts were not served oldest first, a whole command at a time");
+    sim.run(plan);
+  }
+  require(sim.scheduler.phase(1) == Phase::Decode, "the oldest prompt did not end in three commands");
+  sim.scheduler.cancel(1);
+  require(sim.plan().items[0].requestId == 2, "the next oldest equal prompt did not lead once the oldest's ended");
+}
+
+// A later short prompt leads an earlier long one.
+void testShortArrivalPrecedesLongColdPrompt() {
+  DenseSim sim;
+  sim.lane(1, 0, 3000);
+  sim.lane(2, 0, 700);
+  const BatchPlan plan = sim.plan();
+  require(plan.items[0].requestId == 2 && plan.items[0].tokenCount == 700,
+          "a later short prompt waited behind an earlier long one");
+}
+
 // A higher priority's commands do not age a lower one: once they end, a
 // later cheaper lane of its priority still leads.
 void testHigherTierCommandsDoNotAgeALowerTier() {
@@ -1054,6 +1551,216 @@ void testOnlyAHeldStartLiftsTheCommand() {
   }
 }
 
+// D2: under 300-row turns arriving every 5 s, each superseding the long
+// lane's command partway through its passes, the long lane's abandoned
+// commands and the turns' units count as its wait until it has waited K
+// times its expected remaining cost, after which it leads to its end: its
+// first token within K times that cost (its price, at its highest over the
+// run), its own time alone and a unit. Without its abandoned time in its
+// wait it is overdue only once the turns' units alone reach that, which
+// here doubles the wait. (A turn takes 2.5-2.8 s on the profile: turns 3 s
+// apart would leave the long lane a few tenths of a second a cycle, so its
+// abandoned time would barely count.)
+void testRepeatedSupersedesEndOnceTheLongLaneIsOverdue() {
+  const auto alone = [] {
+    Sim sim(test::kM6FlashNextQ2, limits(8192, 48));
+    sim.seed();
+    sim.lane(1, 0, 3 * 8192);
+    while (sim.scheduler.phase(1) == Phase::Prefill)
+      sim.step();
+    return sim.now;
+  }();
+  Sim sim(test::kM6FlashNextQ2, limits(8192, 48));
+  sim.seed();
+  sim.lane(1, 0, 3 * 8192);
+  // The long lane's expected remaining cost: its commands of 8192 rows from
+  // where it is, as the order prices it.
+  const auto remaining = [&] {
+    double total = 0.0;
+    for (uint32_t position = sim.scheduler.promptProcessed(1); position < 3 * 8192; position += 8192) {
+      const std::array command{BatchItem{1, 8192, position}};
+      total += sim.price(command);
+    }
+    return total;
+  };
+  double nextArrival = 5000.0, longest = 0.0, priced = remaining();
+  uint64_t turn = 100;
+  std::vector<uint64_t> turns;
+  while (sim.scheduler.phase(1) == Phase::Prefill && sim.now < 10 * alone) {
+    if (sim.now >= nextArrival) {
+      sim.lane(turn, 8192, 300);
+      turns.push_back(turn++);
+      nextArrival += 5000.0;
+    }
+    longest = std::max(longest, sim.step());
+    priced = std::max(priced, sim.scheduler.phase(1) == Phase::Prefill ? remaining() : 0.0);
+    // A turn ends at its first token: what it waited for is what this
+    // pins, not its decode.
+    std::erase_if(turns, [&](uint64_t id) {
+      if (sim.scheduler.phase(id) == Phase::Prefill)
+        return false;
+      sim.scheduler.cancel(id);
+      sim.scheduler.remove(id);
+      return true;
+    });
+  }
+  const SchedulerSnapshot counts = sim.scheduler.snapshot();
+  require(counts.abandonedPassCommands > 3, "the turns did not supersede the long lane's command");
+  require(sim.scheduler.phase(1) != Phase::Prefill && sim.now <= 3.0 * priced + alone + longest,
+          "the long lane's prompt ended after " + std::to_string(sim.now) + " ms, past K times its " +
+              std::to_string(priced) + " ms priced and its " + std::to_string(alone) + " ms alone, after " +
+              std::to_string(counts.abandonedPassCommands) + " abandoned commands");
+}
+
+// A command between its passes holds its lanes to its last pass: a pass
+// before the last consumes no rows. It is not abandoned while a pass of it
+// runs; abandoned, it leaves its lanes their rows, which they run again
+// from a first pass, a lane suspended meanwhile too once it resumes.
+void testCommandBetweenPassesHoldsItsLanes() {
+  Sim sim(test::kM6FlashNextQ2, limits(8192, 48));
+  sim.seed();
+  sim.lane(1, 20'000, 300);
+  sim.lane(2, 20'000, 300);
+  const BatchPlan first = sim.plan();
+  require(first.width() == 2 && first.passes > 1, "two turns did not share a command in passes");
+  sim.scheduler.commit(first, sim.in());
+  PassProgress progress{.plan = first};
+  test::rejects([&] { sim.scheduler.abandoned(progress); }, "cannot be abandoned",
+                "a command was abandoned while a pass of it ran");
+  const std::array results{StepResult{1, 0, false, DecodeStage::Regular},
+                           StepResult{2, 0, false, DecodeStage::Regular}};
+  sim.scheduler.complete(first, results, {.wallMilliseconds = 500.0});
+  require(sim.scheduler.phase(1) == Phase::Prefill && sim.scheduler.promptProcessed(1) == 20'000,
+          "a pass before a command's last consumed its rows");
+  progress.plan.pass = 1;
+  progress.elapsedMilliseconds = 500.0;
+  sim.scheduler.abandoned(progress);
+  BatchPlan plan = sim.plan();
+  require(plan.pass == 0 && plan.passes == first.passes && plan.items == first.items,
+          "an abandoned command's lanes did not run its rows again from a first pass");
+  sim.run(plan);
+  sim.abandon();
+  sim.scheduler.suspendForResources(1);
+  sim.scheduler.resumeFromResources(1, 20'000, 20'300);
+  plan = sim.plan();
+  require(plan.pass == 0 && plan.items == first.items,
+          "a lane suspended between its command's passes did not run its rows again with the others");
+}
+
+// A higher priority's decode does not abandon a command between its passes,
+// which goes on with its next pass after it; a higher priority's prompt
+// early in the command supersedes it, cannot commit beside it, and once it
+// is abandoned runs, and the command's lanes run their rows again from a
+// first pass.
+void testPassesYieldToAHigherPriority() {
+  Sim sim(test::kM6FlashNextQ2, limits(8192, 48));
+  sim.seed();
+  sim.lane(3, 0, 100, RequestPriority::Foreground);
+  awaitFirstMask(sim, 3);
+  sim.lane(1, 20'000, 300, RequestPriority::Background);
+  sim.lane(2, 20'000, 300, RequestPriority::Background);
+  const BatchPlan first = sim.plan();
+  require(first.width() == 2 && first.pass == 0 && first.passes > 1,
+          "two Background prompts did not share a command in passes");
+  sim.run(first);
+  sim.scheduler.maskReady(3);
+  BatchPlan plan = sim.plan();
+  require(plan.kind == WorkKind::Decode && plan.items[0].requestId == 3 &&
+              !sim.scheduler.abandonsPasses(plan, sim.in()),
+          "a higher priority's decode waited for a command between its passes, or abandoned it");
+  completeDecode(sim, true);
+  plan = sim.plan();
+  require(plan.kind == WorkKind::Prefill && plan.pass == 1 && plan.items == first.items,
+          "a command did not go on with its next pass after a higher priority's decode");
+  sim.lane(5, 0, 100, RequestPriority::Foreground);
+  plan = sim.plan();
+  require(plan.kind == WorkKind::Prefill && plan.items[0].requestId == 5 && plan.width() == 1 &&
+              sim.scheduler.abandonsPasses(plan, sim.in()),
+          "a higher priority's prompt waited for a command between its passes");
+  test::rejects([&] { static_cast<void>(sim.scheduler.commit(plan, sim.in())); }, "batch no longer matches",
+                "a higher priority's prompt committed beside a command between its passes");
+  sim.abandon();
+  require(!sim.scheduler.abandonsPasses(plan, sim.in()), "an abandoned command stayed between its passes");
+  while (sim.scheduler.phase(5) == Phase::Prefill)
+    sim.step();
+  completeDecode(sim, true);
+  plan = sim.plan();
+  require(plan.kind == WorkKind::Prefill && plan.pass == 0 && plan.items == first.items,
+          "an abandoned command's lanes did not run its rows again from a first pass");
+}
+
+// A command between its passes runs at the priority of the most urgent lane
+// it holds back: with a Foreground lane decoding, a Background command's
+// next pass waits for that decode while it holds nothing back, or only a
+// Foreground prompt memory on its way back holds; beside a Foreground prompt
+// it does not yield to (its lane is overdue) it runs as Foreground work,
+// after the decode command.
+void testACommandRunsAtThePriorityOfWhatItHoldsBack() {
+  enum class Held { Nothing, ReadyPrompt, WaitingPrompt };
+  for (const Held held : {Held::Nothing, Held::ReadyPrompt, Held::WaitingPrompt}) {
+    Sim sim(test::kM6FlashNextQ2, limits(8192, 48), 0.5);
+    sim.seed();
+    sim.decoder(2, RequestPriority::Foreground);
+    sim.lane(1, 0, 3 * 8192, RequestPriority::Background);
+    // Planned without the decoder, whose memory is on its way back.
+    sim.excluded = {2};
+    const BatchPlan first = sim.plan();
+    require(first.kind == WorkKind::Prefill && first.passes > 1, "the Background command did not run in passes");
+    sim.run(first);
+    sim.excluded.clear();
+    // Its abandoned commands' time made its lane overdue: it yields to
+    // nothing.
+    PassProgress kept = *sim.passes;
+    sim.passes->elapsedMilliseconds = 1e7;
+    sim.abandon();
+    sim.passes = kept;
+    if (held != Held::Nothing)
+      sim.lane(3, 0, 100, RequestPriority::Foreground);
+    if (held == Held::WaitingPrompt)
+      sim.excluded = {3};
+    completeDecode(sim);
+    const BatchPlan plan = sim.plan();
+    require((plan.kind == WorkKind::Prefill && plan.items == first.items && plan.pass == 1) ==
+                (held == Held::ReadyPrompt),
+            held == Held::ReadyPrompt ? "a command did not run at the priority of a prompt it holds back"
+                                      : "a command ran ahead of a higher priority's decode holding back no ready lane");
+  }
+}
+
+// A command's first pass's image encodes stay out of the price its next
+// command is planned with.
+void testImageEncodesStayOutOfAPassedCommandsEstimate() {
+  std::array<BatchPlan, 2> next;
+  std::array<double, 2> prices{};
+  for (const bool encodes : {false, true}) {
+    Sim sim(test::kM6FlashNextQ2, limits(8192, 48));
+    sim.seed();
+    sim.lane(1, 0, 20'000);
+    BatchPlan plan = sim.plan();
+    require(plan.passes > 1, "the command did not run in passes");
+    for (uint32_t pass = 0; pass < plan.passes; ++pass) {
+      const model::CommandWork work = sim.work.prefillWork(sim.lanes(plan.items), pass, plan.passes);
+      const double encoded = encodes && !pass ? 5000.0 : 0.0;
+      BatchPlan unit = plan;
+      unit.pass = pass;
+      if (pass)
+        sim.passes->plan = unit;
+      completePrefill(sim, unit,
+                      {.work = work,
+                       .wallMilliseconds = test::prefillTimes(sim.work.profile(), work).wallMilliseconds + encoded,
+                       .imageEncodeMilliseconds = encoded});
+      if (!pass && plan.passes > 1)
+        sim.passes = PassProgress{.plan = plan};
+    }
+    sim.passes.reset();
+    next[encodes] = sim.plan();
+    prices[encodes] = sim.price(next[encodes].items);
+  }
+  require(next[1].passes == next[0].passes && next[1].items == next[0].items &&
+              std::abs(prices[1] - prices[0]) <= 1e-9 * prices[0],
+          "a command's first pass's image encodes trained its next command's price");
+}
+
 // The image encodes ahead of a command stay out of its price: a command
 // whose rows ran as priced trains nothing new, encodes or not.
 void testImageEncodesStayOutOfTheCommandEstimate() {
@@ -1089,6 +1796,21 @@ constexpr test::TestCase kTests[] = {
     {"testHighestRunnablePriority", testHighestRunnablePriority},
     {"testResourceSuspensionReplaysFromCache", testResourceSuspensionReplaysFromCache},
     {"testAdmissionStartsTheLanesOfTheNextCommand", testAdmissionStartsTheLanesOfTheNextCommand},
+    {"testAdmissionStartsAtMostAFullBatch", testAdmissionStartsAtMostAFullBatch},
+    {"testAdmissionWaitsForAHigherPrioritysDecode", testAdmissionWaitsForAHigherPrioritysDecode},
+    {"testUnconstrainedLanesShareDecode", testUnconstrainedLanesShareDecode},
+    {"testMaskedLanesShareDecode", testMaskedLanesShareDecode},
+    {"testMaskWaitAccruesNoDecodeDebt", testMaskWaitAccruesNoDecodeDebt},
+    {"testDecodeDebtLeavesWithTheLastDecoder", testDecodeDebtLeavesWithTheLastDecoder},
+    {"testHigherPriorityPrefillPrecedesDecodeDebt", testHigherPriorityPrefillPrecedesDecodeDebt},
+    {"testDecodeCommandContainsOnePriorityTier", testDecodeCommandContainsOnePriorityTier},
+    {"testReplayKeepsHeldInitialMask", testReplayKeepsHeldInitialMask},
+    {"testWaitingMaskBoundsPeerPrefill", testWaitingMaskBoundsPeerPrefill},
+    {"testOnlyContendedUnitsAreBounded", testOnlyContendedUnitsAreBounded},
+    {"testALowerPrioritysDecodeDoesNotBoundAPrefill", testALowerPrioritysDecodeDoesNotBoundAPrefill},
+    {"testWaitingOrPrefillingPeersDoNotBoundAPrefill", testWaitingOrPrefillingPeersDoNotBoundAPrefill},
+    {"testUntimedOrAuxiliaryUnitsTrainNothing", testUntimedOrAuxiliaryUnitsTrainNothing},
+    {"testACommandHoldsOneLanePastAChunk", testACommandHoldsOneLanePastAChunk},
     {"testAPrefillsPriceIsTheCostModels", testAPrefillsPriceIsTheCostModels},
     {"testColdSeedPricesTheFirstContendedTurn", testColdSeedPricesTheFirstContendedTurn},
     {"testEstimateConvergesUnderUniformContendedCommands", testEstimateConvergesUnderUniformContendedCommands},
@@ -1103,6 +1825,8 @@ constexpr test::TestCase kTests[] = {
     {"testAContendedSpillLaneKeepsItsGroupRows", testAContendedSpillLaneKeepsItsGroupRows},
     {"testAGroupBeyondMaximumPassesHalvesOnlyWhenContended", testAGroupBeyondMaximumPassesHalvesOnlyWhenContended},
     {"testAContendedUnitKeepsRowsNoFewerBound", testAContendedUnitKeepsRowsNoFewerBound},
+    {"testDecodeGapsBesideAStreamingLaneStayWithinTheBound", testDecodeGapsBesideAStreamingLaneStayWithinTheBound},
+    {"testTurnsTtftAloneTogetherAndApart", testTurnsTtftAloneTogetherAndApart},
     {"testALongLanesSparingRowsDoNotDelayAShortTurn", testALongLanesSparingRowsDoNotDelayAShortTurn},
     {"testFourShortTurnsShareOneCommand", testFourShortTurnsShareOneCommand},
     {"testADenseFinishingLeaderRunsWithoutFill", testADenseFinishingLeaderRunsWithoutFill},
@@ -1111,12 +1835,19 @@ constexpr test::TestCase kTests[] = {
     {"testShortestExpectedRemainingLeads", testShortestExpectedRemainingLeads},
     {"testNearEqualLongPromptsDoNotInterleave", testNearEqualLongPromptsDoNotInterleave},
     {"testAgingBoundsALongLaneUnderArrivals", testAgingBoundsALongLaneUnderArrivals},
+    {"testEqualPromptsFinishInArrivalOrder", testEqualPromptsFinishInArrivalOrder},
+    {"testShortArrivalPrecedesLongColdPrompt", testShortArrivalPrecedesLongColdPrompt},
     {"testHigherTierCommandsDoNotAgeALowerTier", testHigherTierCommandsDoNotAgeALowerTier},
     {"testASameTierArrivalSupersedesOnlyWhenTheSumFalls", testASameTierArrivalSupersedesOnlyWhenTheSumFalls},
     {"testAHigherTierAbandonCountsLanesWaitingBehindBoth", testAHigherTierAbandonCountsLanesWaitingBehindBoth},
     {"testARegroupHappensOnlyWhenTheSumFalls", testARegroupHappensOnlyWhenTheSumFalls},
     {"testAnOverdueLaneIsNeverAbandoned", testAnOverdueLaneIsNeverAbandoned},
     {"testOnlyAHeldStartLiftsTheCommand", testOnlyAHeldStartLiftsTheCommand},
+    {"testRepeatedSupersedesEndOnceTheLongLaneIsOverdue", testRepeatedSupersedesEndOnceTheLongLaneIsOverdue},
+    {"testCommandBetweenPassesHoldsItsLanes", testCommandBetweenPassesHoldsItsLanes},
+    {"testPassesYieldToAHigherPriority", testPassesYieldToAHigherPriority},
+    {"testACommandRunsAtThePriorityOfWhatItHoldsBack", testACommandRunsAtThePriorityOfWhatItHoldsBack},
+    {"testImageEncodesStayOutOfAPassedCommandsEstimate", testImageEncodesStayOutOfAPassedCommandsEstimate},
     {"testImageEncodesStayOutOfTheCommandEstimate", testImageEncodesStayOutOfTheCommandEstimate},
 };
 
