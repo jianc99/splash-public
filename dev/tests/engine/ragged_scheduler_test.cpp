@@ -703,6 +703,24 @@ void testWaitingOrPrefillingPeersDoNotBoundAPrefill() {
           "lanes that only prefill bounded their leader");
 }
 
+// contended_prefill_ms counts the units planning bounded, those committed
+// while a lane of their priority decoded: none of a lone prompt's, its last
+// among them, which leaves its lane decoding, and one beside that decoder (a
+// prompt of 100 rows, one unit within the bound).
+void testContendedPrefillCountsTheUnitsPlanningBounds() {
+  DenseSim sim;
+  sim.lane(1, 0, 3000);
+  while (sim.scheduler.phase(1) == Phase::Prefill)
+    sim.step();
+  require(sim.scheduler.snapshot().contendedPrefill.count == 0,
+          "a lone prompt's units counted as contended, its last ending beside its own decode");
+  sim.lane(2, 0, 100);
+  while (sim.scheduler.phase(2) == Phase::Prefill)
+    sim.step();
+  require(sim.scheduler.snapshot().contendedPrefill.count == 1,
+          "a unit beside a decoder of its priority was not counted once");
+}
+
 // Behaviour change 7: a ready peer of its priority, with no decoder, does
 // not bound a lane that streams its history: the Spill lane leads a group's
 // rows beside a long Resident prompt as it does alone, and on a store-less
@@ -2035,6 +2053,7 @@ constexpr test::TestCase kTests[] = {
     {"testOnlyContendedUnitsAreBounded", testOnlyContendedUnitsAreBounded},
     {"testALowerPrioritysDecodeDoesNotBoundAPrefill", testALowerPrioritysDecodeDoesNotBoundAPrefill},
     {"testWaitingOrPrefillingPeersDoNotBoundAPrefill", testWaitingOrPrefillingPeersDoNotBoundAPrefill},
+    {"testContendedPrefillCountsTheUnitsPlanningBounds", testContendedPrefillCountsTheUnitsPlanningBounds},
     {"testAReadyPeerDoesNotBoundAStreamingLeader", testAReadyPeerDoesNotBoundAStreamingLeader},
     {"testUntimedOrAuxiliaryUnitsTrainNothing", testUntimedOrAuxiliaryUnitsTrainNothing},
     {"testACommandHoldsOneLanePastAChunk", testACommandHoldsOneLanePastAChunk},

@@ -362,8 +362,11 @@ private:
   // The prefill plan next() made last and what planning it counted, which
   // its commit adds to the counters; the commit of any plan clears it.
   mutable std::optional<Planned> lastPlanned_;
-  // The work planning expected of the prefill unit in flight.
+  // The work planning expected of the prefill unit in flight, and whether it
+  // was contended when it committed, as planning bounds units: what
+  // contendedPrefill_ counts.
   model::CommandWork activeExpected_;
+  bool activeContended_ = false;
   // The lanes the active command was planned without.
   std::vector<uint64_t> excluded_;
   uint64_t order_ = 0;

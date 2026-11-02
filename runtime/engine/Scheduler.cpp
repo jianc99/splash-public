@@ -718,6 +718,7 @@ std::vector<uint64_t> Scheduler::commit(const BatchPlan &plan, const PlanInputs 
   lastPlanned_.reset();
   activeExpected_ = prefill ? work_.prefillWork(prefillLanes(plan.items, in), plan.pass, plan.passes)
                             : model::CommandWork{};
+  activeContended_ = prefill && contended(priority);
   excluded_.assign(in.excluded.begin(), in.excluded.end());
   active_ = plan;
   lastCommittedKind_ = plan.kind;
@@ -772,19 +773,20 @@ void Scheduler::complete(const BatchPlan &plan, std::span<const StepResult> resu
     }
   }
   const RequestPriority priority = get(plan.items.front().requestId).spec.priority;
-  // Whether lanes of its priority or a higher one decoded beside it, not
-  // counting decoders it was planned without, which could not run either.
-  const bool contendedCommand = prefill && std::ranges::any_of(requests_, [&](const auto &entry) {
-                                  const auto &[id, peer] = entry;
-                                  return peer.phase == Phase::Decode && peer.spec.priority <= priority &&
-                                         !listed(excluded_, id);
-                                });
+  // Whether lanes of its priority or a higher one decode beside it now, those
+  // it finished included, not counting decoders it was planned without, which
+  // could not run either.
+  const bool owesDecode = prefill && std::ranges::any_of(requests_, [&](const auto &entry) {
+                            const auto &[id, peer] = entry;
+                            return peer.phase == Phase::Decode && peer.spec.priority <= priority &&
+                                   !listed(excluded_, id);
+                          });
   if (prefill) {
     ++counters_.prefillUnits;
     const double rowsMilliseconds =
         wallMilliseconds - std::clamp(sample.imageEncodeMilliseconds, 0.0, std::max(wallMilliseconds, 0.0));
     if (timed) {
-      if (contendedCommand)
+      if (activeContended_)
         contendedPrefill_.add(static_cast<uint64_t>(wallMilliseconds * 1e6));
       // The lanes of its priority submitted before a lane it served, which
       // waited without rows meanwhile, count its time as waited.
@@ -828,7 +830,7 @@ void Scheduler::complete(const BatchPlan &plan, std::span<const StepResult> resu
         decodeLaneTokens_ = kDecodeTokenDecay * decodeLaneTokens_ + laneTokens;
         decodeTokenWeight_ = kDecodeTokenDecay * decodeTokenWeight_ + 1.0;
       }
-    } else if (contendedCommand && decodeShare_ > 0.0) {
+    } else if (owesDecode && decodeShare_ > 0.0) {
       decodeDebtMilliseconds_ += decodeShare_ * wallMilliseconds;
     }
   }
