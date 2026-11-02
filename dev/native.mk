@@ -816,6 +816,7 @@ $(TEST_TIMING_PROFILE) $(TEST_TIMING_PROFILE_ASAN) $(TEST_TIMING_PROFILE_TSAN): 
 		dev/tests/engine/TimingProfile.cpp dev/tests/engine/timing_profile_test.cpp
 $(TEST_FD_TRANSPORT_TEST) $(TEST_FD_TRANSPORT_ASAN) $(TEST_FD_TRANSPORT_TSAN): \
 		$(NATIVE_RUNTIME_SOURCES) \
+		runtime/engine/MemoryLedger.cpp \
 		runtime/engine/FdTransport.cpp \
 		dev/tests/engine/ProtocolPeer.cpp \
 		dev/tests/engine/native_fd_transport_test.cpp

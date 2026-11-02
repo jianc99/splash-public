@@ -600,6 +600,7 @@ void MemoryPressurePolicy::reclaimed(const MemoryReclaimDirective &directive,
 }
 
 void connectToGovernor(EngineConfig &config, MemoryGovernor &governor) {
+  config.governor = &governor;
   config.growthPaused = [&governor] {
     return !governor.snapshot().hostGrowthAllowed;
   };

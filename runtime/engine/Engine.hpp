@@ -17,6 +17,7 @@
 #include <string_view>
 #include <type_traits>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace splash::engine {
@@ -64,6 +65,9 @@ struct EngineConfig final {
   // The prefill checkpoint interval and the resource wait limit.
   uint32_t prefillCheckpointTokens = kPrefillCheckpointTokens;
   double resourceWaitTimeoutMilliseconds = kResourceWaitTimeoutMilliseconds;
+  // The governor whose ledger holds the requests' claims on memory
+  // (ClaimHandle), which connectToGovernor sets beside its two hooks.
+  MemoryGovernor *governor = nullptr;
   // Host growth admission, supplied by the runtime governor. Queried while
   // resident lanes drain after a suspension, and when a boundary's state
   // buffers are refused: while growth is paused, extents released for them
@@ -411,6 +415,16 @@ private:
     bool diskQuota = false;
   };
 
+  // A request's one claim on memory in the governor's ledger
+  // (MemoryLedger::open), closed when the request leaves requests_.
+  struct ClaimHandle final {
+    MemoryGovernor *governor = nullptr;
+    ClaimId id;
+    ClaimHandle() = default;
+    ClaimHandle(ClaimHandle &&other) noexcept;
+    ~ClaimHandle();
+  };
+
   struct Capture;
   struct Request final {
     struct StateBoundary final {
@@ -467,6 +481,7 @@ private:
     // command at a time instead.
     uint64_t resumeKvTargetTokens = 0;
     ResourceWait resourceWait;
+    ClaimHandle claim;
     // The latest attempt to start it was refused memory, or the SSD cache's
     // quota of active KV. Until it starts, nothing that comes after it in
     // admission order is admitted, in ordinary admission or among suspended
@@ -926,20 +941,30 @@ private:
   // token that no cycle has committed yet (Request::sentFirstToken), as when
   // the request is suspended or cancelled before its first decode cycle.
   [[nodiscard]] static uint32_t generatedTokens(const Request &request) noexcept;
-  // Whether lane a gives up its memory before lane b: the lower priority,
-  // then, at equal priority, a lane in prefill before a decoding one, then
-  // the one with fewer completed tokens.
+  // Who memory goes to first, the higher rank first: the higher priority,
+  // then, at equal priority, a lane past its prompt (decoding, or waiting for
+  // its next token's mask) before one in prefill, then the one with more
+  // completed tokens, then the earlier submission.
+  [[nodiscard]] ClaimRank rankOf(const Request &active) const;
+  // The claim of the request's allocations of class `cls`: its rank and
+  // priority, and for a lane in service the reach of its growth
+  // (growthClass).
+  [[nodiscard]] ClaimSpec claimFor(const Request &active, ClaimClass cls) const;
+  // Whether lane a gives up its memory before lane b: its rank is lower
+  // short of the submission order.
   [[nodiscard]] bool yieldsBefore(const Request &a, const Request &b) const;
   // The resident lane in prefill or decode that yields first when every
-  // lane's growth fails (yieldsBefore; on a tie, the later submission), or
-  // nullptr without one. prepare() gates that lane's growth and suspends
-  // that lane; preemptBelow() suspends it for a higher priority. A lane of
-  // the command between its passes beside one of it that ended gives that
-  // command up in its place, at every point a lane yields
-  // (yieldsEndedLanes). Work that supersedes the command takes what it holds
-  // before that (escalate), and a start whose prompt would not supersede it
-  // suspends no lane of it (preemptBelow).
-  [[nodiscard]] Request *laneToYield();
+  // lane's growth fails (the lowest rank), or nullptr without one. prepare()
+  // gates that lane's growth and suspends that lane; preemptBelow() suspends
+  // it for a higher priority. A lane of the command between its passes
+  // beside one of it that ended gives that command up in its place, at every
+  // point a lane yields (yieldsEndedLanes). Work that supersedes the command
+  // takes what it holds before that (escalate), and a start whose prompt
+  // would not supersede it suspends no lane of it (preemptBelow).
+  [[nodiscard]] const Request *laneToYield() const;
+  [[nodiscard]] Request *laneToYield() {
+    return const_cast<Request *>(std::as_const(*this).laneToYield());
+  }
   // Runs one allocation of a lane's state, of KV pages or of the model's
   // memory for reads of spilled KV, reclaiming cache up to class upTo
   // between attempts while that makes progress: what is in use only for
@@ -1012,7 +1037,7 @@ private:
   // start a resident lane holds back waits. Which lane that is is asked
   // where it matters: an allocation may give up the command between its
   // passes, whose lanes that ended then end (escalate).
-  [[nodiscard]] ReclaimClass growthClass(const Request &active);
+  [[nodiscard]] ReclaimClass growthClass(const Request &active) const;
   // A lane that yields before one waiting for memory on its way back leaves
   // that memory to it until it has it, or for as long as that wait's limit
   // allows (awaitsMemory): as the memory lands, it would take it a page or

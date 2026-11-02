@@ -6,6 +6,7 @@
 #include <functional>
 #include <limits>
 #include <stdexcept>
+#include <tuple>
 #include <utility>
 
 namespace splash::engine {
@@ -471,7 +472,7 @@ Engine::Prepared Engine::refuse(std::span<const Denied> denied, bool heldBack,
   return Prepared::Yielded;
 }
 
-ReclaimClass Engine::growthClass(const Request &active) {
+ReclaimClass Engine::growthClass(const Request &active) const {
   return &active == laneToYield() && anotherResident(active.request.id) ? ReclaimClass::Ordinary
                                                                         : ReclaimClass::InUse;
 }
@@ -611,29 +612,50 @@ Engine::Reservation Engine::reserveCapture(Request &active, StateClass kind, uin
   return result;
 }
 
-bool Engine::yieldsBefore(const Request &a, const Request &b) const {
-  if (a.request.priority != b.request.priority)
-    return a.request.priority > b.request.priority;
-  const Phase aPhase = scheduler_.phase(a.request.id);
-  const Phase bPhase = scheduler_.phase(b.request.id);
-  // At equal priority, prefer uninterrupted streaming over less replay work.
-  if (aPhase != bPhase)
-    return aPhase == Phase::Prefill;
-  return completedTokens(a) < completedTokens(b);
+Engine::ClaimHandle::ClaimHandle(ClaimHandle &&other) noexcept
+    : governor(other.governor), id(std::exchange(other.id, {})) {}
+
+Engine::ClaimHandle::~ClaimHandle() {
+  if (id)
+    governor->ledger().close(id);
 }
 
-Engine::Request *Engine::laneToYield() {
-  Request *yielding = nullptr;
-  for (auto &[id, candidate] : requests_) {
+ClaimRank Engine::rankOf(const Request &active) const {
+  const Phase phase = scheduler_.phase(active.request.id);
+  return {.priority = static_cast<uint8_t>(static_cast<uint8_t>(RequestPriority::Background) -
+                                           static_cast<uint8_t>(active.request.priority)),
+          // At equal priority, prefer uninterrupted streaming over less
+          // replay work.
+          .decoding = phase == Phase::Decode || phase == Phase::WaitingMask,
+          .completedTokens = completedTokens(active),
+          .earliness = std::numeric_limits<uint64_t>::max() - scheduler_.submissionOrder(active.request.id)};
+}
+
+ClaimSpec Engine::claimFor(const Request &active, ClaimClass cls) const {
+  return {.cls = cls,
+          .requestId = active.request.id,
+          .rank = rankOf(active),
+          .reach = cls == ClaimClass::InService ? growthClass(active) : ReclaimClass::Ordinary,
+          .priority = active.request.priority};
+}
+
+bool Engine::yieldsBefore(const Request &a, const Request &b) const {
+  const ClaimRank left = rankOf(a);
+  const ClaimRank right = rankOf(b);
+  return std::tie(left.priority, left.decoding, left.completedTokens) <
+         std::tie(right.priority, right.decoding, right.completedTokens);
+}
+
+const Engine::Request *Engine::laneToYield() const {
+  const Request *yielding = nullptr;
+  for (const auto &[id, candidate] : requests_) {
     if (!candidate.lane)
       continue;
     // Requests enter the scheduler before they can acquire a lane.
     const Phase phase = scheduler_.phase(id);
     if (phase != Phase::Prefill && phase != Phase::Decode)
       continue;
-    if (!yielding || yieldsBefore(candidate, *yielding) ||
-        (!yieldsBefore(*yielding, candidate) &&
-         scheduler_.submissionOrder(id) > scheduler_.submissionOrder(yielding->request.id)))
+    if (!yielding || rankOf(candidate) < rankOf(*yielding))
       yielding = &candidate;
   }
   return yielding;

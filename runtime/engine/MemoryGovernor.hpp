@@ -514,9 +514,11 @@ private:
   bool hostPassShort_ = false;
 };
 
-// Connects an engine to the governor that admits its memory: the engine asks
-// it whether the host pauses growth, and marks the allocations a request in
-// service makes. Every engine that runs against a governor connects through it.
+// Connects an engine to the governor that admits its memory and whose ledger
+// holds its requests' claims (EngineConfig::governor): the engine asks it
+// whether the host pauses growth, and marks the allocations a request in
+// service makes. Every engine that runs against a governor connects through
+// it.
 void connectToGovernor(EngineConfig &config, MemoryGovernor &governor);
 
 } // namespace splash::engine
