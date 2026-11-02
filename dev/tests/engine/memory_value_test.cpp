@@ -1,8 +1,10 @@
 // What memory is worth (engine/MemoryValue.hpp), on inputs from recorded
 // runs and the fakes' fitted profiles.
 
+#include "FakeElasticPool.hpp"
 #include "TestChecks.hpp"
 #include "TestRegistry.hpp"
+#include "engine/MemoryGovernor.hpp"
 #include "engine/MemoryValue.hpp"
 
 #include <algorithm>
@@ -13,6 +15,7 @@
 #include <span>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace splash;
@@ -25,6 +28,8 @@ std::string &recordedLoadsDirectory() {
 
 namespace {
 
+using test::FakeElasticPool;
+using test::FakeMemory;
 using test::require;
 
 constexpr uint64_t kMiB = 1ULL << 20;
@@ -291,6 +296,77 @@ void testRecordedLoadsDoNotFlipFlop() {
   }
 }
 
+// value_per_gib against a pinned store (amend/M.md section 2, D2). On the M6
+// 1.5.0's store held 5722 slots and missed 37.3 and 40.4 experts a decode
+// token (m150a, m150b); mMNa's ran at its 4856-slot floor. Replayed through
+// a store at that floor that a ledger observes every 500 ms, mMNa's misses
+// beyond 1.5.0's are the hits of ghosts spanning the 866 slots between,
+// each at mMNa's miss time (0.2095 ms, its mean host-step work a read): the
+// account's value_per_gib over the passes with commands, per decode token,
+// lies between the host work those misses cost a token and their count at
+// the miss time. It replays to 3.79 and 3.25 ms a decode token a GiB, past
+// D2's 1.1-3.6 (decode wall times) at 37.3: a mean read costs more than the
+// one a smaller store adds (a decode token's host work differs by 3.34 and
+// 2.40 ms for 21.6 and 18.5 reads, 0.155 and 0.130 ms a read; its wall time
+// by 2.66 and 2.07 ms). Whether a miss is priced at the marginal read
+// instead is open (merge report); until then the replay is held between
+// those bounds. pFa is not replayed: its 5128-slot store is not 1.5.0's floor pair, and it
+// misses more a token (61.7) than mMNa's smaller one.
+void testValuePerGiBReproducesThePinnedStore() {
+  constexpr uint32_t kFloorSlots = 4856, kPinnedSlots = 5722;
+  // Host-step work a decode token (streamed_experts.decode.host_steps.work_ms
+  // total over metrics.decode_output_tokens, each run's last status): mMNa,
+  // and 1.5.0's m150a and m150b beside their misses a token.
+  constexpr double kFloorWorkMilliseconds = 12.34;
+  constexpr std::pair<double, double> kPinned[] = {{37.3, 9.00}, {40.4, 9.94}};
+  const RecordedRun run = readRun("m6-mMNa.tsv");
+  const double missMilliseconds = run.constants.at("miss_ms");
+  const double tokens =
+      run.constants.at("decode_tokens_per_second") * (run.samples.back().seconds - run.samples.front().seconds);
+  const double missesPerToken = double(run.samples.back().misses - run.samples.front().misses) / tokens;
+  const double spanGiB = double(kPinnedSlots - kFloorSlots) * double(kSlotBytes) / kGiB;
+  for (const auto &[pinnedPerToken, pinnedWorkMilliseconds] : kPinned) {
+    const double ghostShare = 1.0 - pinnedPerToken / missesPerToken;
+    FakeMemory memory({});
+    FakeElasticPool store("experts", memory, kSlotBytes, kFloorSlots, kPinnedSlots, kPinnedSlots, kFloorSlots,
+                          missMilliseconds, 0.0);
+    MemoryLedger ledger;
+    ledger.addPool(store);
+    ledger.observePools(run.samples.front().seconds, false);
+    // The ghost hits due and served so far; value_per_gib / H summed over
+    // the passes with commands, in seconds a GiB.
+    double due = 0.0, worth = 0.0;
+    uint64_t served = 0;
+    for (size_t index = 1; index < run.samples.size(); ++index) {
+      const RecordedRun::Sample &a = run.samples[index - 1], &b = run.samples[index];
+      const double span = b.seconds - a.seconds;
+      if (span <= 0.0)
+        continue;
+      const bool commands = b.commands != a.commands;
+      const int passes = std::max(1, static_cast<int>(std::lround(span / 0.5)));
+      for (int pass = 1; pass <= passes; ++pass) {
+        due += double(b.misses - a.misses) * ghostShare / passes;
+        const uint64_t ghosts = static_cast<uint64_t>(std::llround(due)) - served;
+        store.served(0, ghosts, 0, 0);
+        served += ghosts;
+        ledger.observePools(a.seconds + span * pass / passes, commands);
+        if (!commands)
+          continue;
+        MemoryGovernorSnapshot snapshot;
+        ledger.fill(snapshot, 0);
+        worth += snapshot.accounts.at(1).valuePerGiB / kValueHorizonSeconds * span / passes;
+      }
+    }
+    const double perToken = worth / tokens * 1000.0;
+    const double work = (kFloorWorkMilliseconds - pinnedWorkMilliseconds) / spanGiB;
+    const double priced = (missesPerToken - pinnedPerToken) * missMilliseconds / spanGiB;
+    require(perToken >= work && perToken <= priced,
+            "at 1.5.0's " + std::to_string(pinnedPerToken) + " misses a token value_per_gib replays to " +
+                std::to_string(perToken) + " ms a decode token a GiB, outside the host work " + std::to_string(work) +
+                " to the misses' price " + std::to_string(priced));
+  }
+}
+
 } // namespace
 
 std::span<const test::TestCase> valueTests() {
@@ -303,6 +379,7 @@ std::span<const test::TestCase> valueTests() {
       {"testSpillDecodeTermUsesTheEnginesMeanAndItsPrior", testSpillDecodeTermUsesTheEnginesMeanAndItsPrior},
       {"testGrowthPaysOnlyWhatARetakeCosts", testGrowthPaysOnlyWhatARetakeCosts},
       {"testRecordedLoadsDoNotFlipFlop", testRecordedLoadsDoNotFlipFlop},
+      {"testValuePerGiBReproducesThePinnedStore", testValuePerGiBReproducesThePinnedStore},
   };
   return kTests;
 }
