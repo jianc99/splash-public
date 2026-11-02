@@ -11,10 +11,13 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <functional>
 #include <limits>
 #include <memory>
 #include <optional>
+#include <string>
+#include <string_view>
 #include <tuple>
 #include <utility>
 
@@ -1955,6 +1958,56 @@ void testPlacementNeverSpillsWhenSpillTakesMore() {
           "a prompt whose Spill footprint is no smaller than its Resident one spilled");
 }
 
+// The penalty of spilling a decoding lane counts its decode commands' hot
+// block reads (DESIGN section 0 Q5, amend/M.md B8): the read time a decode
+// command of a lane with Index pages waits for, a decayed mean of the
+// samples, times its projected output's decode commands. A conversion the
+// host claim takes is priced at it, so twice the read time prices the
+// same lane's conversion at about twice as much.
+void testSpillDecodeTermIsMeasured() {
+  const auto conversionSeconds = [](double readMilliseconds) {
+    test::FakeMemory memory({});
+    metal::MetalBackend backend("");
+    // Memory for KV holds the short request's projection, not the long
+    // one's: the long one spills, the short one stays Resident.
+    std::optional<MemoryGovernor> governor = test::governorOver(backend, memory, {.limitBytes = 3'000});
+    Spilling spill(1024, false, 30 * 100, 0, {4}, 0, {}, &*governor);
+    test::seedAsStartup(spill.engine, spill.model);
+    spill.model.commandTimes = [&](const BatchPlan &plan, std::span<const ModelBatchItem>) {
+      test::CommandTimes times{.wallMilliseconds = 10.0};
+      if (plan.kind == WorkKind::Decode)
+        times.sample.spilledKvReadMilliseconds = readMilliseconds;
+      return times;
+    };
+    spill.engine.submit(Spilling::prompt(1, 1, 40, 100'000));
+    spill.runUntil([&] { return spill.events.outputs[1].size() >= 20 && spill.cache.holdsIndexPages(1); },
+                   "the Spill lane did not decode over Index pages");
+    spill.engine.submit(Spilling::prompt(2, 2, 9, 200));
+    spill.runUntil([&] { return spill.events.outputs[2].size() >= 20 && !spill.engine.commandInFlight(); },
+                   "the Resident lane did not decode");
+    require(spill.engine.snapshot().spill.spill == 1 && spill.engine.snapshot().spill.resident == 1,
+            "the fixture did not run one Spill and one Resident lane");
+    std::optional<double> cost;
+    governor->ledger().setDecisionLog([&](std::string_view line) {
+      if (line.find("engine conversion") == std::string_view::npos)
+        return;
+      const size_t at = line.find(" for ");
+      cost = std::stod(std::string(line.substr(at + 5)));
+    });
+    static_cast<void>(test::hostPass(*governor));
+    require(cost.has_value() && spill.engine.snapshot().spill.converted == 1,
+            "the host claim did not convert the Resident lane");
+    spill.engine.cancel(1);
+    spill.engine.cancel(2);
+    spill.runUntilIdle();
+    return *cost;
+  };
+  const double once = conversionSeconds(10.0);
+  const double twice = conversionSeconds(20.0);
+  require(once > 0.0 && std::abs(twice - 2.0 * once) <= 0.05 * once,
+          "the spill penalty did not price the decode commands' hot block reads");
+}
+
 } // namespace
 
 std::span<const test::TestCase> spillTests() {
@@ -1962,6 +2015,7 @@ std::span<const test::TestCase> spillTests() {
       {"testPlacementReadsLiveRoom", testPlacementReadsLiveRoom},
       {"testPlacementSpillsWhatTheLiveRoomCannotHold", testPlacementSpillsWhatTheLiveRoomCannotHold},
       {"testPlacementNeverSpillsWhenSpillTakesMore", testPlacementNeverSpillsWhenSpillTakesMore},
+      {"testSpillDecodeTermIsMeasured", testSpillDecodeTermIsMeasured},
       {"testUnwritableTierKeepsRequestsResident", testUnwritableTierKeepsRequestsResident},
       {"testAdmissionSpillsWhatMemoryCannotHold", testAdmissionSpillsWhatMemoryCannotHold},
       {"testSpillCommitmentCoversTheChainWithoutCopies", testSpillCommitmentCoversTheChainWithoutCopies},
