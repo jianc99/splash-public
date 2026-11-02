@@ -292,16 +292,16 @@ void testIdleReleaseRestoresTheSplitLast() {
 // A restore takes the weights' memory under the governor's admission as
 // memory the requests waiting need: the host's margins do not refuse it, and
 // critical pressure does. A refused restore keeps the parts that came back
-// and makes no progress; it tries again after the retry backoff, and every
-// request waits for memory, as their resource wait reports, for the resource
-// wait limit from its first refusal or the last part that came back,
-// whichever is later. Memory that comes back in time lets the restore go on.
-// Once the limit passes, the requests waiting fail retryably and the weights
-// give back the parts that came back, the split's program still released for
-// the next restore to load last; the engine stays up, and the next request
-// starts over, its wait counted afresh. A refused restore that no request
-// waits for any more takes no memory past the host's margins: it gives up at
-// once and counts no failure.
+// and makes no progress; the loop tries again after the retry backoff, and
+// every request waits for memory, as their resource wait reports, for the
+// resource wait limit from the first refusal after the last part that came
+// back. Memory that comes back in time lets the restore go on. Once the limit
+// passes, every request waiting fails retryably and the weights give back the
+// parts that came back, the split's program still released for the next
+// restore to load last; the engine stays up, and the next request starts
+// over, its wait counted afresh. A refused restore that no request waits for
+// any more takes no memory past the host's margins: it gives up at once and
+// counts no failure.
 void testRefusedRestoreWaitsForMemory() {
   constexpr double kIdleReleaseSeconds = 2.0;
   constexpr double kWaitLimit = 400.0;
@@ -333,8 +333,6 @@ void testRefusedRestoreWaitsForMemory() {
     static_cast<void>(control.run(pressure));
   };
   const auto errorOf = [&](uint64_t id) { return ::errorOf(fixture, id); };
-  // The refused restore's next try, after the retry backoff.
-  const auto backoff = [&] { fixture.monotonic += engine::kResourceRetryBackoffMilliseconds; };
   loop.announceReady();
 
   pass(MemoryPressure::Normal, 1000.0 * kIdleReleaseSeconds);
@@ -353,15 +351,12 @@ void testRefusedRestoreWaitsForMemory() {
   require(loop.millisecondsUntilNextWakeup() == engine::kResourceRetryBackoffMilliseconds &&
               loop.resourceWaitSnapshot().memory == 1,
           "the request behind a refused restore did not wait for memory");
-  // The last try before the limit.
-  constexpr double kLastTry = kWaitLimit - engine::kResourceRetryBackoffMilliseconds - 1.0;
-  fixture.monotonic += kLastTry;
+  fixture.monotonic += kWaitLimit - 1.0;
   require(!loop.tick() && weights.held() == 1 && !errorOf(1) && loop.engineHealthy() &&
-              loop.resourceWaitSnapshot().oldestWaitMilliseconds == kLastTry,
+              loop.resourceWaitSnapshot().oldestWaitMilliseconds == kWaitLimit - 1.0,
           "a refused restore gave up before the resource wait limit");
   hostAvailable = kHostMemory;
   pass(MemoryPressure::Normal);
-  backoff();
   runUntilIdle(loop);
   require(loop.statusSnapshot().completed == 1 && weights.restores == Weights::kImages &&
               programLoads == 1 && loop.weightsSnapshot().restores == 1,
@@ -410,7 +405,6 @@ void testRefusedRestoreWaitsForMemory() {
               loop.resourceWaitSnapshot().memory == 1,
           "the next request did not wait for memory afresh");
   pass(MemoryPressure::Normal);
-  backoff();
   runUntilIdle(loop);
   require(loop.statusSnapshot().completed == 2 && weights.restores == 2 * Weights::kImages + 2 &&
               programLoads == 2 && loop.weightsSnapshot().restores == 2,
@@ -679,11 +673,45 @@ void testRequestsWaitForTheWeightsEachOnItsOwnClock() {
               loop.resourceWaitSnapshot().oldestWaitMilliseconds == kWaitLimit / 2,
           "a request that came later failed at the first one's limit");
   refuse = false;
-  fixture.monotonic += engine::kResourceRetryBackoffMilliseconds;
   runUntilIdle(loop);
   require(loop.statusSnapshot().completed == 1 && !errorOf(fixture, 2) &&
               loop.weightsSnapshot().restores == 1 && loop.weightsSnapshot().restoreFailures == 0,
           "the request on its own clock did not get the weights once memory came back");
+}
+
+// A request waiting for the weights fails at its resource wait limit only
+// once the restore's attempt there is refused too: memory the host freed
+// since the last attempt, which nothing in the engine signals, lets the
+// restore go on, and the request runs.
+void testRestoreTriesAgainAtTheLimit() {
+  constexpr double kWaitLimit = 400.0;
+  bool refuse = false;
+  engine::NativeLoopConfig config;
+  config.engine.maxContext = 1024;
+  config.engine.resourceWaitTimeoutMilliseconds = kWaitLimit;
+  config.engine.weights = WeightResidencyConfig{.admit = refusing(refuse)};
+  LoopFixture fixture(config);
+  engine::NativeRuntime &loop = fixture.loop;
+  loop.announceReady();
+  require(!releaseAnswer(fixture, 1).restoring && fixture.weights.released(),
+          "the weights were not released");
+  refuse = true;
+  require(loop.receive(protocol::peer::serialize(request(1))) && !loop.tick() &&
+              loop.resourceWaitSnapshot().memory == 1,
+          "the request did not wait for memory");
+  // The last attempt before the limit is refused; the host frees memory
+  // after it.
+  fixture.monotonic += kWaitLimit - 50.0;
+  require(!loop.tick() && !errorOf(fixture, 1) && fixture.weights.held() == 0,
+          "a refused restore gave up before the resource wait limit");
+  refuse = false;
+  fixture.monotonic += 50.0;
+  require(loop.tick() && !errorOf(fixture, 1) && fixture.weights.held() == 1,
+          "a request failed at its limit before the restore tried the memory that came back");
+  runUntilIdle(loop);
+  require(loop.statusSnapshot().completed == 1 && loop.weightsSnapshot().restores == 1 &&
+              loop.weightsSnapshot().restoreFailures == 0,
+          "the request did not get the weights that came back at its limit");
 }
 
 // The expert store's chunks above its floor are the model's (Executor::
@@ -806,6 +834,7 @@ std::span<const test::TestCase> weightsTests() {
       {"testDeadlineEndsARequestWaitingForTheWeights", testDeadlineEndsARequestWaitingForTheWeights},
       {"testTransfersLandWhileTheWeightsAreRestored", testTransfersLandWhileTheWeightsAreRestored},
       {"testRequestsWaitForTheWeightsEachOnItsOwnClock", testRequestsWaitForTheWeightsEachOnItsOwnClock},
+      {"testRestoreTriesAgainAtTheLimit", testRestoreTriesAgainAtTheLimit},
       {"testRestoredStoreGrowsBackAfterTheRequest", testRestoredStoreGrowsBackAfterTheRequest},
       {"testRestoreTakesTheFloorWhateverTheHostSpares", testRestoreTakesTheFloorWhateverTheHostSpares},
   };

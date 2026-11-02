@@ -261,19 +261,20 @@ staging in one part, which fits as the images do, since they were live when it
 was released. Its elastic chunks stay released, and the control pass takes them
 back as it does any chunk given back. A refused image, or one the driver or its
 writer cannot allocate, stays released, and the images before it stay. The
-requests wait for memory as a start refused memory does, each on its own clock:
-retried every 0.1 s, counted in `admission.waiting_memory`, and failed with
-`resource_timeout` once the 30 s resource wait has passed since its first
-refusal or the last image that came back, whichever is later; the log says
-`Weights wait for memory to be restored`. Once no request waits, the restore
-goes on while memory admits it without the waiting requests' mark, and a refused
-image ends it: the images it wrote back are released, and
-`weights.restore_failures` counts it if a request waiting for it failed for want
-of memory. Either way the next request starts over from the first image. Any
-other failure (a read error, a source written in place) stops the engine, which
-the server starts again. With the [Neural Engine split](#neural-engine-prefill),
-the release unloads its program after the images, and the restore loads it again
-in one tick more, after the last image (`ReleasableMemory`).
+requests wait for memory as a start refused memory does, each on its own clock,
+counted in `admission.waiting_memory`: the image is tried again at every tick,
+at least every 0.1 s, and a request fails with `resource_timeout` once the try
+at or past the 30 s resource wait since its first refusal or the last image that
+came back, whichever is later, is refused too; the log says `Weights wait for
+memory to be restored`. Once no request waits, the restore goes on while memory
+admits it without the waiting requests' mark, and a refused image ends it: the
+images it wrote back are released, and `weights.restore_failures` counts it if a
+request waiting for it failed for want of memory. Either way the next request
+starts over from the first image. Any other failure (a read error, a source
+written in place) stops the engine, which the server starts again. With the
+[Neural Engine split](#neural-engine-prefill), the release unloads its program
+after the images, and the restore loads it again in one tick more, after the
+last image (`ReleasableMemory`).
 
 ### Explicit weights release
 

@@ -266,13 +266,14 @@ public:
   // While the weights are released or being restored (weightsHeld), a tick
   // runs its timed checks, collects transfers and runs write-behind, then
   // takes back one part of the weights while a request waits, under the
-  // admission of memory a request in service needs (Serving), as an
-  // admission retry: once its requests' retries are due. A part that comes
-  // back restarts their resource wait limit; a refused one makes them wait
-  // for memory (resourceWaitSnapshot), each failing at its own limit as a
-  // start refused memory does. Once no request waits, the restore goes on
-  // while memory admits it without the mark, and a refused part ends it: the
-  // weights give back what came back. No request runs until they are back.
+  // admission of memory a request in service needs (Serving). A part that
+  // comes back restarts their resource wait limit; a refused one makes them
+  // wait for memory (resourceWaitSnapshot), retried at every tick, which the
+  // loop runs for their retries and limits; each fails once the attempt at
+  // or past its own limit is refused. Once no request waits, the restore goes
+  // on while memory admits it without the mark, and a refused part ends it:
+  // the weights give back what came back. No request runs until they are
+  // back.
   [[nodiscard]] bool tick(double nowMilliseconds);
   [[nodiscard]] bool commandInFlight() const noexcept {
     return pending_.has_value();

@@ -219,15 +219,14 @@ bool Engine::tick(double now) {
     if (scheduler_.submissionOrder(id) > earliestWorking ||
         (admittedBefore && earliestWorkingAdmission <= *admittedBefore))
       active.resourceWait.earlierLaneWorkMilliseconds = now;
+    // A request waiting for the weights fails at its limit only once the
+    // restore's attempt there is refused too (advanceWeights).
     const double deadline = resourceDeadline(active);
-    if (!active.finalized && deadline > 0.0 && now >= deadline) {
+    if (!active.finalized && weightsHeld() && deadline > 0.0 && now >= deadline) {
       settle(active, {LaneOutcome::ResourceTimeout,
                       active.resourceWait.diskQuota
                           ? std::string(kDiskQuotaTimeoutMessage)
                           : resourceTimeoutMessage(active.resourceWait.allocationFailure)});
-      // Every request waits for the weights while they are not held.
-      if (!weightsHeld())
-        weights_->waiterFailed();
       progressed = true;
     }
   }
@@ -1924,11 +1923,8 @@ bool Engine::advanceWeights(double now) {
       waiting.push_back(&active);
   if (waiting.empty() && !weights_->restoring())
     return false;
-  // As admission retries: once a refused part's backoff has passed, or memory
-  // came back since (signalResourceProgress).
-  if (!waiting.empty() &&
-      std::ranges::none_of(waiting, [&](const Request *waiter) { return resourceRetryReady(*waiter, now); }))
-    return false;
+  // Every tick tries: memory the host frees comes back without a signal, and
+  // the loop wakes for the requests' retries and limits.
   const WeightResidency::Step step = [&] {
     // Memory the requests waiting need: the host's margins do not hold it
     // back, critical pressure and the engine's limit refuse it. Without a
@@ -1950,15 +1946,23 @@ bool Engine::advanceWeights(double now) {
   case WeightResidency::Step::Kind::Refused:
     break;
   }
-  if (waiting.empty()) {
-    weights_->abandon();
-    return true;
-  }
+  // Each waiting request waits for memory on its own clock, and fails once
+  // this attempt at or past its limit was refused.
+  bool failed = false;
   for (Request *waiter : waiting) {
     deferResourceRetry(*waiter, now, {.allocationFailure = step.failure});
     scheduler_.waitForResources(waiter->request.id);
+    const double deadline = resourceDeadline(*waiter);
+    if (deadline > 0.0 && now >= deadline) {
+      settle(*waiter, {LaneOutcome::ResourceTimeout, resourceTimeoutMessage(step.failure)});
+      weights_->waiterFailed();
+      failed = true;
+    }
   }
-  return false;
+  if (std::ranges::any_of(waiting, [](const Request *waiter) { return !waiter->finalized; }))
+    return failed;
+  weights_->abandon();
+  return true;
 }
 
 Engine::Request &Engine::request(uint64_t id) {
