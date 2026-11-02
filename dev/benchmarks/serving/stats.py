@@ -6,8 +6,9 @@ that metric between runs of one tree in one order (sigma, from recorded
 same-tree pairs), so the difference of the two means has a one-sided 90 %
 interval of half-width t(0.9, df) * sigma * sqrt(1/n_cand + 1/n_ref). Orders
 are compared within themselves and pooled as the mean of their differences.
-A tolerance turns the interval into a verdict; noise only decides how many
-runs resolve it, never the tolerance.
+A tolerance turns the interval into a PASS, and equality (or the loss a
+gate allows) into a FAIL; noise only decides how many runs resolve it, never
+the tolerance.
 """
 
 from __future__ import annotations
@@ -119,18 +120,25 @@ def interval(by_order: dict, sigma: float, df: int) -> dict:
     return {"orders": orders, "pooled": pooled, "sigma": sigma, "df": df, "t": t}
 
 
-def verdict(estimate: dict | None, higher_is_better: bool, tolerance: float) -> str:
-    """PASS when the bound on the good side clears the tolerance, FAIL when
-    the bound on the bad side is past it, else INCONCLUSIVE."""
+def verdict(
+    estimate: dict | None,
+    higher_is_better: bool,
+    tolerance: float,
+    fail_tolerance: float = 0.0,
+) -> str:
+    """PASS when the bound on the good side clears the tolerance, else FAIL
+    when the bound on the bad side is past fail_tolerance (equality unless a
+    gate allows a loss, DESIGN-1.6.0 §8.3, amend/V.md §5), else
+    INCONCLUSIVE."""
     if estimate is None:
         return INCONCLUSIVE
     low = estimate["log_ratio"] - estimate["half_width"]
     high = estimate["log_ratio"] + estimate["half_width"]
     if higher_is_better:
-        limit = math.log(1 - tolerance)
-        return PASS if low >= limit else FAIL if high < limit else INCONCLUSIVE
-    limit = math.log(1 + tolerance)
-    return PASS if high <= limit else FAIL if low > limit else INCONCLUSIVE
+        passing, failing = math.log(1 - tolerance), math.log(1 - fail_tolerance)
+        return PASS if low >= passing else FAIL if high < failing else INCONCLUSIVE
+    passing, failing = math.log(1 + tolerance), math.log(1 + fail_tolerance)
+    return PASS if high <= passing else FAIL if low > failing else INCONCLUSIVE
 
 
 def clearly_better(estimate: dict | None, higher_is_better: bool) -> bool:

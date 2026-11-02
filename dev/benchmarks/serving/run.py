@@ -20,7 +20,8 @@ SIGINT; and writes beside the client's records:
 - LABEL.meta.json: tree, binary, build id, model, scenario, spawn-to-ready
   seconds and whether the binary had started on this machine before (a first
   start compiles Metal), host memory and pressure at start, ps snapshots at
-  start, middle and end, and on the M5 Pro the idle and sleep-assertion samples
+  the start, middle and end of the scenario while the server serves, the pids
+  this run started, and on the M5 Pro the idle and sleep-assertion samples
   (LABEL.idle.jsonl) that void a run the laptop's owner used;
 - LABEL.server.log (one per server: LABEL-nN for each concurrency of ttft).
 
@@ -559,7 +560,6 @@ def main(argv=None) -> int:
         note(
             f"root {root} tree {tree} binary {meta['binary_sha256'][:12]} build {meta['build_id']}"
         )
-        snapshots.append(ps_snapshot(ours))
         if args.machine == "m5":
 
             def sample_idle():
@@ -590,6 +590,10 @@ def main(argv=None) -> int:
                     f"{part} ready=yes spawn_to_ready_s={ready} pid={checks['pid']} build_id=ok"
                 )
                 parts.append({"label": part, "spawn_to_ready_s": ready, **checks})
+                # The snapshots are taken while the server serves, so that
+                # its processes are among this run's.
+                if index == 0:
+                    snapshots.append(ps_snapshot(ours))
                 if args.scenario == "churn":
                     middle = threading.Timer(
                         args.minutes * 30, lambda: snapshots.append(ps_snapshot(ours))
@@ -616,7 +620,7 @@ def main(argv=None) -> int:
                         args.port, str(out), part, level, rounds=args.rounds
                     )
                     note(f"{part} summary {json.dumps(summary)}")
-                    if index == len(levels) // 2:
+                    if 0 < index < len(levels) - 1 and index == len(levels) // 2:
                         snapshots.append(ps_snapshot(ours))
                 elif args.scenario == "serve1":
                     clients.run_serve1(
@@ -626,11 +630,11 @@ def main(argv=None) -> int:
                         samples=args.samples,
                         sizes=args.size_list,
                     )
-                    snapshots.append(ps_snapshot(ours))
                 else:
                     clients.run_warm(
                         args.port, str(out), part, args.size_list, args.trial
                     )
+                if index == len(levels) - 1:
                     snapshots.append(ps_snapshot(ours))
             finally:
                 note(f"{part} {server.stop()}")
@@ -638,7 +642,6 @@ def main(argv=None) -> int:
         meta["first_start_spawn_to_ready_s"] = (
             parts[0]["spawn_to_ready_s"] if parts else None
         )
-        snapshots.append(ps_snapshot(ours))
         note(f"done {args.label}")
         meta["ended"] = time.time()
         meta["complete"] = True
@@ -651,6 +654,7 @@ def main(argv=None) -> int:
     finally:
         stop_idle.set()
         meta["ps"] = snapshots
+        meta["pids"] = sorted(ours)
         meta["host_at_end"] = host_memory()
         if idle:
             with (out / f"{args.label}.idle.jsonl").open("w") as samples:

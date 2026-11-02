@@ -221,19 +221,37 @@ class IntervalRuleTests(unittest.TestCase):
         def estimate(ratio, half):
             return {"log_ratio": math.log(ratio), "half_width": half}
 
-        # Throughput: the lower bound must clear -2 %; FAIL once the upper is below it.
+        # DESIGN §8.3: throughput PASSes when the lower bound clears -2 %
+        # and FAILs once the upper bound is below 1.00; between them it is
+        # INCONCLUSIVE.
         self.assertEqual(stats.verdict(estimate(1.00, 0.01), True, 0.02), stats.PASS)
-        self.assertEqual(stats.verdict(estimate(0.95, 0.01), True, 0.02), stats.FAIL)
+        self.assertEqual(stats.verdict(estimate(0.99, 0.005), True, 0.02), stats.PASS)
+        self.assertEqual(stats.verdict(estimate(0.985, 0.01), True, 0.02), stats.FAIL)
         self.assertEqual(
             stats.verdict(estimate(0.99, 0.03), True, 0.02), stats.INCONCLUSIVE
         )
-        # Latency: the upper bound at most +2 %.
+        # Latency and TTFT: PASS with the upper bound at most +2 %, FAIL once
+        # the lower is past 1.00, as G3 at 1.04 [1.01, 1.07].
         self.assertEqual(stats.verdict(estimate(1.00, 0.015), False, 0.02), stats.PASS)
-        self.assertEqual(stats.verdict(estimate(1.05, 0.01), False, 0.02), stats.FAIL)
+        self.assertEqual(stats.verdict(estimate(1.01, 0.005), False, 0.02), stats.PASS)
+        self.assertEqual(stats.verdict(estimate(1.04, 0.03), False, 0.02), stats.FAIL)
+        self.assertEqual(
+            stats.verdict(estimate(1.01, 0.03), False, 0.02), stats.INCONCLUSIVE
+        )
         self.assertEqual(stats.verdict(None, False, 0.02), stats.INCONCLUSIVE)
         # A tolerance of zero: equal runs cannot pass.
         self.assertEqual(
             stats.verdict(estimate(1.0, 0.02), True, 0.0), stats.INCONCLUSIVE
+        )
+        # The owner's trade (20:30): with a gain, more than 5 % fails.
+        self.assertEqual(
+            stats.verdict(estimate(0.97, 0.01), True, 0.05, 0.05), stats.PASS
+        )
+        self.assertEqual(
+            stats.verdict(estimate(0.95, 0.02), True, 0.05, 0.05), stats.INCONCLUSIVE
+        )
+        self.assertEqual(
+            stats.verdict(estimate(0.93, 0.01), True, 0.05, 0.05), stats.FAIL
         )
         self.assertTrue(stats.clearly_better(estimate(0.9, 0.05), False))
         self.assertFalse(stats.clearly_better(estimate(0.98, 0.05), False))
@@ -333,6 +351,193 @@ class GateTests(unittest.TestCase):
             churn_run(self.directory, "owed", smooth, owed), self.machine, self.gates
         )["failures"]
         self.assertTrue(any("owed" in f for f in failures), failures)
+
+    def test_a_restart_fails_g8_even_in_a_run_not_used(self):
+        # The engine crashed once under churn and its supervision relaunched
+        # it at once, resuming the requests: none failed, but
+        # transport.restarts moved.
+        done = [
+            {"tag": f"w{w}-r1", "start": 0, "t": 100, "ttft": 5, "decode_tps": 30}
+            for w in range(3)
+        ]
+        restarted = [
+            status(0),
+            status(450, transport__restarts=1),
+            status(960, transport__restarts=1),
+        ]
+        churn_run(self.directory, "restarted", done, restarted)
+        problems = matrix.check_run(
+            self.directory, "restarted", 15, self.machine, self.gates
+        )
+        self.assertIn("G8: the engine restarted (transport.restarts 0 -> 1)", problems)
+        # analyze: the run is not used, and still fails G8; a run left out
+        # only for its surroundings is just listed.
+        cell = {"name": "c", "machine": "m6", "model": "fn-q2", "scenario": "churn"}
+        hot = [status(0), status(960, thermal_state="serious")]
+        churn_run(self.directory, "hot", done, hot)
+        runs = [
+            matrix.Run(self.directory, label, "c", "cand", "A")
+            for label in ("restarted", "hot")
+        ]
+        for run_ in runs:
+            matrix.validate(run_, self.spec, cell)
+            self.assertTrue(run_.invalid, run_.label)
+        verdicts = matrix.churn_cell(cell, self.spec, runs, {}, PRICES)
+        self.assertEqual(
+            [(v["rule"], v["verdict"]) for v in verdicts],
+            [("G4 G8 G9 restarted", stats.FAIL)],
+        )
+
+    def test_work_is_read_at_the_end_of_the_cells_load_window(self):
+        # mini-35b-churn runs 10 minutes. pass's recorded series stopped at
+        # 604.94 s; cand's run.py series runs on through the drain, where it
+        # keeps counting output. cand did 10 % less work in the window.
+        spec = self.spec
+        cell = next(c for c in spec["cells"] if c["name"] == "mini-35b-churn")
+        self.assertEqual(matrix.work_second(cell), 600)
+        done = [
+            {"tag": f"w{w}-r1", "start": 0, "t": 100, "ttft": 5, "decode_tps": 30}
+            for w in range(3)
+        ]
+        churn_run(
+            self.directory,
+            "mini35PSa",
+            done,
+            [
+                status(0),
+                status(600.5, rows=585 * 1000, disk__read_bytes=1000),
+                status(604.94, rows=585 * 1003, disk__read_bytes=1003),
+            ],
+        )
+        label = "mini-35b-churn-cand-A1"
+        churn_run(
+            self.directory,
+            label,
+            done,
+            [
+                status(0),
+                status(599, rows=585 * 900, disk__read_bytes=900),
+                status(900, rows=585 * 1350, disk__read_bytes=1350),
+                status(1020, rows=585 * 1500, disk__read_bytes=1500),
+            ],
+        )
+        (self.directory / f"{label}.meta.json").write_text(
+            json.dumps(
+                {
+                    "label": label,
+                    "cell": "mini-35b-churn",
+                    "tree_name": "cand",
+                    "order": [2, 0, 1],
+                }
+            )
+        )
+        runs = [
+            r
+            for r in matrix.load_runs(spec, [self.directory])
+            if r.cell == cell["name"]
+        ]
+        self.assertEqual(sorted(r.tree for r in runs), ["cand", "pass"])
+        work = next(
+            v
+            for v in matrix.point_gate(cell, runs, PRICES, self.gates, True)
+            if v["rule"] == "G10 work vs pass"
+        )
+        self.assertEqual((work["verdict"], work["numbers"]["point"]), (stats.FAIL, 0.9))
+        candidate = next(r for r in runs if r.tree == "cand")
+        self.assertEqual(matrix.ssd_counters(candidate, 900)["disk_read_per_work"], 1.0)
+
+    def test_prefill_hole_and_ssd_busy_shares(self):
+        # Borrowed item 8: host steps 100 + 700 + 200 ms of 10 s of prefill
+        # wall; 40 GB read at the seeded 8 GB/s is 5 s of it.
+        steps = {
+            f"{part}_ms": {"total": total}
+            for part, total in (("pickup", 100), ("work", 700), ("resume", 200))
+        }
+        streamed = status(
+            900,
+            streamed_experts__prefill={"read_bytes": 40e9, "host_steps": steps},
+            metrics__prefill_wall_ms=10000,
+            scheduler__estimate__prefill={
+                "terms": [
+                    {"quantity": "units", "seed_ms_per_unit": 25},
+                    {"quantity": "weight_read_bytes", "seed_ms_per_unit": 1 / 8e6},
+                ]
+            },
+        )
+        readouts = matrix.health(
+            churn_run(self.directory, "shares", [], [status(0), streamed]),
+            self.machine,
+            self.gates,
+        )["readouts"]
+        self.assertAlmostEqual(readouts["prefill_hole_share"], 0.1)
+        self.assertAlmostEqual(readouts["ssd_busy_share"], 0.5)
+        resident = matrix.health(
+            churn_run(self.directory, "resident", [], [status(0), status(900)]),
+            self.machine,
+            self.gates,
+        )["readouts"]
+        self.assertEqual(
+            (resident["prefill_hole_share"], resident["ssd_busy_share"]), (None, None)
+        )
+
+    def test_a_process_this_run_did_not_start_voids_it(self):
+        # base.md §2.7 with the gates' floor: the run.py smoke's start, with
+        # mediaanalysisd at 117.8 % and nothing of the run's in the top five,
+        # is void; WindowServer's and sysmond's steady 10-12 % are not.
+        cell = {"name": "c", "machine": "m5", "model": "fn-q2", "scenario": "serve1"}
+        model = self.spec["models"]["fn-q2"]["model"]
+
+        def validated(label, rows, holders=()):
+            write_jsonl(
+                self.directory / f"{label}.idle.jsonl",
+                [{"hid_idle_s": 300.0, "holders": list(holders)}],
+            )
+            (self.directory / f"{label}.out").write_text("DONE\n")
+            (self.directory / f"{label}.meta.json").write_text(
+                json.dumps(
+                    {
+                        "complete": True,
+                        "model": model,
+                        "pids": [700, 701],
+                        "ps": [{"rows": rows}],
+                    }
+                )
+            )
+            run_ = matrix.Run(self.directory, label)
+            matrix.validate(run_, self.spec, cell)
+            return run_.invalid
+
+        busy = [
+            [55828, 117.8, 0.5, "mediaanalysisd", False],
+            [68643, 11.2, 1.0, ".venv/bin/python", False],
+            [145, 9.8, 0.1, "WindowServer", False],
+            [70493, 3.0, 0.1, ".venv/bin/python", False],
+            [1162, 2.9, 0.0, "WallpaperAerialsExtension", False],
+        ]
+        self.assertEqual(
+            validated("busy", busy),
+            [
+                "a process this run did not start in the top five by CPU: "
+                "mediaanalysisd at 117.8 %"
+            ],
+        )
+        quiet = [
+            [145, 11.9, 0.1, "WindowServer", False],
+            [322, 10.6, 0.0, "sysmond", False],
+            [700, 8.0, 4.4, "build/splash", True],
+            [701, 3.0, 0.1, ".venv/bin/python", True],
+            [57229, 7.1, 0.1, "Activity Monitor", False],
+        ]
+        self.assertEqual(validated("quiet", quiet), [])
+        # A sleep assertion counts by pid: this run's engine may hold one,
+        # another python may not.
+        ours = "pid 700(splash): [0x0001] 00:05:00 PreventUserIdleSystemSleep named: x"
+        theirs = "pid 4242(python3.12): [0x0002] 00:05:00 PreventUserIdleSystemSleep named: y"
+        self.assertEqual(validated("held", quiet, [ours]), [])
+        self.assertEqual(
+            validated("other", quiet, [ours, theirs]),
+            [f"another process held a sleep assertion: {theirs}"],
+        )
 
     def test_an_unreported_bound_or_ledger_is_not_judged(self):
         # Schema 7 renders the scheduler's target 0 and the ledger empty until
@@ -446,6 +651,7 @@ class GateTests(unittest.TestCase):
                     for i, w in enumerate(worsts)
                 ],
             )
+            (self.directory / f"{label}.out").write_text("DONE\n")
 
         # pass's N=2 rounds (amend/V.md §0.4): median 4622 ms, spread 4622/4399 - 1.
         ttft_run("ref", [6976, 4622, 4399])
@@ -456,16 +662,67 @@ class GateTests(unittest.TestCase):
             "recorded": {"pass": ["ref"], "cand": ["fast"]},
         }
         ttft_run("fast", [4700, 4800, 9000])
-        verdicts, _ = matrix.ttft_cell(cell, [self.directory])
+        verdicts, _, unused = matrix.ttft_cell(cell, self.spec, [self.directory])
         self.assertEqual(verdicts[0]["verdict"], stats.PASS, verdicts)
+        self.assertEqual(unused, [])
         self.assertAlmostEqual(
             verdicts[0]["numbers"]["limit_ms"], 4622 * 4622 / 4399, places=0
         )
         ttft_run("slow", [5000, 5100, 5200])
         cell["recorded"]["cand"] = ["slow"]
         self.assertEqual(
-            matrix.ttft_cell(cell, [self.directory])[0][0]["verdict"], stats.FAIL
+            matrix.ttft_cell(cell, self.spec, [self.directory])[0][0]["verdict"],
+            stats.FAIL,
         )
+
+    def test_a_ttft_level_counts_only_with_every_round_complete(self):
+        # m6-fn-ttft: cand's N=2 server failed two of its three rounds; the
+        # one left is no G5 median. A run without DONE is not used at all.
+        cell = {
+            "name": "t",
+            "machine": "m6",
+            "model": "fn-q2",
+            "scenario": "ttft",
+            "reference": "pass",
+            "gate_n": [2],
+            "recorded": {"pass": ["ref"]},
+            "runs": {"cand": {"-": 1}},
+        }
+
+        def level(label, n, rounds, done=True):
+            write_jsonl(
+                self.directory / f"{label}-n{n}.events.jsonl",
+                [{"kind": "start", "n": n, "rounds": 3}]
+                + [
+                    {
+                        "kind": "round",
+                        "n": n,
+                        "round": r,
+                        "ttft_ms": [4000, 4500],
+                        "cached": [7968, 7968],
+                    }
+                    if r in rounds
+                    else {"kind": "round_failed", "n": n, "round": r, "failures": ["x"]}
+                    for r in range(3)
+                ],
+            )
+            (self.directory / f"{label}.out").write_text("DONE\n" if done else "")
+
+        level("ref", 2, {0, 1, 2})
+        level("t-cand-1", 2, {1})
+        verdicts, _, unused = matrix.ttft_cell(cell, self.spec, [self.directory])
+        self.assertEqual(verdicts[0]["verdict"], stats.INCONCLUSIVE, verdicts)
+        self.assertEqual(
+            [(u["label"], u["reasons"]) for u in unused],
+            [("t-cand-1", ["N=2: 1 of 3 rounds completed their 2 requests"])],
+        )
+        level("t-cand-1", 2, {0, 1, 2}, done=False)
+        verdicts, _, unused = matrix.ttft_cell(cell, self.spec, [self.directory])
+        self.assertEqual(verdicts[0]["verdict"], stats.INCONCLUSIVE, verdicts)
+        self.assertEqual(unused[0]["reasons"], ["the run did not end with DONE"])
+        level("t-cand-1", 2, {0, 1, 2})
+        verdicts, _, unused = matrix.ttft_cell(cell, self.spec, [self.directory])
+        self.assertEqual((verdicts[0]["verdict"], unused), (stats.PASS, []))
 
     def test_trade_rule_needs_a_gain_on_the_other_side(self):
         # cand trails r150 by 3 % in work: without a gain it cannot pass; with
@@ -520,6 +777,66 @@ class GateTests(unittest.TestCase):
         self.assertEqual(g1["verdict"], stats.PASS, g1)
         self.assertTrue(g1["trade"])
 
+    def test_the_freeze_gain_is_measured_on_the_trailed_reference(self):
+        # p-fn-churn-18g on the M5: cand trails r150 by 4 % in work with the
+        # same TTFT and latency and holds G4. That is a gain only where r150's
+        # own runs froze (a decode gap at or past the M5's 8.6 s floor), and
+        # completion latency never takes the trade tolerance.
+        def make(label, tree, order, work, gap_ms=None):
+            done = [
+                {
+                    "tag": f"w{w}-r1",
+                    "start": 0,
+                    "t": 200,
+                    "ttft": 100,
+                    "decode_tps": 30,
+                    "chunks_ms": [0, 100, 200],
+                }
+                for w in range(3)
+            ]
+            fields = (
+                {}
+                if gap_ms is None
+                else {"kv_spill__history_stream__decode_gap_ms": {"max": gap_ms}}
+            )
+            r = churn_run(
+                self.directory,
+                label,
+                done,
+                [status(900, rows=int(work * 1000), **fields)],
+            )
+            r.tree, r.order = tree, order
+            return r
+
+        cell = {
+            "name": "p",
+            "machine": "m5",
+            "release": {"throughput": "r150"},
+            "health": ["cand"],
+        }
+        prices = {"R": 1000, "D": 75}
+        cand = [make(f"c{o}{i}", "cand", o, 960 + i) for o in "AB" for i in range(2)]
+
+        def verdicts(gap_ms):
+            refs = [
+                make(f"r{o}{i}", "r150", o, 1000 + i, gap_ms)
+                for o in "AB"
+                for i in range(2)
+            ]
+            found = matrix.churn_cell(cell, self.spec, refs + cand, {}, prices)
+            return {
+                v["rule"].split(" cand")[0]: v for v in found if " vs " in v["rule"]
+            }
+
+        smooth = verdicts(4600)
+        self.assertNotEqual(smooth["G1"]["verdict"], stats.PASS, smooth["G1"])
+        self.assertFalse(smooth["G1"]["numbers"]["freeze"]["reference_froze"])
+        froze = verdicts(424800)
+        self.assertEqual(froze["G1"]["verdict"], stats.PASS, froze["G1"])
+        self.assertTrue(froze["G1"]["trade"])
+        self.assertEqual(froze["G1"]["numbers"]["freeze"]["reference_gap_s"], 424.8)
+        self.assertEqual(froze["G2"]["numbers"]["tolerance"], 0.0)
+
     def test_check_finds_a_silent_worker_and_a_short_run(self):
         done = [
             {"tag": f"w{w}-r1", "start": 0, "t": 100, "ttft": 5, "decode_tps": 30}
@@ -547,7 +864,13 @@ class GateTests(unittest.TestCase):
         self.assertTrue(late[0].startswith("21-m6-fn-churn-cand-B1.sh"), late)
 
     def test_abba_cell_compares_rounds_in_session(self):
-        cell = {"name": "s1", "machine": "m6", "abba": {"reference": "pass", "sets": 1}}
+        cell = {
+            "name": "s1",
+            "machine": "m5",
+            "model": "fn-iq3s",
+            "scenario": "serve1",
+            "abba": {"reference": "pass", "sets": 1},
+        }
         for (tree, _, repeat), ttft in zip(
             matrix.abba_runs(cell), (1000, 1010, 1005, 1002)
         ):
@@ -564,12 +887,29 @@ class GateTests(unittest.TestCase):
                     for s in range(3)
                 ],
             )
-        verdicts = matrix.abba_cell(cell, self.spec, [self.directory])
+            (self.directory / f"s1-{tree}-{repeat}.out").write_text("DONE\n")
+        verdicts, unused = matrix.abba_cell(cell, self.spec, [self.directory])
         self.assertEqual(
             {v["rule"] for v in verdicts},
             {"G7 serve1_300_ttft_ms set 1", "G7 serve1_300_decode_ms_per_token set 1"},
         )
         self.assertTrue(all(v["verdict"] == stats.PASS for v in verdicts), verdicts)
+        self.assertEqual(unused, [])
+        # p-serve1 on the owner's laptop: typing during a cand run voids it,
+        # and its set is not judged.
+        write_jsonl(
+            self.directory / "s1-cand-2.idle.jsonl",
+            [{"hid_idle_s": 300.0, "holders": []}, {"hid_idle_s": 2.5, "holders": []}],
+        )
+        verdicts, unused = matrix.abba_cell(cell, self.spec, [self.directory])
+        self.assertEqual(
+            [(v["rule"], v["verdict"]) for v in verdicts],
+            [("G7 set 1", stats.INCONCLUSIVE)],
+        )
+        self.assertEqual(
+            [(u["label"], u["reasons"]) for u in unused],
+            [("s1-cand-2", ["the laptop was in use (HIDIdleTime 2.5 s)"])],
+        )
 
 
 class PlanTests(unittest.TestCase):
@@ -770,6 +1110,77 @@ class RunTests(unittest.TestCase):
                 run.refuse_protected(root / "elsewhere"),
                 Path(os.path.realpath(root / "elsewhere")),
             )
+
+    def test_snapshots_are_taken_while_the_server_serves(self):
+        # The process snapshots that void a run see its server and engine
+        # among the run's own: none before it is ready or after it stopped.
+        events = []
+
+        class FakeServer:
+            def __init__(self, tree, root, model, port, server_args, log):
+                self.process = mock.Mock(pid=4242)
+
+            def wait_ready(self):
+                events.append("ready")
+                return 1.0
+
+            def engine_pids(self):
+                return {4242, 4243}
+
+            def stop(self):
+                events.append("stop")
+                return "stopped by SIGINT, exit 0"
+
+        def snapshot(ours):
+            events.append(frozenset(ours))
+            return {"at": 0.0, "rows": [], "therm": ""}
+
+        with tempfile.TemporaryDirectory() as directory:
+            tree = Path(directory)
+            (tree / "build").mkdir()
+            (tree / "build" / "splash").write_bytes(b"splash")
+            with (
+                mock.patch.multiple(
+                    run,
+                    Server=FakeServer,
+                    ps_snapshot=snapshot,
+                    port_answers=lambda port: False,
+                    tree_build_id=lambda tree: "src-1",
+                    host_memory=lambda: {},
+                    check_identity=lambda port, server, build_id: {
+                        "pid": 4242,
+                        "build_id": build_id,
+                        "thermal_state": "nominal",
+                    },
+                ),
+                mock.patch.object(run.clients, "run_serve1"),
+            ):
+                code = run.main(
+                    [
+                        "--tree",
+                        directory,
+                        "--machine",
+                        "studio",
+                        "--model",
+                        "m",
+                        "--model-root",
+                        directory,
+                        "--scenario",
+                        "serve1",
+                        "--label",
+                        "s",
+                        "--out",
+                        f"{directory}/out",
+                    ]
+                )
+            meta = json.loads((tree / "out" / "s.meta.json").read_text())
+        self.assertEqual(code, 0)
+        self.assertEqual(events[0], "ready")
+        self.assertEqual(events[-1], "stop")
+        snapshots = events[1:-1]
+        self.assertEqual(len(snapshots), 2)
+        self.assertTrue(all({4242, 4243} <= ours for ours in snapshots), snapshots)
+        self.assertTrue({4242, 4243} <= set(meta["pids"]))
 
     def test_gpu_utilization_reads_ioreg(self):
         line = (

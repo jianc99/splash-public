@@ -367,8 +367,9 @@ scenario; and stops the server with SIGINT, then SIGTERM. Beside the client's
 `LABEL.events.jsonl` and `LABEL.status.jsonl` it writes `LABEL.out`, whose last
 line is `DONE` only once everything completed, `LABEL.meta.json` (binary
 SHA-256, build id, model, spawn-to-ready seconds and whether the binary had
-started on that Mac before, host memory and pressure, and process snapshots at
-the start, middle and end) and on the M5 Pro `LABEL.idle.jsonl`, its idle time
+started on that Mac before, host memory and pressure, process snapshots at
+the start, middle and end of the scenario while the server serves, and the
+pids the run started) and on the M5 Pro `LABEL.idle.jsonl`, its idle time
 and sleep assertions every 10 s. It refuses any output directory that resolves,
 through whatever symlinks, into `~/.cache/huggingface` or an `install/models`
 directory.
@@ -391,38 +392,51 @@ runs per tree and order, recorded reference runs, gates).
   INCONCLUSIVE with the numbers, the trades for the owner, and every run it
   did not use and why.
 
-A run counts only if it ended with `DONE`, its server never restarted, it
-saw no HTTP error but `context_length_exceeded` and no `serious` or `critical`
-thermal sample, it served the cell's model, no process it did not start
-outranked one of its own among the top five by CPU, and, on the M5 Pro, its
-owner neither touched it (HIDIdleTime under 10 s) nor held a display or system
-sleep assertion. An ample-memory run counts only if the experts were at their
-cap with pressure normal at Ready. Copy a tree to another Mac by content
+A run of any scenario counts only if it ended with `DONE`, it saw no `serious`
+or `critical` thermal sample, it served the cell's model, no process it did not
+start was among the top five by CPU at 24 % or more (`foreign_cpu_percent` in
+the spec, whose note gives its source), and, on the M5 Pro, its owner neither
+touched it (HIDIdleTime under 10 s) nor had a process the run did not start
+hold a display or system sleep assertion. A churn run also needs a server
+that never restarted and no HTTP error but `context_length_exceeded`; a TTFT
+run's concurrency counts only where every round it was to run completed its N
+requests. An ample-memory run counts only if the experts were at their cap
+with pressure normal at Ready. A candidate run left out for its own restart,
+HTTP errors or missing `DONE` still fails G8. Copy a tree to another Mac by content
 (`rsync --checksum`): `git archive` leaves `dev/tests` and `dev/benchmarks` out
 (`.gitattributes`), and a copy that keeps the files' old times leaves make
 running stale binaries. For a gate, delete the test binary before building it
 and record the commit, an empty `git status --porcelain`, the binary's SHA-256
 and its test count.
 
-The gates compare per-run metrics on a log scale: work at 900 s (prefill rows
-and output tokens at each model's single-request prices), and over the tags
-every compared run completed the geometric means of latency, TTFT and decode
-rate. The interval of the candidate/reference ratio is one-sided 90 %, its
-half-width t(0.9, df) times the machine's per-run noise for that metric
-(pooled from the cell's own same-tree runs, else the spec's recorded value)
-times sqrt(1/n + 1/m), per arrival order and pooled; a tolerance turns it into
-a verdict, and noise only decides how many runs resolve it.
+The gates compare per-run metrics on a log scale: work at the end of the
+cell's load window, at most 900 s (prefill rows and output tokens at each
+model's single-request prices), and over the tags every compared run
+completed the geometric means of latency, TTFT and decode rate. The interval
+of the candidate/reference ratio is one-sided 90 %, its half-width t(0.9, df)
+times the machine's per-run noise for that metric (pooled from the cell's own
+same-tree runs, else the spec's recorded value) times sqrt(1/n + 1/m), per
+arrival order and pooled. A gate PASSes when the interval's good bound clears
+its tolerance and FAILs when its bad bound is past equality (or past the loss
+the gate allows), else it is INCONCLUSIVE; noise only decides how many runs
+resolve it.
 
 | Gate | Rule |
 | --- | --- |
-| G1, G2 | work, latency and decode rate against 1.5.0: within 5 % only with a clear gain on TTFT, completion latency, freezes or concurrent TTFT, else no loss at all |
-| G3 | TTFT against main within 2 %; under a memory cap also when G2 passes, no decode froze, and the TTFT is no worse than the cell's best tree that kept decoding |
+| G1, G2 | work and decode rate against 1.5.0: within 5 % only with a clear gain on TTFT, completion latency, freezes (1.5.0's own runs with a decode gap at or past the machine's G4 floor while the candidate holds G4) or concurrent TTFT, else no loss at all; completion latency: no loss at all |
+| G3 | TTFT against main within 2 %, failing once surely worse; under a memory cap also when G2 passes, no decode froze, and the TTFT is not surely worse than the cell's best tree that kept decoding |
 | G4 | per candidate run: contended prefill p95 and client gap p99 within the run's own bound (`max(decode_gap_target_ms, u/0.1)` with its estimate's p95 error), every client gap under the smallest stall rejected on that machine |
 | G5 | concurrent TTFT: per N the median of each round's worst, at most the reference's times one plus its own spread |
-| G6 | ample memory: work, latency and TTFT within 2 % of the best measured tree |
+| G6 | ample memory: work, latency and TTFT within 2 % of the best measured tree, failing once surely worse |
 | G7 | single requests (`test-performance-real` against the base, `serve1`, `warm`): `abba.compare` on every metric, in session |
 | G8, G9 | no restart, failed request, Metal failure or tick past 5 s; warm start within the base's plus the warm-up; memory accounts summing to the charged bytes, nothing owed at the end, no claim waiting past the resource wait |
 | SSD | disk and expert bytes per unit of work not surely above both release references |
 | Tags | no tag whose every candidate run is past the references' worst by their own spread |
 | G10 | dense, resident, Flint and Apple9 cells against the base: work and TTFT point estimates within 2 %, and no G4 failure |
 | Floor | the Flash-Next store held at its cap becomes the floor default only when no metric is worse than the value default's and one is better; mixed results go to the owner |
+
+Each candidate churn run also reports, with nothing judged on them, its
+prefill hole share (the streamed experts' prefill host steps, pickup, work
+and resume, over `metrics.prefill_wall_ms`) and its SSD-busy share (its
+prefill expert reads at the seeded `weight_read_bytes` rate over the same
+wall time).
