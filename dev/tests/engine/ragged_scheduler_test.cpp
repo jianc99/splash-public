@@ -705,7 +705,8 @@ void testWaitingOrPrefillingPeersDoNotBoundAPrefill() {
 
 // Behaviour change 7: a ready peer of its priority, with no decoder, does
 // not bound a lane that streams its history: the Spill lane leads a group's
-// rows beside a long Resident prompt as it does alone.
+// rows beside a long Resident prompt as it does alone, and on a store-less
+// target one whose short history does not group runs its chunk whole.
 void testAReadyPeerDoesNotBoundAStreamingLeader() {
   Sim sim(test::kM6FlashNextQ2, limits(8192, 48));
   sim.seed();
@@ -718,6 +719,15 @@ void testAReadyPeerDoesNotBoundAStreamingLeader() {
               beside.items[0].tokenCount == 8192,
           "a streaming leader beside a ready peer ran " + std::to_string(beside.items[0].tokenCount) +
               " rows, alone " + std::to_string(alone.items[0].tokenCount));
+  Sim storeLess(test::kStoreLessSpillFlashNext, limits(8192, 48));
+  storeLess.seed();
+  storeLess.lane(1, 16384, 20'000);
+  storeLess.shape(1, 16384 / kPageTokens);
+  storeLess.lane(2, 0, 200'000);
+  const BatchPlan chunk = storeLess.plan();
+  require(chunk.items[0].requestId == 1 && chunk.items[0].tokenCount == kChunk && chunk.passes == 1,
+          "a streaming leader's chunk beside a ready peer ran in " + std::to_string(chunk.passes) + " passes of " +
+              std::to_string(chunk.items[0].tokenCount) + " rows");
 }
 
 // A unit whose time is missing, not positive or not finite trains nothing;
