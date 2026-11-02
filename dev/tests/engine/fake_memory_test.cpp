@@ -266,7 +266,7 @@ void testTheModelAllocatesThroughMemory() {
   model.memory = &memory;
   model.admission = governor->allocationAdmission();
   model.growthAdmission = governor->growthAdmission();
-  model.laneStateBytes = 256 * kMiB;
+  model.laneFootprintBytes = 256 * kMiB;
   model.spilledReadFloorBytes = 64 * kMiB;
   model.stagingPageBytes = kMiB;
   ModelRequest request;
@@ -298,7 +298,7 @@ void testTheModelAllocatesThroughMemory() {
   require(model.reclaimIdleState(false, model::IdleMemory::Buffers) == 256 * kMiB &&
               memory.held("states") == 64 && model.heldStateBytes == 64,
           "a reclaim did not give the pooled buffers back");
-  model.laneStateBytes = 7 * kGiB;
+  model.laneFootprintBytes = 7 * kGiB;
   request.id = 3;
   const StateAdmission refused = model.begin(request);
   require(!refused.granted() && refused.failure == StateFailure::MemoryPressure &&
@@ -313,6 +313,34 @@ void testTheModelAllocatesThroughMemory() {
           "the store's hooks did not give back the pool's units");
   require(model.expertGrowthBytes() == kGiB && model.growExperts().granted() && experts.units() == 2,
           "the store's hooks did not take a unit back");
+}
+
+// The pool keeps the buffers one lane starts from: once four lanes have
+// ended, the rest are idle, which idleBufferBytes predicts and a reclaim
+// that keeps the lane gives back, and the next lane starts from those kept.
+void testEndedLanesLeaveOneLanesBuffersPooled() {
+  FakeMemory memory(sixteen());
+  metal::MetalBackend backend("");
+  std::optional<engine::MemoryGovernor> governor = test::governorOver(backend, memory, {.limitBytes = 6 * kGiB});
+  test::Executor model;
+  model.memory = &memory;
+  model.admission = governor->allocationAdmission();
+  model.laneFootprintBytes = 256 * kMiB;
+  ModelRequest request;
+  request.maxNewTokens = 1;
+  for (request.id = 1; request.id <= 4; ++request.id)
+    require(model.begin(request).granted(), "a lane did not begin");
+  require(memory.held("states") == kGiB, "four lanes do not hold their buffers");
+  for (uint64_t id = 1; id <= 4; ++id)
+    model.end(id);
+  require(model.idleBufferBytes(0) == 768 * kMiB,
+          "ended lanes' buffers beyond one lane's are not idle: " + std::to_string(model.idleBufferBytes(0)));
+  require(model.reclaimIdleState(true, model::IdleMemory::Buffers) == 768 * kMiB &&
+              memory.held("states") == 256 * kMiB && model.pooledLaneBytes == 256 * kMiB,
+          "a reclaim that keeps the lane did not give back all but one lane's buffers");
+  request.id = 5;
+  require(model.begin(request).granted() && memory.held("states") == 256 * kMiB && !model.pooledLaneBytes,
+          "the next lane did not start from the buffers kept");
 }
 
 // I1: the harness checks every tick that FakeMemory agrees with each
@@ -381,6 +409,7 @@ int main(int argc, char **argv) {
       {"thePoolReleasesAndGrowsByUnits", testThePoolReleasesAndGrowsByUnits},
       {"theStorageAllocatesThroughMemory", testTheStorageAllocatesThroughMemory},
       {"theModelAllocatesThroughMemory", testTheModelAllocatesThroughMemory},
+      {"endedLanesLeaveOneLanesBuffersPooled", testEndedLanesLeaveOneLanesBuffersPooled},
       {"theHarnessChecksTheBooksEveryTick", testTheHarnessChecksTheBooksEveryTick},
       {"aTickThatChangesNothingSpinsOnlyWhenItWouldRunAgain", testATickThatChangesNothingSpinsOnlyWhenItWouldRunAgain},
       {"memoryQueriesCountPerCandidateAndState", testMemoryQueriesCountPerCandidateAndState},

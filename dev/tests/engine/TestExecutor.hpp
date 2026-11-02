@@ -729,13 +729,7 @@ public:
   }
   uint64_t reclaimIdleState(bool keepLane, model::IdleMemory scope) noexcept override {
     keptLane = keepLane;
-    // The buffers of states the cache let go of refill the lane's footprint;
-    // the rest is idle.
-    const uint64_t refill = std::min(
-        *evictedStateBytes, laneFootprintBytes - std::min(laneFootprintBytes, pooledLaneBytes));
-    pooledLaneBytes += refill;
-    reclaimableIdleStateBytes += *evictedStateBytes - refill;
-    *evictedStateBytes = 0;
+    poolStates(std::exchange(*evictedStateBytes, 0));
     if (!keepLane && pooledLaneBytes)
       return giveBackStates(std::exchange(pooledLaneBytes, 0));
     const uint64_t released = giveBackStates(reclaimableIdleStateBytes);
@@ -973,9 +967,11 @@ public:
   metal::AllocationFailure beginAllocationFailure =
       metal::AllocationFailure::EngineBudget;
   uint64_t reclaimableIdleStateBytes = 0;
-  // The pooled buffers a lane starts from; only a reclaim that does not keep
-  // the lane releases them. A reclaim first refills them, up to
-  // laneFootprintBytes, from the buffers of evicted states.
+  // The pooled buffers a lane starts from, up to laneFootprintBytes (one
+  // lane's state buffers); only a reclaim that does not keep the lane
+  // releases them. The buffers of states the cache let go of (at a reclaim)
+  // and of a lane that leaves (with memory) refill them, and the rest are
+  // idle (reclaimableIdleStateBytes).
   uint64_t pooledLaneBytes = 0;
   uint64_t laneFootprintBytes = 0;
   // The buffers of states the cache has let go of, and of reservations no
@@ -1080,7 +1076,7 @@ public:
   std::unordered_map<uint64_t, std::vector<uint64_t>> unreadableBlocks;
 
   // With `memory`, the model allocates through it: a lane's state buffers
-  // (laneStateBytes, from the pooled ones first) at begin and resume, and a
+  // (laneFootprintBytes, from the pool first) at begin and resume, and a
   // state's at reserveState and snapshot (from the buffers the cache let go
   // of first), under `admission`, held as "states" until a reclaim gives them
   // back (heldStateBytes); a decoding lane's floor of the hot block cache
@@ -1088,7 +1084,7 @@ public:
   // as "spilled_reads" until the lane is suspended or ends.
   FakeMemory *memory = nullptr;
   metal::AllocationAdmission admission, growthAdmission;
-  uint64_t laneStateBytes = 0, spilledReadFloorBytes = 0, stagingPageBytes = 0;
+  uint64_t spilledReadFloorBytes = 0, stagingPageBytes = 0;
   uint64_t heldStateBytes = 0;
   std::unordered_map<uint64_t, uint64_t> spilledReadBytes;
   // The expert store as an elastic pool (pools(), the store's hooks), whose
@@ -1131,14 +1127,23 @@ private:
     }
     return bytes;
   }
-  // A lane's state buffers, from the pooled ones first: the cause of a
-  // refusal, or None.
+  // Buffers back in the pool refill those a lane starts from; the rest are
+  // idle.
+  void poolStates(uint64_t bytes) noexcept {
+    const uint64_t refill = std::min(bytes, laneFootprintBytes - std::min(laneFootprintBytes, pooledLaneBytes));
+    pooledLaneBytes += refill;
+    reclaimableIdleStateBytes += bytes - refill;
+  }
+  // A lane's state buffers, from the idle pooled ones first, then those a
+  // lane starts from: the cause of a refusal, or None.
   metal::AllocationFailure takeLaneState() {
-    if (!memory || !laneStateBytes)
+    if (!memory || !laneFootprintBytes)
       return metal::AllocationFailure::None;
-    const uint64_t pooled = std::min(pooledLaneBytes, laneStateBytes);
-    if (const metal::AllocationResult result = allocateStates(laneStateBytes - pooled); !result)
+    const uint64_t idle = std::min(reclaimableIdleStateBytes, laneFootprintBytes);
+    const uint64_t pooled = std::min(pooledLaneBytes, laneFootprintBytes - idle);
+    if (const metal::AllocationResult result = allocateStates(laneFootprintBytes - idle - pooled); !result)
       return result.failure;
+    reclaimableIdleStateBytes -= idle;
     pooledLaneBytes -= pooled;
     return metal::AllocationFailure::None;
   }
@@ -1153,8 +1158,8 @@ private:
   // A resident lane leaves: its state buffers go back to the pool and its
   // reads' memory to the host.
   void releaseLane(uint64_t id) {
-    if (memory && laneStateBytes)
-      pooledLaneBytes += laneStateBytes;
+    if (memory)
+      poolStates(laneFootprintBytes);
     if (const auto found = spilledReadBytes.find(id); found != spilledReadBytes.end()) {
       memory->release("spilled_reads", found->second);
       spilledReadBytes.erase(found);
