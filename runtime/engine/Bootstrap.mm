@@ -2,6 +2,7 @@
 #include "StderrLine.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <limits>
 #include <sstream>
@@ -18,6 +19,12 @@ namespace {
 // and the state of a warmup the host refused.
 constexpr auto kMemoryReleaseWait = std::chrono::seconds(2);
 constexpr auto kMemoryReleasePoll = std::chrono::milliseconds(100);
+// The second prefill warm-up's rows: beside the first's chunk, the second
+// size the prefill price's seed puts its line through, as short as an agent's
+// turn (300 rows in the recorded M6 commands) and an eighth of the chunk; on a
+// streamed target it costs about one command's fixed part at startup, ~2 s
+// (accepted, DESIGN §0 O4).
+constexpr uint32_t kSeedPrefillRows = 256;
 
 RuntimeBootstrapReport reportForPlan(const EngineMemoryPlan &plan) {
   RuntimeBootstrapReport report;
@@ -201,9 +208,14 @@ RuntimeBootstrapReport RuntimeBootstrap::requireWarmupAndAnnounce(
             [&] {
               return modelRuntime.warmupPrefill(model::ExecutionLimits::prefillTokenBudget);
             });
-    nativeLoop.observePrefill(model::ExecutionLimits::prefillTokenBudget,
-                             maximumPrefill.wallSeconds * 1000.0, maximumPrefill.hostSeconds * 1000.0);
     report.warmup.maximumPrefillDetail = maximumPrefill.detail;
+    // A second, shorter prefill puts a line through two sizes: the prefill
+    // price's seed, with the SSD reads of loading the weights (Scheduler).
+    const model::WarmupStepResult shortPrefill =
+        run(RuntimeBootstrapStage::MaximumPrefill, report.warmup.maximumPrefill,
+            [&] { return modelRuntime.warmupPrefill(kSeedPrefillRows); });
+    const std::array warmups{maximumPrefill.sample, shortPrefill.sample};
+    nativeLoop.seedCost(warmups, modelRuntime.loadReads());
     const auto &budget = memoryPlan.breakdown();
     // Startup exercises only widths that fit this budget. This is not a
     // serving concurrency limit: the engine still admits lanes dynamically.
@@ -312,19 +324,6 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
   }
   config.nativeLoop.engine.vocabularySize =
       config.resources.model.capabilities.vocabularySize;
-  // A prefill command takes no more attention than a full chunk at the end
-  // of the native window, which every supported Mac runs within the command
-  // watchdog: past it, at depths only YaRN serves, commands take fewer rows.
-  // A row of a target with an indexer attends to its top blocks at any depth,
-  // and only the indexer's scores grow with it, a hundredth of attention's,
-  // so its commands keep their rows.
-  constexpr uint32_t chunk = model::ExecutionLimits::prefillTokenBudget;
-  config.nativeLoop.engine.maximumPrefillAttentionPairs = std::visit(
-      [](const auto &layout) {
-        return layout.hasIndexer() ? std::numeric_limits<uint64_t>::max()
-                                   : Scheduler::attentionPairs(layout.nativeContextTokens - chunk, chunk);
-      },
-      config.resources.model.target);
   // Images are admitted up to the server's pixel cap; a model without vision
   // admits none.
   config.nativeLoop.engine.maxImagePatches =

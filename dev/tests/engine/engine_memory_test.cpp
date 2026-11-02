@@ -1,3 +1,4 @@
+#include "CostSeeds.hpp"
 #include "EngineTestSupport.hpp"
 #include "TestCache.hpp"
 #include "TestChecks.hpp"
@@ -2468,7 +2469,7 @@ void testPrefixWaitKeepsAdmissionClosedBehindARefusal() {
   guardReleases(storage, engine);
   // The producer and request 4 share 960 tokens.
   std::vector<uint32_t> producer(1000, 7);
-  std::vector<uint32_t> refused(1100, 7);
+  std::vector<uint32_t> refused(1000, 7);
   std::fill(producer.begin() + 960, producer.end(), 8);
   std::fill(refused.begin() + 960, refused.end(), 9);
   engine.submit(request(1, {1}));
@@ -2820,9 +2821,10 @@ void testGrowthKeepsPrefillProgressWhenAnUnstartedPeerCanYield() {
              std::count_if(executor.requests.begin(), executor.requests.end(),
                            [](const auto &entry) { return entry.second.resident; }) < 2;
     };
-    // Its final command leaves rows of the budget to a peer.
+    // Its final command leaves rows of the budget to a peer whose last chunk
+    // of 96 rows they spare a command (Scheduler: a lane joins with those).
     engine.submit(request(48, std::vector<uint32_t>(4000, 48)));
-    auto peer = request(49, std::vector<uint32_t>(8192, 49));
+    auto peer = request(49, std::vector<uint32_t>(8192 + 96, 49));
     peer.priority = priority;
     engine.submit(std::move(peer));
     require(engine.tick(1) && engine.tick(2) &&
@@ -2842,7 +2844,7 @@ void testGrowthKeepsPrefillProgressWhenAnUnstartedPeerCanYield() {
     }
     runUntilIdle(engine);
     require(events.completedCount == 2 && events.failedCount == 0 &&
-                events.capacityExhaustedCount == 0 && executor.prefillRows == 4000 + 8192,
+                events.capacityExhaustedCount == 0 && executor.prefillRows == 4000 + 8192 + 96,
             "work-aware admission lost prefill work or failed to complete");
   }
 }
@@ -4996,7 +4998,7 @@ void testAHigherPriorityThatWaitsLeavesACommandItsPasses() {
   Events events;
   engine::Engine engine(test::engineConfig(), cache, model, events);
   guardReleases(storage, engine);
-  engine.observePrefill(model::ExecutionLimits::prefillTokenBudget, 4900.0, 3400.0);
+  test::seedAsStartup(engine, model);
   for (uint64_t id = 1; id <= 2; ++id) {
     EngineRequest background = request(id, std::vector<uint32_t>(300, static_cast<uint32_t>(id)));
     background.priority = RequestPriority::Background;

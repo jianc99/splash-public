@@ -42,8 +42,11 @@ std::string resourceTimeoutMessage(metal::AllocationFailure failure) {
 
 Engine::Engine(EngineConfig config, Cache &cache, model::Model &model,
                EngineEventSink &events)
-    : config_(config), cache_(cache), writeBehind_(cache), model_(model),
-      events_(events), scheduler_(config_.decodeShare, config_.maximumPrefillAttentionPairs) {
+    : config_(config), cache_(cache), writeBehind_(cache), model_(model), events_(events),
+      scheduler_({.decodeShare = config_.decodeShare,
+                  .decodeGapMilliseconds = config_.decodeGapMilliseconds,
+                  .limits = model.commandLimits()},
+                 model) {
   if (!config_.maxContext || !config_.vocabularySize) {
     throw std::invalid_argument("context and vocabulary sizes must be positive");
   }
@@ -109,12 +112,7 @@ void Engine::submit(EngineRequest value) {
   requestState.request = std::move(value);
   const Request &stored =
       requests_.emplace(id, std::move(requestState)).first->second;
-  scheduler_.submit(
-      {.id = id,
-       .priority = stored.request.priority,
-       .prefillTokens = stored.promptTokens,
-       .prefillGroupRows = model_.prefillGroupRows(false),
-       .prefillPasses = model_.prefillPasses()});
+  scheduler_.submit({.id = id, .priority = stored.request.priority, .prefillTokens = stored.promptTokens});
   ++counters_.submitted;
 }
 
@@ -270,42 +268,42 @@ bool Engine::tick(double now) {
   const AwakeClock::time_point planning = AwakeClock::now();
   progressed = admitQueued(now) || progressed;
   sweepTerminal(now);
-  // A prefill lane that reads its history from the SSD cache runs alone in
-  // its commands (streamsHistory). One whose history spills, or that holds
-  // another request's spilled blocks, runs prefill groups, which read that
-  // history once for their chunks; a Resident one only where every lane
-  // runs them, so a request that arrives beside it waits for a chunk.
-  if (config_.spill.capable) {
-    for (const auto &[id, active] : requests_)
-      if (active.lane && scheduler_.phase(id) == Phase::Prefill) {
-        scheduler_.setStreamsHistory(id, streamsHistory(active));
-        scheduler_.setPrefillGroupRows(
-            id, model_.prefillGroupRows(active.kvMode == KvMode::Spill || cache_.holdsIndexPages(id)));
-      }
-  }
   // Lanes that wait for memory on its way back cannot run before it lands;
   // the command runs the other lanes meanwhile. A plan whose lanes all wait
-  // adds them, so each attempt plans without at least one more lane.
-  std::vector<uint64_t> excluded;
-  for (const auto &[id, active] : requests_) {
+  // adds them, and each plan prepare sends back adds those it refused or held
+  // back, so each attempt plans without at least one more lane, or with a
+  // lane's rows cut at a state boundary, or after a lane's one conversion.
+  std::vector<uint64_t> excluded, refused;
+  for (auto &[id, active] : requests_) {
+    active.rowCap.reset();
     if (active.lane && active.resourceWait.pending && !resourceRetryReady(active, now))
       excluded.push_back(id);
   }
   // Lanes prepare held back for a lane that waits for memory wait on once
   // this tick's attempts are over (rewaitHeld), however the tick ends.
+  // So do the states plans sent back kept for their lanes go back.
   struct HeldWaits final {
     Engine &engine;
     double now;
-    ~HeldWaits() { engine.rewaitHeld(now); }
+    ~HeldWaits() {
+      engine.rewaitHeld(now);
+      for (auto &[_, active] : engine.requests_)
+        active.keptCaptures.reset();
+    }
   } const heldWaits{*this, now};
-  while (auto plan = scheduler_.next(excluded)) {
-    // A command between its passes yields, whole, to a command that
-    // supersedes it (Scheduler::abandonsPasses), and its lanes that ended
-    // meanwhile end. One planned again with its lanes is abandoned before it
-    // takes shape, its lanes then taking part in it as any lane does; one of
-    // a higher priority, once it runs, so that the command goes on while
-    // that one waits for memory.
-    const bool supersedes = scheduler_.abandonsPasses(*plan);
+  for (;;) {
+    // Planning reads the lanes' shapes as they are now, before every plan.
+    const std::vector<LaneShape> shapes = laneShapes();
+    const PlanInputs in{.excluded = excluded, .shapes = shapes, .passes = passProgress()};
+    const std::optional<BatchPlan> plan = scheduler_.next(in);
+    if (!plan)
+      break;
+    // A command between its passes yields, whole, to a plan that supersedes
+    // it (Scheduler::abandonsPasses), and its lanes that ended meanwhile
+    // end. One that holds a lane of it is abandoned before it takes shape,
+    // its lanes then taking part in it as any lane does; any other once it
+    // runs, so that the command goes on while that one waits for memory.
+    const bool supersedes = scheduler_.abandonsPasses(*plan, in);
     if (supersedes && std::ranges::any_of(plan->items, [&](const BatchItem &item) {
           return betweenPasses(item.requestId);
         })) {
@@ -314,9 +312,10 @@ bool Engine::tick(double now) {
     }
     std::vector<ModelBatchItem> items;
     std::vector<std::vector<Capture>> captures;
+    const size_t planned = excluded.size();
     const Prepared prepared = [&] {
       const Superseding superseding(superseding_, supersedes);
-      return prepare(*plan, items, captures, now);
+      return prepare(*plan, items, captures, excluded, now);
     }();
     switch (prepared) {
     case Prepared::Runnable: {
@@ -332,14 +331,22 @@ bool Engine::tick(double now) {
       if (!ticket) {
         throw std::logic_error("model returned an empty command ticket");
       }
-      // A prefill lane whose page list names Index pages reads its history
-      // from the SSD cache: alone in its command (streamsHistory).
-      const bool streamed = plan->kind == WorkKind::Prefill && items.front().pageSources;
-      scheduler_.commit(*plan, excluded);
+      // The lanes prepare refused or held back were planned without while
+      // ready: a command in passes leaves them out (PassProgress::leftOut),
+      // as it does a lane it had no room for, and they wait for its end.
+      // Those that wait for memory on its way back join it once that lands.
+      std::vector<uint64_t> waiting;
+      for (const uint64_t id : excluded)
+        if (std::ranges::find(refused, id) == refused.end())
+          waiting.push_back(id);
+      const std::vector<LaneShape> committed = laneShapes();
+      std::vector<uint64_t> leftOut = scheduler_.commit(
+          *plan, {.excluded = waiting, .shapes = committed, .passes = passProgress()});
       // A command in passes keeps its items and their captures for its
-      // later passes (prepare).
+      // later passes (prepare), and its progress for planning.
       if (plan->passes > 1 && !plan->pass)
-        passCommand_ = PassCommand{.items = items, .captures = captures};
+        passCommand_ = PassCommand{
+            .progress = {.plan = *plan, .leftOut = std::move(leftOut)}, .items = items, .captures = captures};
       // The command reads the cached pages its lanes' blocks were swapped
       // for, and those a resume restored. Selecting a constrained request's
       // first token reads none, but the cycle after it does; only a first
@@ -349,8 +356,7 @@ bool Engine::tick(double now) {
         lane.deduplicatedKvTokens += lane.unreadDeduplicatedKvTokens;
         counters_.deduplicatedKvTokens += std::exchange(lane.unreadDeduplicatedKvTokens, 0);
       }
-      pending_ = Pending{std::move(*plan), std::move(captures), std::move(ticket),
-                         busySinceMilliseconds_.value_or(now), streamed};
+      pending_ = Pending{*plan, std::move(captures), std::move(ticket), busySinceMilliseconds_.value_or(now)};
       return true;
     }
     case Prepared::Yielded:
@@ -361,7 +367,9 @@ bool Engine::tick(double now) {
         excluded.push_back(item.requestId);
       continue;
     case Prepared::Replan:
-      throw std::logic_error("S");
+      refused.insert(refused.end(), excluded.begin() + static_cast<std::ptrdiff_t>(planned), excluded.end());
+      ++counters_.replans;
+      continue;
     }
   }
   if (!progressed)
@@ -494,6 +502,10 @@ bool Engine::admitQueued(double now) {
   // request until the next pass.
   for (auto &[_, active] : requests_)
     active.heldBehind.reset();
+  // The starts held back for the end of the command between its passes are
+  // this pass's (preemptBelow).
+  if (passCommand_)
+    passCommand_->progress.heldStarts.clear();
   const auto queue = [&](uint64_t id) {
     deferWait(request(id));
     scheduler_.deferAdmission(id);
@@ -535,7 +547,7 @@ bool Engine::admitQueued(double now) {
   const auto waitForLane = [&](uint64_t id, Request &active) {
     if (!laneSought && !pendingSharedPrefill(active, cachedTokens(active))) {
       laneSought = true;
-      if (preemptBelow(active.request.priority, now))
+      if (preemptBelow(active.request.priority, id, now))
         return true;
     }
     scheduler_.waitForResources(id);
@@ -615,7 +627,9 @@ bool Engine::admitQueued(double now) {
   }
   bool progressed = false;
   while (!candidates.empty()) {
-    const auto selected = scheduler_.prefillAdmissionOrder(candidates);
+    const std::vector<LaneShape> shapes = laneShapes(candidates);
+    const auto selected =
+        scheduler_.prefillAdmissionOrder(candidates, {.shapes = shapes, .passes = passProgress()});
     if (selected.empty())
       break;
     for (uint64_t id : selected) {
@@ -748,7 +762,9 @@ bool Engine::admit(Request &active, double now) {
   // A start whose prompt would supersede the command between its passes
   // takes what that command holds first, as its prompt's command does once it
   // runs (escalate).
-  const Superseding superseding(superseding_, scheduler_.yieldsTo(active.request.priority, 1));
+  const std::vector<LaneShape> shapes = laneShapes();
+  const Superseding superseding(
+      superseding_, scheduler_.yieldsTo(active.request.priority, 1, {.shapes = shapes, .passes = passProgress()}));
   ModelRequest modelRequest = active.request.modelView();
   modelRequest.prompt = active.exactTokens;
   CacheLookup lookup =
@@ -830,7 +846,7 @@ bool Engine::admit(Request &active, double now) {
     // whose suspension makes it retry at the next pass. Memory on its way
     // back makes no lane yield: the start waits for it.
     if (active.refusedResources && !resuming && !state.denial.pending)
-      static_cast<void>(preemptBelow(active.request.priority, now));
+      static_cast<void>(preemptBelow(active.request.priority, active.request.id, now));
     return false;
   }
   const uint64_t requestId = active.request.id;
@@ -896,7 +912,7 @@ bool Engine::admit(Request &active, double now) {
     deferResourceRetry(active, now, kv.denial);
     // As for a refused state.
     if (!resuming && !kv.denial.pending)
-      static_cast<void>(preemptBelow(active.request.priority, now));
+      static_cast<void>(preemptBelow(active.request.priority, requestId, now));
     return false;
   }
   active.resourceWait = {};
@@ -1291,8 +1307,9 @@ void Engine::publishReachedStateBoundaries(
   }
 }
 
-Engine::Prepared Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &items,
-                                 std::vector<std::vector<Capture>> &captures, double now) {
+Engine::Prepared Engine::prepare(const BatchPlan &plan, std::vector<ModelBatchItem> &items,
+                                 std::vector<std::vector<Capture>> &captures, std::vector<uint64_t> &excluded,
+                                 double now) {
   const bool prefill = plan.kind == WorkKind::Prefill;
   const bool spill = config_.spill.capable;
   const PlanContext context{.prefill = prefill, .supersedes = superseding_, .now = now};
@@ -1301,6 +1318,21 @@ Engine::Prepared Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &i
     bool &shaped;
     ~Shaping() { shaped = false; }
   } const shaping{commandShaped_};
+  // What the plan was made from that preparing it may change: each lane's
+  // KV mode and whether its history held Index pages, and the command
+  // between its passes.
+  std::vector<std::pair<KvMode, bool>> shapes;
+  for (const BatchItem &item : plan.items)
+    shapes.emplace_back(request(item.requestId).kvMode, cache_.holdsIndexPages(item.requestId));
+  const bool commandBetweenPasses = !plan.pass && passCommand_;
+  const auto reshaped = [&] {
+    for (size_t index = 0; prefill && index < plan.items.size(); ++index) {
+      const uint64_t id = plan.items[index].requestId;
+      if (request(id).kvMode != shapes[index].first || (cache_.holdsIndexPages(id) && !shapes[index].second))
+        return true;
+    }
+    return false;
+  };
   // Pages whose copies have landed leave memory before any lane grows.
   spillLanded();
   // So do a windowed layout's windowed layers' K/V of the pages every
@@ -1340,17 +1372,23 @@ Engine::Prepared Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &i
   bool spilledReads = false;
   // A lane held back with a wait of its own waits on as one refused does
   // (rewaitHeld).
-  bool heldBack = false;
+  std::vector<uint64_t> held;
   const auto hold = [&](const Request &active) {
-    heldBack = true;
+    held.push_back(active.request.id);
     if (active.resourceWait.retryMilliseconds > 0.0)
       heldWaits_.push_back(active.request.id);
   };
+  // An allocation that took the command between its passes (escalate) leaves
+  // a plan made beside it: planning starts again at once, the memory the
+  // lanes were granted kept.
+  const auto commandTaken = [&] { return commandBetweenPasses && !passCommand_; };
   for (const BatchItem &scheduled : plan.items) {
     Request &active = request(scheduled.requestId);
     if (!active.lane)
       throw std::logic_error("scheduled request is not resident");
     const LaneMemory kv = growLane(active, workEndOf(active, scheduled, prefill), context);
+    if (commandTaken())
+      return Prepared::Replan;
     if (kv.held)
       hold(active);
     else if (kv.denied)
@@ -1360,19 +1398,13 @@ Engine::Prepared Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &i
   }
   // The model's memory for reads of the KV only the SSD cache holds: a
   // decoding lane's floor of the hot block cache, or the staging of a
-  // prefill's history up to the command's end. It is reserved once every
-  // lane has its KV, since a lane that converts to Spill moves the landed
-  // pages of lanes admitted before it to the index form too
-  // (Cache::convertToSpill), and only for the lanes the command keeps, in
-  // the plan's order. A prefill lane that streams its history
-  // (streamsHistory) runs alone and whole, as the scheduler runs one
-  // (planPrefill, passesFor): kept first, it is the command, in one pass;
-  // after a lane kept, it leaves for a command of its own. Admission may
-  // have made it stream, converting it at once where its restored chain's
-  // copies had landed, which the plan, made before, did not know. A lane
-  // refused its memory leaves the command, and the lanes after it take that
-  // shape without it. A lane a refusal converts from here on keeps that
-  // shape in this command (commandShaped_).
+  // prefill's history up to the command's end, for a lane whose history
+  // holds Index pages, or may gain them before a later pass of the command
+  // (gainsIndexPages), as a pass streams what it holds then. It is reserved
+  // once every lane has its KV, since a lane that converts to Spill moves the
+  // landed pages of lanes admitted before it to the index form too
+  // (Cache::convertToSpill). A lane a refusal converts from here on keeps its
+  // pages Full in this command (commandShaped_); the plan is made again.
   if (spill) {
     commandShaped_ = true;
     std::vector<BatchItem> kept;
@@ -1380,11 +1412,11 @@ Engine::Prepared Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &i
     for (const BatchItem &scheduled : admitted) {
       Request &active = request(scheduled.requestId);
       const uint64_t id = active.request.id;
-      const bool streams = prefill && streamsHistory(active);
-      if (streams && !kept.empty())
-        continue;
-      if (cache_.holdsIndexPages(id)) {
+      if (cache_.holdsIndexPages(id) ||
+          (prefill && plan.passes > 1 && gainsIndexPages(active.kvMode, scheduled.promptOffset))) {
         const LaneMemory memory = reserveReads(active, scheduled, context);
+        if (commandTaken())
+          return Prepared::Replan;
         if (memory.held) {
           hold(active);
           continue;
@@ -1396,10 +1428,6 @@ Engine::Prepared Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &i
         spilledReads = spilledReads || !prefill;
       }
       kept.push_back(scheduled);
-      if (streams) {
-        plan.passes = 1;
-        break;
-      }
     }
     admitted = std::move(kept);
   }
@@ -1436,60 +1464,113 @@ Engine::Prepared Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &i
   if (spilledReads && !memoryAwaited(now))
     static_cast<void>(allocate([&] { return model_.growSpilledReads(); }, false,
                                ReclaimClass::Ordinary, {}, true));
-  if (!admitted.empty()) {
-    plan.items = std::move(admitted);
-    std::vector<std::vector<StateCapture>> states(plan.items.size());
-    captures.assign(plan.items.size(), {});
-    // A command in passes reads its lanes' history from memory.
-    const auto spilling = [&] {
-      return std::ranges::count_if(plan.items, [&](const BatchItem &item) {
-        return request(item.requestId).kvMode == KvMode::Spill;
-      });
-    };
-    const auto spilled = spilling();
-    for (size_t index = 0; prefill && index < plan.items.size(); ++index) {
-      BatchItem &item = plan.items[index];
-      Request &active = request(item.requestId);
-      const uint32_t rows =
-          reserveCaptures(active, item, states[index], captures[index], heldForWaiter(active, now));
-      if (rows != item.tokenCount) {
-        item.tokenCount = rows;
-        ++counters_.captureCuts;
-      }
-    }
-    // A lane a refusal converted while the command took shape keeps its pages
-    // Full in it, but the point before its next pass would spill those whose
-    // copies landed (spillLanded): it runs the command whole, as the spill
-    // section has a lane that streams run it.
-    if (plan.passes > 1 && spilling() != spilled)
-      plan.passes = 1;
-    // The items come last: making room for a state's buffers may move KV
-    // pages out of an extent, which rewrites the page lists of the lanes
-    // on them.
-    items.reserve(plan.items.size());
-    for (size_t index = 0; index < plan.items.size(); ++index) {
-      const BatchItem &scheduled = plan.items[index];
-      Request &active = request(scheduled.requestId);
-      ModelBatchItem item;
-      item.requestId = active.request.id;
-      item.logicalPosition = prefill ? scheduled.promptOffset : active.exactTokens.size();
-      item.tokenCount = scheduled.tokenCount;
-      const PageTableView pageTable = cache_.cutPageTable(active.request.id);
-      item.pageTable = pageTable.pages;
-      item.pageTableRevision = pageTable.revision;
-      item.pageTableFirstChanged = pageTable.firstChanged;
-      item.pageSources = pageTable.sources;
-      if (prefill) {
-        item.inputTokens =
-            std::span<const uint32_t>(active.exactTokens)
-                .subspan(scheduled.promptOffset, scheduled.tokenCount);
-        item.stateCaptures = std::move(states[index]);
-      }
-      items.push_back(std::move(item));
-    }
-    return Prepared::Runnable;
+  if (admitted.empty())
+    return refuse(denied, !held.empty(), context);
+  // A lane refused or held back leaves the plan: the others are planned
+  // again without it, keeping what they were granted. So does a lane that
+  // converted to Spill, or took Index pages, while the command took shape.
+  if (!denied.empty() || !held.empty()) {
+    for (const Denied &entry : denied)
+      excluded.push_back(entry.requestId);
+    excluded.insert(excluded.end(), held.begin(), held.end());
+    return Prepared::Replan;
   }
-  return refuse(denied, heldBack, context);
+  if (reshaped())
+    return Prepared::Replan;
+  // A lane whose command reaches the state a waiting request starts from, or
+  // a state boundary whose capture is refused, ends there: it is planned
+  // again with its rows up to it, which the others may fill. The first is
+  // known before any state's buffers are taken.
+  bool cut = false;
+  for (size_t index = 0; prefill && index < plan.items.size(); ++index) {
+    const BatchItem &item = plan.items[index];
+    Request &active = request(item.requestId);
+    const uint32_t end = awaitedBoundary(active, item.promptOffset + item.tokenCount);
+    if (end != item.promptOffset + item.tokenCount) {
+      active.rowCap = end - item.promptOffset;
+      ++counters_.captureCuts;
+      cut = true;
+    }
+  }
+  if (cut)
+    return Prepared::Replan;
+  std::vector<std::vector<StateCapture>> states(plan.items.size());
+  captures.assign(plan.items.size(), {});
+  std::vector<uint32_t> ends(plan.items.size());
+  for (size_t index = 0; prefill && index < plan.items.size(); ++index) {
+    const BatchItem &item = plan.items[index];
+    Request &active = request(item.requestId);
+    ends[index] = item.promptOffset + item.tokenCount;
+    // What a plan sent back took for the same rows, it takes again.
+    if (std::optional<Request::KeptCaptures> kept = std::exchange(active.keptCaptures, std::nullopt);
+        kept && kept->start == item.promptOffset && kept->end == ends[index]) {
+      states[index] = std::move(kept->states);
+      captures[index] = std::move(kept->captures);
+      continue;
+    }
+    const uint32_t rows =
+        reserveCaptures(active, item, states[index], captures[index], heldForWaiter(active, now));
+    if (rows != item.tokenCount) {
+      active.rowCap = rows;
+      ends[index] = item.promptOffset + rows;
+      ++counters_.captureCuts;
+      cut = true;
+    }
+  }
+  // Sent back, each lane keeps what it took for its rows, which a plan made
+  // again that runs it so takes without asking for it again.
+  if (cut || reshaped()) {
+    for (size_t index = 0; prefill && index < plan.items.size(); ++index)
+      request(plan.items[index].requestId).keptCaptures = Request::KeptCaptures{
+          plan.items[index].promptOffset, ends[index], std::move(states[index]), std::move(captures[index])};
+    return Prepared::Replan;
+  }
+  // The items come last: making room for a state's buffers may move KV
+  // pages out of an extent, which rewrites the page lists of the lanes
+  // on them.
+  items.reserve(plan.items.size());
+  for (size_t index = 0; index < plan.items.size(); ++index) {
+    const BatchItem &scheduled = plan.items[index];
+    Request &active = request(scheduled.requestId);
+    ModelBatchItem item;
+    item.requestId = active.request.id;
+    item.logicalPosition = prefill ? scheduled.promptOffset : active.exactTokens.size();
+    item.tokenCount = scheduled.tokenCount;
+    const PageTableView pageTable = cache_.cutPageTable(active.request.id);
+    item.pageTable = pageTable.pages;
+    item.pageTableRevision = pageTable.revision;
+    item.pageTableFirstChanged = pageTable.firstChanged;
+    item.pageSources = pageTable.sources;
+    if (prefill) {
+      item.inputTokens =
+          std::span<const uint32_t>(active.exactTokens)
+              .subspan(scheduled.promptOffset, scheduled.tokenCount);
+      item.stateCaptures = std::move(states[index]);
+    }
+    items.push_back(std::move(item));
+  }
+  return Prepared::Runnable;
+}
+
+bool Engine::gainsIndexPages(std::optional<KvMode> mode, uint64_t processed) const {
+  const SpillGeometry &geometry = config_.spill.geometry;
+  return mode == KvMode::Spill &&
+         processed > uint64_t{geometry.densePages + geometry.windowPages} * KvCache::pageTokens;
+}
+
+std::vector<LaneShape> Engine::laneShapes(std::span<const PrefillAdmission> candidates) const {
+  std::vector<LaneShape> shapes;
+  for (const auto &[id, active] : requests_)
+    if (active.lane && scheduler_.phase(id) == Phase::Prefill)
+      shapes.push_back({.requestId = id,
+                        .indexPages = cache_.indexPages(id),
+                        .gainsIndexPages = gainsIndexPages(active.kvMode, scheduler_.promptProcessed(id)),
+                        .rowCap = active.rowCap.value_or(std::numeric_limits<uint32_t>::max())});
+  for (const PrefillAdmission &candidate : candidates)
+    shapes.push_back({.requestId = candidate.requestId,
+                      .gainsIndexPages = gainsIndexPages(requests_.at(candidate.requestId).placement,
+                                                         candidate.cachedTokens)});
+  return shapes;
 }
 
 uint64_t Engine::workEndOf(const Request &active, const BatchItem &scheduled,
@@ -1706,19 +1787,20 @@ void Engine::apply(const Pending &command, std::span<const ModelStepResult> resu
   // Spill requests' new pages are written as they publish them.
   if (config_.spill.capable)
     static_cast<void>(cache_.writeThrough());
-  const double wallMilliseconds = ticket.wallMilliseconds();
-  scheduler_.complete(plan, schedulerResults, wallMilliseconds,
-                      ticket.prefillTimingIsRepresentative(), ticket.hostMilliseconds(),
-                      command.streamed ? std::optional(ticket.streamMilliseconds())
-                                       : std::nullopt,
-                      ticket.imageEncodeMilliseconds());
+  const model::CommandSample sample = ticket.sample();
+  const double wallMilliseconds = sample.wallMilliseconds;
+  scheduler_.complete(plan, schedulerResults, sample);
   // The command's last pass ends it, and the lanes that ended between its
-  // passes with it (below); a pass before goes on unless none of its lanes
-  // is left.
-  if (plan.passes > 1 && !beforeLastPass)
+  // passes with it (below); a pass before moves it to its next pass, which
+  // goes on unless none of its lanes is left.
+  if (plan.passes > 1 && !beforeLastPass) {
     passCommand_.reset();
-  else if (beforeLastPass && passesEnded())
-    abandonPasses();
+  } else if (beforeLastPass) {
+    ++passCommand_->progress.plan.pass;
+    passCommand_->progress.elapsedMilliseconds += wallMilliseconds;
+    if (passesEnded())
+      abandonPasses();
+  }
   events_.batchCompleted(plan.kind, plan.width(), inputTokens, outputTokens,
                          draftedTokens, acceptedDraftTokens, wallMilliseconds,
                          cycleMilliseconds);
@@ -1765,7 +1847,7 @@ bool Engine::yieldsEndedLanes(const Request &lane) {
 }
 
 void Engine::abandonPasses() {
-  scheduler_.abandonPasses();
+  scheduler_.abandoned(passCommand_->progress);
   const std::vector<ModelBatchItem> items = std::move(passCommand_->items);
   passCommand_.reset();
   for (const ModelBatchItem &item : items)

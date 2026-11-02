@@ -254,14 +254,6 @@ std::function<bool(const Engine::Denial &)> Engine::spillFallback(Request &activ
   };
 }
 
-bool Engine::streamsHistory(const Request &active) const {
-  const SpillGeometry &geometry = config_.spill.geometry;
-  return cache_.holdsIndexPages(active.request.id) ||
-         (active.kvMode == KvMode::Spill &&
-          scheduler_.promptProcessed(active.request.id) >
-              uint64_t{geometry.densePages + geometry.windowPages} * KvCache::pageTokens);
-}
-
 bool Engine::spillingPrompt() const {
   return std::any_of(requests_.begin(), requests_.end(), [&](const auto &entry) {
     const auto &[id, active] = entry;
@@ -651,7 +643,7 @@ uint64_t Engine::kvCapacity(uint64_t requestId) const {
   return uint64_t{cache_.pageTable(requestId).pages.size()} * KvCache::pageTokens;
 }
 
-bool Engine::preemptBelow(RequestPriority priority, double now) {
+bool Engine::preemptBelow(RequestPriority priority, uint64_t start, double now) {
   // The lane that yields first has the lowest priority of all residents.
   Request *const victim = laneToYield();
   if (!victim || victim->request.priority <= priority)
@@ -660,9 +652,12 @@ bool Engine::preemptBelow(RequestPriority priority, double now) {
     return true;
   // Suspended, a lane of the command between its passes would give that
   // command up all the same: for a start whose prompt would not supersede
-  // it, the start waits for its end instead.
-  if (betweenPasses(victim->request.id) && !scheduler_.yieldsTo(priority, 1))
+  // it, the start waits for its end instead, which runs at its priority.
+  if (betweenPasses(victim->request.id) &&
+      !scheduler_.yieldsTo(priority, 1, {.shapes = laneShapes(), .passes = passProgress()})) {
+    passCommand_->progress.heldStarts.push_back(start);
     return false;
+  }
   suspendLane(*victim, kvCapacity(victim->request.id), metal::AllocationFailure::None,
               StateFailure::ConcurrencyLimit, now);
   // What the lane held is free: an earlier failure may fit now.

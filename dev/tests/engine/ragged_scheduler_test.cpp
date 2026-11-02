@@ -1,2631 +1,1082 @@
+// The scheduler (engine::Scheduler): its phases, decode commands and debt,
+// and the prefill rules that one price, CostModel's, decides: grouping, the
+// bound and passes, the per-layer pair bound, joins, order and aging, and
+// superseding a command between its passes. Prefill targets are the fakes'
+// fitted profiles (TimingProfile.cpp).
+
 #include "TestChecks.hpp"
+#include "TestRegistry.hpp"
+#include "TimingProfile.hpp"
 #include "engine/Scheduler.hpp"
+#include "metal/abi/ExecutionGeometry.h"
 
 #include <algorithm>
 #include <array>
 #include <cmath>
-#include <cstdlib>
-#include <iostream>
+#include <cstdint>
+#include <functional>
 #include <limits>
 #include <optional>
-#include <stdexcept>
+#include <span>
+#include <string>
+#include <vector>
 
 using namespace splash;
 using namespace splash::engine;
 
 namespace {
 
-using splash::test::rejects;
-using splash::test::require;
+using test::rejects;
+using test::require;
 
-engine::RequestSpec
-request(uint64_t id, uint32_t prompt,
-        RequestPriority priority = RequestPriority::Normal) {
+constexpr uint32_t kChunk = model::ExecutionLimits::prefillTokenBudget;
+constexpr uint32_t kPageTokens = SPLASH_TARGET_KV_BLOCK_TOKENS;
+constexpr double kGap = 500.0;
+
+model::CommandLimits limits(uint32_t commandRows = kChunk, uint32_t passes = 1, uint32_t indexPageLanes = 1,
+                            uint64_t attentionPairs = std::numeric_limits<uint64_t>::max()) {
+  return {.commandRows = commandRows,
+          .maximumPasses = passes,
+          .lanesPastChunk = 1,
+          .indexPageLanes = indexPageLanes,
+          .attentionPairs = attentionPairs};
+}
+
+RequestSpec request(uint64_t id, uint32_t prompt, RequestPriority priority = RequestPriority::Normal) {
   return {id, priority, prompt};
 }
 
-void completePrefill(engine::Scheduler &scheduler,
-                     const BatchPlan &plan, double wallMilliseconds = 0.0,
-                     bool representativePrefillTiming = true) {
-  std::vector<StepResult> results;
-  for (const BatchItem &item : plan.items) {
-    results.push_back(
-        {item.requestId, item.tokenCount, false, DecodeStage::Regular});
+// A target, its scheduler and what the engine gives the scheduler: the
+// lanes' shapes, the lanes left out, and the command between its passes,
+// which run() keeps as the engine's PassCommand does. Commands take the
+// profile's time on a clock.
+class Sim {
+public:
+  explicit Sim(const test::TimingProfile &profile, model::CommandLimits commandLimits = limits(),
+               double decodeShare = 0.5, std::function<double()> residentShare = {})
+      : work(profile, std::move(residentShare)),
+        scheduler({.decodeShare = decodeShare, .decodeGapMilliseconds = kGap, .limits = commandLimits}, work) {}
+
+  test::TimedWork work;
+  Scheduler scheduler;
+  std::vector<LaneShape> shapes;
+  std::vector<uint64_t> excluded;
+  std::optional<PassProgress> passes;
+  double now = 0.0;
+
+  // The startup's two prefill warm-ups (a prompt of one token, as
+  // Runtime::warmupPrefill) and a load of the weights at the profile's SSD
+  // rate.
+  Sim &seed() {
+    const std::array warmups{test::sampleOf(work.warmupTimes(kChunk)), test::sampleOf(work.warmupTimes(256))};
+    const test::TimingProfile &profile = work.profile();
+    const double rate =
+        profile.weightBytesPerMillisecond ? profile.weightBytesPerMillisecond : profile.spilledKvBytesPerMillisecond;
+    scheduler.seedCost(warmups, rate ? model::SsdReads{10'000'000'000, 1e10 / rate} : model::SsdReads{});
+    return *this;
   }
-  scheduler.commit(plan, {});
-  scheduler.complete(plan, results, wallMilliseconds,
-                      representativePrefillTiming);
+  [[nodiscard]] PlanInputs in() const { return {excluded, shapes, passes ? &*passes : nullptr}; }
+  [[nodiscard]] std::optional<BatchPlan> next() const { return scheduler.next(in()); }
+  [[nodiscard]] BatchPlan plan() const {
+    const std::optional<BatchPlan> result = next();
+    require(result.has_value(), "the scheduler planned nothing");
+    return *result;
+  }
+  // A resident prefill lane at `position` with `remaining` rows to go, and a
+  // decoding lane.
+  void lane(uint64_t id, uint32_t position, uint32_t remaining, RequestPriority priority = RequestPriority::Normal) {
+    scheduler.submit(request(id, position + remaining, priority));
+    scheduler.resourcesReady(id, position);
+  }
+  void decoder(uint64_t id, RequestPriority priority = RequestPriority::Normal) {
+    scheduler.submit(request(id, 1, priority));
+    scheduler.resourcesReady(id, 1);
+  }
+  void shape(uint64_t id, uint32_t indexPages, bool gainsIndexPages = false) {
+    std::erase_if(shapes, [id](const LaneShape &shape) { return shape.requestId == id; });
+    shapes.push_back({.requestId = id, .indexPages = indexPages, .gainsIndexPages = gainsIndexPages});
+  }
+  [[nodiscard]] std::vector<model::PrefillLane> lanes(std::span<const BatchItem> items) const {
+    std::vector<model::PrefillLane> result;
+    for (const BatchItem &item : items) {
+      const auto found = std::ranges::find(shapes, item.requestId, &LaneShape::requestId);
+      result.push_back({item.promptOffset, item.tokenCount, found == shapes.end() ? 0 : found->indexPages});
+    }
+    return result;
+  }
+  // The scheduler's price of pass `pass` of `passes` of these items, and of
+  // the passes [first, passes).
+  [[nodiscard]] double price(std::span<const BatchItem> items, uint32_t pass = 0, uint32_t count = 1) const {
+    return scheduler.prefillMilliseconds(work.prefillWork(lanes(items), pass, count));
+  }
+  [[nodiscard]] double passesPrice(std::span<const BatchItem> items, uint32_t first, uint32_t count) const {
+    double total = 0.0;
+    for (uint32_t pass = first; pass < count; ++pass)
+      total += price(items, pass, count);
+    return total;
+  }
+  [[nodiscard]] double turnaround() const {
+    return scheduler.snapshot().prefillEstimate.terms[static_cast<size_t>(CostTerm::Units)].millisecondsPerUnit;
+  }
+  [[nodiscard]] double bound() const { return std::max(kGap, turnaround() / kPassOverheadShare); }
+  // Runs `plan` as the engine does, its time the profile's (times `scale`):
+  // a prefill's lanes consume their rows at its last pass, a decode's commit
+  // eight tokens each.
+  double run(const BatchPlan &plan, double scale = 1.0) {
+    // A plan that supersedes the command between its passes abandons it
+    // first (Engine::tick).
+    if (scheduler.abandonsPasses(plan, in()))
+      abandon();
+    const std::vector<uint64_t> leftOut = scheduler.commit(plan, in());
+    if (plan.kind == WorkKind::Prefill && plan.passes > 1 && !plan.pass)
+      passes = PassProgress{.plan = plan, .leftOut = leftOut};
+    test::CommandTimes times;
+    std::vector<StepResult> results;
+    const bool last = plan.pass + 1 == plan.passes;
+    if (plan.kind == WorkKind::Prefill) {
+      times = test::prefillTimes(work.profile(), work.prefillWork(lanes(plan.items), plan.pass, plan.passes));
+      for (const BatchItem &item : plan.items)
+        results.push_back({item.requestId, last ? item.tokenCount : 0, false, DecodeStage::Regular});
+    } else {
+      times = test::decodeTimes(work.profile(), plan.width(), plan.width() * 8, work.residentShare(), 0);
+      for (const BatchItem &item : plan.items)
+        results.push_back({item.requestId, 0, false, DecodeStage::Regular, 8});
+    }
+    times.wallMilliseconds *= scale;
+    scheduler.complete(plan, results, test::sampleOf(times));
+    if (plan.kind == WorkKind::Prefill && passes) {
+      if (last) {
+        passes.reset();
+      } else {
+        ++passes->plan.pass;
+        passes->elapsedMilliseconds += times.wallMilliseconds;
+      }
+    }
+    now += times.wallMilliseconds;
+    return times.wallMilliseconds;
+  }
+  double step(double scale = 1.0) { return run(plan(), scale); }
+  // Abandons the command between its passes, as Engine::abandonPasses does.
+  void abandon() {
+    scheduler.abandoned(*passes);
+    passes.reset();
+  }
+};
+
+// A dense 27B target of one chunk a command, seeded: what joining and the
+// order weigh is its price.
+class DenseSim final : public Sim {
+public:
+  explicit DenseSim(double decodeShare = 0.0) : Sim(test::kDense27B, limits(), decodeShare) { seed(); }
+};
+
+uint32_t rowsOf(const BatchPlan &plan) {
+  uint32_t rows = 0;
+  for (const BatchItem &item : plan.items)
+    rows += item.tokenCount;
+  return rows;
 }
 
-void completeDecode(engine::Scheduler &scheduler, bool finished = false,
-                    double wallMilliseconds = 0.0) {
-  const BatchPlan plan = *scheduler.next({});
+void completeDecode(Sim &sim, bool finished = false) {
+  const BatchPlan plan = sim.plan();
   require(plan.kind == WorkKind::Decode, "expected a decode command");
-  scheduler.commit(plan, {});
+  sim.scheduler.commit(plan, sim.in());
   std::vector<StepResult> results;
   for (const BatchItem &item : plan.items)
-    results.push_back({item.requestId, 0, finished, DecodeStage::Regular});
-  scheduler.complete(plan, results, wallMilliseconds, true);
+    results.push_back({item.requestId, 0, finished, DecodeStage::Regular, 1});
+  sim.scheduler.complete(plan, results, {.wallMilliseconds = 50.0});
 }
 
 // Prefills a constrained request's prompt, whose end waits for the mask of
 // its first token.
-void awaitFirstMask(engine::Scheduler &scheduler, uint64_t id) {
-  const BatchPlan prompt = *scheduler.next({});
-  require(prompt.kind == WorkKind::Prefill && prompt.width() == 1 &&
-              prompt.items[0].requestId == id,
+void awaitFirstMask(Sim &sim, uint64_t id) {
+  const BatchPlan prompt = sim.plan();
+  require(prompt.kind == WorkKind::Prefill && prompt.width() == 1 && prompt.items[0].requestId == id,
           "expected the constrained prompt");
-  scheduler.commit(prompt, {});
-  const std::array result{StepResult{id, prompt.items[0].tokenCount, false,
-                                     DecodeStage::ApplyInitialMask}};
-  scheduler.complete(prompt, result, 0.0, true);
-  require(scheduler.phase(id) == engine::Phase::WaitingMask,
-          "a constrained prompt did not wait for its first mask");
+  sim.scheduler.commit(prompt, sim.in());
+  const std::array result{StepResult{id, prompt.items[0].tokenCount, false, DecodeStage::ApplyInitialMask}};
+  sim.scheduler.complete(prompt, result, {});
+  require(sim.scheduler.phase(id) == Phase::WaitingMask, "a constrained prompt did not wait for its first mask");
 }
 
-void testAdmissionSharesDispatchOrderAndBudget() {
-  Scheduler scheduler(0.0);
-  scheduler.submit(request(1, 8193));
-  scheduler.resourcesReady(1, 0);
-  scheduler.submit(request(2, 8193));
-  scheduler.submit(request(3, 4097));
-  scheduler.submit(request(4, 65));
-  const std::array candidates{PrefillAdmission{2, 0},
-                              PrefillAdmission{3, 4096},
-                              PrefillAdmission{4, 0}};
-  require(scheduler.prefillAdmissionOrder(candidates) ==
-              std::vector<uint64_t>({3, 4}),
-          "admission did not take cached and short work ahead of cold work");
-  scheduler.resourcesReady(3, 4096);
-  scheduler.resourcesReady(4, 0);
-  const auto plan = *scheduler.next({});
-  require(plan.items.size() == 3 && plan.items[0].requestId == 3 &&
-              plan.items[1].requestId == 4 && plan.items[2].requestId == 1 &&
-              plan.items[2].tokenCount == 1982,
-          "dispatch disagreed with admission work accounting");
+// --- Phases, decode and debt -------------------------------------------------------------------------------
 
-  Scheduler shortPrompts(0.0);
-  std::vector<PrefillAdmission> many;
-  for (uint64_t id = 1; id <= 8; ++id) {
-    shortPrompts.submit(request(id, 65));
-    many.push_back({id, 0});
+void testRealDecodeWidths() {
+  for (uint32_t width = 1; width <= 4; ++width) {
+    DenseSim sim;
+    for (uint32_t lane = 0; lane < width; ++lane)
+      sim.decoder(lane + 1);
+    const BatchPlan plan = sim.plan();
+    require(plan.kind == WorkKind::Decode && plan.width() == width && rowsOf(plan) == 0,
+            "ready decode width was delayed or rewritten");
+    sim.run(plan);
+    require(sim.scheduler.snapshot().decodeBatchesByWidth[width - 1] == 1,
+            "decode width counter did not record the real command");
   }
-  require(shortPrompts.prefillAdmissionOrder(many) ==
-              std::vector<uint64_t>({1, 2, 3, 4}),
-          "short prefill admission lost batching or exceeded the real width");
 }
 
-void testAdmissionRespectsContendedBudgetAndDecodePriority() {
-  Scheduler scheduler(0.0);
-  scheduler.observePrefill(2048, 6144.0);
-  std::vector<PrefillAdmission> candidates;
-  for (uint64_t id = 1; id <= 4; ++id) {
-    scheduler.submit(request(id, 65));
-    candidates.push_back({id, 0});
+void testRejectedCommitCountsNothing() {
+  DenseSim sim;
+  sim.decoder(1);
+  sim.decoder(2);
+  const BatchPlan stale = sim.plan();
+  sim.scheduler.cancel(2);
+  rejects([&] { static_cast<void>(sim.scheduler.commit(stale, sim.in())); },
+          "batch no longer matches scheduler state", "a commit of a cancelled request's batch was accepted");
+  require(sim.scheduler.snapshot().decodeBatches == 0, "rejected commit incremented decode counters");
+  completeDecode(sim);
+  require(sim.scheduler.snapshot().decodeBatches == 1, "the remaining request's decode was not counted");
+}
+
+void testDecodeLanesRotate() {
+  DenseSim sim;
+  for (uint64_t id = 1; id <= 6; ++id)
+    sim.decoder(id);
+  const BatchPlan first = sim.plan();
+  require(first.kind == WorkKind::Decode && first.width() == 4, "the first decode did not use the real B4 graph");
+  sim.run(first);
+  const BatchPlan second = sim.plan();
+  require(second.width() == 4 && second.items[0].requestId == 5 && second.items[1].requestId == 6,
+          "decode did not prioritize lanes omitted by the previous batch");
+}
+
+void testMaskStagesNeverMix() {
+  DenseSim sim;
+  sim.lane(1, 0, 1);
+  sim.lane(2, 0, 1);
+  const BatchPlan prompts = sim.plan();
+  require(prompts.kind == WorkKind::Prefill && prompts.width() == 2, "constrained prompts did not form one prefill");
+  sim.scheduler.commit(prompts, sim.in());
+  const std::array promptResults{StepResult{1, 1, false, DecodeStage::ApplyInitialMask},
+                                 StepResult{2, 1, false, DecodeStage::ApplyInitialMask}};
+  sim.scheduler.complete(prompts, promptResults, {});
+  sim.scheduler.maskReady(1);
+  const BatchPlan initial = sim.plan();
+  require(initial.width() == 1 && initial.items[0].requestId == 1 &&
+              initial.decodeStage == DecodeStage::ApplyInitialMask,
+          "a ready first mask did not get its selection plan");
+  sim.scheduler.commit(initial, sim.in());
+  const std::array selected{StepResult{1, 0, false, DecodeStage::Regular}};
+  sim.scheduler.complete(initial, selected, {});
+  sim.scheduler.maskReady(2);
+  const BatchPlan other = sim.plan();
+  require(other.width() == 1 && other.items[0].requestId == 2 && other.decodeStage == DecodeStage::ApplyInitialMask,
+          "a first token's selection mixed with a drafting lane");
+}
+
+void testPrefillAndDecodeAlternateWithoutStarvation() {
+  DenseSim sim;
+  sim.decoder(1);
+  sim.lane(2, 0, 10'000);
+  require(sim.plan().kind == WorkKind::Decode, "decode did not retain the first ready command");
+  completeDecode(sim);
+  const BatchPlan prefill = sim.plan();
+  require(prefill.kind == WorkKind::Prefill && prefill.items[0].requestId == 2,
+          "continuous decode starved a newly admitted prefill");
+  sim.run(prefill);
+  require(sim.plan().kind == WorkKind::Decode, "prefill did not yield the next command back to decode");
+}
+
+// Lane 1 decodes beside lane 2's long prompt: one decode command, then one
+// prefill unit of 500 ms owes half of it at a share of 0.5.
+void testDecodeRepaysItsShareOfContendedPrefill() {
+  for (const double share : {0.0, 0.5}) {
+    DenseSim sim(share);
+    sim.decoder(1);
+    sim.lane(2, 0, 20'000);
+    completeDecode(sim);
+    const BatchPlan prefill = sim.plan();
+    sim.scheduler.commit(prefill, sim.in());
+    std::vector<StepResult> results;
+    for (const BatchItem &item : prefill.items)
+      results.push_back({item.requestId, prefill.pass + 1 == prefill.passes ? item.tokenCount : 0, false,
+                         DecodeStage::Regular});
+    sim.scheduler.complete(prefill, results, {.wallMilliseconds = 500.0});
+    for (uint32_t step = 0; step < (share > 0.0 ? 5u : 1u); ++step)
+      completeDecode(sim);
+    require(sim.plan().kind == WorkKind::Prefill, "decode did not return the next command once its share was repaid");
   }
-  require(scheduler.prefillAdmissionOrder(candidates) ==
-              std::vector<uint64_t>({1, 2}),
-          "admission ignored the contended actual-row budget");
-  scheduler.submit(request(5, 1, RequestPriority::Foreground));
-  scheduler.resourcesReady(5, 1);
-  require(scheduler.prefillAdmissionOrder(candidates).empty(),
-          "lower-priority prefill reserved lanes ahead of runnable foreground decode");
-  scheduler.cancel(5);
-  require(!scheduler.prefillAdmissionOrder(candidates).empty(),
-          "prefill admission did not resume after foreground decode left");
+}
+
+// The decode time per token is a decode command's wall over the tokens a
+// lane committed, each command weighing 0.9 of the next; the tokens a lane
+// commits per command are their mean the same way. A command whose lanes
+// committed none trains neither.
+void testDecodeTimePerTokenWeighsEachCommand() {
+  DenseSim sim;
+  sim.decoder(1);
+  sim.decoder(2);
+  const auto decode = [&](uint32_t committed, double wallMilliseconds) {
+    const BatchPlan plan = sim.plan();
+    sim.scheduler.commit(plan, sim.in());
+    std::vector<StepResult> results;
+    for (const BatchItem &item : plan.items)
+      results.push_back({item.requestId, 0, false, DecodeStage::Regular, committed});
+    sim.scheduler.complete(plan, results, {.wallMilliseconds = wallMilliseconds});
+  };
+  require(sim.scheduler.decodeTokenMilliseconds() == 0.0 && sim.scheduler.decodeTokensPerLaneCommand() == 0.0,
+          "a decode time per token preceded the first decode");
+  decode(9, 18.0);
+  decode(4, 12.0);
+  const double perToken = (0.9 * 2.0 + 3.0) / (0.9 + 1.0);
+  const double tokens = (0.9 * 9.0 + 4.0) / (0.9 + 1.0);
+  require(std::abs(sim.scheduler.decodeTokenMilliseconds() - perToken) < 1e-9 &&
+              std::abs(sim.scheduler.decodeTokensPerLaneCommand() - tokens) < 1e-9,
+          "the decode time per token did not weigh each command 0.9 of the next");
+  decode(0, 30.0);
+  require(std::abs(sim.scheduler.decodeTokenMilliseconds() - perToken) < 1e-9 &&
+              sim.scheduler.snapshot().decodeEstimate.samples == 2,
+          "a decode command whose lanes committed no tokens trained the decode time per token");
+}
+
+// Lanes left out of a plan are not planned; a prefill owes nothing to the
+// decoders it was planned without.
+void testExcludedLanesAreNotPlanned() {
+  DenseSim sim(0.5);
+  sim.decoder(1);
+  sim.decoder(2);
+  sim.lane(3, 0, 20'000);
+  sim.excluded = {1};
+  const BatchPlan decode = sim.plan();
+  require(decode.kind == WorkKind::Decode && decode.width() == 1 && decode.items[0].requestId == 2,
+          "a decode plan included a lane left out of it");
+  sim.excluded = {1, 2};
+  const BatchPlan prefill = sim.plan();
+  require(prefill.kind == WorkKind::Prefill && prefill.items[0].requestId == 3,
+          "the prefill did not run while every decoder was left out");
+  sim.run(prefill);
+  sim.excluded.clear();
+  completeDecode(sim);
+  require(sim.plan().kind == WorkKind::Prefill, "a prefill owed decode time to decoders it was planned without");
+}
+
+void testPriorityPrecedesWorkKindAlternation() {
+  DenseSim sim;
+  sim.decoder(1, RequestPriority::Background);
+  sim.lane(2, 0, 100, RequestPriority::Foreground);
+  const BatchPlan plan = sim.plan();
+  require(plan.kind == WorkKind::Prefill && plan.items[0].requestId == 2,
+          "work-kind alternation overrode request priority");
+}
+
+void testPrefillCommandContainsOnePriorityTier() {
+  DenseSim sim;
+  sim.lane(1, 0, 100, RequestPriority::Foreground);
+  sim.lane(2, 0, 100, RequestPriority::Background);
+  const BatchPlan plan = sim.plan();
+  require(plan.width() == 1 && plan.items[0].requestId == 1, "a prefill command mixed priority tiers");
 }
 
 // The tier admission can select is set by the lanes that prefill or decode,
 // not by those waiting for a mask or for admission.
 void testHighestRunnablePriority() {
-  Scheduler scheduler(0.0);
-  require(!scheduler.highestRunnablePriority(), "an idle scheduler had a runnable tier");
-  scheduler.submit(request(1, 1, RequestPriority::Foreground));
-  scheduler.resourcesReady(1, 0);
-  awaitFirstMask(scheduler, 1);
-  scheduler.submit(request(2, 1, RequestPriority::Background));
-  scheduler.resourcesReady(2, 1);
-  scheduler.submit(request(3, 100));
-  scheduler.resourcesReady(3, 0);
-  scheduler.submit(request(4, 100, RequestPriority::Foreground));
-  require(scheduler.phase(1) == Phase::WaitingMask &&
-              scheduler.highestRunnablePriority() == RequestPriority::Normal,
+  DenseSim sim;
+  require(!sim.scheduler.highestRunnablePriority(), "an idle scheduler had a runnable tier");
+  sim.lane(1, 0, 1, RequestPriority::Foreground);
+  awaitFirstMask(sim, 1);
+  sim.decoder(2, RequestPriority::Background);
+  sim.lane(3, 0, 100);
+  sim.scheduler.submit(request(4, 100, RequestPriority::Foreground));
+  require(sim.scheduler.highestRunnablePriority() == RequestPriority::Normal,
           "a mask wait or a queued request set the runnable tier");
 }
 
-void testQueuedPrefillCannotBeOvertakenIndefinitely() {
-  Scheduler scheduler(0.0);
-  scheduler.submit(request(1, 8193));
-  for (uint64_t id = 2; id <= 4; ++id) {
-    scheduler.submit(request(id, 2048));
-    const std::array candidates{PrefillAdmission{1, 0}, PrefillAdmission{id, 0}};
-    require(scheduler.prefillAdmissionOrder(candidates) == std::vector<uint64_t>{id},
-            "short work did not overtake queued long work");
-    scheduler.resourcesReady(id, 0);
-    completePrefill(scheduler, *scheduler.next({}));
-    scheduler.cancel(id);
-    scheduler.remove(id);
-  }
-  scheduler.submit(request(5, 65));
-  const std::array candidates{PrefillAdmission{1, 0}, PrefillAdmission{5, 0}};
-  require(scheduler.prefillAdmissionOrder(candidates) == std::vector<uint64_t>{1},
-          "queued long prefill starved behind short arrivals");
-}
-
-// A prefill command's attention stays within a full chunk's at the end of a
-// 262,144-token native window: below it every command takes a whole chunk;
-// past it, at depths only YaRN serves, a lane's rows halve until they fit
-// (512 at a million tokens, after a cached prefix too), and another deep lane
-// joins the command only within what is left. Without a bound every command
-// takes a whole chunk.
-void testDeepPrefillKeepsANativeChunksAttention() {
-  const uint64_t native = Scheduler::attentionPairs(262'144 - 2048, 2048);
-  const auto rows = [](uint64_t bound, std::initializer_list<uint32_t> positions) {
-    Scheduler scheduler(0.0, bound);
-    uint64_t id = 0;
-    for (const uint32_t position : positions) {
-      scheduler.submit(request(++id, 1'010'000));
-      scheduler.resourcesReady(id, position);
-    }
-    const BatchPlan plan = *scheduler.next({});
-    std::vector<uint32_t> result;
-    for (const BatchItem &item : plan.items)
-      result.push_back(item.tokenCount);
-    return result;
-  };
-  using Rows = std::vector<uint32_t>;
-  require(rows(native, {0}) == Rows{2048} && rows(native, {260'096}) == Rows{2048} &&
-              rows(native, {300'000}) == Rows{1024} && rows(native, {1'000'000}) == Rows{512} &&
-              rows(std::numeric_limits<uint64_t>::max(), {1'000'000}) == Rows{2048},
-          "a prefill command's attention left a native chunk's");
-  require(rows(native, {600'000, 600'000}) == Rows({512, 192}),
-          "a second deep lane overran the command's attention");
-}
-
-// Every lane but a prefill command's last lies within its first chunk, so
-// that at most one lane's rows run past a chunk however the engine cuts or
-// drops lanes, and a command holds at most each lane's group rows: a deep
-// group leader whose rows halve to more than a chunk runs alone, one halved
-// to at most a chunk leaves the rest of its group to a peer, a lane without
-// groups (a prompt with images) joins only a command of at most a chunk, and
-// no estimate, depth or peer breaks either.
-void testPrefillGroupHasOneSpanningLane() {
-  constexpr uint32_t chunk = model::ExecutionLimits::prefillTokenBudget;
-  const uint64_t native = Scheduler::attentionPairs(262'144 - 2048, 2048);
-  // A command whose 2048 rows took wallMilliseconds, hostMilliseconds of
-  // it waiting on expert reads; none before the first command.
-  struct Sample final {
-    double wallMilliseconds = 0.0;
-    double hostMilliseconds = 0.0;
-  };
-  // A lane with `remaining` rows after `position`, of 8192-row groups or,
-  // like a prompt with images, of chunks.
-  struct Lane final {
-    uint32_t position = 0;
-    uint32_t remaining = 0;
-    uint32_t groupRows = 4 * chunk;
-  };
-  using Rows = std::vector<uint32_t>;
-  // The rows of the first command's lanes, and their group rows.
-  struct Planned final {
-    Rows rows;
-    Rows groupRows;
-  };
-  const auto plan = [&](Sample sample, std::initializer_list<Lane> lanes) {
-    Scheduler scheduler(0.0, native);
-    if (sample.wallMilliseconds > 0.0)
-      scheduler.observePrefill(chunk, sample.wallMilliseconds, sample.hostMilliseconds);
-    uint64_t id = 0;
-    for (const Lane &lane : lanes) {
-      RequestSpec spec = request(++id, lane.position + lane.remaining);
-      spec.prefillGroupRows = lane.groupRows;
-      scheduler.submit(spec);
-      scheduler.resourcesReady(id, lane.position);
-    }
-    const BatchPlan command = *scheduler.next({});
-    Planned result;
-    for (const BatchItem &item : command.items) {
-      result.rows.push_back(item.tokenCount);
-      result.groupRows.push_back(lanes.begin()[item.requestId - 1].groupRows);
-    }
-    return result;
-  };
-  // The lanes whose rows run past a chunk as the runtime packs them.
-  const auto spanning = [&](const Rows &rows) {
-    uint32_t count = 0, offset = 0;
-    for (const uint32_t value : rows) {
-      count += value && offset / chunk != (offset + value - 1) / chunk;
-      offset += value;
-    }
-    return count;
-  };
-  const Sample streamed{4900.0, 3400.0};
-  // 70K deep, the leader's group of 8192 rows halves to 4096 for its
-  // attention; the long peer would have taken the other 4096.
-  require(plan(streamed, {{70'000, 20'000}, {0, 40'000}}).rows == Rows{4096},
-          "a leader past a chunk shared its command");
-  // From 128.5K deep it halves to a chunk, and the peer takes the rest of
-  // the group, past the chunk's end.
-  require(plan(streamed, {{130'000, 20'000}, {0, 40'000}}).rows == Rows({2048, 6144}),
-          "a peer of a leader of one chunk lost the rest of the group");
-  // 300K deep it halves to 1024: the peer takes the rest of the group, and
-  // the next lane none.
-  require(plan(streamed, {{300'000, 20'000}, {0, 40'000}, {0, 50'000}}).rows == Rows({1024, 7168}),
-          "a lane joined after one ran past a chunk");
-  // A peer of chunks takes only the chunk's other 1024 rows, and keeps the
-  // next lane to them too.
-  require(plan(streamed, {{300'000, 20'000}, {0, 40'000, chunk}, {0, 50'000}}).rows == Rows({1024, 1024}),
-          "a lane without prefill groups ran in a group");
-  require(plan(streamed, {{130'000, 20'000}, {0, 40'000, chunk}, {0, 50'000}}).rows == Rows{2048},
-          "a lane without prefill groups ran in a group");
-  for (const Sample sample : {Sample{}, Sample{600.0}, streamed, Sample{20'000.0, 19'000.0}})
-    for (const uint32_t depth : {0u, 70'000u, 150'000u, 255'000u, 300'000u, 600'000u})
-      for (const uint32_t remaining : {300u, 3000u, 9000u, 20'000u})
-        for (const uint32_t peer : {0u, 100'000u})
-          for (const uint32_t peerGroupRows : {chunk, 4 * chunk})
-            for (const uint32_t shortest : {1000u, remaining + 1000}) {
-              const auto [rows, groupRows] = plan(sample, {{depth, remaining},
-                                                           {peer, shortest, peerGroupRows},
-                                                           {peer, remaining + 2000},
-                                                           {0, remaining + 3000, peerGroupRows}});
-              // The engine runs any of the lanes, in order, each with its rows
-              // or fewer: here all of them or half.
-              for (uint32_t kept = 1; kept < 1u << rows.size(); ++kept)
-                for (uint32_t halved = 0; halved < 1u << rows.size(); ++halved) {
-                  Rows run;
-                  for (uint32_t lane = 0; lane < rows.size(); ++lane)
-                    if (kept >> lane & 1)
-                      run.push_back(halved >> lane & 1 ? rows[lane] / 2 : rows[lane]);
-                  require(spanning(run) <= 1, "several lanes of a prefill command ran past a chunk");
-                }
-              uint32_t total = 0;
-              for (const uint32_t value : rows)
-                total += value;
-              require(total <= *std::min_element(groupRows.begin(), groupRows.end()),
-                      "a prefill command held more than a lane's group rows");
-            }
-}
-
-void testWarmupTimingSeedsFirstContendedCommand() {
-  for (double sample : {0.0, -1.0, std::numeric_limits<double>::infinity(),
-                        std::numeric_limits<double>::quiet_NaN(), 6144.0}) {
-    Scheduler scheduler(0.0);
-    scheduler.observePrefill(2048, sample);
-    scheduler.observePrefill(1, 10000.0);
-    scheduler.submit(request(1, 8193));
-    scheduler.resourcesReady(1, 0);
-    require(scheduler.next({})->items[0].tokenCount == 2048,
-            "warmup shrank an uncontended prefill");
-    scheduler.submit(request(2, 1));
-    scheduler.resourcesReady(2, 1);
-    completeDecode(scheduler);
-    const auto first = *scheduler.next({});
-    require(first.kind == WorkKind::Prefill &&
-                first.items[0].tokenCount == (sample == 6144.0 ? 128 : 2048),
-            "first contended prefill ignored warmup or accepted invalid timing");
-  }
-}
-
-// A command's wait on its host steps (a streamed target's expert reads) is
-// fixed whatever its rows: the contended slice fits fixed plus per-row cost,
-// and grows to twice the fixed part, so a command's rows take at least as
-// long as its fixed part and the slice has no step where the fixed part
-// alone fills it.
-void testFixedPrefillCostSizesContendedSlice() {
-  const auto slice = [](double wallMilliseconds, double hostMilliseconds) {
-    Scheduler scheduler(0.0);
-    scheduler.observePrefill(2048, wallMilliseconds, hostMilliseconds);
-    scheduler.submit(request(1, 20'000));
-    scheduler.resourcesReady(1, 0);
-    scheduler.submit(request(2, 1));
-    scheduler.resourcesReady(2, 1);
-    completeDecode(scheduler);
-    const BatchPlan plan = *scheduler.next({});
-    require(plan.kind == WorkKind::Prefill && plan.items[0].requestId == 1,
-            "expected the contended prefill");
-    return plan.items[0].tokenCount;
-  };
-  // 0.3 ms a row after the fixed part.
-  const auto wall = [](double fixed) { return fixed + 2048 * 0.3; };
-  require(slice(wall(0.0), 0.0) == 1024, "a prefill without host waits lost its per-row slice");
-  require(slice(wall(200.0), 200.0) == 512, "the contended slice ignored the fixed prefill cost");
-  require(slice(wall(490.0), 490.0) == 1024 && slice(wall(510.0), 510.0) == 1024,
-          "the contended slice jumped where the fixed part fills it");
-  require(slice(4900.0, 3400.0) == 2048, "a streamed prefill was cut below its fixed cost");
-}
-
-// A lane whose commands may be prefill groups takes one alone when nothing
-// contends: its remaining chunks split evenly over the fewest groups that
-// hold them. Beside a decoding peer it runs chunks, and a lane without groups
-// (a model without them, or a request with images) keeps to chunks.
-void testPrefillGroupsRunUncontended() {
-  const auto first = [](uint32_t prompt, uint32_t groupRows, bool contended) {
-    Scheduler scheduler(0.0);
-    // A streamed target's command: 3.4 s of its 4.9 s waiting on expert reads.
-    scheduler.observePrefill(2048, 4900.0, 3400.0);
-    RequestSpec spec = request(1, prompt);
-    spec.prefillGroupRows = groupRows;
-    scheduler.submit(spec);
-    scheduler.resourcesReady(1, 0);
-    if (contended) {
-      scheduler.submit(request(2, 1));
-      scheduler.resourcesReady(2, 1);
-      completeDecode(scheduler);
-    }
-    const BatchPlan plan = *scheduler.next({});
-    require(plan.kind == WorkKind::Prefill && plan.width() == 1 && plan.items[0].requestId == 1,
-            "expected the long prefill alone");
-    return plan.items[0].tokenCount;
-  };
-  require(first(10'000, 8192, false) == 6144, "five chunks did not split into two even prefill groups");
-  require(first(8192, 8192, false) == 8192, "four chunks did not run as one prefill group");
-  require(first(3000, 8192, false) == 3000, "a prompt of two chunks did not run as one prefill group");
-  require(first(2048, 8192, false) == 2048, "a prompt of one chunk did not run as a chunk");
-  require(first(10'000, 2048, false) == 2048, "a lane without prefill groups took more than a chunk");
-  require(first(10'000, 8192, true) == 2048, "a prefill group ran beside a decoding peer");
-}
-
-// A lane of 100,000 rows whose commands may be prefill groups and run in up
-// to `passes` passes over its model's layers.
-RequestSpec passingLane(uint64_t id, uint32_t passes) {
-  RequestSpec spec = request(id, 100'000);
-  spec.prefillGroupRows = 4 * model::ExecutionLimits::prefillTokenBudget;
-  spec.prefillPasses = passes;
-  return spec;
-}
-
-// A lane of `remaining` rows past a cached prefix of 20,000, whose commands
-// may be prefill groups and run in up to 48 passes, of `priority`.
-RequestSpec shortPassingLane(uint64_t id, uint32_t remaining,
-                             RequestPriority priority = RequestPriority::Normal) {
-  RequestSpec spec = passingLane(id, 48);
-  spec.priority = priority;
-  spec.prefillTokens = 20'000 + remaining;
-  return spec;
-}
-
-// Completes a pass of a prefill command, planned without the excluded
-// lanes, which consumes its lanes' rows if it is the last, and else none of
-// them.
-void completePass(engine::Scheduler &scheduler, const BatchPlan &plan, double wallMilliseconds,
-                  double hostMilliseconds = 0.0, std::span<const uint64_t> excluded = {}) {
-  require(plan.kind == WorkKind::Prefill, "expected a prefill command's pass");
-  scheduler.commit(plan, excluded);
-  std::vector<StepResult> results;
-  for (const BatchItem &item : plan.items)
-    results.push_back({item.requestId, plan.pass + 1 == plan.passes ? item.tokenCount : 0, false,
-                       DecodeStage::Regular});
-  scheduler.complete(plan, results, wallMilliseconds, true, hostMilliseconds);
-}
-
-// Where its model runs a prefill command in passes over its layers, a lane
-// keeps its group whatever contends, and runs it alone in as many passes as
-// keep each within the contended slice by the command estimate, up to its
-// model's. Its later passes come before any other prefill of its priority,
-// with a decoding peer's commands between them; only the last consumes the
-// rows, and the estimate learns from the passes' time together. A lane that
-// streams its history runs its commands whole, and so does one whose model
-// has no passes or before any estimate.
-void testPrefillPassesBoundCommands() {
-  Scheduler scheduler(0.5);
-  // A streamed target's chunk: 4.9 s, 3.4 s of it on expert reads. A group of
-  // four chunks: 3.4 s + 4 x 1.5 s = 9.4 s, 19 passes of the slice.
-  scheduler.observePrefill(2048, 4900.0, 3400.0);
-  scheduler.submit(passingLane(1, 48));
-  scheduler.resourcesReady(1, 0);
-  scheduler.submit(request(2, 1));
-  scheduler.resourcesReady(2, 1);
-  scheduler.submit(request(3, 200'000));
-  scheduler.resourcesReady(3, 0);
-  completeDecode(scheduler);
-  BatchPlan plan = *scheduler.next({});
-  require(plan.kind == WorkKind::Prefill && plan.width() == 1 && plan.items[0].requestId == 1 &&
-              plan.items[0].tokenCount == 8192 && plan.pass == 0 && plan.passes == 19,
-          "a lane whose model runs passes did not run its group alone in passes within the slice");
-  for (uint32_t pass = 0; pass < plan.passes; ++pass) {
-    require(plan.items[0].requestId == 1 && plan.items[0].tokenCount == 8192 && plan.pass == pass &&
-                plan.passes == 19 && scheduler.promptProcessed(1) == 0,
-            "a command's next pass did not go on, or an earlier one consumed its rows");
-    completePass(scheduler, plan, 500.0, 300.0);
-    // The decoding peer runs what each pass owes it, 250 ms.
-    completeDecode(scheduler, false, 250.0);
-    plan = *scheduler.next({});
-  }
-  require(scheduler.promptProcessed(1) == 8192 && scheduler.phase(1) == engine::Phase::Prefill &&
-              plan.items[0].requestId == 1 && plan.passes == 19 && plan.pass == 0,
-          "the last pass did not consume the command's rows, or the estimate learned from each pass alone");
-  require(scheduler.snapshot().prefillBatches == 1 && scheduler.snapshot().prefillRows == 8192,
-          "a command in passes counted more than once");
-  scheduler.setStreamsHistory(1, true);
-  plan = *scheduler.next({});
-  require(plan.items[0].requestId == 1 && plan.passes == 1, "a lane that streams its history ran passes");
-
-  for (const uint32_t passes : {1u, 48u}) {
-    Scheduler fresh(0.0);
-    if (passes == 1)
-      fresh.observePrefill(2048, 4900.0, 3400.0);
-    fresh.submit(passingLane(1, passes));
-    fresh.resourcesReady(1, 0);
-    require(fresh.next({})->passes == 1, passes == 1 ? "a model without passes ran passes"
-                                                     : "a command ran passes before any estimate");
-  }
-}
-
-// The time of a pass of `plan`, a command of the estimate of a streamed
-// target's chunk (3.4 s and 0.73 ms a row, observed as 4.9 s for 2048 rows).
-double passMilliseconds(const BatchPlan &plan) {
-  uint32_t rows = 0;
-  for (const BatchItem &item : plan.items)
-    rows += item.tokenCount;
-  return (3400.0 + rows * 1500.0 / 2048) / plan.passes;
-}
-
-// Short prompts that arrive together on a target whose commands run in
-// passes, each a few hundred rows past its cached prefix as an agent's turns
-// are, are admitted together and share one command, which reads the experts
-// once for all of them: the last of four ends its prompt with the first,
-// one command's time after they arrived (3.4 s of expert reads and their
-// rows, in passes of the slice), not four commands'.
-void testShortPromptsShareACommandInPasses() {
-  Scheduler scheduler(0.5);
-  // A streamed target's chunk: 4.9 s, 3.4 s of it on expert reads.
-  scheduler.observePrefill(2048, 4900.0, 3400.0);
-  std::vector<PrefillAdmission> candidates;
-  for (uint64_t id = 1; id <= 4; ++id) {
-    scheduler.submit(shortPassingLane(id, 300));
-    candidates.push_back({id, 20'000});
-  }
-  require(scheduler.prefillAdmissionOrder(candidates) == std::vector<uint64_t>({1, 2, 3, 4}),
-          "short prompts on a target whose commands run in passes were admitted one at a time");
-  for (uint64_t id = 1; id <= 4; ++id)
-    scheduler.resourcesReady(id, 20'000);
-  require(scheduler.next({})->width() == 4 && scheduler.next({})->passes == 9 &&
-              std::ranges::all_of(scheduler.next({})->items,
-                                  [](const BatchItem &item) { return item.tokenCount == 300; }),
-          "short prompts did not share one command in passes");
-  double now = 0.0;
-  std::array<double, 4> prompted{};
-  while (std::ranges::any_of(prompted, [](double at) { return at == 0.0; })) {
-    const BatchPlan plan = *scheduler.next({});
-    completePass(scheduler, plan, passMilliseconds(plan), 3400.0 / plan.passes);
-    now += passMilliseconds(plan);
-    for (uint64_t id = 1; id <= 4; ++id)
-      if (!prompted[id - 1] && scheduler.phase(id) == engine::Phase::Decode)
-        prompted[id - 1] = now;
-  }
-  require(std::ranges::all_of(prompted, [&](double at) { return at == prompted[0]; }) &&
-              prompted[0] < 3400.0 + 1200 * 1500.0 / 2048 + 1.0,
-          "the last of four short prompts waited for more than one command");
-}
-
-// Requests that arrive during a command's first pass, as concurrent agent
-// turns do a few milliseconds after the first, are admitted together before
-// its next, and the command is planned again with them: the four end their
-// prompts together, a pass and one command after the first arrived, rather
-// than the first a command before the others. So they do by the M6's
-// estimate, 2.6 s fixed and 1.1 ms a row, which a short Flash-Next command
-// of 3.0 s on a 24 GB M6 fits. A lane ready late in a command's passes waits
-// for its end instead.
-void testArrivalsRegroupACommandInPasses() {
-  // A command's measured rows, time, and time on host steps.
-  struct Sample final {
-    uint32_t rows;
-    double wallMilliseconds, hostMilliseconds;
-  };
-  for (const Sample sample : {Sample{2048, 4900.0, 3400.0}, Sample{300, 2964.0, 2632.0}}) {
-    // The time of a pass of `plan` by the sample's estimate.
-    const auto passTime = [&](const BatchPlan &plan) {
-      uint32_t rows = 0;
-      for (const BatchItem &item : plan.items)
-        rows += item.tokenCount;
-      return (sample.hostMilliseconds +
-              rows * (sample.wallMilliseconds - sample.hostMilliseconds) / sample.rows) /
-             plan.passes;
-    };
-    const auto complete = [&](Scheduler &scheduler, const BatchPlan &plan) {
-      completePass(scheduler, plan, passTime(plan), sample.hostMilliseconds / plan.passes);
-    };
-    Scheduler scheduler(0.0);
-    scheduler.observePrefill(sample.rows, sample.wallMilliseconds, sample.hostMilliseconds);
-    scheduler.submit(shortPassingLane(1, 300));
-    scheduler.resourcesReady(1, 20'000);
-    BatchPlan plan = *scheduler.next({});
-    require(plan.width() == 1 && plan.passes > 1, "a short prompt did not run in passes");
-    complete(scheduler, plan);
-    double now = passTime(plan);
-    std::vector<PrefillAdmission> candidates;
-    for (uint64_t id = 2; id <= 4; ++id) {
-      scheduler.submit(shortPassingLane(id, 300));
-      candidates.push_back({id, 20'000});
-    }
-    require(scheduler.prefillAdmissionOrder(candidates) == std::vector<uint64_t>({2, 3, 4}),
-            "the requests that arrived during a command's pass were not admitted together before its next");
-    for (uint64_t id = 2; id <= 4; ++id)
-      scheduler.resourcesReady(id, 20'000);
-    plan = *scheduler.next({});
-    require(plan.pass == 0 && plan.width() == 4 && plan.items[0].requestId == 1 &&
-                scheduler.abandonsPasses(plan),
-            "a command did not regroup with the lanes ready early in its passes");
-    scheduler.abandonPasses();
-    double regrouped = now + passTime(plan) * plan.passes;
-    std::array<double, 4> prompted{};
-    while (std::ranges::any_of(prompted, [](double at) { return at == 0.0; })) {
-      plan = *scheduler.next({});
-      complete(scheduler, plan);
-      now += passTime(plan);
-      for (uint64_t id = 1; id <= 4; ++id)
-        if (!prompted[id - 1] && scheduler.phase(id) == engine::Phase::Decode)
-          prompted[id - 1] = now;
-    }
-    require(std::ranges::all_of(prompted, [&](double at) { return std::abs(at - regrouped) < 1.0; }),
-            "the four prompts did not end together, one command after the first pass");
-
-    Scheduler late(0.0);
-    late.observePrefill(sample.rows, sample.wallMilliseconds, sample.hostMilliseconds);
-    late.submit(shortPassingLane(1, 300));
-    late.resourcesReady(1, 20'000);
-    const BatchPlan command = *late.next({});
-    for (uint32_t pass = 0; pass + 2 < command.passes; ++pass)
-      complete(late, pass ? *late.next({}) : command);
-    late.submit(shortPassingLane(2, 300));
-    late.resourcesReady(2, 20'000);
-    plan = *late.next({});
-    require(plan.pass + 2 == command.passes && plan.items == command.items && !late.abandonsPasses(plan),
-            "a lane ready late in a command's passes did not wait for its end");
-  }
-}
-
-// Past a short leader of a command in passes, a lane joins with the fewest
-// rows that spare it a command of its own, or not at all: a 5000-row prompt,
-// which takes a command of its own whatever it takes, leaves a 300-row one
-// alone in its command, and a 9000-row one joins it with the 808 rows that
-// leave it one group of 8192, where a 9941-row one, whose 1749 rows would
-// pass the 1748 left in the leader's chunk, waits for its own; two 300-row
-// prompts share their command without the 5000-row one.
-void testPassesShareTheRowsThatSpareACommand() {
-  const auto rows = [](std::initializer_list<uint32_t> remaining) {
-    Scheduler scheduler(0.0);
-    scheduler.observePrefill(2048, 4900.0, 3400.0);
-    uint64_t id = 0;
-    for (const uint32_t prompt : remaining) {
-      scheduler.submit(shortPassingLane(++id, prompt));
-      scheduler.resourcesReady(id, 20'000);
-    }
-    std::vector<uint32_t> result;
-    const BatchPlan plan = *scheduler.next({});
-    for (const BatchItem &item : plan.items)
-      result.push_back(item.tokenCount);
-    return result;
-  };
-  require(rows({300, 5000}) == std::vector<uint32_t>{300},
-          "a long prompt joined a short one's command in passes with rows that spared it no command");
-  require(rows({300, 9000}) == std::vector<uint32_t>{300, 808},
-          "a long prompt did not join a short one's command in passes with the rows that spare it one");
-  require(rows({300, 9941}) == std::vector<uint32_t>{300},
-          "a long prompt joined a short one's command in passes with more rows than its chunk had left");
-  require(rows({300, 300, 5000}) == std::vector<uint32_t>{300, 300},
-          "short prompts did not share a command in passes without a long one");
-}
-
-// A command between its passes is planned again only as one that holds
-// every lane of it with the same rows, beside lanes its first pass was not
-// planned without. A 300-row arrival beside a lane's 8192-row group, which
-// the command planned again would cut, waits for its end; so does one that
-// a full command has no room for, and a lane its first pass was planned
-// without, as prepare refusing it memory the others fit in leaves one,
-// which a command planned again would leave out too. A lane the first pass
-// was planned without while it waited for memory on its way back (excluded)
-// joins, as an arrival does.
-void testRegroupsKeepTheCommandsLanes() {
-  const auto arrive = [](Scheduler &scheduler, uint64_t id, uint32_t rows) {
-    scheduler.submit(shortPassingLane(id, rows));
-    scheduler.resourcesReady(id, 20'000);
-  };
-  const auto goesOn = [](const Scheduler &scheduler, const BatchPlan &command) {
-    const BatchPlan plan = *scheduler.next({});
-    return plan.pass == command.pass + 1 && plan.items == command.items && !scheduler.abandonsPasses(plan);
-  };
-  {
-    Scheduler scheduler(0.0);
-    scheduler.observePrefill(2048, 4900.0, 3400.0);
-    scheduler.submit(passingLane(1, 48));
-    scheduler.resourcesReady(1, 0);
-    const BatchPlan command = *scheduler.next({});
-    require(command.items[0].tokenCount == 8192 && command.passes == 19, "a lane did not run its group in passes");
-    completePass(scheduler, command, 500.0);
-    arrive(scheduler, 2, 300);
-    require(goesOn(scheduler, command), "a short arrival cut a lane's group in passes, planned again");
-  }
-  {
-    Scheduler scheduler(0.0);
-    scheduler.observePrefill(2048, 4900.0, 3400.0);
-    for (uint64_t id = 1; id <= 4; ++id)
-      arrive(scheduler, id, 300);
-    const BatchPlan command = *scheduler.next({});
-    require(command.width() == 4, "four short prompts did not share a command");
-    completePass(scheduler, command, 500.0);
-    arrive(scheduler, 5, 100);
-    require(goesOn(scheduler, command), "an arrival a full command had no room for left a lane of it out, planned again");
-  }
-  {
-    Scheduler scheduler(0.0);
-    scheduler.observePrefill(2048, 4900.0, 3400.0);
-    for (uint64_t id = 1; id <= 2; ++id)
-      arrive(scheduler, id, 300);
-    BatchPlan command = *scheduler.next({});
-    command.items.resize(1);
-    completePass(scheduler, command, 500.0);
-    require(goesOn(scheduler, command), "a lane a command's first pass was planned without joined it, planned again");
-  }
-  {
-    Scheduler scheduler(0.0);
-    scheduler.observePrefill(2048, 4900.0, 3400.0);
-    for (uint64_t id = 1; id <= 2; ++id)
-      arrive(scheduler, id, 300);
-    const std::array waiting{uint64_t{2}};
-    const BatchPlan command = *scheduler.next(waiting);
-    completePass(scheduler, command, 500.0, 0.0, waiting);
-    const BatchPlan plan = *scheduler.next({});
-    require(plan.pass == 0 && plan.width() == 2 && scheduler.abandonsPasses(plan),
-            "a lane that waited for memory on its way back at a command's first pass did not join it");
-  }
-}
-
-// Whether a command of `lanes` prompts of `laneRows` rows takes one of
-// `joining` rows that becomes ready after its pass `pass`, on the estimate
-// the commands `observed` (rows, wall and host milliseconds) leave.
-bool regroupsAfter(std::span<const std::array<double, 3>> observed, uint32_t lanes, uint32_t laneRows,
-                   uint32_t joining, uint32_t pass) {
-  Scheduler scheduler(0.0);
-  for (const auto &[rows, wall, host] : observed)
-    scheduler.observePrefill(static_cast<uint32_t>(rows), wall, host);
-  for (uint64_t id = 1; id <= lanes; ++id) {
-    scheduler.submit(shortPassingLane(id, laneRows));
-    scheduler.resourcesReady(id, 20'000);
-  }
-  BatchPlan plan = *scheduler.next({});
-  for (uint32_t ran = 0; ran < pass; ++ran, plan = *scheduler.next({}))
-    completePass(scheduler, plan, 500.0);
-  scheduler.submit(shortPassingLane(lanes + 1, joining));
-  scheduler.resourcesReady(lanes + 1, 20'000);
-  return scheduler.abandonsPasses(*scheduler.next({}));
-}
-
-// A command planned again with the lanes that join it costs its lanes the
-// passes they ran and what the joining rows add to its time, which the
-// joining lanes' saving of what is left of its passes must outweigh. On the
-// Studio's estimate a short prompt's command of 8 passes takes a 1748-row
-// prompt (2.8 passes more), or the 1748 rows that leave a 9940-row one a
-// group, up to its second pass, and goes on from its third; a 300-row
-// prompt it takes up to its third.
-void testRegroupsWeighTheRowsThatJoin() {
-  const std::array<std::array<double, 3>, 1> studio{{{2048, 4900.0, 3400.0}}};
-  require(regroupsAfter(studio, 1, 300, 1748, 2) && !regroupsAfter(studio, 1, 300, 1748, 3) &&
-              !regroupsAfter(studio, 1, 300, 9940, 3) && regroupsAfter(studio, 1, 300, 300, 3),
-          "a short prompt's command did not weigh the rows that join it");
-}
-
-// The command estimate fits its fixed part and its cost per row to commands
-// of different rows, where a streamed target's waits on host steps miss the
-// GPU work a command does whatever its rows. On the M6's commands (its
-// 2048-row warm-up, two cold 8K prompts' groups, then agent turns of a few
-// hundred rows past a cached prefix), it gives a turn of 300 rows 2.8 s, in
-// 6 passes, and a group of 8192 12.2 s, in 25, about as the M6 takes them
-// (3.0 s and 11.7 s), where the waits' split gave 2.1 s and 22.9 s, in 46
-// passes. A command of three
-// turns, a pass after which a fourth becomes ready, then takes it, which its
-// rows barely lengthen, and goes on from a second pass; so it takes 64 rows
-// that make three turns of 260 rows, 7 passes, run into an eighth, for the
-// seventh of a pass they add.
-void testPrefillEstimateFitsCommandsOfDifferentRows() {
-  // Flash-Next Q2_0 on the 24 GB M6: rows, wall and host milliseconds.
-  const std::array<std::array<double, 3>, 11> m6{{{2048, 3213, 724},
-                                                  {6144, 9172, 653},
-                                                  {2431, 5263, 839},
-                                                  {6144, 9192, 666},
-                                                  {2782, 5536, 684},
-                                                  {8188, 11745, 668},
-                                                  {6144, 9254, 708},
-                                                  {2272, 5270, 1027},
-                                                  {305, 2987, 1693},
-                                                  {336, 2892, 1620},
-                                                  {724, 3588, 1628}}};
-  for (const auto &[rows, passes] : {std::pair{300u, 6u}, {8192u, 25u}}) {
-    Scheduler scheduler(0.0);
-    for (const auto &[observed, wall, host] : m6)
-      scheduler.observePrefill(static_cast<uint32_t>(observed), wall, host);
-    RequestSpec spec = passingLane(1, 48);
-    spec.prefillTokens = rows;
-    scheduler.submit(spec);
-    scheduler.resourcesReady(1, 0);
-    require(scheduler.next({})->passes == passes, "the command estimate did not fit the M6's commands");
-  }
-  require(regroupsAfter(m6, 3, 300, 300, 1) && !regroupsAfter(m6, 3, 300, 300, 2) &&
-              regroupsAfter(m6, 3, 260, 64, 1),
-          "a wider command did not weigh the rows that join it");
-}
-
-// Contended commands of one size keep the estimate's fixed part at their
-// waits on host steps, none on a target whose commands wait for none, and
-// put what the depth of a prompt's rows adds into the cost per row: a long
-// prompt beside a decoding lane, whose rows cost twice as much 20,000 rows
-// deeper, runs commands that stay about within the slice to 120,000 rows.
-void testContendedCommandsStayWithinTheSliceAsTheyDeepen() {
-  Scheduler scheduler(0.5);
-  scheduler.observePrefill(2048, 1024.0);
-  scheduler.submit(request(1, 140'000));
-  scheduler.resourcesReady(1, 0);
-  scheduler.submit(request(2, 1));
-  scheduler.resourcesReady(2, 1);
-  double longest = 0.0;
-  while (scheduler.promptProcessed(1) < 120'000) {
-    const BatchPlan plan = *scheduler.next({});
-    scheduler.commit(plan, {});
-    if (plan.kind == WorkKind::Decode) {
-      const std::array decoded{StepResult{2, 0, false, DecodeStage::Regular}};
-      scheduler.complete(plan, decoded, 25.0, true);
-      continue;
-    }
-    const BatchItem &item = plan.items[0];
-    const double wall = item.tokenCount * 0.5 * (1.0 + item.promptOffset / 20'000.0);
-    longest = std::max(longest, wall);
-    const std::array result{StepResult{1, item.tokenCount, false, DecodeStage::Regular}};
-    scheduler.complete(plan, result, wall, true);
-  }
-  require(longest <= 600.0, "contended commands grew past the slice as their rows deepened");
-}
-
-// The command estimate counts a command at most twice and at least half the
-// time it gave it, weighs each command three quarters of the next, and keeps
-// both its parts non-negative. Seeded with a streamed target's chunk (3.4 s
-// fixed, 0.73 ms a row): a group that stalls ten times as long as the
-// estimate gives it counts twice, 18.8 s, 38 passes, not 94 s, 48; one a
-// tenth as long counts half, 4.7 s, 10 passes, not 1 s, 2; groups of 9.4,
-// 9.4 and 18.8 s weigh to 13.5 s, 27 passes, where counted alike they make
-// 12.5 s, 26; commands of 2048 rows in 1 s and 8192 in 9 s (counted 8 s),
-// whose line would cross zero 1.1 s below it, keep no fixed part and 0.9 ms
-// a row, 15 passes for 8192 rows, not 16; and commands of 64 rows in 8 s
-// and 8192 in 0.1 s (counted 4 s), whose line would fall 0.37 ms a row,
-// keep no cost per row, 5.7 s whatever their rows, 12 passes, not 9.
-void testPrefillEstimateBoundsItsFit() {
-  const auto passes = [](std::initializer_list<std::array<double, 3>> observed) {
-    Scheduler scheduler(0.0);
-    for (const auto &[rows, wall, host] : observed)
-      scheduler.observePrefill(static_cast<uint32_t>(rows), wall, host);
-    scheduler.submit(passingLane(1, 48));
-    scheduler.resourcesReady(1, 0);
-    return scheduler.next({})->passes;
-  };
-  require(passes({{2048, 4900, 3400}, {8192, 94'000, 3400}}) == 38,
-          "a stalled command priced the commands after it past twice the estimate");
-  require(passes({{2048, 4900, 3400}, {8192, 9400, 3400}, {8192, 9400, 3400}, {8192, 18'800, 3400}}) == 27,
-          "the estimate did not weigh each command three quarters of the next");
-  require(passes({{2048, 4900, 3400}, {8192, 1000, 1000}}) == 10,
-          "a fast command priced the commands after it under half the estimate");
-  require(passes({{2048, 1024, 0}, {2048, 1000, 0}, {8192, 9000, 0}}) == 15,
-          "the estimate's fixed part went negative");
-  require(passes({{2048, 4000, 4000}, {64, 8000, 8000}, {8192, 100, 100}}) == 12,
-          "the estimate's cost per row went negative");
-}
-
-// A prefill's price is the command estimate's for its rows: seeded with
-// 2048 rows in 6144 ms, 2048 ms of it waiting on host steps, the estimate is
-// 2048 ms fixed and 2 ms a row, 4048 ms for 1000 rows.
-void testAPrefillsPriceIsTheEstimateForItsRows() {
-  Scheduler scheduler(0.0);
-  scheduler.observePrefill(2048, 6144.0, 2048.0);
-  require(scheduler.prefillMilliseconds(model::CommandWork{.rows = 1000}) == 4048.0,
-          "a prefill's price was not the command estimate for its rows");
-}
-
-// Past a short leader of a command in passes, a lane joins with the rows
-// that spare it a command of its own only while the fixed part it saves
-// outweighs what its rows add for the lanes planned before it: on the M6's
-// estimate, 1748 rows of a 9940-row prompt beside one 300-row turn do (2.1 s
-// against 2.5), and 1448 rows of a 9640-row one beside two turns do not
-// (3.5 s). One whose rows exceed the command's attention bound joins at none
-// of them, though fewer would fit.
-void testPassesShareOnlyWhatTheFixedPartOutweighs() {
-  const std::array<std::array<double, 3>, 11> m6{{{2048, 3213, 724},
-                                                  {6144, 9172, 653},
-                                                  {2431, 5263, 839},
-                                                  {6144, 9192, 666},
-                                                  {2782, 5536, 684},
-                                                  {8188, 11745, 668},
-                                                  {6144, 9254, 708},
-                                                  {2272, 5270, 1027},
-                                                  {305, 2987, 1693},
-                                                  {336, 2892, 1620},
-                                                  {724, 3588, 1628}}};
-  const auto rows = [&](std::initializer_list<uint32_t> remaining) {
-    Scheduler scheduler(0.0);
-    for (const auto &[observed, wall, host] : m6)
-      scheduler.observePrefill(static_cast<uint32_t>(observed), wall, host);
-    uint64_t id = 0;
-    for (const uint32_t prompt : remaining) {
-      scheduler.submit(shortPassingLane(++id, prompt));
-      scheduler.resourcesReady(id, 20'000);
-    }
-    std::vector<uint32_t> result;
-    const BatchPlan plan = *scheduler.next({});
-    for (const BatchItem &item : plan.items)
-      result.push_back(item.tokenCount);
-    return result;
-  };
-  require(rows({300, 9940}) == std::vector<uint32_t>{300, 1748},
-          "a long prompt did not join a short one's command for the fixed part it saves");
-  require(rows({300, 300, 9640}) == std::vector<uint32_t>{300, 300},
-          "a long prompt's rows joined a command whose lanes they cost more than the fixed part they save");
-  Scheduler scheduler(0.0, Scheduler::attentionPairs(262'144 - 2048, 2048));
-  scheduler.observePrefill(2048, 4900.0, 3400.0);
-  scheduler.submit(shortPassingLane(1, 300));
-  scheduler.resourcesReady(1, 20'000);
-  RequestSpec deep = passingLane(2, 48);
-  deep.prefillTokens = 401'748;
-  scheduler.submit(deep);
-  scheduler.resourcesReady(2, 400'000);
-  require(scheduler.next({})->width() == 1,
-          "a lane joined a command in passes with fewer rows than spare it a command, to fit its attention");
-}
-
-// A Foreground prompt's own rows are not held against it when it
-// supersedes a Background command: 2000 rows, more than the command's 300,
-// still supersede it after 3 of its 8 passes, as one lane each.
-void testAHigherPriorityPromptsRowsDoNotCountAgainstIt() {
-  Scheduler scheduler(0.0);
-  scheduler.observePrefill(2048, 4900.0, 3400.0);
-  scheduler.submit(shortPassingLane(1, 300, RequestPriority::Background));
-  scheduler.resourcesReady(1, 20'000);
-  BatchPlan plan = *scheduler.next({});
-  require(plan.passes == 8, "the Background prompt did not run in 8 passes");
-  for (uint32_t pass = 0; pass < 3; ++pass, plan = *scheduler.next({}))
-    completePass(scheduler, plan, 500.0);
-  scheduler.submit(request(2, 2000, RequestPriority::Foreground));
-  scheduler.resourcesReady(2, 0);
-  plan = *scheduler.next({});
-  require(plan.items[0].requestId == 2 && plan.items[0].tokenCount == 2000 && scheduler.abandonsPasses(plan),
-          "a higher priority's rows counted against its superseding a command between its passes");
-}
-
-// A Foreground prompt supersedes a Background command between its passes
-// while the passes the command's lane ran are fewer than those the prompt
-// saves, counted for each Foreground lane: ready after 9 of 19 passes, one is
-// planned at once; after 10, it waits for the command's last pass, which
-// commits its rows first, where two ready together supersede it (10 passes
-// against 2 * 9), and after 13 they wait too (13 against 2 * 6).
-void testAHigherPriorityWaitsForACommandPastItsMiddle() {
-  for (const auto &[ran, prompts, supersedes] :
-       {std::tuple{9u, 1u, true}, {10u, 1u, false}, {10u, 2u, true}, {13u, 2u, false}}) {
-    Scheduler scheduler(0.0);
-    scheduler.observePrefill(2048, 4900.0, 3400.0);
-    RequestSpec spec = passingLane(1, 48);
-    spec.priority = RequestPriority::Background;
-    scheduler.submit(spec);
-    scheduler.resourcesReady(1, 0);
-    BatchPlan plan = *scheduler.next({});
-    require(plan.passes == 19, "the Background group did not run in 19 passes");
-    for (uint32_t pass = 0; pass < ran; ++pass, plan = *scheduler.next({}))
-      completePass(scheduler, plan, 500.0);
-    for (uint64_t id = 2; id < 2 + prompts; ++id) {
-      scheduler.submit(request(id, 100, RequestPriority::Foreground));
-      scheduler.resourcesReady(id, 0);
-    }
-    plan = *scheduler.next({});
-    if (supersedes) {
-      require(plan.items[0].requestId != 1 && plan.width() == prompts && scheduler.abandonsPasses(plan),
-              "Foreground prompts did not supersede a Background command early in its passes");
-      continue;
-    }
-    for (; plan.items[0].requestId == 1; plan = *scheduler.next({}))
-      completePass(scheduler, plan, 500.0);
-    require(scheduler.promptProcessed(1) == 8192 && plan.items[0].requestId != 1,
-            "Foreground prompts superseded a Background command past its middle");
-  }
-}
-
-// A command between its passes runs at the priority of the most urgent request
-// it holds back, which so waits for the rest of its passes and the decode they
-// owe, not for every decode above the command's own priority. A Foreground
-// lane decodes, and a Background command planned without it, as memory on its
-// way back held it, has run past its middle, or is in its fourth attempt after
-// three abandons, so that it yields to nothing. Nothing held back, decode goes
-// first. A Foreground prompt it does not yield to, or a Foreground start it
-// leaves waiting for its end, lets its passes run, three 100 ms decodes owed
-// for each of 500 ms: not a prompt that memory on its way back holds, nor a
-// start beside a prefill that is no command between its passes.
-void testACommandRunsAtThePriorityOfWhatItHoldsBack() {
-  for (const bool abandoned : {false, true}) {
-    for (const bool ready : {true, false}) {
-      Scheduler scheduler(0.5);
-      scheduler.observePrefill(2048, 4900.0, 3400.0);
-      scheduler.submit(request(2, 100, RequestPriority::Foreground));
-      scheduler.resourcesReady(2, 0);
-      completePrefill(scheduler, *scheduler.next({}));
-      RequestSpec spec = passingLane(1, 48);
-      spec.priority = RequestPriority::Background;
-      scheduler.submit(spec);
-      scheduler.resourcesReady(1, 0);
-      const std::array<uint64_t, 1> decoder{2};
-      for (uint64_t attempt = 0; abandoned && attempt < 3; ++attempt) {
-        completePass(scheduler, *scheduler.next(decoder), 500.0, 0.0, decoder);
-        const uint64_t id = 10 + attempt;
-        scheduler.submit(request(id, 100, RequestPriority::Foreground));
-        scheduler.resourcesReady(id, 0);
-        const BatchPlan superseding = *scheduler.next(decoder);
-        require(superseding.items[0].requestId == id && scheduler.abandonsPasses(superseding),
-                "a Foreground prompt did not supersede a Background command early in its passes");
-        scheduler.abandonPasses();
-        scheduler.cancel(id);
-      }
-      const uint32_t ran = abandoned ? 1 : 10;
-      uint32_t left = 0;
-      for (uint32_t pass = 0; pass < ran; ++pass) {
-        const BatchPlan plan = *scheduler.next(decoder);
-        require(plan.items[0].requestId == 1 && plan.pass == pass, "the Background command did not run its passes");
-        left = plan.passes - pass - 1;
-        completePass(scheduler, plan, 500.0, 0.0, decoder);
-      }
-      const auto decode = [&](const BatchPlan &plan) {
-        scheduler.commit(plan, {});
-        const std::array decoded{StepResult{2, 0, false, DecodeStage::Regular}};
-        scheduler.complete(plan, decoded, 100.0, true);
-      };
-      BatchPlan plan = *scheduler.next({});
-      require(plan.kind == WorkKind::Decode, "a command that held nothing back ran before a higher priority's decode");
-      decode(plan);
-      scheduler.submit(request(3, 100, RequestPriority::Foreground));
-      if (ready) {
-        scheduler.resourcesReady(3, 0);
-        const std::array<uint64_t, 1> held{3};
-        require(scheduler.next(held)->kind == WorkKind::Decode,
-                "a command ran at the priority of a prompt that memory on its way back held");
-      } else {
-        scheduler.waitForResources(3);
-      }
-      uint32_t passes = 0, decodes = 0;
-      while (passes < left && decodes <= 3 * left) {
-        plan = *scheduler.next({});
-        if (plan.kind == WorkKind::Decode) {
-          decode(plan);
-          ++decodes;
-        } else {
-          require(plan.items[0].requestId == 1, "a Foreground prompt superseded a command that does not yield to it");
-          completePass(scheduler, plan, 500.0);
-          ++passes;
-        }
-      }
-      require(passes == left && decodes <= 3 * left && scheduler.promptProcessed(1) == 8192,
-              "what a command held back waited for a higher priority's decode, not for its passes");
-      plan = *scheduler.next({});
-      if (ready) {
-        while (plan.kind == WorkKind::Decode) {
-          decode(plan);
-          plan = *scheduler.next({});
-        }
-        require(plan.items[0].requestId == 3, "a prompt a command held back did not run after its last pass");
-      }
-    }
-  }
-  Scheduler scheduler(0.5);
-  scheduler.observePrefill(2048, 4900.0, 3400.0);
-  scheduler.submit(request(2, 100, RequestPriority::Foreground));
-  scheduler.resourcesReady(2, 0);
-  completePrefill(scheduler, *scheduler.next({}));
-  scheduler.submit(request(1, 4096, RequestPriority::Background));
-  scheduler.resourcesReady(1, 0);
-  scheduler.submit(request(3, 100, RequestPriority::Foreground));
-  scheduler.waitForResources(3);
-  completeDecode(scheduler);
-  require(scheduler.next({})->kind == WorkKind::Decode,
-          "a prefill that is no command between its passes ran at a waiting start's priority");
-}
-
-// The oldest of near-equal prompts leads a command in passes as the shortest
-// would. Lane 1 of 34,000 rows leads lane 2 of 30,000, keeps its rows and runs
-// them in passes, alone: lane 2 does not start beside the command, nor a command
-// of its own, since the next plan leaves it out. A prompt's own command goes on
-// when an older near-equal prompt becomes ready between its passes, or a short
-// arrival, whose plan keeps none of its rows, and it is not given up for them:
-// each leads the command after its last pass, which commits its rows first.
-void testANearEqualLeaderKeepsThePassesRules() {
-  const auto longLane = [](uint64_t id, uint32_t rows) {
-    RequestSpec spec = passingLane(id, 48);
-    spec.prefillTokens = rows;
-    return spec;
-  };
-  {
-    Scheduler scheduler(0.0);
-    scheduler.observePrefill(2048, 4900.0, 3400.0);
-    scheduler.submit(longLane(1, 34'000));
-    scheduler.submit(longLane(2, 30'000));
-    scheduler.resourcesReady(1, 0);
-    const std::array waiting{PrefillAdmission{2, 0}};
-    require(scheduler.prefillAdmissionOrder(waiting).empty(),
-            "a younger near-equal prompt started beside the older one's command");
-    const BatchPlan first = *scheduler.next({});
-    require(first.items.size() == 1 && first.items[0].requestId == 1 && first.passes > 1,
-            "the older of near-equal prompts did not lead a command in passes");
-    completePass(scheduler, first, 500.0);
-    require(scheduler.prefillAdmissionOrder(waiting).empty(),
-            "a younger near-equal prompt started beside a command between its passes");
-    scheduler.resourcesReady(2, 0);
-    const BatchPlan second = *scheduler.next({});
-    require(second.pass == 1 && second.items == first.items && !scheduler.abandonsPasses(second),
-            "a near-equal prompt cut the command of the one that leads it");
-  }
-  {
-    Scheduler scheduler(0.0);
-    scheduler.observePrefill(2048, 4900.0, 3400.0);
-    scheduler.submit(longLane(1, 34'000));
-    scheduler.submit(longLane(2, 30'000));
-    scheduler.resourcesReady(2, 0);
-    const BatchPlan first = *scheduler.next({});
-    require(first.items.size() == 1 && first.items[0].requestId == 2 && first.passes > 1,
-            "the only ready prompt did not lead a command in passes");
-    completePass(scheduler, first, 500.0);
-    scheduler.resourcesReady(1, 0);
-    scheduler.submit(shortPassingLane(3, 300));
-    scheduler.resourcesReady(3, 20'000);
-    BatchPlan plan = *scheduler.next({});
-    require(plan.pass == 1 && plan.items == first.items && !scheduler.abandonsPasses(plan),
-            "an older near-equal prompt or a short arrival gave a command up");
-    for (; plan.pass + 1 < plan.passes; plan = *scheduler.next({}))
-      completePass(scheduler, plan, 500.0);
-    const uint32_t rows = plan.items[0].tokenCount;
-    completePass(scheduler, plan, 500.0);
-    plan = *scheduler.next({});
-    require(scheduler.promptProcessed(2) == rows && plan.pass == 0 && plan.items[0].requestId == 3,
-            "a command's last pass did not commit its rows before the next command");
-  }
-}
-
-// However often work that supersedes a command between its passes comes, a
-// lane's rows commit. Short arrivals at every pass of a lane's group leave
-// it its rows, which commit at its last pass. Once a lane has seen three of
-// its commands abandoned, kMaximumOvertakes, its command runs to its end:
-// arrivals that join a short prompt's command, which then runs without them
-// as their memory comes back (excluded), abandon it three times at most;
-// and a Background group that a Foreground prompt arrives during at every
-// attempt yields three times, runs to its end before the fourth's prompt,
-// and its next group yields again.
-void testCommandsInPassesEndUnderArrivals() {
-  {
-    Scheduler scheduler(0.0);
-    scheduler.observePrefill(2048, 4900.0, 3400.0);
-    scheduler.submit(passingLane(1, 48));
-    scheduler.resourcesReady(1, 0);
-    BatchPlan plan = *scheduler.next({});
-    for (uint64_t id = 2; scheduler.promptProcessed(1) == 0; ++id) {
-      require(plan.items.back() == BatchItem{1, 8192, 0} && !scheduler.abandonsPasses(plan),
-              "short arrivals abandoned a lane's group in passes");
-      completePass(scheduler, plan, 500.0);
-      scheduler.submit(shortPassingLane(id, 300));
-      scheduler.resourcesReady(id, 20'000);
-      plan = *scheduler.next({});
-    }
-    require(scheduler.promptProcessed(1) == 8192, "a lane's group did not commit under short arrivals");
-  }
-  {
-    Scheduler scheduler(0.0);
-    scheduler.observePrefill(2048, 4900.0, 3400.0);
-    scheduler.submit(shortPassingLane(1, 300));
-    scheduler.resourcesReady(1, 20'000);
-    BatchPlan plan = *scheduler.next({});
-    completePass(scheduler, plan, 500.0);
-    std::vector<uint64_t> waiting;
-    for (uint64_t id = 2; id <= 4; ++id) {
-      scheduler.submit(shortPassingLane(id, 300));
-      scheduler.resourcesReady(id, 20'000);
-      plan = *scheduler.next(waiting);
-      require(plan.pass == 0 && plan.width() == 2 && scheduler.abandonsPasses(plan),
-              "a short arrival did not join a command early in its passes");
-      scheduler.abandonPasses();
-      plan.items.resize(1);
-      waiting.push_back(id);
-      completePass(scheduler, plan, 500.0, 0.0, waiting);
-    }
-    scheduler.submit(shortPassingLane(5, 300));
-    scheduler.resourcesReady(5, 20'000);
-    const BatchPlan next = *scheduler.next(waiting);
-    require(next.pass == 1 && next.items == plan.items && !scheduler.abandonsPasses(next),
-            "a command abandoned three times for arrivals was abandoned again");
-  }
-  {
-    Scheduler scheduler(0.0);
-    scheduler.observePrefill(2048, 4900.0, 3400.0);
-    RequestSpec spec = passingLane(1, 48);
-    spec.priority = RequestPriority::Background;
-    scheduler.submit(spec);
-    scheduler.resourcesReady(1, 0);
-    for (uint64_t attempt = 1; attempt <= 5; ++attempt) {
-      BatchPlan plan = *scheduler.next({});
-      require(plan.items == std::vector<BatchItem>{{1, 8192, scheduler.promptProcessed(1)}} && plan.pass == 0,
-              "the Background lane did not start its group");
-      completePass(scheduler, plan, 500.0);
-      const uint64_t foreground = 100 + attempt;
-      scheduler.submit(request(foreground, 100, RequestPriority::Foreground));
-      scheduler.resourcesReady(foreground, 0);
-      plan = *scheduler.next({});
-      if (attempt != 4) {
-        require(plan.items[0].requestId == foreground && scheduler.abandonsPasses(plan),
-                "a Foreground prompt did not supersede a Background command that yielded fewer than three times");
-        scheduler.abandonPasses();
-      } else {
-        for (; plan.items[0].requestId == 1; plan = *scheduler.next({}))
-          completePass(scheduler, plan, 500.0);
-        require(scheduler.promptProcessed(1) == 8192 && plan.items[0].requestId == foreground,
-                "a Background command that yielded three times did not run to its end first");
-      }
-      completePrefill(scheduler, plan);
-      completeDecode(scheduler, true);
-    }
-  }
-}
-
-// A command between its passes yields, whole, to a prompt of a higher
-// priority, planned before its next pass, which commits only once it is
-// abandoned, after which its lanes run their rows again from a first pass.
-// A Foreground lane's decode, once its first mask lands, runs before its
-// next pass too, but between its passes, which use none of the memory
-// decode does: the command goes on after it.
-void testPassesYieldToAHigherPriority() {
-  Scheduler scheduler(0.0);
-  scheduler.observePrefill(2048, 4900.0, 3400.0);
-  scheduler.submit(request(3, 100, RequestPriority::Foreground));
-  scheduler.resourcesReady(3, 0);
-  awaitFirstMask(scheduler, 3);
-  for (uint64_t id = 1; id <= 2; ++id) {
-    scheduler.submit(shortPassingLane(id, 300, RequestPriority::Background));
-    scheduler.resourcesReady(id, 20'000);
-  }
-  const BatchPlan first = *scheduler.next({});
-  require(first.width() == 2 && first.pass == 0 && first.passes > 1,
-          "two Background prompts did not share a command in passes");
-  completePass(scheduler, first, 500.0);
-  scheduler.maskReady(3);
-  BatchPlan plan = *scheduler.next({});
-  require(plan.kind == WorkKind::Decode && plan.items[0].requestId == 3 && !scheduler.abandonsPasses(plan),
-          "a higher priority's decode waited for a command between its passes, or abandoned it");
-  completeDecode(scheduler, true);
-  plan = *scheduler.next({});
-  require(plan.kind == WorkKind::Prefill && plan.pass == 1 && plan.items == first.items,
-          "a command did not go on with its next pass after a higher priority's decode");
-  scheduler.submit(request(5, 100, RequestPriority::Foreground));
-  scheduler.resourcesReady(5, 0);
-  plan = *scheduler.next({});
-  require(plan.kind == WorkKind::Prefill && plan.items[0].requestId == 5 && plan.width() == 1 &&
-              scheduler.abandonsPasses(plan),
-          "a higher priority's prompt waited for a command between its passes");
-  rejects([&] { scheduler.commit(plan, {}); }, "batch no longer matches",
-          "a higher priority's prompt committed beside a command between its passes");
-  scheduler.abandonPasses();
-  require(!scheduler.abandonsPasses(plan), "an abandoned command stayed between its passes");
-  completePrefill(scheduler, plan);
-  completeDecode(scheduler, true);
-  plan = *scheduler.next({});
-  require(plan.kind == WorkKind::Prefill && plan.pass == 0 && plan.items == first.items,
-          "an abandoned command's lanes did not run its rows again from a first pass");
-}
-
-// A command between its passes holds its lanes to its last pass: a pass
-// before the last consumes no rows. It is not abandoned while a pass of it
-// runs; abandoned, it leaves
-// its lanes their rows, which they run again from a first pass, a lane
-// suspended meanwhile too once it resumes.
-void testCommandBetweenPassesHoldsItsLanes() {
-  Scheduler scheduler(0.0);
-  scheduler.observePrefill(2048, 4900.0, 3400.0);
-  for (uint64_t id = 1; id <= 2; ++id) {
-    scheduler.submit(shortPassingLane(id, 300));
-    scheduler.resourcesReady(id, 20'000);
-  }
-  const BatchPlan first = *scheduler.next({});
-  scheduler.commit(first, {});
-  rejects([&] { scheduler.abandonPasses(); }, "no command between its passes",
-          "a command was abandoned while a pass of it ran");
-  const std::array results{StepResult{1, 0, false, DecodeStage::Regular},
-                           StepResult{2, 0, false, DecodeStage::Regular}};
-  scheduler.complete(first, results, 500.0, true);
-  require(scheduler.phase(1) == engine::Phase::Prefill && scheduler.promptProcessed(1) == 20'000,
-          "a pass before a command's last consumed its rows");
-  scheduler.abandonPasses();
-  BatchPlan plan = *scheduler.next({});
-  require(plan.pass == 0 && plan.passes == first.passes && plan.items == first.items,
-          "an abandoned command's lanes did not run its rows again from a first pass");
-  completePass(scheduler, plan, 500.0);
-  scheduler.abandonPasses();
-  scheduler.suspendForResources(1);
-  scheduler.resumeFromResources(1, 20'000, 20'300);
-  plan = *scheduler.next({});
-  require(plan.pass == 0 && plan.items == first.items,
-          "a lane suspended between its command's passes did not run its rows again with the others");
-}
-
-// Completes a prefill command of one lane that streamed its history, which
-// waited streamMilliseconds of its hostMilliseconds on the reads.
-void completeStreamedPrefill(engine::Scheduler &scheduler, const BatchPlan &plan,
-                             double wallMilliseconds, double hostMilliseconds,
-                             double streamMilliseconds) {
-  require(plan.kind == WorkKind::Prefill && plan.width() == 1, "expected a streaming lane alone");
-  scheduler.commit(plan, {});
-  const std::array result{
-      StepResult{plan.items[0].requestId, plan.items[0].tokenCount, false, DecodeStage::Regular}};
-  scheduler.complete(plan, result, wallMilliseconds, true, hostMilliseconds, streamMilliseconds);
-}
-
-// A lane that streams its history runs alone: leading, it takes no peers
-// into its command; behind a leader, it is passed over while the others
-// share the command, until later arrivals have overtaken it often enough
-// that it leads one.
-void testStreamingLaneRunsAlone() {
-  Scheduler scheduler(0.0);
-  scheduler.submit(request(1, 100));
-  scheduler.submit(request(2, 300));
-  scheduler.submit(request(3, 500));
-  for (uint64_t id = 1; id <= 3; ++id)
-    scheduler.resourcesReady(id, 0);
-  scheduler.setStreamsHistory(1, true);
-  BatchPlan plan = *scheduler.next({});
-  require(plan.width() == 1 && plan.items[0].requestId == 1 && plan.items[0].tokenCount == 100,
-          "a streaming leader shared its command");
-  scheduler.setStreamsHistory(1, false);
-  scheduler.setStreamsHistory(2, true);
-  plan = *scheduler.next({});
-  require(plan.width() == 2 && plan.items[0].requestId == 1 && plan.items[1].requestId == 3,
-          "a streaming lane joined a command it did not lead");
-
-  Scheduler overtaken(0.0);
-  overtaken.submit(request(1, 4000));
-  overtaken.resourcesReady(1, 0);
-  overtaken.setStreamsHistory(1, true);
-  uint64_t id = 2;
-  for (; id <= model::ExecutionLimits::maximumBatchWidth; ++id) {
-    overtaken.submit(request(id, 100));
-    overtaken.resourcesReady(id, 0);
-    plan = *overtaken.next({});
-    require(plan.width() == 1 && plan.items[0].requestId == id,
-            "a passed-over streaming lane led or joined a command");
-    completePrefill(overtaken, plan);
-    overtaken.cancel(id);
-  }
-  overtaken.submit(request(id, 100));
-  overtaken.resourcesReady(id, 0);
-  plan = *overtaken.next({});
-  require(plan.width() == 1 && plan.items[0].requestId == 1,
-          "an overtaken streaming lane did not lead a command of its own");
-}
-
-// Contended, a lane that streams its history takes the fewest rows, halving
-// from its prefill group's, whose time still covers its estimated wait on
-// the reads: fewer would not end the command sooner. It never takes fewer
-// than another contended command, which it takes before it has streamed.
-// Uncontended, it takes its group.
-void testContendedStreamingLaneHalvesFromItsGroup() {
-  // At 0.5 ms a row, a contended command takes 512 rows.
-  const auto first = [](std::optional<double> streamMilliseconds, bool contended) {
-    Scheduler scheduler(0.0);
-    scheduler.observePrefill(2048, 1024.0);
-    RequestSpec spec = request(1, 100'000);
-    spec.prefillGroupRows = 4 * model::ExecutionLimits::prefillTokenBudget;
-    scheduler.submit(spec);
-    scheduler.resourcesReady(1, 0);
-    scheduler.setStreamsHistory(1, true);
-    if (streamMilliseconds) {
-      const BatchPlan streamed = *scheduler.next({});
-      completeStreamedPrefill(scheduler, streamed,
-                              streamed.items[0].tokenCount * 0.5 + *streamMilliseconds,
-                              *streamMilliseconds, *streamMilliseconds);
-    }
-    if (contended) {
-      scheduler.submit(request(2, 1));
-      scheduler.resourcesReady(2, 1);
-      completeDecode(scheduler);
-    }
-    const BatchPlan plan = *scheduler.next({});
-    require(plan.kind == WorkKind::Prefill && plan.width() == 1 && plan.items[0].requestId == 1,
-            "expected the streaming lane alone");
-    return plan.items[0].tokenCount;
-  };
-  require(first(std::nullopt, true) == 512,
-          "a streaming lane's first contended command took more than another's");
-  require(first(2800.0, true) == 8192, "a contended stream that dominates its group was cut");
-  require(first(1000.0, true) == 2048,
-          "a contended streaming lane did not take the fewest rows covering its stream");
-  require(first(0.0, true) == 512, "a stream nothing waited on cut a command below another's");
-  require(first(2800.0, false) == 8192, "an uncontended streaming lane did not take its group");
-}
-
-// A lane that streams its history may run commands that read none of it,
-// before its first pages spill: they leave its estimate of the wait alone,
-// which its first command that read the history sets.
-void testStreamEstimateIgnoresCommandsThatReadNothing() {
-  Scheduler scheduler(0.0);
-  scheduler.observePrefill(2048, 1024.0);
-  RequestSpec spec = request(1, 100'000);
-  spec.prefillGroupRows = 4 * model::ExecutionLimits::prefillTokenBudget;
-  scheduler.submit(spec);
-  scheduler.resourcesReady(1, 0);
-  scheduler.setStreamsHistory(1, true);
-  const BatchPlan unread = *scheduler.next({});
-  completePrefill(scheduler, unread, unread.items[0].tokenCount * 0.5);
-  const BatchPlan streamed = *scheduler.next({});
-  completeStreamedPrefill(scheduler, streamed, streamed.items[0].tokenCount * 0.5 + 2800.0,
-                          2800.0, 2800.0);
-  scheduler.submit(request(2, 1));
-  scheduler.resourcesReady(2, 1);
-  completeDecode(scheduler);
-  const BatchPlan plan = *scheduler.next({});
-  require(plan.kind == WorkKind::Prefill && plan.items[0].requestId == 1 &&
-              plan.items[0].tokenCount == 8192,
-          "a command that read no history lowered its lane's estimate of the reads");
-}
-
-// A streaming command's wait on its history is its lane's own cost: the
-// command estimate other commands' slices come from leaves it out, and the
-// rows it ran train the per-row estimate as any command's do.
-void testStreamWaitStaysOutOfTheCommandEstimate() {
-  Scheduler scheduler(0.0);
-  scheduler.observePrefill(2048, 1024.0);
-  scheduler.submit(request(1, 4096));
-  scheduler.resourcesReady(1, 0);
-  scheduler.setStreamsHistory(1, true);
-  // 3 s of reads beside 2048 rows at 0.5 ms each.
-  completeStreamedPrefill(scheduler, *scheduler.next({}), 4024.0, 3000.0, 3000.0);
-  scheduler.setStreamsHistory(1, false);
-  scheduler.submit(request(2, 1));
-  scheduler.resourcesReady(2, 1);
-  completeDecode(scheduler);
-  const BatchPlan plan = *scheduler.next({});
-  require(plan.kind == WorkKind::Prefill && plan.items[0].tokenCount == 512,
-          "a streamed command's wait on its reads widened other commands' slices");
-}
-
-// The images a prefill command encodes run ahead of it as a command of their
-// own: the command owes decode their time as its own, and the command
-// estimate other commands' slices come from leaves it out.
-void testImageEncodesStayOutOfTheCommandEstimate() {
-  Scheduler scheduler(0.5);
-  scheduler.observePrefill(2048, 1843.2);
-  scheduler.submit(request(1, 4096));
-  scheduler.resourcesReady(1, 0);
-  scheduler.submit(request(2, 1));
-  scheduler.resourcesReady(2, 1);
-  completeDecode(scheduler);
-  BatchPlan plan = *scheduler.next({});
-  require(plan.kind == WorkKind::Prefill && plan.items[0].tokenCount == 512,
-          "a contended command did not take the slice's rows");
-  // 512 rows at 0.9 ms each, as the estimate gives them, behind 200 ms of
-  // encodes: the rows alone keep it at 0.9 ms a row (512 rows a slice), where
-  // with the encodes it would reach 1.29 (256). The command owes decode its
-  // whole 661 ms by half, two decodes of 250 ms, where its rows alone would
-  // owe one.
-  scheduler.commit(plan, {});
-  const std::array result{StepResult{1, 512, false, DecodeStage::Regular}};
-  scheduler.complete(plan, result, 661.0, true, 0.0, std::nullopt, 200.0);
-  uint32_t decodes = 0;
-  for (plan = *scheduler.next({}); plan.kind == WorkKind::Decode; plan = *scheduler.next({})) {
-    scheduler.commit(plan, {});
-    const std::array decoded{StepResult{2, 0, false, DecodeStage::Regular}};
-    scheduler.complete(plan, decoded, 250.0, true);
-    ++decodes;
-  }
-  require(decodes == 2, "a command did not owe decode the time of its images' encodes");
-  require(plan.items[0].requestId == 1 && plan.items[0].tokenCount == 512,
-          "a command's image encodes trained other commands' slices");
-}
-
-// A command in passes whose first pass encoded images trains the estimate
-// with its passes' time less the encodes: its next command runs in the
-// passes and rows of one that encoded none.
-void testImageEncodesStayOutOfAPassedCommandsEstimate() {
-  std::array<BatchPlan, 2> next;
-  for (const bool encodes : {false, true}) {
-    Scheduler scheduler(0.0);
-    scheduler.observePrefill(2048, 4900.0, 3400.0);
-    scheduler.submit(passingLane(1, 48));
-    scheduler.resourcesReady(1, 0);
-    BatchPlan plan = *scheduler.next({});
-    const uint32_t passes = plan.passes;
-    for (uint32_t pass = 0; pass < passes; ++pass) {
-      require(plan.items[0].requestId == 1 && plan.pass == pass && plan.passes == passes,
-              "a command's next pass did not go on");
-      const double encoded = encodes && !pass ? 5000.0 : 0.0;
-      scheduler.commit(plan, {});
-      const uint32_t consumed = pass + 1 == passes ? plan.items[0].tokenCount : 0;
-      const std::array result{StepResult{1, consumed, false, DecodeStage::Regular}};
-      scheduler.complete(plan, result, 500.0 + encoded, true, 300.0, std::nullopt, encoded);
-      plan = *scheduler.next({});
-    }
-    next[encodes] = plan;
-  }
-  require(next[0].passes == 19 && next[1].passes == next[0].passes &&
-              next[1].items[0].tokenCount == next[0].items[0].tokenCount,
-          "a command's first pass's image encodes trained its next command's passes");
-}
-
-// Each gap a decoding lane sees between its commands across a streaming
-// prefill command is recorded, and the command counts as contended; gaps
-// across other commands are not recorded.
-void testDecodeGapAcrossStreamingPrefill() {
-  Scheduler scheduler(0.0);
-  scheduler.submit(request(1, 1));
-  scheduler.resourcesReady(1, 1);
-  scheduler.submit(request(2, 4096));
-  scheduler.resourcesReady(2, 0);
-  completeDecode(scheduler, false, 40.0);
-  completePrefill(scheduler, *scheduler.next({}), 1000.0);
-  completeDecode(scheduler, false, 40.0);
-  require(scheduler.snapshot().decodeGap.count == 0 &&
-              scheduler.snapshot().contendedStreamingPrefillBatches == 0,
-          "a gap across an ordinary prefill was recorded");
-  scheduler.setStreamsHistory(2, true);
-  completeStreamedPrefill(scheduler, *scheduler.next({}), 3000.0, 2500.0, 2500.0);
-  completeDecode(scheduler, false, 40.0);
-  const SchedulerSnapshot counts = scheduler.snapshot();
-  require(counts.decodeGap.count == 1 && counts.decodeGap.maximumMilliseconds == 3040.0 &&
-              counts.contendedStreamingPrefillBatches == 1,
-          "the gap across a streaming prefill was not recorded");
-}
-
-void testShortestRemainingFirstUsesActualRows() {
-  engine::Scheduler scheduler(0.0);
-  scheduler.submit(request(1, 17));
-  scheduler.submit(request(2, 1000));
-  scheduler.submit(request(3, 3000));
-  scheduler.resourcesReady(1, 0);
-  scheduler.resourcesReady(2, 0);
-  scheduler.resourcesReady(3, 0);
-  BatchPlan plan = *scheduler.next({});
-  require(plan.kind == WorkKind::Prefill && plan.items.size() == 3,
-          "ragged prefill did not batch all ready sequences");
-  uint32_t rows = 0;
-  for (const BatchItem &item : plan.items)
-    rows += item.tokenCount;
-  require(rows == model::ExecutionLimits::prefillTokenBudget,
-          "ragged prefill did not use the exact actual-row budget");
-  require(plan.items[0].requestId == 1 && plan.items[0].tokenCount == 17 &&
-              plan.items[1].requestId == 2 &&
-              plan.items[1].tokenCount == 1000 &&
-              plan.items[2].requestId == 3 &&
-              plan.items[2].tokenCount == 1031,
-          "prefill did not serve the shortest remaining sequences first");
-  require(std::all_of(plan.items.begin(), plan.items.end(),
-                      [](const BatchItem &item) {
-                        return item.promptOffset == 0;
-                      }),
-          "initial prefill plan did not carry its absolute token offset");
-}
-
-// The engine ends a lane's command before its planned rows at a state
-// boundary whose state or KV it could not reserve (Engine::prepare): the
-// scheduler takes the rows the shortened item ran, and the lane resumes from
-// them.
-void testShortenedPrefillResumesFromItsRows() {
-  engine::Scheduler scheduler(0.0);
-  scheduler.submit(request(1, 4096));
-  scheduler.submit(request(2, 1000));
-  scheduler.resourcesReady(1, 0);
-  scheduler.resourcesReady(2, 0);
-  BatchPlan plan = *scheduler.next({});
-  require(plan.items.size() == 2 && plan.items[0].requestId == 2 &&
-              plan.items[1].requestId == 1 && plan.items[1].tokenCount == 1048,
-          "the long lane did not take the rest of the budget");
-  plan.items[1].tokenCount = 32;
-  completePrefill(scheduler, plan);
-  require(scheduler.promptProcessed(1) == 32 && scheduler.phase(1) == engine::Phase::Prefill,
-          "a shortened command did not keep the rows it ran");
-  completeDecode(scheduler, true);
-  const BatchPlan resumed = *scheduler.next({});
-  require(resumed.items.size() == 1 && resumed.items[0].requestId == 1 &&
-              resumed.items[0].promptOffset == 32 &&
-              resumed.items[0].tokenCount == model::ExecutionLimits::prefillTokenBudget,
-          "the shortened lane did not resume from the rows it ran");
-}
-
-void testEqualPromptsFinishInArrivalOrder() {
-  // Equal cold prompts are served oldest first, one whole budget at a time,
-  // instead of an equal water-fill share that finishes them all at once.
-  engine::Scheduler scheduler(0.0);
-  for (uint64_t id = 1; id <= 3; ++id) {
-    scheduler.submit(request(id, 3000));
-    scheduler.resourcesReady(id, 0);
-  }
-  const BatchPlan plan = *scheduler.next({});
-  require(plan.kind == WorkKind::Prefill && plan.items.size() == 1 &&
-              plan.items[0].requestId == 1 &&
-              plan.items[0].tokenCount ==
-                  model::ExecutionLimits::prefillTokenBudget,
-          "equal prompts were water-filled instead of served oldest first");
-}
-
-void testShortArrivalPrecedesLongColdPrompt() {
-  engine::Scheduler scheduler(0.0);
-  scheduler.submit(request(1, 3000));
-  scheduler.submit(request(2, 700));
-  scheduler.resourcesReady(1, 0);
-  scheduler.resourcesReady(2, 0);
-  const BatchPlan plan = *scheduler.next({});
-  require(plan.items.size() == 2 && plan.items[0].requestId == 2 &&
-              plan.items[0].tokenCount == 700 &&
-              plan.items[1].requestId == 1 &&
-              plan.items[1].tokenCount == 1348,
-          "a later short prompt waited behind an earlier long one");
-}
-
-void testEqualLanesRunInArrivalOrderWithoutOvertaking() {
-  engine::Scheduler scheduler(0.0);
-  scheduler.submit(request(1, 5000));
-  scheduler.submit(request(2, 5000));
-  scheduler.resourcesReady(1, 0);
-  scheduler.resourcesReady(2, 0);
-  const BatchPlan first = *scheduler.next({});
-  require(first.items.size() == 1 && first.items[0].requestId == 1 &&
-              first.items[0].tokenCount ==
-                  model::ExecutionLimits::prefillTokenBudget,
-          "first command did not give the whole budget to the oldest lane");
-  completePrefill(scheduler, first);
-  // Lane 2 was left out by an older lane, which is not overtaking: lane 1
-  // keeps the budget until it finishes, as under FIFO.
-  const BatchPlan second = *scheduler.next({});
-  require(second.items.size() == 1 && second.items[0].requestId == 1,
-          "an older lane lost the budget to a younger equal lane");
-}
-
-void testLaneOvertakenThreeTimesLeadsTheNextCommand() {
-  engine::Scheduler scheduler(0.0);
-  scheduler.submit(request(1, 6000));
-  scheduler.resourcesReady(1, 0);
-  // Three later short arrivals each take the whole budget ahead of lane 1;
-  // each stops in prefill so no decode command interleaves.
-  const auto finishShort = [&](const BatchPlan &plan) {
-    scheduler.commit(plan, {});
-    const std::vector<StepResult> results{
-        {plan.items[0].requestId, plan.items[0].tokenCount, true,
-         DecodeStage::Regular}};
-    scheduler.complete(plan, results, 0.0, true);
-  };
-  for (uint64_t id = 2; id <= 4; ++id) {
-    scheduler.submit(request(id, model::ExecutionLimits::prefillTokenBudget));
-    scheduler.resourcesReady(id, 0);
-    const BatchPlan plan = *scheduler.next({});
-    require(plan.kind == WorkKind::Prefill && plan.items.size() == 1 &&
-                plan.items[0].requestId == id,
-            "a short arrival did not run ahead of the long lane");
-    finishShort(plan);
-  }
-  scheduler.submit(request(5, model::ExecutionLimits::prefillTokenBudget));
-  scheduler.resourcesReady(5, 0);
-  const BatchPlan overdue = *scheduler.next({});
-  require(overdue.items.size() == 1 && overdue.items[0].requestId == 1 &&
-              overdue.items[0].tokenCount ==
-                  model::ExecutionLimits::prefillTokenBudget,
-          "a lane overtaken three times did not lead the next command");
-  completePrefill(scheduler, overdue);
-  // Served once, the long lane yields to short arrivals again.
-  const BatchPlan resumed = *scheduler.next({});
-  require(resumed.items.size() == 1 && resumed.items[0].requestId == 5,
-          "a served lane kept its overdue priority");
-}
-
-void testServedLaneResetsOvertaking() {
-  engine::Scheduler scheduler(0.0);
-  scheduler.submit(request(1, 3000));
-  scheduler.submit(request(2, 700));
-  scheduler.resourcesReady(1, 0);
-  scheduler.resourcesReady(2, 0);
-  const BatchPlan first = *scheduler.next({});
-  require(first.items.size() == 2,
-          "both ready lanes did not share the command");
-  scheduler.commit(first, {});
-  // The short prompt stops in prefill; the long one keeps its remainder.
-  std::vector<StepResult> results;
-  for (const BatchItem &item : first.items) {
-    results.push_back({item.requestId, item.tokenCount, item.requestId == 2,
-                       DecodeStage::Regular});
-  }
-  scheduler.complete(first, results, 0.0, true);
-  scheduler.submit(request(3, 200));
-  scheduler.resourcesReady(3, 0);
-  const BatchPlan second = *scheduler.next({});
-  require(second.items.size() == 2 && second.items[0].requestId == 3 &&
-              second.items[0].tokenCount == 200 &&
-              second.items[1].requestId == 1 &&
-              second.items[1].tokenCount == 1652,
-          "a lane that received rows was treated as overtaken");
-}
-
-// The lane that leads the next prefill command once lane 1 of `earlier`
-// tokens and lane 2 of `later`, submitted after it, are ready from their
-// cached positions.
-uint64_t prefillLeader(engine::Scheduler &scheduler, uint32_t earlier, uint32_t later,
-                       uint32_t earlierCached = 0, uint32_t laterCached = 0,
-                       RequestPriority earlierPriority = RequestPriority::Normal) {
-  scheduler.submit(request(1, earlier, earlierPriority));
-  scheduler.submit(request(2, later));
-  scheduler.resourcesReady(1, earlierCached);
-  scheduler.resourcesReady(2, laterCached);
-  return scheduler.next({})->items.front().requestId;
-}
-
-uint64_t prefillLeader(uint32_t earlier, uint32_t later, uint32_t earlierCached = 0,
-                       uint32_t laterCached = 0,
-                       RequestPriority earlierPriority = RequestPriority::Normal) {
-  engine::Scheduler scheduler(0.0);
-  return prefillLeader(scheduler, earlier, later, earlierCached, laterCached, earlierPriority);
-}
-
-// The oldest lane leads whose remaining prompt exceeds the shortest by at most
-// a command of the shortest's for each k = 3 it needs past its first.
-// Unmeasured, a command is 2048 rows: 30,000 take 15 commands and allow
-// 4 x 2048; 6,145 take 4 and allow 2048; 6,144 take 3 and allow none, as at
-// 4,000 and 3,000.
-void testOldestNearEqualPromptLeads() {
-  require(prefillLeader(71'254, 71'220) == 1 && prefillLeader(38'192, 30'000) == 1 &&
-              prefillLeader(8193, 6145) == 1,
-          "a later prompt led an earlier one within the rows it would lead overdue");
-  require(prefillLeader(38'193, 30'000) == 2 && prefillLeader(8192, 6144) == 2 &&
-              prefillLeader(4000, 3000) == 2,
-          "an earlier prompt led a later one past the rows it would lead overdue");
-  // Remaining rows, after a cached prefix: 20,000 against 19,000 lead, and
-  // 22,000 against 16,000 do not.
-  require(prefillLeader(40'000, 19'000, 20'000, 0) == 1 &&
-              prefillLeader(22'000, 40'000, 0, 24'000) == 2,
-          "near-equal prompts were not measured by their remaining rows");
-  // Beside a decoder, at 512-row slices: 2,000 rows take four commands and
-  // allow 512; 500 take one.
-  const auto contendedLeader = [](uint32_t earlier, uint32_t later) {
-    engine::Scheduler scheduler(0.0);
-    scheduler.observePrefill(2048, 1024.0);
-    scheduler.submit(request(3, 1));
-    scheduler.resourcesReady(3, 1);
-    completeDecode(scheduler);
-    return prefillLeader(scheduler, earlier, later);
-  };
-  require(contendedLeader(2512, 2000) == 1 && contendedLeader(2513, 2000) == 2 &&
-              contendedLeader(600, 500) == 2,
-          "near-equal prompts were not measured in their contended commands");
-  // Prompts that finish within k commands keep shortest first.
-  engine::Scheduler scheduler(0.0);
-  for (uint64_t id = 1; id <= 3; ++id) {
-    scheduler.submit(request(id, id == 1 ? 1300 : 1000));
-    scheduler.resourcesReady(id, 0);
-  }
-  const BatchPlan plan = *scheduler.next({});
-  require(plan.items.size() == 3 && plan.items[0].requestId == 2 &&
-              plan.items[1].requestId == 3 && plan.items[2].requestId == 1 &&
-              plan.items[2].tokenCount == 48,
-          "short prompts did not run shortest first");
-}
-
-// The band counts the shortest lane's own commands: in 8192-row prefill
-// groups, 20,000 rows take three and allow none, where chunks would allow
-// 6,144; and with the shortest streaming its history beside a ready peer,
-// 2,000 rows take four 512-row slices and allow 512, where chunks would
-// allow none.
-void testNearEqualBandCountsTheShortestLanesCommands() {
-  engine::Scheduler grouped(0.0);
-  // A streamed target's chunk: 4.9 s, 3.4 s of it on expert reads.
-  grouped.observePrefill(2048, 4900.0, 3400.0);
-  for (uint64_t id = 1; id <= 2; ++id) {
-    RequestSpec spec = request(id, id == 1 ? 21'000 : 20'000);
-    spec.prefillGroupRows = 4 * model::ExecutionLimits::prefillTokenBudget;
-    grouped.submit(spec);
-    grouped.resourcesReady(id, 0);
-  }
-  require(grouped.next({})->items.front().requestId == 2,
-          "the band counted chunks where the shortest lane runs prefill groups");
-  engine::Scheduler streaming(0.0);
-  // At 0.5 ms a row, a contended command takes 512 rows.
-  streaming.observePrefill(2048, 1024.0);
-  streaming.submit(request(1, 2512));
-  streaming.submit(request(2, 2000));
-  streaming.resourcesReady(1, 0);
-  streaming.resourcesReady(2, 0);
-  streaming.setStreamsHistory(2, true);
-  require(streaming.next({})->items.front().requestId == 1,
-          "the band counted chunks where the shortest lane streams its history");
-}
-
-// Lane 1 of 9,000 rows leads lane 3 of 7,000, within a command of it, and
-// where attention halves its rows the rest join it shortest first.
-void testNearEqualLeaderKeepsTheRestShortestFirst() {
-  engine::Scheduler scheduler(0.0, 700'000);
-  for (uint64_t id = 1; id <= 3; ++id) {
-    scheduler.submit(request(id, 10'000 - 1000 * id));
-    scheduler.resourcesReady(id, 0);
-  }
-  const BatchPlan plan = *scheduler.next({});
-  require(plan.items.size() == 3 && plan.items[0].requestId == 1 &&
-              plan.items[0].tokenCount == 1024 && plan.items[1].requestId == 3 &&
-              plan.items[1].tokenCount == 512 && plan.items[2].requestId == 2 &&
-              plan.items[2].tokenCount == 256,
-          "the lanes after a near-equal leader did not stay shortest first");
-}
-
-// An overdue lane leads an older lane that is not overdue, which the band
-// measured from the overdue lane would otherwise put first: lane 1 joins three
-// short arrivals' commands that leave lane 2 out.
-void testOverdueLaneLeadsAnOlderLane() {
-  engine::Scheduler scheduler(0.0);
-  scheduler.submit(request(1, 8000));
-  scheduler.submit(request(2, 9000));
-  scheduler.resourcesReady(1, 0);
-  scheduler.resourcesReady(2, 0);
-  for (uint64_t id = 3; id <= 5; ++id) {
-    scheduler.submit(request(id, 100));
-    scheduler.resourcesReady(id, 0);
-    const BatchPlan plan = *scheduler.next({});
-    require(plan.items.size() == 2 && plan.items[0].requestId == id &&
-                plan.items[1].requestId == 1,
-            "a short arrival and the shorter long lane did not share the command");
-    scheduler.commit(plan, {});
-    const std::vector<StepResult> results{
-        {id, 100, true, DecodeStage::Regular},
-        {1, plan.items[1].tokenCount, false, DecodeStage::Regular}};
-    scheduler.complete(plan, results, 0.0, true);
-  }
-  const BatchPlan overdue = *scheduler.next({});
-  require(overdue.items.size() == 1 && overdue.items[0].requestId == 2,
-          "an overdue lane did not lead an older lane");
-}
-
-// Only lanes of the front lane's priority count: an older lane of a lower
-// priority does not lead, and one overdue after lane 2's three commands does
-// not keep lane 2 from leading lane 3.
-void testNearEqualOrderStaysWithinAPriority() {
-  require(prefillLeader(5000, 5000, 0, 0, RequestPriority::Background) == 2,
-          "an older lane of a lower priority led a near-equal one");
-  engine::Scheduler scheduler(0.0);
-  scheduler.submit(request(1, 5000, RequestPriority::Background));
-  scheduler.resourcesReady(1, 0);
-  scheduler.submit(request(2, 27'144));
-  scheduler.resourcesReady(2, 0);
-  for (int command = 0; command < 3; ++command)
-    completePrefill(scheduler, *scheduler.next({}));
-  scheduler.submit(request(3, 20'000));
-  scheduler.resourcesReady(3, 0);
-  require(scheduler.next({})->items.front().requestId == 2,
-          "an overdue lane of a lower priority stopped the near-equal rule");
-}
-
-// Admission starts the lanes of the next plan, so the older of two queued
-// near-equal prompts starts first, and none that the next command would leave
-// out: without the shortest candidate, lane 3, which the plan leaves out,
-// lane 1 leads lane 2.
-void testAdmissionStartsTheLanesOfTheNextCommand() {
-  engine::Scheduler scheduler(0.0);
-  scheduler.submit(request(1, 71'254));
-  scheduler.submit(request(2, 71'220));
-  const std::array candidates{PrefillAdmission{1, 0}, PrefillAdmission{2, 0}};
-  require(scheduler.prefillAdmissionOrder(candidates) == std::vector<uint64_t>{1},
-          "admission started a later near-equal prompt first");
-  engine::Scheduler running(0.0);
-  running.submit(request(1, 41'000));
-  running.resourcesReady(1, 0);
-  running.submit(request(2, 38'000));
-  running.submit(request(3, 30'000));
-  const std::array queued{PrefillAdmission{2, 0}, PrefillAdmission{3, 0}};
-  require(running.prefillAdmissionOrder(queued).empty() &&
-              running.next({})->items.front().requestId == 1,
-          "admission started a lane the next command leaves out");
-}
-
-void testRealDecodeWidths() {
-  for (uint32_t width = 1; width <= 4; ++width) {
-    engine::Scheduler scheduler(0.0);
-    for (uint32_t lane = 0; lane < width; ++lane) {
-      scheduler.submit(request(lane + 1, 1));
-      scheduler.resourcesReady(lane + 1, 1);
-    }
-    BatchPlan plan = *scheduler.next({});
-    require(plan.kind == WorkKind::Decode && plan.width() == width,
-            "ready decode width was delayed or rewritten");
-    for (const BatchItem &item : plan.items) {
-      require(item.tokenCount == 0, "decode plan carried a variable row count");
-    }
-    scheduler.commit(plan, {});
-    std::vector<StepResult> results;
-    for (const BatchItem &item : plan.items) {
-      results.push_back({item.requestId, 0, false, DecodeStage::Regular});
-    }
-    scheduler.complete(plan, results, 0.0, true);
-    require(scheduler.snapshot().decodeBatchesByWidth[width - 1] == 1,
-            "decode width counter did not record the real command");
-  }
-}
-
-void testUnconstrainedLanesShareDecode() {
-  Scheduler scheduler(0.0);
-  for (uint64_t id = 1; id <= 4; ++id) {
-    scheduler.submit(request(id, 1));
-    scheduler.resourcesReady(id, 1);
-  }
-  const BatchPlan plan = *scheduler.next({});
-  require(plan.width() == 4,
-          "unconstrained requests did not share one decode command");
-}
-
-void testRejectedCommitCountsNothing() {
-  Scheduler scheduler(0.0);
-  scheduler.submit(request(1, 1));
-  scheduler.submit(request(2, 1));
-  scheduler.resourcesReady(1, 1);
-  scheduler.resourcesReady(2, 1);
-  const BatchPlan stale = *scheduler.next({});
-  scheduler.cancel(2);
-  rejects([&] { scheduler.commit(stale, {}); }, "batch no longer matches scheduler state",
-          "a commit of a cancelled request's batch was accepted");
-  require(scheduler.snapshot().decodeBatches == 0,
-          "rejected commit incremented decode counters");
-  completeDecode(scheduler);
-  require(scheduler.snapshot().decodeBatches == 1,
-          "the remaining request's decode was not counted");
-}
-
-// Once its first token is selected, a lane that waited for its first mask
-// decodes in the commands of the lanes that never did: two of each share one.
-void testMaskedLanesShareDecode() {
-  Scheduler scheduler(0.0);
-  for (uint64_t id : {1, 2}) {
-    scheduler.submit(request(id, 1));
-    scheduler.resourcesReady(id, 0);
-  }
-  const BatchPlan prompts = *scheduler.next({});
-  scheduler.commit(prompts, {});
-  const std::array promptResults{
-      StepResult{1, 1, false, DecodeStage::ApplyInitialMask},
-      StepResult{2, 1, false, DecodeStage::ApplyInitialMask},
-  };
-  scheduler.complete(prompts, promptResults, 0.0, true);
-  scheduler.maskReady(1);
-  scheduler.maskReady(2);
-  completeDecode(scheduler);
-  for (uint64_t id : {3, 4}) {
-    scheduler.submit(request(id, 1));
-    scheduler.resourcesReady(id, 1);
-  }
-  const BatchPlan plan = *scheduler.next({});
-  require(plan.kind == WorkKind::Decode && plan.width() == 4 &&
-              plan.decodeStage == DecodeStage::Regular,
-          "lanes that waited for their first masks decoded apart from the others");
-}
-
-void testPrefillAndDecodeAlternateWithoutStarvation() {
-  engine::Scheduler scheduler(0.0);
-  scheduler.submit(request(1, 1));
-  scheduler.submit(request(2, 10'000));
-  scheduler.resourcesReady(1, 1);
-  scheduler.resourcesReady(2, 0);
-
-  BatchPlan decode = *scheduler.next({});
-  require(decode.kind == WorkKind::Decode && decode.items[0].requestId == 1,
-          "decode did not retain the first ready command");
-  scheduler.commit(decode, {});
-  const std::array decodeResult{
-      StepResult{1, 0, false, DecodeStage::Regular}};
-  scheduler.complete(decode, decodeResult, 0.0, true);
-
-  BatchPlan prefill = *scheduler.next({});
-  require(prefill.kind == WorkKind::Prefill &&
-              prefill.items[0].requestId == 2,
-          "continuous decode starved a newly admitted prefill");
-  completePrefill(scheduler, prefill);
-
-  BatchPlan nextDecode = *scheduler.next({});
-  require(nextDecode.kind == WorkKind::Decode &&
-              nextDecode.items[0].requestId == 1,
-          "prefill did not yield the next command back to decode");
-}
-
-// Lane 1 decodes beside lane 2's long prompt: one decode command, then one
-// 500 ms prefill command.
-void runContendedPrefill(engine::Scheduler &scheduler) {
-  scheduler.submit(request(1, 1));
-  scheduler.submit(request(2, 20'000));
-  scheduler.resourcesReady(1, 1);
-  scheduler.resourcesReady(2, 0);
-  completeDecode(scheduler, false, 50.0);
-  const BatchPlan prefill = *scheduler.next({});
-  require(prefill.kind == WorkKind::Prefill && prefill.items[0].requestId == 2,
-          "the long prompt did not follow the first decode command");
-  completePrefill(scheduler, prefill, 500.0);
-}
-
-void testDecodeRepaysItsShareOfContendedPrefill() {
-  for (const double share : {0.0, 0.5}) {
-    engine::Scheduler scheduler(share);
-    runContendedPrefill(scheduler);
-    // At 0.5 the prefill owes 250 ms, five 50 ms decode commands; with no
-    // share the kinds alternate one command each.
-    for (uint32_t step = 0; step < (share > 0.0 ? 5u : 1u); ++step)
-      completeDecode(scheduler, false, 50.0);
-    require(scheduler.next({})->kind == WorkKind::Prefill,
-            "decode did not return the next command once its share was repaid");
-  }
-}
-
-// The decode time per token is a decode command's wall time over the tokens
-// a lane committed, 2 ms for two lanes' 9 each in 18 ms and 3 ms for their 4
-// each in 12 ms, each command weighing 0.9 of the next; a command whose
-// lanes committed none trains nothing. Before the first it is 0.
-void testDecodeTimePerTokenWeighsEachCommand() {
-  Scheduler scheduler(0.0);
-  for (uint64_t id : {1, 2}) {
-    scheduler.submit(request(id, 1));
-    scheduler.resourcesReady(id, 1);
-  }
-  const auto decode = [&](uint32_t committed, double wallMilliseconds) {
-    const BatchPlan plan = *scheduler.next({});
-    require(plan.kind == WorkKind::Decode && plan.width() == 2, "expected a decode command of both lanes");
-    scheduler.commit(plan, {});
-    std::vector<StepResult> results;
-    for (const BatchItem &item : plan.items)
-      results.push_back({item.requestId, 0, false, DecodeStage::Regular, committed});
-    scheduler.complete(plan, results, wallMilliseconds, true);
-  };
-  require(scheduler.decodeTokenMilliseconds() == 0.0, "a decode time per token preceded the first decode");
-  decode(9, 18.0);
-  decode(4, 12.0);
-  const double perToken = (0.9 * 2.0 + 3.0) / (0.9 + 1.0);
-  require(std::abs(scheduler.decodeTokenMilliseconds() - perToken) < 1e-9,
-          "the decode time per token did not weigh each command 0.9 of the next");
-  decode(0, 30.0);
-  require(std::abs(scheduler.decodeTokenMilliseconds() - perToken) < 1e-9,
-          "a decode command whose lanes committed no tokens trained the decode time per token");
-}
-
-// A constrained lane waits for its first mask while an equal-priority prompt
-// prefills: decode could not have used that time, so once the mask arrives
-// the kinds alternate without banked debt.
-void testMaskWaitAccruesNoDecodeDebt() {
-  engine::Scheduler scheduler(0.5);
-  scheduler.submit(request(1, 1));
-  scheduler.resourcesReady(1, 0);
-  awaitFirstMask(scheduler, 1);
-  scheduler.submit(request(2, 20'000));
-  scheduler.resourcesReady(2, 0);
-  for (uint32_t command = 0; command < 3; ++command)
-    completePrefill(scheduler, *scheduler.next({}), 500.0);
-  scheduler.maskReady(1);
-  completeDecode(scheduler, false, 50.0);
-  require(scheduler.next({})->kind == WorkKind::Prefill,
-          "prefill beside a lane waiting for its mask banked decode debt");
-}
-
-// Lanes that wait for memory on its way back are left out of the plan, so
-// the other kind or the other lanes run. A prefill that ran meanwhile owes
-// the decoders it was planned without nothing, and a prefill lane left out
-// was blocked, not overtaken.
-void testExcludedLanesAreNotPlanned() {
-  engine::Scheduler scheduler(0.5);
-  scheduler.submit(request(1, 1));
-  scheduler.submit(request(2, 1));
-  scheduler.submit(request(3, 20'000));
-  scheduler.resourcesReady(1, 1);
-  scheduler.resourcesReady(2, 1);
-  scheduler.resourcesReady(3, 0);
-  const std::array<uint64_t, 1> first{1};
-  const BatchPlan decode = *scheduler.next(first);
-  require(decode.kind == WorkKind::Decode && decode.width() == 1 &&
-              decode.items[0].requestId == 2,
-          "a decode plan included a lane left out of it");
-  const std::array<uint64_t, 2> decoders{1, 2};
-  const BatchPlan prefill = *scheduler.next(decoders);
-  require(prefill.kind == WorkKind::Prefill && prefill.items[0].requestId == 3,
-          "the prefill did not run while every decoder was left out");
-  scheduler.commit(prefill, decoders);
-  const std::array result{StepResult{3, prefill.items[0].tokenCount, false, DecodeStage::Regular}};
-  scheduler.complete(prefill, result, 500.0, true);
-  completeDecode(scheduler, false, 50.0);
-  require(scheduler.next({})->kind == WorkKind::Prefill,
-          "a prefill owed decode time to decoders it was planned without");
-
-  engine::Scheduler blocked(0.0);
-  blocked.submit(request(1, 6000));
-  blocked.resourcesReady(1, 0);
-  const std::array<uint64_t, 1> waiting{1};
-  for (uint64_t id = 2; id <= 4; ++id) {
-    blocked.submit(request(id, model::ExecutionLimits::prefillTokenBudget));
-    blocked.resourcesReady(id, 0);
-    const BatchPlan plan = *blocked.next(waiting);
-    blocked.commit(plan, waiting);
-    const std::array finished{
-        StepResult{id, plan.items[0].tokenCount, true, DecodeStage::Regular}};
-    blocked.complete(plan, finished, 0.0, true);
-  }
-  blocked.submit(request(5, model::ExecutionLimits::prefillTokenBudget));
-  blocked.resourcesReady(5, 0);
-  require(blocked.next({})->items[0].requestId == 5,
-          "a lane left out of three commands was treated as overtaken");
-}
-
-void testDecodeDebtLeavesWithTheLastDecoder() {
-  for (const bool finished : {true, false}) {
-    engine::Scheduler scheduler(0.5);
-    runContendedPrefill(scheduler);
-    // Lane 1 leaves still owed 200 ms: its decode command finishes it, or it
-    // is cancelled between commands.
-    completeDecode(scheduler, finished, 50.0);
-    if (!finished)
-      scheduler.cancel(1);
-    scheduler.submit(request(3, 1));
-    scheduler.resourcesReady(3, 1);
-    require(scheduler.next({})->kind == WorkKind::Prefill,
-            "a later decoder inherited debt owed to one that left");
-  }
-}
-
-void testHigherPriorityPrefillPrecedesDecodeDebt() {
-  engine::Scheduler scheduler(0.5);
-  runContendedPrefill(scheduler);
-  scheduler.submit(request(3, 20'000, RequestPriority::Foreground));
-  scheduler.resourcesReady(3, 0);
-  const BatchPlan plan = *scheduler.next({});
-  require(plan.kind == WorkKind::Prefill && plan.items[0].requestId == 3,
-          "decode debt overrode a higher-priority prefill");
-}
-
-void testMeasuredBudgetOnlyLimitsContendedWork() {
-  engine::Scheduler scheduler(0.0);
-  scheduler.submit(request(1, 20'000));
-  scheduler.resourcesReady(1, 0);
-  const BatchPlan first = *scheduler.next({});
-  require(first.items[0].tokenCount == 2048,
-          "unmeasured isolated work lost the full prefill budget");
-  completePrefill(scheduler, first, 4096.0);
-  require(scheduler.next({})->items[0].tokenCount == 2048,
-          "slow isolated work lost the full prefill budget");
-
-  scheduler.submit(request(2, 1));
-  scheduler.resourcesReady(2, 1);
-  completeDecode(scheduler, false, 1e9);
-  const BatchPlan contended = *scheduler.next({});
-  require(contended.kind == WorkKind::Prefill &&
-              contended.items[0].tokenCount == 128,
-          "measured slow prefill was not shortened for a decoding peer");
-  completePrefill(scheduler, contended, 256.0);
-  completeDecode(scheduler, true);
-  require(scheduler.next({})->items[0].tokenCount == 2048,
-          "prefill did not recover isolated throughput after its peer ended");
-}
-
-void testAuxiliaryWorkDoesNotTrainTextPrefillTiming() {
-  engine::Scheduler scheduler(0.0);
-  scheduler.submit(request(1, 20'000));
-  scheduler.resourcesReady(1, 0);
-  completePrefill(scheduler, *scheduler.next({}), 4096.0);
-  completePrefill(scheduler, *scheduler.next({}), 1e9, false);
-  scheduler.submit(request(2, 1));
-  scheduler.resourcesReady(2, 1);
-  completeDecode(scheduler);
-  require(scheduler.next({})->items.front().tokenCount == 128,
-          "auxiliary encoding latency contaminated the text throughput estimate");
-}
-
-void testMeasuredBudgetUsesActualRowsAndRecovers() {
-  engine::Scheduler scheduler(0.0);
-  scheduler.submit(request(1, 128));
-  scheduler.resourcesReady(1, 0);
-  completePrefill(scheduler, *scheduler.next({}), 512.0);
-  scheduler.submit(request(2, 20'000));
-  scheduler.resourcesReady(2, 0);
-  completeDecode(scheduler);
-  BatchPlan plan = *scheduler.next({});
-  require(plan.items[0].tokenCount == 64,
-          "prefill timing was normalized by capacity instead of actual rows");
-
-  for (uint32_t sample = 0; sample < 8; ++sample) {
-    completePrefill(scheduler, plan, 0.25 * plan.items[0].tokenCount);
-    completeDecode(scheduler);
-    plan = *scheduler.next({});
-  }
-  require(plan.items[0].tokenCount > 64 && plan.items[0].tokenCount < 2048,
-          "prefill budget did not adapt when measured execution became faster");
-}
-
-void testMeasuredBudgetPreservesPriority() {
-  engine::Scheduler scheduler(0.0);
-  scheduler.submit(request(1, 20'000, RequestPriority::Foreground));
-  scheduler.resourcesReady(1, 0);
-  completePrefill(scheduler, *scheduler.next({}), 4096.0);
-  scheduler.submit(request(2, 1, RequestPriority::Background));
-  scheduler.resourcesReady(2, 1);
-  require(scheduler.next({})->items[0].tokenCount == 2048,
-          "lower-priority work reduced foreground throughput");
-
-  scheduler.submit(request(3, 20'000, RequestPriority::Foreground));
-  scheduler.resourcesReady(3, 0);
-  scheduler.submit(request(4, 1, RequestPriority::Foreground));
-  scheduler.resourcesReady(4, 1);
-  completeDecode(scheduler);
-  const BatchPlan plan = *scheduler.next({});
-  require(plan.kind == WorkKind::Prefill && plan.items.size() == 1 &&
-              plan.items[0].requestId == 1 &&
-              plan.items[0].promptOffset == 2048 &&
-              plan.items[0].tokenCount == 128,
-          "adaptive prefill exceeded its shared budget");
-}
-
-void testUnavailableTimingAndMinimumBudget() {
-  for (double wallMilliseconds :
-       {0.0, -1.0, std::numeric_limits<double>::quiet_NaN(),
-        std::numeric_limits<double>::infinity(), 1.0, 1e9}) {
-    engine::Scheduler scheduler(0.0);
-    scheduler.submit(request(1, 20'000));
-    scheduler.resourcesReady(1, 0);
-    completePrefill(scheduler, *scheduler.next({}), wallMilliseconds);
-    scheduler.submit(request(2, 1));
-    scheduler.resourcesReady(2, 1);
-    completeDecode(scheduler);
-    const BatchPlan plan = *scheduler.next({});
-    require(plan.items[0].tokenCount ==
-                (wallMilliseconds == 1e9 ? 64u : 2048u),
-            "missing timing or extreme sample produced an invalid prefill budget");
-  }
-}
-
-void testMeasuredBudgetDoesNotCountBlockedPeers() {
-  engine::Scheduler scheduler(0.0);
-  scheduler.submit(request(1, 20'000));
-  scheduler.resourcesReady(1, 0);
-  completePrefill(scheduler, *scheduler.next({}), 4096.0);
-  scheduler.submit(request(2, 20'000));
-  scheduler.waitForResources(2);
-  scheduler.submit(request(3, 20'000));
-  require(scheduler.next({})->items[0].tokenCount == 2048,
-          "queued or resource-blocked work reduced resident throughput");
-}
-
-// Peers that only prefill, none finishing within the measured slice, do not
-// contend: the leader keeps the full budget.
-void testMeasuredBudgetPreservesPurePrefillThroughput() {
-  engine::Scheduler scheduler(0.0);
-  scheduler.submit(request(1, 20'000));
-  scheduler.resourcesReady(1, 0);
-  completePrefill(scheduler, *scheduler.next({}), 4096.0);
-  for (uint64_t id = 2; id <= 4; ++id) {
-    scheduler.submit(request(id, 20'000));
-    scheduler.resourcesReady(id, 0);
-  }
-  const BatchPlan plan = *scheduler.next({});
-  require(plan.kind == WorkKind::Prefill && plan.width() == 1 &&
-              plan.items[0].requestId == 1 &&
-              plan.items[0].tokenCount == model::ExecutionLimits::prefillTokenBudget,
-          "pure prefill contention lost throughput");
-}
-
-void testTinyTailDoesNotDistortPrefillThroughput() {
-  engine::Scheduler scheduler(0.0);
-  scheduler.submit(request(1, 2056));
-  scheduler.resourcesReady(1, 0);
-  completePrefill(scheduler, *scheduler.next({}), 2048.0);
-  completePrefill(scheduler, *scheduler.next({}), 800.0);
-  scheduler.submit(request(2, 20'000));
-  scheduler.resourcesReady(2, 0);
-  completeDecode(scheduler);
-  require(scheduler.next({})->items[0].tokenCount == 256,
-          "fixed overhead from a tiny tail distorted the prefill estimate");
-}
-
-void testMeasuredBudgetFinishesShortPrefillPromptly() {
-  for (const auto priority : {RequestPriority::Normal,
-                              RequestPriority::Background}) {
-    engine::Scheduler scheduler(0.0);
-    scheduler.submit(request(1, 20'000));
-    scheduler.resourcesReady(1, 0);
-    completePrefill(scheduler, *scheduler.next({}), 4096.0);
-    scheduler.submit(request(2, 31, priority));
-    scheduler.resourcesReady(2, 0);
-    const BatchPlan plan = *scheduler.next({});
-    if (priority == RequestPriority::Background) {
-      require(plan.width() == 1 && plan.items[0].requestId == 1 &&
-                  plan.items[0].tokenCount == 2048,
-              "a lower-priority short prefill throttled foreground work");
-      continue;
-    }
-    require(plan.width() == 2 && plan.items[0].requestId == 2 &&
-                plan.items[0].tokenCount == 31 &&
-                plan.items[1].requestId == 1 &&
-                plan.items[1].tokenCount == 97,
-            "a finishing short prefill waited for a full long-prefill batch");
-    completePrefill(scheduler, plan, 256.0);
-    const BatchPlan next = *scheduler.next({});
-    require(next.kind == WorkKind::Decode && next.items[0].requestId == 2,
-            "the completed short prefill did not get its next decode turn");
-  }
-}
-
-// At a measured 2.75 ms per row the slice is 128 rows. An arrival that
-// finishes within the full budget, though not within one slice, takes a
-// command of its own rows instead of a full one shared with a long prompt;
-// one that does not finish in it still takes a full command.
-void testShortArrivalBesideLongPrefillEndsAtItsLastRow() {
-  const auto beside = [](Scheduler &scheduler, std::initializer_list<uint32_t> arrivals) {
-    scheduler.observePrefill(2048, 5632.0);
-    scheduler.submit(request(1, 20'000));
-    scheduler.resourcesReady(1, 0);
-    completePrefill(scheduler, *scheduler.next({}), 5632.0);
-    uint64_t id = 2;
-    for (uint32_t prompt : arrivals) {
-      scheduler.submit(request(id, prompt));
-      scheduler.resourcesReady(id++, 0);
-    }
-    return *scheduler.next({});
-  };
-  Scheduler chat(0.0);
-  const BatchPlan plan = beside(chat, {300});
-  require(plan.width() == 1 && plan.items[0].requestId == 2 && plan.items[0].tokenCount == 300,
-          "a short arrival shared a full command with a long prefill");
-  completePrefill(chat, plan, 825.0);
-  completeDecode(chat);
-  const BatchPlan slice = *chat.next({});
-  require(slice.width() == 1 && slice.items[0].requestId == 1 &&
-              slice.items[0].tokenCount == 128,
-          "the long prefill did not return to slices beside the decoding arrival");
-
-  Scheduler longer(0.0);
-  const BatchPlan full = beside(longer, {3000});
-  require(full.width() == 1 && full.items[0].requestId == 2 &&
-              full.items[0].tokenCount == 2048,
-          "an arrival that does not finish in one command lost the full budget");
-
-  Scheduler two(0.0);
-  const BatchPlan first = beside(two, {300, 300});
-  require(first.width() == 1 && first.items[0].requestId == 2 &&
-              first.items[0].tokenCount == 300,
-          "two short arrivals shared a command instead of finishing in turn");
-}
-
-void testMeasuredBudgetRetainsOvertakingBound() {
-  engine::Scheduler scheduler(0.0);
-  scheduler.submit(request(1, 20'000));
-  scheduler.resourcesReady(1, 0);
-  completePrefill(scheduler, *scheduler.next({}), 4096.0);
-  scheduler.submit(request(100, 1));
-  scheduler.resourcesReady(100, 1);
-  for (uint64_t id = 2; id <= 4; ++id) {
-    completeDecode(scheduler);
-    scheduler.submit(request(id, 128));
-    scheduler.resourcesReady(id, 0);
-    const BatchPlan plan = *scheduler.next({});
-    require(plan.items.size() == 1 && plan.items[0].requestId == id,
-            "adaptive prefill did not serve a short arrival first");
-    scheduler.commit(plan, {});
-    const std::array result{StepResult{id, 128, true, DecodeStage::Regular}};
-    scheduler.complete(plan, result, 256.0, true);
-  }
-  scheduler.submit(request(5, 128));
-  scheduler.resourcesReady(5, 0);
-  completeDecode(scheduler);
-  const BatchPlan overdue = *scheduler.next({});
-  require(overdue.items.size() == 1 && overdue.items[0].requestId == 1 &&
-              overdue.items[0].tokenCount == 128,
-          "adaptive prefill allowed short arrivals to starve an older lane");
-}
-
-void testPriorityPrecedesWorkKindAlternation() {
-  engine::Scheduler scheduler(0.0);
-  scheduler.submit(request(1, 1, RequestPriority::Background));
-  scheduler.submit(request(2, 100, RequestPriority::Foreground));
-  scheduler.resourcesReady(1, 1);
-  scheduler.resourcesReady(2, 0);
-
-  BatchPlan foreground = *scheduler.next({});
-  require(foreground.kind == WorkKind::Prefill &&
-              foreground.items[0].requestId == 2,
-          "work-kind alternation overrode request priority");
-}
-
-void testPrefillCommandContainsOnePriorityTier() {
-  engine::Scheduler scheduler(0.0);
-  scheduler.submit(request(1, 4096, RequestPriority::Foreground));
-  scheduler.submit(request(2, 4096, RequestPriority::Background));
-  scheduler.resourcesReady(1, 0);
-  scheduler.resourcesReady(2, 0);
-
-  BatchPlan plan = *scheduler.next({});
-  require(plan.kind == WorkKind::Prefill && plan.items.size() == 1 &&
-              plan.items[0].requestId == 1 &&
-              plan.items[0].tokenCount ==
-                  model::ExecutionLimits::prefillTokenBudget,
-          "ragged prefill mixed priority tiers in one command");
-}
-
-void testDecodeCommandContainsOnePriorityTier() {
-  engine::Scheduler scheduler(0.0);
-  scheduler.submit(request(1, 1, RequestPriority::Foreground));
-  scheduler.submit(request(2, 1, RequestPriority::Background));
-  scheduler.resourcesReady(1, 1);
-  scheduler.resourcesReady(2, 1);
-
-  BatchPlan plan = *scheduler.next({});
-  require(plan.kind == WorkKind::Decode && plan.width() == 1 &&
-              plan.items[0].requestId == 1,
-          "a decode command mixed priority tiers");
-  scheduler.commit(plan, {});
-  const std::array result{
-      StepResult{1, 0, true, DecodeStage::Regular}};
-  scheduler.complete(plan, result, 0.0, true);
-
-  BatchPlan background = *scheduler.next({});
-  require(background.kind == WorkKind::Decode && background.width() == 1 &&
-              background.items[0].requestId == 2,
-          "background decode did not run after foreground completion");
-}
-
-void testDecodeLanesRotate() {
-  engine::Scheduler scheduler(0.0);
-  for (uint64_t id = 1; id <= 6; ++id) {
-    scheduler.submit(request(id, 1));
-    scheduler.resourcesReady(id, 1);
-  }
-
-  BatchPlan first = *scheduler.next({});
-  require(first.kind == WorkKind::Decode && first.width() == 4,
-          "the first unconstrained decode did not use the real B4 graph");
-  scheduler.commit(first, {});
-  std::vector<StepResult> firstResults;
-  for (const BatchItem &item : first.items) {
-    firstResults.push_back(
-        {item.requestId, 0, false, DecodeStage::Regular});
-  }
-  scheduler.complete(first, firstResults, 0.0, true);
-
-  BatchPlan second = *scheduler.next({});
-  require(second.kind == WorkKind::Decode && second.width() == 4 &&
-              second.items[0].requestId == 5 && second.items[1].requestId == 6,
-          "decode did not prioritize lanes omitted by the previous batch");
-}
-
-void testMaskStagesNeverMix() {
-  engine::Scheduler scheduler(0.0);
-  scheduler.submit(request(1, 1));
-  scheduler.submit(request(2, 1));
-  scheduler.resourcesReady(1, 0);
-  scheduler.resourcesReady(2, 0);
-
-  BatchPlan prompts = *scheduler.next({});
-  require(prompts.kind == WorkKind::Prefill && prompts.width() == 2,
-          "constrained prompts did not form one prefill");
-  scheduler.commit(prompts, {});
-  const std::array promptResults{
-      StepResult{1, 1, false, DecodeStage::ApplyInitialMask},
-      StepResult{2, 1, false, DecodeStage::ApplyInitialMask},
-  };
-  scheduler.complete(prompts, promptResults, 0.0, true);
-  scheduler.maskReady(1);
-
-  BatchPlan initialSelection = *scheduler.next({});
-  require(initialSelection.width() == 1 &&
-              initialSelection.items[0].requestId == 1 &&
-              initialSelection.decodeStage == DecodeStage::ApplyInitialMask,
-          "a ready first mask did not get its selection plan");
-  scheduler.commit(initialSelection, {});
-  const std::array initialSelectionResult{
-      StepResult{1, 0, false, DecodeStage::Regular}};
-  scheduler.complete(initialSelection, initialSelectionResult, 0.0, true);
-
-  scheduler.maskReady(2);
-  BatchPlan otherInitial = *scheduler.next({});
-  require(otherInitial.width() == 1 &&
-              otherInitial.items[0].requestId == 2 &&
-              otherInitial.decodeStage == DecodeStage::ApplyInitialMask,
-          "a first token's selection mixed with a drafting lane");
-  scheduler.commit(otherInitial, {});
-  const std::array otherInitialResult{
-      StepResult{2, 0, true, DecodeStage::Regular}};
-  scheduler.complete(otherInitial, otherInitialResult, 0.0, true);
-
-  BatchPlan verify = *scheduler.next({});
-  require(verify.width() == 1 && verify.items[0].requestId == 1 &&
-              verify.decodeStage == DecodeStage::Regular,
-          "a drafting lane mixed with a first token's selection");
-  scheduler.commit(verify, {});
-  const std::array verifyResult{
-      StepResult{1, 0, true, DecodeStage::Regular}};
-  scheduler.complete(verify, verifyResult, 0.0, true);
-}
-
-// The first tokens of constrained requests of one priority whose masks have
-// arrived are selected in one plan.
-void testInitialSelectionsBatch() {
-  engine::Scheduler scheduler(0.0);
-  for (uint64_t id : {1, 2}) {
-    scheduler.submit(request(id, 1));
-    scheduler.resourcesReady(id, 0);
-  }
-  const BatchPlan prompts = *scheduler.next({});
-  scheduler.commit(prompts, {});
-  const std::array promptResults{
-      StepResult{1, 1, false, DecodeStage::ApplyInitialMask},
-      StepResult{2, 1, false, DecodeStage::ApplyInitialMask},
-  };
-  scheduler.complete(prompts, promptResults, 0.0, true);
-  scheduler.maskReady(1);
-  scheduler.maskReady(2);
-  const BatchPlan selection = *scheduler.next({});
-  require(selection.kind == WorkKind::Decode && selection.width() == 2 &&
-              selection.decodeStage == DecodeStage::ApplyInitialMask,
-          "first-token selections of one priority did not share a plan");
-}
-
-void testWaitingMaskBoundsPeerPrefill() {
-  for (const RequestPriority priority : {RequestPriority::Foreground,
-                                         RequestPriority::Normal,
-                                         RequestPriority::Background}) {
-    Scheduler scheduler(0.0);
-    scheduler.observePrefill(2048, 4096.0);
-    scheduler.submit(request(1, 1, priority));
-    scheduler.resourcesReady(1, 0);
-    awaitFirstMask(scheduler, 1);
-
-    scheduler.submit(request(2, 20'000));
-    scheduler.resourcesReady(2, 0);
-    const BatchPlan prefill = *scheduler.next({});
-    const bool protectedPeer = priority <= RequestPriority::Normal;
-    require(prefill.kind == WorkKind::Prefill &&
-                prefill.items[0].requestId == 2 &&
-                prefill.items[0].tokenCount == (protectedPeer ? 128u : 2048u),
-            "mask wait lost prefill latency protection or priority ordering");
-    // A mask arriving during the command must get the next decode turn.
-    scheduler.maskReady(1);
-    completePrefill(scheduler, prefill);
-    if (protectedPeer) {
-      const BatchPlan decode = *scheduler.next({});
-      require(decode.kind == WorkKind::Decode &&
-                  decode.items[0].requestId == 1,
-              "ready mask did not resume after bounded prefill");
-    }
-    scheduler.cancel(1);
-    require(scheduler.next({})->items[0].tokenCount == 2048,
-            "cancelled mask request kept isolated prefill throttled");
-  }
-}
-
 void testResourceSuspensionReplaysFromCache() {
-  engine::Scheduler scheduler(0.0);
-  scheduler.submit(request(1, 4096));
-  scheduler.resourcesReady(1, 0);
-  BatchPlan first = *scheduler.next({});
-  completePrefill(scheduler, first);
-  require(!scheduler.suspended(1), "a running request was suspended");
-  scheduler.suspendForResources(1);
-  require(scheduler.phase(1) == engine::Phase::WaitingResources && scheduler.suspended(1),
+  DenseSim sim;
+  sim.lane(1, 0, 4096);
+  sim.step();
+  sim.scheduler.suspendForResources(1);
+  require(sim.scheduler.phase(1) == Phase::WaitingResources && sim.scheduler.suspended(1),
           "resident prefill did not enter resource wait");
-  scheduler.resumeFromResources(1, 32, 4096);
-  require(!scheduler.suspended(1), "a resumed request stayed suspended");
-  BatchPlan resumed = *scheduler.next({});
-  require(resumed.kind == WorkKind::Prefill &&
-              resumed.items[0].promptOffset == 32,
+  sim.scheduler.resumeFromResources(1, 32, 4096);
+  const BatchPlan resumed = sim.plan();
+  require(resumed.kind == WorkKind::Prefill && resumed.items[0].promptOffset == 32,
           "resource resume did not start from its acquired cache boundary");
-
-  // A request that ends while suspended stays so until it is removed, and
-  // submission order follows the submits.
-  engine::Scheduler ended(0.0);
-  ended.submit(request(3, 64));
-  ended.submit(request(4, 64));
-  require(ended.submissionOrder(3) < ended.submissionOrder(4),
-          "submission order did not follow the submits");
-  ended.resourcesReady(3, 0);
-  completePrefill(ended, *ended.next({}));
-  ended.suspendForResources(3);
-  ended.cancel(3);
-  require(ended.phase(3) == engine::Phase::Cancelled && ended.suspended(3),
-          "a cancelled request forgot it was suspended");
-  ended.remove(3);
 }
 
-// A request suspended while it holds its first mask replays its history and
-// selects its first token under that mask, without asking for another: the
-// replay's prefill reports no mask wait.
-void testReplayKeepsHeldInitialMask() {
-  engine::Scheduler scheduler(0.0);
-  scheduler.submit(request(2, 1));
-  scheduler.resourcesReady(2, 0);
-  awaitFirstMask(scheduler, 2);
-  scheduler.maskReady(2);
-  scheduler.suspendForResources(2);
-  scheduler.resumeFromResources(2, 32, 40);
-  const auto replay = *scheduler.next({});
-  require(replay.kind == WorkKind::Prefill &&
-              replay.items[0].promptOffset == 32 &&
-              replay.items[0].tokenCount == 8,
-          "decode resume did not replay its committed token history");
-  completePrefill(scheduler, replay);
-  require(scheduler.phase(2) == engine::Phase::Decode,
-          "the replay waited for a second first mask");
-  const auto continuation = *scheduler.next({});
-  require(continuation.kind == WorkKind::Decode &&
-              continuation.decodeStage == DecodeStage::ApplyInitialMask,
-          "the replay dropped the held first mask's selection");
+// Admission starts only the candidates the next command serves.
+void testAdmissionStartsTheLanesOfTheNextCommand() {
+  DenseSim sim;
+  sim.lane(1, 0, 41'000);
+  sim.scheduler.submit(request(2, 38'000));
+  sim.scheduler.submit(request(3, 30'000));
+  const std::array queued{PrefillAdmission{2, 0}, PrefillAdmission{3, 0}};
+  require(sim.scheduler.prefillAdmissionOrder(queued, sim.in()) == std::vector<uint64_t>{3},
+          "admission did not start the candidate the next command leads with");
 }
+
+// --- The price and its seed ---------------------------------------------------------------------------------
+
+// The prefill price is the cost model's for the work the model expects: a
+// unit of more rows or deeper costs more, and the seed prices a chunk of
+// the warm-ups as they ran.
+void testAPrefillsPriceIsTheCostModels() {
+  Sim sim(test::kM6FlashNextQ2, limits(8192, 48));
+  const model::PrefillLane chunk{0, kChunk, 0};
+  require(sim.scheduler.prefillMilliseconds(sim.work.prefillWork({&chunk, 1}, 0, 1)) == 0.0,
+          "an unseeded price was not zero");
+  sim.seed();
+  const double warmup = sim.work.warmupTimes(kChunk).wallMilliseconds;
+  require(std::abs(sim.scheduler.prefillMilliseconds(sim.work.warmupWork(kChunk)) - warmup) < 0.02 * warmup,
+          "the seed did not price the warm-up as it ran");
+  const model::PrefillLane more{0, 4 * kChunk, 0};
+  require(sim.scheduler.prefillMilliseconds(sim.work.prefillWork({&more, 1}, 0, 1)) >
+              sim.scheduler.prefillMilliseconds(sim.work.prefillWork({&chunk, 1}, 0, 1)),
+          "more rows did not cost more");
+}
+
+// S-P5: a cold start's first contended agent turn is not underpriced as
+// with a host-wait seed (base: 1.09 s for a 3.2 s turn): seeded from the
+// warm-ups and the load, it prices within the clamp above its truth, which
+// the turn's own sample then trains in full.
+void testColdSeedPricesTheFirstContendedTurn() {
+  Sim sim(test::kM6FlashNextQ2, limits(8192, 48));
+  sim.seed();
+  sim.decoder(1);
+  sim.lane(2, 8192, 300);
+  const std::array turn{BatchItem{2, 300, 8192}};
+  const double truth =
+      test::prefillTimes(sim.work.profile(), sim.work.prefillWork(sim.lanes(turn), 0, 1)).wallMilliseconds;
+  const double price = sim.price(turn);
+  require(price >= truth && price <= 2.0 * truth,
+          "the first turn's price " + std::to_string(price) + " ms is not within the clamp above its " +
+              std::to_string(truth) + " ms");
+}
+
+// S-P1: contended commands of one shape, run in their passes, converge on
+// their price: each pass of the next 300- or 8192-row one is priced within
+// 15 % of what it takes. (One shape run in one count of passes does not
+// separate the turnaround from the passes' share of the rest, so the price
+// of that command run whole is not what this pins.)
+void testEstimateConvergesUnderUniformContendedCommands() {
+  for (const uint32_t rows : {300u, 8192u}) {
+    Sim sim(test::kM6FlashNextQ2, limits(8192, 48));
+    sim.seed();
+    sim.decoder(1);
+    for (uint32_t turn = 0; turn < 12; ++turn) {
+      sim.lane(10 + turn, 8192, rows);
+      while (sim.scheduler.phase(10 + turn) == Phase::Prefill)
+        sim.step();
+      sim.scheduler.cancel(10 + turn);
+      sim.scheduler.remove(10 + turn);
+    }
+    sim.lane(99, 8192, rows);
+    BatchPlan plan = sim.plan();
+    while (plan.kind != WorkKind::Prefill) {
+      sim.run(plan);
+      plan = sim.plan();
+    }
+    for (uint32_t pass = 0; pass < plan.passes; ++pass) {
+      const double truth =
+          test::prefillTimes(sim.work.profile(), sim.work.prefillWork(sim.lanes(plan.items), pass, plan.passes))
+              .wallMilliseconds;
+      require(std::abs(sim.price(plan.items, pass, plan.passes) - truth) <= 0.15 * truth,
+              std::to_string(rows) + "-row commands did not converge on their price: pass " + std::to_string(pass) +
+                  " of " + std::to_string(plan.passes) + " priced " +
+                  std::to_string(sim.price(plan.items, pass, plan.passes)) + " against " + std::to_string(truth) +
+                  " ms");
+    }
+  }
+}
+
+// --- Groups, the bound, passes -----------------------------------------------------------------------------
+
+// A dense prompt alone runs whole: nothing waits for its units.
+void testALoneDenseCommandRunsWhole() {
+  Sim sim(test::kDense27B, limits(kChunk, test::kDense27B.layers));
+  sim.seed();
+  sim.lane(1, 0, 4096);
+  const BatchPlan plan = sim.plan();
+  require(plan.items[0].tokenCount == kChunk && plan.passes == 1, "a lone dense command did not run whole");
+}
+
+// A lone streamed request is sized as today: a turn in as many passes as
+// keep each within the bound, and a long prompt in groups of the model's
+// command rows; a lone dense prompt runs whole.
+void testALoneRequestIsSizedAsToday() {
+  Sim sim(test::kM6FlashNextQ2, limits(8192, 48));
+  sim.seed();
+  sim.lane(1, 8192, 300);
+  const BatchPlan turn = sim.plan();
+  const double cost = sim.price(turn.items);
+  const auto expected = static_cast<uint32_t>(std::ceil(cost / sim.bound()));
+  require(turn.items[0].tokenCount == 300 && turn.passes + 1 >= expected && turn.passes <= expected + 1,
+          "a lone turn ran in " + std::to_string(turn.passes) + " passes, not about " + std::to_string(expected));
+  sim.scheduler.cancel(1);
+  sim.scheduler.remove(1);
+  sim.lane(2, 0, 20'000);
+  require(sim.plan().items[0].tokenCount == 8192, "a lone long prompt did not take a group");
+}
+
+// The passes of a contended turn are those the bound needs: with the
+// turnaround the units measure, max(G, u / 0.1).
+void testContendedTurnPassesByTurnaround() {
+  Sim sim(test::kM6FlashNextQ2, limits(8192, 48));
+  sim.seed();
+  sim.decoder(1);
+  // Commands of varied passes teach the fit the turnaround.
+  for (uint32_t turn = 0; turn < 6; ++turn) {
+    sim.lane(10 + turn, 8192, 300 + 1500 * turn);
+    while (sim.scheduler.phase(10 + turn) == Phase::Prefill)
+      sim.step();
+    sim.scheduler.cancel(10 + turn);
+    sim.scheduler.remove(10 + turn);
+  }
+  sim.lane(2, 8192, 300);
+  BatchPlan plan = sim.plan();
+  while (plan.kind != WorkKind::Prefill) {
+    sim.run(plan);
+    plan = sim.plan();
+  }
+  const auto least = static_cast<uint32_t>(std::ceil(sim.price(plan.items) / sim.bound()));
+  require(plan.passes >= least, "a contended turn ran in fewer passes than its bound needs");
+  for (uint32_t pass = 0; pass < plan.passes; ++pass)
+    require(sim.price(plan.items, pass, plan.passes) <= sim.bound() * (1 + 1e-9),
+            "a contended turn's pass exceeds the bound");
+}
+
+// The fewest passes within the bound spend at most a tenth of the command on
+// turnarounds: (P - 1) u <= (price - u) / 9, on every profile.
+void testPassesAddAtMostATenthOfTheCommand() {
+  for (const test::TimingProfile *profile : {&test::kM6FlashNextQ2, &test::kStudio18GFlashNextQ2, &test::kDense27B}) {
+    const uint32_t rows = profile->experts.experts ? 8192 : kChunk;
+    Sim sim(*profile, limits(rows, profile->layers));
+    sim.seed();
+    sim.decoder(1);
+    for (uint32_t command = 0; command < 8; ++command) {
+      sim.lane(10 + command, 4096 * command, rows);
+      while (sim.scheduler.phase(10 + command) == Phase::Prefill)
+        sim.step();
+      sim.scheduler.cancel(10 + command);
+      sim.scheduler.remove(10 + command);
+    }
+    sim.lane(2, 16384, rows);
+    BatchPlan plan = sim.plan();
+    while (plan.kind != WorkKind::Prefill) {
+      sim.run(plan);
+      plan = sim.plan();
+    }
+    const double u = sim.turnaround(), whole = sim.price(plan.items);
+    require(plan.passes > 1 && (plan.passes - 1) * u <= (whole - u) / 9.0 + 1e-6,
+            std::string(profile->name) + ": " + std::to_string(plan.passes) + " passes of " + std::to_string(u) +
+                " ms turnaround for a " + std::to_string(whole) + " ms command");
+  }
+}
+
+// S-P4: on a resident dense target a contended command over G runs in
+// passes where the model offers them, and halves where it does not.
+void testPassesFollowCostOnAResidentTarget() {
+  for (const uint32_t most : {test::kDense27B.layers, 1u}) {
+    Sim sim(test::kDense27B, limits(kChunk, most));
+    sim.seed();
+    sim.decoder(1);
+    sim.lane(2, 0, 20'000);
+    BatchPlan plan = sim.plan();
+    while (plan.kind != WorkKind::Prefill) {
+      sim.run(plan);
+      plan = sim.plan();
+    }
+    if (most > 1)
+      require(plan.items[0].tokenCount == kChunk && plan.passes > 1,
+              "a contended dense command over G did not run in passes");
+    else
+      require(plan.items[0].tokenCount < kChunk && plan.passes == 1 &&
+                  sim.price(plan.items) <= sim.bound() * (1 + 1e-9),
+              "a contended dense command without passes did not halve to its bound");
+  }
+}
+
+// Groups follow the fixed part a group saves: a spill lane whose history
+// reads cost a chunk's command a third of G or more groups, a short one
+// does not; an expert store with 5 % of its experts out groups, a whole one
+// does not, on the M6's SSD.
+void testGroupRowsFollowTheFixedCost() {
+  {
+    Sim sim(test::kStoreLessSpillFlashNext, limits(8192, 48));
+    sim.seed();
+    sim.lane(1, 262144, 20'000);
+    sim.shape(1, 262144 / kPageTokens);
+    require(sim.plan().items[0].tokenCount == 8192, "a spill lane with 256K of history did not group");
+    sim.shape(1, 0);
+    require(sim.plan().items[0].tokenCount == kChunk, "a Resident lane on a store-less target grouped");
+    sim.shape(1, 16384 / kPageTokens);
+    require(sim.plan().items[0].tokenCount == kChunk, "a spill lane with a short history grouped");
+  }
+  test::TimingProfile uniform = test::kM6FlashNextQ2;
+  // Misses as the share not resident (amend/M.md B8's uniform marginal).
+  uniform.curve.prefillHit = {{{0, 0.0}, {24576, 1.0}}};
+  for (const double share : {0.95, 1.0}) {
+    Sim sim(uniform, limits(8192, 48), 0.5, [share] { return share; });
+    sim.seed();
+    sim.lane(1, 0, 20'000);
+    const uint32_t rows = sim.plan().items[0].tokenCount;
+    require(rows == (share < 1.0 ? 8192u : kChunk),
+            "a store " + std::to_string(share) + " resident ran " + std::to_string(rows) + " rows");
+  }
+}
+
+// A row rule, not a pass rule: one attention layer's pairs stay within the
+// cap only by fewer rows. Past a dense target's native window it halves as
+// today; an 8192-row lane at 70,000 on 12 dense layers halves to 4096 (8192
+// rows fit only to 61,183); a block-sparse layer's rows keep the command's.
+void testThePairBoundIsPerLayerAndOnlyRowsMeetIt() {
+  {
+    Sim sim(test::kDense27B, limits(kChunk, test::kDense27B.layers, 1,
+                                    model::denseAttentionPairs(131072 - kChunk, kChunk)));
+    sim.seed();
+    sim.lane(1, 131072 + 8192, 20'000);
+    require(sim.plan().items[0].tokenCount == kChunk / 2, "a dense lane past its window did not halve once");
+  }
+  {
+    test::TimingProfile full = test::kM6FlashNextQ2;
+    full.reach = {};
+    Sim sim(full, limits(8192, 19, 1, model::denseAttentionPairs(61183, 8192)));
+    sim.seed();
+    sim.lane(1, 70000, 20'000);
+    require(sim.plan().items[0].tokenCount == 4096, "passes kept rows the per-layer pair bound refuses");
+  }
+  for (const uint32_t position : {0u, 131072u, 1u << 20}) {
+    Sim sim(test::kM6FlashNextQ2, limits(8192, 48, 1, model::denseAttentionPairs(262144 - kChunk, kChunk)));
+    sim.seed();
+    sim.lane(1, position, 20'000);
+    require(sim.plan().items[0].tokenCount == 8192, "a block-sparse lane lost rows to the pair bound");
+  }
+}
+
+// S-P2: every contended unit is within max(G, u / 0.1) by its price, and
+// takes about that by the profile's clock once the price has learned.
+void testEveryContendedUnitWithinItsBound() {
+  for (const test::TimingProfile *profile : {&test::kM6FlashNextQ2, &test::kStudio18GFlashNextQ2, &test::kDense27B}) {
+    const bool streamed = profile->experts.experts;
+    Sim sim(*profile, limits(streamed ? 8192 : kChunk, profile->layers));
+    sim.seed();
+    sim.decoder(1);
+    sim.lane(2, 0, 120'000);
+    uint32_t units = 0;
+    double longest = 0.0;
+    while (sim.scheduler.phase(2) == Phase::Prefill && units < 400) {
+      const BatchPlan plan = sim.plan();
+      if (plan.kind == WorkKind::Prefill) {
+        // A plan is bounded by the prices it was made with: those of its first
+        // pass's planning.
+        for (uint32_t pass = 0; !plan.pass && pass < plan.passes; ++pass)
+          require(sim.price(plan.items, pass, plan.passes) <= sim.bound() * (1 + 1e-9) ||
+                      plan.passes == profile->layers,
+                  std::string(profile->name) + ": a contended unit's price exceeds the bound");
+        const double wall = sim.run(plan);
+        if (++units > 40)
+          longest = std::max(longest, wall / sim.bound());
+      } else {
+        sim.run(plan);
+      }
+    }
+    require(longest <= 1.25, std::string(profile->name) + ": a contended unit took " + std::to_string(longest) +
+                                 " of its bound once learned");
+  }
+}
+
+// S-P7: a contended Spill lane leads commands of its group's rows, bounded
+// by passes, never halved.
+void testAContendedSpillLaneKeepsItsGroupRows() {
+  for (const test::TimingProfile *profile : {&test::kM6FlashNextQ2, &test::kStudio18GFlashNextQ2}) {
+    Sim sim(*profile, limits(8192, 48));
+    sim.seed();
+    sim.decoder(1);
+    sim.decoder(2);
+    sim.lane(3, 45056, 40'000);
+    sim.shape(3, 45056 / kPageTokens, true);
+    for (uint32_t command = 0; command < 30 && sim.scheduler.phase(3) == Phase::Prefill; ++command) {
+      const BatchPlan plan = sim.plan();
+      if (plan.kind == WorkKind::Prefill && !plan.pass) {
+        const uint32_t remaining = 85056 - plan.items[0].promptOffset;
+        require(plan.items[0].tokenCount == std::min(remaining, 8192u),
+                std::string(profile->name) + ": a contended Spill lane lost its group's rows");
+      }
+      sim.run(plan);
+    }
+    require(sim.scheduler.snapshot().boundCuts == 0, "a contended Spill lane's rows were halved");
+  }
+}
+
+// D5: a group no passes bound halves only when contended; alone it keeps
+// its rows in the most passes.
+void testAGroupBeyondMaximumPassesHalvesOnlyWhenContended() {
+  test::TimingProfile slow = test::kM6FlashNextQ2;
+  slow.chunkMilliseconds *= 3;
+  slow.rowMilliseconds *= 3;
+  slow.weightBytesPerMillisecond /= 3;
+  for (const bool contend : {false, true}) {
+    Sim sim(slow, limits(8192, 8));
+    sim.seed();
+    if (contend)
+      sim.decoder(1);
+    sim.lane(2, 0, 40'000);
+    BatchPlan plan = sim.plan();
+    while (plan.kind != WorkKind::Prefill) {
+      sim.run(plan);
+      plan = sim.plan();
+    }
+    if (!contend) {
+      require(plan.items[0].tokenCount == 8192 && plan.passes == 8, "an uncontended group lost rows for time");
+    } else {
+      require(plan.items[0].tokenCount < 8192, "a contended group no passes bound kept its rows");
+      static_cast<void>(sim.run(plan));
+      require(sim.scheduler.snapshot().boundCuts > 0, "the halving was not counted");
+    }
+  }
+}
+
+// --- Joins --------------------------------------------------------------------------------------------------
+
+// A long lane's sparing rows do not join a short turn: what they add each
+// lane exceeds what they save it.
+void testALongLanesSparingRowsDoNotDelayAShortTurn() {
+  Sim sim(test::kM6FlashNextQ2, limits(8192, 48));
+  sim.seed();
+  sim.lane(1, 8192, 300);
+  sim.lane(2, 0, 8192 * 3 + 5000);
+  const BatchPlan plan = sim.plan();
+  require(plan.width() == 1 && plan.items[0].requestId == 1, "a long lane's 5000 sparing rows joined a turn");
+  Sim small(test::kM6FlashNextQ2, limits(8192, 48));
+  small.seed();
+  small.lane(1, 8192, 300);
+  small.lane(2, 0, 8192 * 3 + 300);
+  const BatchPlan joined = small.plan();
+  require(joined.width() == 2 && joined.items[1].tokenCount == 300, "a long lane's 300 sparing rows did not join");
+}
+
+// N=4: four agent turns share one command; at today's host split the third
+// would not join.
+void testFourShortTurnsShareOneCommand() {
+  Sim sim(test::kM6FlashNextQ2, limits(8192, 48));
+  sim.seed();
+  for (uint64_t id = 1; id <= 4; ++id)
+    sim.lane(id, 8192, 300);
+  require(sim.plan().width() == 4, "four turns did not share one command");
+}
+
+// A dense leader that finishes its prompt runs without filling the rest of
+// its chunk with a long lane's rows.
+void testADenseFinishingLeaderRunsWithoutFill() {
+  DenseSim sim;
+  sim.lane(1, 0, 700);
+  sim.lane(2, 0, 3000);
+  const BatchPlan plan = sim.plan();
+  require(plan.width() == 1 && plan.items[0].requestId == 1 && plan.items[0].tokenCount == 700,
+          "a finishing dense leader was filled");
+}
+
+// One lane whose history holds or may gain Index pages per command: a lane
+// that may gain them does not join a command in passes beside one that holds
+// them, and is counted; in one pass it may.
+void testTwoSpillLanesNeverShareAMultiPassCommand() {
+  Sim sim(test::kM6FlashNextQ2, limits(8192, 48));
+  sim.seed();
+  sim.decoder(9);
+  sim.lane(1, 45056, 300);
+  sim.shape(1, 45056 / kPageTokens);
+  sim.lane(2, 45056, 200);
+  sim.shape(2, 0, true);
+  BatchPlan plan = sim.plan();
+  while (plan.kind != WorkKind::Prefill) {
+    sim.run(plan);
+    plan = sim.plan();
+  }
+  require(plan.passes > 1 && plan.width() == 1, "two lanes with Index pages shared a command in passes");
+  sim.run(plan);
+  require(sim.scheduler.snapshot().indexPageConflicts == 1, "the lane left out for Index pages was not counted");
+}
+
+// --- Order and aging ----------------------------------------------------------------------------------------
+
+// Shortest expected remaining cost leads: 11K, 13K, 35K whatever their
+// order, and of equal rows the shallower.
+void testShortestExpectedRemainingLeads() {
+  DenseSim sim;
+  sim.lane(1, 0, 35'000);
+  sim.lane(2, 0, 13'000);
+  sim.lane(3, 0, 11'000);
+  require(sim.plan().items[0].requestId == 3, "the least remaining cost did not lead");
+  // Once commands at depth have priced attention, of equal rows the
+  // shallower leads, the deeper submitted first.
+  DenseSim depth;
+  for (uint64_t id = 10; id < 16; ++id) {
+    depth.lane(id, (id % 2) * 60'000, 2 * kChunk);
+    while (depth.scheduler.phase(id) == Phase::Prefill)
+      depth.step();
+    depth.scheduler.cancel(id);
+    depth.scheduler.remove(id);
+  }
+  depth.lane(1, 100'000, 4096);
+  depth.lane(2, 0, 4096);
+  require(depth.plan().items[0].requestId == 2, "of equal rows the deeper led");
+}
+
+// 87382087's case: of two near-equal long prompts the younger, cheaper one
+// leads; the older is never admitted while the younger prefills, and leads
+// next.
+void testNearEqualLongPromptsDoNotInterleave() {
+  Sim sim(test::kM6FlashNextQ2, limits(8192, 48));
+  sim.seed();
+  sim.scheduler.submit(request(1, 71'254));
+  sim.scheduler.submit(request(2, 71'220));
+  const std::array both{PrefillAdmission{1, 0}, PrefillAdmission{2, 0}};
+  require(sim.scheduler.prefillAdmissionOrder(both, sim.in()) == std::vector<uint64_t>{2},
+          "admission did not start the cheaper of two near-equal prompts");
+  sim.scheduler.resourcesReady(2, 0);
+  const std::array older{PrefillAdmission{1, 0}};
+  while (sim.scheduler.phase(2) == Phase::Prefill) {
+    require(sim.scheduler.prefillAdmissionOrder(older, sim.in()).empty(),
+            "the older prompt was admitted while the younger prefilled");
+    sim.step();
+  }
+  require(sim.scheduler.prefillAdmissionOrder(older, sim.in()) == std::vector<uint64_t>{1},
+          "the older prompt did not start once the younger's prompt ended");
+}
+
+// A long lane under a stream of short arrivals of its priority waits at
+// most K = 3 times its own remaining cost behind them, then leads to its
+// end: its first token within (1 + K) times its cost plus a unit.
+void testAgingBoundsALongLaneUnderArrivals() {
+  DenseSim sim;
+  sim.lane(1, 0, 6 * kChunk);
+  double cost = 0.0;
+  for (uint32_t command = 0; command < 6; ++command) {
+    const std::array item{BatchItem{1, kChunk, command * kChunk}};
+    cost += test::prefillTimes(sim.work.profile(), sim.work.prefillWork(sim.lanes(item), 0, 1)).wallMilliseconds;
+  }
+  // A shorter prompt arrives as each one before it ends.
+  uint64_t arrival = 0;
+  double longest = 0.0;
+  while (sim.scheduler.phase(1) == Phase::Prefill && arrival < 1000) {
+    if (!arrival || sim.scheduler.phase(arrival) != Phase::Prefill) {
+      if (arrival) {
+        sim.scheduler.cancel(arrival);
+        sim.scheduler.remove(arrival);
+      }
+      sim.lane(arrival = arrival ? arrival + 1 : 100, 0, 1500);
+    }
+    longest = std::max(longest, sim.step());
+  }
+  require(sim.scheduler.phase(1) != Phase::Prefill && sim.now <= 4.0 * cost + longest,
+          "the long lane's prompt ended after " + std::to_string(sim.now) + " ms, past (1 + K) of its " +
+              std::to_string(cost) + " ms");
+}
+
+// A higher priority's commands do not age a lower one: once they end, a
+// later cheaper lane of its priority still leads.
+void testHigherTierCommandsDoNotAgeALowerTier() {
+  DenseSim sim;
+  sim.lane(1, 0, 4096, RequestPriority::Background);
+  for (uint64_t id = 10; id < 30; ++id) {
+    sim.lane(id, 0, 1500, RequestPriority::Foreground);
+    while (sim.scheduler.phase(id) == Phase::Prefill)
+      sim.step();
+    sim.scheduler.cancel(id);
+    sim.scheduler.remove(id);
+  }
+  sim.lane(2, 0, 1000, RequestPriority::Background);
+  require(sim.plan().items[0].requestId == 2, "a higher priority's commands aged a lower lane");
+}
+
+// --- Superseding a command between its passes --------------------------------------------------------------
+
+// D2: a same-priority arrival abandons a command between its passes iff the
+// summed completion falls: |A|(K' + W) + |O| W < |J| R.
+void testASameTierArrivalSupersedesOnlyWhenTheSumFalls() {
+  for (const bool other : {false, true}) {
+    for (const double share : {0.5, 1.5}) {
+      Sim sim(test::kM6FlashNextQ2, limits(8192, 48));
+      sim.seed();
+      sim.lane(1, 0, 3 * 8192);
+      const BatchPlan command = sim.plan();
+      require(command.passes > 2, "the long command did not run in passes");
+      sim.run(command);
+      if (other)
+        sim.lane(3, 0, 6 * 8192);
+      sim.lane(2, 8192, 300);
+      const std::array turn{BatchItem{2, 300, 8192}};
+      const BatchPlan planned = [&] {
+        PassProgress kept = *sim.passes;
+        sim.passes.reset();
+        const BatchPlan fresh = sim.plan();
+        sim.passes = kept;
+        return fresh;
+      }();
+      require(planned.width() == 1 && planned.items == std::vector<BatchItem>(turn.begin(), turn.end()),
+              "the arrival did not lead a plan of its own");
+      const double rest = sim.passesPrice(command.items, 1, command.passes);
+      const double turnPrice = sim.passesPrice(turn, 0, planned.passes);
+      const double threshold = (rest - turnPrice) / (other ? 2.0 : 1.0);
+      require(threshold > 0.0, "the case has no threshold");
+      sim.passes->elapsedMilliseconds = share * threshold;
+      const BatchPlan next = sim.plan();
+      const bool abandons = sim.scheduler.abandonsPasses(next, sim.in());
+      require(abandons == (share < 1.0), std::string(other ? "with" : "without") + " a lane waiting behind both, W " +
+                                             std::to_string(share) + " of the threshold did " +
+                                             (abandons ? "" : "not ") + "abandon");
+    }
+  }
+}
+
+// A higher priority's start abandons a 19-pass command while (|A| + |O|) W
+// < |J| R, with one lower lane waiting behind both.
+void testAHigherTierAbandonCountsLanesWaitingBehindBoth() {
+  test::TimingProfile even = test::kM6FlashNextQ2;
+  even.layers = 38;
+  Sim sim(even, limits(8192, 19));
+  sim.seed();
+  sim.lane(1, 0, 3 * 8192);
+  sim.lane(3, 0, 6 * 8192);
+  BatchPlan plan = sim.plan();
+  require(plan.passes == 19 && plan.items[0].requestId == 1, "the command did not run in 19 passes");
+  for (uint32_t pass = 0; pass + 1 < plan.passes; ++pass) {
+    sim.run(pass ? sim.passes->plan : plan);
+    const double done = sim.passes->elapsedMilliseconds;
+    const double rest = sim.passesPrice(plan.items, pass + 1, plan.passes);
+    require(sim.scheduler.yieldsTo(RequestPriority::Foreground, 1, sim.in()) == (2.0 * done < rest),
+            "after " + std::to_string(pass + 1) + " passes a higher start's abandonment did not weigh the lower lane");
+  }
+}
+
+// A regroup abandons the command only while the summed completion falls:
+// keeping it, its lane ends with its passes, R, and the arrival after its own
+// command; regrouped, both end with the new command, K'. Early in the
+// command it regroups, near its end not.
+void testARegroupHappensOnlyWhenTheSumFalls() {
+  for (const bool early : {true, false}) {
+    Sim sim(test::kM6FlashNextQ2, limits(8192, 48));
+    sim.seed();
+    sim.lane(1, 8192, 300);
+    const BatchPlan command = sim.plan();
+    require(command.passes > 3, "the turn did not run in passes");
+    sim.run(command);
+    while (!early && sim.passes->plan.pass + 1 < command.passes)
+      sim.run(sim.passes->plan);
+    sim.lane(2, 8192, 300);
+    PassProgress kept = *sim.passes;
+    sim.passes.reset();
+    const BatchPlan fresh = sim.plan();
+    sim.passes = kept;
+    require(fresh.width() == 2, "the two turns did not plan together");
+    const double rest = sim.passesPrice(command.items, sim.passes->plan.pass, command.passes);
+    const double together = sim.passesPrice(fresh.items, 0, fresh.passes);
+    const std::array second{fresh.items[1]};
+    const double alone = sim.passesPrice(second, 0, fresh.passes);
+    const double gain = rest + (rest + alone) - 2.0 * together;
+    require((gain > 0.0) == early, "the case does not straddle the rule");
+    const bool abandons = sim.scheduler.abandonsPasses(sim.plan(), sim.in());
+    require(abandons == early, "a regroup did not follow the summed completion");
+  }
+}
+
+// An overdue lane's command is never abandoned.
+void testAnOverdueLaneIsNeverAbandoned() {
+  Sim sim(test::kM6FlashNextQ2, limits(8192, 48));
+  sim.seed();
+  sim.lane(1, 0, 3 * 8192);
+  const BatchPlan command = sim.plan();
+  sim.run(command);
+  // Abandoned commands count as waited: enough of them make lane 1 overdue.
+  sim.passes->elapsedMilliseconds = 1e7;
+  PassProgress kept = *sim.passes;
+  sim.abandon();
+  sim.passes = kept;
+  sim.passes->elapsedMilliseconds = 0.0;
+  sim.lane(2, 8192, 300);
+  require(!sim.scheduler.abandonsPasses(sim.plan(), sim.in()) &&
+              !sim.scheduler.yieldsTo(RequestPriority::Foreground, 1, sim.in()),
+          "an overdue lane's command was abandoned");
+}
+
+// While a command is between its passes, a start waiting for a quota does
+// not lift it over a higher decoder; one the command held back does, and the
+// kinds alternate.
+void testOnlyAHeldStartLiftsTheCommand() {
+  for (const bool held : {false, true}) {
+    Sim sim(test::kM6FlashNextQ2, limits(8192, 48));
+    sim.seed();
+    sim.lane(1, 0, 3 * 8192, RequestPriority::Background);
+    sim.run(sim.plan());
+    sim.decoder(2);
+    sim.scheduler.submit(request(3, 100));
+    sim.scheduler.waitForResources(3);
+    if (held)
+      sim.passes->heldStarts.push_back(3);
+    completeDecode(sim);
+    const BatchPlan plan = sim.plan();
+    require((plan.kind == WorkKind::Prefill) == held, held ? "a held start did not lift the command"
+                                                           : "a waiting start lifted the command");
+  }
+}
+
+// The image encodes ahead of a command stay out of its price: a command
+// whose rows ran as priced trains nothing new, encodes or not.
+void testImageEncodesStayOutOfTheCommandEstimate() {
+  std::array<double, 2> prices{};
+  for (const bool encodes : {false, true}) {
+    DenseSim sim;
+    sim.lane(1, 0, 4096);
+    const BatchPlan plan = sim.plan();
+    sim.scheduler.commit(plan, sim.in());
+    const model::CommandWork work = sim.work.prefillWork(sim.lanes(plan.items), 0, 1);
+    const double rows = test::prefillTimes(sim.work.profile(), work).wallMilliseconds;
+    const std::array result{StepResult{1, plan.items[0].tokenCount, false, DecodeStage::Regular}};
+    sim.scheduler.complete(plan, result,
+                           {.work = work,
+                            .wallMilliseconds = rows + (encodes ? 5000.0 : 0.0),
+                            .imageEncodeMilliseconds = encodes ? 5000.0 : 0.0});
+    prices[encodes] = sim.price(sim.plan().items);
+  }
+  require(prices[0] == prices[1], "a command's image encodes trained its price");
+}
+
+constexpr test::TestCase kTests[] = {
+    {"testRealDecodeWidths", testRealDecodeWidths},
+    {"testRejectedCommitCountsNothing", testRejectedCommitCountsNothing},
+    {"testDecodeLanesRotate", testDecodeLanesRotate},
+    {"testMaskStagesNeverMix", testMaskStagesNeverMix},
+    {"testPrefillAndDecodeAlternateWithoutStarvation", testPrefillAndDecodeAlternateWithoutStarvation},
+    {"testDecodeRepaysItsShareOfContendedPrefill", testDecodeRepaysItsShareOfContendedPrefill},
+    {"testDecodeTimePerTokenWeighsEachCommand", testDecodeTimePerTokenWeighsEachCommand},
+    {"testExcludedLanesAreNotPlanned", testExcludedLanesAreNotPlanned},
+    {"testPriorityPrecedesWorkKindAlternation", testPriorityPrecedesWorkKindAlternation},
+    {"testPrefillCommandContainsOnePriorityTier", testPrefillCommandContainsOnePriorityTier},
+    {"testHighestRunnablePriority", testHighestRunnablePriority},
+    {"testResourceSuspensionReplaysFromCache", testResourceSuspensionReplaysFromCache},
+    {"testAdmissionStartsTheLanesOfTheNextCommand", testAdmissionStartsTheLanesOfTheNextCommand},
+    {"testAPrefillsPriceIsTheCostModels", testAPrefillsPriceIsTheCostModels},
+    {"testColdSeedPricesTheFirstContendedTurn", testColdSeedPricesTheFirstContendedTurn},
+    {"testEstimateConvergesUnderUniformContendedCommands", testEstimateConvergesUnderUniformContendedCommands},
+    {"testALoneDenseCommandRunsWhole", testALoneDenseCommandRunsWhole},
+    {"testALoneRequestIsSizedAsToday", testALoneRequestIsSizedAsToday},
+    {"testContendedTurnPassesByTurnaround", testContendedTurnPassesByTurnaround},
+    {"testPassesAddAtMostATenthOfTheCommand", testPassesAddAtMostATenthOfTheCommand},
+    {"testPassesFollowCostOnAResidentTarget", testPassesFollowCostOnAResidentTarget},
+    {"testGroupRowsFollowTheFixedCost", testGroupRowsFollowTheFixedCost},
+    {"testThePairBoundIsPerLayerAndOnlyRowsMeetIt", testThePairBoundIsPerLayerAndOnlyRowsMeetIt},
+    {"testEveryContendedUnitWithinItsBound", testEveryContendedUnitWithinItsBound},
+    {"testAContendedSpillLaneKeepsItsGroupRows", testAContendedSpillLaneKeepsItsGroupRows},
+    {"testAGroupBeyondMaximumPassesHalvesOnlyWhenContended", testAGroupBeyondMaximumPassesHalvesOnlyWhenContended},
+    {"testALongLanesSparingRowsDoNotDelayAShortTurn", testALongLanesSparingRowsDoNotDelayAShortTurn},
+    {"testFourShortTurnsShareOneCommand", testFourShortTurnsShareOneCommand},
+    {"testADenseFinishingLeaderRunsWithoutFill", testADenseFinishingLeaderRunsWithoutFill},
+    {"testTwoSpillLanesNeverShareAMultiPassCommand", testTwoSpillLanesNeverShareAMultiPassCommand},
+    {"testShortestExpectedRemainingLeads", testShortestExpectedRemainingLeads},
+    {"testNearEqualLongPromptsDoNotInterleave", testNearEqualLongPromptsDoNotInterleave},
+    {"testAgingBoundsALongLaneUnderArrivals", testAgingBoundsALongLaneUnderArrivals},
+    {"testHigherTierCommandsDoNotAgeALowerTier", testHigherTierCommandsDoNotAgeALowerTier},
+    {"testASameTierArrivalSupersedesOnlyWhenTheSumFalls", testASameTierArrivalSupersedesOnlyWhenTheSumFalls},
+    {"testAHigherTierAbandonCountsLanesWaitingBehindBoth", testAHigherTierAbandonCountsLanesWaitingBehindBoth},
+    {"testARegroupHappensOnlyWhenTheSumFalls", testARegroupHappensOnlyWhenTheSumFalls},
+    {"testAnOverdueLaneIsNeverAbandoned", testAnOverdueLaneIsNeverAbandoned},
+    {"testOnlyAHeldStartLiftsTheCommand", testOnlyAHeldStartLiftsTheCommand},
+    {"testImageEncodesStayOutOfTheCommandEstimate", testImageEncodesStayOutOfTheCommandEstimate},
+};
 
 } // namespace
 
-int main() {
-  try {
-    testAdmissionSharesDispatchOrderAndBudget();
-    testAdmissionRespectsContendedBudgetAndDecodePriority();
-    testHighestRunnablePriority();
-    testQueuedPrefillCannotBeOvertakenIndefinitely();
-    testWarmupTimingSeedsFirstContendedCommand();
-    testFixedPrefillCostSizesContendedSlice();
-    testPrefillGroupHasOneSpanningLane();
-    testPrefillGroupsRunUncontended();
-    testPrefillPassesBoundCommands();
-    testShortPromptsShareACommandInPasses();
-    testArrivalsRegroupACommandInPasses();
-    testPassesShareTheRowsThatSpareACommand();
-    testRegroupsKeepTheCommandsLanes();
-    testRegroupsWeighTheRowsThatJoin();
-    testPrefillEstimateFitsCommandsOfDifferentRows();
-    testContendedCommandsStayWithinTheSliceAsTheyDeepen();
-    testPrefillEstimateBoundsItsFit();
-    testAPrefillsPriceIsTheEstimateForItsRows();
-    testPassesShareOnlyWhatTheFixedPartOutweighs();
-    testAHigherPriorityPromptsRowsDoNotCountAgainstIt();
-    testAHigherPriorityWaitsForACommandPastItsMiddle();
-    testACommandRunsAtThePriorityOfWhatItHoldsBack();
-    testANearEqualLeaderKeepsThePassesRules();
-    testCommandsInPassesEndUnderArrivals();
-    testPassesYieldToAHigherPriority();
-    testCommandBetweenPassesHoldsItsLanes();
-    testDeepPrefillKeepsANativeChunksAttention();
-    testStreamingLaneRunsAlone();
-    testContendedStreamingLaneHalvesFromItsGroup();
-    testStreamEstimateIgnoresCommandsThatReadNothing();
-    testStreamWaitStaysOutOfTheCommandEstimate();
-    testImageEncodesStayOutOfTheCommandEstimate();
-    testImageEncodesStayOutOfAPassedCommandsEstimate();
-    testDecodeGapAcrossStreamingPrefill();
-    testShortestRemainingFirstUsesActualRows();
-    testShortenedPrefillResumesFromItsRows();
-    testEqualPromptsFinishInArrivalOrder();
-    testShortArrivalPrecedesLongColdPrompt();
-    testEqualLanesRunInArrivalOrderWithoutOvertaking();
-    testLaneOvertakenThreeTimesLeadsTheNextCommand();
-    testServedLaneResetsOvertaking();
-    testOldestNearEqualPromptLeads();
-    testNearEqualBandCountsTheShortestLanesCommands();
-    testNearEqualLeaderKeepsTheRestShortestFirst();
-    testOverdueLaneLeadsAnOlderLane();
-    testNearEqualOrderStaysWithinAPriority();
-    testAdmissionStartsTheLanesOfTheNextCommand();
-    testRealDecodeWidths();
-    testUnconstrainedLanesShareDecode();
-    testRejectedCommitCountsNothing();
-    testMaskedLanesShareDecode();
-    testPrefillAndDecodeAlternateWithoutStarvation();
-    testDecodeRepaysItsShareOfContendedPrefill();
-    testDecodeTimePerTokenWeighsEachCommand();
-    testMaskWaitAccruesNoDecodeDebt();
-    testExcludedLanesAreNotPlanned();
-    testDecodeDebtLeavesWithTheLastDecoder();
-    testHigherPriorityPrefillPrecedesDecodeDebt();
-    testMeasuredBudgetOnlyLimitsContendedWork();
-    testAuxiliaryWorkDoesNotTrainTextPrefillTiming();
-    testMeasuredBudgetUsesActualRowsAndRecovers();
-    testMeasuredBudgetPreservesPriority();
-    testUnavailableTimingAndMinimumBudget();
-    testMeasuredBudgetDoesNotCountBlockedPeers();
-    testMeasuredBudgetPreservesPurePrefillThroughput();
-    testTinyTailDoesNotDistortPrefillThroughput();
-    testMeasuredBudgetFinishesShortPrefillPromptly();
-    testShortArrivalBesideLongPrefillEndsAtItsLastRow();
-    testMeasuredBudgetRetainsOvertakingBound();
-    testPriorityPrecedesWorkKindAlternation();
-    testPrefillCommandContainsOnePriorityTier();
-    testDecodeCommandContainsOnePriorityTier();
-    testDecodeLanesRotate();
-    testMaskStagesNeverMix();
-    testInitialSelectionsBatch();
-    testWaitingMaskBoundsPeerPrefill();
-    testResourceSuspensionReplaysFromCache();
-    testReplayKeepsHeldInitialMask();
-    std::cout << "ragged scheduler tests passed\n";
-    return EXIT_SUCCESS;
-  } catch (const std::exception &error) {
-    std::cerr << "ragged scheduler tests failed: " << error.what() << '\n';
-    return EXIT_FAILURE;
-  }
+int main(int argc, char **argv) {
+  const test::TestGroup groups[] = {{"scheduler", kTests}};
+  return test::runTests("ragged-scheduler", groups, argc, argv);
 }

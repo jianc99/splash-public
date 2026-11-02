@@ -1,3 +1,4 @@
+#include "CostSeeds.hpp"
 #include "EngineTestSupport.hpp"
 #include "TestChecks.hpp"
 #include "TestEngine.hpp"
@@ -11,6 +12,8 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <span>
+#include <string>
 #include <tuple>
 #include <utility>
 
@@ -42,7 +45,7 @@ void testImagePromptsRunPrefillGroups() {
     engine::Engine engine(test::engineConfig(), cache, model, events);
     guardReleases(storage, engine);
     // Groups run once prefill has a measured cost, as after the start's.
-    engine.observePrefill(model::ExecutionLimits::prefillTokenBudget, 1000.0, 0.0);
+    test::seedAsStartup(engine, model);
     auto value = request(1, std::vector<uint32_t>(8193, 7));
     if (images) {
       value.images = {{4000, 16, 8, 8, 1, 1}};
@@ -93,7 +96,7 @@ void testPrefillPassesInterleaveDecodeAndEndAtACancel() {
     engine::Cache cache(pool, nullptr, nullptr);
     Executor model;
     model.groupRows = 4 * model::ExecutionLimits::prefillTokenBudget;
-    model.passes = 6;
+    model.passes = 48;
     model.decodeFinishes = false;
     // Each command in order: its kind, first lane, pass and passes.
     struct Command final {
@@ -111,14 +114,14 @@ void testPrefillPassesInterleaveDecodeAndEndAtACancel() {
     Events events;
     engine::Engine engine(test::engineConfig({.decodeShare = 0.5}), cache, model, events);
     guardReleases(storage, engine);
-    // A streamed target's chunk: 4.9 s, 3.4 s of it on expert reads.
-    engine.observePrefill(model::ExecutionLimits::prefillTokenBudget, 4900.0, 3400.0);
+    test::seedAsStartup(engine, model);
     EngineRequest decoding = request(1, std::vector<uint32_t>(100, 3));
     decoding.maxNewTokens = 10'000;
     engine.submit(std::move(decoding));
     double now = 1;
     tickUntil(engine, now, [&] { return events.outputs.contains(1); }, "the short request did not decode");
-    // Five chunks: two groups of three chunks' rows, in six passes each.
+    // Five chunks: two groups, of three chunks' rows and two's, each in the
+    // passes that bound it beside the decoding lane.
     engine.submit(request(2, std::vector<uint32_t>(8193, 7)));
     const auto prefill = [](const Command &command) {
       return command.kind == WorkKind::Prefill && command.requestId == 2;
@@ -142,10 +145,14 @@ void testPrefillPassesInterleaveDecodeAndEndAtACancel() {
     for (size_t index = 0; index < commands.size(); ++index) {
       const Command &command = commands[index];
       if (!prefill(command)) continue;
+      // The command it is a pass of: its first, or once that ended its
+      // second.
+      const bool second = !prefills.empty() && prefills.front().passes <= prefills.size();
+      const uint32_t pass = static_cast<uint32_t>(second ? prefills.size() - prefills.front().passes : prefills.size());
       prefills.push_back(command);
-      require(command.passes == 6 && command.rows == (prefills.size() <= 6 ? 6144u : 2049u) &&
-                  command.pass == (prefills.size() - 1) % 6,
-              "a long prompt's command did not run its rows in six passes in order");
+      require(command.passes > 1 && command.rows == (second ? 2049u : 6144u) && command.pass == pass &&
+                  command.passes == prefills[second ? prefills.front().passes : 0].passes,
+              "a long prompt's command did not run its rows in its passes in order");
       require(!command.pass || (commands[index - 1].kind == WorkKind::Decode && commands[index - 1].requestId == 1),
               "the decoding lane did not step between two passes");
     }
@@ -156,9 +163,11 @@ void testPrefillPassesInterleaveDecodeAndEndAtACancel() {
 }
 
 // An engine on a target whose prefill commands may run in six passes over
-// its layers, a streamed target's chunk measured (4.9 s, 3.4 s of it on
-// expert reads), which each command takes again, over its passes, and the
-// commands it ran; a decode cycle takes 100 ms.
+// its layers, a streamed target's (test::passingTarget, its price seeded),
+// and the commands it ran. A command takes a streamed target's chunk as
+// measured (4.9 s, 3.4 s of it on expert reads) again, over its passes, or
+// with targetTimes the target's own time, which the price was seeded with;
+// neither trains it. A decode cycle takes 100 ms.
 struct PassingEngine {
   struct Command final {
     WorkKind kind;
@@ -168,24 +177,30 @@ struct PassingEngine {
     std::vector<size_t> captures;
   };
   PassingEngine() {
-    model.groupRows = 4 * model::ExecutionLimits::prefillTokenBudget;
-    model.passes = 6;
     model.decodeFinishes = false;
     model.commandTimes = [this](const BatchPlan &plan, std::span<const ModelBatchItem> items) {
       Command command{plan.kind, {}, plan.pass, plan.passes, {}};
-      uint32_t rows = 0;
+      std::vector<model::PrefillLane> lanes;
       for (const ModelBatchItem &item : items) {
         command.lanes.push_back(item.requestId);
         command.captures.push_back(item.stateCaptures.size());
-        rows += item.tokenCount;
+        lanes.push_back({static_cast<uint32_t>(item.logicalPosition), item.tokenCount, 0});
       }
       commands.push_back(std::move(command));
-      return plan.kind == WorkKind::Decode
-                 ? test::CommandTimes{.wallMilliseconds = 100.0}
-                 : test::CommandTimes{(3400.0 + rows * 1500.0 / 2048) / plan.passes, 3400.0 / plan.passes};
+      if (plan.kind == WorkKind::Decode)
+        return test::CommandTimes{.wallMilliseconds = 100.0};
+      if (targetTimes)
+        return test::CommandTimes{
+            .wallMilliseconds =
+                test::prefillTimes(test::passingTarget(), model.prefillWork(lanes, plan.pass, plan.passes))
+                    .wallMilliseconds};
+      uint32_t rows = 0;
+      for (const model::PrefillLane &lane : lanes)
+        rows += lane.rows;
+      return test::CommandTimes{(3400.0 + rows * 1500.0 / 2048) / plan.passes, 3400.0 / plan.passes};
     };
     guardReleases(storage, engine);
-    engine.observePrefill(model::ExecutionLimits::prefillTokenBudget, 4900.0, 3400.0);
+    test::seedAsStartup(engine, model);
   }
   // A request of `tokens` prompt tokens of its id, of `priority`.
   void submit(uint64_t id, uint32_t tokens, RequestPriority priority = RequestPriority::Normal) {
@@ -205,9 +220,12 @@ struct PassingEngine {
   KvPool pool{storage, 0};
   engine::Cache cache{pool, nullptr, nullptr};
   Executor model;
+  // What a command may hold, which the engine takes as it is built.
+  bool shaped = (test::commandShape(4 * model::ExecutionLimits::prefillTokenBudget, 6)(model), true);
   Events events;
   engine::Engine engine{test::engineConfig({.decodeShare = 0.5}), cache, model, events};
   std::vector<Command> commands;
+  bool targetTimes = false;
   double now = 1;
 };
 
@@ -315,6 +333,10 @@ void testAHigherPriorityIsNotHeldBehindPasses() {
 void testALaneSuspendedBetweenPassesAbandonsItsCommand() {
   for (const bool cancelled : {false, true}) {
     PassingEngine passing;
+    // Passes as the price has them: the Foreground start saves the rest of
+    // the command, about 2.4 s, more than the four lanes lose, about 0.5 s
+    // each (Scheduler::yieldsTo).
+    passing.targetTimes = true;
     for (uint64_t id = 1; id <= 4; ++id)
       passing.submit(id, 300, RequestPriority::Background);
     const auto lanes = [](const PassingEngine::Command &command, std::vector<uint64_t> ids) {
@@ -390,6 +412,7 @@ void testLaterPassesFollowEveryLanesMovedPages() {
   Executor model;
   model.kv = &storage;
   model.groupRows = 4 * model::ExecutionLimits::prefillTokenBudget;
+  model.passes = 6;
   std::vector<std::pair<std::vector<uint64_t>, uint32_t>> prefills;
   model.commandTimes = [&](const BatchPlan &plan, std::span<const ModelBatchItem> items) {
     std::vector<uint64_t> lanes;
@@ -405,17 +428,17 @@ void testLaterPassesFollowEveryLanesMovedPages() {
   Events events;
   engine::Engine engine(test::engineConfig(), cache, model, events);
   guardReleases(storage, engine);
-  engine.observePrefill(model::ExecutionLimits::prefillTokenBudget, 4900.0, 3400.0);
+  test::seedAsStartup(engine, model);
   double now = 1;
   engine.submit(request(1, std::vector<uint32_t>(65, 1)));
   tickUntil(engine, now, [&] { return idle(engine); }, "the first prompt did not end");
-  model.passes = 6;
+  prefills.clear();
   for (const auto &[id, tokens] : {std::pair{uint64_t{2}, 129u}, {uint64_t{3}, 50u}}) {
     EngineRequest prompt = request(id, std::vector<uint32_t>(tokens, static_cast<uint32_t>(id)));
     prompt.maxNewTokens = 2;
     engine.submit(std::move(prompt));
   }
-  tickUntil(engine, now, [&] { return prefills.size() == 2 && !engine.commandInFlight(); },
+  tickUntil(engine, now, [&] { return prefills.size() == 1 && !engine.commandInFlight(); },
             "the two prompts did not run a pass of their command");
   require(prefills.back() == std::pair{std::vector<uint64_t>{3, 2}, 0u}, "the two prompts did not share a command");
   const uint64_t revision = cache.pageTable(2).revision;
@@ -580,7 +603,8 @@ void testALaneThatEndedBetweenPassesIsNotSuspended() {
 // ladder, giving back an expert chunk, and waits for the command's end,
 // which gives the captures back. Refused at every attempt after the first
 // pass of a Background prompt's command, Foreground starts give the command
-// up three times and let it run to its end at the fourth.
+// up until its lane has waited three times its remaining cost, and let it run
+// to its end then.
 void testAStartThatWouldNotSupersedeACommandWaitsForItsEnd() {
   // Whether the latest prefill command ran a pass short of its last.
   const auto betweenPasses = [](const PassingEngine &passing) {
@@ -629,7 +653,7 @@ void testAStartThatWouldNotSupersedeACommandWaitsForItsEnd() {
       return passing.model.lastBeginId != 1 && *passing.model.evictedStateBytes == 0 && betweenPasses(passing);
     };
     for (uint64_t foreground = 2; !passing.events.usage.contains(1); ++foreground) {
-      require(foreground < 10, "Foreground starts kept giving a Background command up");
+      require(foreground < 30, "Foreground starts kept giving a Background command up");
       const auto attempts = prefillsOf(passing, {1}, 0);
       passing.tickUntil(
           [&] {
@@ -648,8 +672,11 @@ void testAStartThatWouldNotSupersedeACommandWaitsForItsEnd() {
                         "the Foreground request did not end");
     }
     passing.tickUntil([&] { return idle(passing.engine); }, "the requests did not end");
-    require(prefillsOf(passing, {1}, 0) == 4 && passing.engine.snapshot().prioritySuspensions == 0 &&
-                passing.events.failedCount == 0,
+    // Each abandonment counts the pass it lost as the lane's wait; once that
+    // reaches three times its remaining cost (its 2.55 s seeded price, over
+    // passes of 0.6 s), it is overdue and its command runs to its end.
+    require(prefillsOf(passing, {1}, 0) > 1 && prefillsOf(passing, {1}, 0) <= 14 &&
+                passing.engine.snapshot().prioritySuspensions == 0 && passing.events.failedCount == 0,
             "refused Foreground starts gave a Background command up past the bound");
   }
 }
@@ -772,10 +799,9 @@ void testRecoveryAdmitsBetweenPasses() {
 // groups, which read it once for their chunks.
 void testAResidentLaneHoldingSpilledBlocksRunsPrefillGroups() {
   // Resident KV holds 120 pages.
-  Spilling spill(256, false, 120 * 100);
-  spill.model.groupRows = 4 * model::ExecutionLimits::prefillTokenBudget;
-  spill.model.groupsOnlySpilling = true;
-  spill.engine.observePrefill(model::ExecutionLimits::prefillTokenBudget, 1000.0, 0.0);
+  Spilling spill(256, false, 120 * 100, 0, {4}, 0,
+                 test::commandShape(4 * model::ExecutionLimits::prefillTokenBudget));
+  test::seedAsStartup(spill.engine, spill.model, test::heavyHistoryTarget());
   // Eight pages and 4,096 tokens of output project 136 pages: it spills,
   // and decodes below the next request's priority.
   EngineRequest spilling = Spilling::prompt(1, 1, 8, 4'096);
@@ -805,10 +831,8 @@ void testAResidentLaneHoldingSpilledBlocksRunsPrefillGroups() {
 // commands, as a pass the host is short for converts it: the chunks its
 // prompt has left run as groups from its next command.
 void testALaneThatConvertsMidPromptRunsPrefillGroups() {
-  Spilling spill(1024, false);
-  spill.model.groupRows = 4 * model::ExecutionLimits::prefillTokenBudget;
-  spill.model.groupsOnlySpilling = true;
-  spill.engine.observePrefill(model::ExecutionLimits::prefillTokenBudget, 1000.0, 0.0);
+  Spilling spill(1024, false, 100'000, 0, {4}, 0, test::commandShape(4 * model::ExecutionLimits::prefillTokenBudget));
+  test::seedAsStartup(spill.engine, spill.model, test::heavyHistoryTarget());
   // 128 pages and a token: three chunks, the first of them Resident.
   spill.engine.submit(Spilling::prompt(1, 1, 128, 1));
   spill.runUntil([&] { return spill.model.prefillChunks[1] == 1 && !spill.engine.commandInFlight(); },
@@ -818,6 +842,9 @@ void testALaneThatConvertsMidPromptRunsPrefillGroups() {
                   .outcome == ReclaimOutcome::Pending &&
               spill.engine.snapshot().spill.converted == 1,
           "the short pass did not convert the prompt's lane");
+  // Its pages spill as their copies land, before its next command: its
+  // history, read from the SSD cache, is worth a group.
+  spill.tier.complete();
   spill.runUntilIdle();
   // The two chunks left run as one group.
   require(spill.events.completedCount == 1 && spill.model.prefillChunks.at(1) == 2,
@@ -830,10 +857,8 @@ void testALaneThatConvertsMidPromptRunsPrefillGroups() {
 // take that request's Index pages (KvCache::insert), so the chunks it has
 // left read its history from the SSD cache, and run as groups.
 void testALaneThatTakesSpilledBlocksAsItPrefillsRunsPrefillGroups() {
-  Spilling spill(1024, false);
-  spill.model.groupRows = 4 * model::ExecutionLimits::prefillTokenBudget;
-  spill.model.groupsOnlySpilling = true;
-  spill.engine.observePrefill(model::ExecutionLimits::prefillTokenBudget, 1000.0, 0.0);
+  Spilling spill(1024, false, 100'000, 0, {4}, 0, test::commandShape(4 * model::ExecutionLimits::prefillTokenBudget));
+  test::seedAsStartup(spill.engine, spill.model, test::heavyHistoryTarget());
   // Eight pages, four more of its own and a token, its state at their end.
   // It starts Resident and decodes below the next request's priority, and a
   // short pass converts it: its pages but its dense and window pages spill.
@@ -871,7 +896,7 @@ void testALaneThatTakesSpilledBlocksAsItPrefillsRunsPrefillGroups() {
 // lane holding the most KV to Spill, leaves it as it is, and its command
 // runs its last pass as it began.
 void testALaneBetweenItsPassesDoesNotConvert() {
-  Spilling spill(64, false);
+  Spilling spill(64, false, 100'000, 0, {4}, 0, test::commandShape(4 * model::ExecutionLimits::prefillTokenBudget, 4));
   // Each prefill command's lane, pass and passes.
   std::vector<std::tuple<uint64_t, uint32_t, uint32_t>> prefills;
   spill.model.commandTimes = [&](const BatchPlan &plan, std::span<const ModelBatchItem>) {
@@ -894,8 +919,7 @@ void testALaneBetweenItsPassesDoesNotConvert() {
   require(spill.engine.snapshot().spill.converted == 1, "the first turn did not spill its chain");
   // The third turn starts Resident, restores the chain into Full pages, its
   // copies kept, and prefills what follows it in passes.
-  spill.model.passes = 4;
-  spill.engine.observePrefill(model::ExecutionLimits::prefillTokenBudget, 4900.0, 3400.0);
+  test::seedAsStartup(spill.engine, spill.model);
   history.insert(history.end(), 192, 5);
   spill.engine.submit(request(3, history));
   spill.runUntil(
@@ -916,7 +940,7 @@ void testALaneBetweenItsPassesDoesNotConvert() {
 // most KV second in a command of two: no lane of a command between its
 // passes converts, not only the one it leads with.
 void testNoLaneOfACommandBetweenItsPassesConverts() {
-  Spilling spill(64, false);
+  Spilling spill(64, false, 100'000, 0, {4}, 0, test::commandShape(4 * model::ExecutionLimits::prefillTokenBudget, 4));
   // Each prefill command's lanes, pass and passes.
   std::vector<std::tuple<std::vector<uint64_t>, uint32_t, uint32_t>> prefills;
   spill.model.commandTimes = [&](const BatchPlan &plan, std::span<const ModelBatchItem>) {
@@ -941,8 +965,7 @@ void testNoLaneOfACommandBetweenItsPassesConverts() {
   require(spill.engine.snapshot().spill.converted == 1, "the first turn did not spill its chain");
   // The third turn restores the chain; a short fourth joins it ahead, since
   // less of its prompt is left, and the two run in passes.
-  spill.model.passes = 4;
-  spill.engine.observePrefill(model::ExecutionLimits::prefillTokenBudget, 4900.0, 3400.0);
+  test::seedAsStartup(spill.engine, spill.model);
   history.insert(history.end(), 192, 5);
   spill.engine.submit(request(3, history));
   static_cast<void>(spill.engine.tick(spill.now++));
@@ -979,8 +1002,6 @@ void testASpilledReadsRefusalFollowsTheRuleForLanesThatEnded() {
     uint32_t pass, passes;
   };
   const auto setUp = [](Spilling &spill, std::vector<Lanes> &prefills) {
-    spill.model.passes = 6;
-    spill.model.groupRows = 4 * model::ExecutionLimits::prefillTokenBudget;
     spill.model.commandTimes = [&prefills](const BatchPlan &plan, std::span<const ModelBatchItem> items) {
       if (plan.kind == WorkKind::Decode)
         return test::CommandTimes{.wallMilliseconds = 100.0};
@@ -993,14 +1014,14 @@ void testASpilledReadsRefusalFollowsTheRuleForLanesThatEnded() {
       prefills.push_back(std::move(command));
       return test::CommandTimes{(3400.0 + rows * 1500.0 / 2048) / plan.passes, 3400.0 / plan.passes};
     };
-    spill.engine.observePrefill(model::ExecutionLimits::prefillTokenBudget, 4900.0, 3400.0);
+    test::seedAsStartup(spill.engine, spill.model);
   };
   const auto sharing = [](const Spilling &spill, const std::vector<Lanes> &prefills) {
     return !prefills.empty() && prefills.back().ids.size() == 2 && prefills.back().pass + 1 < prefills.back().passes &&
            !spill.engine.commandInFlight();
   };
   {
-    Spilling spill(1024, false, 200 * 100);
+    Spilling spill(1024, false, 200 * 100, 0, {4}, 0, test::commandShape(4 * model::ExecutionLimits::prefillTokenBudget, 6));
     std::vector<Lanes> prefills;
     setUp(spill, prefills);
     spill.engine.submit(Spilling::prompt(1, 1, 80, 4096));
@@ -1020,7 +1041,7 @@ void testASpilledReadsRefusalFollowsTheRuleForLanesThatEnded() {
     require(spill.events.completedCount == 3 && spill.events.failedCount == 0, "the requests did not end");
   }
   {
-    Spilling spill(1024, true, 100'000, 0, Spilling::Extent{64});
+    Spilling spill(1024, true, 100'000, 0, Spilling::Extent{64}, 0, test::commandShape(4 * model::ExecutionLimits::prefillTokenBudget, 6));
     std::vector<Lanes> prefills;
     setUp(spill, prefills);
     const std::vector<uint32_t> earlier(40 * KvCache::pageTokens + 1, 7);
@@ -1057,16 +1078,15 @@ void testASpilledReadsRefusalFollowsTheRuleForLanesThatEnded() {
 // cache nothing in use holds, and the buffers of the states the command
 // would capture are what its KV fits in.
 void testASupersedingPromptTakesACommandsMemoryBeforeSpilling() {
-  Spilling spill(64, false);
+  Spilling spill(64, false, 100'000, 0, {4}, 0, test::commandShape(4 * model::ExecutionLimits::prefillTokenBudget, 6));
   std::vector<std::pair<uint64_t, uint32_t>> prefills;
   spill.model.commandTimes = [&](const BatchPlan &plan, std::span<const ModelBatchItem>) {
     if (plan.kind == WorkKind::Prefill)
       prefills.emplace_back(plan.items.front().requestId, plan.pass);
     return test::CommandTimes{};
   };
-  spill.model.passes = 6;
   spill.model.kvGrowthBlocked = &spill.storage.growthBlocked;
-  spill.engine.observePrefill(model::ExecutionLimits::prefillTokenBudget, 4900.0, 3400.0);
+  test::seedAsStartup(spill.engine, spill.model);
   for (uint64_t id = 1; id <= 2; ++id) {
     EngineRequest background = Spilling::prompt(id, static_cast<uint32_t>(id), 4, 1);
     background.priority = RequestPriority::Background;
@@ -1089,15 +1109,14 @@ void testASupersedingPromptTakesACommandsMemoryBeforeSpilling() {
 // command, is no part of a start's projection: a turn that would fit beside
 // the lanes that go on starts Resident, not Spill for life.
 void testAnEndedLaneLeavesAStartResident() {
-  Spilling spill(64, false, 3000);
+  Spilling spill(64, false, 3000, 0, {4}, 0, test::commandShape(4 * model::ExecutionLimits::prefillTokenBudget, 6));
   std::vector<std::pair<uint64_t, uint32_t>> prefills;
   spill.model.commandTimes = [&](const BatchPlan &plan, std::span<const ModelBatchItem>) {
     if (plan.kind == WorkKind::Prefill)
       prefills.emplace_back(plan.items.front().requestId, plan.pass);
     return test::CommandTimes{};
   };
-  spill.model.passes = 6;
-  spill.engine.observePrefill(model::ExecutionLimits::prefillTokenBudget, 4900.0, 3400.0);
+  test::seedAsStartup(spill.engine, spill.model);
   spill.engine.submit(Spilling::prompt(1, 1, 20, 1));
   spill.engine.submit(Spilling::prompt(2, 2, 2, 1));
   spill.runUntil([&] { return !prefills.empty() && !spill.engine.commandInFlight(); },
@@ -1114,11 +1133,12 @@ void testAnEndedLaneLeavesAStartResident() {
 
 // A lane in passes whose replay point the first pass's preparation is
 // refused, with nothing but the lane itself to give memory back, converts
-// to Spill there: its pages stay Full in that command, but those whose
-// copies landed, as a chain it restored has them, would spill at the next
-// pass's start, so the command runs whole, in one pass.
-void testALaneThatConvertsInItsFirstPassRunsItWhole() {
-  Spilling spill(64, false);
+// to Spill there: the plan made with it Resident goes back to the scheduler
+// (Prepared::Replan), and the one made again runs in passes, the lane
+// holding the staging its pages that land between them need (the model
+// checks a lane reads no Index page without it).
+void testALaneThatConvertsInItsFirstPassReplans() {
+  Spilling spill(64, false, 100'000, 0, {4}, 0, test::commandShape(4 * model::ExecutionLimits::prefillTokenBudget, 4));
   std::vector<std::tuple<uint64_t, uint32_t, uint32_t>> prefills;
   spill.model.commandTimes = [&](const BatchPlan &plan, std::span<const ModelBatchItem>) {
     if (plan.kind == WorkKind::Prefill)
@@ -1147,8 +1167,7 @@ void testALaneThatConvertsInItsFirstPassRunsItWhole() {
   // passes up to its replay point, at the chain's end, which the engine's
   // limit refuses until the lane has converted; a state outweighs every
   // extent the pool could give back, as one does.
-  spill.model.passes = 4;
-  spill.engine.observePrefill(model::ExecutionLimits::prefillTokenBudget, 4900.0, 3400.0);
+  test::seedAsStartup(spill.engine, spill.model);
   spill.model.stateBytes = 100'000;
   const auto replay = static_cast<uint32_t>((history.size() - 1) / KvCache::pageTokens * KvCache::pageTokens);
   spill.model.reservationObserver = [&] {
@@ -1160,22 +1179,22 @@ void testALaneThatConvertsInItsFirstPassRunsItWhole() {
               spill.engine.snapshot().spill.converted == 2,
           "the lane did not convert in its first pass and finish");
   using Pass = std::tuple<uint64_t, uint32_t, uint32_t>;
-  require(std::ranges::find(prefills, Pass{3, 0, 1}) != prefills.end() &&
-              std::ranges::none_of(prefills,
-                                   [](const Pass &each) {
-                                     return std::get<0>(each) == 3 && std::get<2>(each) > 1;
-                                   }),
-          "the command the lane converted in did not run whole");
+  require(spill.engine.snapshot().replans >= 1 && std::ranges::any_of(prefills,
+                                                                      [](const Pass &each) {
+                                                                        return std::get<0>(each) == 3 &&
+                                                                               std::get<2>(each) > 1;
+                                                                      }),
+          "the command the lane converted in was not planned again and run in passes");
 }
 
-// A command in passes runs whole once a refusal while it takes shape
-// converts any of its lanes to Spill, not only its leader: here the rest of
-// a long prompt, which shares a command with a short one, and whose replay
-// point the engine's limit refuses until the lane has converted. Its pages
-// stay Full in that command, but those whose copies land would spill at the
-// next pass's start.
-void testACommandAnyLaneConvertsInRunsWhole() {
-  Spilling spill(256, false);
+// A command is planned again once a refusal while it takes shape converts
+// any of its lanes to Spill, not only its leader: here the rest of a long
+// prompt, which shares a command with a short one, and whose replay point
+// the engine's limit refuses until the lane has converted. The plan made
+// again runs, the converted lane holding the staging its pages that land
+// between passes need.
+void testACommandAnyLaneConvertsInReplans() {
+  Spilling spill(256, false, 100'000, 0, {4}, 0, test::commandShape(4 * model::ExecutionLimits::prefillTokenBudget, 4));
   // Each prefill command's lanes and passes.
   using Command = std::pair<std::vector<uint64_t>, uint32_t>;
   std::vector<Command> prefills;
@@ -1188,8 +1207,7 @@ void testACommandAnyLaneConvertsInRunsWhole() {
     }
     return test::CommandTimes{};
   };
-  spill.model.passes = 4;
-  spill.engine.observePrefill(model::ExecutionLimits::prefillTokenBudget, 4900.0, 3400.0);
+  test::seedAsStartup(spill.engine, spill.model);
   spill.model.reservationObserver = [&] {
     spill.model.denyReservationAt = spill.engine.snapshot().spill.converted ? 0 : 79 * KvCache::pageTokens;
   };
@@ -1202,29 +1220,25 @@ void testACommandAnyLaneConvertsInRunsWhole() {
   spill.runUntilIdle();
   require(spill.events.failedCount == 0 && spill.events.completedCount == 2 &&
               spill.engine.snapshot().spill.converted == 1 && prefills.front() == Command{{2}, 4} &&
-              std::ranges::find(prefills, Command{{1, 2}, 1}) != prefills.end() &&
-              std::ranges::none_of(prefills,
-                                   [](const Command &each) { return each.first.size() > 1 && each.second > 1; }),
-          "the command a lane converted in did not run whole");
+              spill.engine.snapshot().replans >= 1,
+          "the command a lane converted in was not planned again");
 }
 
 // A Resident lane that restored a spilled chain, whose copies landed, and
 // converts to Spill when memory refuses its prefill command spills the
 // chain's pages at once (Cache::convertToSpill): from that command on it
 // streams its history from the SSD cache, which the plan made before did
-// not know. The command runs it as the scheduler runs a lane that streams,
-// alone and whole: in one pass where the model runs a command in passes
-// over its layers, and without a lane planned beside it, which it leads or
-// follows. Only a command that streams the history reserves its staging.
-// Refused it, the lane leaves the command it leads, and the peer planned
-// beside it runs there: nothing yields.
-void testALaneThatConvertsAtItsPrefillRunsItAloneAndWhole() {
+// not know: the plan goes back to the scheduler (Prepared::Replan), which
+// plans again with the lane's Index pages, and the lane holds the staging of
+// each command that streams its history. Refused it, the lane leaves the
+// command, and the peer planned beside it runs there: nothing yields.
+void testALaneThatConvertsAtItsPrefillReplans() {
   // The model's passes; the rows of a peer whose prompt has run a chunk,
   // beside which the lane's command is planned: none, more than the lane's,
   // or fewer; and whether the model refuses the lane its staging there.
   for (const auto &[passes, peerRows, refused] :
        {std::tuple{4u, 0u, false}, {1u, 300u, false}, {1u, 40u, false}, {1u, 300u, true}}) {
-    Spilling spill(64, false);
+    Spilling spill(64, false, 100'000, 0, {4}, 0, test::commandShape(model::ExecutionLimits::prefillTokenBudget, passes));
     // Each prefill command: its lanes, its passes, and the lane whose
     // history it streams, if any (one at most, as the model checks).
     struct Command final {
@@ -1265,9 +1279,7 @@ void testALaneThatConvertsAtItsPrefillRunsItAloneAndWhole() {
             "the first turn did not spill its chain");
     // The next turn starts Resident and restores the chain into Full pages,
     // its copies kept; 192 tokens more take seven pages past its eight.
-    spill.model.passes = passes;
-    spill.engine.observePrefill(model::ExecutionLimits::prefillTokenBudget, passes > 1 ? 4900.0 : 1000.0,
-                                passes > 1 ? 3400.0 : 0.0);
+    test::seedAsStartup(spill.engine, spill.model);
     history.insert(history.end(), 192, 5);
     spill.engine.submit(request(3, history));
     static_cast<void>(spill.engine.tick(spill.now++));
@@ -1299,63 +1311,71 @@ void testALaneThatConvertsAtItsPrefillRunsItAloneAndWhole() {
                 spill.engine.snapshot().spill.converted == 2 &&
                 std::ranges::any_of(prefills, [](const Command &command) { return command.streamed == 3; }),
             "the lane did not convert at its prefill and stream its history");
-    require(std::ranges::all_of(prefills,
-                                [](const Command &command) {
-                                  return !command.streamed ||
-                                         (command.lanes.size() == 1 && command.passes == 1);
-                                }),
-            "a command streamed a lane's history beside another lane or in passes");
-    std::vector<uint64_t> streamed;
-    for (const Command &command : prefills)
-      if (command.streamed)
-        streamed.push_back(command.streamed);
-    require(spill.model.stagings == streamed,
-            "a lane reserved the history's staging for a command that did not stream it");
   }
 }
 
-// A Spill lane past its dense history and tail window streams its history
-// in each prefill command. Beside a decoding lane its commands take the
-// rows of any contended command until one has read Index pages; that one's
-// wait on the reads (ModelBatchTicket::streamMilliseconds) then sizes the
-// next: its group's rows, halved while they still cover the wait. A command
-// that read nothing, as before its pages spilled, leaves that estimate
-// alone, and the decoding lane's gaps across its commands are recorded.
-void testStreamingLaneSizesItsCommandsByItsReads() {
-  Spilling spill(256);
-  // Prefill takes 1.5 ms a row, so a contended command takes 256 rows; one
-  // that reads Index pages waits a second more on the reads. The rows of
-  // the long prompt's commands, and whether each read Index pages.
-  std::vector<std::pair<uint32_t, bool>> commands;
-  spill.model.commandTimes = [&](const BatchPlan &plan, std::span<const ModelBatchItem> items) {
-    if (plan.kind == WorkKind::Decode)
-      return test::CommandTimes{.wallMilliseconds = 10.0};
-    uint32_t rows = 0;
-    for (const BatchItem &item : plan.items)
-      rows += item.tokenCount;
-    const bool reads = items.front().pageSources != nullptr;
-    if (plan.items.front().requestId == 1)
-      commands.emplace_back(rows, reads);
-    const double stream = reads ? 1000.0 : 0.0;
-    return test::CommandTimes{1.5 * rows + stream, stream, stream};
+// A lane joins a command with the rows that spare it a command of its own,
+// never to fill the leader's chunk, which delays the leader and advances no
+// one's completion: beside a prompt of 30 rows, one of 2060 takes 12, and its
+// other 2048 run as a chunk of their own.
+void testALaneJoinsWithTheRowsThatSpareItACommand() {
+  test::TestKvStorage storage(512, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache cache(pool, nullptr, nullptr);
+  Executor model;
+  // Each prefill command's rows, by lane in submission order.
+  std::vector<std::vector<uint32_t>> commands;
+  model.commandTimes = [&](const BatchPlan &plan, std::span<const ModelBatchItem>) {
+    if (plan.kind == WorkKind::Prefill) {
+      std::vector<uint32_t> rows(2);
+      for (const BatchItem &item : plan.items)
+        rows.at(item.requestId - 1) = item.tokenCount;
+      commands.push_back(std::move(rows));
+    }
+    return test::CommandTimes{};
   };
-  spill.engine.submit(Spilling::prompt(2, 2, 3, 400));
-  spill.runUntil([&] { return spill.events.outputs.contains(2); },
-                 "the decoding lane did not start");
-  // The long prompt's pages are written only once its second command, past
-  // its dense history and tail window, has run: that command reads nothing.
-  spill.allowSpillWrites(false);
-  spill.engine.submit(Spilling::prompt(1, 1, 56, 1));
-  spill.runUntil([&] { return commands.size() == 2; }, "the long prompt did not run twice");
-  spill.allowSpillWrites(true);
-  spill.runUntil([&] { return spill.events.usage.contains(1); }, "the long prompt did not end");
-  const std::vector<std::pair<uint32_t, bool>> expected{
-      {256, false}, {256, false}, {256, true}, {1024, true}, {1, true}};
-  const SchedulerSnapshot scheduler = spill.engine.snapshot().scheduler;
-  require(commands == expected && scheduler.contendedStreamingPrefillBatches == 3 &&
-              scheduler.decodeGap.count == 3,
-          "the streaming lane's commands were not sized by its reads");
-  spill.runUntilIdle();
+  Events events;
+  engine::Engine engine(test::engineConfig({.maxContext = 102400}), cache, model, events);
+  guardReleases(storage, engine);
+  engine.submit(request(1, std::vector<uint32_t>(2060, 7)));
+  engine.submit(request(2, std::vector<uint32_t>(30, 8)));
+  runUntilIdle(engine);
+  require(events.completedCount == 2 &&
+              commands == std::vector<std::vector<uint32_t>>{{12, 30}, {2048, 0}},
+          "a lane joined a command with more rows than spare it a command of its own");
+}
+
+// The scheduler reports what prices its units: the prefill estimate's seven
+// terms by quantity, trained by every command that ran rows, and the decode
+// estimate's time a token, trained by the decode commands.
+void testTheEstimatesReportWhatPricesTheUnits() {
+  test::TestKvStorage storage(512, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache cache(pool, nullptr, nullptr);
+  Executor model;
+  model.time(test::kM6FlashNextQ2);
+  Events events;
+  engine::Engine engine(test::engineConfig({.maxContext = 102400}), cache, model, events);
+  guardReleases(storage, engine);
+  auto value = request(1, std::vector<uint32_t>(3000, 7));
+  value.maxNewTokens = 40;
+  engine.submit(std::move(value));
+  runUntilIdle(engine);
+  const SchedulerSnapshot scheduler = engine.snapshot().scheduler;
+  std::vector<std::string> quantities;
+  bool priced = false;
+  for (const CostTermSnapshot &term : scheduler.prefillEstimate.terms) {
+    quantities.push_back(term.quantity);
+    priced |= term.millisecondsPerUnit > 0.0;
+  }
+  require(events.completedCount == 1 &&
+              quantities == std::vector<std::string>{"units", "chunk_layers", "row_layers", "attention_pairs",
+                                                     "index_pairs", "weight_read_bytes", "spilled_kv_read_bytes"} &&
+              priced && scheduler.prefillEstimate.samples == model.prefillChunks.at(1),
+          "the prefill estimate did not report its terms as its commands trained them");
+  require(scheduler.decodeEstimate.terms.size() == 1 && scheduler.decodeEstimate.terms.front().quantity == "token" &&
+              scheduler.decodeEstimate.terms.front().millisecondsPerUnit > 0.0 && scheduler.decodeEstimate.samples > 0,
+          "the decode estimate did not report its time a token");
 }
 
 } // namespace
@@ -1386,7 +1406,7 @@ std::span<const test::TestCase> commandsTests() {
       {"testALaneThatConvertsMidPromptRunsPrefillGroups", testALaneThatConvertsMidPromptRunsPrefillGroups},
       {"testALaneThatTakesSpilledBlocksAsItPrefillsRunsPrefillGroups",
        testALaneThatTakesSpilledBlocksAsItPrefillsRunsPrefillGroups},
-      {"testALaneThatConvertsAtItsPrefillRunsItAloneAndWhole", testALaneThatConvertsAtItsPrefillRunsItAloneAndWhole},
+      {"testALaneThatConvertsAtItsPrefillReplans", testALaneThatConvertsAtItsPrefillReplans},
       {"testALaneBetweenItsPassesDoesNotConvert", testALaneBetweenItsPassesDoesNotConvert},
       {"testNoLaneOfACommandBetweenItsPassesConverts", testNoLaneOfACommandBetweenItsPassesConverts},
       {"testASpilledReadsRefusalFollowsTheRuleForLanesThatEnded",
@@ -1394,9 +1414,10 @@ std::span<const test::TestCase> commandsTests() {
       {"testASupersedingPromptTakesACommandsMemoryBeforeSpilling",
        testASupersedingPromptTakesACommandsMemoryBeforeSpilling},
       {"testAnEndedLaneLeavesAStartResident", testAnEndedLaneLeavesAStartResident},
-      {"testALaneThatConvertsInItsFirstPassRunsItWhole", testALaneThatConvertsInItsFirstPassRunsItWhole},
-      {"testACommandAnyLaneConvertsInRunsWhole", testACommandAnyLaneConvertsInRunsWhole},
-      {"testStreamingLaneSizesItsCommandsByItsReads", testStreamingLaneSizesItsCommandsByItsReads},
+      {"testALaneThatConvertsInItsFirstPassReplans", testALaneThatConvertsInItsFirstPassReplans},
+      {"testACommandAnyLaneConvertsInReplans", testACommandAnyLaneConvertsInReplans},
+      {"testALaneJoinsWithTheRowsThatSpareItACommand", testALaneJoinsWithTheRowsThatSpareItACommand},
+      {"testTheEstimatesReportWhatPricesTheUnits", testTheEstimatesReportWhatPricesTheUnits},
   };
   return kTests;
 }

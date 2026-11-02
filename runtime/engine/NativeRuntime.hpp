@@ -77,8 +77,8 @@ public:
     core_.setCompletionNotifier(std::move(notifier));
   }
 
-  void observePrefill(uint32_t rows, double wallMilliseconds, double hostMilliseconds) {
-    core_.observePrefill(rows, wallMilliseconds, hostMilliseconds);
+  void seedCost(std::span<const model::CommandSample> warmups, model::SsdReads load) {
+    core_.seedCost(warmups, load);
   }
 
   void announceReady();

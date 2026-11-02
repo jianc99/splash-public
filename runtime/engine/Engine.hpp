@@ -57,12 +57,10 @@ struct EngineConfig final {
   // its solo rate through a long prefill, which meanwhile takes 1.5x as long;
   // zero alternates one command of each kind.
   double decodeShare = 0.5;
-  // The query-key pairs a prefill command's attention may compute
-  // (Scheduler::attentionPairs): the bootstrap sets those of a full chunk at
-  // the end of the model's native window, so that a command past it, which
-  // only YaRN serves, takes fewer rows and no longer than the deepest native
-  // one, well within the command watchdog.
-  uint64_t maximumPrefillAttentionPairs = std::numeric_limits<uint64_t>::max();
+  // G: the longest a prefill unit (a command, or one pass of it) may take
+  // while requests of equal or higher priority decode, unless its turnaround
+  // or its fixed part needs more (Scheduler). Finite and positive.
+  double decodeGapMilliseconds = 500.0;
   // The prefill checkpoint interval and the resource wait limit.
   uint32_t prefillCheckpointTokens = kPrefillCheckpointTokens;
   double resourceWaitTimeoutMilliseconds = kResourceWaitTimeoutMilliseconds;
@@ -255,8 +253,10 @@ public:
   // the engine knows: vocabulary, context window, and vision with the
   // server's per-image patch cap.
   void submit(EngineRequest request);
-  void observePrefill(uint32_t rows, double wallMilliseconds, double hostMilliseconds) {
-    scheduler_.observePrefill(rows, wallMilliseconds, hostMilliseconds);
+  // The startup's prefill warm-ups and weight loading seed the prefill price
+  // (Scheduler::seedCost).
+  void seedCost(std::span<const model::CommandSample> warmups, model::SsdReads load) {
+    scheduler_.seedCost(warmups, load);
   }
   void cancel(uint64_t requestId);
   void failRequest(uint64_t requestId, LaneOutcome outcome, std::string message);
@@ -479,6 +479,19 @@ private:
     // back behind, without trying it. It counts as held while that request
     // still waits refused (ResourceWaitSnapshot::heldBehindRefusal).
     std::optional<uint64_t> heldBehind;
+    // The rows a prefill lane's command may take this tick: where prepare
+    // cut it at a state boundary its capture was refused at, or a waiting
+    // request starts from (LaneShape).
+    std::optional<uint32_t> rowCap;
+    // The states a prepare that sent its plan back reserved for the lane's
+    // command over [start, end), with their captures, which the plan made
+    // again takes if it runs the lane over the same rows; this tick only.
+    struct KeptCaptures final {
+      uint32_t start = 0, end = 0;
+      std::vector<StateCapture> states;
+      std::vector<Capture> captures;
+    };
+    std::optional<KeptCaptures> keptCaptures;
     // The prompt from submit on, then the committed output; request.prompt
     // is empty.
     std::vector<uint32_t> exactTokens;
@@ -563,14 +576,13 @@ private:
     // Where the engine's time for this command starts: the previous
     // command's retirement when the engine stayed busy, else its plan.
     double startedMilliseconds = 0.0;
-    // A prefill command of one lane that reads its history from the SSD
-    // cache (KvHistoryStream), whose wait on the reads the ticket reports.
-    bool streamed = false;
   };
-  // A prefill command between its passes (BatchPlan::passes): its progress
-  // as planning reads it, which nothing fills (the scheduler keeps its own,
-  // Scheduler::Passes), its items, with the states they capture,
-  // and their captures, which every pass runs and the last one commits.
+  // A prefill command between its passes (BatchPlan::passes), the one owner
+  // of it: its progress as planning reads it (PlanInputs::passes), its plan
+  // at its next pass, which each pass's completion advances, with the lanes
+  // its first pass left out, the starts held back for its end and its
+  // passes' wall time; its items, with the states they capture, and their
+  // captures, which every pass runs and the last one commits.
   struct PassCommand final {
     PassProgress progress;
     std::vector<ModelBatchItem> items;
@@ -586,8 +598,9 @@ private:
     // meanwhile.
     Waiting,
     // Preparing it changed what the plan was made from (PlanInputs): a lane
-    // was refused or held back, a capture cut its rows, or it converted to
-    // Spill; the scheduler plans again. prepare() does not return it.
+    // was refused or held back, a capture cut its rows, its history took
+    // Index pages or it converted to Spill, or the command between its passes
+    // was taken; the scheduler plans again.
     Replan,
   };
   double nextHealthCheckMilliseconds_ = 0.0;
@@ -649,11 +662,19 @@ private:
   // admission behind it as a start refused memory does
   // (Request::refusedResources).
   void waitForDiskQuota(Request &request, double nowMilliseconds);
-  // Whether the lane's next prefill command reads its history from the SSD
-  // cache: its history holds Index pages (Cache::holdsIndexPages), or, in
-  // Spill mode, reaches past its dense history and tail window, where its
-  // pages spill as their copies land.
-  [[nodiscard]] bool streamsHistory(const Request &request) const;
+  // Whether the lane's history may gain Index pages between a command's
+  // passes: in Spill mode, a prompt `processed` rows in reaches past its
+  // dense history and tail window, where its pages spill as their copies
+  // land (spillLanded runs before every pass).
+  [[nodiscard]] bool gainsIndexPages(std::optional<KvMode> mode, uint64_t processed) const;
+  // The shapes planning reads (PlanInputs::shapes): every resident prefill
+  // lane's, with its Index pages, whether it gains them and its row cap this
+  // tick, and each candidate's, from the placement its latest attempt found.
+  [[nodiscard]] std::vector<LaneShape> laneShapes(std::span<const PrefillAdmission> candidates = {}) const;
+  // The command between its passes as planning reads it, or none.
+  [[nodiscard]] const PassProgress *passProgress() const noexcept {
+    return passCommand_ ? &passCommand_->progress : nullptr;
+  }
   // Whether a resident Spill request's prompt goes on: its next commands
   // take Full pages that spill as their copies land.
   [[nodiscard]] bool spillingPrompt() const;
@@ -741,8 +762,13 @@ private:
   void publishReachedStateBoundaries(
       Request &request, uint32_t promptProcessed, std::span<const Capture> captures,
       std::span<const std::shared_ptr<const CompositeState>> states, double nowMilliseconds);
-  [[nodiscard]] Prepared prepare(BatchPlan &plan, std::vector<ModelBatchItem> &items,
-                                 std::vector<std::vector<Capture>> &captures,
+  // Takes what the plan's lanes need to run it as planned, and returns
+  // Runnable with its items and captures; or, when that changed what the
+  // plan was made from, Replan, the lanes refused or held back added to
+  // `excluded`, a capture cut's rows the lane's rowCap; or, with no lane
+  // admitted, Waiting or Yielded (refuse). It never changes the plan.
+  [[nodiscard]] Prepared prepare(const BatchPlan &plan, std::vector<ModelBatchItem> &items,
+                                 std::vector<std::vector<Capture>> &captures, std::vector<uint64_t> &excluded,
                                  double nowMilliseconds);
   // Reserves the buffers of the states a prefill lane's command reaches,
   // boundary by boundary, and the KV up to the next one; returns the rows
@@ -1028,12 +1054,13 @@ private:
   // lane of that command ended, which that frees (yieldsEndedLanes). A lane
   // of that command otherwise yields only to a start whose prompt would
   // supersede it (Scheduler::yieldsTo): its suspension gives the command up
-  // too, and any other start waits for the command's end. The lane waits as
+  // too, and any other start, `start`, waits for the command's end, which
+  // then runs at its priority (PassProgress::heldStarts). The lane waits as
   // for a free one, and resumes once admission reaches it again, a Resident
   // one with its current KV capacity. True when one was suspended or freed.
   // Memory on its way back makes no lane yield, as in prepare(): a request
   // refused while it is pending waits for it instead.
-  [[nodiscard]] bool preemptBelow(RequestPriority priority, double nowMilliseconds);
+  [[nodiscard]] bool preemptBelow(RequestPriority priority, uint64_t start, double nowMilliseconds);
   [[nodiscard]] bool resourceRetryReady(const Request &request,
                                         double nowMilliseconds) const noexcept;
   // The wait keeps the denial's allocation failure for its timeout message.
@@ -1083,14 +1110,14 @@ private:
   // for the caller to try again at its next attempt; a lane that ended is
   // never suspended. Every point a lane yields asks it first.
   [[nodiscard]] bool yieldsEndedLanes(const Request &lane);
-  // Abandons the command between its passes (Scheduler::abandonPasses),
-  // while none of its passes is in flight, though a command of other lanes
-  // may be: the states it would capture go back to the model's pool, its
-  // lanes that ended meanwhile end now, and the others run its rows again
-  // in a later command, nothing of them committed. A command
-  // yields so, whole, to a command that supersedes it
-  // (Scheduler::abandonsPasses): before one planned again with its lanes
-  // takes shape, and as one of a higher priority runs, or sooner, where an
+  // Abandons the command between its passes, while none of its passes is in
+  // flight, though a command of other lanes may be: its lanes count its
+  // passes' time as waited (Scheduler::abandoned), the states it would
+  // capture go back to the model's pool, its lanes that ended meanwhile end
+  // now, and the others run its rows again in a later command, nothing of
+  // them committed. A command yields so, whole, to a plan that supersedes it
+  // (Scheduler::abandonsPasses): before one that holds a lane of it takes
+  // shape, and as any other runs, or sooner, where an
   // allocation for that work, or for a start whose prompt would supersede
   // it, finds nothing in the cache nothing in use holds (escalate). So it
   // does to the suspension of any of its lanes, in place of that suspension

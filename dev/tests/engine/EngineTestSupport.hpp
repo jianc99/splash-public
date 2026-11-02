@@ -187,15 +187,19 @@ struct Spilling {
   struct Extent final {
     uint32_t pages;
   };
+  // `shape` sets what one of the model's prefill commands may hold
+  // (Executor::groupRows, passes), which the engine takes as it is built.
   explicit Spilling(uint32_t slots, bool always = true, uint64_t residentKvBytes = 100'000,
-                    uint32_t residentTokens = 0, Extent extent = {4}, uint64_t laneReadBytes = 0)
+                    uint32_t residentTokens = 0, Extent extent = {4}, uint64_t laneReadBytes = 0,
+                    const std::function<void(Executor &)> &shape = {})
       : storage(256, 100, extent.pages, 10),
         budget(std::make_shared<model::DiskBudget>(uint64_t{slots} * 100, [this] { return now; })),
         cache(pool, &tier, budget, engine::CacheSpillPolicy{1, 1}),
-        engine(config(always, residentKvBytes,
-                      residentTokens ? residentTokens
-                                     : static_cast<uint32_t>(residentKvBytes / 100 * engine::KvCache::pageTokens),
-                      &paused, &serving, laneReadBytes),
+        engine((shape ? shape(model) : void(),
+                config(always, residentKvBytes,
+                       residentTokens ? residentTokens
+                                      : static_cast<uint32_t>(residentKvBytes / 100 * engine::KvCache::pageTokens),
+                       &paused, &serving, laneReadBytes)),
                cache, model, events) {
     tier.budget = budget;
     tier.transferLimit = 1024;

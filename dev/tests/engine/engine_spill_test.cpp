@@ -1,3 +1,4 @@
+#include "CostSeeds.hpp"
 #include "EngineTestSupport.hpp"
 #include "TestChecks.hpp"
 #include "TestEngine.hpp"
@@ -394,22 +395,22 @@ void testWriteBudgetRefusalSaysWhenToRetry() {
   require(spill.committedSlots() == 0, "the first request kept its commitment");
 }
 
-// On a target whose prefill groups save only a spilling lane's reads, its
-// experts loaded whole, a Spill request's long prompt runs as groups and a
-// Resident one's as chunks, as without the SSD cache: a request that arrives
-// beside a Resident one waits for a chunk, not a group.
-void testOnlySpillingLanesRunPrefillGroups() {
+// On a target whose experts are loaded whole, a prefill group saves only a
+// spilling lane's reads of its history: a Spill request's long prompt runs
+// as groups once its history holds Index pages that cost a group's wait,
+// and a Resident one's as chunks, as without the SSD cache, so a request
+// that arrives beside a Resident one waits for a chunk, not a group.
+void testPrefillGroupsFollowTheFixedPart() {
   for (const bool spills : {false, true}) {
-    Spilling spill(256, spills);
-    spill.model.groupRows = 4 * model::ExecutionLimits::prefillTokenBudget;
-    spill.model.groupsOnlySpilling = true;
-    // Groups run once prefill has a measured cost, as after the start's.
-    spill.engine.observePrefill(model::ExecutionLimits::prefillTokenBudget, 1000.0, 0.0);
-    // 128 pages and a token: three chunks, or one group.
+    Spilling spill(256, spills, 100'000, 0, {4}, 0,
+                   test::commandShape(4 * model::ExecutionLimits::prefillTokenBudget));
+    test::seedAsStartup(spill.engine, spill.model, test::heavyHistoryTarget());
+    // 128 pages and a token: three chunks, or fewer commands with groups.
     spill.engine.submit(Spilling::prompt(1, 1, 128, 1));
     spill.runUntilIdle();
-    require(spill.events.completedCount == 1 && spill.model.prefillChunks.at(1) == (spills ? 1u : 3u),
-            spills ? "a Spill request's prompt did not run as a prefill group"
+    require(spill.events.completedCount == 1 &&
+                (spills ? spill.model.prefillChunks.at(1) < 3u : spill.model.prefillChunks.at(1) == 3u),
+            spills ? "a Spill request's prompt did not run as prefill groups"
                    : "a Resident request's prompt ran as a prefill group");
   }
 }
@@ -602,12 +603,11 @@ void testSpillResumeBoundLeavesOutputPastItsAnchor() {
 // resume is given. A quota of exactly its prompt's pages bounds its output
 // to that token, which it emits.
 void testSpillResumeInItsPromptHoldsNoAnchor() {
-  Spilling spill(20);
+  Spilling spill(20, true, 100'000, 0, {4}, 0, test::commandShape(KvCache::pageTokens));
   // No copies: the request holds its whole history without any.
   spill.allowSpillWrites(false);
   // 95 tokens of prompt end a token short of the third page, and each
   // prefill command takes a page of them.
-  spill.model.groupRows = KvCache::pageTokens;
   EngineRequest background = request(1, std::vector<uint32_t>(3 * KvCache::pageTokens - 1, 1));
   background.maxNewTokens = 100;
   background.priority = RequestPriority::Background;
@@ -741,12 +741,7 @@ void testARefusedDecodeTakesThePrefillLanesMemory() {
     };
     // Prefill takes 4 ms a row: beside a decoding lane, a command runs 64
     // rows, two pages.
-    spill.model.commandTimes = [](const BatchPlan &plan, std::span<const ModelBatchItem>) {
-      uint32_t rows = 0;
-      for (const BatchItem &item : plan.items)
-        rows += item.tokenCount;
-      return test::CommandTimes{plan.kind == WorkKind::Decode ? 10.0 : 4.0 * rows};
-    };
+    test::seedAsStartup(spill.engine, spill.model, test::fourMillisecondRows());
     // With writes in flight, the tier lands every transfer but the writes of
     // the pages the prompt's lane holds, which stay in flight. No restore
     // runs: its writes and transfers pair up in order.
@@ -899,7 +894,7 @@ void testAWaitingFloorKeepsTheMemoryOnItsWayBack() {
     // Extents of 16 pages. Every state goes straight to the SSD. The quota
     // holds the Spill lane's commitment but not the prompt's, which cannot
     // convert to Spill then.
-    Spilling spill(128, true, 100'000, 0, Spilling::Extent{16});
+    Spilling spill(128, true, 100'000, 0, Spilling::Extent{16}, 0, test::commandShape(model::ExecutionLimits::prefillTokenBudget, passes));
     spill.model.deniedReservations = std::numeric_limits<uint32_t>::max();
     spill.model.stateTier = std::make_shared<OffloadControl>();
     spill.model.stateTier->ready = true;
@@ -910,8 +905,7 @@ void testAWaitingFloorKeepsTheMemoryOnItsWayBack() {
         promptPasses.emplace_back(plan.pass, plan.passes);
       return test::CommandTimes{};
     };
-    spill.model.passes = passes;
-    spill.engine.observePrefill(model::ExecutionLimits::prefillTokenBudget, 4900.0, 3400.0);
+    test::seedAsStartup(spill.engine, spill.model);
     // While the SSD cache takes no writes, an earlier turn leaves its chain
     // cached without copies, and the prompt starts Resident.
     spill.tier.writableFile = false;
@@ -1192,7 +1186,7 @@ void testAHeldLaneEndsItsCommandAtItsCapacity() {
 // memory to the waiting lane.
 void testAJoinerHeldBackLeavesACommandItsPasses() {
   for (const bool cancelled : {false, true}) {
-    Spilling spill(1024, true, 100'000, 0, Spilling::Extent{16});
+    Spilling spill(1024, true, 100'000, 0, Spilling::Extent{16}, 0, test::commandShape(4 * model::ExecutionLimits::prefillTokenBudget, 4));
     spill.model.deniedReservations = std::numeric_limits<uint32_t>::max();
     spill.model.stateTier = std::make_shared<OffloadControl>();
     spill.model.stateTier->ready = true;
@@ -1206,7 +1200,6 @@ void testAJoinerHeldBackLeavesACommandItsPasses() {
                  ? test::CommandTimes{.wallMilliseconds = 100.0}
                  : test::CommandTimes{4900.0 / plan.passes, 3400.0 / plan.passes};
     };
-    spill.engine.observePrefill(model::ExecutionLimits::prefillTokenBudget, 4900.0, 3400.0);
     const auto prompt = [](uint64_t id, uint32_t token, uint32_t tokens) {
       EngineRequest result = request(id, std::vector<uint32_t>(tokens, token));
       result.maxNewTokens = 400;
@@ -1225,8 +1218,9 @@ void testAJoinerHeldBackLeavesACommandItsPasses() {
       static_cast<void>(spill.engine.tick(spill.now += 50));
     require(spill.events.outputs.contains(2) && !spill.cache.holdsIndexPages(2),
             "the Spill lane did not decode before its pages spilled");
-    // A short prompt starts Resident and runs its command's first pass.
-    spill.model.passes = 4;
+    // A short prompt starts Resident and runs its command's first pass, its
+    // price seeded now.
+    test::seedAsStartup(spill.engine, spill.model);
     spill.tier.writableFile = false;
     spill.engine.submit(prompt(3, 3, 60));
     const auto passesOf = [&](uint64_t id, uint32_t pass) {
@@ -1292,12 +1286,7 @@ void testAWaitThatNeverLandsHoldsLanesUpToItsLimit() {
   spill.model.restoreControl->ready = true;
   // Prefill takes 4 ms a row: beside a decoding lane, a command runs 64
   // rows, two pages.
-  spill.model.commandTimes = [](const BatchPlan &plan, std::span<const ModelBatchItem>) {
-    uint32_t rows = 0;
-    for (const BatchItem &item : plan.items)
-      rows += item.tokenCount;
-    return test::CommandTimes{plan.kind == WorkKind::Decode ? 10.0 : 4.0 * rows};
-  };
+  test::seedAsStartup(spill.engine, spill.model, test::fourMillisecondRows());
   // No request reaches its deadline here.
   const auto prompt = [](uint64_t id, uint32_t token, uint32_t pages, uint32_t output) {
     EngineRequest result = Spilling::prompt(id, token, pages, output);
@@ -1938,7 +1927,7 @@ std::span<const test::TestCase> spillTests() {
       {"testAStartThatCannotSpillStartsResidentWithinTheResidentContext",
        testAStartThatCannotSpillStartsResidentWithinTheResidentContext},
       {"testWriteBudgetRefusalSaysWhenToRetry", testWriteBudgetRefusalSaysWhenToRetry},
-      {"testOnlySpillingLanesRunPrefillGroups", testOnlySpillingLanesRunPrefillGroups},
+      {"testPrefillGroupsFollowTheFixedPart", testPrefillGroupsFollowTheFixedPart},
       {"testSpilledFullExtentsLeaveOnceNoPromptGrows", testSpilledFullExtentsLeaveOnceNoPromptGrows},
       {"testSpillMovesThroughTheHostPause", testSpillMovesThroughTheHostPause},
       {"testSpillResumeCommitsAgain", testSpillResumeCommitsAgain},

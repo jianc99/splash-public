@@ -1030,7 +1030,7 @@ public:
   // Runs once each command is submitted, a held one's completion stored.
   std::function<void()> submitObserver;
   // The times each command that completes at once reports, from its plan
-  // and items; none without it.
+  // and items, before a profile's (time()); none without either.
   std::function<CommandTimes(const BatchPlan &, std::span<const ModelBatchItem>)> commandTimes;
   // Score requests whose final prompt step reports a non-finite logit.
   std::unordered_set<uint64_t> invalidScores;
@@ -1166,12 +1166,13 @@ private:
     }
   }
   // A command that completes at once, or with a clock once it reaches its
-  // end, taking its work's time on the profile (or commandTimes').
+  // end, taking the times a test gives it (commandTimes), or its work's time
+  // on the profile.
   std::unique_ptr<ModelBatchTicket> timedTicket(std::vector<ModelStepResult> results, const BatchPlan &plan,
                                                 std::span<const ModelBatchItem> items,
                                                 const std::function<void()> &completion) {
     const CommandTimes times =
-        timing ? timedTimes(plan, items) : commandTimes ? commandTimes(plan, items) : CommandTimes{};
+        commandTimes ? commandTimes(plan, items) : timing ? timedTimes(plan, items) : CommandTimes{};
     if (commandTimed)
       commandTimed(plan, times);
     if (!clock)

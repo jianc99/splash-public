@@ -1,5 +1,6 @@
 #pragma once
 
+#include "engine/CostModel.hpp"
 #include "engine/Types.hpp"
 #include "model/CommandCost.hpp"
 #include "model/LatencyHistogram.hpp"
@@ -28,19 +29,21 @@ enum class Phase : uint8_t {
   Failed,
 };
 
+// What the scheduler plans with: decode's share of contended prefill time,
+// the time G a prefill unit may take while lanes of its priority or a higher
+// one decode, and what one prefill command of the model may hold.
+struct SchedulerConfig final {
+  double decodeShare = 0.5;
+  double decodeGapMilliseconds = 500.0;
+  model::CommandLimits limits;
+};
+
 struct RequestSpec final {
   uint64_t id = 0;
   RequestPriority priority = RequestPriority::Normal;
   // Tokens to prefill: the prompt, and after resumeFromResources the
   // replayed history.
   uint32_t prefillTokens = 0;
-  // The most rows of one of its prefill commands (Model::prefillGroupRows): a
-  // prefill group's, or a chunk's; the engine may set it again once it knows
-  // where the request's KV lives (setPrefillGroupRows).
-  uint32_t prefillGroupRows = model::ExecutionLimits::prefillTokenBudget;
-  // The most passes over the model's layers one of its prefill commands may
-  // run in (Model::prefillPasses, BatchPlan::passes).
-  uint32_t prefillPasses = 1;
 };
 
 struct PrefillAdmission final {
@@ -83,11 +86,14 @@ struct PlanInputs final {
 // One rate a command estimate learned: the quantity of a command's work it
 // multiplies ("units", "chunk_layers", "row_layers", "attention_pairs",
 // "index_pairs", "weight_read_bytes", "spilled_kv_read_bytes" for prefill;
-// "token" for decode) and what it charges per unit of it, learned and seeded.
+// "token" for decode), what it charges per unit of it, learned and seeded,
+// and for a quantity the model estimates before a unit runs, the realized
+// over the expected the price scales it by (1 for the others).
 struct CostTermSnapshot final {
   std::string quantity;
   double millisecondsPerUnit = 0.0;
   double seedMillisecondsPerUnit = 0.0;
+  double realizedPerExpected = 1.0;
 };
 
 // One kind of command's estimate (prefill or decode): the commands or passes
@@ -115,13 +121,7 @@ struct SchedulerSnapshot final {
   uint64_t decodeBatches = 0;
   std::array<uint64_t, model::ExecutionLimits::maximumBatchWidth>
       decodeBatchesByWidth{};
-  // Prefill commands of a lane that streams its history from the SSD cache
-  // that ran while lanes of its priority or a higher one decoded, and the
-  // gaps decoding lanes saw between their commands across such a command:
-  // the command time from one of a lane's decode commands to its next.
-  uint64_t contendedStreamingPrefillBatches = 0;
-  model::LatencyStats decodeGap;
-  // The decode gap target contended prefill work is sized by.
+  // The decode gap target contended prefill work is sized by (G).
   double decodeGapTargetMilliseconds = 0.0;
   // The wall time of each prefill unit, a command or one pass of it, that ran
   // while a lane of its priority or a higher one decoded: what the target
@@ -142,49 +142,36 @@ struct SchedulerSnapshot final {
   CostEstimateSnapshot decodeEstimate;
 };
 
-// One single-owner scheduling policy. Prefill batches the shortest remaining
-// sequences first into an actual-row budget, with a bound k on how often
-// later arrivals may overtake a lane, led by the oldest whose remaining
-// prompt exceeds the shortest by at most floor((m-1)/k) of the shortest's m
-// commands; a lane that streams its history from the SSD cache runs
-// alone. A command that runs in passes over the model's layers runs its later
-// passes before any other prefill, but for a command that supersedes it
-// (abandonsPasses), as often as later arrivals may overtake a lane. Decode
-// takes the ready lanes of one priority and stage, constrained or not, without
-// waiting for more, so it runs only the four real M8/M16/M24/M32 shapes,
-// between a command's passes too.
+// One single-owner scheduling policy, one price for every prefill unit (a
+// command or one pass of it): CostModel's, of the work the model expects of
+// it (model::PrefillWorkSource).
+//
+// Prefill takes the ready lanes of the most urgent priority. Within it a lane
+// that has waited behind later arrivals of its priority kAgingSlowdown times
+// its own expected remaining cost is overdue and leads, to its prompt's end;
+// otherwise the lane of the least expected remaining cost leads, ties in
+// submission order. A leader takes a chunk, or a group of the model's command
+// rows where the fixed part a group saves is worth a wait of G. While a lane
+// of its priority or a higher one decodes (contended), or when it leads a
+// group, each unit is bounded: the fewest passes whose every pass's price is
+// within max(G, turnaround / kPassOverheadShare), or failing that within
+// twice its fixed part; a contended unit no passes bound halves its rows. A
+// layer's attention pairs bound rows, never passes. A lane joins with the
+// rows that spare it a command of its own when what it adds to the others
+// is less than what it saves (summed completion). The command between its
+// passes runs its later passes before any other prefill but a plan whose
+// summed completion of the lanes concerned is shorter (supersedes). Decode
+// takes the ready lanes of one priority and stage, constrained or not,
+// without waiting for more, so it runs only the four real M8/M16/M24/M32
+// shapes, between a command's passes too.
 class Scheduler final {
 public:
-  // Decode time owed for each unit of time a prefill runs while requests of
-  // equal or higher priority decode; zero alternates one command of each kind.
-  // A prefill command's attention computes at most maximumAttentionPairs
-  // query-key pairs (attentionPairs): its lanes' rows halve until they fit.
-  explicit Scheduler(double decodeShare,
-                     uint64_t maximumAttentionPairs = std::numeric_limits<uint64_t>::max()) noexcept
-      : decodeShare_(decodeShare), maximumAttentionPairs_(maximumAttentionPairs) {}
+  Scheduler(SchedulerConfig config, const model::PrefillWorkSource &work);
 
-  // The query-key pairs the attention of `rows` prompt rows from `position`
-  // computes: each row attends to its history and itself, so the pairs, and
-  // a command's time, grow with the depth of its rows.
-  [[nodiscard]] static constexpr uint64_t attentionPairs(uint64_t position, uint32_t rows) noexcept {
-    return rows * position + uint64_t{rows} * (rows + 1) / 2;
-  }
-
+  // The prefill warm-ups' samples and the SSD reads of loading the weights
+  // seed the prefill price (CostModel::seed); the warm-ups never train it.
+  void seedCost(std::span<const model::CommandSample> warmups, model::SsdReads load);
   void submit(RequestSpec request);
-  // A prefill command of `rows` rows took wallMilliseconds, of which its GPU
-  // work waited hostMilliseconds on host steps. The first command seeds the
-  // command estimate, a fixed part and a part per row: its waits on host
-  // steps (a streamed target's expert reads) fixed, the rest per row. The
-  // commands after it fit the estimate as the least-squares line of their
-  // times by their rows, each weighing three quarters of the next and
-  // counting at most twice and at least half the time the estimate gave it,
-  // the fixed part shrunk toward their waits on host steps as much as one
-  // command a chunk's rows from the others would pull it: commands of one
-  // size keep their waits fixed and the rest per row, as the depth of a
-  // prompt's rows lengthens them, and commands of different sizes split what
-  // the waits alone miss on a streamed target, the GPU's work a command does
-  // whatever its rows. Neither part is negative.
-  void observePrefill(uint32_t rows, double wallMilliseconds, double hostMilliseconds = 0.0);
   void deferAdmission(uint64_t requestId);
   void waitForResources(uint64_t requestId);
   void waitForPrefix(uint64_t requestId);
@@ -193,11 +180,6 @@ public:
   void resumeFromResources(uint64_t requestId, uint32_t alreadyProcessed,
                            uint32_t replayTokens);
   void maskReady(uint64_t requestId);
-  // Whether the resident lane's prefill commands read its history from the
-  // SSD cache (KvHistoryStream), which a command does for one lane alone and
-  // whatever its rows; the engine says so before it plans.
-  void setStreamsHistory(uint64_t requestId, bool streams);
-  void setPrefillGroupRows(uint64_t requestId, uint32_t rows);
   void cancel(uint64_t requestId);
   // Ends a request outside a command's completion, as at its length.
   void finish(uint64_t requestId);
@@ -205,66 +187,53 @@ public:
   void remove(uint64_t requestId);
 
   [[nodiscard]] std::vector<uint64_t> admissionOrder() const;
-  // Preview the dispatch row budget before allocating new lanes.
+  // The candidates the next command would serve: admission starts only
+  // those, planning again without the ones a plan leaves out until it keeps
+  // all it plans, with the candidates' shapes in `in`.
   [[nodiscard]] std::vector<uint64_t>
-  prefillAdmissionOrder(std::span<const PrefillAdmission> candidates) const;
+  prefillAdmissionOrder(std::span<const PrefillAdmission> candidates, const PlanInputs &in) const;
   // The highest priority among requests that prefill or decode. A waiting
   // request of a lower priority cannot be in prefillAdmissionOrder's result
   // while it lasts: the plan takes one tier, the highest among resident
   // prefill lanes and candidates, and is dropped when a higher tier decodes.
   [[nodiscard]] std::optional<RequestPriority> highestRunnablePriority() const noexcept;
-  // The next command, planned without the excluded lanes: those that wait
-  // for memory on its way back and cannot run before it lands. While a
-  // command is between its passes, that is its next pass, decode, as its
-  // priority, or that of the most urgent request it holds back, and the
-  // decode share order them, or a command that supersedes it
-  // (abandonsPasses).
-  [[nodiscard]] std::optional<BatchPlan> next(std::span<const uint64_t> excluded) const;
-  // Whether `plan` supersedes the command between its passes, which is
-  // abandoned before it commits (abandonPasses): any prefill plan but its
-  // next pass. next() makes one for a prompt of a higher priority, and for a
-  // command of its lanes and lanes of its priority ready since, while the
-  // passes the command's lanes lose by it are fewer than those the lanes
-  // that supersede it save (supersedes).
-  [[nodiscard]] bool abandonsPasses(const BatchPlan &plan) const;
-  // Whether the command between its passes yields to the prompts of
-  // `joined` lanes of a higher priority, as next() supersedes it with their
-  // command: while it has run fewer passes, lane for lane, than those lanes
-  // would wait for its end, and until a lane of it has seen
-  // kMaximumOvertakes of its commands abandoned. False without one. The
-  // engine asks it for a start of that priority (Engine::admit).
-  [[nodiscard]] bool yieldsTo(RequestPriority priority, uint32_t joined) const;
+  // The next command, planned without the excluded lanes. While a command is
+  // between its passes (in.passes), that is its next pass, decode, as its
+  // priority, or that of the most urgent lane it holds back or start it left
+  // waiting, and the decode share order them, or a plan that supersedes it.
+  [[nodiscard]] std::optional<BatchPlan> next(const PlanInputs &in) const;
+  // Whether `plan` is a prefill plan other than the next pass of the command
+  // between its passes, which is abandoned before it commits.
+  [[nodiscard]] bool abandonsPasses(const BatchPlan &plan, const PlanInputs &in) const;
+  // Whether a start of `lanes` lanes of `priority` supersedes the command
+  // between its passes: a higher priority, while the summed completion of
+  // the lanes concerned is shorter abandoned (supersedes). The engine asks
+  // it for a start of that priority (Engine::admit, Engine::preemptBelow).
+  [[nodiscard]] bool yieldsTo(RequestPriority priority, uint32_t lanes, const PlanInputs &in) const;
   // The excluded lanes are those the plan was made without: blocked, not
-  // passed over, so they lose nothing to it. A command in passes commits
-  // them in turn, its first recording it.
-  void commit(const BatchPlan &plan, std::span<const uint64_t> excluded);
-  // Abandons the command between its passes, none of which is in flight:
-  // nothing of its rows was committed, and its lanes, which count it
-  // (Request::abandoned), run them again in a later command. A lane leaves
-  // the command no other way before its last pass: while the command holds
-  // it, it neither ends nor is suspended (Engine::abandonPasses).
-  void abandonPasses();
-  // A prefill command of one lane that streamed its history from the SSD
-  // cache waited streamMilliseconds of its hostMilliseconds on the reads
-  // (ModelBatchTicket); none for a command that streamed nothing. A pass
-  // before a command's last consumes no rows and ends no lane (StepResult),
-  // and the command's estimate learns from its passes' time together. Of
-  // wallMilliseconds, imageEncodeMilliseconds encoded the command's images
-  // ahead of it, which decode's share counts and the estimate leaves out. A
-  // decode command's time and the tokens its lanes committed train the
-  // decode time per token (decodeTokenMilliseconds).
+  // passed over, so they lose nothing to it. A later pass must be the
+  // command's next. For a first pass of several, the ready lanes of its
+  // priority it leaves out (PassProgress::leftOut).
+  std::vector<uint64_t> commit(const BatchPlan &plan, const PlanInputs &in);
+  // A prefill unit trains the price with its sample's realized work against
+  // the work planning expected of it, weighing 1 / its passes; a pass before
+  // the command's last consumes no rows and ends no lane. Of its wall time,
+  // the image encodes ahead of it stay out of the price. A decode command's
+  // time and the tokens its lanes committed train the decode time per token.
   void complete(const BatchPlan &plan, std::span<const StepResult> results,
-                double wallMilliseconds, bool representativePrefillTiming,
-                double hostMilliseconds = 0.0,
-                std::optional<double> streamMilliseconds = std::nullopt,
-                double imageEncodeMilliseconds = 0.0);
-  // The price, in milliseconds, of a prefill command or pass doing `work`:
-  // the command estimate's for its rows (observePrefill).
+                const model::CommandSample &sample);
+  // The command between its passes was abandoned: each of its lanes counts
+  // the time its passes took as time it waited.
+  void abandoned(const PassProgress &command);
+  // The price, in milliseconds, of a prefill command or pass doing `work`.
   [[nodiscard]] double prefillMilliseconds(const model::CommandWork &work) const noexcept;
   // The wall time of a decode command per token it committed per lane, in
   // milliseconds: the mean over the decode commands completed, each weighing
   // kDecodeTokenDecay of the next; 0 before the first.
   [[nodiscard]] double decodeTokenMilliseconds() const noexcept;
+  // The tokens a lane commits per decode command, the same decayed mean; 0
+  // before the first.
+  [[nodiscard]] double decodeTokensPerLaneCommand() const noexcept;
 
   [[nodiscard]] Phase phase(uint64_t requestId) const;
   // The stage of its decode commands, which a suspension keeps.
@@ -289,41 +258,35 @@ private:
     DecodeStage decodeStage = DecodeStage::Regular;
     uint64_t order = 0;
     uint64_t lastDecodeDispatch = 0;
-    // Consecutive prefill commands that served a later arrival while this
-    // lane received no rows. Reset whenever the lane is served.
-    uint32_t overtaken = 0;
-    // The commands in passes it was a lane of that were abandoned since its
-    // rows last committed: from kMaximumOvertakes on, the command between
-    // its passes it is a lane of runs to its end (supersedes).
-    uint32_t abandoned = 0;
-    // Its prefill commands stream its history (setStreamsHistory), and the
-    // running estimate of how long one waits on the reads; none before the
-    // first that read any. The command estimate leaves that wait out: it is
-    // this lane's own cost, which grows with its history.
-    bool streamsHistory = false;
-    std::optional<double> streamMilliseconds;
-    // While it decodes, where its gap since its last decode command began
-    // (startDecodeGap): the command time and streaming prefill commands
-    // completed then.
-    double decodeGapStart = 0.0;
-    uint64_t decodeGapStreams = 0;
+    // Until its prompt completes: the wall time of the units of its priority
+    // that served later arrivals while it waited without rows, and of its
+    // commands abandoned between their passes; and whether that reached
+    // kAgingSlowdown times its expected remaining cost at a commit, after
+    // which it stays overdue.
+    double waitedMilliseconds = 0.0;
+    bool overdue = false;
   };
 
-  // The command between its passes, from its first pass's commit to its
-  // last's completion: its plan, at its next pass, the lanes ready then that
-  // it was planned without, not excluded, and the time its passes took so
-  // far, a sample of its rows unless one was not.
-  struct Passes final {
-    BatchPlan plan;
-    std::vector<uint64_t> leftOut;
-    double wallMilliseconds = 0.0;
-    double hostMilliseconds = 0.0;
-    bool representative = true;
-  };
-
-  struct PrefillRequestView final {
+  // A prefill lane as planning weighs it.
+  struct Lane final {
     const Request *request = nullptr;
-    uint32_t promptProcessed = 0;
+    uint32_t processed = 0;
+    LaneShape shape;
+    double remainingMilliseconds = 0.0;
+    bool overdue = false;
+    [[nodiscard]] uint32_t remaining() const noexcept { return request->spec.prefillTokens - processed; }
+  };
+  // A plan and what planning it counted: rows halved for a contended unit
+  // no passes bound, and joinable lanes left out for the Index-page lanes.
+  struct Planned final {
+    BatchPlan plan;
+    uint32_t boundCuts = 0;
+    uint32_t indexPageConflicts = 0;
+  };
+  // The passes a unit runs in and whether they bound every pass.
+  struct UnitFit final {
+    uint32_t passes = 1;
+    bool within = true;
   };
 
   [[nodiscard]] Request &get(uint64_t requestId);
@@ -331,110 +294,83 @@ private:
   [[nodiscard]] static bool terminal(Phase phase) noexcept;
   [[nodiscard]] static bool byPriorityThenOrder(const Request *a,
                                                 const Request *b) noexcept;
-  [[nodiscard]] std::optional<BatchPlan>
-  nextPrefill(std::span<const uint64_t> excluded) const;
-  // The bound every command that supersedes the command between its passes
-  // keeps (supersedes, yieldsTo): no lane of it has seen kMaximumOvertakes
-  // of its commands abandoned, and the passes its lanes lose, those they ran
-  // and, `added`, those the joining rows add, are fewer than those the
-  // `joined` lanes that supersede it save, what is left of its passes for
-  // each.
-  [[nodiscard]] bool givesWay(uint32_t joined, double added) const;
-  // Whether `plan` replaces the command between its passes: a command of a
-  // higher priority, or one of its priority that holds every lane of it with
-  // the same rows and more, none of which its first pass was planned without
-  // while ready, while the passes its lanes lose by it, together, are fewer
-  // than those the lanes that supersede it save, and until a lane of it has
-  // seen kMaximumOvertakes of its commands abandoned (Request::abandoned),
-  // after which it runs to its end. The lanes that supersede it save what is left
-  // of its passes. Superseded by a higher priority, its lanes lose the
-  // passes they ran, which they run again after it. Planned again, its lanes
-  // and those that join wait the planned command, where going on, its lanes
-  // wait what is left of its passes and those that join that and a command
-  // of their own, about as long as the planned one: a command in passes
-  // costs about its fixed part (a streamed target's expert reads,
-  // Model::prefillPasses), which theirs would pay again, and a lane joins
-  // one with the rows that spare it a command of its own (planPrefill). So
-  // its lanes lose the passes they ran and those the joining rows add, and
-  // the waits sum to less planned again while that holds. Lanes that become
-  // ready early in its passes, as requests that arrive during its first do,
-  // so join it, and a higher priority's prompt supersedes it about while it
-  // has fewer passes behind it than ahead; later, they wait for its end, as
-  // do lanes it was planned without while ready (prepare refused them memory
-  // the others fit in), which a command planned again would leave out too.
-  // A lane it was planned without because it waited for memory on its way
-  // back (an excluded lane) joins once its retry is ready, as an arrival
-  // does.
-  [[nodiscard]] bool supersedes(const BatchPlan &plan) const;
-  [[nodiscard]] std::optional<BatchPlan>
-  nextDecode(std::span<const uint64_t> excluded) const;
-  [[nodiscard]] std::optional<BatchPlan>
-  planPrefill(std::vector<PrefillRequestView> ready) const;
-  [[nodiscard]] uint32_t
-  prefillBudget(const PrefillRequestView &leader,
-                std::span<const PrefillRequestView> ready) const;
-  // The rows of a contended command of a lane that streams its history,
-  // which reads all of it whatever its rows: the fewest, halving from its
-  // prefill group's, whose time covers its estimated wait on the reads, so
-  // that fewer would not end the command sooner, and no fewer than
-  // `contendedRows`, those of another contended command, which it takes
-  // before its first streamed command.
-  [[nodiscard]] uint32_t streamingRows(const Request &leader, uint32_t contendedRows) const;
-  // A prefill command's estimated time with `rows` rows (observePrefill).
-  [[nodiscard]] double prefillMilliseconds(uint32_t rows) const noexcept;
-  // The passes a command of `rows` rows the lane leads runs in: as many as
-  // keep each within the contended slice by the command estimate, up to its
-  // model's; one for a lane that streams its history, or before the first
-  // estimate.
-  [[nodiscard]] uint32_t passesFor(const Request &leader, uint32_t rows) const;
-  // A lane's gap between decode commands starts when it begins to decode
-  // and after each of its decode commands.
-  void startDecodeGap(Request &request) noexcept;
+  [[nodiscard]] static bool samePlan(const BatchPlan &a, const BatchPlan &b) noexcept;
+
+  [[nodiscard]] LaneShape shapeOf(uint64_t requestId, const PlanInputs &in) const;
+  [[nodiscard]] Lane lane(const Request &request, uint32_t processed, const PlanInputs &in) const;
+  [[nodiscard]] std::vector<model::PrefillLane> prefillLanes(std::span<const BatchItem> items,
+                                                             const PlanInputs &in) const;
+  // The price of `lanes` as one command in one pass, and summed over the
+  // passes [first, passes) of a command of `passes`.
+  [[nodiscard]] double commandMilliseconds(std::span<const model::PrefillLane> lanes) const;
+  [[nodiscard]] double passesMilliseconds(std::span<const model::PrefillLane> lanes, uint32_t first,
+                                          uint32_t passes) const;
+  // Whether a lane's chunk saves enough fixed part in a group of the
+  // model's command rows to be worth a wait of G.
+  [[nodiscard]] bool groups(const Lane &lane) const;
+  // The rows of an uncontended command of the lane: a chunk, or a group's.
+  [[nodiscard]] uint32_t ownRows(const Lane &lane) const;
+  [[nodiscard]] double remainingMilliseconds(const Lane &lane) const;
+  [[nodiscard]] bool contended(RequestPriority priority) const;
+  // The most a bounded unit may take: G, or turnaround / kPassOverheadShare.
+  [[nodiscard]] double bound() const;
+  [[nodiscard]] UnitFit passesFor(std::span<const model::PrefillLane> lanes, bool bounded) const;
+  [[nodiscard]] bool withinPairs(std::span<const model::PrefillLane> lanes) const;
+  [[nodiscard]] std::vector<Lane> readyLanes(const PlanInputs &in) const;
+  [[nodiscard]] std::optional<Planned> planPrefill(std::vector<Lane> ready) const;
+  [[nodiscard]] std::optional<BatchPlan> nextPrefill(const PlanInputs &in) const;
+  [[nodiscard]] std::optional<BatchPlan> nextDecode(std::span<const uint64_t> excluded) const;
+  // Whether abandoning the command between its passes for `plan` shortens
+  // the summed completion of the lanes concerned (gain), with no lane of the
+  // command overdue and none of the plan left out of its first pass.
+  [[nodiscard]] bool supersedes(const BatchPlan &plan, const PlanInputs &in) const;
+  // What abandoning the command between its passes for a plan of `lanes`
+  // (and `starts` more lanes not yet resident) of `priority` saves the
+  // lanes of the command, of the plan, and the ready lanes of their
+  // priorities that wait behind both, summed: keeping it, its lanes end
+  // with its passes and the plan's new lanes run after them; abandoning it,
+  // the plan runs first and the command's lanes it leaves out run their rows
+  // again after it. A lane of a lower priority than the plan's does not
+  // count the wait for the plan, which strict priority gives it either way.
+  // `planMilliseconds` and `joinersMilliseconds` price the plan and its new
+  // lanes' own command.
+  [[nodiscard]] double supersedeGain(std::span<const BatchItem> lanes, uint32_t starts, RequestPriority priority,
+                                     double planMilliseconds, double joinersMilliseconds,
+                                     const PlanInputs &in) const;
   // Debt is owed only to requests that decode or wait for a mask: once the
   // last one leaves, a later decoder starts without it.
   void dropStaleDecodeDebt() noexcept;
+  // A prompt that completed leaves its aging behind.
+  static void promptCompleted(Request &request) noexcept;
 
+  SchedulerConfig config_;
+  const model::PrefillWorkSource &work_;
+  CostModel cost_;
   std::unordered_map<uint64_t, Request> requests_;
   std::optional<BatchPlan> active_;
-  std::optional<Passes> passes_;
+  // The work planning expected of the prefill unit in flight.
+  model::CommandWork activeExpected_;
   // The lanes the active command was planned without.
   std::vector<uint64_t> excluded_;
   uint64_t order_ = 0;
   uint64_t decodeDispatchOrder_ = 0;
-  // A prefill command's estimated cost: fixed, plus per row, and the
-  // decayed sums of the later commands' rows, times and waits on host steps
-  // it fits (observePrefill).
-  double prefillFixedMilliseconds_ = 0.0;
-  double prefillMillisecondsPerToken_ = 0.0;
-  struct PrefillFit final {
-    bool seeded = false;
-    double weight = 0.0;
-    double rows = 0.0;
-    double rowsSquared = 0.0;
-    double time = 0.0;
-    double rowsTime = 0.0;
-    double host = 0.0;
-  };
-  PrefillFit prefillFit_;
-  // The decode commands' wall time per token committed per lane, and their
-  // count, each decayed by kDecodeTokenDecay per command after it
-  // (decodeTokenMilliseconds).
+  // The decode commands' wall time per token committed per lane and tokens
+  // committed per lane, and their count, each decayed by kDecodeTokenDecay
+  // per command after it; the relative errors of the latest 256.
   double decodeTokenTime_ = 0.0;
+  double decodeLaneTokens_ = 0.0;
   double decodeTokenWeight_ = 0.0;
+  std::array<double, CostModel::kErrorSamples> decodeErrors_{};
+  size_t decodeErrorCount_ = 0;
+  uint64_t decodeSamples_ = 0;
   double decodeShare_;
-  uint64_t maximumAttentionPairs_;
   // Decode time that prefill still owes the lanes that decoded beside it
   // (not those waiting for a mask): equal-priority decode runs until its
   // commands' wall time has worked it off.
   double decodeDebtMilliseconds_ = 0.0;
   std::optional<WorkKind> lastCommittedKind_;
   SchedulerSnapshot counters_;
-  // The time of the commands completed so far, and the streaming prefill
-  // commands among them, which lanes' decode gaps are measured on; the gaps
-  // across a streaming command.
-  double commandMilliseconds_ = 0.0;
-  uint64_t streamingCommands_ = 0;
-  model::LatencyHistogram decodeGaps_;
+  model::LatencyHistogram contendedPrefill_;
 };
 
 } // namespace splash::engine

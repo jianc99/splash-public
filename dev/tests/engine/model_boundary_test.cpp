@@ -5,7 +5,6 @@
 // (ModelBatchTicket::sample).
 
 #include "TestChecks.hpp"
-#include "engine/Scheduler.hpp"
 #include "model/Model.hpp"
 #include "model/WorkFormulas.hpp"
 
@@ -178,12 +177,12 @@ uint64_t pairsByRow(const model::AttentionReach &reach, uint64_t position, uint3
 constexpr std::array<uint64_t, 9> kPositions{0, 1, 127, 128, 2047, 2048, 2111, 2112, 64000};
 constexpr std::array<uint32_t, 6> kRows{1, 63, 64, 129, 500, kChunk};
 
-void testDenseAttentionPairsAreTheSchedulers() {
+void testDenseAttentionPairsAreEveryRowsKeys() {
   for (const uint64_t position : kPositions)
     for (const uint32_t rows : kRows)
-      require(model::denseAttentionPairs(position, rows) == engine::Scheduler::attentionPairs(position, rows) &&
+      require(model::denseAttentionPairs(position, rows) == rows * position + uint64_t{rows} * (rows + 1) / 2 &&
                   model::denseAttentionPairs(position, rows) == pairsByRow({}, position, rows),
-              "dense attention pairs are not the scheduler's");
+              "dense attention pairs are not every row's keys");
 }
 
 void testAWindowedLayerSaturatesAtItsWindow() {
@@ -201,7 +200,7 @@ void testAWindowedLayerSaturatesAtItsWindow() {
 
 void testABlockSparseLayerSaturatesAtTheSelectionAndTail() {
   const model::AttentionReach sparse{.denseHistoryTokens = 2048, .selectedTokens = 512, .blockTokens = 64};
-  require(model::attentionPairs(sparse, 0, kChunk) == engine::Scheduler::attentionPairs(0, kChunk),
+  require(model::attentionPairs(sparse, 0, kChunk) == model::denseAttentionPairs(0, kChunk),
           "rows within the dense history did not attend every key");
   // A block of rows past it attends the selection and, row by row, 1 to 63
   // keys after the last complete block, and then none, at any depth.
@@ -310,7 +309,7 @@ int main() {
     testALaneEndingAtAChunkDoesNotRunPastIt();
     testStreamingLanesPastTheModelsBreakTheIndexRule();
     testTheFirstRuleBrokenIsNamed();
-    testDenseAttentionPairsAreTheSchedulers();
+    testDenseAttentionPairsAreEveryRowsKeys();
     testAWindowedLayerSaturatesAtItsWindow();
     testABlockSparseLayerSaturatesAtTheSelectionAndTail();
     testPassesDoNotLowerALayersAttentionPairs();

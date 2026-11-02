@@ -11,6 +11,7 @@
 
 #import <Foundation/Foundation.h>
 
+#include <cmath>
 #include <cstdlib>
 #include <functional>
 #include <iostream>
@@ -157,7 +158,7 @@ public:
   model::WarmupStepResult warmupPrefill(uint32_t rows) override {
     if (!rows || rows > model::ExecutionLimits::prefillTokenBudget)
       throw std::invalid_argument("invalid prefill warmup rows");
-    lastPrefillRows = rows;
+    prefillRows.push_back(rows);
     return warmup(0);
   }
   model::WarmupStepResult warmupDecodeBatch(uint32_t width) override {
@@ -176,8 +177,11 @@ public:
     return {};
   }
 
+  model::SsdReads loadReads() const noexcept override { return load; }
+
   std::vector<int> calls;
-  uint32_t lastPrefillRows = 0;
+  std::vector<uint32_t> prefillRows;
+  model::SsdReads load;
   std::function<void(int, model::WarmupStepResult &)> warmupHook;
 
 private:
@@ -249,10 +253,11 @@ void testAllNativeWarmupsPrecedeReady() {
   require(report.stage == RuntimeBootstrapStage::Ready && report.memoryAudit.valid &&
               events.size() == 1 && std::holds_alternative<protocol::ReadyEvent>(events.front()),
           "successful native bootstrap was incomplete");
-  require(harness.executor().calls == std::vector<int>({0, 1, 2, 3, 4, 5}),
-          "bootstrap did not warm fixed prefill and B1/B2/B3/B4 in order");
-  require(harness.executor().lastPrefillRows == model::ExecutionLimits::prefillTokenBudget,
-          "bootstrap memory warmup did not explicitly use maximum prefill rows");
+  require(harness.executor().calls == std::vector<int>({0, 0, 1, 2, 3, 4, 5}),
+          "bootstrap did not warm two prefills and B1/B2/B3/B4 in order");
+  require(harness.executor().prefillRows ==
+              std::vector<uint32_t>({model::ExecutionLimits::prefillTokenBudget, 256}),
+          "bootstrap did not warm a prefill of maximum rows, then one of 256");
   require(report.warmup.decodeBatches[2] == WarmupStepStatus::Complete,
           "bootstrap report omitted the real B3 graph");
 }
@@ -261,6 +266,38 @@ RuntimeBootstrapReport warmup(Harness &harness, const EngineMemoryPlan &plan) {
   return RuntimeBootstrap::requireWarmupAndAnnounce(
       plan, harness.executor(), harness.pool(), [&] { return validActual(plan); },
       harness.loop());
+}
+
+// Startup seeds the prefill price before Ready: an SSD byte at the rate the
+// weights loaded, and a row-layer and a chunk-layer from the line through
+// the two prefill warm-ups less their reads at that rate. Here a chunk-layer
+// costs 1 ms, a row-layer 0.01 ms and a byte 1e-7 ms (10 GB in a second).
+void testStartupSeedsThePrefillPrice() {
+  const EngineMemoryPlan plan = memoryPlan();
+  Harness harness;
+  Executor &model = harness.executor();
+  model.load = {10'000'000'000, 1000.0};
+  model.warmupHook = [&](int step, model::WarmupStepResult &result) {
+    if (step != 0)
+      return;
+    const uint32_t rows = model.prefillRows.back();
+    result.sample.work = {.lanes = 1, .rows = rows, .chunks = 1, .layers = 40,
+                          .weightReadBytes = rows == 256 ? 3'000'000'000ULL : 4'000'000'000ULL};
+    result.sample.wallMilliseconds = 40.0 + rows * 40 * 0.01 + double(result.sample.work.weightReadBytes) * 1e-7;
+  };
+  require(warmup(harness, plan).stage == RuntimeBootstrapStage::Ready, "bootstrap did not become ready");
+  const auto &terms = harness.loop().statusSnapshot().scheduler.prefillEstimate.terms;
+  const auto seed = [&](std::string_view quantity) {
+    for (const CostTermSnapshot &term : terms)
+      if (term.quantity == quantity)
+        return term.seedMillisecondsPerUnit;
+    throw std::runtime_error("the prefill estimate has no term " + std::string(quantity));
+  };
+  const auto near = [](double value, double truth) { return std::fabs(value - truth) <= 1e-9 * truth; };
+  require(near(seed("weight_read_bytes"), 1e-7) && near(seed("spilled_kv_read_bytes"), 1e-7) &&
+              near(seed("row_layers"), 0.01) && near(seed("chunk_layers"), 1.0) && seed("units") == 0.0 &&
+              harness.loop().statusSnapshot().scheduler.prefillEstimate.samples == 0,
+          "startup did not seed the prefill price from the load and both prefill warm-ups");
 }
 
 void requireReadyWithoutReducingConcurrency(
@@ -287,7 +324,7 @@ void testWarmupHoldsTheRunway() {
       require(harness.pool().pageActive(page), "a warmup ran on a runway page no request held");
   };
   const auto report = warmup(harness, plan);
-  require(report.stage == RuntimeBootstrapStage::Ready && warmups == 6 &&
+  require(report.stage == RuntimeBootstrapStage::Ready && warmups == 7 &&
               harness.pool().snapshot().pagesActive == 0,
           "warmup held the runway past Ready");
 }
@@ -306,7 +343,7 @@ void testBudgetLimitedWarmupKeepsRuntimeConcurrency() {
     Harness harness;
     const auto report = warmup(harness, plan);
     requireReadyWithoutReducingConcurrency(harness, report);
-    std::vector<int> expected{0};
+    std::vector<int> expected{0, 0};
     for (uint32_t lane = 1; lane <= width; ++lane)
       expected.push_back(static_cast<int>(lane));
     expected.push_back(5);
@@ -333,7 +370,7 @@ void testOptionalAllocationFailuresAreMemoryLimited() {
       const auto report = warmup(harness, plan);
       requireReadyWithoutReducingConcurrency(harness, report);
       const uint32_t completedWidth = deniedWidth < 0 ? 4 : deniedWidth - 1;
-      std::vector<int> expected{0};
+      std::vector<int> expected{0, 0};
       for (uint32_t width = 1; width <= completedWidth; ++width)
         expected.push_back(static_cast<int>(width));
       if (deniedWidth >= 0)
@@ -600,6 +637,7 @@ int main() {
   try {
     testRuntimeCacheIdentityReportsTheLoadedModel();
     testAllNativeWarmupsPrecedeReady();
+    testStartupSeedsThePrefillPrice();
     testWarmupHoldsTheRunway();
     testBudgetLimitedWarmupKeepsRuntimeConcurrency();
     testOptionalAllocationFailuresAreMemoryLimited();
