@@ -1047,6 +1047,127 @@ void storeRegrowsByDisplacement(MemoryPressure pressure) {
 void testStoreRegrowsByDisplacementUnderPersistentWarning() { storeRegrowsByDisplacement(MemoryPressure::Warning); }
 void testStoreRegrowsByDisplacementInTheBand() { storeRegrowsByDisplacement(MemoryPressure::Normal); }
 
+// A pool's growth waits on nothing but its own victims (R3, amend/M.md B4):
+// neither on a landing a waiting lane is owed (V's M-P3: the landing pays
+// its owner first) nor on another lane's owed copies. A lane waits for its
+// demotions to land with no room free beside a store worth growing: the
+// pass reserves nothing, and the lane is granted the landing. With half a
+// unit free and another lane owing copies, a start fits beside the store.
+void testGrowthPendsOnlyOnItsOwnVictims() {
+  {
+    Fixture fixture(host(32 * kGiB), 8 * kGiB);
+    FakeElasticPool experts("experts", fixture.memory, kGiB, 2, 4, 5, 3, 0.25, 60.0);
+    fixture.memory.hold("weights", 4 * kGiB);
+    fixture.memory.hold("cache", kGiB);
+    MemoryLedger &ledger = fixture.ledger();
+    Returning returning{.landingBytes = kGiB};
+    ledger.setReturning([&] { return returning; }, [](uint64_t) { return Returning{}; });
+    ledger.addPool(experts);
+    serve(ledger, experts, 400.0, 0.0, 10.0);
+    const ClaimId lane = ledger.open(request(1, RequestPriority::Normal));
+    require(!fixture.allocate(lane, kGiB) &&
+                fixture.governor->free(lane, fixture.governor->need(lane)).outcome == FreeOutcome::Pending,
+            "the lane did not wait for its demotions to land");
+    static_cast<void>(fixture.pass(10.5));
+    require(fixture.governor->snapshot().reservedBytes == 0 && experts.units() == 3,
+            "the store's growth was reserved on the landing the lane waits for");
+    fixture.memory.release("cache", kGiB);
+    returning = {};
+    require(fixture.allocate(lane, kGiB), "the lane was refused the landing it waited for");
+  }
+  {
+    Fixture fixture(host(32 * kGiB), 8 * kGiB);
+    FakeElasticPool experts("experts", fixture.memory, kGiB, 2, 4, 5, 3, 0.25, 60.0);
+    fixture.memory.hold("weights", 4608 * kMiB);
+    MemoryLedger &ledger = fixture.ledger();
+    ledger.setReturning([] { return Returning{.owedBytes = 4 * kGiB}; }, [](uint64_t) { return Returning{}; });
+    ledger.addPool(experts);
+    serve(ledger, experts, 400.0, 0.0, 10.0);
+    static_cast<void>(fixture.pass(10.5));
+    const ClaimId start = ledger.open(request(2, RequestPriority::Normal, ClaimClass::Start));
+    require(fixture.governor->snapshot().reservedBytes == 0 && fixture.allocate(start, 256 * kMiB),
+            "the store's growth was reserved on another lane's owed copies and refused a start the room fits");
+  }
+}
+
+// Displacement sizes what it takes against the room as it stands (L9: all
+// or none). Two pools in one pass: the hot block cache, worth more, grows
+// 4 x 128 MiB into 896 MiB of free room; the store's 1 GiB unit then lacks
+// 640 MiB, which its 216 MiB of cache cannot meet, so nothing goes (sized
+// against the pass's 896 MiB it lacked 128 MiB, and the cache went for a
+// growth the room refused). In the band without the host's consent, with
+// 256 MiB free and the lanes projecting 512 MiB, the store frees the whole
+// unit now and the 256 MiB the room lacks besides, and grows (freeing the
+// unit alone, its growth was refused).
+void testDisplacementTakesNothingItCannotGrowInto() {
+  {
+    Fixture fixture(host(32 * kGiB), 8 * kGiB);
+    FakeElasticPool hot("hot_kv", fixture.memory, 128 * kMiB, 1, 5, 16, 1, 9.0, 0.0);
+    FakeElasticPool experts("experts", fixture.memory, kGiB, 2, 4, 5, 3, 0.25, 60.0);
+    TestSource cache("cache", &fixture.memory);
+    fixture.memory.hold("cache", 216 * kMiB);
+    fixture.memory.hold("weights", 3880 * kMiB);
+    cache.units = {unit(1, 108 * kMiB, 0.05), unit(2, 108 * kMiB, 0.05)};
+    MemoryLedger &ledger = fixture.ledger();
+    ledger.addSource(cache);
+    ledger.addPool(hot);
+    ledger.addPool(experts);
+    for (double t = 0.0; t < 10.0; t += 0.5) {
+      hot.served(0, 200, 0, 0);
+      experts.served(0, 200, 0, 0);
+      ledger.observePools(t + 0.5, true);
+    }
+    static_cast<void>(fixture.pass(10.5));
+    require(hot.units() == 5 && experts.units() == 3 && cache.taken.empty(),
+            "the store's displacement took cache for a unit the room the hot block cache left refused");
+  }
+  {
+    // 1536 MiB of headroom beside the engine's 7936 MiB: the host admits
+    // the unit only on its credit.
+    Fixture fixture(host(1536 * kMiB + 7936 * kMiB), 8 * kGiB);
+    FakeElasticPool experts("experts", fixture.memory, kGiB, 2, 4, 5, 3, 0.25, 60.0);
+    TestSource cache("cache", &fixture.memory);
+    fixture.memory.hold("cache", 1280 * kMiB);
+    fixture.memory.hold("weights", 3584 * kMiB);
+    cache.units = {unit(1, kGiB, 0.05), unit(2, 256 * kMiB, 0.05)};
+    MemoryLedger &ledger = fixture.ledger();
+    ledger.addSource(cache);
+    ledger.addPool(experts);
+    ledger.setLanes(512 * kMiB, std::nullopt);
+    serve(ledger, experts, 400.0, 0.0, 10.0);
+    static_cast<void>(fixture.pass(10.5));
+    require(experts.units() == 4 && cache.taken == std::vector<uint64_t>{1, 2},
+            "without the host's consent the displacement did not free the unit and what the room lacked");
+  }
+}
+
+// A claim lacks what admission asks of it: its need and the room claims
+// ranked above it hold, beyond the room. With 512 MiB free and 1 GiB held
+// above it, a 1 GiB claim lacks 1.5 GiB: 1 GiB of cache does not meet it,
+// so it takes nothing (sized at its 1 GiB it took the cache for an
+// allocation admission refused), available() counts 512 MiB, and with
+// another 1 GiB of cache it takes both.
+void testAClaimLacksTheRoomHeldAboveIt() {
+  MemoryLedger ledger;
+  TestSource cache("cache");
+  cache.units = {unit(1, kGiB, 0.1)};
+  ledger.addSource(cache);
+  const ClaimId high = ledger.open(request(1, RequestPriority::Foreground));
+  ledger.refused(high, {.bytes = kGiB});
+  ledger.setWaiting(high, true);
+  const ClaimSpec spec = request(2, RequestPriority::Background);
+  const ClaimId low = ledger.open(spec);
+  require(ledger.available(spec, kGiB, 512 * kMiB, false, false) == 512 * kMiB,
+          "available() counted the room the claim above holds");
+  require(ledger.free(low, {.bytes = kGiB}, 512 * kMiB, false, false).outcome == FreeOutcome::Short &&
+              cache.taken.empty(),
+          "the claim took cache for an allocation the room held above it refuses");
+  cache.units.push_back(unit(2, kGiB, 0.1));
+  require(ledger.free(low, {.bytes = kGiB}, 512 * kMiB, false, false).outcome == FreeOutcome::Met &&
+              cache.taken.size() == 2,
+          "the claim did not take what it and the room held above it lack");
+}
+
 // Free room goes back to a pool claims keep taking units from only while a
 // unit is worth its expected retake: with no ghost value and a claim every
 // 20 s, at most one regrowth per three recurrences.
@@ -1439,6 +1560,9 @@ std::span<const test::TestCase> ledgerTests() {
       {"testWarningAloneTakesNoPoolUnit", testWarningAloneTakesNoPoolUnit},
       {"testStoreRegrowsByDisplacementUnderPersistentWarning", testStoreRegrowsByDisplacementUnderPersistentWarning},
       {"testStoreRegrowsByDisplacementInTheBand", testStoreRegrowsByDisplacementInTheBand},
+      {"testGrowthPendsOnlyOnItsOwnVictims", testGrowthPendsOnlyOnItsOwnVictims},
+      {"testDisplacementTakesNothingItCannotGrowInto", testDisplacementTakesNothingItCannotGrowInto},
+      {"testAClaimLacksTheRoomHeldAboveIt", testAClaimLacksTheRoomHeldAboveIt},
       {"testFreeRoomGrowthWaitsWhileClaimsRecur", testFreeRoomGrowthWaitsWhileClaimsRecur},
       {"testShortStartRegrowsWhenTheHostFrees", testShortStartRegrowsWhenTheHostFrees},
       {"testALoneConvertedLaneWaitsForItsOwnCopies", testALoneConvertedLaneWaitsForItsOwnCopies},

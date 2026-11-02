@@ -456,7 +456,7 @@ FreeResult MemoryLedger::take(const DryRun &run, const VictimQuery &query, Claim
 }
 
 FreeResult MemoryLedger::free(ClaimId claim, const Need &need, uint64_t freeBytes, bool critical, bool deficit) {
-  return freeFor(claim.value, need, freeBytes, critical, deficit, std::nullopt);
+  return freeFor(claim.value, need, freeBytes, critical, deficit, std::nullopt, false);
 }
 
 // The one rule (DESIGN section 4.4; amend/M.md B2-B5): the units that cost
@@ -464,11 +464,15 @@ FreeResult MemoryLedger::free(ClaimId claim, const Need &need, uint64_t freeByte
 // when what is landing, with its own lanes' owed copies, meets its need (or
 // would, but for claims ranked above it); else the cheapest units that meet
 // it are taken, all or none; else it waits when every copy in flight or owed
-// would meet it. A need the host refused counts only units that leave
-// memory in place, and the host's claim lacks its whole need: the room
-// under the engine's limit returns nothing to the host.
+// would meet it. A pool's growth waits on no landing but its own victims':
+// what it waits for is held as pending growth (R3). A claim lacks what
+// admission asks beyond the room: its need and the room held against it. A
+// need the host refused counts only units that leave memory in place; the
+// host's claim lacks its whole need, and growth the host admits only on its
+// credit (`credited`) at least what free() leaves now: the room under the
+// engine's limit returns nothing to the host.
 FreeResult MemoryLedger::freeFor(uint32_t id, const Need &need, uint64_t freeBytes, bool critical, bool deficit,
-                                 std::optional<AccountId> growing) {
+                                 std::optional<AccountId> growing, bool credited) {
   ClaimState &claim = claims_.at(id);
   const ClaimSpec &spec = claim.spec;
   claim.need = need;
@@ -490,10 +494,13 @@ FreeResult MemoryLedger::freeFor(uint32_t id, const Need &need, uint64_t freeByt
   // may take by value; waiting claims ranked above it hold room it waits
   // for.
   const uint64_t growth = host ? 0 : heldForGrowth(growing, spec.cls);
-  const uint64_t forClaim = less(room, plus(growth, host ? 0 : heldByClaims(spec.rank, id)));
-  const uint64_t lackingBytes = need.hostRefused ? 0 : less(need.bytes, forClaim);
+  const uint64_t held = host ? 0 : plus(growth, heldByClaims(spec.rank, id));
+  const uint64_t forClaim = less(room, held);
+  const uint64_t lackingBytes =
+      need.hostRefused ? 0
+                       : std::max(less(plus(need.bytes, held), room), credited ? less(need.bytes, result.nowBytes) : 0);
   const uint32_t lackingPages = need.pages;
-  const bool canWait = spec.timing == NeedTiming::CanWait && !need.hostRefused;
+  const bool canWait = spec.timing == NeedTiming::CanWait && !need.hostRefused && spec.cls != ClaimClass::Growth;
 
   const auto waits = [&](bool owedToo) {
     if (!canWait || (!lackingBytes && !lackingPages))
@@ -552,15 +559,16 @@ FreeResult MemoryLedger::freeFor(uint32_t id, const Need &need, uint64_t freeByt
 
 uint64_t MemoryLedger::available(const ClaimSpec &spec, uint64_t enough, uint64_t freeBytes, bool critical,
                                  bool deficit) const {
-  const uint64_t room =
-      spec.cls == ClaimClass::Host
-          ? 0
-          : less(freeBytes, plus(heldForGrowth(std::nullopt, spec.cls), heldByClaims(spec.rank, std::nullopt)));
-  if (room >= enough)
+  const uint64_t held = spec.cls == ClaimClass::Host
+                            ? 0
+                            : plus(heldForGrowth(std::nullopt, spec.cls), heldByClaims(spec.rank, std::nullopt));
+  const uint64_t room = spec.cls == ClaimClass::Host ? 0 : freeBytes;
+  if (less(room, held) >= enough)
     return enough;
   const VictimQuery query{.claim = &spec, .need = {.bytes = enough}, .critical = critical, .rates = &rates_,
                           .deficit = deficit};
-  return std::min(enough, plus(room, dryRun(spec, query, enough - room, std::nullopt).bytes));
+  const uint64_t taken = dryRun(spec, query, less(plus(enough, held), room), std::nullopt).bytes;
+  return std::min(enough, less(plus(room, taken), held));
 }
 
 // R3 with amend/M.md B4. Pending growth grows once its bytes are free for
@@ -571,15 +579,17 @@ uint64_t MemoryLedger::available(const ClaimSpec &spec, uint64_t enough, uint64_
 // unit per pass then displaces other memory, outside critical pressure,
 // when the victims cost less than the unit is worth beyond its cycle: with
 // the host's consent the victims need only meet what the room lacks, and
-// what lands later is the pool's pending growth; without it they free a
-// whole unit now, which the growth then takes from the host's footprint
-// again (its credit).
+// what its own victims free later is the pool's pending growth; without it
+// they free a whole unit now, which the growth then takes from the host's
+// footprint again (its credit), and what the room lacks besides. The room
+// is the pass's less what the pass has grown.
 bool MemoryLedger::grow(uint64_t freeBytes, const GrowthHost &host) {
   bool acted = false;
   uint64_t waitingBytes = 0;
   for (const auto &[id, state] : claims_)
     if (state.waiting)
       waitingBytes = plus(waitingBytes, state.need.bytes);
+  uint64_t grownBytes = 0;
   const auto growUnit = [&](size_t index, uint64_t credit, std::string_view how) {
     Account &account = accounts_[index];
     const uint64_t bytes = account.pool->state().growUnitBytes;
@@ -588,6 +598,7 @@ bool MemoryLedger::grow(uint64_t freeBytes, const GrowthHost &host) {
         host.grow(claim, AccountId{static_cast<uint8_t>(index)}, *account.pool, credit);
     close(claim);
     if (grown) {
+      grownBytes = plus(grownBytes, bytes);
       ++account.grows;
       if (log_) {
         std::ostringstream line;
@@ -620,7 +631,8 @@ bool MemoryLedger::grow(uint64_t freeBytes, const GrowthHost &host) {
       continue;
     if (account.pendingGrowth) {
       const uint64_t others = less(pendingGrowthBytes(), account.pendingGrowth);
-      if (less(freeBytes, plus(plus(others, waitingBytes), laneDemandBytes_)) >= account.pendingGrowth) {
+      if (less(less(freeBytes, grownBytes), plus(plus(others, waitingBytes), laneDemandBytes_)) >=
+          account.pendingGrowth) {
         account.pendingGrowth = 0;
         acted = growUnit(index, 0, "into its pending growth") || acted;
       }
@@ -632,12 +644,13 @@ bool MemoryLedger::grow(uint64_t freeBytes, const GrowthHost &host) {
   }
   std::ranges::stable_sort(candidates, std::ranges::greater{}, &Candidate::benefit);
 
-  uint64_t room = less(freeBytes, plus(plus(pendingGrowthBytes(), waitingBytes), laneDemandBytes_));
+  const auto room = [&] {
+    return less(less(freeBytes, grownBytes), plus(plus(pendingGrowthBytes(), waitingBytes), laneDemandBytes_));
+  };
   for (Candidate &next : candidates) {
     Account &account = accounts_[next.account];
-    while (next.unit && room >= next.unit && host.admits(next.unit) &&
+    while (next.unit && room() >= next.unit && host.admits(next.unit) &&
            value::growsIntoFreeRoom(account.rate, next.benefit, next.cycle) && growUnit(next.account, 0, "into free room")) {
-      room -= next.unit;
       acted = true;
       next = candidate(next.account);
     }
@@ -650,14 +663,14 @@ bool MemoryLedger::grow(uint64_t freeBytes, const GrowthHost &host) {
     if (!next.unit || account.pendingGrowth || benefit <= 0.0)
       continue;
     const bool consents = host.admits(next.unit);
-    if (consents && room >= next.unit)
+    if (consents && room() >= next.unit)
       continue;
     const ClaimId claim = open({.cls = ClaimClass::Growth,
                                 .timing = consents ? NeedTiming::CanWait : NeedTiming::Immediate,
                                 .holdSeconds = kValueHorizonSeconds,
                                 .benefitSeconds = benefit});
-    const FreeResult freed = freeFor(claim.value, {.bytes = next.unit}, consents ? freeBytes : 0, false,
-                                     false, AccountId{static_cast<uint8_t>(next.account)});
+    const FreeResult freed = freeFor(claim.value, {.bytes = next.unit}, less(freeBytes, grownBytes), false, false,
+                                     AccountId{static_cast<uint8_t>(next.account)}, !consents);
     close(claim);
     if (freed.outcome == FreeOutcome::Met)
       acted = growUnit(next.account, consents ? 0 : freed.nowBytes, "by displacement") || acted;

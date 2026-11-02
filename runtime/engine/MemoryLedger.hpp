@@ -321,8 +321,10 @@ private:
   [[nodiscard]] DryRun dryRun(const ClaimSpec &spec, const VictimQuery &query, uint64_t lackingBytes,
                               std::optional<AccountId> growing) const;
   [[nodiscard]] FreeResult take(const DryRun &run, const VictimQuery &query, ClaimState *claim);
+  // `credited`: the host admits the claim only on what free() leaves now (a
+  // pool's growth without its consent).
   [[nodiscard]] FreeResult freeFor(uint32_t claim, const Need &need, uint64_t freeBytes, bool critical,
-                                   bool deficit, std::optional<AccountId> growing);
+                                   bool deficit, std::optional<AccountId> growing, bool credited);
   void log(const ClaimSpec &spec, const Need &need, const DryRun *run, const FreeResult &result) const;
 
   std::vector<Account> accounts_;
