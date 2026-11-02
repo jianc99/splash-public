@@ -877,14 +877,19 @@ std::vector<Victim> Engine::EngineVictims::conversions(const VictimQuery &query)
                                      : left.second->request.id < right.second->request.id;
   });
   // What the copies can land into now, each conversion's pages taking their
-  // share in turn.
+  // share in turn: the blocks of its chain past its dense history and tail
+  // window, which spill as their copies land (Cache::convertToSpill).
   uint64_t room = engine.cache_.indexLandingPages();
-  const uint64_t full = uint64_t{geometry.densePages} + geometry.windowPages + 2ULL * geometry.groupPages;
+  const uint64_t full = uint64_t{geometry.densePages} + geometry.windowPages;
   const uint64_t quota = geometry.slotBytes ? engine.cache_.spillRoom() / geometry.slotBytes : 0;
   for (const auto &[held, active] : lanes) {
     const uint64_t id = active->request.id;
     const uint64_t pages = (held + KvCache::pageTokens - 1) / KvCache::pageTokens;
-    const uint64_t landing = std::min(pages > full ? pages - full : 0, room);
+    const Phase phase = engine.scheduler_.phase(id);
+    const uint64_t blocks = (phase == Phase::Prefill ? engine.scheduler_.promptProcessed(id)
+                                                     : active->publishedTokens) /
+                            KvCache::pageTokens;
+    const uint64_t landing = std::min(blocks > full ? blocks - full : 0, room);
     if (!landing || quota < engine.spillPages(*active, engine.chainEnd(*active)))
       continue;
     const uint64_t freed = landing * (geometry.fullPageBytes - std::min(geometry.fullPageBytes, geometry.indexPageBytes));

@@ -95,9 +95,10 @@ auto Engine::allocate(Attempt &&attempt, const ClaimSpec &spec, bool frees)
   Denial &denial = result.denial;
   // Each refusal asks the ledger to free what the claim lacks, and the
   // attempt runs again once that is met or memory left now. A refusal that
-  // lacks nothing the ledger counts, or that the host refuses after
-  // exempting the claim (critical pressure), meets nothing more by asking
-  // again.
+  // lacks nothing the ledger counts, that the host refuses after exempting
+  // the claim (critical pressure), or that lacks what it lacked before the
+  // ledger met that, is not for want of what the ledger frees.
+  std::optional<Need> metBefore;
   while (frees && memoryDenied(admission)) {
     std::optional<Need> part;
     if constexpr (std::is_same_v<Admission, StateAdmission>)
@@ -106,7 +107,10 @@ auto Engine::allocate(Attempt &&attempt, const ClaimSpec &spec, bool frees)
       part = inPlace(admission, ledger.heldPages(claim.id));
     const Need need = governor.need(claim.id, part);
     if ((!need.bytes && !need.hostRefused && !need.pages && !need.stateBuffers) ||
-        (need.hostRefused && ledger.claim(claim.id).hostExempt))
+        (need.hostRefused && ledger.claim(claim.id).hostExempt) ||
+        (metBefore && need.bytes == metBefore->bytes && need.hostRefused == metBefore->hostRefused &&
+         need.pages == metBefore->pages && need.form == metBefore->form &&
+         need.stateBuffers == metBefore->stateBuffers))
       break;
     const FreeResult freed = governor.free(claim.id, need);
     ++ledgerChanges_;
@@ -117,6 +121,7 @@ auto Engine::allocate(Attempt &&attempt, const ClaimSpec &spec, bool frees)
       break;
     }
     result.freed = true;
+    metBefore = need;
     signalResourceProgress();
     admission = tryOnce();
   }
