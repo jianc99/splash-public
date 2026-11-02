@@ -799,9 +799,12 @@ void testAPrefillsPriceIsTheCostModels() {
           "more rows did not cost more");
 }
 
-// S-P5: a cold start's first contended agent turn is never underpriced, as
-// the base's host-wait seed prices it (1119.9 ms for a 3226.8 ms turn), and
-// is priced within twice its time, so its first sample trains unclamped
+// S-P5, short of its criterion: DESIGN §7.5 asks for the price within 25 %
+// of the turn's time, and whether this bound replaces it is the owner's to
+// decide (open). A cold start's first contended agent turn is never
+// underpriced, as the base's host-wait seed prices it (1119.9 ms for a
+// 3226.8 ms turn), and is priced within twice its time, so its first
+// sample trains unclamped
 // (CostModel::observe counts a time within half and twice the price, the
 // clamp amend/S.md A10 keeps). Within 25 % (DESIGN §7.5) is out of this
 // seed's reach: seeded from the load's read rate (A10) and the token-0
