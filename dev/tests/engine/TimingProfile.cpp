@@ -118,7 +118,9 @@ const TimingProfile kStudio18GFlashNextQ2 = [] {
 }();
 
 // The Studio at its default memory: the same Mac and target as at 18G, the
-// store at 13,216 slots (sA).
+// store at 13,216 slots (sA). At its prefill hit (0.638) a command of
+// 300-8192 rows reads 0.56-0.67 s of experts compute does not hide, under
+// the host floor, so the floor binds here: its 720 ms is the M6's (studio()).
 const TimingProfile kStudio36FlashNextQ2 = [] {
   TimingProfile profile = studio(kFlashNext);
   profile.name = "studio-36g-flash-next-q2";
@@ -135,10 +137,19 @@ const TimingProfile kStudio36FlashNextQ2 = [] {
 
 // The Studio with every Flash-Next expert resident and its K/V spilling
 // (--expert-memory off --kv-spill always): nothing read on demand but a
-// streaming lane's history, at the Studio's SSD rate.
+// streaming lane's history, at the Studio's SSD rate. It streams no experts,
+// so its commands run no host steps (no host floor) and carry none of the
+// streamed fit's expert term, which on the Studio stands in for the cost of
+// streaming a command, collinear with its fixed part: a command costs its
+// turnaround, its rows at the fit's rate and its unhidden history reads.
+// No Mac the tracks time on runs it: Flash-Next Q2_0's 24,576 routed experts
+// take 32,400 MiB, and the Studio's plan leaves its store 18,552 MiB (13,731
+// slots, sA's start), so its commands are not measured.
 const TimingProfile kStoreLessSpillFlashNext = [] {
   TimingProfile profile = studio(kFlashNext);
   profile.name = "store-less-spill-flash-next";
+  profile.expertMilliseconds = 0.0;
+  profile.hostFloorMilliseconds = 0.0;
   // kStudio36FlashNextQ2's width-1 command less its 22.5 MB a token of expert
   // reads (8 rows at 6.22 GB/s: 28.9 ms), widths 2-4 by its ratios.
   profile.decodeMilliseconds = {16.7, 32.8, 41.7, 50.7};

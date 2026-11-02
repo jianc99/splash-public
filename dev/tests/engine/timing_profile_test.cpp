@@ -136,6 +136,33 @@ void testHalvingTheResidencyAddsItsReadTime() {
   }
 }
 
+// A store-less target streams no experts: its commands wait on no host
+// steps, and a lane's history reads lengthen its command by the read time
+// compute does not hide, from its first Index page (one lane of 2048 rows
+// at 64K).
+void testAStoreLessCommandPaysItsHistoryReads() {
+  const TimingProfile &profile = test::kStoreLessSpillFlashNext;
+  const TimedWork work(profile);
+  const auto times = [&](uint32_t indexPages) {
+    const model::PrefillLane lane{.position = 65'536, .rows = 2048, .indexPages = indexPages};
+    return test::prefillTimes(profile, work.prefillWork({&lane, 1}, 0, 1));
+  };
+  const test::CommandTimes resident = times(0);
+  require(resident.hostMilliseconds == 0,
+          "a store-less command waits " + std::to_string(resident.hostMilliseconds) + " ms on the host");
+  const double compute = resident.wallMilliseconds - profile.turnaroundMilliseconds;
+  for (const uint32_t pages : {1u, 2048u}) {
+    const test::CommandTimes spilled = times(pages);
+    const double unhidden =
+        spilled.streamMilliseconds - profile.hiddenShare * std::min(spilled.streamMilliseconds, compute);
+    require(spilled.streamMilliseconds > 0 &&
+                std::abs(spilled.wallMilliseconds - resident.wallMilliseconds - unhidden) < 1e-6,
+            std::to_string(pages) + " Index pages add " +
+                std::to_string(spilled.wallMilliseconds - resident.wallMilliseconds) + " ms, not their reads' " +
+                std::to_string(unhidden));
+  }
+}
+
 // Routing is the measured one: a Flash-Next command of 300 rows routes
 // 14.5K of the 24,576 experts over its 48 layers (A62's fixture point), far
 // fewer than uniform routing; the warm-up routes ten a layer.
@@ -343,6 +370,7 @@ int main(int argc, char **argv) {
       {"theWarmupIsCalibrated", testTheWarmupIsCalibrated},
       {"theFixedPartExceedsTheHostWait", testTheFixedPartExceedsTheHostWait},
       {"halvingTheResidencyAddsItsReadTime", testHalvingTheResidencyAddsItsReadTime},
+      {"aStoreLessCommandPaysItsHistoryReads", testAStoreLessCommandPaysItsHistoryReads},
       {"routingIsMeasured", testRoutingIsMeasured},
       {"theDenseAndFlintProfilesFitTheirPrompts", testTheDenseAndFlintProfilesFitTheirPrompts},
       {"thePassesSplitTheLayersAndTheirWork", testThePassesSplitTheLayersAndTheirWork},
