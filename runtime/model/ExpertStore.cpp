@@ -11,6 +11,7 @@
 #include "model/WeightImages.hpp"
 #include "model/WeightLayout.hpp"
 #include "model/WeightSource.hpp"
+#include "model/WorkFormulas.hpp"
 
 #include <algorithm>
 #include <array>
@@ -249,6 +250,7 @@ struct ExpertStore::Impl {
     uint32_t size = 0;
     gguf::StreamedExperts experts;
     std::vector<uint32_t> slot; // each expert's, kNoSlot when not resident
+    uint32_t resident = 0;      // the experts that have a slot
     // Its router and shared-expert gate (bind), which predict its routes.
     ops::QuantizedSegment router, scalarGate;
   };
@@ -422,6 +424,8 @@ struct ExpertStore::Impl {
   uint64_t fixedBytes = 0;
   mutable std::mutex statsMutex;
   ExpertStoreStats published;
+  // Each block's resident experts, as publish() left them.
+  std::vector<uint32_t> publishedResident;
   bool released = false;
   // Per ops::MoePhase, the round trips of the loads' host steps, which their
   // commands' completions add from Metal's thread.
@@ -437,6 +441,7 @@ void ExpertStore::Impl::evict(Size &size, uint32_t slot) {
   if (owner == kNoSlot) return;
   const uint32_t expert = size.ownerExpert[slot];
   blocks[owner].slot[expert] = kNoSlot;
+  --blocks[owner].resident;
   // A table entry of no resident expert names slot 0, which is inside chunk
   // 0, which every size has: the kernels read only routed experts' entries,
   // which a load set, so it is never used.
@@ -479,6 +484,7 @@ void ExpertStore::Impl::route(uint32_t index, std::span<const std::span<const Mo
     block.slot[expert] = slot;
     table[expert] = slot;
     waiting[expert] = 1;
+    ++block.resident;
     ++counters.resident;
   }
   use.read += pending.size();
@@ -743,6 +749,7 @@ void ExpertStore::Impl::abandon() {
       table[expert] = 0;
       size.ownerBlock[slot] = size.ownerExpert[slot] = kNoSlot;
       size.recycling.free(slot);
+      --block.resident;
       --counters.resident;
     }
   pending.clear();
@@ -791,6 +798,7 @@ void ExpertStore::Impl::fill() {
                               metal::IndirectGrid{grid, 0});
       static_cast<void>(backend.submitCommandAsync(graph.command()).wait());
     }
+    block.resident = shape.experts;
     counters.resident += shape.experts;
   }
   forgetRepack();
@@ -854,8 +862,10 @@ uint64_t ExpertStore::Impl::shrink(uint32_t index, uint32_t live) {
   }
   counters.shrinks += chunks - live;
   countLive();
-  publish();
   const double took = millisecondsSince(started);
+  counters.releasedBytes += bytes;
+  counters.releaseMilliseconds += took;
+  publish();
   logLine("Expert store gave back ", chunks - live == 1 ? "a chunk" : std::to_string(chunks - live) + " chunks",
           " of ", bytes >> 20, " MiB while memory is short, in ", std::fixed, std::setprecision(1), took,
           " ms: ", moved, " experts moved below ", chunks - live == 1 ? "it" : "them", " and ", evicted,
@@ -941,11 +951,29 @@ void ExpertStore::Impl::countLive() {
   counters.liveBytes = fixedBytes + counters.arenaBytes;
 }
 
-// Leaves a copy of the counters and the failure for stats().
+// Leaves a copy of the counters, the failure and each block's resident
+// experts for stats() and expectedPrefillReadBytes(), with what the next
+// shrink and growth take and the ghosts of the streamed sizes.
 void ExpertStore::Impl::publish() {
+  const bool resizes = !released && failure.empty();
+  const uint32_t shrinking = resizes ? shrinkingSize() : kNoSlot, growing = resizes ? growingSize() : kNoSlot;
+  counters.releaseUnitBytes =
+      shrinking == kNoSlot ? 0 : sizes[shrinking].buffers[sizes[shrinking].chunks.liveChunks() - 1].sizeBytes();
+  counters.growUnitBytes =
+      growing == kNoSlot ? 0 : sizes[growing].buffers[sizes[growing].chunks.liveChunks()].sizeBytes();
+  counters.ghostHits = counters.ghostBytes = 0;
+  for (const Size &size : sizes) {
+    uint64_t slotBytes = 0;
+    for (const ProjectionLayout &projection : size.layout)
+      for (const uint64_t plane : projection.planes) slotBytes += plane;
+    counters.ghostHits += size.recycling.ghostHits();
+    counters.ghostBytes += size.recycling.ghosts() * slotBytes;
+  }
   const std::lock_guard lock(statsMutex);
   published = counters;
   published.failure = failure;
+  publishedResident.resize(blocks.size());
+  for (size_t block = 0; block < blocks.size(); ++block) publishedResident[block] = blocks[block].resident;
 }
 
 void ExpertStore::Impl::load(uint32_t index, ops::MoePhase phase, uint32_t rows, bool predicted,
@@ -1300,6 +1328,26 @@ ExpertStoreStats ExpertStore::stats() const {
   return result;
 }
 
+uint64_t ExpertStore::readBytes() const {
+  const std::lock_guard lock(impl_->statsMutex);
+  return impl_->published.uses[0].readBytes + impl_->published.uses[1].readBytes;
+}
+
+uint64_t ExpertStore::expectedPrefillReadBytes(uint32_t rows, uint32_t firstBlock, uint32_t endBlock) const {
+  const Impl &impl = *impl_;
+  const ops::MoeShape shape = impl.shape;
+  const double routed = expectedDistinctExperts(rows, shape.expertsPerToken, shape.experts);
+  double bytes = 0;
+  const std::lock_guard lock(impl.statsMutex);
+  for (uint32_t block = firstBlock; block < endBlock; ++block) {
+    uint64_t expertBytes = 0;
+    for (const ProjectionLayout &projection : impl.sizes[impl.blocks.at(block).size].layout)
+      expertBytes += projection.nativeBytes();
+    bytes += routed * (shape.experts - impl.publishedResident[block]) / shape.experts * double(expertBytes);
+  }
+  return static_cast<uint64_t>(bytes);
+}
+
 bool ExpertStore::released() const noexcept { return impl_->released; }
 
 void ExpertStore::release() {
@@ -1310,7 +1358,10 @@ void ExpertStore::release() {
   // readers end the pieces they took, and it is forgotten.
   impl.retireAhead();
   impl.ahead.block = impl.plan.block = kNoSlot;
-  for (Impl::Block &block : impl.blocks) std::ranges::fill(block.slot, kNoSlot);
+  for (Impl::Block &block : impl.blocks) {
+    std::ranges::fill(block.slot, kNoSlot);
+    block.resident = 0;
+  }
   std::memset(impl.tables.contents(), 0, impl.tables.sizeBytes());
   // The chunks past the live ones were given back already.
   for (Impl::Size &size : impl.sizes) {

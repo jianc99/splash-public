@@ -29,6 +29,19 @@ struct ExpertStoreStats final {
   // The chunks given back while memory was short, and taken back after.
   uint64_t shrinks = 0;
   uint64_t regrows = 0;
+  // Their bytes given back, and the engine thread's time giving them back
+  // took, mostly the compaction of their experts below them.
+  uint64_t releasedBytes = 0;
+  double releaseMilliseconds = 0.0;
+  // The bytes releaseAboveFloor() would give back next and growTowardCap()
+  // would take: zero at the floor and at the cap, while released and after
+  // a failed load.
+  uint64_t releaseUnitBytes = 0;
+  uint64_t growUnitBytes = 0;
+  // The claims of experts the streamed sizes' recycling gave up lately
+  // (SlotRecycler::ghostHits), and the slots those ghosts would take now.
+  uint64_t ghostHits = 0;
+  uint64_t ghostBytes = 0;
   // Per ops::MoePhase, at its value (uses[0] prefill, uses[1] decode): the
   // blocks loaded, the distinct experts they routed, those not resident and
   // of them those read ahead, the experts read ahead whole (routed or not),

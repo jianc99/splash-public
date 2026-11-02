@@ -12,7 +12,8 @@
 // there in their lists' order, keeps as many keys as fit and the ghosts
 // within ARC's bounds, and leaves no key or claim past the slots; one straight
 // to fewer slots keeps the keys compactions a chunk at a time keep, moving
-// each once at most. On the
+// each once at most. Its ghosts are at most its slots, none from a scan or
+// after a reset. On the
 // decode selections of real requests
 // (dev/tests/fixtures/kv-selection-traces, the directory the test takes), the
 // hot block cache's resolves miss at most 2% more than recycling the least
@@ -150,6 +151,28 @@ void findsWhatItHolds() {
   // A scan's claim of T2's ghost adapts nothing.
   static_cast<void>(slots.claim(10, 6, true));
   require(slots.ghostHits() == 1, "a scan's claim of a ghost counted as a ghost's");
+}
+
+// The keys T1 and T2 gave up lately are its ghosts, at most as many as its
+// slots, which a resize to fewer slots keeps within them; a scan's claims
+// and a reset leave none.
+void countsItsGhosts() {
+  Arena arena(16);
+  for (uint64_t load = 0; load < 50; ++load) {
+    // Keys used again and again beside fresh ones, which T1 recycles.
+    std::vector<uint64_t> keys{0, 1, 2, 3, 4, 5, 6, 7};
+    for (uint64_t fresh = 0; fresh < 4; ++fresh) keys.push_back(100 + 4 * load + fresh);
+    static_cast<void>(arena.route(keys, false));
+    require(arena.order.ghosts() <= arena.order.size(), "a recycler kept more ghosts than its slots");
+  }
+  require(arena.order.ghosts() > 0, "keys T1 recycled left no ghost");
+  arena.order.resize(4);
+  require(arena.order.ghosts() <= 4, "a resize to fewer slots kept more ghosts than them");
+  arena.order.reset();
+  require(arena.order.ghosts() == 0, "a reset kept ghosts");
+  SlotRecycler scans(4);
+  for (uint64_t key = 0; key < 12; ++key) static_cast<void>(scans.claim(key, key + 1, true));
+  require(scans.ghosts() == 0, "a scan's claims left ghosts");
 }
 
 void resizes() {
@@ -524,6 +547,7 @@ int main(int argc, char **argv) {
     neverTakesTheLoadsOwn();
     freeSlotsFirst();
     findsWhatItHolds();
+    countsItsGhosts();
     resizes();
     compactsInRecencyOrder();
     compactsAtTheTarget();

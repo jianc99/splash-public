@@ -183,6 +183,19 @@ public:
   void bind(uint32_t block, ops::BlockMoeWeights &weights);
   void addLoad(metal::CommandGraph &graph, std::span<const ops::MoeLoadPart> parts, uint32_t block) const override;
   [[nodiscard]] ExpertStoreStats stats() const;
+  // The bytes its loads read from the sources, of both phases, as the last
+  // round published them (ExpertStoreStats::Use::readBytes): a command's
+  // reads are what it moved between its submission and its completion.
+  // Any thread; never waits for a load.
+  [[nodiscard]] uint64_t readBytes() const;
+  // The bytes a prefill load of `rows` rows would read from the sources over
+  // blocks [firstBlock, endBlock), with each block's residency as the last
+  // round published it: per block, the distinct experts uniform routing
+  // routes (model::expectedDistinctExperts), the share of them not resident
+  // and an expert's native bytes. Uncalibrated: real routing routes fewer
+  // distinct experts and the resident ones more often, which the realized
+  // readBytes() show. Any thread; never waits for a load.
+  [[nodiscard]] uint64_t expectedPrefillReadBytes(uint32_t rows, uint32_t firstBlock, uint32_t endBlock) const;
   // The live chunks and the staging, while no command is in flight;
   // restore() takes the floor chunks and the staging back in one part under
   // `admit`, then each elastic chunk under an admission of its own by
