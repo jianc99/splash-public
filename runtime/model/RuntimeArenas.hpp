@@ -139,7 +139,7 @@ struct RuntimeGeometry final {
 [[nodiscard]] inline AttentionReach attentionReach(const QwenTargetGeometry &target, uint32_t attention) noexcept {
   if (const uint32_t window = target.attentionVariant(attention).windowTokens)
     return {.windowTokens = window + 1};
-  if (target.hasIndexer())
+  if (target.kvLayout.reads == kv::Reads::SelectedBlocks)
     return {.denseHistoryTokens = target.indexerTokens(),
             .selectedTokens = target.indexerTokens(),
             .blockTokens = target.indexerBlockTokens};
@@ -158,9 +158,10 @@ struct RuntimeGeometry final {
                                                     uint32_t passes) noexcept {
   const LayerRange run = passLayers(pass, passes, target.layers);
   CommandWork work{.lanes = static_cast<uint32_t>(lanes.size()), .layers = run.end - run.first};
+  const bool selectsBlocks = target.kvLayout.reads == kv::Reads::SelectedBlocks;
   uint64_t scores = 0;
   for (const PrefillLane &lane : lanes) {
-    for (uint32_t done = 0; target.hasIndexer() && done < lane.rows;) {
+    for (uint32_t done = 0; selectsBlocks && done < lane.rows;) {
       const uint32_t part = std::min(lane.rows - done, kPrefillRows - (work.rows + done) % kPrefillRows);
       scores += indexPairs(uint64_t{lane.position} + done, part, target.indexerBlockTokens, target.indexerTopBlocks);
       done += part;
