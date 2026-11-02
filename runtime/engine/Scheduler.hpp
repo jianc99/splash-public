@@ -154,10 +154,11 @@ struct SchedulerSnapshot final {
 // rows where the fixed part a group saves is worth a wait of G. While a lane
 // of its priority or a higher one decodes (contended), or when it leads a
 // group, each unit is bounded: the fewest passes whose every pass's price is
-// within max(G, turnaround / kPassOverheadShare), or failing that within
-// twice its fixed part; a contended unit no passes bound halves its rows
-// where fewer rows can bound it. A layer's attention pairs bound rows, never
-// passes. A lane joins with the rows that spare it a command of its own when
+// within max(G, turnaround / kPassOverheadShare), or failing that, of no
+// fewer passes, within twice its fixed part; a contended unit no passes
+// bound halves its rows where fewer rows can bound it. A layer's attention
+// pairs bound rows, never passes. A lane joins with the rows that spare it a
+// command of its own when
 // what it adds to the others is less than what it saves (summed
 // completion). The command between its
 // passes runs its later passes before any other prefill but a plan whose

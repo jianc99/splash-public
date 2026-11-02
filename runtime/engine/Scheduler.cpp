@@ -504,10 +504,12 @@ Scheduler::UnitFit Scheduler::passesFor(std::span<const model::PrefillLane> lane
   const uint32_t most = config_.limits.maximumPasses;
   const double limit = bound();
   // The fewest passes whose every pass is within the bound; or failing that
-  // within twice its fixed part, so that no pass spends more than half its
-  // time on what its rows do not need. A pass's price includes its
-  // turnaround, so the passes' mean, and the heaviest, is at least the
-  // command's over their count: fewer cannot fit.
+  // the fewest of no fewer passes whose every pass is within twice its fixed
+  // part, so that no pass spends more than half its time on what its rows do
+  // not need. A pass's price includes its turnaround, so the passes' mean,
+  // and the heaviest, is at least the command's over their count: fewer
+  // cannot fit the bound, and would only lengthen the passes, a read-bound
+  // unit's to one of twice its fixed part (amend/S.md D4: 6-9 s gaps).
   const auto fits = [&](uint32_t passes, bool relaxed) {
     for (uint32_t pass = 0; pass < passes; ++pass) {
       const model::CommandWork unit = work_.prefillWork(lanes, pass, passes);
@@ -522,7 +524,7 @@ Scheduler::UnitFit Scheduler::passesFor(std::span<const model::PrefillLane> lane
   for (uint32_t passes = first; passes <= most; ++passes)
     if (fits(passes, false))
       return {passes, true};
-  for (uint32_t passes = 1; passes <= most; ++passes)
+  for (uint32_t passes = first; passes <= most; ++passes)
     if (fits(passes, true))
       return {passes, true};
   return {most, false};

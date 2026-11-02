@@ -1190,6 +1190,62 @@ void testAContendedUnitKeepsRowsNoFewerBound() {
   require(sim.scheduler.snapshot().boundCuts == 0, "a halving no fewer rows could make was counted");
 }
 
+// The part of `work`'s price fewer rows do not shorten (CostModel::fixed):
+// the turnaround and the read terms at their realized shares.
+double fixedOf(const Sim &sim, const model::CommandWork &work) {
+  const std::vector<CostTermSnapshot> terms = sim.scheduler.snapshot().prefillEstimate.terms;
+  const auto rate = [&](CostTerm term) {
+    const CostTermSnapshot &snapshot = terms[static_cast<size_t>(term)];
+    return snapshot.millisecondsPerUnit * snapshot.realizedPerExpected;
+  };
+  return rate(CostTerm::Units) + rate(CostTerm::WeightReadBytes) * double(work.weightReadBytes) +
+         rate(CostTerm::SpilledKvReadBytes) * double(work.spilledKvReadBytes);
+}
+
+// A contended unit no passes bring within the bound, a turn on a Spill
+// conversation 256K tokens deep whose every attention layer reads 289 MB of
+// history at the M6's recorded 0.42-0.70 GB/s (amend/S.md S3; 0.5 here), takes
+// no fewer passes than the bound's mean needs: none of its passes costs more
+// than max(bound, twice the fixed part of a pass in the most passes), where
+// in one pass it would take its whole ~10 s (amend/S.md D4). Every other turn
+// is on a resident conversation as deep, so the price tells the history's
+// reads from the attention they feed.
+void testAContendedUnitPastTheBoundKeepsItsPasses() {
+  test::TimingProfile history = test::kM6FlashNextQ2;
+  history.spilledKvBytesPerMillisecond = 0.5e6;
+  constexpr uint32_t kDepth = 262'144;
+  Sim sim(history, limits(8192, history.layers));
+  sim.seed();
+  sim.decoder(1);
+  uint32_t checked = 0;
+  for (uint64_t turn = 0; turn < 24; ++turn) {
+    const uint64_t id = 100 + turn;
+    const bool spill = turn % 2;
+    sim.lane(id, kDepth, 300);
+    if (spill)
+      sim.shape(id, kDepth / kPageTokens);
+    while (sim.scheduler.phase(id) == Phase::Prefill) {
+      const BatchPlan plan = sim.plan();
+      if (plan.kind == WorkKind::Prefill && !plan.pass && spill && turn >= 12) {
+        double ceiling = sim.bound(), heaviest = 0.0;
+        for (uint32_t pass = 0; pass < history.layers; ++pass)
+          ceiling = std::max(ceiling,
+                             2.0 * fixedOf(sim, sim.work.prefillWork(sim.lanes(plan.items), pass, history.layers)));
+        for (uint32_t pass = 0; pass < plan.passes; ++pass)
+          heaviest = std::max(heaviest, sim.price(plan.items, pass, plan.passes));
+        require(heaviest <= ceiling * (1 + 1e-9),
+                "a contended unit past the bound ran in " + std::to_string(plan.passes) + " passes, the heaviest " +
+                    std::to_string(heaviest) + " ms against " + std::to_string(ceiling) + " ms");
+        ++checked;
+      }
+      sim.run(plan);
+    }
+    sim.scheduler.cancel(id);
+    sim.scheduler.remove(id);
+  }
+  require(checked >= 6, "too few deep Spill turns were checked");
+}
+
 // S-P3: beside a Spill lane streaming its history, a decoder's gaps between
 // its decode commands stay within a unit's bound, max(G, u / 0.1) by the
 // price's error (p95), and one decode command, once the price has learned,
@@ -1955,6 +2011,7 @@ constexpr test::TestCase kTests[] = {
     {"testAContendedSpillLaneKeepsItsGroupRows", testAContendedSpillLaneKeepsItsGroupRows},
     {"testAGroupBeyondMaximumPassesHalvesOnlyWhenContended", testAGroupBeyondMaximumPassesHalvesOnlyWhenContended},
     {"testAContendedUnitKeepsRowsNoFewerBound", testAContendedUnitKeepsRowsNoFewerBound},
+    {"testAContendedUnitPastTheBoundKeepsItsPasses", testAContendedUnitPastTheBoundKeepsItsPasses},
     {"testDecodeGapsBesideAStreamingLaneStayWithinTheBound", testDecodeGapsBesideAStreamingLaneStayWithinTheBound},
     {"testTurnsTtftAloneTogetherAndApart", testTurnsTtftAloneTogetherAndApart},
     {"testALongLanesSparingRowsDoNotDelayAShortTurn", testALongLanesSparingRowsDoNotDelayAShortTurn},
