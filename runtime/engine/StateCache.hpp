@@ -143,10 +143,8 @@ public:
   // pending; a write the quota refuses still drops it. Keep: the state goes
   // only when it keeps a copy, a disk copy it has or a write that starts
   // now; it stays otherwise, reported pending while the write in flight
-  // holds the staging buffer. Stay: no write starts; the state goes only
-  // when it needs none, through a disk copy it has or because the tier takes
-  // no write of it, which drops it, and stays otherwise.
-  enum class Unwritten : uint8_t { Drop, Wait, Keep, Stay };
+  // holds the staging buffer.
+  enum class Unwritten : uint8_t { Drop, Wait, Keep };
 
   // makeRoom gives up disk copies for a state's write the quota refuses. In
   // a persistent tier every write labels its disk copy (CompositeState::label).
@@ -232,16 +230,6 @@ public:
     return static_cast<uint32_t>(ordinary_.size() + checkpoints_.size() +
                                  (withInUse ? inUse_.size() : 0));
   }
-  // The RAM copies a reclaim that starts no write frees, each at once: the
-  // checkpoints, then the ordinary states, oldest first, freed with Stay
-  // until none is left, keeping the resume point and the states at `kept`
-  // (Cache::reclaimForExchange). Appends to `staying` the blocks of the RAM
-  // copies it leaves but those in use and those at `kept`: those that need a
-  // write, which the reclaim passes over to the next of their class, the
-  // resume point, and the copies in no order, pinned or read by the write in
-  // flight.
-  [[nodiscard]] uint32_t freedWithoutWrites(std::vector<uint64_t> &staying,
-                                            std::span<const uint64_t> kept) const;
   // The resume point a reclaim may keep (keepResumePoint): the newest
   // unpinned ordinary state in RAM, else the newest such checkpoint; 0
   // without either.
@@ -267,8 +255,8 @@ public:
   inUseCandidate(std::optional<CacheEvictionCandidate> after = std::nullopt) const noexcept;
   // Frees the RAM copy of a candidate above (an unpinned RAM copy; anything
   // else throws std::logic_error): for nothing when a disk copy exists, by
-  // writing one when the tier takes it (makeRoom frees quota on its behalf)
-  // and `unwritten` is not Stay, otherwise as `unwritten` says. Its buffers
+  // writing one when the tier takes it (makeRoom frees quota on its behalf),
+  // otherwise as `unwritten` says. Its buffers
   // return to the model's pool, which reclaimIdleState gives back to the
   // host. A RAM copy a write in flight reads (persist) stays until it lands:
   // pending.
@@ -320,9 +308,6 @@ public:
   [[nodiscard]] uint64_t persistingBytes() const noexcept {
     return pending_ && pending_->source ? pending_->source->bytes() : 0;
   }
-  // The RAM copies reclaim() reached that needed a write first, written
-  // then, waiting for the write in flight, or staying (Stay).
-  [[nodiscard]] uint64_t uncopiedReached() const noexcept { return uncopiedReached_; }
   [[nodiscard]] bool pollOffload();
   [[nodiscard]] StateCacheSnapshot snapshot() const noexcept;
 
@@ -432,7 +417,6 @@ private:
   uint64_t checkpointEvictions_ = 0;
   uint64_t offloads_ = 0;
   uint64_t offloadFailures_ = 0;
-  uint64_t uncopiedReached_ = 0;
   uint64_t invalidations_ = 0;
   // Destroyed before entries_: the ticket's disk copy may still be an entry.
   std::optional<PendingOffload> pending_;

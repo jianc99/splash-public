@@ -63,8 +63,7 @@ public:
 
   // A point published or reused at this block, `tokens` deep. Nothing while
   // the disk tier takes no writes. Whether copies wait for demand is asked
-  // now (copying): until the engine passes the memory's demand, of the
-  // reclaims; then, of the demand the last step was asked with, which a
+  // now (copying), of the demand the last step was asked with, which a
   // claim since changes at the next step.
   void published(uint64_t block, uint32_t tokens, double now);
   // Steps the points that are due and not in use, unless a claim waits for
@@ -78,12 +77,6 @@ public:
   // (Cache::copyingAheadBytes). True when a point became durable or was
   // given up; a write it starts wakes the engine when it lands.
   [[nodiscard]] bool run(double now, uint64_t demandBytes, bool claimWaiting);
-  // The step until the engine's claims weigh copies ahead: a request that
-  // waits for memory on its way back (Engine::memoryAwaited) in place of a
-  // claim, and a temporary tier copies while a reclaim reached cache that
-  // needed a copy first (Cache::uncopiedReached) within the last
-  // kValueHorizonSeconds.
-  [[nodiscard]] bool run(double now, bool memoryAwaited);
   // At a clean stop: in a persistent tier, steps every waiting point, the
   // newest first, due or not and in use or not, whatever the write budget
   // (Cache::liftDiskWriteBudget). True once none is left, and at once in a
@@ -109,16 +102,12 @@ private:
   // `copies` says the next one is.
   [[nodiscard]] bool step(double now, bool claimWaiting, const std::function<bool()> &copies);
   // Copies are made now: always in a persistent tier; in a temporary one
-  // on the demand last asked with, or until the engine passes one, while
-  // reclaims reached cache that needed a copy first recently.
-  [[nodiscard]] bool copying(double now);
+  // on the demand last asked with.
+  [[nodiscard]] bool copying() const noexcept;
   // The cache's victims that go at once, without a write, the oldest first,
   // with what the copies ahead in flight free after they land, hold less
   // than `demandBytes`.
   [[nodiscard]] bool demanded(uint64_t demandBytes) const;
-  // A reclaim reached cache that needed a copy first within the last
-  // kValueHorizonSeconds, as uncopiedReached_ and reachedAt_ keep.
-  [[nodiscard]] bool reachedRecently(double now);
   // A temporary tier's point whose request has not ended.
   [[nodiscard]] bool inUse(uint64_t block) const noexcept;
 
@@ -133,13 +122,8 @@ private:
   Stop stopped_ = Stop::None;
   // Copies are made, as last asked (copying).
   bool copying_;
-  // The demand the last step was asked with; none while the engine passes
-  // none (run(now, memoryAwaited)).
-  std::optional<uint64_t> demandBytes_;
-  // What reclaims reached that needed a copy first, as last seen
-  // (Cache::uncopiedReached), and when it was last seen to grow.
-  uint64_t uncopiedReached_ = 0;
-  std::optional<double> reachedAt_;
+  // The demand the last step was asked with.
+  uint64_t demandBytes_ = 0;
   WriteBehindSnapshot counters_;
 };
 

@@ -5854,17 +5854,18 @@ void testCopyAheadOfALeafHoldsARefusalBack() {
                 cache.stateResident(leaf),
             "the fixture's copies did not start");
     const uint32_t pages = pool.freePageCount() + 1;
-    CacheReclaimResult refused;
+    // A page scan is the need of a refusal the host refused.
+    const Need need{.hostRefused = mode == CacheReclaimMode::ReusePages, .pages = pages};
+    FreeResult refused;
     do
-      refused = cache.reclaimForPages(pages, mode, ReclaimClass::InUse, kv::PageForm::Full);
-    while (refused.madeProgress && !refused.pending);
-    require(refused.pending && !cache.stateResident(leaf) == (mode == CacheReclaimMode::KeepExtents) &&
+      refused = test::freeFromCache(cache, test::kInServiceGrowth, need);
+    while (refused.outcome == FreeOutcome::Met);
+    require(refused.outcome == FreeOutcome::Pending && !cache.stateResident(leaf) == (mode == CacheReclaimMode::KeepExtents) &&
                 cache.stateResident(used) && !cache.snapshot().stateCache.inUseEvictions &&
                 pool.snapshot().pagesPrefix == 2,
             "a refusal took what is in use while the leaf it frees next waited for its copy");
     tier.complete();
-    require(cache.pollTransfers() &&
-                cache.reclaimForPages(pages, mode, ReclaimClass::InUse, kv::PageForm::Full).madeProgress &&
+    require(cache.pollTransfers() && test::freeFromCache(cache, test::kInServiceGrowth, need).outcome == FreeOutcome::Met &&
                 !cache.stateResident(leaf) && cache.stateResident(used) && pool.snapshot().pagesPrefix == 1 &&
                 tier.demotions == 1,
             "the refusal that followed did not free the copied leaf, writing nothing");

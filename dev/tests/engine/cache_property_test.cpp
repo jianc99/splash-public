@@ -69,8 +69,8 @@ private:
 
 // One randomized run of the tiered block store. Requests of both modes on
 // prompts that share prefixes publish, spill, restore, convert, read
-// unreadable copies and end; RAM reclaim, the exchange for the expert store
-// beside the requests, and the disk quota take what they may, a persistent
+// unreadable copies and end; RAM reclaim beside the requests and the disk
+// quota take what they may, a persistent
 // tier keeps restore points, the pool's growth and the
 // tier's writes of every class fail now and then, and the tier's transfers
 // land at random. The cache checks every invariant spilling relies on after
@@ -103,7 +103,7 @@ public:
   }
 
   void step() {
-    switch (pick(0, peeks_ ? 15 : 14)) {
+    switch (pick(0, peeks_ ? 14 : 13)) {
     case 0: start(); break;
     case 1: case 2: grow(); break;
     case 3: static_cast<void>(cache_.writeThrough()); break;
@@ -122,8 +122,7 @@ public:
     case 11: command(); break;
     case 12: persist(); break;
     case 13: failWrites(); break;
-    case 14: checkExchange(false); break;
-    case 15: checkPeek(); break;
+    case 14: checkPeek(); break;
     }
     cache_.checkInvariants();
   }
@@ -163,61 +162,6 @@ public:
     tier_.complete();
     static_cast<void>(cache_.pollTransfers());
     cache_.checkInvariants();
-  }
-
-  // What the exchange for the expert store counts on (Cache::exchangeable)
-  // reclaimForExchange releases at once, repeated until it makes no
-  // progress, with no copy to the SSD cache started: no fewer extents and
-  // RAM copies of states. With `exact`, once nothing is in flight, exactly
-  // those, unless the KV tier takes writes and the state file none. The
-  // chains that probes of base prompts would restore, as requests that have
-  // not started hold them, stay: each still matches whole, and the state it
-  // resumes from keeps its RAM copy.
-  void checkExchange(bool exact) {
-    struct Waiting final {
-      Request request;
-      CacheProbe probe;
-      std::vector<uint64_t> chain;
-      bool stateResident = false;
-    };
-    std::vector<Waiting> waiting;
-    RestoredChains restored;
-    for (uint32_t count = pick(0, 2); count; --count) {
-      const Request request{pick(0, static_cast<uint32_t>(bases_.size()) - 1), pick(1, kMaximumPages - 2)};
-      CacheProbe probe = cache_.probe(prompt(request), {});
-      const std::span<const uint64_t> chain = probe.restoredChain();
-      restored.add(chain);
-      waiting.push_back({request, probe, {chain.begin(), chain.end()},
-                         !chain.empty() && cache_.stateResident(chain.back())});
-    }
-    const CacheExchange predicted = cache_.exchangeable(restored);
-    const uint64_t allocated = pool_.allocatedBytes();
-    const uint64_t resident = cache_.snapshot().stateCache.bytes;
-    const size_t writes = tier_.writes.size();
-    const uint64_t offloads = cache_.snapshot().stateCache.offloads;
-    for (uint32_t steps = 0; cache_.reclaimForExchange(restored).madeProgress; ++steps)
-      require(steps < 100'000, "the exchange's reclaim did not end");
-    cache_.checkInvariants();
-    require(tier_.writes.size() == writes && cache_.snapshot().stateCache.offloads == offloads,
-            "the exchange's reclaim started a copy to the SSD cache");
-    const CacheExchange left = cache_.exchangeable(restored);
-    require(!left.extentBytes && !left.states, "the exchange's reclaim left cache it counts on");
-    for (Waiting &each : waiting) {
-      cache_.refresh(each.probe, prompt(each.request), {});
-      require(std::ranges::equal(each.probe.restoredChain(), each.chain) &&
-                  (!each.stateResident || cache_.stateResident(each.chain.back())),
-              "the exchange took a chain a request that has not started would restore");
-    }
-    const uint64_t released = allocated - pool_.allocatedBytes();
-    const uint64_t freed = (resident - cache_.snapshot().stateCache.bytes) / 100;
-    const std::string counts = "counted " + std::to_string(predicted.extentBytes) + " bytes and " +
-                               std::to_string(predicted.states) + " states, released " +
-                               std::to_string(released) + " bytes and " + std::to_string(freed) + " states";
-    require(released >= predicted.extentBytes && freed >= predicted.states,
-            "the exchange counted more than its reclaim releases: " + counts);
-    if (exact && (!tier_.writableFile || shelf_->takesWrites))
-      require(released == predicted.extentBytes && freed == predicted.states,
-              "the exchange did not count what its reclaim releases: " + counts);
   }
 
   // What the walk weighs its victims to free never exceeds what taking them
@@ -327,9 +271,9 @@ private:
   template <class Attempt> TokenAdmission admit(Attempt attempt) {
     TokenAdmission admission = attempt();
     while (admission.failure == TokenAdmissionFailure::Denied &&
-           cache_.reclaimForPages(admission.additionalPages, CacheReclaimMode::KeepExtents,
-                                  ReclaimClass::InUse, admission.form)
-               .madeProgress)
+           test::takeFirst(cache_, test::kInServiceGrowth,
+                           {.pages = admission.additionalPages, .form = admission.form})
+                   .outcome == FreeOutcome::Met)
       admission = attempt();
     return admission;
   }
@@ -509,10 +453,8 @@ void testRandomRuns(uint32_t plainSeeds, uint32_t windowedSeeds) {
       for (int step = 0; step < 600; ++step)
         run.step();
       run.endRequests();
-      run.checkExchange(false);
       run.drain();
       run.settle();
-      run.checkExchange(true);
     } catch (const std::exception &error) {
       throw std::runtime_error(std::string(windowed ? "windowed " : "") + "seed " + std::to_string(seed) + ": " +
                                error.what());

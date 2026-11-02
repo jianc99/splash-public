@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <limits>
 #include <iostream>
 #include <map>
 #include <memory>
@@ -102,9 +103,8 @@ std::vector<std::vector<std::byte>> labels(const Shelf &shelf) {
 TokenAdmission admitTokens(engine::Cache &cache, uint64_t requestId, uint64_t tokens) {
   TokenAdmission admission = cache.ensureTokens(requestId, tokens);
   while (admission.failure == TokenAdmissionFailure::Denied &&
-         cache.reclaimForPages(admission.additionalPages, CacheReclaimMode::KeepExtents,
-                               ReclaimClass::InUse)
-             .madeProgress)
+         test::takeFirst(cache, test::kInServiceGrowth, {.pages = admission.additionalPages, .form = admission.form})
+                 .outcome == FreeOutcome::Met)
     admission = cache.ensureTokens(requestId, tokens);
   return admission;
 }
@@ -191,8 +191,6 @@ std::vector<uint32_t> promptOf(uint32_t seed, uint32_t pages) {
 // Memory runs short once, before anything else is cached: a reclaim writes a
 // conversation's state as it leaves RAM, then demotes the leaf that state
 // needs, and both land, so that nothing of the conversation stays in RAM.
-// Until the engine's claims weigh copies ahead, a temporary tier copies
-// points ahead for kValueHorizonSeconds after (WriteBehind::run).
 void runShortOfMemory(Process &process) {
   process.publish(process.cachePrompt(900, promptOf(9000, 1))[0]);
   require(process.cache.reclaimOneState(StateClass::Ordinary, false) &&
@@ -1011,6 +1009,10 @@ void testCopiesWaitForWritesNeededNow() {
   }
 }
 
+// The memory's demand for copies ahead a step passes where a test wants them
+// made: more than any cache's victims hold (WriteBehind::run).
+constexpr uint64_t kCopiesDemanded = std::numeric_limits<uint64_t>::max();
+
 // A temporary tier's copies take only the room its quota has free beside
 // its copies and what Spill requests committed: a point that room cannot
 // hold is refused, nothing of it written and no copy given up for it. A
@@ -1077,13 +1079,13 @@ void testPointsWaitTheirTurn() {
   const std::vector<uint64_t> second = process.cachePrompt(2, promptOf(2000, 1));
   process.publish(second[0]);
   writes.published(second[0], WriteBehind::kMinimumTokens - 1, 0.0);
-  require(writes.snapshot().waiting == 1 && !writes.run(kDelay - 1, false) && !process.tier.demotions &&
+  require(writes.snapshot().waiting == 1 && !writes.run(kDelay - 1, kCopiesDemanded, false) && !process.tier.demotions &&
               writes.nextWakeup() == kDelay,
           "a point was written before its delay, or a short one was queued");
-  require(!writes.run(kDelay, false) && process.tier.demotions == 2 && !writes.nextWakeup(),
+  require(!writes.run(kDelay, kCopiesDemanded, false) && process.tier.demotions == 2 && !writes.nextWakeup(),
           "a due point was not written, or its writes did not hold the queue");
   process.tier.complete();
-  require(process.cache.pollTransfers() && writes.run(kDelay + 1, false) &&
+  require(process.cache.pollTransfers() && writes.run(kDelay + 1, kCopiesDemanded, false) &&
               writes.snapshot().durable == 1 && !writes.snapshot().waiting,
           "the point did not become durable once its writes landed");
 
@@ -1097,7 +1099,7 @@ void testPointsWaitTheirTurn() {
   const uint64_t next = process.cachePrompt(4, longer)[2];
   process.publish(next);
   writes.published(next, WriteBehind::kMinimumTokens, 2 * kDelay + 1);
-  require(writes.run(3 * kDelay, false) && writes.snapshot().unneeded == 1 &&
+  require(writes.run(3 * kDelay, kCopiesDemanded, false) && writes.snapshot().unneeded == 1 &&
               writes.snapshot().waiting == 1 && process.tier.demotions == 2,
           "a point its conversation went on from was written");
 
@@ -1132,17 +1134,17 @@ void testWritesKeepToTheWriteBudget() {
   writes.published(blocks[1], WriteBehind::kMinimumTokens, budget.now);
   budget.spend();
   budget.now = kDelay;
-  require(!writes.run(budget.now, false) && !process.tier.demotions && process.shelf->disk.empty(),
+  require(!writes.run(budget.now, kCopiesDemanded, false) && !process.tier.demotions && process.shelf->disk.empty(),
           "a due point was written while the write budget was spent");
   const std::optional<double> wakeup = writes.nextWakeup();
   require(wakeup && std::abs(*wakeup - test::WriteBudget::kRefillMilliseconds) < 1.0,
           "the point was not woken when the write budget has room again");
   budget.refill();
-  require(!writes.run(budget.now, false) && process.shelf->disk.size() == 1 &&
+  require(!writes.run(budget.now, kCopiesDemanded, false) && process.shelf->disk.size() == 1 &&
               process.tier.demotions == 2,
           "a due point waited once the write budget had room");
   process.tier.complete();
-  require(process.cache.pollTransfers() && writes.run(budget.now, false) &&
+  require(process.cache.pollTransfers() && writes.run(budget.now, kCopiesDemanded, false) &&
               writes.snapshot().durable == 1,
           "the point did not become durable once its writes landed");
 
@@ -1222,10 +1224,10 @@ void testCopiesWaitWhileMemoryIsAwaited() {
     process.publish(point);
     writes.published(point, WriteBehind::kMinimumTokens, 0.0);
     const uint32_t demotions = process.tier.demotions;
-    require(!writes.run(kDelay, true) && process.tier.demotions == demotions &&
+    require(!writes.run(kDelay, kCopiesDemanded, true) && process.tier.demotions == demotions &&
                 writes.snapshot().waiting == 1,
             "a point was copied ahead while a request waited for memory");
-    require(!writes.run(kDelay + 1, false) && process.tier.demotions == demotions + 1,
+    require(!writes.run(kDelay + 1, kCopiesDemanded, false) && process.tier.demotions == demotions + 1,
             "the point was not copied once the wait ended");
   }
 }
@@ -1320,6 +1322,8 @@ void testTemporaryPointsWaitForTheirRequests() {
     Process process(persistent);
     runShortOfMemory(process);
     WriteBehind writes(process.cache);
+    // The engine's step before the points: memory demands copies.
+    static_cast<void>(writes.run(0.0, kCopiesDemanded, false));
     const std::vector<uint64_t> used = process.cachePrompt(1, promptOf(1000, 2));
     process.publish(used[1]);
     StateUse use = process.cache.useState(used[1]);
@@ -1328,23 +1332,23 @@ void testTemporaryPointsWaitForTheirRequests() {
     process.publish(unused);
     writes.published(unused, WriteBehind::kMinimumTokens, 1.0);
     if (persistent) {
-      require(writes.nextWakeup() == kDelay && !writes.run(kDelay, false) && process.tier.demotions == 3,
+      require(writes.nextWakeup() == kDelay && !writes.run(kDelay, kCopiesDemanded, false) && process.tier.demotions == 3,
               "a persistent tier did not copy a point in use");
       continue;
     }
-    require(writes.nextWakeup() == kDelay + 1 && !writes.run(kDelay + 1, false) &&
+    require(writes.nextWakeup() == kDelay + 1 && !writes.run(kDelay + 1, kCopiesDemanded, false) &&
                 process.tier.demotions == 2 && writes.snapshot().waiting == 2,
             "the point in use was copied, or held back the one after it");
     process.tier.complete();
-    require(process.cache.pollTransfers() && writes.run(kDelay + 2, false) &&
+    require(process.cache.pollTransfers() && writes.run(kDelay + 2, kCopiesDemanded, false) &&
                 writes.snapshot().durable == 1 && writes.snapshot().waiting == 1 &&
                 !writes.nextWakeup(),
             "the point after the one in use was not copied, or the one in use woke the queue");
     use.reset();
-    require(writes.nextWakeup() == kDelay && !writes.run(kDelay + 3, false) && process.tier.demotions == 4,
+    require(writes.nextWakeup() == kDelay && !writes.run(kDelay + 3, kCopiesDemanded, false) && process.tier.demotions == 4,
             "the point was not copied once its request ended");
     process.tier.complete();
-    require(process.cache.pollTransfers() && writes.run(kDelay + 4, false) &&
+    require(process.cache.pollTransfers() && writes.run(kDelay + 4, kCopiesDemanded, false) &&
                 writes.snapshot().durable == 2 && !writes.snapshot().waiting,
             "the point whose request ended did not get its copies");
     require(process.cache.evictAll(ReclaimClass::Ordinary).madeProgress &&
@@ -1364,97 +1368,6 @@ void testTemporaryPointsWaitForTheirRequests() {
     writes.published(closed, WriteBehind::kMinimumTokens, kDelay);
     require(writes.snapshot().waiting == 1, "a tier that takes no writes queued a point");
   }
-}
-
-// Until the engine's claims weigh copies ahead, a temporary tier copies
-// points ahead only within kValueHorizonSeconds of a reclaim that reached
-// cache a copy would have let go at once: a due point waits, nothing of it
-// written, until a reclaim has written cache to the SSD, and is copied then
-// if it is still its conversation's newest; one that a later point of its
-// conversation superseded meanwhile is dropped unwritten. Once
-// kValueHorizonSeconds have passed without another such reclaim, points
-// wait again, and the next one, a leaf demoted, lets them be copied once its
-// write has landed. A reclaim that takes cache through the copy it has
-// reached nothing uncopied: it keeps no copies going.
-void testTemporaryCopiesFollowReclaimsOfUncopiedCache() {
-  constexpr double kDelay = WriteBehind::kDelayMilliseconds;
-  constexpr double kHorizon = kValueHorizonSeconds * 1000.0;
-  Process process(false);
-  WriteBehind writes(process.cache);
-  // The oldest conversation, whose state a reclaim takes first.
-  const uint64_t oldest = process.cachePrompt(1, promptOf(9000, 1))[0];
-  process.publish(oldest);
-  std::vector<uint32_t> prompt = promptOf(1000, 2);
-  const uint64_t first = process.cachePrompt(2, prompt)[1];
-  process.publish(first);
-  writes.published(first, WriteBehind::kMinimumTokens, 0.0);
-  require(!writes.run(kDelay, false) && !writes.nextWakeup() && !process.tier.demotions &&
-              process.shelf->disk.empty() && writes.snapshot().waiting == 1,
-          "a point was copied ahead before memory ran short");
-  // The conversation goes on while nothing is copied.
-  const std::vector<uint32_t> more = promptOf(2000, 1);
-  prompt.insert(prompt.end(), more.begin(), more.end());
-  const uint64_t next = process.cachePrompt(3, prompt)[2];
-  process.publish(next);
-  writes.published(next, WriteBehind::kMinimumTokens, kDelay);
-  require(writes.snapshot().waiting == 1 && writes.snapshot().unneeded == 1,
-          "a superseded point kept waiting for memory to run short");
-  // Memory runs short: a reclaim writes the oldest state as it leaves RAM.
-  require(process.cache.reclaimOneState(StateClass::Ordinary, false) &&
-              process.cache.pollTransfers() && !process.cache.stateResident(oldest) &&
-              process.shelf->disk.size() == 1,
-          "the reclaim did not write the oldest state");
-  require(!writes.run(2 * kDelay, false) && process.tier.demotions == 3 && process.shelf->disk.size() == 2,
-          "the newest point was not copied once memory ran short");
-  process.tier.complete();
-  require(process.cache.pollTransfers() && writes.run(2 * kDelay + 1, false) &&
-              writes.snapshot().durable == 1 && !writes.snapshot().waiting,
-          "the newest point did not get its copies");
-  // No reclaim for kValueHorizonSeconds: a point waits again.
-  const uint64_t later = process.cachePrompt(4, promptOf(3000, 1))[0];
-  process.publish(later);
-  writes.published(later, WriteBehind::kMinimumTokens, 2 * kDelay + 1);
-  require(!writes.run(2 * kDelay + kHorizon, false) && !writes.nextWakeup() &&
-              process.tier.demotions == 3 && writes.snapshot().waiting == 1,
-          "a point was copied ahead after memory had stopped running short");
-  // A reclaim demotes the oldest leaf: once that write has landed, the point
-  // that waited is copied.
-  require(process.cache.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::Ordinary)
-                  .madeProgress &&
-              process.tier.demotions == 4,
-          "the reclaim did not demote the oldest leaf");
-  require(!writes.run(2 * kDelay + kHorizon + 1, false) && process.tier.demotions == 4,
-          "a point was copied beside a reclaim's demotion");
-  process.tier.complete();
-  require(process.cache.pollTransfers() && !writes.run(2 * kDelay + kHorizon + 2, false) &&
-              process.tier.demotions == 5 && process.shelf->disk.size() == 3,
-          "the point that waited was not copied once memory ran short again");
-  process.tier.complete();
-  require(process.cache.pollTransfers() && writes.run(2 * kDelay + kHorizon + 3, false) &&
-              writes.snapshot().durable == 2 && !writes.snapshot().waiting,
-          "the point that waited did not get its copies");
-
-  // Reclaims that find what they take copied write nothing and keep no
-  // copies going: a copied point's state leaves through its copy, and a
-  // point published past the window the last write opened waits.
-  Process copied(false);
-  runShortOfMemory(copied);
-  WriteBehind behind(copied.cache);
-  const uint64_t point = copied.cachePrompt(1, promptOf(1000, 1))[0];
-  copied.publish(point);
-  behind.published(point, WriteBehind::kMinimumTokens, 0.0);
-  require(!behind.run(kDelay, false) && copied.tier.demotions == 2, "the point was not copied");
-  copied.tier.complete();
-  require(copied.cache.pollTransfers() && behind.run(kDelay + 1, false) &&
-              copied.cache.reclaimOneState(StateClass::Ordinary, false) &&
-              !copied.cache.stateResident(point) && copied.shelf->disk.size() == 2,
-          "the copied state did not leave through its copy");
-  const uint64_t after = copied.cachePrompt(2, promptOf(2000, 1))[0];
-  copied.publish(after);
-  behind.published(after, WriteBehind::kMinimumTokens, kHorizon);
-  require(!behind.run(kHorizon + kDelay, false) && copied.tier.demotions == 2 &&
-              behind.snapshot().waiting == 1,
-          "a reclaim through a copy kept the copies going");
 }
 
 // A temporary tier copies points ahead on the memory's demand, not for a
@@ -1533,40 +1446,6 @@ void testCopyDemandCountsOnlyWhatGoesAtOnce() {
           "a point was copied ahead though what goes at once held the demand");
   require(!writes.run(kDelay, atOnce + 1, false) && process.tier.demotions == 1,
           "a demand beyond what goes at once copied no point");
-}
-
-// Until the engine's claims weigh copies ahead, a reclaim that only passes
-// over cache a copy would have let go at once keeps a temporary tier's
-// copies going as one that writes it does: the exchange for the expert
-// store, which starts no write and waits for none, passes over the states
-// that need a write and the leaves that need a demotion, and a point is
-// copied within kValueHorizonSeconds after, none after that.
-void testCopiesFollowReclaimsThatPassOverUncopiedCache() {
-  constexpr double kDelay = WriteBehind::kDelayMilliseconds;
-  constexpr double kHorizon = kValueHorizonSeconds * 1000.0;
-  Process process(false);
-  WriteBehind writes(process.cache);
-  process.publish(process.cachePrompt(1, promptOf(9000, 2))[1]);
-  const uint64_t point = process.cachePrompt(2, promptOf(1000, 1))[0];
-  process.publish(point);
-  writes.published(point, WriteBehind::kMinimumTokens, 0.0);
-  require(!writes.run(kDelay, false) && !process.tier.demotions && writes.snapshot().waiting == 1,
-          "a point was copied ahead before a reclaim reached uncopied cache");
-  const RestoredChains none;
-  while (process.cache.reclaimForExchange(none).madeProgress) {
-  }
-  require(!process.tier.demotions && process.shelf->disk.empty() && process.cache.stateResident(point),
-          "the exchange wrote the cache it passed over, or took the resume point");
-  require(!writes.run(kDelay + 1, false) && process.tier.demotions == 1 && process.shelf->disk.size() == 1,
-          "a reclaim that passed over uncopied cache started no copies ahead");
-  process.tier.complete();
-  require(process.cache.pollTransfers() && writes.run(kDelay + 2, false) && writes.snapshot().durable == 1,
-          "the point did not get its copies");
-  const uint64_t later = process.cachePrompt(3, promptOf(3000, 1))[0];
-  process.publish(later);
-  writes.published(later, WriteBehind::kMinimumTokens, kDelay + 2);
-  require(!writes.run(kDelay + 2 + kHorizon, false) && process.tier.demotions == 1 && writes.snapshot().waiting == 1,
-          "copies went on past kValueHorizonSeconds after the last reclaim reached uncopied cache");
 }
 
 // A Spill request's pages are written through with the labels a persistent
@@ -1789,10 +1668,8 @@ int main() {
     testRefusedDemotionTakesTheLeafBesideCopiesAhead();
     testCopiesAheadOfSpilledPagesArePending();
     testTemporaryPointsWaitForTheirRequests();
-    testTemporaryCopiesFollowReclaimsOfUncopiedCache();
     testCopiesFollowDemandNotAWindow();
     testCopyDemandCountsOnlyWhatGoesAtOnce();
-    testCopiesFollowReclaimsThatPassOverUncopiedCache();
     testWriteThroughCopiesAreRestorePoints();
     testRecomputedChainsStayWhole();
     testCommittedPagesTakeTheSpilledChainOfAStateInRam();

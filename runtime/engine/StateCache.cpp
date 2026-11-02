@@ -258,35 +258,12 @@ bool StateCache::contains(uint64_t kvBlock) const noexcept {
   return found != entries_.end() && !found->second.invalid;
 }
 
-uint32_t StateCache::freedWithoutWrites(std::vector<uint64_t> &staying,
-                                        std::span<const uint64_t> kept) const {
-  const uint64_t resume = resumePoint();
-  uint32_t freed = 0;
-  for (const RecencyOrder *order : {&checkpoints_, &ordinary_}) {
-    for (auto state = order->oldest(); state; state = order->next(*state)) {
-      // The reclaim passes over a kept state to the next of its class.
-      if (std::ranges::find(kept, state->id) != kept.end())
-        continue;
-      const Entry &entry = entries_.at(state->id);
-      if (state->id == resume || (!entry.disk && entry.ram->canOffload(inUse(state->id))))
-        staying.push_back(state->id);
-      else
-        ++freed;
-    }
-  }
-  for (const auto &[kvBlock, entry] : entries_)
-    if (entry.ram && (entry.pins || entry.invalid || persisting(kvBlock)))
-      staying.push_back(kvBlock);
-  return freed;
-}
-
 uint64_t StateCache::resumePoint() const noexcept {
   // Speculative protection keeps the newest ordinary publication, such as
   // the point of a request that just finished, and a checkpoint only without
   // one: checkpoints can survive cancellation but remain disposable. A state
-  // in use needs no such protection: a pass that nothing waits for takes
-  // nothing in use (MemoryReclaimDirective::upTo), and other work takes it
-  // after everything else.
+  // in use needs no such protection: only a claim that reaches InUse takes
+  // it (ReclaimClass), after everything else.
   std::optional<CacheEvictionCandidate> newest = ordinary_.newest();
   if (!newest)
     newest = checkpoints_.newest();
@@ -396,9 +373,6 @@ StateEviction StateCache::reclaim(uint64_t kvBlock, Unwritten unwritten) {
     return {false, true};
   // One write at a time, of a class the tier takes now.
   const bool writable = !entry.disk && entry.ram->canOffload(inUse(kvBlock));
-  uncopiedReached_ += writable;
-  if (writable && unwritten == Unwritten::Stay)
-    return {};
   if (writable && pending_ && unwritten != Unwritten::Drop)
     return {false, true};
   if (writable) {
@@ -443,8 +417,6 @@ StateEviction StateCache::reclaimOutcome(uint64_t kvBlock, Unwritten unwritten) 
   if (persisting(kvBlock))
     return {false, true};
   const bool writable = reclaimWrites(kvBlock);
-  if (writable && unwritten == Unwritten::Stay)
-    return {};
   if (writable && pending_ && unwritten != Unwritten::Drop)
     return {false, true};
   return {true};

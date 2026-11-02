@@ -2,6 +2,7 @@
 
 #include "TestKvTier.hpp"
 #include "engine/Cache.hpp"
+#include "engine/MemoryLedger.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -94,5 +95,34 @@ inline std::vector<uint64_t> indexBlocks(engine::Cache &cache, uint64_t requestI
   }
   return blocks;
 }
+
+// What the ledger takes of the cache for a claim of `spec` that lacks
+// `need` (MemoryLedger::free over its first source): the cache's first unit
+// for it, taken; Short when it has none.
+inline engine::FreeResult takeFirst(engine::Cache &cache, const engine::ClaimSpec &spec, const engine::Need &need) {
+  const engine::VictimQuery query{.claim = &spec, .need = need};
+  const std::optional<engine::Victim> unit = cache.peek(query, nullptr);
+  return unit ? cache.take(query, *unit) : engine::FreeResult{};
+}
+
+// What the ledger frees for a claim of `spec` that lacks `need`, the cache
+// its only source (MemoryLedger::free): nothing, Pending, while what the
+// cache's transfers return covers the need, as the engine's claims wait.
+inline engine::FreeResult freeFromCache(engine::Cache &cache, const engine::ClaimSpec &spec,
+                                        const engine::Need &need) {
+  engine::MemoryLedger ledger;
+  ledger.addSource(cache);
+  ledger.setReturning([&cache] { return cache.returning(); },
+                      [&cache](uint64_t requestId) { return cache.returningFor(requestId); });
+  const engine::ClaimId claim = ledger.open(spec);
+  const engine::FreeResult result = ledger.free(claim, need, 0, false, false);
+  ledger.close(claim);
+  return result;
+}
+
+// The claim of in-service work that reaches what is in use, as a request's
+// KV growth is.
+inline constexpr engine::ClaimSpec kInServiceGrowth{.cls = engine::ClaimClass::InService,
+                                                    .reach = engine::ReclaimClass::InUse};
 
 } // namespace splash::test

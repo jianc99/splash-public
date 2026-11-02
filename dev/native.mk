@@ -783,7 +783,8 @@ $(TEST_SLOT_RECYCLER) $(TEST_SLOT_RECYCLER_ASAN) $(TEST_SLOT_RECYCLER_TSAN): \
 $(TEST_PERSISTENT_CACHE) $(TEST_PERSISTENT_CACHE_ASAN) $(TEST_PERSISTENT_CACHE_TSAN): \
 		$(CACHE_SOURCES) runtime/model/SlotFile.cpp dev/tests/engine/persistent_cache_test.cpp
 $(TEST_ENGINE_CACHE_TEST) $(TEST_ENGINE_CACHE_ASAN) $(TEST_ENGINE_CACHE_TSAN): \
-		$(CACHE_SOURCES) runtime/model/SlotFile.cpp dev/tests/engine/engine_cache_test.cpp
+		$(CACHE_SOURCES) runtime/engine/MemoryLedger.cpp runtime/model/SlotFile.cpp \
+		dev/tests/engine/engine_cache_test.cpp
 $(TEST_CACHE_PROPERTY) $(TEST_CACHE_PROPERTY_ASAN) $(TEST_CACHE_PROPERTY_TSAN): \
 		$(CACHE_SOURCES) runtime/model/SlotFile.cpp dev/tests/engine/cache_property_test.cpp
 $(TEST_PROTOCOL_TEST) $(TEST_PROTOCOL_ASAN) $(TEST_PROTOCOL_TSAN): \

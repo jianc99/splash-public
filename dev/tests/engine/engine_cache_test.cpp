@@ -125,11 +125,10 @@ TokenAdmission admitLikeEngine(engine::Cache &cache,
                                const std::function<TokenAdmission()> &attempt) {
   TokenAdmission admission = attempt();
   while (admission.failure == TokenAdmissionFailure::Denied) {
-    const CacheReclaimResult step =
-        cache.reclaimForPages(admission.additionalPages, CacheReclaimMode::KeepExtents,
-                              ReclaimClass::InUse);
-    if (!step.madeProgress) {
-      if (step.pending)
+    const FreeResult step = test::freeFromCache(cache, test::kInServiceGrowth,
+                                                {.pages = admission.additionalPages, .form = admission.form});
+    if (step.outcome != FreeOutcome::Met) {
+      if (step.outcome == FreeOutcome::Pending)
         admission.failure = TokenAdmissionFailure::Pending;
       break;
     }
@@ -1460,37 +1459,6 @@ void testRestoredStateKeepsItsDiskCopy() {
           "the disk copy did not remain after the RAM copy left");
 }
 
-// The exchange for the expert store starts no write: an older checkpoint
-// that needs one stays, and the exchange takes a newer one past it, which a
-// restore brought back to RAM beside its copy. The newest ordinary state, the
-// resume point, stays too.
-void testExchangePassesOverACheckpointThatNeedsAWrite() {
-  CacheFixture fixture;
-  auto control = std::make_shared<TransferControl>();
-  control->ready = true;
-  fixture.cache.publishCompositeState(fixture.blocks[2], std::make_shared<TieredState>(control), true);
-  require(fixture.cache.reclaimOneState(StateClass::Checkpoint, false).made && fixture.cache.pollTransfers(),
-          "the fixture's checkpoint was not written");
-  fixture.cache.publishCompositeState(fixture.blocks[1], std::make_shared<TieredState>(control), true);
-  {
-    auto lookup = fixture.lookup(97);
-    PromotionTicket ticket;
-    fixture.cache.promoteState(lookup, ticket);
-    require(ticket.copies == 1, "the fixture's checkpoint was not restored to RAM");
-  }
-  fixture.publish(3);
-  const RestoredChains none;
-  const uint64_t offloads = fixture.cache.snapshot().stateCache.offloads;
-  require(fixture.cache.exchangeable(none).states == 1,
-          "the exchange did not count the checkpoint past the one that needs a write");
-  while (fixture.cache.reclaimForExchange(none).madeProgress) {
-  }
-  require(!fixture.cache.stateResident(fixture.blocks[2]) && fixture.cache.stateResident(fixture.blocks[1]) &&
-              fixture.cache.stateResident(fixture.blocks[3]) &&
-              fixture.cache.snapshot().stateCache.offloads == offloads,
-          "the exchange did not take the copied checkpoint alone, or wrote one");
-}
-
 void testDiskCheckpointRamAccounting() {
   for (bool republish : {false, true}) {
     CacheFixture fixture;
@@ -2722,43 +2690,6 @@ void testBusyTierPreservesDiskVictim() {
             "disk replacement did not resume once the tier had room");
     tier.complete();
     require(cache.pollTransfers(), "resumed demotion did not finish");
-  }
-}
-
-// A denied admission makes room in one reclaim step: it evicts the leaves
-// that cover the shortfall and no more, and stops once an evicted state has
-// returned memory, which may let the retry grow the pool instead.
-void testReclaimForPagesCoversTheShortfall() {
-  for (bool withState : {false, true}) {
-    test::TestKvStorage storage{16, 100, 1};
-    storage.budgetPages = 8;
-    KvPool pool{storage, 0};
-    engine::Cache cache{pool, nullptr, nullptr};
-    // Eight one-page leaves fill the budget. With states, each holds one, so
-    // none is dead KV, and the first leaf's state is the oldest victim.
-    for (uint32_t leaf = 0; leaf < 8; ++leaf) {
-      cache.beginRequest(leaf + 1);
-      require(admitTokens(cache, leaf + 1, 32).granted(), "leaf KV admission failed");
-      const uint64_t block = test::publishBlocks(
-          cache, leaf + 1, std::vector<uint32_t>(33, 100 + leaf), 32);
-      cache.endRequest(leaf + 1);
-      if (withState)
-        cache.publishCompositeState(block, std::make_shared<TestState>(100), false);
-    }
-    require(pool.freePageCount() == 0 && cache.snapshot().pool.pagesPrefix == 8,
-            "fixture geometry changed");
-    const CacheReclaimResult reclaimed =
-        cache.reclaimForPages(3, CacheReclaimMode::KeepExtents, ReclaimClass::InUse);
-    if (withState) {
-      require(reclaimed.madeProgress && pool.freePageCount() == 0 &&
-                  cache.snapshot().pool.pagesPrefix == 8 &&
-                  cache.snapshot().stateCache.entries == 7,
-              "the reclaim step went on evicting after a state returned memory");
-    } else {
-      require(reclaimed.madeProgress && pool.freePageCount() == 3 &&
-                  cache.snapshot().pool.pagesPrefix == 5,
-              "the reclaim step did not evict exactly the shortfall");
-    }
   }
 }
 
@@ -4372,27 +4303,6 @@ void testPublicationReleasesTheExtentItEmpties() {
   cache.endRequest(1);
 }
 
-// The reclaim for memory the governor funds makes progress only once memory
-// has come back, and reports the KV it evicts before then apart: its pages
-// are free for other KV. Here another conversation's chain fills the extent
-// that, emptied, stays as the runway, and nothing else can go.
-void testMemoryReclaimReportsTheKvItEvicts() {
-  test::TestKvStorage storage(8, 4096, 4);
-  KvPool pool(storage, 0);
-  engine::Cache cache(pool, nullptr, nullptr);
-  // A running request holds the first extent, the chain fills the second.
-  static_cast<void>(cacheChain(cache, 1, 4, true));
-  static_cast<void>(cacheChain(cache, 2, 4));
-  require(storage.allocatedPages() == 8 && pool.freePageCount() == 0, "fixture geometry changed");
-  const CacheReclaimResult reclaimed = cache.reclaimForMemory(ReclaimClass::Ordinary, true);
-  require(!reclaimed.madeProgress && !reclaimed.pending && reclaimed.evictedKv &&
-              pool.freePageCount() == 4 && storage.releasedExtents == 0,
-          "a reclaim for memory did not report the KV it evicted without giving memory back");
-  require(!cache.reclaimForMemory(ReclaimClass::Ordinary, true).evictedKv,
-          "a reclaim for memory that evicted nothing reported KV");
-  cache.endRequest(1);
-}
-
 // Spilling. A cache whose requests may spill: its pool's extents hold four
 // pages, 100 bytes a Full page and 10 an Index page, one extent of each form
 // allocated from the start (the Index one the runway spilling draws on, as
@@ -4653,9 +4563,8 @@ void testFullShortfallReleasesEmptyIndexExtents() {
   while (spill.cache.spillSnapshot().spilledPages)
     require(spill.cache.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::InUse).madeProgress,
             "an idle spilled leaf did not go");
-  const CacheReclaimResult released =
-      spill.cache.reclaimForPages(1, CacheReclaimMode::KeepExtents, ReclaimClass::InUse);
-  require(released.madeProgress && released.reclaimedBytes == 80 && spill.storage.releasedExtents == 2 &&
+  const FreeResult released = test::takeFirst(spill.cache, test::kInServiceGrowth, {.pages = 1});
+  require(released.outcome == FreeOutcome::Met && released.nowBytes == 80 && spill.storage.releasedExtents == 2 &&
               spill.pool.freePageCount(kv::PageForm::Index) == 4,
           "a Full shortfall did not release the empty Index extents past the runway first");
 }
@@ -4672,9 +4581,9 @@ void testIndexShortfallCompactsOnlyFullExtents() {
   for (uint32_t page : std::span(index.pages).first(3))
     spill.pool.releasePage(page, false);
   spill.storage.growthBlocked = true;
-  const CacheReclaimResult reclaimed = spill.cache.reclaimForPages(
-      8, CacheReclaimMode::KeepExtents, ReclaimClass::InUse, kv::PageForm::Index);
-  require(!reclaimed.madeProgress && spill.storage.copies.empty() &&
+  const FreeResult reclaimed =
+      test::takeFirst(spill.cache, test::kInServiceGrowth, {.pages = 8, .form = kv::PageForm::Index});
+  require(reclaimed.outcome != FreeOutcome::Met && spill.storage.copies.empty() &&
               spill.pool.snapshot().extentCompactions == 0,
           "an Index shortfall compacted an Index extent");
   for (uint32_t page : std::span(index.pages).last(2))
@@ -4789,9 +4698,9 @@ void testWritesShortOfARefusalHoldNothingBack() {
   require(admission.failure == TokenAdmissionFailure::Denied,
           "the writes through covered more than they free");
   while (admission.failure == TokenAdmissionFailure::Denied) {
-    const CacheReclaimResult reclaimed = spill.cache.reclaimForPages(
-        admission.additionalPages, CacheReclaimMode::KeepExtents, ReclaimClass::InUse);
-    require(reclaimed.madeProgress && !reclaimed.pending,
+    const FreeResult reclaimed =
+        test::takeFirst(spill.cache, test::kInServiceGrowth, {.pages = admission.additionalPages});
+    require(reclaimed.outcome == FreeOutcome::Met,
             "a refused page allocation waited for writes through that cannot cover it");
     admission = spill.cache.ensureTokens(3, tokens);
   }
@@ -4824,8 +4733,12 @@ void testMemoryReclaimEmptiesAnExtentBesideWritesThatSpill() {
               spill.cache.pendingPages(kv::PageForm::Full) == 2 && spill.pool.freePageCount() == 1 &&
               spill.cache.reusablePages(ReclaimClass::Ordinary) == 5,
           "fixture geometry changed");
-  const CacheReclaimResult reclaimed = spill.cache.reclaimForMemory(ReclaimClass::Ordinary, false);
-  require(reclaimed.reclaimedBytes == 400 && spill.storage.releasedExtents == 1 &&
+  // A device need of in-service work within Ordinary, its state buffers
+  // counted too (Cache::walkFor).
+  const FreeResult reclaimed =
+      test::takeFirst(spill.cache, {.cls = ClaimClass::InService, .reach = ReclaimClass::Ordinary},
+                      {.bytes = 400, .stateBuffers = 1});
+  require(reclaimed.nowBytes == 400 && spill.storage.releasedExtents == 1 &&
               spill.cache.pendingPages(kv::PageForm::Full) == 2,
           "the reclaim for memory stopped short of the extent an idle chain empties beside writes "
           "that spill");
@@ -5761,9 +5674,12 @@ void testFullShortfallsTrimBeforeAnyLeafGoes() {
   cache.beginRequest(2);
   const TokenAdmission refused = cache.ensureTokens(2, 12 * KvCache::pageTokens);
   require(!refused.granted() && refused.form == kv::PageForm::Full, "the shortfall setup was granted");
-  const CacheReclaimResult checkpoint =
-      cache.reclaimForPages(refused.additionalPages, CacheReclaimMode::KeepExtents, ReclaimClass::InUse);
-  require(checkpoint.madeProgress && checkpoint.evictedState && windowed.slimPages() == 6 &&
+  // The refusal's units until a state went.
+  while (cache.snapshot().stateCache.entries == 2)
+    require(test::takeFirst(cache, test::kInServiceGrowth, {.pages = refused.additionalPages}).outcome ==
+                FreeOutcome::Met,
+            "the refusal took no state");
+  require(windowed.slimPages() == 6 &&
               cache.snapshot().stateCache.entries == 1 && cache.snapshot().stateCache.checkpointEntries == 0,
           "the checkpoint did not go first, or its tail was not trimmed");
   require(admitTokens(cache, 2, 12 * KvCache::pageTokens).granted() && windowed.slimPages() == 8 &&
@@ -5796,9 +5712,12 @@ void testFullShortfallsKeepTheTailsOfStatesTheSsdKeeps() {
   cache.beginRequest(2);
   const TokenAdmission refused = cache.ensureTokens(2, 12 * KvCache::pageTokens);
   require(!refused.granted() && refused.form == kv::PageForm::Full, "the shortfall setup was granted");
-  const CacheReclaimResult checkpoint =
-      cache.reclaimForPages(refused.additionalPages, CacheReclaimMode::KeepExtents, ReclaimClass::InUse);
-  require(checkpoint.madeProgress && checkpoint.evictedState && cache.pollTransfers(),
+  // The refusal's units until the checkpoint's write started.
+  while (control->slots == 0)
+    require(test::takeFirst(cache, test::kInServiceGrowth, {.pages = refused.additionalPages}).outcome ==
+                FreeOutcome::Met,
+            "the refusal wrote no checkpoint");
+  require(cache.pollTransfers(),
           "the checkpoint was not written to the SSD");
   const auto states = cache.snapshot().stateCache;
   require(states.entries == 2 && states.checkpointEntries == 1 && states.diskBytes == 100 && control->slots == 1 &&
@@ -6592,10 +6511,8 @@ int main() {
     testInUsePublicationStartsNoDemotion();
     testInUsePublicationTakesNoKvWhenNoExtentCanEmpty();
     testPublicationReleasesTheExtentItEmpties();
-    testMemoryReclaimReportsTheKvItEvicts();
     testLargeSharedDiskRestore();
     testRefusedRestoresStopAtTheFirstRefusal();
-    testReclaimForPagesCoversTheShortfall();
     testPageReuseTakesKvBeforeStates();
     testLookupKeepsADiskChainsResidentBoundaryWarm();
     testRestoreKeepsTheBlockItExtends();
@@ -6629,7 +6546,6 @@ int main() {
     testRepublicationKeepsTheDiskCopy();
     testLostStatesAreCounted();
     testRestoredStateKeepsItsDiskCopy();
-    testExchangePassesOverACheckpointThatNeedsAWrite();
     testDiskReplacementSpansStatesAndKv();
     testDiskPublicationLifecycle();
     testDiskPublicationFailure();

@@ -9,7 +9,7 @@ void WriteBehind::published(uint64_t block, uint32_t tokens, double now) {
     return;
   // While copies wait for demand, the queue keeps only the points their
   // conversations still resume from.
-  copying_ = copying(now);
+  copying_ = copying();
   if (!copying_)
     std::erase_if(waiting_, [&](const Point &point) {
       if (cache_.newestPoint(point.block))
@@ -40,19 +40,7 @@ bool WriteBehind::settle(PersistStatus status) {
   return false;
 }
 
-bool WriteBehind::reachedRecently(double now) {
-  if (const uint64_t reached = cache_.uncopiedReached(); reached != uncopiedReached_) {
-    uncopiedReached_ = reached;
-    reachedAt_ = now;
-  }
-  return reachedAt_ && now - *reachedAt_ < kValueHorizonSeconds * 1000.0;
-}
-
-bool WriteBehind::copying(double now) {
-  if (cache_.persistent())
-    return true;
-  return demandBytes_ ? *demandBytes_ != 0 : reachedRecently(now);
-}
+bool WriteBehind::copying() const noexcept { return cache_.persistent() || demandBytes_ != 0; }
 
 bool WriteBehind::demanded(uint64_t demandBytes) const {
   // What a growth that displaces cache could take now, which starts no
@@ -74,14 +62,8 @@ bool WriteBehind::inUse(uint64_t block) const noexcept {
 
 bool WriteBehind::run(double now, uint64_t demandBytes, bool claimWaiting) {
   demandBytes_ = demandBytes;
-  copying_ = copying(now);
+  copying_ = copying();
   return step(now, claimWaiting, [&] { return cache_.persistent() || demanded(demandBytes); });
-}
-
-bool WriteBehind::run(double now, bool memoryAwaited) {
-  demandBytes_.reset();
-  copying_ = copying(now);
-  return step(now, memoryAwaited, [] { return true; });
 }
 
 bool WriteBehind::step(double now, bool claimWaiting, const std::function<bool()> &copies) {
