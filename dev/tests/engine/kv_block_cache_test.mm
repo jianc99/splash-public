@@ -24,6 +24,7 @@
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
 #include "model/KvBlockCache.hpp"
+#include "model/ModelPools.hpp"
 #include "ops/PagedAttention.hpp"
 
 #import <Foundation/Foundation.h>
@@ -357,6 +358,92 @@ void growsAndReleases(MetalBackend &backend) {
   std::cout << "kv_block_cache_test: growth and release PASS\n";
 }
 
+// A lane's floor allocates what laneShortfallBytes() says it lacks, nothing
+// once the floors' extents hold it. Growth under a passed admission consults
+// it, not the cache's, and a refusal changes nothing. As an elastic pool
+// (model::HotBlocksPool): the lanes' floors are its floor and an extent its
+// unit, given back above the floors one at a time or all at once, counted
+// with the time it took; it grows toward its target while a lane holds a
+// floor; its value is its resolves' hits and ghost hits, the bytes of the
+// blocks its layers gave up lately, and the read time of a block it missed.
+void growsAsAPool(MetalBackend &backend) {
+  const kv::Layout layout = layoutOf(kv::Format::Int8);
+  const uint64_t extent = extentBytes(layout);
+  uint64_t allocated = 0;
+  bool refuse = false;
+  KvBlockCache cache = makeCache(backend, layout, 4, [&](uint64_t bytes, const std::function<void()> &allocate) {
+    if (refuse) return metal::AllocationResult(metal::AllocationFailure::EngineBudget);
+    allocated += bytes;
+    return test::admitAll(bytes, allocate);
+  });
+  require(cache.extentBytes() == extent, "the cache's extent is not the pool's");
+  // One lane's floor is an extent, two lanes' two and three lanes' too.
+  for (const uint32_t lane : {0u, 1u, 2u}) {
+    const uint64_t shortfall = cache.laneShortfallBytes(lane);
+    allocated = 0;
+    require(shortfall == (lane == 2 ? 0 : extent) && cache.reserveLane(lane).granted() && allocated == shortfall &&
+                !cache.laneShortfallBytes(lane),
+            "lane " + std::to_string(lane) + "'s floor did not allocate its shortfall");
+  }
+  model::HotBlocksPool pool(cache);
+  model::PoolState state = pool.state();
+  require(state.name == "hot_kv" && state.floorBytes == 2 * extent && state.currentBytes == 2 * extent &&
+              state.capBytes == 4 * extent && !state.releaseUnitBytes && state.growUnitBytes == extent,
+          "the pool's state at its floors is not the cache's");
+  // A passed admission decides growth, whatever the cache's own says.
+  refuse = true;
+  const auto granting = [&](uint64_t bytes, const std::function<void()> &allocate) {
+    return test::admitAll(bytes, allocate);
+  };
+  require(static_cast<bool>(pool.grow(granting)) && cache.stats().bytes == 3 * extent,
+          "growth under a granting admission was refused by the cache's");
+  refuse = false;
+  const auto refusing = [](uint64_t, const std::function<void()> &) {
+    return metal::AllocationResult(metal::AllocationFailure::HostPressure);
+  };
+  require(pool.grow(refusing).failure == metal::AllocationFailure::HostPressure && cache.stats().bytes == 3 * extent,
+          "a refused growth under a passed admission changed the cache");
+  require(static_cast<bool>(pool.grow(test::admitAll)) && cache.stats().bytes == 4 * extent &&
+              !pool.state().growUnitBytes && static_cast<bool>(pool.grow(test::admitAll)) &&
+              cache.stats().bytes == 4 * extent,
+          "the pool grew past its target");
+  // Resolves in one extent's slots of a layer: a page set's blocks, its first
+  // half again (used again, kept), half as many other blocks, which evict
+  // the second half as ghosts, and the second half again, its claims ghost
+  // hits.
+  cache.releaseLane(1);
+  cache.releaseLane(2);
+  require(pool.release(UINT64_MAX) == 3 * extent && cache.stats().bytes == extent && !pool.state().releaseUnitBytes,
+          "everything above the floor did not go at once");
+  std::vector<KvPageSource> first(256), second(256);
+  for (uint32_t page = 0; page < 256; ++page) {
+    first[page] = {1 + page, copyOf(layout)};
+    second[page] = {1001 + page, copyOf(layout)};
+  }
+  const struct {
+    const std::vector<KvPageSource> &pages;
+    uint32_t first, end;
+  } turns[] = {{first, 0, 256}, {first, 0, 128}, {second, 0, 128}, {first, 128, 256}};
+  for (const auto &turn : turns) {
+    const auto stats = std::make_shared<KvReadStats>();
+    static_cast<void>(resolve(backend, cache, 0, {sourcesOf(turn.pages)}, {blocksOf(turn.first, turn.end)}, stats));
+    cache.mergeStats(*stats);
+  }
+  const model::PoolValue value = pool.value();
+  const model::KvBlockCacheStats stats = cache.stats();
+  require(value.hits == stats.reads.hits && value.ghostHits == stats.reads.ghostHits && value.ghostHits &&
+              value.ghostBytes == stats.ghostBytes && stats.ghostBytes &&
+              stats.ghostBytes <= extent / layout.attentionLayers && value.missMilliseconds > 0,
+          "the pool's value is not its resolves' hits, ghost hits, ghost bytes and miss time");
+  // Above the floor an extent at a time, counted.
+  require(static_cast<bool>(pool.grow(test::admitAll)) && static_cast<bool>(pool.grow(test::admitAll)) &&
+              pool.state().releaseUnitBytes == extent && pool.release(1) == extent &&
+              cache.stats().bytes == 2 * extent && pool.value().releasedBytes == 4 * extent &&
+              pool.value().releaseMilliseconds > 0,
+          "a release of one unit did not give back an extent, counted");
+  std::cout << "kv_block_cache_test: shortfall, admitted growth and the pool PASS\n";
+}
+
 void failsTheLanesOfUnreadBlocks(MetalBackend &backend) {
   const kv::Layout layout = layoutOf(kv::Format::Int8);
   KvBlockCache cache = makeCache(backend, layout, 2);
@@ -530,6 +617,7 @@ int main(int argc, const char *argv[]) {
       resolvesEntries(backend);
       readsAPagesMissesAtOnce(backend);
       growsAndReleases(backend);
+      growsAsAPool(backend);
       failsTheLanesOfUnreadBlocks(backend);
       attendsThroughLocations<int8_t>(backend, kv::Format::Int8);
       attendsThroughLocations<uint16_t>(backend, kv::Format::BFloat16);

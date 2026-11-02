@@ -33,13 +33,16 @@
 #include "TestChecks.hpp"
 #include "TestFiles.hpp"
 #include "TestMethodReplacement.hpp"
+#include "TestStderr.hpp"
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
 #include "model/ExpertStore.hpp"
 #include "model/GgufImageLayout.hpp"
 #include "model/Model.hpp"
+#include "model/ModelPools.hpp"
 #include "model/WeightLayout.hpp"
 #include "model/WeightSource.hpp"
+#include "model/WorkFormulas.hpp"
 #include "ops/MoE.hpp"
 
 #import <Foundation/Foundation.h>
@@ -48,6 +51,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -1172,6 +1176,142 @@ int streamedElastic(MetalBackend &backend, const MoeShape &shape, const std::fil
   return failures;
 }
 
+// The store as an elastic pool (model::ExpertStorePool) and what a prefill
+// load would read (ExpertStore::expectedPrefillReadBytes). The pool's state
+// is the store's statistics: its live bytes, its floor and cap, the next
+// chunk a shrink gives back and a regrow takes; release(1) gives the chunk
+// releaseAboveFloor() would, everything above the floor goes in one
+// compaction per size as releaseToFloor() would, and its value counts what
+// went and the time the compactions took, as the store logs it; a refused
+// grow changes nothing and a granted one takes the chunk it named. After the
+// shrinks, decode steps that miss experts they routed lately count ghost
+// hits over the bytes the ghosts span. A load's expected reads are the
+// distinct experts uniform routing routes times the share of the block's
+// experts not resident times an expert's native bytes: all of them on an
+// empty block, the share a long chunk left not resident, and within 15 % of
+// the experts the loads of seeded rows miss, block by block.
+int streamedPool(MetalBackend &backend, const MoeShape &shape, const std::filesystem::path &directory) {
+  const Model m = makeModel(backend, shape, Q5K, true);
+  ExpertFile file(m, directory / "experts.bin");
+  const uint64_t slots = 2 * shape.experts - shape.experts / 8, fixed = ExpertStore::fixedBytes(file.blocks, shape);
+  ExpertStoreOptions options = storeOptions(arenaBytes(m, slots) + kSpareBytes, file.blocks, shape);
+  options.floorBytes = fixed + arenaBytes(m, shape.experts);
+  options.elasticChunkBytes = arenaBytes(m, slots / 8);
+  ExpertStore store(backend, file.blocks, shape, options);
+  std::array<BlockMoeWeights, 2> streamed{m.weights, m.weights};
+  for (uint32_t block = 0; block < 2; ++block) store.bind(block, streamed[block]);
+  splash::model::ExpertStorePool pool(store);
+  int failures = 0;
+  const auto fail = [&](const std::string &what) {
+    printf("  expert pool %s FAIL\n", what.c_str());
+    ++failures;
+  };
+  uint64_t expertBytes = 0;
+  for (const Tensor &tensor : m.routed) expertBytes += tensor.native.size() / shape.experts;
+  const auto expected = [&](uint32_t rows) {
+    return splash::model::expectedDistinctExperts(rows, shape.expertsPerToken, shape.experts) * double(expertBytes);
+  };
+  // An empty store reads every routed expert.
+  for (const uint32_t rows : {1u, 9u, kMaximumRows})
+    if (const double bytes = double(store.expectedPrefillReadBytes(rows, 0, 2));
+        std::abs(bytes - 2 * expected(rows)) > 2)
+      fail("expects " + std::to_string(bytes) + " bytes for " + std::to_string(rows) + " rows of an empty store");
+  // The state and value are the store's.
+  const auto requireState = [&](const std::string &when) {
+    const ExpertStoreStats stats = store.stats();
+    const splash::model::PoolState state = pool.state();
+    if (state.name != "experts" || state.currentBytes != stats.liveBytes || state.capBytes != stats.capBytes ||
+        state.floorBytes != (stats.liveBytes ? stats.floorBytes : 0) || state.growUnitBytes != store.growthBytes())
+      fail(when + ": its state is not the store's");
+    return state;
+  };
+  Buffers b;
+  const auto load = [&](const MoePlan &plan, uint32_t block) {
+    freshRows(backend, b, shape);
+    static_cast<void>(runWeights(backend, streamed[block], b, plan));
+  };
+  // A long chunk of block 0 leaves its routed experts resident, block 1's
+  // none: block 0 expects the reads of the share it lacks.
+  load(prefillPlan(shape, kMaximumRows), 0);
+  const uint64_t resident = store.stats().resident;
+  if (std::abs(double(store.expectedPrefillReadBytes(kMaximumRows, 0, 1)) -
+               expected(kMaximumRows) * double(shape.experts - resident) / shape.experts) > 2 ||
+      std::abs(double(store.expectedPrefillReadBytes(kMaximumRows, 1, 2)) - expected(kMaximumRows)) > 2 ||
+      (resident == shape.experts && store.expectedPrefillReadBytes(kMaximumRows, 0, 1)))
+    fail("does not expect the reads of the share of a block's experts not resident (" + std::to_string(resident) +
+         " of " + std::to_string(shape.experts) + " resident)");
+  // Seeded rows' loads, the blocks taking turns, each evicting the other's
+  // experts: the misses they count against what each expected.
+  double expectedReads = 0, read = 0;
+  for (uint32_t step = 0; step < 16; ++step)
+    for (uint32_t block = 0; block < 2; ++block) {
+      const uint32_t rows = step % 2 ? 9 : 27;
+      const uint64_t before = store.stats().uses[0].read;
+      expectedReads += double(store.expectedPrefillReadBytes(rows, block, block + 1));
+      load(prefillPlan(shape, rows), block);
+      read += double(store.stats().uses[0].read - before) * double(expertBytes);
+    }
+  if (std::abs(read / expectedReads - 1.0) > 0.15)
+    fail("expected " + std::to_string(expectedReads) + " bytes for seeded loads that read " + std::to_string(read));
+  // Shrinks: one unit, then everything above the floor at once.
+  splash::model::PoolState state = requireState("at the cap");
+  if (state.growUnitBytes || !state.releaseUnitBytes) fail("at the cap grows or has no unit to give back");
+  ExpertStoreStats before = store.stats();
+  uint64_t given = 0;
+  const std::string logged = splash::test::capturedStderr([&] { given = pool.release(1); });
+  ExpertStoreStats after = store.stats();
+  const size_t in = logged.find(" in "), ms = logged.find(" ms:");
+  const double took = in != std::string::npos && ms != std::string::npos ? std::stod(logged.substr(in + 4)) : -1;
+  if (given != state.releaseUnitBytes || after.shrinks != before.shrinks + 1 ||
+      after.releasedBytes != before.releasedBytes + given ||
+      std::abs(after.releaseMilliseconds - before.releaseMilliseconds - took) > 0.051)
+    fail("release(1) gave back " + std::to_string(given) + " bytes in " +
+         std::to_string(after.releaseMilliseconds - before.releaseMilliseconds) +
+         " ms, not the chunk it named in the " +
+         std::to_string(took) + " ms the store logged");
+  state = requireState("after a release of one unit");
+  before = after;
+  const uint64_t aboveFloor = state.currentBytes - state.floorBytes;
+  given = pool.release(UINT64_MAX);
+  after = store.stats();
+  const splash::model::PoolValue value = pool.value();
+  if (given != aboveFloor || after.liveBytes != after.floorBytes || pool.state().releaseUnitBytes ||
+      after.releasedBytes != before.releasedBytes + given ||
+      !(after.releaseMilliseconds > before.releaseMilliseconds) ||
+      value.releasedBytes != after.releasedBytes || value.releaseMilliseconds != after.releaseMilliseconds ||
+      pool.release(1))
+    fail("release(UINT64_MAX) gave back " + std::to_string(given) + " bytes, not the " + std::to_string(aboveFloor) +
+         " above the floor at once, or counted it apart from the store");
+  // A refused grow changes nothing; a granted one takes the unit it named.
+  state = requireState("at the floor");
+  const auto refuse = [](uint64_t, const std::function<void()> &) -> AllocationResult {
+    return AllocationFailure::EngineBudget;
+  };
+  if (pool.grow(refuse).failure != AllocationFailure::EngineBudget || pool.state().currentBytes != state.currentBytes)
+    fail("a refused grow changed the store");
+  if (!pool.grow(splash::test::admitAll) || pool.state().currentBytes != state.currentBytes + state.growUnitBytes)
+    fail("a granted grow did not take the unit it named");
+  // Decode steps after the shrinks, the blocks taking turns, miss experts
+  // they routed lately.
+  const ExpertStoreStats ghostsBefore = store.stats();
+  for (uint32_t step = 0; step < 24; ++step)
+    for (uint32_t block = 0; block < 2; ++block) load(MoE::decodePlan(shape, 1 + step % 4, MoeConfig{}), block);
+  const splash::model::PoolValue ghosts = pool.value();
+  if (ghosts.ghostHits <= ghostsBefore.ghostHits || !ghosts.ghostBytes || ghosts.hits <= value.hits ||
+      !(ghosts.missMilliseconds > 0))
+    fail("decode steps after the shrinks counted " + std::to_string(ghosts.ghostHits - ghostsBefore.ghostHits) +
+         " ghost hits over " + std::to_string(ghosts.ghostBytes) + " bytes");
+  // Released, it holds nothing.
+  store.release();
+  if (pool.state().currentBytes || pool.state().floorBytes || pool.state().releaseUnitBytes ||
+      pool.state().growUnitBytes || pool.release(UINT64_MAX))
+    fail("released, it holds or gives something");
+  printf("streamed experts as a pool: state, release by unit and to the floor, grow, ghost hits and expected "
+         "reads %s\n",
+         failures ? "FAIL" : "ok");
+  return failures;
+}
+
 // A size's slot planes as the store's chunk layout takes them
 // (model/ExpertChunkLayout.hpp), gate's, up's and down's.
 splash::model::ExpertSlotPlanes slotPlanes(const Model &m) {
@@ -1659,6 +1799,7 @@ int main(int argc, const char *argv[]) {
                     streamedRefusal(backend, shape, directory.path()) +
                     streamedChunks(backend, shape, directory.path()) +
                     streamedElastic(backend, shape, directory.path()) +
+                    streamedPool(backend, shape, directory.path()) +
                     streamedElasticSizes(backend, shape, directory.path()) +
                     streamedStart(backend, shape, directory.path()) +
                     streamedSkippedLoadAfterShrink(argv[1], shape, directory.path()) +
