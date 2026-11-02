@@ -1434,7 +1434,10 @@ void testPoolValueSurvivesAnIdleReleaseAndRestore() {
 }
 
 // A shortfall of X frees at most X and one unit of a pool (owner 21:05,
-// borrowed item 3(c)).
+// borrowed item 3(c)), also when the unit that goes first is the smallest:
+// a store whose last live chunk is 117 MiB, the rest of its size, before two
+// of 1023 MiB gives the small chunk and one large one for 300 MiB, not every
+// large chunk the dry run's 117 MiB units stood for.
 void testAShortfallTakesAtMostOneUnitBeyondIt() {
   for (const uint64_t unitBytes : {kGiB, 512 * kMiB}) {
     FakeMemory memory({});
@@ -1448,6 +1451,15 @@ void testAShortfallTakesAtMostOneUnitBeyondIt() {
                 freed.nowBytes < shortfall + unitBytes,
             "a shortfall took more than itself and one unit");
   }
+  ListedPool experts(kGiB, {1023 * kMiB, 1023 * kMiB, 117 * kMiB}, 8 * kGiB, 1382400, 0.1846);
+  MemoryLedger ledger;
+  ledger.addPool(experts);
+  const ClaimId claim = ledger.open(request(1, RequestPriority::Normal));
+  const FreeResult freed = ledger.free(claim, {.bytes = 300 * kMiB}, 0, false, false);
+  require(freed.outcome == FreeOutcome::Met && freed.nowBytes == 1140 * kMiB &&
+              experts.currentBytes() == kGiB + 1023 * kMiB,
+          "a shortfall of 300 MiB took " + std::to_string(freed.nowBytes / kMiB) +
+              " MiB of a store whose small chunk goes first, not it and one large chunk");
 }
 
 // A host reading that lags the release behind it takes nothing more: the

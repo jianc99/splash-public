@@ -405,25 +405,38 @@ MemoryLedger::DryRun MemoryLedger::dryRun(const ClaimSpec &spec, const VictimQue
 
 // Takes what a covered dry run chose, in its order: a source's unit by its
 // place in the source's order as it stands, past the units the run passed
-// over (VictimSource), a pool's unit by its release, pending growth by
-// cancelling it.
+// over (VictimSource), a pool's units by releasing what the run's choices of
+// them still lack, pending growth by cancelling it. The run sized a pool's
+// units after its first at the first's bytes, and a later one may be larger
+// (the store's last live chunk is the rest of a size, the chunk before it
+// about 1 GiB): released choice by choice, each larger unit would go for a
+// choice the one before already met.
 FreeResult MemoryLedger::take(const DryRun &run, const VictimQuery &query, ClaimState *claim) {
   FreeResult result{.outcome = run.later ? FreeOutcome::Pending : FreeOutcome::Met};
   // Each source's last unit the run passed over, which stays in its order.
   std::vector<std::optional<Victim>> passed(sources_.size());
+  // Each pool's bytes the run chose so far, and those its releases gave.
+  std::vector<uint64_t> chosen(accounts_.size()), released(accounts_.size());
   for (const Choice &choice : run.chosen) {
     if (choice.pool) {
-      Account &account = accounts_[choice.pool->value];
-      ++account.taken;
+      const size_t index = choice.pool->value;
+      Account &account = accounts_[index];
       if (choice.pending) {
+        ++account.taken;
         account.pendingGrowth = 0;
         result.nowBytes = plus(result.nowBytes, choice.victim.bytes);
         continue;
       }
-      const uint64_t released = account.pool->release(choice.victim.bytes);
-      if (released)
+      chosen[index] = plus(chosen[index], choice.victim.bytes);
+      if (released[index] >= chosen[index])
+        continue;
+      const uint64_t bytes = account.pool->release(chosen[index] - released[index]);
+      if (bytes) {
+        ++account.taken;
         ++account.shrinks;
-      result.nowBytes = plus(result.nowBytes, released);
+      }
+      released[index] = plus(released[index], bytes);
+      result.nowBytes = plus(result.nowBytes, bytes);
       continue;
     }
     VictimSource &source = *sources_[choice.source];
