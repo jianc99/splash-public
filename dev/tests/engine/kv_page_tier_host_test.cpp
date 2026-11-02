@@ -124,6 +124,43 @@ void roundTrips(const std::shared_ptr<model::SsdReaders> &readers, kv::Layout la
   std::cout << "round trips " << kv::formatName(layout.format) << " slot format v" << format.version() << '\n';
 }
 
+// What the tier moved, as it retires each transfer that succeeded: the
+// bytes a write sent to its slot and those a restore read back, the index
+// alone for an Index page, and how long each took from its start.
+void tierThroughputCounts(const std::shared_ptr<model::SsdReaders> &readers, kv::Layout layout) {
+  constexpr uint32_t kPages = 8;
+  test::HostKvPages pages(layout, 2 * kPages);
+  const kv::SlotFormat format(layout);
+  std::shared_ptr<DiskBudget> budget;
+  Tier tier(pages, format, slotFile(format, kPages + 1, budget), readers);
+  std::vector<std::shared_ptr<engine::KvDiskSlot>> slots;
+  std::vector<std::unique_ptr<KvTransfer>> writes;
+  for (uint32_t page = 0; page < kPages; ++page) {
+    pages.fill(page, page + 1);
+    slots.push_back(tier.acquireSlot(cached));
+    writes.push_back(tier.demote(page, slots.back(), WriteClass::Reclaim, {}));
+  }
+  runUntilReady(tier, writes);
+  const engine::KvTierThroughput written = tier.throughput();
+  require(written.writtenBytes == kPages * format.payloadBytes() && written.writeSeconds > 0.0 &&
+              !written.readBytes,
+          "the tier did not count the bytes its writes sent and their time");
+  std::vector<std::unique_ptr<KvTransfer>> restores;
+  uint64_t read = 0;
+  for (uint32_t page = 0; page < kPages; ++page) {
+    const bool index = layout.spillable() && page % 2;
+    if (index)
+      pages.setForm(kPages + page, kv::PageForm::Index);
+    read += index ? format.indexRange().bytes : format.payloadBytes();
+    restores.push_back(tier.restore(slots[page], kPages + page, {}));
+  }
+  runUntilReady(tier, restores);
+  const engine::KvTierThroughput moved = tier.throughput();
+  require(moved.readBytes == read && moved.readSeconds > 0.0 && moved.writtenBytes == written.writtenBytes,
+          "the tier did not count the bytes its restores read and their time");
+  std::cout << "throughput " << kv::formatName(layout.format) << '\n';
+}
+
 // A tier goes away with writes and restores in flight: the worker and the
 // readers are done with its pages first. And a tier that goes right after
 // its last restore retired leaves no batch end running on a reader, so the
@@ -180,6 +217,7 @@ int main() {
                                       kv::Layout{6, 2, 256, format, 0, false, 512, 0b010110},
                                       kv::Layout{12, 2, 256, format, 128, true, 0, 0, kv::Reads::SelectedBlocks}}) {
         roundTrips(readers, layout);
+        tierThroughputCounts(readers, layout);
         teardown(readers, layout);
       }
     }

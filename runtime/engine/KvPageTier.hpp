@@ -1,5 +1,6 @@
 #pragma once
 
+#include "AwakeClock.hpp"
 #include "engine/KvTier.hpp"
 #include "model/KvCopyRead.hpp"
 #include "model/Model.hpp"
@@ -103,6 +104,9 @@ public:
     return diskSlot(slot);
   }
   void poll() override;
+  // Counted as the engine thread retires each transfer that succeeded: the
+  // bytes it moved, and the time from its start to its retirement.
+  [[nodiscard]] KvTierThroughput throughput() const noexcept override { return throughput_; }
 
 private:
   // What a transfer's ticket reports once the tier retired it.
@@ -123,6 +127,8 @@ private:
     WriteClass write;
     std::shared_ptr<model::SlotFile::Operation> io;
     std::shared_ptr<Outcome> outcome;
+    uint64_t bytes = 0;
+    AwakeClock::time_point started = AwakeClock::now();
   };
   // A restore: its slot, its page and the page's form, which says what it
   // reads: the page's index alone (an Index page) or the payload of what
@@ -140,6 +146,7 @@ private:
     std::shared_ptr<model::SsdReaders::Batch> batch;
     std::vector<bool> retired;
     size_t left = 0;
+    AwakeClock::time_point started = AwakeClock::now();
   };
   [[nodiscard]] static std::shared_ptr<DiskSlot> diskSlot(const std::shared_ptr<KvDiskSlot> &slot);
   // A reader's task: reads one restore's range and scatters it.
@@ -158,6 +165,7 @@ private:
   std::vector<Restore> queued_;
   std::vector<RestoreBatch> batches_;
   uint32_t restores_ = 0;
+  KvTierThroughput throughput_;
 };
 
 // The tier of the pool's extents.
@@ -248,13 +256,17 @@ std::unique_ptr<KvTransfer> BasicKvPageTier<Pages>::demote(uint32_t page, std::s
   auto disk = diskSlot(slot);
   auto outcome = std::make_shared<Outcome>();
   auto ticket = std::make_unique<Ticket>(outcome);
-  auto io = file_->write(disk->slot, format_.transferSpans(pages_, page), std::move(completion));
+  const std::vector<std::span<const std::byte>> spans = format_.transferSpans(pages_, page);
+  uint64_t bytes = 0;
+  for (const std::span<const std::byte> span : spans)
+    bytes += span.size();
+  auto io = file_->write(disk->slot, spans, std::move(completion));
   // A file that stopped taking writes since canDemote() refuses this one as
   // canDemote() does from now on.
   if (!io)
     return {};
   ++classWrites_[static_cast<size_t>(write)];
-  writes_.push_back({write, std::move(io), std::move(outcome)});
+  writes_.push_back({write, std::move(io), std::move(outcome), bytes});
   return ticket;
 }
 
@@ -331,6 +343,10 @@ template <class Pages> void BasicKvPageTier<Pages>::poll() {
     --classWrites_[static_cast<size_t>(write.write)];
     write.outcome->success = write.io->wait();
     write.outcome->ready = true;
+    if (write.outcome->success) {
+      throughput_.writtenBytes += write.bytes;
+      throughput_.writeSeconds += millisecondsSince(write.started) / 1000.0;
+    }
     writes_.erase(writes_.begin() + static_cast<std::ptrdiff_t>(index));
   }
   // A restore that ended lets its copy go: the cache may give the copy up
@@ -342,6 +358,11 @@ template <class Pages> void BasicKvPageTier<Pages>::poll() {
       Restore &restore = (*batch->restores)[index];
       restore.outcome->success = !batch->batch->failed(index);
       restore.outcome->ready = true;
+      if (restore.outcome->success) {
+        throughput_.readBytes +=
+            restore.form == kv::PageForm::Index ? format_.indexRange().bytes : format_.payloadBytes(restore.form);
+        throughput_.readSeconds += millisecondsSince(batch->started) / 1000.0;
+      }
       restore.copy.reset();
       batch->retired[index] = true;
       --batch->left;
