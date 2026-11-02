@@ -675,6 +675,9 @@ class FakeProcess:
         self.stdin = FakeInput(self)
         self._condition = threading.Condition()
         self._exit_code = None
+        # The fault signal it is dying by (crash), which no other signal
+        # changes.
+        self._fault = None
         if initial_output is None:
             self.send(READY)
         elif initial_output:
@@ -686,12 +689,23 @@ class FakeProcess:
     def close_stdout(self):
         self.stdout.close()
 
+    def crash(self, fault):
+        """Dies by signal `fault` as a real engine does: its output ends
+        first, and its exit status is there to read a moment later."""
+        with self._condition:
+            self._fault = fault
+        self.stdout.close()
+        exit_later = threading.Timer(0.05, self._exit, (-fault,))
+        exit_later.daemon = True
+        exit_later.start()
+
     def poll(self):
         with self._condition:
             return self._exit_code
 
     def terminate(self):
-        self._exit(-15)
+        # The engine stops on SIGTERM as on stdin's end, and exits with EX_OK.
+        self._exit(0)
 
     def kill(self):
         self._exit(-9)
@@ -700,7 +714,7 @@ class FakeProcess:
         with self._condition:
             if self._exit_code is not None:
                 return
-            self._exit_code = code
+            self._exit_code = code if self._fault is None else -self._fault
             self._condition.notify_all()
         self.stdin.close()
         self.stdout.close()

@@ -840,7 +840,7 @@ class NativeBackendContractTests(unittest.TestCase):
         native.mode = "status_timeout"
         with mock.patch.object(backend_api, "print_status"):
             transport._engine_failed(
-                runtime.EngineUnhealthy("gpu fault"), 120.0, frozenset(), None
+                runtime.EngineUnhealthy("gpu fault"), 120.0, frozenset(), lambda: None
             )
             # The relaunch succeeds; its status refresh is not answered.
             self.wait_for_recovery(transport)
@@ -860,7 +860,10 @@ class NativeBackendContractTests(unittest.TestCase):
                 answered.append(event)
                 native.ready = False
                 transport._engine_failed(
-                    runtime.EngineUnhealthy("gpu fault"), 120.0, frozenset(), None
+                    runtime.EngineUnhealthy("gpu fault"),
+                    120.0,
+                    frozenset(),
+                    lambda: None,
                 )
             return decode(event)
 

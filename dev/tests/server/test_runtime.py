@@ -1692,10 +1692,10 @@ class RuntimeTests(unittest.TestCase):
             engine.kill()
             with self.assertRaises(engine_runtime.EngineUnhealthy):
                 call.result(1.0)
-        [(error, _served, fingerprints, returncode)] = heard
+        [(error, _served, fingerprints, exit_status)] = heard
         self.assertEqual(fingerprints, frozenset({started.fingerprint}))
         self.assertNotIn(queued.fingerprint, fingerprints)
-        self.assertEqual(returncode, -9)
+        self.assertEqual(exit_status(), -9)
 
     def test_startup_refuses_other_events_before_ready(self):
         for event in (

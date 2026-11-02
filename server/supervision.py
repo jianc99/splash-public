@@ -5,6 +5,7 @@ requests that keep failing the engine."""
 
 import signal
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from . import protocol as wire
@@ -76,10 +77,11 @@ PERMANENT_START_FAILURES = frozenset(
     }
 )
 
-# Engine failures a request it ran may have caused: an execution failure the
-# engine reports, an engine whose output broke the protocol, and a death by a
-# fault signal. Not a kill (the user's, jetsam's or the server's own fence),
-# a command short of GPU memory, or a start, which runs no request.
+# Engine failures a request it ran may have caused: a death by a fault signal,
+# and of an engine that exited on its own, an execution failure it reported
+# or output that broke the protocol. Not a kill (the user's, jetsam's or the
+# server's own, after a fence or past the stop grace), whatever its output
+# showed, a command short of GPU memory, or a start, which runs no request.
 REQUEST_FAILURE_CODES = frozenset(
     {"engine_execution_failed", "metal_execution_failed", "protocol_fatal"}
 )
@@ -110,16 +112,23 @@ class EngineFailure:
     # The fingerprints (protocol.request_fingerprint) of the requests the
     # engine had started when it failed.
     started: frozenset[bytes] = frozenset()
-    # Whether a request it ran may have caused the failure.
-    counted: bool = False
+    # For an engine that failed after Ready, its exit status once it has
+    # exited (runtime.FailureListener), which decides with the code whether
+    # a request it ran may have caused the failure.
+    exit_status: Callable[[], int | None] | None = None
 
 
 def request_caused(code: str, returncode: int | None) -> bool:
     """Whether an engine that failed with `code` and exited with `returncode`
-    (None while it runs) failed in a way a request it ran may have caused."""
-    return code in REQUEST_FAILURE_CODES or (
-        returncode is not None and returncode < 0 and -returncode in FAULT_SIGNALS
-    )
+    failed in a way a request it ran may have caused. A signal it died by
+    decides: a fault signal counts, any other is a kill. Only an engine that
+    exited on its own is judged by its code; one that had not exited within
+    the stop grace (None) is killed, and does not count."""
+    if returncode is None:
+        return False
+    if returncode < 0:
+        return -returncode in FAULT_SIGNALS
+    return code in REQUEST_FAILURE_CODES
 
 
 class RestartPolicy:

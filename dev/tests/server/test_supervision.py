@@ -97,13 +97,19 @@ class QuarantineTests(unittest.TestCase):
         self.assertFalse(quarantine.refuses(b"y"))
 
     def test_only_a_failure_a_request_may_have_caused_counts(self):
+        """How the engine exited decides first: a fault signal counts, a kill
+        never does, whatever its output showed, nor does an engine that had
+        not exited. Only an engine that exited on its own (EX_SOFTWARE after
+        an engine failure, EX_OK after the server's SIGTERM) is judged by its
+        code."""
         for code in (
             "engine_execution_failed",
             "metal_execution_failed",
             "protocol_fatal",
         ):
-            with self.subTest(code=code):
-                self.assertTrue(supervision.request_caused(code, None))
+            for returncode in (70, 0):
+                with self.subTest(code=code, returncode=returncode):
+                    self.assertTrue(supervision.request_caused(code, returncode))
         for fault in (
             signal.SIGSEGV,
             signal.SIGBUS,
@@ -115,12 +121,14 @@ class QuarantineTests(unittest.TestCase):
             with self.subTest(signal=fault):
                 self.assertTrue(supervision.request_caused("engine_unhealthy", -fault))
         for code, returncode in (
-            ("metal_out_of_memory", None),
+            ("metal_out_of_memory", 70),
+            ("protocol_fatal", -signal.SIGKILL),
+            ("engine_execution_failed", -signal.SIGTERM),
+            ("engine_execution_failed", None),
             ("engine_unhealthy", -signal.SIGKILL),
-            ("engine_unhealthy", -signal.SIGTERM),
             ("engine_unhealthy", None),
             ("engine_unhealthy", 1),
-            ("start_failed", None),
+            ("start_failed", 70),
         ):
             with self.subTest(code=code, returncode=returncode):
                 self.assertFalse(supervision.request_caused(code, returncode))

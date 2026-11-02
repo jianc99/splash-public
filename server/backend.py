@@ -375,8 +375,10 @@ class NativeBackend:
         self.policy = supervision.RestartPolicy()
         self.stop_reason = None
         # The requests refused for having been in flight at two engine
-        # failures in a row.
+        # failures in a row, and the last engine failure, until its engine has
+        # exited and it is counted (_count_failure).
         self.quarantine = supervision.Quarantine()
+        self.failure_to_count = None
         # Set by close() to cut a relaunch's backoff short.
         self.wakeup = threading.Event()
         # Why the engine cannot serve: its failure, the last failed restart or
@@ -393,18 +395,17 @@ class NativeBackend:
         self.finalizer.start()
         runtime.on_engine_failure = self._engine_failed
 
-    def _engine_failed(self, error, served_seconds, started, returncode):
+    def _engine_failed(self, error, served_seconds, started, exit_status):
         """The runtime's failure listener (engine_runtime.FailureListener): an
         engine that reached Ready failed after serving for `served_seconds`."""
-        code = _failure_code(error)
         self._failed(
             "Engine failed",
             supervision.EngineFailure(
-                code,
+                _failure_code(error),
                 str(error),
                 served_seconds,
                 started=started,
-                counted=supervision.request_caused(code, returncode),
+                exit_status=exit_status,
             ),
         )
 
@@ -417,11 +418,8 @@ class NativeBackend:
             if self.status_snapshot is not None:
                 # A failed engine's readiness is no longer evidence.
                 self.status_snapshot["ready"] = False
-            refused = (
-                self.quarantine.after(failure.started)
-                if failure.counted
-                else frozenset()
-            )
+            if failure.exit_status is not None:
+                self.failure_to_count = failure
             delay = self.policy.after(failure)
             if delay is None:
                 self._stop_restarting_locked(self._stop_message(failure))
@@ -430,13 +428,6 @@ class NativeBackend:
             stopped = self.stop_reason
             self._ensure_recovery_locked()
         print_status(f"{event} · {failure.message}", error=True)
-        if refused:
-            print_status(
-                f"Quarantine · {len(refused)} request"
-                f"{'' if len(refused) == 1 else 's'} in flight at two engine "
-                "failures in a row refused until the server restarts",
-                error=True,
-            )
         if stopped is not None:
             print_status(f"Engine stopped · {stopped}", error=True)
 
@@ -528,7 +519,31 @@ class NativeBackend:
                     with self.lock:
                         self.status_unanswered_since = None
 
+    def _count_failure(self):
+        """Count the last engine failure toward the quarantine once its engine
+        has exited, which it waits for at most the stop grace, and before the
+        relaunch admits requests: how the engine exited decides whether a
+        request it ran may have caused the failure
+        (supervision.request_caused). Its output may end before its exit
+        status is there to read."""
+        with self.lock:
+            failure = self.failure_to_count
+            self.failure_to_count = None
+        if failure is None or not supervision.request_caused(
+            failure.code, failure.exit_status()
+        ):
+            return
+        refused = self.quarantine.after(failure.started)
+        if refused:
+            print_status(
+                f"Quarantine · {len(refused)} request"
+                f"{'' if len(refused) == 1 else 's'} in flight at two engine "
+                "failures in a row refused until the server restarts",
+                error=True,
+            )
+
     def _relaunch(self, due):
+        self._count_failure()
         try:
             # It returns once the engine is Ready. The failure listener counts
             # a failure after Ready, even one before wait_ready returns.

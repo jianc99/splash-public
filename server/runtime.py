@@ -146,10 +146,12 @@ MaskProvider: TypeAlias = Callable[[wire.MaskRequestEvent], bytes]
 EventCallback: TypeAlias = Callable[["RuntimeCall", wire.EngineEvent], None]
 CompletionCallback: TypeAlias = Callable[["RuntimeCall"], None]
 # The failure, the seconds the engine served, the fingerprints of the requests
-# it had started (GenerationRequest.fingerprint) and its exit status, None
-# while it runs.
+# it had started (GenerationRequest.fingerprint), and its exit status: a call
+# that waits for the engine to exit, at most the stop grace, and returns its
+# returncode, None if it still runs. The engine's output may end before its
+# exit status is there to read, so the status is read only once it exited.
 FailureListener: TypeAlias = Callable[
-    [EngineRuntimeError, float, frozenset[bytes], int | None], None
+    [EngineRuntimeError, float, frozenset[bytes], Callable[[], int | None]], None
 ]
 
 _READ_CHUNK_BYTES = 64 * 1024
@@ -1463,6 +1465,14 @@ class MultiplexedRuntime:
             last_status = self._last_status.json if self._last_status else None
             returncode = process.poll() if process is not None else None
 
+        def exit_status() -> int | None:
+            # finish() has asked the engine to stop, and kills it past the
+            # stop grace: an engine that exited on its own did so by then.
+            if process is None:
+                return None
+            self._wait_exit(process, time.monotonic() + self._thresholds.stop_grace)
+            return process.poll()
+
         def finish() -> None:
             if not isinstance(failure, RuntimeClosed):
                 try:
@@ -1481,7 +1491,7 @@ class MultiplexedRuntime:
                     # Before the calls end, so their terminals can follow
                     # what the listener decided about the engine.
                     try:
-                        listener(failure, served_seconds, started, returncode)
+                        listener(failure, served_seconds, started, exit_status)
                     except Exception:
                         pass
             if attempt is not None and attempt.generation == generation:

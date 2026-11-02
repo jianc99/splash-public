@@ -4,6 +4,7 @@ import http.client
 import io
 import json
 import queue
+import signal
 import threading
 import time
 import unittest
@@ -51,7 +52,7 @@ class RecoveringRuntime(FakeRuntime):
             error or engine_runtime.EngineUnhealthy("native protocol reached EOF"),
             served,
             frozenset(),
-            None,
+            lambda: None,
         )
 
     def wait_ready(self, timeout=None):
@@ -659,6 +660,65 @@ class ServerRecoveryTests(HarnessTestCase):
             kind, error = self.outcome_of(backend, runtime, poison)
             self.assertEqual((kind, error.code), ("error", "runtime_unavailable"))
         self.assertEqual(self.outcome_of(backend, runtime, poison)[0], "done")
+
+    def test_a_request_started_at_two_fault_deaths_in_a_row_is_refused(self):
+        """An engine that dies by a fault signal ends its output before its
+        exit status is there to read: its failure counts once it has
+        exited."""
+        poison = (1, 2, 3)
+
+        def segfault(process, frame):
+            process.send(wire.StartEvent(frame.request_id, 0, 0))
+            process.crash(signal.SIGSEGV)
+
+        factory, runtime, backend = self.quarantine_server(
+            lambda process, frame: (
+                segfault if frame.prompt_tokens == poison else self.serve
+            )(process, frame)
+        )
+        for _ in range(2):
+            kind, error = self.outcome_of(backend, runtime, poison)
+            self.assertEqual((kind, error.code), ("error", "runtime_unavailable"))
+        kind, error = self.outcome_of(backend, runtime, poison)
+        self.assertEqual(
+            (kind, error.status, error.code), ("error", 400, "request_quarantined")
+        )
+        self.assertEqual(self.outcome_of(backend, runtime, (4, 5))[0], "done")
+
+    def test_requests_started_at_two_kills_mid_frame_are_not_quarantined(self):
+        """A kill that cuts a frame short breaks the protocol, and still says
+        nothing about the requests in flight: the signal decides."""
+        poison = (1, 2, 3)
+
+        def killed_mid_frame(process, frame):
+            process.send(wire.StartEvent(frame.request_id, 0, 0))
+            done = native_peer.serialize_event(
+                wire.DoneEvent(
+                    frame.request_id, wire.FinishReason.STOP, 3, 1, 100, 200, 350, ()
+                )
+            )
+            process.stdout.feed(done[: len(done) // 2])
+            process.kill()
+
+        factory, runtime, backend = self.quarantine_server(
+            lambda process, frame: (
+                killed_mid_frame if len(factory.processes) <= 2 else self.serve
+            )(process, frame)
+        )
+        for _ in range(2):
+            kind, error = self.outcome_of(backend, runtime, poison)
+            self.assertEqual((kind, error.code), ("error", "runtime_unavailable"))
+        self.assertEqual(self.outcome_of(backend, runtime, poison)[0], "done")
+        # Both failures were the frame cut short.
+        failures = [
+            call.args[0]
+            for call in backend_api.print_status.call_args_list
+            if call.args[0].startswith("Engine failed")
+        ]
+        self.assertEqual(len(failures), 2)
+        self.assertTrue(
+            all("stream ended after" in line for line in failures), failures
+        )
 
     def test_a_queued_request_is_never_quarantined(self):
         """A request the engine had not started was in no command."""
