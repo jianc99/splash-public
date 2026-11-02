@@ -1352,15 +1352,27 @@ Engine::Prepared Engine::prepare(const BatchPlan &plan, std::vector<ModelBatchIt
   // grow into, so the Slim extents are memory the lanes in service need: an
   // InService claim of the engine's while one is, else an Optional one, and
   // a long prompt's pages trim as it prefills rather than filling the
-  // budget Full. A refusal leaves pages Full for a later pass.
+  // budget Full. Refused, they ask the ledger as the lanes' pages do, and
+  // in service pass the host once nothing in place meets them (amend/M.md
+  // B2); with no lane in service they take only what costs nothing. A
+  // refusal the ledger does not meet leaves pages Full for a later pass.
   {
+    const bool inService = laneInService(std::nullopt);
     ClaimHandle claim;
     claim.governor = &governor();
     claim.id = governor().ledger().open(
-        {.cls = laneInService(std::nullopt) ? ClaimClass::InService : ClaimClass::Optional,
-         .timing = NeedTiming::Immediate});
+        {.cls = inService ? ClaimClass::InService : ClaimClass::Optional,
+         .timing = NeedTiming::Immediate,
+         .benefitSeconds = inService ? std::numeric_limits<double>::infinity() : 0.0});
     const MemoryGovernor::Scope scope(governor(), claim.id);
     static_cast<void>(cache_.trimWindows());
+    for (Need need = governor().need(claim.id); need.bytes; need = governor().need(claim.id)) {
+      if (governor().free(claim.id, need).outcome != FreeOutcome::Met)
+        break;
+      governor().ledger().refused(claim.id, {});
+      if (!cache_.trimWindows())
+        break;
+    }
   }
   // A command's later passes run its items again: their lanes hold what
   // they need, and only their page tables may have changed, as moves
