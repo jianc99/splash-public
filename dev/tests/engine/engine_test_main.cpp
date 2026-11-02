@@ -11,11 +11,13 @@ std::span<const test::TestCase> commandsTests();
 std::span<const test::TestCase> memoryTests();
 std::span<const test::TestCase> spillTests();
 std::span<const test::TestCase> diskTests();
+std::span<const test::TestCase> rulesTests();
 
 int main(int argc, char **argv) {
   const test::TestGroup groups[] = {
       {"requests", requestsTests()}, {"checkpoints", checkpointsTests()}, {"commands", commandsTests()},
       {"memory", memoryTests()},     {"spill", spillTests()},             {"disk", diskTests()},
+      {"rules", rulesTests()},
   };
   return test::runTests("engine", groups, argc, argv, [] { test::metalStatistics() = {}; });
 }
