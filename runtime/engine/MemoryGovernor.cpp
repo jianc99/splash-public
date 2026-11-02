@@ -407,7 +407,7 @@ bool MemoryGovernor::HostRule::admits(ClaimClass cls, uint64_t bytes, bool hostE
   if (system_ == MemoryPressure::Critical)
     return false;
   if (cls == ClaimClass::Floor || (cls == ClaimClass::InService && hostExempt) ||
-      (cls == ClaimClass::Growth && bytes <= creditBytes))
+      (cls == ClaimClass::Growth && bytes && bytes <= creditBytes))
     return true;
   const bool keepsMargin = measured_ && headroom_ >= bytes && headroom_ - bytes >= kHostMarginBytes;
   if (cls == ClaimClass::InService)

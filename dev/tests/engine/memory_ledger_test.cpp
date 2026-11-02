@@ -416,6 +416,17 @@ void testOneHostRule() {
     require(!admits(2560 * kMiB, normal, cls, 1792 * kMiB), "elective work inside the margin was admitted");
     require(!admits(8 * kGiB, warning, cls, kGiB), "macOS's warning admitted elective work");
   }
+  // The query the engine asks of growth, with no bytes and no credit: the
+  // margin, the band and macOS's warning hold it as they hold growth.
+  const auto growthAllowed = [](uint64_t headroom, MemoryPressure pressure) {
+    Fixture fixture(host(headroom, pressure));
+    static_cast<void>(fixture.governor->evaluate());
+    return fixture.governor->admits(ClaimClass::Growth);
+  };
+  require(growthAllowed(8 * kGiB, normal), "growth was not allowed outside the band");
+  require(!growthAllowed(900 * kMiB, normal), "growth was allowed in the band");
+  require(!growthAllowed(8 * kGiB, warning), "growth was allowed under macOS's warning");
+  require(!growthAllowed(8 * kGiB, critical), "growth was allowed under critical pressure");
   // The band: in below M, out at M + H, H the largest growth unit. The
   // pool's two units are held on the host too.
   for (const uint64_t unit : {kGiB, 512 * kMiB}) {
