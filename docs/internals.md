@@ -803,11 +803,13 @@ A layout whose attention reads the blocks its index selects
 for a target with a QSA indexer) attends sparsely; such a reader requires its
 values token-major (`kv::valuesTokenMajorFor`, `kv::Layout::valid`), the
 storage order whose blocks are contiguous, while the dense page loop reads
-every page of dimension-major ones. It runs kernels compiled for 24 query heads over two KV heads
-(Qwen3.8-Flash-Next's): a query row attends only to the blocks of 4 tokens its
-block mask names within its causal history, the mask a bitmap per row over the
-history's blocks (`metal/abi/PagedAttention.h`). The rows of a tile (a verify
-lane's 8, or 8 of a prefill chunk's) attend through one list, the union of
+every page of dimension-major ones. Only such a reader's layout holds a block
+index, and only its pages can spill (`kv::Layout::spillable`). It runs
+kernels compiled for 24 query heads over two KV heads (Qwen3.8-Flash-Next's):
+a query row attends only to the blocks of 4 tokens its block mask names
+within its causal history, the mask a bitmap per row over the history's
+blocks (`metal/abi/PagedAttention.h`). The rows of a tile (a verify lane's 8,
+or 8 of a prefill chunk's) attend through one list, the union of
 their blocks in block order, each entry a block and the rows of the tile that
 attend it (`attention_block_lists`, `ops::PagedAttention::addBlockLists`).
 The split kernels (`kernels/shared/sparse_attention.metal`) share a list out

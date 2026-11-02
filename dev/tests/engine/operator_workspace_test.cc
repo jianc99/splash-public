@@ -97,6 +97,20 @@ void attentionReads() {
   require(!dimensionMajor.valid(), "a reader of selected blocks took dimension-major values");
 }
 
+// Only a reader of selected blocks reads a block index, so only its layout
+// holds one and only its pages can leave memory while their index stays:
+// Qwen3.8-Flash-Next's pages read page by page are no layout, whose K/V
+// every row would read.
+void blockIndexReader() {
+  using namespace splash;
+  const kv::Layout selected{.attentionLayers = 12, .kvHeads = 2, .headDimension = 256, .indexDimension = 128,
+                            .valuesTokenMajor = true, .reads = kv::Reads::SelectedBlocks};
+  require(selected.valid() && selected.spillable(), "a reader of selected blocks cannot spill its pages");
+  kv::Layout everyPage = selected;
+  everyPage.reads = kv::Reads::EveryPage;
+  require(!everyPage.valid() && !everyPage.spillable(), "the page loop's layout holds a block index");
+}
+
 // Expert ids, route rows and grouped routes are uint32, routing weights fp32
 // and activations bf16; a row routes its top k and each shared slice, which
 // fills one tile per tileRows rows. The grouped input first holds the
@@ -225,6 +239,7 @@ int main() {
   try {
     attention();
     attentionReads();
+    blockIndexReader();
     moe();
     sampling();
     std::cout << "operator workspace: PASS\n";

@@ -82,7 +82,7 @@ struct RuntimeGeometry final {
     if (parts.kv) result.spilledKv = model.descriptor.capabilities.sparseKv;
     if (parts.experts || parts.kv) result.prefillChunks = kPrefillGroupChunks;
     if (!result.target.valid() || !result.draft.stateLayout().valid() ||
-        (parts.kv && (!result.spilledKv || !result.target.kvLayout.spillable())) ||
+        (parts.kv && !result.target.kvLayout.spillable()) ||
         result.target.contextTokens() != model.descriptor.capabilities.maximumContextTokens ||
         result.target.hiddenSize != result.draft.hiddenSize ||
         result.target.vocabularySize != result.draft.vocabularySize ||

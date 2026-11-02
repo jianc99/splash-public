@@ -187,12 +187,14 @@ struct Layout final {
   // How an attention reads the pages.
   Reads reads = Reads::EveryPage;
 
-  // A block-selecting reader gathers token-major values.
+  // A block-selecting reader gathers token-major values, and only it reads
+  // a block index.
   [[nodiscard]] constexpr bool valid() const noexcept {
     return attentionLayers && kvHeads && headDimension && validFormat(format) &&
            !windowTokens == !windowedLayers &&
            (attentionLayers >= 64 || !(windowedLayers >> attentionLayers)) &&
-           (reads != Reads::SelectedBlocks || valuesTokenMajor);
+           (reads != Reads::SelectedBlocks || valuesTokenMajor) &&
+           (!indexDimension || reads == Reads::SelectedBlocks);
   }
   [[nodiscard]] constexpr bool windowed(uint32_t layer) const noexcept {
     return layer < 64 && (windowedLayers >> layer & 1);
@@ -258,13 +260,13 @@ struct Layout final {
     return uint64_t{regions(form)} * bytesPerLayerPage() + indexBytesPerModelPage();
   }
   // Whether a page's K/V can leave memory while its index stays (PageForm::
-  // Index): the layout has a block index, which selects the blocks a row
-  // reads; its values are token-major, so that a block's tokens are
-  // contiguous in every tensor; and a page holds whole location places
+  // Index): the reader selects blocks by the layout's block index, so that a
+  // row reads only the blocks it selects, each contiguous in every tensor
+  // (token-major values, valid()); and a page holds whole location places
   // (SPLASH_ATTENTION_LOCATION_BLOCK_BITS), so that a block read back sits at
   // its own place in a page of the hot block cache.
   [[nodiscard]] constexpr bool spillable() const noexcept {
-    return indexDimension && valuesTokenMajor &&
+    return reads == Reads::SelectedBlocks && indexDimension &&
            kPageTokens == SPLASH_ATTENTION_BLOCK_TOKENS << SPLASH_ATTENTION_LOCATION_BLOCK_BITS;
   }
   // Whether a page can give up its windowed layers' K/V (PageForm::Slim)
