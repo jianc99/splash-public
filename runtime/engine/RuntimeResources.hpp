@@ -168,13 +168,15 @@ struct RuntimeResourcesConfig {
   // rounds repeat one another.
   AneFfnSetting aneFfn;
   // A relaunch's context (--relaunch-context): the context the server's
-  // first engine served without --max-context, which the server passes to
-  // every relaunch. The relaunch decides the rest as an automatic start, as
-  // that engine did, the SSD cache's staging among it, but its split takes at
+  // first engine served, which the server passes to its relaunches. The
+  // relaunch decides the rest as that engine did, for --max-context or as
+  // an automatic start, the SSD cache's staging among it, but the room the
+  // SSD cache's volume has left bounds its plan only above this context, and
+  // where its plan spills its SSD cache opens whatever room the volume has
+  // (RuntimeResources::create); without --max-context its split takes at
   // most the units whose plan holds this context, the GPU alone where none
-  // does (startAneFfn), where its plan spills its SSD cache opens whatever
-  // room the volume has (RuntimeResources::create), and it serves this
-  // context where its plan holds it (RuntimeBootstrap::start). Zero for none.
+  // does (startAneFfn); and it serves this context where its plan holds it
+  // (RuntimeBootstrap::start). Zero for none.
   uint32_t relaunchContext = 0;
   // The process's existing pressure observer runs before resource assembly;
   // it only publishes a level. Bootstrap checks it at Metal operation

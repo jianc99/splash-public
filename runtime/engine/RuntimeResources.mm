@@ -787,8 +787,6 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   // engine's plan holds all the same (ModelMemoryFootprint::hostHeldBackBytes).
   uint64_t hostBudget = std::numeric_limits<uint64_t>::max();
   uint64_t hostHeldBackBytes = 0;
-  // The context a relaunch keeps, which only an automatic context does.
-  const uint32_t relaunchContext = requestedContextTokens ? 0 : config.relaunchContext;
   // The pages of a prefill group's rows (model::kPrefillGroupChunks chunks).
   constexpr uint32_t groupPages =
       model::kPrefillGroupChunks * model::ExecutionLimits::prefillTokenBudget / kv::kPageTokens;
@@ -808,7 +806,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
          .kvLayout = kvLayout,
          .windowTokens = config.model.capabilities.maximumContextTokens,
          .requestedContextTokens = requestedContextTokens,
-         .relaunchContextTokens = relaunchContext,
+         .relaunchContextTokens = config.relaunchContext,
          .experts = {streamable.expertBytes, streamable.expertMinimumBytes, experts},
          .table = {streamable.tableBytes, streamable.tableMinimumBytes, table},
          .tableShareBytes = streamable.tableShareBytes,
@@ -1070,9 +1068,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   // and the requested context beside it, the parts as they load. The split
   // wins over it: where the plan refuses the split beside the staging but not
   // without it, the tier turns off before the split is decided. A relaunch
-  // decides it as its first engine, an automatic start, did, so that it keeps
-  // the staging that engine kept; only its split leaves that engine's context
-  // (below).
+  // decides it as its first engine did, so that it keeps the staging that
+  // engine kept; only its split leaves that engine's context (below).
   if (stateStagingBytes && automaticDisk) {
     const auto withoutStaging = [&](uint64_t aneFfnBytes) { return planWith(0, aneFfnBytes); };
     const EngineMemoryPlanResult planResult = planMemory(0);
@@ -1136,7 +1133,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     const model::SlotFile::Options stateFileOptions{.deferWrites = readers->criticalBusyProbe()};
     DiskTier disk = openDiskTier(config, cacheNamespace, stateStagingBytes ? cacheDiskBytes : 0, kvSlotBytes,
                                  kvSlotLabelBytes(kvLayout.windowedLayers != 0), kvFileOptions, stateBytes,
-                                 stateFileOptions, relaunchContext && memoryPlan.breakdown().kvSpill.enabled);
+                                 stateFileOptions, config.relaunchContext && memoryPlan.breakdown().kvSpill.enabled);
     if (memoryPlan.breakdown().kvSpill.enabled) {
       kvFileOpen = disk.kv != nullptr;
       if (disk.budget)

@@ -91,10 +91,12 @@ struct StreamedStart final {
   size_t loads = 0;
 };
 
-StreamedStart startStreamed(const RuntimeResourcesConfig &config) {
+// A start of `config` asked for `requestedContextTokens` (--max-context),
+// zero for the automatic context.
+StreamedStart startStreamed(const RuntimeResourcesConfig &config, uint32_t requestedContextTokens = 0) {
   StreamedStart started;
   started.log = test::capturedStderr([&] {
-    auto resources = RuntimeResources::create(config, 0);
+    auto resources = RuntimeResources::create(config, requestedContextTokens);
     const EngineMemoryBreakdown &budget = resources->memoryPlan().breakdown();
     started.context = resources->memoryPlan().maximumContextTokens();
     started.minimumRequired = budget.minimumRequiredBytes;
@@ -1079,8 +1081,9 @@ void testAutomaticContextIgnoresTheVolume(const char *metallibPath) {
 // A block-sparse target's context past what memory holds spills to the SSD
 // cache, so where the automatic cache's volume has no room for it, a first
 // start serves only what memory holds. A relaunch keeps its first engine's
-// context whatever room the volume has left since: its spilling plan opens
-// the cache's temporary files however little room their volume has.
+// context whatever room the volume has left since, that of a server started
+// with --max-context, which asks for it again, as well: its spilling plan
+// opens the cache's temporary files however little room their volume has.
 void testRelaunchKeepsTheSpilledContext(const char *metallibPath) {
   const test::TemporaryDirectory root("splash-relaunch");
   RuntimeResourcesConfig config = flashNextConfig(metallibPath, root.path());
@@ -1089,6 +1092,8 @@ void testRelaunchKeepsTheSpilledContext(const char *metallibPath) {
   // A budget whose memory holds less of the window than spilling does.
   config.maximumMemoryBytes = startStreamed(config).minimumRequired + 512 * kMiB;
   const StreamedStart first = startStreamed(config);
+  require(startStreamed(config, first.context).context >= first.context,
+          "a --max-context of the context a start spills for was not held");
   config.diskVolume = reading(localVolume(11 * kGiB));
   const StreamedStart refused = startStreamed(config);
   require(first.tier && !refused.tier && refused.context < first.context &&
@@ -1099,6 +1104,9 @@ void testRelaunchKeepsTheSpilledContext(const char *metallibPath) {
   const StreamedStart relaunch = startStreamed(config);
   require(relaunch.tier && relaunch.context >= first.context,
           "a relaunch served less than its first engine's context for want of SSD room");
+  const StreamedStart explicitRelaunch = startStreamed(config, first.context);
+  require(explicitRelaunch.tier && explicitRelaunch.context >= first.context,
+          "a relaunch for --max-context served less than its first engine's context for want of SSD room");
 }
 
 // --ple-memory auto takes at most the rows of every id a 128K-token prompt
