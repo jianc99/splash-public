@@ -13,6 +13,7 @@
 #include "metal/MetalBackend.hpp"
 
 #include <cstdint>
+#include <optional>
 #include <utility>
 
 namespace splash::test {
@@ -66,6 +67,15 @@ public:
     memory.setHost(memory.otherBytes(), pressure);
     governor.setPressure(pressure);
     static_cast<void>(governor.evaluate());
+  }
+  // From now on the limit leaves `bytes` of room beside what the engine
+  // holds, as if the engine held the rest; none: the limit leaves what it
+  // did. A fake's refusal that asks the governor (reserve) then lacks what
+  // it asks beyond that room, which is what the ledger frees for it.
+  void leaveRoom(std::optional<uint64_t> bytes) {
+    memory.release("limit", memory.held("limit"));
+    if (bytes)
+      memory.hold("limit", governor.snapshot().headroomBytes - *bytes);
   }
 
   FakeMemory memory;

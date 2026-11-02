@@ -1,3 +1,4 @@
+#include "CostSeeds.hpp"
 #include "EngineTestSupport.hpp"
 #include "TestCache.hpp"
 #include "TestChecks.hpp"
@@ -473,28 +474,46 @@ void testRollingHandleCannotRetirePromotedState() {
           "old rolling handle deleted a state promoted by another request");
 }
 
+// A checkpoint is optional progress, worth the rows since the state boundary
+// before it, which a recovery would compute again without it: refused its
+// buffers, it takes only cached units that cost less (amend/M.md B2). An
+// unrelated hot prefix, the resume point whose reuse is certain, is worth
+// its rows: one of fewer rows than the checkpoint's goes for it, one of more
+// stays. The control pass's rates price both (Engine::refreshMemoryRates).
 void testCheckpointDenialPreservesUnrelatedHotState() {
-  test::TestKvStorage storage(1024, 4096, 4);
-  KvPool pool(storage, 0);
-  engine::Cache resources(pool, nullptr, nullptr);
-  Executor executor(1);
-  Events events;
-  engine::Engine engine(test::engineConfig(), resources, executor, events);
-  guardReleases(storage, engine);
-  const std::vector<uint32_t> hot(65, 21);
-  engine.submit(request(420, hot));
-  runUntilIdle(engine);
-  executor.denyReservationAt = kPrefillCheckpointTokens;
-  engine.submit(request(421, std::vector<uint32_t>(18001, 22)));
-  for (uint32_t step = 0; step < 32 &&
-       !engine.snapshot().checkpointPublicationFailures; ++step)
-    static_cast<void>(engine.tick(step + 1));
-  require(engine.snapshot().checkpointPublicationFailures == 1 &&
-              resources.snapshot().stateCache.evictions == 0 &&
-              resources.lookup(hot, {}).resumeBoundary() == 64,
-          "optional progress allocation displaced an unrelated hot prefix");
-  engine.cancel(421);
-  runUntilIdle(engine);
+  for (const uint32_t hotTokens : {64u, 2 * kPrefillCheckpointTokens}) {
+    test::TestKvStorage storage(1024, 4096, 4);
+    KvPool pool(storage, 0);
+    engine::Cache resources(pool, nullptr, nullptr);
+    Executor executor(1);
+    Events events;
+    engine::Engine engine(test::engineConfig(), resources, executor, events);
+    guardReleases(storage, engine);
+    test::seedAsStartup(engine, executor);
+    const std::vector<uint32_t> hot(hotTokens + 1, 21);
+    engine.submit(request(420, hot));
+    runUntilIdle(engine);
+    // The hot prefix keeps its state alone.
+    while (resources.reclaimOneState(StateClass::Checkpoint, false)) {
+    }
+    require(resources.snapshot().stateCache.entries == 1 && resources.lookup(hot, {}).resumeBoundary() == hotTokens,
+            "fixture did not keep the hot prefix's state alone");
+    engine.refreshMemoryRates(0.0);
+    const bool cheaper = hotTokens < kPrefillCheckpointTokens;
+    const uint64_t evictions = resources.snapshot().stateCache.evictions;
+    executor.denyReservationAt = kPrefillCheckpointTokens;
+    engine.submit(request(421, std::vector<uint32_t>(18001, 22)));
+    for (uint32_t step = 0; step < 32 &&
+         !engine.snapshot().checkpointPublicationFailures; ++step)
+      static_cast<void>(engine.tick(step + 1));
+    require(engine.snapshot().checkpointPublicationFailures == 1 &&
+                resources.snapshot().stateCache.evictions == evictions + (cheaper ? 1 : 0) &&
+                resources.lookup(hot, {}).resumeBoundary() == (cheaper ? 0u : hotTokens),
+            cheaper ? "a checkpoint left a hot prefix worth less than it"
+                    : "optional progress allocation displaced an unrelated hot prefix worth more");
+    engine.cancel(421);
+    runUntilIdle(engine);
+  }
 }
 
 // With room for it, the next checkpoint takes buffers of its own before its

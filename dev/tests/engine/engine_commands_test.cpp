@@ -171,7 +171,8 @@ void testPrefillPassesInterleaveDecodeAndEndAtACancel() {
 // and the commands it ran. A command takes a streamed target's chunk as
 // measured (4.9 s, 3.4 s of it on expert reads) again, over its passes, or
 // with targetTimes the target's own time, which the price was seeded with;
-// neither trains it. A decode cycle takes 100 ms.
+// neither trains it. A decode cycle takes 100 ms. A governed one runs under
+// the governor of `host`, whose limit a test may close (leaveRoom).
 struct PassingEngine {
   struct Command final {
     WorkKind kind;
@@ -180,7 +181,9 @@ struct PassingEngine {
     // The states each lane's item captures.
     std::vector<size_t> captures;
   };
-  PassingEngine() {
+  explicit PassingEngine(bool governed = false)
+      : engine(governed ? host.connect({.decodeShare = 0.5}) : test::engineConfig({.decodeShare = 0.5}), cache,
+               model, events) {
     model.decodeFinishes = false;
     model.commandTimes = [this](const BatchPlan &plan, std::span<const ModelBatchItem> items) {
       Command command{plan.kind, {}, plan.pass, plan.passes, {}};
@@ -227,7 +230,8 @@ struct PassingEngine {
   // What a command may hold, which the engine takes as it is built.
   bool shaped = (test::commandShape(4 * model::ExecutionLimits::prefillTokenBudget, 6)(model), true);
   Events events;
-  engine::Engine engine{test::engineConfig({.decodeShare = 0.5}), cache, model, events};
+  test::GovernedHost host;
+  engine::Engine engine;
   std::vector<Command> commands;
   bool targetTimes = false;
   double now = 1;
@@ -380,18 +384,27 @@ void testALaneSuspendedBetweenPassesAbandonsItsCommand() {
 
 // A prompt of a higher priority that the engine's limit refuses its KV
 // takes what the Background command between its passes holds before any
-// lane of it yields: the command, which a lane's suspension would abandon
-// anyway, is given up, and the buffers of the states it would capture are
-// what the prompt's KV fits in. No lane is suspended, and the Background
-// prompts run their rows again from a first pass.
+// lane of it yields: its claim, of work that supersedes the command, takes
+// the command (amend/M.md B15), which a lane's suspension would abandon
+// anyway, and the buffers of the states it would capture are what the
+// prompt's KV fits in. No lane is suspended, and the Background prompts run
+// their rows again from a first pass.
 void testAHigherPriorityTakesWhatACommandBetweenPassesHolds() {
-  PassingEngine passing;
-  passing.model.kvGrowthBlocked = &passing.storage.growthBlocked;
+  PassingEngine passing(true);
+  // While growth is blocked an extent asks the engine's limit for one
+  // state's buffers, which it leaves no room for, and the buffers going
+  // back unblock it (Executor::kvGrowthBlocked).
+  bool blocked = false;
+  passing.model.kvGrowthBlocked = &blocked;
+  passing.storage.growthAllowed = [&](uint32_t) {
+    return !blocked || static_cast<bool>(passing.host.reserve(64));
+  };
   for (uint64_t id = 1; id <= 2; ++id)
     passing.submit(id, 300, RequestPriority::Background);
   passing.tickUntil([&] { return passing.prefills() == 1 && !passing.engine.commandInFlight(); },
                     "the Background prompts did not run a pass");
-  passing.storage.growthBlocked = true;
+  blocked = true;
+  passing.host.leaveRoom(0);
   passing.submit(3, 100, RequestPriority::Foreground);
   const size_t arrived = passing.commands.size();
   passing.tickUntil([&] { return idle(passing.engine); }, "the requests did not end");
@@ -399,7 +412,9 @@ void testAHigherPriorityTakesWhatACommandBetweenPassesHolds() {
                                           passing.commands.end(), [](const PassingEngine::Command &command) {
                                             return command.lanes == std::vector<uint64_t>{1, 2};
                                           });
-  require(passing.engine.snapshot().resourceSuspensions == 0 && passing.model.reclaimedIdleStateBytes != 0 &&
+  const EngineSnapshot counts = passing.engine.snapshot();
+  require(counts.resourceSuspensions == 0 && counts.prioritySuspensions == 0 &&
+              passing.model.reclaimedIdleStateBytes != 0 &&
               passing.commands.at(arrived).lanes == std::vector<uint64_t>{3} && rerun != passing.commands.end() &&
               rerun->pass == 0 && passing.events.completedCount == 3 && passing.events.failedCount == 0,
           "a higher priority's refused KV suspended a lane of a command between its passes");
@@ -457,26 +472,34 @@ void testLaterPassesFollowEveryLanesMovedPages() {
           "a later pass did not follow a lane's moved page");
 }
 
-// A start of a higher priority that the engine's limit refuses its state
-// early in a Background command's passes, where its prompt would supersede
-// the command (Scheduler::yieldsTo), takes what the command holds before any
-// lane of it is suspended: given up, the command gives back the buffers of
-// the states it would capture.
-void testAHigherPriorityStartTakesWhatACommandBetweenPassesHolds() {
-  PassingEngine passing;
+// A start of a higher priority beside the lanes of a Background command
+// between its passes is a start even where its prompt would supersede the
+// command (Scheduler::yieldsTo): it takes only the cache nothing in use
+// holds (amend/M.md B2), never the command, which only in-service work that
+// supersedes it takes (B15). Refused its state early in the command's
+// passes, it takes its memory from the lane that yields first, by priority:
+// that lane's suspension gives the command up, and the buffers of the states
+// the command would capture are what the start then fits in. No lane is
+// suspended for memory.
+void testAHigherPriorityStartBesideACommandBetweenPassesIsAStart() {
+  PassingEngine passing(true);
   for (uint64_t id = 1; id <= 2; ++id)
     passing.submit(id, 300, RequestPriority::Background);
   passing.tickUntil([&] { return passing.prefills() == 1 && !passing.engine.commandInFlight(); },
                     "the Background prompts did not run a pass");
+  // Until state buffers come back, its state asks the engine's limit for
+  // one state's, which it leaves no room for.
   passing.model.beginGrowthBlocked = [&] {
-    return passing.model.lastBeginId == 3 && *passing.model.evictedStateBytes == 0;
+    return passing.model.lastBeginId == 3 && *passing.model.evictedStateBytes == 0 &&
+           !passing.host.reserve(64);
   };
+  passing.host.leaveRoom(0);
   passing.submit(3, 100, RequestPriority::Foreground);
   passing.tickUntil([&] { return idle(passing.engine); }, "the requests did not end");
   const EngineSnapshot counts = passing.engine.snapshot();
-  require(counts.prioritySuspensions == 0 && counts.resourceSuspensions == 0 &&
+  require(counts.prioritySuspensions == 1 && counts.resourceSuspensions == 0 &&
               passing.events.completedCount == 3 && passing.events.failedCount == 0,
-          "a higher priority's refused start suspended a lane of a command between its passes");
+          "a higher priority's refused start took the command between its passes, or a lane yielded for memory");
 }
 
 // A lane of several that ends at its deadline during its command's passes
@@ -604,12 +627,13 @@ void testALaneThatEndedBetweenPassesIsNotSuspended() {
 // A start of a higher priority whose prompt would not supersede the command
 // between its passes (Scheduler::yieldsTo) takes nothing the command holds
 // and suspends no lane of it: refused memory after four of a two-lane
-// Background command's six passes, a Foreground start climbs the rest of the
-// ladder, giving back an expert chunk, and waits for the command's end,
-// which gives the captures back. Refused at every attempt after the first
-// pass of a Background prompt's command, Foreground starts give the command
-// up until its lane has waited three times its remaining cost, and let it run
-// to its end then.
+// Background command's six passes, a Foreground start, which takes only the
+// cache nothing in use holds (amend/M.md B2), finds none and waits for the
+// command's end, which gives the captures back. Refused at every attempt
+// after the first pass of a Background prompt's command, Foreground starts
+// take its lane by priority, whose suspension gives the command up, until
+// the lane has waited three times its remaining cost, and let it run to its
+// end then.
 void testAStartThatWouldNotSupersedeACommandWaitsForItsEnd() {
   // Whether the latest prefill command ran a pass short of its last.
   const auto betweenPasses = [](const PassingEngine &passing) {
@@ -625,20 +649,23 @@ void testAStartThatWouldNotSupersedeACommandWaitsForItsEnd() {
     });
   };
   {
-    PassingEngine passing;
-    passing.model.expertChunks = {1000};
+    PassingEngine passing(true);
     for (uint64_t id = 1; id <= 2; ++id)
       passing.submit(id, 300, RequestPriority::Background);
     passing.tickUntil([&] { return passing.prefills() == 4 && !passing.engine.commandInFlight(); },
                       "the Background prompts did not run four passes");
     require(passing.commands.back().passes == 6, "the Background prompts did not run in six passes");
-    // Its memory comes back once the command gives its captures back.
+    // Its memory comes back once the command gives its captures back: until
+    // then its state asks the engine's limit for one state's buffers, which
+    // it leaves no room for.
     while (passing.cache.reclaimOneState(StateClass::Ordinary, false)) {
     }
     *passing.model.evictedStateBytes = 0;
     passing.model.beginGrowthBlocked = [&] {
-      return passing.model.lastBeginId == 3 && *passing.model.evictedStateBytes == 0 && betweenPasses(passing);
+      return passing.model.lastBeginId == 3 && *passing.model.evictedStateBytes == 0 && betweenPasses(passing) &&
+             !passing.host.reserve(64);
     };
+    passing.host.leaveRoom(0);
     passing.submit(3, 100, RequestPriority::Foreground);
     passing.tickUntil([&] { return idle(passing.engine); }, "the requests did not end");
     const auto first = std::ranges::find_if(passing.commands, [](const PassingEngine::Command &command) {
@@ -646,9 +673,8 @@ void testAStartThatWouldNotSupersedeACommandWaitsForItsEnd() {
     });
     const EngineSnapshot counts = passing.engine.snapshot();
     require(prefillsOf(passing, {1, 2}, 0) == 1 && prefillsOf(passing, {1, 2}, 5) == 1 &&
-                first != passing.commands.end() && first->pass == 0 &&
-                std::ranges::count(passing.model.reclaimSteps, Executor::ReclaimStep::ExpertRelease) == 1 &&
-                counts.prioritySuspensions == 0 && counts.resourceSuspensions == 0 && counts.completed == 3,
+                first != passing.commands.end() && first->pass == 0 && counts.prioritySuspensions == 0 &&
+                counts.resourceSuspensions == 0 && counts.completed == 3,
             "a start whose prompt would not supersede a command took what it holds, or suspended a lane of it");
   }
   {
@@ -677,11 +703,14 @@ void testAStartThatWouldNotSupersedeACommandWaitsForItsEnd() {
                         "the Foreground request did not end");
     }
     passing.tickUntil([&] { return idle(passing.engine); }, "the requests did not end");
-    // Each abandonment counts the pass it lost as the lane's wait; once that
-    // reaches three times its remaining cost (its 2.55 s seeded price, over
-    // passes of 0.6 s), it is overdue and its command runs to its end.
-    require(prefillsOf(passing, {1}, 0) > 1 && prefillsOf(passing, {1}, 0) <= 14 &&
-                passing.engine.snapshot().prioritySuspensions == 0 && passing.events.failedCount == 0,
+    // Each start takes the lane by priority, whose suspension gives its
+    // command up (a start never takes the command itself: amend/M.md B2),
+    // and each abandonment counts the pass it lost as the lane's wait; once
+    // that reaches three times its remaining cost (its 2.55 s seeded price,
+    // over passes of 0.6 s), it is overdue and its command runs to its end.
+    const auto restarts = prefillsOf(passing, {1}, 0) - 1;
+    require(restarts > 0 && restarts <= 13 && passing.engine.snapshot().prioritySuspensions == uint64_t(restarts) &&
+                passing.events.failedCount == 0,
             "refused Foreground starts gave a Background command up past the bound");
   }
 }
@@ -803,9 +832,11 @@ void testRecoveryAdmitsBetweenPasses() {
 // its history from the SSD cache as a Spill one does, and runs as prefill
 // groups, which read it once for their chunks.
 void testAResidentLaneHoldingSpilledBlocksRunsPrefillGroups() {
-  // Resident KV holds 120 pages.
-  Spilling spill(256, false, 120 * 100, 0, {4}, 0,
-                 test::commandShape(4 * model::ExecutionLimits::prefillTokenBudget));
+  // Resident KV holds 120 pages, and the engine's limit no more: a request
+  // whose projection does not fit in the room left starts Spill
+  // (Engine::placement).
+  Spilling spill(256, false, 120 * 100, 0, {4}, 0, test::commandShape(4 * model::ExecutionLimits::prefillTokenBudget),
+                 {.limitBytes = 120 * 100});
   test::seedAsStartup(spill.engine, spill.model, test::heavyHistoryTarget());
   // Eight pages and 4,096 tokens of output project 136 pages: it spills,
   // and decodes below the next request's priority.
@@ -1021,7 +1052,10 @@ void testASpilledReadsRefusalFollowsTheRuleForLanesThatEnded() {
            !spill.engine.commandInFlight();
   };
   {
-    Spilling spill(1024, false, 200 * 100, 0, {4}, 0, test::commandShape(4 * model::ExecutionLimits::prefillTokenBudget, 6));
+    // The engine's limit holds 200 pages of Resident KV: the first request
+    // projects 209 and starts Spill (Engine::placement).
+    Spilling spill(1024, false, 200 * 100, 0, {4}, 0, test::commandShape(4 * model::ExecutionLimits::prefillTokenBudget, 6),
+                   {.limitBytes = 200 * 100});
     std::vector<Lanes> prefills;
     setUp(spill, prefills);
     spill.engine.submit(Spilling::prompt(1, 1, 80, 4096));
@@ -1073,10 +1107,10 @@ void testASpilledReadsRefusalFollowsTheRuleForLanesThatEnded() {
 
 // On a target that can spill, a prompt of a higher priority that the
 // engine's limit refuses its KV takes what the Background command between its
-// passes holds before it converts itself to Spill: giving the command up,
-// which that prompt's command does once it runs, is the first rung above the
-// cache nothing in use holds, and the buffers of the states the command
-// would capture are what its KV fits in.
+// passes holds before it converts itself to Spill: the command, which that
+// prompt's command gives up once it runs, costs its claim nothing (amend/M.md
+// B15), and the buffers of the states the command would capture are what
+// its KV fits in.
 void testASupersedingPromptTakesACommandsMemoryBeforeSpilling() {
   Spilling spill(64, false, 100'000, 0, {4}, 0, test::commandShape(4 * model::ExecutionLimits::prefillTokenBudget, 6));
   std::vector<std::pair<uint64_t, uint32_t>> prefills;
@@ -1085,7 +1119,23 @@ void testASupersedingPromptTakesACommandsMemoryBeforeSpilling() {
       prefills.emplace_back(plan.items.front().requestId, plan.pass);
     return test::CommandTimes{};
   };
-  spill.model.kvGrowthBlocked = &spill.storage.growthBlocked;
+  // Once the prompt has started Resident, an extent asks the engine's limit
+  // for one state's buffers, which it leaves no room for, until buffers go
+  // back (Executor::kvGrowthBlocked).
+  bool blocked = false;
+  spill.model.kvGrowthBlocked = &blocked;
+  spill.storage.growthAllowed = [&](uint32_t) {
+    if (blocked)
+      return static_cast<bool>(spill.host.reserve(64));
+    spill.host.leaveRoom(std::nullopt);
+    return true;
+  };
+  spill.model.beginObserver = [&] {
+    if (spill.model.lastBeginId == 3) {
+      blocked = true;
+      spill.host.leaveRoom(0);
+    }
+  };
   test::seedAsStartup(spill.engine, spill.model);
   for (uint64_t id = 1; id <= 2; ++id) {
     EngineRequest background = Spilling::prompt(id, static_cast<uint32_t>(id), 4, 1);
@@ -1094,13 +1144,13 @@ void testASupersedingPromptTakesACommandsMemoryBeforeSpilling() {
   }
   spill.runUntil([&] { return !prefills.empty() && !spill.engine.commandInFlight(); },
                  "the Background prompts did not run a pass");
-  spill.storage.growthBlocked = true;
   EngineRequest foreground = Spilling::prompt(3, 3, 4, 1);
   foreground.priority = RequestPriority::Foreground;
   spill.engine.submit(std::move(foreground));
   spill.runUntilIdle();
   const EngineSnapshot counts = spill.engine.snapshot();
-  require(counts.spill.converted == 0 && counts.resourceSuspensions == 0 && spill.events.completedCount == 3 &&
+  require(counts.spill.converted == 0 && counts.spill.spill == 0 && counts.resourceSuspensions == 0 &&
+              spill.model.reclaimedIdleStateBytes != 0 && spill.events.completedCount == 3 &&
               spill.events.failedCount == 0,
           "a superseding prompt converted itself to Spill before the command between its passes gave its memory back");
 }
@@ -1547,8 +1597,8 @@ std::span<const test::TestCase> commandsTests() {
       {"testARefusedLaneWaitsForItsCommandsEnd", testARefusedLaneWaitsForItsCommandsEnd},
       {"testAHigherPriorityTakesWhatACommandBetweenPassesHolds",
        testAHigherPriorityTakesWhatACommandBetweenPassesHolds},
-      {"testAHigherPriorityStartTakesWhatACommandBetweenPassesHolds",
-       testAHigherPriorityStartTakesWhatACommandBetweenPassesHolds},
+      {"testAHigherPriorityStartBesideACommandBetweenPassesIsAStart",
+       testAHigherPriorityStartBesideACommandBetweenPassesIsAStart},
       {"testALaneThatExpiredBetweenPassesEndsOnce", testALaneThatExpiredBetweenPassesEndsOnce},
       {"testTheLaneThatYieldsIsChosenAfterTheLadder", testTheLaneThatYieldsIsChosenAfterTheLadder},
       {"testALaneThatEndedBetweenPassesIsNotSuspended", testALaneThatEndedBetweenPassesIsNotSuspended},

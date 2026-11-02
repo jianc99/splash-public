@@ -1132,16 +1132,22 @@ void testSharedJunctionPublishesFromCachedKv() {
   engine::Cache resources(pool, nullptr, nullptr);
   Executor executor;
   Events events;
-  engine::Engine engine(test::engineConfig(), resources, executor, events);
+  GovernedHost host;
+  engine::Engine engine(host.connect({}), resources, executor, events);
   guardReleases(storage, engine);
   // Another conversation's KV, with no state, fills two whole extents.
   resources.beginRequest(900);
   require(resources.ensureTokens(900, 256).granted(), "the other conversation got no pages");
   resources.publishCommittedBlocks(900, std::vector<uint32_t>(257, 6), 256, {});
   resources.endRequest(900);
-  // A state's buffers need memory that only a released extent gives.
+  // A state's buffers need memory that only a released extent gives: until
+  // one is released, each asks the engine's limit for one state's buffers,
+  // which it leaves no room for.
   const uint32_t releases = storage.releasedExtents;
-  executor.reservationRoom = [&] { return storage.releasedExtents > releases; };
+  executor.reservationRoom = [&] {
+    return storage.releasedExtents > releases || static_cast<bool>(host.reserve(64));
+  };
+  host.leaveRoom(0);
   for (uint32_t id = 1; id <= 2; ++id) {
     std::vector<uint32_t> prompt(193, 7);
     std::fill(prompt.begin() + 160, prompt.end(), id + 10);
@@ -1150,8 +1156,8 @@ void testSharedJunctionPublishesFromCachedKv() {
   runUntilIdle(engine);
   const auto snapshot = engine.snapshot();
   require(snapshot.junctionMaterializations == 1 &&
-              snapshot.junctionMaterializationFailures == 0 && executor.restored == 160 &&
-              executor.prefillRows == 193 + 33 && events.completedCount == 2,
+              snapshot.junctionMaterializationFailures == 0 && storage.releasedExtents > releases &&
+              executor.restored == 160 && executor.prefillRows == 193 + 33 && events.completedCount == 2,
           "the shared junction did not make room from cached KV");
 }
 
