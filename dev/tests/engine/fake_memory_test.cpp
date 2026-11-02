@@ -383,17 +383,20 @@ void testATickThatChangesNothingSpinsOnlyWhenItWouldRunAgain() {
   require(harness.now() == 1.0, "the harness clock moved");
 }
 
-// The model's spilled-read shortfall queries count per candidate and
-// admission state: two in one state count twice, one after an allocation
-// counts in the next.
+// The model's spilled-read shortfall queries count per candidate, admission
+// state and kind: two of one kind in one state count twice, one of the other
+// kind apart, one after an allocation in the next state.
 void testShortfallQueriesCountPerCandidateAndState() {
   test::EngineHarness harness({.memory = sixteen(), .limits = {.limitBytes = 6 * kGiB}});
   static_cast<void>(harness.model.spilledReadShortfall(5, {}));
   static_cast<void>(harness.model.spilledReadShortfall(5, {}));
   require(harness.mostShortfallQueries() == 2, "two queries in one state were not counted");
+  static_cast<void>(harness.model.spilledReadShortfall(5, {.kind = WorkKind::Prefill, .pages = 4}));
+  require(harness.shortfallQueries().size() == 2 && harness.mostShortfallQueries() == 2,
+          "a prefill's query counted with a decode's");
   harness.memory->hold("kv", 4096);
   static_cast<void>(harness.model.spilledReadShortfall(5, {}));
-  require(harness.shortfallQueries().size() == 2 && harness.mostShortfallQueries() == 2,
+  require(harness.shortfallQueries().size() == 3 && harness.mostShortfallQueries() == 2,
           "a query after an allocation counted in the same state");
 }
 

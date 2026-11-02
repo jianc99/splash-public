@@ -31,6 +31,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -60,8 +61,9 @@ class EngineHarness final {
 public:
   struct Command final {
     WorkKind kind = WorkKind::Decode;
+    // Each lane, its rows and where they start in its prompt.
     std::vector<uint64_t> lanes;
-    std::vector<uint32_t> rows;
+    std::vector<uint32_t> rows, positions;
     uint32_t pass = 0, passes = 1;
     double startMilliseconds = 0, wallMilliseconds = 0;
   };
@@ -103,6 +105,7 @@ public:
       for (const BatchItem &item : plan.items) {
         command.lanes.push_back(item.requestId);
         command.rows.push_back(item.tokenCount);
+        command.positions.push_back(item.promptOffset);
       }
       commands_.push_back(std::move(command));
     };
@@ -174,9 +177,11 @@ public:
   // received them.
   [[nodiscard]] const std::vector<Command> &commands() const noexcept { return commands_; }
   // The model's spilled-read shortfall queries (Model::spilledReadShortfall)
-  // of each candidate in each admission state, and the most one candidate
-  // made in one state. The governor's available() calls are not counted.
-  [[nodiscard]] const std::map<std::pair<uint64_t, uint64_t>, uint32_t> &shortfallQueries() const noexcept {
+  // of each candidate in each admission state by the need's kind, and the
+  // most one candidate made of one kind in one state. The governor's
+  // available() calls are not counted: the governor gives no hook to count
+  // them by.
+  [[nodiscard]] const std::map<std::tuple<uint64_t, uint64_t, WorkKind>, uint32_t> &shortfallQueries() const noexcept {
     return model.shortfallQueries;
   }
   [[nodiscard]] uint32_t mostShortfallQueries() const noexcept {

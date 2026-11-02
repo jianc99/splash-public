@@ -22,6 +22,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -589,9 +590,9 @@ public:
   }
   // The bytes reserveSpilledReads(id, need) would allocate now: a decode's
   // floor unless held, a prefill's staging beyond what it holds. Each call
-  // counts for the request in the admission state now.
+  // counts for the request and the need's kind in the admission state now.
   uint64_t spilledReadShortfall(uint64_t id, model::SpilledReadNeed need) const override {
-    ++shortfallQueries[{id, admissionState ? admissionState() : 0}];
+    ++shortfallQueries[{id, admissionState ? admissionState() : 0, need.kind}];
     if (need.kind == WorkKind::Decode)
       return spilledReadFloors.contains(id) ? 0 : spilledReadFloorBytes;
     const auto staged = historyStaging.find(id);
@@ -1118,10 +1119,10 @@ public:
   // Runs as each command that takes those times (or commandTimes') is
   // submitted.
   std::function<void(const BatchPlan &, const CommandTimes &)> commandTimed;
-  // The spilled-read shortfall queries of each request in each admission
-  // state, which admissionState names.
+  // The spilled-read shortfall queries of each request, admission state
+  // (which admissionState names) and kind (a prefill's or a decode's need).
   std::function<uint64_t()> admissionState;
-  mutable std::map<std::pair<uint64_t, uint64_t>, uint32_t> shortfallQueries;
+  mutable std::map<std::tuple<uint64_t, uint64_t, WorkKind>, uint32_t> shortfallQueries;
 
   // Holds every command until the flag it returns is set.
   std::shared_ptr<std::atomic<bool>> holdCommands() {
