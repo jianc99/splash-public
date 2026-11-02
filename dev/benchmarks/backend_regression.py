@@ -20,10 +20,13 @@ this machine, which must be otherwise idle:
   runs that share and must report it. Without it startup calibrates the split
   from timings, so the first share and least chunk rows a round reports are
   those every later round runs.
-- speed (abba.compare): decode GPU milliseconds per step for B1-B4, the GPU
-  time of the 14,096-token cold prefill (partial_4k_cold), the TTFT of its
-  partial hit (partial_4k_hit) and the GPU time of each short cold prefill
-  (short_<rows>_rows_prefill_gpu_ms, by the rows of its one chunk).
+- speed (abba.compare): decode GPU milliseconds per step and wall
+  milliseconds per output token for B1-B4, the GPU time and the wall time of
+  the 14,096-token cold prefill (partial_4k_cold), the TTFT of its partial
+  hit (partial_4k_hit), and the GPU time and the TTFT of each short cold
+  prefill (short_<rows>_rows_*, by the rows of its one chunk). The wall times
+  hold what the GPU times leave out: host work between commands and the
+  engine's own scheduling.
 - memory plan: the candidate's plan holds no less context without the Neural
   Engine split than the baseline's holds without it; the split takes its
   memory from the KV cache. The context each serves, the candidate's what its
@@ -182,6 +185,8 @@ def round_record(version: str, document: dict) -> dict:
                 "decode_batches": sample["decode_batches"],
                 "decode_gpu_ms": sample["decode_gpu_ms"],
                 "gpu_ms_per_step": sample["decode_gpu_ms"] / sample["decode_batches"],
+                "wall_ms_per_token": sample["decode_wall_ms"]
+                / sample["decode_output_tokens"],
             }
         )
     for measurement in document["measurements"]:
@@ -190,6 +195,7 @@ def round_record(version: str, document: dict) -> dict:
             "output_tokens": measurement["output_tokens"],
             "prefill_gpu_ms": measurement["prefill_gpu_ms"],
             "ttft_ms": measurement["ttft_ms"],
+            "wall_ms": measurement["wall_ms"],
         }
         if measurement["scenario"] in partial:
             partial[measurement["scenario"]].append(request)
@@ -225,8 +231,16 @@ def metrics(rounds: list[dict]) -> dict:
             [sample["gpu_ms_per_step"] for sample in record["decode"][width]]
             for record in rounds
         ]
+        result[f"decode_B{width}_wall_ms_per_token"] = [
+            [sample["wall_ms_per_token"] for sample in record["decode"][width]]
+            for record in rounds
+        ]
     result["partial_4k_cold_prefill_gpu_ms"] = [
         [request["prefill_gpu_ms"] for request in record["partial"]["partial_4k_cold"]]
+        for record in rounds
+    ]
+    result["partial_4k_cold_wall_ms"] = [
+        [request["wall_ms"] for request in record["partial"]["partial_4k_cold"]]
         for record in rounds
     ]
     result["partial_4k_hit_ttft_ms"] = [
@@ -236,6 +250,10 @@ def metrics(rounds: list[dict]) -> dict:
     for rows in rounds[0]["short"]:
         result[f"short_{rows}_rows_prefill_gpu_ms"] = [
             [request["prefill_gpu_ms"] for request in record["short"][rows]]
+            for record in rounds
+        ]
+        result[f"short_{rows}_rows_ttft_ms"] = [
+            [request["ttft_ms"] for request in record["short"][rows]]
             for record in rounds
         ]
     return result

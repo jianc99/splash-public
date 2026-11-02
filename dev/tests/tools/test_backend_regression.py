@@ -28,6 +28,8 @@ def benchmark_document(
             "drafted_tokens": 64,
             "decode_batches": 8,
             "decode_gpu_ms": step * width * 8,
+            "decode_output_tokens": 64 * width,
+            "decode_wall_ms": 1.25 * 64 * width,
         }
         for sample in range(2)
         for width in regression.WIDTHS
@@ -46,6 +48,7 @@ def benchmark_document(
             "output_tokens": [7],
             "prefill_gpu_ms": 1000.0,
             "ttft_ms": 300.0,
+            "wall_ms": 320.0,
         }
         for sample in range(2)
         for scenario, tokens in requests
@@ -95,17 +98,31 @@ class BackendRegressionTests(unittest.TestCase):
         self.assertEqual(summary["failures"], [])
         self.assertTrue(summary["pass"])
         decode_and_partial = [
-            f"decode_B{width}_gpu_ms_per_step" for width in regression.WIDTHS
-        ] + ["partial_4k_cold_prefill_gpu_ms", "partial_4k_hit_ttft_ms"]
+            f"decode_B{width}_{metric}"
+            for width in regression.WIDTHS
+            for metric in ("gpu_ms_per_step", "wall_ms_per_token")
+        ] + [
+            "partial_4k_cold_prefill_gpu_ms",
+            "partial_4k_cold_wall_ms",
+            "partial_4k_hit_ttft_ms",
+        ]
         self.assertEqual(
             sorted(summary["speed"]),
             sorted(
                 decode_and_partial
-                + [f"short_{rows}_rows_prefill_gpu_ms" for rows in regression.SHORT]
+                + [
+                    f"short_{rows}_rows_{metric}"
+                    for rows in regression.SHORT
+                    for metric in ("prefill_gpu_ms", "ttft_ms")
+                ]
             ),
         )
         # GPU time per decode step, not per request.
         self.assertEqual(summary["speed"]["decode_B2_gpu_ms_per_step"]["baseline"], 20)
+        # Wall time per output token: the decode phase over the lanes' tokens.
+        self.assertEqual(
+            summary["speed"]["decode_B2_wall_ms_per_token"]["baseline"], 1.25
+        )
         self.assertEqual(summary["acceptance"]["B1"]["candidate"], 40 / 64)
 
     def test_speed_regressions_fail_per_metric(self):
@@ -129,6 +146,9 @@ class BackendRegressionTests(unittest.TestCase):
                 "prefill_gpu_ms", 1.05, "partial_4k_cold"
             ),
             "partial_4k_hit_ttft_ms": slower("ttft_ms", 1.05, "partial_4k_hit"),
+            "decode_B3_wall_ms_per_token": slower("decode_wall_ms", 1.05, width=3),
+            "partial_4k_cold_wall_ms": slower("wall_ms", 1.05, "partial_4k_cold"),
+            "short_1024_rows_ttft_ms": slower("ttft_ms", 1.05, "short", tokens=1024),
             # A prompt of a 512-row chunk 2.5% slower: beyond the 2% floor.
             "short_512_rows_prefill_gpu_ms": slower(
                 "prefill_gpu_ms", 1.025, "short", tokens=512
