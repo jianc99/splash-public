@@ -1,5 +1,6 @@
 #include "model/QwenTarget.hpp"
 
+#include "model/Flint.hpp"
 #include "model/Qwen3_6Moe.hpp"
 #include "model/Qwen3_8.hpp"
 #include "model/WeightStore.hpp"
@@ -449,8 +450,10 @@ template <class Buffers> metal::MetalBuffer mixerOutput(const Buffers &b, const 
   return b.attentionOutput;
 }
 
-// The Qwen3.5 architecture: Qwen3.8-27B (model/Qwen3_8.hpp, a dense FFN) and
-// Qwen3.6-35B-A3B (model/Qwen3_6Moe.hpp, a sparse MoE). Layer l reads its
+// The Qwen3.5 architecture: Qwen3.8-27B (model/Qwen3_8.hpp, a dense FFN),
+// Qwen3.6-35B-A3B (model/Qwen3_6Moe.hpp, a sparse MoE) and Flint
+// (model/Flint.hpp: every layer attends, with its sinks, and its FFN is dense
+// on the leading layers and a MoE block on the others). Layer l reads its
 // input rows from buffers.hidden[l & 1]; its mixer and its FFN each read the
 // RMS norm of the rows before them and add their output to them, into the
 // other buffer. The layers the draft reads copy their output rows into the
@@ -547,6 +550,15 @@ private:
                      metal::MetalBuffer residual, metal::MetalBuffer output) const {
     addPrefillMoeRouting(step, layer.postAttentionNorm, layer.ffn, std::move(residual), std::move(output));
   }
+  void addPrefillFfn(PrefillStep &step, uint32_t index, const FlintLayerWeights &layer, metal::MetalBuffer residual,
+                     metal::MetalBuffer output) const {
+    if (const auto *dense = std::get_if<FlintDenseFfnWeights>(&layer.ffn))
+      addPrefillDenseFfn(step, index, layer.postAttentionNorm, dense->projections(), std::move(residual),
+                         std::move(output));
+    else
+      addPrefillMoeRouting(step, layer.postAttentionNorm, std::get<ops::BlockMoeWeights>(layer.ffn),
+                           std::move(residual), std::move(output));
+  }
 
   void addVerifyFfn(VerifyStep &step, const Qwen3_8LayerWeights &layer, metal::MetalBuffer residual,
                     metal::MetalBuffer output) const {
@@ -555,6 +567,14 @@ private:
   void addVerifyFfn(VerifyStep &step, const Qwen3_6MoeLayerWeights &layer, metal::MetalBuffer residual,
                     metal::MetalBuffer output) const {
     addVerifyMoe(step, layer.postAttentionNorm, layer.ffn, std::move(residual), std::move(output));
+  }
+  void addVerifyFfn(VerifyStep &step, const FlintLayerWeights &layer, metal::MetalBuffer residual,
+                    metal::MetalBuffer output) const {
+    if (const auto *dense = std::get_if<FlintDenseFfnWeights>(&layer.ffn))
+      addVerifyDenseFfn(step, layer.postAttentionNorm, dense->projections(), std::move(residual), std::move(output));
+    else
+      addVerifyMoe(step, layer.postAttentionNorm, std::get<ops::BlockMoeWeights>(layer.ffn), std::move(residual),
+                   std::move(output));
   }
   static ops::SwiGluProjections swiGlu(const Qwen3_8LayerWeights &layer) {
     return {&layer.gateProjection, &layer.upProjection, &layer.downProjection};
@@ -575,6 +595,8 @@ std::unique_ptr<QwenTarget> makeQwenTarget(const QwenTargetWeights<Layout, Layer
 template std::unique_ptr<QwenTarget> makeQwenTarget(const Qwen3_8Weights &, const QwenTargetGeometry &,
                                                     metal::MetalBackend &, const ops::ExecutionPlans &, uint32_t);
 template std::unique_ptr<QwenTarget> makeQwenTarget(const Qwen3_6MoeWeights &, const QwenTargetGeometry &,
+                                                    metal::MetalBackend &, const ops::ExecutionPlans &, uint32_t);
+template std::unique_ptr<QwenTarget> makeQwenTarget(const FlintWeights &, const QwenTargetGeometry &,
                                                     metal::MetalBackend &, const ops::ExecutionPlans &, uint32_t);
 
 } // namespace splash::model

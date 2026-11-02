@@ -16,8 +16,9 @@
 //    one, which runs as two slices of the routed width (ops::MoeShape).
 //  - Four tokens end a turn, and no mask token is its own: a DFlash2 draft
 //    chooses one of its reserved special tokens.
-// Its target (model/FlintTarget.hpp) is a QwenTarget over those blocks. Its
-// weights load from a GGUF only.
+// Its target is the Qwen3.5 architecture's (model/QwenTarget.cpp) over its
+// layers: every layer attends and none keeps GDN state. Its weights load from
+// a GGUF only.
 
 #include "QwenHybridLayout.hpp"
 #include "QwenTarget.hpp"
@@ -95,12 +96,12 @@ struct FlintDenseFfnWeights final {
   [[nodiscard]] ops::SwiGluProjections projections() const noexcept { return {&gate, &up, &down}; }
 };
 
-// A layer: its attention with its sinks, the norms before it and before the
-// FFN, and the FFN, dense on the leading layers and a MoE block on the
-// others (QwenTargetDimensions::isMoeLayer).
+// A layer: its mixer, an attention with its sinks, the norms before it and
+// before the FFN, and the FFN, dense on the leading layers and a MoE block on
+// the others (QwenTargetDimensions::isMoeLayer).
 struct FlintLayerWeights final {
   ops::NormWeights inputNorm;
-  QwenAttentionWeights mixer;
+  QwenMixerWeights mixer;
   ops::NormWeights postAttentionNorm;
   std::variant<FlintDenseFfnWeights, ops::BlockMoeWeights> ffn;
 };
@@ -114,11 +115,5 @@ using FlintWeights = QwenTargetWeights<FlintLayout, FlintLayerWeights>;
 [[nodiscard]] const ops::BlockMoeWeights *qwenMoeBlock(const FlintLayerWeights &layer) noexcept;
 // The projections its dense layers dispatch (qwenTargetGeometry).
 void includeFamilyProjections(QwenTargetGeometry &geometry, const FlintWeights &weights);
-// Its target (model/FlintTarget.hpp), which keeps no step scratch of its own.
-[[nodiscard]] std::unique_ptr<QwenTarget> makeQwenTarget(const FlintWeights &weights,
-                                                         const QwenTargetGeometry &geometry,
-                                                         metal::MetalBackend &backend,
-                                                         const ops::ExecutionPlans &operators,
-                                                         uint32_t prefillChunks);
 
 } // namespace splash::model

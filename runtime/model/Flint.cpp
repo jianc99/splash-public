@@ -19,8 +19,9 @@ FlintWeights loadFlintWeights(metal::MetalBackend &backend, FlintLayout layout, 
           WeightFile file = gguf.layer(index);
           FlintLayerWeights &layer = result.layers.emplace_back();
           layer.inputNorm = format.norm(file, layout.hiddenSize, "input-norm");
-          layer.mixer = readQwenAttention(file, format, layout);
-          layer.mixer.sinks = file.section(uint64_t{layout.attentionQueryHeads} * kFloat32Bytes, "attention-sinks");
+          QwenAttentionWeights attention = readQwenAttention(file, format, layout);
+          attention.sinks = file.section(uint64_t{layout.attentionQueryHeads} * kFloat32Bytes, "attention-sinks");
+          layer.mixer = std::move(attention);
           layer.postAttentionNorm = format.norm(file, layout.hiddenSize, "post-attention-norm");
           if (layout.isMoeLayer(index)) {
             layer.ffn = readMoeBlock(file, layout, experts, layout.moeBlock(index));

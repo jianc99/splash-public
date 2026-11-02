@@ -39,8 +39,8 @@ struct Qwen3_8LayerWeights;
 struct Qwen3_6MoeLayout;
 struct Qwen3_6MoeLayerWeights;
 
-// Both supported targets bind the same mixer tensors per hybrid layer; only
-// the FFN differs between them.
+// Every Qwen family binds these mixer tensors per layer, a GDN or an
+// attention; their FFNs differ.
 struct QwenGdnWeights final {
   ops::Projection inputProjection;
   metal::MetalBuffer convolutionWeights;
@@ -83,9 +83,8 @@ struct QwenTargetWeightsBase {
   std::shared_ptr<SparseRowStore> streamedTable;
 };
 
-// The weights of a Qwen3.5-architecture target of Layout, whose layers the
-// family keeps in Layer, and the norm the head reads its last layer's output
-// through.
+// The weights of a Qwen target of Layout, whose layers the family keeps in
+// Layer, and the norm the head reads its last layer's output through.
 template <class Layout, class Layer> struct QwenTargetWeights final : QwenTargetWeightsBase {
   Layout layout;
   std::vector<Layer> layers;
@@ -426,9 +425,9 @@ template <class Weights>
 // wiring each for prefill and for verify), the FFNs of a residual of one
 // row (a dense SwiGLU and a MoE block's routing and experts), the draft's
 // captures and the normed head; each family composes them into its layers
-// and residual: the Qwen3.5 architecture's (Qwen3.8-27B and
-// Qwen3.6-35B-A3B, model/QwenTarget.cpp), Qwen3.8-Flash-Next's
-// (model/Qwen4ExpTarget.cpp) and Flint's (model/FlintTarget.cpp).
+// and residual: the Qwen3.5 architecture's (Qwen3.8-27B, Qwen3.6-35B-A3B and
+// Flint, model/QwenTarget.cpp) and Qwen3.8-Flash-Next's
+// (model/Qwen4ExpTarget.cpp).
 // A family that needs more of a step than the buffers the runtime binds
 // keeps that scratch itself (qwenTargetScratchBytes) and makes its own
 // inputs of the step's tokens; the runtime calls the same functions for
@@ -712,7 +711,7 @@ private:
 };
 
 // The target of a Qwen3.5-architecture family's weights (Qwen3.8-27B,
-// Qwen3.6-35B-A3B), whose prefill commands run up to `prefillChunks` chunks,
+// Qwen3.6-35B-A3B, Flint), whose prefill commands run up to `prefillChunks` chunks,
 // and the step scratch it keeps itself (none: it has no table to stream).
 template <class Layout, class Layer>
 [[nodiscard]] std::unique_ptr<QwenTarget> makeQwenTarget(const QwenTargetWeights<Layout, Layer> &weights,

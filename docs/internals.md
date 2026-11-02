@@ -317,9 +317,9 @@ A family's target is a `QwenTarget` (`QwenTarget.hpp`) composed of the blocks
 every Qwen target shares: a step's checks and plans, the GDN and attention
 mixers, the FFNs of a residual of one row (a dense SwiGLU and a MoE block's
 routing and experts), the draft's captures and the normed head. The Qwen3.5
-architecture's target (`Qwen3_5Target`, `QwenTarget.cpp`), Flash-Next's
-(`Qwen4ExpTarget`) and Flint's (`FlintTarget`) each compose them into their own
-layer loop. What a family changes in a block is a value of its layout
+architecture's target (`Qwen3_5Target`, `QwenTarget.cpp`), which Flint's
+layers run too, and Flash-Next's (`Qwen4ExpTarget`) each compose them into
+their own layer loop. What a family changes in a block is a value of its layout
 (`QwenTargetDimensions`), read by the shared block rather than branched on: an
 attention layer's variant (`QwenTargetGeometry::attentionVariant`: rotated by
 the target's RoPE unless `unrotatedLayers` names it, over a sliding window of
