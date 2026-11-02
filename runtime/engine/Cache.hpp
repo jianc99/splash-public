@@ -425,12 +425,15 @@ public:
   // on more than one of its branches, which no single conversation went on
   // from. persist() copies only such a point.
   [[nodiscard]] bool newestPoint(uint64_t block) const;
-  // The cached KV leaves and states reclaims took out of RAM to the disk
-  // tier, written for it or freed through the copy they had: each shows that
-  // memory ran short, which a temporary tier's copies ahead of need wait for
+  // The units reclaims reached whose memory a copy on the disk tier would
+  // have let go at once: KV leaves a state needs and states, without a copy
+  // while the tier takes their writes, whether the reclaim wrote them, waited
+  // for the write in flight, or passed over them because it writes nothing
+  // or waits for nothing. Until the engine's claims weigh copies ahead, a
+  // temporary tier copies points ahead while such reclaims are recent
   // (WriteBehind).
-  [[nodiscard]] uint64_t reclaimedToDisk() const noexcept {
-    return reclaimedToDisk_ + states_.reclaimedToDisk();
+  [[nodiscard]] uint64_t uncopiedReached() const noexcept {
+    return uncopiedReached_ + states_.uncopiedReached();
   }
   // At a clean stop: the label of each state copy a persistent tier keeps
   // takes its state's current recency, which the next process orders them
@@ -1375,8 +1378,8 @@ private:
   std::unordered_map<uint64_t, Request> requests_;
   // The chains requests waiting to start restore (setWantedChains).
   RestoredChains wanted_;
-  // KV leaves reclaims took out of RAM to the disk tier (reclaimedToDisk).
-  uint64_t reclaimedToDisk_ = 0;
+  // KV leaves reclaims reached that needed a copy first (uncopiedReached).
+  uint64_t uncopiedReached_ = 0;
   // Writes in flight, in the order they started. Only reclaim demotions,
   // and writes of pages that spill once they land, free memory a reclaim
   // waits for (pendingPages); the other copies persist() keeps hold only

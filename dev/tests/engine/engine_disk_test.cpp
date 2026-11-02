@@ -589,7 +589,7 @@ void testWaitingPlanDoesNotIdleRunnableLanes() {
 // Memory runs short once: a reclaim writes a cached state as it leaves RAM
 // and then demotes the leaf that state needs, both landing, so that nothing
 // of that conversation stays in RAM. A temporary tier copies points ahead
-// for a while after (WriteBehind::kNeedMilliseconds).
+// for a while after (WriteBehind::run, Cache::uncopiedReached).
 void runShortOfMemory(engine::Cache &cache, test::TestKvTier &tier) {
   cacheBlocksUnderDiskStates(cache, 1);
   require(cache.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::Ordinary).madeProgress,

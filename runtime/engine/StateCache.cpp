@@ -396,6 +396,7 @@ StateEviction StateCache::reclaim(uint64_t kvBlock, Unwritten unwritten) {
     return {false, true};
   // One write at a time, of a class the tier takes now.
   const bool writable = !entry.disk && entry.ram->canOffload(inUse(kvBlock));
+  uncopiedReached_ += writable;
   if (writable && unwritten == Unwritten::Stay)
     return {};
   if (writable && pending_ && unwritten != Unwritten::Drop)
@@ -413,7 +414,6 @@ StateEviction StateCache::reclaim(uint64_t kvBlock, Unwritten unwritten) {
   // A write reads its own copy, so the RAM copy is free at once.
   discardRam(entry);
   reindex(kvBlock, entry);
-  ++reclaimedToDisk_;
   return {true};
 }
 

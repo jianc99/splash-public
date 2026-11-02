@@ -2,14 +2,14 @@
 
 namespace splash::engine {
 
-WriteBehind::WriteBehind(Cache &cache) : cache_(cache), needed_(cache.persistent()) {}
+WriteBehind::WriteBehind(Cache &cache) : cache_(cache), copying_(cache.persistent()) {}
 
 void WriteBehind::published(uint64_t block, uint32_t tokens, double now) {
   if (!cache_.kvTierWritable() || tokens < kMinimumTokens || queued_.contains(block))
     return;
-  // While copies wait for need, the queue keeps only the points their
+  // While copies wait for demand, the queue keeps only the points their
   // conversations still resume from.
-  if (!needed(now))
+  if (!copying_)
     std::erase_if(waiting_, [&](const Point &point) {
       if (cache_.newestPoint(point.block))
         return false;
@@ -39,24 +39,43 @@ bool WriteBehind::settle(PersistStatus status) {
   return false;
 }
 
-bool WriteBehind::needed(double now) {
-  if (cache_.persistent())
-    return true;
-  if (const uint64_t reclaimed = cache_.reclaimedToDisk(); reclaimed != reclaimedToDisk_) {
-    reclaimedToDisk_ = reclaimed;
-    shortAt_ = now;
+bool WriteBehind::reachedRecently(double now) {
+  if (const uint64_t reached = cache_.uncopiedReached(); reached != uncopiedReached_) {
+    uncopiedReached_ = reached;
+    reachedAt_ = now;
   }
-  needed_ = shortAt_ && now - *shortAt_ < kNeedMilliseconds;
-  return needed_;
+  return reachedAt_ && now - *reachedAt_ < kValueHorizonSeconds * 1000.0;
+}
+
+bool WriteBehind::demanded(uint64_t demandBytes) const {
+  // What a growth that displaces cache could take now, which starts no
+  // write and waits for none.
+  const ClaimSpec atOnce{.cls = ClaimClass::Growth, .timing = NeedTiming::Immediate};
+  const VictimQuery query{.claim = &atOnce, .need = {.bytes = demandBytes}};
+  uint64_t covered = 0;
+  for (std::optional<Victim> unit = cache_.peek(query, nullptr); unit && covered < demandBytes;
+       unit = cache_.peek(query, &*unit))
+    covered += unit->bytes;
+  return covered < demandBytes;
 }
 
 bool WriteBehind::inUse(uint64_t block) const noexcept {
   return !cache_.persistent() && cache_.stateInUse(block);
 }
 
-bool WriteBehind::run(double now, bool, bool claimWaiting) {
+bool WriteBehind::run(double now, uint64_t demandBytes, bool claimWaiting) {
+  copying_ = cache_.persistent() || demandBytes;
+  return step(now, claimWaiting, [&] { return cache_.persistent() || demanded(demandBytes); });
+}
+
+bool WriteBehind::run(double now, bool memoryAwaited) {
+  copying_ = cache_.persistent() || reachedRecently(now);
+  return step(now, memoryAwaited, [] { return true; });
+}
+
+bool WriteBehind::step(double now, bool claimWaiting, const std::function<bool()> &copies) {
   stalled_ = false;
-  if (!needed(now) || claimWaiting)
+  if (!copying_ || claimWaiting)
     return false;
   bool settled = false;
   for (auto point = waiting_.begin(); point != waiting_.end() && point->due <= now;) {
@@ -64,6 +83,8 @@ bool WriteBehind::run(double now, bool, bool claimWaiting) {
       ++point;
       continue;
     }
+    if (!copies())
+      break;
     if (!settle(cache_.persist(point->block))) {
       stalled_ = true;
       break;
@@ -94,7 +115,7 @@ std::optional<double> WriteBehind::nextWakeup() const {
   // which wakes the engine, or once the write budget has room again, which
   // does not. A point in use waits for its request's end, a step of the
   // engine, which runs this again.
-  if (!needed_)
+  if (!copying_)
     return std::nullopt;
   for (const Point &point : waiting_)
     if (!inUse(point.block))

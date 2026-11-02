@@ -1825,16 +1825,20 @@ write next. A demotion or write through started meanwhile waits on the KV
 file's worker behind at most the copies in flight, a quarter of the tier's
 writes, and a state a reclaim writes waits for the point's, the one state write
 in flight, as for any other. A temporary tier's copies serve reclaims alone, so
-they wait for need: a point is copied only within 5 minutes
-(`WriteBehind::kNeedMilliseconds`) of a reclaim last taking cache out of RAM to
-the tier (`Cache::reclaimedToDisk`), a KV leaf or a state, written for it or
-freed through the copy it had, which shows that memory ran short. What leaves
-through a copy counts as much as what is written, so that the copies go on
-while memory stays short and reclaims find what they take copied, writing
-nothing. Without memory pressure nothing is written ahead. A point that waits
-for need keeps its turn while it stays its conversation's newest: a publication
-meanwhile drops the queued points their conversations went on from or that are
-gone (`Cache::newestPoint`), so that need, once it comes, finds no backlog of
+they wait for the memory's demand (`WriteBehind::run`): twice the bytes the
+claim ahead will take, while a recent claim reached cache that a copy would
+have let go at once, and a point is copied only while the cache's victims that
+go at once, starting no write and waiting for none, hold less than that (the
+cache's walk, `Cache::peek`). Until the engine's claims weigh that demand, a
+point is copied within `kValueHorizonSeconds` of a reclaim that reached a KV
+leaf a state needs, or a state, without a copy while the tier takes writes
+(`Cache::uncopiedReached`), whether it wrote it, waited for the write in
+flight or passed over it; what leaves through a copy it has counts for
+nothing, so the copies stop once reclaims find what they take copied. Without
+that nothing is written ahead. A point that waits for demand keeps its turn
+while it stays its conversation's newest: a publication meanwhile drops the
+queued points their conversations went on from or that are gone
+(`Cache::newestPoint`), so that demand, once it comes, finds no backlog of
 superseded points. There a point also waits while it is in use, as its request
 holds its chain and may go on from it, and its copies take only the room the
 quota has free beside the other copies and the commitments of Spill requests,

@@ -315,8 +315,9 @@ public:
   void promotionSkipped() noexcept { ++promotionsSkipped_; }
   // The one state write is in flight; its RAM or quota returns when it lands.
   [[nodiscard]] bool writing() const noexcept { return pending_.has_value(); }
-  // The RAM copies reclaim() freed for a disk copy, written then or before.
-  [[nodiscard]] uint64_t reclaimedToDisk() const noexcept { return reclaimedToDisk_; }
+  // The RAM copies reclaim() reached that needed a write first, written
+  // then, waiting for the write in flight, or staying (Stay).
+  [[nodiscard]] uint64_t uncopiedReached() const noexcept { return uncopiedReached_; }
   [[nodiscard]] bool pollOffload();
   [[nodiscard]] StateCacheSnapshot snapshot() const noexcept;
 
@@ -426,7 +427,7 @@ private:
   uint64_t checkpointEvictions_ = 0;
   uint64_t offloads_ = 0;
   uint64_t offloadFailures_ = 0;
-  uint64_t reclaimedToDisk_ = 0;
+  uint64_t uncopiedReached_ = 0;
   uint64_t invalidations_ = 0;
   // Destroyed before entries_: the ticket's disk copy may still be an entry.
   std::optional<PendingOffload> pending_;

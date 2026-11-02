@@ -591,8 +591,8 @@ target keeps the KV of its long requests there ([KV on the SSD](#kv-on-the-ssd))
 While memory runs short, the cache also copies each conversation's newest
 restore point at least 2048 tokens deep there ahead of need, the state its next
 turn resumes from and the KV of the prompt up to it, while its memory copy
-stays. It does so while a reclaim has taken cached KV or a state out of memory
-to the SSD within the last 5 minutes: 10 s after the point was published, once
+stays. It does so while a reclaim has reached cached KV or a state that had no
+copy there within the last minute: 10 s after the point was published, once
 its request has ended, unless the conversation has gone on from it by then, so
 a step of a tool loop that goes on within that time costs no write. A point
 that falls due while memory is not short waits, and is copied once memory runs

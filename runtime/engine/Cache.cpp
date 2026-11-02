@@ -1598,13 +1598,14 @@ Cache::LeafReclaim Cache::reclaimKvLeaf(uint64_t block, ReclaimTiming timing) {
   // copy.
   if (kv_.slot(block)) {
     kv_.dropPage(block);
-    ++reclaimedToDisk_;
     return LeafReclaim::Started;
   }
   // The leaf is written for a state on it or below it, and disk copies below
   // that no state needs go with it. A writable tier means a demotion, whose
-  // page returns only when the copy lands.
+  // page returns only when the copy lands: the reclaim reached a leaf a copy
+  // ahead would have let go at once.
   if (kvNeededByState(block)) {
+    uncopiedReached_ += kvTierWritable();
     if (timing == ReclaimTiming::Immediate && kvTierWritable())
       return LeafReclaim::Impossible;
     const LeafReclaim demotion = demoteKv(block);
@@ -2356,7 +2357,6 @@ Cache::LeafReclaim Cache::demoteKv(uint64_t block) {
   kv_.setSlot(block, std::move(slot));
   kv_.setTransfer(block, KvCache::Transfer::Draining);
   writes_.push_back({block, WriteClass::Reclaim, std::move(transfer)});
-  ++reclaimedToDisk_;
   return LeafReclaim::Started;
 }
 
