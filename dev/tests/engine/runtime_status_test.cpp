@@ -210,6 +210,14 @@ void testCleanRuntimeStatus(const char *goldenPath) {
   governor.hostSpareReserveBytes = 2 * kGiB;
   governor.hostHeadroomBytes = 6 * kGiB;
   governor.hostGrowthAllowed = true;
+  // The host as macOS counts it: the process's footprint, part of it
+  // compressed, the host's file-backed and inactive pages and its file
+  // cache's minimum.
+  governor.hostTelemetry = HostTelemetry{.physFootprintBytes = 5 * kGiB,
+                                         .compressedBytes = 256 * kMiB,
+                                         .fileBackedBytes = 3 * kGiB,
+                                         .inactiveBytes = 2 * kGiB,
+                                         .fileCacheMinimumBytes = 6 * kGiB};
   // The ledger's KV account, of extents of 32 pages, and the experts' pool,
   // each growing by a unit; two demotions return two extents, one of them
   // owed to the requests that wait for memory.
@@ -652,6 +660,8 @@ void testMemoryPressureTelemetry() {
   governor.pressure = MemoryPressure::Critical;
   require(status().find("\"host_measurement_valid\":false") != std::string::npos,
           "missing host measurement was reported as a valid zero");
+  require(status().find("\"host_telemetry\":null") != std::string::npos,
+          "host telemetry macOS did not report was reported as zeros");
 }
 
 void testResourceWaitDiagnostics() {

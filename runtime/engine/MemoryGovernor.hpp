@@ -10,6 +10,9 @@
 #include <string>
 #include <vector>
 
+struct task_vm_info;
+struct vm_statistics64;
+
 namespace splash::engine {
 
 struct EngineConfig;
@@ -51,6 +54,29 @@ struct HostMemory final {
 // compressed, and one in critical pressure falls back to the pages it can
 // hand out as they are.
 [[nodiscard]] std::optional<HostMemory> queryHostMemory() noexcept;
+
+// The host's memory as macOS counts it beside the governor's estimate,
+// reported in /status and acted on by no rule (AMENDMENTS, Borrowed item 2):
+// the process's physical footprint and the part of it macOS holds
+// compressed (task_vm_info's phys_footprint and compressed), the host's
+// file-backed pages and its inactive and speculative pages (vm_statistics64
+// splits neither queue into file and anonymous pages), and the file cache
+// macOS keeps however short memory is (vm.vm_page_filecache_min), all in
+// bytes.
+struct HostTelemetry final {
+  uint64_t physFootprintBytes = 0;
+  uint64_t compressedBytes = 0;
+  uint64_t fileBackedBytes = 0;
+  uint64_t inactiveBytes = 0;
+  uint64_t fileCacheMinimumBytes = 0;
+};
+// The telemetry of a task's `task` and the host's `pages` of `pageSize` bytes
+// beside a file cache minimum of `fileCacheMinimumPages` pages.
+[[nodiscard]] HostTelemetry hostTelemetryOf(const task_vm_info &task, const vm_statistics64 &pages,
+                                            uint64_t fileCacheMinimumPages, uint64_t pageSize) noexcept;
+// The live telemetry of this process and its host; none when macOS does not
+// report any part of it.
+[[nodiscard]] std::optional<HostTelemetry> queryHostTelemetry() noexcept;
 
 enum class MemoryPressure : uint8_t {
   Normal,
@@ -164,6 +190,9 @@ struct MemoryGovernorSnapshot {
   // Allocation need not ask: admission names the host as the cause of every
   // refusal the host shares.
   bool hostGrowthAllowed = true;
+  // The host's memory as macOS counts it, which /status reports; none when
+  // it does not (queryHostTelemetry).
+  std::optional<HostTelemetry> hostTelemetry{};
   // The ledger's accounts, their reserved bytes summed, what transfers will
   // return, and the claims that wait.
   std::vector<MemoryAccountSnapshot> accounts{};

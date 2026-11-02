@@ -36,6 +36,19 @@ uint64_t spareHeadroom(const HostMemory &host, uint64_t spareReserveBytes, uint6
   return reservedBytes < spareAfterReserve ? spareAfterReserve - reservedBytes : 0;
 }
 
+// The host's page counts and page size; false when macOS reports neither.
+bool sampleHostPages(vm_statistics64_data_t &pages, vm_size_t &pageSize) noexcept {
+  mach_port_t host = mach_host_self();
+  mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+  const kern_return_t pageResult = host_page_size(host, &pageSize);
+  const kern_return_t pagesResult =
+      pageResult == KERN_SUCCESS
+          ? host_statistics64(host, HOST_VM_INFO64, reinterpret_cast<host_info64_t>(&pages), &count)
+          : pageResult;
+  mach_port_deallocate(mach_task_self(), host);
+  return pagesResult == KERN_SUCCESS && pageSize;
+}
+
 } // namespace
 
 uint64_t hostBudgetBytes(const HostMemory &host, uint64_t spareReserveBytes, uint64_t engineBytes) noexcept {
@@ -62,18 +75,9 @@ HostMemory estimateHostMemory(const HostMemoryPages &statistics, uint64_t pageSi
 }
 
 std::optional<HostMemory> queryHostMemory() noexcept {
-  mach_port_t host = mach_host_self();
   vm_size_t pageSize = 0;
   vm_statistics64_data_t statistics{};
-  mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
-  kern_return_t pageResult = host_page_size(host, &pageSize);
-  kern_return_t statisticsResult = pageResult == KERN_SUCCESS
-      ? host_statistics64(host, HOST_VM_INFO64,
-                          reinterpret_cast<host_info64_t>(&statistics),
-                          &count)
-      : pageResult;
-  mach_port_deallocate(mach_task_self(), host);
-  if (statisticsResult != KERN_SUCCESS || !pageSize) return std::nullopt;
+  if (!sampleHostPages(statistics, pageSize)) return std::nullopt;
 
   return estimateHostMemory(
       {.free = statistics.free_count,
@@ -84,6 +88,31 @@ std::optional<HostMemory> queryHostMemory() noexcept {
        .compressor = statistics.compressor_page_count,
        .compressed = statistics.total_uncompressed_pages_in_compressor},
       pageSize, querySystemMemoryPressure().value_or(MemoryPressure::Critical) != MemoryPressure::Critical);
+}
+
+HostTelemetry hostTelemetryOf(const task_vm_info &task, const vm_statistics64 &pages, uint64_t fileCacheMinimumPages,
+                              uint64_t pageSize) noexcept {
+  return {.physFootprintBytes = task.phys_footprint,
+          .compressedBytes = task.compressed,
+          .fileBackedBytes = uint64_t{pages.external_page_count} * pageSize,
+          .inactiveBytes = (uint64_t{pages.inactive_count} + pages.speculative_count) * pageSize,
+          .fileCacheMinimumBytes = fileCacheMinimumPages * pageSize};
+}
+
+std::optional<HostTelemetry> queryHostTelemetry() noexcept {
+  task_vm_info_data_t task{};
+  mach_msg_type_number_t taskCount = TASK_VM_INFO_COUNT;
+  if (task_info(mach_task_self(), TASK_VM_INFO, reinterpret_cast<task_info_t>(&task), &taskCount) != KERN_SUCCESS)
+    return std::nullopt;
+  vm_size_t pageSize = 0;
+  vm_statistics64_data_t pages{};
+  uint32_t fileCacheMinimum = 0;
+  size_t size = sizeof(fileCacheMinimum);
+  if (!sampleHostPages(pages, pageSize) ||
+      sysctlbyname("vm.vm_page_filecache_min", &fileCacheMinimum, &size, nullptr, 0) != 0 ||
+      size != sizeof(fileCacheMinimum))
+    return std::nullopt;
+  return hostTelemetryOf(task, pages, fileCacheMinimum, pageSize);
 }
 
 std::optional<MemoryPressure> querySystemMemoryPressure() noexcept {
@@ -304,7 +333,9 @@ void MemoryGovernor::reclaimed(ReclaimOutcome outcome) noexcept {
 
 MemoryGovernorSnapshot MemoryGovernor::snapshot() const noexcept {
   const std::optional<HostMemory> host = sampleHost();
-  return snapshot(host, hostState(host));
+  MemoryGovernorSnapshot result = snapshot(host, hostState(host));
+  result.hostTelemetry = queryHostTelemetry();
+  return result;
 }
 
 MemoryGovernorSnapshot MemoryGovernor::evaluate() noexcept {

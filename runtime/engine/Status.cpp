@@ -403,7 +403,13 @@ std::string runtimeStatusJson(
       << ",\"host_reserve_bytes\":" << memoryGovernor.hostReserveBytes
       << ",\"host_spare_bytes\":" << memoryGovernor.hostSpareBytes
       << ",\"host_spare_reserve_bytes\":" << memoryGovernor.hostSpareReserveBytes
-      << ",\"host_headroom_bytes\":" << memoryGovernor.hostHeadroomBytes;
+      << ",\"host_headroom_bytes\":" << memoryGovernor.hostHeadroomBytes << ",\"host_telemetry\":";
+  if (const std::optional<HostTelemetry> &host = memoryGovernor.hostTelemetry)
+    out << "{\"phys_footprint_bytes\":" << host->physFootprintBytes << ",\"compressed_bytes\":" << host->compressedBytes
+        << ",\"file_backed_bytes\":" << host->fileBackedBytes << ",\"inactive_bytes\":" << host->inactiveBytes
+        << ",\"filecache_min_bytes\":" << host->fileCacheMinimumBytes << '}';
+  else
+    out << "null";
   appendMemoryLedger(out, memoryGovernor);
   out << "}"
       << ",\"memory_audit\":" << memoryAudit.toStatusJson()

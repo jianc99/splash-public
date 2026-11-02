@@ -4,6 +4,8 @@
 #include "engine/MemoryGovernor.hpp"
 #include "engine/MemoryPlan.hpp"
 
+#include <mach/mach.h>
+
 #include <cstdlib>
 #include <functional>
 #include <iostream>
@@ -928,6 +930,40 @@ void testHostBudgetIsWhatThePassesKeep() {
           "an engine past the host's budget did not have a pass take it back");
 }
 
+// The host telemetry /status reports (AMENDMENTS, Borrowed item 2): the
+// task's physical footprint and its compressed bytes, not its resident size;
+// the host's file-backed pages, and its inactive and speculative pages, not
+// its active ones; and the file cache's minimum, each page count in bytes of
+// the host's pages. The live sample of this process reads them all, and the
+// governor's snapshot carries it.
+void testHostTelemetryReadsTheTaskAndTheHost() {
+  task_vm_info_data_t task{};
+  task.phys_footprint = 3 * kGiB;
+  task.compressed = 256 * kMiB;
+  task.resident_size = 5 * kGiB;
+  vm_statistics64_data_t pages{};
+  pages.external_page_count = 1000;
+  pages.inactive_count = 300;
+  pages.speculative_count = 20;
+  pages.active_count = 999;
+  pages.internal_page_count = 777;
+  const HostTelemetry telemetry = hostTelemetryOf(task, pages, 400, 16384);
+  require(telemetry.physFootprintBytes == 3 * kGiB && telemetry.compressedBytes == 256 * kMiB &&
+              telemetry.fileBackedBytes == 1000 * 16384ULL && telemetry.inactiveBytes == 320 * 16384ULL &&
+              telemetry.fileCacheMinimumBytes == 400 * 16384ULL,
+          "the host telemetry did not read the task's footprint and compressed bytes and the host's file-backed, "
+          "inactive and speculative pages and file cache minimum");
+  const std::optional<HostTelemetry> live = queryHostTelemetry();
+  require(live && live->physFootprintBytes && live->fileBackedBytes && live->fileCacheMinimumBytes,
+          "the live host telemetry is missing a part");
+  test::metalStatistics() = {};
+  metal::MetalBackend backend("unused");
+  MemoryGovernor governor(backend, 4 * kGiB, kGiB, kGiB, [] { return hostMemory(8 * kGiB); }, 0);
+  const std::optional<HostTelemetry> reported = governor.snapshot().hostTelemetry;
+  require(reported && reported->physFootprintBytes && reported->fileCacheMinimumBytes,
+          "the governor's snapshot did not carry the host telemetry");
+}
+
 } // namespace
 
 int main() {
@@ -952,6 +988,7 @@ int main() {
     testOnlyAShortHostTakesTheExpertStore();
     testGrowthCreditCountsOnlyTheRest();
     testHostBudgetIsWhatThePassesKeep();
+    testHostTelemetryReadsTheTaskAndTheHost();
     std::cout << "memory governor tests passed\n";
     return EXIT_SUCCESS;
   } catch (const std::exception &error) {
