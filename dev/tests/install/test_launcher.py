@@ -1296,8 +1296,8 @@ class LauncherTests(unittest.TestCase):
     def test_python_programs_write_bytecode_only_as_the_launcher_does(self):
         # A runtime inside a signed app must not gain __pycache__ folders: a
         # launcher run with -B or PYTHONDONTWRITEBYTECODE gives the installer
-        # and the server PYTHONDONTWRITEBYTECODE, which the server's PDF
-        # workers inherit from it.
+        # and the server PYTHONDONTWRITEBYTECODE (the server's PDF workers,
+        # started with no environment, have -B of their own).
         for flag in (False, True):
             with (
                 self.subTest(dont_write_bytecode=flag),
