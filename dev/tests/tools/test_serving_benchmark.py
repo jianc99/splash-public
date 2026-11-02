@@ -334,6 +334,28 @@ class GateTests(unittest.TestCase):
         )["failures"]
         self.assertTrue(any("owed" in f for f in failures), failures)
 
+    def test_an_unreported_bound_or_ledger_is_not_judged(self):
+        # Schema 7 renders the scheduler's target 0 and the ledger empty until
+        # the tracks that own them fill them in, as on the fork base.
+        done = [
+            {"tag": f"w{w}-r1", "start": 0, "t": 100, "ttft": 5, "decode_tps": 30}
+            for w in range(3)
+        ]
+        done[0]["chunks_ms"] = [0, 330, 660]
+        unfilled = [
+            self.schema7(
+                t, scheduler__decode_gap_target_ms=0, memory_governor__accounts=[]
+            )
+            for t in (0, 900)
+        ]
+        facts = matrix.health(
+            churn_run(self.directory, "unfilled", done, unfilled),
+            self.machine,
+            self.gates,
+        )
+        self.assertEqual(facts["failures"], [])
+        self.assertNotIn("g4", facts)
+
     def test_store_taken_back_soon_after_its_regrow(self):
         sizes = [(0, 4), (10, 5), (40, 4), (200, 5), (400, 4)]
         samples = [status(t, streamed_experts__chunks=size) for t, size in sizes]

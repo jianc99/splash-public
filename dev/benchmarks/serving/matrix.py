@@ -484,13 +484,14 @@ def counter_delta(run: Run, path: str) -> float:
 def gap_bound(status: dict, share: float) -> dict | None:
     """amend/V.md A09: the run's own decode gap bound max(G, u/share) with u
     the units term of its last prefill estimate, and that estimate's p95
-    relative error (schema 7; None for older trees)."""
+    relative error (schema 7; None for older trees, and while the scheduler
+    reports no target: the contract renders it 0 until a scheduler sets it)."""
     scheduler = status.get("scheduler") or {}
     target, estimate = (
         scheduler.get("decode_gap_target_ms"),
         value(scheduler, "estimate.prefill"),
     )
-    if target is None or estimate is None:
+    if not target or estimate is None:
         return None
     unit = next(
         (
@@ -602,10 +603,11 @@ def health(run: Run, machine: dict, gates: dict) -> dict:
         facts["failures"].append(f"G8: loop.max_tick_ms {max(ticks):.0f}")
     for sample in run.samples:
         governor = sample["status"].get("memory_governor") or {}
+        # Accounts are checked once the ledger reports any.
         accounts = governor.get("accounts")
-        if accounts is not None and sum(
-            a["current_bytes"] for a in accounts
-        ) != governor.get("charged_bytes"):
+        if accounts and sum(a["current_bytes"] for a in accounts) != governor.get(
+            "charged_bytes"
+        ):
             facts["failures"].append(
                 f"G9: the accounts do not sum to charged_bytes at t={sample['t']}"
             )
