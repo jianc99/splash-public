@@ -537,9 +537,10 @@ TokenAdmission Cache::admitPages(uint32_t count, std::vector<uint32_t> &pages,
   KvPageAcquisition acquired = pool_.acquirePages(count, form, held);
   if (!acquired.granted()) {
     // Demoted and spilled pages free theirs when their copies land: wait
-    // once those on their way cover what the free pages do not, and until
-    // then reclaim.
-    const uint32_t missing = count - std::min(count, pool_.freePageCount(form));
+    // once those on their way cover what the free pages beyond those held
+    // do not, and until then reclaim.
+    const uint32_t free = pool_.freePageCount(form);
+    const uint32_t missing = count - std::min(count, free - std::min(free, held));
     const uint32_t pending = pendingPages(form);
     const bool covered = pending > 0 && pending >= missing;
     return {covered ? TokenAdmissionFailure::Pending : TokenAdmissionFailure::Denied,

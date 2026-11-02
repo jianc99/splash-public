@@ -607,8 +607,10 @@ public:
   // attention weighs the rows past the request's end by zero, and a BF16
   // value is read as stored, so a non-finite one the page's previous holder
   // left there would reach the request as 0 x NaN. `held[form]`, the free
-  // pages of the form waiting claims ranked above the request hold, goes to
-  // KvPool::acquirePages, which ignores it.
+  // pages of the form waiting claims ranked above the request hold, stay
+  // free (KvPool::acquirePages): a request refused the pages waits
+  // (Pending) only while those on their way back cover what the free pages
+  // beyond them do not.
   [[nodiscard]] TokenAdmission
   ensureTokens(uint64_t requestId, uint64_t tokenCount,
                uint64_t writtenTokens = std::numeric_limits<uint64_t>::max(),

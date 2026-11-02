@@ -6209,6 +6209,42 @@ void testDeviceNeedWeighsALargeCacheAtOnce() {
   require(seconds < 5.0, "weighing the cache's memory reclaims took " + std::to_string(seconds) + " s");
 }
 
+// What a request may wait for counts only the free pages beyond those
+// waiting claims above it hold: with growth refused, a demotion in flight
+// freeing one page leaves the request short of the three pages held ones
+// would have given it, which it reclaims for rather than waits.
+void testHeldPagesAreNoRoomToWaitFor() {
+  test::TestKvStorage storage{24, 100, 1};
+  KvPool pool{storage, 16};
+  test::TestKvTier tier;
+  engine::Cache cache(pool, &tier, nullptr);
+  auto control = std::make_shared<TransferControl>();
+  control->ready = true;
+  std::vector<uint32_t> prompt(KvCache::pageTokens + 1);
+  std::iota(prompt.begin(), prompt.end(), 1000);
+  cache.beginRequest(1);
+  require(admitTokens(cache, 1, prompt.size()).granted(), "the prompt's pages were denied");
+  cache.publishCommittedBlocks(1, prompt, KvCache::pageTokens, {});
+  cache.publishCompositeState(cache.blockAt(1, KvCache::pageTokens), std::make_shared<TieredState>(control), false);
+  cache.endRequest(1);
+  require(reclaimStateBytes(cache, CacheReclaimMode::KeepExtents) == 100 && cache.pollTransfers() &&
+              cache.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::InUse).madeProgress &&
+              cache.transfersInFlight() && tier.demotions == 1,
+          "the leaf's demotion did not start");
+  storage.growthBlocked = true;
+  const uint32_t free = pool.freePageCount();
+  cache.beginRequest(2);
+  constexpr uint64_t all = std::numeric_limits<uint64_t>::max();
+  require(free > 5 && cache.ensureTokens(2, 5 * KvCache::pageTokens, all, {free - 2, 0, 0}).failure ==
+                          TokenAdmissionFailure::Denied,
+          "a request waited for a landing that leaves it short of the pages held ones would give");
+  require(cache.ensureTokens(2, (free + 1) * KvCache::pageTokens).failure == TokenAdmissionFailure::Pending,
+          "a request did not wait for the page on its way back");
+  tier.complete();
+  static_cast<void>(cache.pollTransfers());
+  cache.endRequest(2);
+}
+
 // A state that needs a write frees its memory as a unit that lands later: a
 // claim that cannot wait, of any class, passes over it and starts no write,
 // and one that can wait, growth too, takes it with its write.
@@ -6419,6 +6455,7 @@ int main() {
     testBurstReclaimTakesWholeExtentsOncePerNeed();
     testDeviceNeedReachesTheLeavesPastTheStates();
     testDeviceNeedWeighsALargeCacheAtOnce();
+    testHeldPagesAreNoRoomToWaitFor();
     testImmediateClaimsPassOverStatesThatNeedAWrite();
     std::cout << "engine cache tests passed\n";
     return 0;
