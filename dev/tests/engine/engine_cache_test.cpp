@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <functional>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <numeric>
 #include <optional>
@@ -5831,6 +5832,25 @@ void testFullShortfallsAtTheWallTakeDeadLeavesFirst() {
   }
 }
 
+// The free pages waiting claims ranked above a request hold stay free: its
+// pages come from those beyond them, and with growth refused it is denied
+// rather than given them.
+void testHeldPagesStayFree() {
+  test::TestKvStorage storage{16, 100, 4};
+  KvPool pool{storage, 8};
+  engine::Cache cache(pool, nullptr, nullptr);
+  storage.growthBlocked = true;
+  cache.beginRequest(1);
+  constexpr uint64_t all = std::numeric_limits<uint64_t>::max();
+  // Eight free pages, six held: the request may take two.
+  const TokenAdmission refused = cache.ensureTokens(1, 3 * KvCache::pageTokens, all, {6, 0, 0});
+  require(refused.failure == TokenAdmissionFailure::Denied && pool.freePageCount() == 8,
+          "the request took free pages waiting claims hold");
+  require(cache.ensureTokens(1, 2 * KvCache::pageTokens, all, {6, 0, 0}).granted() && pool.freePageCount() == 6,
+          "the request was refused the free pages beyond those held");
+  cache.endRequest(1);
+}
+
 int main() {
   try {
     testStateInUseGoesLast();
@@ -5989,6 +6009,7 @@ int main() {
     testFullShortfallsTrimBeforeAnyLeafGoes();
     testFullShortfallsKeepTheTailsOfStatesTheSsdKeeps();
     testFullShortfallsAtTheWallTakeDeadLeavesFirst();
+    testHeldPagesStayFree();
     std::cout << "engine cache tests passed\n";
     return 0;
   } catch (const std::exception &error) {

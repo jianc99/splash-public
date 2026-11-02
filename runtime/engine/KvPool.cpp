@@ -55,8 +55,8 @@ KvPool::RunwayHold::~RunwayHold() {
     pool_.releasePage(page, false);
 }
 
-KvPageAcquisition KvPool::acquirePages(uint32_t count, kv::PageForm form, uint32_t) {
-  KvPageAcquisition acquired = takeFreePages(count, form);
+KvPageAcquisition KvPool::acquirePages(uint32_t count, kv::PageForm form, uint32_t held) {
+  KvPageAcquisition acquired = takeFreePages(count, form, held);
   for (uint32_t page : acquired.pages) {
     markUsed(page);
     pages_[page].activeReferences = 1;
@@ -65,7 +65,7 @@ KvPageAcquisition KvPool::acquirePages(uint32_t count, kv::PageForm form, uint32
   return acquired;
 }
 
-KvPageAcquisition KvPool::takeFreePages(uint32_t count, kv::PageForm form) {
+KvPageAcquisition KvPool::takeFreePages(uint32_t count, kv::PageForm form, uint32_t held) {
   if (!count)
     return {};
 
@@ -76,7 +76,7 @@ KvPageAcquisition KvPool::takeFreePages(uint32_t count, kv::PageForm form) {
       insertFree(*p);
   };
   while (selected.size() < count) {
-    if (formRecord(form).freePages) {
+    if (formRecord(form).freePages > held) {
       selected.push_back(popFree(form));
       continue;
     }

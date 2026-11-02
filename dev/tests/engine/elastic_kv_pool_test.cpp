@@ -210,6 +210,32 @@ void testPassReleasesEveryEmptyExtent() {
             "a pass without the runway did not release it");
 }
 
+// The free pages waiting claims ranked above a requester hold stay free: it
+// takes those beyond them, then an extent the pool grows by, and with growth
+// refused it gets none.
+void testAcquireLeavesHeldPages() {
+    TestKvStorage storage(12, 100, 4);
+    KvPool pool(storage, 4);
+    auto first = pool.acquirePages(1);
+    require(first.granted() && pool.freePageCount() == 3, "held setup did not take one page of the runway");
+    auto beyond = pool.acquirePages(2, PageForm::Full, 2);
+    require(beyond.granted() && beyond.pages.size() == 2 && pool.snapshot().pagesAllocated == 8 &&
+                pool.freePageCount() >= 2,
+            "the pages came from the free pages waiting claims hold, not from an extent the pool grew by");
+    storage.growthBlocked = true;
+    const uint32_t free = pool.freePageCount();
+    auto refused = pool.acquirePages(free - 1, PageForm::Full, 2);
+    require(!refused.granted() && refused.failure == AllocationFailure::EngineBudget &&
+                pool.freePageCount() == free,
+            "the requester took free pages waiting claims hold while growth was refused");
+    auto granted = pool.acquirePages(free - 2, PageForm::Full, 2);
+    require(granted.granted() && pool.freePageCount() == 2,
+            "the requester was refused the free pages beyond those waiting claims hold");
+    release(pool, granted.pages);
+    release(pool, beyond.pages);
+    release(pool, first.pages);
+}
+
 void testFullestExtentFillsFirstSoColdExtentsDrain() {
     TestKvStorage storage(12, 100, 4);
     KvPool pool(storage, 12);
@@ -855,6 +881,7 @@ int main() {
         testPressureReusesFreePagesAndDeniesGrowth();
         testPassReleasesEveryEmptyExtent();
         testFullestExtentFillsFirstSoColdExtentsDrain();
+        testAcquireLeavesHeldPages();
         testRefusedReleaseChangesNothing();
         testPrefixAndActiveReferencesHoldTheExtent();
         testCacheOwnsAPageOnce();

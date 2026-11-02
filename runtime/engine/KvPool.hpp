@@ -139,8 +139,9 @@ public:
   };
 
   // The pages, of the form, come with one active reference each, the
-  // requester's. `held`, the free pages waiting claims ranked above the
-  // requester hold, is ignored.
+  // requester's. `held` free pages of the form stay free, those waiting
+  // claims ranked above the requester hold: the pages come from the free
+  // pages beyond them, and then from extents it allocates.
   [[nodiscard]] KvPageAcquisition acquirePages(uint32_t count, kv::PageForm form = kv::PageForm::Full,
                                                uint32_t held = 0);
   void retainPage(uint32_t page, bool prefixOwner);
@@ -278,10 +279,10 @@ private:
   // The extent of the form compactExtent() empties; noIndex when the free
   // pages of the form cover none.
   [[nodiscard]] uint32_t compactableExtent(kv::PageForm form, std::span<const uint32_t> fixed) const noexcept;
-  // Takes `count` free pages of the form off the free lists, allocating
-  // extents of the form when they run out; with a refusal, puts them back
-  // and returns none.
-  [[nodiscard]] KvPageAcquisition takeFreePages(uint32_t count, kv::PageForm form);
+  // Takes `count` free pages of the form off the free lists, leaving `held`
+  // of them there, allocating extents of the form when they run out; with a
+  // refusal, puts them back and returns none.
+  [[nodiscard]] KvPageAcquisition takeFreePages(uint32_t count, kv::PageForm form, uint32_t held = 0);
   // Gives a page's references to the free page its content was copied to,
   // and frees it.
   void moveReferences(const kv::PageCopy &copy) noexcept;
