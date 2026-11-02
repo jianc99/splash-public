@@ -1037,6 +1037,10 @@ private:
     uint32_t pages = 0;
     kv::PageForm form = kv::PageForm::Full;
     bool hostRefused = false;
+    // A device need that also lacks pages in place counts the free pages
+    // its attempt found: an extent released of them frees bytes its retry
+    // only allocates again.
+    bool keepFree = false;
     friend bool operator==(const Walk &, const Walk &) = default;
   };
   [[nodiscard]] Walk walkFor(const VictimQuery &query) const;

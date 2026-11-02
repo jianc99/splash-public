@@ -671,6 +671,7 @@ Cache::Walk Cache::walkFor(const VictimQuery &query) const {
     // extent released covers it.
     walk.device = true;
     walk.refused = Shortfall{pool_.extentPages(), kv::PageForm::Full};
+    walk.keepFree = need.pages != 0;
   } else if (need.pages) {
     // Pages in place; a host that refuses growth takes them in a page scan.
     walk.pages = need.pages;
@@ -1181,7 +1182,7 @@ std::optional<engine::Victim> Cache::ReclaimPlan::weigh(Weighed weighed) {
 
 // takeReclaim, weighed; one that stopped at uncopied cache goes on there.
 Cache::ReclaimPlan::Step Cache::ReclaimPlan::step() {
-  if (!std::exchange(resumes_, false)) {
+  if (!std::exchange(resumes_, false) && !walk.keepFree) {
     for (std::pair<bool, uint64_t> released; (released = releaseExtent()).first;)
       if (released.second)
         return {.progress = true, .bytes = released.second};
@@ -2026,9 +2027,10 @@ uint64_t Cache::releaseOtherForms(kv::PageForm form) {
 
 CacheReclaimResult Cache::takeReclaim(const Walk &walk) {
   plan_.reset();
-  // Free pages first, as the extent they fill; one that empties the runway
-  // kept gives nothing yet, and the next one does.
-  for (CacheReclaimResult released; (released = releaseExtent(walk.keepRunway)).madeProgress;)
+  // Free pages first, as the extent they fill, unless the need counts them;
+  // one that empties the runway kept gives nothing yet, and the next one
+  // does.
+  for (CacheReclaimResult released; !walk.keepFree && (released = releaseExtent(walk.keepRunway)).madeProgress;)
     if (released.reclaimedBytes)
       return released;
   // Then the victims in reclaimOne's order while their KV can empty an
@@ -2641,20 +2643,22 @@ uint32_t Cache::trimWindows(bool allocate) {
   const auto repeated = std::ranges::unique(kept);
   pages.insert(pages.end(), kept.begin(), repeated.begin());
   // Free Slim pages first, the runway's among them; with `allocate` the
-  // rest asks for extents of the form, and a refusal leaves them Full.
+  // rest asks for extents of the form, an extent's pages at a time, and a
+  // refusal leaves the rest Full: a claim the host exempts for one
+  // reservation (MemoryGovernor) trims one extent more on each retry.
   const auto now = std::min<size_t>(pages.size(), pool_.freePageCount(kv::PageForm::Slim));
   if (!allocate)
     pages.resize(now);
   uint32_t moved = 0;
-  for (const std::span<const uint32_t> part :
-       {std::span<const uint32_t>(pages).first(now), std::span<const uint32_t>(pages).subspan(now)}) {
-    if (part.empty())
-      continue;
-    const KvPageMoveResult trimmed = pool_.movePages(part, kv::PageForm::Slim);
+  for (size_t at = 0; at < pages.size();) {
+    const size_t count = at < now ? now - at : std::min<size_t>(pool_.extentPages(), pages.size() - at);
+    const KvPageMoveResult trimmed = pool_.movePages(std::span<const uint32_t>(pages).subspan(at, count),
+                                                     kv::PageForm::Slim);
     if (!trimmed.granted())
       break;
     followMoves(trimmed.moves);
-    moved += static_cast<uint32_t>(part.size());
+    moved += static_cast<uint32_t>(count);
+    at += count;
   }
   trimmedPages_ += moved;
   // The next pass, at the memory wall too, trims without an allocation.
