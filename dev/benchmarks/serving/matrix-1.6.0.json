@@ -31,7 +31,10 @@
       "_note": "g4c 7.3 s (R4's M6 max). warmup_256_s: 2.11 s + 1.204 ms/row x 256. sigma from 10 work and latency pairs and 8 TTFT pairs (amend/V.md §0.4; decode taken as latency's)."},
     "mini": {"lock": "/tmp/kernel-gpu.lock", "port": 8594, "g4c_floor_s": 6.2, "warmup_256_s": null,
       "sigma": {"work": {"sigma": 0.026, "df": 10}, "latency": {"sigma": 0.035, "df": 10}, "ttft": {"sigma": 0.068, "df": 8}, "decode": {"sigma": 0.035, "df": 10}},
-      "_note": "someone else's machine: its existing lock (AMENDMENTS X16); g4c the smallest of the three measured floors; sigma borrowed from the M6."}
+      "_note": "someone else's machine: its existing lock (AMENDMENTS X16); g4c the smallest of the three measured floors; sigma borrowed from the M6."},
+    "other": {"lock": null, "port": 8594, "g4c_floor_s": 6.2, "warmup_256_s": null,
+      "sigma": {"work": {"sigma": 0.026, "df": 10}, "latency": {"sigma": 0.035, "df": 10}, "ttft": {"sigma": 0.068, "df": 8}, "decode": {"sigma": 0.035, "df": 10}},
+      "_note": "any other Mac, as the release gate's runners (make test-pressure-real): no cell runs there; g4c the smallest of the three measured floors (amend/V.md A09)."}
   },
   "gates": {
     "tolerance": 0.02,

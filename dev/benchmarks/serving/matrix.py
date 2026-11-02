@@ -1452,13 +1452,23 @@ def verdict_markdown(document: dict) -> str:
 
 
 def check_run(
-    directory: Path, label: str, minutes: float | None, machine: dict, gates: dict
+    directory: Path,
+    label: str,
+    minutes: float | None,
+    machine: dict,
+    gates: dict,
+    streamed: bool = False,
 ) -> list[str]:
     """What is wrong with one churn run on its own: no DONE, an end before
-    its load window, a worker that completed nothing, HTTP errors, or a
-    G4/G8/G9 failure of its own status and gaps."""
+    its load window, a worker that completed nothing, HTTP errors, a G4/G8/G9
+    failure of its own status and gaps, or, with `streamed`, a model that did
+    not start with its routed experts streamed."""
     run = Run(directory, label)
     problems = [] if run.complete else ["the run did not end with DONE"]
+    if streamed and not value(
+        run.samples[0]["status"] if run.samples else {}, "streamed_experts.cap_bytes"
+    ):
+        problems.append("the routed experts did not stream from the start")
     if minutes is not None and (run.end is None or run.end["t"] < minutes * 60):
         problems.append(f"the run ended before its {minutes:g} min load window")
     workers = {tag.split("-")[0] for tag in run.done}
@@ -1719,6 +1729,11 @@ def parse_args(argv=None):
     c.add_argument("--machine", default="studio")
     c.add_argument("--minutes", type=float, help="the run's load window")
     c.add_argument(
+        "--streamed",
+        action="store_true",
+        help="the model must have started with its routed experts streamed",
+    )
+    c.add_argument(
         "--running",
         type=Path,
         help="a gpuq root: list its jobs past twice their expected time",
@@ -1771,6 +1786,7 @@ def main(argv=None) -> int:
             args.minutes,
             spec["machines"][args.machine],
             spec["gates"],
+            args.streamed,
         )
         for problem in problems:
             print(f"FAIL {problem}")

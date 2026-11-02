@@ -46,7 +46,8 @@ from pathlib import Path
 
 from dev.benchmarks.serving import clients
 
-MACHINES = ("studio", "m5", "m6", "mini")
+# The matrix machines, and any other (a release gate runner).
+MACHINES = ("studio", "m5", "m6", "mini", "other")
 SCENARIOS = ("churn", "ttft", "serve1", "warm")
 READY_TIMEOUT_SECONDS = 900
 # A server that ignores SIGINT this long gets SIGTERM, then SIGKILL (a server
@@ -324,7 +325,7 @@ def install(args, out: Path) -> str:
     """The model's installation root: --model-root, or the tree's own
     installer's offline prepare and link."""
     if args.model_root:
-        return args.model_root
+        return str(args.model_root)
     options = ["--model", args.model]
     if args.revision:
         options += ["--revision", args.revision]
@@ -402,7 +403,7 @@ def parse_args(argv=None):
         "--language-only", action=argparse.BooleanOptionalAction, default=True
     )
     parser.add_argument(
-        "--model-root", help="an installed model root; skips the installer"
+        "--model-root", type=Path, help="an installed model root; skips the installer"
     )
     parser.add_argument("--scenario", required=True, choices=SCENARIOS)
     parser.add_argument(

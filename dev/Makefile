@@ -91,7 +91,7 @@ HTTP_SMOKE_ARGS ?=
 	check-native-engine check-native-cpu check-native-metal check-native-build \
 	check-python \
 	install-development _install-development release-check test \
-	test-agent-real test-http-real test-performance-real test-release-real \
+	test-agent-real test-http-real test-performance-real test-pressure-real test-release-real \
 	test-python test-real verify-models \
 	test-engine test-engine-cpu test-engine-metal test-sanitizers
 
@@ -203,6 +203,26 @@ else
 		&& $(PYTHON) -m json.tool "$(MODEL_RESULTS)/backend-benchmark.json" >/dev/null
 	@echo "native backend characterization: PASS ($(MODEL_RESULTS)/backend-benchmark.json)"
 endif
+
+# The installed model served by this checkout's own server under
+# PRESSURE_ARGS, the memory cap that makes it stream its routed experts, to
+# the serving benchmark's three churn clients for PRESSURE_MINUTES
+# (dev/benchmarks/serving/run.py), then the run judged on its own
+# (matrix.py check): the experts streamed from the start, every client
+# completed a request, no engine restart, HTTP error or Metal failure, no
+# command loop tick past the GPU wait limit, and no decode gap past the
+# bound. 5 minutes: on the M5 Pro at 18G the 35B's churn runs completed
+# 78-112 requests in 15 (the p-35b-churn-18g references).
+PRESSURE_ARGS ?= --max-memory 18G
+PRESSURE_MINUTES ?= 5
+PRESSURE_RESULTS = $(MODEL_RESULTS)/pressure
+test-pressure-real: preflight $(TARGET) verify-build-identity
+	@rm -rf "$(PRESSURE_RESULTS)"
+	$(PYTHON) -m dev.benchmarks.serving.run --tree . --machine other --model "$(MODEL)" \
+		--model-root "$(MODEL_ROOT)" --scenario churn --minutes $(PRESSURE_MINUTES) \
+		--server-args="$(PRESSURE_ARGS)" --label pressure --out "$(PRESSURE_RESULTS)"
+	$(PYTHON) -m dev.benchmarks.serving.matrix check "$(PRESSURE_RESULTS)" pressure \
+		--machine other --minutes $(PRESSURE_MINUTES) --streamed
 
 # The installer's restarts without the Hub, a full source hash and the
 # digests of the weight images a load of the installation holds
