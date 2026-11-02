@@ -1,6 +1,7 @@
 #pragma once
 
 #include "engine/ReclaimClass.hpp"
+#include "engine/Types.hpp"
 #include "model/ElasticPool.hpp"
 #include "ops/PagedKv.hpp"
 
@@ -9,9 +10,11 @@
 #include <cstdint>
 #include <functional>
 #include <limits>
+#include <map>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace splash::engine {
 
@@ -25,11 +28,23 @@ inline constexpr uint64_t kHostMarginBytes = 1ULL << 30;
 // How long the host's counters take to show what a pass returned.
 inline constexpr double kHostSettleMilliseconds = 1000.0;
 // The payback horizon of growth that displaces other memory, and how long
-// memory a host pass returns stays returned.
+// memory a host pass returns stays returned: within the lifetime of a
+// regrown expert-store chunk. Of the 40 chunks the Studio's recorded churn
+// runs took back, 15 went again (after 1-114 s; 12 of them the 35B runs'
+// 1-29 s, which the take rate prices) and 25 lived to the run's end:
+// Kaplan-Meier survival 0.57 at 60 s and 0.53 from 114 s on, so the median
+// lifetime lies past every retake recorded and 60 s stays within it.
 inline constexpr double kValueHorizonSeconds = 60.0;
-// The time constant of the measured rates: pools' ghost hits, the cache's
-// reuse, the KV tier's throughput.
-inline constexpr double kRateTimeConstantSeconds = 30.0;
+// The time constant of the measured rates: pools' ghost hits, scan reads and
+// takes, the cache's reuse, the KV tier's throughput. The smallest of 10, 30,
+// 60 and 120 s at which the recorded M6 runs' decode misses and prefill reads,
+// replayed through PoolRate at the control pass's 500 ms, change by less, at
+// P95 over passes of steady load, than half the relative hysteresis a
+// 1023 MiB store chunk's cycle cost gives it at the run's value (1.9-2.2 %):
+// at 30 s 2 of the 38 runs of the trees 1.6.0 builds on fail (mMNa, mSl:
+// 1.05x), at 60 s none; only 1.5.0's six and fn15b of the old store fail
+// there (memory_value_test replays two of them).
+inline constexpr double kRateTimeConstantSeconds = 60.0;
 
 struct AccountId final {
   uint8_t value = 0;
@@ -67,6 +82,11 @@ struct ClaimSpec final {
   double holdSeconds = 0.0;                     // how long the claimant keeps what it gets
   // The seconds of engine work the units taken for it may cost in all.
   double benefitSeconds = std::numeric_limits<double>::infinity();
+  // The tier that decides what it may take from lanes: no conversion of a
+  // lane of a higher priority, and no pool unit while such a lane is in
+  // service (pools serve every lane). The rank still orders held room. A
+  // claim that is no lane's (the host, a pool's growth) takes Foreground.
+  RequestPriority priority = RequestPriority::Foreground;
 };
 
 struct ClaimId final {
@@ -104,13 +124,26 @@ struct UnitCost final {
 
 // The rates units are priced at, set once per control pass (setRates).
 struct MemoryRates final {
-  double prefillSecondsPerRow = 0.0;     // Scheduler::prefillMilliseconds of a 2048-row command, per row
-  double commandInterceptSeconds = 0.0;  // Scheduler::prefillMilliseconds of a one-row command
-  // Priors, each replaced by its first measurement.
-  double tierReadBytesPerSecond = 4.0e9; // KvTier::throughput
-  double tierWriteBytesPerSecond = 2.0e9;
-  double reuse = 0.25;                   // the probes' hit share (EngineSnapshot::cacheHits, coldMisses)
+  double prefillSecondsPerRow = 0.0;      // Scheduler::prefillMilliseconds of a 2048-row command, per row
+  // Scheduler::prefillMilliseconds({.weightReadBytes = b}) less that of no
+  // work, per byte: what a byte the expert store misses in a prefill costs.
+  double weightReadSecondsPerByte = 0.0;
+  // The engine's decayed mean of a decode command's hot-block read time
+  // (CommandSample::spilledKvReadMilliseconds) per lane with Index pages;
+  // from the measured 7.0-11.5 ms (DESIGN section 0 Q5) until its first
+  // sample.
+  double spilledReadMillisecondsPerLaneCommand = 9.0;
+  double decodeTokensPerLaneCommand = 0.0;  // Scheduler::decodeTokensPerLaneCommand
+  // Model::loadReads's SSD rate until the KV tier has read (KvTier::throughput).
+  double tierReadBytesPerSecond = 0.0;
+  double reuse = 0.0;                     // the probes' hit share; 0 before the first probe
 };
+
+// What taking a unit gives up besides its bytes, which the claim's class
+// decides whether it may: memory nothing needs now (a cached unit, a
+// buffer), a Resident lane's KV in memory (its conversion to Spill), or the
+// command between its passes.
+enum class VictimKind : uint8_t { Memory, Conversion, PassCommand };
 
 // One unit a source would give up, in the source's own order.
 struct Victim final {
@@ -124,18 +157,23 @@ struct Victim final {
   bool sized = true;            // false: a unit that costs nothing and whose size is known only when taken
   ReclaimClass cls = ReclaimClass::Ordinary;
   UnitCost cost;
+  VictimKind kind = VictimKind::Memory;
 };
 struct VictimQuery final {
   const ClaimSpec *claim = nullptr;
   Need need;
   bool critical = false;        // macOS critical: InUse and certain-reuse units for Host claims too
   const MemoryRates *rates = nullptr;
+  // The host lacks memory beyond its margin: a Host claim may take pool
+  // units and conversions, not only cache.
+  bool deficit = false;
 };
 
 // A source of the units free() takes, on the engine thread between commands.
 // peek changes nothing, and may understate what later units free but never
 // overstate it: free() takes nothing unless what it peeked covers the need.
-// take takes exactly the unit the latest peek returned.
+// take takes exactly the unit the latest peek returned. Units that cost
+// nothing and are sized only when taken come first in a source's order.
 class VictimSource {
 public:
   virtual ~VictimSource() = default;
@@ -162,44 +200,136 @@ struct Returning final {
   double oldestMilliseconds = 0.0;
 };
 
+// What the ledger knows of an open claim.
+struct ClaimState final {
+  ClaimSpec spec;
+  // Its latest need: the refusal its scope recorded (refused), with the
+  // in-place part free() was given. A waiting claim holds it.
+  Need need;
+  bool waiting = false;
+  double waitingSinceSeconds = 0.0;
+  // The host refused it after in-place units could not meet it: its
+  // retries pass the host (a Floor or InService claim) until one is granted.
+  bool hostExempt = false;
+  // The lanes free() converted for it, whose copies it waits for as its own.
+  std::vector<uint64_t> converted;
+  // What its latest free() decided.
+  std::optional<FreeOutcome> outcome;
+};
+
+// The host's side of one growth pass, from the governor: whether the host
+// admits a pool's growth of so many bytes on its own (the host's rule for
+// the Growth class at the pass's sample), whether growth may displace other
+// memory (not under macOS's critical pressure), and the growth itself: one
+// unit of the pool under the governor's admission inside
+// Scope{claim, its account, creditBytes}.
+struct GrowthHost final {
+  std::function<bool(uint64_t bytes)> admits;
+  bool displaces = false;
+  std::function<metal::AllocationResult(ClaimId claim, AccountId account, model::ElasticPool &pool,
+                                        uint64_t creditBytes)>
+      grow;
+};
+
 // The books and the one rule. No Metal, no host: the governor supplies the
 // charged bytes and the host's decisions.
 class MemoryLedger final {
 public:
+  MemoryLedger();
+  ~MemoryLedger();
+  MemoryLedger(const MemoryLedger &) = delete;
+  MemoryLedger &operator=(const MemoryLedger &) = delete;
+
   // Registration (startup; stable for the process). An account's current
-  // bytes are pulled from its owner.
+  // bytes are pulled from its owner. Units tie, at equal cost per byte, to
+  // the source registered first and then to the pools.
   AccountId addAccount(std::string name, AccountRole role, std::function<uint64_t()> currentBytes);
   AccountId addPool(model::ElasticPool &pool);   // account + victim source; name = PoolState::name
   void addSource(VictimSource &source);          // the cache, the engine's lane victims
-  void setReturning(std::function<Returning()> returning);
+  // What transfers return when they land: all of them (Cache::returning),
+  // and those of one request's own pages (Cache::returningFor).
+  void setReturning(std::function<Returning()> all, std::function<Returning(uint64_t requestId)> ofRequest);
   void setRates(const MemoryRates &rates) noexcept;
-  void observePools(double nowSeconds);          // differentiates each pool's PoolValue over the control clock
-  void setLaneDemand(uint64_t bytes) noexcept;   // the lanes' projected growth
+  // Differentiates each pool's counters, and the units claims took from it,
+  // over the control clock, only across intervals in which the engine ran a
+  // command (an idle interval says nothing of demand); also the clock the
+  // ledger dates its claims and copy demand by.
+  void observePools(double nowSeconds, bool commandsRan);
+  // The lanes in service: their projected growth, which pools' growth leaves
+  // free, and the highest priority among them.
+  void setLanes(uint64_t demandBytes, std::optional<RequestPriority> highest) noexcept;
+  // Where the ledger writes one line per decision: the claimant, what it
+  // took, the price, the bytes and the outcome.
+  void setDecisionLog(std::function<void(std::string_view)> log);
 
   // Claims.
   [[nodiscard]] ClaimId open(const ClaimSpec &spec);
   void update(ClaimId claim, const ClaimSpec &spec);
   void refused(ClaimId claim, const Need &need);
   void setWaiting(ClaimId claim, bool waiting);
+  void setHostExempt(ClaimId claim, bool exempt);
   void close(ClaimId claim) noexcept;
+  [[nodiscard]] const ClaimState &claim(ClaimId claim) const;
   // What admission holds against an allocation in `claim`'s scope: other
   // accounts' pending growth, waiting claims ranked above it, and for a
   // Growth claim the lanes' projected growth.
   [[nodiscard]] uint64_t heldBytes(ClaimId claim, std::optional<AccountId> growing) const;
   [[nodiscard]] std::array<uint32_t, 3> heldPages(ClaimId claim) const;
+  // The waiting claims, and the bytes those the host refused lack.
+  [[nodiscard]] bool claimWaiting() const noexcept;
+  [[nodiscard]] uint64_t hostRefusedWaitingBytes() const noexcept;
+  // The largest unit a pool grows by next: the host's band reaches past its
+  // margin by it.
+  [[nodiscard]] uint64_t largestGrowthUnit() const;
+  [[nodiscard]] Returning returning() const;
+  // Whether, within the value horizon, a free() reached a cached unit that
+  // frees memory only once its copy lands (took it so, or skipped it for an
+  // Immediate claim): a temporary tier's copies ahead then pay.
+  [[nodiscard]] bool copyDemand() const noexcept;
 
   // The rule: what is taken for a claim, what is there for one, what grows.
-  [[nodiscard]] FreeResult free(ClaimId claim, const Need &need, uint64_t freeBytes, bool critical);
-  [[nodiscard]] uint64_t available(const ClaimSpec &spec, uint64_t enough, uint64_t freeBytes) const;
-  // One growth pass; `admitGrowth` is the governor's admission inside the
-  // pool's growth scope. True when a pool grew or started freeing for its
+  // `critical`: macOS's critical pressure; `deficit`: the host lacks memory
+  // past its margin.
+  [[nodiscard]] FreeResult free(ClaimId claim, const Need &need, uint64_t freeBytes, bool critical, bool deficit);
+  [[nodiscard]] uint64_t available(const ClaimSpec &spec, uint64_t enough, uint64_t freeBytes, bool critical,
+                                   bool deficit) const;
+  // One growth pass. True when a pool grew or started freeing for its
   // pending growth.
-  bool grow(uint64_t freeBytes,
-            const std::function<metal::AllocationResult(AccountId, model::ElasticPool &)> &admitGrowth);
+  bool grow(uint64_t freeBytes, const GrowthHost &host);
   uint64_t dropToFloors();                       // critical pressure: every pool to its floor
 
   // The accounts, reservations, owed bytes and claims.
   void fill(MemoryGovernorSnapshot &snapshot, uint64_t chargedBytes) const;
+
+private:
+  struct Account;
+  struct Choice;
+  struct DryRun;
+
+  // Other accounts' pending growth, and for a Growth claim the lanes'
+  // projected growth; the needs of waiting claims ranked above `rank`.
+  [[nodiscard]] uint64_t heldForGrowth(std::optional<AccountId> growing, ClaimClass cls) const noexcept;
+  [[nodiscard]] uint64_t heldByClaims(const ClaimRank &rank, std::optional<uint32_t> self) const noexcept;
+  [[nodiscard]] uint64_t pendingGrowthBytes() const noexcept;
+  [[nodiscard]] DryRun dryRun(const ClaimSpec &spec, const VictimQuery &query, uint64_t lackingBytes,
+                              std::optional<AccountId> growing) const;
+  [[nodiscard]] FreeResult take(const DryRun &run, const VictimQuery &query, ClaimState *claim);
+  [[nodiscard]] FreeResult freeFor(uint32_t claim, const Need &need, uint64_t freeBytes, bool critical,
+                                   bool deficit, std::optional<AccountId> growing);
+  void log(const ClaimSpec &spec, const Need &need, const DryRun *run, const FreeResult &result) const;
+
+  std::vector<Account> accounts_;
+  std::vector<VictimSource *> sources_;
+  std::map<uint32_t, ClaimState> claims_;
+  uint32_t nextClaim_ = 1;
+  std::function<Returning()> returning_;
+  std::function<Returning(uint64_t)> returningFor_;
+  MemoryRates rates_;
+  uint64_t laneDemandBytes_ = 0;
+  std::optional<RequestPriority> lanePriority_;
+  std::function<void(std::string_view)> log_;
+  double nowSeconds_ = 0.0;
+  std::optional<double> uncopiedReachedSeconds_;
 };
 
 } // namespace splash::engine
