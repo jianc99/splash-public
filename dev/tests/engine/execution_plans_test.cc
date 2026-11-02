@@ -6,6 +6,8 @@
 #include <iostream>
 #include <limits>
 #include <stdexcept>
+#include <string>
+#include <utility>
 
 namespace {
 using namespace splash;
@@ -222,6 +224,26 @@ void ggufMoePlans() {
           "invalid MoE expert tile configuration", "a decode plan took 32-row tiles");
 }
 
+// A dense prefill tile's history splits follow the device's pages per split
+// (KernelCalibration.hpp): one per 64 pages on Apple9 GPUs of 10 cores or
+// fewer, one per 32 elsewhere. Qwen3.6-35B-A3B's attention: a 512-row chunk
+// after 4K tokens (144 pages) and a 64-row chunk after 32K (1026 pages).
+void prefillSplitsFollowTheDeviceRow() {
+  const kv::Layout layout{1, 2, 256};
+  struct Expected final {
+    uint32_t rows, history, small, other;
+  };
+  for (const auto [rows, history, small, other] : {Expected{512, 4096, 2, 4}, Expected{64, 32768, 16, 32}})
+    for (const auto [family, cores] : {std::pair{9U, 10U}, {9U, 1U}, {9U, 11U}, {9U, 40U}, {10U, 12U}, {10U, 32U}}) {
+      DeviceCapabilities capabilities = device(family);
+      capabilities.gpuCoreCount = cores;
+      const uint32_t splits = ExecutionPlans(capabilities).prefillAttention(rows, history, 16, layout).splits;
+      require(splits == (family == 9 && cores <= 10 ? small : other),
+              "a prefill attention plan of family " + std::to_string(family) + ", " + std::to_string(cores) +
+                  " cores took " + std::to_string(splits) + " splits");
+    }
+}
+
 // A device that reports no core count gets the plans of kAssumedGpuCores
 // cores, Linear and MoE alike.
 void unknownCoreCount() {
@@ -317,6 +339,7 @@ int main() {
     baselinePlans();
     ggufMoePlans();
     unknownCoreCount();
+    prefillSplitsFollowTheDeviceRow();
     workspaceBounds();
     invalidLookupsAndContextEdges();
     std::cout << "PASS execution plans: device policies, device MoE tiles, B1-B4 "

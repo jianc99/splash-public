@@ -12,6 +12,7 @@
 #include "ops/Linear.hpp"
 #include "ops/PagedAttention.hpp"
 #include "ops/RoPE.hpp"
+#include "ops/KernelCalibration.hpp"
 
 #include <algorithm>
 #include <array>
@@ -33,6 +34,10 @@
 // own store wrote.
 
 namespace {
+
+// The pages per prefill attention split these plans take: the Apple10 row's
+// (KernelCalibration.hpp).
+constexpr uint32_t kPagesPerSplit = splash::ops::kAttention.prefillPagesPerSplit;
 
 using namespace splash;
 using test::HostKvExtents;
@@ -487,7 +492,8 @@ void checkPrefill(metal::MetalBackend &backend, kv::Format format, ops::Attentio
       const uint32_t chunkRows = std::min(chunk, rows - first);
       const Staging staging = stage(backend, data, first, chunkRows, (chunkRows + kPageTokens - 1) / kPageTokens * kPageTokens);
       run(backend, data, staging,
-          ops::PagedAttention::prefillPlan(chunkRows, history + first, kQueryHeads, data.layout, variant));
+          ops::PagedAttention::prefillPlan(chunkRows, history + first, kQueryHeads, data.layout, kPagesPerSplit,
+                                           variant));
       checkStore(data, staging, what);
       largest = std::max(largest, checkOutput(data, staging, what + (whole ? "" : " in chunks of " + std::to_string(chunk))));
     }
@@ -541,7 +547,7 @@ void checkSplitCounts(metal::MetalBackend &backend, kv::Format format) {
   }
   const Case tile = makeCase(backend, format, kWindowed, 1, 8, {4103, 0, 0, 0});
   const Staging tileStaging = stage(backend, tile, 0, 8, kPageTokens);
-  const auto tilePlan = ops::PagedAttention::prefillPlan(8, 4103, kQueryHeads, tile.layout, kWindowed);
+  const auto tilePlan = ops::PagedAttention::prefillPlan(8, 4103, kQueryHeads, tile.layout, kPagesPerSplit, kWindowed);
   run(backend, tile, tileStaging, tilePlan);
   for (uint32_t splits = 1; splits <= SPLASH_PREFILL_ATTENTION_MAXIMUM_SPLITS; ++splits) {
     const metal::MetalBuffer partials = poisoned(backend, uint64_t{splits} * kKvHeads * 64 * kHeadDimension * 4);
@@ -573,7 +579,8 @@ void checkWindowWithinHistory(metal::MetalBackend &backend, kv::Format format) {
       run(backend, data, staging,
           ops::PagedAttention::verifyPlan(lanes, kQueryHeads, data.layout, std::span(histories).first(lanes), variant));
     else
-      run(backend, data, staging, ops::PagedAttention::prefillPlan(rows, histories[0], kQueryHeads, data.layout, variant));
+      run(backend, data, staging,
+          ops::PagedAttention::prefillPlan(rows, histories[0], kQueryHeads, data.layout, kPagesPerSplit, variant));
     const auto *begin = contents<uint16_t>(staging.output);
     return std::vector<uint16_t>(begin, begin + staging.output.sizeBytes() / 2);
   };
@@ -599,25 +606,26 @@ void checkPlans(metal::MetalBackend &backend) {
   // windowed chunk keeps its splits as the history grows; a whole layer's
   // chunk takes more.
   const auto splitsAfter = [&](uint32_t history, ops::AttentionVariant variant) {
-    return ops::PagedAttention::prefillPlan(64, history, kQueryHeads, layout, variant).splits;
+    return ops::PagedAttention::prefillPlan(64, history, kQueryHeads, layout, kPagesPerSplit, variant).splits;
   };
   require(splitsAfter(1024, kWindowed) == splitsAfter(65536, kWindowed) &&
               splitsAfter(1024, kWhole) < splitsAfter(65536, kWhole),
           "a windowed chunk's splits follow its history, or a whole chunk's do not");
   for (const ops::AttentionVariant variant : {ops::AttentionVariant{.rotated = true, .windowTokens = 256},
                                               ops::AttentionVariant{.rotated = false, .windowTokens = 1024}})
-    rejects([&] { (void)ops::PagedAttention::prefillPlan(8, 0, kQueryHeads, layout, variant); },
+    rejects([&] { (void)ops::PagedAttention::prefillPlan(8, 0, kQueryHeads, layout, kPagesPerSplit, variant); },
             "no attention kernel for the layer's variant", "a window the geometry has no kernels for was accepted");
   for (const ops::AttentionVariant variant : {kWindowed, kWhole})
-    rejects([&] { (void)ops::PagedAttention::prefillPlan(8, 0, 24, qwen, variant); },
+    rejects([&] { (void)ops::PagedAttention::prefillPlan(8, 0, 24, qwen, kPagesPerSplit, variant); },
             "no attention kernel for the layer's variant", "a variant of a geometry without it was accepted");
-  require(!ops::PagedAttention::prefillPlan(8, 0, 24, qwen).sinks &&
-              ops::PagedAttention::prefillPlan(8, 0, 24, qwen).reducePipeline == "prefill_attention_reduce",
+  require(!ops::PagedAttention::prefillPlan(8, 0, 24, qwen, kPagesPerSplit).sinks &&
+              ops::PagedAttention::prefillPlan(8, 0, 24, qwen, kPagesPerSplit).reducePipeline ==
+                  "prefill_attention_reduce",
           "a geometry without sinks takes none");
   const metal::MetalBuffer buffer = zeroed(backend, 1 << 23), sinks = zeroed(backend, kQueryHeads * 4);
   const metal::MetalBuffer fewSinks = zeroed(backend, kQueryHeads * 4 - 4);
   const kv::ChunkedPrefillParams chunk = ops::PagedAttention::prefillParams(0, 8, 32, 1);
-  const auto plan = ops::PagedAttention::prefillPlan(8, 0, kQueryHeads, layout, kWindowed);
+  const auto plan = ops::PagedAttention::prefillPlan(8, 0, kQueryHeads, layout, kPagesPerSplit, kWindowed);
   metal::CommandGraph graph;
   rejects([&] { ops::PagedAttention::addPrefill(graph, {1, 0}, buffer, buffer, buffer, buffer, buffer, chunk, plan); },
           "attention sinks buffer holds", "a plan with sinks encoded without them");
@@ -626,7 +634,7 @@ void checkPlans(metal::MetalBackend &backend) {
   }, "attention sinks buffer holds", "a plan with sinks encoded with too few");
   rejects([&] {
     ops::PagedAttention::addPrefill(graph, {1, 0}, buffer, buffer, buffer, buffer, buffer, chunk,
-                                    ops::PagedAttention::prefillPlan(8, 0, 24, qwen), {}, sinks);
+                                    ops::PagedAttention::prefillPlan(8, 0, 24, qwen, kPagesPerSplit), {}, sinks);
   }, "the attention kernels take no sinks", "a plan without sinks encoded with some");
   require(graph.empty(), "a refused attention encoded a dispatch");
   std::cout << "variant plans PASS\n";

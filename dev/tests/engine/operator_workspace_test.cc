@@ -5,6 +5,7 @@
 #include "ops/MoE.hpp"
 #include "ops/PagedAttention.hpp"
 #include "ops/Sampling.hpp"
+#include "ops/KernelCalibration.hpp"
 
 #include <algorithm>
 #include <array>
@@ -13,6 +14,10 @@
 #include <stdexcept>
 
 namespace {
+
+// The pages per prefill attention split these plans take: the Apple10 row's
+// (KernelCalibration.hpp).
+constexpr uint32_t kPagesPerSplit = splash::ops::kAttention.prefillPagesPerSplit;
 
 using splash::test::rejects;
 using splash::test::require;
@@ -35,7 +40,7 @@ void attention() {
       require(workspace.statisticsBytes == uint64_t{maximumSlots} * 8 * queryHeads * 2 * 4,
               "prefill statistics workspace differs from the maximum over actual row counts");
       for (const uint32_t history : {0U, 65536U, 1'000'000U}) {
-        const auto plan = ops::PagedAttention::prefillPlan(rows, history, queryHeads, layout);
+        const auto plan = ops::PagedAttention::prefillPlan(rows, history, queryHeads, layout, kPagesPerSplit);
         require(workspace.partialsBytes >= plan.workspace.partialsBytes &&
                     workspace.statisticsBytes >= plan.workspace.statisticsBytes,
                 "prefill workspace omitted the plan of its own rows");
@@ -77,13 +82,13 @@ void attentionReads() {
   const kv::Layout selected{.attentionLayers = 1, .kvHeads = 2, .headDimension = 256,
                             .valuesTokenMajor = true, .reads = kv::Reads::SelectedBlocks};
   const std::array<uint32_t, 1> history{4096};
-  require(ops::PagedAttention::prefillPlan(64, 4096, 24, selected).sparse &&
+  require(ops::PagedAttention::prefillPlan(64, 4096, 24, selected, kPagesPerSplit).sparse &&
               ops::PagedAttention::verifyPlan(1, 24, selected, history).sparse,
           "a reader of selected blocks did not plan the sparse kernels");
   kv::Layout everyPage = selected;
   everyPage.reads = kv::Reads::EveryPage;
   require(everyPage.valid(), "a page loop over token-major values is not a layout");
-  rejects([&] { (void)ops::PagedAttention::prefillPlan(64, 4096, 24, everyPage); },
+  rejects([&] { (void)ops::PagedAttention::prefillPlan(64, 4096, 24, everyPage, kPagesPerSplit); },
           "no paged-attention kernel for layout", "the page loop planned the sparse kernels of token-major values");
   rejects([&] { (void)ops::PagedAttention::verifyPlan(1, 24, everyPage, history); },
           "no paged-attention kernel for layout", "the page loop planned the sparse kernels of token-major values");

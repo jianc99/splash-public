@@ -111,6 +111,12 @@ struct FloatTileCalibration final {
   uint32_t bf16Halves, f32Halves, quantizedRowsHalves;
 };
 
+struct AttentionCalibration final {
+  // A dense prefill tile takes one history split per this many pages its
+  // rows read (PagedAttention.cpp).
+  uint32_t prefillPagesPerSplit;
+};
+
 struct MoeCalibration final {
   // The expert tile by the block's FormatClass, in both phases: register
   // where true.
@@ -124,6 +130,7 @@ struct KernelCalibration final {
   ProjectionCalibration projection;
   FloatTileCalibration floatTile;
   MoeCalibration moe;
+  AttentionCalibration attention;
 
   [[nodiscard]] static KernelCalibration of(const DeviceCapabilities &device) noexcept;
 };
@@ -411,23 +418,40 @@ inline constexpr MoeCalibration kApple9SmallMoe{{false, false, false, false}};
 // Apple10 stages experts in every format.
 inline constexpr MoeCalibration kApple10Moe{{false, false, false, false}};
 
+
+// ---- Attention ----------------------------------------------------------
+
+// A chunk of a few hundred rows over a long history otherwise leaves much of
+// the GPU idle: on an M5 Max the attention of a 256-row chunk after 32K-128K
+// tokens ran 23-26% faster at one split per 32 pages (Qwen3.6-35B-A3B's and
+// Qwen3.8-27B's), of a 512-row chunk 23% and 10%, within 7% of the fastest
+// split count; the 20-core M5 Pro's 256-row chunk ran 40-43% faster. On the
+// 12-core M6 (attention-sweep, the 27B, 35B and Flint's whole-history layers,
+// 64-512 rows after 4K-128K tokens, medians of 5; binaries 27020101, metallib
+// 703016c3) no case is slower than the shared splits by more than the rule's
+// A/A spread (3.1%), 9.7% less time in total, at most 8.3% from each case's
+// fastest forced split (35B, 64 rows after 4K tokens). Status: measured on
+// Apple10 at 12, 20 and 32 cores.
+inline constexpr AttentionCalibration kAttention{32};
+
+// On the 10-core M4 (the same sweep, the 27B and 35B) one split per 32 pages
+// takes 4.0% less time in total than the shared splits but 1.8% more on the
+// 35B's 512-row chunk after 4K tokens, past the A/A spread (0.7%); one per 64
+// pages leaves no case past the spread and takes 3362.3 ms in total against
+// 3362.8 at 32 and 3363.5 at 128 (sweeps at forced splits; binaries 27020101,
+// metallib 703016c3). Status: measured on the M4; Apple9 of more cores
+// unmeasured, so it keeps 32 (O5).
+inline constexpr AttentionCalibration kApple9SmallAttention{64};
+
+// ---- The device's row ------------------------------------------------------
+
 inline KernelCalibration KernelCalibration::of(const DeviceCapabilities &device) noexcept {
   const uint32_t cores = device.plannedGpuCores();
-  if (device.gpuClass() == GpuClass::Apple10) return {cores, kApple10Projection, kApple10FloatTile, kApple10Moe};
+  if (device.gpuClass() == GpuClass::Apple10)
+    return {cores, kApple10Projection, kApple10FloatTile, kApple10Moe, kAttention};
   const bool small = cores <= kApple9SmallGpuCores;
   return {cores, small ? kApple9SmallProjection : kApple9Projection, kApple9FloatTile,
-          small ? kApple9SmallMoe : kApple9Moe};
+          small ? kApple9SmallMoe : kApple9Moe, small ? kApple9SmallAttention : kAttention};
 }
-
-// ---- Attention ------------------------------------------------------------
-
-// Each prefill query tile's history splits: one per this many pages a tile's
-// rows read (PagedAttention.cpp, prefillSplits). A chunk of a few hundred rows
-// over a long history otherwise leaves much of the GPU idle: on an M5 Max the
-// attention of a 256-row chunk after 32K-128K tokens ran 23-26% faster at
-// these splits (Qwen3.6-35B-A3B's and Qwen3.8-27B's), of a 512-row chunk 23%
-// and 10%, within 7% of the fastest split count. Status: measured on the
-// 32-core M5 Max and the 20-core M5 Pro; unmeasured on Apple9 and on 12 cores.
-inline constexpr uint32_t kPrefillPagesPerSplit = 32;
 
 } // namespace splash::ops

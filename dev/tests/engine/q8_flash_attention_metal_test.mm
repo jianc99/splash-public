@@ -6,6 +6,7 @@
 #include "TestFamilies.hpp"
 #include "ops/PagedAttention.hpp"
 #include "Q8PageFormatReference.hpp"
+#include "ops/KernelCalibration.hpp"
 
 #include <algorithm>
 #include <array>
@@ -24,6 +25,10 @@ using namespace splash::kv;
 using splash::test::HostKvExtents;
 
 namespace {
+
+// The pages per prefill attention split these plans take: the Apple10 row's
+// (KernelCalibration.hpp).
+constexpr uint32_t kPagesPerSplit = splash::ops::kAttention.prefillPagesPerSplit;
 
 constexpr uint32_t kStride = 32;
 constexpr uint32_t kQueryStride = kStride;
@@ -66,7 +71,7 @@ struct Shape {
 
 private:
   splash::ops::PrefillAttentionPlan prefillPlan() const {
-    return splash::ops::PagedAttention::prefillPlan(kRows, 0, queryHeads(), layout());
+    return splash::ops::PagedAttention::prefillPlan(kRows, 0, queryHeads(), layout(), kPagesPerSplit);
   }
   splash::ops::VerifyAttentionPlan verifyPlan() const {
     const std::array<uint32_t, 1> history{0};

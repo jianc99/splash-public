@@ -255,10 +255,11 @@ public:
   // The kernels read a sequence's history from its chunk parameters; a
   // plan's split count follows its rows and, unless it is sparse, the pages
   // its tiles read of the historyTokens committed before them (with a
-  // window, no more than its window's).
+  // window, no more than its window's), a split per the device's
+  // `pagesPerSplit` (AttentionCalibration).
   [[nodiscard]] static PrefillAttentionPlan
   prefillPlan(uint32_t rows, uint32_t historyTokens, uint32_t queryHeads, kv::Layout layout,
-              AttentionVariant variant = {});
+              uint32_t pagesPerSplit, AttentionVariant variant = {});
   // historyTokens holds each lane's committed tokens before its verify rows,
   // one entry per lane.
   [[nodiscard]] static VerifyAttentionPlan

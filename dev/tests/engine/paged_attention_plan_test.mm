@@ -9,6 +9,7 @@
 #include "LinearNumerics.hpp"
 #include "NormReference.hpp"
 #include "TestFamilies.hpp"
+#include "ops/KernelCalibration.hpp"
 
 #include <algorithm>
 #include <array>
@@ -28,6 +29,10 @@
 #include <vector>
 
 namespace {
+
+// The pages per prefill attention split these plans take: the Apple10 row's
+// (KernelCalibration.hpp).
+constexpr uint32_t kPagesPerSplit = splash::ops::kAttention.prefillPagesPerSplit;
 
 using namespace splash;
 using test::HostKvExtents;
@@ -101,7 +106,7 @@ void checkPrefillSlotOrientation(uint32_t queryHeads, kv::Layout layout) {
   // split.
   for (const auto [rows, history] : {std::pair{17U, 0U}, std::pair{257U, 0U}, std::pair{257U, 65536U},
                                      std::pair{2048U, 131072U}}) {
-    const auto plan = ops::PagedAttention::prefillPlan(rows, history, queryHeads, layout);
+    const auto plan = ops::PagedAttention::prefillPlan(rows, history, queryHeads, layout, kPagesPerSplit);
     const uint32_t tiles = (rows + 7) / 8;
     require(plan.splitGroups.x == headParts &&
                 plan.splitGroups.y == tiles && plan.splitGroups.z == plan.splits,
@@ -146,12 +151,12 @@ void checkPlans(uint32_t queryHeads, kv::Layout layout) {
         std::array{256U, 4096U, 4U}, std::array{64U, 8192U, 8U}, std::array{256U, 16384U, 8U},
         std::array{64U, 65536U, 32U}, std::array{256U, 131072U, 8U}, std::array{512U, 65536U, 4U},
         std::array{300U, 65536U, 6U}, std::array{2048U, 131072U, 1U}})
-    require(ops::PagedAttention::prefillPlan(rows, history, queryHeads, layout).splits ==
+    require(ops::PagedAttention::prefillPlan(rows, history, queryHeads, layout, kPagesPerSplit).splits ==
                 (selectsBlocks(layout) ? std::clamp(32U / ((rows + 7) / 8), 1U, 32U) : splits),
             "prefill split count does not follow its rows and history");
   for (uint32_t rows = 1; rows <= 2048; ++rows)
     for (const uint32_t history : {0U, 4000U, 8192U, 32768U, 131072U, 1'000'000U}) {
-      const auto plan = ops::PagedAttention::prefillPlan(rows, history, queryHeads, layout);
+      const auto plan = ops::PagedAttention::prefillPlan(rows, history, queryHeads, layout, kPagesPerSplit);
       const uint32_t tiles = (rows + 7) / 8;
       const uint32_t splits = prefillSplits(rows, history, selectsBlocks(layout));
       require(plan.rows == rows && plan.splits == splits, "prefill plan lost actual rows");
@@ -208,7 +213,7 @@ void checkPlans(uint32_t queryHeads, kv::Layout layout) {
             "verify partition changed");
   }
   for (const uint32_t rows : {0U, 2049U})
-    rejects([&] { (void)ops::PagedAttention::prefillPlan(rows, 0, queryHeads, layout); },
+    rejects([&] { (void)ops::PagedAttention::prefillPlan(rows, 0, queryHeads, layout, kPagesPerSplit); },
             "invalid attention workspace rows", "a prefill plan of no rows or past the budget was accepted");
   for (const uint32_t lanes : {0U, 5U})
     rejects([&] { (void)ops::PagedAttention::verifyPlan(lanes, queryHeads, layout, zeroHistory); },
@@ -594,7 +599,8 @@ std::vector<uint16_t> run(metal::MetalBackend &backend, Case &data, bool testBou
   constexpr bool prefill = phase == Phase::Prefill;
   const auto plan = [&] {
     if constexpr (prefill)
-      return ops::PagedAttention::prefillPlan(data.rows, data.stores[0].committed_tokens, data.queryHeads, data.layout);
+      return ops::PagedAttention::prefillPlan(data.rows, data.stores[0].committed_tokens, data.queryHeads,
+                                              data.layout, kPagesPerSplit);
     else {
       std::vector<uint32_t> histories;
       for (uint32_t lane = 0; lane < data.lanes; ++lane)
@@ -1101,7 +1107,7 @@ void bufferExtents(metal::MetalBackend &backend, uint32_t queryHeads, kv::Layout
                        [&](metal::CommandGraph &graph, const Buffers &b) {
                          ops::PagedAttention::addPrefillStore(graph, {}, b[0], b[1], b[2], chunk, layout);
                        });
-  const auto prefill = ops::PagedAttention::prefillPlan(tokens, committed, queryHeads, layout);
+  const auto prefill = ops::PagedAttention::prefillPlan(tokens, committed, queryHeads, layout, kPagesPerSplit);
   const uint64_t tileRows = kv::prefillAttentionTiles(tokens) * kv::kPrefillAttentionTileRows;
   test::requireExtents(backend,
                        Extents{{0, staged(kvHeads, stride, tileRows, queryWidth), 2, "attention query"},
@@ -1207,7 +1213,7 @@ void attentionBlocks(metal::MetalBackend &backend) {
   tokenMajor.valuesTokenMajor = true;
   tokenMajor.reads = kv::Reads::SelectedBlocks;
   const std::array<uint32_t, lanes> histories{100, 2000, 0};
-  rejects([&] { (void)ops::PagedAttention::prefillPlan(tokens, 100, 24, dense); },
+  rejects([&] { (void)ops::PagedAttention::prefillPlan(tokens, 100, 24, dense, kPagesPerSplit); },
           "no paged-attention kernel for layout", "the sparse kernels took dimension-major values");
   rejects([&] { (void)ops::PagedAttention::verifyPlan(lanes, 16, tokenMajor, histories); },
           "no sparse attention kernel for layout", "the page loop took token-major values");
@@ -1226,7 +1232,7 @@ void attentionBlocks(metal::MetalBackend &backend) {
   for (const uint32_t queryHeads : {16U, 24U}) {
     const bool sparse = queryHeads == 24;
     const kv::Layout layout = sparse ? tokenMajor : dense;
-    const auto prefill = ops::PagedAttention::prefillPlan(tokens, 100, queryHeads, layout);
+    const auto prefill = ops::PagedAttention::prefillPlan(tokens, 100, queryHeads, layout, kPagesPerSplit);
     const auto verify = ops::PagedAttention::verifyPlan(lanes, queryHeads, layout, histories);
     require(prefill.sparse == sparse && verify.sparse == sparse,
             "a plan's kernels do not take block lists as its group size states");
