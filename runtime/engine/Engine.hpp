@@ -650,8 +650,8 @@ private:
   // Whether a resident Spill request's prompt goes on: its next commands
   // take Full pages that spill as their copies land.
   [[nodiscard]] bool spillingPrompt() const;
-  // Whether a lane, of the given KV mode if one is named, is in service.
-  [[nodiscard]] bool laneInService(std::optional<KvMode> mode) const;
+  // Whether a lane is in service.
+  [[nodiscard]] bool laneInService() const;
   // What becomes of the Full extents the spill of pages whose copies landed
   // empties (Cache::spillWritten): they leave memory but the runway while a
   // spilling prompt still grows into it or the host holds growth back, when

@@ -403,10 +403,8 @@ bool Engine::spillingPrompt() const {
   });
 }
 
-bool Engine::laneInService(std::optional<KvMode> mode) const {
-  return std::any_of(requests_.begin(), requests_.end(), [&](const auto &entry) {
-    return entry.second.lane && (!mode || entry.second.kvMode == *mode);
-  });
+bool Engine::laneInService() const {
+  return std::any_of(requests_.begin(), requests_.end(), [](const auto &entry) { return entry.second.lane.has_value(); });
 }
 
 SpilledExtents Engine::landedExtents() const {
@@ -420,11 +418,17 @@ void Engine::spillLanded() {
   // The Index runway the pages draw on refills if memory allows. The Index
   // pages, the runway's included, are memory the resident Spill lanes need,
   // as their Full pages are, and a fraction of what the moves free: with no
-  // such lane in service they take only what costs nothing.
+  // such lane in service they take only what costs nothing. With one, they
+  // are the highest-ranked such lane's: the room its waiting claim holds is
+  // the room its landed pages move into.
   const SpilledExtents extents = landedExtents();
-  const bool needed = laneInService(KvMode::Spill);
+  std::optional<ClaimRank> needed;
+  for (const auto &[_, active] : requests_)
+    if (active.lane && active.kvMode == KvMode::Spill && (!needed || rankOf(active) > *needed))
+      needed = rankOf(active);
   static_cast<void>(allocate([&] { return cache_.spillWritten(extents); },
                              {.cls = needed ? ClaimClass::InService : ClaimClass::Optional,
+                              .rank = needed.value_or(ClaimRank{}),
                               .timing = NeedTiming::Immediate,
                               .benefitSeconds = needed ? std::numeric_limits<double>::infinity() : 0.0}));
 }
@@ -534,10 +538,10 @@ Engine::Prepared Engine::refuse(std::span<const Denied> denied, const PlanContex
     throw std::logic_error("empty resource admission result");
   // No lane runs: the copies Spill requests owe and have not started, as a
   // chain a lane restored has before its first command or those the control
-  // pass left when it collected the ones that landed, start now. A lane
-  // alone waits while they are written (MemoryLedger::free).
-  if (spill)
-    static_cast<void>(cache_.writeThrough());
+  // pass left when it collected the ones that landed, start now, and the
+  // lanes wait: their next attempt finds them in flight, which a claim alone
+  // waits for (MemoryLedger::free).
+  const bool written = spill && cache_.writeThrough() != 0;
   // Memory on its way back arrives without anyone yielding. The lanes still
   // take a retry deadline: the transfer's completion wakes the engine, and
   // the deadline is what makes the wait end if that wake is ever missed.
@@ -546,8 +550,7 @@ Engine::Prepared Engine::refuse(std::span<const Denied> denied, const PlanContex
       deferResourceRetry(request(entry.requestId), plan.now, entry.denial);
     return Prepared::Waiting;
   };
-  if (std::any_of(denied.begin(), denied.end(),
-                  [](const Denied &entry) { return entry.denial.pending; }))
+  if (written || std::any_of(denied.begin(), denied.end(), [](const Denied &entry) { return entry.denial.pending; }))
     return wait();
   const Denied &victim = *std::min_element(
       denied.begin(), denied.end(),

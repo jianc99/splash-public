@@ -1357,7 +1357,7 @@ Engine::Prepared Engine::prepare(const BatchPlan &plan, std::vector<ModelBatchIt
   // B2); with no lane in service they take only what costs nothing. A
   // refusal the ledger does not meet leaves pages Full for a later pass.
   {
-    const bool inService = laneInService(std::nullopt);
+    const bool inService = laneInService();
     ClaimHandle claim;
     claim.governor = &governor();
     claim.id = governor().ledger().open(
