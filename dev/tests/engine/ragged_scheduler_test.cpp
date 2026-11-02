@@ -1713,6 +1713,49 @@ void testAnOverdueLaneIsNeverAbandoned() {
           "an overdue lane's command was abandoned");
 }
 
+// A lane whose wait is within its command's passes so far (W) of
+// kAgingSlowdown times its remaining cost is not abandoned, by its priority's
+// arrival or a higher one's start: the abandonment, which adds W to its wait,
+// would make it overdue, so it would lead the next plan with its own rows
+// and the plan W was given up for would not run. Further from it, both
+// supersede the command, W being half the arrival's threshold
+// (testASameTierArrivalSupersedesOnlyWhenTheSumFalls).
+void testAnAbandonmentDoesNotMakeALaneOverdue() {
+  constexpr double kAging = model::ExecutionLimits::maximumBatchWidth - 1;
+  for (const bool near : {false, true}) {
+    Sim sim(test::kM6FlashNextQ2, limits(8192, 48));
+    sim.seed();
+    sim.lane(1, 0, 3 * 8192);
+    const BatchPlan command = sim.plan();
+    sim.run(command);
+    sim.lane(2, 8192, 300);
+    const BatchPlan fresh = [&] {
+      const PassProgress kept = *sim.passes;
+      sim.passes.reset();
+      const BatchPlan result = sim.plan();
+      sim.passes = kept;
+      return result;
+    }();
+    require(fresh.width() == 1 && fresh.items[0].requestId == 2, "the arrival did not lead a plan of its own");
+    const double elapsed = 0.5 * (sim.passesPrice(command.items, 1, command.passes) -
+                                  sim.passesPrice(fresh.items, 0, fresh.passes));
+    double remaining = 0.0;
+    for (uint32_t position = 0; position < 3 * 8192; position += 8192) {
+      const std::array whole{BatchItem{1, 8192, position}};
+      remaining += sim.price(whole);
+    }
+    PassProgress earlier = *sim.passes;
+    earlier.elapsedMilliseconds = kAging * remaining - (near ? 0.5 : 2.0) * elapsed;
+    sim.scheduler.abandoned(earlier);
+    sim.passes->elapsedMilliseconds = elapsed;
+    const std::string after = std::string(near ? "within" : "past") + " W of overdue, ";
+    require(sim.scheduler.abandonsPasses(sim.plan(), sim.in()) == !near,
+            after + "its priority's arrival did " + (near ? "" : "not ") + "abandon the command");
+    require(sim.scheduler.yieldsTo(RequestPriority::Foreground, 1, sim.in()) == !near,
+            after + "a higher priority's start did " + (near ? "" : "not ") + "abandon the command");
+  }
+}
+
 // While a command is between its passes, a start waiting for a quota does
 // not lift it over a higher decoder; one the command held back does, and the
 // kinds alternate.
@@ -2032,6 +2075,7 @@ constexpr test::TestCase kTests[] = {
     {"testAHigherTierAbandonCountsLanesWaitingBehindBoth", testAHigherTierAbandonCountsLanesWaitingBehindBoth},
     {"testARegroupHappensOnlyWhenTheSumFalls", testARegroupHappensOnlyWhenTheSumFalls},
     {"testAnOverdueLaneIsNeverAbandoned", testAnOverdueLaneIsNeverAbandoned},
+    {"testAnAbandonmentDoesNotMakeALaneOverdue", testAnAbandonmentDoesNotMakeALaneOverdue},
     {"testOnlyAHeldStartLiftsTheCommand", testOnlyAHeldStartLiftsTheCommand},
     {"testRepeatedSupersedesEndOnceTheLongLaneIsOverdue", testRepeatedSupersedesEndOnceTheLongLaneIsOverdue},
     {"testCommandBetweenPassesHoldsItsLanes", testCommandBetweenPassesHoldsItsLanes},

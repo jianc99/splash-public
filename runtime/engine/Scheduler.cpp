@@ -28,6 +28,13 @@ bool holds(std::span<const BatchItem> items, uint64_t id) noexcept {
   return std::ranges::any_of(items, [id](const BatchItem &item) { return item.requestId == id; });
 }
 
+// Whether a lane that has waited `waited` is overdue: its wait is bounded by
+// its own priced remaining cost; before any price there is none to bound it
+// by.
+bool aged(double waited, double remainingMilliseconds) noexcept {
+  return remainingMilliseconds > 0.0 && waited >= kAgingSlowdown * remainingMilliseconds;
+}
+
 // The rows of an uncontended command of a lane with `remaining` rows to
 // prefill: up to a chunk, or for a lane whose commands are groups of up to
 // `groupRows` rows, its remaining chunks split evenly over the fewest groups
@@ -277,13 +284,8 @@ bool Scheduler::yieldsTo(RequestPriority priority, uint32_t lanes, const PlanInp
   if (!in.passes || !lanes)
     return false;
   const BatchPlan &command = in.passes->plan;
-  if (priority >= get(command.items.front().requestId).spec.priority)
+  if (priority >= get(command.items.front().requestId).spec.priority || overdueOnceAbandoned(in))
     return false;
-  for (const BatchItem &item : command.items) {
-    const Request &request = get(item.requestId);
-    if (lane(request, request.promptProcessed, in).overdue)
-      return false;
-  }
   // The start runs first either way, so the plan's price drops out.
   return supersedeGain({}, lanes, priority, 0.0, 0.0, in) > 0.0;
 }
@@ -347,12 +349,8 @@ std::optional<BatchPlan> Scheduler::nextPrefill(const PlanInputs &in) const {
 
 bool Scheduler::supersedes(const BatchPlan &plan, const PlanInputs &in) const {
   const PassProgress &command = *in.passes;
-  for (const BatchItem &item : command.plan.items) {
-    const Request &request = get(item.requestId);
-    if (lane(request, request.promptProcessed, in).overdue)
-      return false;
-  }
-  if (std::ranges::any_of(plan.items, [&](const BatchItem &item) { return listed(command.leftOut, item.requestId); }))
+  if (overdueOnceAbandoned(in) ||
+      std::ranges::any_of(plan.items, [&](const BatchItem &item) { return listed(command.leftOut, item.requestId); }))
     return false;
   std::vector<BatchItem> joiners;
   for (const BatchItem &item : plan.items)
@@ -425,11 +423,17 @@ LaneShape Scheduler::shapeOf(uint64_t id, const PlanInputs &in) const {
 Scheduler::Lane Scheduler::lane(const Request &request, uint32_t processed, const PlanInputs &in) const {
   Lane result{.request = &request, .processed = processed, .shape = shapeOf(request.spec.id, in)};
   result.remainingMilliseconds = remainingMilliseconds(result);
-  // A lane's wait is bounded by its own priced cost; before any price there
-  // is none to bound it by.
-  result.overdue = request.overdue || (result.remainingMilliseconds > 0.0 &&
-                                       request.waitedMilliseconds >= kAgingSlowdown * result.remainingMilliseconds);
+  result.overdue = request.overdue || aged(request.waitedMilliseconds, result.remainingMilliseconds);
   return result;
+}
+
+bool Scheduler::overdueOnceAbandoned(const PlanInputs &in) const {
+  return std::ranges::any_of(in.passes->plan.items, [&](const BatchItem &item) {
+    const Request &request = get(item.requestId);
+    const Lane view = lane(request, request.promptProcessed, in);
+    return view.overdue ||
+           aged(request.waitedMilliseconds + in.passes->elapsedMilliseconds, view.remainingMilliseconds);
+  });
 }
 
 std::vector<model::PrefillLane> Scheduler::prefillLanes(std::span<const BatchItem> items,

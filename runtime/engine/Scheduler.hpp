@@ -325,9 +325,15 @@ private:
   [[nodiscard]] std::optional<Planned> planPrefill(std::vector<Lane> ready) const;
   [[nodiscard]] std::optional<BatchPlan> nextPrefill(const PlanInputs &in) const;
   [[nodiscard]] std::optional<BatchPlan> nextDecode(std::span<const uint64_t> excluded) const;
+  // Whether a lane of the command between its passes is overdue, or would be
+  // once abandoning it adds the time its passes took to its wait (abandoned):
+  // such a lane leads the next plan, so a plan made without that wait would
+  // not run, and its passes would be lost.
+  [[nodiscard]] bool overdueOnceAbandoned(const PlanInputs &in) const;
   // Whether abandoning the command between its passes for `plan` shortens
   // the summed completion of the lanes concerned (gain), with no lane of the
-  // command overdue and none of the plan left out of its first pass.
+  // command overdue once abandoned and none of the plan left out of its first
+  // pass.
   [[nodiscard]] bool supersedes(const BatchPlan &plan, const PlanInputs &in) const;
   // What abandoning the command between its passes for a plan of `lanes`
   // (and `starts` more lanes not yet resident) of `priority` saves the
