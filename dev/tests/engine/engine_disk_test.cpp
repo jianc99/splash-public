@@ -1,4 +1,5 @@
 #include "EngineTestSupport.hpp"
+#include "MemoryPasses.hpp"
 #include "TestCache.hpp"
 #include "TestChecks.hpp"
 #include "TestEngine.hpp"
@@ -481,7 +482,7 @@ void testWaitingLaneAlwaysNamesAWakeup() {
   KvPool pool(storage, 0);
   test::TestKvTier tier;
   tier.transferLimit = 8;
-  engine::Cache cache(pool, &tier, nullptr);
+  engine::Cache cache(pool, &tier, test::ampleDiskBudget());
   Executor executor;
   Events events;
   engine::Engine engine(test::engineConfig({.maxContext = 102400}), cache, executor, events);
@@ -522,7 +523,7 @@ void testWaitingPlanDoesNotIdleRunnableLanes() {
     KvPool pool(storage, 0);
     test::TestKvTier tier;
     tier.transferLimit = 8;
-    engine::Cache cache(pool, &tier, nullptr);
+    engine::Cache cache(pool, &tier, test::ampleDiskBudget());
     Executor executor;
     executor.decodeFinishes = false;
     Events events;
@@ -555,7 +556,7 @@ void testWaitingPlanDoesNotIdleRunnableLanes() {
     KvPool pool(storage, 0);
     test::TestKvTier tier;
     tier.transferLimit = 8;
-    engine::Cache cache(pool, &tier, nullptr);
+    engine::Cache cache(pool, &tier, test::ampleDiskBudget());
     Executor executor;
     Events events;
     engine::Engine engine(test::engineConfig({.maxContext = 102400}), cache, executor, events);
@@ -608,7 +609,7 @@ void runShortOfMemory(engine::Cache &cache, test::TestKvTier &tier) {
 void testReplayPointsAreWrittenBehind() {
   struct Fixture final {
     Fixture(bool persistent, bool shortOfMemory)
-        : tier(persistent), cache(pool, &tier, nullptr),
+        : tier(persistent), cache(pool, &tier, test::ampleDiskBudget()),
           engine(test::engineConfig({.maxContext = 102400}), cache, executor, events) {
       tier.transferLimit = 64;
       tier.capacity = 128;
@@ -695,7 +696,7 @@ void testFinishedConversationsLeaveAtOnce() {
     test::TestKvTier tier(persistent);
     tier.transferLimit = 64;
     tier.capacity = 128;
-    engine::Cache cache(pool, &tier, nullptr);
+    engine::Cache cache(pool, &tier, test::ampleDiskBudget());
     Executor executor;
     executor.keptTier = std::make_shared<OffloadControl>();
     executor.keptTier->ready = true;
@@ -752,7 +753,7 @@ void testCopiesAheadWaitForALaneRefusedBesideOthers() {
   test::TestKvTier tier(true);
   tier.transferLimit = 64;
   tier.capacity = 256;
-  engine::Cache cache(pool, &tier, nullptr);
+  engine::Cache cache(pool, &tier, test::ampleDiskBudget());
   Executor executor;
   executor.keptTier = std::make_shared<OffloadControl>();
   executor.keptTier->ready = true;
@@ -822,7 +823,7 @@ void testCopiesAheadWaitNoLongerThanTheWaitsLimit() {
   test::TestKvTier tier(true);
   tier.transferLimit = 64;
   tier.capacity = 256;
-  engine::Cache cache(pool, &tier, nullptr);
+  engine::Cache cache(pool, &tier, test::ampleDiskBudget());
   Executor executor;
   executor.keptTier = std::make_shared<OffloadControl>();
   executor.keptTier->ready = true;
@@ -895,7 +896,7 @@ void testCopiesAheadDoNotWaitForALaneBelowThePriorityThatRuns() {
   test::TestKvTier tier(true);
   tier.transferLimit = 64;
   tier.capacity = 256;
-  engine::Cache cache(pool, &tier, nullptr);
+  engine::Cache cache(pool, &tier, test::ampleDiskBudget());
   Executor executor;
   executor.keptTier = std::make_shared<OffloadControl>();
   executor.keptTier->ready = true;
@@ -962,7 +963,7 @@ void testARefusalAfterProgressRestartsTheWaitLimit() {
   KvPool pool(storage, 0);
   test::TestKvTier tier;
   tier.transferLimit = 8;
-  engine::Cache cache(pool, &tier, nullptr);
+  engine::Cache cache(pool, &tier, test::ampleDiskBudget());
   Executor executor(2);
   executor.decodeFinishes = false;
   Events events;
@@ -1041,7 +1042,7 @@ void testCopiesAheadDoNotWaitForARequestHeldBehindARefusal() {
   test::TestKvTier tier(true);
   tier.transferLimit = 64;
   tier.capacity = 512;
-  engine::Cache cache(pool, &tier, nullptr);
+  engine::Cache cache(pool, &tier, test::ampleDiskBudget());
   Executor executor;
   executor.keptTier = std::make_shared<OffloadControl>();
   executor.keptTier->ready = true;
@@ -1117,7 +1118,7 @@ void testCopiesAheadWaitForALaneRefusedDuringARecovery() {
   test::TestKvTier tier(true);
   tier.transferLimit = 64;
   tier.capacity = 256;
-  engine::Cache cache(pool, &tier, nullptr);
+  engine::Cache cache(pool, &tier, test::ampleDiskBudget());
   Executor executor;
   executor.keptTier = std::make_shared<OffloadControl>();
   executor.keptTier->ready = true;
@@ -1191,7 +1192,7 @@ void testNothingInFlightIsNotPending() {
   KvPool pool(storage, 0);
   test::TestKvTier tier;
   tier.writableFile = false;
-  engine::Cache cache(pool, &tier, nullptr);
+  engine::Cache cache(pool, &tier, test::ampleDiskBudget());
   Executor executor;
   Events events;
   engine::Engine engine(test::engineConfig({.maxContext = 102400}), cache, executor, events);
@@ -1225,7 +1226,7 @@ void testPageShortfallDemotesInBulk() {
   test::TestKvTier tier;
   tier.transferLimit = 8;
   tier.capacity = 8;
-  engine::Cache cache(pool, &tier, nullptr);
+  engine::Cache cache(pool, &tier, test::ampleDiskBudget());
   Executor executor;
   Events events;
   engine::Engine engine(test::engineConfig({.maxContext = 102400}), cache, executor, events);
@@ -1304,7 +1305,7 @@ void testCopiesAheadDoNotWaitForARequestARecoveryLeavesUntried() {
   test::TestKvTier tier(true);
   tier.transferLimit = 64;
   tier.capacity = 256;
-  engine::Cache cache(pool, &tier, nullptr);
+  engine::Cache cache(pool, &tier, test::ampleDiskBudget());
   Executor executor;
   executor.keptTier = std::make_shared<OffloadControl>();
   executor.keptTier->ready = true;
@@ -1403,7 +1404,7 @@ void testABatchRefusalOfNothingOnItsWayBackHoldsNoOne() {
   KvPool pool(storage, 0);
   test::TestKvTier tier;
   tier.transferLimit = 8;
-  engine::Cache cache(pool, &tier, nullptr);
+  engine::Cache cache(pool, &tier, test::ampleDiskBudget());
   Executor executor;
   executor.decodeFinishes = false;
   Events events;
@@ -1585,7 +1586,7 @@ void testDiskKvPrefixIsRestoredBeforeTheLaneRuns() {
   test::TestKvStorage storage(128, 4096, 4);
   KvPool pool(storage, 0);
   test::TestKvTier tier;
-  engine::Cache cache(pool, &tier, nullptr);
+  engine::Cache cache(pool, &tier, test::ampleDiskBudget());
   Executor executor;
   Events events;
   engine::Engine engine(test::engineConfig({.maxContext = 102400}), cache, executor, events);
@@ -1706,7 +1707,7 @@ void testSkipCacheRequestDoesNotWaitForAProducer() {
   test::TestKvStorage storage(128, 4096, 4);
   KvPool pool(storage, 0);
   test::TestKvTier tier;
-  engine::Cache cache(pool, &tier, nullptr);
+  engine::Cache cache(pool, &tier, test::ampleDiskBudget());
   Executor executor;
   Events events;
   engine::Engine engine(test::engineConfig({.maxContext = 102400}), cache, executor, events);
@@ -1784,7 +1785,7 @@ void testSkipCacheCandidateIsNotProbed() {
   test::TestKvStorage storage(128, 4096, 4);
   KvPool pool(storage, 0);
   test::TestKvTier tier;
-  engine::Cache cache(pool, &tier, nullptr);
+  engine::Cache cache(pool, &tier, test::ampleDiskBudget());
   Executor executor;
   Events events;
   engine::Engine engine(test::engineConfig({.maxContext = 102400}), cache, executor, events);
@@ -1922,7 +1923,7 @@ void testCancelledDiskPrefixStopsQueuedReads() {
   KvPool pool(storage, 0);
   test::TestKvTier tier;
   tier.transferLimit = 1;
-  engine::Cache cache(pool, &tier, nullptr);
+  engine::Cache cache(pool, &tier, test::ampleDiskBudget());
   Executor executor;
   Events events;
   engine::Engine engine(test::engineConfig({.maxContext = 102400}), cache, executor, events);

@@ -7,10 +7,12 @@
 // pool to its floor.
 
 #include "engine/MemoryGovernor.hpp"
+#include "model/SlotFile.hpp"
 
 #include <algorithm>
 #include <cstdint>
 #include <limits>
+#include <memory>
 
 namespace splash::test {
 
@@ -34,6 +36,14 @@ inline engine::FreeResult hostPass(engine::MemoryGovernor &governor,
 // everything the host claim may take.
 inline engine::FreeResult criticalPass(engine::MemoryGovernor &governor) {
   return hostPass(governor, std::numeric_limits<uint64_t>::max(), true, true);
+}
+
+// The quota a test's cache with a disk tier counts its copies against, as
+// every production cache with a tier has one (model::DiskBudget): far past
+// what any test writes, so that a demotion the tier has room for is sure to
+// start.
+inline std::shared_ptr<model::DiskBudget> ampleDiskBudget() {
+  return std::make_shared<model::DiskBudget>(uint64_t{1} << 40);
 }
 
 } // namespace splash::test

@@ -4572,7 +4572,7 @@ void testPagesReturnFromDemotionWithoutSuspending() {
   KvPool pool(storage, 0);
   test::TestKvTier tier;
   tier.transferLimit = 8;
-  engine::Cache cache(pool, &tier, nullptr);
+  engine::Cache cache(pool, &tier, test::ampleDiskBudget());
   Executor executor;
   Events events;
   engine::Engine engine(test::engineConfig({.maxContext = 102400}), cache, executor, events);
@@ -4622,7 +4622,7 @@ void testRefusedRestoreClosesAdmission() {
     KvPool pool(storage, 0);
     test::TestKvTier tier;
     tier.transferLimit = 8;
-    engine::Cache cache(pool, &tier, nullptr);
+    engine::Cache cache(pool, &tier, test::ampleDiskBudget());
     Executor executor;
     executor.decodeFinishes = false;
     executor.restoreControl->ready = true;
@@ -4711,7 +4711,7 @@ void testAHigherPriorityThatWaitsLeavesACommandItsPasses() {
   test::TestKvTier tier;
   tier.capacity = 64;
   tier.transferLimit = 8;
-  engine::Cache cache(pool, &tier, nullptr);
+  engine::Cache cache(pool, &tier, test::ampleDiskBudget());
   Executor model;
   model.groupRows = 4 * model::ExecutionLimits::prefillTokenBudget;
   model.passes = 6;
@@ -4777,7 +4777,7 @@ void testWaitWithProgressOutlivesTheResourceLimit() {
   KvPool pool(storage, 0);
   test::TestKvTier tier;
   tier.transferLimit = 8;
-  engine::Cache cache(pool, &tier, nullptr);
+  engine::Cache cache(pool, &tier, test::ampleDiskBudget());
   Executor executor;
   Events events;
   engine::Engine engine(test::engineConfig({.maxContext = 102400}), cache, executor, events);
@@ -4842,7 +4842,7 @@ void testRolledBackAdmissionKeepsItsWaitLimit() {
   KvPool pool(storage, 0);
   test::TestKvTier tier;
   tier.transferLimit = 8;
-  engine::Cache cache(pool, &tier, nullptr);
+  engine::Cache cache(pool, &tier, test::ampleDiskBudget());
   Executor executor;
   Events events;
   engine::Engine engine(test::engineConfig({.maxContext = 102400}), cache, executor, events);
@@ -4904,7 +4904,7 @@ void testLimitOutlivedByProgressDoesNotWakeTheLoop() {
   test::TestKvTier tier;
   tier.capacity = 64;
   tier.transferLimit = 8;
-  engine::Cache cache(pool, &tier, nullptr);
+  engine::Cache cache(pool, &tier, test::ampleDiskBudget());
   Executor executor;
   executor.decodeFinishes = false;
   Events events;
@@ -4991,7 +4991,7 @@ void testLaneAdmittedBeforeASuspensionHoldsTheWaitOpen() {
   KvPool pool(storage, 0);
   test::TestKvTier tier;
   tier.transferLimit = 8;
-  engine::Cache cache(pool, &tier, nullptr);
+  engine::Cache cache(pool, &tier, test::ampleDiskBudget());
   Executor executor;
   executor.decodeFinishes = false;
   Events events;
@@ -5050,7 +5050,7 @@ void testRestoringLaneWaitsForResidentLanes() {
   KvPool pool(storage, 0);
   test::TestKvTier tier;
   tier.transferLimit = 8;
-  engine::Cache cache(pool, &tier, nullptr);
+  engine::Cache cache(pool, &tier, test::ampleDiskBudget());
   Executor executor;
   Events events;
   engine::Engine engine(test::engineConfig({.maxContext = 102400}), cache, executor, events);
@@ -5102,7 +5102,7 @@ void testRestoreCompletesWhileAConstrainedLaneDecodes() {
   test::TestKvStorage storage(128, 4096, 4);
   KvPool pool(storage, 0);
   test::TestKvTier tier;
-  engine::Cache cache(pool, &tier, nullptr);
+  engine::Cache cache(pool, &tier, test::ampleDiskBudget());
   Executor executor;
   executor.decodeFinishes = false;
   Events events;
@@ -5498,7 +5498,7 @@ void testHeldBackStartTakesNothingInUse() {
     test::TestKvStorage storage(16, 4096, 4);
     KvPool pool(storage, 0);
     test::TestKvTier tier;
-    engine::Cache resources(pool, &tier, nullptr);
+    engine::Cache resources(pool, &tier, test::ampleDiskBudget());
     Executor executor;
     executor.decodeFinishes = false;
     Events events;
@@ -5880,7 +5880,7 @@ void testCopyAheadOfALeafHoldsARefusalBack() {
     test::TestKvStorage storage(4, 100, 1);
     KvPool pool(storage, 0);
     test::TestKvTier tier;
-    engine::Cache cache(pool, &tier, nullptr);
+    engine::Cache cache(pool, &tier, test::ampleDiskBudget());
     auto transfer = std::make_shared<OffloadControl>();
     transfer->ready = true;
     // A finished conversation's leaf with its state in RAM, and a state in
@@ -5993,7 +5993,7 @@ void testReplayPointCopiesCacheBeforeTheExpertStore() {
   test::TestKvStorage storage(16, 4096, 4);
   KvPool pool(storage, 0);
   test::TestKvTier tier;
-  engine::Cache cache(pool, &tier, nullptr);
+  engine::Cache cache(pool, &tier, test::ampleDiskBudget());
   Executor executor;
   Events events;
   engine::Engine engine(test::engineConfig(), cache, executor, events);

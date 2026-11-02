@@ -78,12 +78,15 @@ void testUnwritableTierKeepsRequestsResident() {
 }
 
 // Admission keeps a request's KV in memory where its projection, its prompt
-// and min(max_tokens, 4096) tokens of output, fits the memory the plan
-// leaves resident KV beside the other lanes' (a Resident lane's projection, a
-// Spill lane's floor), and spills it otherwise; a request within the dense
-// history never spills. Resident KV holds 200 pages here.
+// and min(max_tokens, 4096) tokens of output, fits the memory the governor
+// finds beside the other lanes' growth to their projections, and spills it
+// otherwise; a request within the dense history never spills. The engine's
+// limit holds 200 pages of KV here.
 void testAdmissionSpillsWhatMemoryCannotHold() {
-  Spilling spill(1024, false, 200 * 100);
+  test::FakeMemory memory({});
+  metal::MetalBackend backend("");
+  std::optional<MemoryGovernor> governor = test::governorOver(backend, memory, {.limitBytes = 200 * 100});
+  Spilling spill(1024, false, 200 * 100, 0, {4}, 0, {}, &*governor);
   // Eight pages of prompt and 32K tokens of output: the output is clipped at
   // 4,096 tokens, so it projects 137 pages, which memory holds.
   spill.engine.submit(Spilling::prompt(1, 1, 8, 32'768));
