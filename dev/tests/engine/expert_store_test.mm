@@ -1320,6 +1320,34 @@ int streamedPool(MetalBackend &backend, const MoeShape &shape, const std::filesy
   return failures;
 }
 
+// A store whose floor is its cap has no chunk to give back or take: decode
+// steps of two blocks taking turns, each evicting the other's experts, hit
+// experts they gave up lately, and none of those hits, nor any hit on a
+// resident expert, is one a chunk more or less decides.
+int streamedFloorAtCap(MetalBackend &backend, const MoeShape &shape, const std::filesystem::path &directory) {
+  const Model m = makeModel(backend, shape, Q4K, true);
+  ExpertFile file(m, directory / "experts.bin");
+  ExpertStoreOptions options = storeOptions(arenaBytes(m, shape.experts + shape.experts / 2), file.blocks, shape);
+  options.floorBytes = options.memoryBytes;
+  ExpertStore store(backend, file.blocks, shape, options);
+  std::array<BlockMoeWeights, 2> streamed{m.weights, m.weights};
+  for (uint32_t block = 0; block < 2; ++block) store.bind(block, streamed[block]);
+  Buffers b;
+  for (uint32_t step = 0; step < 24; ++step)
+    for (uint32_t block = 0; block < 2; ++block) {
+      freshRows(backend, b, shape);
+      static_cast<void>(runWeights(backend, streamed[block], b, MoE::decodePlan(shape, 1 + step % 4, MoeConfig{})));
+    }
+  const ExpertStoreStats stats = store.stats();
+  const bool ok = stats.capChunks == 1 && !stats.releaseUnitBytes && !stats.growUnitBytes && stats.ghostHits &&
+                  !stats.nearGhostHits && !stats.tailHits;
+  printf("streamed experts with the floor at the cap: %llu ghost hits, %llu within a chunk, %llu hits a chunk less "
+         "would give up %s\n",
+         (unsigned long long)stats.ghostHits, (unsigned long long)stats.nearGhostHits,
+         (unsigned long long)stats.tailHits, ok ? "ok" : "FAIL");
+  return ok ? 0 : 1;
+}
+
 // A size's slot planes as the store's chunk layout takes them
 // (model/ExpertChunkLayout.hpp), gate's, up's and down's.
 splash::model::ExpertSlotPlanes slotPlanes(const Model &m) {
@@ -1808,6 +1836,7 @@ int main(int argc, const char *argv[]) {
                     streamedChunks(backend, shape, directory.path()) +
                     streamedElastic(backend, shape, directory.path()) +
                     streamedPool(backend, shape, directory.path()) +
+                    streamedFloorAtCap(backend, shape, directory.path()) +
                     streamedElasticSizes(backend, shape, directory.path()) +
                     streamedStart(backend, shape, directory.path()) +
                     streamedSkippedLoadAfterShrink(argv[1], shape, directory.path()) +

@@ -1172,7 +1172,10 @@ ExpertStore::ExpertStore(metal::MetalBackend &backend, StreamedBlocks streamed, 
     size.chunks = ops::ExpertChunks::of(std::move(planes), chunks.floorSlots, chunks.chunkSlots, size.slots,
                                         size.routed[0], size.routed[1], size.routed[2]);
     size.chunks.keep(chunks.floorChunks);
-    size.recycling = SlotRecycler(chunks.first(chunks.floorChunks), chunks.chunkSlots);
+    // The marginal counts count in an elastic chunk's slots, and in none
+    // where the floor holds every chunk.
+    size.recycling =
+        SlotRecycler(chunks.first(chunks.floorChunks), chunks.chunks > chunks.floorChunks ? chunks.chunkSlots : 0);
     size.ownerBlock.assign(size.slots, kNoSlot);
     size.ownerExpert.assign(size.slots, kNoSlot);
   }
