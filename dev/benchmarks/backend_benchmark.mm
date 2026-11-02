@@ -1014,11 +1014,15 @@ int main(int argc, char **argv) {
       progress->identity(identity);
 
     // These warmups run after serving began, and widths 2-4 each add a lane.
-    // Like a start's warmup, what they allocate is memory a request in
-    // service needs (MemoryGovernor::setServing): unmarked, the host's
-    // margins refuse a lane the plan holds, and the run fails. Like a start's
-    // warmup too, they hold the KV runway they run on.
-    const bool wasServing = resources->memoryGovernor().setServing(true);
+    // They are lanes alone in service, which the engine passes through the
+    // host's margins allocation by allocation once nothing in place meets
+    // one; a warmup retries none, so like a start's warmup they run inside a
+    // Floor claim: only the engine's limit and macOS's critical pressure
+    // refuse what they allocate. Like a start's warmup too, they hold the KV
+    // runway they run on.
+    MemoryGovernor &governor = resources->memoryGovernor();
+    const ClaimId warmups = governor.ledger().open({.cls = ClaimClass::Floor});
+    std::optional<MemoryGovernor::Scope> warmupScope(std::in_place, governor, warmups);
     std::optional<engine::KvPool::RunwayHold> runway(std::in_place, resources->kvPool());
     if (progress)
       progress->begin("warmup", "prefill_2048", 0,
@@ -1048,7 +1052,8 @@ int main(int argc, char **argv) {
           executor->telemetry().lastDecodeGpuSeconds * 1000.0;
     }
     runway.reset();
-    resources->memoryGovernor().setServing(wasServing);
+    warmupScope.reset();
+    governor.ledger().close(warmups);
 
     Events events;
     engine::EngineConfig engineConfig;

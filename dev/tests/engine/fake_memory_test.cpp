@@ -62,6 +62,7 @@ void testTheBooksBalanceOverSeededSequences() {
     FakeMemory memory(sixteen());
     metal::MetalBackend backend("");
     std::optional<engine::MemoryGovernor> governor = test::governorOver(backend, memory, {.limitBytes = 6 * kGiB});
+    const test::ClaimScope claim(*governor, engine::ClaimClass::InService);
     std::map<std::string, uint64_t> expected;
     uint64_t peak = 0;
     for (int step = 0; step < 40; ++step) {
@@ -116,6 +117,7 @@ void testARefusalThroughTheGovernorHoldsNothing() {
   FakeMemory memory(sixteen({{100.0, 10 * kGiB, engine::MemoryPressure::Normal}}));
   metal::MetalBackend backend("");
   std::optional<engine::MemoryGovernor> governor = test::governorOver(backend, memory, {.limitBytes = 4 * kGiB});
+  const test::ClaimScope claim(*governor, engine::ClaimClass::InService);
   require(static_cast<bool>(memory.allocate(governor->allocationAdmission(), "kv", 3 * kGiB)),
           "an allocation within the limit and the host's room was refused");
   const auto refused = [&](uint64_t bytes, metal::AllocationFailure cause) {
@@ -204,12 +206,15 @@ void testThePoolReleasesAndGrowsByUnits() {
   require(pool.release(1) == 0 && !pool.state().releaseUnitBytes, "the pool went below its floor");
   require(pool.shrinks == 3 && pool.value().releasedBytes == 3 * kGiB && pool.value().releaseMilliseconds == 240.0,
           "the pool did not price its releases");
-  for (int unit = 0; unit < 4; ++unit)
-    require(static_cast<bool>(pool.grow(governor->growthAdmission())), "the pool's growth was refused");
-  require(pool.grows == 4 && memory.held("experts") == 5 * kGiB && !pool.state().growUnitBytes,
-          "the pool did not grow to its cap by units");
-  require(static_cast<bool>(pool.grow(governor->growthAdmission())) && pool.grows == 4,
-          "the pool grew past its cap");
+  {
+    const test::ClaimScope growth(*governor, engine::ClaimClass::Growth);
+    for (int unit = 0; unit < 4; ++unit)
+      require(static_cast<bool>(pool.grow(governor->allocationAdmission())), "the pool's growth was refused");
+    require(pool.grows == 4 && memory.held("experts") == 5 * kGiB && !pool.state().growUnitBytes,
+            "the pool did not grow to its cap by units");
+    require(static_cast<bool>(pool.grow(governor->allocationAdmission())) && pool.grows == 4,
+            "the pool grew past its cap");
+  }
   require(pool.release(std::numeric_limits<uint64_t>::max()) == 4 * kGiB && pool.units() == 1,
           "the pool did not give back everything above its floor");
   const metal::AllocationAdmission refuse = [](uint64_t, const std::function<void()> &) {
@@ -235,7 +240,10 @@ void testTheStorageAllocatesThroughMemory() {
   std::optional<engine::MemoryGovernor> governor =
       test::governorOver(backend, memory, {.limitBytes = 28 * 4096 + 1});
   test::TestKvStorage storage(32, 4096, 4);
+  std::optional<test::ClaimScope> start = test::startScope(governor);
   engine::KvPool pool(storage.through(memory, governor->allocationAdmission()), 8);
+  start.reset();
+  const test::ClaimScope claim(*governor, engine::ClaimClass::InService);
   require(memory.held("kv") == 8 * 4096 && storage.allocatedBytes() == 8 * 4096, "the runway was not held");
   for (uint32_t extent = 2; extent < 4; ++extent)
     require(static_cast<bool>(storage.allocateExtent(extent, kv::PageForm::Full)), "growth was refused");
@@ -265,10 +273,11 @@ void testTheModelAllocatesThroughMemory() {
   test::Executor model;
   model.memory = &memory;
   model.admission = governor->allocationAdmission();
-  model.growthAdmission = governor->growthAdmission();
+  model.growthAdmission = governor->allocationAdmission();
   model.laneFootprintBytes = 256 * kMiB;
   model.spilledReadFloorBytes = 64 * kMiB;
   model.stagingPageBytes = kMiB;
+  std::optional<test::ClaimScope> claim(std::in_place, *governor, engine::ClaimClass::InService);
   ModelRequest request;
   request.id = 1;
   request.maxNewTokens = 1;
@@ -311,6 +320,7 @@ void testTheModelAllocatesThroughMemory() {
   require(model.releaseExpertChunk() == kGiB && model.releaseExpertsToFloor() == kGiB && experts.units() == 1 &&
               model.releaseExpertChunk() == 0,
           "the store's hooks did not give back the pool's units");
+  claim.emplace(*governor, engine::ClaimClass::Growth);
   require(model.expertGrowthBytes() == kGiB && model.growExperts().granted() && experts.units() == 2,
           "the store's hooks did not take a unit back");
 }
@@ -326,6 +336,7 @@ void testEndedLanesLeaveOneLanesBuffersPooled() {
   model.memory = &memory;
   model.admission = governor->allocationAdmission();
   model.laneFootprintBytes = 256 * kMiB;
+  const test::ClaimScope claim(*governor, engine::ClaimClass::InService);
   ModelRequest request;
   request.maxNewTokens = 1;
   for (request.id = 1; request.id <= 4; ++request.id)

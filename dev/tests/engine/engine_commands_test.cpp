@@ -842,7 +842,7 @@ void testALaneThatConvertsMidPromptRunsPrefillGroups() {
   spill.engine.submit(Spilling::prompt(1, 1, 128, 1));
   spill.runUntil([&] { return spill.model.prefillChunks[1] == 1 && !spill.engine.commandInFlight(); },
                  "the prompt's first chunk did not run");
-  require(test::hostPass(*spill.settings.governor, 1'000'000).outcome == FreeOutcome::Pending &&
+  require(test::hostPass(spill.host.governor, 1'000'000).outcome == FreeOutcome::Pending &&
               spill.engine.snapshot().spill.converted == 1,
           "the short pass did not convert the prompt's lane");
   // Its pages spill as their copies land, before its next command: its
@@ -873,7 +873,7 @@ void testALaneThatTakesSpilledBlocksAsItPrefillsRunsPrefillGroups() {
   spill.engine.submit(std::move(spilling));
   spill.runUntil([&] { return spill.events.outputs[1].size() >= 2 && !spill.engine.commandInFlight(); },
                  "the first request did not decode");
-  static_cast<void>(test::hostPass(*spill.settings.governor, 1'000'000));
+  static_cast<void>(test::hostPass(spill.host.governor, 1'000'000));
   spill.runUntil([&] { return spill.cache.spillSnapshot().spilledPages == 10; },
                  "the converted request's pages did not spill");
   // Its eight pages, then 120 pages and a token: three chunks, the first of
@@ -930,7 +930,7 @@ void testALaneBetweenItsPassesDoesNotConvert() {
                !spill.engine.commandInFlight();
       },
       "the lane did not run its command's first pass");
-  static_cast<void>(test::hostPass(*spill.settings.governor, 100'000));
+  static_cast<void>(test::hostPass(spill.host.governor, 100'000));
   require(spill.engine.snapshot().spill.converted == 1, "a lane between its passes converted to Spill");
   spill.runUntilIdle();
   require(spill.events.failedCount == 0 && spill.events.completedCount == 3,
@@ -979,7 +979,7 @@ void testNoLaneOfACommandBetweenItsPassesConverts() {
                !spill.engine.commandInFlight();
       },
       "the two lanes did not share a command in passes");
-  static_cast<void>(test::hostPass(*spill.settings.governor, 100'000));
+  static_cast<void>(test::hostPass(spill.host.governor, 100'000));
   require(spill.engine.snapshot().spill.converted == 1, "a lane between its command's passes converted to Spill");
   spill.runUntilIdle();
   require(spill.events.failedCount == 0 && spill.events.completedCount == 4,

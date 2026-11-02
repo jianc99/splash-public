@@ -79,7 +79,8 @@ struct PoolShape {
 
 // What a loop fixture adds to the loop. With memory: FakeMemory, the
 // stand-in backend and a real governor of `limits` wired by
-// connectToGovernor, whose admissions the KV storage, the model and the
+// connectToGovernor, the fixture built inside a start's Floor claim
+// (startScope), whose admissions the KV storage, the model and the
 // weights allocate through, and with `control` the production control pass
 // (MemoryControl::run at FakeMemory's pressure) between commands. With
 // timing: the model takes the profile's time and the awake clock moves only
@@ -105,7 +106,7 @@ struct LoopFixture {
                        double idleReleaseSeconds = metal::kResidencyKeepAliveSeconds,
                        std::optional<LoopOptions> loopOptions = std::nullopt)
       : options(std::move(loopOptions)), memory(fakeMemory(options)), backend(standIn(memory)),
-        governor(memoryGovernor(options, memory, backend)),
+        governor(memoryGovernor(options, memory, backend)), startup_(startScope(governor)),
         storage(shape.pages, 4096, shape.extentPages),
         pool(memory ? storage.through(*memory, governor->allocationAdmission()) : storage, shape.runwayPages),
         cache(pool, nullptr, nullptr),
@@ -131,6 +132,7 @@ struct LoopFixture {
       executor.time(*options->timing);
       executor.clock = [this] { return monotonic; };
     }
+    startup_.reset();
   }
 
   // Every event the loop has written.
@@ -197,6 +199,12 @@ struct LoopFixture {
   std::optional<FakeMemory> memory;
   std::optional<metal::MetalBackend> backend;
   std::optional<engine::MemoryGovernor> governor;
+
+private:
+  // While the fixture is built, with memory.
+  std::optional<ClaimScope> startup_;
+
+public:
   test::TestKvStorage storage;
   engine::KvPool pool;
   engine::Cache cache;

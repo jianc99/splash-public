@@ -3,9 +3,10 @@
 // The fixture for new and converted engine tests: an engine on the fake
 // model, its cache, KV storage and optional tier, and with memory a
 // FakeMemory, the stand-in backend and a real MemoryGovernor wired by
-// connectToGovernor; a clock that moves to each participant's next instant;
-// a record of the commands and of every token event's time; and the checks
-// of every tick.
+// connectToGovernor, the harness built inside a start's Floor claim
+// (startScope); a clock that moves to each participant's next instant; a
+// record of the commands and of every token event's time; and the checks of
+// every tick.
 
 #include "EngineTestSupport.hpp"
 #include "FakeMemory.hpp"
@@ -68,7 +69,7 @@ public:
 
   explicit EngineHarness(HarnessOptions options = {})
       : options_(std::move(options)), memory(fakeMemory(options_)), backend(standIn(options_)),
-        governor(memoryGovernor(options_, memory, backend)),
+        governor(memoryGovernor(options_, memory, backend)), startup_(startScope(governor)),
         storage(options_.pages, options_.pageBytes, options_.extentPages, options_.indexPageBytes,
                 options_.slimPageBytes),
         pool(memory ? storage.through(*memory, governor->allocationAdmission()) : storage, options_.runwayPages),
@@ -102,6 +103,7 @@ public:
       commands_.push_back(std::move(command));
     };
     model.admissionState = [this] { return admissionState(); };
+    startup_.reset();
   }
   EngineHarness(const EngineHarness &) = delete;
   EngineHarness &operator=(const EngineHarness &) = delete;
@@ -188,6 +190,12 @@ public:
   std::optional<FakeMemory> memory;
   std::optional<metal::MetalBackend> backend;
   std::optional<engine::MemoryGovernor> governor;
+
+private:
+  // While the harness is built, with memory.
+  std::optional<ClaimScope> startup_;
+
+public:
   TestKvStorage storage;
   engine::KvPool pool;
   std::optional<TestKvTier> tier;

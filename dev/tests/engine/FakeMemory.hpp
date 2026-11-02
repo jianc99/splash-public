@@ -2,6 +2,7 @@
 
 // The bytes a test's engine holds and the Mac around it, as one budget.
 
+#include "ClaimScope.hpp"
 #include "TestMetalStatistics.hpp"
 #include "engine/MemoryGovernor.hpp"
 #include "metal/MetalBackend.hpp"
@@ -112,6 +113,14 @@ public:
       return std::nullopt;
     return config_.script[next_].atMilliseconds;
   }
+  // Changes the Mac around the engine now, as a script event at the clock's
+  // time would, for a test that moves it from its own steps.
+  void setHost(uint64_t otherBytes, engine::MemoryPressure pressure) {
+    other_ = otherBytes;
+    pressure_ = pressure;
+    notePeak();
+  }
+  [[nodiscard]] uint64_t hostBytes() const noexcept { return config_.hostBytes; }
   // Throws unless the backend's statistics count exactly what the fakes
   // allocated through FakeMemory: nothing wrote them behind its back.
   void check() const {

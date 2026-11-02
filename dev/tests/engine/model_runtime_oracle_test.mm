@@ -205,8 +205,8 @@ std::string mebibytes(uint64_t bytes) {
 }
 
 // The admission of what the oracle allocates for `need` through `governor`,
-// which the oracle marks serving, so that only its limit and macOS's critical
-// pressure refuse it. It reads macOS's level before each allocation, as the
+// inside the oracle's Floor claim, so that only its limit and macOS's
+// critical pressure refuse it. It reads macOS's level before each allocation, as the
 // engine's control pass reads it between commands, and stops the run at
 // critical pressure or when it cannot read the level.
 metal::AllocationAdmission governedFor(MemoryGovernor &governor, std::string need) {
@@ -4289,16 +4289,17 @@ int main(int argc, char **argv) {
     // which only moves bytes from KV to fixed memory: the same with the split
     // or without. The checks can neither wait for memory nor yield it, so the
     // governor admits all the oracle allocates, its runtime's arenas and the
-    // lanes, KV and cached states of the requests it runs together, as memory
-    // a request in service needs (MemoryGovernor::setServing): only the plan's
-    // limit and macOS's critical pressure refuse it. Production grants that
-    // only to its start, a request it serves alone and the KV of the requests
-    // it serves; a start beside a resident request, and the cache, are held
-    // to the host's margins and macOS's warning (Engine::allocate).
+    // lanes, KV and cached states of the requests it runs together, under one
+    // Floor claim, as a start's: only the plan's limit and macOS's critical
+    // pressure refuse it. Production grants that only to its start; a request
+    // in service passes the host's margins only once nothing in place meets
+    // it, and a start beside a resident request, and the cache, are held to
+    // them and to macOS's warning (MemoryGovernor::free).
     const EngineMemoryPlanResult gpuAlone = planMemory(0);
     require(gpuAlone.plan.has_value(), "the oracle model has no memory plan: " + gpuAlone.status.describe());
     MemoryGovernor governor(backend, gpuAlone.plan->breakdown(), queryHostMemory);
-    governor.setServing(true);
+    const ClaimId oracleClaim = governor.ledger().open({.cls = ClaimClass::Floor});
+    const MemoryGovernor::Scope oracleScope(governor, oracleClaim);
     const metal::AllocationAdmission governed = governedFor(governor, "an allocation");
     // A block-sparse target's spill check runs before the split is set up, on
     // a pool and a runtime of its own that the context the oracle asks the

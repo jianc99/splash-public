@@ -322,7 +322,7 @@ void testRefusedRestoreWaitsForMemory() {
   engine::NativeLoopConfig config;
   config.engine.maxContext = 1024;
   config.engine.resourceWaitTimeoutMilliseconds = kWaitLimit;
-  config.engine.serving = [&](bool serving) { return governor.setServing(serving); };
+  engine::connectToGovernor(config.engine, governor);
   config.engine.weights =
       WeightResidencyConfig{.weights = &memory, .admit = governor.allocationAdmission()};
   LoopFixture fixture(config, {}, {}, kIdleReleaseSeconds);
@@ -843,7 +843,7 @@ void testRestoreTakesTheFloorWhateverTheHostSpares() {
                             [&] { return hostMemory(hostReserve + spare); }, 0);
     engine::NativeLoopConfig config;
     config.engine.maxContext = 1024;
-    config.engine.serving = [&governor](bool serving) { return governor.setServing(serving); };
+    engine::connectToGovernor(config.engine, governor);
     config.engine.weights =
         WeightResidencyConfig{.weights = &store, .admit = governor.allocationAdmission()};
     LoopFixture fixture(config);

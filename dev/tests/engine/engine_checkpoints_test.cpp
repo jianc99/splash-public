@@ -20,6 +20,7 @@ using namespace splash::engine;
 using benchmark::draftContextRows;
 using splash::test::capturedStates;
 using splash::test::Events;
+using splash::test::GovernedHost;
 using splash::test::Executor;
 using splash::test::guardReleases;
 using splash::test::idle;
@@ -891,9 +892,8 @@ void testKeptCheckpointGoesFirstUnderPressure() {
   engine::Cache resources(pool, nullptr, nullptr);
   Executor executor(1);
   Events events;
-  bool paused = false;
-  EngineConfig config = test::engineConfig();
-  config.growthPaused = [&] { return paused; };
+  GovernedHost host;
+  EngineConfig config = host.connect({});
   engine::Engine engine(config, resources, executor, events);
   guardReleases(storage, engine);
   const std::vector<uint32_t> hot(65, 27);
@@ -920,7 +920,7 @@ void testKeptCheckpointGoesFirstUnderPressure() {
   const std::vector<uint32_t> second = keep(3, 29);
   // While the engine may not grow, a state's buffers take no free pages: the
   // next replay point, refused them once, recycles a state.
-  paused = true;
+  host.pause(true);
   executor.deniedReservations = 1;
   const std::vector<uint32_t> next(65, 30);
   engine.submit(request(4, next));
@@ -1025,9 +1025,8 @@ void testReplayPointWithoutRoomTakesItsOwnCheckpoint() {
     engine::Cache resources(pool, nullptr, nullptr);
     Executor executor(2);
     Events events;
-    bool paused = false;
-    EngineConfig config = test::engineConfig();
-    config.growthPaused = [&] { return paused; };
+    GovernedHost host;
+    EngineConfig config = host.connect({});
     engine::Engine engine(config, resources, executor, events);
     guardReleases(storage, engine);
     bool memoryFull = false;
@@ -1057,7 +1056,7 @@ void testReplayPointWithoutRoomTakesItsOwnCheckpoint() {
               "the lane did not publish its checkpoint at 8192");
     require(resources.probe(other, {}).cachedTokens() == 4096,
             "fixture did not leave each lane its checkpoint");
-    paused = true;
+    host.pause(true);
     memoryFull = full;
     // Memory fills: the idle buffers the retired checkpoint at 4096 left in
     // the pool went back to the host.
@@ -1169,9 +1168,8 @@ void testReplayPointWithoutRoomTakesTheCheckpointItsCommandCaptures() {
   executor.decodeFinishes = false;
   executor.decodeTokens = 8;
   Events events;
-  bool paused = false;
-  EngineConfig config = test::engineConfig({.prefillCheckpointTokens = 3072});
-  config.growthPaused = [&] { return paused; };
+  GovernedHost host;
+  EngineConfig config = host.connect({.prefillCheckpointTokens = 3072});
   engine::Engine engine(config, resources, executor, events);
   guardReleases(storage, engine);
   bool memoryFull = false;
@@ -1194,7 +1192,7 @@ void testReplayPointWithoutRoomTakesTheCheckpointItsCommandCaptures() {
   // Memory fills: a state's buffers come only from a state the cache lets
   // go, and while the engine may not grow, from no free pages. One state's
   // buffers are idle in the pool, and the checkpoint takes them.
-  paused = true;
+  host.pause(true);
   memoryFull = true;
   *executor.evictedStateBytes = 64;
   const uint64_t evictions = resources.snapshot().stateCache.evictions;
@@ -1209,7 +1207,7 @@ void testReplayPointWithoutRoomTakesTheCheckpointItsCommandCaptures() {
               resources.probe(std::vector<uint32_t>(65, 2), {}).cachedTokens() == 64 &&
               resources.probe(prompt, {}).cachedTokens() == 6656,
           "the replay point refused room recycled another conversation's state");
-  paused = false;
+  host.pause(false);
   memoryFull = false;
   executor.decodeFinishes = true;
   tickUntil(engine, now, [&] { return idle(engine); }, "the lane did not finish");

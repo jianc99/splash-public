@@ -428,9 +428,9 @@ void testGrowthWaitsForTheStateWriteInFlight() {
     engine::Cache cache(pool, nullptr, nullptr);
     Executor executor;
     Events events;
-    engine::Engine engine(
-        test::engineConfig({.maxContext = 102400, .growthPaused = [paused] { return paused; }}),
-        cache, executor, events);
+    test::GovernedHost host;
+    host.pause(paused);
+    engine::Engine engine(host.connect({.maxContext = 102400}), cache, executor, events);
     guardReleases(storage, engine);
     // A write in flight from a lane still running: its block is no leaf to evict.
     auto writing = std::make_shared<OffloadControl>();

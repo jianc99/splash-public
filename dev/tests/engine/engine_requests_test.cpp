@@ -17,6 +17,7 @@ using namespace splash;
 using namespace splash::engine;
 using splash::test::constrainedRequest;
 using splash::test::Events;
+using splash::test::GovernedHost;
 using splash::test::Executor;
 using splash::test::guardReleases;
 using splash::test::idle;
@@ -1029,9 +1030,8 @@ void testLatestReplayDenialRecyclesOlderStateNotTheJunction() {
   engine::Cache resources(pool, nullptr, nullptr);
   Executor executor(1);
   Events events;
-  bool paused = false;
-  EngineConfig config = test::engineConfig();
-  config.growthPaused = [&] { return paused; };
+  GovernedHost host;
+  EngineConfig config = host.connect({});
   engine::Engine engine(config, resources, executor, events);
   guardReleases(storage, engine);
 
@@ -1052,10 +1052,10 @@ void testLatestReplayDenialRecyclesOlderStateNotTheJunction() {
   // The pages this request held for the cached prefix are free; while the
   // engine may not grow, the replay state's buffers take none of them and
   // recycle a state.
-  paused = true;
+  host.pause(true);
   executor.deniedReservations = 1;
   runUntilIdle(engine);
-  paused = false;
+  host.pause(false);
 
   const DraftContextPlan &plan = executor.plans.at(8);
   const auto snapshot = engine.snapshot();

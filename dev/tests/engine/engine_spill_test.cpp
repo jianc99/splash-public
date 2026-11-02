@@ -86,10 +86,7 @@ void testUnwritableTierKeepsRequestsResident() {
 // otherwise; a request within the dense history never spills. The engine's
 // limit holds 200 pages of KV here.
 void testAdmissionSpillsWhatMemoryCannotHold() {
-  test::FakeMemory memory({});
-  metal::MetalBackend backend("");
-  std::optional<MemoryGovernor> governor = test::governorOver(backend, memory, {.limitBytes = 200 * 100});
-  Spilling spill(1024, false, 200 * 100, 0, {4}, 0, {}, &*governor);
+  Spilling spill(1024, false, 200 * 100, 0, {4}, 0, {}, {.limitBytes = 200 * 100});
   // Eight pages of prompt and 32K tokens of output: the output is clipped at
   // 4,096 tokens, so it projects 137 pages, which memory holds.
   spill.engine.submit(Spilling::prompt(1, 1, 8, 32'768));
@@ -434,7 +431,7 @@ void testSpilledFullExtentsLeaveOnceNoPromptGrows() {
     };
     // 70 pages and a token: two prefill commands, the second after the
     // first's pages spilled, then 64 tokens of output.
-    spill.paused = paused;
+    spill.host.pause(paused);
     spill.engine.submit(Spilling::prompt(1, 1, 70, 64));
     uint64_t prompting = 0;
     spill.runUntil(
@@ -449,7 +446,7 @@ void testSpilledFullExtentsLeaveOnceNoPromptGrows() {
     require(spill.model.prefillChunks.at(1) == 2 && prompting <= 1 && emptyFullExtents() == (paused ? 1u : 0u),
             paused ? "the Full extents spills emptied did not keep the runway while the host held growth back"
                    : "the Full extents spills emptied stayed, or the runway went while the prompt grew");
-    spill.paused = false;
+    spill.host.pause(false);
     spill.runUntilIdle();
   }
 }
@@ -461,16 +458,15 @@ void testSpilledFullExtentsLeaveOnceNoPromptGrows() {
 // spilled, but not as Full pages, completes with them spilled.
 void testSpillMovesThroughTheHostPause() {
   Spilling spill(1024);
-  // As the governor does, the host refuses growth unless a request in
-  // service needs it, then the engine's limit: 90 Full pages.
+  // The governor's host refuses growth unless a request in service needs
+  // it, then the engine's limit: 90 Full pages.
   spill.storage.budgetPages = 90;
   spill.storage.growthAllowed = [&](uint32_t) {
-    const bool host = spill.paused && !spill.serving;
-    spill.storage.allocationFailure =
-        host ? metal::AllocationFailure::HostPressure : metal::AllocationFailure::EngineBudget;
-    return !host;
+    const metal::AllocationResult host = spill.host.reserve(100);
+    spill.storage.allocationFailure = host ? metal::AllocationFailure::EngineBudget : host.failure;
+    return static_cast<bool>(host);
   };
-  spill.paused = true;
+  spill.host.pause(true);
   // 120 pages and a token: two prefill commands, the second after 62 of the
   // first's 64 pages spilled, 58 of them past the runway's four Index pages.
   // As Full pages, the prompt's 121 outgrow the limit.
@@ -699,7 +695,7 @@ void testAResumeThatConvertsTakesItsReplaysPagesAsItRuns() {
   // Memory shrinks to 72 Full pages, which hold a prefill command's 64 and
   // not the 80 it held: a critical pass releases what the cache held.
   spill.storage.budgetPages = 72;
-  static_cast<void>(test::criticalPass(*spill.settings.governor));
+  static_cast<void>(test::criticalPass(spill.host.governor));
   spill.model.resumeDenied = false;
   spill.runUntilIdle();
   const SpillRequestsSnapshot counts = spill.engine.snapshot().spill;
@@ -1562,7 +1558,7 @@ void testALaneBeingAdmittedDoesNotConvert() {
   spill.engine.submit(request(2, history));
   spill.runUntil([&] { return spill.model.diskReads > reads; }, "the follow-up did not restore its state");
   spill.tier.writableFile = true;
-  static_cast<void>(test::hostPass(*spill.settings.governor, 100'000));
+  static_cast<void>(test::hostPass(spill.host.governor, 100'000));
   require(spill.engine.snapshot().spill.converted == 0, "a pass converted a lane whose admission was not complete");
   spill.model.restoreControl->ready = true;
   spill.runUntilIdle();
@@ -1819,8 +1815,8 @@ void testHostRefusedHotFloorTakesNoModelCache() {
   Spilling spill(64);
   spill.model.cacheUnits = {100};
   spill.model.spilledReadsRefusal = metal::AllocationFailure::HostPressure;
-  spill.model.spilledReadsRoom = [&](uint64_t) { return !spill.paused || spill.serving; };
-  spill.paused = true;
+  spill.model.spilledReadsRoom = [&](uint64_t) { return static_cast<bool>(spill.host.reserve(100)); };
+  spill.host.pause(true);
   spill.engine.submit(Spilling::prompt(1, 1, 5, 20));
   spill.runUntilIdle();
   require(spill.events.completedCount == 1 && spill.events.failedCount == 0 &&
@@ -1933,10 +1929,7 @@ void testPlacementReadsLiveRoom() {
 // It spills where the room the governor finds for its Resident KV, at a
 // cost below what spilling costs it, falls short.
 void testPlacementSpillsWhatTheLiveRoomCannotHold() {
-  test::FakeMemory memory({});
-  metal::MetalBackend backend("");
-  std::optional<MemoryGovernor> governor = test::governorOver(backend, memory, {.limitBytes = 3'000});
-  Spilling spill(1024, false, 20 * 100, 0, {4}, 0, {}, &*governor);
+  Spilling spill(1024, false, 20 * 100, 0, {4}, 0, {}, {.limitBytes = 3'000});
   spill.engine.submit(Spilling::prompt(1, 1, 40, 1));
   spill.runUntilIdle();
   const SpillRequestsSnapshot counts = spill.engine.snapshot().spill;
@@ -1966,12 +1959,9 @@ void testPlacementNeverSpillsWhenSpillTakesMore() {
 // same lane's conversion at about twice as much.
 void testSpillDecodeTermIsMeasured() {
   const auto conversionSeconds = [](double readMilliseconds) {
-    test::FakeMemory memory({});
-    metal::MetalBackend backend("");
     // Memory for KV holds the short request's projection, not the long
     // one's: the long one spills, the short one stays Resident.
-    std::optional<MemoryGovernor> governor = test::governorOver(backend, memory, {.limitBytes = 3'000});
-    Spilling spill(1024, false, 30 * 100, 0, {4}, 0, {}, &*governor);
+    Spilling spill(1024, false, 30 * 100, 0, {4}, 0, {}, {.limitBytes = 3'000});
     test::seedAsStartup(spill.engine, spill.model);
     spill.model.commandTimes = [&](const BatchPlan &plan, std::span<const ModelBatchItem>) {
       test::CommandTimes times{.wallMilliseconds = 10.0};
@@ -1988,13 +1978,13 @@ void testSpillDecodeTermIsMeasured() {
     require(spill.engine.snapshot().spill.spill == 1 && spill.engine.snapshot().spill.resident == 1,
             "the fixture did not run one Spill and one Resident lane");
     std::optional<double> cost;
-    governor->ledger().setDecisionLog([&](std::string_view line) {
+    spill.host.governor.ledger().setDecisionLog([&](std::string_view line) {
       if (line.find("engine conversion") == std::string_view::npos)
         return;
       const size_t at = line.find(" for ");
       cost = std::stod(std::string(line.substr(at + 5)));
     });
-    static_cast<void>(test::hostPass(*governor));
+    static_cast<void>(test::hostPass(spill.host.governor));
     require(cost.has_value() && spill.engine.snapshot().spill.converted == 1,
             "the host claim did not convert the Resident lane");
     spill.engine.cancel(1);

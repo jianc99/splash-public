@@ -1,3 +1,4 @@
+#include "ClaimScope.hpp"
 #include "SyntheticModels.hpp"
 #include "TestChecks.hpp"
 #include "TestFiles.hpp"
@@ -724,8 +725,8 @@ void testFailedStepIsNamed(const char *metallibPath) {
 // What a start allocates, the KV runway and then the arenas and the warmup as
 // RuntimeBootstrap::start allocates them, is memory a request in service
 // needs: neither the warning margin above the spare reserve nor macOS's
-// warning refuses it, only what refuses loading, and an allocation the
-// engine marks meanwhile leaves the start's mark in place. Once serving
+// warning refuses it, only what refuses loading, and a claim the engine
+// opens meanwhile leaves the start's admission in place. Once serving
 // begins, growth that no request in service needs keeps to both again.
 void testStartGrowsThroughHostPressure(const char *metallibPath) {
   const test::TemporaryDirectory root("splash-start-pressure");
@@ -753,10 +754,8 @@ void testStartGrowsThroughHostPressure(const char *metallibPath) {
               runtime = model::createRuntime(resources->modelContext());
             })),
             "the start's arenas waited " + host);
-    EngineConfig engine;
-    connectToGovernor(engine, resources->memoryGovernor());
     {
-      const Serving allocation(engine.serving, true);
+      const test::ClaimScope request(resources->memoryGovernor(), ClaimClass::Start);
     }
     // The warmup's lane state; it throws if refused.
     {
@@ -765,6 +764,7 @@ void testStartGrowsThroughHostPressure(const char *metallibPath) {
       static_cast<void>(runtime->warmupDecodeBatch(1));
     }
     resources->beginServing();
+    const test::ClaimScope growth(resources->memoryGovernor(), ClaimClass::Growth);
     const metal::AllocationResult grown = admit(kMiB, [] {});
     require(!grown && grown.failure == metal::AllocationFailure::HostPressure,
             "growth that no request in service needs went on " + host + " once serving began");
@@ -1479,8 +1479,9 @@ void testSpilledRuntimeBoundary(const char *metallibPath) {
   runtime->end(request.id);
 }
 
-// The engine asks the governor whether the host pauses growth, and its
-// serving mark lets a request in service grow through that pause.
+// The engine allocates for its requests' claims in the governor's ledger
+// (EngineConfig::governor): inside the warning margin the host refuses a
+// start, and a request in service until nothing in place meets its need.
 void testEngineFollowsTheGovernor(const char *metallibPath) {
   metal::MetalBackend backend(metallibPath);
   constexpr uint64_t kGiB = 1ULL << 30;
@@ -1493,19 +1494,19 @@ void testEngineFollowsTheGovernor(const char *metallibPath) {
       [&available] { return std::optional<HostMemory>(HostMemory{*available, *available}); }, 0);
   EngineConfig config;
   connectToGovernor(config, governor);
-  require(config.growthPaused && config.serving && !config.growthPaused(),
-          "the engine was not connected to the governor");
+  require(config.governor == &governor, "the engine was not connected to the governor");
   const auto admits = [admit = governor.allocationAdmission()] {
     return static_cast<bool>(admit(1024, [] {}));
   };
-  // Inside the warning margin the host pauses growth that no request in
-  // service needs.
   available = hostReserve + kGiB / 2;
-  require(config.growthPaused() && !admits(), "the engine did not see the host's pause");
-  config.serving(true);
-  require(admits(), "the serving mark did not reach the governor");
-  config.serving(false);
-  require(!admits(), "the serving mark was not cleared");
+  {
+    const test::ClaimScope start(governor, ClaimClass::Start);
+    require(!admits(), "the host's margin admitted a start");
+  }
+  const test::ClaimScope inService(governor, ClaimClass::InService);
+  require(!admits(), "the host's margin admitted a request in service before what it holds");
+  require(governor.free(inService.id(), governor.need(inService.id())).outcome == FreeOutcome::Met && admits(),
+          "a request in service did not pass the host's margin once nothing in place met its need");
 }
 
 } // namespace

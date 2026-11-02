@@ -1,5 +1,6 @@
 #include "CostSeeds.hpp"
 #include "EngineTestSupport.hpp"
+#include "GovernedHost.hpp"
 #include "MemoryPasses.hpp"
 #include "TestCache.hpp"
 #include "TestChecks.hpp"
@@ -30,6 +31,7 @@ using splash::test::constrainedRequest;
 using splash::test::demoteState;
 using splash::test::Events;
 using splash::test::Executor;
+using splash::test::GovernedHost;
 using splash::test::guardReleases;
 using splash::test::idle;
 using splash::test::OffloadControl;
@@ -307,9 +309,7 @@ void testLaneStateGrowthReclaimsCachedStateAndRetries() {
     engine::Cache resources(pool, nullptr, nullptr);
     Executor executor(1);
     Events events;
-    EngineConfig config = test::engineConfig();
-    config.growthPaused = [] { return false; };
-    engine::Engine engine(config, resources, executor, events);
+    engine::Engine engine(test::engineConfig(), resources, executor, events);
     guardReleases(storage, engine);
 
     engine.submit(request(20, std::vector<uint32_t>(65, 7)));
@@ -355,9 +355,7 @@ void testKvGrowthReclaimsIdleStateBeforeCache() {
     engine::Cache resources(pool, nullptr, nullptr);
     Executor executor(1);
     Events events;
-    EngineConfig config = test::engineConfig();
-    config.growthPaused = [] { return false; };
-    engine::Engine engine(config, resources, executor, events);
+    engine::Engine engine(test::engineConfig(), resources, executor, events);
     guardReleases(storage, engine);
 
     engine.submit(request(25, std::vector<uint32_t>(65, 25)));
@@ -402,24 +400,20 @@ void testKvGrowthKeepsTheRingAWaitingLaneStartsFrom() {
   Executor executor(2);
   executor.decodeFinishes = false;
   Events events;
-  bool serving = false;
-  bool hostShort = false;
-  EngineConfig config = test::engineConfig();
-  config.growthPaused = [&] { return hostShort; };
-  config.serving = [&](bool mark) { return std::exchange(serving, mark); };
-  engine::Engine engine(config, resources, executor, events);
+  GovernedHost host;
+  engine::Engine engine(host.connect({}), resources, executor, events);
   guardReleases(storage, engine);
   executor.pooledLaneBytes = kRing;
   executor.statesLacked = [&]() -> uint32_t {
     return executor.pooledLaneBytes ? 0 : std::numeric_limits<uint32_t>::max();
   };
-  executor.beginAllocationFailure = metal::AllocationFailure::HostPressure;
   executor.beginGrowthBlocked = [&] {
     if (executor.pooledLaneBytes >= kRing) {
       executor.pooledLaneBytes -= kRing;
       return false;
     }
-    return hostShort && !serving;
+    executor.beginAllocationFailure = host.reserve(kRing).failure;
+    return executor.beginAllocationFailure != metal::AllocationFailure::None;
   };
   executor.laneReleased = [&] { executor.pooledLaneBytes += kRing; };
   const auto resident = [&](uint64_t id) {
@@ -441,7 +435,7 @@ void testKvGrowthKeepsTheRingAWaitingLaneStartsFrom() {
   require(resident(41) && executor.pooledLaneBytes == kRing,
           "the finished lane's ring did not return to the pool");
 
-  hostShort = true;
+  host.pause(true);
   storage.growthBlocked = true;
   executor.kvGrowthBlocked = &storage.growthBlocked;
   executor.unblockGrowthOnSuspend = false;
@@ -632,10 +626,8 @@ void testPassedCheckpointLeavesTheJunctionItsOwnClass() {
   executor.stateTier = std::make_shared<OffloadControl>();
   executor.stateTier->ready = true;
   Events events;
-  bool paused = false;
-  EngineConfig config = test::engineConfig({.prefillCheckpointTokens = 3072});
-  config.growthPaused = [&] { return paused; };
-  engine::Engine engine(config, resources, executor, events);
+  GovernedHost host;
+  engine::Engine engine(host.connect({.prefillCheckpointTokens = 3072}), resources, executor, events);
   guardReleases(storage, engine);
   bool memoryFull = false;
   executor.reservationRoom = [&] {
@@ -656,7 +648,7 @@ void testPassedCheckpointLeavesTheJunctionItsOwnClass() {
   runUntilIdle(engine);
   // Memory fills: a state's buffers come only from a state the cache lets
   // go, and while the engine may not grow, from no free pages.
-  paused = true;
+  host.pause(true);
   memoryFull = true;
   engine.submit(request(2, prompt));
   double now = 100;
@@ -672,7 +664,7 @@ void testPassedCheckpointLeavesTheJunctionItsOwnClass() {
               counters.recycledStatePublications == 1 && counters.checkpointPublications == 0 &&
               executor.diskSnapshots == 0,
           "a passed checkpoint's refusal ended the command, or it was written to the SSD");
-  paused = false;
+  host.pause(false);
   memoryFull = false;
   tickUntil(engine, now, [&] { return idle(engine); }, "the request did not finish");
   require(events.completedCount == 2 && events.failedCount == 0 &&
@@ -909,10 +901,8 @@ void testHostPressureDoesNotDrainCacheOnStateAdmission() {
   engine::Cache resources(pool, nullptr, nullptr);
   Executor executor(1);
   Events events;
-  MemoryPressure pressure = MemoryPressure::Normal;
-  EngineConfig config = test::engineConfig();
-  config.growthPaused = [&] { return pressure != MemoryPressure::Normal; };
-  engine::Engine engine(config, resources, executor, events);
+  GovernedHost host;
+  engine::Engine engine(host.connect({}), resources, executor, events);
   guardReleases(storage, engine);
   engine.submit(request(200, std::vector<uint32_t>(65, 200)));
   runUntilIdle(engine);
@@ -921,9 +911,8 @@ void testHostPressureDoesNotDrainCacheOnStateAdmission() {
   const uint64_t coldMisses = engine.snapshot().coldMisses;
   const uint32_t attempts = executor.beginAttempts;
 
-  pressure = MemoryPressure::Critical;
-  executor.beginAllocationFailure = metal::AllocationFailure::HostPressure;
-  executor.beginGrowthBlocked = [&] { return pressure != MemoryPressure::Normal; };
+  host.setPressure(MemoryPressure::Critical);
+  host.admitBegins(executor, 4096);
   engine.submit(request(201, {201}));
   static_cast<void>(engine.tick(20.0));
   static_cast<void>(engine.tick(50.0));
@@ -936,7 +925,7 @@ void testHostPressureDoesNotDrainCacheOnStateAdmission() {
               engine.snapshot().scheduler.waitingResources == 1,
           "paused state admission drained the cache or retried without backoff");
 
-  pressure = MemoryPressure::Normal;
+  host.setPressure(MemoryPressure::Normal);
   for (double now = 120.0; now < 140.0 && !idle(engine); ++now)
     static_cast<void>(engine.tick(now));
   require(idle(engine) && events.completedCount == 2 &&
@@ -955,17 +944,15 @@ void testHostPressureStillRecyclesLruStateForRefusedBuffers() {
   engine::Cache resources(pool, nullptr, nullptr);
   Executor executor(1);
   Events events;
-  MemoryPressure pressure = MemoryPressure::Normal;
-  EngineConfig config = test::engineConfig();
-  config.growthPaused = [&] { return pressure != MemoryPressure::Normal; };
-  engine::Engine engine(config, resources, executor, events);
+  GovernedHost host;
+  engine::Engine engine(host.connect({}), resources, executor, events);
   guardReleases(storage, engine);
   engine.submit(request(210, std::vector<uint32_t>(65, 210)));
   runUntilIdle(engine);
   const auto cached = resources.snapshot();
   const uint32_t attempts = executor.reservationAttempts;
 
-  pressure = MemoryPressure::Warning;
+  host.setPressure(MemoryPressure::Warning);
   executor.deniedReservations = 1;
   engine.submit(request(211, std::vector<uint32_t>(65, 211)));
   runUntilIdle(engine);
@@ -984,33 +971,32 @@ void testHostPressureStillRecyclesLruStateForRefusedBuffers() {
           "recycling under host pressure grew state or drained KV cache");
 }
 
-// The governor's host pause as the engine meets it: KV growth and a lane's
-// state are refused for the host unless the engine marks them as memory a
-// request in service needs.
+// The governor's host pause as the engine meets it: other applications leave
+// the host short of the governor's margin (GovernedHost::pause), and the
+// governor refuses KV growth and a lane's state for the host unless they are
+// memory a request in service needs. The engine's limit is the governor's.
 struct HostPause final {
-  bool paused = false;
-  bool serving = false;
+  explicit HostPause(const test::GovernorLimits &limits = {}) : host(limits) {}
+  void pause() { host.pause(true); }
+  [[nodiscard]] MemoryGovernor &governor() noexcept { return host.governor; }
+
+  GovernedHost host;
   // The pages no request held each time the pause let a request grow.
   std::vector<uint32_t> reusableAtGrowth;
 
   void attach(EngineConfig &config, test::TestKvStorage &storage, KvPool &pool) {
-    config.growthPaused = [this] { return paused; };
-    config.serving = [this](bool value) { return std::exchange(serving, value); };
-    storage.allocationFailure = metal::AllocationFailure::HostPressure;
-    storage.growthAllowed = [this, &pool](uint32_t) {
-      if (paused && !serving)
-        return false;
-      if (paused) {
-        const KvPoolSnapshot pages = pool.snapshot();
+    config = host.connect(std::move(config));
+    storage.through(host.memory, [this, &pool, admission = host.governor.allocationAdmission()](
+                                     uint64_t bytes, const std::function<void()> &allocate) {
+      const KvPoolSnapshot pages = pool.snapshot();
+      const metal::AllocationResult result = admission(bytes, allocate);
+      if (result && host.paused())
         reusableAtGrowth.push_back(pages.pagesAllocated - pages.pagesActive);
-      }
-      return true;
-    };
+      return result;
+    });
   }
-  void attach(Executor &executor) {
-    executor.beginAllocationFailure = metal::AllocationFailure::HostPressure;
-    executor.beginGrowthBlocked = [this] { return paused && !serving; };
-  }
+  // A start allocates a lane's state buffers of a page.
+  void attach(Executor &executor) { host.admitBegins(executor, 4096); }
 };
 
 // Host pressure pauses growth, not a request in service. Short of pages, it
@@ -1043,7 +1029,7 @@ void testRequestInServiceGrowsThroughTheHostPause() {
     static_cast<void>(engine.tick(now++));
   require(!events.outputs[2].empty(), "the request did not start decoding");
 
-  host.paused = true;
+  host.pause();
   const uint32_t allocated = pool.snapshot().pagesAllocated;
   while (now < 2000 && events.completedCount < 2)
     static_cast<void>(engine.tick(now++));
@@ -1087,7 +1073,7 @@ void testPausedPageShortfallKeepsTheLaneRunway() {
     static_cast<void>(engine.tick(now++));
   require(!events.outputs[2].empty(), "the request did not start decoding");
 
-  host.paused = true;
+  host.pause();
   while (now < 2000 && events.completedCount < 2)
     static_cast<void>(engine.tick(now++));
   require(events.completedCount == 2 && events.failedCount == 0 &&
@@ -1108,7 +1094,7 @@ void testFirstRequestStartsThroughTheHostPause() {
   executor.decodeFinishes = false;
   Events events;
   HostPause host;
-  host.paused = true;
+  host.pause();
   EngineConfig config = test::engineConfig();
   host.attach(config, storage, pool);
   host.attach(executor);
@@ -1157,7 +1143,7 @@ void testHostRefusalTakesNoModelCache() {
   Executor executor;
   Events events;
   HostPause host;
-  host.paused = true;
+  host.pause();
   EngineConfig config = test::engineConfig();
   host.attach(config, storage, pool);
   host.attach(executor);
@@ -1200,7 +1186,7 @@ void testRequestThatNeedsNoGrowthStartsUnderTheHostPause() {
   double now = 1;
   while (now < 100 && events.outputs[1].empty())
     static_cast<void>(engine.tick(now++));
-  host.paused = true;
+  host.pause();
   // The lane's buffers are pooled and the first extent has free pages.
   auto second = request(2, std::vector<uint32_t>(33, 2));
   second.maxNewTokens = 300;
@@ -1226,15 +1212,11 @@ void testSuspendedRequestWaitsForTheHostBesideOneInService() {
   Executor executor(2);
   executor.decodeFinishes = false;
   Events events;
-  HostPause host;
+  // The engine's limit is two extents.
+  HostPause host({.limitBytes = 8 * 4096});
   EngineConfig config = test::engineConfig();
   config.resourceWaitTimeoutMilliseconds = 100.0;
   host.attach(config, storage, pool);
-  // Until the host runs short, the engine's limit is two extents.
-  storage.allocationFailure = metal::AllocationFailure::EngineBudget;
-  storage.growthAllowed = [&](uint32_t) {
-    return host.paused ? host.serving : pool.snapshot().pagesAllocated < 8;
-  };
   engine::Engine engine(config, resources, executor, events);
   guardReleases(storage, engine);
   for (uint64_t id : {1, 2}) {
@@ -1250,8 +1232,7 @@ void testSuspendedRequestWaitsForTheHostBesideOneInService() {
               !executor.requests.at(2).resident && executor.requests.at(1).resident,
           "the limit did not suspend the shorter request");
 
-  host.paused = true;
-  storage.allocationFailure = metal::AllocationFailure::HostPressure;
+  host.pause();
   while (now < 5000 && events.completedCount < 1) {
     require(engine.snapshot().resourceResumptions == 0,
             "a suspended request grew through the pause beside one in service");
@@ -1279,21 +1260,11 @@ void testEngineLimitBindsThroughTheHostPause() {
   Executor executor;
   executor.decodeFinishes = false;
   Events events;
-  bool paused = false;
-  bool serving = false;
+  // The host refuses first unless a request in service needs the pages, then
+  // the engine's limit of two extents.
+  HostPause host({.limitBytes = 8 * 4096});
   EngineConfig config = test::engineConfig();
-  config.growthPaused = [&] { return paused; };
-  config.serving = [&](bool value) { return std::exchange(serving, value); };
-  // As the governor does, the host refuses first unless a request in service
-  // needs the pages, then the engine's limit of two extents.
-  storage.growthAllowed = [&](uint32_t) {
-    if (paused && !serving) {
-      storage.allocationFailure = metal::AllocationFailure::HostPressure;
-      return false;
-    }
-    storage.allocationFailure = metal::AllocationFailure::EngineBudget;
-    return pool.snapshot().pagesAllocated < 8;
-  };
+  host.attach(config, storage, pool);
   engine::Engine engine(config, resources, executor, events);
   guardReleases(storage, engine);
   auto value = request(1, std::vector<uint32_t>(65, 1));
@@ -1303,7 +1274,7 @@ void testEngineLimitBindsThroughTheHostPause() {
   double now = 1;
   while (now < 100 && events.outputs[1].empty())
     static_cast<void>(engine.tick(now++));
-  paused = true;
+  host.pause();
   while (now < 1000 && !events.failedCount && !events.completedCount)
     static_cast<void>(engine.tick(now++));
   require(events.failures == std::vector<std::string>{"capacity_exhausted"} &&
@@ -1331,13 +1302,17 @@ void testPausedPageShortageKeepsCachedStates() {
   host.attach(config, storage, pool);
   engine::Engine engine(config, resources, executor, events);
   guardReleases(storage, engine);
-  // Cached: a checkpoint, an ordinary state below it, and KV below both.
-  resources.beginRequest(900);
-  require(resources.ensureTokens(900, 128).granted(), "fixture KV failed");
-  resources.publishCommittedBlocks(900, std::vector<uint32_t>(129, 9), 128, {});
-  resources.publishCompositeState(resources.blockAt(900, 32), std::make_shared<State>(), true);
-  resources.publishCompositeState(resources.blockAt(900, 64), std::make_shared<State>(), false);
-  resources.endRequest(900);
+  // Cached: a checkpoint, an ordinary state below it, and KV below both,
+  // allocated as a start's.
+  {
+    const test::ClaimScope fixture(host.governor(), ClaimClass::Floor);
+    resources.beginRequest(900);
+    require(resources.ensureTokens(900, 128).granted(), "fixture KV failed");
+    resources.publishCommittedBlocks(900, std::vector<uint32_t>(129, 9), 128, {});
+    resources.publishCompositeState(resources.blockAt(900, 32), std::make_shared<State>(), true);
+    resources.publishCompositeState(resources.blockAt(900, 64), std::make_shared<State>(), false);
+    resources.endRequest(900);
+  }
   // The decode needs one more page, at its 57th token.
   auto running = request(1, std::vector<uint32_t>(33, 1));
   running.maxNewTokens = 30;
@@ -1345,7 +1320,7 @@ void testPausedPageShortageKeepsCachedStates() {
   double now = 1;
   tickUntil(engine, now, [&] { return !events.outputs[1].empty(); },
             "the request did not decode");
-  host.paused = true;
+  host.pause();
   const StateCacheSnapshot before = resources.snapshot().stateCache;
   tickUntil(engine, now, [&] { return idle(engine); }, "the request did not finish");
   const StateCacheSnapshot after = resources.snapshot().stateCache;
@@ -1366,9 +1341,8 @@ void testSingletonHostPressureReusesIdleCacheInsteadOfSuspending() {
   engine::Cache resources(pool, nullptr, nullptr);
   Executor executor(1);
   Events events;
-  MemoryPressure pressure = MemoryPressure::Normal;
-  EngineConfig config = test::engineConfig();
-  config.growthPaused = [&] { return pressure != MemoryPressure::Normal; };
+  GovernedHost host;
+  EngineConfig config = host.connect({});
   engine::Engine engine(config, resources, executor, events);
   guardReleases(storage, engine);
   engine.submit(request(230, std::vector<uint32_t>(65, 230)));
@@ -1378,7 +1352,7 @@ void testSingletonHostPressureReusesIdleCacheInsteadOfSuspending() {
               cached.pool.pagesFree + cached.pool.pagesPrefix >= 3,
           "idle-cache reuse fixture geometry changed");
 
-  pressure = MemoryPressure::Warning;
+  host.setPressure(MemoryPressure::Warning);
   storage.growthBlocked = true;
   storage.allocationFailure = metal::AllocationFailure::HostPressure;
   engine.submit(request(231, std::vector<uint32_t>(65, 231)));
@@ -1553,9 +1527,8 @@ void testSingletonHostPressureWaitRecoversOrTerminates() {
     engine::Cache resources(pool, nullptr, nullptr);
     Executor executor(1);
     Events events;
-    MemoryPressure pressure = MemoryPressure::Normal;
-    EngineConfig config = test::engineConfig();
-    config.growthPaused = [&] { return pressure != MemoryPressure::Normal; };
+    GovernedHost host;
+    EngineConfig config = host.connect({});
     config.resourceWaitTimeoutMilliseconds = outcome == 3 ? 100.0 : 30000.0;
     engine::Engine engine(config, resources, executor, events);
     guardReleases(storage, engine);
@@ -1563,7 +1536,7 @@ void testSingletonHostPressureWaitRecoversOrTerminates() {
     runUntilIdle(engine);
     const auto cached = resources.snapshot();
 
-    pressure = MemoryPressure::Warning;
+    host.setPressure(MemoryPressure::Warning);
     storage.growthBlocked = true;
     storage.allocationFailure = metal::AllocationFailure::HostPressure;
     auto value = request(221, std::vector<uint32_t>(161, 221));
@@ -1590,7 +1563,7 @@ void testSingletonHostPressureWaitRecoversOrTerminates() {
             "resource diagnostics lost suspension reason or original wait time");
 
     if (outcome == 0) {
-      pressure = MemoryPressure::Normal;
+      host.setPressure(MemoryPressure::Normal);
       storage.growthBlocked = false;
       for (double now = 121.0; now < 140.0 && !idle(engine); ++now)
         static_cast<void>(engine.tick(now));
@@ -1924,24 +1897,23 @@ void testHostRefusedStartKeepsItsLease() {
   engine::Cache cache(pool, nullptr, nullptr);
   Executor executor(1);
   Events events;
-  bool paused = false;
-  engine::Engine engine(test::engineConfig({.growthPaused = [&] { return paused; }}), cache,
-                        executor, events);
+  GovernedHost host;
+  engine::Engine engine(host.connect({}), cache, executor, events);
   guardReleases(storage, engine);
   const std::vector<uint32_t> prompt(65, 1);
   double now = 1;
   engine.submit(request(1, prompt));
   tickUntil(engine, now, [&] { return idle(engine); }, "the first request did not finish");
-  paused = true;
+  host.pause(true);
   executor.beginAllocationFailure = metal::AllocationFailure::HostPressure;
-  executor.beginGrowthBlocked = [&] { return paused; };
+  executor.beginGrowthBlocked = [&] { return host.paused(); };
   engine.submit(request(2, prompt));
   for (int step = 0; step < 5; ++step)
     static_cast<void>(engine.tick(now++));
   require(cache.probe(prompt, {}).cachedTokens() == 64 && events.startIds.size() == 1 &&
               events.failedCount == 0,
           "a start the host refused gave up its cached state");
-  paused = false;
+  host.pause(false);
   tickUntil(engine, now, [&] { return idle(engine); }, "the refused start did not run");
   require(events.starts.back() == 64 && executor.prefillRows == 65 + 1,
           "the refused start did not resume from its cached state");
@@ -2763,9 +2735,9 @@ void testPressureRetryIsBackedOffWithoutProgress() {
   executor.kvGrowthBlocked = &storage.growthBlocked;
   executor.unblockGrowthOnSuspend = false;
   Events events;
-  MemoryPressure pressure = MemoryPressure::Warning;
-  EngineConfig config = test::engineConfig();
-  config.growthPaused = [&] { return pressure != MemoryPressure::Normal; };
+  GovernedHost host;
+  host.setPressure(MemoryPressure::Warning);
+  EngineConfig config = host.connect({});
   engine::Engine engine(config, resources, executor, events);
   guardReleases(storage, engine);
 
@@ -2783,7 +2755,7 @@ void testPressureRetryIsBackedOffWithoutProgress() {
           "resource wait retried on an unrelated scheduler tick");
 
   storage.growthBlocked = false;
-  pressure = MemoryPressure::Normal;
+  host.setPressure(MemoryPressure::Normal);
   require(engine.tick(102.0), "resource retry timer did not wake the engine");
   for (double now = 103.0; now < 120.0 && !idle(engine); ++now)
     static_cast<void>(engine.tick(now));
@@ -2827,9 +2799,9 @@ void testAdmissionRetryWakesOnlyWhenTickCanRetry() {
     engine::Cache resources(pool, nullptr, nullptr);
     Executor executor(1);
     Events events;
-    bool paused = true;
-    EngineConfig config = test::engineConfig();
-    config.growthPaused = [&] { return paused; };
+    GovernedHost host;
+    host.pause(true);
+    EngineConfig config = host.connect({});
     engine::Engine engine(config, resources, executor, events);
     guardReleases(storage, engine);
     storage.growthBlocked = true;
@@ -2842,7 +2814,7 @@ void testAdmissionRetryWakesOnlyWhenTickCanRetry() {
     require(!engine.tick(101) && executor.resumeAttempts == 1 &&
                 engine.nextWakeupMilliseconds() == 201.0,
             "a lane wait asked for a wake-up only the suspended request gets");
-    paused = false;
+    host.pause(false);
     storage.growthBlocked = false;
     for (double now = 201; now < 220 && !idle(engine); ++now)
       static_cast<void>(engine.tick(now));
@@ -2985,11 +2957,11 @@ void testLongDecodePreemptionPlansTheCurrentReplayBoundary() {
   executor.decodeFinishes = false;
   executor.deniedReservations = std::numeric_limits<uint32_t>::max();
   Events events;
-  MemoryPressure pressure = MemoryPressure::Normal;
+  GovernedHost host;
   EngineConfig config = test::engineConfig();
   // Keep the old 4096-token replay boundary distinct from checkpoints.
   config.prefillCheckpointTokens = 8192;
-  config.growthPaused = [&] { return pressure != MemoryPressure::Normal; };
+  config = host.connect(std::move(config));
   engine::Engine engine(config, resources, executor, events);
   guardReleases(storage, engine);
 
@@ -3007,7 +2979,7 @@ void testLongDecodePreemptionPlansTheCurrentReplayBoundary() {
     if (events.emitted >= 4200) {
       storage.growthBlocked = true;
       storage.allocationFailure = metal::AllocationFailure::HostPressure;
-      pressure = MemoryPressure::Warning;
+      host.setPressure(MemoryPressure::Warning);
     }
     static_cast<void>(engine.tick(now));
   }
@@ -3038,7 +3010,7 @@ void testLongDecodePreemptionPlansTheCurrentReplayBoundary() {
   }
 
   storage.growthBlocked = false;
-  pressure = MemoryPressure::Normal;
+  host.setPressure(MemoryPressure::Normal);
   executor.deniedReservations = 0;
   executor.decodeFinishes = true;
   now += 101;
@@ -3095,9 +3067,8 @@ void testResumedProducerPlansJunctionsForSiblings() {
   engine::Cache resources(pool, nullptr, nullptr);
   Executor executor(2);
   Events events;
-  bool paused = false;
-  EngineConfig config = test::engineConfig();
-  config.growthPaused = [&] { return paused; };
+  GovernedHost host;
+  EngineConfig config = host.connect({});
   engine::Engine engine(config, resources, executor, events);
   guardReleases(storage, engine);
   std::vector<uint32_t> prompt(20001);
@@ -3108,7 +3079,7 @@ void testResumedProducerPlansJunctionsForSiblings() {
             [&] { return !engine.commandInFlight() && executor.prefillRows >= 10'000; },
             "the producer did not pass its checkpoint at 8192");
   // The host refuses the producer's next pages: it yields its lane.
-  paused = true;
+  host.pause(true);
   storage.growthBlocked = true;
   storage.allocationFailure = metal::AllocationFailure::HostPressure;
   tickUntil(engine, now, [&] { return executor.suspensions == 1; },
@@ -3117,7 +3088,7 @@ void testResumedProducerPlansJunctionsForSiblings() {
   sibling.resize(18'065, 0);
   engine.submit(request(2, sibling));
   const uint32_t rows = executor.prefillRows;
-  paused = false;
+  host.pause(false);
   storage.growthBlocked = false;
   now += 101;
   tickUntil(engine, now, [&] { return engine.snapshot().scheduler.waitingPrefix == 1; },
@@ -3152,7 +3123,7 @@ struct LostReplayPoint {
       if (events.emitted >= 200) {
         storage.growthBlocked = true;
         storage.allocationFailure = metal::AllocationFailure::HostPressure;
-        pressure = MemoryPressure::Warning;
+        host.setPressure(MemoryPressure::Warning);
       }
       static_cast<void>(engine.tick(now));
     }
@@ -3166,7 +3137,7 @@ struct LostReplayPoint {
     require(resources.snapshot().pool.pagesPrefix == 0 && pool.snapshot().pagesAllocated == 0,
             "the suspended lane's KV stayed");
     storage.growthBlocked = false;
-    pressure = MemoryPressure::Normal;
+    host.setPressure(MemoryPressure::Normal);
     // Another conversation's KV, with no state, fills two whole extents.
     resources.beginRequest(900);
     require(resources.ensureTokens(900, 256).granted(), "the other conversation got no pages");
@@ -3175,12 +3146,6 @@ struct LostReplayPoint {
     releases = storage.releasedExtents;
   }
 
-  static EngineConfig config(const MemoryPressure &pressure) {
-    EngineConfig result = test::engineConfig();
-    result.prefillCheckpointTokens = 8192;
-    result.growthPaused = [&pressure] { return pressure != MemoryPressure::Normal; };
-    return result;
-  }
 
   // Resumes the lane, whose replay point is planned again, and runs it to
   // its end. A state's buffers need memory that only released extents give,
@@ -3201,8 +3166,8 @@ struct LostReplayPoint {
   engine::Cache resources{pool, nullptr, nullptr};
   Executor executor{1};
   Events events;
-  MemoryPressure pressure = MemoryPressure::Normal;
-  engine::Engine engine{config(pressure), resources, executor, events};
+  GovernedHost host;
+  engine::Engine engine{host.connect({.prefillCheckpointTokens = 8192}), resources, executor, events};
   double now = 1;
   // The extents released before the lane resumes.
   uint32_t releases = 0;
@@ -3304,9 +3269,8 @@ void testPausedPublicationInUseTakesNoKv() {
   engine::Cache resources(pool, nullptr, nullptr);
   Executor executor(1);
   Events events;
-  bool paused = false;
-  EngineConfig config = test::engineConfig();
-  config.growthPaused = [&] { return paused; };
+  GovernedHost host;
+  EngineConfig config = host.connect({});
   engine::Engine engine(config, resources, executor, events);
   guardReleases(storage, engine);
   const std::vector<uint32_t> other(257, 6);
@@ -3320,7 +3284,7 @@ void testPausedPublicationInUseTakesNoKv() {
   engine.submit(request(1, std::vector<uint32_t>(4097, 5)));
   double now = 1;
   require(engine.tick(now++) && executor.requests.contains(1), "the request did not start");
-  paused = true;
+  host.pause(true);
   tickUntil(engine, now, [&] { return idle(engine); }, "engine did not reach idle");
   require(events.completedCount == 1 && events.failedCount == 0 &&
               engine.snapshot().replayStatePublicationFailures == 1 &&
@@ -3410,9 +3374,9 @@ void testRepeatedPreemptionRespectsBackoffAndCancellation() {
     executor.kvGrowthBlocked = &storage.growthBlocked;
     executor.unblockGrowthOnSuspend = false;
     Events events;
-    EngineConfig config = test::engineConfig();
-    config.growthPaused = [] { return true; };
-    engine::Engine engine(config, resources, executor, events);
+    GovernedHost host;
+    host.pause(true);
+    engine::Engine engine(host.connect({}), resources, executor, events);
     guardReleases(storage, engine);
     storage.growthBlocked = true;
     storage.allocationFailure = metal::AllocationFailure::HostPressure;
@@ -3536,9 +3500,8 @@ void testPausedStateAdmissionReusesCachedStates() {
     engine::Cache cache(pool, nullptr, nullptr);
     Executor executor;
     Events events;
-    bool paused = false;
-    EngineConfig config = test::engineConfig();
-    config.growthPaused = [&] { return paused; };
+    GovernedHost host;
+    EngineConfig config = host.connect({});
     engine::Engine engine(config, cache, executor, events);
     guardReleases(storage, engine);
     engine.submit(request(287, std::vector<uint32_t>(65, 287)));
@@ -3546,7 +3509,7 @@ void testPausedStateAdmissionReusesCachedStates() {
     const auto cached = cache.snapshot().stateCache;
     require(cached.entries == 1, "fixture did not cache one state");
 
-    paused = true;
+    host.pause(true);
     // Each state the cache gives up returns what the pool lacks of one.
     executor.statesLacked = [&] {
       const uint64_t given = cache.snapshot().stateCache.evictions - cached.evictions;
@@ -3901,8 +3864,12 @@ void testWindowTrimChangesNoOutput() {
 // request at the engine's limit.
 void testWindowTrimServesThroughTheHostPause() {
   test::TestKvStorage storage(512, 4096, 4, 0, 1024);
-  // 128 Full pages, 4096 tokens; the prompt is 8000.
-  storage.budgetPages = 128;
+  // The engine's limit is 128 Full pages, 4096 tokens; the prompt is 8000.
+  // The host refuses growth unless a request in service needs it, then the
+  // engine's limit binds.
+  GovernedHost host({.limitBytes = 128 * 4096});
+  host.pause(true);
+  host.through(storage);
   KvPool pool(storage, 0);
   engine::Cache cache(pool, nullptr, nullptr, std::nullopt, CacheWindowPolicy{2, true});
   Executor model;
@@ -3910,18 +3877,7 @@ void testWindowTrimServesThroughTheHostPause() {
   model.windowPages = 2;
   model.decodeFinishes = false;
   Events events;
-  bool serving = false;
-  EngineConfig config = test::engineConfig();
-  config.growthPaused = [] { return true; };
-  config.serving = [&](bool value) { return std::exchange(serving, value); };
-  // As the governor does: the host refuses growth unless a request in
-  // service needs it, then the engine's limit binds.
-  storage.growthAllowed = [&](uint32_t) {
-    storage.allocationFailure =
-        serving ? metal::AllocationFailure::EngineBudget : metal::AllocationFailure::HostPressure;
-    return serving;
-  };
-  engine::Engine engine(config, cache, model, events);
+  engine::Engine engine(host.connect({}), cache, model, events);
   guardReleases(storage, engine);
   EngineRequest prompt = request(1, ScatteredPages::prompt(1000, 8000));
   prompt.maxNewTokens = 8;
@@ -3984,10 +3940,9 @@ void testRecoveryAdmitsFailedKvTargetBeforeReplaying() {
     executor.unblockGrowthOnSuspend = false;
     executor.kvGrowthBlocked = &storage.growthBlocked;
     Events events;
-    EngineConfig config = test::engineConfig();
-    // Models the request-sized headroom denial while global pressure is Normal.
-    config.growthPaused = [] { return false; };
-    engine::Engine engine(config, resources, executor, events);
+    // The storage models the request-sized headroom denial while global
+    // pressure is Normal: test::engineConfig's host pauses no growth.
+    engine::Engine engine(test::engineConfig(), resources, executor, events);
     guardReleases(storage, engine);
     const std::vector<uint32_t> prompt(129, 280);
     if (sharePrefix) {
@@ -4120,9 +4075,9 @@ void testAdmissionReopensAfterLastSuspendedRequestResumes() {
   Executor executor(2);
   executor.decodeFinishes = false;
   Events events;
-  MemoryPressure pressure = MemoryPressure::Warning;
-  EngineConfig config = test::engineConfig();
-  config.growthPaused = [&] { return pressure != MemoryPressure::Normal; };
+  GovernedHost host;
+  host.setPressure(MemoryPressure::Warning);
+  EngineConfig config = host.connect({});
   engine::Engine engine(config, resources, executor, events);
   guardReleases(storage, engine);
 
@@ -4133,7 +4088,7 @@ void testAdmissionReopensAfterLastSuspendedRequestResumes() {
   engine.submit(std::move(longRequest));
   require(engine.tick(1) && executor.suspensions == 1,
           "recovery admission fixture did not suspend its only lane");
-  pressure = MemoryPressure::Normal;
+  host.setPressure(MemoryPressure::Normal);
   storage.growthBlocked = false;
   require(engine.tick(101) && engine.tick(102) && executor.resumptions == 1,
           "recovery admission fixture did not resume its last waiting lane");
@@ -4196,10 +4151,10 @@ struct SuspendedBesideAMaskWait {
     require(events.maskRequests.size() == 1 &&
                 engine.snapshot().scheduler.decoding == 1,
             "fixture lanes did not reach their mask wait and decode");
-    paused = hostPause;
+    host.pause(hostPause);
     storage.growthBlocked = true;
-    storage.allocationFailure = paused ? metal::AllocationFailure::HostPressure
-                                       : metal::AllocationFailure::EngineBudget;
+    storage.allocationFailure = hostPause ? metal::AllocationFailure::HostPressure
+                                          : metal::AllocationFailure::EngineBudget;
     require(engine.tick(7) && executor.suspensions == 1 &&
                 executor.requests.at(1).resident,
             "denied growth did not suspend the lane beside the resident");
@@ -4210,10 +4165,8 @@ struct SuspendedBesideAMaskWait {
   engine::Cache resources{pool, nullptr, nullptr};
   Executor executor;
   Events events;
-  bool paused = false;
-  engine::Engine engine{test::engineConfig({.resourceWaitTimeoutMilliseconds = 1000.0,
-                                            .growthPaused = [this] { return paused; }}),
-                        resources, executor, events};
+  GovernedHost host;
+  engine::Engine engine{host.connect({.resourceWaitTimeoutMilliseconds = 1000.0}), resources, executor, events};
 };
 
 // After a suspension, admission waits for resident lanes only while memory
@@ -4239,7 +4192,6 @@ void testRecoveryDrainEndsWithItsCause() {
     engine::Cache &resources = fixture.resources;
     Executor &executor = fixture.executor;
     Events &events = fixture.events;
-    bool &paused = fixture.paused;
     engine::Engine &engine = fixture.engine;
     // A request of the suspended lane's priority waits behind it.
     auto later = request(3, {3});
@@ -4251,7 +4203,7 @@ void testRecoveryDrainEndsWithItsCause() {
                             cause == Cause::KvStillShort ||
                             cause == Cause::StateStillShort;
     if (pauseLifts)
-      paused = false;
+      fixture.host.pause(false);
     if (cause == Cause::PressureClears || cause == Cause::StateStillShort)
       storage.growthBlocked = false;
     executor.resumeDenied = cause == Cause::StateStillShort;
@@ -5212,9 +5164,8 @@ void testSuspendedRequestKeepsItsReplayPoint() {
   Executor executor(3);
   executor.decodeFinishes = false;
   Events events;
-  bool paused = false;
-  EngineConfig config = test::engineConfig();
-  config.growthPaused = [&] { return paused; };
+  GovernedHost host;
+  EngineConfig config = host.connect({});
   engine::Engine engine(config, resources, executor, events);
   guardReleases(storage, engine);
   double now = 1;
@@ -5229,7 +5180,7 @@ void testSuspendedRequestKeepsItsReplayPoint() {
     engine.submit(std::move(value));
   }
   tickUntil(engine, now, [&] { return !events.outputs[3].empty(); }, "the lanes did not decode");
-  paused = true;
+  host.pause(true);
   storage.growthBlocked = true;
   storage.allocationFailure = metal::AllocationFailure::HostPressure;
   tickUntil(engine, now, [&] { return executor.suspensions == 1; }, "no lane was suspended");
@@ -5247,7 +5198,7 @@ void testSuspendedRequestKeepsItsReplayPoint() {
   require(executor.resumptions == 0 && state.evictions == 1 && state.inUseEvictions == 0 &&
               resources.probe(history, {}).cachedTokens() == 64,
           "the growing peer took the suspended lane's replay point");
-  paused = false;
+  host.pause(false);
   storage.growthBlocked = false;
   tickUntil(engine, now, [&] { return idle(engine); }, "the suspended lane did not finish");
   require(executor.restored == 64, "the suspended lane did not resume from its replay point");
@@ -5341,13 +5292,12 @@ void testRestoredHistoryCheckpointStaysDisposable() {
   Executor executor(2);
   executor.decodeFinishes = false;
   Events events;
-  bool paused = false;
-  EngineConfig config = test::engineConfig();
-  config.growthPaused = [&] { return paused; };
+  GovernedHost host;
+  EngineConfig config = host.connect({});
   engine::Engine engine(config, resources, executor, events);
   guardReleases(storage, engine);
   const auto hostPressure = [&](bool refused) {
-    paused = refused;
+    host.pause(refused);
     storage.growthBlocked = refused;
     storage.allocationFailure = refused ? metal::AllocationFailure::HostPressure
                                         : metal::AllocationFailure::EngineBudget;
