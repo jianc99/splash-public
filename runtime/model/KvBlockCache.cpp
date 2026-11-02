@@ -95,8 +95,15 @@ struct KvBlockCache::Impl {
   [[nodiscard]] uint32_t floorExtents(uint32_t lanes) const noexcept {
     return lanes ? extentsFor(uint64_t{lanes + 1} * laneSlots, extentSlots) : 0;
   }
-  // Allocates extents up to `held` extents, or none of them.
-  [[nodiscard]] ModelMemoryAdmission grow(uint32_t held);
+  // Allocates extents up to `held` extents under `admit`, or none of them.
+  [[nodiscard]] metal::AllocationResult grow(uint32_t held, const metal::AllocationAdmission &admit);
+  // The keys every layer gave up lately (SlotRecycler::ghosts), under the
+  // lock.
+  [[nodiscard]] uint64_t countGhosts() const noexcept {
+    uint64_t count = 0;
+    for (const SlotRecycler &layer : directory) count += layer.ghosts();
+    return count;
+  }
   // The directory and the location pages of `held` extents.
   void place(uint32_t held);
   // Extents and the directory change between commands only: no slot moves
@@ -111,6 +118,7 @@ struct KvBlockCache::Impl {
   void readSpan(uint32_t layer, const Span &span) const;
 
   metal::MetalBackend &backend;
+  const metal::AllocationAdmission admission;
   const kv::SlotFormat format;
   const std::shared_ptr<SsdReaders> readers;
   const uint32_t laneSlots;
@@ -125,10 +133,12 @@ struct KvBlockCache::Impl {
   const std::vector<std::byte> zeros;
 
   // The engine thread's: the state lanes that hold a floor, the extents
-  // allocated, and the counts of every completed command.
+  // allocated, the counts of every completed command, and the ghosts as the
+  // directory last changed between commands.
   std::array<bool, kLanes> floors{};
   uint32_t extents = 0;
   KvReadStats totals;
+  uint64_t ghosts = 0;
 
   // The host steps of the command in flight and the engine thread between
   // commands hand the directory over under `mutex`: each layer's slots, the
@@ -148,8 +158,8 @@ struct KvBlockCache::Impl {
 
 KvBlockCache::Impl::Impl(metal::MetalBackend &backend, metal::AllocationAdmission admission,
                          const kv::Layout &layout, uint32_t extentPages, const KvBlockCacheOptions &options)
-    : backend(backend), format(checked(layout, extentPages, options).format), readers(options.readers),
-      laneSlots(options.laneSlots), extentSlots(extentPages << kPlaceBits),
+    : backend(backend), admission(admission), format(checked(layout, extentPages, options).format),
+      readers(options.readers), laneSlots(options.laneSlots), extentSlots(extentPages << kPlaceBits),
       targetExtents(static_cast<uint32_t>(options.targetBytes /
                                           (uint64_t{extentPages} * layout.kvBytesPerModelPage()))),
       pages(backend, std::move(admission), withoutIndex(layout),
@@ -159,15 +169,15 @@ KvBlockCache::Impl::Impl(metal::MetalBackend &backend, metal::AllocationAdmissio
       recordBytes(format.recordBytes()), zeros(recordBytes),
       directory(layout.attentionLayers, SlotRecycler(0)) {}
 
-ModelMemoryAdmission KvBlockCache::Impl::grow(uint32_t held) {
+metal::AllocationResult KvBlockCache::Impl::grow(uint32_t held, const metal::AllocationAdmission &admit) {
   requireNoCommand();
   for (uint32_t extent = extents; extent < held; ++extent)
-    if (const metal::AllocationResult result = pages.allocateExtent(extent); !result) {
+    if (const metal::AllocationResult result = pages.allocateExtent(extent, kv::PageForm::Full, admit); !result) {
       for (uint32_t allocated = extents; allocated < extent; ++allocated) pages.releaseExtent(allocated);
-      return {.ok = false, .allocationFailure = result.failure};
+      return result;
     }
   place(held);
-  return {.ok = true};
+  return {};
 }
 
 void KvBlockCache::Impl::place(uint32_t held) {
@@ -179,6 +189,7 @@ void KvBlockCache::Impl::place(uint32_t held) {
   std::iota(cachePages.begin(), cachePages.end(), 0u);
   pages.writeEntries(cachePages, 0, locationPages);
   extents = held;
+  ghosts = countGhosts();
 }
 
 kv::SlotRange KvBlockCache::Impl::spanRange(uint32_t layer, const Span &span) const {
@@ -312,21 +323,34 @@ ModelMemoryAdmission KvBlockCache::reserveLane(uint32_t stateLane) {
   if (stateLane >= kLanes) throw std::out_of_range("the hot block cache has no such lane");
   if (holdsLane(stateLane)) return {.ok = true};
   if (const uint32_t held = impl.floorExtents(impl.floorLanes() + 1); held > impl.extents)
-    if (const ModelMemoryAdmission admission = impl.grow(held); !admission.granted()) return admission;
+    if (const metal::AllocationResult result = impl.grow(held, impl.admission); !result)
+      return {.ok = false, .allocationFailure = result.failure};
   impl.floors[stateLane] = true;
   return {.ok = true};
 }
 
 bool KvBlockCache::holdsLane(uint32_t stateLane) const { return impl_->floors.at(stateLane); }
 
+uint64_t KvBlockCache::laneShortfallBytes(uint32_t stateLane) const {
+  const Impl &impl = *impl_;
+  if (holdsLane(stateLane)) return 0;
+  const uint32_t held = impl.floorExtents(impl.floorLanes() + 1);
+  return held > impl.extents ? (held - impl.extents) * impl.pages.extentBytes() : 0;
+}
+
 void KvBlockCache::releaseLane(uint32_t stateLane) noexcept {
   if (stateLane < kLanes) impl_->floors[stateLane] = false;
 }
 
 ModelMemoryAdmission KvBlockCache::growTowardTarget() {
+  const metal::AllocationResult result = growTowardTarget(impl_->admission);
+  return {.ok = static_cast<bool>(result), .allocationFailure = result.failure};
+}
+
+metal::AllocationResult KvBlockCache::growTowardTarget(const metal::AllocationAdmission &admit) {
   Impl &impl = *impl_;
-  if (!impl.floorLanes() || impl.extents >= impl.targetExtents) return {.ok = true};
-  return impl.grow(impl.extents + 1);
+  if (!impl.floorLanes() || impl.extents >= impl.targetExtents) return {};
+  return impl.grow(impl.extents + 1, admit);
 }
 
 uint64_t KvBlockCache::releaseAboveFloor() {
@@ -339,6 +363,8 @@ uint64_t KvBlockCache::releaseAboveFloor() {
   impl.pages.releaseExtent(held - 1);
   return impl.pages.extentBytes();
 }
+
+uint64_t KvBlockCache::extentBytes() const noexcept { return impl_->pages.extentBytes(); }
 
 ops::AttentionBlocks KvBlockCache::addResolve(metal::CommandGraph &graph, uint32_t layer,
                                               std::span<const std::shared_ptr<const KvPageSources>> lanes,
@@ -386,14 +412,17 @@ void KvBlockCache::mergeStats(const KvReadStats &stats) {
   // Under the directory's lock, which the host steps that counted held.
   const std::lock_guard lock(impl_->mutex);
   impl_->totals += stats;
+  impl_->ghosts = impl_->countGhosts();
 }
 
 KvBlockCacheStats KvBlockCache::stats() const {
   const Impl &impl = *impl_;
   const uint64_t extentBytes = impl.pages.extentBytes();
+  // A slot of every layer takes an extent's bytes over its slots.
   return {.bytes = impl.extents * extentBytes,
           .targetBytes = impl.targetExtents * extentBytes,
           .floorBytes = impl.floorExtents(impl.floorLanes()) * extentBytes,
+          .ghostBytes = impl.ghosts * extentBytes / (uint64_t{impl.extentSlots} * impl.directory.size()),
           .slotsPerLayer = impl.extents * impl.extentSlots,
           .lanes = impl.floorLanes(),
           .reads = impl.totals,

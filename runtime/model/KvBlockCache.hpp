@@ -81,11 +81,18 @@ public:
   // Whether the lane holds its floor: reserveLane() granted it, and
   // releaseLane() has not given it back.
   [[nodiscard]] bool holdsLane(uint32_t stateLane) const;
-  // Between commands, optionally: at most one extent more toward the target.
+  // The bytes reserveLane(stateLane) would allocate now: zero while the lane
+  // holds its floor or the floors' extents hold one more.
+  [[nodiscard]] uint64_t laneShortfallBytes(uint32_t stateLane) const;
+  // Between commands, optionally: at most one extent more toward the target,
+  // under the cache's admission or under `admit`.
   [[nodiscard]] ModelMemoryAdmission growTowardTarget();
+  [[nodiscard]] metal::AllocationResult growTowardTarget(const metal::AllocationAdmission &admit);
   // An idle reclaim: the cache's last extent above its floors, in bytes;
   // zero at its floors. A reclaim that needs more calls again.
   [[nodiscard]] uint64_t releaseAboveFloor();
+  // The bytes of one extent, what the cache grows and gives back at a time.
+  [[nodiscard]] uint64_t extentBytes() const noexcept;
 
   // After `layer`'s block lists: a host step that resolves the entries of
   // lane l's list, whose pages' sources are lanes[l] (null for a lane none

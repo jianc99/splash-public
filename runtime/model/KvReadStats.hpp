@@ -53,13 +53,16 @@ struct KvReadStats final {
 };
 
 // The hot block cache as /status reports it: its memory, target and floor,
-// its slots per layer and the lanes that hold a floor, everything its
-// commands' resolves did, and how long a resolve, a read and its host steps
-// took (metal::HostStepTiming).
+// the memory its ghosts span (the blocks its layers gave up lately, as many
+// as a cache larger by those bytes would still hold), its slots per layer
+// and the lanes that hold a floor, everything its commands' resolves did,
+// and how long a resolve, a read and its host steps took
+// (metal::HostStepTiming).
 struct KvBlockCacheStats final {
   uint64_t bytes = 0;
   uint64_t targetBytes = 0;
   uint64_t floorBytes = 0;
+  uint64_t ghostBytes = 0;
   uint32_t slotsPerLayer = 0;
   uint32_t lanes = 0;
   KvReadStats reads;

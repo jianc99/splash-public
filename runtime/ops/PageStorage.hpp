@@ -71,9 +71,11 @@ public:
   // std::out_of_range for an extent past the pool; std::invalid_argument for
   // Index pages of a layout that cannot spill (Layout::spillable) and Slim
   // pages of one whose pages cannot give up a window's layers
-  // (Layout::slimmable).
+  // (Layout::slimmable). Under the storage's admission, or under `admit`.
   [[nodiscard]] metal::AllocationResult allocateExtent(uint32_t extent,
                                                        PageForm form = PageForm::Full) override;
+  [[nodiscard]] metal::AllocationResult allocateExtent(uint32_t extent, PageForm form,
+                                                       const metal::AllocationAdmission &admit);
   // The caller must prove that no active, prefix, reserved, or in-flight
   // reference remains anywhere in this extent. std::out_of_range for an
   // extent past the pool. KvPool never releases an extent that holds a page

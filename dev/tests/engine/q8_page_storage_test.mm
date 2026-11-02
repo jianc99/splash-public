@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <iostream>
 #include <span>
 #include <stdexcept>
@@ -492,6 +493,28 @@ void run(const std::string &metallib) {
                 hostGatedStorage.actualAllocatedBytes() ==
                     uint64_t{256} * hostGatedStorage.bytesPerPage(),
             "KV growth did not recover after host memory became available");
+    // An extent allocated under an admission of its own asks that one alone:
+    // the storage's, which host pressure refuses, does not refuse it, and a
+    // refusing one refuses it with nothing allocated.
+    hostGatedStorage.releaseExtent(1);
+    elasticHostAvailable = 128ULL * 1024 * 1024;
+    uint64_t admitted = 0;
+    const metal::AllocationAdmission own = [&](uint64_t bytes, const std::function<void()> &allocate) {
+        admitted += bytes;
+        allocate();
+        return metal::AllocationResult{};
+    };
+    const metal::AllocationAdmission refusing = [](uint64_t, const std::function<void()> &) {
+        return metal::AllocationResult(metal::AllocationFailure::EngineBudget);
+    };
+    require(hostGatedStorage.allocateExtent(1, kv::PageForm::Full, refusing).failure ==
+                    metal::AllocationFailure::EngineBudget &&
+                !hostGatedStorage.isAllocated(128),
+            "an extent refused by its own admission was allocated");
+    require(hostGatedStorage.allocateExtent(1, kv::PageForm::Full, own) && admitted == hostGatedStorage.extentBytes() &&
+                hostGatedStorage.isAllocated(128),
+            "an extent under its own admission was refused by the storage's");
+    elasticHostAvailable = 4ULL * 1024 * 1024 * 1024;
 
     MemoryGovernor governor(
         backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1, queryHostMemory, 0);

@@ -72,6 +72,11 @@ bool PageStorage::isAllocated(uint32_t page) const {
 }
 
 metal::AllocationResult PageStorage::allocateExtent(uint32_t extent, PageForm form) {
+    return allocateExtent(extent, form, admitAllocation_);
+}
+
+metal::AllocationResult PageStorage::allocateExtent(uint32_t extent, PageForm form,
+                                                    const metal::AllocationAdmission &admit) {
     Extent &record = extents_.at(extent);
     if (record.buffer) {
         throw std::logic_error(
@@ -89,7 +94,7 @@ metal::AllocationResult PageStorage::allocateExtent(uint32_t extent, PageForm fo
     const std::string label = form == PageForm::Full   ? "kv-extent-"
                               : form == PageForm::Slim ? "kv-slim-extent-"
                                                        : "kv-index-extent-";
-    return admitAllocation_(bytes, [&] {
+    return admit(bytes, [&] {
         metal::MetalBuffer allocated = backend_.allocateBuffer(
             bytes, metal::BufferStorage::Shared,
             label + std::to_string(extent * extentPages_), metal::BufferReach::Addressed);
