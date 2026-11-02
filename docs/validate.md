@@ -345,8 +345,8 @@ schema, and the client times what a user sees.
 | --- | --- |
 | `churn` | three clients, each sending 1500-token answers to prompts that grow every round (about 8K tokens, then more; `CHURN_BASE`/`CHURN_STEP` words), every fourth round resending its conversation, the first requests in a fixed arrival order (`--order 2,0,1` or `0,1,2`, 0.6 s apart), for `--minutes`; `/status` every 2 s |
 | `ttft` | for each N of `--n`, on a fresh server: N conversations cache an ~8K-token prefix one at a time, then send it with distinct ~300-token suffixes at the same instant, `--rounds` times; `/status` every 0.5 s |
-| `serve1` | one request at a time on an idle server, cold prompts of about `--sizes` tokens (300, 2K and 14K): time to first token and decode milliseconds per token |
-| `warm` | per cached depth of `--sizes`, a fresh cold prefix, then 2 discarded and 8 measured ~300-token suffixes after it: the server's prompt time of each (`--trial` picks the texts, the same for every tree) |
+| `serve1` | one request at a time on an idle server, cold prompts of about `--sizes` tokens (300, 2K and 14K): time to first token and decode milliseconds per token; the `/status` each request waited idle for, and one after the last |
+| `warm` | per cached depth of `--sizes`, a fresh cold prefix, then 2 discarded and 8 measured ~300-token suffixes after it: the server's prompt time of each (`--trial` picks the texts, the same for every tree); `/status` as `serve1` |
 
 Every request timestamps each content chunk of its stream; its gaps are the
 intervals between consecutive chunks after the first, and a request still
@@ -368,9 +368,11 @@ scenario; and stops the server with SIGINT, then SIGTERM. Beside the client's
 line is `DONE` only once everything completed, `LABEL.meta.json` (binary
 SHA-256, build id, model, spawn-to-ready seconds and whether the binary had
 started on that Mac before, host memory and pressure, process snapshots at
-the start, middle and end of the scenario while the server serves, and the
-pids the run started) and on the M5 Pro `LABEL.idle.jsonl`, its idle time
-and sleep assertions every 10 s. It refuses any output directory that resolves,
+the start, middle and end of the scenario while the server serves, the pids
+the run started, and for a run that did not complete why and whose failure
+that was: the server's, which exited, was not ready in time or failed a
+request, or `run.py`'s refusal to measure) and on the M5 Pro
+`LABEL.idle.jsonl`, its idle time and sleep assertions every 10 s. It refuses any output directory that resolves,
 through whatever symlinks, into `~/.cache/huggingface` or an `install/models`
 directory.
 
@@ -392,17 +394,22 @@ runs per tree and order, recorded reference runs, gates).
   INCONCLUSIVE with the numbers, the trades for the owner, and every run it
   did not use and why.
 
-A run of any scenario counts only if it ended with `DONE`, it saw no `serious`
-or `critical` thermal sample, it served the cell's model, no process it did not
-start was among the top five by CPU at 24 % or more (`foreign_cpu_percent` in
-the spec, whose note gives its source), and, on the M5 Pro, its owner neither
-touched it (HIDIdleTime under 10 s) nor had a process the run did not start
-hold a display or system sleep assertion. A churn run also needs a server
-that never restarted and no HTTP error but `context_length_exceeded`; a TTFT
-run's concurrency counts only where every round it was to run completed its N
-requests. An ample-memory run counts only if the experts were at their cap
-with pressure normal at Ready. A candidate run left out for its own restart,
-HTTP errors or missing `DONE` still fails G8. Copy a tree to another Mac by content
+A run of any scenario counts only if it ended with `DONE`, its server never
+restarted and failed no request (an HTTP error but `context_length_exceeded`,
+or a request of a failed TTFT round), it saw no `serious` or `critical`
+thermal sample, it served the cell's model, no process it did not start was
+among the top five by CPU at 24 % or more (`foreign_cpu_percent` in the spec,
+whose note gives its source), and, on the M5 Pro, its owner neither touched
+it (HIDIdleTime under 10 s) nor had a process the run did not start hold a
+display or system sleep assertion. A TTFT run's concurrency counts only where
+every round it was to run completed its N requests. An ample-memory run counts
+only if the experts were at their cap with pressure normal at Ready. G8 is
+judged on every candidate run of every scenario but those left out for
+anything other than the server's own failures: a run whose server restarted,
+failed a request, or exited or was not ready in time fails G8; one that
+`run.py` refused to measure (a port that already answers, a build that is not
+the tree's, an installation that failed) or that its surroundings or the
+cell's void list voided is only listed, to be repeated. Copy a tree to another Mac by content
 (`rsync --checksum`): `git archive` leaves `dev/tests` and `dev/benchmarks` out
 (`.gitattributes`), and a copy that keeps the files' old times leaves make
 running stale binaries. For a gate, delete the test binary before building it

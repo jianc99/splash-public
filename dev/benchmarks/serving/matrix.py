@@ -31,7 +31,7 @@ from pathlib import Path
 
 from dev.benchmarks import abba
 from dev.benchmarks.serving import clients, stats
-from dev.benchmarks.serving.run import refuse_protected
+from dev.benchmarks.serving.run import SERVER_FAILURES, refuse_protected
 from dev.benchmarks.serving.stats import FAIL, INCONCLUSIVE, PASS
 
 # A churn run's work and SSD counters are read at the sample nearest the end
@@ -119,9 +119,13 @@ def abba_runs(cell: dict) -> list[tuple[str, str, int]]:
 
 
 def locate(results: list[Path], label: str) -> Path | None:
+    """The results directory holding a run: its run.py meta.json, written
+    also for a run that did not reach its scenario, or its client's
+    records."""
     for directory in results:
         if (
-            (directory / f"{label}.events.jsonl").exists()
+            (directory / f"{label}.meta.json").exists()
+            or (directory / f"{label}.events.jsonl").exists()
             or (directory / f"{label}.jsonl").exists()
             or any(directory.glob(f"{label}-n*.events.jsonl"))
         ):
@@ -132,10 +136,22 @@ def locate(results: list[Path], label: str) -> Path | None:
 # ------------------------------------------------------------------ runs
 
 
+def run_files(directory: Path, label: str, kind: str) -> list[Path]:
+    """A run's LABEL.KIND.jsonl, or a ttft run's, one per concurrency."""
+    single = directory / f"{label}.{kind}.jsonl"
+    return (
+        [single]
+        if single.exists()
+        else sorted(directory.glob(f"{label}-n*.{kind}.jsonl"))
+    )
+
+
 class Run:
-    """One run's records: its done requests, errors, end, /status samples
-    (a ttft run's over its levels) and meta, and the reasons it may not be
-    used. A churn run's work is read at `window` seconds."""
+    """One run's records: its done requests, the requests the server failed,
+    its end, /status samples and events (a ttft run's over its levels) and
+    meta, and the reasons it may not be used: `invalid` all of them,
+    `voided` those not the server's own failure. A churn run's work is read
+    at `window` seconds."""
 
     def __init__(
         self,
@@ -157,25 +173,33 @@ class Run:
         meta = directory / f"{label}.meta.json"
         self.meta = json.loads(meta.read_text()) if meta.exists() else {}
         self.invalid: list[str] = []
+        self.voided: list[str] = []
         out = directory / f"{label}.out"
         self.complete = out.exists() and out.read_text().rstrip().endswith("DONE")
-        events = read_jsonl(directory / f"{label}.events.jsonl")
-        self.done = {e["tag"]: e for e in events if e.get("kind") == "done"}
-        self.errors = [
+        events = [
             e
+            for path in run_files(directory, label, "events")
+            for e in read_jsonl(path)
+        ]
+        self.done = {e["tag"]: e for e in events if e.get("kind") == "done"}
+        # Churn's HTTP errors but context_length_exceeded, and each request
+        # of a failed TTFT round.
+        self.errors = [
+            failure
             for e in events
-            if e.get("kind") == "http_error"
-            and "context_length_exceeded" not in e.get("body", "")
+            for failure in (
+                [f"{e.get('code')} {e.get('body', '')}"]
+                if e.get("kind") == "http_error"
+                else e.get("failures", [])
+                if e.get("kind") == "round_failed"
+                else []
+            )
+            if "context_length_exceeded" not in failure
         ]
         self.end = next((e for e in events if e.get("kind") == "end"), None)
-        status = directory / f"{label}.status.jsonl"
         self.samples = [
             s
-            for path in (
-                [status]
-                if status.exists()
-                else sorted(directory.glob(f"{label}-n*.status.jsonl"))
-            )
+            for path in run_files(directory, label, "status")
             for s in read_jsonl(path)
             if "status" in s
         ]
@@ -286,30 +310,42 @@ def assertion_pid(holder: str) -> int | None:
 
 
 def validate(run: Run, spec: dict, cell: dict) -> None:
-    """Records why a run cannot be used (amend/V.md §5 validity): every
-    scenario's run, and a churn run's HTTP errors, restarts and ample
-    start."""
+    """Records why a run cannot be used (amend/V.md §5 validity), each reason
+    in run.invalid. The server's own failures, an engine restart, a request
+    it failed, or its exit, a start not ready in time or a failed request
+    that ended the run (run.py's `failure`), fail a candidate's G8; every
+    other reason, run.py refusing to measure (a port that answers, a build
+    that is not the tree's, an installation that failed), the run's
+    surroundings or the cell's void list, is also in run.voided: such a run
+    is to be repeated, and judged on nothing."""
+
+    def void(reason: str) -> None:
+        run.invalid.append(reason)
+        run.voided.append(reason)
+
+    meta = run.meta
     if not run.complete:
-        run.invalid.append("the run did not end with DONE")
+        reason = "the run did not end with DONE" + (
+            f": {meta['error']}" if meta.get("error") else ""
+        )
+        if meta.get("failure") in SERVER_FAILURES:
+            run.invalid.append(reason)
+        else:
+            void(reason)
     if run.label in (cell.get("void") or {}):
-        run.invalid.append(f"void: {cell['void'][run.label]}")
+        void(f"void: {cell['void'][run.label]}")
     thermal = {s["status"].get("thermal_state") for s in run.samples} & set(
         THERMAL_VOID
     )
     if thermal:
-        run.invalid.append(f"thermal state {sorted(thermal)}")
-    meta = run.meta
+        void(f"thermal state {sorted(thermal)}")
     if meta:
-        if not meta.get("complete"):
-            run.invalid.append(f"run.py did not complete: {meta.get('error')}")
         idle = meta.get("gpu_idle_check")
         if idle and not idle["ok"]:
-            run.invalid.append(
-                f"the GPU was busy at the start ({idle['max_percent']} %)"
-            )
+            void(f"the GPU was busy at the start ({idle['max_percent']} %)")
         model = spec["models"][cell["model"]]["model"]
         if meta.get("model") != model:
-            run.invalid.append(f"model {meta.get('model')}, the cell's is {model}")
+            void(f"model {meta.get('model')}, the cell's is {model}")
         floor = spec["gates"]["foreign_cpu_percent"]
         for snapshot in meta.get("ps") or []:
             # base.md §2.7: void when a process this run did not start is
@@ -319,7 +355,7 @@ def validate(run: Run, spec: dict, cell: dict) -> None:
                 row for row in snapshot["rows"][:5] if not row[4] and row[1] >= floor
             ]
             if foreign:
-                run.invalid.append(
+                void(
                     f"a process this run did not start in the top five by CPU: "
                     f"{foreign[0][3]} at {foreign[0][1]:g} %"
                 )
@@ -339,17 +375,13 @@ def validate(run: Run, spec: dict, cell: dict) -> None:
             if assertion_pid(h) not in ours
         ]
         if touched:
-            run.invalid.append(
+            void(
                 f"the laptop was in use (HIDIdleTime {touched[0]['hid_idle_s']:.1f} s)"
             )
         if held:
-            run.invalid.append(f"another process held a sleep assertion: {held[0]}")
-    if cell.get("scenario") != "churn":
-        return
+            void(f"another process held a sleep assertion: {held[0]}")
     if run.errors:
-        run.invalid.append(
-            f"{len(run.errors)} HTTP errors other than context_length_exceeded"
-        )
+        run.invalid.append(f"requests the server failed: {len(run.errors)}")
     restarted = run.restarts()
     if restarted:
         run.invalid.append(f"the engine restarted ({restarted[0]} -> {restarted[1]})")
@@ -370,7 +402,7 @@ def validate(run: Run, spec: dict, cell: dict) -> None:
             == value(first, "streamed_experts.cap_chunks")
         )
         if not at_cap or first.get("memory_pressure") != "normal":
-            run.invalid.append(
+            void(
                 "ample start: the experts were not at their cap with pressure normal at Ready"
             )
 
@@ -661,6 +693,40 @@ def prefill_shares(status: dict) -> dict:
     }
 
 
+def g8_failures(run: Run, gates: dict) -> list[str]:
+    """G8 (amend/V.md §5): the server's own failures a run shows, from its
+    /status samples (a ttft run's over its servers, each starting afresh),
+    its clients' records and run.py's: an engine restart, a request it
+    failed, a Metal failure, a tick of its loop past the GPU wait limit, or
+    an exit, a start not ready in time or a failed request that ended the
+    run."""
+    failures = []
+    restarted = run.restarts()
+    if restarted:
+        failures.append(
+            f"G8: the engine restarted (transport.restarts {restarted[0]} -> {restarted[1]})"
+        )
+    failed = max(
+        (value(s["status"], "requests.failed", 0) for s in run.samples), default=0
+    )
+    if failed or run.errors:
+        failures.append(
+            f"G8: {failed} failed requests in /status, {len(run.errors)} at the client"
+        )
+    if any(
+        value(s["status"], "metrics.metal_failures", 0)
+        or not value(s["status"], "metal.healthy", True)
+        for s in run.samples
+    ):
+        failures.append("G8: a Metal failure")
+    ticks = [value(s["status"], "loop.max_tick_ms", 0) for s in run.samples]
+    if ticks and max(ticks) >= gates["max_tick_ms"]:
+        failures.append(f"G8: loop.max_tick_ms {max(ticks):.0f}")
+    if run.meta.get("failure") in SERVER_FAILURES:
+        failures.append(f"G8: {run.meta.get('error')}")
+    return failures
+
+
 def health(run: Run, machine: dict, gates: dict) -> dict:
     """One candidate run on its own: G4 from its client gaps and its own
     status, G8 and G9, and the readouts verdict.md reports."""
@@ -686,22 +752,7 @@ def health(run: Run, machine: dict, gates: dict) -> dict:
             )
         facts["gap_causes"] = gap_causes(run, limit / 1000)
     last = run.last
-    restarted = run.restarts()
-    if restarted:
-        facts["failures"].append(
-            f"G8: the engine restarted (transport.restarts {restarted[0]} -> {restarted[1]})"
-        )
-    if value(last, "requests.failed", 0) or run.errors:
-        facts["failures"].append(
-            f"G8: {value(last, 'requests.failed', 0)} failed requests, {len(run.errors)} HTTP errors"
-        )
-    if value(last, "metrics.metal_failures", 0) or not all(
-        value(s["status"], "metal.healthy", True) for s in run.samples
-    ):
-        facts["failures"].append("G8: a Metal failure")
-    ticks = [value(s["status"], "loop.max_tick_ms", 0) for s in run.samples]
-    if ticks and max(ticks) >= gates["max_tick_ms"]:
-        facts["failures"].append(f"G8: loop.max_tick_ms {max(ticks):.0f}")
+    facts["failures"] += g8_failures(run, gates)
     for sample in run.samples:
         governor = sample["status"].get("memory_governor") or {}
         # Accounts are checked once the ledger reports any.
@@ -845,21 +896,16 @@ def churn_cell(
             }
         )
 
-    # G8 is judged on every candidate run (amend/V.md §5): one its own
-    # restart, HTTP errors or missing DONE made unusable fails it; one left
-    # out only for its surroundings (heat, other processes, the laptop's
-    # owner) is listed under the runs not used.
+    # G4, G8 and G9 are judged on every candidate run (amend/V.md §5) but
+    # the voided: one the server's own failures made unusable fails G8; one
+    # run.py refused to measure or its surroundings voided (heat, other
+    # processes, the laptop's owner) is only listed under the runs not used,
+    # to be repeated.
     g4_holds = True
     for run in runs:
-        if run.tree not in cell.get("health", ["cand"]):
+        if run.tree not in cell.get("health", ["cand"]) or run.voided:
             continue
         facts = health(run, machine, gates)
-        if not run.complete:
-            facts["failures"].append(
-                f"G8: the run did not end with DONE ({run.meta.get('error')})"
-            )
-        if run.invalid and not any(f.startswith("G8") for f in facts["failures"]):
-            continue
         g4_holds &= not any(f.startswith("G4") for f in facts["failures"])
         record(f"G4 G8 G9 {run.label}", FAIL if facts["failures"] else PASS, facts)
     for candidate in cell.get("candidates", ["cand"]):
@@ -1261,11 +1307,27 @@ def unused_entry(cell: dict, label: str, tree: str, reasons: list[str]) -> dict:
     return {"cell": cell["name"], "label": label, "tree": tree, "reasons": reasons}
 
 
-def ttft_rounds(cell: dict, spec: dict, results: list[Path]) -> tuple[dict, list]:
+def g8_verdict(cell: dict, spec: dict, run: Run) -> list[dict]:
+    """G8 of a validated ttft, serve1 or warm run of a candidate tree, unless
+    voided (a churn run's is part of its health in churn_cell)."""
+    if run.tree not in cell.get("health", ["cand"]) or run.voided:
+        return []
+    failures = g8_failures(run, spec["gates"])
+    return [
+        {
+            "cell": cell["name"],
+            "rule": f"G8 {run.label}",
+            "verdict": FAIL if failures else PASS,
+            "numbers": failures,
+        }
+    ]
+
+
+def ttft_rounds(cell: dict, spec: dict, results: list[Path]) -> tuple[dict, list, list]:
     """{tree: {n: [(directory, label, round)]}} of a TTFT cell's recorded and
     planned runs that are valid, over the concurrencies whose every round
-    completed its N requests (A104's structural minimum), and the runs and
-    concurrencies left out, with why."""
+    completed its N requests (A104's structural minimum), the runs and
+    concurrencies left out, with why, and the candidate runs' G8."""
     labels = {tree: list(found) for tree, found in (cell.get("recorded") or {}).items()}
     for tree, orders in (cell.get("runs") or {}).items():
         for order, count in orders.items():
@@ -1273,7 +1335,7 @@ def ttft_rounds(cell: dict, spec: dict, results: list[Path]) -> tuple[dict, list
                 run_label(cell["name"], tree, order, r) for r in range(1, count + 1)
             )
     found: dict = {}
-    unused = []
+    unused, health_verdicts = [], []
     for tree, names in labels.items():
         for label in names:
             directory = locate(results, label)
@@ -1281,6 +1343,7 @@ def ttft_rounds(cell: dict, spec: dict, results: list[Path]) -> tuple[dict, list
                 continue
             run = Run(directory, label, cell["name"], tree)
             validate(run, spec, cell)
+            health_verdicts += g8_verdict(cell, spec, run)
             if run.invalid:
                 unused.append(unused_entry(cell, label, tree, run.invalid))
                 continue
@@ -1305,7 +1368,7 @@ def ttft_rounds(cell: dict, spec: dict, results: list[Path]) -> tuple[dict, list
                 found.setdefault(tree, {}).setdefault(n, []).extend(
                     (directory, label, r) for r in rounds
                 )
-    return found, unused
+    return found, unused, health_verdicts
 
 
 def ttft_cell(cell: dict, spec: dict, results: list[Path]) -> tuple[list, bool, list]:
@@ -1313,10 +1376,10 @@ def ttft_cell(cell: dict, spec: dict, results: list[Path]) -> tuple[list, bool, 
     worst TTFT, cand at most the reference's times 1 + r_N, r_N the
     reference's spread of round worsts over its rounds other than the
     largest; N=1 and the first round reported. With point_gate, G10's point
-    rule instead. Also whether cand's concurrent TTFT clearly beats the
-    gain reference's (a gain for the owner's trade rule), and the runs and
-    concurrencies not used."""
-    found, unused = ttft_rounds(cell, spec, results)
+    rule instead. Each candidate run's G8. Also whether cand's concurrent
+    TTFT clearly beats the gain reference's (a gain for the owner's trade
+    rule), and the runs and concurrencies not used."""
+    found, unused, health_verdicts = ttft_rounds(cell, spec, results)
     verdicts, gain = [], False
     gate = "G10" if cell.get("point_gate") else "G5"
     for n in cell.get("gate_n", [2, 4]):
@@ -1379,7 +1442,7 @@ def ttft_cell(cell: dict, spec: dict, results: list[Path]) -> tuple[list, bool, 
                 "numbers": [max(r["ttft_ms"]) for _, _, r in found["cand"][1]],
             }
         )
-    return verdicts, gain, unused
+    return verdicts + health_verdicts, gain, unused
 
 
 def abba_metrics(directory: Path, label: str) -> dict:
@@ -1407,10 +1470,10 @@ def abba_metrics(directory: Path, label: str) -> dict:
 
 def abba_cell(cell: dict, spec: dict, results: list[Path]) -> tuple[list, list]:
     """G7 on in-session ABBA runs (reference, cand, cand, reference, per set):
-    every metric must PASS abba.compare; and G8's warm start (amend/V.md A16):
-    cand's warm spawn-to-ready at most the reference's plus the 256-row
-    warm-up's cost. A set with a run that is not valid is not judged; its
-    invalid runs are returned with why."""
+    every metric must PASS abba.compare; G8 of each cand run; and G8's warm
+    start (amend/V.md A16): cand's warm spawn-to-ready at most the
+    reference's plus the 256-row warm-up's cost. A set with a run that is
+    not valid is not judged; its invalid runs are returned with why."""
     runs = abba_runs(cell)
     verdicts, unused = [], []
     for index in range(0, len(runs), 4):
@@ -1419,30 +1482,25 @@ def abba_cell(cell: dict, spec: dict, results: list[Path]) -> tuple[list, list]:
             for tree, order, repeat in runs[index : index + 4]
         ]
         directories = [locate(results, label) for label in labels]
-        if None in directories:
-            verdicts.append(
-                {
-                    "cell": cell["name"],
-                    "rule": f"G7 set {index // 4 + 1}",
-                    "verdict": INCONCLUSIVE,
-                    "numbers": "not run",
-                }
-            )
-            continue
         invalid = []
         for (tree, _, _), d, label in zip(runs[index : index + 4], directories, labels):
+            if d is None:
+                continue
             run = Run(d, label, cell["name"], tree)
             validate(run, spec, cell)
+            verdicts += g8_verdict(cell, spec, run)
             if run.invalid:
                 invalid.append(unused_entry(cell, label, tree, run.invalid))
-        if invalid:
-            unused += invalid
+        unused += invalid
+        if None in directories or invalid:
             verdicts.append(
                 {
                     "cell": cell["name"],
                     "rule": f"G7 set {index // 4 + 1}",
                     "verdict": INCONCLUSIVE,
-                    "numbers": "runs not used: "
+                    "numbers": "not run"
+                    if None in directories
+                    else "runs not used: "
                     + ", ".join(entry["label"] for entry in invalid),
                 }
             )

@@ -21,8 +21,10 @@ SIGINT; and writes beside the client's records:
   seconds and whether the binary had started on this machine before (a first
   start compiles Metal), host memory and pressure at start, ps snapshots at
   the start, middle and end of the scenario while the server serves, the pids
-  this run started, and on the M5 Pro the idle and sleep-assertion samples
-  (LABEL.idle.jsonl) that void a run the laptop's owner used;
+  this run started, on the M5 Pro the idle and sleep-assertion samples
+  (LABEL.idle.jsonl) that void a run the laptop's owner used, and for a run
+  that did not complete why (error) and whose failure that was (failure:
+  server or request, the server's own, else the refusal's kind);
 - LABEL.server.log (one per server: LABEL-nN for each concurrency of ttft).
 
 No output goes under ~/.cache/huggingface or an install/models directory,
@@ -67,7 +69,20 @@ PRINT_CONSTANTS = "splash-benchmark-print-build-id-constants:\n\t@printf '%s\\n'
 
 
 class RunError(RuntimeError):
-    pass
+    """Why a run cannot complete, and whose doing that is: `kind`, recorded
+    in meta.json as `failure`, is one of SERVER_FAILURES when the server
+    failed the run, else this harness refused to measure it (a port that
+    answers, a build or a server that is not the tree's, an installation or
+    an output it cannot make)."""
+
+    def __init__(self, message: str, kind: str):
+        super().__init__(message)
+        self.kind = kind
+
+
+# The server's own failures, which fail a candidate's G8 (amend/V.md §5): it
+# exited or was not ready in time, or it failed a request.
+SERVER_FAILURES = ("server", "request")
 
 
 def protected_roots() -> list[Path]:
@@ -81,11 +96,12 @@ def refuse_protected(path: Path) -> Path:
     real = Path(os.path.realpath(path))
     for root in protected_roots():
         if real == root or root in real.parents:
-            raise RunError(f"refusing output {path}: it resolves into {root}")
+            raise RunError(f"refusing output {path}: it resolves into {root}", "output")
     parts = real.parts
     if any(parts[i : i + 2] == ("install", "models") for i in range(len(parts) - 1)):
         raise RunError(
-            f"refusing output {path}: it resolves into an install/models directory ({real})"
+            f"refusing output {path}: it resolves into an install/models directory ({real})",
+            "output",
         )
     return real
 
@@ -141,7 +157,8 @@ def tree_build_id(tree: Path) -> str:
         )
     if listed.returncode:
         raise RunError(
-            f"{tree}: cannot read its build identity constants: {listed.stderr[-300:]}"
+            f"{tree}: cannot read its build identity constants: {listed.stderr[-300:]}",
+            "build",
         )
     checked = subprocess.run(
         [
@@ -164,7 +181,8 @@ def tree_build_id(tree: Path) -> str:
     )
     if checked.returncode:
         raise RunError(
-            f"{tree}: its build does not match its sources: {checked.stderr[-300:]}"
+            f"{tree}: its build does not match its sources: {checked.stderr[-300:]}",
+            "build",
         )
     return json.loads(checked.stdout)["build_id"]
 
@@ -320,14 +338,15 @@ class Server:
         while time.time() < deadline:
             if self.process.poll() is not None:
                 raise RunError(
-                    f"the server exited {self.process.returncode} before it was ready"
+                    f"the server exited {self.process.returncode} before it was ready",
+                    "server",
                 )
             try:
                 clients.get_json(self.port, "/ready", timeout=5)
                 return round(time.time() - self.spawned, 2)
             except Exception:
                 time.sleep(1)
-        raise RunError(f"the server was not ready within {timeout} s")
+        raise RunError(f"the server was not ready within {timeout} s", "server")
 
     def engine_pids(self) -> set[int]:
         listed = command_output(["pgrep", "-P", str(self.process.pid)])
@@ -380,7 +399,9 @@ def install(args, out: Path) -> str:
                 text=True,
             )
             if done.returncode:
-                raise RunError(f"install/models.py {step} exited {done.returncode}")
+                raise RunError(
+                    f"install/models.py {step} exited {done.returncode}", "install"
+                )
     return done.stdout.strip().splitlines()[-1]
 
 
@@ -401,10 +422,13 @@ def check_identity(port: int, server: Server, build_id: str) -> dict:
     served = clients.dig(status, "identity.cache.build_id")
     if pid != server.process.pid:
         raise RunError(
-            f"/status names pid {pid}, not the server this run started ({server.process.pid})"
+            f"/status names pid {pid}, not the server this run started ({server.process.pid})",
+            "identity",
         )
     if served != build_id:
-        raise RunError(f"/status names build {served}, not the tree's {build_id}")
+        raise RunError(
+            f"/status names build {served}, not the tree's {build_id}", "identity"
+        )
     return {
         "pid": pid,
         "build_id": served,
@@ -511,7 +535,7 @@ def main(argv=None) -> int:
     out.mkdir(parents=True, exist_ok=True)
     label_out = out / f"{args.label}.out"
     if any(out.glob(f"{args.label}.*")):
-        raise RunError(f"label {args.label} already used in {out}")
+        raise RunError(f"label {args.label} already used in {out}", "label")
     tree = args.tree.resolve()
     args.tree = tree
     lines = label_out.open("w")
@@ -545,7 +569,8 @@ def main(argv=None) -> int:
     try:
         if port_answers(args.port):
             raise RunError(
-                f"port {args.port} already answers: a stale server would serve this run"
+                f"port {args.port} already answers: a stale server would serve this run",
+                "port",
             )
         binary = tree / "build/splash"
         meta["binary_sha256"] = sha256(binary)
@@ -634,8 +659,27 @@ def main(argv=None) -> int:
                     clients.run_warm(
                         args.port, str(out), part, args.size_list, args.trial
                     )
+                # A server gone by the scenario's end failed the run, also
+                # where its clients carried on (a churn client stops at the
+                # first request the server no longer answers).
+                if server.process.poll() is not None:
+                    raise RunError(
+                        f"the server exited {server.process.returncode} during the scenario",
+                        "server",
+                    )
                 if index == len(levels) - 1:
                     snapshots.append(ps_snapshot(ours))
+            except clients.RequestFailed as error:
+                raise RunError(str(error), "request") from error
+            except OSError as error:
+                # A request or /status the server no longer answered: its own
+                # failure once it has exited, else not.
+                if server.process.poll() is None:
+                    raise
+                raise RunError(
+                    f"the server exited {server.process.returncode} during the scenario: {error}",
+                    "server",
+                ) from error
             finally:
                 note(f"{part} {server.stop()}")
         meta["parts"] = parts
@@ -649,6 +693,7 @@ def main(argv=None) -> int:
     except RunError as error:
         note(f"FAIL {error}")
         meta["error"] = str(error)
+        meta["failure"] = error.kind
         meta["complete"] = False
         return 1
     finally:

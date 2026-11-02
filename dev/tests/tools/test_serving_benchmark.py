@@ -140,6 +140,39 @@ class ClientRequestTests(unittest.TestCase):
             clients.busy({**idle, "requests": {"submitted": 3, "completed": 2}})
         )
 
+    def test_serve1_samples_its_idle_status_and_fails_on_an_error(self):
+        # serve1 records the /status each request waited idle for and one
+        # after the last, so that G8 sees a restart or a Metal failure; a
+        # request the server fails ends it as the server's failure.
+        statuses = iter({"n": i} for i in range(10))
+
+        class FakeStream:
+            def __init__(self, port, body):
+                self.sent, self.chunks, self.error_body = 0.0, [0.5, 0.6, 0.7], ""
+                self.status = 500 if "Log s2048" in body else 200
+                self.usage = {"completion_tokens": 3, "prompt_tokens": 300}
+
+        def sampled(directory, label):
+            return [
+                json.loads(line)["status"]["n"]
+                for line in (Path(directory) / f"{label}.status.jsonl").open()
+            ]
+
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            mock.patch.multiple(
+                clients,
+                served_model=lambda port: "m",
+                wait_idle=lambda port, settle: next(statuses),
+                Stream=FakeStream,
+            ),
+        ):
+            clients.run_serve1(1, directory, "ok", samples=2, sizes=(300,))
+            self.assertEqual(sampled(directory, "ok"), [0, 1, 2])
+            with self.assertRaisesRegex(clients.RequestFailed, "serve1 2048: 500"):
+                clients.run_serve1(1, directory, "bad", samples=1, sizes=(300, 2048))
+            self.assertEqual(sampled(directory, "bad"), [3, 4])
+
 
 class LegacyNumberTests(unittest.TestCase):
     """analyze reproduces bin/cmp.py and pertag.py on recorded M6 runs
@@ -387,6 +420,179 @@ class GateTests(unittest.TestCase):
             [(v["rule"], v["verdict"]) for v in verdicts],
             [("G4 G8 G9 restarted", stats.FAIL)],
         )
+
+    def run_meta(self, label, **fields):
+        model = self.spec["models"]["fn-q2"]["model"]
+        (self.directory / f"{label}.meta.json").write_text(
+            json.dumps({"label": label, "model": model, "complete": True, **fields})
+        )
+
+    def test_only_the_servers_own_failures_fail_g8(self):
+        # s-fn-churn-18g on the final day: a stale server still answers on
+        # the port, and run.py refuses the run. An M5 run is voided because
+        # the laptop's owner was on a call, and its loop shows a 5.2 s tick.
+        # Both are listed, to be repeated, and fail nothing. A run whose
+        # server exited during the scenario fails G8.
+        cell = {"name": "c", "machine": "m6", "model": "fn-q2", "scenario": "churn"}
+        done = [
+            {"tag": f"w{w}-r1", "start": 0, "t": 100, "ttft": 5, "decode_tps": 30}
+            for w in range(3)
+        ]
+        refusal = "port 8611 already answers: a stale server would serve this run"
+        (self.directory / "refused.out").write_text(f"FAIL {refusal}\n")
+        self.run_meta("refused", complete=False, failure="port", error=refusal)
+        churn_run(
+            self.directory,
+            "called",
+            done,
+            [status(0), status(960, loop__max_tick_ms=5200)],
+        )
+        self.run_meta("called")
+        write_jsonl(
+            self.directory / "called.idle.jsonl", [{"hid_idle_s": 3.0, "holders": []}]
+        )
+        churn_run(
+            self.directory, "exited", done, [status(0), status(300)], complete=False
+        )
+        exit_error = "the server exited -9 during the scenario"
+        self.run_meta("exited", complete=False, failure="server", error=exit_error)
+        runs = [
+            matrix.Run(self.directory, label, "c", "cand", "A")
+            for label in ("refused", "called", "exited")
+        ]
+        for run_ in runs:
+            matrix.validate(run_, self.spec, cell)
+        verdicts = matrix.churn_cell(cell, self.spec, runs, {}, PRICES)
+        self.assertEqual(
+            [(v["rule"], v["verdict"]) for v in verdicts],
+            [("G4 G8 G9 exited", stats.FAIL)],
+        )
+        self.assertIn(f"G8: {exit_error}", verdicts[0]["numbers"]["failures"])
+        self.assertEqual(
+            [(r.label, r.invalid, bool(r.voided)) for r in runs],
+            [
+                ("refused", [f"the run did not end with DONE: {refusal}"], True),
+                ("called", ["the laptop was in use (HIDIdleTime 3.0 s)"], True),
+                ("exited", [f"the run did not end with DONE: {exit_error}"], False),
+            ],
+        )
+
+    def test_g8_judges_every_scenarios_candidate_runs(self):
+        # m6-fn-ttft: cand's engine crashed during its N=2 level and its
+        # supervision relaunched it; the rounds after still completed. The
+        # run is not used for G5 and fails G8, as does one with a failed
+        # round.
+        cell = {
+            "name": "t",
+            "machine": "m6",
+            "model": "fn-q2",
+            "scenario": "ttft",
+            "reference": "pass",
+            "gate_n": [2],
+            "recorded": {"pass": ["ref"]},
+            "runs": {"cand": {"-": 2}},
+        }
+
+        def level(label, n, samples, failed_round=None):
+            write_jsonl(
+                self.directory / f"{label}-n{n}.events.jsonl",
+                [{"kind": "start", "n": n, "rounds": 3}]
+                + [
+                    {
+                        "kind": "round_failed",
+                        "n": n,
+                        "round": r,
+                        "failures": ["500 engine_execution_failed"],
+                    }
+                    if r == failed_round
+                    else {
+                        "kind": "round",
+                        "n": n,
+                        "round": r,
+                        "ttft_ms": [4000] * n,
+                        "cached": [7968] * n,
+                    }
+                    for r in range(3)
+                ],
+            )
+            write_jsonl(self.directory / f"{label}-n{n}.status.jsonl", samples)
+
+        for label in ("ref", "t-cand-1", "t-cand-2"):
+            (self.directory / f"{label}.out").write_text("DONE\n")
+        level("ref", 2, [status(0), status(30)])
+        # Each level's server starts afresh at 0 restarts.
+        level(
+            "t-cand-1",
+            2,
+            [
+                status(0),
+                status(10, transport__restarts=1),
+                status(30, transport__restarts=1),
+            ],
+        )
+        level("t-cand-1", 4, [status(0), status(30)])
+        level("t-cand-2", 2, [status(0), status(30)], failed_round=1)
+        verdicts, _, unused = matrix.ttft_cell(cell, self.spec, [self.directory])
+        self.assertEqual(
+            [(v["rule"], v["verdict"]) for v in verdicts],
+            [
+                ("G5 N=2", stats.INCONCLUSIVE),
+                ("G8 t-cand-1", stats.FAIL),
+                ("G8 t-cand-2", stats.FAIL),
+            ],
+        )
+        self.assertEqual(
+            [(u["label"], u["reasons"]) for u in unused],
+            [
+                ("t-cand-1", ["the engine restarted (0 -> 1)"]),
+                ("t-cand-2", ["requests the server failed: 1"]),
+            ],
+        )
+        # p-serve1: cand's 14K request came back 500 and ended its run; its
+        # other server exited before it was ready, leaving only run.py's
+        # records. Both fail G8, and the set is not judged.
+        cell = {
+            "name": "s1",
+            "machine": "m5",
+            "model": "fn-q2",
+            "scenario": "serve1",
+            "abba": {"reference": "pass", "sets": 1},
+        }
+        for label in ("s1-pass-1", "s1-pass-2", "s1-cand-1"):
+            write_jsonl(
+                self.directory / f"{label}.events.jsonl",
+                [
+                    {
+                        "kind": "request",
+                        "size": 300,
+                        "sample": 0,
+                        "ttft_ms": 1000,
+                        "decode_ms_per_token": 20.0,
+                    }
+                ],
+            )
+            write_jsonl(
+                self.directory / f"{label}.status.jsonl", [status(0), status(10)]
+            )
+        for label in ("s1-pass-1", "s1-pass-2"):
+            (self.directory / f"{label}.out").write_text("DONE\n")
+            self.run_meta(label)
+        failed = "serve1 14336: 500 engine_execution_failed"
+        (self.directory / "s1-cand-1.out").write_text(f"FAIL {failed}\n")
+        self.run_meta("s1-cand-1", complete=False, failure="request", error=failed)
+        never = "the server exited 1 before it was ready"
+        (self.directory / "s1-cand-2.out").write_text(f"FAIL {never}\n")
+        self.run_meta("s1-cand-2", complete=False, failure="server", error=never)
+        verdicts, unused = matrix.abba_cell(cell, self.spec, [self.directory])
+        self.assertEqual(
+            [(v["rule"], v["verdict"], v["numbers"]) for v in verdicts],
+            [
+                ("G8 s1-cand-1", stats.FAIL, [f"G8: {failed}"]),
+                ("G8 s1-cand-2", stats.FAIL, [f"G8: {never}"]),
+                ("G7 set 1", stats.INCONCLUSIVE, "runs not used: s1-cand-1, s1-cand-2"),
+            ],
+        )
+        self.assertEqual([u["label"] for u in unused], ["s1-cand-1", "s1-cand-2"])
 
     def test_work_is_read_at_the_end_of_the_cells_load_window(self):
         # mini-35b-churn runs 10 minutes. pass's recorded series stopped at
@@ -676,7 +882,7 @@ class GateTests(unittest.TestCase):
         )
 
     def test_a_ttft_level_counts_only_with_every_round_complete(self):
-        # m6-fn-ttft: cand's N=2 server failed two of its three rounds; the
+        # m6-fn-ttft: cand's N=2 records hold one of its three rounds; the
         # one left is no G5 median. A run without DONE is not used at all.
         cell = {
             "name": "t",
@@ -701,9 +907,7 @@ class GateTests(unittest.TestCase):
                         "ttft_ms": [4000, 4500],
                         "cached": [7968, 7968],
                     }
-                    if r in rounds
-                    else {"kind": "round_failed", "n": n, "round": r, "failures": ["x"]}
-                    for r in range(3)
+                    for r in sorted(rounds)
                 ],
             )
             (self.directory / f"{label}.out").write_text("DONE\n" if done else "")
@@ -891,12 +1095,17 @@ class GateTests(unittest.TestCase):
         verdicts, unused = matrix.abba_cell(cell, self.spec, [self.directory])
         self.assertEqual(
             {v["rule"] for v in verdicts},
-            {"G7 serve1_300_ttft_ms set 1", "G7 serve1_300_decode_ms_per_token set 1"},
+            {
+                "G8 s1-cand-1",
+                "G8 s1-cand-2",
+                "G7 serve1_300_ttft_ms set 1",
+                "G7 serve1_300_decode_ms_per_token set 1",
+            },
         )
         self.assertTrue(all(v["verdict"] == stats.PASS for v in verdicts), verdicts)
         self.assertEqual(unused, [])
         # p-serve1 on the owner's laptop: typing during a cand run voids it,
-        # and its set is not judged.
+        # its set is not judged, and the voided run is not judged on G8.
         write_jsonl(
             self.directory / "s1-cand-2.idle.jsonl",
             [{"hid_idle_s": 300.0, "holders": []}, {"hid_idle_s": 2.5, "holders": []}],
@@ -904,7 +1113,7 @@ class GateTests(unittest.TestCase):
         verdicts, unused = matrix.abba_cell(cell, self.spec, [self.directory])
         self.assertEqual(
             [(v["rule"], v["verdict"]) for v in verdicts],
-            [("G7 set 1", stats.INCONCLUSIVE)],
+            [("G8 s1-cand-1", stats.PASS), ("G7 set 1", stats.INCONCLUSIVE)],
         )
         self.assertEqual(
             [(u["label"], u["reasons"]) for u in unused],
@@ -1118,7 +1327,7 @@ class RunTests(unittest.TestCase):
 
         class FakeServer:
             def __init__(self, tree, root, model, port, server_args, log):
-                self.process = mock.Mock(pid=4242)
+                self.process = mock.Mock(pid=4242, **{"poll.return_value": None})
 
             def wait_ready(self):
                 events.append("ready")
@@ -1182,6 +1391,94 @@ class RunTests(unittest.TestCase):
         self.assertTrue(all({4242, 4243} <= ours for ours in snapshots), snapshots)
         self.assertTrue({4242, 4243} <= set(meta["pids"]))
 
+    def test_the_servers_own_failures_are_recorded_as_such(self):
+        # A request the server failed, or a server gone by the end of the
+        # scenario, ends the run as the server's failure, which fails G8;
+        # run.py's refusals are recorded by their own kinds.
+        exited = {}
+
+        class FakeServer:
+            def __init__(self, tree, root, model, port, server_args, log):
+                self.process = mock.Mock(pid=4242, returncode=-9)
+                self.process.poll = lambda: exited.get("code")
+
+            def wait_ready(self):
+                return 1.0
+
+            def engine_pids(self):
+                return {4242}
+
+            def stop(self):
+                return "exited -9"
+
+        def recorded(label, serve1):
+            with tempfile.TemporaryDirectory() as directory:
+                tree = Path(directory)
+                (tree / "build").mkdir()
+                (tree / "build" / "splash").write_bytes(b"splash")
+                with (
+                    mock.patch.multiple(
+                        run,
+                        Server=FakeServer,
+                        ps_snapshot=lambda ours: {"at": 0.0, "rows": [], "therm": ""},
+                        port_answers=lambda port: False,
+                        tree_build_id=lambda tree: "src-1",
+                        host_memory=lambda: {},
+                        check_identity=lambda port, server, build_id: {
+                            "pid": 4242,
+                            "build_id": build_id,
+                            "thermal_state": "nominal",
+                        },
+                    ),
+                    mock.patch.object(run.clients, "run_serve1", side_effect=serve1),
+                ):
+                    code = run.main(
+                        [
+                            "--tree",
+                            directory,
+                            "--machine",
+                            "studio",
+                            "--model",
+                            "m",
+                            "--model-root",
+                            directory,
+                            "--scenario",
+                            "serve1",
+                            "--label",
+                            label,
+                            "--out",
+                            f"{directory}/out",
+                        ]
+                    )
+                meta = json.loads((tree / "out" / f"{label}.meta.json").read_text())
+            return code, meta.get("failure"), meta.get("error")
+
+        def failed_request(*args, **kwargs):
+            raise clients.RequestFailed("serve1 14336: 500 engine_execution_failed")
+
+        self.assertEqual(
+            recorded("request", failed_request),
+            (1, "request", "serve1 14336: 500 engine_execution_failed"),
+        )
+
+        def server_gone(*args, **kwargs):
+            exited["code"] = -9
+
+        self.assertEqual(
+            recorded("gone", server_gone),
+            (1, "server", "the server exited -9 during the scenario"),
+        )
+
+        def connection_refused(*args, **kwargs):
+            raise ConnectionRefusedError(61, "Connection refused")
+
+        code, failure, error = recorded("refused", connection_refused)
+        self.assertEqual((code, failure), (1, "server"))
+        self.assertTrue(error.startswith("the server exited -9 during the scenario: "))
+        exited.clear()
+        with self.assertRaises(ConnectionRefusedError):
+            recorded("alive", connection_refused)
+
     def test_gpu_utilization_reads_ioreg(self):
         line = (
             '  | "PerformanceStatistics" = {"In use system memory"=1,'
@@ -1219,6 +1516,8 @@ class RunTests(unittest.TestCase):
                 self.assertIn(
                     "already answers", (Path(directory) / "busy.out").read_text()
                 )
+                meta = json.loads((Path(directory) / "busy.meta.json").read_text())
+                self.assertEqual((meta["complete"], meta["failure"]), (False, "port"))
         self.assertFalse(run.port_answers(port))
 
 

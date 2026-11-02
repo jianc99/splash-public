@@ -15,6 +15,8 @@ OpenAI API but different /status documents):
   time to first token and decode milliseconds per token.
 - warm: a cached long prefix per depth, then short suffixes after it: the
   server's prompt time of each (the prefill-splits measurement's protocol).
+  serve1 and warm record the /status each request waited idle for, and the
+  one after the last.
 
 Every request timestamps each content chunk of its stream, so a request's
 gaps, the intervals between consecutive chunks after its first, are measured
@@ -40,6 +42,11 @@ HEADERS = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/js
 LONG_GAP_SECONDS = 1.0
 # Log2 buckets of gap milliseconds: [0, 2), [2, 4), ..., [2^20, inf).
 GAP_BUCKETS = 21
+
+
+class RequestFailed(RuntimeError):
+    """A request the server answered with an error, or without a token,
+    that ends a scenario (the server's own failure, amend/V.md §5 G8)."""
 
 
 def dig(document, path: str):
@@ -591,7 +598,7 @@ def run_ttft(
             warm, slot = ttft_conversation(text, n, c)
             stream = Stream(port, ttft_body(model, warm, 1))
             if stream.status != 200:
-                raise RuntimeError(f"warm-up {c}: {stream.status} {stream.error_body}")
+                raise RequestFailed(f"warm-up {c}: {stream.status} {stream.error_body}")
             recorder.emit(
                 "warmup", n=n, conv=c, **ttft_request_record(stream, recorder)
             )
@@ -710,13 +717,15 @@ def run_serve1(
     sizes=SERVE1_SIZES,
 ) -> None:
     """Each size's cold prompt `samples` times, one request at a time on an
-    idle server: time to first token and decode milliseconds per token."""
+    idle server: time to first token and decode milliseconds per token. The
+    /status each request waited idle for, and the one after the last, are
+    the run's samples."""
     model = served_model(port)
     recorder = Recorder(directory, label)
     try:
         for sample in range(samples):
             for size in sizes:
-                wait_idle(port, settle)
+                recorder.sample(wait_idle(port, settle))
                 body = json.dumps(
                     {
                         "model": model,
@@ -730,7 +739,7 @@ def run_serve1(
                 )
                 stream = Stream(port, body)
                 if stream.status != 200 or not stream.chunks:
-                    raise RuntimeError(
+                    raise RequestFailed(
                         f"serve1 {size}: {stream.status} {stream.error_body}"
                     )
                 out = stream.usage.get("completion_tokens") or 0
@@ -749,6 +758,7 @@ def run_serve1(
                     cached=dig(stream.usage, "prompt_tokens_details.cached_tokens"),
                     out=out,
                 )
+        recorder.sample(wait_idle(port, 0))
         recorder.emit("end")
     finally:
         recorder.close()
@@ -792,23 +802,26 @@ def run_warm(
     port: int, directory: str, label: str, depths, trial: int, settle: float = 2.0
 ) -> None:
     """The warm-suffix trial `trial` at each cached depth: the same texts for
-    every tree, so trees compare trial by trial."""
+    every tree, so trees compare trial by trial. The /status each request
+    waited idle for, and the one after the last, are the run's samples."""
     model = served_model(port)
     recorder = Recorder(directory, label)
     try:
         for depth in depths:
             prefix = warm_prefix(depth, trial)
-            wait_idle(port, settle)
+            recorder.sample(wait_idle(port, settle))
             cached = Stream(port, ttft_body(model, prefix, 1))
             if cached.status != 200:
-                raise RuntimeError(f"warm {depth}: {cached.status} {cached.error_body}")
+                raise RequestFailed(
+                    f"warm {depth}: {cached.status} {cached.error_body}"
+                )
             for index in range(WARM_DISCARDED + WARM_SUFFIXES):
-                wait_idle(port, settle)
+                recorder.sample(wait_idle(port, settle))
                 stream = Stream(
                     port, ttft_body(model, warm_suffix(prefix, depth, trial, index), 1)
                 )
                 if stream.status != 200:
-                    raise RuntimeError(
+                    raise RequestFailed(
                         f"warm {depth} suffix {index}: {stream.status} {stream.error_body}"
                     )
                 recorder.emit(
@@ -823,6 +836,7 @@ def run_warm(
                     prompt=stream.usage.get("prompt_tokens"),
                     cached=dig(stream.usage, "prompt_tokens_details.cached_tokens"),
                 )
+        recorder.sample(wait_idle(port, 0))
         recorder.emit("end")
     finally:
         recorder.close()
