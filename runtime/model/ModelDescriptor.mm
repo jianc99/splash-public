@@ -846,8 +846,8 @@ GgufMetadata readGgufMetadata(const std::filesystem::path &path) {
 // block indexer): a verify row attends its top blocks, and a row whose
 // history holds no more than those attends it all, through its page table.
 // None for a target whose rows attend every token.
-std::optional<SparseKvShape> sparseKvShape(const QwenTargetDimensions &layout) {
-  if (!layout.hasIndexer()) return std::nullopt;
+std::optional<SparseKvShape> sparseKvShape(const QwenHybridLayout &layout) {
+  if (layout.kvLayout().reads != kv::Reads::SelectedBlocks) return std::nullopt;
   return SparseKvShape{.blockTokens = layout.indexerBlockTokens,
                        .selectedBlocks = layout.indexerTopBlocks,
                        .verifyRows = ExecutionLimits::targetVerifyRows,

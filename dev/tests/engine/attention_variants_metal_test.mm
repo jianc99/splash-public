@@ -44,7 +44,7 @@ using test::ulpBf16;
 
 constexpr uint32_t kQueryHeads = 32, kKvHeads = 4, kGroup = kQueryHeads / kKvHeads, kHeadDimension = 128;
 // The geometry among the families' (TestFamilies.hpp): Flint's.
-constexpr test::AttentionGeometry kGeometry{kQueryHeads, kKvHeads, kHeadDimension, false};
+constexpr test::AttentionGeometry kGeometry{kQueryHeads, kKvHeads, kHeadDimension, kv::Reads::EveryPage};
 constexpr uint32_t kWindow = 512, kRotaryPairs = kHeadDimension / 2;
 constexpr uint32_t kPageTokens = kv::kPageTokens;
 // The attention layer under test is the second of a pool's two, so its region

@@ -68,6 +68,30 @@ void attention() {
   }
 }
 
+// The attention kernels follow how a layout reads its pages, not its value
+// order: Qwen3.8-Flash-Next's geometry read page by page has no kernel (its
+// sparse kernels read selected blocks), and a reader of selected blocks takes
+// token-major values, the only order whose blocks are contiguous.
+void attentionReads() {
+  using namespace splash;
+  const kv::Layout selected{.attentionLayers = 1, .kvHeads = 2, .headDimension = 256,
+                            .valuesTokenMajor = true, .reads = kv::Reads::SelectedBlocks};
+  const std::array<uint32_t, 1> history{4096};
+  require(ops::PagedAttention::prefillPlan(64, 4096, 24, selected).sparse &&
+              ops::PagedAttention::verifyPlan(1, 24, selected, history).sparse,
+          "a reader of selected blocks did not plan the sparse kernels");
+  kv::Layout everyPage = selected;
+  everyPage.reads = kv::Reads::EveryPage;
+  require(everyPage.valid(), "a page loop over token-major values is not a layout");
+  rejects([&] { (void)ops::PagedAttention::prefillPlan(64, 4096, 24, everyPage); },
+          "no paged-attention kernel for layout", "the page loop planned the sparse kernels of token-major values");
+  rejects([&] { (void)ops::PagedAttention::verifyPlan(1, 24, everyPage, history); },
+          "no paged-attention kernel for layout", "the page loop planned the sparse kernels of token-major values");
+  kv::Layout dimensionMajor = selected;
+  dimensionMajor.valuesTokenMajor = false;
+  require(!dimensionMajor.valid(), "a reader of selected blocks took dimension-major values");
+}
+
 // Expert ids, route rows and grouped routes are uint32, routing weights fp32
 // and activations bf16; a row routes its top k and each shared slice, which
 // fills one tile per tileRows rows. The grouped input first holds the
@@ -195,6 +219,7 @@ void sampling() {
 int main() {
   try {
     attention();
+    attentionReads();
     moe();
     sampling();
     std::cout << "operator workspace: PASS\n";

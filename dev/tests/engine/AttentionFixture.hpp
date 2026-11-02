@@ -30,6 +30,8 @@ namespace splash::test {
 // The target attention layer a fixture holds: its query and KV heads and
 // their width, its cache format, its value order (kv::Layout::
 // valuesTokenMajor) and its variant of the geometry (a window, RoPE).
+// Token-major values are the sparse attention's, which reads selected blocks
+// (kv::valuesTokenMajorFor).
 struct AttentionShape final {
   uint32_t queryHeads = 0;
   uint32_t kvHeads = 0;
@@ -38,6 +40,15 @@ struct AttentionShape final {
   bool valuesTokenMajor = false;
   ops::AttentionVariant variant{};
 };
+// The pages of `layers` attention layers of a shape.
+[[nodiscard]] inline kv::Layout attentionLayout(const AttentionShape &shape, uint32_t layers = 1) noexcept {
+  return {.attentionLayers = layers,
+          .kvHeads = shape.kvHeads,
+          .headDimension = shape.headDimension,
+          .format = shape.format,
+          .valuesTokenMajor = shape.valuesTokenMajor,
+          .reads = shape.valuesTokenMajor ? kv::Reads::SelectedBlocks : kv::Reads::EveryPage};
+}
 
 // Where a fixture's attention layer sits: layer `layer` of a pool of
 // poolLayers attention layers, in extents of extentPages pages.
@@ -174,13 +185,7 @@ struct AttentionFixturePlan final {
   }
 
 private:
-  [[nodiscard]] kv::Layout layoutOf(uint32_t layers) const noexcept {
-    return {.attentionLayers = layers,
-            .kvHeads = shape.kvHeads,
-            .headDimension = shape.headDimension,
-            .format = shape.format,
-            .valuesTokenMajor = shape.valuesTokenMajor};
-  }
+  [[nodiscard]] kv::Layout layoutOf(uint32_t layers) const noexcept { return attentionLayout(shape, layers); }
   void size(Tensor tensor, uint64_t value) noexcept {
     sizes[static_cast<size_t>(tensor)] = value;
   }

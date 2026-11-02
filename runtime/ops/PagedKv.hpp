@@ -154,8 +154,12 @@ namespace detail {
 
 // How an attention reads a layout's pages: every page of its rows' history
 // (the dense page loop), or the blocks a block index selects, gathering
-// blocks of tokens (ops::AttentionBlocks).
+// blocks of tokens (ops::AttentionBlocks). It picks the attention kernels.
 enum class Reads : uint8_t { EveryPage, SelectedBlocks };
+// The value order a reader takes: a gather of blocks of tokens finds them
+// contiguous only token-major; the dense page loop's PV runs faster on
+// dimension-major values.
+[[nodiscard]] constexpr bool valuesTokenMajorFor(Reads reads) noexcept { return reads == Reads::SelectedBlocks; }
 
 // Physical KV geometry: Page32, either BF16 or per-(token, head) symmetric INT8.
 // Layer and head counts vary by target.
@@ -171,11 +175,8 @@ struct Layout final {
   // page: whoever owns the sequence keeps the keys of its open block.
   uint32_t indexDimension = 0;
   // Whether a page holds each head's values token-major like its keys
-  // ([token][dimension]) rather than dimension-major ([dimension][token]).
-  // The page loop of dense attention reads whole pages, and its PV runs
-  // faster on dimension-major values; a sparse attention
-  // (ops::AttentionBlocks) gathers blocks of tokens, whose values are
-  // contiguous only token-major.
+  // ([token][dimension]) rather than dimension-major ([dimension][token]):
+  // the storage order, which a reader requires (valuesTokenMajorFor).
   bool valuesTokenMajor = false;
   // A sliding window: a row at position p of a windowed layer reads the keys
   // of positions p - windowTokens to p alone, the other layers' every key up
@@ -186,10 +187,12 @@ struct Layout final {
   // How an attention reads the pages.
   Reads reads = Reads::EveryPage;
 
+  // A block-selecting reader gathers token-major values.
   [[nodiscard]] constexpr bool valid() const noexcept {
     return attentionLayers && kvHeads && headDimension && validFormat(format) &&
            !windowTokens == !windowedLayers &&
-           (attentionLayers >= 64 || !(windowedLayers >> attentionLayers));
+           (attentionLayers >= 64 || !(windowedLayers >> attentionLayers)) &&
+           (reads != Reads::SelectedBlocks || valuesTokenMajor);
   }
   [[nodiscard]] constexpr bool windowed(uint32_t layer) const noexcept {
     return layer < 64 && (windowedLayers >> layer & 1);

@@ -196,8 +196,7 @@ std::vector<uint32_t> qsaBitmaps(const AttentionFixturePlan &plan, const std::st
 // lanes, all after `history` tokens, with their plan's scratch.
 AttentionFixturePlan casePlan(AttentionShape shape, bool prefill, uint32_t lanes,
                               uint32_t history, uint32_t extentPages, uint32_t rows) {
-  const kv::Layout layout{.attentionLayers = 1, .kvHeads = shape.kvHeads, .headDimension = shape.headDimension,
-                          .format = shape.format, .valuesTokenMajor = shape.valuesTokenMajor};
+  const kv::Layout layout = test::attentionLayout(shape);
   const uint32_t caseLanes = prefill ? 1 : lanes;
   AttentionFixturePlan::Histories histories{};
   std::fill_n(histories.begin(), caseLanes, history);

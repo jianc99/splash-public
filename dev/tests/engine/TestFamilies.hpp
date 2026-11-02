@@ -32,25 +32,25 @@ template <class Family> [[nodiscard]] ops::GdnShape gdnShape(const Family &famil
   return shapes;
 }
 
-// A family's full attention: its query heads over the KV heads, head
-// dimension and value order of its pages.
+// A family's full attention: its query heads over the KV heads and head
+// dimension of its pages, and how it reads them.
 struct AttentionGeometry final {
   uint32_t queryHeads;
   uint32_t kvHeads;
   uint32_t headDimension;
-  bool valuesTokenMajor;
+  kv::Reads reads;
 
-  // Its pages of one attention layer in `format`.
+  // Its pages of one attention layer in `format`, in its reader's value order.
   [[nodiscard]] kv::Layout layout(kv::Format format) const {
     return {.attentionLayers = 1, .kvHeads = kvHeads, .headDimension = headDimension, .format = format,
-            .valuesTokenMajor = valuesTokenMajor};
+            .valuesTokenMajor = kv::valuesTokenMajorFor(reads), .reads = reads};
   }
   bool operator==(const AttentionGeometry &) const = default;
 };
 // A family's attention geometry.
 template <class Family> [[nodiscard]] AttentionGeometry attentionGeometry(const Family &family) {
   const kv::Layout layout = family.kvLayout();
-  return {family.attentionQueryHeads, layout.kvHeads, layout.headDimension, layout.valuesTokenMajor};
+  return {family.attentionQueryHeads, layout.kvHeads, layout.headDimension, layout.reads};
 }
 // Each family's full attention of 256-wide heads, the paged and sparse
 // attention tests' (q8_flash_attention_metal_test, paged_attention_plan_test).

@@ -52,10 +52,14 @@ using splash::test::require;
 using Geometry = splash::test::AttentionGeometry;
 const std::vector<Geometry> kGeometries = splash::test::familyAttentionGeometries();
 
+// Whether a layout's attention reads the blocks its index selects (the
+// sparse kernels).
+bool selectsBlocks(kv::Layout layout) { return layout.reads == kv::Reads::SelectedBlocks; }
+
 // The parts of a layout's tiles, each a threadgroup of the split grid's x
 // beside its KV head.
 uint32_t tileParts(uint32_t queryHeads, kv::Layout layout) {
-  return layout.valuesTokenMajor ? 1 : SPLASH_ATTENTION_TILE_PARTS(queryHeads / layout.kvHeads);
+  return selectsBlocks(layout) ? 1 : SPLASH_ATTENTION_TILE_PARTS(queryHeads / layout.kvHeads);
 }
 
 // A prefill tile's history splits (PagedAttention.cpp prefillSplits): one
@@ -71,7 +75,7 @@ uint32_t prefillSplits(uint32_t rows, uint32_t history, bool sparse) {
 
 // A layout's split or reduce pipeline of a phase ("prefill" or "verify").
 std::string pipelineName(std::string_view phase, bool split, uint32_t queryHeads, kv::Layout layout) {
-  const bool sparse = layout.valuesTokenMajor;
+  const bool sparse = selectsBlocks(layout);
   // The kernels of four KV heads, the first compiled, have no suffix.
   const std::string suffix = layout.kvHeads == 4 ? "" : "_kv" + std::to_string(layout.kvHeads) + "_g" +
                                                             std::to_string(queryHeads / layout.kvHeads);
@@ -143,13 +147,13 @@ void checkPlans(uint32_t queryHeads, kv::Layout layout) {
         std::array{64U, 65536U, 32U}, std::array{256U, 131072U, 8U}, std::array{512U, 65536U, 4U},
         std::array{300U, 65536U, 6U}, std::array{2048U, 131072U, 1U}})
     require(ops::PagedAttention::prefillPlan(rows, history, queryHeads, layout).splits ==
-                (layout.valuesTokenMajor ? std::clamp(32U / ((rows + 7) / 8), 1U, 32U) : splits),
+                (selectsBlocks(layout) ? std::clamp(32U / ((rows + 7) / 8), 1U, 32U) : splits),
             "prefill split count does not follow its rows and history");
   for (uint32_t rows = 1; rows <= 2048; ++rows)
     for (const uint32_t history : {0U, 4000U, 8192U, 32768U, 131072U, 1'000'000U}) {
       const auto plan = ops::PagedAttention::prefillPlan(rows, history, queryHeads, layout);
       const uint32_t tiles = (rows + 7) / 8;
-      const uint32_t splits = prefillSplits(rows, history, layout.valuesTokenMajor);
+      const uint32_t splits = prefillSplits(rows, history, selectsBlocks(layout));
       require(plan.rows == rows && plan.splits == splits, "prefill plan lost actual rows");
       require(plan.splitPipeline == prefillSplit && plan.reducePipeline == prefillReduce,
               "prefill plan runs the wrong pipelines");
@@ -188,7 +192,7 @@ void checkPlans(uint32_t queryHeads, kv::Layout layout) {
         uint64_t{lanes} * 8 * kv::kVerifyMaximumSplits * queryHeads;
     // The sparse split's grid is one-dimensional, KV head and then split;
     // the page loop's is two-dimensional.
-    const bool sparse = layout.valuesTokenMajor;
+    const bool sparse = selectsBlocks(layout);
     require(plan.splits == maximum &&
                 plan.workspace.partialsBytes == fused * 256 * 4 &&
                 plan.workspace.statisticsBytes == fused * 2 * 4 &&
@@ -230,7 +234,7 @@ void checkPlans(uint32_t queryHeads, kv::Layout layout) {
       "verify attention history exceeds physical context",
       "verify rows past the physical context were accepted");
   rejects([&] { (void)ops::PagedAttention::verifyPlan(1, queryHeads + 1, layout, zeroHistory); },
-          layout.valuesTokenMajor ? "no sparse attention kernel for layout" : "no paged-attention kernel for layout",
+          selectsBlocks(layout) ? "no sparse attention kernel for layout" : "no paged-attention kernel for layout",
           "a query head count without a kernel was accepted");
 }
 
@@ -1201,6 +1205,7 @@ void attentionBlocks(metal::MetalBackend &backend) {
   const kv::Layout dense{1, 2, 256, kv::Format::Int8};
   kv::Layout tokenMajor = dense;
   tokenMajor.valuesTokenMajor = true;
+  tokenMajor.reads = kv::Reads::SelectedBlocks;
   const std::array<uint32_t, lanes> histories{100, 2000, 0};
   rejects([&] { (void)ops::PagedAttention::prefillPlan(tokens, 100, 24, dense); },
           "no paged-attention kernel for layout", "the sparse kernels took dimension-major values");
@@ -1592,7 +1597,7 @@ int main(int argc, char **argv) {
         checkVerify(backend, heads, layout, 1023, lanes);
       }
       checkVerify(backend, heads, layout, 16384, 2);
-      if (layout.valuesTokenMajor) {
+      if (selectsBlocks(layout)) {
         // The sparse kernels through the block lists of QSA masks: a chunk
         // whose last tile holds fewer rows, and verify lanes of their own
         // histories.
@@ -1607,7 +1612,7 @@ int main(int argc, char **argv) {
       }
       for (const auto [history, rows] : std::array<std::array<uint32_t, 2>, 2>{{{6145, 77}, {4096, 130}}}) {
         checkStagedPrefill(backend, heads, layout, history, rows, false);
-        if (layout.valuesTokenMajor) checkStagedPrefill(backend, heads, layout, history, rows, true);
+        if (selectsBlocks(layout)) checkStagedPrefill(backend, heads, layout, history, rows, true);
       }
     }
     std::cout << "paged attention plans: PASS\n";

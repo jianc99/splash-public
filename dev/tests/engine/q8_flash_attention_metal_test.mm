@@ -40,10 +40,10 @@ static_assert(kStride == SPLASH_VERIFY_CHUNK_STRIDE);
 struct Shape {
   uint32_t kvHeads;
   uint32_t queryHeadsPerKvHead;
-  bool tokenMajor;
+  splash::kv::Reads reads;
   uint32_t queryHeads() const { return kvHeads * queryHeadsPerKvHead; }
   uint32_t fusedRows() const { return kRows * queryHeadsPerKvHead; }
-  bool sparse() const { return tokenMajor; }
+  bool sparse() const { return reads == splash::kv::Reads::SelectedBlocks; }
   uint32_t parts() const { return sparse() ? 1 : SPLASH_ATTENTION_TILE_PARTS(queryHeadsPerKvHead); }
   // The partial of a fused row of the tile of KV head `head` from split
   // `split` of `slotSplits`: [KV head][part][split][part's fused row].
@@ -53,7 +53,7 @@ struct Shape {
   }
   Layout layout() const {
     return {.attentionLayers = 1, .kvHeads = kvHeads, .headDimension = kHeadDimension,
-            .valuesTokenMajor = sparse()};
+            .valuesTokenMajor = splash::kv::valuesTokenMajorFor(reads), .reads = reads};
   }
   // A phase's ("verify" or "prefill") split and reduce entries, as its plans
   // name them.
@@ -76,7 +76,7 @@ private:
 const std::vector<Shape> kShapes = [] {
   std::vector<Shape> shapes;
   for (const splash::test::AttentionGeometry &geometry : splash::test::familyAttentionGeometries())
-    shapes.push_back({geometry.kvHeads, geometry.queryHeads / geometry.kvHeads, geometry.valuesTokenMajor});
+    shapes.push_back({geometry.kvHeads, geometry.queryHeads / geometry.kvHeads, geometry.reads});
   return shapes;
 }();
 

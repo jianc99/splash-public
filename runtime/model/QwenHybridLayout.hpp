@@ -195,17 +195,19 @@ struct QwenHybridLayout : QwenTargetDimensions {
   std::string_view family;
 
   // The KV pages, which also hold a QSA indexer's pooled keys; a QSA target's
-  // sparse attention gathers blocks of tokens, so its values are token-major.
-  // A sliding layer reads the slidingWindow - 1 keys before its row's.
+  // attention reads the blocks its indexer selects, in the value order that
+  // reader takes. A sliding layer reads the slidingWindow - 1 keys before its
+  // row's.
   [[nodiscard]] constexpr kv::Layout kvLayout() const noexcept {
+    const kv::Reads reads = hasIndexer() ? kv::Reads::SelectedBlocks : kv::Reads::EveryPage;
     return {.attentionLayers = attentionLayerCount(),
             .kvHeads = attentionKvHeads,
             .headDimension = attentionHeadDimension,
             .indexDimension = indexerHeadDimension,
-            .valuesTokenMajor = hasIndexer(),
+            .valuesTokenMajor = kv::valuesTokenMajorFor(reads),
             .windowTokens = slidingWindow ? slidingWindow - 1 : 0,
             .windowedLayers = slidingLayers,
-            .reads = hasIndexer() ? kv::Reads::SelectedBlocks : kv::Reads::EveryPage};
+            .reads = reads};
   }
   // The GDN layers' state and, after it in a cell, a PLE convolution's
   // history and the QSA indexer's pending keys.
