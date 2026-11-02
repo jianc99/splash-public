@@ -203,7 +203,7 @@ public:
         resources_(pool_, nullptr, nullptr),
         executor_(throwingStep),
         loop_(
-            loopConfig(), metal::kResidencyKeepAliveSeconds, resources_, executor_,
+            loopConfig(), resources_, executor_,
             [this, failReadyWrite](std::span<const uint8_t> bytes) {
               if (failReadyWrite) {
                 throw std::runtime_error("injected output failure");
@@ -221,10 +221,10 @@ public:
 
 private:
   engine::NativeLoopConfig loopConfig() {
-    return {.engine = test::engineConfig({.maxContext = 1024}),
-            .metrics = &metrics_,
-            .weights = &weights_,
-            .weightAdmission = test::admitAll};
+    return {.engine = test::engineConfig(
+                {.maxContext = 1024,
+                 .weights = engine::WeightResidencyConfig{.weights = &weights_, .admit = test::admitAll}}),
+            .metrics = &metrics_};
   }
 
   test::TestKvStorage backing_;

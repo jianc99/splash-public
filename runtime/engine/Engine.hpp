@@ -79,8 +79,8 @@ struct EngineConfig final {
   // plan; none unless the target can spill.
   EngineSpillConfig spill;
   // The weights the engine releases while idle and restores before it runs
-  // the next request (WeightResidency). Nothing reads it: the native loop
-  // releases and restores them (NativeRuntime).
+  // the next request (WeightResidency): the native loop's; empty where
+  // nothing is released.
   std::optional<WeightResidencyConfig> weights;
 };
 
@@ -263,6 +263,16 @@ public:
   void provideMask(uint64_t requestId, std::span<const uint32_t> words);
   void setCompletionNotifier(std::function<void()> notifier);
 
+  // While the weights are released or being restored (weightsHeld), a tick
+  // runs its timed checks, collects transfers and runs write-behind, then
+  // takes back one part of the weights while a request waits, under the
+  // admission of memory a request in service needs (Serving), as an
+  // admission retry: once its requests' retries are due. A part that comes
+  // back restarts their resource wait limit; a refused one makes them wait
+  // for memory (resourceWaitSnapshot), each failing at its own limit as a
+  // start refused memory does. Once no request waits, the restore goes on
+  // while memory admits it without the mark, and a refused part ends it: the
+  // weights give back what came back. No request runs until they are back.
   [[nodiscard]] bool tick(double nowMilliseconds);
   [[nodiscard]] bool commandInFlight() const noexcept {
     return pending_.has_value();
@@ -344,6 +354,18 @@ public:
   // stays. Runs only between commands: throws std::logic_error while a
   // command is in flight.
   [[nodiscard]] uint64_t reclaimForExperts(uint64_t bytes);
+  // Releases the weights (EngineConfig::weights) while the engine is idle
+  // and they are held: once the idle release has passed without a request
+  // (releaseIdleWeights), or at once (releaseWeights). True when it did.
+  [[nodiscard]] bool releaseIdleWeights(double nowMilliseconds);
+  [[nodiscard]] bool releaseWeights(double nowMilliseconds);
+  // At Ready: the idle release counts from here, not from warmup.
+  void startIdleClock(double nowMilliseconds);
+  // Restoring from the arrival of a request that found them released.
+  [[nodiscard]] WeightsSnapshot weightsSnapshot() const;
+  // Neither released nor being restored; true for an engine with no weights
+  // to release.
+  [[nodiscard]] bool weightsHeld() const noexcept { return !weights_ || weights_->held(); }
   // The bytes growExperts takes next (Model::expertGrowthBytes).
   [[nodiscard]] uint64_t expertGrowthBytes() const { return model_.expertGrowthBytes(); }
   // The reclaim steps that gave chunks of the expert store back, which the
@@ -1103,9 +1125,14 @@ private:
   // suspension (suspendForGrowth), which starts the recovery drain instead.
   void vacateLane(Request &request, bool keepContinuation);
   void release(Request &request);
-  void sweepTerminal();
+  // Removes the finalized requests; the idle period begins once none is left.
+  void sweepTerminal(double nowMilliseconds);
+  // Takes back the next part of the weights for the requests waiting, or
+  // ends a restore no request waits for (tick); true when it progressed.
+  [[nodiscard]] bool advanceWeights(double nowMilliseconds);
 
   EngineConfig config_;
+  std::optional<WeightResidency> weights_;
   Cache &cache_;
   WriteBehind writeBehind_;
   model::Model &model_;

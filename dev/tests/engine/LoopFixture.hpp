@@ -93,8 +93,9 @@ struct LoopOptions final {
 
 // A native loop over the fake model, collecting the bytes it writes. Its
 // config is completed with the engine's (test::engineConfig), and the
-// fixture's metrics and weights, each weight allocation admitted
-// (test::admitAll, or the governor's with memory), where the test gave none; the weights' idle release is production's unless the
+// fixture's metrics and weights (EngineConfig::weights), each weight
+// allocation admitted (test::admitAll, or the governor's with memory), where
+// the test gave none; the weights' idle release is production's unless the
 // test gives one. Its unix clock stands still and its awake clock reads
 // `monotonic`, advanced by `clockStep` on every read, or with timing by
 // run().
@@ -109,7 +110,7 @@ struct LoopFixture {
         pool(memory ? storage.through(*memory, governor->allocationAdmission()) : storage, shape.runwayPages),
         cache(pool, nullptr, nullptr),
         loop(
-            clocked(std::move(config)), idleReleaseSeconds, cache, executor,
+            clocked(std::move(config), idleReleaseSeconds), cache, executor,
             [this](std::span<const uint8_t> bytes) {
               if (writeFailure)
                 throw *writeFailure;
@@ -137,19 +138,20 @@ struct LoopFixture {
     return protocol::peer::decodeEvents(output);
   }
 
-  engine::NativeLoopConfig clocked(engine::NativeLoopConfig config) {
-    if (governor) {
+  engine::NativeLoopConfig clocked(engine::NativeLoopConfig config, double idleReleaseSeconds) {
+    if (governor)
       engine::connectToGovernor(config.engine, *governor);
-      if (!config.weightAdmission)
-        config.weightAdmission = governor->allocationAdmission();
-    }
     config.engine = test::engineConfig(std::move(config.engine));
     if (!config.metrics)
       config.metrics = &metrics;
-    if (!config.weights)
-      config.weights = &weights;
-    if (!config.weightAdmission)
-      config.weightAdmission = test::admitAll;
+    if (!config.engine.weights)
+      config.engine.weights.emplace();
+    engine::WeightResidencyConfig &residency = *config.engine.weights;
+    if (!residency.weights)
+      residency.weights = &weights;
+    if (!residency.admit)
+      residency.admit = governor ? governor->allocationAdmission() : test::admitAll;
+    residency.idleReleaseMilliseconds = 1000.0 * idleReleaseSeconds;
     config.unixMicros = [] { return uint64_t{1'000'000}; };
     if (options && options->timing)
       config.monotonicMilliseconds = [this] { return monotonic; };

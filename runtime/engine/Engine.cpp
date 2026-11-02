@@ -1,6 +1,7 @@
 #include "engine/Engine.hpp"
 #include "AwakeClock.hpp"
 #include "engine/EngineAllocate.hpp"
+#include "engine/Status.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -53,6 +54,8 @@ Engine::Engine(EngineConfig config, Cache &cache, model::Model &model,
   if (config_.spill.capable &&
       (!config_.spill.geometry.fullPageBytes || !config_.spill.geometry.slotBytes))
     throw std::invalid_argument("a target that can spill needs its page and slot sizes");
+  if (config_.weights)
+    weights_.emplace(*config_.weights);
 }
 
 void Engine::submit(EngineRequest value) {
@@ -222,13 +225,16 @@ bool Engine::tick(double now) {
                       active.resourceWait.diskQuota
                           ? std::string(kDiskQuotaTimeoutMessage)
                           : resourceTimeoutMessage(active.resourceWait.allocationFailure)});
+      // Every request waits for the weights while they are not held.
+      if (!weightsHeld())
+        weights_->waiterFailed();
       progressed = true;
     }
   }
   // The requests the checks above ended leave the engine and the scheduler
   // now, even while a command is in flight.
   if (progressed)
-    sweepTerminal();
+    sweepTerminal(now);
   if (pending_) {
     // A mask response, cancellation, or deadline can make the commit tail
     // runnable without another Metal completion wake.
@@ -245,17 +251,26 @@ bool Engine::tick(double now) {
     std::vector<ModelStepResult> results = command.ticket->wait();
     apply(command, results, now - command.startedMilliseconds, now);
     busySinceMilliseconds_ = now;
-    sweepTerminal();
+    sweepTerminal(now);
     return true;
   }
 
+  // No request runs until the weights are back: a tick takes back a part,
+  // so that frames are answered between them.
+  if (!weightsHeld()) {
+    progressed = advanceWeights(now) || progressed;
+    if (!weightsHeld()) {
+      sweepTerminal(now);
+      return progressed;
+    }
+  }
   // Pages whose copies landed leave memory before admission judges it.
   spillLanded();
   // The tick's host time runs from here, its first planning call, to the
   // submission of the command it plans (tickHostMilliseconds).
   const AwakeClock::time_point planning = AwakeClock::now();
   progressed = admitQueued(now) || progressed;
-  sweepTerminal();
+  sweepTerminal(now);
   // A prefill lane that reads its history from the SSD cache runs alone in
   // its commands (streamsHistory). One whose history spills, or that holds
   // another request's spilled blocks, runs prefill groups, which read that
@@ -340,7 +355,7 @@ bool Engine::tick(double now) {
       return true;
     }
     case Prepared::Yielded:
-      sweepTerminal();
+      sweepTerminal(now);
       return true;
     case Prepared::Waiting:
       for (const BatchItem &item : plan->items)
@@ -1863,7 +1878,8 @@ void Engine::release(Request &active) {
   active.replayPoint.reset();
 }
 
-void Engine::sweepTerminal() {
+void Engine::sweepTerminal(double now) {
+  bool swept = false;
   for (auto iterator = requests_.begin(); iterator != requests_.end();) {
     const uint64_t id = iterator->first;
     Request &active = iterator->second;
@@ -1873,7 +1889,76 @@ void Engine::sweepTerminal() {
     }
     scheduler_.remove(id);
     iterator = requests_.erase(iterator);
+    swept = true;
   }
+  if (weights_ && swept && requests_.empty())
+    weights_->idleFrom(now);
+}
+
+bool Engine::releaseIdleWeights(double now) {
+  return weights_.value().release(now, idle(), true);
+}
+
+bool Engine::releaseWeights(double now) {
+  return weights_.value().release(now, idle(), false);
+}
+
+void Engine::startIdleClock(double now) { weights_.value().idleFrom(now); }
+
+WeightsSnapshot Engine::weightsSnapshot() const {
+  WeightsSnapshot snapshot = weights_.value().snapshot();
+  // A request that finds them released restores them: from its arrival.
+  snapshot.restoring = snapshot.restoring ||
+                       (snapshot.released && std::ranges::any_of(requests_, [](const auto &entry) {
+                          return !entry.second.finalized;
+                        }));
+  return snapshot;
+}
+
+bool Engine::advanceWeights(double now) {
+  // Every request not finalized waits for the weights: none starts before
+  // they are back.
+  std::vector<Request *> waiting;
+  for (auto &[_, active] : requests_)
+    if (!active.finalized)
+      waiting.push_back(&active);
+  if (waiting.empty() && !weights_->restoring())
+    return false;
+  // As admission retries: once a refused part's backoff has passed, or memory
+  // came back since (signalResourceProgress).
+  if (!waiting.empty() &&
+      std::ranges::none_of(waiting, [&](const Request *waiter) { return resourceRetryReady(*waiter, now); }))
+    return false;
+  const WeightResidency::Step step = [&] {
+    // Memory the requests waiting need: the host's margins do not hold it
+    // back, critical pressure and the engine's limit refuse it. Without a
+    // request it comes back only as far as the margins admit it.
+    const Serving serving(config_.serving, !waiting.empty());
+    return weights_->restore(now);
+  }();
+  switch (step.kind) {
+  case WeightResidency::Step::Kind::Progress:
+    // A part that came back restarts each waiting request's resource wait
+    // limit (resourceDeadline).
+    for (Request *waiter : waiting)
+      waiter->resourceWait.earlierLaneWorkMilliseconds = now;
+    signalResourceProgress();
+    return true;
+  case WeightResidency::Step::Kind::Restored:
+    signalResourceProgress();
+    return true;
+  case WeightResidency::Step::Kind::Refused:
+    break;
+  }
+  if (waiting.empty()) {
+    weights_->abandon();
+    return true;
+  }
+  for (Request *waiter : waiting) {
+    deferResourceRetry(*waiter, now, {.allocationFailure = step.failure});
+    scheduler_.waitForResources(waiter->request.id);
+  }
+  return false;
 }
 
 Engine::Request &Engine::request(uint64_t id) {

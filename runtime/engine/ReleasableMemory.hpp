@@ -11,7 +11,7 @@
 
 namespace splash::engine {
 
-// What the engine gives back while idle (NativeLoopConfig::weights): the
+// What the engine gives back while idle (EngineConfig::weights): the
 // weight memory's parts in the order they come back, the weights' images
 // first, then any store of streamed weights (model::ExpertStore), and, when
 // the prefill FFN splits with the Neural Engine, the split's program in the

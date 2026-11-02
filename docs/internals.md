@@ -242,42 +242,38 @@ lane's state, the KV runway and any disk tier state staging, exceed the hard
 budget, so a model that can never fit is not loaded.
 
 When the idle release passes without a request, the memory control between
-commands releases the images' memory (`WeightImages::release`): their buffers
-are freed, the weights' views stay the same handles, and a command that binds
-released memory fails (`MetalBackend::releaseMemory`). The next request waits
-while the same writers write the images again (`WeightImages::restore`), an
-image per tick so that the loop keeps answering status and cancellations; this
-takes about as long as the load at startup and logs `Weights restored in N s`.
-The governor admits each image's memory (`MemoryGovernor::allocationAdmission`)
-as memory the waiting requests need: neither the host's margins nor macOS's
-warning refuse it, as for a request in service, and it fits the
-engine's limit, since the cache does not grow while the engine holds no
-request; critical pressure refuses it. The [expert
-store](server.md#streamed-experts) is the exception to that fit: a chunk it gave
-back while memory was short left room the cache may have taken since. So it
-comes back in parts: its floor chunks and staging in one, which fits as the
-images do, since they were live when it was released, then each elastic chunk in
-a part of its own, as growth the store can do without
-(`MemoryGovernor::growthAdmission`): the serving mark does not lift its host
-checks, and it comes back only while macOS reports no memory pressure and the
-host has the chunk and the 2 GiB recovery margin to spare. The first elastic
-chunk refused stays released with those after it, which the control pass takes
-back later as it does any chunk given back, and the restore goes on as if it had
-come back: only the floor holds the restore up. A refused image, or one the
-driver or its writer cannot allocate, stays released, and the images before it
-stay. The
-requests wait for memory, retrying every 0.1 s as a refused request does and
-counted in `admission.waiting_memory`, and the log says `Weights wait for
-memory to be restored`. Once the 30 s resource wait has passed since the first
-refusal after the last image that came back, the restore gives up: the images it
-wrote back are released, the waiting requests fail with `resource_timeout`, and
-`weights.restore_failures` counts the give-up. When no request waits any more,
-it gives up at once and counts nothing. Either way the next request starts over
-from the first image. Any other failure (a read error, a source written in
-place) stops the engine, which the server starts again. With the [Neural Engine
-split](#neural-engine-prefill), the release unloads its program after the
-images, and the restore loads it again in one tick more, after the last image
-(`ReleasableMemory`).
+commands has the engine release the images' memory (`Engine::releaseIdleWeights`,
+`WeightResidency`, `WeightImages::release`): their buffers are freed, the
+weights' views stay the same handles, and a command that binds released memory
+fails (`MetalBackend::releaseMemory`). The next request waits while the same
+writers write the images again (`WeightImages::restore`), the engine taking back
+an image per tick so that the loop keeps answering status and cancellations;
+meanwhile the tick still ends requests at their deadlines, collects the
+transfers that land and writes restore points behind (`Engine::tick`). The
+restore takes about as long as the load at startup and logs `Weights restored in
+N s`. The governor admits each image's memory
+(`MemoryGovernor::allocationAdmission`) as memory the waiting requests need:
+neither the host's margins nor macOS's warning refuse it, as for a request in
+service, and it fits the engine's limit, since the cache does not grow while the
+engine holds no request; critical pressure refuses it. The [expert
+store](server.md#streamed-experts) comes back at its floor: its floor chunks and
+staging in one part, which fits as the images do, since they were live when it
+was released. Its elastic chunks stay released, and the control pass takes them
+back as it does any chunk given back. A refused image, or one the driver or its
+writer cannot allocate, stays released, and the images before it stay. The
+requests wait for memory as a start refused memory does, each on its own clock:
+retried every 0.1 s, counted in `admission.waiting_memory`, and failed with
+`resource_timeout` once the 30 s resource wait has passed since its first
+refusal or the last image that came back, whichever is later; the log says
+`Weights wait for memory to be restored`. Once no request waits, the restore
+goes on while memory admits it without the waiting requests' mark, and a refused
+image ends it: the images it wrote back are released, and
+`weights.restore_failures` counts it if a request waiting for it failed for want
+of memory. Either way the next request starts over from the first image. Any
+other failure (a read error, a source written in place) stops the engine, which
+the server starts again. With the [Neural Engine split](#neural-engine-prefill),
+the release unloads its program after the images, and the restore loads it again
+in one tick more, after the last image (`ReleasableMemory`).
 
 ### Explicit weights release
 

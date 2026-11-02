@@ -85,11 +85,10 @@ struct Harness final {
   RuntimeMetrics metrics;
   test::Weights weights;
   engine::NativeRuntime loop{
-      {.engine = test::engineConfig(),
-       .metrics = &metrics,
-       .weights = &weights,
-       .weightAdmission = test::admitAll},
-      metal::kResidencyKeepAliveSeconds, resources, executor, transport.outputSink(),
+      {.engine = test::engineConfig(
+           {.weights = engine::WeightResidencyConfig{.weights = &weights, .admit = test::admitAll}}),
+       .metrics = &metrics},
+      resources, executor, transport.outputSink(),
       [this] { return status(); }, protocol::ProtocolLimits{}};
 };
 
@@ -116,11 +115,10 @@ struct PersistentHarness final {
   RuntimeMetrics metrics;
   test::Weights weights;
   engine::NativeRuntime loop{
-      {.engine = test::engineConfig(),
-       .metrics = &metrics,
-       .weights = &weights,
-       .weightAdmission = test::admitAll},
-      metal::kResidencyKeepAliveSeconds, resources, executor, transport.outputSink(),
+      {.engine = test::engineConfig(
+           {.weights = engine::WeightResidencyConfig{.weights = &weights, .admit = test::admitAll}}),
+       .metrics = &metrics},
+      resources, executor, transport.outputSink(),
       test::readyStatusJson, protocol::ProtocolLimits{}};
 };
 
@@ -349,11 +347,10 @@ void testLoopWakesForAnEngineDeadline() {
   RuntimeMetrics metrics;
   test::Weights weights;
   engine::NativeRuntime loop{
-      {.engine = test::engineConfig(),
-       .metrics = &metrics,
-       .weights = &weights,
-       .weightAdmission = test::admitAll},
-      metal::kResidencyKeepAliveSeconds, resources, executor,
+      {.engine = test::engineConfig(
+           {.weights = engine::WeightResidencyConfig{.weights = &weights, .admit = test::admitAll}}),
+       .metrics = &metrics},
+      resources, executor,
       [&](std::span<const uint8_t> bytes) {
         for (const auto &event : protocol::peer::decodeEvents(bytes)) {
           if (const auto *error = std::get_if<protocol::ErrorEvent>(&event)) {

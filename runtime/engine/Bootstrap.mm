@@ -370,13 +370,15 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
   try {
     connectToGovernor(config.nativeLoop.engine, resources->memoryGovernor());
     config.nativeLoop.engine.spill = resources->spillConfig();
-    config.nativeLoop.weights = &resources->releasableMemory();
-    config.nativeLoop.weightAdmission = resources->memoryGovernor().allocationAdmission();
+    config.nativeLoop.engine.weights = WeightResidencyConfig{
+        .weights = &resources->releasableMemory(),
+        .admit = resources->memoryGovernor().allocationAdmission(),
+        .idleReleaseMilliseconds = 1000.0 * config.resources.idleReleaseSeconds};
     config.nativeLoop.engineFailed = [owner = resources.get()] { owner->engineFailed(); };
     // The parser and engine consume the same resolved ceiling. In automatic
     // mode it cannot be known until resource planning has measured the device.
     nativeLoop = std::make_unique<NativeRuntime>(
-        config.nativeLoop, config.resources.idleReleaseSeconds, resources->cache(),
+        config.nativeLoop, resources->cache(),
         *modelRuntime, std::move(output), std::move(statusProvider),
         protocolLimitsFor(config.resources.model.capabilities,
                           config.nativeLoop.engine.maxContext));
@@ -400,7 +402,7 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
             modelPointer->actualRuntimeMemory());
         // Keep what the first request starts from: one lane's state buffers
         // and one empty KV extent. No cache data is evicted.
-        while (modelPointer->reclaimIdleState(true, model::IdleMemory::Buffers)) {
+        while (modelPointer->releaseIdleBuffer(true)) {
         }
         static_cast<void>(resourcesPointer->cache().releaseEmptyExtents(true));
         // The last check of the host's reserve before Ready weighs what the
