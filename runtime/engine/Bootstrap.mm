@@ -19,12 +19,6 @@ namespace {
 // and the state of a warmup the host refused.
 constexpr auto kMemoryReleaseWait = std::chrono::seconds(2);
 constexpr auto kMemoryReleasePoll = std::chrono::milliseconds(100);
-// The second prefill warm-up's rows: beside the first's chunk, the second
-// size the prefill price's seed puts its line through, as short as an agent's
-// turn (300 rows in the recorded M6 commands) and an eighth of the chunk; on a
-// streamed target it costs about one command's fixed part at startup, ~2 s
-// (accepted, DESIGN §0 O4).
-constexpr uint32_t kSeedPrefillRows = 256;
 
 RuntimeBootstrapReport reportForPlan(const EngineMemoryPlan &plan) {
   RuntimeBootstrapReport report;
@@ -213,7 +207,7 @@ RuntimeBootstrapReport RuntimeBootstrap::requireWarmupAndAnnounce(
     // price's seed, with the SSD reads of loading the weights (Scheduler).
     const model::WarmupStepResult shortPrefill =
         run(RuntimeBootstrapStage::MaximumPrefill, report.warmup.maximumPrefill,
-            [&] { return modelRuntime.warmupPrefill(kSeedPrefillRows); });
+            [&] { return modelRuntime.warmupPrefill(CostModel::kSeedRows); });
     const std::array warmups{maximumPrefill.sample, shortPrefill.sample};
     nativeLoop.seedCost(warmups, modelRuntime.loadReads());
     const auto &budget = memoryPlan.breakdown();

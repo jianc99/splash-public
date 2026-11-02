@@ -63,6 +63,12 @@ public:
   // them once, whatever its passes.
   static constexpr double kDecay = 0.9;
   static constexpr size_t kErrorSamples = 256;
+  // The second prefill warm-up's rows, beside the first's chunk: the second
+  // size the seed puts its line through, as short as an agent's turn (300
+  // rows in the recorded M6 commands) and an eighth of the chunk; on a
+  // streamed target it costs about one command's fixed part at startup, ~2 s
+  // (accepted, DESIGN §0 O4).
+  static constexpr uint32_t kSeedRows = 256;
 
   CostModel() noexcept;
 

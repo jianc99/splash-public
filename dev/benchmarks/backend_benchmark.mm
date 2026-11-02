@@ -1026,6 +1026,9 @@ int main(int argc, char **argv) {
                          prefillWarmup.wallSeconds * 1000.0,
                          prefillWarmupGpuMilliseconds, 0.0);
     }
+    // With a shorter one, it seeds the engine's prefill price below, as a
+    // start's seeds the server's (RuntimeBootstrap).
+    const model::WarmupStepResult seedWarmup = executor->warmupPrefill(engine::CostModel::kSeedRows);
     std::array<double, model::ExecutionLimits::maximumBatchWidth>
         decodeWarmupWall{};
     std::array<double, model::ExecutionLimits::maximumBatchWidth>
@@ -1047,6 +1050,7 @@ int main(int argc, char **argv) {
     engine::connectToGovernor(engineConfig, resources->memoryGovernor());
     engine::Engine engine(engineConfig, resources->cache(),
                                   *executor, events);
+    engine.seedCost(std::array{prefillWarmup.sample, seedWarmup.sample}, executor->loadReads());
     Driver driver(engine, events);
 
     // All four widths receive the same production-token payload. Different
