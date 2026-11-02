@@ -155,9 +155,14 @@ struct WithDrawer<Content: View>: View {
 private struct DrawerView: View {
     @Environment(AppState.self) private var state
     @State private var dragged: CGFloat?
+    /// The terminal with the keyboard: the one shown, picked in the drawer shown; none otherwise.
+    /// One value for them all moves the keyboard from the terminal hidden to the one shown in one
+    /// step; each giving it up on its own left it to the window on macOS 26.5.
+    @FocusState private var focused: TerminalSession.ID?
 
     var body: some View {
         let drawer = state.drawer
+        let shown = state.showsDrawer && drawer.part == .terminal ? drawer.terminal : nil
         VStack(spacing: 0) {
             Divider()
                 .overlay(alignment: .center) {
@@ -209,7 +214,7 @@ private struct DrawerView: View {
                 // its view and what it shows.
                 ForEach(drawer.terminals) { session in
                     let picked = drawer.part == .terminal && drawer.terminal == session.id
-                    TerminalPane(session: session, shown: state.showsDrawer && picked)
+                    TerminalPane(session: session, focused: $focused)
                         .opacity(picked ? 1 : 0)
                         .allowsHitTesting(picked)
                         .accessibilityHidden(!picked)
@@ -221,6 +226,7 @@ private struct DrawerView: View {
             }
         }
         .background(.background)
+        .onChange(of: shown, initial: true) { focused = shown }
     }
 }
 
@@ -267,19 +273,17 @@ private struct TerminalTabs: View {
 }
 
 /// A terminal's view, moved into the drawer each time it is laid out there, in the window's
-/// appearance, with a margin of its background around it. Shown, picked in the drawer shown, it
-/// takes the keyboard; hidden, it gives it up.
+/// appearance, with a margin of its background around it. It has the keyboard while `focused` is
+/// its terminal.
 private struct TerminalPane: View {
     let session: TerminalSession
-    let shown: Bool
-    @FocusState private var focused: Bool
+    let focused: FocusState<TerminalSession.ID?>.Binding
 
     var body: some View {
         Hosted(session: session)
-            .focused($focused)
+            .focused(focused, equals: session.id)
             .padding(EdgeInsets(top: 6, leading: 10, bottom: 4, trailing: 4))
             .background(Color(nsColor: .textBackgroundColor))
-            .onChange(of: shown, initial: true) { focused = shown }
     }
 
     private struct Hosted: NSViewRepresentable {
