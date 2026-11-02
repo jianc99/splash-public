@@ -60,7 +60,10 @@ struct CostModelStats final {
 class CostModel final {
 public:
   // What each unit's sums keep against the next command's: a command decays
-  // them once, whatever its passes.
+  // them once, whatever its passes. 0.9 is DESIGN §4.3's value, not yet
+  // derived: amend/S.md A10 chooses it by replaying recorded commands
+  // (cost_model_test testDecayFitsRecordedCommands over V-tools' fixtures
+  // prefill_commands_*.json, which do not exist yet).
   static constexpr double kDecay = 0.9;
   static constexpr size_t kErrorSamples = 256;
   // The second prefill warm-up's rows, beside the first's chunk: the second

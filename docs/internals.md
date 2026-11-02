@@ -1513,9 +1513,9 @@ its share of its command, each weighing nine tenths of the next, its time held
 within half and twice its price, in a fit that keeps every cost non-negative
 and a cost no unit's work varies at its seed; the bytes it prices are scaled
 by what units read over what the model expected of them. The status reports
-each cost, its seed and that scale, and the units' relative errors over the
-last 256 (`scheduler.prefill_estimate`), and a decode token's time
-(`scheduler.decode_estimate`).
+each cost and its seed, and the units' relative errors over the last 256
+(`scheduler.estimate.prefill`), and a decode token's time
+(`scheduler.estimate.decode`).
 
 Prefill takes the ready lanes of the most urgent priority. Within it a lane
 that has waited, while units served later arrivals of its priority, three times
@@ -1532,7 +1532,9 @@ While a lane of its priority or a higher one decodes, or when it leads a group,
 a unit is bounded: it runs in the fewest passes over the model's layers whose
 every pass's price is within max(G, ten times the turnaround), or failing that
 within twice the pass's fixed part (the turnaround and the pass's reads); a
-contended unit no passes bound halves its rows (`scheduler.bound_cuts`). The
+contended unit no passes bound halves its rows (`scheduler.bound_cuts`) where
+fewer rows can bound it, and keeps them where a cost per chunk or per pass
+that no rows shorten keeps even its fewest rows over the bound. The
 query-key pairs one attention layer computes bound a command's rows, never its
 passes (`CommandLimits::attentionPairs`). Another ready prompt of the priority
 joins the command with the fewest rows that spare it a command of its own, all
