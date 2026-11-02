@@ -17,9 +17,11 @@
 #include <functional>
 #include <initializer_list>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace splash;
@@ -220,6 +222,33 @@ void completePrefill(Sim &sim, const BatchPlan &plan, const model::CommandSample
     results.push_back(
         {item.requestId, plan.pass + 1 == plan.passes ? item.tokenCount : 0, false, DecodeStage::Regular});
   sim.scheduler.complete(plan, results, sample);
+}
+
+// The M6 TTFT bench's rounds ahead of its four turns (DATA.md): the 8K
+// prefix's command, then a turn of 300 rows on it alone and two together,
+// each leaving at its first token, so the price has their commands.
+void runTtftBenchRounds(Sim &sim) {
+  struct Round final {
+    uint32_t position, rows, turns;
+  };
+  uint64_t id = 1000;
+  for (const Round round : {Round{0, 8192, 1}, Round{8192, 300, 1}, Round{8192, 300, 2}}) {
+    std::vector<uint64_t> waiting;
+    for (uint32_t turn = 0; turn < round.turns; ++turn) {
+      sim.lane(id, round.position, round.rows);
+      waiting.push_back(id++);
+    }
+    while (!waiting.empty()) {
+      sim.step();
+      std::erase_if(waiting, [&](uint64_t lane) {
+        if (sim.scheduler.phase(lane) == Phase::Prefill)
+          return false;
+        sim.scheduler.cancel(lane);
+        sim.scheduler.remove(lane);
+        return true;
+      });
+    }
+  }
 }
 
 // Lane 1 decodes beside lane 2's long prompt: a decode command, then a
@@ -458,10 +487,11 @@ void testAdmissionStartsTheLanesOfTheNextCommand() {
 }
 
 // Admission starts at most a full batch: of eight agent turns that share a
-// command, the first four.
+// command, the first four (after the TTFT bench's rounds, as there).
 void testAdmissionStartsAtMostAFullBatch() {
   Sim sim(test::kM6FlashNextQ2, limits(8192, 48));
   sim.seed();
+  runTtftBenchRounds(sim);
   std::vector<PrefillAdmission> turns;
   for (uint64_t id = 1; id <= 8; ++id) {
     sim.scheduler.submit(request(id, 8192 + 300));
@@ -673,6 +703,23 @@ void testWaitingOrPrefillingPeersDoNotBoundAPrefill() {
           "lanes that only prefill bounded their leader");
 }
 
+// Behaviour change 7: a ready peer of its priority, with no decoder, does
+// not bound a lane that streams its history: the Spill lane leads a group's
+// rows beside a long Resident prompt as it does alone.
+void testAReadyPeerDoesNotBoundAStreamingLeader() {
+  Sim sim(test::kM6FlashNextQ2, limits(8192, 48));
+  sim.seed();
+  sim.lane(1, 45056, 40'000);
+  sim.shape(1, 45056 / kPageTokens, true);
+  const BatchPlan alone = sim.plan();
+  sim.lane(2, 0, 200'000);
+  const BatchPlan beside = sim.plan();
+  require(beside.items[0].requestId == 1 && beside.items[0].tokenCount == alone.items[0].tokenCount &&
+              beside.items[0].tokenCount == 8192,
+          "a streaming leader beside a ready peer ran " + std::to_string(beside.items[0].tokenCount) +
+              " rows, alone " + std::to_string(alone.items[0].tokenCount));
+}
+
 // A unit whose time is missing, not positive or not finite trains nothing;
 // one whose completion added work (an auxiliary encoder's rerun) neither.
 void testUntimedOrAuxiliaryUnitsTrainNothing() {
@@ -841,41 +888,57 @@ void testALoneRequestIsSizedAsToday() {
   }
 }
 
+// A contended agent turn on the M6's profile at turnaround `turnaround`,
+// after commands of varied passes have taught the fit the turnaround: the
+// sim and the turn's first plan.
+std::pair<std::unique_ptr<Sim>, BatchPlan> learnedContendedTurn(const test::TimingProfile &profile) {
+  auto sim = std::make_unique<Sim>(profile, limits(8192, 48));
+  sim->seed();
+  sim->decoder(1);
+  for (uint32_t turn = 0; turn < 6; ++turn) {
+    sim->lane(10 + turn, 8192, 300 + 1500 * turn);
+    while (sim->scheduler.phase(10 + turn) == Phase::Prefill)
+      sim->step();
+    sim->scheduler.cancel(10 + turn);
+    sim->scheduler.remove(10 + turn);
+  }
+  sim->lane(2, 8192, 300);
+  BatchPlan plan = sim->plan();
+  while (plan.kind != WorkKind::Prefill) {
+    sim->run(plan);
+    plan = sim->plan();
+  }
+  return {std::move(sim), plan};
+}
+
 // The passes of a contended turn are those the bound needs, and no more:
-// with the turnaround the units measure, max(G, u / 0.1), which at 150 ms
-// is 1.5 s, so fewer passes than G would need (behaviour change 2).
+// the fewest whose every pass is within max(G, u / 0.1), at every
+// turnaround.
 void testContendedTurnPassesByTurnaround() {
   for (const double turnaround : kTurnarounds) {
     const test::TimingProfile profile = withTurnaround(test::kM6FlashNextQ2, turnaround);
-    Sim sim(profile, limits(8192, 48));
-    sim.seed();
-    sim.decoder(1);
-    // Commands of varied passes teach the fit the turnaround.
-    for (uint32_t turn = 0; turn < 6; ++turn) {
-      sim.lane(10 + turn, 8192, 300 + 1500 * turn);
-      while (sim.scheduler.phase(10 + turn) == Phase::Prefill)
-        sim.step();
-      sim.scheduler.cancel(10 + turn);
-      sim.scheduler.remove(10 + turn);
-    }
-    sim.lane(2, 8192, 300);
-    BatchPlan plan = sim.plan();
-    while (plan.kind != WorkKind::Prefill) {
-      sim.run(plan);
-      plan = sim.plan();
-    }
-    const auto least = static_cast<uint32_t>(std::ceil(sim.price(plan.items) / sim.bound()));
+    const auto [sim, plan] = learnedContendedTurn(profile);
+    const auto least = static_cast<uint32_t>(std::ceil(sim->price(plan.items) / sim->bound()));
     require(plan.passes >= least && plan.passes <= least + 1,
             at(profile) + ": a contended turn ran in " + std::to_string(plan.passes) + " passes, not the " +
                 std::to_string(least) + " its bound needs");
     for (uint32_t pass = 0; pass < plan.passes; ++pass)
-      require(sim.price(plan.items, pass, plan.passes) <= sim.bound() * (1 + 1e-9),
+      require(sim->price(plan.items, pass, plan.passes) <= sim->bound() * (1 + 1e-9),
               at(profile) + ": a contended turn's pass exceeds the bound");
-    if (turnaround / kPassOverheadShare >= 2.0 * kGap)
-      require(sim.bound() > kGap && plan.passes < static_cast<uint32_t>(std::ceil(sim.price(plan.items) / kGap)),
-              at(profile) + ": the bound did not follow the turnaround the units measured (" +
-                  std::to_string(sim.turnaround()) + " ms)");
   }
+}
+
+// Behaviour change 2: the bound follows the turnaround the units measure.
+// At u = 150 ms it is u / 0.1 = 1.5 s, so a contended turn runs in fewer
+// passes than G's 500 ms would cut it into (the base's slice).
+void testTheBoundFollowsTheTurnaround() {
+  const test::TimingProfile profile = withTurnaround(test::kM6FlashNextQ2, 150.0);
+  const auto [sim, plan] = learnedContendedTurn(profile);
+  const auto byGap = static_cast<uint32_t>(std::ceil(sim->price(plan.items) / kGap));
+  require(plan.passes < byGap, at(profile) + ": a contended turn ran in " + std::to_string(plan.passes) +
+                                   " passes, as many as G's " + std::to_string(byGap));
+  require(sim->bound() > kGap, at(profile) + ": the bound did not follow the turnaround the units measured (" +
+                                   std::to_string(sim->turnaround()) + " ms)");
 }
 
 // The fewest passes within the bound spend at most a tenth of the command on
@@ -937,22 +1000,24 @@ void testPassesFollowCostOnAResidentTarget() {
   }
 }
 
-// Groups follow the fixed part a group saves: a spill lane whose history
-// reads cost a chunk's command a third of G or more groups, a short one
-// does not; an expert store with 5 % of its experts out groups, a whole one
-// does not, on the M6's SSD.
+// Behaviour change 5: groups follow the fixed part a group saves: on a
+// store-less target a spill lane whose history reads cost a chunk's command
+// a third of G or more groups, a short one does not, nor a Resident lane.
 void testGroupRowsFollowTheFixedCost() {
-  {
-    Sim sim(test::kStoreLessSpillFlashNext, limits(8192, 48));
-    sim.seed();
-    sim.lane(1, 262144, 20'000);
-    sim.shape(1, 262144 / kPageTokens);
-    require(sim.plan().items[0].tokenCount == 8192, "a spill lane with 256K of history did not group");
-    sim.shape(1, 0);
-    require(sim.plan().items[0].tokenCount == kChunk, "a Resident lane on a store-less target grouped");
-    sim.shape(1, 16384 / kPageTokens);
-    require(sim.plan().items[0].tokenCount == kChunk, "a spill lane with a short history grouped");
-  }
+  Sim sim(test::kStoreLessSpillFlashNext, limits(8192, 48));
+  sim.seed();
+  sim.lane(1, 262144, 20'000);
+  sim.shape(1, 262144 / kPageTokens);
+  require(sim.plan().items[0].tokenCount == 8192, "a spill lane with 256K of history did not group");
+  sim.shape(1, 0);
+  require(sim.plan().items[0].tokenCount == kChunk, "a Resident lane on a store-less target grouped");
+  sim.shape(1, 16384 / kPageTokens);
+  require(sim.plan().items[0].tokenCount == kChunk, "a spill lane with a short history grouped");
+}
+
+// Behaviour change 6: an expert store with 5 % of its experts out groups, a
+// whole one does not, on the M6's SSD: grouping saves it nothing.
+void testANearlyResidentStoreRunsChunks() {
   test::TimingProfile uniform = test::kM6FlashNextQ2;
   // Misses as the share not resident (amend/M.md B8's uniform marginal).
   uniform.curve.prefillHit = {{{0, 0.0}, {24576, 1.0}}};
@@ -1234,11 +1299,13 @@ void testALongLanesSparingRowsDoNotDelayAShortTurn() {
   require(joined.width() == 2 && joined.items[1].tokenCount == 300, "a long lane's 300 sparing rows did not join");
 }
 
-// N=4: four agent turns share one command; at today's host split the third
-// would not join.
+// N=4: four agent turns share one command, as on 0bd50301 in the TTFT
+// bench (A68: 5152/5247 ms), whose rounds before them trained its price; at
+// a host-wait split (1.7 s + 4.3 ms a row) the third would not join.
 void testFourShortTurnsShareOneCommand() {
   Sim sim(test::kM6FlashNextQ2, limits(8192, 48));
   sim.seed();
+  runTtftBenchRounds(sim);
   for (uint64_t id = 1; id <= 4; ++id)
     sim.lane(id, 8192, 300);
   require(sim.plan().width() == 4, "four turns did not share one command");
@@ -1253,6 +1320,21 @@ void testADenseFinishingLeaderRunsWithoutFill() {
   const BatchPlan plan = sim.plan();
   require(plan.width() == 1 && plan.items[0].requestId == 1 && plan.items[0].tokenCount == 700,
           "a finishing dense leader was filled");
+}
+
+// Behaviour change 4: a lane that streams its history shares a command: a
+// Spill lane's last rows join a short turn's command, which runs in passes.
+void testAStreamingLaneSharesACommand() {
+  Sim sim(test::kM6FlashNextQ2, limits(8192, 48));
+  sim.seed();
+  sim.lane(1, 8192, 300);
+  sim.lane(2, 45056, 200);
+  sim.shape(2, 45056 / kPageTokens);
+  const BatchPlan plan = sim.plan();
+  require(plan.width() == 2 && plan.items[0].requestId == 1 && plan.items[1].requestId == 2 &&
+              plan.items[1].tokenCount == 200,
+          "a lane with Index pages did not share a turn's command");
+  require(plan.passes > 1, "the shared command did not run in passes");
 }
 
 // One lane whose history holds or may gain Index pages per command: a lane
@@ -1811,6 +1893,7 @@ constexpr test::TestCase kTests[] = {
     {"testOnlyContendedUnitsAreBounded", testOnlyContendedUnitsAreBounded},
     {"testALowerPrioritysDecodeDoesNotBoundAPrefill", testALowerPrioritysDecodeDoesNotBoundAPrefill},
     {"testWaitingOrPrefillingPeersDoNotBoundAPrefill", testWaitingOrPrefillingPeersDoNotBoundAPrefill},
+    {"testAReadyPeerDoesNotBoundAStreamingLeader", testAReadyPeerDoesNotBoundAStreamingLeader},
     {"testUntimedOrAuxiliaryUnitsTrainNothing", testUntimedOrAuxiliaryUnitsTrainNothing},
     {"testACommandHoldsOneLanePastAChunk", testACommandHoldsOneLanePastAChunk},
     {"testAPrefillsPriceIsTheCostModels", testAPrefillsPriceIsTheCostModels},
@@ -1819,9 +1902,11 @@ constexpr test::TestCase kTests[] = {
     {"testALoneDenseCommandRunsWhole", testALoneDenseCommandRunsWhole},
     {"testALoneRequestIsSizedAsToday", testALoneRequestIsSizedAsToday},
     {"testContendedTurnPassesByTurnaround", testContendedTurnPassesByTurnaround},
+    {"testTheBoundFollowsTheTurnaround", testTheBoundFollowsTheTurnaround},
     {"testPassesAddAtMostATenthOfTheCommand", testPassesAddAtMostATenthOfTheCommand},
     {"testPassesFollowCostOnAResidentTarget", testPassesFollowCostOnAResidentTarget},
     {"testGroupRowsFollowTheFixedCost", testGroupRowsFollowTheFixedCost},
+    {"testANearlyResidentStoreRunsChunks", testANearlyResidentStoreRunsChunks},
     {"testThePairBoundIsPerLayerAndOnlyRowsMeetIt", testThePairBoundIsPerLayerAndOnlyRowsMeetIt},
     {"testEveryContendedUnitWithinItsBound", testEveryContendedUnitWithinItsBound},
     {"testAContendedSpillLaneKeepsItsGroupRows", testAContendedSpillLaneKeepsItsGroupRows},
@@ -1832,6 +1917,7 @@ constexpr test::TestCase kTests[] = {
     {"testALongLanesSparingRowsDoNotDelayAShortTurn", testALongLanesSparingRowsDoNotDelayAShortTurn},
     {"testFourShortTurnsShareOneCommand", testFourShortTurnsShareOneCommand},
     {"testADenseFinishingLeaderRunsWithoutFill", testADenseFinishingLeaderRunsWithoutFill},
+    {"testAStreamingLaneSharesACommand", testAStreamingLaneSharesACommand},
     {"testTwoSpillLanesNeverShareAMultiPassCommand", testTwoSpillLanesNeverShareAMultiPassCommand},
     {"testTheCountersAreThoseOfThePlanCommitted", testTheCountersAreThoseOfThePlanCommitted},
     {"testShortestExpectedRemainingLeads", testShortestExpectedRemainingLeads},
