@@ -3959,23 +3959,17 @@ void testReclaimRefusesACommandInFlight() {
           "the reclaim after the command did not take the idle memory");
 }
 
-// Three prompts of three blocks each fill pages 0 to 8, and the first
-// prompt's state and blocks go, so extent 0 keeps one page. A fourth request
-// continues the third prompt and keeps decoding; its new rows fill extent 0
-// again, so extent 2 holds its third block alone. The fake model marks the
+// Three prompts of three blocks each fill pages 0 to 8; the first is used
+// again, and the second prompt's state and blocks go, so extent 0 keeps a
+// free page and extent 1 two. A fourth request continues the third prompt
+// and keeps decoding; its new rows fill extent 1, which holds its pages
+// already, so extent 2 holds its third block alone. The fake model marks the
 // pages it writes and checks them on every step (Executor::kv).
 struct ScatteredPages {
   ScatteredPages() {
     model.kv = &storage;
     guardReleases(storage, engine);
-    for (uint32_t id = 1; id <= 3; ++id) {
-      engine.submit(request(id, prompt(1000 * id, 97)));
-      runUntilIdle(engine);
-    }
-    for (uint32_t victim = 0; victim < 4; ++victim) {
-      require(cache.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::InUse).madeProgress,
-              "the first prompt was not evicted");
-    }
+    scatter(engine, cache);
     EngineRequest running = request(4, prompt(3000, 129));
     running.maxNewTokens = 4;
     model.decodeFinishes = false;
@@ -3986,9 +3980,23 @@ struct ScatteredPages {
     const CacheSnapshot cached = cache.snapshot();
     require(!events.outputs[4].empty() &&
                 std::vector<uint32_t>(table.pages.begin(), table.pages.end()) ==
-                    std::vector<uint32_t>{6, 7, 8, 0, 1} &&
+                    std::vector<uint32_t>{6, 7, 8, 4, 5} &&
                 cached.pool.pagesAllocated == 12 && cached.pool.pagesFree == 4,
             "compaction setup did not leave extent 2 with one held page");
+  }
+
+  // The three prompts, the first used again (a lookup), and the second's
+  // state and blocks evicted.
+  static void scatter(engine::Engine &engine, engine::Cache &cache) {
+    for (uint32_t id = 1; id <= 3; ++id) {
+      engine.submit(request(id, prompt(1000 * id, 97)));
+      runUntilIdle(engine);
+    }
+    static_cast<void>(cache.lookup(prompt(1000, 97), {}));
+    for (uint32_t victim = 0; victim < 4; ++victim) {
+      require(cache.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::InUse).madeProgress,
+              "the second prompt was not evicted");
+    }
   }
 
   static std::vector<uint32_t> prompt(uint32_t first, uint32_t tokens) {
@@ -4031,13 +4039,13 @@ void testStateStartGathersFreePagesBeforeEvicting() {
     static_cast<void>(fixture.engine.tick(now));
   const CacheSnapshot started = cache.snapshot();
   require(events.startIds.back() == 5 && fixture.storage.copies.size() == 1 &&
-              fixture.storage.copies[0].from == 8 && fixture.storage.copies[0].to == 2 &&
+              fixture.storage.copies[0].from == 8 && fixture.storage.copies[0].to == 3 &&
               started.pool.extentCompactions == 1 && started.pool.extentReleases == 1 &&
               started.pool.pagesPrefix >= cached.pool.pagesPrefix &&
               started.stateCache.entries >= cached.stateCache.entries,
           "the lane's start evicted instead of gathering the free pages");
   const PageTableState moved = cache.pageTable(4);
-  require(moved.pages[2] == 2 && moved.pages[0] == 6 && moved.pages[4] == 1 &&
+  require(moved.pages[2] == 3 && moved.pages[0] == 6 && moved.pages[4] == 5 &&
               moved.revision > revision,
           "the running request did not follow its moved page");
   runUntilIdle(fixture.engine);
@@ -4060,14 +4068,7 @@ void testCommandReadsItsPageTableAfterRoomForItsStates() {
   Events events;
   engine::Engine engine{test::engineConfig(), cache, model, events};
   guardReleases(storage, engine);
-  for (uint32_t id = 1; id <= 3; ++id) {
-    engine.submit(request(id, ScatteredPages::prompt(1000 * id, 97)));
-    runUntilIdle(engine);
-  }
-  for (uint32_t victim = 0; victim < 4; ++victim) {
-    require(cache.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::InUse).madeProgress,
-            "the first prompt was not evicted");
-  }
+  ScatteredPages::scatter(engine, cache);
   // The governor admits the buffers of the continuation's replay point only
   // once an extent has gone.
   const uint32_t releases = storage.releasedExtents;

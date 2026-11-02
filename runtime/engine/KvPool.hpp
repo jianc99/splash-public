@@ -103,10 +103,13 @@ struct KvPageMoveResult final {
 // form (kv::PageForm) from its allocation to its release, and the forms
 // share one id space: a page's content goes to a page of another form when
 // its K/V leaves memory or comes back, or when it gives up a window's layers
-// (movePages). Free pages of a form are handed out from the allocated extent
-// of the form with the most live pages first, so partially used extents fill
-// up, empty extents are touched last, and cold extents drain to empty, the
-// only state in which an extent can be released. Held pages are scattered
+// (movePages). Free pages of a form are handed out from the extents of the
+// form that hold a page a request holds first, then from the others, and
+// among those from the one with the most live pages first: a request's new
+// page joins an extent already resident for commands rather than one only
+// the cache holds, partially used extents fill up, empty extents are touched
+// last, and cold extents drain to empty, the only state in which an extent
+// can be released. Held pages are scattered
 // over the extents all the same; compactExtent() empties one more extent
 // whenever the free pages of the others of its form cover it. Commands reach
 // a page only through the tables of the requests that hold it, so the pool

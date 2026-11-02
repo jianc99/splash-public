@@ -236,6 +236,32 @@ void testAcquireLeavesHeldPages() {
     release(pool, first.pages);
 }
 
+// A request's new page joins an extent that holds a page a request holds,
+// resident for commands already, before a fuller one only the cache holds:
+// the extents resident for commands stay as many.
+void testNewPagesFillActiveExtentsFirst() {
+    TestKvStorage storage(12, 100, 4);
+    KvPool pool(storage, 12);
+    auto all = pool.acquirePages(8);
+    require(all.granted() && all.pages.size() == 8, "fill setup did not acquire two extents");
+    // Extent 0: three pages only the cache holds and one free; extent 1: two
+    // pages a request holds and two free.
+    for (const uint32_t page : {0u, 1u, 2u}) {
+        pool.retainPage(page, true);
+        pool.releasePage(page, false);
+    }
+    release(pool, {3, 6, 7});
+    const auto before = pool.snapshot();
+    require(before.extentsActive == 1 && before.pagesFree == 7 && !storage.active(0) && storage.active(1),
+            "only the extent of pages a request holds was not active");
+    auto page = pool.acquirePages(1);
+    require(page.granted() && page.pages.front() / 4 == 1 && pool.snapshot().extentsActive == 1,
+            "the new page went to the fuller extent only the cache holds, which became active");
+    release(pool, page.pages);
+    release(pool, {4, 5});
+    for (const uint32_t cached : {0u, 1u, 2u}) pool.releasePage(cached, true);
+}
+
 void testFullestExtentFillsFirstSoColdExtentsDrain() {
     TestKvStorage storage(12, 100, 4);
     KvPool pool(storage, 12);
@@ -882,6 +908,7 @@ int main() {
         testPassReleasesEveryEmptyExtent();
         testFullestExtentFillsFirstSoColdExtentsDrain();
         testAcquireLeavesHeldPages();
+        testNewPagesFillActiveExtentsFirst();
         testRefusedReleaseChangesNothing();
         testPrefixAndActiveReferencesHoldTheExtent();
         testCacheOwnsAPageOnce();

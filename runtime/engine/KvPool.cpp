@@ -471,22 +471,25 @@ uint32_t KvPool::popFree(kv::PageForm form) noexcept {
   return page;
 }
 
-// The allocated extent of the form with the most live pages that still has
-// a free page; ties go to the lowest index, and empty extents lose to any
-// used one. The answer only changes when another extent of the form gains or
-// loses a page, so it is reused until then.
+// The allocated extent of the form that still has a free page: one that
+// holds a page a request holds before one that does not, then the one with
+// the most live pages; ties go to the lowest index, and empty extents lose
+// to any used one. The answer only changes when another extent of the form
+// gains or loses a page, or an extent's first request page comes or its last
+// goes, so it is reused until then.
 uint32_t KvPool::fillingExtent(kv::PageForm form) noexcept {
   FormRecord &record = formRecord(form);
   if (const uint32_t filling = record.fillingExtent;
       filling != noIndex && extents_[filling].form == form && extents_[filling].freePages.count)
     return filling;
+  const auto rank = [&](uint32_t index) {
+    return std::pair{extents_[index].activePages != 0, extents_[index].usedPages};
+  };
   uint32_t best = noIndex;
   for (uint32_t index = 0; index < extents_.size(); ++index) {
     const ExtentRecord &extent = extents_[index];
-    if (extent.form == form && extent.freePages.count &&
-        (best == noIndex || extent.usedPages > extents_[best].usedPages)) {
+    if (extent.form == form && extent.freePages.count && (best == noIndex || rank(index) > rank(best)))
       best = index;
-    }
   }
   if (best == noIndex)
     std::terminate();
@@ -525,6 +528,7 @@ void KvPool::markActive(uint32_t page) noexcept {
   ++form.activePages;
   if (!extents_[extentOf(page)].activePages++) {
     ++form.activeExtents;
+    form.fillingExtent = noIndex;
     storage_.setExtentActive(extentOf(page), true);
   }
 }
@@ -537,6 +541,7 @@ void KvPool::markInactive(uint32_t page) noexcept {
   --form.activePages;
   if (!--extent.activePages) {
     --form.activeExtents;
+    form.fillingExtent = noIndex;
     storage_.setExtentActive(extentOf(page), false);
   }
 }
