@@ -233,6 +233,16 @@ class ChatTemplateProbeTests(unittest.TestCase):
             with self.subTest(name=name):
                 templates = ChatTemplates(tokenizer(source(name)))
                 self.assertEqual(templates.select(None).thinking_end, close)
+        # Whatever the template writes there.
+        written = BY_EFFORT.replace(
+            "{{ m.content }}",
+            "{% if m.reasoning_content %}<think>{{ m.reasoning_content }} Done.\n"
+            "</think>{% endif %}{{ m.content }}",
+        )
+        self.assertEqual(
+            ChatTemplates(tokenizer(written)).select(None).thinking_end,
+            " Done.\n</think>",
+        )
         self.assertIsNone(ChatTemplates(tokenizer(BY_EFFORT)).select(None).thinking_end)
 
     def test_original_templates_reject_or_drop_what_the_patch_renders(self):

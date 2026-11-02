@@ -65,6 +65,9 @@ public:
   std::unique_ptr<StateOffload> offload(std::function<void()>) const override {
     return writeState(control_);
   }
+  std::unique_ptr<StateOffload> persist(std::function<void()>) const override {
+    return writeState(control_);
+  }
 private:
   std::shared_ptr<TransferControl> control_;
   bool disk_;
@@ -5481,6 +5484,42 @@ void testUnreadableCopyLeavesWithItsHolders() {
           "the unreadable block and those below it did not leave with their copies");
 }
 
+// A poisoned block leaves once nothing refers to it, a write in flight
+// included: a point's copies go on through a block whose read failed while
+// a request held the chain, the subtree below the block leaves once its
+// writes have landed and the request has ended, and the block leaves with
+// its page once its own write lands. The exchange then counts exactly what
+// it releases.
+void testPoisonedBlockLeavesOnceItsWriteLands() {
+  test::TestKvTier tier;
+  tier.transferLimit = 8;
+  CacheFixture fixture(&tier, true);
+  auto control = std::make_shared<TransferControl>();
+  control->ready = true;
+  fixture.cache.publishCompositeState(fixture.blocks[3], std::make_shared<TieredState>(control), false);
+  fixture.cache.poisonCopy(fixture.blocks[1]);
+  require(fixture.cache.persist(fixture.blocks[3]) == PersistStatus::Started && tier.writes.size() == 4,
+          "the point's copies did not go on through the poisoned block");
+  fixture.cache.endRequest(1);
+  tier.transfers[2]->ready = tier.transfers[3]->ready = true;
+  static_cast<void>(fixture.cache.pollTransfers());
+  require(fixture.cache.snapshot().pool.pagesPrefix == 2 && !fixture.cache.snapshot().stateCache.entries,
+          "the subtree below the poisoned block did not leave once its writes landed");
+  tier.complete();
+  static_cast<void>(fixture.cache.pollTransfers());
+  const CacheSnapshot landed = fixture.cache.snapshot();
+  require(landed.pool.pagesPrefix == 1 && landed.kvTier.diskBlocks == 1,
+          "the poisoned block did not leave with its page once its write landed");
+  fixture.cache.checkInvariants();
+  const RestoredChains none;
+  const uint64_t predicted = fixture.cache.exchangeable(none).extentBytes;
+  const uint64_t allocated = fixture.pool.allocatedBytes();
+  while (fixture.cache.reclaimForExchange(none).madeProgress) {
+  }
+  require(predicted && allocated - fixture.pool.allocatedBytes() == predicted,
+          "the exchange did not count exactly what it releases");
+}
+
 // A cut copies only the chunks of sources from its first change on; the
 // chunks before it are the last cut's.
 void testCutsShareUnchangedChunks() {
@@ -5941,6 +5980,7 @@ int main() {
     testOwedCopiesReturnWhileAnyIsWritten();
     testRecomputedBlocksSpillToCopiesOfTheirPages();
     testUnreadableCopyLeavesWithItsHolders();
+    testPoisonedBlockLeavesOnceItsWriteLands();
     testCutsShareUnchangedChunks();
     testWindowsTrimWhatEveryHolderPassed();
     testWritersKeepTheirPagesTrimmedOrNot();

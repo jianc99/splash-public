@@ -1,5 +1,5 @@
-// The model's Markdown as the app's pages draw it, with the runtime's markdown-it and highlight.js,
-// which the app adds to each page before its scripts: no raw HTML, its line breaks kept, only web
+// The model's Markdown as the transcript draws it, with the runtime's markdown-it and highlight.js,
+// which the app adds to the page before its scripts: no raw HTML, its line breaks kept, only web
 // and mail links, and an image as a link to it, so that what the model writes never loads anything
 // by itself.
 'use strict';
@@ -161,32 +161,32 @@ const markdown = (() => {
   }
 
   // Where `text` can be cut, from `start`, which is such a place, so that what comes before it
-  // draws alone as it does in the whole: the start of the last line after a blank line that
-  // starts at the column's start, outside any fence, and no list item, as a list goes on past a
-  // blank line and its items' lines are indented. A line that might still become an item, "1" or
-  // "-", counts as one. Also whether the text ends in a fence that is still open.
+  // draws alone as it does in the whole: the start of the last block the parser finds at the top
+  // level, after a blank line and at the column's start, and no list item, as a list goes on past
+  // a blank line. A line that might still become an item, "1" or "-", counts as one. Also whether
+  // the text ends in a fence that is still open: one that reaches its end with no closing line,
+  // all of its lines but the first being its code.
   function scan(text, start) {
-    let fence = null;
-    let blank = false;
+    const rest = text.slice(start);
+    let tokens = [];
+    // None where Markdown is missing or fails, as `render` then shows the text as it came.
+    try {
+      tokens = parser.parse(rest, {});
+    } catch {}
+    const blocks = new Set(tokens.filter(token => token.level === 0 && token.map).map(token => token.map[0]));
     let cut = start;
-    for (let at = start; at < text.length;) {
-      const end = text.indexOf('\n', at);
-      const line = text.slice(at, end === -1 ? text.length : end);
-      const marker = /^\s*(`{3,}|~{3,})(.*)$/.exec(line);
-      if (fence) {
-        if (marker && marker[1][0] === fence[0] && marker[1].length >= fence.length && marker[2].trim() === '') fence = null;
-      } else if (/^\s*$/.test(line)) {
-        blank = true;
-      } else {
-        if (blank && /^\S/.test(line) && !/^([-+*]|\d{1,9}[.)]?)(\s|$)/.test(line)) cut = at;
-        blank = false;
-        // A backtick fence's info has no backtick.
-        if (marker && !(marker[1][0] === '`' && marker[2].includes('`'))) fence = marker[1];
-      }
-      if (end === -1) break;
-      at = end + 1;
+    let at = start;
+    let blank = false;
+    let number = 0;
+    // The lines as the parser counts them, and an empty one after them.
+    for (const [line] of rest.matchAll(/[^\r\n]*(?:\r\n?|\n|$)/g)) {
+      if (blank && blocks.has(number) && /^\S/.test(line) && !/^([-+*]|\d{1,9}[.)]?)(\s|$)/.test(line)) cut = at;
+      blank = line.trim() === '';
+      at += line.length;
+      number++;
     }
-    return {cut, open: fence !== null};
+    const fence = tokens.findLast(token => token.type === 'fence');
+    return {cut, open: fence?.map[1] === number - 1 && fence.content.split('\n').length === fence.map[1] - fence.map[0]};
   }
 
   // Draws `text` into `container` as Markdown. Whole, it changes only the nodes that differ from

@@ -1,7 +1,8 @@
 // The Chat's transcript: the open conversation as the app sends it (Transcript.swift). The app
 // calls page.setup once the page has loaded, show with the whole conversation when it changes, and
-// update with the reply that streams; the page sends back what to copy, and Ask Again. Markdown
-// comes from markdown.js, and what the app's pages share from page.js.
+// update with its last message alone, a reply as it streams or once it has ended; the page sends
+// back what to copy, and Ask Again. Markdown comes from markdown.js, and the rest of what it does
+// apart from the conversation from page.js.
 'use strict';
 
 const transcript = (() => {
@@ -190,7 +191,7 @@ const transcript = (() => {
     if (opened || added) follow.toLatest();
   }
 
-  // The reply that streams, alone.
+  // The last message alone: a reply as it streams or once it has ended.
   function update(message) {
     if (views.has(message.id)) draw(message);
   }

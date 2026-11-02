@@ -3,7 +3,6 @@ time budgets."""
 
 import atexit
 import ctypes
-import functools
 import json
 import math
 import os
@@ -55,7 +54,6 @@ PROFILE = """(version 1)
   (sysctl-name "kern.version"))
 (allow file-read*
   (literal "/") ; the interpreter aborts as it starts without it
-  (literal "/dev/urandom") ; its seed, where it was built without getentropy
   (subpath "/System")
   (subpath "/usr/lib")
   (subpath "/Library/Fonts")
@@ -147,9 +145,10 @@ def _links(path):
     return links
 
 
-@functools.cache
 def _sandbox():
-    """sandbox-exec's command that runs the interpreter under PROFILE.
+    """sandbox-exec's command that runs the interpreter under PROFILE. Each
+    worker builds its own: an upgrade under a running server moves the real
+    paths it names.
 
     The kernel checks a path the worker opens by its real path, and each
     symbolic link it follows to get there as a read of the link: a venv's
@@ -214,11 +213,9 @@ def _start(arguments, source, output):
     """The interpreter, started with `arguments` as the worker starts: under
     the sandbox, in ROOT, and with no environment, so that no secret of the
     server's, such as SPLASH_API_KEY, reaches a process parsing untrusted
-    PDFs. With -E and -s, neither the environment nor the user's
-    site-packages decides what it imports; with -B it writes no bytecode,
-    which the profile would refuse."""
+    PDFs; with -B it writes no bytecode, which the profile would refuse."""
     return subprocess.Popen(
-        [*_sandbox(), sys.executable, "-E", "-s", "-B", *arguments],
+        [*_sandbox(), sys.executable, "-B", *arguments],
         stdin=source,
         stdout=output,
         stderr=subprocess.DEVNULL,

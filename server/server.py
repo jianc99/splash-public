@@ -1758,7 +1758,8 @@ def _stop_with(pid):
 
     The desktop app passes its own process ID as SPLASH_APP_PID, so a model
     it started gives its memory back when the app crashes, rather than at
-    the app's next launch. A process already gone stops the server at once.
+    the app's next launch. A process already gone stops the server at once:
+    kqueue returns its watch at once, as an error event.
     """
 
     def watch():
@@ -1769,10 +1770,7 @@ def _stop_with(pid):
             flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
             fflags=select.KQ_NOTE_EXIT,
         )
-        try:
-            queue.control([exited], 1, None)
-        except ProcessLookupError:
-            pass
+        queue.control([exited], 1, None)
         os.kill(os.getpid(), signal.SIGINT)
 
     threading.Thread(target=watch, name="stop-with-app", daemon=True).start()
@@ -1840,8 +1838,9 @@ def main():
         chat_templates = ChatTemplates(tokenizer)
         print_status(f"Chat template · {chat_templates.describe()}")
         # Unset, a budget ends thinking as the template closes it, so that the
-        # reply renders back as it was generated and the next request resumes
-        # at the state where it ended.
+        # next request renders that close back as the tokens the reply ended
+        # its thinking with; Qwen's templates still trim a space or line break
+        # the cut leaves before it.
         if thinking_end is None:
             thinking_end = thinking_end_tokens(
                 tokenizer, chat_templates.select(None).thinking_end, family.chat_format

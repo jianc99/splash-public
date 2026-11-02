@@ -993,11 +993,13 @@ request thinks on until the character is complete, a token or a few, and its
   model's tokenizer when it starts, and stops with an error on one that breaks
   these rules. Unset, the end is the close the chat template writes after a
   reasoning, which the server probes at startup: a line break then `</think>`
-  for Qwen's templates, `</think>` alone for Flint's. A reply whose thinking
-  the budget ended then renders back in the next request as it was generated,
-  so that the prompt cache reuses the whole reply; with `</think>` alone, the
-  Qwen templates' line break made the next request read the reply again. A
-  reasoning cut just after a line break still renders back with one less.
+  for Qwen's templates, `</think>` alone for Flint's. The next request then
+  renders the close of a reply whose thinking the budget ended as the tokens
+  the budget selected, so that its prompt keeps to the reply's tokens through
+  the cut and can read the reply's cached KV past it; an end that closes
+  otherwise, such as `</think>` alone on Qwen's templates, departs from the
+  reply at its close. Where the cut follows a space or a line break, the prompt
+  still departs there: Qwen's templates trim them from the reasoning.
 
 A model whose thinking is cut mid-thought may go on planning in its answer, and
 may close that with a `</think>` of its own. A chat answer drops every `</think>`
@@ -1017,10 +1019,11 @@ splash serve --model mlx-community/Qwen3.8-27B-4bit --thinking-token-budget 1200
 A budget applies only where generation starts in a thinking block, and one the
 output limit reaches first changes nothing; the output limit can also cut the
 end short. Where the context leaves a request less room than its output limit,
-its budget gives up the difference, down to none, so that the answer keeps the
-room the request left it: a budget of 24,576 under a limit of 32,768 with
-20,000 tokens of context left ends thinking at 11,808. A model that opens its
-thinking itself, as Flint does, never starts
+the budget keeps its share of that room, and the answer the rest, a limit past
+the budget plus the room counting as the budget plus the room: a budget of
+24,576 under a limit of 32,768 with 20,000 tokens of context left ends thinking
+at 15,000, and one of 8,192 under a limit of 2,147,483,647 with 122,072 left at
+7,676. A model that opens its thinking itself, as Flint does, never starts
 in one, and a budget caps nothing for it. Where the output may call a tool, a
 call's opening ends thinking too, so the end never lands inside a call. The
 engine takes any `<tool_call>` token for that opening, while the reply's

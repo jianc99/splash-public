@@ -35,7 +35,7 @@ final class Transcript {
     /// conversation, the same, tells at once; the whole conversation otherwise, but its last
     /// message alone where only that changed, as a reply that ended; nothing when the page shows
     /// them already.
-    func show(_ conversation: TranscriptPage, reply: TranscriptMessage? = nil) {
+    func show(_ conversation: TranscriptPage, reply: TranscriptMessage?) {
         let reply = reply.flatMap { conversation.messages.last?.id == $0.id ? $0 : nil }
         defer { (shown, self.reply) = (conversation, reply) }
         if conversation == shown {
@@ -52,7 +52,7 @@ final class Transcript {
 
     enum Change: Equatable {
         case none
-        /// The last message alone, as while it streams.
+        /// The last message alone, as a reply that ended.
         case message(TranscriptMessage)
         case page(TranscriptPage)
     }

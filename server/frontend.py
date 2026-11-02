@@ -1095,12 +1095,12 @@ class Frontend:
             )
         max_new = self._output_budget(requested, prompt_tokens, output_field)
         budget = options.thinking_token_budget
-        if budget is not None and requested is not None and budget < requested:
-            # Where the context leaves less room than the request asked for,
-            # the thinking gives up the difference: the answer keeps the room
-            # the request left it, which the output limit would otherwise
-            # take from it, the budget ending past the limit or not at all.
-            budget = max(0, budget - (requested - max_new))
+        if budget is not None and requested is not None:
+            # Where the context leaves less room than the request's limit, the
+            # thinking keeps its share of that room, and the answer the rest; a
+            # limit past the budget plus the room counts as the budget plus the
+            # room.
+            budget = budget * max_new // min(requested, budget + max_new)
         # A budget the output limit reaches first closes nothing.
         return self._generation_job(
             options,

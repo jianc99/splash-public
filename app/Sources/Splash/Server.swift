@@ -106,7 +106,9 @@ final class Server {
     private let runtime: Runtime
     private let log: URL
     private var child: ChildProcess?
-    private let record = ChildRecord(key: Preference.serverPID)
+    /// SIGTERM, which a running server takes for Ctrl+C and one already stopping ignores, where a
+    /// second Ctrl+C would stop its engine at once.
+    let record = ChildRecord(key: Preference.serverPID, stop: SIGTERM)
     private var tail: LogTail?
     private var stopRequested = false
     private var firstError: String?
@@ -157,9 +159,9 @@ final class Server {
         if child != nil { stop() } else { phase = .stopped }
     }
 
-    /// Stops the server an app started before it quit or crashed, if it still serves, and waits
+    /// Stops the server an app started before it quit or crashed, if it still runs, and waits
     /// until it has given its port and memory back. It stops by itself once that app has ended
-    /// (`SPLASH_APP_PID`); this stops one that has not yet, or that an older app started.
+    /// (`SPLASH_APP_PID`), and is left to finish; this stops one that has not yet.
     func stopLeftover() async {
         await record.stopLeftover()
     }

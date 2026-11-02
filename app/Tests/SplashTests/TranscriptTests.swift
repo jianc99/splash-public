@@ -19,7 +19,7 @@ struct TranscriptTests {
             ChatMessage(role: .user, text: "Sure?"),
             ChatMessage(role: .assistant, text: ""),
         ])
-        let live = ChatStore.Live(conversation: conversation.id, asked: asked, read: 0.45)
+        let live = ChatStore.Live(asked: asked, read: 0.45)
         let name = { (model: String) in "Name of \(model)" }
         let page = TranscriptPage(conversation, askAgain: .init(enabled: false, help: "Ask Big Again"), name: name)
             .streaming(TranscriptMessage(conversation.messages[3], live: live, asleep: false, name: name))
@@ -40,7 +40,7 @@ struct TranscriptTests {
         #expect(messages[3]["live"] as? Bool == true)
         #expect(messages[3]["line"] as? [String: AnyHashable] == ["verb": "Reading", "facts": "45%", "since": NSNull()])
         // Dates in milliseconds, as JavaScript counts them.
-        let waiting = TranscriptMessage(conversation.messages[3], live: ChatStore.Live(conversation: conversation.id, asked: asked),
+        let waiting = TranscriptMessage(conversation.messages[3], live: ChatStore.Live(asked: asked),
                                         asleep: false, name: { $0 })
         let line = try #require(JSONSerialization.jsonObject(with: WebPage.encoder.encode(waiting.line)) as? [String: Any])
         #expect(line["since"] as? Double == 1_000_000)
@@ -52,28 +52,27 @@ struct TranscriptTests {
         func line(_ message: ChatMessage, _ live: ChatStore.Live?, asleep: Bool = false) -> ReplyLine? {
             ReplyLine(message, live: live, asleep: asleep)
         }
-        let id = UUID()
         // Reading: how much of the prompt, or the seconds since it was asked until the server says.
-        #expect(line(waiting, .init(conversation: id, asked: asked)) == ReplyLine(verb: "Reading", facts: nil, since: asked))
-        #expect(line(waiting, .init(conversation: id, asked: asked, read: 0.456))
+        #expect(line(waiting, .init(asked: asked)) == ReplyLine(verb: "Reading", facts: nil, since: asked))
+        #expect(line(waiting, .init(asked: asked, read: 0.456))
             == ReplyLine(verb: "Reading", facts: "45%", since: nil))
         // A model the idle release put to sleep loads again first.
-        #expect(line(waiting, .init(conversation: id, asked: asked, read: 0.5), asleep: true)
+        #expect(line(waiting, .init(asked: asked, read: 0.5), asleep: true)
             == ReplyLine(verb: "Loading into memory", facts: nil, since: asked))
         // Thinking, the seconds since it began.
         let thinking = ChatMessage(role: .assistant, text: "", reasoning: "Hm.")
-        #expect(line(thinking, .init(conversation: id, asked: asked, thinking: started))
+        #expect(line(thinking, .init(asked: asked, thinking: started))
             == ReplyLine(verb: "Thinking", facts: nil, since: started))
         // Once it answers, what the thinking took, though the reply still streams.
         var answered = thinking
         answered.text = "Yes."
         answered.thinkingTime = 9.96
-        #expect(line(answered, .init(conversation: id, asked: asked, thinking: started))
+        #expect(line(answered, .init(asked: asked, thinking: started))
             == ReplyLine(verb: "Thinking", facts: "10s", since: nil))
         answered.thinkingTime = nil
         #expect(line(answered, nil) == ReplyLine(verb: "Thinking", facts: nil, since: nil))
         // No line for a reply that answers without thinking, or once it has ended.
-        #expect(line(ChatMessage(role: .assistant, text: "Yes."), .init(conversation: id, asked: asked)) == nil)
+        #expect(line(ChatMessage(role: .assistant, text: "Yes."), .init(asked: asked)) == nil)
         #expect(line(waiting, nil) == nil)
     }
 
@@ -126,7 +125,7 @@ struct TranscriptTests {
                 """),
         ])
         let askAgain = TranscriptPage.AskAgain(enabled: true, help: "Ask Big Again")
-        transcript.show(TranscriptPage(conversation, askAgain: askAgain, name: { $0 }))
+        transcript.show(TranscriptPage(conversation, askAgain: askAgain, name: { $0 }), reply: nil)
         func run(_ script: String) async throws -> String {
             try await webView.callAsyncJavaScript(script, contentWorld: .page) as? String ?? ""
         }
@@ -206,7 +205,7 @@ struct TranscriptTests {
         var messages = (0..<12).flatMap { _ in [ChatMessage(role: .user, text: "Tell me more."), ChatMessage(role: .assistant, text: paragraph)] }
         let id = UUID()
         func show(_ messages: [ChatMessage]) {
-            transcript.show(TranscriptPage(Conversation(id: id, messages: messages), askAgain: .init(enabled: false, help: ""), name: { $0 }))
+            transcript.show(TranscriptPage(Conversation(id: id, messages: messages), askAgain: .init(enabled: false, help: ""), name: { $0 }), reply: nil)
         }
         // Where the page is two frames on, however long WebKit takes to draw them: by then the
         // scroll and resize observers have seen what came before, as the follow of a reply that grew.
@@ -253,8 +252,8 @@ struct TranscriptTests {
         let question = ChatMessage(role: .user, text: "Show me.")
         var reply = ChatMessage(role: .assistant, text: "")
         let page = TranscriptPage(Conversation(messages: [question, reply]), askAgain: .init(enabled: false, help: ""), name: { $0 })
-        let live = ChatStore.Live(conversation: page.id, asked: .now)
-        transcript.show(page)
+        let live = ChatStore.Live(asked: .now)
+        transcript.show(page, reply: nil)
         /// Sends `reply`, streaming or not, as the app does, and returns what the page shows of it
         /// at once, before any frame: its text's length.
         func send(live streaming: Bool) async throws -> Int {
@@ -304,7 +303,7 @@ struct TranscriptTests {
         let reply = ChatMessage(role: .assistant, text: "", reasoning: thought)
         let page = TranscriptPage(Conversation(messages: [ChatMessage(role: .user, text: "Think."), reply]),
                                   askAgain: .init(enabled: false, help: ""), name: { $0 })
-        let live = ChatStore.Live(conversation: page.id, asked: .now, thinking: .now)
+        let live = ChatStore.Live(asked: .now, thinking: .now)
         transcript.show(page, reply: TranscriptMessage(reply, live: live, asleep: false, name: { $0 }))
         func text() async throws -> String {
             try await webView.callAsyncJavaScript("return document.querySelector('.reply .text > div').textContent",
@@ -357,6 +356,173 @@ struct TranscriptTests {
         _ = transcript
     }
 
+    @Test func aReplyThatStreamsShowsWhatItHasAtOnceWhereItOpens() async throws {
+        let (_, webView, window) = try await shownPage()
+        defer { window.orderOut(nil) }
+        let paragraph = String(repeating: "A sentence that goes on for a while. ", count: 20).trimmingCharacters(in: .whitespaces)
+        let reply = ChatMessage(role: .assistant, text: paragraph)
+        let streaming = TranscriptPage(Conversation(messages: [ChatMessage(role: .user, text: "Go on."), reply]),
+                                       askAgain: .init(enabled: false, help: ""), name: { $0 })
+            .streaming(TranscriptMessage(reply, live: ChatStore.Live(asked: .now), asleep: false, name: { $0 }))
+        let other = TranscriptPage(Conversation(messages: [ChatMessage(role: .user, text: "Hi.")]),
+                                   askAgain: .init(enabled: false, help: ""), name: { $0 })
+        /// What the page shows of the reply as it opens `page`, before any frame.
+        func open(_ page: TranscriptPage) async throws -> String {
+            let json = String(decoding: try WebPage.encoder.encode(page), as: UTF8.self)
+            return try await webView.callAsyncJavaScript("""
+                transcript.show(JSON.parse(json))
+                return document.querySelector('.reply .markdown')?.textContent ?? ''
+                """, arguments: ["json": json], contentWorld: .page) as? String ?? ""
+        }
+        // Opened while it streams, as once the page has loaded again, and again after another.
+        #expect(try await open(streaming) == paragraph)
+        _ = try await open(other)
+        #expect(try await open(streaming) == paragraph)
+    }
+
+    @Test func aReplyThatStreamsIsCutOnlyWhereWhatComesBeforeDrawsAsInTheWhole() async throws {
+        let (_, webView, window) = try await shownPage()
+        defer { window.orderOut(nil) }
+        // Each text streamed a character at a time, and each step drawn as it streams and whole,
+        // which once past `settled` are the same: a list goes on past a blank line, its next
+        // marker, indented or not, coming a character at a time; a fence, of backticks or tildes,
+        // closes only on its own character, as long or longer, with nothing after it, and less
+        // than four columns in from its container; a backtick fence's info has no backtick; a
+        // fence opens where its list item does, and a line indented four columns is code, marker
+        // or not; lines end in any of the parser's line ends.
+        let texts = [
+            ["", "Intro.\n\n1. a\n\n2. b\n\n   More of b.\n\n- c\n\n- d\n\nDone."],
+            ["", "Intro.\n\n~~~\nt\n\nu\n~~~\n\n~~~\n```\nx\n\ny\n~~~\n\n````\n```\nz\n\nw\n````\n\n```\n```js\nu\n\nv\n```\n\nDone."],
+            ["```swift\nlet a = 1\n```", "\n```a`b\n\nDone."],
+            ["", "Intro.\n\n```\n# Tool\n\n1. Install:\n\n    ```bash\n    pip\n    ```\n\n## Usage\n\nRun.\n```\n\nDone."],
+            ["", "```\ndef a():\n    ```\n\ndef b():\n    pass\n```\n\nDone."],
+            ["", "  ```\nx\n     ```\n\ny\n  ```\n\nDone."],
+            ["", "- ```\n  code\n  ```\n\nDone.\n\n```\nx\n\ny\n```\n\nEnd."],
+            ["", "    ```\n\nDone.\n\n```\nx\n\ny\n```\n\nEnd."],
+            ["", "Intro.\r\n\r\n```\r\nx\r\n\r\ny\r\n```\r\n\r\nDone."],
+            ["", "a\r\r\rb\n```\n\nd\n```\n\nDone."],
+            ["", "1. a\n\n 2. b\n\nDone."],
+        ]
+        let differs = try await webView.callAsyncJavaScript("""
+            const differs = []
+            for (const [settled, rest] of JSON.parse(json)) {
+              const text = settled + rest
+              const live = document.createElement('div'), whole = document.createElement('div')
+              for (let end = 1; end <= text.length; end++) {
+                markdown.draw(live, text.slice(0, end), true)
+                markdown.draw(whole, text.slice(0, end))
+                if (end >= settled.length && live.innerHTML !== whole.innerHTML) {
+                  differs.push(text.slice(0, end))
+                  break
+                }
+              }
+            }
+            return differs
+            """, arguments: ["json": String(decoding: try JSONEncoder().encode(texts), as: UTF8.self)], contentWorld: .page) as? [String]
+        #expect(differs == [])
+    }
+
+    /// Code that streams shows as it is until its fence closes, whatever looks like closing it.
+    @Test func aFenceStaysOpenUntilTheParserClosesIt() async throws {
+        let (_, webView, window) = try await shownPage()
+        defer { window.orderOut(nil) }
+        let cases: [(String, Int)] = [
+            ("```swift\nlet a = 1\n", 0),
+            ("```swift\n", 0),
+            ("```swift\nlet a = 1\n    ```\nlet b = 2\n", 0),
+            ("- ```swift\n  let a = 1\n", 0),
+            ("> ```swift\n> let a = 1\n", 0),
+            ("```swift\nlet a = 1\n```", 1),
+            ("```swift\nlet a = 1\n```\n", 1),
+            ("```swift\nlet a = 1\n  ```\n", 1),
+            ("- ```swift\n  let a = 1\nDone.", 1),
+            ("> ```swift\n> let a = 1\nDone.", 1),
+        ]
+        for (text, keywords) in cases {
+            let drawn = try await webView.callAsyncJavaScript("""
+                const live = document.createElement('div')
+                markdown.draw(live, text, true)
+                return live.querySelectorAll('.hljs-keyword').length
+                """, arguments: ["text": text], contentWorld: .page) as? Int
+            #expect(drawn == keywords, "\(text)")
+        }
+    }
+
+    /// Without Markdown a reply shows as it came, as it streams too.
+    @Test func withoutMarkdownAReplyStreamsAsItCame() async throws {
+        let transcript = Transcript(runtime: Runtime(root: URL(filePath: "/nonexistent")))
+        transcript.page.load()
+        let webView = try #require(transcript.page.webView)
+        try await waitFor(transcript.page.loaded)
+        let drawn = try await webView.callAsyncJavaScript("""
+            const live = document.createElement('div')
+            markdown.draw(live, 'a **b**\\n\\nc', true)
+            return live.innerHTML
+            """, contentWorld: .page) as? String
+        #expect(drawn == "<p>a **b**\n\nc</p>")
+    }
+
+    /// Text let out over the frames never ends in half of a character of two UTF-16 units. Two
+    /// texts of a length, the characters of each a unit further on, which each frame lets out as
+    /// much of: wherever it cuts them, one has half a character there.
+    @Test func textLetOutNeverShowsHalfACharacter() async throws {
+        let (_, webView, window) = try await shownPage()
+        defer { window.orderOut(nil) }
+        let cut = try await webView.callAsyncJavaScript("""
+            const faces = '\\u{1F600}'.repeat(300)
+            const whole = {first: faces + '.', last: '.' + faces}
+            const shown = []
+            const paced = page.paced(texts => shown.push(texts))
+            paced.to({first: '', last: ''}, true)
+            paced.to(whole, true)
+            const done = () => shown.at(-1).first === whole.first && shown.at(-1).last === whole.last
+            const deadline = performance.now() + 10000
+            while (!done() && performance.now() < deadline) await new Promise(requestAnimationFrame)
+            return done() ? shown.flatMap(Object.values).filter(text => /[\\uD800-\\uDBFF]$/.test(text)).length : -1
+            """, contentWorld: .page) as? Int
+        #expect(cut == 0)
+    }
+
+    /// With Reduce Motion a reply shows all that came at once, and the page follows it at once.
+    @Test func withReduceMotionAReplyShowsAtOnceAndThePageFollowsAtOnce() async throws {
+        let (transcript, webView, window) = try await shownPage()
+        defer { window.orderOut(nil) }
+        // The system's setting as the page reads it, which it reads each time.
+        _ = try await webView.callAsyncJavaScript("""
+            Object.defineProperty(MediaQueryList.prototype, 'matches', {configurable: true, get() { return this.media.includes('reduced-motion') }})
+            """, contentWorld: .page)
+        let paragraph = String(repeating: "A sentence that goes on for a while. ", count: 12).trimmingCharacters(in: .whitespaces)
+        let earlier = (0..<8).flatMap { _ in [ChatMessage(role: .user, text: "Tell me more."), ChatMessage(role: .assistant, text: paragraph)] }
+        var reply = ChatMessage(role: .assistant, text: paragraph)
+        let page = TranscriptPage(Conversation(messages: earlier + [ChatMessage(role: .user, text: "And?"), reply]),
+                                  askAgain: .init(enabled: false, help: ""), name: { $0 })
+        let live = ChatStore.Live(asked: .now)
+        transcript.show(page, reply: nil)
+        // Every reply drawn, which the page does after it shows, and it at the bottom.
+        let ready = try await settled({
+            try await webView.callAsyncJavaScript("""
+                await new Promise(drawn => requestAnimationFrame(() => requestAnimationFrame(drawn)))
+                return [...document.querySelectorAll('.reply .markdown')].every(body => body.textContent !== '')
+                    && document.scrollingElement.scrollHeight - innerHeight - scrollY === 0
+                """, contentWorld: .page) as? Bool ?? false
+        }) { $0 }
+        #expect(ready)
+        for _ in 0..<3 {
+            reply.text += " " + paragraph
+            let message = TranscriptMessage(reply, live: live, asleep: false, name: { $0 })
+            let shown = try await webView.callAsyncJavaScript("""
+                transcript.update(JSON.parse(json))
+                return document.querySelector('#messages > article:last-child .markdown').textContent
+                """, arguments: ["json": String(decoding: try WebPage.encoder.encode(message), as: UTF8.self)], contentWorld: .page) as? String
+            #expect(shown == reply.text)
+            let gap = try await webView.callAsyncJavaScript("""
+                await new Promise(drawn => requestAnimationFrame(() => requestAnimationFrame(drawn)))
+                return document.scrollingElement.scrollHeight - innerHeight - scrollY
+                """, contentWorld: .page) as? Double
+            #expect(gap == 0)
+        }
+    }
+
     @Test func thePageFollowsAReplyThatStreamsUntilTheReaderScrollsUp() async throws {
         let (transcript, webView, window) = try await shownPage()
         defer { window.orderOut(nil) }
@@ -365,8 +531,8 @@ struct TranscriptTests {
         var reply = ChatMessage(role: .assistant, text: "")
         let page = TranscriptPage(Conversation(messages: earlier + [ChatMessage(role: .user, text: "And?"), reply]),
                                   askAgain: .init(enabled: false, help: ""), name: { $0 })
-        let live = ChatStore.Live(conversation: page.id, asked: .now)
-        transcript.show(page)
+        let live = ChatStore.Live(asked: .now)
+        transcript.show(page, reply: nil)
         func position() async throws -> (gap: Double, latest: Bool) {
             let values = try await webView.callAsyncJavaScript(
                 "return [document.scrollingElement.scrollHeight - innerHeight - scrollY, document.getElementById('latest').classList.contains('shown') ? 1 : 0]",
@@ -401,7 +567,7 @@ struct TranscriptTests {
         let messages = (0..<20).flatMap { index in
             [ChatMessage(role: .user, text: "Question \(index)"), ChatMessage(role: .assistant, text: "Answer \(index). \(paragraph)")]
         }
-        transcript.show(TranscriptPage(Conversation(messages: messages), askAgain: .init(enabled: false, help: ""), name: { $0 }))
+        transcript.show(TranscriptPage(Conversation(messages: messages), askAgain: .init(enabled: false, help: ""), name: { $0 }), reply: nil)
         func run(_ script: String) async throws -> String {
             try await webView.callAsyncJavaScript("""
                 await new Promise(drawn => requestAnimationFrame(() => requestAnimationFrame(drawn)))
@@ -522,6 +688,38 @@ struct TranscriptTests {
     }
 }
 
+/// The page of the Chat's transcript, apart from what it shows. A suite of its own, as its test
+/// waits a minute, while the others run.
+@MainActor
+struct WebPageTests {
+    @Test func aPageWhoseProcessKeepsEndingLoadsAgainThreeTimesAMinute() async throws {
+        let transcript = Transcript(runtime: Showcase.runtime)
+        let page = transcript.page
+        page.load()
+        let webView = try #require(page.webView)
+        func loads(within seconds: Double) async throws {
+            let deadline = ContinuousClock.now + .seconds(seconds)
+            while !page.loaded {
+                try #require(ContinuousClock.now < deadline, "timed out")
+                try await Task.sleep(for: .milliseconds(20))
+            }
+        }
+        try await loads(within: 10)
+        let first = ContinuousClock.now
+        for _ in 0..<3 {
+            page.webViewWebContentProcessDidTerminate(webView)
+            #expect(!page.loaded)
+            try await loads(within: 10)
+        }
+        // A fourth time within the minute, once the minute since the first has passed.
+        page.webViewWebContentProcessDidTerminate(webView)
+        try await Task.sleep(for: .seconds(2))
+        #expect(!page.loaded)
+        try await loads(within: 70)
+        #expect(ContinuousClock.now - first >= .seconds(60))
+    }
+}
+
 /// A conversation with every kind of content the Chat shows, drawn to `transcript-*.png` in
 /// `SPLASH_APP_SNAPSHOTS`, light and dark, for people to review the transcript's look: the whole
 /// window at the conversation's start, middle and end, then the reply line's states while a reply
@@ -565,19 +763,19 @@ struct TranscriptPictures {
         while !transcript.page.loaded { try await Task.sleep(for: .milliseconds(20)) }
         let question = ChatMessage(role: .user, text: "Why is the sea salty?")
         let thought = (1...14).map { "Line \($0) of the model’s thinking, which goes on for a while to wrap." }.joined(separator: "\n")
-        let states: [(String, ChatMessage, (UUID) -> ChatStore.Live, Bool)] = [
-            ("reading", ChatMessage(role: .assistant, text: ""), { .init(conversation: $0, asked: .now - 3, read: 0.45) }, false),
-            ("loading", ChatMessage(role: .assistant, text: ""), { .init(conversation: $0, asked: .now - 3.2) }, true),
+        let states: [(String, ChatMessage, () -> ChatStore.Live, Bool)] = [
+            ("reading", ChatMessage(role: .assistant, text: ""), { .init(asked: .now - 3, read: 0.45) }, false),
+            ("loading", ChatMessage(role: .assistant, text: ""), { .init(asked: .now - 3.2) }, true),
             ("thinking", ChatMessage(role: .assistant, text: "", reasoning: thought),
-             { .init(conversation: $0, asked: .now - 9, thinking: .now - 5.4) }, false),
+             { .init(asked: .now - 9, thinking: .now - 5.4) }, false),
             ("streaming", ChatMessage(role: .assistant, text: "Rivers carry salts from rocks into the sea.\n\n```python\nsalt = 35  # grams per litre\n",
                                       reasoning: thought, model: "a/Big-GGUF:Q4", thinkingTime: 5.4, reasoningTokens: 320),
-             { .init(conversation: $0, asked: .now - 9, thinking: .now - 7) }, false),
+             { .init(asked: .now - 9, thinking: .now - 7) }, false),
         ]
         for (name, reply, live, asleep) in states {
             let conversation = Conversation(messages: [question, reply])
             let page = TranscriptPage(conversation, askAgain: .init(enabled: false, help: "Ask Big Again"), name: { _ in "Big" })
-            let streaming = TranscriptMessage(reply, live: live(conversation.id), asleep: asleep, name: { _ in "Big" })
+            let streaming = TranscriptMessage(reply, live: live(), asleep: asleep, name: { _ in "Big" })
             await Snapshot.save("transcript-\(name)", size: CGSize(width: 860, height: 520),
                                 TranscriptView(transcript: transcript, page: page, reply: streaming).background(.background))
         }

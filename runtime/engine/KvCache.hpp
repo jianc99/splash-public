@@ -241,10 +241,13 @@ public:
   // Abandons an unsubmitted restore at an unused leaf, keeping its disk copy.
   [[nodiscard]] bool abandonRestore(uint64_t blockId);
   // A restore or a read of its copy that failed: the block matches nothing
-  // any more and leaves once its subtree, users and holders are gone. Its
-  // copy goes at once, unless a request holds the block or its page holds
-  // only its index: then it leaves with the block.
+  // any more and leaves once its subtree, users, holders and transfer are
+  // gone. Its copy goes at once, unless a request holds the block or its
+  // page holds only its index: then it leaves with the block.
   void poison(uint64_t blockId);
+  // Erases the block if it is poisoned and nothing refers to it any more: no
+  // child, user, holder or transfer.
+  void erasePoisonedLeaf(uint64_t blockId) noexcept;
 
   // Oldest resident leaf (no resident children) that no request uses. Pass
   // the previous candidate to continue the scan without a lookup.
@@ -376,8 +379,6 @@ private:
   // Applies count to every block above this one.
   template <typename Count>
   void countAbove(uint64_t blockId, const Count &count) noexcept;
-  // A poisoned block leaves as soon as nothing refers to it.
-  void erasePoisonedLeaf(uint64_t blockId) noexcept;
 
   KvPool &pool_;
   CacheRecency &recency_;

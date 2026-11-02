@@ -233,9 +233,9 @@ final class AppState {
         installer.install(model)
     }
 
-    /// Stops the download, the model, the drawer's terminals and the installer of cached models for
-    /// the app to quit, and starts nothing after. The installer gets SIGINT, as Ctrl+C sends, and
-    /// SIGTERM 5 s later.
+    /// Stops the download, the model and the installer of cached models, which the app waits for
+    /// as it quits, and the drawer's terminals, and starts nothing after. The installer gets
+    /// SIGINT, as Ctrl+C sends, and SIGTERM 5 s later.
     func quit() {
         quitting = true
         chats.stop()

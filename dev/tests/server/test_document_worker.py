@@ -75,6 +75,7 @@ print(json.dumps({
     "home": attempt(lambda: os.listdir(home)),
     "private": attempt(lambda: open(private).read()),
     "beside": attempt(lambda: open(beside).read()),
+    "urandom": attempt(lambda: open("/dev/urandom", "rb").read(1)),
     "write": attempt(lambda: open(os.path.join(folder, "written"), "w").close()),
     "connect": attempt(
         lambda: socket.create_connection(("127.0.0.1", int(port)), 10).close()
@@ -116,6 +117,13 @@ def worker(payload, sandboxed=True):
     limits = json.dumps(asdict(full_render_limits()))
     return run(
         ["-m", "server.document_worker", limits, "30"], payload, sandboxed=sandboxed
+    )
+
+
+def parameters(command):
+    """The parameters sandbox-exec's `command` gives its profile, by name."""
+    return dict(
+        argument[2:].split("=", 1) for argument in command if argument.startswith("-D")
     )
 
 
@@ -276,6 +284,7 @@ class SandboxTests(unittest.TestCase):
             "home",
             "private",
             "beside",
+            "urandom",
             "write",
             "connect",
             "fork",
@@ -306,7 +315,8 @@ class SandboxTests(unittest.TestCase):
             base = Path(os.path.realpath(folder))
             (base / "real" / "bin").mkdir(parents=True)
             (base / "real" / "bin" / "tool").touch()
-            (base / "real" / "bin" / "run").symlink_to("../bin/tool")
+            (base / "real" / "bin" / "next").symlink_to("tool")
+            (base / "real" / "bin" / "run").symlink_to("../bin/next")
             (base / "alias").symlink_to("real")
             (base / "absolute").symlink_to(base / "alias")
             (base / "loop").symlink_to("loop")
@@ -316,6 +326,7 @@ class SandboxTests(unittest.TestCase):
                     base / "absolute",
                     base / "alias",
                     base / "real" / "bin" / "run",
+                    base / "real" / "bin" / "next",
                 ],
             )
             self.assertEqual(document_worker._links(base / "real" / "bin" / "tool"), [])
@@ -323,24 +334,45 @@ class SandboxTests(unittest.TestCase):
                 len(document_worker._links(base / "loop")), document_worker.MAX_LINKS
             )
 
+    def test_each_start_follows_an_upgrade_of_the_interpreter(self):
+        # An upgrade under a running server repoints a link on the way to the
+        # interpreter (Homebrew's opt, uv's minor version), and the kernel
+        # checks the next worker by the new real paths.
+        with tempfile.TemporaryDirectory() as folder:
+            base = Path(os.path.realpath(folder))
+            old, new = base / "3.13.1", base / "3.13.2"
+            opt = base / "opt"
+            commands = []
+            for tree in (old, new):
+                (tree / "bin").mkdir(parents=True)
+                (tree / "bin" / "python3.13").touch()
+                opt.unlink(missing_ok=True)
+                opt.symlink_to(tree)
+                with mock.patch.multiple(
+                    sys,
+                    executable=str(opt / "bin" / "python3.13"),
+                    base_prefix=str(opt),
+                ):
+                    commands.append(document_worker._sandbox())
+        before, after = (set(parameters(command).values()) for command in commands)
+        self.assertLessEqual({str(old / "bin" / "python3.13"), str(old)}, before)
+        self.assertLessEqual({str(new / "bin" / "python3.13"), str(new)}, after)
+        self.assertEqual([value for value in after if str(old) in value], [])
+
     def test_worker_starts_through_a_linked_folder(self):
         # The same interpreter, reached through a link to its prefix: a venv's
         # own, whose interpreter is a link, or the installation's.
         venv = sys.prefix != sys.base_prefix
         prefix = sys.prefix if venv else os.path.realpath(sys.prefix)
         executable = sys.executable if venv else os.path.realpath(sys.executable)
-        document_worker._sandbox.cache_clear()
-        self.addCleanup(document_worker._sandbox.cache_clear)
         with tempfile.TemporaryDirectory() as folder:
             link = Path(folder, "runtime")
             link.symlink_to(prefix)
             linked = link / os.path.relpath(executable, prefix)
             with mock.patch.object(sys, "executable", str(linked)):
                 started = worker(pdf_bytes())
-                document_worker._sandbox.cache_clear()
                 with mock.patch.object(document_worker, "_links", return_value=[]):
                     refused = worker(pdf_bytes())
-                document_worker._sandbox.cache_clear()
         self.assertEqual(started, worker(pdf_bytes(), sandboxed=False))
         # Without the links, sandbox-exec cannot start it.
         self.assertEqual(refused, (document_worker.SANDBOX_FAILED, b""))
@@ -350,8 +382,6 @@ class SandboxTests(unittest.TestCase):
         # its folder and starts the framework's Python.app, as CI's does;
         # Homebrew's prefix is a link (/opt/homebrew/opt), and the kernel
         # checks what starts by its real path.
-        document_worker._sandbox.cache_clear()
-        self.addCleanup(document_worker._sandbox.cache_clear)
         with tempfile.TemporaryDirectory() as folder:
             real = Path(os.path.realpath(folder), "Cellar", "Versions", "3.13")
             app = real / "Resources" / "Python.app" / "Contents" / "MacOS" / "Python"
@@ -365,20 +395,11 @@ class SandboxTests(unittest.TestCase):
             with mock.patch.multiple(
                 sys, executable=str(base / "bin" / "python3.13"), base_prefix=str(base)
             ):
-                command = document_worker._sandbox()
-        parameters = dict(
-            argument[2:].split("=", 1)
-            for argument in command
-            if argument.startswith("-D")
-        )
-        started = {
-            value for name, value in parameters.items() if name.startswith("PYTHON")
-        }
+                named = parameters(document_worker._sandbox())
+        started = {value for name, value in named.items() if name.startswith("PYTHON")}
         self.assertEqual(started, {str(launcher), str(app)})
         # The folders by their real paths, the linked one where its link leads.
-        folders = {
-            value for name, value in parameters.items() if name.startswith("FOLDER")
-        }
+        folders = {value for name, value in named.items() if name.startswith("FOLDER")}
         self.assertLessEqual({str(launcher.parent), str(real), "/"}, folders)
         self.assertNotIn(str(base / "bin"), folders)
 

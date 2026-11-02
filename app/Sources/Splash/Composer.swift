@@ -180,8 +180,8 @@ struct Ring<Tint: ShapeStyle>: View {
     }
 }
 
-/// The send and stop button: a circle in the label color, the composer's one solid element, faded
-/// as the app's controls fade while it can't be used.
+/// The send and stop button: a circle, the composer's one solid element, in the mark's color, the
+/// app's one accent, while it can send or stop; gray while it can't.
 private struct InkCircle: ButtonStyle {
     @Environment(\.isEnabled) private var isEnabled
 
@@ -189,7 +189,6 @@ private struct InkCircle: ButtonStyle {
         configuration.label
             .foregroundStyle(.background)
             .frame(width: 28, height: 28)
-            // The mark's color while it sends or stops, the app's one accent; gray while it can't.
             .background(isEnabled ? AnyShapeStyle(Color.splash) : AnyShapeStyle(.tertiary), in: .circle)
             .opacity(configuration.isPressed ? 0.7 : 1)
     }

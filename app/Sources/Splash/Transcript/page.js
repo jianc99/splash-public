@@ -1,6 +1,7 @@
-// What the app's pages do alike (WebPage.swift): send the app a message, draw the symbols it sends,
-// copy and say so, follow the latest while the reader is at the bottom, let text that streams out
-// at an even pace, and count seconds.
+// What the transcript's page does apart from drawing its messages (transcript.js): send the app a
+// message, draw the symbols it sends, copy and say so, follow the latest while the reader is at
+// the bottom, let text that streams out at an even pace, show a thought's latest lines, keep room
+// for messages not drawn yet, and count seconds.
 'use strict';
 
 const page = (() => {
@@ -133,15 +134,14 @@ const page = (() => {
     }).observe(content);
     addEventListener('resize', () => follow(true));
 
-    // A message laid out only near the screen (page.css) takes its own height as it comes on it, in
-    // place of the room kept for it: one that starts above the screen would move what the reader
-    // reads by as much, and the scroller moves with it, as browsers anchor scrolling, which
+    // A message laid out only near the screen (transcript.css) takes its own height as it comes on
+    // it, in place of the room kept for it: one that starts above the screen would move what the
+    // reader reads by as much, and the scroller moves with it, as browsers anchor scrolling, which
     // WebKit doesn't. Only then: a message that grows as it streams, or as the reader opens a line
     // in it, stays where it is. The observer measures it after the layout the frame does anyway;
     // the event that says it is laid out again comes before that or after, so that it counts as
     // coming on the screen while it is still skipped, or where the event found it laid out at
-    // another height than measured last. From the top down, as each moves where those under it
-    // are.
+    // another height than measured last. From the top down, as each moves where those under it are.
     const heights = new WeakMap();
     const anchor = new ResizeObserver(entries => {
       const drawn = [];
@@ -215,7 +215,8 @@ const page = (() => {
   // a reply every 50 ms, shows at about the rate it comes, about a tenth of a second behind it.
   // `draw` gets what to show of each of the texts `to` was given; all of them at once once they
   // no longer stream, so that a reply's end is never held back, and with Reduce Motion. A text
-  // that does not go on from what shows shows whole at once.
+  // shows whole at once the first time it is given, as when the page opens a reply that streams,
+  // and where it does not go on from what shows.
   function paced(draw) {
     let target = {};
     let shown = {};
@@ -225,7 +226,7 @@ const page = (() => {
     function to(texts, live) {
       target = texts;
       for (const [key, text] of Object.entries(texts)) {
-        shown[key] ??= '';
+        shown[key] ??= text;
         if (!live || reduced.matches || !text.startsWith(shown[key])) shown[key] = text;
       }
       draw({...shown});
@@ -292,9 +293,9 @@ const page = (() => {
   const measure = text => tall.observe(text);
 
   // How tall a message of `text` might be, for one never drawn yet: the room a long conversation's
-  // messages off the screen keep (page.css, content-visibility), so that the scroller is about as
-  // long as the conversation before the reader has seen all of it. Lines of about 80 characters,
-  // 24 px each.
+  // messages off the screen keep (transcript.css, content-visibility), so that the scroller is
+  // about as long as the conversation before the reader has seen all of it. Lines of about 80
+  // characters, 24 px each.
   function estimate(element, text) {
     let rows = 0;
     for (const line of text.split('\n')) rows += Math.max(1, Math.ceil(line.length / 80));

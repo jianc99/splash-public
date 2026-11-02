@@ -468,10 +468,7 @@ private struct ProblemRow: View {
             }
             Spacer(minLength: 12)
             if let log {
-                Button("Show Log") {
-                    state.drawer.log = log
-                    state.showDrawer(.logs)
-                }
+                Button("Show Log") { state.showLog(log) }
             }
             if let action { Button(action.title, action: action.run) }
             if let dismiss {

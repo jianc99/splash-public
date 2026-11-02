@@ -1,12 +1,11 @@
 import AppKit
 import WebKit
 
-/// A page of the app's own, shown in the system's WebKit: its text selectable across what it shows
-/// and scrolled by WebKit off the main thread. It loads once, from the app's resources with the
-/// runtime's markdown-it and highlight.js; after that only data goes to it, as JSON. It outlives
-/// the views it shows in, so that showing it again never loads it again. The Chat's transcript is
-/// one (`Transcript`): a page's own scripts and styles are in its folder, and what the app's pages
-/// share is this, the scripts and styles in Shared/, and their look.
+/// The web page the Chat's transcript is (`Transcript`), shown in the system's WebKit: its text
+/// selectable across what it shows and scrolled by WebKit off the main thread. It loads once, from
+/// the app's resources with the runtime's markdown-it and highlight.js; after that only data goes
+/// to it, as JSON. It outlives the views it shows in, so that showing it again never loads it
+/// again.
 @MainActor
 final class WebPage: NSObject {
     /// What the page asks of the app, but copies, which it takes itself.
@@ -22,13 +21,14 @@ final class WebPage: NSObject {
     private(set) var webView: WKWebView?
     /// Whether the page has loaded, and takes data.
     private(set) var loaded = false
-    /// When the page's process ended lately, which bounds how often it loads again.
-    private var terminations: [ContinuousClock.Instant] = []
+    /// When the page loaded again after its process ended, the last three times, which bound how
+    /// often it does.
+    private var reloads: [ContinuousClock.Instant] = []
 
     /// The page `name`.html in `folder` of the app's resources, drawing `glyphs` besides the
-    /// symbols every page draws.
-    init(_ name: String, in folder: String, runtime: Runtime, glyphs: [String: Glyph] = [:],
-         schemes: [String: any WKURLSchemeHandler] = [:]) {
+    /// symbols of page.css.
+    init(_ name: String, in folder: String, runtime: Runtime, glyphs: [String: Glyph],
+         schemes: [String: any WKURLSchemeHandler]) {
         page = Bundle.resources.url(forResource: name, withExtension: "html", subdirectory: folder)
         scripts = runtime.markdownScripts
         self.glyphs = Self.glyphs.merging(glyphs) { _, own in own }
@@ -55,8 +55,7 @@ final class WebPage: NSObject {
         // A drop would load what was dropped in place of the page.
         view.unregisterDraggedTypes()
         view.navigationDelegate = self
-        // The page's folder and Shared/ beside it, which its scripts and styles come from.
-        view.loadFileURL(page, allowingReadAccessTo: page.deletingLastPathComponent().deletingLastPathComponent())
+        view.loadFileURL(page, allowingReadAccessTo: page.deletingLastPathComponent())
         webView = view
     }
 
@@ -97,7 +96,7 @@ final class WebPage: NSObject {
         }
     }
 
-    /// The symbols every page draws (Shared/page.css), by name.
+    /// The symbols page.css draws, by name.
     private static let glyphs = [
         "chevron": Glyph("chevron.right", size: 10, weight: .semibold),
         "copy": Glyph("doc.on.doc", size: 12),
@@ -124,14 +123,18 @@ extension WebPage: WKNavigationDelegate {
     }
 
     /// The page's process ended, as when the system took its memory back: the page loads again
-    /// and shows what it showed. Not a fourth time within a minute: what it shows is then what
-    /// ends it, and loading it again and again would only spend the Mac's time.
+    /// and shows what it showed, three times a minute at most. A fourth time waits until the first
+    /// of the three is a minute old: what the page shows may be what ends it, and loading it again
+    /// and again would only spend the Mac's time.
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
         loaded = false
         let now = ContinuousClock.now
-        terminations = terminations.filter { now - $0 < .seconds(60) } + [now]
-        guard terminations.count <= 3 else { return }
-        webView.reload()
+        let at = reloads.count < 3 ? now : max(now, reloads[0] + .seconds(60))
+        reloads = Array((reloads + [at]).suffix(3))
+        Task { [weak webView] in
+            try? await Task.sleep(until: at, clock: .continuous)
+            webView?.reload()
+        }
     }
 }
 
@@ -149,9 +152,9 @@ private final class Messages: NSObject, WKScriptMessageHandler {
     }
 }
 
-/// A page's web view, its context menu without what a browser's has for pages, which the app's
-/// pages have no use for: Reload, Back and Forward, Inspect Element, and opening or downloading in
-/// another window. Copy, Look Up, Search and Share stay.
+/// The page's web view, its context menu without what a browser's has for pages, which this one
+/// has no use for: Reload, Back and Forward, Inspect Element, and opening or downloading in another
+/// window. Copy, Look Up, Search and Share stay.
 private final class PageWebView: WKWebView {
     private static let unwanted: Set<String> = [
         "WKMenuItemIdentifierReload", "WKMenuItemIdentifierGoBack", "WKMenuItemIdentifierGoForward",
@@ -206,9 +209,9 @@ struct Glyph: Encodable {
 }
 
 extension Bundle {
-    /// The app's own resources, its pages among them: in the app's Resources once packaged
-    /// (dev/tools/package_app.py puts them there, as nothing may sit beside Contents), where the
-    /// build put them when the app runs from it.
+    /// The app's own resources, the transcript's page among them: in the app's Resources once
+    /// packaged (dev/tools/package_app.py puts them there, as nothing may sit beside Contents),
+    /// where the build put them when the app runs from it.
     static let resources = Bundle.main.url(forResource: "Splash_Splash", withExtension: "bundle").flatMap(Bundle.init(url:))
         ?? .module
 }

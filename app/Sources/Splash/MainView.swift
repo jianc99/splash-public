@@ -150,11 +150,12 @@ struct Segments<Value: Hashable>: View {
 
 /// The Chat's sidebar beside its content, a column of the window's height, up through the toolbar,
 /// that slides away as the toolbar's button and ⌘B hide it. Hidden, it keeps its place in the
-/// window at no width, with what was typed in it and how far it scrolled.
+/// window at no width, with what was typed in it and how far it scrolled; the keyboard leaves it.
 struct WithSidebar<Side: View, Content: View>: View {
     static var width: CGFloat { 280 }
 
     @Environment(AppState.self) private var state
+    @FocusState private var focused: Bool
     @ViewBuilder let side: Side
     @ViewBuilder let content: Content
 
@@ -166,6 +167,7 @@ struct WithSidebar<Side: View, Content: View>: View {
                 // Up through the toolbar, as far as the sidebar's background goes.
                 Divider().ignoresSafeArea(edges: .top)
             }
+            .focused($focused)
             // Slides out at its leading edge as its column narrows.
             .frame(width: shown ? nil : 0, alignment: .trailing)
             .clipped()
@@ -173,16 +175,14 @@ struct WithSidebar<Side: View, Content: View>: View {
             .accessibilityHidden(!shown)
             content
         }
+        .onChange(of: shown) { if !shown { focused = false } }
     }
 }
 
 extension AppState {
     /// A terminal in the home folder.
-    @discardableResult
-    func newTerminal() -> TerminalSession {
-        let session = TerminalSession(environment: runtime.userEnvironment)
-        drawer.add(session)
-        return session
+    func newTerminal() {
+        drawer.add(TerminalSession(environment: runtime.userEnvironment))
     }
 
     /// Opens or closes the drawer, sliding; opened on the terminals, it starts one where there is
@@ -197,6 +197,12 @@ extension AppState {
         drawer.part = part
         if part == .terminal && drawer.terminals.isEmpty { newTerminal() }
         withAnimation(Motion.settle) { showsDrawer = true }
+    }
+
+    /// Opens the drawer on `log`.
+    func showLog(_ log: LogSource) {
+        drawer.log = log
+        showDrawer(.logs)
     }
 
     /// Hides the sidebar shown, or shows the one hidden, sliding.
@@ -224,6 +230,27 @@ struct SidebarButton: View {
     }
 }
 
+extension AppState {
+    /// The Server button's title: the model's name while one starts, its step with it, runs, its
+    /// speed with it while it answers, or stops; the download while one comes.
+    var serverTitle: String {
+        if installer.running {
+            guard let progress = installer.progress, progress.total > 0 else { return "Downloading…" }
+            return "Downloading \(progress.fraction.formatted(.percent.precision(.fractionLength(0))))"
+        }
+        guard let name = server.model.map(displayName(of:)) else { return "Server" }
+        switch server.phase {
+        case .starting: return "\(name) · \(server.step.rawValue)"
+        case .ready:
+            // Its speed while it answers, which the status brings every 2 s.
+            guard server.activity.running > 0, let rate = server.activity.generation else { return name }
+            return "\(name) · \(rate.formatted(.number.precision(.fractionLength(0)))) tok/s"
+        case .stopping: return name
+        case .stopped, .failed: return "Server"
+        }
+    }
+}
+
 /// The Server, at the toolbar's end: a light and the model that runs, with its speed while it
 /// answers, or the word Server while none does; a spinner and the step while one starts, the
 /// download's ring while one comes. It opens the Server, and shows picked while the Server shows,
@@ -238,7 +265,7 @@ struct ServerButton: View {
             HStack(spacing: 7) {
                 indicator
                     .frame(width: 12, height: 12)
-                Text(title)
+                Text(state.serverTitle)
                     .lineLimit(1)
                     .truncationMode(.middle)
                     .frame(maxWidth: 220)
@@ -260,26 +287,6 @@ struct ServerButton: View {
         .accessibilityLabel("Server")
         .accessibilityValue(state.downloadStatus ?? state.status)
         .accessibilityAddTraits(selected ? .isSelected : [])
-    }
-
-    /// The model's name while one starts, its step with it, runs, its speed with it while it
-    /// answers, or stops; the download while one comes.
-    private var title: String {
-        if state.installer.running {
-            guard let progress = state.installer.progress, progress.total > 0 else { return "Downloading…" }
-            return "Downloading \(progress.fraction.formatted(.percent.precision(.fractionLength(0))))"
-        }
-        guard let name = state.server.model.map(state.displayName(of:)) else { return "Server" }
-        switch state.server.phase {
-        case .starting: return "\(name) · \(state.server.step.rawValue)"
-        case .ready:
-            // Its speed while it answers, which the status brings every 2 s.
-            let activity = state.server.activity
-            guard activity.running > 0, let rate = activity.generation else { return name }
-            return "\(name) · \(rate.formatted(.number.precision(.fractionLength(0)))) tok/s"
-        case .stopping: return name
-        case .stopped, .failed: return "Server"
-        }
     }
 
     @ViewBuilder private var indicator: some View {

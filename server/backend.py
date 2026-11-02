@@ -47,16 +47,18 @@ _ENGINE_RESOURCE_CODES = frozenset(
 
 
 class ThinkingEndError(ValueError):
-    """A --thinking-end-text the model's tokenizer cannot end thinking with."""
+    """A thinking end, --thinking-end-text or the chat template's close, the
+    model's tokenizer cannot end thinking with."""
 
 
 def thinking_end_tokens(tokenizer, text, chat_format):
-    """The tokens the engine selects where a thinking budget runs out:
-    --thinking-end-text's, which must encode as text then chat_format's
-    close of thinking as its own token, at most wire.MAX_THINKING_END_TOKENS
-    tokens. The text holds none of the tokenizer's added tokens, the
-    template's special tokens. None without a text, where the close alone
-    ends thinking (NativeBackend)."""
+    """The tokens the engine selects where a thinking budget runs out: those
+    of the text, --thinking-end-text or else the close the chat template
+    writes after a reasoning (ChatTemplate.thinking_end), which must encode
+    as text then chat_format's close of thinking as its own token, at most
+    wire.MAX_THINKING_END_TOKENS tokens. The text holds none of the
+    tokenizer's added tokens, the template's special tokens. None without a
+    text, where the close alone ends thinking (NativeBackend)."""
     if text is None:
         return None
     tokens = tuple(tokenizer.encode(text, add_special_tokens=False))
@@ -66,12 +68,12 @@ def thinking_end_tokens(tokenizer, text, chat_format):
         or not tokenizer.added_tokens_decoder.keys().isdisjoint(tokens[:-1])
     ):
         raise ThinkingEndError(
-            f"--thinking-end-text must end with {THINK_END} and hold no other "
-            "special token"
+            f"the thinking end {text!r} must end with {THINK_END} and hold no "
+            "other special token"
         )
     if len(tokens) > wire.MAX_THINKING_END_TOKENS:
         raise ThinkingEndError(
-            f"--thinking-end-text takes {len(tokens)} tokens; the most is "
+            f"the thinking end {text!r} takes {len(tokens)} tokens; the most is "
             f"{wire.MAX_THINKING_END_TOKENS}"
         )
     return tokens
