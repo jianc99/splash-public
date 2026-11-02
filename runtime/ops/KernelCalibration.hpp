@@ -314,10 +314,21 @@ inline constexpr uint32_t kApple10SixteenRowBelowBits16 = 72;
 // staged tile's 64-row height, which reads the weights once: 0.48 ms there,
 // and 6-43% less than the prefill tile over the 27B's Q4_K, MLX 4-bit and
 // Q8_0 projections at the split law's choice (gguf-projection-benchmark
-// prefill=33,48,64). Status: Apple9 33-64 rows unmeasured (U2), so it keeps
-// the prefill tile.
+// prefill=33,48,64). On a 10-core M4 (the same tool, medians of 20, two
+// passes 2.7% apart at most; binaries e33524f0, metallib 703016c3) it takes
+// 12-22% less than the prefill tile on every case, 15% less in total, at the
+// staged law's split over 5120 x 17408, a gated 17408 x 5120 and 2048 x 4096
+// in Q4_K, Q5_K, Q6_K, IQ3_XXS and IQ2_XS: Apple9 GPUs of 10 cores or fewer
+// stage chunks of up to 64 rows. Status: measured on the M4 (U2); Apple9 of
+// more cores unmeasured, so it keeps the prefill tile past 32 rows (O5).
 inline constexpr uint32_t kApple9StagedPrefillRows = SPLASH_MAXIMUM_BATCH_WIDTH * SPLASH_TARGET_VERIFY_ROWS;
+inline constexpr uint32_t kApple9SmallStagedPrefillRows = 64;
 inline constexpr uint32_t kApple10StagedPrefillRows = 64;
+
+// The core count up to which an Apple9 GPU takes the rows measured on the
+// 10-core M4 (the base M3 and M4) rather than those of the 40-core M3 Max;
+// the boundary between them is unmeasured (U5).
+inline constexpr uint32_t kApple9SmallGpuCores = 10;
 
 inline constexpr ProjectionCalibration kApple9Projection{
     .registerSplits = TierLaw{kRegisterTiers},
@@ -328,6 +339,11 @@ inline constexpr ProjectionCalibration kApple9Projection{
     .sixteenRowBelowBits16 = 0,
     .stagedPrefillRows = kApple9StagedPrefillRows,
 };
+inline constexpr ProjectionCalibration kApple9SmallProjection = [] {
+  ProjectionCalibration row = kApple9Projection;
+  row.stagedPrefillRows = kApple9SmallStagedPrefillRows;
+  return row;
+}();
 inline constexpr ProjectionCalibration kApple10Projection{
     .registerSplits = TierLaw{kRegisterTiers},
     .stagedSplits = kApple10StagedLaw,
@@ -390,7 +406,6 @@ inline constexpr MoeCalibration kApple9Moe{{false, true, true, true}};
 // 1% more) and 7-28% less on a 2048-row chunk (at most 4% more on 128- to
 // 512-row chunks). Status: measured at 10 cores and on the 40-core M3 Max; the
 // boundary between them unmeasured (U5).
-inline constexpr uint32_t kApple9SmallGpuCores = 10;
 inline constexpr MoeCalibration kApple9SmallMoe{{false, false, false, false}};
 
 // Apple10 stages experts in every format.
@@ -399,7 +414,9 @@ inline constexpr MoeCalibration kApple10Moe{{false, false, false, false}};
 inline KernelCalibration KernelCalibration::of(const DeviceCapabilities &device) noexcept {
   const uint32_t cores = device.plannedGpuCores();
   if (device.gpuClass() == GpuClass::Apple10) return {cores, kApple10Projection, kApple10FloatTile, kApple10Moe};
-  return {cores, kApple9Projection, kApple9FloatTile, cores > kApple9SmallGpuCores ? kApple9Moe : kApple9SmallMoe};
+  const bool small = cores <= kApple9SmallGpuCores;
+  return {cores, small ? kApple9SmallProjection : kApple9Projection, kApple9FloatTile,
+          small ? kApple9SmallMoe : kApple9Moe};
 }
 
 // ---- Attention ------------------------------------------------------------

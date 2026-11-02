@@ -111,6 +111,23 @@ void floatOutputPlans() {
   }
 }
 
+// Apple9 GPUs of 10 cores or fewer, which the 10-core M4 measured
+// (KernelCalibration.hpp), run prefill chunks of 33 to 64 rows on the staged
+// tile's 64-row height; larger ones keep the 128-row prefill tile past 32
+// rows, and every Apple9 stages chunks of up to 32.
+void smallApple9StagesShortPrefillChunks() {
+  const Projection down = blockProjection(5120, 17408, 1);
+  for (const uint32_t cores : {1U, 10U, 11U, 14U, 40U})
+    for (const uint32_t rows : {32U, 33U, 48U, 64U, 65U}) {
+      const LinearPlan plan =
+          gpu(9, cores).plan({{5120, 17408}, rows, LinearPhase::Prefill, LinearEpilogue::Residual}, down);
+      const bool staged = rows <= 32 || (cores <= 10 && rows <= 64);
+      if (plan.configuration().tile != (staged ? LinearTile::GgufStaged : LinearTile::GgufPrefill) ||
+          plan.storageRows() != (!staged ? 128U : rows <= 32 ? 32U : 64U))
+        broke("Apple9 prefill chunk tile", 9, cores, plan.workload());
+    }
+}
+
 // A GGUF decode projection whose split count is pinned on one core count.
 struct SplitAnchor final {
   const char *projection;
@@ -1342,6 +1359,7 @@ int main(int argc, char **argv) {
     scratchBoundsRotated();
     ggufCoreLaws();
     floatOutputPlans();
+    smallApple9StagesShortPrefillChunks();
     if (std::string_view(argv[1]) == "--cpu") {
       std::cout << "Linear CPU plans: PASS\n";
       return 0;

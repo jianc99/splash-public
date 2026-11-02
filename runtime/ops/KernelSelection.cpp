@@ -11,8 +11,9 @@
 namespace splash::ops {
 namespace {
 
-static_assert(kApple9StagedPrefillRows <= kMaximumStagedPrefillRows &&
-                  kApple10StagedPrefillRows <= kMaximumStagedPrefillRows,
+static_assert(kApple9Projection.stagedPrefillRows <= kMaximumStagedPrefillRows &&
+                  kApple9SmallProjection.stagedPrefillRows <= kMaximumStagedPrefillRows &&
+                  kApple10Projection.stagedPrefillRows <= kMaximumStagedPrefillRows,
               "the staged tile holds the prefill chunks it runs");
 
 // The most bits per weight a format stores, in sixteenths (BF16 and F16).
