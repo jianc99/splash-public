@@ -80,10 +80,10 @@ public:
   // The keys T1 and T2 gave up lately (|B1| + |B2|), at most size().
   [[nodiscard]] uint32_t ghosts() const noexcept { return recentGhosts_.count + frequentGhosts_.count; }
   // The marginal counts, of uses that are not a scan's: the ghost hits on a
-  // key among the last `margin` keys given up as ghosts, which a unit more
-  // would have held, and the touches of a key among the `margin` least
-  // recently used of the list REPLACE recycles from now, which a unit less
-  // would have given up first.
+  // key among the `margin` newest ghosts (of B1 and B2, in the order they
+  // were given up), which a unit more would have held, and the touches of a
+  // key among the `margin` least recently used of the list REPLACE recycles
+  // from now, which a unit less would have given up first.
   [[nodiscard]] uint64_t nearGhostHits() const noexcept { return nearGhostHits_; }
   [[nodiscard]] uint64_t tailHits() const noexcept { return tailHits_; }
 
@@ -126,6 +126,23 @@ private:
     // `by` takes `at`'s place in the list.
     void replace(Order &order, uint32_t at, uint32_t by) noexcept;
   };
+  // A run of a list's entries from its least recently used end (`oldest`)
+  // or from its most recently used one, each flagged in `in`: `count` of
+  // them, the last `end`.
+  struct Run final {
+    bool oldest = true;
+    uint32_t end = UINT32_MAX, count = 0;
+    // `at`, just linked at the run's end of its list, joins the run.
+    void join(std::vector<uint8_t> &in, uint32_t at) noexcept;
+    // `at`, about to be unlinked from `links`, leaves the run.
+    void leave(std::vector<uint8_t> &in, const Links &links, uint32_t at) noexcept;
+    // The run holds the first `entries` of `order` (at most its count).
+    void fit(std::vector<uint8_t> &in, const Links &links, const Order &order, uint32_t entries) noexcept;
+    void clear() noexcept {
+      end = UINT32_MAX;
+      count = 0;
+    }
+  };
 
   [[nodiscard]] Order &slots(List list) noexcept { return list == Recent ? recent_ : frequent_; }
   [[nodiscard]] Order &ghosts(List list) noexcept { return list == Recent ? recentGhosts_ : frequentGhosts_; }
@@ -151,6 +168,8 @@ private:
   void leaveTail(uint32_t slot, List list) noexcept;
   // `slot` leaves its list and gives its key up, as a ghost or not.
   void evict(uint32_t slot, bool ghost);
+  // A ghost joins or leaves its list and the order of all ghosts, whose
+  // margin_ newest are the near ones.
   void addGhost(uint64_t key, List list);
   void dropGhost(uint32_t ghost);
   void forgetGhosts();
@@ -165,25 +184,26 @@ private:
   std::vector<uint64_t> key_, lastLoad_;
   Order recent_, frequent_;
   KeyIndex slotOf_;
-  // The ghosts: each a key of B1 or B2 (ghostList_) in a list of its own, at
-  // most as many as the slots; the unused ones are freeGhosts_.
+  // The ghosts: each a key of B1 or B2 (ghostList_) in a list of its own and
+  // in the order of all of them (ghostAge_, oldest first), at most as many as
+  // the slots; the unused ones are freeGhosts_.
   std::vector<uint64_t> ghostKey_;
   std::vector<uint8_t> ghostList_;
-  Links ghostLinks_;
+  Links ghostLinks_, ghostAge_;
   std::vector<uint32_t> freeGhosts_;
-  Order recentGhosts_, frequentGhosts_;
+  Order recentGhosts_, frequentGhosts_, ghostsByAge_;
   KeyIndex ghostOf_;
   // T1's target size.
   uint64_t target_ = 0;
   uint64_t ghostHits_ = 0;
   // The marginal counts: the margin, each slot's place in its list's tail
-  // and the tails' last slots (T1's, T2's), each ghost's number among those
-  // made and how many were made, and the counts.
+  // and the tails' last slots (T1's, T2's), the ghosts among the margin_
+  // newest (a run of ghostsByAge_), and the counts.
   uint32_t margin_ = 0;
   std::vector<uint8_t> tail_;
   uint32_t tailEnd_[2] = {UINT32_MAX, UINT32_MAX};
-  std::vector<uint64_t> ghostMade_;
-  uint64_t ghostsMade_ = 0;
+  std::vector<uint8_t> near_;
+  Run nearGhosts_{.oldest = false};
   uint64_t nearGhostHits_ = 0, tailHits_ = 0;
 };
 

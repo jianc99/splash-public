@@ -86,6 +86,30 @@ void SlotRecycler::Links::replace(Order &order, uint32_t at, uint32_t by) noexce
   (next[at] == kNone ? order.tail : previous[next[at]]) = by;
 }
 
+void SlotRecycler::Run::join(std::vector<uint8_t> &in, uint32_t at) noexcept {
+  in[at] = 1;
+  if (!count++) end = at;
+}
+
+void SlotRecycler::Run::leave(std::vector<uint8_t> &in, const Links &links, uint32_t at) noexcept {
+  if (!in[at]) return;
+  in[at] = 0;
+  --count;
+  if (at == end) end = oldest ? links.previous[at] : links.next[at];
+}
+
+void SlotRecycler::Run::fit(std::vector<uint8_t> &in, const Links &links, const Order &order,
+                            uint32_t entries) noexcept {
+  for (; count < entries; ++count) {
+    end = end == kNone ? (oldest ? order.head : order.tail) : oldest ? links.next[end] : links.previous[end];
+    in[end] = 1;
+  }
+  for (; count > entries; --count) {
+    in[end] = 0;
+    end = oldest ? links.previous[end] : links.next[end];
+  }
+}
+
 SlotRecycler::SlotRecycler(uint32_t slots, uint32_t margin) : margin_(margin) { resize(slots); }
 
 void SlotRecycler::joinTail(uint32_t slot, List list, bool leastRecent) noexcept {
@@ -153,12 +177,20 @@ void SlotRecycler::addGhost(uint64_t key, List list) {
   freeGhosts_.pop_back();
   ghostKey_[ghost] = key;
   ghostList_[ghost] = list;
-  ghostMade_[ghost] = ++ghostsMade_;
   ghostLinks_.append(ghosts(list), ghost);
+  ghostAge_.append(ghostsByAge_, ghost);
+  // The newest ghost is near, and the oldest near one no longer once more
+  // than margin_ are.
+  nearGhosts_.join(near_, ghost);
+  nearGhosts_.fit(near_, ghostAge_, ghostsByAge_, std::min(margin_, ghostsByAge_.count));
   ghostOf_.insert(key, ghost);
 }
 
 void SlotRecycler::dropGhost(uint32_t ghost) {
+  // A near ghost's place goes to the newest of the older ones.
+  nearGhosts_.leave(near_, ghostAge_, ghost);
+  ghostAge_.unlink(ghostsByAge_, ghost);
+  nearGhosts_.fit(near_, ghostAge_, ghostsByAge_, std::min(margin_, ghostsByAge_.count));
   ghostLinks_.unlink(ghosts(List(ghostList_[ghost])), ghost);
   ghostOf_.erase(ghostKey_[ghost]);
   freeGhosts_.push_back(ghost);
@@ -178,8 +210,10 @@ void SlotRecycler::keepGhosts(uint32_t slots) {
         freeGhosts_.pop_back();
         ghostKey_[place] = ghostKey_[ghost];
         ghostList_[place] = ghostList_[ghost];
-        ghostMade_[place] = ghostMade_[ghost];
         ghostLinks_.replace(*order, ghost, place);
+        ghostAge_.replace(ghostsByAge_, ghost, place);
+        near_[place] = std::exchange(near_[ghost], uint8_t{0});
+        if (nearGhosts_.end == ghost) nearGhosts_.end = place;
         ghostOf_.erase(ghostKey_[ghost]);
         ghostOf_.insert(ghostKey_[place], place);
       }
@@ -189,7 +223,9 @@ void SlotRecycler::keepGhosts(uint32_t slots) {
 }
 
 void SlotRecycler::forgetGhosts() {
-  recentGhosts_ = frequentGhosts_ = {};
+  recentGhosts_ = frequentGhosts_ = ghostsByAge_ = {};
+  std::ranges::fill(near_, uint8_t{0});
+  nearGhosts_.clear();
   ghostOf_.clear();
   freeGhosts_.clear();
   for (uint32_t ghost = static_cast<uint32_t>(ghostKey_.size()); ghost-- > 0;) freeGhosts_.push_back(ghost);
@@ -247,7 +283,7 @@ uint32_t SlotRecycler::claim(uint64_t key, uint64_t load, bool chunk) {
     const uint64_t step = std::max<uint64_t>(1, other.count / mine.count);
     target_ = gaveUp == Recent ? std::min<uint64_t>(slots, target_ + step) : target_ > step ? target_ - step : 0;
     ++ghostHits_;
-    if (ghostsMade_ - ghostMade_[ghost] < margin_) ++nearGhostHits_;
+    if (near_[ghost]) ++nearGhostHits_;
     dropGhost(ghost);
     slot = take(gaveUp == Frequent);
     frequent = true;
@@ -330,9 +366,11 @@ void SlotRecycler::resize(uint32_t slots) {
   // As many ghosts as slots: more add free ones.
   ghostKey_.resize(slots);
   ghostList_.resize(slots);
-  ghostMade_.resize(slots);
+  near_.resize(slots, 0);
   ghostLinks_.previous.resize(slots);
   ghostLinks_.next.resize(slots);
+  ghostAge_.previous.resize(slots);
+  ghostAge_.next.resize(slots);
   if (!fewer)
     for (uint32_t ghost = slots; ghost-- > held;) freeGhosts_.push_back(ghost);
   ghostOf_.reserve(slots);

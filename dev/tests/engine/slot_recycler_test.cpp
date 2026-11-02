@@ -13,13 +13,12 @@
 // within ARC's bounds, and leaves no key or claim past the slots; one straight
 // to fewer slots keeps the keys compactions a chunk at a time keep, moving
 // each once at most. Its ghosts are at most its slots, none from a scan or
-// after a reset. A unit of slots counts the ghost hits on the keys it gave up
-// last and the touches of the keys it would give up first, also after a
-// compaction. On the
-// decode selections of real requests
-// (dev/tests/fixtures/kv-selection-traces, the directory the test takes), the
-// hot block cache's resolves miss at most 2% more than recycling the least
-// recently used block would.
+// after a reset. A unit of slots counts the ghost hits on the newest ghosts
+// left, whose keys a unit more holds, and the touches of the keys it would
+// give up first, also after a compaction. On the decode selections of real
+// requests (dev/tests/fixtures/kv-selection-traces, the directory the test
+// takes), the hot block cache's resolves miss at most 2% more than recycling
+// the least recently used block would.
 #include "TestChecks.hpp"
 #include "model/SlotRecycler.hpp"
 
@@ -177,27 +176,51 @@ void countsItsGhosts() {
   require(scans.ghosts() == 0, "a scan's claims left ghosts");
 }
 
-// With a margin of two slots: a ghost hit on one of the two keys given up as
-// ghosts last is a unit's more, one on an older ghost is not; a touch of one
-// of the two least recently used keys of the list REPLACE recycles from is a
-// unit's less, of another key, of T2's while T1 is recycled, or a scan's is
-// not; a compaction keeps each list's tail.
+// Load `load` uses `key`: touches it where it is held, else claims a slot
+// for it; returns whether it was held.
+bool use(SlotRecycler &slots, uint64_t key, uint64_t load) {
+  if (const auto slot = slots.find(key)) {
+    slots.touch(*slot, load, false);
+    return true;
+  }
+  static_cast<void>(slots.claim(key, load, false));
+  return false;
+}
+
+// A ghost hit is a unit's more when the key is among the `margin` newest of
+// the ghosts left: those a recycler of a unit more slots still holds, as
+// the same uses of one show. A ghost claimed back holds its key again, so it
+// takes none of their places: with a margin of two, the claim of the newest
+// ghost leaves the one before it among the two newest, and with a margin of
+// one it does not; a touch of one of the two least recently used keys of
+// the list REPLACE recycles from is a unit's less, of another key, of T2's
+// while T1 is recycled, or a scan's is not; a compaction keeps each list's
+// tail.
 void countsMarginalHits() {
-  {
-    SlotRecycler slots(4, 2);
-    for (uint64_t key = 0; key < 4; ++key) static_cast<void>(slots.claim(key, 1, false));
-    slots.touch(*slots.find(0), 2, false);
-    slots.touch(*slots.find(1), 2, false);
-    // T1 holds 2, 3 and gives them up as ghosts for 4 and 5, then 4 for 6,
-    // after it dropped ghost 2: B1 holds 3, then 4, the last ghost made.
-    for (uint64_t key = 4; key < 7; ++key) static_cast<void>(slots.claim(key, key - 1, false));
+  for (const uint32_t margin : {1u, 2u}) {
+    SlotRecycler slots(4, margin), more(4 + margin);
+    for (SlotRecycler *each : {&slots, &more}) {
+      for (uint64_t key = 0; key < 4; ++key) static_cast<void>(use(*each, key, 1));
+      static_cast<void>(use(*each, 0, 2));
+      static_cast<void>(use(*each, 1, 2));
+      // T1 holds 2, 3 and gives them up as ghosts for 4 and 5, then 4 for
+      // 6, after it dropped ghost 2: B1 holds 3, then 4, the newest.
+      for (uint64_t key = 4; key < 7; ++key) static_cast<void>(use(*each, key, key - 1));
+    }
     require(!slots.find(2) && !slots.find(3) && !slots.find(4) && slots.ghosts() == 2,
             "T1 did not give up 2, 3 and 4 for the new keys");
-    static_cast<void>(slots.claim(4, 6, false));
-    require(slots.ghostHits() == 1 && slots.nearGhostHits() == 1, "the last ghost's hit was not a unit's more");
-    // Recycling for 4 gave up 5 as a ghost, so 3 is the third ghost made last.
-    static_cast<void>(slots.claim(3, 7, false));
-    require(slots.ghostHits() == 2 && slots.nearGhostHits() == 1, "an older ghost's hit was a unit's more");
+    // Claimed back: 4, the newest ghost, then 3, which a unit more holds
+    // after 4 came back, or 3 alone, which one slot more does not hold.
+    const std::vector<uint64_t> back = margin == 2 ? std::vector<uint64_t>{4, 3} : std::vector<uint64_t>{3};
+    for (uint64_t at = 0; at < back.size(); ++at) {
+      const uint64_t near = slots.nearGhostHits();
+      static_cast<void>(use(slots, back[at], 6 + at));
+      const bool held = use(more, back[at], 6 + at);
+      require(slots.ghostHits() == at + 1 && slots.nearGhostHits() - near == uint64_t{held},
+              "with a margin of " + std::to_string(margin) + ", the hit on ghost " + std::to_string(back[at]) +
+                  (held ? " was not a unit's more, though a unit more holds the key"
+                        : " was a unit's more, though a unit more does not hold the key"));
+    }
   }
   SlotRecycler slots(8, 2);
   for (uint64_t key = 1; key <= 8; ++key) static_cast<void>(slots.claim(key, 1, false));
