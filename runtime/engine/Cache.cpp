@@ -1267,12 +1267,15 @@ Cache::ReclaimPlan::Step Cache::ReclaimPlan::evictPhase(bool inUse) {
       visit(states);
       if (keptState(state->id))
         continue;
+      // One that needs a write and waits for the write slot frees its memory
+      // as a unit that lands later, once that write and its own have landed;
+      // the newer states of its phase follow it.
       const StateEviction goes = stateGoes(state->id);
-      if (goes.evicted) {
+      held = goes.pending;
+      if (goes.evicted || (goes.pending && writes(state->id))) {
         takeState(state->id, inUse);
         return {.progress = true, .state = true};
       }
-      held = goes.pending;
       continue;
     }
     if (ramState(leaf->id)) {
