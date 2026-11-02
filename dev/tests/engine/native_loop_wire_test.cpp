@@ -667,7 +667,7 @@ void testInvalidLimitsAreRejectedAtConstruction() {
 // The loop refuses a config without the metrics, the weights or their
 // admission the bootstrap always gives it; each case lacks one of them.
 void testLoopNeedsItsComponents() {
-  for (const int lacking : {0, 1, 2, 3}) {
+  for (const int lacking : {0, 1, 2}) {
     test::TestKvStorage storage(8, 4096, 4);
     KvPool pool(storage, 8);
     engine::Cache cache(pool, nullptr, nullptr);
@@ -677,14 +677,13 @@ void testLoopNeedsItsComponents() {
     NativeLoopConfig config{.engine = test::engineConfig(),
                             .metrics = lacking == 0 ? nullptr : &runtimeMetrics,
                             .weights = lacking == 1 ? nullptr : &weights,
-                            .weightAdmission = lacking == 2 ? nullptr : test::admitAll,
-                            .growthAdmission = lacking == 3 ? nullptr : test::admitAll};
+                            .weightAdmission = lacking == 2 ? nullptr : test::admitAll};
     rejects([&] {
       engine::NativeRuntime(std::move(config), metal::kResidencyKeepAliveSeconds, cache,
                             executor, [](std::span<const uint8_t>) {},
                             test::readyStatusJson, protocol::ProtocolLimits{});
     }, "the native engine loop lacks a component it needs",
-            "a loop without its metrics, its weights or their admissions was built");
+            "a loop without its metrics, its weights or their admission was built");
   }
 }
 

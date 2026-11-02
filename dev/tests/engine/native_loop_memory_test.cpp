@@ -798,124 +798,6 @@ void testRefusedExchangeLeavesItsBytesToTheNextPass() {
           "the next pass took cache again for the bytes the refused exchange returned");
 }
 
-// The store's chunks above its floor are the model's (Executor::
-// expertChunks): a release gives them back with the floor, and a restore
-// takes the floor back under the admission of what is needed (`floors`
-// counts those), then each chunk while the optional growth's grants it.
-struct StoreMemory final : model::WeightMemory {
-  explicit StoreMemory(Executor *&model) : model(model) {}
-  [[nodiscard]] bool released() const noexcept override { return out; }
-  void release() override {
-    while (!model->expertChunks.empty()) {
-      model->releasedExpertChunks.push_back(model->expertChunks.back());
-      model->expertChunks.pop_back();
-    }
-    out = true;
-  }
-  bool restore(const metal::AllocationAdmission &admit,
-               const metal::AllocationAdmission &optional) override {
-    if (const metal::AllocationResult admitted = admit(kFloorBytes, [] {}); !admitted)
-      throw metal::MetalAllocationError("the store's floor was refused", admitted.failure);
-    ++floors;
-    while (!model->releasedExpertChunks.empty() &&
-           optional(model->releasedExpertChunks.back(), [] {})) {
-      model->expertChunks.push_back(model->releasedExpertChunks.back());
-      model->releasedExpertChunks.pop_back();
-    }
-    out = false;
-    return true;
-  }
-  static constexpr uint64_t kFloorBytes = 1ULL << 28;
-  Executor *&model;
-  bool out = false;
-  uint32_t floors = 0;
-};
-
-// The expert store's idle restore takes its floor back as memory the
-// request waiting needs, and each chunk above it only while the optional
-// growth's admission grants it (model::ExpertStore::restore): a chunk refused
-// stays released, the request waiting runs at once, and the control pass
-// grows the store back toward its cap, a chunk per pass, once memory is
-// ample.
-void testShrunkRestoreGrowsBackAfterTheRequest() {
-  Executor *model = nullptr;
-  StoreMemory store(model);
-  // Admission grants the first chunk of each restore and refuses the rest.
-  uint32_t granted = 0;
-  engine::NativeLoopConfig config;
-  config.engine.maxContext = 1024;
-  config.weights = &store;
-  config.growthAdmission = [&](uint64_t, const std::function<void()> &allocate) {
-    if (granted++)
-      return metal::AllocationResult{metal::AllocationFailure::EngineBudget};
-    allocate();
-    return metal::AllocationResult{};
-  };
-  LoopFixture fixture(config);
-  model = &fixture.executor;
-  engine::NativeRuntime &loop = fixture.loop;
-  constexpr uint64_t chunk = 1ULL << 30;
-  fixture.executor.expertChunks = {chunk, chunk, chunk};
-  test::metalStatistics() = {};
-  metal::MetalBackend backend("unused");
-  constexpr uint64_t hostReserve = 2ULL << 30;
-  MemoryGovernor governor(backend, 40ULL << 30, hostReserve, hostReserve,
-                          [] { return hostMemory(hostReserve + (16ULL << 30)); }, 0);
-  MemoryControl control(governor, backend, loop);
-  loop.announceReady();
-  require(!releaseAnswer(fixture, 1).restoring && store.released() &&
-              fixture.executor.releasedExpertChunks.size() == 3,
-          "the store was not released");
-  require(loop.receive(protocol::peer::serialize(request(1))), "the request failed");
-  runUntilIdle(loop);
-  require(loop.statusSnapshot().completed == 1 && loop.resourceWaitSnapshot().memory == 0 &&
-              store.floors == 1 && fixture.executor.expertChunks.size() == 1,
-          "a refused chunk above the floor held the restore back");
-  for (size_t chunks = 2; chunks <= 3; ++chunks) {
-    require(!control.run(MemoryPressure::Normal) && fixture.executor.expertChunks.size() == chunks,
-            "the control pass did not grow the restored store a chunk per pass");
-  }
-}
-
-// Under the governor's admissions (Bootstrap's), the restore takes the
-// chunks above the floor back only while the host has each and the recovery
-// margin to spare, under no pressure, whatever the serving mark a request
-// waiting sets: on a host short of that only the floor comes back, and the
-// request runs; on an ample host the store comes back at its cap.
-void testRestoreTakesChunksOnlyFromAHostWithRoomToSpare() {
-  constexpr uint64_t chunk = 1ULL << 30;
-  constexpr uint64_t hostReserve = 2ULL << 30;
-  for (const bool ample : {false, true}) {
-    Executor *model = nullptr;
-    StoreMemory store(model);
-    test::metalStatistics() = {};
-    metal::MetalBackend backend("unused");
-    // The floor fits beside the warning margin; a chunk does not beside the
-    // recovery margin unless the host is ample.
-    const uint64_t spare = ample ? 3 * chunk + kHostRecoveryMarginBytes
-                                 : chunk + kHostRecoveryMarginBytes - 4096;
-    MemoryGovernor governor(backend, 40ULL << 30, hostReserve, hostReserve,
-                            [&] { return hostMemory(hostReserve + spare); }, 0);
-    engine::NativeLoopConfig config;
-    config.engine.maxContext = 1024;
-    config.engine.serving = [&governor](bool serving) { return governor.setServing(serving); };
-    config.weights = &store;
-    config.weightAdmission = governor.allocationAdmission();
-    config.growthAdmission = governor.growthAdmission();
-    LoopFixture fixture(config);
-    model = &fixture.executor;
-    fixture.executor.expertChunks = {chunk, chunk, chunk};
-    fixture.loop.announceReady();
-    require(!releaseAnswer(fixture, 1).restoring && store.released(), "the store was not released");
-    require(fixture.loop.receive(protocol::peer::serialize(request(1))), "the request failed");
-    runUntilIdle(fixture.loop);
-    require(fixture.loop.statusSnapshot().completed == 1 && store.floors == 1 &&
-                fixture.executor.expertChunks.size() == (ample ? 3U : 0U),
-            ample ? "an ample host did not restore the store at its cap"
-                  : "a host short of a chunk and the recovery margin took one back in a restore");
-  }
-}
-
 } // namespace
 
 std::span<const test::TestCase> memoryTests() {
@@ -932,8 +814,6 @@ std::span<const test::TestCase> memoryTests() {
       {"testExpertExchangeKeepsCacheThatCannotCoverTheChunk", testExpertExchangeKeepsCacheThatCannotCoverTheChunk},
       {"testExpertExchangeCoversTheEngineLimit", testExpertExchangeCoversTheEngineLimit},
       {"testRefusedExchangeLeavesItsBytesToTheNextPass", testRefusedExchangeLeavesItsBytesToTheNextPass},
-      {"testShrunkRestoreGrowsBackAfterTheRequest", testShrunkRestoreGrowsBackAfterTheRequest},
-      {"testRestoreTakesChunksOnlyFromAHostWithRoomToSpare", testRestoreTakesChunksOnlyFromAHostWithRoomToSpare},
       {"testMemoryStatusReporterLogsTransitionsOnly", testMemoryStatusReporterLogsTransitionsOnly},
   };
   return kTests;

@@ -24,7 +24,7 @@ namespace splash::engine {
 [[nodiscard]] uint64_t systemUnixMicros() noexcept;
 
 // The loop's constructor refuses a config without its metrics, its weights,
-// their admissions or its clocks.
+// their admission or its clocks.
 struct NativeLoopConfig {
   engine::EngineConfig engine;
   RuntimeMetrics *metrics = nullptr;
@@ -34,11 +34,8 @@ struct NativeLoopConfig {
   model::WeightMemory *weights = nullptr;
   // Admits the memory the weights take back
   // (MemoryGovernor::allocationAdmission), as memory the requests waiting for
-  // them need (EngineConfig::serving), and the memory they may take back but
-  // can do without, an expert store's chunks above its floor, as growth only
-  // a host with room to spare admits (MemoryGovernor::growthAdmission).
+  // them need (EngineConfig::serving).
   metal::AllocationAdmission weightAdmission;
-  metal::AllocationAdmission growthAdmission;
   // Told true when the engine takes a request while it holds none, and false
   // when its last request ends; the process keeps the Mac from idle sleep in
   // between (main.mm). It must not throw. Empty where nothing needs to know.

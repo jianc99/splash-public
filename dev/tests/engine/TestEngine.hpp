@@ -44,7 +44,7 @@ public:
       memory->release("weights", uint64_t{restored_} * kImageBytes);
     restored_ = 0;
   }
-  bool restore(const metal::AllocationAdmission &admit, const metal::AllocationAdmission &) override {
+  bool restore(const metal::AllocationAdmission &admit) override {
     if (failRestore)
       throw std::runtime_error("weights restore test");
     require(released(), "held weights were restored");

@@ -93,9 +93,8 @@ struct LoopOptions final {
 
 // A native loop over the fake model, collecting the bytes it writes. Its
 // config is completed with the engine's (test::engineConfig), and the
-// fixture's metrics and weights, each weight allocation admitted, the
-// optional growth too (test::admitAll, or the governor's with memory), where
-// the test gave none; the weights' idle release is production's unless the
+// fixture's metrics and weights, each weight allocation admitted
+// (test::admitAll, or the governor's with memory), where the test gave none; the weights' idle release is production's unless the
 // test gives one. Its unix clock stands still and its awake clock reads
 // `monotonic`, advanced by `clockStep` on every read, or with timing by
 // run().
@@ -143,8 +142,6 @@ struct LoopFixture {
       engine::connectToGovernor(config.engine, *governor);
       if (!config.weightAdmission)
         config.weightAdmission = governor->allocationAdmission();
-      if (!config.growthAdmission)
-        config.growthAdmission = governor->growthAdmission();
     }
     config.engine = test::engineConfig(std::move(config.engine));
     if (!config.metrics)
@@ -153,8 +150,6 @@ struct LoopFixture {
       config.weights = &weights;
     if (!config.weightAdmission)
       config.weightAdmission = test::admitAll;
-    if (!config.growthAdmission)
-      config.growthAdmission = test::admitAll;
     config.unixMicros = [] { return uint64_t{1'000'000}; };
     if (options && options->timing)
       config.monotonicMilliseconds = [this] { return monotonic; };

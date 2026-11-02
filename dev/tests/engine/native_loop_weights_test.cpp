@@ -18,6 +18,7 @@ using namespace splash::engine;
 namespace {
 
 using splash::test::answeredStatus;
+using splash::test::Executor;
 using splash::test::hostMemory;
 using splash::test::idle;
 using splash::test::LoopFixture;
@@ -131,7 +132,7 @@ void testReleasableMemoryRestoresTheExpertsAfterTheImages() {
     uint32_t restores = 0;
     [[nodiscard]] bool released() const noexcept override { return !held; }
     void release() override { held = false; }
-    bool restore(const metal::AllocationAdmission &, const metal::AllocationAdmission &) override {
+    bool restore(const metal::AllocationAdmission &) override {
       require(!held, "a held arena was restored");
       held = true;
       ++restores;
@@ -147,13 +148,13 @@ void testReleasableMemoryRestoresTheExpertsAfterTheImages() {
   require(memory.released() && weights.released() && experts.released(),
           "the release kept the images or the arena");
   for (uint32_t image = 0; image < Weights::kImages; ++image)
-    require(!memory.restore(admit, admit) && experts.released(),
+    require(!memory.restore(admit) && experts.released(),
             "the arena came back before the last image");
   require(!weights.released() && memory.released(), "the restore ended without the arena");
-  require(memory.restore(admit, admit) && !memory.released() && experts.restores == 1,
+  require(memory.restore(admit) && !memory.released() && experts.restores == 1,
           "the arena did not come back in one restore after the images");
   memory.release();
-  require(!memory.restore(admit, admit) && weights.held() == 1,
+  require(!memory.restore(admit) && weights.held() == 1,
           "a restore did not write the first image back");
   memory.release();
   require(weights.held() == 0 && experts.released() && experts.restores == 1,
@@ -523,6 +524,111 @@ void testHoldingRequestsSpansFirstToLastRequest() {
           "a request refused on arrival was held");
 }
 
+// The expert store's chunks above its floor are the model's (Executor::
+// expertChunks): a release gives them back with the floor, and a restore
+// takes the floor back alone in one admission (`floors` counts those), as
+// model::ExpertStore::restore does.
+struct StoreMemory final : model::WeightMemory {
+  explicit StoreMemory(Executor *&model) : model(model) {}
+  [[nodiscard]] bool released() const noexcept override { return out; }
+  void release() override {
+    while (!model->expertChunks.empty()) {
+      model->releasedExpertChunks.push_back(model->expertChunks.back());
+      model->expertChunks.pop_back();
+    }
+    out = true;
+  }
+  bool restore(const metal::AllocationAdmission &admit) override {
+    if (const metal::AllocationResult admitted = admit(kFloorBytes, [] {}); !admitted)
+      throw metal::MetalAllocationError("the store's floor was refused", admitted.failure);
+    ++floors;
+    out = false;
+    return true;
+  }
+  static constexpr uint64_t kFloorBytes = 1ULL << 28;
+  Executor *&model;
+  bool out = false;
+  uint32_t floors = 0;
+};
+
+// The expert store's idle restore takes its floor back as memory the request
+// waiting needs, and no chunk above it: the request runs at once, and the
+// control pass grows the store back to its cap once memory is ample.
+void testRestoredStoreGrowsBackAfterTheRequest() {
+  Executor *model = nullptr;
+  StoreMemory store(model);
+  engine::NativeLoopConfig config;
+  config.engine.maxContext = 1024;
+  config.weights = &store;
+  LoopFixture fixture(config);
+  model = &fixture.executor;
+  engine::NativeRuntime &loop = fixture.loop;
+  constexpr uint64_t chunk = 1ULL << 30;
+  fixture.executor.expertChunks = {chunk, chunk, chunk};
+  test::metalStatistics() = {};
+  metal::MetalBackend backend("unused");
+  constexpr uint64_t hostReserve = 2ULL << 30;
+  MemoryGovernor governor(backend, 40ULL << 30, hostReserve, hostReserve,
+                          [] { return hostMemory(hostReserve + (16ULL << 30)); }, 0);
+  MemoryControl control(governor, backend, loop);
+  loop.announceReady();
+  require(!releaseAnswer(fixture, 1).restoring && store.released() &&
+              fixture.executor.releasedExpertChunks.size() == 3,
+          "the store was not released");
+  require(loop.receive(protocol::peer::serialize(request(1))), "the request failed");
+  runUntilIdle(loop);
+  require(loop.statusSnapshot().completed == 1 && loop.resourceWaitSnapshot().memory == 0 &&
+              store.floors == 1 && fixture.executor.expertChunks.empty(),
+          "the restore took a chunk above the floor back, or held the request");
+  for (uint32_t pass = 0; pass < 8 && fixture.executor.expertChunks.size() < 3; ++pass)
+    static_cast<void>(control.run(MemoryPressure::Normal));
+  require(fixture.executor.expertChunks.size() == 3,
+          "the control pass did not grow the restored store back to its cap");
+}
+
+// Under the governor's admissions (Bootstrap's), the restore takes back the
+// store's floor alone, whatever the host spares, and the request runs; on an
+// ample host the control pass then grows the store back to its cap.
+void testRestoreTakesTheFloorWhateverTheHostSpares() {
+  constexpr uint64_t chunk = 1ULL << 30;
+  constexpr uint64_t hostReserve = 2ULL << 30;
+  for (const bool ample : {false, true}) {
+    Executor *model = nullptr;
+    StoreMemory store(model);
+    test::metalStatistics() = {};
+    metal::MetalBackend backend("unused");
+    // The floor fits beside the warning margin; a chunk does not beside the
+    // recovery margin unless the host is ample.
+    const uint64_t spare = ample ? 3 * chunk + kHostRecoveryMarginBytes
+                                 : chunk + kHostRecoveryMarginBytes - 4096;
+    MemoryGovernor governor(backend, 40ULL << 30, hostReserve, hostReserve,
+                            [&] { return hostMemory(hostReserve + spare); }, 0);
+    engine::NativeLoopConfig config;
+    config.engine.maxContext = 1024;
+    config.engine.serving = [&governor](bool serving) { return governor.setServing(serving); };
+    config.weights = &store;
+    config.weightAdmission = governor.allocationAdmission();
+    LoopFixture fixture(config);
+    model = &fixture.executor;
+    fixture.executor.expertChunks = {chunk, chunk, chunk};
+    fixture.executor.expertAdmission = governor.growthAdmission();
+    MemoryControl control(governor, backend, fixture.loop);
+    fixture.loop.announceReady();
+    require(!releaseAnswer(fixture, 1).restoring && store.released(), "the store was not released");
+    require(fixture.loop.receive(protocol::peer::serialize(request(1))), "the request failed");
+    runUntilIdle(fixture.loop);
+    require(fixture.loop.statusSnapshot().completed == 1 && store.floors == 1 &&
+                fixture.executor.expertChunks.empty(),
+            "the restore took a chunk above the floor back");
+    if (!ample)
+      continue;
+    for (uint32_t pass = 0; pass < 8 && fixture.executor.expertChunks.size() < 3; ++pass)
+      static_cast<void>(control.run(MemoryPressure::Normal));
+    require(fixture.executor.expertChunks.size() == 3,
+            "an ample host did not grow the restored store back to its cap");
+  }
+}
+
 } // namespace
 
 std::span<const test::TestCase> weightsTests() {
@@ -535,6 +641,8 @@ std::span<const test::TestCase> weightsTests() {
       {"testIdleReleaseOffReleasesOnlyOnRequest", testIdleReleaseOffReleasesOnlyOnRequest},
       {"testReleaseRequestGivesTheWeightsBackWhenIdle", testReleaseRequestGivesTheWeightsBackWhenIdle},
       {"testHoldingRequestsSpansFirstToLastRequest", testHoldingRequestsSpansFirstToLastRequest},
+      {"testRestoredStoreGrowsBackAfterTheRequest", testRestoredStoreGrowsBackAfterTheRequest},
+      {"testRestoreTakesTheFloorWhateverTheHostSpares", testRestoreTakesTheFloorWhateverTheHostSpares},
   };
   return kTests;
 }

@@ -1383,7 +1383,7 @@ void ExpertStore::release() {
   impl.publish();
 }
 
-bool ExpertStore::restore(const metal::AllocationAdmission &admit, const metal::AllocationAdmission &optional) {
+bool ExpertStore::restore(const metal::AllocationAdmission &admit) {
   std::lock_guard lock(impl_->mutex);
   Impl &impl = *impl_;
   if (!impl.released) throw std::logic_error("expert memory is not released");
@@ -1410,19 +1410,14 @@ bool ExpertStore::restore(const metal::AllocationAdmission &admit, const metal::
     throw metal::MetalAllocationError(std::string("unable to restore the expert chunks: ") +
                                           metal::allocationFailureName(admitted.failure),
                                       admitted.failure);
+  // The elastic chunks stay released: growTowardCap() takes them back, their
+  // slots free, as memory allows.
   for (Impl::Size &size : impl.sizes) {
     size.chunks.keep(size.chunkLayout.floorChunks);
     size.recycling.resize(size.chunkLayout.first(size.chunkLayout.floorChunks));
+    // Every slot free, the lowest claimed first.
+    size.recycling.reset();
   }
-  // Each elastic chunk comes back in a part of its own while `optional`
-  // admits it, the sizes in turn as a regrow takes them; the first refused
-  // stays released with those after it, which a regrow takes later, so that
-  // neither the room the cache may have taken while the store was smaller
-  // nor a host too short to keep them holds the restore back.
-  for (uint32_t index = impl.growingSize(); index != kNoSlot; index = impl.growingSize())
-    if (!impl.grow(index, optional)) break;
-  // Every slot free, the lowest claimed first.
-  for (Impl::Size &size : impl.sizes) size.recycling.reset();
   impl.released = false;
   impl.countLive();
   impl.fill();

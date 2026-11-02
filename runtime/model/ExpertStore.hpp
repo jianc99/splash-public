@@ -63,10 +63,9 @@
 // The live chunks and the staging are memory the engine gives back while
 // idle (model::WeightMemory): released, every slot is free. A restore takes
 // the floor chunks and the staging back in one part, as memory the next
-// request needs, then each elastic chunk in a part of its own while memory
-// admits it as growth it may do without, the rest left to a later
-// growTowardCap(); it reads the experts of the sizes of one block again, and
-// the loads after it every expert they route.
+// request needs; the elastic chunks stay released for growTowardCap() to take
+// back as memory allows. It reads the experts of the sizes of one block
+// again, and the loads after it every expert they route.
 //
 // Reads run on the engine's SSD readers (model::SsdReaders), which try a
 // failed read once more. A load checks its sources unchanged after it read
@@ -139,7 +138,7 @@ struct ExpertStoreOptions final {
   uint64_t floorBytes = 0;
   // What the store starts with in the same bytes, from its floor to
   // memoryBytes, as the host's memory leaves it: its elastic chunks past
-  // these bytes start released, as a restore leaves those it is refused, and
+  // these bytes start released, as a restore leaves every elastic chunk, and
   // growTowardCap takes them later. Zero to start at the cap.
   uint64_t startBytes = 0;
   // The readers its reads run on: the engine's one pool, which the other
@@ -198,13 +197,11 @@ public:
   [[nodiscard]] uint64_t expectedPrefillReadBytes(uint32_t rows, uint32_t firstBlock, uint32_t endBlock) const;
   // The live chunks and the staging, while no command is in flight;
   // restore() takes the floor chunks and the staging back in one part under
-  // `admit`, then each elastic chunk under an admission of its own by
-  // `optional` until one is refused, which stays released with those after
-  // it, and reads the experts of the sizes of one block again.
+  // `admit`, leaves the elastic chunks to growTowardCap(), and reads the
+  // experts of the sizes of one block again.
   [[nodiscard]] bool released() const noexcept override;
   void release() override;
-  [[nodiscard]] bool restore(const metal::AllocationAdmission &admit,
-                             const metal::AllocationAdmission &optional) override;
+  [[nodiscard]] bool restore(const metal::AllocationAdmission &admit) override;
   // While memory is short: gives back the last live elastic chunk of the
   // streamed size with the largest share of its slots above its floor. The
   // experts it holds move to free slots below it, after as many of the
