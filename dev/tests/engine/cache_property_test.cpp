@@ -418,24 +418,28 @@ private:
 
 // A windowed run takes more seeds: the paths that leave a state's tail
 // Slim, unless the cache keeps it Full, take a run of steps few seeds make.
+// Windowed seed 9454 runs too: in it a poisoned block's own write lands
+// after its subtree left (Cache::dropPoisoned).
 void testRandomRuns() {
-  for (const bool windowed : {false, true}) {
-    for (uint32_t seed = 1; seed <= (windowed ? 400u : 40u); ++seed) {
-      Run run(seed, windowed);
-      try {
-        for (int step = 0; step < 600; ++step)
-          run.step();
-        run.endRequests();
-        run.checkExchange(false);
-        run.drain();
-        run.settle();
-        run.checkExchange(true);
-      } catch (const std::exception &error) {
-        throw std::runtime_error(std::string(windowed ? "windowed " : "") + "seed " + std::to_string(seed) + ": " +
-                                 error.what());
-      }
+  const auto check = [](uint32_t seed, bool windowed) {
+    Run run(seed, windowed);
+    try {
+      for (int step = 0; step < 600; ++step)
+        run.step();
+      run.endRequests();
+      run.checkExchange(false);
+      run.drain();
+      run.settle();
+      run.checkExchange(true);
+    } catch (const std::exception &error) {
+      throw std::runtime_error(std::string(windowed ? "windowed " : "") + "seed " + std::to_string(seed) + ": " +
+                               error.what());
     }
-  }
+  };
+  for (const bool windowed : {false, true})
+    for (uint32_t seed = 1; seed <= (windowed ? 400u : 40u); ++seed)
+      check(seed, windowed);
+  check(9454, true);
   std::cout << "cache property runs ok\n";
 }
 
