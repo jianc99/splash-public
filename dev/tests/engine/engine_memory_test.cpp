@@ -50,6 +50,21 @@ namespace {
 using splash::test::rejects;
 using splash::test::require;
 
+// The engine's limit reached: the rest of it holds other memory (the
+// weights), so that every allocation through `host`'s governor is refused
+// there for want of room, its claim lacking what it asked (MemoryGovernor::
+// need). For a fake that admits its own allocations once what the ledger
+// freed made room, and asks the governor for the refusal's books.
+void reachTheLimit(GovernedHost &host) { host.memory.hold("weights", host.governor.snapshot().headroomBytes); }
+
+// A fake's refusal of `bytes` at that limit, its cause, the need booked.
+metal::AllocationFailure refusedAtTheLimit(GovernedHost &host, uint64_t bytes) {
+  const metal::AllocationResult result = host.reserve(bytes);
+  if (result)
+    throw std::logic_error("the governor admitted what its limit was to refuse");
+  return result.failure;
+}
+
 // A publication's expected refusals are values (refused state buffers, a
 // refused disk write). An exception is a broken invariant: it ends the
 // engine instead of counting as a failed publication.
@@ -304,6 +319,11 @@ void testCancellationInFlightAtBoundaryPublishesNoState() {
           "cancellation leaked active resources or dropped committed KV");
 }
 
+// A lane's start refused its state's buffers retries once the ledger has
+// freed what it lacks: the cached state whose buffers its activation lacks
+// (Model::statesToActivate), or, the host refusing it, the idle buffers that
+// cost nothing, which leave the cached state where it is, the start then in
+// service passing the host.
 void testLaneStateGrowthReclaimsCachedStateAndRetries() {
   for (bool hostPressure : {false, true}) {
     test::TestKvStorage storage(16, 4096, 4);
@@ -311,7 +331,8 @@ void testLaneStateGrowthReclaimsCachedStateAndRetries() {
     engine::Cache resources(pool, nullptr, nullptr);
     Executor executor(1);
     Events events;
-    engine::Engine engine(test::engineConfig(), resources, executor, events);
+    GovernedHost host;
+    engine::Engine engine(host.connect({}), resources, executor, events);
     guardReleases(storage, engine);
 
     engine.submit(request(20, std::vector<uint32_t>(65, 7)));
@@ -323,11 +344,12 @@ void testLaneStateGrowthReclaimsCachedStateAndRetries() {
     if (hostPressure) {
       storage.growthBlocked = true;
       executor.kvGrowthBlocked = &storage.growthBlocked;
-      executor.beginGrowthBlocked = [&] { return storage.growthBlocked; };
-      executor.beginAllocationFailure = metal::AllocationFailure::HostPressure;
       executor.reclaimableIdleStateBytes = 350'224'384;
+      host.pause(true);
+      host.admitBegins(executor, 4096);
     } else {
-      executor.deniedBegins = 1;
+      executor.statesLacked = [&] { return resources.snapshot().stateCache.entries != 0 ? 1U : 0U; };
+      executor.beginGrowthBlocked = [&] { return executor.statesLacked() != 0; };
     }
     const uint32_t attempts = executor.beginAttempts;
     engine.submit(request(21, {8}));
@@ -1640,17 +1662,26 @@ void testKvGrowthReclaimsCachedStateWhenBudgetIsShared() {
   KvPool pool(storage, 0);
   engine::Cache resources(pool, nullptr, nullptr);
   Executor executor(1);
-  storage.growthAllowed = [&](uint32_t) {
-    return resources.snapshot().stateCache.entries == 0;
-  };
   Events events;
-  engine::Engine engine(test::engineConfig(), resources, executor, events);
+  GovernedHost host;
+  engine::Engine engine(host.connect({}), resources, executor, events);
   guardReleases(storage, engine);
+  // The engine's limit refuses an extent's bytes while the cached state
+  // holds the memory the KV shares with it.
+  bool limited = false;
+  storage.growthAllowed = [&](uint32_t) {
+    if (!limited || resources.snapshot().stateCache.entries == 0)
+      return true;
+    storage.allocationFailure = refusedAtTheLimit(host, 4 * 4096);
+    return false;
+  };
   engine.submit(request(230, std::vector<uint32_t>(65, 230)));
   runUntilIdle(engine);
   const auto cached = resources.snapshot();
   require(cached.stateCache.entries == 1 && cached.pool.pagesAllocated == 4,
           "shared-budget fixture did not cache one state in one extent");
+  reachTheLimit(host);
+  limited = true;
 
   engine.submit(request(231, std::vector<uint32_t>(161, 231)));
   runUntilIdle(engine);
@@ -1709,11 +1740,15 @@ void testAdmissionPinsDesiredStateAndCountsOnlySuccess() {
   executor.beginObserver = [&] {
     if (resources.snapshot().stateCache.pinned == 1) ++pinnedAttempts;
   };
-  executor.deniedBegins = 2;
+  // The start lacks the buffers of a state the cache holds beside the one
+  // it pins, which the ledger takes before it retries once.
+  executor.statesLacked = [&] { return resources.snapshot().stateCache.entries > 1 ? 1U : 0U; };
+  executor.beginGrowthBlocked = [&] { return executor.statesLacked() != 0; };
+  const uint32_t attempts = executor.beginAttempts;
   engine.submit(request(242, desired));
   runUntilIdle(engine);
   const auto after = engine.snapshot();
-  require(pinnedAttempts == 3 && events.completedCount == 3 &&
+  require(pinnedAttempts == 2 && executor.beginAttempts == attempts + 2 && events.completedCount == 3 &&
               after.resources.stateCache.entries == 1 &&
               after.resources.stateCache.pinned == 0 &&
               events.starts.back() == 64 &&
@@ -1736,10 +1771,10 @@ void testAdmissionCanDropItsOwnCachePinToMakeProgress() {
   require(resources.snapshot().stateCache.entries == 1,
           "self-pin test did not retain its initial state");
   // Under the new ceiling, one active request fits only after releasing the
-  // sole cached state. Its lookup lease must not create a permanent deadlock.
-  executor.beginGrowthBlocked = [&] {
-    return resources.snapshot().stateCache.entries != 0;
-  };
+  // sole cached state, whose buffers its activation lacks. Its lookup lease
+  // must not create a permanent deadlock.
+  executor.statesLacked = [&] { return resources.snapshot().stateCache.entries != 0 ? 1U : 0U; };
+  executor.beginGrowthBlocked = [&] { return executor.statesLacked() != 0; };
   engine.submit(request(246, prompt));
   runUntilIdle(engine);
   require(events.completedCount == 2 && events.failedCount == 0 &&
@@ -1771,9 +1806,8 @@ void testActivationReceivesTheRestoreBoundary() {
           "a prefix hit did not activate with its restore boundary");
   std::vector<uint32_t> attempts;
   executor.beginObserver = [&] { attempts.push_back(executor.lastRestoredTokens); };
-  executor.beginGrowthBlocked = [&] {
-    return resources.snapshot().stateCache.entries != 0;
-  };
+  executor.statesLacked = [&] { return resources.snapshot().stateCache.entries != 0 ? 1U : 0U; };
+  executor.beginGrowthBlocked = [&] { return executor.statesLacked() != 0; };
   engine.submit(request(249, prompt));
   runUntilIdle(engine);
   require(attempts.size() >= 2 && attempts.front() == 64 && attempts.back() == 0 &&
@@ -1879,7 +1913,9 @@ void testDroppedLeaseLooksUpAgain() {
   cache.publishCompositeState(test::publishBlocks(cache, 999, prompt, 64),
                               std::make_shared<OffloadState>(write), false);
   cache.endRequest(999);
-  executor.beginGrowthBlocked = [&] { return cache.snapshot().stateCache.bytes != 0; };
+  // Its activation lacks the buffers of the state in RAM.
+  executor.statesLacked = [&] { return cache.snapshot().stateCache.bytes != 0 ? 1U : 0U; };
+  executor.beginGrowthBlocked = [&] { return executor.statesLacked() != 0; };
   executor.restoreControl->ready = true;
   engine.submit(request(1, prompt));
   runUntilIdle(engine);
@@ -2068,6 +2104,22 @@ void testWaitingCandidateProbeIsRefreshedNotRepeated() {
           "a kept probe hashed more than the page past its match");
 }
 
+// The host refuses the first start twice: as the governor's rule for the
+// only request in service while the host is short of its margin, and once
+// that claim passes the host, as the driver may (MemoryGovernor::
+// allocationAdmission), which nothing the ledger frees ends. Later starts
+// pass.
+void refuseTheExemptRetry(Executor &executor, GovernedHost &host) {
+  executor.beginGrowthBlocked = [&executor, &host] {
+    if (executor.beginAttempts == 1) {
+      executor.beginAllocationFailure = host.reserve(4096).failure;
+      return executor.beginAllocationFailure != metal::AllocationFailure::None;
+    }
+    executor.beginAllocationFailure = metal::AllocationFailure::HostPressure;
+    return executor.beginAttempts == 2;
+  };
+}
+
 // A request that waits for memory closes admission behind it: the request
 // that arrived after it is not tried, and starts once the first has.
 void testMemoryWaitHoldsBackLaterArrivals() {
@@ -2076,12 +2128,11 @@ void testMemoryWaitHoldsBackLaterArrivals() {
   engine::Cache resources(pool, nullptr, nullptr);
   Executor executor;
   Events events;
-  engine::Engine engine(test::engineConfig(), resources, executor, events);
+  GovernedHost host;
+  engine::Engine engine(host.connect({}), resources, executor, events);
   guardReleases(storage, engine);
-  // The host refuses the first request twice: as an ordinary allocation and
-  // as that of the only request in service.
-  executor.beginAllocationFailure = metal::AllocationFailure::HostPressure;
-  executor.beginGrowthBlocked = [&] { return executor.beginAttempts <= 2; };
+  host.pause(true);
+  refuseTheExemptRetry(executor, host);
   engine.submit(request(1, std::vector<uint32_t>(4097, 47)));
   engine.submit(request(2, std::vector<uint32_t>(8193, 48)));
   static_cast<void>(engine.tick(1));
@@ -2481,13 +2532,11 @@ void testSchedulingWaitDoesNotConsumeMemoryTimeout() {
   engine::Cache resources(pool, nullptr, nullptr);
   Executor executor;
   Events events;
-  engine::Engine engine(test::engineConfig({.resourceWaitTimeoutMilliseconds = 1000.0}),
-                        resources, executor, events);
+  GovernedHost host;
+  engine::Engine engine(host.connect({.resourceWaitTimeoutMilliseconds = 1000.0}), resources, executor, events);
   guardReleases(storage, engine);
-  executor.beginAllocationFailure = metal::AllocationFailure::HostPressure;
-  // The host refuses the first request twice: as an ordinary allocation and
-  // as that of the only request in service.
-  executor.beginGrowthBlocked = [&] { return executor.beginAttempts <= 2; };
+  host.pause(true);
+  refuseTheExemptRetry(executor, host);
   engine.submit(request(1, std::vector<uint32_t>(8193, 47)));
   static_cast<void>(engine.tick(1));
   require(executor.beginAttempts == 2 && !executor.requests.contains(1) &&
@@ -3187,8 +3236,12 @@ void testResumedLaneRebuildsItsPointFromCachedKv(uint32_t extentsPerState) {
   engine::Cache &resources = fixture.resources;
   const uint32_t releases = fixture.releases;
   fixture.executor.stateBytes = extentsPerState * 4 * 4096;
+  reachTheLimit(fixture.host);
   fixture.executor.reservationRoom = [&] {
-    return storage.releasedExtents >= releases + extentsPerState;
+    if (storage.releasedExtents >= releases + extentsPerState)
+      return true;
+    fixture.executor.reservationFailure = refusedAtTheLimit(fixture.host, fixture.executor.stateBytes);
+    return false;
   };
   fixture.finish();
   const Events &events = fixture.events;
@@ -3220,7 +3273,11 @@ void testResumedLaneRebuildsItsPointFromCachedKv(uint32_t extentsPerState) {
 void testRefusedBuffersTakeAtMostOneStateOfExtents() {
   LostReplayPoint fixture;
   fixture.executor.stateBytes = 4 * 4096;
-  fixture.executor.reservationRoom = [] { return false; };
+  reachTheLimit(fixture.host);
+  fixture.executor.reservationRoom = [&] {
+    fixture.executor.reservationFailure = refusedAtTheLimit(fixture.host, fixture.executor.stateBytes);
+    return false;
+  };
   fixture.finish();
   std::vector<uint32_t> next = fixture.prompt;
   next.resize(next.size() + 40, 9);
@@ -3233,16 +3290,17 @@ void testRefusedBuffersTakeAtMostOneStateOfExtents() {
 
 // A lane's state is memory the governor funds, on a target whose KV stays in
 // memory too: cached KV gives it memory only as the extent its pages leave
-// empty. Refused its state at the engine's limit, a start takes another
-// conversation's leaves until an extent has left memory, and asks for the
-// state again once then, not after each leaf.
+// empty. Refused its state's extent of bytes at the engine's limit, a start
+// takes another conversation's leaves until an extent has left memory, and
+// asks for the state again once then, not after each leaf.
 void testRefusedStateAsksAgainOnceAnExtentLeft() {
   test::TestKvStorage storage(64, 4096, 4);
   KvPool pool(storage, 0);
   engine::Cache resources(pool, nullptr, nullptr);
   Executor executor;
   Events events;
-  engine::Engine engine(test::engineConfig(), resources, executor, events);
+  GovernedHost host;
+  engine::Engine engine(host.connect({}), resources, executor, events);
   guardReleases(storage, engine);
   // Another conversation's KV, with no state, fills two whole extents.
   const std::vector<uint32_t> other(257, 6);
@@ -3252,7 +3310,13 @@ void testRefusedStateAsksAgainOnceAnExtentLeft() {
   resources.endRequest(900);
   // The start's state fits only once an extent has left memory.
   const uint32_t releases = storage.releasedExtents;
-  executor.beginGrowthBlocked = [&] { return storage.releasedExtents == releases; };
+  reachTheLimit(host);
+  executor.beginGrowthBlocked = [&] {
+    if (storage.releasedExtents != releases)
+      return false;
+    executor.beginAllocationFailure = refusedAtTheLimit(host, 4 * 4096);
+    return true;
+  };
   const uint32_t attempts = executor.beginAttempts;
   engine.submit(request(1, std::vector<uint32_t>(65, 7)));
   runUntilIdle(engine);
@@ -3415,10 +3479,11 @@ void testRepeatedPreemptionRespectsBackoffAndCancellation() {
   }
 }
 
-// A budget denial releases one empty extent per step and retries after each;
-// if that admits the request it runs, and if reclaim has nothing more to free
-// the lone request fails as exhausted capacity in the same tick, since a
-// release takes effect when it is made.
+// A budget denial takes the empty extents that cover what it lacks, both at
+// once, and retries once (MemoryLedger::free: the cheapest units that meet
+// the need, all or none); if that admits the request it runs, and if the
+// ledger has nothing more to free the lone request fails as exhausted
+// capacity in the same tick, since a release takes effect when it is made.
 void testBudgetDenialRetriesAfterRelease() {
   for (bool recovers : {true, false}) {
     test::TestKvStorage storage(8, 4096, 4);
@@ -3429,21 +3494,24 @@ void testBudgetDenialRetriesAfterRelease() {
     for (uint32_t page : pages.pages)
       pool.releasePage(page, false);
     Executor executor(1);
-    executor.beginGrowthBlocked = [&] {
-      return pool.snapshot().pagesAllocated != 0 || !recovers;
-    };
-    executor.beginAllocationFailure = metal::AllocationFailure::EngineBudget;
     Events events;
-    EngineConfig config = test::engineConfig();
-    config.resourceWaitTimeoutMilliseconds = 500.0;
-    engine::Engine engine(config, cache, executor, events);
+    GovernedHost host;
+    engine::Engine engine(host.connect({.resourceWaitTimeoutMilliseconds = 500.0}), cache, executor, events);
     guardReleases(storage, engine);
+    // The start lacks the storage's two extents of bytes.
+    reachTheLimit(host);
+    executor.beginGrowthBlocked = [&] {
+      if (pool.snapshot().pagesAllocated == 0 && recovers)
+        return false;
+      executor.beginAllocationFailure = refusedAtTheLimit(host, 8 * 4096);
+      return true;
+    };
     engine.submit(request(284, {284}));
     static_cast<void>(engine.tick(1));
-    // The denial released one empty extent per step, retrying after each:
-    // the storage's two extents take two steps.
-    require(executor.beginAttempts == 3,
-            "a denied admission did not retry after each extent it released");
+    // The denial released both empty extents in one free() and retried
+    // once.
+    require(executor.beginAttempts == 2,
+            "a denied admission did not retry once after the extents it released");
     if (recovers) {
       require(executor.requests.size() == 1 && events.failedCount == 0,
               "the retry after the release did not admit the request");
@@ -3465,30 +3533,37 @@ void testBudgetDenialRetriesAfterRelease() {
 
 // A lane's admission keeps the pooled buffers it starts from: its activation
 // takes them, so releasing them would only make the retry allocate them
-// again. KV growth releases them once the cache has nothing to give.
+// again. So does KV growth short of macOS's critical pressure: the idle
+// buffers the ledger takes first, at no cost, are those beyond one lane's
+// (EngineVictims, plan/M3a.md S2); under critical pressure they go too.
 void testLaneAdmissionAndKvGrowthKeepThePooledLaneBuffers() {
-  for (bool state : {true, false}) {
+  enum class Refused { State, Kv, KvCritical };
+  for (const Refused refused : {Refused::State, Refused::Kv, Refused::KvCritical}) {
     test::TestKvStorage storage(8, 4096, 4);
     KvPool pool(storage, 0);
     engine::Cache cache(pool, nullptr, nullptr);
     Executor executor(1);
     executor.pooledLaneBytes = 4096;
     Events events;
-    engine::Engine engine(test::engineConfig(), cache, executor, events);
+    GovernedHost host;
+    engine::Engine engine(host.connect({}), cache, executor, events);
     guardReleases(storage, engine);
-    if (state) {
+    if (refused == Refused::State) {
       executor.beginGrowthBlocked = [] { return true; };
       executor.beginAllocationFailure = metal::AllocationFailure::EngineBudget;
     } else {
       storage.growthBlocked = true;
     }
+    if (refused == Refused::KvCritical)
+      host.setPressure(MemoryPressure::Critical);
     engine.submit(request(286, {286}));
     static_cast<void>(engine.tick(1));
     require(idle(engine) &&
                 events.failures == std::vector<std::string>{"capacity_exhausted"} &&
-                (executor.pooledLaneBytes != 0) == state,
-            state ? "a lane's admission released the pooled buffers it starts from"
-                  : "KV growth kept the pooled buffers with no lane waiting for them");
+                (executor.pooledLaneBytes != 0) == (refused != Refused::KvCritical),
+            refused == Refused::State ? "a lane's admission released the pooled buffers it starts from"
+            : refused == Refused::Kv  ? "KV growth released the pooled buffers short of critical pressure"
+                                      : "KV growth kept the pooled buffers under critical pressure");
   }
 }
 
@@ -3698,12 +3773,16 @@ struct ScatteredPages {
     return result;
   }
 
-  // A fifth lane that fits only once the pool has given an extent back.
+  // A fifth lane that fits only once the pool has given an extent back:
+  // its state lacks an extent's bytes at the engine's limit.
   void submitLaneTheBudgetRefuses() {
+    reachTheLimit(host);
     model.beginGrowthBlocked = [this] {
-      return model.lastBeginId == 5 && pool.snapshot().pagesAllocated > 8;
+      if (model.lastBeginId != 5 || pool.snapshot().pagesAllocated <= 8)
+        return false;
+      model.beginAllocationFailure = refusedAtTheLimit(host, 4 * 4096);
+      return true;
     };
-    model.beginAllocationFailure = metal::AllocationFailure::EngineBudget;
     engine.submit(request(5, prompt(5000, 33)));
   }
 
@@ -3712,7 +3791,8 @@ struct ScatteredPages {
   engine::Cache cache{pool, nullptr, nullptr};
   Executor model;
   Events events;
-  engine::Engine engine{test::engineConfig(), cache, model, events};
+  GovernedHost host;
+  engine::Engine engine{host.connect({}), cache, model, events};
   // The time of the next tick.
   double now = 1;
 };
@@ -3759,13 +3839,20 @@ void testCommandReadsItsPageTableAfterRoomForItsStates() {
   Executor model;
   model.kv = &storage;
   Events events;
-  engine::Engine engine{test::engineConfig(), cache, model, events};
+  GovernedHost host;
+  engine::Engine engine{host.connect({}), cache, model, events};
   guardReleases(storage, engine);
   ScatteredPages::scatter(engine, cache);
-  // The governor admits the buffers of the continuation's replay point only
-  // once an extent has gone.
+  // The governor admits the buffers of the continuation's replay point, an
+  // extent's bytes at its limit, only once an extent has gone.
   const uint32_t releases = storage.releasedExtents;
-  model.reservationRoom = [&] { return storage.releasedExtents > releases; };
+  reachTheLimit(host);
+  model.reservationRoom = [&] {
+    if (storage.releasedExtents > releases)
+      return true;
+    model.reservationFailure = refusedAtTheLimit(host, 4 * 4096);
+    return false;
+  };
   engine.submit(request(4, ScatteredPages::prompt(3000, 129)));
   runUntilIdle(engine);
   require(storage.copies.size() == 1 && storage.copies[0].from == 8 &&
@@ -5690,8 +5777,9 @@ void testEveryEndReleasesTheReplayPoint() {
   enum class End { Cancel, Failure, Deadline, Capacity };
   for (const End end : {End::Cancel, End::Failure, End::Deadline, End::Capacity}) {
     // Without a peer or cached KV to take, the decode's growth past three
-    // pages exhausts the capacity, after it took the request's own point as
-    // the last thing left.
+    // pages exhausts the capacity. The pages it lacks are no state's: its
+    // own point stays cached once its end releases it, as nothing that
+    // frees no page is taken for a page need.
     test::TestKvStorage storage(64, 4096, 1);
     if (end == End::Capacity)
       storage.budgetPages = 3;
@@ -5722,7 +5810,7 @@ void testEveryEndReleasesTheReplayPoint() {
       static_cast<void>(engine.tick(now));
     const auto state = resources.snapshot().stateCache;
     require(idle(engine) && state.inUse == 0 &&
-                state.entries == (end == End::Capacity ? 0U : 1U) &&
+                state.entries == 1 &&
                 events.capacityExhaustedCount == (end == End::Capacity ? 1U : 0U),
             "a request's end did not release its replay point");
   }
@@ -5817,8 +5905,25 @@ struct StoreFixture {
   engine::Cache resources{pool, nullptr, nullptr};
   Executor executor;
   Events events;
-  engine::Engine engine{test::engineConfig(), resources, executor, events};
+  GovernedHost host;
+  engine::Engine engine{host.connect({}), resources, executor, events};
   double now = 1;
+};
+
+// The expert store as the ledger's pool over `host`'s memory: units of an
+// extent's bytes, of which `above` above its floor of one; registered as a
+// start registers the model's pools (Bootstrap).
+struct Store {
+  Store(GovernedHost &host, Executor &executor, uint32_t above)
+      : experts("experts", host.memory, 4 * 4096, 1, 1 + above, 8, 1 + above, 2.5, 80.0), executor(executor) {
+    executor.experts = &experts;
+    static_cast<void>(host.governor.ledger().addPool(experts));
+  }
+  ~Store() { executor.experts = nullptr; }
+  Store(const Store &) = delete;
+  Store &operator=(const Store &) = delete;
+  test::FakeElasticPool experts;
+  Executor &executor;
 };
 
 // A copy ahead of the leaf a refused allocation would free through it holds
@@ -5904,9 +6009,11 @@ void testCaptureKvPastABoundaryTakesNothingInUse() {
 }
 
 // The prompt's replay point, refused at the engine's limit with nothing
-// ordinary left, takes a chunk of the expert store above its floor before
+// ordinary left, takes a unit of the expert store above its floor before
 // another request's state in use, which goes only with the store at its
-// floor.
+// floor: the store's units, which nothing has missed, cost nothing, the
+// state in use its recompute at the scheduler's prices (value: amend/M.md
+// B6, B8).
 void testReplayPointTakesTheExpertStoreBeforeWhatIsInUse() {
   for (const bool atFloor : {false, true}) {
     StoreFixture fixture;
@@ -5915,42 +6022,56 @@ void testReplayPointTakesTheExpertStoreBeforeWhatIsInUse() {
                .madeProgress) {
     }
     static_cast<void>(fixture.resources.releaseEmptyExtents(false));
-    if (!atFloor)
-      executor.expertChunks = {1000, 1000};
-    // Refused until a chunk went, or the state in use did.
+    Store store(fixture.host, executor, atFloor ? 0 : 2);
+    // The rate the control pass prices a row's recompute at: the passing
+    // target's 0.3 ms (CostSeeds.hpp).
+    fixture.host.governor.ledger().setRates({.prefillSecondsPerRow = 0.0003});
+    reachTheLimit(fixture.host);
+    // Refused an extent's bytes at the limit until a unit went, or the state
+    // in use did.
     executor.reservationRoom = [&] {
-      return !executor.releasedExpertChunks.empty() ||
-             fixture.resources.snapshot().stateCache.inUseEvictions != 0;
+      if (store.experts.shrinks || fixture.resources.snapshot().stateCache.inUseEvictions)
+        return true;
+      executor.reservationFailure = refusedAtTheLimit(fixture.host, 4 * 4096);
+      return false;
     };
     const uint64_t publications = fixture.engine.snapshot().replayStatePublications;
     fixture.engine.submit(request(3, std::vector<uint32_t>(65, 3)));
     tickUntil(fixture.engine, fixture.now,
               [&] { return fixture.engine.snapshot().replayStatePublications > publications; },
               "the replay point was not published");
-    require(executor.releasedExpertChunks.size() == (atFloor ? 0U : 1U) &&
+    require(store.experts.shrinks == (atFloor ? 0U : 1U) &&
                 fixture.resources.snapshot().stateCache.inUseEvictions == (atFloor ? 1U : 0U),
             atFloor ? "the replay point did not take a state in use with the store at its floor"
-                    : "the replay point took a state in use before a chunk of the expert store");
+                    : "the replay point took a state in use before a unit of the expert store");
     executor.reservationRoom = {};
     fixture.finish();
   }
 }
 
 // The prompt's replay point, refused at the engine's limit, takes the cache
-// nothing in use holds before a chunk of the expert store, KV that needs its
-// copy on the SSD cache first included: it starts that copy, and while the
-// copy is on its way the store keeps its chunks and the command ends at the
-// replay point's boundary without the state. Here a finished conversation's
-// state has gone to the disk and its pages have no copy there yet.
+// nothing in use holds before a unit of the expert store whose misses the
+// commands measured, KV that needs its copy on the SSD cache first included:
+// it starts that copy, and while the copy is on its way the store keeps its
+// units and the command ends at the replay point's boundary without the
+// state (amend/M.md B6, B9). Here a finished conversation's state has gone
+// to the disk and its pages have no copy there yet, and nothing it holds
+// was reused.
 void testReplayPointCopiesCacheBeforeTheExpertStore() {
   test::TestKvStorage storage(16, 4096, 4);
   KvPool pool(storage, 0);
   test::TestKvTier tier;
+  // The tier takes the copies of an extent's pages at once.
+  tier.transferLimit = 4;
   engine::Cache cache(pool, &tier, test::ampleDiskBudget());
   Executor executor;
   Events events;
-  engine::Engine engine(test::engineConfig(), cache, executor, events);
+  GovernedHost host;
+  engine::Engine engine(host.connect({}), cache, executor, events);
   guardReleases(storage, engine);
+  // Priced as a start seeds it: the request holds what it takes for the
+  // time its work takes.
+  test::seedAsStartup(engine, executor);
   std::vector<uint32_t> prompt(129);
   std::iota(prompt.begin(), prompt.end(), 1000);
   cache.beginRequest(1);
@@ -5967,11 +6088,21 @@ void testReplayPointCopiesCacheBeforeTheExpertStore() {
   static_cast<void>(cache.pollTransfers());
   require(!cache.stateResident(leaf) && pool.snapshot().pagesPrefix != 0 && tier.demotions == 0,
           "the fixture did not leave its pages in RAM without copies");
-  executor.expertChunks = {1000};
-  // The replay point is refused until the conversation's pages left RAM or
-  // a chunk of the store went.
+  // A unit of the store above its floor, which ghost hits the commands of
+  // half a minute served price.
+  Store store(host, executor, 1);
+  for (double seconds = 0.5; seconds <= 30.0; seconds += 0.5) {
+    store.experts.served(0, 5, 0, 0);
+    host.governor.ledger().observePools(seconds, true);
+  }
+  reachTheLimit(host);
+  // The replay point is refused an extent's bytes at the limit until the
+  // conversation's pages left RAM or a unit of the store went.
   executor.reservationRoom = [&] {
-    return pool.snapshot().pagesPrefix == 0 || !executor.releasedExpertChunks.empty();
+    if (pool.snapshot().pagesPrefix == 0 || store.experts.shrinks)
+      return true;
+    executor.reservationFailure = refusedAtTheLimit(host, 4 * 4096);
+    return false;
   };
   engine.submit(request(3, std::vector<uint32_t>(65, 3)));
   double now = 1;
@@ -5980,8 +6111,8 @@ void testReplayPointCopiesCacheBeforeTheExpertStore() {
     tier.complete();
   }
   require(idle(engine) && events.failedCount == 0, "the request did not finish");
-  require(executor.releasedExpertChunks.empty() && tier.demotions != 0,
-          "the replay point took a chunk of the expert store before the cache that needed a copy");
+  require(!store.experts.shrinks && tier.demotions != 0,
+          "the replay point took a unit of the expert store before the cache that needed a copy");
   executor.reservationRoom = {};
 }
 
