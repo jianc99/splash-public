@@ -413,8 +413,9 @@ one `/status` counts in `requests.failed`), it saw no `serious` or `critical`
 thermal sample, it served the cell's model, no process it did not start was
 among the top five by CPU at 24 % or more (`foreign_cpu_percent` in the spec,
 whose note gives its source), and, on the M5 Pro, its owner neither touched
-it (HIDIdleTime under 10 s) nor had a process the run did not start hold a
-display or system sleep assertion. A TTFT run's concurrency counts only where
+it (HIDIdleTime under 10 s) nor had an app hold a display or system sleep
+assertion: a process the run did not start other than powerd, which holds one
+itself whenever the display is on. A TTFT run's concurrency counts only where
 every round it was to run completed its N requests. An ample-memory run counts
 only if the experts were at their cap with pressure normal at Ready. G8 is
 judged on every candidate run of every scenario: a run whose server

@@ -1051,33 +1051,33 @@ class GateTests(unittest.TestCase):
             (resident["prefill_hole_share"], resident["ssd_busy_share"]), (None, None)
         )
 
+    def m5_validated(self, label, rows, holders=(), hid_idle_s=300.0):
+        """The reasons validate gives a complete M5 Pro serve1 run with these
+        ps rows and one idle sample, pids 700 and 701 its own."""
+        cell = {"name": "c", "machine": "m5", "model": "fn-q2", "scenario": "serve1"}
+        write_jsonl(
+            self.directory / f"{label}.idle.jsonl",
+            [{"hid_idle_s": hid_idle_s, "holders": list(holders)}],
+        )
+        (self.directory / f"{label}.out").write_text("DONE\n")
+        (self.directory / f"{label}.meta.json").write_text(
+            json.dumps(
+                {
+                    "complete": True,
+                    "model": self.spec["models"]["fn-q2"]["model"],
+                    "pids": [700, 701],
+                    "ps": [{"rows": rows}],
+                }
+            )
+        )
+        run_ = matrix.Run(self.directory, label)
+        matrix.validate(run_, self.spec, cell)
+        return run_.invalid
+
     def test_a_process_this_run_did_not_start_voids_it(self):
         # base.md §2.7 with the gates' floor: the run.py smoke's start, with
         # mediaanalysisd at 117.8 % and nothing of the run's in the top five,
         # is void; WindowServer's and sysmond's steady 10-12 % are not.
-        cell = {"name": "c", "machine": "m5", "model": "fn-q2", "scenario": "serve1"}
-        model = self.spec["models"]["fn-q2"]["model"]
-
-        def validated(label, rows, holders=()):
-            write_jsonl(
-                self.directory / f"{label}.idle.jsonl",
-                [{"hid_idle_s": 300.0, "holders": list(holders)}],
-            )
-            (self.directory / f"{label}.out").write_text("DONE\n")
-            (self.directory / f"{label}.meta.json").write_text(
-                json.dumps(
-                    {
-                        "complete": True,
-                        "model": model,
-                        "pids": [700, 701],
-                        "ps": [{"rows": rows}],
-                    }
-                )
-            )
-            run_ = matrix.Run(self.directory, label)
-            matrix.validate(run_, self.spec, cell)
-            return run_.invalid
-
         busy = [
             [55828, 117.8, 0.5, "mediaanalysisd", False],
             [68643, 11.2, 1.0, ".venv/bin/python", False],
@@ -1086,7 +1086,7 @@ class GateTests(unittest.TestCase):
             [1162, 2.9, 0.0, "WallpaperAerialsExtension", False],
         ]
         self.assertEqual(
-            validated("busy", busy),
+            self.m5_validated("busy", busy),
             [
                 "a process this run did not start in the top five by CPU: "
                 "mediaanalysisd at 117.8 %"
@@ -1099,15 +1099,38 @@ class GateTests(unittest.TestCase):
             [701, 3.0, 0.1, ".venv/bin/python", True],
             [57229, 7.1, 0.1, "Activity Monitor", False],
         ]
-        self.assertEqual(validated("quiet", quiet), [])
+        self.assertEqual(self.m5_validated("quiet", quiet), [])
         # A sleep assertion counts by pid: this run's engine may hold one,
         # another python may not.
         ours = "pid 700(splash): [0x0001] 00:05:00 PreventUserIdleSystemSleep named: x"
         theirs = "pid 4242(python3.12): [0x0002] 00:05:00 PreventUserIdleSystemSleep named: y"
-        self.assertEqual(validated("held", quiet, [ours]), [])
+        self.assertEqual(self.m5_validated("held", quiet, [ours]), [])
         self.assertEqual(
-            validated("other", quiet, [ours, theirs]),
+            self.m5_validated("other", quiet, [ours, theirs]),
             [f"another process held a sleep assertion: {theirs}"],
+        )
+
+    def test_only_an_app_holding_a_sleep_assertion_voids_a_run(self):
+        # powerd holds this whenever the M5 Pro's display is on (displaysleep
+        # 0), as in every sample of the 11-01 M5 references: no void. A video
+        # app's assertion voids the run, and the owner's touch still does.
+        quiet = [[700, 8.0, 4.4, "build/splash", True]]
+        display = (
+            "pid 351(powerd): [0x0000004d00018008] 06:27:03 PreventUserIdleSystemSleep"
+            ' named: "Powerd - Prevent sleep while display is on"'
+        )
+        video = (
+            "pid 5120(QuickTime Player): [0x0000004d00018a40] 00:12:00"
+            ' PreventUserIdleDisplaySleep named: "Playing video"'
+        )
+        self.assertEqual(self.m5_validated("display", quiet, [display]), [])
+        self.assertEqual(
+            self.m5_validated("video", quiet, [display, video]),
+            [f"another process held a sleep assertion: {video}"],
+        )
+        self.assertEqual(
+            self.m5_validated("touched", quiet, [display], hid_idle_s=2.5),
+            ["the laptop was in use (HIDIdleTime 2.5 s)"],
         )
 
     def test_an_unreported_bound_or_ledger_is_not_judged(self):

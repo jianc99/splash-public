@@ -325,11 +325,18 @@ def not_run(cell: dict, runs: list[Run]) -> list[tuple[str, str]]:
     ]
 
 
-def assertion_pid(holder: str) -> int | None:
-    """The pid of a `pmset -g assertions` line ("pid 330(powerd): ...")."""
+def app_assertion(holder: str, ours: set) -> bool:
+    """Whether a `pmset -g assertions` line ("pid 351(powerd): ...") is an
+    app's: held by a process the run did not start other than powerd. macOS's
+    power manager holds "Powerd - Prevent sleep while display is on" itself
+    whenever the display is on, on the M5 Pro (displaysleep 0) always: every
+    sample of its six references of 11-01 shows it, at HIDIdleTime 11,263 s
+    or more. It is a system process following the display, not an app in
+    use; the owner's use shows in HIDIdleTime."""
     _, found, rest = holder.partition("pid ")
-    digits = rest.split("(", 1)[0].strip()
-    return int(digits) if found and digits.isdigit() else None
+    digits, _, rest = rest.partition("(")
+    pid = int(digits) if found and digits.strip().isdigit() else None
+    return pid not in ours and rest.partition(")")[0] != "powerd"
 
 
 def validate(run: Run, spec: dict, cell: dict) -> None:
@@ -393,10 +400,7 @@ def validate(run: Run, spec: dict, cell: dict) -> None:
             if s.get("hid_idle_s") is not None and s["hid_idle_s"] < floor
         ]
         held = [
-            h
-            for s in run.idle
-            for h in s.get("holders", [])
-            if assertion_pid(h) not in ours
+            h for s in run.idle for h in s.get("holders", []) if app_assertion(h, ours)
         ]
         if touched:
             void(
