@@ -980,6 +980,7 @@ void Cache::dropPoisoned() {
       if (kv_.contains(below))
         kv_.erase(below);
     }
+    kv_.erasePoisonedLeaf(block);
     return !kv_.contains(block);
   });
 }

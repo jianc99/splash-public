@@ -1054,7 +1054,8 @@ private:
   [[nodiscard]] bool dropDiskSubtree(uint64_t block);
   // Nothing below a block whose read failed matches any more. Once none of
   // it is in transfer or active, it is erased with the states on it, in use
-  // or not, and the poisoned block leaves with its last user.
+  // or not, and the poisoned block leaves once nothing refers to it: with its
+  // last user, or here once a transfer that held it has landed.
   void dropPoisoned();
   // The KV tier's part of pollTransfers().
   [[nodiscard]] bool pollTierTransfers();
