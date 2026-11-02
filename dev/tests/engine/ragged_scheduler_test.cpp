@@ -1323,6 +1323,25 @@ void testALongLanesSparingRowsDoNotDelayAShortTurn() {
   require(joined.width() == 2 && joined.items[1].tokenCount == 300, "a long lane's 300 sparing rows did not join");
 }
 
+// A long lane's sparing rows are those past its whole commands of the
+// model's command rows, however evenly its own commands would split them:
+// 8192 + 300 rows alone run as 6144 and 2348, 16384 + 116 as 6144, 6144 and
+// 4212, and 300 or 116 rows spare it a command beside a turn.
+void testALongLaneSparesACommandWithTheRowsPastItsWholeCommands() {
+  for (const uint32_t sparing : {300u, 116u}) {
+    const uint32_t remaining = (sparing == 300 ? 8192 : 16384) + sparing;
+    Sim sim(test::kM6FlashNextQ2, limits(8192, 48));
+    sim.seed();
+    sim.lane(1, 8192, 300);
+    sim.lane(2, 0, remaining);
+    const BatchPlan plan = sim.plan();
+    require(plan.width() == 2 && plan.items[0].requestId == 1 && plan.items[1].tokenCount == sparing,
+            "a lane of " + std::to_string(remaining) + " rows did not join a turn with its " +
+                std::to_string(sparing) + " sparing rows: " + std::to_string(plan.width()) + " lanes, " +
+                std::to_string(plan.items.back().tokenCount) + " rows last");
+  }
+}
+
 // N=4: four agent turns share one command, as on 0bd50301 in the TTFT
 // bench (A68: 5152/5247 ms), whose rounds before them trained its price; at
 // a host-wait split (1.7 s + 4.3 ms a row) the third would not join.
@@ -1939,6 +1958,8 @@ constexpr test::TestCase kTests[] = {
     {"testDecodeGapsBesideAStreamingLaneStayWithinTheBound", testDecodeGapsBesideAStreamingLaneStayWithinTheBound},
     {"testTurnsTtftAloneTogetherAndApart", testTurnsTtftAloneTogetherAndApart},
     {"testALongLanesSparingRowsDoNotDelayAShortTurn", testALongLanesSparingRowsDoNotDelayAShortTurn},
+    {"testALongLaneSparesACommandWithTheRowsPastItsWholeCommands",
+     testALongLaneSparesACommandWithTheRowsPastItsWholeCommands},
     {"testFourShortTurnsShareOneCommand", testFourShortTurnsShareOneCommand},
     {"testADenseFinishingLeaderRunsWithoutFill", testADenseFinishingLeaderRunsWithoutFill},
     {"testAStreamingLaneSharesACommand", testAStreamingLaneSharesACommand},

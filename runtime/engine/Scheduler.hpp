@@ -309,6 +309,9 @@ private:
   // Whether a lane's chunk saves enough fixed part in a group of the
   // model's command rows to be worth a wait of G.
   [[nodiscard]] bool groups(const Lane &lane) const;
+  // The most rows a command of the lane alone holds: the model's command
+  // rows where it groups, else a chunk.
+  [[nodiscard]] uint32_t groupRows(const Lane &lane) const;
   // The rows of an uncontended command of the lane: a chunk, or a group's.
   [[nodiscard]] uint32_t ownRows(const Lane &lane) const;
   [[nodiscard]] double remainingMilliseconds(const Lane &lane) const;

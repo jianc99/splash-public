@@ -461,18 +461,22 @@ bool Scheduler::groups(const Lane &lane) const {
   return (chunks - 1) * cost_.fixed(work_.prefillWork({&probe, 1}, 0, 1)) >= config_.decodeGapMilliseconds;
 }
 
+uint32_t Scheduler::groupRows(const Lane &lane) const {
+  return groups(lane) ? config_.limits.commandRows : kChunk;
+}
+
 uint32_t Scheduler::ownRows(const Lane &lane) const {
-  return std::min({uncontendedRows(lane.remaining(), groups(lane) ? config_.limits.commandRows : kChunk),
-                   config_.limits.commandRows, lane.shape.rowCap});
+  return std::min({uncontendedRows(lane.remaining(), groupRows(lane)), config_.limits.commandRows,
+                   lane.shape.rowCap});
 }
 
 double Scheduler::remainingMilliseconds(const Lane &lane) const {
   // Its remaining commands alone, each of its uncontended rows from where the
   // one before ends, at its history's Index pages now.
-  const uint32_t groupRows = groups(lane) ? config_.limits.commandRows : kChunk;
+  const uint32_t most = groupRows(lane);
   double total = 0.0;
   for (uint32_t position = lane.processed, remaining = lane.remaining(); remaining;) {
-    const uint32_t rows = std::min(uncontendedRows(remaining, groupRows), config_.limits.commandRows);
+    const uint32_t rows = std::min(uncontendedRows(remaining, most), config_.limits.commandRows);
     const model::PrefillLane command{position, rows, lane.shape.indexPages};
     total += commandMilliseconds({&command, 1});
     position += rows;
@@ -592,9 +596,11 @@ std::optional<Scheduler::Planned> Scheduler::planPrefill(std::vector<Lane> ready
   for (auto view = ready.begin() + 1; view != ready.end(); ++view) {
     if (view->request->spec.priority != tier || lanes.size() == model::ExecutionLimits::maximumBatchWidth)
       break;
-    // The fewest rows that spare it one of its own commands.
-    const uint32_t own = ownRows(*view);
-    const uint32_t rows = std::min((view->remaining() - 1) % own + 1, view->shape.rowCap);
+    // The fewest rows that spare it one of its own commands, each of up to
+    // groupRows rows or its row cap this tick: those past its whole commands,
+    // not past ownRows' even split of them (8492 rows alone run as 6144 and
+    // 2348; 300 of them spare one).
+    const uint32_t rows = (view->remaining() - 1) % std::min(groupRows(*view), view->shape.rowCap) + 1;
     std::vector<model::PrefillLane> with = lanes;
     with.push_back({view->processed, rows, view->shape.indexPages});
     if (rowsOf(with) > config_.limits.commandRows || lanesPastChunk(with) > config_.limits.lanesPastChunk ||
