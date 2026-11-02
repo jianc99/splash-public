@@ -80,8 +80,11 @@ struct MemoryLedger::Account final {
   std::function<uint64_t()> current;
   model::ElasticPool *pool = nullptr;
   // Growth the ledger decided that has not landed yet: held for this account
-  // against every other.
+  // against every other until it grows, a claim cancels it or critical
+  // pressure drops the pool to its floor; and what its victims free once
+  // their transfers land, the host's credit for it.
   uint64_t pendingGrowth = 0;
+  uint64_t pendingLaterBytes = 0;
   uint64_t grows = 0;
   uint64_t shrinks = 0;
   // The units claims took from it, which its rate differentiates.
@@ -423,7 +426,7 @@ FreeResult MemoryLedger::take(const DryRun &run, const VictimQuery &query, Claim
       Account &account = accounts_[index];
       if (choice.pending) {
         ++account.taken;
-        account.pendingGrowth = 0;
+        account.pendingGrowth = account.pendingLaterBytes = 0;
         result.nowBytes = plus(result.nowBytes, choice.victim.bytes);
         continue;
       }
@@ -576,17 +579,19 @@ uint64_t MemoryLedger::available(const ClaimSpec &spec, uint64_t enough, uint64_
 }
 
 // R3 with amend/M.md B4. Pending growth grows once its bytes are free for
-// it. Free room beyond what the waiting claims, the lanes' projected growth
-// and every pending growth hold goes to the pools, the one whose next unit
-// is worth most first, while the host admits each unit and, once claims take
-// a pool's units, while a unit is worth its expected retake. At most one
-// unit per pass then displaces other memory, outside critical pressure,
-// when the victims cost less than the unit is worth beyond its cycle: with
-// the host's consent the victims need only meet what the room lacks, and
-// what its own victims free later is the pool's pending growth; without it
-// they free a whole unit now, which the growth then takes from the host's
-// footprint again (its credit), and what the room lacks besides. The room
-// is the pass's less what the pass has grown.
+// it, on the host's credit of what its victims freed as their transfers
+// landed (the host's footprint is then where it was), and stays pending
+// while the host refuses it. Free room beyond what the waiting claims, the
+// lanes' projected growth and every pending growth hold goes to the pools,
+// the one whose next unit is worth most first, while the host admits each
+// unit and, once claims take a pool's units, while a unit is worth its
+// expected retake. At most one unit per pass then displaces other memory,
+// outside critical pressure, when the victims cost less than the unit is
+// worth beyond its cycle: with the host's consent the victims need only meet
+// what the room lacks, and what its own victims free later is the pool's
+// pending growth; without it they free a whole unit now, which the growth
+// then takes from the host's footprint again (its credit), and what the
+// room lacks besides. The room is the pass's less what the pass has grown.
 bool MemoryLedger::grow(uint64_t freeBytes, const GrowthHost &host) {
   bool acted = false;
   uint64_t waitingBytes = 0;
@@ -636,8 +641,12 @@ bool MemoryLedger::grow(uint64_t freeBytes, const GrowthHost &host) {
       const uint64_t others = less(pendingGrowthBytes(), account.pendingGrowth);
       if (less(less(freeBytes, grownBytes), plus(plus(others, waitingBytes), laneDemandBytes_)) >=
           account.pendingGrowth) {
-        account.pendingGrowth = 0;
-        acted = growUnit(index, 0, "into its pending growth") || acted;
+        // Of its victims' bytes at most what is in flight now has not landed.
+        const uint64_t landed = less(account.pendingLaterBytes, returning().landingBytes);
+        if (growUnit(index, landed, "into its pending growth")) {
+          account.pendingGrowth = account.pendingLaterBytes = 0;
+          acted = true;
+        }
       }
       continue;
     }
@@ -679,6 +688,7 @@ bool MemoryLedger::grow(uint64_t freeBytes, const GrowthHost &host) {
       acted = growUnit(next.account, consents ? 0 : freed.nowBytes, "by displacement") || acted;
     else if (freed.outcome == FreeOutcome::Pending) {
       account.pendingGrowth = next.unit;
+      account.pendingLaterBytes = freed.laterBytes;
       acted = true;
     }
     break;
@@ -691,7 +701,7 @@ uint64_t MemoryLedger::dropToFloors() {
   for (Account &account : accounts_) {
     if (!account.pool)
       continue;
-    account.pendingGrowth = 0;
+    account.pendingGrowth = account.pendingLaterBytes = 0;
     const uint64_t bytes = account.pool->release(std::numeric_limits<uint64_t>::max());
     if (bytes) {
       ++account.shrinks;
