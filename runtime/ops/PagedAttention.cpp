@@ -1,6 +1,7 @@
 #include "ops/PagedAttention.hpp"
 
 #include "ops/BufferExtent.hpp"
+#include "ops/KernelCalibration.hpp"
 
 #include <algorithm>
 #include <array>
@@ -234,18 +235,13 @@ std::array<metal::MetalBuffer, 2> blockBindings(const AttentionBlocks &blocks, c
 metal::DispatchSize reduceThreads(kv::Layout layout) { return {layout.headDimension, 1, 1}; }
 
 // Each query tile's history splits: one per kPrefillPagesPerSplit pages a
-// tile's rows read, those of the visibleTokens the chunk's rows see or, with
-// a window of windowTokens keys before each row, no more than its window's;
-// but no fewer than the maximum shared out over the chunk's tiles (all a
-// short history or a window takes), and no more than the maximum nor, over
-// all the tiles, than the longest chunk's tiles, whose partials the prefill
-// workspace holds; with a window no more than the pages it reads (a split
-// each). A chunk of a few hundred rows over a long history otherwise leaves
-// much of the GPU idle: on an M5 Max the attention of a 256-row chunk after
-// 32K-128K tokens ran 23-26% faster at these splits (Qwen3.6-35B-A3B's and
-// Qwen3.8-27B's), of a 512-row chunk 23% and 10%, within 7% of the fastest
-// split count.
-constexpr uint32_t kPrefillPagesPerSplit = 32;
+// tile's rows read (KernelCalibration.hpp), those of the visibleTokens the
+// chunk's rows see or, with a window of windowTokens keys before each row, no
+// more than its window's; but no fewer than the maximum shared out over the
+// chunk's tiles (all a short history or a window takes), and no more than the
+// maximum nor, over all the tiles, than the longest chunk's tiles, whose
+// partials the prefill workspace holds; with a window no more than the pages
+// it reads (a split each).
 uint32_t prefillSplits(uint32_t tiles, uint64_t visibleTokens, uint32_t windowTokens) {
   constexpr uint32_t maximum = SPLASH_PREFILL_ATTENTION_MAXIMUM_SPLITS;
   constexpr uint32_t ceiling = kv::prefillAttentionTiles(kv::kChunkedPrefillMaximumRows);

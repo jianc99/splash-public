@@ -21,15 +21,6 @@ namespace {
 // The rows a decode step verifies of each of its lanes.
 constexpr uint32_t kVerifyRows = ExecutionLimits::targetVerifyRows;
 
-// Whether the register tile takes every routed and shared expert weight of a
-// MoE block (ops::MoeShape::registerFormats).
-bool registerTakes(const ops::BlockMoeWeights &block) {
-  for (const ops::BlockExpertProjection *projection : {&block.gate, &block.up, &block.down})
-    for (const ops::QuantizedSegment *s : {&projection->routed, &projection->shared})
-      if (!s->isFloat() && !quant_register_tensor(s->formatId, s->inputSize)) return false;
-  return true;
-}
-
 // A prefill sequence binds every GDN layer's state cells, in and out, and so
 // does each state it captures; with auxiliary state, its cells too.
 void requirePrefillStates(const QwenTargetGeometry &geometry, const QwenTargetPrefillSequence &sequence) {
@@ -50,23 +41,7 @@ void requirePrefillStates(const QwenTargetGeometry &geometry, const QwenTargetPr
 
 void QwenTargetGeometry::finish(std::span<const ops::BlockMoeWeights *const> moeBlocks,
                                 const ops::Projection &logits) {
-  // The format of most routed expert weights, GGUF_FMT_COUNT for none, and
-  // of most routers, F32 for none (counted one past the GGUF formats).
-  std::array<uint64_t, GGUF_FMT_COUNT> weights{};
-  std::array<uint32_t, GGUF_FMT_COUNT + 1> routers{};
-  moeRegisterFormats = true;
-  for (const ops::BlockMoeWeights *block : moeBlocks) {
-    moeRegisterFormats &= registerTakes(*block);
-    for (const ops::BlockExpertProjection *projection : {&block->gate, &block->up, &block->down})
-      if (!projection->routed.isFloat())
-        weights[projection->routed.formatId] += uint64_t{projection->routed.outputSize} * projection->routed.inputSize;
-    ++routers[std::min<uint32_t>(block->router.formatId, GGUF_FMT_COUNT)];
-  }
-  const auto most = std::max_element(weights.begin(), weights.end());
-  moeExpertFormat = *most ? uint32_t(most - weights.begin()) : GGUF_FMT_COUNT;
-  const auto router = std::max_element(routers.begin(), routers.end());
-  moeRouterFormat = *router && router < routers.end() - 1 ? uint32_t(router - routers.begin())
-                                                          : ops::QuantizedSegment::kFloat32;
+  moeFormats = ops::moeFormats(moeBlocks);
   prefillProjections = decodeProjections;
   include(logits);
   for (auto *shapes : {&prefillProjections, &decodeProjections, &gateUpProjections}) {
@@ -187,7 +162,8 @@ QwenTarget::PrefillStep QwenTarget::prefillStep(metal::CommandGraph &graph, cons
     if (window)
       step.windowedAttention.push_back(prefillAttentionPlan(operators_, geometry_, sequence, {.windowTokens = window}));
   }
-  if (geometry_.ffnKind == QwenFfnKind::SparseMoe) step.moe = operators_.moePrefill(geometry_.moeShape(), chunk.rows);
+  if (geometry_.ffnKind == QwenFfnKind::SparseMoe)
+    step.moe = operators_.moePrefill(geometry_.moeBlockShape(), geometry_.moeFormats, chunk.rows);
   if (aneFfn && aneFfn->splits(chunk.rows)) step.aneFfn = aneFfn;
   return step;
 }
@@ -216,7 +192,8 @@ QwenTarget::VerifyStep QwenTarget::verifyStep(metal::CommandGraph &graph, const 
     step.windowedAttention.emplace(operators_.verifyAttention(lanes, geometry_.attentionQueryHeads,
                                                               geometry_.kvLayout, std::span(histories).first(lanes),
                                                               {.windowTokens = window}));
-  if (geometry_.ffnKind == QwenFfnKind::SparseMoe) step.moe = operators_.moeDecode(geometry_.moeShape(), lanes);
+  if (geometry_.ffnKind == QwenFfnKind::SparseMoe)
+    step.moe = operators_.moeDecode(geometry_.moeBlockShape(), geometry_.moeFormats, lanes);
   return step;
 }
 

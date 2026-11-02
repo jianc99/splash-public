@@ -28,12 +28,9 @@ struct ProjectionShape final {
   // The bits per weight its quantized segments store together, its float
   // ones aside, in sixteenths, rounded down; 0 where it has none or they are
   // unknown, which plans take for the most a format stores. Apple10's staged
-  // split law weighs a split's partials against the weights (LinearGguf.cpp).
+  // split law weighs a split's partials against the weights, and one lane of
+  // few bits runs the 16-row tile (KernelSelection.cpp).
   uint32_t weightBits16 = 0;
-  // Whether its quantized segments, together, store fewer than four and a
-  // half bits per weight; Apple10 may decode a lane of it on the staged
-  // 16-row tile (Linear::decodeStorageRows).
-  [[nodiscard]] constexpr bool underFourAndHalfBits() const noexcept { return weightBits16 && weightBits16 < 72; }
   auto operator<=>(const ProjectionShape &) const = default;
 };
 

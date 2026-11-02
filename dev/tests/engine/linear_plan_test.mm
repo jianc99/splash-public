@@ -30,6 +30,11 @@ using splash::test::rejects;
 using splash::test::require;
 using splash::test::requireExtent;
 
+// Whether a projection's quantized segments store fewer than four and a half
+// bits per weight together, which Apple10 decodes a lane of on the 16-row
+// tile.
+bool underFourAndHalfBits(const ProjectionShape &shape) { return shape.weightBits16 && shape.weightBits16 < 72; }
+
 DeviceCapabilities simulatedDevice(uint32_t family, uint32_t cores) {
   DeviceCapabilities device;
   device.appleGpuFamily = family;
@@ -129,7 +134,7 @@ void requireAnchorSplits(const LinearPlan &plan, const SplitAnchor &anchor, cons
 
 constexpr auto kNone = LinearEpilogue::None, kResidual = LinearEpilogue::Residual, kGateUp = LinearEpilogue::GateUp;
 
-// Apple10's staged wave law (apple10Staged) on Q4_K, for every projection
+// Apple10's staged wave law (kApple10StagedLaw) on Q4_K, for every projection
 // kind; the narrow grids at 32 rows, where Apple10 stages them (its register
 // tile takes the steps whose grid of column tiles and lanes holds fewer than
 // 1.5 threadgroups per core).
@@ -498,7 +503,7 @@ void ggufPlans() {
                              Weighed{"IQ3_XXS beside F32", {{GGUF_FMT_IQ3XXS, 1024}, {kF32, 96}}, 49, true},
                              Weighed{"F32 alone", {{kF32, 1024}}, 0, false}}) {
       const ProjectionShape shape = segments(5120, w.parts).shape();
-      require(shape.weightBits16 == w.bits16 && shape.underFourAndHalfBits() == w.under,
+      require(shape.weightBits16 == w.bits16 && underFourAndHalfBits(shape) == w.under,
               std::string("the bits per weight of ") + w.projection);
     }
     // The 27B's 17408 x 5120 IQ3_XXS runs it on a 12-core M6 and a 32-core M5
@@ -571,7 +576,7 @@ void ggufPlans() {
               LinearConfig config = one.configuration();
               const bool sixteen = gate ? alone(*p) && alone(*gate)
                                         : family >= 10 && config.tile == LinearTile::GgufStaged &&
-                                              config.splits == 1 && p->shape().underFourAndHalfBits();
+                                              config.splits == 1 && underFourAndHalfBits(p->shape());
               uint32_t storage = device.decodeStorageRows(8, p->shape());
               if (gate) storage = std::max(storage, device.decodeStorageRows(8, gate->shape()));
               require(config.sixteenRows == sixteen && one.storageRows() == (sixteen ? 16U : 8U) &&
@@ -745,9 +750,9 @@ void ggufCoreLaws() {
   for (const uint32_t family : {9U, 10U, 11U})
     for (uint32_t cores = 0; cores <= 128; ++cores) {
       const Linear linear = gpu(family, cores), more = gpu(family, cores + 1), twice = gpu(family, 2 * cores);
-      const uint32_t planned = plannedGpuCores(simulatedDevice(family, cores));
+      const uint32_t planned = simulatedDevice(family, cores).plannedGpuCores();
       const bool spreads = family >= 10 && planned >= 16,
-                 twiceSpreads = family >= 10 && plannedGpuCores(simulatedDevice(family, 2 * cores)) >= 16;
+                 twiceSpreads = family >= 10 && simulatedDevice(family, 2 * cores).plannedGpuCores() >= 16;
       for (const uint32_t format : {uint32_t{GGUF_FMT_Q4K}, uint32_t{GGUF_FMT_IQ4XS}})
         for (const uint32_t n : widths)
           for (const uint32_t k : inputs)
@@ -770,7 +775,7 @@ void ggufCoreLaws() {
                 // 4.5 bits per weight, staged, a pair where its tensors' own
                 // plans run it.
                 const LinearWorkload own{{n, k}, 8, LinearPhase::Decode, LinearEpilogue::None};
-                const bool sixteen = family >= 10 && p.shape().underFourAndHalfBits() && !registers(1, columns) &&
+                const bool sixteen = family >= 10 && underFourAndHalfBits(p.shape()) && !registers(1, columns) &&
                                      (!gateUp || linear.plan(own, gate).configuration().sixteenRows);
                 // Every batch width takes its tile and binds its tile's rows; the
                 // tiers' tiles take one configuration at every width, and on
@@ -807,7 +812,7 @@ void ggufCoreLaws() {
                   for (const uint32_t rows : {8U, 32U}) {
                     const LinearConfig at = plan(linear, n, rows).configuration();
                     // The tile, its split and passes; the staged walk follows
-                    // the core count (spreadsStagedDecode), and with it whether
+                    // the core count (kApple10SpreadFromCores), and with it whether
                     // a pair may run in one pass.
                     const LinearConfig doubled = plan(twice, 2 * n, rows).configuration();
                     require((gateUp && spreads != twiceSpreads) ||

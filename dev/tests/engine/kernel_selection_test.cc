@@ -10,7 +10,6 @@
 //   kernel-selection --dump <dir> [...]  also write the plan lines
 #include "TestChecks.hpp"
 #include "model/ModelDescriptor.hpp"
-#include "model/QwenTarget.hpp"
 #include "ops/ExecutionPlans.hpp"
 
 #include "metal/abi/QuantFormat.h"
@@ -338,15 +337,12 @@ std::vector<BlockMoeWeights> moeBlocks(const MoeShape &shape, const MoeFormatSet
   return blocks;
 }
 
-// The target's MoE shape with its formats, as the loaded weights give them.
-MoeShape moeShapeOf(const model::QwenTargetDimensions &family, const std::vector<BlockMoeWeights> &blocks) {
-  model::QwenTargetGeometry geometry;
-  static_cast<model::QwenTargetDimensions &>(geometry) = family;
+// The formats of the target's MoE blocks, as its loaded weights give them
+// (QwenTargetGeometry::finish).
+MoeFormats formatsOf(const std::vector<BlockMoeWeights> &blocks) {
   std::vector<const BlockMoeWeights *> pointers;
   for (const BlockMoeWeights &block : blocks) pointers.push_back(&block);
-  const Projection logits(256, family.hiddenSize, BlockWeights{{segment(GGUF_FMT_Q4K, 256, family.hiddenSize)}});
-  geometry.finish(pointers, logits);
-  return geometry.moeShape();
+  return moeFormats(pointers);
 }
 
 std::string describe(const MoePlan &plan) {
@@ -369,22 +365,22 @@ void moePlans(Golden &golden, const std::string &name, const ExecutionPlans &pla
     if (family.ffnKind != model::QwenFfnKind::SparseMoe) return;
     const std::string f(family.family);
     for (const MoeFormatSet &set : sets) {
-      const std::vector<BlockMoeWeights> blocks = moeBlocks(family.moeBlockShape(), set);
-      const MoeShape shape = moeShapeOf(family, blocks);
+      const MoeShape shape = family.moeBlockShape();
+      const MoeFormats formats = formatsOf(moeBlocks(shape, set));
       Group &decode = golden.group(name, "moe-decode", f);
       Group &prefill = golden.group(name, "moe-prefill", f);
       Group &workspace = golden.group(name, "moe-workspace", f);
       for (uint32_t lanes = 1; lanes <= SPLASH_MAXIMUM_BATCH_WIDTH; ++lanes)
         decode.add(set.name + " lanes " + std::to_string(lanes) + ": " +
-                   attempt([&] { return describe(plans.moeDecode(shape, lanes)); }));
+                   attempt([&] { return describe(plans.moeDecode(shape, formats, lanes)); }));
       for (uint32_t rows = 1; rows <= SPLASH_PREFILL_TOKEN_BUDGET; rows += rows < 128 ? 1 : 16)
         prefill.add(set.name + " rows " + std::to_string(rows) + ": " +
-                    attempt([&] { return describe(plans.moePrefill(shape, rows)); }));
+                    attempt([&] { return describe(plans.moePrefill(shape, formats, rows)); }));
       for (const uint32_t rows : {64U, 512U, uint32_t{SPLASH_PREFILL_TOKEN_BUDGET}})
         workspace.add(set.name + " prefill " + std::to_string(rows) + ":" +
-                      attempt([&] { return describe(plans.moePrefillWorkspace(shape, rows)); }));
+                      attempt([&] { return describe(plans.moePrefillWorkspace(shape, formats, rows)); }));
       workspace.add(set.name + " decode per lane:" +
-                    attempt([&] { return describe(plans.moeDecodeWorkspacePerLane(shape)); }));
+                    attempt([&] { return describe(plans.moeDecodeWorkspacePerLane(shape, formats)); }));
     }
   });
 }

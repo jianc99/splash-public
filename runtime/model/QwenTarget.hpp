@@ -107,12 +107,9 @@ struct QwenTargetGeometry final : QwenTargetDimensions {
       std::ranges::copy(captureLayers, captureLayerValues.begin());
   }
 
-  // The format of most of the sparse MoE blocks' routed expert weights,
-  // whether every routed and shared expert weight is in a format the register
-  // tile takes, and the format of most of their routers' rows (ops::MoeShape).
-  uint32_t moeExpertFormat = GGUF_FMT_COUNT;
-  bool moeRegisterFormats = true;
-  uint32_t moeRouterFormat = ops::QuantizedSegment::kFloat32;
+  // The formats of the sparse MoE blocks' weights, which their plans follow
+  // (ops::moeFormats).
+  ops::MoeFormats moeFormats{};
   // The layers whose output rows the DFlash2 draft reads, ascending.
   std::array<uint32_t, ExecutionLimits::maximumDraftTargetLayers> captureLayerValues{};
   uint32_t captureLayerCount = 0;
@@ -142,13 +139,6 @@ struct QwenTargetGeometry final : QwenTargetDimensions {
   }
   [[nodiscard]] constexpr uint32_t capturedHiddenSize() const noexcept {
     return hiddenSize * captureLayerCount;
-  }
-  [[nodiscard]] constexpr ops::MoeShape moeShape() const noexcept {
-    ops::MoeShape shape = moeBlockShape();
-    shape.expertFormat = moeExpertFormat;
-    shape.registerFormats = moeRegisterFormats;
-    shape.routerFormat = moeRouterFormat;
-    return shape;
   }
   // How attention layer `attention` (the a-th attention layer) attends: with
   // the RoPE of the target's pairs unless unrotatedLayers names it, and over
@@ -201,7 +191,7 @@ struct QwenTargetGeometry final : QwenTargetDimensions {
            kvLayout.headDimension == attentionHeadDimension &&
            sized(prefillProjections) && sized(decodeProjections) &&
            ((ffnKind == QwenFfnKind::Dense && dense) ||
-            (ffnKind == QwenFfnKind::SparseMoe && moeShape().valid() && (!leadingDenseLayers || dense)));
+            (ffnKind == QwenFfnKind::SparseMoe && moeBlockShape().valid() && (!leadingDenseLayers || dense)));
   }
 };
 

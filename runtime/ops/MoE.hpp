@@ -3,7 +3,6 @@
 #include "metal/CommandGraph.hpp"
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/MoE.h"
-#include "metal/abi/QuantFormat.h"
 #include "ops/Linear.hpp"
 
 #include <algorithm>
@@ -57,18 +56,9 @@ struct MoeShape final {
   uint32_t experts = 0;
   uint32_t expertsPerToken = 0;
   uint32_t expertIntermediateSize = 0;
-  // The format of most routed expert weights, which picks the expert tile on
-  // Apple9 GPUs of more than 10 cores (moeGgufTile).
-  uint32_t expertFormat = GGUF_FMT_COUNT;
-  // Whether the register tile takes every routed and shared expert weight
-  // (quant_register_tensor).
-  bool registerFormats = true;
   MoeRouter router = MoeRouter::Softmax;
   uint32_t sharedSlices = 1;
   bool sharedGate = true;
-  // The format of the router's rows (QuantizedSegment::rows), which picks its
-  // float tile (Linear::ggufFloatTile).
-  uint32_t routerFormat = QuantizedSegment::kFloat32;
 
   [[nodiscard]] constexpr bool valid() const noexcept {
     // Experts up to the wide slots, of an intermediate width that fills
@@ -326,67 +316,28 @@ inline constexpr auto kMoeWorkspaceFields = [] {
 
 // The tile applies to grouping, gather and the expert passes together;
 // changing it never changes the physical rows in a command. Plans run their
-// passes on M8 tiles, or on M32 tiles to prefill (moeGgufPrefillTile).
+// passes on M8 tiles, or on M32 tiles to prefill (selectMoe).
 enum class MoeExpertTile : uint8_t { M8 = 8, M32 = 32 };
 
 // The expert tile of GGUF plans, which run grouped passes (gate, up with
 // silu(gate), down; the staged tile runs gate and up in one pass) over the
-// GGUF image: the half-staged tiles of
-// kernels/shared/moe_gguf.metal, or Register, the exact register tile of
-// kernels/decode/linear_gguf_sgmatrix.metal over Table16 tiles of the
-// grouped rows (8-row tiles only). Apple9 GPUs of more than 10 cores run
-// Register in both phases but for experts mostly in a format they stage. In
-// decode, as Apple9's dense GGUF projections do (LinearGguf.cpp): its matrix
-// operations share the FP32 pipe, where the register tile beats staging. In
-// prefill as last measured, on the 35B's real routes on the 40-core M3 Max
-// (ms per layer): against the staged 32-row tiles, faster at 512 rows (3.52
-// vs 3.72) and slower at 2048 (12.6-13.1 vs 11.0-11.7).
+// GGUF image: the half-staged tiles of kernels/shared/moe_gguf.metal, or
+// Register, the exact register tile of
+// kernels/decode/linear_gguf_sgmatrix.metal over Table16 tiles of the grouped
+// rows (8-row tiles only). The device's MoeCalibration picks one
+// (KernelCalibration.hpp, selectMoe).
 enum class MoeGgufTile : uint8_t { Staged, Register };
-
-// Apple9 stages experts mostly in a format apple9StagesFormat names: one
-// 35B-shaped layer on a 40-core M3 Max decodes UD-Q2_K_XL's IQ2_XS and
-// IQ3_XXS experts, and the IQ2, IQ3_XXS and IQ1 formats alone, 4-21% faster
-// staged at B1-B4, where Q4_K/Q5_K, Q2_K and IQ4_XS experts take 3-34% longer.
-// Apple9 GPUs of 10 cores or fewer (the base M3 and M4) stage experts in every
-// format, in both phases: on a 10-core M4 such a layer in each of the 25
-// formats the register tile takes, and one of Flash-Next's shape in 4-bit
-// formats, take 12-45% less time staged at B1-B4 with rows routed at random,
-// up to 17% less with each lane's rows routed among few experts (IQ4_NL at B1:
-// 1% more) and 7-28% less on a 2048-row chunk (at most 4% more on 128- to
-// 512-row chunks). The M3 Max's numbers predate the staged tile's one gate/up
-// pass and its column tile for an expert's lone tile of one or two rows: at
-// their code the M4 too ran Q4_K/Q5_K, Q2_K and IQ4_XS experts 2-15% faster on
-// the register tile, so larger GPUs, unmeasured since, keep it.
-[[nodiscard]] inline MoeGgufTile moeGgufTile(GpuFamilyClass family, uint32_t cores, MoeShape shape) noexcept {
-  return family == GpuFamilyClass::Apple9 && cores > 10 && shape.registerFormats &&
-                 !apple9StagesFormat(shape.expertFormat)
-             ? MoeGgufTile::Register
-             : MoeGgufTile::Staged;
-}
-
-// The rows of a GGUF prefill plan's tiles on the device's `tile`: 8 on the
-// register tile. Staged: 8-row tiles while the chunk's routes average at most
-// one row per expert (rows * topK <= experts), where the two tiles take the
-// same time, and 32-row tiles beyond, which stream an expert's weights once
-// for up to 32 of its rows (its tiles run 8-, 16- or 32-row matmuls by their
-// live rows, moe_live_rows).
-[[nodiscard]] constexpr MoeExpertTile moeGgufPrefillTile(MoeShape shape, uint32_t rows,
-                                                         MoeGgufTile tile) noexcept {
-  return tile == MoeGgufTile::Register ||
-                 uint64_t{rows} * shape.expertsPerToken <= shape.experts
-             ? MoeExpertTile::M8
-             : MoeExpertTile::M32;
-}
 
 // The device's policy for a MoE plan, which the execution plans derive.
 struct MoeConfig final {
-  // M8 for decode plans; a prefill plan takes moeGgufPrefillTile's.
+  // M8 for decode plans and the register tile; a staged prefill plan's by its
+  // routes per expert (selectMoe).
   MoeExpertTile expertTile = MoeExpertTile::M8;
-  // The execution plans derive it from the GPU family, its planned core count
-  // and the expert formats (moeGgufTile).
+  // The execution plans derive it from the device's MoeCalibration and the
+  // experts' formats (selectMoe).
   MoeGgufTile ggufTile = MoeGgufTile::Staged;
   // The router's float tile; the execution plans derive it from the device,
-  // the plan's rows and the router's format (Linear::ggufFloatTile).
+  // the plan's rows and the router's format (selectFloatTile).
   FloatTile ggufRouterTile = FloatTile::Simdgroup;
   bool operator==(const MoeConfig &) const = default;
 };
