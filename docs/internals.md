@@ -1292,51 +1292,43 @@ is about to free, the resident of the lowest priority below it is suspended for
 it (`cache.priority_suspensions` in `/status`) and resumes once a lane and its
 memory are free. A new request below the priority of a running lane neither
 starts nor takes a lane until no lane of that priority runs, since it could not
-run before. Critical pressure evicts every unpinned cache entry and stops all
-growth; it takes the expert store down to its floor after what nothing in use
-holds and before what is in use, in one compaction per format. Refused at
-`--max-memory`, a lane's state, or the model's memory for reading KV from the
-SSD cache, takes cached KV only while evicting it can empty an extent, and is
-tried again only once an extent or a state has gone. Any growth `--max-memory`
-refuses, a start's beside a resident request too, then climbs one ladder
-(`Engine::escalate`), a rung only when the ones below gave nothing. For work
-that supersedes a prefill command between its passes, that command is given
-up first (below). On a target whose KV can live on the SSD cache, a Resident
-lane converts to
-Spill, which allocates nothing and gives its pages back as their copies
-land: the requester's own lane first, and the allocation is tried again at
-once; else, unless the copies Spill lanes owe already bring an extent's
-pages back, the lane holding the most KV whose Full pages past those a Spill
-lane keeps outweigh the hot block cache its reads add, and the request waits
-for that memory. Pages whose copies landed leave memory wherever memory is
-judged between commands, before admission and at each command's start
-(`Engine::spillLanded`) and as a paced pass begins, so the next attempt finds
-what they gave back; one that finds it fell short climbs on, to the next lane
-and then the store, so each conversion delays the store by one attempt at
-most. Then a chunk of the expert store above its floor; then, for work that
-may, anything in use. Only lanes whose admission is complete convert this way.
-A lane that cannot convert, the tier closed or its quota short,
-is passed over, as on a target whose KV stays in memory, and so is a lane
-of a prefill command between its passes, which reads its lanes' whole
-history from memory. A lane converted once the command being built has
-reserved its lanes' reads of spilled KV keeps its pages Full in that
-command, and the next point between commands spills those whose copies
-landed; a command in passes any of whose lanes converted so, its history now
-one that streams, runs whole. The
-prompt's replay point climbs the same rungs short of what is in use before
-it recycles another request's state in use, after the cache nothing in use
-holds whose KV needs its copy on the SSD cache first: it starts that copy,
-and while memory is on its way the command ends at the boundary without the
-state's buffers, and the point is kept from the lane after the command, as
-a refused one is. A paced pass the host is really short for climbs them
-too, short of what is in use, once its cache waits for no transfer, and
-ends Pending while a conversion's memory is on its way; the pass that
-continues it counts what the landed pages gave back before it climbs on.
-Growth that only shortens a command
-(the KV a prefill captures past its first state boundary) or leaves memory for
-later takes neither the store nor anything in use, a junction or checkpoint
-capture never takes the store, and neither does a refusal of the host, which
-the paced passes answer.
+run before. Every refusal goes through one rule (`MemoryLedger::free`),
+whoever asks: a request's start, its growth in service, the buffers of a
+state it captures, the model's memory for reading its spilled KV, and the
+control pass's host claim alike; under critical pressure every pool first
+drops to its floor, and the host's claim takes everything else it can, what
+is in use and a Resident lane's conversion included. The claim's class
+says what it may take, and the ledger takes the cheapest units that meet
+what it lacks, each priced at what losing it costs the work that uses it,
+all of them or none; a refusal that lacks again exactly what the
+ledger met before is not tried again. A KV refusal counts the free pages of
+its form as its own: the ledger never releases their extent for it, which
+it would only allocate again. A request in service may take a Resident
+lane's conversion to Spill, which allocates nothing and gives its Full pages
+back as their copies land, priced at what spilling costs that lane: its
+remaining prompt's commands over Index pages, and the hot block reads of its
+projected output's decode commands, a decayed mean of what decode commands
+measured (9 ms until the first). Only an admitted lane converts, of a
+priority no higher than the claim's, neither between its passes nor
+restoring, whose pages past its dense history and tail window the Index
+pages free now can take, and only while its Full pages outweigh the hot
+block cache its reads would add; a claim converts the lanes holding the most
+KV first, and waits for their copies as for its own. For work that
+supersedes a prefill command between its passes, the ledger gives that
+command up at no cost (below). A lane's growth and a start take neither a
+lane nor a unit of a pool from a lane of a higher priority in service, since
+the pools serve every lane; the work of a higher priority takes what those
+of a lower one hold in the same order. Memory for later (the Index runway's
+refill with no Spill lane in service) takes only what costs nothing, and an
+optional allocation, the KV a prefill captures past its first state boundary
+or a checkpoint's buffers, takes only units that cost less than what its
+refusal costs: the command cut at the boundary, the rows since the previous
+state computed again. Such an allocation cannot wait, so it passes over any
+unit whose memory frees only once its copy lands. Pages whose copies landed
+leave memory at every point between commands where memory is judged, before
+admission and at each command's start (`Engine::spillLanded`) and in the
+control pass (`Engine::collectLandings`), so the next attempt finds what
+they gave back.
 
 A request keeps its reusable model state at the last whole 32-token page before
 its generation prompt, the text a chat template appends to open the reply: the
@@ -1345,37 +1337,34 @@ next turn may render it differently, so a follow-up resumes from there.
 Until the request ends, suspended or not, that replay point is in use, and so is
 the KV it restores through. When the last request using it ends, the point
 becomes the newest ordinary state; the older points on its chain keep their age.
-Cache victims come in three classes: checkpoints, then ordinary states and KV
+Cache units come in three classes: checkpoints, then ordinary states and KV
 (first the KV no state restores through, which saves no prefill), then what is
-in use. No work displaces anything of a class above its own. The expert store's
-chunks above its floor rank between the last two, just above a Resident lane's
-conversion to Spill: they go once nothing ordinary is left and no lane can
-convert, before anything in use, for work that may take what is in use and for
-needed growth whose class stops at ordinary, but never for growth that only
-shortens a command or leaves memory for later, which takes nothing in use
-either. One exception is kept: a paced pass a request waits for under macOS's
-warning alone, the host not short, takes what is in use while the store keeps
-its chunks, since the warning alone never shrinks the store. Memory for running
-requests takes what is in use after everything else, and so does a paced pass
-that a request waits for. Three kinds of work take nothing in use: a paced pass
-that nothing waits for, under macOS's warning too, and the two that follow. A
-start that a resident lane holds back waits for that lane. And when no lane's
-growth fits, the lane that yields first, such as one just started beside a
-decoding lane, pays for the memory with its own suspension; while other lanes
-fit, it waits for them, resident, as any lane refused its KV does, since they
-grow too and are refused in turn. Where KV spills, a refusal they do not share,
-of the model's memory for reading KV from the SSD cache (a decoding lane's share
-of the hot block cache, a prompt's staging), which no transfer in flight
-returns, suspends the lane that yields first if that lane yields before it and
-is resident outside its command. Memory a transfer in flight returns to a
-refused lane of the priority that runs, KV pages or the model's memory alike,
-alone or beside lanes that run, waits for that lane: until it has it, or for
-the resource wait's limit from when it first awaited it, a lane that
-yields before it leaves a command where it would take KV pages past its
-capacity or memory for its reads of spilled KV it does not hold, ends one at a
-state boundary past which it would, and runs within what it holds; the hot
-block cache does not grow, and a command between its passes goes on. The
-buffers of the states a command captures, and new starts, are not held. A
+in use; a unit a request will certainly reuse, its replay point or a chain a
+waiting request restores, is priced so. What is in use goes only to a
+request in service that would not yield for it, or to its replay point, and
+to the host's claim under critical pressure; what a request will certainly
+reuse never to a pool's growth, and to the host's claim only under critical
+pressure. Between the
+classes no fixed rank holds: the expert store's chunks above its floor, a
+Resident lane's conversion and the cache go by price for every claim that
+may take them, so the store keeps its chunks while its decode misses and
+prefill reads are worth more than what the cache or a conversion costs, and
+gives one first when they are worth less. A start that a resident lane holds
+back waits for that lane. And when no lane's growth fits, the lane that yields
+first (the lowest priority, a prefill before a decoding lane of its priority,
+then the one with less completed work, then the later arrival), such as one
+just started beside a decoding lane, pays for the memory with its own
+suspension; while other lanes fit, it waits for them, resident, as any lane
+refused its KV does, since they grow too and are refused in turn. A claim
+that memory on its way back would meet, KV pages or bytes alike, waits for
+it, and while it waits holds what it lacks against every claim ranked after
+it, in the same order: their admissions leave that room and those pages
+free, so what lands goes to the claim it was owed to first, and the claims
+ranked before it are not held back. It holds the room for the resource
+wait's limit from its first refusal that waited, and only while it is
+retried; meanwhile a lane after it leaves a command where it would take
+what is held, ends one at a state boundary past which it would, and runs
+within what it holds. A
 prefill command captures the state of
 each boundary it reaches, in buffers reserved before it runs. A junction or a
 checkpoint retires its lane's checkpoint once published, and a checkpoint the
@@ -1390,16 +1379,17 @@ junction or a checkpoint in that checkpoint's buffers, which it takes first,
 the replay point in them only when refused again. A checkpoint only on disk
 gives no buffers, and stays until the state is published. A checkpoint whose
 predecessor a reader pins ends its command too, and is published only once the
-pin has gone. Refused, the replay point, which is in use, takes cached KV and
-states in the same order, then the oldest state in use; of the KV it takes only
-leaves whose page frees at once, and only while an extent can be emptied, which
-is released at once; it drops a state whose write must wait for the write in
-flight. Refused then by the host alone, it takes its buffers as memory the
-request in service needs, as that request's KV does: a headroom between the
-1 GiB margin and the margin plus one state would otherwise refuse every replay
-point once no cached state is left to recycle. A junction makes room the same
-way short of what is in use, and an optional checkpoint takes only
-checkpoints; neither drops a state whose write must wait, and the host's margin
+pin has gone. Refused, the replay point, a claim of its request in service that
+reaches what is in use last, takes by price what its class may (a cache the
+model can rebuild or a chunk of the store among them), waits for memory on
+its way back, the copy of uncopied cache it starts included, and only then
+takes the oldest state in use. Refused then by the host alone, it takes its
+buffers as memory the request in service needs, as that request's KV does:
+a headroom between the 1 GiB margin and the margin plus one state would
+otherwise refuse every replay point once no cached state is left to recycle.
+A junction's buffers are an optional allocation worth whatever its refusal
+costs, short of what is in use, and a checkpoint's worth the rows since the
+state boundary before it; neither waits for a write, and the host's margin
 refuses both. A state whose lane holds no such checkpoint makes that room before
 its command, and still refused ends its command at its boundary. With the SSD
 cache, a state its command could not capture and memory still refuses is
@@ -1536,15 +1526,16 @@ gives the command up in its place, which gives back the ended lanes' lanes and
 memory and its captured states' buffers. Work that supersedes it, a command
 that takes shape to replace it or a start whose prompt would supersede it by
 the same rule, takes what it holds before memory that costs anything: giving
-the command up, as that work does anyway once it runs, is the first rung of
-the ladder above the cache nothing in use holds. Any other start refused
-memory climbs the rest of the ladder and, still refused, waits for the
-command's end rather than suspend a lane of it, which would give the command
-up all the same. The passes a lane loses count as waited, so a lane whose
-commands are abandoned again and again becomes overdue, and no work supersedes
-a command with an overdue lane: a long prompt's rows commit however often
-short prompts or work of a higher priority arrive. A request that ends
-between passes, cancelled or at its deadline, stays in the command to its last
+the command up, as that work does anyway once it runs, costs nothing, and
+frees the buffers of the states the command would capture; the lanes of it
+that ended settle once the preparation that gave it up has returned. Any
+other start refused memory takes what its class may and, still refused,
+waits for the command's end rather than suspend a lane of it, which would
+give the command up all the same. The passes a lane loses count as waited, so
+a lane whose commands are abandoned again and again becomes overdue, and no
+work supersedes a command with an overdue lane: a long prompt's rows commit
+however often short prompts or work of a higher priority arrive. A request
+that ends between passes, cancelled or at its deadline, stays in the command to its last
 pass, which commits nothing of it, and a command all of whose requests have
 ended stops at once. While requests of the same or a higher priority
 decode (a lane waiting for its token mask is owed nothing), each prefill unit owes them
