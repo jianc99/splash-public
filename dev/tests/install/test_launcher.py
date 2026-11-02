@@ -148,6 +148,10 @@ class LauncherTests(unittest.TestCase):
                 served = api.parse_args(server_arguments(execute.call_args.args[1]))
                 self.assertEqual(served.host, expected)
                 self.assertEqual(served.allowed_host, ["proxy.example"])
+                # The app reads why a start failed beside the port's lock.
+                self.assertEqual(
+                    served.serve_record, Path(temporary) / "serve-9123.json"
+                )
 
     def test_invalid_bind_address_fails_before_model_work(self):
         with (

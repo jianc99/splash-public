@@ -1,0 +1,11 @@
+# The lines of a server's log the app follows a start and its requests by
+# (app Server.Step, RequestEntry), one of each as the server and the engine
+# write them: dev/tests/server/test_diagnostics.py checks the server writes
+# its request lines so, runtime_resources_test.mm the engine its weights line,
+# and SplashTests reads each.
+12:00:00 Loading · a/b
+12:00:06 Weights loaded in 6.52 s.
+12:00:09 Started · input 4,096 · cached 1,024 · effort none · thinking off
+12:01:09 Done · input 4,096 · cached 1,024 · output 574 · TTFT 0.4s · 36.8 tok/s · 1.9 tok/cycle
+12:02:00 Cancelled · input 69 · cached 0 · output 12
+12:03:00 Error · invalid_request_error

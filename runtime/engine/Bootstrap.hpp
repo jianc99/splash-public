@@ -46,6 +46,9 @@ struct RuntimeBootstrapReport {
     // What a start refused for want of memory or context needed against what
     // it had: RuntimeResourcesError::shortfall, or the --max-context check.
     std::optional<protocol::StartShortfall> shortfall;
+    // A warmup command failed for want of GPU memory
+    // (metal::MetalBackendError::outOfMemory).
+    bool commandOutOfMemory = false;
 
     [[nodiscard]] std::string describe() const;
 };
@@ -94,10 +97,10 @@ private:
         reached_;
 };
 
-// Temporary host/driver allocation failures can recover during startup.
-// Preserve the desktop reserve and bound retries; configuration and compute
-// failures remain immediate and fail-closed.
-inline constexpr auto kStartupMemoryRecoveryTimeout = std::chrono::seconds(30);
+// Temporary host/driver allocation failures can recover during startup,
+// within supervision::kStartRetryWindow, checked this often. Configuration
+// and compute failures, a command's want of GPU memory among them, remain
+// immediate and fail-closed.
 inline constexpr auto kStartupMemoryRecoveryPoll = std::chrono::seconds(1);
 
 // The wire limits of a model served with maxContext tokens: prompts and
@@ -133,7 +136,7 @@ public:
         NativeRuntime::ByteSink output,
         NativeRuntime::StatusProvider statusProvider);
 
-    // Completes warmup and validation before announcing readiness. Warmup
+    // Completes warmup and validation before announcing `ready`. Warmup
     // runs on kvPool's runway (model::ExecutionLimits::warmupKvPages) and
     // holds its pages while it runs (KvPool::RunwayHold).
     [[nodiscard]] static RuntimeBootstrapReport requireWarmupAndAnnounce(
@@ -141,7 +144,8 @@ public:
         model::RuntimeModel &modelRuntime,
         KvPool &kvPool,
         ActualMemoryReporter memoryReporter,
-        NativeRuntime &nativeLoop);
+        NativeRuntime &nativeLoop,
+        const protocol::ReadyEvent &ready);
 
     RuntimeBootstrap(const RuntimeBootstrap &) = delete;
     RuntimeBootstrap &operator=(const RuntimeBootstrap &) = delete;

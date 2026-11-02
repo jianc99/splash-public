@@ -303,6 +303,10 @@ def serve(args):
             str(paths.BINARY),
             "--port",
             str(args.port),
+            # Beside the lock, which cannot be replaced atomically without
+            # breaking its flock: the app reads why a start failed there.
+            "--serve-record",
+            str(RUNTIME_DIR / f"serve-{args.port}.json"),
             *serve_options.serve_argv(args),
         ]
         environment = dict(

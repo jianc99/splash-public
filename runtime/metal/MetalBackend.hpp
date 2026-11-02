@@ -1,5 +1,6 @@
 #pragma once
 
+#include "Supervision.hpp"
 #include "metal/DeviceCapabilities.hpp"
 
 #include <cstddef>
@@ -12,6 +13,10 @@
 #include <string_view>
 #include <utility>
 #include <vector>
+
+#ifdef __OBJC__
+@class NSError;
+#endif
 
 namespace splash::metal {
 
@@ -229,13 +234,13 @@ enum class HostStepGpu : uint8_t {
 // signals, so a signal is never held back behind the dispatches that follow
 // it, and a signal is delivered even when the work before it fails.
 //
-// Metal fails a wait (a Wait, or the work after a host step) still unmet 5 s
-// after its queue reached it ("Caused GPU Timeout Error"), and the command
-// with it. The queue reaches a command's first wait as the command is
-// submitted, whatever work runs ahead of it, and each later one once the
-// wait before it was met: the work between two waits, with the agent's or
-// the step's part, must end within 5 s. Longer work, such as the encodes of
-// a prefill command's images, runs as a command of its own.
+// Metal fails a wait (a Wait, or the work after a host step) still unmet
+// supervision::kGpuWaitLimit after its queue reached it ("Caused GPU Timeout
+// Error"), and the command with it. The queue reaches a command's first wait
+// as the command is submitted, whatever work runs ahead of it, and each later
+// one once the wait before it was met: the work between two waits, with the
+// agent's or the step's part, must end within it. Longer work, such as the
+// encodes of a prefill command's images, runs as a command of its own.
 //
 // A Host step runs `work` on the CPU once all earlier work has completed and
 // holds all later work until it returned, through two shared events the
@@ -366,8 +371,21 @@ struct MetalMemoryStats {
 
 class MetalBackendError : public std::runtime_error {
 public:
-  using std::runtime_error::runtime_error;
+  explicit MetalBackendError(const std::string &message, bool outOfMemory = false)
+      : std::runtime_error(message), outOfMemory_(outOfMemory) {}
+  // A command failed for want of GPU memory (commandOutOfMemory): another
+  // process holds what it needs, or the command asked more than the GPU has.
+  [[nodiscard]] bool outOfMemory() const noexcept { return outOfMemory_; }
+
+private:
+  bool outOfMemory_ = false;
 };
+
+#ifdef __OBJC__
+// Whether a failed command buffer's error says the GPU had too little memory
+// for it (MTLCommandBufferErrorDomain, MTLCommandBufferErrorOutOfMemory).
+[[nodiscard]] bool commandOutOfMemory(NSError *error) noexcept;
+#endif
 
 // A normal capacity failure. Callers may evict cache or return a retryable
 // admission error; the Metal backend remains healthy. MemoryGovernor's
@@ -391,7 +409,8 @@ private:
 // it by default, in time the Mac is awake (AwakeClock): from its commit, and
 // then from each of its host steps as the GPU work before it ends and as it
 // returns (CommandWatchdog).
-inline constexpr double kCommandTimeoutSeconds = 120.0;
+inline constexpr double kCommandTimeoutSeconds =
+    std::chrono::duration<double>(supervision::kCommandTimeout).count();
 // How long every buffer stays wired after the last command by default (see
 // allocateBuffer), also the default of the engine's idle release
 // (RuntimeResourcesConfig::idleReleaseSeconds).

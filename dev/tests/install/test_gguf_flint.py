@@ -31,11 +31,11 @@ from dev.tests.installer_fixtures import (
     vision_fixture,
     write_gguf,
 )
+from dev.tests.server_fixtures import NATIVE_CONTEXT
 from install import assembly, families, gguf, local, models, upstream
 from server import constraints
 from server.chat_format import FLINT
 from server.chat_templates import NATIVE, ChatTemplates
-from server.serve_options import MAX_CONTEXT_TOKENS
 from server.tokenization import PromptTokenizer
 
 FIXTURES = CONFIGS / "flint"
@@ -305,9 +305,7 @@ class FlintGgufTests(unittest.TestCase):
         # tokens after <|assistant|> and serves its template unchanged.
         constraints.validate_tokenizer(tokenizer, FLINT)
         self.assertTrue(
-            PromptTokenizer(
-                tokenizer, FLINT.message_boundary, MAX_CONTEXT_TOKENS
-            ).enabled
+            PromptTokenizer(tokenizer, FLINT.message_boundary, NATIVE_CONTEXT).enabled
         )
         self.assertEqual(files["tokenizer/chat_template.jinja"].decode(), TEMPLATE)
         template = ChatTemplates(tokenizer).select(None)

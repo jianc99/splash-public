@@ -20,6 +20,7 @@ from dev.tests.server_fixtures import (
     png_data_url,
     reasoning_template,
     response_events,
+    serve_context,
 )
 from server import documents
 from server import frontend as request_frontend
@@ -1646,7 +1647,7 @@ class AnthropicHTTPContractTest(HarnessTestCase):
         )
         with self.assertRaisesRegex(APIError, "context window"):
             harness.app.prepare(chat, deadline=FOREVER)
-        harness.app.max_context = 256
+        serve_context(harness.app, 256)
         job = harness.app.prepare(chat, deadline=FOREVER)
         self.assertEqual(len(job.prompt_tokens), 130)
         del job

@@ -72,6 +72,8 @@ SERVER_FILES = (
     "thinking.py",
     "schema_validation.py",
     "crash_trace.py",
+    "supervision.py",
+    "serve_record.py",
     "chat.html",
     "favicon.svg",
 )

@@ -22,8 +22,9 @@ public:
 // pins the lines both sides agree on.
 struct NativeArguments final {
   std::filesystem::path modelRoot;
-  // The model the directory holds, served for MAX_CONTEXT (model::servedFor):
-  // with YaRN for a context past its native window.
+  // The model the directory holds, served for MAX_CONTEXT or a relaunch's
+  // context (model::servedFor): with YaRN for a context past its native
+  // window.
   model::ModelDescriptor model;
   // Zero for auto.
   uint32_t maxContext = 0;

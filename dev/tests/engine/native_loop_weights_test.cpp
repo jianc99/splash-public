@@ -91,7 +91,7 @@ void testIdleWeightsAreReleasedAndRestored(bool releasable) {
   };
   // Warmup before Ready is not idleness.
   fixture.monotonic += 10 * idleRelease;
-  loop.announceReady();
+  loop.announceReady(protocol::peer::kTestReady);
   require(!idlePass(idleRelease - 1), "weights were released before the idle release passed");
   require(idlePass(1), "idle weights were kept past the idle release");
   require(loop.weightsSnapshot().released && loop.weightsSnapshot().restores == 0 &&
@@ -256,7 +256,7 @@ void testIdleReleaseRestoresTheSplitLast() {
               "a request ran before every image was written back");
     return loop.weightsSnapshot().restores == id - 1;
   };
-  loop.announceReady();
+  loop.announceReady(protocol::peer::kTestReady);
 
   require(idlePass() && !loaded, "the idle release kept the split's program");
   require(imagesBack(1) && !loaded && !memory.released(),
@@ -337,7 +337,7 @@ void testRefusedRestoreWaitsForMemory() {
     static_cast<void>(control.run(pressure));
   };
   const auto errorOf = [&](uint64_t id) { return ::errorOf(fixture, id); };
-  loop.announceReady();
+  loop.announceReady(protocol::peer::kTestReady);
 
   pass(MemoryPressure::Normal, 1000.0 * kIdleReleaseSeconds);
   require(memory.released() && programReleases == 1, "idle weights were kept");
@@ -445,7 +445,7 @@ void testIdleReleaseOffReleasesOnlyOnRequest() {
   config.engine.weights = WeightResidencyConfig{.weights = &weights};
   LoopFixture fixture(config, {}, {}, std::numeric_limits<double>::infinity());
   engine::NativeRuntime &loop = fixture.loop;
-  loop.announceReady();
+  loop.announceReady(protocol::peer::kTestReady);
   fixture.monotonic += 1e12;
   loop.releaseIdleWeights();
   require(!weights.released(), "weights were released with the idle release off");
@@ -479,7 +479,7 @@ void testReleaseRequestGivesTheWeightsBackWhenIdle() {
   config.engine.weights = WeightResidencyConfig{.weights = &memory};
   LoopFixture fixture(config);
   engine::NativeRuntime &loop = fixture.loop;
-  loop.announceReady();
+  loop.announceReady(protocol::peer::kTestReady);
   require(!weights.released(), "the weights were released before any release request");
 
   WeightsSnapshot answer = releaseAnswer(fixture, 5);
@@ -524,7 +524,7 @@ void testHoldingRequestsSpansFirstToLastRequest() {
   config.holdingRequests = [&](bool held) { reported.push_back(held); };
   LoopFixture fixture(config);
   engine::NativeRuntime &loop = fixture.loop;
-  loop.announceReady();
+  loop.announceReady(protocol::peer::kTestReady);
   require(reported.empty(), "a loop without requests reported holding one");
   require(loop.receive(protocol::peer::serialize(request(1))) &&
               loop.receive(protocol::peer::serialize(request(2))),
@@ -563,7 +563,7 @@ void testDeadlineEndsARequestWaitingForTheWeights() {
   config.engine.weights = WeightResidencyConfig{.admit = refusing(refuse)};
   LoopFixture fixture(config);
   engine::NativeRuntime &loop = fixture.loop;
-  loop.announceReady();
+  loop.announceReady(protocol::peer::kTestReady);
   require(!releaseAnswer(fixture, 1).restoring && fixture.weights.released(),
           "the weights were not released");
   constexpr double kDeadline = 200.0;
@@ -619,7 +619,7 @@ void testTransfersLandWhileTheWeightsAreRestored() {
       [&](std::span<const uint8_t> bytes) { output.insert(output.end(), bytes.begin(), bytes.end()); },
       test::readyStatusJson, protocol::ProtocolLimits{});
   storage.commandInFlight = [&] { return loop.commandInFlight(); };
-  loop.announceReady();
+  loop.announceReady(protocol::peer::kTestReady);
   // A conversation leaves its replay point, whose copies start once it has
   // waited the write-behind delay.
   protocol::RequestFrame conversation = request(1);
@@ -660,7 +660,7 @@ void testRequestsWaitForTheWeightsEachOnItsOwnClock() {
   config.engine.weights = WeightResidencyConfig{.admit = refusing(refuse)};
   LoopFixture fixture(config);
   engine::NativeRuntime &loop = fixture.loop;
-  loop.announceReady();
+  loop.announceReady(protocol::peer::kTestReady);
   require(!releaseAnswer(fixture, 1).restoring && fixture.weights.released(),
           "the weights were not released");
   refuse = true;
@@ -701,7 +701,7 @@ void testRestoreTriesAgainAtTheLimit() {
   config.engine.weights = WeightResidencyConfig{.admit = refusing(refuse)};
   LoopFixture fixture(config);
   engine::NativeRuntime &loop = fixture.loop;
-  loop.announceReady();
+  loop.announceReady(protocol::peer::kTestReady);
   require(!releaseAnswer(fixture, 1).restoring && fixture.weights.released(),
           "the weights were not released");
   refuse = true;
@@ -740,7 +740,7 @@ void testARestoredRequestWaitsAfreshAtItsStart() {
   fixture.executor.laneFootprintBytes = 64ULL << 20;
   fixture.executor.admission = refusing(refuseStates);
   engine::NativeRuntime &loop = fixture.loop;
-  loop.announceReady();
+  loop.announceReady(protocol::peer::kTestReady);
   require(!releaseAnswer(fixture, 1).restoring && fixture.weights.released(),
           "the weights were not released");
   require(loop.receive(protocol::peer::serialize(request(1))) && loop.tick() && loop.tick() &&
@@ -813,7 +813,7 @@ void testRestoredStoreGrowsBackAfterTheRequest() {
   engine::NativeRuntime &loop = fixture.loop;
   constexpr uint64_t chunk = 1ULL << 30;
   fixture.executor.expertChunks = {chunk, chunk, chunk};
-  loop.announceReady();
+  loop.announceReady(protocol::peer::kTestReady);
   require(!releaseAnswer(fixture, 1).restoring && store.released() &&
               fixture.executor.releasedExpertChunks.size() == 3,
           "the store was not released");
@@ -848,7 +848,7 @@ void testRestoreTakesTheFloorWhateverTheHostSpares() {
     LoopFixture fixture(config);
     model = &fixture.executor;
     fixture.executor.expertChunks = {chunk, chunk, chunk};
-    fixture.loop.announceReady();
+    fixture.loop.announceReady(protocol::peer::kTestReady);
     require(!releaseAnswer(fixture, 1).restoring && store.released(), "the store was not released");
     require(fixture.loop.receive(protocol::peer::serialize(request(1))), "the request failed");
     runUntilIdle(fixture.loop);

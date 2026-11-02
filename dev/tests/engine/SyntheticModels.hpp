@@ -44,6 +44,7 @@ inline PlannedModel plannedModel() {
   target.layers = 4;
   target.hiddenSize = 2048;
   target.vocabularySize = 1024;
+  target.stopTokens = {1022, 1023};
   target.intermediateSize = 1024;
   constexpr std::array<uint32_t, 2> draftReads{1, 3};
   result.draft = model::draftLayout(target.hiddenSize, target.vocabularySize, 2, 1024, 10'000'000.0F, draftReads);
@@ -107,6 +108,7 @@ inline engine::RuntimeResourcesConfig moeConfig(const char *metallibPath, const 
   model::Qwen3_6MoeLayout target;
   target.layers = kMoeLayers;
   target.vocabularySize = planned.target.vocabularySize;
+  target.stopTokens = planned.target.stopTokens;
   target.experts = kMoeExperts;
   static_cast<void>(test::writeSyntheticModel(root, target, planned.draft, planned.vision));
   engine::RuntimeResourcesConfig config;

@@ -5,6 +5,7 @@ launcher arguments several tests build."""
 
 import base64
 import contextlib
+import dataclasses
 import http.client
 import inspect
 import io
@@ -33,7 +34,7 @@ from server import frontend as request_frontend
 from server import protocol as wire
 from server import runtime as engine_runtime
 from server import server as api
-from server.chat_format import QWEN
+from server.chat_format import FLINT, QWEN
 from server.chat_templates import ChatTemplates
 from server.lru import LRUCache
 from server.origins import parse_allowed_origin
@@ -41,7 +42,36 @@ from server.thinking import ThinkingCodec
 
 # The deadline of a request prepared directly, which never expires.
 FOREVER = math.inf
-READY = wire.ReadyEvent(4, 131_072, False)
+# The targets' native window, the context a start serves without --max-context
+# (QwenTargetDimensions::nativeContextTokens).
+NATIVE_CONTEXT = 262144
+# The vocabulary and stop tokens the engine of each chat format's targets
+# announces in Ready (runtime/model/Qwen3_8.hpp, Flint.hpp).
+ENGINE_TOKENS = {
+    QWEN: (248_320, (248_044, 248_046)),
+    FLINT: (150_144, (150_001, 150_003, 150_005, 150_018)),
+}
+
+
+def engine_ready(context=131_072, *, vision=False, concurrency=4, chat_format=QWEN):
+    """The Ready an engine of `chat_format`'s family serving `context` tokens
+    announces, with the mask rows of a draft of eight."""
+    vocabulary, stops = ENGINE_TOKENS[chat_format]
+    return wire.ReadyEvent(concurrency, context, vision, vocabulary, 9, stops)
+
+
+READY = engine_ready()
+
+
+def serve_context(app, tokens):
+    """Have `app`'s engine serve `tokens` of context from now on, as a relaunch
+    whose plan holds that much announces."""
+    runtime = app.backend.runtime
+    runtime.capabilities = dataclasses.replace(
+        runtime.capabilities, max_context_tokens=tokens
+    )
+
+
 # The generation APIs: Chat Completions, Responses and Messages.
 PATHS = ("/v1/chat/completions", "/v1/responses", "/v1/messages")
 # The weights section of the status document an engine answers a release
@@ -337,6 +367,8 @@ class FakeCall:
         self.on_event = on_event
         self.on_complete = on_complete
         self.plan = plan
+        # Every event it emitted.
+        self.events = []
         self.callback_error = None
         self.cancel_requested = False
         self._result = None
@@ -349,7 +381,12 @@ class FakeCall:
         with self._lock:
             return self._done
 
+    @property
+    def started(self):
+        return any(isinstance(event, wire.StartEvent) for event in self.events)
+
     def emit(self, event):
+        self.events.append(event)
         if self.on_event is None:
             return
         try:
@@ -405,12 +442,11 @@ class FakeRuntime:
         self.cancel_count = 0
         self.closed = False
         self.ready = True
-        self.readiness = READY
-        self.fatal_error = None
+        self.capabilities = READY
         self.pending_limit = 32
         self.restart_count = 0
         self.last_start_seconds = 0.0
-        self.expected_ready_at = None
+        self.spawned_at = None
         self.last_crash_trace = None
         self.status_event = native_peer.status_event()
         self.release_event = native_peer.status_event(weights=RELEASED_WEIGHTS)
@@ -726,7 +762,11 @@ def request(
         generation_prompt_tokens=generation_prompt_tokens,
     )
     return engine_runtime.GenerationRequest(
-        frame, time.monotonic() + deadline, mask_provider, image_owner
+        frame,
+        time.monotonic() + deadline,
+        mask_provider,
+        image_owner,
+        wire.request_fingerprint(frame),
     )
 
 
@@ -817,6 +857,7 @@ def main_args(**overrides):
             "sparse_kv_memory": None,
             "kv_format": "int8",
             "state_format": "fp32",
+            "serve_record": None,
             **overrides,
         }
     )
@@ -836,23 +877,42 @@ def unprepared_hold(family="Qwen3.8-27B"):
 
 def make_frontend(
     tokenizer,
-    *args,
+    backend,
+    model,
+    max_context,
+    request_timeout,
+    capacity,
+    *,
+    vision,
     constraint_factory=None,
     thinking_codec=None,
     chat_format=QWEN,
     **options,
 ):
     """A frontend over the tokenizer, with its chat templates probed as
-    startup probes them. Unless a test passes its own, generation is
-    unconstrained, thinking is signed with a fresh key and the output is
-    read in the Qwen families' chat format."""
+    startup probes them, serving what an engine of `capacity` lanes announces
+    for `max_context` tokens with or without `vision`: the Ready its
+    backend's runtime holds, or a stand-in backend's where the test passes
+    none. Unless a test passes its own, generation is unconstrained, thinking
+    is signed with a fresh key and the output is read in the Qwen families'
+    chat format."""
     if constraint_factory is None:
         constraint_factory = PassThroughConstraintFactory()
     if thinking_codec is None:
         thinking_codec = ThinkingCodec()
+    capabilities = engine_ready(max_context, vision=vision, concurrency=capacity)
+    backend = backend or SimpleNamespace()
+    runtime = getattr(backend, "runtime", None)
+    if runtime is None:
+        backend.runtime = SimpleNamespace(capabilities=capabilities)
+    elif not isinstance(runtime, engine_runtime.MultiplexedRuntime):
+        # A runtime that runs engines serves what they announce.
+        runtime.capabilities = capabilities
     return request_frontend.Frontend(
         tokenizer,
-        *args,
+        backend,
+        model,
+        request_timeout,
         constraint_factory=constraint_factory,
         chat_templates=ChatTemplates(tokenizer),
         chat_format=chat_format,

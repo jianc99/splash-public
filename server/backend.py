@@ -10,7 +10,7 @@ from dataclasses import dataclass, field, replace
 
 from tokenizers.decoders import DecodeStream
 
-from . import json_codec
+from . import json_codec, supervision
 from . import protocol as wire
 from . import runtime as engine_runtime
 from .chat_format import THINK_END, ChatFormat
@@ -21,22 +21,6 @@ from .latency import RequestLatency
 from .metrics import metrics_dict
 from .output import hold_partial
 from .tool_schema import ToolPolicy
-
-# A failure counts toward a crash loop unless its engine served this long.
-CRASH_LOOP_WINDOW_SECONDS = 60.0
-# Consecutive such failures, failed relaunches included, that stop relaunching.
-CRASH_LOOP_LIMIT = 3
-# The n-th consecutive relaunch waits RESTART_BACKOFF_SECONDS * 2**(n-2); the
-# first waits 0.
-RESTART_BACKOFF_SECONDS = 5.0
-# The longest Retry-After a refusal while the engine restarts asks for, the
-# longest every OpenAI and Anthropic SDK follows: the JavaScript ones follow
-# less than a minute, the Python ones up to a minute.
-RECOVERY_RETRY_AFTER_LIMIT_SECONDS = 59
-
-
-# Control requests use a short live probe and explicitly label stale snapshots.
-STATUS_REFRESH_TIMEOUT_SECONDS = 0.05
 
 # Engine outcomes whose message the engine words from its own limits and
 # counts, never from a request: the client gets it as it is, and the console
@@ -344,6 +328,16 @@ class _JobState:
         self.streamer.on_stop = None
 
 
+def _failure_code(error):
+    """How an engine failed (supervision.EngineFailure): the code its
+    failure carries, engine_unhealthy for one the runtime did not class."""
+    if isinstance(
+        error, (engine_runtime.EngineUnhealthy, engine_runtime.ProtocolFatal)
+    ):
+        return error.code
+    return "engine_unhealthy"
+
+
 class NativeBackend:
     """Write admitted requests directly to native inference.
 
@@ -373,14 +367,16 @@ class NativeBackend:
         # Since when the engine loop has left status probes unanswered.
         self.status_unanswered_since = None
         # Recovery state, under self.lock: the one background worker, when a
-        # relaunch is owed (monotonic), whether a status refresh is owed,
-        # consecutive failures without a full window of service, and why
-        # relaunching stopped for good.
+        # relaunch is owed (monotonic), whether a status refresh is owed, when
+        # to relaunch after a failure, and why relaunching stopped for good.
         self.recovery = None
         self.restart_due = None
         self.refresh_due = False
-        self.failures = 0
-        self.fatal_error = None
+        self.policy = supervision.RestartPolicy()
+        self.stop_reason = None
+        # The requests refused for having been in flight at two engine
+        # failures in a row.
+        self.quarantine = supervision.Quarantine()
         # Set by close() to cut a relaunch's backoff short.
         self.wakeup = threading.Event()
         # Why the engine cannot serve: its failure, the last failed restart or
@@ -397,64 +393,82 @@ class NativeBackend:
         self.finalizer.start()
         runtime.on_engine_failure = self._engine_failed
 
-    def _engine_failed(self, error, served_seconds):
-        """The runtime's failure listener: an engine that reached Ready failed
-        after serving for `served_seconds`."""
-        self._failed("Engine failed", error, served_seconds)
+    def _engine_failed(self, error, served_seconds, started, returncode):
+        """The runtime's failure listener (engine_runtime.FailureListener): an
+        engine that reached Ready failed after serving for `served_seconds`."""
+        code = _failure_code(error)
+        self._failed(
+            "Engine failed",
+            supervision.EngineFailure(
+                code,
+                str(error),
+                served_seconds,
+                started=started,
+                counted=supervision.request_caused(code, returncode),
+            ),
+        )
 
-    def _failed(self, event, error, served_seconds):
+    def _failed(self, event, failure):
         # Clients get the reason with every refusal until a status succeeds.
         with self.lock:
-            if self.closing or self.fatal_error is not None:
+            if self.closing or self.stop_reason is not None:
                 return
-            self.engine_error = str(error)
+            self.engine_error = failure.message
             if self.status_snapshot is not None:
                 # A failed engine's readiness is no longer evidence.
                 self.status_snapshot["ready"] = False
-            if (unchangeable := self.runtime.fatal_error) is not None:
-                # Changed limits would recur at every relaunch; the error says
-                # how to recover.
-                self._stop_restarting_locked(str(unchangeable))
-            elif (delay := self._restart_delay_locked(served_seconds)) is None:
-                # The runtime writes an engine's crash trace before it reports
-                # that engine's failure, to the listener or from wait_ready.
-                trace = self.runtime.last_crash_trace
-                self._stop_restarting_locked(
-                    f"the inference engine failed {self.failures} times in a row, "
-                    f"each within {CRASH_LOOP_WINDOW_SECONDS:.0f} s of starting "
-                    f"({error}); Splash stopped restarting it. "
-                    + (
-                        f"Crash trace: {trace}. "
-                        if trace
-                        else "Set SPLASH_CRASH_TRACE=1 to record a crash trace. "
-                    )
-                    + "Restart the Splash server after fixing the cause."
-                )
+            refused = (
+                self.quarantine.after(failure.started)
+                if failure.counted
+                else frozenset()
+            )
+            delay = self.policy.after(failure)
+            if delay is None:
+                self._stop_restarting_locked(self._stop_message(failure))
             else:
                 self.restart_due = time.monotonic() + delay
-            stopped = self.fatal_error
+            stopped = self.stop_reason
             self._ensure_recovery_locked()
-        print_status(f"{event} · {error}", error=True)
+        print_status(f"{event} · {failure.message}", error=True)
+        if refused:
+            print_status(
+                f"Quarantine · {len(refused)} request"
+                f"{'' if len(refused) == 1 else 's'} in flight at two engine "
+                "failures in a row refused until the server restarts",
+                error=True,
+            )
         if stopped is not None:
             print_status(f"Engine stopped · {stopped}", error=True)
 
-    def _restart_delay_locked(self, served_seconds):
-        """Seconds until the relaunch a failure owes; None once a crash loop
-        stops relaunching."""
-        if served_seconds >= CRASH_LOOP_WINDOW_SECONDS:
-            self.failures = 0
-        self.failures += 1
-        if self.failures >= CRASH_LOOP_LIMIT:
-            return None
-        if self.failures == 1:
-            return 0.0
-        return RESTART_BACKOFF_SECONDS * 2 ** (self.failures - 2)
+    def _stop_message(self, failure):
+        """Why relaunching stopped after `failure`, and what to do."""
+        if (
+            failure.start is not None
+            and failure.start.kind is wire.StartFailureKind.COMMAND_MEMORY
+        ):
+            return (
+                "the engine's start ran out of GPU memory another process holds "
+                "(another Splash server?); Splash stopped restarting it. Quit that "
+                "process, then restart the Splash server."
+            )
+        # The runtime writes an engine's crash trace before it reports that
+        # engine's failure, to the listener or from wait_ready.
+        trace = self.runtime.last_crash_trace
+        return (
+            f"Splash stopped restarting the engine: {failure.message}. "
+            + (
+                f"Crash trace: {trace}. "
+                if trace
+                else "Set SPLASH_CRASH_TRACE=1 to record a crash trace. "
+            )
+            + "Restart the Splash server after fixing the cause."
+        )
 
     def _stop_restarting_locked(self, message):
         """Stop relaunching for good; there is no way back but a server
         restart."""
         self.restart_due = None
-        self.fatal_error = message
+        self.stop_reason = message
         self.engine_error = message
 
     def _ensure_recovery_locked(self):
@@ -464,7 +478,7 @@ class NativeBackend:
         is started by the next probe or request."""
         if (
             self.closing
-            or self.fatal_error is not None
+            or self.stop_reason is not None
             or (self.restart_due is None and not self.refresh_due)
             or (self.recovery is not None and self.recovery.is_alive())
         ):
@@ -485,7 +499,7 @@ class NativeBackend:
         owed."""
         while True:
             with self.lock:
-                if self.closing or self.fatal_error is not None:
+                if self.closing or self.stop_reason is not None:
                     self.recovery = None
                     return
                 due = self.restart_due
@@ -502,7 +516,7 @@ class NativeBackend:
             try:
                 restarts = self.runtime.restart_count
                 event = self.runtime.status(
-                    timeout=engine_runtime.STATUS_ANSWER_LIMIT_SECONDS,
+                    timeout=self.policy.thresholds.status_answer,
                     fail_unanswered=True,
                 )
                 self._cache_status(self._decode_status_event(event), restarts)
@@ -520,7 +534,18 @@ class NativeBackend:
             # a failure after Ready, even one before wait_ready returns.
             self.runtime.wait_ready()
         except Exception as error:
-            self._failed("Engine restart failed", error, 0.0)
+            self._failed(
+                "Engine restart failed",
+                supervision.EngineFailure(
+                    _failure_code(error),
+                    str(error),
+                    0.0,
+                    start=error.event
+                    if isinstance(error, engine_runtime.EngineStartFailed)
+                    else None,
+                    launch=isinstance(error, engine_runtime.EngineLaunchFailed),
+                ),
+            )
             return
         with self.lock:
             # A failure after Ready may already owe the next relaunch.
@@ -530,19 +555,31 @@ class NativeBackend:
 
     def _recovery_retry_after_locked(self):
         """The Retry-After of a refusal while the engine restarts: the seconds
-        until the relaunched engine should be Ready, as long after its spawn
-        as the engine before took to start. Before the spawn, while the
-        relaunch waits for its backoff or for the engine before to exit, it
-        is as long after the later of now and the time the relaunch is due;
-        a relaunch not owed yet, before the failure listener has run, is due
-        now. At least 1 once that time has passed, and at most
-        RECOVERY_RETRY_AFTER_LIMIT_SECONDS."""
+        until the next bound on the relaunched engine's start still ahead. It
+        should be Ready as long after its spawn as the engine before took to
+        start; past that it waits for memory the host or Metal refused, up to
+        the start retry window more; past that the start timeout ends it.
+        Before the spawn, while the relaunch waits for its backoff or for the
+        engine before to exit, it is as long after the later of now and the
+        time the relaunch is due; a relaunch not owed yet, before the failure
+        listener has run, is due now. At least 1, and at most
+        supervision.RETRY_AFTER_LIMIT_SECONDS."""
         now = time.monotonic()
-        ready = self.runtime.expected_ready_at
-        if ready is None:
+        start = self.runtime.last_start_seconds
+        spawned = self.runtime.spawned_at
+        if spawned is None:
             due = now if self.restart_due is None else max(self.restart_due, now)
-            ready = due + self.runtime.last_start_seconds
-        return min(max(math.ceil(ready - now), 1), RECOVERY_RETRY_AFTER_LIMIT_SECONDS)
+            ready = due + start
+        else:
+            bounds = (
+                spawned + start,
+                spawned + start + self.policy.thresholds.start_retry_window,
+                spawned + supervision.START_TIMEOUT_SECONDS,
+            )
+            ready = next((bound for bound in bounds if bound > now), now)
+        return min(
+            max(math.ceil(ready - now), 1), supervision.RETRY_AFTER_LIMIT_SECONDS
+        )
 
     def refusal(self):
         """The error a request not yet admitted gets now; None while the
@@ -550,8 +587,8 @@ class NativeBackend:
         with self.lock:
             if self.closing:
                 return APIError(503, "server is shutting down", "server_shutdown")
-            if self.fatal_error is not None:
-                return APIError(500, self.fatal_error, "engine_failed")
+            if self.stop_reason is not None:
+                return APIError(500, self.stop_reason, "engine_failed")
             self._ensure_recovery_locked()
             if self.runtime.ready:
                 return None
@@ -602,7 +639,7 @@ class NativeBackend:
             print_status("Engine restarted")
         return True
 
-    def status(self, timeout=STATUS_REFRESH_TIMEOUT_SECONDS):
+    def status(self, timeout=supervision.STATUS_PROBE_SECONDS):
         stale_error = None
         stale_age_ms = None
         with self.lock:
@@ -652,7 +689,7 @@ class NativeBackend:
                     and snapshot.get("ready") is True
                     and (
                         unanswered is None
-                        or now - unanswered < engine_runtime.STATUS_ANSWER_LIMIT_SECONDS
+                        or now - unanswered < self.policy.thresholds.status_answer
                     )
                 )
         else:
@@ -661,7 +698,7 @@ class NativeBackend:
         with self.lock:
             transport_ready = not self.closing and self.runtime.ready
             engine_error = self.engine_error
-            stopped = self.fatal_error is not None
+            stopped = self.stop_reason is not None
         snapshot["transport"] = {
             "ready": transport_ready,
             "recovering": not self.closing and not stopped and not transport_ready,
@@ -720,7 +757,11 @@ class NativeBackend:
             thinking_budget=self._thinking_budget(job),
         )
         return engine_runtime.GenerationRequest(
-            frame, job.deadline, self._mask_provider(job), job.image_owner
+            frame,
+            job.deadline,
+            self._mask_provider(job),
+            job.image_owner,
+            wire.request_fingerprint(frame),
         )
 
     def _thinking_budget(self, job):
@@ -827,6 +868,23 @@ class NativeBackend:
                             503,
                             "server is shutting down",
                             "server_shutdown",
+                        ),
+                    )
+                )
+                return
+            if self.quarantine.refuses(request.fingerprint):
+                # Retrying fails the same way, as capacity_exhausted does.
+                state.detach()
+                trace = self.runtime.last_crash_trace
+                job.events.put(
+                    (
+                        "error",
+                        APIError(
+                            400,
+                            "this request was in flight at two engine failures in "
+                            "a row; Splash refuses it until the server restarts"
+                            + (f" (crash trace: {trace})" if trace else ""),
+                            "request_quarantined",
                         ),
                     )
                 )
@@ -989,8 +1047,8 @@ class NativeBackend:
             # protocol. The listener has already decided whether that engine
             # restarts; the console names the failure.
             with self.lock:
-                if self.fatal_error is not None:
-                    error = APIError(500, self.fatal_error, "engine_failed")
+                if self.stop_reason is not None:
+                    error = APIError(500, self.stop_reason, "engine_failed")
                 else:
                     error = APIError(
                         503,

@@ -1,6 +1,7 @@
 #include "AwakeClock.hpp"
 #include "LegacyWeightCache.hpp"
 #include "StderrLine.hpp"
+#include "Supervision.hpp"
 #include "engine/FdTransport.hpp"
 #include "engine/Bootstrap.hpp"
 #include "engine/NativeArguments.hpp"
@@ -260,9 +261,9 @@ public:
 };
 
 // The time a clean stop gives the newest restore points of a persistent
-// cache to reach the disk before it closes the cache. The server waits
-// longer for the engine to exit (server/runtime.py `_shutdown_grace_seconds`).
-constexpr std::chrono::seconds kFlushBudget{6};
+// cache to reach the disk before it closes the cache; the server waits
+// supervision::kStop for the engine to exit.
+constexpr auto kFlushBudget = supervision::kFlush;
 
 // A clean stop of a persistent cache: the newest restore points reach the
 // disk, then the cache closes. An engine that fails meanwhile writes nothing
@@ -284,17 +285,15 @@ void closePersistentCache(engine::FdTransport &transport,
 }
 
 // A start that fails reports on stderr, as main does for any error, then
-// tells the server its reason in place of the ReadyEvent, as the engine does
-// for a failure once it serves (NativeRuntime::engineError). The frame
-// follows the report, so the server's line about it follows the report too.
-// A server that has gone away does not change the exit.
+// tells the server its classed reason in place of the ReadyEvent
+// (engine::startFailedEvent). The frame follows the report, so the server's
+// line about it follows the report too. A server that has gone away does not
+// change the exit.
 void reportStartFailure(engine::FdTransport &transport,
                         const engine::RuntimeBootstrapError &error) {
   writeStderrLine(std::string("error: ") + error.what());
-  const auto frame = protocol::serializeEvent(
-      protocol::ErrorEvent{protocol::FailureClass::EngineUnhealthy, 0, false,
-                           "bootstrap_failed", error.report().message},
-      protocol::ProtocolLimits{});
+  const auto frame = protocol::serializeEvent(engine::startFailedEvent(error.report()),
+                                              protocol::ProtocolLimits{});
   if (!frame)
     return;
   try {
@@ -318,7 +317,7 @@ int runNative(const engine::NativeArguments &arguments) {
         engine::NativeLoopTiming{transport.maxTickMilliseconds()});
   };
 
-  engine::StartupRetryWindow recovery(engine::kStartupMemoryRecoveryTimeout);
+  engine::StartupRetryWindow recovery(supervision::kStartRetryWindow);
   bool reportedRecoveryWait = false;
   std::unique_ptr<engine::RuntimeBootstrap> bootstrap;
   while (!bootstrap) {

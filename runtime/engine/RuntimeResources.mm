@@ -3,6 +3,7 @@
 #include "AwakeClock.hpp"
 #include "Checked.hpp"
 #include "StderrLine.hpp"
+#include "Supervision.hpp"
 #include "engine/DiskLabels.hpp"
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/PagedAttention.h"
@@ -91,15 +92,14 @@ void requireStartupHeadroom(
 constexpr uint32_t kPersistentCacheFormat = 2;
 // How long a start waits for the cache directory another process holds: one
 // that is closing has finished its flush, or been stopped by the server, by
-// then (server/runtime.py `_shutdown_grace_seconds`).
+// then (supervision::kStop).
 constexpr std::chrono::seconds kCacheLockWait{20};
+static_assert(kCacheLockWait > supervision::kStop);
 // A cache nobody opened or wrote for this long is removed at the next start,
 // whether or not that start keeps a cache itself.
 constexpr std::chrono::hours kStaleCache{24 * 14};
-// How long a start serves on probation: the server counts a failure within
-// that time toward a crash loop (server/backend.py
-// `CRASH_LOOP_WINDOW_SECONDS`) and stops restarting after three in a row.
-constexpr std::chrono::seconds kProbation{60};
+// How long a start serves on probation (supervision::kProbation).
+constexpr auto kProbation = supervision::kProbation;
 
 // A cache root the engine made stays out of Time Machine backups, as
 // ~/Library/Caches and $TMPDIR do: its files change with every write.
@@ -334,8 +334,9 @@ DiskTier openDiskTier(const RuntimeResourcesConfig &config, const std::string &c
 // with what its floors take of those the model has: the stores of parts
 // that stream, and the floors of a block-sparse target's KV on the SSD
 // cache.
-RuntimeResourcesError planRefusal(const StreamedMemoryResult &result, uint64_t hardBudgetBytes,
-                                  const model::StreamableWeights &streamable, const model::ModelDescriptor &model) {
+RuntimeResourcesError planRefusal(const StreamedMemoryResult &result, uint64_t configuredLimitBytes,
+                                  uint64_t hardBudgetBytes, const model::StreamableWeights &streamable,
+                                  const model::ModelDescriptor &model) {
   if (!result.requiredBytes)
     return RuntimeResourcesError(RuntimeResourceStage::Configuration, result.error);
   std::string floors = "model weights with the runtime reserves, one lane's state, the KV runway";
@@ -347,7 +348,10 @@ RuntimeResourcesError planRefusal(const StreamedMemoryResult &result, uint64_t h
                                floors + " and any SSD cache state staging require " +
                                    std::to_string(result.requiredBytes) + " bytes but the Metal memory budget is " +
                                    std::to_string(hardBudgetBytes) + " bytes",
-                               {}, RuntimeResourceFailure::EngineCapacity);
+                               {}, RuntimeResourceFailure::EngineCapacity,
+                               protocol::StartShortfall{.bound = memoryBound(configuredLimitBytes, hardBudgetBytes),
+                                                        .requiredBytes = result.requiredBytes,
+                                                        .budgetBytes = hardBudgetBytes});
 }
 
 // An explicit size of `option` that changes nothing: the model has no `what`
@@ -866,7 +870,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     // cache state staging; the plan after the load adds the arenas.
     const StreamedMemoryResult planned = storesPlan(false);
     if (!planned.plan)
-      throw planRefusal(planned, hardBudgetBytes, streamable, config.model);
+      throw planRefusal(planned, config.maximumMemoryBytes, hardBudgetBytes, streamable, config.model);
     loadOptions = storesOf(*planned.plan, true);
     // Fail before loading the model when the machine has no headroom at
     // all; the guard installed above keeps checking as residency grows.
@@ -1002,7 +1006,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   // grows it by the host's rule before Ready (MemoryGovernor::growToTargets).
   const StreamedMemoryResult planned = storesPlan(true);
   if (!planned.plan && !planned.requiredBytes)
-    throw planRefusal(planned, hardBudgetBytes, streamable, config.model);
+    throw planRefusal(planned, config.maximumMemoryBytes, hardBudgetBytes, streamable, config.model);
   if (planned.plan) {
     const model::ModelLoadOptions next = storesOf(*planned.plan, false);
     if (next.expertMemoryBytes != loadOptions.expertMemoryBytes ||
@@ -1056,13 +1060,22 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
 
   // The engine's plan with the staging the tier keeps; one that cannot hold
   // the model stops the start with its breakdown, before the tier's files
-  // open.
+  // open, and one the budget cannot hold with what its floors require.
   const auto requirePlan = [&] {
     EngineMemoryPlanResult planResult = planMemory(0);
     if (!planResult.plan) {
-      throw RuntimeResourcesError(RuntimeResourceStage::MemoryPlanning,
-                                  planResult.status.message,
-                                  planResult.status.describe());
+      const EngineMemoryBreakdown &breakdown = planResult.status.breakdown;
+      if (planResult.status.code != BudgetErrorCode::KvPoolDoesNotFit)
+        throw RuntimeResourcesError(RuntimeResourceStage::MemoryPlanning,
+                                    planResult.status.message,
+                                    planResult.status.describe());
+      throw RuntimeResourcesError(
+          RuntimeResourceStage::MemoryPlanning, planResult.status.message,
+          planResult.status.describe(), RuntimeResourceFailure::EngineCapacity,
+          protocol::StartShortfall{
+              .bound = memoryBound(breakdown.configuredMemoryLimitBytes, breakdown.hardBudgetBytes),
+              .requiredBytes = breakdown.minimumRequiredBytes,
+              .budgetBytes = breakdown.hardBudgetBytes});
     }
     return std::move(*planResult.plan);
   };

@@ -239,26 +239,25 @@ class Frontend:
         tokenizer,
         backend,
         model,
-        max_context,
         request_timeout,
-        preparation_capacity,
         *,
         constraint_factory,
         chat_templates,
         chat_format,
         thinking_codec,
-        vision,
         max_image_pixels=image_input.MAX_PIXELS,
         served_model_names=(),
         announce_served_name=False,
         default_reasoning_effort=None,
         default_thinking_token_budget=None,
     ):
-        if not isinstance(preparation_capacity, int) or preparation_capacity <= 0:
-            raise ValueError("frontend preparation capacity must be positive")
-        # Announced by the engine in its Ready event. Without it, message
-        # normalization rejects image and PDF input before any decoding.
-        self.vision = vision
+        # What the engine serves, from its Ready (backend.runtime.capabilities):
+        # the context follows the latest engine (max_context); its lanes and
+        # vision are the model's. Without vision, message normalization
+        # rejects image and PDF input before any decoding.
+        served = backend.runtime.capabilities
+        preparation_capacity = served.max_concurrent_requests
+        self.vision = served.vision
         self.latencies = LatencyMetrics()
         self.tokenizer = tokenizer
         # Probed at startup; requests choose among these, never the
@@ -266,8 +265,9 @@ class Frontend:
         self.chat_templates = chat_templates
         # The served family's: how its output reasons and calls tools.
         self.chat_format = chat_format
+        # Sized by the first engine's context, which every relaunch asks for.
         self.prompt_tokenizer = PromptTokenizer(
-            tokenizer, chat_format.message_boundary, max_context
+            tokenizer, chat_format.message_boundary, served.max_context_tokens
         )
         self.backend = backend
         # The model id the engine loaded. /status reports it, so an alias
@@ -295,7 +295,6 @@ class Frontend:
         ):
             raise ValueError("invalid default_thinking_token_budget")
         self.default_thinking_token_budget = default_thinking_token_budget
-        self.max_context = max_context
         self.request_timeout = request_timeout
         self.constraint_factory = constraint_factory
         self.max_image_pixels = max_image_pixels
@@ -315,6 +314,12 @@ class Frontend:
         return model in (None, "") or (
             isinstance(model, str) and model in self.model_names
         )
+
+    @property
+    def max_context(self):
+        """The context the latest engine serves: a relaunch whose plan holds
+        less serves that, until a later one regains the first's."""
+        return self.backend.runtime.capabilities.max_context_tokens
 
     @property
     def input_modalities(self):
@@ -338,6 +343,8 @@ class Frontend:
 
     def status(self):
         status = self.backend.status()
+        # The app shows the context the server serves now.
+        status["capabilities"] = {"max_context_tokens": self.max_context}
         status["vision"] = self.vision
         status["input_modalities"] = self.input_modalities
         status["reasoning_switch"] = self.chat_format.reasoning_switch

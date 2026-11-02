@@ -485,6 +485,12 @@ void testWeightBudgetBeforeLoading(const char *metallibPath) {
                     text.find("budget is " + std::to_string(minimum - 1) +
                               " bytes") != std::string_view::npos,
                 "weight loading began before checking the memory ceiling");
+        // What the start reports in place of Ready (engine::startFailedEvent).
+        require(error.shortfall() ==
+                    protocol::StartShortfall{.bound = protocol::ShortfallBound::MaxMemory,
+                                             .requiredBytes = minimum,
+                                             .budgetBytes = minimum - 1},
+                "the refusal lost what the plan's floors require against the ceiling");
       } else {
         require(error.failure() == RuntimeResourceFailure::Other,
                 "missing model file was misclassified as allocation pressure");
@@ -618,6 +624,10 @@ void testModelBeyondBudgetIsRefusedBeforeLoading(const char *metallibPath) {
     require(error.failure() == RuntimeResourceFailure::EngineCapacity &&
                 error.stage() == RuntimeResourceStage::MemoryPlanning,
             "a model that cannot fit reached the weight loader");
+    require(error.shortfall() && error.shortfall()->bound == protocol::ShortfallBound::MaxMemory &&
+                error.shortfall()->budgetBytes == config.maximumMemoryBytes &&
+                error.shortfall()->requiredBytes > config.maximumMemoryBytes,
+            "the refusal of a model beyond --max-memory lost what it needed against it");
   }
 }
 

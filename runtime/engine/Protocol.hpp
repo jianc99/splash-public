@@ -18,7 +18,7 @@
 // pins the bytes both sides agree on.
 namespace splash::protocol {
 
-inline constexpr uint16_t kProtocolVersion = 11;
+inline constexpr uint16_t kProtocolVersion = 12;
 // A frame is its header, the magic "SPLH", the u16 protocol version, the
 // u16 FrameType and the u64 payload length, then the payload.
 inline constexpr size_t kFrameHeaderBytes = 16;
@@ -193,7 +193,9 @@ struct RequestFrame {
 //   MaskResponse   u64 requestId, u64 maskRequestId, u32 count, u32 words
 //   StatusRequest  u64 correlationId
 //   ReleaseRequest u64 correlationId
-//   Ready          u32 maxConcurrentRequests, u32 maxContextTokens, u8 vision
+//   Ready          u32 maxConcurrentRequests, u32 maxContextTokens, u8 vision,
+//                  u32 vocabularySize, u32 maskRows, u32 stop token count,
+//                  u32 stop tokens
 //   Start          u64 requestId, u32 lane, u32 matchedPromptTokens
 //   PromptProgress u64 requestId, u32 processedTokens, u64 elapsedMicros
 //   Tokens         u64 requestId, u32 sequenceOffset, u32 count, u32 tokens
@@ -208,6 +210,8 @@ struct RequestFrame {
 //                  u64 requestId, u32 code bytes, u32 message bytes, the code,
 //                  the message
 //   StatusJson     u64 correlationId, the JSON
+//   StartFailed    u8 kind, u8 bound, u64 requiredBytes, u64 budgetBytes,
+//                  u32 planContextTokens, u32 message bytes, the message
 struct CancelFrame {
   uint64_t requestId = 0;
 
@@ -361,6 +365,10 @@ enum class StartFailureKind : uint8_t {
   Model = 6,
   // This Mac cannot run Splash.
   Device = 7,
+  // A start command failed for want of GPU memory
+  // (MTLCommandBufferErrorOutOfMemory): another process holds what the
+  // model's commands need; a retry would take it from that process.
+  CommandMemory = 8,
 };
 
 // What bounds a shortfall: the Metal budget this Mac gives, the one
@@ -372,12 +380,12 @@ enum class ShortfallBound : uint8_t {
 };
 
 // What a start refused for want of memory or context needed against what it
-// had: MemoryBudget sets the bytes, ContextBudget the tokens.
+// had: MemoryBudget sets the bytes, ContextBudget the context its plan holds
+// (at least one token: a plan that holds none fails before the check).
 struct StartShortfall {
   ShortfallBound bound = ShortfallBound::DeviceMemory;
   uint64_t requiredBytes = 0;
   uint64_t budgetBytes = 0;
-  uint32_t requestedContextTokens = 0;
   uint32_t planContextTokens = 0;
 
   bool operator==(const StartShortfall &) const = default;

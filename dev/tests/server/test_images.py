@@ -22,6 +22,7 @@ from dev.tests.server_fixtures import (
     anthropic_body,
     chat_body,
     document_block,
+    engine_ready,
     no_signed_thinking,
     pdf_bytes,
     png_data_url,
@@ -348,7 +349,9 @@ class ImageRequestTest(HarnessTestCase):
         from server.latency import LatencyMetrics
 
         app.latencies = LatencyMetrics()
-        app.max_context = 1024
+        app.backend = SimpleNamespace(
+            runtime=SimpleNamespace(capabilities=engine_ready(1024))
+        )
         quoted = "中文 📷 <|vision_start|><|image_pad|><|vision_end|>"
         messages = [
             {"role": "system", "content": "Document: " + api_shapes.IMAGE_PAD_TOKEN},

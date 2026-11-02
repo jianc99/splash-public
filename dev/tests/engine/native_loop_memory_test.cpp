@@ -118,7 +118,7 @@ void testLaggingHostReadingsCauseNoSecondRelease() {
     test::FakeElasticPool experts("experts", *fixture.memory, kGiB, 1, 4, 8, 4, 2.5, 80.0);
     fixture.executor.experts = &experts;
     static_cast<void>(fixture.governor->ledger().addPool(experts));
-    fixture.loop.announceReady();
+    fixture.loop.announceReady(protocol::peer::kTestReady);
     // The control pass every 100 ms, the loop idle: past the lag first, so
     // that the readings show what the engine holds.
     const auto passes = [&](double milliseconds) {

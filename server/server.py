@@ -27,7 +27,7 @@ from install import assembly
 from install.models import ModelError
 
 from . import images as image_input
-from . import json_codec, judgments, serve_options
+from . import json_codec, judgments, serve_options, serve_record
 from . import protocol as wire
 from . import runtime as engine_runtime
 from .api_shapes import (
@@ -57,7 +57,7 @@ from .backend import (
 )
 from .chat_templates import ChatTemplateError, ChatTemplates
 from .connections import ConnectionSlots, HttpAdmission, RequestBodyReservation
-from .constraints import ConstraintFactory, validate_tokenizer
+from .constraints import ConstraintFactory, check_capabilities, validate_tokenizer
 from .diagnostics import log_unexpected, print_request, print_status
 from .errors import (
     ANTHROPIC_ERRORS,
@@ -104,7 +104,6 @@ REFUSED_LINGER_SECONDS = 2.0
 # macOS's OPEN_MAX.
 DESCRIPTOR_LIMIT = 10240
 SSE_KEEPALIVE_SECONDS = 2.0
-NATIVE_START_TIMEOUT = 600.0
 ROOT = Path(__file__).parents[1]
 CHAT_HTML = Path(__file__).with_name("chat.html").read_bytes()
 CHAT_ASSETS = {
@@ -1678,6 +1677,9 @@ def parse_args(argv=None):
     )
     parser.add_argument("--port", type=int, default=serve_options.DEFAULT_PORT)
     parser.add_argument("--binary", default=str(ROOT / "build" / "splash"))
+    # The launcher's, not a serve option: where the app reads why a start
+    # failed (serve_record).
+    parser.add_argument("--serve-record", type=Path, metavar="PATH")
     serve_options.add_serve_arguments(parser)
     args = parser.parse_args(argv)
     serve_options.check_serve_arguments(parser, args)
@@ -1688,14 +1690,17 @@ def parse_args(argv=None):
 
 def _native_command(args, model_root, relaunch_context=None):
     """The engine's command line serving model_root, a relaunch's with
-    `relaunch_context`, the context the first engine served: without
-    --max-context the relaunch keeps it, where its own would follow a Neural
+    `relaunch_context`, the context the first engine served, which the
+    relaunch asks for whether --max-context set it or not: it serves what its
+    plan holds of it, where its own automatic one would follow a Neural
     Engine split calibrated anew."""
     command = [
         args.binary,
         "serve-native",
         str(model_root),
-        "auto" if args.max_context is None else str(args.max_context),
+        "auto"
+        if args.max_context is None or relaunch_context is not None
+        else str(args.max_context),
         "auto" if args.max_memory is None else str(args.max_memory),
     ]
     if args.max_cache_disk is not None:
@@ -1726,7 +1731,7 @@ def _native_command(args, model_root, relaunch_context=None):
         )
     if args.allow_idle_sleep:
         command.extend(("--idle-sleep", "allow"))
-    if relaunch_context is not None and args.max_context is None:
+    if relaunch_context is not None:
         command.extend(("--relaunch-context", str(relaunch_context)))
     for flag, value in (
         ("--ple-memory", args.ple_memory),
@@ -1778,6 +1783,9 @@ def _stop_with(pid):
 
 def main():
     args = parse_args()
+    # The launcher execs the server, so its pid is the lock's and the app's
+    # child's; a record of an earlier start never names it.
+    serve_record.write(args.serve_record, pid=os.getpid(), phase="starting")
     server = None
     runtime = None
     backend = None
@@ -1850,7 +1858,6 @@ def main():
             relaunch_command=lambda first: _native_command(
                 args, model_root, first.max_context_tokens
             ),
-            startup_timeout=NATIVE_START_TIMEOUT,
             pending_limit=args.queue_size,
         )
         backend = NativeBackend(
@@ -1861,29 +1868,18 @@ def main():
         )
         if not runtime.wait_ready():
             raise engine_runtime.EngineUnhealthy("native runtime did not become ready")
-        readiness = runtime.readiness
-        # The engine serves --max-context as given, and without it a context
-        # the native window holds.
-        if readiness is None or not (
-            readiness.max_context_tokens == args.max_context
-            if args.max_context is not None
-            else 1 <= readiness.max_context_tokens <= serve_options.MAX_CONTEXT_TOKENS
-        ):
-            raise engine_runtime.EngineUnhealthy(
-                "native runtime reported an invalid context window"
-            )
-        effective_context = readiness.max_context_tokens
-        constraint_factory = ConstraintFactory(tokenizer, family.chat_format)
+        # The engine is authoritative for what it serves: it refuses a
+        # --max-context it cannot serve.
+        served = runtime.capabilities
+        check_capabilities(tokenizer, family.chat_format, served)
         app = Frontend(
             tokenizer,
             backend,
             args.model,
-            effective_context,
             # No deadline unless given, as in vLLM and SGLang; a request still
             # ends when its client disconnects.
             math.inf if args.request_timeout is None else args.request_timeout,
-            readiness.max_concurrent_requests,
-            constraint_factory=constraint_factory,
+            constraint_factory=ConstraintFactory(tokenizer, served),
             chat_templates=chat_templates,
             chat_format=family.chat_format,
             max_image_pixels=args.max_image_pixels,
@@ -1892,17 +1888,13 @@ def main():
             announce_served_name=args.announce_served_name,
             default_reasoning_effort=args.default_reasoning_effort,
             default_thinking_token_budget=args.thinking_token_budget,
-            vision=readiness.vision,
         )
         server.app = app
         server.server_activate()
         address = f"http://{args.host}:{server.server_port}"
-        context = (
-            f"{effective_context // 1024}K"
-            if effective_context % 1024 == 0
-            else f"{effective_context:,}"
-        )
-        mode = "" if readiness.vision else " · text only"
+        tokens = served.max_context_tokens
+        context = f"{tokens // 1024}K" if tokens % 1024 == 0 else f"{tokens:,}"
+        mode = "" if served.vision else " · text only"
         print_status(f"Ready · {args.model} · context {context}{mode} · {address}")
         server.serve_forever()
     except (
@@ -1913,9 +1905,22 @@ def main():
         ThinkingEndError,
     ) as error:
         print_status(f"Error · {error}", error=True)
+        serve_record.write(
+            args.serve_record,
+            pid=os.getpid(),
+            phase="failed",
+            failure=serve_record.failure_of(error),
+        )
         raise SystemExit(1) from None
     except OSError as error:
-        print_status(f"Error · unable to start HTTP server: {error}", error=True)
+        message = f"unable to start HTTP server: {error}"
+        print_status(f"Error · {message}", error=True)
+        serve_record.write(
+            args.serve_record,
+            pid=os.getpid(),
+            phase="failed",
+            failure={"source": "server", "kind": "server", "message": message},
+        )
         raise SystemExit(1) from None
     except KeyboardInterrupt:
         pass

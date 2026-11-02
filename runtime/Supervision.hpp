@@ -4,7 +4,25 @@
 
 // Every time limit one Splash process holds another to, and those the engine
 // holds itself to, in one place. server/protocol.py SUPERVISION mirrors the
-// ones the server times the engine by.
+// ones the server times the engine by, the app mirrors the stop budget (its
+// Supervision.stop), dev/tests/engine/protocol_golden.txt ("supervision")
+// pins them on every side, and server/supervision.py derives each threshold
+// by which the server fails, stops or relaunches an engine from them.
+//
+// Stopping, from the outside in:
+// 1. The engine, on SIGTERM or the end of its input, stops taking work,
+//    gives the newest restore points of a persistent cache up to kFlush to
+//    reach the disk, and exits.
+// 2. The server stops its engine with SIGTERM, sends SIGKILL to one still
+//    running after kStop, then waits up to kStop more for it to exit.
+// 3. The server, on SIGTERM or a first SIGINT, stops as in 2; later SIGTERMs
+//    are ignored, and a second SIGINT while it stops (the user's double
+//    Ctrl+C) kills the engine at once.
+// 4. The app stops a server with one signal, SIGINT for its own and SIGTERM
+//    for a leftover one (which may already be stopping), and kills the
+//    process group only after 2 * kStop, the longest 2 takes. A second
+//    signal before kStop could cut a flush 1 allows; one after it adds
+//    nothing the server does not do itself.
 namespace splash::supervision {
 
 using std::chrono::milliseconds;
@@ -30,11 +48,17 @@ inline constexpr milliseconds kFlush{6'000};
 inline constexpr milliseconds kStop{15'000};
 // A start serves on probation this long: a persistent cache it took back is
 // dropped if the engine fails within it (RuntimeResources::beginServing), and
-// the server counts a failure within it as short-lived.
+// the server counts a failure within it as short-lived, which doubles its
+// relaunch backoff, up to this long.
 inline constexpr milliseconds kProbation{60'000};
+// How long a start waits for memory the host or Metal refused before it
+// fails (engine::StartupRetryWindow); a relaunch past its usual start may
+// need this much more.
+inline constexpr milliseconds kStartRetryWindow{30'000};
 
 static_assert(kGpuWaitLimit < kCommandTimeout);
 static_assert(kFlush < kStop);
 static_assert(kLoopStall < kProbation);
+static_assert(kStartRetryWindow < kProbation);
 
 } // namespace splash::supervision

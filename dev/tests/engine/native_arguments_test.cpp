@@ -154,14 +154,18 @@ void testServerCommandLines(const char *path) {
       {"idle_sleep", [](NativeArguments &read) { read.preventIdleSleep = false; }},
       {"disable_ane", [](NativeArguments &read) { read.neuralEngine = false; }},
       {"verify_rows_all", [](NativeArguments &read) { read.verifyRows = model::VerifyRows::All; }},
-      // Auto is the engine's default, which the server leaves out.
-      {"verify_rows_auto", [](NativeArguments &) {}},
-      // A relaunch keeps the first engine's context; with --max-context,
-      // which every start holds, its command is the first one's.
+      // The defaults the server leaves out are the engine's: each meaning
+      // names the value, so a change of the engine's default fails it.
+      {"verify_rows_auto", [](NativeArguments &read) { read.verifyRows = model::VerifyRows::Auto; }},
+      {"kv_format_default", [](NativeArguments &read) { read.kvFormat = kv::Format::Int8; }},
+      {"state_format_default",
+       [](NativeArguments &read) { read.stateFormat = ops::GdnStateFormat::Float32; }},
+      // A relaunch asks for the first engine's context, with --max-context
+      // as without: the engine serves what its plan holds of it.
       {"relaunch", [](NativeArguments &read) { read.relaunchContext = 61433; }},
       {"relaunch_limits",
        [](NativeArguments &read) {
-         read.maxContext = 102400;
+         read.relaunchContext = 61433;
          read.maxMemoryBytes = 32 * kGiB;
        }},
       // Past the native window, YaRN by the context over it.
@@ -342,14 +346,15 @@ void testRefusals() {
                 stretched.model.ropeScaling == model::RopeScaling{factor, 262144},
             "MAX_CONTEXT " + std::to_string(context) + " was not served with YaRN by its ratio to the native window");
   }
-  // A relaunch's context is one the model holds, and only without
-  // MAX_CONTEXT, which every start holds; auto never serves it with YaRN.
+  // A relaunch's context is one the model serves, and only with MAX_CONTEXT
+  // auto, as every relaunch passes.
   for (const std::string &context : {std::string("0"), std::string("auto"), std::string("100K"),
-                                     std::to_string(std::stoull(maximum) + 1), std::string()})
+                                     std::string()})
     refuses({"auto", "auto", "--relaunch-context", context},
-            "--relaunch-context requires an integer in [1, " + maximum + "]");
-  refuses({"auto", "auto", "--relaunch-context"},
-          "--relaunch-context requires an integer in [1, " + maximum + "]");
+            "--relaunch-context requires a positive integer");
+  refuses({"auto", "auto", "--relaunch-context"}, "--relaunch-context requires a positive integer");
+  refuses({"auto", "auto", "--relaunch-context", "1010001"},
+          "--relaunch-context: Qwen3.8-27B serves at most 1010000 tokens of context");
   refuses({"102400", "auto", "--relaunch-context", "102400"},
           "--relaunch-context requires MAX_CONTEXT auto");
   require(parse(model, {"auto", "auto", "--relaunch-context", maximum}).relaunchContext ==
@@ -374,6 +379,21 @@ void testRefusals() {
 
 } // namespace
 
+// A relaunch after a first engine that served a YaRN context serves the model
+// with YaRN for it, as MAX_CONTEXT would: the server passes MAX_CONTEXT auto
+// and the first context to every relaunch, --max-context or not.
+void testAnAutoRelaunchServesAYarnContext() {
+  const ModelDirectory model;
+  const NativeArguments relaunch = parse(model, {"auto", "auto", "--relaunch-context", "1000000"});
+  require(!relaunch.maxContext && relaunch.relaunchContext == 1'000'000 &&
+              relaunch.model.ropeScaling == model::RopeScaling{3.814697265625, 262144} &&
+              relaunch.model.capabilities.maximumContextTokens == 1'000'000,
+          "a relaunch of a YaRN context did not serve the model with YaRN for it");
+  const NativeArguments native = parse(model, {"auto", "auto", "--relaunch-context", "61433"});
+  require(native.relaunchContext == 61433 && !native.model.ropeScaling.yarn(),
+          "a relaunch within the native window was served with YaRN");
+}
+
 int main(int argc, char **argv) {
   if (argc != 3) {
     std::cerr << "usage: " << argv[0] << " native_command_golden.txt MODEL_CONFIGS\n";
@@ -387,6 +407,7 @@ int main(int argc, char **argv) {
     testStreamedMemoryAndSpill();
     testWindowTrim();
     testRefusals();
+    testAnAutoRelaunchServesAYarnContext();
     std::cout << "native arguments tests passed\n";
     return EXIT_SUCCESS;
   } catch (const std::exception &error) {

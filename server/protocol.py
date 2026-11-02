@@ -8,6 +8,7 @@ the bytes both sides agree on.
 from __future__ import annotations
 
 import array
+import hashlib
 import math
 import struct
 import sys
@@ -15,7 +16,7 @@ from dataclasses import dataclass, fields
 from enum import IntEnum, IntFlag
 from typing import TypeAlias
 
-PROTOCOL_VERSION = 11
+PROTOCOL_VERSION = 12
 # A frame is its header, the magic, the protocol version, the frame type and
 # the payload length, then the payload.
 FRAME_HEADER_BYTES = 16
@@ -52,7 +53,8 @@ _CANCEL = struct.Struct("<Q")
 _MASK_RESPONSE = struct.Struct("<QQI")
 _STATUS_REQUEST = struct.Struct("<Q")
 _RELEASE_REQUEST = struct.Struct("<Q")
-_READY = struct.Struct("<IIB")
+# Concurrent requests, context, vision, vocabulary, mask rows, stop count.
+_READY = struct.Struct("<IIBIII")
 _START = struct.Struct("<QII")
 _PROMPT_PROGRESS = struct.Struct("<QIQ")
 _TOKENS = struct.Struct("<QII")
@@ -60,6 +62,8 @@ _MASK_REQUEST = struct.Struct("<QQII")
 _DONE = struct.Struct("<QBBIIQQQIIIII")
 _ERROR = struct.Struct("<BBIQII")
 _STATUS_JSON = struct.Struct("<Q")
+# Kind, bound, required bytes, budget bytes, plan context, message bytes.
+_START_FAILED = struct.Struct("<BBQQII")
 
 assert (
     array.array("I").itemsize == 4
@@ -69,11 +73,12 @@ assert (
 assert _HEADER.size == FRAME_HEADER_BYTES
 assert _REQUEST.size == 114
 assert _IMAGE_SPAN.size == 32
-assert _READY.size == 9
+assert _READY.size == 21
 assert _START.size == 16
 assert _DONE.size == 62
 assert _ERROR.size == 22
 assert _STATUS_JSON.size == 8
+assert _START_FAILED.size == 26
 
 REQUEST_FIXED_BYTES = _REQUEST.size
 IMAGE_SPAN_BYTES = _IMAGE_SPAN.size
@@ -94,6 +99,7 @@ class FrameType(IntEnum):
     ERROR = 0x0105
     STATUS_JSON = 0x0107
     PROMPT_PROGRESS = 0x0108
+    START_FAILED = 0x0109
 
 
 # The frame types the engine sends; the others are the server's.
@@ -107,6 +113,7 @@ _EVENT_TYPES = frozenset(
         FrameType.ERROR,
         FrameType.STATUS_JSON,
         FrameType.PROMPT_PROGRESS,
+        FrameType.START_FAILED,
     }
 )
 
@@ -326,9 +333,9 @@ class ReadyEvent:
     # The target's logit rows a token mask covers; the rows of one mask
     # request, before the anchor and after each draft query row; and the
     # tokens that end generation.
-    vocabulary_size: int = 0
-    mask_rows: int = 0
-    stop_token_ids: tuple[int, ...] = ()
+    vocabulary_size: int
+    mask_rows: int
+    stop_token_ids: tuple[int, ...]
 
 
 @dataclass(slots=True, frozen=True)
@@ -432,6 +439,9 @@ class StartFailureKind(IntEnum):
     CONFIGURATION = 5
     MODEL = 6
     DEVICE = 7
+    # A start command failed for want of GPU memory: another process holds
+    # what the model's commands need; a retry would take it from that process.
+    COMMAND_MEMORY = 8
 
 
 # What bounds a shortfall: the Metal budget the Mac gives, the one
@@ -443,14 +453,14 @@ class ShortfallBound(IntEnum):
 
 
 # Sent in place of Ready by a start that fails. The shortfall is all zero but
-# for MEMORY_BUDGET, which sets the bytes, and CONTEXT_BUDGET, the tokens.
+# for MEMORY_BUDGET, which sets the bytes, and CONTEXT_BUDGET, the context
+# its plan holds.
 @dataclass(slots=True, frozen=True)
 class StartFailedEvent:
     kind: StartFailureKind
     bound: ShortfallBound
     required_bytes: int
     budget_bytes: int
-    requested_context_tokens: int
     plan_context_tokens: int
     message: bytes
 
@@ -476,13 +486,14 @@ EngineEvent: TypeAlias = (
 
 
 # The engine's supervision budgets the server times it by, in milliseconds
-# (runtime/Supervision.hpp).
+# (runtime/Supervision.hpp; protocol_golden.txt "supervision" pins them).
 @dataclass(slots=True, frozen=True)
 class Supervision:
     command_timeout_ms: int
     loop_stall_ms: int
     stop_ms: int
     probation_ms: int
+    start_retry_window_ms: int
 
 
 SUPERVISION = Supervision(
@@ -490,6 +501,7 @@ SUPERVISION = Supervision(
     loop_stall_ms=30_000,
     stop_ms=15_000,
     probation_ms=60_000,
+    start_retry_window_ms=30_000,
 )
 
 
@@ -631,7 +643,9 @@ def _payload_bounds(frame_type: FrameType) -> tuple[int, int]:
         case FrameType.RELEASE_REQUEST:
             bounds = (_RELEASE_REQUEST.size, _RELEASE_REQUEST.size)
         case FrameType.READY:
-            bounds = (_READY.size, _READY.size)
+            # The stop tokens are the target's, inside its vocabulary; the
+            # frame limit is the bound.
+            bounds = (_READY.size, MAX_FRAME_PAYLOAD_BYTES)
         case FrameType.PROMPT_PROGRESS:
             bounds = (_PROMPT_PROGRESS.size, _PROMPT_PROGRESS.size)
         case FrameType.START:
@@ -649,6 +663,8 @@ def _payload_bounds(frame_type: FrameType) -> tuple[int, int]:
             bounds = (_ERROR.size, _ERROR.size + MAX_ERROR_STRING_BYTES * 2)
         case FrameType.STATUS_JSON:
             bounds = (_STATUS_JSON.size, _STATUS_JSON.size + MAX_STATUS_JSON_BYTES)
+        case FrameType.START_FAILED:
+            bounds = (_START_FAILED.size, _START_FAILED.size + MAX_ERROR_STRING_BYTES)
     return bounds[0], min(bounds[1], MAX_FRAME_PAYLOAD_BYTES)
 
 
@@ -972,6 +988,38 @@ def _release_request_frame(request: ReleaseRequestFrame) -> bytearray:
     return frame
 
 
+# What a request's fingerprint leaves out: what differs between a request and
+# its retry (its id, priority, deadlines and seed, random per request unless
+# the client sets it), and the pixels its image spans' digests name.
+_UNFINGERPRINTED = frozenset(
+    {
+        "request_id",
+        "priority",
+        "absolute_deadline_unix_micros",
+        "remaining_deadline_micros",
+        "seed",
+        "image_pixels",
+    }
+)
+_TOKEN_FIELDS = frozenset({"prompt_tokens", "score_tokens"})
+
+
+def request_fingerprint(request: RequestFrame) -> bytes:
+    """The SHA-256 of what a request asks the engine, which its retries share:
+    every field but those _UNFINGERPRINTED names."""
+    digest = hashlib.sha256()
+    for field in fields(RequestFrame):
+        if field.name in _UNFINGERPRINTED:
+            continue
+        value = getattr(request, field.name)
+        if field.name in _TOKEN_FIELDS:
+            digest.update(f"{field.name}:{len(value)}:".encode())
+            digest.update(array.array("I", value))
+        else:
+            digest.update(f"{field.name}:{value!r};".encode())
+    return digest.digest()
+
+
 def serialize_message(message: ClientMessage) -> bytearray:
     """Validate and serialize one client message as a whole frame, built in
     one buffer: a request's image pixels are copied once."""
@@ -1076,12 +1124,42 @@ def _tail(
 def _decode_event(frame: Frame) -> EngineEvent:
     frame_type, payload = _checked_frame(frame)
     if frame_type is FrameType.READY:
-        concurrent, context, vision = _READY.unpack(payload)
+        concurrent, context, vision, vocabulary, rows, stop_count = _READY.unpack_from(
+            payload
+        )
+        stops = _tail(payload, _READY.size, stop_count, "I", "stop token", 0)
         if vision > 1:
             _fatal(IssueCode.INVALID_ENUM_VALUE, "ready vision must be a boolean")
-        if not concurrent or not context:
-            _fatal(IssueCode.INVALID_COUNT, "ready event capacities must be non-zero")
-        return ReadyEvent(concurrent, context, bool(vision))
+        if not concurrent or not context or not vocabulary or not rows or not stops:
+            _fatal(
+                IssueCode.INVALID_COUNT,
+                "ready event capacities and stop tokens must be non-zero",
+            )
+        if max(stops) >= vocabulary:
+            _fatal(
+                IssueCode.INVALID_COUNT,
+                "ready event stop token is outside the vocabulary",
+            )
+        return ReadyEvent(concurrent, context, bool(vision), vocabulary, rows, stops)
+    if frame_type is FrameType.START_FAILED:
+        kind, bound, required, budget, plan_context, message_bytes = (
+            _START_FAILED.unpack_from(payload)
+        )
+        if message_bytes != len(payload) - _START_FAILED.size:
+            _fatal(
+                IssueCode.INVALID_PAYLOAD_LENGTH,
+                "start failure message length does not match the frame payload",
+            )
+        try:
+            kind = StartFailureKind(kind)
+            bound = ShortfallBound(bound)
+        except ValueError:
+            _fatal(
+                IssueCode.INVALID_ENUM_VALUE, "start failure kind or bound is invalid"
+            )
+        return StartFailedEvent(
+            kind, bound, required, budget, plan_context, payload[_START_FAILED.size :]
+        )
     if frame_type is FrameType.START:
         request_id, lane, matched = _START.unpack(payload)
         if not request_id:

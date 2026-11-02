@@ -29,21 +29,38 @@ upgrading.
 ### Engine restarts and sleep
 
 An engine that fails is restarted at once. If it fails again within 60 s of
-starting, the next restart waits 5 s; after a third such failure (failed
-restarts count) Splash stops restarting it, and requests get 500 `engine_failed`
-until the server is restarted; its message names the crash trace when
+starting, the next restart waits 5 s, and each such failure in a row after it
+doubles the wait, up to 60 s (failed restarts count); 60 s of service starts
+the count anew. Splash stops restarting only after a restart that would fail
+again whatever the Mac's memory: a setting the engine refuses, a Mac that
+cannot run Splash, a missing engine executable, or a start whose GPU commands
+another process's memory starved (another Splash server?), which a retry
+would take from that process. Requests then get 500 `engine_failed` until the
+server is restarted; its message names the crash trace when
 `SPLASH_CRASH_TRACE=1` recorded one
 ([crash traces](internals.md#failures-and-crash-traces)). Meanwhile generation requests get
 503 `engine_recovering`, whose message names the last failure and whose
-`Retry-After` the time until the restart should be ready ([errors](api.md#errors)). An engine whose
+`Retry-After` the time until the next bound on the restart's start: when it
+should be ready, as long after its spawn as the start before took, then up to
+30 s more while it waits for memory the Mac refused ([errors](api.md#errors)). An engine whose
 loop leaves a status request unanswered for 30 seconds, while requests are
 pending or during a background status refresh, is failed and restarted by the
-same rules. A restarted engine serves what the first one announced: the same
-options give it the same concurrency and image input, and without
-`--max-context` the server passes it the first engine's context to keep
-([Neural Engine prefill](internals.md#neural-engine-prefill)). One that announces other
-limits, as once the Mac's memory budget shrank below that context, stops the
-restarts at once.
+same rules; so is one that leaves a frame unread for 30 seconds. A request the
+engine had started at each of two engine failures in a row that a request may
+cause (an execution failure, broken output, or a crash by a fault signal; not
+a kill, nor a command short of GPU memory) is refused with 400
+`request_quarantined` until the server restarts. A restarted engine is asked
+for the first engine's context, with `--max-context` as without, and serves
+what its plan holds of it ([Neural Engine prefill](internals.md#neural-engine-prefill)): one
+whose plan holds less, as once the Mac's memory budget shrank, serves less, and
+the server serves that until a later restart regains it; `/status` reports it
+as `capabilities.max_context_tokens`.
+
+Ctrl+C or SIGTERM stops the server: it stops its engine with SIGTERM, which
+gives a persistent cache's newest restore points up to 6 s to reach the disk,
+and kills an engine still running 15 s later; later SIGTERMs are ignored, and a
+second Ctrl+C stops the engine at once. The app stops a server with one signal
+and kills it only after 30 s.
 
 Timeouts and keep-alives count only time the Mac is awake: a request in flight
 when the Mac sleeps continues when it wakes. While requests run, Splash keeps
@@ -91,7 +108,7 @@ paths for `--model-dir`, `--draft-model` and `--mmproj`.
 | `--kv-format` | `int8` | Target KV storage: `int8` or `bf16`. See [KV cache precision](#kv-cache-precision). |
 | `--state-format` | `fp32` | Recurrent state storage: `fp32` or `bf16`. See [state precision](#state-precision). |
 | `--ple-memory` | Auto | Qwen3.8-Flash-Next: read the PLE n-gram table from the SSD through a host row cache of this size, e.g. `2G`; `off` loads the whole table. Auto loads it where memory holds it, else streams it through its share of the budget. See [PLE table streaming](#ple-table-streaming). |
-| `--expert-memory` | Auto | MoE targets: the least memory routed experts keep, e.g. `16G`; they load whole where memory holds them all, as auto does, and otherwise take all the memory the plan leaves them, at least this, give memory back down to it while requests need it, and read the other experts from the SSD when a step routes them; `off` loads every expert. Auto loads them all where memory holds them, else gives them what the context leaves, given back down to within a chunk of 85% of the slots they start with. See [streamed experts](#streamed-experts). |
+| `--expert-memory` | Auto | MoE targets: the least memory routed experts keep, e.g. `16G`; they load whole where memory holds them all, as auto does, and otherwise take all the memory the plan leaves them, at least this, give memory back down to it while requests need it, and read the other experts from the SSD when a step routes them; `off` loads every expert. Auto loads them all where memory holds them, else gives them what the context leaves, given back down to their floor while requests need it. See [streamed experts](#streamed-experts). |
 | `--sparse-kv-memory` | Auto | Qwen3.8-Flash-Next: memory for the KV blocks read back from the SSD for requests whose KV is there, e.g. `1200M`; never below its floor, which auto keeps. See [KV on the SSD](#kv-on-the-ssd). |
 | `--idle-release` | `10m` | Time without a request before the engine unwires its memory and frees the weights; the next request restores them. `off` keeps both, though `POST /v1/memory/release` still frees the weights. See [weight loading](internals.md#weight-loading). |
 | `--max-cache-disk` | `auto` | SSD quota for cached KV pages and states: `auto` follows the volume, a quarter of its free space beyond a floor of 10 GiB (5% of a volume under 200 GiB), at most 32 GiB; a size such as `16G` is held as given while the volume keeps that floor; `0` turns the cache off. Kept for the session, or across restarts with `--persistent-cache`. See [SSD cache](#ssd-cache). |

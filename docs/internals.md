@@ -1965,13 +1965,31 @@ but no sampling policy or DFlash decode. Successful scoring emits no Tokens
 event, finishes with Stop, and reports zero decode time. Cancelled requests
 carry no logits.
 
-An engine sends its Ready event first. One whose bootstrap fails, as when
+An engine sends its Ready event first. Ready says what the start serves: its
+lanes, the context it resolved (a relaunch may serve less than the first
+engine did), whether it admits images, and the target's vocabulary, stop
+tokens and mask rows, from which the server sizes its token masks and against
+which it checks its tokenizer. One whose bootstrap fails, as when
 `--max-context` exceeds what its budget holds, writes its report to stderr,
-sends the report's reason as an engine failure in its place and exits; the
-server ends the start with that reason (`Error · …`, or
-`Engine restart failed · …` for a relaunch). An engine that ends before either,
-as a crashed one or one refusing its arguments does, ends it with
-`native protocol reached EOF`.
+sends a StartFailed event in its place and exits. StartFailed classes the
+failure for the server's restart policy and the app's words: host memory, a
+driver allocation, the memory budget or the context the plan holds (with what
+the start needed against what it had, and whether this Mac, `--max-memory` or
+the SSD cache's room bounded it), configuration, the model's files, the
+device, a start command short of GPU memory, or internal. The server ends the
+start with its message (`Error · …`, or `Engine restart failed · …` for a
+relaunch). An engine that ends before either, as a crashed one or one
+refusing its arguments does, ends it with `native protocol reached EOF`.
+
+The time limits the processes hold each other to live in
+`runtime/Supervision.hpp`: Metal's 5 s event wait, the 120 s command watchdog,
+the 30 s loop step (a frame waits at most one step to be read, and a status
+request is answered within it), the 6 s flush of a clean stop, the 15 s from
+a stop signal to the engine's exit, the 60 s probation of a start, and the
+30 s a start waits for memory the host or Metal refused. The server mirrors
+the ones it times the engine by (`server/protocol.py` `SUPERVISION`), the app
+the stop budget, and `protocol_golden.txt` pins every copy; the server derives
+each of its thresholds from them in `server/supervision.py`.
 
 ## Failures and crash traces
 

@@ -2,6 +2,7 @@
 
 #include "Checked.hpp"
 #include "StderrLine.hpp"
+#include "Supervision.hpp"
 #include "metal/abi/AneFfn.h"
 #include "metal/abi/QuantFormat.h"
 #include "ops/BufferExtent.hpp"
@@ -43,14 +44,16 @@ static_assert(kChannelUnit % ANE_FFN_WEIGHT_ROWS == 0 && kSegment % ANE_FFN_WEIG
               "the weight kernels' threadgroups take whole rows of every matrix the split stages");
 // How long an ANE evaluation may run once the GPU has raised its `ready`
 // before the split stops (ane::Handoff). An evaluation takes 10-60 ms. Metal
-// fails a command buffer whose event wait is still unmet 5 s after its queue
-// reached it ("Caused GPU Timeout Error", macOS 27.0 on an M5 Max), and once
+// fails a command buffer whose event wait is still unmet
+// supervision::kGpuWaitLimit after its queue reached it ("Caused GPU Timeout
+// Error", macOS 27.0 on an M5 Max), and once
 // two have failed so it ignores the process's later commands on that queue.
 // The queue reaches each wait once the one before it was met, so at the
 // release a wait has waited through one layer's GPU part and at most the
 // bound; a command's first wait also through the work from the command's
 // submission, which image encodes no longer add (Runtime::prefillAsync).
 constexpr auto kHandoffBound = std::chrono::seconds(2);
+static_assert(kHandoffBound < supervision::kGpuWaitLimit);
 // How long the service may take to compile and load the program: four times
 // the cold compile of the largest the split compiles, calibration's at share
 // 0.8 (27 s on an M5 Max, about 30 s on an M6), so that a busy Mac still

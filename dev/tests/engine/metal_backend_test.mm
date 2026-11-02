@@ -2621,6 +2621,30 @@ void run(const std::string &metallibPath) {
               << " last_wall_seconds=" << lastWallSeconds << '\n';
 }
 
+// A command buffer that failed for want of GPU memory says so in its error
+// (MTLCommandBufferErrorDomain, MTLCommandBufferErrorOutOfMemory), which the
+// error a ticket throws carries (MetalBackendError::outOfMemory) for the
+// engine's start failure and its failure code; no other error does.
+void testACommandOutOfMemoryIsClassed() {
+    using splash::metal::commandOutOfMemory;
+    require(commandOutOfMemory([NSError errorWithDomain:MTLCommandBufferErrorDomain
+                                                   code:MTLCommandBufferErrorOutOfMemory
+                                               userInfo:nil]),
+            "a command buffer's want of GPU memory was not classed");
+    require(!commandOutOfMemory([NSError errorWithDomain:MTLCommandBufferErrorDomain
+                                                    code:MTLCommandBufferErrorTimeout
+                                                userInfo:nil]) &&
+                !commandOutOfMemory([NSError errorWithDomain:NSPOSIXErrorDomain
+                                                        code:MTLCommandBufferErrorOutOfMemory
+                                                    userInfo:nil]) &&
+                !commandOutOfMemory(nil),
+            "a command buffer failure of another kind was classed as out of memory");
+    require(MetalBackendError("Metal command 1 failed", true).outOfMemory() &&
+                !MetalBackendError("Metal command 1 failed").outOfMemory(),
+            "a backend error did not keep whether its command ran out of GPU memory");
+    std::cout << "PASS a command out of GPU memory is classed\n";
+}
+
 }  // namespace
 
 int main(int argc, const char *argv[]) {
@@ -2630,6 +2654,7 @@ int main(int argc, const char *argv[]) {
             return 2;
         }
         try {
+            testACommandOutOfMemoryIsClassed();
             completionDoesNotWaitForMemoryTelemetry(argv[1]);
             terminalCommandRecovers(argv[1], false);
             terminalCommandRecovers(argv[1], false, true);

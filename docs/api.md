@@ -678,7 +678,7 @@ Proxy consumers can use these fields; additional fields may be added:
 | `memory_governor.host_telemetry` | The host's memory as macOS counts it, beside the governor's estimate, which no rule acts on: the engine process's `phys_footprint_bytes` and the part of them macOS holds `compressed_bytes`, the host's `file_backed_bytes` (its file cache, active and inactive alike) and `inactive_bytes` (its inactive and speculative pages, file-backed and anonymous alike: macOS splits neither queue), and the file cache macOS keeps however short memory is (`filecache_min_bytes`, `vm.vm_page_filecache_min`); `null` where macOS does not report it |
 | `memory_governor.accounts` | Each account of the engine's memory ledger, by the `name` its owner gives it (`kv`, `states`, `fixed`, or a model pool such as `experts`): its `floor_bytes`, `current_bytes` and `cap_bytes` (the bound its growth approaches), the `reserved_bytes` of its pending growth the ledger holds against every other account (its target is its `current_bytes` and these), its `unit_bytes`, what its next unit is worth (`value_per_gib`: seconds of engine work over the ledger's value horizon, per GiB, its hits spread evenly over the keys it lacks, which the ledger's rule reads), the same at the pool's edge (`grow_value_per_gib`: what one unit more would save, from the ghost hits among its newest ghosts; `shrink_value_per_gib`: what one unit less would cost, from the hits on what it gives up first; each the unit's share of the hits the pool counts in a unit of its own, such as the expert store's elastic chunk; reported only, no rule reads them; 0 for an account that counts neither), and the units it took (`grows`) and gave back (`shrinks`) since engine start |
 | `memory_governor.reserved_bytes`, `owed`, `claims` | The accounts' `reserved_bytes` summed; the `bytes` the `transfers` in flight or owed free when they land, the part of them owed to requests waiting for memory (`to_claims_bytes`) and the oldest transfer's age (`oldest_ms`); and the requests `waiting` for memory, the `bytes` they lack and how long the oldest has waited (`oldest_ms`) |
-| `loop.max_tick_ms` | Longest control pass and engine step of the native loop. A reader thread keeps reading requests meanwhile, so a request frame whose write stalls 5 s after it started fails the engine only when the process stopped reading; while requests are pending the server asks for status every 10 s and fails an engine whose loop does not answer within 30 s. |
+| `loop.max_tick_ms` | Longest control pass and engine step of the native loop. A reader thread reads one request frame ahead meanwhile, so a frame write may wait up to one loop step: one that waits 30 s (`loop.stall_budget_ms`) fails the engine; while requests are pending the server asks for status every 10 s and fails an engine whose loop does not answer within 30 s. |
 | `loop.stall_budget_ms` | The longest one control pass and engine step of the native loop may take, 30000: a request frame waits at most this long before the loop takes it, and a status request is answered within it |
 | `loop.tick_host_ms` | The engine's host time in each step that submitted a command, from its first planning call (admission) to the command's submission, since engine start, in the shape of `metrics.decode_gap_ms` |
 | `maximum_context_tokens` | Declared context limit; available memory may limit admission |
@@ -686,7 +686,8 @@ Proxy consumers can use these fields; additional fields may be added:
 | `vision`, `input_modalities` | Whether image and PDF input is accepted; `false` and `["text"]` for a model serving without vision |
 | `reasoning_switch` | Whether a request's reasoning effort or `enable_thinking` turns the model's reasoning on and off ([default reasoning effort](server.md#default-reasoning-effort)): `true` for the Qwen families, `false` for Flint, whose model decides each turn |
 | `chat_template.later_system` | `native`, `patched` or `unsupported`: how system messages after the first render (per name for named templates) |
-| `transport.recovering`, `transport.stopped`, `transport.error` | The engine is restarting, or Splash stopped restarting it after repeated failures; `error` names its failure, the last failed restart, or why restarts stopped |
+| `transport.recovering`, `transport.stopped`, `transport.error` | The engine is restarting, or Splash stopped restarting it after a failure a restart would meet again ([engine restarts](server.md#engine-restarts-and-sleep)); `error` names its failure, the last failed restart, or why restarts stopped |
+| `capabilities.max_context_tokens` | The context the server serves now: the latest engine's, which a restart whose plan holds less may lower until a later one regains it |
 
 `GET /ready` is 200 while the engine's own `ready` is true. While the engine
 loop is busy, `/ready` keeps its last answer until the loop has left status
@@ -759,9 +760,10 @@ status, such as `overloaded_error` for 503. `/v1/systemone` answers invalid
 requests with 422 `detail` arrays and every 503 with 529. Every 503, and every
 529, carries `Retry-After: 1`, unless the engine says when a retry may succeed,
 as `kv_write_budget` does. While the engine restarts (`engine_recovering`,
-`runtime_unavailable`) it is the seconds until the restarted engine should be
-ready, as long after its spawn as the engine before took to start; before the
-spawn, while the restart waits for its backoff or for the engine before to
+`runtime_unavailable`) it is the seconds until the next bound on the restarted
+engine's start: ready as long after its spawn as the engine before took to
+start, then up to 30 s more while it waits for memory the Mac refused, then the
+start's timeout; before the spawn, while the restart waits for its backoff or for the engine before to
 exit, as long after the later of now and the time the restart is due. It is
 at least 1, and at most 59, the longest the JavaScript OpenAI and Anthropic
 SDKs follow. A connection the server refuses before reading any of its
@@ -775,6 +777,7 @@ its path, `/v1/systemone`'s included: OpenAI's `server_error` with code
 | 400 | `invalid_request_error` | A malformed request, or a field Splash cannot honor; the message names it. |
 | 400 | `context_length_exceeded` | The prompt exceeds the context limit, or leaves no room in it for output. |
 | 400 | `capacity_exhausted` | The request cannot fit in memory even alone; retrying fails the same way. |
+| 400 | `request_quarantined` | The engine had started this request at each of two engine failures in a row; Splash refuses it until the server restarts, and retrying fails the same way ([engine restarts](server.md#engine-restarts-and-sleep)). |
 | 400 | `kv_disk_quota` | The request's KV does not fit in memory, and the SSD cache may not hold even its prompt's (`--max-cache-disk`, and the volume's free space); retrying fails the same way. |
 | 401 | `authentication_error` | The API key is missing or wrong. |
 | 403 | `forbidden` | A Host or Origin the server does not serve; the message names the flag that admits it. |
@@ -783,7 +786,7 @@ its path, `/v1/systemone`'s included: OpenAI's `server_error` with code
 | 408 | `request_timeout` | The upload stalled or ran past its time. |
 | 413 | `request_too_large` | The body exceeds `--max-request-size`. |
 | 415 | `invalid_request_error` | The body is not `application/json`, or is compressed. |
-| 500 | `engine_failed` | The engine failed repeatedly and Splash stopped restarting it ([engine restarts](server.md#engine-restarts-and-sleep)). |
+| 500 | `engine_failed` | The engine failed in a way a restart would meet again, and Splash stopped restarting it ([engine restarts](server.md#engine-restarts-and-sleep)). |
 | 500 | `model_result_invalid` | The model produced a non-finite result for this request; others continue ([failures](internals.md#failures-and-crash-traces)). |
 | 500 | `internal_server_error` | A fault in the server, not in the request; the console names the error's type and the server line it arose at. |
 | 501 | `not_implemented` | The request's method is not one the server has. |

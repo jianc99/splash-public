@@ -27,14 +27,6 @@ uint64_t parseMaxMemory(std::string_view value) {
   return result;
 }
 
-// Whether `value` is a context of 1 to the model's own tokens, which
-// `result` then holds.
-bool parseContext(std::string_view value,
-                  const model::ModelCapabilities &capabilities, uint32_t &result) {
-  return parsePositive(value, result) &&
-         result <= capabilities.maximumContextTokens;
-}
-
 // MAX_CONTEXT, zero for auto; the model bounds it (model::servedFor).
 uint32_t parseMaxContext(std::string_view value) {
   if (value == "auto")
@@ -193,17 +185,20 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
   result.modelRoot = requireModelRoot(argv[2]);
   model::ModelDescriptor inspected = model::inspectModelRoot(result.modelRoot);
   result.maxContext = parseMaxContext(argv[3]);
-  try {
-    result.model = model::servedFor(std::move(inspected), result.maxContext);
-  } catch (const std::invalid_argument &error) {
-    throw UsageError(std::string("MAX_CONTEXT: ") + error.what());
-  }
+  // A relaunch serves the model as its first engine did: for that engine's
+  // context, with YaRN past the native window.
   if (relaunchContext) {
     if (result.maxContext)
       throw UsageError("--relaunch-context requires MAX_CONTEXT auto");
-    if (!parseContext(*relaunchContext, result.model.capabilities, result.relaunchContext))
-      throw UsageError("--relaunch-context requires an integer in [1, " +
-                       std::to_string(result.model.capabilities.maximumContextTokens) + "]");
+    if (!parsePositive(*relaunchContext, result.relaunchContext))
+      throw UsageError("--relaunch-context requires a positive integer");
+  }
+  try {
+    result.model = model::servedFor(std::move(inspected),
+                                    relaunchContext ? result.relaunchContext : result.maxContext);
+  } catch (const std::invalid_argument &error) {
+    throw UsageError(std::string(relaunchContext ? "--relaunch-context: " : "MAX_CONTEXT: ") +
+                     error.what());
   }
   result.maxMemoryBytes = parseMaxMemory(argv[4]);
   return result;

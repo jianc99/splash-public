@@ -130,7 +130,10 @@ void NativeRuntime::executionFailed(std::exception_ptr failure) {
     std::rethrow_exception(failure);
   } catch (const metal::MetalBackendError &error) {
     config_.metrics->metalFailed();
-    engineError("metal_execution_failed", error.what());
+    // A command short of GPU memory says nothing about the requests it ran
+    // (server/supervision.py Quarantine counts the other failures).
+    engineError(error.outOfMemory() ? "metal_out_of_memory" : "metal_execution_failed",
+                error.what());
   } catch (const std::exception &error) {
     engineError("engine_execution_failed", error.what());
   } catch (...) {
@@ -138,15 +141,13 @@ void NativeRuntime::executionFailed(std::exception_ptr failure) {
   }
 }
 
-void NativeRuntime::announceReady() {
+void NativeRuntime::announceReady(const protocol::ReadyEvent &ready) {
   if (closeConnection_ || !engineHealthy_) {
     throw std::logic_error("unhealthy engine cannot become ready");
   }
   if (ready_)
     throw std::logic_error("ready was already announced");
-  if (!send(protocol::ReadyEvent{model::ExecutionLimits::maximumBatchWidth,
-                                 config_.engine.maxContext,
-                                 config_.engine.maxImagePatches != 0})) {
+  if (!send(ready)) {
     throw std::runtime_error("failed to serialize ready event");
   }
   ready_ = true;

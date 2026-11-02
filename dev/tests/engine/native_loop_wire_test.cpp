@@ -51,7 +51,7 @@ void testPromptProgress() {
   engine::NativeRuntime &loop = fixture.loop;
   Executor &executor = fixture.executor;
   fixture.clockStep = 0.25;
-  loop.announceReady();
+  loop.announceReady(protocol::peer::kTestReady);
   auto submit = [&](uint64_t id, bool enabled) {
     auto input = request(id);
     input.flags = enabled ? protocol::kReturnProgressFlag : 0;
@@ -144,7 +144,7 @@ void testSnapshotReportsLiveRequests() {
   engine::NativeLoopConfig config;
   LoopFixture fixture(config, {.pages = 512});
   engine::NativeRuntime &loop = fixture.loop;
-  loop.announceReady();
+  loop.announceReady(protocol::peer::kTestReady);
   const auto commandsReady = fixture.executor.holdCommands();
   require(loop.receive(protocol::peer::serialize(request(7, 4))), "request failed");
   require(loop.tick() && loop.commandInFlight(), "prefill was not submitted");
@@ -168,7 +168,7 @@ void testWireLifecycleAndCacheHit() {
   Executor &executor = fixture.executor;
   fixture.clockStep = 0.25;
 
-  loop.announceReady();
+  loop.announceReady(protocol::peer::kTestReady);
   require(loop.receive(protocol::peer::serialize(request(1))),
           "cold request wire failed");
   require(loop.tick() && loop.commandInFlight(),
@@ -231,7 +231,7 @@ void testGenerationPromptBoundsTheReplayState() {
   LoopFixture fixture(config);
   engine::NativeRuntime &loop = fixture.loop;
   fixture.clockStep = 0.25;
-  loop.announceReady();
+  loop.announceReady(protocol::peer::kTestReady);
   for (uint64_t id : {1, 2}) {
     auto input = request(id);
     input.generationPromptTokens = 2;
@@ -258,7 +258,7 @@ void testCacheSaltAndDeduplicationCrossTheWire() {
   LoopFixture fixture(config);
   engine::NativeRuntime &loop = fixture.loop;
   fixture.clockStep = 0.25;
-  loop.announceReady();
+  loop.announceReady(protocol::peer::kTestReady);
   const auto send = [&](protocol::RequestFrame input) {
     require(loop.receive(protocol::peer::serialize(input)), "salted request wire failed");
     runUntilIdle(loop);
@@ -304,7 +304,7 @@ void testRequestFlagsReachTheModel() {
   engine::NativeRuntime &loop = fixture.loop;
   Executor &executor = fixture.executor;
   fixture.clockStep = 0.25;
-  loop.announceReady();
+  loop.announceReady(protocol::peer::kTestReady);
   for (uint64_t id : {1, 2}) {
     auto input = request(id);
     input.flags = id == 2 ? RequestIgnoreEndOfSequence : 0;
@@ -327,7 +327,7 @@ void testSamplingReachesTheModel() {
   engine::NativeRuntime &loop = fixture.loop;
   Executor &executor = fixture.executor;
   fixture.clockStep = 0.25;
-  loop.announceReady();
+  loop.announceReady(protocol::peer::kTestReady);
   auto greedy = request(1);
   greedy.sampling = {0.0f, 1.0f, 0, 1.5f, 0.0f, 1.1f, 0.2f};
   auto sampled = request(2);
@@ -379,7 +379,7 @@ void testRequestErrorKeepsFraming() {
   LoopFixture fixture(config, {}, limits);
   engine::NativeRuntime &loop = fixture.loop;
 
-  loop.announceReady();
+  loop.announceReady(protocol::peer::kTestReady);
   // Errors, completions and status answers so far; every error must be the
   // rejected request's own.
   const auto events = [&] {
@@ -428,7 +428,7 @@ void testCapacityFailureHasOneTerminalFrame() {
   engine::NativeRuntime &loop = fixture.loop;
   fixture.storage.budgetPages = 1;
 
-  loop.announceReady();
+  loop.announceReady(protocol::peer::kTestReady);
   require(loop.receive(protocol::peer::serialize(request(3))),
           "capacity request wire failed");
   runUntilIdle(loop);
@@ -483,7 +483,7 @@ void testCommandWatchdogAndPendingHealthWake() {
       if (watchdog.expired(now / 1000.0))
         throw metal::MetalBackendError("test command completion timeout");
     };
-    loop.announceReady();
+    loop.announceReady(protocol::peer::kTestReady);
     auto input = request(1);
     input.absoluteDeadlineUnixMicros = 601'000'000;
     input.remainingDeadlineMicros = 600'000'000;
@@ -533,7 +533,7 @@ void testDuplicateLiveRequestClosesWithoutAmbiguousError() {
     limits.maxLogicalOutputTokens = 1;
     LoopFixture fixture({}, {}, limits);
     engine::NativeRuntime &loop = fixture.loop;
-    loop.announceReady();
+    loop.announceReady(protocol::peer::kTestReady);
     require(loop.receive(protocol::peer::serialize(request(1))) && loop.tick(),
             "live duplicate fixture did not start");
     require(!loop.receive(
@@ -559,7 +559,7 @@ void testDuplicateLiveRequestClosesWithoutAmbiguousError() {
 void testCancelledIdIsReusableInTheSameInput() {
   LoopFixture fixture;
   engine::NativeRuntime &loop = fixture.loop;
-  loop.announceReady();
+  loop.announceReady(protocol::peer::kTestReady);
   require(loop.receive(protocol::peer::serialize(request(7, 4))) &&
               loop.tick() && loop.tick() && !loop.commandInFlight(),
           "the first request did not start");
@@ -588,7 +588,7 @@ void testControlFailureUsesExecutionBoundary() {
   for (bool metalFailure : {false, true}) {
     LoopFixture fixture;
     engine::NativeRuntime &loop = fixture.loop;
-    loop.announceReady();
+    loop.announceReady(protocol::peer::kTestReady);
     require(loop.runControl([] { return true; }) && loop.engineHealthy(),
             "ordinary deferred control work failed");
     require(!loop.runControl([&]() -> bool {
@@ -632,7 +632,7 @@ void testFrameFailureUsesExecutionBoundary() {
         throw metal::MetalBackendError("status test");
       throw 42;
     };
-    loop.announceReady();
+    loop.announceReady(protocol::peer::kTestReady);
     require(!loop.receive(protocol::peer::serialize(
                 protocol::StatusRequestFrame{77})) &&
                 !loop.engineHealthy() && loop.connectionMustClose(),
@@ -692,7 +692,7 @@ void testAdmissionExceptionStopsTheEngineOnce() {
   LoopFixture fixture;
   engine::NativeRuntime &loop = fixture.loop;
   fixture.executor.beginObserver = [] { throw std::runtime_error("begin failed"); };
-  loop.announceReady();
+  loop.announceReady(protocol::peer::kTestReady);
   require(loop.receive(protocol::peer::serialize(request(1))),
           "admission fixture was refused");
   require(!loop.tick() && !loop.engineHealthy() && loop.connectionMustClose(),
@@ -719,7 +719,7 @@ void testEngineFailureNamesItsReason() {
     engine::NativeRuntime &loop = fixture.loop;
     const std::system_error closed(EPIPE, std::generic_category(),
                                    "write(native output)");
-    loop.announceReady();
+    loop.announceReady(protocol::peer::kTestReady);
     fixture.writeFailure = closed;
     require(!loop.receive(
                 protocol::peer::serialize(protocol::StatusRequestFrame{77})) &&
@@ -732,7 +732,7 @@ void testEngineFailureNamesItsReason() {
   {
     LoopFixture fixture({}, {.pages = 8});
     engine::NativeRuntime &loop = fixture.loop;
-    loop.announceReady();
+    loop.announceReady(protocol::peer::kTestReady);
     const auto frame = protocol::peer::serialize(request(1));
     // A header and one payload byte: the parser's first allocation is the
     // payload buffer, and it fails.
@@ -766,7 +766,7 @@ void testOutOfVocabularyTokensStayRequestScoped() {
   config.engine.vocabularySize = 128;
   LoopFixture fixture(config);
   engine::NativeRuntime &loop = fixture.loop;
-  loop.announceReady();
+  loop.announceReady(protocol::peer::kTestReady);
   std::vector<protocol::RequestFrame> invalid;
   for (uint32_t token : {128U, std::numeric_limits<uint32_t>::max()}) {
     invalid.push_back(request(9));
@@ -798,28 +798,19 @@ void testOutOfVocabularyTokensStayRequestScoped() {
           "invalid tokens reached admission or prevented subsequent completion");
 }
 
-// Whether Ready announces vision for an engine admitting images of up to
-// `maxImagePatches` patches.
-bool announcedVision(uint32_t maxImagePatches) {
+// The loop announces the Ready its start built (engine::readyEventFor), every
+// field as given, once.
+void testAnnounceReadySendsTheReadyItIsGiven() {
   engine::NativeLoopConfig config;
   config.engine.maxContext = 1024;
-  config.engine.maxImagePatches = maxImagePatches;
   LoopFixture fixture(config);
-  engine::NativeRuntime &loop = fixture.loop;
-  loop.announceReady();
+  const protocol::ReadyEvent ready{4, 1000, true, 248'320, {248'044, 248'046}, 9};
+  fixture.loop.announceReady(ready);
   const auto announced = fixture.events();
-  const auto *ready = announced.size() == 1
-                          ? std::get_if<protocol::ReadyEvent>(&announced.front())
-                          : nullptr;
-  require(ready, "announceReady did not send exactly one Ready event");
-  return ready->vision;
-}
-
-void testReadyAnnouncesVisionWhenImagesAreAdmitted() {
-  require(announcedVision(ops::kMaximumImagePatches),
-          "Ready did not announce vision for an engine that admits images");
-  require(!announcedVision(0),
-          "Ready announced vision for an engine serving without it");
+  require(announced.size() == 1 && announced.front() == protocol::EngineEvent{ready},
+          "announceReady did not send exactly the Ready it was given");
+  rejects([&] { fixture.loop.announceReady(ready); }, "ready was already announced",
+          "a second Ready was announced");
 }
 
 // Without vision, or past the server's per-image patch cap, an image request
@@ -835,7 +826,7 @@ void testImageRequestBeyondVisionStaysRequestScoped() {
     config.engine.maxImagePatches = maxImagePatches;
     LoopFixture fixture(config);
     engine::NativeRuntime &loop = fixture.loop;
-    loop.announceReady();
+    loop.announceReady(protocol::peer::kTestReady);
     auto image = request(9);
     image.imageSpans = {{8, 16, 8, 8, 1, 2}};
     image.imagePixels.assign(image.imageSpans[0].pixelBytes(), 1);
@@ -877,7 +868,7 @@ void testStepTokensFitTheWire() {
     Executor &executor = fixture.executor;
     executor.decodeTokens = model::ExecutionLimits::maximumStepTokens;
 
-    loop.announceReady();
+    loop.announceReady(protocol::peer::kTestReady);
     require(loop.receive(
                 protocol::peer::serialize(request(5, executor.decodeTokens))),
             "step request wire failed");
@@ -916,7 +907,7 @@ void testScoreRequestCompletesAfterFullPrompt() {
   config.engine.maxContext = 8192;
   LoopFixture fixture(config, {.pages = 512});
   engine::NativeRuntime &loop = fixture.loop;
-  loop.announceReady();
+  loop.announceReady(protocol::peer::kTestReady);
   require(loop.receive(protocol::peer::serialize(scoreRequest(9, 3000))),
           "score request failed");
   runUntilIdle(loop);
@@ -951,7 +942,7 @@ void testCancelledScoreReturnsEmptyLogits() {
   engine::NativeRuntime &loop = fixture.loop;
   Executor &executor = fixture.executor;
   const auto commandReady = executor.holdCommands();
-  loop.announceReady();
+  loop.announceReady(protocol::peer::kTestReady);
   require(loop.receive(protocol::peer::serialize(scoreRequest(11, 65))),
           "cancel-score request failed");
   require(loop.tick() && loop.commandInFlight(), "score prefill was not held");
@@ -982,7 +973,7 @@ void testPrefillTimeCountsFromTheStart() {
   config.engine.maxContext = 1024;
   LoopFixture fixture(config);
   engine::NativeRuntime &loop = fixture.loop;
-  loop.announceReady();
+  loop.announceReady(protocol::peer::kTestReady);
   fixture.monotonic = -2.0;
   require(loop.receive(protocol::peer::serialize(request(1))), "request wire failed");
   fixture.monotonic = 0.0;
@@ -1025,7 +1016,7 @@ ScoreBesideChat runScoreBesideChat(bool invalidScore) {
   Executor &executor = fixture.executor;
   if (invalidScore)
     executor.invalidScores.insert(21);
-  loop.announceReady();
+  loop.announceReady(protocol::peer::kTestReady);
 
   // Whole KV pages, so the last prompt chunk is the one that publishes the
   // final block: a chunk and a page, whose first command runs the chunk
@@ -1131,7 +1122,7 @@ void testConstrainedMaskExchange() {
     engine::NativeRuntime &loop = fixture.loop;
     Executor &executor = fixture.executor;
     double &now = fixture.monotonic;
-    loop.announceReady();
+    loop.announceReady(protocol::peer::kTestReady);
     const auto send = [&](const protocol::ClientMessage &message) {
       require(loop.receive(protocol::peer::serialize(message)),
               "mask exchange message closed the connection");
@@ -1266,7 +1257,7 @@ std::span<const test::TestCase> wireTests() {
       {"testFrameFailureUsesExecutionBoundary", testFrameFailureUsesExecutionBoundary},
       {"testEngineFailureNamesItsReason", testEngineFailureNamesItsReason},
       {"testOutOfVocabularyTokensStayRequestScoped", testOutOfVocabularyTokensStayRequestScoped},
-      {"testReadyAnnouncesVisionWhenImagesAreAdmitted", testReadyAnnouncesVisionWhenImagesAreAdmitted},
+      {"testAnnounceReadySendsTheReadyItIsGiven", testAnnounceReadySendsTheReadyItIsGiven},
       {"testImageRequestBeyondVisionStaysRequestScoped", testImageRequestBeyondVisionStaysRequestScoped},
       {"testStepTokensFitTheWire", testStepTokensFitTheWire},
       {"testScoreRequestCompletesAfterFullPrompt", testScoreRequestCompletesAfterFullPrompt},

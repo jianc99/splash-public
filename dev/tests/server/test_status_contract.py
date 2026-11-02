@@ -7,18 +7,23 @@ import re
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from dev.tests import native_peer
 from dev.tests.server_fixtures import FakeRuntime, HarnessTestCase
+from server import backend as backend_api
 from server import protocol as wire
+from server import supervision
 from server.chat_format import FLINT, QWEN
 from server.metrics import PROMETHEUS_SERIES, prometheus_metrics
 
 # A representative status document, every section of it set, which
 # runtime_status_test.cpp checks the engine writes.
 GOLDEN = Path(__file__).parents[1] / "engine/status_golden.json"
+# The server's sections of a stopped server's /status, which the app decodes.
+TRANSPORT_GOLDEN = Path(__file__).with_name("status_transport_golden.json")
 # The sections the server adds to the engine's document before it renders it.
-SERVER_SECTIONS = {"transport", "frontend", "response_store"}
+SERVER_SECTIONS = {"capabilities", "transport", "frontend", "response_store"}
 # Leaves of the engine's document that /metrics must export, each by a series
 # of PROMETHEUS_SERIES.
 REQUIRED_EXPORTS = (
@@ -140,6 +145,35 @@ class StatusRouteTests(HarnessTestCase):
                 "status_stale": False,
                 "status_age_ms": 0.0,
             },
+        )
+        # The one capability the app reads: the context served now.
+        self.assertEqual(snapshot["capabilities"], {"max_context_tokens": 128})
+
+    def test_a_stopped_servers_sections_are_the_golden_the_app_reads(self):
+        """What /status says of a server that stopped restarting its engine,
+        as the app decodes it (status_transport_golden.json)."""
+        runtime = FakeRuntime()
+        harness = self.harness(runtime, max_context=131072)
+        runtime.ready = False
+        refused = wire.StartFailedEvent(
+            wire.StartFailureKind.CONFIGURATION,
+            wire.ShortfallBound.DEVICE_MEMORY,
+            0,
+            0,
+            0,
+            b"--kv-format bf16 is refused",
+        )
+        with mock.patch.object(backend_api, "print_status"):
+            harness.backend._failed(
+                "Engine restart failed",
+                supervision.EngineFailure(
+                    "start_failed", "--kv-format bf16 is refused", 0.0, start=refused
+                ),
+            )
+        snapshot = json.loads(harness.request("GET", "/status")[2])
+        self.assertEqual(
+            {key: snapshot[key] for key in ("capabilities", "transport")},
+            json.loads(TRANSPORT_GOLDEN.read_text()),
         )
 
     def test_metrics_route_renders_the_engine_status(self):

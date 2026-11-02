@@ -5,9 +5,11 @@
 #include <array>
 #include <cmath>
 #include <limits>
+#include <span>
 #include <sstream>
 #include <thread>
 #include <utility>
+#include <variant>
 
 namespace splash::engine {
 namespace {
@@ -33,6 +35,7 @@ reportForResourceFailure(const RuntimeResourcesError &error) {
   report.resourceFailure = error.failure();
   report.message = error.what();
   report.budgetDescription = error.budgetDescription();
+  report.shortfall = error.shortfall();
   return report;
 }
 
@@ -117,6 +120,55 @@ protocol::ProtocolLimits protocolLimitsFor(
   return limits;
 }
 
+protocol::ReadyEvent readyEventFor(const model::ModelDescriptor &model,
+                                   const EngineConfig &engine,
+                                   const protocol::ProtocolLimits &limits) {
+  const std::span<const uint32_t> stops = std::visit(
+      [](const auto &layout) { return layout.stopTokens.tokens(); }, model.target);
+  return {.maxConcurrentRequests = model::ExecutionLimits::maximumBatchWidth,
+          .maxContextTokens = engine.maxContext,
+          .vision = engine.maxImagePatches != 0,
+          .vocabularySize = model.capabilities.vocabularySize,
+          .stopTokens = {stops.begin(), stops.end()},
+          .maskRows = limits.maxSimulationTokens + 1};
+}
+
+protocol::StartFailedEvent startFailedEvent(const RuntimeBootstrapReport &report) {
+  using Kind = protocol::StartFailureKind;
+  Kind kind = Kind::Internal;
+  if (report.commandOutOfMemory)
+    kind = Kind::CommandMemory;
+  else if (report.shortfall)
+    // A context refusal names the context its plan holds, at least one token.
+    kind = report.shortfall->planContextTokens ? Kind::ContextBudget : Kind::MemoryBudget;
+  else if (report.resourceFailure == RuntimeResourceFailure::HostCapacity)
+    kind = Kind::HostMemory;
+  else if (report.resourceFailure == RuntimeResourceFailure::DriverAllocation)
+    kind = Kind::DriverAllocation;
+  else if (report.resourceFailure == RuntimeResourceFailure::EngineCapacity)
+    // The budget refused an allocation; no plan numbers.
+    kind = Kind::MemoryBudget;
+  else if (report.resourceStage)
+    switch (*report.resourceStage) {
+    case RuntimeResourceStage::Configuration:
+      kind = Kind::Configuration;
+      break;
+    case RuntimeResourceStage::CapabilityValidation:
+      kind = Kind::Device;
+      break;
+    case RuntimeResourceStage::ModelLoading:
+      kind = Kind::Model;
+      break;
+    case RuntimeResourceStage::MemoryPlanning:
+      kind = Kind::MemoryBudget;
+      break;
+    case RuntimeResourceStage::BackendCreation:
+    case RuntimeResourceStage::StorageAllocation:
+      break;
+    }
+  return {kind, report.shortfall.value_or(protocol::StartShortfall{}), report.message};
+}
+
 RuntimeBootstrap::RuntimeBootstrap(std::unique_ptr<RuntimeResources> resources,
                                    std::unique_ptr<model::RuntimeModel> modelRuntime,
                                    std::unique_ptr<NativeRuntime> nativeLoop,
@@ -159,7 +211,8 @@ void RuntimeBootstrap::sampleThermalState() {
 
 RuntimeBootstrapReport RuntimeBootstrap::requireWarmupAndAnnounce(
     const EngineMemoryPlan &memoryPlan, model::RuntimeModel &modelRuntime, KvPool &kvPool,
-    ActualMemoryReporter memoryReporter, NativeRuntime &nativeLoop) {
+    ActualMemoryReporter memoryReporter, NativeRuntime &nativeLoop,
+    const protocol::ReadyEvent &ready) {
   RuntimeBootstrapReport report = reportForPlan(memoryPlan);
   auto run = [&](RuntimeBootstrapStage stage, WarmupStepStatus &status,
                  auto &&operation, bool optional = false) {
@@ -172,6 +225,11 @@ RuntimeBootstrapReport RuntimeBootstrap::requireWarmupAndAnnounce(
         return model::WarmupStepResult{};
       }
       report.resourceFailure = resourceAllocationFailure(error.failure());
+      fail(report, stage,
+           std::string(runtimeBootstrapStageName(stage)) +
+               " threw: " + error.what());
+    } catch (const metal::MetalBackendError &error) {
+      report.commandOutOfMemory = error.outOfMemory();
       fail(report, stage,
            std::string(runtimeBootstrapStageName(stage)) +
                " threw: " + error.what());
@@ -256,7 +314,7 @@ RuntimeBootstrapReport RuntimeBootstrap::requireWarmupAndAnnounce(
   }
 
   try {
-    nativeLoop.announceReady();
+    nativeLoop.announceReady(ready);
   } catch (const std::exception &error) {
     fail(report, RuntimeBootstrapStage::AnnounceReady,
          std::string("ReadyEvent announcement failed: ") + error.what());
@@ -291,8 +349,8 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
   if (!config.nativeLoop.engine.maxContext && relaunchContext) {
     // A relaunch serves the context of the server's first engine, which its
     // split left. A plan that holds less, as once this Mac's memory budget
-    // shrank, has the relaunch serve that, and the server, which serves the
-    // first engine's context, stops relaunching (server/runtime.py).
+    // shrank, has the relaunch serve that, and the server adopts it from
+    // Ready (server/runtime.py).
     if (relaunchContext > planContext)
       logLine("The memory plan holds ", planContext, " tokens of context, less than the ",
               relaunchContext, " the server's first engine served.");
@@ -306,14 +364,17 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
     // --max-memory sets the budget only below this Mac's own; the SSD cache's
     // room bounds a context whose KV spills (ContextBounds::bound).
     const auto &budget = resources->memoryPlan().breakdown();
-    const bool memoryCapped = budget.configuredMemoryLimitBytes &&
-                              budget.hardBudgetBytes == budget.configuredMemoryLimitBytes;
+    const protocol::ShortfallBound bound =
+        budget.contextBounds.bound() == "disk"
+            ? protocol::ShortfallBound::Disk
+            : memoryBound(budget.configuredMemoryLimitBytes, budget.hardBudgetBytes);
+    base.shortfall = protocol::StartShortfall{.bound = bound, .planContextTokens = planContext};
     fail(std::move(base), RuntimeBootstrapStage::ModelCreation,
          "--max-context " + std::to_string(config.nativeLoop.engine.maxContext) +
              " exceeds the " + std::to_string(planContext) + " tokens the model and " +
-             (budget.contextBounds.bound() == "disk" ? "the SSD cache's room for its KV"
-              : memoryCapped                         ? "--max-memory"
-                                                     : "this Mac's memory") +
+             (bound == protocol::ShortfallBound::Disk        ? "the SSD cache's room for its KV"
+              : bound == protocol::ShortfallBound::MaxMemory ? "--max-memory"
+                                                             : "this Mac's memory") +
              " allow; omit it or pass at most " + std::to_string(planContext));
   }
   config.nativeLoop.engine.vocabularySize =
@@ -359,6 +420,12 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
     fail(std::move(base), RuntimeBootstrapStage::ModelCreation,
          "modelRuntime creation failed with an unknown exception");
   }
+  // The parser and engine consume the same resolved ceiling. In automatic
+  // mode it cannot be known until resource planning has measured the device.
+  const protocol::ProtocolLimits limits = protocolLimitsFor(
+      config.resources.model.capabilities, config.nativeLoop.engine.maxContext);
+  const protocol::ReadyEvent ready =
+      readyEventFor(config.resources.model, config.nativeLoop.engine, limits);
   std::unique_ptr<NativeRuntime> nativeLoop;
   try {
     connectToGovernor(config.nativeLoop.engine, resources->memoryGovernor());
@@ -375,13 +442,9 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
         .admit = resources->memoryGovernor().allocationAdmission(),
         .idleReleaseMilliseconds = 1000.0 * config.resources.idleReleaseSeconds};
     config.nativeLoop.engineFailed = [owner = resources.get()] { owner->engineFailed(); };
-    // The parser and engine consume the same resolved ceiling. In automatic
-    // mode it cannot be known until resource planning has measured the device.
     nativeLoop = std::make_unique<NativeRuntime>(
         config.nativeLoop, resources->cache(),
-        *modelRuntime, std::move(output), std::move(statusProvider),
-        protocolLimitsFor(config.resources.model.capabilities,
-                          config.nativeLoop.engine.maxContext));
+        *modelRuntime, std::move(output), std::move(statusProvider), limits);
   } catch (const metal::MetalAllocationError &error) {
     base.resourceFailure = resourceAllocationFailure(error.failure());
     fail(std::move(base), RuntimeBootstrapStage::ModelCreation,
@@ -425,7 +488,7 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
         resourcesPointer->memoryGovernor().growToTargets(loopPointer->monotonicMilliseconds());
         return report;
       },
-      *nativeLoop);
+      *nativeLoop, ready);
 
   // The per-operation guard RuntimeResources installed is only for startup:
   // once Ready, the engine meets memory pressure between its ticks.

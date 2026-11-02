@@ -284,6 +284,11 @@ id<MTLLibrary> loadLibrary(id<MTLDevice> device, const std::string &metallibPath
 
 }  // namespace
 
+bool commandOutOfMemory(NSError *error) noexcept {
+    return error && [error.domain isEqualToString:MTLCommandBufferErrorDomain] &&
+           error.code == MTLCommandBufferErrorOutOfMemory;
+}
+
 struct AllocationAccounting {
     std::atomic<uint64_t> allocatedBytes{0};
     std::atomic<uint64_t> peakAllocatedBytes{0};
@@ -514,9 +519,10 @@ struct BackendAsyncState {
 // the work after it waits for. A shared event holds the value written last,
 // and a GPU signal can land after a later value the CPU wrote to the same
 // event (M5 Max, macOS 27: about once in a million steps), which puts it back
-// and holds the work waiting for the CPU's value until Metal fails it after 5
-// s ("Caused GPU Timeout Error"). Past ranEvent of a step that keeps the GPU
-// awake the runner raises the backend's release counter to the step's value,
+// and holds the work waiting for the CPU's value until Metal fails it after
+// supervision::kGpuWaitLimit ("Caused GPU Timeout Error"). Past ranEvent of a
+// step that keeps the GPU awake the runner raises the backend's release
+// counter to the step's value,
 // which ends the GPU's spin through it (host_step_wait), and then runs the
 // step's `then` once its work returned. Each step runs unless the command
 // buffer before it failed or an earlier step of its command did not run or
@@ -775,6 +781,8 @@ struct CommandTicket::State {
     std::vector<id<MTLCommandBuffer>> leadingCommands;
     std::shared_ptr<HostSteps> hostSteps;
     std::string error;
+    // The failure was a command buffer's want of GPU memory.
+    bool outOfMemory = false;
     bool completed = false;
     bool released = false;
 
@@ -824,10 +832,10 @@ struct CommandTicket::State {
             }
         }
 
-        finish(timing, std::move(error));
+        finish(timing, std::move(error), host.empty() && failed && commandOutOfMemory(failed.error));
     }
 
-    void finish(CommandTiming result, std::string failure) {
+    void finish(CommandTiming result, std::string failure, bool failedOutOfMemory) {
         CommandCompletion notify;
         {
             std::lock_guard lock(mutex);
@@ -838,6 +846,7 @@ struct CommandTicket::State {
             if (!failure.empty()) backend->markUnhealthy(failure);
             timing = result;
             error = std::move(failure);
+            outOfMemory = failedOutOfMemory;
             completed = true;
             notify = completion;
         }
@@ -1756,13 +1765,15 @@ CommandTiming CommandTicket::wait() {
     }
     CommandTiming timing;
     std::string error;
+    bool outOfMemory = false;
     {
         std::lock_guard lock(state_->mutex);
         timing = state_->timing;
         error = state_->error;
+        outOfMemory = state_->outOfMemory;
     }
     state_->release();
-    if (!error.empty()) throw MetalBackendError(error);
+    if (!error.empty()) throw MetalBackendError(error, outOfMemory);
     return timing;
 }
 

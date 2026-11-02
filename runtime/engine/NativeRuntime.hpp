@@ -81,7 +81,8 @@ public:
     core_.seedCost(warmups, load);
   }
 
-  void announceReady();
+  // Sends `ready` (readyEventFor), once, and starts the idle release's count.
+  void announceReady(const protocol::ReadyEvent &ready);
 
   [[nodiscard]] bool connectionMustClose() const noexcept {
     return closeConnection_;

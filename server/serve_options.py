@@ -20,11 +20,8 @@ from .http_security import validate_api_key
 from .protocol import MAX_THINKING_END_TOKENS
 
 REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
-# The targets' native window, the most context without --max-context, and
-# the most context --max-context takes, which YaRN stretches the native window
-# to and Qwen validates (QwenTargetDimensions::nativeContextTokens,
-# yarnContextTokens).
-MAX_CONTEXT_TOKENS = 262144
+# The most context --max-context takes, which YaRN stretches the targets'
+# native window to and Qwen validates (QwenTargetDimensions::yarnContextTokens).
 MAX_YARN_CONTEXT_TOKENS = 1010000
 # The suffixes of a --max-context: K, 1024 tokens, and M, a million.
 _CONTEXT_UNITS = {"K": 1024, "M": 1000000}
@@ -482,7 +479,8 @@ SERVE_OPTIONS = (
             "experts from the SSD when a token routes them; off loads every "
             "expert (default: auto, which loads them all where memory holds "
             "them, and otherwise gives them what the context leaves, giving "
-            "back down to 85%% of their slots)",
+            "back down to their floor while requests need it; see streamed "
+            "experts)",
         ),
     ),
     ServeOption(

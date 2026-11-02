@@ -1,4 +1,6 @@
+import contextlib
 import io
+import json
 import math
 import signal
 import tempfile
@@ -7,7 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from dev.tests.server_fixtures import main_args, unprepared_hold
+from dev.tests.server_fixtures import engine_ready, main_args, unprepared_hold
 from install import families
 from server import diagnostics
 from server import protocol as native_wire
@@ -16,15 +18,15 @@ from server.origins import ANY_ORIGIN
 
 # Templates whose probe found no close of thinking: the close alone ends it.
 NO_THINKING_END = {"return_value.select.return_value.thinking_end": None}
+# The goldens the app reads the server's records by.
+GOLDEN = Path(__file__).parent
 
 
 class ServerMainTests(unittest.TestCase):
     def test_sigterm_uses_the_normal_main_cleanup_path(self):
         args = main_args()
         runtime = mock.Mock()
-        runtime.readiness = native_wire.ReadyEvent(
-            max_concurrent_requests=4, max_context_tokens=262144, vision=False
-        )
+        runtime.capabilities = engine_ready(262144)
         backend = mock.Mock()
         server = mock.Mock(server_port=8000)
         tokenizer = object()
@@ -62,6 +64,7 @@ class ServerMainTests(unittest.TestCase):
                 api.AutoTokenizer, "from_pretrained", return_value=tokenizer
             ),
             mock.patch.object(api, "validate_tokenizer"),
+            mock.patch.object(api, "check_capabilities"),
             mock.patch.object(api, "ChatTemplates", **NO_THINKING_END),
             mock.patch.object(
                 api.engine_runtime, "MultiplexedRuntime", return_value=runtime
@@ -87,15 +90,12 @@ class ServerMainTests(unittest.TestCase):
         runtime.kill.assert_called_once_with()
         command = ["splash", "serve-native", "model", "auto", "auto"]
         runtime_type.assert_called_once_with(
-            command,
-            relaunch_command=mock.ANY,
-            startup_timeout=api.NATIVE_START_TIMEOUT,
-            pending_limit=1,
+            command, relaunch_command=mock.ANY, pending_limit=1
         )
-        # Every relaunch keeps the context the first engine served.
+        # Every relaunch asks for the context the first engine served.
         relaunch_command = runtime_type.call_args.kwargs["relaunch_command"]
         self.assertEqual(
-            relaunch_command(native_wire.ReadyEvent(4, 61433, False)),
+            relaunch_command(engine_ready(61433)),
             [*command, "--relaunch-context", "61433"],
         )
         backend_type.assert_called_once_with(
@@ -104,10 +104,8 @@ class ServerMainTests(unittest.TestCase):
             request_logger=diagnostics.print_request,
             thinking_end=None,
         )
-        self.assertEqual(app_type.call_args.args[3], 262144)
         # No --request-timeout, no deadline.
-        self.assertEqual(app_type.call_args.args[4], math.inf)
-        self.assertEqual(app_type.call_args.args[5], 4)
+        self.assertEqual(app_type.call_args.args[3], math.inf)
         runtime.wait_ready.assert_called_once_with()
         server.serve_forever.assert_called_once()
         server.server_close.assert_called_once()
@@ -121,7 +119,7 @@ class ServerMainTests(unittest.TestCase):
         for vision in (True, False):
             with self.subTest(vision=vision):
                 runtime = mock.Mock()
-                runtime.readiness = native_wire.ReadyEvent(4, 131072, vision)
+                runtime.capabilities = engine_ready(131072, vision=vision)
                 with (
                     mock.patch.object(api, "parse_args", return_value=args),
                     unprepared_hold(),
@@ -130,6 +128,7 @@ class ServerMainTests(unittest.TestCase):
                         api.AutoTokenizer, "from_pretrained", return_value=object()
                     ),
                     mock.patch.object(api, "validate_tokenizer"),
+                    mock.patch.object(api, "check_capabilities"),
                     mock.patch.object(
                         api, "ChatTemplates", **NO_THINKING_END
                     ) as templates_type,
@@ -150,7 +149,6 @@ class ServerMainTests(unittest.TestCase):
                     mock.patch.object(api, "print_status") as status,
                 ):
                     api.main()
-                self.assertIs(app_type.call_args.kwargs["vision"], vision)
                 self.assertIs(
                     app_type.call_args.kwargs["chat_templates"],
                     templates_type.return_value,
@@ -170,57 +168,108 @@ class ServerMainTests(unittest.TestCase):
                     status.call_args_list,
                 )
 
-    def test_main_serves_the_context_it_asked_for(self):
-        # The engine announces --max-context as given, past the native window
-        # too, where YaRN serves it; without it, a context the native window
-        # holds, which the automatic context never passes.
-        for max_context, window, served in (
-            (1010000, 1010000, True),
-            (300000, 300000, True),
-            (1000000, 1010000, False),
-            (300000, 262144, False),
-            (None, 262144, True),
-            (None, 262145, False),
-        ):
-            with self.subTest(max_context=max_context, window=window):
+    def main_starting(self, args, runtime, tokenizer=None):
+        """main() over a runtime stand-in, its prints captured: its patches."""
+        return (
+            mock.patch.object(api, "parse_args", return_value=args),
+            unprepared_hold(),
+            mock.patch.object(api, "load_thinking_key", return_value=None),
+            mock.patch.object(
+                api.AutoTokenizer, "from_pretrained", return_value=tokenizer or object()
+            ),
+            mock.patch.object(api, "validate_tokenizer"),
+            mock.patch.object(api, "ChatTemplates", **NO_THINKING_END),
+            mock.patch.object(
+                api.engine_runtime, "MultiplexedRuntime", return_value=runtime
+            ),
+            mock.patch.object(api, "NativeBackend"),
+            mock.patch.object(api, "ConstraintFactory"),
+            mock.patch.object(api, "Frontend"),
+            mock.patch.object(
+                api, "FrontendServer", return_value=mock.Mock(server_port=8000)
+            ),
+            mock.patch.object(api.signal, "signal"),
+            mock.patch.object(api.os, "getpid", return_value=4242),
+        )
+
+    def test_main_serves_the_context_the_engine_announces(self):
+        """The engine is authoritative for its context: it refuses a
+        --max-context it cannot serve, and the server serves what it
+        announces, past the native window too."""
+        for max_context, window in ((1010000, 1010000), (None, 262144)):
+            with self.subTest(max_context=max_context):
                 runtime = mock.Mock()
-                runtime.readiness = native_wire.ReadyEvent(4, window, False)
-                with (
-                    mock.patch.object(
-                        api,
-                        "parse_args",
-                        return_value=main_args(max_context=max_context),
-                    ),
-                    unprepared_hold(),
-                    mock.patch.object(api, "load_thinking_key", return_value=None),
-                    mock.patch.object(
-                        api.AutoTokenizer, "from_pretrained", return_value=object()
-                    ),
-                    mock.patch.object(api, "validate_tokenizer"),
-                    mock.patch.object(api, "ChatTemplates", **NO_THINKING_END),
-                    mock.patch.object(
-                        api.engine_runtime, "MultiplexedRuntime", return_value=runtime
-                    ),
-                    mock.patch.object(api, "NativeBackend"),
-                    mock.patch.object(api, "ConstraintFactory"),
-                    mock.patch.object(api, "Frontend") as app_type,
-                    mock.patch.object(
-                        api, "FrontendServer", return_value=mock.Mock(server_port=8000)
-                    ),
-                    mock.patch.object(api.signal, "signal"),
-                    mock.patch.object(api, "print_status") as status,
-                ):
-                    if served:
-                        api.main()
-                        self.assertEqual(app_type.call_args.args[3], window)
-                    else:
-                        with self.assertRaises(SystemExit):
-                            api.main()
-                        status.assert_any_call(
-                            "Error · native runtime reported an invalid context window",
-                            error=True,
-                        )
-                        app_type.assert_not_called()
+                runtime.capabilities = engine_ready(window)
+                with contextlib.ExitStack() as stack:
+                    for patch in self.main_starting(
+                        main_args(max_context=max_context), runtime
+                    ):
+                        stack.enter_context(patch)
+                    stack.enter_context(mock.patch.object(api, "check_capabilities"))
+                    status = stack.enter_context(mock.patch.object(api, "print_status"))
+                    api.main()
+                context = "1,010,000" if window == 1010000 else "256K"
+                status.assert_any_call(
+                    f"Ready · test-model · context {context} · text only"
+                    " · http://127.0.0.1:8000"
+                )
+
+    def test_main_checks_the_tokenizer_against_the_engines_ready(self):
+        """Once the engine is Ready, a tokenizer whose stop texts are not its
+        stop tokens fails the start, naming both."""
+        runtime = mock.Mock()
+        runtime.capabilities = engine_ready(131072)
+        tokenizer = mock.Mock(eos_token_id=248046)
+        tokenizer.get_vocab.return_value = {"<|im_end|>": 248046, "x": 1}
+        tokenizer.encode.side_effect = lambda text, **_: {
+            "<|endoftext|>": [248045],
+            "<|im_end|>": [248046],
+        }[text]
+        with contextlib.ExitStack() as stack:
+            for patch in self.main_starting(main_args(), runtime, tokenizer):
+                stack.enter_context(patch)
+            status = stack.enter_context(mock.patch.object(api, "print_status"))
+            with self.assertRaises(SystemExit):
+                api.main()
+        status.assert_any_call(
+            "Error · the tokenizer encodes the stop texts ('<|endoftext|>', "
+            "'<|im_end|>') as tokens (248045, 248046), but the native model "
+            "stops at (248044, 248046)",
+            error=True,
+        )
+
+    def test_a_start_writes_its_serve_record(self):
+        """The record says the server is starting, then, for a start the
+        engine refuses, the engine's class and numbers, as the app reads them
+        (serve_record_golden.json)."""
+        record = Path(self.enterContext(tempfile.TemporaryDirectory())) / "s.json"
+        golden = json.loads((GOLDEN / "serve_record_golden.json").read_text())
+        failure = golden["failure"]
+        event = native_wire.StartFailedEvent(
+            native_wire.StartFailureKind.MEMORY_BUDGET,
+            native_wire.ShortfallBound.MAX_MEMORY,
+            failure["required_bytes"],
+            failure["budget_bytes"],
+            failure["plan_context_tokens"],
+            failure["message"].encode(),
+        )
+        runtime = mock.Mock()
+        phases = []
+
+        def refuse():
+            phases.append(json.loads(record.read_text()))
+            raise api.engine_runtime.EngineStartFailed(event)
+
+        runtime.wait_ready.side_effect = refuse
+        with contextlib.ExitStack() as stack:
+            for patch in self.main_starting(main_args(serve_record=record), runtime):
+                stack.enter_context(patch)
+            stack.enter_context(mock.patch.object(api, "print_status"))
+            with self.assertRaises(SystemExit):
+                api.main()
+        self.assertEqual(phases, [{"pid": 4242, "phase": "starting"}])
+        self.assertEqual(json.loads(record.read_text()), golden)
+        self.assertEqual(list(record.parent.iterdir()), [record])
 
     def test_main_wires_allowed_origins_and_warns_without_a_key(self):
         warning = mock.call(
@@ -235,9 +284,7 @@ class ServerMainTests(unittest.TestCase):
         ):
             with self.subTest(origins=origins, key=key):
                 runtime = mock.Mock()
-                runtime.readiness = native_wire.ReadyEvent(
-                    max_concurrent_requests=4, max_context_tokens=131072, vision=False
-                )
+                runtime.capabilities = engine_ready(131072)
                 with (
                     mock.patch.object(
                         api,
@@ -250,6 +297,7 @@ class ServerMainTests(unittest.TestCase):
                         api.AutoTokenizer, "from_pretrained", return_value=object()
                     ),
                     mock.patch.object(api, "validate_tokenizer"),
+                    mock.patch.object(api, "check_capabilities"),
                     mock.patch.object(api, "ChatTemplates", **NO_THINKING_END),
                     mock.patch.object(
                         api.engine_runtime,
@@ -287,6 +335,7 @@ class ServerMainTests(unittest.TestCase):
                 api.AutoTokenizer, "from_pretrained", return_value=object()
             ),
             mock.patch.object(api, "validate_tokenizer"),
+            mock.patch.object(api, "check_capabilities"),
             mock.patch.object(api, "ChatTemplates", **NO_THINKING_END),
             mock.patch.object(
                 api.engine_runtime, "MultiplexedRuntime", return_value=runtime
@@ -316,6 +365,7 @@ class ServerMainTests(unittest.TestCase):
                 return_value=SimpleNamespace(chat_template=None),
             ),
             mock.patch.object(api, "validate_tokenizer"),
+            mock.patch.object(api, "check_capabilities"),
             mock.patch.object(api.engine_runtime, "MultiplexedRuntime") as runtime,
             mock.patch.object(api, "FrontendServer", return_value=server),
             mock.patch.object(api.signal, "signal"),
@@ -359,7 +409,7 @@ class ServerMainTests(unittest.TestCase):
         link.parent.mkdir()
         link.symlink_to(served, target_is_directory=True)
         runtime = mock.Mock()
-        runtime.readiness = native_wire.ReadyEvent(4, 131072, False)
+        runtime.capabilities = engine_ready(131072)
         held = []
 
         def start(command, **options):
@@ -380,6 +430,7 @@ class ServerMainTests(unittest.TestCase):
                 api.assembly, "family", return_value=families.named("Qwen3.8-27B")
             ),
             mock.patch.object(api, "validate_tokenizer"),
+            mock.patch.object(api, "check_capabilities"),
             mock.patch.object(api, "ChatTemplates", **NO_THINKING_END),
             mock.patch.object(
                 api.engine_runtime, "MultiplexedRuntime", side_effect=start
@@ -403,7 +454,7 @@ class ServerMainTests(unittest.TestCase):
         command = runtime_type.call_args.args[0]
         relaunch = runtime_type.call_args.kwargs["relaunch_command"]
         self.assertEqual(command[2], str(served))
-        self.assertEqual(relaunch(runtime.readiness)[2], str(served))
+        self.assertEqual(relaunch(runtime.capabilities)[2], str(served))
 
     def test_main_refuses_a_directory_that_names_no_prepared_model(self):
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))

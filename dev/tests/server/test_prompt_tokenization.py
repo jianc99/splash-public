@@ -15,9 +15,9 @@ from tokenizers import (
 )
 from transformers import PreTrainedTokenizerFast
 
+from dev.tests.server_fixtures import NATIVE_CONTEXT
 from server import judgments
 from server.chat_format import QWEN
-from server.serve_options import MAX_CONTEXT_TOKENS
 from server.tokenization import PromptTokenizer, tokenizable
 
 
@@ -48,7 +48,7 @@ class PromptTokenizationTests(unittest.TestCase):
     def setUp(self):
         self.tokenizer = tokenizer()
         self.cache = PromptTokenizer(
-            self.tokenizer, QWEN.message_boundary, MAX_CONTEXT_TOKENS
+            self.tokenizer, QWEN.message_boundary, NATIVE_CONTEXT
         )
         self.assertTrue(self.cache.enabled)
 
@@ -144,7 +144,7 @@ class PromptTokenizationTests(unittest.TestCase):
         ):
             with self.subTest(name):
                 self.assertEqual(
-                    PromptTokenizer(t, QWEN.message_boundary, MAX_CONTEXT_TOKENS).split(
+                    PromptTokenizer(t, QWEN.message_boundary, NATIVE_CONTEXT).split(
                         text
                     ),
                     ([], text),
@@ -281,7 +281,7 @@ class PromptTokenizationTests(unittest.TestCase):
                     )
                 else:
                     t.backend_tokenizer.model.dropout = 0.1
-                cache = PromptTokenizer(t, QWEN.message_boundary, MAX_CONTEXT_TOKENS)
+                cache = PromptTokenizer(t, QWEN.message_boundary, NATIVE_CONTEXT)
                 self.assertFalse(cache.enabled)
                 if mode == "dropout":
                     # Check fallback rather than comparing two random encodes.
@@ -296,9 +296,7 @@ class PromptTokenizationTests(unittest.TestCase):
         self.tokenizer.backend_tokenizer.add_special_tokens(
             [AddedToken("hello<|im_end", normalized=False)]
         )
-        cache = PromptTokenizer(
-            self.tokenizer, QWEN.message_boundary, MAX_CONTEXT_TOKENS
-        )
+        cache = PromptTokenizer(self.tokenizer, QWEN.message_boundary, NATIVE_CONTEXT)
         self.assertTrue(cache.enabled)
         text = "Hello world!" * 500 + "hello<|im_end|>suffix"
         self.assert_encoding(text, cache)
@@ -314,7 +312,7 @@ class PromptTokenizationTests(unittest.TestCase):
         )
         backend.add_special_tokens([AddedToken("<|im_end|>", normalized=False)])
         t = PreTrainedTokenizerFast(tokenizer_object=backend)
-        cache = PromptTokenizer(t, QWEN.message_boundary, MAX_CONTEXT_TOKENS)
+        cache = PromptTokenizer(t, QWEN.message_boundary, NATIVE_CONTEXT)
         self.assertFalse(cache.enabled)
         prefix, tail = "hello world " * 500 + "<|im_end|>", "tail"
         expected = t(prefix + tail, add_special_tokens=False)["input_ids"]

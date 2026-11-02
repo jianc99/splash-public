@@ -3,6 +3,7 @@
 #include "engine/Json.hpp"
 #include "engine/RuntimeResources.hpp"
 #include "model/Runtime.hpp"
+#include "Supervision.hpp"
 #include "PrefillWork.hpp"
 #include "TranscriptPrompts.hpp"
 
@@ -964,7 +965,7 @@ int main(int argc, char **argv) {
     // engine's memory settles, retries as serve's does (main.mm): within the
     // same window, opened at its first such refusal.
     std::unique_ptr<engine::RuntimeBootstrap> bootstrap;
-    engine::StartupRetryWindow recovery(engine::kStartupMemoryRecoveryTimeout);
+    engine::StartupRetryWindow recovery(supervision::kStartRetryWindow);
     std::optional<AwakeClock::time_point> firstRefusal;
     while (!bootstrap) {
       try {

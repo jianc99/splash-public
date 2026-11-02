@@ -4397,11 +4397,11 @@ int main(int argc, char **argv) {
     // any is loaded; it can refuse a model production starts. As a start
     // retries a refusal of host memory, the oracle waits for that memory,
     // measuring every kStartupMemoryRecoveryPoll for up to
-    // kStartupMemoryRecoveryTimeout: macOS can return the memory of a process
+    // supervision::kStartRetryWindow: macOS can return the memory of a process
     // that has just exited a moment later, so a run that starts as a server
     // stops can find it still held.
     const uint64_t weightBytes = tools::weightBytes(modelRoot, descriptor, loadOptions);
-    const auto memoryDeadline = AwakeClock::now() + kStartupMemoryRecoveryTimeout;
+    const auto memoryDeadline = AwakeClock::now() + supervision::kStartRetryWindow;
     bool reportedMemoryWait = false;
     while (true) {
       const std::optional<HostMemory> host = queryHostMemory();

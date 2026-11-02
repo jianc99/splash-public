@@ -288,7 +288,7 @@ void testControlWaitsForTheCommandInFlight() {
     harness.transport.requestShutdown();
     return false;
   });
-  harness.loop.announceReady();
+  harness.loop.announceReady(protocol::peer::kTestReady);
   writeAll(harness.pipes.input[1],
            protocol::peer::serialize(requestFrame(7, 30'000'000)));
   auto loop = start(harness);
@@ -361,7 +361,7 @@ void testLoopWakesForAnEngineDeadline() {
       },
       test::readyStatusJson, protocol::ProtocolLimits{}};
   storage.commandInFlight = [&] { return loop.commandInFlight(); };
-  loop.announceReady();
+  loop.announceReady(protocol::peer::kTestReady);
   const auto wire = protocol::peer::serialize(requestFrame(5, 20'000));
   require(write(pipes.input[1], wire.data(), wire.size()) ==
               static_cast<ssize_t>(wire.size()),
@@ -625,7 +625,7 @@ void testFlushEndsOrStopsAtItsDeadline() {
             "a flush with nothing waiting did not end");
   }
   PersistentHarness harness;
-  harness.loop.announceReady();
+  harness.loop.announceReady(protocol::peer::kTestReady);
   protocol::RequestFrame frame = requestFrame(1, 30'000'000);
   frame.promptTokens.assign(2060, 7);
   require(harness.loop.receive(protocol::peer::serialize(frame)), "the request was refused");

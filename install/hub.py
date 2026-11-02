@@ -79,16 +79,42 @@ def reason(error) -> str:
     return message
 
 
+def failure_kind(error) -> str | None:
+    """What the app words a Hub, network or disk failure by
+    (models.ModelError.kind): no such repository, no connection, access
+    denied, or a full disk; None for any other."""
+    import httpx
+    from huggingface_hub.errors import HfHubHTTPError, RepositoryNotFoundError
+
+    status = (
+        error.response.status_code
+        if isinstance(error, HfHubHTTPError) and error.response is not None
+        else None
+    )
+    if isinstance(error, RepositoryNotFoundError) or status == 404:
+        return "not_found"
+    if status in (401, 403):
+        return "auth"
+    if isinstance(error, (httpx.ConnectError, httpx.TimeoutException)):
+        return "offline"
+    if isinstance(error, OSError) and error.errno == errno.ENOSPC:
+        return "disk"
+    return None
+
+
 @contextmanager
 def as_model_errors(context: str):
     """Report a Hub, network or cache failure in the block as a ModelError,
-    "context: reason", which callers print without a traceback."""
+    "context: reason", which callers print without a traceback, classed for
+    the app (failure_kind)."""
     import httpx
 
     try:
         yield
     except (OSError, httpx.HTTPError) as error:
-        raise models.ModelError(f"{context}: {reason(error)}") from error
+        raise models.ModelError(
+            f"{context}: {reason(error)}", kind=failure_kind(error)
+        ) from error
 
 
 def folder_name(repo_id: str) -> str:

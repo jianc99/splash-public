@@ -16,6 +16,7 @@ from tokenizers import Tokenizer, decoders, models
 from dev.tests import native_peer
 from dev.tests.server_fixtures import (
     FOREVER,
+    READY,
     FakeFactory,
     FakeRuntime,
     byte_alphabet,
@@ -30,7 +31,7 @@ from server import diagnostics, images, runtime
 from server import errors as api_errors
 from server import protocol as wire
 from server.chat_format import QWEN
-from server.runtime import STATUS_ANSWER_LIMIT_SECONDS
+from server.supervision import THRESHOLDS
 
 
 class DigitTokenizer:
@@ -228,7 +229,7 @@ class NativeBackendContractTests(unittest.TestCase):
         self.assertEqual(constraint.mask_calls, [(), tuple(range(8))])
 
         with self.assertRaises(api_errors.ConstraintError):
-            generation_constraints.TokenConstraint(None, None, QWEN).masks(
+            generation_constraints.TokenConstraint(None, None, READY).masks(
                 tuple(range(9))
             )
 
@@ -651,7 +652,7 @@ class NativeBackendContractTests(unittest.TestCase):
 
     def test_token_constraint_consumes_committed_batches_only_at_mask_or_finish(self):
         matcher = FakeMatcher()
-        constraint = generation_constraints.TokenConstraint(matcher, None, QWEN)
+        constraint = generation_constraints.TokenConstraint(matcher, None, READY)
         constraint.commit((7, 8))
         constraint.commit((9,))
         self.assertEqual(matcher.consumed, [])
@@ -826,7 +827,7 @@ class NativeBackendContractTests(unittest.TestCase):
             )
             self.assertTrue(transport.is_ready())
 
-            clock[0] += STATUS_ANSWER_LIMIT_SECONDS
+            clock[0] += THRESHOLDS.status_answer
             status = transport.status(timeout=0.01)
             self.assertFalse(status["ready"])
             self.assertTrue(status["transport"]["status_stale"])
@@ -838,7 +839,9 @@ class NativeBackendContractTests(unittest.TestCase):
         self.assertTrue(transport.status()["ready"])
         native.mode = "status_timeout"
         with mock.patch.object(backend_api, "print_status"):
-            transport._engine_failed(runtime.EngineUnhealthy("gpu fault"), 120.0)
+            transport._engine_failed(
+                runtime.EngineUnhealthy("gpu fault"), 120.0, frozenset(), None
+            )
             # The relaunch succeeds; its status refresh is not answered.
             self.wait_for_recovery(transport)
         self.assertTrue(native.ready)
@@ -856,7 +859,9 @@ class NativeBackendContractTests(unittest.TestCase):
             if not answered:
                 answered.append(event)
                 native.ready = False
-                transport._engine_failed(runtime.EngineUnhealthy("gpu fault"), 120.0)
+                transport._engine_failed(
+                    runtime.EngineUnhealthy("gpu fault"), 120.0, frozenset(), None
+                )
             return decode(event)
 
         with (
@@ -932,7 +937,7 @@ class NativeBackendContractTests(unittest.TestCase):
             release.set()
             self.wait_for_recovery(transport)
             self.assertIsNone(transport.status_unanswered_since)
-            clock[0] += STATUS_ANSWER_LIMIT_SECONDS
+            clock[0] += THRESHOLDS.status_answer
             native.mode = "status_timeout_once"
             # One missed probe later on is a busy loop, not a wedged one.
             self.assertTrue(transport.status()["ready"])
@@ -958,7 +963,7 @@ class NativeBackendContractTests(unittest.TestCase):
             self.assertTrue(transport.status()["ready"])
             self.wait_for_recovery(transport)
             self.assertIsNone(transport.status_unanswered_since)
-            clock[0] += STATUS_ANSWER_LIMIT_SECONDS
+            clock[0] += THRESHOLDS.status_answer
             self.assertTrue(transport.status()["ready"])
             self.wait_for_recovery(transport)
 

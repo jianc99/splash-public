@@ -1,5 +1,6 @@
 import _thread
 import contextlib
+import errno
 import fcntl
 import hashlib
 import inspect
@@ -332,6 +333,36 @@ class DownloadTest(unittest.TestCase):
             (self.snapshot / name).unlink()
         self.download()
         self.assertEqual([path.exists() for path in live], [False, False])
+
+
+class FailureKindTest(unittest.TestCase):
+    def test_hub_failures_carry_their_kind(self):
+        """A Hub, network or disk failure says which, as the app words it."""
+        import httpx
+        from huggingface_hub.errors import HfHubHTTPError, RepositoryNotFoundError
+
+        request = httpx.Request("GET", f"https://huggingface.co/api/models/{REPO}")
+
+        def refused(status, kind=HfHubHTTPError):
+            return kind("refused", response=httpx.Response(status, request=request))
+
+        for error, kind in (
+            (refused(401, RepositoryNotFoundError), "not_found"),
+            (refused(404), "not_found"),
+            (refused(401), "auth"),
+            (refused(403), "auth"),
+            (httpx.ConnectError("no route", request=request), "offline"),
+            (httpx.ReadTimeout("slow", request=request), "offline"),
+            (OSError(errno.ENOSPC, "No space left on device"), "disk"),
+            (OSError(errno.EACCES, "Permission denied"), None),
+            (refused(500), None),
+        ):
+            with self.subTest(error=error):
+                with self.assertRaises(hub.models.ModelError) as caught:
+                    with hub.as_model_errors(f"cannot install {REPO}"):
+                        raise error
+                self.assertEqual(caught.exception.kind, kind)
+                self.assertTrue(str(caught.exception).startswith("cannot install"))
 
 
 if __name__ == "__main__":
