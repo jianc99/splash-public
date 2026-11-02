@@ -544,6 +544,17 @@ public:
   [[nodiscard]] uint32_t pendingPages(kv::PageForm form) const noexcept;
   // The bytes the KV pool's extents take, of every form.
   [[nodiscard]] uint64_t allocatedBytes() const noexcept { return pool_.allocatedBytes(); }
+  // The bytes one page of the form takes.
+  [[nodiscard]] uint64_t bytesPerPage(kv::PageForm form) const noexcept { return pool_.bytesPerPage(form); }
+  // The free Index pages, the runway's among them, beyond those the copies
+  // in flight that spill as they land and the copies Spill requests owe
+  // land into: the pages a lane's conversion to Spill can land into now.
+  [[nodiscard]] uint32_t indexLandingPages() const;
+  // What the KV tier's transfers read and wrote, and how long they took
+  // (KvTier::throughput); zeros without a tier.
+  [[nodiscard]] KvTierThroughput tierThroughput() const noexcept {
+    return tier_ ? tier_->throughput() : KvTierThroughput{};
+  }
   // Between commands, with a window: moves to the Slim form every Full page
   // no row will read whole again: every request that holds it has
   // published windowPages blocks past it (its next command's rows, at or

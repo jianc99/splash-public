@@ -1,5 +1,6 @@
 #include "CostSeeds.hpp"
 #include "EngineTestSupport.hpp"
+#include "MemoryPasses.hpp"
 #include "TestChecks.hpp"
 #include "TestEngine.hpp"
 #include "TestExecutor.hpp"
@@ -692,7 +693,7 @@ void testAResumeThatConvertsTakesItsReplaysPagesAsItRuns() {
   // Memory shrinks to 72 Full pages, which hold a prefill command's 64 and
   // not the 80 it held: a critical pass releases what the cache held.
   spill.storage.budgetPages = 72;
-  static_cast<void>(spill.engine.reclaimMemory({.critical = true}));
+  static_cast<void>(test::criticalPass(*spill.settings.governor));
   spill.model.resumeDenied = false;
   spill.runUntilIdle();
   const SpillRequestsSnapshot counts = spill.engine.snapshot().spill;
@@ -1535,9 +1536,8 @@ void testARefusedStartTakesWhatItsConversionFreed() {
 }
 
 // A lane whose admission is not complete, its state's restore from the SSD
-// cache in flight, holds the chain it restores, which only its admission's
-// own conversion counts: a pass the host is short for converts no such lane,
-// and the store gives its chunk back.
+// cache in flight, holds the chain it restores: a host claim the host is
+// short for converts no such lane (EngineVictims).
 void testALaneBeingAdmittedDoesNotConvert() {
   Spilling spill(1024, true, 100'000, 0, Spilling::Extent{16});
   // Every state goes straight to the SSD.
@@ -1556,11 +1556,8 @@ void testALaneBeingAdmittedDoesNotConvert() {
   spill.engine.submit(request(2, history));
   spill.runUntil([&] { return spill.model.diskReads > reads; }, "the follow-up did not restore its state");
   spill.tier.writableFile = true;
-  spill.model.expertChunks = {1000};
-  static_cast<void>(spill.engine.reclaimMemory(
-      {.targetBytes = 100'000, .upTo = ReclaimClass::Ordinary, .hostShort = true}));
-  require(spill.engine.snapshot().spill.converted == 0 && spill.model.releasedExpertChunks.size() == 1,
-          "a pass converted a lane whose admission was not complete");
+  static_cast<void>(test::hostPass(*spill.settings.governor, 100'000));
+  require(spill.engine.snapshot().spill.converted == 0, "a pass converted a lane whose admission was not complete");
   spill.model.restoreControl->ready = true;
   spill.runUntilIdle();
   require(spill.events.failedCount == 0, "the follow-up failed");
@@ -1606,7 +1603,7 @@ void testALoneSpillLaneWaitsForItsOwnCopies() {
           continue;
         spill.tier.complete();
         if (each.governorCollects && !spill.engine.commandInFlight())
-          static_cast<void>(spill.engine.reclaimMemory({.targetBytes = 1'000'000'000}));
+          spill.engine.collectLandings(spill.now);
       }
       require(done(), message);
     };
@@ -1912,10 +1909,56 @@ void testFailedRestoreReturnsTheCommitment() {
           "the start did not run from the prefix that remained");
 }
 
+// Placement reads the memory there is now, not the plan's share for
+// resident KV (M-P5): a prompt whose Resident KV is past that share starts
+// Resident while the governor finds room for it beside the lanes' growth.
+void testPlacementReadsLiveRoom() {
+  // The plan leaves resident KV 20 pages; forty pages and a token of prompt
+  // and a token of output project 41 Full pages (4,100 bytes), of which a
+  // Spill lane keeps 10 Full and 31 as Index pages (1,310 bytes).
+  Spilling spill(1024, false, 20 * 100);
+  spill.engine.submit(Spilling::prompt(1, 1, 40, 1));
+  spill.runUntilIdle();
+  const SpillRequestsSnapshot counts = spill.engine.snapshot().spill;
+  require(counts.resident == 1 && counts.spill == 0 && spill.events.failedCount == 0,
+          "a prompt the live room held spilled by the plan's share for resident KV");
+}
+
+// It spills where the room the governor finds for its Resident KV, at a
+// cost below what spilling costs it, falls short.
+void testPlacementSpillsWhatTheLiveRoomCannotHold() {
+  test::FakeMemory memory({});
+  metal::MetalBackend backend("");
+  std::optional<MemoryGovernor> governor = test::governorOver(backend, memory, {.limitBytes = 3'000});
+  Spilling spill(1024, false, 20 * 100, 0, {4}, 0, {}, &*governor);
+  spill.engine.submit(Spilling::prompt(1, 1, 40, 1));
+  spill.runUntilIdle();
+  const SpillRequestsSnapshot counts = spill.engine.snapshot().spill;
+  require(counts.resident == 0 && counts.spill == 1 && spill.events.failedCount == 0,
+          "a prompt the live room did not hold started Resident");
+}
+
+// Spill never takes more memory than Resident (amend/M.md B13): a prompt
+// whose pages a Spill lane keeps Full all the same (its dense history, tail
+// window and prefill groups) starts Resident, past the plan's share too.
+void testPlacementNeverSpillsWhenSpillTakesMore() {
+  // Resident KV holds 2 pages; five pages and a token of prompt and a token
+  // of output project 6 pages, all of which a Spill lane keeps Full.
+  Spilling spill(1024, false, 2 * 100);
+  spill.engine.submit(Spilling::prompt(1, 1, 5, 1));
+  spill.runUntilIdle();
+  const SpillRequestsSnapshot counts = spill.engine.snapshot().spill;
+  require(counts.resident == 1 && counts.spill == 0 && spill.events.failedCount == 0,
+          "a prompt whose Spill footprint is no smaller than its Resident one spilled");
+}
+
 } // namespace
 
 std::span<const test::TestCase> spillTests() {
   static constexpr test::TestCase kTests[] = {
+      {"testPlacementReadsLiveRoom", testPlacementReadsLiveRoom},
+      {"testPlacementSpillsWhatTheLiveRoomCannotHold", testPlacementSpillsWhatTheLiveRoomCannotHold},
+      {"testPlacementNeverSpillsWhenSpillTakesMore", testPlacementNeverSpillsWhenSpillTakesMore},
       {"testUnwritableTierKeepsRequestsResident", testUnwritableTierKeepsRequestsResident},
       {"testAdmissionSpillsWhatMemoryCannotHold", testAdmissionSpillsWhatMemoryCannotHold},
       {"testSpillCommitmentCoversTheChainWithoutCopies", testSpillCommitmentCoversTheChainWithoutCopies},

@@ -182,6 +182,8 @@ inline engine::EngineRequest constrainedRequest(uint64_t id, double deadline = 1
 // the tokens of resident KV's pages. The tier's transfers land as the
 // fixture ticks on, and decode runs to each request's output limit. The
 // tier's write budget, if a test sets one, refills on the fixture's clock.
+// Its engine's governor is `governor` where the test gives one, else an
+// ample one (test::engineConfig).
 struct Spilling {
   // The pages of an extent, of a type of its own for a call to name.
   struct Extent final {
@@ -191,16 +193,16 @@ struct Spilling {
   // (Executor::groupRows, passes), which the engine takes as it is built.
   explicit Spilling(uint32_t slots, bool always = true, uint64_t residentKvBytes = 100'000,
                     uint32_t residentTokens = 0, Extent extent = {4}, uint64_t laneReadBytes = 0,
-                    const std::function<void(Executor &)> &shape = {})
+                    const std::function<void(Executor &)> &shape = {}, engine::MemoryGovernor *governor = nullptr)
       : storage(256, 100, extent.pages, 10),
         budget(std::make_shared<model::DiskBudget>(uint64_t{slots} * 100, [this] { return now; })),
         cache(pool, &tier, budget, engine::CacheSpillPolicy{1, 1}),
-        engine((shape ? shape(model) : void(),
-                config(always, residentKvBytes,
-                       residentTokens ? residentTokens
-                                      : static_cast<uint32_t>(residentKvBytes / 100 * engine::KvCache::pageTokens),
-                       &paused, &serving, laneReadBytes)),
-               cache, model, events) {
+        settings((shape ? shape(model) : void(),
+                  config(always, residentKvBytes,
+                         residentTokens ? residentTokens
+                                        : static_cast<uint32_t>(residentKvBytes / 100 * engine::KvCache::pageTokens),
+                         &paused, &serving, laneReadBytes, governor))),
+        engine(settings, cache, model, events) {
     tier.budget = budget;
     tier.transferLimit = 1024;
     require(static_cast<bool>(pool.fillRunway(kv::PageForm::Index)),
@@ -210,8 +212,9 @@ struct Spilling {
   }
 
   static engine::EngineConfig config(bool always, uint64_t residentKvBytes, uint32_t residentTokens,
-                                     const bool *paused, bool *serving, uint64_t laneReadBytes) {
-    engine::EngineConfig result = test::engineConfig();
+                                     const bool *paused, bool *serving, uint64_t laneReadBytes,
+                                     engine::MemoryGovernor *governor) {
+    engine::EngineConfig result = test::engineConfig({.governor = governor});
     result.growthPaused = [paused] { return *paused; };
     result.serving = [serving](bool value) { return std::exchange(*serving, value); };
     result.spill = {.capable = true,
@@ -265,6 +268,8 @@ struct Spilling {
   // service needs (EngineConfig::serving).
   bool paused = false;
   bool serving = false;
+  // The engine's config, its governor among it.
+  engine::EngineConfig settings;
   engine::Engine engine;
   double now = 1;
 };

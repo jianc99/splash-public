@@ -1,5 +1,6 @@
 #include "CostSeeds.hpp"
 #include "EngineTestSupport.hpp"
+#include "MemoryPasses.hpp"
 #include "TestChecks.hpp"
 #include "TestEngine.hpp"
 #include "TestExecutor.hpp"
@@ -429,7 +430,8 @@ void testLaterPassesFollowEveryLanesMovedPages() {
     return test::CommandTimes{(3400.0 + rows * 1500.0 / 2048) / plan.passes, 3400.0 / plan.passes};
   };
   Events events;
-  engine::Engine engine(test::engineConfig(), cache, model, events);
+  const EngineConfig config = test::engineConfig();
+  engine::Engine engine(config, cache, model, events);
   guardReleases(storage, engine);
   test::seedAsStartup(engine, model);
   double now = 1;
@@ -445,7 +447,7 @@ void testLaterPassesFollowEveryLanesMovedPages() {
             "the two prompts did not run a pass of their command");
   require(prefills.back() == std::pair{std::vector<uint64_t>{3, 2}, 0u}, "the two prompts did not share a command");
   const uint64_t revision = cache.pageTable(2).revision;
-  static_cast<void>(engine.reclaimMemory({.critical = true}));
+  static_cast<void>(test::criticalPass(*config.governor));
   const CacheSnapshot reclaimed = cache.snapshot();
   require(reclaimed.pool.extentCompactions == 1 && reclaimed.pool.extentReleases == 1 &&
               cache.pageTable(2).revision > revision,
@@ -840,9 +842,7 @@ void testALaneThatConvertsMidPromptRunsPrefillGroups() {
   spill.engine.submit(Spilling::prompt(1, 1, 128, 1));
   spill.runUntil([&] { return spill.model.prefillChunks[1] == 1 && !spill.engine.commandInFlight(); },
                  "the prompt's first chunk did not run");
-  require(spill.engine.reclaimMemory({.targetBytes = 1'000'000, .upTo = ReclaimClass::Ordinary,
-                                      .hostShort = true})
-                  .outcome == ReclaimOutcome::Pending &&
+  require(test::hostPass(*spill.settings.governor, 1'000'000).outcome == FreeOutcome::Pending &&
               spill.engine.snapshot().spill.converted == 1,
           "the short pass did not convert the prompt's lane");
   // Its pages spill as their copies land, before its next command: its
@@ -873,8 +873,7 @@ void testALaneThatTakesSpilledBlocksAsItPrefillsRunsPrefillGroups() {
   spill.engine.submit(std::move(spilling));
   spill.runUntil([&] { return spill.events.outputs[1].size() >= 2 && !spill.engine.commandInFlight(); },
                  "the first request did not decode");
-  static_cast<void>(spill.engine.reclaimMemory(
-      {.targetBytes = 1'000'000, .upTo = ReclaimClass::Ordinary, .hostShort = true}));
+  static_cast<void>(test::hostPass(*spill.settings.governor, 1'000'000));
   spill.runUntil([&] { return spill.cache.spillSnapshot().spilledPages == 10; },
                  "the converted request's pages did not spill");
   // Its eight pages, then 120 pages and a token: three chunks, the first of
@@ -931,8 +930,7 @@ void testALaneBetweenItsPassesDoesNotConvert() {
                !spill.engine.commandInFlight();
       },
       "the lane did not run its command's first pass");
-  static_cast<void>(spill.engine.reclaimMemory(
-      {.targetBytes = 100'000, .upTo = ReclaimClass::Ordinary, .hostShort = true}));
+  static_cast<void>(test::hostPass(*spill.settings.governor, 100'000));
   require(spill.engine.snapshot().spill.converted == 1, "a lane between its passes converted to Spill");
   spill.runUntilIdle();
   require(spill.events.failedCount == 0 && spill.events.completedCount == 3,
@@ -981,8 +979,7 @@ void testNoLaneOfACommandBetweenItsPassesConverts() {
                !spill.engine.commandInFlight();
       },
       "the two lanes did not share a command in passes");
-  static_cast<void>(spill.engine.reclaimMemory(
-      {.targetBytes = 100'000, .upTo = ReclaimClass::Ordinary, .hostShort = true}));
+  static_cast<void>(test::hostPass(*spill.settings.governor, 100'000));
   require(spill.engine.snapshot().spill.converted == 1, "a lane between its command's passes converted to Spill");
   spill.runUntilIdle();
   require(spill.events.failedCount == 0 && spill.events.completedCount == 4,

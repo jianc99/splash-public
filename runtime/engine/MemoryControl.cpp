@@ -2,31 +2,9 @@
 
 #include "StderrLine.hpp"
 
-#include <algorithm>
-#include <optional>
 #include <sstream>
 
 namespace splash::engine {
-
-namespace {
-
-// While one lives, the governor's growth admission counts the bytes an
-// exchange returned to the system as the host's already
-// (MemoryGovernor::setGrowthCredit). It restores the credit it found.
-class GrowthCredit final {
-public:
-  GrowthCredit(MemoryGovernor &governor, uint64_t bytes) noexcept
-      : governor_(governor), previous_(governor.setGrowthCredit(bytes)) {}
-  ~GrowthCredit() { static_cast<void>(governor_.setGrowthCredit(previous_)); }
-  GrowthCredit(const GrowthCredit &) = delete;
-  GrowthCredit &operator=(const GrowthCredit &) = delete;
-
-private:
-  MemoryGovernor &governor_;
-  uint64_t previous_;
-};
-
-} // namespace
 
 std::string MemoryStatusReporter::update(const ResourceWaitSnapshot &wait,
                                          bool hostGrowthAllowed) {
@@ -54,88 +32,17 @@ bool MemoryControl::run(MemoryPressure pressure) {
   loop_.releaseIdleWeights();
   governor_.setPressure(pressure);
   const double now = loop_.monotonicMilliseconds();
-  // Requests held back by a refusal wait for memory too, the refused one
-  // included while a pass defers it.
-  const ResourceWaitSnapshot wait = loop_.resourceWaitSnapshot();
-  const bool requestWaiting = wait.memory || wait.suspended || wait.heldBehindRefusal;
-  governor_.setRequestWaiting(requestWaiting);
+  loop_.collectLandings(now);
+  loop_.refreshMemoryRates(now);
   static_cast<void>(backend_.refreshMemoryStats());
-  const MemoryGovernorSnapshot memory = governor_.evaluate();
-  const std::string diagnostic = reporter_.update(wait, memory.hostGrowthAllowed);
+  static_cast<void>(governor_.evaluate());
+  const std::string diagnostic =
+      reporter_.update(loop_.resourceWaitSnapshot(), governor_.admits(ClaimClass::Growth));
   if (!diagnostic.empty())
     logLine(diagnostic);
-  const std::optional<MemoryReclaimDirective> directive =
-      policy_.update(memory, now, requestWaiting);
-  noteExpertReleases(now);
-  // A pass the host is short for may take the store's chunks, and takes none
-  // back. Any other takes one back before its reclaim: under macOS's warning
-  // alone the cache the pass gives back buys it first, the store ranking
-  // above that cache.
-  if (!directive || !directive->hostShort)
-    growExperts(memory, requestWaiting, now);
-  if (!directive)
-    return false;
-  const MemoryReclaimResult reclaim = loop_.reclaimMemory(*directive);
-  noteExpertReleases(now);
-  policy_.reclaimed(*directive, reclaim);
-  governor_.reclaimed(reclaim.outcome);
+  const bool again = governor_.controlPass(now);
   static_cast<void>(backend_.refreshMemoryStats());
-  // What transfers held back continues at the next command-free point.
-  return reclaim.outcome == ReclaimOutcome::Pending;
-}
-
-void MemoryControl::noteExpertReleases(double now) {
-  const uint64_t releases = loop_.expertReleases();
-  if (releases == expertReleases_)
-    return;
-  expertReleases_ = releases;
-  if (expertGrowthMilliseconds_ && now - *expertGrowthMilliseconds_ < expertCooldownMilliseconds_)
-    expertCooldownMilliseconds_ =
-        std::min(2 * expertCooldownMilliseconds_, kExpertGrowthCooldownLimitMilliseconds);
-  expertGrowthMilliseconds_.reset();
-  expertReleaseMilliseconds_ = now;
-}
-
-void MemoryControl::growExperts(const MemoryGovernorSnapshot &memory, bool requestWaiting,
-                                double now) {
-  if (expertGrowthMilliseconds_ && now - *expertGrowthMilliseconds_ >= expertCooldownMilliseconds_) {
-    expertGrowthMilliseconds_.reset();
-    expertCooldownMilliseconds_ = kExpertGrowthCooldownMilliseconds;
-  }
-  // A host short of its warning margin takes no chunk back, in the passes
-  // that answer it and between them.
-  if (requestWaiting || memory.hostHeadroomBytes < kHostWarningMarginBytes ||
-      (expertReleaseMilliseconds_ && now - *expertReleaseMilliseconds_ < expertCooldownMilliseconds_))
-    return;
-  const uint64_t bytes = loop_.expertGrowthBytes();
-  if (!bytes)
-    return;
-  // What the chunk lacks of the host's headroom beyond the recovery margin,
-  // in the pass's sample, or of the room the engine's limit has free,
-  // whichever lacks more: what the engine returns adds to both. The engine
-  // returns it first, or nothing when what leaves at once falls short, and
-  // the chunk waits. Under macOS's warning, which holds back growth that
-  // adds to the host's footprint (hostGrowthAllowed), the chunk takes none
-  // of the host's headroom: the engine returns all of it first, and the
-  // footprint stays where it was. A chunk refused after all leaves what the
-  // engine returned with the system.
-  const uint64_t spare =
-      memory.hostGrowthAllowed
-          ? memory.hostHeadroomBytes - std::min(memory.hostHeadroomBytes, kHostRecoveryMarginBytes)
-          : 0;
-  const uint64_t lacking = bytes - std::min({bytes, spare, memory.headroomBytes});
-  const uint64_t returned = lacking ? loop_.reclaimForExperts(lacking) : 0;
-  bool grown = false;
-  if (returned >= lacking) {
-    // The admission samples the host again, which may not show yet what the
-    // engine returned: the credit counts it as the host's.
-    const GrowthCredit credit(governor_, returned);
-    grown = loop_.growExperts(memory.headroomBytes + returned);
-  }
-  if (grown)
-    expertGrowthMilliseconds_ = now;
-  if (grown || returned)
-    static_cast<void>(backend_.refreshMemoryStats());
+  return again;
 }
 
 } // namespace splash::engine

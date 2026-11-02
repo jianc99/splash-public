@@ -1,5 +1,6 @@
 #include "CostSeeds.hpp"
 #include "EngineTestSupport.hpp"
+#include "MemoryPasses.hpp"
 #include "TestCache.hpp"
 #include "TestChecks.hpp"
 #include "TestEngine.hpp"
@@ -806,253 +807,6 @@ void testOneCommandCapturesSeveralLanesStates() {
   require(counters.junctionMaterializations == 1 && counters.replayStatePublications == 3 &&
               counters.resources.stateCache.entries == 4 && events.completedCount == 3,
           "the states one command captured were not all published");
-}
-
-// A pressure pass without a byte target keeps the caches the model can
-// rebuild and returns only its idle buffers; a targeted pass takes the
-// caches one at a time and stops once its target is met.
-void testPressurePassKeepsCachesWithoutATarget() {
-  test::TestKvStorage storage(8, 4096, 4);
-  KvPool pool(storage, 0);
-  engine::Cache resources(pool, nullptr, nullptr);
-  Executor executor(1);
-  Events events;
-  engine::Engine engine(test::engineConfig(), resources, executor, events);
-  guardReleases(storage, engine);
-  executor.reclaimableIdleStateBytes = 64;
-  executor.cacheUnits = {100, 100, 100};
-  static_cast<void>(engine.reclaimMemory({}));
-  require(executor.reclaimedIdleStateBytes == 64 && executor.cacheReclaims == 0 &&
-              executor.cacheUnits.size() == 3,
-          "a pass without a target took the model's caches");
-  const MemoryReclaimResult targeted = engine.reclaimMemory({.targetBytes = 150});
-  require(executor.cacheReclaims == 2 && executor.cacheUnits.size() == 1 &&
-              targeted.releasedBytes >= 200,
-          "a targeted pass did not stop taking caches at its target");
-}
-
-// Rows only a cached state held become a cache unit once a pass evicts that
-// state, and a pass whose target is still unmet takes them as well.
-void testPressurePassTakesTheRowsItsEvictionsLeave() {
-  test::TestKvStorage storage(8, 4096, 4);
-  KvPool pool(storage, 0);
-  Executor executor(1);
-  engine::Cache resources(pool, nullptr, nullptr);
-  Events events;
-  engine::Engine engine(test::engineConfig(), resources, executor, events);
-  guardReleases(storage, engine);
-  executor.stateHeldRows = 100;
-  engine.submit(request(29, std::vector<uint32_t>(65, 29)));
-  runUntilIdle(engine);
-  require(resources.snapshot().stateCache.entries == 1 && executor.cacheUnits.empty(),
-          "setup did not cache a state holding rows");
-  const MemoryReclaimResult critical = engine.reclaimMemory({.critical = true});
-  require(resources.snapshot().stateCache.entries == 0 && executor.cacheUnits.empty() &&
-              critical.releasedBytes >= 164,
-          "a critical pass left the rows of the state it evicted");
-}
-
-void testPressureReclaimRespectsStateLifetimes() {
-  test::TestKvStorage storage(8, 4096, 4);
-  KvPool pool(storage, 0);
-  engine::Cache resources(pool, nullptr, nullptr);
-  Executor executor(1);
-  Events events;
-  engine::Engine engine(test::engineConfig(), resources, executor, events);
-  guardReleases(storage, engine);
-
-  engine.submit(request(27, std::vector<uint32_t>(65, 27)));
-  runUntilIdle(engine);
-  const auto cached = resources.snapshot();
-  require(cached.stateCache.entries == 1 && cached.pool.pagesPrefix == 2,
-          "pressure setup did not retain KV and composite state");
-
-  // A shrink that nothing is waiting for stops at the resume point. Freeing
-  // its cell gains the host a little; the next request pays a full replay.
-  static_cast<void>(engine.reclaimMemory({.targetBytes = 64, .keepResumePoint = true}));
-  require(resources.snapshot().stateCache.entries == 1,
-          "a speculative shrink discarded the only resume point");
-
-  executor.reclaimableIdleStateBytes = 128;
-  const MemoryReclaimResult first = engine.reclaimMemory({.targetBytes = 64});
-  require(first.releasedBytes >= 128 && first.outcome == ReclaimOutcome::Met &&
-              executor.reclaimedIdleStateBytes == 128,
-          "pressure reclaim did not release idle state buffers first");
-  require(
-      resources.snapshot().stateCache.entries == 1,
-      "pressure reclaim evicted a cached state before satisfying its target");
-
-  // Drain the extents the test starts with but does not use, then prove cached
-  // state is the next lifecycle selected while its parent KV remains usable.
-  require(engine.reclaimMemory({}).outcome == ReclaimOutcome::Untargeted,
-          "a pass without a target reported one");
-  const MemoryReclaimResult state = engine.reclaimMemory({.targetBytes = 64});
-  require(state.releasedBytes >= 64 && state.outcome == ReclaimOutcome::Met,
-          "pressure reclaim did not release immutable cached state");
-  const auto stateEvicted = resources.snapshot();
-  require(stateEvicted.stateCache.entries == 0 &&
-              stateEvicted.pool.pagesPrefix == 2,
-          "cached-state eviction incorrectly removed target KV");
-
-  require(engine.reclaimMemory({.critical = true}).outcome == ReclaimOutcome::Exhausted,
-          "evicting everything left something to reclaim");
-  const auto critical = resources.snapshot();
-  require(critical.stateCache.entries == 0 && critical.pool.pagesPrefix == 0 &&
-              critical.pool.allocatedBytes == 0,
-          "critical pressure left evictable cached state or KV extents");
-  const MemoryReclaimResult empty = engine.reclaimMemory({.targetBytes = 64});
-  require(!empty.releasedBytes && empty.outcome == ReclaimOutcome::Exhausted,
-          "an empty cache did not report reclaim exhausted");
-}
-
-// Pressure short of critical takes cached state and KV but keeps what a
-// request starts from without allocating: a lane's pooled buffers and one
-// empty extent, for the request that arrives while the host is short.
-// Critical pressure takes those too.
-void testWarningReclaimKeepsTheServingFootprint() {
-  test::TestKvStorage storage(8, 4096, 4);
-  KvPool pool(storage, 0);
-  engine::Cache resources(pool, nullptr, nullptr);
-  Executor executor(1);
-  Events events;
-  engine::Engine engine(test::engineConfig(), resources, executor, events);
-  guardReleases(storage, engine);
-
-  engine.submit(request(28, std::vector<uint32_t>(65, 28)));
-  runUntilIdle(engine);
-  constexpr uint64_t extentBytes = 4 * 4096;
-  require(resources.snapshot().pool.allocatedBytes == extentBytes,
-          "footprint setup did not keep one allocated extent of cached KV");
-
-  static_cast<void>(
-      engine.reclaimMemory({.targetBytes = std::numeric_limits<uint64_t>::max()}));
-  const auto warning = resources.snapshot();
-  require(executor.keptLane && warning.stateCache.entries == 0 &&
-              warning.pool.pagesPrefix == 0 &&
-              warning.pool.allocatedBytes == extentBytes,
-          "warning pressure did not keep only the serving footprint");
-
-  static_cast<void>(engine.reclaimMemory({.critical = true}));
-  require(!executor.keptLane &&
-              resources.snapshot().pool.allocatedBytes == 0,
-          "critical pressure kept the serving footprint");
-}
-
-// A pass counts only memory that leaves the engine. A warning pass that
-// evicts a cached state while the lane's pooled buffers are short gains the
-// host nothing: the state's buffers refill them. The pass goes on to the
-// cached KV and releases the extent that empties, keeping the empty one the
-// next request starts from.
-void testWarningReclaimCountsOnlyWhatReachesTheHost() {
-  test::TestKvStorage storage(8, 4096, 4);
-  KvPool pool(storage, 0);
-  engine::Cache resources(pool, nullptr, nullptr);
-  Executor executor(1);
-  Events events;
-  engine::Engine engine(test::engineConfig(), resources, executor, events);
-  guardReleases(storage, engine);
-  engine.submit(request(1, std::vector<uint32_t>(129, 1)));
-  runUntilIdle(engine);
-  constexpr uint64_t extentBytes = 4 * 4096;
-  require(resources.snapshot().stateCache.bytes == 64 &&
-              resources.snapshot().pool.allocatedBytes == 2 * extentBytes &&
-              resources.snapshot().pool.reclaimableBytes == extentBytes,
-          "fixture did not cache a state and an extent of KV beside the runway");
-  // The lane's pooled buffers went back to the host earlier.
-  executor.laneFootprintBytes = 64;
-  const MemoryReclaimResult result = engine.reclaimMemory({.targetBytes = 64});
-  require(result.releasedBytes == extentBytes && result.outcome == ReclaimOutcome::Met &&
-              executor.pooledLaneBytes == 64 &&
-              resources.snapshot().stateCache.entries == 0 &&
-              resources.snapshot().pool.allocatedBytes == extentBytes,
-          "a warning pass counted a state whose buffers stayed in the engine");
-}
-
-// Memory a pass frees but keeps still wakes the requests waiting for memory.
-// A start the host refused can start from the lane's pooled buffers; a
-// warning pass that refills them from an evicted state releases nothing,
-// and the start retries at once rather than after its backoff.
-void testWarningReclaimWakesARefusedStart() {
-  test::TestKvStorage storage(8, 4096, 4);
-  KvPool pool(storage, 0);
-  engine::Cache resources(pool, nullptr, nullptr);
-  Executor executor(1);
-  Events events;
-  engine::Engine engine(test::engineConfig(), resources, executor, events);
-  guardReleases(storage, engine);
-  engine.submit(request(1, std::vector<uint32_t>(65, 1)));
-  runUntilIdle(engine);
-  require(resources.snapshot().stateCache.bytes == 64, "fixture did not cache a state");
-  executor.laneFootprintBytes = 64;
-  executor.beginAllocationFailure = metal::AllocationFailure::HostPressure;
-  executor.beginGrowthBlocked = [&] { return executor.pooledLaneBytes == 0; };
-  engine.submit(request(2, std::vector<uint32_t>(65, 2)));
-  static_cast<void>(engine.tick(100));
-  require(engine.resourceWaitSnapshot(100).memory == 1 &&
-              engine.nextWakeupMilliseconds() == 200.0,
-          "the host did not refuse the start");
-  const MemoryReclaimResult result = engine.reclaimMemory({.targetBytes = 64});
-  require(!result.releasedBytes && executor.pooledLaneBytes == 64 &&
-              resources.snapshot().stateCache.entries == 0 &&
-              engine.nextWakeupMilliseconds() == 0.0,
-          "a pass that refilled the lane's buffers did not wake the refused start");
-  for (double now = 101; now < 120 && !idle(engine); ++now)
-    static_cast<void>(engine.tick(now));
-  require(idle(engine) && events.completedCount == 2 && events.failedCount == 0,
-          "the start did not run from the refilled buffers");
-}
-
-// A KV chain gives up one leaf at a time, each after its copy is written. A
-// pass reports that transfers hold back the rest of its target, and passes
-// with that rest (MemoryPressurePolicy continues it) take the chain as the
-// copies land, each pass first collecting the copies that landed since the
-// last, each leaf after its child, and stop at the target. The first extent
-// the copies empty stays allocated as the runway.
-void testPressureReclaimFollowsTheChain() {
-  test::TestKvStorage storage(4, 100, 1);
-  KvPool pool(storage, 4);
-  test::TestKvTier tier;
-  engine::Cache cache(pool, &tier, nullptr);
-  Executor executor;
-  Events events;
-  engine::Engine engine(test::engineConfig(), cache, executor, events);
-  guardReleases(storage, engine);
-  std::vector<uint32_t> prompt(129);
-  std::iota(prompt.begin(), prompt.end(), 1000);
-  cache.beginRequest(1);
-  require(cache.ensureTokens(1, 128).granted(), "fixture KV failed");
-  const uint64_t leaf = test::publishBlocks(cache, 1, prompt, 128);
-  auto transfer = std::make_shared<OffloadControl>();
-  transfer->ready = true;
-  cache.publishCompositeState(
-      leaf, std::make_shared<OffloadState>(transfer, executor.evictedStateBytes), false);
-  cache.endRequest(1);
-
-  const auto reclaim = [&](uint64_t target) {
-    return engine.reclaimMemory({.targetBytes = target});
-  };
-  // The state's buffers, which the model returns once the cache has written
-  // the state, then the chain's leaf, whose parent waits for its copy.
-  MemoryReclaimResult result = reclaim(264);
-  require(result.releasedBytes == 64 && result.outcome == ReclaimOutcome::Pending &&
-              tier.demotions == 1,
-          "the leaf's copy did not hold back the rest of the target");
-  const uint64_t target = 264 - result.releasedBytes;
-  tier.complete();
-  result = reclaim(target);
-  require(result.releasedBytes == 0 && result.outcome == ReclaimOutcome::Pending &&
-              tier.demotions == 2,
-          "the first extent the copies emptied did not stay as the runway");
-  tier.complete();
-  result = reclaim(target);
-  require(result.releasedBytes == 100 && result.outcome == ReclaimOutcome::Met &&
-              tier.demotions == 3,
-          "the rest of the target did not take the chain leaf by leaf");
-  tier.complete();
-  result = engine.reclaimMemory({});
-  require(result.releasedBytes == 100 && result.outcome == ReclaimOutcome::Untargeted &&
-              tier.demotions == 3 && pool.snapshot().pagesAllocated == 2,
-          "reclaim went past its target");
 }
 
 // A request starts only in a free lane. While every lane is resident, a
@@ -3887,39 +3641,11 @@ void testGrowthBeyondTheBudgetFailsAtOnce() {
           "the denied growth did not keep the extents it allocated");
 }
 
-// One reclaim pass releases every empty extent, however many there are,
-// and reports what is left: nothing after a critical pass, no target
-// otherwise. A pass short of critical keeps one extent as the runway.
-void testReclaimPassReleasesEveryEmptyExtent() {
-  constexpr uint32_t extents = 200;
-  for (bool critical : {true, false}) {
-    test::TestKvStorage storage(4 * extents, 4096, 4);
-    KvPool pool(storage, 0);
-    engine::Cache cache(pool, nullptr, nullptr);
-    auto pages = pool.acquirePages(4 * extents);
-    require(pages.granted(), "could not seed the KV extents");
-    for (uint32_t page : pages.pages)
-      pool.releasePage(page, false);
-    Executor executor(1);
-    Events events;
-    engine::Engine engine(test::engineConfig(), cache, executor, events);
-    guardReleases(storage, engine);
-    const MemoryReclaimResult result = engine.reclaimMemory({.critical = critical});
-    const uint32_t kept = critical ? 0 : 1;
-    require(result.outcome == (critical ? ReclaimOutcome::Exhausted
-                                        : ReclaimOutcome::Untargeted) &&
-                result.releasedBytes == uint64_t{extents - kept} * 4 * 4096 &&
-                pool.snapshot().pagesAllocated == kept * 4 &&
-                pool.snapshot().reclaimableBytes == kept * 4 * 4096,
-            "a pass did not release every empty extent or report what was left");
-  }
-}
-
-// A reclaim runs only between commands: while a prefill is in flight it
-// throws and reclaims nothing, neither idle model state nor an extent
-// nothing holds. Once the command has completed, the same reclaim takes
-// both.
-void testReclaimRefusesACommandInFlight() {
+// The control pass runs only between commands: while a prefill is in flight
+// its landings and the host claim throw and take nothing, neither idle
+// model state nor an extent nothing holds. Once the command has completed,
+// the same pass takes both.
+void testControlPassRefusesACommandInFlight() {
   test::TestKvStorage storage(8, 4096, 4);
   KvPool pool(storage, 0);
   engine::Cache cache(pool, nullptr, nullptr);
@@ -3932,17 +3658,19 @@ void testReclaimRefusesACommandInFlight() {
   executor.holdPrefillUntil = std::make_shared<std::atomic<bool>>(false);
   executor.reclaimableIdleStateBytes = 64;
   Events events;
-  engine::Engine engine(test::engineConfig(), cache, executor, events);
+  const EngineConfig config = test::engineConfig();
+  engine::Engine engine(config, cache, executor, events);
   guardReleases(storage, engine);
   engine.submit(request(289, {289}));
   require(engine.tick(1) && engine.commandInFlight() &&
               pool.snapshot().reclaimableBytes == 4 * 4096,
           "the prefill did not stay in flight beside an empty extent");
 
-  const MemoryReclaimDirective directive{.critical = true};
-  rejects([&] { static_cast<void>(engine.reclaimMemory(directive)); },
-          "memory reclaim requested while a command is in flight",
-          "a reclaim ran while a command was in flight");
+  rejects([&] { engine.collectLandings(1); }, "memory landings collected while a command is in flight",
+          "the control pass collected landings while a command was in flight");
+  rejects([&] { static_cast<void>(test::criticalPass(*config.governor)); },
+          "the engine's victims taken while a command is in flight",
+          "the host claim took memory while a command was in flight");
   require(executor.reclaimableIdleStateBytes == 64 &&
               pool.snapshot().extentReleases == 0 &&
               pool.snapshot().reclaimableBytes == 4 * 4096,
@@ -3952,7 +3680,7 @@ void testReclaimRefusesACommandInFlight() {
   require(engine.tick(2) && !engine.commandInFlight() &&
               events.completedCount == 1,
           "the held prefill did not complete");
-  static_cast<void>(engine.reclaimMemory(directive));
+  static_cast<void>(test::criticalPass(*config.governor));
   require(executor.reclaimedIdleStateBytes == 64 &&
               pool.snapshot().extentReleases == 2 &&
               pool.snapshot().pagesAllocated == 0,
@@ -4334,7 +4062,8 @@ void testFailedResumeRestoreKeepsTheKvTarget() {
   executor.stateTier = std::make_shared<OffloadControl>();
   executor.stateTier->ready = true;
   Events events;
-  engine::Engine engine(test::engineConfig(), cache, executor, events);
+  const EngineConfig config = test::engineConfig();
+  engine::Engine engine(config, cache, executor, events);
   guardReleases(storage, engine);
   storage.allocationFailure = metal::AllocationFailure::HostPressure;
   const std::vector<uint32_t> prompt(129, 290);
@@ -4360,7 +4089,7 @@ void testFailedResumeRestoreKeepsTheKvTarget() {
   executor.restoreControl->ready = true;
   executor.restoreControl->success = false;
   static_cast<void>(engine.tick(104));
-  static_cast<void>(engine.reclaimMemory({.critical = true}));
+  static_cast<void>(test::criticalPass(*config.governor));
   require(cache.snapshot().stateCache.entries == 0 && pool.snapshot().pagesAllocated == 0 &&
               engine.snapshot().resourceResumptions == 0,
           "fixture did not release the failed resumption's memory");
@@ -5757,50 +5486,6 @@ void testReplayPointRecyclesAnOlderPointInUse() {
           "the newer replay point did not recycle the older point in use");
 }
 
-// A shrink under the pressure warning that a request waits for keeps the
-// point it kept before states could be in use: a request that just finished
-// outranks an older running request's replay point, which goes, after the
-// older ordinary state, like any cache the shrink may take.
-void testWarningShrinkKeepsTheFinishedPoint() {
-  test::TestKvStorage storage(64, 4096, 4);
-  KvPool pool(storage, 0);
-  engine::Cache resources(pool, nullptr, nullptr);
-  Executor executor(2);
-  Events events;
-  engine::Engine engine(test::engineConfig(), resources, executor, events);
-  guardReleases(storage, engine);
-  double now = 1;
-  engine.submit(request(1, std::vector<uint32_t>(65, 1)));
-  tickUntil(engine, now, [&] { return idle(engine); }, "the older conversation did not finish");
-  executor.decodeFinishes = false;
-  auto running = request(2, std::vector<uint32_t>(65, 2));
-  running.maxNewTokens = 1000;
-  engine.submit(std::move(running));
-  tickUntil(engine, now, [&] { return events.outputs[2].size() >= 2; },
-            "the long decode did not start");
-  auto finished = request(3, std::vector<uint32_t>(65, 3));
-  finished.maxNewTokens = 2;
-  engine.submit(std::move(finished));
-  tickUntil(engine, now, [&] { return events.usage.contains(3); },
-            "the newer request did not finish");
-  require(resources.snapshot().stateCache.entries == 3 &&
-              resources.snapshot().stateCache.inUse == 1,
-          "the fixture did not cache three replay points, one in use");
-
-  static_cast<void>(engine.reclaimMemory({.targetBytes = std::numeric_limits<uint64_t>::max(),
-                                          .keepResumePoint = true,
-                                          .upTo = ReclaimClass::InUse}));
-  const auto cachedTokens = [&](uint32_t token) {
-    std::vector<uint32_t> next(65, token);
-    next.resize(80, 9);
-    return resources.probe(next, {}).cachedTokens();
-  };
-  const auto state = resources.snapshot().stateCache;
-  require(state.entries == 1 && state.inUseEvictions == 1 && cachedTokens(3) == 64 &&
-              cachedTokens(1) == 0 && cachedTokens(2) == 0,
-          "the shrink did not keep the finished request's point over the running one");
-}
-
 // A start beside a resident lane is held back by it (judge() yields), so the
 // reclaim for its memory takes nothing in use: the running request's replay
 // point outlasts the start's state allocation, which the budget refuses, or
@@ -5930,12 +5615,10 @@ void testLaneThatWouldYieldTakesNothingInUse() {
           "the lanes did not both complete");
 }
 
-// A paced pass that nothing waits for takes nothing in use, whatever its
-// target, under macOS's warning too: the replay point a running request has
-// published stays, the point its follow-up resumes from once it ends, beside
-// the resume point the pass keeps. What the pass would free there goes back
-// to that request's growth, which neither the host's margin nor the warning
-// holds back.
+// The host claim takes nothing in use short of macOS's critical pressure,
+// whatever its target, in the band and under the warning: the replay point
+// a running request has published stays, the point its follow-up resumes
+// from once it ends (amend/M.md B3).
 void testPacedPassKeepsInServiceReplayPoint() {
   // The host is short of the whole warning margin, or has room to spare
   // while macOS warns.
@@ -5946,7 +5629,8 @@ void testPacedPassKeepsInServiceReplayPoint() {
     engine::Cache resources(pool, nullptr, nullptr);
     Executor executor;
     Events events;
-    engine::Engine engine(test::engineConfig(), resources, executor, events);
+    const EngineConfig config = test::engineConfig();
+    engine::Engine engine(config, resources, executor, events);
     guardReleases(storage, engine);
     double now = 1;
     // Each turn is the one before, its reply and a new message.
@@ -5969,15 +5653,10 @@ void testPacedPassKeepsInServiceReplayPoint() {
                 resources.snapshot().stateCache.inUse == 1,
             "the second turn did not restore the first turn's point and publish its own");
 
-    MemoryGovernorSnapshot host;
-    host.pressure = MemoryPressure::Warning;
-    host.hostMeasurementValid = true;
-    if (condition == Host::Warned) {
-      host.systemPressure = MemoryPressure::Warning;
-      host.hostHeadroomBytes = 16ULL << 30;
-    }
-    MemoryPressurePolicy policy;
-    static_cast<void>(engine.reclaimMemory(policy.update(host, now, false).value()));
+    // Short of its margin the host claim may take what lanes hold beside
+    // the cache; under the warning alone, the cache.
+    static_cast<void>(test::hostPass(*config.governor, std::numeric_limits<uint64_t>::max(),
+                                     condition == Host::Short));
     require(resources.snapshot().stateCache.entries == 2 &&
                 resources.snapshot().stateCache.inUseEvictions == 0,
             "a paced pass nothing waited for took what a running request uses");
@@ -6190,727 +5869,6 @@ struct StoreFixture {
   double now = 1;
 };
 
-// A paced pass the host is short for takes what nothing in use holds, then
-// the expert store's chunks above its floor, one per step, and only then,
-// for a request that waits, what is in use: the replay point a running
-// request uses outlasts the store. With the store at its floor the pass goes
-// straight on to what is in use. Critical pressure keeps the same order and
-// takes the whole store down to its floor in one step
-// (Model::releaseExpertsToFloor). Either reports nothing left only once the
-// store is at its floor too.
-void testPressurePassTakesTheExpertStoreBeforeWhatIsInUse() {
-  enum class Pass { Short, AtFloor, Critical };
-  for (const Pass pass : {Pass::Short, Pass::AtFloor, Pass::Critical}) {
-    StoreFixture fixture;
-    Executor &executor = fixture.executor;
-    if (pass != Pass::AtFloor)
-      executor.expertChunks = {1000, 1000};
-    // The state cache's entries and in-use evictions as each chunk goes.
-    std::vector<std::pair<uint32_t, uint64_t>> atRelease;
-    executor.expertReleaseObserver = [&] {
-      const auto state = fixture.resources.snapshot().stateCache;
-      atRelease.emplace_back(state.entries, state.inUseEvictions);
-    };
-    executor.reclaimSteps.clear();
-    const MemoryReclaimResult result = fixture.engine.reclaimMemory(
-        pass == Pass::Critical
-            ? MemoryReclaimDirective{.critical = true, .hostShort = true}
-            : MemoryReclaimDirective{.targetBytes = std::numeric_limits<uint64_t>::max(),
-                                     .upTo = ReclaimClass::InUse,
-                                     .hostShort = true});
-    const auto state = fixture.resources.snapshot().stateCache;
-    const std::vector<std::pair<uint32_t, uint64_t>> expected =
-        pass == Pass::AtFloor ? std::vector<std::pair<uint32_t, uint64_t>>{}
-                              : std::vector<std::pair<uint32_t, uint64_t>>{{1, 0}, {1, 0}};
-    require(atRelease == expected,
-            "the store's chunks did not go after the ordinary replay point and before the one in use");
-    require(executor.expertChunks.empty() && state.entries == 0 && state.inUseEvictions == 1 &&
-                result.outcome == ReclaimOutcome::Exhausted &&
-                result.releasedBytes >= (pass == Pass::AtFloor ? 0U : 2000U),
-            "the pass did not take the whole store and what is in use before reporting nothing left");
-    // The ordinary replay point's buffers, the store's chunks, then the
-    // buffers of the replay point in use.
-    using Step = Executor::ReclaimStep;
-    const std::vector<Step> steps =
-        pass == Pass::AtFloor
-            ? std::vector<Step>{Step::Buffers, Step::Buffers}
-            : std::vector<Step>{Step::Buffers, Step::ExpertRelease, Step::ExpertRelease, Step::Buffers};
-    require(executor.reclaimSteps == steps &&
-                fixture.engine.expertReleases() ==
-                    (pass == Pass::AtFloor ? 0U : pass == Pass::Critical ? 1U : 2U) &&
-                executor.expertsToFloor == (pass == Pass::Critical ? 1U : 0U),
-            "the model's reclaim steps did not run in the class order, or went uncounted");
-    fixture.finish();
-  }
-}
-
-// Only a host that is really short gives the expert store's chunks back: a
-// pass macOS's warning alone asks for returns cache and keeps the store,
-// reporting nothing left that it may take. A measured deficit takes one
-// chunk per step while the target is unmet, and only once the store is at
-// its floor does a pass report nothing left.
-void testOnlyAShortHostTakesTheExpertStore() {
-  test::TestKvStorage storage(8, 4096, 4);
-  KvPool pool(storage, 0);
-  engine::Cache resources(pool, nullptr, nullptr);
-  Executor executor(1);
-  Events events;
-  engine::Engine engine(test::engineConfig(), resources, executor, events);
-  guardReleases(storage, engine);
-  constexpr uint64_t chunk = 1ULL << 30;
-  executor.expertChunks = {chunk, chunk, chunk};
-  MemoryPressurePolicy policy;
-  MemoryGovernorSnapshot host{.pressure = MemoryPressure::Warning,
-                              .hostMeasurementValid = true,
-                              .hostHeadroomBytes = 16 * chunk,
-                              .systemPressure = MemoryPressure::Warning};
-  const MemoryReclaimResult warned = engine.reclaimMemory(policy.update(host, 0.0, false).value());
-  require(executor.expertChunks.size() == 3 && !warned.releasedBytes &&
-              warned.outcome == ReclaimOutcome::Exhausted,
-          "macOS's warning alone took the expert store");
-  host.systemPressure = MemoryPressure::Normal;
-  host.hostHeadroomBytes = chunk / 2;
-  const MemoryReclaimResult deficit = engine.reclaimMemory(policy.update(host, 1000.0, false).value());
-  require(executor.expertChunks.size() == 2 && deficit.releasedBytes == chunk &&
-              deficit.outcome == ReclaimOutcome::Met,
-          "a measured deficit did not take one chunk of the store");
-  const MemoryReclaimResult two =
-      engine.reclaimMemory({.targetBytes = chunk + chunk / 2, .hostShort = true});
-  require(executor.expertChunks.empty() && two.releasedBytes == 2 * chunk &&
-              two.outcome == ReclaimOutcome::Met,
-          "a pass did not take a chunk per step while its target was unmet");
-  const MemoryReclaimResult floor = engine.reclaimMemory({.targetBytes = 64, .hostShort = true});
-  require(!floor.releasedBytes && floor.outcome == ReclaimOutcome::Exhausted,
-          "a store at its floor did not leave the pass with nothing left");
-}
-
-// A refusal of the engine's limit takes what nothing in use holds, then one
-// chunk of the expert store, and the allocation retries before anything in
-// use goes: a decoding lane's KV takes one chunk and its replay point stays,
-// and so does a start beside it, which takes nothing in use at all. A
-// refusal of the host leaves the store to the paced passes.
-void testEngineLimitTakesTheExpertStoreBeforeWhatIsInUse() {
-  enum class Refused { DecodeKv, StartBeside, HostKv };
-  for (const Refused refused : {Refused::DecodeKv, Refused::StartBeside, Refused::HostKv}) {
-    StoreFixture fixture;
-    Executor &executor = fixture.executor;
-    engine::Engine &engine = fixture.engine;
-    // Nothing but what is in use is left in the cache.
-    while (fixture.resources.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::Ordinary)
-               .madeProgress) {
-    }
-    executor.expertChunks = {1000, 1000};
-    if (refused == Refused::StartBeside) {
-      executor.beginGrowthBlocked = [&] { return executor.releasedExpertChunks.empty(); };
-      engine.submit(request(3, std::vector<uint32_t>(65, 3)));
-      tickUntil(engine, fixture.now, [&] { return fixture.events.startIds.size() == 3; },
-                "the start beside the decoding lane did not start");
-    } else {
-      bool hostAllows = false;
-      if (refused == Refused::HostKv)
-        fixture.storage.allocationFailure = metal::AllocationFailure::HostPressure;
-      fixture.storage.growthAllowed = [&](uint32_t) {
-        return refused == Refused::HostKv ? hostAllows : !executor.releasedExpertChunks.empty();
-      };
-      // The decode outgrows the extents it holds.
-      const auto decoded = [&] { return fixture.events.outputs[2].size() >= 300; };
-      if (refused == Refused::HostKv) {
-        for (int step = 0; step < 100 && !decoded(); ++step)
-          static_cast<void>(engine.tick(fixture.now++));
-        require(!decoded() && executor.expertChunks.size() == 2,
-                "the host did not refuse the decode, or its refusal took a chunk of the expert store");
-        hostAllows = true;
-      }
-      tickUntil(engine, fixture.now, decoded, "the decode did not grow past its first extent");
-    }
-    const size_t taken = refused == Refused::HostKv ? 0 : 1;
-    require(executor.releasedExpertChunks.size() == taken &&
-                fixture.resources.snapshot().stateCache.inUseEvictions == 0,
-            "a refusal of the engine's limit did not take one chunk of the store before what is in use");
-    fixture.storage.growthAllowed = {};
-    fixture.finish();
-  }
-}
-
-// The control pass's growth of the expert store takes one chunk a call, and
-// with a request in the engine or without, only room the engine's limit has
-// free: it asks for none it lacks and takes no cache for it, which only the
-// exchange takes (reclaimForExperts). So it does beside a resident lane,
-// beside a request queued before its first tick, and with none.
-void testExpertGrowthTakesOnlyFreeRoom() {
-  StoreFixture fixture;
-  Executor &executor = fixture.executor;
-  engine::Engine &engine = fixture.engine;
-  const auto entries = [&] { return fixture.resources.snapshot().stateCache.entries; };
-  executor.expertChunks = {1000};
-  executor.releasedExpertChunks = {1000, 1000};
-  require(!engine.growExperts(999) && executor.expertGrowthAttempts == 0,
-          "growth beside a resident lane asked for room the engine's limit lacked");
-  require(engine.growExperts(1000) && executor.expertChunks.size() == 2 &&
-              executor.releasedExpertChunks.size() == 1,
-          "growth beside a resident lane did not take one chunk into free room");
-  fixture.finish();
-  require(entries() == 2, "the fixture did not keep its two replay points");
-  executor.reclaimSteps.clear();
-  uint32_t attempts = executor.expertGrowthAttempts;
-  require(!engine.growExperts(0) && executor.expertGrowthAttempts == attempts && entries() == 2 &&
-              executor.reclaimSteps.empty(),
-          "growth with no request asked for room the engine's limit lacked, or took cache for it");
-  require(engine.growExperts(1000) && executor.expertChunks.size() == 3 &&
-              executor.releasedExpertChunks.empty(),
-          "growth with no request did not take one chunk into free room");
-  require(!engine.growExperts(1000), "a store at its cap grew");
-  // A request queued before its first tick holds the cache it may look up.
-  executor.expertChunks.pop_back();
-  executor.releasedExpertChunks = {1000};
-  attempts = executor.expertGrowthAttempts;
-  engine.submit(request(3, std::vector<uint32_t>(65, 2)));
-  require(!engine.growExperts(0) && executor.expertGrowthAttempts == attempts && entries() == 2,
-          "growth beside a queued request asked for room the engine's limit lacked, or took cache");
-  require(engine.growExperts(1000) && executor.expertChunks.size() == 3,
-          "growth beside a queued request did not take free room");
-  tickUntil(engine, fixture.now, [&] { return idle(engine); }, "the queued request did not finish");
-}
-
-// The cache's side of the control pass's exchange for a chunk of the expert
-// store takes only cache nothing in use holds and no request would restore:
-// beside a resident lane with only the resume point cached beside its replay
-// point, nothing. It takes cache only when all it may take covers the bytes
-// asked for, and then
-// returns memory to the system until what it returned covers them: idle
-// buffers beyond one lane's, then the cache nothing in use holds, releasing
-// the extents it empties, but never the resume point, which the newest
-// conversation's next turn resumes from, nor the runway extent. It reports
-// only what left the engine: the extents released and the buffers the model
-// released. What it may take is exactly what it returns: a byte more takes
-// nothing.
-void testExpertExchangeReturnsCacheToTheSystem() {
-  StoreFixture fixture(2, 2);
-  Executor &executor = fixture.executor;
-  engine::Engine &engine = fixture.engine;
-  const KvPool &pool = fixture.pool;
-  constexpr uint64_t extentBytes = 2 * 4096;
-  const auto entries = [&] { return fixture.resources.snapshot().stateCache.entries; };
-  // What left the engine since `allocated` and `buffers` were read.
-  uint64_t allocated = pool.snapshot().allocatedBytes;
-  uint64_t buffers = executor.reclaimedIdleStateBytes;
-  const auto left = [&] {
-    return allocated - pool.snapshot().allocatedBytes + executor.reclaimedIdleStateBytes - buffers;
-  };
-  require(engine.reclaimForExperts(1) == 0 && left() == 0 && entries() == 2,
-          "the exchange took the resume point, or the replay point a resident lane uses");
-  fixture.finish();
-  const std::vector<uint32_t> newest(65, 3);
-  engine.submit(request(3, newest));
-  tickUntil(engine, fixture.now, [&] { return idle(engine); }, "the queued request did not finish");
-  require(entries() == 3, "the fixture did not keep three replay points");
-
-  allocated = pool.snapshot().allocatedBytes;
-  buffers = executor.reclaimedIdleStateBytes;
-  const uint64_t first = engine.reclaimForExperts(1);
-  require(first != 0 && first == left() && entries() == 2,
-          "the exchange did not stop once what left the engine covered the bytes asked for, or "
-          "counted memory that stayed");
-  allocated = pool.snapshot().allocatedBytes;
-  buffers = executor.reclaimedIdleStateBytes;
-  const uint64_t extentReleases = pool.snapshot().extentReleases;
-  // All it may take is the extents of the two other conversations and the
-  // buffers of the state left beside the resume point.
-  const uint64_t cover = 2 * extentBytes + test::State().bytes();
-  require(engine.reclaimForExperts(cover + 1) == 0 && left() == 0 && entries() == 2 &&
-              pool.snapshot().extentReleases == extentReleases &&
-              executor.reclaimedIdleStateBytes == buffers,
-          "the exchange took cache that could not cover the bytes asked for");
-  const uint64_t rest = engine.reclaimForExperts(cover);
-  // The resume point's extent and the empty runway stay.
-  require(rest == cover && rest == left() && pool.snapshot().extentReleases == extentReleases + 2 &&
-              pool.snapshot().allocatedBytes == 2 * extentBytes &&
-              pool.snapshot().reclaimableBytes == extentBytes && entries() == 1 &&
-              engine.reclaimForExperts(1) == 0,
-          "the exchange did not return all but the resume point and the runway extent");
-  const uint64_t hits = engine.snapshot().cacheHits;
-  engine.submit(request(4, newest));
-  tickUntil(engine, fixture.now, [&] { return idle(engine); }, "the follow-up did not finish");
-  require(engine.snapshot().cacheHits == hits + 1,
-          "the newest conversation did not resume from the state the exchange kept");
-}
-
-// Beside a running lane the exchange takes the cache nothing in use holds,
-// as with no request in the engine: the store's cap is a reservation the
-// cache repays from what no request needs. Of three cached conversations
-// the two older leave, while the replay point the lane uses and the resume
-// point, the newest conversation's, stay; the lane decodes on to its end,
-// and the newest conversation's next turn resumes where it was.
-void testExpertExchangeTakesOnlyUnusedCacheBesideARunningLane() {
-  StoreFixture fixture(2, 2, 32);
-  Executor &executor = fixture.executor;
-  engine::Engine &engine = fixture.engine;
-  const KvPool &pool = fixture.pool;
-  const auto states = [&] { return fixture.resources.snapshot().stateCache; };
-  // Two more conversations finish beside the decoding lane.
-  for (const uint32_t id : {3u, 4u}) {
-    engine.submit(request(id, std::vector<uint32_t>(65, id)));
-    tickUntil(engine, fixture.now, [&] { return fixture.events.usage.contains(id); },
-              "a conversation beside the decoding lane did not finish");
-  }
-  require(states().entries == 4 && states().inUse == 1,
-          "the fixture did not cache three conversations beside the lane's replay point");
-  const uint64_t allocated = pool.snapshot().allocatedBytes;
-  const uint64_t buffers = executor.reclaimedIdleStateBytes;
-  uint64_t returned = 0;
-  while (const uint64_t step = engine.reclaimForExperts(1))
-    returned += step;
-  require(returned != 0 &&
-              returned == allocated - pool.snapshot().allocatedBytes + executor.reclaimedIdleStateBytes - buffers,
-          "the exchange took no cache beside a running lane, or counted memory that stayed");
-  require(states().entries == 2 && states().inUse == 1 && states().inUseEvictions == 0,
-          "the exchange beside a running lane took more than the two older conversations");
-  fixture.finish();
-  const uint64_t hits = engine.snapshot().cacheHits;
-  engine.submit(request(5, std::vector<uint32_t>(65, 4)));
-  tickUntil(engine, fixture.now, [&] { return idle(engine); }, "the follow-up did not finish");
-  require(engine.snapshot().cacheHits == hits + 1,
-          "the newest conversation did not resume from the state the exchange kept");
-}
-
-// A request that has not started holds the chain its probe found: the
-// exchange takes neither the state it resumes from nor that state's KV. Two
-// next turns wait for a lane, each attempt to start one making the state it
-// found the newest; the newer is the resume point, the older stays for its
-// probe alone, and the exchange takes the conversation no request needs.
-// Once lanes are free both turns start from the states the exchange kept.
-void testExpertExchangeKeepsWhatQueuedRequestsRestore() {
-  StoreFixture fixture(2, 2, 32);
-  engine::Engine &engine = fixture.engine;
-  const auto states = [&] { return fixture.resources.snapshot().stateCache; };
-  // Two more conversations finish beside the decoding lane; another long
-  // decode then takes the second lane.
-  for (const uint32_t id : {3u, 4u}) {
-    engine.submit(request(id, std::vector<uint32_t>(65, id)));
-    tickUntil(engine, fixture.now, [&] { return fixture.events.usage.contains(id); },
-              "a conversation beside the decoding lane did not finish");
-  }
-  auto second = request(5, std::vector<uint32_t>(65, 5));
-  second.maxNewTokens = 1000;
-  engine.submit(std::move(second));
-  tickUntil(engine, fixture.now, [&] { return fixture.events.outputs[5].size() >= 2; },
-            "the second long decode did not start");
-  // The first and the third conversation's next turns wait for a lane.
-  engine.submit(request(6, std::vector<uint32_t>(129, 1)));
-  engine.submit(request(7, std::vector<uint32_t>(129, 3)));
-  for (uint32_t step = 0; step < 4; ++step)
-    static_cast<void>(engine.tick(fixture.now++));
-  const auto started = [&](uint64_t id) {
-    const auto start = std::ranges::find(fixture.events.startIds, id);
-    return start == fixture.events.startIds.end()
-               ? std::optional<uint32_t>()
-               : fixture.events.starts[start - fixture.events.startIds.begin()];
-  };
-  require(!started(6) && !started(7) && states().entries == 5 && states().inUse == 2,
-          "the next turns did not wait for a lane beside three cached conversations");
-  uint64_t returned = 0;
-  while (const uint64_t step = engine.reclaimForExperts(1))
-    returned += step;
-  require(returned != 0 && states().entries == 4 && states().inUseEvictions == 0,
-          "the exchange did not take the one conversation no request needs, or took one a next "
-          "turn resumes from");
-  fixture.finish();
-  require(started(6) == 64 && started(7) == 64,
-          "the next turns did not start from the states the exchange kept for them");
-}
-
-// A request admission leaves unprobed keeps the chain it restores too: the
-// first conversation's next turn, queued behind a Foreground decode below
-// the priority that runs, the exchange probes itself, and it takes the one
-// conversation no request needs while it keeps the one that turn continues.
-// Once the lanes are free the turn starts from the state the exchange kept.
-void testExpertExchangeKeepsWhatAnUnprobedRequestRestores() {
-  StoreFixture fixture(2, 2, 32);
-  engine::Engine &engine = fixture.engine;
-  const auto states = [&] { return fixture.resources.snapshot().stateCache; };
-  for (const uint32_t id : {3u, 4u}) {
-    engine.submit(request(id, std::vector<uint32_t>(65, id)));
-    tickUntil(engine, fixture.now, [&] { return fixture.events.usage.contains(id); },
-              "a conversation beside the decoding lane did not finish");
-  }
-  auto foreground = request(5, std::vector<uint32_t>(65, 5));
-  foreground.priority = RequestPriority::Foreground;
-  foreground.maxNewTokens = 1000;
-  engine.submit(std::move(foreground));
-  tickUntil(engine, fixture.now, [&] { return fixture.events.outputs[5].size() >= 2; },
-            "the Foreground decode did not start");
-  engine.submit(request(6, std::vector<uint32_t>(129, 1)));
-  for (uint32_t step = 0; step < 4; ++step)
-    static_cast<void>(engine.tick(fixture.now++));
-  const auto started = [&](uint64_t id) {
-    const auto start = std::ranges::find(fixture.events.startIds, id);
-    return start == fixture.events.startIds.end()
-               ? std::optional<uint32_t>()
-               : fixture.events.starts[start - fixture.events.startIds.begin()];
-  };
-  require(!started(6) && states().entries == 5 && states().inUse == 2,
-          "the next turn did not wait behind the Foreground decode beside three cached conversations");
-  uint64_t returned = 0;
-  while (const uint64_t step = engine.reclaimForExperts(1))
-    returned += step;
-  require(returned != 0 && states().entries == 4 && states().inUseEvictions == 0,
-          "the exchange took nothing beside a request admission left unprobed, or took the "
-          "conversation it continues");
-  fixture.finish();
-  require(started(6) == 64, "the next turn did not start from the state the exchange kept for it");
-}
-
-// A request that skips the cache restores no chain once it starts: while it
-// waits, its prefix restore having failed alone and a long decode holding
-// the lane, the exchange takes the cache beside it that no other request
-// restores.
-void testExpertExchangeBesideARequestThatSkipsTheCache() {
-  test::TestKvStorage storage(128, 4096, 4);
-  KvPool pool(storage, 0);
-  test::TestKvTier tier;
-  engine::Cache cache(pool, &tier, nullptr);
-  Executor executor(1);
-  executor.decodeFinishes = false;
-  Events events;
-  engine::Engine engine(test::engineConfig({.maxContext = 102400}), cache, executor, events);
-  guardReleases(storage, engine);
-  // The request's prefix, its state and KV on the SSD alone.
-  const std::vector<uint32_t> prompt(65, 17);
-  cache.beginRequest(999);
-  require(cache.ensureTokens(999, 64).granted(), "fixture KV failed");
-  demoteState(cache, test::publishBlocks(cache, 999, prompt, 64));
-  cache.endRequest(999);
-  for (uint32_t written = 1; written <= 2; ++written) {
-    require(cache.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::InUse).madeProgress,
-            "KV block was not written");
-    tier.complete();
-    require(cache.pollTransfers(), "written block did not land");
-  }
-  require(cache.reclaimOne(CacheReclaimMode::ReleaseExtents, ReclaimClass::InUse).madeProgress &&
-              storage.allocatedPages() == 0,
-          "the prefix did not move to disk whole");
-  storage.growthBlocked = true;
-  engine.submit(request(1, prompt));
-  static_cast<void>(engine.tick(1));
-  require(events.starts.empty() && engine.resourceWaitSnapshot(1).memory == 1,
-          "the restore that cannot fit alone did not wait");
-  // A cached chain no request restores, of two extents beside the runway,
-  // and a long decode that takes the lane the request waits for.
-  storage.growthBlocked = false;
-  cache.beginRequest(998);
-  require(cache.ensureTokens(998, 256).granted(), "fixture KV failed");
-  static_cast<void>(test::publishBlocks(cache, 998, std::vector<uint32_t>(257, 18), 256));
-  cache.endRequest(998);
-  auto decoding = request(2, std::vector<uint32_t>(9, 2));
-  decoding.priority = RequestPriority::Foreground;
-  decoding.maxNewTokens = 1000;
-  engine.submit(std::move(decoding));
-  double now = 200;
-  tickUntil(engine, now, [&] { return !engine.commandInFlight() && events.outputs[2].size() >= 2; },
-            "the decode did not take the lane");
-  require(events.startIds == std::vector<uint64_t>{2}, "the request that skips the cache started");
-  require(engine.reclaimForExperts(1) != 0,
-          "the exchange took nothing beside a request that skips the cache");
-  executor.decodeFinishes = true;
-  tickUntil(engine, now, [&] { return idle(engine); }, "engine did not reach idle");
-  require(events.failedCount == 0 && events.completedCount == 2, "a request failed");
-}
-
-// With a tier that takes writes, the exchange starts no copy to the SSD
-// cache, whose memory would come back only after the call: cache that needs
-// one stays and counts for nothing, so a call it could cover only once copies
-// had landed takes nothing. A conversation whose state and KV have copies on
-// the SSD leaves at once, and a state a lookup pins stays with its KV. When
-// what leaves at once covers the bytes asked for, the call returns them,
-// starting no copy, and the rest stays in RAM.
-void testExpertExchangeTakesOnlyWhatLeavesAtOnce() {
-  constexpr uint64_t pageBytes = 4096;
-  test::TestKvStorage storage(8, pageBytes, 1);
-  // Four conversations' pages and the runway.
-  KvPool pool(storage, 5);
-  test::TestKvTier tier(true);
-  engine::Cache cache(pool, &tier, nullptr);
-  Executor executor;
-  Events events;
-  engine::Engine engine(test::engineConfig(), cache, executor, events);
-  guardReleases(storage, engine);
-  // Four conversations of a page each, the newest the resume point; a state
-  // write lands as soon as the cache collects it.
-  auto transfer = std::make_shared<OffloadControl>();
-  transfer->ready = true;
-  constexpr uint32_t tokens = KvCache::pageTokens;
-  std::vector<std::vector<uint32_t>> prompts;
-  std::vector<uint64_t> leaves;
-  for (uint64_t id = 1; id <= 4; ++id) {
-    std::vector<uint32_t> &prompt = prompts.emplace_back(tokens + 1);
-    std::iota(prompt.begin(), prompt.end(), static_cast<uint32_t>(1000 * id));
-    cache.beginRequest(id);
-    require(cache.ensureTokens(id, tokens).granted(), "fixture KV failed");
-    leaves.push_back(test::publishBlocks(cache, id, prompt, tokens));
-    cache.publishCompositeState(
-        leaves.back(), std::make_shared<OffloadState>(transfer, executor.evictedStateBytes), false);
-    cache.endRequest(id);
-  }
-  const uint64_t stateBytes = test::State().bytes();
-  const auto copies = [&] { return tier.writes.size() + cache.snapshot().stateCache.offloads; };
-  const auto ramStates = [&] { return cache.snapshot().stateCache.bytes / stateBytes; };
-  const auto releases = [&] { return pool.snapshot().extentReleases; };
-  require(engine.reclaimForExperts(pageBytes) == 0 && copies() == 0 && ramStates() == 4 && releases() == 0,
-          "the exchange took cache that needs a copy to the SSD cache, or started one");
-
-  // The two oldest conversations keep copies of their states and pages,
-  // which stay in RAM (Cache::persist).
-  for (const uint64_t leaf : {leaves[0], leaves[1]}) {
-    require(cache.persist(leaf) == PersistStatus::Started, "the fixture's copies did not start");
-    tier.complete();
-    static_cast<void>(cache.pollTransfers());
-  }
-  require(cache.persist(leaves[1]) == PersistStatus::Durable, "the fixture's copies did not land");
-  const size_t copied = copies();
-  // A lookup of the second pins its state.
-  CacheLookup pinned = cache.lookup(prompts[1], {});
-  require(pinned.state && pinned.state->kvBlock() == leaves[1], "the fixture's lookup pinned no state");
-  const uint64_t oldest = pageBytes + stateBytes;
-  require(engine.reclaimForExperts(oldest + 1) == 0 && copies() == copied && ramStates() == 4 &&
-              releases() == 0,
-          "the exchange took cache that could not cover the bytes asked for at once");
-  require(engine.reclaimForExperts(oldest) == oldest && copies() == copied && ramStates() == 3 &&
-              releases() == 1 && cache.stateResident(leaves[1]) && cache.stateResident(leaves[2]),
-          "the exchange did not return the oldest conversation's copied cache alone");
-  // Released, the pinned state is the newest, and the resume point; the
-  // third conversation still needs copies.
-  pinned.state.reset();
-  require(engine.reclaimForExperts(1) == 0 && copies() == copied && ramStates() == 3 && releases() == 1,
-          "the exchange took the resume point or cache that needs a copy");
-}
-
-// The exchange passes over what needs a copy to the SSD cache before it
-// leaves, starting none, and takes newer cache that leaves at once: an older
-// state that needs a write stays with its page, and a newer one whose state
-// and page have copies leaves; an older page whose state is on the SSD
-// stays until a copy of it is.
-void testExpertExchangePassesOverWhatNeedsACopy() {
-  constexpr uint64_t pageBytes = 4096;
-  test::TestKvStorage storage(8, pageBytes, 1);
-  // Five conversations' pages and the runway.
-  KvPool pool(storage, 6);
-  test::TestKvTier tier(true);
-  engine::Cache cache(pool, &tier, nullptr);
-  Executor executor;
-  Events events;
-  engine::Engine engine(test::engineConfig(), cache, executor, events);
-  guardReleases(storage, engine);
-  // A state write lands as soon as the cache collects it.
-  auto transfer = std::make_shared<OffloadControl>();
-  transfer->ready = true;
-  constexpr uint32_t tokens = KvCache::pageTokens;
-  // A conversation of a page with its state in RAM, and its prompt.
-  const auto publish = [&](uint64_t id) {
-    std::vector<uint32_t> prompt(tokens + 1);
-    std::iota(prompt.begin(), prompt.end(), static_cast<uint32_t>(1000 * id));
-    cache.beginRequest(id);
-    require(cache.ensureTokens(id, tokens).granted(), "fixture KV failed");
-    const uint64_t leaf = test::publishBlocks(cache, id, prompt, tokens);
-    cache.publishCompositeState(
-        leaf, std::make_shared<OffloadState>(transfer, executor.evictedStateBytes), false);
-    cache.endRequest(id);
-    return std::pair{leaf, prompt};
-  };
-  const auto land = [&] {
-    tier.complete();
-    static_cast<void>(cache.pollTransfers());
-  };
-  // The first conversation's state and page have copies on the SSD, and only
-  // its state left RAM, for nothing.
-  const auto [copied, copiedPrompt] = publish(1);
-  require(cache.persist(copied) == PersistStatus::Started, "the fixture's copies did not start");
-  land();
-  require(cache.reclaimStateForLane(ReclaimClass::Ordinary).evictedState,
-          "the fixture's copied state did not leave RAM");
-  // The second's state was written to the SSD, and its page has no copy.
-  const uint64_t uncopied = publish(2).first;
-  require(cache.reclaimStateForLane(ReclaimClass::Ordinary).evictedState,
-          "the fixture's state did not go to the SSD");
-  land();
-  // Three in RAM: the oldest state needs a write, the next has copies of its
-  // state and page, and the newest is the resume point.
-  const uint64_t unwritten = publish(3).first;
-  const uint64_t newer = publish(4).first;
-  require(cache.persist(newer) == PersistStatus::Started, "the fixture's copies did not start");
-  land();
-  publish(5);
-  // A lookup makes the first conversation's page the newest.
-  require(cache.lookup(copiedPrompt, {}).kvBoundary == tokens, "the fixture's lookup missed");
-  const size_t copies = tier.writes.size() + cache.snapshot().stateCache.offloads;
-  const auto ramStates = [&] { return cache.snapshot().stateCache.bytes / test::State().bytes(); };
-  // The buffers of the two states that left RAM and of the newer copied one,
-  // the first page and the newer one's.
-  const uint64_t leaving = 3 * test::State().bytes() + 2 * pageBytes;
-  require(engine.reclaimForExperts(leaving + 1) == 0 && ramStates() == 3 &&
-              pool.snapshot().extentReleases == 0,
-          "the exchange took cache that could not cover the bytes asked for at once");
-  require(engine.reclaimForExperts(leaving) == leaving && pool.snapshot().extentReleases == 2 &&
-              ramStates() == 2 && cache.stateResident(unwritten) && !cache.stateResident(newer) &&
-              cache.copiedBlocks(uncopied) == 0 &&
-              tier.writes.size() + cache.snapshot().stateCache.offloads == copies,
-          "the exchange did not take the cache that leaves at once alone, or started a copy");
-}
-
-// A pass the host is short for leaves the expert store while the cache
-// nothing in use holds waits for its copies to the SSD cache: the pass ends
-// Pending, and the passes that continue it once the copies land take that
-// cache leaf by leaf, the store's chunks only once no cached KV is left in
-// memory.
-void testShortPassWaitsForCopiesBeforeTheExpertStore() {
-  test::TestKvStorage storage(4, 100, 1);
-  KvPool pool(storage, 4);
-  test::TestKvTier tier;
-  engine::Cache cache(pool, &tier, nullptr);
-  Executor executor;
-  Events events;
-  engine::Engine engine(test::engineConfig(), cache, executor, events);
-  guardReleases(storage, engine);
-  std::vector<uint32_t> prompt(129);
-  std::iota(prompt.begin(), prompt.end(), 1000);
-  cache.beginRequest(1);
-  require(cache.ensureTokens(1, 128).granted(), "fixture KV failed");
-  const uint64_t leaf = test::publishBlocks(cache, 1, prompt, 128);
-  auto transfer = std::make_shared<OffloadControl>();
-  transfer->ready = true;
-  cache.publishCompositeState(
-      leaf, std::make_shared<OffloadState>(transfer, executor.evictedStateBytes), false);
-  cache.endRequest(1);
-  executor.expertChunks = {1000, 1000};
-  std::vector<uint32_t> prefixAtRelease;
-  executor.expertReleaseObserver = [&] { prefixAtRelease.push_back(pool.snapshot().pagesPrefix); };
-  uint64_t target = 100'000;
-  const auto reclaim = [&] {
-    return engine.reclaimMemory(
-        {.targetBytes = target, .upTo = ReclaimClass::Ordinary, .hostShort = true});
-  };
-  MemoryReclaimResult result = reclaim();
-  require(result.outcome == ReclaimOutcome::Pending && tier.demotions == 1 &&
-              executor.expertChunks.size() == 2,
-          "a short pass took the store while cache nothing in use holds waited for its copy");
-  for (int pass = 0; pass < 16 && result.outcome == ReclaimOutcome::Pending; ++pass) {
-    target -= std::min(target, result.releasedBytes);
-    tier.complete();
-    result = reclaim();
-  }
-  require(result.outcome == ReclaimOutcome::Exhausted && executor.expertChunks.empty() &&
-              tier.demotions > 1 && prefixAtRelease == std::vector<uint32_t>{0, 0},
-          "the passes that continued a short pass took the store before the cache that waited for its "
-          "copies");
-}
-
-// A copy ahead frees nothing as it lands where no Spill request spills its
-// page, and one of a page a running Resident request holds holds nothing
-// back: while copies ahead of a finished conversation
-// write the prefix a decoding lane shares, a refusal of the engine's limit
-// that finds nothing else ordinary takes a chunk of the expert store, and so
-// does a pass the host is short for, which ends without waiting for those
-// copies.
-void testCopiesAheadOfHeldPagesHoldNothingBack() {
-  for (const bool pass : {false, true}) {
-    test::TestKvStorage storage{16, 4096, 4};
-    KvPool pool{storage, 0};
-    test::TestKvTier tier;
-    tier.transferLimit = 64;
-    engine::Cache cache(pool, &tier, nullptr);
-    Executor executor;
-    executor.keptTier = std::make_shared<OffloadControl>();
-    executor.keptTier->ready = true;
-    Events events;
-    engine::Engine engine(test::engineConfig(), cache, executor, events);
-    guardReleases(storage, engine);
-    // Two conversations on one two-page prefix: the first finishes, the
-    // second decodes on.
-    const auto prompt = [](uint32_t token) {
-      std::vector<uint32_t> tokens(64, 5);
-      tokens.insert(tokens.end(), 33, token);
-      return tokens;
-    };
-    engine.submit(request(1, prompt(6)));
-    double now = 1;
-    tickUntil(engine, now, [&] { return idle(engine); }, "the first conversation did not finish");
-    executor.decodeFinishes = false;
-    auto decoding = request(2, prompt(7));
-    decoding.maxNewTokens = 1000;
-    engine.submit(std::move(decoding));
-    tickUntil(engine, now, [&] { return events.outputs[2].size() >= 2; }, "the decode did not start");
-    // The first conversation's point is copied ahead, its state and its own
-    // page landed; the prefix's copies stay in flight.
-    const uint64_t point = cache.probe(prompt(6), {}).restoredChain().back();
-    require(cache.persist(point) == PersistStatus::Started && tier.inFlight() == 3,
-            "the fixture's copies did not start");
-    tier.transfers.back()->ready = true;
-    require(cache.pollTransfers() && tier.inFlight() == 2, "the fixture's own page was not copied");
-    executor.expertChunks = {1000};
-    if (pass) {
-      const MemoryReclaimResult result = engine.reclaimMemory(
-          {.targetBytes = std::numeric_limits<uint64_t>::max(), .upTo = ReclaimClass::Ordinary,
-           .hostShort = true});
-      require(executor.expertChunks.empty() && result.outcome == ReclaimOutcome::Exhausted &&
-                  tier.inFlight() == 2,
-              "a short pass waited for copies of pages a running request holds");
-    } else {
-      storage.growthAllowed = [&](uint32_t) { return !executor.releasedExpertChunks.empty(); };
-      tickUntil(engine, now, [&] { return events.outputs[2].size() >= 300; },
-                "the decode waited for copies of pages it holds");
-      require(executor.releasedExpertChunks.size() == 1 && tier.inFlight() == 2,
-              "the decode did not take a chunk of the expert store beside the copies in flight");
-      storage.growthAllowed = {};
-    }
-    tier.complete();
-    executor.decodeFinishes = true;
-    tickUntil(engine, now, [&] { return idle(engine); }, "the decode did not finish");
-    require(events.failedCount == 0 && cache.snapshot().kvTier.copies == 3, "a request failed or a copy did not land");
-  }
-}
-
-// A copy ahead of the leaf a reclaim would free through it holds the ladder
-// back as a demotion does: a pass the host is short for ends Pending while it
-// is in flight, and the pass that continues it once the copy landed frees the
-// leaf, writing nothing more, before the expert store gives a chunk.
-void testCopyAheadOfALeafHoldsTheStoreBack() {
-  test::TestKvStorage storage(4, 100, 1);
-  KvPool pool(storage, 4);
-  test::TestKvTier tier;
-  engine::Cache cache(pool, &tier, nullptr);
-  Executor executor;
-  Events events;
-  engine::Engine engine(test::engineConfig(), cache, executor, events);
-  guardReleases(storage, engine);
-  std::vector<uint32_t> prompt(KvCache::pageTokens + 1);
-  std::iota(prompt.begin(), prompt.end(), 1000);
-  cache.beginRequest(1);
-  require(cache.ensureTokens(1, KvCache::pageTokens).granted(), "fixture KV failed");
-  const uint64_t leaf = test::publishBlocks(cache, 1, prompt, KvCache::pageTokens);
-  auto transfer = std::make_shared<OffloadControl>();
-  transfer->ready = true;
-  cache.publishCompositeState(
-      leaf, std::make_shared<OffloadState>(transfer, executor.evictedStateBytes), false);
-  cache.endRequest(1);
-  // The state's copy lands; the page's stays in flight.
-  require(cache.persist(leaf) == PersistStatus::Started && cache.pollTransfers() && tier.inFlight() == 1,
-          "the fixture's copies did not start");
-  executor.expertChunks = {1000};
-  std::vector<uint32_t> prefixAtRelease;
-  executor.expertReleaseObserver = [&] { prefixAtRelease.push_back(pool.snapshot().pagesPrefix); };
-  const auto reclaim = [&] {
-    return engine.reclaimMemory(
-        {.targetBytes = std::numeric_limits<uint64_t>::max(), .upTo = ReclaimClass::Ordinary,
-         .hostShort = true});
-  };
-  require(reclaim().outcome == ReclaimOutcome::Pending && executor.expertChunks.size() == 1 &&
-              !cache.stateResident(leaf),
-          "a short pass took the store while the leaf it frees next waited for its copy");
-  tier.complete();
-  require(reclaim().outcome == ReclaimOutcome::Exhausted && executor.expertChunks.empty() &&
-              prefixAtRelease == std::vector<uint32_t>{0} && tier.demotions == 1,
-          "the pass that continued it did not free the copied leaf, writing nothing, before the store");
-}
-
 // A copy ahead of the leaf a refused allocation would free through it holds
 // the refusal back as a demotion does: with nothing ordinary left, a step up
 // to what is in use waits for it, Pending, and takes nothing in use, and
@@ -6958,110 +5916,6 @@ void testCopyAheadOfALeafHoldsARefusalBack() {
                 !cache.stateResident(leaf) && cache.stateResident(used) && pool.snapshot().pagesPrefix == 1 &&
                 tier.demotions == 1,
             "the refusal that followed did not free the copied leaf, writing nothing");
-  }
-}
-
-// A pass the host is short for converts a Resident lane to Spill before a
-// chunk of the expert store goes, as a refusal at the engine's limit does:
-// the pass ends Pending while the lane's pages leave as their copies land,
-// and the store keeps its chunks.
-void testShortPassConvertsAResidentLaneBeforeTheExpertStore() {
-  Spilling spill(1024, true, 100'000, 0, Spilling::Extent{16});
-  spill.model.expertChunks = {1000};
-  // The lane starts Resident, as a request does while the SSD cache takes no
-  // writes.
-  spill.tier.writableFile = false;
-  spill.engine.submit(Spilling::prompt(2, 1, 48, 10000));
-  spill.runUntil([&] { return spill.events.outputs.contains(2); }, "the lane did not decode");
-  spill.tier.writableFile = true;
-  const MemoryReclaimResult result = spill.engine.reclaimMemory(
-      {.targetBytes = 100'000, .upTo = ReclaimClass::Ordinary, .hostShort = true});
-  require(result.outcome == ReclaimOutcome::Pending && spill.engine.snapshot().spill.converted == 1 &&
-              spill.model.releasedExpertChunks.empty(),
-          "a short pass took a chunk of the expert store before a lane that could convert");
-  spill.model.decodeFinishes = true;
-  spill.runUntilIdle();
-  require(spill.events.failedCount == 0 && spill.committedSlots() == 0,
-          "the lane failed or kept its commitment");
-}
-
-// A pass the host is short for that converted a Resident lane ends Pending
-// while the lane's copies are written. The pass that continues it once they
-// landed, before the next command, spills every page of the lane past its
-// dense and window pages and counts what it gives back: it converts no
-// other lane, and the store keeps its chunk. So it does while the host holds
-// growth back, the lane in service, and beside idle buffers past a lane's,
-// all the host is short of, which it counts too. Where the engine's limit
-// refuses the Index extent the pages past the runway's free Index pages
-// need, an untargeted pass leaves them Full and takes nothing for them,
-// neither the model's caches nor the buffers a lane starts from; the next
-// tick spills them.
-void testAContinuedShortPassTakesWhatItsConversionFreed() {
-  enum class Growth { Free, Paused, AtTheLimit };
-  for (const Growth growth : {Growth::Free, Growth::Paused, Growth::AtTheLimit}) {
-    Spilling spill(1024, true, 100'000, 0, Spilling::Extent{16});
-    // The tier writes every copy the conversion owes at once.
-    spill.tier.writeLimits[static_cast<size_t>(WriteClass::Spill)] = 64;
-    spill.model.expertChunks = {1000};
-    // Two lanes start Resident, as requests do while the SSD cache takes no
-    // writes: 16 and 40 pages.
-    spill.tier.writableFile = false;
-    spill.engine.submit(Spilling::prompt(4, 4, 16, 10000));
-    spill.engine.submit(Spilling::prompt(5, 5, 40, 10000));
-    spill.runUntil([&] { return spill.events.outputs.contains(4) && spill.events.outputs.contains(5); },
-                   "the lanes did not decode");
-    spill.tier.writableFile = true;
-    const auto pass = [&](uint64_t target) {
-      return spill.engine.reclaimMemory(
-          {.targetBytes = target, .upTo = ReclaimClass::Ordinary, .hostShort = true});
-    };
-    require(pass(10'000).outcome == ReclaimOutcome::Pending &&
-                spill.engine.snapshot().spill.converted == 1,
-            "the short pass did not convert a lane and wait for its copies");
-    spill.tier.complete();
-    // The converted lane's pages past its dense and window pages.
-    constexpr uint32_t spillable = 40 - 2;
-    const auto spilled = [&] { return spill.cache.spillSnapshot().spilledPages; };
-    if (growth == Growth::AtTheLimit) {
-      spill.storage.growthBlocked = true;
-      spill.model.cacheUnits = {100};
-      spill.model.laneFootprintBytes = spill.model.pooledLaneBytes = 1000;
-      static_cast<void>(spill.engine.reclaimMemory({.upTo = ReclaimClass::Ordinary}));
-      require(spilled() == 16 && spill.model.cacheUnits.size() == 1 && spill.model.pooledLaneBytes == 1000,
-              "an untargeted pass took the model's caches or a lane's buffers for the Index pages of "
-              "the pages it spilled");
-      spill.storage.growthBlocked = false;
-      static_cast<void>(spill.engine.tick(spill.now++));
-      require(spilled() == spillable, "the next tick did not spill the pages a refused extent left Full");
-    } else {
-      // As the governor does, the host refuses growth unless a request in
-      // service needs it; the pool holds 5,000 bytes of idle buffers, all
-      // the host is short of. Without the pause, the host is short of an
-      // extent.
-      if (growth == Growth::Paused) {
-        spill.storage.growthAllowed = [&](uint32_t) {
-          const bool host = spill.paused && !spill.serving;
-          spill.storage.allocationFailure =
-              host ? metal::AllocationFailure::HostPressure : metal::AllocationFailure::EngineBudget;
-          return !host;
-        };
-        spill.paused = true;
-        spill.model.reclaimableIdleStateBytes = 5'000;
-      }
-      const uint64_t target = growth == Growth::Paused ? 5'000 : 16 * 100;
-      const MemoryReclaimResult continued = pass(target);
-      require(continued.outcome == ReclaimOutcome::Met && continued.releasedBytes >= target &&
-                  spilled() == spillable && spill.engine.snapshot().spill.converted == 1 &&
-                  spill.model.releasedExpertChunks.empty(),
-              "the pass that continued a short pass did not spill the pages its conversion freed, or "
-              "climbed on before counting what they and the idle buffers gave back");
-      spill.paused = false;
-      spill.storage.growthAllowed = {};
-    }
-    spill.model.decodeFinishes = true;
-    spill.runUntilIdle();
-    require(spill.events.failedCount == 0 && spill.committedSlots() == 0,
-            "a lane failed or kept its commitment");
   }
 }
 
@@ -7189,30 +6043,11 @@ std::span<const test::TestCase> memoryTests() {
       {"testSharedReplayPointCountsEachRequest", testSharedReplayPointCountsEachRequest},
       {"testRestoredEndpointIsInUse", testRestoredEndpointIsInUse},
       {"testReplayPointRecyclesAnOlderPointInUse", testReplayPointRecyclesAnOlderPointInUse},
-      {"testWarningShrinkKeepsTheFinishedPoint", testWarningShrinkKeepsTheFinishedPoint},
       {"testHeldBackStartTakesNothingInUse", testHeldBackStartTakesNothingInUse},
       {"testLaneThatWouldYieldTakesNothingInUse", testLaneThatWouldYieldTakesNothingInUse},
       {"testPacedPassKeepsInServiceReplayPoint", testPacedPassKeepsInServiceReplayPoint},
-      {"testPressurePassTakesTheExpertStoreBeforeWhatIsInUse", testPressurePassTakesTheExpertStoreBeforeWhatIsInUse},
-      {"testOnlyAShortHostTakesTheExpertStore", testOnlyAShortHostTakesTheExpertStore},
-      {"testEngineLimitTakesTheExpertStoreBeforeWhatIsInUse", testEngineLimitTakesTheExpertStoreBeforeWhatIsInUse},
-      {"testExpertGrowthTakesOnlyFreeRoom", testExpertGrowthTakesOnlyFreeRoom},
-      {"testExpertExchangeReturnsCacheToTheSystem", testExpertExchangeReturnsCacheToTheSystem},
-      {"testExpertExchangeTakesOnlyUnusedCacheBesideARunningLane",
-       testExpertExchangeTakesOnlyUnusedCacheBesideARunningLane},
-      {"testExpertExchangeKeepsWhatQueuedRequestsRestore", testExpertExchangeKeepsWhatQueuedRequestsRestore},
-      {"testExpertExchangeKeepsWhatAnUnprobedRequestRestores", testExpertExchangeKeepsWhatAnUnprobedRequestRestores},
-      {"testExpertExchangeBesideARequestThatSkipsTheCache", testExpertExchangeBesideARequestThatSkipsTheCache},
-      {"testExpertExchangeTakesOnlyWhatLeavesAtOnce", testExpertExchangeTakesOnlyWhatLeavesAtOnce},
-      {"testExpertExchangePassesOverWhatNeedsACopy", testExpertExchangePassesOverWhatNeedsACopy},
       {"testReplayPointCopiesCacheBeforeTheExpertStore", testReplayPointCopiesCacheBeforeTheExpertStore},
-      {"testShortPassWaitsForCopiesBeforeTheExpertStore", testShortPassWaitsForCopiesBeforeTheExpertStore},
-      {"testCopiesAheadOfHeldPagesHoldNothingBack", testCopiesAheadOfHeldPagesHoldNothingBack},
-      {"testCopyAheadOfALeafHoldsTheStoreBack", testCopyAheadOfALeafHoldsTheStoreBack},
       {"testCopyAheadOfALeafHoldsARefusalBack", testCopyAheadOfALeafHoldsARefusalBack},
-      {"testShortPassConvertsAResidentLaneBeforeTheExpertStore",
-       testShortPassConvertsAResidentLaneBeforeTheExpertStore},
-      {"testAContinuedShortPassTakesWhatItsConversionFreed", testAContinuedShortPassTakesWhatItsConversionFreed},
       {"testCaptureKvPastABoundaryTakesNothingInUse", testCaptureKvPastABoundaryTakesNothingInUse},
       {"testReplayPointTakesTheExpertStoreBeforeWhatIsInUse", testReplayPointTakesTheExpertStoreBeforeWhatIsInUse},
       {"testReplayPointAdmittedInMarginBand", testReplayPointAdmittedInMarginBand},
@@ -7246,13 +6081,6 @@ std::span<const test::TestCase> memoryTests() {
       {"testNonFiniteCommandDropsItsCaptures", testNonFiniteCommandDropsItsCaptures},
       {"testDuplicateCaptureIsDropped", testDuplicateCaptureIsDropped},
       {"testOneCommandCapturesSeveralLanesStates", testOneCommandCapturesSeveralLanesStates},
-      {"testPressureReclaimRespectsStateLifetimes", testPressureReclaimRespectsStateLifetimes},
-      {"testPressurePassKeepsCachesWithoutATarget", testPressurePassKeepsCachesWithoutATarget},
-      {"testPressurePassTakesTheRowsItsEvictionsLeave", testPressurePassTakesTheRowsItsEvictionsLeave},
-      {"testWarningReclaimKeepsTheServingFootprint", testWarningReclaimKeepsTheServingFootprint},
-      {"testWarningReclaimCountsOnlyWhatReachesTheHost", testWarningReclaimCountsOnlyWhatReachesTheHost},
-      {"testWarningReclaimWakesARefusedStart", testWarningReclaimWakesARefusedStart},
-      {"testPressureReclaimFollowsTheChain", testPressureReclaimFollowsTheChain},
       {"testFullLanesSkipAdmissionAttempts", testFullLanesSkipAdmissionAttempts},
       {"testConcurrencyLimitDoesNotEvictCache", testConcurrencyLimitDoesNotEvictCache},
       {"testHostPressureDoesNotDrainCacheOnStateAdmission", testHostPressureDoesNotDrainCacheOnStateAdmission},
@@ -7335,8 +6163,7 @@ std::span<const test::TestCase> memoryTests() {
       {"testPausedStateAdmissionReusesCachedStates", testPausedStateAdmissionReusesCachedStates},
       {"testDeniedGrowthAllocatesEachExtentOnce", testDeniedGrowthAllocatesEachExtentOnce},
       {"testGrowthBeyondTheBudgetFailsAtOnce", testGrowthBeyondTheBudgetFailsAtOnce},
-      {"testReclaimPassReleasesEveryEmptyExtent", testReclaimPassReleasesEveryEmptyExtent},
-      {"testReclaimRefusesACommandInFlight", testReclaimRefusesACommandInFlight},
+      {"testControlPassRefusesACommandInFlight", testControlPassRefusesACommandInFlight},
       {"testStateStartGathersFreePagesBeforeEvicting", testStateStartGathersFreePagesBeforeEvicting},
       {"testCommandReadsItsPageTableAfterRoomForItsStates", testCommandReadsItsPageTableAfterRoomForItsStates},
       {"testCompactionWaitsForTheCommandInFlight", testCompactionWaitsForTheCommandInFlight},

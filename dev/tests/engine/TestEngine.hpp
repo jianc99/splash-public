@@ -13,9 +13,15 @@
 
 namespace splash::test {
 
+// A governor of its own for each engine a test builds without one, over an
+// ample limit and host, so that its memory is the KV storage and the model
+// the test gives it: set by the binary's stand-in backend
+// (TestMetalMemory.hpp), none in a binary that links the Metal backend.
+inline engine::MemoryGovernor *(*ampleGovernor)() = nullptr;
+
 // An engine config completed as the bootstrap completes one, for tests: what
 // the test set, and otherwise the whole logical context, every 32-bit token
-// in the vocabulary and a host that never pauses growth.
+// in the vocabulary, a host that never pauses growth and an ample governor.
 [[nodiscard]] inline engine::EngineConfig engineConfig(engine::EngineConfig config = {}) {
   if (!config.maxContext)
     config.maxContext = kv::kMaximumLogicalTokens;
@@ -25,6 +31,8 @@ namespace splash::test {
     config.growthPaused = [] { return false; };
   if (!config.serving)
     config.serving = [](bool) { return false; };
+  if (!config.governor && ampleGovernor)
+    config.governor = ampleGovernor();
   return config;
 }
 

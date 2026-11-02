@@ -109,26 +109,10 @@ public:
   [[nodiscard]] double monotonicMilliseconds() const {
     return config_.monotonicMilliseconds();
   }
-  [[nodiscard]] MemoryReclaimResult
-  reclaimMemory(const MemoryReclaimDirective &directive) {
-    return core_.reclaimMemory(directive);
-  }
-  // The expert store's growth toward its cap (Engine::growExperts,
-  // expertGrowthBytes, reclaimForExperts), which waits while the weights are
-  // released or being restored: none grows, and no cache goes for it,
-  // meanwhile. Between commands, in the control pass.
-  [[nodiscard]] uint64_t expertGrowthBytes() const {
-    return core_.weightsHeld() ? core_.expertGrowthBytes() : 0;
-  }
-  [[nodiscard]] bool growExperts(uint64_t headroomBytes) {
-    return core_.weightsHeld() && core_.growExperts(headroomBytes);
-  }
-  [[nodiscard]] uint64_t reclaimForExperts(uint64_t bytes) {
-    return core_.weightsHeld() ? core_.reclaimForExperts(bytes) : 0;
-  }
-  [[nodiscard]] uint64_t expertReleases() const noexcept {
-    return core_.expertReleases();
-  }
+  // The control pass's engine side, between commands
+  // (Engine::collectLandings, refreshMemoryRates).
+  void collectLandings(double nowMilliseconds) { core_.collectLandings(nowMilliseconds); }
+  void refreshMemoryRates(double nowMilliseconds) { core_.refreshMemoryRates(nowMilliseconds); }
 
 private:
   struct RequestTelemetry {

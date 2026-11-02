@@ -606,6 +606,24 @@ Returning Cache::returningOf(const Request *active) const noexcept {
   return result;
 }
 
+uint32_t Cache::indexLandingPages() const {
+  if (!spill_)
+    return 0;
+  uint32_t landing = 0;
+  for (const Write &write : writes_)
+    landing += spillsOnLanding(write) ? 1 : 0;
+  // Requests on one prefix owe its blocks each.
+  std::unordered_set<uint64_t> owed;
+  for (const auto &[_, holder] : requests_)
+    if (holder.mode == KvMode::Spill)
+      for (const uint64_t block : holder.owedCopies)
+        if (spillEligibility(block) == Eligibility::Eligible)
+          owed.insert(block);
+  const uint64_t needed = uint64_t{landing} + owed.size();
+  const uint32_t free = pool_.freePageCount(kv::PageForm::Index);
+  return free > needed ? static_cast<uint32_t>(free - needed) : 0;
+}
+
 std::array<uint32_t, 3> Cache::demotedPages() const noexcept {
   std::array<uint32_t, 3> pages{};
   for (const Write &write : writes_)
