@@ -112,41 +112,20 @@ void SlotRecycler::Run::fit(std::vector<uint8_t> &in, const Links &links, const 
 
 SlotRecycler::SlotRecycler(uint32_t slots, uint32_t margin) : margin_(margin) { resize(slots); }
 
-void SlotRecycler::joinTail(uint32_t slot, List list, bool leastRecent) noexcept {
-  tail_[slot] = 0;
-  if (!margin_) return;
-  const uint32_t count = slots(list).count;
-  uint32_t &end = tailEnd_[list == Frequent];
-  if (!leastRecent) {
-    if (count <= margin_) {
-      tail_[slot] = 1;
-      end = slot;
-    }
-    return;
-  }
-  tail_[slot] = 1;
-  if (count == 1) {
-    end = slot;
-  } else if (count > margin_) {
-    tail_[end] = 0;
-    end = links_.previous[end];
-  }
-}
-
-void SlotRecycler::leaveTail(uint32_t slot, List list) noexcept {
-  if (!tail_[slot]) return;
-  tail_[slot] = 0;
-  uint32_t &end = tailEnd_[list == Frequent];
-  if (const uint32_t past = links_.next[end]; past != kNone) {
-    tail_[past] = 1;
-    end = past;
-  } else if (slot == end) {
-    end = links_.previous[slot];
-  }
+void SlotRecycler::fitTails() noexcept {
+  // compact() to margin_ slots fewer gives up as many keys as the free slots
+  // leave past them, REPLACE's: T1's least recently used while T1 holds more
+  // than its target, then T2's, then T1's again.
+  const uint32_t held = recent_.count + frequent_.count;
+  const uint32_t victims = std::min(held, held + margin_ > size() ? held + margin_ - size() : 0);
+  const uint32_t pastTarget = recent_.count > target_ ? static_cast<uint32_t>(recent_.count - target_) : 0;
+  const uint32_t frequent = std::min(frequent_.count, victims - std::min(victims, pastTarget));
+  tails_[0].fit(tail_, links_, recent_, std::min(recent_.count, victims - frequent));
+  tails_[1].fit(tail_, links_, frequent_, frequent);
 }
 
 void SlotRecycler::unlink(uint32_t slot) {
-  leaveTail(slot, List(list_[slot]));
+  tails_[list_[slot] == Frequent].leave(tail_, links_, slot);
   links_.unlink(slots(List(list_[slot])), slot);
   list_[slot] = Free;
 }
@@ -154,13 +133,12 @@ void SlotRecycler::unlink(uint32_t slot) {
 void SlotRecycler::append(uint32_t slot, List list) {
   list_[slot] = list;
   links_.append(slots(list), slot);
-  joinTail(slot, list, false);
 }
 
 void SlotRecycler::prepend(uint32_t slot, List list) {
   list_[slot] = list;
   links_.prepend(slots(list), slot);
-  joinTail(slot, list, true);
+  tails_[list == Frequent].join(tail_, slot);
 }
 
 uint32_t SlotRecycler::oldest(List list, uint64_t load) const {
@@ -258,10 +236,11 @@ void SlotRecycler::touch(uint32_t slot, uint64_t load, bool chunk) {
   lastLoad_[slot] = load;
   // A scan moves nothing; another use makes a key of T1 frequent.
   if (chunk) return;
-  if (tail_[slot] && list_[slot] == (recyclesRecent(false) ? Recent : Frequent)) ++tailHits_;
+  if (tail_[slot]) ++tailHits_;
   unlink(slot);
   scan_[slot] = 0;
   append(slot, Frequent);
+  fitTails();
 }
 
 uint32_t SlotRecycler::claim(uint64_t key, uint64_t load, bool chunk) {
@@ -317,6 +296,7 @@ uint32_t SlotRecycler::claim(uint64_t key, uint64_t load, bool chunk) {
   if (frequent) append(slot, Frequent);
   else if (chunk) prepend(slot, Recent);
   else append(slot, Recent);
+  fitTails();
   return slot;
 }
 
@@ -325,6 +305,7 @@ void SlotRecycler::free(uint32_t slot) {
     unlink(slot);
     slotOf_.erase(key_[slot]);
     free_.push_back(slot);
+    fitTails();
   }
   scan_[slot] = 0;
   lastLoad_[slot] = 0;
@@ -333,7 +314,8 @@ void SlotRecycler::free(uint32_t slot) {
 void SlotRecycler::reset() {
   recent_ = frequent_ = {};
   std::ranges::fill(tail_, uint8_t{0});
-  tailEnd_[0] = tailEnd_[1] = kNone;
+  tails_[0].clear();
+  tails_[1].clear();
   slotOf_.clear();
   forgetGhosts();
   target_ = 0;
@@ -374,6 +356,7 @@ void SlotRecycler::resize(uint32_t slots) {
   if (!fewer)
     for (uint32_t ghost = slots; ghost-- > held;) freeGhosts_.push_back(ghost);
   ghostOf_.reserve(slots);
+  fitTails();
 }
 
 void SlotRecycler::compact(uint32_t slots, const std::function<void(uint32_t)> &evicted,
@@ -407,7 +390,7 @@ void SlotRecycler::compact(uint32_t slots, const std::function<void(uint32_t)> &
     list_[to] = list;
     list_[from] = Free;
     tail_[to] = std::exchange(tail_[from], uint8_t{0});
-    if (uint32_t &end = tailEnd_[list == Frequent]; end == from) end = to;
+    if (Run &tail = tails_[list == Frequent]; tail.end == from) tail.end = to;
     key_[to] = key_[from];
     lastLoad_[to] = lastLoad_[from];
     scan_[to] = scan_[from];

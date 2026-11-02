@@ -32,6 +32,7 @@
 #include <list>
 #include <map>
 #include <new>
+#include <random>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -192,10 +193,10 @@ bool use(SlotRecycler &slots, uint64_t key, uint64_t load) {
 // the same uses of one show. A ghost claimed back holds its key again, so it
 // takes none of their places: with a margin of two, the claim of the newest
 // ghost leaves the one before it among the two newest, and with a margin of
-// one it does not; a touch of one of the two least recently used keys of
-// the list REPLACE recycles from is a unit's less, of another key, of T2's
-// while T1 is recycled, or a scan's is not; a compaction keeps each list's
-// tail.
+// one it does not; a touch of one of the two keys a compaction to a unit
+// less gives up, T1's oldest while T1 holds two keys or more past its
+// target, is a unit's less, of another key, T2's then, or a scan's is not;
+// a compaction keeps the keys that are.
 void countsMarginalHits() {
   for (const uint32_t margin : {1u, 2u}) {
     SlotRecycler slots(4, margin), more(4 + margin);
@@ -225,17 +226,17 @@ void countsMarginalHits() {
   SlotRecycler slots(8, 2);
   for (uint64_t key = 1; key <= 8; ++key) static_cast<void>(slots.claim(key, 1, false));
   const auto touch = [&](uint64_t key, uint64_t load, bool chunk) { slots.touch(*slots.find(key), load, chunk); };
-  // T1 1..8, recycled from: 1 and 2 are its tail.
+  // T1 1..8 past its target of none: 1 and 2 are its tail.
   touch(1, 2, false);
   require(slots.tailHits() == 1, "a touch of T1's least recently used key was not a unit's less");
   touch(5, 2, false);
   require(slots.tailHits() == 1, "a touch of a key past T1's tail was a unit's less");
   touch(2, 2, false);
   require(slots.tailHits() == 2, "the key that joined T1's tail did not count");
-  // T2 1, 5, 2; T1 3, 4, 6, 7, 8, recycled from.
+  // T2 1, 5, 2; T1 3, 4, 6, 7, 8, whose 3 and 4 a unit less gives up.
   touch(1, 3, false);
   touch(3, 3, true);
-  require(slots.tailHits() == 2, "a touch of T2's tail while T1 is recycled, or a scan's, was a unit's less");
+  require(slots.tailHits() == 2, "a touch of a key a unit less keeps, or a scan's, was a unit's less");
   // To six slots: 3 and 4 go first, 7 and 8 move below; T1's tail is 6, 7.
   slots.compact(6, [](uint32_t) {}, [](uint32_t, uint32_t) {});
   require(!slots.find(3) && !slots.find(4) && slots.find(7) && slots.find(8), "the compaction kept 3 or 4");
@@ -243,6 +244,94 @@ void countsMarginalHits() {
   require(slots.tailHits() == 2, "a compaction put the key past T1's tail into it");
   touch(7, 4, false);
   require(slots.tailHits() == 3, "a compaction lost a key of T1's tail");
+}
+
+// The keys of `keys` that a compaction of a copy of `slots` to `margin`
+// slots fewer gives up.
+std::set<uint64_t> givenUp(const SlotRecycler &slots, uint32_t margin, const std::set<uint64_t> &keys) {
+  SlotRecycler fewer = slots;
+  std::map<uint32_t, uint64_t> keyOf;
+  for (const uint64_t key : keys)
+    if (const auto slot = fewer.find(key)) keyOf[*slot] = key;
+  std::set<uint64_t> result;
+  fewer.compact(
+      fewer.size() - margin, [&](uint32_t slot) { result.insert(keyOf.at(slot)); }, [](uint32_t, uint32_t) {});
+  return result;
+}
+
+// Whether load `load`'s touch of `key`, held, is a unit's less, on a copy.
+bool aUnitLess(const SlotRecycler &slots, uint64_t key, uint64_t load) {
+  SlotRecycler touched = slots;
+  touched.touch(*touched.find(key), load, false);
+  return touched.tailHits() > slots.tailHits();
+}
+
+// A touch is a unit's less when a compaction to a unit less gives its key
+// up. With T1 one key past its target, that is T1's oldest key and T2's
+// oldest (REPLACE recycles T1 while T1 holds more than its target, then
+// T2), not T1's two oldest. And so on recyclers whose loads use keys again,
+// new keys and ghosts, as scans or not, between freed slots, units added
+// and compactions to a unit less: also when free slots leave a compaction
+// fewer keys to give up than the margin.
+void countsTheTouchesAUnitLessGivesUp() {
+  {
+    SlotRecycler slots(6, 2);
+    for (uint64_t key = 1; key <= 6; ++key) static_cast<void>(use(slots, key, 1));
+    for (const uint64_t key : {1, 2, 3, 4}) static_cast<void>(use(slots, key, 2));
+    // T1 gives 5 up as a ghost for 7; 5's claim grows T1's target to one
+    // and recycles 6; T1 at its target, 8 recycles T2's 1. T1 holds 7, 8,
+    // one past its target, and T2 2, 3, 4, 5.
+    static_cast<void>(use(slots, 7, 3));
+    static_cast<void>(use(slots, 5, 4));
+    static_cast<void>(use(slots, 8, 5));
+    require(slots.ghostHits() == 1 && !slots.find(1) && !slots.find(6), "the claims recycled other keys than 6 and 1");
+    const std::set<uint64_t> held{2, 3, 4, 5, 7, 8};
+    require(givenUp(slots, 2, held) == std::set<uint64_t>{2, 7},
+            "a compaction to a unit less gave up other keys than T1's 7 and T2's 2");
+    for (const uint64_t key : held)
+      require(aUnitLess(slots, key, 6) == (key == 2 || key == 7),
+              "with T1 one past its target, the touch of " + std::to_string(key) +
+                  (key == 2 || key == 7 ? " was not a unit's less, though a compaction to a unit less gives it up"
+                                        : " was a unit's less, though a compaction to a unit less keeps it"));
+  }
+  for (const auto &[start, margin] : {std::pair{12u, 3u}, std::pair{9u, 4u}, std::pair{16u, 2u}}) {
+    SlotRecycler slots(start, margin);
+    std::mt19937 random(start * 64 + margin);
+    std::set<uint64_t> used;
+    uint64_t fewerThanTheMargin = 0, theMargin = 0;
+    for (uint64_t load = 1; load <= 400; ++load) {
+      const uint32_t kind = random() % 20;
+      if (kind == 0 && slots.size() < start + 2 * margin) {
+        slots.resize(slots.size() + margin);
+      } else if (kind == 1 && slots.size() >= 2 * margin) {
+        slots.compact(slots.size() - margin, [](uint32_t) {}, [](uint32_t, uint32_t) {});
+      } else if (kind == 2 && !used.empty()) {
+        if (const auto slot = slots.find(*std::next(used.begin(), random() % used.size()))) slots.free(*slot);
+      } else {
+        // Keys used again and again, and others, which come back as
+        // ghosts or new keys; some loads are scans.
+        std::set<uint64_t> keys;
+        for (uint32_t count = 1 + random() % (slots.size() / 3 + 1); keys.size() < count;)
+          keys.insert(random() % 2 ? random() % 6 : random() % (4 * start));
+        for (const uint64_t key : keys) {
+          if (const auto slot = slots.find(key)) slots.touch(*slot, load, kind == 3);
+          else static_cast<void>(slots.claim(key, load, kind == 3));
+          used.insert(key);
+        }
+      }
+      const std::set<uint64_t> victims = givenUp(slots, margin, used);
+      for (const uint64_t key : used)
+        if (slots.find(key))
+          require(aUnitLess(slots, key, load + 1) == victims.contains(key),
+                  "after load " + std::to_string(load) + " of " + std::to_string(slots.size()) + " slots, the touch of " +
+                      std::to_string(key) + (victims.contains(key) ? " was not" : " was") +
+                      " a unit's less, though a compaction to a unit less " +
+                      (victims.contains(key) ? "gives it up" : "keeps it"));
+      ++(victims.size() < margin ? fewerThanTheMargin : theMargin);
+    }
+    require(fewerThanTheMargin && theMargin && slots.ghostHits(),
+            "the loads left no free slot, or always some, or hit no ghost");
+  }
 }
 
 void resizes() {
@@ -620,6 +709,7 @@ int main(int argc, char **argv) {
     findsWhatItHolds();
     countsItsGhosts();
     countsMarginalHits();
+    countsTheTouchesAUnitLessGivesUp();
     resizes();
     compactsInRecencyOrder();
     compactsAtTheTarget();

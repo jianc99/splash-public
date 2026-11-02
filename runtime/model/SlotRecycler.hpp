@@ -82,8 +82,8 @@ public:
   // The marginal counts, of uses that are not a scan's: the ghost hits on a
   // key among the `margin` newest ghosts (of B1 and B2, in the order they
   // were given up), which a unit more would have held, and the touches of a
-  // key among the `margin` least recently used of the list REPLACE recycles
-  // from now, which a unit less would have given up first.
+  // key a compaction to `margin` slots fewer would give up now, which a unit
+  // less would have given up first.
   [[nodiscard]] uint64_t nearGhostHits() const noexcept { return nearGhostHits_; }
   [[nodiscard]] uint64_t tailHits() const noexcept { return tailHits_; }
 
@@ -160,12 +160,10 @@ private:
   [[nodiscard]] bool recyclesRecent(bool frequentGhost) const noexcept {
     return recent_.count && (recent_.count > target_ || (frequentGhost && recent_.count == target_));
   }
-  // The tail of a list, its margin_ least recently used slots (tail_, the
-  // last of them tailEnd_): `slot`, just linked at the list's least or most
-  // recently used end, joins it or not; `slot`, about to be unlinked,
-  // leaves it, and the slot past the tail joins it.
-  void joinTail(uint32_t slot, List list, bool leastRecent) noexcept;
-  void leaveTail(uint32_t slot, List list) noexcept;
+  // The tails of T1 and T2 hold the slots compact() to margin_ slots fewer
+  // would give up now, after a change of the lists, the target or the free
+  // slots.
+  void fitTails() noexcept;
   // `slot` leaves its list and gives its key up, as a ghost or not.
   void evict(uint32_t slot, bool ghost);
   // A ghost joins or leaves its list and the order of all ghosts, whose
@@ -196,12 +194,12 @@ private:
   // T1's target size.
   uint64_t target_ = 0;
   uint64_t ghostHits_ = 0;
-  // The marginal counts: the margin, each slot's place in its list's tail
-  // and the tails' last slots (T1's, T2's), the ghosts among the margin_
-  // newest (a run of ghostsByAge_), and the counts.
+  // The marginal counts: the margin, the slots in the tails of T1 and T2
+  // (runs of their lists), the ghosts among the margin_ newest (a run of
+  // ghostsByAge_), and the counts.
   uint32_t margin_ = 0;
   std::vector<uint8_t> tail_;
-  uint32_t tailEnd_[2] = {UINT32_MAX, UINT32_MAX};
+  Run tails_[2];
   std::vector<uint8_t> near_;
   Run nearGhosts_{.oldest = false};
   uint64_t nearGhostHits_ = 0, tailHits_ = 0;
