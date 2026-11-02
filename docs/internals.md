@@ -1075,7 +1075,7 @@ command is submitted, whatever GPU work runs ahead of it, and each later one
 once the one before it was met (macOS 27, M5 Max and M5 Pro; a wait committed
 behind 4.5 s of work and met 1 s after it fails at 5.0 s). The work between
 two steps, with the step, must therefore end within 5 s, which the
-scheduler's prefill slices keep with room to spare. Work outside them runs as
+scheduler's bounded prefill units keep with room to spare. Work outside them runs as
 a command of its own: a prefill command's image encodes, seconds of GPU work
 on a small GPU, run first, and the prefill command is submitted once they
 have completed ([Vision](models.md#vision)).
@@ -1089,9 +1089,7 @@ Metal compiler that refuses it only warns. Before the first command with such
 a step, the backend checks that the spin sees the CPU end it; without the
 library, or if it does not, the steps run without the spin, with a warning.
 A completed command reports each step's round trip (`HostStepTiming`) and the
-time its GPU work waited on its steps (`CommandTiming::hostSeconds`), which the
-scheduler counts as the command's fixed cost
-([Admission and eviction](#admission-and-eviction)).
+time its GPU work waited on its steps (`CommandTiming::hostSeconds`).
 
 ## Residency and KV extents
 
@@ -1502,40 +1500,51 @@ when no RAM slot took it, stays there. These writes draw on the SSD cache's
 write budget when one is set, which drops them while it is spent, a suspended
 request's own too, and a full quota makes room for one by dropping the oldest
 copy, perhaps an older conversation's restore point.
-Contended prefill adapts toward a 500 ms slice, keeping
-2048-token chunks for long unopposed work. A command's estimated cost is a fixed
-part and a part per row. The first command, the startup's warm-up, seeds them:
-the time its GPU work waited on host steps (a streamed target's expert reads)
-fixed, the rest per row. The later commands fit them, the least-squares line of
-their times by their rows, each weighing three quarters of the next and none
-more than twice or less than half what the estimate gave it, its fixed part
-held to their waits on host steps until their rows spread by about a chunk:
-commands of one size, as contended ones are, keep what the depth of their rows
-adds per row, and on a target whose experts stream, commands of several sizes
-split out the GPU's work that is the same whatever a command's rows, which the
-host waits miss. On a 24 GB M6, Flash-Next's 2048-row warm-up waits
-0.7 s of its 3.2 s on host steps, and commands of a few hundred to 8192 rows
-then fit about 2.4 s and 1.2 ms a row, most within 15% of their measured
-times, the first turns after a cold prompt's groups up to 60% under, where taking
-every command's host waits for its fixed part gave a 300-row command 2.1 s of
-its 3.0 s and a group of 8192 rows 22.9 s of its 11.7 s. The slice grows to
-twice the fixed part, so a
-command's rows take at least as long as its fixed part. Unopposed, a target whose
-experts stream runs its remaining chunks in as few prefill groups of up to four
-as hold them, evenly split, and so does a request whose KV spills to the SSD
-cache, or that holds another request's spilled blocks, which reads its history
-once a group; one whose KV stays in memory on a target whose experts load whole
-runs chunks, so a request that arrives beside it waits for a chunk. On a target whose experts stream, a command reads nearly all
-of each layer's experts whatever its rows, a fixed cost that shortest-first
-commands would each pay: a request keeps its groups whatever contends, and a
-prompt that ends within a chunk shares the chunk with the ready prompts of its
-priority, one command for all of them, each taking the fewest rows that spare it
-a command of its own, all of a short prompt's, while the fixed part it saves
-outweighs what its rows add for the prompts before it; a longer prompt that the
-rows left in the chunk cannot spare one waits for its own, whose reads it pays
-either way. A command
-whose estimate exceeds the slice runs in passes over the model's layers, as many
-as keep each within the slice; every pass runs all its lanes, decode commands of
+One estimate prices every prefill unit, a command or one pass of it
+(`CostModel`), from the work the model expects of it
+(`PrefillWorkSource::prefillWork`): a turnaround, and a cost per chunk-layer,
+row-layer, attention pair, block-index pair, byte of weights read from the SSD
+and byte of spilled K/V read from it. Startup seeds it before Ready: a byte of
+either read at the rate loading the weights read the SSD, and from two prefill
+warm-ups, of a chunk's rows and of 256, the line of their times less those
+reads by their row-layers, whose intercept is a chunk-layer's cost; the
+turnaround starts at zero. Every unit that runs rows then trains it, a pass by
+its share of its command, each weighing nine tenths of the next, its time held
+within half and twice its price, in a fit that keeps every cost non-negative
+and a cost no unit's work varies at its seed; the bytes it prices are scaled
+by what units read over what the model expected of them. The status reports
+each cost, its seed and that scale, and the units' relative errors over the
+last 256 (`scheduler.prefill_estimate`), and a decode token's time
+(`scheduler.decode_estimate`).
+
+Prefill takes the ready lanes of the most urgent priority. Within it a lane
+that has waited, while units served later arrivals of its priority, three times
+its own expected remaining cost is overdue and leads, to its prompt's end (work
+it loses to an abandoned command counts as waited); otherwise the lane of the
+least expected remaining cost leads, ties to fewer rows, then in submission
+order. The leader takes a chunk, or a group of the model's command rows (four
+chunks on a target whose experts stream), evenly split, where the fixed part a
+group saves, its chunks' reads, is worth a wait of the decode gap G, 500 ms
+(`EngineConfig::decodeGapMilliseconds`): a request whose KV spills, or that
+holds another request's spilled blocks, reads its history once a group, and
+one whose KV stays in memory on a target whose experts load whole runs chunks.
+While a lane of its priority or a higher one decodes, or when it leads a group,
+a unit is bounded: it runs in the fewest passes over the model's layers whose
+every pass's price is within max(G, ten times the turnaround), or failing that
+within twice the pass's fixed part (the turnaround and the pass's reads); a
+contended unit no passes bound halves its rows (`scheduler.bound_cuts`). The
+query-key pairs one attention layer computes bound a command's rows, never its
+passes (`CommandLimits::attentionPairs`). Another ready prompt of the priority
+joins the command with the fewest rows that spare it a command of its own, all
+of a short prompt's, while what its rows add to the command, for each lane
+already in it, is no more than what it saves, and never only to fill the
+leader's chunk: a longer prompt that the rows left cannot spare a command waits
+for its own. A joiner keeps the unit within its bound where the plan meets it,
+and a command holds at most `CommandLimits::indexPageLanes` lanes whose history
+may hold Index pages (`scheduler.index_page_conflicts` counts the plans that
+left one out for it). A lane whose history holds Index pages reads that history
+in each command, whatever its rows, which its price counts, and holds the
+history's staging while it does. Every pass runs all its lanes, decode commands of
 any priority run between passes as priority and the decode share order them,
 and only the last commits their rows. A pass runs at the priority of the most
 urgent request its command holds back, a prompt it does not yield to or a start
@@ -1545,9 +1554,13 @@ later passes come before any other
 prefill, whose rows would take the prefill memory its work is in, but admission
 waits for no pass: a request that arrives meanwhile starts at the next command's
 boundary, in ordinary admission and during recovery alike. A command between
-its passes is abandoned, nothing of it committed, for work that supersedes it
-while the passes its lanes lose by that, together, are fewer than those the
-lanes that supersede it save, what is left of its passes for each. Prompts of
+its passes is abandoned, nothing of it committed, for work that supersedes it:
+work that leaves no lane of it overdue behind and shortens the summed
+completion of the lanes concerned, the command's, the work's and the other
+ready prompts of either priority, each lane of the command losing the passes
+it ran (a lane of a lower priority than the work only those, the work's
+precedence being given) and each lane the work runs saving what is left of the
+command's passes, and what it adds. Prompts of
 its priority that are ready then join it, the command planned again with them
 from its first pass, where that command keeps every lane's rows and none of the
 prompts was ready and left out of the command's first pass (a lane refused memory the
@@ -1560,13 +1573,12 @@ prompts' rows. Requests that arrive during a command's first pass, as an
 agent's concurrent turns do, so end their prompts together, a pass and a
 command after the first arrived; prompts ready late in its passes, or with
 rows that make the command planned again much longer, wait for its end. A
-prompt of a higher priority supersedes the command once that prompt's command
-runs, the command's lanes losing the passes they ran: for one lane each, while
-the command has fewer passes behind it than ahead. That trades the higher
-priority's first token for the lower one's work: a Foreground prompt that
-arrives late in a Background command's passes waits for the rest of them,
-fewer, lane for lane, than it would throw away, and half a command at most
-where the command has one lane. The command yields so, whole, to the
+prompt of a higher priority supersedes the command by the same rule once that
+prompt's command runs, the command's lanes losing the passes they ran. That
+trades the higher priority's first token for the lower one's work: a
+Foreground prompt that arrives late in a Background command's passes waits for
+the rest of them, fewer, lane for lane, than it would throw away. The command
+yields so, whole, to the
 suspension of any of its lanes too, whose others run their rows again in a
 later command, and a lane of it that would yield beside one of it that ended
 gives the command up in its place, which gives back the ended lanes' lanes and
@@ -1577,22 +1589,15 @@ the command up, as that work does anyway once it runs, is the first rung of
 the ladder above the cache nothing in use holds. Any other start refused
 memory climbs the rest of the ladder and, still refused, waits for the
 command's end rather than suspend a lane of it, which would give the command
-up all the same. Once a lane has seen three of
-its commands abandoned since its rows last committed, as many as a command
-planned again can widen, its command runs to its end: a long prompt's rows
-commit however often short prompts or work of a higher priority arrive. A request that ends
+up all the same. The passes a lane loses count as waited, so a lane whose
+commands are abandoned again and again becomes overdue, and no work supersedes
+a command with an overdue lane: a long prompt's rows commit however often
+short prompts or work of a higher priority arrive. A request that ends
 between passes, cancelled or at its deadline, stays in the command to its last
 pass, which commits nothing of it, and a command all of whose requests have
-ended stops at once. A lane whose history holds KV only the SSD cache has
-reads all of that history in each command, whatever its rows: it runs alone,
-and contended it takes the fewest rows, halving from its group's, whose time
-still covers its own running estimate of that wait, and never fewer than another
-contended command; the wait stays out of the command estimate. Without
-contention, a prompt that can finish within one 2048-token chunk ends its chunk
-at its last row instead of sharing it with a longer prompt, but where its
-command may run in passes (above). While requests of the same or a higher priority
-decode (a lane waiting for its token mask is owed nothing), each slice owes them
-decode time, `--decode-share` times its own, before the next slice runs. These
+ended stops at once. While requests of the same or a higher priority
+decode (a lane waiting for its token mask is owed nothing), each prefill unit owes them
+decode time, `--decode-share` times its own, before the next one runs. These
 policies do not extend client deadlines. Memory recovery waits are bounded:
 after a suspension, new work waits for resident requests only while memory is
 still short, and at most for the 30 s resource wait; suspended requests then
