@@ -182,12 +182,14 @@ struct LoopFixture {
     return config;
   }
 
-  // Ticks, with memory running the control pass between commands and the
-  // memory checks (I1) after each tick, again at once after a tick that
-  // made progress, else once the awake clock reaches the earliest of the
-  // command in flight's end, the loop's next wakeup, the tier's next landing
-  // and the host's next event, or 1 ms on; until done() or `steps` ticks,
-  // then requires done().
+  // Ticks, with memory running the control pass between commands, and
+  // after each tick the checks of EngineHarness::check: the memory checks
+  // (I1) with memory, the extents' activity following the pages requests
+  // hold (I4) and, between commands, the cache's invariants (I5); I3 holds
+  // inside the storage. Again at once after a tick that made progress, else
+  // once the awake clock reaches the earliest of the command in flight's
+  // end, the loop's next wakeup, the tier's next landing and the host's next
+  // event, or 1 ms on; until done() or `steps` ticks, then requires done().
   void run(const std::function<bool()> &done, std::string_view what, uint32_t steps = 100'000) {
     for (uint32_t step = 0; step < steps && !done(); ++step) {
       const bool progressed = loop.tick();
@@ -199,6 +201,9 @@ struct LoopFixture {
                      .model = executor,
                      .weights = &weights,
                      .governor = &*governor});
+      require(storage.activityFollows(pool), "KV extents' activity does not follow the pages requests hold");
+      if (!loop.commandInFlight())
+        cache.checkInvariants();
       if (progressed)
         continue;
       const std::optional<double> wakeup = loop.millisecondsUntilNextWakeup();
