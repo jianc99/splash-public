@@ -27,39 +27,6 @@ using splash::test::request;
 using splash::test::require;
 using splash::test::runUntilIdle;
 
-// A start marks what it allocates as memory a request in service needs until
-// serving begins. An allocation the engine marks meanwhile restores the mark
-// it found, so the start's mark outlives it, and once serving begins the
-// engine's marks still end with their allocations.
-void testServingMarkRestoresTheMarkItFound() {
-  test::metalStatistics() = {};
-  metal::MetalBackend backend("unused");
-  constexpr uint64_t hostReserve = 2ULL << 30;
-  const std::optional<uint64_t> available = hostReserve + (16ULL << 30);
-  MemoryGovernor governor(backend, 40ULL << 30, hostReserve, hostReserve,
-                          [&available] { return hostMemory(available); }, 0);
-  // Under macOS's warning only the mark admits growth.
-  governor.setPressure(MemoryPressure::Warning);
-  const auto admits = [&governor] {
-    return static_cast<bool>(governor.allocationAdmission()(4096, [] {}));
-  };
-  const std::function<bool(bool)> mark = [&governor](bool serving) {
-    return governor.setServing(serving);
-  };
-  static_cast<void>(governor.setServing(true));
-  {
-    const Serving allocation(mark, true);
-    require(admits(), "an allocation the engine marked was refused");
-  }
-  require(admits(), "an allocation the engine marked ended the start's mark");
-  static_cast<void>(governor.setServing(false));
-  {
-    const Serving allocation(mark, true);
-    require(admits(), "an allocation the engine marked was refused once serving began");
-  }
-  require(!admits(), "an allocation the engine marked left its mark behind");
-}
-
 // The reporter logs a change in what requests wait for, never a retry or the
 // depth of a queue.
 void testMemoryStatusReporterLogsTransitionsOnly() {
@@ -178,7 +145,6 @@ void testLaggingHostReadingsCauseNoSecondRelease() {
 
 std::span<const test::TestCase> memoryTests() {
   static constexpr test::TestCase kTests[] = {
-      {"testServingMarkRestoresTheMarkItFound", testServingMarkRestoresTheMarkItFound},
       {"testMemoryStatusReporterLogsTransitionsOnly", testMemoryStatusReporterLogsTransitionsOnly},
       {"testRestoreBringsTheFloorThenGrowthTheRest", testRestoreBringsTheFloorThenGrowthTheRest},
       {"testStoreRetakesFreeRoomAfterCriticalPressure", testStoreRetakesFreeRoomAfterCriticalPressure},

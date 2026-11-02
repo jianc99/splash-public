@@ -88,7 +88,6 @@ public:
     if (memory) {
       model.memory = &*memory;
       model.admission = governor->allocationAdmission();
-      model.growthAdmission = governor->growthAdmission();
     }
     if (options_.timing) {
       model.time(*options_.timing);

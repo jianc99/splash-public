@@ -21,16 +21,12 @@ inline engine::MemoryGovernor *(*ampleGovernor)() = nullptr;
 
 // An engine config completed as the bootstrap completes one, for tests: what
 // the test set, and otherwise the whole logical context, every 32-bit token
-// in the vocabulary, a host that never pauses growth and an ample governor.
+// in the vocabulary and an ample governor.
 [[nodiscard]] inline engine::EngineConfig engineConfig(engine::EngineConfig config = {}) {
   if (!config.maxContext)
     config.maxContext = kv::kMaximumLogicalTokens;
   if (!config.vocabularySize)
     config.vocabularySize = std::numeric_limits<uint32_t>::max();
-  if (!config.growthPaused)
-    config.growthPaused = [] { return false; };
-  if (!config.serving)
-    config.serving = [](bool) { return false; };
   if (!config.governor && ampleGovernor)
     config.governor = ampleGovernor();
   return config;

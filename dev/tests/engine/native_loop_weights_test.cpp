@@ -1,3 +1,4 @@
+#include "ClaimScope.hpp"
 #include "LoopFixture.hpp"
 #include "ProtocolPeer.hpp"
 #include "TestChecks.hpp"
@@ -80,9 +81,12 @@ void testIdleWeightsAreReleasedAndRestored(bool releasable) {
   MemoryGovernor governor(backend, 40ULL << 30, 2ULL << 30, 2ULL << 30,
                           [] { return hostMemory(64ULL << 30); }, 0);
   MemoryControl control(governor, backend, loop);
+  // The pass runs as the transport runs it, at a command-free point: one
+  // asked while a command is in flight waits for its end (FdTransport).
   const auto idlePass = [&](double elapsed) {
     fixture.monotonic += elapsed;
-    static_cast<void>(control.run(MemoryPressure::Normal));
+    if (!loop.commandInFlight())
+      static_cast<void>(control.run(MemoryPressure::Normal));
     return weights.released();
   };
   // Warmup before Ready is not idleness.
@@ -338,9 +342,14 @@ void testRefusedRestoreWaitsForMemory() {
   pass(MemoryPressure::Normal, 1000.0 * kIdleReleaseSeconds);
   require(memory.released() && programReleases == 1, "idle weights were kept");
   hostAvailable = kReserve + (512ULL << 20);
-  require(governor.allocationAdmission()(Weights::kImageBytes, [] {}).failure ==
-              metal::AllocationFailure::HostPressure,
-          "the host's margin admitted memory no request needs");
+  {
+    // Memory no request needs is a Start claim's, as the restore's is with
+    // no request waiting.
+    const test::ClaimScope start(governor, ClaimClass::Start);
+    require(governor.allocationAdmission()(Weights::kImageBytes, [] {}).failure ==
+                metal::AllocationFailure::HostPressure,
+            "the host's margin admitted memory no request needs");
+  }
   require(loop.receive(protocol::peer::serialize(request(1))) && loop.tick() &&
               weights.held() == 1,
           "the host's margin held back weights a request waits for");
@@ -790,8 +799,9 @@ struct StoreMemory final : model::WeightMemory {
 };
 
 // The expert store's idle restore takes its floor back as memory the request
-// waiting needs, and no chunk above it: the request runs at once, and the
-// control pass grows the store back to its cap once memory is ample.
+// waiting needs, and no chunk above it: the request runs at once. The chunks
+// above the floor come back as the ledger grows the store's pool
+// (native_loop_memory_test's testRestoreBringsTheFloorThenGrowthTheRest).
 void testRestoredStoreGrowsBackAfterTheRequest() {
   Executor *model = nullptr;
   StoreMemory store(model);
@@ -803,12 +813,6 @@ void testRestoredStoreGrowsBackAfterTheRequest() {
   engine::NativeRuntime &loop = fixture.loop;
   constexpr uint64_t chunk = 1ULL << 30;
   fixture.executor.expertChunks = {chunk, chunk, chunk};
-  test::metalStatistics() = {};
-  metal::MetalBackend backend("unused");
-  constexpr uint64_t hostReserve = 2ULL << 30;
-  MemoryGovernor governor(backend, 40ULL << 30, hostReserve, hostReserve,
-                          [] { return hostMemory(hostReserve + (16ULL << 30)); }, 0);
-  MemoryControl control(governor, backend, loop);
   loop.announceReady();
   require(!releaseAnswer(fixture, 1).restoring && store.released() &&
               fixture.executor.releasedExpertChunks.size() == 3,
@@ -818,15 +822,12 @@ void testRestoredStoreGrowsBackAfterTheRequest() {
   require(loop.statusSnapshot().completed == 1 && loop.resourceWaitSnapshot().memory == 0 &&
               store.floors == 1 && fixture.executor.expertChunks.empty(),
           "the restore took a chunk above the floor back, or held the request");
-  for (uint32_t pass = 0; pass < 8 && fixture.executor.expertChunks.size() < 3; ++pass)
-    static_cast<void>(control.run(MemoryPressure::Normal));
-  require(fixture.executor.expertChunks.size() == 3,
-          "the control pass did not grow the restored store back to its cap");
 }
 
 // Under the governor's admissions (Bootstrap's), the restore takes back the
-// store's floor alone, whatever the host spares, and the request runs; on an
-// ample host the control pass then grows the store back to its cap.
+// store's floor alone, whatever the host spares, and the request runs: a
+// request waits for it, so it is a Floor claim's, which the host's margin
+// does not refuse.
 void testRestoreTakesTheFloorWhateverTheHostSpares() {
   constexpr uint64_t chunk = 1ULL << 30;
   constexpr uint64_t hostReserve = 2ULL << 30;
@@ -835,10 +836,8 @@ void testRestoreTakesTheFloorWhateverTheHostSpares() {
     StoreMemory store(model);
     test::metalStatistics() = {};
     metal::MetalBackend backend("unused");
-    // The floor fits beside the warning margin; a chunk does not beside the
-    // recovery margin unless the host is ample.
-    const uint64_t spare = ample ? 3 * chunk + kHostRecoveryMarginBytes
-                                 : chunk + kHostRecoveryMarginBytes - 4096;
+    // Short of the host's margin, or past it by the whole store.
+    const uint64_t spare = ample ? 3 * chunk + kHostMarginBytes : kHostMarginBytes - 4096;
     MemoryGovernor governor(backend, 40ULL << 30, hostReserve, hostReserve,
                             [&] { return hostMemory(hostReserve + spare); }, 0);
     engine::NativeLoopConfig config;
@@ -849,8 +848,6 @@ void testRestoreTakesTheFloorWhateverTheHostSpares() {
     LoopFixture fixture(config);
     model = &fixture.executor;
     fixture.executor.expertChunks = {chunk, chunk, chunk};
-    fixture.executor.expertAdmission = governor.growthAdmission();
-    MemoryControl control(governor, backend, fixture.loop);
     fixture.loop.announceReady();
     require(!releaseAnswer(fixture, 1).restoring && store.released(), "the store was not released");
     require(fixture.loop.receive(protocol::peer::serialize(request(1))), "the request failed");
@@ -858,12 +855,6 @@ void testRestoreTakesTheFloorWhateverTheHostSpares() {
     require(fixture.loop.statusSnapshot().completed == 1 && store.floors == 1 &&
                 fixture.executor.expertChunks.empty(),
             "the restore took a chunk above the floor back");
-    if (!ample)
-      continue;
-    for (uint32_t pass = 0; pass < 8 && fixture.executor.expertChunks.size() < 3; ++pass)
-      static_cast<void>(control.run(MemoryPressure::Normal));
-    require(fixture.executor.expertChunks.size() == 3,
-            "an ample host did not grow the restored store back to its cap");
   }
 }
 

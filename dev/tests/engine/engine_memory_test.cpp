@@ -5637,7 +5637,7 @@ void testReplayPointAdmittedInMarginBand() {
   // The host's spare memory falls by the state buffers it gives.
   uint64_t given = 0;
   MemoryGovernor governor(backend, 40ULL << 30, reserve, reserve, [&] {
-    const uint64_t spare = reserve + kHostWarningMarginBytes + stateBytes / 2 - given;
+    const uint64_t spare = reserve + kHostMarginBytes + stateBytes / 2 - given;
     return std::optional<HostMemory>{{spare, spare}};
   }, 0);
   test::TestKvStorage storage(64, 4096, 4);
@@ -5669,7 +5669,7 @@ void testReplayPointAdmittedInMarginBand() {
   tickUntil(engine, now, [&] { return idle(engine); }, "the first turn did not finish");
   require(engine.snapshot().replayStatePublications == 1 &&
               engine.snapshot().replayStatePublicationFailures == 0 && given == stateBytes &&
-              governor.snapshot().hostHeadroomBytes < kHostWarningMarginBytes,
+              governor.snapshot().hostHeadroomBytes < kHostMarginBytes,
           "the host's margin refused the replay point of the request in service");
 
   // The next turn resumes there, and its own point recycles the first's.

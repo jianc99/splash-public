@@ -1995,10 +1995,7 @@ void testIncompleteConfigIsRefused() {
           "context and vocabulary sizes must be positive");
   refused([](EngineConfig &config) { config.vocabularySize = 0; },
           "context and vocabulary sizes must be positive");
-  refused([](EngineConfig &config) { config.growthPaused = {}; },
-          "the engine needs the governor's growth pause and serving mark");
-  refused([](EngineConfig &config) { config.serving = {}; },
-          "the engine needs the governor's growth pause and serving mark");
+  refused([](EngineConfig &config) { config.governor = nullptr; }, "the engine needs its memory governor");
   refused([](EngineConfig &config) { config.spill.capable = true; },
           "a target that can spill needs its page and slot sizes");
 }

@@ -46,8 +46,8 @@ inline constexpr double kResourceRetryBackoffMilliseconds = 100.0;
 inline constexpr uint32_t kProjectedOutputTokens = 4096;
 
 // The engine's constructor refuses a config without its context window, its
-// vocabulary or the governor's two hooks, which the bootstrap sets from the
-// model, its memory plan and the governor (connectToGovernor).
+// vocabulary or its governor, which the bootstrap sets from the model, its
+// memory plan and the governor (connectToGovernor).
 struct EngineConfig final {
   uint32_t maxContext = 0;
   uint32_t vocabularySize = 0;
@@ -66,18 +66,9 @@ struct EngineConfig final {
   // The prefill checkpoint interval and the resource wait limit.
   uint32_t prefillCheckpointTokens = kPrefillCheckpointTokens;
   double resourceWaitTimeoutMilliseconds = kResourceWaitTimeoutMilliseconds;
-  // The governor whose ledger holds the requests' claims on memory
-  // (ClaimHandle), which connectToGovernor sets beside its two hooks.
+  // The governor that admits the engine's memory and whose ledger holds
+  // the requests' claims on it (ClaimHandle), which connectToGovernor sets.
   MemoryGovernor *governor = nullptr;
-  // Host growth admission, supplied by the runtime governor. Queried while
-  // resident lanes drain after a suspension, and when a boundary's state
-  // buffers are refused: while growth is paused, extents released for them
-  // cannot hold them. Allocation reads the cause of a refusal instead.
-  std::function<bool()> growthPaused;
-  // Marks the allocations that follow as memory a request in service needs,
-  // which the pause does not hold back, or clears the mark, and returns the
-  // mark it replaced (MemoryGovernor::setServing).
-  std::function<bool(bool)> serving;
   // Which requests keep their KV on the SSD cache (KvMode), from the memory
   // plan; none unless the target can spill.
   EngineSpillConfig spill;
@@ -85,26 +76,6 @@ struct EngineConfig final {
   // the next request (WeightResidency): the native loop's; empty where
   // nothing is released.
   std::optional<WeightResidencyConfig> weights;
-};
-
-// While an active one lives, allocations are memory a request in service
-// needs (EngineConfig::serving). It restores the mark it found, so that a
-// start's mark (RuntimeResources::beginServing) outlives an allocation the
-// engine marks before serving begins.
-class Serving final {
-public:
-  Serving(const std::function<bool(bool)> &mark, bool active)
-      : mark_(active ? &mark : nullptr), previous_(mark_ && (*mark_)(true)) {}
-  ~Serving() {
-    if (mark_)
-      (*mark_)(previous_);
-  }
-  Serving(const Serving &) = delete;
-  Serving &operator=(const Serving &) = delete;
-
-private:
-  const std::function<bool(bool)> *mark_;
-  bool previous_;
 };
 
 // What a request fails with once it has waited the resource wait limit for
@@ -843,8 +814,7 @@ private:
     [[nodiscard]] std::vector<Victim> conversions(const VictimQuery &query) const;
     Engine &engine_;
   };
-  // The governor whose ledger holds the requests' claims; std::logic_error
-  // without one.
+  // The governor whose ledger holds the requests' claims.
   [[nodiscard]] MemoryGovernor &governor() const;
   // The pages a request's KV admission leaves free for the waiting claims
   // ranked above its claim (MemoryLedger::heldPages); none before its claim

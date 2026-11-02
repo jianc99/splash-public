@@ -7,6 +7,8 @@
 #include "TestStatus.hpp"
 #include "engine/Cache.hpp"
 #include "engine/Bootstrap.hpp"
+#include "engine/MemoryGovernor.hpp"
+#include "metal/MetalBackend.hpp"
 #include "TestModel.hpp"
 
 #import <Foundation/Foundation.h>
@@ -199,6 +201,17 @@ private:
   int throwingStep_ = -1;
 };
 
+// The Metal library the tests' backend loads (main's argument).
+std::string gMetallibPath;
+
+// This Mac's backend, under each harness's governor: a limit and a host
+// every engine's claims fit, for an engine that allocates nothing through
+// it but needs one for the claims it keeps.
+metal::MetalBackend &ampleGovernorBackend() {
+  static metal::MetalBackend backend(gMetallibPath);
+  return backend;
+}
+
 class Harness final {
 public:
   explicit Harness(int throwingStep = -1, bool failReadyWrite = false)
@@ -227,6 +240,7 @@ private:
   engine::NativeLoopConfig loopConfig() {
     return {.engine = test::engineConfig(
                 {.maxContext = 1024,
+                 .governor = &governor_,
                  .weights = engine::WeightResidencyConfig{.weights = &weights_, .admit = test::admitAll}}),
             .metrics = &metrics_};
   }
@@ -238,6 +252,10 @@ private:
   std::vector<uint8_t> output_;
   RuntimeMetrics metrics_;
   test::Weights weights_;
+  // Its own: the engine registers its cache and victims with it, and the
+  // ledger keeps them while it lives.
+  engine::MemoryGovernor governor_{ampleGovernorBackend(), 1ULL << 50, 1, 0,
+                                   [] { return std::optional<HostMemory>({1ULL << 50, 1ULL << 50}); }, 0};
   engine::NativeRuntime loop_;
 };
 
@@ -633,7 +651,12 @@ void testProtocolLimitsFollowTheModel() {
 
 } // namespace
 
-int main() {
+int main(int argc, char **argv) {
+  if (argc != 2) {
+    std::cerr << "usage: runtime-bootstrap METALLIB\n";
+    return EXIT_FAILURE;
+  }
+  gMetallibPath = argv[1];
   try {
     testRuntimeCacheIdentityReportsTheLoadedModel();
     testAllNativeWarmupsPrecedeReady();

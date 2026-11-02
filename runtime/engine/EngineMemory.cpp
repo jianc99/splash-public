@@ -225,11 +225,7 @@ void Engine::sampleSpilledReads(const BatchPlan &plan, const model::CommandSampl
   spilledReadWeight_ = kSpilledReadDecay * spilledReadWeight_ + 1.0;
 }
 
-MemoryGovernor &Engine::governor() const {
-  if (!config_.governor)
-    throw std::logic_error("the engine allocates through its governor's claims (connectToGovernor)");
-  return *config_.governor;
-}
+MemoryGovernor &Engine::governor() const { return *config_.governor; }
 
 std::array<uint32_t, 3> Engine::heldPages(const Request &active) const {
   return active.claim.id ? governor().ledger().heldPages(active.claim.id) : std::array<uint32_t, 3>{};

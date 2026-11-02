@@ -100,31 +100,6 @@ memoryPressureName(MemoryPressure pressure) noexcept {
 
 [[nodiscard]] std::optional<MemoryPressure> querySystemMemoryPressure() noexcept;
 
-// Growth that no request in service needs leaves the warning margin free
-// above the spare reserve, in the host's spare memory, and the paced reclaim
-// returns cache to keep it so. Once the host has run short, a request that
-// waits for memory has the paced reclaim free toward the recovery margin,
-// and such growth waits for that margin meanwhile, so that what reclaim
-// frees goes to the request; with no request waiting, a pass only restores
-// the warning margin and growth keeps to it. macOS's warning asks caches to
-// give memory back: while it lasts, such growth stops whatever the host's
-// headroom, and every pass returns up to the warning margin's worth of cache
-// until the level is normal again. Unavailable telemetry pauses growth; the
-// OS critical signal causes full eviction of unpinned cache entries and stops
-// all growth.
-inline constexpr uint64_t kHostWarningMarginBytes = 1ULL << 30;
-inline constexpr uint64_t kHostRecoveryMarginBytes = 2ULL << 30;
-
-// The memory an engine that holds `engineBytes` may hold in all on a host
-// whose memory is `host`: what it holds and the host's spare memory beyond
-// the spare reserve and the warning margin, which growth no request in
-// service needs leaves free and the paced reclaim restores while no request
-// waits (MemoryPressurePolicy). An engine without requests that holds no
-// more leaves that reclaim nothing to take; the plan sizes the streamed
-// stores within it (planStreamedMemory).
-[[nodiscard]] uint64_t hostBudgetBytes(const HostMemory &host, uint64_t spareReserveBytes,
-                                       uint64_t engineBytes) noexcept;
-
 // One account of the memory ledger: a consumer the ledger moves between its
 // floor and its cap, named as its owner names it ("kv", "states", "fixed",
 // or a model pool's name, which status renders and nothing branches on).
@@ -172,6 +147,8 @@ struct MemoryGovernorSnapshot {
   // Room under the limit beside what is charged and reserved: zero once the
   // engine's limit is reached.
   uint64_t headroomBytes = 0;
+  // macOS's critical pressure; else warning while macOS warns or the host
+  // is in its band (short of its margin, or unmeasured); else normal.
   MemoryPressure pressure = MemoryPressure::Normal;
   // Failed reservation attempts, including retries of the same request.
   uint64_t deniedReservations = 0;
@@ -181,14 +158,12 @@ struct MemoryGovernorSnapshot {
   uint64_t hostSpareBytes = 0;
   uint64_t hostSpareReserveBytes = 0;
   // The host's spare memory above its spare reserve, beside what is
-  // reserved: the room growth that no request in service needs takes from.
+  // reserved: the room the host's rule weighs work against (h).
   uint64_t hostHeadroomBytes = 0;
   MemoryPressure systemPressure = MemoryPressure::Normal;
-  // Whether the host has room for growth that no request in service needs
-  // and macOS reports normal pressure. Admission still grants what such a
-  // request needs while this is false, short of critical pressure.
-  // Allocation need not ask: admission names the host as the cause of every
-  // refusal the host shares.
+  // Whether the host's rule admits growth now: macOS reports normal
+  // pressure, the host is outside its band and keeps its margin. A claim
+  // the host refuses is told so with its cause, whatever this says.
   bool hostGrowthAllowed = true;
   // The host's memory as macOS counts it, which /status reports; none when
   // it does not (queryHostTelemetry).
@@ -199,73 +174,6 @@ struct MemoryGovernorSnapshot {
   uint64_t reservedBytes = 0;
   OwedBytesSnapshot owed{};
   MemoryClaimsSnapshot claims{};
-};
-
-// Critical pressure evicts every unpinned entry and takes what a request
-// starts from, one lane's pooled state buffers and the empty KV runway
-// extent, so it has no target. Every other pass keeps those for the growth
-// that follows; targetBytes zero returns only empty extents. keepResumePoint keeps
-// the newest state publication (else the newest checkpoint), the point a
-// follow-up request resumes from; only a shrink nothing waits for can afford
-// to, or one under macOS's warning, which holds a waiting request back too.
-// upTo is the highest class the pass takes. A shrink nothing waits for takes
-// nothing in use, under macOS's warning too: the states the requests in
-// service restore from and publish for their follow-ups, and the KV they
-// restore through. What it would free there goes back to those requests'
-// growth, which neither the host's margin nor the warning holds back, and
-// the replay point it would take is the next resume point. hostShort says
-// the host really lacks memory: a valid measurement short of the pass's
-// margin, or critical pressure, never macOS's warning alone. Only then does
-// a pass take the expert store's chunks above its floor
-// (Model::releaseExpertChunk), whose experts the next steps would read from
-// the SSD again.
-struct MemoryReclaimDirective {
-  bool critical = false;
-  uint64_t targetBytes = 0;
-  bool keepResumePoint = false;
-  ReclaimClass upTo = ReclaimClass::InUse;
-  bool hostShort = false;
-};
-
-// What a reclaim pass made of its directive's target.
-enum class ReclaimOutcome : uint8_t {
-  // The directive set none; the pass returned only empty extents.
-  Untargeted,
-  // Released, counting the pages whose copies are being written.
-  Met,
-  // Transfers in flight hold back the rest, which a pass can take once they
-  // land.
-  Pending,
-  // Nothing is left to release.
-  Exhausted,
-};
-
-struct MemoryReclaimResult {
-  uint64_t releasedBytes = 0;
-  ReclaimOutcome outcome = ReclaimOutcome::Untargeted;
-};
-
-// Bounded shrink passes separated by a telemetry settling interval. New host
-// pressure is never offset by bytes reclaimed earlier in the same episode.
-class MemoryPressurePolicy final {
-public:
-  // The pass to run now; none under normal pressure. requestWaiting reports
-  // whether a request cannot proceed for want of memory. Without one the
-  // pass is speculative: it keeps the resume point, as every pass under
-  // macOS's warning does, takes nothing in use and, unless macOS warns, only
-  // restores the warning margin.
-  [[nodiscard]] std::optional<MemoryReclaimDirective>
-  update(const MemoryGovernorSnapshot &snapshot, double nowMilliseconds,
-         bool requestWaiting) noexcept;
-  // What the pass of `directive` achieved. The passes up to the next
-  // measurement continue the part of its target that transfers held back:
-  // a KV chain gives up one leaf at a time, each after its copy is written.
-  void reclaimed(const MemoryReclaimDirective &directive,
-                 const MemoryReclaimResult &result) noexcept;
-
-private:
-  double nextReclaimMilliseconds_ = 0.0;
-  std::optional<MemoryReclaimDirective> continued_;
 };
 
 // The sole memory admission ledger. It does not allocate, evict, or
@@ -281,9 +189,9 @@ public:
   // Metal memory outside the backend's buffers (pipelines, driver
   // allocations) is charged only beyond untrackedReserveBytes, the part of
   // the limit the caller has set aside for it. The host's available memory
-  // must exceed hostReserveBytes, which macOS keeps; growth that no request
-  // in service needs keeps hostSpareReserveBytes of its spare memory, and
-  // the warning margin above them, for other applications.
+  // must exceed hostReserveBytes, which macOS keeps; the host's rule weighs
+  // work against its spare memory beyond hostSpareReserveBytes, which it
+  // keeps for other applications with the margin above them.
   // hostHeldBytes, host memory held outside Metal (the streamed table's
   // row cache), is charged in full.
   MemoryGovernor(metal::MetalBackend &backend, uint64_t limitBytes,
@@ -298,67 +206,23 @@ public:
 
   // The only way to reserve memory. Low-level storage/model components
   // receive only this transactional callback, so allocation stays governed
-  // without introducing a reverse dependency on engine policy. It reserves
-  // the bytes under the limit and the host's headroom while the allocation
-  // runs, or refuses them with the cause: HostPressure when the host refuses,
+  // without introducing a reverse dependency on engine policy. Every
+  // allocation is for a claim: it runs inside that claim's Scope, and one
+  // outside any is a defect (std::logic_error). It reserves the bytes under
+  // the limit, beside the room claims ranked above it hold, while the
+  // allocation runs, if the host's rule admits them for the claim's class,
+  // or refuses them with the cause: HostPressure when the host refuses,
   // whether or not the limit does too, and EngineBudget when only the limit
-  // does. The host refuses under critical pressure and, unless a request in
-  // service needs the bytes (setServing), while macOS warns, inside the
-  // warning margin or while it holds for the recovery margin for a waiting
-  // request (setRequestWaiting).
+  // does. A refusal records what the claim lacks (need).
   [[nodiscard]] metal::AllocationAdmission allocationAdmission() noexcept;
-  // The admission of growth the engine can do without, an expert store's
-  // chunks above its floor (model::ExpertStore::growTowardCap, restore),
-  // which a request in service never needs: the serving mark does not lift
-  // its host checks. Beside the limit and critical pressure, the host
-  // refuses it while macOS reports any pressure, while growth holds for a
-  // waiting request, and unless its headroom keeps the recovery margin
-  // (kHostRecoveryMarginBytes) beyond the bytes, so that what comes back
-  // never brings the host near the warning margin. Only the bytes beyond
-  // the growth credit (setGrowthCredit) count against the host's headroom,
-  // and with none beyond it neither a margin nor macOS's warning holds the
-  // growth back, which leaves the host's footprint where it was; the limit
-  // counts them all. Its refusal does not mark the host constrained: it
-  // asks no reclaim.
-  [[nodiscard]] metal::AllocationAdmission growthAdmission() noexcept;
-  // Marks the reservations that follow as memory a request in service needs,
-  // until it is cleared, and returns the mark it replaced, which a scope
-  // that sets it restores (Serving). Neither the host's margins nor macOS's
-  // warning refuse those: holding them back would strand the request and
-  // the memory it already has, while the cache it could give up instead is
-  // what the paced reclaim returns. The limit and critical pressure refuse
-  // them like any other. A start marks what it allocates so until serving
-  // begins (RuntimeResources::beginServing).
-  bool setServing(bool serving) noexcept;
-  // Sets the bytes the engine has just returned to the system for the growth
-  // that follows, until it is set again, and returns the credit it replaced,
-  // which a scope that sets it restores. The control pass sets it while the
-  // engine exchanges its cache for a chunk of the expert store
-  // (MemoryControl): those bytes are the host's already, so growthAdmission
-  // counts only the chunk's bytes beyond them against the host's headroom,
-  // whose sample may not show them yet. The control pass checks the rest
-  // against the sample it took before the exchange.
-  uint64_t setGrowthCredit(uint64_t bytes) noexcept;
-  // Whether a request cannot proceed for want of memory, as each control pass
-  // finds: only then does growth wait for the recovery margin once the host
-  // has run short.
-  void setRequestWaiting(bool waiting) noexcept;
   void setPressure(MemoryPressure pressure) noexcept;
-  // The outcome of the engine's last reclaim pass with a target. While one
-  // finds nothing left to release, the hold for the recovery margin is
-  // waived: growth proceeds as with no request waiting, since only other
-  // applications could restore the rest, and the paced passes keep looking.
-  // A pass that releases or waits for memory again, or the host's recovery,
-  // ends the waiver. Only a pass while the host is short counts, so no
-  // episode starts waived by a pass that macOS's warning alone asked for.
-  void reclaimed(ReclaimOutcome outcome) noexcept;
   // What the governor makes of a fresh sample of the host. Reading it
-  // changes nothing: the host's hysteresis moves only with the samples a
-  // reservation or the control pass (evaluate) takes, so /status and the
-  // engine's growth queries do not move admission.
+  // changes nothing: the host's band moves only with the samples a
+  // reservation or the control pass (evaluate) takes, so /status does not
+  // move admission.
   [[nodiscard]] MemoryGovernorSnapshot snapshot() const noexcept;
-  // The control pass's evaluation: snapshot(), with the host's hysteresis
-  // moved to its sample, as a reservation's moves it.
+  // The control pass's evaluation: snapshot(), with the host's band moved
+  // to its sample, as a reservation's moves it.
   MemoryGovernorSnapshot evaluate() noexcept;
 
   // The accounts, claims and victim sources the governor's rule works on.
@@ -366,7 +230,7 @@ public:
   [[nodiscard]] const MemoryLedger &ledger() const noexcept { return ledger_; }
   // While one lives, admissions are for `claim`, under the host's rule for
   // its class and the room claims ranked above it hold (MemoryLedger::
-  // heldBytes); with none open an admission is as allocationAdmission says.
+  // heldBytes).
   // `growing` names the account a ledger growth allocates into, whose own
   // pending growth is not held against it, and `hostCreditBytes` what that
   // growth's victims gave back to the host just now: growth within it leaves
@@ -396,8 +260,7 @@ public:
   // What free() would find for such a claim, up to `enough`, taking nothing.
   [[nodiscard]] uint64_t available(const ClaimSpec &spec, uint64_t enough) const;
   // Whether the host admits an allocation of the class, as its last sample
-  // found: the paths that ask take no sample of their own, unlike
-  // EngineConfig::growthPaused.
+  // found: the paths that ask take no sample of their own.
   [[nodiscard]] bool admits(ClaimClass cls) const noexcept;
   // Whether a temporary tier's copies ahead pay: within the value horizon a
   // free() reached a cached unit that frees memory only once its copy
@@ -437,25 +300,6 @@ private:
     friend class MemoryGovernor;
   };
 
-  // The host under the hysteresis at one sample of its available memory.
-  struct HostState final {
-    // From when its headroom falls inside the warning margin, or cannot be
-    // measured, until the headroom clears the recovery margin.
-    bool constrained = false;
-    // Reclaim found nothing to release in this episode of host pressure.
-    bool reclaimExhausted = false;
-
-    // Short of the recovery margin with reclaim not yet exhausted.
-    [[nodiscard]] bool held() const noexcept {
-      return constrained && !reclaimExhausted;
-    }
-  };
-
-  // Growth that no request in service needs waits for the recovery margin
-  // while the host holds and a request waits for memory.
-  [[nodiscard]] bool growthHeld(const HostState &host) const noexcept {
-    return requestWaiting_ && host.held();
-  }
   // The host's one rule at its latest sample (DESIGN section 4.4 R4;
   // amend/M.md B3, B4): its headroom h is its spare memory above the spare
   // reserve, beside what is being allocated. The band begins when h falls
@@ -492,24 +336,17 @@ private:
   // HostRule::sample at a fresh sample of the host.
   void sampleHostRule(const std::optional<HostMemory> &host) noexcept;
   [[nodiscard]] GrowthHost growthHost(bool displaces);
-  // allocationAdmission's reservation, or growthAdmission's where
-  // `optional`.
-  [[nodiscard]] metal::AllocationAdmission admission(bool optional) noexcept;
-  // The admission's reservation, or nothing with the cause of the refusal in
-  // failure.
+  // The admission's reservation for the scope's claim, or nothing with the
+  // cause of the refusal in failure.
   [[nodiscard]] std::optional<Reservation>
-  tryReserve(uint64_t bytes, bool optional, metal::AllocationFailure &failure);
+  tryReserve(uint64_t bytes, metal::AllocationFailure &failure);
   [[nodiscard]] uint64_t
   chargedBytes(bool refreshDevice = false) const noexcept;
   [[nodiscard]] std::optional<HostMemory> sampleHost() const noexcept;
   [[nodiscard]] uint64_t hostHeadroomBytes(const std::optional<HostMemory> &host,
                                            uint64_t reservedBytes) const noexcept;
-  // The host's state at this sample, from the one it was last evaluated at.
-  [[nodiscard]] HostState hostState(const std::optional<HostMemory> &host) const noexcept;
-  [[nodiscard]] MemoryPressure
-  effectivePressure(const HostState &host) const noexcept;
   [[nodiscard]] MemoryGovernorSnapshot
-  snapshot(const std::optional<HostMemory> &hostMemory, const HostState &host) const noexcept;
+  snapshot(const std::optional<HostMemory> &hostMemory, const HostRule &rule) const noexcept;
   void release(uint64_t bytes) noexcept;
 
   metal::MetalBackend &backend_;
@@ -520,13 +357,8 @@ private:
   uint64_t untrackedReserveBytes_ = 0;
   uint64_t hostHeldBytes_ = 0;
   uint64_t reservedBytes_ = 0;
-  bool serving_ = false;
-  uint64_t growthCreditBytes_ = 0;
-  bool requestWaiting_ = false;
   uint64_t deniedReservations_ = 0;
   MemoryPressure systemPressure_ = MemoryPressure::Normal;
-  // As the latest reservation or control pass evaluated it.
-  HostState host_;
   MemoryLedger ledger_;
   // The innermost Scope's claim, growing account and host credit.
   ClaimId scope_;
@@ -544,10 +376,8 @@ private:
 };
 
 // Connects an engine to the governor that admits its memory and whose ledger
-// holds its requests' claims (EngineConfig::governor): the engine asks it
-// whether the host pauses growth, and marks the allocations a request in
-// service makes. Every engine that runs against a governor connects through
-// it.
+// holds its requests' claims (EngineConfig::governor). Every engine that
+// runs against a governor connects through it.
 void connectToGovernor(EngineConfig &config, MemoryGovernor &governor);
 
 } // namespace splash::engine

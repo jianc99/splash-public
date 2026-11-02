@@ -282,6 +282,9 @@ int main(int argc, char **argv) {
       const uint32_t pageCount = (lanePages + extentPages - 1) / extentPages * extentPages;
       MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1, queryHostMemory,
                               0);
+      // Every allocation through the governor is for a claim: the run's are
+      // a start's, one Floor claim for all of it.
+      const MemoryGovernor::Scope run(governor, governor.ledger().open({.cls = ClaimClass::Floor}));
       kv::PageStorage pages(backend, governor.allocationAdmission(), kvLayout, pageCount, extentPages);
       for (uint32_t extent = 0; extent < pageCount / extentPages; ++extent)
         require(static_cast<bool>(pages.allocateExtent(extent)), "could not allocate the KV extents");

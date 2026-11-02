@@ -50,8 +50,8 @@ Engine::Engine(EngineConfig config, Cache &cache, model::Model &model,
   if (!config_.maxContext || !config_.vocabularySize) {
     throw std::invalid_argument("context and vocabulary sizes must be positive");
   }
-  if (!config_.growthPaused || !config_.serving)
-    throw std::invalid_argument("the engine needs the governor's growth pause and serving mark");
+  if (!config_.governor)
+    throw std::invalid_argument("the engine needs its memory governor");
   if (!std::isfinite(config_.decodeShare) || config_.decodeShare < 0.0)
     throw std::invalid_argument("decode share must be nonnegative and finite");
   if (config_.spill.capable &&
@@ -62,13 +62,11 @@ Engine::Engine(EngineConfig config, Cache &cache, model::Model &model,
   // What the engine holds is the ledger's to take, cache before the
   // engine's own victims (the tie order of the sources), and the cache
   // tells it what transfers return.
-  if (config_.governor) {
-    MemoryLedger &ledger = config_.governor->ledger();
-    ledger.addSource(cache_);
-    ledger.addSource(victims_);
-    ledger.setReturning([this] { return cache_.returning(); },
-                        [this](uint64_t requestId) { return cache_.returningFor(requestId); });
-  }
+  MemoryLedger &ledger = config_.governor->ledger();
+  ledger.addSource(cache_);
+  ledger.addSource(victims_);
+  ledger.setReturning([this] { return cache_.returning(); },
+                      [this](uint64_t requestId) { return cache_.returningFor(requestId); });
 }
 
 void Engine::submit(EngineRequest value) {

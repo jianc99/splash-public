@@ -124,7 +124,6 @@ struct LoopFixture {
       weights.memory = &*memory;
       executor.memory = &*memory;
       executor.admission = governor->allocationAdmission();
-      executor.growthAdmission = governor->growthAdmission();
       if (options->control)
         control.emplace(*governor, *backend, loop);
     }

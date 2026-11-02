@@ -254,8 +254,15 @@ void testAccountsSumToCharged() {
       case 2:
         static_cast<void>(experts.release(1));
         break;
-      default:
-        static_cast<void>(experts.grow(fixture.governor->allocationAdmission()));
+      default: {
+        // The pool grows inside a growth claim's scope, as the ledger grows it.
+        const ClaimId growth = fixture.ledger().open({.cls = ClaimClass::Growth});
+        {
+          const MemoryGovernor::Scope scope(*fixture.governor, growth);
+          static_cast<void>(experts.grow(fixture.governor->allocationAdmission()));
+        }
+        fixture.ledger().close(growth);
+      }
       }
       const MemoryGovernorSnapshot snapshot = fixture.governor->snapshot();
       uint64_t sum = 0;
@@ -356,9 +363,16 @@ void testNestedScopesRestore() {
   }
   require(ledger.claim(inner).need.bytes == 2 * kGiB && ledger.claim(outer).need.bytes == 3 * kGiB,
           "a refusal was recorded on the wrong claim");
+  // Once they end, an admission is for the claim whose scope is open then: a
+  // claim ranked above the one that waits is not held back by it.
   ledger.setWaiting(outer, true);
-  require(fixture.memory.allocate(fixture.governor->allocationAdmission(), "kv", 512 * kMiB),
-          "an admission outside every scope was held back by a claim");
+  const ClaimId above = ledger.open(request(3, RequestPriority::Foreground));
+  {
+    const MemoryGovernor::Scope scope(*fixture.governor, above);
+    require(fixture.memory.allocate(fixture.governor->allocationAdmission(), "kv", 512 * kMiB),
+            "an admission of a claim ranked above the waiting one was held back by it");
+  }
+  ledger.close(above);
 }
 
 // KV pages a waiting claim lacks are held, by form, against claims ranked
@@ -1062,7 +1076,7 @@ void testDeficitNetOfReturning() {
 }
 
 // Missing telemetry holds elective work back but gives no cache back: no
-// deficit is measured (MemoryPressurePolicy kept the same rule).
+// deficit is measured.
 void testMissingTelemetryGivesNoCacheBack() {
   bool measured = true;
   metal::MetalBackend backend("");

@@ -1209,78 +1209,37 @@ it, even one that recovery does not try, which still waits for what it was
 refused) and those waiting for a disk restore
 (`restoring`), reports suspended requests, recovery draining and the oldest
 current wait age, which for a request holding admission closed runs from when
-its wait began. Memory transitions also appear in the console. Growth that no
-request in service needs, and so the cache, leaves other applications their
-memory: it keeps a spare reserve of 7% of the Mac's memory (2 to 7 GiB) and a
-1 GiB margin free of the host's spare memory, the free, file-backed and
-purgeable pages and half of what compressing the anonymous pages would free at
-the compressor's present ratio, at most a quarter of them. When the spare memory
-runs short of that, such growth pauses and the cache gives memory back, a paced
-pass at a time, down to one lane's state buffers and one KV extent. A pass that
-no request waits for keeps the state a follow-up resumes from and takes nothing
-in use (below), such as the replay point a request in service has just
-published: what it would free there would only go back to that request's
-growth. So it does, however much spare memory there is, while macOS reports
-warning memory pressure, its signal for caches to give memory back: each pass
-then returns up to 1 GiB until the level is normal again, still taking nothing
-in use unless a request waits, and keeps the state a follow-up resumes from,
-even while a request waits, whose growth the warning refuses as well (`/status`:
-`memory_governor.system_pressure`, and `growth_allowed` is false meanwhile). A
-pass counts only memory that leaves the engine; a cached state it evicts first
-refills the lane's state buffers it keeps. Where routed experts stream, a pass
-the host is really short for, its headroom measured short of the pass's margin
-or macOS reporting critical pressure, also takes the [expert
-store](server.md#streamed-experts)'s chunks above its floor, a chunk at a time
-while its target is unmet, once nothing outside what is in use is left to free
-and before anything in use; the experts a chunk held move to the chunks below it
-or are evicted, and later steps read them from the SSD again. Memory on its way
-back holds the store back: while cache nothing in use holds waits for a
-transfer, a KV demotion, a state write or the copy ahead of a leaf that then
-leaves through it, the pass ends pending, and the pass that continues it once
-the transfer landed takes that cache first. A copy ahead of a page a Spill
-request holds past its dense history and window frees that page as it spills,
-as a page written through does; a copy ahead of anything else, such as a page
-a Resident request holds, frees nothing as it lands and holds nothing back. macOS's warning alone never takes the store. The store's cap is a
-reservation: the memory a chunk gave back is a deficit the engine repays once
-the cache that took it can pay. Each control pass, before its reclaim, takes
-one chunk back, its slots empty, while no request waits for memory, the host
-keeps the 1 GiB warning margin short of critical pressure, the weights are
-neither released nor being restored, and the cool-down has passed since a
-chunk last went:
-30 s, doubled up to 4 minutes each time a chunk taken back goes again within
-it, which shows the requests still needed its memory, and back to 30 s once a
-chunk taken back stays for a whole cool-down (`MemoryControl`). The chunk
-takes from the host only its headroom beyond the 2 GiB recovery margin, none
-of it under macOS's warning, and from the engine only room `--max-memory`
-leaves free. For what it lacks of either the chunk is an exchange for cache
-nothing in use holds, which ranks below the store, beside running requests as
-with none: the engine first returns that cache to the system, one reclaim
-step at a time, each releasing the extent it empties, until the bytes that
-left the engine cover what the chunk lacks. It keeps the resume point of the
-newest conversation and every chain a request that holds no lane would
-restore: the KV of the chain its probe of the cache found, brought up to date
-first, and the state the chain ends at (`RestoredChains`). A request
-admission has not probed, such as one that arrived since its last pass, one
-below the priority that runs or one behind the first waiting for a lane, the
-exchange probes itself. What is in use, the replay points of unfinished
-requests and the KV they restore through, stays, and so does every chain a request holds pages of. The
-governor's growth admission then counts those bytes as the host's already
-(`MemoryGovernor::setGrowthCredit`): its own sample of the host may not show
-them yet, and the pass checked the rest against the sample it took before the
-exchange. An exchange that returns the whole chunk leaves the host's
-footprint where it was, which macOS's warning does not hold back: a pass
-under the warning alone first exchanges cache for the chunk and then gives
-back what the warning asks of the rest. Cache that cannot pay for the chunk
-in that pass stays. The exchange starts no copy to the SSD cache, whose
-memory would come back only after the pass: a state or page that needs one
-stays, and so do the pages above that page, and the exchange goes on to the
-next state or page that leaves at once. Unless the idle state buffers beyond
-a lane's and the extents that what leaves at once would empty cover what the
-chunk lacks (`Engine::exchangeableBytes`, `Cache::exchangeable`), the
-exchange takes nothing and the chunk waits; it waits too while a transfer is
-in flight. With the SSD cache on, a cached conversation buys a chunk only
-once its state and pages have copies there, as its restore point gets them
-ahead of need ([disk tier](#disk-tier)). A start
+its wait began. Memory transitions also appear in the console. Every allocation is for a claim on the memory ledger (`MemoryLedger`): a
+request's start, its growth in service, an optional allocation such as a
+checkpoint's buffers, a pool's growth, and the host's own claim. The host's
+rule weighs each against the host's headroom: its spare memory beyond a
+reserve of 7% of the Mac's memory (2 to 7 GiB), the free, file-backed and
+purgeable pages and half of what compressing the anonymous pages would free
+at the compressor's present ratio, at most a quarter of them. Work no request
+needs now, a start, an optional allocation or a pool's growth, keeps a 1 GiB
+margin of headroom and waits under macOS's warning and in the band, which
+begins when the headroom falls short of the margin and ends once it clears
+the margin by a pool's unit. A request in service keeps the margin too, and
+grows past it, short of critical pressure, once nothing it holds in place
+meets a refusal. A claim refused memory asks the ledger to free what it
+lacks: the units that cost nothing first (idle state buffers), then, unless
+memory on its way back covers it, the cheapest units its class may take,
+each priced at what losing it costs: cached KV and states (computing them
+again, or reading them back from the SSD cache), a chunk of the [expert
+store](server.md#streamed-experts) above its floor (the experts' misses,
+prefill reads counted), or a Resident request converted to Spill (its slower
+prefill and decode). What is in use goes last, and only to a request in
+service. A claim nothing meets waits for what is landing, or falls short.
+Between commands the control pass gives the host's claim what macOS's warning
+asks, up to the margin and cache only while the host lacks nothing past it,
+what the band lacks, or under critical pressure everything above the floors;
+then it grows the pools into the free room while each unit is worth its
+expected retake, or by displacing cheaper cache once a pass (`/status`:
+`memory_governor.accounts`, `claims` and `owed`; `growth_allowed` is false
+while the host refuses growth). A temporary SSD cache copies ahead only on
+demand, while a recent claim reached cache a copy would have let go at once,
+and only until the uncopied units at the head of the order hold about twice
+what the next claim needs ([disk tier](#disk-tier)). A start
 needs only what macOS can
 hand out at all beyond a reserve of a tenth of a small Mac's memory and 2 GiB of
 a larger one, counting what compressing the anonymous pages would free at the
@@ -1303,7 +1262,7 @@ it takes cached KV, and a cached state only where it sits on the KV that goes
 next, since a state's buffers give it no page. An allocation the host refuses
 takes none of the caches the model can rebuild (the vision encoder's scratch,
 images' encoded rows, the readers of spilled KV), which would not get it past
-the host; the paced passes take them. A new request waits while another
+the host; the control pass's host claim takes them. A new request waits while another
 is in service unless it can start from what the engine already holds, and with
 none in service it starts. A request whose start was refused memory, under host
 pressure or at `--max-memory`, holds back the requests that arrived after it

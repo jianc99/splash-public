@@ -736,7 +736,7 @@ void testStartGrowsThroughHostPressure(const char *metallibPath) {
   // A host with its reserve but not the warning margin beyond it, then one
   // with ample room while macOS warns.
   for (const bool warning : {false, true}) {
-    const uint64_t available = warning ? 64 * kGiB : reserve + kHostWarningMarginBytes / 2;
+    const uint64_t available = warning ? 64 * kGiB : reserve + kHostMarginBytes / 2;
     config.hostMemory = [available] {
       return std::optional<HostMemory>(HostMemory{available, available});
     };
@@ -1117,7 +1117,7 @@ void testTheTableIgnoresTheHostsSpareMemory(const char *metallibPath) {
   const uint64_t spareReserve =
       EngineMemoryPolicy::hostSpareReserveBytes(metal::probeDeviceCapabilities().physicalMemoryBytes);
   bounded.hostMemory = [spareReserve] {
-    return std::optional<HostMemory>(HostMemory{64 * kGiB, spareReserve + kHostWarningMarginBytes});
+    return std::optional<HostMemory>(HostMemory{64 * kGiB, spareReserve + kHostMarginBytes});
   };
   const StreamedStart held = startStreamed(bounded);
   require(roomy.table > weights.tableMinimumBytes && held.table == roomy.table && !held.heldBack &&
@@ -1137,7 +1137,7 @@ void testTwoLaunchesGetOneFloor(const RuntimeResourcesConfig &config) {
   const uint64_t spareReserve =
       EngineMemoryPolicy::hostSpareReserveBytes(metal::probeDeviceCapabilities().physicalMemoryBytes);
   bounded.hostMemory = [spareReserve] {
-    return std::optional<HostMemory>(HostMemory{64 * kGiB, spareReserve + kHostWarningMarginBytes});
+    return std::optional<HostMemory>(HostMemory{64 * kGiB, spareReserve + kHostMarginBytes});
   };
   const StreamedStart held = startStreamed(bounded);
   require(roomy.experts && held.experts && held.experts->floorBytes == roomy.experts->floorBytes &&
