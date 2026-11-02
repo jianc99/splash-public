@@ -5,9 +5,11 @@
 
 #include "engine/Engine.hpp"
 
+#include <algorithm>
 #include <array>
 #include <string>
 #include <type_traits>
+#include <vector>
 
 namespace splash::engine {
 
@@ -96,9 +98,16 @@ auto Engine::allocate(Attempt &&attempt, const ClaimSpec &spec, bool frees)
   // Each refusal asks the ledger to free what the claim lacks, and the
   // attempt runs again once that is met or memory left now. A refusal that
   // lacks nothing the ledger counts, that the host refuses after exempting
-  // the claim (critical pressure), or that lacks what it lacked before the
-  // ledger met that, is not for want of what the ledger frees.
-  std::optional<Need> metBefore;
+  // the claim (critical pressure), or that lacks what it lacked when the
+  // ledger met a need of this allocation before, is not for want of what the
+  // ledger frees.
+  std::vector<Need> met;
+  const auto metBefore = [&](const Need &need) {
+    return std::ranges::any_of(met, [&](const Need &before) {
+      return need.bytes == before.bytes && need.hostRefused == before.hostRefused && need.pages == before.pages &&
+             need.form == before.form && need.stateBuffers == before.stateBuffers;
+    });
+  };
   while (frees && memoryDenied(admission)) {
     std::optional<Need> part;
     if constexpr (std::is_same_v<Admission, StateAdmission>)
@@ -108,10 +117,9 @@ auto Engine::allocate(Attempt &&attempt, const ClaimSpec &spec, bool frees)
     const Need need = governor.need(claim.id, part);
     if ((!need.bytes && !need.hostRefused && !need.pages && !need.stateBuffers) ||
         (need.hostRefused && ledger.claim(claim.id).hostExempt) ||
-        (metBefore && need.bytes == metBefore->bytes && need.hostRefused == metBefore->hostRefused &&
-         need.pages == metBefore->pages && need.form == metBefore->form &&
-         need.stateBuffers == metBefore->stateBuffers))
+        metBefore(need))
       break;
+    const bool exempt = ledger.claim(claim.id).hostExempt;
     const FreeResult freed = governor.free(claim.id, need);
     ++ledgerChanges_;
     // What it freed now, the units that cost nothing among them, the
@@ -120,8 +128,9 @@ auto Engine::allocate(Attempt &&attempt, const ClaimSpec &spec, bool frees)
       denial.pending = freed.outcome == FreeOutcome::Pending;
       break;
     }
-    result.freed = true;
-    metBefore = need;
+    // The host's exemption takes nothing for it.
+    result.freed = result.freed || exempt || !ledger.claim(claim.id).hostExempt;
+    met.push_back(need);
     signalResourceProgress();
     admission = tryOnce();
   }
