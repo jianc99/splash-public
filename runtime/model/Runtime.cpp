@@ -60,11 +60,14 @@ using metal::MetalBuffer;
 // the work it encodes, with the weights it read on demand as the store's
 // reads moved from before its submission to its completion
 // (ExpertStore::readBytes), as commands never overlap, and the spilled
-// history its reads streamed.
+// history its reads streamed; a decode's, the host-step work of the hot
+// block cache's reads in the same span (KvBlockCacheStats::work), which the
+// backend counts before the command completes (metal::EventStep).
 class WorkCount final {
 public:
-  WorkCount(CommandWork work, const ExpertStore *store)
-      : work_(work), store_(store), weightReadBytes_(store ? store->readBytes() : 0) {}
+  WorkCount(CommandWork work, const ExpertStore *store, const KvBlockCache *blockCache = nullptr)
+      : work_(work), store_(store), blockCache_(blockCache), weightReadBytes_(store ? store->readBytes() : 0),
+        hotBlockMilliseconds_(blockCache ? blockCache->stats().work.totalMilliseconds : 0.0) {}
 
   // Once the command completed.
   [[nodiscard]] CommandWork realized(uint64_t spilledKvReadBytes) const {
@@ -73,11 +76,16 @@ public:
     work.spilledKvReadBytes = spilledKvReadBytes;
     return work;
   }
+  [[nodiscard]] double spilledKvReadMilliseconds() const {
+    return blockCache_ ? blockCache_->stats().work.totalMilliseconds - hotBlockMilliseconds_ : 0.0;
+  }
 
 private:
   CommandWork work_;
   const ExpertStore *store_ = nullptr;
+  const KvBlockCache *blockCache_ = nullptr;
   uint64_t weightReadBytes_ = 0;
+  double hotBlockMilliseconds_ = 0.0;
 };
 
 class DeferredMetalTicket final : public ModelBatchTicket {
@@ -135,6 +143,7 @@ public:
       spilledKvReadBytes = reads->readBytes();
     }
     work_ = count_.realized(spilledKvReadBytes);
+    spilledKvReadMilliseconds_ = count_.spilledKvReadMilliseconds();
     // Work the completion added takes wall time, but is no sample of the
     // command's rows.
     if (timing.wallSeconds != commandSeconds)
@@ -154,6 +163,7 @@ public:
   CommandSample sample() const noexcept override {
     return {.work = work_,
             .wallMilliseconds = wallMilliseconds_,
+            .spilledKvReadMilliseconds = spilledKvReadMilliseconds_,
             .imageEncodeMilliseconds = imageEncodeMilliseconds_,
             .representative = representativePrefillTiming_};
   }
@@ -182,6 +192,7 @@ private:
   double wallMilliseconds_ = 0.0;
   double hostMilliseconds_ = 0.0;
   double streamMilliseconds_ = 0.0;
+  double spilledKvReadMilliseconds_ = 0.0;
   double imageEncodeMilliseconds_ = 0.0;
   bool representativePrefillTiming_ = true;
 };
@@ -2724,6 +2735,7 @@ struct Runtime::Impl {
       items_.clear();
       reads_.reset();
       work_ = count_.realized(0);
+      spilledKvReadMilliseconds_ = count_.spilledKvReadMilliseconds();
       return results;
     }
 
@@ -2731,7 +2743,9 @@ struct Runtime::Impl {
       return timing_.wallSeconds * 1000.0;
     }
     CommandSample sample() const noexcept override {
-      return {.work = work_, .wallMilliseconds = wallMilliseconds()};
+      return {.work = work_,
+              .wallMilliseconds = wallMilliseconds(),
+              .spilledKvReadMilliseconds = spilledKvReadMilliseconds_};
     }
 
   private:
@@ -2764,6 +2778,7 @@ struct Runtime::Impl {
     std::shared_ptr<SpilledKvReads> reads_;
     WorkCount count_;
     CommandWork work_;
+    double spilledKvReadMilliseconds_ = 0.0;
     Stage stage_ = Stage::Draft;
     CommandTicket command_;
     CommandTiming timing_;
@@ -3327,10 +3342,10 @@ Runtime::decodeAsync(const BatchPlan &plan,
                                {logicalPositions.data(), width},
                                {maximumRetained.data(), width}, constrained);
   std::shared_ptr<SpilledKvReads> reads = impl_->decodeReads(items);
-  // The rows its graph verifies over every layer of the target, and the
-  // weights it reads on demand.
+  // The rows its graph verifies over every layer of the target, the weights
+  // it reads on demand and the hot blocks it resolves.
   WorkCount count({.lanes = width, .rows = ropeRows, .layers = impl_->geometry.target.layers},
-                  impl_->model.expertStore());
+                  impl_->model.expertStore(), impl_->blockCache);
   if (constrained) {
     return std::make_unique<Impl::ConstrainedDecodeTicket>(*impl_, std::move(lanes), items, std::move(reads),
                                                            commandGraph, std::move(count), std::move(completion));

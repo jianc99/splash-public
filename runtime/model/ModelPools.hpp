@@ -55,11 +55,15 @@ template <class ReleaseOne> uint64_t releaseUnits(uint64_t bytes, ReleaseOne rel
 // the most above its floor going first (ExpertStore::releaseAboveFloor), all
 // of them in one compaction per size when the bytes asked reach them
 // (releaseToFloor), and the next one of the size with the least above its
-// floor coming back (growTowardCap). Released while idle, it holds nothing.
-// Its value: the routed experts it held, decode's ghost hits and the bytes
-// its ghosts would take, and the host-step work a decode load took per
-// expert it read; the store counts what its shrinks gave back and their
-// compactions' time itself (ExpertStoreStats).
+// floor coming back (growTowardCap). Released while idle, it holds nothing;
+// whole, it would hold every block's experts in slots of the live chunks'
+// mean bytes beside its staging and tables. Its value: the routed experts it
+// held, decode's ghost hits and the bytes its ghosts would take, the
+// host-step work a decode load took per expert it read and a slot's mean
+// bytes, which a miss reads, and the bytes prefill loads read, whose misses
+// leave no ghosts (SlotRecycler recycles a long chunk's loads first); the
+// store counts what its shrinks gave back and their compactions' time
+// itself (ExpertStoreStats).
 class ExpertStorePool final : public ElasticPool {
 public:
   explicit ExpertStorePool(ExpertStore &store) noexcept : store_(store) {}
@@ -71,19 +75,22 @@ public:
             .currentBytes = stats.liveBytes,
             .capBytes = stats.capBytes,
             .releaseUnitBytes = stats.releaseUnitBytes,
-            .growUnitBytes = stats.growUnitBytes};
+            .growUnitBytes = stats.growUnitBytes,
+            .wholeBytes = stats.liveBytes - stats.arenaBytes + stats.experts * slotBytes(stats)};
   }
   [[nodiscard]] PoolValue value() const override {
     const ExpertStoreStats stats = store_.stats();
     uint64_t hits = 0;
     for (const ExpertStoreStats::Use &use : stats.uses) hits += use.routed - use.read;
-    const ExpertStoreStats::Use &decode = stats.uses[1];
+    const ExpertStoreStats::Use &prefill = stats.uses[0], &decode = stats.uses[1];
     return {.hits = hits,
             .ghostHits = stats.ghostHits,
             .ghostBytes = stats.ghostBytes,
             .missMilliseconds = decode.read ? decode.work.totalMilliseconds / double(decode.read) : 0.0,
             .releasedBytes = stats.releasedBytes,
-            .releaseMilliseconds = stats.releaseMilliseconds};
+            .releaseMilliseconds = stats.releaseMilliseconds,
+            .keyBytes = slotBytes(stats),
+            .scanReadBytes = prefill.readBytes};
   }
   uint64_t release(uint64_t bytes) override {
     const ExpertStoreStats stats = store_.stats();
@@ -95,6 +102,11 @@ public:
   }
 
 private:
+  // A slot's mean bytes over the live chunks; 0 while released.
+  static uint64_t slotBytes(const ExpertStoreStats &stats) noexcept {
+    return stats.slots ? stats.arenaBytes / stats.slots : 0;
+  }
+
   ExpertStore &store_;
 };
 

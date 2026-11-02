@@ -1180,7 +1180,8 @@ int streamedElastic(MetalBackend &backend, const MoeShape &shape, const std::fil
 // releaseAboveFloor() would, everything above the floor goes in one
 // compaction per size as releaseToFloor() would, and its value counts what
 // went and the time the compactions took, as the store logs it; a refused
-// grow changes nothing and a granted one takes the chunk it named. After the
+// grow changes nothing and a granted one takes the chunk it named. A long
+// chunk's load reads as a scan, which leaves no ghost. After the
 // shrinks, decode steps that miss experts they routed lately count ghost
 // hits over the bytes the ghosts span. A load's expected reads are the
 // distinct experts uniform routing routes times the share of the block's
@@ -1228,9 +1229,25 @@ int streamedPool(MetalBackend &backend, const MoeShape &shape, const std::filesy
     static_cast<void>(runWeights(backend, streamed[block], b, plan));
   };
   // A long chunk of block 0 leaves its routed experts resident, block 1's
-  // none: block 0 expects the reads of the share it lacks.
+  // none: block 0 expects the reads of the share it lacks. Its reads are the
+  // pool's scan reads, and they leave no ghost; whole, the pool would hold
+  // every expert in a slot of the live chunks' mean bytes, which a miss
+  // reads.
+  const splash::model::PoolValue unscanned = pool.value();
+  const ExpertStoreStats unloaded = store.stats();
   load(prefillPlan(shape, kMaximumRows), 0);
-  const uint64_t resident = store.stats().resident;
+  const ExpertStoreStats loaded = store.stats();
+  const splash::model::PoolValue scanned = pool.value();
+  const uint64_t slotBytes = loaded.arenaBytes / loaded.slots;
+  if (scanned.scanReadBytes - unscanned.scanReadBytes != loaded.uses[0].readBytes - unloaded.uses[0].readBytes ||
+      scanned.scanReadBytes == unscanned.scanReadBytes || scanned.ghostHits != unscanned.ghostHits ||
+      scanned.keyBytes != slotBytes ||
+      pool.state().wholeBytes != loaded.liveBytes - loaded.arenaBytes + loaded.experts * slotBytes)
+    fail("a long chunk's load scanned " + std::to_string(scanned.scanReadBytes - unscanned.scanReadBytes) +
+         " bytes and counted " + std::to_string(scanned.ghostHits - unscanned.ghostHits) +
+         " ghost hits, not its reads and none, or the pool's key and whole bytes are not a slot's and every "
+         "expert's");
+  const uint64_t resident = loaded.resident;
   if (std::abs(double(store.expectedPrefillReadBytes(kMaximumRows, 0, 1)) -
                expected(kMaximumRows) * double(shape.experts - resident) / shape.experts) > 2 ||
       std::abs(double(store.expectedPrefillReadBytes(kMaximumRows, 1, 2)) - expected(kMaximumRows)) > 2 ||
@@ -1311,8 +1328,8 @@ int streamedPool(MetalBackend &backend, const MoeShape &shape, const std::filesy
   if (pool.state().currentBytes || pool.state().floorBytes || pool.state().releaseUnitBytes ||
       pool.state().growUnitBytes || pool.release(UINT64_MAX))
     fail("released, it holds or gives something");
-  printf("streamed experts as a pool: state, release by unit and to the floor, grow, ghost hits and expected "
-         "reads %s\n",
+  printf("streamed experts as a pool: state, release by unit and to the floor, grow, scan reads, ghost hits and "
+         "expected reads %s\n",
          failures ? "FAIL" : "ok");
   return failures;
 }

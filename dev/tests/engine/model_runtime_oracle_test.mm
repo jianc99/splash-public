@@ -3524,20 +3524,30 @@ public:
   }
 
   // A decode cycle of the requests together, in lanes in their order;
-  // `during`, if any, runs while its command is in flight.
+  // `during`, if any, runs while its command is in flight. Its sample
+  // carries the host-step work of the hot block cache's reads during it,
+  // some once a lane holds Index pages and none otherwise.
   std::vector<SpillStep> decode(std::span<SpillRequest *const> requests, const std::function<void()> &during = {}) {
     BatchPlan plan{.kind = WorkKind::Decode, .decodeStage = DecodeStage::Regular};
     std::vector<ModelBatchItem> items;
+    bool indexed = false;
     for (SpillRequest *request : requests) {
       ensure(*request, request->committed + model::ExecutionLimits::targetVerifyRows);
       if (request->holdsIndexPages())
         require(runtime_->reserveSpilledReads(request->id).granted(), "a lane's floor of the hot block cache was refused");
+      indexed = indexed || request->holdsIndexPages();
       plan.items.push_back({request->id, 0});
       items.push_back(item(*request, request->committed, 0, {}));
     }
+    const double resolving = cache_.stats().work.totalMilliseconds;
     const std::unique_ptr<ModelBatchTicket> ticket = runtime_->submit(plan, items, {});
     if (during) during();
     std::vector<ModelStepResult> results = ticket->wait();
+    const double resolved = ticket->sample().spilledKvReadMilliseconds;
+    require(resolved == cache_.stats().work.totalMilliseconds - resolving && (resolved > 0.0) == indexed,
+            "a decode's sample carried " + std::to_string(resolved) + " ms of hot-block reads, not the " +
+                std::to_string(cache_.stats().work.totalMilliseconds - resolving) + " ms its resolves worked " +
+                (indexed ? "over Index pages" : "over none"));
     require(results.size() == requests.size(), "a spill run's decode lost a lane");
     lastResults_ = results;
     std::vector<SpillStep> steps;
