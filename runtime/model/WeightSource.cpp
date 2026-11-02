@@ -1,11 +1,14 @@
 #include "model/WeightSource.hpp"
 
+#include "AwakeClock.hpp"
+
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
 
 #include <cerrno>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <system_error>
@@ -18,20 +21,63 @@ namespace {
   throw std::system_error(errno, std::generic_category(), std::string(operation) + " " + path.string());
 }
 
+// The process's weight reads (weightReads): the bytes read, the reads
+// running, since when one has been, and the wall time while one ran before.
+struct Reads final {
+  std::mutex mutex;
+  uint64_t bytes = 0;
+  uint32_t running = 0;
+  AwakeClock::time_point since;
+  double milliseconds = 0.0;
+};
+
+Reads &reads() noexcept {
+  static Reads counts;
+  return counts;
+}
+
+// Counts one read from its start to its end, whatever ends it.
+class CountedRead final {
+public:
+  CountedRead() {
+    Reads &counts = reads();
+    const std::lock_guard lock(counts.mutex);
+    if (!counts.running++) counts.since = AwakeClock::now();
+  }
+  ~CountedRead() {
+    Reads &counts = reads();
+    const std::lock_guard lock(counts.mutex);
+    counts.bytes += bytes;
+    if (!--counts.running) counts.milliseconds += millisecondsSince(counts.since);
+  }
+  CountedRead(const CountedRead &) = delete;
+  CountedRead &operator=(const CountedRead &) = delete;
+
+  uint64_t bytes = 0;
+};
+
 } // namespace
 
 void readWeightBytes(int fd, uint64_t offset, std::span<uint8_t> bytes) {
   if (bytes.size() > uint64_t(std::numeric_limits<off_t>::max()) ||
       offset > uint64_t(std::numeric_limits<off_t>::max()) - bytes.size())
     throw std::overflow_error("weight read offset overflow");
+  CountedRead read;
   while (!bytes.empty()) {
     const ssize_t count = pread(fd, bytes.data(), bytes.size(), static_cast<off_t>(offset));
     if (count < 0 && errno == EINTR) continue;
     if (count < 0) throw std::system_error(errno, std::generic_category(), "read weight bytes");
     if (!count) throw std::runtime_error("truncated weight file");
     offset += count;
+    read.bytes += count;
     bytes = bytes.subspan(count);
   }
+}
+
+SsdReads weightReads() noexcept {
+  Reads &counts = reads();
+  const std::lock_guard lock(counts.mutex);
+  return {counts.bytes, counts.milliseconds};
 }
 
 struct WeightSource::Impl {

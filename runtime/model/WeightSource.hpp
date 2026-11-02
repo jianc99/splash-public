@@ -1,5 +1,7 @@
 #pragma once
 
+#include "model/CommandCost.hpp"
+
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -11,6 +13,12 @@ namespace splash::model {
 
 // Bytes [offset, offset + size) of the file open at descriptor.
 void readWeightBytes(int descriptor, uint64_t offset, std::span<uint8_t> bytes);
+// What every readWeightBytes() of the process read so far: its bytes, and
+// the wall time while at least one ran, so that reads on many threads count
+// the time they overlap once. Loading reads a model's weights through it,
+// past the page cache (WeightSource), before anything else does
+// (Model::loadReads).
+[[nodiscard]] SsdReads weightReads() noexcept;
 
 // A source file of a model's weights, open until the model is unloaded: its
 // images are written from it again whenever their memory is restored
