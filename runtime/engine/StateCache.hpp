@@ -315,6 +315,11 @@ public:
   void promotionSkipped() noexcept { ++promotionsSkipped_; }
   // The one state write is in flight; its RAM or quota returns when it lands.
   [[nodiscard]] bool writing() const noexcept { return pending_.has_value(); }
+  // The bytes of the RAM copy a write ahead of need reads (persist), which a
+  // reclaim frees at once after it lands.
+  [[nodiscard]] uint64_t persistingBytes() const noexcept {
+    return pending_ && pending_->source ? pending_->source->bytes() : 0;
+  }
   // The RAM copies reclaim() reached that needed a write first, written
   // then, waiting for the write in flight, or staying (Stay).
   [[nodiscard]] uint64_t uncopiedReached() const noexcept { return uncopiedReached_; }

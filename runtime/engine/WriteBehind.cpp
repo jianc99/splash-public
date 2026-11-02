@@ -9,6 +9,7 @@ void WriteBehind::published(uint64_t block, uint32_t tokens, double now) {
     return;
   // While copies wait for demand, the queue keeps only the points their
   // conversations still resume from.
+  copying_ = copying(now);
   if (!copying_)
     std::erase_if(waiting_, [&](const Point &point) {
       if (cache_.newestPoint(point.block))
@@ -47,12 +48,19 @@ bool WriteBehind::reachedRecently(double now) {
   return reachedAt_ && now - *reachedAt_ < kValueHorizonSeconds * 1000.0;
 }
 
+bool WriteBehind::copying(double now) {
+  if (cache_.persistent())
+    return true;
+  return demandBytes_ ? *demandBytes_ != 0 : reachedRecently(now);
+}
+
 bool WriteBehind::demanded(uint64_t demandBytes) const {
   // What a growth that displaces cache could take now, which starts no
-  // write and waits for none.
+  // write and waits for none, and what the copies ahead in flight let go
+  // once they land.
   const ClaimSpec atOnce{.cls = ClaimClass::Growth, .timing = NeedTiming::Immediate};
   const VictimQuery query{.claim = &atOnce, .need = {.bytes = demandBytes}};
-  uint64_t covered = 0;
+  uint64_t covered = cache_.copyingAheadBytes();
   for (std::optional<Victim> unit = cache_.peek(query, nullptr); unit && covered < demandBytes;
        unit = cache_.peek(query, &*unit))
     covered += unit->bytes;
@@ -64,29 +72,37 @@ bool WriteBehind::inUse(uint64_t block) const noexcept {
 }
 
 bool WriteBehind::run(double now, uint64_t demandBytes, bool claimWaiting) {
-  copying_ = cache_.persistent() || demandBytes;
+  demandBytes_ = demandBytes;
+  copying_ = copying(now);
   return step(now, claimWaiting, [&] { return cache_.persistent() || demanded(demandBytes); });
 }
 
 bool WriteBehind::run(double now, bool memoryAwaited) {
-  copying_ = cache_.persistent() || reachedRecently(now);
+  demandBytes_.reset();
+  copying_ = copying(now);
   return step(now, memoryAwaited, [] { return true; });
 }
 
 bool WriteBehind::step(double now, bool claimWaiting, const std::function<bool()> &copies) {
-  stalled_ = false;
-  if (!copying_ || claimWaiting)
+  stopped_ = Stop::None;
+  if (!copying_)
     return false;
+  if (claimWaiting) {
+    stopped_ = Stop::ClaimWaiting;
+    return false;
+  }
   bool settled = false;
   for (auto point = waiting_.begin(); point != waiting_.end() && point->due <= now;) {
     if (inUse(point->block)) {
       ++point;
       continue;
     }
-    if (!copies())
+    if (!copies()) {
+      stopped_ = Stop::Covered;
       break;
+    }
     if (!settle(cache_.persist(point->block))) {
-      stalled_ = true;
+      stopped_ = Stop::Stalled;
       break;
     }
     queued_.erase(point->block);
@@ -114,12 +130,13 @@ std::optional<double> WriteBehind::nextWakeup() const {
   // A stalled step goes on when the writes or restores it waits for land,
   // which wakes the engine, or once the write budget has room again, which
   // does not. A point in use waits for its request's end, a step of the
-  // engine, which runs this again.
-  if (!copying_)
+  // engine, which runs this again. A claim that waits wakes the engine as
+  // what it waits for lands, and only a step changes the demand.
+  if (!copying_ || stopped_ == Stop::ClaimWaiting || stopped_ == Stop::Covered)
     return std::nullopt;
   for (const Point &point : waiting_)
     if (!inUse(point.block))
-      return stalled_ ? cache_.diskWritesAdmittedAt() : point.due;
+      return stopped_ == Stop::Stalled ? cache_.diskWritesAdmittedAt() : point.due;
   return std::nullopt;
 }
 

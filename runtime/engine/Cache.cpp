@@ -2307,6 +2307,14 @@ uint32_t Cache::pendingPages(kv::PageForm form) const noexcept {
   return form == kv::PageForm::Full ? writes(WriteClass::Reclaim) + spillingWrites() : 0;
 }
 
+uint64_t Cache::copyingAheadBytes() const noexcept {
+  uint64_t bytes = states_.persistingBytes();
+  for (const Write &write : writes_)
+    if (write.write == WriteClass::Persist)
+      bytes += pool_.bytesPerPage(pool_.form(kv_.page(write.block)));
+  return bytes;
+}
+
 uint32_t Cache::writes(WriteClass write) const noexcept {
   return static_cast<uint32_t>(
       std::ranges::count(writes_, write, [](const Write &each) { return each.write; }));

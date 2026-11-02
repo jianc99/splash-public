@@ -1828,8 +1828,10 @@ in flight, as for any other. A temporary tier's copies serve reclaims alone, so
 they wait for the memory's demand (`WriteBehind::run`): twice the bytes the
 claim ahead will take, while a recent claim reached cache that a copy would
 have let go at once, and a point is copied only while the cache's victims that
-go at once, starting no write and waiting for none, hold less than that (the
-cache's walk, `Cache::peek`). Until the engine's claims weigh that demand, a
+go at once, starting no write and waiting for none, with what the copies ahead
+in flight let go once they land, hold less than that (the cache's walk,
+`Cache::peek`); a step that stops there, or for a claim that waits, asks for no
+wake-up. Until the engine's claims weigh that demand, a
 point is copied within `kValueHorizonSeconds` of a reclaim that reached a KV
 leaf a state needs, or a state, without a copy while the tier takes writes
 (`Cache::uncopiedReached`), whether it wrote it, waited for the write in

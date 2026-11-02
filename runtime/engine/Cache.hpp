@@ -435,6 +435,10 @@ public:
   [[nodiscard]] uint64_t uncopiedReached() const noexcept {
     return uncopiedReached_ + states_.uncopiedReached();
   }
+  // What the copies ahead of need in flight (persist) let a reclaim free at
+  // once after they land: the bytes of the pages they copy and of the RAM
+  // copy of the state they write.
+  [[nodiscard]] uint64_t copyingAheadBytes() const noexcept;
   // At a clean stop: the label of each state copy a persistent tier keeps
   // takes its state's current recency, which the next process orders them
   // by; a copy takes its state's class as soon as a checkpoint becomes

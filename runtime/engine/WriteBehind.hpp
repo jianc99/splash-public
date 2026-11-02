@@ -62,7 +62,10 @@ public:
   WriteBehind &operator=(const WriteBehind &) = delete;
 
   // A point published or reused at this block, `tokens` deep. Nothing while
-  // the disk tier takes no writes.
+  // the disk tier takes no writes. Whether copies wait for demand is asked
+  // now (copying): until the engine passes the memory's demand, of the
+  // reclaims; then, of the demand the last step was asked with, which a
+  // claim since changes at the next step.
   void published(uint64_t block, uint32_t tokens, double now);
   // Steps the points that are due and not in use, unless a claim waits for
   // memory on its way back (claimWaiting), which needs the tier's writes and
@@ -70,7 +73,9 @@ public:
   // (the memory's demand for copies: none while no recent claim reached
   // cache a copy would have let go at once, else twice what the claim ahead
   // will take) is more than the cache's victims that go at once, without a
-  // write, the oldest first, hold. True when a point became durable or was
+  // write, the oldest first, hold, with what the copies ahead in flight free
+  // at once after they land, those it started among them
+  // (Cache::copyingAheadBytes). True when a point became durable or was
   // given up; a write it starts wakes the engine when it lands.
   [[nodiscard]] bool run(double now, uint64_t demandBytes, bool claimWaiting);
   // The step until the engine's claims weigh copies ahead: a request that
@@ -87,7 +92,9 @@ public:
   // When run() next has something to do that no landing write will wake it
   // for: the next point not in use falling due, or, for a step the write
   // budget held back, when the budget admits it again; none while copies
-  // wait for demand, which a claim brings in a step of the engine.
+  // wait for demand, which a claim brings in a step of the engine, nor once
+  // the last step stopped because a claim waits, whose landings wake the
+  // engine, or because the demand was covered, which only a step changes.
   [[nodiscard]] std::optional<double> nextWakeup() const;
   [[nodiscard]] WriteBehindSnapshot snapshot() const noexcept;
 
@@ -101,8 +108,13 @@ private:
   // Steps the due points not in use, while copies are made (copying_) and
   // `copies` says the next one is.
   [[nodiscard]] bool step(double now, bool claimWaiting, const std::function<bool()> &copies);
+  // Copies are made now: always in a persistent tier; in a temporary one
+  // on the demand last asked with, or until the engine passes one, while
+  // reclaims reached cache that needed a copy first recently.
+  [[nodiscard]] bool copying(double now);
   // The cache's victims that go at once, without a write, the oldest first,
-  // hold less than `demandBytes`.
+  // with what the copies ahead in flight free after they land, hold less
+  // than `demandBytes`.
   [[nodiscard]] bool demanded(uint64_t demandBytes) const;
   // A reclaim reached cache that needed a copy first within the last
   // kValueHorizonSeconds, as uncopiedReached_ and reachedAt_ keep.
@@ -113,12 +125,17 @@ private:
   Cache &cache_;
   std::deque<Point> waiting_;
   std::unordered_set<uint64_t> queued_;
-  // The first point due and not in use waits for writes or restores to
-  // land, its own or the tier's, or for the write budget.
-  bool stalled_ = false;
-  // Copies are made: always in a persistent tier, in a temporary one on the
-  // demand last asked with.
+  // Why the last step stopped before the points due: a claim waits, the
+  // demand was covered, or the first point due and not in use waits for
+  // writes or restores to land, its own or the tier's, or for the write
+  // budget.
+  enum class Stop : uint8_t { None, ClaimWaiting, Covered, Stalled };
+  Stop stopped_ = Stop::None;
+  // Copies are made, as last asked (copying).
   bool copying_;
+  // The demand the last step was asked with; none while the engine passes
+  // none (run(now, memoryAwaited)).
+  std::optional<uint64_t> demandBytes_;
   // What reclaims reached that needed a copy first, as last seen
   // (Cache::uncopiedReached), and when it was last seen to grow.
   uint64_t uncopiedReached_ = 0;
