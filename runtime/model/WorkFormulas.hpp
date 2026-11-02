@@ -45,8 +45,7 @@ struct AttentionReach final {
   }
   return causal(position, rows);
 }
-// The pairs of `rows` rows from `position` that each attend to every key up to their own
-// (engine::Scheduler::attentionPairs).
+// The pairs of `rows` rows from `position` that each attend to every key up to their own.
 [[nodiscard]] constexpr uint64_t denseAttentionPairs(uint64_t position, uint32_t rows) noexcept {
   return attentionPairs({}, position, rows);
 }

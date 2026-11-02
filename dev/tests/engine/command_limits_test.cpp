@@ -14,7 +14,6 @@
 // layers, and the heaviest layer's pairs of the target whatever the pass; a
 // block index scores each lane's part of a chunk apart.
 #include "TestChecks.hpp"
-#include "engine/Scheduler.hpp"
 #include "model/Flint.hpp"
 #include "model/Qwen3_6Moe.hpp"
 #include "model/Qwen3_8.hpp"
@@ -69,7 +68,9 @@ uint64_t layerPairs(const model::RuntimeGeometry &geometry, uint32_t position, u
 }
 
 void testPairCapIsTodaysPerLayerCap() {
-  require(engine::Scheduler::attentionPairs(262'144 - kChunk, kChunk) == kLayerPairs,
+  // Today's bound: a chunk's rows each attend to the keys before the chunk and
+  // to the chunk's up to their own, rows * position + rows * (rows + 1) / 2.
+  require(uint64_t{kChunk} * (262'144 - kChunk) + uint64_t{kChunk} * (kChunk + 1) / 2 == kLayerPairs,
           "the per-layer bound is not a full chunk's at the end of the native window");
   for (const model::RuntimeGeometry &geometry :
        {geometryOf<model::Qwen3_8Layout>(), geometryOf<model::Qwen3_6MoeLayout>(true),
