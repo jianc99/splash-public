@@ -908,10 +908,6 @@ public:
   }
   [[nodiscard]] CacheSnapshot snapshot() const;
   [[nodiscard]] KvSpillSnapshot spillSnapshot() const;
-  // Tests, in the differential run alone (testSourceMatchesTheEntryPoints):
-  // the reclaim entry points run their bodies from before they became loops
-  // over the walk's units.
-  void useLegacySteps() noexcept { legacySteps_ = true; }
   // Tests, between commands: std::logic_error unless the blocks, pages,
   // references and quota keep every invariant spilling relies on.
   void checkInvariants() const;
@@ -1195,43 +1191,6 @@ private:
   // and once no transfer in flight can return what is needed first, a state
   // in use. A state that needs a write the walk passes over leaves the next.
   [[nodiscard]] CacheReclaimResult recycleState(const Walk &walk);
-  // The reclaim entry points' bodies from before they became loops over the
-  // walk's units, for the differential run.
-  struct LegacyStep final {
-    CacheReclaimMode mode;
-    ReclaimClass upTo;
-    bool keepResumePoint = false;
-    std::optional<Shortfall> refused;
-    StateCache::Unwritten unwritten = StateCache::Unwritten::Wait;
-    ReclaimTiming timing = ReclaimTiming::CanWait;
-    const RestoredChains *restored = nullptr;
-  };
-  struct LegacyScan final {
-    bool inUse;
-    bool keepResumePoint;
-    StateCache::Unwritten unwritten;
-    ReclaimTiming timing;
-    bool pagesOnly;
-    const RestoredChains *restored = nullptr;
-  };
-  bool legacySteps_ = false;
-  [[nodiscard]] CacheReclaimResult legacyEvictAll(ReclaimClass upTo);
-  [[nodiscard]] CacheReclaimResult legacyReclaimOne(CacheReclaimMode mode, ReclaimClass upTo, bool keepResumePoint,
-                                                    bool keepRunway);
-  [[nodiscard]] CacheReclaimResult legacyReclaimForExchange(const RestoredChains &restored);
-  [[nodiscard]] CacheReclaimResult legacyReclaimStep(const LegacyStep &step, bool keepRunway);
-  [[nodiscard]] CacheReclaimResult legacyEvictOne(const LegacyStep &step);
-  [[nodiscard]] CacheReclaimResult legacyReclaimForPages(uint32_t pages, CacheReclaimMode mode, ReclaimClass upTo,
-                                                         kv::PageForm form);
-  [[nodiscard]] CacheReclaimResult legacyReclaimForMemory(ReclaimClass upTo, bool keepRunway);
-  [[nodiscard]] CacheReclaimResult legacyReclaimMemory(ReclaimClass upTo, bool keepRunway, ReclaimTiming timing,
-                                                       StateCache::Unwritten unwritten);
-  [[nodiscard]] std::optional<Victim> legacyReclaimOldest(const LegacyScan &scan);
-  [[nodiscard]] StateRoom legacyReclaimOneState(StateClass state, bool growth);
-  [[nodiscard]] StateRoom legacyReclaimInUseState();
-  [[nodiscard]] CacheReclaimResult legacyReclaimStateForLane(ReclaimClass upTo);
-  [[nodiscard]] CacheReclaimResult legacyRecycleState(ReclaimClass upTo, const Shortfall &shortfall,
-                                                      StateCache::Unwritten unwritten = StateCache::Unwritten::Wait);
   // One memory reclaim (reclaimForMemory) of the walk: free pages first, as
   // the extent they fill; then the walk's victims while their KV can empty
   // an extent, until one is released or a state goes; otherwise a state

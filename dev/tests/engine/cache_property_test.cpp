@@ -83,17 +83,13 @@ private:
 class Run final {
 public:
   // With peeks, the walk's units for a device need are weighed and taken
-  // too (checkPeek). With entryPoints, every reclaim entry point is drawn
-  // beside the other steps too, and with legacy the cache runs their old
-  // bodies (testSourceMatchesTheEntryPoints).
-  Run(uint32_t seed, bool windowed, bool peeks = false, bool entryPoints = false, bool legacy = false)
-      : random_(seed), windowed_(windowed), peeks_(peeks), entryPoints_(entryPoints), tier_(chance(50)),
+  // too (checkPeek).
+  Run(uint32_t seed, bool windowed, bool peeks = false)
+      : random_(seed), windowed_(windowed), peeks_(peeks), tier_(chance(50)),
         budget_(std::make_shared<model::DiskBudget>(kSlots * 100)),
         cache_(pool_, &tier_, budget_,
                windowed ? std::nullopt : std::optional(CacheSpillPolicy{pick(0, 2), pick(1, 2)}),
                windowed ? std::optional(CacheWindowPolicy{pick(1, 3)}) : std::nullopt) {
-    if (legacy)
-      cache_.useLegacySteps();
     tier_.budget = budget_;
     tier_.transferLimit = 64;
     tier_.writeLimits = {8, 4, 8};
@@ -106,7 +102,7 @@ public:
   }
 
   void step() {
-    switch (pick(0, entryPoints_ ? 16 : peeks_ ? 15 : 14)) {
+    switch (pick(0, peeks_ ? 15 : 14)) {
     case 0: start(); break;
     case 1: case 2: grow(); break;
     case 3: static_cast<void>(cache_.writeThrough()); break;
@@ -127,61 +123,11 @@ public:
     case 13: failWrites(); break;
     case 14: checkExchange(false); break;
     case 15: checkPeek(); break;
-    case 16: entryPoint(); break;
     }
     cache_.checkInvariants();
   }
 
   uint64_t exactUnits = 0, unsureUnits = 0;
-
-  // One reclaim entry point, drawn with its arguments; its result is noted.
-  void entryPoint() {
-    const ReclaimClass upTo = chance(50) ? ReclaimClass::InUse : ReclaimClass::Ordinary;
-    switch (pick(0, 19)) {
-    case 0: note(cache_.evictAll(upTo)); break;
-    case 1: case 2: case 3: case 4: case 5: note(cache_.reclaimForMemory(upTo, chance(50))); break;
-    case 6: case 7: case 8: note(cache_.reclaimStateForLane(upTo)); break;
-    case 9: case 10: case 11: {
-      const StateRoom room = cache_.reclaimOneState(
-          std::array{StateClass::Checkpoint, StateClass::Ordinary, StateClass::InUse}[pick(0, 2)], chance(50));
-      results_.insert(results_.end(), {room.made, room.extentBytes});
-      break;
-    }
-    case 12: results_.push_back(cache_.reclaimInUseState().made); break;
-    default: {
-      const CacheReclaimMode mode = std::array{CacheReclaimMode::KeepExtents, CacheReclaimMode::ReleaseExtents,
-                                               CacheReclaimMode::ReusePages}[pick(0, 2)];
-      const kv::PageForm form = windowed_ ? std::array{kv::PageForm::Full, kv::PageForm::Slim}[pick(0, 1)]
-                                          : std::array{kv::PageForm::Full, kv::PageForm::Index}[pick(0, 1)];
-      note(cache_.reclaimForPages(pick(1, 4), mode, upTo, form));
-      break;
-    }
-    }
-  }
-
-  // What the run did and holds, for its twin to match: what each entry
-  // point returned, the pool, the state cache, the tier and the quota, the
-  // requests, and what the cache holds of each base prompt.
-  std::vector<uint64_t> fingerprint() {
-    const CacheSnapshot snapshot = cache_.snapshot();
-    const KvPoolSnapshot &pool = snapshot.pool;
-    std::vector<uint64_t> print = results_;
-    print.insert(print.end(),
-                 {pool.pagesAllocated, pool.pagesActive, pool.pagesPrefix, pool.pagesFree, pool.allocatedBytes,
-                  pool.extentAllocations, pool.extentReleases, pool.extentCompactions, pool.pagesMoved,
-                  snapshot.stateCache.entries, snapshot.stateCache.bytes, snapshot.stateCache.diskBytes,
-                  snapshot.stateCache.offloads, snapshot.stateCache.evictions, snapshot.kvTier.demotions,
-                  snapshot.kvTier.demotionsRefused, snapshot.kvTier.copies, snapshot.kvTier.diskBlocks,
-                  cache_.uncopiedReached(), tier_.writes.size(), budget_->usedBytes(), budget_->committedBytes(),
-                  shelf_->used});
-    for (const auto &[id, request] : requests_)
-      print.insert(print.end(), {id, request.pages, static_cast<uint64_t>(request.mode)});
-    for (uint32_t base = 0; base < bases_.size(); ++base) {
-      CacheProbe probe = cache_.probe(prompt({base, kMaximumPages - 1}), {});
-      print.insert(print.end(), {probe.cachedTokens(), probe.restoredChain().size()});
-    }
-    return print;
-  }
 
   // Every request ends, every transfer lands, and nothing leaks: the pool's
   // pages and the tier's slots belong to the cache's blocks alone.
@@ -248,13 +194,8 @@ public:
     const uint64_t resident = cache_.snapshot().stateCache.bytes;
     const size_t writes = tier_.writes.size();
     const uint64_t offloads = cache_.snapshot().stateCache.offloads;
-    for (uint32_t steps = 0;; ++steps) {
-      const CacheReclaimResult step = cache_.reclaimForExchange(restored);
-      note(step);
-      if (!step.madeProgress)
-        break;
+    for (uint32_t steps = 0; cache_.reclaimForExchange(restored).madeProgress; ++steps)
       require(steps < 100'000, "the exchange's reclaim did not end");
-    }
     cache_.checkInvariants();
     require(tier_.writes.size() == writes && cache_.snapshot().stateCache.offloads == offloads,
             "the exchange's reclaim started a copy to the SSD cache");
@@ -350,23 +291,15 @@ private:
   }
   bool waiting(uint64_t id) const { return cache_.kvRestoreStatus(id) == KvRestoreStatus::Pending; }
 
-  void note(const CacheReclaimResult &result) {
-    results_.insert(results_.end(), {result.madeProgress, result.reclaimedBytes, result.pending,
-                                     result.evictedState, result.evictedKv});
-  }
-
   // Admits as the engine does: a denial makes room in reclaim steps, of
   // the form denied, until the pages fit or nothing more goes.
   template <class Attempt> TokenAdmission admit(Attempt attempt) {
     TokenAdmission admission = attempt();
-    while (admission.failure == TokenAdmissionFailure::Denied) {
-      const CacheReclaimResult step = cache_.reclaimForPages(admission.additionalPages, CacheReclaimMode::KeepExtents,
-                                                             ReclaimClass::InUse, admission.form);
-      note(step);
-      if (!step.madeProgress)
-        break;
+    while (admission.failure == TokenAdmissionFailure::Denied &&
+           cache_.reclaimForPages(admission.additionalPages, CacheReclaimMode::KeepExtents,
+                                  ReclaimClass::InUse, admission.form)
+               .madeProgress)
       admission = attempt();
-    }
     return admission;
   }
 
@@ -408,7 +341,7 @@ private:
     // at is reused, and one is published only with a tail it restores from.
     if (const uint64_t block = cache_.blockAt(id, pages * KvCache::pageTokens);
         chance(30) && !cache_.reuseStoredState(block) && cache_.stateTailFull(block))
-      cache_.publishCompositeState(block, std::make_shared<ShelvedState>(shelf_, false), (peeks_ || entryPoints_) && chance(30));
+      cache_.publishCompositeState(block, std::make_shared<ShelvedState>(shelf_, false), peeks_ && chance(30));
   }
 
   // The tier's transfers land, a few of them failing.
@@ -443,7 +376,7 @@ private:
   void reclaim() {
     const CacheReclaimMode mode = std::array{CacheReclaimMode::KeepExtents, CacheReclaimMode::ReleaseExtents,
                                              CacheReclaimMode::ReusePages}[pick(0, 2)];
-    note(cache_.reclaimOne(mode, chance(50) ? ReclaimClass::InUse : ReclaimClass::Ordinary));
+    static_cast<void>(cache_.reclaimOne(mode, chance(50) ? ReclaimClass::InUse : ReclaimClass::Ordinary));
   }
 
   // The volume's room changes, and the quota follows it; so does the state
@@ -516,9 +449,6 @@ private:
   std::mt19937 random_;
   bool windowed_;
   bool peeks_;
-  bool entryPoints_;
-  // What the entry points returned, in order.
-  std::vector<uint64_t> results_;
   // Index pages of 10 bytes for a run that spills, Slim ones of 30 for a
   // windowed one.
   test::TestKvStorage storage_{1024, 100, 4, 10, 30};
@@ -588,45 +518,6 @@ void testPeekNeverOverstates(uint32_t plainSeeds, uint32_t windowedSeeds) {
 
 } // namespace
 
-// The reclaim entry points as loops over the walk's units, as peek gives
-// them and take takes them, do what their old bodies did: two runs from one
-// seed, one cache stepping the old way, return the same results, take the
-// same victims and leave the same pools, step after step, with every entry
-// point drawn beside the other steps, checkpoints among the states, and
-// device needs weighed and taken.
-void testSourceMatchesTheEntryPoints(uint32_t plainSeeds, uint32_t windowedSeeds) {
-  for (const bool windowed : {false, true})
-    for (uint32_t seed = 1; seed <= (windowed ? windowedSeeds : plainSeeds); ++seed) {
-      Run loops(seed, windowed, false, true), bodies(seed, windowed, false, true, true);
-      const auto same = [&](const char *when, int step) {
-        const std::vector<uint64_t> loop = loops.fingerprint(), body = bodies.fingerprint();
-        if (loop != body)
-          throw std::runtime_error(std::string("the loops and the old bodies differ ") + when + " " +
-                                   std::to_string(step) + ", from fingerprint field " +
-                                   std::to_string(std::ranges::mismatch(loop, body).in1 - loop.begin()));
-      };
-      try {
-        for (int step = 0; step < 600; ++step) {
-          loops.step();
-          bodies.step();
-          same("after step", step);
-        }
-        for (Run *run : {&loops, &bodies}) {
-          run->endRequests();
-          run->checkExchange(false);
-          run->drain();
-          run->settle();
-          run->checkExchange(true);
-        }
-        same("at the end", 600);
-      } catch (const std::exception &error) {
-        throw std::runtime_error(std::string(windowed ? "differential windowed " : "differential ") + "seed " +
-                                 std::to_string(seed) + ": " + error.what());
-      }
-    }
-  std::cout << "cache differential runs ok: " << plainSeeds << " plain seeds, " << windowedSeeds << " windowed\n";
-}
-
 // cache-property [plainSeeds windowedSeeds]: 40 and 400 by default.
 int main(int argc, char **argv) {
   if (argc != 1 && argc != 3) {
@@ -638,7 +529,6 @@ int main(int argc, char **argv) {
     const uint32_t windowedSeeds = argc == 3 ? static_cast<uint32_t>(std::stoul(argv[2])) : 400u;
     testRandomRuns(plainSeeds, windowedSeeds);
     testPeekNeverOverstates(plainSeeds, windowedSeeds);
-    testSourceMatchesTheEntryPoints(plainSeeds, windowedSeeds);
     std::cout << "cache property tests passed\n";
     return 0;
   } catch (const std::exception &error) {
