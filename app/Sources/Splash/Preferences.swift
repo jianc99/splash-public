@@ -39,9 +39,6 @@ struct ServeSettings: Equatable {
 
     var port: Int { values["--port"].flatMap(Int.init) ?? Self.defaultPort }
 
-    /// The memory limit set, in GB.
-    var memoryLimit: Int? { values["--max-memory"].flatMap { Int($0.dropLast()) } }
-
     /// The options UserDefaults keeps, of the flags the app offers and values they take; no key.
     static func current(_ defaults: UserDefaults = .standard) -> ServeSettings {
         let kept = defaults.dictionary(forKey: Preference.launchOptions) as? [String: String] ?? [:]

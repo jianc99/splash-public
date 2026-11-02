@@ -103,12 +103,18 @@ final class Server {
 
     static let log = URL.libraryDirectory.appending(path: "Logs/Splash/server.log")
 
+    /// How long a stop gives the server before its process group is killed: the longest its own
+    /// stop of the engine takes.
+    nonisolated static let killAfter = Supervision.stop * 2
+
     private let runtime: Runtime
     private let log: URL
     private var child: ChildProcess?
+    /// The process of the server starting or serving, as its serve record names it.
+    private var pid: pid_t?
     /// SIGTERM, which a running server takes for Ctrl+C and one already stopping ignores, where a
     /// second Ctrl+C would stop its engine at once.
-    let record = ChildRecord(key: Preference.serverPID, stop: SIGTERM)
+    let record = ChildRecord(key: Preference.serverPID, stop: SIGTERM, killAfter: Server.killAfter)
     private var tail: LogTail?
     private var stopRequested = false
     private var firstError: String?
@@ -134,9 +140,10 @@ final class Server {
         }
     }
 
-    /// Stops the model, and drops a switch to another one: SIGINT to the process group, as Ctrl+C
-    /// sends; a second one after 10 s, on which the server stops the engine at once; SIGKILL if
-    /// anything still runs 20 s later.
+    /// Stops the model, and drops a switch to another one: SIGINT to the process group, once, as
+    /// Ctrl+C sends, on which the server stops its engine, its flush included; SIGKILL if anything
+    /// still runs `killAfter` later. A second SIGINT would stop the engine at once, cutting the
+    /// flush short.
     func stop() {
         queued = nil
         guard let child, phase != .stopping else { return }
@@ -145,11 +152,9 @@ final class Server {
         watch?.cancel()
         child.signal(SIGINT)
         Task { [weak self] in
-            for (delay, signal) in [(10, SIGINT), (20, SIGKILL)] {
-                try? await Task.sleep(for: .seconds(delay))
-                guard self?.child === child else { return }
-                child.signal(signal)
-            }
+            try? await Task.sleep(for: Self.killAfter)
+            guard self?.child === child else { return }
+            child.signal(SIGKILL)
         }
     }
 
@@ -202,6 +207,7 @@ final class Server {
         }
         tail = LogTail(log) { [weak self] in self?.received($0) }
         let pid = child!.pid
+        self.pid = pid
         record.keep(child!)
         watch = Task { [weak self] in await self?.follow(pid) }
     }
@@ -236,35 +242,52 @@ final class Server {
             launch(queued.model, settings: queued.settings)
         } else if stopRequested {
             phase = .stopped
-        } else if phase == .starting, let firstError, let model {
-            phase = .failed(Self.memoryProblem(firstError, settings: settings) ?? plainProblem(firstError, model: model))
+        } else if phase == .starting, let pid {
+            phase = .failed(Self.startProblem(record: runtime.serveRecord(port: settings.port), pid: pid,
+                                              firstError: firstError))
         } else {
             phase = .failed("It stopped unexpectedly. The log has the details.")
         }
     }
 
-    /// A start the engine refuses for want of memory, in the words of the launch options: the
-    /// model, with its reserves, needs more than the budget, the memory limit set or this Mac's own;
-    /// or the context length set is more than the memory left, or the SSD cache, holds.
-    nonisolated static func memoryProblem(_ message: String, settings: ServeSettings) -> String? {
-        if let match = message.firstMatch(of: /require (\d+) bytes but the Metal memory budget is (\d+) bytes/),
-           let need = Int64(match.1), let budget = Int64(match.2) {
-            if let limit = settings.memoryLimit, Int64(limit) << 30 == budget {
-                return "It needs \(Format.memory(need)) of memory but the memory limit is \(Format.memory(budget)). Raise the memory limit in Launch Options."
-            }
-            return "It needs \(Format.memory(need)) of memory but this Mac can give it \(Format.memory(budget)). Choose a smaller model."
-        }
-        if let match = message.firstMatch(of: /exceeds the (\d+) tokens the model and (.+) allow/), let most = Int(match.1) {
+    /// Why a start by process `pid` failed: what its serve record says, where the record is this
+    /// start's; else the first error line of the log; else that it stopped.
+    nonisolated static func startProblem(record: ServeRecord?, pid: pid_t, firstError: String?) -> String {
+        if let record, record.pid == pid, let failure = record.failure { return problem(failure) }
+        if let firstError { return plainProblem(firstError) }
+        return "It stopped unexpectedly. The log has the details."
+    }
+
+    /// A start failure in the words of the launch options: the model, with its reserves, needs more
+    /// memory than the limit set or this Mac gives; the context length set is more than the memory
+    /// left, or the SSD cache, holds; other apps hold the memory or GPU memory it needs; else the
+    /// failure's own message.
+    nonisolated static func problem(_ failure: ServeRecord.Failure) -> String {
+        switch (failure.kind, failure.bound) {
+        case ("memory_budget", "max_memory"):
+            return "It needs \(Format.memory(failure.required_bytes ?? 0)) of memory but the memory limit is "
+                + "\(Format.memory(failure.budget_bytes ?? 0)). Raise the memory limit in Launch Options."
+        case ("memory_budget", "device_memory"):
+            return "It needs \(Format.memory(failure.required_bytes ?? 0)) of memory but this Mac can give it "
+                + "\(Format.memory(failure.budget_bytes ?? 0)). Choose a smaller model."
+        case ("context_budget", let bound?):
+            let most = failure.plan_context_tokens ?? 0
             let tokens = most >= 1024 ? "\(most / 1024)K" : "\(most)"
-            if match.2.contains("--max-memory") {
+            switch bound {
+            case "max_memory":
                 return "Its context fits up to \(tokens) tokens within the memory limit. Choose a shorter context length, or raise the memory limit."
-            }
-            if match.2.contains("SSD cache") {
+            case "disk":
                 return "Its context fits up to \(tokens) tokens in the SSD cache. Choose a shorter context length, or a larger SSD cache."
+            default:
+                return "Its context fits up to \(tokens) tokens on this Mac. Choose a shorter context length, or Auto."
             }
-            return "Its context fits up to \(tokens) tokens on this Mac. Choose a shorter context length, or Auto."
+        case ("host_memory", _):
+            return "Other apps are using the memory it needs. Quit some, then start it again."
+        case ("command_memory", _):
+            return "Another app is using the GPU memory this model needs, such as another Splash server. Quit it, then start again."
+        default:
+            return failure.message
         }
-        return nil
     }
 
     /// Waits until this start's server answers, then follows its status. The port's lock names the
@@ -293,6 +316,8 @@ final class Server {
                 asleep = report.asleep
                 recovering = report.recovering
                 activity = report.activity
+                // A relaunched engine may serve less context than the first did.
+                if let served = report.context { context = served }
                 if let stopped = report.stopped { phase = .failed(stopped) }
             }
             try? await Task.sleep(for: .seconds(2))
@@ -307,6 +332,8 @@ final class Server {
         var asleep: Bool
         var recovering = false
         var stopped: String?
+        /// The tokens of context the server serves now.
+        var context: Int?
     }
 
     /// The report of `/status`'s body, if it is one.
@@ -327,12 +354,15 @@ final class Server {
             ),
             asleep: status.weights?.released ?? false,
             recovering: status.transport?.recovering ?? false,
-            // The engine failed again and again; the server stays up but serves nothing.
-            stopped: status.transport?.stopped == true ? status.transport?.error ?? "It stopped after failing repeatedly." : nil
+            // The engine failed in a way restarting cannot help; the server stays up but serves
+            // nothing.
+            stopped: status.transport?.stopped == true ? status.transport?.error ?? "Its engine stopped." : nil,
+            context: status.capabilities?.max_context_tokens
         )
     }
 
     private struct Status: Decodable {
+        struct Capabilities: Decodable { let max_context_tokens: Int? }
         struct Weights: Decodable { let released: Bool? }
         struct Transport: Decodable { let recovering: Bool?; let stopped: Bool?; let error: String? }
         struct Requests: Decodable { let completed: Int? }
@@ -347,6 +377,7 @@ final class Server {
         }
         struct Cache: Decodable { let reused_tokens: Int? }
         struct Memory: Decodable { let current_bytes: Int64? }
+        let capabilities: Capabilities?
         let weights: Weights?
         let transport: Transport?
         let requests: Requests?

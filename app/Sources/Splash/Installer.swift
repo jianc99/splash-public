@@ -30,6 +30,45 @@ final class Installer {
         }
     }
 
+    /// A failure the installer reports as it ends: its class, which the app words, and its own
+    /// message for one it does not class.
+    struct Failure: Decodable, Equatable {
+        /// "not_found", "offline", "auth", "disk", or nil.
+        let kind: String?
+        let message: String
+
+        /// The failure a line of the installer's output reports, if it is an error event.
+        init?(line: String) {
+            struct Event: Decodable {
+                let event: String
+                let kind: String?
+                let message: String
+            }
+            guard line.hasPrefix("{"),
+                  let event = try? JSONDecoder().decode(Event.self, from: Data(line.utf8)),
+                  event.event == "error"
+            else { return nil }
+            (kind, message) = (event.kind, event.message)
+        }
+    }
+
+    /// A failure installing `model`, in words a user can act on.
+    nonisolated static func problem(_ failure: Failure, model: String) -> String {
+        let name = model.split(separator: ":")[0]
+        switch failure.kind {
+        case "not_found":
+            return "Hugging Face has no public model named \(name). Check the name, then try again."
+        case "offline":
+            return "Splash couldn’t reach Hugging Face. Check the internet connection, then try again."
+        case "auth":
+            return "Hugging Face refused access to \(name). Sign in with an account that can read it (hf auth login), then try again."
+        case "disk":
+            return "The disk is full. Free some space, then try again."
+        default:
+            return failure.message
+        }
+    }
+
     /// The model installing.
     private(set) var model: String?
     /// The download of the model's own files. A model's draft downloads first; it is small, and
@@ -45,10 +84,12 @@ final class Installer {
 
     private let runtime: Runtime
     private var child: ChildProcess?
-    let record = ChildRecord(key: Preference.installerPID, stop: SIGINT)
+    /// A leftover download gets Ctrl+C, which removes its temporary files as it ends.
+    let record = ChildRecord(key: Preference.installerPID, stop: SIGINT, killAfter: .seconds(20))
     private var tail: LogTail?
     private var cancelled = false
     private var firstError: String?
+    private var reported: Failure?
     private var activity: NSObjectProtocol?
     /// When and at how many bytes the model's own download was first reported.
     private var began: (date: Date, done: Int64)?
@@ -74,6 +115,7 @@ final class Installer {
         began = nil
         failure = nil
         firstError = nil
+        reported = nil
         cancelled = false
         resetLog(Self.log)
         do {
@@ -119,6 +161,10 @@ final class Installer {
     }
 
     private func received(_ line: String) {
+        if let reported = Failure(line: line) {
+            self.reported = reported
+            return
+        }
         guard let event = Progress(line: line) else {
             if firstError == nil { firstError = errorMessage(line) }
             return
@@ -155,7 +201,8 @@ final class Installer {
         if status == 0 {
             installed(model)
         } else if !cancelled {
-            failure = (model, firstError.map { plainProblem($0, model: model) }
+            failure = (model, reported.map { Self.problem($0, model: model) }
+                ?? firstError.map { plainProblem($0) }
                 ?? "The download stopped unexpectedly. The log has the details.")
         }
     }

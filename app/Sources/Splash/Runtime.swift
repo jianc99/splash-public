@@ -107,6 +107,13 @@ struct Runtime: Sendable {
         return (try? JSONDecoder().decode(Owner.self, from: data))?.pid
     }
 
+    /// What the server serving `port` last wrote of its start (`server/serve_record.py`), beside
+    /// the port's lock; nil before one has.
+    func serveRecord(port: Int) -> ServeRecord? {
+        guard let data = try? Data(contentsOf: locks.appending(path: "serve-\(port).json")) else { return nil }
+        return try? JSONDecoder().decode(ServeRecord.self, from: data)
+    }
+
     /// Why this Mac cannot run Splash, as the engine's own check says, which the launcher repeats
     /// before every start; nil where the check passes or gives no reason: it does not start, runs
     /// past 30 s, or fails saying nothing.
@@ -116,6 +123,28 @@ struct Runtime: Sendable {
         let reason = ran.error.trimmingCharacters(in: .whitespacesAndNewlines).replacing(#/^error: /#, with: "")
         return reason.isEmpty ? nil : reason
     }
+}
+
+/// What a server writes of its start: the process (the launcher's, which runs the server as
+/// itself), whether it is starting or its start failed, and why: the engine's class of the failure
+/// with what it needed against what it had, or the server's own message.
+struct ServeRecord: Decodable, Equatable {
+    struct Failure: Decodable, Equatable {
+        /// "engine" or "server".
+        let source: String
+        /// The engine's class of the failure (`StartFailureKind`, lowercased), or "server".
+        let kind: String
+        let message: String
+        /// What bounds a memory or context shortfall: "device_memory", "max_memory" or "disk".
+        let bound: String?
+        let required_bytes: Int64?
+        let budget_bytes: Int64?
+        let plan_context_tokens: Int?
+    }
+
+    let pid: Int32
+    let phase: String
+    let failure: Failure?
 }
 
 struct InstalledModel: Identifiable, Hashable, Sendable {

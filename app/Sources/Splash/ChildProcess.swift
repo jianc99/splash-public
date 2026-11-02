@@ -176,13 +176,24 @@ final class LogTail {
     }
 }
 
+/// The engine's stop budget (runtime/Supervision.hpp `kStop`, which
+/// dev/tests/engine/protocol_golden.txt pins): from a stop signal to the engine's exit, its flush
+/// included. A server stops its engine with SIGTERM and kills it past this, then waits this long
+/// more for it to exit, so a server stopping takes at most twice it.
+enum Supervision {
+    static let stop = Duration.seconds(15)
+}
+
 /// A program this app started, as the defaults keep it for the next launch should this one end
 /// without stopping it: its process ID and when it started. Together they name it whichever copy
 /// of the app started it, and never a later process given the same ID.
 struct ChildRecord {
     let key: String
-    /// The signal a later launch stops it with.
+    /// The signal a later launch stops it with, once: a second one could cut what the first lets
+    /// it finish.
     let stop: Int32
+    /// How long after that signal its process group is killed if it still runs.
+    let killAfter: Duration
 
     /// Keeps `child` as the program this record names.
     func keep(_ child: ChildProcess) {
@@ -201,7 +212,7 @@ struct ChildRecord {
         guard let kept = UserDefaults.standard.array(forKey: key) as? [Int], kept.count == 2,
               let pid = pid_t(exactly: kept[0])
         else { return forget() }
-        if processStart(pid) == kept[1] { await stopProcessGroup(pid, with: stop) }
+        if processStart(pid) == kept[1] { await stopProcessGroup(pid, with: stop, killAfter: killAfter) }
         if processStart(pid) != kept[1] { forget() }
     }
 }
@@ -215,11 +226,17 @@ func processStart(_ pid: pid_t) -> Int? {
 }
 
 /// Stops the process group `pid` leads, as `ChildProcess.signal` would, when this app no longer
-/// holds it: `signal`, then SIGKILL if it still runs 20 s later; returns once it has ended.
-func stopProcessGroup(_ pid: pid_t, with signal: Int32) async {
+/// holds it: `signal`, then SIGKILL if it still runs `killAfter` later; returns once its leader
+/// has ended, or 10 s after the SIGKILL.
+func stopProcessGroup(_ pid: pid_t, with signal: Int32, killAfter: Duration) async {
     killpg(pid, signal)
-    for tick in 1...300 where kill(pid, 0) == 0 {
-        if tick == 200 { killpg(pid, SIGKILL) }
+    let killAt = ContinuousClock.now + killAfter
+    var killed = false
+    while kill(pid, 0) == 0, ContinuousClock.now < killAt + .seconds(10) {
+        if !killed, ContinuousClock.now >= killAt {
+            killpg(pid, SIGKILL)
+            killed = true
+        }
         try? await Task.sleep(for: .milliseconds(100))
     }
 }
@@ -251,16 +268,11 @@ func resetLog(_ url: URL) {
     FileManager.default.createFile(atPath: url.path, contents: nil)
 }
 
-/// A failure of `model`'s in words a user can act on; the log keeps the original.
-func plainProblem(_ message: String, model: String) -> String {
+/// A failure in words a user can act on; the log keeps the original. The installer classes its
+/// own failures (`Installer.Failure`), and a server its start's (`ServeRecord`).
+func plainProblem(_ message: String) -> String {
     if let reason = message.firstMatch(of: /^cannot prepare .+?: (.+)$/)?.1 {
         return "Splash can’t serve these files: \(reason)"
-    }
-    if message.contains("Repository Not Found") || message.contains("404 Client Error") {
-        return "Hugging Face has no public model named \(model.split(separator: ":")[0]). Check the name, then try again."
-    }
-    if message.contains("ConnectionError") || message.contains("Max retries exceeded") || message.contains("nodename nor servname") {
-        return "Splash couldn’t reach Hugging Face. Check the internet connection, then try again."
     }
     return message
 }
