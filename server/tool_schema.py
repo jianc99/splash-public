@@ -897,14 +897,16 @@ def _parameter_rules(rule, prefix, value_schema, syntax):
     """The rules of a parameter of a strict tool, its value written as the
     template writes values, a string as its text and any other value as
     JSON, then the syntax's value close: raw text when it may be any string,
-    else one of the values each member of its union lists, or JSON of a
-    member that lists none. None when no value is possible. Framing makes
-    each parameter schema self-contained, so it is its own reference
-    root."""
+    else one of the values each member of its union lists, or JSON of the
+    members that list none. None when no value is possible. Framing makes
+    each parameter schema self-contained, so it is its own reference root:
+    the members that list no value are one JSON schema, the parameter
+    schema with them as its union, whose references reach its definitions
+    as they are, and the grammar grows with the parameter schema alone."""
     closing = _tags(syntax, syntax.value_close)
     if value_schema is False:
         return None
-    rules, choices = [], []
+    rules, choices, structured = [], [], []
     for member in _union_members(value_schema):
         texts = _literal_texts(member, value_schema)
         if texts is None:
@@ -915,11 +917,7 @@ def _parameter_rules(rule, prefix, value_schema, syntax):
                     f"{rule}: {prefix} {rule}_value",
                     *_raw_value(syntax, f"{rule}_value"),
                 ]
-            if member is not value_schema:
-                # A member refers to the parameter schema's definitions.
-                member = _schema_with_root(member, value_schema)
-            member = _grammar_compatible_schema(member)
-            choices.append(f"%json {json.dumps(member, separators=(',', ':'))}")
+            structured.append(member)
             continue
         for text in texts:
             if syntax.value_close in text:
@@ -929,6 +927,21 @@ def _parameter_rules(rule, prefix, value_schema, syntax):
             else:
                 rules.append(f"{rule}_empty_{len(rules)}:")
                 choices.append(f"{rule}_empty_{len(rules) - 1}")
+    if structured:
+        schema = (
+            value_schema
+            if structured[0] is value_schema
+            else {
+                **{
+                    key: value
+                    for key, value in value_schema.items()
+                    if key not in ("anyOf", "oneOf")
+                },
+                "anyOf": structured,
+            }
+        )
+        schema = _grammar_compatible_schema(schema)
+        choices.append(f"%json {json.dumps(schema, separators=(',', ':'))}")
     if not choices:
         return None
     return [
