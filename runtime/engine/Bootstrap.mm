@@ -362,6 +362,12 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
   std::unique_ptr<NativeRuntime> nativeLoop;
   try {
     connectToGovernor(config.nativeLoop.engine, resources->memoryGovernor());
+    // The model's pools join the ledger after the cache, its first source
+    // (RuntimeResources::create), and the ledger logs each decision it makes.
+    MemoryLedger &ledger = resources->memoryGovernor().ledger();
+    for (model::ElasticPool *pool : modelRuntime->pools())
+      ledger.addPool(*pool);
+    ledger.setDecisionLog([](std::string_view line) { logLine(line); });
     config.nativeLoop.engine.spill = resources->spillConfig();
     config.nativeLoop.engine.weights = WeightResidencyConfig{
         .weights = &resources->releasableMemory(),
@@ -386,9 +392,10 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
 
   RuntimeResources *resourcesPointer = resources.get();
   model::RuntimeModel *modelPointer = modelRuntime.get();
+  NativeRuntime *loopPointer = nativeLoop.get();
   RuntimeBootstrapReport report = requireWarmupAndAnnounce(
       resources->memoryPlan(), *modelRuntime, resources->kvPool(),
-      [resourcesPointer, modelPointer] {
+      [resourcesPointer, modelPointer, loopPointer] {
         // Audit every attempted warmup before reclaiming idle buffers.
         // Wider batches and cache memory grow on demand after Ready.
         ActualMemoryReport report = resourcesPointer->actualMemoryReport(
@@ -404,13 +411,18 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
         for (;;) {
           try {
             resourcesPointer->backend().checkOperation();
-            return report;
+            break;
           } catch (const metal::MetalAllocationError &) {
             if (AwakeClock::now() >= deadline)
               throw;
           }
           std::this_thread::sleep_for(kMemoryReleasePoll);
         }
+        // The pools start at their floors and grow before Ready into the
+        // room the host's rule for growth leaves (MemoryGovernor::
+        // growToTargets), which serving's control passes keep to.
+        resourcesPointer->memoryGovernor().growToTargets(loopPointer->monotonicMilliseconds());
+        return report;
       },
       *nativeLoop);
 

@@ -623,7 +623,8 @@ RuntimeResources::RuntimeResources(
     std::unique_ptr<metal::MetalBackend> backend, std::shared_ptr<model::SsdReaders> readers,
     model::LoadedModel model, ops::ExecutionPlans operators, EngineMemoryPlan memoryPlan,
     RuntimeCacheIdentity cacheIdentity,
-    std::unique_ptr<MemoryGovernor> memoryGovernor,
+    std::unique_ptr<MemoryGovernor> memoryGovernor, ClaimId startClaim,
+    std::unique_ptr<MemoryGovernor::Scope> startScope,
     std::unique_ptr<kv::PageStorage> kvPages,
     std::unique_ptr<model::QwenStateStorage> stateStorage,
     std::unique_ptr<KvPageTier> kvTier, std::unique_ptr<DiskSpace> diskSpace,
@@ -637,7 +638,8 @@ RuntimeResources::RuntimeResources(
       operators_(std::move(operators)),
       memoryPlan_(std::move(memoryPlan)),
       cacheIdentity_(std::move(cacheIdentity)),
-      memoryGovernor_(std::move(memoryGovernor)), kvPages_(std::move(kvPages)),
+      memoryGovernor_(std::move(memoryGovernor)), startClaim_(startClaim), startScope_(std::move(startScope)),
+      kvPages_(std::move(kvPages)),
       stateStorage_(std::move(stateStorage)), kvTier_(std::move(kvTier)),
       diskSpace_(std::move(diskSpace)), kvPool_(std::move(kvPool)),
       cache_(std::move(cache)), aneFfn_(std::move(aneFfn)),
@@ -1152,11 +1154,12 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     if (config.memoryPressure)
       memoryGovernor->setPressure(config.memoryPressure());
     // What the start allocates, the KV runway, the arenas and the warmup, is
-    // memory a request in service needs: like loading, it needs only the
-    // reserve macOS keeps short of critical pressure, which every Metal
-    // operation checks. The host's margins and macOS's warning hold back
-    // only what serving adds (beginServing).
-    memoryGovernor->setServing(true);
+    // the start's one Floor claim until serving begins (beginServing): like
+    // loading, it needs only the reserve macOS keeps short of critical
+    // pressure, which every Metal operation checks. The host's margin and
+    // macOS's warning hold back only what serving adds.
+    const ClaimId startClaim = memoryGovernor->ledger().open({.cls = ClaimClass::Floor});
+    auto startScope = std::make_unique<MemoryGovernor::Scope>(*memoryGovernor, startClaim);
     logLine("Kernel policy for GPU family ", device.appleGpuFamily,
             " with ", device.gpuCoreCount, " cores.");
     if (const model::RopeScaling &rope = config.model.ropeScaling; rope.yarn())
@@ -1216,6 +1219,17 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     auto cache = std::make_unique<engine::Cache>(*kvPool, kvTier.get(), disk.budget, spillPolicy, windowPolicy);
     if (disk.space)
       cache->setDiskMeasure([space = disk.space.get()] { space->measure(); });
+    // The ledger's accounts of the KV pages and the lane states, which it
+    // reads from their storage, and the cache, its first source of victims,
+    // whose transfers return memory as they land. The engine's lanes and the
+    // model's pools follow (RuntimeBootstrap::start).
+    MemoryLedger &ledger = memoryGovernor->ledger();
+    ledger.addAccount("kv", AccountRole::Kv, [pages = kvPages.get()] { return pages->actualAllocatedBytes(); });
+    ledger.addAccount("states", AccountRole::States,
+                      [states = stateStorage.get()] { return states->actualAllocatedBytes(); });
+    ledger.addSource(*cache);
+    ledger.setReturning([cache = cache.get()] { return cache->returning(); },
+                        [cache = cache.get()](uint64_t requestId) { return cache->returningFor(requestId); });
     // A target whose KV spills reads it back through one hot block cache and
     // one history stream, which take KV memory from the governor.
     std::unique_ptr<model::KvBlockCache> blockCache;
@@ -1250,7 +1264,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     auto result = std::unique_ptr<RuntimeResources>(new RuntimeResources(
         std::move(disk.persistent), std::move(backend), std::move(readers), std::move(loaded),
         std::move(operators), std::move(memoryPlan), std::move(cacheIdentity),
-        std::move(memoryGovernor), std::move(kvPages), std::move(stateStorage),
+        std::move(memoryGovernor), startClaim, std::move(startScope), std::move(kvPages), std::move(stateStorage),
         std::move(kvTier), std::move(disk.space), std::move(kvPool), std::move(cache),
         std::move(aneFfn.split), std::move(aneFfn.outcome), std::move(blockCache),
         std::move(historyStream), config.kvSpillAlways, config.verifyRows));
@@ -1302,7 +1316,8 @@ void RuntimeResources::adoptPersistentCache() {
 }
 
 void RuntimeResources::beginServing() {
-  memoryGovernor_->setServing(false);
+  startScope_.reset();
+  memoryGovernor_->ledger().close(startClaim_);
   CacheDirectory *directory = persistentCache_.directory.get();
   if (!directory)
     return;

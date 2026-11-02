@@ -276,8 +276,8 @@ public:
   RuntimeResources &operator=(const RuntimeResources &) = delete;
   ~RuntimeResources();
 
-  // The engine is Ready: what the start allocated as memory a request in
-  // service needs is in place, so the governor's mark for it ends, and a
+  // The engine is Ready: what the start allocated under its Floor claim is
+  // in place, so the claim's scope ends and the claim closes, and a
   // persistent tier's directory marks this process serving, on probation for
   // its first minute (CacheDirectory::beginServing).
   void beginServing();
@@ -338,7 +338,8 @@ private:
                    model::LoadedModel model, ops::ExecutionPlans operators,
                    EngineMemoryPlan memoryPlan,
                    RuntimeCacheIdentity cacheIdentity,
-                   std::unique_ptr<MemoryGovernor> memoryGovernor,
+                   std::unique_ptr<MemoryGovernor> memoryGovernor, ClaimId startClaim,
+                   std::unique_ptr<MemoryGovernor::Scope> startScope,
                    std::unique_ptr<kv::PageStorage> kvPages,
                    std::unique_ptr<model::QwenStateStorage> stateStorage,
                    std::unique_ptr<KvPageTier> kvTier,
@@ -364,6 +365,10 @@ private:
   EngineMemoryPlan memoryPlan_;
   RuntimeCacheIdentity cacheIdentity_;
   std::unique_ptr<MemoryGovernor> memoryGovernor_;
+  // The start's Floor claim and its scope, from the governor's construction
+  // until serving begins; the scope goes before the governor.
+  ClaimId startClaim_;
+  std::unique_ptr<MemoryGovernor::Scope> startScope_;
   std::unique_ptr<kv::PageStorage> kvPages_;
   std::unique_ptr<model::QwenStateStorage> stateStorage_;
   std::unique_ptr<KvPageTier> kvTier_;

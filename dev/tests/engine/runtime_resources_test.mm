@@ -1161,6 +1161,52 @@ void testTheHeldBackTableStaysInThePlan(const char *metallibPath) {
           "host's context");
 }
 
+// A start of `resources` as the server makes one, whose log it keeps in
+// `log`.
+std::unique_ptr<RuntimeBootstrap> bootstrapOf(const RuntimeResourcesConfig &resources, RuntimeMetrics &metrics,
+                                              std::string &log) {
+  RuntimeBootstrapConfig config;
+  config.resources = resources;
+  config.nativeLoop.metrics = &metrics;
+  std::unique_ptr<RuntimeBootstrap> bootstrap;
+  log = test::capturedStderr([&] {
+    bootstrap = RuntimeBootstrap::start(config, [](std::span<const uint8_t>) {}, [] { return std::string(); });
+  });
+  return bootstrap;
+}
+
+// The ledger's account named `name` in `memory`, or nullptr.
+const MemoryAccountSnapshot *accountOf(const MemoryGovernorSnapshot &memory, std::string_view name) {
+  const auto found = std::ranges::find(memory.accounts, name, &MemoryAccountSnapshot::name);
+  return found == memory.accounts.end() ? nullptr : &*found;
+}
+
+// The ledger's accounts sum to what the governor charges: at Ready a start of
+// streamed experts books the KV pages and the lane states as their storage
+// counts them and the expert store as its pool reports it, and the fixed
+// account holds the rest, so that the accounts' current bytes add up to the
+// charged bytes exactly.
+void testLedgerAccountsSumToTheBackend(const RuntimeResourcesConfig &config) {
+  RuntimeMetrics metrics;
+  std::string log;
+  const std::unique_ptr<RuntimeBootstrap> bootstrap = bootstrapOf(config, metrics, log);
+  RuntimeResources &resources = bootstrap->resources();
+  const MemoryGovernorSnapshot memory = resources.memoryGovernor().snapshot();
+  const MemoryAccountSnapshot *kv = accountOf(memory, "kv"), *states = accountOf(memory, "states"),
+                              *experts = accountOf(memory, "experts");
+  require(!memory.accounts.empty() && memory.accounts.front().name == "fixed" && kv && states && experts,
+          "the ledger has no account of the KV pages, the lane states or the expert store");
+  uint64_t booked = 0;
+  for (const MemoryAccountSnapshot &account : memory.accounts) booked += account.currentBytes;
+  require(booked == memory.chargedBytes && memory.accounts.front().currentBytes > 0,
+          "the ledger's accounts did not sum to the charged bytes, " + std::to_string(booked) + " of " +
+              std::to_string(memory.chargedBytes));
+  const ActualMemoryReport actual = resources.actualMemoryReport(bootstrap->modelRuntime().actualRuntimeMemory());
+  require(kv->currentBytes == resources.kvPool().allocatedBytes() && states->currentBytes == actual.stateAllocatedBytes &&
+              experts->currentBytes == resources.streamedExpertStats()->liveBytes,
+          "an account did not book what its owner holds");
+}
+
 // The runtime of a start, built under the governor's admission of its
 // arenas, as Bootstrap builds it.
 std::unique_ptr<model::Runtime> runtimeOf(RuntimeResources &resources) {
@@ -1455,6 +1501,9 @@ int main(int argc, char **argv) {
         testAutomaticExpertMemory(moe);
         testVerifyRows(argv[1], moe);
         testStreamedRuntimeBoundary(moe);
+        RuntimeResourcesConfig streamed = moe;
+        streamed.maximumMemoryBytes = startStreamed(moe).minimumRequired - 1;
+        testLedgerAccountsSumToTheBackend(streamed);
       }
       std::cout << "runtime resources tests passed\n";
       return EXIT_SUCCESS;
