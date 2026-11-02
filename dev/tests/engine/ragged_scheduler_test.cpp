@@ -726,6 +726,25 @@ void testAGroupBeyondMaximumPassesHalvesOnlyWhenContended() {
   }
 }
 
+// A contended unit whose cost per chunk no passes bring within the bound,
+// nor any fewer rows, keeps its rows in the most passes: halving would cost
+// as much a unit for fewer rows. (A dense target whose chunk takes 2.2 s,
+// in four passes at most.)
+void testAContendedUnitKeepsRowsNoFewerBound() {
+  test::TimingProfile heavy = test::kDense27B;
+  heavy.chunkMilliseconds = 2220.0;
+  Sim sim(heavy, limits(kChunk, 4));
+  sim.seed();
+  sim.decoder(1);
+  sim.lane(2, 0, 20'000);
+  completeDecode(sim);
+  const BatchPlan plan = sim.plan();
+  require(plan.kind == WorkKind::Prefill && plan.items[0].tokenCount == kChunk && plan.passes == 4,
+          "a contended unit no fewer rows bound halved to " + std::to_string(plan.items[0].tokenCount) + " rows");
+  sim.run(plan);
+  require(sim.scheduler.snapshot().boundCuts == 0, "a halving no fewer rows could make was counted");
+}
+
 // --- Joins --------------------------------------------------------------------------------------------------
 
 // A long lane's sparing rows do not join a short turn: what they add each
@@ -785,6 +804,31 @@ void testTwoSpillLanesNeverShareAMultiPassCommand() {
   require(plan.passes > 1 && plan.width() == 1, "two lanes with Index pages shared a command in passes");
   sim.run(plan);
   require(sim.scheduler.snapshot().indexPageConflicts == 1, "the lane left out for Index pages was not counted");
+}
+
+// What planning counted is the committed plan's, as next() made it: a lane
+// prepare refused this tick, which the plan was made without but the commit
+// does not exclude (it is no longer waiting for memory on its way back),
+// changes nothing of the halvings and Index-page conflicts counted.
+void testTheCountersAreThoseOfThePlanCommitted() {
+  Sim sim(test::kM6FlashNextQ2, limits(8192, 48));
+  sim.seed();
+  sim.decoder(9);
+  sim.lane(1, 45056, 300);
+  sim.shape(1, 45056 / kPageTokens);
+  sim.lane(2, 45056, 200);
+  sim.shape(2, 0, true);
+  // Lane 3, the cheapest, which would lead, was refused.
+  sim.lane(3, 8192, 100);
+  completeDecode(sim);
+  sim.excluded = {3};
+  const BatchPlan plan = sim.plan();
+  require(plan.kind == WorkKind::Prefill && plan.items[0].requestId != 3 && plan.width() == 1,
+          "the plan without the refused lane did not leave a lane out for Index pages");
+  sim.excluded.clear();
+  sim.run(plan);
+  require(sim.scheduler.snapshot().indexPageConflicts == 1,
+          "the committed plan's Index-page conflict was not counted");
 }
 
 // --- Order and aging ----------------------------------------------------------------------------------------
@@ -1058,10 +1102,12 @@ constexpr test::TestCase kTests[] = {
     {"testEveryContendedUnitWithinItsBound", testEveryContendedUnitWithinItsBound},
     {"testAContendedSpillLaneKeepsItsGroupRows", testAContendedSpillLaneKeepsItsGroupRows},
     {"testAGroupBeyondMaximumPassesHalvesOnlyWhenContended", testAGroupBeyondMaximumPassesHalvesOnlyWhenContended},
+    {"testAContendedUnitKeepsRowsNoFewerBound", testAContendedUnitKeepsRowsNoFewerBound},
     {"testALongLanesSparingRowsDoNotDelayAShortTurn", testALongLanesSparingRowsDoNotDelayAShortTurn},
     {"testFourShortTurnsShareOneCommand", testFourShortTurnsShareOneCommand},
     {"testADenseFinishingLeaderRunsWithoutFill", testADenseFinishingLeaderRunsWithoutFill},
     {"testTwoSpillLanesNeverShareAMultiPassCommand", testTwoSpillLanesNeverShareAMultiPassCommand},
+    {"testTheCountersAreThoseOfThePlanCommitted", testTheCountersAreThoseOfThePlanCommitted},
     {"testShortestExpectedRemainingLeads", testShortestExpectedRemainingLeads},
     {"testNearEqualLongPromptsDoNotInterleave", testNearEqualLongPromptsDoNotInterleave},
     {"testAgingBoundsALongLaneUnderArrivals", testAgingBoundsALongLaneUnderArrivals},

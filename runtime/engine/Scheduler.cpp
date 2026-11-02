@@ -332,6 +332,8 @@ std::optional<BatchPlan> Scheduler::next(const PlanInputs &in) const {
 
 std::optional<BatchPlan> Scheduler::nextPrefill(const PlanInputs &in) const {
   std::optional<Planned> planned = planPrefill(readyLanes(in));
+  // Its commit counts what planning it counted.
+  lastPlanned_ = planned;
   // A command between its passes goes on before any other prefill, whose
   // rows would take the model's prefill memory its rows' work is in, but one
   // that supersedes it.
@@ -563,7 +565,12 @@ std::optional<Scheduler::Planned> Scheduler::planPrefill(std::vector<Lane> ready
   while (lanes.front().rows > kMinimumPrefillRows && !withinPairs(lanes))
     lanes.front().rows /= 2;
   UnitFit fit = passesFor(lanes, bounded);
-  while (!fit.within && contend && lanes.front().rows > kMinimumPrefillRows) {
+  // A contended unit no passes bound halves its rows where fewer rows can
+  // bound it: a cost per chunk or per pass no rows shorten leaves its rows.
+  const model::PrefillLane fewest{leader.processed, std::min(lanes.front().rows, kMinimumPrefillRows),
+                                  leader.shape.indexPages};
+  const bool halves = !fit.within && contend && passesFor({&fewest, 1}, bounded).within;
+  while (halves && !fit.within && lanes.front().rows > kMinimumPrefillRows) {
     lanes.front().rows = std::max(lanes.front().rows / 2, kMinimumPrefillRows);
     ++result.boundCuts;
     fit = passesFor(lanes, bounded);
@@ -674,15 +681,13 @@ std::vector<uint64_t> Scheduler::commit(const BatchPlan &plan, const PlanInputs 
     ++counters_.prefillBatches;
     for (const BatchItem &item : plan.items)
       counters_.prefillRows += item.tokenCount;
-    // What planning counted for this plan, and the lanes now overdue, which
-    // stay so to their prompt's end.
-    const std::vector<Lane> ready = readyLanes(in);
-    if (const std::optional<Planned> planned = planPrefill(ready);
-        planned && planned->plan.items == plan.items) {
-      counters_.boundCuts += planned->boundCuts;
-      counters_.indexPageConflicts += planned->indexPageConflicts;
+    // What planning counted for this plan, as next() made it, and the lanes
+    // now overdue, which stay so to their prompt's end.
+    if (lastPlanned_ && samePlan(lastPlanned_->plan, plan)) {
+      counters_.boundCuts += lastPlanned_->boundCuts;
+      counters_.indexPageConflicts += lastPlanned_->indexPageConflicts;
     }
-    for (const Lane &view : ready)
+    for (const Lane &view : readyLanes(in))
       if (view.overdue)
         get(view.request->spec.id).overdue = true;
   } else if (!prefill) {
@@ -692,6 +697,7 @@ std::vector<uint64_t> Scheduler::commit(const BatchPlan &plan, const PlanInputs 
     ++counters_.decodeBatches;
     ++counters_.decodeBatchesByWidth[plan.width() - 1];
   }
+  lastPlanned_.reset();
   activeExpected_ = prefill ? work_.prefillWork(prefillLanes(plan.items, in), plan.pass, plan.passes)
                             : model::CommandWork{};
   excluded_.assign(in.excluded.begin(), in.excluded.end());

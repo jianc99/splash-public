@@ -155,10 +155,11 @@ struct SchedulerSnapshot final {
 // of its priority or a higher one decodes (contended), or when it leads a
 // group, each unit is bounded: the fewest passes whose every pass's price is
 // within max(G, turnaround / kPassOverheadShare), or failing that within
-// twice its fixed part; a contended unit no passes bound halves its rows. A
-// layer's attention pairs bound rows, never passes. A lane joins with the
-// rows that spare it a command of its own when what it adds to the others
-// is less than what it saves (summed completion). The command between its
+// twice its fixed part; a contended unit no passes bound halves its rows
+// where fewer rows can bound it. A layer's attention pairs bound rows, never
+// passes. A lane joins with the rows that spare it a command of its own when
+// what it adds to the others is less than what it saves (summed
+// completion). The command between its
 // passes runs its later passes before any other prefill but a plan whose
 // summed completion of the lanes concerned is shorter (supersedes). Decode
 // takes the ready lanes of one priority and stage, constrained or not,
@@ -348,6 +349,9 @@ private:
   CostModel cost_;
   std::unordered_map<uint64_t, Request> requests_;
   std::optional<BatchPlan> active_;
+  // The prefill plan next() made last and what planning it counted, which
+  // its commit adds to the counters; the commit of any plan clears it.
+  mutable std::optional<Planned> lastPlanned_;
   // The work planning expected of the prefill unit in flight.
   model::CommandWork activeExpected_;
   // The lanes the active command was planned without.
