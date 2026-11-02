@@ -1022,7 +1022,9 @@ private:
   // released, or a page need's pages of
   // a form, whose unit is the evictions up to a page freed, the states on
   // the way among its victims unless the need counts state buffers too
-  // (statesAreUnits).
+  // (statesAreUnits). A device need that also lacks pages of a form keeps
+  // the free pages of that form it takes first (keptPages): its reclaims
+  // release an extent of that form only past them.
   struct Walk final {
     WalkScope scope;
     ReclaimTiming timing = ReclaimTiming::CanWait;
@@ -1037,15 +1039,17 @@ private:
     bool statesAreUnits = false;
     uint32_t pages = 0;
     kv::PageForm form = kv::PageForm::Full;
+    uint32_t keptPages = 0;
     bool hostRefused = false;
-    // A device need that also lacks pages in place counts the free pages
-    // its attempt found: an extent released of them frees bytes its retry
-    // only allocates again.
-    bool keepFree = false;
     friend bool operator==(const Walk &, const Walk &) = default;
     // Whether its releases leave the form one empty extent.
     [[nodiscard]] bool keeps(kv::PageForm form) const noexcept {
       return keepRunway || (form == kv::PageForm::Index && keepIndexRunway);
+    }
+    // Whether its releases may take an extent of the form, which has
+    // `freePages` free: only past the free pages it keeps (keptPages).
+    [[nodiscard]] bool releases(kv::PageForm each, uint32_t freePages, uint32_t extentPages) const noexcept {
+      return each != form || freePages >= keptPages + extentPages;
     }
   };
   [[nodiscard]] Walk walkFor(const VictimQuery &query) const;
@@ -1254,7 +1258,9 @@ private:
   // empties; progress with zero bytes when the extent emptied is the runway
   // kept. No progress when the free pages fill none.
   [[nodiscard]] CacheReclaimResult releaseExtent(bool keepRunway);
-  // releaseExtent, leaving each form the runway the walk keeps.
+  // releaseExtent for a walk: it leaves each form the runway the walk keeps,
+  // and an extent of the form whose free pages it keeps goes only past them
+  // (Walk::releases).
   [[nodiscard]] CacheReclaimResult releaseExtent(const Walk &walk);
   // Empties one extent that still holds pages, of the form or of any
   // (KvPool::compactExtent); the blocks and requests on its pages follow

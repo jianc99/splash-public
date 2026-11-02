@@ -679,7 +679,12 @@ Cache::Walk Cache::walkFor(const VictimQuery &query) const {
     // extent released covers it.
     walk.device = true;
     walk.refused = Shortfall{pool_.extentPages(), kv::PageForm::Full};
-    walk.keepFree = need.pages != 0;
+    // A KV need takes the free pages of its form first: releasing their
+    // extent would give it bytes for an extent it then allocates again.
+    if (need.pages) {
+      walk.form = need.form;
+      walk.keptPages = pool_.freePageCount(need.form);
+    }
   } else if (need.pages) {
     // Pages in place; a host that refuses growth takes them in a page scan.
     walk.pages = need.pages;
@@ -1181,7 +1186,7 @@ std::optional<engine::Victim> Cache::ReclaimPlan::weigh(Weighed weighed) {
 
 // takeReclaim, weighed; one that stopped at uncopied cache goes on there.
 Cache::ReclaimPlan::Step Cache::ReclaimPlan::step() {
-  if (!std::exchange(resumes_, false) && !walk.keepFree) {
+  if (!std::exchange(resumes_, false)) {
     for (std::pair<bool, uint64_t> released; (released = releaseExtent()).first;)
       if (released.second)
         return {.progress = true, .bytes = released.second};
@@ -1380,7 +1385,7 @@ void Cache::ReclaimPlan::fixPage(uint32_t page) {
 uint64_t Cache::ReclaimPlan::releaseEmpty() {
   for (const kv::PageForm each : {kv::PageForm::Full, kv::PageForm::Slim, kv::PageForm::Index}) {
     Form &form = forms_[static_cast<size_t>(each)];
-    if (form.empty.size() <= (walk.keeps(each) ? 1u : 0u))
+    if (form.empty.size() <= (walk.keeps(each) ? 1u : 0u) || !walk.releases(each, form.freePages, extentPages_))
       continue;
     const uint32_t index = *form.empty.begin();
     unlist(index);
@@ -1398,7 +1403,8 @@ uint64_t Cache::ReclaimPlan::releaseEmpty() {
 bool Cache::ReclaimPlan::compact() {
   for (const kv::PageForm each : {kv::PageForm::Full, kv::PageForm::Slim, kv::PageForm::Index}) {
     const Form &form = forms_[static_cast<size_t>(each)];
-    if (!form.allocated || form.holders.empty() || form.freeInUse < extentPages_)
+    if (!form.allocated || form.holders.empty() || form.freeInUse < extentPages_ ||
+        !walk.releases(each, form.freePages, extentPages_))
       continue;
     const uint32_t emptied = form.holders.begin()->second;
     std::vector<uint32_t> receivers;
@@ -2004,10 +2010,9 @@ uint64_t Cache::releaseOtherForms(kv::PageForm form) {
 
 CacheReclaimResult Cache::takeReclaim(const Walk &walk) {
   plan_.reset();
-  // Free pages first, as the extent they fill, unless the need counts them;
-  // one that empties the runway kept gives nothing yet, and the next one
-  // does.
-  for (CacheReclaimResult released; !walk.keepFree && (released = releaseExtent(walk)).madeProgress;)
+  // Free pages first, as the extent they fill; one that empties the runway
+  // kept gives nothing yet, and the next one does.
+  for (CacheReclaimResult released; (released = releaseExtent(walk)).madeProgress;)
     if (released.reclaimedBytes)
       return released;
   // Then the victims in reclaimOne's order while their KV can empty an
@@ -2190,16 +2195,17 @@ bool Cache::extentWithinReach(ReclaimClass upTo) const {
 }
 
 CacheReclaimResult Cache::releaseExtent(const Walk &walk) {
-  const auto release = [&] {
-    for (const kv::PageForm form : {kv::PageForm::Full, kv::PageForm::Slim, kv::PageForm::Index})
-      if (const uint64_t bytes = pool_.reclaimEmptyExtents(walk.keeps(form), 1, form))
-        return bytes;
-    return uint64_t{0};
+  constexpr std::array kForms{kv::PageForm::Full, kv::PageForm::Slim, kv::PageForm::Index};
+  const auto releases = [&](kv::PageForm form) {
+    return walk.releases(form, pool_.freePageCount(form), pool_.extentPages());
   };
-  if (const uint64_t bytes = release())
-    return {true, bytes};
-  if (compactExtent())
-    return {true, release()};
+  for (const kv::PageForm form : kForms)
+    if (releases(form))
+      if (const uint64_t bytes = pool_.reclaimEmptyExtents(walk.keeps(form), 1, form))
+        return {true, bytes};
+  for (const kv::PageForm form : kForms)
+    if (releases(form) && compactExtent(form))
+      return {true, pool_.reclaimEmptyExtents(walk.keeps(form), 1, form)};
   return {};
 }
 
