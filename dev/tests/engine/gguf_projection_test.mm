@@ -313,9 +313,10 @@ struct Operands {
   }
 };
 
-// The output rows [0, storage) of a run and, for gate/up, the gate its up pass read.
+// The output rows [0, storage) of a run, for gate/up the gate its up pass read, and the dispatches it ran.
 struct Outcome {
   std::vector<uint16_t> output, gate;
+  size_t dispatches = 0;
 };
 
 // Runs one projection with `plan` over `x` (and `aux`), its split partials first set to `poison`; checks that a spread
@@ -343,8 +344,9 @@ Outcome run(MetalBackend &backend, const Linear &linear, const LinearPlan &plan,
   static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
   if (!scratch.intact() || !o.input.intact() || !o.aux.intact() || !o.output.intact() || !o.gate.intact())
     fail(label + ": a counter is not reset or a write past a buffer");
-  Outcome out{o.output.halves(), plan.workload().epilogue == LinearEpilogue::GateUp ? o.gate.halves()
-                                                                                   : std::vector<uint16_t>{}};
+  Outcome out{o.output.halves(),
+              plan.workload().epilogue == LinearEpilogue::GateUp ? o.gate.halves() : std::vector<uint16_t>{},
+              graph.dispatches().size()};
   const uint32_t columns = plan.workload().matrix.outputSize;
   for (const std::vector<uint16_t> *rows : {&out.output, &out.gate})
     for (uint64_t i = 0; i < rows->size(); ++i)
@@ -720,6 +722,27 @@ void prefill(MetalBackend &backend, const Linear &linear, uint32_t K, const std:
         checkValues(out, dots, {}, chunkAux, chunk, rows, covered, true, name);
         if (splits == 1 && !sameRows(out.output, 0, tileOutput, 0, rows, columns))
           fail(name + ": differs from the 128-row tiles");
+        // A fused chunk runs its segments in one dispatch, each segment's columns bitwise its own chunk's at the
+        // same split.
+        if (parts.size() > 1) {
+          if (out.dispatches != 1)
+            fail(name + ": ran " + std::to_string(out.dispatches) + " dispatches, not one");
+          uint32_t offset = 0;
+          for (const Tensor *t : parts) {
+            const LinearWorkload alone{{t->N, K}, rows, LinearPhase::Prefill, epilogue};
+            const LinearPlan own = Linear::plan(alone, config(LinearTile::GgufStaged, alone, splits),
+                                                FloatOutput::BFloat16);
+            const Outcome segment = run(backend, linear, own, projection({t}, t->N), nullptr,
+                                        storageRows(x, K, rows, own.storageRows()), chunkAux, kPoisonNaN, t->N,
+                                        name + " " + fmtName(t->format) + " alone");
+            for (uint32_t r = 0; r < rows; ++r)
+              if (!std::equal(segment.output.begin() + uint64_t{r} * t->N,
+                              segment.output.begin() + uint64_t{r + 1} * t->N,
+                              out.output.begin() + uint64_t{r} * columns + offset))
+                fail(name + ": " + fmtName(t->format) + "'s columns differ from its own chunk's");
+            offset += t->N;
+          }
+        }
       }
   };
   for (size_t i = 0; i < formats.size(); ++i) {
@@ -736,7 +759,7 @@ void prefill(MetalBackend &backend, const Linear &linear, uint32_t K, const std:
   section("prefill: " + std::to_string(formats.size()) + " formats, K " + std::to_string(K) +
           ", plain/residual/up-with-gate and fused segments, 128-row tiles over 168- and 136-row chunks and chunks of "
           "8-64 rows (S 1 and " + std::to_string(splitChunk) + (K / 32 % 8 ? "" : ", and 8 past 32 rows") +
-          ") within fp64, equal to the 128-row tiles");
+          ") within fp64, equal to the 128-row tiles; a fused chunk in one dispatch, bitwise its segments' own");
 }
 
 // ---------------------------------------------------------------- leading inputs

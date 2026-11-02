@@ -226,12 +226,13 @@ void Linear::addGguf(metal::CommandGraph &graph, const LinearBuffers &b,
 }
 
 // The staged decode tiles, for decode and prefill chunks of up to
-// ProjectionCalibration::stagedPrefillRows rows: every row of the plan's storage in each threadgroup's tile,
-// grid (64-column tiles, K splits). Decode runs one dispatch per projection
-// (addDecodeTensor, fusedSegments), gate/up as two passes, or, where
-// selectProjection sets LinearConfig::oneGateUpPass, as one pass over 32-column
-// threadgroups of one simdgroup each. Prefill chunks run one dispatch per
-// segment, but a fused projection's chunk of 33 to 64 rows runs one.
+// ProjectionCalibration::stagedPrefillRows rows: every row of the plan's
+// storage in each threadgroup's tile, grid (64-column tiles, K splits). A
+// projection runs one dispatch, a fused one's segments together
+// (fusedSegments), in decode as in prefill; decode runs gate/up as two passes,
+// or, where selectProjection sets LinearConfig::oneGateUpPass, as one pass over
+// 32-column threadgroups of one simdgroup each, and a prefill chunk with an
+// epilogue runs one dispatch per segment.
 void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
                              const Projection &p, const LinearPlan &plan,
                              const Projection *gate) const {
@@ -268,11 +269,17 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
               {segmentColumns(p) / GGUF_TILE_COLUMNS, splits, 1}, {GGUF_STAGED_THREADS, 1, 1});
   };
   if (w.phase == LinearPhase::Prefill) {
-    // A fused projection's chunk of 33 to 64 rows runs its segments in one
-    // dispatch: a dispatch costs about 0.045 ms however narrow, and one per
-    // segment of a 35B GDN layer's qkv|z|ab made its resumes 3-5% slower
-    // than the prefill tile's one per format.
-    if (segments.size() > 1 && w.rows > kMaximumDecodeTileRows && w.epilogue == LinearEpilogue::None) {
+    // A fused projection's chunk runs its segments in one dispatch, as decode
+    // does: a dispatch costs about 0.045 ms however narrow, and one per
+    // segment of a 35B GDN layer's qkv|z|ab made its resumes 3-5% slower than
+    // the prefill tile's one per format. At 8 to 32 rows (decode's kernels,
+    // gguf-projection-benchmark, medians of 20, two passes) the 27B attention
+    // input (IQ4_XS|Q6_K|Q8_0, 14336 x 5120), its GDN input (Q4_K|Q4_K,
+    // 16384 x 5120) and the 35B GDN input (Q8_0|Q8_0, 12288 x 2048) take
+    // 16-56% less time in one dispatch than in one per segment on a 32-core M5
+    // Max (A/A 0.6%), and on a 10-core M4 3-11% less but for the 27B GDN input,
+    // within 1.3% (A/A 3.6%).
+    if (segments.size() > 1 && w.epilogue == LinearEpilogue::None) {
       fused();
       return;
     }
