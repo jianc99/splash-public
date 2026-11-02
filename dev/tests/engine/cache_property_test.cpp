@@ -419,8 +419,9 @@ private:
 // A windowed run takes more seeds: the paths that leave a state's tail
 // Slim, unless the cache keeps it Full, take a run of steps few seeds make.
 // Windowed seed 9454 runs too: in it a poisoned block's own write lands
-// after its subtree left (Cache::dropPoisoned).
-void testRandomRuns() {
+// after its subtree left (Cache::dropPoisoned). The seeds run are
+// 1..plainSeeds plain and 1..windowedSeeds windowed.
+void testRandomRuns(uint32_t plainSeeds, uint32_t windowedSeeds) {
   const auto check = [](uint32_t seed, bool windowed) {
     Run run(seed, windowed);
     try {
@@ -437,17 +438,24 @@ void testRandomRuns() {
     }
   };
   for (const bool windowed : {false, true})
-    for (uint32_t seed = 1; seed <= (windowed ? 400u : 40u); ++seed)
+    for (uint32_t seed = 1; seed <= (windowed ? windowedSeeds : plainSeeds); ++seed)
       check(seed, windowed);
   check(9454, true);
-  std::cout << "cache property runs ok\n";
+  std::cout << "cache property runs ok: " << plainSeeds << " plain seeds, " << windowedSeeds
+            << " windowed and windowed seed 9454\n";
 }
 
 } // namespace
 
-int main() {
+// cache-property [plainSeeds windowedSeeds]: 40 and 400 by default.
+int main(int argc, char **argv) {
+  if (argc != 1 && argc != 3) {
+    std::cerr << "usage: cache-property [plainSeeds windowedSeeds]\n";
+    return 2;
+  }
   try {
-    testRandomRuns();
+    testRandomRuns(argc == 3 ? static_cast<uint32_t>(std::stoul(argv[1])) : 40u,
+                   argc == 3 ? static_cast<uint32_t>(std::stoul(argv[2])) : 400u);
     std::cout << "cache property tests passed\n";
     return 0;
   } catch (const std::exception &error) {
