@@ -246,7 +246,6 @@ std::string EngineMemoryBreakdown::toStatusJson() const {
     out << "\"kv_window\":{\"slim_page_bytes\":" << kvSlimPageBytes << ",\"floor_pages\":" << kvWindowFloorPages
         << "},";
   out << "\"kv_spill\":" << spillStatusJson(kvSpill) << ','
-      << "\"resident_kv_bytes\":" << residentKvBytes << ','
       << "\"context_bounds\":{\"window\":" << contextBounds.window
       << ",\"resident\":" << contextBounds.resident << ",\"spilled\":" << contextBounds.spilled
       << ",\"disk\":" << contextBounds.disk << ",\"bound\":" << json::quote(contextBounds.bound()) << "},"
@@ -300,7 +299,7 @@ std::string EngineMemoryBreakdown::describe() const {
         << kvSpill.floorTokens << " tokens: hot block cache " << bytesAndMiB(kvSpill.hotFloorBytes)
         << " (target " << bytesAndMiB(kvSpill.hotTargetBytes) << "), history staging "
         << bytesAndMiB(kvSpill.stagingBytes) << " in " << kvSpill.stagingBuffers << ", Index runway "
-        << bytesAndMiB(kvSpill.indexRunwayBytes) << "; resident KV " << bytesAndMiB(residentKvBytes) << '\n';
+        << bytesAndMiB(kvSpill.indexRunwayBytes) << '\n';
   out << "context: " << contextBounds.maximum() << " tokens (" << contextBounds.bound() << "; window "
       << contextBounds.window << ", resident " << contextBounds.resident << ", spilled " << contextBounds.spilled
       << ", disk " << contextBounds.disk << ")\n"
@@ -332,7 +331,6 @@ SpillGeometry EngineMemoryPlan::spillGeometry() const noexcept {
   return {.fullPageBytes = breakdown_.kvPageBytes,
           .indexPageBytes = breakdown_.kvIndexPageBytes,
           .slotBytes = spill.slotBytes,
-          .residentKvBytes = breakdown_.residentKvBytes,
           .residentTokens = breakdown_.contextBounds.resident,
           .densePages = spill.densePages,
           .windowPages = spill.windowPages,
@@ -460,9 +458,6 @@ evaluateEngineMemoryPlan(const DeviceCapabilities &device,
           remaining(breakdown.kvCapacityTokens, model::ExecutionLimits::speculativeScratchTokens))),
       .spilled = spill.memoryTokens,
       .disk = spill.diskTokens};
-  if (spill.enabled)
-    breakdown.residentKvBytes = remaining(breakdown.dynamicBudgetBytes,
-                                          breakdown.laneStateBytes + spill.indexRunwayBytes + spill.readerBytes());
   if (!breakdown.kvExtentPages ||
       breakdown.dynamicBudgetBytes < breakdown.minimumDynamicBytes) {
     if (breakdown.minimumRequiredBytes > breakdown.hardBudgetBytes) {

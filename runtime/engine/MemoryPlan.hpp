@@ -297,11 +297,8 @@ struct EngineMemoryBreakdown {
   // on a request's chain stay Full beside these and are not counted.
   uint64_t kvSlimPageBytes = 0;
   uint32_t kvWindowFloorPages = 0;
-  // A spill-capable target's plan, and what the dynamic budget leaves the
-  // requests' pages beside one lane's state, its readers and its runway
-  // (SpillGeometry::residentKvBytes).
+  // A spill-capable target's plan.
   KvSpillPlan kvSpill;
-  uint64_t residentKvBytes = 0;
   ContextBounds contextBounds;
 
   uint64_t minimumDynamicBytes = 0;
@@ -322,17 +319,16 @@ struct BudgetValidationStatus {
 };
 
 // What the engine's admission needs of the memory plan to decide which
-// requests spill (Engine::kvModeFor), as data: the bytes of a Full page, of
-// an Index page and of a tier slot; the memory left to resident KV after the
-// floors; the tokens one request's KV may take in memory alone, as without
-// the SSD cache (ContextBounds::resident), for a request that cannot spill;
-// and, per Spill request, the pages its cache keeps Full (its dense history,
-// its tail window and up to two prefill groups awaiting copies).
+// requests spill (Engine::placement), as data: the bytes of a Full page, of
+// an Index page and of a tier slot; the tokens one request's KV may take in
+// memory alone, as without the SSD cache (ContextBounds::resident), for a
+// request that cannot spill; and, per Spill request, the pages its cache
+// keeps Full (its dense history, its tail window and up to two prefill
+// groups awaiting copies).
 struct SpillGeometry final {
   uint64_t fullPageBytes = 0;
   uint64_t indexPageBytes = 0;
   uint64_t slotBytes = 0;
-  uint64_t residentKvBytes = 0;
   uint32_t residentTokens = 0;
   uint32_t densePages = 0;
   uint32_t windowPages = 0;

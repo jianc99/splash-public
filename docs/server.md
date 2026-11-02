@@ -736,21 +736,20 @@ steps read. No option turns this on: it needs only the
 what memory holds, as a dense target's is.
 
 - Admission decides it per request. A request whose KV, its prompt and
-  `min(max_tokens, 4096)` tokens of output, fits the memory the plan leaves
-  resident KV beside the other requests', which leaves the
-  [expert store](#streamed-experts) its cap, keeps its KV in memory; any other
-  spills. A request in memory whose KV cannot grow spills
-  from then on rather than yield its lane or fail: its pages whose copies landed before,
-  as a prefix restored from the SSD cache has them, spill at once, and it
-  waits while the others' copies land. When any other memory is short, a
-  state, a spilling request's reads, or the host's, the request in memory
-  holding the most KV spills the same way, once the cached prefixes nothing
-  in use holds are gone and before the [expert store](#streamed-experts)
-  gives a chunk back: spilled, its KV needs only its dense and window pages
-  and the index of the rest, while every decode step reads the experts. A
-  request that cannot spill, the SSD cache closed or its quota short, or
-  whose KV fits in the pages a spilling request keeps whole anyway, keeps
-  its KV in memory, and the store gives the chunk back.
+  `min(max_tokens, 4096)` tokens of output, fits the memory free now, or
+  what the memory it can take costs less than spilling would (the cached
+  prefixes nothing in use holds, the [expert store](#streamed-experts)'s
+  chunks above its floor, each priced at what losing it costs), keeps its KV
+  in memory; any other spills. A request in memory whose KV cannot grow
+  spills from then on rather than yield its lane or fail: its pages whose
+  copies landed before, as a prefix restored from the SSD cache has them,
+  spill at once, and it waits while the others' copies land. When any other
+  memory is short, a state, a spilling request's reads, or the host's, the
+  cheapest of what can go goes first: a cached prefix, a chunk of the store,
+  or a request in memory that spills the same way, priced at the slower
+  prefill and decode steps spilling costs it. A request that cannot spill,
+  the SSD cache closed or its quota short, or whose KV fits in the pages a
+  spilling request keeps whole anyway, keeps its KV in memory.
 - A spilling request writes each committed page once to the SSD cache. Once
   the copy has landed, the page keeps only its index, 24 KiB of the int8
   page's 414 KiB. Alone at the memory wall, it waits while its writes land

@@ -177,13 +177,13 @@ inline engine::EngineRequest constrainedRequest(uint64_t id, double deadline = 1
 // 100-byte slots whose quota, active KV's limit included, holds `slots` of
 // them; and a dense history and a tail window of a page each. With
 // `always`, every request spills (--kv-spill always); otherwise a request
-// spills where its projection does not fit `residentKvBytes` of resident KV
-// (1,000 pages by default) beside the other lanes' (SpillGeometry). One that
-// cannot spill may start Resident within `residentTokens` alone, by default
-// the tokens of resident KV's pages. The tier's transfers land as the
-// fixture ticks on, and decode runs to each request's output limit. The
-// tier's write budget, if a test sets one, refills on the fixture's clock.
-// Its engine's governor is the host's (GovernedHost), of `limits`.
+// spills where its projection does not fit the room the governor finds for
+// it (Engine::placement). One that cannot spill may start Resident within
+// `residentTokens` alone, by default the tokens of `residentKvBytes` of
+// pages (1,000 pages by default). The tier's transfers land as the fixture
+// ticks on, and decode runs to each request's output limit. The tier's
+// write budget, if a test sets one, refills on the fixture's clock. Its
+// engine's governor is the host's (GovernedHost), of `limits`.
 struct Spilling {
   // The pages of an extent, of a type of its own for a call to name.
   struct Extent final {
@@ -199,7 +199,7 @@ struct Spilling {
         cache(pool, &tier, budget, engine::CacheSpillPolicy{1, 1}),
         host(limits),
         engine((shape ? shape(model) : void(),
-                config(always, residentKvBytes,
+                config(always,
                        residentTokens ? residentTokens
                                       : static_cast<uint32_t>(residentKvBytes / 100 * engine::KvCache::pageTokens),
                        host, laneReadBytes)),
@@ -212,7 +212,7 @@ struct Spilling {
     model.decodeFinishes = false;
   }
 
-  static engine::EngineConfig config(bool always, uint64_t residentKvBytes, uint32_t residentTokens,
+  static engine::EngineConfig config(bool always, uint32_t residentTokens,
                                      GovernedHost &host, uint64_t laneReadBytes) {
     engine::EngineConfig result = host.connect({});
     result.spill = {.capable = true,
@@ -221,7 +221,6 @@ struct Spilling {
                     .geometry = {.fullPageBytes = 100,
                                  .indexPageBytes = 10,
                                  .slotBytes = 100,
-                                 .residentKvBytes = residentKvBytes,
                                  .residentTokens = residentTokens,
                                  .densePages = 1,
                                  .windowPages = 1,

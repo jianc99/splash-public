@@ -362,8 +362,9 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
   std::unique_ptr<NativeRuntime> nativeLoop;
   try {
     connectToGovernor(config.nativeLoop.engine, resources->memoryGovernor());
-    // The model's pools join the ledger after the cache, its first source
-    // (RuntimeResources::create), and the ledger logs each decision it makes.
+    // The model's pools join the ledger, which ranks them after the sources
+    // the engine registers as it is built (the cache, then the engine's own
+    // victims), and the ledger logs each decision it makes.
     MemoryLedger &ledger = resources->memoryGovernor().ledger();
     for (model::ElasticPool *pool : modelRuntime->pools())
       ledger.addPool(*pool);

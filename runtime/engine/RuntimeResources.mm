@@ -471,8 +471,7 @@ void reportSpill(const model::ModelDescriptor &model, const EngineMemoryBreakdow
   }
   logLine("Long requests keep their KV on the SSD cache: ", bounds.maximum(), " tokens of context (bound: ",
           bounds.bound(), "; window ", bounds.window, ", resident ", bounds.resident, ", spilled ", bounds.spilled,
-          ", disk ", bounds.disk, "); a request whose KV fits ", budget.residentKvBytes / kMiB,
-          " MiB stays in memory; hot block cache ", spill.hotTargetBytes / kMiB, " MiB (floor ",
+          ", disk ", bounds.disk, "); hot block cache ", spill.hotTargetBytes / kMiB, " MiB (floor ",
           spill.hotFloorBytes / kMiB, " MiB); history staging in ", spill.stagingBuffers,
           " buffers; SSD room for active KV ", gibibytes(activeLimitBytes), ".");
 }
@@ -1183,16 +1182,13 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     if (disk.space)
       cache->setDiskMeasure([space = disk.space.get()] { space->measure(); });
     // The ledger's accounts of the KV pages and the lane states, which it
-    // reads from their storage, and the cache, its first source of victims,
-    // whose transfers return memory as they land. The engine's lanes and the
-    // model's pools follow (RuntimeBootstrap::start).
+    // reads from their storage. The engine registers the cache and its own
+    // victims as it is built, and the model's pools follow
+    // (RuntimeBootstrap::start).
     MemoryLedger &ledger = memoryGovernor->ledger();
     ledger.addAccount("kv", AccountRole::Kv, [pages = kvPages.get()] { return pages->actualAllocatedBytes(); });
     ledger.addAccount("states", AccountRole::States,
                       [states = stateStorage.get()] { return states->actualAllocatedBytes(); });
-    ledger.addSource(*cache);
-    ledger.setReturning([cache = cache.get()] { return cache->returning(); },
-                        [cache = cache.get()](uint64_t requestId) { return cache->returningFor(requestId); });
     // A target whose KV spills reads it back through one hot block cache and
     // one history stream, which take KV memory from the governor.
     std::unique_ptr<model::KvBlockCache> blockCache;
@@ -1358,7 +1354,6 @@ model::RuntimeContext RuntimeResources::modelContext() noexcept {
       blockCache_.get(),
       historyStream_.get(),
       verifyRows_,
-      memoryGovernor_->growthAdmission(),
   };
 }
 
@@ -1419,9 +1414,9 @@ ActualMemoryReport RuntimeResources::actualMemoryReport(
   }
   report.kvAllocatedBytes = kvPool_->allocatedBytes();
   if (blockCache_)
-    report.kvBlockCacheBytes = blockCache_->stats().bytes;
+    report.spilledKvHotBytes = blockCache_->stats().bytes;
   if (historyStream_)
-    report.kvHistoryStagingBytes = historyStream_->stats().stagingBytes;
+    report.spilledKvStagingBytes = historyStream_->stats().stagingBytes;
   report.stateStagingBytes = modelMemory.stateStagingBytes;
   report.aneFfnBytes = aneFfn_ ? aneFfn_->allocatedBytes() : 0;
   if (const auto table = streamedTableStats()) report.streamedTableBytes = table->cacheBytes;

@@ -56,7 +56,6 @@ void testUnwritableTierKeepsRequestsResident() {
                     .geometry = {.fullPageBytes = 423'936,
                                  .indexPageBytes = 24'576,
                                  .slotBytes = 425'984,
-                                 .residentKvBytes = uint64_t{1} << 40,
                                  .residentTokens = residentTokens,
                                  .densePages = 64,
                                  .windowPages = 64,

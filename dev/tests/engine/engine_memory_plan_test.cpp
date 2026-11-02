@@ -988,7 +988,6 @@ void testPlanSetsTheStoresFloor() {
   require(held.maximumContextTokens() == mains.maximumContextTokens() &&
               budget.dynamicBudgetBytes == mains.breakdown().dynamicBudgetBytes &&
               budget.kvCapacityTokens == mains.breakdown().kvCapacityTokens &&
-              held.spillGeometry().residentKvBytes == mains.spillGeometry().residentKvBytes &&
               budget.hostHeldBackBytes == heldBack &&
               held.toStatusJson().find("\"host_held_back_bytes\":" + std::to_string(heldBack) +
                                        ",\"fixed_runtime_bytes\"") != std::string::npos &&
@@ -1018,11 +1017,7 @@ void testEnginePlanServesTheSpilledContext() {
     const SpillGeometry geometry = plan.spillGeometry();
     require(geometry.fullPageBytes == 423'936 && geometry.indexPageBytes == 24'576 &&
                 geometry.slotBytes == 425'984 && geometry.densePages == 64 && geometry.windowPages == 64 &&
-                geometry.groupPages == 256 &&
-                geometry.residentKvBytes == plan.breakdown().dynamicBudgetBytes -
-                                                plan.breakdown().laneStateBytes - streamed.spill.indexRunwayBytes -
-                                                streamed.spill.readerBytes() &&
-                geometry.residentTokens == bounds.resident,
+                geometry.groupPages == 256 && geometry.residentTokens == bounds.resident,
             "admission's geometry is not the plan's");
   }
   const SpillGeometry geometry{.fullPageBytes = 423'936, .indexPageBytes = 24'576, .densePages = 64,
