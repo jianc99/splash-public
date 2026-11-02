@@ -149,9 +149,16 @@ struct KernelCalibration final {
 // would keep 320 inputs. From five threadgroups per core a 10-core M4 takes
 // 3-7% less time at one lane on one or two partitions than on the tiers' four
 // (MLX 4-bit, 5120 inputs), where at two to four lanes the tiers' are the
-// fastest: telling one lane apart needs an Apple9 GPU of more cores.
-// Status: tiers 1-2 measured (M3 Max); tier 3 measured on Apple10, unmeasured
-// on Apple9 (U1).
+// fastest: telling one lane apart needs an Apple9 GPU of more cores. On a
+// 10-core M4, by width (64-192 columns: 0.8-2.4 threadgroups per core at
+// eight, as 320 columns on 17-50 cores) over 10240 inputs in Q8_0, BF16 and
+// Q4_K and 17408 in Q4_K at one to four lanes (gguf-projection-benchmark,
+// medians of 20, two passes 1.3% apart at most; binaries e33524f0, metallib
+// 703016c3), eight partitions instead of the tier's sixteen take 1.9% less
+// time in total but more than that spread in 18 of the 48 cases, up to 21%
+// (Q8_0 64 x 10240 and Q4_K 64 x 17408 at one lane), while BF16 takes 7-20%
+// less: Apple9 keeps tier 3. Status: measured (M3 Max; Apple10; Apple9 by
+// width on the M4, U1; no Apple9 of 14 or more cores is reachable, O5).
 inline constexpr SplitTier kRegisterTiers[] = {{4, 256}, {32, 1024}, {3, 512, 16}};
 
 // Apple9's staged tile takes the register tile's tiers of eight partitions
