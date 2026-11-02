@@ -3,8 +3,11 @@
 // The model the engine, native loop and transport tests run their engines
 // on, and the states and tickets it hands them.
 
+#include "FakeElasticPool.hpp"
+#include "FakeMemory.hpp"
 #include "TestImmediateTicket.hpp"
 #include "TestKvPool.hpp"
+#include "TimingProfile.hpp"
 #include "engine/KvCache.hpp"
 #include "model/Model.hpp"
 
@@ -12,8 +15,10 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
+#include <random>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -258,6 +263,8 @@ public:
             return entry.second.resident && entry.second.lane == lane;
           });
       if (!used) {
+        if (const metal::AllocationFailure refused = takeLaneState(); refused != metal::AllocationFailure::None)
+          return {{}, StateFailure::MemoryPressure, refused};
         requests.emplace(
             request.id,
             Request{.lane = lane,
@@ -279,6 +286,7 @@ public:
     pageTables.erase(id);
     spilledReadFloors.erase(id);
     historyStaging.erase(id);
+    releaseLane(id);
     entry.resident = false;
     entry.position = 0;
     ++suspensions;
@@ -302,6 +310,8 @@ public:
                    candidate.second.lane == lane;
           });
       if (!used) {
+        if (const metal::AllocationFailure refused = takeLaneState(); refused != metal::AllocationFailure::None)
+          return {{}, StateFailure::MemoryPressure, refused};
         entry.lane = lane;
         entry.resident = true;
         entry.position = 0;
@@ -545,13 +555,10 @@ public:
       // runtime's returns.
       std::vector<ModelStepResult> results(items.size());
       for (size_t lane = 0; lane < items.size(); ++lane) results[lane].requestId = items[lane].requestId;
-      const CommandTimes times = commandTimes ? commandTimes(plan, items) : CommandTimes{};
-      ticket = immediateTicket(std::move(results), completion, times);
+      ticket = timedTicket(std::move(results), plan, items, completion);
     } else {
-      const CommandTimes times = commandTimes ? commandTimes(plan, items) : CommandTimes{};
-      ticket = immediateTicket(plan.kind == WorkKind::Prefill ? prefill(plan, items)
-                                                              : decode(plan, items),
-                               completion, times);
+      ticket = timedTicket(plan.kind == WorkKind::Prefill ? prefill(plan, items) : decode(plan, items), plan,
+                           items, completion);
     }
     if (submitObserver)
       submitObserver();
@@ -565,6 +572,43 @@ public:
   // lane at most past a chunk, and streams the history of one lane at most.
   model::CommandLimits commandLimits() const noexcept override {
     return {.commandRows = groupRows, .maximumPasses = passes, .lanesPastChunk = 1, .indexPageLanes = 1};
+  }
+  // With timing, the profile's work (TimedWork); otherwise the default.
+  model::CommandWork prefillWork(std::span<const model::PrefillLane> lanes, uint32_t pass,
+                                 uint32_t passes) const override {
+    return timing ? timing->prefillWork(lanes, pass, passes) : model::Model::prefillWork(lanes, pass, passes);
+  }
+  std::span<model::ElasticPool *const> pools() noexcept override {
+    pools_[0] = experts;
+    return experts ? std::span<model::ElasticPool *const>(pools_) : std::span<model::ElasticPool *const>();
+  }
+  // The bytes reserveSpilledReads(id, need) would allocate now: a decode's
+  // floor unless held, a prefill's staging beyond what it holds. Each call
+  // counts for the request in the admission state now.
+  uint64_t spilledReadShortfall(uint64_t id, model::SpilledReadNeed need) const override {
+    ++shortfallQueries[{id, admissionState ? admissionState() : 0}];
+    if (need.kind == WorkKind::Decode)
+      return spilledReadFloors.contains(id) ? 0 : spilledReadFloorBytes;
+    const auto staged = historyStaging.find(id);
+    const uint32_t held = staged == historyStaging.end() ? 0 : staged->second;
+    return need.pages > held ? uint64_t{need.pages - held} * stagingPageBytes : 0;
+  }
+  // Runs the model's commands on `profile`: they report its work and take
+  // its time, the experts pool's residency pricing their reads.
+  void time(const TimingProfile &profile) {
+    timing.emplace(profile,
+                   [this, &profile] { return experts ? experts->residentShare() : profile.measuredResidentShare; });
+    noise_.seed(profile.seed);
+  }
+  // With a clock: when the timed command in flight ends, and its completion,
+  // run once the clock has reached it.
+  [[nodiscard]] std::optional<double> commandEnd() const noexcept { return commandEnd_; }
+  void land(double nowMilliseconds) {
+    if (!commandEnd_ || *commandEnd_ > nowMilliseconds)
+      return;
+    commandEnd_.reset();
+    if (const std::function<void()> completion = std::exchange(timedCompletion_, {}))
+      completion();
   }
   uint64_t snapshotBytes() const noexcept override { return stateBytes; }
   // The production model takes a cached state's buffers from its pool, or
@@ -588,6 +632,15 @@ public:
     if (denyReservationAt == tokens || (reservationRoom && !reservationRoom())) {
       refusal = reservationFailure;
       return nullptr;
+    }
+    if (memory) {
+      const uint64_t bytes = State().bytes();
+      if (*evictedStateBytes >= bytes) {
+        *evictedStateBytes -= bytes;
+      } else if (const metal::AllocationResult result = allocateStates(bytes); !result) {
+        refusal = result.failure;
+        return nullptr;
+      }
     }
     refusal = metal::AllocationFailure::None;
     ++reservations;
@@ -636,6 +689,9 @@ public:
   model::ModelMemoryAdmission reserveSpilledReads(uint64_t id) override {
     if (refusedSpilledReads.contains(id) || (spilledReadsRoom && !spilledReadsRoom(id)))
       return {.allocationFailure = spilledReadsRefusal};
+    if (!spilledReadFloors.contains(id))
+      if (const metal::AllocationResult result = allocateReads(id, spilledReadFloorBytes); !result)
+        return {.allocationFailure = result.failure};
     spilledReadFloors.insert(id);
     return {.ok = true};
   }
@@ -645,6 +701,11 @@ public:
   model::ModelMemoryAdmission reserveHistoryStaging(uint64_t id, uint32_t pages) override {
     if (refusedStaging.contains(id))
       return {.allocationFailure = metal::AllocationFailure::EngineBudget};
+    const auto found = historyStaging.find(id);
+    if (const uint32_t held = found == historyStaging.end() ? 0 : found->second; pages > held)
+      if (const metal::AllocationResult result = allocateReads(id, uint64_t{pages - held} * stagingPageBytes);
+          !result)
+        return {.allocationFailure = result.failure};
     uint32_t &staged = historyStaging[id];
     staged = std::max(staged, pages);
     stagings.push_back(id);
@@ -676,8 +737,8 @@ public:
     reclaimableIdleStateBytes += *evictedStateBytes - refill;
     *evictedStateBytes = 0;
     if (!keepLane && pooledLaneBytes)
-      return std::exchange(pooledLaneBytes, 0);
-    const uint64_t released = reclaimableIdleStateBytes;
+      return giveBackStates(std::exchange(pooledLaneBytes, 0));
+    const uint64_t released = giveBackStates(reclaimableIdleStateBytes);
     reclaimableIdleStateBytes = 0;
     reclaimedIdleStateBytes += released;
     if (released && kvGrowthBlocked)
@@ -702,8 +763,18 @@ public:
   // next, refused with expertGrowthRefusal otherwise, and expertAdmission,
   // when set, admits its bytes as the production store's admission does
   // (Runtime::growExperts), refused with the admission's cause.
-  // expertReleaseObserver runs as a chunk goes, before it is logged.
+  // expertReleaseObserver runs as a chunk goes, before it is logged. With
+  // `experts`, the hooks act on that pool instead, growing under
+  // growthAdmission.
   uint64_t releaseExpertChunk() override {
+    if (experts) {
+      if (!experts->state().releaseUnitBytes)
+        return 0;
+      if (expertReleaseObserver)
+        expertReleaseObserver();
+      reclaimSteps.push_back(ReclaimStep::ExpertRelease);
+      return experts->release(1);
+    }
     if (expertChunks.empty())
       return 0;
     if (expertReleaseObserver)
@@ -722,10 +793,20 @@ public:
     return bytes;
   }
   uint64_t expertGrowthBytes() const override {
+    if (experts)
+      return experts->state().growUnitBytes;
     return releasedExpertChunks.empty() ? 0 : releasedExpertChunks.back();
   }
   model::ModelMemoryAdmission growExperts() override {
     ++expertGrowthAttempts;
+    if (experts) {
+      const uint32_t before = experts->units();
+      if (const metal::AllocationResult result = experts->grow(growthAdmission); !result)
+        return {.allocationFailure = result.failure};
+      if (experts->units() > before)
+        reclaimSteps.push_back(ReclaimStep::ExpertGrowth);
+      return {.ok = true};
+    }
     if (releasedExpertChunks.empty())
       return {.ok = true};
     if (expertGrowthRoom && !expertGrowthRoom())
@@ -757,9 +838,11 @@ public:
     return std::nullopt;
   }
   void end(uint64_t id) override {
-    if (const auto found = requests.find(id);
-        laneReleased && found != requests.end() && found->second.resident)
-      laneReleased();
+    if (const auto found = requests.find(id); found != requests.end() && found->second.resident) {
+      releaseLane(id);
+      if (laneReleased)
+        laneReleased();
+    }
     requests.erase(id);
     pageTables.erase(id);
     spilledReadFloors.erase(id);
@@ -996,6 +1079,35 @@ public:
   // it could not read (ModelStepResult::unreadableKvBlocks).
   std::unordered_map<uint64_t, std::vector<uint64_t>> unreadableBlocks;
 
+  // With `memory`, the model allocates through it: a lane's state buffers
+  // (laneStateBytes, from the pooled ones first) at begin and resume, and a
+  // state's at reserveState and snapshot (from the buffers the cache let go
+  // of first), under `admission`, held as "states" until a reclaim gives them
+  // back (heldStateBytes); a decoding lane's floor of the hot block cache
+  // (spilledReadFloorBytes) and a prefill's staging (stagingPageBytes a page)
+  // as "spilled_reads" until the lane is suspended or ends.
+  FakeMemory *memory = nullptr;
+  metal::AllocationAdmission admission, growthAdmission;
+  uint64_t laneStateBytes = 0, spilledReadFloorBytes = 0, stagingPageBytes = 0;
+  uint64_t heldStateBytes = 0;
+  std::unordered_map<uint64_t, uint64_t> spilledReadBytes;
+  // The expert store as an elastic pool (pools(), the store's hooks), whose
+  // residency prices the timed commands' reads and which their routing
+  // serves.
+  FakeElasticPool *experts = nullptr;
+  // With it (time()), the model reports the profile's work and its commands
+  // take the profile's time and sample its work; with a clock too, each
+  // completes once the clock reaches its end (TimedTicket).
+  std::optional<TimedWork> timing;
+  std::function<double()> clock;
+  // Runs as each command that takes those times (or commandTimes') is
+  // submitted.
+  std::function<void(const BatchPlan &, const CommandTimes &)> commandTimed;
+  // The spilled-read shortfall queries of each request in each admission
+  // state, which admissionState names.
+  std::function<uint64_t()> admissionState;
+  mutable std::map<std::pair<uint64_t, uint64_t>, uint32_t> shortfallQueries;
+
   // Holds every command until the flag it returns is set.
   std::shared_ptr<std::atomic<bool>> holdCommands() {
     holdPrefillUntil = holdDecodeUntil = std::make_shared<std::atomic<bool>>(false);
@@ -1003,6 +1115,110 @@ public:
   }
 
 private:
+  metal::AllocationResult allocateStates(uint64_t bytes) {
+    if (!bytes)
+      return {};
+    const metal::AllocationResult result = memory->allocate(admission, "states", bytes);
+    if (result)
+      heldStateBytes += bytes;
+    return result;
+  }
+  // State buffers a reclaim gives back.
+  uint64_t giveBackStates(uint64_t bytes) noexcept {
+    if (memory && bytes) {
+      memory->release("states", bytes);
+      heldStateBytes -= bytes;
+    }
+    return bytes;
+  }
+  // A lane's state buffers, from the pooled ones first: the cause of a
+  // refusal, or None.
+  metal::AllocationFailure takeLaneState() {
+    if (!memory || !laneStateBytes)
+      return metal::AllocationFailure::None;
+    const uint64_t pooled = std::min(pooledLaneBytes, laneStateBytes);
+    if (const metal::AllocationResult result = allocateStates(laneStateBytes - pooled); !result)
+      return result.failure;
+    pooledLaneBytes -= pooled;
+    return metal::AllocationFailure::None;
+  }
+  metal::AllocationResult allocateReads(uint64_t id, uint64_t bytes) {
+    if (!memory || !bytes)
+      return {};
+    const metal::AllocationResult result = memory->allocate(admission, "spilled_reads", bytes);
+    if (result)
+      spilledReadBytes[id] += bytes;
+    return result;
+  }
+  // A resident lane leaves: its state buffers go back to the pool and its
+  // reads' memory to the host.
+  void releaseLane(uint64_t id) {
+    if (memory && laneStateBytes)
+      pooledLaneBytes += laneStateBytes;
+    if (const auto found = spilledReadBytes.find(id); found != spilledReadBytes.end()) {
+      memory->release("spilled_reads", found->second);
+      spilledReadBytes.erase(found);
+    }
+  }
+  // A command that completes at once, or with a clock once it reaches its
+  // end, taking its work's time on the profile (or commandTimes').
+  std::unique_ptr<ModelBatchTicket> timedTicket(std::vector<ModelStepResult> results, const BatchPlan &plan,
+                                                std::span<const ModelBatchItem> items,
+                                                const std::function<void()> &completion) {
+    const CommandTimes times =
+        timing ? timedTimes(plan, items) : commandTimes ? commandTimes(plan, items) : CommandTimes{};
+    if (commandTimed)
+      commandTimed(plan, times);
+    if (!clock)
+      return immediateTicket(std::move(results), completion, times);
+    commandEnd_ = clock() + times.wallMilliseconds;
+    timedCompletion_ = completion;
+    return std::make_unique<TimedTicket>(std::move(results), times, clock, *commandEnd_);
+  }
+  // A command's time and work on the profile at the experts' residency now,
+  // with the uses its routing served the experts pool: a prefill's routed
+  // experts found resident or read, a decode's every row's topK a layer, of
+  // which its misses (decodeBytesPerToken a row) are ghost hits.
+  CommandTimes timedTimes(const BatchPlan &plan, std::span<const ModelBatchItem> items) {
+    const TimingProfile &profile = timing->profile();
+    const double share = timing->residentShare();
+    CommandTimes times;
+    if (plan.kind == WorkKind::Prefill) {
+      std::vector<model::PrefillLane> lanes;
+      for (const ModelBatchItem &item : items)
+        lanes.push_back({.position = static_cast<uint32_t>(item.logicalPosition),
+                         .rows = item.tokenCount,
+                         .indexPages = item.pageSources ? item.pageSources->indexPages() : 0});
+      const model::CommandWork work = timing->prefillWork(lanes, plan.pass, plan.passes);
+      times = prefillTimes(profile, work);
+      if (experts) {
+        const auto routed = static_cast<uint64_t>(work.layers * distinctExperts(profile, work.rows));
+        const auto hits = static_cast<uint64_t>(routed * prefillHit(profile, share));
+        experts->served(0, 0, hits, routed - hits);
+      }
+    } else {
+      const auto width = static_cast<uint32_t>(items.size());
+      const uint32_t rows = width * model::ExecutionLimits::targetVerifyRows;
+      const auto spilling = static_cast<uint32_t>(std::ranges::count_if(
+          items, [](const ModelBatchItem &item) { return item.pageSources && item.pageSources->indexPages(); }));
+      times = decodeTimes(profile, width, rows, share, spilling);
+      const uint64_t routed = uint64_t{rows} * profile.experts.topK * profile.layers;
+      const uint64_t misses =
+          profile.experts.expertBytes
+              ? std::min(routed, static_cast<uint64_t>(decodeBytesPerToken(profile, share) * rows /
+                                                       double(profile.experts.expertBytes)))
+              : 0;
+      times.sample.work = {.lanes = width,
+                           .rows = rows,
+                           .layers = profile.layers,
+                           .weightReadBytes = misses * profile.experts.expertBytes};
+      if (experts)
+        experts->served(routed - misses, misses, 0, 0);
+    }
+    if (profile.noise)
+      times.wallMilliseconds *= std::max(0.0, 1.0 + profile.noise * std::normal_distribution<double>()(noise_));
+    return times;
+  }
   // The blocks the request's step reports it could not read, once.
   std::vector<uint64_t> takeUnreadable(uint64_t id) {
     const auto found = unreadableBlocks.find(id);
@@ -1030,6 +1246,11 @@ private:
     restored += length;
     restoredDraft = restoreDraftState;
   }
+
+  model::ElasticPool *pools_[1] = {};
+  std::mt19937_64 noise_;
+  std::optional<double> commandEnd_;
+  std::function<void()> timedCompletion_;
 };
 
 } // namespace splash::test

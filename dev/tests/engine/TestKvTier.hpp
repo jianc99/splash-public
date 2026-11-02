@@ -85,6 +85,8 @@ public:
     bool submitted = true;
     // A write's class; none for a restore.
     std::optional<engine::WriteClass> write;
+    // When it lands, on a tier with a rate.
+    std::optional<double> dueMilliseconds;
   };
 
   TestKvTier() = default;
@@ -146,6 +148,22 @@ public:
       transfer->success = success;
     }
   }
+  // With a rate, a transfer lands a slot's bytes at bytesPerMillisecond
+  // after it starts, by the test's clock: the next of those to land, and
+  // those due by `nowMilliseconds` landed (a restore once submitted).
+  [[nodiscard]] std::optional<double> nextLanding() const {
+    std::optional<double> next;
+    for (const auto &transfer : transfers)
+      if (!transfer->finished && !transfer->ready && transfer->submitted && transfer->dueMilliseconds)
+        next = std::min(next.value_or(*transfer->dueMilliseconds), *transfer->dueMilliseconds);
+    return next;
+  }
+  void land(double nowMilliseconds) {
+    for (auto &transfer : transfers)
+      if (!transfer->finished && !transfer->ready && transfer->submitted && transfer->dueMilliseconds &&
+          *transfer->dueMilliseconds <= nowMilliseconds)
+        transfer->ready = true;
+  }
   // Fails every write of the class still in flight.
   void fail(engine::WriteClass write) {
     for (auto &transfer : transfers) {
@@ -190,6 +208,8 @@ public:
   bool writableFile = true;
   bool persistentTier = false;
   std::vector<std::shared_ptr<Transfer>> transfers;
+  std::optional<double> bytesPerMillisecond;
+  std::function<double()> clock;
 
 private:
   struct Slot final : engine::KvDiskSlot, TestKvCopy {
@@ -231,6 +251,8 @@ private:
   std::unique_ptr<engine::KvTransfer> start(std::optional<engine::WriteClass> write) {
     auto transfer = std::make_shared<Transfer>();
     transfer->write = write;
+    if (bytesPerMillisecond)
+      transfer->dueMilliseconds = clock() + double(slotBytes()) / *bytesPerMillisecond;
     transfers.push_back(transfer);
     ++inFlight_;
     if (write) ++writesInFlight_[static_cast<size_t>(*write)];

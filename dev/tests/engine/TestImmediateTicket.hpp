@@ -1,8 +1,10 @@
 #pragma once
 
 #include "engine/Types.hpp"
+#include "model/CommandCost.hpp"
 
 #include <atomic>
+#include <functional>
 #include <memory>
 #include <stdexcept>
 #include <utility>
@@ -11,12 +13,19 @@
 namespace splash::test {
 
 // The times a command reports (ModelBatchTicket): none unless a test sets
-// them, as a fake runs no kernels.
+// them, as a fake runs no kernels, and its sample, whose wall is wallMilliseconds.
 struct CommandTimes final {
   double wallMilliseconds = 0.0;
   double hostMilliseconds = 0.0;
   double streamMilliseconds = 0.0;
+  model::CommandSample sample{};
 };
+
+[[nodiscard]] inline model::CommandSample sampleOf(const CommandTimes &times) noexcept {
+  model::CommandSample sample = times.sample;
+  sample.wallMilliseconds = times.wallMilliseconds;
+  return sample;
+}
 
 class ImmediateTicket final : public ModelBatchTicket {
 public:
@@ -36,10 +45,36 @@ public:
   [[nodiscard]] double streamMilliseconds() const noexcept override {
     return times_.streamMilliseconds;
   }
+  [[nodiscard]] model::CommandSample sample() const noexcept override { return sampleOf(times_); }
 
 private:
   std::vector<ModelStepResult> results_;
   CommandTimes times_;
+};
+
+// A command that completes once the test's clock reaches its end.
+class TimedTicket final : public ModelBatchTicket {
+public:
+  TimedTicket(std::vector<ModelStepResult> results, CommandTimes times, std::function<double()> clock,
+              double endMilliseconds)
+      : results_(std::move(results)), times_(times), clock_(std::move(clock)), end_(endMilliseconds) {}
+
+  [[nodiscard]] bool ready() const noexcept override { return clock_() >= end_; }
+  [[nodiscard]] std::vector<ModelStepResult> wait() override {
+    if (!ready())
+      throw std::logic_error("a timed command completed before its end");
+    return std::move(results_);
+  }
+  [[nodiscard]] double wallMilliseconds() const noexcept override { return times_.wallMilliseconds; }
+  [[nodiscard]] double hostMilliseconds() const noexcept override { return times_.hostMilliseconds; }
+  [[nodiscard]] double streamMilliseconds() const noexcept override { return times_.streamMilliseconds; }
+  [[nodiscard]] model::CommandSample sample() const noexcept override { return sampleOf(times_); }
+
+private:
+  std::vector<ModelStepResult> results_;
+  CommandTimes times_;
+  std::function<double()> clock_;
+  double end_;
 };
 
 // A command that stays in flight until the test sets `ready`, from any
