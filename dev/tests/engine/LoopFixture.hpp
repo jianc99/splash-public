@@ -3,21 +3,29 @@
 // What the native loop tests of several areas share: the loop fixture, its
 // requests and the loops that tick it.
 
+#include "FakeMemory.hpp"
+#include "MemoryChecks.hpp"
 #include "ProtocolPeer.hpp"
 #include "TestChecks.hpp"
 #include "TestEngine.hpp"
 #include "TestExecutor.hpp"
 #include "TestKvPool.hpp"
 #include "TestStatus.hpp"
+#include "TimingProfile.hpp"
 #include "engine/Cache.hpp"
+#include "engine/MemoryControl.hpp"
+#include "engine/MemoryGovernor.hpp"
 #include "engine/NativeRuntime.hpp"
+#include "metal/MetalBackend.hpp"
 
 #include <algorithm>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <utility>
 #include <variant>
@@ -69,19 +77,38 @@ struct PoolShape {
   uint32_t runwayPages = pages;
 };
 
+// What a loop fixture adds to the loop. With memory: FakeMemory, the
+// stand-in backend and a real governor of `limits` wired by
+// connectToGovernor, whose admissions the KV storage, the model and the
+// weights allocate through, and with `control` the production control pass
+// (MemoryControl::run at FakeMemory's pressure) between commands. With
+// timing: the model takes the profile's time and the awake clock moves only
+// as run() moves it.
+struct LoopOptions final {
+  std::optional<FakeMemory::Config> memory;
+  GovernorLimits limits{};
+  const TimingProfile *timing = nullptr;
+  bool control = true;
+};
+
 // A native loop over the fake model, collecting the bytes it writes. Its
 // config is completed with the engine's (test::engineConfig), and the
 // fixture's metrics and weights, each weight allocation admitted, the
-// optional growth too (test::admitAll), where the test gave none; the
-// weights' idle release is production's unless the test gives one. Its unix
-// clock stands still and its awake clock reads `monotonic`, advanced by
-// `clockStep` on every read.
+// optional growth too (test::admitAll, or the governor's with memory), where
+// the test gave none; the weights' idle release is production's unless the
+// test gives one. Its unix clock stands still and its awake clock reads
+// `monotonic`, advanced by `clockStep` on every read, or with timing by
+// run().
 struct LoopFixture {
   explicit LoopFixture(engine::NativeLoopConfig config = {}, PoolShape shape = {},
                        protocol::ProtocolLimits limits = {},
-                       double idleReleaseSeconds = metal::kResidencyKeepAliveSeconds)
-      : storage(shape.pages, 4096, shape.extentPages),
-        pool(storage, shape.runwayPages), cache(pool, nullptr, nullptr),
+                       double idleReleaseSeconds = metal::kResidencyKeepAliveSeconds,
+                       std::optional<LoopOptions> loopOptions = std::nullopt)
+      : options(std::move(loopOptions)), memory(fakeMemory(options)), backend(standIn(memory)),
+        governor(memoryGovernor(options, memory, backend)),
+        storage(shape.pages, 4096, shape.extentPages),
+        pool(memory ? storage.through(*memory, governor->allocationAdmission()) : storage, shape.runwayPages),
+        cache(pool, nullptr, nullptr),
         loop(
             clocked(std::move(config)), idleReleaseSeconds, cache, executor,
             [this](std::span<const uint8_t> bytes) {
@@ -91,6 +118,19 @@ struct LoopFixture {
             },
             [this] { return status(); }, limits) {
     storage.commandInFlight = [this] { return loop.commandInFlight(); };
+    if (memory) {
+      memory->hold("weights", uint64_t{weights.held()} * Weights::kImageBytes);
+      weights.memory = &*memory;
+      executor.memory = &*memory;
+      executor.admission = governor->allocationAdmission();
+      executor.growthAdmission = governor->growthAdmission();
+      if (options->control)
+        control.emplace(*governor, *backend, loop);
+    }
+    if (options && options->timing) {
+      executor.time(*options->timing);
+      executor.clock = [this] { return monotonic; };
+    }
   }
 
   // Every event the loop has written.
@@ -99,6 +139,13 @@ struct LoopFixture {
   }
 
   engine::NativeLoopConfig clocked(engine::NativeLoopConfig config) {
+    if (governor) {
+      engine::connectToGovernor(config.engine, *governor);
+      if (!config.weightAdmission)
+        config.weightAdmission = governor->allocationAdmission();
+      if (!config.growthAdmission)
+        config.growthAdmission = governor->growthAdmission();
+    }
     config.engine = test::engineConfig(std::move(config.engine));
     if (!config.metrics)
       config.metrics = &metrics;
@@ -109,10 +156,50 @@ struct LoopFixture {
     if (!config.growthAdmission)
       config.growthAdmission = test::admitAll;
     config.unixMicros = [] { return uint64_t{1'000'000}; };
-    config.monotonicMilliseconds = [this] { return monotonic += clockStep; };
+    if (options && options->timing)
+      config.monotonicMilliseconds = [this] { return monotonic; };
+    else
+      config.monotonicMilliseconds = [this] { return monotonic += clockStep; };
     return config;
   }
 
+  // Ticks, with memory running the control pass between commands and the
+  // memory checks (I1) after each tick, again at once after a tick that
+  // made progress, else once the awake clock reaches the earliest of the
+  // command in flight's end, the loop's next wakeup and the host's next
+  // event, or 1 ms on; until done() or `steps` ticks, then requires done().
+  void run(const std::function<bool()> &done, std::string_view what, uint32_t steps = 100'000) {
+    for (uint32_t step = 0; step < steps && !done(); ++step) {
+      const bool progressed = loop.tick();
+      if (control && !loop.commandInFlight())
+        static_cast<void>(control->run(memory->pressure()));
+      if (memory)
+        checkMemory({.memory = *memory,
+                     .storage = storage,
+                     .model = executor,
+                     .weights = &weights,
+                     .governor = &*governor});
+      if (progressed)
+        continue;
+      const std::optional<double> wakeup = loop.millisecondsUntilNextWakeup();
+      double next = std::numeric_limits<double>::infinity();
+      for (const std::optional<double> &instant :
+           {executor.commandEnd(), wakeup ? std::optional<double>(monotonic + *wakeup) : std::nullopt,
+            memory ? memory->nextEvent() : std::nullopt})
+        if (instant)
+          next = std::min(next, *instant);
+      monotonic = next == std::numeric_limits<double>::infinity() ? monotonic + 1.0 : std::max(monotonic, next);
+      if (memory)
+        memory->advanceTo(monotonic);
+      executor.land(monotonic);
+    }
+    require(done(), what);
+  }
+
+  std::optional<LoopOptions> options;
+  std::optional<FakeMemory> memory;
+  std::optional<metal::MetalBackend> backend;
+  std::optional<engine::MemoryGovernor> governor;
   test::TestKvStorage storage;
   engine::KvPool pool;
   engine::Cache cache;
@@ -127,6 +214,26 @@ struct LoopFixture {
   engine::RuntimeMetrics metrics;
   Weights weights;
   engine::NativeRuntime loop;
+  std::optional<engine::MemoryControl> control;
+
+private:
+  static std::optional<FakeMemory> fakeMemory(const std::optional<LoopOptions> &options) {
+    if (!options || !options->memory)
+      return std::nullopt;
+    return std::optional<FakeMemory>(std::in_place, *options->memory);
+  }
+  static std::optional<metal::MetalBackend> standIn(const std::optional<FakeMemory> &memory) {
+    if (!memory)
+      return std::nullopt;
+    return std::optional<metal::MetalBackend>(std::in_place, "");
+  }
+  static std::optional<engine::MemoryGovernor> memoryGovernor(const std::optional<LoopOptions> &options,
+                                                              std::optional<FakeMemory> &memory,
+                                                              std::optional<metal::MetalBackend> &backend) {
+    if (!memory)
+      return std::nullopt;
+    return governorOver(*backend, *memory, options->limits);
+  }
 };
 
 inline bool answeredStatus(const LoopFixture &fixture, uint64_t correlationId) {

@@ -41,6 +41,8 @@ public:
   }
   void tokens(uint64_t id, std::span<const uint32_t> values) override {
     emitted += values.size();
+    if (clock)
+      tokenTimes[id].push_back(clock());
     auto &transcript = outputs[id];
     transcript.insert(transcript.end(), values.begin(), values.end());
   }
@@ -70,6 +72,9 @@ public:
     retryAfters.push_back(retryAfterSeconds);
   }
 
+  // With a clock, the time of each request's token events.
+  std::function<double()> clock;
+  std::unordered_map<uint64_t, std::vector<double>> tokenTimes;
   std::unordered_map<uint64_t, std::vector<uint32_t>> progress;
   // The matched prompt tokens of each start, zero for a cold one.
   std::vector<uint32_t> starts;
