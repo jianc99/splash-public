@@ -619,7 +619,12 @@ uint32_t Cache::indexLandingPages() const {
       for (const uint64_t block : holder.owedCopies)
         if (spillEligibility(block) == Eligibility::Eligible)
           owed.insert(block);
-  const uint64_t needed = uint64_t{landing} + owed.size();
+  // The empty Index extents beyond the runway a reclaim may release.
+  uint32_t empty = 0;
+  for (const KvPool::ExtentCounts &extent : pool_.extentCounts({}))
+    empty += extent.allocated && !extent.usedPages && extent.form == kv::PageForm::Index;
+  const uint64_t needed =
+      uint64_t{landing} + owed.size() + (empty > 1 ? uint64_t{empty - 1} * pool_.extentPages() : 0);
   const uint32_t free = pool_.freePageCount(kv::PageForm::Index);
   return free > needed ? static_cast<uint32_t>(free - needed) : 0;
 }
@@ -661,9 +666,12 @@ Cache::Walk Cache::walkFor(const VictimQuery &query) const {
   // which the reclaims of an Immediate claim pass over (amend/M.md A38).
   walk.skipStateWrites = walk.timing == ReclaimTiming::Immediate;
   // Memory for later, growth and a pass keep the empty extent the next
-  // request takes, unless the host is critical.
+  // request takes, and every claim keeps the Index runway, where landed
+  // copies spill at the memory wall (moveLandedPages) and a conversion lands
+  // (indexLandingPages), unless the host is critical.
   walk.keepRunway = !query.critical && (claim.cls == ClaimClass::Optional || claim.cls == ClaimClass::Growth ||
                                          claim.cls == ClaimClass::Host);
+  walk.keepIndexRunway = !query.critical;
   walk.hostRefused = need.hostRefused;
   walk.statesAreUnits = need.stateBuffers != 0;
   if (need.bytes && !need.hostRefused) {
@@ -1382,7 +1390,7 @@ void Cache::ReclaimPlan::fixPage(uint32_t page) {
 uint64_t Cache::ReclaimPlan::releaseEmpty() {
   for (const kv::PageForm each : {kv::PageForm::Full, kv::PageForm::Slim, kv::PageForm::Index}) {
     Form &form = forms_[static_cast<size_t>(each)];
-    if (form.empty.size() <= (walk.keepRunway ? 1u : 0u))
+    if (form.empty.size() <= (walk.keeps(each) ? 1u : 0u))
       continue;
     const uint32_t index = *form.empty.begin();
     unlist(index);
@@ -1467,7 +1475,7 @@ uint64_t Cache::ReclaimPlan::laterBytes(const std::array<uint32_t, 3> &before) c
   for (const kv::PageForm form : {kv::PageForm::Full, kv::PageForm::Slim, kv::PageForm::Index}) {
     const auto index = static_cast<size_t>(form);
     bytes += uint64_t{completedExtents(forms_[index].freePages + before[index], landing_[index] - before[index],
-                                       extentPages_, walk.keepRunway)} *
+                                       extentPages_, walk.keeps(form))} *
              extentPages_ * cache.pool_.bytesPerPage(form);
   }
   return bytes;
@@ -1889,7 +1897,7 @@ FreeResult Cache::take(const VictimQuery &query, const engine::Victim &victim) {
       for (const kv::PageForm each : {kv::PageForm::Full, kv::PageForm::Slim, kv::PageForm::Index}) {
         const auto index = static_cast<size_t>(each);
         later += extentsCompleted(each, landed[index] - std::min(landed[index], landing[index]), landing[index],
-                                  walk.keepRunway);
+                                  walk.keeps(each));
       }
       const uint32_t pagesNow = pool_.freePageCount(walk.form) + landed[form];
       pages = pagesNow - std::min(pagesNow, pagesBefore);
@@ -2030,7 +2038,7 @@ CacheReclaimResult Cache::takeReclaim(const Walk &walk) {
   // Free pages first, as the extent they fill, unless the need counts them;
   // one that empties the runway kept gives nothing yet, and the next one
   // does.
-  for (CacheReclaimResult released; !walk.keepFree && (released = releaseExtent(walk.keepRunway)).madeProgress;)
+  for (CacheReclaimResult released; !walk.keepFree && (released = releaseExtent(walk)).madeProgress;)
     if (released.reclaimedBytes)
       return released;
   // Then the victims in reclaimOne's order while their KV can empty an
@@ -2046,7 +2054,7 @@ CacheReclaimResult Cache::takeReclaim(const Walk &walk) {
     if (!evicted.madeProgress || evicted.evictedState)
       return outcome(evicted);
     evictedKv = true;
-    if (const CacheReclaimResult released = releaseExtent(walk.keepRunway); released.reclaimedBytes)
+    if (const CacheReclaimResult released = releaseExtent(walk); released.reclaimedBytes)
       return outcome(released);
   }
   return outcome(recycleState(walk));
@@ -2210,6 +2218,20 @@ void Cache::dropPoisoned() {
 
 bool Cache::extentWithinReach(ReclaimClass upTo) const {
   return writes(WriteClass::Reclaim) + pool_.extentPages() <= reusablePages(upTo);
+}
+
+CacheReclaimResult Cache::releaseExtent(const Walk &walk) {
+  const auto release = [&] {
+    for (const kv::PageForm form : {kv::PageForm::Full, kv::PageForm::Slim, kv::PageForm::Index})
+      if (const uint64_t bytes = pool_.reclaimEmptyExtents(walk.keeps(form), 1, form))
+        return bytes;
+    return uint64_t{0};
+  };
+  if (const uint64_t bytes = release())
+    return {true, bytes};
+  if (compactExtent())
+    return {true, release()};
+  return {};
 }
 
 CacheReclaimResult Cache::releaseExtent(bool keepRunway) {

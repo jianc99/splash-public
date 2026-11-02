@@ -529,7 +529,9 @@ public:
   [[nodiscard]] uint64_t bytesPerPage(kv::PageForm form) const noexcept { return pool_.bytesPerPage(form); }
   // The free Index pages, the runway's among them, beyond those the copies
   // in flight that spill as they land and the copies Spill requests owe
-  // land into: the pages a lane's conversion to Spill can land into now.
+  // land into and those of the empty extents past the runway, which a
+  // reclaim may release: the pages a lane's conversion to Spill can land
+  // into now.
   [[nodiscard]] uint32_t indexLandingPages() const;
   // What the KV tier's transfers read and wrote, and how long they took
   // (KvTier::throughput); zeros without a tier.
@@ -1032,6 +1034,7 @@ private:
     const RestoredChains *restored = nullptr;
     std::optional<Shortfall> refused;
     bool keepRunway = false;
+    bool keepIndexRunway = false;
     bool device = false;
     bool statesAreUnits = false;
     uint32_t pages = 0;
@@ -1042,6 +1045,10 @@ private:
     // only allocates again.
     bool keepFree = false;
     friend bool operator==(const Walk &, const Walk &) = default;
+    // Whether its releases leave the form one empty extent.
+    [[nodiscard]] bool keeps(kv::PageForm form) const noexcept {
+      return keepRunway || (form == kv::PageForm::Index && keepIndexRunway);
+    }
   };
   [[nodiscard]] Walk walkFor(const VictimQuery &query) const;
   // The walk's next unit, moving the cursor on: the checkpoints, the dead
@@ -1252,6 +1259,8 @@ private:
   // empties; progress with zero bytes when the extent emptied is the runway
   // kept. No progress when the free pages fill none.
   [[nodiscard]] CacheReclaimResult releaseExtent(bool keepRunway);
+  // releaseExtent, leaving each form the runway the walk keeps.
+  [[nodiscard]] CacheReclaimResult releaseExtent(const Walk &walk);
   // Empties one extent that still holds pages, of the form or of any
   // (KvPool::compactExtent); the blocks and requests on its pages follow
   // them. A page a transfer reads or writes stays where it is until the
