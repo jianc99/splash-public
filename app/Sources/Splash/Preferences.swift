@@ -322,7 +322,7 @@ extension LaunchOption {
             flag: "--thinking-end-text", title: "Thinking end text",
             help: "What closes thinking where its budget runs out, such as a sentence that turns to the answer.",
             section: .api,
-            kind: .text(Value(prompt: "</think>", message: "", parse: { $0.isEmpty ? nil : $0 }), list: false)),
+            kind: .text(Value(prompt: "Model’s Default", message: "", parse: { $0.isEmpty ? nil : $0 }), list: false)),
         LaunchOption(
             flag: "--served-model-name", title: "Other model names",
             help: "More names requests may give the model, such as gpt-4o for an app that asks for it.",

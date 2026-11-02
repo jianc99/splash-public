@@ -28,7 +28,12 @@ for ``add_generation_prompt``, under each reasoning effort, and under other
 template variables a request sets when it first sets them. A request's prompt
 must end with it, and it says whether generation starts in a think block. The
 next turn may render it differently, so the engine keeps a turn's reusable
-state before it. No chat format's markers are assumed.
+state before it. The generation prompt is found without assuming any chat
+format's markers.
+
+The probe also records what a template writes from a reply's reasoning
+through ``</think>``, which ends thinking where a budget runs out unless
+--thinking-end-text sets the end.
 
 Requests and the probe share the reasoning efforts, template options and
 alias retry defined here, so the probe renders exactly as requests do.
@@ -312,10 +317,8 @@ def _prepare(render, encode, source):
 
 def _thinking_end(render, source):
     """What the template writes from the end of a reply's reasoning through
-    its close: the close alone, or after line breaks, as Qwen's templates
-    write one. A reply whose thinking a budget ended renders back as it was
-    generated only where the budget ends it so. None where the template
-    renders no reasoning in a turn, or writes more than line breaks."""
+    its close, such as Qwen's line break then </think>. None where the
+    template renders no reasoning in a turn, or no </think> after it."""
     rendered = _outcome(
         render,
         source,
@@ -332,8 +335,7 @@ def _thinking_end(render, source):
     end = rendered.find(THINK_END, start) if start >= 0 else -1
     if end < 0:
         return None
-    between = rendered[start + len(reasoning) : end]
-    return between + THINK_END if between.strip(" \n") == "" else None
+    return rendered[start + len(reasoning) : end + len(THINK_END)]
 
 
 # Probe conversations. Leading system messages are already merged, as request

@@ -924,15 +924,17 @@ def run_thinking_budget_under_grammar(port: int, model: str, schema: dict) -> No
     grammar admits the end of thinking only between whole characters, so a
     budget whose last token is part of one thinks on until it is complete.
     Greedy requests that think in Chinese about characters the tokenizer
-    splits, at budgets of 1 to 48, must each succeed with reasoning that
-    breaks no character, those that finish with the schema's JSON. Where
-    their reasoning holds such a character, a budget ended inside it, and
-    that request must have thought past its budget; a model that thinks in
-    English may reach none within these budgets."""
+    splits, at budgets of 0 to 48, must each succeed with reasoning that
+    breaks no character, those that finish with the schema's JSON. A budget
+    of 0 thinks nothing: its reasoning is the end's text before </think>,
+    which every cut adds. Where their reasoning holds such a character, a
+    budget ended inside it, and that request must have thought past its
+    budget by more; a model that thinks in English may reach none within
+    these budgets."""
     words = "、".join(SPLIT_WORDS)
     prompt = f"请用中文思考：{words}这些字分别怎么读？然后按要求返回 JSON。"
-    budgets = range(1, 49)
-    past = 0
+    budgets = range(49)
+    excesses = []
     split = False
     for budget in budgets:
         code, chat = request(
@@ -966,7 +968,10 @@ def run_thinking_budget_under_grammar(port: int, model: str, schema: dict) -> No
             f"thinking budget {budget} under a grammar broke its output: {message!r}",
         )
         split |= any(character in reasoning for character in "".join(SPLIT_WORDS))
-        past += chat["usage"]["completion_tokens_details"]["reasoning_tokens"] > budget
+        excesses.append(
+            chat["usage"]["completion_tokens_details"]["reasoning_tokens"] - budget
+        )
+    past = sum(excess > excesses[0] for excess in excesses)
     require(
         past or not split,
         "the reasoning holds a split character, yet no thinking budget under a "

@@ -1840,8 +1840,9 @@ def main():
         chat_templates = ChatTemplates(tokenizer)
         print_status(f"Chat template · {chat_templates.describe()}")
         # Unset, a budget ends thinking as the template closes it, so that the
-        # reply renders back as it was generated and the next request resumes
-        # at the state where it ended.
+        # next request renders that close back as the tokens the reply ended
+        # its thinking with; Qwen's templates still trim a space or line break
+        # the cut leaves before it.
         if thinking_end is None:
             thinking_end = thinking_end_tokens(
                 tokenizer, chat_templates.select(None).thinking_end, family.chat_format

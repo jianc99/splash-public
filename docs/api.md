@@ -294,13 +294,14 @@ Chat's `max_completion_tokens` or `max_tokens`, Responses' `max_output_tokens`,
 and text completions' and Messages' `max_tokens` bound a response's output from
 above: a larger value than the context the prompt leaves generates up to the
 context limit, since clients such as Claude Code ask for the same limit on every
-turn. Omitted from Chat or Responses, the output may use all the context the
-prompt leaves: the context limit, and `--request-timeout` when set, are the only
-server bounds on a request that names no limit. A response the context limit
-ends finishes as one its limit ends; Messages gives it the `stop_reason`
-`model_context_window_exceeded`, not `max_tokens`, and so does one the engine
-ends before its limit at what the SSD cache or memory holds of a long request's
-KV ([KV on the SSD](server.md#kv-on-the-ssd)). An
+turn; a [thinking token budget](server.md#thinking-token-budget) then keeps its
+share of the context left. Omitted from Chat or Responses, the output may use
+all the context the prompt leaves: the context limit, and `--request-timeout`
+when set, are the only server bounds on a request that names no limit. A
+response the context limit ends finishes as one its limit ends; Messages gives
+it the `stop_reason` `model_context_window_exceeded`, not `max_tokens`, and so
+does one the engine ends before its limit at what the SSD cache or memory holds
+of a long request's KV ([KV on the SSD](server.md#kv-on-the-ssd)). An
 invalid value returns 400 naming the field the request sent. Messages refuses
 a final assistant message (prefill) with 400; `count_tokens` still counts it.
 
