@@ -1110,6 +1110,66 @@ void testRelaunchKeepsTheSpilledContext(const char *metallibPath) {
           "a relaunch for --max-context served less than its first engine's context for want of SSD room");
 }
 
+// A relaunch is planned as its first engine was. That of a server started
+// with --max-context asks for it again, beside the context the first engine
+// served (server/server.py `_native_command`), and on the budget that engine
+// had announces that context: the automatic SSD cache turns its staging off
+// for it, as it did for the first engine, where a relaunch planned as an
+// automatic start keeps the staging and holds less. On a budget that holds
+// less, as once this Mac's memory shrank, it serves what its plan holds.
+void testAnExplicitRelaunchServesItsFirstContext(const char *metallibPath) {
+  const test::TemporaryDirectory root("splash-explicit-relaunch");
+  RuntimeBootstrapConfig config;
+  config.resources = loadableConfig(metallibPath, root.path(), "explicit-relaunch-test");
+  config.resources.diskVolume = reading(localVolume(500 * kGiB));
+  // The context the plan of a start asked for `requestedContextTokens`
+  // holds, and the least memory it needs.
+  const auto plan = [&](uint32_t requestedContextTokens) {
+    std::pair<uint32_t, uint64_t> planned;
+    static_cast<void>(test::capturedStderr([&] {
+      const auto resources = RuntimeResources::create(config.resources, requestedContextTokens);
+      planned = {resources->memoryPlan().maximumContextTokens(),
+                 resources->memoryPlan().breakdown().minimumRequiredBytes};
+    }));
+    return planned;
+  };
+  // A budget whose KV the staging shortens: the plan's least, the staging
+  // and a little KV. Without the SSD cache it holds the context a first
+  // engine started with --max-context serves.
+  config.resources.maximumMemoryBytes =
+      plan(0).second + config.resources.model.stateLayout.cachedBytes() + 64 * kMiB;
+  const uint32_t first = plan(0).first;
+  config.resources.cacheDisk = {.automatic = true};
+  config.resources.relaunchContext = first;
+  require(plan(0).first < first && plan(first).first == first,
+          "the automatic SSD cache's staging cost a relaunch planned as an automatic start no context, or "
+          "one planned for --max-context did not hold it");
+  // What the relaunch announces (Ready's maxContextTokens, which the status
+  // reports), and its log.
+  config.nativeLoop.engine.maxContext = first;
+  const auto relaunch = [&] {
+    RuntimeMetrics metrics;
+    config.nativeLoop.metrics = &metrics;
+    std::unique_ptr<RuntimeBootstrap> bootstrap;
+    const std::string log = test::capturedStderr([&] {
+      bootstrap = RuntimeBootstrap::start(config, [](std::span<const uint8_t>) {}, [] { return std::string(); });
+    });
+    const std::string status = bootstrap->statusJson(metrics.snapshot(), {});
+    const std::string field = "\"maximum_context_tokens\":";
+    const size_t at = status.find(field);
+    require(at != std::string::npos, "the status names no context");
+    return std::pair{static_cast<uint32_t>(std::stoul(status.substr(at + field.size()))), log};
+  };
+  require(relaunch().first == first, "a relaunch on its first engine's budget served less than its --max-context");
+  config.resources.maximumMemoryBytes -= 32 * kMiB;
+  const uint32_t held = plan(first).first;
+  const auto [served, log] = relaunch();
+  require(held < first && served == held &&
+              log.find("The memory plan holds " + std::to_string(held) + " tokens of context, less than the " +
+                       std::to_string(first) + " the server's first engine served.") != std::string::npos,
+          "a relaunch whose plan holds less than its --max-context did not serve what the plan holds");
+}
+
 // --ple-memory auto takes at most the rows of every id a 128K-token prompt
 // stages beside the row cache's working memory: on the Flash-Next fixture,
 // 128K tokens of its PLE heads' ids.
@@ -1625,6 +1685,7 @@ int main(int argc, char **argv) {
       testAutomaticTierYieldsToTheContext(argv[1]);
       testAutomaticContextIgnoresTheVolume(argv[1]);
       testRelaunchKeepsTheSpilledContext(argv[1]);
+      testAnExplicitRelaunchServesItsFirstContext(argv[1]);
       testTableShareHoldsAPromptsIds(argv[1]);
       testTheTableIgnoresTheHostsSpareMemory(argv[1]);
       testEngineFollowsTheGovernor(argv[1]);

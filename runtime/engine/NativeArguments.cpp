@@ -27,6 +27,12 @@ uint64_t parseMaxMemory(std::string_view value) {
   return result;
 }
 
+// Whether `value` is a context of 1 to `most` tokens, which `result` then
+// holds.
+bool parseContext(std::string_view value, uint32_t most, uint32_t &result) {
+  return parsePositive(value, result) && result <= most;
+}
+
 // MAX_CONTEXT, zero for auto; the model bounds it (model::servedFor).
 uint32_t parseMaxContext(std::string_view value) {
   if (value == "auto")
@@ -185,20 +191,18 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
   result.modelRoot = requireModelRoot(argv[2]);
   model::ModelDescriptor inspected = model::inspectModelRoot(result.modelRoot);
   result.maxContext = parseMaxContext(argv[3]);
-  // A relaunch serves the model as its first engine did: for that engine's
-  // context, with YaRN past the native window.
-  if (relaunchContext) {
-    if (result.maxContext)
-      throw UsageError("--relaunch-context requires MAX_CONTEXT auto");
-    if (!parsePositive(*relaunchContext, result.relaunchContext))
-      throw UsageError("--relaunch-context requires a positive integer");
-  }
   try {
-    result.model = model::servedFor(std::move(inspected),
-                                    relaunchContext ? result.relaunchContext : result.maxContext);
+    result.model = model::servedFor(std::move(inspected), result.maxContext);
   } catch (const std::invalid_argument &error) {
-    throw UsageError(std::string(relaunchContext ? "--relaunch-context: " : "MAX_CONTEXT: ") +
-                     error.what());
+    throw UsageError(std::string("MAX_CONTEXT: ") + error.what());
+  }
+  // A relaunch's context is one its first engine served: MAX_CONTEXT at
+  // most, which a relaunch passes as that engine's, else one the model holds.
+  if (relaunchContext) {
+    const uint32_t most =
+        result.maxContext ? result.maxContext : result.model.capabilities.maximumContextTokens;
+    if (!parseContext(*relaunchContext, most, result.relaunchContext))
+      throw UsageError("--relaunch-context requires an integer in [1, " + std::to_string(most) + "]");
   }
   result.maxMemoryBytes = parseMaxMemory(argv[4]);
   return result;

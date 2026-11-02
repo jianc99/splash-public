@@ -907,12 +907,14 @@ forgets the calibration (below), after a start whose calibration failed and
 left none, or once macOS cleared the directory that keeps it. The server's
 relaunch of the engine after a failure keeps the first engine's context
 whatever it calibrates: the server passes that context
-(`serve-native --relaunch-context`), the relaunch decides the rest as the first
-engine did, the SSD cache's staging among it, and its split takes at most the
-channels whose plan holds the context, calibrated within them and remembered
-for them, or leaves the GPU alone with a line, not the warning a refused
-`--max-context` gets. A relaunch whose plan holds less, as once the Mac's
-memory budget shrank, serves that, and the server stops relaunching
+(`serve-native --relaunch-context`) beside the first engine's `MAX_CONTEXT`,
+and the relaunch is planned as the first engine was. One of the automatic
+context decides the rest as that engine did, the SSD cache's staging among it,
+and its split takes at most the channels whose plan holds the context,
+calibrated within them and remembered for them, or leaves the GPU alone with a
+line, not the warning a refused `--max-context` gets. A relaunch whose plan
+holds less, as once the Mac's memory budget shrank, serves that, with
+`--max-context` too, and the server serves it from then on
 ([engine restarts](server.md#engine-restarts-and-sleep)).
 Until a calibration is remembered, a start that fails assumes the largest split
 the model could take (all its channel units but one, or the most whose plan

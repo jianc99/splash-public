@@ -22,15 +22,14 @@ public:
 // pins the lines both sides agree on.
 struct NativeArguments final {
   std::filesystem::path modelRoot;
-  // The model the directory holds, served for MAX_CONTEXT or a relaunch's
-  // context (model::servedFor): with YaRN for a context past its native
-  // window.
+  // The model the directory holds, served for MAX_CONTEXT (model::servedFor):
+  // with YaRN for a context past its native window.
   model::ModelDescriptor model;
   // Zero for auto.
   uint32_t maxContext = 0;
-  // --relaunch-context TOKENS, with MAX_CONTEXT auto: the context the
-  // server's first engine served, which the server passes to every relaunch
-  // (RuntimeResourcesConfig::relaunchContext); zero for none.
+  // --relaunch-context TOKENS: the context the server's first engine served,
+  // which the server passes to every relaunch beside that engine's
+  // MAX_CONTEXT (RuntimeResourcesConfig::relaunchContext); zero for none.
   uint32_t relaunchContext = 0;
   uint64_t maxMemoryBytes = 0;
   // Automatic without MAX_CACHE_DISK_BYTES, as the server's default.

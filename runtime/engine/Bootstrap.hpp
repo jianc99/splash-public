@@ -118,10 +118,10 @@ protocolLimitsFor(const model::ModelCapabilities &capabilities,
 
 struct RuntimeBootstrapConfig {
     RuntimeResourcesConfig resources;
-    // A zero engine maxContext is a relaunch's context
-    // (RuntimeResourcesConfig::relaunchContext), or else what the memory
-    // plan holds, as serve's default; another one larger than the plan
-    // holds fails the bootstrap.
+    // A relaunch serves its context (RuntimeResourcesConfig::relaunchContext)
+    // as far as the memory plan holds it. Otherwise a zero engine maxContext
+    // is what the plan holds, as serve's default, and another one larger
+    // than the plan holds fails the bootstrap.
     NativeLoopConfig nativeLoop;
 };
 

@@ -444,7 +444,8 @@ class ServeOptionsTests(unittest.TestCase):
     def test_a_relaunch_asks_for_the_first_context_as_relaunch_context(self):
         """A relaunch after --max-context asks for the first engine's context
         as an automatic one does, past the native window too, and serves
-        what its plan holds of it (it required --max-context again)."""
+        what its plan holds of it (it required --max-context again). It keeps
+        --max-context, so that it is planned as the first engine was."""
         model = "community/custom-splash"
         required = [str(api.ROOT / "install/models" / model), "--model", model]
         args = api.parse_args([*required, "--max-context", "1000000"])
@@ -454,7 +455,7 @@ class ServeOptionsTests(unittest.TestCase):
                 args.binary,
                 "serve-native",
                 args.model_root,
-                "auto",
+                "1000000",
                 "auto",
                 "--relaunch-context",
                 "1000000",

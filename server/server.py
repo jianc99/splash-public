@@ -1690,17 +1690,16 @@ def parse_args(argv=None):
 
 def _native_command(args, model_root, relaunch_context=None):
     """The engine's command line serving model_root, a relaunch's with
-    `relaunch_context`, the context the first engine served, which the
-    relaunch asks for whether --max-context set it or not: it serves what its
-    plan holds of it, where its own automatic one would follow a Neural
-    Engine split calibrated anew."""
+    `relaunch_context`, the context the first engine served. A relaunch is
+    planned as the first engine was, for --max-context or the automatic
+    context, and serves what its plan holds of the first engine's context,
+    where its own automatic one would follow a Neural Engine split calibrated
+    anew."""
     command = [
         args.binary,
         "serve-native",
         str(model_root),
-        "auto"
-        if args.max_context is None or relaunch_context is not None
-        else str(args.max_context),
+        "auto" if args.max_context is None else str(args.max_context),
         "auto" if args.max_memory is None else str(args.max_memory),
     ]
     if args.max_cache_disk is not None:

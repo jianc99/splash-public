@@ -346,11 +346,12 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
          "memory plan cannot hold one model token");
   }
   const uint32_t relaunchContext = config.resources.relaunchContext;
-  if (!config.nativeLoop.engine.maxContext && relaunchContext) {
-    // A relaunch serves the context of the server's first engine, which its
-    // split left. A plan that holds less, as once this Mac's memory budget
-    // shrank, has the relaunch serve that, and the server adopts it from
-    // Ready (server/runtime.py).
+  if (relaunchContext) {
+    // A relaunch, planned as the server's first engine was, for
+    // --max-context or the automatic context, serves the context that
+    // engine served, which its split left. A plan that holds less, as once
+    // this Mac's memory budget shrank, has the relaunch serve that, and the
+    // server adopts it from Ready (server/runtime.py).
     if (relaunchContext > planContext)
       logLine("The memory plan holds ", planContext, " tokens of context, less than the ",
               relaunchContext, " the server's first engine served.");

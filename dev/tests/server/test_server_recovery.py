@@ -397,15 +397,12 @@ class ServerRecoveryTests(HarnessTestCase):
 
     def test_relaunch_asks_for_the_first_engines_context(self):
         # A relaunch is asked for the context the first engine served, with
-        # --max-context as without, and serves what its plan holds of it.
+        # --max-context as without, and serves what its plan holds of it. It
+        # keeps --max-context, so that it is planned as the first engine was.
         for max_context in (None, 131072):
             args = main_args(max_context=max_context)
             first = tuple(api._native_command(args, args.model_root))
-            relaunch = (
-                *(first if max_context is None else (*first[:3], "auto", first[4])),
-                "--relaunch-context",
-                str(READY.max_context_tokens),
-            )
+            relaunch = (*first, "--relaunch-context", str(READY.max_context_tokens))
             for relaunched in (
                 READY,
                 dataclasses.replace(READY, max_context_tokens=65_536),
