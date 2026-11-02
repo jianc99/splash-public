@@ -1326,9 +1326,10 @@ void testStreamedRuntimeBoundary(RuntimeResourcesConfig moe) {
 // rows, stream one lane's history, and run a pass per layer. Its pools are
 // its store's where the plan streams its experts, its hot block cache's and
 // its history's staging. A lane's decode reads and a prompt's staging lack
-// what a reservation of them then allocates, and nothing once they hold it.
-// (The fixture runs no command: no hyper-connection kernel takes its
-// 256-wide hidden state.)
+// what a reservation of them then allocates, and nothing once they hold it;
+// before the runtime begins the request, which the engine places first,
+// they lack the same. (The fixture runs no command: no hyper-connection
+// kernel takes its 256-wide hidden state.)
 void testSpilledRuntimeBoundary(const char *metallibPath) {
   const test::TemporaryDirectory root("splash-boundary-spill");
   RuntimeResourcesConfig config = flashNextConfig(metallibPath, root.path());
@@ -1358,21 +1359,25 @@ void testSpilledRuntimeBoundary(const char *metallibPath) {
   request.id = 911;
   request.prompt = prompt;
   request.maxNewTokens = 4;
-  runtime->beginColdRequest(request, 0);
   model::ElasticPool &hot = *runtime->pools()[streamsExperts], &staging = *runtime->pools()[streamsExperts + 1];
   const struct {
     model::SpilledReadNeed need;
     model::ElasticPool &pool;
   } needs[] = {{{.kind = WorkKind::Decode}, hot}, {{.kind = WorkKind::Prefill, .pages = 128}, staging}};
-  // Through the model's interface, as the engine reserves them.
+  // Through the model's interface, as the engine places and reserves them.
   model::Model &reads = *runtime;
-  for (const auto &[need, pool] : needs) {
+  std::array<uint64_t, 2> placed{};
+  for (size_t index = 0; index < placed.size(); ++index)
+    placed[index] = reads.spilledReadShortfall(request.id, needs[index].need);
+  runtime->beginColdRequest(request, 0);
+  for (size_t index = 0; index < placed.size(); ++index) {
+    const auto &[need, pool] = needs[index];
     const uint64_t shortfall = reads.spilledReadShortfall(request.id, need);
     const uint64_t before = pool.state().currentBytes;
-    require(shortfall && reads.reserveSpilledReads(request.id, need).granted() &&
+    require(shortfall && shortfall == placed[index] && reads.reserveSpilledReads(request.id, need).granted() &&
                 pool.state().currentBytes - before == shortfall && !reads.spilledReadShortfall(request.id, need),
             std::string(need.kind == WorkKind::Decode ? "a lane's decode reads" : "a prompt's staging") +
-                " did not allocate the shortfall it named");
+                " did not allocate the shortfall it named before and after the request began");
   }
   runtime->end(request.id);
 }

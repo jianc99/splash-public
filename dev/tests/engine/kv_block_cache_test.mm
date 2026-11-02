@@ -377,14 +377,16 @@ void growsAsAPool(MetalBackend &backend) {
     return test::admitAll(bytes, allocate);
   });
   require(cache.extentBytes() == extent, "the cache's extent is not the pool's");
-  // One lane's floor is an extent, two lanes' two and three lanes' too.
+  // One lane's floor is an extent, two lanes' two and three lanes' too: a
+  // lane without a floor lacks one more lane's.
   for (const uint32_t lane : {0u, 1u, 2u}) {
     const uint64_t shortfall = cache.laneShortfallBytes(lane);
     allocated = 0;
-    require(shortfall == (lane == 2 ? 0 : extent) && cache.reserveLane(lane).granted() && allocated == shortfall &&
-                !cache.laneShortfallBytes(lane),
+    require(shortfall == (lane == 2 ? 0 : extent) && shortfall == cache.laneShortfallBytes() &&
+                cache.reserveLane(lane).granted() && allocated == shortfall && !cache.laneShortfallBytes(lane),
             "lane " + std::to_string(lane) + "'s floor did not allocate its shortfall");
   }
+  require(cache.laneShortfallBytes() == extent, "a fourth lane's floor lacks no extent");
   model::HotBlocksPool pool(cache);
   model::PoolState state = pool.state();
   require(state.name == "hot_kv" && state.floorBytes == 2 * extent && state.currentBytes == 2 * extent &&

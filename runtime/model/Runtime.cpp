@@ -3420,11 +3420,18 @@ uint64_t Runtime::idleBufferBytes(uint32_t evictedStates) const noexcept {
   return impl_->states.idleBytes(evictedStates);
 }
 
+// Also for a request the runtime has not begun or holds no lane for, as the
+// engine places a fresh start before it begins it: the staging is the
+// prompts', whichever request holds it, and a decode's floor is one more
+// lane's unless the request's lane holds it.
 uint64_t Runtime::spilledReadShortfall(uint64_t requestId, SpilledReadNeed need) const {
-  const uint32_t lane = residentLane(requestId);
-  if (need.kind == WorkKind::Decode)
-    return impl_->blockCache ? impl_->blockCache->laneShortfallBytes(lane) : 0;
-  return impl_->historyStream ? impl_->historyStream->shortfallBytes(need.pages) : 0;
+  if (need.kind == WorkKind::Prefill)
+    return impl_->historyStream ? impl_->historyStream->shortfallBytes(need.pages) : 0;
+  if (!impl_->blockCache) return 0;
+  const auto found = impl_->requests.find(requestId);
+  return found != impl_->requests.end() && found->second.resident
+             ? impl_->blockCache->laneShortfallBytes(found->second.stateLane)
+             : impl_->blockCache->laneShortfallBytes();
 }
 
 // A prompt reads its spilled history through the staging, a decode through
