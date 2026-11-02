@@ -287,15 +287,18 @@ private:
                                    request.generatedTokens, static_cast<uint64_t>(request.kvMode)});
     return result;
   }
-  // I1 and I2 with memory, and no claim waits once no request is left; I3
-  // holds inside the storage (guardReleases); I4 the extents' activity
-  // follows the pool's held pages; I5 the cache's invariants between
-  // commands; I6 inside the model (commandViolation); I7 no spin (spins).
+  // I1 and I2 with memory (checkMemory); I3 holds inside the storage
+  // (guardReleases); I4 the extents' activity follows the pool's held
+  // pages; I5 the cache's invariants between commands; I6 inside the model
+  // (commandViolation); I7 no spin (spins).
   void check(bool progressed) {
     if (memory) {
-      checkMemory({.memory = *memory, .storage = storage, .model = model, .governor = &*governor});
-      if (governor->ledger().claimWaiting() && idle(engine))
-        throw std::logic_error("a claim waits for memory with no request left");
+      checkMemory({.memory = *memory,
+                   .storage = storage,
+                   .model = model,
+                   .governor = &*governor,
+                   .cache = &cache,
+                   .engine = &engine});
     }
     if (!storage.activityFollows(pool))
       throw std::logic_error("KV extents' activity does not follow the pages requests hold");

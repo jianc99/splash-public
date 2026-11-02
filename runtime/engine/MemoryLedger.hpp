@@ -284,6 +284,8 @@ public:
   void setHostExempt(ClaimId claim, bool exempt);
   void close(ClaimId claim) noexcept;
   [[nodiscard]] const ClaimState &claim(ClaimId claim) const;
+  // Every open claim by its id, for the checks of the ledger's relations.
+  [[nodiscard]] const std::map<uint32_t, ClaimState> &claims() const noexcept { return claims_; }
   // What admission holds against an allocation in `claim`'s scope: other
   // accounts' pending growth, waiting claims ranked above it, and for a
   // Growth claim the lanes' projected growth.

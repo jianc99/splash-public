@@ -2,14 +2,18 @@
 
 // The memory checks the harness runs after every tick when the test's engine
 // allocates through FakeMemory: I1, the allocators' counts, and I2, the
-// ledger's relations.
+// ledger's relations (design/M.md L1, L2, L4, and no waiting claim of a
+// request the engine finalized).
 
 #include "FakeMemory.hpp"
 #include "TestEngine.hpp"
 #include "TestExecutor.hpp"
 #include "TestKvPool.hpp"
+#include "engine/Cache.hpp"
+#include "engine/Engine.hpp"
 #include "engine/MemoryGovernor.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <numeric>
 #include <stdexcept>
@@ -25,6 +29,10 @@ struct MemoryHolders final {
   const Executor &model;
   const Weights *weights = nullptr;
   const engine::MemoryGovernor *governor = nullptr;
+  // With them, L4 over the cache's transfers, and the claims of the
+  // engine's requests.
+  const engine::Cache *cache = nullptr;
+  const engine::Engine *engine = nullptr;
 };
 
 // I1: nothing wrote the backend's statistics behind FakeMemory's back; per
@@ -68,6 +76,28 @@ inline void checkMemory(const MemoryHolders &holders) {
     throw std::logic_error("charged " + std::to_string(snapshot.chargedBytes) + " and reserved " +
                            std::to_string(snapshot.reservedBytes) + " bytes pass the limit of " +
                            std::to_string(snapshot.limitBytes));
+  // L4: transfers return nothing while none is in flight and no copy is
+  // owed.
+  if (holders.cache) {
+    const engine::Returning back = holders.cache->returning();
+    if (!back.transfers && std::ranges::none_of(back.owedPages, [](uint32_t pages) { return pages != 0; }) &&
+        snapshot.owed.bytes)
+      throw std::logic_error("transfers return " + std::to_string(snapshot.owed.bytes) +
+                             " bytes with none in flight and no copy owed");
+  }
+  // No claim of a request the engine finalized waits for memory, and none
+  // of the engine's own once it serves no request.
+  if (holders.engine) {
+    const std::vector<engine::ActiveRequestSnapshot> served = holders.engine->snapshot().activeRequests;
+    for (const auto &[_, claim] : holders.governor->ledger().claims()) {
+      const uint64_t id = claim.spec.requestId;
+      if (claim.waiting && (id ? std::ranges::none_of(served, [&](const auto &active) { return active.id == id; })
+                               : served.empty()))
+        throw std::logic_error(id ? "the claim of request " + std::to_string(id) +
+                                        ", which the engine finalized, waits for memory"
+                                  : std::string("a claim waits for memory with no request left"));
+    }
+  }
 }
 
 } // namespace splash::test
