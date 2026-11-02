@@ -218,6 +218,11 @@ void testEpisodesKeepTheBooksAndRegrow() {
             at + ": the experts account was not back at its size before the episode");
   }
   served.stepFor(60'000.0, {}, [&] { return served.ended.size() == served.submitted.size(); });
+  std::string unended;
+  for (const uint64_t id : served.submitted)
+    if (!served.ended.contains(id))
+      unended += " " + std::to_string(id);
+  require(unended.empty(), "requests that neither completed nor failed within 60 s of the episodes:" + unended);
   for (const auto &[id, code] : served.ended)
     require(code == "done" || code == "capacity_exhausted",
             "request " + std::to_string(id) + " ended with " + code);
