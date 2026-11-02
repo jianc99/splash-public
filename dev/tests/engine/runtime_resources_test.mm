@@ -10,9 +10,11 @@
 #include "engine/MemoryPlan.hpp"
 #include "model/ModelSizing.hpp"
 #include "model/Qwen4Exp.hpp"
+#include "model/Runtime.hpp"
 #include "model/RuntimeArenas.hpp"
 #include "model/SparseRowStore.hpp"
 #include "model/SsdReaders.hpp"
+#include "model/WorkFormulas.hpp"
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -28,12 +30,15 @@
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <numeric>
 #include <optional>
+#include <set>
 #include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace {
 
@@ -1148,6 +1153,230 @@ void testTheHeldBackTableStaysInThePlan(const char *metallibPath) {
           "host's context");
 }
 
+// The runtime of a start, built under the governor's admission of its
+// arenas, as Bootstrap builds it.
+std::unique_ptr<model::Runtime> runtimeOf(RuntimeResources &resources) {
+  const EngineMemoryBreakdown &budget = resources.memoryPlan().breakdown();
+  std::unique_ptr<model::Runtime> runtime;
+  require(static_cast<bool>(resources.memoryGovernor().allocationAdmission()(
+              budget.sharedPrefillBytes + budget.sharedDecodeBytes,
+              [&] { runtime = std::make_unique<model::Runtime>(resources.modelContext()); })),
+          "a runtime's arenas were refused");
+  return runtime;
+}
+
+// The bound of one attention layer's pairs a command may compute: a full
+// chunk's at the end of the native window of 262,144 tokens of every family
+// (Bootstrap.mm's former EngineConfig::maximumPrefillAttentionPairs).
+constexpr uint64_t kLayerPairs = 534'774'784;
+constexpr uint32_t kChunk = model::ExecutionLimits::prefillTokenBudget;
+
+// The names of a runtime's pools, in order.
+std::vector<std::string> poolNames(model::Runtime &runtime) {
+  std::vector<std::string> names;
+  for (const model::ElasticPool *pool : runtime.pools()) names.emplace_back(pool->state().name);
+  return names;
+}
+
+// A prompt of `tokens` tokens prefilled on the runway's pages (KvPool::RunwayHold) as one command in `passes`
+// passes of the target's layers, each its own command; its last pass's results.
+std::vector<ModelStepResult> prefillInPasses(model::Runtime &runtime, uint64_t id, uint32_t tokens, uint32_t passes) {
+  std::vector<uint32_t> prompt(tokens);
+  for (uint32_t index = 0; index < tokens; ++index) prompt[index] = 1 + index * 37 % 997;
+  ModelRequest request;
+  request.id = id;
+  request.prompt = prompt;
+  request.maxNewTokens = 4;
+  runtime.beginColdRequest(request, 0);
+  std::vector<uint32_t> pages((tokens + kv::kPageTokens - 1) / kv::kPageTokens);
+  std::iota(pages.begin(), pages.end(), 0u);
+  ModelBatchItem item{.requestId = id, .logicalPosition = 0, .tokenCount = tokens, .pageTable = pages,
+                      .pageTableRevision = 1};
+  item.inputTokens = prompt;
+  std::vector<ModelStepResult> results;
+  try {
+    for (uint32_t pass = 0; pass < passes; ++pass) {
+      const BatchPlan plan{.kind = WorkKind::Prefill,
+                           .items = {{id, tokens}},
+                           .decodeStage = DecodeStage::Regular,
+                           .pass = pass,
+                           .passes = passes};
+      results = runtime.submit(plan, std::span(&item, 1), {})->wait();
+      require(results.size() == 1 && results[0].failure.empty() &&
+                  (pass + 1 == passes || !results[0].consumedPromptTokens),
+              "a pass before a command's last committed its rows, or a pass failed");
+    }
+  } catch (...) {
+    runtime.end(id);
+    throw;
+  }
+  runtime.end(id);
+  return results;
+}
+
+// A resident dense start's runtime: a command in two passes, which the
+// runtime refused while only streamed targets ran passes, leaves what it
+// leaves whole, and one in more passes than its layers is refused before
+// anything of it runs; its command limits are one chunk's rows in up to a
+// pass per layer, one lane past a chunk, no streamed history and the
+// per-layer pair bound. What a command computes counts its attention
+// layer's pairs over the layers its pass runs, the heaviest layer's whatever
+// the pass, and a warm-up's sample is that work with what its ticket timed.
+// Loading read its weights from the SSD, and its pools are the vision arena
+// and the embedding cache of a model that serves vision.
+void testDenseRuntimeBoundary(const char *metallibPath) {
+  const test::TemporaryDirectory root("splash-boundary-dense");
+  const RuntimeResourcesConfig config = loadableConfig(metallibPath, root.path(), "boundary-test");
+  const std::unique_ptr<RuntimeResources> resources = RuntimeResources::create(config, 0);
+  const std::unique_ptr<model::Runtime> runtime = runtimeOf(*resources);
+  const uint32_t layers = test::plannedModel().target.layers;
+  const KvPool::RunwayHold runway(resources->kvPool());
+  const std::vector<ModelStepResult> once = prefillInPasses(*runtime, 902, 64, 1);
+  const std::vector<ModelStepResult> twice = prefillInPasses(*runtime, 903, 64, 2);
+  require(once[0].consumedPromptTokens == 64 && twice[0].consumedPromptTokens == 64 && once[0].firstToken &&
+              once[0].firstToken == twice[0].firstToken,
+          "a resident command in two passes did not leave what it leaves whole");
+  rejects([&] { static_cast<void>(prefillInPasses(*runtime, 901, 64, layers + 1)); }, "passes are not ones",
+          "a command in more passes than the target's layers ran");
+  require(runtime->commandLimits() == model::CommandLimits{.commandRows = kChunk,
+                                                           .maximumPasses = layers,
+                                                           .lanesPastChunk = 1,
+                                                           .indexPageLanes = 0,
+                                                           .attentionPairs = kLayerPairs},
+          "a resident dense runtime's command limits are not a chunk in a pass a layer, with the per-layer bound");
+  const std::array<model::PrefillLane, 1> chunk{{{.position = 0, .rows = kChunk}}};
+  const model::CommandWork whole = runtime->prefillWork(chunk, 0, 1);
+  const uint64_t pairs = model::denseAttentionPairs(0, kChunk);
+  require(whole == model::CommandWork{.lanes = 1, .rows = kChunk, .chunks = 1, .layers = layers,
+                                      .attentionPairs = pairs, .layerAttentionPairs = pairs},
+          "a chunk's work is not its attention layer's pairs over the target's layers");
+  // The planned model's one attention layer is its last.
+  require(runtime->prefillWork(chunk, 0, 2) == model::CommandWork{.lanes = 1, .rows = kChunk, .chunks = 1,
+                                                                    .layers = layers / 2,
+                                                                    .layerAttentionPairs = pairs} &&
+              runtime->prefillWork(chunk, 1, 2).attentionPairs == pairs,
+          "a pass's work does not count its own layers' pairs and the heaviest layer's of the target");
+  const model::SsdReads loaded = runtime->loadReads();
+  require(loaded.bytes && loaded.milliseconds > 0, "loading read no weights from the SSD");
+  require(poolNames(*runtime) == std::vector<std::string>{"vision_arena", "embeddings"},
+          "a model that serves vision does not have its vision arena and embeddings as pools");
+  const model::WarmupStepResult warmup = runtime->warmupPrefill(kChunk);
+  require(warmup.sample.work == whole && warmup.sample.wallMilliseconds > 0 && warmup.sample.representative,
+          "a warm-up's sample is not its command's work and time");
+}
+
+// A streamed MoE start's runtime: a prefill group's rows in a pass per
+// layer and no streamed history. Its pool is the expert store's, whose bytes
+// are Metal's: a unit given back and taken again moves the backend's
+// allocations by its bytes, rounded to whole pages. What a pass would read
+// is its own blocks' share of the command's, and a warm-up's sample counts
+// the weights it read on demand as the store counted them.
+void testStreamedRuntimeBoundary(RuntimeResourcesConfig moe) {
+  moe.maximumMemoryBytes = startStreamed(moe).minimumRequired - 1;
+  moe.expertMemory = {StreamedSetting::Mode::Size,
+                      model::streamableWeights(moe.modelRoot, moe.model, {.streamExperts = true}).expertMinimumBytes};
+  const std::unique_ptr<RuntimeResources> resources = RuntimeResources::create(moe, 0);
+  const std::unique_ptr<model::Runtime> runtime = runtimeOf(*resources);
+  require(resources->streamedExpertStats().has_value(), "the MoE start did not stream its experts");
+  require(runtime->commandLimits() == model::CommandLimits{.commandRows = 4 * kChunk,
+                                                           .maximumPasses = kMoeLayers,
+                                                           .lanesPastChunk = 1,
+                                                           .indexPageLanes = 0,
+                                                           .attentionPairs = kLayerPairs},
+          "a streamed MoE runtime's command limits are not a group's rows in a pass a layer");
+  require(poolNames(*runtime) == std::vector<std::string>{"experts", "vision_arena", "embeddings"},
+          "a streamed MoE runtime's pools are not its store's and its vision's");
+  const std::array<model::PrefillLane, 1> group{{{.position = 0, .rows = 4 * kChunk}}};
+  const uint64_t wholeReads = runtime->prefillWork(group, 0, 1).weightReadBytes;
+  const uint64_t passReads = runtime->prefillWork(group, 0, 2).weightReadBytes +
+                             runtime->prefillWork(group, 1, 2).weightReadBytes;
+  require(wholeReads && passReads + 2 >= wholeReads && passReads <= wholeReads + 2,
+          "two passes would not read their blocks' shares of the command's experts");
+  const auto storeReads = [&] {
+    const model::ExpertStoreStats stats = *resources->streamedExpertStats();
+    return stats.uses[0].readBytes + stats.uses[1].readBytes;
+  };
+  {
+    const KvPool::RunwayHold runway(resources->kvPool());
+    const uint64_t before = storeReads();
+    const model::WarmupStepResult warmup = runtime->warmupPrefill(kChunk);
+    require(warmup.sample.work.weightReadBytes == storeReads() - before && warmup.sample.work.weightReadBytes &&
+                warmup.sample.work.layers == kMoeLayers && warmup.sample.work.rows == kChunk,
+            "a warm-up's sample did not count the experts it read as the store did");
+  }
+  model::ElasticPool &experts = *runtime->pools()[0];
+  metal::MetalBackend &backend = resources->backend();
+  const model::PoolState state = experts.state();
+  const auto allocated = [&] { return backend.refreshMemoryStats().allocatedBytes; };
+  uint64_t before = allocated();
+  const uint64_t released = experts.release(1);
+  const uint64_t freed = before - allocated();
+  require(released && released == state.releaseUnitBytes && freed >= released && freed - released < 16384 &&
+              experts.state().currentBytes == state.currentBytes - released,
+          "a unit the store gave back did not leave the backend's allocations");
+  before = allocated();
+  const model::PoolState shrunk = experts.state();
+  require(static_cast<bool>(experts.grow(resources->memoryGovernor().allocationAdmission())) &&
+              allocated() - before >= shrunk.growUnitBytes && allocated() - before - shrunk.growUnitBytes < 16384 &&
+              experts.state().currentBytes == shrunk.currentBytes + shrunk.growUnitBytes,
+          "a unit the store took back did not take the backend's allocations");
+}
+
+// A Flash-Next start whose K/V spills: its commands hold a prefill group's
+// rows, stream one lane's history, and run a pass per layer. Its pools are
+// its store's where the plan streams its experts, its hot block cache's and
+// its history's staging. A lane's decode reads and a prompt's staging lack
+// what a reservation of them then allocates, and nothing once they hold it.
+// (The fixture runs no command: no hyper-connection kernel takes its
+// 256-wide hidden state.)
+void testSpilledRuntimeBoundary(const char *metallibPath) {
+  const test::TemporaryDirectory root("splash-boundary-spill");
+  RuntimeResourcesConfig config = flashNextConfig(metallibPath, root.path());
+  config.cacheDisk = {.automatic = true};
+  config.diskVolume = reading(localVolume(500 * kGiB));
+  // A budget whose memory holds less of the window than spilling does
+  // (testRelaunchKeepsTheSpilledContext).
+  config.maximumMemoryBytes = startStreamed(config).minimumRequired + 512 * kMiB;
+  const std::unique_ptr<RuntimeResources> resources = RuntimeResources::create(config, 0);
+  const model::RuntimeContext context = resources->modelContext();
+  require(context.blockCache && context.historyStream, "the Flash-Next start did not spill its K/V");
+  const bool streamsExperts = resources->streamedExpertStats().has_value();
+  const std::unique_ptr<model::Runtime> runtime = runtimeOf(*resources);
+  const uint32_t layers = std::get<model::Qwen4ExpLayout>(config.model.target).layers;
+  require(runtime->commandLimits() == model::CommandLimits{.commandRows = 4 * kChunk,
+                                                           .maximumPasses = layers,
+                                                           .lanesPastChunk = 1,
+                                                           .indexPageLanes = 1,
+                                                           .attentionPairs = kLayerPairs},
+          "a spilling Flash-Next runtime's command limits do not stream one lane's history");
+  std::vector<std::string> pools{"hot_kv", "kv_staging"};
+  if (streamsExperts) pools.insert(pools.begin(), "experts");
+  require(poolNames(*runtime) == pools,
+          "a spilling Flash-Next runtime's pools are not its store's, hot block cache's and staging's");
+  ModelRequest request;
+  const std::vector<uint32_t> prompt(2 * kChunk, 7);
+  request.id = 911;
+  request.prompt = prompt;
+  request.maxNewTokens = 4;
+  runtime->beginColdRequest(request, 0);
+  model::ElasticPool &hot = *runtime->pools()[streamsExperts], &staging = *runtime->pools()[streamsExperts + 1];
+  const struct {
+    model::SpilledReadNeed need;
+    model::ElasticPool &pool;
+  } needs[] = {{{.kind = WorkKind::Decode}, hot}, {{.kind = WorkKind::Prefill, .pages = 128}, staging}};
+  // Through the model's interface, as the engine reserves them.
+  model::Model &reads = *runtime;
+  for (const auto &[need, pool] : needs) {
+    const uint64_t shortfall = reads.spilledReadShortfall(request.id, need);
+    const uint64_t before = pool.state().currentBytes;
+    require(shortfall && reads.reserveSpilledReads(request.id, need).granted() &&
+                pool.state().currentBytes - before == shortfall && !reads.spilledReadShortfall(request.id, need),
+            std::string(need.kind == WorkKind::Decode ? "a lane's decode reads" : "a prompt's staging") +
+                " did not allocate the shortfall it named");
+  }
+  runtime->end(request.id);
+}
+
 // The engine asks the governor whether the host pauses growth, and its
 // serving mark lets a request in service grow through that pause.
 void testEngineFollowsTheGovernor(const char *metallibPath) {
@@ -1204,12 +1433,15 @@ int main(int argc, char **argv) {
       testTableShareHoldsAPromptsIds(argv[1]);
       testTheHeldBackTableStaysInThePlan(argv[1]);
       testEngineFollowsTheGovernor(argv[1]);
+      testDenseRuntimeBoundary(argv[1]);
+      testSpilledRuntimeBoundary(argv[1]);
       {
         const test::TemporaryDirectory root("splash-moe");
         const RuntimeResourcesConfig moe = moeConfig(argv[1], root.path());
         testStreamableWeightsAreWhatLoads(moe);
         testAutomaticExpertMemory(moe);
         testVerifyRows(argv[1], moe);
+        testStreamedRuntimeBoundary(moe);
       }
       std::cout << "runtime resources tests passed\n";
       return EXIT_SUCCESS;

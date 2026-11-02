@@ -6,6 +6,7 @@
 #include "model/ModelFactory.hpp"
 #include "model/QwenState.hpp"
 #include "model/QwenTarget.hpp"
+#include "model/WorkFormulas.hpp"
 
 #include "Checked.hpp"
 #include "metal/MetalBackend.hpp"
@@ -105,6 +106,83 @@ struct RuntimeGeometry final {
     return maskWordsPerToken(target.vocabularySize);
   }
 };
+
+// What one prefill command of a runtime of `geometry` may hold: its chunks'
+// rows; a pass per target layer, or with the Neural Engine's FFN split
+// (`aneFfn`) one, as the split takes a chunk's layers whole
+// (QwenTarget::requirePrefill); one lane whose rows run past a chunk, as a
+// prefill group passes each lane's state between its parts through its one
+// scratch cell (PrefillArena::groupCell); the history of one lane streamed
+// (KvHistoryStream) where K/V spills, none where it stays in memory; and in
+// one attention layer the pairs of a full chunk at the end of the native
+// window.
+[[nodiscard]] inline CommandLimits commandLimits(const RuntimeGeometry &geometry, bool aneFfn) noexcept {
+  return {.commandRows = geometry.prefillChunks * kPrefillRows,
+          .maximumPasses = aneFfn ? 1u : geometry.target.layers,
+          .lanesPastChunk = 1,
+          .indexPageLanes = geometry.spilledKv ? 1u : 0u,
+          .attentionPairs = denseAttentionPairs(geometry.target.nativeContextTokens - kPrefillRows, kPrefillRows)};
+}
+
+// The attention layers of `target` before its layer `layer`.
+[[nodiscard]] inline uint32_t attentionLayersBefore(const QwenTargetGeometry &target, uint32_t layer) noexcept {
+  uint32_t attention = 0;
+  for (uint32_t before = 0; before < layer; ++before)
+    attention += target.isFullAttentionLayer(before);
+  return attention;
+}
+
+// How far the rows of attention layer `attention` of `target` reach back: a
+// sliding layer's window, the row's own key included (the window's other
+// keys are kv::Layout::windowTokens); a block-sparse target's indexer
+// selection; else every key.
+[[nodiscard]] inline AttentionReach attentionReach(const QwenTargetGeometry &target, uint32_t attention) noexcept {
+  if (const uint32_t window = target.attentionVariant(attention).windowTokens)
+    return {.windowTokens = window + 1};
+  if (target.hasIndexer())
+    return {.denseHistoryTokens = target.indexerTokens(),
+            .selectedTokens = target.indexerTokens(),
+            .blockTokens = target.indexerBlockTokens};
+  return {};
+}
+
+// What pass `pass` of `passes` of a prefill command of `lanes` computes on
+// `target`, the lanes filling its chunks in order (Model::prefillWork): each
+// attention layer's pairs over the lanes' rows at its reach, the most of
+// them over every attention layer whatever the pass (a pass does not split
+// a layer), and over the pass's layers their sum and the scores of a block
+// index, which scores each lane's part of a chunk apart (Qwen4ExpTarget's
+// prefill). What the pass reads is the runtime's to add.
+[[nodiscard]] inline CommandWork prefillCommandWork(const QwenTargetGeometry &target,
+                                                    std::span<const PrefillLane> lanes, uint32_t pass,
+                                                    uint32_t passes) noexcept {
+  const LayerRange run = passLayers(pass, passes, target.layers);
+  CommandWork work{.lanes = static_cast<uint32_t>(lanes.size()), .layers = run.end - run.first};
+  uint64_t scores = 0;
+  for (const PrefillLane &lane : lanes) {
+    for (uint32_t done = 0; target.hasIndexer() && done < lane.rows;) {
+      const uint32_t part = std::min(lane.rows - done, kPrefillRows - (work.rows + done) % kPrefillRows);
+      scores += indexPairs(uint64_t{lane.position} + done, part, target.indexerBlockTokens, target.indexerTopBlocks);
+      done += part;
+    }
+    work.rows += lane.rows;
+  }
+  work.chunks = (work.rows + kPrefillRows - 1) / kPrefillRows;
+  for (uint32_t layer = 0, attention = 0; layer < target.layers; ++layer) {
+    if (!target.isFullAttentionLayer(layer))
+      continue;
+    const AttentionReach reach = attentionReach(target, attention++);
+    uint64_t pairs = 0;
+    for (const PrefillLane &lane : lanes)
+      pairs += attentionPairs(reach, lane.position, lane.rows);
+    work.layerAttentionPairs = std::max(work.layerAttentionPairs, pairs);
+    if (layer >= run.first && layer < run.end) {
+      work.attentionPairs += pairs;
+      work.indexPairs += scores;
+    }
+  }
+  return work;
+}
 
 template <class T> constexpr uint64_t bytesFor(uint64_t elements) noexcept {
   return elements * sizeof(T);

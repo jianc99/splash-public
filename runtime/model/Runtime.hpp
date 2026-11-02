@@ -19,6 +19,11 @@ public:
   [[nodiscard]] uint64_t idleBufferBytes(uint32_t evictedStates) const noexcept override;
   [[nodiscard]] uint32_t prefillGroupRows(bool spills) const noexcept override;
   [[nodiscard]] uint32_t prefillPasses() const noexcept override;
+  [[nodiscard]] CommandLimits commandLimits() const noexcept override;
+  [[nodiscard]] CommandWork prefillWork(std::span<const PrefillLane> lanes, uint32_t pass,
+                                        uint32_t passes) const override;
+  [[nodiscard]] std::span<ElasticPool *const> pools() noexcept override;
+  [[nodiscard]] SsdReads loadReads() const noexcept override;
 
   Runtime(const Runtime &) = delete;
   Runtime &operator=(const Runtime &) = delete;
@@ -51,6 +56,8 @@ public:
   [[nodiscard]] bool canSnapshotToDisk(bool inUse) const noexcept override;
   [[nodiscard]] std::unique_ptr<StateOffload>
   snapshotToDisk(uint64_t requestId, std::function<void()> completion) override;
+  [[nodiscard]] uint64_t spilledReadShortfall(uint64_t requestId, SpilledReadNeed need) const override;
+  [[nodiscard]] ModelMemoryAdmission reserveSpilledReads(uint64_t requestId, SpilledReadNeed need) override;
   [[nodiscard]] ModelMemoryAdmission reserveSpilledReads(uint64_t requestId) override;
   [[nodiscard]] ModelMemoryAdmission reserveHistoryStaging(uint64_t requestId, uint32_t pages) override;
   [[nodiscard]] ModelMemoryAdmission growSpilledReads() override;

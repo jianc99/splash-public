@@ -7,11 +7,14 @@
 #include "model/ExpertStore.hpp"
 #include "model/KvBlockCache.hpp"
 #include "model/KvHistoryStream.hpp"
+#include "model/ModelPools.hpp"
 #include "model/QwenState.hpp"
 #include "model/QwenTarget.hpp"
 #include "model/RuntimeArenas.hpp"
 #include "model/SpilledKvReads.hpp"
 #include "model/VerifyBudget.hpp"
+#include "model/WeightSource.hpp"
+#include "model/WorkFormulas.hpp"
 
 #include "metal/CommandGraph.hpp"
 #include "ops/AneFfn.hpp"
@@ -30,6 +33,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <iterator>
 #include <limits>
 #include <list>
 #include <numeric>
@@ -52,26 +56,51 @@ using metal::CommandTiming;
 using metal::MetalBackend;
 using metal::MetalBuffer;
 
+// What a command's sample reports of its work (ModelBatchTicket::sample):
+// the work it encodes, with the weights it read on demand as the store's
+// reads moved from before its submission to its completion
+// (ExpertStore::readBytes), as commands never overlap, and the spilled
+// history its reads streamed.
+class WorkCount final {
+public:
+  WorkCount(CommandWork work, const ExpertStore *store)
+      : work_(work), store_(store), weightReadBytes_(store ? store->readBytes() : 0) {}
+
+  // Once the command completed.
+  [[nodiscard]] CommandWork realized(uint64_t spilledKvReadBytes) const {
+    CommandWork work = work_;
+    work.weightReadBytes = store_ ? store_->readBytes() - weightReadBytes_ : 0;
+    work.spilledKvReadBytes = spilledKvReadBytes;
+    return work;
+  }
+
+private:
+  CommandWork work_;
+  const ExpertStore *store_ = nullptr;
+  uint64_t weightReadBytes_ = 0;
+};
+
 class DeferredMetalTicket final : public ModelBatchTicket {
 public:
   // Runs once the command has completed, and may add work of its own to its
   // timing, as a rerun of the command does.
   using Completion = std::function<std::vector<ModelStepResult>(CommandTiming &)>;
-  // Submits the command.
-  using Submission = std::function<CommandTicket()>;
+  // Submits the command once the image encodes ahead of it took `encodes`.
+  using Submission = std::function<CommandTicket(const CommandTiming &encodes)>;
 
   // `reads` are the command's reads of spilled K/V, which its completion
-  // ends.
-  DeferredMetalTicket(CommandTicket ticket, Completion completion,
+  // ends; `count` counts its work from before its submission.
+  DeferredMetalTicket(CommandTicket ticket, Completion completion, WorkCount count,
                       std::shared_ptr<const SpilledKvReads> reads = {})
-      : completion_(std::move(completion)), reads_(std::move(reads)), ticket_(std::move(ticket)) {}
+      : count_(std::move(count)), completion_(std::move(completion)), reads_(std::move(reads)),
+        ticket_(std::move(ticket)) {}
 
   // A command submitted once `encodes`, the command of the image encodes
   // ahead of it, has completed (Runtime::prefillAsync).
-  DeferredMetalTicket(CommandTicket encodes, Submission submit, Completion completion,
+  DeferredMetalTicket(CommandTicket encodes, Submission submit, Completion completion, WorkCount count,
                       std::shared_ptr<const SpilledKvReads> reads)
-      : completion_(std::move(completion)), reads_(std::move(reads)), submit_(std::move(submit)),
-        ticket_(std::move(encodes)) {}
+      : count_(std::move(count)), completion_(std::move(completion)), reads_(std::move(reads)),
+        submit_(std::move(submit)), ticket_(std::move(encodes)) {}
 
   void advance() override {
     if (submit_ && ticket_.ready())
@@ -99,8 +128,13 @@ public:
     std::vector<ModelStepResult> results = completion(timing);
     wallMilliseconds_ = timing.wallSeconds * 1000.0;
     hostMilliseconds_ = timing.hostSeconds * 1000.0;
-    if (reads_)
-      streamMilliseconds_ = std::exchange(reads_, {})->streamMilliseconds();
+    uint64_t spilledKvReadBytes = 0;
+    if (reads_) {
+      const std::shared_ptr<const SpilledKvReads> reads = std::exchange(reads_, {});
+      streamMilliseconds_ = reads->streamMilliseconds();
+      spilledKvReadBytes = reads->readBytes();
+    }
+    work_ = count_.realized(spilledKvReadBytes);
     // Work the completion added takes wall time, but is no sample of the
     // command's rows.
     if (timing.wallSeconds != commandSeconds)
@@ -117,16 +151,24 @@ public:
   bool prefillTimingIsRepresentative() const noexcept override {
     return representativePrefillTiming_;
   }
+  CommandSample sample() const noexcept override {
+    return {.work = work_,
+            .wallMilliseconds = wallMilliseconds_,
+            .imageEncodeMilliseconds = imageEncodeMilliseconds_,
+            .representative = representativePrefillTiming_};
+  }
 
 private:
   // Waits for the encodes, which lets the backend take the next command, and
   // submits the command.
   void submitAfterEncodes() {
     encodes_ = ticket_.wait();
-    ticket_ = submit_();
+    ticket_ = submit_(encodes_);
     submit_ = {};
   }
 
+  WorkCount count_;
+  CommandWork work_;
   // Before the ticket, which goes first: a ticket dropped unconsumed waits for
   // its command before the completion lets go of what the command writes,
   // such as the state reservations of its items and the staging its reads
@@ -165,8 +207,7 @@ T *contents(const MetalBuffer &buffer, std::string_view label) {
 
 void validatePlan(const BatchPlan &plan, std::span<const ModelBatchItem> items,
                   WorkKind expected) {
-  if (plan.kind != expected || plan.empty() || plan.width() > kLaneCount ||
-      items.size() != plan.items.size()) {
+  if (plan.kind != expected || plan.empty() || items.size() != plan.items.size()) {
     throw std::invalid_argument("model runtime received an invalid batch plan");
   }
   for (size_t index = 0; index < items.size(); ++index) {
@@ -304,6 +345,10 @@ struct Runtime::Impl {
     // Rebuild state from already-emitted tokens without sampling an initial
     // anchor, consuming RNG, or replaying output to the caller.
     bool replayingGeneration = false;
+    // The blocks the reads of spilled history of its prefill command's
+    // passes before the last could not read, which fail the command at its
+    // last pass (BatchPlan::passes).
+    std::vector<uint64_t> unreadableBlocks;
     uint32_t promptTokens = 0;
     uint32_t maxNewTokens = 0;
     uint32_t generatedTokens = 0;
@@ -450,6 +495,135 @@ struct Runtime::Impl {
   // The request the history's staging was last reserved for
   // (reserveHistoryStaging), whose next prefill command streams into it.
   uint64_t stagingRequest = 0;
+  // What one prefill command may hold (Runtime::commandLimits).
+  const CommandLimits limits;
+  // What loading the weights read from the SSD (Runtime::loadReads): the
+  // process's weight reads as the runtime is built, once the model loaded
+  // and before any command.
+  const SsdReads loadReads;
+  // The wall time of the commands that encoded images (counters.imageEncodes
+  // of them).
+  double imageEncodeMilliseconds = 0.0;
+
+  // The history's staging (KvHistoryStream) as an elastic pool: a streaming
+  // prompt's reservation allocates it, and it goes whole once no prompt
+  // holds it (stagingHeld), as an idle reclaim gives it back.
+  class StagingPool final : public ElasticPool {
+  public:
+    explicit StagingPool(Impl &runtime) noexcept : runtime_(runtime) {}
+    [[nodiscard]] PoolState state() const override {
+      const uint64_t bytes = runtime_.historyStream->stats().stagingBytes;
+      const bool held = runtime_.stagingHeld();
+      return {.name = "kv_staging",
+              .floorBytes = held ? bytes : 0,
+              .currentBytes = bytes,
+              .capBytes = bytes,
+              .releaseUnitBytes = held ? 0 : bytes};
+    }
+    [[nodiscard]] PoolValue value() const override {
+      return {.releasedBytes = released_.bytes(), .releaseMilliseconds = released_.milliseconds()};
+    }
+    uint64_t release(uint64_t bytes) override {
+      if (!bytes || runtime_.stagingHeld()) return 0;
+      return released_([this] { return runtime_.historyStream->releaseIdle(); });
+    }
+    metal::AllocationResult grow(const metal::AllocationAdmission &) override { return {}; }
+
+  private:
+    Impl &runtime_;
+    ReleaseCount released_;
+  };
+
+  // The vision arena as an elastic pool: the encoder goes whole once no
+  // image waits for its encode and nothing else holds it, and the next start
+  // that needs one builds it.
+  class VisionArenaPool final : public ElasticPool {
+  public:
+    explicit VisionArenaPool(Impl &runtime) noexcept : runtime_(runtime) {}
+    [[nodiscard]] PoolState state() const override {
+      const uint64_t bytes = runtime_.vision ? runtime_.vision->arenaBytes() : 0;
+      const bool idle = releasable();
+      return {.name = "vision_arena",
+              .floorBytes = idle ? 0 : bytes,
+              .currentBytes = bytes,
+              .capBytes = bytes,
+              .releaseUnitBytes = idle ? bytes : 0};
+    }
+    [[nodiscard]] PoolValue value() const override {
+      return {.releasedBytes = released_.bytes(), .releaseMilliseconds = released_.milliseconds()};
+    }
+    uint64_t release(uint64_t bytes) override {
+      if (!bytes || !releasable()) return 0;
+      return released_([this] {
+        const uint64_t arena = runtime_.vision->arenaBytes();
+        runtime_.vision.reset();
+        return arena;
+      });
+    }
+    metal::AllocationResult grow(const metal::AllocationAdmission &) override { return {}; }
+
+  private:
+    [[nodiscard]] bool releasable() const {
+      return runtime_.vision && runtime_.vision.use_count() == 1 && runtime_.visionIdle();
+    }
+
+    Impl &runtime_;
+    ReleaseCount released_;
+  };
+
+  // The embedding cache as an elastic pool: an entry nothing else holds is a
+  // unit, the least recently used first, and the entries something else
+  // holds are its floor. Its value: the rows it served again, and the encode
+  // time of an image it would miss.
+  class EmbeddingsPool final : public ElasticPool {
+  public:
+    explicit EmbeddingsPool(Impl &runtime) noexcept : runtime_(runtime) {}
+    [[nodiscard]] PoolState state() const override {
+      uint64_t held = 0, unit = 0;
+      for (const std::shared_ptr<ImageRows> &entry : runtime_.embeddingCache) {
+        const uint64_t bytes = entry->embeddings.sizeBytes();
+        if (entry.use_count() > 1) held += bytes;
+        else unit = bytes;
+      }
+      return {.name = "embeddings",
+              .floorBytes = held,
+              .currentBytes = runtime_.embeddingCacheBytes,
+              .capBytes = runtime_.embeddingCacheBytes,
+              .releaseUnitBytes = unit};
+    }
+    [[nodiscard]] PoolValue value() const override {
+      const uint64_t encodes = runtime_.counters.imageEncodes;
+      return {.hits = runtime_.counters.imageEmbeddingReuses,
+              .missMilliseconds = encodes ? runtime_.imageEncodeMilliseconds / double(encodes) : 0.0,
+              .releasedBytes = released_.bytes(),
+              .releaseMilliseconds = released_.milliseconds()};
+    }
+    uint64_t release(uint64_t bytes) override {
+      return released_([&] {
+        uint64_t released = 0;
+        for (auto entry = runtime_.embeddingCache.end();
+             released < bytes && entry != runtime_.embeddingCache.begin();) {
+          if ((--entry)->use_count() == 1) released += runtime_.uncache(entry++);
+        }
+        return released;
+      });
+    }
+    metal::AllocationResult grow(const metal::AllocationAdmission &) override { return {}; }
+
+  private:
+    Impl &runtime_;
+    ReleaseCount released_;
+  };
+
+  // The model's elastic memories (Runtime::pools): the store's when its
+  // experts stream, the readers' hot blocks and staging when K/V spills, and
+  // the vision arena and embeddings when the model serves vision.
+  std::optional<ExpertStorePool> expertPool;
+  std::optional<HotBlocksPool> hotBlocksPool;
+  StagingPool stagingPool{*this};
+  VisionArenaPool visionPool{*this};
+  EmbeddingsPool embeddingsPool{*this};
+  std::vector<ElasticPool *> pools;
 #ifdef SPLASH_RUNTIME_INSTRUMENTATION
   // Whether commands copy the target's logits before their policy
   // (RuntimeInstrumentation::captureTargetLogits), and the copies, one per
@@ -475,7 +649,8 @@ struct Runtime::Impl {
                         value.model.target)),
         draftModel(value.model.draft, value.backend, operators),
         aneFfn(value.aneFfn), blockCache(value.blockCache), historyStream(value.historyStream),
-        expertAdmission(std::move(value.expertAdmission)) {
+        expertAdmission(std::move(value.expertAdmission)),
+        limits(splash::model::commandLimits(geometry, aneFfn != nullptr)), loadReads(weightReads()) {
     if (states.layout() != model.stateLayout(states.layout().target.format) ||
         kvPages.layout() != model.targetKvLayout(kvPages.layout().format) || !blockCache != !historyStream) {
       throw std::invalid_argument(
@@ -487,6 +662,16 @@ struct Runtime::Impl {
         decodeArena->batchSlice(DecodeTensor::PenaltyState, kLaneCount);
     if (budgetsVerifyRows(model, value.verifyRows))
       verifyBudget.emplace();
+    if (ExpertStore *store = model.expertStore())
+      pools.push_back(&expertPool.emplace(*store));
+    if (blockCache) {
+      pools.push_back(&hotBlocksPool.emplace(*blockCache));
+      pools.push_back(&stagingPool);
+    }
+    if (model.descriptor.hasVision()) {
+      pools.push_back(&visionPool);
+      pools.push_back(&embeddingsPool);
+    }
     preparePolicyPipelines();
   }
 
@@ -968,31 +1153,58 @@ struct Runtime::Impl {
   }
 
   // A prefill command's: the null one unless a lane's history holds Index
-  // pages, which one lane of a command streams, alone.
-  [[nodiscard]] std::shared_ptr<SpilledKvReads> prefillReads(std::span<const ModelBatchItem> items) {
+  // pages, which one lane of a command streams (CommandLimits::
+  // indexPageLanes), over the attention layers of the command's `layers`.
+  [[nodiscard]] std::shared_ptr<SpilledKvReads> prefillReads(std::span<const ModelBatchItem> items,
+                                                             QwenPrefillLayers layers) {
     const auto streamed = std::ranges::find_if(items, readsSpilledKv);
     if (streamed == items.end())
       return std::make_shared<SpilledKvReads>();
-    if (std::any_of(streamed + 1, items.end(), readsSpilledKv))
-      throw std::logic_error("a prefill command streams the history of one sequence");
     const uint64_t end = streamed->logicalPosition + streamed->tokenCount;
     return std::make_shared<SpilledKvReads>(
         spilledReader(historyStream), static_cast<uint32_t>(streamed - items.begin()), streamed->pageSources,
         static_cast<uint32_t>((end + kv::kPageTokens - 1) / kv::kPageTokens),
-        laneTables(request(streamed->requestId).stateLane).pages, kvPages.layers());
+        laneTables(request(streamed->requestId).stateLane).pages, kvPages.layers(),
+        AttentionLayers{attentionLayersBefore(geometry.target, layers.first),
+                        attentionLayersBefore(geometry.target, layers.end)});
+  }
+
+  // A command keeps every rule of the commands the runtime runs
+  // (commandViolation), checked before anything of it is encoded or
+  // written: std::invalid_argument names the first it breaks.
+  void requireCommand(const BatchPlan &plan, std::span<const ModelBatchItem> items) const {
+    if (const std::optional<std::string_view> broken = commandViolation(limits, plan, items))
+      throw std::invalid_argument(std::string(*broken));
   }
 
   // The layers a prefill command's pass runs (BatchPlan::passes): the
-  // pass's even share of them, all of them for a command that runs whole.
-  // Only a command whose lanes' history stays in memory runs in passes, as
-  // many as the runtime allows (Runtime::prefillPasses).
-  [[nodiscard]] QwenPrefillLayers passLayers(const BatchPlan &plan, std::span<const ModelBatchItem> items,
-                                             uint32_t passes) const {
-    const uint32_t all = geometry.target.layers;
-    if (!plan.passes || plan.pass >= plan.passes || plan.passes > passes ||
-        (plan.passes > 1 && std::ranges::any_of(items, readsSpilledKv)))
-      throw std::invalid_argument("a prefill command's passes are not ones the runtime runs");
-    return {plan.pass * all / plan.passes, (plan.pass + 1) * all / plan.passes};
+  // pass's even share of them (model::passLayers), all of them for a
+  // command that runs whole.
+  [[nodiscard]] QwenPrefillLayers passLayers(const BatchPlan &plan) const noexcept {
+    const LayerRange layers = splash::model::passLayers(plan.pass, plan.passes, geometry.target.layers);
+    return {layers.first, layers.end};
+  }
+
+  // Runtime::prefillWork: what the pass computes (prefillCommandWork) and
+  // would read, the history of the lanes' Index pages over its attention
+  // layers and the experts of its MoE blocks as the store's residency
+  // stands.
+  [[nodiscard]] CommandWork prefillWork(std::span<const PrefillLane> lanes, uint32_t pass, uint32_t passes) const {
+    const QwenTargetGeometry &target = geometry.target;
+    CommandWork work = prefillCommandWork(target, lanes, pass, passes);
+    const LayerRange run = splash::model::passLayers(pass, passes, target.layers);
+    if (historyStream) {
+      uint64_t indexPages = 0;
+      for (const PrefillLane &lane : lanes)
+        indexPages += lane.indexPages;
+      work.spilledKvReadBytes = indexPages * historyStream->pageReadBytes() *
+                                (attentionLayersBefore(target, run.end) - attentionLayersBefore(target, run.first));
+    }
+    if (const ExpertStore *store = model.expertStore()) {
+      const auto block = [&](uint32_t layer) { return target.moeBlock(std::max(layer, target.leadingDenseLayers)); };
+      work.weightReadBytes = store->expectedPrefillReadBytes(work.rows, block(run.first), block(run.end));
+    }
+    return work;
   }
 
   // The blocks each lane of a command could not read
@@ -1381,8 +1593,9 @@ struct Runtime::Impl {
       }
       return results;
     };
-    return std::make_unique<DeferredMetalTicket>(std::move(command),
-                                                 std::move(finish));
+    // It selects from rows the prompts left, through no layer.
+    return std::make_unique<DeferredMetalTicket>(std::move(command), std::move(finish),
+                                                 WorkCount({.lanes = width}, nullptr));
   }
 
   ChunkedPrefillParams chunkParams(uint64_t logicalPosition,
@@ -1558,10 +1771,6 @@ struct Runtime::Impl {
   // DFlash2 draft captures.
   std::vector<PrefillChunk> preparePrefill(std::span<const ModelBatchItem> items,
                                            std::array<Request *, kLaneCount> &entries) {
-    uint64_t rows = 0;
-    for (const ModelBatchItem &item : items) rows += item.tokenCount;
-    if (!rows || rows > uint64_t{kPrefillRows} * prefillArena->chunks())
-      throw std::invalid_argument("a prefill command's rows exceed its chunks");
     std::vector<PrefillChunk> chunks(1);
     for (uint32_t lane = 0; lane < items.size(); ++lane) {
       const ModelBatchItem &item = items[lane];
@@ -1736,7 +1945,8 @@ struct Runtime::Impl {
   // a state it captures writes that state's cell, another the next cell or
   // the arena's scratch cell, whichever the part after it does not write. So
   // no part writes the cell it reads, and none the lane's current cell; with
-  // one scratch cell, at most one lane's rows run past a chunk.
+  // one scratch cell, at most one lane's rows run past a chunk
+  // (CommandLimits::lanesPastChunk).
   PrefillOutputs encodePrefillGraph(CommandGraph &graph, CommandGraph &encodes,
                                     std::span<const ModelBatchItem> items,
                                     std::array<Request *, kLaneCount> &entries, SpilledKvReads &reads,
@@ -1750,13 +1960,11 @@ struct Runtime::Impl {
       for (uint32_t s = 0; s < chunks[c].sequences.size(); ++s) parts[chunks[c].sequences[s].lane].push_back({c, s});
     std::vector<std::vector<const GdnParityBuffers *>> written(chunks.size());
     for (uint32_t c = 0; c < chunks.size(); ++c) written[c].resize(chunks[c].sequences.size());
-    uint32_t spanning = 0;
     for (uint32_t lane = 0; lane < lanes; ++lane) {
       const GdnParityBuffers *const next = &states.next(entries[lane]->stateLane);
       // The cell the part after this one writes; none after the last part,
       // whose end is the lane's rows' (a state there is `atEnd`).
       const GdnParityBuffers *after = nullptr;
-      spanning += parts[lane].size() > 1;
       for (size_t index = parts[lane].size(); index-- > 0;) {
         const auto [c, s] = parts[lane][index];
         const PrefillSequence &sequence = chunks[c].sequences[s];
@@ -1772,7 +1980,6 @@ struct Runtime::Impl {
         written[c][s] = after = cell;
       }
     }
-    if (spanning > 1) throw std::invalid_argument("several lanes' rows run past a prefill chunk");
 
     // A restored lane's rings first: they pass through the context buffers
     // and the draft RoPE tables before the command's rows do. Once the window
@@ -2375,14 +2582,15 @@ struct Runtime::Impl {
   // ticket.
   class ConstrainedDecodeTicket final : public ModelBatchTicket {
   public:
+    // `count` counts its work from before its first command.
     ConstrainedDecodeTicket(Impl &impl, std::vector<DecodeLaneResult> lanes,
                             std::span<const ModelBatchItem> items,
                             std::shared_ptr<SpilledKvReads> reads,
-                            const CommandGraph &draft,
+                            const CommandGraph &draft, WorkCount count,
                             std::function<void()> completion)
         : impl_(impl), lanes_(std::move(lanes)),
           items_(items.begin(), items.end()), reads_(std::move(reads)),
-          wake_(std::move(completion)) {
+          count_(std::move(count)), wake_(std::move(completion)) {
       submit(draft);
     }
 
@@ -2515,11 +2723,15 @@ struct Runtime::Impl {
       // before the engine applies its results (DeferredMetalTicket::wait).
       items_.clear();
       reads_.reset();
+      work_ = count_.realized(0);
       return results;
     }
 
     double wallMilliseconds() const noexcept override {
       return timing_.wallSeconds * 1000.0;
+    }
+    CommandSample sample() const noexcept override {
+      return {.work = work_, .wallMilliseconds = wallMilliseconds()};
     }
 
   private:
@@ -2550,6 +2762,8 @@ struct Runtime::Impl {
     std::vector<ModelBatchItem> items_;
     // Before the command, which goes first and waits for the GPU.
     std::shared_ptr<SpilledKvReads> reads_;
+    WorkCount count_;
+    CommandWork work_;
     Stage stage_ = Stage::Draft;
     CommandTicket command_;
     CommandTiming timing_;
@@ -2762,23 +2976,28 @@ std::unique_ptr<ModelBatchTicket>
 Runtime::prefillAsync(const BatchPlan &plan,
                       std::span<const ModelBatchItem> items,
                       std::function<void()> completion) {
+  impl_->requireCommand(plan, items);
   validatePlan(plan, items, WorkKind::Prefill);
   if (plan.decodeStage != DecodeStage::Regular) {
     throw std::invalid_argument("Qwen prefill cannot resume a mask plan");
   }
-  const QwenPrefillLayers layers = impl_->passLayers(plan, items, prefillPasses());
+  const QwenPrefillLayers layers = impl_->passLayers(plan);
   const bool begins = !layers.first, ends = layers.end == impl_->geometry.target.layers;
 
   std::array<Impl::Request *, kLaneCount> entries{};
   // Each request's draws before the chunk, which a rerun of it restores.
   std::array<uint64_t, kLaneCount> draws{};
+  // A command's first pass forgets what the passes of one given up before
+  // could not read.
+  for (uint32_t lane = 0; begins && lane < items.size(); ++lane)
+    impl_->request(items[lane].requestId).unreadableBlocks.clear();
   CommandGraph graph;
   if (impl_->aneFfn) {
     for (uint32_t lane = 0; lane < items.size(); ++lane)
       draws[lane] = impl_->request(items[lane].requestId).rngCounter;
     impl_->aneFfn->begin();
   }
-  const std::shared_ptr<SpilledKvReads> reads = impl_->prefillReads(items);
+  const std::shared_ptr<SpilledKvReads> reads = impl_->prefillReads(items, layers);
   CommandGraph encodes;
   const auto outputs = impl_->encodePrefillGraph(graph, encodes, items, entries, *reads, layers);
   // A state captured inside the command starts from the lane's context
@@ -2828,15 +3047,25 @@ Runtime::prefillAsync(const BatchPlan &plan,
       ++impl->counters.aneFfnReruns;
     }
     reads->end();
-    // A pass before the last commits nothing: the rows go on in the next.
+    std::array<std::vector<uint64_t>, kLaneCount> unreadable = Impl::unreadableBlocks(*reads);
+    // A pass before the last commits nothing: the rows go on in the next,
+    // and the blocks its reads could not read fail them at the last.
     if (!ends) {
       impl->counters.totalPrefillWallSeconds += timing.wallSeconds;
       impl->counters.totalPrefillGpuSeconds += timing.gpuSeconds;
       std::vector<ModelStepResult> results(items.size());
-      for (uint32_t lane = 0; lane < items.size(); ++lane) results[lane].requestId = entries[lane]->id;
+      for (uint32_t lane = 0; lane < items.size(); ++lane) {
+        results[lane].requestId = entries[lane]->id;
+        std::ranges::copy(unreadable[lane], std::back_inserter(entries[lane]->unreadableBlocks));
+      }
       return results;
     }
-    std::array<std::vector<uint64_t>, kLaneCount> unreadable = Impl::unreadableBlocks(*reads);
+    for (uint32_t lane = 0; lane < items.size(); ++lane) {
+      std::vector<uint64_t> &blocks = unreadable[lane];
+      std::ranges::copy(std::exchange(entries[lane]->unreadableBlocks, {}), std::back_inserter(blocks));
+      std::ranges::sort(blocks);
+      blocks.erase(std::ranges::unique(blocks).begin(), blocks.end());
+    }
     // A row that is not finite, of the chunk or of the state it computed
     // from, reaches the lane's last row through the recurrent state, and
     // through attention on a GPU whose tile weighs non-finite keys and values
@@ -2991,20 +3220,28 @@ Runtime::prefillAsync(const BatchPlan &plan,
     impl->counters.totalPrefillGpuSeconds += timing.gpuSeconds;
     return results;
   };
-  const auto submit = [impl, graph = std::make_shared<CommandGraph>(std::move(graph)), completion] {
+  const auto submit = [impl, graph = std::make_shared<CommandGraph>(std::move(graph)),
+                       completion](const CommandTiming &encodes) {
+    impl->imageEncodeMilliseconds += encodes.wallSeconds * 1000.0;
     return impl->aneFfn ? impl->aneFfn->commit(*graph, completion)
                         : impl->backend.submitCommandAsync(graph->command(), completion);
   };
+  std::array<PrefillLane, kLaneCount> lanes{};
+  for (uint32_t lane = 0; lane < items.size(); ++lane)
+    lanes[lane] = {static_cast<uint32_t>(items[lane].logicalPosition), items[lane].tokenCount};
+  WorkCount count(prefillCommandWork(impl_->geometry.target, std::span(lanes).first(items.size()), plan.pass,
+                                     plan.passes),
+                  impl_->model.expertStore());
   if (encodes.empty())
-    return std::make_unique<DeferredMetalTicket>(submit(), std::move(finish), reads);
+    return std::make_unique<DeferredMetalTicket>(submit({}), std::move(finish), std::move(count), reads);
   // Metal fails an event wait unmet 5 s after its queue reached it, which it
   // does for a command's first host step or Neural Engine wait as the
   // command is submitted, whatever work runs ahead of it (MetalBackend.hpp,
   // EventStep): the images' encodes, seconds of GPU work on a small GPU, run
   // as a command of their own, and the command is submitted once they have
   // completed.
-  return std::make_unique<DeferredMetalTicket>(
-      impl_->backend.submitCommandAsync(encodes.command(), completion), submit, std::move(finish), reads);
+  return std::make_unique<DeferredMetalTicket>(impl_->backend.submitCommandAsync(encodes.command(), completion),
+                                               submit, std::move(finish), std::move(count), reads);
 }
 
 std::vector<ModelStepResult>
@@ -3016,6 +3253,7 @@ std::unique_ptr<ModelBatchTicket>
 Runtime::decodeAsync(const BatchPlan &plan,
                      std::span<const ModelBatchItem> items,
                      std::function<void()> completion) {
+  impl_->requireCommand(plan, items);
   validatePlan(plan, items, WorkKind::Decode);
   if (plan.decodeStage != DecodeStage::Regular)
     return impl_->submitInitialSelection(items, std::move(completion));
@@ -3089,9 +3327,13 @@ Runtime::decodeAsync(const BatchPlan &plan,
                                {logicalPositions.data(), width},
                                {maximumRetained.data(), width}, constrained);
   std::shared_ptr<SpilledKvReads> reads = impl_->decodeReads(items);
+  // The rows its graph verifies over every layer of the target, and the
+  // weights it reads on demand.
+  WorkCount count({.lanes = width, .rows = ropeRows, .layers = impl_->geometry.target.layers},
+                  impl_->model.expertStore());
   if (constrained) {
-    return std::make_unique<Impl::ConstrainedDecodeTicket>(
-        *impl_, std::move(lanes), items, std::move(reads), commandGraph, std::move(completion));
+    return std::make_unique<Impl::ConstrainedDecodeTicket>(*impl_, std::move(lanes), items, std::move(reads),
+                                                           commandGraph, std::move(count), std::move(completion));
   }
   impl_->encodeBatchVerifyInput(commandGraph, width);
   impl_->encodeBatchEmbedding(commandGraph, DecodeTensor::InputTokens,
@@ -3107,8 +3349,7 @@ Runtime::decodeAsync(const BatchPlan &plan,
   };
   CommandTicket command = impl_->backend.submitCommandAsync(
       commandGraph.command(), std::move(completion));
-  return std::make_unique<DeferredMetalTicket>(std::move(command),
-                                               std::move(finish));
+  return std::make_unique<DeferredMetalTicket>(std::move(command), std::move(finish), std::move(count));
 }
 
 uint32_t Runtime::residentLane(uint64_t requestId) const {
@@ -3161,6 +3402,16 @@ uint32_t Runtime::prefillPasses() const noexcept {
   return impl_->model.expertStore() ? impl_->geometry.target.layers : 1;
 }
 
+CommandLimits Runtime::commandLimits() const noexcept { return impl_->limits; }
+
+CommandWork Runtime::prefillWork(std::span<const PrefillLane> lanes, uint32_t pass, uint32_t passes) const {
+  return impl_->prefillWork(lanes, pass, passes);
+}
+
+std::span<ElasticPool *const> Runtime::pools() noexcept { return impl_->pools; }
+
+SsdReads Runtime::loadReads() const noexcept { return impl_->loadReads; }
+
 uint32_t Runtime::statesToActivate() const noexcept {
   return impl_->states.statesToActivate();
 }
@@ -3169,26 +3420,39 @@ uint64_t Runtime::idleBufferBytes(uint32_t evictedStates) const noexcept {
   return impl_->states.idleBytes(evictedStates);
 }
 
+uint64_t Runtime::spilledReadShortfall(uint64_t requestId, SpilledReadNeed need) const {
+  const uint32_t lane = residentLane(requestId);
+  if (need.kind == WorkKind::Decode)
+    return impl_->blockCache ? impl_->blockCache->laneShortfallBytes(lane) : 0;
+  return impl_->historyStream ? impl_->historyStream->shortfallBytes(need.pages) : 0;
+}
+
 // A prompt reads its spilled history through the staging, a decode through
 // the hot block cache: the floor a decoding lane takes replaces the staging
 // once no prompt holds it, so a lane never holds both (the memory plan
 // counts the larger of the two). The staging holds nothing between
 // prompts, and a next prompt allocates it again as it streams; the hot
-// block cache keeps its blocks.
-ModelMemoryAdmission Runtime::reserveSpilledReads(uint64_t requestId) {
+// block cache keeps its blocks. The staging is the prompt's from its
+// reservation on, also when its growth is refused: the reclaim that funds a
+// retry spares it (Impl::stagingHeld).
+ModelMemoryAdmission Runtime::reserveSpilledReads(uint64_t requestId, SpilledReadNeed need) {
   const uint32_t lane = residentLane(requestId);
+  if (need.kind == WorkKind::Prefill) {
+    if (!impl_->historyStream) return {.ok = true};
+    impl_->stagingRequest = requestId;
+    return impl_->historyStream->reserve(need.pages);
+  }
   if (!impl_->blockCache) return {.ok = true};
   if (impl_->historyStream && !impl_->stagingHeld()) static_cast<void>(impl_->historyStream->releaseIdle());
   return impl_->blockCache->reserveLane(lane);
 }
 
-// The staging is the request's from now on, also when its growth is
-// refused: the reclaim that funds a retry spares it (Impl::stagingHeld).
+ModelMemoryAdmission Runtime::reserveSpilledReads(uint64_t requestId) {
+  return reserveSpilledReads(requestId, {.kind = WorkKind::Decode});
+}
+
 ModelMemoryAdmission Runtime::reserveHistoryStaging(uint64_t requestId, uint32_t pages) {
-  static_cast<void>(residentLane(requestId));
-  if (!impl_->historyStream) return {.ok = true};
-  impl_->stagingRequest = requestId;
-  return impl_->historyStream->reserve(pages);
+  return reserveSpilledReads(requestId, {.kind = WorkKind::Prefill, .pages = pages});
 }
 
 bool Runtime::holdsSpilledReads(uint64_t requestId, uint32_t historyPages) const {
@@ -3337,6 +3601,7 @@ WarmupStepResult Runtime::warmupPrefill(uint32_t rows) {
     throw std::invalid_argument("invalid prefill warmup row count");
   constexpr uint64_t id = std::numeric_limits<uint64_t>::max() - 100;
   double wallSeconds = 0.0, hostSeconds = 0.0;
+  CommandSample sample;
   std::vector<WarmupLaneResult> lanes;
   std::vector<uint32_t> warmupPrompt(rows, 0);
   ModelRequest request;
@@ -3358,6 +3623,7 @@ WarmupStepResult Runtime::warmupPrefill(uint32_t rows) {
     auto result = ticket->wait();
     wallSeconds = std::chrono::duration<double>(AwakeClock::now() - phaseStart).count();
     hostSeconds = ticket->hostMilliseconds() / 1000.0;
+    sample = ticket->sample();
     requireLanesSucceeded(result);
     if (result.size() != 1 || result[0].consumedPromptTokens != rows) {
       throw std::runtime_error("prefill warmup result mismatch");
@@ -3371,7 +3637,7 @@ WarmupStepResult Runtime::warmupPrefill(uint32_t rows) {
   }
   return {"real " + std::to_string(rows) +
               "-row KV target+draft prefill [M32]",
-          wallSeconds, std::move(lanes), hostSeconds};
+          wallSeconds, std::move(lanes), hostSeconds, sample};
 }
 
 WarmupStepResult Runtime::warmupDecodeBatch(uint32_t width) {

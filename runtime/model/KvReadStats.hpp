@@ -70,12 +70,13 @@ struct KvBlockCacheStats final {
 };
 
 // What a prefill's history stream did when its command ended
-// (KvHistoryStream::end): the blocks it could not read, and the time the
+// (KvHistoryStream::end): the blocks it could not read, the time the
 // command waited on its reads, which the scheduler sizes a streaming
-// prefill's rows by.
+// prefill's rows by, and the bytes its reads brought.
 struct KvStreamResult final {
   std::vector<KvReadFailure> failures;
   double streamMilliseconds = 0.0;
+  uint64_t readBytes = 0;
 };
 
 // The history streams as /status reports them: commands that streamed, the

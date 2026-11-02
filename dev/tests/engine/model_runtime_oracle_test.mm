@@ -1673,28 +1673,35 @@ void requirePrefillGroupMatchesItsChunks(model::Runtime &executor, const kv::Pag
 // (BatchPlan::passes), each its own command, leaves what it leaves run
 // whole: its score logits, KV, GDN cell, PLE history, lengths, draft rings
 // and window, and the states it captures, at three passes and at one a
-// layer, and with an image its first pass encodes when the target serves
-// vision; so does each lane of a command of two, the first lane's rows in
-// its first chunk and the second's past it, each capturing a state inside
-// its rows and one at their end. A pass before the last returns its
-// requests' ids alone. A target whose commands run whole (its experts load
-// whole) skips it.
+// layer (CommandLimits::maximumPasses), and with an image its first pass
+// encodes when the target serves vision; so does each lane of a command of
+// two, each capturing a state inside its rows and one at their end. On a
+// runtime whose commands hold a prefill group's chunks, the command spans
+// three chunks, its image the first chunk's end, and the second lane's rows
+// run past the first chunk; on one of one chunk, they keep to the chunk, the
+// image past the states inside it. A
+// pass before the last returns its requests' ids alone. A runtime whose
+// commands run whole (the Neural Engine's FFN split) skips it.
 void requirePrefillPassesMatchWhole(model::Runtime &executor, const kv::PageStorage &pages,
                                     const model::QwenStateStorage &states, std::span<const uint32_t> chat,
                                     bool vision) {
-  const uint32_t passes = executor.prefillPasses();
+  const model::CommandLimits limits = executor.commandLimits();
+  const uint32_t passes = limits.maximumPasses;
   if (passes <= 1) {
-    std::cout << "prefill_passes=SKIP (the target runs its prefill commands whole)\n";
+    std::cout << "prefill_passes=SKIP (the runtime runs its prefill commands whole)\n";
     return;
   }
   constexpr uint32_t chunk = model::ExecutionLimits::prefillTokenBudget;
-  constexpr uint32_t rows = kGroupFixtureRows;
+  const bool grouped = limits.commandRows > chunk;
+  const uint32_t rows = grouped ? kGroupFixtureRows : chunk;
   const std::vector<uint32_t> pageTable = pageRange(0, rows / kv::kPageTokens);
   require(pages.pageCount() >= pageTable.size(), "the KV pool cannot hold the prefill passes fixture");
   std::vector<uint32_t> prompt(rows + kv::kPageTokens);
   for (uint32_t index = 0; index < prompt.size(); ++index) prompt[index] = chat[index % chat.size()];
   const std::span<const uint32_t> tokens(prompt);
-  constexpr std::array<uint32_t, 3> capturedAt{1024, chunk + 1024, rows};
+  const std::array<uint32_t, 3> capturedAt =
+      grouped ? std::array<uint32_t, 3>{1024, chunk + 1024, rows} : std::array<uint32_t, 3>{512, 1024, rows};
+  const uint32_t imageAt = (grouped ? chunk : 3 * chunk / 4) - 16;
   const uint32_t width = states.layout().draft.contextWidth;
   struct Run final {
     std::vector<float> scores;
@@ -1712,7 +1719,7 @@ void requirePrefillPassesMatchWhole(model::Runtime &executor, const kv::PageStor
     // The same pixels in every request, under a digest of its own, so that
     // each request encodes the image itself.
     if (image) {
-      request.images = {{chunk - 16, 64, 16, 16, id, 0}};
+      request.images = {{imageAt, 64, 16, 16, id, 0}};
       request.imagePixels.resize(request.images.front().pixelBytes());
       for (size_t index = 0; index < request.imagePixels.size(); ++index)
         request.imagePixels[index] = static_cast<uint8_t>(index * 13 + 7);
@@ -1784,11 +1791,12 @@ void requirePrefillPassesMatchWhole(model::Runtime &executor, const kv::PageStor
     }
   }
 
-  constexpr uint32_t firstRows = chunk / 2, secondRows = chunk + chunk / 2;
+  const uint32_t firstRows = grouped ? chunk / 2 : chunk / 4, secondRows = grouped ? chunk + chunk / 2 : chunk / 2;
   const std::array<std::vector<uint32_t>, 2> lanePages{pageRange(0, firstRows / kv::kPageTokens),
                                                        pageRange(firstRows / kv::kPageTokens,
                                                                  secondRows / kv::kPageTokens)};
-  const std::array<std::array<uint32_t, 2>, 2> laneCaptures{{{chunk / 4, firstRows}, {chunk / 2, secondRows}}};
+  const std::array<std::array<uint32_t, 2>, 2> laneCaptures{
+      {{firstRows / 2, firstRows}, {secondRows / 3 / kv::kPageTokens * kv::kPageTokens, secondRows}}};
   struct LaneRun final {
     std::vector<float> scores;
     std::vector<std::vector<uint8_t>> kv;
@@ -3475,19 +3483,32 @@ public:
     beginCold(*runtime_, engineRequest, request.stateLane);
   }
 
-  // The request's prompt from what it committed to token `end`, one command.
-  SpillStep prefill(SpillRequest &request, uint32_t end) {
+  // The request's prompt from what it committed to token `end`, one
+  // command, in `passes` passes over the target's layers (BatchPlan::passes),
+  // each its own command; `afterPass`, if any, runs after each pass but the
+  // last.
+  SpillStep prefill(SpillRequest &request, uint32_t end, uint32_t passes = 1,
+                    const std::function<void()> &afterPass = {}) {
     const uint32_t position = request.committed;
     ensure(request, end);
     if (request.holdsIndexPages())
       require(runtime_->reserveHistoryStaging(request.id, pagesFor(end)).granted(),
               "the staging of a spilled history was refused");
     const std::span<const uint32_t> input = std::span(request.prompt).subspan(position, end - position);
-    const BatchPlan plan{.kind = WorkKind::Prefill,
-                         .items = {{request.id, end - position}},
-                         .decodeStage = DecodeStage::Regular};
     const std::array items{item(request, position, end - position, input)};
-    std::vector<ModelStepResult> results = runtime_->submit(plan, items, {})->wait();
+    std::vector<ModelStepResult> results;
+    for (uint32_t pass = 0; pass < passes; ++pass) {
+      const BatchPlan plan{.kind = WorkKind::Prefill,
+                           .items = {{request.id, end - position}},
+                           .decodeStage = DecodeStage::Regular,
+                           .pass = pass,
+                           .passes = passes};
+      results = runtime_->submit(plan, items, {})->wait();
+      if (pass + 1 == passes) break;
+      require(results.size() == 1 && !results[0].consumedPromptTokens && results[0].unreadableKvBlocks.empty(),
+              "a pass before a spill run's last committed rows or failed them");
+      if (afterPass) afterPass();
+    }
     require(results.size() == 1 && results[0].consumedPromptTokens == end - position,
             "a spill run's prefill result mismatch");
     lastResults_ = results;
@@ -3556,7 +3577,8 @@ public:
     while (!request.copies[unreadable]) --unreadable;
     const uint32_t firstPage = request.committed / kv::kPageTokens, endPage = pagesFor(end);
     kv_.writeEntries(request.pages, 0, tables_[0]);
-    model::SpilledKvReads reads(stream_, 0, pageSources(request), endPage, tables_[0], kv_.layers());
+    model::SpilledKvReads reads(stream_, 0, pageSources(request), endPage, tables_[0], kv_.layers(),
+                                {0, layout_.attentionLayers});
     const uint64_t commands = stream_.stats().commands;
     double waited = 0.0;
     request.copies[unreadable]->failAll = true;
@@ -3829,7 +3851,7 @@ void requireSpilledKvMatchesResident(metal::MetalBackend &backend, const model::
     prompts[index].resize(tokens);
     for (uint32_t &token : prompts[index]) token = distribution(random);
   }
-  const auto run = [&](uint64_t firstId, std::array<bool, 4> spills) {
+  const auto run = [&](uint64_t firstId, std::array<bool, 4> spills, uint32_t passes) {
     std::array<SpillRequest, 4> requests;
     SpillRecord record;
     const auto took = [&] { record.commandBuffers.push_back(BackendInstrumentation::lastCommandBuffers(backend)); };
@@ -3838,7 +3860,7 @@ void requireSpilledKvMatchesResident(metal::MetalBackend &backend, const model::
       spill.begin(requests[index]);
       std::vector<SpillStep> steps;
       for (const uint32_t end : ends[index]) {
-        steps.push_back(spill.prefill(requests[index], end));
+        steps.push_back(spill.prefill(requests[index], end, passes));
         took();
       }
       record.steps.push_back(std::move(steps));
@@ -3864,15 +3886,29 @@ void requireSpilledKvMatchesResident(metal::MetalBackend &backend, const model::
     spill.end(requests[0]);
     return record;
   };
-  const SpillRecord resident = run(4001, {false, false, false, false});
+  const SpillRecord resident = run(4001, {false, false, false, false}, 1);
   const model::KvBlockCacheStats residentReads = spill.blockCache().stats();
   require(!residentReads.reads.resolves && !spill.historyStream().stats().commands,
           "a run whose pages all hold their K/V read spilled K/V");
-  const SpillRecord spilled = run(4011, {true, false, true, false});
+  const SpillRecord spilled = run(4011, {true, false, true, false}, 1);
   require(spill.unspilledPages(), "the spilled run's last turn un-spilled nothing");
   for (size_t step = 0; step < resident.steps.size(); ++step)
     require(spilled.steps[step] == resident.steps[step], "a run whose K/V spilled gave other tokens or logits than one "
                                                          "whose K/V stayed, at step " + std::to_string(step));
+  // Prompts whose commands run in passes over the target's layers, each pass
+  // a command that streams the spilled history of its attention layers
+  // (KvHistoryStream), give what they give whole: in three passes and in one
+  // a layer.
+  const uint64_t streamedCommands = spill.historyStream().stats().commands;
+  const uint32_t layerPasses = runtime.commandLimits().maximumPasses;
+  for (const uint32_t passes : {3u, layerPasses}) {
+    const SpillRecord passed = run(passes == 3 ? 4031 : 4041, {true, false, true, false}, passes);
+    for (size_t step = 0; step < resident.steps.size(); ++step)
+      require(passed.steps[step] == resident.steps[step],
+              "a run whose spilled prompts ran in " + std::to_string(passes) +
+                  " passes gave other tokens or logits than one whose K/V stayed, at step " + std::to_string(step));
+  }
+  require(spill.historyStream().stats().commands > streamedCommands, "prompts in passes streamed no history");
   const model::KvBlockCacheStats reads = spill.blockCache().stats();
   const model::KvHistoryStreamStats history = spill.historyStream().stats();
   require(reads.reads.resolves && reads.reads.hits && reads.reads.misses && reads.reads.paged < reads.reads.entries &&
@@ -3930,6 +3966,17 @@ void requireSpilledKvMatchesResident(metal::MetalBackend &backend, const model::
                   streamed.committed == ends[0][command - 1],
               "a prefill command whose history could not be read did not fail its lane alone, committing nothing");
       streamed.copies[unreadable]->failAll = false;
+      // A copy a pass before the last cannot read fails the command at its
+      // last pass, which reads it, committing nothing.
+      streamed.copies[unreadable]->failAll = true;
+      static_cast<void>(spill.prefill(streamed, ends[0][command], 2,
+                                      [&] { streamed.copies[unreadable]->failAll = false; }));
+      const ModelStepResult &failedFirst = spill.lastResults().front();
+      require(failedFirst.failure.empty() && failedFirst.outputTokens.empty() &&
+                  failedFirst.unreadableKvBlocks == std::vector<uint64_t>{streamed.sources[unreadable].block} &&
+                  streamed.committed == ends[0][command - 1],
+              "a prefill command in passes whose history a pass before the last could not read did not fail its "
+              "lane, committing nothing");
       // The staging is the prompt's while it goes on: an idle reclaim, as
       // one that funds the staging's growth, leaves it.
       const uint64_t staging = spill.historyStream().stats().stagingBytes;
