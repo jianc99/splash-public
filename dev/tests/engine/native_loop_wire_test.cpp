@@ -1027,16 +1027,22 @@ ScoreBesideChat runScoreBesideChat(bool invalidScore) {
     executor.invalidScores.insert(21);
   loop.announceReady();
 
-  // Whole KV pages, so the last prompt chunk is the one that publishes the
-  // final block: beside the chat's 65 rows the first command takes all but
-  // the last of them. The chat lane deliberately does not share this prefix.
+  // Whole KV pages, a chunk and one more, so the last prompt chunk is the
+  // one that publishes the final block: the first command takes the chunk,
+  // and the last the page, beside a longer chat's first 65 rows, the fewest
+  // that spare the chat a command of its own. The chat lane deliberately
+  // does not share this prefix.
   auto scored = scoreRequest(
-      21, model::ExecutionLimits::prefillTokenBudget - 2 * KvCache::pageTokens);
+      21, model::ExecutionLimits::prefillTokenBudget + KvCache::pageTokens);
   for (uint32_t index = 0; index < scored.promptTokens.size(); ++index)
     scored.promptTokens[index] = 1000 + index;
   require(loop.receive(protocol::peer::serialize(scored)),
           "score request wire failed");
-  require(loop.receive(protocol::peer::serialize(request(22))),
+  auto chat = request(22);
+  chat.promptTokens.resize(model::ExecutionLimits::prefillTokenBudget + 65);
+  for (uint32_t index = 0; index < chat.promptTokens.size(); ++index)
+    chat.promptTokens[index] = index + 1;
+  require(loop.receive(protocol::peer::serialize(chat)),
           "batched chat request wire failed");
   runUntilIdle(loop);
 
