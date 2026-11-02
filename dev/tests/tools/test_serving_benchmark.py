@@ -1406,6 +1406,175 @@ class GateTests(unittest.TestCase):
         self.assertEqual(froze["G1"]["numbers"]["freeze"]["reference_gap_s"], 424.8)
         self.assertEqual(froze["G2"]["numbers"]["tolerance"], 0.0)
 
+    def test_each_candidate_takes_its_own_g4(self):
+        # m6-fn-churn: every cand run holds G4; the floor = cap control's A1
+        # has an 8 s client gap (G4c, the M6's floor is 7.3 s). r150's own
+        # runs froze (9 s decode gaps). cand trails r150 by 3 % in work with
+        # the same TTFT and latency: its own G4 makes the freeze its gain.
+        def make(label, tree, order, work, chunks=(0, 100, 200), gap_ms=None):
+            done = [
+                {
+                    "tag": f"w{w}-r1",
+                    "start": 0,
+                    "t": 200,
+                    "ttft": 100,
+                    "decode_tps": 30,
+                    "chunks_ms": list(chunks),
+                }
+                for w in range(3)
+            ]
+            fields = (
+                {}
+                if gap_ms is None
+                else {"kv_spill__history_stream__decode_gap_ms": {"max": gap_ms}}
+            )
+            r = churn_run(
+                self.directory,
+                label,
+                done,
+                [status(900, rows=int(work * 585), **fields)],
+            )
+            r.tree, r.order = tree, order
+            return r
+
+        cell = {
+            "name": "m",
+            "machine": "m6",
+            "release": {"throughput": "r150"},
+            "candidates": ["cand"],
+            "health": ["cand", "cand-floorcap"],
+        }
+        runs = (
+            [
+                make(f"r{o}{i}", "r150", o, 1000 + i, gap_ms=9000)
+                for o in "AB"
+                for i in range(2)
+            ]
+            + [make(f"c{o}{i}", "cand", o, 970 + i) for o in "AB" for i in range(2)]
+            + [make("f1", "cand-floorcap", "A", 1000, chunks=(0, 8000))]
+        )
+        verdicts = matrix.churn_cell(cell, self.spec, runs, {}, PRICES)
+        self.assertIn(
+            ("G4 G8 G9 f1", stats.FAIL), [(v["rule"], v["verdict"]) for v in verdicts]
+        )
+        g1 = next(v for v in verdicts if v["rule"] == "G1 cand vs r150")
+        self.assertTrue(g1["numbers"]["gain"], g1)
+        self.assertEqual(g1["numbers"]["tolerance"], self.gates["trade_tolerance"])
+
+    def test_a_cell_without_a_usable_candidate_run_says_so(self):
+        # p-fn-churn-18g: the laptop's owner used the M5 Pro during cand's A
+        # runs, the watchdog killed B1 before it wrote its meta.json, and B2
+        # never ran. cand's gates are INCONCLUSIVE, naming its runs; the
+        # killed run is listed, and B2 as not run.
+        spec = matrix.load_spec(SPEC)
+        cell = next(c for c in spec["cells"] if c["name"] == "p-fn-churn-18g")
+        spec = {**spec, "cells": [cell]}
+        model = spec["models"][cell["model"]]["model"]
+        done = [
+            {"tag": f"w{w}-r1", "start": 0, "t": 100, "ttft": 5, "decode_tps": 30}
+            for w in range(3)
+        ]
+        for label in ("p-fn-churn-18g-cand-A1", "p-fn-churn-18g-cand-A2"):
+            churn_run(self.directory, label, done, [status(0), status(960)])
+            (self.directory / f"{label}.meta.json").write_text(
+                json.dumps(
+                    {
+                        "label": label,
+                        "cell": cell["name"],
+                        "tree_name": "cand",
+                        "order": [2, 0, 1],
+                        "model": model,
+                        "complete": True,
+                    }
+                )
+            )
+            write_jsonl(
+                self.directory / f"{label}.idle.jsonl",
+                [{"hid_idle_s": 3.0, "holders": []}],
+            )
+        churn_run(
+            self.directory,
+            "p-fn-churn-18g-cand-B1",
+            done[:1],
+            [status(0), status(400)],
+            complete=False,
+        )
+        document = matrix.analyze(spec, [self.directory])
+        verdicts = {
+            v["rule"]: (v["verdict"], v["numbers"]) for v in document["verdicts"]
+        }
+        why = "no usable cand run: " + ", ".join(
+            f"p-fn-churn-18g-cand-{run}" for run in ("A1", "A2", "B1", "B2")
+        )
+        for rule in (
+            "G1 cand vs r150",
+            "G2 cand vs r150",
+            "G2 decode cand vs r150",
+            "G3 cand vs main",
+            "SSD disk_read_per_work",
+            "SSD disk_written_per_work",
+            "SSD expert_read_per_work",
+        ):
+            self.assertEqual(verdicts.get(rule), (stats.INCONCLUSIVE, why), rule)
+        self.assertEqual(
+            [(u["label"], u["reasons"]) for u in document["invalid"]],
+            [
+                (
+                    "p-fn-churn-18g-cand-A1",
+                    ["the laptop was in use (HIDIdleTime 3.0 s)"],
+                ),
+                (
+                    "p-fn-churn-18g-cand-A2",
+                    ["the laptop was in use (HIDIdleTime 3.0 s)"],
+                ),
+                ("p-fn-churn-18g-cand-B1", ["the run did not end with DONE"]),
+                ("p-fn-churn-18g-cand-B2", ["not run"]),
+            ],
+        )
+
+    def test_scheduler_readouts_and_the_owners_conflict_report(self):
+        # s-fn-churn-18g cand: 12 plans in 15 minutes left a request out for
+        # the Index-page lane limit, past S's bound of 5 (amend/S.md D1);
+        # each interval's committed rows per command give the unit sizes.
+        counters = [
+            # t, prefill_batches, prefill_rows, index_page_conflicts, prefill_units,
+            # pass_commands, bound_cuts
+            (0, 0, 0, 0, 0, 0, 0),
+            (300, 1, 2048, 4, 1, 0, 0),
+            (600, 3, 2048 + 2 * 8192, 9, 3, 0, 1),
+            (900, 4, 2048 + 2 * 8192 + 4096, 12, 7, 1, 2),
+        ]
+        samples = [
+            self.schema7(
+                t,
+                scheduler__prefill_batches=batches,
+                scheduler__prefill_rows=rows,
+                scheduler__index_page_conflicts=conflicts,
+                scheduler__prefill_units=units,
+                scheduler__pass_commands=passes,
+                scheduler__bound_cuts=cuts,
+            )
+            for t, batches, rows, conflicts, units, passes, cuts in counters
+        ]
+        r = churn_run(self.directory, "s-cand", [], samples)
+        r.tree, r.order = "cand", "A"
+        cell = {"name": "s", "machine": "studio", "health": ["cand"]}
+        verdicts = matrix.churn_cell(cell, self.spec, [r], {}, PRICES)
+        readouts = next(v for v in verdicts if v["rule"] == "G4 G8 G9 s-cand")[
+            "numbers"
+        ]["readouts"]
+        self.assertEqual(readouts["index_page_conflicts_per_15min"], 12)
+        self.assertEqual(readouts["bound_cuts"], 2)
+        self.assertEqual(
+            readouts["rows_per_unit"],
+            {"intervals": 3, "p10": 2048, "p50": 4096, "p90": 8192, "max": 8192},
+        )
+        self.assertEqual((readouts["pass_commands"], readouts["prefill_units"]), (1, 7))
+        self.assertIn(
+            ("index page conflicts s-cand", "report", {"per_15min": 12.0, "bound": 5}),
+            [(v["rule"], v["verdict"], v["numbers"]) for v in verdicts],
+        )
+
     def test_check_finds_a_silent_worker_and_a_short_run(self):
         done = [
             {"tag": f"w{w}-r1", "start": 0, "t": 100, "ttft": 5, "decode_tps": 30}
@@ -1638,14 +1807,41 @@ class PlanTests(unittest.TestCase):
                             self.assertIn("BASELINE=/trees/pass", words, job.name)
 
     def test_analyze_judges_every_cell(self):
-        # Recorded references alone: every candidate cell is "not run", and
-        # every recorded run is valid.
+        # Recorded references alone: every candidate cell is "not run", each
+        # planned churn run is listed as not run, and every recorded run is
+        # valid. verdict.md carries bin/cmp.py's and pertag.py's numbers of
+        # each fixed-order set (cmp.txt, pertag.txt).
         document = matrix.analyze(matrix.load_spec(SPEC), [FIXTURES / "m6"])
         verdicts = {(v["cell"], v["rule"]): v["verdict"] for v in document["verdicts"]}
         self.assertEqual(verdicts[("m6-fn-churn", "cell")], "not run")
         self.assertEqual(verdicts[("m6-fn-ttft", "G5 N=2")], stats.INCONCLUSIVE)
-        self.assertEqual(document["invalid"], [])
-        self.assertIn("## Runs not used", matrix.verdict_markdown(document))
+        self.assertEqual(
+            {tuple(u["reasons"]) for u in document["invalid"]}, {("not run",)}
+        )
+        self.assertIn(
+            ("m6-fn-churn", "m6-fn-churn-cand-floorcap-B2"),
+            {(u["cell"], u["label"]) for u in document["invalid"]},
+        )
+        markdown = matrix.verdict_markdown(document)
+        self.assertIn("## Runs not used", markdown)
+        self.assertEqual(
+            [
+                (s["cell"], s["order"], [row["label"] for row in s["cmp"]])
+                for s in document["legacy"]
+            ],
+            [
+                ("m6-fn-churn", "A", ["m150a", "m150a2", "mMNa", "mMNa2"]),
+                ("m6-fn-churn", "B", ["m150b", "mMNb"]),
+            ],
+        )
+        for line in (FIXTURES / "cmp.txt").read_text().splitlines():
+            self.assertIn(
+                ("    " if line.startswith(" ") else "### m6-fn-churn ") + line.strip(),
+                markdown,
+            )
+        pertag = (FIXTURES / "pertag.txt").read_text().splitlines()[-4:]
+        for line in pertag:
+            self.assertIn(f"    {line}\n", markdown)
 
 
 class RunTests(unittest.TestCase):

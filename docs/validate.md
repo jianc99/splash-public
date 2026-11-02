@@ -400,8 +400,11 @@ runs per tree and order, recorded reference runs, gates).
   of their type took on that Mac (20 minutes per churn run without one).
 - `analyze --results DIR... --out DIR` applies the gates to every cell with
   results and writes `verdict.json` and `verdict.md`: PASS, FAIL or
-  INCONCLUSIVE with the numbers, the trades for the owner, and every run it
-  did not use and why.
+  INCONCLUSIVE with the numbers (a candidate none of whose runs is usable
+  gets its gates INCONCLUSIVE, naming its runs), the trades for the owner,
+  every run it did not use and why, a run a cell plans that left no record
+  as not run, and per fixed-order set of each churn cell the per-run numbers
+  of `bin/cmp.py` and `pertag.py`.
 
 A run of any scenario counts only if it ended with `DONE`, its server never
 restarted and failed no request (an HTTP error but `context_length_exceeded`,
@@ -458,6 +461,11 @@ resolve it.
 
 Each candidate churn run also reports, with nothing judged on them, its
 prefill hole share (the streamed experts' prefill host steps, pickup, work
-and resume, over `metrics.prefill_wall_ms`) and its SSD-busy share (its
+and resume, over `metrics.prefill_wall_ms`), its SSD-busy share (its
 prefill expert reads at the seeded `weight_read_bytes` rate over the same
-wall time).
+wall time), its `scheduler.bound_cuts`, the rows of its prefill units (each
+sample interval's `prefill_rows` per committed command, p10, p50, p90 and
+max, with its pass commands and units) and its
+`scheduler.index_page_conflicts` per 15 minutes; a run past 5 per 15
+minutes (`index_page_conflicts_per_15min`, the scheduler's bound) is
+reported to the owner.

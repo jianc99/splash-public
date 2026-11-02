@@ -15,7 +15,9 @@ bounded gaps), or lists the queued jobs running past twice their expected
 time. analyze applies the spec's gates (DESIGN-1.6.0 §8.3 as amended by
 amend/V.md §5 and the owner's rulings) to every cell with results and writes
 verdict.json and verdict.md: PASS, FAIL or INCONCLUSIVE with the numbers, the
-trades for the owner, and the runs it did not use and why.
+trades for the owner, the runs it did not use and why (a planned run that
+left no record as not run), and per fixed-order set of each churn cell the
+numbers of bin/cmp.py and pertag.py.
 """
 
 from __future__ import annotations
@@ -277,44 +279,50 @@ class Run:
 
 def load_runs(spec: dict, results: list[Path]) -> list[Run]:
     """The churn runs of the spec's cells found in the results: new runs by
-    their meta.json, recorded ones by the labels each cell lists."""
+    their meta.json, the runs each cell plans also by their client's records
+    (a run killed before it wrote its meta.json), and recorded ones by the
+    labels each cell lists."""
     cells = {cell["name"]: cell for cell in spec["cells"]}
-    runs = []
+    runs, found = [], set()
+
+    def add(directory, label, cell, tree, order):
+        found.add((cell["name"], label))
+        runs.append(Run(directory, label, cell["name"], tree, order, work_second(cell)))
+
     for directory in results:
         for path in sorted(directory.glob("*.meta.json")):
             meta = json.loads(path.read_text())
             cell = cells.get(meta.get("cell"))
             if cell and cell.get("scenario") == "churn":
                 order = spec["order_names"].get(tuple(meta.get("order") or ()))
-                runs.append(
-                    Run(
-                        directory,
-                        meta["label"],
-                        cell["name"],
-                        meta.get("tree_name"),
-                        order,
-                        work_second(cell),
-                    )
-                )
+                add(directory, meta["label"], cell, meta.get("tree_name"), order)
     for cell in spec["cells"]:
         if cell.get("scenario") != "churn":
             continue
-        for tree, orders in (cell.get("recorded") or {}).items():
-            for order, labels in orders.items():
-                for label in labels:
-                    directory = locate(results, label)
-                    if directory is not None:
-                        runs.append(
-                            Run(
-                                directory,
-                                label,
-                                cell["name"],
-                                tree,
-                                order,
-                                work_second(cell),
-                            )
-                        )
+        listed = [
+            (tree, order, run_label(cell["name"], tree, order, repeat))
+            for tree, order, repeat in planned_runs(cell, False)
+        ] + [
+            (tree, order, label)
+            for tree, orders in (cell.get("recorded") or {}).items()
+            for order, labels in orders.items()
+            for label in labels
+        ]
+        for tree, order, label in listed:
+            directory = locate(results, label)
+            if (cell["name"], label) not in found and directory is not None:
+                add(directory, label, cell, tree, order)
     return runs
+
+
+def not_run(cell: dict, runs: list[Run]) -> list[tuple[str, str]]:
+    """(tree, label) of the runs a churn cell plans that left no record."""
+    labels = {run.label for run in runs}
+    return [
+        (tree, label)
+        for tree, order, repeat in planned_runs(cell, False)
+        if (label := run_label(cell["name"], tree, order, repeat)) not in labels
+    ]
 
 
 def assertion_pid(holder: str) -> int | None:
@@ -488,6 +496,25 @@ def legacy_pertag(runs: list[Run]) -> dict:
     return {"table": table, "summary": summary}
 
 
+def legacy_sets(cell: dict, runs: list[Run], prices: dict) -> list[dict]:
+    """bin/cmp.py's and pertag.py's numbers for each fixed-order set of a
+    churn cell: its valid runs of the order that ended with DONE, where they
+    completed a tag in common."""
+    sets = []
+    for order in ("A", "B"):
+        group = [r for r in runs if r.order == order and r.complete and not r.invalid]
+        if group and set.intersection(*(set(r.done) for r in group)):
+            sets.append(
+                {
+                    "cell": cell["name"],
+                    "order": order,
+                    "cmp": legacy_cmp(group, prices),
+                    "pertag": legacy_pertag(group),
+                }
+            )
+    return sets
+
+
 def prefill_walls(run: Run) -> dict:
     """Each completed request's prefill wall (amend/V.md A08): from the first
     sample where its lane's processed prompt rose above where it started
@@ -589,6 +616,51 @@ def counter_delta(run: Run, path: str) -> float:
     if len(run.samples) < 2:
         return 0
     return value(run.last, path, 0) - value(run.samples[0]["status"], path, 0)
+
+
+def per_15_minutes(run: Run, path: str) -> float | None:
+    """A counter's change over the run's samples per 15 minutes, None where
+    its status lacks the counter or holds one sample."""
+    span = run.samples[-1]["t"] - run.samples[0]["t"] if run.samples else 0
+    if not span or value(run.last, path) is None:
+        return None
+    return counter_delta(run, path) * 900 / span
+
+
+def unit_sizes(run: Run) -> dict:
+    """amend/V.md A08: the rows of the prefill units the run ran. A command
+    adds its rows to scheduler.prefill_rows and one to prefill_batches as it
+    commits, and runs them in one unit or, a pass command, in each of its
+    passes (prefill_units counts units as they complete), so each sample
+    interval that committed commands gives their rows per unit: p10, p50,
+    p90 and max over those intervals, and the run's pass commands and units."""
+    sizes = []
+    for earlier, later in zip(run.samples, run.samples[1:]):
+        commands = value(later["status"], "scheduler.prefill_batches", 0) - value(
+            earlier["status"], "scheduler.prefill_batches", 0
+        )
+        if commands > 0:
+            rows = value(later["status"], "scheduler.prefill_rows", 0) - value(
+                earlier["status"], "scheduler.prefill_rows", 0
+            )
+            sizes.append(rows / commands)
+    ordered = sorted(sizes)
+    return {
+        "rows_per_unit": {
+            "intervals": len(ordered),
+            **{
+                f"p{round(q * 100)}": ordered[
+                    min(len(ordered) - 1, int(q * len(ordered)))
+                ]
+                for q in (0.1, 0.5, 0.9)
+            },
+            "max": ordered[-1],
+        }
+        if ordered
+        else None,
+        "pass_commands": counter_delta(run, "scheduler.pass_commands"),
+        "prefill_units": counter_delta(run, "scheduler.prefill_units"),
+    }
 
 
 def gap_bound(status: dict, share: float) -> dict | None:
@@ -804,6 +876,11 @@ def health(run: Run, machine: dict, gates: dict) -> dict:
         "capture_cuts_per_unit": counter_delta(run, "cache.capture_cuts") / units
         if units
         else None,
+        "bound_cuts": counter_delta(run, "scheduler.bound_cuts"),
+        "index_page_conflicts_per_15min": per_15_minutes(
+            run, "scheduler.index_page_conflicts"
+        ),
+        **unit_sizes(run),
         "tick_host_ms_p99": value(last, "loop.tick_host_ms.p99"),
         "value_per_gib": {
             a["name"]: a.get("value_per_gib")
@@ -916,8 +993,11 @@ def churn_cell(
     # run.py refused to measure or its surroundings voided (heat, other
     # processes, the laptop's owner) is listed under the runs not used, to be
     # repeated, and judged on G8 alone, which fails on the server's own
-    # failures it also shows.
-    g4_holds = True
+    # failures it also shows. G4 holds for a tree when none of its runs
+    # fails it: each candidate's own, never another tree's (the floor = cap
+    # control's), takes part in its gates. Index page conflicts past S's
+    # bound are reported to the owner (amend/S.md D1, AMENDMENTS X23).
+    g4_holds: dict[str, bool] = {}
     for run in runs:
         if run.tree not in cell.get("health", ["cand"]):
             continue
@@ -925,12 +1005,51 @@ def churn_cell(
             verdicts.extend(g8_verdict(cell, spec, run))
             continue
         facts = health(run, machine, gates)
-        g4_holds &= not any(f.startswith("G4") for f in facts["failures"])
+        g4_holds[run.tree] = g4_holds.get(run.tree, True) and not any(
+            f.startswith("G4") for f in facts["failures"]
+        )
         record(f"G4 G8 G9 {run.label}", FAIL if facts["failures"] else PASS, facts)
+        conflicts = facts["readouts"]["index_page_conflicts_per_15min"]
+        if (
+            conflicts is not None
+            and conflicts > gates["index_page_conflicts_per_15min"]
+        ):
+            record(
+                f"index page conflicts {run.label}",
+                "report",
+                {
+                    "per_15min": round(conflicts, 1),
+                    "bound": gates["index_page_conflicts_per_15min"],
+                },
+            )
+    throughput, ttft = release.get("throughput"), release.get("ttft")
     for candidate in cell.get("candidates", ["cand"]):
+        holds = g4_holds.get(candidate, True)
         if not any(r.tree == candidate for r in used):
+            # Its gates are not judged, and say so (owner OQ3: cells not run
+            # by the cut are reported as not run).
+            labels = sorted(
+                {r.label for r in runs if r.tree == candidate}
+                | {label for tree, label in not_run(cell, runs) if tree == candidate}
+            )
+            why = f"no usable {candidate} run: {', '.join(labels) or 'none planned'}"
+            rules = (
+                [
+                    f"{rule} {candidate} vs {throughput}"
+                    for rule in ("G1", "G2", "G2 decode")
+                ]
+                if throughput
+                else []
+            )
+            rules += [f"G3 {candidate} vs {ttft}"] if ttft else []
+            rules += (
+                [f"SSD {counter}" for counter in ssd_counters_of(cell)]
+                if cell.get("ssd")
+                else []
+            )
+            for rule in rules:
+                record(rule, INCONCLUSIVE, why)
             continue
-        throughput, ttft = release.get("throughput"), release.get("ttft")
         if throughput:
             estimates = {
                 m: compare(used, machine, prices, candidate, throughput, m)
@@ -946,7 +1065,7 @@ def churn_cell(
             gain = (
                 stats.clearly_better(pooled["ttft"], False)
                 or stats.clearly_better(pooled["latency"], False)
-                or (g4_holds and froze["reference_froze"])
+                or (holds and froze["reference_froze"])
                 or gains.get(cell["machine"], False)
             )
             for metric, rule in (
@@ -1002,8 +1121,8 @@ def churn_cell(
                 )
                 best = compare(used, machine, prices, candidate, kept, "ttft")["pooled"]
                 no_worse = stats.verdict(best, False, 0.0) != FAIL
-                result = PASS if g2 == PASS and g4_holds and no_worse else FAIL
-                why = f"OQ2: G2 {g2}, G4 {'holds' if g4_holds else 'fails'}, TTFT vs {kept} {stats.ratio_text(best)}"
+                result = PASS if g2 == PASS and holds and no_worse else FAIL
+                why = f"OQ2: G2 {g2}, G4 {'holds' if holds else 'fails'}, TTFT vs {kept} {stats.ratio_text(best)}"
             record(
                 f"G3 {candidate} vs {ttft}",
                 result,
@@ -1043,7 +1162,9 @@ def churn_cell(
                 {"ratio": stats.ratio_text(estimate)},
             )
     if cell.get("point_gate"):
-        verdicts.extend(point_gate(cell, used, prices, gates, g4_holds))
+        verdicts.extend(
+            point_gate(cell, used, prices, gates, g4_holds.get("cand", True))
+        )
     return verdicts
 
 
@@ -1087,16 +1208,21 @@ def point_gate(
     return verdicts
 
 
+def ssd_counters_of(cell: dict) -> list[str]:
+    """The SSD counters a cell's SSD rule compares (ssd_counters)."""
+    return cell.get(
+        "ssd_counters",
+        ["disk_read_per_work", "disk_written_per_work", "expert_read_per_work"],
+    )
+
+
 def ssd_rule(cell: dict, runs: list[Run], prices, candidate: str) -> list[dict]:
     """amend/V.md A30: SSD bytes per unit of work against each release
     reference, tolerance 0, sigma from the references' same-tree runs; FAIL
     when the candidate is surely higher than every reference."""
     verdicts = []
     references = cell["ssd"]
-    for counter in cell.get(
-        "ssd_counters",
-        ("disk_read_per_work", "disk_written_per_work", "expert_read_per_work"),
-    ):
+    for counter in ssd_counters_of(cell):
         groups: dict[tuple, list[float]] = {}
         for run in runs:
             if run.tree in (candidate, *references):
@@ -1642,7 +1768,7 @@ def serve1_prices(label: str, results: list[Path]) -> dict | None:
 def analyze(spec: dict, results: list[Path]) -> dict:
     runs = load_runs(spec, results)
     cells = {cell["name"]: cell for cell in spec["cells"]}
-    verdicts, invalid, gains = [], [], {}
+    verdicts, invalid, gains, legacy = [], [], {}, []
     for run in runs:
         validate(run, spec, cells[run.cell])
         if run.invalid:
@@ -1659,11 +1785,17 @@ def analyze(spec: dict, results: list[Path]) -> dict:
         scenario = cell.get("scenario")
         if scenario == "churn":
             cell_runs = [r for r in runs if r.cell == cell["name"]]
+            invalid += [
+                unused_entry(cell, label, tree, ["not run"])
+                for tree, label in not_run(cell, cell_runs)
+            ]
             prices = cell.get("prices") or (
                 serve1_prices(cell["prices_from"], results)
                 if cell.get("prices_from")
                 else None
             )
+            if prices is not None:
+                legacy += legacy_sets(cell, cell_runs, prices)
             if not any(r.tree in cell.get("health", ["cand"]) for r in cell_runs):
                 verdicts.append(
                     {
@@ -1694,6 +1826,7 @@ def analyze(spec: dict, results: list[Path]) -> dict:
         "spec": spec["path"],
         "verdicts": verdicts,
         "invalid": invalid,
+        "legacy": legacy,
         "generated": time.time(),
     }
 
@@ -1725,6 +1858,36 @@ def verdict_markdown(document: dict) -> str:
         f"- {r['cell']} {r['label']} ({r['tree']}): {'; '.join(r['reasons'])}"
         for r in document["invalid"]
     ] or ["- none"]
+    lines += ["", "## Per-run numbers (bin/cmp.py, pertag.py)"]
+
+    def number(value):
+        return "-" if value is None else f"{value:.0f}"
+
+    for found in document["legacy"]:
+        rows = found["cmp"]
+        lines += [
+            "",
+            f"### {found['cell']} order {found['order']}: {rows[0]['common']} common tags",
+            "",
+        ]
+        lines += [
+            f"    {row['label']:7s} done={row['done']:2d} work650={number(row['work650']):>6} "
+            f"work900={number(row['work900']):>6}  common ttft={row['ttft']:6.1f} "
+            f"lat={row['lat']:6.1f} maxlat={row['maxlat']:5.0f}"
+            for row in rows
+        ]
+        lines += [
+            f"    {summary['label']}: common n={summary['common']} ttft_mean={summary['ttft_mean']:.0f} "
+            f"lat_mean={summary['lat_mean']:.0f}; extra=["
+            + ", ".join(
+                f"('{tag}', {ttft}, {latency})"
+                for tag, ttft, latency in summary["extra"]
+            )
+            + "]"
+            for summary in found["pertag"]["summary"]
+        ]
+    if not document["legacy"]:
+        lines += ["", "- none"]
     return "\n".join(lines) + "\n"
 
 
@@ -2096,8 +2259,10 @@ def main(argv=None) -> int:
     )
     (out / "verdict.md").write_text(verdict_markdown(document))
     failed = [v for v in document["verdicts"] if v["verdict"] == FAIL]
+    open_ = [v for v in document["verdicts"] if v["verdict"] == INCONCLUSIVE]
     print(
-        f"{len(document['verdicts'])} verdicts, {len(failed)} FAIL, {len(document['invalid'])} runs not used"
+        f"{len(document['verdicts'])} verdicts, {len(failed)} FAIL, {len(open_)} INCONCLUSIVE, "
+        f"{len(document['invalid'])} runs not used"
     )
     return 0
 
