@@ -15,6 +15,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <memory>
 #include <span>
 #include <string>
 #include <vector>
@@ -291,6 +292,29 @@ void testTimedCommandsServeTheExpertsPool() {
           "the decodes did not serve the pool their rows' routing");
 }
 
+// With a rate, the harness's tier lands a transfer a slot's bytes at that
+// rate after it starts, a restore once submitted (the cache submits its
+// restores as it ticks), and the harness clock moves to the next landing.
+void testTheTierLandsTransfersAtItsRate() {
+  test::EngineHarness harness({.tier = test::TierOptions{.bytesPerMillisecond = 0.5}});
+  test::TestKvTier &tier = *harness.tier;
+  const auto slot = [&] { return tier.acquireSlot(model::DiskBudget::Draw::Cache); };
+  const std::unique_ptr<engine::KvTransfer> write = tier.demote(3, slot(), engine::WriteClass::Reclaim, {});
+  const std::unique_ptr<engine::KvTransfer> read = tier.restore(slot(), 4, {});
+  require(tier.nextLanding() == 201.0, "the write is not due a slot's bytes at the rate after it started");
+  harness.advanceTo(200.0);
+  require(!write->ready(), "a write landed before it was due");
+  harness.advanceTo(201.0);
+  require(write->ready() && !read->ready(), "the write did not land when due, or an unsubmitted restore did");
+  tier.submitRestores();
+  harness.advanceTo(201.0);
+  require(read->ready(), "a submitted restore that was due did not land");
+  require(write->finish() && read->finish(), "a landed transfer failed");
+  const std::unique_ptr<engine::KvTransfer> next = tier.demote(5, slot(), engine::WriteClass::Reclaim, {});
+  harness.runUntil([&] { return next->ready(); }, "the next write did not land");
+  require(harness.now() == 401.0, "the clock moved to " + std::to_string(harness.now()) + ", not the landing");
+}
+
 // Noise is seeded: one seed gives the same walls run after run, another
 // different ones.
 void testNoiseIsSeeded() {
@@ -326,6 +350,7 @@ int main(int argc, char **argv) {
       {"ticketsSampleTheirWorkAndWaitForTheirEnd", testTicketsSampleTheirWorkAndWaitForTheirEnd},
       {"theHarnessClockRunsCommandsForTheirTime", testTheHarnessClockRunsCommandsForTheirTime},
       {"timedCommandsServeTheExpertsPool", testTimedCommandsServeTheExpertsPool},
+      {"theTierLandsTransfersAtItsRate", testTheTierLandsTransfersAtItsRate},
       {"noiseIsSeeded", testNoiseIsSeeded},
   };
   const test::TestGroup groups[] = {{"timing-profile", kTests}};
