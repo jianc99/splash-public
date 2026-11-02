@@ -1301,6 +1301,14 @@ int streamedPool(MetalBackend &backend, const MoeShape &shape, const std::filesy
       !(ghosts.missMilliseconds > 0))
     fail("decode steps after the shrinks counted " + std::to_string(ghosts.ghostHits - ghostsBefore.ghostHits) +
          " ghost hits over " + std::to_string(ghosts.ghostBytes) + " bytes");
+  // Of their ghost hits, those on experts given up within a chunk's slots are
+  // a chunk's more, and some of their hits are a chunk's less.
+  const ExpertStoreStats ghostsAfter = store.stats();
+  if (ghostsAfter.nearGhostHits - ghostsBefore.nearGhostHits > ghostsAfter.ghostHits - ghostsBefore.ghostHits ||
+      ghostsAfter.tailHits <= ghostsBefore.tailHits)
+    fail("decode steps after the shrinks counted " +
+         std::to_string(ghostsAfter.nearGhostHits - ghostsBefore.nearGhostHits) + " ghost hits within a chunk and " +
+         std::to_string(ghostsAfter.tailHits - ghostsBefore.tailHits) + " hits a chunk less would give up");
   // Released, it holds nothing.
   store.release();
   if (pool.state().currentBytes || pool.state().floorBytes || pool.state().releaseUnitBytes ||

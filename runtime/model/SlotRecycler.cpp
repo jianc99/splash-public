@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <bit>
 #include <stdexcept>
+#include <utility>
 
 namespace splash::model {
 namespace {
@@ -85,9 +86,43 @@ void SlotRecycler::Links::replace(Order &order, uint32_t at, uint32_t by) noexce
   (next[at] == kNone ? order.tail : previous[next[at]]) = by;
 }
 
-SlotRecycler::SlotRecycler(uint32_t slots) { resize(slots); }
+SlotRecycler::SlotRecycler(uint32_t slots, uint32_t margin) : margin_(margin) { resize(slots); }
+
+void SlotRecycler::joinTail(uint32_t slot, List list, bool leastRecent) noexcept {
+  tail_[slot] = 0;
+  if (!margin_) return;
+  const uint32_t count = slots(list).count;
+  uint32_t &end = tailEnd_[list == Frequent];
+  if (!leastRecent) {
+    if (count <= margin_) {
+      tail_[slot] = 1;
+      end = slot;
+    }
+    return;
+  }
+  tail_[slot] = 1;
+  if (count == 1) {
+    end = slot;
+  } else if (count > margin_) {
+    tail_[end] = 0;
+    end = links_.previous[end];
+  }
+}
+
+void SlotRecycler::leaveTail(uint32_t slot, List list) noexcept {
+  if (!tail_[slot]) return;
+  tail_[slot] = 0;
+  uint32_t &end = tailEnd_[list == Frequent];
+  if (const uint32_t past = links_.next[end]; past != kNone) {
+    tail_[past] = 1;
+    end = past;
+  } else if (slot == end) {
+    end = links_.previous[slot];
+  }
+}
 
 void SlotRecycler::unlink(uint32_t slot) {
+  leaveTail(slot, List(list_[slot]));
   links_.unlink(slots(List(list_[slot])), slot);
   list_[slot] = Free;
 }
@@ -95,11 +130,13 @@ void SlotRecycler::unlink(uint32_t slot) {
 void SlotRecycler::append(uint32_t slot, List list) {
   list_[slot] = list;
   links_.append(slots(list), slot);
+  joinTail(slot, list, false);
 }
 
 void SlotRecycler::prepend(uint32_t slot, List list) {
   list_[slot] = list;
   links_.prepend(slots(list), slot);
+  joinTail(slot, list, true);
 }
 
 uint32_t SlotRecycler::oldest(List list, uint64_t load) const {
@@ -116,6 +153,7 @@ void SlotRecycler::addGhost(uint64_t key, List list) {
   freeGhosts_.pop_back();
   ghostKey_[ghost] = key;
   ghostList_[ghost] = list;
+  ghostMade_[ghost] = ++ghostsMade_;
   ghostLinks_.append(ghosts(list), ghost);
   ghostOf_.insert(key, ghost);
 }
@@ -140,6 +178,7 @@ void SlotRecycler::keepGhosts(uint32_t slots) {
         freeGhosts_.pop_back();
         ghostKey_[place] = ghostKey_[ghost];
         ghostList_[place] = ghostList_[ghost];
+        ghostMade_[place] = ghostMade_[ghost];
         ghostLinks_.replace(*order, ghost, place);
         ghostOf_.erase(ghostKey_[ghost]);
         ghostOf_.insert(ghostKey_[place], place);
@@ -165,8 +204,7 @@ void SlotRecycler::evict(uint32_t slot, bool ghost) {
 }
 
 uint32_t SlotRecycler::replace(uint64_t load, bool frequentGhost) {
-  const bool fromRecent =
-      recent_.count && (recent_.count > target_ || (frequentGhost && recent_.count == target_));
+  const bool fromRecent = recyclesRecent(frequentGhost);
   uint32_t slot = oldest(fromRecent ? Recent : Frequent, load);
   if (slot == kNone) slot = oldest(fromRecent ? Frequent : Recent, load);
   if (slot == kNone) throw std::runtime_error("a slot recycler holds fewer slots than one load's keys");
@@ -184,6 +222,7 @@ void SlotRecycler::touch(uint32_t slot, uint64_t load, bool chunk) {
   lastLoad_[slot] = load;
   // A scan moves nothing; another use makes a key of T1 frequent.
   if (chunk) return;
+  if (tail_[slot] && list_[slot] == (recyclesRecent(false) ? Recent : Frequent)) ++tailHits_;
   unlink(slot);
   scan_[slot] = 0;
   append(slot, Frequent);
@@ -208,6 +247,7 @@ uint32_t SlotRecycler::claim(uint64_t key, uint64_t load, bool chunk) {
     const uint64_t step = std::max<uint64_t>(1, other.count / mine.count);
     target_ = gaveUp == Recent ? std::min<uint64_t>(slots, target_ + step) : target_ > step ? target_ - step : 0;
     ++ghostHits_;
+    if (ghostsMade_ - ghostMade_[ghost] < margin_) ++nearGhostHits_;
     dropGhost(ghost);
     slot = take(gaveUp == Frequent);
     frequent = true;
@@ -256,6 +296,8 @@ void SlotRecycler::free(uint32_t slot) {
 
 void SlotRecycler::reset() {
   recent_ = frequent_ = {};
+  std::ranges::fill(tail_, uint8_t{0});
+  tailEnd_[0] = tailEnd_[1] = kNone;
   slotOf_.clear();
   forgetGhosts();
   target_ = 0;
@@ -278,6 +320,7 @@ void SlotRecycler::resize(uint32_t slots) {
   }
   list_.resize(slots, Free);
   scan_.resize(slots, 0);
+  tail_.resize(slots, 0);
   links_.previous.resize(slots);
   links_.next.resize(slots);
   key_.resize(slots);
@@ -287,6 +330,7 @@ void SlotRecycler::resize(uint32_t slots) {
   // As many ghosts as slots: more add free ones.
   ghostKey_.resize(slots);
   ghostList_.resize(slots);
+  ghostMade_.resize(slots);
   ghostLinks_.previous.resize(slots);
   ghostLinks_.next.resize(slots);
   if (!fewer)
@@ -324,6 +368,8 @@ void SlotRecycler::compact(uint32_t slots, const std::function<void(uint32_t)> &
     links_.replace(this->slots(list), from, to);
     list_[to] = list;
     list_[from] = Free;
+    tail_[to] = std::exchange(tail_[from], uint8_t{0});
+    if (uint32_t &end = tailEnd_[list == Frequent]; end == from) end = to;
     key_[to] = key_[from];
     lastLoad_[to] = lastLoad_[from];
     scan_[to] = scan_[from];

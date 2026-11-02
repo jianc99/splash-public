@@ -40,7 +40,9 @@ namespace splash::model {
 class SlotRecycler final {
 public:
   // `slots` slots, every one free.
-  explicit SlotRecycler(uint32_t slots);
+  // `margin` is the slots one unit of the store adds or gives back, which the
+  // marginal counts count in (0: none).
+  explicit SlotRecycler(uint32_t slots, uint32_t margin = 0);
 
   // The slot that holds `key`, if any.
   [[nodiscard]] std::optional<uint32_t> find(uint64_t key) const noexcept;
@@ -77,6 +79,13 @@ public:
   [[nodiscard]] uint64_t ghostHits() const noexcept { return ghostHits_; }
   // The keys T1 and T2 gave up lately (|B1| + |B2|), at most size().
   [[nodiscard]] uint32_t ghosts() const noexcept { return recentGhosts_.count + frequentGhosts_.count; }
+  // The marginal counts, of uses that are not a scan's: the ghost hits on a
+  // key among the last `margin` keys given up as ghosts, which a unit more
+  // would have held, and the touches of a key among the `margin` least
+  // recently used of the list REPLACE recycles from now, which a unit less
+  // would have given up first.
+  [[nodiscard]] uint64_t nearGhostHits() const noexcept { return nearGhostHits_; }
+  [[nodiscard]] uint64_t tailHits() const noexcept { return tailHits_; }
 
 private:
   enum List : uint8_t { Free, Recent, Frequent };
@@ -129,6 +138,17 @@ private:
   // key T2 gave up claims it): its key becomes a ghost, unless a scan brought
   // it.
   [[nodiscard]] uint32_t replace(uint64_t load, bool frequentGhost);
+  // Whether REPLACE recycles from T1 now (`frequentGhost` when the key T2
+  // gave up claims the slot), else from T2.
+  [[nodiscard]] bool recyclesRecent(bool frequentGhost) const noexcept {
+    return recent_.count && (recent_.count > target_ || (frequentGhost && recent_.count == target_));
+  }
+  // The tail of a list, its margin_ least recently used slots (tail_, the
+  // last of them tailEnd_): `slot`, just linked at the list's least or most
+  // recently used end, joins it or not; `slot`, about to be unlinked,
+  // leaves it, and the slot past the tail joins it.
+  void joinTail(uint32_t slot, List list, bool leastRecent) noexcept;
+  void leaveTail(uint32_t slot, List list) noexcept;
   // `slot` leaves its list and gives its key up, as a ghost or not.
   void evict(uint32_t slot, bool ghost);
   void addGhost(uint64_t key, List list);
@@ -156,6 +176,15 @@ private:
   // T1's target size.
   uint64_t target_ = 0;
   uint64_t ghostHits_ = 0;
+  // The marginal counts: the margin, each slot's place in its list's tail
+  // and the tails' last slots (T1's, T2's), each ghost's number among those
+  // made and how many were made, and the counts.
+  uint32_t margin_ = 0;
+  std::vector<uint8_t> tail_;
+  uint32_t tailEnd_[2] = {UINT32_MAX, UINT32_MAX};
+  std::vector<uint64_t> ghostMade_;
+  uint64_t ghostsMade_ = 0;
+  uint64_t nearGhostHits_ = 0, tailHits_ = 0;
 };
 
 } // namespace splash::model

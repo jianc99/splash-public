@@ -961,13 +961,15 @@ void ExpertStore::Impl::publish() {
       shrinking == kNoSlot ? 0 : sizes[shrinking].buffers[sizes[shrinking].chunks.liveChunks() - 1].sizeBytes();
   counters.growUnitBytes =
       growing == kNoSlot ? 0 : sizes[growing].buffers[sizes[growing].chunks.liveChunks()].sizeBytes();
-  counters.ghostHits = counters.ghostBytes = 0;
+  counters.ghostHits = counters.ghostBytes = counters.nearGhostHits = counters.tailHits = 0;
   for (const Size &size : sizes) {
     uint64_t slotBytes = 0;
     for (const ProjectionLayout &projection : size.layout)
       for (const uint64_t plane : projection.planes) slotBytes += plane;
     counters.ghostHits += size.recycling.ghostHits();
     counters.ghostBytes += size.recycling.ghosts() * slotBytes;
+    counters.nearGhostHits += size.recycling.nearGhostHits();
+    counters.tailHits += size.recycling.tailHits();
   }
   const std::lock_guard lock(statsMutex);
   published = counters;
@@ -1170,7 +1172,7 @@ ExpertStore::ExpertStore(metal::MetalBackend &backend, StreamedBlocks streamed, 
     size.chunks = ops::ExpertChunks::of(std::move(planes), chunks.floorSlots, chunks.chunkSlots, size.slots,
                                         size.routed[0], size.routed[1], size.routed[2]);
     size.chunks.keep(chunks.floorChunks);
-    size.recycling = SlotRecycler(chunks.first(chunks.floorChunks));
+    size.recycling = SlotRecycler(chunks.first(chunks.floorChunks), chunks.chunkSlots);
     size.ownerBlock.assign(size.slots, kNoSlot);
     size.ownerExpert.assign(size.slots, kNoSlot);
   }

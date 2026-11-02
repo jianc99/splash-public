@@ -42,6 +42,11 @@ struct ExpertStoreStats final {
   // (SlotRecycler::ghostHits), and the slots those ghosts would take now.
   uint64_t ghostHits = 0;
   uint64_t ghostBytes = 0;
+  // The hits one elastic chunk decides (SlotRecycler::nearGhostHits,
+  // tailHits): ghost hits a chunk more would have served, and hits on the
+  // experts a chunk less would have given up first.
+  uint64_t nearGhostHits = 0;
+  uint64_t tailHits = 0;
   // Per ops::MoePhase, at its value (uses[0] prefill, uses[1] decode): the
   // blocks loaded, the distinct experts they routed, those not resident and
   // of them those read ahead, the experts read ahead whole (routed or not),

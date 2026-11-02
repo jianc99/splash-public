@@ -13,7 +13,9 @@
 // within ARC's bounds, and leaves no key or claim past the slots; one straight
 // to fewer slots keeps the keys compactions a chunk at a time keep, moving
 // each once at most. Its ghosts are at most its slots, none from a scan or
-// after a reset. On the
+// after a reset. A unit of slots counts the ghost hits on the keys it gave up
+// last and the touches of the keys it would give up first, also after a
+// compaction. On the
 // decode selections of real requests
 // (dev/tests/fixtures/kv-selection-traces, the directory the test takes), the
 // hot block cache's resolves miss at most 2% more than recycling the least
@@ -173,6 +175,51 @@ void countsItsGhosts() {
   SlotRecycler scans(4);
   for (uint64_t key = 0; key < 12; ++key) static_cast<void>(scans.claim(key, key + 1, true));
   require(scans.ghosts() == 0, "a scan's claims left ghosts");
+}
+
+// With a margin of two slots: a ghost hit on one of the two keys given up as
+// ghosts last is a unit's more, one on an older ghost is not; a touch of one
+// of the two least recently used keys of the list REPLACE recycles from is a
+// unit's less, of another key, of T2's while T1 is recycled, or a scan's is
+// not; a compaction keeps each list's tail.
+void countsMarginalHits() {
+  {
+    SlotRecycler slots(4, 2);
+    for (uint64_t key = 0; key < 4; ++key) static_cast<void>(slots.claim(key, 1, false));
+    slots.touch(*slots.find(0), 2, false);
+    slots.touch(*slots.find(1), 2, false);
+    // T1 holds 2, 3 and gives them up as ghosts for 4 and 5, then 4 for 6,
+    // after it dropped ghost 2: B1 holds 3, then 4, the last ghost made.
+    for (uint64_t key = 4; key < 7; ++key) static_cast<void>(slots.claim(key, key - 1, false));
+    require(!slots.find(2) && !slots.find(3) && !slots.find(4) && slots.ghosts() == 2,
+            "T1 did not give up 2, 3 and 4 for the new keys");
+    static_cast<void>(slots.claim(4, 6, false));
+    require(slots.ghostHits() == 1 && slots.nearGhostHits() == 1, "the last ghost's hit was not a unit's more");
+    // Recycling for 4 gave up 5 as a ghost, so 3 is the third ghost made last.
+    static_cast<void>(slots.claim(3, 7, false));
+    require(slots.ghostHits() == 2 && slots.nearGhostHits() == 1, "an older ghost's hit was a unit's more");
+  }
+  SlotRecycler slots(8, 2);
+  for (uint64_t key = 1; key <= 8; ++key) static_cast<void>(slots.claim(key, 1, false));
+  const auto touch = [&](uint64_t key, uint64_t load, bool chunk) { slots.touch(*slots.find(key), load, chunk); };
+  // T1 1..8, recycled from: 1 and 2 are its tail.
+  touch(1, 2, false);
+  require(slots.tailHits() == 1, "a touch of T1's least recently used key was not a unit's less");
+  touch(5, 2, false);
+  require(slots.tailHits() == 1, "a touch of a key past T1's tail was a unit's less");
+  touch(2, 2, false);
+  require(slots.tailHits() == 2, "the key that joined T1's tail did not count");
+  // T2 1, 5, 2; T1 3, 4, 6, 7, 8, recycled from.
+  touch(1, 3, false);
+  touch(3, 3, true);
+  require(slots.tailHits() == 2, "a touch of T2's tail while T1 is recycled, or a scan's, was a unit's less");
+  // To six slots: 3 and 4 go first, 7 and 8 move below; T1's tail is 6, 7.
+  slots.compact(6, [](uint32_t) {}, [](uint32_t, uint32_t) {});
+  require(!slots.find(3) && !slots.find(4) && slots.find(7) && slots.find(8), "the compaction kept 3 or 4");
+  touch(8, 4, false);
+  require(slots.tailHits() == 2, "a compaction put the key past T1's tail into it");
+  touch(7, 4, false);
+  require(slots.tailHits() == 3, "a compaction lost a key of T1's tail");
 }
 
 void resizes() {
@@ -395,14 +442,14 @@ void aRoutedCoreOutlivesMoreLanes() {
 
 void claimsAllocateNothing() {
   // Loads of 32 keys used again and again and 16 of 56 others in turn: the
-  // 64 slots recycle the others, which come back as ghosts; every seventh
-  // load is a scan, and every fiftieth frees a slot.
+  // 64 slots, counted in units of 16, recycle the others, which come back as
+  // ghosts; every seventh load is a scan, and every fiftieth frees a slot.
   std::vector<std::vector<uint64_t>> loads(400);
   for (size_t load = 0; load < loads.size(); ++load) {
     for (uint64_t key = 0; key < 32; ++key) loads[load].push_back(key);
     for (uint64_t other = 0; other < 16; ++other) loads[load].push_back(1000 + (load * 16 + other) % 56);
   }
-  SlotRecycler slots(64);
+  SlotRecycler slots(64, 16);
   uint64_t before = 0;
   for (uint64_t load = 1; load <= loads.size(); ++load) {
     if (load == 100) before = allocations;
@@ -414,7 +461,8 @@ void claimsAllocateNothing() {
     if (load % 50 == 0) slots.free(*slots.find(keys.front()));
   }
   require(allocations == before, "a claim allocated: " + std::to_string(allocations - before) + " allocations");
-  require(slots.ghostHits() > 0, "the loads hit no ghost");
+  require(slots.ghostHits() > 0 && slots.nearGhostHits() <= slots.ghostHits(),
+          "the loads hit no ghost, or more ghosts within a unit than ghosts");
 }
 
 // The decode selections of real requests: the blocks each attention layer
@@ -548,6 +596,7 @@ int main(int argc, char **argv) {
     freeSlotsFirst();
     findsWhatItHolds();
     countsItsGhosts();
+    countsMarginalHits();
     resizes();
     compactsInRecencyOrder();
     compactsAtTheTarget();
