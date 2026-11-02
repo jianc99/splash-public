@@ -5851,6 +5851,76 @@ void testHeldPagesStayFree() {
   cache.endRequest(1);
 }
 
+// A demotion returns its page as it lands; a restore frees nothing as it
+// lands, so the walk's answer counts none, though a restore holds back what
+// a reclaim would take (transfersInFlight).
+void testRestoresReturnNothing() {
+  test::TestKvTier tier;
+  CacheFixture fixture(&tier);
+  auto control = std::make_shared<TransferControl>();
+  control->ready = true;
+  fixture.cache.publishCompositeState(fixture.blocks[3], std::make_shared<TieredState>(control), false);
+  require(reclaimStateBytes(fixture.cache, CacheReclaimMode::KeepExtents) == 100 && fixture.cache.pollTransfers() &&
+              fixture.cache.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::InUse).madeProgress,
+          "the leaf was not demoted");
+  const Returning demoting = fixture.cache.returning();
+  require(demoting.transfers == 1 && demoting.landingPages[static_cast<size_t>(kv::PageForm::Full)] == 1 &&
+              !demoting.owedPages[static_cast<size_t>(kv::PageForm::Full)],
+          "a demotion in flight did not return its page");
+  tier.complete();
+  require(fixture.cache.pollTransfers() && fixture.pool.freePageCount() == 1, "the leaf did not land");
+  auto lookup = fixture.lookup(129);
+  fixture.cache.beginRequest(2);
+  require(admitRestore(fixture.cache, 2, lookup).granted() && fixture.cache.transfersInFlight(),
+          "the restore did not start");
+  const Returning restoring = fixture.cache.returning();
+  require(!restoring.transfers && restoring.landingPages == std::array<uint32_t, 3>{} && !restoring.landingBytes &&
+              fixture.cache.returningFor(2).landingPages == std::array<uint32_t, 3>{},
+          "a restore counted as memory on its way back");
+  tier.complete();
+  static_cast<void>(fixture.cache.pollTransfers());
+  lookup = {};
+  fixture.cache.endRequest(2);
+}
+
+// What spilling returns: landing, the pages written through that spill once
+// their copies land, as far as free Index pages take them, and none of a
+// dense history's; owed, the copies not started yet of the pages that spill
+// once copied, all of them, while a copy is written. A request's own count
+// leaves another's out.
+void testReturningSplitsLandingAndOwed() {
+  Spilling spill(CacheSpillPolicy{1, 1});
+  spill.tier.writeLimits[static_cast<size_t>(WriteClass::Spill)] = 2;
+  spill.start(1, Spilling::prompt(1000, 8), 8);
+  spill.start(2, Spilling::prompt(5000, 4), 4);
+  require(spill.cache.writeThrough() == 2, "the first copies were not written");
+  // Request 1's dense page and its second, past the dense history: the
+  // second spills once it lands. Pages 2 to 6 spill once copied, the last
+  // stays in its window; request 2's pages 1 and 2 spill once copied.
+  constexpr auto full = static_cast<size_t>(kv::PageForm::Full);
+  const Returning all = spill.cache.returning();
+  const Returning first = spill.cache.returningFor(1);
+  const Returning second = spill.cache.returningFor(2);
+  require(all.transfers == 1 && all.landingPages[full] == 1 && all.owedPages[full] == 7,
+          "the spilling writes and the owed copies were not split into landing and owed");
+  require(first.transfers == 1 && first.landingPages[full] == 1 && first.owedPages[full] == 5 &&
+              !second.transfers && !second.landingPages[full] && second.owedPages[full] == 2,
+          "a request's own count took in another's pages");
+  // With no free Index page a landing spills nothing; the owed copies count
+  // all the same.
+  KvPageAcquisition index = spill.pool.acquirePages(spill.pool.freePageCount(kv::PageForm::Index), kv::PageForm::Index);
+  const Returning capped = spill.cache.returning();
+  require(index.granted() && !capped.landingPages[full] && capped.owedPages[full] == 7,
+          "the landing pages were not capped by the free Index pages, or the owed copies were");
+  for (const uint32_t page : index.pages)
+    spill.pool.releasePage(page, false);
+  spill.tier.complete();
+  static_cast<void>(spill.cache.pollTransfers());
+  require(!spill.cache.returning().owedPages[full], "copies were owed while none was written");
+  spill.cache.endRequest(1);
+  spill.cache.endRequest(2);
+}
+
 int main() {
   try {
     testStateInUseGoesLast();
@@ -6010,6 +6080,8 @@ int main() {
     testFullShortfallsKeepTheTailsOfStatesTheSsdKeeps();
     testFullShortfallsAtTheWallTakeDeadLeavesFirst();
     testHeldPagesStayFree();
+    testRestoresReturnNothing();
+    testReturningSplitsLandingAndOwed();
     std::cout << "engine cache tests passed\n";
     return 0;
   } catch (const std::exception &error) {

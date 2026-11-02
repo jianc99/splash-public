@@ -689,8 +689,21 @@ public:
                                                    const engine::Victim *after) const override;
   FreeResult take(const VictimQuery &query, const engine::Victim &victim) override;
   // What the transfers in flight and the copies Spill requests owe free as
-  // they land.
+  // they land. Landing: demotions, by the form of their pages, and the pages
+  // Spill requests hold, written through or copied ahead, that spill once
+  // their copies land, as far as free Index pages take them. Owed: the
+  // copies Spill requests owe of the pages that spill once copied, while the
+  // SSD cache writes their copies (a Spill write in flight), all of them: the
+  // Full extents they empty fund their Index pages. The bytes are the whole
+  // extents those pages add to the free pages of their form, which
+  // compaction returns. A restore frees nothing, nor does the state write,
+  // whose RAM copy left as it started, nor a copy ahead of a page that stays.
   [[nodiscard]] Returning returning() const noexcept;
+  // What returning() counts of the request's own pages: those of its page
+  // table, written through or copied ahead, that spill once their copies
+  // land, as far as free Index pages take them, and the copies it owes.
+  [[nodiscard]] Returning returningFor(uint64_t requestId) const noexcept;
+
   // The chains the requests waiting to start restore (their admission
   // probes): units on them are of certain reuse.
   void setWantedChains(std::vector<std::span<const uint64_t>> chains);
@@ -922,6 +935,7 @@ private:
     uint64_t block = 0;
     WriteClass write = WriteClass::Reclaim;
     std::unique_ptr<KvTransfer> transfer;
+    AwakeClock::time_point started = AwakeClock::now();
   };
   struct Restore final {
     // Null until the tier has room for it.
@@ -1210,6 +1224,12 @@ private:
   // holds those writes back (the tier's share, the quota, a file that takes
   // none) holds the owed ones back too.
   [[nodiscard]] uint32_t copiesToSpill(uint32_t enough) const;
+  // The bytes of the whole extents `pages` pages add to the free pages of
+  // their form (Returning).
+  [[nodiscard]] uint64_t extentsCompleted(kv::PageForm form, uint32_t pages) const noexcept;
+  // Returning's count of the request's writes and owed copies, or of every
+  // request's without one.
+  [[nodiscard]] Returning returningOf(const Request *active) const noexcept;
   // Rescans every Spill request's blocks from its dense history: a holder
   // that kept some of them Full ended or began to spill.
   void rescanSpills() noexcept;

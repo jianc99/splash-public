@@ -546,6 +546,60 @@ TokenAdmission Cache::admitPages(uint32_t count, std::vector<uint32_t> &pages,
   return {};
 }
 
+Returning Cache::returning() const noexcept { return returningOf(nullptr); }
+
+Returning Cache::returningFor(uint64_t requestId) const noexcept {
+  const auto found = requests_.find(requestId);
+  return found == requests_.end() ? Returning{} : returningOf(&found->second);
+}
+
+Returning Cache::returningOf(const Request *active) const noexcept {
+  Returning result;
+  // A request's own pages: the blocks of its page table on its pages.
+  const auto own = [&](uint64_t block) {
+    if (!active)
+      return true;
+    const uint32_t index = kv_.chainLength(block) - 1;
+    return index < active->cachedBlocks.size() && active->cachedBlocks[index] == block &&
+           active->pages[index] == kv_.page(block);
+  };
+  uint32_t spilling = 0;
+  for (const Write &write : writes_) {
+    if (!own(write.block))
+      continue;
+    if (write.write == WriteClass::Reclaim)
+      ++result.landingPages[static_cast<size_t>(pool_.form(kv_.page(write.block)))];
+    else if (spill_ && spillsOnLanding(write))
+      ++spilling;
+    else
+      continue;
+    ++result.transfers;
+    result.oldestMilliseconds = std::max(result.oldestMilliseconds, millisecondsSince(write.started));
+  }
+  constexpr auto full = static_cast<size_t>(kv::PageForm::Full);
+  result.landingPages[full] += std::min(spilling, pool_.freePageCount(kv::PageForm::Index));
+  if (spill_ && writes(WriteClass::Spill)) {
+    // Requests on one prefix owe its blocks each.
+    std::unordered_set<uint64_t> owed;
+    for (const auto &[_, holder] : requests_)
+      if (holder.mode == KvMode::Spill && (!active || &holder == active))
+        for (const uint64_t block : holder.owedCopies)
+          if (spillEligibility(block) == Eligibility::Eligible)
+            owed.insert(block);
+    result.owedPages[full] = static_cast<uint32_t>(owed.size());
+  }
+  for (const kv::PageForm form : {kv::PageForm::Full, kv::PageForm::Slim, kv::PageForm::Index})
+    result.landingBytes += extentsCompleted(form, result.landingPages[static_cast<size_t>(form)]);
+  result.owedBytes = extentsCompleted(kv::PageForm::Full, result.landingPages[full] + result.owedPages[full]) -
+                     extentsCompleted(kv::PageForm::Full, result.landingPages[full]);
+  return result;
+}
+
+uint64_t Cache::extentsCompleted(kv::PageForm form, uint32_t pages) const noexcept {
+  const uint32_t extent = pool_.extentPages(), free = pool_.freePageCount(form);
+  return uint64_t{(free + pages) / extent - free / extent} * extent * pool_.bytesPerPage(form);
+}
+
 std::optional<engine::Victim> Cache::peek(const VictimQuery &, const engine::Victim *) const {
   throw std::logic_error("M2");
 }
