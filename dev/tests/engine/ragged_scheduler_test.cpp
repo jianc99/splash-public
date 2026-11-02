@@ -744,8 +744,7 @@ void testAPrefillsPriceIsTheCostModels() {
 
 // S-P5: a cold start's first contended agent turn is not underpriced as
 // with a host-wait seed (base: 1.09 s for a 3.2 s turn): seeded from the
-// warm-ups and the load, it prices within the clamp above its truth, which
-// the turn's own sample then trains in full.
+// warm-ups and the load, it prices within 25 % of its truth (DESIGN §7.5).
 void testColdSeedPricesTheFirstContendedTurn() {
   Sim sim(test::kM6FlashNextQ2, limits(8192, 48));
   sim.seed();
@@ -755,8 +754,8 @@ void testColdSeedPricesTheFirstContendedTurn() {
   const double truth =
       test::prefillTimes(sim.work.profile(), sim.work.prefillWork(sim.lanes(turn), 0, 1)).wallMilliseconds;
   const double price = sim.price(turn);
-  require(price >= truth && price <= 2.0 * truth,
-          "the first turn's price " + std::to_string(price) + " ms is not within the clamp above its " +
+  require(std::abs(price - truth) <= 0.25 * truth,
+          "the first turn's price " + std::to_string(price) + " ms is not within 25 % of its " +
               std::to_string(truth) + " ms");
 }
 
