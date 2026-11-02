@@ -42,6 +42,9 @@ constexpr double kPrefillTimeWeight = 0.25;
 // (observePrefill).
 constexpr double kPrefillHostSpread = double{model::ExecutionLimits::prefillTokenBudget} *
                                       model::ExecutionLimits::prefillTokenBudget;
+// The weight a decode command's time per token keeps against the next
+// command's in the decode time per token (decodeTokenMilliseconds).
+constexpr double kDecodeTokenDecay = 0.9;
 
 // A command excludes at most the lanes of a full batch: a linear search.
 bool listed(std::span<const uint64_t> ids, uint64_t id) noexcept {
@@ -781,6 +784,16 @@ void Scheduler::complete(const BatchPlan &plan,
     if (plan.kind == WorkKind::Decode) {
       decodeDebtMilliseconds_ =
           std::max(0.0, decodeDebtMilliseconds_ - wallMilliseconds);
+      // Its time over the tokens a lane committed on average trains the
+      // decode time per token; a command whose lanes all ended in flight
+      // committed none and trains nothing.
+      uint32_t committed = 0;
+      for (const StepResult &result : results)
+        committed += result.committedTokens;
+      if (committed) {
+        decodeTokenTime_ = kDecodeTokenDecay * decodeTokenTime_ + wallMilliseconds * plan.width() / committed;
+        decodeTokenWeight_ = kDecodeTokenDecay * decodeTokenWeight_ + 1.0;
+      }
     } else if (streaming || decodeShare_ > 0.0) {
       const RequestPriority priority =
           get(plan.items.front().requestId).spec.priority;
@@ -862,6 +875,14 @@ void Scheduler::observePrefill(uint32_t rows, double wallMilliseconds,
                        (fit.weight * spread + kPrefillHostSpread);
   prefillMillisecondsPerToken_ = std::clamp(slope, 0.0, meanTime / meanRows);
   prefillFixedMilliseconds_ = meanTime - prefillMillisecondsPerToken_ * meanRows;
+}
+
+double Scheduler::prefillMilliseconds(const model::CommandWork &work) const noexcept {
+  return prefillMilliseconds(work.rows);
+}
+
+double Scheduler::decodeTokenMilliseconds() const noexcept {
+  return decodeTokenWeight_ > 0.0 ? decodeTokenTime_ / decodeTokenWeight_ : 0.0;
 }
 
 Phase Scheduler::phase(uint64_t id) const { return get(id).phase; }

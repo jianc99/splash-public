@@ -8,6 +8,7 @@
 #include "engine/ThermalState.hpp"
 #include "model/ExpertStoreStats.hpp"
 #include "model/KvReadStats.hpp"
+#include "model/LatencyHistogram.hpp"
 #include "model/SparseRowStore.hpp"
 
 #include <algorithm>
@@ -60,6 +61,12 @@ struct RuntimeMetricsSnapshot {
   double itlP50Milliseconds = 0.0;
   double itlP95Milliseconds = 0.0;
   uint32_t itlSamples = 0;
+  // Every gap a request saw between two of its token events after its first:
+  // the wall time from one TokensEvent to the next, undivided by the tokens
+  // the event carries (the ITL divides), whatever ran meanwhile (commands of
+  // other lanes, suspensions and replays, a constrained lane's mask round
+  // trip). Lifetime; quantiles within a factor of two, maximum exact.
+  model::LatencyStats decodeGap;
   double prefillTokensPerSecond = 0.0;
   double decodeTokensPerSecond = 0.0;
   // Lifetime native batch counters. Consumers take two status snapshots and
@@ -111,6 +118,7 @@ private:
   uint32_t latencyWindow_ = 0;
   std::deque<double> ttftMilliseconds_;
   std::deque<double> itlMilliseconds_;
+  model::LatencyHistogram decodeGaps_;
   uint64_t prefillTokens_ = 0;
   uint64_t decodeTokens_ = 0;
   double prefillWallMilliseconds_ = 0.0;
@@ -145,6 +153,8 @@ inline void RuntimeMetrics::tokens(
              nowMilliseconds >= *previousTokenMilliseconds) {
     append(itlMilliseconds_,
            (nowMilliseconds - *previousTokenMilliseconds) / count);
+    decodeGaps_.add(
+        uint64_t((nowMilliseconds - *previousTokenMilliseconds) * 1e6));
   } else {
     throw std::invalid_argument("metrics token clock moved backwards");
   }
@@ -200,6 +210,7 @@ inline RuntimeMetricsSnapshot RuntimeMetrics::snapshot() const {
   result.itlP50Milliseconds = percentile(itlMilliseconds_, 0.50);
   result.itlP95Milliseconds = percentile(itlMilliseconds_, 0.95);
   result.itlSamples = static_cast<uint32_t>(itlMilliseconds_.size());
+  result.decodeGap = decodeGaps_.snapshot();
   if (prefillWallMilliseconds_ > 0.0) {
     result.prefillTokensPerSecond =
         double(prefillTokens_) * 1000.0 / prefillWallMilliseconds_;

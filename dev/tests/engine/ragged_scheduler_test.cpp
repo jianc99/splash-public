@@ -808,6 +808,16 @@ void testPrefillEstimateBoundsItsFit() {
           "the estimate's cost per row went negative");
 }
 
+// A prefill's price is the command estimate's for its rows: seeded with
+// 2048 rows in 6144 ms, 2048 ms of it waiting on host steps, the estimate is
+// 2048 ms fixed and 2 ms a row, 4048 ms for 1000 rows.
+void testAPrefillsPriceIsTheEstimateForItsRows() {
+  Scheduler scheduler(0.0);
+  scheduler.observePrefill(2048, 6144.0, 2048.0);
+  require(scheduler.prefillMilliseconds(model::CommandWork{.rows = 1000}) == 4048.0,
+          "a prefill's price was not the command estimate for its rows");
+}
+
 // Past a short leader of a command in passes, a lane joins with the rows
 // that spare it a command of its own only while the fixed part it saves
 // outweighs what its rows add for the lanes planned before it: on the M6's
@@ -1934,6 +1944,36 @@ void testDecodeRepaysItsShareOfContendedPrefill() {
   }
 }
 
+// The decode time per token is a decode command's wall time over the tokens
+// a lane committed, 2 ms for two lanes' 9 each in 18 ms and 3 ms for their 4
+// each in 12 ms, each command weighing 0.9 of the next; a command whose
+// lanes committed none trains nothing. Before the first it is 0.
+void testDecodeTimePerTokenWeighsEachCommand() {
+  Scheduler scheduler(0.0);
+  for (uint64_t id : {1, 2}) {
+    scheduler.submit(request(id, 1));
+    scheduler.resourcesReady(id, 1);
+  }
+  const auto decode = [&](uint32_t committed, double wallMilliseconds) {
+    const BatchPlan plan = *scheduler.next({});
+    require(plan.kind == WorkKind::Decode && plan.width() == 2, "expected a decode command of both lanes");
+    scheduler.commit(plan, {});
+    std::vector<StepResult> results;
+    for (const BatchItem &item : plan.items)
+      results.push_back({item.requestId, 0, false, DecodeStage::Regular, committed});
+    scheduler.complete(plan, results, wallMilliseconds, true);
+  };
+  require(scheduler.decodeTokenMilliseconds() == 0.0, "a decode time per token preceded the first decode");
+  decode(9, 18.0);
+  decode(4, 12.0);
+  const double perToken = (0.9 * 2.0 + 3.0) / (0.9 + 1.0);
+  require(std::abs(scheduler.decodeTokenMilliseconds() - perToken) < 1e-9,
+          "the decode time per token did not weigh each command 0.9 of the next");
+  decode(0, 30.0);
+  require(std::abs(scheduler.decodeTokenMilliseconds() - perToken) < 1e-9,
+          "a decode command whose lanes committed no tokens trained the decode time per token");
+}
+
 // A constrained lane waits for its first mask while an equal-priority prompt
 // prefills: decode could not have used that time, so once the mask arrives
 // the kinds alternate without banked debt.
@@ -2521,6 +2561,7 @@ int main() {
     testPrefillEstimateFitsCommandsOfDifferentRows();
     testContendedCommandsStayWithinTheSliceAsTheyDeepen();
     testPrefillEstimateBoundsItsFit();
+    testAPrefillsPriceIsTheEstimateForItsRows();
     testPassesShareOnlyWhatTheFixedPartOutweighs();
     testAHigherPriorityPromptsRowsDoNotCountAgainstIt();
     testAHigherPriorityWaitsForACommandPastItsMiddle();
@@ -2556,6 +2597,7 @@ int main() {
     testMaskedLanesShareDecode();
     testPrefillAndDecodeAlternateWithoutStarvation();
     testDecodeRepaysItsShareOfContendedPrefill();
+    testDecodeTimePerTokenWeighsEachCommand();
     testMaskWaitAccruesNoDecodeDebt();
     testExcludedLanesAreNotPlanned();
     testDecodeDebtLeavesWithTheLastDecoder();

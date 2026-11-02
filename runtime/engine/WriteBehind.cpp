@@ -54,9 +54,9 @@ bool WriteBehind::inUse(uint64_t block) const noexcept {
   return !cache_.persistent() && cache_.stateInUse(block);
 }
 
-bool WriteBehind::run(double now, bool memoryAwaited) {
+bool WriteBehind::run(double now, bool, bool claimWaiting) {
   stalled_ = false;
-  if (!needed(now) || memoryAwaited)
+  if (!needed(now) || claimWaiting)
     return false;
   bool settled = false;
   for (auto point = waiting_.begin(); point != waiting_.end() && point->due <= now;) {

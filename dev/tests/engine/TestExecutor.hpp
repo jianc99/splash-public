@@ -488,18 +488,10 @@ public:
   submit(const BatchPlan &plan, std::span<const ModelBatchItem> items,
          std::function<void()> completion) override {
     checkPageTables(items);
-    // A prefill command streams the history of one lane at most, whose
-    // pages hold only their index, and only whole, as the production
-    // runtime refuses another.
-    if (plan.kind == WorkKind::Prefill) {
-      const auto streams = std::ranges::count_if(items, [](const ModelBatchItem &item) {
-        return item.pageSources && item.pageSources->indexPages();
-      });
-      if (streams > 1)
-        throw std::logic_error("a prefill command streams the history of one sequence");
-      if (streams && plan.passes > 1)
-        throw std::invalid_argument("a prefill command's passes are not ones the runtime runs");
-    }
+    // A command keeps within the model's limits, as the production runtime
+    // runs no other.
+    if (const auto broken = model::commandViolation(commandLimits(), plan, items))
+      throw std::invalid_argument(std::string(*broken));
     // A lane reads the K/V only a copy holds through memory reserved for it
     // before its command, as the production runtime's readers require: a
     // decoding lane's floor of the hot block cache, a prefill's staging of
@@ -569,6 +561,11 @@ public:
     return spills || !groupsOnlySpilling ? groupRows : model::ExecutionLimits::prefillTokenBudget;
   }
   uint32_t prefillPasses() const noexcept override { return passes; }
+  // A command holds groupRows rows in up to `passes` passes, the rows of one
+  // lane at most past a chunk, and streams the history of one lane at most.
+  model::CommandLimits commandLimits() const noexcept override {
+    return {.commandRows = groupRows, .maximumPasses = passes, .lanesPastChunk = 1, .indexPageLanes = 1};
+  }
   uint64_t snapshotBytes() const noexcept override { return stateBytes; }
   // The production model takes a cached state's buffers from its pool, or
   // with one admission, for a resident lane's page-aligned boundary, and
@@ -967,13 +964,14 @@ public:
   std::unordered_map<uint64_t, uint32_t> outputLimits;
   // The prefill steps each request took.
   std::unordered_map<uint64_t, uint32_t> prefillChunks;
-  // The most rows of a prefill command (Model::prefillGroupRows): a chunk's,
-  // or a prefill group's, for every lane, as where experts stream, or with
-  // groupsOnlySpilling only for a lane whose history spills.
+  // The most rows of a prefill command (Model::prefillGroupRows,
+  // CommandLimits::commandRows): a chunk's, or a prefill group's, for every
+  // lane, as where experts stream, or with groupsOnlySpilling only for a
+  // lane whose history spills.
   uint32_t groupRows = model::ExecutionLimits::prefillTokenBudget;
   bool groupsOnlySpilling = false;
   // The most passes over its layers a prefill command runs in
-  // (Model::prefillPasses).
+  // (Model::prefillPasses, CommandLimits::maximumPasses).
   uint32_t passes = 1;
   // The tokens a decode step emits.
   uint32_t decodeTokens = 1;

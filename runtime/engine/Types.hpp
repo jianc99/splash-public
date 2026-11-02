@@ -23,6 +23,9 @@ struct StepResult final {
   uint32_t consumedPromptTokens = 0;
   bool finished = false;
   DecodeStage nextDecodeStage = DecodeStage::Regular;
+  // The output tokens the command committed for the lane
+  // (ModelStepResult::outputTokens).
+  uint32_t committedTokens = 0;
 };
 
 // Where a request's committed KV lives, chosen at admission and kept across

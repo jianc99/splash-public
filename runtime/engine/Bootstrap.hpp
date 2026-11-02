@@ -43,6 +43,9 @@ struct RuntimeBootstrapReport {
     WarmupReport warmup;
     MemoryAuditResult memoryAudit;
     std::string budgetDescription;
+    // What a start refused for want of memory or context needed against what
+    // it had: RuntimeResourcesError::shortfall, or the --max-context check.
+    std::optional<protocol::StartShortfall> shortfall;
 
     [[nodiscard]] std::string describe() const;
 };
@@ -59,6 +62,11 @@ public:
 private:
     RuntimeBootstrapReport report_;
 };
+
+// The failure a start reports in place of Ready (main.mm), classed for the
+// server's restart policy and the app's words.
+[[nodiscard]] protocol::StartFailedEvent startFailedEvent(
+    const RuntimeBootstrapReport &report);
 
 // Startup retries a temporary host or driver allocation failure for a
 // bounded time. The window opens at the first such failure, not at process
@@ -98,6 +106,12 @@ inline constexpr auto kStartupMemoryRecoveryPoll = std::chrono::seconds(1);
 [[nodiscard]] protocol::ProtocolLimits
 protocolLimitsFor(const model::ModelCapabilities &capabilities,
                   uint32_t maxContext) noexcept;
+
+// What a model served under `engine` and `limits` (protocolLimitsFor)
+// announces in Ready.
+[[nodiscard]] protocol::ReadyEvent readyEventFor(
+    const model::ModelDescriptor &model, const EngineConfig &engine,
+    const protocol::ProtocolLimits &limits);
 
 struct RuntimeBootstrapConfig {
     RuntimeResourcesConfig resources;

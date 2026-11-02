@@ -19,7 +19,7 @@ PROTOCOL_VERSION = 11
 # A frame is its header, the magic, the protocol version, the frame type and
 # the payload length, then the payload.
 FRAME_HEADER_BYTES = 16
-STATUS_SCHEMA_VERSION = 6
+STATUS_SCHEMA_VERSION = 7
 # Score-only requests carry 2..255 distinct option token ids and produce no
 # generated tokens; a successful score DoneEvent returns one raw
 # final-position logit per requested token, in request order.
@@ -318,9 +318,17 @@ class ReleaseRequestFrame:
 @dataclass(slots=True, frozen=True)
 class ReadyEvent:
     max_concurrent_requests: int
+    # The context this start serves: the one asked for, or what its plan
+    # holds; a relaunch may serve less than the first engine did.
     max_context_tokens: int
     # Requests may carry image spans; false for a model serving without vision.
     vision: bool
+    # The target's logit rows a token mask covers; the rows of one mask
+    # request, before the anchor and after each draft query row; and the
+    # tokens that end generation.
+    vocabulary_size: int = 0
+    mask_rows: int = 0
+    stop_token_ids: tuple[int, ...] = ()
 
 
 @dataclass(slots=True, frozen=True)
@@ -413,6 +421,40 @@ class StatusJsonEvent:
     json: bytes
 
 
+# Why a start failed, for the restart decision and the app's words; the values
+# are runtime/engine/Protocol.hpp's.
+class StartFailureKind(IntEnum):
+    INTERNAL = 0
+    HOST_MEMORY = 1
+    DRIVER_ALLOCATION = 2
+    MEMORY_BUDGET = 3
+    CONTEXT_BUDGET = 4
+    CONFIGURATION = 5
+    MODEL = 6
+    DEVICE = 7
+
+
+# What bounds a shortfall: the Metal budget the Mac gives, the one
+# --max-memory set, or the SSD cache's room for spilled KV.
+class ShortfallBound(IntEnum):
+    DEVICE_MEMORY = 0
+    MAX_MEMORY = 1
+    DISK = 2
+
+
+# Sent in place of Ready by a start that fails. The shortfall is all zero but
+# for MEMORY_BUDGET, which sets the bytes, and CONTEXT_BUDGET, the tokens.
+@dataclass(slots=True, frozen=True)
+class StartFailedEvent:
+    kind: StartFailureKind
+    bound: ShortfallBound
+    required_bytes: int
+    budget_bytes: int
+    requested_context_tokens: int
+    plan_context_tokens: int
+    message: bytes
+
+
 ClientMessage: TypeAlias = (
     RequestFrame
     | CancelFrame
@@ -429,6 +471,25 @@ EngineEvent: TypeAlias = (
     | DoneEvent
     | ErrorEvent
     | StatusJsonEvent
+    | StartFailedEvent
+)
+
+
+# The engine's supervision budgets the server times it by, in milliseconds
+# (runtime/Supervision.hpp).
+@dataclass(slots=True, frozen=True)
+class Supervision:
+    command_timeout_ms: int
+    loop_stall_ms: int
+    stop_ms: int
+    probation_ms: int
+
+
+SUPERVISION = Supervision(
+    command_timeout_ms=120_000,
+    loop_stall_ms=30_000,
+    stop_ms=15_000,
+    probation_ms=60_000,
 )
 
 

@@ -40,6 +40,14 @@ public:
 // Spill request's page written through (Cache::writeThrough).
 enum class WriteClass : uint8_t { Reclaim, Persist, Spill };
 
+// What the tier's transfers read and wrote, and how long they took, since it
+// started: the rates the memory ledger prices a copy and a read back at
+// (MemoryRates).
+struct KvTierThroughput final {
+  uint64_t readBytes = 0, writtenBytes = 0;
+  double readSeconds = 0.0, writeSeconds = 0.0;
+};
+
 // The disk tier for KV pages as the engine drives it. Until a transfer is
 // ready its page is the caller's to keep still: no command writes a page
 // being demoted, no command reads or writes a page being restored, and
@@ -89,6 +97,8 @@ public:
   copy(const std::shared_ptr<KvDiskSlot> &slot) const = 0;
   // Engine-thread bookkeeping after IO completes.
   virtual void poll() = 0;
+  // Zeros for a tier that does not count them.
+  [[nodiscard]] virtual KvTierThroughput throughput() const noexcept { return {}; }
 };
 
 } // namespace splash::engine

@@ -16,6 +16,7 @@
 #include "model/SparseRowStore.hpp"
 #include "model/SsdReaders.hpp"
 #include "engine/MemoryAudit.hpp"
+#include "engine/Protocol.hpp"
 #include "engine/ReleasableMemory.hpp"
 #include "engine/Status.hpp"
 #include "ops/ExecutionPlans.hpp"
@@ -33,8 +34,6 @@
 #include <thread>
 
 namespace splash::engine {
-
-struct EngineConfig;
 
 enum class RuntimeResourceStage {
   Configuration,
@@ -212,7 +211,9 @@ public:
   RuntimeResourcesError(RuntimeResourceStage stage, std::string message,
                         std::string budgetDescription = {},
                         RuntimeResourceFailure failure =
-                            RuntimeResourceFailure::Other);
+                            RuntimeResourceFailure::Other,
+                        std::optional<protocol::StartShortfall> shortfall =
+                            std::nullopt);
 
   [[nodiscard]] RuntimeResourceStage stage() const noexcept { return stage_; }
   [[nodiscard]] RuntimeResourceFailure failure() const noexcept {
@@ -221,12 +222,28 @@ public:
   [[nodiscard]] const std::string &budgetDescription() const noexcept {
     return budgetDescription_;
   }
+  // What the plan's floors require against the budget, for a plan the budget
+  // cannot hold (stage MemoryPlanning, failure EngineCapacity).
+  [[nodiscard]] const std::optional<protocol::StartShortfall> &
+  shortfall() const noexcept {
+    return shortfall_;
+  }
 
 private:
   RuntimeResourceStage stage_;
   RuntimeResourceFailure failure_;
   std::string budgetDescription_;
+  std::optional<protocol::StartShortfall> shortfall_;
 };
+
+// The bound of a Metal memory budget: --max-memory where it set the budget,
+// else this Mac's own.
+[[nodiscard]] constexpr protocol::ShortfallBound
+memoryBound(uint64_t configuredLimitBytes, uint64_t hardBudgetBytes) noexcept {
+  return configuredLimitBytes && hardBudgetBytes == configuredLimitBytes
+             ? protocol::ShortfallBound::MaxMemory
+             : protocol::ShortfallBound::DeviceMemory;
+}
 
 // Owns every process-wide native resource exactly once. Members go in
 // reverse declaration order: what the engine gives back while idle -> the
@@ -380,10 +397,5 @@ private:
 [[nodiscard]] AneFfnModel aneFfnModel(metal::MetalBackend &backend, const model::LoadedModel &loaded,
                                       const ops::ExecutionPlans &operators, kv::Format format,
                                       std::string_view buildId, std::function<bool()> cancelled);
-
-// Connects an engine to the governor that admits its memory: the engine asks
-// it whether the host pauses growth, and marks the allocations a request in
-// service makes. Every engine that runs against a governor connects through it.
-void connectToGovernor(EngineConfig &config, MemoryGovernor &governor);
 
 } // namespace splash::engine

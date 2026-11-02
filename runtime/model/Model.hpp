@@ -2,6 +2,8 @@
 
 #include "ops/PagedKv.hpp"
 #include "ops/Vision.hpp"
+#include "model/CommandCost.hpp"
+#include "model/ElasticPool.hpp"
 #include "model/StateTransfer.hpp"
 
 #include <algorithm>
@@ -469,6 +471,13 @@ public:
   [[nodiscard]] virtual bool prefillTimingIsRepresentative() const noexcept {
     return true;
   }
+  // What the command did and how long it took, valid once wait() returned:
+  // by default the times above, with no work counted.
+  [[nodiscard]] virtual model::CommandSample sample() const noexcept {
+    return {.wallMilliseconds = wallMilliseconds(),
+            .imageEncodeMilliseconds = imageEncodeMilliseconds(),
+            .representative = prefillTimingIsRepresentative()};
+  }
 };
 
 namespace model {
@@ -577,6 +586,14 @@ struct ModelMemoryAdmission final {
   [[nodiscard]] bool granted() const noexcept { return ok; }
 };
 
+// What a request's reads of spilled K/V need before its next command: a
+// decode, its lane's floor of the hot block cache; a prefill, staging for
+// the `pages` pages of its history up to the command's end.
+struct SpilledReadNeed final {
+  WorkKind kind = WorkKind::Decode;
+  uint32_t pages = 0;
+};
+
 // A token mask row holds one bit per vocabulary token in 32-bit words.
 [[nodiscard]] constexpr uint32_t
 maskWordsPerToken(uint32_t vocabularySize) noexcept {
@@ -624,6 +641,41 @@ static_assert(ExecutionLimits::draftQueryRows ==
               ExecutionLimits::draftProposalTokens + 1);
 static_assert(ExecutionLimits::targetVerifyRows ==
               ExecutionLimits::draftQueryRows);
+
+// The first rule a command breaks, or none: at most maximumBatchWidth
+// lanes; and for a prefill, pass `pass` of one to maximumPasses passes, at
+// most commandRows rows, at most lanesPastChunk lanes whose rows run past a
+// chunk as the lanes fill the chunks in order, and at most indexPageLanes
+// lanes whose history holds Index pages. Any lane of a decode may hold
+// Index pages: each reads its spilled K/V through the hot block cache
+// (Runtime::Impl::decodeReads). CommandLimits::attentionPairs bounds
+// planning and is not checked here. Neither the runtime nor the engine
+// tests' model runs a command that breaks one.
+[[nodiscard]] inline std::optional<std::string_view>
+commandViolation(const CommandLimits &limits, const BatchPlan &plan,
+                 std::span<const ModelBatchItem> items) noexcept {
+  if (items.size() > ExecutionLimits::maximumBatchWidth)
+    return "a command's lanes exceed the batch width";
+  if (plan.kind != WorkKind::Prefill)
+    return std::nullopt;
+  if (!plan.passes || plan.pass >= plan.passes || plan.passes > limits.maximumPasses)
+    return "a prefill command's passes are not ones the runtime runs";
+  constexpr uint64_t chunk = ExecutionLimits::prefillTokenBudget;
+  uint64_t rows = 0;
+  uint32_t pastChunk = 0, indexed = 0;
+  for (const ModelBatchItem &item : items) {
+    pastChunk += item.tokenCount && rows / chunk != (rows + item.tokenCount - 1) / chunk;
+    indexed += item.pageSources && item.pageSources->indexPages();
+    rows += item.tokenCount;
+  }
+  if (rows > limits.commandRows)
+    return "a prefill command's rows exceed its chunks";
+  if (pastChunk > limits.lanesPastChunk)
+    return "several lanes' rows run past a prefill chunk";
+  if (indexed > limits.indexPageLanes)
+    return "a prefill command streams the history of more lanes than the runtime reads";
+  return std::nullopt;
+}
 
 // Shared accounting for model-owned state allocations.  Target and draft
 // implementations may allocate from separate physical pools while the engine
@@ -728,6 +780,9 @@ struct WarmupStepResult final {
   // For prefill warmup, of wallSeconds the time its GPU work waited on host
   // steps (ModelBatchTicket::hostMilliseconds).
   double hostSeconds = 0.0;
+  // A warmup command's sample (ModelBatchTicket::sample). No warmup fills
+  // it: it stays empty.
+  CommandSample sample{};
 };
 
 // What a reclaim step may release of the model's idle memory.
@@ -738,7 +793,7 @@ enum class IdleMemory : uint8_t {
   BuffersThenCaches,
 };
 
-class Model {
+class Model : public PrefillWorkSource {
 public:
   virtual ~Model() = default;
   virtual void checkHealth() {}
@@ -800,6 +855,16 @@ public:
   // the staging, which the prompts that stream share, holds `historyPages`
   // pages already, so reserveHistoryStaging takes nothing.
   [[nodiscard]] virtual bool holdsSpilledReads(uint64_t, uint32_t) const { return true; }
+  // The bytes reserveSpilledReads(requestId, need) would allocate now: zero
+  // when the request holds what it reserves or the model reads no spilled
+  // K/V, and by default.
+  [[nodiscard]] virtual uint64_t spilledReadShortfall(uint64_t, SpilledReadNeed) const { return 0; }
+  // Reserves what `need` names: by default a decode's floor through
+  // reserveSpilledReads, a prefill's staging through reserveHistoryStaging.
+  [[nodiscard]] virtual ModelMemoryAdmission reserveSpilledReads(uint64_t requestId, SpilledReadNeed need) {
+    return need.kind == WorkKind::Decode ? reserveSpilledReads(requestId)
+                                         : reserveHistoryStaging(requestId, need.pages);
+  }
   // Whether the disk tier takes a state written from a lane now, for a
   // state in use or not, as CompositeState::canOffload. Room in the quota is
   // the write's own concern.
@@ -842,6 +907,30 @@ public:
   // a streamed target's expert reads; 1 where a command runs whole. A
   // command that streams a lane's history runs whole.
   [[nodiscard]] virtual uint32_t prefillPasses() const noexcept { return 1; }
+  // What one prefill command may hold (commandViolation): by default a
+  // prefill group's rows, prefillPasses() passes, one lane past a chunk and
+  // one lane whose history streams.
+  [[nodiscard]] virtual CommandLimits commandLimits() const noexcept {
+    return {.commandRows = prefillGroupRows(true),
+            .maximumPasses = prefillPasses(),
+            .lanesPastChunk = 1,
+            .indexPageLanes = 1};
+  }
+  // By default a command's lanes, rows, chunks and the attention pairs of
+  // one layer, each row attending to every key up to its own
+  // (model::denseAttentionPairs, which engine code does not include), in
+  // any of its passes, over no layers and with nothing read.
+  [[nodiscard]] CommandWork prefillWork(std::span<const PrefillLane> lanes, uint32_t,
+                                        uint32_t) const override {
+    CommandWork work{.lanes = static_cast<uint32_t>(lanes.size())};
+    for (const PrefillLane &lane : lanes) {
+      work.rows += lane.rows;
+      work.attentionPairs += lane.rows * uint64_t{lane.position} + uint64_t{lane.rows} * (lane.rows + 1) / 2;
+    }
+    work.layerAttentionPairs = work.attentionPairs;
+    work.chunks = (work.rows + ExecutionLimits::prefillTokenBudget - 1) / ExecutionLimits::prefillTokenBudget;
+    return work;
+  }
   // Releases one unit of idle model memory and returns its bytes; zero when
   // nothing in scope is idle. A unit is one pooled state buffer (keepLane
   // keeps those one lane starts from); with BuffersThenCaches, once no
@@ -852,6 +941,12 @@ public:
   // retries between calls, so it frees only what it needs.
   [[nodiscard]] virtual uint64_t reclaimIdleState(bool keepLane,
                                                   IdleMemory scope) noexcept = 0;
+  // Releases one pooled state buffer no lane holds (keepLane keeps those one
+  // lane starts from) and returns its bytes; zero when none is idle. By
+  // default reclaimIdleState's step over the buffers.
+  [[nodiscard]] virtual uint64_t releaseIdleBuffer(bool keepLane) noexcept {
+    return reclaimIdleState(keepLane, IdleMemory::Buffers);
+  }
   // The store of streamed routed experts above its floor
   // (model::ExpertStore), between commands. releaseExpertChunk gives one
   // chunk back while memory is short and returns its bytes; zero when the
@@ -867,6 +962,11 @@ public:
   [[nodiscard]] virtual uint64_t releaseExpertsToFloor() { return 0; }
   [[nodiscard]] virtual uint64_t expertGrowthBytes() const { return 0; }
   [[nodiscard]] virtual ModelMemoryAdmission growExperts() { return {.ok = true}; }
+  // The model's elastic memories, stable for its lifetime; none by default.
+  [[nodiscard]] virtual std::span<ElasticPool *const> pools() noexcept { return {}; }
+  // What loading the weights read from the SSD through WeightSource, which
+  // reads past the page cache (F_NOCACHE); none by default.
+  [[nodiscard]] virtual SsdReads loadReads() const noexcept { return {}; }
   // Why this request's mask is unusable, or nothing when the model took it.
   [[nodiscard]] virtual std::optional<std::string>
   provideMask(uint64_t requestId, std::span<const uint32_t> words) = 0;

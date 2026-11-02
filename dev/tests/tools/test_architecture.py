@@ -247,21 +247,18 @@ class ArchitectureTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             (root / "runtime/engine").mkdir(parents=True)
-            for assembly in (
-                "Bootstrap.hpp",
-                "Bootstrap.mm",
-                "RuntimeResources.hpp",
-                "RuntimeResources.mm",
-            ):
-                (root / "runtime/engine" / assembly).write_text(
+            for assembly in check_architecture.ENGINE_ASSEMBLY:
+                (root / assembly).write_text(
                     "".join(f'#include "{header}"\n' for header in headers)
                 )
             policy = root / "runtime/engine/Scheduler.cpp"
+            reporting = root / "runtime/engine/Status.cpp"
             startup = root / "runtime/main.mm"
             generic = (
                 '#include "model/Model.hpp"\n#include "model/ModelDescriptor.hpp"\n'
             )
-            policy.write_text(generic)
+            policy.write_text('#include "model/Model.hpp"\n')
+            reporting.write_text(generic)
             startup.write_text(generic + "model::ModelDescriptor model;\n")
             with mock.patch.object(check_architecture, "ROOT", root):
                 self.assertEqual(check_architecture.check(), [])
@@ -272,10 +269,21 @@ class ArchitectureTests(unittest.TestCase):
                             check_architecture.check(),
                             [
                                 "runtime/engine/Scheduler.cpp: engine policy "
+                                f"depends on model internals {header}"
+                            ],
+                        )
+                policy.write_text('#include "model/Model.hpp"\n')
+                for header in headers:
+                    with self.subTest(source="engine reporting", header=header):
+                        reporting.write_text(f'#include "{header}"\n')
+                        self.assertEqual(
+                            check_architecture.check(),
+                            [
+                                "runtime/engine/Status.cpp: engine reporting "
                                 f"depends on concrete model {header}"
                             ],
                         )
-                policy.write_text(generic)
+                reporting.write_text(generic)
                 for header in headers:
                     with self.subTest(source="startup", header=header):
                         startup.write_text(f'#include "{header}"\n')
@@ -339,9 +347,176 @@ class ArchitectureTests(unittest.TestCase):
                             check_architecture.check(),
                             [
                                 "runtime/engine/Scheduler.cpp: engine policy "
-                                "depends on concrete model model/QwenTarget.hpp"
+                                "depends on model internals model/QwenTarget.hpp"
                             ],
                         )
+
+    def test_engine_policy_includes_model_headers_from_the_boundary(self):
+        boundary = "".join(
+            f'#include "{header}"\n'
+            for header in sorted(check_architecture.ENGINE_MODEL_BOUNDARY)
+        )
+        internals = (
+            "model/ExpertStore.hpp",
+            "model/KvHistoryStream.hpp",
+            "model/ModelDescriptor.hpp",
+            "model/SparseRowStore.hpp",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            policy = root / "runtime/engine/MemoryControl.cpp"
+            policy.parent.mkdir(parents=True)
+            policy.write_text(boundary)
+            # Assembly and reporting include what they assemble and render.
+            for source in (
+                check_architecture.ENGINE_ASSEMBLY | check_architecture.ENGINE_REPORTING
+            ):
+                (root / source).write_text(
+                    "".join(f'#include "{header}"\n' for header in internals)
+                )
+            with mock.patch.object(check_architecture, "ROOT", root):
+                self.assertEqual(check_architecture.check(), [])
+                for header in internals:
+                    with self.subTest(header=header):
+                        policy.write_text(boundary + f'#include "{header}"\n')
+                        self.assertEqual(
+                            check_architecture.check(),
+                            [
+                                "runtime/engine/MemoryControl.cpp: engine policy "
+                                f"depends on model internals {header}"
+                            ],
+                        )
+
+    def test_engine_policy_names_no_model_family(self):
+        identifiers = "model::QwenTarget target;\nauto rows = kDFlashRows;\n"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            policy = root / "runtime/engine/Scheduler.cpp"
+            policy.parent.mkdir(parents=True)
+            with mock.patch.object(check_architecture, "ROOT", root):
+                for text in (
+                    "// Qwen3.8-Flash-Next's prompts\nint rows = 0;\n",
+                    "/* a DFlash draft's\n   window */ int rows = 0;\n",
+                    "auto label = \"flint\";\nauto first = 'q';\n",
+                    # Words that only contain a family's name.
+                    "auto flinty = 0, qwenish = 0;\n",
+                    # A name's words that no concrete model is named by.
+                    "auto nextFlash = 0, b = 0, incoai = 0;\nuint8_t a3 = 0;\n",
+                ):
+                    with self.subTest(text=text):
+                        policy.write_text(text)
+                        self.assertEqual(check_architecture.check(), [])
+                for text, identifier in (
+                    ("model::QwenTarget target;\n", "QwenTarget"),
+                    ("auto rows = kDFlashRows;\n", "kDFlashRows"),
+                    ("bool dflash_draft = false;\n", "dflash_draft"),
+                    ("constexpr int FLINT_LAYERS = 4;\n", "FLINT_LAYERS"),
+                    ("struct OrnithLayout {};\n", "OrnithLayout"),
+                    ("auto qwen2Rows = 0;\n", "qwen2Rows"),
+                    # A digit separator starts no character literal.
+                    ("auto rows = 1'000 * qwenRows / 1'000;\n", "qwenRows"),
+                ):
+                    with self.subTest(text=text):
+                        policy.write_text(text)
+                        self.assertEqual(
+                            check_architecture.check(),
+                            [
+                                "runtime/engine/Scheduler.cpp: engine policy names "
+                                f"a model family ({identifier})"
+                            ],
+                        )
+                policy.unlink()
+                for source in sorted(
+                    check_architecture.ENGINE_ASSEMBLY
+                    | check_architecture.ENGINE_REPORTING
+                ):
+                    with self.subTest(source=source):
+                        (root / source).write_text(identifiers)
+                        self.assertEqual(check_architecture.check(), [])
+
+    def test_every_family_names_itself_with_a_family_word(self):
+        families = check_architecture.family_names(
+            check_architecture.ROOT / "install/families.py"
+        )
+        self.assertTrue(families)
+        for name, _ in families:
+            with self.subTest(family=name):
+                self.assertTrue(
+                    check_architecture.MODEL_FAMILY_PARTS.intersection(
+                        check_architecture.identifier_parts(name)
+                    )
+                )
+
+    def test_family_words_are_brands_and_what_a_concrete_model_goes_by(self):
+        self.assertEqual(
+            check_architecture.family_words(
+                [("Gemma4-12B-Flash", "incoai/Opal-2-12B-DFlash2")],
+                (
+                    "model/Gemma4Target.hpp",
+                    "model/DFlashDraft.hpp",
+                    "model/Runtime.hpp",
+                ),
+            ),
+            {"gemma", "opal", "dflash"},
+        )
+
+    def test_engine_mechanism_names_are_found_but_not_yet_checked(self):
+        name = "runtime/engine/Engine.cpp"
+        for text, identifier in (
+            ("void releaseExpertChunk();\n", "releaseExpertChunk"),
+            ("auto experts = 0;\n", "experts"),
+            ("bool hasIndexer = false;\n", "hasIndexer"),
+            ("auto PLERows = 0;\n", "PLERows"),
+            ("auto kvHistoryStream = 0;\n", "kvHistoryStream"),
+            ("auto history_staging_bytes = 0;\n", "history_staging_bytes"),
+            ("auto kvBlockCacheBytes = 0;\n", "kvBlockCacheBytes"),
+            ("model::SparseRowStore *rows = nullptr;\n", "SparseRowStore"),
+            ("auto hyperConnections = 0;\n", "hyperConnections"),
+            ("bool valuesTokenMajor = false;\n", "valuesTokenMajor"),
+            # A mechanism's words in any order, singular or plural.
+            ("bool streamsHistory = false;\n", "streamsHistory"),
+            ("auto historyStreams = 0;\n", "historyStreams"),
+            ("auto historyStaging = 0;\n", "historyStaging"),
+            ("auto cacheBlocks = 0;\n", "cacheBlocks"),
+            ("auto rowsSparse = 0;\n", "rowsSparse"),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(
+                    check_architecture.check_engine_policy(
+                        name, text, [], mechanisms=True
+                    ),
+                    [f"{name}: engine policy names a model mechanism ({identifier})"],
+                )
+        # Words that only contain or neighbour a mechanism's, and comments.
+        text = (
+            "auto historyBytes = 0, streamConflicts = 0, blockSize = 0;\n"
+            "auto sampled = 0, expertise = 0, indexes = 0;\n"
+            "bool gainsIndexPages = false;\nauto indexPageLanes = 0;\n"
+            "// an expert's history stream\n"
+        )
+        self.assertEqual(
+            check_architecture.check_engine_policy(name, text, [], mechanisms=True), []
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / name
+            source.parent.mkdir(parents=True)
+            source.write_text("void releaseExpertChunk();\n")
+            with mock.patch.object(check_architecture, "ROOT", root):
+                self.assertEqual(check_architecture.check(), [])
+
+    def test_identifiers_split_into_words(self):
+        for identifier, parts in (
+            ("kvHistoryStream", ["kv", "history", "stream"]),
+            ("history_staging_bytes", ["history", "staging", "bytes"]),
+            ("DFlashDraft", ["dflash", "draft"]),
+            ("kDFlashRows", ["k", "dflash", "rows"]),
+            ("PLERows", ["ple", "rows"]),
+            ("Qwen3_6Moe", ["qwen", "3", "6", "moe"]),
+            ("FLINT_LAYERS", ["flint", "layers"]),
+        ):
+            with self.subTest(identifier=identifier):
+                self.assertEqual(check_architecture.identifier_parts(identifier), parts)
 
     def test_production_cannot_include_test_code(self):
         with tempfile.TemporaryDirectory() as temporary:

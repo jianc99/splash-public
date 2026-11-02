@@ -73,11 +73,15 @@ public:
   // the disk tier takes no writes.
   void published(uint64_t block, uint32_t tokens, double now);
   // Steps the points that are due and not in use, while copies are needed
-  // and no request waits for memory on its way back (memoryAwaited), which
+  // and no claim waits for memory on its way back (claimWaiting), which
   // needs the tier's writes and the state write first. True when one became
   // durable or was given up; a write it starts wakes the engine when it
-  // lands.
-  [[nodiscard]] bool run(double now, bool memoryAwaited);
+  // lands. Whether copies are needed is the tier's and its reclaims' to say
+  // (needed): the memory's demand for them, `demand`, is ignored.
+  [[nodiscard]] bool run(double now, bool demand, bool claimWaiting);
+  // The step with a request that waits for memory on its way back
+  // (Engine::memoryAwaited) in place of a claim.
+  [[nodiscard]] bool run(double now, bool memoryAwaited) { return run(now, false, memoryAwaited); }
   // At a clean stop: in a persistent tier, steps every waiting point, the
   // newest first, due or not and in use or not, whatever the write budget
   // (Cache::liftDiskWriteBudget). True once none is left, and at once in a

@@ -3,7 +3,6 @@
 #include "Checked.hpp"
 #include "StderrLine.hpp"
 #include "engine/DiskLabels.hpp"
-#include "engine/Engine.hpp"
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/PagedAttention.h"
 #include "model/ExpertStore.hpp"
@@ -612,9 +611,11 @@ std::string persistentCacheNamespace(const RuntimeCacheIdentity &identity,
 RuntimeResourcesError::RuntimeResourcesError(RuntimeResourceStage stage,
                                              std::string message,
                                              std::string budgetDescription,
-                                             RuntimeResourceFailure failure)
+                                             RuntimeResourceFailure failure,
+                                             std::optional<protocol::StartShortfall> shortfall)
     : std::runtime_error(std::move(message)), stage_(stage), failure_(failure),
-      budgetDescription_(std::move(budgetDescription)) {}
+      budgetDescription_(std::move(budgetDescription)),
+      shortfall_(std::move(shortfall)) {}
 
 RuntimeResources::RuntimeResources(
     PersistentCacheFiles persistentCache,
@@ -1508,13 +1509,6 @@ AneFfnModel aneFfnModel(metal::MetalBackend &backend, const model::LoadedModel &
   model.forget = [key](uint32_t maxAneUnits) { ane::forget(key + std::to_string(maxAneUnits)); };
   model.healthy = [&backend] { return backend.healthy(); };
   return model;
-}
-
-void connectToGovernor(EngineConfig &config, MemoryGovernor &governor) {
-  config.growthPaused = [&governor] {
-    return !governor.snapshot().hostGrowthAllowed;
-  };
-  config.serving = [&governor](bool serving) { return governor.setServing(serving); };
 }
 
 } // namespace splash::engine

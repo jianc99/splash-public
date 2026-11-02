@@ -18,6 +18,24 @@ from server.metrics import PROMETHEUS_SERIES, prometheus_metrics
 GOLDEN = Path(__file__).parents[1] / "engine/status_golden.json"
 # The sections the server adds to the engine's document before it renders it.
 SERVER_SECTIONS = {"transport", "frontend", "response_store"}
+# Leaves of the engine's document that /metrics must export, each by a series
+# of PROMETHEUS_SERIES.
+REQUIRED_EXPORTS = (
+    ("metrics", "decode_gap_ms", "max"),
+    ("metrics", "decode_gap_ms", "p99"),
+    ("metrics", "decode_gap_ms", "samples"),
+    ("scheduler", "decode_gap_target_ms"),
+    ("scheduler", "contended_prefill_ms", "max"),
+    ("scheduler", "estimate", "prefill", "relative_error", "p95"),
+    ("memory_governor", "reserved_bytes"),
+    ("memory_governor", "owed", "bytes"),
+    ("memory_governor", "claims", "waiting"),
+    ("streamed_experts", "shrinks"),
+    ("streamed_experts", "regrows"),
+    ("kv_spill", "requests", "converted"),
+    ("loop", "tick_host_ms", "p99"),
+    ("loop", "tick_host_ms", "max"),
+)
 
 
 class StatusContractTests(unittest.TestCase):
@@ -41,6 +59,39 @@ class StatusContractTests(unittest.TestCase):
         self.assertIn('splash_disk_writes_gated{state="no"} 0', lines)
         self.assertIn("splash_disk_read_bytes_total 12345", lines)
         self.assertIn("splash_disk_written_bytes_total 67890", lines)
+
+    def test_required_leaves_are_exported(self):
+        status = json.loads(GOLDEN.read_text())
+        paths = set(PROMETHEUS_SERIES.values())
+        for path in REQUIRED_EXPORTS:
+            with self.subTest(path=path):
+                leaf = status
+                for key in path:
+                    leaf = leaf[key]
+                self.assertIsNotNone(leaf)
+                self.assertIn(path, paths)
+
+    def test_accounts_render_with_labels(self):
+        status = json.loads(GOLDEN.read_text())
+        lines = prometheus_metrics(status).splitlines()
+        accounts = status["memory_governor"]["accounts"]
+        self.assertTrue(accounts)
+        for account in accounts:
+            label = f'account="{account["name"]}"'
+            for measure in ("floor", "current", "cap", "reserved"):
+                self.assertIn(
+                    f'splash_memory_account_bytes{{{label},measure="{measure}"}} '
+                    f"{account[measure + '_bytes']}",
+                    lines,
+                )
+            self.assertIn(
+                f"splash_memory_account_grows_total{{{label}}} {account['grows']}",
+                lines,
+            )
+            self.assertIn(
+                f"splash_memory_account_shrinks_total{{{label}}} {account['shrinks']}",
+                lines,
+            )
 
 
 class StatusRouteTests(HarnessTestCase):

@@ -140,6 +140,34 @@ void testCleanRuntimeStatus(const char *goldenPath) {
   engine.resources.kvTier.copies = 64;
   engine.resources.adoption = {2, 96, 4096, 1};
   engine.writeBehind = {1, 5, 3, 0};
+  // Sliding windows that trim, and a target whose KV can spill: a request
+  // spilled, one converted and one's output was bounded.
+  engine.resources.window = engine::KvWindowSnapshot{
+      .windowPages = 16, .trim = true, .pinnedBlocks = 4, .trimmedPages = 12, .upgrades = 1, .refusedStates = 1};
+  engine.spill = {.spill = 1, .resident = 2, .converted = 1, .bounded = 1};
+  // Prefill ran six units, three of them beside decoders; a command ran in
+  // passes and a superseding plan abandoned it between them; one plan was
+  // prepared again.
+  engine.scheduler.decodeGapTargetMilliseconds = 500.0;
+  engine.scheduler.contendedPrefill = {.count = 3, .totalMilliseconds = 1200, .maximumMilliseconds = 480,
+                                       .p50Milliseconds = 262.144, .p95Milliseconds = 524.288,
+                                       .p99Milliseconds = 524.288};
+  engine.scheduler.prefillUnits = 6;
+  engine.scheduler.passCommands = 1;
+  engine.scheduler.abandonedPassCommands = 1;
+  engine.scheduler.boundCuts = 1;
+  engine.scheduler.indexPageConflicts = 2;
+  engine.scheduler.prefillEstimate = {.samples = 6,
+                                      .clamped = 1,
+                                      .terms = {{"units", 20.5, 25.0}, {"row_layers", 0.0075, 0.008}},
+                                      .relativeErrorP50 = 0.0625,
+                                      .relativeErrorP95 = 0.25};
+  engine.scheduler.decodeEstimate = {
+      .samples = 4, .terms = {{"token", 12.5, 0.0}}, .relativeErrorP50 = 0.125, .relativeErrorP95 = 0.5};
+  engine.replans = 1;
+  // Twelve ticks submitted a command, the longest after 1.75 ms of planning.
+  engine.tickHostMilliseconds = {.count = 12, .totalMilliseconds = 4.5, .maximumMilliseconds = 1.75,
+                                 .p50Milliseconds = 0.512, .p95Milliseconds = 1.024, .p99Milliseconds = 2.048};
 
   WarmupReport warmup;
   warmup.maximumPrefill = WarmupStepStatus::Complete;
@@ -156,6 +184,8 @@ void testCleanRuntimeStatus(const char *goldenPath) {
   metrics.acceptedDraftTokens = 20;
   metrics.draftAcceptanceRate = 20.0 / 28.0;
   metrics.currentDecodeBatch = {true, 3, 0, 4, 21, 15, 1.5, 2666.0};
+  metrics.decodeGap = {.count = 31, .totalMilliseconds = 1240, .maximumMilliseconds = 96.5,
+                       .p50Milliseconds = 32.768, .p95Milliseconds = 65.536, .p99Milliseconds = 131.072};
 
   engine::RuntimeCacheIdentity identity;
   identity.modelLayoutSha256 = std::string(64, 'a');
@@ -180,6 +210,72 @@ void testCleanRuntimeStatus(const char *goldenPath) {
   governor.hostSpareReserveBytes = 2 * kGiB;
   governor.hostHeadroomBytes = 6 * kGiB;
   governor.hostGrowthAllowed = true;
+  // The ledger's KV account, of extents of 32 pages, and the experts' pool,
+  // each growing by a unit; two demotions return two extents, one of them
+  // owed to the requests that wait for memory.
+  governor.accounts = {{.name = "kv",
+                        .floorBytes = 32 * 4096ULL,
+                        .currentBytes = 128 * 4096ULL,
+                        .capBytes = 256 * 4096ULL,
+                        .reservedBytes = 32 * 4096ULL,
+                        .unitBytes = 32 * 4096ULL,
+                        .valuePerGiB = 0.5,
+                        .grows = 5,
+                        .shrinks = 3},
+                       {.name = "experts",
+                        .floorBytes = 512 * kMiB,
+                        .currentBytes = 768 * kMiB,
+                        .capBytes = 1 * kGiB,
+                        .reservedBytes = 256 * kMiB,
+                        .unitBytes = 256 * kMiB,
+                        .valuePerGiB = 1.75,
+                        .grows = 1,
+                        .shrinks = 2}};
+  governor.reservedBytes = 32 * 4096ULL + 256 * kMiB;
+  governor.owed = {.transfers = 2, .bytes = 64 * 4096ULL, .toClaimsBytes = 32 * 4096ULL, .oldestMilliseconds = 12.5};
+  governor.claims = {.waiting = 2, .bytes = 32 * 4096ULL, .oldestMilliseconds = 1250.0};
+
+  // A streamed table, the experts' store and KV on the SSD cache with its
+  // readers.
+  model::SparseRowStats table;
+  table.table = "per_layer_token_embd.weight";
+  table.tableBytes = 28800138240;
+  table.cacheBytes = 2147483648;
+  table.cacheCapacityRows = 18000000;
+  table.cachedRows = 1200;
+  table.uses[1] = {10, 1280, 1000, 750, 250, {10, 12.5, 3.25, 1.024, 2.048, 4.096}};
+  table.readBytes = 22500;
+  model::ExpertStoreStats experts{.capBytes = 1 * kGiB,
+                                  .floorBytes = 512 * kMiB,
+                                  .capChunks = 4,
+                                  .chunks = 3,
+                                  .arenaBytes = 768 * kMiB,
+                                  .stagingBytes = 32 * kMiB,
+                                  .slots = 3072,
+                                  .experts = 10240,
+                                  .resident = 3000,
+                                  .shrinks = 2,
+                                  .regrows = 1};
+  experts.uses[1] = {
+      .loads = 480, .routed = 4000, .read = 1000, .prefetched = 600, .readAhead = 900, .readBytes = 1973000000};
+  KvSpillStatus spill;
+  spill.cache = {.spilledPages = 640,
+                 .spilledBytes = 272'629'760,
+                 .writeThroughPages = 640,
+                 .writeThroughBytes = 272'629'760,
+                 .spillMoves = 640,
+                 .indexRestores = 2,
+                 .activeLimitBytes = 32 * kGiB,
+                 .heldBytes = 272'629'760};
+  spill.blockCache = model::KvBlockCacheStats{
+      .bytes = 408'944'640,
+      .targetBytes = 408'944'640,
+      .floorBytes = 408'944'640,
+      .slotsPerLayer = 8'192,
+      .lanes = 1,
+      .reads = {.resolves = 24, .entries = 98'304, .hits = 60'000, .misses = 37'280, .readBytes = 310'000'000}};
+  spill.historyStream = model::KvHistoryStreamStats{
+      .commands = 2, .layers = 24, .pages = 7'500, .bytes = 249'600'000, .stagingBytes = 1'056'440'320, .buffers = 2};
 
   model::ModelTelemetry executorTelemetry;
   executorTelemetry.stateAllocatedBytes = 350'224'384;
@@ -228,7 +324,7 @@ void testCleanRuntimeStatus(const char *goldenPath) {
   const std::string json = runtimeStatusJson(
       memoryPlan, engine, metal, warmup, audit(memoryPlan), metrics, executorTelemetry,
       identity, governor, true, {}, wait, NativeLoopTiming{1843.25}, {600.0, false, false, 2, 1}, aneFfn,
-      ThermalState::Fair);
+      ThermalState::Fair, table, experts, spill);
   std::ifstream golden(goldenPath);
   const std::string expected{std::istreambuf_iterator<char>(golden), {}};
   require(golden && json + '\n' == expected,
@@ -288,7 +384,8 @@ void testCleanRuntimeStatus(const char *goldenPath) {
                        "\"original_context_tokens\":262144}");
   require(runtimeStatusJson(memoryPlan, engine, metal, warmup, audit(memoryPlan), metrics, executorTelemetry,
                             yarnIdentity, governor, true, {}, wait, NativeLoopTiming{1843.25},
-                            {600.0, false, false, 2, 1}, aneFfn, ThermalState::Fair) == yarnExpected,
+                            {600.0, false, false, 2, 1}, aneFfn, ThermalState::Fair, table, experts,
+                            spill) == yarnExpected,
           "the cache identity did not report YaRN, or the status after it lost its precision");
   auto tokenMajorIdentity = identity;
   tokenMajorIdentity.kvLayout.valuesTokenMajor = true;
@@ -299,7 +396,7 @@ void testCleanRuntimeStatus(const char *goldenPath) {
                   std::string::npos &&
               tokenMajorStatus.find("\"value_layout\":\"token_major\"") != std::string::npos,
           "token-major values were reported dimension-major");
-  require(json.find("\"schema_version\":6") != std::string::npos &&
+  require(json.find("\"schema_version\":7") != std::string::npos &&
               json.find("\"ready\":true") != std::string::npos,
           "status readiness/schema is wrong");
   require(json.find("\"ready\":true,\"maximum_context_tokens\":102400,") !=
@@ -343,7 +440,7 @@ void testCleanRuntimeStatus(const char *goldenPath) {
   require(json.find("\"extent_allocations\":5,\"extent_releases\":3,"
                     "\"extent_allocate_max_ms\":2.5,\"extent_release_max_ms\":0.75,"
                     "\"extent_compactions\":2,\"pages_moved\":9,"
-                    "\"extent_compact_max_ms\":1.25}") !=
+                    "\"extent_compact_max_ms\":1.25,\"window\":{") !=
               std::string::npos,
           "status lost the KV extent growth and release diagnostics");
   require(json.find("\"system_pressure\":\"normal\"") != std::string::npos &&
@@ -351,8 +448,7 @@ void testCleanRuntimeStatus(const char *goldenPath) {
               json.find("\"host_headroom_bytes\":" + std::to_string(6 * kGiB)) !=
                   std::string::npos,
           "status omitted the host-side growth constraints");
-  require(json.find("\"serving_footprint_bytes\"") == std::string::npos &&
-              json.find("\"reserved_bytes\"") == std::string::npos,
+  require(json.find("\"serving_footprint_bytes\"") == std::string::npos,
           "status reported a governor field nothing reads");
   require(json.find("\"allocated_bytes\":350224384") != std::string::npos &&
               json.find("\"idle_gdn_cells\":1,\"idle_draft_rings\":2,\"idle_context_windows\":3,") !=
@@ -378,7 +474,7 @@ void testCleanRuntimeStatus(const char *goldenPath) {
           "status reported a lookup counter twice");
   require(json.find("\"block_tokens\":32") != std::string::npos &&
               json.find("\"decode_batches_by_width\":{\"b1\":1,\"b2\":1,\"b3\":"
-                        "1,\"b4\":1}}") != std::string::npos,
+                        "1,\"b4\":1},") != std::string::npos,
           "Page32 or real B3 status is missing");
   require(
       json.find("\"dynamic_budget_bytes\"") != std::string::npos &&
@@ -568,15 +664,17 @@ void testResourceWaitDiagnostics() {
   require(json.find("\"admission\":{\"waiting\":3,\"waiting_memory\":2,"
                     "\"waiting_concurrency\":1,\"held_behind_refusal\":4,\"restoring\":1,"
                     "\"suspended\":1,\"draining\":true,"
-                    "\"oldest_wait_ms\":1250},\"loop\":{\"max_tick_ms\":0}") !=
+                    "\"oldest_wait_ms\":1250},\"loop\":{\"max_tick_ms\":0,\"stall_budget_ms\":30000,") !=
               std::string::npos,
           "resource wait summary is missing or inaccurate");
   const std::string ticked = runtimeStatusJson(
       memoryPlan, {}, {}, {}, {}, {}, {}, {}, {}, true, {}, wait,
       NativeLoopTiming{1843.25}, {}, {}, {});
-  require(ticked.find("\"loop\":{\"max_tick_ms\":1843.25}") != std::string::npos &&
-              ticked.find("\"schema_version\":6") != std::string::npos,
-          "the loop's longest tick is missing, or changed the status schema");
+  require(ticked.find("\"loop\":{\"max_tick_ms\":1843.25,\"stall_budget_ms\":30000,\"tick_host_ms\":{\"p50\":0,"
+                      "\"p95\":0,\"p99\":0,\"max\":0,\"total\":0,\"samples\":0}}") != std::string::npos &&
+              ticked.find("\"schema_version\":7") != std::string::npos,
+          "the loop's longest tick, its stall budget or its ticks' host time is missing, or changed the "
+          "status schema");
 }
 
 // The weights' idle release, null with --idle-release off, whether they are
@@ -676,12 +774,8 @@ void testKvSpillStatus() {
                             .maxNewTokens = 512,
                             .kvMode = engine::KvMode::Spill}};
   // That one spilled, one other did after it converted, and one was refused
-  // for want of quota; another start waits for it. Its prefill streamed once
-  // beside a decoder, which waited 40 ms.
+  // for want of quota; another start waits for it.
   engine.spill = {.spill = 1, .resident = 3, .converted = 1, .refusedQuota = 1};
-  engine.scheduler.contendedStreamingPrefillBatches = 1;
-  engine.scheduler.decodeGap = {.count = 1, .totalMilliseconds = 40, .maximumMilliseconds = 40,
-                                .p50Milliseconds = 40, .p95Milliseconds = 40, .p99Milliseconds = 40};
   // 31,250 of its pages hold only their index, of 24 KiB, and a free extent of
   // them is the runway.
   engine.resources.pool.index = {.pagesAllocated = 31'506,
@@ -755,10 +849,10 @@ void testKvSpillStatus() {
       "\"ghost_hits\":512,\"read_bytes\":310000000,\"read_failures\":0,\"resolve_ms\":" +
       none + ",\"read_ms\":" + none + ",\"host_steps\":{\"pickup_ms\":" + none + ",\"work_ms\":" + none +
       ",\"resume_ms\":" + none +
-      "}},\"history_stream\":{\"commands\":2,\"contended_commands\":1,\"layers\":24,\"pages\":750000,"
+      "}},\"history_stream\":{\"commands\":2,\"layers\":24,\"pages\":750000,"
       "\"bytes\":24960000000,\"staging_bytes\":1056440320,\"buffers\":2,\"read_ms\":{\"p50\":262.144,"
       "\"p95\":262.144,\"p99\":262.144,\"max\":250,\"total\":5000,\"samples\":24},\"wait_ms\":" +
-      none + ",\"decode_gap_ms\":{\"p50\":40,\"p95\":40,\"p99\":40,\"max\":40,\"total\":40,\"samples\":1}}}";
+      none + "}}";
   require(json.find(expected) != std::string::npos, "the spilling target's kv_spill differs:\n" + json);
 }
 
@@ -819,7 +913,7 @@ void testStreamedTableStatus() {
                         "\"samples\":0},\"prefetch_requested_rows\":32768,") != std::string::npos &&
               json.find("\"prefetch_read_rows\":30000,\"prefetch_dropped_rows\":0,\"poisoned\":true,"
                         "\"failure\":\"injected\"}") != std::string::npos &&
-              json.find("\"schema_version\":6,") != std::string::npos,
+              json.find("\"schema_version\":7,") != std::string::npos,
           "the streamed table's status is missing or inaccurate");
 }
 

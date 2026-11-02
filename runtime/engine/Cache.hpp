@@ -4,6 +4,7 @@
 #include "engine/KvCache.hpp"
 #include "engine/KvPool.hpp"
 #include "engine/KvTier.hpp"
+#include "engine/MemoryLedger.hpp"
 #include "engine/ReclaimClass.hpp"
 #include "engine/StateCache.hpp"
 #include "engine/Types.hpp"
@@ -11,6 +12,7 @@
 #include "model/Model.hpp"
 #include "model/SlotFile.hpp"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -19,6 +21,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -370,7 +373,7 @@ struct PersistedState final {
 // block's state before its page (oldestKvLeaf skips it, and a page scan
 // takes the state a step before the leaf), and endRequest and pollTransfers
 // leave such a block its page.
-class Cache final {
+class Cache final : public VictimSource {
 public:
   // The disk budget is the quota the states' file shares with the KV tier;
   // the states' file can run on it without the tier. A persistent KV tier
@@ -546,6 +549,9 @@ public:
   // Full, which costs only memory, for the next pass. Returns the pages
   // moved; none with trim off.
   uint32_t trimWindows(bool allocate = true);
+  // The request's pages of the index form, whose K/V only the SSD cache
+  // holds.
+  [[nodiscard]] uint32_t indexPages(uint64_t requestId) const;
   [[nodiscard]] bool holdsIndexPages(uint64_t requestId) const;
   // Whether the copies Spill requests owe give back what a refusal lacks
   // while the SSD cache writes them: `pages` Full pages of KV, or with none
@@ -588,7 +594,8 @@ public:
   // whole when no other request holds it and no transfer moves it; else it
   // holds it spilled too.
   [[nodiscard]] TokenAdmission restoreRequest(uint64_t requestId,
-                                              const CacheLookup &lookup);
+                                              const CacheLookup &lookup,
+                                              std::array<uint32_t, 3> held = {});
   [[nodiscard]] KvRestoreStatus kvRestoreStatus(uint64_t requestId) const;
 
   // Gives the request pages for its first tokenCount tokens, which the work
@@ -596,10 +603,13 @@ public:
   // otherwise. A new page with a row the work does not write comes cleared:
   // attention weighs the rows past the request's end by zero, and a BF16
   // value is read as stored, so a non-finite one the page's previous holder
-  // left there would reach the request as 0 x NaN.
+  // left there would reach the request as 0 x NaN. `held[form]`, the free
+  // pages of the form waiting claims ranked above the request hold, goes to
+  // KvPool::acquirePages, which ignores it.
   [[nodiscard]] TokenAdmission
   ensureTokens(uint64_t requestId, uint64_t tokenCount,
-               uint64_t writtenTokens = std::numeric_limits<uint64_t>::max());
+               uint64_t writtenTokens = std::numeric_limits<uint64_t>::max(),
+               std::array<uint32_t, 3> held = {});
   // The request's page list as it is now, at the revision and first change
   // its next cut gives it.
   [[nodiscard]] PageTableState pageTable(uint64_t requestId) const;
@@ -662,6 +672,28 @@ public:
   [[nodiscard]] bool checkpointPinned(StateCheckpoint checkpoint) const noexcept {
     return states_.checkpointPinned(checkpoint);
   }
+
+  // The cache as a source of the units the memory ledger takes, in the order
+  // of its walk: free pages first (an empty extent, then compaction toward
+  // one; other forms' empty extents for a page need), a windowed cache's
+  // trims for Full pages, checkpoints, KV no state restores through,
+  // ordinary states and resident leaves by one recency order, then units of
+  // certain reuse (the newest resume point, the wanted chains), then, for a
+  // claim that reaches InUse alone, states in use and the KV they restore
+  // through. A device need's unit is one extent released and costs the
+  // victims that empty it; an in-place page need's is one leaf, a state
+  // need's one state. Immediate passes over units that free memory only as
+  // a transfer lands. A unit the query cannot use is passed over.
+  [[nodiscard]] std::string_view name() const noexcept override { return "cache"; }
+  [[nodiscard]] std::optional<engine::Victim> peek(const VictimQuery &query,
+                                                   const engine::Victim *after) const override;
+  FreeResult take(const VictimQuery &query, const engine::Victim &victim) override;
+  // What the transfers in flight and the copies Spill requests owe free as
+  // they land.
+  [[nodiscard]] Returning returning() const noexcept;
+  // The chains the requests waiting to start restore (their admission
+  // probes): units on them are of certain reuse.
+  void setWantedChains(std::vector<std::span<const uint64_t>> chains);
 
   // Releases every empty extent, but one with keepRunway, and returns the
   // bytes released.
@@ -927,8 +959,8 @@ private:
     bool kv = false;
   };
 
-  [[nodiscard]] TokenAdmission admitPages(uint32_t count, std::vector<uint32_t> &pages,
-                                          kv::PageForm form = kv::PageForm::Full);
+  [[nodiscard]] TokenAdmission admitPages(uint32_t count, std::vector<uint32_t> &pages, kv::PageForm form,
+                                          uint32_t held);
   // What an allocation that was refused lacks, as the free pages that cover
   // it: the KV pages it lacks, of their form; for memory the governor funds,
   // an extent's worth of Full pages, whose extent then leaves memory; none

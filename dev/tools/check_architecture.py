@@ -40,6 +40,80 @@ SLEEP_COUNTING_CLOCK = re.compile(
 HUGGING_FACE_TOKEN = re.compile(
     r"\b(?:HF_TOKEN|HUGGING_FACE_HUB_TOKEN)\b|\bsecrets\s*(?:\.\s*|\[\s*['\"])HF_"
 )
+# Engine files that assemble concrete models or parse their options, and the
+# status writer, which renders model telemetry types: they may name models and
+# mechanisms. Every other engine file is policy.
+ENGINE_ASSEMBLY = frozenset(
+    {
+        "runtime/engine/Bootstrap.hpp",
+        "runtime/engine/Bootstrap.mm",
+        "runtime/engine/RuntimeResources.hpp",
+        "runtime/engine/RuntimeResources.mm",
+        "runtime/engine/NativeArguments.hpp",
+        "runtime/engine/NativeArguments.cpp",
+    }
+)
+ENGINE_REPORTING = frozenset({"runtime/engine/Status.hpp", "runtime/engine/Status.cpp"})
+# The concrete models' headers, which engine assembly alone includes: neither
+# the status writer nor startup does, and engine policy includes model headers
+# from the boundary only.
+CONCRETE_MODEL_HEADERS = (
+    "model/DFlashDraft.hpp",
+    "model/Flint.hpp",
+    "model/FlintTarget.hpp",
+    "model/ModelFactory.hpp",
+    "model/Qwen3_6Moe.hpp",
+    "model/Qwen3_8.hpp",
+    "model/Qwen4Exp.hpp",
+    "model/Qwen4ExpTarget.hpp",
+    "model/Qwen4Steps.hpp",
+    "model/QwenHybridLayout.hpp",
+    "model/QwenState.hpp",
+    "model/QwenTarget.hpp",
+    "model/QwenTargetFiles.hpp",
+    "model/QwenTargetLoader.hpp",
+    "model/Runtime.hpp",
+    "model/WeightStore.hpp",
+)
+# Identifier word parts (identifier_parts): engine policy decides from what
+# the model reports (costs, pools, shape), never from which model
+# (MODEL_FAMILY_PARTS, below) or mechanism serves it. An identifier names a
+# mechanism when it holds every word of one of these, in any order
+# (names_mechanism).
+MODEL_MECHANISM_WORDS = (
+    ("expert",),
+    ("indexer",),
+    ("ple",),
+    ("history", "stream"),
+    ("history", "staging"),
+    ("block", "cache"),
+    ("sparse", "row"),
+    ("hyper", "connection"),
+    ("values", "token", "major"),
+)
+# The model headers engine policy may include: the boundary and the storage
+# the KV tier uses.
+ENGINE_MODEL_BOUNDARY = frozenset(
+    {
+        "model/Model.hpp",
+        "model/CommandCost.hpp",
+        "model/ElasticPool.hpp",
+        "model/LatencyHistogram.hpp",
+        "model/SlotFile.hpp",
+        "model/SsdReaders.hpp",
+        "model/KvCopyRead.hpp",
+        "model/WeightMemory.hpp",
+    }
+)
+# Comments and string and character literals, which the identifier rules do
+# not read; a quote after a word character separates digits.
+NOT_CODE = re.compile(
+    r"//[^\n]*|/\*.*?\*/|\"(?:\\.|[^\"\\\n])*\"|(?<!\w)'(?:\\.|[^'\\\n])*'", re.S
+)
+IDENTIFIER = re.compile(r"\b[A-Za-z_]\w*")
+# A word of an identifier: an uppercase run before a capitalized word, a
+# capitalized or lowercase word, an uppercase run, or a number.
+IDENTIFIER_PART = re.compile(r"[A-Z]{2,}(?=[A-Z][a-z])|[A-Z]*[a-z]+|[A-Z]+|\d+")
 
 
 def production_sources() -> list[Path]:
@@ -65,6 +139,99 @@ def include_paths(path: Path, text: str) -> list[str]:
             include = posixpath.relpath(beside, (ROOT / "runtime").as_posix())
         result.append(posixpath.normpath(include))
     return result
+
+
+def identifier_parts(identifier: str) -> list[str]:
+    """The lower-cased words of an identifier, split at underscores, numbers
+    and case changes. An uppercase run before a capitalized word is a word of
+    its own (PLERows: ple, rows); a single capital is the start of the word
+    after it (DFlashDraft: dflash, draft)."""
+    return [part.lower() for part in IDENTIFIER_PART.findall(identifier)]
+
+
+def family_names(path: Path) -> list[tuple[str, str]]:
+    """The name and the draft's repository of each family the installer
+    serves (FAMILIES in install/families.py)."""
+    families = next(
+        node.value
+        for node in ast.parse(path.read_text()).body
+        if isinstance(node, ast.Assign)
+        and any(getattr(target, "id", None) == "FAMILIES" for target in node.targets)
+    )
+    return [(family.args[0].value, family.args[1].value) for family in families.elts]
+
+
+def family_words(
+    families: list[tuple[str, str]], headers: tuple[str, ...]
+) -> frozenset[str]:
+    """The words a family goes by: the first word of a family's name and of
+    its draft's repository after the owner, the model's brand (Qwen, Ornith,
+    Flint), and those of either that a concrete model header's name holds
+    too (DFlash). Numbers are not words, and a name's other words (Flash,
+    Next, a size, the repository's owner) are no family's."""
+    header_words = {
+        part for header in headers for part in identifier_parts(Path(header).stem)
+    }
+
+    def words(name: str) -> list[str]:
+        return [part for part in identifier_parts(name) if part.isalpha()]
+
+    return frozenset(
+        part
+        for family, repository in families
+        for name in (words(family), words(repository.rpartition("/")[2]))
+        for part in name
+        if part == name[0] or part in header_words
+    )
+
+
+MODEL_FAMILY_PARTS = family_words(
+    family_names(ROOT / "install/families.py"), CONCRETE_MODEL_HEADERS
+)
+
+
+def singular(word: str) -> str:
+    """A word without a trailing s, so that a plural names what its singular
+    does."""
+    return word.removesuffix("s")
+
+
+def names_mechanism(parts: list[str]) -> bool:
+    """Whether an identifier of these words holds every word of a model
+    mechanism, in any order, singular or plural."""
+    words = {singular(part) for part in parts}
+    return any(
+        all(singular(word) in words for word in mechanism)
+        for mechanism in MODEL_MECHANISM_WORDS
+    )
+
+
+def code_identifiers(text: str) -> list[str]:
+    """The identifiers of a source, without its comments, literals and
+    include paths."""
+    return IDENTIFIER.findall(NOT_CODE.sub(" ", INCLUDE.sub(" ", text)))
+
+
+def check_engine_policy(
+    name: str, text: str, includes: list[str], mechanisms: bool
+) -> list[str]:
+    """An engine policy file's model dependencies: model headers outside the
+    boundary, and identifiers that name a model family or, with `mechanisms`,
+    a model mechanism."""
+    errors = [
+        f"{name}: engine policy depends on model internals {include}"
+        for include in includes
+        if include.startswith("model/") and include not in ENGINE_MODEL_BOUNDARY
+    ]
+    for identifier in dict.fromkeys(code_identifiers(text)):
+        parts = identifier_parts(identifier)
+        if MODEL_FAMILY_PARTS.intersection(parts):
+            errors.append(f"{name}: engine policy names a model family ({identifier})")
+        elif mechanisms and names_mechanism(parts):
+            errors.append(
+                f"{name}: engine policy names a model mechanism ({identifier})"
+            )
+    return errors
 
 
 def imported_module(call: ast.Call) -> str | None:
@@ -178,28 +345,6 @@ def check() -> list[str]:
     forbidden_metal_dependencies = ("engine/", "model/", "ops/")
     forbidden_model_dependencies = ("engine/",)
     forbidden_operator_dependencies = ("engine/", "model/")
-    engine_assembly_sources = {
-        "runtime/engine/Bootstrap.hpp",
-        "runtime/engine/Bootstrap.mm",
-        "runtime/engine/RuntimeResources.hpp",
-        "runtime/engine/RuntimeResources.mm",
-    }
-    concrete_model_headers = (
-        "model/DFlashDraft.hpp",
-        "model/ModelFactory.hpp",
-        "model/Qwen3_6Moe.hpp",
-        "model/Qwen3_8.hpp",
-        "model/Qwen4Exp.hpp",
-        "model/Qwen4ExpTarget.hpp",
-        "model/Qwen4Steps.hpp",
-        "model/QwenHybridLayout.hpp",
-        "model/QwenState.hpp",
-        "model/QwenTarget.hpp",
-        "model/QwenTargetFiles.hpp",
-        "model/QwenTargetLoader.hpp",
-        "model/Runtime.hpp",
-        "model/WeightStore.hpp",
-    )
     concrete_model_symbols = re.compile(r"\bmodel::(?:Qwen\w*|DFlash\w*|Runtime)\b")
     client_names = re.compile(r"\b(?:Claude Code|OpenCode|Codex|Hermes)\b", re.I)
 
@@ -232,15 +377,18 @@ def check() -> list[str]:
                     errors.append(
                         f"{name}: operator depends on upper production layer {include}"
                     )
-        if name.startswith("runtime/engine/") and name not in engine_assembly_sources:
+        if name in ENGINE_REPORTING:
             for include in includes:
-                if include in concrete_model_headers:
+                if include in CONCRETE_MODEL_HEADERS:
                     errors.append(
-                        f"{name}: engine policy depends on concrete model {include}"
+                        f"{name}: engine reporting depends on concrete model {include}"
                     )
+        elif name.startswith("runtime/engine/") and name not in ENGINE_ASSEMBLY:
+            # Mechanism names are not checked: engine policy still names some.
+            errors.extend(check_engine_policy(name, text, includes, mechanisms=False))
         if name == "runtime/main.mm":
             for include in includes:
-                if include in concrete_model_headers:
+                if include in CONCRETE_MODEL_HEADERS:
                     errors.append(
                         f"{name}: startup depends on concrete model {include}"
                     )

@@ -1,14 +1,18 @@
 #pragma once
 
+#include "engine/MemoryLedger.hpp"
 #include "engine/ReclaimClass.hpp"
 #include "metal/MetalBackend.hpp"
 
 #include <cstdint>
 #include <functional>
 #include <optional>
+#include <string>
+#include <vector>
 
 namespace splash::engine {
 
+struct EngineConfig;
 struct EngineMemoryBreakdown;
 
 struct HostMemoryPages {
@@ -95,6 +99,45 @@ inline constexpr uint64_t kHostRecoveryMarginBytes = 2ULL << 30;
 [[nodiscard]] uint64_t hostBudgetBytes(const HostMemory &host, uint64_t spareReserveBytes,
                                        uint64_t engineBytes) noexcept;
 
+// One account of the memory ledger: a consumer the ledger moves between its
+// floor and its cap, named as its owner names it ("kv", "states", "fixed",
+// or a model pool's name, which status renders and nothing branches on).
+struct MemoryAccountSnapshot final {
+  std::string name;
+  uint64_t floorBytes = 0;
+  uint64_t currentBytes = 0;
+  // The bound its growth approaches (model::PoolState::capBytes).
+  uint64_t capBytes = 0;
+  // Its pending growth, which the ledger holds for it against every other
+  // account: its target is its current bytes and these.
+  uint64_t reservedBytes = 0;
+  uint64_t unitBytes = 0;
+  // What its next unit is worth: seconds of engine work over the ledger's
+  // value horizon, per GiB.
+  double valuePerGiB = 0.0;
+  // Units it took and gave back since the engine started.
+  uint64_t grows = 0;
+  uint64_t shrinks = 0;
+};
+
+// Bytes that transfers in flight or owed free when they land, the part of
+// them owed to waiting claims, and the age of the oldest transfer.
+struct OwedBytesSnapshot final {
+  uint32_t transfers = 0;
+  uint64_t bytes = 0;
+  uint64_t toClaimsBytes = 0;
+  double oldestMilliseconds = 0.0;
+};
+
+// Requests that cannot proceed for want of memory (a wait for the SSD
+// cache's quota is not one): how many, the bytes they lack, and how long the
+// oldest has waited.
+struct MemoryClaimsSnapshot final {
+  uint32_t waiting = 0;
+  uint64_t bytes = 0;
+  double oldestMilliseconds = 0.0;
+};
+
 struct MemoryGovernorSnapshot {
   uint64_t limitBytes = 0;
   // Charged against the limit: the backend's allocated buffers plus the
@@ -121,6 +164,12 @@ struct MemoryGovernorSnapshot {
   // Allocation need not ask: admission names the host as the cause of every
   // refusal the host shares.
   bool hostGrowthAllowed = true;
+  // The ledger's accounts, their reserved bytes summed, what transfers will
+  // return, and the claims that wait.
+  std::vector<MemoryAccountSnapshot> accounts{};
+  uint64_t reservedBytes = 0;
+  OwedBytesSnapshot owed{};
+  MemoryClaimsSnapshot claims{};
 };
 
 // Critical pressure evicts every unpinned entry and takes what a request
@@ -283,6 +332,53 @@ public:
   // moved to its sample, as a reservation's moves it.
   MemoryGovernorSnapshot evaluate() noexcept;
 
+  // The accounts, claims and victim sources the governor's rule works on.
+  [[nodiscard]] MemoryLedger &ledger() noexcept { return ledger_; }
+  [[nodiscard]] const MemoryLedger &ledger() const noexcept { return ledger_; }
+  // While one lives, admissions are for `claim`; `growing` names the account
+  // a ledger growth allocates into, whose own pending growth is not held
+  // against it. It restores the scope it replaced.
+  class Scope final {
+  public:
+    Scope(MemoryGovernor &governor, ClaimId claim, std::optional<AccountId> growing = {}) noexcept;
+    ~Scope();
+    Scope(const Scope &) = delete;
+    Scope &operator=(const Scope &) = delete;
+
+  private:
+    MemoryGovernor &governor_;
+    ClaimId previousClaim_;
+    std::optional<AccountId> previousGrowing_;
+  };
+  // The need its scope's refusals recorded, with the caller's in-place part.
+  [[nodiscard]] Need need(ClaimId claim, const std::optional<Need> &inPlace = {}) const;
+  // Frees what the claim lacks (MemoryLedger::free). A need the host refused
+  // is met in place first, from the pages and state buffers already
+  // allocated; failing that, a Floor or InService claim's retries pass the
+  // host, and another class's claim falls short.
+  [[nodiscard]] FreeResult free(ClaimId claim, const Need &need);
+  // What free() would find for such a claim, up to `enough`, taking nothing.
+  [[nodiscard]] uint64_t available(const ClaimSpec &spec, uint64_t enough) const;
+  // Whether the host admits an allocation of the class, as its last sample
+  // found: the paths that ask take no sample of their own, unlike
+  // EngineConfig::growthPaused.
+  [[nodiscard]] bool admits(ClaimClass cls) const noexcept;
+  // Whether memory wants a temporary tier's copies ahead of need: the host
+  // is constrained, growth is pending, or the room for growth is short of
+  // one unit.
+  [[nodiscard]] bool copyDemand() const noexcept;
+  // Whether a claim waits for memory on its way back, which copies ahead
+  // would hold up.
+  [[nodiscard]] bool claimWaiting() const noexcept;
+  // The control pass's decision: under critical pressure every pool to its
+  // floor, else the host's deficit freed or the pools grown into free room.
+  // Throws with a command in flight (the caller checks). True when the
+  // host's deficit is unmet while bytes are returning: the transport runs
+  // the pass again at the next command-free point.
+  [[nodiscard]] bool controlPass(double nowMilliseconds);
+  // At startup, before Ready: grows the pools into the free room.
+  void growToTargets(double nowMilliseconds);
+
 private:
   // Held while an admitted allocation runs; released when it ends.
   class Reservation final {
@@ -321,6 +417,17 @@ private:
   [[nodiscard]] bool growthHeld(const HostState &host) const noexcept {
     return requestWaiting_ && host.held();
   }
+  // The host's rule at its latest sample: which classes it admits, and the
+  // deficit a host pass frees.
+  class HostRule final {
+  public:
+    void sample(const std::optional<HostMemory> &host, uint64_t spareReserve, uint64_t inFlight,
+                MemoryPressure system, uint64_t hysteresisBytes, bool reclaimShort) noexcept;
+    [[nodiscard]] bool admits(ClaimClass cls, uint64_t bytes, bool hostExempt) const noexcept;
+    [[nodiscard]] uint64_t deficitBytes(uint64_t refusedWaitingBytes, uint64_t returningBytes) const noexcept;
+    [[nodiscard]] bool constrained() const noexcept;
+    [[nodiscard]] MemoryPressure level() const noexcept;
+  };
   // allocationAdmission's reservation, or growthAdmission's where
   // `optional`.
   [[nodiscard]] metal::AllocationAdmission admission(bool optional) noexcept;
@@ -356,6 +463,15 @@ private:
   MemoryPressure systemPressure_ = MemoryPressure::Normal;
   // As the latest reservation or control pass evaluated it.
   HostState host_;
+  MemoryLedger ledger_;
+  // The innermost Scope's claim and growing account.
+  ClaimId scope_;
+  std::optional<AccountId> growing_;
 };
+
+// Connects an engine to the governor that admits its memory: the engine asks
+// it whether the host pauses growth, and marks the allocations a request in
+// service makes. Every engine that runs against a governor connects through it.
+void connectToGovernor(EngineConfig &config, MemoryGovernor &governor);
 
 } // namespace splash::engine

@@ -16,6 +16,12 @@ def is_finite_number(value):
         return False
 
 
+def label_value(text):
+    """A label value in the Prometheus text format: backslash, double quote
+    and line feed escaped."""
+    return text.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
+
 # Each gauge or counter Prometheus reads from the status, by the path of
 # keys to its value.
 PROMETHEUS_SERIES = {
@@ -63,6 +69,27 @@ PROMETHEUS_SERIES = {
         "scheduler",
         "decode_batches_by_width",
         "b4",
+    ),
+    "splash_scheduler_decode_gap_target_milliseconds": (
+        "scheduler",
+        "decode_gap_target_ms",
+    ),
+    "splash_scheduler_contended_prefill_p99_milliseconds": (
+        "scheduler",
+        "contended_prefill_ms",
+        "p99",
+    ),
+    "splash_scheduler_contended_prefill_max_milliseconds": (
+        "scheduler",
+        "contended_prefill_ms",
+        "max",
+    ),
+    "splash_scheduler_prefill_estimate_error_p95_ratio": (
+        "scheduler",
+        "estimate",
+        "prefill",
+        "relative_error",
+        "p95",
     ),
     "splash_kv_pages_allocated": ("kv", "pages_allocated"),
     "splash_kv_pages_active": ("kv", "pages_active"),
@@ -158,6 +185,18 @@ PROMETHEUS_SERIES = {
     ),
     "splash_memory_limit_bytes": ("memory_governor", "limit_bytes"),
     "splash_memory_headroom_bytes": ("memory_governor", "headroom_bytes"),
+    "splash_memory_reserved_bytes": ("memory_governor", "reserved_bytes"),
+    "splash_memory_owed_bytes": ("memory_governor", "owed", "bytes"),
+    "splash_memory_owed_transfers": ("memory_governor", "owed", "transfers"),
+    "splash_memory_claims_waiting": ("memory_governor", "claims", "waiting"),
+    "splash_memory_claims_bytes": ("memory_governor", "claims", "bytes"),
+    "splash_streamed_experts_chunks": ("streamed_experts", "chunks"),
+    "splash_streamed_experts_shrinks_total": ("streamed_experts", "shrinks"),
+    "splash_streamed_experts_regrows_total": ("streamed_experts", "regrows"),
+    "splash_kv_spill_converted_total": ("kv_spill", "requests", "converted"),
+    "splash_loop_max_tick_milliseconds": ("loop", "max_tick_ms"),
+    "splash_loop_tick_host_p99_milliseconds": ("loop", "tick_host_ms", "p99"),
+    "splash_loop_tick_host_max_milliseconds": ("loop", "tick_host_ms", "max"),
     "splash_admission_waiting_memory": ("admission", "waiting_memory"),
     "splash_admission_waiting_concurrency": ("admission", "waiting_concurrency"),
     "splash_admission_held_behind_refusal": ("admission", "held_behind_refusal"),
@@ -168,6 +207,10 @@ PROMETHEUS_SERIES = {
     "splash_ttft_p95_milliseconds": ("metrics", "ttft_ms", "p95"),
     "splash_itl_p50_milliseconds": ("metrics", "itl_ms", "p50"),
     "splash_itl_p95_milliseconds": ("metrics", "itl_ms", "p95"),
+    "splash_decode_gap_p50_milliseconds": ("metrics", "decode_gap_ms", "p50"),
+    "splash_decode_gap_p99_milliseconds": ("metrics", "decode_gap_ms", "p99"),
+    "splash_decode_gap_max_milliseconds": ("metrics", "decode_gap_ms", "max"),
+    "splash_decode_gaps_total": ("metrics", "decode_gap_ms", "samples"),
     "splash_prefill_input_tokens_total": ("metrics", "prefill_input_tokens"),
     "splash_prefill_wall_milliseconds_total": ("metrics", "prefill_wall_ms"),
     "splash_prefill_tokens_per_second": (
@@ -225,6 +268,17 @@ def prometheus_metrics(status):
     for state in ("no", "budget", "closed"):
         lines.append(
             f'splash_disk_writes_gated{{state="{state}"}} {1 if gated == state else 0}'
+        )
+    for account in status.get("memory_governor", {}).get("accounts", ()):
+        label = f'account="{label_value(account["name"])}"'
+        for measure in ("floor", "current", "cap", "reserved"):
+            lines.append(
+                f'splash_memory_account_bytes{{{label},measure="{measure}"}} '
+                f"{account[measure + '_bytes']}"
+            )
+        lines.append(f"splash_memory_account_grows_total{{{label}}} {account['grows']}")
+        lines.append(
+            f"splash_memory_account_shrinks_total{{{label}}} {account['shrinks']}"
         )
     for name, path in PROMETHEUS_SERIES.items():
         metric_value = value(path)

@@ -204,7 +204,8 @@ struct QwenHybridLayout : QwenTargetDimensions {
             .indexDimension = indexerHeadDimension,
             .valuesTokenMajor = hasIndexer(),
             .windowTokens = slidingWindow ? slidingWindow - 1 : 0,
-            .windowedLayers = slidingLayers};
+            .windowedLayers = slidingLayers,
+            .reads = hasIndexer() ? kv::Reads::SelectedBlocks : kv::Reads::EveryPage};
   }
   // The GDN layers' state and, after it in a cell, a PLE convolution's
   // history and the QSA indexer's pending keys.

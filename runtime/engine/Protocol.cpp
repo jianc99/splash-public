@@ -889,6 +889,8 @@ std::string_view frameTypeName(FrameType type) {
     return "error";
   case FrameType::StatusJson:
     return "status_json";
+  case FrameType::StartFailed:
+    return "start_failed";
   }
   return "unknown";
 }
@@ -1043,6 +1045,8 @@ serializeEvent(const EngineEvent &event, const ProtocolLimits &limits) {
             return encodeDone(value);
           } else if constexpr (std::is_same_v<T, ErrorEvent>) {
             return encodeError(value, limits);
+          } else if constexpr (std::is_same_v<T, StartFailedEvent>) {
+            throw std::logic_error("C-E");
           } else {
             return encodeStatusJson(value, limits);
           }

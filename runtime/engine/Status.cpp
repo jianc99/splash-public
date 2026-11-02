@@ -1,5 +1,6 @@
 #include "engine/Status.hpp"
 
+#include "Supervision.hpp"
 #include "engine/Json.hpp"
 #include "engine/Protocol.hpp"
 #include "engine/RuntimeResources.hpp"
@@ -215,9 +216,8 @@ void appendKvWindow(std::ostringstream &out, const KvWindowSnapshot &window, con
 // as the cache does), of `indexPageBytes` each, and those spilled; the
 // write-through of Spill requests' pages; the moves between page forms,
 // rewrites and restores; the quota of active KV; the Index runway, the free
-// pages of that form; and the readers' memory and reads, with the commands
-// that streamed a history beside decoders and the decoders' gaps across them.
-// A target that keeps its KV in memory has none: its /status is main's.
+// pages of that form; and the readers' memory and reads. A target that keeps
+// its KV in memory has none: its /status is main's.
 void appendKvSpill(std::ostringstream &out, const KvSpillStatus &spill, uint64_t indexPageBytes,
                    const engine::EngineSnapshot &core, const ResourceWaitSnapshot &resourceWait) {
   const KvSpillSnapshot &cache = spill.cache;
@@ -262,21 +262,54 @@ void appendKvSpill(std::ostringstream &out, const KvSpillStatus &spill, uint64_t
   }
   out << ",\"history_stream\":";
   if (const std::optional<model::KvHistoryStreamStats> &stream = spill.historyStream) {
-    out << "{\"commands\":" << stream->commands
-        << ",\"contended_commands\":" << core.scheduler.contendedStreamingPrefillBatches
-        << ",\"layers\":" << stream->layers << ",\"pages\":" << stream->pages << ",\"bytes\":" << stream->bytes
-        << ",\"staging_bytes\":" << stream->stagingBytes << ",\"buffers\":" << stream->buffers
-        << ",\"read_ms\":";
+    out << "{\"commands\":" << stream->commands << ",\"layers\":" << stream->layers << ",\"pages\":" << stream->pages
+        << ",\"bytes\":" << stream->bytes << ",\"staging_bytes\":" << stream->stagingBytes
+        << ",\"buffers\":" << stream->buffers << ",\"read_ms\":";
     appendLatency(out, stream->read);
     out << ",\"wait_ms\":";
     appendLatency(out, stream->wait);
-    out << ",\"decode_gap_ms\":";
-    appendLatency(out, core.scheduler.decodeGap);
     out << '}';
   } else {
     out << "null";
   }
   out << '}';
+}
+
+// The memory ledger in memory_governor (MemoryGovernorSnapshot): each
+// account's floor, current bytes and cap, what the ledger holds for its
+// growth, its unit and the value of its next one, and the units it took and
+// gave back; the reservations summed; the bytes transfers will return; and
+// the claims that wait for memory.
+void appendMemoryLedger(std::ostringstream &out, const MemoryGovernorSnapshot &governor) {
+  out << ",\"accounts\":[";
+  for (size_t index = 0; index < governor.accounts.size(); ++index) {
+    const MemoryAccountSnapshot &account = governor.accounts[index];
+    out << (index ? "," : "") << "{\"name\":" << json::quote(account.name)
+        << ",\"floor_bytes\":" << account.floorBytes << ",\"current_bytes\":" << account.currentBytes
+        << ",\"cap_bytes\":" << account.capBytes << ",\"reserved_bytes\":" << account.reservedBytes
+        << ",\"unit_bytes\":" << account.unitBytes << ",\"value_per_gib\":" << account.valuePerGiB
+        << ",\"grows\":" << account.grows << ",\"shrinks\":" << account.shrinks << '}';
+  }
+  out << "],\"reserved_bytes\":" << governor.reservedBytes << ",\"owed\":{\"transfers\":" << governor.owed.transfers
+      << ",\"bytes\":" << governor.owed.bytes << ",\"to_claims_bytes\":" << governor.owed.toClaimsBytes
+      << ",\"oldest_ms\":" << governor.owed.oldestMilliseconds << "},\"claims\":{\"waiting\":"
+      << governor.claims.waiting << ",\"bytes\":" << governor.claims.bytes
+      << ",\"oldest_ms\":" << governor.claims.oldestMilliseconds << '}';
+}
+
+// A command estimate (scheduler.estimate): the commands or passes that
+// trained it and those it clamped, per quantity its rate and the seed's, and
+// its relative error.
+void appendEstimate(std::ostringstream &out, const CostEstimateSnapshot &estimate) {
+  out << "{\"samples\":" << estimate.samples << ",\"clamped\":" << estimate.clamped << ",\"terms\":[";
+  for (size_t index = 0; index < estimate.terms.size(); ++index) {
+    const CostTermSnapshot &term = estimate.terms[index];
+    out << (index ? "," : "") << "{\"quantity\":" << json::quote(term.quantity)
+        << ",\"ms_per_unit\":" << term.millisecondsPerUnit << ",\"seed_ms_per_unit\":" << term.seedMillisecondsPerUnit
+        << '}';
+  }
+  out << "],\"relative_error\":{\"p50\":" << estimate.relativeErrorP50 << ",\"p95\":" << estimate.relativeErrorP95
+      << "}}";
 }
 
 } // namespace
@@ -333,8 +366,10 @@ std::string runtimeStatusJson(
       << ",\"suspended\":" << resourceWait.suspended
       << ",\"draining\":" << boolean(resourceWait.draining)
       << ",\"oldest_wait_ms\":" << resourceWait.oldestWaitMilliseconds << "}"
-      << ",\"loop\":{\"max_tick_ms\":" << loop.maxTickMilliseconds << "}"
-      << ",\"identity\":{\"cache\":{"
+      << ",\"loop\":{\"max_tick_ms\":" << loop.maxTickMilliseconds
+      << ",\"stall_budget_ms\":" << supervision::kLoopStall.count() << ",\"tick_host_ms\":";
+  appendLatency(out, core.tickHostMilliseconds);
+  out << "},\"identity\":{\"cache\":{"
       << "\"loaded_model_layout_sha256\":"
       << json::quote(cacheIdentity.modelLayoutSha256)
       << ",\"build_id\":" << json::quote(cacheIdentity.buildId)
@@ -368,7 +403,9 @@ std::string runtimeStatusJson(
       << ",\"host_reserve_bytes\":" << memoryGovernor.hostReserveBytes
       << ",\"host_spare_bytes\":" << memoryGovernor.hostSpareBytes
       << ",\"host_spare_reserve_bytes\":" << memoryGovernor.hostSpareReserveBytes
-      << ",\"host_headroom_bytes\":" << memoryGovernor.hostHeadroomBytes << "}"
+      << ",\"host_headroom_bytes\":" << memoryGovernor.hostHeadroomBytes;
+  appendMemoryLedger(out, memoryGovernor);
+  out << "}"
       << ",\"memory_audit\":" << memoryAudit.toStatusJson()
       << ",\"weights\":";
   appendWeights(out, weights);
@@ -541,8 +578,20 @@ std::string runtimeStatusJson(
       << scheduler.decodeBatchesByWidth[0]
       << ",\"b2\":" << scheduler.decodeBatchesByWidth[1]
       << ",\"b3\":" << scheduler.decodeBatchesByWidth[2]
-      << ",\"b4\":" << scheduler.decodeBatchesByWidth[3] << "}}";
-  out << ",\"active_requests\":[";
+      << ",\"b4\":" << scheduler.decodeBatchesByWidth[3] << "}"
+      << ",\"decode_gap_target_ms\":" << scheduler.decodeGapTargetMilliseconds
+      << ",\"contended_prefill_ms\":";
+  appendLatency(out, scheduler.contendedPrefill);
+  out << ",\"prefill_units\":" << scheduler.prefillUnits
+      << ",\"pass_commands\":" << scheduler.passCommands
+      << ",\"abandoned_pass_commands\":" << scheduler.abandonedPassCommands
+      << ",\"bound_cuts\":" << scheduler.boundCuts
+      << ",\"index_page_conflicts\":" << scheduler.indexPageConflicts
+      << ",\"replans\":" << core.replans << ",\"estimate\":{\"prefill\":";
+  appendEstimate(out, scheduler.prefillEstimate);
+  out << ",\"decode\":";
+  appendEstimate(out, scheduler.decodeEstimate);
+  out << "}},\"active_requests\":[";
   for (size_t index = 0; index < core.activeRequests.size(); ++index) {
     const engine::ActiveRequestSnapshot &request = core.activeRequests[index];
     out << (index ? "," : "") << "{\"id\":" << request.id
@@ -567,8 +616,9 @@ std::string runtimeStatusJson(
       << ",\"samples\":" << metrics.ttftSamples
       << "},\"itl_ms\":{\"p50\":" << metrics.itlP50Milliseconds
       << ",\"p95\":" << metrics.itlP95Milliseconds
-      << ",\"samples\":" << metrics.itlSamples
-      << "},\"prefill_input_tokens\":" << metrics.prefillInputTokens
+      << ",\"samples\":" << metrics.itlSamples << "},\"decode_gap_ms\":";
+  appendLatency(out, metrics.decodeGap);
+  out << ",\"prefill_input_tokens\":" << metrics.prefillInputTokens
       << ",\"prefill_wall_ms\":" << metrics.prefillWallMilliseconds
       << ",\"prefill_tokens_per_second\":" << metrics.prefillTokensPerSecond
       << ",\"decode_output_tokens\":" << metrics.decodeOutputTokens

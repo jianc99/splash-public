@@ -55,7 +55,7 @@ KvPool::RunwayHold::~RunwayHold() {
     pool_.releasePage(page, false);
 }
 
-KvPageAcquisition KvPool::acquirePages(uint32_t count, kv::PageForm form) {
+KvPageAcquisition KvPool::acquirePages(uint32_t count, kv::PageForm form, uint32_t) {
   KvPageAcquisition acquired = takeFreePages(count, form);
   for (uint32_t page : acquired.pages) {
     markUsed(page);

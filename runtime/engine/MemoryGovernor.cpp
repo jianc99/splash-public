@@ -1,5 +1,6 @@
 #include "engine/MemoryGovernor.hpp"
 
+#include "engine/Engine.hpp"
 #include "engine/MemoryPlan.hpp"
 
 #include <dispatch/dispatch.h>
@@ -356,6 +357,25 @@ void MemoryGovernor::release(uint64_t bytes) noexcept {
   reservedBytes_ -= bytes;
 }
 
+MemoryGovernor::Scope::Scope(MemoryGovernor &governor, ClaimId claim, std::optional<AccountId> growing) noexcept
+    : governor_(governor), previousClaim_(std::exchange(governor.scope_, claim)),
+      previousGrowing_(std::exchange(governor.growing_, growing)) {}
+
+MemoryGovernor::Scope::~Scope() {
+  governor_.scope_ = previousClaim_;
+  governor_.growing_ = previousGrowing_;
+}
+
+Need MemoryGovernor::need(ClaimId, const std::optional<Need> &) const { throw std::logic_error("M1"); }
+
+FreeResult MemoryGovernor::free(ClaimId, const Need &) { throw std::logic_error("M1"); }
+
+uint64_t MemoryGovernor::available(const ClaimSpec &, uint64_t) const { throw std::logic_error("M1"); }
+
+bool MemoryGovernor::controlPass(double) { throw std::logic_error("M1"); }
+
+void MemoryGovernor::growToTargets(double) { throw std::logic_error("M1"); }
+
 std::optional<MemoryReclaimDirective> MemoryPressurePolicy::update(
     const MemoryGovernorSnapshot &snapshot, double nowMilliseconds,
     bool requestWaiting) noexcept {
@@ -420,6 +440,13 @@ void MemoryPressurePolicy::reclaimed(const MemoryReclaimDirective &directive,
     return;
   continued_ = directive;
   continued_->targetBytes -= std::min(result.releasedBytes, directive.targetBytes);
+}
+
+void connectToGovernor(EngineConfig &config, MemoryGovernor &governor) {
+  config.growthPaused = [&governor] {
+    return !governor.snapshot().hostGrowthAllowed;
+  };
+  config.serving = [&governor](bool serving) { return governor.setServing(serving); };
 }
 
 } // namespace splash::engine

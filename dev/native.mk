@@ -29,7 +29,8 @@ BACKEND_CONTROL_SOURCES := \
 	runtime/engine/Scheduler.cpp \
 	runtime/model/DraftContextPlan.cpp \
 	$(CACHE_SOURCES) \
-	runtime/engine/Engine.cpp
+	runtime/engine/Engine.cpp \
+	runtime/engine/EngineMemory.cpp
 NATIVE_RUNTIME_SOURCES := $(BACKEND_CONTROL_SOURCES) \
 	runtime/engine/Protocol.cpp \
 	runtime/engine/NativeRuntime.cpp
@@ -54,6 +55,8 @@ TEST_ENGINE_ASAN := $(ENGINE_SANITIZER_BUILD)/engine-asan-ubsan
 TEST_ENGINE_TSAN := $(ENGINE_SANITIZER_BUILD)/engine-tsan
 TEST_RAGGED_SCHEDULER_ASAN := $(ENGINE_SANITIZER_BUILD)/ragged-scheduler-asan-ubsan
 TEST_RAGGED_SCHEDULER_TSAN := $(ENGINE_SANITIZER_BUILD)/ragged-scheduler-tsan
+TEST_MODEL_BOUNDARY_ASAN := $(ENGINE_SANITIZER_BUILD)/model-boundary-asan-ubsan
+TEST_MODEL_BOUNDARY_TSAN := $(ENGINE_SANITIZER_BUILD)/model-boundary-tsan
 TEST_FD_TRANSPORT_ASAN := $(ENGINE_SANITIZER_BUILD)/native-fd-asan-ubsan
 TEST_FD_TRANSPORT_TSAN := $(ENGINE_SANITIZER_BUILD)/native-fd-tsan
 TEST_ANE_FFN_CALIBRATION_ASAN := $(ENGINE_SANITIZER_BUILD)/ane-ffn-calibration-asan-ubsan
@@ -111,6 +114,7 @@ TEST_ENGINE_CACHE_TEST := $(ENGINE_TEST_BUILD)/engine-cache
 TEST_CACHE_PROPERTY := $(ENGINE_TEST_BUILD)/cache-property
 TEST_DRAFT_CONTEXT_PLAN_TEST := $(ENGINE_TEST_BUILD)/draft-context-plan
 TEST_RAGGED_SCHEDULER_TEST := $(ENGINE_TEST_BUILD)/ragged-scheduler
+TEST_MODEL_BOUNDARY_TEST := $(ENGINE_TEST_BUILD)/model-boundary
 TEST_ENGINE_TEST := $(ENGINE_TEST_BUILD)/engine
 TEST_ELASTIC_KV_TEST := $(ENGINE_TEST_BUILD)/elastic-kv-pool
 TEST_PROTOCOL_TEST := $(ENGINE_TEST_BUILD)/protocol
@@ -210,6 +214,7 @@ TEST_CPU_TARGETS := $(TEST_SLOT_FILE) $(TEST_SPARSE_ROW_STORE) $(TEST_SSD_READER
 	$(TEST_PERSISTENT_CACHE) \
 	$(TEST_DRAFT_CONTEXT_PLAN_TEST) \
 	$(TEST_RAGGED_SCHEDULER_TEST) \
+	$(TEST_MODEL_BOUNDARY_TEST) \
 	$(TEST_ENGINE_TEST) \
 	$(TEST_ELASTIC_KV_TEST) \
 	$(TEST_PROTOCOL_TEST) \
@@ -283,6 +288,7 @@ SANITIZER_CONFIG_TARGETS := $(TEST_SLOT_FILE_ASAN) $(TEST_SLOT_FILE_TSAN) \
 	$(TEST_PROTOCOL_ASAN) $(TEST_PROTOCOL_TSAN) \
 	$(TEST_ENGINE_ASAN) $(TEST_ENGINE_TSAN) \
 	$(TEST_RAGGED_SCHEDULER_ASAN) $(TEST_RAGGED_SCHEDULER_TSAN) \
+	$(TEST_MODEL_BOUNDARY_ASAN) $(TEST_MODEL_BOUNDARY_TSAN) \
 	$(TEST_FD_TRANSPORT_ASAN) $(TEST_FD_TRANSPORT_TSAN) \
 	$(TEST_ANE_FFN_CALIBRATION_ASAN) $(TEST_ANE_FFN_CALIBRATION_TSAN) \
 	$(TEST_SPARSE_ROW_STORE_ASAN) $(TEST_SPARSE_ROW_STORE_TSAN) \
@@ -320,17 +326,22 @@ $(TEST_DRAFT_CONTEXT_PLAN_TEST): runtime/model/DraftContextPlan.cpp \
 		dev/tests/engine/draft_context_plan_test.cpp
 $(TEST_NATIVE_LOOP_TEST): $(NATIVE_RUNTIME_SOURCES) \
 		runtime/engine/MemoryGovernor.cpp runtime/engine/MemoryControl.cpp \
+		runtime/engine/MemoryLedger.cpp \
 		dev/tests/engine/ProtocolPeer.cpp \
-		dev/tests/engine/native_engine_loop_test.cpp
-$(TEST_METRICS_TEST): dev/tests/engine/runtime_metrics_test.cpp
+		dev/tests/engine/native_loop_wire_test.cpp dev/tests/engine/native_loop_weights_test.cpp \
+		dev/tests/engine/native_loop_memory_test.cpp dev/tests/engine/native_loop_test_main.cpp
+$(TEST_METRICS_TEST): $(BACKEND_CONTROL_SOURCES) \
+		runtime/engine/MemoryGovernor.cpp runtime/engine/MemoryLedger.cpp \
+		dev/tests/engine/runtime_metrics_test.cpp
 $(TEST_MEMORY_GOVERNOR_TEST): runtime/metal/DeviceCapabilities.cpp \
 		runtime/engine/MemoryPlan.cpp runtime/engine/MemoryGovernor.cpp \
+		runtime/engine/MemoryLedger.cpp \
 		dev/tests/engine/memory_governor_test.cpp
 $(TEST_Q8_CPU_TEST): dev/tests/engine/q8_paged_kv_test.cc
 $(TEST_LEGACY_WEIGHT_CACHE): dev/tests/engine/legacy_weight_cache_test.cpp
 
 $(TEST_WEIGHT_SOURCE) $(TEST_GGUF_FILE) $(TEST_MEMORY_TEST) $(TEST_KV_PAGE_CACHE_TEST) \
-		$(TEST_DRAFT_CONTEXT_PLAN_TEST) $(TEST_RAGGED_SCHEDULER_TEST) \
+		$(TEST_DRAFT_CONTEXT_PLAN_TEST) $(TEST_RAGGED_SCHEDULER_TEST) $(TEST_MODEL_BOUNDARY_TEST) \
 		$(TEST_ELASTIC_KV_TEST) $(TEST_NATIVE_LOOP_TEST) $(TEST_METRICS_TEST) \
 		$(TEST_MEMORY_AUDIT_TEST) $(TEST_MEMORY_GOVERNOR_TEST) $(TEST_STATUS_TEST) \
 		$(TEST_Q8_CPU_TEST) $(TEST_SLOT_FILE) $(TEST_SPARSE_ROW_STORE) $(TEST_SSD_READERS) $(TEST_SLOT_RECYCLER) \
@@ -580,6 +591,7 @@ test-engine-cpu: $(TEST_CPU_TARGETS) $(TEST_ATTENTION_SWEEP) $(TEST_BACKEND_BENC
 	$(TEST_PERSISTENT_CACHE)
 	$(TEST_DRAFT_CONTEXT_PLAN_TEST)
 	$(TEST_RAGGED_SCHEDULER_TEST)
+	$(TEST_MODEL_BOUNDARY_TEST)
 	$(TEST_ENGINE_TEST)
 	$(TEST_ELASTIC_KV_TEST)
 	$(TEST_PROTOCOL_TEST) dev/tests/engine/protocol_golden.txt
@@ -737,10 +749,16 @@ $(TEST_PROTOCOL_TEST) $(TEST_PROTOCOL_ASAN) $(TEST_PROTOCOL_TSAN): \
 $(TEST_ENGINE_TEST) $(TEST_ENGINE_ASAN) $(TEST_ENGINE_TSAN): \
 		$(BACKEND_CONTROL_SOURCES) \
 		runtime/engine/MemoryGovernor.cpp \
+		runtime/engine/MemoryLedger.cpp \
 		dev/benchmarks/PrefillWork.hpp \
-		dev/tests/engine/engine_test.cpp
+		dev/tests/engine/engine_requests_test.cpp dev/tests/engine/engine_checkpoints_test.cpp \
+		dev/tests/engine/engine_commands_test.cpp dev/tests/engine/engine_memory_test.cpp \
+		dev/tests/engine/engine_spill_test.cpp dev/tests/engine/engine_disk_test.cpp \
+		dev/tests/engine/engine_test_main.cpp
 $(TEST_RAGGED_SCHEDULER_TEST) $(TEST_RAGGED_SCHEDULER_ASAN) $(TEST_RAGGED_SCHEDULER_TSAN): \
 		runtime/engine/Scheduler.cpp dev/tests/engine/ragged_scheduler_test.cpp
+$(TEST_MODEL_BOUNDARY_TEST) $(TEST_MODEL_BOUNDARY_ASAN) $(TEST_MODEL_BOUNDARY_TSAN): \
+		dev/tests/engine/model_boundary_test.cpp
 $(TEST_FD_TRANSPORT_TEST) $(TEST_FD_TRANSPORT_ASAN) $(TEST_FD_TRANSPORT_TSAN): \
 		$(NATIVE_RUNTIME_SOURCES) \
 		runtime/engine/FdTransport.cpp \
@@ -791,6 +809,8 @@ test-sanitizers: $(SANITIZER_CONFIG_TARGETS)
 	$(TSAN_TEST_ENV) $(TEST_ENGINE_TSAN)
 	$(ASAN_TEST_ENV) $(TEST_RAGGED_SCHEDULER_ASAN)
 	$(TSAN_TEST_ENV) $(TEST_RAGGED_SCHEDULER_TSAN)
+	$(ASAN_TEST_ENV) $(TEST_MODEL_BOUNDARY_ASAN)
+	$(TSAN_TEST_ENV) $(TEST_MODEL_BOUNDARY_TSAN)
 	$(ASAN_TEST_ENV) $(TEST_FD_TRANSPORT_ASAN)
 	$(TSAN_TEST_ENV) $(TEST_FD_TRANSPORT_TSAN)
 	$(ASAN_TEST_ENV) $(TEST_ANE_FFN_CALIBRATION_ASAN)

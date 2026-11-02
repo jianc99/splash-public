@@ -139,8 +139,10 @@ public:
   };
 
   // The pages, of the form, come with one active reference each, the
-  // requester's.
-  [[nodiscard]] KvPageAcquisition acquirePages(uint32_t count, kv::PageForm form = kv::PageForm::Full);
+  // requester's. `held`, the free pages waiting claims ranked above the
+  // requester hold, is ignored.
+  [[nodiscard]] KvPageAcquisition acquirePages(uint32_t count, kv::PageForm form = kv::PageForm::Full,
+                                               uint32_t held = 0);
   void retainPage(uint32_t page, bool prefixOwner);
   void releasePage(uint32_t page, bool prefixOwner);
   // Zeroes a page its requester holds alone and has not written yet, so the

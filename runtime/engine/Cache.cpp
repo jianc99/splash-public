@@ -504,7 +504,7 @@ bool Cache::retireCheckpointState(StateCheckpoint checkpoint) noexcept {
 // must be written first comes back when its copy lands.
 
 TokenAdmission Cache::ensureTokens(uint64_t requestId, uint64_t tokenCount,
-                                   uint64_t writtenTokens) {
+                                   uint64_t writtenTokens, std::array<uint32_t, 3> held) {
   Request &active = request(requestId);
   const uint64_t needed64 =
       (tokenCount + KvCache::pageTokens - 1) / KvCache::pageTokens;
@@ -515,7 +515,9 @@ TokenAdmission Cache::ensureTokens(uint64_t requestId, uint64_t tokenCount,
   if (needed <= previousSize)
     return {};
   std::vector<uint32_t> acquired;
-  if (const TokenAdmission admission = admitPages(needed - previousSize, acquired);
+  if (const TokenAdmission admission =
+          admitPages(needed - previousSize, acquired, kv::PageForm::Full,
+                     held[static_cast<size_t>(kv::PageForm::Full)]);
       !admission.granted())
     return admission;
   const uint64_t written = std::min(writtenTokens, tokenCount);
@@ -528,8 +530,8 @@ TokenAdmission Cache::ensureTokens(uint64_t requestId, uint64_t tokenCount,
 }
 
 TokenAdmission Cache::admitPages(uint32_t count, std::vector<uint32_t> &pages,
-                                  kv::PageForm form) {
-  KvPageAcquisition acquired = pool_.acquirePages(count, form);
+                                  kv::PageForm form, uint32_t held) {
+  KvPageAcquisition acquired = pool_.acquirePages(count, form, held);
   if (!acquired.granted()) {
     // Demoted and spilled pages free theirs when their copies land: wait
     // once those on their way cover what the free pages do not, and until
@@ -543,6 +545,14 @@ TokenAdmission Cache::admitPages(uint32_t count, std::vector<uint32_t> &pages,
   pages = std::move(acquired.pages);
   return {};
 }
+
+std::optional<engine::Victim> Cache::peek(const VictimQuery &, const engine::Victim *) const {
+  throw std::logic_error("M2");
+}
+
+FreeResult Cache::take(const VictimQuery &, const engine::Victim &) { throw std::logic_error("M2"); }
+
+void Cache::setWantedChains(std::vector<std::span<const uint64_t>>) { throw std::logic_error("M2"); }
 
 // Reclaim: memory returns as whole extents. Free pages go first, an empty
 // extent as it is and the pages scattered over the others once they fill
@@ -1359,7 +1369,9 @@ TokenAdmission Cache::moveLandedPages(std::optional<SpilledExtents> extents) {
   return {};
 }
 
-bool Cache::holdsIndexPages(uint64_t requestId) const { return request(requestId).indexPages != 0; }
+uint32_t Cache::indexPages(uint64_t requestId) const { return request(requestId).indexPages; }
+
+bool Cache::holdsIndexPages(uint64_t requestId) const { return indexPages(requestId) != 0; }
 
 // Trimming: the pages every window has passed give up their windowed
 // layers' K/V between commands.
@@ -1520,7 +1532,8 @@ void Cache::checkInvariants() const {
 // Disk tier: restores and demotions in flight, the quota they draw on, and
 // states promoted back into RAM.
 
-TokenAdmission Cache::restoreRequest(uint64_t requestId, const CacheLookup &lookup) {
+TokenAdmission Cache::restoreRequest(uint64_t requestId, const CacheLookup &lookup,
+                                     std::array<uint32_t, 3> held) {
   Request &active = request(requestId);
   if (!active.pages.empty() || !active.cachedBlocks.empty()) {
     throw std::logic_error("restore target already owns KV pages");
@@ -1564,7 +1577,8 @@ TokenAdmission Cache::restoreRequest(uint64_t requestId, const CacheLookup &look
     const auto each = static_cast<size_t>(form);
     if (!restored[each])
       continue;
-    if (const TokenAdmission admission = admitPages(restored[each], taken[each], form); !admission.granted()) {
+    if (const TokenAdmission admission = admitPages(restored[each], taken[each], form, held[each]);
+        !admission.granted()) {
       giveBack();
       return admission;
     }

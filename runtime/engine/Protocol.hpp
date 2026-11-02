@@ -22,7 +22,7 @@ inline constexpr uint16_t kProtocolVersion = 11;
 // A frame is its header, the magic "SPLH", the u16 protocol version, the
 // u16 FrameType and the u64 payload length, then the payload.
 inline constexpr size_t kFrameHeaderBytes = 16;
-inline constexpr uint32_t kStatusSchemaVersion = 6;
+inline constexpr uint32_t kStatusSchemaVersion = 7;
 // Image pixels travel inside the request frame; a multi-image agent turn can
 // carry well over 64 MiB of resized RGB bytes.
 inline constexpr uint64_t kAbsoluteMaxFramePayloadBytes =
@@ -45,6 +45,7 @@ enum class FrameType : uint16_t {
   Error = 0x0105,
   StatusJson = 0x0107,
   PromptProgress = 0x0108,
+  StartFailed = 0x0109,
 };
 
 // Request errors reject one request while preserving the stream.  An
@@ -239,10 +240,19 @@ struct ReleaseRequestFrame {
 
 struct ReadyEvent {
   uint32_t maxConcurrentRequests = 0;
+  // The context this start serves: the one asked for, or what its plan holds;
+  // a relaunch may serve less than the first engine did.
   uint32_t maxContextTokens = 0;
   // Requests may carry image spans. A model serving without vision rejects
   // each image request with a request error.
   bool vision = false;
+  // The target's logit rows a token mask covers, and the tokens that end
+  // generation (its layout's vocabularySize and stopTokens).
+  uint32_t vocabularySize = 0;
+  std::vector<uint32_t> stopTokens{};
+  // The rows of one mask request: before the anchor and after each draft
+  // query row (ProtocolLimits::maxSimulationTokens + 1).
+  uint32_t maskRows = 0;
 
   bool operator==(const ReadyEvent &) const = default;
 };
@@ -332,11 +342,64 @@ struct StatusJsonEvent {
   bool operator==(const StatusJsonEvent &) const = default;
 };
 
+// Why a start failed, for the supervisor's restart decision and the app's
+// words (server/protocol.py StartFailureKind).
+enum class StartFailureKind : uint8_t {
+  // A defect, or a failure the engine does not class.
+  Internal = 0,
+  // The host had too little free memory (RuntimeResourceFailure::HostCapacity).
+  HostMemory = 1,
+  // Metal refused an allocation the budget allowed.
+  DriverAllocation = 2,
+  // The plan's floors exceed the Metal memory budget.
+  MemoryBudget = 3,
+  // --max-context exceeds the context the plan holds.
+  ContextBudget = 4,
+  // A setting the engine refuses.
+  Configuration = 5,
+  // The model's files.
+  Model = 6,
+  // This Mac cannot run Splash.
+  Device = 7,
+};
+
+// What bounds a shortfall: the Metal budget this Mac gives, the one
+// --max-memory set, or the SSD cache's room for spilled KV.
+enum class ShortfallBound : uint8_t {
+  DeviceMemory = 0,
+  MaxMemory = 1,
+  Disk = 2,
+};
+
+// What a start refused for want of memory or context needed against what it
+// had: MemoryBudget sets the bytes, ContextBudget the tokens.
+struct StartShortfall {
+  ShortfallBound bound = ShortfallBound::DeviceMemory;
+  uint64_t requiredBytes = 0;
+  uint64_t budgetBytes = 0;
+  uint32_t requestedContextTokens = 0;
+  uint32_t planContextTokens = 0;
+
+  bool operator==(const StartShortfall &) const = default;
+};
+
+// Sent in place of Ready by a start that fails (main.mm); the process then
+// exits.
+struct StartFailedEvent {
+  StartFailureKind kind = StartFailureKind::Internal;
+  // All zero but for MemoryBudget and ContextBudget.
+  StartShortfall shortfall;
+  std::string message;
+
+  bool operator==(const StartFailedEvent &) const = default;
+};
+
 using ClientMessage = std::variant<RequestFrame, CancelFrame, MaskResponseFrame,
                                    StatusRequestFrame, ReleaseRequestFrame>;
 using EngineEvent =
     std::variant<ReadyEvent, StartEvent, PromptProgressEvent, TokensEvent,
-                 MaskRequestEvent, DoneEvent, ErrorEvent, StatusJsonEvent>;
+                 MaskRequestEvent, DoneEvent, ErrorEvent, StatusJsonEvent,
+                 StartFailedEvent>;
 
 struct Frame {
   FrameType type = FrameType::Request;

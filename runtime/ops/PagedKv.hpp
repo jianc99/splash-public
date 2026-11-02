@@ -152,6 +152,11 @@ namespace detail {
 
 } // namespace detail
 
+// How an attention reads a layout's pages: every page of its rows' history
+// (the dense page loop), or the blocks a block index selects, gathering
+// blocks of tokens (ops::AttentionBlocks).
+enum class Reads : uint8_t { EveryPage, SelectedBlocks };
+
 // Physical KV geometry: Page32, either BF16 or per-(token, head) symmetric INT8.
 // Layer and head counts vary by target.
 struct Layout final {
@@ -178,6 +183,8 @@ struct Layout final {
   // for the l-th; both are zero for a layout without a window.
   uint32_t windowTokens = 0;
   uint64_t windowedLayers = 0;
+  // How an attention reads the pages.
+  Reads reads = Reads::EveryPage;
 
   [[nodiscard]] constexpr bool valid() const noexcept {
     return attentionLayers && kvHeads && headDimension && validFormat(format) &&
