@@ -26,6 +26,7 @@ CACHE_SOURCES := \
 	runtime/engine/Cache.cpp \
 	runtime/engine/WriteBehind.cpp
 BACKEND_CONTROL_SOURCES := \
+	runtime/engine/CostModel.cpp \
 	runtime/engine/Scheduler.cpp \
 	runtime/model/DraftContextPlan.cpp \
 	$(CACHE_SOURCES) \
@@ -56,6 +57,8 @@ TEST_ENGINE_ASAN := $(ENGINE_SANITIZER_BUILD)/engine-asan-ubsan
 TEST_ENGINE_TSAN := $(ENGINE_SANITIZER_BUILD)/engine-tsan
 TEST_RAGGED_SCHEDULER_ASAN := $(ENGINE_SANITIZER_BUILD)/ragged-scheduler-asan-ubsan
 TEST_RAGGED_SCHEDULER_TSAN := $(ENGINE_SANITIZER_BUILD)/ragged-scheduler-tsan
+TEST_COST_MODEL_ASAN := $(ENGINE_SANITIZER_BUILD)/cost-model-asan-ubsan
+TEST_COST_MODEL_TSAN := $(ENGINE_SANITIZER_BUILD)/cost-model-tsan
 TEST_MODEL_BOUNDARY_ASAN := $(ENGINE_SANITIZER_BUILD)/model-boundary-asan-ubsan
 TEST_MODEL_BOUNDARY_TSAN := $(ENGINE_SANITIZER_BUILD)/model-boundary-tsan
 TEST_FAKE_MEMORY_ASAN := $(ENGINE_SANITIZER_BUILD)/fake-memory-asan-ubsan
@@ -119,6 +122,7 @@ TEST_ENGINE_CACHE_TEST := $(ENGINE_TEST_BUILD)/engine-cache
 TEST_CACHE_PROPERTY := $(ENGINE_TEST_BUILD)/cache-property
 TEST_DRAFT_CONTEXT_PLAN_TEST := $(ENGINE_TEST_BUILD)/draft-context-plan
 TEST_RAGGED_SCHEDULER_TEST := $(ENGINE_TEST_BUILD)/ragged-scheduler
+TEST_COST_MODEL := $(ENGINE_TEST_BUILD)/cost-model
 TEST_MODEL_BOUNDARY_TEST := $(ENGINE_TEST_BUILD)/model-boundary
 TEST_WEIGHT_RESIDENCY := $(ENGINE_TEST_BUILD)/weight-residency
 TEST_FAKE_MEMORY := $(ENGINE_TEST_BUILD)/fake-memory
@@ -226,6 +230,7 @@ TEST_CPU_TARGETS := $(TEST_SLOT_FILE) $(TEST_SPARSE_ROW_STORE) $(TEST_SSD_READER
 	$(TEST_PERSISTENT_CACHE) \
 	$(TEST_DRAFT_CONTEXT_PLAN_TEST) \
 	$(TEST_RAGGED_SCHEDULER_TEST) \
+	$(TEST_COST_MODEL) \
 	$(TEST_MODEL_BOUNDARY_TEST) \
 	$(TEST_WEIGHT_RESIDENCY) \
 	$(TEST_FAKE_MEMORY) \
@@ -303,6 +308,7 @@ SANITIZER_CONFIG_TARGETS := $(TEST_SLOT_FILE_ASAN) $(TEST_SLOT_FILE_TSAN) \
 	$(TEST_PROTOCOL_ASAN) $(TEST_PROTOCOL_TSAN) \
 	$(TEST_ENGINE_ASAN) $(TEST_ENGINE_TSAN) \
 	$(TEST_RAGGED_SCHEDULER_ASAN) $(TEST_RAGGED_SCHEDULER_TSAN) \
+	$(TEST_COST_MODEL_ASAN) $(TEST_COST_MODEL_TSAN) \
 	$(TEST_MODEL_BOUNDARY_ASAN) $(TEST_MODEL_BOUNDARY_TSAN) \
 	$(TEST_FAKE_MEMORY_ASAN) $(TEST_FAKE_MEMORY_TSAN) \
 	$(TEST_TIMING_PROFILE_ASAN) $(TEST_TIMING_PROFILE_TSAN) \
@@ -358,7 +364,7 @@ $(TEST_Q8_CPU_TEST): dev/tests/engine/q8_paged_kv_test.cc
 $(TEST_LEGACY_WEIGHT_CACHE): dev/tests/engine/legacy_weight_cache_test.cpp
 
 $(TEST_WEIGHT_SOURCE) $(TEST_GGUF_FILE) $(TEST_MEMORY_TEST) $(TEST_KV_PAGE_CACHE_TEST) \
-		$(TEST_DRAFT_CONTEXT_PLAN_TEST) $(TEST_RAGGED_SCHEDULER_TEST) $(TEST_MODEL_BOUNDARY_TEST) \
+		$(TEST_DRAFT_CONTEXT_PLAN_TEST) $(TEST_RAGGED_SCHEDULER_TEST) $(TEST_COST_MODEL) $(TEST_MODEL_BOUNDARY_TEST) \
 		$(TEST_WEIGHT_RESIDENCY) \
 		$(TEST_ELASTIC_KV_TEST) $(TEST_NATIVE_LOOP_TEST) $(TEST_METRICS_TEST) \
 		$(TEST_MEMORY_AUDIT_TEST) $(TEST_MEMORY_GOVERNOR_TEST) $(TEST_STATUS_TEST) \
@@ -616,6 +622,7 @@ test-engine-cpu: $(TEST_CPU_TARGETS) $(TEST_ATTENTION_SWEEP) $(TEST_BACKEND_BENC
 	$(TEST_PERSISTENT_CACHE)
 	$(TEST_DRAFT_CONTEXT_PLAN_TEST)
 	$(TEST_RAGGED_SCHEDULER_TEST)
+	$(TEST_COST_MODEL)
 	$(TEST_MODEL_BOUNDARY_TEST)
 	$(TEST_WEIGHT_RESIDENCY)
 	$(TEST_FAKE_MEMORY)
@@ -782,9 +789,12 @@ $(TEST_ENGINE_TEST) $(TEST_ENGINE_ASAN) $(TEST_ENGINE_TSAN): \
 		dev/tests/engine/engine_requests_test.cpp dev/tests/engine/engine_checkpoints_test.cpp \
 		dev/tests/engine/engine_commands_test.cpp dev/tests/engine/engine_memory_test.cpp \
 		dev/tests/engine/engine_spill_test.cpp dev/tests/engine/engine_disk_test.cpp \
-		dev/tests/engine/engine_test_main.cpp
+		dev/tests/engine/TimingProfile.cpp dev/tests/engine/engine_test_main.cpp
 $(TEST_RAGGED_SCHEDULER_TEST) $(TEST_RAGGED_SCHEDULER_ASAN) $(TEST_RAGGED_SCHEDULER_TSAN): \
-		runtime/engine/Scheduler.cpp dev/tests/engine/ragged_scheduler_test.cpp
+		runtime/engine/CostModel.cpp runtime/engine/Scheduler.cpp \
+		dev/tests/engine/TimingProfile.cpp dev/tests/engine/ragged_scheduler_test.cpp
+$(TEST_COST_MODEL) $(TEST_COST_MODEL_ASAN) $(TEST_COST_MODEL_TSAN): \
+		runtime/engine/CostModel.cpp dev/tests/engine/cost_model_test.cpp
 $(TEST_MODEL_BOUNDARY_TEST) $(TEST_MODEL_BOUNDARY_ASAN) $(TEST_MODEL_BOUNDARY_TSAN): \
 		dev/tests/engine/model_boundary_test.cpp
 $(TEST_WEIGHT_RESIDENCY): runtime/engine/WeightResidency.cpp dev/tests/engine/weight_residency_test.cpp
@@ -846,6 +856,8 @@ test-sanitizers: $(SANITIZER_CONFIG_TARGETS)
 	$(TSAN_TEST_ENV) $(TEST_ENGINE_TSAN)
 	$(ASAN_TEST_ENV) $(TEST_RAGGED_SCHEDULER_ASAN)
 	$(TSAN_TEST_ENV) $(TEST_RAGGED_SCHEDULER_TSAN)
+	$(ASAN_TEST_ENV) $(TEST_COST_MODEL_ASAN)
+	$(TSAN_TEST_ENV) $(TEST_COST_MODEL_TSAN)
 	$(ASAN_TEST_ENV) $(TEST_MODEL_BOUNDARY_ASAN)
 	$(TSAN_TEST_ENV) $(TEST_MODEL_BOUNDARY_TSAN)
 	$(ASAN_TEST_ENV) $(TEST_FAKE_MEMORY_ASAN)
