@@ -45,7 +45,7 @@ final class Installer {
 
     private let runtime: Runtime
     private var child: ChildProcess?
-    private let record = ChildRecord(key: Preference.installerPID)
+    let record = ChildRecord(key: Preference.installerPID, stop: SIGINT)
     private var tail: LogTail?
     private var cancelled = false
     private var firstError: String?

@@ -272,6 +272,7 @@ final class AppFlowTests {
         try await waitFor((installer.progress?.done ?? 0) > 0, "progress", seconds: 120)
         #expect(installer.progress?.repo == String(download.split(separator: ":")[0]))
         #expect(state.downloadStatus?.hasPrefix("Downloading ") == true)
+        #expect(state.serverTitle.hasPrefix("Downloading "))
         await Snapshot.save("server-downloading", MainView().environment(state))
         let clock = ContinuousClock.now
         installer.cancel()
@@ -282,7 +283,7 @@ final class AppFlowTests {
         // A crash of the app leaves the download running; the next launch stops it.
         installer.install(download)
         try await waitFor((installer.progress?.done ?? 0) > 0, "progress again", seconds: 120)
-        let pid = pid_t(UserDefaults.standard.integer(forKey: Preference.installerPID))
+        let pid = pid_t(try #require((UserDefaults.standard.array(forKey: Preference.installerPID) as? [Int])?.first))
         await AppState(runtime: state.runtime, keychain: Self.keychain).installer.stopLeftover()
         #expect(kill(pid, 0) != 0)
         try await waitFor(!installer.running, "noticed", seconds: 30)

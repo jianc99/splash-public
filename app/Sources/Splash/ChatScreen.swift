@@ -1,6 +1,6 @@
 import SwiftUI
 
-/// The width of the composer: the transcript's column (`main`'s max-width in Shared/page.css), so
+/// The width of the composer: the transcript's column (`main`'s max-width in page.css), so
 /// that the two line up.
 private let column: CGFloat = 680
 

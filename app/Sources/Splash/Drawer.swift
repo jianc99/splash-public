@@ -27,7 +27,8 @@ final class Drawer {
         if terminal == id { terminal = terminals[safe: min(index, terminals.count - 1)]?.id }
     }
 
-    /// Ends every shell, as the app quits.
+    /// Ends every shell at once, for a quit that goes on to wait for the model or a download to
+    /// stop. Any other end of the app hangs them up (`TerminalSession`).
     func endAll() {
         terminals.forEach { $0.end() }
     }
@@ -40,9 +41,9 @@ extension Array {
 }
 
 /// A login shell in a pseudo-terminal, as Terminal opens one, in the home folder, with the app's
-/// own environment (`Runtime.userEnvironment`), which the login shell completes as in Terminal. Its
-/// view outlives the drawer's, so that a terminal keeps what it shows while the drawer is closed or
-/// the window shows another part.
+/// own environment (`Runtime.userEnvironment`), which the login shell completes as in Terminal,
+/// and Option typing what the keyboard layout gives, as there. Its view outlives the drawer's, so
+/// that a terminal keeps what it shows while the drawer is closed or the window shows another part.
 @MainActor @Observable
 final class TerminalSession: Identifiable {
     let id = UUID()
@@ -57,7 +58,7 @@ final class TerminalSession: Identifiable {
         title = folder.lastPathComponent
         view = LocalProcessTerminalView(frame: NSRect(x: 0, y: 0, width: 640, height: 280))
         view.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
-        view.optionAsMetaKey = true
+        view.optionAsMetaKey = false
         let delegate = Delegate(self)
         self.delegate = delegate
         view.processDelegate = delegate
@@ -69,6 +70,9 @@ final class TerminalSession: Identifiable {
         if environment["LANG"] == nil { environment["LANG"] = "en_US.UTF-8" }
         view.startProcess(executable: shell, environment: environment.map { "\($0.key)=\($0.value)" },
                           execName: "-" + (shell as NSString).lastPathComponent, currentDirectory: folder.path)
+        // Only the app holds the terminal's master, not the shells started after this one, nor what
+        // they leave running: the app's end hangs this shell up, however it ends.
+        _ = fcntl(view.process.childfd, F_SETFD, FD_CLOEXEC)
     }
 
     /// Paints it in the window's appearance: the text and background of a text view.
@@ -81,10 +85,17 @@ final class TerminalSession: Identifiable {
         }
     }
 
+    /// Hangs the shell up, as closing a terminal window does, which ends it and its jobs, and
+    /// waits for it off the main thread, as SwiftTerm stops waiting once told to stop.
     func end() {
         guard !ended else { return }
         ended = true
+        let shell = view.process.shellPid
         view.terminate()
+        // None where it failed to start.
+        guard shell != 0 else { return }
+        kill(shell, SIGHUP)
+        DispatchQueue.global(qos: .utility).async { waitpid(shell, nil, 0) }
     }
 
     /// SwiftTerm's delegate, which calls on the main thread.
@@ -111,29 +122,33 @@ final class TerminalSession: Identifiable {
 }
 
 /// A log the drawer shows: the server's, which each start begins again, and the downloads'.
-enum LogSource: String, CaseIterable, Identifiable {
+enum LogSource: String, CaseIterable {
     case server = "Server", downloads = "Downloads"
 
-    var id: Self { self }
     @MainActor var url: URL { self == .server ? Server.log : Installer.log }
 }
 
 /// The content with the drawer under it, its edge dragged to resize it.
 struct WithDrawer<Content: View>: View {
     @Environment(AppState.self) private var state
+    @FocusState private var focused: Bool
     @ViewBuilder let content: Content
 
     var body: some View {
         let shown = state.showsDrawer
         VStack(spacing: 0) {
             content
-            // Closed, it keeps its place at no height, its terminals and their views with it.
+            // Closed, it keeps its place and its height, clipped to none, its terminals and their
+            // views with it; the keyboard leaves it.
             DrawerView()
+                .frame(height: state.drawerHeight)
+                .focused($focused)
                 .frame(height: shown ? state.drawerHeight : 0, alignment: .top)
                 .clipped()
                 .allowsHitTesting(shown)
                 .accessibilityHidden(!shown)
         }
+        .onChange(of: shown) { if !shown { focused = false } }
     }
 }
 
@@ -193,11 +208,11 @@ private struct DrawerView: View {
                 // Every terminal stays in the window, the one picked on top, so that each keeps
                 // its view and what it shows.
                 ForEach(drawer.terminals) { session in
-                    let shown = drawer.part == .terminal && drawer.terminal == session.id
-                    TerminalPane(session: session)
-                        .opacity(shown ? 1 : 0)
-                        .allowsHitTesting(shown)
-                        .accessibilityHidden(!shown)
+                    let picked = drawer.part == .terminal && drawer.terminal == session.id
+                    TerminalPane(session: session, shown: state.showsDrawer && picked)
+                        .opacity(picked ? 1 : 0)
+                        .allowsHitTesting(picked)
+                        .accessibilityHidden(!picked)
                 }
                 if drawer.part == .logs {
                     LogText(url: drawer.log.url)
@@ -252,14 +267,19 @@ private struct TerminalTabs: View {
 }
 
 /// A terminal's view, moved into the drawer each time it is laid out there, in the window's
-/// appearance, with a margin of its background around it.
+/// appearance, with a margin of its background around it. Shown, picked in the drawer shown, it
+/// takes the keyboard; hidden, it gives it up.
 private struct TerminalPane: View {
     let session: TerminalSession
+    let shown: Bool
+    @FocusState private var focused: Bool
 
     var body: some View {
         Hosted(session: session)
+            .focused($focused)
             .padding(EdgeInsets(top: 6, leading: 10, bottom: 4, trailing: 4))
             .background(Color(nsColor: .textBackgroundColor))
+            .onChange(of: shown, initial: true) { focused = shown }
     }
 
     private struct Hosted: NSViewRepresentable {
@@ -283,7 +303,7 @@ private struct TerminalPane: View {
 /// A log file, read only, as it grows: its last 512 KB at first, then each line as it is written,
 /// kept in view while the end is; ⌘F finds in it. A file written again from its start, as the
 /// server's log is at each start, is read again from there.
-private struct LogText: NSViewRepresentable {
+struct LogText: NSViewRepresentable {
     let url: URL
 
     func makeNSView(context: Context) -> NSScrollView {
@@ -329,11 +349,16 @@ private struct LogText: NSViewRepresentable {
             source = nil
         }
 
-        /// Opens the file again, as when it was replaced, and reads its end.
+        /// Opens the file again, as when it was replaced, and reads its end. One not written yet is
+        /// made, empty, with its folder, and followed from its start.
         private func reopen() {
             stop()
             text?.string = ""
-            guard let url, let handle = try? FileHandle(forReadingFrom: url) else { return }
+            guard let url else { return }
+            try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            let descriptor = open(url.path, O_RDONLY | O_CREAT | O_CLOEXEC, 0o644)
+            guard descriptor >= 0 else { return }
+            let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
             self.handle = handle
             let size = (try? handle.seekToEnd()) ?? 0
             offset = size > 512 * 1024 ? size - 512 * 1024 : 0

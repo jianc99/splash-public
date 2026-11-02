@@ -50,10 +50,9 @@ struct ChatTarget: Equatable, Sendable {
 /// The conversations, one JSON file each in the app's folder, and the one reply that streams.
 @MainActor @Observable
 final class ChatStore {
-    /// The reply that streams: its conversation, when it was asked for, when the model began to
-    /// think, and how much of the prompt it has read, while it reads.
+    /// The reply that streams: when it was asked for, when the model began to think, and how much
+    /// of the prompt it has read, while it reads.
     struct Live: Equatable {
-        let conversation: UUID
         let asked: Date
         var thinking: Date?
         var read: Double?
@@ -72,7 +71,7 @@ final class ChatStore {
         fileprivate init(_ message: ChatMessage, in conversation: UUID) {
             self.conversation = conversation
             self.message = message
-            live = Live(conversation: conversation, asked: .now)
+            live = Live(asked: .now)
         }
     }
 
@@ -180,7 +179,7 @@ final class ChatStore {
                     // Asked for no limit, a reply runs to the end of the context.
                     if delta.cut { answer.error = "The reply reached the end of the model’s context." }
                     // A redraw per token would be wasted work: the page lets out what comes at an
-                    // even pace (Shared/page.js).
+                    // even pace (page.js).
                     if ContinuousClock.now - shown > .milliseconds(50) {
                         shown = .now
                         reply.live.read = read

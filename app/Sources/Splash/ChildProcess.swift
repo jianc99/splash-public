@@ -78,8 +78,8 @@ final class ChildProcess: @unchecked Sendable {
 
 /// A program run to its end for what it says on its error output, as the engine's device check
 /// is: its exit status and that output, read as it writes it, so that it never waits on a pipe
-/// nobody reads; nil where it does not start. One still running after `timeout` is ended, and so
-/// is one whose caller no longer waits for it. The read and the wait for its end hold no thread of
+/// nobody reads; nil where it does not start, or runs past `timeout`, which ends it. One whose
+/// caller no longer waits for it is ended too. The read and the wait for its end hold no thread of
 /// Swift's own pool: waitUntilExit there once never returned for a process that had exited.
 enum Program {
     static func run(_ command: [String], timeout: Duration) async -> (status: Int32, error: String)? {
@@ -91,15 +91,18 @@ enum Program {
         process.standardError = errors
         let ended = AsyncStream<Void> { continuation in process.terminationHandler = { _ in continuation.finish() } }
         guard (try? process.run()) != nil else { return nil }
+        // Whether it ran past `timeout`, and was ended then.
         let deadline = Task {
             try? await Task.sleep(for: timeout)
-            if process.isRunning { process.terminate() }
+            guard process.isRunning else { return false }
+            process.terminate()
+            return true
         }
-        defer { deadline.cancel() }
         return await withTaskCancellationHandler {
             let error = String(decoding: await reading(errors.fileHandleForReading), as: UTF8.self)
             await end(ended)
-            return (process.terminationStatus, error)
+            deadline.cancel()
+            return await deadline.value ? nil : (process.terminationStatus, error)
         } onCancel: {
             if process.isRunning { process.terminate() }
         }
@@ -178,6 +181,8 @@ final class LogTail {
 /// of the app started it, and never a later process given the same ID.
 struct ChildRecord {
     let key: String
+    /// The signal a later launch stops it with.
+    let stop: Int32
 
     /// Keeps `child` as the program this record names.
     func keep(_ child: ChildProcess) {
@@ -190,12 +195,13 @@ struct ChildRecord {
     }
 
     /// Stops the program kept, if it still runs, and forgets it once it has ended; one still
-    /// running stays kept, for the launch after.
+    /// running stays kept, for the launch after. A record of the ID alone, as an older app kept
+    /// it, is forgotten, and its program left running.
     func stopLeftover() async {
         guard let kept = UserDefaults.standard.array(forKey: key) as? [Int], kept.count == 2,
               let pid = pid_t(exactly: kept[0])
         else { return forget() }
-        if processStart(pid) == kept[1] { await stopProcessGroup(pid) }
+        if processStart(pid) == kept[1] { await stopProcessGroup(pid, with: stop) }
         if processStart(pid) != kept[1] { forget() }
     }
 }
@@ -209,9 +215,9 @@ func processStart(_ pid: pid_t) -> Int? {
 }
 
 /// Stops the process group `pid` leads, as `ChildProcess.signal` would, when this app no longer
-/// holds it: SIGINT, then SIGKILL if it still runs 20 s later; returns once it has ended.
-func stopProcessGroup(_ pid: pid_t) async {
-    killpg(pid, SIGINT)
+/// holds it: `signal`, then SIGKILL if it still runs 20 s later; returns once it has ended.
+func stopProcessGroup(_ pid: pid_t, with signal: Int32) async {
+    killpg(pid, signal)
     for tick in 1...300 where kill(pid, 0) == 0 {
         if tick == 200 { killpg(pid, SIGKILL) }
         try? await Task.sleep(for: .milliseconds(100))

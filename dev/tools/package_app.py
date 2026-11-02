@@ -44,7 +44,7 @@ MACH_O_MAGICS = frozenset(
         "cafebabf",
     )
 )
-# The app's own resources, its pages among them: the bundle
+# The app's own resources, the Chat's transcript page among them: the bundle
 # SwiftPM builds beside the executable, which the app reads from
 # Contents/Resources (Bundle.resources, app/Sources/Splash/WebPage.swift).
 RESOURCE_BUNDLE = "Splash_Splash.bundle"

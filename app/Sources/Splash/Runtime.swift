@@ -107,8 +107,9 @@ struct Runtime: Sendable {
         return (try? JSONDecoder().decode(Owner.self, from: data))?.pid
     }
 
-    /// Why this Mac cannot run Splash, or nil when it can: the engine's own check, which the
-    /// launcher repeats before every start; nil too where the check does not answer in 30 s.
+    /// Why this Mac cannot run Splash, as the engine's own check says, which the launcher repeats
+    /// before every start; nil where the check passes or gives no reason: it does not start, runs
+    /// past 30 s, or fails saying nothing.
     func unsupportedReason() async -> String? {
         guard let ran = await Program.run([engine.path, "device-check"], timeout: .seconds(30)), ran.status != 0
         else { return nil }

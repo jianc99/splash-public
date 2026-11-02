@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import Testing
 
@@ -270,6 +271,26 @@ struct ServerTests {
         #expect(Server.Step("16:14:50 Weights loaded in 6.52 s.") == .warming)
         #expect(Server.Step("16:14:50 Kernel policy for GPU family 10 with 32 cores.") == nil)
     }
+
+    @MainActor @Test func givesTheServerTheAppsProcessID() async throws {
+        // A checkout whose Python says what SPLASH_APP_PID it was given, and ends.
+        let root = FileManager.default.temporaryDirectory.appending(path: "splash-server-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runtime = Runtime(root: root)
+        try FileManager.default.createDirectory(at: runtime.python.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try "#!/bin/sh\necho \"SPLASH_APP_PID=$SPLASH_APP_PID\"\n".write(to: runtime.python, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: runtime.python.path)
+        let log = root.appending(path: "server.log")
+        let server = Server(runtime: runtime, log: log)
+        // On a port nothing serves.
+        server.start("a/b", settings: ServeSettings(values: ["--port": "0"]))
+        let deadline = ContinuousClock.now + .seconds(10)
+        while server.running {
+            try #require(ContinuousClock.now < deadline, "timed out")
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        #expect(try String(contentsOf: log, encoding: .utf8) == "SPLASH_APP_PID=\(getpid())\n")
+    }
 }
 
 /// A program the app started, kept for the next launch: stopped then, whichever copy of the app
@@ -277,7 +298,7 @@ struct ServerTests {
 @MainActor
 struct ChildRecordTests {
     @Test func stopsTheProgramItKeepsAndForgetsIt() async throws {
-        let record = ChildRecord(key: "test.child.\(UUID().uuidString)")
+        let record = ChildRecord(key: "test.child.\(UUID().uuidString)", stop: SIGINT)
         defer { record.forget() }
         let log = FileManager.default.temporaryDirectory.appending(path: "child-\(UUID().uuidString).log")
         defer { try? FileManager.default.removeItem(at: log) }
@@ -290,7 +311,7 @@ struct ChildRecordTests {
     }
 
     @Test func leavesAnotherProcessWithTheIDAlone() async throws {
-        let record = ChildRecord(key: "test.child.\(UUID().uuidString)")
+        let record = ChildRecord(key: "test.child.\(UUID().uuidString)", stop: SIGINT)
         defer { record.forget() }
         let log = FileManager.default.temporaryDirectory.appending(path: "child-\(UUID().uuidString).log")
         defer { try? FileManager.default.removeItem(at: log) }
@@ -306,6 +327,82 @@ struct ChildRecordTests {
         await record.stopLeftover()
         #expect(processStart(other.pid) != nil)
         #expect(UserDefaults.standard.object(forKey: record.key) == nil)
+    }
+
+    /// A leftover server stops by itself once its app has ended, as Ctrl+C stops it, and a second
+    /// Ctrl+C would stop its engine at once: the next launch sends what it ignores by then, and
+    /// waits for it.
+    @Test func aLeftoverServerAlreadyStoppingIsLeftToFinish() async throws {
+        let log = try await Self.leftover("trap 'echo interrupted' INT; trap '' TERM; echo ready; sleep 1",
+                                          stoppedBy: Server(runtime: Showcase.runtime).record.stop)
+        #expect(log == "ready\n")
+    }
+
+    /// A leftover download gets Ctrl+C, which removes its temporary files as it ends.
+    @Test func aLeftoverDownloadIsInterrupted() async throws {
+        let log = try await Self.leftover("trap 'echo interrupted; exit' INT; echo ready; sleep 60",
+                                          stoppedBy: Installer(runtime: Showcase.runtime).record.stop)
+        #expect(log == "ready\ninterrupted\n")
+    }
+
+    /// What `script` wrote by the time a record that stops with `signal` has stopped it, once it
+    /// has written `ready`.
+    private static func leftover(_ script: String, stoppedBy signal: Int32) async throws -> String {
+        let record = ChildRecord(key: "test.child.\(UUID().uuidString)", stop: signal)
+        defer { record.forget() }
+        let log = FileManager.default.temporaryDirectory.appending(path: "child-\(UUID().uuidString).log")
+        defer { try? FileManager.default.removeItem(at: log) }
+        let child = try ChildProcess(command: ["/bin/sh", "-c", script], environment: [:], log: log) { _ in }
+        defer { child.signal(SIGKILL) }
+        let deadline = ContinuousClock.now + .seconds(10)
+        while (try? String(contentsOf: log, encoding: .utf8)) != "ready\n" {
+            try #require(ContinuousClock.now < deadline, "it never ran")
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        record.keep(child)
+        await record.stopLeftover()
+        #expect(processStart(child.pid) == nil)
+        return try String(contentsOf: log, encoding: .utf8)
+    }
+}
+
+/// A program run for what it says on its error output, as the engine's device check is.
+struct ProgramTests {
+    @Test func givesItsStatusAndErrorOutput() async throws {
+        let ran = try #require(await Program.run(["/bin/sh", "-c", "echo 'error: no Metal' >&2; exit 3"], timeout: .seconds(10)))
+        #expect(ran.status == 3 && ran.error == "error: no Metal\n")
+    }
+
+    @Test func endsOneThatRunsPastItsTimeoutAndGivesNothing() async {
+        let started = ContinuousClock.now
+        // What it wrote before is no answer.
+        #expect(await Program.run(["/bin/sh", "-c", "echo 'error: x' >&2; exec sleep 60"], timeout: .milliseconds(300)) == nil)
+        #expect(ContinuousClock.now - started < .seconds(10))
+    }
+
+    @Test func endsOneItsCallerNoLongerWaitsFor() async {
+        let started = ContinuousClock.now
+        let run = Task { await Program.run(["/bin/sleep", "60"], timeout: .seconds(60)) }
+        try? await Task.sleep(for: .milliseconds(300))
+        run.cancel()
+        _ = await run.value
+        #expect(ContinuousClock.now - started < .seconds(10))
+    }
+
+    @Test func theDeviceCheckGivesItsReasonOrPasses() async throws {
+        // A checkout's engine, which runs the check.
+        let root = FileManager.default.temporaryDirectory.appending(path: "splash-check-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runtime = Runtime(root: root)
+        try FileManager.default.createDirectory(at: runtime.engine.deletingLastPathComponent(), withIntermediateDirectories: true)
+        func check(_ script: String) async throws -> String? {
+            try "#!/bin/sh\n\(script)\n".write(to: runtime.engine, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: runtime.engine.path)
+            return await runtime.unsupportedReason()
+        }
+        #expect(try await check("echo 'error: no Metal GPU' >&2; exit 1") == "no Metal GPU")
+        #expect(try await check("exit 1") == nil)
+        #expect(try await check("exit 0") == nil)
     }
 }
 
@@ -510,6 +607,21 @@ struct ChatTests {
         #expect(changed && store.reply == nil && store.current?.messages.last?.text == "One two three")
         store.flush()
         #expect(ChatStore(folder: folder).conversations.first?.messages.last?.text == "One two three")
+    }
+
+    /// What changed last is on disk by when the app has ended, though writes go to a queue. Large,
+    /// so that the queue is still writing it when the app goes on to end.
+    @MainActor @Test func theAppEndsOnceTheChatsAreWritten() throws {
+        let folder = FileManager.default.temporaryDirectory.appending(path: "splash-chat-tests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: folder) }
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let conversation = Conversation(title: "Before", messages: [ChatMessage(role: .user, text: "Hi", images: [Data(count: 8_000_000)])])
+        try JSONEncoder().encode(conversation).write(to: folder.appending(path: "\(conversation.id.uuidString).json"))
+        let state = AppState(runtime: Showcase.runtime, chats: ChatStore(folder: folder), keychain: Keychain(service: "Splash Tests"))
+        let delegate = AppDelegate(state: state)
+        state.chats.rename(conversation.id, to: "After")
+        delegate.applicationWillTerminate(Notification(name: NSApplication.willTerminateNotification))
+        #expect(ChatStore(folder: folder).conversations.first?.title == "After")
     }
 
     @MainActor @Test func anAnswerTheAppQuitDuringSaysSo() throws {
