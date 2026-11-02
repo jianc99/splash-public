@@ -8,14 +8,17 @@
 #include "engine/Engine.hpp"
 
 #include <algorithm>
+#include <array>
 #include <functional>
 #include <limits>
 #include <memory>
 #include <optional>
+#include <random>
 #include <span>
 #include <string>
 #include <tuple>
 #include <utility>
+#include <vector>
 
 using namespace splash;
 using namespace splash::engine;
@@ -1378,6 +1381,127 @@ void testTheEstimatesReportWhatPricesTheUnits() {
           "the decode estimate did not report its time a token");
 }
 
+// A prefill command of each lane's rows as the model ran it.
+using RanRows = std::vector<std::vector<std::pair<uint64_t, uint32_t>>>;
+
+void recordPrefills(Executor &model, RanRows &commands) {
+  model.commandTimes = [out = &commands](const BatchPlan &plan, std::span<const ModelBatchItem> items) {
+    if (plan.kind == WorkKind::Prefill && !plan.pass) {
+      std::vector<std::pair<uint64_t, uint32_t>> rows;
+      for (size_t index = 0; index < plan.items.size(); ++index) {
+        require(items[index].requestId == plan.items[index].requestId &&
+                    items[index].tokenCount == plan.items[index].tokenCount,
+                "a command reached the model other than as planned");
+        rows.emplace_back(plan.items[index].requestId, plan.items[index].tokenCount);
+      }
+      out->push_back(std::move(rows));
+    }
+    return test::CommandTimes{};
+  };
+}
+
+// A state capture refused at a boundary inside a lane's command cuts the
+// command there: prepare sends the plan back with the lane's rows capped at
+// the boundary (LaneShape::rowCap), the plan made again reaches the model as
+// planned, and the next command goes on from the boundary. (The prompt's
+// group of 7000 rows crosses its checkpoint at 4096, which the model
+// refuses.)
+void testACaptureCutReplansWithARowCap() {
+  test::TestKvStorage storage(512, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache cache(pool, nullptr, nullptr);
+  Executor model;
+  test::commandShape(4 * model::ExecutionLimits::prefillTokenBudget)(model);
+  RanRows commands;
+  recordPrefills(model, commands);
+  model.denyReservationAt = engine::kPrefillCheckpointTokens;
+  Events events;
+  engine::Engine engine(test::engineConfig({.maxContext = 102400}), cache, model, events);
+  guardReleases(storage, engine);
+  test::seedAsStartup(engine, model);
+  engine.submit(request(1, std::vector<uint32_t>(7000, 7)));
+  runUntilIdle(engine);
+  const EngineSnapshot counts = engine.snapshot();
+  require(events.completedCount == 1 && !commands.empty() &&
+              commands.front() == std::vector<std::pair<uint64_t, uint32_t>>{{1, engine::kPrefillCheckpointTokens}},
+          "the command did not end at the boundary whose capture was refused");
+  require(counts.captureCuts == 1 && counts.replans >= 1,
+          "the capture cut was not planned again with the lane's rows capped");
+  require(commands.size() >= 2 && commands[1].front() == std::pair<uint64_t, uint32_t>{1, 7000 - 4096},
+          "the next command did not go on from the boundary");
+}
+
+// A lane refused its KV leaves the plan: prepare sends the plan back
+// without it, the others keeping what they were granted, and the plan made
+// again runs them; the refused lane runs once memory frees. (The short
+// prompt leads and the long one joins with its rows; the pool's budget
+// holds the short one's pages but not both.)
+void testAPartialAdmissionReplansWithoutTheDeniedLane() {
+  test::TestKvStorage storage(512, 4096, 4);
+  storage.budgetPages = 52;
+  KvPool pool(storage, 0);
+  engine::Cache cache(pool, nullptr, nullptr);
+  Executor model;
+  RanRows commands;
+  recordPrefills(model, commands);
+  Events events;
+  engine::Engine engine(test::engineConfig({.maxContext = 102400}), cache, model, events);
+  guardReleases(storage, engine);
+  engine.submit(request(1, std::vector<uint32_t>(300, 7)));
+  engine.submit(request(2, std::vector<uint32_t>(1500, 8)));
+  static_cast<void>(engine.tick(1));
+  require(commands.size() == 1 && commands.front() == std::vector<std::pair<uint64_t, uint32_t>>{{1, 300}} &&
+              engine.snapshot().replans >= 1,
+          "the plan was not made again without the lane refused its KV");
+  runUntilIdle(engine);
+  require(events.completedCount == 2 && events.failedCount == 0 && model.prefillChunks.at(1) == 1 &&
+              model.prefillRows == 1800,
+          "the lanes did not each run their rows once");
+}
+
+// However prepare's refusals fall, a tick's planning ends: each plan sent
+// back leaves a lane more out, caps a lane's rows at an earlier boundary, or
+// follows a change of a lane's shape, so a tick plans again at most once a
+// lane for refusals and once a lane for each state boundary its command may
+// cross (a command of 8192 rows crosses at most two checkpoints of 4096 and
+// the replay point), and once for the command between its passes taken.
+// Random refusals of states over prompts with checkpoints and a short one.
+// (A tick that planned only to wait leaves a later wakeup: EngineHarness,
+// V's I7.)
+void testReplansPerTickAreBounded() {
+  constexpr uint32_t groupRows = 4 * model::ExecutionLimits::prefillTokenBudget;
+  constexpr std::array<uint32_t, 4> prompts{300, 7000, 9500, 13'000};
+  constexpr uint64_t most = prompts.size() * (1 + groupRows / engine::kPrefillCheckpointTokens + 1) + 1;
+  uint64_t replanned = 0;
+  for (uint32_t seed = 1; seed <= 20; ++seed) {
+    std::mt19937 random(seed);
+    test::TestKvStorage storage(2048, 4096, 4);
+    KvPool pool(storage, 0);
+    engine::Cache cache(pool, nullptr, nullptr);
+    Executor model;
+    test::commandShape(groupRows)(model);
+    model.reservationRoom = [&] { return random() % 3 != 0; };
+    Events events;
+    engine::Engine engine(test::engineConfig({.maxContext = 102400}), cache, model, events);
+    guardReleases(storage, engine);
+    test::seedAsStartup(engine, model);
+    for (uint64_t id = 1; id <= prompts.size(); ++id)
+      engine.submit(request(id, std::vector<uint32_t>(prompts[id - 1], static_cast<uint32_t>(id))));
+    double now = 1;
+    for (uint32_t step = 0; step < 2000 && !idle(engine); ++step) {
+      const uint64_t before = engine.snapshot().replans;
+      static_cast<void>(engine.tick(now++));
+      const uint64_t replans = engine.snapshot().replans - before;
+      replanned += replans;
+      require(replans <= most, "seed " + std::to_string(seed) + ": a tick planned again " +
+                                   std::to_string(replans) + " times");
+    }
+    require(idle(engine) && events.completedCount == prompts.size(),
+            "seed " + std::to_string(seed) + ": the prompts did not end");
+  }
+  require(replanned > 0, "no refusal sent a plan back");
+}
+
 } // namespace
 
 std::span<const test::TestCase> commandsTests() {
@@ -1418,6 +1542,9 @@ std::span<const test::TestCase> commandsTests() {
       {"testACommandAnyLaneConvertsInReplans", testACommandAnyLaneConvertsInReplans},
       {"testALaneJoinsWithTheRowsThatSpareItACommand", testALaneJoinsWithTheRowsThatSpareItACommand},
       {"testTheEstimatesReportWhatPricesTheUnits", testTheEstimatesReportWhatPricesTheUnits},
+      {"testACaptureCutReplansWithARowCap", testACaptureCutReplansWithARowCap},
+      {"testAPartialAdmissionReplansWithoutTheDeniedLane", testAPartialAdmissionReplansWithoutTheDeniedLane},
+      {"testReplansPerTickAreBounded", testReplansPerTickAreBounded},
   };
   return kTests;
 }
