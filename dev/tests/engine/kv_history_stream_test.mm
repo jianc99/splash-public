@@ -59,7 +59,9 @@ constexpr uint32_t kExtentPages = 256, kLayers = 3;
 // 10 pages each.
 constexpr uint32_t kHistoryPages = 80, kPages = 100, kChunkPages = 10;
 
-constexpr kv::Layout layoutOf(kv::Format format) { return {kLayers, 2, 256, format, 128, true}; }
+constexpr kv::Layout layoutOf(kv::Format format) {
+  return {kLayers, 2, 256, format, 128, true, 0, 0, kv::Reads::SelectedBlocks};
+}
 
 std::vector<std::byte> layerBytes(const kv::PageStorage &storage, uint32_t page, uint32_t layer) {
   std::vector<std::byte> bytes;

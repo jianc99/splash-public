@@ -639,8 +639,8 @@ void namespaceNamesTheSlotFormat() {
         model.stateLayout);
   };
   const kv::Layout dense{16, 4, 256, kv::Format::Int8};
-  const kv::Layout flashNext{12, 2, 256, kv::Format::Int8, 128, true};
-  const kv::Layout flashNextBf16{12, 2, 256, kv::Format::BFloat16, 128, true};
+  const kv::Layout flashNext{12, 2, 256, kv::Format::Int8, 128, true, 0, 0, kv::Reads::SelectedBlocks};
+  const kv::Layout flashNextBf16{12, 2, 256, kv::Format::BFloat16, 128, true, 0, 0, kv::Reads::SelectedBlocks};
   require(KvPageTier::slotFormatToken(dense).empty() &&
               KvPageTier::slotFormatToken(flashNext) == " slots block-records-v1",
           "the slot format's token changed");
@@ -667,7 +667,7 @@ void run(const std::string &metallib) {
     persistentRoundTrip(backend, governor, readers, kv::Layout{16, 4, 256, format});
     // Qwen3.8-Flash-Next's token-major values and QSA index: its slots hold
     // the index, then one record per block of each layer.
-    const kv::Layout flashNext{12, 2, 256, format, 128, true};
+    const kv::Layout flashNext{12, 2, 256, format, 128, true, 0, 0, kv::Reads::SelectedBlocks};
     roundTrip(backend, governor, readers, flashNext);
     blockRecords(backend, governor, readers, flashNext);
     persistentRoundTrip(backend, governor, readers, flashNext);

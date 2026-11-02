@@ -59,7 +59,9 @@ constexpr uint32_t kExtentPages = 256, kPlaces = 8, kLaneSlots = 1024;
 // An extent's slots per layer.
 constexpr uint32_t kExtentSlots = kExtentPages * kPlaces;
 
-constexpr kv::Layout layoutOf(kv::Format format) { return {2, 2, 256, format, 128, true}; }
+constexpr kv::Layout layoutOf(kv::Format format) {
+  return {2, 2, 256, format, 128, true, 0, 0, kv::Reads::SelectedBlocks};
+}
 
 uint64_t extentBytes(kv::Layout layout) { return uint64_t{kExtentPages} * layout.kvBytesPerModelPage(); }
 

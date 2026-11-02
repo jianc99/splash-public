@@ -33,8 +33,8 @@ constexpr kv::Layout bf16Layout{16, 4, 256, kv::Format::BFloat16};
 constexpr kv::Layout compactBf16Layout{10, 2, 256, kv::Format::BFloat16};
 // Qwen3.8-Flash-Next's: token-major values and a QSA index of 128-wide pooled
 // keys.
-constexpr kv::Layout indexedLayout{12, 2, 256, kv::Format::Int8, 128, true};
-constexpr kv::Layout indexedBf16Layout{12, 2, 256, kv::Format::BFloat16, 128, true};
+constexpr kv::Layout indexedLayout{12, 2, 256, kv::Format::Int8, 128, true, 0, 0, kv::Reads::SelectedBlocks};
+constexpr kv::Layout indexedBf16Layout{12, 2, 256, kv::Format::BFloat16, 128, true, 0, 0, kv::Reads::SelectedBlocks};
 // A sliding window over 35 of 49 layers of 4 KV heads of 128, Flint's: every
 // layer but 0, 1, 48 and every fourth from 5 reads the 512 keys before its
 // row's alone.

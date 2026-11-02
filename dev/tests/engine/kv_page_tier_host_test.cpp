@@ -178,7 +178,7 @@ int main() {
       // records.
       for (const kv::Layout layout : {kv::Layout{10, 2, 256, format},
                                       kv::Layout{6, 2, 256, format, 0, false, 512, 0b010110},
-                                      kv::Layout{12, 2, 256, format, 128, true}}) {
+                                      kv::Layout{12, 2, 256, format, 128, true, 0, 0, kv::Reads::SelectedBlocks}}) {
         roundTrips(readers, layout);
         teardown(readers, layout);
       }
