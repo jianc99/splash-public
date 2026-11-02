@@ -138,6 +138,42 @@ void testStoreRetakesFreeRoomAfterCriticalPressure() {
           "the store did not take the free room back once the pressure was over");
 }
 
+// Borrowed 3(d): host readings that show a release only 0.5-1 s late cause
+// no second release. Other applications leave the idle engine's host half
+// its margin short; the control pass, every 100 ms, gives back a unit of the
+// expert store, which covers that, and the passes while the host's readings
+// still show the shortfall take nothing more, nor take the unit back.
+void testLaggingHostReadingsCauseNoSecondRelease() {
+  constexpr uint64_t kGiB = 1ULL << 30;
+  for (const double lag : {500.0, 1000.0}) {
+    test::LoopFixture fixture({}, {}, {}, metal::kResidencyKeepAliveSeconds,
+                              test::LoopOptions{.memory = test::FakeMemory::Config{.readingLagMilliseconds = lag}});
+    test::FakeElasticPool experts("experts", *fixture.memory, kGiB, 1, 4, 8, 4, 2.5, 80.0);
+    fixture.executor.experts = &experts;
+    static_cast<void>(fixture.governor->ledger().addPool(experts));
+    fixture.loop.announceReady();
+    // The control pass every 100 ms, the loop idle: past the lag first, so
+    // that the readings show what the engine holds.
+    const auto passes = [&](double milliseconds) {
+      for (const double end = fixture.monotonic + milliseconds; fixture.monotonic < end; fixture.monotonic += 100.0) {
+        fixture.memory->advanceTo(fixture.monotonic);
+        static_cast<void>(fixture.loop.tick());
+        static_cast<void>(fixture.control->run(fixture.memory->pressure()));
+      }
+    };
+    passes(lag + 1000.0);
+    require(!experts.shrinks && !experts.grows, "an ample host moved the store");
+    const test::GovernorLimits limits;
+    fixture.memory->setHost(fixture.memory->hostBytes() - limits.hostSpareReserveBytes - fixture.memory->total() -
+                                kHostMarginBytes / 2,
+                            MemoryPressure::Normal);
+    passes(3000.0);
+    require(experts.shrinks == 1 && experts.grows == 0,
+            "host readings " + std::to_string(lag) + " ms late took " + std::to_string(experts.shrinks) +
+                " units of the store and gave back " + std::to_string(experts.grows) + ", not one and none");
+  }
+}
+
 } // namespace
 
 std::span<const test::TestCase> memoryTests() {
@@ -146,6 +182,7 @@ std::span<const test::TestCase> memoryTests() {
       {"testMemoryStatusReporterLogsTransitionsOnly", testMemoryStatusReporterLogsTransitionsOnly},
       {"testRestoreBringsTheFloorThenGrowthTheRest", testRestoreBringsTheFloorThenGrowthTheRest},
       {"testStoreRetakesFreeRoomAfterCriticalPressure", testStoreRetakesFreeRoomAfterCriticalPressure},
+      {"testLaggingHostReadingsCauseNoSecondRelease", testLaggingHostReadingsCauseNoSecondRelease},
   };
   return kTests;
 }

@@ -41,6 +41,9 @@ public:
     uint64_t hostBytes = 64ULL << 30;
     uint64_t otherBytes = 8ULL << 30;
     std::vector<HostEvent> script;
+    // How long the host's readings take to show what the engine allocates
+    // and gives back, as macOS's counters lag a release.
+    double readingLagMilliseconds = 0.0;
   };
   struct Change final {
     double atMilliseconds = 0.0;
@@ -86,10 +89,11 @@ public:
   [[nodiscard]] const std::vector<Change> &changes() const noexcept { return changes_; }
 
   // The host as the governor samples it (MemoryGovernor::HostMemoryProvider):
-  // available = spare = what other applications and the engine leave.
+  // available = spare = what other applications and the engine leave, the
+  // engine's bytes as they stood the reading lag ago.
   [[nodiscard]] engine::MemoryGovernor::HostMemoryProvider hostMemory() {
     return [this]() -> std::optional<engine::HostMemory> {
-      const uint64_t used = other_ + total_;
+      const uint64_t used = other_ + totalAt(now_ - config_.readingLagMilliseconds);
       const uint64_t free = used < config_.hostBytes ? config_.hostBytes - used : 0;
       return engine::HostMemory{free, free};
     };
@@ -129,6 +133,13 @@ public:
   }
 
 private:
+  // What the engine held at the clock time: after the last change by then.
+  [[nodiscard]] uint64_t totalAt(double milliseconds) const noexcept {
+    for (auto change = changes_.rbegin(); change != changes_.rend(); ++change)
+      if (change->atMilliseconds <= milliseconds)
+        return change->totalAfter;
+    return 0;
+  }
   void change(std::string_view holder, int64_t bytes) {
     auto found = holders_.find(holder);
     if (found == holders_.end())
