@@ -118,7 +118,7 @@ check-native-engine: check-native-cpu check-native-metal check-native-build
 
 check-native-cpu: platform-check $(TARGET) test-engine-cpu
 
-check-native-metal: platform-check $(TARGET) test-engine-metal
+check-native-metal: platform-check $(TARGET) test-engine-metal test-sanitizers-metal
 
 # Build every native test, benchmark and tool, the outputs TEST_CONFIG_TARGETS
 # and PRODUCTION_FLAG_TOOLS name, and run none: hosted CI has no GPU the Metal

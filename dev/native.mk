@@ -899,11 +899,12 @@ test-sanitizers: $(SANITIZER_CONFIG_TARGETS)
 	$(ASAN_TEST_ENV) $(TEST_MEMORY_LEDGER_ASAN) $(RECORDED_LOADS)
 
 # The Metal tests of the components whose host steps share their state with
-# the engine thread and the SSD readers, the hot block cache and the history
-# stream, under ThreadSanitizer on a Mac with a GPU: the engine library and
-# the tests built with it, and their metallibs, in a build of their own (the
-# builds above link no framework), and what it cannot see inside Metal
-# suppressed (metal_tsan_suppressions.txt).
+# the engine thread and the SSD readers, the hot block cache, the history
+# stream and the expert store, under ThreadSanitizer on a Mac with a GPU: the
+# engine library and the tests built with it, and their metallibs, in a build
+# of their own (the builds above link no framework), and what it cannot see
+# inside Metal suppressed (metal_tsan_suppressions.txt). check-native-metal
+# runs it.
 METAL_TSAN_BUILD := $(BUILD)/metal-tsan
 METAL_TSAN_CXXFLAGS := $(ENGINE_SANITIZER_CXXFLAGS) -fsanitize=thread
 METAL_TSAN_TEST_ENV := $(TSAN_TEST_ENV):suppressions=dev/tests/engine/metal_tsan_suppressions.txt
@@ -912,6 +913,8 @@ test-sanitizers-metal:
 	$(MAKE) --no-print-directory -f "$(SPLASH_MAKEFILE)" BUILD=$(METAL_TSAN_BUILD) \
 		ENGINE_CXXFLAGS='$(METAL_TSAN_CXXFLAGS)' ENGINE_TEST_CXXFLAGS='$(METAL_TSAN_CXXFLAGS)' \
 		$(METAL_TSAN_BUILD)/splash.metallib $(METAL_TSAN_BUILD)/host-step.metallib \
-		$(METAL_TSAN_BUILD)/engine-tests/kv-block-cache $(METAL_TSAN_BUILD)/engine-tests/kv-history-stream
+		$(METAL_TSAN_BUILD)/engine-tests/kv-block-cache $(METAL_TSAN_BUILD)/engine-tests/kv-history-stream \
+		$(METAL_TSAN_BUILD)/engine-tests/expert-store
 	$(METAL_TSAN_TEST_ENV) $(METAL_TSAN_BUILD)/engine-tests/kv-block-cache $(METAL_TSAN_BUILD)/splash.metallib
 	$(METAL_TSAN_TEST_ENV) $(METAL_TSAN_BUILD)/engine-tests/kv-history-stream $(METAL_TSAN_BUILD)/splash.metallib
+	$(METAL_TSAN_TEST_ENV) $(METAL_TSAN_BUILD)/engine-tests/expert-store $(METAL_TSAN_BUILD)/splash.metallib

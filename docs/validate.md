@@ -12,14 +12,19 @@ the desktop app's tests (`swift test --package-path app`). `make
 check-native-cpu` builds production and runs native CPU tests without a GPU;
 `make check-native-metal` requires a supported Metal device and runs the kernel
 tests under shader validation, and the Linear pipeline resource check without
-it. They include loading small synthetic MLX, GGUF and vision sources and the
-GGUF kernels on synthetic tensors. `make check-native-build` builds every
-native test, benchmark and tool and runs none. Hosted CI runs the CPU checks,
-`check-native-build`, the sanitizers and `check-app`. `make
-test-sanitizers-metal` runs the Metal tests of the components whose host steps
-share their state with the engine thread and the SSD readers (the hot block
-cache of spilled KV and the history stream) under ThreadSanitizer, built with
-it in `build/metal-tsan`. `make architecture-check`, one of the source checks,
+it, then `test-sanitizers-metal`. They include loading small synthetic MLX,
+GGUF and vision sources and the GGUF kernels on synthetic tensors. `make
+check-native-build` builds every native test, benchmark and tool and runs
+none. Hosted CI runs the CPU checks, `check-native-build`, the sanitizers and
+`check-app`. `make test-sanitizers` runs the CPU tests that start threads,
+the control plane's (`engine`, `native-engine-loop`, the cache, protocol and
+transport tests) among them, under AddressSanitizer with UndefinedBehavior
+and under ThreadSanitizer. `make test-sanitizers-metal` runs the Metal tests
+of the components whose host steps share their state with the engine thread
+and the SSD readers (the hot block cache of spilled KV, the history stream
+and the expert store) under ThreadSanitizer, built with it in
+`build/metal-tsan`; only orders that lie inside Metal are suppressed
+(`dev/tests/engine/metal_tsan_suppressions.txt`). `make architecture-check`, one of the source checks,
 also fails when a workflow under `.github/workflows` names a Hugging Face token
 (`HF_TOKEN`, `HUGGING_FACE_HUB_TOKEN` or a `secrets.HF_*` secret): CI installs
 public models alone and never receives one.
@@ -44,6 +49,7 @@ does, and `REVISION`, `DRAFT_MODEL` and `LANGUAGE_ONLY=1` as its `--revision`,
 | `test-agent-real` | the five official clients through `splash serve` (`dev/tests/agent_real.py`), in `AGENT_SCENARIO` `complete` (the default) or `smoke` |
 | `test-release-real` | the HTTP smoke and all five clients on one `splash serve` |
 | `test-performance-real` | the native decode, partial-prefix and short-prompt benchmark, or with `BASELINE` its ABBA comparison with that build, in which both builds' `weight-digests` take `WEIGHT_DIGESTS_ARGS` (`dev/benchmarks/backend_regression.py`) |
+| `test-pressure-real` | the installation on this checkout's own server under `PRESSURE_ARGS` (default `--max-memory 18G`), which must make it stream its routed experts, with the [serving benchmark](#serving-benchmark)'s three churn clients for `PRESSURE_MINUTES` (default 5), judged on its own by `matrix.py check`: every client served, no engine restart, HTTP error (but `context_length_exceeded`) or Metal failure, no tick of the command loop past the GPU wait limit, no client decode gap at or past 6.2 s, and with a schema-7 `/status` the run's own gap bound; results in `build/release/<model>/pressure` |
 | `release-check` | one model on this Mac ([Release check](#release-check)) |
 
 `test-agent-real` and `test-release-real` first run the tests
@@ -122,6 +128,7 @@ make install release-check MODEL=mlx-community/Qwen3.8-27B-4bit REVISION=<commit
 make install release-check MODEL=unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M LANGUAGE_ONLY=1 REVISION=<commit> BASELINE=...
 make install release-check MODEL=mlx-community/Qwen3.6-35B-A3B-4bit REVISION=<commit> BASELINE=...
 make install release-check MODEL=unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M REVISION=<commit> BASELINE=...
+make install test-pressure-real MODEL=unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M REVISION=<commit> PRESSURE_ARGS="--max-memory 18G"
 make install verify-models MODEL=mlx-community/Qwen3.6-35B-A3B-4bit
 make test-agent-real MODEL=mlx-community/Qwen3.6-35B-A3B-4bit REVISION=<commit> AGENT_SCENARIO=smoke AGENT_CLIENTS=...
 ```
@@ -157,8 +164,10 @@ the other. Per model, `release-check`:
   MoE target's outputs repeat and its times measure the backend, not the
   verify budget of [Drafts](models.md#drafts)), and so must the bytes of the weight images
   both load (`dev/benchmarks/weights.py`); decode and prefill GPU time, with the cold
-  prefills of short prompts (480 to 2016 tokens, one chunk each), may regress
-  by at most the larger of 2% and
+  prefills of short prompts (480 to 2016 tokens, one chunk each), and their wall
+  times (decode milliseconds per output token, the cold 14K prefill's wall
+  time and the short prefills' TTFT), which hold the host work between
+  commands, may regress by at most the larger of 2% and
   twice the run's own ABBA spread, a spread above 5% fails as inconclusive,
   and this build's
   memory plan must hold, without the Neural Engine split, at least the
@@ -323,3 +332,97 @@ GPU workloads, and report chip/GPU cores, memory, Splash version, model
 revision, actual input/output token counts, and cache hits with results. Keep
 cold prefill, cached TTFT and sustained decode separate; a UI token rate alone
 does not measure end-to-end agent performance.
+
+## Serving benchmark
+
+`dev/benchmarks/serving` measures a server under concurrent requests and
+compares builds of different trees, such as a release candidate with the last
+release, on one Mac. Each run starts the tree's own server, so every tree is
+measured through the same OpenAI API whatever its native wire and status
+schema, and the client times what a user sees.
+
+| Scenario | Requests |
+| --- | --- |
+| `churn` | three clients, each sending 1500-token answers to prompts that grow every round (about 8K tokens, then more; `CHURN_BASE`/`CHURN_STEP` words), every fourth round resending its conversation, the first requests in a fixed arrival order (`--order 2,0,1` or `0,1,2`, 0.6 s apart), for `--minutes`; `/status` every 2 s |
+| `ttft` | for each N of `--n`, on a fresh server: N conversations cache an ~8K-token prefix one at a time, then send it with distinct ~300-token suffixes at the same instant, `--rounds` times; `/status` every 0.5 s |
+| `serve1` | one request at a time on an idle server, cold prompts of about `--sizes` tokens (300, 2K and 14K): time to first token and decode milliseconds per token |
+| `warm` | per cached depth of `--sizes`, a fresh cold prefix, then 2 discarded and 8 measured ~300-token suffixes after it: the server's prompt time of each (`--trial` picks the texts, the same for every tree) |
+
+Every request timestamps each content chunk of its stream; its gaps are the
+intervals between consecutive chunks after the first, and a request still
+streaming when a run is cut contributes its open gap.
+
+```sh
+.venv/bin/python -m dev.benchmarks.serving.run --tree TREE --machine m6 \
+  --model ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF:Q2_0 --revision <commit> \
+  --draft-model DRAFT --scenario churn --order 2,0,1 --minutes 15 --label LABEL --out RESULTS
+```
+
+`run.py` installs the model with the tree's own installer, offline, or takes
+`--model-root`; refuses a port that already answers; checks that `/status`
+names the server it started (`instance.pid`) and the build of the tree's
+sources (`identity.cache.build_id` against the tree's own
+`dev/tools/build_identity.py check` with its Makefile's constants); runs the
+scenario; and stops the server with SIGINT, then SIGTERM. Beside the client's
+`LABEL.events.jsonl` and `LABEL.status.jsonl` it writes `LABEL.out`, whose last
+line is `DONE` only once everything completed, `LABEL.meta.json` (binary
+SHA-256, build id, model, spawn-to-ready seconds and whether the binary had
+started on that Mac before, host memory and pressure, and process snapshots at
+the start, middle and end) and on the M5 Pro `LABEL.idle.jsonl`, its idle time
+and sleep assertions every 10 s. It refuses any output directory that resolves,
+through whatever symlinks, into `~/.cache/huggingface` or an `install/models`
+directory.
+
+`matrix.py` reads the matrix, `matrix-1.6.0.json` for 1.6.0: the trees and
+their commits, the models at pinned revisions, each machine's GPU lock, port
+and measured noise, and the cells (machine, model, scenario, server options,
+runs per tree and order, recorded reference runs, gates).
+
+- `plan --machine M --tree NAME=DIR ...` writes one job per run, holding the
+  machine's GPU lock around `run.py`, interleaved so that no tree owns the
+  start or end of the queue; `--references` plans the reference runs a cell
+  still lacks.
+- `check RESULTS LABEL --minutes N` judges one churn run on its own (`DONE`,
+  the load window, every client served, health and gaps); `check --running
+  GPUQ` lists queued jobs running past twice the time the first finished job
+  of their type took on that Mac (20 minutes per churn run without one).
+- `analyze --results DIR... --out DIR` applies the gates to every cell with
+  results and writes `verdict.json` and `verdict.md`: PASS, FAIL or
+  INCONCLUSIVE with the numbers, the trades for the owner, and every run it
+  did not use and why.
+
+A run counts only if it ended with `DONE`, its server never restarted, it
+saw no HTTP error but `context_length_exceeded` and no `serious` or `critical`
+thermal sample, it served the cell's model, no process it did not start
+outranked one of its own among the top five by CPU, and, on the M5 Pro, its
+owner neither touched it (HIDIdleTime under 10 s) nor held a display or system
+sleep assertion. An ample-memory run counts only if the experts were at their
+cap with pressure normal at Ready. Copy a tree to another Mac by content
+(`rsync --checksum`): `git archive` leaves `dev/tests` and `dev/benchmarks` out
+(`.gitattributes`), and a copy that keeps the files' old times leaves make
+running stale binaries. For a gate, delete the test binary before building it
+and record the commit, an empty `git status --porcelain`, the binary's SHA-256
+and its test count.
+
+The gates compare per-run metrics on a log scale: work at 900 s (prefill rows
+and output tokens at each model's single-request prices), and over the tags
+every compared run completed the geometric means of latency, TTFT and decode
+rate. The interval of the candidate/reference ratio is one-sided 90 %, its
+half-width t(0.9, df) times the machine's per-run noise for that metric
+(pooled from the cell's own same-tree runs, else the spec's recorded value)
+times sqrt(1/n + 1/m), per arrival order and pooled; a tolerance turns it into
+a verdict, and noise only decides how many runs resolve it.
+
+| Gate | Rule |
+| --- | --- |
+| G1, G2 | work, latency and decode rate against 1.5.0: within 5 % only with a clear gain on TTFT, completion latency, freezes or concurrent TTFT, else no loss at all |
+| G3 | TTFT against main within 2 %; under a memory cap also when G2 passes, no decode froze, and the TTFT is no worse than the cell's best tree that kept decoding |
+| G4 | per candidate run: contended prefill p95 and client gap p99 within the run's own bound (`max(decode_gap_target_ms, u/0.1)` with its estimate's p95 error), every client gap under the smallest stall rejected on that machine |
+| G5 | concurrent TTFT: per N the median of each round's worst, at most the reference's times one plus its own spread |
+| G6 | ample memory: work, latency and TTFT within 2 % of the best measured tree |
+| G7 | single requests (`test-performance-real` against the base, `serve1`, `warm`): `abba.compare` on every metric, in session |
+| G8, G9 | no restart, failed request, Metal failure or tick past 5 s; warm start within the base's plus the warm-up; memory accounts summing to the charged bytes, nothing owed at the end, no claim waiting past the resource wait |
+| SSD | disk and expert bytes per unit of work not surely above both release references |
+| Tags | no tag whose every candidate run is past the references' worst by their own spread |
+| G10 | dense, resident, Flint and Apple9 cells against the base: work and TTFT point estimates within 2 %, and no G4 failure |
+| Floor | the Flash-Next store held at its cap becomes the floor default only when no metric is worse than the value default's and one is better; mixed results go to the owner |
