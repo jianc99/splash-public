@@ -291,7 +291,7 @@ public:
 void testTheDefaultSampleIsTheTicketsTimes() {
   const model::CommandSample sample = TimedTicket().sample();
   require(sample.work == model::CommandWork{} && sample.wallMilliseconds == 12.5 &&
-              sample.weightReadMilliseconds == 0.0 && sample.imageEncodeMilliseconds == 2.0 &&
+              sample.spilledKvReadMilliseconds == 0.0 && sample.imageEncodeMilliseconds == 2.0 &&
               !sample.representative,
           "the default sample is not the ticket's times with no work");
 }

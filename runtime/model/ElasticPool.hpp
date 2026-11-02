@@ -17,6 +17,8 @@ struct PoolState final {
   uint64_t releaseUnitBytes = 0;  // what release(1) frees now; 0 at the floor
   uint64_t growUnitBytes = 0;     // what grow() takes next; 0 when the engine cannot grow it now (at its cap,
                                   // released, a pool that grows only as it is used)
+  uint64_t wholeBytes = 0;        // what it would allocate holding every key it serves (the store: every expert
+                                  // in a slot); 0 when it does not say
 };
 
 // The pool's own measurements, monotonic since it was built; the consumer differentiates them over its own
@@ -31,6 +33,10 @@ struct PoolValue final {
   uint64_t releasedBytes = 0;     // bytes release() gave back
   double releaseMilliseconds = 0.0;  // engine-thread time release() took to give them back (the store's
                                      // compactions)
+  uint64_t keyBytes = 0;          // bytes one miss reads now (the store: a slot's mean bytes); 0 when it does
+                                  // not say
+  uint64_t scanReadBytes = 0;     // bytes prefill loads read from the SSD, whose misses leave no ghosts; 0
+                                  // without scans
 };
 
 // A memory of the model's that follows the engine's memory. The model owns the mechanism; the engine alone
