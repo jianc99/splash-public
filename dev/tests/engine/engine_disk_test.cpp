@@ -1971,10 +1971,43 @@ void testCancelledDiskPrefixStopsQueuedReads() {
           "retry did not reuse the cancelled request's disk prefix");
 }
 
+// A start refused pages that demotions in flight return waits for them on
+// its claim (amend/M.md B14): the claim waits from its first pending refusal
+// for the resource wait limit, holding the room against claims ranked below
+// it, and no longer.
+void testAPendingRefusalHoldsItsClaimForTheWaitLimit() {
+  test::TestKvStorage storage(16, 4096, 4);
+  KvPool pool(storage, 0);
+  test::TestKvTier tier;
+  tier.transferLimit = 8;
+  tier.capacity = 8;
+  engine::Cache cache(pool, &tier, test::ampleDiskBudget());
+  Executor executor;
+  Events events;
+  const EngineConfig config = test::engineConfig({.maxContext = 102400});
+  engine::Engine engine(config, cache, executor, events);
+  guardReleases(storage, engine);
+  cacheBlocksUnderDiskStates(cache, 6);
+  storage.growthBlocked = true;
+  EngineRequest start = request(1, std::vector<uint32_t>(161, 7));
+  start.deadlineMilliseconds = 1e9;
+  engine.submit(std::move(start));
+  static_cast<void>(engine.tick(1));
+  require(tier.demotions == 3 && config.governor->ledger().claimWaiting(),
+          "the start refused pages on their way back did not wait on its claim");
+  // The demotions never land.
+  static_cast<void>(engine.tick(1 + kResourceWaitTimeoutMilliseconds - 1000));
+  require(config.governor->ledger().claimWaiting() && events.failedCount == 0,
+          "the claim stopped waiting before the wait limit from its first pending refusal");
+  static_cast<void>(engine.tick(1 + kResourceWaitTimeoutMilliseconds + 500));
+  require(!config.governor->ledger().claimWaiting(), "the claim held its room past the wait limit");
+}
+
 } // namespace
 
 std::span<const test::TestCase> diskTests() {
   static constexpr test::TestCase kTests[] = {
+      {"testAPendingRefusalHoldsItsClaimForTheWaitLimit", testAPendingRefusalHoldsItsClaimForTheWaitLimit},
       {"testDiskKvPrefixIsRestoredBeforeTheLaneRuns", testDiskKvPrefixIsRestoredBeforeTheLaneRuns},
       {"testSkipCacheCandidateIsNotProbed", testSkipCacheCandidateIsNotProbed},
       {"testRefusedPrefixRestorePreemptsLowerResident", testRefusedPrefixRestorePreemptsLowerResident},
