@@ -183,9 +183,6 @@ StreamedMemoryResult planParts(const StreamedMemoryInputs &in, const Part &exper
   StreamedMemoryPlan plan{.spill = planSpill(in, spillFloors)};
   KvSpillPlan &spill = plan.spill;
   if (spill.enabled) floors = spillFloors;
-  // What an engine without requests holds of the floors: all of them but a
-  // Spill request's.
-  const uint64_t idleBytes = floors;
   if (!checkedAdd(floors, spill.floorBytes, floors)) return overflow();
   if (floors > in.hardBudgetBytes)
     return {std::nullopt,
@@ -251,9 +248,10 @@ StreamedMemoryResult planParts(const StreamedMemoryInputs &in, const Part &exper
     }
   }
   // A size of the routed experts is the floor of the store they stream
-  // through; an automatic store keeps its own
-  // (model::ExpertStoreOptions::floorBytes).
+  // through; an automatic store keeps the model's share of its slots
+  // (model::ExpertStoreOptions::floorBytes, floorShare).
   plan.expertFloorBytes = expertsStream && experts.floor ? experts.charged : 0;
+  plan.expertFloorShare = in.expertFloorShare;
   plan.tableBytes = table.streams ? table.charged : 0;
   if (table.automatic) {
     const int64_t kept = rest - allowance(expertsStream);
@@ -276,35 +274,6 @@ StreamedMemoryResult planParts(const StreamedMemoryInputs &in, const Part &exper
       spill.stagingBytes = 2 * one;
       spill.floorBytes += std::max(2 * one, spill.hotFloorBytes) - std::max(one, spill.hotFloorBytes);
     }
-  }
-
-  // Last, the host's budget beyond what an engine without requests holds of
-  // the floors once warm, the reserve the budget holds already aside: an
-  // automatic part that loads whole takes what it adds to its floors'
-  // charge, then the table's store and the experts' take, each above its
-  // charge, at most what is left. The table's row cache, which does not
-  // grow, takes that much, and what the budget holds back of it stays
-  // planned (hostHeldBackBytes); the experts' store, one --expert-memory
-  // sets the floor of too, starts with it and takes the rest of its cap back
-  // once memory allows. So the floors, what loads whole and the context
-  // never rest on the host.
-  uint64_t hostRoom = remaining(in.hostBudgetBytes, remaining(idleBytes, in.reserveBytes));
-  if (experts.automatic && !expertsStream) hostRoom = remaining(hostRoom, experts.all - experts.charged);
-  if (table.automatic && !plan.tableBytes) hostRoom = remaining(hostRoom, table.all - table.charged);
-  // What the host leaves the store above its smallest.
-  const auto hostKeeps = [&](const Part &part, uint64_t storeBytes) {
-    const uint64_t kept = std::min(storeBytes - part.charged, hostRoom);
-    hostRoom -= kept;
-    return part.charged + kept;
-  };
-  if (table.automatic && plan.tableBytes) {
-    const uint64_t kept = hostKeeps(table, plan.tableBytes);
-    plan.hostHeldBackBytes = plan.tableBytes - kept;
-    plan.tableBytes = kept;
-  }
-  if (experts.automatic && expertsStream) {
-    const uint64_t start = hostKeeps(experts, plan.expertBytes);
-    plan.expertStartBytes = start < plan.expertBytes ? start : 0;
   }
   return {plan, {}};
 }

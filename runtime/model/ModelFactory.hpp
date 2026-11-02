@@ -2,6 +2,7 @@
 
 #include "ops/Vision.hpp"
 #include "DFlashDraft.hpp"
+#include "ExpertChunkLayout.hpp"
 #include "ModelDescriptor.hpp"
 #include "Qwen3_6Moe.hpp"
 #include "Qwen3_8.hpp"
@@ -36,9 +37,9 @@ using TargetWeights = std::variant<Qwen3_8Weights, Qwen3_6MoeWeights, Qwen4ExpWe
 // file through a row cache of that many bytes instead of loading into memory
 // (model/SparseRowStore.hpp, --ple-memory). With expertMemoryBytes, a MoE
 // target's routed experts stream from their files through a store of that
-// many bytes at its cap, which gives memory back down to its floor of
-// expertFloorBytes, zero for the store's own, and starts with
-// expertStartBytes, zero for its cap (model/ExpertStore.hpp,
+// many bytes at its cap, which starts at its floor and gives memory back
+// down to it: expertFloorBytes, or where that is zero expertFloorShare of its
+// slots, the share the model's plan sets (model/ExpertStore.hpp,
 // ExpertStoreOptions, --expert-memory). Other models load as without them.
 // Streamed weights read on `readers`, the engine's one pool of SSD readers,
 // which KV reads share.
@@ -46,7 +47,7 @@ struct ModelLoadOptions final {
   uint64_t streamedTableBytes = 0;
   uint64_t expertMemoryBytes = 0;
   uint64_t expertFloorBytes = 0;
-  uint64_t expertStartBytes = 0;
+  double expertFloorShare = kExpertFloorShare;
   std::shared_ptr<SsdReaders> readers;
 };
 

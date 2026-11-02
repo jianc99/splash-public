@@ -89,7 +89,7 @@ LoadedModel loadModel(metal::MetalBackend &backend,
   // The weights that stream from their files read on the engine's readers.
   const ExpertStoreOptions experts{.memoryBytes = options.expertMemoryBytes,
                                    .floorBytes = options.expertFloorBytes,
-                                   .startBytes = options.expertStartBytes,
+                                   .floorShare = options.expertFloorShare,
                                    .readers = options.readers};
   result.target = std::visit(
       [&](const auto &layout) -> TargetWeights {

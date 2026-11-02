@@ -6,6 +6,7 @@
 // (EngineMemoryPlan) is made from what loaded.
 
 #include "engine/MemoryPlan.hpp"
+#include "model/ExpertChunkLayout.hpp"
 
 #include <array>
 #include <cstdint>
@@ -23,12 +24,6 @@ struct StreamedMemoryInputs final {
   // lanes' state and KV: the weights that load, the reserves, the state
   // staging and the Neural Engine split.
   uint64_t fixedBytes = 0;
-  // Of fixedBytes, the reserve the host's budget holds already when it is
-  // sampled: the process's runtime overhead
-  // (model::kRuntimeOverheadReserveBytes), which the spare memory counts.
-  // The pipeline reserve's pipelines and encoder scratch are built at
-  // warmup, after the sample, so the host room charges them.
-  uint64_t reserveBytes = 0;
   // The arenas of the model's geometry (model::plannedRuntimeMemory) by what
   // streams, [experts][table]: a target whose routed experts stream runs its
   // prefill commands as groups, and one whose table streams stages its rows,
@@ -52,11 +47,10 @@ struct StreamedMemoryInputs final {
   // The row cache an automatic table takes at most
   // (model::StreamableWeights::tableShareBytes).
   uint64_t tableShareBytes = 0;
-  // What the host leaves the engine as the governor counts it when the
-  // stores are sized (hostBudgetBytes): an automatic part's store starts
-  // with at most what it leaves beside what an engine without requests
-  // holds once warm, reserveBytes aside.
-  uint64_t hostBudgetBytes = 0;
+  // The share of each streamed size's slots the routed experts' store keeps
+  // as its floor where --expert-memory sets none: a parameter of the model's
+  // plan (amend/M.md B17), which the engine reads no model name for.
+  double expertFloorShare = model::kExpertFloorShare;
   // --sparse-kv-memory: the hot block cache's target, at least its floor;
   // none keeps it at its floor.
   std::optional<uint64_t> hotCacheBytes;
@@ -74,20 +68,16 @@ struct StreamedMemoryInputs final {
 
 // The stores the plan streams the parts through, zero for a part that loads
 // whole or a model without it, and a spill-capable target's plan. The
-// routed experts' store takes expertBytes, its cap, and gives back what
-// memory needs down to its floor, expertFloorBytes: --expert-memory's size,
-// or zero for the store's own (model::ExpertStoreOptions::floorBytes). An
-// automatic store starts with expertStartBytes, what the host's budget
-// leaves it, zero for its cap, and takes the rest back once memory allows
-// (model::ExpertStoreOptions::startBytes). hostHeldBackBytes is what the
-// host's budget held back of an automatic table's share, whose row cache
-// does not grow.
+// routed experts' store takes expertBytes, its cap, starts at its floor and
+// gives back what memory needs down to it: expertFloorBytes,
+// --expert-memory's size, or where that is zero expertFloorShare of its
+// slots (model::ExpertStoreOptions::floorBytes, floorShare). The ledger
+// grows it toward its cap (MemoryGovernor::growToTargets).
 struct StreamedMemoryPlan final {
   uint64_t expertBytes = 0;
   uint64_t expertFloorBytes = 0;
-  uint64_t expertStartBytes = 0;
+  double expertFloorShare = model::kExpertFloorShare;
   uint64_t tableBytes = 0;
-  uint64_t hostHeldBackBytes = 0;
   KvSpillPlan spill{};
 };
 
@@ -112,23 +102,16 @@ struct StreamedMemoryResult final {
 // extents hold it, as one request's capacity rounds them (kvCapacityPagesFor):
 // a spill-capable target's first 64K tokens; a dense target's --max-context,
 // or none, so that its experts load wherever main loads them, and the first
-// 64K tokens once they stream. Last, the host's budget: an engine without
-// requests holds what loads, the floors but a Spill request's and the
-// stores, the reserve the budget holds already aside, and the automatic
-// stores, the table's share first, take above their charge only what the
-// budget leaves of what the engine's limit gives them: the table's row cache
-// that much, what the budget holds back of it the plan's all the same
-// (hostHeldBackBytes), and the experts' store starts with it, its cap the
-// limit's (expertStartBytes), so that what loads whole, the floors and the
-// context follow the engine's limit alone. The arenas are those of the
-// parts that stream: where the plan with the arenas of fewer parts streams
-// more, it plans again with those. An explicit size of the PLE table
-// replaces its part; one of the routed experts is charged among the floors,
-// and they load whole or stream as automatic experts do, a store that
-// streams them taking all that the rest leaves them, so at least that size,
-// with that size as its floor, and starting as an automatic store does.
-// A size below the part's smallest store, a hot cache target beyond what
-// the floors leave, and floors beyond the budget are refused.
+// 64K tokens once they stream. Nothing rests on the host: the stores, the
+// floors, what loads whole and the context follow the engine's limit alone.
+// The arenas are those of the parts that stream: where the plan with the
+// arenas of fewer parts streams more, it plans again with those. An
+// explicit size of the PLE table replaces its part; one of the routed
+// experts is charged among the floors, and they load whole or stream as
+// automatic experts do, a store that streams them taking all that the rest
+// leaves them, so at least that size, with that size as its floor. A size
+// below the part's smallest store, a hot cache target beyond what the floors
+// leave, and floors beyond the budget are refused.
 [[nodiscard]] StreamedMemoryResult planStreamedMemory(const StreamedMemoryInputs &inputs);
 
 } // namespace splash::engine

@@ -102,12 +102,10 @@ struct ModelMemoryFootprint final {
   // as long as it runs, so the plan and the governor charge it like the
   // weights it stands in for. Zero without one.
   uint64_t streamedTableBytes = 0;
-  // What the host held back of the streamed stores the engine's limit gives
-  // them: the table's row cache below its share
-  // (StreamedMemoryPlan::hostHeldBackBytes) and the expert store's chunks
-  // that start released (StreamedMemoryPlan::expertStartBytes). No memory,
-  // but fixed in the plan, so that the context and the KV it holds rest on
-  // the engine's limit alone, as on a host with the room.
+  // The expert store's chunks above its floor, which it starts without and
+  // the ledger grows into as the host allows (StreamedMemoryPlan). No memory
+  // at the start, but fixed in the plan, so that the context and the KV it
+  // holds rest on the engine's limit alone.
   uint64_t hostHeldBackBytes = 0;
 };
 

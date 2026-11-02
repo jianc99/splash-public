@@ -192,45 +192,13 @@ void testAutomaticExpertMemory(RuntimeResourcesConfig config) {
   const StreamedStart reloaded = startStreamed(config);
   streams(reloaded,
           "experts that fit beside everything but the arenas did not stream through the store the plan sizes");
-  // The same start on a host whose spare memory holds nothing past the
-  // governor's reserve and margin: the store's cap is the limit's and it
-  // starts below it, the chunks past its start released and held back in
-  // the plan, so that the context and the budget of states and KV are the
-  // roomy host's.
-  const uint64_t spareReserve =
-      EngineMemoryPolicy::hostSpareReserveBytes(metal::probeDeviceCapabilities().physicalMemoryBytes);
-  RuntimeResourcesConfig bounded = config;
-  bounded.hostMemory = [spareReserve] {
-    return std::optional<HostMemory>(HostMemory{64 * kGiB, spareReserve + kHostWarningMarginBytes});
-  };
-  const StreamedStart held = startStreamed(bounded);
-  require(reloaded.experts->chunks == reloaded.experts->capChunks && !reloaded.heldBack && held.experts &&
-              held.experts->capBytes == reloaded.experts->capBytes &&
-              held.experts->chunks < held.experts->capChunks &&
-              held.experts->liveBytes < held.experts->capBytes &&
-              held.heldBack == held.experts->capBytes - held.experts->liveBytes &&
-              held.context == reloaded.context && held.dynamicBudget == reloaded.dynamicBudget &&
-              held.log.find("it starts with " + std::to_string(held.experts->chunks) + " of them") !=
-                  std::string::npos &&
-              held.log.find("keep 85% of it, one at least, but none below a layer's experts") != std::string::npos,
-          "a store the host held back did not start with its smallest store below the limit's cap, held back "
-          "in the plan beside the roomy host's context");
-  // The host's room is the Metal memory the first load holds, every expert
-  // among it, beside what an engine without requests holds once warm, the
-  // process's runtime overhead aside: the store starts above its smallest by
-  // that, to within the memory Metal holds outside the backend's buffers, and
-  // by each byte of spare memory more.
+  // The store starts at its floor, the chunks above it reserved and held in
+  // the plan (testTwoLaunchesGetOneFloor).
+  require(reloaded.experts->chunks < reloaded.experts->capChunks &&
+              reloaded.experts->liveBytes == reloaded.experts->floorBytes &&
+              reloaded.heldBack == reloaded.experts->capBytes - reloaded.experts->liveBytes,
+          "a streamed store did not start at its floor, the chunks above it held in the plan");
   const uint64_t firstLoad = weights.loadedBytes + weights.expertBytes;
-  const uint64_t idle = held.minimumRequired - (held.experts->capBytes - weights.expertMinimumBytes);
-  const uint64_t room = firstLoad + model::kRuntimeOverheadReserveBytes - idle;
-  const uint64_t started = held.experts->liveBytes - weights.expertMinimumBytes;
-  RuntimeResourcesConfig roomier = bounded;
-  roomier.hostMemory = [spareReserve] {
-    return std::optional<HostMemory>(HostMemory{64 * kGiB, spareReserve + kHostWarningMarginBytes + 256 * kMiB});
-  };
-  const uint64_t more = startStreamed(roomier).experts->liveBytes - held.experts->liveBytes;
-  require(started >= room && started - room < 64 * kMiB && more <= 256 * kMiB && more + 8 * kMiB > 256 * kMiB,
-          "the store did not start with the room the host's sample leaves beside the engine without requests");
   require(reloaded.memory.peakAllocatedBytes < firstLoad && reloaded.memory.devicePeakAllocatedBytes < firstLoad,
           "the backend's peaks counted the load the start discarded");
   // Short of that too: at the floor, then through the store.
@@ -277,13 +245,14 @@ void testAutomaticExpertMemory(RuntimeResourcesConfig config) {
           "an explicit size streamed the experts memory holds whole");
   config.maximumMemoryBytes = whole.minimumRequired - 1;
   const StreamedStart floor = startStreamed(config);
-  require(floor.experts && floor.experts->slots > kMoeExperts && floor.loads == 2 &&
-              floor.experts->floorBytes < floor.experts->capBytes && floor.experts->chunks > 1 &&
+  require(floor.experts && floor.experts->slots >= kMoeExperts && floor.loads == 2 &&
+              floor.experts->floorBytes < floor.experts->capBytes && floor.experts->capChunks > 1 &&
+              floor.experts->liveBytes == floor.experts->floorBytes &&
               floor.log.find("gives chunks back down to its floor, the " +
                              std::to_string(weights.expertMinimumBytes >> 20) + " MiB --expert-memory sets") !=
                   std::string::npos,
           "an explicit size did not stream the experts memory cannot hold through the store auto would above "
-          "that floor, loaded at the floor first");
+          "that floor, loaded at the floor first, starting at it");
   config.maximumMemoryBytes = 0;
   config.expertMemory = {StreamedSetting::Mode::Size, weights.expertMinimumBytes - 1};
   try {
@@ -1128,15 +1097,13 @@ void testTableShareHoldsAPromptsIds(const char *metallibPath) {
           "--ple-memory auto's share is not the rows of every id a 128K-token prompt stages");
 }
 
-// A PLE table the host holds back stays in the plan, as the expert store's
-// chunks do: Flash-Next's fixture of a table three times its row cache's
-// working memory, under a limit that streams it above its smallest, starts
-// on a host with no spare room with its smallest row cache, the rest held
-// back, so that the context and the budget of states and KV are the roomy
-// host's, to within the whole rows the row cache commits of what the limit
-// gives it.
-void testTheHeldBackTableStaysInThePlan(const char *metallibPath) {
-  const test::TemporaryDirectory root("splash-held-table");
+// The PLE table's row cache is what the engine's limit gives it, whatever
+// the host spares as the engine starts: Flash-Next's fixture of a table three
+// times its row cache's working memory, under a limit that streams it above
+// its smallest, starts on a host with no spare room with the roomy host's row
+// cache, context and budget of states and KV, nothing held back.
+void testTheTableIgnoresTheHostsSpareMemory(const char *metallibPath) {
+  const test::TemporaryDirectory root("splash-table-host");
   RuntimeResourcesConfig config = flashNextConfig(metallibPath, root.path(), 491'520);
   config.expertMemory = {StreamedSetting::Mode::Off, 0};
   const model::StreamableWeights weights =
@@ -1153,21 +1120,48 @@ void testTheHeldBackTableStaysInThePlan(const char *metallibPath) {
     return std::optional<HostMemory>(HostMemory{64 * kGiB, spareReserve + kHostWarningMarginBytes});
   };
   const StreamedStart held = startStreamed(bounded);
-  const uint64_t heldBack = roomy.table - held.table;
-  require(roomy.table > weights.tableMinimumBytes && !roomy.heldBack && held.table == weights.tableMinimumBytes &&
-              held.heldBack >= heldBack && held.heldBack - heldBack < 4096 && held.context == roomy.context &&
-              roomy.dynamicBudget >= held.dynamicBudget && roomy.dynamicBudget - held.dynamicBudget < 4096,
-          "a table the host held back did not start at its smallest, held back in the plan beside the roomy "
-          "host's context");
+  require(roomy.table > weights.tableMinimumBytes && held.table == roomy.table && !held.heldBack &&
+              held.context == roomy.context && held.dynamicBudget == roomy.dynamicBudget,
+          "a host with no spare room started the table below the row cache the limit gives it");
 }
 
-// A start of `resources` as the server makes one, whose log it keeps in
-// `log`.
+// Two launches of one model on hosts that spare different memory get one
+// floor: the store starts at its floor either way, the share of its slots
+// the model's plan sets, its cap the limit's, the chunks above its floor
+// held in the plan, so the floor, the store's start, the context and the
+// budget of states and KV are the roomy host's on a host whose spare memory
+// holds nothing past the governor's reserve and margin.
+void testTwoLaunchesGetOneFloor(const RuntimeResourcesConfig &config) {
+  const StreamedStart roomy = startStreamed(config);
+  RuntimeResourcesConfig bounded = config;
+  const uint64_t spareReserve =
+      EngineMemoryPolicy::hostSpareReserveBytes(metal::probeDeviceCapabilities().physicalMemoryBytes);
+  bounded.hostMemory = [spareReserve] {
+    return std::optional<HostMemory>(HostMemory{64 * kGiB, spareReserve + kHostWarningMarginBytes});
+  };
+  const StreamedStart held = startStreamed(bounded);
+  require(roomy.experts && held.experts && held.experts->floorBytes == roomy.experts->floorBytes &&
+              held.experts->capBytes == roomy.experts->capBytes && held.experts->chunks == roomy.experts->chunks &&
+              held.experts->liveBytes == held.experts->floorBytes && held.heldBack == roomy.heldBack &&
+              held.context == roomy.context && held.dynamicBudget == roomy.dynamicBudget,
+          "two launches on hosts that spare different memory got floors of " +
+              std::to_string(roomy.experts ? roomy.experts->floorBytes : 0) + " and " +
+              std::to_string(held.experts ? held.experts->floorBytes : 0) + " bytes, or did not start at them");
+  require(held.log.find("it starts at its floor and grows toward its cap as memory allows") != std::string::npos &&
+              held.log.find(std::to_string(static_cast<int>(model::kExpertFloorShare * 100)) + "% of its slots") !=
+                  std::string::npos,
+          "the start did not say the store starts at the floor share of its slots");
+}
+
+// A start of `resources` as the server makes one, asked for `maxContext`
+// tokens (--max-context, zero for the automatic context), whose log it keeps
+// in `log`.
 std::unique_ptr<RuntimeBootstrap> bootstrapOf(const RuntimeResourcesConfig &resources, RuntimeMetrics &metrics,
-                                              std::string &log) {
+                                              std::string &log, uint32_t maxContext = 0) {
   RuntimeBootstrapConfig config;
   config.resources = resources;
   config.nativeLoop.metrics = &metrics;
+  config.nativeLoop.engine.maxContext = maxContext;
   std::unique_ptr<RuntimeBootstrap> bootstrap;
   log = test::capturedStderr([&] {
     bootstrap = RuntimeBootstrap::start(config, [](std::span<const uint8_t>) {}, [] { return std::string(); });
@@ -1205,6 +1199,53 @@ void testLedgerAccountsSumToTheBackend(const RuntimeResourcesConfig &config) {
   require(kv->currentBytes == resources.kvPool().allocatedBytes() && states->currentBytes == actual.stateAllocatedBytes &&
               experts->currentBytes == resources.streamedExpertStats()->liveBytes,
           "an account did not book what its owner holds");
+}
+
+// Before Ready the ledger grows the store from its floor into the room the
+// host's rule for growth leaves: on a roomy host to its cap, one logged
+// decision a chunk, and on a host whose spare memory keeps less than the
+// margin beyond the spare reserve not at all. The first control pass after
+// Ready gives nothing back. The starts ask for 98,304 tokens of context, KV
+// of two extents, of which the engine at Ready holds the runway's one: the
+// store's growth does not rest on the memory Metal holds beside the
+// backend's buffers.
+void testStartupGrowsByTheHostRule(const RuntimeResourcesConfig &config) {
+  constexpr uint32_t kContext = 98'304;
+  RuntimeMetrics metrics;
+  std::string log;
+  model::ExpertStoreStats grown;
+  {
+    const std::unique_ptr<RuntimeBootstrap> roomy = bootstrapOf(config, metrics, log, kContext);
+    grown = *roomy->resources().streamedExpertStats();
+    const MemoryGovernorSnapshot memory = roomy->resources().memoryGovernor().snapshot();
+    const MemoryAccountSnapshot *experts = accountOf(memory, "experts");
+    size_t logged = 0;
+    for (size_t at = log.find("Memory: experts grew"); at != std::string::npos;
+         at = log.find("Memory: experts grew", at + 1))
+      ++logged;
+    require(grown.chunks == grown.capChunks && grown.liveBytes == grown.capBytes &&
+                grown.floorBytes < grown.capBytes && experts && experts->grows == grown.regrows && grown.regrows &&
+                logged == grown.regrows,
+            "a roomy host's start did not grow the store from its floor to its cap by the ledger, one logged "
+            "decision a chunk: " + std::to_string(grown.chunks) + " of " + std::to_string(grown.capChunks) +
+                " chunks, " + std::to_string(grown.liveBytes) + " of " + std::to_string(grown.capBytes) +
+                " bytes, " + std::to_string(experts ? experts->grows : 0) + " grows, " + std::to_string(logged) +
+                " logged, " + std::to_string(memory.headroomBytes) + " bytes of headroom");
+    static_cast<void>(roomy->controlPass(MemoryPressure::Normal));
+    require(roomy->resources().streamedExpertStats()->liveBytes == grown.liveBytes,
+            "the first control pass after Ready gave back what the start grew");
+  }
+  RuntimeResourcesConfig bounded = config;
+  const uint64_t spareReserve =
+      EngineMemoryPolicy::hostSpareReserveBytes(metal::probeDeviceCapabilities().physicalMemoryBytes);
+  bounded.hostMemory = [spareReserve] {
+    return std::optional<HostMemory>(HostMemory{64 * kGiB, spareReserve + kHostMarginBytes / 2});
+  };
+  const std::unique_ptr<RuntimeBootstrap> held = bootstrapOf(bounded, metrics, log, kContext);
+  const model::ExpertStoreStats floor = *held->resources().streamedExpertStats();
+  require(floor.liveBytes == floor.floorBytes && floor.floorBytes == grown.floorBytes && !floor.regrows &&
+              log.find("Memory: experts grew") == std::string::npos,
+          "a start on a host inside the margin grew the store past its floor");
 }
 
 // The runtime of a start, built under the governor's admission of its
@@ -1321,8 +1362,8 @@ void testDenseRuntimeBoundary(const char *metallibPath) {
 
 // A streamed MoE start's runtime: a prefill group's rows in a pass per
 // layer and no streamed history. Its pool is the expert store's, whose bytes
-// are Metal's: a unit given back and taken again moves the backend's
-// allocations by its bytes, rounded to whole pages. What a pass would read
+// are Metal's: a unit taken above its floor and given back again moves the
+// backend's allocations by its bytes, rounded to whole pages. What a pass would read
 // is its own blocks' share of the command's, and a warm-up's sample counts
 // the weights it read on demand as the store counted them.
 void testStreamedRuntimeBoundary(RuntimeResourcesConfig moe) {
@@ -1358,22 +1399,24 @@ void testStreamedRuntimeBoundary(RuntimeResourcesConfig moe) {
                 warmup.sample.work.layers == kMoeLayers && warmup.sample.work.rows == kChunk,
             "a warm-up's sample did not count the experts it read as the store did");
   }
+  // The store starts at its floor: a unit it takes, then gives back.
   model::ElasticPool &experts = *runtime->pools()[0];
   metal::MetalBackend &backend = resources->backend();
-  const model::PoolState state = experts.state();
   const auto allocated = [&] { return backend.refreshMemoryStats().allocatedBytes; };
   uint64_t before = allocated();
+  const model::PoolState floor = experts.state();
+  require(floor.currentBytes == floor.floorBytes && floor.growUnitBytes &&
+              static_cast<bool>(experts.grow(resources->memoryGovernor().allocationAdmission())) &&
+              allocated() - before >= floor.growUnitBytes && allocated() - before - floor.growUnitBytes < 16384 &&
+              experts.state().currentBytes == floor.currentBytes + floor.growUnitBytes,
+          "a unit the store took did not take the backend's allocations");
+  before = allocated();
+  const model::PoolState state = experts.state();
   const uint64_t released = experts.release(1);
   const uint64_t freed = before - allocated();
   require(released && released == state.releaseUnitBytes && freed >= released && freed - released < 16384 &&
               experts.state().currentBytes == state.currentBytes - released,
           "a unit the store gave back did not leave the backend's allocations");
-  before = allocated();
-  const model::PoolState shrunk = experts.state();
-  require(static_cast<bool>(experts.grow(resources->memoryGovernor().allocationAdmission())) &&
-              allocated() - before >= shrunk.growUnitBytes && allocated() - before - shrunk.growUnitBytes < 16384 &&
-              experts.state().currentBytes == shrunk.currentBytes + shrunk.growUnitBytes,
-          "a unit the store took back did not take the backend's allocations");
 }
 
 // A Flash-Next start whose K/V spills: its commands hold a prefill group's
@@ -1490,7 +1533,7 @@ int main(int argc, char **argv) {
       testAutomaticContextIgnoresTheVolume(argv[1]);
       testRelaunchKeepsTheSpilledContext(argv[1]);
       testTableShareHoldsAPromptsIds(argv[1]);
-      testTheHeldBackTableStaysInThePlan(argv[1]);
+      testTheTableIgnoresTheHostsSpareMemory(argv[1]);
       testEngineFollowsTheGovernor(argv[1]);
       testDenseRuntimeBoundary(argv[1]);
       testSpilledRuntimeBoundary(argv[1]);
@@ -1504,6 +1547,8 @@ int main(int argc, char **argv) {
         RuntimeResourcesConfig streamed = moe;
         streamed.maximumMemoryBytes = startStreamed(moe).minimumRequired - 1;
         testLedgerAccountsSumToTheBackend(streamed);
+        testTwoLaunchesGetOneFloor(streamed);
+        testStartupGrowsByTheHostRule(streamed);
       }
       std::cout << "runtime resources tests passed\n";
       return EXIT_SUCCESS;

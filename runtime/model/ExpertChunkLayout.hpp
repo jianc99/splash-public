@@ -5,21 +5,18 @@
 // without a GPU.
 //
 // A streamed size's floor chunk, chunk 0, holds its floor: the slots it
-// keeps however short memory is (kExpertFloorShare of its slots, unless the
-// store is given a floor, floorBytes), or as much of them as the largest
-// buffer holds, and the elastic chunks after it the rest. The slots above
-// the floor lie in elastic chunks of about kExpertElasticChunkBytes each
+// keeps however short memory is (a share of its slots, kExpertFloorShare
+// unless the model's plan sets another, or the floor the store is given,
+// floorBytes), or as much of them as the largest buffer holds, and the
+// elastic chunks after it the rest. The slots above the floor lie in elastic
+// chunks of about kExpertElasticChunkBytes each
 // (ExpertStoreOptions::elasticChunkBytes), the last of the rest, which the
 // store gives back from the last on while memory is short and takes again
-// once it is not; an idle release releases all of them. A store of the
-// default floor that starts below its cap (ExpertStoreOptions::startBytes)
-// starts on a chunk boundary, its elastic chunks the cap's: its floor lies
-// whole chunks below its start, as many as keep kExpertFloorShare of it, one
-// at least, but none below a block's experts. A floor given stays as it is, and
-// the store starts with the whole chunks its start holds. A size of one block
-// keeps every expert, in its floor chunk alone. Chunks are few because each
-// chunk an encoder makes resident costs GPU time: about 0.065% of a streamed
-// decode cycle per chunk on an M5 Max.
+// once it is not; it starts with its floor alone, and an idle release
+// releases all of them. A size of one block keeps every expert, in its
+// floor chunk alone. Chunks are few because each chunk an encoder makes
+// resident costs GPU time: about 0.065% of a streamed decode cycle per chunk
+// on an M5 Max.
 
 #include "metal/abi/MoE.h"
 #include "model/WeightLayout.hpp"
@@ -33,9 +30,8 @@
 
 namespace splash::model {
 
-// The share of its slots a streamed size's floor holds by default, and of
-// the slots it starts with below its cap at least, unless a chunk is more
-// than the rest of the start.
+// The share of its slots a streamed size's floor holds where the model's
+// plan sets no other (ExpertStoreOptions::floorShare).
 inline constexpr double kExpertFloorShare = 0.85;
 // About the most bytes an elastic chunk takes by default, unless the size
 // needs larger ones to fit the expert kernels' table (MOE_EXPERT_MAX_CHUNKS).
@@ -103,63 +99,38 @@ struct ExpertSlotGroup final {
 } // namespace detail
 
 // The chunks of a streamed size of `slots` slots, each of `planes`' bytes, in
-// buffers of at most `largest` bytes, of a store that starts with `start` of
-// them (`slots` at its cap). The floor is `floor` slots, or kExpertFloorShare
-// of them where `floor` is zero, rounded down to a multiple of the fewest that
-// fill whole regions unless it is every slot, but at least `minimum` (a
-// block's experts) rounded up to one and at least one such group, and at most
-// the slots. The floor chunk holds the floor, or what a buffer of `largest`
-// bytes holds when that is less, and the fewest elastic chunks after it that
-// hold the rest of the floor hold it too (floorChunks). An elastic chunk holds
-// a multiple of those slots of about `elasticBytes` (kExpertElasticChunkBytes),
-// or more where the slots above the floor would take more than
-// MOE_EXPERT_MAX_CHUNKS - 1 of them, at most what a buffer of `largest` bytes
-// holds, and at most the slots above the floor chunk. A start of the default
-// floor below the slots, rounded down to whole regions, ends an elastic chunk
-// instead, each of the cap's elastic chunk's slots rounded down to whole
-// regions, or more where the slots above kExpertFloorShare of the start would
-// take more than MOE_EXPERT_MAX_CHUNKS - 2 of them: the floor lies the most
-// of them below the start that keep kExpertFloorShare of it, one at least,
-// but none below `minimum`, which a start below it keeps, and the floor chunk
-// the fewest below the floor that keep it within a buffer. A floor given is
-// the cap's, whatever the start. Throws std::invalid_argument when chunks of
-// at most `largest` bytes would take more than MOE_EXPERT_MAX_CHUNKS of them.
+// buffers of at most `largest` bytes. The floor is `floor` slots, or
+// `floorShare` of them where `floor` is zero, rounded down to a multiple of
+// the fewest that fill whole regions unless it is every slot, but at least
+// `minimum` (a block's experts) rounded up to one and at least one such
+// group, and at most the slots. The floor chunk holds the floor, or what a
+// buffer of `largest` bytes holds when that is less, and the fewest elastic
+// chunks after it that hold the rest of the floor hold it too (floorChunks).
+// An elastic chunk holds a multiple of those slots of about `elasticBytes`
+// (kExpertElasticChunkBytes), or more where the slots above the floor would
+// take more than MOE_EXPERT_MAX_CHUNKS - 1 of them, at most what a buffer of
+// `largest` bytes holds, and at most the slots above the floor chunk. Throws
+// std::invalid_argument when chunks of at most `largest` bytes would take
+// more than MOE_EXPERT_MAX_CHUNKS of them.
 [[nodiscard]] inline ExpertChunkLayout streamedExpertChunkLayout(const ExpertSlotPlanes &planes, uint32_t slots,
                                                                  uint32_t floor, uint32_t minimum,
                                                                  uint64_t largest, uint64_t elasticBytes,
-                                                                 uint32_t start) {
+                                                                 double floorShare) {
   if (!slots || minimum > slots) throw std::invalid_argument("invalid streamed expert size");
   const detail::ExpertSlotGroup group = detail::expertSlotGroup(planes);
   const auto alignUp = [&](uint64_t value) { return (value + group.slots - 1) / group.slots * group.slots; };
   const auto alignDown = [&](uint64_t value) { return value / group.slots * group.slots; };
   const uint64_t largestSlots = largest / group.bytes * group.slots;
   const uint64_t least = std::min<uint64_t>(std::max(alignUp(minimum), group.slots), slots);
-  // The floor `asked` slots take.
-  const auto keptOf = [&](uint64_t asked) {
-    return std::min<uint64_t>(std::max(asked >= slots ? slots : alignDown(asked), least), slots);
-  };
-  uint64_t kept = keptOf(floor ? floor : static_cast<uint64_t>(kExpertFloorShare * slots));
-  uint64_t floorSlots = std::min(kept, largestSlots);
+  const uint64_t asked = floor ? floor : static_cast<uint64_t>(floorShare * slots);
+  const uint64_t kept = std::min<uint64_t>(std::max(asked >= slots ? slots : alignDown(asked), least), slots);
+  const uint64_t floorSlots = std::min(kept, largestSlots);
   if (!floorSlots) throw detail::tooManyExpertChunks(slots);
   if (floorSlots == slots) return {slots, slots, slots, 1, 1};
   const uint64_t fewest = alignUp((slots - floorSlots + MOE_EXPERT_MAX_CHUNKS - 2) / (MOE_EXPERT_MAX_CHUNKS - 1));
   const uint64_t chunkSlots = std::min(std::max(fewest, elasticBytes / group.bytes * group.slots), largestSlots);
   if (chunkSlots < fewest) throw detail::tooManyExpertChunks(slots);
-  // An elastic chunk's slots, but the last's.
-  uint64_t step = chunkSlots;
-  if (!floor && start < slots) {
-    const uint64_t target = keptOf(static_cast<uint64_t>(kExpertFloorShare * start));
-    // The floor may lie a chunk below the target.
-    const uint64_t most = MOE_EXPERT_MAX_CHUNKS - 2;
-    step = std::max(alignDown(std::min(chunkSlots, slots - floorSlots)),
-                    alignUp((slots - std::min(target, largestSlots) + most - 1) / most));
-    if (step > largestSlots) throw detail::tooManyExpertChunks(slots);
-    const uint64_t started = std::max(alignDown(start), least);
-    const uint64_t below = std::min(std::max<uint64_t>(1, (started - target) / step), (started - least) / step);
-    kept = started - below * step;
-    floorSlots = kept > largestSlots ? kept - (kept - largestSlots + step - 1) / step * step : kept;
-  }
-  const uint64_t rest = slots - floorSlots, elastic = std::min(step, rest);
+  const uint64_t rest = slots - floorSlots, elastic = std::min(chunkSlots, rest);
   return {slots, static_cast<uint32_t>(floorSlots), static_cast<uint32_t>(elastic),
           static_cast<uint32_t>(1 + (rest + elastic - 1) / elastic),
           static_cast<uint32_t>(1 + (kept - floorSlots + elastic - 1) / elastic)};

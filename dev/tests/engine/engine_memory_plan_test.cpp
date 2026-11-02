@@ -460,7 +460,6 @@ struct Target final {
     return {.hardBudgetBytes = hardBudget(mac),
             .fixedBytes = loadedBytes + draftBytes + visionBytes + model::kPipelineReserveBytes +
                           model::kRuntimeOverheadReserveBytes + stagingBytes,
-            .reserveBytes = model::kRuntimeOverheadReserveBytes,
             .arenaBytes = {{{arenaBytes(chunk), arenaBytes(chunk)}, {arenaBytes(group), arenaBytes(group)}}},
             .laneStateBytes = chunk.laneStatePlannedAllocatedBytes,
             .kvLayout = layout,
@@ -468,7 +467,6 @@ struct Target final {
             .experts = experts,
             .table = table,
             .tableShareBytes = tableShareBytes,
-            .hostBudgetBytes = std::numeric_limits<uint64_t>::max(),
             .sparseKv = sparseKv,
             .tierWritable = true,
             .kvSlotBytes = (layout.bytesPerModelPage() + 16'383) / 16'384 * 16'384,
@@ -560,7 +558,7 @@ void testFlashNextOnTheThreeMacs() {
     const StreamedMemoryInputs inputs = kFlashNext.inputs(mac);
     const StreamedMemoryPlan plan = requirePlan(inputs);
     const KvSpillPlan &spill = plan.spill;
-    require(spill.enabled && plan.tableBytes == kFlashNextTableShare && !plan.hostHeldBackBytes,
+    require(spill.enabled && plan.tableBytes == kFlashNextTableShare,
             std::string("Flash-Next's table on the ") + mac.name + " does not stream through its share");
     // The floors, the arenas, the stores and the KV of the first 64K tokens
     // and their speculative rows (2,049 pages), in the fewest pages whose
@@ -954,151 +952,49 @@ void testServedPlanStagesAsTheSizedPlan() {
   }
 }
 
-// The host's budget (hostBudgetBytes) bounds the automatic stores, never
-// the expert store's cap, the floors, what loads whole or the context: it
-// bounds what the stores start with. Flash-Next on the M6: a budget that
-// holds what the engine's limit gives the stores changes nothing; a smaller
-// one has the experts' store start below its cap first, byte for byte,
-// while the table keeps its share, and then the table below its share, down
-// to their smallest stores. The pipeline reserve, built at warmup after the
-// budget's sample, counts against it, and the process's runtime overhead,
-// which the sample's spare memory holds, against the limit alone. What the
-// table holds back the engine's plan holds as fixed, and the chunks the
-// expert store starts without count at its cap, so that the context, one
-// request's KV capacity and the KV admission keeps resident are the
-// engine's limit's.
-// Explicit sizes stay as set, and the 35B's experts, which load whole on the
-// M5 Pro, still do; Flash-Next's, which do too, take their room from the
-// host before the table's share, and a plan that spills charges the host
-// the arenas of a runtime whose K/V spills.
-void testHostBudgetBoundsOnlyTheStores() {
+// The floor of the routed experts' store: the size --expert-memory sets, and
+// otherwise the model's floor share of its slots, a parameter of the model's
+// plan that the plan hands the store whatever it is and that moves nothing
+// else in it. The engine's plan holds the store at its cap, the chunks above
+// its floor it starts without among the fixed bytes, so that the context,
+// one request's KV capacity and the KV admission keeps resident are the
+// limit's. Flash-Next on the M6.
+void testPlanSetsTheStoresFloor() {
   const StreamedMemoryInputs inputs = kFlashNext.inputs(kM6);
   const StreamedMemoryPlan limit = requirePlan(inputs);
-  const auto planned = [&](uint64_t hostBudgetBytes, uint64_t reserveBytes = model::kRuntimeOverheadReserveBytes) {
-    StreamedMemoryInputs bounded = inputs;
-    bounded.hostBudgetBytes = hostBudgetBytes;
-    bounded.reserveBytes = reserveBytes;
-    return requirePlan(bounded);
-  };
-  const auto sameFloors = [&](const StreamedMemoryPlan &plan) {
-    return plan.expertBytes == limit.expertBytes && plan.expertFloorBytes == limit.expertFloorBytes &&
-           plan.spill.floorBytes == limit.spill.floorBytes && plan.spill.floorTokens == limit.spill.floorTokens &&
-           plan.spill.memoryTokens == limit.spill.memoryTokens && plan.spill.diskTokens == limit.spill.diskTokens &&
-           plan.spill.hotTargetBytes == limit.spill.hotTargetBytes;
-  };
-  const StreamedMemoryPlan roomy = planned(hardBudget(kM6));
-  require(!roomy.expertStartBytes && roomy.tableBytes == limit.tableBytes && !roomy.hostHeldBackBytes &&
-              sameFloors(roomy),
-          "a host budget that holds the stores changed them");
-  const StreamedMemoryPlan short1 = planned(hardBudget(kM6) - 6 * kGiB),
-                           short2 = planned(hardBudget(kM6) - 7 * kGiB);
-  require(short1.expertStartBytes && short1.expertStartBytes < limit.expertBytes &&
-              short1.expertStartBytes - short2.expertStartBytes == kGiB && short1.tableBytes == limit.tableBytes &&
-              short2.tableBytes == limit.tableBytes && !short1.hostHeldBackBytes && !short2.hostHeldBackBytes &&
-              sameFloors(short1) && sameFloors(short2),
-          "a short host did not start the experts' store lower byte for byte, its cap and the table's share kept");
-  const StreamedMemoryPlan reserved = planned(hardBudget(kM6) - 6 * kGiB, 0);
-  require(short1.expertStartBytes - reserved.expertStartBytes == model::kRuntimeOverheadReserveBytes,
-          "the host's budget was charged the runtime overhead its sample holds");
-  const StreamedMemoryPlan none = planned(0);
-  require(none.expertStartBytes == kFlashNext.experts.minimumBytes &&
-              none.tableBytes == kFlashNext.table.minimumBytes &&
-              none.hostHeldBackBytes == limit.tableBytes - none.tableBytes && sameFloors(none),
-          "a host without room did not start the stores at their smallest");
-  // The plans that serve charge the stores as the engine's plan holds them,
-  // the experts' at its cap and the table's at its share, the rows the host
-  // held back among them (RuntimeResources), and so spill as the roomy
-  // host's do, also where memory bounds the context.
-  StreamedMemoryInputs tight = inputs;
-  tight.hardBudgetBytes = 14 * kGiB;
-  for (StreamedMemoryInputs sizing : {inputs, tight}) {
-    const auto served = [&](const StreamedMemoryPlan &sized) {
-      StreamedMemoryInputs serving = sizing;
-      serving.experts.setting = {StreamedSetting::Mode::Loaded, sized.expertBytes};
-      serving.table.setting = {StreamedSetting::Mode::Loaded, sized.tableBytes + sized.hostHeldBackBytes};
-      return requirePlan(serving).spill;
-    };
-    const KvSpillPlan roomy = served(requirePlan(sizing));
-    sizing.hostBudgetBytes = 0;
-    const StreamedMemoryPlan bound = requirePlan(sizing);
-    const KvSpillPlan spill = served(bound);
-    require(bound.hostHeldBackBytes && spill.memoryTokens == roomy.memoryTokens &&
-                spill.floorTokens == roomy.floorTokens && spill.floorBytes == roomy.floorBytes &&
-                spill.stagingBuffers == roomy.stagingBuffers,
-            "the plan that serves stores the host held back spilled otherwise than the roomy host's");
-  }
-  // The engine's plan holds what the host held back: the context, one
-  // request's KV capacity and admission's resident KV are the limit's.
+  require(limit.expertBytes && !limit.expertFloorBytes && limit.expertFloorShare == model::kExpertFloorShare,
+          "an automatic store's floor is not the model's default share of its slots");
+  StreamedMemoryInputs pinned = inputs;
+  pinned.expertFloorShare = 1.0;
+  const StreamedMemoryPlan cap = requirePlan(pinned);
+  require(cap.expertFloorShare == 1.0 && !cap.expertFloorBytes && cap.expertBytes == limit.expertBytes &&
+              cap.tableBytes == limit.tableBytes && cap.spill.floorBytes == limit.spill.floorBytes &&
+              cap.spill.memoryTokens == limit.spill.memoryTokens,
+          "the model's floor share did not reach the store, or moved the rest of the plan");
+  StreamedMemoryInputs sized = inputs;
+  sized.experts.setting = {StreamedSetting::Mode::Size, 4 * kGiB};
+  const StreamedMemoryPlan explicitFloor = requirePlan(sized);
+  require(explicitFloor.expertBytes > 4 * kGiB && explicitFloor.expertFloorBytes == 4 * kGiB,
+          "--expert-memory did not set the store's floor");
+
   const EngineMemoryPlan mains = test::requireMemoryPlan(
       deviceOf(kM6), kFlashNext.profile(limit.expertBytes, limit.tableBytes, limit.spill));
-  for (const StreamedMemoryPlan *plan : {&short1, &none}) {
-    // The store's allocations hold the chunks it starts with, and the rest
-    // of its cap is held back with the table's.
-    const uint64_t heldBack = plan->hostHeldBackBytes + plan->expertBytes - plan->expertStartBytes;
-    ModelMemoryProfile profile = kFlashNext.profile(plan->expertStartBytes, plan->tableBytes, plan->spill);
-    profile.footprint.hostHeldBackBytes = heldBack;
-    const EngineMemoryPlan held = test::requireMemoryPlan(deviceOf(kM6), profile);
-    const EngineMemoryBreakdown &budget = held.breakdown();
-    require(held.maximumContextTokens() == mains.maximumContextTokens() &&
-                budget.dynamicBudgetBytes == mains.breakdown().dynamicBudgetBytes &&
-                budget.kvCapacityTokens == mains.breakdown().kvCapacityTokens &&
-                held.spillGeometry().residentKvBytes == mains.spillGeometry().residentKvBytes &&
-                budget.hostHeldBackBytes == heldBack &&
-                held.toStatusJson().find("\"host_held_back_bytes\":" + std::to_string(heldBack) +
-                                         ",\"fixed_runtime_bytes\"") != std::string::npos &&
-                budget.describe().find("streamed stores held back for the host: " + std::to_string(heldBack)) !=
-                    std::string::npos,
-            "the room the host held back moved the context or the KV the plan holds");
-  }
-
-  StreamedMemoryInputs sized = inputs;
-  sized.hostBudgetBytes = 0;
-  sized.experts.setting = {StreamedSetting::Mode::Size, 4 * kGiB};
-  sized.table.setting = {StreamedSetting::Mode::Size, 2 * kGiB};
-  const StreamedMemoryPlan explicitSizes = requirePlan(sized);
-  require(explicitSizes.expertBytes > 4 * kGiB && explicitSizes.expertFloorBytes == 4 * kGiB &&
-              explicitSizes.expertStartBytes == 4 * kGiB && explicitSizes.tableBytes == 2 * kGiB,
-          "a host without room took an explicit size below what it set");
-  StreamedMemoryInputs dense = k35BQ4.inputs(kM5Pro);
-  dense.hostBudgetBytes = 0;
-  const StreamedMemoryPlan whole = requirePlan(dense);
-  require(!whole.expertBytes && !whole.expertStartBytes && !whole.hostHeldBackBytes,
-          "a host without room streamed experts the limit holds whole");
-  // Flash-Next's experts load whole on the M5 Pro, and take their room from
-  // the host first: a host that holds them and the table's share keeps both,
-  // and one that holds them alone starts the table at its smallest.
-  const StreamedMemoryInputs pro = kFlashNext.inputs(kM5Pro);
-  const StreamedMemoryPlan unbounded = requirePlan(pro);
-  for (const uint64_t host : {40 * kGiB, 36 * kGiB}) {
-    StreamedMemoryInputs bounded = pro;
-    bounded.hostBudgetBytes = host;
-    const StreamedMemoryPlan plan = requirePlan(bounded);
-    const bool roomy = host == 40 * kGiB;
-    require(!plan.expertBytes && !plan.expertStartBytes &&
-                plan.tableBytes == (roomy ? kFlashNextTableShare : kFlashNext.table.minimumBytes) &&
-                plan.hostHeldBackBytes == (roomy ? 0 : kFlashNextTableShare - kFlashNext.table.minimumBytes) &&
-                plan.spill.floorBytes == unbounded.spill.floorBytes &&
-                plan.spill.floorTokens == unbounded.spill.floorTokens &&
-                plan.spill.memoryTokens == unbounded.spill.memoryTokens &&
-                plan.spill.stagingBuffers == unbounded.spill.stagingBuffers,
-            "the M5 Pro's whole experts did not take their room from the host before the table's share");
-  }
-  // An engine without requests that spills holds the arenas of a runtime
-  // whose K/V spills: where the host's budget starts the table between its
-  // smallest and its share, as 37.5 GiB does, a plan with those arenas starts
-  // it as the plan without them does at a budget smaller by what they add.
-  StreamedMemoryInputs resident = pro;
-  resident.hostBudgetBytes = 37 * kGiB + 512 * kMiB;
-  const StreamedMemoryPlan part = requirePlan(resident);
-  StreamedMemoryInputs spilling = resident;
-  const uint64_t group = arenaBytes(kFlashNext.group);
-  spilling.spillArenaBytes = {group, group};
-  spilling.hostBudgetBytes += group - arenaBytes(kFlashNext.chunk);
-  const StreamedMemoryPlan spilled = requirePlan(spilling);
-  require(part.spill.enabled && spilled.spill.enabled && part.tableBytes > kFlashNext.table.minimumBytes &&
-              part.tableBytes < kFlashNextTableShare && spilled.tableBytes == part.tableBytes &&
-              spilled.hostHeldBackBytes == part.hostHeldBackBytes,
-          "the host's budget did not hold the arenas of a runtime whose K/V spills");
+  const uint64_t floor = static_cast<uint64_t>(model::kExpertFloorShare * double(limit.expertBytes));
+  const uint64_t heldBack = limit.expertBytes - floor;
+  ModelMemoryProfile profile = kFlashNext.profile(floor, limit.tableBytes, limit.spill);
+  profile.footprint.hostHeldBackBytes = heldBack;
+  const EngineMemoryPlan held = test::requireMemoryPlan(deviceOf(kM6), profile);
+  const EngineMemoryBreakdown &budget = held.breakdown();
+  require(held.maximumContextTokens() == mains.maximumContextTokens() &&
+              budget.dynamicBudgetBytes == mains.breakdown().dynamicBudgetBytes &&
+              budget.kvCapacityTokens == mains.breakdown().kvCapacityTokens &&
+              held.spillGeometry().residentKvBytes == mains.spillGeometry().residentKvBytes &&
+              budget.hostHeldBackBytes == heldBack &&
+              held.toStatusJson().find("\"host_held_back_bytes\":" + std::to_string(heldBack) +
+                                       ",\"fixed_runtime_bytes\"") != std::string::npos &&
+              budget.describe().find("expert store above its floor at the start: " + std::to_string(heldBack)) !=
+                  std::string::npos,
+          "the store's chunks above its floor moved the context or the KV the plan holds");
 }
 
 // The plan serves what spilling serves, the window where memory and the SSD
@@ -1236,7 +1132,7 @@ int main() {
     testDiskBoundsTheSpilledContext();
     testSecondStagingBufferOnlyWhereFree();
     testServedPlanStagesAsTheSizedPlan();
-    testHostBudgetBoundsOnlyTheStores();
+    testPlanSetsTheStoresFloor();
     testEnginePlanServesTheSpilledContext();
     testContextBoundNames();
     testDeviceValidationNamesTheMacosFloor();

@@ -17,6 +17,7 @@
 
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <iomanip>
 #include <limits>
 #include <optional>
@@ -373,14 +374,11 @@ std::string_view streamedOnlyIn(const StreamedMemoryPlan &plan, const StreamedMe
 }
 
 // What streams of the loaded model, and how an automatic part's store was
-// sized; for the routed experts' store, its cap, the chunks it starts with
-// and the floor it gives memory back down to and where that came from; and
-// what the host's spare memory, of which the governor keeps
-// `spareReserveBytes` and the warning margin, held back of the stores
-// (`heldBackBytes`).
+// sized; for the routed experts' store, its cap and the floor it starts at
+// and gives memory back down to, and where that came from: --expert-memory,
+// or the model plan's `floorShare` of its slots.
 void reportStreamedStores(const model::LoadedModel &loaded, const model::StreamableWeights &streamable,
-                          const StreamedSetting &experts, const StreamedSetting &table, uint64_t heldBackBytes,
-                          uint64_t spareReserveBytes) {
+                          const StreamedSetting &experts, const StreamedSetting &table, double floorShare) {
   const auto automatic = [](const StreamedSetting &setting, std::string_view option, std::string_view beside) {
     return setting.mode == StreamedSetting::Mode::Auto
                ? std::string(", all that ") + std::string(option) + " auto leaves it beside " + std::string(beside)
@@ -393,7 +391,7 @@ void reportStreamedStores(const model::LoadedModel &loaded, const model::Streama
             store->committedBytes() / kMiB, " MiB",
             table.mode == StreamedSetting::Mode::Auto && store->committedBytes() == streamable.tableShareBytes
                 ? ", the most --ple-memory auto takes: the rows of every id a 128K-token prompt stages"
-                : automatic(table, "--ple-memory", "the floors, the KV kept resident and the host's spare memory"),
+                : automatic(table, "--ple-memory", "the floors and the KV kept resident"),
             "; ", model::kSsdReaders, " readers.");
   } else if (streamable.tableBytes && table.mode == StreamedSetting::Mode::Auto) {
     logLine("The PLE table loads with the weights: memory holds its ", streamable.tableBytes / kMiB,
@@ -410,26 +408,18 @@ void reportStreamedStores(const model::LoadedModel &loaded, const model::Streama
                          ? " (" + std::to_string(stats.floorBytes / kMiB) + " MiB in whole slots and chunks)"
                          : std::string())
               : std::to_string(stats.floorBytes / kMiB) + " MiB, " +
-                    (stats.chunks < stats.capChunks ? "the whole chunks below its start that keep " : "") +
-                    std::to_string(static_cast<int>(model::kExpertFloorShare * 100)) +
-                    (stats.chunks < stats.capChunks ? "% of it, one at least, but none below a layer's experts"
-                                                    : "% of its slots");
-    const std::string starts =
-        stats.chunks < stats.capChunks
-            ? "; it starts with " + std::to_string(stats.chunks) +
-                  " of them, the whole chunks the host's spare memory holds, and takes the rest back once memory "
-                  "allows"
-            : std::string();
+                    std::to_string(static_cast<int>(std::lround(floorShare * 100))) + "% of its slots";
     const std::string shrinks =
         stats.floorBytes < stats.capBytes
-            ? "; while memory is short it gives chunks back down to its floor, " + floor
+            ? "; it starts at its floor and grows toward its cap as memory allows; while memory is short it gives "
+                  "chunks back down to its floor, " + floor
             : "; it gives none back, its floor, " + floor + ", being all of it";
     logLine("Routed experts stream from their files: ", stats.slots, " slots for ", stats.experts, " experts (",
             stats.slots * 100 / std::max<uint64_t>(stats.experts, 1), "%) in ", stats.arenaBytes / kMiB,
             " MiB, a store of ", stats.capBytes / kMiB, " MiB in ", stats.capChunks, " chunks",
             sized ? ", all that the floors, its own among them, leave it beside the KV kept resident"
                   : automatic(experts, "--expert-memory", "the floors and the KV kept resident"),
-            starts, shrinks, ".");
+            shrinks, ".");
   } else if (streamable.expertBytes && experts.mode == StreamedSetting::Mode::Auto) {
     logLine("Routed experts load with their layers: memory holds their ", streamable.expertBytes / kMiB,
             " MiB (--expert-memory auto).");
@@ -438,11 +428,6 @@ void reportStreamedStores(const model::LoadedModel &loaded, const model::Streama
     logLine("--expert-memory ignored: memory holds every routed expert (", streamable.expertBytes / kMiB,
             " MiB) beside the KV kept resident, which load with their layers.");
   }
-  if (heldBackBytes)
-    logLine("The host's spare memory holds the streamed stores ", heldBackBytes / kMiB,
-            " MiB below what the engine's limit leaves them as the engine starts: the memory governor keeps ",
-            spareReserveBytes / kMiB, " MiB of it and a ", kHostWarningMarginBytes / kMiB,
-            " MiB margin free. The context and the KV kept resident are planned without that room.");
 }
 
 // The rows the target's decode cycles verify (--verify-rows), and why.
@@ -781,14 +766,9 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
         config.diskVolume(root ? config.cacheRoot : std::filesystem::temp_directory_path(ignored)), heldBytes);
   }
   bool kvFileOpen = true;
-  // What the host leaves the engine as the governor counts it
-  // (hostBudgetBytes), which the stores that serve start within: taken once
-  // the first load holds its weights, so that the host's sample counts the
-  // engine's memory outside Metal too. No bound before. What it held back of
-  // the stores the engine's limit gives them, the table's row cache below
-  // its share and the expert store's chunks that start released, which the
-  // engine's plan holds all the same (ModelMemoryFootprint::hostHeldBackBytes).
-  uint64_t hostBudget = std::numeric_limits<uint64_t>::max();
+  // The expert store's chunks above its floor, which it starts without and
+  // the ledger grows into: the engine's plan holds them all the same
+  // (ModelMemoryFootprint::hostHeldBackBytes).
   uint64_t hostHeldBackBytes = 0;
   // The pages of a prefill group's rows (model::kPrefillGroupChunks chunks).
   constexpr uint32_t groupPages =
@@ -802,7 +782,6 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
         {.hardBudgetBytes = hardBudgetBytes,
          .fixedBytes = streamable.loadedBytes + model::kPipelineReserveBytes + model::kRuntimeOverheadReserveBytes +
                        stagingBytes + aneFfnBytes,
-         .reserveBytes = model::kRuntimeOverheadReserveBytes,
          .arenaBytes = arenaBytes,
          .spillArenaBytes = spillArenaBytes,
          .laneStateBytes = stateLayout.laneBytes(),
@@ -813,7 +792,6 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
          .experts = {streamable.expertBytes, streamable.expertMinimumBytes, experts},
          .table = {streamable.tableBytes, streamable.tableMinimumBytes, table},
          .tableShareBytes = streamable.tableShareBytes,
-         .hostBudgetBytes = hostBudget,
          .hotCacheBytes = config.sparseKvMemory,
          .sparseKv = config.model.capabilities.sparseKv,
          .tierWritable = stagingBytes && kvFileOpen,
@@ -852,18 +830,17 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     diskOff(reason);
     return without;
   };
-  // The stores the plan gives the parts, the expert store starting with what
-  // the host leaves it, except that routed experts the plan streams load
-  // through a store of the least the floors charge them while `floors`,
-  // their smallest store or the floor --expert-memory sets: until the loaded
-  // model gives the arenas, which take from all that the experts stream
-  // through.
+  // The stores the plan gives the parts, the expert store at its floor,
+  // except that routed experts the plan streams load through a store of the
+  // least the floors charge them while `floors`, their smallest store or the
+  // floor --expert-memory sets: until the loaded model gives the arenas,
+  // which take from all that the experts stream through.
   const auto storesOf = [&](const StreamedMemoryPlan &plan, bool floors) {
     const uint64_t least = plan.expertFloorBytes ? plan.expertFloorBytes : streamable.expertMinimumBytes;
     return model::ModelLoadOptions{.streamedTableBytes = plan.tableBytes,
                                    .expertMemoryBytes = floors && plan.expertBytes ? least : plan.expertBytes,
                                    .expertFloorBytes = plan.expertFloorBytes,
-                                   .expertStartBytes = floors ? 0 : plan.expertStartBytes,
+                                   .expertFloorShare = plan.expertFloorShare,
                                    .readers = readers};
   };
   model::ModelLoadOptions loadOptions;
@@ -965,9 +942,6 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   };
   load(false);
 
-  // The table's rows the host held back (hostHeldBackBytes), which the plans
-  // that serve charge with its row cache, at the share the limit gives it.
-  uint64_t tableHeldBackBytes = 0;
   // The engine's memory plan, with `stagingBytes` set aside for the disk
   // tier's state staging and `aneFfnBytes` for the prefill FFN's Neural Engine
   // split, each part as it loaded, whole or through its store, and the spill
@@ -978,13 +952,13 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     // The routed experts' store counts at its cap, as it loaded, and the PLE
     // row cache at the share the limit gives it: the context and the KV the
     // plan holds beside them never rest on what the store gives back, which
-    // only adds room, or on what the host held back.
+    // only adds room.
     const auto asLoaded = [](uint64_t storeBytes) {
       return storeBytes ? StreamedSetting{StreamedSetting::Mode::Loaded, storeBytes}
                         : StreamedSetting{StreamedSetting::Mode::Off, 0};
     };
     const StreamedMemoryResult streamed = streamedPlan(
-        asLoaded(loadOptions.expertMemoryBytes), asLoaded(loadOptions.streamedTableBytes + tableHeldBackBytes),
+        asLoaded(loadOptions.expertMemoryBytes), asLoaded(loadOptions.streamedTableBytes),
         stagingBytes, aneFfnBytes);
     ModelMemoryFootprint footprint{
         loaded.targetActualAllocatedBytes(),
@@ -1024,44 +998,33 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   // no part to stream or routed experts whose floor --expert-memory sets as
   // all the plan gives them, and twice otherwise, as where the routed
   // experts stream. Floors that the arenas take beyond the budget stop the
-  // start with the engine plan's breakdown (requirePlan, below). The stores
-  // take only what the host leaves the engine, as the governor will count
-  // it: the Metal memory the first load holds is the engine's, and the
-  // host's spare memory beyond the governor's reserve and warning margin
-  // the room; a host it cannot measure leaves the stores none above their
-  // smallest.
-  const std::optional<HostMemory> host = config.hostMemory();
-  hostBudget = host ? hostBudgetBytes(*host, EngineMemoryPolicy::hostSpareReserveBytes(device.physicalMemoryBytes),
-                                      backend->refreshMemoryStats().deviceCurrentAllocatedBytes)
-                    : 0;
+  // start with the engine plan's breakdown (requirePlan, below). Nothing
+  // here samples the host: the store starts at its floor, and the ledger
+  // grows it by the host's rule before Ready (MemoryGovernor::growToTargets).
   const StreamedMemoryResult planned = storesPlan(true);
   if (!planned.plan && !planned.requiredBytes)
     throw planRefusal(planned, hardBudgetBytes, streamable, config.model);
   if (planned.plan) {
-    tableHeldBackBytes = planned.plan->hostHeldBackBytes;
-    hostHeldBackBytes = planned.plan->hostHeldBackBytes;
     const model::ModelLoadOptions next = storesOf(*planned.plan, false);
     if (next.expertMemoryBytes != loadOptions.expertMemoryBytes ||
         next.expertFloorBytes != loadOptions.expertFloorBytes ||
-        next.expertStartBytes != loadOptions.expertStartBytes ||
         next.streamedTableBytes != loadOptions.streamedTableBytes) {
       loadOptions = next;
       load(true);
     }
   }
   // The engine's plan charges the expert store at its cap: the weights'
-  // allocations count the chunks it started with alone.
+  // allocations count its floor alone, which it starts at.
   if (const model::ExpertStore *store = loaded.expertStore()) {
     const model::ExpertStoreStats stats = store->stats();
-    hostHeldBackBytes += stats.capBytes - stats.liveBytes;
+    hostHeldBackBytes = stats.capBytes - stats.liveBytes;
   }
   // The PLE row cache takes all of its host memory now, before the checks
   // of the host that the start and the expert store's growth make, which
   // see it whole from here on rather than as rows fill it.
   if (model::SparseRowStore *table = loaded.streamedTable())
     table->commit();
-  reportStreamedStores(loaded, streamable, config.expertMemory, config.pleMemory, hostHeldBackBytes,
-                       EngineMemoryPolicy::hostSpareReserveBytes(device.physicalMemoryBytes));
+  reportStreamedStores(loaded, streamable, config.expertMemory, config.pleMemory, loadOptions.expertFloorShare);
   reportVerifyRows(loaded, config.verifyRows);
   // The model's side of the split (startAneFfn).
   const AneFfnModel splitModel =

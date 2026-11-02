@@ -218,24 +218,15 @@ target's first 64K tokens, kept in memory. A dense target keeps
 the plan it has without streaming: its allowance is `--max-context`, so that
 its experts load whole wherever that context fits beside them and stream to
 hold it where it does not, or else none, so its experts load wherever they
-fit; only once they stream does it keep the first 64K tokens too. Last, the
-automatic stores start with no more than the host leaves the engine as the
-memory governor counts it, sampled once the first load holds its weights: the
-Metal memory the engine holds and the host's spare memory beyond the spare
-reserve and the 1 GiB warning margin
-([admission and eviction](internals.md#admission-and-eviction)), less what an
-engine without requests holds of the floors once warm (all but a Spill
-request's, and the runtime overhead reserve, which the spare memory counts
-already); the table's share first, then the experts' store, each down to its
-smallest at most, so that nothing they start with is built for the governor
-to take back. The expert
-store's cap stays all that the budget gives it: the chunks past what the host
-leaves start released, and the store takes them back once memory allows, as
-after giving them back ([streamed experts](#streamed-experts)); the PLE row
-cache, which does not grow, stays at what the host leaves it. What the host
-holds back stays in the plan (`memory_plan.budget.host_held_back_bytes`, and
-a startup line), so that what loads whole, the floors, the context and the KV
-admission keeps in memory follow the budget alone, and a relaunch serves its
+fit; only once they stream does it keep the first 64K tokens too. Nothing in
+the plan rests on the host's memory at the start: the expert store's cap is
+all that the budget gives it, and it starts at its floor, the chunks above it
+released; the memory ledger grows it into the room the host leaves before the
+engine is ready, and later as memory allows, as after giving them back
+([streamed experts](#streamed-experts)). The chunks it starts without stay in
+the plan (`memory_plan.budget.host_held_back_bytes`), so that what loads
+whole, the floors, the context and the KV admission keeps in memory follow
+the budget alone, and a relaunch serves its
 first engine's context whatever the host holds then. The automatic SSD cache
 gives its state staging up where that alone would stream a part, unless the
 target's KV spills to it. `--ple-memory` and
@@ -390,19 +381,14 @@ SSD, and a store holds as many of them as fit (`ExpertStore`,
 `runtime/model/ExpertStore.hpp`): the weights shrink by the routed experts'
 bytes, and the store counts in their place at its cap
 (`target_weights_bytes` and `host_held_back_bytes`). Its cap is all that the
-plan leaves the experts; it starts with as much of that as the host's spare
-memory holds as the engine starts ([memory and context](#memory-and-context)),
-the chunks past it released, which it takes back as after giving them back,
-and gives memory back down to its floor while requests or the Mac need it.
-Under auto the floor is 85% of its slots; a store that starts below its cap
-starts on a chunk boundary, in chunks of its cap's size, its floor the whole
-chunks below its start that keep 85% of that, one at least, but none below a
-layer's experts. With
+plan leaves the experts; it starts at its floor, the chunks above it
+released, which it takes as memory allows, and gives memory back down to its
+floor while requests or the Mac need it
+([memory and context](#memory-and-context)). Under auto the floor is the
+model plan's share of its slots, 85%. With
 `--expert-memory SIZE` it is SIZE bytes, counted as the whole store's, its
 slots, staging and tables, which the plan's floors charge, rounded to whole
-slots and chunks, which startup logs beside SIZE where they differ, whatever
-the store starts with: below its cap it starts with the whole chunks the
-host's spare memory holds. The
+slots and chunks, which startup logs beside SIZE where they differ. The
 cap is all that the rest leaves the store, as under auto, so at least SIZE,
 and a SIZE the plan leaves nothing more than itself has nothing to give back,
 which startup says. Where memory holds every expert beside the KV kept resident,
@@ -440,10 +426,8 @@ off` loads every expert, as a SIZE that holds them all does.
   ([Drafts](models.md#drafts)); the selector writes those rows before the step's load.
 - Experts of one format share their slots, held in chunks, each a buffer of
   its own of at most the device's largest buffer (`maxBufferLength`). One
-  chunk holds each format's floor, by default 0.85 of its slots (for a store
-  that starts below its cap, its start less the whole chunks of its cap's
-  that keep 0.85 of it, one at least, but none below a layer's experts), or
-  the share of them `--expert-memory SIZE` holds;
+  chunk holds each format's floor, the model plan's share of its slots, 0.85
+  by default, or the share of them `--expert-memory SIZE` holds;
   the rest lie in chunks of about 1 GiB
   (more where they would take more than 47, since the expert kernels' address
   table holds at most 48 chunks), the last of fewer slots; a floor larger than

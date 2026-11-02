@@ -281,7 +281,7 @@ std::string EngineMemoryBreakdown::describe() const {
       << "streamed table cache: " << bytesAndMiB(streamedTableBytes) << '\n'
       << "Neural Engine split: " << bytesAndMiB(aneFfnBytes) << '\n'
       << "SSD cache state staging: " << bytesAndMiB(stateStagingBytes) << '\n'
-      << "streamed stores held back for the host: " << bytesAndMiB(hostHeldBackBytes) << '\n'
+      << "expert store above its floor at the start: " << bytesAndMiB(hostHeldBackBytes) << '\n'
       << "fixed runtime: " << bytesAndMiB(fixedRuntimeBytes) << '\n'
       << "elastic state/KV budget: " << bytesAndMiB(dynamicBudgetBytes) << '\n'
       << "KV page: " << kvPageTokens << " tokens, "
