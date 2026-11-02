@@ -67,6 +67,8 @@ TEST_TIMING_PROFILE_ASAN := $(ENGINE_SANITIZER_BUILD)/timing-profile-asan-ubsan
 TEST_TIMING_PROFILE_TSAN := $(ENGINE_SANITIZER_BUILD)/timing-profile-tsan
 TEST_FD_TRANSPORT_ASAN := $(ENGINE_SANITIZER_BUILD)/native-fd-asan-ubsan
 TEST_FD_TRANSPORT_TSAN := $(ENGINE_SANITIZER_BUILD)/native-fd-tsan
+TEST_NATIVE_LOOP_ASAN := $(ENGINE_SANITIZER_BUILD)/native-engine-loop-asan-ubsan
+TEST_NATIVE_LOOP_TSAN := $(ENGINE_SANITIZER_BUILD)/native-engine-loop-tsan
 TEST_ANE_FFN_CALIBRATION_ASAN := $(ENGINE_SANITIZER_BUILD)/ane-ffn-calibration-asan-ubsan
 TEST_ANE_FFN_CALIBRATION_TSAN := $(ENGINE_SANITIZER_BUILD)/ane-ffn-calibration-tsan
 TEST_SPARSE_ROW_STORE_ASAN := $(ENGINE_SANITIZER_BUILD)/sparse-row-store-asan-ubsan
@@ -319,6 +321,7 @@ SANITIZER_CONFIG_TARGETS := $(TEST_SLOT_FILE_ASAN) $(TEST_SLOT_FILE_TSAN) \
 	$(TEST_FAKE_MEMORY_ASAN) $(TEST_FAKE_MEMORY_TSAN) \
 	$(TEST_TIMING_PROFILE_ASAN) $(TEST_TIMING_PROFILE_TSAN) \
 	$(TEST_FD_TRANSPORT_ASAN) $(TEST_FD_TRANSPORT_TSAN) \
+	$(TEST_NATIVE_LOOP_ASAN) $(TEST_NATIVE_LOOP_TSAN) \
 	$(TEST_ANE_FFN_CALIBRATION_ASAN) $(TEST_ANE_FFN_CALIBRATION_TSAN) \
 	$(TEST_SPARSE_ROW_STORE_ASAN) $(TEST_SPARSE_ROW_STORE_TSAN) \
 	$(TEST_SSD_READERS_ASAN) $(TEST_SSD_READERS_TSAN) \
@@ -354,12 +357,6 @@ $(TEST_KV_PAGE_CACHE_TEST): runtime/engine/KvPool.cpp \
 $(TEST_DRAFT_CONTEXT_PLAN_TEST): runtime/model/DraftContextPlan.cpp \
 		dev/benchmarks/PrefillWork.hpp \
 		dev/tests/engine/draft_context_plan_test.cpp
-$(TEST_NATIVE_LOOP_TEST): $(NATIVE_RUNTIME_SOURCES) \
-		runtime/engine/MemoryGovernor.cpp runtime/engine/MemoryControl.cpp \
-		runtime/engine/MemoryLedger.cpp \
-		dev/tests/engine/ProtocolPeer.cpp \
-		dev/tests/engine/native_loop_wire_test.cpp dev/tests/engine/native_loop_weights_test.cpp \
-		dev/tests/engine/native_loop_memory_test.cpp dev/tests/engine/native_loop_test_main.cpp
 $(TEST_METRICS_TEST): $(BACKEND_CONTROL_SOURCES) \
 		runtime/engine/MemoryGovernor.cpp runtime/engine/MemoryLedger.cpp \
 		dev/tests/engine/runtime_metrics_test.cpp
@@ -822,6 +819,13 @@ $(TEST_FD_TRANSPORT_TEST) $(TEST_FD_TRANSPORT_ASAN) $(TEST_FD_TRANSPORT_TSAN): \
 		runtime/engine/FdTransport.cpp \
 		dev/tests/engine/ProtocolPeer.cpp \
 		dev/tests/engine/native_fd_transport_test.cpp
+$(TEST_NATIVE_LOOP_TEST) $(TEST_NATIVE_LOOP_ASAN) $(TEST_NATIVE_LOOP_TSAN): \
+		$(NATIVE_RUNTIME_SOURCES) \
+		runtime/engine/MemoryGovernor.cpp runtime/engine/MemoryControl.cpp \
+		runtime/engine/MemoryLedger.cpp \
+		dev/tests/engine/ProtocolPeer.cpp \
+		dev/tests/engine/native_loop_wire_test.cpp dev/tests/engine/native_loop_weights_test.cpp \
+		dev/tests/engine/native_loop_memory_test.cpp dev/tests/engine/native_loop_test_main.cpp
 $(TEST_ANE_FFN_CALIBRATION) $(TEST_ANE_FFN_CALIBRATION_ASAN) $(TEST_ANE_FFN_CALIBRATION_TSAN): \
 		runtime/ops/AneFfnCalibration.cpp dev/tests/engine/ane_ffn_calibration_test.cpp
 $(TEST_MEMORY_TEST) $(TEST_MEMORY_PLAN_ASAN): runtime/metal/DeviceCapabilities.cpp \
@@ -877,6 +881,8 @@ test-sanitizers: $(SANITIZER_CONFIG_TARGETS)
 	$(TSAN_TEST_ENV) $(TEST_TIMING_PROFILE_TSAN)
 	$(ASAN_TEST_ENV) $(TEST_FD_TRANSPORT_ASAN)
 	$(TSAN_TEST_ENV) $(TEST_FD_TRANSPORT_TSAN)
+	$(ASAN_TEST_ENV) $(TEST_NATIVE_LOOP_ASAN)
+	$(TSAN_TEST_ENV) $(TEST_NATIVE_LOOP_TSAN)
 	$(ASAN_TEST_ENV) $(TEST_ANE_FFN_CALIBRATION_ASAN)
 	$(TSAN_TEST_ENV) $(TEST_ANE_FFN_CALIBRATION_TSAN)
 	$(ASAN_TEST_ENV) $(TEST_SPARSE_ROW_STORE_ASAN)
