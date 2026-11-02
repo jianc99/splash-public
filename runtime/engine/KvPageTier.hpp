@@ -11,6 +11,8 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -104,16 +106,42 @@ public:
     return diskSlot(slot);
   }
   void poll() override;
-  // Counted as the engine thread retires each transfer that succeeded: the
-  // bytes it moved, and the time from its start to its retirement.
-  [[nodiscard]] KvTierThroughput throughput() const noexcept override { return throughput_; }
+  // The bytes of the transfers that succeeded, as the engine thread retires
+  // them, and the wall time the tier had reads, or writes, in flight: from
+  // the start of a write, or of a batch of restores, to the end of its IO,
+  // once however many ran beside it.
+  [[nodiscard]] KvTierThroughput throughput() const noexcept override {
+    return {readBytes_, writtenBytes_, reading_.seconds, writing_.seconds};
+  }
 
 private:
-  // What a transfer's ticket reports once the tier retired it.
+  // What a transfer's ticket reports once the tier retired it, and when its
+  // IO ended, on the awake clock (0 until it has).
   struct Outcome final {
     bool ready = false;
     bool success = false;
+    std::atomic<AwakeClock::rep> ended{0};
   };
+  // The wall time transfers of one direction were in flight. Each counts
+  // from its start, or from where the count already reached, to its end,
+  // taken in the order they started: transfers in flight together count
+  // once.
+  struct BusyTime final {
+    AwakeClock::time_point until{};
+    double seconds = 0.0;
+    void add(AwakeClock::time_point start, AwakeClock::time_point end) noexcept {
+      if (end <= until)
+        return;
+      seconds += std::chrono::duration<double>(end - std::max(start, until)).count();
+      until = end;
+    }
+  };
+  // When the IO an Outcome records ended: now, while the hook that records it
+  // has yet to run.
+  [[nodiscard]] static AwakeClock::time_point endOf(const std::atomic<AwakeClock::rep> &ended) noexcept {
+    const AwakeClock::rep at = ended.load(std::memory_order_acquire);
+    return at ? AwakeClock::time_point(AwakeClock::duration(at)) : AwakeClock::now();
+  }
   class Ticket final : public KvTransfer {
   public:
     explicit Ticket(std::shared_ptr<Outcome> outcome) : outcome_(std::move(outcome)) {}
@@ -140,13 +168,15 @@ private:
     std::function<void()> completion;
     std::shared_ptr<Outcome> outcome;
   };
-  // Restores submitted together, until the tier retired each of them.
+  // Restores submitted together, until the tier retired each of them, and
+  // when the last of their reads ended.
   struct RestoreBatch final {
     std::shared_ptr<std::vector<Restore>> restores;
     std::shared_ptr<model::SsdReaders::Batch> batch;
     std::vector<bool> retired;
     size_t left = 0;
     AwakeClock::time_point started = AwakeClock::now();
+    std::shared_ptr<std::atomic<AwakeClock::rep>> ended = std::make_shared<std::atomic<AwakeClock::rep>>(0);
   };
   [[nodiscard]] static std::shared_ptr<DiskSlot> diskSlot(const std::shared_ptr<KvDiskSlot> &slot);
   // A reader's task: reads one restore's range and scatters it.
@@ -165,7 +195,8 @@ private:
   std::vector<Restore> queued_;
   std::vector<RestoreBatch> batches_;
   uint32_t restores_ = 0;
-  KvTierThroughput throughput_;
+  uint64_t readBytes_ = 0, writtenBytes_ = 0;
+  BusyTime reading_, writing_;
 };
 
 // The tier of the pool's extents.
@@ -260,7 +291,12 @@ std::unique_ptr<KvTransfer> BasicKvPageTier<Pages>::demote(uint32_t page, std::s
   uint64_t bytes = 0;
   for (const std::span<const std::byte> span : spans)
     bytes += span.size();
-  auto io = file_->write(disk->slot, spans, std::move(completion));
+  // The worker runs the hook once the write's IO has ended.
+  auto io = file_->write(disk->slot, spans, [outcome, completion = std::move(completion)] {
+    outcome->ended.store(AwakeClock::now().time_since_epoch().count(), std::memory_order_release);
+    if (completion)
+      completion();
+  });
   // A file that stopped taking writes since canDemote() refuses this one as
   // canDemote() does from now on.
   if (!io)
@@ -297,13 +333,27 @@ template <class Pages> void BasicKvPageTier<Pages>::submitRestores() {
     // call; one that starts is tracked without another allocation.
     batches_.reserve(batches_.size() + 1);
     RestoreBatch batch{std::make_shared<std::vector<Restore>>(), nullptr, std::vector<bool>(count), count};
+    // Each read marks its end, the last one the batch's, even when it throws.
+    const auto readTask = [this, restores = batch.restores, ended = batch.ended](size_t task) {
+      struct Mark final {
+        std::atomic<AwakeClock::rep> &ended;
+        ~Mark() {
+          const AwakeClock::rep now = AwakeClock::now().time_since_epoch().count();
+          AwakeClock::rep last = ended.load(std::memory_order_relaxed);
+          while (last < now && !ended.compare_exchange_weak(last, now, std::memory_order_release,
+                                                            std::memory_order_relaxed)) {
+          }
+        }
+      } mark{*ended};
+      read((*restores)[task]);
+    };
     batch.restores->reserve(count);
     std::move(first, queued_.end(), std::back_inserter(*batch.restores));
     try {
       // A failed read throws, and the readers try it once more. The batch
       // wakes the engine once every restore in it has ended.
       batch.batch = readers_->start(
-          count, [this, restores = batch.restores](size_t task) { read((*restores)[task]); },
+          count, readTask,
           index ? readers_->readers() : std::min(kWholeRestoreReaders, readers_->readers()),
           [restores = batch.restores](const model::SsdReaders::Batch &) {
             if (const std::function<void()> &completion = restores->front().completion)
@@ -343,14 +393,16 @@ template <class Pages> void BasicKvPageTier<Pages>::poll() {
     --classWrites_[static_cast<size_t>(write.write)];
     write.outcome->success = write.io->wait();
     write.outcome->ready = true;
-    if (write.outcome->success) {
-      throughput_.writtenBytes += write.bytes;
-      throughput_.writeSeconds += millisecondsSince(write.started) / 1000.0;
-    }
+    // The worker runs writes one at a time, in the order they started.
+    writing_.add(write.started, endOf(write.outcome->ended));
+    if (write.outcome->success)
+      writtenBytes_ += write.bytes;
     writes_.erase(writes_.begin() + static_cast<std::ptrdiff_t>(index));
   }
   // A restore that ended lets its copy go: the cache may give the copy up
-  // once the restore has landed.
+  // once the restore has landed. A batch that ended counts its time unless
+  // one that started before it is still reading, whose time will hold its.
+  bool earlierReading = false;
   for (auto batch = batches_.begin(); batch != batches_.end();) {
     for (size_t index = 0; index < batch->retired.size(); ++index) {
       if (batch->retired[index] || !batch->batch->ended(index))
@@ -358,20 +410,21 @@ template <class Pages> void BasicKvPageTier<Pages>::poll() {
       Restore &restore = (*batch->restores)[index];
       restore.outcome->success = !batch->batch->failed(index);
       restore.outcome->ready = true;
-      if (restore.outcome->success) {
-        throughput_.readBytes +=
+      if (restore.outcome->success)
+        readBytes_ +=
             restore.form == kv::PageForm::Index ? format_.indexRange().bytes : format_.payloadBytes(restore.form);
-        throughput_.readSeconds += millisecondsSince(batch->started) / 1000.0;
-      }
       restore.copy.reset();
       batch->retired[index] = true;
       --batch->left;
       --restores_;
     }
     if (batch->left) {
+      earlierReading = true;
       ++batch;
       continue;
     }
+    if (!earlierReading)
+      reading_.add(batch->started, endOf(*batch->ended));
     // The reader that ended the last restore runs the batch's end once that
     // restore shows ended: the batch goes when its end has returned, so no
     // completion runs past the tier.

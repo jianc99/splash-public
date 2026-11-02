@@ -21,6 +21,7 @@
 #include <memory>
 #include <span>
 #include <stdexcept>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -126,25 +127,35 @@ void roundTrips(const std::shared_ptr<model::SsdReaders> &readers, kv::Layout la
 
 // What the tier moved, as it retires each transfer that succeeded: the
 // bytes a write sent to its slot and those a restore read back, the index
-// alone for an Index page, and how long each took from its start.
+// alone for an Index page; and the wall time it had writes, or reads, in
+// flight, once however many ran beside each other: never more than the
+// time from the first start to the last retirement, and none of the time
+// the engine thread took to retire them after their IO had ended.
 void tierThroughputCounts(const std::shared_ptr<model::SsdReaders> &readers, kv::Layout layout) {
   constexpr uint32_t kPages = 8;
+  // Longer than the transfers' IO by far: the engine runs a command meanwhile.
+  constexpr auto kPoll = std::chrono::milliseconds(200);
+  const double poll = std::chrono::duration<double>(kPoll).count();
   test::HostKvPages pages(layout, 2 * kPages);
   const kv::SlotFormat format(layout);
   std::shared_ptr<DiskBudget> budget;
   Tier tier(pages, format, slotFile(format, kPages + 1, budget), readers);
   std::vector<std::shared_ptr<engine::KvDiskSlot>> slots;
   std::vector<std::unique_ptr<KvTransfer>> writes;
+  const auto wrote = std::chrono::steady_clock::now();
   for (uint32_t page = 0; page < kPages; ++page) {
     pages.fill(page, page + 1);
     slots.push_back(tier.acquireSlot(cached));
     writes.push_back(tier.demote(page, slots.back(), WriteClass::Reclaim, {}));
   }
+  std::this_thread::sleep_for(kPoll);
   runUntilReady(tier, writes);
+  const double writing = std::chrono::duration<double>(std::chrono::steady_clock::now() - wrote).count();
   const engine::KvTierThroughput written = tier.throughput();
   require(written.writtenBytes == kPages * format.payloadBytes() && written.writeSeconds > 0.0 &&
-              !written.readBytes,
-          "the tier did not count the bytes its writes sent and their time");
+              written.writeSeconds <= writing && written.writeSeconds < poll && !written.readBytes,
+          "the tier did not count the bytes its writes sent and the time it had writes in flight: " +
+              std::to_string(written.writeSeconds) + " s of " + std::to_string(writing) + " s");
   std::vector<std::unique_ptr<KvTransfer>> restores;
   uint64_t read = 0;
   for (uint32_t page = 0; page < kPages; ++page) {
@@ -154,10 +165,16 @@ void tierThroughputCounts(const std::shared_ptr<model::SsdReaders> &readers, kv:
     read += index ? format.indexRange().bytes : format.payloadBytes();
     restores.push_back(tier.restore(slots[page], kPages + page, {}));
   }
+  const auto restored = std::chrono::steady_clock::now();
+  tier.submitRestores();
+  std::this_thread::sleep_for(kPoll);
   runUntilReady(tier, restores);
+  const double reading = std::chrono::duration<double>(std::chrono::steady_clock::now() - restored).count();
   const engine::KvTierThroughput moved = tier.throughput();
-  require(moved.readBytes == read && moved.readSeconds > 0.0 && moved.writtenBytes == written.writtenBytes,
-          "the tier did not count the bytes its restores read and their time");
+  require(moved.readBytes == read && moved.readSeconds > 0.0 && moved.readSeconds <= reading &&
+              moved.readSeconds < poll && moved.writtenBytes == written.writtenBytes,
+          "the tier did not count the bytes its restores read and the time it had reads in flight: " +
+              std::to_string(moved.readSeconds) + " s of " + std::to_string(reading) + " s");
   std::cout << "throughput " << kv::formatName(layout.format) << '\n';
 }
 
