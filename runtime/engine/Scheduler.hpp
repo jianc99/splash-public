@@ -196,12 +196,13 @@ public:
   void remove(uint64_t requestId);
 
   [[nodiscard]] std::vector<uint64_t> admissionOrder() const;
-  // The candidates the next command would serve and leave waiting for no
+  // The candidates their first command would serve and leave waiting for no
   // other prompt: running them to their prompt's end, leading them now or,
   // beside no Spill lane, next, or as they are overdue, beside the resident
-  // prefill lanes and the requests restoring in `in`. Admission starts only
-  // those, planning again without the others until it serves all it plans,
-  // with the candidates' shapes in `in`.
+  // prefill lanes (those of the command between its passes past its rows),
+  // and led by none of the requests restoring in `in` once they land.
+  // Admission starts only those, planning again without the others until it
+  // serves all it plans, with the candidates' shapes in `in`.
   [[nodiscard]] std::vector<uint64_t>
   prefillAdmissionOrder(std::span<const PrefillAdmission> candidates, const PlanInputs &in) const;
   // The highest priority among requests that prefill or decode. A waiting

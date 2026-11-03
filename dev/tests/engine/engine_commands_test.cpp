@@ -1536,13 +1536,86 @@ void testReplansPerTickAreBounded() {
   require(replanned > 0, "no refusal sent a plan back");
 }
 
+// The rows a request has left to prefill: none once its prompt ended.
+uint32_t rowsLeft(const engine::Engine &engine, uint64_t id) {
+  const EngineSnapshot counts = engine.snapshot();
+  const auto found = std::ranges::find(counts.activeRequests, id, &ActiveRequestSnapshot::id);
+  return found != counts.activeRequests.end() && found->phase == Phase::Prefill
+             ? found->promptTokens - found->promptProcessed
+             : 0;
+}
+
 // A start of a higher priority takes a lower resident's lane only as the
-// scheduler admits it (amend/S.md A103), and in the recovery that follows
-// as in ordinary admission: with every lane resident, a Foreground prompt
-// suspends a Normal lane and leads; a longer one after it, which would
-// neither lead nor end in the next command, suspends no lane and does not
-// start before the first's last command.
+// scheduler admits it (amend/S.md A103), in ordinary admission as in the
+// recovery that follows a suspension: with every lane resident, a
+// Foreground prompt that started in a free lane, or one that suspended a
+// Normal lane and leads, a longer one after it, which would neither lead
+// nor end in the next command, suspends no lane and does not start before
+// the first's last command. One that the first's command then leaves
+// behind it, submitted with 96 rows fewer than the first has left, suspends
+// a lane as it leads and waits once the first leads again: the Normal lanes
+// suspended stay so meanwhile, as resumed below it they would yield the
+// lane again.
 void testAPreemptingStartWaitsUntilItLeads() {
+  constexpr uint32_t chunk = model::ExecutionLimits::prefillTokenBudget;
+  // The Normal decoders resident, the second prompt's tokens, whether it is
+  // submitted once the first ran a command, and the lanes suspended before
+  // the first's last command.
+  for (const auto &[normals, second, afterCommand, suspended] :
+       {std::tuple{3u, 3 * chunk + 400, false, 0u}, {4u, 3 * chunk + 400, false, 1u}, {4u, 2 * chunk + 4, true, 2u}}) {
+    test::TestKvStorage storage(1024, 4096, 4);
+    KvPool pool(storage, 0);
+    engine::Cache cache(pool, nullptr, nullptr);
+    Executor executor;
+    executor.decodeFinishes = false;
+    Events events;
+    engine::Engine engine(test::engineConfig({.maxContext = 102400}), cache, executor, events);
+    guardReleases(storage, engine);
+    const auto submit = [&](uint64_t id, uint32_t tokens, RequestPriority priority, uint32_t output) {
+      EngineRequest value = request(id, std::vector<uint32_t>(tokens, static_cast<uint32_t>(id)));
+      value.priority = priority;
+      value.maxNewTokens = output;
+      value.deadlineMilliseconds = 1e9;
+      engine.submit(std::move(value));
+    };
+    double now = 1;
+    for (uint64_t id = 1; id <= normals; ++id)
+      submit(id, 300, RequestPriority::Normal, 100'000);
+    tickUntil(engine, now, [&] { return engine.snapshot().scheduler.decoding == normals; },
+              "the Normal requests did not decode");
+    submit(5, 3 * chunk + 100, RequestPriority::Foreground, 1);
+    tickUntil(engine, now, [&] { return std::ranges::count(events.startIds, 5u) == 1; },
+              "the first Foreground prompt did not start");
+    if (afterCommand)
+      tickUntil(engine, now, [&] { return rowsLeft(engine, 5) == 2 * chunk + 100; },
+                "the first Foreground prompt did not run a command");
+    submit(6, second, RequestPriority::Foreground, 1);
+    std::string early;
+    tickUntil(
+        engine, now,
+        [&] {
+          const EngineSnapshot counts = engine.snapshot();
+          const bool started = std::ranges::count(events.startIds, 6u) != 0;
+          if (early.empty() &&
+              ((rowsLeft(engine, 5) > chunk && (started || counts.prioritySuspensions > suspended)) ||
+               (!started && counts.resourceResumptions)))
+            early = std::to_string(counts.prioritySuspensions) + " lanes suspended, " +
+                    std::to_string(counts.resourceResumptions) + " resumed, the second " +
+                    (started ? "started" : "not started");
+          return started;
+        },
+        "the second Foreground prompt did not start");
+    require(early.empty(), "before the first Foreground prompt's last command, of " + std::to_string(second) +
+                               " tokens beside " + std::to_string(normals) + " Normal lanes: " + early);
+  }
+}
+
+// Foreground prompts that arrive together are judged together, in ordinary
+// admission and in the recovery that follows (amend/S.md A103): with every
+// lane resident, of a longer prompt and a shorter one submitted after it,
+// the shorter suspends a Normal lane and leads, and the longer suspends no
+// other lane and does not start before the shorter's last command.
+void testPreemptingStartsAreJudgedTogether() {
   test::TestKvStorage storage(1024, 4096, 4);
   KvPool pool(storage, 0);
   engine::Cache cache(pool, nullptr, nullptr);
@@ -1564,26 +1637,47 @@ void testAPreemptingStartWaitsUntilItLeads() {
   tickUntil(engine, now, [&] { return engine.snapshot().scheduler.decoding == 4; },
             "the Normal requests did not decode");
   constexpr uint32_t chunk = model::ExecutionLimits::prefillTokenBudget;
-  submit(5, 3 * chunk + 100, RequestPriority::Foreground, 1);
-  tickUntil(engine, now, [&] { return std::ranges::count(events.startIds, 5u) == 1; },
-            "the first Foreground prompt did not start");
-  submit(6, 3 * chunk + 400, RequestPriority::Foreground, 1);
+  submit(5, 4 * chunk + 400, RequestPriority::Foreground, 1);
+  submit(6, 2 * chunk + 100, RequestPriority::Foreground, 1);
   std::string early;
   tickUntil(
       engine, now,
       [&] {
         const EngineSnapshot counts = engine.snapshot();
-        const bool started = std::ranges::count(events.startIds, 6u) != 0;
-        if (early.empty() && std::ranges::any_of(counts.activeRequests, [&](const ActiveRequestSnapshot &active) {
-              return active.id == 5 && active.phase == Phase::Prefill &&
-                     active.promptTokens - active.promptProcessed > chunk;
-            }) && (started || counts.prioritySuspensions > 1))
-          early = std::to_string(counts.prioritySuspensions) + " lanes suspended, the second " +
+        const bool started = std::ranges::count(events.startIds, 5u) != 0;
+        if (early.empty() && (std::ranges::count(events.startIds, 6u) == 0 || rowsLeft(engine, 6) > chunk) &&
+            (started || counts.prioritySuspensions > 1))
+          early = std::to_string(counts.prioritySuspensions) + " lanes suspended, the longer " +
                   (started ? "started" : "not started");
         return started;
       },
-      "the second Foreground prompt did not start");
-  require(early.empty(), "before the first Foreground prompt's last command: " + early);
+      "the longer Foreground prompt did not start");
+  require(early.empty(), "before the shorter Foreground prompt's last command: " + early);
+}
+
+// Under --kv-spill always, of two prompts submitted before any was tried,
+// the longer, whose 193 rows past its whole commands would fit beside the
+// shorter's 481, starts only once it leads: the shorter is judged a Spill
+// lane, the mode it would start with, and two Spill lanes prefill together
+// only as the later one leads (amend/S.md A100 (3)).
+void testSpillPromptsTriedTogetherPrefillApart() {
+  Spilling spill(1024);
+  std::vector<std::vector<uint64_t>> prefills;
+  spill.model.commandTimes = [&](const BatchPlan &plan, std::span<const ModelBatchItem>) {
+    if (plan.kind == WorkKind::Prefill) {
+      std::vector<uint64_t> lanes;
+      for (const BatchItem &item : plan.items)
+        lanes.push_back(item.requestId);
+      prefills.push_back(std::move(lanes));
+    }
+    return test::CommandTimes{};
+  };
+  spill.engine.submit(Spilling::prompt(1, 1, 15, 4));
+  spill.engine.submit(Spilling::prompt(2, 2, 70, 4));
+  spill.runUntilIdle();
+  require(spill.events.completedCount == 2 && spill.events.failedCount == 0 &&
+              std::ranges::none_of(prefills, [](const std::vector<uint64_t> &lanes) { return lanes.size() > 1; }),
+          "two Spill prompts tried together prefilled together, the later one behind");
 }
 
 } // namespace
@@ -1631,6 +1725,8 @@ std::span<const test::TestCase> commandsTests() {
       {"testAPartialAdmissionReplansWithoutTheDeniedLane", testAPartialAdmissionReplansWithoutTheDeniedLane},
       {"testReplansPerTickAreBounded", testReplansPerTickAreBounded},
       {"testAPreemptingStartWaitsUntilItLeads", testAPreemptingStartWaitsUntilItLeads},
+      {"testPreemptingStartsAreJudgedTogether", testPreemptingStartsAreJudgedTogether},
+      {"testSpillPromptsTriedTogetherPrefillApart", testSpillPromptsTriedTogetherPrefillApart},
   };
   return kTests;
 }

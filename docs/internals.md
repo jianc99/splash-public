@@ -1561,10 +1561,16 @@ boundary, in ordinary admission and during recovery alike. Admission starts a
 prompt only where the next command serves it and leaves it waiting for no other
 prompt: the command ends the prompt, the prompt leads it or is overdue, or every
 lane ahead of it ends its prompt there and none is a Spill lane, so two Spill
-lanes prefill together only as the later one leads. A start still restoring its
-prefix from the SSD cache counts as a lane ahead. A prompt that would join with
-the rows that spare it a command and then wait out another's waits for
-scheduling, and takes no lower resident's lane, until it leads. A command between
+lanes prefill together only as the later one leads. The lanes of a command
+between its passes count past its rows, which commit before any other prefill.
+A start still restoring its prefix from the SSD cache runs in no command before
+it lands, and a prompt it would lead then, once the prompt's first command ran
+(as the prompt stands while a command is between its passes), waits for it. A
+prompt that would join with the rows that spare it a command and then wait out
+another's waits for scheduling, and takes no lower resident's lane, until it
+leads; the requests one admission pass tries are judged together, in recovery
+as in ordinary admission, and while one waits so, no suspended lane below it
+resumes into the lane it will take. A command between
 its passes is abandoned, nothing of it committed, for work that supersedes it:
 work that leaves no lane of it overdue behind and shortens the summed
 completion of the lanes concerned, the command's, the work's and the other

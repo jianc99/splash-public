@@ -234,29 +234,52 @@ std::vector<uint64_t> Scheduler::prefillAdmissionOrder(std::span<const PrefillAd
   pending.reserve(candidates.size());
   for (const auto &candidate : candidates)
     pending.push_back(unstarted(candidate));
-  // The lanes ahead of the candidates: the resident prefill lanes, and the
-  // requests restoring their prefix, which prefill once it lands.
+  // The lanes of the candidates' first command: the resident prefill lanes,
+  // those of the command between its passes past its rows, which commit at
+  // its last pass before any other prefill runs (nextPrefill). One whose
+  // prompt those rows end is a lane ahead of every candidate of its priority
+  // or a lower one, its prompt ending there, which matters only for a Spill
+  // lane (below): the most urgent such lane's priority.
   std::vector<Lane> lanes;
   lanes.reserve(requests_.size());
   std::vector<uint64_t> result;
-  for (const auto &[_, request] : requests_) {
-    if (request.phase == Phase::Prefill)
-      lanes.push_back(lane(request, request.promptProcessed, in));
+  std::optional<RequestPriority> spillEnds;
+  for (const auto &[id, request] : requests_) {
+    if (request.phase != Phase::Prefill)
+      continue;
+    uint32_t processed = request.promptProcessed;
+    if (in.passes)
+      if (const auto item = std::ranges::find(in.passes->plan.items, id, &BatchItem::requestId);
+          item != in.passes->plan.items.end())
+        processed += item->tokenCount;
+    if (processed != request.spec.prefillTokens)
+      lanes.push_back(lane(request, processed, in));
+    else if (shapeOf(id, in).spill && (!spillEnds || request.spec.priority < *spillEnds))
+      spillEnds = request.spec.priority;
   }
-  for (const auto &restoring : in.restoring)
-    lanes.push_back(unstarted(restoring));
-  // Admission starts only lanes the next command serves and leaves waiting
-  // for no other prompt (amend/S.md A103): one whose prompt the command
-  // ends, an overdue one, or one it leads or that leads next, every lane
-  // ordered before it ending its prompt there. A start holds its memory from
-  // its first command to its last, so a prompt that would join with the rows
-  // that spare it a command and then wait out another's prompt stays queued
+  // The requests restoring their prefix, which prefill once it lands, in no
+  // command planned before then.
+  std::vector<Lane> restoring;
+  restoring.reserve(in.restoring.size());
+  for (const auto &entry : in.restoring)
+    restoring.push_back(unstarted(entry));
+  // Admission starts only lanes their first command serves and leaves
+  // waiting for no other prompt (amend/S.md A103): one whose prompt the
+  // command ends, an overdue one, or one it leads or that leads next, every
+  // lane ordered before it ending its prompt there, and that no restoring
+  // start leads once it lands. A start holds its memory from its first
+  // command to its last, so a prompt that would join with the rows that
+  // spare it a command and then wait out another's prompt stays queued
   // until it leads. One that leads next starts beside no Spill lane, as two
   // Spill lanes prefill together only as the later one leads or one is
-  // overdue (A100 (3)): beside the last command of a Spill lane it stays
-  // queued too. Admission plans again without the candidates a plan does not
-  // serve until it serves all it plans, as without them the plan can take
-  // another leader.
+  // overdue (A100 (3)): beside the last command of a Spill lane, one between
+  // its passes too, it stays queued. A restoring start holds back a
+  // candidate it leads once it lands: past the candidate's first command,
+  // which this tick plans without it, or as the candidate stands while a
+  // command is between its passes, as it may land before the first command
+  // after them. Admission plans again without the candidates a plan does
+  // not serve until it serves all it plans, as without them the plan can
+  // take another leader.
   std::optional<Planned> planned;
   size_t count = 0;
   do {
@@ -272,11 +295,19 @@ std::vector<uint64_t> Scheduler::prefillAdmissionOrder(std::span<const PrefillAd
       return item != items.end() && item->tokenCount == view.remaining();
     };
     std::erase_if(pending, [&](const Lane &view) {
-      return !holds(items, view.request->spec.id) ||
-             (!view.overdue && !ends(view) && std::ranges::any_of(ready, [&](const Lane &other) {
-                return other.request != view.request && leadsBefore(other, view) &&
-                       (!ends(other) || other.shape.spill);
-              }));
+      const auto item = std::ranges::find(items, view.request->spec.id, &BatchItem::requestId);
+      if (item == items.end())
+        return true;
+      if (view.overdue || item->tokenCount == view.remaining())
+        return false;
+      const Lane landed = in.passes ? view : lane(*view.request, view.processed + item->tokenCount, in);
+      return (spillEnds && *spillEnds <= view.request->spec.priority) ||
+             std::ranges::any_of(ready,
+                                 [&](const Lane &other) {
+                                   return other.request != view.request && leadsBefore(other, view) &&
+                                          (!ends(other) || other.shape.spill);
+                                 }) ||
+             std::ranges::any_of(restoring, [&](const Lane &other) { return leadsBefore(other, landed); });
     });
   } while (pending.size() != count);
   // Admission ranks candidates against every decoder, left out of a plan or

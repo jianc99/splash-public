@@ -72,9 +72,9 @@ std::string at(const test::TimingProfile &profile) {
 }
 
 // A target, its scheduler and what the engine gives the scheduler: the
-// lanes' shapes, the lanes left out, and the command between its passes,
-// which run() keeps as the engine's PassCommand does. Commands take the
-// profile's time on a clock.
+// lanes' shapes, the lanes left out, the command between its passes, which
+// run() keeps as the engine's PassCommand does, and for admission the starts
+// restoring their prefix. Commands take the profile's time on a clock.
 class Sim {
 public:
   explicit Sim(const test::TimingProfile &profile, model::CommandLimits commandLimits = limits(),
@@ -87,6 +87,7 @@ public:
   std::vector<LaneShape> shapes;
   std::vector<uint64_t> excluded;
   std::optional<PassProgress> passes;
+  std::vector<PrefillAdmission> restoring;
   double now = 0.0;
 
   // The startup's two prefill warm-ups (a prompt of one token, as
@@ -100,7 +101,7 @@ public:
     scheduler.seedCost(warmups, rate ? model::SsdReads{10'000'000'000, 1e10 / rate} : model::SsdReads{});
     return *this;
   }
-  [[nodiscard]] PlanInputs in() const { return {excluded, shapes, passes ? &*passes : nullptr, {}}; }
+  [[nodiscard]] PlanInputs in() const { return {excluded, shapes, passes ? &*passes : nullptr, restoring}; }
   [[nodiscard]] std::optional<BatchPlan> next() const { return scheduler.next(in()); }
   [[nodiscard]] BatchPlan plan() const {
     const std::optional<BatchPlan> result = next();
@@ -1493,10 +1494,32 @@ void testShortestExpectedRemainingLeads() {
   require(depth.plan().items[0].requestId == 2, "of equal rows the deeper led");
 }
 
-// 87382087's case: of two near-equal long prompts the younger, cheaper one
-// leads; the older is never admitted while the younger prefills, and leads
-// next.
+// 87382087's case: of two near-equal long prompts, Spill lanes as at 18G,
+// the younger, cheaper one leads; the older is never admitted while the
+// younger prefills, its last command's passes included (amend/S.md A100
+// (3)), and leads next. Started alone, the older leads once its first
+// command commits: the younger, arriving while that command is between its
+// passes, is judged against the older past the command's rows, which
+// commit before any other prefill, and is never admitted while it
+// prefills.
 void testNearEqualLongPromptsDoNotInterleave() {
+  Sim alone(test::kM6FlashNextQ2, limits(8192, 48));
+  alone.seed();
+  alone.lane(1, 0, 71'254);
+  alone.shapes.push_back({.requestId = 1, .spill = true});
+  alone.step();
+  require(alone.passes.has_value(), "the older prompt's first command did not run in passes");
+  alone.scheduler.submit(request(2, 71'220));
+  const std::array younger{PrefillAdmission{2, 0}};
+  while (alone.scheduler.phase(1) == Phase::Prefill) {
+    require(alone.scheduler.prefillAdmissionOrder(younger, alone.in()).empty(),
+            "the younger prompt was admitted while the older prefilled, at " +
+                std::to_string(alone.scheduler.promptProcessed(1)) + " of its rows" +
+                (alone.passes ? " and a pass of its command" : ""));
+    alone.step();
+  }
+  require(alone.scheduler.prefillAdmissionOrder(younger, alone.in()) == std::vector<uint64_t>{2},
+          "the younger prompt did not start once the older's prompt ended");
   Sim sim(test::kM6FlashNextQ2, limits(8192, 48));
   sim.seed();
   sim.scheduler.submit(request(1, 71'254));
@@ -1505,6 +1528,7 @@ void testNearEqualLongPromptsDoNotInterleave() {
   require(sim.scheduler.prefillAdmissionOrder(both, sim.in()) == std::vector<uint64_t>{2},
           "admission did not start the cheaper of two near-equal prompts");
   sim.scheduler.resourcesReady(2, 0);
+  sim.shapes.push_back({.requestId = 2, .spill = true});
   const std::array older{PrefillAdmission{1, 0}};
   while (sim.scheduler.phase(2) == Phase::Prefill) {
     require(sim.scheduler.prefillAdmissionOrder(older, sim.in()).empty(),
@@ -1571,6 +1595,48 @@ void testALongPromptStartsOnlyToLead() {
   const std::array whole{PrefillAdmission{2, 0}};
   require(chunk.scheduler.prefillAdmissionOrder(whole, chunk.in()) == std::vector<uint64_t>{2},
           "a prompt the next command ends did not start beside its leader");
+}
+
+// A start restoring its prefix from the SSD cache runs in no command before
+// its read lands, and holds back only a prompt that it would then lead
+// (amend/S.md A103). On a dense target of one chunk a command, a cold prompt
+// of 1500 rows starts beside one restoring with 640 to go, its first command
+// ending it (a plan of both would not hold it), as does one of 3100 beside
+// 3000, which that command leaves 1052; one of 5200, left 3152, stays
+// queued. Beside a Foreground start restoring with 162 rows to go, a Normal
+// prompt its first command ends starts; one of 3100 stays queued. Of the
+// near-equal pair at 18G on the Studio, the second, 57,664 tokens, stays
+// queued beside the first restoring its last 1000 rows, though its 320 rows
+// past its whole commands fit beside them and the first's shape is no Spill
+// lane's, as two Spill lanes prefill together only as the later one leads
+// (A100 (3)).
+void testARestoringStartHoldsBackWhatItWouldLead() {
+  // Whether a cold prompt of `prompt` rows starts beside a start of
+  // `priority` restoring to `cached` with `restoring` rows to go.
+  const auto starts = [](Sim &sim, uint32_t cached, uint32_t restoring, uint32_t prompt,
+                         RequestPriority priority = RequestPriority::Normal) {
+    sim.scheduler.submit(request(1, cached + restoring, priority));
+    sim.restoring.push_back({1, cached});
+    sim.scheduler.submit(request(2, prompt));
+    const std::array candidate{PrefillAdmission{2, 0}};
+    return sim.scheduler.prefillAdmissionOrder(candidate, sim.in()) == std::vector<uint64_t>{2};
+  };
+  for (const auto &[restoring, prompt, priority, expected] :
+       {std::tuple{640u, 1500u, RequestPriority::Normal, true},
+        {3000u, 3100u, RequestPriority::Normal, true},
+        {3000u, 5200u, RequestPriority::Normal, false},
+        {162u, 226u, RequestPriority::Foreground, true},
+        {162u, 3100u, RequestPriority::Foreground, false}}) {
+    DenseSim sim;
+    require(starts(sim, 64, restoring, prompt, priority) == expected,
+            "a prompt of " + std::to_string(prompt) + " rows " + (expected ? "did not start" : "started") +
+                " beside a start of priority " + std::to_string(static_cast<int>(priority)) + " restoring with " +
+                std::to_string(restoring) + " rows to go");
+  }
+  Sim pair(test::kStudio18GFlashNextQ2, limits(8192, 48));
+  pair.seed();
+  pair.shapes.push_back({.requestId = 1});
+  require(!starts(pair, 56'644, 1000, 57'664), "the second of the near-equal pair started beside the first's restore");
 }
 
 // A long lane under a stream of short arrivals of its priority waits at
@@ -2105,6 +2171,7 @@ constexpr test::TestCase kTests[] = {
     {"testShortestExpectedRemainingLeads", testShortestExpectedRemainingLeads},
     {"testNearEqualLongPromptsDoNotInterleave", testNearEqualLongPromptsDoNotInterleave},
     {"testALongPromptStartsOnlyToLead", testALongPromptStartsOnlyToLead},
+    {"testARestoringStartHoldsBackWhatItWouldLead", testARestoringStartHoldsBackWhatItWouldLead},
     {"testAgingBoundsALongLaneUnderArrivals", testAgingBoundsALongLaneUnderArrivals},
     {"testEqualPromptsFinishInArrivalOrder", testEqualPromptsFinishInArrivalOrder},
     {"testShortArrivalPrecedesLongColdPrompt", testShortArrivalPrecedesLongColdPrompt},

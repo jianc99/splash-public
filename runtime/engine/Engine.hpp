@@ -670,7 +670,8 @@ private:
   // The shapes planning reads (PlanInputs::shapes): every resident prefill
   // lane's, with its Index pages, whether it gains them, its row cap this
   // tick and whether it is a Spill lane, and each candidate's, from the
-  // placement its latest attempt found.
+  // placement its latest attempt found or, before its first, the one it
+  // would start with now (kvModeFor).
   [[nodiscard]] std::vector<LaneShape> laneShapes(std::span<const PrefillAdmission> candidates = {}) const;
   // The command between its passes as planning reads it, or none.
   [[nodiscard]] const PassProgress *passProgress() const noexcept {
