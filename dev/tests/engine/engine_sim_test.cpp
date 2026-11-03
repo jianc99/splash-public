@@ -591,7 +591,9 @@ double estimatedPrice(const engine::CostEstimateSnapshot &estimate, const model:
 // changes direction at most once per level of the host, and the episode
 // takes a unit. Value may take a store unit for a long prompt's prefill
 // outside it (brief §2.12, DESIGN §0 19:45; which one is SIM-value's
-// question, on calibrated counterfactuals). The store's regrowth is A30's
+// question, on calibrated counterfactuals), and what it takes comes back:
+// once no request that prefilled when it went still prefills, within two
+// control passes after the host's settling (X19). The store's regrowth is A30's
 // (owner 11-03 03:55, RegrowthWatch): through the whole run it does not
 // oscillate (coordinator 09:20: an isolated take back is counted, not
 // failed), and it is never short of
@@ -619,6 +621,25 @@ void testChurnRegrowsAfterTheHostEpisode() {
                             {release, machine.otherBytes, engine::MemoryPressure::Normal}});
   Churn churn(serving, {2, 0, 1});
   test::RegrowthWatch regrowth("experts");
+  // A unit given outside the episode: when, the store's bytes before, the
+  // requests that prefilled then, when the last of them stopped, and the
+  // control passes since the host settled after that.
+  struct Given final {
+    double at = 0.0;
+    uint64_t bytesBefore = 0;
+    std::set<uint64_t> prefilling;
+    std::optional<double> claimEnd;
+    uint32_t passes = 0;
+  };
+  std::vector<Given> given;
+  std::string notBack;
+  const auto prefilling = [&] {
+    std::set<uint64_t> ids;
+    for (const engine::ActiveRequestSnapshot &request : serving.fixture.loop.statusSnapshot().activeRequests)
+      if (request.phase == engine::Phase::Prefill)
+        ids.insert(request.id);
+    return ids;
+  };
   uint64_t last = serving.experts->state().currentBytes, before = last;
   int direction = 0;
   std::map<int, uint32_t> turnsByLevel;  // per level of the host: 1 warning, 2 short, 3 the minute after
@@ -638,12 +659,34 @@ void testChurnRegrowsAfterTheHostEpisode() {
       before = std::max(before, current);
     if (current != last) {
       const int moved = current > last ? 1 : -1;
-      givenOutside += moved < 0 && !inside;
+      if (moved < 0 && !inside) {
+        given.push_back({.at = now, .bytesBefore = last, .prefilling = prefilling()});
+        ++givenOutside;
+      }
       episodeShrank |= moved < 0 && now >= episode && now < release;
       if (inside && direction && moved != direction)
         ++turnsByLevel[level];
       direction = moved;
       last = current;
+    }
+    // What went outside the episode comes back once no request that
+    // prefilled when it went still prefills, unless the episode begins
+    // before its bound: the host's level decides then.
+    const auto settled = [&](const Given &unit) {
+      return current >= unit.bytesBefore || (unit.at < episode && now >= episode);
+    };
+    std::erase_if(given, settled);
+    for (Given &unit : given) {
+      if (!unit.claimEnd) {
+        const std::set<uint64_t> still = prefilling();
+        if (std::ranges::none_of(unit.prefilling, [&](uint64_t id) { return still.contains(id); }))
+          unit.claimEnd = now;
+      }
+      if (unit.claimEnd && now >= *unit.claimEnd + engine::kHostSettleMilliseconds &&
+          !serving.fixture.loop.commandInFlight() && ++unit.passes > 2 && notBack.empty())
+        notBack = "a store unit given at " + std::to_string(unit.at / 1000.0) +
+                  " s, outside the host's episode, was not back two control passes after its claim ended at " +
+                  std::to_string(*unit.claimEnd / 1000.0) + " s and the host settled";
     }
     regrowth.observe(*serving.fixture.governor, serving.experts->units(), now, serving.fixture.controlPasses,
                      serving.fixture.loop.commandInFlight());
@@ -668,6 +711,7 @@ void testChurnRegrowsAfterTheHostEpisode() {
                                       " ms");
   require(oldestClaim < engine::kResourceWaitTimeoutMilliseconds && counts.failed == 0,
           at(machine) + "a request waited " + std::to_string(oldestClaim) + " ms for memory, or failed");
+  require(notBack.empty(), at(machine) + notBack + serving.holders());
   for (const auto &[level, turns] : turnsByLevel)
     require(turns <= 1, at(machine) + "the store changed direction " + std::to_string(turns) +
                             " times at one host level (" + std::to_string(level) + ")");
