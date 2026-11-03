@@ -1235,10 +1235,11 @@ std::optional<engine::Victim> Cache::ReclaimPlan::next() {
 }
 
 // The reclaims of the unit from what it weighed so far, up to the one that
-// frees what the need lacks: for a device need an extent, released now or
-// completed by the pages its demotions free as they land, for a page need a
-// page of its form. The reclaims that give up states and the leaves of other
-// forms on the way are the unit's too, unless the need counts states.
+// frees what the need lacks: for a device need, which counts states, one
+// step (an extent released now or completed by the pages its demotions free
+// as they land, or a state given up), for a page need a page of its form.
+// The reclaims that give up states and the leaves of other forms on the way
+// are the unit's too, unless the need counts states.
 std::optional<engine::Victim> Cache::ReclaimPlan::weigh(Weighed weighed) {
   for (;;) {
     const Step taken = walk.device ? step() : evict();
@@ -1267,7 +1268,7 @@ std::optional<engine::Victim> Cache::ReclaimPlan::weigh(Weighed weighed) {
       ended_ = true;
       break;
     }
-    if ((walk.device ? taken.bytes || laterBytes(weighed.landing) : taken.pages) || walk.statesAreUnits)
+    if (taken.pages || walk.statesAreUnits)
       break;
   }
   if (!weighed.changed)
@@ -2120,9 +2121,9 @@ FreeResult Cache::take(const VictimQuery &query, const engine::Victim &victim) {
     // cache, a page need's trims of what a state that left unpinned. A copy
     // given up for room or a write the tier refused may bring in another
     // extent than weighed; a unit weighed at nothing goes on, for a need of
-    // bytes or pages alone, past states to the end of the reclaims. A unit
-    // with later steps takes the victims before the first of them and tries
-    // that one's demotion: its retries take the rest as landings allow.
+    // pages alone, past states to the end of the reclaims. A unit with later
+    // steps takes the victims before the first of them and tries that one's
+    // demotion: its retries take the rest as landings allow.
     const ReclaimPlan::Takes takes =
         ReclaimPlan::takesOf(*this, plan, walk, query.rates ? *query.rates : MemoryRates{}, victim);
     const uint32_t demotions = writes(WriteClass::Reclaim);
@@ -2147,9 +2148,8 @@ FreeResult Cache::take(const VictimQuery &query, const engine::Victim &victim) {
       took = took || reclaimed.madeProgress || reclaimed.evictedKv;
       count();
     } while (reclaimed.madeProgress &&
-             (walk.device
-                  ? released + later < victim.bytes || (!victim.bytes && !walk.statesAreUnits && !released && !later)
-                  : pages < victim.pages || (!victim.pages && !walk.statesAreUnits && !pages)));
+             (walk.device ? released + later < victim.bytes
+                          : pages < victim.pages || (!victim.pages && !walk.statesAreUnits && !pages)));
     victimsLeft_.reset();
     if (takes.tries && kv_.contains(*takes.tries) && kv_.residentLeaf(*takes.tries) &&
         kv_.transfer(*takes.tries) == KvCache::Transfer::None && !states_.stateResident(*takes.tries) &&
