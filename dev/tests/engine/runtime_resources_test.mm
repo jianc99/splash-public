@@ -1282,7 +1282,9 @@ void testDenseRuntimeBoundary(const char *metallibPath) {
 // the window's 262,144 tokens and leave nothing beside them (measured on the
 // fixture: the experts stream from 256 to 512 MiB above it and load whole
 // at 128 and 1024). The fixture runs no command: no hyper-connection kernel
-// takes its 256-wide hidden state.
+// takes its 256-wide hidden state. What a command then read, the store's
+// reads alone, is checked on a real Flash-Next start
+// (model_runtime_oracle_test, requireWeightReadsAreTheStoresAlone).
 void testWeightReadsAreStreamedExpertsOnly(const char *metallibPath) {
   const test::TemporaryDirectory root("splash-weight-reads");
   RuntimeResourcesConfig config = flashNextConfig(metallibPath, root.path(), 491'520);
