@@ -26,6 +26,10 @@ struct CommandLimits final {
   uint32_t commandRows = 0;      // rows of one command, all lanes: prefillTokenBudget * RuntimeGeometry::prefillChunks
   uint32_t maximumPasses = 1;    // the target's layers; 1 with the Neural Engine FFN split
                                  // (QwenTarget::requirePrefill)
+  uint32_t minimumUnitRows = 1;  // the fewest rows of a command its faster path takes: with the Neural Engine FFN
+                                 // split the least rows of a chunk it takes (ops::AneFfn::minimumRows), as fewer
+                                 // run the FFN on the GPU alone at a higher cost a row; else 1. A planning bound
+                                 // (Scheduler), which the runtime does not refuse
   uint32_t lanesPastChunk = 1;   // lanes whose rows may run past a chunk as the lanes fill the chunks in order: 1
                                  // with GDN state, whose prefill group has one scratch cell for the state between a
                                  // lane's parts (ExecutionLimits::prefillTokenBudget), else maximumBatchWidth

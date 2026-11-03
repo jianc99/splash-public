@@ -648,9 +648,9 @@ static_assert(ExecutionLimits::targetVerifyRows ==
 // chunk as the lanes fill the chunks in order, and at most indexPageLanes
 // lanes whose history holds Index pages. Any lane of a decode may hold
 // Index pages: each reads its spilled K/V through the hot block cache
-// (Runtime::Impl::decodeReads). CommandLimits::attentionPairs bounds
-// planning and is not checked here. Neither the runtime nor the engine
-// tests' model runs a command that breaks one.
+// (Runtime::Impl::decodeReads). CommandLimits::attentionPairs and
+// minimumUnitRows bound planning and are not checked here. Neither the
+// runtime nor the engine tests' model runs a command that breaks one.
 [[nodiscard]] inline std::optional<std::string_view>
 commandViolation(const CommandLimits &limits, const BatchPlan &plan,
                  std::span<const ModelBatchItem> items) noexcept {
@@ -909,7 +909,7 @@ public:
   [[nodiscard]] virtual uint32_t prefillPasses() const noexcept { return 1; }
   // What one prefill command may hold (commandViolation): by default a
   // prefill group's rows, prefillPasses() passes, one lane past a chunk and
-  // one lane whose history streams.
+  // one lane whose history streams, at one rate a row from one row.
   [[nodiscard]] virtual CommandLimits commandLimits() const noexcept {
     return {.commandRows = prefillGroupRows(true),
             .maximumPasses = prefillPasses(),

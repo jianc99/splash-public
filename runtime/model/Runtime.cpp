@@ -681,7 +681,7 @@ struct Runtime::Impl {
         draftModel(value.model.draft, value.backend, operators),
         aneFfn(value.aneFfn), blockCache(value.blockCache), historyStream(value.historyStream),
         expertAdmission(std::move(value.expertAdmission)),
-        limits(splash::model::commandLimits(geometry, aneFfn != nullptr)), loadReads(weightReads()) {
+        limits(splash::model::commandLimits(geometry, aneFfn ? aneFfn->minimumRows() : 0)), loadReads(weightReads()) {
     if (states.layout() != model.stateLayout(states.layout().target.format) ||
         kvPages.layout() != model.targetKvLayout(kvPages.layout().format) || !blockCache != !historyStream) {
       throw std::invalid_argument(

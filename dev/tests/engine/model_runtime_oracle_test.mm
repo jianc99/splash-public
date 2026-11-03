@@ -4629,6 +4629,10 @@ int main(int argc, char **argv) {
       return 0;
     }
     model::Runtime &executor = *runtime;
+    // The scheduler plans no unit below the split's least chunk, where the GPU
+    // alone runs the FFN (model::CommandLimits::minimumUnitRows).
+    require(executor.commandLimits().minimumUnitRows == (aneFfn ? aneFfn->minimumRows() : 1u),
+            "the runtime's least unit rows are not the Neural Engine split's least chunk");
     // Warmup runs on the KV runway and never allocates: without it, after
     // actual state activation, warmupPrefill fails and cleans up.
     pages.releaseExtent(0);

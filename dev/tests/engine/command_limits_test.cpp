@@ -11,8 +11,9 @@
 // dense target does, its full-history layers being the heaviest; Flash-Next
 // keeps its group within 3.2 % of it at any depth. A
 // command holds its chunks' rows, a pass a layer (one with the Neural
-// Engine's FFN split), one lane past a chunk, and one lane's streamed history
-// where K/V spills. A pass counts the pairs and block-index scores of its own
+// Engine's FFN split, whose least chunk is the fewest rows of a command at
+// its rate), one lane past a chunk, and one lane's streamed history where K/V
+// spills. A pass counts the pairs and block-index scores of its own
 // layers, and the heaviest layer's pairs of the target whatever the pass; a
 // block index scores each lane's part of a chunk apart.
 #include "TestChecks.hpp"
@@ -77,7 +78,7 @@ void testPairCapIsTodaysPerLayerCap() {
   for (const model::RuntimeGeometry &geometry :
        {geometryOf<model::Qwen3_8Layout>(), geometryOf<model::Qwen3_6MoeLayout>(true),
         geometryOf<model::FlintLayout>(true), geometryOf<model::Qwen4ExpLayout>(true, true)})
-    require(model::commandLimits(geometry, false).attentionPairs == kLayerPairs &&
+    require(model::commandLimits(geometry, 0).attentionPairs == kLayerPairs &&
                 geometry.target.attentionLayerCount() > 1,
             "a family's bound of one attention layer's pairs is not today's per-layer bound");
 }
@@ -136,7 +137,7 @@ void testLimitsAreTheRuntimes() {
                   {geometryOf<model::Qwen4ExpLayout>(true), 4 * kChunk, 0},
                   {geometryOf<model::Qwen4ExpLayout>(true, true), 4 * kChunk, 1}};
   for (const auto &runtime : runtimes) {
-    const model::CommandLimits limits = model::commandLimits(runtime.geometry, false);
+    const model::CommandLimits limits = model::commandLimits(runtime.geometry, 0);
     require(limits == model::CommandLimits{.commandRows = runtime.rows,
                                            .maximumPasses = runtime.geometry.target.layers,
                                            .lanesPastChunk = 1,
@@ -144,8 +145,15 @@ void testLimitsAreTheRuntimes() {
                                            .attentionPairs = kLayerPairs},
             "a runtime's limits are not its chunks' rows in a pass a layer, one lane past a chunk and its "
             "streamed history");
-    require(model::commandLimits(runtime.geometry, true).maximumPasses == 1,
-            "a runtime with the Neural Engine's FFN split ran passes");
+    // The split's least chunk (ops::AneFfn::minimumRows: kMinimumRows to the
+    // chunk's rows) is the fewest rows of a command at its rate.
+    for (const uint32_t least : {512u, 640u, kChunk}) {
+      const model::CommandLimits split = model::commandLimits(runtime.geometry, least);
+      require(split.maximumPasses == 1, "a runtime with the Neural Engine's FFN split ran passes");
+      require(split.minimumUnitRows == least, "a runtime with the Neural Engine's FFN split from " +
+                                                  std::to_string(least) + " rows planned units from " +
+                                                  std::to_string(split.minimumUnitRows));
+    }
   }
 }
 
