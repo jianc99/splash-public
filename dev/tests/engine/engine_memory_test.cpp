@@ -1658,7 +1658,8 @@ void testKvPressureNarrowsTheRealBatch() {
 // reclaim order instead of failing or suspending, and the growing lane still
 // publishes its own replay state afterwards.
 void testKvGrowthReclaimsCachedStateWhenBudgetIsShared() {
-  test::TestKvStorage storage(8, 4096, 4);
+  // An extent of four pages takes the bytes of a state's buffers.
+  test::TestKvStorage storage(8, State().bytes() / 4, 4);
   KvPool pool(storage, 0);
   engine::Cache resources(pool, nullptr, nullptr);
   Executor executor(1);
@@ -1666,13 +1667,14 @@ void testKvGrowthReclaimsCachedStateWhenBudgetIsShared() {
   GovernedHost host;
   engine::Engine engine(host.connect({}), resources, executor, events);
   guardReleases(storage, engine);
+  host.bookStates(executor);
   // The engine's limit refuses an extent's bytes while the cached state
   // holds the memory the KV shares with it.
   bool limited = false;
   storage.growthAllowed = [&](uint32_t) {
     if (!limited || resources.snapshot().stateCache.entries == 0)
       return true;
-    storage.allocationFailure = refusedAtTheLimit(host, 4 * 4096);
+    storage.allocationFailure = refusedAtTheLimit(host, State().bytes());
     return false;
   };
   engine.submit(request(230, std::vector<uint32_t>(65, 230)));
@@ -1892,14 +1894,23 @@ void testRefusedStartKeepsItsLeaseBesideAResidentLane() {
 
 // Memory a state write in flight holds comes back by itself (judge() waits):
 // a start refused memory meanwhile keeps the state its prompt resumes from.
+// At the engine's limit, the start's own state is the one unit left once
+// its lease drops, and it waits for the write slot: the start waits with
+// it, and once the write lands the state is written, its buffers leave, and
+// the start restores it.
 void testRefusedStartKeepsItsLeaseWhileMemoryIsPending() {
   test::TestKvStorage storage(16, 4096, 4);
   KvPool pool(storage, 0);
   engine::Cache resources(pool, nullptr, nullptr);
   Executor executor(1);
   Events events;
-  engine::Engine engine(test::engineConfig(), resources, executor, events);
+  GovernedHost host;
+  engine::Engine engine(host.connect({}), resources, executor, events);
   guardReleases(storage, engine);
+  host.bookStates(executor);
+  executor.offloadTier = std::make_shared<OffloadControl>();
+  executor.offloadTier->ready = true;
+  executor.restoreControl->ready = true;
   auto write = std::make_shared<OffloadControl>();
   resources.beginRequest(999);
   require(resources.ensureTokens(999, 64).granted(), "fixture KV failed");
@@ -1914,7 +1925,8 @@ void testRefusedStartKeepsItsLeaseWhileMemoryIsPending() {
   const std::vector<uint32_t> prompt(65, 1);
   engine.submit(request(1, prompt));
   tickUntil(engine, now, [&] { return idle(engine); }, "the first request did not finish");
-  executor.beginGrowthBlocked = [&] { return !write->ready; };
+  reachTheLimit(host);
+  host.admitBegins(executor, State().bytes());
   engine.submit(request(2, prompt));
   for (int step = 0; step < 5; ++step)
     static_cast<void>(engine.tick(now++));
@@ -5109,8 +5121,14 @@ void testLaneAdmittedBeforeASuspensionHoldsTheWaitOpen() {
     require(events.failedCount == 0 && engine.snapshot().resourceResumptions == 0,
             "a lane resident at a suspension did not hold the wait open");
   }
+  // Once the lane beside it ends, the suspended lane's page is the oldest
+  // cached leaf's, which leaves RAM once its copy lands.
   executor.decodeFinishes = true;
-  tickUntil(engine, now, [&] { return idle(engine); }, "engine did not reach idle");
+  for (uint32_t step = 0; step < 1000 && !idle(engine); ++step) {
+    tier.complete();
+    static_cast<void>(engine.tick(now++));
+  }
+  require(idle(engine), "engine did not reach idle");
   require(events.completedCount == 2 && events.failedCount == 0 &&
               engine.snapshot().resourceResumptions == 1,
           "the suspended lane did not resume once the lane beside it finished");

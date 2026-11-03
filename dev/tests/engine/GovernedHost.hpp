@@ -20,9 +20,10 @@ namespace splash::test {
 
 // The governor of `limits` over FakeMemory's host and the stand-in backend.
 // connect() completes an engine config wired to it (connectToGovernor),
-// through() has a KV storage allocate its extents through it, and reserve()
-// asks it to admit bytes as one of the model's allocations would, holding
-// none, for a fake that takes its refusals from it. The host is ample until
+// through() has a KV storage allocate its extents through it, bookStates()
+// has the model allocate its states through it, and reserve() asks it to
+// admit bytes as one of the model's allocations would, holding none, for a
+// fake that takes its refusals from it. The host is ample until
 // pause(): other applications then leave the host less spare memory than the
 // governor's margin, where it refuses what no request in service needs and
 // growth pauses. setPressure() hands the governor macOS's level, as the
@@ -44,6 +45,13 @@ public:
   void through(TestKvStorage &storage) { storage.through(memory, governor.allocationAdmission()); }
   [[nodiscard]] metal::AllocationResult reserve(uint64_t bytes) {
     return governor.allocationAdmission()(bytes, [] {});
+  }
+  // The model allocates its states' buffers through the governor, held as
+  // "states" until a reclaim gives them back (Executor::memory), so that
+  // the governor sees the memory a cached state's eviction frees.
+  void bookStates(Executor &executor) {
+    executor.memory = &memory;
+    executor.admission = governor.allocationAdmission();
   }
   // Each start of the model (Executor::begin) allocates a lane's `bytes`
   // through the governor, refused with its cause.

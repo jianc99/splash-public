@@ -1,4 +1,5 @@
 #include "Checked.hpp"
+#include "MemoryPasses.hpp"
 #include "TestCache.hpp"
 #include "TestChecks.hpp"
 #include "TestKvPool.hpp"
@@ -2266,7 +2267,7 @@ void testLimitBelowASlotMakesNoRoom() {
 void testParentOfDiskChildrenSurvivesRefusal() {
   constexpr auto reuse = CacheReclaimMode::KeepExtents;
   test::TestKvTier tier;
-  CacheFixture fixture(&tier);
+  CacheFixture fixture(&tier, false, test::ampleDiskBudget());
   auto control = std::make_shared<TransferControl>();
   control->ready = true;
   fixture.cache.publishCompositeState(fixture.blocks[3], std::make_shared<TieredState>(control), false);
@@ -2393,10 +2394,11 @@ void testFullTierStopsTheScan() {
   p.cache.endRequest(9);
 }
 
-// A shortfall while restores are in flight is pending, not exhausted: the
-// restored blocks become leaves with disk copies. Pages held by an active
-// request are exhausted for real.
-void testRestoresInFlightMakeAShortfallPending() {
+// Restores in flight return nothing: a shortfall while a restore holds
+// every page it could use is denied, as it is once the restore has landed
+// and its request holds the pages. Once that request ends, the restored
+// leaf, which has its disk copy, gives up its page for nothing.
+void testRestoresInFlightReturnNothingToAShortfall() {
   constexpr auto reuse = CacheReclaimMode::KeepExtents;
   test::TestKvTier tier;
   CacheFixture fixture(&tier);
@@ -2414,8 +2416,8 @@ void testRestoresInFlightMakeAShortfallPending() {
   require(admitRestore(fixture.cache, 2, lookup).granted() && fixture.pool.freePageCount() == 0,
           "restore did not take the free page");
   fixture.cache.beginRequest(3);
-  require(admitTokens(fixture.cache, 3, 32).failure == TokenAdmissionFailure::Pending,
-          "a shortfall during a restore was reported as exhausted");
+  require(admitTokens(fixture.cache, 3, 32).failure == TokenAdmissionFailure::Denied,
+          "a shortfall during a restore waited for what the restore returns");
   tier.complete();
   require(fixture.cache.pollTransfers() &&
               admitTokens(fixture.cache, 3, 32).failure == TokenAdmissionFailure::Denied,
@@ -2746,7 +2748,7 @@ void testLookupKeepsADiskChainsResidentBoundaryWarm() {
 void testRestoreKeepsTheBlockItExtends() {
   constexpr auto reuse = CacheReclaimMode::KeepExtents;
   test::TestKvTier tier;
-  CacheFixture fixture(&tier);
+  CacheFixture fixture(&tier, false, test::ampleDiskBudget());
   auto control = std::make_shared<TransferControl>();
   control->ready = true;
   fixture.cache.publishCompositeState(fixture.blocks[3], std::make_shared<TieredState>(control), false);
@@ -4526,8 +4528,9 @@ void testSpillAtTheMemoryWall() {
 
 // A Full shortfall reaches the Full pages of an idle spilled chain: leaves of
 // either form go oldest first, so its Index leaves go before the dense
-// history above them; the Index extent they empty goes, and the runway
-// stays.
+// history above them. A page need's units free pages and release no extent
+// they do not need, so the Index extent they empty stays; a need of bytes
+// then takes it, and the runway stays.
 void testFullReclaimReachesAnIdleSpilledChain() {
   Spilling spill;
   const std::vector<uint32_t> prompt = Spilling::prompt(1000, 6);
@@ -4543,8 +4546,13 @@ void testFullReclaimReachesAnIdleSpilledChain() {
           "the Full shortfall did not reach the idle chain's dense history");
   const CacheSnapshot after = spill.cache.snapshot();
   require(after.kvTier.diskBlocks == 6 && spill.cache.spillSnapshot().spilledPages == 0 &&
-              spill.pool.freePageCount(kv::PageForm::Index) == 4 && spill.storage.releasedExtents == 1,
-          "the idle chain did not leave RAM for its copies, or its runway went");
+              spill.pool.freePageCount(kv::PageForm::Index) == 8 && spill.storage.releasedExtents == 0,
+          "the idle chain did not leave RAM for its copies, or a page need released an extent");
+  const FreeResult released = test::freeFromCache(
+      spill.cache, {.cls = ClaimClass::InService}, {.bytes = 4 * spill.storage.bytesPerPage(kv::PageForm::Index)});
+  require(released.outcome == FreeOutcome::Met && spill.storage.releasedExtents == 1 &&
+              spill.pool.freePageCount(kv::PageForm::Index) == 4,
+          "a need of bytes did not take the emptied Index extent first, or its runway went");
   spill.cache.checkInvariants();
   spill.cache.endRequest(2);
 }
@@ -6534,7 +6542,7 @@ int main() {
     testSecondStateWaitsForTheWrite();
     testWaitingCheckpointHoldsBackNothingElse();
     testFullTierStopsTheScan();
-    testRestoresInFlightMakeAShortfallPending();
+    testRestoresInFlightReturnNothingToAShortfall();
     testParentOfDiskChildrenSurvivesRefusal();
     testDiskReplacementOrder();
     testPendingPagesGateAllocation();

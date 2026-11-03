@@ -939,6 +939,9 @@ public:
   // With it, captured states are KeptStates whose copies land when it says
   // so.
   std::shared_ptr<OffloadControl> keptTier;
+  // With it, captured states are OffloadStates, written as the cache lets
+  // them leave RAM, their copies landing when it says so.
+  std::shared_ptr<OffloadControl> offloadTier;
   // What a cached state's buffers take; State::bytes() unless a test needs a
   // state larger than an extent.
   uint64_t stateBytes = 64;
@@ -1239,6 +1242,8 @@ private:
     std::shared_ptr<uint64_t> pool = reservation.seal();
     if (keptTier)
       return std::make_shared<KeptState>(keptTier);
+    if (offloadTier)
+      return std::make_shared<OffloadState>(offloadTier, std::move(pool));
     if (stateHeldRows)
       return std::make_shared<RowsHoldingState>(cacheUnits, stateHeldRows);
     return std::make_shared<State>(std::move(pool));

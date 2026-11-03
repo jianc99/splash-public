@@ -1309,25 +1309,40 @@ void testPageShortfallDemotesInBulk() {
           "the lane did not run on the pages the demotions gave back");
 }
 
+// KV growth the engine's limit refuses while a cached state holds the
+// memory KV shares with it, an extent's bytes, takes that state: its write
+// frees its buffers at once, which leave the model's pool, and the lane
+// grows before the write lands.
 void testKvGrowthProceedsThroughDemotion() {
-  test::TestKvStorage storage(128, 4096, 4);
+  test::TestKvStorage storage(128, State().bytes() / 4, 4);
   KvPool pool(storage, 0);
   engine::Cache cache(pool, nullptr, nullptr);
   Executor executor;
   Events events;
-  engine::Engine engine(test::engineConfig({.maxContext = 102400}), cache, executor, events);
+  test::GovernedHost host;
+  engine::Engine engine(host.connect({.maxContext = 102400}), cache, executor, events);
   guardReleases(storage, engine);
+  host.bookStates(executor);
   auto transfer = std::make_shared<OffloadControl>();
   cache.beginRequest(999);
   require(cache.ensureTokens(999, 32).granted(), "offload fixture KV failed");
   const auto block = test::publishBlocks(cache, 999, std::vector<uint32_t>(32, 12), 32);
-  cache.publishCompositeState(block, std::make_shared<OffloadState>(transfer), false);
+  // The cached state's buffers are the model's, booked as its states.
+  host.memory.hold("states", State().bytes());
+  executor.heldStateBytes += State().bytes();
+  cache.publishCompositeState(block, std::make_shared<OffloadState>(transfer, executor.evictedStateBytes), false);
   cache.endRequest(999);
   {
     auto lookup = cache.lookup(std::vector<uint32_t>(33, 12), {});
     cache.recordLookup(lookup);
   }
-  storage.growthAllowed = [&](uint32_t) { return transfer->released; };
+  host.leaveRoom(0);
+  storage.growthAllowed = [&](uint32_t) {
+    if (transfer->released)
+      return true;
+    storage.allocationFailure = host.reserve(State().bytes()).failure;
+    return false;
+  };
   engine.submit(request(1, std::vector<uint32_t>(256, 17)));
   runUntilIdle(engine);
   // The demoted state's RAM served KV growth before its write finished.
