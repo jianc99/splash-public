@@ -1612,7 +1612,8 @@ std::vector<LaneShape> Engine::laneShapes(std::span<const PrefillAdmission> cand
       shapes.push_back({.requestId = id,
                         .indexPages = cache_.indexPages(id),
                         .gainsIndexPages = gainsIndexPages(active.kvMode, scheduler_.promptProcessed(id)),
-                        .rowCap = active.rowCap.value_or(std::numeric_limits<uint32_t>::max())});
+                        .rowCap = active.rowCap.value_or(std::numeric_limits<uint32_t>::max()),
+                        .ended = active.pendingEnd.has_value()});
   for (const PrefillAdmission &candidate : candidates)
     shapes.push_back({.requestId = candidate.requestId,
                       .gainsIndexPages = gainsIndexPages(requests_.at(candidate.requestId).placement,

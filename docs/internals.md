@@ -1446,9 +1446,11 @@ row-layer, attention pair, block-index pair, byte of weights read from the SSD
 and byte of spilled K/V read from it. Startup seeds it before Ready: a byte of
 either read at the rate loading the weights read the SSD, and from two prefill
 warm-ups, of a chunk's rows and of 256, the line of their times less those
-reads by their row-layers, whose intercept is a chunk-layer's cost; the
-turnaround starts at zero. Every unit that runs rows then trains it, a pass by
-its share of its command, each weighing nine tenths of the next, its time held
+reads by their row-layers, whose intercept is a chunk-layer's cost, their
+turnaround in it; the turnaround starts at zero, where units of one pass over
+one chunk, which do not tell the two apart, leave it. Every unit that runs
+rows then trains it, a pass by its share of its command, each weighing nine
+tenths of the next, its time held
 within half and twice its price, in a fit that keeps every cost non-negative
 and a cost no unit's work varies at its seed; the bytes it prices are scaled
 by what units read over what the model expected of them. The status reports
@@ -1537,7 +1539,9 @@ work supersedes a command with an overdue lane: a long prompt's rows commit
 however often short prompts or work of a higher priority arrive. A request
 that ends between passes, cancelled or at its deadline, stays in the command to its last
 pass, which commits nothing of it, and a command all of whose requests have
-ended stops at once. While requests of the same or a higher priority
+ended stops at once. Such a request is in no plan and loses nothing to work that
+supersedes the command, and overdue, it keeps no work from superseding it.
+While requests of the same or a higher priority
 decode (a lane waiting for its token mask is owed nothing), each prefill unit owes them
 decode time, `--decode-share` times its own, before the next one runs. These
 policies do not extend client deadlines. Memory recovery waits are bounded:

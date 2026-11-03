@@ -703,6 +703,24 @@ void testWaitingOrPrefillingPeersDoNotBoundAPrefill() {
           "lanes that only prefill bounded their leader");
 }
 
+// contended_prefill_ms counts the units planning bounded, those committed
+// while a lane of their priority decoded: none of a lone prompt's, its last
+// among them, which leaves its lane decoding, and one beside that decoder (a
+// prompt of 100 rows, one unit within the bound).
+void testContendedPrefillCountsTheUnitsPlanningBounds() {
+  DenseSim sim;
+  sim.lane(1, 0, 3000);
+  while (sim.scheduler.phase(1) == Phase::Prefill)
+    sim.step();
+  require(sim.scheduler.snapshot().contendedPrefill.count == 0,
+          "a lone prompt's units counted as contended, its last ending beside its own decode");
+  sim.lane(2, 0, 100);
+  while (sim.scheduler.phase(2) == Phase::Prefill)
+    sim.step();
+  require(sim.scheduler.snapshot().contendedPrefill.count == 1,
+          "a unit beside a decoder of its priority was not counted once");
+}
+
 // Behaviour change 7: a ready peer of its priority, with no decoder, does
 // not bound a lane that streams its history: the Spill lane leads a group's
 // rows beside a long Resident prompt as it does alone, and on a store-less
@@ -797,6 +815,37 @@ void testAPrefillsPriceIsTheCostModels() {
   require(sim.scheduler.prefillMilliseconds(sim.work.prefillWork({&more, 1}, 0, 1)) >
               sim.scheduler.prefillMilliseconds(sim.work.prefillWork({&chunk, 1}, 0, 1)),
           "more rows did not cost more");
+}
+
+// A byte of weights a prefill read costs the rate the fit learned of the
+// bytes units read, what the memory ledger prices the bytes a pool's prefill
+// reads at (MemoryRates::weightReadSecondsPerByte). The prefill price
+// charges a model's expected bytes that rate scaled by the share of them
+// units read, so on the M6 target, its units reading half the bytes its
+// model expects (amend/I.md F1: 0.46-0.59), the bytes a turn reads cost what
+// its price charges for the bytes it expects, not half of that.
+void testAWeightReadByteIsPricedAsRead() {
+  Sim sim(test::kM6FlashNextQ2);
+  sim.seed();
+  sim.lane(1, 0, 8 * kChunk);
+  for (uint32_t command = 0; command < 8; ++command) {
+    const BatchPlan plan = sim.plan();
+    model::CommandWork read = sim.work.prefillWork(sim.lanes(plan.items), plan.pass, plan.passes);
+    read.weightReadBytes /= 2;
+    completePrefill(sim, plan, test::sampleOf(test::prefillTimes(sim.work.profile(), read)));
+  }
+  const CostTermSnapshot weights =
+      sim.scheduler.snapshot().prefillEstimate.terms[static_cast<size_t>(CostTerm::WeightReadBytes)];
+  require(std::abs(weights.realizedPerExpected - 0.5) < 1e-9, "the units did not read half the expected bytes");
+  const model::PrefillLane turn{8192, 300, 0};
+  const model::CommandWork expected = sim.work.prefillWork({&turn, 1}, 0, 1);
+  model::CommandWork noReads = expected;
+  noReads.weightReadBytes = 0;
+  const double charged = sim.scheduler.prefillMilliseconds(expected) - sim.scheduler.prefillMilliseconds(noReads);
+  const double priced = sim.scheduler.weightReadMillisecondsPerByte() * 0.5 * double(expected.weightReadBytes);
+  require(charged > 0.0 && std::abs(priced - charged) < 1e-6 * charged,
+          "the bytes a turn reads were priced " + std::to_string(priced) + " ms against the " +
+              std::to_string(charged) + " ms its expected bytes are charged");
 }
 
 // S-P5 (the owner's bound, DESIGN §0, in place of §7.5's 25 %): a cold
@@ -1025,6 +1074,36 @@ void testPassesFollowCostOnAResidentTarget() {
   }
 }
 
+// Units of one pass over one chunk do not price the turnaround: a dense
+// prompt alone runs whole, each command's Units and ChunkLayers one apiece,
+// so its 20 commands running 8 % over the warm-ups (a GPU slower than at
+// startup) leave the turnaround at zero and the bound at G, and the next
+// contended command runs in passes of G (behaviour change 2: as today
+// while u is small).
+void testWholeCommandsLeaveTheTurnaroundAtZero() {
+  Sim sim(test::kDense27B, limits(kChunk, test::kDense27B.layers));
+  sim.seed();
+  sim.lane(1, 0, 20 * kChunk);
+  while (sim.scheduler.phase(1) == Phase::Prefill) {
+    const BatchPlan plan = sim.plan();
+    require(plan.items[0].tokenCount == kChunk && plan.passes == 1, "a lone dense command did not run whole");
+    sim.run(plan, 1.08);
+  }
+  require(sim.turnaround() < 1e-6 && sim.bound() == kGap,
+          "whole commands priced a turnaround of " + std::to_string(sim.turnaround()) + " ms, a bound of " +
+              std::to_string(sim.bound()) + " ms");
+  sim.lane(2, 0, 4 * kChunk);
+  BatchPlan plan = sim.plan();
+  while (plan.kind != WorkKind::Prefill) {
+    sim.run(plan);
+    plan = sim.plan();
+  }
+  for (uint32_t pass = 0; pass < plan.passes; ++pass)
+    require(sim.price(plan.items, pass, plan.passes) <= kGap * (1 + 1e-9),
+            "a contended dense command ran in " + std::to_string(plan.passes) + " passes of " +
+                std::to_string(sim.price(plan.items, pass, plan.passes)) + " ms, past G");
+}
+
 // Behaviour change 5: groups follow the fixed part a group saves: on a
 // store-less target a spill lane whose history reads cost a chunk's command
 // a third of G or more groups, a short one does not, nor a Resident lane.
@@ -1191,6 +1270,62 @@ void testAContendedUnitKeepsRowsNoFewerBound() {
   require(sim.scheduler.snapshot().boundCuts == 0, "a halving no fewer rows could make was counted");
 }
 
+// The part of `work`'s price fewer rows do not shorten (CostModel::fixed):
+// the turnaround and the read terms at their realized shares.
+double fixedOf(const Sim &sim, const model::CommandWork &work) {
+  const std::vector<CostTermSnapshot> terms = sim.scheduler.snapshot().prefillEstimate.terms;
+  const auto rate = [&](CostTerm term) {
+    const CostTermSnapshot &snapshot = terms[static_cast<size_t>(term)];
+    return snapshot.millisecondsPerUnit * snapshot.realizedPerExpected;
+  };
+  return rate(CostTerm::Units) + rate(CostTerm::WeightReadBytes) * double(work.weightReadBytes) +
+         rate(CostTerm::SpilledKvReadBytes) * double(work.spilledKvReadBytes);
+}
+
+// A contended unit no passes bring within the bound, a turn on a Spill
+// conversation 256K tokens deep whose every attention layer reads 289 MB of
+// history at the M6's recorded 0.42-0.70 GB/s (amend/S.md S3; 0.5 here), takes
+// no fewer passes than the bound's mean needs: none of its passes costs more
+// than max(bound, twice the fixed part of a pass in the most passes), where
+// in one pass it would take its whole ~10 s (amend/S.md D4). Every other turn
+// is on a resident conversation as deep, so the price tells the history's
+// reads from the attention they feed.
+void testAContendedUnitPastTheBoundKeepsItsPasses() {
+  test::TimingProfile history = test::kM6FlashNextQ2;
+  history.spilledKvBytesPerMillisecond = 0.5e6;
+  constexpr uint32_t kDepth = 262'144;
+  Sim sim(history, limits(8192, history.layers));
+  sim.seed();
+  sim.decoder(1);
+  uint32_t checked = 0;
+  for (uint64_t turn = 0; turn < 24; ++turn) {
+    const uint64_t id = 100 + turn;
+    const bool spill = turn % 2;
+    sim.lane(id, kDepth, 300);
+    if (spill)
+      sim.shape(id, kDepth / kPageTokens);
+    while (sim.scheduler.phase(id) == Phase::Prefill) {
+      const BatchPlan plan = sim.plan();
+      if (plan.kind == WorkKind::Prefill && !plan.pass && spill && turn >= 12) {
+        double ceiling = sim.bound(), heaviest = 0.0;
+        for (uint32_t pass = 0; pass < history.layers; ++pass)
+          ceiling = std::max(ceiling,
+                             2.0 * fixedOf(sim, sim.work.prefillWork(sim.lanes(plan.items), pass, history.layers)));
+        for (uint32_t pass = 0; pass < plan.passes; ++pass)
+          heaviest = std::max(heaviest, sim.price(plan.items, pass, plan.passes));
+        require(heaviest <= ceiling * (1 + 1e-9),
+                "a contended unit past the bound ran in " + std::to_string(plan.passes) + " passes, the heaviest " +
+                    std::to_string(heaviest) + " ms against " + std::to_string(ceiling) + " ms");
+        ++checked;
+      }
+      sim.run(plan);
+    }
+    sim.scheduler.cancel(id);
+    sim.scheduler.remove(id);
+  }
+  require(checked >= 6, "too few deep Spill turns were checked");
+}
+
 // S-P3: beside a Spill lane streaming its history, a decoder's gaps between
 // its decode commands stay within a unit's bound, max(G, u / 0.1) by the
 // price's error (p95), and one decode command, once the price has learned,
@@ -1322,6 +1457,25 @@ void testALongLanesSparingRowsDoNotDelayAShortTurn() {
   small.lane(2, 0, 8192 * 3 + 300);
   const BatchPlan joined = small.plan();
   require(joined.width() == 2 && joined.items[1].tokenCount == 300, "a long lane's 300 sparing rows did not join");
+}
+
+// A long lane's sparing rows are those past its whole commands of the
+// model's command rows, however evenly its own commands would split them:
+// 8192 + 300 rows alone run as 6144 and 2348, 16384 + 116 as 6144, 6144 and
+// 4212, and 300 or 116 rows spare it a command beside a turn.
+void testALongLaneSparesACommandWithTheRowsPastItsWholeCommands() {
+  for (const uint32_t sparing : {300u, 116u}) {
+    const uint32_t remaining = (sparing == 300 ? 8192 : 16384) + sparing;
+    Sim sim(test::kM6FlashNextQ2, limits(8192, 48));
+    sim.seed();
+    sim.lane(1, 8192, 300);
+    sim.lane(2, 0, remaining);
+    const BatchPlan plan = sim.plan();
+    require(plan.width() == 2 && plan.items[0].requestId == 1 && plan.items[1].tokenCount == sparing,
+            "a lane of " + std::to_string(remaining) + " rows did not join a turn with its " +
+                std::to_string(sparing) + " sparing rows: " + std::to_string(plan.width()) + " lanes, " +
+                std::to_string(plan.items.back().tokenCount) + " rows last");
+  }
 }
 
 // N=4: four agent turns share one command, as on 0bd50301 in the TTFT
@@ -1639,6 +1793,131 @@ void testAnOverdueLaneIsNeverAbandoned() {
           "an overdue lane's command was abandoned");
 }
 
+// A lane whose wait is within its command's passes so far (W) of
+// kAgingSlowdown times its remaining cost is not abandoned, by its priority's
+// arrival or a higher one's start: the abandonment, which adds W to its wait,
+// would make it overdue, so it would lead the next plan with its own rows
+// and the plan W was given up for would not run. Further from it, both
+// supersede the command, W being half the arrival's threshold
+// (testASameTierArrivalSupersedesOnlyWhenTheSumFalls).
+void testAnAbandonmentDoesNotMakeALaneOverdue() {
+  constexpr double kAging = model::ExecutionLimits::maximumBatchWidth - 1;
+  for (const bool near : {false, true}) {
+    Sim sim(test::kM6FlashNextQ2, limits(8192, 48));
+    sim.seed();
+    sim.lane(1, 0, 3 * 8192);
+    const BatchPlan command = sim.plan();
+    sim.run(command);
+    sim.lane(2, 8192, 300);
+    const BatchPlan fresh = [&] {
+      const PassProgress kept = *sim.passes;
+      sim.passes.reset();
+      const BatchPlan result = sim.plan();
+      sim.passes = kept;
+      return result;
+    }();
+    require(fresh.width() == 1 && fresh.items[0].requestId == 2, "the arrival did not lead a plan of its own");
+    const double elapsed = 0.5 * (sim.passesPrice(command.items, 1, command.passes) -
+                                  sim.passesPrice(fresh.items, 0, fresh.passes));
+    double remaining = 0.0;
+    for (uint32_t position = 0; position < 3 * 8192; position += 8192) {
+      const std::array whole{BatchItem{1, 8192, position}};
+      remaining += sim.price(whole);
+    }
+    PassProgress earlier = *sim.passes;
+    earlier.elapsedMilliseconds = kAging * remaining - (near ? 0.5 : 2.0) * elapsed;
+    sim.scheduler.abandoned(earlier);
+    sim.passes->elapsedMilliseconds = elapsed;
+    const std::string after = std::string(near ? "within" : "past") + " W of overdue, ";
+    require(sim.scheduler.abandonsPasses(sim.plan(), sim.in()) == !near,
+            after + "its priority's arrival did " + (near ? "" : "not ") + "abandon the command");
+    require(sim.scheduler.yieldsTo(RequestPriority::Foreground, 1, sim.in()) == !near,
+            after + "a higher priority's start did " + (near ? "" : "not ") + "abandon the command");
+  }
+}
+
+// A lane that ended between its command's passes (a cancel, its deadline)
+// runs to the command's last pass for no one. Overdue, it keeps no command
+// from being abandoned, no plan serves it, and its rows are not run again:
+// a higher priority's start, or its prompt, supersedes the command while
+// what that saves the live lane and the start is positive, R - K_A + R with
+// R the command's rest and K_A the live lane's rows again over the command's
+// passes, and the live lane is not overdue once abandoned
+// (testAnAbandonmentDoesNotMakeALaneOverdue).
+void testALaneThatEndedBetweenPassesHoldsNoSupersedeBack() {
+  constexpr double kAging = model::ExecutionLimits::maximumBatchWidth - 1;
+  Sim sim(test::kM6FlashNextQ2, limits(8192, 48));
+  sim.seed();
+  sim.lane(1, 20'000, 300);
+  sim.lane(2, 20'000, 300);
+  // Abandoned commands count as waited: enough of them make lane 1 overdue.
+  sim.scheduler.abandoned({.plan = {.kind = WorkKind::Prefill, .items = {{1, 300, 20'000}}},
+                           .elapsedMilliseconds = 1e7});
+  const BatchPlan command = sim.plan();
+  require(command.width() == 2 && command.items[0].requestId == 1 && command.passes > 2,
+          "the overdue lane and another did not share a command in passes");
+  sim.run(command);
+  sim.shapes.push_back({.requestId = 1, .ended = true});
+  const std::array live{command.items[1]};
+  bool yields = false, keeps = false;
+  while (sim.passes) {
+    const uint32_t pass = sim.passes->plan.pass;
+    const double rest = sim.passesPrice(command.items, pass, command.passes);
+    const double again = sim.passesPrice(live, 0, command.passes);
+    const bool aged = sim.passes->elapsedMilliseconds >= kAging * sim.price(live);
+    const bool expected = !aged && 2.0 * rest - again > 0.0;
+    const std::string after = "after " + std::to_string(pass) + " of " + std::to_string(command.passes) +
+                              " passes, R " + std::to_string(rest) + " ms, K_A " + std::to_string(again) +
+                              " ms, the live lane " + (aged ? "" : "not ") + "overdue once abandoned: ";
+    const BatchPlan fresh = [&] {
+      const PassProgress kept = *sim.passes;
+      sim.passes.reset();
+      const BatchPlan result = sim.plan();
+      sim.passes = kept;
+      return result;
+    }();
+    require(std::ranges::none_of(fresh.items, [](const BatchItem &item) { return item.requestId == 1; }),
+            after + "a plan served the lane that ended");
+    // The live lane's rows alone, from a first pass, supersede the command
+    // only where they end sooner than its rest.
+    const bool restarts = !aged && rest - sim.passesPrice(fresh.items, 0, fresh.passes) > 0.0;
+    require(sim.scheduler.abandonsPasses(sim.plan(), sim.in()) == restarts,
+            after + "the live lane's rows alone did " + (restarts ? "not " : "") + "supersede the command");
+    require(sim.scheduler.yieldsTo(RequestPriority::Foreground, 1, sim.in()) == expected,
+            after + "a higher priority's start did " + (expected ? "not " : "") + "supersede the command");
+    sim.lane(3, 0, 300, RequestPriority::Foreground);
+    require(sim.scheduler.abandonsPasses(sim.plan(), sim.in()) == expected,
+            after + "a higher priority's prompt did " + (expected ? "not " : "") + "supersede the command");
+    sim.scheduler.cancel(3);
+    sim.scheduler.remove(3);
+    yields |= expected;
+    keeps |= !aged && !expected;
+    sim.run(sim.passes->plan);
+  }
+  require(yields && keeps, "the case does not straddle the rule");
+}
+
+// Admission plans the next command without a lane that ended between its
+// command's passes, as planning does: a prompt that joins the live lane
+// starts, though the ended lane, overdue, would lead with rows that leave it
+// no room.
+void testAdmissionPlansWithoutALaneThatEnded() {
+  Sim sim(test::kM6FlashNextQ2, limits(8192, 48));
+  sim.seed();
+  sim.lane(1, 0, 8000);
+  sim.lane(2, 20'000, 192);
+  sim.scheduler.abandoned({.plan = {.kind = WorkKind::Prefill, .items = {{1, 8000, 0}}}, .elapsedMilliseconds = 1e7});
+  const BatchPlan command = sim.plan();
+  require(command.width() == 2 && command.items[0].requestId == 1 && command.passes > 1,
+          "the overdue lane and another did not share a command in passes");
+  sim.run(command);
+  sim.shapes.push_back({.requestId = 1, .ended = true});
+  sim.scheduler.submit(request(3, 300));
+  const std::array candidate{PrefillAdmission{3, 0}};
+  require(sim.scheduler.prefillAdmissionOrder(candidate, sim.in()) == std::vector<uint64_t>{3},
+          "admission planned the next command with the lane that ended");
+}
+
 // While a command is between its passes, a start waiting for a quota does
 // not lift it over a higher decoder; one the command held back does, and the
 // kinds alternate.
@@ -1754,6 +2033,71 @@ void testCommandBetweenPassesHoldsItsLanes() {
   plan = sim.plan();
   require(plan.pass == 0 && plan.items == first.items,
           "a lane suspended between its command's passes did not run its rows again with the others");
+}
+
+// A command's rows count once, with its first pass, in prefill_rows, the
+// work the matrix compares with 1.5.0, which counts them so: the rows its
+// lanes plan again after it was abandoned between its passes counted
+// already, those of a lane suspended meanwhile too once it resumes. Of a
+// resume's replay, the rows that ran before its suspension count again, as
+// 1.5.0's replays do.
+void testAnAbandonedCommandsRowsCountOnce() {
+  Sim sim(test::kM6FlashNextQ2, limits(8192, 48));
+  sim.seed();
+  sim.lane(1, 0, 3 * 8192);
+  sim.run(sim.plan());
+  require(sim.passes.has_value(), "the long command did not run in passes");
+  sim.lane(2, 8192, 300);
+  require(sim.scheduler.abandonsPasses(sim.plan(), sim.in()), "the turn did not supersede the long command");
+  while (sim.scheduler.phase(1) == Phase::Prefill || sim.scheduler.phase(2) == Phase::Prefill)
+    sim.step();
+  const SchedulerSnapshot counts = sim.scheduler.snapshot();
+  require(counts.abandonedPassCommands > 0 && counts.prefillRows == 3 * 8192 + 300,
+          std::to_string(counts.prefillRows) + " rows counted for the prompts' " + std::to_string(3 * 8192 + 300) +
+              " after " + std::to_string(counts.abandonedPassCommands) + " abandoned commands");
+  sim.lane(3, 0, 8192);
+  BatchPlan plan = sim.plan();
+  while (plan.kind != WorkKind::Prefill) {
+    sim.run(plan);
+    plan = sim.plan();
+  }
+  sim.run(plan);
+  require(sim.passes.has_value(), "the contended command did not run in passes");
+  const uint64_t counted = sim.scheduler.snapshot().prefillRows;
+  sim.abandon();
+  sim.scheduler.suspendForResources(3);
+  sim.scheduler.resumeFromResources(3, 0, 8192);
+  while (sim.scheduler.phase(3) == Phase::Prefill)
+    sim.step();
+  require(sim.scheduler.snapshot().prefillRows == counted,
+          "a lane suspended in its first command's passes counted " +
+              std::to_string(sim.scheduler.snapshot().prefillRows - counted) +
+              " of its 8192 rows again once it resumed, which never ran before");
+  // A lane whose first command ended, suspended between the passes of its
+  // second, resumes from its prompt's start: the first command's rows count
+  // again, the second's not.
+  sim.lane(4, 0, 2 * 8192);
+  plan = sim.plan();
+  while (plan.kind != WorkKind::Prefill || !sim.scheduler.promptProcessed(4)) {
+    sim.run(plan);
+    plan = sim.plan();
+  }
+  require(plan.width() == 1 && plan.items[0].requestId == 4 && plan.passes > 1,
+          "the second command did not run in passes");
+  const uint32_t ran = sim.scheduler.promptProcessed(4);
+  const uint32_t reached = plan.items[0].promptOffset + plan.items[0].tokenCount;
+  sim.run(plan);
+  const uint64_t before = sim.scheduler.snapshot().prefillRows;
+  sim.abandon();
+  sim.scheduler.suspendForResources(4);
+  sim.scheduler.resumeFromResources(4, 0, 2 * 8192);
+  while (sim.scheduler.phase(4) == Phase::Prefill)
+    sim.step();
+  const uint64_t replayed = sim.scheduler.snapshot().prefillRows - before;
+  require(replayed == ran + (2 * 8192 - reached),
+          "a replay from the prompt's start counted " + std::to_string(replayed) + " rows, not the " +
+              std::to_string(ran) + " that ran before its suspension and the " + std::to_string(2 * 8192 - reached) +
+              " no command counted");
 }
 
 // A higher priority's decode does not abandon a command between its passes,
@@ -1918,10 +2262,12 @@ constexpr test::TestCase kTests[] = {
     {"testOnlyContendedUnitsAreBounded", testOnlyContendedUnitsAreBounded},
     {"testALowerPrioritysDecodeDoesNotBoundAPrefill", testALowerPrioritysDecodeDoesNotBoundAPrefill},
     {"testWaitingOrPrefillingPeersDoNotBoundAPrefill", testWaitingOrPrefillingPeersDoNotBoundAPrefill},
+    {"testContendedPrefillCountsTheUnitsPlanningBounds", testContendedPrefillCountsTheUnitsPlanningBounds},
     {"testAReadyPeerDoesNotBoundAStreamingLeader", testAReadyPeerDoesNotBoundAStreamingLeader},
     {"testUntimedOrAuxiliaryUnitsTrainNothing", testUntimedOrAuxiliaryUnitsTrainNothing},
     {"testACommandHoldsOneLanePastAChunk", testACommandHoldsOneLanePastAChunk},
     {"testAPrefillsPriceIsTheCostModels", testAPrefillsPriceIsTheCostModels},
+    {"testAWeightReadByteIsPricedAsRead", testAWeightReadByteIsPricedAsRead},
     {"testColdSeedPricesTheFirstContendedTurn", testColdSeedPricesTheFirstContendedTurn},
     {"testEstimateConvergesUnderUniformContendedCommands", testEstimateConvergesUnderUniformContendedCommands},
     {"testALoneDenseCommandRunsWhole", testALoneDenseCommandRunsWhole},
@@ -1930,6 +2276,7 @@ constexpr test::TestCase kTests[] = {
     {"testTheBoundFollowsTheTurnaround", testTheBoundFollowsTheTurnaround},
     {"testPassesAddAtMostATenthOfTheCommand", testPassesAddAtMostATenthOfTheCommand},
     {"testPassesFollowCostOnAResidentTarget", testPassesFollowCostOnAResidentTarget},
+    {"testWholeCommandsLeaveTheTurnaroundAtZero", testWholeCommandsLeaveTheTurnaroundAtZero},
     {"testGroupRowsFollowTheFixedCost", testGroupRowsFollowTheFixedCost},
     {"testANearlyResidentStoreRunsChunks", testANearlyResidentStoreRunsChunks},
     {"testThePairBoundIsPerLayerAndOnlyRowsMeetIt", testThePairBoundIsPerLayerAndOnlyRowsMeetIt},
@@ -1937,9 +2284,12 @@ constexpr test::TestCase kTests[] = {
     {"testAContendedSpillLaneKeepsItsGroupRows", testAContendedSpillLaneKeepsItsGroupRows},
     {"testAGroupBeyondMaximumPassesHalvesOnlyWhenContended", testAGroupBeyondMaximumPassesHalvesOnlyWhenContended},
     {"testAContendedUnitKeepsRowsNoFewerBound", testAContendedUnitKeepsRowsNoFewerBound},
+    {"testAContendedUnitPastTheBoundKeepsItsPasses", testAContendedUnitPastTheBoundKeepsItsPasses},
     {"testDecodeGapsBesideAStreamingLaneStayWithinTheBound", testDecodeGapsBesideAStreamingLaneStayWithinTheBound},
     {"testTurnsTtftAloneTogetherAndApart", testTurnsTtftAloneTogetherAndApart},
     {"testALongLanesSparingRowsDoNotDelayAShortTurn", testALongLanesSparingRowsDoNotDelayAShortTurn},
+    {"testALongLaneSparesACommandWithTheRowsPastItsWholeCommands",
+     testALongLaneSparesACommandWithTheRowsPastItsWholeCommands},
     {"testFourShortTurnsShareOneCommand", testFourShortTurnsShareOneCommand},
     {"testADenseFinishingLeaderRunsWithoutFill", testADenseFinishingLeaderRunsWithoutFill},
     {"testAStreamingLaneSharesACommand", testAStreamingLaneSharesACommand},
@@ -1955,9 +2305,13 @@ constexpr test::TestCase kTests[] = {
     {"testAHigherTierAbandonCountsLanesWaitingBehindBoth", testAHigherTierAbandonCountsLanesWaitingBehindBoth},
     {"testARegroupHappensOnlyWhenTheSumFalls", testARegroupHappensOnlyWhenTheSumFalls},
     {"testAnOverdueLaneIsNeverAbandoned", testAnOverdueLaneIsNeverAbandoned},
+    {"testAnAbandonmentDoesNotMakeALaneOverdue", testAnAbandonmentDoesNotMakeALaneOverdue},
+    {"testALaneThatEndedBetweenPassesHoldsNoSupersedeBack", testALaneThatEndedBetweenPassesHoldsNoSupersedeBack},
+    {"testAdmissionPlansWithoutALaneThatEnded", testAdmissionPlansWithoutALaneThatEnded},
     {"testOnlyAHeldStartLiftsTheCommand", testOnlyAHeldStartLiftsTheCommand},
     {"testRepeatedSupersedesEndOnceTheLongLaneIsOverdue", testRepeatedSupersedesEndOnceTheLongLaneIsOverdue},
     {"testCommandBetweenPassesHoldsItsLanes", testCommandBetweenPassesHoldsItsLanes},
+    {"testAnAbandonedCommandsRowsCountOnce", testAnAbandonedCommandsRowsCountOnce},
     {"testPassesYieldToAHigherPriority", testPassesYieldToAHigherPriority},
     {"testACommandRunsAtThePriorityOfWhatItHoldsBack", testACommandRunsAtThePriorityOfWhatItHoldsBack},
     {"testImageEncodesStayOutOfAPassedCommandsEstimate", testImageEncodesStayOutOfAPassedCommandsEstimate},
