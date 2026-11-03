@@ -356,9 +356,9 @@ intervals between consecutive chunks after the first. Each request may take
 the machine's recorded runs, `longest_request_s` in the spec; `run.py`'s
 default is twice the longest on any machine): one the server keeps streaming
 past it, though its keepalives hold the connection open, ends the scenario as
-the server's failure; in `churn` its client stops, and the end record lists
-every request still open, with its open gap or, before its first token, as
-unanswered.
+the server's failure; in `churn` its client stops with a record of the
+request's chunk times, and the end record lists every request still open,
+with its open gap or, before its first token, as unanswered.
 
 ```sh
 .venv/bin/python -m dev.benchmarks.serving.run --tree TREE --machine m6 \
@@ -486,10 +486,12 @@ max, with its pass commands and units) and its
 `scheduler.index_page_conflicts` per 15 minutes; a run past 5 per 15
 minutes (`index_page_conflicts_per_15min`, the scheduler's bound) is
 reported to the owner. It counts its client gaps above its G4 bound by
-cause, each gap taking the first of these that the `/status` samples from
-2 s before it to 2 s after it show: a claim waiting for memory, the
-experts' size changing, a compaction, a replan, a history-stream wait, a
-committed prefill command; else it is unattributed. It reports the share
+cause, those of a request it ended at its deadline and those the end
+record lists as open among them, each gap taking the first of these that
+the `/status` samples from 2 s before it to 2 s after it show: a claim
+waiting for memory, the experts' size changing, a compaction, a replan, a
+history-stream wait, a committed prefill command; else it is
+unattributed. It reports the share
 of the commands that trained each `scheduler.estimate` whose time it
 clamped; per use of the streamed experts the share of those read (not
 resident) that were read ahead, over the sample intervals in which a

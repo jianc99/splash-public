@@ -423,6 +423,70 @@ class TtftRoundTests(unittest.TestCase):
         self.assertEqual(rounds(dict), [None, None])
 
 
+class ChurnStatusTests(unittest.TestCase):
+    def test_each_sample_also_logs_its_status_event(self):
+        # s-fn-churn-18g cand: beside each /status sample a churn run logs
+        # the store's chunks, cap, shrinks and regrows, its arena, the decode
+        # hit rate, the pressure, the requests and Metal's health as an
+        # event, the record notes/churn/summ.py reads.
+        usage = {
+            "choices": [],
+            "usage": {"prompt_tokens": 9000, "completion_tokens": 2},
+        }
+        document = {
+            "streamed_experts": {
+                "chunks": 40,
+                "cap_chunks": 48,
+                "shrinks": 2,
+                "regrows": 1,
+                "arena_bytes": 1 << 30,
+                "decode": {"hit_rate": 0.9},
+            },
+            "memory_pressure": "warning",
+            "requests": {"active": 3, "failed": 0},
+            "metal": {"healthy": True},
+        }
+
+        def answer(body):
+            time.sleep(0.05)
+            return [content_event("1"), usage]
+
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            StreamingServer(answer, lambda: document) as fake,
+            mock.patch.object(clients, "CHURN_STAGGER_SECONDS", 0),
+        ):
+            clients.run_churn(
+                fake.port, directory, "c", 0.01, [0, 1, 2], poll_seconds=0.05
+            )
+            events = (Path(directory) / "c.events.jsonl").read_text().splitlines()
+            samples = (Path(directory) / "c.status.jsonl").read_text().splitlines()
+        logged = [
+            {key: value for key, value in event.items() if key != "t"}
+            for event in map(json.loads, events)
+            if event["kind"] == "status"
+        ]
+        self.assertGreater(len(samples), 0)
+        self.assertEqual(
+            logged,
+            [
+                {
+                    "kind": "status",
+                    "chunks": 40,
+                    "cap_chunks": 48,
+                    "shrinks": 2,
+                    "regrows": 1,
+                    "arena": 1 << 30,
+                    "hit": 0.9,
+                    "pressure": "warning",
+                    "req": {"active": 3, "failed": 0},
+                    "metal_ok": True,
+                }
+            ]
+            * len(samples),
+        )
+
+
 class DeadlineTests(unittest.TestCase):
     """server.py keeps every stream alive with a keepalive every 2 s and sets
     no deadline of its own, so a request a scheduler or ledger bug starves
@@ -447,8 +511,10 @@ class DeadlineTests(unittest.TestCase):
         self.assertIsInstance(outcome[1], clients.Deadline)
 
     def test_churn_fails_a_request_the_server_keeps_open(self):
-        # m6-fn-churn cand: w1's first request stays queued while w0 and w2
-        # keep working, and the server keeps its stream alive.
+        # m6-fn-churn cand: w1's first request stays queued and w2's stops
+        # after its first token while w0 keeps working, and the server keeps
+        # both streams alive. Each deadline record keeps the chunk times its
+        # request had, for gap_causes.
         usage = {
             "choices": [],
             "usage": {"prompt_tokens": 9000, "completion_tokens": 2},
@@ -456,6 +522,9 @@ class DeadlineTests(unittest.TestCase):
 
         def answer(body):
             if "Log 1-" in body:
+                yield from keepalives_forever()
+            if "Log 2-" in body:
+                yield content_event("1")
                 yield from keepalives_forever()
             time.sleep(0.2)
             yield from (content_event("1"), content_event("2"), usage)
@@ -477,14 +546,18 @@ class DeadlineTests(unittest.TestCase):
             )
         self.assertEqual(outcome[0], "raised", outcome)
         self.assertIsInstance(outcome[1], clients.Deadline)
-        self.assertIn("w1-r1", str(outcome[1]))
+        self.assertIn("w1-r1, w2-r1", str(outcome[1]))
         events = self.events("c")
-        (expired,) = [e for e in events if e["kind"] == "deadline"]
-        self.assertEqual((expired["tag"], expired["chunks"]), ("w1-r1", 0))
+        expired = {e["tag"]: e for e in events if e["kind"] == "deadline"}
+        self.assertEqual(sorted(expired), ["w1-r1", "w2-r1"])
+        self.assertEqual(expired["w1-r1"]["chunks_ms"], [])
+        self.assertEqual(len(expired["w2-r1"]["chunks_ms"]), 1)
+        self.assertLess(expired["w2-r1"]["chunks_ms"][0], 1000)
         (end,) = [e for e in events if e["kind"] == "end"]
         self.assertEqual(end["unanswered"], ["w1-r1"])
+        self.assertEqual(list(end["open_gaps"]), ["w2-r1"])
         done = {e["tag"].split("-")[0] for e in events if e["kind"] == "done"}
-        self.assertEqual(done, {"w0", "w2"})
+        self.assertEqual(done, {"w0"})
 
     def test_a_sender_that_fails_before_the_barrier_releases_the_others(self):
         # m6-fn-ttft cand at N=2: one sender of a round cannot connect; the
@@ -2036,8 +2109,9 @@ class GateTests(unittest.TestCase):
         # second or more) leaves out, takes the first cause in GAP_CAUSES
         # that the /status samples from 2 s before it to 2 s after it show,
         # here 97.5-102.5 s around a gap from 99.1 s; a claim waits in a
-        # sample inside the gap, gone by its end. One sample there shows no
-        # change: the gap is unattributed.
+        # sample inside the gap, gone by its end. The experts that shrink for
+        # a claim in one sample and are back by the last changed size. One
+        # sample there shows no change: the gap is unattributed.
         experts = [
             {"name": "kv", "current_bytes": 100, "cap_bytes": 100},
             {"name": "experts", "current_bytes": 100, "cap_bytes": 200},
@@ -2056,12 +2130,17 @@ class GateTests(unittest.TestCase):
             "prefill unit": {i: {"scheduler__prefill_batches": 1} for i in (3, 4, 5)},
         }
 
-        def causes(names, gap_ms=1500, times=(97.5, 98.5, 99.5, 100.5, 101.5, 102.5)):
+        def causes(
+            names,
+            gap_ms=1500,
+            times=(97.5, 98.5, 99.5, 100.5, 101.5, 102.5),
+            changes=None,
+        ):
             samples = []
             for index, t in enumerate(times):
                 fields = {}
-                for name in names:
-                    fields.update(shows[name].get(index, {}))
+                for shown in [shows[name] for name in names] + [changes or {}]:
+                    fields.update(shown.get(index, {}))
                 samples.append(self.schema7(t, **fields))
             chunks = [0, 100, 100 + gap_ms, 200 + gap_ms]
             done = {
@@ -2082,9 +2161,58 @@ class GateTests(unittest.TestCase):
             self.assertEqual(causes(order[index:]), {cause: 1}, cause)
         self.assertEqual(causes(["prefill unit"], gap_ms=980), {"prefill unit": 1})
         self.assertEqual(causes(["prefill unit"], gap_ms=900), {})
+        self.assertEqual(
+            causes([], changes={3: {"memory_governor__accounts": experts}}),
+            {"store resize": 1},
+        )
         self.assertEqual(causes([]), {"unattributed": 1})
         self.assertEqual(
             causes(["claim wait"], times=(80.0, 90.0, 100.0)), {"unattributed": 1}
+        )
+
+    def test_the_gaps_of_a_stream_past_its_deadline_and_left_open_take_causes(self):
+        # Borrowed item 4 on m6-fn-churn cand, whose limit is 960 ms: the
+        # engine starves w1-r7 until its deadline. Its deadline record keeps
+        # its chunk times, with a 2 s gap ending at 101.1 s while a claim
+        # waited at 98 s. The end record at 150 s lists its 48.9 s open gap,
+        # in which the experts shrank for a claim at 130 s and were back by
+        # 151 s, and w2-r5's open gap of 0.5 s, within the limit.
+        experts = [
+            {"name": "kv", "current_bytes": 100, "cap_bytes": 100},
+            {"name": "experts", "current_bytes": 100, "cap_bytes": 200},
+        ]
+        write_jsonl(
+            self.directory / "starved.status.jsonl",
+            [
+                self.schema7(98, memory_governor__claims={"waiting": 1}),
+                self.schema7(100),
+                self.schema7(102),
+                self.schema7(130, memory_governor__accounts=experts),
+                self.schema7(151),
+            ],
+        )
+        write_jsonl(
+            self.directory / "starved.events.jsonl",
+            [
+                {
+                    "t": 140.0,
+                    "kind": "deadline",
+                    "tag": "w1-r7",
+                    "start": 99.0,
+                    "chunks_ms": [0, 100, 2100],
+                    "error": "a request still streaming 41 s after its send",
+                },
+                {
+                    "t": 150.0,
+                    "kind": "end",
+                    "open_gaps": {"w1-r7": 48.9, "w2-r5": 0.5},
+                    "unanswered": [],
+                },
+            ],
+        )
+        run = matrix.Run(self.directory, "starved")
+        self.assertEqual(
+            matrix.gap_causes(run, 0.96), {"claim wait": 1, "store resize": 1}
         )
 
     def test_compressed_and_unbooked_engine_memory(self):
@@ -2166,6 +2294,43 @@ class GateTests(unittest.TestCase):
         )
         report = found["unbooked memory cand"]
         self.assertEqual((report["verdict"], report["numbers"]), ("report", unbooked))
+        # 200 MiB at most, live, is within the bound: no report. 300 MiB
+        # grown only while idle is past it.
+        within = verdicts(
+            "within",
+            [
+                sample(10, 10240, 9728, 0),
+                sample(20, 10552, 9840, 0, lanes=[lane]),
+                sample(30, 10340, 9740, 0),
+            ],
+        )
+        readout = within["G4 G8 G9 within"]["numbers"]["readouts"]["unbooked"]
+        self.assertEqual(
+            (
+                readout["growth_idle_max_bytes"],
+                readout["growth_live_max_bytes"],
+                readout["past_bound"],
+            ),
+            (88 * mib, 200 * mib, False),
+        )
+        self.assertNotIn("unbooked memory within", within)
+        idle = verdicts(
+            "idle",
+            [
+                sample(10, 10240, 9728, 0),
+                sample(20, 10340, 9740, 0, lanes=[lane]),
+                sample(30, 10552, 9740, 0),
+            ],
+        )
+        report = idle["unbooked memory idle"]["numbers"]
+        self.assertEqual(
+            (
+                report["growth_idle_max_bytes"],
+                report["growth_live_max_bytes"],
+                report["past_bound"],
+            ),
+            (300 * mib, 88 * mib, True),
+        )
         old = verdicts("old", [status(0), status(900)])
         readouts = old["G4 G8 G9 old"]["numbers"]["readouts"]
         self.assertEqual(

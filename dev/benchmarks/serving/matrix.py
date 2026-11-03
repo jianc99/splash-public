@@ -169,11 +169,11 @@ def run_files(directory: Path, label: str, kind: str) -> list[Path]:
 
 
 class Run:
-    """One run's records: its done requests, the requests the server failed,
-    its end, /status samples and events (a ttft run's over its levels) and
-    meta, and the reasons it may not be used: `invalid` all of them,
-    `voided` those not the server's own failure. A churn run's work is read
-    at `window` seconds."""
+    """One run's records: its done requests, the requests the server failed
+    and those the client ended at their deadline, its end, /status samples
+    and events (a ttft run's over its levels) and meta, and the reasons it
+    may not be used: `invalid` all of them, `voided` those not the server's
+    own failure. A churn run's work is read at `window` seconds."""
 
     def __init__(
         self,
@@ -216,6 +216,8 @@ class Run:
             for e in read_jsonl(path)
         ]
         self.done = {e["tag"]: e for e in events if e.get("kind") == "done"}
+        # Churn's requests the client ended at their deadline.
+        self.expired = [e for e in events if e.get("kind") == "deadline"]
         # Churn's HTTP errors but context_length_exceeded (error events of
         # streams the server had begun among them), and each request of a
         # failed TTFT round.
@@ -960,28 +962,32 @@ GAP_CAUSES = (
 
 
 def gap_causes(run: Run, bound_s: float) -> dict:
-    """Every client gap above the bound, from each request's chunk times
-    (its gap summary lists only those of a second or more), attributed to
-    the first cause in GAP_CAUSES the samples from 2 s before it to 2 s
-    after it show, else unattributed."""
+    """Every client gap above the bound, attributed to the first cause in
+    GAP_CAUSES the samples from 2 s before it to 2 s after it show, else
+    unattributed: those between the chunks of each request that ended or
+    that the client ended at its deadline (a gap summary lists only those
+    of a second or more), and each gap the end record lists as open, ending
+    at that record."""
+    gaps = [
+        ((later - earlier) / 1000, record["start"] + later / 1000)
+        for record in [*run.done.values(), *run.expired]
+        for chunks in [record.get("chunks_ms") or []]
+        for earlier, later in zip(chunks, chunks[1:])
+    ] + [
+        (length, run.end["t"])
+        for length in ((run.end or {}).get("open_gaps") or {}).values()
+    ]
     causes: dict[str, int] = {}
-    for record in run.done.values():
-        chunks = record.get("chunks_ms") or []
-        for earlier, later in zip(chunks, chunks[1:]):
-            length, end = (later - earlier) / 1000, record["start"] + later / 1000
-            if length <= bound_s:
-                continue
-            around = [
-                s["status"]
-                for s in run.samples
-                if end - length - 2 <= s["t"] <= end + 2
-            ]
-            cause = "unattributed"
-            if len(around) >= 2:
-                cause = next(
-                    (name for name, shows in GAP_CAUSES if shows(around)), cause
-                )
-            causes[cause] = causes.get(cause, 0) + 1
+    for length, end in gaps:
+        if length <= bound_s:
+            continue
+        around = [
+            s["status"] for s in run.samples if end - length - 2 <= s["t"] <= end + 2
+        ]
+        cause = "unattributed"
+        if len(around) >= 2:
+            cause = next((name for name, shows in GAP_CAUSES if shows(around)), cause)
+        causes[cause] = causes.get(cause, 0) + 1
     return causes
 
 

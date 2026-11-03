@@ -314,9 +314,10 @@ def run_churn(
     """A churn run. Workers send requests until `minutes` have passed and
     finish the one they have in flight; the run ends 4 s after the last. A
     request the server keeps streaming `timeout` seconds after its send ends
-    its worker; the end record lists it, as every request still open, with
-    its open gap or, before its first token, as unanswered, and the run
-    raises Deadline."""
+    its worker with a deadline record of its chunk times; the end record
+    lists it, as every request still open, with its open gap or, before its
+    first token, as unanswered, and the run raises Deadline. Each /status
+    sample also logs churn_status_event's values as an event."""
     model = served_model(port)
     recorder = Recorder(directory, label)
     end = recorder.start + minutes * 60
@@ -329,10 +330,18 @@ def run_churn(
         chunks: list[float] = []
         with recorder.lock:
             open_streams[tag] = chunks
+        sent = time.time()
         try:
             stream = Stream(port, churn_body(model, messages), timeout, chunks=chunks)
         except Deadline as error:
-            recorder.emit("deadline", tag=tag, chunks=len(chunks), error=str(error))
+            # Its chunk times, as a done record's, for its gaps' causes.
+            recorder.emit(
+                "deadline",
+                tag=tag,
+                start=round(sent - recorder.start, 1),
+                chunks_ms=[round((t - sent) * 1000) for t in chunks],
+                error=str(error),
+            )
             with recorder.lock:
                 expired.append(tag)
             raise
@@ -380,10 +389,13 @@ def run_churn(
             if answer is not None:
                 previous = churn_resend(messages, answer)
 
+    def observe(status):
+        recorder.emit("status", **churn_status_event(status))
+
     done = threading.Event()
     poller = threading.Thread(
         target=poll_status,
-        args=(port, recorder, done.is_set, poll_seconds, churn_status_event),
+        args=(port, recorder, done.is_set, poll_seconds, observe),
         daemon=True,
     )
     poller.start()
