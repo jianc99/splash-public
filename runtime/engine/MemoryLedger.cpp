@@ -182,7 +182,7 @@ ClaimId MemoryLedger::open(const ClaimSpec &spec) {
   const ClaimId id{nextClaim_++};
   if (!nextClaim_)
     nextClaim_ = 1;
-  claims_.emplace(id.value, ClaimState{.spec = spec});
+  claims_.emplace(id.value, ClaimState{.spec = spec, .openedSeconds = nowSeconds_});
   return id;
 }
 
@@ -204,6 +204,8 @@ void MemoryLedger::setHostRefusedWaiting(ClaimId claim, bool waiting) {
 }
 
 void MemoryLedger::setHostExempt(ClaimId claim, bool exempt) { claims_.at(claim.value).hostExempt = exempt; }
+
+void MemoryLedger::setInDemand(ClaimId claim, bool inDemand) { claims_.at(claim.value).inDemand = inDemand; }
 
 void MemoryLedger::close(ClaimId claim) noexcept { claims_.erase(claim.value); }
 
@@ -267,6 +269,32 @@ uint64_t MemoryLedger::pendingGrowthBytes() const noexcept {
   for (const Account &account : accounts_)
     bytes = plus(bytes, account.pendingGrowth);
   return bytes;
+}
+
+// A claim takes a pool's unit only when nothing cheaper meets its need, and
+// while the engine's lanes may yet need it (its lane prefills into it, or
+// another lane is in service beside it, whose growth and the requests that
+// follow it take units as it did) its units over the time since it opened
+// measure the rate from its first take, which the pool's own rate (PoolRate,
+// over kRateTimeConstantSeconds) shows only as its time constant goes by,
+// and which already counts those takes: the larger of the two. Smoke a, 35B
+// at 18G (test-pressure-real): requests took store units 6, 13, 26, 40 and
+// 45 s after Ready; the store's own rate stayed at 0.03-0.04 a second
+// through the first 30 s, so the units it regrew 14 and 36 s after Ready went
+// back 13 and 4 s later. A lane that decodes alone grows little: its takes
+// count in the pool's rate only, and the store regrows right after its
+// prefill (owner rule 12).
+double MemoryLedger::takesPerSecond(size_t account) const noexcept {
+  double inDemand = 0.0;
+  for (const auto &[id, state] : claims_) {
+    if (!state.inDemand)
+      continue;
+    const auto units = std::ranges::count(state.poolTakes, AccountId{static_cast<uint8_t>(account)});
+    if (units)
+      inDemand += nowSeconds_ > state.openedSeconds ? double(units) / (nowSeconds_ - state.openedSeconds)
+                                                     : std::numeric_limits<double>::infinity();
+  }
+  return std::max(accounts_[account].rate.takesPerSecond(), inDemand);
 }
 
 uint64_t MemoryLedger::poolReleases() const noexcept {
@@ -529,6 +557,8 @@ FreeResult MemoryLedger::take(const DryRun &run, const VictimQuery &query, Claim
       Account &account = accounts_[index];
       if (choice.pending) {
         ++account.taken;
+        if (claim)
+          claim->poolTakes.push_back(*choice.pool);
         account.pendingGrowth = account.pendingLaterBytes = 0;
         result.nowBytes = plus(result.nowBytes, choice.victim.bytes);
         continue;
@@ -540,6 +570,8 @@ FreeResult MemoryLedger::take(const DryRun &run, const VictimQuery &query, Claim
       if (bytes) {
         ++account.taken;
         ++account.shrinks;
+        if (claim)
+          claim->poolTakes.push_back(*choice.pool);
       }
       released[index] = plus(released[index], bytes);
       result.nowBytes = plus(result.nowBytes, bytes);
@@ -736,23 +768,25 @@ uint64_t MemoryLedger::available(const ClaimSpec &spec, uint64_t enough, uint64_
   return std::min(enough, less(plus(room, taken), held));
 }
 
-// R3 with amend/M.md B4. Pending growth grows once its bytes are free for
-// it, taking what its victims left once they landed as a claim's retry
-// takes it, without the host's consent on the host's credit of what that
-// take releases (the host's footprint is then where it was), and is
-// cancelled once that take finds it short. Free room beyond what the
+// R3 with amend/M.md B4, its growth rule A30's (owner 11-03 03:55: no unit
+// regrown is taken back within the horizon). Pending growth grows once its
+// bytes are free for it, taking what its victims left once they landed as a
+// claim's retry takes it, without the host's consent on the host's credit
+// of what that take releases (the host's footprint is then where it was),
+// and is cancelled once that take finds it short. Free room beyond what the
 // waiting claims, the lanes' projected growth and every pending growth hold
 // goes to the pools, the one whose next unit is worth most first, while the
-// host admits each unit and, once claims take a pool's units, while a unit
-// is worth its expected retake. At most one unit per pass then displaces
-// other memory, outside critical pressure, when the victims cost less than
-// the unit is worth beyond its cycle and its expected retake: with the
-// host's consent the victims need only meet what the room lacks; without
-// it they free a whole unit, which the growth then takes from the host's
-// footprint again (its credit), and what the room lacks besides. Either way
-// victims that free memory only once their transfers land make the unit the
-// pool's pending growth. The room is the pass's less what the pass has
-// grown.
+// host admits each unit and, once claims take a pool's units, while its
+// regrowth gains: what it saves over the horizon if no claim takes it back
+// within it, at the rate claims take the pool's units (takesPerSecond),
+// beyond its cycle. At most one unit per pass then displaces other memory,
+// outside critical pressure, when the victims cost less than its regrowth
+// gains: with the host's consent the victims need only meet what the room
+// lacks; without it they free a whole unit, which the growth then takes
+// from the host's footprint again (its credit), and what the room lacks
+// besides. Either way victims that free memory only once their transfers
+// land make the unit the pool's pending growth. The room is the pass's less
+// what the pass has grown.
 bool MemoryLedger::grow(uint64_t freeBytes, const GrowthHost &host) {
   bool acted = false;
   uint64_t waitingBytes = 0;
@@ -808,9 +842,8 @@ bool MemoryLedger::grow(uint64_t freeBytes, const GrowthHost &host) {
       uint64_t credit = 0;
       // Once they have landed, it takes what they left, as a claim's retry
       // does: the extents a demotion's landing empties, which only a take
-      // releases, and the steps of its units still to go, within the
-      // unit's worth beyond its cycle; what that starts lands for a later
-      // pass. Without the host's consent it frees the whole unit now, its
+      // releases, and the steps of its units still to go, within what its
+      // regrowth gains; what that starts lands for a later pass. Without the host's consent it frees the whole unit now, its
       // credit, as a displacement does: a landing frees its page into a
       // kept extent, which leaves the host's footprint only as a take
       // releases it, and the host's pass or a claim may have taken it for
@@ -821,7 +854,8 @@ bool MemoryLedger::grow(uint64_t freeBytes, const GrowthHost &host) {
         const ClaimId claim = open({.cls = ClaimClass::Growth,
                                     .timing = consents ? NeedTiming::CanWait : NeedTiming::Immediate,
                                     .holdSeconds = kValueHorizonSeconds,
-                                    .benefitSeconds = std::max(0.0, next.benefit - next.cycle)});
+                                    .benefitSeconds = std::max(
+                                        0.0, value::regrowthSeconds(next.benefit, next.cycle, takesPerSecond(index)))});
         const FreeResult freed = freeFor(claim.value, {.bytes = account.pendingGrowth}, less(freeBytes, grownBytes),
                                          false, false, AccountId{static_cast<uint8_t>(index)}, !consents);
         close(claim);
@@ -848,9 +882,9 @@ bool MemoryLedger::grow(uint64_t freeBytes, const GrowthHost &host) {
     return less(less(freeBytes, grownBytes), plus(plus(pendingGrowthBytes(), waitingBytes), laneDemandBytes_));
   };
   for (Candidate &next : candidates) {
-    Account &account = accounts_[next.account];
     while (next.unit && room() >= next.unit && host.admits(next.unit) &&
-           value::growsIntoFreeRoom(account.rate, next.benefit, next.cycle) && growUnit(next.account, 0, "into free room")) {
+           value::growsIntoFreeRoom(takesPerSecond(next.account), next.benefit, next.cycle) &&
+           growUnit(next.account, 0, "into free room")) {
       acted = true;
       next = candidate(next.account);
     }
@@ -859,7 +893,7 @@ bool MemoryLedger::grow(uint64_t freeBytes, const GrowthHost &host) {
     return acted;
   for (const Candidate &next : candidates) {
     Account &account = accounts_[next.account];
-    const double benefit = next.benefit - next.cycle - value::retakeSeconds(account.rate, next.cycle);
+    const double benefit = value::regrowthSeconds(next.benefit, next.cycle, takesPerSecond(next.account));
     if (!next.unit || account.pendingGrowth || benefit <= 0.0)
       continue;
     const bool consents = host.admits(next.unit);

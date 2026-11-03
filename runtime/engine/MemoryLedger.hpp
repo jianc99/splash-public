@@ -258,6 +258,14 @@ struct ClaimState final {
   std::vector<uint64_t> converted;
   // What its latest free() decided.
   std::optional<FreeOutcome> outcome;
+  // When it opened on the control clock, the pools whose units free() took
+  // for it, one entry a unit, and whether the engine's lanes may yet need
+  // what it took: its lane prefills, growing into it, or shares the engine
+  // with another lane in service (Engine::syncClaims). While they may, the
+  // pools' units go at its rate since it opened (MemoryLedger::grow).
+  double openedSeconds = 0.0;
+  std::vector<AccountId> poolTakes;
+  bool inDemand = false;
 };
 
 // The host's side of one growth pass, from the governor: whether the host
@@ -325,6 +333,7 @@ public:
   void setWaiting(ClaimId claim, bool waiting);
   void setHostRefusedWaiting(ClaimId claim, bool waiting);
   void setHostExempt(ClaimId claim, bool exempt);
+  void setInDemand(ClaimId claim, bool inDemand);
   void close(ClaimId claim) noexcept;
   [[nodiscard]] const ClaimState &claim(ClaimId claim) const;
   // Every open claim by its id, for the checks of the ledger's relations.
@@ -382,6 +391,10 @@ private:
   [[nodiscard]] uint64_t heldForGrowth(std::optional<AccountId> growing, ClaimClass cls) const noexcept;
   [[nodiscard]] uint64_t heldByClaims(const ClaimRank &rank, std::optional<uint32_t> self) const noexcept;
   [[nodiscard]] uint64_t pendingGrowthBytes() const noexcept;
+  // The units of the pool `account` claims take per second: its measured
+  // rate, or, if more, that of the claims in demand that took its units,
+  // each its units since it opened.
+  [[nodiscard]] double takesPerSecond(size_t account) const noexcept;
   [[nodiscard]] DryRun dryRun(const ClaimSpec &spec, const VictimQuery &query, uint64_t lackingBytes,
                               uint32_t lackingPages, std::optional<AccountId> growing) const;
   // `whole`: false when a unit the run chose was no longer offered as

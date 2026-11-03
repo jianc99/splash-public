@@ -61,21 +61,23 @@ value::PoolRate observed(double ghostsPerSecond, double hitsPerSecond, double sc
 
 // Before its first interval a rate is zero, and the first interval with
 // commands sets the value rates, with no prior. The take rate counts every
-// interval, the first setting it, and decays over an idle one that took
-// nothing while the value rates hold (amend/M.md B4, B10). A cache unit is
-// worth nothing before the probes measure reuse, and the spilled decode's
-// read time starts from the measured 9 ms.
+// interval, from none taken before the first (one interval's takes are no
+// rate, amend/V.md A30), and decays over an idle one that took nothing while
+// the value rates hold (amend/M.md B4, B10). A cache unit is worth nothing
+// before the probes measure reuse, and the spilled decode's read time starts
+// from the measured 9 ms.
 void testRatesStartFromTheirFirstMeasurement() {
   value::PoolRate rate;
   require(rate.ghostHitsPerSecond() == 0.0 && rate.hitsPerSecond() == 0.0 && rate.scanReadBytesPerSecond() == 0.0 &&
               rate.takesPerSecond() == 0.0 && rate.ghostBytes() == 0.0,
           "a rate is not zero before its first interval");
+  const double weight = 1.0 - std::exp(-0.5 / kRateTimeConstantSeconds);
   rate.observe({.hits = 10, .ghostHits = 20, .ghostBytes = 4096, .scanReadBytes = 100}, 1, 0.0, true);
   rate.observe({.hits = 60, .ghostHits = 70, .ghostBytes = 4096, .scanReadBytes = 600}, 3, 0.5, false);
-  require(rate.ghostHitsPerSecond() == 0.0 && rate.takesPerSecond() == 4.0,
-          "an interval without commands set a value rate, or did not count its takes");
+  require(rate.ghostHitsPerSecond() == 0.0 && std::abs(rate.takesPerSecond() - weight * 4.0) < 1e-12,
+          "an interval without commands set a value rate, or did not count its takes from none before it");
   rate.observe({.hits = 110, .ghostHits = 170, .ghostBytes = 8192, .scanReadBytes = 1100}, 4, 1.0, true);
-  const double takes = 4.0 + (1.0 - std::exp(-0.5 / kRateTimeConstantSeconds)) * (2.0 - 4.0);
+  const double takes = weight * 4.0 + weight * (2.0 - weight * 4.0);
   require(rate.hitsPerSecond() == 100.0 && rate.ghostHitsPerSecond() == 200.0 &&
               rate.scanReadBytesPerSecond() == 1000.0 && std::abs(rate.takesPerSecond() - takes) < 1e-12 &&
               rate.ghostBytes() == 8192.0,
@@ -200,21 +202,24 @@ void testSpillDecodeTermUsesTheEnginesMeanAndItsPrior() {
   require(value::conversion(2.5).at(1e6) == 2.5, "a conversion's cost is not its penalty, once");
 }
 
-// Free room goes back to a pool claims retake only while a unit is worth its
-// expected retake: none taken grows unconditionally; one taken every 20 s
-// asks 95 % of its cycle (1 - e^-3 over the 60 s horizon).
+// Free room goes back to a pool claims retake only while a unit saves more
+// than its cycle should no claim take it back within the horizon (amend/V.md
+// A30, owner 11-03 03:55): none taken grows unconditionally; one taken every
+// 20 s keeps e^-3 of what it saves over the 60 s horizon, so it asks e^3
+// times its cycle.
 void testGrowthPaysOnlyWhatARetakeCosts() {
   value::PoolRate untaken;
-  require(value::growsIntoFreeRoom(untaken, 0.0, 1.0), "an untaken pool did not grow unconditionally");
+  require(value::growsIntoFreeRoom(untaken.takesPerSecond(), 0.0, 1.0),
+          "an untaken pool did not grow unconditionally");
   value::PoolRate retaken;
   for (uint64_t step = 0; step <= 400; ++step)
     retaken.observe({}, step / 40, step * 0.5, true);
-  const double share = 1.0 - std::exp(-retaken.takesPerSecond() * kValueHorizonSeconds);
-  require(std::abs(retaken.takesPerSecond() - 0.05) < 0.02 && share > 0.9,
+  const double kept = std::exp(-retaken.takesPerSecond() * kValueHorizonSeconds);
+  require(std::abs(retaken.takesPerSecond() - 0.05) < 0.02 && kept < 0.1,
           "a unit taken every 20 s is not taken at about 0.05 a second");
-  require(value::growsIntoFreeRoom(retaken, share * 1.0 + 1e-9, 1.0) &&
-              !value::growsIntoFreeRoom(retaken, share * 1.0 - 1e-6, 1.0),
-          "growth into free room does not ask the expected retake's cost");
+  require(value::growsIntoFreeRoom(retaken.takesPerSecond(), 1.0 / kept + 1e-6, 1.0) &&
+              !value::growsIntoFreeRoom(retaken.takesPerSecond(), 1.0 / kept - 1e-6, 1.0),
+          "growth into free room does not ask its cycle of what the expected retake leaves it");
 }
 
 // A miss costs the store the host-step work one read more adds to a load,

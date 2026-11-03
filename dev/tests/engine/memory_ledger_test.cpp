@@ -2044,13 +2044,13 @@ void testTheStoreRegrowsBeforeTheWarningPassTakesItsCache() {
 // 100 GiB its ghosts span: 0.194 s) at the cycle of the M6's chunk (777
 // experts refilled at 0.1 ms and 51.4 ms of compaction: 0.129 s) gives a
 // long prompt that unit at 10 s. The take sets the rate at 2 a second times
-// 1 - e^(-0.5/60), 0.0166 a second, 0.0154 when the prompt ends at 15 s: a
-// retake within the horizon costs 1 - e^(-0.0154 x 60) = 0.60 cycles, more
-// than the 0.5 the unit gains beyond its cycle, and it does not displace
-// the prompt's copied KV. Idle, the rate is 0.0130 at 25 s (a retake 0.54
-// cycles), and the store is still short; 0.0101 at 40 s (0.46), by which it
-// has grown back. With the rate held over the idle time it would stay
-// short until the next command.
+// 1 - e^(-0.5/60), 0.0166 a second, 0.0154 when the prompt ends at 15 s:
+// should no claim take it back within the horizon the unit keeps e^(-0.0154
+// x 60) of its 1.5 cycles, 0.60 cycles, less than its cycle (amend/V.md A30),
+// and it does not displace the prompt's copied KV. Idle, the rate is 0.0130
+// at 25 s (0.69 cycles kept) and 0.0073 at 60 s (0.97), and the store is
+// still short; 0.0068 at 64.5 s (1.00), by which it grows back. With the
+// rate held over the idle time it would stay short until the next command.
 void testTheTakeRateDecaysWhileTheEngineIdles() {
   // 800 MiB of headroom once the engine holds 17 GiB.
   Fixture fixture(host(800 * kMiB + 17 * kGiB), 16 * kGiB);
@@ -2075,13 +2075,66 @@ void testTheTakeRateDecaysWhileTheEngineIdles() {
   fixture.memory.release("kv", 2 * kGiB);
   fixture.memory.hold("cache", 3 * kGiB);
   cache.units = {unit(2, kGiB, 0.0), unit(3, kGiB, 0.0), unit(4, kGiB, 0.0)};
-  for (double seconds = 15.5; seconds <= 25.0; seconds += 0.5)
+  for (double seconds = 15.5; seconds <= 60.0; seconds += 0.5)
     static_cast<void>(fixture.pass(seconds, false));
-  require(experts.units() == 3, "the store regrew while the take rate priced a retake above what the unit gains");
-  for (double seconds = 25.5; seconds <= 40.0; seconds += 0.5)
+  require(experts.units() == 3,
+          "the store regrew while what the unit saves, should no claim take it back, paid no cycle");
+  for (double seconds = 60.5; seconds <= 70.0; seconds += 0.5)
     static_cast<void>(fixture.pass(seconds, false));
   require(experts.units() == 4 && fixture.memory.total() == 16 * kGiB,
           "the store did not grow back as the take rate decayed over the idle time");
+}
+
+// A lane that prefills into a store unit it took and then decodes alone has
+// the store grow the unit back right after its prefill (owner rule 12;
+// amend/V.md A30's regrowth lower bound, owner 11-03 03:55): its claim is in
+// demand only while it prefills or shares the engine with another lane, and
+// the store's own rate after the one take keeps 0.60 of what the unit saves
+// over the horizon 40 s later. In the band, a store whose 1 GiB unit is worth
+// 2.5 cycles over the horizon in decode ghost hits (5380 a second at 0.1 ms
+// over the 100 GiB its ghosts span: 0.323 s) at the M6 chunk's cycle (0.129
+// s), the host 512 MiB past its margin, gives a long prompt that unit at 10
+// s, beside another lane that ends at
+// 20 s and leaves its KV as copied cache; the prompt prefills until 50 s (a
+// 30K-token prompt on the M6) and then decodes alone. The store is back by
+// displacing that cache within a pass of the prefill's end. Counted through
+// the decode at its own rate, 1/age, the claim would hold the unit short
+// until 75.5 s.
+void testAUnitAPrefillTookGrowsBackOnceItsLaneDecodesAlone() {
+  // 1.5 GiB of headroom once the engine holds 16 GiB, its limit: the host
+  // lacks nothing of its margin and admits no 1 GiB unit beside it.
+  Fixture fixture(host(1536 * kMiB + 16 * kGiB), 16 * kGiB);
+  FakeElasticPool experts("experts", fixture.memory, kGiB, 2, 4, 104, 4, 0.1, 51.4);
+  experts.keyBytes = 1382000;
+  TestSource cache("cache", &fixture.memory);
+  MemoryLedger &ledger = fixture.ledger();
+  ledger.addSource(cache);
+  ledger.addPool(experts);
+  serve(ledger, experts, 5380.0, 0.0, 10.0);
+  fixture.memory.hold("weights", 11 * kGiB);
+  fixture.memory.hold("kv", kGiB);
+  cache.units = {unit(1, kGiB, 9.0, true)};
+  const ClaimId prompt = ledger.open(request(1, RequestPriority::Normal, ClaimClass::InService, 60.0));
+  ledger.setInDemand(prompt, true);
+  require(fixture.allocateFreeing(prompt, kGiB) && experts.units() == 3 && cache.taken.empty(),
+          "the prompt did not take a store unit");
+  std::optional<double> regrown;
+  for (double seconds = 10.5; seconds <= 150.0; seconds += 0.5) {
+    experts.served(0, 2690, 0, 0);
+    if (seconds == 20.0) {
+      // The other lane ends: its KV, copied, is cache.
+      fixture.memory.release("kv", kGiB);
+      fixture.memory.hold("cache", kGiB);
+      cache.units = {unit(2, kGiB, 0.0)};
+    }
+    ledger.setInDemand(prompt, seconds < 50.0);
+    static_cast<void>(fixture.pass(seconds));
+    if (!regrown && experts.units() == 4)
+      regrown = seconds;
+  }
+  require(regrown && *regrown >= 50.0 && *regrown <= 50.5 && experts.units() == 4,
+          "the store did not grow the unit back within a pass of the prefill's end, or did not keep it: " +
+              (regrown ? "grew at " + std::to_string(*regrown) + " s" : std::string("never grew")));
 }
 
 // A pool's growth waits on nothing but its own victims (R3, amend/M.md B4):
@@ -2756,14 +2809,15 @@ void testGrowthLeavesTheHostWhatTheLanesGrowInto() {
 // 110.5 s every request ends, its extents copied cache, and the engine
 // idles for two minutes: the store, short of its cap, is back at it within
 // a pass a chunk (displacement grows one unit a pass, AMENDMENTS X19) and
-// keeps it (owner rule 12: the experts regrow right after). Open for the
-// owner (amend/V.md A30's zero against amend/M.md B4): by B4's rule, with
-// the displacement's retake term, the store regrows the 146 MiB chunk at 14
-// s, at a take rate of 0.03 a second (0.025 s x 0.85 of retake against
-// 0.42 s), which request 4 takes back at 27 s, and a chunk at 36 s, taken
-// back at 46 and 65 s; matrix.py's store churn counts each shrink within
-// kValueHorizonSeconds of the last grow. The failure message lists them.
-void testThe35BPressurePatternRegrowsOnceItsRequestsEnd() {
+// keeps it (owner rule 12: the experts regrow right after). No unit the
+// store regrows goes back within kValueHorizonSeconds of a regrowth
+// (amend/V.md A30, owner 11-03 03:55; matrix.py's store churn counts each
+// shrink within the horizon of the last grow): B4's rule, with the
+// displacement's retake term, regrew the 146 MiB chunk at 14 s, at a take
+// rate of 0.03 a second (0.025 s x 0.85 of retake against 0.42 s), which
+// request 4 took back at 27 s, and a chunk at 36 s, taken back at 46 and 65
+// s. The failure message lists them.
+void testThe35BPressurePatternTakesNoRegrownUnitBack() {
   constexpr uint64_t kExtent = 85196800;
   constexpr uint64_t kLimit = 19327352832;
   // The M5 Pro's host keeps tens of GB to spare: only the limit binds.
@@ -2784,7 +2838,16 @@ void testThe35BPressurePatternRegrowsOnceItsRequestsEnd() {
   ledger.setRates({.weightReadSecondsPerByte = 1.65e-10});
   std::map<uint64_t, ClaimId> lanes;
   std::map<uint64_t, uint32_t> extents;
-  const auto start = [&](uint64_t id) { lanes[id] = ledger.open(request(id, RequestPriority::Normal, ClaimClass::InService, 30.0)); };
+  // When each lane's prefill ends, by the first tokens the server log's
+  // TTFTs put 7.5, 24.5, 16.5, 41.5 and 60 s after Ready for requests 1-5,
+  // and 26 s after its start for each later one (the recorded 30K-token
+  // turns' 26.0 and 26.1 s): a claim is in demand while its lane prefills or
+  // another lane is in service (Engine::syncClaims).
+  std::map<uint64_t, double> prefills{{1, 7.5}, {2, 24.5}, {3, 16.5}, {4, 41.5}, {5, 60.0}};
+  const auto start = [&](uint64_t id) {
+    lanes[id] = ledger.open(request(id, RequestPriority::Normal, ClaimClass::InService, 30.0));
+    ledger.setInDemand(lanes[id], true);
+  };
   const auto grow = [&](uint64_t id) {
     require(fixture.allocateFreeing(lanes.at(id), kExtent), "request " + std::to_string(id) + " was refused its extent");
     ++extents[id];
@@ -2804,6 +2867,7 @@ void testThe35BPressurePatternRegrowsOnceItsRequestsEnd() {
   for (const uint64_t id : {1, 2, 3})
     start(id);
   std::optional<double> regrown;
+  uint64_t retaken = 0;
   std::string history;
   uint64_t before = store.currentBytes();
   const auto note = [&](double seconds) {
@@ -2812,6 +2876,7 @@ void testThe35BPressurePatternRegrowsOnceItsRequestsEnd() {
       regrown = seconds;
       history += " regrew at " + std::to_string(seconds) + " s;";
     } else if (after < before && regrown && seconds - *regrown <= kValueHorizonSeconds) {
+      ++retaken;
       history += " took back at " + std::to_string(seconds) + " s;";
     }
     before = after;
@@ -2855,10 +2920,13 @@ void testThe35BPressurePatternRegrowsOnceItsRequestsEnd() {
       const uint64_t id = lanes.begin()->first;
       if (step % 30 == 20 && lanes.size() > 1) {
         end(id);
+        prefills[10 + step] = seconds + 26.0;
         start(10 + step);
       }
       grow(lanes.rbegin()->first);
     }
+    for (const auto &[id, claim] : lanes)
+      ledger.setInDemand(claim, seconds < prefills.at(id) || lanes.size() > 1);
     note(seconds);
     static_cast<void>(fixture.pass(seconds));
     note(seconds);
@@ -2877,6 +2945,8 @@ void testThe35BPressurePatternRegrowsOnceItsRequestsEnd() {
     if (!capped && store.currentBytes() == cap)
       capped = seconds;
   }
+  require(retaken == 0, "the store took back " + std::to_string(retaken) +
+                            " units within the horizon of a regrowth:" + history);
   require(capped && *capped <= kEnded + 2 * 0.5 && store.currentBytes() == cap,
           "the store did not grow back to its cap within a pass a chunk of its requests' end at " +
               std::to_string(kEnded) + " s, or did not keep it:" + history);
@@ -3069,6 +3139,8 @@ std::span<const test::TestCase> ledgerTests() {
       {"testStoreRegrowsByDisplacementInTheBand", testStoreRegrowsByDisplacementInTheBand},
       {"testTheStoreRegrowsBeforeTheWarningPassTakesItsCache", testTheStoreRegrowsBeforeTheWarningPassTakesItsCache},
       {"testTheTakeRateDecaysWhileTheEngineIdles", testTheTakeRateDecaysWhileTheEngineIdles},
+      {"testAUnitAPrefillTookGrowsBackOnceItsLaneDecodesAlone",
+       testAUnitAPrefillTookGrowsBackOnceItsLaneDecodesAlone},
       {"testGrowthPendsOnlyOnItsOwnVictims", testGrowthPendsOnlyOnItsOwnVictims},
       {"testDisplacementTakesNothingItCannotGrowInto", testDisplacementTakesNothingItCannotGrowInto},
       {"testAClaimLacksTheRoomHeldAboveIt", testAClaimLacksTheRoomHeldAboveIt},
@@ -3093,7 +3165,7 @@ std::span<const test::TestCase> ledgerTests() {
       {"testDisplacementPaysForItsExpectedRetake", testDisplacementPaysForItsExpectedRetake},
       {"testGrowthCountsWhatTheHostDoesNotShowYet", testGrowthCountsWhatTheHostDoesNotShowYet},
       {"testGrowthLeavesTheHostWhatTheLanesGrowInto", testGrowthLeavesTheHostWhatTheLanesGrowInto},
-      {"testThe35BPressurePatternRegrowsOnceItsRequestsEnd", testThe35BPressurePatternRegrowsOnceItsRequestsEnd},
+      {"testThe35BPressurePatternTakesNoRegrownUnitBack", testThe35BPressurePatternTakesNoRegrownUnitBack},
       {"testTheM6HostPatternTakesNoRegrownUnitBack", testTheM6HostPatternTakesNoRegrownUnitBack},
       {"testAClaimPaysForAPoolUnitsRelease", testAClaimPaysForAPoolUnitsRelease},
       {"testABytesNeedBesideBuffersNoStateGivesFreesTheirBytes",

@@ -451,7 +451,8 @@ void growsAsAPool(MetalBackend &backend) {
   rate.observe({}, 0, 0.0, true);
   rate.observe(value, 2, engine::kValueHorizonSeconds, true);
   const double benefit = engine::value::growthBenefit(rate, value, extent, 0, {});
-  require(benefit > 0.0 && !engine::value::growsIntoFreeRoom(rate, benefit, engine::value::cycleSeconds(value, extent)),
+  require(benefit > 0.0 && !engine::value::growsIntoFreeRoom(rate.takesPerSecond(), benefit,
+                                                              engine::value::cycleSeconds(value, extent)),
           "an extent claims kept taking back grew into free room though its refill cost more than it saved");
   // Above the floor an extent at a time, counted.
   require(static_cast<bool>(pool.grow(test::admitAll)) && static_cast<bool>(pool.grow(test::admitAll)) &&

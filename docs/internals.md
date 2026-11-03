@@ -1237,10 +1237,16 @@ service. A claim nothing meets waits for what is landing, or falls short.
 Between commands the control pass gives the host's claim what macOS's warning
 asks, up to the margin and cache only while the host lacks nothing past it,
 what the band lacks, or under critical pressure everything above the floors;
-then it grows the pools into the free room while each unit is worth its
-expected retake, or by displacing cheaper cache once a pass (`/status`:
-`memory_governor.accounts`, `claims` and `owed`; `growth_allowed` is false
-while the host refuses growth). A temporary SSD cache copies ahead only on
+then it grows the pools into the free room while a unit, should no claim
+take it back within the minute ahead, saves more than its cycle costs, or by
+displacing cheaper cache once a pass (`/status`: `memory_governor.accounts`,
+`claims` and `owed`; `growth_allowed` is false while the host refuses
+growth). Claims take a pool's units at its measured rate, which falls over
+idle time too, or, while a request that took them prefills or shares the
+engine with another, at that request's own rate since it began, whichever is
+higher: a store chunk a long prompt took comes back right after the prompt
+when it decodes alone, and not while other requests keep taking chunks. A
+temporary SSD cache copies ahead only on
 demand, while a recent claim reached cache a copy would have let go at once,
 and only until the uncopied units at the head of the order hold about twice
 what the next claim needs ([disk tier](#disk-tier)). A start

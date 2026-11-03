@@ -1104,7 +1104,10 @@ private:
   // whatever its retries find (ResourceWait::holdEnded); a wait for the SSD
   // cache's quota is no memory claim. One whose latest refusal was the
   // host's, retried within its deadline, counts in the host's deficit
-  // (MemoryLedger::setHostRefusedWaiting).
+  // (MemoryLedger::setHostRefusedWaiting). A lane that prefills, or is in
+  // service beside another, marks its claim in demand
+  // (MemoryLedger::setInDemand): the pool units it took count in the rate
+  // claims take them at.
   void syncClaims(double nowMilliseconds);
   // What copies ahead are worth now (WriteBehind::run): none unless a
   // recent free() reached cache a copy would have let go at once

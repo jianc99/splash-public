@@ -244,6 +244,11 @@ void Engine::syncClaims(double now) {
   MemoryLedger &ledger = governor().ledger();
   const std::optional<RequestPriority> tier = suspendedTier();
   const bool draining = drainingForRecovery();
+  const auto inService = [&](const Request &active) {
+    const Phase phase = scheduler_.phase(active.request.id);
+    return active.lane && (phase == Phase::Prefill || phase == Phase::Decode);
+  };
+  const auto lanes = std::ranges::count_if(requests_, [&](const auto &entry) { return inService(entry.second); });
   for (auto &[_, active] : requests_) {
     if (!active.claim.id)
       continue;
@@ -262,6 +267,8 @@ void Engine::syncClaims(double now) {
                              wait.allocationFailure == metal::AllocationFailure::HostPressure && retried &&
                              (deadline <= 0.0 || now < deadline);
     ledger.setHostRefusedWaiting(active.claim.id, hostRefused);
+    ledger.setInDemand(active.claim.id,
+                       inService(active) && (scheduler_.phase(active.request.id) == Phase::Prefill || lanes > 1));
     // A lane that sent tokens waits in its next decode gap.
     active.gapSince.claimWaited =
         active.gapSince.claimWaited || ((waiting || hostRefused) && active.lastTokenMilliseconds);

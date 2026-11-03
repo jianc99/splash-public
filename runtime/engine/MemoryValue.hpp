@@ -17,11 +17,14 @@ namespace splash::engine::value {
 // bytes its ghosts span, and of the units claims take from it per second.
 // Only intervals in which the engine ran a command update the value rates
 // (an idle interval says nothing of demand); the first such interval sets
-// them. The take rate counts every interval, the first setting it: one in
-// which no command ran took what claims took in it, none while the engine
-// idled, so that the rate a burst of takes left decays over the idle time
-// after it as it does over commands that take nothing (amend/M.md B4: the
-// units claims take per second). They outlive the pool's own resets: an
+// them. The take rate counts every interval, from none taken before the
+// first: one in which no command ran took what claims took in it, none while
+// the engine idled, so that the rate a burst of takes left decays over the
+// idle time after it as it does over commands that take nothing (amend/M.md
+// B4: the units claims take per second). One interval's takes are no rate: a
+// unit taken in the first, half a second, would set it at two a second, which
+// holds a unit worth twenty cycles short for nearly four minutes (amend/V.md
+// A30's regrowth test). They outlive the pool's own resets: an
 // idle release and restore clear its ghosts but not these.
 class PoolRate final {
 public:
@@ -36,7 +39,7 @@ public:
         rate += weight * (double(after - before) / seconds - rate);
       };
       double takes = takes_.value_or(0.0);
-      mix(takes, takes_ ? 1.0 - decay : 1.0, now.taken, last_->taken);
+      mix(takes, 1.0 - decay, now.taken, last_->taken);
       takes_ = takes;
       if (commandsRan) {
         const double weight = rates_ ? 1.0 - decay : 1.0;
@@ -164,17 +167,19 @@ struct MarginalCost final {
                                           uint64_t missingBytes, const MemoryRates &rates) noexcept {
   return poolUnit(rate, value, unitBytes, missingBytes, kValueHorizonSeconds, rates).at(kValueHorizonSeconds);
 }
-// What a unit grown back is expected to cost in its being taken back within
-// the horizon: claims that take the pool's units at the measured rate take
-// one within it with probability 1 - exp(-rate * horizon) (Poisson), each
-// time costing its cycle.
-[[nodiscard]] inline double retakeSeconds(const PoolRate &rate, double cycle) noexcept {
-  return cycle * (1.0 - std::exp(-rate.takesPerSecond() * kValueHorizonSeconds));
+// What growing a pool's unit back gains: what it saves over the horizon if
+// no claim takes it back within it, beyond its cycle, which it costs either
+// way. Claims that take the pool's units at `takesPerSecond` take one within
+// the horizon with probability 1 - exp(-rate * horizon) (Poisson), and a
+// unit taken back within it is churn, whatever it saved meanwhile (amend/V.md
+// A30: none may be; owner 11-03 03:55).
+[[nodiscard]] inline double regrowthSeconds(double benefitSeconds, double cycle, double takesPerSecond) noexcept {
+  return benefitSeconds * std::exp(-takesPerSecond * kValueHorizonSeconds) - cycle;
 }
-// Whether a unit grown into free room pays for being taken back within the
-// horizon. A pool no claim has taken from grows unconditionally.
-[[nodiscard]] inline bool growsIntoFreeRoom(const PoolRate &rate, double benefitSeconds, double cycle) noexcept {
-  return rate.takesPerSecond() == 0.0 || benefitSeconds >= retakeSeconds(rate, cycle);
+// Whether a unit grows into free room: a pool no claim has taken from
+// unconditionally, any other while its regrowth gains.
+[[nodiscard]] inline bool growsIntoFreeRoom(double takesPerSecond, double benefitSeconds, double cycle) noexcept {
+  return takesPerSecond == 0.0 || regrowthSeconds(benefitSeconds, cycle, takesPerSecond) >= 0.0;
 }
 // A cache unit: its tokens computed again, or its copy read back, as often
 // as it is reused.
