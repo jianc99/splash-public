@@ -1,8 +1,7 @@
 // The rules every command keeps (model::commandViolation), the attention
 // pairs a command's rows compute (model::attentionPairs), the work a model
-// reports by default (Model::prefillWork), the experts a load routes
-// (model::expectedDistinctExperts) and the sample a ticket gives by default
-// (ModelBatchTicket::sample).
+// reports by default (Model::prefillWork) and the experts a load routes
+// (model::expectedDistinctExperts).
 
 #include "TestChecks.hpp"
 #include "model/Model.hpp"
@@ -268,25 +267,6 @@ void testALoadRoutesFromTopKToEveryExpert() {
           "a chunk did not route nearly every expert");
 }
 
-// A ticket that reports only the times every ticket reports.
-class TimedTicket final : public ModelBatchTicket {
-public:
-  bool ready() const noexcept override { return true; }
-  std::vector<ModelStepResult> wait() override { return {}; }
-  double wallMilliseconds() const noexcept override { return 12.5; }
-  double hostMilliseconds() const noexcept override { return 5.0; }
-  double imageEncodeMilliseconds() const noexcept override { return 2.0; }
-  bool prefillTimingIsRepresentative() const noexcept override { return false; }
-};
-
-void testTheDefaultSampleIsTheTicketsTimes() {
-  const model::CommandSample sample = TimedTicket().sample();
-  require(sample.work == model::CommandWork{} && sample.wallMilliseconds == 12.5 &&
-              sample.spilledKvReadMilliseconds == 0.0 && sample.imageEncodeMilliseconds == 2.0 &&
-              !sample.representative,
-          "the default sample is not the ticket's times with no work");
-}
-
 } // namespace
 
 int main() {
@@ -305,7 +285,6 @@ int main() {
     testABlockSparseLayerSaturatesAtTheSelectionAndTail();
     testTheDefaultLayerPairsIgnoreThePass();
     testALoadRoutesFromTopKToEveryExpert();
-    testTheDefaultSampleIsTheTicketsTimes();
     std::cout << "model boundary tests passed\n";
     return EXIT_SUCCESS;
   } catch (const std::exception &error) {

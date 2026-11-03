@@ -58,8 +58,8 @@ struct KvHistoryStream::Impl {
   };
   // A command's stream, from begin() to end(): the attention layers it runs,
   // the pages the command reads, before commandPages, of which `pages` hold
-  // only their index (in order), the pool's table and layers, each layer's
-  // reads, and how long its host steps waited.
+  // only their index (in order), the pool's table and layers, and each
+  // layer's reads.
   struct Run final {
     uint64_t serial = 0;
     bool active = false;
@@ -69,7 +69,6 @@ struct KvHistoryStream::Impl {
     metal::MetalBuffer poolTable;
     std::vector<SplashKvLayer> poolLayers;
     std::vector<LayerReads> layers;
-    double waitMilliseconds = 0.0;
   };
 
   Impl(metal::MetalBackend &backend, metal::AllocationAdmission admission, const kv::Layout &layout,
@@ -188,7 +187,6 @@ void KvHistoryStream::Impl::finish(uint64_t serial, uint32_t layer) {
   const double waited = millisecondsSince(began);
   const std::lock_guard lock(mutex);
   if (!run.active || run.serial != serial) return;
-  run.waitMilliseconds += waited;
   waits.add(static_cast<uint64_t>(waited * 1e6));
 }
 
@@ -288,8 +286,7 @@ void KvHistoryStream::begin(const KvPageSources &sources, uint32_t commandPages,
               .pages = std::move(pages),
               .poolTable = poolTable,
               .poolLayers = {poolLayers.begin(), poolLayers.end()},
-              .layers = std::vector<Impl::LayerReads>(poolLayers.size()),
-              .waitMilliseconds = 0.0};
+              .layers = std::vector<Impl::LayerReads>(poolLayers.size())};
   impl.startLocked(layers.first);
 }
 
@@ -345,7 +342,7 @@ KvStreamResult KvHistoryStream::end() {
   Impl::Run &run = impl.run;
   if (!run.active) return {};
   impl.drainLocked();
-  KvStreamResult result{.failures = {}, .streamMilliseconds = run.waitMilliseconds};
+  KvStreamResult result;
   std::vector<uint64_t> unreadable;
   for (const Impl::LayerReads &reads : run.layers) {
     if (!reads.batch) continue;

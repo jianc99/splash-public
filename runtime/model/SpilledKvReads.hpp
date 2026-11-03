@@ -74,12 +74,9 @@ public:
   // could not read; merges its resolves' counts into the cache's.
   void end();
   // What end() kept of every run: the blocks the command's reads could not
-  // read, each with the command's lane that needed it, the time its GPU
-  // work waited on its history's reads (ModelBatchTicket::streamMilliseconds)
-  // and the bytes they brought (a decode's resolves count theirs in the
-  // cache's statistics).
+  // read, each with the command's lane that needed it, and the bytes they
+  // brought (a decode's resolves count theirs in the cache's statistics).
   [[nodiscard]] std::span<const KvReadFailure> failures() const noexcept { return failures_; }
-  [[nodiscard]] double streamMilliseconds() const noexcept { return streamMilliseconds_; }
   [[nodiscard]] uint64_t readBytes() const noexcept { return readBytes_; }
 
 private:
@@ -103,7 +100,6 @@ private:
   std::optional<uint32_t> stagedLayer_;
   PrefillKv staged_;
   std::vector<KvReadFailure> failures_;
-  double streamMilliseconds_ = 0.0;
   uint64_t readBytes_ = 0;
 };
 

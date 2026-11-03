@@ -135,11 +135,9 @@ public:
     Completion completion = std::move(completion_);
     std::vector<ModelStepResult> results = completion(timing);
     wallMilliseconds_ = timing.wallSeconds * 1000.0;
-    hostMilliseconds_ = timing.hostSeconds * 1000.0;
     uint64_t spilledKvReadBytes = 0;
     if (reads_) {
       const std::shared_ptr<const SpilledKvReads> reads = std::exchange(reads_, {});
-      streamMilliseconds_ = reads->streamMilliseconds();
       spilledKvReadBytes = reads->readBytes();
     }
     work_ = count_.realized(spilledKvReadBytes);
@@ -151,15 +149,6 @@ public:
     return results;
   }
 
-  double wallMilliseconds() const noexcept override {
-    return wallMilliseconds_;
-  }
-  double hostMilliseconds() const noexcept override { return hostMilliseconds_; }
-  double streamMilliseconds() const noexcept override { return streamMilliseconds_; }
-  double imageEncodeMilliseconds() const noexcept override { return imageEncodeMilliseconds_; }
-  bool prefillTimingIsRepresentative() const noexcept override {
-    return representativePrefillTiming_;
-  }
   CommandSample sample() const noexcept override {
     return {.work = work_,
             .wallMilliseconds = wallMilliseconds_,
@@ -190,8 +179,6 @@ private:
   CommandTicket ticket_;
   CommandTiming encodes_;
   double wallMilliseconds_ = 0.0;
-  double hostMilliseconds_ = 0.0;
-  double streamMilliseconds_ = 0.0;
   double spilledKvReadMilliseconds_ = 0.0;
   double imageEncodeMilliseconds_ = 0.0;
   bool representativePrefillTiming_ = true;
@@ -2791,12 +2778,9 @@ struct Runtime::Impl {
       return results;
     }
 
-    double wallMilliseconds() const noexcept override {
-      return timing_.wallSeconds * 1000.0;
-    }
     CommandSample sample() const noexcept override {
       return {.work = work_,
-              .wallMilliseconds = wallMilliseconds(),
+              .wallMilliseconds = timing_.wallSeconds * 1000.0,
               .spilledKvReadMilliseconds = spilledKvReadMilliseconds_};
     }
 
@@ -3672,7 +3656,7 @@ WarmupStepResult Runtime::warmupPrefill(uint32_t rows) {
   if (!rows || rows > kPrefillRows)
     throw std::invalid_argument("invalid prefill warmup row count");
   constexpr uint64_t id = std::numeric_limits<uint64_t>::max() - 100;
-  double wallSeconds = 0.0, hostSeconds = 0.0;
+  double wallSeconds = 0.0;
   CommandSample sample;
   std::vector<WarmupLaneResult> lanes;
   std::vector<uint32_t> warmupPrompt(rows, 0);
@@ -3694,7 +3678,6 @@ WarmupStepResult Runtime::warmupPrefill(uint32_t rows) {
     const std::unique_ptr<ModelBatchTicket> ticket = prefillAsync(plan, std::span<const ModelBatchItem>(&item, 1), {});
     auto result = ticket->wait();
     wallSeconds = std::chrono::duration<double>(AwakeClock::now() - phaseStart).count();
-    hostSeconds = ticket->hostMilliseconds() / 1000.0;
     sample = ticket->sample();
     requireLanesSucceeded(result);
     if (result.size() != 1 || result[0].consumedPromptTokens != rows) {
@@ -3709,7 +3692,7 @@ WarmupStepResult Runtime::warmupPrefill(uint32_t rows) {
   }
   return {"real " + std::to_string(rows) +
               "-row KV target+draft prefill [M32]",
-          wallSeconds, std::move(lanes), hostSeconds, sample};
+          wallSeconds, std::move(lanes), sample};
 }
 
 WarmupStepResult Runtime::warmupDecodeBatch(uint32_t width) {

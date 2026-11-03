@@ -590,8 +590,8 @@ ModelStepResult prefillChunk(model::Runtime &executor, uint64_t requestId,
   auto result = ticket->wait();
   if (images) {
     require(BackendInstrumentation::submittedCommands(images->backend) - commands == (images->encodes ? 2u : 1u) &&
-                (ticket->imageEncodeMilliseconds() > 0.0) == images->encodes &&
-                ticket->prefillTimingIsRepresentative(),
+                (ticket->sample().imageEncodeMilliseconds > 0.0) == images->encodes &&
+                ticket->sample().representative,
             "a chunk's image encodes did not run as a command of their own ahead of it");
   }
   require(result.size() == 1 && result[0].consumedPromptTokens == tokenCount,
@@ -3688,8 +3688,7 @@ public:
   // one model::SpilledKvReads, each attention layer staged with the
   // command's pages and handed off, the copy of its last spilled page
   // unreadable in the first run alone. The reads stream it again once they
-  // ended, and keep what the first run could not read and the time both
-  // waited.
+  // ended, and keep what the first run could not read.
   void requireReadsRunAgain(SpillRequest &request, uint32_t end) {
     ensure(request, end);
     const model::ModelMemoryAdmission staging = runtime_->reserveHistoryStaging(request.id, pagesFor(end));
@@ -3701,7 +3700,6 @@ public:
     model::SpilledKvReads reads(stream_, 0, pageSources(request), endPage, tables_[0], kv_.layers(),
                                 {0, layout_.attentionLayers});
     const uint64_t commands = stream_.stats().commands;
-    double waited = 0.0;
     request.copies[unreadable]->failAll = true;
     for (uint32_t run = 0; run < 2; ++run) {
       metal::CommandGraph graph;
@@ -3714,10 +3712,8 @@ public:
       reads.end();
       request.copies[unreadable]->failAll = false;
       require(reads.failures().size() == 1 && reads.failures().front().lane == 0 &&
-                  reads.failures().front().block == request.sources[unreadable].block &&
-                  reads.streamMilliseconds() >= waited,
-              "a prefill's reads streamed again did not keep what they could not read and the time they waited");
-      waited = reads.streamMilliseconds();
+                  reads.failures().front().block == request.sources[unreadable].block,
+              "a prefill's reads streamed again did not keep what they could not read");
     }
     require(stream_.stats().commands == commands + 2, "a prefill's reads did not stream its history again");
   }

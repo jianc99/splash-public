@@ -109,8 +109,8 @@ public:
   void addLayerEnd(metal::CommandGraph &graph, uint32_t layer);
   // Once the command completed, failed or was abandoned: cancels and drains
   // every batch it started, and returns the blocks it could not read, each
-  // for lane 0 (the stream's one sequence, which the caller names), the
-  // time the command waited on its reads and the bytes they brought.
+  // for lane 0 (the stream's one sequence, which the caller names), and the
+  // bytes they brought.
   // Nothing more for a command it already ended.
   [[nodiscard]] KvStreamResult end();
 

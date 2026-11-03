@@ -211,7 +211,7 @@ public:
       throw std::logic_error("mask-overlap ticket completed without input");
     return std::move(results_);
   }
-  double wallMilliseconds() const noexcept override { return 1.0; }
+  model::CommandSample sample() const noexcept override { return {.wallMilliseconds = 1.0}; }
 
 private:
   std::shared_ptr<MaskOverlapState> state_;

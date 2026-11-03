@@ -36,15 +36,6 @@ public:
   [[nodiscard]] std::vector<ModelStepResult> wait() override {
     return std::move(results_);
   }
-  [[nodiscard]] double wallMilliseconds() const noexcept override {
-    return times_.wallMilliseconds;
-  }
-  [[nodiscard]] double hostMilliseconds() const noexcept override {
-    return times_.hostMilliseconds;
-  }
-  [[nodiscard]] double streamMilliseconds() const noexcept override {
-    return times_.streamMilliseconds;
-  }
   [[nodiscard]] model::CommandSample sample() const noexcept override { return sampleOf(times_); }
 
 private:
@@ -65,9 +56,6 @@ public:
       throw std::logic_error("a timed command completed before its end");
     return std::move(results_);
   }
-  [[nodiscard]] double wallMilliseconds() const noexcept override { return times_.wallMilliseconds; }
-  [[nodiscard]] double hostMilliseconds() const noexcept override { return times_.hostMilliseconds; }
-  [[nodiscard]] double streamMilliseconds() const noexcept override { return times_.streamMilliseconds; }
   [[nodiscard]] model::CommandSample sample() const noexcept override { return sampleOf(times_); }
 
 private:
@@ -90,8 +78,8 @@ public:
   [[nodiscard]] std::vector<ModelStepResult> wait() override {
     return std::move(results_);
   }
-  [[nodiscard]] double wallMilliseconds() const noexcept override {
-    return wallMilliseconds_;
+  [[nodiscard]] model::CommandSample sample() const noexcept override {
+    return {.wallMilliseconds = wallMilliseconds_};
   }
 
 private:
@@ -116,7 +104,7 @@ public:
       throw std::logic_error("a staged ticket completed before its second command ran");
     return std::move(results_);
   }
-  [[nodiscard]] double wallMilliseconds() const noexcept override { return 1.0; }
+  [[nodiscard]] model::CommandSample sample() const noexcept override { return {.wallMilliseconds = 1.0}; }
 
 private:
   std::vector<ModelStepResult> results_;

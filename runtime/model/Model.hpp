@@ -453,31 +453,8 @@ public:
   // yet; one that waits for the engine's input, such as a mask, must have
   // been.
   [[nodiscard]] virtual std::vector<ModelStepResult> wait() = 0;
-  [[nodiscard]] virtual double wallMilliseconds() const noexcept = 0;
-  // Of wallMilliseconds, the time the command's GPU work waited on its host
-  // steps: a streamed target's expert reads, which a prefill command pays
-  // about whole whatever its rows.
-  [[nodiscard]] virtual double hostMilliseconds() const noexcept { return 0.0; }
-  // Of hostMilliseconds, the time it waited on the reads of its history's
-  // spilled K/V (model::KvHistoryStream), which bound a streamed prefill
-  // command's length whatever its rows.
-  [[nodiscard]] virtual double streamMilliseconds() const noexcept { return 0.0; }
-  // Of wallMilliseconds, the time of the command of image encodes that ran
-  // ahead of a prefill command (Runtime::prefillAsync), which the prefill
-  // throughput estimate leaves out.
-  [[nodiscard]] virtual double imageEncodeMilliseconds() const noexcept { return 0.0; }
-  // Fixed auxiliary work remains in wall latency but must not train the
-  // text-prefill throughput estimate.
-  [[nodiscard]] virtual bool prefillTimingIsRepresentative() const noexcept {
-    return true;
-  }
-  // What the command did and how long it took, valid once wait() returned:
-  // by default the times above, with no work counted.
-  [[nodiscard]] virtual model::CommandSample sample() const noexcept {
-    return {.wallMilliseconds = wallMilliseconds(),
-            .imageEncodeMilliseconds = imageEncodeMilliseconds(),
-            .representative = prefillTimingIsRepresentative()};
-  }
+  // What the command did and how long it took, valid once wait() returned.
+  [[nodiscard]] virtual model::CommandSample sample() const noexcept = 0;
 };
 
 namespace model {
@@ -777,11 +754,8 @@ struct WarmupStepResult final {
   double wallSeconds = 0.0;
   // Those two warmups return one observation per lane in batch-plan order.
   std::vector<WarmupLaneResult> lanes;
-  // For prefill warmup, of wallSeconds the time its GPU work waited on host
-  // steps (ModelBatchTicket::hostMilliseconds).
-  double hostSeconds = 0.0;
-  // A warmup command's sample (ModelBatchTicket::sample). No warmup fills
-  // it: it stays empty.
+  // The prefill warmup's command's sample (ModelBatchTicket::sample); the
+  // other warmups leave it empty.
   CommandSample sample{};
 };
 

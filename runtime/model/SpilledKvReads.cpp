@@ -73,7 +73,6 @@ void SpilledKvReads::end() {
   }
   const KvStreamResult result = stream_->end();
   for (const KvReadFailure &failure : result.failures) failures_.push_back({sequence_, failure.block});
-  streamMilliseconds_ += result.streamMilliseconds;
   readBytes_ += result.readBytes;
   stagedLayer_.reset();
 }
