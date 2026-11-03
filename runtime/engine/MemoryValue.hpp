@@ -116,20 +116,25 @@ private:
     cost.ratePerSecond += rate.scanReadBytesPerSecond() * rates.weightReadSecondsPerByte * unit / double(missingBytes);
   return cost;
 }
-// A pool's unit at the margin (AMENDMENTS Borrowed 1; research/SUMMARY.md
-// R1): one unit more saves a miss per ghost hit within the newest unit's
-// worth of ghosts, one unit less costs a miss per hit on what the pool gives
-// up first, both per second while the rates hold. The counters' window is
-// one unit, so the unit carries all of each. Reported beside poolUnit's
-// uniform spread, which the rule keeps as its input.
+// A pool's unit of `unitBytes` at the margin (AMENDMENTS Borrowed 1;
+// research/SUMMARY.md R1 (b)): one unit more saves a miss per ghost hit
+// among the newest ghosts, one unit less costs a miss per hit on what the
+// pool gives up first, both per second while the rates hold, each the
+// unit's share of the bytes the counters count in (PoolValue::marginBytes),
+// capped at them. Reported beside poolUnit's uniform spread, which the rule
+// keeps as its input.
 struct MarginalCost final {
   double growRatePerSecond = 0.0;
   double shrinkRatePerSecond = 0.0;
 };
-[[nodiscard]] inline MarginalCost marginal(const PoolRate &rate, const model::PoolValue &value) noexcept {
-  const double missSeconds = value.missMilliseconds / 1000.0;
-  return {.growRatePerSecond = rate.nearGhostHitsPerSecond() * missSeconds,
-          .shrinkRatePerSecond = rate.tailHitsPerSecond() * missSeconds};
+[[nodiscard]] inline MarginalCost marginal(const PoolRate &rate, const model::PoolValue &value,
+                                           uint64_t unitBytes) noexcept {
+  if (!value.marginBytes)
+    return {};
+  const double share =
+      double(std::min(unitBytes, value.marginBytes)) / double(value.marginBytes) * value.missMilliseconds / 1000.0;
+  return {.growRatePerSecond = rate.nearGhostHitsPerSecond() * share,
+          .shrinkRatePerSecond = rate.tailHitsPerSecond() * share};
 }
 // What growth that displaces other memory costs beyond what it takes: the
 // unit read back key by key once it comes back (PoolValue::keyBytes a miss;

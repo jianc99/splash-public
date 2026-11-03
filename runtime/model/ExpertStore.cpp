@@ -961,7 +961,7 @@ void ExpertStore::Impl::publish() {
       shrinking == kNoSlot ? 0 : sizes[shrinking].buffers[sizes[shrinking].chunks.liveChunks() - 1].sizeBytes();
   counters.growUnitBytes =
       growing == kNoSlot ? 0 : sizes[growing].buffers[sizes[growing].chunks.liveChunks()].sizeBytes();
-  counters.ghostHits = counters.ghostBytes = counters.nearGhostHits = counters.tailHits = 0;
+  counters.ghostHits = counters.ghostBytes = counters.nearGhostHits = counters.tailHits = counters.marginBytes = 0;
   for (const Size &size : sizes) {
     uint64_t slotBytes = 0;
     for (const ProjectionLayout &projection : size.layout)
@@ -970,6 +970,7 @@ void ExpertStore::Impl::publish() {
     counters.ghostBytes += size.recycling.ghosts() * slotBytes;
     counters.nearGhostHits += size.recycling.nearGhostHits();
     counters.tailHits += size.recycling.tailHits();
+    counters.marginBytes += uint64_t{size.recycling.margin()} * slotBytes;
   }
   const std::lock_guard lock(statsMutex);
   published = counters;

@@ -906,7 +906,7 @@ void MemoryLedger::fill(MemoryGovernorSnapshot &snapshot, uint64_t chargedBytes)
                                           missingBytes(state), kValueHorizonSeconds, rates_)
                               .at(kValueHorizonSeconds) *
                           kGiB / double(row.unitBytes);
-        const value::MarginalCost margin = value::marginal(account.rate, counters);
+        const value::MarginalCost margin = value::marginal(account.rate, counters, row.unitBytes);
         row.growValuePerGiB = margin.growRatePerSecond * kValueHorizonSeconds * kGiB / double(row.unitBytes);
         row.shrinkValuePerGiB = margin.shrinkRatePerSecond * kValueHorizonSeconds * kGiB / double(row.unitBytes);
       }

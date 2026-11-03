@@ -92,7 +92,8 @@ public:
             .keyBytes = slotBytes(stats),
             .scanReadBytes = prefill.readBytes,
             .nearGhostHits = stats.nearGhostHits,
-            .tailHits = stats.tailHits};
+            .tailHits = stats.tailHits,
+            .marginBytes = stats.marginBytes};
   }
   uint64_t release(uint64_t bytes) override {
     const ExpertStoreStats stats = store_.stats();

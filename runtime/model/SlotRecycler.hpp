@@ -86,6 +86,8 @@ public:
   // less would have given up first.
   [[nodiscard]] uint64_t nearGhostHits() const noexcept { return nearGhostHits_; }
   [[nodiscard]] uint64_t tailHits() const noexcept { return tailHits_; }
+  // The slots they count in.
+  [[nodiscard]] uint32_t margin() const noexcept { return margin_; }
 
 private:
   enum List : uint8_t { Free, Recent, Frequent };

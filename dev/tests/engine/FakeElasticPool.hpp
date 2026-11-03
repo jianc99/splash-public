@@ -55,7 +55,8 @@ public:
             .releasedBytes = releasedBytes_,
             .releaseMilliseconds = releaseMilliseconds_,
             .nearGhostHits = nearGhostHits,
-            .tailHits = tailHits};
+            .tailHits = tailHits,
+            .marginBytes = unitBytes_};
   }
   [[nodiscard]] uint64_t release(uint64_t bytes) override {
     const uint64_t above = units_ - floorUnits_;

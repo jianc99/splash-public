@@ -41,6 +41,8 @@ struct PoolValue final {
                                   // elastic chunk, SlotRecycler::nearGhostHits); 0 without ghosts
   uint64_t tailHits = 0;          // hits on what a pool smaller by one unit would have given up first (the
                                   // store: SlotRecycler::tailHits); 0 when it does not say
+  uint64_t marginBytes = 0;       // bytes nearGhostHits and tailHits count in (the store: an elastic chunk's
+                                  // slots of each streamed size); 0 without them
 };
 
 // A memory of the model's that follows the engine's memory. The model owns the mechanism; the engine alone

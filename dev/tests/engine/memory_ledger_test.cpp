@@ -126,7 +126,8 @@ public:
   }
   [[nodiscard]] model::PoolValue value() const override {
     return {.hits = hits, .missMilliseconds = missMilliseconds_, .keyBytes = keyBytes_,
-            .scanReadBytes = scanReadBytes};
+            .scanReadBytes = scanReadBytes, .nearGhostHits = nearGhostHits, .tailHits = tailHits,
+            .marginBytes = marginBytes};
   }
   [[nodiscard]] uint64_t release(uint64_t bytes) override {
     uint64_t released = 0;
@@ -146,6 +147,8 @@ public:
   }
 
   uint64_t hits = 0, scanReadBytes = 0;
+  // The marginal counts and the bytes they count in, an elastic chunk's.
+  uint64_t nearGhostHits = 0, tailHits = 0, marginBytes = 0;
 
 private:
   uint64_t floorBytes_;
@@ -944,6 +947,31 @@ void testTheMarginalPriceIsReportedBesideTheUniform() {
   require(fixture.ledger().free(claim, {.bytes = kGiB}, 0, false, false).outcome == FreeOutcome::Met &&
               experts.shrinks == 1 && cache.taken.empty(),
           "the rule priced the store's unit at its edge, not by the uniform spread");
+}
+
+// The marginal price of a unit is its share of the bytes the counts count
+// in. The store counts its near-ghost and tail hits in an elastic chunk's
+// slots, and at its cap gives back its last chunk first, the rest of its
+// slots (ExpertChunkLayout), as on the M6 a 117 MiB chunk beside 1023 MiB
+// ones (amend/M.md D2): per GiB, the remainder's price at the edge is the
+// chunk's, not the chunk's hits on fewer bytes.
+void testTheMarginalPriceIsTheUnitsShareOfItsCounts() {
+  Fixture fixture(host(32 * kGiB));
+  ListedPool experts(kGiB, {1023 * kMiB, 117 * kMiB}, 8 * kGiB, 16 * kMiB, 2.0);
+  experts.marginBytes = 1023 * kMiB;
+  fixture.ledger().addPool(experts);
+  for (double t = 0.0; t < 30.0; t += 0.5) {
+    experts.nearGhostHits += 5;
+    experts.tailHits += 5;
+    fixture.ledger().observePools(t + 0.5, true);
+  }
+  const MemoryAccountSnapshot account = fixture.governor->snapshot().accounts.back();
+  const double perGiB = 10 * 0.002 * kValueHorizonSeconds * double(kGiB) / double(1023 * kMiB);
+  require(account.unitBytes == 117 * kMiB && std::abs(account.shrinkValuePerGiB - perGiB) < 1e-6 * perGiB &&
+              std::abs(account.growValuePerGiB - perGiB) < 1e-6 * perGiB,
+          "a remainder's price at the edge was " + std::to_string(account.shrinkValuePerGiB) + " to shrink and " +
+              std::to_string(account.growValuePerGiB) + " to grow per GiB, not its share of the chunk's hits, " +
+              std::to_string(perGiB));
 }
 
 // free() takes the cheapest unit per byte across sources first.
@@ -2408,6 +2436,7 @@ std::span<const test::TestCase> ledgerTests() {
       {"testDeficitCountsHostRefusedClaimsNotAnIdleMargin", testDeficitCountsHostRefusedClaimsNotAnIdleMargin},
       {"testAHostRefusedStartIsAdmittedWithinTwoPasses", testAHostRefusedStartIsAdmittedWithinTwoPasses},
       {"testTheMarginalPriceIsReportedBesideTheUniform", testTheMarginalPriceIsReportedBesideTheUniform},
+      {"testTheMarginalPriceIsTheUnitsShareOfItsCounts", testTheMarginalPriceIsTheUnitsShareOfItsCounts},
       {"testCheapestPerByteFirstAcrossSources", testCheapestPerByteFirstAcrossSources},
       {"testAUnitLargerThanTheNeedCostsItsWholeCost", testAUnitLargerThanTheNeedCostsItsWholeCost},
       {"testSourceOrderIsKeptWithinASource", testSourceOrderIsKeptWithinASource},
