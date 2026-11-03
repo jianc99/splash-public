@@ -51,6 +51,19 @@ class RestartPolicyTests(unittest.TestCase):
         self.assertEqual(policy.after(served), 0.0)
         self.assertEqual(policy.after(failure), 5.0)
 
+    def test_the_backoff_stays_at_the_cap_however_long_failures_go_on(self):
+        """However long short-lived failures go on, the backoff stays at the
+        cap (from the 1026th in a row, at least 17 h of relaunches in, it no
+        longer fit a float, and the policy raised: the server relaunched with
+        no backoff, or never again)."""
+        policy = supervision.RestartPolicy()
+        failure = supervision.EngineFailure("engine_unhealthy", "crashed", 1.0)
+        delays = [policy.after(failure) for _ in range(2000)]
+        self.assertEqual(set(delays[5:]), {60.0})
+        served = supervision.EngineFailure("engine_unhealthy", "crashed", 60.0)
+        self.assertEqual(policy.after(served), 0.0)
+        self.assertEqual(policy.after(failure), 5.0)
+
     def test_only_a_failure_a_relaunch_would_meet_again_stops(self):
         for kind in (
             wire.StartFailureKind.CONFIGURATION,

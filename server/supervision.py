@@ -3,6 +3,7 @@ derived from the engine's supervision budgets (protocol.SUPERVISION, which
 runtime/Supervision.hpp owns), the restart policy, and the quarantine of
 requests that keep failing the engine."""
 
+import math
 import signal
 import threading
 from collections.abc import Callable
@@ -153,10 +154,11 @@ class RestartPolicy:
         self.streak += 1
         if self.streak == 1:
             return 0.0
-        return min(
-            self.thresholds.backoff_cap,
-            BACKOFF_BASE_SECONDS * 2 ** (self.streak - 2),
-        )
+        cap = self.thresholds.backoff_cap
+        # Doubled until it reaches the cap and no further: doubled on, it no
+        # longer fits a float from the 1026th failure in a row.
+        doublings = math.ceil(math.log2(cap / BACKOFF_BASE_SECONDS))
+        return min(cap, BACKOFF_BASE_SECONDS * 2 ** min(self.streak - 2, doublings))
 
 
 class Quarantine:
