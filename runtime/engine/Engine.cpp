@@ -1800,9 +1800,16 @@ Engine::Prepared Engine::yieldLane(Request &lane, uint64_t workEnd,
 }
 
 uint64_t Engine::completedTokens(const Request &active) const {
-  return scheduler_.phase(active.request.id) == Phase::Prefill
-             ? scheduler_.promptProcessed(active.request.id)
-             : active.exactTokens.size();
+  const uint64_t id = active.request.id;
+  switch (scheduler_.phase(id)) {
+  case Phase::Prefill:
+    return scheduler_.promptProcessed(id);
+  case Phase::Decode:
+  case Phase::WaitingMask:
+    return active.exactTokens.size();
+  default:
+    return active.admissionProbe ? active.admissionProbe->cachedTokens() : 0;
+  }
 }
 
 uint32_t Engine::generatedTokens(const Request &active) noexcept {

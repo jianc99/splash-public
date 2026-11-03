@@ -316,6 +316,43 @@ void testAHostRefusedStartIsFreedForByThePass() {
               std::to_string(harness.governor->ledger().hostRefusedWaitingBytes()));
 }
 
+// A request that has not started ranks by the work it holds, what its start
+// restores (smoke a trace): a cold start's claim, at its first attempt beside
+// a lane in prefill of its priority, counts none of its prompt as completed,
+// so it does not outrank the lane, which has processed fewer rows than that
+// prompt holds, nor hold room the lane waits for.
+void testAStartRanksByTheWorkItHolds() {
+  test::EngineHarness harness({.pages = 256, .memory = test::FakeMemory::Config{}});
+  EngineRequest lane = request(1, std::vector<uint32_t>(4000, 1));
+  lane.deadlineMilliseconds = 1e9;
+  harness.engine.submit(std::move(lane));
+  harness.runUntil(
+      [&] {
+        const EngineSnapshot counts = harness.engine.snapshot();
+        return !counts.activeRequests.empty() && counts.activeRequests.front().promptProcessed != 0 &&
+               !harness.engine.commandInFlight();
+      },
+      "the long prompt did not run its first command");
+  const auto rank = [&](uint64_t id) -> std::optional<ClaimRank> {
+    for (const auto &[_, state] : harness.governor->ledger().claims())
+      if (state.spec.requestId == id)
+        return state.spec.rank;
+    return std::nullopt;
+  };
+  std::optional<ClaimRank> started;
+  harness.model.beginObserver = [&] {
+    if (harness.model.lastBeginId == 2 && !started)
+      started = rank(2);
+  };
+  EngineRequest start = request(2, std::vector<uint32_t>(3000, 2));
+  start.deadlineMilliseconds = 1e9;
+  harness.engine.submit(std::move(start));
+  harness.runUntil([&] { return started.has_value(); }, "the start was never attempted");
+  require(started->completedTokens == 0,
+          "a cold start's claim counted " + std::to_string(started->completedTokens) +
+              " tokens of its prompt as completed work");
+}
+
 // Five cached one-page blocks under states on disk in a pool the budget
 // holds to two extents, three pages free: evicting a block starts a
 // demotion whose page comes back once its copy lands (tier.complete()).
@@ -1050,6 +1087,7 @@ std::span<const test::TestCase> rulesTests() {
       {"testACancelBetweenPassesEndsBesideAHigherPrioritysDecode",
        testACancelBetweenPassesEndsBesideAHigherPrioritysDecode},
       {"testAHostRefusedStartIsFreedForByThePass", testAHostRefusedStartIsFreedForByThePass},
+      {"testAStartRanksByTheWorkItHolds", testAStartRanksByTheWorkItHolds},
   };
   return kTests;
 }

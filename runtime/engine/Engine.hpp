@@ -935,8 +935,9 @@ private:
   enum class Verdict : uint8_t { Wait, Yield, Fail };
   [[nodiscard]] Verdict judge(const Denial &denial, uint64_t requestId) const;
   [[nodiscard]] bool anotherResident(uint64_t requestId) const;
-  // The prompt rows a lane in prefill has processed, or the tokens a
-  // decoding lane holds.
+  // The prompt rows a lane in prefill has processed, the tokens a decoding
+  // lane holds, or what the start of a request that runs neither would
+  // restore (its admission probe's cached tokens; none before it is probed).
   [[nodiscard]] uint64_t completedTokens(const Request &request) const;
   // The output tokens the client was sent: the committed ones and a first
   // token that no cycle has committed yet (Request::sentFirstToken), as when
