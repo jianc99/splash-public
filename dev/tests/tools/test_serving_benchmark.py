@@ -179,6 +179,35 @@ class ClientRequestTests(unittest.TestCase):
                 clients.run_serve1(1, directory, "bad", samples=1, sizes=(300, 2048))
             self.assertEqual(sampled(directory, "bad"), [3, 4])
 
+    def test_prompts_take_the_tokens_their_sizes_name(self):
+        # The prompt_tokens the servers recorded for churn_doc prompts (Qwen
+        # tokenizers, which split digits one by one): serve1's size-300
+        # prompt of sample 0, 75 words at the old 4 tokens a word, came back
+        # as 662 tokens (smoke-s-serve1-pass-1-132500 and
+        # smoke-a-mini-serve1-cand-1-201707), its size-2048 one, 512 words,
+        # as 4,190; churn's first rounds of 2,000 and 7,300 words as
+        # 16,205-16,259 (smoke-a-fn-churn-A1) and 59,043-59,144
+        # (smoke-a-s-fn-churn-18g-cand-A1-193918). A prompt of w words takes
+        # about 662 + (w - 75) x 8.09 tokens. Each serve1 size and s-warm's
+        # depths then come within 2 %, and s-warm's longest prompt, its
+        # 134K prefix and a suffix, fits its --max-context.
+        def tokens(words):
+            return 662 + (59141 - 662) / (7300 - 75) * (words - 75)
+
+        def words(messages):
+            return len(messages[-1]["content"].split("\n")[1].split())
+
+        for size in clients.SERVE1_SIZES + (32768,):
+            prompt = tokens(words(clients.serve1_messages(size, 0)))
+            self.assertAlmostEqual(prompt, size, delta=0.02 * size)
+        cell = next(c for c in matrix.load_spec(SPEC)["cells"] if c["name"] == "s-warm")
+        context = int(cell["server_args"].split()[-1])
+        for depth in cell["sizes"]:
+            prefix = clients.warm_prefix(depth, 1)
+            self.assertAlmostEqual(tokens(words(prefix)), depth, delta=0.02 * depth)
+            suffix = clients.warm_suffix(prefix, depth, 1, 9)[-1:]
+            self.assertLess(tokens(words(prefix) + words(suffix)), context)
+
 
 # A request that fails after its stream began: server.py's _sse_error.
 FAILED_EVENT = {
