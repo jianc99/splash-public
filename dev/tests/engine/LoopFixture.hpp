@@ -193,8 +193,10 @@ struct LoopFixture {
   void run(const std::function<bool()> &done, std::string_view what, uint32_t steps = 100'000) {
     for (uint32_t step = 0; step < steps && !done(); ++step) {
       const bool progressed = loop.tick();
-      if (control && !loop.commandInFlight())
+      if (control && !loop.commandInFlight()) {
         static_cast<void>(control->run(memory->pressure()));
+        ++controlPasses;
+      }
       if (memory)
         checkMemory({.memory = *memory,
                      .storage = storage,
@@ -251,6 +253,8 @@ public:
   Weights weights;
   engine::NativeRuntime loop;
   std::optional<engine::MemoryControl> control;
+  // The control passes run() has run.
+  uint64_t controlPasses = 0;
 
 private:
   static std::optional<FakeMemory> fakeMemory(const std::optional<LoopOptions> &options) {

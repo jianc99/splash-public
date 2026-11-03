@@ -385,7 +385,8 @@ void testATickThatChangesNothingSpinsOnlyWhenItWouldRunAgain() {
 
 // The model's spilled-read shortfall queries count per candidate, admission
 // state and kind: two of one kind in one state count twice, one of the other
-// kind apart, one after an allocation in the next state.
+// kind apart, one after an allocation in the next state; a lane in service
+// is no candidate, and its queries do not count.
 void testShortfallQueriesCountPerCandidateAndState() {
   test::EngineHarness harness({.memory = sixteen(), .limits = {.limitBytes = 6 * kGiB}});
   static_cast<void>(harness.model.spilledReadShortfall(5, {}));
@@ -398,6 +399,9 @@ void testShortfallQueriesCountPerCandidateAndState() {
   static_cast<void>(harness.model.spilledReadShortfall(5, {}));
   require(harness.shortfallQueries().size() == 3 && harness.mostShortfallQueries() == 2,
           "a query after an allocation counted in the same state");
+  harness.model.requests.emplace(6, test::Executor::Request{.resident = true});
+  static_cast<void>(harness.model.spilledReadShortfall(6, {}));
+  require(harness.shortfallQueries().size() == 3, "a lane in service counted as a candidate");
 }
 
 // The loop fixture with memory: the loop's weights, KV and states allocate
