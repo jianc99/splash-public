@@ -837,6 +837,7 @@ public:
     return std::nullopt;
   }
   void end(uint64_t id) override {
+    ++ends;
     if (const auto found = requests.find(id); found != requests.end() && found->second.resident) {
       releaseLane(id);
       if (laneReleased)
@@ -962,6 +963,8 @@ public:
   uint32_t suspensions = 0;
   uint32_t resumptions = 0;
   uint32_t resumeAttempts = 0;
+  // Requests the engine ended (end()).
+  uint32_t ends = 0;
   bool resumeDenied = false;
   uint32_t maximumLanes = model::ExecutionLimits::maximumBatchWidth;
   std::function<void()> beginObserver;

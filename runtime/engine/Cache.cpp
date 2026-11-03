@@ -632,6 +632,17 @@ uint32_t Cache::indexLandingPages() const {
   return free > needed ? static_cast<uint32_t>(free - needed) : 0;
 }
 
+uint32_t Cache::residentChainPages(std::span<const uint64_t> chain) const {
+  uint32_t pages = 0;
+  for (const uint64_t block : chain) {
+    if (!kv_.contains(block))
+      continue;
+    const uint32_t page = kv_.page(block);
+    pages += page != KvCache::noPage && pool_.form(page) != kv::PageForm::Index;
+  }
+  return pages;
+}
+
 bool Cache::freesOnLanding(const Write &write) const noexcept {
   const uint64_t block = write.block;
   return write.write == WriteClass::Reclaim && kv_.residentLeaf(block) && !states_.stateResident(block) &&

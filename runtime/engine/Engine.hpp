@@ -553,12 +553,13 @@ private:
   // on a target that can spill, Spill only when its projection's Resident
   // KV is more than its Spill peak (its floor, and the larger of the staging
   // its prompt's history takes and the hot block cache its decode reads
-  // through, Model::spilledReadShortfall), and memory for the Resident KV
-  // beside every lane's projected growth (laneDemandBytes) is not there at a
-  // cost below what spilling costs the request (spillPenaltySeconds), as
-  // the governor finds it (MemoryGovernor::available); for every request
-  // under --kv-spill always; Resident otherwise. Correctness never depends
-  // on it.
+  // through, Model::spilledReadShortfall), and memory for the Resident KV,
+  // less the pages in memory of the chain it restores (Cache::
+  // residentChainPages), beside every lane's projected growth
+  // (laneDemandBytes) is not there at a cost below what spilling costs the
+  // request (spillPenaltySeconds), as the governor finds it
+  // (MemoryGovernor::available); for every request under --kv-spill always;
+  // Resident otherwise. Correctness never depends on it.
   [[nodiscard]] KvMode placement(const Request &request) const;
   // Places every candidate whose placement is older than the memory's state
   // now (ledgerChanges_), once per candidate and state.
@@ -1156,9 +1157,11 @@ private:
   // lane last released its memory, or the suspension itself met a limit
   // that only freed memory lifts, unlike a host pause.
   bool allocationFailed_ = false;
-  // Counts what changes the memory a placement reads: every allocation
-  // (its grant, refusal or what the ledger took for it) and every landing
-  // the control pass collects (Request::placementState).
+  // Counts what changes the memory a placement reads: what the ledger takes
+  // for an allocation, a lane that starts (its projected growth) or ends,
+  // and every landing, the tick's and those the control pass collects
+  // (Request::placementState). A grant of a lane's growth leaves the room
+  // beside the lanes' projections where it was.
   uint64_t ledgerChanges_ = 1;
   // The decayed sum and weight of the decode commands' hot-block read time
   // per lane holding Index pages (spilledReadMilliseconds).

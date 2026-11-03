@@ -2017,6 +2017,71 @@ void testPlacementNeverSpillsWhenSpillTakesMore() {
           "a prompt whose Spill footprint is no smaller than its Resident one spilled");
 }
 
+// A placement holds only while the memory it read holds (DESIGN section 4.4:
+// placed again once an admission changed the ledger): two prompts whose
+// Resident KV fits the room one at a time arrive together, and the second,
+// placed after the first took its lane, beside the first's projected KV,
+// starts Spill. Each projects 17 Full pages (1,700 bytes) in 2,500 bytes of
+// room.
+void testAnAdmissionPlacesTheNextCandidateAgain() {
+  Spilling spill(Spilling::Governed{}, 1024, false);
+  spill.limit(spill.held() + 2'500);
+  spill.engine.submit(Spilling::prompt(1, 1, 16, 1));
+  spill.engine.submit(Spilling::prompt(2, 2, 16, 1));
+  spill.runUntil(
+      [&] {
+        const SpillRequestsSnapshot started = spill.engine.snapshot().spill;
+        return started.resident + started.spill == 2;
+      },
+      "the prompts did not start");
+  spill.limit(Spilling::kGovernedLimitBytes);
+  spill.runUntilIdle();
+  const SpillRequestsSnapshot counts = spill.engine.snapshot().spill;
+  require(counts.resident == 1 && counts.spill == 1 && spill.events.failedCount == 0,
+          "a candidate started on a placement made before another start took its lane: " +
+              std::to_string(counts.resident) + " Resident, " + std::to_string(counts.spill) + " Spill");
+}
+
+// A start's Resident KV less what it holds already (design/M.md R5's
+// "- held"): the pages of the chain it restores that are in memory, which
+// its start takes in place (Cache::restoreRequest), are not room it must
+// find again. A conversation's next turn, its 40 pages cached in memory,
+// adds a page beside a lane in service, in a room of ten pages: it starts
+// Resident.
+void testPlacementCountsTheChainItRestoresInMemory() {
+  Spilling spill(Spilling::Governed{}, 1024, false);
+  test::seedAsStartup(spill.engine, spill.model);
+  const EngineRequest first = Spilling::prompt(1, 1, 40, 1);
+  spill.engine.submit(first);
+  spill.runUntilIdle();
+  spill.model.decodeFinishes = false;
+  EngineRequest lane = Spilling::prompt(3, 3, 1, 30);
+  lane.deadlineMilliseconds = 1e9;
+  spill.engine.submit(std::move(lane));
+  spill.runUntil([&] { return spill.events.outputs.contains(3) && !spill.engine.commandInFlight(); },
+                 "the lane in service did not decode");
+  spill.engine.refreshMemoryRates(spill.now);
+  spill.limit(spill.held() + 1'000);
+  std::vector<uint32_t> turn = first.prompt;
+  turn.resize(turn.size() + KvCache::pageTokens, 1);
+  EngineRequest next = request(2, turn);
+  next.maxNewTokens = 1;
+  spill.engine.submit(std::move(next));
+  spill.runUntil(
+      [&] {
+        const SpillRequestsSnapshot started = spill.engine.snapshot().spill;
+        return started.resident + started.spill == 3;
+      },
+      "the next turn did not start");
+  spill.limit(Spilling::kGovernedLimitBytes);
+  spill.model.decodeFinishes = true;
+  spill.runUntilIdle();
+  const SpillRequestsSnapshot counts = spill.engine.snapshot().spill;
+  require(counts.resident == 3 && counts.spill == 0 && spill.events.failedCount == 0,
+          "a turn whose cached chain is in memory was placed as if it needed that memory again: " +
+              std::to_string(counts.resident) + " Resident, " + std::to_string(counts.spill) + " Spill");
+}
+
 // The penalty of spilling a decoding lane counts its decode commands' hot
 // block reads (DESIGN section 0 Q5, amend/M.md B8): the read time a decode
 // command of a lane with Index pages waits for, a decayed mean of the
@@ -2071,6 +2136,8 @@ std::span<const test::TestCase> spillTests() {
       {"testPlacementReadsLiveRoom", testPlacementReadsLiveRoom},
       {"testPlacementSpillsWhatTheLiveRoomCannotHold", testPlacementSpillsWhatTheLiveRoomCannotHold},
       {"testPlacementNeverSpillsWhenSpillTakesMore", testPlacementNeverSpillsWhenSpillTakesMore},
+      {"testAnAdmissionPlacesTheNextCandidateAgain", testAnAdmissionPlacesTheNextCandidateAgain},
+      {"testPlacementCountsTheChainItRestoresInMemory", testPlacementCountsTheChainItRestoresInMemory},
       {"testSpillDecodeTermIsMeasured", testSpillDecodeTermIsMeasured},
       {"testUnwritableTierKeepsRequestsResident", testUnwritableTierKeepsRequestsResident},
       {"testAdmissionSpillsWhatMemoryCannotHold", testAdmissionSpillsWhatMemoryCannotHold},

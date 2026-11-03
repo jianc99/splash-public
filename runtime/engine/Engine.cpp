@@ -183,9 +183,11 @@ bool Engine::tick(double now) {
   if (now >= drainEndMilliseconds_)
     drainEndMilliseconds_ = 0.0;
   if (cache_.pollTransfers()) {
-    // Demoted pages and written states are back; waiting lanes retry now.
-    // The tier's share for Spill requests' writes has room again.
+    // Demoted pages and written states are back; waiting lanes retry now,
+    // and candidates are placed again. The tier's share for Spill
+    // requests' writes has room again.
     signalResourceProgress();
+    ++ledgerChanges_;
     progressed = true;
     if (config_.spill.capable)
       static_cast<void>(cache_.writeThrough());
@@ -867,6 +869,8 @@ bool Engine::admit(Request &active, double now) {
   cache_.beginRequest(requestId, active.kvMode);
   active.lane = *state.admission.lane;
   active.admission = ++admissions_;
+  // Its projected growth is the lanes' now (laneDemandBytes).
+  ++ledgerChanges_;
   if (droppedLease)
     lookup = cache_.lookup(modelRequest.prompt, promptIdentity(active.request));
   // The commitment covers the chain it restores too, once the lookup is
@@ -1992,6 +1996,8 @@ void Engine::vacateLane(Request &active, bool keepContinuation) {
     model_.end(id);
   cache_.endRequest(id);
   active.lane.reset();
+  // Its KV is the cache's now, and its projected growth no lane's.
+  ++ledgerChanges_;
 }
 
 void Engine::release(Request &active) {

@@ -534,6 +534,10 @@ public:
   // reclaim may release: the pages a lane's conversion to Spill can land
   // into now.
   [[nodiscard]] uint32_t indexLandingPages() const;
+  // The pages of `chain`, the blocks a start restores, that are in memory in
+  // a form its start takes in place (restoreRequest): any but the Index
+  // form, which a Resident start moves to Full pages.
+  [[nodiscard]] uint32_t residentChainPages(std::span<const uint64_t> chain) const;
   // What the KV tier's transfers read and wrote, and how long they took
   // (KvTier::throughput); zeros without a tier.
   [[nodiscard]] KvTierThroughput tierThroughput() const noexcept {

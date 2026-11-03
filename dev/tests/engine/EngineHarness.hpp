@@ -321,11 +321,13 @@ private:
   }
   // Changes with every admission or refusal: what memory allocated or gave
   // back and the governor refused, or without memory the model's
-  // admissions asked for.
+  // admissions asked for; and with every lane that starts, resumes, is
+  // suspended or ends, whose projected growth placements read.
   [[nodiscard]] uint64_t admissionState() const {
+    const uint64_t lanes = uint64_t{model.beginAttempts} + model.resumeAttempts + model.suspensions + model.ends;
     if (memory)
-      return memory->changes().size() + governor->snapshot().deniedReservations;
-    return uint64_t{model.beginAttempts} + model.resumeAttempts + model.reservationAttempts;
+      return memory->changes().size() + governor->snapshot().deniedReservations + lanes;
+    return lanes + model.reservationAttempts;
   }
 
   double now_ = 1.0;
