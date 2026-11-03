@@ -1324,8 +1324,8 @@ void testPromotionIdentityAndDenial() {
     auto peer = fixture.lookup(129);
     PromotionTicket ticket;
     ticket.available = available;
-    fixture.cache.promoteState(first, ticket);
-    if (available) fixture.cache.promoteState(peer, ticket);
+    fixture.cache.promoteState(first, [&] { return ticket.snapshot(); });
+    if (available) fixture.cache.promoteState(peer, [&] { return ticket.snapshot(); });
     auto current = fixture.lookup(129);
     require(current.state && bool(current.state->state()->residentBytes()) == available,
             "denied promotion lost disk fallback or successful promotion remained on disk");
@@ -1340,8 +1340,11 @@ void testPromotionIdentityAndDenial() {
   }
 }
 
-// Promotion only saves a later read: the oldest RAM copy gives it room only
-// when that state keeps a disk copy, never when the RAM copy is its only one.
+// Promotion only saves a later read, and the cache takes nothing for it: its
+// copy's room is what the request's claim is admitted or freed by the
+// ledger's rule (Engine::promotedCopy). A refused copy leaves the restored
+// state on disk and every state in RAM, a state's only copy or one with a
+// disk copy, where it was.
 void testPromotionNeverDropsAUniqueState() {
   for (const bool onDisk : {false, true}) {
     CacheFixture fixture;
@@ -1363,16 +1366,13 @@ void testPromotionNeverDropsAUniqueState() {
     const auto lookup = fixture.lookup(129);
     PromotionTicket ticket;
     ticket.deniedCopies = 1;
-    fixture.cache.promoteState(lookup, ticket);
+    const uint64_t evictions = fixture.cache.snapshot().stateCache.evictions;
+    fixture.cache.promoteState(lookup, [&] { return ticket.snapshot(); });
     const auto stats = fixture.cache.snapshot().stateCache;
-    if (onDisk)
-      require(stats.promotions == 1 && !fixture.cache.stateResident(fixture.blocks[1]) &&
-                  fixture.lookup(65).resumeBoundary() == 64,
-              "promotion did not take the RAM of a state with a disk copy");
-    else
-      require(stats.promotions == 0 && stats.promotionsSkipped == 1 &&
-                  fixture.cache.stateResident(fixture.blocks[1]),
-              "promotion dropped a state's only copy");
+    require(ticket.copies == 1 && stats.promotions == 0 && stats.promotionsSkipped == 1 &&
+                stats.evictions == evictions && fixture.cache.stateResident(fixture.blocks[1]),
+            onDisk ? "a refused promotion took the RAM of a state with a disk copy"
+                   : "a refused promotion dropped a state's only copy");
   }
 }
 
@@ -1450,7 +1450,7 @@ void testRestoredStateKeepsItsDiskCopy() {
   {
     auto lookup = fixture.lookup(129);
     PromotionTicket ticket;
-    fixture.cache.promoteState(lookup, ticket);
+    fixture.cache.promoteState(lookup, [&] { return ticket.snapshot(); });
     require(ticket.copies == 1, "restored state was not promoted");
   }
   auto stats = fixture.cache.snapshot().stateCache;
@@ -1480,7 +1480,7 @@ void testDiskCheckpointRamAccounting() {
     } else {
       auto lookup = fixture.lookup(129);
       PromotionTicket ticket;
-      fixture.cache.promoteState(lookup, ticket);
+      fixture.cache.promoteState(lookup, [&] { return ticket.snapshot(); });
     }
     auto stats = fixture.cache.snapshot().stateCache;
     require(stats.checkpointEntries == 1 && stats.checkpointBytes == 100 &&
@@ -1641,7 +1641,7 @@ void testInvalidatedStateUnderALookup() {
     auto first = fixture.lookup(129);
     auto reader = fixture.lookup(129);
     PromotionTicket ticket;
-    fixture.cache.promoteState(first, ticket);
+    fixture.cache.promoteState(first, [&] { return ticket.snapshot(); });
     fixture.cache.invalidateState(block);
     first = {};
     auto stats = fixture.cache.snapshot().stateCache;
@@ -1749,7 +1749,7 @@ void testDiskReplacementSpansStatesAndKv() {
     tier.complete();
     require(fixture.cache.pollTransfers(), "restore did not land");
     PromotionTicket ticket;
-    fixture.cache.promoteState(lookup, ticket);
+    fixture.cache.promoteState(lookup, [&] { return ticket.snapshot(); });
     require(ticket.copies == 1, "state was not promoted");
     lookup = {};
     fixture.cache.endRequest(2);
@@ -3873,7 +3873,7 @@ void testPromotionSkipsForAStateInUse() {
   auto lookup = fixture.lookup(129);
   PromotionTicket ticket;
   ticket.available = false;
-  fixture.cache.promoteState(lookup, ticket);
+  fixture.cache.promoteState(lookup, [&] { return ticket.snapshot(); });
   const auto stats = fixture.cache.snapshot().stateCache;
   require(ticket.copies == 1 && stats.promotionsSkipped == 1 && stats.inUseEvictions == 0 &&
               fixture.cache.stateResident(fixture.blocks[1]),

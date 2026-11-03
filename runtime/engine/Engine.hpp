@@ -697,6 +697,11 @@ private:
   [[nodiscard]] uint32_t awaitedBoundary(const Request &producer, uint32_t end) const;
   void completeAdmission(Request &request, CacheLookup &lookup, DraftContextPlan draft);
   [[nodiscard]] bool pollRestores();
+  // The RAM copy of the state the request's restore read from disk, which
+  // only saves the state's next read: an Optional claim of the request,
+  // worth that read, that takes nothing landing later; nullptr when refused.
+  [[nodiscard]] std::shared_ptr<const CompositeState> promotedCopy(Request &request, const CacheLookup &lookup,
+                                                                   StateRestore &restore);
   [[nodiscard]] DraftContextPlan
   configureDraftStatePlan(Request &request, uint32_t stateBoundary,
                           uint32_t junctionBoundary);

@@ -1,6 +1,7 @@
 #include "engine/Engine.hpp"
 #include "AwakeClock.hpp"
 #include "engine/EngineAllocate.hpp"
+#include "engine/MemoryValue.hpp"
 #include "engine/Status.hpp"
 
 #include <algorithm>
@@ -1021,7 +1022,8 @@ bool Engine::pollRestores() {
     }
     const bool stateRestored = !restore.ticket || restore.ticket->finish();
     if (stateRestored && kv == KvRestoreStatus::None) {
-      if (restore.ticket) cache_.promoteState(restore.lookup, *restore.ticket);
+      if (restore.ticket)
+        cache_.promoteState(restore.lookup, [&] { return promotedCopy(active, restore.lookup, *restore.ticket); });
       completeAdmission(active, restore.lookup, std::move(restore.draft));
       continue;
     }
@@ -1038,6 +1040,26 @@ bool Engine::pollRestores() {
     scheduler_.waitForResources(id);
   }
   return progressed;
+}
+
+std::shared_ptr<const CompositeState> Engine::promotedCopy(Request &active, const CacheLookup &lookup,
+                                                           StateRestore &restore) {
+  // Worth the read as the cache prices a state with a copy (value::cached),
+  // so it takes only what costs less. A restore may land while a command is
+  // in flight, when nothing is taken (L8): the copy takes what is free.
+  ClaimSpec spec = claimFor(active, ClaimClass::Optional);
+  spec.timing = NeedTiming::Immediate;
+  spec.benefitSeconds = value::cached(lookup.resumeBoundary(), lookup.state->state()->bytes(), true, false,
+                                      governor().ledger().rates())
+                            .onceSeconds;
+  std::shared_ptr<const CompositeState> state;
+  static_cast<void>(allocate(
+      [&] {
+        state = restore.snapshot();
+        return StateBuffers{.ok = state != nullptr};
+      },
+      spec, !pending_));
+  return state;
 }
 
 DraftContextPlan Engine::configureDraftStatePlan(Request &active,

@@ -310,6 +310,9 @@ public:
   // frees memory only once its copy lands (took it so, or skipped it for an
   // Immediate claim): a temporary tier's copies ahead then pay.
   [[nodiscard]] bool copyDemand() const noexcept;
+  // The rates units are priced at now, which a claim's benefit is priced at
+  // too.
+  [[nodiscard]] const MemoryRates &rates() const noexcept { return rates_; }
 
   // The rule: what is taken for a claim, what is there for one, what grows.
   // `critical`: macOS's critical pressure; `deficit`: the host lacks memory

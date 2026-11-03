@@ -16,9 +16,11 @@
 #include "engine/Engine.hpp"
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <limits>
+#include <memory>
 #include <span>
 #include <string>
 #include <string_view>
@@ -449,6 +451,86 @@ void testPlacementOncePerCandidatePerState() {
               std::to_string(harness.mostShortfallQueries()) + " queries");
 }
 
+// A state only on disk at `prompt`'s 64 tokens, over KV the cache holds in
+// memory, built in a start's Floor claim as a start that adopts a
+// persistent cache builds it.
+void cacheDiskState(test::EngineHarness &harness, const std::vector<uint32_t> &prompt) {
+  const test::ClaimScope start(*harness.governor, ClaimClass::Floor);
+  harness.cache.beginRequest(999);
+  require(harness.cache.ensureTokens(999, 64).granted(), "the disk state's KV was not allocated");
+  test::demoteState(harness.cache, test::publishBlocks(harness.cache, 999, prompt, 64));
+  harness.cache.endRequest(999);
+}
+
+// L7: a state restored from disk takes its RAM copy in a claim of its
+// request, an Optional one, since the copy only saves the next read. With
+// room the copy is admitted and the next request on the prompt reads no
+// disk. A restore that lands while a command is in flight takes nothing for
+// its copy (L8): refused, the state stays on disk and the request runs from
+// it.
+void testARestoredStateIsPromotedInAClaim() {
+  const std::vector<uint32_t> prompt(65, 17);
+  {
+    test::EngineHarness harness({.memory = test::FakeMemory::Config{}});
+    cacheDiskState(harness, prompt);
+    harness.model.restoreControl->ready = true;
+    harness.engine.submit(harness.request(1, prompt));
+    harness.runUntilIdle();
+    harness.engine.submit(harness.request(2, prompt));
+    harness.runUntilIdle();
+    const StateCacheSnapshot states = harness.cache.snapshot().stateCache;
+    require(harness.model.diskReads == 1 && states.promotions == 1 && harness.model.heldStateBytes == 64 &&
+                harness.events.completedCount == 2 && harness.events.failedCount == 0,
+            "a restored state was not promoted into memory its claim was admitted: disk reads " +
+                std::to_string(harness.model.diskReads) + ", promotions " + std::to_string(states.promotions) +
+                ", state bytes " + std::to_string(harness.model.heldStateBytes));
+  }
+  {
+    test::EngineHarness harness({.memory = test::FakeMemory::Config{}});
+    cacheDiskState(harness, prompt);
+    const std::shared_ptr<std::atomic<bool>> release = harness.model.holdCommands();
+    harness.engine.submit(harness.request(1, prompt));
+    harness.engine.submit(harness.request(2, std::vector<uint32_t>(31, 2)));
+    harness.runUntil([&] { return harness.engine.commandInFlight() && harness.model.diskReads == 1; },
+                     "the restore did not start beside a command in flight", 100);
+    harness.memory->hold("limit", harness.governor->snapshot().headroomBytes - 32);
+    harness.model.restoreControl->ready = true;
+    static_cast<void>(harness.tick());
+    const StateCacheSnapshot states = harness.cache.snapshot().stateCache;
+    require(harness.engine.commandInFlight() && states.promotions == 0 && states.promotionsSkipped == 1,
+            "a restore that landed beside a command in flight was promoted with no room");
+    harness.memory->release("limit", harness.memory->held("limit"));
+    *release = true;
+    harness.runUntilIdle();
+    require(harness.events.completedCount == 2 && harness.events.failedCount == 0 &&
+                harness.model.heldStateBytes == 0,
+            "the requests did not finish, or the refused copy held memory");
+  }
+}
+
+// L7: a command that captures a checkpoint and the prompt's replay point
+// reserves the replay point's buffers beside the checkpoint's in the replay
+// point's claim, and takes the checkpoint's only when refused. A checkpoint
+// lies a chunk or more before the replay point (plannedCheckpoints), so
+// only a command of more rows holds both: the 8192-row command of a prompt
+// of 6145 tokens captures the checkpoint at 4096 and the replay point at
+// 6144, the model's state pool empty.
+void testAReplayPointBesideACheckpointIsReservedInAClaim() {
+  PassesUnderALimit passes(1ULL << 30);
+  passes.submit(1, 6145, RequestPriority::Normal);
+  passes.runUntil([&] { return idle(passes.engine); }, "the prompt did not finish");
+  const EngineSnapshot counts = passes.engine.snapshot();
+  require(test::capturedStates(passes.model, 1) ==
+                  std::vector<std::pair<uint32_t, uint64_t>>{{4096, 6145}, {6144, 6145}} &&
+              counts.checkpointPublications == 1 && counts.replayStatePublications == 1 &&
+              passes.model.heldStateBytes == 128 && passes.events.usage.contains(1) &&
+              passes.events.failedCount == 0,
+          "the command did not capture the checkpoint and the replay point in buffers of their own: "
+          "checkpoints " + std::to_string(counts.checkpointPublications) + ", replay points " +
+              std::to_string(counts.replayStatePublications) + ", state bytes " +
+              std::to_string(passes.model.heldStateBytes));
+}
+
 } // namespace
 
 std::span<const test::TestCase> rulesTests() {
@@ -460,6 +542,8 @@ std::span<const test::TestCase> rulesTests() {
       {"testQuotaWaitIsNotAMemoryClaim", testQuotaWaitIsNotAMemoryClaim},
       {"testConversionVsStoreFollowsValue", testConversionVsStoreFollowsValue},
       {"testPlacementOncePerCandidatePerState", testPlacementOncePerCandidatePerState},
+      {"testARestoredStateIsPromotedInAClaim", testARestoredStateIsPromotedInAClaim},
+      {"testAReplayPointBesideACheckpointIsReservedInAClaim", testAReplayPointBesideACheckpointIsReservedInAClaim},
   };
   return kTests;
 }

@@ -616,12 +616,18 @@ uint32_t Engine::reserveCaptures(Request &active, const BatchItem &item,
     const StateClass kind = stateClass(index);
     if (kind == StateClass::InUse && !states.empty() && boundaries[index - 1].disposable) {
       // The prompt's replay point keeps the checkpoint the command captures
-      // before it beside buffers of its own, and takes that checkpoint's
-      // when refused the pool and the admission, as it takes its lane's
-      // after a command.
-      metal::AllocationFailure refusal;
-      if (std::shared_ptr<StateReservation> buffers =
-              model_.reserveState(active.request.id, tokens, refusal)) {
+      // before it beside buffers of its own, in its claim, and takes that
+      // checkpoint's when refused the pool and the admission, as it takes
+      // its lane's after a command: nothing is freed for it.
+      std::shared_ptr<StateReservation> buffers;
+      static_cast<void>(allocate(
+          [&] {
+            metal::AllocationFailure refusal = metal::AllocationFailure::None;
+            buffers = model_.reserveState(active.request.id, tokens, refusal);
+            return StateBuffers{.ok = buffers != nullptr, .allocationFailure = refusal};
+          },
+          stateClaim(active, kind, tokens, supersedes), false));
+      if (buffers) {
         states.push_back({tokens, std::move(buffers)});
         captures.push_back({tokens});
       } else {

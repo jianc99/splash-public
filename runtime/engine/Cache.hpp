@@ -584,7 +584,11 @@ public:
       PromptIdentity identity,
       const CacheProbe *probe = nullptr);
   void recordLookup(const CacheLookup &lookup);
-  void promoteState(const CacheLookup &lookup, StateRestore &transfer);
+  // Gives a state the lookup restored from disk the RAM copy `copy` takes
+  // (StateRestore::snapshot, in a claim of the request), asked only while
+  // the state has none; a copy refused leaves it on disk alone.
+  void promoteState(const CacheLookup &lookup,
+                    const std::function<std::shared_ptr<const CompositeState>()> &copy);
   // Gives the request the matched chain up to its state. Disk-only blocks
   // get fresh pages and start their restores; the request waits on
   // kvRestoreStatus() before it runs. Pages are admitted like ensureTokens().

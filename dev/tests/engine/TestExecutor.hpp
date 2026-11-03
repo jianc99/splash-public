@@ -156,6 +156,9 @@ class RestoreTicket final : public StateRestore {
 public:
   std::shared_ptr<RestoreControl> control;
   std::function<void()> commit;
+  // With the model's memory, the RAM copy in buffers it takes as its
+  // reserveState() does (Executor::restoredCopy).
+  std::function<std::shared_ptr<const CompositeState>()> copy;
   bool ready() const noexcept override { return control->ready; }
   bool finish() override {
     if (!control->success || control->cancelled) return false;
@@ -166,7 +169,7 @@ public:
   std::shared_ptr<const CompositeState> snapshot() override {
     if (control->promotionDenied)
       return nullptr;
-    return std::make_shared<State>();
+    return copy ? copy() : std::make_shared<State>();
   }
 };
 
@@ -336,6 +339,8 @@ public:
     ticket->commit = [this, id, length, state, restoreDraft] {
       applyRestore(id, length, state, restoreDraft);
     };
+    if (memory)
+      ticket->copy = [this] { return restoredCopy(); };
     return ticket;
   }
   void setDraftContextPlan(uint64_t id, DraftContextPlan plan) override {
@@ -634,10 +639,7 @@ public:
       return nullptr;
     }
     if (memory) {
-      const uint64_t bytes = State().bytes();
-      if (*evictedStateBytes >= bytes) {
-        *evictedStateBytes -= bytes;
-      } else if (const metal::AllocationResult result = allocateStates(bytes); !result) {
+      if (const metal::AllocationResult result = takeStateBuffers(); !result) {
         refusal = result.failure;
         return nullptr;
       }
@@ -1080,9 +1082,10 @@ public:
 
   // With `memory`, the model allocates through it: a lane's state buffers
   // (laneFootprintBytes, from the pool first) at begin and resume, and a
-  // state's at reserveState and snapshot (from the buffers the cache let go
-  // of first), under `admission`, held as "states" until a reclaim gives them
-  // back (heldStateBytes); a decoding lane's floor of the hot block cache
+  // state's at reserveState, snapshot and a restore's snapshot (from the
+  // buffers the cache let go of first), under `admission`, held as "states"
+  // until a reclaim gives them back (heldStateBytes); a decoding lane's
+  // floor of the hot block cache
   // (spilledReadFloorBytes) and a prefill's staging (stagingPageBytes a page)
   // as "spilled_reads" until the lane is suspended or ends.
   FakeMemory *memory = nullptr;
@@ -1121,6 +1124,22 @@ private:
     if (result)
       heldStateBytes += bytes;
     return result;
+  }
+  // One state's buffers: those the cache let go of first, else booked.
+  metal::AllocationResult takeStateBuffers() {
+    const uint64_t bytes = State().bytes();
+    if (*evictedStateBytes >= bytes) {
+      *evictedStateBytes -= bytes;
+      return {};
+    }
+    return allocateStates(bytes);
+  }
+  // A restored state's RAM copy, in one state's buffers: nullptr when they
+  // are refused, as the production snapshot of a restore is.
+  std::shared_ptr<const CompositeState> restoredCopy() {
+    if (!takeStateBuffers())
+      return nullptr;
+    return std::make_shared<State>(evictedStateBytes);
   }
   // State buffers a reclaim gives back.
   uint64_t giveBackStates(uint64_t bytes) noexcept {

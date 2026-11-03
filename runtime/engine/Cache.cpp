@@ -3164,24 +3164,16 @@ void Cache::startRestore(uint64_t block) {
         tier_->restore(kv_.slot(block), kv_.page(block), completionNotifier_);
 }
 
-void Cache::promoteState(const CacheLookup &lookup, StateRestore &transfer) {
+void Cache::promoteState(const CacheLookup &lookup,
+                         const std::function<std::shared_ptr<const CompositeState>()> &copy) {
   if (!lookup.state) return;
   const auto block = lookup.state->kvBlock();
   const auto *source = lookup.state->state().get();
   if (!states_.promotable(block, source)) return;
-  // Promotion is optional and uses the ordinary snapshot admission/reclaimer.
-  // The admitted request can run even when no cache buffer is available.
-  auto state = transfer.snapshot();
-  if (!state) {
-    // The restored state is the most recently used one; the oldest RAM copy
-    // makes room for it. Promotion only saves a later read: it takes only
-    // RAM whose state keeps a copy, never a state's only copy.
-    auto victim = states_.checkpointCandidate(false);
-    if (!victim)
-      victim = states_.ordinaryCandidate(false);
-    if (victim && states_.reclaim(victim->id, StateCache::Unwritten::Keep).evicted)
-      state = transfer.snapshot();
-  }
+  // The copy only saves a later read, and the admitted request runs without
+  // it: its room is what its claim is admitted or freed, nothing the cache
+  // takes for it here.
+  auto state = copy();
   if (state) states_.promote(block, source, std::move(state));
   else states_.promotionSkipped();
 }
