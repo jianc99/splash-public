@@ -658,6 +658,34 @@ void testPendingGrowthTakesWhatItsLandedVictimsLeave() {
           "the pending growth did not take the extent its landed victim emptied and grow into it");
 }
 
+// Without the host's consent a displacement takes units that free memory
+// only once their copies land too, as pending growth (amend/M.md B4): in
+// the M6's band (1.1 GiB of headroom) a store a unit short of its cap,
+// beside uncopied cache, regrows once the cache's copies land, on the
+// extent its take releases (its credit), rather than staying short while
+// no claim asks for copies.
+void testDisplacementWithoutTheHostsConsentPendsOnUncopiedCache() {
+  Fixture fixture(host(1100 * kMiB + 8 * kGiB), 8 * kGiB);
+  FakeElasticPool experts("experts", fixture.memory, kGiB, 2, 4, 5, 3, 0.25, 60.0);
+  TestSource cache("cache", &fixture.memory);
+  cache.landsIntoExtents = true;
+  fixture.memory.hold("cache", kGiB);
+  fixture.memory.hold("weights", 4 * kGiB);
+  cache.units = {unit(1, kGiB, 0.5, true)};
+  MemoryLedger &ledger = fixture.ledger();
+  ledger.addSource(cache);
+  ledger.addPool(experts);
+  serve(ledger, experts, 400.0, 0.0, 10.0);
+  static_cast<void>(fixture.pass(10.5));
+  require(cache.taken == std::vector<uint64_t>{1} && fixture.governor->snapshot().reservedBytes == kGiB,
+          "a displacement the host did not consent to took no cache whose copies land later");
+  cache.land();
+  static_cast<void>(fixture.pass(11.5));
+  require(experts.units() == 4 && fixture.governor->snapshot().reservedBytes == 0 &&
+              cache.taken == std::vector<uint64_t>{1, 1001},
+          "the store did not regrow in the band on the extent its landed victim emptied");
+}
+
 // A claim that takes a pool's pending growth cancels it: the pool keeps its
 // units and the room is the claim's.
 void testTakenPendingGrowthIsCancelled() {
@@ -2292,6 +2320,8 @@ std::span<const test::TestCase> ledgerTests() {
       {"testPendingGrowthTakesWhatItsLandedVictimsLeave", testPendingGrowthTakesWhatItsLandedVictimsLeave},
       {"testPendingGrowthCreditsOnlyWhatItsTakeReleases", testPendingGrowthCreditsOnlyWhatItsTakeReleases},
       {"testAShortPendingGrowthHoldsNothing", testAShortPendingGrowthHoldsNothing},
+      {"testDisplacementWithoutTheHostsConsentPendsOnUncopiedCache",
+       testDisplacementWithoutTheHostsConsentPendsOnUncopiedCache},
       {"testTakenPendingGrowthIsCancelled", testTakenPendingGrowthIsCancelled},
       {"testOneHostRule", testOneHostRule},
       {"testBandWaivedWhenTheHostClaimFindsNothing", testBandWaivedWhenTheHostClaimFindsNothing},

@@ -731,11 +731,11 @@ uint64_t MemoryLedger::available(const ClaimSpec &spec, uint64_t enough, uint64_
 // is worth its expected retake. At most one unit per pass then displaces
 // other memory, outside critical pressure, when the victims cost less than
 // the unit is worth beyond its cycle: with the host's consent the victims
-// need only meet what the room lacks, and what its own victims free later
-// is the pool's pending growth; without it they free a whole unit now,
+// need only meet what the room lacks; without it they free a whole unit,
 // which the growth then takes from the host's footprint again (its
-// credit), and what the room lacks besides. The room is the pass's less
-// what the pass has grown.
+// credit), and what the room lacks besides. Either way victims that free
+// memory only once their transfers land make the unit the pool's pending
+// growth. The room is the pass's less what the pass has grown.
 bool MemoryLedger::grow(uint64_t freeBytes, const GrowthHost &host) {
   bool acted = false;
   uint64_t waitingBytes = 0;
@@ -849,7 +849,7 @@ bool MemoryLedger::grow(uint64_t freeBytes, const GrowthHost &host) {
     if (consents && room() >= next.unit)
       continue;
     const ClaimId claim = open({.cls = ClaimClass::Growth,
-                                .timing = consents ? NeedTiming::CanWait : NeedTiming::Immediate,
+                                .timing = NeedTiming::CanWait,
                                 .holdSeconds = kValueHorizonSeconds,
                                 .benefitSeconds = benefit});
     const FreeResult freed = freeFor(claim.value, {.bytes = next.unit}, less(freeBytes, grownBytes), false, false,
