@@ -1508,13 +1508,18 @@ and byte of spilled K/V read from it. Startup seeds it before Ready: a byte of
 either read at the rate loading the weights read the SSD, and from two prefill
 warm-ups, of a chunk's rows and of 256, the line of their times less those
 reads by their row-layers, whose intercept is a chunk-layer's cost, their
-turnaround in it; the turnaround starts at zero, where units of one pass over
-one chunk, which do not tell the two apart, leave it. Every unit that runs
+turnaround in it; the turnaround starts at zero. Every unit that runs
 rows then trains it, a pass by its share of its command, each weighing nine
 tenths of the next, its time held
 within half and twice its price, in a fit that keeps every cost non-negative
 and a cost no unit's work varies at its seed; the bytes it prices are scaled
-by what units read over what the model expected of them. The status reports
+by what units read over what the model expected of them. The turnaround is
+what the units say of it beside their work, whatever the other costs are,
+once they pin it down to within a tenth of G (its standard error from their
+scatter about the fit), the turnaround that moves the bound by G; until then
+it stays at zero and the bound at G. Units of other passes over the same
+work pin it down; units of one shape, or in the passes their prices set,
+whose pass counts follow their work, do not. The status reports
 each cost and its seed, and the units' relative errors over the last 256
 (`scheduler.estimate.prefill`), and a decode token's time
 (`scheduler.estimate.decode`).

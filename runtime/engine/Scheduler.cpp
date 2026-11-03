@@ -63,7 +63,7 @@ uint64_t rowsOf(std::span<const model::PrefillLane> lanes) noexcept {
 } // namespace
 
 Scheduler::Scheduler(SchedulerConfig config, const model::PrefillWorkSource &work)
-    : config_(config), work_(work), decodeShare_(config.decodeShare) {
+    : config_(config), work_(work), cost_(config.decodeGapMilliseconds), decodeShare_(config.decodeShare) {
   if (!std::isfinite(config_.decodeGapMilliseconds) || config_.decodeGapMilliseconds <= 0.0)
     throw std::invalid_argument("the decode gap target must be positive and finite");
   if (!config_.limits.commandRows || !config_.limits.maximumPasses)

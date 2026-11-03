@@ -4,7 +4,8 @@
 // that ran. A unit's price is a rate per unit of each of seven quantities of
 // its work (model::CommandWork) summed; the rates are a decayed ridge fit of
 // the units' measured times on their realized work, toward a seed of weak
-// priors, no rate below zero.
+// priors, no rate below zero, the turnaround at its seed until the units
+// pin it down as finely as the bound it sets can tell.
 
 #include "model/CommandCost.hpp"
 
@@ -73,7 +74,9 @@ public:
   // (accepted, DESIGN §0 O4).
   static constexpr uint32_t kSeedRows = 256;
 
-  CostModel() noexcept;
+  // The decode gap G the scheduler bounds contended units by: the bound is
+  // max(G, turnaround / kPassOverheadShare).
+  explicit CostModel(double decodeGapMilliseconds) noexcept;
 
   // The startup measurements: the prefill warm-ups' samples (their work and
   // wall time) and the SSD reads of loading the weights. Both read terms
@@ -91,6 +94,8 @@ public:
   // below zero.
   [[nodiscard]] double price(const model::CommandWork &expected) const noexcept;
   // The rate of Units: what every command or pass costs whatever its work.
+  // Its seed until the units pin it down to within G * kPassOverheadShare,
+  // what moves the bound by G, then what they say of it (solve).
   [[nodiscard]] double turnaround() const noexcept;
   // The rate of WeightReadBytes: what a byte of weights a unit read costs,
   // which price charges the expected bytes at once scaled by their realized
@@ -110,13 +115,20 @@ public:
 private:
   [[nodiscard]] double rawPrice(const CostVector &terms) const noexcept;
   [[nodiscard]] double scale(CostTerm term) const noexcept;
+  // The turnaround the sums identify beside the `measured` terms (solve).
+  [[nodiscard]] double identifiedTurnaround(const std::array<bool, kCostTerms> &measured) const noexcept;
   void solve();
 
-  // Decayed sums of w·x̂·x̂ᵀ and w·x̂·t over the terms normalized by `unit_`,
-  // each term's first nonzero quantity; a term without one keeps its seed
-  // and stays out of the system.
+  // Decayed sums of w·x̂·x̂ᵀ, w·x̂·t and w·t² over the terms normalized by
+  // `unit_`, each term's first nonzero quantity (a term without one keeps
+  // its seed and stays out of the system), and of w, the commands the units
+  // make up.
   std::array<CostVector, kCostTerms> normal_{};
   CostVector moment_{}, unit_{}, seedRates_{}, precision_{}, rates_{};
+  double timeSquares_ = 0.0, commands_ = 0.0;
+  // G * kPassOverheadShare: the bound, max(G, turnaround /
+  // kPassOverheadShare), moves by G for this much turnaround past it.
+  double resolution_;
   // The warm-ups' normalized Units per normalized ChunkLayers of theirs,
   // which ChunkLayers' seed weighs on with it (solve); 0 where the seed's
   // constant is Units'.

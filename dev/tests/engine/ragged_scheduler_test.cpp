@@ -19,6 +19,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <random>
 #include <span>
 #include <string>
 #include <utility>
@@ -945,18 +946,25 @@ void testALoneRequestIsSizedAsToday() {
 }
 
 // A contended agent turn on `profile` (the M6's at some turnaround), after
-// commands of varied passes have taught the fit the turnaround: the sim and
-// the turn's first plan.
+// commands of the same work in other passes have taught the fit the
+// turnaround: turns of 300-7800 rows, each run in 6 and in 24 passes (the
+// passes the scheduler plans follow a turn's price, so they alone do not
+// tell the turnaround from the work, testVariedPromptsLeaveTheBoundAtG).
+// The sim and the turn's first plan.
 std::pair<std::unique_ptr<Sim>, BatchPlan> learnedContendedTurn(const test::TimingProfile &profile) {
   auto sim = std::make_unique<Sim>(profile, limits(8192, 48));
   sim->seed();
   sim->decoder(1);
+  uint64_t id = 10;
   for (uint32_t turn = 0; turn < 6; ++turn) {
-    sim->lane(10 + turn, 8192, 300 + 1500 * turn);
-    while (sim->scheduler.phase(10 + turn) == Phase::Prefill)
-      sim->step();
-    sim->scheduler.cancel(10 + turn);
-    sim->scheduler.remove(10 + turn);
+    for (const uint32_t passes : {6u, 24u}) {
+      sim->lane(id, 8192, 300 + 1500 * turn);
+      const BatchPlan command{.kind = WorkKind::Prefill, .items = {{id, 300 + 1500 * turn, 8192}}, .passes = passes};
+      for (sim->run(command); sim->passes;)
+        sim->run(sim->passes->plan);
+      sim->scheduler.cancel(id);
+      sim->scheduler.remove(id++);
+    }
   }
   sim->lane(2, 8192, 300);
   BatchPlan plan = sim->plan();
@@ -1084,6 +1092,159 @@ void testWholeCommandsLeaveTheTurnaroundAtZero() {
     require(sim.price(plan.items, pass, plan.passes) <= kGap * (1 + 1e-9),
             "a contended dense command ran in " + std::to_string(plan.passes) + " passes of " +
                 std::to_string(sim.price(plan.items, pass, plan.passes)) + " ms, past G");
+}
+
+// M6-diag B (2): commands whose passes do not tell the turnaround from their
+// work leave it at its seed. The M6 smoke's startup priced its first
+// commands by their reads alone, every compute rate seeded at zero (here
+// the warm-ups' reads at the load's rate take their whole time), and ran
+// its first prompt alone, 8192 rows in 12 and then 6 passes, the passes of
+// each alike; [0, 8192) took 10.62 s in 12 passes and 10.54 s in 3, about
+// 10 ms a pass. Fitted with the other terms, the turnaround took what the
+// seeds left of those times, 301 ms, and the next prompt, contended, ran in
+// passes of 3.5 s against a bound of u / 0.1 = 3 s. Replayed at 10 ms (the
+// first prompt decoding beside the next), the two commands, at another
+// depth where they run in other passes, leave the turnaround at its seed
+// and every pass of the contended command within about twice G.
+void testStartupUnitsOfOneShapeLeaveTheTurnaroundAtItsSeed() {
+  const test::TimingProfile profile = withTurnaround(test::kM6FlashNextQ2, 10.0);
+  Sim sim(profile, limits(8192, 48));
+  std::array warmups{test::sampleOf(sim.work.warmupTimes(kChunk)), test::sampleOf(sim.work.warmupTimes(256))};
+  for (model::CommandSample &warmup : warmups)
+    warmup.work.weightReadBytes = static_cast<uint64_t>(warmup.wallMilliseconds * profile.weightBytesPerMillisecond);
+  sim.scheduler.seedCost(warmups, {10'000'000'000, 1e10 / profile.weightBytesPerMillisecond});
+  sim.lane(1, 0, 2 * 8192);
+  for (const uint32_t passes : {12u, 6u}) {
+    const BatchPlan command{
+        .kind = WorkKind::Prefill, .items = {{1, 8192, sim.scheduler.promptProcessed(1)}}, .passes = passes};
+    for (sim.run(command); sim.passes;)
+      sim.run(sim.passes->plan);
+  }
+  require(sim.turnaround() <= 2.0 * profile.turnaroundMilliseconds,
+          "the startup's commands in 12 and 6 passes priced a turnaround of " + std::to_string(sim.turnaround()) +
+              " ms against the profile's " + std::to_string(profile.turnaroundMilliseconds));
+  sim.lane(2, 0, 2 * 8192);
+  BatchPlan plan = sim.plan();
+  while (plan.kind != WorkKind::Prefill) {
+    sim.run(plan);
+    plan = sim.plan();
+  }
+  require(plan.items[0].requestId == 2 && plan.passes > 1, "the second prompt did not run in passes");
+  for (uint32_t pass = 0; pass < plan.passes; ++pass) {
+    const double wall =
+        test::prefillTimes(profile, sim.work.prefillWork(sim.lanes(plan.items), pass, plan.passes)).wallMilliseconds;
+    require(wall <= 2.0 * kGap, "beside a decode a pass of " + std::to_string(plan.passes) + " took " +
+                                    std::to_string(wall) + " ms, its bound " + std::to_string(sim.bound()) + " ms");
+  }
+}
+
+// The same startup as the scheduler plans it, at the smoke's 10 ms and at
+// each of kTurnarounds: the first prompt's 23,488 rows alone, then a 32K
+// prompt beside its decode and six turns of 300-7800 rows. The first
+// command, priced by the seeds, runs few passes far over G and the next at
+// depth 8192 runs many: a few passes of another count beside units the seed
+// underpriced, which tell the turnaround only what the price left of them.
+// After every command the turnaround is within twice the profile's, and
+// every contended pass within 2 G. (113e105c priced 62.6 ms at 10 ms after
+// one pass of the second command, abandoned it and learned 62-72 ms, a
+// bound of 620-723 ms; at 60 ms 137-149 ms, contended passes of 1043.6 ms.)
+void testThePlannedStartupLeavesTheTurnaroundWithinTwiceItsTruth() {
+  for (const double turnaround : {10.0, kTurnarounds[0], kTurnarounds[1], kTurnarounds[2]}) {
+    const test::TimingProfile profile = withTurnaround(test::kM6FlashNextQ2, turnaround);
+    Sim sim(profile, limits(8192, 48));
+    std::array warmups{test::sampleOf(sim.work.warmupTimes(kChunk)), test::sampleOf(sim.work.warmupTimes(256))};
+    for (model::CommandSample &warmup : warmups)
+      warmup.work.weightReadBytes =
+          static_cast<uint64_t>(warmup.wallMilliseconds * profile.weightBytesPerMillisecond);
+    sim.scheduler.seedCost(warmups, {10'000'000'000, 1e10 / profile.weightBytesPerMillisecond});
+    const auto prefill = [&](uint64_t id) {
+      while (sim.scheduler.phase(id) == Phase::Prefill) {
+        const BatchPlan plan = sim.plan();
+        const bool contended = sim.scheduler.phase(1) == Phase::Decode;
+        if (plan.kind == WorkKind::Prefill && contended) {
+          const double wall =
+              test::prefillTimes(profile, sim.work.prefillWork(sim.lanes(plan.items), plan.pass, plan.passes))
+                  .wallMilliseconds;
+          require(wall <= 2.0 * kGap, at(profile) + ": beside a decode pass " + std::to_string(plan.pass) + " of " +
+                                          std::to_string(plan.passes) + " of lane " + std::to_string(id) +
+                                          " took " + std::to_string(wall) + " ms, its bound " +
+                                          std::to_string(sim.bound()) + " ms");
+        }
+        sim.run(plan);
+        if (plan.kind == WorkKind::Prefill && plan.pass + 1 == plan.passes)
+          require(sim.turnaround() <= 2.0 * turnaround,
+                  at(profile) + ": after a command of lane " + std::to_string(id) + " in " +
+                      std::to_string(plan.passes) + " passes the turnaround was " +
+                      std::to_string(sim.turnaround()) + " ms");
+      }
+    };
+    sim.lane(1, 0, 23'488);
+    prefill(1);
+    sim.lane(2, 0, 32'768);
+    prefill(2);
+    for (uint64_t turn = 0; turn < 6; ++turn) {
+      sim.lane(10 + turn, 8192, static_cast<uint32_t>(300 + 1500 * turn));
+      prefill(10 + turn);
+      sim.scheduler.cancel(10 + turn);
+      sim.scheduler.remove(10 + turn);
+    }
+  }
+}
+
+// M6-diag B (2) by another route: on a streamed target each contended
+// command runs in the passes its price sets, so its pass count follows its
+// work, and what such units leave of the linear price (reads hidden behind
+// compute, unevenly where the passes split the attention layers unevenly)
+// looks like a turnaround. 80 prompts one after another beside a decode,
+// 300-12,000 rows at depths to 32K, at the profile's 10 ms: after every
+// command the turnaround is within twice that, so the bound stays G; every
+// pass is within twice G (M6-diag's acceptance, about 1 s), and their p95
+// within G and the price's e95 overrun (G4a). (113e105c learned 115.5 ms
+// after command 22, 2258 rows in 12 passes, and planned the next at a
+// bound of 1155 ms, a pass of 1232.6 ms; then 10-73 ms, mostly 25-60.)
+void testVariedPromptsLeaveTheBoundAtG() {
+  const test::TimingProfile profile = withTurnaround(test::kM6FlashNextQ2, 10.0);
+  Sim sim(profile, limits(8192, 48));
+  sim.seed();
+  sim.decoder(1);
+  std::mt19937 random(7);
+  std::uniform_real_distribution<double> logRows(std::log(300.0), std::log(12'000.0));
+  std::uniform_int_distribution<uint32_t> depth(0, 128);
+  const double bound = std::max(kGap, profile.turnaroundMilliseconds / kPassOverheadShare);
+  std::vector<double> walls;
+  uint32_t commands = 0;
+  for (uint64_t id = 100; id < 180; ++id) {
+    const auto rows = static_cast<uint32_t>(std::exp(logRows(random)));
+    sim.lane(id, 256 * depth(random), rows);
+    while (sim.scheduler.phase(id) == Phase::Prefill) {
+      const BatchPlan plan = sim.plan();
+      if (plan.kind == WorkKind::Prefill) {
+        walls.push_back(
+            test::prefillTimes(profile, sim.work.prefillWork(sim.lanes(plan.items), plan.pass, plan.passes))
+                .wallMilliseconds);
+        require(walls.back() <= 2.0 * bound, "command " + std::to_string(commands) + ": pass " +
+                                                 std::to_string(plan.pass) + " of " + std::to_string(plan.passes) +
+                                                 " took " + std::to_string(walls.back()) +
+                                                 " ms beside a decode, its bound " + std::to_string(sim.bound()) +
+                                                 " ms");
+      }
+      sim.run(plan);
+      if (plan.kind == WorkKind::Prefill && plan.pass + 1 == plan.passes)
+        require(sim.turnaround() <= 2.0 * profile.turnaroundMilliseconds,
+                "command " + std::to_string(commands++) + ", " + std::to_string(plan.items[0].tokenCount) +
+                    " rows at " + std::to_string(plan.items[0].promptOffset) + " in " +
+                    std::to_string(plan.passes) + " passes, priced a turnaround of " +
+                    std::to_string(sim.turnaround()) + " ms");
+    }
+    sim.scheduler.cancel(id);
+    sim.scheduler.remove(id);
+  }
+  std::ranges::sort(walls);
+  const double p95 = walls[static_cast<size_t>(std::ceil(0.95 * double(walls.size()))) - 1];
+  const double e95 = sim.scheduler.snapshot().prefillEstimate.relativeErrorP95;
+  require(p95 <= bound * (1.0 + e95), "the contended passes' p95 was " + std::to_string(p95) + " ms, over " +
+                                          std::to_string(bound) + " ms and the price's e95 of " +
+                                          std::to_string(e95));
 }
 
 // Behaviour change 5: groups follow the fixed part a group saves: on a
@@ -1813,13 +1974,15 @@ void testARegroupHappensOnlyWhenTheSumFalls() {
 // abandoned itself after every pass where those outweighed 2 (K' - R): on
 // the M6 smoke, 24 passes at a learned u of 53-72 ms. Whether they do here
 // follows from the turnaround the fit learns, so each case requires that
-// they would. The 150 ms profile learns 24.3 ms and the 225 ms one 68.8 ms,
-// inside the smoke's band, each in 48 passes (no lanes priced 1165.6 and
-// 3301.8 ms against 791.8 and 941.8); at 5 and 60 ms the fit learns none,
-// so the old price of no lanes is nothing as well and those profiles cannot
-// tell the prices apart.
+// they would. The 20 ms profile learns 20.2 ms and the 30 ms one 30.0 ms,
+// which the first command's rows, run again in other passes, tell it, each
+// in 48 passes (no lanes priced 970.1 and 1438.2 ms against 533.5 and
+// 553.5); the 5 ms one learns 5.0 ms in 24 passes, too few to tell the
+// prices apart, and at 40-225 ms the commands, all in 48 passes, tell the
+// fit none (testStartupUnitsOfOneShapeLeaveTheTurnaroundAtItsSeed), so the
+// old price of no lanes is nothing as well.
 void testARestartOfTheCommandsOwnRowsDoesNotSupersedeIt() {
-  for (const double turnaround : {150.0, 225.0}) {
+  for (const double turnaround : {20.0, 30.0}) {
     const test::TimingProfile profile = withTurnaround(test::kM6FlashNextQ2, turnaround);
     Sim sim(profile, limits(8192, 48));
     sim.seed();
@@ -2224,6 +2387,10 @@ constexpr test::TestCase kTests[] = {
     {"testPassesAddAtMostATenthOfTheCommand", testPassesAddAtMostATenthOfTheCommand},
     {"testPassesFollowCostOnAResidentTarget", testPassesFollowCostOnAResidentTarget},
     {"testWholeCommandsLeaveTheTurnaroundAtZero", testWholeCommandsLeaveTheTurnaroundAtZero},
+    {"testStartupUnitsOfOneShapeLeaveTheTurnaroundAtItsSeed", testStartupUnitsOfOneShapeLeaveTheTurnaroundAtItsSeed},
+    {"testThePlannedStartupLeavesTheTurnaroundWithinTwiceItsTruth",
+     testThePlannedStartupLeavesTheTurnaroundWithinTwiceItsTruth},
+    {"testVariedPromptsLeaveTheBoundAtG", testVariedPromptsLeaveTheBoundAtG},
     {"testGroupRowsFollowTheFixedCost", testGroupRowsFollowTheFixedCost},
     {"testANearlyResidentStoreRunsChunks", testANearlyResidentStoreRunsChunks},
     {"testThePairBoundIsPerLayerAndOnlyRowsMeetIt", testThePairBoundIsPerLayerAndOnlyRowsMeetIt},
