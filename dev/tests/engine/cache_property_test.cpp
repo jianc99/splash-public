@@ -498,7 +498,10 @@ void testRandomRuns(uint32_t plainSeeds, uint32_t windowedSeeds) {
 // can (9349). So does windowed seed 25949: in it restores no request holds
 // land with the demotion in flight, and the claim's first retry takes those
 // leaves, with the first later step, before what the next landings free;
-// the extent they empty leaves the next demotions out of reach.
+// the extent they empty leaves the next demotions out of reach. And windowed
+// seed 28462: in it a unit takes the state on a block whose demotion is in
+// flight and on which a request's chain ends, so its page frees as nothing
+// lands.
 void testPeekNeverOverstates(uint32_t plainSeeds, uint32_t windowedSeeds) {
   uint64_t exact = 0, unsure = 0, landing = 0;
   const auto check = [&](uint32_t seed, bool windowed) {
@@ -522,8 +525,9 @@ void testPeekNeverOverstates(uint32_t plainSeeds, uint32_t windowedSeeds) {
   check(2484, true);
   check(9349, true);
   check(25949, true);
+  check(28462, true);
   std::cout << "cache peek runs ok: " << plainSeeds << " plain seeds, " << windowedSeeds
-            << " windowed and windowed seeds 2484, 9349 and 25949; " << exact
+            << " windowed and windowed seeds 2484, 9349, 25949 and 28462; " << exact
             << " units released what they were weighed at, "
             << unsure << " after a copy or a write, " << landing
             << " freeing extents as their copies land, never more than taken\n";

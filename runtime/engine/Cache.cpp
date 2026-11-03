@@ -1089,6 +1089,7 @@ private:
   [[nodiscard]] bool needed(uint64_t block) const;
   [[nodiscard]] bool stateBelow(uint64_t block) const;
   [[nodiscard]] bool leaf(uint64_t block, bool onceLanded = false) const;
+  [[nodiscard]] bool used(uint64_t block) const;
   [[nodiscard]] uint32_t leafGeneration(uint64_t block) const;
   void joinSelf(uint64_t block);
   [[nodiscard]] bool ramState(uint64_t block) const;
@@ -1809,19 +1810,25 @@ bool Cache::ReclaimPlan::leaf(uint64_t block, bool onceLanded) const {
   const KvCache &kv = cache.kv_;
   if (!kv.contains(block) || leftRam_.contains(block) || demoting_.contains(block))
     return false;
-  const uint32_t page = kv.page(block);
-  // A parent a request or a lease uses, holds or reads stays no leaf.
-  if (page == KvCache::noPage || !kv.matchable(block) || kv.held(block) || cache.pool_.pageActive(page) ||
+  if (kv.page(block) == KvCache::noPage || used(block) ||
       (kv.transfer(block) != KvCache::Transfer::None &&
-       !(onceLanded && (copyingAhead_.contains(block) || restoring_.contains(block)))) ||
-      cache.states_.pinned(block) || std::ranges::any_of(cache.requests_, [&](const auto &entry) {
-        return !entry.second.cachedBlocks.empty() && entry.second.cachedBlocks.back() == block;
-      }))
+       !(onceLanded && (copyingAhead_.contains(block) || restoring_.contains(block)))))
     return false;
   return std::ranges::none_of(kv.children(block), [&](uint64_t child) {
     return kv.page(child) != KvCache::noPage && !leftRam_.contains(child) &&
            !(onceLanded && demoting_.contains(child));
   });
+}
+
+// A request or a lease uses, holds or reads the resident block, or a failed
+// read poisoned it: it stays no leaf (KvCache::residentLeaf), and its page
+// frees as no demotion lands (Cache::freesOnLanding).
+bool Cache::ReclaimPlan::used(uint64_t block) const {
+  const KvCache &kv = cache.kv_;
+  return !kv.matchable(block) || kv.held(block) || cache.pool_.pageActive(kv.page(block)) ||
+         cache.states_.pinned(block) || std::ranges::any_of(cache.requests_, [&](const auto &entry) {
+           return !entry.second.cachedBlocks.empty() && entry.second.cachedBlocks.back() == block;
+         });
 }
 
 // The generation from which a leaf once landed is one: its own copy ahead
@@ -1954,13 +1961,13 @@ void Cache::ReclaimPlan::stateOut(uint64_t block, bool inUse) {
 
 // A demotion in flight on a block that was no resident leaf, or kept a
 // state in RAM, frees its page as it lands once the block's last resident
-// child or its state left RAM (Cache::freesOnLanding): for a claim that can
-// wait, the page lands, with the transfers in flight or once what held it
-// left, and the parent goes once it has.
+// child or its state left RAM, unless a request or a lease still uses it
+// (Cache::freesOnLanding): for a claim that can wait, the page lands, with
+// the transfers in flight or once what held it left, and the parent goes
+// once it has.
 void Cache::ReclaimPlan::demotionLands(uint64_t block) {
   const KvCache &kv = cache.kv_;
-  if (timing() == ReclaimTiming::Immediate || !heldDemotions_.contains(block) || ramState(block) ||
-      cache.pool_.pageActive(kv.page(block)) ||
+  if (timing() == ReclaimTiming::Immediate || !heldDemotions_.contains(block) || ramState(block) || used(block) ||
       std::ranges::any_of(kv.children(block), [&](uint64_t child) {
         return kv.page(child) != KvCache::noPage && !leftRam_.contains(child);
       }))
