@@ -436,7 +436,7 @@ SpilledExtents Engine::landedExtents() const {
                                                                      : SpilledExtents::Released;
 }
 
-void Engine::spillLanded() {
+void Engine::spillLanded(bool controlPass) {
   if (!config_.spill.capable)
     return;
   // The Index runway the pages draw on refills if memory allows. The Index
@@ -450,6 +450,8 @@ void Engine::spillLanded() {
   for (const auto &[_, active] : requests_)
     if (active.lane && active.kvMode == KvMode::Spill && (!needed || rankOf(active) > rankOf(*needed)))
       needed = &active;
+  if (!needed && !controlPass)
+    return;
   static_cast<void>(allocate([&] { return cache_.spillWritten(extents); },
                              {.cls = needed ? ClaimClass::InService : ClaimClass::Optional,
                               .rank = needed ? rankOf(*needed) : ClaimRank{},
@@ -1077,7 +1079,7 @@ void Engine::collectLandings(double now) {
     if (config_.spill.capable)
       static_cast<void>(cache_.writeThrough());
   }
-  spillLanded();
+  spillLanded(true);
   governor().ledger().setLanes(laneDemandBytes(), highestLanePriority());
   // The chains requests without a lane restore once they start: admission's
   // probes brought up to date, and for those it has not probed, probes of

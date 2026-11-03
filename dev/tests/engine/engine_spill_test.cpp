@@ -2035,6 +2035,36 @@ void testFailedRestoreReturnsTheCommitment() {
           "the start did not run from the prefix that remained");
 }
 
+// With no Spill lane in service the Index runway refills in the control
+// pass alone (collectLandings): what a command needs of the Index pages is a
+// Spill lane's, and a refill the host refuses, an Optional claim's free(),
+// would run at every tick and command until it stood. A Resident request
+// decodes beside a missing runway whose refill is refused, and no tick or
+// command asks for it.
+void testWithNoSpillLaneTheRunwayRefillsInTheControlPass() {
+  Spilling spill(1024, false);
+  require(spill.pool.reclaimEmptyExtents(false, 1, kv::PageForm::Index) &&
+              !spill.pool.allocatedExtents(kv::PageForm::Index),
+          "fixture: the Index runway stayed");
+  uint32_t refills = 0;
+  spill.storage.growthAllowed = [&](uint32_t) {
+    for (const auto &[_, state] : spill.host.governor.ledger().claims())
+      if (!state.spec.requestId && state.spec.cls == ClaimClass::Optional &&
+          state.spec.timing == NeedTiming::Immediate) {
+        ++refills;
+        return false;
+      }
+    return true;
+  };
+  spill.engine.submit(Spilling::prompt(1, 1, 3, 16));
+  spill.runUntilIdle();
+  const SpillRequestsSnapshot counts = spill.engine.snapshot().spill;
+  require(spill.events.completedCount == 1 && counts.resident == 1 && counts.spill == 0,
+          "fixture: the request did not run Resident");
+  require(!refills, "with no Spill lane in service the refused Index runway refill was asked " +
+                        std::to_string(refills) + " times in ticks and commands");
+}
+
 // A start whose cached chain is only on disk restores its dense history
 // into Full pages and the rest into Index pages. At the wall a refusal of its
 // Index extent gives back the Full pages the attempt took, which leaves their
@@ -2438,6 +2468,7 @@ std::span<const test::TestCase> spillTests() {
       {"testProjectionClipsTheOutput", testProjectionClipsTheOutput},
       {"testFailedRestoreReturnsTheCommitment", testFailedRestoreReturnsTheCommitment},
       {"testARestoreOfTwoFormsKeepsTheFreePagesItTakes", testARestoreOfTwoFormsKeepsTheFreePagesItTakes},
+      {"testWithNoSpillLaneTheRunwayRefillsInTheControlPass", testWithNoSpillLaneTheRunwayRefillsInTheControlPass},
       {"testPreemptedSpillPrefillResumesFromItsDurablePrefix", testPreemptedSpillPrefillResumesFromItsDurablePrefix},
   };
   return kTests;

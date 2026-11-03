@@ -297,7 +297,7 @@ bool Engine::tick(double now) {
     }
   }
   // Pages whose copies landed leave memory before admission judges it.
-  spillLanded();
+  spillLanded(false);
   // The tick's host time runs from here, its first planning call, to the
   // submission of the command it plans (tickHostMilliseconds).
   const AwakeClock::time_point planning = AwakeClock::now();
@@ -1543,7 +1543,7 @@ Engine::Prepared Engine::prepare(const BatchPlan &plan, std::vector<ModelBatchIt
     return false;
   };
   // Pages whose copies have landed leave memory before any lane grows.
-  spillLanded();
+  spillLanded(false);
   // So do a windowed layout's windowed layers' K/V of the pages every
   // window has passed, the processed rows' (Cache::trimWindows): into the
   // Slim runway and what memory allows, the rest Full for a later pass. A

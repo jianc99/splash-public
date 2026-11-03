@@ -719,8 +719,9 @@ private:
   // memory finds it rather than taking more. The Index pages they take are
   // memory a Spill lane in service needs (an InService claim of the
   // engine's), and with none in service an Optional one that takes only
-  // what costs nothing (allocate()).
-  void spillLanded();
+  // what costs nothing (allocate()), which only the control pass asks: no
+  // command needs the runway then, and a refusal would run at each.
+  void spillLanded(bool controlPass);
   // Ends a request at its length outside a command: in Spill mode, once
   // the SSD cache can hold no more of its KV.
   void endAtLength(Request &request);
