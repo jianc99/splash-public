@@ -888,44 +888,41 @@ def gap_bound(status: dict, share: float) -> dict | None:
     }
 
 
+def rose(path: str):
+    """A gap cause shown by a counter that rose across the samples."""
+    return lambda around: value(around[-1], path, 0) > value(around[0], path, 0)
+
+
+# The causes of a decode gap (Borrowed item 4, owner 21:05), in the order
+# gap_causes tries them on the /status samples around the gap: a claim
+# waiting in any of them, the experts' size changing between any two, or a
+# counter rising across them. Nearly every churn window commits a prefill
+# command, so a prefill unit comes last.
 GAP_CAUSES = (
-    ("claim wait", lambda a, b: value(b, "memory_governor.claims.waiting", 0) > 0),
-    ("store resize", lambda a, b: store_size(a) != store_size(b)),
     (
-        "compaction",
-        lambda a, b: (
-            value(b, "kv.extent_compactions", 0) > value(a, "kv.extent_compactions", 0)
+        "claim wait",
+        lambda around: any(
+            value(s, "memory_governor.claims.waiting", 0) > 0 for s in around
         ),
     ),
-    (
-        "replan",
-        lambda a, b: (
-            value(b, "scheduler.replans", 0) > value(a, "scheduler.replans", 0)
-        ),
-    ),
-    (
-        "history wait",
-        lambda a, b: (
-            value(b, "kv_spill.history_stream.wait_ms.total", 0)
-            > value(a, "kv_spill.history_stream.wait_ms.total", 0)
-        ),
-    ),
-    (
-        "prefill unit",
-        lambda a, b: (
-            value(b, "scheduler.prefill_batches", 0)
-            > value(a, "scheduler.prefill_batches", 0)
-        ),
-    ),
+    ("store resize", lambda around: len({store_size(s) for s in around}) > 1),
+    ("compaction", rose("kv.extent_compactions")),
+    ("replan", rose("scheduler.replans")),
+    ("history wait", rose("kv_spill.history_stream.wait_ms.total")),
+    ("prefill unit", rose("scheduler.prefill_batches")),
 )
 
 
 def gap_causes(run: Run, bound_s: float) -> dict:
-    """Each client gap above the bound, attributed to the first cause the
-    samples around it show, in GAP_CAUSES order, else unattributed."""
+    """Every client gap above the bound, from each request's chunk times
+    (its gap summary lists only those of a second or more), attributed to
+    the first cause in GAP_CAUSES the samples from 2 s before it to 2 s
+    after it show, else unattributed."""
     causes: dict[str, int] = {}
     for record in run.done.values():
-        for end, length in (record.get("gap") or {}).get("long", []):
+        chunks = record.get("chunks_ms") or []
+        for earlier, later in zip(chunks, chunks[1:]):
+            length, end = (later - earlier) / 1000, record["start"] + later / 1000
             if length <= bound_s:
                 continue
             around = [
@@ -936,8 +933,7 @@ def gap_causes(run: Run, bound_s: float) -> dict:
             cause = "unattributed"
             if len(around) >= 2:
                 cause = next(
-                    (name for name, test in GAP_CAUSES if test(around[0], around[-1])),
-                    cause,
+                    (name for name, shows in GAP_CAUSES if shows(around)), cause
                 )
             causes[cause] = causes.get(cause, 0) + 1
     return causes

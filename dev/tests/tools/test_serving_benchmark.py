@@ -1974,6 +1974,63 @@ class GateTests(unittest.TestCase):
             [(v["rule"], v["verdict"], v["numbers"]) for v in verdicts],
         )
 
+    def test_every_gap_above_the_bound_takes_the_first_cause_it_shows(self):
+        # Borrowed item 4 on m6-fn-churn cand, whose limit is 960 ms: each
+        # gap above it, also one of 0.98 s that the gap summary (gaps of a
+        # second or more) leaves out, takes the first cause in GAP_CAUSES
+        # that the /status samples from 2 s before it to 2 s after it show,
+        # here 97.5-102.5 s around a gap from 99.1 s; a claim waits in a
+        # sample inside the gap, gone by its end. One sample there shows no
+        # change: the gap is unattributed.
+        experts = [
+            {"name": "kv", "current_bytes": 100, "cap_bytes": 100},
+            {"name": "experts", "current_bytes": 100, "cap_bytes": 200},
+        ]
+        shows = {
+            "claim wait": {2: {"memory_governor__claims": {"waiting": 1}}},
+            "store resize": {
+                i: {"memory_governor__accounts": experts} for i in (3, 4, 5)
+            },
+            "compaction": {i: {"kv__extent_compactions": 1} for i in (3, 4, 5)},
+            "replan": {i: {"scheduler__replans": 1} for i in (3, 4, 5)},
+            "history wait": {
+                i: {"kv_spill__history_stream__wait_ms": {"total": 300.0}}
+                for i in (3, 4, 5)
+            },
+            "prefill unit": {i: {"scheduler__prefill_batches": 1} for i in (3, 4, 5)},
+        }
+
+        def causes(names, gap_ms=1500, times=(97.5, 98.5, 99.5, 100.5, 101.5, 102.5)):
+            samples = []
+            for index, t in enumerate(times):
+                fields = {}
+                for name in names:
+                    fields.update(shows[name].get(index, {}))
+                samples.append(self.schema7(t, **fields))
+            chunks = [0, 100, 100 + gap_ms, 200 + gap_ms]
+            done = {
+                "tag": "w0-r1",
+                "start": 99.0,
+                "t": 104,
+                "ttft": 0.1,
+                "decode_tps": 30,
+                "chunks_ms": chunks,
+                "gap": clients.gap_summary([99.0 + c / 1000 for c in chunks], 0.0),
+            }
+            run = churn_run(self.directory, "gaps", [done], samples)
+            return matrix.gap_causes(run, 0.96)
+
+        order = [name for name, _ in matrix.GAP_CAUSES]
+        self.assertEqual(order, list(shows))
+        for index, cause in enumerate(order):
+            self.assertEqual(causes(order[index:]), {cause: 1}, cause)
+        self.assertEqual(causes(["prefill unit"], gap_ms=980), {"prefill unit": 1})
+        self.assertEqual(causes(["prefill unit"], gap_ms=900), {})
+        self.assertEqual(causes([]), {"unattributed": 1})
+        self.assertEqual(
+            causes(["claim wait"], times=(80.0, 90.0, 100.0)), {"unattributed": 1}
+        )
+
     def test_check_finds_a_silent_worker_and_a_short_run(self):
         done = [
             {"tag": f"w{w}-r1", "start": 0, "t": 100, "ttft": 5, "decode_tps": 30}

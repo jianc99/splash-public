@@ -485,4 +485,8 @@ sample interval's `prefill_rows` per committed command, p10, p50, p90 and
 max, with its pass commands and units) and its
 `scheduler.index_page_conflicts` per 15 minutes; a run past 5 per 15
 minutes (`index_page_conflicts_per_15min`, the scheduler's bound) is
-reported to the owner.
+reported to the owner. It counts its client gaps above its G4 bound by
+cause, each gap taking the first of these that the `/status` samples from
+2 s before it to 2 s after it show: a claim waiting for memory, the
+experts' size changing, a compaction, a replan, a history-stream wait, a
+committed prefill command; else it is unattributed.
