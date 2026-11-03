@@ -95,8 +95,9 @@ class StatusContractTests(unittest.TestCase):
             )
 
     def test_write_behind_counts_are_documented(self):
-        # A reader waiting for an idle engine goes by this row of docs/api.md:
-        # the restore points queued for their copies (`waiting`) are not work.
+        # A reader waiting for an idle engine goes by this row of docs/api.md
+        # to tell when the restore points queued for their copies (`waiting`)
+        # are SSD work still to come.
         status = json.loads(GOLDEN.read_text())
         first, *rest = status["disk"]["write_behind"]
         api = Path(__file__).parents[3] / "docs/api.md"
