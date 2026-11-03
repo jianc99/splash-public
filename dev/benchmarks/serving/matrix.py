@@ -1441,7 +1441,8 @@ def churn_cell(
             if result != PASS and cell.get("memory_cap") and kept and throughput:
                 # OQ2 (owner 20:45): under a memory cap G3 also passes when G2
                 # passes, decodes never froze, and the TTFT is no worse than
-                # the cell's best tree that kept decodes running.
+                # the cell's best tree that kept decodes running, which
+                # without a usable run of that tree is not known.
                 g2 = next(
                     (
                         v["verdict"]
@@ -1451,8 +1452,10 @@ def churn_cell(
                     FAIL,
                 )
                 best = compare(used, machine, prices, candidate, kept, "ttft")["pooled"]
-                no_worse = stats.verdict(best, False, 0.0) != FAIL
-                result = PASS if g2 == PASS and holds and no_worse else FAIL
+                if g2 != PASS or not holds or stats.verdict(best, False, 0.0) == FAIL:
+                    result = FAIL
+                else:
+                    result = PASS if best else INCONCLUSIVE
                 why = f"OQ2: G2 {g2}, G4 {'holds' if holds else 'fails'}, TTFT vs {kept} {stats.ratio_text(best)}"
             record(
                 f"G3 {candidate} vs {ttft}",

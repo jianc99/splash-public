@@ -465,7 +465,7 @@ resolve it.
 | Gate | Rule |
 | --- | --- |
 | G1, G2 | work and decode rate against 1.5.0: within 5 % only with a clear gain on TTFT, completion latency, freezes (1.5.0's own runs with a decode gap at or past the machine's G4 floor while the candidate holds G4) or concurrent TTFT, else no loss at all; completion latency: no loss at all |
-| G3 | TTFT against main within 2 %, failing once surely worse; under a memory cap also when G2 passes, no decode froze, and the TTFT is not surely worse than the cell's best tree that kept decoding |
+| G3 | TTFT against main within 2 %, failing once surely worse; under a memory cap also when G2 passes, no decode froze, and the TTFT is not surely worse than the cell's best tree that kept decoding, INCONCLUSIVE when only a usable run of that tree is missing |
 | G4 | per candidate run: contended prefill p95 and the p99 of the client gaps between token events (chunks less than half the shortest decode command apart are one event's) within the run's own bound (`max(decode_gap_target_ms, u/0.1)` with its estimate's p95 error), every client gap under the smallest stall rejected on that machine |
 | G5 | concurrent TTFT: per N the median of each round's worst, at most the reference's times one plus its own spread |
 | G6 | ample memory: work, latency and TTFT within 2 % of the best measured tree, failing once surely worse |

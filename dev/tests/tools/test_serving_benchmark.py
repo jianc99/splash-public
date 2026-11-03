@@ -2198,6 +2198,64 @@ class GateTests(unittest.TestCase):
             resident["prefetch_coverage"], {"prefill": None, "decode": None}
         )
 
+    def test_g3_under_a_memory_cap_follows_oq2(self):
+        # s-fn-churn-18g (OQ2, owner 20:45): cand's TTFT is surely worse than
+        # main's. G3 passes only when G2 passes, cand holds G4 and its TTFT
+        # is not surely worse than intp's, the tree that kept decoding; it
+        # fails otherwise, and without a usable intp run it is not known.
+        def make(label, tree, order, ttft, latency, chunks=(0, 100, 200)):
+            done = [
+                {
+                    "tag": f"w{w}-r1",
+                    "start": 0,
+                    "t": latency,
+                    "ttft": ttft,
+                    "decode_tps": 30,
+                    "chunks_ms": list(chunks),
+                }
+                for w in range(3)
+            ]
+            r = churn_run(self.directory, label, done, [status(900, rows=585000)])
+            r.tree, r.order = tree, order
+            return r
+
+        cell = {
+            "name": "s",
+            "machine": "studio",
+            "release": {"throughput": "r150", "ttft": "main"},
+            "memory_cap": True,
+            "kept_decodes_reference": "intp",
+            "health": ["cand"],
+        }
+
+        def g3(ttft=130, latency=150, intp=130, chunks=(0, 100, 200)):
+            runs = [
+                make(f"{tree}{o}{i}", tree, o, 100 + i, 200 + i)
+                for tree in ("r150", "main")
+                for o in "AB"
+                for i in range(2)
+            ]
+            runs += [
+                make(f"intp{o}{i}", "intp", o, intp + i, 200 + i)
+                for o in "AB"
+                for i in range(2)
+                if intp is not None
+            ]
+            runs += [
+                make(f"cand{o}{i}", "cand", o, ttft + i, latency + i, chunks)
+                for o in "AB"
+                for i in range(2)
+            ]
+            found = matrix.churn_cell(cell, self.spec, runs, {}, PRICES)
+            g3 = next(v for v in found if v["rule"] == "G3 cand vs main")
+            return g3["verdict"], g3["numbers"]["why"].split(", TTFT")[0]
+
+        self.assertEqual(g3(), (stats.PASS, "OQ2: G2 pass, G4 holds"))
+        self.assertEqual(g3(intp=100), (stats.FAIL, "OQ2: G2 pass, G4 holds"))
+        self.assertEqual(g3(latency=250), (stats.FAIL, "OQ2: G2 fail, G4 holds"))
+        self.assertEqual(g3(chunks=(0, 8000)), (stats.FAIL, "OQ2: G2 pass, G4 fails"))
+        self.assertEqual(g3(intp=None), (stats.INCONCLUSIVE, "OQ2: G2 pass, G4 holds"))
+
     def test_check_finds_a_silent_worker_and_a_short_run(self):
         done = [
             {"tag": f"w{w}-r1", "start": 0, "t": 100, "ttft": 5, "decode_tps": 30}
