@@ -121,6 +121,13 @@ struct MemoryAccountSnapshot final {
   // cost, from the hits the pool counts within a unit of its edge.
   double growValuePerGiB = 0.0;
   double shrinkValuePerGiB = 0.0;
+  // A pool's regrowth as its rule prices it (amend/V.md A30): the units
+  // claims take of it a second (MemoryLedger::takesPerSecond), and what its
+  // next unit saves over the horizon should no claim take it back within it,
+  // beyond its cycle, at that rate (value::regrowthSeconds); 0 at its cap.
+  // Not in /status.
+  double takesPerSecond = 0.0;
+  double regrowthSeconds = 0.0;
   // Units it took and gave back since the engine started.
   uint64_t grows = 0;
   uint64_t shrinks = 0;

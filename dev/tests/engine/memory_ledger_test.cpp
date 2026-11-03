@@ -2194,6 +2194,66 @@ void testTheTakeRateDecaysWhileTheEngineIdles() {
           "the store did not grow back as the take rate decayed over the idle time");
 }
 
+// The governor's snapshot shows a pool's regrowth as its rule prices it
+// (amend/V.md A30), which a check of the rule reads: the rate claims take its
+// units at, and what its next unit saves over the horizon at that rate beyond
+// its cycle. testTheTakeRateDecaysWhileTheEngineIdles's store, idle 45 s after
+// the prompt that took its unit ended: the rate is 0.0073 a second, the unit
+// keeps 0.97 of its cycle, and it is still short; it grows back in the pass
+// that turns the regrowth to gaining. At its cap there is no next unit to
+// gain by.
+void testTheSnapshotShowsTheRegrowthItsRuleTests() {
+  Fixture fixture(host(800 * kMiB + 17 * kGiB), 16 * kGiB);
+  FakeElasticPool experts("experts", fixture.memory, kGiB, 2, 4, 104, 4, 0.1, 51.4);
+  experts.keyBytes = 1382000;
+  TestSource cache("cache", &fixture.memory);
+  MemoryLedger &ledger = fixture.ledger();
+  ledger.addSource(cache);
+  ledger.addPool(experts);
+  serve(ledger, experts, 3228.0, 0.0, 10.0);
+  fixture.memory.hold("weights", 11 * kGiB);
+  cache.units = {unit(1, kGiB, 9.0, true)};
+  const ClaimId prompt = ledger.open(request(1, RequestPriority::Normal, ClaimClass::InService, 60.0));
+  require(fixture.allocateFreeing(prompt, 2 * kGiB) && experts.units() == 3, "the prompt did not take a store unit");
+  for (double seconds = 10.5; seconds <= 15.0; seconds += 0.5) {
+    experts.served(0, 1614, 0, 0);
+    static_cast<void>(fixture.pass(seconds));
+  }
+  ledger.close(prompt);
+  fixture.memory.release("kv", 2 * kGiB);
+  fixture.memory.hold("cache", 3 * kGiB);
+  cache.units = {unit(2, kGiB, 0.0), unit(3, kGiB, 0.0), unit(4, kGiB, 0.0)};
+  for (double seconds = 15.5; seconds <= 60.0; seconds += 0.5)
+    static_cast<void>(fixture.pass(seconds, false));
+  const auto pool = [&] { return fixture.governor->snapshot().accounts.back(); };
+  const MemoryAccountSnapshot short60 = pool();
+  // 0.194 s x e^(-0.0073 x 60) - 0.129 s.
+  require(short60.name == "experts" && experts.units() == 3 && std::abs(short60.takesPerSecond - 0.0073) < 0.0002 &&
+              short60.regrowthSeconds < 0.0 && short60.regrowthSeconds > -0.01,
+          "at 60 s the snapshot showed " + std::to_string(short60.takesPerSecond) + " takes a second and a regrowth of " +
+              std::to_string(short60.regrowthSeconds) + " s, the store at " + std::to_string(experts.units()) +
+              " units");
+  // A pass decays the rate by e^(-0.5/60) and the regrowth by under 1 ms:
+  // the store grows back in the pass whose snapshot before it shows the
+  // regrowth within that of gaining, and in none before.
+  std::optional<double> grewAt;
+  double before = short60.regrowthSeconds;
+  for (double seconds = 60.5; seconds <= 70.0 && !grewAt; seconds += 0.5) {
+    before = pool().regrowthSeconds;
+    static_cast<void>(fixture.pass(seconds, false));
+    if (experts.units() == 4)
+      grewAt = seconds;
+    else
+      require(before < 0.0, "the snapshot showed the regrowth gaining " + std::to_string(before) +
+                                " s before the pass at " + std::to_string(seconds) + " s, which did not grow it back");
+  }
+  const MemoryAccountSnapshot grown = pool();
+  require(grewAt && std::abs(before) < 0.001 && grown.regrowthSeconds == 0.0 && grown.takesPerSecond > 0.0,
+          "the store grew back at " + std::to_string(grewAt.value_or(0.0)) + " s with the snapshot before it showing " +
+              std::to_string(before) + " s of regrowth, or at its cap a regrowth of " +
+              std::to_string(grown.regrowthSeconds) + " s");
+}
+
 // A lane that prefills into a store unit it took and then decodes alone has
 // the store grow the unit back right after its prefill (owner rule 12;
 // amend/V.md A30's regrowth lower bound, owner 11-03 03:55): its claim is in
@@ -3569,6 +3629,7 @@ std::span<const test::TestCase> ledgerTests() {
       {"testStoreRegrowsByDisplacementInTheBand", testStoreRegrowsByDisplacementInTheBand},
       {"testTheStoreRegrowsBeforeTheWarningPassTakesItsCache", testTheStoreRegrowsBeforeTheWarningPassTakesItsCache},
       {"testTheTakeRateDecaysWhileTheEngineIdles", testTheTakeRateDecaysWhileTheEngineIdles},
+      {"testTheSnapshotShowsTheRegrowthItsRuleTests", testTheSnapshotShowsTheRegrowthItsRuleTests},
       {"testAUnitAPrefillTookGrowsBackOnceItsLaneDecodesAlone",
        testAUnitAPrefillTookGrowsBackOnceItsLaneDecodesAlone},
       {"testGrowthPendsOnlyOnItsOwnVictims", testGrowthPendsOnlyOnItsOwnVictims},

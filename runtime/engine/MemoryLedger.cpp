@@ -1014,6 +1014,11 @@ void MemoryLedger::fill(MemoryGovernorSnapshot &snapshot, uint64_t chargedBytes)
         row.growValuePerGiB = margin.growRatePerSecond * kValueHorizonSeconds * kGiB / double(row.unitBytes);
         row.shrinkValuePerGiB = margin.shrinkRatePerSecond * kValueHorizonSeconds * kGiB / double(row.unitBytes);
       }
+      row.takesPerSecond = takesPerSecond(index);
+      if (state.growUnitBytes)
+        row.regrowthSeconds = value::regrowthSeconds(
+            value::growthBenefit(account.rate, counters, state.growUnitBytes, missingBytes(state), rates_),
+            value::cycleSeconds(counters, state.growUnitBytes), row.takesPerSecond);
     } else {
       row.currentBytes = account.current();
       row.capBytes = row.currentBytes;
