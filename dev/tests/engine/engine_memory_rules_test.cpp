@@ -17,6 +17,7 @@
 
 #include <array>
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <functional>
 #include <limits>
@@ -608,6 +609,41 @@ void testAJunctionTakesNothingWorthMoreThanItSaves() {
               " states\n" + decisions);
 }
 
+// The cache's reuse, which prices every unit not certain to be reused, is the
+// probes' hit share over the rates' time constant (design/M.md section 4.3;
+// kRateTimeConstantSeconds), not over the server's life: after ten minutes
+// of turns that each hit the cache, a minute of prompts that each miss it
+// leaves e^-1 of the share, as a workload that moved on would have it.
+void testCacheReuseFollowsTheRecentProbes() {
+  test::TestKvStorage storage(256, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache cache(pool, nullptr, nullptr);
+  Executor model(1);
+  Events events;
+  const EngineConfig config = test::engineConfig();
+  engine::Engine engine(config, cache, model, events);
+  guardReleases(storage, engine);
+  double now = 1;
+  uint64_t id = 0;
+  // One request every 10 s, the control pass's rates refreshed after each.
+  const auto serve = [&](uint32_t token) {
+    EngineRequest value = request(++id, std::vector<uint32_t>(65, token));
+    value.deadlineMilliseconds = 1e12;
+    engine.submit(std::move(value));
+    test::tickUntil(engine, now, [&] { return idle(engine); }, "a request did not finish");
+    now += 10'000;
+    engine.refreshMemoryRates(now);
+  };
+  for (int turn = 0; turn <= 60; ++turn)
+    serve(7);
+  for (uint32_t miss = 0; miss < 6; ++miss)
+    serve(1000 + miss);
+  const double reuse = config.governor->ledger().rates().reuse;
+  require(engine.snapshot().cacheHits == 60 && std::abs(reuse - std::exp(-1.0)) < 0.02,
+          "the cache's reuse did not follow the recent probes: " + std::to_string(reuse) + " after " +
+              std::to_string(engine.snapshot().cacheHits) + " hits, where e^-1 is 0.368");
+}
+
 } // namespace
 
 std::span<const test::TestCase> rulesTests() {
@@ -622,6 +658,7 @@ std::span<const test::TestCase> rulesTests() {
       {"testARestoredStateIsPromotedInAClaim", testARestoredStateIsPromotedInAClaim},
       {"testAReplayPointBesideACheckpointIsReservedInAClaim", testAReplayPointBesideACheckpointIsReservedInAClaim},
       {"testAJunctionTakesNothingWorthMoreThanItSaves", testAJunctionTakesNothingWorthMoreThanItSaves},
+      {"testCacheReuseFollowsTheRecentProbes", testCacheReuseFollowsTheRecentProbes},
   };
   return kTests;
 }

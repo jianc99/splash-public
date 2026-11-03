@@ -141,9 +141,11 @@ struct MemoryRates final {
   // sample.
   double spilledReadMillisecondsPerLaneCommand = 9.0;
   double decodeTokensPerLaneCommand = 0.0;  // Scheduler::decodeTokensPerLaneCommand
-  // Model::loadReads's SSD rate until the KV tier has read (KvTier::throughput).
+  // Model::loadReads's SSD rate until the KV tier has read, then its read
+  // throughput (KvTier::throughput), over kRateTimeConstantSeconds.
   double tierReadBytesPerSecond = 0.0;
-  double reuse = 0.0;                     // the probes' hit share; 0 before the first probe
+  // The probes' hit share over kRateTimeConstantSeconds; 0 before probes.
+  double reuse = 0.0;
 };
 
 // What taking a unit gives up besides its bytes, which the claim's class

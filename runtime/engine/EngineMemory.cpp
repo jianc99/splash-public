@@ -1063,17 +1063,21 @@ void Engine::refreshMemoryRates(double now) {
   rates.spilledReadMillisecondsPerLaneCommand = spilledReadMilliseconds();
   rates.decodeTokensPerLaneCommand = scheduler_.decodeTokensPerLaneCommand();
   // The KV tier's reads once it has read, else the weights' load from the
-  // same SSD (Model::loadReads).
+  // same SSD (Model::loadReads), and the probes' hit share: each over the
+  // rates' time constant, as the pools' rates (design/M.md section 4.3).
+  const double seconds = now / 1000.0;
+  const bool ran = commandsApplied_ != commandsAtRates_;
   const KvTierThroughput tier = cache_.tierThroughput();
+  tierReads_.observe(double(tier.readBytes), tier.readSeconds, seconds, ran);
+  reuse_.observe(double(counters_.cacheHits), double(counters_.cacheHits + counters_.coldMisses), seconds, ran);
   const model::SsdReads load = model_.loadReads();
-  if (tier.readBytes && tier.readSeconds > 0.0)
-    rates.tierReadBytesPerSecond = double(tier.readBytes) / tier.readSeconds;
+  if (const std::optional<double> read = tierReads_.value(); read && *read > 0.0)
+    rates.tierReadBytesPerSecond = *read;
   else if (load.bytes && load.milliseconds > 0.0)
     rates.tierReadBytesPerSecond = double(load.bytes) / (load.milliseconds / 1000.0);
-  if (const uint64_t probes = counters_.cacheHits + counters_.coldMisses)
-    rates.reuse = double(counters_.cacheHits) / double(probes);
+  rates.reuse = reuse_.value().value_or(0.0);
   ledger.setRates(rates);
-  ledger.observePools(now / 1000.0, commandsApplied_ != commandsAtRates_);
+  ledger.observePools(seconds, ran);
   commandsAtRates_ = commandsApplied_;
 }
 

@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdint>
 #include <optional>
+#include <utility>
 
 // What memory is worth, in seconds of engine work: the prices the ledger
 // compares units by, from measured inputs.
@@ -56,6 +57,35 @@ private:
   std::optional<Counters> last_;
   double lastSeconds_ = 0.0;
   std::optional<Rates> rates_;
+};
+
+// The ratio of two monotonic counts over the same time constant: the cache's
+// probe hit share (hits over probes), the KV tier's read throughput (bytes
+// over seconds). Each count's rate is an EWMA updated, as PoolRate's, only
+// over intervals in which the engine ran a command, the first such interval
+// setting it; none until the denominator has moved.
+class RatioRate final {
+public:
+  void observe(double numerator, double denominator, double nowSeconds, bool commandsRan) noexcept {
+    if (last_ && commandsRan && nowSeconds > lastSeconds_) {
+      const double seconds = nowSeconds - lastSeconds_;
+      const double weight = rated_ ? 1.0 - std::exp(-seconds / kRateTimeConstantSeconds) : 1.0;
+      numerator_ += weight * ((numerator - last_->first) / seconds - numerator_);
+      denominator_ += weight * ((denominator - last_->second) / seconds - denominator_);
+      rated_ = true;
+    }
+    last_ = {numerator, denominator};
+    lastSeconds_ = nowSeconds;
+  }
+  [[nodiscard]] std::optional<double> value() const noexcept {
+    return denominator_ > 0.0 ? std::optional<double>(numerator_ / denominator_) : std::nullopt;
+  }
+
+private:
+  std::optional<std::pair<double, double>> last_;
+  double lastSeconds_ = 0.0;
+  double numerator_ = 0.0, denominator_ = 0.0;
+  bool rated_ = false;
 };
 
 // A pool's unit of `unitBytes`, kept away for `holdSeconds`. Decode: a ghost

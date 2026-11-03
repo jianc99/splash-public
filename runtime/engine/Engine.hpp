@@ -4,6 +4,7 @@
 #include "engine/Cache.hpp"
 #include "engine/MemoryGovernor.hpp"
 #include "engine/MemoryPlan.hpp"
+#include "engine/MemoryValue.hpp"
 #include "engine/Scheduler.hpp"
 #include "engine/Types.hpp"
 #include "engine/WeightResidency.hpp"
@@ -1171,6 +1172,9 @@ private:
   // rates move only across intervals in which the engine ran a command.
   uint64_t commandsApplied_ = 0;
   uint64_t commandsAtRates_ = 0;
+  // The cache's probe hit share and the KV tier's read throughput over the
+  // rates' time constant, over the same intervals (refreshMemoryRates).
+  value::RatioRate reuse_, tierReads_;
   EngineSnapshot counters_;
   // EngineSnapshot::tickHostMilliseconds.
   model::LatencyHistogram tickHosts_;
