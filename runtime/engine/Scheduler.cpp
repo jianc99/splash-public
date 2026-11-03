@@ -244,8 +244,8 @@ std::vector<uint64_t> Scheduler::prefillAdmissionOrder(std::span<const PrefillAd
   std::vector<Lane> lanes;
   lanes.reserve(requests_.size());
   std::vector<uint64_t> result;
-  for (const auto &[_, request] : requests_) {
-    if (request.phase == Phase::Prefill)
+  for (const auto &[id, request] : requests_) {
+    if (request.phase == Phase::Prefill && !shapeOf(id, in).ended)
       lanes.push_back(lane(request, request.promptProcessed, in));
   }
   // Admission starts only lanes the next command serves: it plans again
@@ -373,12 +373,13 @@ double Scheduler::supersedeGain(std::span<const BatchItem> lanes, uint32_t start
   const RequestPriority commandPriority = get(kept.items.front().requestId).spec.priority;
   // The command's measured passes and its predicted rest; what the lanes it
   // leaves out lose: their rows' whole command again, which is all of it
-  // when the plan keeps none of its lanes.
+  // when the plan keeps none of its lanes and none ended. A lane that ended
+  // loses nothing: no one waits for its rows.
   const double done = command.elapsedMilliseconds;
   const double rest = passesMilliseconds(prefillLanes(kept.items, in), kept.pass, kept.passes);
   std::vector<BatchItem> dropped;
   for (const BatchItem &item : kept.items)
-    if (!holds(lanes, item.requestId))
+    if (!holds(lanes, item.requestId) && !shapeOf(item.requestId, in).ended)
       dropped.push_back(item);
   const bool keepsSome = dropped.size() != kept.items.size();
   const double redone =
@@ -435,8 +436,9 @@ bool Scheduler::overdueOnceAbandoned(const PlanInputs &in) const {
   return std::ranges::any_of(in.passes->plan.items, [&](const BatchItem &item) {
     const Request &request = get(item.requestId);
     const Lane view = lane(request, request.promptProcessed, in);
-    return view.overdue ||
-           aged(request.waitedMilliseconds + in.passes->elapsedMilliseconds, view.remainingMilliseconds);
+    return !view.shape.ended &&
+           (view.overdue ||
+            aged(request.waitedMilliseconds + in.passes->elapsedMilliseconds, view.remainingMilliseconds));
   });
 }
 
@@ -545,7 +547,7 @@ bool Scheduler::withinPairs(std::span<const model::PrefillLane> lanes) const {
 std::vector<Scheduler::Lane> Scheduler::readyLanes(const PlanInputs &in) const {
   std::vector<Lane> ready;
   for (const auto &[id, request] : requests_)
-    if (request.phase == Phase::Prefill && !listed(in.excluded, id))
+    if (request.phase == Phase::Prefill && !listed(in.excluded, id) && !shapeOf(id, in).ended)
       ready.push_back(lane(request, request.promptProcessed, in));
   return ready;
 }

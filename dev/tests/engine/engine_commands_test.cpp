@@ -325,6 +325,40 @@ void testAHigherPriorityIsNotHeldBehindPasses() {
           "an abandoned command's lanes did not run their rows again from a first pass");
 }
 
+// Lanes cancelled between their command's passes run to the command's last
+// pass for no one, and a higher priority's arrival weighs only the lane that
+// did not end: halfway through the passes of three 300-row prompts, two of
+// them cancelled, a Foreground arrival, with the batch's fourth lane, saves
+// the live lane and itself the command's rest each, half its 4.1 s, more
+// together than the live lane's rows again, about 3.6 s, and runs at once.
+// Were the cancelled lanes to run their rows again too, abandoning would
+// lose each lane the passes so far, more than the rest the arrival saves,
+// and the arrival would wait for the command's last pass.
+void testLanesCancelledBetweenPassesHoldNoArrivalBack() {
+  PassingEngine passing;
+  for (uint64_t id = 1; id <= 3; ++id)
+    passing.submit(id, 300, RequestPriority::Background);
+  passing.tickUntil([&] { return passing.prefills() == 1 && !passing.engine.commandInFlight(); },
+                    "the Background prompts did not run a pass");
+  const PassingEngine::Command first = passing.commands.back();
+  require(first.kind == WorkKind::Prefill && first.lanes == std::vector<uint64_t>{1, 2, 3} && first.passes >= 4,
+          "the Background prompts did not share a command in passes");
+  passing.tickUntil([&] { return passing.prefills() == first.passes / 2 && !passing.engine.commandInFlight(); },
+                    "the Background prompts did not run half their passes");
+  for (uint64_t id = 2; id <= 3; ++id)
+    passing.engine.cancel(id);
+  passing.submit(4, 100, RequestPriority::Foreground);
+  const size_t arrived = passing.commands.size();
+  passing.tickUntil([&] { return passing.events.usage.contains(4); }, "the Foreground request did not end");
+  require(passing.commands.at(arrived).lanes == std::vector<uint64_t>{4},
+          "a higher priority's arrival waited for a command whose other lanes were cancelled halfway through its " +
+              std::to_string(first.passes) + " passes");
+  passing.tickUntil([&] { return idle(passing.engine); }, "the requests did not end");
+  const EngineSnapshot counts = passing.engine.snapshot();
+  require(counts.completed == 2 && counts.cancelled == 2 && passing.events.failedCount == 0,
+          "the requests did not end as two completed and two cancelled");
+}
+
 // A lane suspended between its command's passes takes the command's
 // remaining passes with it: four Background prompts share every lane in a
 // command in passes, and a Foreground arrival suspends one of them, which
@@ -1546,6 +1580,7 @@ std::span<const test::TestCase> commandsTests() {
       {"testShortPromptsShareACommandInPasses", testShortPromptsShareACommandInPasses},
       {"testArrivalsDuringPassesShareTheCommand", testArrivalsDuringPassesShareTheCommand},
       {"testAHigherPriorityIsNotHeldBehindPasses", testAHigherPriorityIsNotHeldBehindPasses},
+      {"testLanesCancelledBetweenPassesHoldNoArrivalBack", testLanesCancelledBetweenPassesHoldNoArrivalBack},
       {"testALaneSuspendedBetweenPassesAbandonsItsCommand", testALaneSuspendedBetweenPassesAbandonsItsCommand},
       {"testARefusedLaneWaitsForItsCommandsEnd", testARefusedLaneWaitsForItsCommandsEnd},
       {"testAHigherPriorityTakesWhatACommandBetweenPassesHolds",

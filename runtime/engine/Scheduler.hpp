@@ -54,12 +54,15 @@ struct PrefillAdmission final {
 // A prefill lane as the engine knows it when the scheduler plans: the pages
 // of its history only the SSD cache holds now, whether it may gain such pages
 // between a command's passes (a Spill lane past its dense history and
-// window), and the most rows a state capture prepare cut this tick leaves it.
+// window), the most rows a state capture prepare cut this tick leaves it, and
+// whether its request ended between its command's passes (a cancel, its
+// deadline), so that it runs to the command's last pass for no one.
 struct LaneShape final {
   uint64_t requestId = 0;
   uint32_t indexPages = 0;
   bool gainsIndexPages = false;
   uint32_t rowCap = std::numeric_limits<uint32_t>::max();
+  bool ended = false;
 };
 
 // The command between its passes as planning reads it: its plan at its next
@@ -337,14 +340,16 @@ private:
   [[nodiscard]] double bound() const;
   [[nodiscard]] UnitFit passesFor(std::span<const model::PrefillLane> lanes, bool bounded) const;
   [[nodiscard]] bool withinPairs(std::span<const model::PrefillLane> lanes) const;
+  // The resident prefill lanes a plan may serve: those it is not made
+  // without and that did not end.
   [[nodiscard]] std::vector<Lane> readyLanes(const PlanInputs &in) const;
   [[nodiscard]] std::optional<Planned> planPrefill(std::vector<Lane> ready) const;
   [[nodiscard]] std::optional<BatchPlan> nextPrefill(const PlanInputs &in) const;
   [[nodiscard]] std::optional<BatchPlan> nextDecode(std::span<const uint64_t> excluded) const;
-  // Whether a lane of the command between its passes is overdue, or would be
-  // once abandoning it adds the time its passes took to its wait (abandoned):
-  // such a lane leads the next plan, so a plan made without that wait would
-  // not run, and its passes would be lost.
+  // Whether a lane of the command between its passes that did not end is
+  // overdue, or would be once abandoning it adds the time its passes took to
+  // its wait (abandoned): such a lane leads the next plan, so a plan made
+  // without that wait would not run, and its passes would be lost.
   [[nodiscard]] bool overdueOnceAbandoned(const PlanInputs &in) const;
   // Whether abandoning the command between its passes for `plan` shortens
   // the summed completion of the lanes concerned (gain), with no lane of the
@@ -357,8 +362,9 @@ private:
   // priorities that wait behind both, summed: keeping it, its lanes end
   // with its passes and the plan's new lanes run after them; abandoning it,
   // the plan runs first and the command's lanes it leaves out run their rows
-  // again after it. A lane of a lower priority than the plan's does not
-  // count the wait for the plan, which strict priority gives it either way.
+  // again after it; one that ended loses nothing. A lane of a lower priority
+  // than the plan's does not count the wait for the plan, which strict
+  // priority gives it either way.
   // `planMilliseconds` and `joinersMilliseconds` price the plan and its new
   // lanes' own command.
   [[nodiscard]] double supersedeGain(std::span<const BatchItem> lanes, uint32_t starts, RequestPriority priority,

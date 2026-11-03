@@ -1599,7 +1599,9 @@ a command with an overdue lane: a long prompt's rows commit however often
 short prompts or work of a higher priority arrive. A request that ends
 between passes, cancelled or at its deadline, stays in the command to its last
 pass, which commits nothing of it, and a command all of whose requests have
-ended stops at once. While requests of the same or a higher priority
+ended stops at once. Such a request is in no plan and loses nothing to work that
+supersedes the command, and overdue, it keeps no work from superseding it.
+While requests of the same or a higher priority
 decode (a lane waiting for its token mask is owed nothing), each prefill unit owes them
 decode time, `--decode-share` times its own, before the next one runs. These
 policies do not extend client deadlines. Memory recovery waits are bounded:

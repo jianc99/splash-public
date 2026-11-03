@@ -1835,6 +1835,88 @@ void testAnAbandonmentDoesNotMakeALaneOverdue() {
   }
 }
 
+// A lane that ended between its command's passes (a cancel, its deadline)
+// runs to the command's last pass for no one. Overdue, it keeps no command
+// from being abandoned, no plan serves it, and its rows are not run again:
+// a higher priority's start, or its prompt, supersedes the command while
+// what that saves the live lane and the start is positive, R - K_A + R with
+// R the command's rest and K_A the live lane's rows again over the command's
+// passes, and the live lane is not overdue once abandoned
+// (testAnAbandonmentDoesNotMakeALaneOverdue).
+void testALaneThatEndedBetweenPassesHoldsNoSupersedeBack() {
+  constexpr double kAging = model::ExecutionLimits::maximumBatchWidth - 1;
+  Sim sim(test::kM6FlashNextQ2, limits(8192, 48));
+  sim.seed();
+  sim.lane(1, 20'000, 300);
+  sim.lane(2, 20'000, 300);
+  // Abandoned commands count as waited: enough of them make lane 1 overdue.
+  sim.scheduler.abandoned({.plan = {.kind = WorkKind::Prefill, .items = {{1, 300, 20'000}}},
+                           .elapsedMilliseconds = 1e7});
+  const BatchPlan command = sim.plan();
+  require(command.width() == 2 && command.items[0].requestId == 1 && command.passes > 2,
+          "the overdue lane and another did not share a command in passes");
+  sim.run(command);
+  sim.shapes.push_back({.requestId = 1, .ended = true});
+  const std::array live{command.items[1]};
+  bool yields = false, keeps = false;
+  while (sim.passes) {
+    const uint32_t pass = sim.passes->plan.pass;
+    const double rest = sim.passesPrice(command.items, pass, command.passes);
+    const double again = sim.passesPrice(live, 0, command.passes);
+    const bool aged = sim.passes->elapsedMilliseconds >= kAging * sim.price(live);
+    const bool expected = !aged && 2.0 * rest - again > 0.0;
+    const std::string after = "after " + std::to_string(pass) + " of " + std::to_string(command.passes) +
+                              " passes, R " + std::to_string(rest) + " ms, K_A " + std::to_string(again) +
+                              " ms, the live lane " + (aged ? "" : "not ") + "overdue once abandoned: ";
+    const BatchPlan fresh = [&] {
+      const PassProgress kept = *sim.passes;
+      sim.passes.reset();
+      const BatchPlan result = sim.plan();
+      sim.passes = kept;
+      return result;
+    }();
+    require(std::ranges::none_of(fresh.items, [](const BatchItem &item) { return item.requestId == 1; }),
+            after + "a plan served the lane that ended");
+    // The live lane's rows alone, from a first pass, supersede the command
+    // only where they end sooner than its rest.
+    const bool restarts = !aged && rest - sim.passesPrice(fresh.items, 0, fresh.passes) > 0.0;
+    require(sim.scheduler.abandonsPasses(sim.plan(), sim.in()) == restarts,
+            after + "the live lane's rows alone did " + (restarts ? "not " : "") + "supersede the command");
+    require(sim.scheduler.yieldsTo(RequestPriority::Foreground, 1, sim.in()) == expected,
+            after + "a higher priority's start did " + (expected ? "not " : "") + "supersede the command");
+    sim.lane(3, 0, 300, RequestPriority::Foreground);
+    require(sim.scheduler.abandonsPasses(sim.plan(), sim.in()) == expected,
+            after + "a higher priority's prompt did " + (expected ? "not " : "") + "supersede the command");
+    sim.scheduler.cancel(3);
+    sim.scheduler.remove(3);
+    yields |= expected;
+    keeps |= !aged && !expected;
+    sim.run(sim.passes->plan);
+  }
+  require(yields && keeps, "the case does not straddle the rule");
+}
+
+// Admission plans the next command without a lane that ended between its
+// command's passes, as planning does: a prompt that joins the live lane
+// starts, though the ended lane, overdue, would lead with rows that leave it
+// no room.
+void testAdmissionPlansWithoutALaneThatEnded() {
+  Sim sim(test::kM6FlashNextQ2, limits(8192, 48));
+  sim.seed();
+  sim.lane(1, 0, 8000);
+  sim.lane(2, 20'000, 192);
+  sim.scheduler.abandoned({.plan = {.kind = WorkKind::Prefill, .items = {{1, 8000, 0}}}, .elapsedMilliseconds = 1e7});
+  const BatchPlan command = sim.plan();
+  require(command.width() == 2 && command.items[0].requestId == 1 && command.passes > 1,
+          "the overdue lane and another did not share a command in passes");
+  sim.run(command);
+  sim.shapes.push_back({.requestId = 1, .ended = true});
+  sim.scheduler.submit(request(3, 300));
+  const std::array candidate{PrefillAdmission{3, 0}};
+  require(sim.scheduler.prefillAdmissionOrder(candidate, sim.in()) == std::vector<uint64_t>{3},
+          "admission planned the next command with the lane that ended");
+}
+
 // While a command is between its passes, a start waiting for a quota does
 // not lift it over a higher decoder; one the command held back does, and the
 // kinds alternate.
@@ -2223,6 +2305,8 @@ constexpr test::TestCase kTests[] = {
     {"testARegroupHappensOnlyWhenTheSumFalls", testARegroupHappensOnlyWhenTheSumFalls},
     {"testAnOverdueLaneIsNeverAbandoned", testAnOverdueLaneIsNeverAbandoned},
     {"testAnAbandonmentDoesNotMakeALaneOverdue", testAnAbandonmentDoesNotMakeALaneOverdue},
+    {"testALaneThatEndedBetweenPassesHoldsNoSupersedeBack", testALaneThatEndedBetweenPassesHoldsNoSupersedeBack},
+    {"testAdmissionPlansWithoutALaneThatEnded", testAdmissionPlansWithoutALaneThatEnded},
     {"testOnlyAHeldStartLiftsTheCommand", testOnlyAHeldStartLiftsTheCommand},
     {"testRepeatedSupersedesEndOnceTheLongLaneIsOverdue", testRepeatedSupersedesEndOnceTheLongLaneIsOverdue},
     {"testCommandBetweenPassesHoldsItsLanes", testCommandBetweenPassesHoldsItsLanes},
