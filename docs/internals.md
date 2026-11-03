@@ -1314,7 +1314,8 @@ whoever asks: a request's start, its growth in service, the buffers of a
 state it captures, the model's memory for reading its spilled KV, and the
 control pass's host claim alike; under critical pressure every pool first
 drops to its floor, and the host's claim takes everything else it can, what
-is in use and a Resident lane's conversion included. The claim's class
+is in use included, but no Resident lane's conversion: its walk may release
+the Index extents the copies would land into. The claim's class
 says what it may take, and the ledger takes the cheapest units that meet
 what it lacks, each priced at what losing it costs the work that uses it,
 all of them or none; a refusal that lacks again exactly what the
@@ -1327,8 +1328,9 @@ remaining prompt's commands over Index pages, and the hot block reads of its
 projected output's decode commands, a decayed mean of what decode commands
 measured (9 ms until the first). Only an admitted lane converts, of a
 priority no higher than the claim's, neither between its passes nor
-restoring, whose pages past its dense history and tail window the Index
-pages free now can take, and only while its Full pages outweigh the hot
+restoring, whose pages past its dense history and tail window the free
+Index pages its claim's reclaims surely leave can take (a device need's walk
+leaves up to an extent's), and only while its Full pages outweigh the hot
 block cache its reads would add; a claim converts the lanes holding the most
 KV first, and waits for their copies as for its own. For work that
 supersedes a prefill command between its passes, the ledger gives that
