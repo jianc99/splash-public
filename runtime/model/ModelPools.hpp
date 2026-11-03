@@ -38,6 +38,28 @@ private:
   double milliseconds_ = 0.0;
 };
 
+// What a pool that grows only as it is used took to build its memory again
+// (PoolValue::missMilliseconds of a pool whose miss is a rebuild): the
+// engine thread's mean time over the builds.
+class RebuildCount final {
+public:
+  // Runs `build`, which returns whether it built.
+  template <class Build> bool operator()(Build build) {
+    const AwakeClock::time_point started = AwakeClock::now();
+    const bool built = build();
+    if (built) {
+      ++builds_;
+      milliseconds_ += millisecondsSince(started);
+    }
+    return built;
+  }
+  [[nodiscard]] double meanMilliseconds() const noexcept { return builds_ ? milliseconds_ / double(builds_) : 0.0; }
+
+private:
+  uint64_t builds_ = 0;
+  double milliseconds_ = 0.0;
+};
+
 // Gives units back with `releaseOne`, which returns a unit's bytes or zero
 // once it has none to give, until their bytes reach `bytes`; returns them.
 template <class ReleaseOne> uint64_t releaseUnits(uint64_t bytes, ReleaseOne releaseOne) {

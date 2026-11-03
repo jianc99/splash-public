@@ -518,10 +518,16 @@ struct Runtime::Impl {
   // The wall time of the commands that encoded images (counters.imageEncodes
   // of them).
   double imageEncodeMilliseconds = 0.0;
+  // The staging's reservations, and what allocating it took (reserveStaging);
+  // what building a vision encoder's arena took (activate).
+  uint64_t stagingReservations = 0;
+  RebuildCount stagingBuilds, visionBuilds;
 
   // The history's staging (KvHistoryStream) as an elastic pool: a streaming
   // prompt's reservation allocates it, and it goes whole once no prompt
-  // holds it (stagingHeld), as an idle reclaim gives it back.
+  // holds it (stagingHeld), as an idle reclaim gives it back. Its value: the
+  // prompts' reservations, and the time allocating it took, which the next
+  // reservation pays once it went.
   class StagingPool final : public ElasticPool {
   public:
     explicit StagingPool(Impl &runtime) noexcept : runtime_(runtime) {}
@@ -532,10 +538,14 @@ struct Runtime::Impl {
               .floorBytes = held ? bytes : 0,
               .currentBytes = bytes,
               .capBytes = bytes,
-              .releaseUnitBytes = held ? 0 : bytes};
+              .releaseUnitBytes = held ? 0 : bytes,
+              .rebuildOnly = true};
     }
     [[nodiscard]] PoolValue value() const override {
-      return {.releasedBytes = released_.bytes(), .releaseMilliseconds = released_.milliseconds()};
+      return {.hits = runtime_.stagingReservations,
+              .missMilliseconds = runtime_.stagingBuilds.meanMilliseconds(),
+              .releasedBytes = released_.bytes(),
+              .releaseMilliseconds = released_.milliseconds()};
     }
     uint64_t release(uint64_t bytes) override {
       if (!bytes || runtime_.stagingHeld()) return 0;
@@ -550,7 +560,9 @@ struct Runtime::Impl {
 
   // The vision arena as an elastic pool: the encoder goes whole once no
   // image waits for its encode and nothing else holds it, and the next start
-  // that needs one builds it.
+  // that needs one builds it. Its value: the encodes it ran, and the time
+  // building an encoder took, which the next image's start pays once it
+  // went.
   class VisionArenaPool final : public ElasticPool {
   public:
     explicit VisionArenaPool(Impl &runtime) noexcept : runtime_(runtime) {}
@@ -561,10 +573,14 @@ struct Runtime::Impl {
               .floorBytes = idle ? 0 : bytes,
               .currentBytes = bytes,
               .capBytes = bytes,
-              .releaseUnitBytes = idle ? bytes : 0};
+              .releaseUnitBytes = idle ? bytes : 0,
+              .rebuildOnly = true};
     }
     [[nodiscard]] PoolValue value() const override {
-      return {.releasedBytes = released_.bytes(), .releaseMilliseconds = released_.milliseconds()};
+      return {.hits = runtime_.counters.imageEncodes,
+              .missMilliseconds = runtime_.visionBuilds.meanMilliseconds(),
+              .releasedBytes = released_.bytes(),
+              .releaseMilliseconds = released_.milliseconds()};
     }
     uint64_t release(uint64_t bytes) override {
       if (!bytes || !releasable()) return 0;
@@ -603,7 +619,8 @@ struct Runtime::Impl {
               .floorBytes = held,
               .currentBytes = runtime_.embeddingCacheBytes,
               .capBytes = runtime_.embeddingCacheBytes,
-              .releaseUnitBytes = unit};
+              .releaseUnitBytes = unit,
+              .rebuildOnly = true};
     }
     [[nodiscard]] PoolValue value() const override {
       const uint64_t encodes = runtime_.counters.imageEncodes;
@@ -902,7 +919,14 @@ struct Runtime::Impl {
     std::erase_if(stagingRequests, [this](uint64_t id) { return !residentRequest(id); });
     if (std::ranges::find(stagingRequests, requestId) == stagingRequests.end())
       stagingRequests.push_back(requestId);
-    return historyStream->reserve(pages);
+    ++stagingReservations;
+    ModelMemoryAdmission admission;
+    stagingBuilds([&] {
+      const bool allocates = historyStream->shortfallBytes(pages) != 0;
+      admission = historyStream->reserve(pages);
+      return allocates && admission.ok;
+    });
+    return admission;
   }
 
   // Gives the history's staging back, which then is no request's.
@@ -1038,8 +1062,10 @@ struct Runtime::Impl {
     const uint8_t *pixels = request.imagePixels.data();
     const auto allocate = [&] {
       if (encoderBytes) {
-        encoder = std::make_shared<ops::Vision>(
-            backend, model.vision.tensors, encodePatches);
+        visionBuilds([&] {
+          encoder = std::make_shared<ops::Vision>(backend, model.vision.tensors, encodePatches);
+          return true;
+        });
       }
       for (ImageState &image : staged) {
         const ImageSpan &span = image.span;

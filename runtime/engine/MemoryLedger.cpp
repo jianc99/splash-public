@@ -338,12 +338,17 @@ MemoryLedger::DryRun MemoryLedger::dryRun(const ClaimSpec &spec, const VictimQue
   };
   // Pool units: above floors for in-service work, optional work (while they
   // cost less than its benefit), growth (another pool's) and a host short of
-  // memory; none for a claim below a lane in service. Pending growth only
-  // for claims that may take memory the engine's limit holds for a pool.
+  // memory; for a start, only those of a pool whose units cost only their
+  // rebuild, which nothing in service holds or reads (PoolState::
+  // rebuildOnly; amend/M.md B2 as the owner amended it 11-03: the store and
+  // the hot block cache stay out of its reach); none for a claim below a
+  // lane in service. Pending growth only for claims that may take memory the
+  // engine's limit holds for a pool.
   const bool belowALane = lanePriority_ && *lanePriority_ < spec.priority;
   const bool poolUnits = !belowALane && (spec.cls == ClaimClass::InService || spec.cls == ClaimClass::Optional ||
                                          spec.cls == ClaimClass::Growth ||
                                          (spec.cls == ClaimClass::Host && (query.deficit || query.critical)));
+  const bool rebuiltUnits = poolUnits || (!belowALane && spec.cls == ClaimClass::Start);
   const bool pendingUnits = poolUnits && spec.cls != ClaimClass::Growth && spec.cls != ClaimClass::Host;
 
   struct Head final {
@@ -387,11 +392,13 @@ MemoryLedger::DryRun MemoryLedger::dryRun(const ClaimSpec &spec, const VictimQue
     heads.push_back(Head{.victim = sources_[index]->peek(query, nullptr), .source = index});
   for (size_t index = 1; index < accounts_.size(); ++index) {
     const Account &account = accounts_[index];
-    if (!account.pool || !poolUnits || (growing && growing->value == index))
+    if (!account.pool || !rebuiltUnits || (growing && growing->value == index))
       continue;
     Head head{.pool = AccountId{static_cast<uint8_t>(index)},
               .state = account.pool->state(),
               .counters = account.pool->value()};
+    if (!poolUnits && !head.state.rebuildOnly)
+      continue;
     head.victim = poolUnit(head);
     heads.push_back(std::move(head));
   }

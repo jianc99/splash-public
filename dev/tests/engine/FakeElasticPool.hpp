@@ -44,7 +44,8 @@ public:
             .currentBytes = uint64_t{units_} * unitBytes_,
             .capBytes = uint64_t{capUnits_} * unitBytes_,
             .releaseUnitBytes = units_ > floorUnits_ ? unitBytes_ : 0,
-            .growUnitBytes = units_ < capUnits_ ? unitBytes_ : 0};
+            .growUnitBytes = units_ < capUnits_ ? unitBytes_ : 0,
+            .rebuildOnly = rebuildOnly};
   }
   // Ghosts span the keys not resident.
   [[nodiscard]] model::PoolValue value() const override {
@@ -94,6 +95,16 @@ public:
     this->prefillMisses += prefillMisses;
   }
 
+  // Whether its units cost only their rebuild (model::PoolState::rebuildOnly,
+  // a cache the model builds on use such as the vision arena), which the
+  // test sets.
+  bool rebuildOnly = false;
+  // Its units live requests hold from now on, its floor, as a refused image
+  // start keeps the vision arena its image fits (StateAdmission::held).
+  void hold(uint32_t units) {
+    if (units > units_) throw std::invalid_argument("a fake elastic pool holds more units than it has");
+    floorUnits_ = units;
+  }
   // Units taken and given back, and the prefill uses served from memory and
   // read from the SSD (the scans' value, which ghosts do not show).
   uint64_t grows = 0, shrinks = 0;

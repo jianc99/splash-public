@@ -1410,7 +1410,11 @@ std::vector<ModelStepResult> prefillInPasses(model::Runtime &runtime, uint64_t i
 // layer's pairs over the layers its pass runs, the heaviest layer's whatever
 // the pass, and a warm-up's sample is that work with what its ticket timed.
 // Loading read its weights from the SSD, and its pools are the vision arena
-// and the embedding cache of a model that serves vision.
+// and the embedding cache of a model that serves vision, units that cost
+// only their rebuild, which a start may take (model::PoolState::rebuildOnly,
+// amend/M.md B2 as the owner amended it 11-03; their value once an image's
+// start built the arena is the runtime oracle's, whose model's tower the
+// vision kernels run).
 void testDenseRuntimeBoundary(const char *metallibPath) {
   const test::TemporaryDirectory root("splash-boundary-dense");
   const RuntimeResourcesConfig config = loadableConfig(metallibPath, root.path(), "boundary-test");
@@ -1447,6 +1451,8 @@ void testDenseRuntimeBoundary(const char *metallibPath) {
   require(loaded.bytes && loaded.milliseconds > 0, "loading read no weights from the SSD");
   require(poolNames(*runtime) == std::vector<std::string>{"vision_arena", "embeddings"},
           "a model that serves vision does not have its vision arena and embeddings as pools");
+  require(runtime->pools()[0]->state().rebuildOnly && runtime->pools()[1]->state().rebuildOnly,
+          "the vision arena or the embeddings is not a pool whose units cost only their rebuild");
   const model::WarmupStepResult warmup = runtime->warmupPrefill(kChunk);
   require(warmup.sample.work == whole && warmup.sample.wallMilliseconds > 0 && warmup.sample.representative,
           "a warm-up's sample is not its command's work and time");
@@ -1506,6 +1512,9 @@ void testStreamedRuntimeBoundary(RuntimeResourcesConfig moe) {
           "a streamed MoE runtime's command limits are not a group's rows in a pass a layer");
   require(poolNames(*runtime) == std::vector<std::string>{"experts", "vision_arena", "embeddings"},
           "a streamed MoE runtime's pools are not its store's and its vision's");
+  require(!runtime->pools()[0]->state().rebuildOnly && runtime->pools()[1]->state().rebuildOnly &&
+              runtime->pools()[2]->state().rebuildOnly,
+          "the store, which the lanes in service read through, is a pool a start may take, or its vision's are not");
   const std::array<model::PrefillLane, 1> group{{{.position = 0, .rows = 4 * kChunk}}};
   const uint64_t wholeReads = runtime->prefillWork(group, 0, 1).weightReadBytes;
   const uint64_t passReads = runtime->prefillWork(group, 0, 2).weightReadBytes +
@@ -1547,7 +1556,10 @@ void testStreamedRuntimeBoundary(RuntimeResourcesConfig moe) {
 // A Flash-Next start whose K/V spills: its commands hold a prefill group's
 // rows, stream one lane's history, and run a pass per layer. Its pools are
 // its store's where the plan streams its experts, its hot block cache's and
-// its history's staging. A lane's decode reads and a prompt's staging lack
+// its history's staging; of them only the staging, which no lane in service
+// reads through, costs only its rebuild (model::PoolState::rebuildOnly), and
+// its value is its reservations and the time allocating it took, which the
+// next reservation pays once it went. A lane's decode reads and a prompt's staging lack
 // what a reservation of them then allocates, and nothing once they hold it;
 // before the runtime begins the request, which the engine places first,
 // they lack the same. The staging stays a prompt's while it goes on,
@@ -1583,6 +1595,10 @@ void testSpilledRuntimeBoundary(const char *metallibPath) {
   request.prompt = prompt;
   request.maxNewTokens = 4;
   model::ElasticPool &hot = *runtime->pools()[streamsExperts], &staging = *runtime->pools()[streamsExperts + 1];
+  require(staging.state().rebuildOnly && !hot.state().rebuildOnly &&
+              !(streamsExperts && runtime->pools()[0]->state().rebuildOnly),
+          "the staging is not a pool whose units cost only their rebuild, or the hot block cache or the store, "
+          "which the lanes in service read through, is");
   const struct {
     model::SpilledReadNeed need;
     model::ElasticPool &pool;
@@ -1602,6 +1618,10 @@ void testSpilledRuntimeBoundary(const char *metallibPath) {
             std::string(need.kind == WorkKind::Decode ? "a lane's decode reads" : "a prompt's staging") +
                 " did not allocate the shortfall it named before and after the request began");
   }
+  const model::PoolValue reserved = staging.value();
+  require(reserved.hits == 1 && reserved.missMilliseconds > 0,
+          "the staging's value is " + std::to_string(reserved.hits) + " reservations and an allocation of " +
+              std::to_string(reserved.missMilliseconds) + " ms, not the one that allocated it and its time");
   // The staging stays the prompt's while it goes on, as its command in
   // passes reserved it once, before its first pass, whatever other prompts
   // reserved meanwhile: one that reserved it and was suspended, and one that

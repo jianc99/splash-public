@@ -1024,6 +1024,101 @@ void testAHostRefusedStartWaitsOnItsClaim() {
               std::to_string(parts[static_cast<size_t>(TtftPart::Decode)]) + " ms as decode commands'");
 }
 
+// A start beside a decoding lane may release a cache the model rebuilds on
+// use that nothing holds (owner 11-03 00:35, amending amend/M.md B2; smoke
+// issue 20): a request beside a text request's decode, under the engine's
+// limit, whose start holds none of the idle vision arena (a text request,
+// or an image whose encode needs a larger arena than the idle one, which
+// Runtime::activate does not keep), starts by giving the arena back, as
+// 1.5.0 freed it first, not once the decode ended; the store, whose units
+// the decode reads, stays out of a start's reach though a unit of it costs
+// no more (B2, A103). The limit leaves the text lane its growth and less
+// than a lane's state beside it.
+void testAStartReleasesAnIdleArenaBesideADecodingLane() {
+  constexpr uint64_t kExtent = 4 * 4096, kState = 64 * 1024, kChunk = 64 * 1024, kArena = 256 * 1024;
+  test::EngineHarness harness(
+      {.pages = 64,
+       .memory = test::FakeMemory::Config{},
+       .limits = {.limitBytes = 3 * kChunk + kArena + kState + 2 * kExtent + kExtent}});
+  // The store: three units, one its floor, of the four that would hold every
+  // expert, which nothing misses. The arena: one unit, which the next image's
+  // start builds again.
+  test::FakeElasticPool experts("experts", *harness.memory, kChunk, 1, 3, 4, 3, 0.25, 0.0);
+  test::FakeElasticPool arena("vision_arena", *harness.memory, kArena, 0, 1, 1, 1, 5.0, 0.0);
+  arena.rebuildOnly = true;
+  static_cast<void>(harness.governor->ledger().addPool(experts));
+  static_cast<void>(harness.governor->ledger().addPool(arena));
+  harness.model.laneFootprintBytes = kState;
+  harness.model.decodeFinishes = false;
+  EngineRequest text = harness.request(1, std::vector<uint32_t>(40, 1));
+  text.maxNewTokens = 30;
+  text.deadlineMilliseconds = 1e9;
+  harness.engine.submit(std::move(text));
+  harness.runUntil([&] { return harness.events.outputs.contains(1); }, "the text request did not decode");
+  EngineRequest second = harness.request(2, std::vector<uint32_t>(16, 2));
+  second.deadlineMilliseconds = 1e9;
+  harness.engine.submit(std::move(second));
+  harness.runUntil([&] { return harness.events.outputs.contains(2); }, "the second request did not answer");
+  require(!harness.events.usage.contains(1) && arena.shrinks == 1,
+          "the second request started once the text request's decode ended (" +
+              std::to_string(harness.events.outputs[1].size()) + " of its 30 tokens), not by giving back the "
+              "idle arena (" + std::to_string(arena.shrinks) + " units)");
+  require(experts.shrinks == 0, "a start took a unit of the store");
+  harness.runUntilIdle();
+  require(harness.events.completedCount == 2 && harness.events.failedCount == 0 && experts.shrinks == 0,
+          "the text request did not finish beside the second request");
+}
+
+// Smoke issue 20's trigger (owner 11-03 00:35): an image request beside a
+// text request's decode, under the engine's limit. Its refused activation
+// keeps the encoder its image fits (Runtime::activate's Matched, which the
+// engine holds while it frees for the start and tries again), so that arena
+// is the start's own and stays. The start gives back the embedding rows
+// nothing holds, which an encode rebuilds, and answers before the decode
+// ends; the store, whose units the decode reads, keeps its units though one
+// costs no more (B2, A103). The limit leaves the text lane its growth and
+// less than a lane's state beside it.
+void testAnImageStartKeepsItsArenaAndGivesBackIdleRows() {
+  constexpr uint64_t kExtent = 4 * 4096, kState = 64 * 1024, kChunk = 64 * 1024, kCache = 256 * 1024;
+  test::EngineHarness harness(
+      {.pages = 64,
+       .memory = test::FakeMemory::Config{},
+       .limits = {.limitBytes = 3 * kChunk + 2 * kCache + kState + 2 * kExtent + kExtent}});
+  // The store as testAStartReleasesAnIdleArenaBesideADecodingLane's. The
+  // arena and the rows: one unit each, built again by an image's start and
+  // encode.
+  test::FakeElasticPool experts("experts", *harness.memory, kChunk, 1, 3, 4, 3, 0.25, 0.0);
+  test::FakeElasticPool arena("vision_arena", *harness.memory, kCache, 0, 1, 1, 1, 5.0, 0.0);
+  test::FakeElasticPool rows("embeddings", *harness.memory, kCache, 0, 1, 1, 1, 5.0, 0.0);
+  arena.rebuildOnly = rows.rebuildOnly = true;
+  static_cast<void>(harness.governor->ledger().addPool(experts));
+  static_cast<void>(harness.governor->ledger().addPool(arena));
+  static_cast<void>(harness.governor->ledger().addPool(rows));
+  harness.model.laneFootprintBytes = kState;
+  harness.model.decodeFinishes = false;
+  // The image request's activation holds the arena from its first attempt.
+  harness.model.beginObserver = [&] {
+    if (harness.model.lastBeginId == 2) arena.hold(1);
+  };
+  EngineRequest text = harness.request(1, std::vector<uint32_t>(40, 1));
+  text.maxNewTokens = 30;
+  text.deadlineMilliseconds = 1e9;
+  harness.engine.submit(std::move(text));
+  harness.runUntil([&] { return harness.events.outputs.contains(1); }, "the text request did not decode");
+  EngineRequest image = harness.request(2, std::vector<uint32_t>(16, 2));
+  image.deadlineMilliseconds = 1e9;
+  harness.engine.submit(std::move(image));
+  harness.runUntil([&] { return harness.events.outputs.contains(2); }, "the image request did not answer");
+  require(!harness.events.usage.contains(1) && rows.shrinks == 1,
+          "the image request started once the text request's decode ended (" +
+              std::to_string(harness.events.outputs[1].size()) + " of its 30 tokens), not by giving back the "
+              "embedding rows nothing holds (" + std::to_string(rows.shrinks) + " units)");
+  require(arena.shrinks == 0 && experts.shrinks == 0, "a start took the arena its image holds or a unit of the store");
+  harness.runUntilIdle();
+  require(harness.events.completedCount == 2 && harness.events.failedCount == 0 && experts.shrinks == 0,
+          "the text request did not finish beside the image request");
+}
+
 // AMENDMENTS Borrowed 4: a decode gap past the scheduler's bound counts
 // once, under the first cause that held in it, and a gap within the bound
 // nowhere. On the harness clock with the M6 profile a lane decodes alone,
@@ -1122,6 +1217,8 @@ std::span<const test::TestCase> rulesTests() {
       {"testCacheReuseFollowsTheRecentProbes", testCacheReuseFollowsTheRecentProbes},
       {"testTtftPartsSumToTtft", testTtftPartsSumToTtft},
       {"testAHostRefusedStartWaitsOnItsClaim", testAHostRefusedStartWaitsOnItsClaim},
+      {"testAStartReleasesAnIdleArenaBesideADecodingLane", testAStartReleasesAnIdleArenaBesideADecodingLane},
+      {"testAnImageStartKeepsItsArenaAndGivesBackIdleRows", testAnImageStartKeepsItsArenaAndGivesBackIdleRows},
       {"testADecodeGapNamesItsCause", testADecodeGapNamesItsCause},
       {"testADecodeGapOnExpertReadsIsAnSsdWait", testADecodeGapOnExpertReadsIsAnSsdWait},
       {"testACancelBetweenPassesEndsBesideAHigherPrioritysDecode",

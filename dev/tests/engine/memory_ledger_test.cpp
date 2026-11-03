@@ -1310,11 +1310,14 @@ void testTiesGoToTheImmediateUnitThenTheSourceRegisteredFirst() {
   require(cache.taken == std::vector<uint64_t>{4} && pool.units() == 2, "a pool won a tie against a source");
 }
 
-// What each class may take (amend/M.md B2, B3): the bytes available() counts
-// for it from units of distinct sizes name which.
+// What each class may take (amend/M.md B2, B3; a start the units of a pool
+// that cost only their rebuild, owner 11-03 00:35): the bytes available()
+// counts for it from units of distinct sizes name which.
 void testClassBoundsEligibility() {
   FakeMemory memory({});
   FakeElasticPool pool("experts", memory, 32 * kMiB, 0, 1, 2, 1, 0.0, 0.0);
+  FakeElasticPool rebuilt("vision_arena", memory, 64 * kMiB, 0, 1, 1, 1, 0.0, 0.0);
+  rebuilt.rebuildOnly = true;
   MemoryLedger ledger;
   TestSource cache("cache"), engine("engine");
   Victim inUse = unit(2, 2 * kMiB, 0.0);
@@ -1330,28 +1333,70 @@ void testClassBoundsEligibility() {
   ledger.addSource(cache);
   ledger.addSource(engine);
   ledger.addPool(pool);
+  ledger.addPool(rebuilt);
   const auto counted = [&](ClaimSpec spec, bool critical = false, bool deficit = false) {
     return ledger.available(spec, kGiB, 0, critical, deficit) / kMiB;
   };
   // 1 Ordinary, 2 InUse, 4 certain reuse, 8 a conversion, 16 the pass
-  // command, 32 a pool unit.
+  // command, 32 a pool unit, 64 a unit that costs only its rebuild.
   require(counted({.cls = ClaimClass::Floor}) == 1 + 4, "the floor took more than Ordinary units");
-  require(counted({.cls = ClaimClass::InService}) == 1 + 4 + 8 + 32, "in-service work took the wrong units");
-  require(counted({.cls = ClaimClass::InService, .reach = ReclaimClass::InUse, .supersedes = true}) == 63,
+  require(counted({.cls = ClaimClass::InService}) == 1 + 4 + 8 + 32 + 64, "in-service work took the wrong units");
+  require(counted({.cls = ClaimClass::InService, .reach = ReclaimClass::InUse, .supersedes = true}) == 127,
           "in-service work that reaches InUse and supersedes took the wrong units");
-  require(counted({.cls = ClaimClass::Start, .supersedes = true}) == 1 + 4, "a start took more than Ordinary units");
-  require(counted({.cls = ClaimClass::Optional, .reach = ReclaimClass::InUse, .supersedes = true}) == 1 + 4 + 32,
+  require(counted({.cls = ClaimClass::Start, .supersedes = true}) == 1 + 4 + 64,
+          "a start took other than Ordinary units and those that cost only their rebuild");
+  require(counted({.cls = ClaimClass::Optional, .reach = ReclaimClass::InUse, .supersedes = true}) ==
+              1 + 4 + 32 + 64,
           "optional work converted, took InUse or the pass command");
-  require(counted({.cls = ClaimClass::Growth}) == 1 + 32, "growth took certain reuse, a conversion or InUse");
+  require(counted({.cls = ClaimClass::Growth}) == 1 + 32 + 64, "growth took certain reuse, a conversion or InUse");
   require(counted({.cls = ClaimClass::Host}) == 1, "the host took more than Ordinary cache without a deficit");
-  require(counted({.cls = ClaimClass::Host}, false, true) == 1 + 8 + 32, "the host's deficit took the wrong units");
-  require(counted({.cls = ClaimClass::Host, .reach = ReclaimClass::InUse}, true, true) == 1 + 2 + 4 + 8 + 32,
+  require(counted({.cls = ClaimClass::Host}, false, true) == 1 + 8 + 32 + 64,
+          "the host's deficit took the wrong units");
+  require(counted({.cls = ClaimClass::Host, .reach = ReclaimClass::InUse}, true, true) == 1 + 2 + 4 + 8 + 32 + 64,
           "critical pressure did not give the host what is in use");
   ledger.setLanes(0, RequestPriority::Foreground);
   require(counted(request(1, RequestPriority::Background)) == 1 + 4 + 8,
           "a claim below a lane in service took a pool unit");
-  require(counted(request(1, RequestPriority::Foreground)) == 1 + 4 + 8 + 32,
+  require(counted(request(1, RequestPriority::Background, ClaimClass::Start)) == 1 + 4,
+          "a start below a lane in service took a pool unit");
+  require(counted(request(1, RequestPriority::Foreground)) == 1 + 4 + 8 + 32 + 64,
           "a claim at the lanes' priority was refused a pool unit");
+}
+
+// A start beside a resident lane takes a unit of a pool that costs only its
+// rebuild by its price, as it takes cache, and never a store's (owner 11-03
+// 00:35, amending amend/M.md B2): an idle arena that one 20 ms build
+// replaces, used at two images a second, goes before a cached chain worth
+// 50 ms and after one worth 5 ms; a unit of the store, which nothing misses
+// and so costs nothing, stays either way.
+void testAStartTakesAnIdleCacheOnlyWhereItIsCheaper() {
+  const auto taken = [](double chainSeconds) {
+    FakeMemory memory({});
+    FakeElasticPool experts("experts", memory, 64 * kMiB, 1, 3, 4, 3, 0.25, 0.0);
+    FakeElasticPool arena("vision_arena", memory, 64 * kMiB, 0, 1, 1, 1, 20.0, 0.0);
+    arena.rebuildOnly = true;
+    MemoryLedger ledger;
+    TestSource cache("cache");
+    cache.units = {unit(1, 64 * kMiB, chainSeconds)};
+    ledger.addSource(cache);
+    ledger.addPool(experts);
+    ledger.addPool(arena);
+    for (double t = 0.0; t <= 30.0; t += 0.5) {
+      arena.served(1, 0, 0, 0);
+      ledger.observePools(t, true);
+    }
+    const ClaimId start = ledger.open(request(1, RequestPriority::Normal, ClaimClass::Start, 60.0));
+    require(ledger.free(start, {.bytes = 64 * kMiB}, 0, false, false).outcome == FreeOutcome::Met,
+            "a start beside a resident lane found nothing to take");
+    require(experts.units() == 3, "a start took a unit of the store");
+    return arena.units() == 0 ? std::string("arena") : cache.taken.empty() ? std::string("nothing")
+                                                                           : std::string("chain");
+  };
+  const std::string dear = taken(0.050), cheap = taken(0.005);
+  require(dear == "arena", "a start took the " + dear + " before an idle arena its 20 ms build replaces, beside a "
+                           "cached chain worth 50 ms");
+  require(cheap == "chain", "a start took the " + cheap + " before a cached chain worth 5 ms, beside an idle arena "
+                            "its 20 ms build replaces");
 }
 
 // Short takes nothing (all or none).
@@ -2995,6 +3040,7 @@ std::span<const test::TestCase> ledgerTests() {
       {"testTiesGoToTheImmediateUnitThenTheSourceRegisteredFirst",
        testTiesGoToTheImmediateUnitThenTheSourceRegisteredFirst},
       {"testClassBoundsEligibility", testClassBoundsEligibility},
+      {"testAStartTakesAnIdleCacheOnlyWhereItIsCheaper", testAStartTakesAnIdleCacheOnlyWhereItIsCheaper},
       {"testShortTakesNothing", testShortTakesNothing},
       {"testRoomHeldForHigherRanksMakesAWait", testRoomHeldForHigherRanksMakesAWait},
       {"testLandingThenVictimsThenOwed", testLandingThenVictimsThenOwed},

@@ -19,6 +19,10 @@ struct PoolState final {
                                   // released, a pool that grows only as it is used)
   uint64_t wholeBytes = 0;        // what it would allocate holding every key it serves (the store: every expert
                                   // in a slot); 0 when it does not say
+  bool rebuildOnly = false;       // a unit it gives back costs only its rebuild once something uses it again: it
+                                  // grows only as it is used (the vision arena, images' rows, an idle staging),
+                                  // and what live requests hold is its floor; false for a pool the lanes in
+                                  // service read through (the store, the hot block cache)
 };
 
 // The pool's own measurements, monotonic since it was built; the consumer differentiates them over its own
@@ -28,8 +32,8 @@ struct PoolValue final {
   uint64_t ghostHits = 0;         // misses a pool larger by ghostBytes would have served (ARC ghosts);
                                   // 0 without ghosts
   uint64_t ghostBytes = 0;        // bytes the ghosts span now (ghost keys * bytes per key); 0 without ghosts
-  double missMilliseconds = 0.0;  // measured mean cost of one miss: an SSD read, or a rebuild (an image encode);
-                                  // 0 when a miss costs only an allocation
+  double missMilliseconds = 0.0;  // measured cost of one miss: an SSD read, or a rebuild (an image's encode, the
+                                  // vision arena or the staging allocated again); 0 while unmeasured
   uint64_t releasedBytes = 0;     // bytes release() gave back
   double releaseMilliseconds = 0.0;  // engine-thread time release() took to give them back (the store's
                                      // compactions)

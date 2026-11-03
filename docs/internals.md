@@ -1267,8 +1267,11 @@ next, since a state's buffers give it no page. An allocation the host refuses
 takes none of the caches the model can rebuild (the vision encoder's scratch,
 images' encoded rows, the readers of spilled KV), which would not get it past
 the host; the control pass's host claim takes them. A new request waits while another
-is in service unless it can start from what the engine already holds, and with
-none in service it starts. A request whose start was refused memory, under host
+is in service unless it can start from what the engine already holds or from
+the caches the model rebuilds on use that nothing holds (the vision encoder's
+scratch no image waits on, images' encoded rows, the readers' idle staging),
+each priced at its measured rebuild, and with none in service it starts. A
+request whose start was refused memory, under host
 pressure or at `--max-memory`, holds back the requests that arrived after it
 until it starts, fails or is cancelled, so the lanes that finish leave their
 memory to it; a higher priority is not held back. So does a start that waits
@@ -1279,7 +1282,8 @@ A prompt near the context limit can hold back every other start of its priority
 or below until it ends, its prefill alone taking many minutes: in service, its
 KV grows into the host's spare memory, which pauses other growth; a start beside
 it takes only what the engine already holds, such as a lane's state buffers that
-a finished request left in the pool; and the first start refused holds back the
+a finished request left in the pool or an idle cache the model rebuilds on use;
+and the first start refused holds back the
 rest, its wait's limit restarting while the long request works (below).
 `/status` shows it: `admission.held_behind_refusal` counts the requests held
 back, `memory_governor.growth_allowed` and `host_headroom_bytes` show whether
@@ -1353,8 +1357,10 @@ classes no fixed rank holds: the expert store's chunks above its floor, a
 Resident lane's conversion and the cache go by price for every claim that
 may take them, so the store keeps its chunks while its decode misses and
 prefill reads are worth more than what the cache or a conversion costs, and
-gives one first when they are worth less. A start that a resident lane holds
-back waits for that lane. And when no lane's growth fits, the lane that yields
+gives one first when they are worth less. A start beside a resident lane
+takes cache and the model's idle caches by price, never a chunk of the store
+or the hot block cache, which the lanes read, and otherwise waits for that
+lane. And when no lane's growth fits, the lane that yields
 first (the lowest priority, a prefill before a decoding lane of its priority,
 then the one with less completed work, then the later arrival), such as one
 just started beside a decoding lane, pays for the memory with its own

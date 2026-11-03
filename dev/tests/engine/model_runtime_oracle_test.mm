@@ -1025,13 +1025,33 @@ void requireImageRowsAfterReclaim(model::Runtime &executor,
       request.id, planDraftContext(0, static_cast<uint32_t>(prompt.size()), {}));
   prefillChunk(executor, request.id, 0,
                std::span<const uint32_t>(prompt).first(64), pages, ImageEncodes{backend, true});
+  const ImageSpan &span = request.images.front();
+  const uint64_t encoderBytes = ops::Vision::scratchBytes(
+      model.vision.tensors.layout, span.gridHeight * span.gridWidth);
+  // The encoder, its only image encoded, is a unit of a pool that costs only
+  // its rebuild, which a start may take (model::PoolState::rebuildOnly,
+  // owner 11-03 00:35), as the image cache is; its value is the encodes it
+  // ran and the time building an encoder took, which the next image pays
+  // once it went.
+  const auto pool = [&](std::string_view name) -> const model::ElasticPool & {
+    for (const model::ElasticPool *candidate : executor.pools())
+      if (candidate->state().name == name)
+        return *candidate;
+    throw std::runtime_error("the runtime has no pool " + std::string(name));
+  };
+  const model::PoolState arena = pool("vision_arena").state();
+  const model::PoolValue built = pool("vision_arena").value();
+  require(arena.rebuildOnly && arena.releaseUnitBytes == encoderBytes &&
+              built.hits == executor.telemetry().imageEncodes &&
+              built.missMilliseconds > 0 && pool("embeddings").state().rebuildOnly,
+          "an idle encoder's " + std::to_string(arena.releaseUnitBytes) +
+              " bytes after " + std::to_string(built.hits) +
+              " encodes and builds of " + std::to_string(built.missMilliseconds) +
+              " ms are not a unit that costs only its rebuild, or the image cache's are not");
   // Nothing else is idle, so the pass releases exactly the encoder arena.
   uint64_t reclaimed = 0;
   while (const uint64_t bytes = executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches))
     reclaimed += bytes;
-  const ImageSpan &span = request.images.front();
-  const uint64_t encoderBytes = ops::Vision::scratchBytes(
-      model.vision.tensors.layout, span.gridHeight * span.gridWidth);
   require(reclaimed == encoderBytes,
           "encoder whose only image is encoded survived reclaim");
   prefillChunk(executor, request.id, 64,
