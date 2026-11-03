@@ -592,7 +592,10 @@ FreeResult MemoryLedger::freeFor(uint32_t id, const Need &need, uint64_t freeByt
           ? 0
           : std::max(less(plus(need.bytes, held), room), credited ? less(need.bytes, result.nowBytes) : 0);
   const uint32_t lackingPages = need.pages;
-  const bool canWait = spec.timing == NeedTiming::CanWait && !need.hostRefused && spec.cls != ClaimClass::Growth;
+  // Under macOS's critical pressure the host claim waits for nothing: it
+  // takes all it finds at once, and what lands comes on top.
+  const bool canWait = spec.timing == NeedTiming::CanWait && !need.hostRefused && spec.cls != ClaimClass::Growth &&
+                       !(host && critical);
 
   // What a claim that can wait may wait for: what lands of every transfer
   // in flight and every owed copy, and the copies its own lanes owe (its

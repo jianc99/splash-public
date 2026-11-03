@@ -1320,6 +1320,27 @@ void testCriticalDropsPoolsToFloors() {
   require(experts.units() == 2 && cache.units.empty(), "critical pressure left a pool above its floor or cache");
 }
 
+// Under macOS's critical pressure the host claim takes all it may at once,
+// whatever is on its way back: 1 GiB of demotions in flight does not keep
+// the pass from the 400 MiB of cache it finds, what is in use and what a
+// request will reuse among it.
+void testCriticalTakesWhatItFindsWhateverLands() {
+  Fixture fixture(host(8 * kGiB, MemoryPressure::Critical));
+  TestSource cache("cache", &fixture.memory);
+  fixture.memory.hold("cache", 400 * kMiB);
+  Victim inUse = unit(1, 200 * kMiB, 9.0);
+  inUse.cls = ReclaimClass::InUse;
+  Victim certain = unit(2, 200 * kMiB, 9.0);
+  certain.certainReuse = true;
+  cache.units = {inUse, certain};
+  fixture.ledger().setReturning([] { return Returning{.landingBytes = kGiB, .transfers = 4}; },
+                                [](uint64_t) { return Returning{}; });
+  fixture.ledger().addSource(cache);
+  static_cast<void>(fixture.pass(0.5));
+  require(cache.units.empty() && fixture.memory.held("cache") == 0,
+          "a critical pass left the cache it found while more than it was on its way back");
+}
+
 // Under macOS's warning each settled pass frees at most the margin.
 void testWarningFreesAtMostTheMarginPerSettledPass() {
   Fixture fixture(host(8 * kGiB, MemoryPressure::Warning));
@@ -2054,6 +2075,7 @@ std::span<const test::TestCase> ledgerTests() {
       {"testDisplacementNeedsValueAboveCycle", testDisplacementNeedsValueAboveCycle},
       {"testNoFlipFlopAtConstantInputs", testNoFlipFlopAtConstantInputs},
       {"testCriticalDropsPoolsToFloors", testCriticalDropsPoolsToFloors},
+      {"testCriticalTakesWhatItFindsWhateverLands", testCriticalTakesWhatItFindsWhateverLands},
       {"testWarningFreesAtMostTheMarginPerSettledPass", testWarningFreesAtMostTheMarginPerSettledPass},
       {"testHostClaimTakesNoCertainReuseUnlessCritical", testHostClaimTakesNoCertainReuseUnlessCritical},
       {"testDeficitNetOfReturning", testDeficitNetOfReturning},
