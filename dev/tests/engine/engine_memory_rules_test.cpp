@@ -198,6 +198,35 @@ struct PassesUnderALimit {
   double now = 1;
 };
 
+// B7 for the Index pages a Spill lane's landed copies move into: their
+// claim, the highest-ranked Spill lane's, is of that lane's priority, which
+// decides that beside a lane of a higher priority in service it takes no
+// unit of a pool (MemoryLedger::dryRun). A Background Spill prompt's moves
+// fill the runway and allocate Index extents in that claim.
+void testASpillLanesIndexPagesAreClaimedAtItsPriority() {
+  Spilling spill(1024);
+  std::vector<RequestPriority> claimed;
+  spill.storage.growthAllowed = [&](uint32_t) {
+    for (const auto &[_, state] : spill.host.governor.ledger().claims())
+      if (!state.spec.requestId && state.spec.cls == ClaimClass::InService &&
+          state.spec.timing == NeedTiming::Immediate)
+        claimed.push_back(state.spec.priority);
+    return true;
+  };
+  EngineRequest background = Spilling::prompt(1, 1, 20, 8);
+  background.priority = RequestPriority::Background;
+  spill.engine.submit(std::move(background));
+  spill.runUntilIdle();
+  require(spill.events.completedCount == 1 && spill.cache.spillSnapshot().spilledPages != 0,
+          "the Background Spill prompt did not run and spill");
+  require(!claimed.empty() && std::ranges::all_of(claimed, [](RequestPriority priority) {
+            return priority == RequestPriority::Background;
+          }),
+          "the Index pages of a Background Spill lane were claimed at another priority: " +
+              std::to_string(std::ranges::count(claimed, RequestPriority::Foreground)) + " of " +
+              std::to_string(claimed.size()) + " allocations at Foreground");
+}
+
 // B15: a prompt whose work supersedes the command between its passes takes
 // what that command holds, by the same rule as any unit and without a flag
 // of the engine's: the buffers of the states the command would capture,
@@ -1200,6 +1229,7 @@ std::span<const test::TestCase> rulesTests() {
   static constexpr test::TestCase kTests[] = {
       {"testALowerPriorityClaimTakesNothingAHigherPriorityLaneNeeds",
        testALowerPriorityClaimTakesNothingAHigherPriorityLaneNeeds},
+      {"testASpillLanesIndexPagesAreClaimedAtItsPriority", testASpillLanesIndexPagesAreClaimedAtItsPriority},
       {"testSupersedingClaimTakesThePassCommand", testSupersedingClaimTakesThePassCommand},
       {"testLandingPaysItsOwnerFirst", testLandingPaysItsOwnerFirst},
       {"testQuotaWaitIsNotAMemoryClaim", testQuotaWaitIsNotAMemoryClaim},

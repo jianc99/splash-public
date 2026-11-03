@@ -443,18 +443,19 @@ void Engine::spillLanded() {
   // pages, the runway's included, are memory the resident Spill lanes need,
   // as their Full pages are, and a fraction of what the moves free: with no
   // such lane in service they take only what costs nothing. With one, they
-  // are the highest-ranked such lane's: the room its waiting claim holds is
-  // the room its landed pages move into.
+  // are the highest-ranked such lane's, at its priority (amend/M.md B7): the
+  // room its waiting claim holds is the room its landed pages move into.
   const SpilledExtents extents = landedExtents();
-  std::optional<ClaimRank> needed;
+  const Request *needed = nullptr;
   for (const auto &[_, active] : requests_)
-    if (active.lane && active.kvMode == KvMode::Spill && (!needed || rankOf(active) > *needed))
-      needed = rankOf(active);
+    if (active.lane && active.kvMode == KvMode::Spill && (!needed || rankOf(active) > rankOf(*needed)))
+      needed = &active;
   static_cast<void>(allocate([&] { return cache_.spillWritten(extents); },
                              {.cls = needed ? ClaimClass::InService : ClaimClass::Optional,
-                              .rank = needed.value_or(ClaimRank{}),
+                              .rank = needed ? rankOf(*needed) : ClaimRank{},
                               .timing = NeedTiming::Immediate,
-                              .benefitSeconds = needed ? std::numeric_limits<double>::infinity() : 0.0}));
+                              .benefitSeconds = needed ? std::numeric_limits<double>::infinity() : 0.0,
+                              .priority = needed ? needed->request.priority : RequestPriority::Foreground}));
 }
 
 void Engine::endAtLength(Request &active) {
