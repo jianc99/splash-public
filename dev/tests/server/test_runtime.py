@@ -1327,11 +1327,17 @@ class RuntimeTests(unittest.TestCase):
                 self.assertLess(time.monotonic(), deadline)
                 time.sleep(0.005)
 
-        # The engine fails and ignores SIGTERM: it exits once killed, past
-        # the shutdown grace.
+        # The engine fails and ignores SIGTERM; killed past the shutdown
+        # grace, by the failure's fallback and by the relaunch, it exits only
+        # when the test lets it, as one slow to give its memory back. Until
+        # then no relaunch spawns beside it.
         old = factory.processes[0]
+        killed = []
         with (
             mock.patch.object(old, "terminate"),
+            mock.patch.object(
+                old, "kill", side_effect=lambda: killed.append(time.monotonic())
+            ),
             mock.patch.object(
                 runtime,
                 "_thresholds",
@@ -1344,12 +1350,15 @@ class RuntimeTests(unittest.TestCase):
             old.close_stdout()
             wait_until(lambda: not runtime.ready)
             relaunch = executor.submit(runtime.wait_ready, 2.0)
-            time.sleep(0.1)
+            wait_until(lambda: len(killed) == 2)
+            self.assertGreaterEqual(killed[0], failed + 0.3)
             self.assertIsNone(runtime.spawned_at)
             self.assertEqual(len(factory.processes), 1)
+            exited = time.monotonic()
+            FakeProcess.kill(old)
             wait_until(lambda: len(factory.processes) == 2)
             spawned = runtime.spawned_at
-            self.assertGreaterEqual(spawned, failed + 0.3)
+            self.assertGreaterEqual(spawned, exited)
             self.assertLessEqual(spawned, time.monotonic())
             factory.processes[1].send(READY)
             self.assertTrue(relaunch.result(2.0))
