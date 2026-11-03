@@ -158,7 +158,7 @@ struct Victim final {
   uint64_t bytes = 0;           // device bytes it frees (an extent it empties, a chunk, buffers)
   uint32_t pages = 0;           // free KV pages of `form` it leaves in kept extents (in-place needs)
   kv::PageForm form = kv::PageForm::Full;
-  uint32_t stateBuffers = 0;    // pooled state buffers it frees (in-place needs)
+  uint32_t stateBuffers = 0;    // pooled state buffers it frees (in-place needs; bytes, setBufferBytes)
   bool later = false;           // frees on a landing (a demotion, a state write, a conversion's copies)
   bool certainReuse = false;    // in use, the newest resume point, a chain a queued request restores
   bool sized = true;            // false: a unit that costs nothing and whose size is known only when taken
@@ -263,6 +263,10 @@ public:
   // What transfers return when they land: all of them (Cache::returning),
   // and those of one request's own pages (Cache::returningFor).
   void setReturning(std::function<Returning()> all, std::function<Returning(uint64_t requestId)> ofRequest);
+  // The bytes the model's pool releases of `states` more state buffers
+  // (Model::idleBufferBytes beyond its value at none): what the buffers a
+  // unit frees give a need of bytes once they leave the pool.
+  void setBufferBytes(std::function<uint64_t(uint32_t states)> bytes);
   void setRates(const MemoryRates &rates) noexcept;
   // Differentiates each pool's counters, and the units claims took from it,
   // over the control clock, only across intervals in which the engine ran a
@@ -328,8 +332,11 @@ private:
   [[nodiscard]] uint64_t heldByClaims(const ClaimRank &rank, std::optional<uint32_t> self) const noexcept;
   [[nodiscard]] uint64_t pendingGrowthBytes() const noexcept;
   [[nodiscard]] DryRun dryRun(const ClaimSpec &spec, const VictimQuery &query, uint64_t lackingBytes,
-                              std::optional<AccountId> growing) const;
+                              uint32_t lackingPages, std::optional<AccountId> growing) const;
   [[nodiscard]] FreeResult take(const DryRun &run, const VictimQuery &query, ClaimState *claim);
+  // Takes each source's units that cost nothing and are sized only when
+  // taken, until one frees nothing; the bytes they freed.
+  uint64_t takeUnsized(const VictimQuery &query);
   // `credited`: the host admits the claim only on what free() leaves now (a
   // pool's growth without its consent).
   [[nodiscard]] FreeResult freeFor(uint32_t claim, const Need &need, uint64_t freeBytes, bool critical,
@@ -342,6 +349,7 @@ private:
   uint32_t nextClaim_ = 1;
   std::function<Returning()> returning_;
   std::function<Returning(uint64_t)> returningFor_;
+  std::function<uint64_t(uint32_t)> bufferBytes_;
   MemoryRates rates_;
   uint64_t laneDemandBytes_ = 0;
   std::optional<RequestPriority> lanePriority_;

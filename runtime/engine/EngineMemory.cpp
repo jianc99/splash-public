@@ -922,15 +922,15 @@ std::optional<Victim> Engine::EngineVictims::peek(const VictimQuery &query, cons
     if (next != units.end())
       return *next;
     // The command between its passes, none of whose passes is in flight,
-    // for work that supersedes it.
+    // for work that supersedes it: the buffers its captures hold, which the
+    // ledger counts as bytes for a need of bytes.
     const Engine &engine = engine_;
     if (engine.passCommand_ && !engine.pending_ && query.claim && query.claim->supersedes) {
       uint32_t buffers = 0;
       for (const ModelBatchItem &item : engine.passCommand_->items)
         buffers += static_cast<uint32_t>(std::ranges::count_if(
             item.stateCaptures, [](const StateCapture &capture) { return capture.reservation != nullptr; }));
-      const uint64_t bytes = engine.model_.idleBufferBytes(buffers) - engine.model_.idleBufferBytes(0);
-      return Victim{.bytes = bytes, .stateBuffers = buffers, .kind = VictimKind::PassCommand};
+      return Victim{.stateBuffers = buffers, .kind = VictimKind::PassCommand};
     }
   }
   return std::nullopt;

@@ -108,6 +108,9 @@ struct MemoryLedger::DryRun final {
   uint64_t bytes = 0;
   uint32_t pages = 0;
   uint32_t buffers = 0;
+  // Of its bytes, those its units' state buffers give once they leave the
+  // model's pool.
+  uint64_t bufferBytes = 0;
   double cost = 0.0;
   bool covered = false;
   bool later = false;
@@ -143,6 +146,8 @@ void MemoryLedger::setReturning(std::function<Returning()> all, std::function<Re
   returning_ = std::move(all);
   returningFor_ = std::move(ofRequest);
 }
+
+void MemoryLedger::setBufferBytes(std::function<uint64_t(uint32_t)> bytes) { bufferBytes_ = std::move(bytes); }
 
 void MemoryLedger::setRates(const MemoryRates &rates) noexcept { rates_ = rates; }
 
@@ -257,11 +262,13 @@ bool MemoryLedger::copyDemand() const noexcept {
 // tie going to a unit that frees memory now and then to the source
 // registered first (the pools after the sources), until the need is met or
 // the units' cost would pass the claim's benefit. A unit the claim's class
-// may not take is skipped, not stopped at.
+// may not take is skipped, not stopped at. A unit's state buffers count for
+// a need of bytes as the bytes the model's pool releases of them beyond
+// those of the units chosen before (setBufferBytes).
 MemoryLedger::DryRun MemoryLedger::dryRun(const ClaimSpec &spec, const VictimQuery &query, uint64_t lackingBytes,
-                                          std::optional<AccountId> growing) const {
+                                          uint32_t lackingPages, std::optional<AccountId> growing) const {
   const Lacking lack{.bytes = lackingBytes,
-                     .pages = query.need.pages,
+                     .pages = lackingPages,
                      .form = query.need.form,
                      .buffers = query.need.stateBuffers};
   const bool immediate = spec.timing == NeedTiming::Immediate;
@@ -358,6 +365,12 @@ MemoryLedger::DryRun MemoryLedger::dryRun(const ClaimSpec &spec, const VictimQue
   };
 
   DryRun run;
+  const auto counted = [&](const Victim &victim) {
+    Victim unit = victim;
+    if (lack.bytes && victim.stateBuffers && bufferBytes_)
+      unit.bytes = plus(unit.bytes, less(bufferBytes_(run.buffers + victim.stateBuffers), bufferBytes_(run.buffers)));
+    return unit;
+  };
   for (;;) {
     Head *best = nullptr;
     double bestPrice = 0.0;
@@ -365,11 +378,11 @@ MemoryLedger::DryRun MemoryLedger::dryRun(const ClaimSpec &spec, const VictimQue
       // Skip what this claim may not take or what meets none of its need;
       // keep a unit that lands later in an Immediate claim's way, to note
       // that the run reached it.
-      while (head.victim && (!mayTake(*head.victim) || lack.share(*head.victim) == 0.0))
+      while (head.victim && (!mayTake(*head.victim) || lack.share(counted(*head.victim)) == 0.0))
         pass(head);
       if (!head.victim)
         continue;
-      const double price = head.victim->cost.at(spec.holdSeconds) / lack.share(*head.victim);
+      const double price = head.victim->cost.at(spec.holdSeconds) / lack.share(counted(*head.victim));
       if (!best || price < bestPrice || (price == bestPrice && !head.victim->later && best->victim->later)) {
         best = &head;
         bestPrice = price;
@@ -377,7 +390,7 @@ MemoryLedger::DryRun MemoryLedger::dryRun(const ClaimSpec &spec, const VictimQue
     }
     if (!best)
       break;
-    const Victim victim = *best->victim;
+    const Victim victim = counted(*best->victim);
     if (victim.later && victim.kind == VictimKind::Memory)
       run.uncopied = true;
     if (victim.later && immediate) {
@@ -389,6 +402,7 @@ MemoryLedger::DryRun MemoryLedger::dryRun(const ClaimSpec &spec, const VictimQue
       break;
     run.cost += cost;
     run.bytes = plus(run.bytes, victim.bytes);
+    run.bufferBytes = plus(run.bufferBytes, victim.bytes - best->victim->bytes);
     if (victim.form == lack.form)
       run.pages += victim.pages;
     run.buffers += victim.stateBuffers;
@@ -464,11 +478,26 @@ FreeResult MemoryLedger::free(ClaimId claim, const Need &need, uint64_t freeByte
   return freeFor(claim.value, need, freeBytes, critical, deficit, std::nullopt, false);
 }
 
+uint64_t MemoryLedger::takeUnsized(const VictimQuery &query) {
+  uint64_t bytes = 0;
+  for (VictimSource *source : sources_) {
+    for (std::optional<Victim> unit = source->peek(query, nullptr);
+         unit && !unit->sized && unit->cost.at(query.claim->holdSeconds) == 0.0; unit = source->peek(query, nullptr)) {
+      const FreeResult taken = source->take(query, *unit);
+      bytes = plus(bytes, taken.nowBytes);
+      if (!taken.nowBytes && !taken.laterBytes)
+        break;
+    }
+  }
+  return bytes;
+}
+
 // The one rule (DESIGN section 4.4; amend/M.md B2-B5): the units that cost
 // nothing and cannot be sized go first; then a claim that can wait waits
 // when what is landing, with its own lanes' owed copies, meets its need (or
 // would, but for claims ranked above it); else the cheapest units that meet
-// it are taken, all or none; else it waits when every copy in flight or owed
+// what those do not are taken, all or none, and it waits for the rest unless
+// the units meet it alone; else it waits when every copy in flight or owed
 // would meet it. A pool's growth waits on no landing but its own victims':
 // what it waits for is held as pending growth (R3). A claim admission
 // refused bytes lacks what admission asks beyond the room: its need and the
@@ -476,7 +505,9 @@ FreeResult MemoryLedger::free(ClaimId claim, const Need &need, uint64_t freeByte
 // refused counts only units that leave memory in place; the host's claim
 // lacks its whole need, and growth the host admits only on its credit
 // (`credited`) at least what free() leaves now: the room under the engine's
-// limit returns nothing to the host.
+// limit returns nothing to the host. State buffers the units free meet a
+// need of bytes once they leave the model's pool: the units that cost
+// nothing go again (a need in place keeps them).
 FreeResult MemoryLedger::freeFor(uint32_t id, const Need &need, uint64_t freeBytes, bool critical, bool deficit,
                                  std::optional<AccountId> growing, bool credited) {
   ClaimState &claim = claims_.at(id);
@@ -484,16 +515,7 @@ FreeResult MemoryLedger::freeFor(uint32_t id, const Need &need, uint64_t freeByt
   claim.need = need;
   const VictimQuery query{.claim = &spec, .need = need, .critical = critical, .rates = &rates_, .deficit = deficit};
 
-  FreeResult result;
-  for (VictimSource *source : sources_) {
-    for (std::optional<Victim> unit = source->peek(query, nullptr);
-         unit && !unit->sized && unit->cost.at(spec.holdSeconds) == 0.0; unit = source->peek(query, nullptr)) {
-      const FreeResult taken = source->take(query, *unit);
-      result.nowBytes = plus(result.nowBytes, taken.nowBytes);
-      if (!taken.nowBytes && !taken.laterBytes)
-        break;
-    }
-  }
+  FreeResult result{.nowBytes = takeUnsized(query)};
   const bool host = spec.cls == ClaimClass::Host;
   const uint64_t room = host ? 0 : plus(freeBytes, result.nowBytes);
   // Pending growth and the lanes' projected growth hold room the claim
@@ -509,11 +531,15 @@ FreeResult MemoryLedger::freeFor(uint32_t id, const Need &need, uint64_t freeByt
   const uint32_t lackingPages = need.pages;
   const bool canWait = spec.timing == NeedTiming::CanWait && !need.hostRefused && spec.cls != ClaimClass::Growth;
 
-  const auto waits = [&](bool owedToo) {
-    if (!canWait || (!lackingBytes && !lackingPages))
-      return false;
-    const Returning all = returning();
-    Returning own;
+  // What a claim that can wait may wait for: what lands of every transfer
+  // in flight and every owed copy, and the copies its own lanes owe (its
+  // request's and those free() converted for it); the pages of its form
+  // waiting claims ranked above it take first.
+  Returning all, own;
+  const size_t form = static_cast<size_t>(need.form);
+  uint64_t heldPagesAbove = 0;
+  if (canWait && (lackingBytes || lackingPages)) {
+    all = returning();
     if (returningFor_) {
       std::vector<uint64_t> lanes = claim.converted;
       if (spec.requestId)
@@ -521,20 +547,30 @@ FreeResult MemoryLedger::freeFor(uint32_t id, const Need &need, uint64_t freeByt
       for (uint64_t lane : lanes) {
         const Returning of = returningFor_(lane);
         own.owedBytes = plus(own.owedBytes, of.owedBytes);
-        for (size_t form = 0; form < own.owedPages.size(); ++form)
-          own.owedPages[form] += of.owedPages[form];
+        for (size_t each = 0; each < own.owedPages.size(); ++each)
+          own.owedPages[each] += of.owedPages[each];
       }
     }
-    const size_t form = static_cast<size_t>(need.form);
+    heldPagesAbove = heldPages(ClaimId{id})[form];
+  }
+  const auto waits = [&](bool owedToo) {
+    if (!canWait || (!lackingBytes && !lackingPages))
+      return false;
     const uint64_t landing = plus(all.landingBytes, owedToo ? all.owedBytes : own.owedBytes);
     const uint64_t landingPages =
         uint64_t{all.landingPages[form]} + (owedToo ? all.owedPages[form] : own.owedPages[form]);
-    const uint64_t heldPagesAbove = heldPages(ClaimId{id})[form];
     if (lackingBytes && (plus(forClaim, landing) >= need.bytes || (!owedToo && plus(less(room, growth), all.landingBytes) >= need.bytes)))
       return true;
     return lackingPages && (less(landingPages, heldPagesAbove) >= lackingPages ||
                             (!owedToo && all.landingPages[form] >= lackingPages));
   };
+  // What lands and its own lanes' owed copies count before victims also in
+  // part (amend/M.md B5): the dry run covers only what they do not. The
+  // room held above the claim is in what it lacks already; the host's pass
+  // sizes its claim by what lands (MemoryGovernor::controlPass, hostPass).
+  const uint64_t creditBytes = host ? 0 : plus(all.landingBytes, own.owedBytes);
+  const uint64_t creditPages =
+      host ? 0 : less(uint64_t{all.landingPages[form]} + own.owedPages[form], heldPagesAbove);
 
   std::optional<DryRun> run;
   if (!need.hostRefused && !lackingBytes && !lackingPages && !need.stateBuffers) {
@@ -542,12 +578,19 @@ FreeResult MemoryLedger::freeFor(uint32_t id, const Need &need, uint64_t freeByt
   } else if (waits(false)) {
     result.outcome = FreeOutcome::Pending;
   } else {
-    run = dryRun(spec, query, lackingBytes, growing);
+    run = dryRun(spec, query, less(lackingBytes, creditBytes),
+                 static_cast<uint32_t>(less(lackingPages, creditPages)), growing);
     if (run->uncopied)
       uncopiedReachedSeconds_ = nowSeconds_;
     if (run->covered) {
-      const FreeResult taken = take(*run, query, &claim);
-      result = {taken.outcome, plus(result.nowBytes, taken.nowBytes), taken.laterBytes};
+      FreeResult taken = take(*run, query, &claim);
+      if (run->bufferBytes && !need.stateBuffers)
+        taken.nowBytes = plus(taken.nowBytes, takeUnsized(query));
+      const bool alone = (lackingBytes && run->bytes >= lackingBytes) ||
+                         (lackingPages && run->pages >= lackingPages) ||
+                         (need.stateBuffers && run->buffers >= need.stateBuffers);
+      result = {alone ? taken.outcome : FreeOutcome::Pending, plus(result.nowBytes, taken.nowBytes),
+                taken.laterBytes};
     } else {
       result.outcome = waits(true) ? FreeOutcome::Pending : FreeOutcome::Short;
     }
@@ -574,7 +617,7 @@ uint64_t MemoryLedger::available(const ClaimSpec &spec, uint64_t enough, uint64_
     return enough;
   const VictimQuery query{.claim = &spec, .need = {.bytes = enough}, .critical = critical, .rates = &rates_,
                           .deficit = deficit};
-  const uint64_t taken = dryRun(spec, query, less(plus(enough, held), room), std::nullopt).bytes;
+  const uint64_t taken = dryRun(spec, query, less(plus(enough, held), room), 0, std::nullopt).bytes;
   return std::min(enough, less(plus(room, taken), held));
 }
 

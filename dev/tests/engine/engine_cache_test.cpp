@@ -6047,12 +6047,13 @@ void testBurstReclaimTakesWholeExtentsOncePerNeed() {
   cache.checkInvariants();
 }
 
-// A device need's units go on past the states its reclaims give up on the
-// way to an extent: the oldest conversation's checkpoint goes first,
-// written as it leaves RAM, then its state, which the tier takes no write
-// of and which drops, leaving its KV dead, and the leaves of the
-// conversations after it, whose extents the next units release. Each unit
-// is weighed at what taking it releases.
+// A device need's units reach the leaves past the states its reclaims give
+// up, each state a unit of its own, whose buffers the ledger counts as
+// bytes (MemoryLedger::setBufferBytes): the oldest conversation's
+// checkpoint goes first, written as it leaves RAM; its state, which the
+// tier takes no write of and which drops, leaving its KV dead, goes in its
+// place among the leaves, an extent each unit. Each unit is weighed at what
+// taking it releases of the pool.
 void testDeviceNeedReachesTheLeavesPastTheStates() {
   test::TestKvStorage storage{48, 100, 4};
   KvPool pool{storage, 4};
@@ -6082,11 +6083,12 @@ void testDeviceNeedReachesTheLeavesPastTheStates() {
   for (std::optional<engine::Victim> victim = cache.peek(query, nullptr); victim; victim = cache.peek(query, &*victim))
     units.push_back(*victim);
   const uint64_t extent = 4 * 100;
-  require(units.size() == 6 && units[0].stateBuffers == 1 && units[0].later && units[0].bytes == extent,
-          "the first unit did not go past the oldest conversation's checkpoint to an extent");
+  require(units.size() == 8 && units[0].stateBuffers == 1 && units[0].later && !units[0].bytes &&
+              std::ranges::count_if(units, [](const engine::Victim &unit) { return unit.stateBuffers == 1; }) == 2,
+          "the checkpoint did not go first, or a state did not go as a unit of its own");
   for (const engine::Victim &unit : units) {
     const uint64_t allocated = pool.allocatedBytes();
-    require(unit.bytes == extent && cache.take(query, unit).outcome == FreeOutcome::Met &&
+    require((unit.stateBuffers || unit.bytes == extent) && cache.take(query, unit).outcome == FreeOutcome::Met &&
                 allocated - pool.allocatedBytes() == unit.bytes,
             "a unit did not release the extent it was weighed at");
   }
@@ -6376,8 +6378,9 @@ void testPageWalkOffersEachDeadLeafOnce() {
 
 // A need the engine's limit refused is a device need, whatever pages it
 // was for (M.md section 3.4): an extent released covers the growth it
-// refused. Its units go past each conversation's state, which leaves its
-// KV dead, to the leaves, each releasing the extent it was weighed at.
+// refused. Its units reach past each conversation's state, a unit of its
+// own that leaves its KV dead, the leaves, each releasing the extent it was
+// weighed at.
 void testEngineRefusedPageNeedIsADeviceNeed() {
   test::TestKvStorage storage{16, 100, 1};
   KvPool pool{storage, 16};
@@ -6394,7 +6397,7 @@ void testEngineRefusedPageNeedIsADeviceNeed() {
     weighed += victim->bytes;
     units.push_back(*victim);
   }
-  require(units.size() == 6 && weighed == 600 && units[0].stateBuffers == 1,
+  require(units.size() == 9 && weighed == 600 && units[0].stateBuffers == 1 && !units[0].bytes,
           "a need the engine's limit refused weighed " + std::to_string(weighed) + " bytes in " +
               std::to_string(units.size()) + " units, not the extents the cache releases");
   for (const engine::Victim &unit : units) {

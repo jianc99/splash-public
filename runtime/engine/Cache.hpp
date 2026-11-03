@@ -1019,7 +1019,7 @@ private:
   // that finds nothing to report pending (returnsInFlight), any transfer
   // without one; whether the runway stays; and a query's need: a device
   // need's bytes, whose unit is the memory reclaims up to an extent
-  // released, or a page need's pages of
+  // released or a state given up, or a page need's pages of
   // a form, whose unit is the evictions up to a page freed, the states on
   // the way among its victims unless the need counts state buffers too
   // (statesAreUnits). A device need that also lacks pages of a form keeps

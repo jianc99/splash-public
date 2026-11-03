@@ -60,13 +60,15 @@ Engine::Engine(EngineConfig config, Cache &cache, model::Model &model,
   if (config_.weights)
     weights_.emplace(*config_.weights);
   // What the engine holds is the ledger's to take, cache before the
-  // engine's own victims (the tie order of the sources), and the cache
-  // tells it what transfers return.
+  // engine's own victims (the tie order of the sources), the cache tells it
+  // what transfers return, and the model what the state buffers its units
+  // free release once they leave the pool.
   MemoryLedger &ledger = config_.governor->ledger();
   ledger.addSource(cache_);
   ledger.addSource(victims_);
   ledger.setReturning([this] { return cache_.returning(); },
                       [this](uint64_t requestId) { return cache_.returningFor(requestId); });
+  ledger.setBufferBytes([this](uint32_t states) { return model_.idleBufferBytes(states) - model_.idleBufferBytes(0); });
 }
 
 void Engine::submit(EngineRequest value) {

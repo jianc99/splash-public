@@ -1423,7 +1423,8 @@ void testCopiesFollowDemandNotAWindow() {
 // The cache's victims that go at once, against which the memory's demand
 // for copies is weighed, start no write and wait for none: the walk offers
 // the unit a claim that can wait gets from cache that needs a write, here
-// the oldest conversation's checkpoint before the KV of the others, in its
+// the oldest conversation's checkpoint, whose buffers are its bytes
+// (MemoryLedger::setBufferBytes), before the KV of the others, in its
 // place, and it counts for nothing (amend/M.md B9). A demand that what goes
 // at once holds copies no point; one byte more copies it.
 void testCopyDemandCountsOnlyWhatGoesAtOnce() {
@@ -1437,10 +1438,15 @@ void testCopyDemandCountsOnlyWhatGoesAtOnce() {
   writes.published(point, WriteBehind::kMinimumTokens, 0.0);
   const ClaimSpec growth{.cls = ClaimClass::Growth, .timing = NeedTiming::Immediate};
   const VictimQuery query{.claim = &growth, .need = {.bytes = 1}};
-  uint64_t atOnce = 0, later = 0;
+  uint64_t atOnce = 0;
+  uint32_t later = 0;
   for (std::optional<Victim> unit = process.cache.peek(query, nullptr); unit;
-       unit = process.cache.peek(query, &*unit))
-    (unit->later ? later : atOnce) += unit->bytes;
+       unit = process.cache.peek(query, &*unit)) {
+    if (unit->later)
+      later += unit->stateBuffers;
+    else
+      atOnce += unit->bytes;
+  }
   require(atOnce && later, "the walk did not offer what writing the checkpoint frees before the KV that goes at once");
   require(!writes.run(kDelay, atOnce, false) && !process.tier.demotions && writes.snapshot().waiting == 1,
           "a point was copied ahead though what goes at once held the demand");

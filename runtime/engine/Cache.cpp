@@ -673,7 +673,9 @@ Cache::Walk Cache::walkFor(const VictimQuery &query) const {
                                          claim.cls == ClaimClass::Host);
   walk.keepIndexRunway = !query.critical;
   walk.hostRefused = need.hostRefused;
-  walk.statesAreUnits = need.stateBuffers != 0;
+  // A state that goes ends a unit for a need of its buffers, and of bytes,
+  // which its buffers meet once they leave the model's pool.
+  walk.statesAreUnits = need.stateBuffers != 0 || (need.bytes && !need.hostRefused);
   if (need.bytes && !need.hostRefused) {
     // Memory the engine's limit refused, whatever pages it was for: an
     // extent released covers it.

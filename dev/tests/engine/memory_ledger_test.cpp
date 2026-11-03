@@ -793,7 +793,7 @@ void testRoomHeldForHigherRanksMakesAWait() {
 // Landings first, then the cheapest victims, then owed copies: a need the
 // landing bytes do not meet takes a victim before it waits for another
 // lane's write-through (the base's escalate waited on owed copies first,
-// Engine.cpp:2380).
+// Engine.cpp:2380). The victim meets it alone, so it is met.
 void testLandingThenVictimsThenOwed() {
   MemoryLedger ledger;
   TestSource cache("cache");
@@ -828,6 +828,135 @@ void testImmediateSkipsLandings() {
           "an Immediate claim waited or took a unit that lands later");
   require(ledger.free(claim, {.bytes = kGiB}, 0, false, false).outcome == FreeOutcome::Short,
           "an Immediate claim waited for landings");
+}
+
+// What lands, and the copies a claim's own lanes owe, count before victims
+// also in part (amend/M.md B5): a claim that can wait takes the cheapest
+// units for what they do not cover and waits for the rest. Another lane's
+// owed copies count nothing here, nor what lands for an Immediate claim,
+// nor the pages that land for a waiting claim ranked above; units that
+// meet the need alone meet it.
+void testLandingCountsBeforeVictimsInPart() {
+  struct Case final {
+    Returning all;
+    Returning own;
+    NeedTiming timing = NeedTiming::CanWait;
+    FreeOutcome outcome = FreeOutcome::Pending;
+    std::vector<uint64_t> taken;
+  };
+  const Case cases[] = {
+      {.all = {.landingBytes = 512 * kMiB}, .taken = {1}},
+      {.all = {.owedBytes = 512 * kMiB}, .own = {.owedBytes = 512 * kMiB}, .taken = {1}},
+      {.all = {.owedBytes = 512 * kMiB}, .outcome = FreeOutcome::Met, .taken = {1, 2}},
+      {.all = {.landingBytes = 512 * kMiB}, .timing = NeedTiming::Immediate, .outcome = FreeOutcome::Met,
+       .taken = {1, 2}},
+  };
+  for (const Case &each : cases) {
+    MemoryLedger ledger;
+    TestSource cache("cache");
+    cache.units = {unit(1, 512 * kMiB, 0.5), unit(2, 512 * kMiB, 0.6)};
+    ledger.addSource(cache);
+    ledger.setReturning([&] { return each.all; }, [&](uint64_t id) { return id == 1 ? each.own : Returning{}; });
+    ClaimSpec spec = request(1, RequestPriority::Normal);
+    spec.timing = each.timing;
+    const ClaimId claim = ledger.open(spec);
+    require(ledger.free(claim, {.bytes = kGiB}, 0, false, false).outcome == each.outcome && cache.taken == each.taken &&
+                ledger.claim(claim).waiting == (each.outcome == FreeOutcome::Pending),
+            "the claim took victims for what lands, or did not wait for it after taking the rest");
+  }
+  // In pages: two land, a waiting claim ranked above them takes them first.
+  for (const bool heldAbove : {false, true}) {
+    MemoryLedger ledger;
+    TestSource cache("cache");
+    ledger.addSource(cache);
+    ledger.setReturning([] { return Returning{.landingPages = {2, 0, 0}}; }, [](uint64_t) { return Returning{}; });
+    if (heldAbove) {
+      const ClaimId high = ledger.open(request(2, RequestPriority::Foreground));
+      require(ledger.free(high, {.pages = 2}, 0, false, false).outcome == FreeOutcome::Pending,
+              "the claim above did not wait for the pages that land");
+    }
+    for (uint64_t key : {1, 2})
+      cache.units.push_back({.key = key, .pages = 2, .cost = {.onceSeconds = 0.5}});
+    const ClaimId claim = ledger.open(request(3, RequestPriority::Background));
+    const FreeOutcome outcome = ledger.free(claim, {.pages = 4}, 0, false, false).outcome;
+    require(heldAbove ? outcome == FreeOutcome::Met && cache.taken == std::vector<uint64_t>{1, 2}
+                      : outcome == FreeOutcome::Pending && cache.taken == std::vector<uint64_t>{1},
+            "the pages that land were not counted before victims, or counted although held above");
+  }
+}
+
+// A model's pool of state buffers: those idle go one at a time, at no cost,
+// as a unit sized only when taken (Model::releaseIdleBuffer).
+class BufferPool final : public VictimSource {
+public:
+  explicit BufferPool(uint64_t bufferBytes) : bufferBytes_(bufferBytes) {}
+  [[nodiscard]] std::string_view name() const noexcept override { return "buffers"; }
+  [[nodiscard]] std::optional<Victim> peek(const VictimQuery &, const Victim *after) const override {
+    return after ? std::nullopt : std::optional<Victim>(Victim{.sized = false});
+  }
+  FreeResult take(const VictimQuery &, const Victim &) override {
+    if (!idle)
+      return {};
+    --idle;
+    return {FreeOutcome::Met, bufferBytes_};
+  }
+  uint32_t idle = 0;
+
+private:
+  uint64_t bufferBytes_;
+};
+
+// Cached states in the test's order, whose buffers return to the pool as
+// they go.
+class CachedStates final : public VictimSource {
+public:
+  explicit CachedStates(BufferPool &pool) : pool_(pool) {}
+  [[nodiscard]] std::string_view name() const noexcept override { return "cache"; }
+  [[nodiscard]] std::optional<Victim> peek(const VictimQuery &, const Victim *after) const override {
+    auto unit = units.begin();
+    if (after)
+      unit = std::next(std::ranges::find(units, after->key, &Victim::key));
+    return unit == units.end() ? std::nullopt : std::optional<Victim>(*unit);
+  }
+  FreeResult take(const VictimQuery &, const Victim &victim) override {
+    const auto unit = std::ranges::find(units, victim.key, &Victim::key);
+    taken.push_back(unit->key);
+    pool_.idle += unit->stateBuffers;
+    units.erase(unit);
+    return {FreeOutcome::Met};
+  }
+  std::vector<Victim> units;
+  std::vector<uint64_t> taken;
+
+private:
+  BufferPool &pool_;
+};
+
+// The buffers a state frees meet a need of bytes (design/M.md section 3.1,
+// Victim::bytes): counted at what the pool releases of them, beyond the
+// buffers of the states chosen before, and released once the states went;
+// a need of buffers in place keeps them in the pool.
+void testStateBuffersMeetANeedOfBytes() {
+  MemoryLedger ledger;
+  BufferPool pool(64 * kMiB);
+  CachedStates cache(pool);
+  for (uint64_t key = 1; key <= 3; ++key)
+    cache.units.push_back({.key = key, .stateBuffers = 1, .cost = {.onceSeconds = 0.1}});
+  ledger.addSource(cache);
+  ledger.addSource(pool);
+  // The first state's buffers release 64 MiB, each after it 32 MiB more:
+  // two cover no 100 MiB, three do.
+  ledger.setBufferBytes([](uint32_t states) { return states ? uint64_t{states + 1} * 32 * kMiB : 0; });
+  const ClaimId claim = ledger.open(request(1, RequestPriority::Normal));
+  const FreeResult freed = ledger.free(claim, {.bytes = 100 * kMiB}, 0, false, false);
+  require(freed.outcome == FreeOutcome::Met && freed.nowBytes == 192 * kMiB &&
+              cache.taken == std::vector<uint64_t>{1, 2, 3} && !pool.idle,
+          "a need of bytes did not take the states whose buffers the pool releases, or left them in the pool");
+  cache.units.push_back({.key = 4, .stateBuffers = 1, .cost = {.onceSeconds = 0.1}});
+  const ClaimId lane = ledger.open(request(2, RequestPriority::Normal));
+  const FreeResult inPlace = ledger.free(lane, {.stateBuffers = 1}, 0, false, false);
+  require(inPlace.outcome == FreeOutcome::Met && !inPlace.nowBytes && cache.taken.back() == 4 && pool.idle == 1,
+          "a need of buffers in place did not keep the buffers its state freed");
 }
 
 // A need the host refused is met in place first; failing that, in-service
@@ -1747,6 +1876,8 @@ std::span<const test::TestCase> ledgerTests() {
       {"testRoomHeldForHigherRanksMakesAWait", testRoomHeldForHigherRanksMakesAWait},
       {"testLandingThenVictimsThenOwed", testLandingThenVictimsThenOwed},
       {"testImmediateSkipsLandings", testImmediateSkipsLandings},
+      {"testLandingCountsBeforeVictimsInPart", testLandingCountsBeforeVictimsInPart},
+      {"testStateBuffersMeetANeedOfBytes", testStateBuffersMeetANeedOfBytes},
       {"testHostRefusedNeedIsMetInPlaceFirst", testHostRefusedNeedIsMetInPlaceFirst},
       {"testZeroCostUnsizedUnitsGoFirst", testZeroCostUnsizedUnitsGoFirst},
       {"testBenefitBoundsTheDryRun", testBenefitBoundsTheDryRun},
