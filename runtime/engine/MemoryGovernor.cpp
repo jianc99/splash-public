@@ -232,7 +232,6 @@ MemoryGovernor::tryReserve(uint64_t bytes, metal::AllocationFailure &failure) {
     ledger_.refused(scope_, {.bytes = bytes, .hostRefused = !hostAdmits});
     return std::nullopt;
   }
-  ledger_.setHostExempt(scope_, false);
   reservedBytes_ = requested;
   return Reservation(this, bytes);
 }

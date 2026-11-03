@@ -139,6 +139,9 @@ auto Engine::allocate(Attempt &&attempt, const ClaimSpec &spec, bool frees)
     signalResourceProgress();
     admission = tryOnce();
   }
+  // The host's exemption covers this allocation's retries alone.
+  if (ledger.claim(claim.id).hostExempt)
+    ledger.setHostExempt(claim.id, false);
   if (!admission.granted()) {
     denial.allocationFailure = admission.allocationFailure;
     if constexpr (std::is_same_v<Admission, TokenAdmission>) {

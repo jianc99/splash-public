@@ -1145,13 +1145,42 @@ void testHostRefusedNeedIsMetInPlaceFirst() {
   need.pages = 0;
   require(fixture.governor->free(lane, need).outcome == FreeOutcome::Met && fixture.ledger().claim(lane).hostExempt,
           "in-service work nothing in place meets was not exempted");
-  require(fixture.allocate(lane, 512 * kMiB) && !fixture.ledger().claim(lane).hostExempt,
-          "the exempt retry was refused or kept its exemption");
+  require(fixture.allocate(lane, 512 * kMiB) && fixture.ledger().claim(lane).hostExempt,
+          "the exempt retry was refused, or its grant ended the exemption before the allocation did");
+  fixture.ledger().setHostExempt(lane, false);
   const ClaimId start = fixture.ledger().open(request(2, RequestPriority::Normal, ClaimClass::Start));
   require(!fixture.allocate(start, 512 * kMiB), "the host admitted the start");
   require(fixture.governor->free(start, fixture.governor->need(start)).outcome == FreeOutcome::Short &&
               !fixture.ledger().claim(start).hostExempt,
           "a start was exempted from the host");
+}
+
+// The exemption covers the retry of the whole allocation, as the serving
+// mark did (design/M.md R2): an attempt that takes several reservations,
+// all or none (a hot block cache's floor of four extents, a history
+// stream's buffers), passes the host with each of them, where the host's
+// headroom keeps its margin beside one but not two.
+void testAnExemptRetryPassesTheHostWithEachReservation() {
+  constexpr uint64_t extent = 108'527'616;
+  Fixture fixture(host(kHostMarginBytes + extent / 2));
+  const ClaimId lane = fixture.ledger().open(request(1, RequestPriority::Normal));
+  const auto attempt = [&] {
+    std::vector<uint64_t> granted;
+    for (int reservation = 0; reservation < 4; ++reservation) {
+      if (!fixture.allocate(lane, extent)) {
+        for (const uint64_t bytes : granted)
+          fixture.memory.release("kv", bytes);
+        return false;
+      }
+      granted.push_back(extent);
+    }
+    return true;
+  };
+  require(!attempt(), "the host admitted the floor beside its margin");
+  require(fixture.governor->free(lane, fixture.governor->need(lane)).outcome == FreeOutcome::Met &&
+              fixture.ledger().claim(lane).hostExempt,
+          "in-service work nothing in place meets was not exempted");
+  require(attempt(), "the exempt retry was refused the host after its first reservation");
 }
 
 // Units that cost nothing and are sized only when taken go first.
@@ -2067,6 +2096,7 @@ std::span<const test::TestCase> ledgerTests() {
       {"testLandingCountsBeforeVictimsInPart", testLandingCountsBeforeVictimsInPart},
       {"testStateBuffersMeetANeedOfBytes", testStateBuffersMeetANeedOfBytes},
       {"testHostRefusedNeedIsMetInPlaceFirst", testHostRefusedNeedIsMetInPlaceFirst},
+      {"testAnExemptRetryPassesTheHostWithEachReservation", testAnExemptRetryPassesTheHostWithEachReservation},
       {"testZeroCostUnsizedUnitsGoFirst", testZeroCostUnsizedUnitsGoFirst},
       {"testBenefitBoundsTheDryRun", testBenefitBoundsTheDryRun},
       {"testAvailableTakesNothing", testAvailableTakesNothing},

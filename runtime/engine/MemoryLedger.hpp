@@ -234,8 +234,10 @@ struct ClaimState final {
   Need need;
   bool waiting = false;
   double waitingSinceSeconds = 0.0;
-  // The host refused it after in-place units could not meet it: its
-  // retries pass the host (a Floor or InService claim) until one is granted.
+  // The host refused it after in-place units could not meet it: the
+  // retries of that allocation pass the host with each of their
+  // reservations (a Floor or InService claim), until the allocation ends
+  // (Engine::allocate), as the serving mark did (design/M.md R2).
   bool hostExempt = false;
   // The lanes free() converted for it, whose copies it waits for as its own.
   std::vector<uint64_t> converted;
