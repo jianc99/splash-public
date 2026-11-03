@@ -4026,6 +4026,54 @@ void testWindowTrimServesThroughTheHostPause() {
           "the pages the prompt's windows passed stayed Full under the host's pause");
 }
 
+// The ledger takes outside any allocation's scope, where an allocation is a
+// logic error (L7: Engine::allocate frees between its attempts), so no unit
+// it takes allocates: a governed windowed cache's page need that trims meet
+// with the Slim runway's last free pages takes them and allocates no
+// extent, and the runway refills where trims run in a claim's scope.
+void testTrimsAtTheSlimRunwaysLastPagesAllocateNothing() {
+  test::TestKvStorage storage(64, 4096, 4, 0, 1024);
+  GovernedHost host;
+  host.through(storage);
+  KvPool pool(storage, 0);
+  engine::Cache cache(pool, nullptr, nullptr, std::nullopt, CacheWindowPolicy{2, true});
+  MemoryLedger &ledger = host.governor.ledger();
+  ledger.addSource(cache);
+  ledger.setReturning([&cache] { return cache.returning(); },
+                      [&cache](uint64_t requestId) { return cache.returningFor(requestId); });
+  // Two conversations cached under a start's Floor claim: the first's eight
+  // pages trim, which leaves the Slim runway an extent of free pages, and
+  // the second's four Full pages wait to trim.
+  const auto converse = [&](uint64_t id, uint32_t pages) {
+    std::vector<uint32_t> prompt(pages * KvCache::pageTokens + 1);
+    std::iota(prompt.begin(), prompt.end(), 1000 * static_cast<uint32_t>(id));
+    cache.beginRequest(id);
+    require(cache.ensureTokens(id, prompt.size()).granted(), "fixture KV failed");
+    cache.publishCommittedBlocks(id, prompt, pages * KvCache::pageTokens, {});
+    cache.endRequest(id);
+  };
+  {
+    const test::ClaimScope start(host.governor, ClaimClass::Floor);
+    converse(1, 8);
+    require(cache.trimWindows() == 8, "the first conversation's pages did not trim");
+    converse(2, 4);
+  }
+  const uint32_t fullPages = pool.freePageCount(kv::PageForm::Full);
+  const uint64_t allocated = storage.allocatedBytes();
+  require(pool.freePageCount(kv::PageForm::Slim) == 4, "the Slim runway is not an extent of free pages");
+  const ClaimId claim = ledger.open(test::kInServiceGrowth);
+  const FreeResult freed = host.governor.free(claim, {.pages = 4});
+  ledger.close(claim);
+  require(freed.outcome == FreeOutcome::Met && pool.freePageCount(kv::PageForm::Slim) == 0 &&
+              pool.freePageCount(kv::PageForm::Full) == fullPages + 4 && storage.allocatedBytes() == allocated,
+          "a page need's trims allocated, or did not take the Slim runway's pages");
+  {
+    const test::ClaimScope trims(host.governor, ClaimClass::InService);
+    static_cast<void>(cache.trimWindows());
+  }
+  require(pool.freePageCount(kv::PageForm::Slim) == 4, "the Slim runway did not refill in a claim's scope");
+}
+
 void testAllocationCausesRemainDistinct() {
   for (bool stateAllocation : {false, true}) {
     for (auto reason : {metal::AllocationFailure::HostPressure,
@@ -4856,7 +4904,8 @@ void testAHigherPriorityThatWaitsLeavesACommandItsPasses() {
 // A lane whose pages keep landing is never failed for waiting: the resource
 // limit measures time without progress. With one transfer at a time every
 // round moves one page, so the restore takes many rounds and several times
-// the limit, and still completes as a prefix hit.
+// the limit, and still completes as a prefix hit. The tier's slots draw on
+// the cache's quota, as KvPageTier's do, so the tier's room is its writes'.
 void testWaitWithProgressOutlivesTheResourceLimit() {
   constexpr auto reuse = CacheReclaimMode::KeepExtents;
   test::TestKvStorage storage(12, 4096, 4);
@@ -4864,7 +4913,8 @@ void testWaitWithProgressOutlivesTheResourceLimit() {
   KvPool pool(storage, 0);
   test::TestKvTier tier;
   tier.transferLimit = 8;
-  engine::Cache cache(pool, &tier, test::ampleDiskBudget());
+  tier.budget = test::ampleDiskBudget();
+  engine::Cache cache(pool, &tier, tier.budget);
   Executor executor;
   Events events;
   engine::Engine engine(test::engineConfig({.maxContext = 102400}), cache, executor, events);
@@ -6411,6 +6461,7 @@ std::span<const test::TestCase> memoryTests() {
       {"testCompactionWaitsForTheCommandInFlight", testCompactionWaitsForTheCommandInFlight},
       {"testWindowTrimChangesNoOutput", testWindowTrimChangesNoOutput},
       {"testWindowTrimServesThroughTheHostPause", testWindowTrimServesThroughTheHostPause},
+      {"testTrimsAtTheSlimRunwaysLastPagesAllocateNothing", testTrimsAtTheSlimRunwaysLastPagesAllocateNothing},
       {"testAllocationCausesRemainDistinct", testAllocationCausesRemainDistinct},
       {"testAdmissionRespectsPriorityBeforeHashOrder", testAdmissionRespectsPriorityBeforeHashOrder},
       {"testMemoryNotWidthTriggersPriorityPreemption", testMemoryNotWidthTriggersPriorityPreemption},

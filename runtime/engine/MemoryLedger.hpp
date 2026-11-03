@@ -179,9 +179,13 @@ struct VictimQuery final {
 // A source of the units free() takes, on the engine thread between commands.
 // peek changes nothing, and may understate what later units free but never
 // overstate it: free() takes nothing unless what it peeked covers the need.
-// take takes exactly the unit the latest peek returned. A key may name its
-// unit by no more than its place in the source's order (the cache's
-// reclaims are steps from its state as it stands), but a conversion's is
+// What a later unit frees includes what goes only once another of its
+// transfers lands, as the writes that landing lets start: take starts what
+// can start now, and the claim, waiting, takes the rest on its retries as
+// landings allow. take takes exactly the unit the latest peek returned. A
+// key may name its unit by no more than its place in the source's order
+// (the cache's reclaims are steps from its state as it stands), but a
+// conversion's is
 // its lane's request id, which free() records: free() takes the units its
 // dry run chose in the source's order, each found again by peeking from the
 // head as it stands then, past as many units as the run passed over before

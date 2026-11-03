@@ -206,7 +206,8 @@ struct CacheFixture {
 
 // Four one-page prefixes, each cached by a request of its own, on four pages,
 // all allocated, and a budget of no more. With continued, each prompt runs
-// one token past its page, so a lookup can match the page.
+// one token past its page, so a lookup can match the page. A tier's copies
+// count against `budget`, if any.
 struct Prefixes {
   test::TestKvStorage storage{5, 100, 1};
   KvPool pool{storage, 4};
@@ -214,8 +215,9 @@ struct Prefixes {
   std::array<std::vector<uint32_t>, 4> prompts;
   std::array<uint64_t, 4> blocks{};
 
-  explicit Prefixes(test::TestKvTier *tier = nullptr, bool continued = true)
-      : cache(pool, tier, nullptr) {
+  explicit Prefixes(test::TestKvTier *tier = nullptr, bool continued = true,
+                    std::shared_ptr<model::DiskBudget> budget = nullptr)
+      : cache(pool, tier, std::move(budget)) {
     storage.budgetPages = 4;
     for (uint32_t i = 0; i < prompts.size(); ++i) {
       prompts[i].assign(KvCache::pageTokens, 1000 + i);
@@ -2366,7 +2368,7 @@ void testWaitingCheckpointHoldsBackNothingElse() {
 // attempt costs one refusal, not one per cached block.
 void testFullTierStopsTheScan() {
   test::TestKvTier tier;
-  Prefixes p(&tier, false);
+  Prefixes p(&tier, false, test::ampleDiskBudget());
   auto control = std::make_shared<TransferControl>();
   control->ready = true;
   control->capacity = 4;
@@ -2480,10 +2482,12 @@ void testDiskReplacementOrder() {
 }
 
 // Pages already on their way back gate allocation: the request is told to
-// wait instead of the cache demoting more than it needs.
+// wait instead of the cache demoting more than it needs. The state written
+// first leaves the quota room for the leaf's copy, so the leaf's demotion
+// is sure to free its page.
 void testPendingPagesGateAllocation() {
   test::TestKvTier tier;
-  CacheFixture fixture(&tier);
+  CacheFixture fixture(&tier, false, test::ampleDiskBudget());
   auto control = std::make_shared<TransferControl>();
   control->ready = true;
   fixture.cache.publishCompositeState(fixture.blocks[3], std::make_shared<TieredState>(control), false);
@@ -5699,7 +5703,9 @@ void testFullShortfallsTrimBeforeAnyLeafGoes() {
 
 // A state the SSD keeps still pins its tail, which a resume at it reads
 // whole: the Full shortfall above, with a checkpoint the SSD takes, writes it
-// there and trims none of its tail, and the checkpoint keeps its entry.
+// there and trims none of its tail, and the checkpoint keeps its entry. Its
+// write frees no page, so the refusal's unit goes on to the ordinary state,
+// which leaves the cache, and the trim of its tail ends the unit.
 void testFullShortfallsKeepTheTailsOfStatesTheSsdKeeps() {
   Windowed windowed;
   windowed.storage.budgetPages = 16;
@@ -5709,8 +5715,8 @@ void testFullShortfallsKeepTheTailsOfStatesTheSsdKeeps() {
   const std::vector<uint32_t> cached = Windowed::prompt(8000, 8);
   cache.beginRequest(1);
   windowed.run(1, cached, 8);
-  cache.publishCompositeState(cache.blockAt(1, 4 * KvCache::pageTokens), std::make_shared<TieredState>(control),
-                              true);
+  const uint64_t checkpoint = cache.blockAt(1, 4 * KvCache::pageTokens);
+  cache.publishCompositeState(checkpoint, std::make_shared<TieredState>(control), true);
   windowed.publish(1, 8);
   cache.endRequest(1);
   require(cache.trimWindows() == 4 && windowed.slimPages() == 4, "the unpinned pages were not trimmed");
@@ -5718,16 +5724,15 @@ void testFullShortfallsKeepTheTailsOfStatesTheSsdKeeps() {
   cache.beginRequest(2);
   const TokenAdmission refused = cache.ensureTokens(2, 12 * KvCache::pageTokens);
   require(!refused.granted() && refused.form == kv::PageForm::Full, "the shortfall setup was granted");
-  // The refusal's units until the checkpoint's write started.
-  while (control->slots == 0)
-    require(test::takeFirst(cache, test::kInServiceGrowth, {.pages = refused.additionalPages}).outcome ==
-                FreeOutcome::Met,
-            "the refusal wrote no checkpoint");
-  require(cache.pollTransfers(),
-          "the checkpoint was not written to the SSD");
+  // The refusal's first unit.
+  require(test::takeFirst(cache, test::kInServiceGrowth, {.pages = refused.additionalPages}).outcome ==
+                  FreeOutcome::Met &&
+              control->slots == 1,
+          "the refusal wrote no checkpoint");
+  require(cache.pollTransfers(), "the checkpoint was not written to the SSD");
   const auto states = cache.snapshot().stateCache;
-  require(states.entries == 2 && states.checkpointEntries == 1 && states.diskBytes == 100 && control->slots == 1 &&
-              windowed.slimPages() == 4,
+  require(states.entries == 1 && states.checkpointEntries == 1 && states.diskBytes == 100 && control->slots == 1 &&
+              windowed.slimPages() == 6 && cache.stateTailFull(checkpoint),
           "the checkpoint the SSD keeps lost its entry, or its tail was trimmed");
   cache.checkInvariants();
   cache.endRequest(2);
@@ -6235,7 +6240,8 @@ void testImmediateWalksOfferWhatLandsLaterInItsPlace() {
 
   // The leaf a state on disk restores through, without a copy while the
   // tier takes writes: the unit of its demotion, which the tier and the
-  // quota have room for, frees its page as the copy lands.
+  // quota have room for, frees its page as the copy lands. A claim that can
+  // wait gets each block above it next, a leaf once the copy below it lands.
   test::TestKvTier tier;
   test::RoomTier room(tier);
   CacheFixture kv(&room, false, std::make_shared<model::DiskBudget>(1000));
@@ -6256,9 +6262,10 @@ void testImmediateWalksOfferWhatLandsLaterInItsPlace() {
   };
   const std::vector<engine::Victim> demoted = leavesOf(NeedTiming::Immediate);
   const std::vector<engine::Victim> demotes = leavesOf(NeedTiming::CanWait);
-  require(demoted.size() == 1 && demoted[0].later && demoted[0].pages == 1 && demotes.size() == 1 &&
-              demotes[0].later && demotes[0].pages == 1,
-          "a claim that cannot wait was not offered the leaf that needs a demotion in its place, marked later");
+  require(demoted.size() == 1 && demoted[0].later && demoted[0].pages == 1 && demotes.size() == 4 &&
+              std::ranges::all_of(demotes, [](const engine::Victim &unit) { return unit.later && unit.pages == 1; }),
+          "a claim that cannot wait was not offered the leaf that needs a demotion in its place, marked later, "
+          "or one that can wait not the blocks above it");
 }
 
 // The reclaims of an Immediate claim pass over cache only a write frees,

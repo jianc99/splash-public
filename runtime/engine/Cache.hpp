@@ -707,9 +707,20 @@ public:
   // reached cache a copy ahead would have let go at once (B9). The reclaims
   // of an Immediate claim pass over such cache, so a unit whose reclaims
   // first reach it comes after the unit a claim that can wait gets from
-  // there. A unit peek() cannot be sure a transfer for it starts, a
-  // demotion the tier or the quota may refuse, frees nothing in what it
-  // reports, and a unit that waits for the state write in flight frees
+  // there. What goes only once another transfer lands, a parent whose
+  // resident children's copies are on their way, a leaf whose demotion the
+  // tier refuses while transfers are in flight, a leaf whose copy ahead is
+  // in flight, comes after what goes now of its class, as later steps of a
+  // unit, which the pages a unit's own demotions free as they land help
+  // empty an extent; take() takes a unit's victims up to its first later
+  // step and tries that one's demotion, and the claim's retries take the
+  // rest as landings allow (design/M.md section 3.4, R2). In a windowed
+  // cache a state that leaves the cache unpins its tail, whose trim into
+  // free Slim pages frees Full pages for a page need and ends its unit;
+  // take() trims after the state. A unit peek() cannot be sure a transfer
+  // for it starts, a demotion the tier or the quota may refuse, frees
+  // nothing in what it reports, and a unit that waits for the state write in
+  // flight frees
   // nothing yet: peek() may understate what a unit frees, never overstate
   // it. A unit's cost is the prefill it takes to compute it again, or with a
   // copy the time to read it back, as often as the cache's reuse
@@ -1087,6 +1098,9 @@ private:
   struct ReclaimPlan;
   mutable std::shared_ptr<ReclaimPlan> plan_;
   mutable uint32_t planSerial_ = 0;
+  // While take() takes a unit with later steps: the victims it may still
+  // take, those before the first of them (takeOldest, recycleState).
+  std::optional<uint32_t> victimsLeft_;
   // The walk's reclaims pass over a state that needs a write
   // (skipStateWrites).
   [[nodiscard]] bool skipsState(const Walk &walk, uint64_t block) const;
@@ -1147,11 +1161,14 @@ private:
   // state in use. A state that needs a write the walk passes over leaves the
   // next.
   [[nodiscard]] CacheReclaimResult recycleState(const Walk &walk);
-  // One memory reclaim of the walk: free pages first, as
-  // the extent they fill; then the walk's victims while their KV can empty
-  // an extent, until one is released or a state goes; otherwise a state
-  // (recycleState).
-  [[nodiscard]] CacheReclaimResult takeReclaim(const Walk &walk);
+  // One memory reclaim of a unit of the walk, which began with `demotions`
+  // in flight and `unit` pages landing by form (demotedPages): free pages
+  // first, as the extent they fill; then the walk's victims while their KV,
+  // with the pages the unit's demotions free as they land, can empty an
+  // extent, until one is released, those pages complete one or a state
+  // goes; otherwise a state (recycleState).
+  [[nodiscard]] CacheReclaimResult takeReclaim(const Walk &walk, uint32_t demotions,
+                                               const std::array<uint32_t, 3> &unit);
   // Oldest resident KV leaf after `after` no state restores through: nothing
   // sits on it or below it, so it saves no prefill, and it frees its page
   // with no IO.
@@ -1242,12 +1259,18 @@ private:
   [[nodiscard]] bool holdsOrdinaryState(uint64_t block) const;
   void startRestore(uint64_t block);
   // Evicting KV of the class may empty an extent: the pages upTo may reuse
-  // (reusablePages), less those whose demotion is in flight, cover one. That
-  // counts the leaves that need a demotion too, which an Immediate step
-  // passes over while the tier takes writes. A page written through is none
-  // of them: its Spill request holds it, though it frees once its copy lands
+  // (reusablePages), less those whose demotion is in flight, or the
+  // `demoting` of them a unit found in flight, cover one. That counts the
+  // leaves that need a demotion too, which an Immediate step passes over
+  // while the tier takes writes. A page written through is none of them:
+  // its Spill request holds it, though it frees once its copy lands
   // (pendingPages).
-  [[nodiscard]] bool extentWithinReach(ReclaimClass upTo = ReclaimClass::Ordinary) const;
+  [[nodiscard]] bool extentWithinReach(ReclaimClass upTo = ReclaimClass::Ordinary,
+                                       std::optional<uint32_t> demoting = std::nullopt) const;
+  // The bytes of the extents the pages of the demotions started since
+  // `before` pages were landing, by form, complete as they land, past the
+  // runway the walk keeps.
+  [[nodiscard]] uint64_t landedSince(const Walk &walk, const std::array<uint32_t, 3> &before) const noexcept;
   // For a shortfall of pages of the form in a cache that spills or trims:
   // the empty extents of the other forms beyond the runway each keeps, and
   // for Index pages, when none is, a Full extent compaction empties (the Full
@@ -1319,6 +1342,9 @@ private:
   // holds those writes back (the tier's share, the quota, a file that takes
   // none) holds the owed ones back too.
   [[nodiscard]] uint32_t copiesToSpill(uint32_t enough) const;
+  // A demotion in flight frees its page as its copy lands: the page of a
+  // leaf no state in RAM keeps (pollTierTransfers) and no request holds.
+  [[nodiscard]] bool freesOnLanding(const Write &write) const noexcept;
   // The pages the demotions in flight free as they land, by form.
   [[nodiscard]] std::array<uint32_t, 3> demotedPages() const noexcept;
   // The bytes of the whole extents `pages` pages add to the free pages of
@@ -1348,11 +1374,15 @@ private:
   // empty Slim extents past the runway, which a page need's walk releases
   // first (its Extent unit).
   [[nodiscard]] uint32_t trimRoom() const;
+  // A page need of Full pages in a windowed cache that trims: trims free
+  // pages in place for it, the passed pages first (trimmedBy), then the tail
+  // a state that leaves the cache unpins (ReclaimPlan).
+  [[nodiscard]] bool trims(const Walk &walk) const noexcept;
   // The pages a page need's walk may trim first (its Trim unit, peek), as
-  // many as free Slim pages take while the host refuses growth: Full pages
-  // each frees, which leave the blocks on them Slim. The unit counts only
-  // those trimRoom takes: the Extent unit before it may release Slim
-  // pages, and an allocation for the others may be refused.
+  // many as free Slim pages take, since no take allocates (a ledger take
+  // runs outside any allocation's scope): Full pages each frees, which leave
+  // the blocks on them Slim. The unit counts only those trimRoom takes: the
+  // Extent unit before it may release Slim pages.
   [[nodiscard]] std::vector<uint32_t> trimmedBy(const Walk &walk) const;
 
   KvPool &pool_;

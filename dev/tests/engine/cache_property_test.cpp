@@ -27,21 +27,19 @@ namespace {
 using splash::test::require;
 
 // A state the tier takes whenever reclaim or persist writes it, as long as
-// `slots` leave room and the file takes writes: the restore points requests
-// resume from.
+// the quota has room for its copy and the file takes writes: the restore
+// points requests resume from. Its copies draw on the quota the KV tier's
+// copies draw on, as the state file's slots do (openDiskTier).
 struct Shelf final {
-  uint32_t used = 0;
-  uint32_t slots = 64;
+  std::shared_ptr<model::DiskBudget> budget;
   bool takesWrites = true;
 };
 
 class ShelvedState final : public CompositeState {
 public:
-  ShelvedState(std::shared_ptr<Shelf> shelf, bool disk) : shelf_(std::move(shelf)), disk_(disk) {
-    if (disk_) ++shelf_->used;
-  }
+  ShelvedState(std::shared_ptr<Shelf> shelf, bool disk) : shelf_(std::move(shelf)), disk_(disk) {}
   ~ShelvedState() override {
-    if (disk_) --shelf_->used;
+    if (disk_) shelf_->budget->release(bytes());
   }
   uint64_t bytes() const noexcept override { return 100; }
   uint64_t residentBytes() const noexcept override { return disk_ ? 0 : bytes(); }
@@ -51,7 +49,7 @@ public:
 
 private:
   std::unique_ptr<StateOffload> shelve() const {
-    if (shelf_->used >= shelf_->slots) return {};
+    if (!shelf_->budget->reserve(bytes())) return {};
     struct Written final : StateOffload {
       std::shared_ptr<const CompositeState> disk;
       bool ready() const noexcept override { return true; }
@@ -155,7 +153,6 @@ public:
   void settle() {
     budget_->setLimitBytes(kSlots * 100);
     budget_->setActiveLimitBytes(kSlots * 100);
-    shelf_->slots = 64;
     cache_.keepDiskLimit();
     tier_.writableFile = chance(50);
     shelf_->takesWrites = chance(50);
@@ -171,8 +168,10 @@ public:
   // order, are at most those the pool releases and those take() says the
   // copies it started complete as they land (laterBytes), and their pages
   // at most the pages of the need's form that free, now or as demotions
-  // land; an Immediate claim, as free() does, passes over those that land
-  // later. Each unit of a device need releases exactly what it was weighed
+  // land, with what was started landed and the query's units taken again,
+  // as a waiting claim's retries take a unit's later steps; an Immediate
+  // claim, as free() does, passes over those that land later. Each unit of
+  // a device need releases exactly what it was weighed
   // at while none so far lands later and the takes so far started no
   // transfer and wrote no state: what the tier refuses, and the copies a
   // write gives up for room, the walk cannot know (exactUnits, the others
@@ -229,6 +228,26 @@ public:
       ++(sure ? exactUnits : unsureUnits);
       require(!sure || released == victim.bytes,
               "a unit released " + std::to_string(released) + " bytes, weighed at " + std::to_string(victim.bytes));
+    }
+    // A unit's later steps free once the transfers before them land, which
+    // the claim's retries take: what was started lands, and the query's
+    // units are taken again until they free what was weighed or none goes.
+    for (uint32_t retry = 0; retry < 64 && (freed < predicted || freedPages < predictedPages); ++retry) {
+      tier_.complete();
+      static_cast<void>(cache_.pollTransfers());
+      std::optional<engine::Victim> unit = cache_.peek(query, nullptr);
+      while (unit && unit->later && claim.timing == NeedTiming::Immediate)
+        unit = cache_.peek(query, &*unit);
+      if (!unit)
+        break;
+      const uint64_t before = pool_.allocatedBytes();
+      const uint32_t pagesBefore = pagesOf();
+      const FreeResult taken = cache_.take(query, *unit);
+      freed += before - std::min(before, pool_.allocatedBytes()) + taken.laterBytes;
+      const uint32_t pagesAfter = pagesOf();
+      freedPages += pagesAfter - std::min(pagesAfter, pagesBefore);
+      if (taken.outcome != FreeOutcome::Met)
+        break;
     }
     require(freed >= predicted && freedPages >= predictedPages,
             "the walk weighed its victims to free more than taking them freed: weighed " + std::to_string(predicted) +
@@ -354,12 +373,11 @@ private:
     static_cast<void>(cache_.reclaimOne(mode, chance(50) ? ReclaimClass::InUse : ReclaimClass::Ordinary));
   }
 
-  // The volume's room changes, and the quota follows it; so does the state
-  // file's, whose writes then make room or are refused.
+  // The volume's room changes, and the quota follows it, which the state
+  // file shares: its writes then make room or are refused.
   void keepQuota() {
     budget_->setLimitBytes(pick(0, kSlots) * 100);
     budget_->setActiveLimitBytes(pick(0, kSlots) * 100);
-    shelf_->slots = pick(0, 64);
     cache_.keepDiskLimit();
     const KvSpillSnapshot spilled = cache_.spillSnapshot();
     require(!spilled.committedBytes || spilled.heldBytes + spilled.committedBytes <= spilled.activeLimitBytes,
@@ -433,7 +451,7 @@ private:
   bool saysRoom_;
   std::shared_ptr<model::DiskBudget> budget_;
   engine::Cache cache_;
-  std::shared_ptr<Shelf> shelf_ = std::make_shared<Shelf>();
+  std::shared_ptr<Shelf> shelf_ = std::make_shared<Shelf>(Shelf{.budget = budget_});
   std::array<std::vector<uint32_t>, 3> bases_;
   std::map<uint64_t, Request> requests_;
   // What the commands in flight read.
