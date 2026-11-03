@@ -468,9 +468,9 @@ void cacheDiskState(test::EngineHarness &harness, const std::vector<uint32_t> &p
 // L7: a state restored from disk takes its RAM copy in a claim of its
 // request, an Optional one, since the copy only saves the next read. With
 // room the copy is admitted and the next request on the prompt reads no
-// disk. A restore that lands while a command is in flight takes nothing for
-// its copy (L8): refused, the state stays on disk and the request runs from
-// it.
+// disk. A restore that lands while a command is in flight waits for the
+// command to end (L8: its claim takes units only then), and its copy is
+// admitted in the room there is by then.
 void testARestoredStateIsPromotedInAClaim() {
   const std::vector<uint32_t> prompt(65, 17);
   {
@@ -499,15 +499,16 @@ void testARestoredStateIsPromotedInAClaim() {
     harness.memory->hold("limit", harness.governor->snapshot().headroomBytes - 32);
     harness.model.restoreControl->ready = true;
     static_cast<void>(harness.tick());
-    const StateCacheSnapshot states = harness.cache.snapshot().stateCache;
-    require(harness.engine.commandInFlight() && states.promotions == 0 && states.promotionsSkipped == 1,
-            "a restore that landed beside a command in flight was promoted with no room");
+    const StateCacheSnapshot landed = harness.cache.snapshot().stateCache;
+    require(harness.engine.commandInFlight() && landed.promotions == 0 && landed.promotionsSkipped == 0,
+            "a restore that landed beside a command in flight gave up its copy before the command ended");
     harness.memory->release("limit", harness.memory->held("limit"));
     *release = true;
     harness.runUntilIdle();
-    require(harness.events.completedCount == 2 && harness.events.failedCount == 0 &&
-                harness.model.heldStateBytes == 0,
-            "the requests did not finish, or the refused copy held memory");
+    const StateCacheSnapshot states = harness.cache.snapshot().stateCache;
+    require(harness.events.completedCount == 2 && harness.events.failedCount == 0 && states.promotions == 1 &&
+                states.promotionsSkipped == 0,
+            "a restore that landed beside a command in flight was not promoted once the command ended");
   }
 }
 

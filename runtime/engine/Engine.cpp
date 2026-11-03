@@ -1024,6 +1024,10 @@ bool Engine::pollRestores() {
     if (ticket && !ticket->ready()) continue;
     const KvRestoreStatus kv = cache_.kvRestoreStatus(id);
     if (!active.pendingEnd && kv == KvRestoreStatus::Pending) continue;
+    // A state read that landed beside a command in flight waits for the
+    // command to end, where the claim of its RAM copy may take units (L8):
+    // its lane joins no command before that.
+    if (ticket && pending_ && !active.pendingEnd) continue;
     auto restore = std::move(*active.restore);
     active.restore.reset();
     progressed = true;
@@ -1058,8 +1062,8 @@ bool Engine::pollRestores() {
 std::shared_ptr<const CompositeState> Engine::promotedCopy(Request &active, const CacheLookup &lookup,
                                                            StateRestore &restore) {
   // Worth the read as the cache prices a state with a copy (value::cached),
-  // so it takes only what costs less. A restore may land while a command is
-  // in flight, when nothing is taken (L8): the copy takes what is free.
+  // so it takes only what costs less, with no command in flight
+  // (pollRestores).
   ClaimSpec spec = claimFor(active, ClaimClass::Optional);
   spec.timing = NeedTiming::Immediate;
   spec.benefitSeconds = value::cached(lookup.resumeBoundary(), lookup.state->state()->bytes(), true, false,
@@ -1071,7 +1075,7 @@ std::shared_ptr<const CompositeState> Engine::promotedCopy(Request &active, cons
         state = restore.snapshot();
         return StateBuffers{.ok = state != nullptr};
       },
-      spec, !pending_));
+      spec));
   return state;
 }
 
