@@ -271,9 +271,10 @@ struct ExpertStore::Impl {
   // rows in the tiles of `parts`; `predicted` when the step predicted the
   // next block's routes (predictionRoutes and predictionWeights), from the
   // rows `verifyRows` names when the step routes its verify rows alone
-  // (ops::MoeBuffers::verifyRows).
-  void load(uint32_t block, ops::MoePhase phase, uint32_t rows, bool predicted, std::span<const PartTiles> parts,
-            uint32_t round, uint32_t rounds, const metal::MetalBuffer &verifyRows);
+  // (ops::MoeBuffers::verifyRows). Returns the experts its route found not
+  // resident, which the load reads: none after its first round.
+  uint64_t load(uint32_t block, ops::MoePhase phase, uint32_t rows, bool predicted, std::span<const PartTiles> parts,
+                uint32_t round, uint32_t rounds, const metal::MetalBuffer &verifyRows);
   void route(uint32_t block, std::span<const std::span<const MoeTileDescriptor>> parts, ops::MoePhase phase,
              uint32_t rows, ExpertStoreStats::Use &use);
   // Whether a load of `rows` rows of `phase` is a long prefill chunk's,
@@ -428,11 +429,21 @@ struct ExpertStore::Impl {
   std::vector<uint32_t> publishedResident;
   bool released = false;
   // Per ops::MoePhase, the round trips of the loads' host steps, which their
-  // commands' completions add from Metal's thread.
+  // commands' completions add from Metal's thread, and the line of each
+  // load's work against the experts its route read (ReadWork), which a
+  // load's last round adds.
   struct StepTimes final {
     LatencyHistogram pickup, work, resume;
+    mutable std::mutex loadsMutex;
+    ReadWork loads;
   };
   std::array<StepTimes, 2> stepTimes;
+  // A load's reads, which its first round routes on the runner, and the work
+  // of its rounds' host steps, which the completion adds in their order.
+  struct LoadWork final {
+    std::atomic<uint64_t> read{0};
+    double milliseconds = 0.0;
+  };
 };
 
 // The expert in a slot, if any, is no longer resident.
@@ -979,15 +990,16 @@ void ExpertStore::Impl::publish() {
   for (size_t block = 0; block < blocks.size(); ++block) publishedResident[block] = blocks[block].resident;
 }
 
-void ExpertStore::Impl::load(uint32_t index, ops::MoePhase phase, uint32_t rows, bool predicted,
-                             std::span<const PartTiles> parts, uint32_t round, uint32_t rounds,
-                             const metal::MetalBuffer &verifyRows) {
+uint64_t ExpertStore::Impl::load(uint32_t index, ops::MoePhase phase, uint32_t rows, bool predicted,
+                                 std::span<const PartTiles> parts, uint32_t round, uint32_t rounds,
+                                 const metal::MetalBuffer &verifyRows) {
   std::lock_guard lock(mutex);
   // No job runs until the round's are staged; the last round's ran.
   static_cast<uint32_t *>(grid.contents())[1] = 0;
   staged.clear();
   if (!failure.empty()) throw std::runtime_error("expert store failed earlier: " + failure);
   ExpertStoreStats::Use &use = counters.uses[static_cast<size_t>(phase)];
+  uint64_t read = 0;
   try {
     if (round == 0) {
       // A load whose later rounds did not run (its command failed) frees the
@@ -1004,13 +1016,14 @@ void ExpertStore::Impl::load(uint32_t index, ops::MoePhase phase, uint32_t rows,
         partTiles.push_back({descriptors, counted->tiles});
       }
       route(index, partTiles, phase, rows, use);
+      read = pending.size();
       ++use.loads;
     } else if (pendingBlock != index) {
       throw std::logic_error("an expert load's round follows another block's load");
     } else if (pending.empty()) {
       // An earlier round staged every expert, and the read-ahead of the next
       // block runs on.
-      return;
+      return read;
     }
     // The read-ahead halts: its readers take no more pieces.
     if (ahead.batch) readers->halt(*ahead.batch);
@@ -1024,7 +1037,7 @@ void ExpertStore::Impl::load(uint32_t index, ops::MoePhase phase, uint32_t rows,
       std::vector<uint32_t> waitingExperts;
       for (const auto &entry : pending) waitingExperts.push_back(entry.first);
       planAhead(index, waitingExperts, use);
-      return;
+      return read;
     }
     // A long chunk's next block is read ahead by the host step after its
     // last repack (readBlockAhead).
@@ -1041,6 +1054,7 @@ void ExpertStore::Impl::load(uint32_t index, ops::MoePhase phase, uint32_t rows,
     throw;
   }
   publish();
+  return read;
 }
 
 void ExpertStore::Impl::readBlockAhead(uint32_t index, ops::MoePhase phase) {
@@ -1277,12 +1291,24 @@ void ExpertStore::addLoad(metal::CommandGraph &graph, std::span<const ops::MoeLo
   // Each step's read-ahead starts once the GPU went on (startAhead).
   const auto startAhead = [impl = impl_] { impl->startAhead(); };
   const metal::MetalBuffer verifyRows = predicted ? parts.front().buffers->verifyRows : metal::MetalBuffer{};
+  // What the load read and its rounds' work, which its last round's round
+  // trip adds to the phase's line of loads.
+  const auto work = std::make_shared<Impl::LoadWork>();
   for (uint32_t round = 0; round < rounds; ++round) {
     graph.host(
-        [impl = impl_, block, phase, rows, predicted, tiles, round, rounds, verifyRows] {
-          impl->load(block, phase, rows, predicted, tiles, round, rounds, verifyRows);
+        [impl = impl_, block, phase, rows, predicted, tiles, round, rounds, verifyRows, work] {
+          work->read.fetch_add(impl->load(block, phase, rows, predicted, tiles, round, rounds, verifyRows),
+                               std::memory_order_release);
         },
-        timed, gpu, startAhead);
+        [impl = impl_, timed, phase, work, last = round + 1 == rounds](const metal::HostStepTiming &timing) {
+          timed(timing);
+          work->milliseconds += timing.workSeconds * 1000.0;
+          if (!last) return;
+          Impl::StepTimes &times = impl->stepTimes[static_cast<size_t>(phase)];
+          const std::lock_guard lock(times.loadsMutex);
+          times.loads.add(double(work->read.load(std::memory_order_acquire)), work->milliseconds);
+        },
+        gpu, startAhead);
     ops::MoE::addExpertLoad(graph, impl.staging, size.chunks, impl.jobs, impl.sources, size.load,
                             static_cast<uint32_t>(std::min<uint64_t>(routable, impl.places.count)),
                             metal::IndirectGrid{impl.grid, 0});
@@ -1308,6 +1334,8 @@ ExpertStoreStats ExpertStore::stats() const {
     result.uses[use].pickup = times.pickup.snapshot();
     result.uses[use].work = times.work.snapshot();
     result.uses[use].resume = times.resume.snapshot();
+    const std::lock_guard lock(times.loadsMutex);
+    result.uses[use].readWork = times.loads;
   }
   return result;
 }

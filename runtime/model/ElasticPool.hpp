@@ -32,8 +32,9 @@ struct PoolValue final {
   uint64_t ghostHits = 0;         // misses a pool larger by ghostBytes would have served (ARC ghosts);
                                   // 0 without ghosts
   uint64_t ghostBytes = 0;        // bytes the ghosts span now (ghost keys * bytes per key); 0 without ghosts
-  double missMilliseconds = 0.0;  // measured cost of one miss: an SSD read, or a rebuild (an image's encode, the
-                                  // vision arena or the staging allocated again); 0 while unmeasured
+  double missMilliseconds = 0.0;  // measured cost of one miss: an SSD read (the store: the work one read more
+                                  // adds to its loads, the readers overlapping), or a rebuild (an image's
+                                  // encode, the vision arena or the staging allocated again); 0 while unmeasured
   uint64_t releasedBytes = 0;     // bytes release() gave back
   double releaseMilliseconds = 0.0;  // engine-thread time release() took to give them back (the store's
                                      // compactions)

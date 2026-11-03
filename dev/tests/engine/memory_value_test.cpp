@@ -6,6 +6,7 @@
 #include "TestRegistry.hpp"
 #include "engine/MemoryGovernor.hpp"
 #include "engine/MemoryValue.hpp"
+#include "model/ExpertStoreStats.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -15,6 +16,7 @@
 #include <span>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace splash;
@@ -215,6 +217,43 @@ void testGrowthPaysOnlyWhatARetakeCosts() {
           "growth into free room does not ask the expected retake's cost");
 }
 
+// A miss costs the store the host-step work one read more adds to a load,
+// its readers overlapping, not the mean work a read (DESIGN section 0, owner
+// 11-03 00:35): decode loads of 2-18 reads whose work is a load's own 0.66
+// ms and 0.142 ms a read (the M6's runs measure 0.130-0.155 a read; at
+// mMNa's 0.2095 ms mean and about ten reads a load, the rest is the load's
+// own) price a miss at 0.142 ms, and a store chunk's decode value with it;
+// loads that all read as many experts identify no line, and a miss costs
+// the mean.
+void testAMissIsPricedAtTheMarginalRead() {
+  const auto loads = [](uint32_t spread) {
+    model::ExpertStoreStats::Use decode;
+    for (uint32_t load = 0; load < 340; ++load) {
+      const uint64_t reads = 10 - spread / 2 + load % (spread + 1);
+      const double work = 0.66 + 0.142 * double(reads);
+      decode.read += reads;
+      decode.work.totalMilliseconds += work;
+      decode.readWork.add(double(reads), work);
+    }
+    return decode;
+  };
+  const model::ExpertStoreStats::Use varied = loads(16), even = loads(0);
+  const double mean = varied.work.totalMilliseconds / double(varied.read);
+  require(std::abs(varied.missMilliseconds() - 0.142) < 1e-9 && mean > 0.2,
+          "loads of 2-18 reads priced a miss at " + std::to_string(varied.missMilliseconds()) +
+              " ms, not the 0.142 ms a read adds to a load (the mean work a read " + std::to_string(mean) + " ms)");
+  const value::PoolRate ghosts = observed(21.6, 0.0, 0.0, 1023 * kMiB);
+  const auto chunk = [&](double missMilliseconds) {
+    return value::poolUnit(ghosts, {.missMilliseconds = missMilliseconds}, 1023 * kMiB, 0, 60.0, MemoryRates{})
+        .at(60.0);
+  };
+  require(std::abs(chunk(varied.missMilliseconds()) - chunk(mean) * 0.142 / mean) < 1e-9,
+          "a store chunk's decode value does not follow the marginal read");
+  require(std::abs(even.missMilliseconds() - (0.66 + 0.142 * 10) / 10) < 1e-9,
+          "loads that all read as many experts priced a miss at " + std::to_string(even.missMilliseconds()) +
+              " ms, not the mean work a read");
+}
+
 // A recorded M6 run, sampled every 2 s.
 struct RecordedRun final {
   std::map<std::string, double> constants;
@@ -312,32 +351,40 @@ void testRecordedLoadsDoNotFlipFlop() {
 // token (m150a, m150b); mMNa's ran at its 4856-slot floor. Replayed through
 // a store at that floor that a ledger observes every 500 ms, mMNa's misses
 // beyond 1.5.0's are the hits of ghosts spanning the 866 slots between,
-// each at mMNa's miss time (0.2095 ms, its mean host-step work a read): the
-// account's value_per_gib over the passes with commands, per decode token,
-// is what the slots above the floor saved a decode token's wall time, D2's
-// 1.1-3.6 ms a GiB. At 37.3 it replays to 3.79, and at 40.4 to 3.25, 1.59
-// and 1.75 times what those runs' own wall times show (2.66 and 2.07 ms a
-// token, 2.39 and 1.86 a GiB): a mean read costs more than the one a
-// smaller store adds (a decode token's host work differs by 3.34 and 2.40
-// ms for 21.6 and 18.5 reads, 0.155 and 0.130 ms a read). Whether a miss
-// is priced at the marginal read is the owner's to decide (open); until
-// then this fails at 37.3. pFa is not replayed: its 5128-slot store is not
-// 1.5.0's floor pair, and it misses more a token (61.7) than mMNa's
-// smaller one.
+// each at the marginal read (DESIGN section 0, owner 11-03 00:35): the line
+// of host-step work against reads the store fits through its loads
+// (ExpertStoreStats::Use::missMilliseconds), here through each pair's decode
+// tokens, which load every streamed block once a command alike: a token's
+// host work differs by 3.34 and 2.40 ms for 21.6 and 18.5 reads, 0.155 and
+// 0.130 ms a read, against mMNa's mean of 0.2095. The account's
+// value_per_gib over the passes with commands, per decode token, is what the
+// slots above the floor saved a decode token's wall time, D2's 1.1-3.6 ms a
+// GiB: at the marginal read it replays to 2.81 and 2.02 (at the mean read
+// 3.79 and 3.25, 1.59 and 1.75 times what those runs' own wall times show).
+// pFa is not replayed: its 5128-slot store is not 1.5.0's floor pair, and it
+// misses more a token (61.7) than mMNa's smaller one. This calibrates the
+// price against D2; that the store's pool reports its own loads' slope is
+// expert-store's pool case.
 void testValuePerGiBReproducesThePinnedStore() {
   constexpr uint32_t kFloorSlots = 4856, kPinnedSlots = 5722;
   // What the store's slots above the floor saved a decode token's wall time
   // on the M6, ms a GiB (amend/M.md D2: 1.5.0's whole store at 18.2-19.1 ms
   // a token, main's and intpart's floor at 20.3-22.2, 1140 MiB between).
   constexpr double kSavedLeast = 1.1, kSavedMost = 3.6;
-  // 1.5.0's misses a decode token: m150a and m150b.
-  constexpr double kPinnedMisses[] = {37.3, 40.4};
+  // Host-step work a decode token (streamed_experts.decode.host_steps.work_ms
+  // total over metrics.decode_output_tokens, each run's last status): mMNa,
+  // and 1.5.0's m150a and m150b beside their misses a token.
+  constexpr double kFloorWorkMilliseconds = 12.34;
+  constexpr std::pair<double, double> kPinned[] = {{37.3, 9.00}, {40.4, 9.94}};
   const RecordedRun run = readRun("m6-mMNa.tsv");
-  const double missMilliseconds = run.constants.at("miss_ms");
   const double tokens =
       run.constants.at("decode_tokens_per_second") * (run.samples.back().seconds - run.samples.front().seconds);
   const double missesPerToken = double(run.samples.back().misses - run.samples.front().misses) / tokens;
-  for (const double pinnedPerToken : kPinnedMisses) {
+  for (const auto &[pinnedPerToken, pinnedWorkMilliseconds] : kPinned) {
+    model::ExpertStoreStats::Use decode;
+    decode.readWork.add(pinnedPerToken, pinnedWorkMilliseconds);
+    decode.readWork.add(missesPerToken, kFloorWorkMilliseconds);
+    const double missMilliseconds = decode.missMilliseconds();
     const double ghostShare = 1.0 - pinnedPerToken / missesPerToken;
     FakeMemory memory({});
     FakeElasticPool store("experts", memory, kSlotBytes, kFloorSlots, kPinnedSlots, kPinnedSlots, kFloorSlots,
@@ -371,9 +418,10 @@ void testValuePerGiBReproducesThePinnedStore() {
     }
     const double perToken = worth / tokens * 1000.0;
     require(perToken >= kSavedLeast && perToken <= kSavedMost,
-            "at 1.5.0's " + std::to_string(pinnedPerToken) + " misses a token value_per_gib replays to " +
-                std::to_string(perToken) + " ms a decode token a GiB, outside the " + std::to_string(kSavedLeast) +
-                " to " + std::to_string(kSavedMost) + " the store saved (amend/M.md D2)");
+            "at 1.5.0's " + std::to_string(pinnedPerToken) + " misses a token, a miss at " +
+                std::to_string(missMilliseconds) + " ms, value_per_gib replays to " + std::to_string(perToken) +
+                " ms a decode token a GiB, outside the " + std::to_string(kSavedLeast) + " to " +
+                std::to_string(kSavedMost) + " the store saved (amend/M.md D2)");
   }
 }
 
@@ -388,6 +436,7 @@ std::span<const test::TestCase> valueTests() {
       {"testHiSparseOnStudio36GWeighsPrefillScans", testHiSparseOnStudio36GWeighsPrefillScans},
       {"testSpillDecodeTermUsesTheEnginesMeanAndItsPrior", testSpillDecodeTermUsesTheEnginesMeanAndItsPrior},
       {"testGrowthPaysOnlyWhatARetakeCosts", testGrowthPaysOnlyWhatARetakeCosts},
+      {"testAMissIsPricedAtTheMarginalRead", testAMissIsPricedAtTheMarginalRead},
       {"testRecordedLoadsDoNotFlipFlop", testRecordedLoadsDoNotFlipFlop},
       {"testValuePerGiBReproducesThePinnedStore", testValuePerGiBReproducesThePinnedStore},
   };

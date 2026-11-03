@@ -81,8 +81,9 @@ template <class ReleaseOne> uint64_t releaseUnits(uint64_t bytes, ReleaseOne rel
 // whole, it would hold every block's experts in slots of the live chunks'
 // mean bytes beside its staging and tables. Its value: the routed experts it
 // held, decode's ghost hits and the bytes its ghosts would take, the
-// host-step work a decode load took per expert it read and a slot's mean
-// bytes, which a miss reads, and the bytes prefill loads read, whose misses
+// host-step work one expert more read adds to a decode load (the marginal
+// read, ExpertStoreStats::Use::missMilliseconds) and a slot's mean bytes,
+// which a miss reads, and the bytes prefill loads read, whose misses
 // leave no ghosts (SlotRecycler recycles a long chunk's loads first); the
 // store counts what its shrinks gave back and their compactions' time
 // itself (ExpertStoreStats).
@@ -108,7 +109,7 @@ public:
     return {.hits = hits,
             .ghostHits = stats.ghostHits,
             .ghostBytes = stats.ghostBytes,
-            .missMilliseconds = decode.read ? decode.work.totalMilliseconds / double(decode.read) : 0.0,
+            .missMilliseconds = decode.missMilliseconds(),
             .releasedBytes = stats.releasedBytes,
             .releaseMilliseconds = stats.releaseMilliseconds,
             .keyBytes = slotBytes(stats),

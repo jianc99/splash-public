@@ -1280,6 +1280,11 @@ def health(run: Run, machine: dict, gates: dict) -> dict:
             a["name"]: a.get("value_per_gib")
             for a in value(last, "memory_governor.accounts", [])
         },
+        # The experts' value input beside it: the decode loads' line of work
+        # against reads (miss_ms, the marginal read; the M6 measures
+        # 0.130-0.155 ms, DESIGN section 0, owner 11-03 00:35), so that a
+        # value_per_gib off D2 tells a wrong miss price from a wrong ghost rate.
+        "miss_line": value(last, "streamed_experts.decode.read_line"),
         "spawn_to_ready_s": [
             part.get("spawn_to_ready_s") for part in run.meta.get("parts", [])
         ],

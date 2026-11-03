@@ -6,10 +6,37 @@
 
 #include "model/LatencyHistogram.hpp"
 
+#include <algorithm>
 #include <cstdint>
+#include <optional>
 #include <string>
 
 namespace splash::model {
+
+// The loads' host-step work against the experts each read: the least-squares
+// line through every load's (reads, work), as its count, means and centred
+// sums. Its slope is the work one read more adds with the store's readers
+// overlapping, the marginal read; its intercept, a load's own work.
+struct ReadWork final {
+  uint64_t loads = 0;
+  double reads = 0.0, milliseconds = 0.0;   // means
+  double readSpread = 0.0, coSpread = 0.0;  // sum (r - mean r)^2 and sum (r - mean r)(w - mean w)
+
+  void add(double read, double work) noexcept {
+    ++loads;
+    const double off = read - reads;
+    reads += off / double(loads);
+    milliseconds += (work - milliseconds) / double(loads);
+    readSpread += off * (read - reads);
+    coSpread += off * (work - milliseconds);
+  }
+  // The marginal read in ms, never below zero; none until loads of different
+  // reads identify it.
+  [[nodiscard]] std::optional<double> marginalMilliseconds() const noexcept {
+    if (readSpread <= 0.0) return std::nullopt;
+    return std::max(0.0, coSpread / readSpread);
+  }
+};
 
 struct ExpertStoreStats final {
   // The store at its cap, at its floor and as it is, as ExpertStoreOptions
@@ -55,7 +82,8 @@ struct ExpertStoreStats final {
   // the bytes read from the sources (ahead or not, routed or not), and the
   // round trips of the loads' host steps, one per round (metal::
   // HostStepTiming: the GPU's work before a step to the runner taking it up,
-  // its work, its end to the GPU's work after it).
+  // its work, its end to the GPU's work after it), and the line of each
+  // load's work against what it read.
   struct Use final {
     uint64_t loads = 0;
     uint64_t routed = 0;
@@ -64,6 +92,19 @@ struct ExpertStoreStats final {
     uint64_t readAhead = 0;
     uint64_t readBytes = 0;
     LatencyStats pickup, work, resume;
+    ReadWork readWork;
+
+    // What a miss costs the loads: the marginal read (DESIGN section 0,
+    // owner 11-03 00:35: what a read adds with the readers overlapping, not
+    // the mean work a read), the mean until loads identify it.
+    [[nodiscard]] double missMilliseconds() const noexcept {
+      return readWork.marginalMilliseconds().value_or(read ? work.totalMilliseconds / double(read) : 0.0);
+    }
+    // A load's own work besides its reads at that price: the line's at no
+    // read through the loads' means (about 0 while the mean prices them).
+    [[nodiscard]] double loadMilliseconds() const noexcept {
+      return readWork.milliseconds - missMilliseconds() * readWork.reads;
+    }
   };
   Use uses[2];
   // Why a load failed, which fails every later load too; empty while none

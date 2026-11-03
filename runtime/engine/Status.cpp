@@ -159,8 +159,12 @@ void appendStreamedTable(std::ostringstream &out, const std::optional<model::Spa
 // them, per use (prefill, decode) its loads: the distinct experts they
 // routed, those not resident (read) and of them those read ahead
 // (prefetched), the experts read ahead whole, the bytes read from the
-// sources and their host steps' round trips, one per round (pickup, work,
-// resume); and why a load failed, which fails every later load.
+// sources, their host steps' round trips, one per round (pickup, work,
+// resume), and the line of each load's host-step work against the experts
+// it read: the loads on it, what a miss costs (its slope, the price the
+// store's pool reports, model::ExpertStoreStats::Use::missMilliseconds) and
+// a load's own work at that price; and why a load failed, which fails every
+// later load.
 void appendStreamedExperts(std::ostringstream &out, const std::optional<model::ExpertStoreStats> &experts) {
   if (!experts) {
     out << "null";
@@ -184,7 +188,8 @@ void appendStreamedExperts(std::ostringstream &out, const std::optional<model::E
     appendLatency(out, counters.work);
     out << ",\"resume_ms\":";
     appendLatency(out, counters.resume);
-    out << "}}";
+    out << "},\"read_line\":{\"loads\":" << counters.readWork.loads << ",\"miss_ms\":" << counters.missMilliseconds()
+        << ",\"load_ms\":" << counters.loadMilliseconds() << "}}";
   }
   out << ",\"failure\":" << json::quote(experts->failure) << '}';
 }

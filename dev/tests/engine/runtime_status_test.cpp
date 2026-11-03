@@ -738,8 +738,10 @@ void testWeightsStatus() {
 // Streamed routed experts' store (--expert-memory): null without one; with
 // one its cap and floor, its live chunks and those at the cap, its shrinks
 // and regrows, its live arena, staging, slots, residency, loads, hit rate,
-// the latencies of its host steps' round trips and its failure. An added
-// field: the schema version stays.
+// the latencies of its host steps' round trips, the line of its loads' work
+// against their reads (the loads on it, a miss's price, its slope, and a
+// load's own work at that price) and its failure. An added field: the
+// schema version stays.
 void testStreamedExpertsStatus() {
   const auto memoryPlan = plan();
   const auto status = [&](const std::optional<model::ExpertStoreStats> &experts) {
@@ -771,6 +773,10 @@ void testStreamedExpertsStatus() {
                               .p50Milliseconds = 0.512, .p95Milliseconds = 2.048, .p99Milliseconds = 8.192},
                      .resume = {.count = 500, .totalMilliseconds = 48.5, .maximumMilliseconds = 12.5,
                                 .p50Milliseconds = 0.128, .p95Milliseconds = 0.128, .p99Milliseconds = 16.384}};
+  // Decode loads of 2 and 6 reads that took 1 and 2 ms: a miss at 0.25 ms
+  // and a load's own work 0.5 ms.
+  experts.uses[1].readWork.add(2, 1.0);
+  experts.uses[1].readWork.add(6, 2.0);
   experts.failure = "injected";
   const std::string none = "{\"p50\":0,\"p95\":0,\"p99\":0,\"max\":0,\"total\":0,\"samples\":0}";
   require(status(experts).find(
@@ -780,12 +786,14 @@ void testStreamedExpertsStatus() {
               "\"experts\":25088,\"resident\":8000,\"prefill\":{\"loads\":0,\"routed\":0,\"read\":0,\"prefetched\":0,"
               "\"read_ahead\":0,\"hit_rate\":0,\"read_bytes\":0,\"host_steps\":{\"pickup_ms\":" +
               none + ",\"work_ms\":" + none + ",\"resume_ms\":" + none +
-              "}},\"decode\":{\"loads\":480,\"routed\":4000,\"read\":1000,\"prefetched\":600,"
+              "},\"read_line\":{\"loads\":0,\"miss_ms\":0,\"load_ms\":0}},"
+              "\"decode\":{\"loads\":480,\"routed\":4000,\"read\":1000,\"prefetched\":600,"
               "\"read_ahead\":900,\"hit_rate\":0.75,\"read_bytes\":1973000000,\"host_steps\":"
               "{\"pickup_ms\":{\"p50\":0.032,\"p95\":0.032,\"p99\":0.064,\"max\":0.09,\"total\":11.5,"
               "\"samples\":500},\"work_ms\":{\"p50\":0.512,\"p95\":2.048,\"p99\":8.192,\"max\":9.5,"
               "\"total\":240,\"samples\":500},\"resume_ms\":{\"p50\":0.128,\"p95\":0.128,\"p99\":16.384,"
-              "\"max\":12.5,\"total\":48.5,\"samples\":500}}},\"failure\":\"injected\"}") != std::string::npos,
+              "\"max\":12.5,\"total\":48.5,\"samples\":500}},\"read_line\":{\"loads\":2,\"miss_ms\":0.25,"
+              "\"load_ms\":0.5}},\"failure\":\"injected\"}") != std::string::npos,
           "streamed experts' status differs");
 }
 

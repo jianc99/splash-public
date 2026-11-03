@@ -1325,15 +1325,44 @@ int streamedPool(MetalBackend &backend, const MoeShape &shape, const std::filesy
   if (!pool.grow(splash::test::admitAll) || pool.state().currentBytes != state.currentBytes + state.growUnitBytes)
     fail("a granted grow did not take the unit it named");
   // Decode steps after the shrinks, the blocks taking turns, miss experts
-  // they routed lately.
+  // they routed lately. A miss costs the slope of the least-squares line
+  // through each decode load's host-step work against the experts it read
+  // (the marginal read): here each load's reads and work are the store's
+  // counts before and after it, and of 1-4 rows the loads read different
+  // numbers of experts.
   const ExpertStoreStats ghostsBefore = store.stats();
+  std::vector<std::pair<double, double>> decodeLoads;
   for (uint32_t step = 0; step < 24; ++step)
-    for (uint32_t block = 0; block < 2; ++block) load(MoE::decodePlan(shape, 1 + step % 4, MoeConfig{}), block);
+    for (uint32_t block = 0; block < 2; ++block) {
+      const ExpertStoreStats::Use was = store.stats().uses[1];
+      load(MoE::decodePlan(shape, 1 + step % 4, MoeConfig{}), block);
+      const ExpertStoreStats::Use is = store.stats().uses[1];
+      decodeLoads.emplace_back(double(is.read - was.read), is.work.totalMilliseconds - was.work.totalMilliseconds);
+    }
+  double meanReads = 0, meanWork = 0, readSpread = 0, coSpread = 0;
+  for (const auto &[reads, work] : decodeLoads) {
+    meanReads += reads / double(decodeLoads.size());
+    meanWork += work / double(decodeLoads.size());
+  }
+  for (const auto &[reads, work] : decodeLoads) {
+    readSpread += (reads - meanReads) * (reads - meanReads);
+    coSpread += (reads - meanReads) * (work - meanWork);
+  }
+  const double slope = readSpread > 0 ? coSpread / readSpread : 0.0;
   const splash::model::PoolValue ghosts = pool.value();
+  const ExpertStoreStats::Use decoded = store.stats().uses[1];
+  // The store adds its loads' work in seconds, the histogram in whole
+  // nanoseconds a round: their slopes agree within a few nanoseconds.
   if (ghosts.ghostHits <= ghostsBefore.ghostHits || !ghosts.ghostBytes || ghosts.hits <= value.hits ||
-      !(ghosts.missMilliseconds > 0))
+      decoded.readWork.loads != decodeLoads.size() || !(readSpread > 0) || !(ghosts.missMilliseconds > 0) ||
+      ghosts.missMilliseconds != decoded.missMilliseconds() ||
+      std::abs(ghosts.missMilliseconds - slope) > 1e-3 * slope + 1e-5)
     fail("decode steps after the shrinks counted " + std::to_string(ghosts.ghostHits - ghostsBefore.ghostHits) +
-         " ghost hits over " + std::to_string(ghosts.ghostBytes) + " bytes");
+         " ghost hits over " + std::to_string(ghosts.ghostBytes) + " bytes and " +
+         std::to_string(decoded.readWork.loads) + " of their " + std::to_string(decodeLoads.size()) +
+         " loads on the line; a miss at " + std::to_string(ghosts.missMilliseconds) + " ms (the store's " +
+         std::to_string(decoded.missMilliseconds()) + "), against their loads' line of " + std::to_string(slope) +
+         " ms a read");
   // Of their ghost hits, those on experts given up within a chunk's slots are
   // a chunk's more, and some of their hits are a chunk's less.
   const ExpertStoreStats ghostsAfter = store.stats();
