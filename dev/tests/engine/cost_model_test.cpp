@@ -133,6 +133,40 @@ void testTheSeedReproducesAnExactAffineTruth() {
           "warm-ups over no layers did not seed Units");
 }
 
+// A model whose faster path takes 512 rows or more (the Neural Engine FFN
+// split's least chunk) runs its second warm-up at those, others at
+// kSeedRows: the seed's line then runs through two sizes at the rate of the
+// units the scheduler plans and prices them, where through 256 rows the GPU
+// alone runs at twice the cost a row it puts a constant per chunk no unit has
+// and a slope below theirs.
+void testTheSeedRunsWhereTheFasterPathTakes() {
+  require(CostModel::seedRows({}) == CostModel::kSeedRows &&
+              CostModel::seedRows({.minimumUnitRows = 64}) == CostModel::kSeedRows &&
+              CostModel::seedRows({.minimumUnitRows = 512}) == 512 &&
+              CostModel::seedRows({.minimumUnitRows = kChunk}) == kChunk,
+          "the second warm-up's rows are not the model's least unit rows where they exceed kSeedRows");
+  const auto took = [](uint32_t rows) {
+    const model::CommandWork work = unit(rows, 0, 0, 0);
+    return truth(work) + (rows < 512 ? kTruth[2] * rows * kLayers : 0.0);
+  };
+  const auto error = [&](uint32_t seedRows, uint32_t rows) {
+    CostModel cost(kGap);
+    const std::array warmups{sample(unit(kChunk, 0, 0, 0), took(kChunk)),
+                             sample(unit(seedRows, 0, 0, 0), took(seedRows))};
+    cost.seed(warmups, {});
+    return relative(cost.price(unit(rows, 0, 0, 0)), took(rows));
+  };
+  const uint32_t seedRows = CostModel::seedRows({.minimumUnitRows = 512});
+  for (const uint32_t rows : {512u, 1024u}) {
+    require(error(seedRows, rows) < 0.02, "a seed through the faster path's sizes mispriced its unit of " +
+                                              std::to_string(rows) + " rows by " +
+                                              std::to_string(100 * error(seedRows, rows)) + " %");
+    require(error(CostModel::kSeedRows, rows) > 0.05,
+            "a seed through a size the faster path does not take priced its unit of " + std::to_string(rows) +
+                " rows within 5 %");
+  }
+}
+
 // (10) Both SSD terms take the load's time per byte on every target, whatever
 // the warm-ups read: their host-step time is not a price.
 void testSeedReadRatesComeFromTheLoad() {
@@ -573,6 +607,7 @@ void testDecayFitsRecordedCommands() {
 
 constexpr test::TestCase kTests[] = {
     {"testTheSeedReproducesAnExactAffineTruth", testTheSeedReproducesAnExactAffineTruth},
+    {"testTheSeedRunsWhereTheFasterPathTakes", testTheSeedRunsWhereTheFasterPathTakes},
     {"testSeedReadRatesComeFromTheLoad", testSeedReadRatesComeFromTheLoad},
     {"testPriceIsLinearInReadBytes", testPriceIsLinearInReadBytes},
     {"testRecoversTheRatesVariedUnitsShow", testRecoversTheRatesVariedUnitsShow},

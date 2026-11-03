@@ -80,10 +80,11 @@ class Sim {
 public:
   explicit Sim(const test::TimingProfile &profile, model::CommandLimits commandLimits = limits(),
                double decodeShare = 0.5, std::function<double()> residentShare = {})
-      : work(profile, std::move(residentShare)),
+      : work(profile, std::move(residentShare)), commandLimits(commandLimits),
         scheduler({.decodeShare = decodeShare, .decodeGapMilliseconds = kGap, .limits = commandLimits}, work) {}
 
   test::TimedWork work;
+  model::CommandLimits commandLimits;
   Scheduler scheduler;
   std::vector<LaneShape> shapes;
   std::vector<uint64_t> excluded;
@@ -92,10 +93,11 @@ public:
   double now = 0.0;
 
   // The startup's two prefill warm-ups (a prompt of one token, as
-  // Runtime::warmupPrefill) and a load of the weights at the profile's SSD
-  // rate.
+  // Runtime::warmupPrefill, the second of CostModel::seedRows) and a load of
+  // the weights at the profile's SSD rate.
   Sim &seed() {
-    const std::array warmups{test::sampleOf(work.warmupTimes(kChunk)), test::sampleOf(work.warmupTimes(256))};
+    const std::array warmups{test::sampleOf(work.warmupTimes(kChunk)),
+                             test::sampleOf(work.warmupTimes(CostModel::seedRows(commandLimits)))};
     const test::TimingProfile &profile = work.profile();
     const double rate =
         profile.weightBytesPerMillisecond ? profile.weightBytesPerMillisecond : profile.spilledKvBytesPerMillisecond;

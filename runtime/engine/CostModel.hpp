@@ -9,6 +9,7 @@
 
 #include "model/CommandCost.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -83,6 +84,14 @@ public:
   // streamed target it costs about one command's fixed part at startup, ~2 s
   // (accepted, DESIGN §0 O4).
   static constexpr uint32_t kSeedRows = 256;
+  // The second warm-up's rows on a model of `limits`: kSeedRows, or the
+  // fewest rows its faster path takes where they are more
+  // (model::CommandLimits::minimumUnitRows), so that the seed's line runs
+  // through two sizes at the rate of the units the scheduler plans, none
+  // fewer but a prompt's rest (Scheduler).
+  [[nodiscard]] static constexpr uint32_t seedRows(const model::CommandLimits &limits) noexcept {
+    return std::max(kSeedRows, limits.minimumUnitRows);
+  }
 
   // The decode gap G the scheduler bounds contended units by: the bound is
   // max(G, turnaround / kPassOverheadShare). `decay` is what the sums keep a

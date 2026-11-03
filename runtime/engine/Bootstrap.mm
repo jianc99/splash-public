@@ -265,7 +265,7 @@ RuntimeBootstrapReport RuntimeBootstrap::requireWarmupAndAnnounce(
     // price's seed, with the SSD reads of loading the weights (Scheduler).
     const model::WarmupStepResult shortPrefill =
         run(RuntimeBootstrapStage::MaximumPrefill, report.warmup.maximumPrefill,
-            [&] { return modelRuntime.warmupPrefill(CostModel::kSeedRows); });
+            [&] { return modelRuntime.warmupPrefill(CostModel::seedRows(modelRuntime.commandLimits())); });
     const std::array warmups{maximumPrefill.sample, shortPrefill.sample};
     nativeLoop.seedCost(warmups, modelRuntime.loadReads());
     const auto &budget = memoryPlan.breakdown();
