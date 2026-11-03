@@ -16,8 +16,9 @@ namespace splash::kv {
 // extentPages pages each, which KvPool alone allocates and releases: its
 // runway when it is built, then an extent when it needs one of its pages.
 // An extent whose pages are all free stays allocated until a reclaim pass
-// between commands releases it (Engine::reclaimMemory); the cleanup after
-// startup warmup keeps one. Inside an extent every attention layer has a
+// between commands releases it (the memory ledger taking the cache's units,
+// engine::Cache); the cleanup after startup warmup keeps one. Inside an
+// extent every attention layer has a
 // region that holds the keys of all its pages, then their key scales, values
 // and value scales (abi/KvExtent.h), in the order Layout::region gives them:
 // a window's layers after the others. With a block index, the index plane
