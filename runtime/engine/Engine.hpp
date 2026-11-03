@@ -496,6 +496,10 @@ private:
     std::vector<StateBoundary> stateBoundaries;
     size_t stateBoundaryCursor = 0;
     StateCheckpoint latestCheckpoint;
+    // Where a recovery of its lane computes its prompt again from: the
+    // boundary of the last state it published, or the state its plan began
+    // at, which it restored or resumed from (configureDraftStatePlan).
+    uint32_t recoveryTokens = 0;
     // The block of the prompt's replay boundary, where the conversation's
     // next turn resumes: its state is in use from the moment the request
     // reaches, reuses or restores it until the request ends, suspended or not.
@@ -827,19 +831,21 @@ private:
   // state ends its command at its boundary, and apply takes it from the lane
   // after the command (publishReachedStateBoundaries). Only the first state
   // the command captures follows that checkpoint (followsCheckpoint): a
-  // later one follows the state before it in the command. A checkpoint whose
+  // later one follows the state before it in the command, at `since`, the
+  // lane's recovery point before this state (stateClaim). A checkpoint whose
   // predecessor a reader pins takes only the pool or the admission too:
   // refused, its command ends at it, and apply publishes it from the lane
   // only if the pin has gone by then. Null buffers when refused.
-  [[nodiscard]] Reservation reserveCapture(Request &request, StateClass kind, uint32_t tokens,
+  [[nodiscard]] Reservation reserveCapture(Request &request, StateClass kind, uint32_t tokens, uint32_t since,
                                            bool followsCheckpoint, bool supersedes);
   // The claim of a state's buffers of class `kind` at `tokens` (amend/M.md
   // B6): the prompt's replay point, the state the request's next turn
   // resumes from, is work in service that may wait for memory on its way
   // back and reaches what is in use; a checkpoint, a junction or an
   // ordinary state is Optional, within what frees memory at once, and takes
-  // nothing that costs more than computing its rows again.
-  [[nodiscard]] ClaimSpec stateClaim(const Request &request, StateClass kind, uint32_t tokens,
+  // nothing that costs more than computing its rows again from `since`, the
+  // lane's recovery point before it.
+  [[nodiscard]] ClaimSpec stateClaim(const Request &request, StateClass kind, uint32_t tokens, uint32_t since,
                                      bool supersedes) const;
   // The victims that are the engine's decisions, in this order (amend/M.md
   // B7, B15): the model's idle state buffers, which cost nothing and are

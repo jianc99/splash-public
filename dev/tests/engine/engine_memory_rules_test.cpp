@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <functional>
 #include <limits>
+#include <map>
 #include <memory>
 #include <numeric>
 #include <optional>
@@ -157,12 +158,13 @@ void testALowerPriorityClaimTakesNothingAHigherPriorityLaneNeeds() {
   }
 }
 
-// An engine whose prompts run in passes (test::commandShape), its KV pages
-// of 16 bytes and the model's states of 64 allocated through FakeMemory
-// under a governor of `limitBytes` (GovernedHost); the prefill commands'
-// first lane and pass, in order.
+// An engine whose prompts run in passes (test::commandShape), its `pages`
+// KV pages of 16 bytes and the model's states of 64 allocated through
+// FakeMemory under a governor of `limitBytes` (GovernedHost); the prefill
+// commands' first lane and pass, in order.
 struct PassesUnderALimit {
-  explicit PassesUnderALimit(uint64_t limitBytes) : host({.limitBytes = limitBytes}) {
+  explicit PassesUnderALimit(uint64_t limitBytes, uint32_t pages = 512)
+      : host({.limitBytes = limitBytes}), storage(pages, 16, 4) {
     model.memory = &host.memory;
     model.admission = host.governor.allocationAdmission();
     model.decodeFinishes = false;
@@ -185,7 +187,7 @@ struct PassesUnderALimit {
   }
 
   test::GovernedHost host;
-  test::TestKvStorage storage{512, 16, 4};
+  test::TestKvStorage storage;
   KvPool pool{(host.through(storage), storage), 0};
   engine::Cache cache{pool, nullptr, nullptr};
   Executor model;
@@ -731,6 +733,42 @@ void testAReplayPointBesideACheckpointIsReservedInAClaim() {
               std::to_string(passes.model.heldStateBytes));
 }
 
+// A checkpoint's claim is worth the rows since the lane's recovery point
+// before it, which a recovery would compute again without it (smoke a,
+// finding 16): on 8192-row commands a 20K prompt's checkpoint at 8192 the
+// rows from 0, not from the checkpoint at 4096 its command passed; a second
+// conversation that restores the first's checkpoint at 16384 and shares no
+// junction above it, its checkpoint at 20480 the rows from 16384, not from
+// 0. So the second, 4096 rows, is worth well under the first, 8192 rows.
+void testACheckpointIsWorthTheRowsSinceTheLanesRecoveryPoint() {
+  PassesUnderALimit passes(1ULL << 30, 4096);
+  std::map<std::pair<uint64_t, uint32_t>, double> benefits;
+  passes.model.reservationObserver = [&] {
+    for (const auto &[_, state] : passes.host.governor.ledger().claims())
+      if (state.spec.requestId == passes.model.lastReservation.first && state.spec.cls == ClaimClass::Optional &&
+          std::isfinite(state.spec.benefitSeconds))
+        benefits[passes.model.lastReservation] = state.spec.benefitSeconds;
+  };
+  // Both conversations share their first 17,392 tokens, the second's
+  // junction less than a draft window past the first's checkpoint at 16384.
+  for (const auto &[id, tokens] : {std::pair<uint64_t, uint32_t>{1, 20000}, {2, 24000}}) {
+    std::vector<uint32_t> prompt(tokens, 1);
+    std::fill(prompt.begin() + 17392, prompt.end(), static_cast<uint32_t>(id) + 1);
+    EngineRequest value = request(id, std::move(prompt));
+    value.deadlineMilliseconds = 1e9;
+    passes.engine.submit(std::move(value));
+    passes.runUntil([&] { return idle(passes.engine); }, "a conversation did not end");
+  }
+  require(passes.events.starts.back() == 16384, "the second conversation did not restore the checkpoint at 16384");
+  const auto worth = [&](uint64_t id, uint32_t tokens) {
+    const auto found = benefits.find({id, tokens});
+    return found == benefits.end() ? -1.0 : found->second;
+  };
+  require(worth(1, 8192) > 0.0 && worth(2, 20480) > 0.0 && 1.5 * worth(2, 20480) < worth(1, 8192),
+          "the checkpoint at 8192 was worth " + std::to_string(worth(1, 8192)) + " s and the one at 20480 after "
+              "the restore at 16384 " + std::to_string(worth(2, 20480)) + " s");
+}
+
 // amend/M.md B8 (S-9): the ledger prices a byte the expert store misses in a
 // prefill at the scheduler's fitted rate of a byte read, not at what an
 // expected byte adds to a prefill's price, which the share of expected
@@ -1076,6 +1114,8 @@ std::span<const test::TestCase> rulesTests() {
        testALaneBelowAWaitingClaimTakesWhatItLacksBeyondTheHeldPages},
       {"testARestoredStateIsPromotedInAClaim", testARestoredStateIsPromotedInAClaim},
       {"testAReplayPointBesideACheckpointIsReservedInAClaim", testAReplayPointBesideACheckpointIsReservedInAClaim},
+      {"testACheckpointIsWorthTheRowsSinceTheLanesRecoveryPoint",
+       testACheckpointIsWorthTheRowsSinceTheLanesRecoveryPoint},
       {"testAMissedExpertByteIsPricedAtTheFittedRate", testAMissedExpertByteIsPricedAtTheFittedRate},
       {"testEnginesOnOneGovernorOfferTheCacheOnce", testEnginesOnOneGovernorOfferTheCacheOnce},
       {"testAJunctionTakesNothingWorthMoreThanItSaves", testAJunctionTakesNothingWorthMoreThanItSaves},

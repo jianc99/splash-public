@@ -1247,6 +1247,7 @@ DraftContextPlan Engine::configureDraftStatePlan(Request &active,
   if (!active.stateBoundaries.empty() || active.stateBoundaryCursor != 0) {
     throw std::logic_error("request already has a composite-state plan");
   }
+  active.recoveryTokens = stateBoundary;
 
   const uint32_t latestReplayBoundary = replayStateBoundary(active);
   // Plan draft windows before prefill; arbitrary chunk ends do not carry a
@@ -1463,7 +1464,7 @@ void Engine::publishReachedStateBoundaries(
                                   checkpoint ? StateClass::Checkpoint
                                   : replay   ? StateClass::InUse
                                              : StateClass::Ordinary,
-                                  objective.tokens, false))
+                                  objective.tokens, active.recoveryTokens, false))
                        .freed &&
                    state;
       }
@@ -1501,6 +1502,7 @@ void Engine::publishReachedStateBoundaries(
       static_cast<void>(retireCheckpoint(active));
     active.latestCheckpoint = checkpoint ? cache_.checkpointState(block)
                                          : StateCheckpoint{};
+    active.recoveryTokens = objective.tokens;
     if (!checkpoint)
       writeBehind_.published(block, objective.tokens, now);
   }

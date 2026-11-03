@@ -659,10 +659,12 @@ uint32_t Engine::reserveCaptures(Request &active, const BatchItem &item,
   };
   // Takes the buffers of the state at boundaries[index]; false when refused.
   // Only the first state the command captures follows the lane's
-  // checkpoint, and each later one the state before it.
+  // checkpoint, and its recovery point, and each later one the state before
+  // it: a checkpoint the command passes is no recovery point.
   const auto reserve = [&](size_t index) {
     const uint32_t tokens = boundaries[index].tokens;
     const StateClass kind = stateClass(index);
+    const uint32_t since = states.empty() ? active.recoveryTokens : states.back().tokens;
     if (kind == StateClass::InUse && !states.empty() && boundaries[index - 1].disposable) {
       // The prompt's replay point keeps the checkpoint the command captures
       // before it beside buffers of its own, in its claim, and takes that
@@ -675,7 +677,7 @@ uint32_t Engine::reserveCaptures(Request &active, const BatchItem &item,
             buffers = model_.reserveState(active.request.id, tokens, refusal);
             return StateBuffers{.ok = buffers != nullptr, .allocationFailure = refusal};
           },
-          stateClaim(active, kind, tokens, supersedes), false));
+          stateClaim(active, kind, tokens, since, supersedes), false));
       if (buffers) {
         states.push_back({tokens, std::move(buffers)});
         captures.push_back({tokens});
@@ -685,7 +687,7 @@ uint32_t Engine::reserveCaptures(Request &active, const BatchItem &item,
       }
       return true;
     }
-    Reservation reservation = reserveCapture(active, kind, tokens, states.empty(), supersedes);
+    Reservation reservation = reserveCapture(active, kind, tokens, since, states.empty(), supersedes);
     if (!reservation.buffers) {
       if (reservation.fromLane)
         captures.push_back({tokens, false, true});
@@ -750,7 +752,8 @@ uint32_t Engine::reserveCaptures(Request &active, const BatchItem &item,
   return end - start;
 }
 
-ClaimSpec Engine::stateClaim(const Request &active, StateClass kind, uint32_t tokens, bool supersedes) const {
+ClaimSpec Engine::stateClaim(const Request &active, StateClass kind, uint32_t tokens, uint32_t since,
+                             bool supersedes) const {
   ClaimSpec spec = claimFor(active, kind == StateClass::InUse ? ClaimClass::InService : ClaimClass::Optional);
   spec.supersedes = supersedes;
   switch (kind) {
@@ -761,15 +764,11 @@ ClaimSpec Engine::stateClaim(const Request &active, StateClass kind, uint32_t to
     break;
   case StateClass::Checkpoint:
   case StateClass::Ordinary: {
-    // A checkpoint is worth the rows since the state boundary before it,
-    // which a recovery would compute again without it; a junction or a
+    // A checkpoint is worth the rows since the lane's recovery point before
+    // it, which a recovery would compute again without it; a junction or a
     // shared prefix's state the same rows, which a later request that
     // resumes from it does not compute.
     spec.timing = NeedTiming::Immediate;
-    uint32_t since = 0;
-    for (const Request::StateBoundary &boundary : active.stateBoundaries)
-      if (boundary.tokens < tokens)
-        since = std::max(since, boundary.tokens);
     const model::PrefillLane lane{.position = since, .rows = tokens - since};
     spec.benefitSeconds = scheduler_.prefillMilliseconds(model_.prefillWork({&lane, 1}, 0, 1)) / 1000.0;
     break;
@@ -778,7 +777,7 @@ ClaimSpec Engine::stateClaim(const Request &active, StateClass kind, uint32_t to
   return spec;
 }
 
-Engine::Reservation Engine::reserveCapture(Request &active, StateClass kind, uint32_t tokens,
+Engine::Reservation Engine::reserveCapture(Request &active, StateClass kind, uint32_t tokens, uint32_t since,
                                            bool followsCheckpoint, bool supersedes) {
   const uint64_t id = active.request.id;
   // The lane's checkpoint is its recovery point until a state that retires
@@ -803,7 +802,7 @@ Engine::Reservation Engine::reserveCapture(Request &active, StateClass kind, uin
         result.buffers = model_.reserveState(id, tokens, refusal);
         return StateBuffers{.ok = result.buffers != nullptr, .allocationFailure = refusal};
       },
-      stateClaim(active, kind, tokens, supersedes), !fromLane);
+      stateClaim(active, kind, tokens, since, supersedes), !fromLane);
   result.fromLane = !result.buffers && fromLane;
   result.recycled = result.buffers && taken.freed;
   return result;
