@@ -661,9 +661,17 @@ stopped taking writes), `write_budget_bytes`, the bytes the next state's
 write not in use may take now, and `writes_deferred_ms`, how long writes held
 back for SSD reads a step waited for. Without a write budget `writes_gated` is
 never `budget` and `write_budget_bytes` is 0. It counts the KV pages copied
-ahead (`kv_copies`), and under `write_behind` the restore points waiting for
-their copies (`waiting`), copied (`durable`), gone on from first (`unneeded`)
-and not copied for want of room or a file that takes writes (`refused`).
+ahead (`kv_copies`), and under `write_behind` the restore points queued for
+their copies, the one being copied among them (`waiting`), copied
+(`durable`), gone on from first (`unneeded`) and not copied for want of room
+or a file that takes writes (`refused`). An idle engine can report points
+queued. Without the persistent cache a point is copied only while a reclaim
+has reached cached KV or a state with no copy on the SSD within the last
+minute, 10 s after its publication once its request has ended; otherwise it
+waits for memory to run short, which may never happen, and is not work the
+engine owes. With the persistent cache each point is written once it falls
+due, 10 s after its publication at the earliest, and at a clean stop (up to
+6 s), so there `waiting` is SSD work still to come and drains by itself.
 
 Restarts recompute everything unless `--persistent-cache` is on (see
 [persistent cache](#persistent-cache)); otherwise the cache keeps evicted KV
