@@ -6333,6 +6333,77 @@ void testDeviceNeedPassesOverLeavesOfFormsOutOfReach() {
   spill.cache.endRequest(3);
 }
 
+// The weight of a page need's units, by the prefill of each victim's chain:
+// the first four units the walk gives.
+std::vector<double> unitCosts(engine::Cache &cache, const VictimQuery &query) {
+  std::vector<double> costs;
+  for (std::optional<engine::Victim> victim = cache.peek(query, nullptr); victim && costs.size() < 4;
+       victim = cache.peek(query, &*victim))
+    costs.push_back(victim->cost.onceSeconds);
+  return costs;
+}
+
+// A parent becomes a leaf as recent as the child that leaves it last
+// (KvCache::inherit): a child whose demotion lands after its siblings went.
+// Of P's children, the older A needs a demotion and the newer B goes now for
+// its copy, so P goes once A's copy has landed, at A's recency: before Q,
+// newer than A, whose demotion the tier takes only once A's has landed.
+// Each unit of a page need takes one leaf, here weighed at its chain's
+// prefill: a page for P, two for Q. The walk gives P before Q, as the
+// claim's retry takes them.
+void testParentTakesTheRecencyOfTheChildThatLeavesLast() {
+  // A dense history of four pages: the chain's pages are copied and stay Full.
+  Spilling spill(CacheSpillPolicy{4, 1});
+  const std::vector<uint32_t> prompt = Spilling::prompt(1000, 2);
+  spill.start(1, prompt, 2);
+  static_cast<void>(test::spillRound(spill.cache, spill.tier));
+  const uint64_t b = spill.block(1, 1);
+  spill.cache.endRequest(1);
+  std::vector<uint32_t> sibling = prompt;
+  for (size_t row = KvCache::pageTokens; row < sibling.size(); ++row)
+    sibling[row] = 5000 + static_cast<uint32_t>(row);
+  spill.start(2, sibling, 2, KvMode::Resident);
+  const uint64_t a = spill.block(2, 1);
+  spill.cache.endRequest(2);
+  spill.start(3, Spilling::prompt(9000, 2), 2, KvMode::Resident);
+  const uint64_t q = spill.block(3, 1);
+  spill.cache.endRequest(3);
+  // A state only the disk holds on each leaf; B's lookup leaves it the newest.
+  for (const uint64_t leaf : {b, a, q}) {
+    spill.publishState(leaf);
+    require(spill.cache.reclaimOneState(StateClass::Ordinary, false) && spill.cache.pollTransfers(),
+            "a leaf's state was not written");
+  }
+  static_cast<void>(spill.cache.lookup(prompt, {}));
+  require(spill.cache.copiedBlocks(b) == 2 && spill.cache.copiedBlocks(a) == 1 && !spill.cache.copiedBlocks(q),
+          "fixture copies changed");
+  // One demotion at a time.
+  spill.tier.writeLimits[static_cast<size_t>(WriteClass::Reclaim)] = 1;
+  const MemoryRates rates{.prefillSecondsPerRow = 1.0, .reuse = 1.0};
+  const ClaimSpec claim{.cls = ClaimClass::InService};
+  const VictimQuery query{.claim = &claim, .need = {.pages = 1}, .rates = &rates};
+  const double page = KvCache::pageTokens * rates.prefillSecondsPerRow;
+  // A, B, then P.
+  const auto take = [&] {
+    const std::optional<engine::Victim> unit = spill.cache.peek(query, nullptr);
+    require(unit && spill.cache.take(query, *unit).outcome == FreeOutcome::Met, "a unit the walk weighed stayed");
+  };
+  std::vector<double> costs = unitCosts(spill.cache, query);
+  require(costs.size() >= 3 && costs[2] == page,
+          "the parent's later step came after a leaf newer than the child that leaves it last");
+  // With A's demotion in flight: B, then P.
+  take();
+  costs = unitCosts(spill.cache, query);
+  require(costs.size() >= 2 && costs[1] == page,
+          "the parent of a child whose demotion is in flight came after a leaf newer than that child");
+  take();
+  spill.tier.complete();
+  static_cast<void>(spill.cache.pollTransfers());
+  costs = unitCosts(spill.cache, query);
+  require(!costs.empty() && costs[0] == page, "the retry did not take the parent first");
+  spill.cache.checkInvariants();
+}
+
 // What a request may wait for counts only the free pages beyond those
 // waiting claims above it hold: with growth refused, a demotion in flight
 // freeing one page leaves the request short of the three pages held ones
@@ -6853,6 +6924,7 @@ int main() {
     testDeviceNeedWeighsALargeCacheAtOnce();
     testDeviceNeedKeepsKvBesideTheIndexRunway();
     testDeviceNeedPassesOverLeavesOfFormsOutOfReach();
+    testParentTakesTheRecencyOfTheChildThatLeavesLast();
     testHeldPagesAreNoRoomToWaitFor();
     testImmediateWalksOfferWhatLandsLaterInItsPlace();
     testImmediateDeviceWalkOffersWhatAWriteFreesFirst();

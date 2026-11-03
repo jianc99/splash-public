@@ -1119,6 +1119,7 @@ private:
   // The blocks.
   [[nodiscard]] uint64_t recencyOf(uint64_t block) const;
   [[nodiscard]] uint64_t erasedRecency(uint64_t block) const;
+  [[nodiscard]] uint64_t lastToLeave(uint64_t block) const;
   [[nodiscard]] bool hasResidentChild(uint64_t block) const;
   [[nodiscard]] bool needed(uint64_t block) const;
   [[nodiscard]] bool stateBelow(uint64_t block) const;
@@ -1166,11 +1167,22 @@ private:
     friend auto operator<=>(const Later &, const Later &) = default;
   };
   std::array<std::set<Later>, 2> later_;
-  // The generation the walk has reached, 0 for what goes now; the one from
-  // which each block whose page frees as a demotion lands, or that a later
-  // step took, has left RAM (one that went now left at 0).
+  // The generation the walk has reached, 0 for what goes now; and when each
+  // block whose page frees as a demotion lands, or that a later step took,
+  // leaves RAM (one that went now left at 0, before them): the generation
+  // from which it has left, at the landings of that generation or after
+  // them, as a later step, and in the order the cache does each, landing
+  // writes in the order they started (pollTierTransfers) and taking one
+  // leaf after another.
+  struct Gone final {
+    uint32_t generation = 0;
+    bool taken = false;
+    uint32_t order = 0;
+    friend auto operator<=>(const Gone &, const Gone &) = default;
+  };
   uint32_t generation_ = 0;
-  std::unordered_map<uint64_t, uint32_t> gone_;
+  std::unordered_map<uint64_t, Gone> gone_;
+  uint32_t departures_ = 0;
 
   uint32_t extentPages_;
   std::vector<KvPool::ExtentCounts> extents_;
@@ -1197,7 +1209,10 @@ private:
   std::unordered_set<uint32_t> trimmed_;
   uint32_t slimRoom_ = 0;
   std::unordered_set<uint64_t> leftRam_, demoting_, diskParents_, statesOut_, statesDropped_, copyingAhead_,
-      restoring_, heldDemotions_;
+      restoring_;
+  // The demotions in flight whose pages free once what holds them left
+  // (demotionLands), by the order they land in (Gone).
+  std::unordered_map<uint64_t, uint32_t> heldDemotions_;
   // The states dropPoisoned erases once the transfers in flight land, for a
   // walk that keeps the resume point.
   std::unordered_set<uint64_t> dropped_;
@@ -1251,16 +1266,17 @@ Cache::ReclaimPlan::ReclaimPlan(const Cache &owner, const Walk &plan, const Memo
   // of a page a demotion frees (freesOnLanding), a leaf whose copy ahead is
   // in flight, and a leaf no request holds whose restore is in flight. A
   // demotion whose page a child or a state in RAM holds frees it once they
-  // leave (demotionLands).
+  // leave (demotionLands). The writes land in the order they started.
   for (const Write &write : cache.writes_) {
     if (cache.freesOnLanding(write)) {
       demoting_.insert(write.block);
-      gone_[write.block] = 1;
+      gone_[write.block] = {.generation = 1, .order = departures_};
     } else if (write.write == WriteClass::Persist) {
       copyingAhead_.insert(write.block);
     } else if (write.write == WriteClass::Reclaim) {
-      heldDemotions_.insert(write.block);
+      heldDemotions_.emplace(write.block, departures_);
     }
+    ++departures_;
   }
   for (const auto &[block, _] : cache.restores_)
     restoring_.insert(block);
@@ -1861,7 +1877,9 @@ void Cache::ReclaimPlan::joinSelf(uint64_t block) {
 }
 
 // The parent of a block that leaves RAM, now or as its copy lands, is a
-// leaf as recent as that block once its last resident child left.
+// leaf once its last resident child left, as recent as that child
+// (KvCache::inherit): the block, or a sibling that leaves after it
+// (lastToLeave).
 void Cache::ReclaimPlan::joinParent(uint64_t block) {
   const uint64_t parent = cache.kv_.key(block).parent;
   if (!parent)
@@ -1869,7 +1887,7 @@ void Cache::ReclaimPlan::joinParent(uint64_t block) {
   const bool now = leaf(parent);
   if (!now && !leaf(parent, true))
     return;
-  recency_[parent] = std::max(recencyOf(parent), recencyOf(block));
+  recency_[parent] = std::max(recencyOf(parent), recencyOf(lastToLeave(block)));
   now ? join(parent) : joinLater(parent);
 }
 
@@ -1908,6 +1926,17 @@ uint64_t Cache::ReclaimPlan::erasedRecency(uint64_t block) const {
       passed[parent] = own;
   }
   return recency;
+}
+
+// Of a block that leaves RAM and its siblings whose pages free as their
+// demotions land or later steps take them, the one that leaves last (Gone),
+// a block that goes now before any of them.
+uint64_t Cache::ReclaimPlan::lastToLeave(uint64_t block) const {
+  uint64_t last = block;
+  for (const uint64_t sibling : cache.kv_.children(cache.kv_.key(block).parent))
+    if (demoting_.contains(sibling) && (!demoting_.contains(last) || gone_.at(last) < gone_.at(sibling)))
+      last = sibling;
+  return last;
 }
 
 // A child of the block holds a page the reclaims before left (KvCache's
@@ -1972,7 +2001,7 @@ uint32_t Cache::ReclaimPlan::leafGeneration(uint64_t block) const {
   uint32_t generation = copyingAhead_.contains(block) || restoring_.contains(block) ? 1 : 0;
   for (const uint64_t child : cache.kv_.children(block))
     if (const auto gone = gone_.find(child); gone != gone_.end())
-      generation = std::max(generation, gone->second);
+      generation = std::max(generation, gone->second.generation);
   return generation;
 }
 
@@ -2133,12 +2162,13 @@ void Cache::ReclaimPlan::stateOut(uint64_t block, bool inUse) {
 // once it has.
 void Cache::ReclaimPlan::demotionLands(uint64_t block) {
   const KvCache &kv = cache.kv_;
-  if (timing() == ReclaimTiming::Immediate || !heldDemotions_.contains(block) || ramState(block) || used(block) ||
+  const auto held = heldDemotions_.find(block);
+  if (timing() == ReclaimTiming::Immediate || held == heldDemotions_.end() || ramState(block) || used(block) ||
       hasResidentChild(block))
     return;
-  heldDemotions_.erase(block);
+  gone_[block] = {.generation = std::max(generation_, 1u), .order = held->second};
+  heldDemotions_.erase(held);
   demoting_.insert(block);
-  gone_[block] = std::max(generation_, 1u);
   ++landing_[static_cast<size_t>(cache.pool_.form(kv.page(block)))];
   joinParent(block);
 }
@@ -2227,7 +2257,7 @@ Cache::ReclaimPlan::Step Cache::ReclaimPlan::takeLeaf(uint64_t block, LeafGoes g
     const bool sure = (tierRoom_ || later) && budget && !copiesMayGo_ &&
                       budget->usedBytes() + quotaBytes_ + slot <= budget->limitBytes();
     demoting_.insert(block);
-    gone_[block] = generation_ + 1;
+    gone_[block] = {.generation = generation_ + 1, .order = departures_++};
     ++demotions_[static_cast<size_t>(form)];
     if (tierRoom_ && !later)
       --*tierRoom_;
@@ -2242,7 +2272,7 @@ Cache::ReclaimPlan::Step Cache::ReclaimPlan::takeLeaf(uint64_t block, LeafGoes g
     fixPage(page);
     ++landing[static_cast<size_t>(form)];
     demoting_.insert(block);
-    gone_[block] = generation_;
+    gone_[block] = {.generation = generation_, .taken = true, .order = departures_++};
   } else {
     freePage(page);
     leftRam_.insert(block);
