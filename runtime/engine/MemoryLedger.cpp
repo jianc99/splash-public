@@ -55,7 +55,9 @@ struct Lacking final {
   uint32_t buffers = 0;
 
   [[nodiscard]] bool none() const noexcept { return !bytes && !pages && !buffers; }
-  // The share of the need a unit meets, in the measure it meets most of.
+  // The share of the need a unit meets, in the measure it meets most of: at
+  // most all of it, so that a unit larger than the need is priced at its
+  // whole cost, not at its cost per byte (amend/M.md B2, R2).
   [[nodiscard]] double share(const Victim &victim) const noexcept {
     double share = 0.0;
     if (bytes)
@@ -64,7 +66,7 @@ struct Lacking final {
       share = std::max(share, double(victim.pages) / double(pages));
     if (buffers)
       share = std::max(share, double(victim.stateBuffers) / double(buffers));
-    return share;
+    return std::min(1.0, share);
   }
 };
 

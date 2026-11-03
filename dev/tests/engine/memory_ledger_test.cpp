@@ -829,6 +829,36 @@ void testCheapestPerByteFirstAcrossSources() {
           "free() did not take the two cheapest units per byte");
 }
 
+// A unit meets at most the whole need: one larger than the need is priced
+// at its whole cost, and the dry run takes a smaller unit that meets the
+// need for fewer seconds (amend/M.md B2, R2). On the M6's inputs
+// (earlyfix.md): a 1023 MiB store chunk at 4.07 s beside an uncopied 8K
+// chain at 3.2 s, for an extent of 108,527,616 bytes. An Optional claim
+// worth 3.5 s, as a capture's KV is, gets the chain rather than stopping
+// short at the chunk.
+void testAUnitLargerThanTheNeedCostsItsWholeCost() {
+  constexpr uint64_t extent = 108'527'616;
+  for (const ClaimClass cls : {ClaimClass::InService, ClaimClass::Optional}) {
+    MemoryLedger ledger;
+    TestSource store("store"), cache("cache");
+    store.units = {unit(1, 1023 * kMiB, 4.07)};
+    cache.units = {unit(2, extent, 3.2)};
+    ledger.addSource(store);
+    ledger.addSource(cache);
+    ClaimSpec spec = request(1, RequestPriority::Normal, cls);
+    if (cls == ClaimClass::Optional) {
+      spec.timing = NeedTiming::Immediate;
+      spec.benefitSeconds = 3.5;
+    }
+    const ClaimId claim = ledger.open(spec);
+    require(ledger.free(claim, {.bytes = extent}, 0, false, false).outcome == FreeOutcome::Met &&
+                cache.taken == std::vector<uint64_t>{2} && store.taken.empty(),
+            cls == ClaimClass::Optional
+                ? "an optional claim stopped at a unit larger than its need that costs more than one that meets it"
+                : "a unit larger than the need was priced by the bytes it frees past the need");
+  }
+}
+
 // Inside a source its own order holds: a cheaper unit behind a dearer one
 // waits for it.
 void testSourceOrderIsKeptWithinASource() {
@@ -2226,6 +2256,7 @@ std::span<const test::TestCase> ledgerTests() {
       {"testEveryHostPassGivesBackIdleBuffers", testEveryHostPassGivesBackIdleBuffers},
       {"testDeficitCountsHostRefusedClaimsNotAnIdleMargin", testDeficitCountsHostRefusedClaimsNotAnIdleMargin},
       {"testCheapestPerByteFirstAcrossSources", testCheapestPerByteFirstAcrossSources},
+      {"testAUnitLargerThanTheNeedCostsItsWholeCost", testAUnitLargerThanTheNeedCostsItsWholeCost},
       {"testSourceOrderIsKeptWithinASource", testSourceOrderIsKeptWithinASource},
       {"testUnitsKeyedByTheirPlaceAreTakenAsChosen", testUnitsKeyedByTheirPlaceAreTakenAsChosen},
       {"testATakeConvertsOnlyTheLanesItsRunChose", testATakeConvertsOnlyTheLanesItsRunChose},
