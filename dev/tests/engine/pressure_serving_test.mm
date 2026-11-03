@@ -188,11 +188,13 @@ void requireBooks(Served &served, const std::string &when) {
 // 11-03 03:55, RegrowthWatch): no unit it grew back is taken back within the
 // horizon, and it is never short of its cap for more than two settled passes
 // while its next unit would grow by the rule's terms. B4's "back at its size
-// before each episode within its normal level" is not A30's: a unit the
-// decoder's claim took stays out while that lane is in service beside the
-// fed prompts (coordinator 06:10), and after the critical level's drop the
-// take rate decays over its time constant first. Every request completes or
-// ends for capacity; Metal stays healthy.
+// before each episode within its normal level" is not A30's: the fed
+// prompts' starts wait for memory at each normal level, and a unit grown into
+// free room then would go back to the start (MemoryLedger::grow holds it while
+// a start waits); the store grows back once none waits, after the episodes. A
+// critical level's drop to the floors within the horizon of a regrowth counts
+// as a take back here too. Every request completes or ends for capacity;
+// Metal stays healthy.
 void testEpisodesKeepTheBooksAndRegrow() {
   const test::TemporaryDirectory root("splash-pressure-serving");
   auto host = std::make_shared<Host>();
