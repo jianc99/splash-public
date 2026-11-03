@@ -889,10 +889,9 @@ bool Engine::admit(Request &active, double now) {
     // Its new pages past the chain it restored come cleared: a resume's
     // replay writes them in chunks that may end inside any of them. A
     // Resident lane that resumes takes the KV target it was suspended with
-    // at once. A Spill lane, a Resident one that converts here included,
-    // takes the first work's page, as a start that waits for its restore
-    // does: its replay takes Full pages a command at a time (prepare), which
-    // spill as their copies land, as its output's did.
+    // at once. A Spill lane takes the first work's page, as a start that
+    // waits for its restore does: its replay takes Full pages a command at a
+    // time (prepare), which spill as their copies land, as its output's did.
     const auto workEnd = [&] {
       return resuming && active.kvMode == KvMode::Resident ? active.resumeKvTargetTokens
                                                            : uint64_t{resumeBoundary} + 1;
