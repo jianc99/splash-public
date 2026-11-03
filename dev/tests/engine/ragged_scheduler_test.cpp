@@ -1488,6 +1488,58 @@ void testAContendedUnitPastTheBoundKeepsItsPasses() {
   require(checked >= 6, "too few deep Spill turns were checked");
 }
 
+// A contended unit no passes bound halves its rows no lower than the fewest
+// rows of a command the model's faster path takes
+// (model::CommandLimits::minimumUnitRows: the Neural Engine FFN split's
+// least chunk, below which the GPU alone runs the FFN), nor leaves its prompt
+// fewer than those to run after it, and runs past the bound instead: on the
+// dense 27B in one pass, units of 512 rows or more, the halving counted,
+// where without the limit it halves to its bound, below 512 rows. A prompt
+// whose remaining rows are fewer than the limit runs them as they are, and
+// one of fewer than twice the limit runs whole (a cut would leave a rest the
+// faster path does not take).
+void testAContendedUnitKeepsTheModelsLeastRows() {
+  for (const uint32_t least : {1u, 512u}) {
+    model::CommandLimits split = limits();
+    split.minimumUnitRows = least;
+    Sim sim(test::kDense27B, split);
+    sim.seed();
+    sim.decoder(1);
+    sim.lane(2, 0, 20'000);
+    std::vector<uint32_t> units;
+    while (sim.scheduler.phase(2) == Phase::Prefill) {
+      const BatchPlan plan = sim.plan();
+      if (plan.kind == WorkKind::Prefill) {
+        require(plan.items.size() == 1 && plan.items[0].requestId == 2 && plan.passes == 1,
+                "a contended dense lane alone did not run in commands of its own");
+        units.push_back(plan.items[0].tokenCount);
+      }
+      sim.run(plan);
+    }
+    const uint32_t fewest = *std::ranges::min_element(units);
+    if (least == 1) {
+      require(fewest < 512, "a contended dense unit without passes did not halve below 512 rows to its bound");
+      continue;
+    }
+    require(fewest >= least, "a contended unit of a target whose faster path takes " + std::to_string(least) +
+                                 " rows or more halved to " + std::to_string(fewest) + " rows");
+    require(sim.scheduler.snapshot().boundCuts > 0, "a contended unit past its bound kept its rows");
+    for (const uint64_t id : {3u, 4u}) {
+      const uint32_t remaining = id == 3 ? 300 : 700;
+      sim.lane(id, 0, remaining);
+      BatchPlan plan = sim.plan();
+      while (plan.kind != WorkKind::Prefill) {
+        sim.run(plan);
+        plan = sim.plan();
+      }
+      require(plan.items[0].requestId == id && plan.items[0].tokenCount == remaining,
+              "a contended prompt of " + std::to_string(remaining) + " rows ran " +
+                  std::to_string(plan.items[0].tokenCount) + " of them");
+      sim.run(plan);
+    }
+  }
+}
+
 // S-P3: beside a Spill lane streaming its history, a decoder's gaps between
 // its decode commands stay within a unit's bound, max(G, u / 0.1) by the
 // price's error (p95), and one decode command, once the price has learned,
@@ -2683,6 +2735,7 @@ constexpr test::TestCase kTests[] = {
     {"testAGroupBeyondMaximumPassesHalvesOnlyWhenContended", testAGroupBeyondMaximumPassesHalvesOnlyWhenContended},
     {"testAContendedUnitKeepsRowsNoFewerBound", testAContendedUnitKeepsRowsNoFewerBound},
     {"testAContendedUnitPastTheBoundKeepsItsPasses", testAContendedUnitPastTheBoundKeepsItsPasses},
+    {"testAContendedUnitKeepsTheModelsLeastRows", testAContendedUnitKeepsTheModelsLeastRows},
     {"testDecodeGapsBesideAStreamingLaneStayWithinTheBound", testDecodeGapsBesideAStreamingLaneStayWithinTheBound},
     {"testTurnsTtftAloneTogetherAndApart", testTurnsTtftAloneTogetherAndApart},
     {"testALongLanesSparingRowsDoNotDelayAShortTurn", testALongLanesSparingRowsDoNotDelayAShortTurn},

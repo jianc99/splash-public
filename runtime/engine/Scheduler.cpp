@@ -637,11 +637,27 @@ std::optional<Scheduler::Planned> Scheduler::planPrefill(std::vector<Lane> ready
   // nothing and multiplies the commands: a 2.2 s dense chunk in four passes
   // would take 32 commands of about its time for its 2048 rows
   // (testAContendedUnitKeepsRowsNoFewerBound).
-  const model::PrefillLane fewest{leader.processed, std::min(lanes.front().rows, kMinimumPrefillRows),
-                                  leader.shape.indexPages};
-  const bool halves = !fit.within && contend && passesFor({&fewest, 1}, bounded).within;
-  while (halves && !fit.within && lanes.front().rows > kMinimumPrefillRows) {
-    lanes.front().rows = std::max(lanes.front().rows / 2, kMinimumPrefillRows);
+  // Halving stops at the fewest rows the model's faster path takes
+  // (CommandLimits::minimumUnitRows), and leaves the prompt none or at least
+  // those after the unit: fewer run at a higher cost a row, which the price,
+  // linear in rows, does not tell, so a unit there may exceed the bound. Below
+  // them the price is no guide to what a unit takes, so where they exceed the
+  // halving's own fewest it halves where they price at most half the unit:
+  // what halving takes off is its rows', not a cost per chunk
+  // (testAContendedUnitKeepsTheModelsLeastRows).
+  const uint32_t least = config_.limits.minimumUnitRows, lowest = std::max(kMinimumPrefillRows, least);
+  const model::PrefillLane fewest{leader.processed, std::min(lanes.front().rows, lowest), leader.shape.indexPages};
+  const bool halves = !fit.within && contend &&
+                      (lowest > kMinimumPrefillRows
+                           ? 2.0 * commandMilliseconds({&fewest, 1}) <= commandMilliseconds(lanes)
+                           : passesFor({&fewest, 1}, bounded).within);
+  while (halves && !fit.within && lanes.front().rows > lowest) {
+    uint32_t rows = std::max(lanes.front().rows / 2, lowest);
+    if (leader.remaining() - rows < least)
+      rows = leader.remaining() - least;
+    if (rows < lowest)
+      break;
+    lanes.front().rows = rows;
     ++result.boundCuts;
     fit = passesFor(lanes, bounded);
   }

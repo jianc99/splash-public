@@ -167,9 +167,11 @@ struct SchedulerSnapshot final {
 // group, each unit is bounded: the fewest passes whose every pass's price is
 // within max(G, turnaround / kPassOverheadShare), or failing that, of no
 // fewer passes, within twice its fixed part; a contended unit no passes
-// bound halves its rows where fewer rows can bound it. A layer's attention
-// pairs bound rows, never passes. A lane joins with the rows that spare it a
-// command of its own when
+// bound halves its rows where fewer rows can bound it, never below the
+// fewest rows the model's faster path takes
+// (model::CommandLimits::minimumUnitRows) nor leaving its prompt fewer, past
+// the bound if need be. A layer's attention pairs bound rows, never passes.
+// A lane joins with the rows that spare it a command of its own when
 // what it adds to the others is less than what it saves (summed
 // completion). The command between its
 // passes runs its later passes before any other prefill but a plan whose
