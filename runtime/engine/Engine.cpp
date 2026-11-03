@@ -331,6 +331,19 @@ bool Engine::tick(double now) {
     const std::optional<BatchPlan> plan = scheduler_.next(in);
     if (!plan)
       break;
+    // A command between its passes beside a lane of it that ended (a cancel,
+    // a deadline) gives way, whole, to any plan but its next pass, as at
+    // every point a lane yields (yieldsEndedLanes), and the tick ends there:
+    // the lane's end and its memory wait for no pass a higher priority's
+    // work may hold off.
+    if (passCommand_ && !plan->pass &&
+        std::ranges::any_of(passCommand_->items, [&](const ModelBatchItem &item) {
+          return requests_.at(item.requestId).pendingEnd.has_value();
+        })) {
+      abandonPasses();
+      sweepTerminal(now);
+      return true;
+    }
     // A command between its passes yields, whole, to a plan that supersedes
     // it (Scheduler::abandonsPasses), and its lanes that ended meanwhile
     // end. One that holds a lane of it is abandoned before it takes shape,

@@ -232,6 +232,50 @@ void testSupersedingClaimTakesThePassCommand() {
   }
 }
 
+// A lane cancelled between the passes of its command ends at once though a
+// higher priority's decode holds the command off (smoke a trace; the server
+// fails every stream 150 s after a cancel it has no answer for): while a
+// constrained Foreground lane waits for its first mask, two Background
+// prompts share a command in passes; the mask comes and the Foreground lane
+// decodes, every mask answered at once; one Background lane is cancelled
+// between the passes, and the command gives way, whole, to the decode.
+void testACancelBetweenPassesEndsBesideAHigherPrioritysDecode() {
+  PassesUnderALimit passes(uint64_t{1} << 30);
+  EngineRequest foreground = request(3, std::vector<uint32_t>(64, 3));
+  foreground.priority = RequestPriority::Foreground;
+  foreground.constraint = ConstraintMode::TokenMask;
+  foreground.maxNewTokens = 1000;
+  foreground.deadlineMilliseconds = 1e9;
+  passes.engine.submit(std::move(foreground));
+  passes.runUntil([&] { return !passes.events.maskRequests.empty(); },
+                  "the Foreground lane did not ask for its first mask");
+  passes.submit(1, 129, RequestPriority::Background);
+  passes.submit(2, 129, RequestPriority::Background);
+  passes.runUntil(
+      [&] {
+        return std::ranges::any_of(passes.prefills, [](const auto &prefill) { return prefill.first != 3; }) &&
+               !passes.engine.commandInFlight();
+      },
+      "the Background prompts did not run a pass");
+  require(passes.prefills.back().second == 0 && passes.prefills.back().first != 3,
+          "the Background prompts' command is not between its passes");
+  const std::array<uint32_t, 1> mask{1};
+  size_t answered = 0;
+  const auto answer = [&] {
+    for (; answered < passes.events.maskRequests.size(); ++answered)
+      if (passes.events.maskRequests[answered].first == 3)
+        passes.engine.provideMask(3, mask);
+  };
+  answer();
+  passes.engine.cancel(2);
+  for (uint32_t step = 0; step < 50 && !passes.events.usage.contains(2); ++step) {
+    answer();
+    static_cast<void>(passes.engine.tick(passes.now++));
+  }
+  require(passes.events.usage.contains(2) && !passes.events.usage.contains(3),
+          "the cancelled lane did not end while the Foreground lane decoded");
+}
+
 // A start the host refused beside a resident lane waits for the host's
 // passes, which free what it lacks (earlyfix.md, MemoryLedger.cpp:555 and
 // MemoryGovernor.cpp:515; amend/M.md B3): a Foreground lane waits for its
@@ -1003,6 +1047,8 @@ std::span<const test::TestCase> rulesTests() {
       {"testAHostRefusedStartWaitsOnItsClaim", testAHostRefusedStartWaitsOnItsClaim},
       {"testADecodeGapNamesItsCause", testADecodeGapNamesItsCause},
       {"testADecodeGapOnExpertReadsIsAnSsdWait", testADecodeGapOnExpertReadsIsAnSsdWait},
+      {"testACancelBetweenPassesEndsBesideAHigherPrioritysDecode",
+       testACancelBetweenPassesEndsBesideAHigherPrioritysDecode},
       {"testAHostRefusedStartIsFreedForByThePass", testAHostRefusedStartIsFreedForByThePass},
   };
   return kTests;
