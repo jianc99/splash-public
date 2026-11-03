@@ -1530,6 +1530,236 @@ void testConversionsFitTheQuotaAndTheWriteBudgetTogether() {
   }
 }
 
+// A conversion is offered only for the Index pages its copies can land into
+// whatever its claim's reclaims take, before it or after (amend/M.md A11,
+// B7; peek never overstates, L9): a device need's reclaims gather the free
+// Index pages scattered over the extents that hold pages into fewer of them
+// and release the extent that empties, and under macOS's critical pressure
+// release the runway too. A host pass that prices a lane's conversion then
+// takes what it found. Two Index extents hold half their pages each (pages
+// the test holds) beside the empty runway; a Resident lane holds 16 pages,
+// 14 past its dense history and tail window. Its conversion lands into the
+// runway alone: 4 pages, which free 360 bytes. With reads of 500 bytes, or
+// with no runway under critical pressure, it is not offered.
+void testAConversionCountsOnlyTheIndexPagesItsClaimsReclaimsLeave() {
+  struct Case final {
+    bool critical;
+    uint64_t reads;
+  };
+  std::string failures;
+  for (const Case each : {Case{false, 0}, Case{false, 500}, Case{true, 0}}) {
+    Spilling spill(Spilling::Governed{}, 1024, true, Spilling::Extent{4});
+    // Two extents' Index pages beside the runway, the first two of each
+    // then let go.
+    std::vector<uint32_t> held;
+    {
+      const test::ClaimScope start(spill.host.governor, ClaimClass::Floor);
+      const KvPageAcquisition acquired = spill.pool.acquirePages(8, kv::PageForm::Index);
+      require(acquired.granted() && static_cast<bool>(spill.pool.fillRunway(kv::PageForm::Index)),
+              "the Index pages were not allocated");
+      held = acquired.pages;
+    }
+    std::ranges::sort(held);
+    for (const uint32_t page : held)
+      if (page % 4 < 2)
+        spill.pool.releasePage(page, false);
+    require(spill.pool.freePageCount(kv::PageForm::Index) == 8, "two extents did not hold half their pages");
+    spill.tier.writableFile = false;
+    spill.engine.submit(Spilling::prompt(4, 4, 16, 10000));
+    spill.runUntil([&] { return spill.events.outputs.contains(4) && !spill.engine.commandInFlight(); },
+                   "the lane did not decode");
+    spill.tier.writableFile = true;
+    spill.model.spilledReadFloorBytes = each.reads;
+    MemoryLedger &ledger = spill.host.governor.ledger();
+    const ClaimSpec spec{.cls = ClaimClass::Host,
+                         .reach = each.critical ? ReclaimClass::InUse : ReclaimClass::Ordinary,
+                         .holdSeconds = kValueHorizonSeconds};
+    if (each.critical)
+      static_cast<void>(ledger.dropToFloors());
+    const uint64_t found = ledger.available(spec, std::numeric_limits<uint64_t>::max(), 0, each.critical, true);
+    const ClaimId claim = ledger.open(spec);
+    const FreeResult taken = ledger.free(claim, {.bytes = found}, 0, each.critical, true);
+    ledger.close(claim);
+    const std::string pass = std::string(each.critical ? "a critical" : "a deficit") + " host pass with reads of " +
+                             std::to_string(each.reads) + " bytes";
+    if (taken.nowBytes + taken.laterBytes < found)
+      failures += pass + " took " + std::to_string(taken.nowBytes + taken.laterBytes) + " of the " +
+                  std::to_string(found) + " bytes it found; ";
+    const bool converted = spill.engine.snapshot().spill.converted == 1;
+    if (converted != (!each.critical && !each.reads) || (converted && taken.laterBytes != 4 * 90))
+      failures += pass + (converted ? " converted the lane for " + std::to_string(taken.laterBytes) + " bytes"
+                                    : " left the lane Resident") +
+                  ", not what the runway lands; ";
+    spill.model.decodeFinishes = true;
+    spill.runUntilIdle();
+    require(spill.events.failedCount == 0, "a request failed");
+  }
+  require(failures.empty(), failures + "a conversion was priced on Index pages its claim's reclaims release");
+}
+
+// Nor does a conversion count the free pages of an Index extent the claim's
+// walk may empty by its evictions: the walk evicts the cache that costs less
+// than a lane's spill penalty, and releases the Index extent its evictions
+// empty beside the runway it keeps. An ended Spill request leaves the one
+// page of its chain past its dense history and before its window in an
+// Index extent whose other three pages are free, beside the empty runway; a
+// Resident lane holds 16 pages. A deficit host pass converts the lane for
+// the runway's 4 pages alone, which free 360 bytes, and takes what it found.
+void testAConversionCountsNoIndexPagesTheWalkMayEvictAndRelease() {
+  Spilling spill(Spilling::Governed{}, 1024, true, Spilling::Extent{4});
+  spill.engine.submit(Spilling::prompt(1, 1, 3, 1));
+  spill.runUntilIdle();
+  // Its states leave memory for their disk copies: the walk keeps no state
+  // of its chain as the resume point, and evicts its pages, which cost
+  // nothing while no probe has reused the cache.
+  for (uint32_t step = 0; step < 8 && spill.cache.reclaimOneState(StateClass::Ordinary, false); ++step) {
+    spill.tier.complete();
+    static_cast<void>(spill.cache.pollTransfers());
+  }
+  require(spill.pool.freePageCount(kv::PageForm::Index) == 7 && spill.cache.snapshot().stateCache.bytes == 0,
+          "the ended request did not leave its spilled page beside three free ones and the runway, its states "
+          "on disk: " +
+              std::to_string(spill.pool.freePageCount(kv::PageForm::Index)) + " free Index pages");
+  spill.tier.writableFile = false;
+  spill.engine.submit(Spilling::prompt(4, 4, 16, 10000));
+  spill.runUntil([&] { return spill.events.outputs.contains(4) && !spill.engine.commandInFlight(); },
+                 "the lane did not decode");
+  spill.tier.writableFile = true;
+  {
+    // An empty Full extent, as the pool keeps one in production: its free
+    // pages bring an extent within the walk's reach (extentWithinReach), so
+    // it evicts the ended request's pages.
+    const test::ClaimScope start(spill.host.governor, ClaimClass::Floor);
+    require(static_cast<bool>(spill.pool.fillRunway(kv::PageForm::Full)), "the Full extent was not allocated");
+  }
+  MemoryLedger &ledger = spill.host.governor.ledger();
+  std::string decisions;
+  ledger.setDecisionLog([&](std::string_view line) { decisions += std::string(line) + "\n"; });
+  const ClaimSpec spec{.cls = ClaimClass::Host, .holdSeconds = kValueHorizonSeconds};
+  const uint64_t found = ledger.available(spec, std::numeric_limits<uint64_t>::max(), 0, false, true);
+  const ClaimId claim = ledger.open(spec);
+  const FreeResult taken = ledger.free(claim, {.bytes = found}, 0, false, true);
+  ledger.close(claim);
+  require(taken.nowBytes + taken.laterBytes >= found && spill.engine.snapshot().spill.converted == 1 &&
+              taken.laterBytes == 4 * 90,
+          "a deficit host pass took " + std::to_string(taken.nowBytes) + " bytes now and " +
+              std::to_string(taken.laterBytes) + " later of the " + std::to_string(found) +
+              " it found: it priced the conversion on Index pages its evictions let it release\n" + decisions);
+  spill.model.decodeFinishes = true;
+  spill.runUntilIdle();
+  require(spill.events.failedCount == 0, "a request failed");
+}
+
+// Where no Index extent is empty, as where memory refused the runway's
+// refill (Engine::spillLanded), a conversion lands into the free Index pages
+// there are up to an extent's: the claim's walk gathers the free pages of
+// the extents that hold pages and releases each extent that empties but the
+// one it keeps. Three Index extents hold pages the test holds: three each,
+// whose free pages no compaction gathers, or one each, which the walk
+// gathers into one of them, releasing one of the two it empties. A deficit
+// host pass converts the Resident lane for those 3 pages, which free 270
+// bytes, or for the 4 of the extent the walk keeps, which free 360, and
+// takes what it found.
+void testAConversionLandsIntoTheFreeIndexPagesUpToAnExtent() {
+  struct Case final {
+    uint32_t held;
+    uint32_t landing;
+  };
+  std::string failures;
+  for (const Case each : {Case{3, 3}, Case{1, 4}}) {
+    Spilling spill(Spilling::Governed{}, 1024, true, Spilling::Extent{4});
+    spill.tier.writableFile = false;
+    spill.engine.submit(Spilling::prompt(4, 4, 16, 10000));
+    spill.runUntil([&] { return spill.events.outputs.contains(4) && !spill.engine.commandInFlight(); },
+                   "the lane did not decode");
+    spill.tier.writableFile = true;
+    // Between ticks, which refill the runway: its pages and two more
+    // extents', all but the first `held` of each then let go.
+    std::vector<uint32_t> pages;
+    {
+      const test::ClaimScope start(spill.host.governor, ClaimClass::Floor);
+      const KvPageAcquisition acquired = spill.pool.acquirePages(12, kv::PageForm::Index);
+      require(acquired.granted(), "the Index pages were not allocated");
+      pages = acquired.pages;
+    }
+    std::ranges::sort(pages);
+    for (const uint32_t page : pages)
+      if (page % 4 >= each.held)
+        spill.pool.releasePage(page, false);
+    require(spill.pool.freePageCount(kv::PageForm::Index) == 3 * (4 - each.held),
+            "three extents did not hold " + std::to_string(each.held) + " pages each");
+    MemoryLedger &ledger = spill.host.governor.ledger();
+    const ClaimSpec spec{.cls = ClaimClass::Host, .holdSeconds = kValueHorizonSeconds};
+    const uint64_t found = ledger.available(spec, std::numeric_limits<uint64_t>::max(), 0, false, true);
+    const ClaimId claim = ledger.open(spec);
+    const FreeResult taken = ledger.free(claim, {.bytes = found}, 0, false, true);
+    ledger.close(claim);
+    if (taken.nowBytes + taken.laterBytes < found || spill.engine.snapshot().spill.converted != 1 ||
+        taken.laterBytes != each.landing * 90)
+      failures += "with " + std::to_string(each.held) + " pages held in each extent a deficit host pass took " +
+                  std::to_string(taken.nowBytes) + " bytes now and " + std::to_string(taken.laterBytes) +
+                  " later of the " + std::to_string(found) + " it found; ";
+    spill.model.decodeFinishes = true;
+    spill.runUntilIdle();
+    require(spill.events.failedCount == 0, "a request failed");
+  }
+  require(failures.empty(), failures + "a conversion did not land into the free Index pages up to an extent's");
+}
+
+// A lane's growth at the engine's limit takes what covers it at its price,
+// not a conversion priced on Index pages its claim's own reclaims release
+// (amend/M.md A11, B7; L9). On a target that can spill a lane's conversion
+// is offered only for what it frees beyond the hot block cache it then reads
+// through: here, of the free Index pages of two half-held extents and the
+// runway, the claim's reclaims, which gather the pages of the first two into
+// one of them and release the other, surely leave the runway's 4 pages,
+// which free 360 bytes, less than the lane's 500 bytes of reads. A lone
+// Resident lane whose next extent the limit refuses takes the expert store's
+// unit above its floor, which the decode misses price above the conversion,
+// and decodes on.
+void testALaneGrowsOnTheStoreWhenItsConversionLandsTooLittle() {
+  Spilling spill(Spilling::Governed{}, 1024, true, Spilling::Extent{4});
+  // Decode tokens take time, which the store's unit is priced over.
+  test::seedAsStartup(spill.engine, spill.model);
+  std::vector<uint32_t> held;
+  {
+    const test::ClaimScope start(spill.host.governor, ClaimClass::Floor);
+    const KvPageAcquisition acquired = spill.pool.acquirePages(8, kv::PageForm::Index);
+    require(acquired.granted() && static_cast<bool>(spill.pool.fillRunway(kv::PageForm::Index)),
+            "the Index pages were not allocated");
+    held = acquired.pages;
+  }
+  std::ranges::sort(held);
+  for (const uint32_t page : held)
+    if (page % 4 < 2)
+      spill.pool.releasePage(page, false);
+  // The store: one unit above its floor, whose misses come often.
+  test::FakeElasticPool experts("experts", spill.host.memory, 4 * 100, 0, 1, 2, 1, 0.25, 0.0);
+  MemoryLedger &ledger = spill.host.governor.ledger();
+  static_cast<void>(ledger.addPool(experts));
+  for (double seconds = 0.5; seconds <= 10.0; seconds += 0.5) {
+    experts.served(0, 1'000'000, 0, 0);
+    ledger.observePools(seconds, true);
+  }
+  spill.tier.writableFile = false;
+  spill.engine.submit(Spilling::prompt(4, 4, 16, 10000));
+  spill.runUntil([&] { return spill.events.outputs.contains(4) && !spill.engine.commandInFlight(); },
+                 "the lane did not decode");
+  spill.tier.writableFile = true;
+  spill.model.spilledReadFloorBytes = 500;
+  spill.limit(spill.held());
+  spill.runUntil([&] { return experts.shrinks != 0 || spill.events.failedCount != 0; },
+                 "the lane's growth neither took the store's unit nor failed");
+  require(spill.events.failedCount == 0 && experts.shrinks == 1 && spill.engine.snapshot().spill.converted == 0,
+          "a lane whose growth the store's unit covered " +
+              std::string(spill.events.failedCount ? "failed: " + spill.events.failures.front()
+                                                   : "converted instead") +
+              ", its conversion priced on Index pages its claim's reclaims release");
+  spill.model.decodeFinishes = true;
+  spill.runUntilIdle();
+  require(spill.events.failedCount == 0, "a request failed");
+}
+
 // The copies a converted lane owes free its Full pages as they land, a few
 // writes at a time where an extent holds more pages than the tier writes at
 // once, as the production pool's do: while they bring an extent's pages
@@ -2453,6 +2683,13 @@ std::span<const test::TestCase> spillTests() {
        testAFloorConvertsAResidentNeighbourOrTakesTheExpertStore},
       {"testAFloorConvertsTheLargestLaneThatGivesMemoryBack", testAFloorConvertsTheLargestLaneThatGivesMemoryBack},
       {"testConversionsFitTheQuotaAndTheWriteBudgetTogether", testConversionsFitTheQuotaAndTheWriteBudgetTogether},
+      {"testAConversionCountsOnlyTheIndexPagesItsClaimsReclaimsLeave",
+       testAConversionCountsOnlyTheIndexPagesItsClaimsReclaimsLeave},
+      {"testAConversionCountsNoIndexPagesTheWalkMayEvictAndRelease",
+       testAConversionCountsNoIndexPagesTheWalkMayEvictAndRelease},
+      {"testAConversionLandsIntoTheFreeIndexPagesUpToAnExtent", testAConversionLandsIntoTheFreeIndexPagesUpToAnExtent},
+      {"testALaneGrowsOnTheStoreWhenItsConversionLandsTooLittle",
+       testALaneGrowsOnTheStoreWhenItsConversionLandsTooLittle},
       {"testOwedCopiesHoldBackTheNextConversion", testOwedCopiesHoldBackTheNextConversion},
       {"testARefusedStartTakesNothingTheLanesInServiceHold", testARefusedStartTakesNothingTheLanesInServiceHold},
       {"testALaneBeingAdmittedDoesNotConvert", testALaneBeingAdmittedDoesNotConvert},

@@ -860,12 +860,12 @@ private:
   // the claim's, on a target that can spill with the tier open, its quota
   // and its write budget holding the lane's pages beside those of the lanes
   // offered before it, and only for what its pages can land into now (the
-  // free Index pages the copies in flight and owed leave, Cache::
-  // indexLandingPages) net of the hot block cache it then reads through;
-  // with nothing left it is not offered. It frees its memory as its copies
-  // land. The command between its passes gives back the buffers of the
-  // states it would capture, which the model's pool releases at once;
-  // its lanes that ended end after the plan is made again
+  // free Index pages the claim's own reclaims and the copies in flight and
+  // owed leave, Cache::indexLandingPages) net of the hot block cache it then
+  // reads through; with nothing left it is not offered. It frees its memory
+  // as its copies land. The command between its passes gives back the
+  // buffers of the states it would capture, which the model's pool releases
+  // at once; its lanes that ended end after the plan is made again
   // (settleEndedBetweenPasses).
   class EngineVictims final : public VictimSource {
   public:

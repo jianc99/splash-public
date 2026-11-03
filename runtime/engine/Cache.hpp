@@ -531,12 +531,17 @@ public:
   [[nodiscard]] uint64_t allocatedBytes() const noexcept { return pool_.allocatedBytes(); }
   // The bytes one page of the form takes.
   [[nodiscard]] uint64_t bytesPerPage(kv::PageForm form) const noexcept { return pool_.bytesPerPage(form); }
-  // The free Index pages, the runway's among them, beyond those the copies
-  // in flight that spill as they land and the copies Spill requests owe
-  // land into and those of the empty extents past the runway, which a
-  // reclaim may release: the pages a lane's conversion to Spill can land
-  // into now.
-  [[nodiscard]] uint32_t indexLandingPages() const;
+  // The pages a lane's conversion to Spill can land into now for the
+  // query's claim: the free Index pages its reclaims surely leave, beyond
+  // those the copies in flight that spill as they land and the copies Spill
+  // requests owe land into. A reclaim may release the empty Index extents
+  // past the runway it keeps; a device need's, but for one that lacks Index
+  // pages and keeps those it takes first, also frees and gathers the pages
+  // of the others and releases each extent that empties (releaseExtent), so
+  // it surely leaves the free pages there are up to an extent's, and none is
+  // counted under macOS's critical pressure, where it may release the runway
+  // too.
+  [[nodiscard]] uint32_t indexLandingPages(const VictimQuery &query) const;
   // The pages of `chain`, the blocks a start restores, that are in memory in
   // a form its start takes in place (restoreRequest): any but the Index
   // form, which a Resident start moves to Full pages.

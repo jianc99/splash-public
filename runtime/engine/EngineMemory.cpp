@@ -942,13 +942,14 @@ std::vector<Victim> Engine::EngineVictims::conversions(const VictimQuery &query)
     return left.first != right.first ? left.first > right.first
                                      : left.second->request.id < right.second->request.id;
   });
-  // What the copies can land into now, each conversion's pages taking their
-  // share in turn: the blocks of its chain past its dense history and tail
-  // window, which spill as their copies land (Cache::convertToSpill). And
-  // what each conversion commits, which the quota of active KV and the
-  // write budget then hold no more for the lanes after it: taking one leaves
-  // the others as they were offered (VictimSource).
-  uint64_t room = engine.cache_.indexLandingPages();
+  // What the copies can land into now, whatever the claim's reclaims take
+  // (Cache::indexLandingPages), each conversion's pages taking their share
+  // in turn: the blocks of its chain past its dense history and tail window,
+  // which spill as their copies land (Cache::convertToSpill). And what each
+  // conversion commits, which the quota of active KV and the write budget
+  // then hold no more for the lanes after it: taking one leaves the others
+  // as they were offered (VictimSource).
+  uint64_t room = engine.cache_.indexLandingPages(query);
   const uint64_t full = uint64_t{geometry.densePages} + geometry.windowPages;
   const uint64_t quota = geometry.slotBytes ? engine.cache_.spillRoom() / geometry.slotBytes : 0;
   uint64_t committed = 0;

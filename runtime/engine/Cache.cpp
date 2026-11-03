@@ -618,7 +618,7 @@ Returning Cache::returningOf(std::optional<std::span<const uint64_t>> requestIds
   return result;
 }
 
-uint32_t Cache::indexLandingPages() const {
+uint32_t Cache::indexLandingPages(const VictimQuery &query) const {
   if (!spill_)
     return 0;
   uint32_t landing = 0;
@@ -631,13 +631,24 @@ uint32_t Cache::indexLandingPages() const {
       for (const uint64_t block : holder.owedCopies)
         if (spillEligibility(block) == Eligibility::Eligible)
           owed.insert(block);
-  // The empty Index extents beyond the runway a reclaim may release.
+  // The free Index pages, the runway's among them, that the claim's reclaims
+  // surely leave, before or after its conversions: a reclaim may release the
+  // empty Index extents beyond the runway it keeps. A device need's walk,
+  // unless it lacks Index pages and so keeps the free ones (keptPages), also
+  // frees pages by its evictions and gathers them into extents it releases
+  // (releaseExtent). Only a release takes free pages, and none the empty
+  // extent the walk keeps, so it surely leaves the free pages there are up
+  // to an extent's; under macOS's critical pressure, where it keeps no
+  // runway and may release each extent it empties, none is counted.
+  constexpr kv::PageForm index = kv::PageForm::Index;
   uint32_t empty = 0;
   for (const KvPool::ExtentCounts &extent : pool_.extentCounts({}))
-    empty += extent.allocated && !extent.usedPages && extent.form == kv::PageForm::Index;
-  const uint64_t needed =
-      uint64_t{landing} + owed.size() + (empty > 1 ? uint64_t{empty - 1} * pool_.extentPages() : 0);
-  const uint32_t free = pool_.freePageCount(kv::PageForm::Index);
+    empty += extent.allocated && !extent.usedPages && extent.form == index;
+  uint32_t free = pool_.freePageCount(index) - (empty > 1 ? (empty - 1) * pool_.extentPages() : 0);
+  const Walk walk = walkFor(query);
+  if (walk.device && walk.releases(index, pool_.freePageCount(index), pool_.extentPages()))
+    free = walk.keeps(index) ? std::min(free, pool_.extentPages()) : 0;
+  const uint64_t needed = uint64_t{landing} + owed.size();
   return free > needed ? static_cast<uint32_t>(free - needed) : 0;
 }
 
