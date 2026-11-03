@@ -56,6 +56,14 @@ struct AllocationResult final {
 using AllocationAdmission =
     std::function<AllocationResult(uint64_t, const std::function<void()> &)>;
 
+// The admission of one of several allocations an admission granted at once,
+// whose reservation holds their bytes: the operation runs as it is, and a
+// driver's refusal throws for that admission to report.
+inline AllocationResult admittedWithin(uint64_t, const std::function<void()> &allocate) {
+  allocate();
+  return {};
+}
+
 enum class BufferStorage {
   Shared,
   Private,

@@ -344,18 +344,30 @@ void growsAndReleases(MetalBackend &backend) {
           "an idle reclaim kept a cache no lane needs");
   rejects([&] { static_cast<void>(cache.reserveLane(model::ExecutionLimits::maximumBatchWidth)); }, "no such lane",
           "a floor past the lanes was reserved");
-  // A floor of two extents, the second refused, leaves neither.
-  uint32_t grants = 1;
+  // A floor of two extents asks one admission for both, with room for one
+  // and a half: refused, it asked for the two it lacks, which is what the
+  // ledger frees for, and keeps neither; with room for two it takes both.
+  uint64_t room = extent + extent / 2;
+  std::vector<uint64_t> asked;
   KvBlockCache wide = makeCache(
       backend, layout, 2,
       [&](uint64_t bytes, const std::function<void()> &allocate) {
-        if (!grants) return metal::AllocationResult(metal::AllocationFailure::HostPressure);
-        --grants;
+        asked.push_back(bytes);
+        if (bytes > room) return metal::AllocationResult(metal::AllocationFailure::EngineBudget);
+        room -= bytes;
         return test::admitAll(bytes, allocate);
       },
       2 * kLaneSlots);
   require(!wide.reserveLane(0).granted() && wide.stats().bytes == 0 && wide.stats().lanes == 0,
-          "a floor refused its second extent kept its first");
+          "a refused floor of two extents kept one");
+  require(!asked.empty() && asked.back() == 2 * extent,
+          "a refused floor of two extents asked its admission for " +
+              std::to_string(asked.empty() ? 0 : asked.back() / extent) + " extent(s) at once, not the 2 it lacks");
+  room = 2 * extent;
+  asked.clear();
+  require(wide.reserveLane(0).granted() && asked.size() == 1 && asked.front() == 2 * extent &&
+              wide.stats().bytes == 2 * extent && wide.stats().floorBytes == 2 * extent,
+          "a floor of two extents was not one admission of both");
   std::cout << "kv_block_cache_test: growth and release PASS\n";
 }
 

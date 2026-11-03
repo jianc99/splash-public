@@ -95,7 +95,8 @@ struct KvBlockCache::Impl {
   [[nodiscard]] uint32_t floorExtents(uint32_t lanes) const noexcept {
     return lanes ? extentsFor(uint64_t{lanes + 1} * laneSlots, extentSlots) : 0;
   }
-  // Allocates extents up to `held` extents under `admit`, or none of them.
+  // Allocates extents up to `held` extents under one admission of `admit`,
+  // or none of them.
   [[nodiscard]] metal::AllocationResult grow(uint32_t held, const metal::AllocationAdmission &admit);
   // The keys every layer gave up lately (SlotRecycler::ghosts), under the
   // lock.
@@ -171,11 +172,19 @@ KvBlockCache::Impl::Impl(metal::MetalBackend &backend, metal::AllocationAdmissio
 
 metal::AllocationResult KvBlockCache::Impl::grow(uint32_t held, const metal::AllocationAdmission &admit) {
   requireNoCommand();
-  for (uint32_t extent = extents; extent < held; ++extent)
-    if (const metal::AllocationResult result = pages.allocateExtent(extent, kv::PageForm::Full, admit); !result) {
-      for (uint32_t allocated = extents; allocated < extent; ++allocated) pages.releaseExtent(allocated);
-      return result;
+  // One admission of every extent it lacks, so that a refusal asks for all
+  // of them; a driver's refusal of one gives back those allocated before.
+  uint32_t allocated = extents;
+  const metal::AllocationResult result = admit(uint64_t{held - extents} * pages.extentBytes(), [&] {
+    try {
+      for (; allocated < held; ++allocated)
+        static_cast<void>(pages.allocateExtent(allocated, kv::PageForm::Full, metal::admittedWithin));
+    } catch (const metal::MetalAllocationError &) {
+      while (allocated > extents) pages.releaseExtent(--allocated);
+      throw;
     }
+  });
+  if (!result) return result;
   place(held);
   return {};
 }

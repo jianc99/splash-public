@@ -347,21 +347,26 @@ void passesStageWhatOneCommandStages(MetalBackend &backend, uint32_t buffers) {
 }
 
 // reserve() allocates in each buffer the extents shortfallBytes() says it
-// lacks, and then lacks none.
+// lacks, under one admission of them all, and then lacks none.
 void reservesItsShortfall(MetalBackend &backend) {
   const kv::Layout layout = layoutOf(kv::Format::Int8);
   uint64_t allocated = 0;
+  uint32_t admissions = 0;
   const metal::AllocationAdmission counting = [&](uint64_t bytes, const std::function<void()> &allocate) {
     allocated += bytes;
+    ++admissions;
     return test::admitAll(bytes, allocate);
   };
   KvHistoryStream stream = makeStream(backend, layout, 2, counting);
   for (const uint32_t pages : {1u, kExtentPages, kExtentPages + 1, 3 * kExtentPages}) {
     const uint64_t shortfall = stream.shortfallBytes(pages);
     allocated = 0;
+    admissions = 0;
     require((shortfall == 0) == stream.holds(pages) && stream.reserve(pages).granted() && allocated == shortfall &&
                 !stream.shortfallBytes(pages) && stream.holds(pages),
             "staging for " + std::to_string(pages) + " pages did not allocate its shortfall");
+    require(admissions == (shortfall ? 1u : 0u), "staging for " + std::to_string(pages) + " pages took " +
+                                                     std::to_string(admissions) + " admissions, not one of its shortfall");
   }
   require(stream.shortfallBytes(1) == 0 && stream.releaseIdle() &&
               stream.shortfallBytes(1) == 2 * kExtentPages * layout.bytesPerLayerPage(),
@@ -372,18 +377,25 @@ void reservesItsShortfall(MetalBackend &backend) {
 void lifecycle(MetalBackend &backend) {
   const kv::Layout layout = layoutOf(kv::Format::Int8);
   Sequence sequence(backend, layout);
-  // Staging the budget refuses changes nothing, the second buffer's extent
-  // refused too.
-  uint32_t grants = 1;
+  // Staging the budget refuses changes nothing, with room for one buffer's
+  // extent of two: refused, it asked for both, which is what the ledger
+  // frees for.
+  uint64_t room = kExtentPages * layout.bytesPerLayerPage();
+  std::vector<uint64_t> asked;
   KvHistoryStream refused = makeStream(backend, layout, 2, [&](uint64_t bytes, const std::function<void()> &allocate) {
-    if (!grants) return metal::AllocationResult(metal::AllocationFailure::EngineBudget);
-    --grants;
+    asked.push_back(bytes);
+    if (bytes > room) return metal::AllocationResult(metal::AllocationFailure::EngineBudget);
+    room -= bytes;
     return test::admitAll(bytes, allocate);
   });
+  const uint64_t shortfall = refused.shortfallBytes(kPages);
   const model::ModelMemoryAdmission admission = refused.reserve(kPages);
   require(!admission.granted() && admission.allocationFailure == metal::AllocationFailure::EngineBudget &&
               refused.stats().stagingBytes == 0,
           "refused staging kept an extent");
+  require(!asked.empty() && asked.back() == shortfall,
+          "refused staging asked its admission for " + std::to_string(asked.empty() ? 0 : asked.back()) +
+              " bytes at once, not the " + std::to_string(shortfall) + " it lacks");
   rejects([&] { refused.begin(*sequence.sources, kPages, sequence.table, sequence.pool.layers(), {0, kLayers}); },
           "staging do not hold", "a stream began without staging for its pages");
   KvHistoryStream stream = makeStream(backend, layout, 1);

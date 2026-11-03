@@ -102,6 +102,8 @@ struct KvHistoryStream::Impl {
   const kv::SlotFormat format;
   const std::shared_ptr<SsdReaders> readers;
   const uint32_t buffers;
+  // The staging's admission, which reserve() asks once for every extent.
+  const metal::AllocationAdmission admission;
   // The bytes of a page's records of one layer (kv::SlotFormat::layerRange).
   const uint64_t layerBytes;
   std::vector<std::unique_ptr<kv::PageStorage>> staging;
@@ -123,7 +125,7 @@ KvHistoryStream::Impl::Impl(metal::MetalBackend &backend, metal::AllocationAdmis
                             const kv::Layout &layout, uint32_t extentPages, std::shared_ptr<SsdReaders> readers,
                             kv::SlotFormat format, uint32_t buffers)
     : format(checked(layout, format, readers.get(), buffers)), readers(std::move(readers)), buffers(buffers),
-      layerBytes(this->format.layerRange(0).bytes) {
+      admission(admission), layerBytes(this->format.layerRange(0).bytes) {
   const uint64_t pages = (kMostPages + extentPages - 1) / extentPages * extentPages;
   for (uint32_t buffer = 0; buffer < buffers; ++buffer) {
     staging.push_back(std::make_unique<kv::PageStorage>(backend, admission, oneLayer(layout),
@@ -226,20 +228,28 @@ ModelMemoryAdmission KvHistoryStream::reserve(uint32_t pages) {
   if (uint64_t{wanted} * extentPages > impl.staging.front()->pageCount())
     throw std::invalid_argument("history staging past the longest sequence");
   if (impl.run.active) throw std::logic_error("history staging grows while a command streams");
-  for (uint32_t buffer = 0; buffer < impl.buffers; ++buffer)
-    for (uint32_t extent = impl.extents; extent < wanted; ++extent)
-      if (const metal::AllocationResult result = impl.staging[buffer]->allocateExtent(extent); !result) {
-        // Nothing changes: what this call allocated goes back.
-        for (uint32_t back = 0; back <= buffer; ++back)
-          for (uint32_t allocated = impl.extents; allocated < (back == buffer ? extent : wanted); ++allocated)
-            impl.staging[back]->releaseExtent(allocated);
-        return {.ok = false, .allocationFailure = result.failure};
-      }
+  // One admission of every buffer's extents, so that a refusal asks for all
+  // of them; a driver's refusal of one changes nothing: what this call
+  // allocated goes back.
+  uint32_t buffer = 0, extent = impl.extents;
+  const metal::AllocationResult result = impl.admission(shortfallBytes(pages), [&] {
+    try {
+      for (buffer = 0; buffer < impl.buffers; ++buffer)
+        for (extent = impl.extents; extent < wanted; ++extent)
+          static_cast<void>(impl.staging[buffer]->allocateExtent(extent, kv::PageForm::Full, metal::admittedWithin));
+    } catch (const metal::MetalAllocationError &) {
+      for (uint32_t back = 0; back <= buffer; ++back)
+        for (uint32_t allocated = impl.extents; allocated < (back == buffer ? extent : wanted); ++allocated)
+          impl.staging[back]->releaseExtent(allocated);
+      throw;
+    }
+  });
+  if (!result) return {.ok = false, .allocationFailure = result.failure};
   impl.extents = wanted;
   std::vector<uint32_t> staged(impl.stagingPages());
   std::iota(staged.begin(), staged.end(), 0u);
-  for (uint32_t buffer = 0; buffer < impl.buffers; ++buffer)
-    impl.staging[buffer]->writeEntries(staged, 0, impl.tables[buffer]);
+  for (uint32_t each = 0; each < impl.buffers; ++each)
+    impl.staging[each]->writeEntries(staged, 0, impl.tables[each]);
   return {.ok = true};
 }
 
