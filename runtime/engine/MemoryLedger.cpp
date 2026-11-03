@@ -773,13 +773,14 @@ uint64_t MemoryLedger::available(const ClaimSpec &spec, uint64_t enough, uint64_
 // bytes are free for it, taking what its victims left once they landed as a
 // claim's retry takes it, without the host's consent on the host's credit
 // of what that take releases (the host's footprint is then where it was),
-// and is cancelled once that take finds it short. Free room beyond what the
-// waiting claims, the lanes' projected growth and every pending growth hold
-// goes to the pools, the one whose next unit is worth most first, while the
-// host admits each unit and, once claims take a pool's units, while its
-// regrowth gains: what it saves over the horizon if no claim takes it back
-// within it, at the rate claims take the pool's units (takesPerSecond),
-// beyond its cycle. At most one unit per pass then displaces other memory,
+// and is cancelled once that take finds it short or its regrowth no longer
+// gains. Free room beyond what the waiting claims, the lanes' projected
+// growth and every pending growth hold goes to the pools, the one whose next
+// unit is worth most first, while the host admits each unit and, once
+// claims take a pool's units, while its regrowth gains: what it saves over
+// the horizon if no claim takes it back within it, at the rate claims take
+// the pool's units (takesPerSecond), beyond its cycle. At most one unit per
+// pass then displaces other memory,
 // outside critical pressure, when the victims cost less than its regrowth
 // gains: with the host's consent the victims need only meet what the room
 // lacks; without it they free a whole unit, which the growth then takes
@@ -833,6 +834,14 @@ bool MemoryLedger::grow(uint64_t freeBytes, const GrowthHost &host) {
     if (!account.pool)
       continue;
     if (account.pendingGrowth) {
+      // A unit whose regrowth no longer gains holds nothing, as one its take
+      // finds short does: what its victims freed is the room's.
+      const Candidate next = candidate(index);
+      const double takes = takesPerSecond(index);
+      if (!value::growsIntoFreeRoom(takes, next.benefit, next.cycle)) {
+        account.pendingGrowth = account.pendingLaterBytes = 0;
+        continue;
+      }
       const uint64_t others = less(pendingGrowthBytes(), account.pendingGrowth);
       // Of its victims' bytes at most what is in flight now has not landed.
       const uint64_t landed = less(account.pendingLaterBytes, returning().landingBytes);
@@ -843,19 +852,18 @@ bool MemoryLedger::grow(uint64_t freeBytes, const GrowthHost &host) {
       // Once they have landed, it takes what they left, as a claim's retry
       // does: the extents a demotion's landing empties, which only a take
       // releases, and the steps of its units still to go, within what its
-      // regrowth gains; what that starts lands for a later pass. Without the host's consent it frees the whole unit now, its
-      // credit, as a displacement does: a landing frees its page into a
-      // kept extent, which leaves the host's footprint only as a take
-      // releases it, and the host's pass or a claim may have taken it for
-      // itself since. Short, the growth is no longer worth what it takes,
-      // and holds nothing.
+      // regrowth gains; what that starts lands for a later pass. Without the
+      // host's consent it frees the whole unit now, its credit, as a
+      // displacement does: a landing frees its page into a kept extent, which
+      // leaves the host's footprint only as a take releases it, and the
+      // host's pass or a claim may have taken it for itself since. Short, the
+      // growth is no longer worth what it takes, and holds nothing.
       if (!met && landed >= account.pendingLaterBytes) {
-        const Candidate next = candidate(index);
         const ClaimId claim = open({.cls = ClaimClass::Growth,
                                     .timing = consents ? NeedTiming::CanWait : NeedTiming::Immediate,
                                     .holdSeconds = kValueHorizonSeconds,
-                                    .benefitSeconds = std::max(
-                                        0.0, value::regrowthSeconds(next.benefit, next.cycle, takesPerSecond(index)))});
+                                    .benefitSeconds =
+                                        std::max(0.0, value::regrowthSeconds(next.benefit, next.cycle, takes))});
         const FreeResult freed = freeFor(claim.value, {.bytes = account.pendingGrowth}, less(freeBytes, grownBytes),
                                          false, false, AccountId{static_cast<uint8_t>(index)}, !consents);
         close(claim);

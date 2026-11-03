@@ -785,6 +785,51 @@ void testDisplacementWithoutTheHostsConsentPendsOnUncopiedCache() {
           "the store did not regrow in the band on the extent its landed victim emptied");
 }
 
+// A pending growth holds to A30's rule until it grows (amend/V.md A30, owner
+// 11-03 03:55): a unit whose regrowth gained when its displacement started,
+// but no longer once a lane that took the pool's units is in demand again
+// before its victims land, holds nothing, and takes neither the room nor
+// what the landing left. The store's 1 GiB unit is worth 3 s over the
+// horizon against a cycle of 0.19 s (777 keys at 0.25 ms); a prompt takes
+// one at 10 s and decodes alone, so at 10.5 s the unit, at the store's own
+// rate after the take, keeps 0.37 of what it saves and displaces uncopied
+// cache, pending on its demotion; at 11 s another lane starts beside the
+// prompt, whose claim, one unit in a second, is in demand again: the unit
+// would keep e^-60 of it.
+void testAPendingGrowthWhoseRegrowthNoLongerGainsHoldsNothing() {
+  Fixture fixture(host(32 * kGiB), 8 * kGiB);
+  FakeElasticPool experts("experts", fixture.memory, kGiB, 2, 4, 5, 4, 0.25, 60.0);
+  experts.keyBytes = 1382000;
+  TestSource cache("cache", &fixture.memory);
+  cache.landsIntoExtents = true;
+  fixture.memory.hold("cache", kGiB);
+  fixture.memory.hold("weights", 3 * kGiB);
+  cache.units = {unit(1, kGiB, 9.0, true)};
+  MemoryLedger &ledger = fixture.ledger();
+  ledger.addSource(cache);
+  ledger.addPool(experts);
+  serve(ledger, experts, 400.0, 0.0, 10.0);
+  const ClaimId prompt = ledger.open(request(1, RequestPriority::Normal, ClaimClass::InService, 60.0));
+  ledger.setInDemand(prompt, true);
+  require(fixture.allocateFreeing(prompt, kGiB) && experts.units() == 3 && cache.taken.empty(),
+          "the prompt did not take a store unit");
+  ledger.setInDemand(prompt, false);
+  cache.units = {unit(2, kGiB, 0.5, true)};
+  static_cast<void>(fixture.pass(10.5));
+  require(cache.taken == std::vector<uint64_t>{2} && fixture.governor->snapshot().reservedBytes == kGiB,
+          "the displacement did not pend on its demotion");
+  ledger.setInDemand(prompt, true);
+  cache.land();
+  for (double seconds = 11.0; seconds <= 13.0; seconds += 0.5)
+    static_cast<void>(fixture.pass(seconds));
+  require(experts.units() == 3 && fixture.governor->snapshot().reservedBytes == 0 &&
+              cache.taken == std::vector<uint64_t>{2},
+          "a pending growth whose regrowth no longer gained grew or held its bytes: " +
+              std::to_string(experts.units()) + " units, " +
+              std::to_string(fixture.governor->snapshot().reservedBytes / kMiB) + " MiB reserved, " +
+              std::to_string(cache.taken.size()) + " units taken");
+}
+
 // A claim that takes a pool's pending growth cancels it: the pool keeps its
 // units and the room is the claim's.
 void testTakenPendingGrowthIsCancelled() {
@@ -3092,6 +3137,8 @@ std::span<const test::TestCase> ledgerTests() {
       {"testAShortPendingGrowthHoldsNothing", testAShortPendingGrowthHoldsNothing},
       {"testDisplacementWithoutTheHostsConsentPendsOnUncopiedCache",
        testDisplacementWithoutTheHostsConsentPendsOnUncopiedCache},
+      {"testAPendingGrowthWhoseRegrowthNoLongerGainsHoldsNothing",
+       testAPendingGrowthWhoseRegrowthNoLongerGainsHoldsNothing},
       {"testTakenPendingGrowthIsCancelled", testTakenPendingGrowthIsCancelled},
       {"testOneHostRule", testOneHostRule},
       {"testBandWaivedWhenTheHostClaimFindsNothing", testBandWaivedWhenTheHostClaimFindsNothing},
