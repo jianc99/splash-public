@@ -875,7 +875,14 @@ $(SANITIZER_CONFIG_TARGETS): | $(ENGINE_SANITIZER_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_SANITIZER_CXXFLAGS) -fsanitize=$(SANITIZERS) \
 		$(TEST_INPUTS) -o $@
 
-.PHONY: test-sanitizers
+.PHONY: test-sanitizers test-sanitizers-sim
+# engine-sim's scenarios under the sanitizers in PR CI. On the mini-M4 at
+# 410bb55d every scenario takes 47 s plain (test-engine-cpu runs them all),
+# 203 s under ASan and 1111 s under TSan, of which SIM-churn-order, SIM-value
+# and SIM-35b-churn take 188 and 1013 s, two thirds of the CI job's 30
+# minutes (ci.yml) by themselves: test-sanitizers runs the others (15 and
+# 98 s), and test-sanitizers-sim, which stage 1 runs, all of them.
+ENGINE_SIM_PR_SCENARIOS := Turns,LongPrompt,ChurnRegrows,PersistentWarning,ShortStart,Placement
 ASAN_TEST_ENV := ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 \
 	UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1
 TSAN_TEST_ENV := TSAN_OPTIONS=halt_on_error=1
@@ -913,8 +920,8 @@ test-sanitizers: $(SANITIZER_CONFIG_TARGETS)
 	$(TSAN_TEST_ENV) $(TEST_FD_TRANSPORT_TSAN)
 	$(ASAN_TEST_ENV) $(TEST_NATIVE_LOOP_ASAN)
 	$(TSAN_TEST_ENV) $(TEST_NATIVE_LOOP_TSAN)
-	$(ASAN_TEST_ENV) $(TEST_ENGINE_SIM_ASAN)
-	$(TSAN_TEST_ENV) $(TEST_ENGINE_SIM_TSAN)
+	$(ASAN_TEST_ENV) $(TEST_ENGINE_SIM_ASAN) --filter $(ENGINE_SIM_PR_SCENARIOS)
+	$(TSAN_TEST_ENV) $(TEST_ENGINE_SIM_TSAN) --filter $(ENGINE_SIM_PR_SCENARIOS)
 	$(ASAN_TEST_ENV) $(TEST_ANE_FFN_CALIBRATION_ASAN)
 	$(TSAN_TEST_ENV) $(TEST_ANE_FFN_CALIBRATION_TSAN)
 	$(ASAN_TEST_ENV) $(TEST_SPARSE_ROW_STORE_ASAN)
@@ -929,6 +936,9 @@ test-sanitizers: $(SANITIZER_CONFIG_TARGETS)
 	$(ASAN_TEST_ENV) $(TEST_MEMORY_AUDIT_ASAN)
 	$(ASAN_TEST_ENV) $(TEST_STATUS_ASAN) dev/tests/engine/status_golden.json
 	$(ASAN_TEST_ENV) $(TEST_MEMORY_LEDGER_ASAN) $(RECORDED_LOADS)
+test-sanitizers-sim: $(TEST_ENGINE_SIM_ASAN) $(TEST_ENGINE_SIM_TSAN)
+	$(ASAN_TEST_ENV) $(TEST_ENGINE_SIM_ASAN)
+	$(TSAN_TEST_ENV) $(TEST_ENGINE_SIM_TSAN)
 
 # The Metal tests of the components whose host steps share their state with
 # the engine thread and the SSD readers, the hot block cache, the history
