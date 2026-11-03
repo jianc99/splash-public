@@ -513,7 +513,14 @@ void testRandomRuns(uint32_t plainSeeds, uint32_t windowedSeeds) {
 // 105144, 386046, 470525, 482345, 247559 and 364835: in them the resume
 // point lies below a poisoned block whose subtree goes as the first
 // transfers land, and the retries keep the newest state left, most often
-// one the walk left waiting for the write slot.
+// one the walk left waiting for the write slot. Windowed seeds 55544, 63544,
+// 546782, 1061965, 1748006 and 2429048, and plain seeds 415497, 478646 and
+// 483524: in them a retry first releases a Full extent the plan placed
+// elsewhere, as a leaf goes once the state write that kept it lands, a
+// write the quota refuses drops its state, a demotion counted unsure
+// starts, landings complete an extent with the free pages a unit leaves, or
+// Spill writes land copies through which blocks no request holds go; the
+// Slim and Index units after it reach as far as their own form's pages.
 void testPeekNeverOverstates(uint32_t plainSeeds, uint32_t windowedSeeds) {
   uint64_t exact = 0, unsure = 0, landing = 0;
   const auto check = [&](uint32_t seed, bool windowed) {
@@ -543,6 +550,10 @@ void testPeekNeverOverstates(uint32_t plainSeeds, uint32_t windowedSeeds) {
   check(1836083, true);
   check(396221, false);
   for (const uint32_t seed : {10248u, 15837u, 24025u, 105144u, 386046u, 470525u, 482345u, 247559u, 364835u})
+    check(seed, false);
+  for (const uint32_t seed : {55544u, 63544u, 546782u, 1061965u, 1748006u, 2429048u})
+    check(seed, true);
+  for (const uint32_t seed : {415497u, 478646u, 483524u})
     check(seed, false);
   std::cout << "cache peek runs ok: " << plainSeeds << " plain seeds, " << windowedSeeds
             << " windowed and the fixed seeds; " << exact

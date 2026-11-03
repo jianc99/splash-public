@@ -1183,12 +1183,13 @@ private:
   // next.
   [[nodiscard]] CacheReclaimResult recycleState(const Walk &walk);
   // One memory reclaim of a unit of the walk, which began with `demotions`
-  // in flight and `unit` pages landing by form (demotedPages): free pages
-  // first, as the extent they fill; then the walk's victims while their KV,
-  // with the pages the unit's demotions free as they land, can empty an
-  // extent, until one is released, those pages complete one or a state
-  // goes; otherwise a state (recycleState).
-  [[nodiscard]] CacheReclaimResult takeReclaim(const Walk &walk, uint32_t demotions,
+  // pages held by the demotions in flight (demotionPages) and `unit` pages
+  // landing (demotedPages), by form: free pages first, as the extent they
+  // fill; then the walk's victims while their KV, with the pages the unit's
+  // demotions free as they land, can empty an extent of some form, until
+  // one is released, those pages complete one or a state goes; otherwise a
+  // state (recycleState).
+  [[nodiscard]] CacheReclaimResult takeReclaim(const Walk &walk, const std::array<uint32_t, 3> &demotions,
                                                const std::array<uint32_t, 3> &unit);
   // Oldest resident KV leaf after `after` no state restores through: nothing
   // sits on it or below it, so it saves no prefill, and it frees its page
@@ -1279,15 +1280,15 @@ private:
   // An ordinary state at the block or anywhere below it.
   [[nodiscard]] bool holdsOrdinaryState(uint64_t block) const;
   void startRestore(uint64_t block);
-  // Evicting KV of the class may empty an extent: the pages upTo may reuse
-  // (reusablePages), less those whose demotion is in flight, or the
-  // `demoting` of them a unit found in flight, cover one. That counts the
-  // leaves that need a demotion too, which an Immediate step passes over
-  // while the tier takes writes. A page written through is none of them:
-  // its Spill request holds it, though it frees once its copy lands
+  // Evicting KV of the class may empty an extent: of some form, the pages
+  // upTo may reuse (reusablePages), less those whose demotion is in flight,
+  // or the `demoting` of them a unit found in flight, by form, cover one.
+  // That counts the leaves that need a demotion too, which an Immediate step
+  // passes over while the tier takes writes. A page written through is none
+  // of them: its Spill request holds it, though it frees once its copy lands
   // (pendingPages).
   [[nodiscard]] bool extentWithinReach(ReclaimClass upTo = ReclaimClass::Ordinary,
-                                       std::optional<uint32_t> demoting = std::nullopt) const;
+                                       std::optional<std::array<uint32_t, 3>> demoting = std::nullopt) const;
   // The bytes of the extents the pages of the demotions started since
   // `before` pages were landing, by form, complete as they land, past the
   // runway the walk keeps; none for a walk that cannot wait.
@@ -1366,6 +1367,8 @@ private:
   // A demotion in flight frees its page as its copy lands: the page of a
   // leaf no state in RAM keeps (pollTierTransfers) and no request holds.
   [[nodiscard]] bool freesOnLanding(const Write &write) const noexcept;
+  // The pages the demotions in flight hold, by form.
+  [[nodiscard]] std::array<uint32_t, 3> demotionPages() const noexcept;
   // The bytes of the whole extents `pages` pages add to the free pages of
   // their form and `beside` more pages that free before them (Returning),
   // past the empty one a runway keeps with keepRunway.

@@ -40,6 +40,16 @@ uint32_t completedExtents(uint32_t free, uint32_t pages, uint32_t extentPages, b
   return beyond(free + pages) - beyond(free);
 }
 
+// Evicting KV may still empty an extent: of some form, the pages a reclaim
+// may reuse, less those demotions hold, cover one.
+bool extentInReach(const std::array<uint32_t, 3> &reusable, const std::array<uint32_t, 3> &demoting,
+                   uint32_t extentPages) noexcept {
+  for (size_t form = 0; form < reusable.size(); ++form)
+    if (demoting[form] + extentPages <= reusable[form])
+      return true;
+  return false;
+}
+
 } // namespace
 
 Cache::Cache(KvPool &pool, KvTier *kvTier, std::shared_ptr<model::DiskBudget> diskBudget,
@@ -665,6 +675,14 @@ std::array<uint32_t, 3> Cache::demotedPages() const noexcept {
   return pages;
 }
 
+std::array<uint32_t, 3> Cache::demotionPages() const noexcept {
+  std::array<uint32_t, 3> pages{};
+  for (const Write &write : writes_)
+    if (write.write == WriteClass::Reclaim)
+      ++pages[static_cast<size_t>(pool_.form(kv_.page(write.block)))];
+  return pages;
+}
+
 uint64_t Cache::extentsCompleted(kv::PageForm form, uint32_t pages, uint32_t beside, bool keepRunway) const noexcept {
   const uint32_t extent = pool_.extentPages();
   return uint64_t{completedExtents(pool_.freePageCount(form) + beside, pages, extent, keepRunway)} * extent *
@@ -1072,7 +1090,7 @@ private:
   // What the reclaims of the unit being weighed released, freed and gave up
   // so far, and the pages demotions free as they land, by form, before it.
   struct Weighed final {
-    uint32_t demotions = 0;
+    std::array<uint32_t, 3> demotions{};
     std::array<uint32_t, 3> landing{};
     uint64_t bytes = 0;
     uint32_t pages = 0;
@@ -1165,8 +1183,11 @@ private:
   std::vector<KvPool::ExtentCounts> extents_;
   std::array<Form, 3> forms_;
   std::unordered_map<uint32_t, uint32_t> movedTo_;
-  uint32_t reusable_;
-  uint32_t demotions_;
+  // By form: the pages the walk may reuse (Cache::reusablePages) less those
+  // of the extents that leave, and the pages demotions hold, those in
+  // flight, then those the reclaims start.
+  std::array<uint32_t, 3> reusable_{};
+  std::array<uint32_t, 3> demotions_;
   // The pages demotions free as they land, by form: those in flight, then
   // those sure to start, then those of later steps; and those restored
   // leaves free, which no unit is weighed at.
@@ -1196,7 +1217,7 @@ private:
   bool inUse_ = false;
   bool written_ = false;
   bool ended_ = false;
-  uint32_t unitDemotions_ = 0;
+  std::array<uint32_t, 3> unitDemotions_{};
   std::array<uint32_t, 3> unitLanding_{};
   std::array<uint32_t, 3> unitRestored_{};
   uint32_t nowTaken_ = 0;
@@ -1214,10 +1235,11 @@ private:
 
 Cache::ReclaimPlan::ReclaimPlan(const Cache &owner, const Walk &plan, const MemoryRates &prices, uint32_t id)
     : cache(owner), walk(plan), rates(prices), serial(id), checkpointsDone_(plan.scope.pagesOnly),
-      extentPages_(owner.pool_.extentPages()), reusable_(owner.reusablePages(plan.scope.upTo)),
-      demotions_(owner.writes(WriteClass::Reclaim)), landing_(owner.demotedPages()),
+      extentPages_(owner.pool_.extentPages()), demotions_(owner.demotionPages()), landing_(owner.demotedPages()),
       tierRoom_(owner.tier_ ? owner.tier_->demotionRoom(WriteClass::Reclaim) : std::optional<uint32_t>(0u)),
       writing_(owner.states_.writing()) {
+  for (const kv::PageForm form : {kv::PageForm::Full, kv::PageForm::Slim, kv::PageForm::Index})
+    reusable_[static_cast<size_t>(form)] = owner.reusablePages(plan.scope.upTo, form);
   std::vector<uint32_t> inTransfer;
   for (const Write &write : cache.writes_)
     inTransfer.push_back(cache.kv_.page(write.block));
@@ -1368,11 +1390,12 @@ std::optional<engine::Victim> Cache::ReclaimPlan::weigh(Weighed weighed) {
   if (!weighed.changed)
     return std::nullopt;
   if (walk.device) {
-    // The Full extents its landings and its restored leaves complete leave
-    // as they land: the units after it reach no further than the pages
-    // left.
-    const uint32_t full = completed(weighed.landing, true)[static_cast<size_t>(kv::PageForm::Full)];
-    reusable_ -= std::min(reusable_, full * extentPages_);
+    // The extents its landings and its restored leaves complete leave as
+    // they land: the units after it reach no further than the pages of each
+    // form left.
+    const std::array<uint32_t, 3> extents = completed(weighed.landing, true);
+    for (size_t form = 0; form < extents.size(); ++form)
+      reusable_[form] -= std::min(reusable_[form], extents[form] * extentPages_);
   }
   // Bytes that land free later, also those of demotions in flight that
   // its victims let free their pages (demotionLands).
@@ -1381,16 +1404,18 @@ std::optional<engine::Victim> Cache::ReclaimPlan::weigh(Weighed weighed) {
                         .pages = weighed.pages,
                         .form = walk.form,
                         .stateBuffers = weighed.states,
-                        .later = later || demotions_ > weighed.demotions || written_ || unitTakes_.now.has_value(),
+                        .later = later || demotions_ != weighed.demotions || written_ || unitTakes_.now.has_value(),
                         .certainReuse = certain_,
                         .cls = inUse_ ? ReclaimClass::InUse : ReclaimClass::Ordinary,
                         .cost = cost_};
 }
 
 // takeReclaim, weighed; one that stopped at uncopied cache goes on there.
-// The pages the unit's own demotions free as they land count toward the
-// extent its victims empty, and it ends once they, or with them the pages
-// of its restored leaves, complete one.
+// Its victims go while their KV can empty an extent of some form: the pages
+// of the form left to reuse, less those the demotions before the unit hold,
+// cover one. The pages the unit's own demotions free as they land count
+// toward the extent its victims empty, and it ends once they, or with them
+// the pages of its restored leaves, complete one.
 Cache::ReclaimPlan::Step Cache::ReclaimPlan::step() {
   if (!std::exchange(resumes_, false)) {
     for (std::pair<bool, uint64_t> released; (released = releaseExtent()).first;)
@@ -1398,7 +1423,7 @@ Cache::ReclaimPlan::Step Cache::ReclaimPlan::step() {
         return {.progress = true, .bytes = released.second};
   }
   bool kv = false;
-  while (unitDemotions_ + extentPages_ <= reusable_) {
+  while (extentInReach(reusable_, unitDemotions_, extentPages_)) {
     const Step evicted = evict();
     if (evicted.uncopied) {
       resumes_ = true;
@@ -1629,8 +1654,7 @@ uint64_t Cache::ReclaimPlan::releaseEmpty() {
     const uint32_t index = *form.empty.begin();
     unlist(index);
     extents_[index].allocated = false;
-    if (each == kv::PageForm::Full)
-      reusable_ -= extentPages_;
+    reusable_[static_cast<size_t>(each)] -= extentPages_;
     return uint64_t{extentPages_} * cache.pool_.bytesPerPage(each);
   }
   return 0;
@@ -1986,7 +2010,8 @@ bool Cache::ReclaimPlan::writes(uint64_t block) const {
 
 // transfersInFlight once the reclaims before started what they did.
 bool Cache::ReclaimPlan::transfers() const {
-  return cache.transfersInFlight() || demotions_ > cache.writes(WriteClass::Reclaim) || writing_;
+  return cache.transfersInFlight() || std::ranges::any_of(demotions_, [](uint32_t pages) { return pages != 0; }) ||
+         writing_;
 }
 
 // A claim that can wait's plan writes and demotes what an Immediate one
@@ -2185,7 +2210,7 @@ Cache::ReclaimPlan::Step Cache::ReclaimPlan::takeLeaf(uint64_t block, LeafGoes g
                       budget->usedBytes() + quotaBytes_ + slot <= budget->limitBytes();
     demoting_.insert(block);
     gone_[block] = generation_ + 1;
-    ++demotions_;
+    ++demotions_[static_cast<size_t>(form)];
     if (tierRoom_ && !later)
       --*tierRoom_;
     quotaBytes_ += slot;
@@ -2365,7 +2390,7 @@ FreeResult Cache::take(const VictimQuery &query, const engine::Victim &victim) {
     // demotion: its retries take the rest as landings allow.
     const ReclaimPlan::Takes takes =
         ReclaimPlan::takesOf(*this, plan, walk, query.rates ? *query.rates : MemoryRates{}, victim);
-    const uint32_t demotions = writes(WriteClass::Reclaim);
+    const std::array<uint32_t, 3> demotions = demotionPages();
     const std::array<uint32_t, 3> landing = demotedPages();
     const auto form = static_cast<size_t>(walk.form);
     const uint32_t pagesBefore = pool_.freePageCount(walk.form) + landing[form];
@@ -2530,7 +2555,8 @@ uint64_t Cache::releaseOtherForms(kv::PageForm form) {
   return released;
 }
 
-CacheReclaimResult Cache::takeReclaim(const Walk &walk, uint32_t demotions, const std::array<uint32_t, 3> &unit) {
+CacheReclaimResult Cache::takeReclaim(const Walk &walk, const std::array<uint32_t, 3> &demotions,
+                                      const std::array<uint32_t, 3> &unit) {
   plan_.reset();
   // Free pages first, as the extent they fill; one that empties the runway
   // kept gives nothing yet, and the next one does.
@@ -2538,10 +2564,11 @@ CacheReclaimResult Cache::takeReclaim(const Walk &walk, uint32_t demotions, cons
     if (released.reclaimedBytes)
       return released;
   // Then the victims in reclaimOne's order while their KV can empty an
-  // extent, until one is released, the pages the unit's demotions free as
-  // they land complete one, or a state goes; otherwise only a state. Those
-  // pages count toward the extent; the demotions in flight before the unit
-  // hold theirs. Whatever it returns says whether KV went.
+  // extent of some form, until one is released, the pages the unit's
+  // demotions free as they land complete one, or a state goes; otherwise
+  // only a state. Those pages count toward the extent; the demotions in
+  // flight before the unit hold theirs, of their form. Whatever it returns
+  // says whether KV went.
   bool evictedKv = false;
   const auto outcome = [&](CacheReclaimResult result) {
     result.evictedKv = evictedKv;
@@ -2720,8 +2747,11 @@ void Cache::dropPoisoned() {
   });
 }
 
-bool Cache::extentWithinReach(ReclaimClass upTo, std::optional<uint32_t> demoting) const {
-  return demoting.value_or(writes(WriteClass::Reclaim)) + pool_.extentPages() <= reusablePages(upTo);
+bool Cache::extentWithinReach(ReclaimClass upTo, std::optional<std::array<uint32_t, 3>> demoting) const {
+  std::array<uint32_t, 3> reusable{};
+  for (const kv::PageForm form : {kv::PageForm::Full, kv::PageForm::Slim, kv::PageForm::Index})
+    reusable[static_cast<size_t>(form)] = reusablePages(upTo, form);
+  return extentInReach(reusable, demoting.value_or(demotionPages()), pool_.extentPages());
 }
 
 CacheReclaimResult Cache::releaseExtent(const Walk &walk) {
