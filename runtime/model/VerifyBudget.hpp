@@ -25,16 +25,15 @@
 // must not price it. The slope shrinks toward the seed's, the shape the
 // measured MoE targets share, at the cycles' level, as much as
 // kPriorCycles cycles over a lane count's spread of rows would; before any
-// cycle, the seed itself is the cost. No total costs less than kCostFloor
-// of the cycles' mean time, and a cycle counts at most twice and at least
-// half that price, so that one stall cannot price the fewest rows at next
-// to nothing: over rows that cluster, a stalled cycle of every row tilts
-// the line toward zero at the fewest rows, and the cycles that then
-// verified them alone would count as that and keep the line there. The
-// stall still moves the rows of the cycles after it, until the decay lets
-// it go. Constrained cycles, whose verify waits for the host's masks, are
-// fit apart. Every kExploreCycles-th cycle of a lane count verifies every
-// row, which keeps the rows of the fit spread.
+// cycle, the seed itself is the cost. A cycle counts at most twice and at
+// least half the time the fit gives it, so that a stall does not price the
+// rows of the next thirty cycles. A floor under every total at a quarter of
+// the cycles' mean, where costs() keeps a twentieth, made decode 0.977-0.997
+// times as fast (90 % interval of an ABBA on an M5 Max: Qwen3.8-Flash-Next
+// Q2_0 with its DFlash2 draft, four lanes of 16-24K-token prose accepting
+// 0.55-0.59 of the proposals). Constrained cycles, whose verify waits
+// for the host's masks, are fit apart. Every kExploreCycles-th cycle of a
+// lane count verifies every row, which keeps the rows of the fit spread.
 #include "metal/abi/ExecutionGeometry.h"
 
 #include <array>
@@ -56,10 +55,6 @@ public:
   static constexpr uint32_t kExploreCycles = 32;
   static constexpr double kDecay = 0.97;
   static constexpr double kPriorCycles = 5.0;
-  // Under the seed's cost of one row a lane (0.40-0.60 of every row's, which
-  // the mean does not exceed), so that a fit of the measured shape never
-  // reaches it.
-  static constexpr double kCostFloor = 0.25;
   // The prior's precision on the slope and on each intercept: about twenty
   // labels' worth each (a label tells the slope about its logit squared, some
   // 2.5, times what it tells its intercept).
@@ -127,9 +122,6 @@ private:
   [[nodiscard]] const Cost &table(uint32_t lanes, bool constrained) const;
   // The fit's intercept and slope; none before any cycle.
   [[nodiscard]] std::optional<std::pair<double, double>> line(uint32_t lanes, bool constrained) const;
-  // The fit's cost of `rows` rows in all, at least kCostFloor of the cycles'
-  // mean time; none before any cycle.
-  [[nodiscard]] std::optional<double> price(uint32_t lanes, bool constrained, uint32_t rows) const;
 
   Acceptance acceptance_ = kPrior;
   std::vector<Label> labels_;

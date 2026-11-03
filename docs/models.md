@@ -343,9 +343,7 @@ cycles, which for streamed experts include the store's reads of its misses: a
 least-squares line in the rows over about the last 30 cycles, its slope shrunk
 toward the shape the measured targets share, since what a row costs follows the
 requests served (a Qwen3.6-35B-A3B cycle with 4 GB of experts adds about 3 ms a
-row on prose and 8 ms on reasoning), never under a quarter of those cycles' mean
-time, and a cycle counts at most twice and at least half that price, so that one
-stall cannot make the fewest rows look free; constrained cycles are fit apart, and every
+row on prose and 8 ms on reasoning); constrained cycles are fit apart, and every
 32nd cycle of a lane count verifies every row, which keeps the rows of the fit
 spread. A fixed shorter block would do worse: in agentic use about one cycle in
 six accepts all seven proposals and one in five accepts none. Rows past a lane's
