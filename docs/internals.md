@@ -1447,13 +1447,18 @@ and byte of spilled K/V read from it. Startup seeds it before Ready: a byte of
 either read at the rate loading the weights read the SSD, and from two prefill
 warm-ups, of a chunk's rows and of 256, the line of their times less those
 reads by their row-layers, whose intercept is a chunk-layer's cost, their
-turnaround in it; the turnaround starts at zero, where units of one pass over
-one chunk, which do not tell the two apart, leave it. Every unit that runs
+turnaround in it; the turnaround starts at zero. Every unit that runs
 rows then trains it, a pass by its share of its command, each weighing nine
 tenths of the next, its time held
 within half and twice its price, in a fit that keeps every cost non-negative
 and a cost no unit's work varies at its seed; the bytes it prices are scaled
-by what units read over what the model expected of them. The status reports
+by what units read over what the model expected of them. The turnaround is
+what the units say of it beside their work, whatever the other costs are,
+once they pin it down to within a tenth of G (its standard error from their
+scatter about the fit), the turnaround that moves the bound by G; until then
+it stays at zero and the bound at G. Units of other passes over the same
+work pin it down; units of one shape, or in the passes their prices set,
+whose pass counts follow their work, do not. The status reports
 each cost and its seed, and the units' relative errors over the last 256
 (`scheduler.estimate.prefill`), and a decode token's time
 (`scheduler.estimate.decode`).
@@ -1496,7 +1501,20 @@ decode they owe, not for every decode above the command's own priority. Its
 later passes come before any other
 prefill, whose rows would take the prefill memory its work is in, but admission
 waits for no pass: a request that arrives meanwhile starts at the next command's
-boundary, in ordinary admission and during recovery alike. A command between
+boundary, in ordinary admission and during recovery alike. Admission starts a
+prompt only where the next command serves it and leaves it waiting for no other
+prompt: the command ends the prompt, the prompt leads it or is overdue, or every
+lane ahead of it ends its prompt there and none is a Spill lane, so two Spill
+lanes prefill together only as the later one leads. The lanes of a command
+between its passes count past its rows, which commit before any other prefill.
+A start still restoring its prefix from the SSD cache runs in no command before
+it lands, and a prompt it would lead then, once the prompt's first command ran
+(as the prompt stands while a command is between its passes), waits for it. A
+prompt that would join with the rows that spare it a command and then wait out
+another's waits for scheduling, and takes no lower resident's lane, until it
+leads; the requests one admission pass tries are judged together, in recovery
+as in ordinary admission, and while one waits so, no suspended lane below it
+resumes into the lane it will take. A command between
 its passes is abandoned, nothing of it committed, for work that supersedes it:
 work that leaves no lane of it overdue behind and shortens the summed
 completion of the lanes concerned, the command's, the work's and the other

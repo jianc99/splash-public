@@ -649,8 +649,9 @@ private:
   [[nodiscard]] bool gainsIndexPages(std::optional<KvMode> mode, uint64_t processed) const;
   // The shapes planning reads (PlanInputs::shapes): every resident prefill
   // lane's, with its Index pages, whether it gains them, its row cap this
-  // tick and whether it ended (Request::pendingEnd), and each candidate's,
-  // from the placement its latest attempt found.
+  // tick, whether it is a Spill lane and whether it ended
+  // (Request::pendingEnd), and each candidate's, from the placement found for
+  // it in the memory's current state (placeCandidates).
   [[nodiscard]] std::vector<LaneShape> laneShapes(std::span<const PrefillAdmission> candidates = {}) const;
   // The command between its passes as planning reads it, or none.
   [[nodiscard]] const PassProgress *passProgress() const noexcept {

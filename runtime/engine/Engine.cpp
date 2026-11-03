@@ -546,15 +546,59 @@ bool Engine::admitQueued(double now) {
       active.admissionProbe = cache_.probe(active.exactTokens, promptIdentity(active.request));
     return active.admissionProbe->cachedTokens();
   };
+  // The starts restoring their prefix from the SSD cache, which prefill once
+  // it lands (PlanInputs::restoring).
+  std::vector<PrefillAdmission> restoring;
+  for (const auto &[id, active] : requests_)
+    if (active.restore && !scheduler_.suspended(id))
+      restoring.push_back({id, active.restore->lookup.resumeBoundary()});
+  // The candidates the scheduler starts (Scheduler::prefillAdmissionOrder),
+  // each placed once in each state of the memory it reads.
+  const auto admissionOrder = [&](std::span<const PrefillAdmission> candidates) {
+    placeCandidates(candidates);
+    const std::vector<LaneShape> shapes = laneShapes(candidates);
+    return scheduler_.prefillAdmissionOrder(candidates,
+                                            {.shapes = shapes, .passes = passProgress(), .restoring = restoring});
+  };
+  // A request the scheduler would not start in a free lane waits for
+  // scheduling, in recovery as in ordinary admission, and takes no lane,
+  // neither a free one nor a lower resident's. The scheduler judges the
+  // requests this pass tries together, as ordinary admission does its
+  // candidates: in recovery those above every suspended request, those
+  // ready to retry that a running priority does not hold back and that
+  // wait for no producer's prefix, up to the first refused memory. Judged
+  // alone, a costlier prompt would start ahead of a cheaper one that then
+  // leads it.
+  std::optional<std::vector<uint64_t>> unscheduled;
+  const auto waitsForScheduling = [&](uint64_t id) {
+    if (!unscheduled) {
+      std::vector<PrefillAdmission> judged;
+      for (const uint64_t each : order) {
+        Request &value = request(each);
+        if (value.restore || scheduler_.suspended(each) || !admissionTries(value, tier, draining))
+          continue;
+        if (resourceRetryReady(value, now) && !belowRunnable(value))
+          if (const uint32_t cached = cachedTokens(value); !pendingSharedPrefill(value, cached))
+            judged.push_back({each, cached});
+        if (value.refusedResources)
+          break;
+      }
+      const std::vector<uint64_t> starts = admissionOrder(judged);
+      unscheduled.emplace();
+      for (const PrefillAdmission &each : judged)
+        if (std::ranges::find(starts, each.requestId) == starts.end())
+          unscheduled->push_back(each.requestId);
+    }
+    return std::ranges::find(*unscheduled, id) != unscheduled->end();
+  };
   // A request starts only in a free lane. While every lane is resident,
-  // record each wait as a failed admission would. The first request that
-  // waits for a lane and not for a producer's prefix takes one from the
-  // lowest-priority resident below it, if there is one: the order is by
-  // priority, so no later request has one to take. The next pass admits
-  // it, above the lane it suspended. Only the requests up to that one are
-  // probed, to tell a prefix wait: a request waiting for a prefix would
-  // leave the freed lane to the suspended one, which would resume into it
-  // and replay for nothing.
+  // record each wait of a request the scheduler would start as a failed
+  // admission would. The first request that waits for a lane and not for a
+  // producer's prefix takes one from the lowest-priority resident below it,
+  // if there is one: the order is by priority, so no later request has one
+  // to take. The next pass admits it, above the lane it suspended. A
+  // request waiting for a prefix would leave the freed lane to the
+  // suspended one, which would resume into it and replay for nothing.
   const bool lanesFull =
       std::count_if(requests_.begin(), requests_.end(), [](const auto &entry) {
         return entry.second.lane.has_value();
@@ -573,27 +617,36 @@ bool Engine::admitQueued(double now) {
   if (tier) {
     // Recovery admits one request at a time, in admission order: those
     // above every suspended request, then the suspended ones, which resume
-    // below a running priority too. As in ordinary admission, the first one
-    // refused memory holds back the ones after it. Those are not tried, so
-    // they keep no retry time, and their wait limit starts again at their
-    // next attempt.
+    // below a running priority too, into the lane a higher priority took
+    // from them, whatever lane leads. As in ordinary admission, the first one
+    // refused memory holds back the ones after it, and one above them that
+    // waits for scheduling holds back the suspended ones, all of a lower
+    // priority: resumed into the lane it takes once it leads, they would
+    // replay for nothing below it and yield that lane again. Those are not
+    // tried, so they keep no retry time, and their wait limit starts again
+    // at their next attempt.
     std::optional<uint64_t> refused;
+    bool startWaits = false;
     for (uint64_t id : order) {
       Request &active = request(id);
       if (active.restore || !admissionTries(active, tier, draining))
         continue;
-      if (refused) {
+      const bool suspended = scheduler_.suspended(id);
+      if (refused || (suspended && startWaits)) {
         active.resourceWait.retryMilliseconds = 0.0;
         active.resourceWait.deadlineMilliseconds = 0.0;
         active.heldBehind = refused;
         continue;
       }
       if (resourceRetryReady(active, now)) {
-        const bool suspended = scheduler_.suspended(id);
-        if (!suspended && belowRunnable(active))
+        if (!suspended && belowRunnable(active)) {
           queue(id);
-        else if (lanesFull && !suspended ? waitForLane(id, active) : admit(active, now))
+        } else if (!suspended && waitsForScheduling(id)) {
+          queue(id);
+          startWaits = true;
+        } else if (lanesFull && !suspended ? waitForLane(id, active) : admit(active, now)) {
           return true;
+        }
       }
       if (active.refusedResources)
         refused = id;
@@ -628,7 +681,9 @@ bool Engine::admitQueued(double now) {
       continue;
     }
     if (lanesFull) {
-      if (waitForLane(id, active))
+      if (waitsForScheduling(id))
+        queue(id);
+      else if (waitForLane(id, active))
         return true;
       continue;
     }
@@ -643,11 +698,7 @@ bool Engine::admitQueued(double now) {
   }
   bool progressed = false;
   while (!candidates.empty()) {
-    // Each candidate is placed once in each state of the memory it reads.
-    placeCandidates(candidates);
-    const std::vector<LaneShape> shapes = laneShapes(candidates);
-    const auto selected =
-        scheduler_.prefillAdmissionOrder(candidates, {.shapes = shapes, .passes = passProgress()});
+    const auto selected = admissionOrder(candidates);
     if (selected.empty())
       break;
     for (uint64_t id : selected) {
@@ -1613,11 +1664,14 @@ std::vector<LaneShape> Engine::laneShapes(std::span<const PrefillAdmission> cand
                         .indexPages = cache_.indexPages(id),
                         .gainsIndexPages = gainsIndexPages(active.kvMode, scheduler_.promptProcessed(id)),
                         .rowCap = active.rowCap.value_or(std::numeric_limits<uint32_t>::max()),
+                        .spill = active.kvMode == KvMode::Spill,
                         .ended = active.pendingEnd.has_value()});
-  for (const PrefillAdmission &candidate : candidates)
+  for (const PrefillAdmission &candidate : candidates) {
+    const KvMode mode = *requests_.at(candidate.requestId).placement;
     shapes.push_back({.requestId = candidate.requestId,
-                      .gainsIndexPages = gainsIndexPages(requests_.at(candidate.requestId).placement,
-                                                         candidate.cachedTokens)});
+                      .gainsIndexPages = gainsIndexPages(mode, candidate.cachedTokens),
+                      .spill = mode == KvMode::Spill});
+  }
   return shapes;
 }
 

@@ -24,6 +24,8 @@ using test::require;
 
 constexpr uint32_t kChunk = model::ExecutionLimits::prefillTokenBudget;
 constexpr uint32_t kLayers = 48;
+// The decode gap G (DESIGN §0 O3).
+constexpr double kGap = 500.0;
 constexpr size_t kWeightReads = static_cast<size_t>(CostTerm::WeightReadBytes);
 constexpr size_t kSpilledReads = static_cast<size_t>(CostTerm::SpilledKvReadBytes);
 
@@ -66,7 +68,7 @@ model::CommandSample sample(const model::CommandWork &work, double milliseconds)
 // The two prefill warm-ups at the truth, a prompt of one token reading few
 // experts, and a load at the weights' true rate.
 CostModel seeded() {
-  CostModel cost;
+  CostModel cost(kGap);
   const std::array warmups{sample(unit(kChunk, 0, 400'000'000, 0), truth(unit(kChunk, 0, 400'000'000, 0))),
                            sample(unit(256, 0, 400'000'000, 0), truth(unit(256, 0, 400'000'000, 0)))};
   cost.seed(warmups, {.bytes = 10'000'000'000, .milliseconds = 10'000'000'000 * kTruth[kWeightReads]});
@@ -95,7 +97,7 @@ void testTheSeedReproducesAnExactAffineTruth() {
           "a term no startup measurement measured did not seed at zero");
   // Warm-ups whose short one costs more than the long: the slope would be
   // negative, so the constant is their mean and RowLayers zero.
-  CostModel inverted;
+  CostModel inverted(kGap);
   const std::array warmups{sample(unit(kChunk, 0, 0, 0), 1000.0), sample(unit(256, 0, 0, 0), 2000.0)};
   inverted.seed(warmups, {});
   const CostModelStats clamped = inverted.stats();
@@ -103,14 +105,14 @@ void testTheSeedReproducesAnExactAffineTruth() {
           "a negative seed slope was not clamped to a mean");
   // One whose line would cross zero at a positive row count: no constant,
   // the rows carry it all.
-  CostModel steep;
+  CostModel steep(kGap);
   const std::array steepWarmups{sample(unit(kChunk, 0, 0, 0), 2048.0), sample(unit(256, 0, 0, 0), 64.0)};
   steep.seed(steepWarmups, {});
   require(steep.stats().seedRates[1] == 0.0 && steep.stats().seedRates[2] > 0.0,
           "a negative seed intercept was not clamped to zero");
   // Warm-ups over no layers: rows and chunks are all there is, the constant
   // is Units'.
-  CostModel flat;
+  CostModel flat(kGap);
   model::CommandWork noLayers = unit(kChunk, 0, 0, 0);
   noLayers.layers = 0;
   const std::array flatWarmups{sample(noLayers, 300.0), sample(noLayers, 300.0)};
@@ -123,7 +125,7 @@ void testTheSeedReproducesAnExactAffineTruth() {
 // the warm-ups read: their host-step time is not a price.
 void testSeedReadRatesComeFromTheLoad() {
   for (const uint64_t warmupBytes : {uint64_t{0}, uint64_t{2'000'000'000}}) {
-    CostModel cost;
+    CostModel cost(kGap);
     const std::array warmups{sample(unit(kChunk, 0, warmupBytes, 0), 3213.0),
                              sample(unit(256, 0, warmupBytes, 0), 2400.0)};
     cost.seed(warmups, {.bytes = 30'000'000'000, .milliseconds = 4000.0});
@@ -218,6 +220,31 @@ void testOneSizeKeepsTheSeedsSplit() {
     return constant / (constant + of.rates[2] * 300 * kLayers);
   };
   require(relative(share(stats), share(seed)) < 0.05, "one size moved the seed's split of its constant and rows");
+}
+
+// The turnaround is what the units say of it beside their work, whatever
+// the other rates are, once they pin it down. Ten commands of one shape,
+// 8192 rows in 24 passes, a quarter over the truth, cannot tell it from
+// their work: it stays at its seed, zero, where fitted with the other terms
+// it took what their seeds left. Three of the same commands in 12 passes
+// tell it, exactly as nothing scatters: the time 12 passes fewer save, the
+// truth's turnaround a quarter over, within 2 %.
+void testOnlyOtherPassesOfTheWorkTellTheTurnaround() {
+  CostModel cost = seeded();
+  const auto run = [&](uint32_t passes, uint32_t commands) {
+    for (uint32_t command = 0; command < commands; ++command)
+      for (uint32_t pass = 0; pass < passes; ++pass) {
+        const model::CommandWork work = unit(4 * kChunk, 16384, 16'000'000'000, 0, passes);
+        cost.observe(work, work, 1.25 * truth(work), 1.0 / passes);
+      }
+  };
+  run(24, 10);
+  require(cost.stats().rates[0] < 1e-6,
+          "commands of one shape priced a turnaround of " + std::to_string(cost.stats().rates[0]) + " ms");
+  run(12, 3);
+  require(relative(cost.stats().rates[0], 1.25 * kTruth[0]) < 0.02,
+          "the same commands in other passes priced a turnaround of " + std::to_string(cost.stats().rates[0]) +
+              " ms, not their " + std::to_string(1.25 * kTruth[0]));
 }
 
 // (3) The model's expected bytes price at once: 30 % more of them adds their
@@ -322,7 +349,7 @@ void testExpectedWeightReadsCalibrateToRealized() {
 // The warm-ups seed the price and never calibrate it: a warm-up prompt of
 // one token reads 4 % of what a text prompt would.
 void testWarmupsDoNotCalibrate() {
-  CostModel cost;
+  CostModel cost(kGap);
   const std::array warmups{sample(unit(kChunk, 0, 600'000'000, 0), 3213.0),
                            sample(unit(256, 0, 600'000'000, 0), 2400.0)};
   cost.seed(warmups, {.bytes = 30'000'000'000, .milliseconds = 4000.0});
@@ -359,6 +386,7 @@ constexpr test::TestCase kTests[] = {
     {"testPriceIsLinearInReadBytes", testPriceIsLinearInReadBytes},
     {"testRecoversTheRatesVariedUnitsShow", testRecoversTheRatesVariedUnitsShow},
     {"testOneSizeKeepsTheSeedsSplit", testOneSizeKeepsTheSeedsSplit},
+    {"testOnlyOtherPassesOfTheWorkTellTheTurnaround", testOnlyOtherPassesOfTheWorkTellTheTurnaround},
     {"testMoreExpectedBytesPriceAtOnce", testMoreExpectedBytesPriceAtOnce},
     {"testAStallMovesTheFitAsTwiceItsPrice", testAStallMovesTheFitAsTwiceItsPrice},
     {"testPassesMoveTheFitAsTheirCommand", testPassesMoveTheFitAsTheirCommand},

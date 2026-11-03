@@ -19,6 +19,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <random>
 #include <span>
 #include <string>
 #include <utility>
@@ -72,9 +73,9 @@ std::string at(const test::TimingProfile &profile) {
 }
 
 // A target, its scheduler and what the engine gives the scheduler: the
-// lanes' shapes, the lanes left out, and the command between its passes,
-// which run() keeps as the engine's PassCommand does. Commands take the
-// profile's time on a clock.
+// lanes' shapes, the lanes left out, the command between its passes, which
+// run() keeps as the engine's PassCommand does, and for admission the starts
+// restoring their prefix. Commands take the profile's time on a clock.
 class Sim {
 public:
   explicit Sim(const test::TimingProfile &profile, model::CommandLimits commandLimits = limits(),
@@ -87,6 +88,7 @@ public:
   std::vector<LaneShape> shapes;
   std::vector<uint64_t> excluded;
   std::optional<PassProgress> passes;
+  std::vector<PrefillAdmission> restoring;
   double now = 0.0;
 
   // The startup's two prefill warm-ups (a prompt of one token, as
@@ -100,7 +102,7 @@ public:
     scheduler.seedCost(warmups, rate ? model::SsdReads{10'000'000'000, 1e10 / rate} : model::SsdReads{});
     return *this;
   }
-  [[nodiscard]] PlanInputs in() const { return {excluded, shapes, passes ? &*passes : nullptr}; }
+  [[nodiscard]] PlanInputs in() const { return {excluded, shapes, passes ? &*passes : nullptr, restoring}; }
   [[nodiscard]] std::optional<BatchPlan> next() const { return scheduler.next(in()); }
   [[nodiscard]] BatchPlan plan() const {
     const std::optional<BatchPlan> result = next();
@@ -963,18 +965,25 @@ void testALoneRequestIsSizedAsToday() {
 }
 
 // A contended agent turn on `profile` (the M6's at some turnaround), after
-// commands of varied passes have taught the fit the turnaround: the sim and
-// the turn's first plan.
+// commands of the same work in other passes have taught the fit the
+// turnaround: turns of 300-7800 rows, each run in 6 and in 24 passes (the
+// passes the scheduler plans follow a turn's price, so they alone do not
+// tell the turnaround from the work, testVariedPromptsLeaveTheBoundAtG).
+// The sim and the turn's first plan.
 std::pair<std::unique_ptr<Sim>, BatchPlan> learnedContendedTurn(const test::TimingProfile &profile) {
   auto sim = std::make_unique<Sim>(profile, limits(8192, 48));
   sim->seed();
   sim->decoder(1);
+  uint64_t id = 10;
   for (uint32_t turn = 0; turn < 6; ++turn) {
-    sim->lane(10 + turn, 8192, 300 + 1500 * turn);
-    while (sim->scheduler.phase(10 + turn) == Phase::Prefill)
-      sim->step();
-    sim->scheduler.cancel(10 + turn);
-    sim->scheduler.remove(10 + turn);
+    for (const uint32_t passes : {6u, 24u}) {
+      sim->lane(id, 8192, 300 + 1500 * turn);
+      const BatchPlan command{.kind = WorkKind::Prefill, .items = {{id, 300 + 1500 * turn, 8192}}, .passes = passes};
+      for (sim->run(command); sim->passes;)
+        sim->run(sim->passes->plan);
+      sim->scheduler.cancel(id);
+      sim->scheduler.remove(id++);
+    }
   }
   sim->lane(2, 8192, 300);
   BatchPlan plan = sim->plan();
@@ -1102,6 +1111,159 @@ void testWholeCommandsLeaveTheTurnaroundAtZero() {
     require(sim.price(plan.items, pass, plan.passes) <= kGap * (1 + 1e-9),
             "a contended dense command ran in " + std::to_string(plan.passes) + " passes of " +
                 std::to_string(sim.price(plan.items, pass, plan.passes)) + " ms, past G");
+}
+
+// M6-diag B (2): commands whose passes do not tell the turnaround from their
+// work leave it at its seed. The M6 smoke's startup priced its first
+// commands by their reads alone, every compute rate seeded at zero (here
+// the warm-ups' reads at the load's rate take their whole time), and ran
+// its first prompt alone, 8192 rows in 12 and then 6 passes, the passes of
+// each alike; [0, 8192) took 10.62 s in 12 passes and 10.54 s in 3, about
+// 10 ms a pass. Fitted with the other terms, the turnaround took what the
+// seeds left of those times, 301 ms, and the next prompt, contended, ran in
+// passes of 3.5 s against a bound of u / 0.1 = 3 s. Replayed at 10 ms (the
+// first prompt decoding beside the next), the two commands, at another
+// depth where they run in other passes, leave the turnaround at its seed
+// and every pass of the contended command within about twice G.
+void testStartupUnitsOfOneShapeLeaveTheTurnaroundAtItsSeed() {
+  const test::TimingProfile profile = withTurnaround(test::kM6FlashNextQ2, 10.0);
+  Sim sim(profile, limits(8192, 48));
+  std::array warmups{test::sampleOf(sim.work.warmupTimes(kChunk)), test::sampleOf(sim.work.warmupTimes(256))};
+  for (model::CommandSample &warmup : warmups)
+    warmup.work.weightReadBytes = static_cast<uint64_t>(warmup.wallMilliseconds * profile.weightBytesPerMillisecond);
+  sim.scheduler.seedCost(warmups, {10'000'000'000, 1e10 / profile.weightBytesPerMillisecond});
+  sim.lane(1, 0, 2 * 8192);
+  for (const uint32_t passes : {12u, 6u}) {
+    const BatchPlan command{
+        .kind = WorkKind::Prefill, .items = {{1, 8192, sim.scheduler.promptProcessed(1)}}, .passes = passes};
+    for (sim.run(command); sim.passes;)
+      sim.run(sim.passes->plan);
+  }
+  require(sim.turnaround() <= 2.0 * profile.turnaroundMilliseconds,
+          "the startup's commands in 12 and 6 passes priced a turnaround of " + std::to_string(sim.turnaround()) +
+              " ms against the profile's " + std::to_string(profile.turnaroundMilliseconds));
+  sim.lane(2, 0, 2 * 8192);
+  BatchPlan plan = sim.plan();
+  while (plan.kind != WorkKind::Prefill) {
+    sim.run(plan);
+    plan = sim.plan();
+  }
+  require(plan.items[0].requestId == 2 && plan.passes > 1, "the second prompt did not run in passes");
+  for (uint32_t pass = 0; pass < plan.passes; ++pass) {
+    const double wall =
+        test::prefillTimes(profile, sim.work.prefillWork(sim.lanes(plan.items), pass, plan.passes)).wallMilliseconds;
+    require(wall <= 2.0 * kGap, "beside a decode a pass of " + std::to_string(plan.passes) + " took " +
+                                    std::to_string(wall) + " ms, its bound " + std::to_string(sim.bound()) + " ms");
+  }
+}
+
+// The same startup as the scheduler plans it, at the smoke's 10 ms and at
+// each of kTurnarounds: the first prompt's 23,488 rows alone, then a 32K
+// prompt beside its decode and six turns of 300-7800 rows. The first
+// command, priced by the seeds, runs few passes far over G and the next at
+// depth 8192 runs many: a few passes of another count beside units the seed
+// underpriced, which tell the turnaround only what the price left of them.
+// After every command the turnaround is within twice the profile's, and
+// every contended pass within 2 G. (113e105c priced 62.6 ms at 10 ms after
+// one pass of the second command, abandoned it and learned 62-72 ms, a
+// bound of 620-723 ms; at 60 ms 137-149 ms, contended passes of 1043.6 ms.)
+void testThePlannedStartupLeavesTheTurnaroundWithinTwiceItsTruth() {
+  for (const double turnaround : {10.0, kTurnarounds[0], kTurnarounds[1], kTurnarounds[2]}) {
+    const test::TimingProfile profile = withTurnaround(test::kM6FlashNextQ2, turnaround);
+    Sim sim(profile, limits(8192, 48));
+    std::array warmups{test::sampleOf(sim.work.warmupTimes(kChunk)), test::sampleOf(sim.work.warmupTimes(256))};
+    for (model::CommandSample &warmup : warmups)
+      warmup.work.weightReadBytes =
+          static_cast<uint64_t>(warmup.wallMilliseconds * profile.weightBytesPerMillisecond);
+    sim.scheduler.seedCost(warmups, {10'000'000'000, 1e10 / profile.weightBytesPerMillisecond});
+    const auto prefill = [&](uint64_t id) {
+      while (sim.scheduler.phase(id) == Phase::Prefill) {
+        const BatchPlan plan = sim.plan();
+        const bool contended = sim.scheduler.phase(1) == Phase::Decode;
+        if (plan.kind == WorkKind::Prefill && contended) {
+          const double wall =
+              test::prefillTimes(profile, sim.work.prefillWork(sim.lanes(plan.items), plan.pass, plan.passes))
+                  .wallMilliseconds;
+          require(wall <= 2.0 * kGap, at(profile) + ": beside a decode pass " + std::to_string(plan.pass) + " of " +
+                                          std::to_string(plan.passes) + " of lane " + std::to_string(id) +
+                                          " took " + std::to_string(wall) + " ms, its bound " +
+                                          std::to_string(sim.bound()) + " ms");
+        }
+        sim.run(plan);
+        if (plan.kind == WorkKind::Prefill && plan.pass + 1 == plan.passes)
+          require(sim.turnaround() <= 2.0 * turnaround,
+                  at(profile) + ": after a command of lane " + std::to_string(id) + " in " +
+                      std::to_string(plan.passes) + " passes the turnaround was " +
+                      std::to_string(sim.turnaround()) + " ms");
+      }
+    };
+    sim.lane(1, 0, 23'488);
+    prefill(1);
+    sim.lane(2, 0, 32'768);
+    prefill(2);
+    for (uint64_t turn = 0; turn < 6; ++turn) {
+      sim.lane(10 + turn, 8192, static_cast<uint32_t>(300 + 1500 * turn));
+      prefill(10 + turn);
+      sim.scheduler.cancel(10 + turn);
+      sim.scheduler.remove(10 + turn);
+    }
+  }
+}
+
+// M6-diag B (2) by another route: on a streamed target each contended
+// command runs in the passes its price sets, so its pass count follows its
+// work, and what such units leave of the linear price (reads hidden behind
+// compute, unevenly where the passes split the attention layers unevenly)
+// looks like a turnaround. 80 prompts one after another beside a decode,
+// 300-12,000 rows at depths to 32K, at the profile's 10 ms: after every
+// command the turnaround is within twice that, so the bound stays G; every
+// pass is within twice G (M6-diag's acceptance, about 1 s), and their p95
+// within G and the price's e95 overrun (G4a). (113e105c learned 115.5 ms
+// after command 22, 2258 rows in 12 passes, and planned the next at a
+// bound of 1155 ms, a pass of 1232.6 ms; then 10-73 ms, mostly 25-60.)
+void testVariedPromptsLeaveTheBoundAtG() {
+  const test::TimingProfile profile = withTurnaround(test::kM6FlashNextQ2, 10.0);
+  Sim sim(profile, limits(8192, 48));
+  sim.seed();
+  sim.decoder(1);
+  std::mt19937 random(7);
+  std::uniform_real_distribution<double> logRows(std::log(300.0), std::log(12'000.0));
+  std::uniform_int_distribution<uint32_t> depth(0, 128);
+  const double bound = std::max(kGap, profile.turnaroundMilliseconds / kPassOverheadShare);
+  std::vector<double> walls;
+  uint32_t commands = 0;
+  for (uint64_t id = 100; id < 180; ++id) {
+    const auto rows = static_cast<uint32_t>(std::exp(logRows(random)));
+    sim.lane(id, 256 * depth(random), rows);
+    while (sim.scheduler.phase(id) == Phase::Prefill) {
+      const BatchPlan plan = sim.plan();
+      if (plan.kind == WorkKind::Prefill) {
+        walls.push_back(
+            test::prefillTimes(profile, sim.work.prefillWork(sim.lanes(plan.items), plan.pass, plan.passes))
+                .wallMilliseconds);
+        require(walls.back() <= 2.0 * bound, "command " + std::to_string(commands) + ": pass " +
+                                                 std::to_string(plan.pass) + " of " + std::to_string(plan.passes) +
+                                                 " took " + std::to_string(walls.back()) +
+                                                 " ms beside a decode, its bound " + std::to_string(sim.bound()) +
+                                                 " ms");
+      }
+      sim.run(plan);
+      if (plan.kind == WorkKind::Prefill && plan.pass + 1 == plan.passes)
+        require(sim.turnaround() <= 2.0 * profile.turnaroundMilliseconds,
+                "command " + std::to_string(commands++) + ", " + std::to_string(plan.items[0].tokenCount) +
+                    " rows at " + std::to_string(plan.items[0].promptOffset) + " in " +
+                    std::to_string(plan.passes) + " passes, priced a turnaround of " +
+                    std::to_string(sim.turnaround()) + " ms");
+    }
+    sim.scheduler.cancel(id);
+    sim.scheduler.remove(id);
+  }
+  std::ranges::sort(walls);
+  const double p95 = walls[static_cast<size_t>(std::ceil(0.95 * double(walls.size()))) - 1];
+  const double e95 = sim.scheduler.snapshot().prefillEstimate.relativeErrorP95;
+  require(p95 <= bound * (1.0 + e95), "the contended passes' p95 was " + std::to_string(p95) + " ms, over " +
+                                          std::to_string(bound) + " ms and the price's e95 of " +
+                                          std::to_string(e95));
 }
 
 // Behaviour change 5: groups follow the fixed part a group saves: on a
@@ -1587,10 +1749,32 @@ void testShortestExpectedRemainingLeads() {
   require(depth.plan().items[0].requestId == 2, "of equal rows the deeper led");
 }
 
-// 87382087's case: of two near-equal long prompts the younger, cheaper one
-// leads; the older is never admitted while the younger prefills, and leads
-// next.
+// 87382087's case: of two near-equal long prompts, Spill lanes as at 18G,
+// the younger, cheaper one leads; the older is never admitted while the
+// younger prefills, its last command's passes included (amend/S.md A100
+// (3)), and leads next. Started alone, the older leads once its first
+// command commits: the younger, arriving while that command is between its
+// passes, is judged against the older past the command's rows, which
+// commit before any other prefill, and is never admitted while it
+// prefills.
 void testNearEqualLongPromptsDoNotInterleave() {
+  Sim alone(test::kM6FlashNextQ2, limits(8192, 48));
+  alone.seed();
+  alone.lane(1, 0, 71'254);
+  alone.shapes.push_back({.requestId = 1, .spill = true});
+  alone.step();
+  require(alone.passes.has_value(), "the older prompt's first command did not run in passes");
+  alone.scheduler.submit(request(2, 71'220));
+  const std::array younger{PrefillAdmission{2, 0}};
+  while (alone.scheduler.phase(1) == Phase::Prefill) {
+    require(alone.scheduler.prefillAdmissionOrder(younger, alone.in()).empty(),
+            "the younger prompt was admitted while the older prefilled, at " +
+                std::to_string(alone.scheduler.promptProcessed(1)) + " of its rows" +
+                (alone.passes ? " and a pass of its command" : ""));
+    alone.step();
+  }
+  require(alone.scheduler.prefillAdmissionOrder(younger, alone.in()) == std::vector<uint64_t>{2},
+          "the younger prompt did not start once the older's prompt ended");
   Sim sim(test::kM6FlashNextQ2, limits(8192, 48));
   sim.seed();
   sim.scheduler.submit(request(1, 71'254));
@@ -1599,6 +1783,7 @@ void testNearEqualLongPromptsDoNotInterleave() {
   require(sim.scheduler.prefillAdmissionOrder(both, sim.in()) == std::vector<uint64_t>{2},
           "admission did not start the cheaper of two near-equal prompts");
   sim.scheduler.resourcesReady(2, 0);
+  sim.shapes.push_back({.requestId = 2, .spill = true});
   const std::array older{PrefillAdmission{1, 0}};
   while (sim.scheduler.phase(2) == Phase::Prefill) {
     require(sim.scheduler.prefillAdmissionOrder(older, sim.in()).empty(),
@@ -1607,6 +1792,106 @@ void testNearEqualLongPromptsDoNotInterleave() {
   }
   require(sim.scheduler.prefillAdmissionOrder(older, sim.in()) == std::vector<uint64_t>{1},
           "the older prompt did not start once the younger's prompt ended");
+}
+
+// A queued prompt starts only when the next command serves it and leaves it
+// waiting for no other prompt: the command ends its prompt, it leads, it is
+// overdue, or every lane ordered before it ends its prompt there and none
+// is a Spill lane, two of which prefill together only as the later one
+// leads or one is overdue (amend/S.md A100 (3), A103). Of a round's
+// near-equal prompts on the Studio at 18G (SIM-churn-order), after the
+// first, 59,043 tokens, now decoding, the second, a Spill lane, leads, and
+// the third, which would join its commands with the rows past its whole
+// ones, stays queued until it leads: the churn's 59,020 and 59,054, whose
+// 1710 such rows would join commands of 6144 rows, and 57,644 and 57,664,
+// whose 320 fit beside the second's last command, of 4396 rows, in the chunk
+// it ends in. Beside a Resident prompt of 6144 rows, which its command ends,
+// a prompt of three commands and 1710 rows starts with those and leads next;
+// beside a Spill one it stays queued. One of 1048 rows beside a leader of
+// 1000 in one chunk starts, the command ending it.
+void testALongPromptStartsOnlyToLead() {
+  const auto spill = [](Sim &sim, uint64_t id) { sim.shapes.push_back({.requestId = id, .spill = true}); };
+  const auto round = [&](Sim &sim, uint32_t second, uint32_t third) {
+    sim.seed();
+    sim.lane(3, 0, 59'043);
+    while (sim.scheduler.phase(3) == Phase::Prefill)
+      sim.step();
+    sim.lane(1, 0, second);
+    spill(sim, 1);
+    sim.scheduler.submit(request(2, third));
+    const std::array later{PrefillAdmission{2, 0}};
+    while (sim.scheduler.phase(1) == Phase::Prefill) {
+      require(sim.scheduler.prefillAdmissionOrder(later, sim.in()).empty(),
+              "the third prompt, " + std::to_string(third) + " tokens, started to join the second's command at " +
+                  std::to_string(sim.scheduler.promptProcessed(1)) + " of its rows");
+      sim.step();
+    }
+    require(sim.scheduler.prefillAdmissionOrder(later, sim.in()) == std::vector<uint64_t>{2},
+            "the third prompt, " + std::to_string(third) + " tokens, did not start once it led");
+  };
+  Sim fits(test::kStudio18GFlashNextQ2, limits(8192, 48));
+  round(fits, 57'644, 57'664);
+  Sim sim(test::kStudio18GFlashNextQ2, limits(8192, 48));
+  round(sim, 59'020, 59'054);
+  sim.scheduler.cancel(2);
+  sim.scheduler.remove(2);
+  sim.lane(4, 0, 6144);
+  sim.scheduler.submit(request(5, 3 * 8192 + 1710));
+  const std::array next{PrefillAdmission{5, 0}};
+  require(sim.scheduler.prefillAdmissionOrder(next, sim.in()) == std::vector<uint64_t>{5},
+          "a prompt that leads once the command ends the Resident one ahead of it did not start beside it");
+  spill(sim, 4);
+  require(sim.scheduler.prefillAdmissionOrder(next, sim.in()).empty(),
+          "a prompt that leads once the command ends the Spill one ahead of it started beside it");
+  Sim chunk(test::kStudio18GFlashNextQ2, limits(8192, 48));
+  chunk.seed();
+  chunk.lane(1, 0, 1000);
+  chunk.scheduler.submit(request(2, 1048));
+  const std::array whole{PrefillAdmission{2, 0}};
+  require(chunk.scheduler.prefillAdmissionOrder(whole, chunk.in()) == std::vector<uint64_t>{2},
+          "a prompt the next command ends did not start beside its leader");
+}
+
+// A start restoring its prefix from the SSD cache runs in no command before
+// its read lands, and holds back only a prompt that it would then lead
+// (amend/S.md A103). On a dense target of one chunk a command, a cold prompt
+// of 1500 rows starts beside one restoring with 640 to go, its first command
+// ending it (a plan of both would not hold it), as does one of 3100 beside
+// 3000, which that command leaves 1052; one of 5200, left 3152, stays
+// queued. Beside a Foreground start restoring with 162 rows to go, a Normal
+// prompt its first command ends starts; one of 3100 stays queued. Of the
+// near-equal pair at 18G on the Studio, the second, 57,664 tokens, stays
+// queued beside the first restoring its last 1000 rows, though its 320 rows
+// past its whole commands fit beside them and the first's shape is no Spill
+// lane's, as two Spill lanes prefill together only as the later one leads
+// (A100 (3)).
+void testARestoringStartHoldsBackWhatItWouldLead() {
+  // Whether a cold prompt of `prompt` rows starts beside a start of
+  // `priority` restoring to `cached` with `restoring` rows to go.
+  const auto starts = [](Sim &sim, uint32_t cached, uint32_t restoring, uint32_t prompt,
+                         RequestPriority priority = RequestPriority::Normal) {
+    sim.scheduler.submit(request(1, cached + restoring, priority));
+    sim.restoring.push_back({1, cached});
+    sim.scheduler.submit(request(2, prompt));
+    const std::array candidate{PrefillAdmission{2, 0}};
+    return sim.scheduler.prefillAdmissionOrder(candidate, sim.in()) == std::vector<uint64_t>{2};
+  };
+  for (const auto &[restoring, prompt, priority, expected] :
+       {std::tuple{640u, 1500u, RequestPriority::Normal, true},
+        {3000u, 3100u, RequestPriority::Normal, true},
+        {3000u, 5200u, RequestPriority::Normal, false},
+        {162u, 226u, RequestPriority::Foreground, true},
+        {162u, 3100u, RequestPriority::Foreground, false}}) {
+    DenseSim sim;
+    require(starts(sim, 64, restoring, prompt, priority) == expected,
+            "a prompt of " + std::to_string(prompt) + " rows " + (expected ? "did not start" : "started") +
+                " beside a start of priority " + std::to_string(static_cast<int>(priority)) + " restoring with " +
+                std::to_string(restoring) + " rows to go");
+  }
+  Sim pair(test::kStudio18GFlashNextQ2, limits(8192, 48));
+  pair.seed();
+  pair.shapes.push_back({.requestId = 1});
+  require(!starts(pair, 56'644, 1000, 57'664), "the second of the near-equal pair started beside the first's restore");
 }
 
 // A long lane under a stream of short arrivals of its priority waits at
@@ -1771,6 +2056,79 @@ void testARegroupHappensOnlyWhenTheSumFalls() {
     require((gain > 0.0) == early, "the case does not straddle the rule");
     const bool abandons = sim.scheduler.abandonsPasses(sim.plan(), sim.in());
     require(abandons == early, "a regroup did not follow the summed completion");
+  }
+}
+
+// D2: after a pass, a leader that stays plans its command's own rows again
+// from a first pass. That plan joins no lane, whose own command is then none
+// and costs nothing (K_J = price(C'|J)), so restarting it would only redo the
+// pass: (|B| + |O|)(R - K') < 0, and the command goes on to its prompt's end
+// while an older 64K prompt of its tier waits. Priced as a command of no
+// rows, the joiners cost the plan's P' turnarounds, and the command
+// abandoned itself after every pass where those outweighed 2 (K' - R): on
+// the M6 smoke, 24 passes at a learned u of 53-72 ms. Whether they do here
+// follows from the turnaround the fit learns, so each case requires that
+// they would. The 20 ms profile learns 20.2 ms and the 30 ms one 30.0 ms,
+// which the first command's rows, run again in other passes, tell it, each
+// in 48 passes (no lanes priced 970.1 and 1438.2 ms against 533.5 and
+// 553.5); the 5 ms one learns 5.0 ms in 24 passes, too few to tell the
+// prices apart, and at 40-225 ms the commands, all in 48 passes, tell the
+// fit none (testStartupUnitsOfOneShapeLeaveTheTurnaroundAtItsSeed), so the
+// old price of no lanes is nothing as well.
+void testARestartOfTheCommandsOwnRowsDoesNotSupersedeIt() {
+  for (const double turnaround : {20.0, 30.0}) {
+    const test::TimingProfile profile = withTurnaround(test::kM6FlashNextQ2, turnaround);
+    Sim sim(profile, limits(8192, 48));
+    sim.seed();
+    // The turnaround learned as testPassesAddAtMostATenthOfTheCommand
+    // learns it.
+    sim.decoder(2);
+    for (uint32_t command = 0; command < 8; ++command) {
+      sim.lane(10 + command, 4096 * command, 8192);
+      while (sim.scheduler.phase(10 + command) == Phase::Prefill)
+        sim.step();
+      sim.scheduler.cancel(10 + command);
+      sim.scheduler.remove(10 + command);
+    }
+    sim.lane(3, 12'288, 64'087);
+    sim.lane(1, 0, 23'488);
+    const auto nextPrefill = [&] {
+      BatchPlan plan = sim.plan();
+      while (plan.kind != WorkKind::Prefill) {
+        sim.run(plan);
+        plan = sim.plan();
+      }
+      return plan;
+    };
+    const BatchPlan command = nextPrefill();
+    require(command.width() == 1 && command.items[0].requestId == 1 && command.passes > 1,
+            at(profile) + ": the 23K prompt did not lead a command in passes alone");
+    const uint64_t abandoned = sim.scheduler.snapshot().abandonedPassCommands;
+    sim.run(command);
+    const BatchPlan next = nextPrefill();
+    const PassProgress kept = *sim.passes;
+    sim.passes.reset();
+    const BatchPlan restart = sim.plan();
+    sim.passes = kept;
+    require(restart.kind == WorkKind::Prefill && restart.items == command.items,
+            at(profile) + ": the 23K prompt did not plan its own rows again");
+    // Kept, lane 1 ends at R and lane 3 waits R + K_J; restarted, both wait
+    // K'. So the old K_J, no lanes' P' turnarounds, abandons over 2 (K' - R).
+    const double rest = sim.passesPrice(command.items, 1, command.passes);
+    const double again = sim.passesPrice(restart.items, 0, restart.passes);
+    const double noLanes = sim.passesPrice({}, 0, restart.passes);
+    require(noLanes > 2.0 * (again - rest),
+            at(profile) + ": the case does not straddle the rule: no lanes' " + std::to_string(restart.passes) +
+                " passes priced " + std::to_string(noLanes) + " ms, not over twice the " +
+                std::to_string(again - rest) + " ms a restart adds to the rest");
+    require(!sim.scheduler.abandonsPasses(next, sim.in()),
+            at(profile) + ": a restart of its own rows superseded the command after the first of its " +
+                std::to_string(command.passes) + " passes, the turnaround learned " +
+                std::to_string(sim.turnaround()) + " ms");
+    while (sim.scheduler.phase(1) == Phase::Prefill)
+      sim.step();
+    const uint64_t more = sim.scheduler.snapshot().abandonedPassCommands - abandoned;
+    require(more == 0, at(profile) + ": the 23K prompt's commands were abandoned " + std::to_string(more) + " times");
   }
 }
 
@@ -2098,6 +2456,42 @@ void testAnAbandonedCommandsRowsCountOnce() {
           "a replay from the prompt's start counted " + std::to_string(replayed) + " rows, not the " +
               std::to_string(ran) + " that ran before its suspension and the " + std::to_string(2 * 8192 - reached) +
               " no command counted");
+  // The same suspension resumed past the rows counted, where the cache
+  // holds the prompt's blocks another request published: the replay's rows
+  // all count, none of them counted before.
+  sim.lane(5, 0, 3 * 8192);
+  plan = sim.plan();
+  while (plan.kind != WorkKind::Prefill || !sim.scheduler.promptProcessed(5)) {
+    sim.run(plan);
+    plan = sim.plan();
+  }
+  require(plan.width() == 1 && plan.items[0].requestId == 5 && plan.passes > 1,
+          "the second command did not run in passes");
+  const uint32_t resumed = plan.items[0].promptOffset + plan.items[0].tokenCount + 2048;
+  sim.run(plan);
+  const uint64_t past = sim.scheduler.snapshot().prefillRows;
+  sim.abandon();
+  sim.scheduler.suspendForResources(5);
+  sim.scheduler.resumeFromResources(5, resumed, 3 * 8192);
+  while (sim.scheduler.phase(5) == Phase::Prefill)
+    sim.step();
+  require(sim.scheduler.snapshot().prefillRows - past == 3 * 8192 - resumed,
+          "a replay from " + std::to_string(resumed) + ", past the rows counted, counted " +
+              std::to_string(sim.scheduler.snapshot().prefillRows - past) + " of the " +
+              std::to_string(3 * 8192 - resumed) + " rows no command counted");
+  // A lane admitted on a cached prefix and suspended before its first
+  // command replays from the prompt's start: every row of the replay ran
+  // in no command of its own, so all count.
+  sim.lane(6, 4096, 8192);
+  const uint64_t admitted = sim.scheduler.snapshot().prefillRows;
+  sim.scheduler.suspendForResources(6);
+  sim.scheduler.resumeFromResources(6, 0, 4096 + 8192);
+  while (sim.scheduler.phase(6) == Phase::Prefill)
+    sim.step();
+  require(sim.scheduler.snapshot().prefillRows - admitted == 4096 + 8192,
+          "a lane admitted at 4096 and suspended before its first command counted " +
+              std::to_string(sim.scheduler.snapshot().prefillRows - admitted) + " of the " +
+              std::to_string(4096 + 8192) + " rows its replay ran");
 }
 
 // A higher priority's decode does not abandon a command between its passes,
@@ -2277,6 +2671,10 @@ constexpr test::TestCase kTests[] = {
     {"testPassesAddAtMostATenthOfTheCommand", testPassesAddAtMostATenthOfTheCommand},
     {"testPassesFollowCostOnAResidentTarget", testPassesFollowCostOnAResidentTarget},
     {"testWholeCommandsLeaveTheTurnaroundAtZero", testWholeCommandsLeaveTheTurnaroundAtZero},
+    {"testStartupUnitsOfOneShapeLeaveTheTurnaroundAtItsSeed", testStartupUnitsOfOneShapeLeaveTheTurnaroundAtItsSeed},
+    {"testThePlannedStartupLeavesTheTurnaroundWithinTwiceItsTruth",
+     testThePlannedStartupLeavesTheTurnaroundWithinTwiceItsTruth},
+    {"testVariedPromptsLeaveTheBoundAtG", testVariedPromptsLeaveTheBoundAtG},
     {"testGroupRowsFollowTheFixedCost", testGroupRowsFollowTheFixedCost},
     {"testANearlyResidentStoreRunsChunks", testANearlyResidentStoreRunsChunks},
     {"testThePairBoundIsPerLayerAndOnlyRowsMeetIt", testThePairBoundIsPerLayerAndOnlyRowsMeetIt},
@@ -2297,6 +2695,8 @@ constexpr test::TestCase kTests[] = {
     {"testTheCountersAreThoseOfThePlanCommitted", testTheCountersAreThoseOfThePlanCommitted},
     {"testShortestExpectedRemainingLeads", testShortestExpectedRemainingLeads},
     {"testNearEqualLongPromptsDoNotInterleave", testNearEqualLongPromptsDoNotInterleave},
+    {"testALongPromptStartsOnlyToLead", testALongPromptStartsOnlyToLead},
+    {"testARestoringStartHoldsBackWhatItWouldLead", testARestoringStartHoldsBackWhatItWouldLead},
     {"testAgingBoundsALongLaneUnderArrivals", testAgingBoundsALongLaneUnderArrivals},
     {"testEqualPromptsFinishInArrivalOrder", testEqualPromptsFinishInArrivalOrder},
     {"testShortArrivalPrecedesLongColdPrompt", testShortArrivalPrecedesLongColdPrompt},
@@ -2304,6 +2704,7 @@ constexpr test::TestCase kTests[] = {
     {"testASameTierArrivalSupersedesOnlyWhenTheSumFalls", testASameTierArrivalSupersedesOnlyWhenTheSumFalls},
     {"testAHigherTierAbandonCountsLanesWaitingBehindBoth", testAHigherTierAbandonCountsLanesWaitingBehindBoth},
     {"testARegroupHappensOnlyWhenTheSumFalls", testARegroupHappensOnlyWhenTheSumFalls},
+    {"testARestartOfTheCommandsOwnRowsDoesNotSupersedeIt", testARestartOfTheCommandsOwnRowsDoesNotSupersedeIt},
     {"testAnOverdueLaneIsNeverAbandoned", testAnOverdueLaneIsNeverAbandoned},
     {"testAnAbandonmentDoesNotMakeALaneOverdue", testAnAbandonmentDoesNotMakeALaneOverdue},
     {"testALaneThatEndedBetweenPassesHoldsNoSupersedeBack", testALaneThatEndedBetweenPassesHoldsNoSupersedeBack},

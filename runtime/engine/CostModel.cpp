@@ -42,7 +42,8 @@ std::string_view costTermName(CostTerm term) noexcept {
   return "";
 }
 
-CostModel::CostModel() noexcept {
+CostModel::CostModel(double decodeGapMilliseconds) noexcept
+    : resolution_(decodeGapMilliseconds * kPassOverheadShare) {
   precision_.fill(1.0);
   unit_[kUnits] = 1.0;
 }
@@ -65,13 +66,13 @@ void CostModel::seed(std::span<const model::CommandSample> warmups, model::SsdRe
   // on the M6 profile, TimingProfile.cpp) and bound units at ten times that,
   // so no contended unit would run in passes before samples of several
   // passes; at zero the bound is G, the base's slice, until such samples
-  // price the turnaround (six commands do in
-  // testContendedTurnPassesByTurnaround). The constant holds the warm-ups'
-  // one turnaround too, so ChunkLayers' seed weighs on it with their Units
-  // (solve): units of one pass over one chunk, whose Units and ChunkLayers
-  // move together, leave Units at zero whatever they cost, as a dense target
-  // runs every uncontended command (testWholeCommandsLeaveTheTurnaroundAtZero).
-  // A model that reports no layers leaves it nowhere but Units.
+  // price the turnaround (testTheBoundFollowsTheTurnaround). The constant
+  // holds the warm-ups' one turnaround too, so ChunkLayers' prior is the
+  // constant less the turnaround (solve). Units of one pass over one chunk,
+  // as a dense target runs every uncontended command, never tell the
+  // turnaround from the chunk's cost and leave it at zero whatever they cost
+  // (testWholeCommandsLeaveTheTurnaroundAtZero). A model that reports no
+  // layers leaves the constant nowhere but Units.
   std::vector<std::pair<double, double>> points;
   double chunkLayers = std::numeric_limits<double>::infinity();
   for (const model::CommandSample &warmup : warmups) {
@@ -121,6 +122,7 @@ void CostModel::seed(std::span<const model::CommandSample> warmups, model::SsdRe
   }
   normal_ = {};
   moment_ = {};
+  timeSquares_ = commands_ = 0.0;
   rates_ = seedRates_;
 }
 
@@ -189,20 +191,24 @@ void CostModel::observe(const model::CommandWork &realized, const model::Command
       normal_[row][column] = decay * normal_[row][column] + normalized[row] * normalized[column] / weight;
     moment_[row] = decay * moment_[row] + normalized[row] * time / weight;
   }
+  timeSquares_ = decay * timeSquares_ + time * time / weight;
+  commands_ = decay * commands_ + weight;
   ++samples_;
   solve();
 }
 
 void CostModel::solve() {
-  // (N + K) β = m + K·ŝ over the terms with a unit, then again without the
-  // most negative rate, held at zero, until none is negative. K is diag κ
-  // but while Units and ChunkLayers are both free: ChunkLayers' prior is then
-  // κ (β_c + s β_u − ŝ_c)², s = seedUnits_, the warm-ups' line at no rows
-  // with their turnaround, so β_u leaves its seed only as far as units of
-  // other passes or chunks than the warm-ups' show it.
+  // The turnaround u first, from what the units say of it beside every
+  // measured term whatever their rates (identifiedTurnaround). Then
+  // (N + K) β = m − N·u + K·ŝ over the other terms with a unit, N and m the
+  // normal matrix and the moments, and again without the most negative
+  // rate, held at zero, until none is negative. K is diag κ, ChunkLayers'
+  // prior κ (β_c + s u − ŝ_c)², s = seedUnits_: the warm-ups' line at no
+  // rows holds their turnaround.
   std::array<bool, kCostTerms> free{};
   for (size_t term = 0; term < kCostTerms; ++term)
-    free[term] = unit_[term] > 0.0;
+    free[term] = term != kUnits && unit_[term] > 0.0;
+  const double turnaround = identifiedTurnaround(free);
   CostVector beta{};
   for (size_t round = 0; round < kCostTerms; ++round) {
     std::array<CostVector, kCostTerms> system{};
@@ -216,15 +222,10 @@ void CostModel::solve() {
         if (free[column])
           system[row][column] = normal_[row][column];
       system[row][row] += precision_[row];
-      target[row] = moment_[row] + precision_[row] * seedRates_[row] * unit_[row];
+      target[row] = moment_[row] - normal_[row][kUnits] * turnaround + precision_[row] * seedRates_[row] * unit_[row];
     }
-    if (free[kUnits] && free[kChunkLayers]) {
-      const double coupling = precision_[kChunkLayers] * seedUnits_;
-      system[kUnits][kChunkLayers] += coupling;
-      system[kChunkLayers][kUnits] += coupling;
-      system[kUnits][kUnits] += coupling * seedUnits_;
-      target[kUnits] += coupling * seedRates_[kChunkLayers] * unit_[kChunkLayers];
-    }
+    if (free[kChunkLayers])
+      target[kChunkLayers] -= precision_[kChunkLayers] * seedUnits_ * turnaround;
     beta = splash::solve<kCostTerms>(system, target);
     size_t negative = kCostTerms;
     for (size_t term = 0; term < kCostTerms; ++term)
@@ -240,6 +241,67 @@ void CostModel::solve() {
     else
       rates_[term] = unit_[term] > 0.0 ? 0.0 : seedRates_[term];
   }
+  // Units' unit is 1.
+  rates_[kUnits] = turnaround;
+}
+
+double CostModel::identifiedTurnaround(const std::array<bool, kCostTerms> &measured) const noexcept {
+  // Eliminates from N, m and the times' sum of squares the measured terms'
+  // columns, each that anything is left of: Units' entries then hold S and
+  // e, what no combination of the work explains of Units' sum of squares
+  // and of its products with the times, and the times' entry what the work
+  // leaves of them.
+  std::array<CostVector, kCostTerms> rest = normal_;
+  CostVector moment = moment_;
+  double times = timeSquares_;
+  size_t fitted = 0;
+  std::array<bool, kCostTerms> left = measured;
+  for (size_t pivot = 0; pivot < kCostTerms; ++pivot) {
+    if (!left[pivot] || !(rest[pivot][pivot] > 0.0))
+      continue;
+    left[pivot] = false;
+    ++fitted;
+    times -= moment[pivot] * moment[pivot] / rest[pivot][pivot];
+    for (size_t row = 0; row < kCostTerms; ++row) {
+      if (!left[row] && row != kUnits)
+        continue;
+      const double factor = rest[row][pivot] / rest[pivot][pivot];
+      for (size_t column = 0; column < kCostTerms; ++column)
+        if (left[column] || column == kUnits)
+          rest[row][column] -= factor * rest[pivot][column];
+      moment[row] -= factor * moment[pivot];
+    }
+  }
+  // u = (e + κ ŝ) / (S + κ) beside its seed's weight κ, with a standard
+  // error of σ / sqrt(S + κ), σ² the units' scatter about the work and u
+  // per command (a command's passes weigh one in all) over the commands
+  // less the rates fitted. u counts once that error is within
+  // G * kPassOverheadShare, what moves the bound by G; until then it keeps
+  // its seed and the bound stays G (owner 11-03 00:10). Units of other
+  // passes over the same work pin it down
+  // (testOnlyOtherPassesOfTheWorkTellTheTurnaround). Units whose passes
+  // their prices set, so that their pass counts follow their work, leave
+  // too little of Units for that beside the scatter of what a linear price
+  // misses, reads hidden behind compute: fitted whatever its error, u took
+  // that misfit, 25-115 ms where the profile's is 10, among 80 prompts
+  // beside a decode (testVariedPromptsLeaveTheBoundAtG) and 62-72 ms after
+  // the M6 startup as planned
+  // (testThePlannedStartupLeavesTheTurnaroundWithinTwiceItsTruth), and
+  // fitted beside the other terms 301 ms after the M6 smoke's startup, 8192
+  // rows in 12 and then 6 even passes beside compute rates seeded at zero,
+  // where the hardware's was about 10 (M6-diag B (2),
+  // testStartupUnitsOfOneShapeLeaveTheTurnaroundAtItsSeed). Every measured
+  // term stays in S whether or not its rate is held at zero: a sign held on
+  // a work term identifies no turnaround.
+  const double units = rest[kUnits][kUnits], products = moment[kUnits];
+  const double seed = seedRates_[kUnits], weight = precision_[kUnits];
+  const double estimate = (products + weight * seed) / (units + weight);
+  const double freedom = commands_ - double(fitted) - 1.0;
+  if (!(freedom > 0.0))
+    return seed;
+  const double scatter =
+      std::max(times - 2.0 * estimate * products + estimate * estimate * units, 0.0) / freedom;
+  return scatter <= resolution_ * resolution_ * (units + weight) ? std::max(estimate, 0.0) : seed;
 }
 
 CostModelStats CostModel::stats() const noexcept {
