@@ -553,7 +553,7 @@ void testWaitingPlanDoesNotIdleRunnableLanes() {
   }
   {
     test::TestKvStorage storage(72, 4096, 4);
-    storage.budgetPages = 68;
+    storage.budgetPages = 8;
     KvPool pool(storage, 0);
     test::TestKvTier tier;
     tier.transferLimit = 8;
@@ -562,28 +562,34 @@ void testWaitingPlanDoesNotIdleRunnableLanes() {
     Events events;
     engine::Engine engine(test::engineConfig({.maxContext = 102400}), cache, executor, events);
     guardReleases(storage, engine);
-    cacheBlocksUnderDiskStates(cache, 3);
-    // One command takes every page left: the short prompt's 30 rows and
-    // 2018 of the long one's, which stops inside the page that ends at its
-    // replay boundary, 2048. The short prompt's first decode needs a page;
-    // the long one's next 30 rows, up to that boundary, need none, and its
-    // command ends there while the page past it is on its way.
-    engine.submit(request(1, std::vector<uint32_t>(2060, 7)));
-    engine.submit(request(2, std::vector<uint32_t>(30, 8)));
+    cacheBlocksUnderDiskStates(cache, 6);
+    // A prompt that goes on from the first block's 32 tokens by 8 more
+    // restores that block's state from disk: it holds the block's page, and
+    // takes the page its 8 rows need as it starts (Engine::admit), so its
+    // prefill needs none. The read lands when the test says.
+    std::vector<uint32_t> continuing(KvCache::pageTokens, 900);
+    continuing.resize(KvCache::pageTokens + 8, 7);
+    engine.submit(request(1, continuing));
     double now = 1;
     static_cast<void>(engine.tick(now++));
-    static_cast<void>(engine.tick(now++));
-    require(executor.prefillRows == 2048 && pool.freePageCount() == 0 && !engine.commandInFlight(),
+    // A short prompt takes the last of the eight pages memory holds, and its
+    // first decode needs one more, which only a block's demotion frees.
+    engine.submit(request(2, std::vector<uint32_t>(30, 8)));
+    tickUntil(engine, now, [&] { return tier.demotions > 0; }, "the decode did not wait for a page");
+    require(executor.diskReads == 1 && executor.prefillRows == 30 && pool.freePageCount() == 0 &&
+                !engine.commandInFlight() && !events.outputs.contains(2),
             "fixture pages are off");
+    // Once the read has landed, the restored prompt's rows run while the
+    // decode waits for its page.
+    executor.restoreControl->ready = true;
     const uint64_t prefills = engine.snapshot().scheduler.prefillBatches;
-    static_cast<void>(engine.tick(now++));
-    require(tier.demotions > 0 && engine.commandInFlight() &&
-                engine.snapshot().scheduler.prefillBatches == prefills + 1 &&
-                !events.outputs.contains(2),
-            "the long prompt idled while a decode waited for its page");
+    tickUntil(engine, now, [&] { return engine.snapshot().scheduler.prefillBatches != prefills; },
+              "the restored prompt did not run");
+    require(engine.commandInFlight() && engine.snapshot().scheduler.prefillBatches == prefills + 1 &&
+                executor.prefillRows == 38 && !events.outputs.contains(2),
+            "the restored prompt idled while a decode waited for its page");
     runWithTransfers(engine, tier, now, [&] { return idle(engine); });
-    require(events.completedCount == 2 && events.failedCount == 0 &&
-                executor.prefillRows == 2090,
+    require(events.completedCount == 2 && events.failedCount == 0 && executor.prefillRows == 38,
             "the lanes did not finish");
   }
 }
