@@ -2094,6 +2094,101 @@ void testAPendingRefusalHoldsItsClaimForTheWaitLimit() {
   require(!config.governor->ledger().claimWaiting(), "the claim held its room past the wait limit");
 }
 
+// The wait limit bounds what the claim holds whatever its retries find
+// (amend/M.md B14): a lane refused pages that never land, whose wait's
+// deadline another lane's end renews, goes on retrying past the limit from
+// its first pending refusal, and its claim holds no room after a retry
+// that is pending again.
+void testARetryPastTheWaitLimitHoldsNothing() {
+  test::TestKvStorage storage(16, 4096, 4);
+  KvPool pool(storage, 0);
+  test::TestKvTier tier;
+  tier.transferLimit = 8;
+  tier.capacity = 8;
+  engine::Cache cache(pool, &tier, test::ampleDiskBudget());
+  Executor executor;
+  Events events;
+  const EngineConfig config = test::engineConfig({.maxContext = 102400});
+  engine::Engine engine(config, cache, executor, events);
+  guardReleases(storage, engine);
+  cacheBlocksUnderDiskStates(cache, 6);
+  storage.growthBlocked = true;
+  EngineRequest lane = request(1, std::vector<uint32_t>(161, 7));
+  lane.deadlineMilliseconds = 1e9;
+  engine.submit(std::move(lane));
+  static_cast<void>(engine.tick(1));
+  require(tier.demotions == 3 && config.governor->ledger().claimWaiting(),
+          "the lane refused pages on their way back did not wait on its claim");
+  // The demotions never land. Another lane starts and ends before the
+  // limit, which renews the waiting lane's deadline at its next refusal.
+  EngineRequest other = request(2, std::vector<uint32_t>(1, 3));
+  other.deadlineMilliseconds = 1e9;
+  engine.submit(std::move(other));
+  static_cast<void>(engine.tick(29'000));
+  engine.cancel(2);
+  static_cast<void>(engine.tick(29'001));
+  static_cast<void>(engine.tick(29'002));
+  static_cast<void>(engine.tick(1 + kResourceWaitTimeoutMilliseconds + 500));
+  require(events.failedCount == 0 && !config.governor->ledger().claimWaiting(),
+          "a retry past the wait limit from the first pending refusal held its room again");
+}
+
+// A start refused memory on its way back keeps the time of its first
+// pending refusal while a pass leaves it waiting for scheduling (deferWait),
+// which bounds what its claim holds (amend/M.md B14): queued while a
+// Foreground lane runs and refused again after it ended, its claim holds no
+// room past that limit from its first refusal.
+void testAStartQueuedBetweenRefusalsHoldsFromTheFirst() {
+  test::TestKvStorage storage(32, 4096, 4);
+  KvPool pool(storage, 0);
+  test::TestKvTier tier;
+  tier.transferLimit = 8;
+  tier.capacity = 16;
+  engine::Cache cache(pool, &tier, test::ampleDiskBudget());
+  Executor executor;
+  Events events;
+  const EngineConfig config = test::engineConfig({.maxContext = 102400});
+  engine::Engine engine(config, cache, executor, events);
+  guardReleases(storage, engine);
+  // The chain the start restores, on disk, and cached blocks whose eviction
+  // starts demotions; no free page, no extent more.
+  const std::vector<uint32_t> prompt(129, 17);
+  cache.beginRequest(999);
+  require(cache.ensureTokens(999, 128).granted(), "fixture KV failed");
+  demoteState(cache, test::publishBlocks(cache, 999, prompt, 128));
+  cache.endRequest(999);
+  for (int page = 0; page < 4; ++page) {
+    require(cache.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::InUse).madeProgress,
+            "fixture KV did not demote");
+    tier.complete();
+    static_cast<void>(cache.pollTransfers());
+  }
+  cacheBlocksUnderDiskStates(cache, 6);
+  storage.growthBlocked = true;
+  const KvPageAcquisition held = pool.acquirePages(pool.freePageCount());
+  EngineRequest start = request(1, prompt);
+  start.deadlineMilliseconds = 1e9;
+  engine.submit(std::move(start));
+  static_cast<void>(engine.tick(1));
+  require(held.granted() && tier.demotions != 0 && config.governor->ledger().claimWaiting() &&
+              !engine.snapshot().activeRequests.empty() &&
+              engine.snapshot().activeRequests.front().phase == Phase::WaitingResources,
+          "the start was not refused the pages of its chain while demotions are in flight");
+  // A Foreground lane starts, and the start waits for scheduling below it
+  // until it ends; then it is refused again.
+  EngineRequest foreground = request(2, std::vector<uint32_t>(1, 3));
+  foreground.priority = RequestPriority::Foreground;
+  foreground.deadlineMilliseconds = 1e9;
+  engine.submit(std::move(foreground));
+  static_cast<void>(engine.tick(2));
+  static_cast<void>(engine.tick(4'999));
+  engine.cancel(2);
+  static_cast<void>(engine.tick(5'000));
+  static_cast<void>(engine.tick(1 + kResourceWaitTimeoutMilliseconds + 500));
+  require(events.failedCount == 0 && !config.governor->ledger().claimWaiting(),
+          "a start queued between pending refusals held its room past the wait limit from its first");
+}
+
 // Borrowed 3(e): a burst of completions keeps write-behind bounded and delays
 // no decode command. Three requests that resume one cached prompt end
 // within seconds of each other beside a lane that decodes, each leaving a
@@ -2159,6 +2254,8 @@ void testCompletionBurstKeepsWriteBehindBounded() {
 std::span<const test::TestCase> diskTests() {
   static constexpr test::TestCase kTests[] = {
       {"testAPendingRefusalHoldsItsClaimForTheWaitLimit", testAPendingRefusalHoldsItsClaimForTheWaitLimit},
+      {"testARetryPastTheWaitLimitHoldsNothing", testARetryPastTheWaitLimitHoldsNothing},
+      {"testAStartQueuedBetweenRefusalsHoldsFromTheFirst", testAStartQueuedBetweenRefusalsHoldsFromTheFirst},
       {"testDiskKvPrefixIsRestoredBeforeTheLaneRuns", testDiskKvPrefixIsRestoredBeforeTheLaneRuns},
       {"testSkipCacheCandidateIsNotProbed", testSkipCacheCandidateIsNotProbed},
       {"testRefusedPrefixRestorePreemptsLowerResident", testRefusedPrefixRestorePreemptsLowerResident},

@@ -241,17 +241,18 @@ void Engine::syncClaims(double now) {
   MemoryLedger &ledger = governor().ledger();
   const std::optional<RequestPriority> tier = suspendedTier();
   const bool draining = drainingForRecovery();
-  for (const auto &[_, active] : requests_) {
+  for (auto &[_, active] : requests_) {
     if (!active.claim.id)
       continue;
-    const ResourceWait &wait = active.resourceWait;
+    ResourceWait &wait = active.resourceWait;
     const bool retried = active.lane ? !belowRunnable(active)
                                      : admissionTries(active, tier, draining) && !holdsBack(active.heldBehind);
     const double deadline = resourceDeadline(active);
+    wait.holdEnded = (wait.pendingSinceMilliseconds &&
+                      now >= *wait.pendingSinceMilliseconds + config_.resourceWaitTimeoutMilliseconds) ||
+                     (deadline > 0.0 && now >= deadline);
     const bool waiting = !active.finalized && wait.pending && !wait.diskQuota && wait.pendingSinceMilliseconds &&
-                         retried &&
-                         now < *wait.pendingSinceMilliseconds + config_.resourceWaitTimeoutMilliseconds &&
-                         (deadline <= 0.0 || now < deadline);
+                         retried && !wait.holdEnded;
     if (ledger.claim(active.claim.id).waiting != waiting)
       ledger.setWaiting(active.claim.id, waiting);
   }
@@ -485,8 +486,13 @@ void Engine::noteRefusal(Request &active, double now, const Denial &denial) noex
 
 void Engine::deferWait(Request &active) noexcept {
   ResourceWait kept;
+  // A start refused memory keeps when its wait began, and when its claim
+  // first waited for memory on its way back, which bounds what that claim
+  // holds (amend/M.md B14).
   if (active.refusedResources) {
     kept.startedMilliseconds = active.resourceWait.startedMilliseconds;
+    kept.pendingSinceMilliseconds = active.resourceWait.pendingSinceMilliseconds;
+    kept.holdEnded = active.resourceWait.holdEnded;
     kept.admittedBefore = active.resourceWait.admittedBefore;
   }
   active.resourceWait = kept;

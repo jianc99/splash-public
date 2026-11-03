@@ -334,6 +334,9 @@ private:
     // claim holds room for it from there for the resource wait limit
     // (syncClaims), however long it waited for anything else before.
     std::optional<double> pendingSinceMilliseconds;
+    // That limit, or its wait's deadline, has passed: its claim may go on
+    // waiting but holds nothing, a retry's refusal too (syncClaims).
+    bool holdEnded = false;
     // It waits for the SSD cache's quota of active KV, which other requests'
     // active KV holds, rather than for memory.
     bool diskQuota = false;
@@ -1031,8 +1034,9 @@ private:
   // wait limit from when its refusals began waiting
   // (ResourceWait::pendingSinceMilliseconds) and within its wait's deadline
   // (resourceDeadline). A waiting claim holds room against claims ranked
-  // below it (amend/M.md B14); a wait for the SSD cache's quota is no
-  // memory claim.
+  // below it (amend/M.md B14); past that limit or deadline it holds none,
+  // whatever its retries find (ResourceWait::holdEnded); a wait for the SSD
+  // cache's quota is no memory claim.
   void syncClaims(double nowMilliseconds);
   // What copies ahead are worth now (WriteBehind::run): none unless a
   // recent free() reached cache a copy would have let go at once

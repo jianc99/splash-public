@@ -124,6 +124,10 @@ auto Engine::allocate(Attempt &&attempt, const ClaimSpec &spec, bool frees)
     const FreeResult freed = governor.free(claim.id, need);
     ++ledgerChanges_;
     denial.pending = freed.outcome == FreeOutcome::Pending;
+    // Past its hold's limit a request's claim waits holding nothing
+    // (syncClaims), whatever this retry found.
+    if (denial.pending && spec.requestId && request(spec.requestId).resourceWait.holdEnded)
+      ledger.setWaiting(claim.id, false);
     // What it freed now, the units that cost nothing among them, the
     // attempt may fit in.
     if (freed.outcome != FreeOutcome::Met && !freed.nowBytes) {
