@@ -2035,6 +2035,59 @@ void testFailedRestoreReturnsTheCommitment() {
           "the start did not run from the prefix that remained");
 }
 
+// Borrowed 3(a): a Spill lane preempted in its prompt resumes from its
+// durable prefix, never from 0, though its copies land a command late. A
+// Background prompt that has passed its first prefill checkpoint (4096
+// tokens) by two commands of a page is suspended for a Foreground start whose
+// lane the governor finds no room for, each of its copies acknowledged a tick
+// after the one it started in, and it resumes at that checkpoint or past it once
+// the room is back.
+void testPreemptedSpillPrefillResumesFromItsDurablePrefix() {
+  Spilling spill(Spilling::Governed{}, 1024, true, Spilling::Extent{4}, 0, test::commandShape(KvCache::pageTokens));
+  spill.model.memory = &spill.host.memory;
+  spill.model.admission = spill.host.governor.allocationAdmission();
+  // Each lane's state takes buffers of its own from the governor.
+  spill.model.laneFootprintBytes = 1000;
+  // Copies started before the tick before this one land now.
+  size_t landing = 0;
+  const auto tick = [&] {
+    for (size_t index = 0; index < landing; ++index)
+      if (!spill.tier.transfers[index]->finished && spill.tier.transfers[index]->submitted)
+        spill.tier.transfers[index]->ready = true;
+    landing = spill.tier.transfers.size();
+    static_cast<void>(spill.engine.tick(spill.now++));
+  };
+  const auto runUntil = [&](const std::function<bool()> &done, const char *message) {
+    for (uint32_t step = 0; step < 4000 && !done(); ++step)
+      tick();
+    require(done(), message);
+  };
+  EngineRequest background = Spilling::prompt(1, 1, 200, 4);
+  background.priority = RequestPriority::Background;
+  spill.engine.submit(std::move(background));
+  runUntil([&] { return spill.model.prefillChunks[1] == 130 && !spill.engine.commandInFlight(); },
+           "the prompt did not run 130 commands");
+  // Room for the Foreground request's states but not for its lane's: that
+  // comes only from the prompt, which yields it.
+  spill.limit(spill.held() + 200);
+  EngineRequest foreground = Spilling::prompt(2, 2, 1, 1);
+  foreground.priority = RequestPriority::Foreground;
+  spill.engine.submit(std::move(foreground));
+  runUntil([&] { return spill.events.usage.contains(2); }, "the Foreground request did not run");
+  require(spill.model.suspensions == 1, "the prompt was not suspended for the Foreground start");
+  const uint64_t restored = spill.model.restored;
+  const uint32_t commands = spill.model.prefillChunks[1];
+  spill.limit(Spilling::kGovernedLimitBytes);
+  runUntil([&] { return idle(spill.engine); }, "the requests did not end");
+  require(spill.model.resumptions == 1 && spill.model.restored - restored >= 4096,
+          "the preempted prompt did not resume from its durable prefix: it restored " +
+              std::to_string(spill.model.restored - restored) + " tokens (resume asked " +
+              std::to_string(spill.model.lastRestoredTokens) + "), and ran " +
+              std::to_string(spill.model.prefillChunks[1] - commands) + " more prefill commands");
+  require(spill.events.failedCount == 0 && spill.events.completedCount == 2 && spill.events.usage.at(1).second == 4,
+          "a request failed");
+}
+
 // Placement reads the memory there is now, not the plan's share for
 // resident KV (M-P5): a prompt whose Resident KV is past that share starts
 // Resident while the governor finds room for it beside the lanes' growth.
@@ -2272,6 +2325,7 @@ std::span<const test::TestCase> spillTests() {
       {"testUnreadableKvEndsOnlyItsLane", testUnreadableKvEndsOnlyItsLane},
       {"testProjectionClipsTheOutput", testProjectionClipsTheOutput},
       {"testFailedRestoreReturnsTheCommitment", testFailedRestoreReturnsTheCommitment},
+      {"testPreemptedSpillPrefillResumesFromItsDurablePrefix", testPreemptedSpillPrefillResumesFromItsDurablePrefix},
   };
   return kTests;
 }
