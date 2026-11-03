@@ -682,13 +682,15 @@ Cache::Walk Cache::walkFor(const VictimQuery &query) const {
   // critical pressure, nothing of certain reuse, which the walk keeps; what
   // is in use only in-service work that reaches it and the host at critical
   // pressure. A device need's unit holds many victims, so the walk leaves
-  // out what the claim may not take rather than mark it.
+  // out what the claim may not take rather than mark it. A class that may
+  // take what is of certain reuse keeps the chains the query names: a
+  // start's placement, the chain the start reuses (VictimQuery::kept).
   const bool certain = claim.cls != ClaimClass::Growth && (claim.cls != ClaimClass::Host || query.critical);
   const bool inUse = (claim.cls == ClaimClass::InService && claim.reach == ReclaimClass::InUse) ||
                      (claim.cls == ClaimClass::Host && query.critical);
   walk.scope.upTo = inUse ? ReclaimClass::InUse : ReclaimClass::Ordinary;
   walk.keepResumePoint = !certain;
-  walk.restored = certain ? nullptr : &wanted_;
+  walk.restored = certain ? query.kept : &wanted_;
   walk.timing = claim.timing == NeedTiming::Immediate ? ReclaimTiming::Immediate : ReclaimTiming::CanWait;
   // A state that needs a write frees its memory as a unit that lands later,
   // which the reclaims of an Immediate claim pass over (amend/M.md A38).

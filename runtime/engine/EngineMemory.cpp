@@ -94,15 +94,18 @@ KvMode Engine::placement(const Request &active) const {
   // Its Resident KV beside what the lanes still grow into, from what the
   // claim of its start may take for less than spilling costs it: less the
   // pages of the chain it restores that are in memory, which its start
-  // takes in place (design/M.md R5's "- held").
-  const uint64_t held =
-      active.admissionProbe && !active.skipCache
-          ? uint64_t{cache_.residentChainPages(active.admissionProbe->restoredChain())} * geometry.fullPageBytes
-          : 0;
-  const uint64_t need = (resident > held ? resident - held : 0) + laneDemandBytes();
+  // takes in place (design/M.md R5's "- held"), and the claim keeps that
+  // chain, which the start reuses as it stands.
+  RestoredChains own;
+  uint64_t held = 0;
+  if (active.admissionProbe && !active.skipCache) {
+    own.add(active.admissionProbe->restoredChain());
+    held = uint64_t{cache_.residentChainPages(active.admissionProbe->restoredChain())} * geometry.fullPageBytes;
+  }
+  const uint64_t need = resident - std::min(resident, held) + laneDemandBytes();
   ClaimSpec spec = claimFor(active, anotherResident(id) ? ClaimClass::Start : ClaimClass::InService);
   spec.benefitSeconds = spillPenaltySeconds(active);
-  return governor().available(spec, need) >= need ? KvMode::Resident : KvMode::Spill;
+  return governor().available(spec, need, &own) >= need ? KvMode::Resident : KvMode::Spill;
 }
 
 void Engine::placeCandidates(std::span<const PrefillAdmission> candidates) {

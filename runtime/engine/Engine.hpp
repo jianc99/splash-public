@@ -609,9 +609,9 @@ private:
   // less the pages in memory of the chain it restores (Cache::
   // residentChainPages), beside every lane's projected growth
   // (laneDemandBytes) is not there at a cost below what spilling costs the
-  // request (spillPenaltySeconds), as the governor finds it
-  // (MemoryGovernor::available); for every request under --kv-spill always;
-  // Resident otherwise. Correctness never depends on it.
+  // request (spillPenaltySeconds), as the governor finds it keeping that
+  // chain (MemoryGovernor::available); for every request under --kv-spill
+  // always; Resident otherwise. Correctness never depends on it.
   [[nodiscard]] KvMode placement(const Request &request) const;
   // Places every candidate whose placement is older than the memory's state
   // now (ledgerChanges_), once per candidate and state.

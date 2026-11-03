@@ -20,6 +20,7 @@
 namespace splash::engine {
 
 struct MemoryGovernorSnapshot;
+class RestoredChains;
 
 // The memory layer's policy constants. The working-set margin and the host's
 // reserves are not among them: they set the limit and gate the start
@@ -179,6 +180,10 @@ struct VictimQuery final {
   // The host lacks memory beyond its margin: a Host claim may take pool
   // units and conversions, not only cache.
   bool deficit = false;
+  // Chains a walk that may take what is of certain reuse keeps all the
+  // same: the one a start restores, which its placement leaves out of the
+  // need it asks about (Engine::placement).
+  const RestoredChains *kept = nullptr;
 };
 
 // A source of the units free() takes, on the engine thread between commands.
@@ -354,10 +359,11 @@ public:
 
   // The rule: what is taken for a claim, what is there for one, what grows.
   // `critical`: macOS's critical pressure; `deficit`: the host lacks memory
-  // past its margin.
+  // past its margin; `kept`: the chains a walk for what is there keeps
+  // (VictimQuery::kept).
   [[nodiscard]] FreeResult free(ClaimId claim, const Need &need, uint64_t freeBytes, bool critical, bool deficit);
   [[nodiscard]] uint64_t available(const ClaimSpec &spec, uint64_t enough, uint64_t freeBytes, bool critical,
-                                   bool deficit) const;
+                                   bool deficit, const RestoredChains *kept = nullptr) const;
   // One growth pass. True when a pool grew or started freeing for its
   // pending growth.
   bool grow(uint64_t freeBytes, const GrowthHost &host);

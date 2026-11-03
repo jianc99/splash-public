@@ -262,8 +262,9 @@ public:
   // allocated; failing that, a Floor or InService claim's retries pass the
   // host, and another class's claim falls short.
   [[nodiscard]] FreeResult free(ClaimId claim, const Need &need);
-  // What free() would find for such a claim, up to `enough`, taking nothing.
-  [[nodiscard]] uint64_t available(const ClaimSpec &spec, uint64_t enough) const;
+  // What free() would find for such a claim, up to `enough`, taking nothing
+  // and leaving the chains `kept` (VictimQuery::kept).
+  [[nodiscard]] uint64_t available(const ClaimSpec &spec, uint64_t enough, const RestoredChains *kept = nullptr) const;
   // Whether the host admits an allocation of the class, as its last sample
   // found: the paths that ask take no sample of their own.
   [[nodiscard]] bool admits(ClaimClass cls) const noexcept;

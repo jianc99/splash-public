@@ -710,7 +710,7 @@ FreeResult MemoryLedger::freeFor(uint32_t id, const Need &need, uint64_t freeByt
 // claim that can wait what lands and the copies its own request owes count
 // before victims, as free() counts them.
 uint64_t MemoryLedger::available(const ClaimSpec &spec, uint64_t enough, uint64_t freeBytes, bool critical,
-                                 bool deficit) const {
+                                 bool deficit, const RestoredChains *kept) const {
   const bool host = spec.cls == ClaimClass::Host;
   const uint64_t held =
       host ? 0 : plus(heldForGrowth(std::nullopt, spec.cls), heldByClaims(spec.rank, std::nullopt));
@@ -724,7 +724,7 @@ uint64_t MemoryLedger::available(const ClaimSpec &spec, uint64_t enough, uint64_
   if (less(room, held) >= enough)
     return enough;
   const VictimQuery query{.claim = &spec, .need = {.bytes = enough}, .critical = critical, .rates = &rates_,
-                          .deficit = deficit};
+                          .deficit = deficit, .kept = kept};
   const uint64_t taken = dryRun(spec, query, less(plus(enough, held), room), 0, std::nullopt).bytes;
   return std::min(enough, less(plus(room, taken), held));
 }

@@ -417,8 +417,8 @@ FreeResult MemoryGovernor::free(ClaimId claim, const Need &need) {
   return result;
 }
 
-uint64_t MemoryGovernor::available(const ClaimSpec &spec, uint64_t enough) const {
-  return ledger_.available(spec, enough, roomBytes(), hostRule_.level() == MemoryPressure::Critical, false);
+uint64_t MemoryGovernor::available(const ClaimSpec &spec, uint64_t enough, const RestoredChains *kept) const {
+  return ledger_.available(spec, enough, roomBytes(), hostRule_.level() == MemoryPressure::Critical, false, kept);
 }
 
 bool MemoryGovernor::admits(ClaimClass cls) const noexcept { return hostRule_.admits(cls, 0, false, 0); }

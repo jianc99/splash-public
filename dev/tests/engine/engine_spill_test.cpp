@@ -2185,7 +2185,7 @@ void testPlacementCountsIdleStateBuffers() {
 // find again. A conversation's next turn, its 40 pages cached in memory,
 // adds a page beside a lane in service, in a room of ten pages: it starts
 // Resident.
-void testPlacementCountsTheChainItRestoresInMemory() {
+void testPlacementBesideALaneCountsTheChainItRestores() {
   Spilling spill(Spilling::Governed{}, 1024, false);
   test::seedAsStartup(spill.engine, spill.model);
   const EngineRequest first = Spilling::prompt(1, 1, 40, 1);
@@ -2217,6 +2217,72 @@ void testPlacementCountsTheChainItRestoresInMemory() {
   require(counts.resident == 3 && counts.spill == 0 && spill.events.failedCount == 0,
           "a turn whose cached chain is in memory was placed as if it needed that memory again: " +
               std::to_string(counts.resident) + " Resident, " + std::to_string(counts.spill) + " Spill");
+}
+
+// A start's placement needs only the Resident KV the chain it restores does
+// not already hold in memory (design/M.md R5; smoke a, finding 2), and the
+// claim it weighs that against keeps the chain, which the start reuses as
+// it stands: a follow-up turn whose first 32 pages the turn before it left
+// cached in memory, its projection 37 pages, starts Resident beside room
+// for 26 pages; the same prompt with nothing cached starts Spill. A block
+// of the chain costs more to compute again than spilling costs the turn.
+// A follow-up of 56 pages on the same 32, its projection 57, beside room
+// for 20 pages, fewer than its 25 new ones and more than its Spill floor
+// (14.7 pages), starts Spill where the chain was copied ahead to a tier
+// that reads a page back in 0.1 us, so that it costs next to nothing to
+// give up.
+void testPlacementCountsTheChainItRestoresInMemory() {
+  for (const bool cached : {true, false}) {
+    Spilling spill(1024, false, 60 * 100, 0, {4}, 0, {}, {.limitBytes = Spilling::kGovernedLimitBytes}, true);
+    spill.host.governor.ledger().setRates({.prefillSecondsPerRow = 1e-3, .reuse = 1.0});
+    if (cached) {
+      spill.engine.submit(Spilling::prompt(1, 1, 32, 1));
+      spill.runUntilIdle();
+    }
+    spill.limit(spill.held() + 26 * 100);
+    spill.engine.submit(Spilling::prompt(2, 1, 36, 1));
+    spill.runUntil([&] { return std::ranges::find(spill.events.startIds, 2) != spill.events.startIds.end(); },
+                   "the turn did not start");
+    const SpillRequestsSnapshot counts = spill.engine.snapshot().spill;
+    if (cached)
+      require(counts.resident == 2 && counts.spill == 0 && spill.events.starts.back() == 32 * KvCache::pageTokens,
+              "a follow-up turn spilled though the chain it restored held its first 32 pages in memory");
+    else
+      require(counts.resident == 0 && counts.spill == 1, "a prompt with nothing cached started Resident beside room "
+                                                          "for less than its projection");
+    spill.engine.cancel(2);
+    spill.runUntilIdle();
+  }
+  {
+    Spilling spill(1024, false, 60 * 100, 0, {4}, 0, {}, {.limitBytes = Spilling::kGovernedLimitBytes}, true);
+    spill.host.governor.ledger().setRates(
+        {.prefillSecondsPerRow = 1e-3, .tierReadBytesPerSecond = 1e9, .reuse = 1.0});
+    auto states = std::make_shared<OffloadControl>();
+    states->ready = true;
+    spill.model.offloadTier = states;
+    spill.engine.submit(Spilling::prompt(1, 1, 32, 1));
+    spill.runUntilIdle();
+    const EngineRequest turn = Spilling::prompt(2, 1, 56, 1);
+    const CacheProbe probe = spill.cache.probe(turn.prompt, {});
+    require(probe.restoredChain().size() == 32, "the follow-up turn did not find its first 32 pages cached");
+    const uint64_t point = probe.restoredChain().back();
+    PersistStatus written = spill.cache.persist(point);
+    for (int step = 0; step < 8 && written != PersistStatus::Durable; ++step) {
+      spill.tier.complete();
+      static_cast<void>(spill.cache.pollTransfers());
+      written = spill.cache.persist(point);
+    }
+    require(written == PersistStatus::Durable, "the chain's point was not written ahead");
+    spill.limit(spill.held() + 20 * 100);
+    spill.engine.submit(turn);
+    spill.runUntil([&] { return std::ranges::find(spill.events.startIds, 2) != spill.events.startIds.end(); },
+                   "the turn did not start");
+    const SpillRequestsSnapshot counts = spill.engine.snapshot().spill;
+    require(counts.resident == 1 && counts.spill == 1 && counts.converted == 0,
+            "a follow-up turn started Resident on the room its own chain's copies would free");
+    spill.engine.cancel(2);
+    spill.runUntilIdle();
+  }
 }
 
 // The penalty of spilling a decoding lane counts its decode commands' hot
@@ -2275,6 +2341,7 @@ std::span<const test::TestCase> spillTests() {
       {"testPlacementNeverSpillsWhenSpillTakesMore", testPlacementNeverSpillsWhenSpillTakesMore},
       {"testAnAdmissionPlacesTheNextCandidateAgain", testAnAdmissionPlacesTheNextCandidateAgain},
       {"testPlacementCountsIdleStateBuffers", testPlacementCountsIdleStateBuffers},
+      {"testPlacementBesideALaneCountsTheChainItRestores", testPlacementBesideALaneCountsTheChainItRestores},
       {"testPlacementCountsTheChainItRestoresInMemory", testPlacementCountsTheChainItRestoresInMemory},
       {"testSpillDecodeTermIsMeasured", testSpillDecodeTermIsMeasured},
       {"testUnwritableTierKeepsRequestsResident", testUnwritableTierKeepsRequestsResident},
