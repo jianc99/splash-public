@@ -608,7 +608,10 @@ void testHostMemoryProbeIsRequired(const char *metallibPath) {
 
 // The 27B under a budget half a GiB above its weights: the weights alone fit,
 // but not with what the runtime needs beside them. Startup refuses it before
-// any weight is loaded.
+// any weight is loaded, against the bound that binds: --max-memory, or this
+// Mac's Metal budget where that is lower (a 16 GB Mac's 10.8 GiB), which
+// --max-memory can only lower. There, a --max-memory half a GiB below the
+// Metal budget binds instead.
 void testModelBeyondBudgetIsRefusedBeforeLoading(const char *metallibPath) {
   const test::TemporaryDirectory root("splash-budget");
   RuntimeResourcesConfig config = budgetConfig(metallibPath, root.path());
@@ -616,18 +619,30 @@ void testModelBeyondBudgetIsRefusedBeforeLoading(const char *metallibPath) {
                                             test::qwen3_8Vision(), model::TargetSource::Safetensors,
                                             model::VisionSource::Safetensors);
   writeCheckpoints(root.path(), config.model);
-  config.maximumMemoryBytes = model::streamableWeights(root.path(), config.model, {}).loadedBytes + kGiB / 2;
-  try {
-    auto resources = RuntimeResources::create(config, 0);
-    throw std::runtime_error("a model that cannot fit unexpectedly loaded");
-  } catch (const RuntimeResourcesError &error) {
-    require(error.failure() == RuntimeResourceFailure::EngineCapacity &&
-                error.stage() == RuntimeResourceStage::MemoryPlanning,
-            "a model that cannot fit reached the weight loader");
-    require(error.shortfall() && error.shortfall()->bound == protocol::ShortfallBound::MaxMemory &&
-                error.shortfall()->budgetBytes == config.maximumMemoryBytes &&
-                error.shortfall()->requiredBytes > config.maximumMemoryBytes,
-            "the refusal of a model beyond --max-memory lost what it needed against it");
+  const uint64_t device =
+      EngineMemoryPolicy::hardBudgetBytes(metal::probeDeviceCapabilities().recommendedMaxWorkingSetBytes, 0);
+  const uint64_t above = model::streamableWeights(root.path(), config.model, {}).loadedBytes + kGiB / 2;
+  std::vector<uint64_t> limits{above};
+  if (above >= device)
+    limits.push_back(device - kGiB / 2);
+  for (const uint64_t limit : limits) {
+    config.maximumMemoryBytes = limit;
+    const bool maxMemory = limit <= device;
+    const uint64_t budget = maxMemory ? limit : device;
+    try {
+      auto resources = RuntimeResources::create(config, 0);
+      throw std::runtime_error("a model that cannot fit unexpectedly loaded");
+    } catch (const RuntimeResourcesError &error) {
+      require(error.failure() == RuntimeResourceFailure::EngineCapacity &&
+                  error.stage() == RuntimeResourceStage::MemoryPlanning,
+              "a model that cannot fit reached the weight loader");
+      require(error.shortfall() &&
+                  error.shortfall()->bound ==
+                      (maxMemory ? protocol::ShortfallBound::MaxMemory : protocol::ShortfallBound::DeviceMemory) &&
+                  error.shortfall()->budgetBytes == budget && error.shortfall()->requiredBytes > budget,
+              maxMemory ? "the refusal of a model beyond --max-memory lost what it needed against it"
+                        : "the refusal of a model beyond this Mac's Metal budget lost what it needed against it");
+    }
   }
 }
 
