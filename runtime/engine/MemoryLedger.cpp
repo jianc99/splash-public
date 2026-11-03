@@ -700,9 +700,10 @@ uint64_t MemoryLedger::available(const ClaimSpec &spec, uint64_t enough, uint64_
 }
 
 // R3 with amend/M.md B4. Pending growth grows once its bytes are free for
-// it, on the host's credit of what its victims freed as their transfers
-// landed (the host's footprint is then where it was), and stays pending
-// while the host refuses it. Free room beyond what the waiting claims, the
+// it, taking what its victims left once they landed as a claim's retry
+// takes it, on the host's credit of what its victims freed (the host's
+// footprint is then where it was), and stays pending while the host
+// refuses it. Free room beyond what the waiting claims, the
 // lanes' projected growth and every pending growth hold goes to the pools,
 // the one whose next unit is worth most first, while the host admits each
 // unit and, once claims take a pool's units, while a unit is worth its
@@ -760,14 +761,32 @@ bool MemoryLedger::grow(uint64_t freeBytes, const GrowthHost &host) {
       continue;
     if (account.pendingGrowth) {
       const uint64_t others = less(pendingGrowthBytes(), account.pendingGrowth);
-      if (less(less(freeBytes, grownBytes), plus(plus(others, waitingBytes), laneDemandBytes_)) >=
-          account.pendingGrowth) {
-        // Of its victims' bytes at most what is in flight now has not landed.
-        const uint64_t landed = less(account.pendingLaterBytes, returning().landingBytes);
-        if (growUnit(index, landed, "into its pending growth")) {
-          account.pendingGrowth = account.pendingLaterBytes = 0;
-          acted = true;
-        }
+      // Of its victims' bytes at most what is in flight now has not landed.
+      const uint64_t landed = less(account.pendingLaterBytes, returning().landingBytes);
+      bool met = less(less(freeBytes, grownBytes), plus(plus(others, waitingBytes), laneDemandBytes_)) >=
+                 account.pendingGrowth;
+      uint64_t credit = landed;
+      // Once they have landed, it takes what they left, as a claim's retry
+      // does: the extents a demotion's landing empties, which only a take
+      // releases, and the steps of its units still to go, within the
+      // unit's worth beyond its cycle; what that starts lands for a later
+      // pass.
+      if (!met && landed >= account.pendingLaterBytes) {
+        const Candidate next = candidate(index);
+        const ClaimId claim = open({.cls = ClaimClass::Growth,
+                                    .holdSeconds = kValueHorizonSeconds,
+                                    .benefitSeconds = std::max(0.0, next.benefit - next.cycle)});
+        const FreeResult freed = freeFor(claim.value, {.bytes = account.pendingGrowth}, less(freeBytes, grownBytes),
+                                         false, false, AccountId{static_cast<uint8_t>(index)}, false);
+        close(claim);
+        met = freed.outcome == FreeOutcome::Met;
+        credit = std::max(credit, freed.nowBytes);
+        if (freed.outcome == FreeOutcome::Pending)
+          account.pendingLaterBytes = freed.laterBytes;
+      }
+      if (met && growUnit(index, credit, "into its pending growth")) {
+        account.pendingGrowth = account.pendingLaterBytes = 0;
+        acted = true;
       }
       continue;
     }

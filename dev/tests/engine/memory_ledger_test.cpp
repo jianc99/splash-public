@@ -76,11 +76,17 @@ public:
       memory_->release(name_, bytes);
     return {.nowBytes = bytes};
   }
-  // The units taken to land later free their memory.
+  // The units taken to land later free their memory. With
+  // landsIntoExtents, as the cache's demotions do, a landing only empties
+  // the page's extent: a unit of its own that costs nothing, which a later
+  // take releases.
   void land() {
-    for (const Victim &unit : landing)
-      if (memory_ && unit.bytes)
+    for (const Victim &unit : landing) {
+      if (landsIntoExtents)
+        units.push_back(Victim{.key = 1000 + unit.key, .bytes = unit.bytes});
+      else if (memory_ && unit.bytes)
         memory_->release(name_, unit.bytes);
+    }
     landing.clear();
   }
 
@@ -88,6 +94,7 @@ public:
   std::vector<uint64_t> taken;
   std::vector<Victim> landing;
   uint64_t unsizedBytes = 0;
+  bool landsIntoExtents = false;
   mutable uint32_t peeks = 0;
 
 private:
@@ -559,6 +566,33 @@ void testPendingGrowthGrowsOnItsLandedVictims() {
   require(experts.units() == 4 && fixture.governor->snapshot().reservedBytes == 0 &&
               fixture.memory.total() == 7680 * kMiB,
           "the pending growth did not grow on its landed victims' credit");
+}
+
+// Pending growth takes what its victims leave once they land: a demotion's
+// landing only empties its page's extent, which the cache releases when a
+// claim takes it (Cache.cpp's landing drops the page into its extent), so the
+// growth frees that extent for itself at a later pass and grows into it.
+void testPendingGrowthTakesWhatItsLandedVictimsLeave() {
+  Fixture fixture(host(32 * kGiB), 8 * kGiB);
+  FakeElasticPool experts("experts", fixture.memory, kGiB, 2, 4, 5, 3, 0.25, 60.0);
+  TestSource cache("cache", &fixture.memory);
+  cache.landsIntoExtents = true;
+  fixture.memory.hold("cache", 2 * kGiB);
+  fixture.memory.hold("weights", 2816 * kMiB);
+  cache.units = {unit(1, kGiB, 0.5, true)};
+  MemoryLedger &ledger = fixture.ledger();
+  ledger.addSource(cache);
+  ledger.addPool(experts);
+  serve(ledger, experts, 400.0, 0.0, 10.0);
+  static_cast<void>(fixture.pass(10.5));
+  require(cache.taken == std::vector<uint64_t>{1} && fixture.governor->snapshot().reservedBytes == kGiB,
+          "the displacement did not pend on its demotion");
+  cache.land();
+  for (double seconds = 11.0; seconds <= 13.0; seconds += 0.5)
+    static_cast<void>(fixture.pass(seconds));
+  require(experts.units() == 4 && fixture.governor->snapshot().reservedBytes == 0 &&
+              cache.taken == std::vector<uint64_t>{1, 1001},
+          "the pending growth did not take the extent its landed victim emptied and grow into it");
 }
 
 // A claim that takes a pool's pending growth cancels it: the pool keeps its
@@ -2076,6 +2110,7 @@ std::span<const test::TestCase> ledgerTests() {
       {"testAMetNeedKeepsTheWaitAShortOneEndsIt", testAMetNeedKeepsTheWaitAShortOneEndsIt},
       {"testPendingGrowthIsReservedAgainstOthers", testPendingGrowthIsReservedAgainstOthers},
       {"testPendingGrowthGrowsOnItsLandedVictims", testPendingGrowthGrowsOnItsLandedVictims},
+      {"testPendingGrowthTakesWhatItsLandedVictimsLeave", testPendingGrowthTakesWhatItsLandedVictimsLeave},
       {"testTakenPendingGrowthIsCancelled", testTakenPendingGrowthIsCancelled},
       {"testOneHostRule", testOneHostRule},
       {"testBandWaivedWhenTheHostClaimFindsNothing", testBandWaivedWhenTheHostClaimFindsNothing},
