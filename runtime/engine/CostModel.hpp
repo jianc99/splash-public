@@ -4,8 +4,9 @@
 // that ran. A unit's price is a rate per unit of each of seven quantities of
 // its work (model::CommandWork) summed; the rates are a decayed ridge fit of
 // the units' measured times on their realized work, toward a seed of weak
-// priors, no rate below zero, the turnaround at its seed until the units
-// pin it down as finely as the bound it sets can tell.
+// priors, no rate below zero, the turnaround at its seed until units of
+// other pass counts over like work pin it down as finely as the bound it
+// sets can tell.
 
 #include "model/CommandCost.hpp"
 #include "model/Model.hpp"
@@ -74,9 +75,11 @@ public:
   // 0.344, 0.335 and 0.345 at 0.75, 0.9, 0.95, 0.97 and 0.99: 0.95-0.99 lie
   // within 0.01 of the least, which goes to the largest decay. The runs hold
   // no shift of the rates that would tell those apart (0.995 and 1 would lie
-  // within it too), and their median errors favour smaller decays (0.056 at
-  // 0.75, 0.072 at 0.9, 0.082 at 0.99); at 0.99 the median is 0.03-0.15 on
-  // every run.
+  // within it too), and their median errors favour smaller decays (0.057 at
+  // 0.75, 0.072 at 0.9, 0.082 at 0.99); at 0.99 the median is 0.02-0.15 on
+  // every run. The sums then hold about a hundred commands, ten times 0.9's
+  // window; the turnaround's gate takes no credit for their number
+  // (identifiedTurnaround).
   static constexpr double kDecay = 0.99;
   static constexpr size_t kErrorSamples = 256;
   // The second prefill warm-up's rows, beside the first's chunk: the second
@@ -121,8 +124,10 @@ public:
   // below zero.
   [[nodiscard]] double price(const model::CommandWork &expected) const noexcept;
   // The rate of Units: what every command or pass costs whatever its work.
-  // Its seed until the units pin it down to within G * kPassOverheadShare,
-  // what moves the bound by G, then what they say of it (solve).
+  // Its seed until units of other pass counts over like work pin it down to
+  // within G * kPassOverheadShare at one command's worth of their evidence,
+  // what moves the bound by G, then what they say of it
+  // (identifiedTurnaround).
   [[nodiscard]] double turnaround() const noexcept;
   // The rate of WeightReadBytes: what a byte of weights a unit read costs,
   // which price charges the expected bytes at once scaled by their realized
@@ -152,11 +157,12 @@ private:
 
   // Decayed sums of w·x̂·x̂ᵀ, w·x̂·t and w·t² over the terms normalized by
   // `unit_`, each term's first nonzero quantity (a term without one keeps
-  // its seed and stays out of the system), and of w, the commands the units
-  // make up.
+  // its seed and stays out of the system), of w, the commands the units
+  // make up, and of w·x̂ and w·t, what a constant per command multiplies
+  // (identifiedTurnaround).
   std::array<CostVector, kCostTerms> normal_{};
-  CostVector moment_{}, unit_{}, seedRates_{}, precision_{}, rates_{};
-  double timeSquares_ = 0.0, commands_ = 0.0;
+  CostVector moment_{}, unit_{}, seedRates_{}, precision_{}, rates_{}, sums_{};
+  double timeSquares_ = 0.0, commands_ = 0.0, times_ = 0.0;
   // G * kPassOverheadShare: the bound, max(G, turnaround /
   // kPassOverheadShare), moves by G for this much turnaround past it.
   double resolution_;

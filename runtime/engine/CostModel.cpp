@@ -122,7 +122,8 @@ void CostModel::seed(std::span<const model::CommandSample> warmups, model::SsdRe
   }
   normal_ = {};
   moment_ = {};
-  timeSquares_ = commands_ = 0.0;
+  sums_ = {};
+  timeSquares_ = commands_ = times_ = 0.0;
   rates_ = seedRates_;
 }
 
@@ -190,9 +191,11 @@ void CostModel::observe(const model::CommandWork &realized, const model::Command
     for (size_t column = 0; column < kCostTerms; ++column)
       normal_[row][column] = decay * normal_[row][column] + normalized[row] * normalized[column] / weight;
     moment_[row] = decay * moment_[row] + normalized[row] * time / weight;
+    sums_[row] = decay * sums_[row] + normalized[row];
   }
   timeSquares_ = decay * timeSquares_ + time * time / weight;
   commands_ = decay * commands_ + weight;
+  times_ = decay * times_ + time;
   ++samples_;
   solve();
 }
@@ -200,13 +203,14 @@ void CostModel::observe(const model::CommandWork &realized, const model::Command
 void CostModel::age(uint32_t commands) {
   const double decay = std::pow(decay_, commands);
   for (double *sum :
-       {&realizedWeight_, &expectedWeight_, &realizedSpilled_, &expectedSpilled_, &timeSquares_, &commands_})
+       {&realizedWeight_, &expectedWeight_, &realizedSpilled_, &expectedSpilled_, &timeSquares_, &commands_, &times_})
     *sum *= decay;
   for (CostVector &row : normal_)
     for (double &sum : row)
       sum *= decay;
-  for (double &sum : moment_)
-    sum *= decay;
+  for (CostVector *sums : {&moment_, &sums_})
+    for (double &sum : *sums)
+      sum *= decay;
   solve();
 }
 
@@ -259,53 +263,77 @@ void CostModel::solve() {
 }
 
 double CostModel::identifiedTurnaround(const std::array<bool, kCostTerms> &measured) const noexcept {
-  // Eliminates from N, m and the times' sum of squares the measured terms'
-  // columns, each that anything is left of: Units' entries then hold S and
-  // e, what no combination of the work explains of Units' sum of squares
-  // and of its products with the times, and the times' entry what the work
-  // leaves of them.
-  std::array<CostVector, kCostTerms> rest = normal_;
-  CostVector moment = moment_;
+  // Eliminates from N, m and the times' sum of squares, bordered by a
+  // constant per command (its sums commands_, sums_ and times_), that
+  // constant's column and then the measured terms', each that anything is
+  // left of: Units' entries then hold S and e, what neither a constant per
+  // command nor any combination of the work explains of Units' sum of
+  // squares and of its products with the times, and the times' entry what
+  // those leave of them. A command's Units are its passes, so S is the
+  // spread of the pass counts beyond their mean and the work: units all in
+  // one pass count, whatever their work, leave none.
+  constexpr size_t kCommand = kCostTerms, kBordered = kCostTerms + 1;
+  std::array<std::array<double, kBordered>, kBordered> rest{};
+  std::array<double, kBordered> moment{};
+  for (size_t row = 0; row < kCostTerms; ++row) {
+    std::copy(normal_[row].begin(), normal_[row].end(), rest[row].begin());
+    rest[row][kCommand] = rest[kCommand][row] = sums_[row];
+    moment[row] = moment_[row];
+  }
+  rest[kCommand][kCommand] = commands_;
+  moment[kCommand] = times_;
   double times = timeSquares_;
   size_t fitted = 0;
-  std::array<bool, kCostTerms> left = measured;
-  for (size_t pivot = 0; pivot < kCostTerms; ++pivot) {
+  std::array<bool, kBordered> left{};
+  std::copy(measured.begin(), measured.end(), left.begin());
+  left[kCommand] = true;
+  for (size_t step = 0; step < kBordered; ++step) {
+    const size_t pivot = step ? step - 1 : kCommand;
     if (!left[pivot] || !(rest[pivot][pivot] > 0.0))
       continue;
     left[pivot] = false;
     ++fitted;
     times -= moment[pivot] * moment[pivot] / rest[pivot][pivot];
-    for (size_t row = 0; row < kCostTerms; ++row) {
+    for (size_t row = 0; row < kBordered; ++row) {
       if (!left[row] && row != kUnits)
         continue;
       const double factor = rest[row][pivot] / rest[pivot][pivot];
-      for (size_t column = 0; column < kCostTerms; ++column)
+      for (size_t column = 0; column < kBordered; ++column)
         if (left[column] || column == kUnits)
           rest[row][column] -= factor * rest[pivot][column];
       moment[row] -= factor * moment[pivot];
     }
   }
-  // u = (e + κ ŝ) / (S + κ) beside its seed's weight κ, with a standard
-  // error of σ / sqrt(S + κ), σ² the units' scatter about the work and u
-  // per command (a command's passes weigh one in all) over the commands
-  // less the rates fitted. u counts once that error is within
+  // u = (e + κ ŝ) / (S + κ) beside its seed's weight κ: what other pass
+  // counts over the same work say of it, units of one pass count nothing
+  // (owner 11-03 00:10). It counts once σ sqrt(n / (S + κ)) is within
   // G * kPassOverheadShare, what moves the bound by G; until then it keeps
-  // its seed and the bound stays G (owner 11-03 00:10). Units of other
-  // passes over the same work pin it down
-  // (testOnlyOtherPassesOfTheWorkTellTheTurnaround). Units whose passes
-  // their prices set, so that their pass counts follow their work, leave
-  // too little of Units for that beside the scatter of what a linear price
-  // misses, reads hidden behind compute: fitted whatever its error, u took
-  // that misfit, 25-115 ms where the profile's is 10, among 80 prompts
-  // beside a decode (testVariedPromptsLeaveTheBoundAtG) and 62-72 ms after
-  // the M6 startup as planned
-  // (testThePlannedStartupLeavesTheTurnaroundWithinTwiceItsTruth), and
-  // fitted beside the other terms 301 ms after the M6 smoke's startup, 8192
-  // rows in 12 and then 6 even passes beside compute rates seeded at zero,
-  // where the hardware's was about 10 (M6-diag B (2),
-  // testStartupUnitsOfOneShapeLeaveTheTurnaroundAtItsSeed). Every measured
-  // term stays in S whether or not its rate is held at zero: a sign held on
-  // a work term identifies no turnaround.
+  // its seed and the bound stays G. σ² is the units' scatter about the work
+  // and u per command (a command's passes weigh one in all) over the
+  // commands less the rates fitted, the constant among them, and n the
+  // commands: the standard error of one command's worth of the evidence,
+  // S / n, not of all n commands'. What a linear price misses of the units,
+  // reads hidden behind compute, is no noise that more commands average
+  // away. Units in the passes their prices set, whose pass counts follow
+  // their work, leave it in what their pass counts say beyond the work
+  // however many run, and a standard error of all of them took it for u as
+  // the decayed sums grew (kDecay 0.99 keeps about a hundred commands, 0.9
+  // ten): 24 and 47 ms where the profile's is 10 after 8 and 23 commands,
+  // after the M6 startup as planned
+  // (testThePlannedStartupLeavesTheTurnaroundWithinTwiceItsTruth) and among
+  // 80 prompts beside a decode (testVariedPromptsLeaveTheBoundAtG). Units of
+  // other passes over the same work pin it down
+  // (testOnlyOtherPassesOfTheWorkTellTheTurnaround); units of one pass count
+  // and varied work, whose constant per command holds as much of what the
+  // price misses as of u, do not
+  // (testAMisfitOfOnePassCountDoesNotTellTheTurnaround). Fitted whatever its
+  // error, u took that misfit, 25-115 ms among those 80 prompts and 62-72 ms
+  // after that startup, and fitted beside the other terms 301 ms after the
+  // M6 smoke's startup, 8192 rows in 12 and then 6 even passes beside
+  // compute rates seeded at zero, where the hardware's was about 10 (M6-diag
+  // B (2), testStartupUnitsOfOneShapeLeaveTheTurnaroundAtItsSeed). Every
+  // measured term stays in S whether or not its rate is held at zero: a
+  // sign held on a work term identifies no turnaround.
   const double units = rest[kUnits][kUnits], products = moment[kUnits];
   const double seed = seedRates_[kUnits], weight = precision_[kUnits];
   const double estimate = (products + weight * seed) / (units + weight);
@@ -314,7 +342,7 @@ double CostModel::identifiedTurnaround(const std::array<bool, kCostTerms> &measu
     return seed;
   const double scatter =
       std::max(times - 2.0 * estimate * products + estimate * estimate * units, 0.0) / freedom;
-  return scatter <= resolution_ * resolution_ * (units + weight) ? std::max(estimate, 0.0) : seed;
+  return scatter * commands_ <= resolution_ * resolution_ * (units + weight) ? std::max(estimate, 0.0) : seed;
 }
 
 CostModelStats CostModel::stats() const noexcept {

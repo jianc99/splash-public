@@ -299,6 +299,58 @@ void testOnlyOtherPassesOfTheWorkTellTheTurnaround() {
               " ms, not their " + std::to_string(1.25 * kTruth[0]));
 }
 
+// Units of one pass count do not tell the turnaround, however many commands
+// they make up; units of two pass counts over like work do. Commands of
+// varied work, each in 4 passes, whose compute hides a fifth of the lesser
+// of their reads and their compute, which no linear price holds: their
+// constant per command, four turnarounds, holds that misfit as much as u.
+// Taken out beside the work, it leaves their Units nothing, and the
+// turnaround stays at its seed through 400 of them (before, the gate took
+// the misfit for u: 4-28 ms at the 7th to 10th, and from the 30th on
+// 126-220 ms against the truth's 60). Commands of that kind, each run in 4
+// and again in 24 passes, tell it: within 15 % of the truth from the tenth
+// on (within 11 % over 40 seeds of these draws). The constant alone holds
+// the first part, whatever the gate asks; the gate's standard error at one
+// command's worth is what testVariedPromptsLeaveTheBoundAtG and
+// testThePlannedStartupLeavesTheTurnaroundWithinTwiceItsTruth hold to.
+void testAMisfitOfOnePassCountDoesNotTellTheTurnaround() {
+  CostModel cost = seeded();
+  std::mt19937_64 random(5);
+  std::uniform_int_distribution<uint32_t> rows(512, 4 * kChunk), position(0, 65536);
+  std::uniform_int_distribution<uint64_t> weights(0, 48'000'000'000);
+  const auto measured = [](const model::CommandWork &work) {
+    const CostVector terms = costTerms(work);
+    double compute = 0.0;
+    for (const CostTerm term :
+         {CostTerm::ChunkLayers, CostTerm::RowLayers, CostTerm::AttentionPairs, CostTerm::IndexPairs})
+      compute += kTruth[static_cast<size_t>(term)] * terms[static_cast<size_t>(term)];
+    return truth(work) - 0.2 * std::min(kTruth[kWeightReads] * terms[kWeightReads], compute);
+  };
+  const auto run = [&](std::span<const uint32_t> counts) {
+    const uint32_t r = rows(random), p = position(random);
+    const uint64_t w = weights(random);
+    for (const uint32_t passes : counts)
+      for (uint32_t pass = 0; pass < passes; ++pass) {
+        const model::CommandWork work = unit(r, p, w, 0, passes);
+        cost.observe(work, work, measured(work), 1.0 / passes);
+      }
+  };
+  constexpr std::array<uint32_t, 1> kOne{4};
+  for (uint32_t command = 0; command < 400; ++command) {
+    run(kOne);
+    require(cost.stats().rates[0] < 1e-6,
+            "after " + std::to_string(command + 1) + " commands in 4 passes the turnaround was " +
+                std::to_string(cost.stats().rates[0]) + " ms");
+  }
+  constexpr std::array<uint32_t, 2> kTwo{4, 24};
+  for (uint32_t command = 0; command < 20; ++command) {
+    run(kTwo);
+    require(command < 9 || relative(cost.stats().rates[0], kTruth[0]) < 0.15,
+            "after " + std::to_string(command + 1) + " commands in 4 and in 24 passes the turnaround was " +
+                std::to_string(cost.stats().rates[0]) + " ms, not the truth's " + std::to_string(kTruth[0]));
+  }
+}
+
 // (3) The model's expected bytes price at once: 30 % more of them adds their
 // rate times the difference, before any unit trains.
 void testMoreExpectedBytesPriceAtOnce() {
@@ -322,9 +374,12 @@ void testAStallMovesTheFitAsTwiceItsPrice() {
           "a stall moved the fit beyond twice its price");
 }
 
-// (5) A command in 24 passes, each a 24th of it, moves the fit as the whole
-// command does: varied commands at 1.2 times the truth, run in passes or
-// whole, price a whole command alike, and as they ran.
+// (5) A command in 24 or 12 passes, each pass its share of it, moves the
+// fit as the whole command does: varied commands at 1.2 times the truth,
+// run in passes or whole, price a whole command alike, and as they ran.
+// Passes of two counts tell the turnaround, which a whole command pays once
+// (owner 11-03 00:10); all in 24 they would leave it at its seed, their 24
+// a command in what their work costs, and price a whole command 12 % over.
 void testPassesMoveTheFitAsTheirCommand() {
   CostModel passed = seeded(), whole = seeded();
   std::mt19937_64 random(11);
@@ -333,8 +388,10 @@ void testPassesMoveTheFitAsTheirCommand() {
   for (uint32_t command = 0; command < 30; ++command) {
     const uint32_t r = rows(random), p = position(random);
     const uint64_t w = weights(random);
-    for (uint32_t pass = 0; pass < 24; ++pass)
-      passed.observe(unit(r, p, w, 0, 24), unit(r, p, w, 0, 24), 1.2 * truth(unit(r, p, w, 0, 24)), 1.0 / 24);
+    const uint32_t passes = command % 2 ? 12 : 24;
+    for (uint32_t pass = 0; pass < passes; ++pass)
+      passed.observe(unit(r, p, w, 0, passes), unit(r, p, w, 0, passes), 1.2 * truth(unit(r, p, w, 0, passes)),
+                     1.0 / passes);
     whole.observe(unit(r, p, w, 0), unit(r, p, w, 0), 1.2 * truth(unit(r, p, w, 0)), 1.0);
   }
   const model::CommandWork probe = unit(4096, 16384, 10'000'000'000, 0);
@@ -616,6 +673,7 @@ constexpr test::TestCase kTests[] = {
     {"testRecoversTheRatesVariedUnitsShow", testRecoversTheRatesVariedUnitsShow},
     {"testOneSizeKeepsTheSeedsSplit", testOneSizeKeepsTheSeedsSplit},
     {"testOnlyOtherPassesOfTheWorkTellTheTurnaround", testOnlyOtherPassesOfTheWorkTellTheTurnaround},
+    {"testAMisfitOfOnePassCountDoesNotTellTheTurnaround", testAMisfitOfOnePassCountDoesNotTellTheTurnaround},
     {"testMoreExpectedBytesPriceAtOnce", testMoreExpectedBytesPriceAtOnce},
     {"testAStallMovesTheFitAsTwiceItsPrice", testAStallMovesTheFitAsTwiceItsPrice},
     {"testPassesMoveTheFitAsTheirCommand", testPassesMoveTheFitAsTheirCommand},

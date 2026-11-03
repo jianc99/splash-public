@@ -1469,12 +1469,15 @@ of the next, its time held
 within half and twice its price, in a fit that keeps every cost non-negative
 and a cost no unit's work varies at its seed; the bytes it prices are scaled
 by what units read over what the model expected of them. The turnaround is
-what the units say of it beside their work, whatever the other costs are,
-once they pin it down to within a tenth of G (its standard error from their
-scatter about the fit), the turnaround that moves the bound by G; until then
-it stays at zero and the bound at G. Units of other passes over the same
-work pin it down; units of one shape, or in the passes their prices set,
-whose pass counts follow their work, do not. The status reports
+what the units' pass counts say of it beyond their work and a constant per
+command, whatever the other costs are, once they pin it down to within a
+tenth of G (its standard error from their scatter about the fit, at one
+command's worth of their evidence however many ran: what a linear price
+misses of them does not average away), the turnaround that moves the bound
+by G; until then it stays at zero and the bound at G. Units of other passes
+over the same work pin it down; units all in one pass count, whatever their
+work, or in the passes their prices set, whose pass counts follow their
+work, do not. The status reports
 each cost and its seed, and the units' relative errors over the last 256
 (`scheduler.estimate.prefill`), and a decode token's time
 (`scheduler.estimate.decode`).
